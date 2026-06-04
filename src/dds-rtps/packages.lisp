@@ -102,4 +102,10 @@
            #:spdp-data-metatraffic-unicast-address
            #:spdp-data-lease-duration-seconds #:spdp-data-builtin-endpoint-set
            #:serialize-spdp-data #:parse-spdp-data
-           #:run-discovery-test))
+           #:run-discovery-test
+           #:+reliability-best-effort+ #:+reliability-reliable+
+           #:endpoint-data #:make-endpoint-data #:endpoint-data-p
+           #:endpoint-data-guid #:endpoint-data-topic-name
+           #:endpoint-data-type-name #:endpoint-data-reliability-kind
+           #:serialize-endpoint-data #:parse-endpoint-data #:endpoint-match-p
+           #:run-sedp-test))

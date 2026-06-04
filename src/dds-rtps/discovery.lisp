@@ -235,3 +235,134 @@
       (assert (= (spdp-data-lease-duration-seconds back) 30) () "lease mismatch")
       (assert (= (spdp-data-builtin-endpoint-set back) #x0000043F) () "endpoint-set mismatch")
       (values t back))))
+
+;;;; ---- SEDP: Simple Endpoint Discovery Protocol (RTPS 2.5 §8.5.4 / §9.6.2.2).
+;;;; DiscoveredWriterData / DiscoveredReaderData carried as a ParameterList in the
+;;;; SEDP DATA. One ENDPOINT-DATA struct serves both (shared core fields for v1).
+;;;; Wire constants pinned from docs/specs/ (cited inline), never memorized. ----
+
+;; ReliabilityQosPolicyKind: BEST_EFFORT=1, RELIABLE=2 (RELIABLE is the stronger/
+;; higher value for RxO) — DDS-XTypes 1.3 §7.6.3.1.2 IDL, xtypes-1_3-discovery-builtin-topic.idl L126.
+(defconstant +reliability-best-effort+ 1)
+;; RELIABLE_RELIABILITY_QOS = 2 (DDS-XTypes 1.3 §7.6.3.1.2; same IDL L127).
+(defconstant +reliability-reliable+ 2)
+
+(defstruct (endpoint-data (:constructor make-endpoint-data))
+  "DiscoveredWriterData / DiscoveredReaderData core fields (RTPS 2.5 §8.5.4 /
+   §9.6.2.2): a 16-octet GUID (12-octet participant prefix + 4-octet entity id),
+   topic + type names, and the RELIABILITY kind for RxO matching."
+  (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+        :type (simple-array (unsigned-byte 8) (16)))
+  (topic-name "" :type string)
+  (type-name "" :type string)
+  (reliability-kind +reliability-best-effort+ :type integer))
+
+(declaim (ftype (function (dds.core.buffer:cursor endpoint-data) fixnum) serialize-endpoint-data))
+(defun serialize-endpoint-data (cursor data)
+  "Serialize ENDPOINT-DATA as a ParameterList terminated by PID_SENTINEL (RTPS 2.5
+   §8.5.4 / §9.4.2.11). Each Parameter value is built in a scratch buffer then
+   emitted via WRITE-PARAMETER (which adds pid+length+padding)."
+  ;; PID_ENDPOINT_GUID: GUID_t = 12-octet prefix + 4-octet entity id = 16 octets (§9.3.1.2).
+  (multiple-value-bind (c vec) (%make-scratch 16)
+    (dds.core.buffer:put-octets c (endpoint-data-guid data) 0 16)
+    (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-endpoint-guid+ vec 0 16))
+  ;; PID_TOPIC_NAME: CDR string (§9.6.2.2 / DDS-XTypes 1.3 PublicationBuiltinTopicData.topic_name).
+  (let ((s (endpoint-data-topic-name data)))
+    (multiple-value-bind (c vec) (%make-scratch (+ 8 (length s)))
+      (dds.cdr:cdr-put-string c s :xcdr1)
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-topic-name+
+                                        vec 0 (dds.core.buffer:cursor-position c))))
+  ;; PID_TYPE_NAME: CDR string (§9.6.2.2 / DDS-XTypes 1.3 ...BuiltinTopicData.type_name).
+  (let ((s (endpoint-data-type-name data)))
+    (multiple-value-bind (c vec) (%make-scratch (+ 8 (length s)))
+      (dds.cdr:cdr-put-string c s :xcdr1)
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-type-name+
+                                        vec 0 (dds.core.buffer:cursor-position c))))
+  ;; PID_RELIABILITY: ReliabilityQosPolicy {long kind; Duration_t max_blocking_time;}
+  ;; = 4 + (long sec + ulong nanosec) = 12 octets (DDS-XTypes 1.3 §7.6.3.1.2, idl L131-134).
+  (multiple-value-bind (c vec) (%make-scratch 12)
+    (dds.core.buffer:put-u32 c (logand (endpoint-data-reliability-kind data) #xFFFFFFFF))
+    (dds.core.buffer:put-u32 c 0)
+    (dds.core.buffer:put-u32 c 0)
+    (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-reliability+ vec 0 12))
+  (dds.rtps.message:write-parameter-sentinel cursor))
+
+(declaim (ftype (function (endpoint-data (unsigned-byte 16) dds.core.buffer:cursor (integer 0)) t) %fill-endpoint-param))
+(defun %fill-endpoint-param (data pid cursor len)
+  "ParameterList handler: fill DATA from one Parameter. The caller guarantees LEN
+   octets are present; inner reads gate on the minimum size (§9.4.2.11)."
+  (cond
+    ((= pid dds.rtps.message:+pid-endpoint-guid+)
+     (when (>= len 16)
+       (dds.core.buffer:get-octets cursor (endpoint-data-guid data) 0 16)))
+    ((= pid dds.rtps.message:+pid-topic-name+)
+     (when (>= len 4)
+       (setf (endpoint-data-topic-name data) (dds.cdr:cdr-get-string cursor :xcdr1))))
+    ((= pid dds.rtps.message:+pid-type-name+)
+     (when (>= len 4)
+       (setf (endpoint-data-type-name data) (dds.cdr:cdr-get-string cursor :xcdr1))))
+    ((= pid dds.rtps.message:+pid-reliability+)
+     (when (>= len 4)
+       (setf (endpoint-data-reliability-kind data) (dds.core.buffer:get-u32 cursor)))))
+  data)
+
+(declaim (ftype (function (dds.core.buffer:cursor) t) parse-endpoint-data))
+(defun parse-endpoint-data (cursor)
+  "Parse a SEDP ParameterList into an ENDPOINT-DATA struct, or NIL if the list is
+   truncated (RTPS 2.5 §8.5.4 / §9.4.2.11). Bounds-checked via PARSE-PARAMETER-LIST."
+  (let ((data (make-endpoint-data)))
+    (if (dds.rtps.message:parse-parameter-list
+         cursor (lambda (pid c len) (%fill-endpoint-param data pid c len)))
+        data
+        nil)))
+
+(declaim (ftype (function (endpoint-data endpoint-data) t) endpoint-match-p))
+(defun endpoint-match-p (writer-data reader-data)
+  "T iff topic + type names are equal and RELIABILITY RxO is compatible: offered
+   (writer) kind >= requested (reader) kind, so a RELIABLE writer satisfies a
+   BEST_EFFORT or RELIABLE reader (FR-QOS-2; RTPS 2.5 §8.7.5.1 RxO ordering)."
+  (and (string= (endpoint-data-topic-name writer-data) (endpoint-data-topic-name reader-data))
+       (string= (endpoint-data-type-name writer-data) (endpoint-data-type-name reader-data))
+       (>= (endpoint-data-reliability-kind writer-data)
+           (endpoint-data-reliability-kind reader-data))
+       t))
+
+(declaim (ftype (function () (simple-array (unsigned-byte 8) (16))) %sample-guid))
+(defun %sample-guid ()
+  "A deterministic 16-octet GUID for the SEDP round-trip test."
+  (make-array 16 :element-type '(unsigned-byte 8)
+              :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 0 0 1 2)))
+
+(declaim (ftype (function () t) run-sedp-test))
+(defun run-sedp-test ()
+  "Round-trip an ENDPOINT-DATA through serialize/parse and assert the GUID, topic,
+   type, and reliability kind survive; then exercise the RxO matching truth table.
+   Returns T on success (ASSERT signals otherwise)."
+  (let* ((guid (%sample-guid))
+         (data (make-endpoint-data :guid guid
+                                   :topic-name "Square"
+                                   :type-name "ShapeType"
+                                   :reliability-kind +reliability-reliable+))
+         (ob (dds.core.buffer:make-octet-buffer 256))
+         (wc (dds.core.buffer:cursor ob :endianness :little)))
+    (serialize-endpoint-data wc data)
+    (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
+           (back (parse-endpoint-data rc)))
+      (assert back () "parse-endpoint-data returned NIL")
+      (assert (equalp (endpoint-data-guid back) guid) () "guid mismatch")
+      (assert (string= (endpoint-data-topic-name back) "Square") () "topic-name mismatch")
+      (assert (string= (endpoint-data-type-name back) "ShapeType") () "type-name mismatch")
+      (assert (= (endpoint-data-reliability-kind back) +reliability-reliable+) () "reliability mismatch")))
+  ;; Matching truth table (FR-QOS-2 RxO: offered >= requested).
+  (let ((w-rel (make-endpoint-data :topic-name "T" :type-name "Y" :reliability-kind +reliability-reliable+))
+        (w-be  (make-endpoint-data :topic-name "T" :type-name "Y" :reliability-kind +reliability-best-effort+))
+        (r-rel (make-endpoint-data :topic-name "T" :type-name "Y" :reliability-kind +reliability-reliable+))
+        (r-be  (make-endpoint-data :topic-name "T" :type-name "Y" :reliability-kind +reliability-best-effort+))
+        (r-topic (make-endpoint-data :topic-name "OTHER" :type-name "Y" :reliability-kind +reliability-best-effort+))
+        (r-type  (make-endpoint-data :topic-name "T" :type-name "OTHER" :reliability-kind +reliability-best-effort+)))
+    (assert (endpoint-match-p w-rel r-be) () "(a) RELIABLE writer + BEST_EFFORT reader should match")
+    (assert (endpoint-match-p w-rel r-rel) () "(b) RELIABLE writer + RELIABLE reader should match")
+    (assert (not (endpoint-match-p w-be r-rel)) () "(c) BEST_EFFORT writer + RELIABLE reader must not match")
+    (assert (not (endpoint-match-p w-rel r-topic)) () "(d) different topic-name must not match")
+    (assert (not (endpoint-match-p w-rel r-type)) () "(e) different type-name must not match"))
+  t)
