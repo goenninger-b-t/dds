@@ -21,6 +21,7 @@
 (defun udp-open (&key (host "0.0.0.0") (port 0))
   "Open a UDPv4 socket bound to HOST:PORT (port 0 = ephemeral). Returns the socket."
   (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address s) t)
     (sb-bsd-sockets:socket-bind s (%parse-ipv4 host) port)
     s))
 

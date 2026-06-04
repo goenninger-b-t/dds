@@ -17,6 +17,15 @@
   "Dispatch-free per-packet send: one slot read + funcall (FR-XPORT-5)."
   (funcall (transport-send transport) locator buffer off len))
 
+(declaim (ftype (function (&key (:kind t) (:send (or null function)) (:receive-loop (or null function)) (:open-receive-resource (or null function)) (:close (or null function)) (:max-message-size fixnum) (:locator-kind t)) transport) make-transport))
+(defun make-transport (&key (kind :mock) send receive-loop open-receive-resource
+                            close (max-message-size 65507) (locator-kind :mock))
+  "Public constructor for a pluggable transport record (FR-XPORT-5). Adding a
+   transport = constructing one of these; the RTPS engine is untouched."
+  (%make-transport :kind kind :send send :receive-loop receive-loop
+                   :open-receive-resource open-receive-resource :close close
+                   :max-message-size max-message-size :locator-kind locator-kind))
+
 (defun make-mock-transport (&key on-receive (max-message-size 65507))
   "Synchronous loopback transport: SEND hands the octets straight to ON-RECEIVE,
    which is called as (buffer off len). Deterministic; used by the M0 echo test."

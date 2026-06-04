@@ -18,7 +18,7 @@
    (values transport socket); the socket has no slot in the frozen record."
   (let ((socket (dds.pal:udp-open :host host :port port)))
     (values
-     (dds.xport::%make-transport ; internal constructor: %make-transport is not exported (v1)
+     (dds.xport:make-transport
       :kind :udpv4
       :locator-kind :udpv4
       :max-message-size 65507
@@ -80,3 +80,47 @@
              t)
         (dds.pal:udp-close rx-socket)
         (dds.pal:udp-close tx-socket)))))
+
+(declaim (ftype (function (t function) t) start-udp-receiver))
+(defun start-udp-receiver (socket on-datagram)
+  "Spawn a thread that blocks on SOCKET, receiving each datagram into a 64 KiB
+   octet-buffer and calling (ON-DATAGRAM buffer size). The thread exits when the
+   socket is closed (udp-recv then signals). Returns the thread (FR-XPORT-5)."
+  (dds.pal:spawn
+   (lambda ()
+     (let ((buf (dds.core.buffer:make-octet-buffer 65507)))
+       (handler-case
+           (loop
+             (multiple-value-bind (size a p)
+                 (dds.pal:udp-recv socket (dds.core.buffer:octet-buffer-vec buf) 65507)
+               (declare (ignore a p))
+               (funcall on-datagram buf size)))
+         (error () nil))))
+   :name "dds-udp-rx"))
+
+(declaim (ftype (function () (eql t)) run-udp-receiver-test))
+(defun run-udp-receiver-test ()
+  "Receiver-thread loopback: a background thread receives a datagram and records
+   it; assert it arrives within a bounded wait. Returns T."
+  (multiple-value-bind (rx-tr rx-sock) (make-udp-transport :host "127.0.0.1" :port 0)
+    (declare (ignore rx-tr))
+    (multiple-value-bind (tx-tr tx-sock) (make-udp-transport :host "127.0.0.1" :port 0)
+      (let ((received nil))
+        (unwind-protect
+            (progn
+              (start-udp-receiver
+               rx-sock (lambda (buf size)
+                         (setf received (cons size (aref (dds.core.buffer:octet-buffer-vec buf) 0)))))
+              (let ((ob (dds.core.buffer:make-octet-buffer 16))
+                    (port (udp-transport-local-port rx-sock)))
+                (let ((c (dds.core.buffer:cursor ob)))
+                  (dds.core.buffer:put-u8 c #x55)
+                  (dds.core.buffer:put-u8 c #x66))
+                (dds.xport:send tx-tr (make-udp-locator :host "127.0.0.1" :port port) ob 0 2))
+              (loop repeat 100 until received do (sleep 0.02))
+              (assert received () "receiver thread did not deliver a datagram")
+              (assert (= 2 (car received)) () "wrong datagram size")
+              (assert (= #x55 (cdr received)) () "wrong datagram byte")
+              t)
+          (dds.pal:udp-close tx-sock)
+          (dds.pal:udp-close rx-sock))))))

@@ -196,6 +196,7 @@
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
                  ("udp-transport"           . dds.xport.udp:run-udp-transport-test)
+                 ("udp-receiver-thread"      . dds.xport.udp:run-udp-receiver-test)
                  ("end-to-end-udp"           . run-end-to-end-test))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))

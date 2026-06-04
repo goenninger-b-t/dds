@@ -13,7 +13,7 @@
            #:transport-send #:transport-receive-loop
            #:transport-open-receive-resource #:transport-close
            #:transport-max-message-size #:transport-locator-kind
-           #:send #:make-mock-transport))
+           #:send #:make-transport #:make-mock-transport))
 
 (defpackage #:net.goenninger.dds.xport.udp
   (:nicknames #:dds.xport.udp)
@@ -25,4 +25,5 @@
   (:export #:make-udp-transport #:udp-locator #:make-udp-locator
            #:udp-locator-host #:udp-locator-port
            #:udp-transport-local-port #:udp-transport-recv
-           #:run-udp-transport-test))
+           #:start-udp-receiver
+           #:run-udp-transport-test #:run-udp-receiver-test))
