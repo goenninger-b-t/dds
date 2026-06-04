@@ -13,7 +13,7 @@
            #:cache-change-kind #:cache-change-writer-guid #:cache-change-sn
            #:cache-change-instance-key-hash #:cache-change-serialized-payload
            #:cache-change-source-timestamp #:cache-change-inline-qos
-           #:history-cache #:make-history-cache
+           #:history-cache #:make-history-cache #:hc-change-count
            #:hc-add-change #:hc-remove-change #:hc-get-change
            #:hc-min-seq #:hc-max-seq #:hc-changes-for-reader
            #:history-not-implemented))

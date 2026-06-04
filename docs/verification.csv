@@ -13,6 +13,7 @@ DDS.CORE.ARENA,acquire/release/zero-leak,dds-tests echo-test,P0,done-clasp+sbcl,
 M0-exit,echo over mock transport,dds-tests:run-echo-test,M0,PASSED (owner-commanded),Clasp boehmprecise + SBCL 2.6.5 green; AllegroCL exception by explicit owner command 2026-06-04 (ADR 0004)
 FR-RTPS-1,RTPS message/submessage/entityid byte-exact,src/dds-rtps/message.lisp; dds-tests rtps-test,P1,partial,Full wire-codec layer: Header+SubmessageHeader+EntityId+SequenceNumber(Set)+HEARTBEAT/ACKNACK/GAP/DATA byte-exact + bounds-checked parse (RTPS 2.5 §9.4.4/§9.4.5/§9.3.1.2/§9.4.2.6) green Clasp+SBCL; reliable engine/HistoryCache/discovery/UDP/interop next
 FR-RTPS-7,SequenceNumber(Set) byte-exact + bitmap boundaries,src/dds-rtps/message.lisp; dds-tests rtps-test,P1,partial,SequenceNumber + SequenceNumberSet byte-exact + exhaustive bit-boundary + membership + bounds-checked parse (RTPS 2.5 §9.3.2.10/§9.4.2.6) green Clasp+SBCL
+FR-RTPS-5,HistoryCache HISTORY+RESOURCE_LIMITS,src/dds-rtps/history.lisp; dds-tests rtps-test,P1,partial,KEEP_LAST eviction + KEEP_ALL max_samples reject + duplicate + min/max + changes-for-reader green Clasp+SBCL; pooled zero-alloc store / per-instance KEEP_LAST / LIFESPAN later
 FR-QOS-2,RxO truth-table tests,tests/qos/,P2,not-started,M3
 FR-TYPE-4,assignability matrix,tests/xtypes/,P3,not-started,M4
 NFR-SEC-POSTURE,parser fuzz,src/dds-tests/pbt-test.lisp,P1,partial,PBT parser-fuzz (1600 random buffers/run) finds no OOB across all RTPS parsers; green Clasp+SBCL; AFL/libfuzzer replay of Connext captures later

@@ -185,6 +185,7 @@
                  ("rtps-seqnum-bitmap"       . run-rtps-seqnum-test)
                  ("rtps-submessages"         . run-rtps-submessage-test)
                  ("rtps-data"                . run-rtps-data-test)
+                 ("rtps-history-cache"       . run-history-test)
                  ("property-based"           . run-pbt-tests))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))

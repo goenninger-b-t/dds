@@ -93,6 +93,35 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+;;; HistoryCache: HISTORY (KEEP_LAST/KEEP_ALL) + RESOURCE_LIMITS (FR-RTPS-5).
+
+(declaim (ftype (function () t) run-history-test))
+(defun run-history-test ()
+  (flet ((mk (sn) (dds.rtps.history:make-cache-change :sn sn)))
+    ;; KEEP_LAST depth 3: adding 1..4 evicts SN 1
+    (let ((hc (dds.rtps.history:make-history-cache :keep-last 3 nil nil)))
+      (dolist (sn '(1 2 3 4)) (dds.rtps.history:hc-add-change hc (mk sn)))
+      (%check :kl-count (= 3 (dds.rtps.history:hc-change-count hc)) "KEEP_LAST count")
+      (%check :kl-evict (null (dds.rtps.history:hc-get-change hc 1)) "KEEP_LAST evicted SN1")
+      (%check :kl-keep (dds.rtps.history:hc-get-change hc 4) "KEEP_LAST kept SN4")
+      (%check :kl-min (= 2 (dds.rtps.history:hc-min-seq hc)) "KEEP_LAST min")
+      (%check :kl-max (= 4 (dds.rtps.history:hc-max-seq hc)) "KEEP_LAST max")
+      (%check :kl-sorted
+              (equal '(2 3 4) (mapcar #'dds.rtps.history:cache-change-sn
+                                      (dds.rtps.history:hc-changes-for-reader hc nil)))
+              "changes-for-reader ascending SN"))
+    ;; KEEP_ALL with max_samples=2: 3rd add rejected; duplicate detected
+    (let ((hc (dds.rtps.history:make-history-cache :keep-all 1 2 nil)))
+      (%check :ka-1 (eq :ok (dds.rtps.history:hc-add-change hc (mk 1))) "KEEP_ALL add 1")
+      (%check :ka-2 (eq :ok (dds.rtps.history:hc-add-change hc (mk 2))) "KEEP_ALL add 2")
+      (%check :ka-rej (eq :rejected-resource-limits (dds.rtps.history:hc-add-change hc (mk 3)))
+              "KEEP_ALL rejects at max_samples")
+      (%check :ka-dup (eq :duplicate (dds.rtps.history:hc-add-change hc (mk 1))) "duplicate SN")
+      (%check :ka-rm (and (dds.rtps.history:hc-remove-change hc 1)
+                          (= 1 (dds.rtps.history:hc-change-count hc)))
+              "remove decrements count"))
+    t))
+
 ;;; HEARTBEAT / ACKNACK / GAP submessage round-trips (RTPS 2.5 §9.4.5.7/.3/.6).
 ;;; Writes a complete submessage, re-reads the SubmessageHeader, then the body.
 
