@@ -67,3 +67,99 @@
               t)
           (dds.pal:udp-close rx-sock)
           (dds.pal:udp-close tx-sock))))))
+
+;;; Typed data plane: a generated ShapeType (the canonical Connext Shapes type)
+;;; flows through the FULL participant stack — SPDP discovery, SEDP matching, and
+;;; the reliable HEARTBEAT/ACKNACK data plane — not the manual one-shot path above.
+;;; The middleware carries the opaque SerializedPayload; the application uses the
+;;; generated XCDR codec at both ends, exactly as real DDS type-support does.
+
+(dds.gen:define-dds-type shape-type (:extensibility :final)
+  (color :string :key t)
+  (x :i32)
+  (y :i32)
+  (shapesize :i32))
+
+(declaim (ftype (function (shape-type) (simple-array (unsigned-byte 8) (*))) %serialize-shape))
+(defun %serialize-shape (shape)
+  "Serialize SHAPE as a PLAIN_CDR2_LE SerializedPayload (encapsulation header +
+   XCDR2 body) into a fresh octet vector — the data-plane publish payload."
+  (let* ((buf (dds.core.buffer:make-octet-buffer 256))
+         (wc (dds.core.buffer:cursor buf :endianness :little)))
+    (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+    (serialize-shape-type shape wc :xcdr2)
+    (let* ((len (dds.core.buffer:cursor-position wc))
+           (out (make-array len :element-type '(unsigned-byte 8))))
+      (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
+      out)))
+
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (*))) shape-type) %deserialize-shape))
+(defun %deserialize-shape (bytes)
+  "Parse a PLAIN_CDR2_LE SerializedPayload (encapsulation header + XCDR2 body) into
+   a shape-type. The deserialized struct copies its fields out, so the scratch
+   buffer is freed immediately."
+  (let* ((ob (dds.core.buffer:make-octet-buffer (length bytes)))
+         (rc (dds.core.buffer:cursor ob :endianness :little)))
+    (replace (dds.core.buffer:octet-buffer-vec ob) bytes)
+    (dds.cdr:parse-encapsulation-header rc)
+    (prog1 (deserialize-shape-type rc :xcdr2)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))
+
+(declaim (ftype (function () t) run-typed-dataplane-test))
+(defun run-typed-dataplane-test ()
+  "A generated ShapeType flows fully typed across the participant data plane: two
+   participants discover (SPDP) + match (SEDP), then node1 publishes an XCDR2-encoded
+   Shape that node2 receives reliably and deserializes; assert every field survives.
+   Proves the reliable UDP data plane carries real generated types, not opaque bytes."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
+         (node1 (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (node2 (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (shape (make-shape-type :color "BLUE" :x 100 :y 150 :shapesize 30)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer node1 :topic "Square" :type "ShapeType"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-publisher node1)
+           (dds.disc:add-local-reader node2 :topic "Square" :type "ShapeType"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber node2)
+           (setf (dds.disc:disc-node-peers node1)
+                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node2))))
+           (setf (dds.disc:disc-node-peers node2)
+                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node1))))
+           (dds.disc:start-node node1)
+           (dds.disc:start-node node2)
+           (dds.disc:announce-participant node1)
+           (dds.disc:announce-participant node2)
+           (loop repeat 100
+                 until (and (plusp (dds.disc:disc-node-discovered-count node1))
+                            (plusp (dds.disc:disc-node-discovered-count node2)))
+                 do (sleep 0.02))
+           (dds.disc:announce-endpoints node1)
+           (dds.disc:announce-endpoints node2)
+           (loop repeat 100
+                 until (and (plusp (dds.disc:disc-node-matched-count node1))
+                            (plusp (dds.disc:disc-node-matched-count node2)))
+                 do (sleep 0.02))
+           (%check :typed-matched (plusp (dds.disc:disc-node-matched-count node2))
+                   "endpoints did not match before publish")
+           (dds.disc:publish-sample node1 (%serialize-shape shape))
+           (loop repeat 150 until (plusp (dds.disc:node-sample-count node2)) do (sleep 0.02))
+           (%check :typed-received (plusp (dds.disc:node-sample-count node2))
+                   "subscriber never received the shape over UDP")
+           (let ((bytes (dds.disc:node-sample node2 1)))
+             (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+             (let ((q (%deserialize-shape bytes)))
+               (%check :typed-fields
+                       (and (string= (shape-type-color q) "BLUE")
+                            (= (shape-type-x q) 100)
+                            (= (shape-type-y q) 150)
+                            (= (shape-type-shapesize q) 30))
+                       "ShapeType did not survive the typed data-plane round-trip")))
+           t)
+      (dds.disc:stop-node node1)
+      (dds.disc:stop-node node2))))
