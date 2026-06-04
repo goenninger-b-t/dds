@@ -58,7 +58,8 @@
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
            #:write-parameter #:write-parameter-sentinel #:parse-parameter-list
            #:spdp-multicast-port #:spdp-unicast-port
-           #:user-multicast-port #:user-unicast-port))
+           #:user-multicast-port #:user-unicast-port
+           #:dispatch-message))
 
 ;;;; dds.rtps.reliable — the stateful reliable writer/reader protocol logic
 ;;;; (RTPS 2.5 §8.4). Value-level state machines over the HistoryCache; the

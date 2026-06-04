@@ -185,6 +185,7 @@
                  ("rtps-seqnum-bitmap"       . run-rtps-seqnum-test)
                  ("rtps-submessages"         . run-rtps-submessage-test)
                  ("rtps-data"                . run-rtps-data-test)
+                 ("rtps-message-dispatch"    . run-rtps-dispatch-test)
                  ("rtps-parameterlist"       . run-paramlist-test)
                  ("rtps-port-mapping"        . run-port-mapping-test)
                  ("rtps-history-cache"       . run-history-test)

@@ -93,6 +93,43 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+;;; RTPS message framing: build Header + DATA + HEARTBEAT into one buffer, then
+;;; dispatch-message walks the submessages back out (RTPS 2.5 §8.3.4 / §9.4.5).
+
+(declaim (ftype (function () t) run-rtps-dispatch-test))
+(defun run-rtps-dispatch-test ()
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 256 1))
+         (buf (dds.core.arena:pool-acquire pool))
+         (c (dds.core.buffer:cursor buf :endianness :little))
+         (prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0))
+         (rid dds.rtps.message:+entityid-participant+)
+         (wid dds.rtps.message:+entityid-unknown+)
+         (payload (make-array 8 :element-type '(unsigned-byte 8)
+                                :initial-contents '(0 #x11 0 0 #x2a 0 0 0))))
+    (dds.rtps.message:write-header c prefix :vendor 0)
+    (dds.rtps.message:write-data c rid wid 7 payload 0 8)
+    (dds.rtps.message:write-heartbeat c rid wid 1 7 1 :final t)
+    (dds.core.buffer:cursor-reset c)
+    (let ((seen '()))
+      (let ((ok (dds.rtps.message:dispatch-message
+                 c (lambda (id flags cur body-len)
+                     (cond
+                       ((= id dds.rtps.message:+submsg-data+)
+                        (multiple-value-bind (r w sn) (dds.rtps.message:parse-data-body cur flags body-len)
+                          (declare (ignore r w))
+                          (push (list :data sn) seen)))
+                       ((= id dds.rtps.message:+submsg-heartbeat+)
+                        (multiple-value-bind (r w first) (dds.rtps.message:parse-heartbeat-body cur flags)
+                          (declare (ignore r w))
+                          (push (list :heartbeat first) seen))))))))
+        (%check :dispatch-ok ok "message dispatch returned T")
+        (%check :dispatch-seen (equal '((:data 7) (:heartbeat 1)) (nreverse seen))
+                "DATA then HEARTBEAT dispatched in order")))
+    (dds.core.arena:pool-release pool buf)
+    (dds.core.arena:teardown-arena arena)
+    t))
+
 ;;; ParameterList (PID) codec byte-exact + round-trip (RTPS 2.5 §9.4.2.11) and the
 ;;; RTPS port-mapping formula (§9.6.1.1).
 

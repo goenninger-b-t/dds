@@ -425,3 +425,25 @@
 (defun user-unicast-port (domain participant-id)
   "User-traffic unicast port: PB + DG*domain + d3 + PG*participantId."
   (+ +port-base+ (* +port-domain-gain+ domain) +port-d3+ (* +port-participant-gain+ participant-id)))
+
+;;; ---- RTPS Message receive loop (§8.3.4 / §9.4.5): parse the Header then walk
+;;; the submessages, dispatching each to a handler. Each submessage's endianness
+;;; comes from its E flag; octetsToNextHeader (0 = extends to the end) frames the
+;;; next one. Bounds-checked throughout (NFR-SEC-POSTURE). ----
+
+(declaim (ftype (function (dds.core.buffer:cursor function) t) dispatch-message))
+(defun dispatch-message (cursor handler)
+  "Parse an RTPS message; for each submessage call (HANDLER id flags cursor
+   body-len) with the cursor at the body and its endianness set per the E flag.
+   Returns T on a well-formed message, NIL on bad magic / truncation."
+  (unless (parse-header cursor) (return-from dispatch-message nil))
+  (loop
+    (when (< (%remaining cursor) 4) (return t))
+    (multiple-value-bind (id flags octets le) (parse-submessage-header cursor)
+      (when (null id) (return nil))
+      (dds.core.buffer:cursor-set-endianness cursor (if le :little :big))
+      (let* ((body-start (dds.core.buffer:cursor-position cursor))
+             (body-len (if (plusp octets) octets (%remaining cursor))))
+        (when (> body-len (%remaining cursor)) (return nil))
+        (funcall handler id flags cursor body-len)
+        (dds.core.buffer:cursor-set-position cursor (+ body-start body-len))))))
