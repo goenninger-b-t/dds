@@ -200,6 +200,7 @@
                  ("end-to-end-udp"           . run-end-to-end-test)
                  ("spdp-discovery-over-udp"  . dds.disc:run-spdp-discovery-test)
                  ("sedp-matching-over-udp"   . dds.disc:run-sedp-discovery-test)
+                 ("multicast-spdp-discovery" . dds.disc:run-mcast-discovery-test)
                  ("reliable-data-over-udp"   . dds.disc:run-dataplane-test))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))

@@ -42,20 +42,39 @@
   (on-data nil :type (or null function))
   (on-heartbeat nil :type (or null function))
   (on-acknack nil :type (or null function))
+  (mcast-socket nil)
+  (mcast-rx-thread nil)
   (rx-thread nil))
 
-(declaim (ftype (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list)) disc-node) make-disc-node))
+;; Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
+;; participants announce + listen on UDPv4 239.255.0.1 : spdp-multicast-port.
+(defparameter +spdp-multicast-group+ "239.255.0.1")
+
+(declaim (ftype (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t)) disc-node) make-disc-node))
 (defun make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
                                                      :initial-element 0))
-                            (domain 0) (host "127.0.0.1") (port 0) (peers '()))
+                            (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast)
   "Open a metatraffic UDPv4 socket bound to HOST:PORT and build a discovery node.
-   PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4)."
-  (multiple-value-bind (tr sock) (dds.xport.udp:make-udp-transport :host host :port port)
-    (%make-disc-node :guid-prefix guid-prefix :domain domain
-                     :socket sock :transport tr :peers peers
-                     :tx-payload (dds.core.buffer:make-octet-buffer 512)
-                     :tx-msg (dds.core.buffer:make-octet-buffer 2048)
-                     :rx-tx-msg (dds.core.buffer:make-octet-buffer 2048))))
+   PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4).
+   MULTICAST opens a second socket bound to the SPDP multicast port and joins the
+   well-known group, so the node also discovers peers via multicast (FR-DISC-3)."
+  ;; In multicast mode bind the unicast socket to 0.0.0.0: a loopback-bound socket
+  ;; cannot egress to a multicast group (EADDRNOTAVAIL), and 0.0.0.0 still receives
+  ;; unicast SEDP addressed to 127.0.0.1:port.
+  (multiple-value-bind (tr sock)
+      (dds.xport.udp:make-udp-transport :host (if multicast "0.0.0.0" host) :port port)
+    (let ((node (%make-disc-node :guid-prefix guid-prefix :domain domain
+                                 :socket sock :transport tr :peers peers
+                                 :tx-payload (dds.core.buffer:make-octet-buffer 512)
+                                 :tx-msg (dds.core.buffer:make-octet-buffer 2048)
+                                 :rx-tx-msg (dds.core.buffer:make-octet-buffer 2048))))
+      (when multicast
+        (let ((ms (dds.pal:udp-open :host "0.0.0.0"
+                                    :port (dds.rtps.message:spdp-multicast-port domain)
+                                    :reuse-port t)))
+          (dds.pal:udp-join-multicast ms +spdp-multicast-group+)
+          (setf (disc-node-mcast-socket node) ms)))
+      node)))
 
 (declaim (ftype (function (disc-node) (integer 0 65535)) disc-node-port))
 (defun disc-node-port (node)
@@ -125,17 +144,24 @@
 (declaim (ftype (function (disc-node) (eql t)) announce-participant))
 (defun announce-participant (node)
   "Announce NODE's SPDPdiscoveredParticipantData (writer = SPDP builtin participant
-   writer) to every unicast peer (FR-DISC-1/4)."
+   writer) to every unicast peer (FR-DISC-1/4) and, if multicast is enabled, to the
+   well-known SPDP multicast group (FR-DISC-3). The SPDP data advertises the node's
+   unicast metatraffic locator, so SEDP comes back unicast either way."
   (incf (disc-node-spdp-sn node))
   (let ((sn (disc-node-spdp-sn node))
         (data (%node-spdp-data node)))
-    (dolist (peer (disc-node-peers node))
-      (%send-paramlist node
-                       dds.rtps.discovery:+entityid-spdp-reader+
-                       dds.rtps.discovery:+entityid-spdp-writer+
-                       sn
-                       (lambda (c) (dds.rtps.discovery:serialize-spdp-data c data))
-                       (car peer) (cdr peer))))
+    (flet ((send-spdp (host port)
+             (%send-paramlist node
+                              dds.rtps.discovery:+entityid-spdp-reader+
+                              dds.rtps.discovery:+entityid-spdp-writer+
+                              sn
+                              (lambda (c) (dds.rtps.discovery:serialize-spdp-data c data))
+                              host port)))
+      (dolist (peer (disc-node-peers node))
+        (send-spdp (car peer) (cdr peer)))
+      (when (disc-node-mcast-socket node)
+        (send-spdp +spdp-multicast-group+
+                   (dds.rtps.message:spdp-multicast-port (disc-node-domain node))))))
   t)
 
 (declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8))) dds.rtps.discovery:endpoint-data) add-local-writer))
@@ -278,19 +304,28 @@
 
 (declaim (ftype (function (disc-node) disc-node) start-node))
 (defun start-node (node)
-  "Spawn the background receiver thread that processes inbound datagrams for NODE.
-   Returns NODE."
+  "Spawn the background receiver thread(s) that process inbound datagrams for NODE:
+   the unicast metatraffic socket always, plus the multicast socket if enabled.
+   Both feed the same %handle-datagram. Returns NODE."
   (setf (disc-node-rx-thread node)
         (dds.xport.udp:start-udp-receiver
          (disc-node-socket node)
          (lambda (buf size) (%handle-datagram node buf size))))
+  (when (disc-node-mcast-socket node)
+    (setf (disc-node-mcast-rx-thread node)
+          (dds.xport.udp:start-udp-receiver
+           (disc-node-mcast-socket node)
+           (lambda (buf size) (%handle-datagram node buf size)))))
   node)
 
 (declaim (ftype (function (disc-node) (eql t)) stop-node))
 (defun stop-node (node)
-  "Close NODE's socket (terminating its receiver thread) and free the reusable
+  "Close NODE's socket(s) (terminating its receiver thread(s)) and free the reusable
    announce scratch buffers. Idempotent."
   (dds.pal:udp-close (disc-node-socket node))
+  (when (disc-node-mcast-socket node)
+    (dds.pal:udp-close (disc-node-mcast-socket node))
+    (setf (disc-node-mcast-socket node) nil))
   (when (disc-node-tx-payload node)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-payload node)))
     (setf (disc-node-tx-payload node) nil))
@@ -409,6 +444,50 @@
                    "node1 matched the wrong topic")
            (assert (member "Square" (disc-node-matched-topics node2) :test #'string=) ()
                    "node2 matched the wrong topic")
+           t)
+      (stop-node node1)
+      (stop-node node2))))
+
+(declaim (ftype (function () (eql t)) run-mcast-discovery-test))
+(defun run-mcast-discovery-test ()
+  "Two participants with NO unicast peers discover each other purely via multicast
+   SPDP (well-known group 239.255.0.1 : spdp-multicast-port, RTPS 2.5 §9.6.1.1),
+   then match endpoints via unicast SEDP routed to the multicast-discovered unicast
+   locators. Proves discovery works with zero initial-peer configuration (FR-DISC-3)."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
+         (node1 (make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0 :multicast t))
+         (node2 (make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0 :multicast t)))
+    (unwind-protect
+         (progn
+           (add-local-writer node1 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+           (add-local-reader node2 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (start-node node1)
+           (start-node node2)
+           (announce-participant node1)
+           (announce-participant node2)
+           (loop repeat 150
+                 until (and (member p2 (disc-node-discovered-prefixes node1) :test #'equalp)
+                            (member p1 (disc-node-discovered-prefixes node2) :test #'equalp))
+                 do (sleep 0.02))
+           (assert (member p2 (disc-node-discovered-prefixes node1) :test #'equalp) ()
+                   "node1 did not discover node2 via multicast SPDP")
+           (assert (member p1 (disc-node-discovered-prefixes node2) :test #'equalp) ()
+                   "node2 did not discover node1 via multicast SPDP")
+           (announce-endpoints node1)
+           (announce-endpoints node2)
+           (loop repeat 100
+                 until (and (plusp (disc-node-matched-count node1))
+                            (plusp (disc-node-matched-count node2)))
+                 do (sleep 0.02))
+           (assert (plusp (disc-node-matched-count node1)) ()
+                   "node1 did not match node2's endpoint after multicast discovery")
+           (assert (plusp (disc-node-matched-count node2)) ()
+                   "node2 did not match node1's endpoint after multicast discovery")
            t)
       (stop-node node1)
       (stop-node node2))))

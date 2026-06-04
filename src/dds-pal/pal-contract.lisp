@@ -26,6 +26,7 @@
    #:monotonic-ns
    ;; UDPv4 sockets (native, FR-XPORT-1)
    #:udp-open #:udp-local-port #:udp-send-to #:udp-recv #:udp-close
+   #:udp-set-reuse-port #:udp-join-multicast
    ;; gc control / measurement
    #:gc-suggest #:with-gc-inhibited #:bytes-consed
    ;; optimization hints
