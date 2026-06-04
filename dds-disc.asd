@@ -8,5 +8,6 @@
   :pathname "src/dds-disc"
   :serial t
   :components ((:file "packages")
-               (:file "disc"))
+               (:file "disc")
+               (:file "dataplane"))
   :in-order-to ((test-op (test-op "dds-tests"))))

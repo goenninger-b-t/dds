@@ -20,4 +20,7 @@
            #:add-local-writer #:add-local-reader
            #:start-node #:stop-node
            #:announce-participant #:announce-endpoints
-           #:run-spdp-discovery-test #:run-sedp-discovery-test))
+           #:enable-publisher #:enable-subscriber
+           #:publish-sample #:node-sample-count #:node-sample
+           #:run-spdp-discovery-test #:run-sedp-discovery-test
+           #:run-dataplane-test))

@@ -34,6 +34,14 @@
   (lock (dds.pal:make-lock "disc-node"))
   (tx-payload nil :type (or null dds.core.buffer:octet-buffer))
   (tx-msg nil :type (or null dds.core.buffer:octet-buffer))
+  (rx-tx-msg nil :type (or null dds.core.buffer:octet-buffer))
+  (user-writer nil)
+  (user-reader nil)
+  (samples (make-hash-table :test 'eql) :type hash-table)
+  (ack-count 0 :type integer)
+  (on-data nil :type (or null function))
+  (on-heartbeat nil :type (or null function))
+  (on-acknack nil :type (or null function))
   (rx-thread nil))
 
 (declaim (ftype (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list)) disc-node) make-disc-node))
@@ -46,7 +54,8 @@
     (%make-disc-node :guid-prefix guid-prefix :domain domain
                      :socket sock :transport tr :peers peers
                      :tx-payload (dds.core.buffer:make-octet-buffer 512)
-                     :tx-msg (dds.core.buffer:make-octet-buffer 2048))))
+                     :tx-msg (dds.core.buffer:make-octet-buffer 2048)
+                     :rx-tx-msg (dds.core.buffer:make-octet-buffer 2048))))
 
 (declaim (ftype (function (disc-node) (integer 0 65535)) disc-node-port))
 (defun disc-node-port (node)
@@ -224,32 +233,46 @@
 
 (declaim (ftype (function (disc-node dds.core.buffer:octet-buffer (integer 0)) t) %handle-datagram))
 (defun %handle-datagram (node buf size)
-  "Dispatch an inbound datagram (bounded by SIZE). For a DATA submessage, parse the
-   SerializedPayload (encapsulation header + ParameterList) and route by writerId:
-   SPDP -> record participant; SEDP publications -> match vs local readers; SEDP
-   subscriptions -> match vs local writers. Everything else is ignored."
+  "Dispatch an inbound datagram (bounded by SIZE). DATA is routed by writerId: SPDP
+   -> record participant; SEDP publications/subscriptions -> match; any other DATA
+   plus HEARTBEAT/ACKNACK -> the installed data-plane hooks (nil = ignore). The
+   discovery SerializedPayloads are ParameterLists (encap header + list); a user
+   DATA payload is opaque bytes handed to the on-data hook as a [poff,plen) region."
   (let ((cursor (dds.core.buffer:cursor buf :endianness :little)))
     (dds.rtps.message:dispatch-message
      cursor
      (lambda (id flags c body-len)
-       (when (= id dds.rtps.message:+submsg-data+)
-         (multiple-value-bind (rdr wtr sn has-payload poff plen keyp)
-             (dds.rtps.message:parse-data-body c flags body-len)
-           (declare (ignore rdr sn plen keyp))
-           (when has-payload
-             (let ((pc (dds.core.buffer:cursor buf :endianness :little)))
-               (dds.core.buffer:cursor-set-position pc poff)
-               (dds.cdr:parse-encapsulation-header pc)
-               (cond
-                 ((= wtr dds.rtps.discovery:+entityid-spdp-writer+)
-                  (let ((spdp (dds.rtps.discovery:parse-spdp-data pc)))
-                    (when spdp (%record-participant node spdp))))
-                 ((= wtr dds.rtps.discovery:+entityid-sedp-pub-writer+)
-                  (let ((ep (dds.rtps.discovery:parse-endpoint-data pc)))
-                    (when ep (%match-remote-writer node ep))))
-                 ((= wtr dds.rtps.discovery:+entityid-sedp-sub-writer+)
-                  (let ((ep (dds.rtps.discovery:parse-endpoint-data pc)))
-                    (when ep (%match-remote-reader node ep))))))))))
+       (cond
+         ((= id dds.rtps.message:+submsg-data+)
+          (multiple-value-bind (rdr wtr sn has-payload poff plen keyp)
+              (dds.rtps.message:parse-data-body c flags body-len)
+            (declare (ignore rdr keyp))
+            (when has-payload
+              (cond
+                ((= wtr dds.rtps.discovery:+entityid-spdp-writer+)
+                 (let ((pc (dds.core.buffer:cursor buf :endianness :little)))
+                   (dds.core.buffer:cursor-set-position pc poff)
+                   (dds.cdr:parse-encapsulation-header pc)
+                   (let ((spdp (dds.rtps.discovery:parse-spdp-data pc)))
+                     (when spdp (%record-participant node spdp)))))
+                ((= wtr dds.rtps.discovery:+entityid-sedp-pub-writer+)
+                 (let ((pc (dds.core.buffer:cursor buf :endianness :little)))
+                   (dds.core.buffer:cursor-set-position pc poff)
+                   (dds.cdr:parse-encapsulation-header pc)
+                   (let ((ep (dds.rtps.discovery:parse-endpoint-data pc)))
+                     (when ep (%match-remote-writer node ep)))))
+                ((= wtr dds.rtps.discovery:+entityid-sedp-sub-writer+)
+                 (let ((pc (dds.core.buffer:cursor buf :endianness :little)))
+                   (dds.core.buffer:cursor-set-position pc poff)
+                   (dds.cdr:parse-encapsulation-header pc)
+                   (let ((ep (dds.rtps.discovery:parse-endpoint-data pc)))
+                     (when ep (%match-remote-reader node ep)))))
+                ((disc-node-on-data node)
+                 (funcall (disc-node-on-data node) wtr sn buf poff plen))))))
+         ((and (= id dds.rtps.message:+submsg-heartbeat+) (disc-node-on-heartbeat node))
+          (funcall (disc-node-on-heartbeat node) c flags))
+         ((and (= id dds.rtps.message:+submsg-acknack+) (disc-node-on-acknack node))
+          (funcall (disc-node-on-acknack node) c flags))))
      size)
     t))
 
@@ -274,6 +297,9 @@
   (when (disc-node-tx-msg node)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-msg node)))
     (setf (disc-node-tx-msg node) nil))
+  (when (disc-node-rx-tx-msg node)
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-rx-tx-msg node)))
+    (setf (disc-node-rx-tx-msg node) nil))
   t)
 
 (declaim (ftype (function (disc-node) (integer 0)) disc-node-discovered-count))
