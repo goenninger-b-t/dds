@@ -294,3 +294,47 @@
     (multiple-value-bind (base numbits bitmap) (read-sequence-number-set cursor)
       (when (null base) (return-from parse-gap-body nil))
       (values reader-id writer-id gap-start base numbits bitmap))))
+
+;;; ---- DATA submessage (§9.4.5.4): extraFlags + octetsToInlineQos + readerId +
+;;; writerId + writerSN + [inlineQos if Q] + serializedPayload [if D||K]. v1 emits
+;;; and parses the base form (Q=0; inlineQos parsing lands with the ParameterList
+;;; / discovery increment). serializedPayload is passed/returned as a byte region.
+
+(defconstant +data-flag-inline-qos+    #x02)
+(defconstant +data-flag-data+          #x04)
+(defconstant +data-flag-key+           #x08)
+(defconstant +data-flag-non-standard+  #x10)
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum) write-data))
+(defun write-data (cursor reader-id writer-id writer-sn payload payload-off payload-len &key key)
+  "Write a complete DATA submessage with a serializedPayload, no inlineQos. KEY t
+   emits a key payload (K=1,D=0); else data (D=1,K=0). RTPS 2.5 §9.4.5.4."
+  (write-submessage-header cursor +submsg-data+
+                           (logior (%e-flag cursor)
+                                   (if key +data-flag-key+ +data-flag-data+))
+                           (+ 20 payload-len))
+  (dds.core.buffer:put-u16 cursor 0)             ; extraFlags = 0 (this version)
+  (dds.core.buffer:put-u16 cursor 16)            ; octetsToInlineQos = 16
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (write-sequence-number cursor writer-sn)
+  (dds.core.buffer:put-octets cursor payload payload-off payload-len)
+  (dds.core.buffer:cursor-position cursor))
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t) parse-data-body))
+(defun parse-data-body (cursor flags octets-to-next)
+  "Parse a DATA body (base form, Q=0). Returns (values reader-id writer-id writer-sn
+   has-payload payload-offset payload-len key-p), or NIL if Q is set (inlineQos
+   deferred) or the buffer is short. The serializedPayload is left in place (the
+   caller reads it from PAYLOAD-OFFSET). RTPS 2.5 §9.4.5.4."
+  (when (logtest flags +data-flag-inline-qos+) (return-from parse-data-body nil))
+  (when (< (%remaining cursor) 20) (return-from parse-data-body nil))
+  (dds.core.buffer:get-u16 cursor)               ; extraFlags (reserved)
+  (dds.core.buffer:get-u16 cursor)               ; octetsToInlineQos
+  (let* ((reader (read-entity-id cursor))
+         (writer (read-entity-id cursor))
+         (sn (read-sequence-number cursor))
+         (has-payload (logtest flags (logior +data-flag-data+ +data-flag-key+)))
+         (len (if (plusp octets-to-next) (- octets-to-next 20) (%remaining cursor))))
+    (values reader writer sn has-payload (dds.core.buffer:cursor-position cursor)
+            (if has-payload len 0) (logtest flags +data-flag-key+))))

@@ -53,6 +53,46 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+;;; DATA submessage byte-exact + parse (RTPS 2.5 §9.4.5.4, base form, Q=0).
+
+(declaim (ftype (function () t) run-rtps-data-test))
+(defun run-rtps-data-test ()
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 128 1))
+         (buf (dds.core.arena:pool-acquire pool))
+         (c (dds.core.buffer:cursor buf :endianness :little))
+         (rid dds.rtps.message:+entityid-participant+)
+         (wid dds.rtps.message:+entityid-unknown+)
+         ;; an 8-octet fake serializedPayload: PLAIN_CDR2_LE header + i32=42
+         (payload (make-array 8 :element-type '(unsigned-byte 8)
+                                :initial-contents '(0 #x11 0 0 #x2a 0 0 0))))
+    (dds.rtps.message:write-data c rid wid 5 payload 0 8)
+    ;; full 32-octet byte image: header(4) + extra/oti(4) + reader(4) + writer(4)
+    ;;                          + writerSN(8) + payload(8)
+    (%check :data-bytes
+            (equal '(#x15 #x05 #x1c 0   0 0 #x10 0   0 0 1 #xc1   0 0 0 0
+                     0 0 0 0 5 0 0 0   0 #x11 0 0 #x2a 0 0 0)
+                   (%first-bytes buf 32))
+            "DATA submessage bytes")
+    (dds.core.buffer:cursor-reset c)
+    (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+      (declare (ignore le))
+      (%check :data-hdr (and (= id #x15) (= flags #x05) (= octets 28)) "DATA header")
+      (multiple-value-bind (r w sn has off len key)
+          (dds.rtps.message:parse-data-body c flags octets)
+        (%check :data-body
+                (and (= r rid) (= w wid) (= sn 5) has (= off 24) (= len 8) (not key))
+                "DATA body parse")
+        ;; the payload region must equal what we wrote
+        (%check :data-payload
+                (equal '(0 #x11 0 0 #x2a 0 0 0)
+                       (loop for i from off below (+ off len)
+                             collect (aref (dds.core.buffer:octet-buffer-vec buf) i)))
+                "DATA payload region")))
+    (dds.core.arena:pool-release pool buf)
+    (dds.core.arena:teardown-arena arena)
+    t))
+
 ;;; HEARTBEAT / ACKNACK / GAP submessage round-trips (RTPS 2.5 §9.4.5.7/.3/.6).
 ;;; Writes a complete submessage, re-reads the SubmessageHeader, then the body.
 
