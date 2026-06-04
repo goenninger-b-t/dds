@@ -9,7 +9,12 @@ SBCL  := ./scripts/with-sbcl.sh
 LISP  ?= $(CLASP)
 
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
-        build-all test-all gate-hotpath gate-types corpus fuzz wire interop bench mem clean
+        build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
+        square-pub square-sub bench mem clean
+
+DOMAIN   ?= 0
+COLOR    ?= BLUE
+ADVERTISE ?= 127.0.0.1
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -41,6 +46,18 @@ fuzz:
 
 wire:
 	./scripts/wire-check.sh
+
+# Standalone Shapes interop participants (docs/interop-shapes.md). Run forever;
+# Ctrl-C to stop. Override DOMAIN=.. COLOR=.. ; LISP=$(SBCL) used (CFFI multicast).
+square-pub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
+
+square-sub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
 
 interop: wire
 	@echo "interop: 'wire' validates our output vs the tshark RTPS dissector."

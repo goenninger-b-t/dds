@@ -28,6 +28,19 @@
                     (dds.xport.udp:make-udp-locator :host host :port port)
                     buf 0 (dds.core.buffer:cursor-position mc))))
 
+(declaim (ftype (function (disc-node) list) %data-destinations))
+(defun %data-destinations (node)
+  "Where to send user DATA/HEARTBEAT: the union of static PEERS and each discovered
+   participant's default-unicast (user-traffic) locator, deduped by (host . port).
+   Discovery-driven routing is what makes the data plane work against a foreign
+   participant (e.g. Connext), not just hand-wired peers."
+  (let ((dests (copy-list (disc-node-peers node))))
+    (dolist (p (%discovered-participants node) dests)
+      (let ((host (%locator-ipv4-string (dds.rtps.discovery:spdp-data-default-unicast-address p)))
+            (port (%locator-port (dds.rtps.discovery:spdp-data-default-unicast-port p))))
+        (when (plusp port)
+          (pushnew (cons host port) dests :test #'equal))))))
+
 (declaim (ftype (function (disc-node) t) %push-data))
 (defun %push-data (node)
   "Writer side: send every change not yet acked by the reader as a DATA submessage,
@@ -35,7 +48,7 @@
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (let ((datas (dds.rtps.reliable:writer-data-list writer +user-reader-id+)))
-        (dolist (peer (disc-node-peers node))
+        (dolist (peer (%data-destinations node))
           (dolist (d datas)
             (let ((sn (car d)) (pl (cdr d)))
               (declare (type (simple-array (unsigned-byte 8) (*)) pl))
@@ -81,7 +94,7 @@
         (dds.rtps.reliable:reader-on-heartbeat reader wid first last)
         (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
           (let ((cnt (incf (disc-node-ack-count node))))
-            (dolist (peer (disc-node-peers node))
+            (dolist (peer (%data-destinations node))
               (%send-msg-buf node (disc-node-rx-tx-msg node)
                              (lambda (mc)
                                (dds.rtps.message:write-acknack
@@ -101,7 +114,7 @@
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
                                                +user-reader-id+ base numbits bitmap)
         (declare (ignore gaps))
-        (dolist (peer (disc-node-peers node))
+        (dolist (peer (%data-destinations node))
           (dolist (d resends)
             (let ((sn (car d)) (pl (cdr d)))
               (declare (type (simple-array (unsigned-byte 8) (*)) pl))
@@ -144,6 +157,13 @@
   "The received payload for sequence number SN, or NIL."
   (dds.pal:with-lock ((disc-node-lock node))
     (gethash sn (disc-node-samples node))))
+
+(declaim (ftype (function (disc-node) list) node-sample-sns))
+(defun node-sample-sns (node)
+  "Sequence numbers of the user samples received so far (unordered). Lets a
+   subscriber drain new samples without assuming SNs start at 1 (Connext may not)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (loop for k being the hash-keys of (disc-node-samples node) collect k)))
 
 (declaim (ftype (function () (eql t)) run-dataplane-test))
 (defun run-dataplane-test ()

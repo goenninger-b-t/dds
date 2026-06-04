@@ -22,6 +22,7 @@
   (guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)
                :type (simple-array (unsigned-byte 8) (12)))
   (domain 0 :type (integer 0))
+  (advertise-address "127.0.0.1" :type string)
   (socket nil)
   (transport nil)
   (spdp-sn 0 :type integer)
@@ -50,10 +51,11 @@
 ;; participants announce + listen on UDPv4 239.255.0.1 : spdp-multicast-port.
 (defparameter +spdp-multicast-group+ "239.255.0.1")
 
-(declaim (ftype (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t)) disc-node) make-disc-node))
+(declaim (ftype (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string)) disc-node) make-disc-node))
 (defun make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
                                                      :initial-element 0))
-                            (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast)
+                            (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast
+                            (advertise-address "127.0.0.1"))
   "Open a metatraffic UDPv4 socket bound to HOST:PORT and build a discovery node.
    PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4).
    MULTICAST opens a second socket bound to the SPDP multicast port and joins the
@@ -64,6 +66,7 @@
   (multiple-value-bind (tr sock)
       (dds.xport.udp:make-udp-transport :host (if multicast "0.0.0.0" host) :port port)
     (let ((node (%make-disc-node :guid-prefix guid-prefix :domain domain
+                                 :advertise-address advertise-address
                                  :socket sock :transport tr :peers peers
                                  :tx-payload (dds.core.buffer:make-octet-buffer 512)
                                  :tx-msg (dds.core.buffer:make-octet-buffer 2048)
@@ -100,13 +103,21 @@
     (setf (aref g 14) key (aref g 15) kind)
     g))
 
+(declaim (ftype (function (string) (simple-array (unsigned-byte 8) (4))) %ipv4-octets))
+(defun %ipv4-octets (host)
+  "Parse a dotted-quad 'a.b.c.d' string into a 4-octet vector."
+  (let ((v (make-array 4 :element-type '(unsigned-byte 8))) (start 0))
+    (dotimes (i 4 v)
+      (let ((dot (position #\. host :start start)))
+        (setf (aref v i) (parse-integer host :start start :end dot)
+              start (if dot (1+ dot) (length host)))))))
+
 (declaim (ftype (function (disc-node) dds.rtps.discovery:spdp-data) %node-spdp-data))
 (defun %node-spdp-data (node)
-  "Build NODE's SPDPdiscoveredParticipantData: its GUID prefix + one metatraffic
-   unicast locator at 127.0.0.1:<bound port>, protocol version 2.5."
+  "Build NODE's SPDPdiscoveredParticipantData: its GUID prefix + a unicast locator
+   at <advertise-address>:<bound port> (default 127.0.0.1), protocol version 2.5."
   (let ((addr (dds.rtps.discovery:make-ipv4-locator
-               (make-array 4 :element-type '(unsigned-byte 8)
-                           :initial-contents '(127 0 0 1))))
+               (%ipv4-octets (disc-node-advertise-address node))))
         (port (disc-node-port node)))
     (dds.rtps.discovery:make-spdp-data
      :guid-prefix (disc-node-guid-prefix node)
