@@ -14,3 +14,15 @@
            #:transport-open-receive-resource #:transport-close
            #:transport-max-message-size #:transport-locator-kind
            #:send #:make-mock-transport))
+
+(defpackage #:net.goenninger.dds.xport.udp
+  (:nicknames #:dds.xport.udp)
+  (:use #:common-lisp)
+  (:documentation
+   "UDPv4 transport (ADR 0006): wraps the frozen DDS.XPORT transport record
+    around the native DDS.PAL UDP socket layer. make-udp-transport returns the
+    raw PAL socket as a second value since the record has no slot for it.")
+  (:export #:make-udp-transport #:udp-locator #:make-udp-locator
+           #:udp-locator-host #:udp-locator-port
+           #:udp-transport-local-port #:udp-transport-recv
+           #:run-udp-transport-test))

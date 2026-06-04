@@ -5,5 +5,6 @@
   :pathname "src/dds-xport"
   :serial t
   :components ((:file "packages")
-               (:file "transport"))
+               (:file "transport")
+               (:file "udp"))
   :in-order-to ((test-op (test-op "dds-tests"))))
