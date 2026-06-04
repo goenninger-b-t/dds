@@ -148,8 +148,8 @@
 
 (declaim (ftype (function () t) run-mem-test))
 (defun run-mem-test ()
-  "Measured zero-alloc deserialize (NFR-PERF-8). Asserted on SBCL (exact
-   bytes-consed); on Clasp bytes-consed is 0 (documented gap) so it only smokes."
+  "Measured zero-alloc serialize + deserialize (NFR-PERF-8). Asserted on SBCL
+   (exact bytes-consed); on Clasp bytes-consed is 0 (gap) so it only smokes."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 512 1))
          (ts (dds.types:find-type-support "mline"))
@@ -160,18 +160,26 @@
          (rc (dds.core.buffer:cursor buf :endianness :little))
          (iters 100000))
     (serialize-mline src wc :xcdr2)
-    (deserialize-into-mline sample rc :xcdr2)        ; warm up
-    (let ((before (dds.pal:bytes-consed)))
-      (dotimes (i iters)
-        (dds.core.buffer:cursor-reset rc)
-        (deserialize-into-mline sample rc :xcdr2))
-      (let* ((delta (- (dds.pal:bytes-consed) before))
-             (per (/ (float delta) iters)))
-        (format t "~&  mem: ~d bytes over ~d deserialize-into (~,4f bytes/sample), impl=~a~%"
-                delta iters per (dds.pal:pal-impl-name))
-        (when (eq (dds.pal:pal-impl-name) :sbcl)
-          (%check :zero-alloc-deserialize (< per 1.0)
-                  (format nil "~,4f bytes/sample (expected ~~0)" per)))))
+    (deserialize-into-mline sample rc :xcdr2)         ; warm up both paths
+    (flet ((measure (label thunk)
+             (declare (type function thunk))
+             (let ((before (dds.pal:bytes-consed)))
+               (dotimes (i iters) (funcall thunk))
+               (let* ((delta (- (dds.pal:bytes-consed) before))
+                      (per (/ (float delta) iters)))
+                 (format t "~&  mem[~11a]: ~9d bytes / ~d iters = ~,4f bytes/sample (~a)~%"
+                         label delta iters per (dds.pal:pal-impl-name))
+                 (when (eq (dds.pal:pal-impl-name) :sbcl)
+                   (%check :zero-alloc (< per 1.0)
+                           (format nil "~a: ~,4f bytes/sample (expected ~~0)" label per)))))))
+      (measure "serialize"
+               (lambda () (dds.core.buffer:cursor-reset wc) (serialize-mline src wc :xcdr2)))
+      (measure "deserialize"
+               (lambda () (dds.core.buffer:cursor-reset rc) (deserialize-into-mline sample rc :xcdr2)))
+      (measure "round-trip"
+               (lambda ()
+                 (dds.core.buffer:cursor-reset wc) (serialize-mline src wc :xcdr2)
+                 (dds.core.buffer:cursor-reset rc) (deserialize-into-mline sample rc :xcdr2))))
     (funcall (dds.types:type-support-sample-pool-free ts) sample)
     (dds.core.arena:pool-release pool buf)
     (dds.core.arena:teardown-arena arena)
