@@ -36,7 +36,8 @@ corpus:
 	@echo "corpus: byte-exact XCDR vectors — not yet implemented (M1, FR-CDR-8)"
 
 fuzz:
-	@echo "fuzz: CDR/RTPS parser fuzzing — not yet implemented (M1+, NFR-SEC-POSTURE)"
+	$(LISP) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(handler-case (progn (dds.tests:run-pbt-tests) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 interop:
 	@echo "interop: Connext + tshark — not yet implemented (M2, FR-IO)"

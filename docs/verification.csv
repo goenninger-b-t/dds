@@ -15,5 +15,6 @@ FR-RTPS-1,RTPS message/submessage/entityid byte-exact,src/dds-rtps/message.lisp;
 FR-RTPS-7,SequenceNumber(Set) byte-exact + bitmap boundaries,src/dds-rtps/message.lisp; dds-tests rtps-test,P1,partial,SequenceNumber + SequenceNumberSet byte-exact + exhaustive bit-boundary + membership + bounds-checked parse (RTPS 2.5 §9.3.2.10/§9.4.2.6) green Clasp+SBCL
 FR-QOS-2,RxO truth-table tests,tests/qos/,P2,not-started,M3
 FR-TYPE-4,assignability matrix,tests/xtypes/,P3,not-started,M4
-NFR-SEC-POSTURE,parser fuzz,tests/fuzz/,P1,not-started,M1+
+NFR-SEC-POSTURE,parser fuzz,src/dds-tests/pbt-test.lisp,P1,partial,PBT parser-fuzz (1600 random buffers/run) finds no OOB across all RTPS parsers; green Clasp+SBCL; AFL/libfuzzer replay of Connext captures later
+NFR-TEST,property-based testing,src/dds-tests/pbt-test.lisp,all,partial,deterministic xorshift-seeded PBT in make test/all + make fuzz: CDR round-trip + SequenceNumber/Set round-trip + parser-fuzz (4x400 cases); shrinking + soak later
 NFR-PERF-*,perftest-equiv harness,bench/report/,per-gate,not-started,M5
