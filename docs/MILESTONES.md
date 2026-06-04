@@ -6,7 +6,7 @@ Exit gates are defined in `IMPLEMENTATION-PLAN.md` §4. This file tracks status.
 |---|---|---|
 | **M0** | Contracts, skeleton, CI | ✅ **PASSED** — Clasp + SBCL green. **AllegroCL exception, by explicit owner command (DG1SBG), 2026-06-04** — see ADR 0004. |
 | **M1** | P0 XCDR byte-exact + real PALs | 🟡 **IN PROGRESS** — XCDR1/2 codec + spec-pinned encapsulation + s-expr type compiler (`define-dds-type` → defstruct + monomorphic codecs + type-support) round-tripping on Clasp+SBCL. Remaining: full RTI byte-exact vectors (oracle), IDL parser, mutable/appendable framing, key-hash, string/sequence member pooling. |
-| M2 | P1 minimal RTPS + Connext Shapes interop | 🟡 **IN PROGRESS** — RTPS Header/SubmessageHeader/EntityId byte-exact codec (spec-pinned, bounds-checked). Next: SequenceNumber(Set) + reliable writer/reader + SPDP/SEDP + UDPv4 + Connext Shapes interop. |
+| M2 | P1 minimal RTPS + Connext Shapes interop | 🟡 **IN PROGRESS** — RTPS Header/SubmessageHeader/EntityId + SequenceNumber/SequenceNumberSet byte-exact codec (spec-pinned, bounds-checked, exhaustive bitmap tests). Next: DATA/HEARTBEAT/ACKNACK/GAP submessage bodies + reliable writer/reader + SPDP/SEDP + UDPv4 + Connext interop. |
 | M3 | P2 DCPS + QoS + conditions + content-filter | ⬜ not started |
 | M4 | P3 XTypes + TypeLookup + assignability | ⬜ not started |
 | M5 | P4 batching/async/SHMEM/Zero-Copy/FlatData/LZ4 + bench | ⬜ not started |

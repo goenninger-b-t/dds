@@ -38,4 +38,8 @@
            #:+flag-endianness+ #:+entityid-unknown+ #:+entityid-participant+
            #:write-header #:parse-header
            #:write-submessage-header #:parse-submessage-header
-           #:write-entity-id #:read-entity-id))
+           #:write-entity-id #:read-entity-id
+           #:+sequence-number-unknown+ #:+seqnum-set-max-bits+
+           #:write-sequence-number #:read-sequence-number
+           #:write-sequence-number-set #:read-sequence-number-set
+           #:seqnum-set-bit #:seqnum-set-member-p))

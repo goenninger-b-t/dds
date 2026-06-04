@@ -127,3 +127,73 @@
   (let ((b0 (dds.core.buffer:get-u8 cursor)) (b1 (dds.core.buffer:get-u8 cursor))
         (b2 (dds.core.buffer:get-u8 cursor)) (b3 (dds.core.buffer:get-u8 cursor)))
     (logior (ash b0 24) (ash b1 16) (ash b2 8) b3)))
+
+;;; ---- SequenceNumber (§9.3.2.10): high (i32) + low (u32); value = low+high*2^32 ----
+
+(defconstant +sequence-number-unknown+ (- (ash 1 32))
+  "SEQUENCENUMBER_UNKNOWN = {high=-1, low=0} (RTPS 2.5 §8.3.5.4).")
+
+(declaim (ftype (function (dds.core.buffer:cursor integer) fixnum) write-sequence-number))
+(defun write-sequence-number (cursor seqnum)
+  "Write an 8-octet SequenceNumber: high (i32) then low (u32), cursor endianness."
+  (dds.core.buffer:put-u32 cursor (logand (ash seqnum -32) #xFFFFFFFF))
+  (dds.core.buffer:put-u32 cursor (logand seqnum #xFFFFFFFF))
+  (dds.core.buffer:cursor-position cursor))
+
+(declaim (ftype (function (dds.core.buffer:cursor) integer) read-sequence-number))
+(defun read-sequence-number (cursor)
+  "Read an 8-octet SequenceNumber as a signed 64-bit value (RTPS 2.5 §9.3.2.10)."
+  (let* ((hu (dds.core.buffer:get-u32 cursor))
+         (low (dds.core.buffer:get-u32 cursor))
+         (high (if (>= hu #x80000000) (- hu #x100000000) hu)))
+    (+ low (* high #x100000000))))
+
+;;; ---- SequenceNumberSet (§9.4.2.6): bitmapBase + numBits + M=(numBits+31)/32 longs.
+;;; Offset deltaN maps to bitmap[deltaN/32], bit (31 - deltaN%32) — MSB-first. ----
+
+(defconstant +seqnum-set-max-bits+ 256)
+
+(declaim (ftype (function ((unsigned-byte 32)) fixnum) %seqnum-set-words))
+(defun %seqnum-set-words (numbits)
+  "M = (numBits+31)/32 longs (RTPS 2.5 §9.4.2.6)."
+  (ceiling numbits 32))
+
+(declaim (ftype (function ((simple-array (unsigned-byte 32) (*)) (integer 0)) (unsigned-byte 32)) seqnum-set-bit))
+(defun seqnum-set-bit (bitmap delta)
+  "Set the bit for offset DELTA: word DELTA/32, bit (31 - DELTA%32) (§9.4.2.6)."
+  (let ((w (floor delta 32)))
+    (setf (aref bitmap w) (logior (aref bitmap w) (ash 1 (- 31 (mod delta 32)))))))
+
+(declaim (ftype (function (integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) integer) t) seqnum-set-member-p))
+(defun seqnum-set-member-p (base numbits bitmap seqnum)
+  "T iff SEQNUM is in the SequenceNumberSet, per the §9.4.2.6 membership rule."
+  (let ((delta (- seqnum base)))
+    (and (<= base seqnum) (< delta numbits)
+         (logbitp (- 31 (mod delta 32)) (aref bitmap (floor delta 32))))))
+
+(declaim (ftype (function (dds.core.buffer:cursor integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum) write-sequence-number-set))
+(defun write-sequence-number-set (cursor base numbits bitmap)
+  "Write a SequenceNumberSet: bitmapBase + numBits + M longs (RTPS 2.5 §9.4.2.6)."
+  (assert (<= numbits +seqnum-set-max-bits+))
+  (write-sequence-number cursor base)
+  (dds.core.buffer:put-u32 cursor numbits)
+  (dotimes (i (%seqnum-set-words numbits))
+    (dds.core.buffer:put-u32 cursor (aref bitmap i)))
+  (dds.core.buffer:cursor-position cursor))
+
+(declaim (ftype (function (dds.core.buffer:cursor) t) read-sequence-number-set))
+(defun read-sequence-number-set (cursor)
+  "Parse a SequenceNumberSet. Returns (values base numBits bitmap-words) or NIL on
+   short buffer / numBits>256 (§9.4.2.6). Bounds-checked; never reads OOB."
+  (when (< (%remaining cursor) 12)
+    (return-from read-sequence-number-set nil))
+  (let* ((base (read-sequence-number cursor))
+         (numbits (dds.core.buffer:get-u32 cursor)))
+    (when (> numbits +seqnum-set-max-bits+)
+      (return-from read-sequence-number-set nil))
+    (let ((m (%seqnum-set-words numbits)))
+      (when (< (%remaining cursor) (* m 4))
+        (return-from read-sequence-number-set nil))
+      (let ((bitmap (make-array (max 1 m) :element-type '(unsigned-byte 32) :initial-element 0)))
+        (dotimes (i m) (setf (aref bitmap i) (dds.core.buffer:get-u32 cursor)))
+        (values base numbits bitmap)))))

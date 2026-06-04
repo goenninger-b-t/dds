@@ -11,7 +11,8 @@ DDS.PAL,capability conformance,src/dds-pal/ (pal-clasp+pal-sbcl),M0-M1,partial,C
 DDS.CORE.BUFFER,unit round-trip,dds-tests echo-test,P0,done-clasp+sbcl,u8/16/32/64 LE+BE + octets round-trip + bounds-check
 DDS.CORE.ARENA,acquire/release/zero-leak,dds-tests echo-test,P0,done-clasp+sbcl,init/pool/acquire/release/high-water verified
 M0-exit,echo over mock transport,dds-tests:run-echo-test,M0,PASSED (owner-commanded),Clasp boehmprecise + SBCL 2.6.5 green; AllegroCL exception by explicit owner command 2026-06-04 (ADR 0004)
-FR-RTPS-1,RTPS message/submessage/entityid byte-exact,src/dds-rtps/message.lisp; dds-tests rtps-test,P1,partial,Header+SubmessageHeader+EntityId byte-exact + bounds-checked parse (RTPS 2.5 §9.4.4/§9.4.5.1/§9.3.1.2) green Clasp+SBCL; SequenceNumberSet/reliable engine/discovery/UDP/interop next
+FR-RTPS-1,RTPS message/submessage/entityid byte-exact,src/dds-rtps/message.lisp; dds-tests rtps-test,P1,partial,Header+SubmessageHeader+EntityId byte-exact + bounds-checked parse (RTPS 2.5 §9.4.4/§9.4.5.1/§9.3.1.2) green Clasp+SBCL; submessage bodies/reliable engine/discovery/UDP/interop next
+FR-RTPS-7,SequenceNumber(Set) byte-exact + bitmap boundaries,src/dds-rtps/message.lisp; dds-tests rtps-test,P1,partial,SequenceNumber + SequenceNumberSet byte-exact + exhaustive bit-boundary + membership + bounds-checked parse (RTPS 2.5 §9.3.2.10/§9.4.2.6) green Clasp+SBCL
 FR-QOS-2,RxO truth-table tests,tests/qos/,P2,not-started,M3
 FR-TYPE-4,assignability matrix,tests/xtypes/,P3,not-started,M4
 NFR-SEC-POSTURE,parser fuzz,tests/fuzz/,P1,not-started,M1+
