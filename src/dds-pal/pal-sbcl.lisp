@@ -6,6 +6,11 @@
 
 (in-package #:dds.pal)
 
+;; SBCL ships sb-bsd-sockets as a contrib; load it so pal-net.lisp (the shared
+;; native UDP layer) compiles. Clasp bundles sb-bsd-sockets preloaded.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-bsd-sockets))
+
 #-sbcl
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (warn "pal-sbcl.lisp loaded on a non-SBCL build; capabilities will stub out."))

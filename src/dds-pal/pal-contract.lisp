@@ -24,6 +24,8 @@
    #:spawn #:join #:make-lock #:with-lock #:make-condvar #:condvar-wait #:condvar-signal
    ;; clock
    #:monotonic-ns
+   ;; UDPv4 sockets (native, FR-XPORT-1)
+   #:udp-open #:udp-local-port #:udp-send-to #:udp-recv #:udp-close
    ;; gc control / measurement
    #:gc-suggest #:with-gc-inhibited #:bytes-consed
    ;; optimization hints

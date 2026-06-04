@@ -6,5 +6,6 @@
   :serial t
   :components ((:file "pal-contract")
                (:file "pal-clasp" :if-feature :clasp)
-               (:file "pal-sbcl"  :if-feature :sbcl))
+               (:file "pal-sbcl"  :if-feature :sbcl)
+               (:file "pal-net"))
   :in-order-to ((test-op (test-op "dds-tests"))))
