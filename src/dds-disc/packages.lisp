@@ -16,5 +16,8 @@
   (:export #:disc-node #:disc-node-p #:make-disc-node
            #:disc-node-guid-prefix #:disc-node-peers #:disc-node-port
            #:disc-node-discovered-count #:disc-node-discovered-prefixes
-           #:start-node #:stop-node #:announce-participant
-           #:run-spdp-discovery-test))
+           #:disc-node-matched-count #:disc-node-matched-topics
+           #:add-local-writer #:add-local-reader
+           #:start-node #:stop-node
+           #:announce-participant #:announce-endpoints
+           #:run-spdp-discovery-test #:run-sedp-discovery-test))

@@ -89,13 +89,15 @@
   (dds.pal:spawn
    (lambda ()
      (let ((buf (dds.core.buffer:make-octet-buffer 65507)))
-       (handler-case
-           (loop
-             (multiple-value-bind (size a p)
-                 (dds.pal:udp-recv socket (dds.core.buffer:octet-buffer-vec buf) 65507)
-               (declare (ignore a p))
-               (funcall on-datagram buf size)))
-         (error () nil))))
+       (unwind-protect
+            (handler-case
+                (loop
+                  (multiple-value-bind (size a p)
+                      (dds.pal:udp-recv socket (dds.core.buffer:octet-buffer-vec buf) 65507)
+                    (declare (ignore a p))
+                    (funcall on-datagram buf size)))
+              (error () nil))
+         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
    :name "dds-udp-rx"))
 
 (declaim (ftype (function () (eql t)) run-udp-receiver-test))
