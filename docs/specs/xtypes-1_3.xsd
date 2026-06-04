@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This file contains the XML Schema Document (XSD) for the XML Type 
+Representation defined by the OMG specification "Extensible and Dynamic
+Topic Types for DDS" (DDS-XTypes).
+-->
+
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns="http://www.omg.org/dds"
+        targetNamespace="http://www.omg.org/dds"
+        elementFormDefault="qualified"
+        attributeFormDefault="unqualified">
+
+  <xs:include schemaLocation="https://www.omg.org/spec/DDS-XTypes/20190301/dds-xtypes_type_definition_nonamespace.xsd" />
+
+  <xs:element name="types" type="typeLibrary"/>
+
+</xs:schema>
