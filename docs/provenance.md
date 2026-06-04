@@ -18,11 +18,12 @@ headers, or `rtiddsgen` output.
 Normative OMG specs added to `docs/specs/` (PDF + machine-readable) and read
 directly to pin wire constants — the required clean-room source (CLAUDE.md §4):
 
-- **XTypes 1.3 §7.4.3.4 Table 39 (ENC_HEADER)** — the 11 encapsulation
-  representation identifiers (PLAIN_CDR=0x0000/01, PL_CDR=0x0002/03,
-  PLAIN_CDR2=0x0010/11, PL_CDR2=0x0012/13, DELIMITED_CDR=0x0014/15, XML=0x0100).
-  Confirmed my prior recollection (0x0006/0x0007) was **wrong** — pinned from the
-  table, not memory. → `src/dds-cdr/cdr.lisp`.
+- **XTypes 1.3 §7.4.3.4 (ENC_HEADER illustration)** — the encapsulation
+  representation identifiers. **⚠ SUPERSEDED in M2 — the XCDR2 values pinned here
+  were WRONG.** The §7.4 ENC_HEADER prose lists PLAIN_CDR2=0x0010/11,
+  PL_CDR2=0x0012/13, DELIMITED_CDR=0x0014/15, XML=0x0100. Those are a non-normative
+  inconsistency; the normative on-the-wire table is §7.6 Table 60 (see M2). The
+  XCDR1 values pinned here (PLAIN_CDR 0x00/01, PL_CDR 0x02/03) are correct.
 - **XTypes 1.3 §7.4.3.4.1 (DHEADER)** and **§7.4.3.4.2 (EMHEADER1/LC/NEXTINT)** —
   `EMHEADER1=(M_FLAG<<31)+(LC<<28)+(MemberId&0x0fffffff)`, LC 0–7 semantics.
   → `src/dds-cdr/primitives.lisp`.
@@ -31,6 +32,32 @@ directly to pin wire constants — the required clean-room source (CLAUDE.md §4
   the header. Cross-checked §10.3 Table 10.1. → cdr.lisp + cursor origin.
 - Text extracted locally with `pdftotext` (poppler); no external service used.
 - Still **no RTI/Fast DDS/Cyclone/OpenDDS source** consulted.
+
+## M2 (2026-06-04) — wire validation against the tshark RTPS dissector
+
+The discovery + reliable data plane now run over real UDP. To validate the wire
+format short of a live Connext peer, representative messages built by the project
+codecs (SPDP DATA, SEDP DATA, user DATA+HEARTBEAT, ACKNACK) are framed into a
+DLT_RAW pcap (`tools/rtps-pcap.lisp`) and dissected with **Wireshark/tshark 4.6.6
+RTPS dissector** — the same reference dissector used to validate Connext interop.
+No RTI artifacts involved; the dissector is the OMG-spec-derived oracle.
+
+- **Encapsulation identifier correction (the wire is the oracle).** The dissector
+  flagged our PLAIN_CDR2_LE = `0x0011` as **Unknown**. Investigation found the
+  DDS-XTypes 1.3 spec contradicts itself: the **§7.4 ENC_HEADER illustration**
+  lists the XCDR2 kinds as 0x10–0x15, but the **normative §7.6 Table 60 "RTPS
+  encapsulation identifier"** lists CDR2 = `0x06/0x07`, D_CDR2 = `0x08/0x09`,
+  PL_CDR2 = `0x0a/0x0b`, XML = `0x04`. Table 60 is the on-the-wire table and
+  matches the dissector (and Connext / Fast DDS / Cyclone) exactly. The M1 pinning
+  trusted the wrong (§7.4) table; **corrected to Table 60 values** in
+  `src/dds-cdr/cdr.lisp`, re-confirmed: tshark now reads our payload as
+  `CDR2_LE (0x0007)`. Lesson: a spec can be internally inconsistent — the wire
+  (dissector / interop) is the final arbiter (CLAUDE.md §4).
+- All four submessage shapes dissect cleanly: `DATA(p)` (SPDP participant data),
+  `DATA(w) -> Square` (SEDP — the dissector extracted our PID_TOPIC_NAME),
+  `DATA, HEARTBEAT`, and `ACKNACK` (SequenceNumberSet). Our SPDP writer EntityId is
+  recognized as `ENTITYID_BUILTIN_PARTICIPANT_WRITER (0x000100c2)`, guidPrefix,
+  flags, and sequence numbers all parse correctly. Repeatable via `make wire`.
 
 ## Third-party runtime dependencies (licenses apply; not vendored yet)
 

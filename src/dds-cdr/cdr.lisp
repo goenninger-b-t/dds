@@ -12,16 +12,19 @@
     (:plain-cdr-le     . #x0001)
     (:pl-cdr-be        . #x0002)
     (:pl-cdr-le        . #x0003)
-    (:plain-cdr2-be    . #x0010)
-    (:plain-cdr2-le    . #x0011)
-    (:pl-cdr2-be       . #x0012)
-    (:pl-cdr2-le       . #x0013)
-    (:delimited-cdr-be . #x0014)
-    (:delimited-cdr-le . #x0015)
-    (:xml              . #x0100))
-  "Encapsulation representation identifiers (name . 16-bit value). Source: XTypes
-   1.3 §7.4.3.4 Table 39 (ENC_HEADER); cross-checked vs RTPS 2.5 §10.3 Table 10.1.
-   Pinned from the in-repo normative specs (docs/specs), never from memory.")
+    (:xml              . #x0004)
+    (:plain-cdr2-be    . #x0006)
+    (:plain-cdr2-le    . #x0007)
+    (:delimited-cdr-be . #x0008)
+    (:delimited-cdr-le . #x0009)
+    (:pl-cdr2-be       . #x000a)
+    (:pl-cdr2-le       . #x000b))
+  "Encapsulation representation identifiers (name . 16-bit value). Source: the
+   NORMATIVE DDS-XTypes 1.3 Table 60 'RTPS encapsulation identifier' (§7.6), the
+   on-the-wire values. The §7.4 ENC_HEADER illustration lists the XCDR2 kinds as
+   0x10-0x15; that is a non-normative INCONSISTENCY in the spec — Table 60 (CDR2
+   0x06/0x07, D_CDR2 0x08/0x09, PL_CDR2 0x0a/0x0b, XML 0x04) is what every DDS wire
+   uses, confirmed against the Wireshark RTPS dissector. See docs/provenance.md.")
 
 (declaim (ftype (function (symbol) t) representation-id-value))
 (declaim (ftype (function (integer) t) representation-id-name))
@@ -29,7 +32,7 @@
 (declaim (ftype (function (dds.core.buffer:cursor) (values t integer)) parse-encapsulation-header))
 
 (defun representation-id-value (name)
-  "16-bit wire value for representation NAME (XTypes 1.3 §7.4.3.4 Table 39)."
+  "16-bit wire value for representation NAME (XTypes 1.3 §7.6 Table 60)."
   (or (cdr (assoc name +representation-ids+))
       (error 'cdr-not-implemented :what (format nil "unknown representation ~s" name))))
 

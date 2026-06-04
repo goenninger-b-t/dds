@@ -9,7 +9,7 @@ SBCL  := ./scripts/with-sbcl.sh
 LISP  ?= $(CLASP)
 
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
-        build-all test-all gate-hotpath gate-types corpus fuzz interop bench mem clean
+        build-all test-all gate-hotpath gate-types corpus fuzz wire interop bench mem clean
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -39,8 +39,12 @@ fuzz:
 	$(LISP) --eval '(ql:quickload :dds-tests :silent t)' \
 	        --eval '(handler-case (progn (dds.tests:run-pbt-tests) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
-interop:
-	@echo "interop: Connext + tshark — not yet implemented (M2, FR-IO)"
+wire:
+	./scripts/wire-check.sh
+
+interop: wire
+	@echo "interop: 'wire' validates our output vs the tshark RTPS dissector."
+	@echo "interop: bidirectional Connext interop pending a Connext install (M2, FR-IO)."
 
 bench:
 	@echo "bench: perftest-equivalent harness — not yet implemented (M5, NFR-PERF)"

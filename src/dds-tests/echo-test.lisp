@@ -110,7 +110,8 @@
           t)))))
 
 ;;; Byte-exact corpus seed (M1, P0). Values are pinned from the in-repo normative
-;;; specs (docs/specs): XTypes 1.3 §7.4.3.4 Table 39 + §7.4.3.4.2; RTPS 2.5 §10.2.
+;;; specs (docs/specs): encapsulation ids from XTypes 1.3 §7.6 Table 60 (the wire
+;;; identifier table, dissector-confirmed); EMHEADER1 from §7.4.3.4.2; RTPS 2.5 §10.2.
 ;;; This is the spec-sourced seed of FR-CDR-8; full payload byte-exactness vs. RTI
 ;;; vectors is the interop follow-up.
 
@@ -123,11 +124,12 @@
          (pool (dds.core.arena:make-buffer-pool arena 64 6)))
     (flet ((fresh (&optional (e :little))
              (dds.core.buffer:cursor (dds.core.arena:pool-acquire pool) :endianness e)))
-      ;; encapsulation header bytes (XTypes Table 39 / RTPS §10.2)
+      ;; encapsulation header bytes (XTypes 1.3 §7.6 Table 60 / RTPS §10.2),
+      ;; tshark-RTPS-dissector-confirmed: CDR2_LE=0x07, PL_CDR2_BE=0x0a.
       (let ((c (fresh)))
         (dds.cdr:make-encapsulation-header c :plain-cdr2-le)
         (%check :encap-plain-cdr2-le
-                (equal '(#x00 #x11 #x00 #x00)
+                (equal '(#x00 #x07 #x00 #x00)
                        (%first-bytes (dds.core.buffer:cursor-buffer c) 4))
                 "PLAIN_CDR2_LE header bytes")
         (%check :encap-origin (= 4 (dds.core.buffer:cursor-origin c))
@@ -135,7 +137,7 @@
       (let ((c (fresh)))
         (dds.cdr:make-encapsulation-header c :pl-cdr2-be)
         (%check :encap-pl-cdr2-be
-                (equal '(#x00 #x12 #x00 #x00)
+                (equal '(#x00 #x0a #x00 #x00)
                        (%first-bytes (dds.core.buffer:cursor-buffer c) 4))
                 "PL_CDR2_BE header bytes"))
       ;; header parse round-trip
