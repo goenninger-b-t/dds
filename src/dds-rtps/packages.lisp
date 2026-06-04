@@ -78,3 +78,28 @@
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
            #:reader-acknack #:reader-on-gap #:reader-complete-p
            #:get-writer-proxy #:writer-proxy #:writer-proxy-received))
+
+;;;; dds.rtps.discovery — SPDP Locator_t codec + SPDPdiscoveredParticipantData
+;;;; build/parse (RTPS 2.5 §8.5.3 / §9.6.2). Wire constants pinned from the in-repo
+;;;; spec (docs/specs/rtps-2_5.pdf), never memorized. CLOS-free: defstruct +
+;;;; monomorphic functions; every parser bounds-checked (NFR-SEC-POSTURE).
+
+(defpackage #:net.goenninger.dds.rtps.discovery
+  (:nicknames #:dds.rtps.discovery)
+  (:use #:common-lisp)
+  (:documentation
+   "Simple Participant Discovery Protocol (SPDP): the Locator_t codec (RTPS 2.5
+    §9.3.2.4) and SPDPdiscoveredParticipantData ParameterList build/parse (§8.5.3/
+    §9.6.2). PID values from §9.6.2.2; Duration/Locator layouts from §9.3.2.")
+  (:export #:+locator-kind-udpv4+ #:+locator-bytes+
+           #:write-locator #:read-locator #:make-ipv4-locator
+           #:spdp-data #:make-spdp-data #:spdp-data-p
+           #:spdp-data-guid-prefix #:spdp-data-version-major #:spdp-data-version-minor
+           #:spdp-data-vendor-id
+           #:spdp-data-default-unicast-kind #:spdp-data-default-unicast-port
+           #:spdp-data-default-unicast-address
+           #:spdp-data-metatraffic-unicast-kind #:spdp-data-metatraffic-unicast-port
+           #:spdp-data-metatraffic-unicast-address
+           #:spdp-data-lease-duration-seconds #:spdp-data-builtin-endpoint-set
+           #:serialize-spdp-data #:parse-spdp-data
+           #:run-discovery-test))

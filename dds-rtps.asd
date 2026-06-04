@@ -7,5 +7,6 @@
   :components ((:file "packages")
                (:file "history")
                (:file "message")
-               (:file "reliable"))
+               (:file "reliable")
+               (:file "discovery"))
   :in-order-to ((test-op (test-op "dds-tests"))))
