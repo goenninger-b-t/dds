@@ -23,21 +23,39 @@
 
 (declaim (ftype (function (list) list) %parse-member))
 (defun %parse-member (spec)
-  "Parse a member spec (SLOT DDS-TYPE &key key) into a plist of codegen facts."
+  "Parse a member spec into a codegen plist. Member type is a primitive keyword,
+   or (:sequence ELEMENT-KEYWORD) for a sequence of fixed-size primitives."
   (destructuring-bind (slot dds-type &rest opts) spec
-    (let ((row (cdr (assoc dds-type *dds-type-map*))))
-      (unless row
-        (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec))
-      (destructuring-bind (ltype default put get align size) row
-        (list :slot slot :ltype ltype :default default :put put :get get
-              :align align :var (eq size :var) :size (if (eq size :var) 0 size)
-              :key (getf opts :key))))))
+    (cond
+      ((and (consp dds-type) (eq (car dds-type) :sequence))
+       (let* ((elt (second dds-type))
+              (row (cdr (assoc elt *dds-type-map*))))
+         (unless row
+           (error "define-dds-type: unsupported sequence element ~s in ~s" elt spec))
+         (destructuring-bind (eltype default eput eget ealign esize) row
+           (declare (ignore eltype default))
+           (when (eq esize :var)
+             (error "define-dds-type: sequence of variable-size element ~s not supported in v1"
+                    elt))
+           (list :slot slot :kind :sequence :ltype 'vector :default '(vector)
+                 :elt-put eput :elt-get eget :elt-align ealign :elt-size esize
+                 :key (getf opts :key)))))
+      ((keywordp dds-type)
+       (let ((row (cdr (assoc dds-type *dds-type-map*))))
+         (unless row
+           (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec))
+         (destructuring-bind (ltype default put get align size) row
+           (list :slot slot :kind :scalar :ltype ltype :default default :put put :get get
+                 :align align :var (eq size :var) :size (if (eq size :var) 0 size)
+                 :key (getf opts :key)))))
+      (t (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec)))))
 
 (defmacro define-dds-type (name options &body members)
   "Define a DDS topic type NAME from an s-expr spec. OPTIONS is a plist (only
-   :extensibility, default :final, in v1). Each MEMBER is (slot-name dds-type
-   &key key). Emits: a defstruct, ftype-declared serialize/deserialize/
-   serialized-size monomorphic functions, and a registered type-support."
+   :extensibility, default :final, in v1). Each MEMBER is (slot-name member-type
+   &key key), where member-type is a primitive keyword or (:sequence element).
+   Emits a defstruct, ftype-declared serialize/deserialize/serialized-size
+   monomorphic functions, and a registered type-support."
   (let* ((pkg (or (symbol-package name) *package*))
          (ext (getf options :extensibility :final))
          (parsed (mapcar #'%parse-member members))
@@ -55,13 +73,20 @@
                    collect `(,(getf m :slot) ,(getf m :default) :type ,(getf m :ltype))))
          (declaim (ftype (function (,name dds.core.buffer:cursor &optional symbol) ,name) ,ser))
          (defun ,ser (sample cursor &optional (mode :xcdr2))
-           ,@(loop for m in parsed
-                   collect `(,(getf m :put) cursor (,(acc m) sample) mode))
+           ,@(loop for m in parsed collect
+                   (ecase (getf m :kind)
+                     (:scalar `(,(getf m :put) cursor (,(acc m) sample) mode))
+                     (:sequence `(dds.cdr:cdr-put-sequence
+                                  cursor (,(acc m) sample) (function ,(getf m :elt-put)) mode))))
            sample)
          (declaim (ftype (function (dds.core.buffer:cursor &optional symbol) ,name) ,des))
          (defun ,des (cursor &optional (mode :xcdr2))
-           (let ,(loop for m in parsed
-                       collect `(,(getf m :slot) (,(getf m :get) cursor mode)))
+           (let ,(loop for m in parsed collect
+                       (ecase (getf m :kind)
+                         (:scalar `(,(getf m :slot) (,(getf m :get) cursor mode)))
+                         (:sequence `(,(getf m :slot)
+                                      (dds.cdr:cdr-get-sequence
+                                       cursor (function ,(getf m :elt-get)) mode)))))
              (,ctor ,@(loop for m in parsed
                             append (list (intern (string (getf m :slot)) :keyword)
                                          (getf m :slot))))))
@@ -70,11 +95,20 @@
            (declare (ignorable sample))
            (let ((pos 0))
              (declare (type (integer 0) pos))
-             ,@(loop for m in parsed
-                     append `((setf pos (dds.cdr:cdr-size-align pos ,(getf m :align) mode))
-                              (incf pos ,(if (getf m :var)
-                                             `(+ 5 (length (,(acc m) sample)))
-                                             (getf m :size)))))
+             ,@(loop for m in parsed append
+                     (ecase (getf m :kind)
+                       (:scalar
+                        (if (getf m :var)
+                            `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
+                              (incf pos (+ 5 (length (,(acc m) sample)))))
+                            `((setf pos (dds.cdr:cdr-size-align pos ,(getf m :align) mode))
+                              (incf pos ,(getf m :size)))))
+                       (:sequence
+                        `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
+                          (incf pos 4)
+                          (loop repeat (length (,(acc m) sample))
+                                do (setf pos (dds.cdr:cdr-size-align pos ,(getf m :elt-align) mode))
+                                   (incf pos ,(getf m :elt-size)))))))
              pos))
          (dds.types:register-type
           (dds.types:make-type-support
