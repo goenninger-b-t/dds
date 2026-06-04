@@ -431,19 +431,23 @@
 ;;; comes from its E flag; octetsToNextHeader (0 = extends to the end) frames the
 ;;; next one. Bounds-checked throughout (NFR-SEC-POSTURE). ----
 
-(declaim (ftype (function (dds.core.buffer:cursor function) t) dispatch-message))
-(defun dispatch-message (cursor handler)
+(declaim (ftype (function (dds.core.buffer:cursor function &optional (integer 0)) t) dispatch-message))
+(defun dispatch-message (cursor handler &optional msg-end)
   "Parse an RTPS message; for each submessage call (HANDLER id flags cursor
    body-len) with the cursor at the body and its endianness set per the E flag.
-   Returns T on a well-formed message, NIL on bad magic / truncation."
-  (unless (parse-header cursor) (return-from dispatch-message nil))
-  (loop
-    (when (< (%remaining cursor) 4) (return t))
-    (multiple-value-bind (id flags octets le) (parse-submessage-header cursor)
-      (when (null id) (return nil))
-      (dds.core.buffer:cursor-set-endianness cursor (if le :little :big))
-      (let* ((body-start (dds.core.buffer:cursor-position cursor))
-             (body-len (if (plusp octets) octets (%remaining cursor))))
-        (when (> body-len (%remaining cursor)) (return nil))
-        (funcall handler id flags cursor body-len)
-        (dds.core.buffer:cursor-set-position cursor (+ body-start body-len))))))
+   MSG-END bounds the message (e.g. a UDP datagram size); defaults to the buffer
+   capacity. Returns T on a well-formed message, NIL on bad magic / truncation."
+  (let ((end (or msg-end
+                 (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor)))))
+    (unless (parse-header cursor) (return-from dispatch-message nil))
+    (loop
+      (when (< (- end (dds.core.buffer:cursor-position cursor)) 4) (return t))
+      (multiple-value-bind (id flags octets le) (parse-submessage-header cursor)
+        (when (null id) (return nil))
+        (dds.core.buffer:cursor-set-endianness cursor (if le :little :big))
+        (let* ((body-start (dds.core.buffer:cursor-position cursor))
+               (avail (- end body-start))
+               (body-len (if (plusp octets) octets avail)))
+          (when (> body-len avail) (return nil))
+          (funcall handler id flags cursor body-len)
+          (dds.core.buffer:cursor-set-position cursor (+ body-start body-len)))))))

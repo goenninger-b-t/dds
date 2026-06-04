@@ -8,6 +8,14 @@
 ;; LOCATOR_KIND_UDPv4 = 1 (RTPS 2.5 §9.3.2.1 IDL / §9.3.2.4).
 (defconstant +locator-kind-udpv4+ 1)
 
+;; Builtin EntityIds (RTPS 2.5 §9.3.1.3 Table 9.2): entityKey[3]+entityKind, MSB-first u32.
+(defconstant +entityid-spdp-writer+     #x000100c2) ; SPDPbuiltinParticipantWriter {{00,01,00},c2}
+(defconstant +entityid-spdp-reader+     #x000100c7) ; SPDPbuiltinParticipantReader {{00,01,00},c7}
+(defconstant +entityid-sedp-pub-writer+ #x000003c2) ; SEDPbuiltinPublicationsWriter {{00,00,03},c2}
+(defconstant +entityid-sedp-pub-reader+ #x000003c7) ; SEDPbuiltinPublicationsReader {{00,00,03},c7}
+(defconstant +entityid-sedp-sub-writer+ #x000004c2) ; SEDPbuiltinSubscriptionsWriter {{00,00,04},c2}
+(defconstant +entityid-sedp-sub-reader+ #x000004c7) ; SEDPbuiltinSubscriptionsReader {{00,00,04},c7}
+
 ;; Locator_t = {long kind; unsigned long port; octet address[16];} = 24 octets (§9.3.2.1).
 (defconstant +locator-bytes+ 24)
 

@@ -92,6 +92,9 @@
     §9.3.2.4) and SPDPdiscoveredParticipantData ParameterList build/parse (§8.5.3/
     §9.6.2). PID values from §9.6.2.2; Duration/Locator layouts from §9.3.2.")
   (:export #:+locator-kind-udpv4+ #:+locator-bytes+
+           #:+entityid-spdp-writer+ #:+entityid-spdp-reader+
+           #:+entityid-sedp-pub-writer+ #:+entityid-sedp-pub-reader+
+           #:+entityid-sedp-sub-writer+ #:+entityid-sedp-sub-reader+
            #:write-locator #:read-locator #:make-ipv4-locator
            #:spdp-data #:make-spdp-data #:spdp-data-p
            #:spdp-data-guid-prefix #:spdp-data-version-major #:spdp-data-version-minor
