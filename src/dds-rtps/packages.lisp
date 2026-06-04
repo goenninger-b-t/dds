@@ -42,7 +42,7 @@
            #:+sequence-number-unknown+ #:+seqnum-set-max-bits+
            #:write-sequence-number #:read-sequence-number
            #:write-sequence-number-set #:read-sequence-number-set
-           #:seqnum-set-bit #:seqnum-set-member-p
+           #:seqnum-set-bit #:seqnum-set-bit-p #:seqnum-set-member-p
            #:+heartbeat-flag-final+ #:+heartbeat-flag-liveliness+ #:+heartbeat-flag-group-info+
            #:+acknack-flag-final+ #:+gap-flag-group-info+ #:+gap-flag-filtered+
            #:write-heartbeat #:parse-heartbeat-body
@@ -51,3 +51,21 @@
            #:+data-flag-inline-qos+ #:+data-flag-data+ #:+data-flag-key+
            #:+data-flag-non-standard+
            #:write-data #:parse-data-body))
+
+;;;; dds.rtps.reliable — the stateful reliable writer/reader protocol logic
+;;;; (RTPS 2.5 §8.4). Value-level state machines over the HistoryCache; the
+;;;; byte/transport wiring is a later increment. CLOS-free.
+
+(defpackage #:net.goenninger.dds.rtps.reliable
+  (:nicknames #:dds.rtps.reliable)
+  (:use #:common-lisp)
+  (:documentation
+   "Stateful reliable RTPS writer + reader (RTPS 2.5 §8.4.2/§8.4.10): ReaderProxy/
+    WriterProxy, changes-for-reader, HEARTBEAT/ACKNACK/GAP-driven retransmit and
+    reordering. Verified by a lossy/reorder/dup fault-injection suite (NFR-TEST).")
+  (:export #:rtps-writer #:make-rtps-writer #:writer-write #:writer-heartbeat
+           #:writer-data-list #:writer-on-acknack #:get-reader-proxy
+           #:reader-proxy #:reader-proxy-acked-base
+           #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
+           #:reader-acknack #:reader-on-gap #:reader-complete-p
+           #:get-writer-proxy #:writer-proxy #:writer-proxy-received))

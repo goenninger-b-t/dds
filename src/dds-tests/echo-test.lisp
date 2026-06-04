@@ -186,6 +186,8 @@
                  ("rtps-submessages"         . run-rtps-submessage-test)
                  ("rtps-data"                . run-rtps-data-test)
                  ("rtps-history-cache"       . run-history-test)
+                 ("rtps-reliable-delivery"   . run-reliability-test)
+                 ("rtps-gap-handling"        . run-gap-handling-test)
                  ("property-based"           . run-pbt-tests))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))

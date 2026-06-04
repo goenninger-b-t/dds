@@ -122,6 +122,67 @@
               "remove decrements count"))
     t))
 
+;;; Reliable writer/reader: eventual delivery through a lossy/reorder/dup channel
+;;; (RTPS 2.5 §8.4; NFR-TEST reliability suite). Deterministic loss pattern that
+;;; clears by round 3, so convergence is guaranteed and the loop is bounded.
+
+(declaim (ftype (function () t) run-reliability-test))
+(defun run-reliability-test ()
+  (let* ((writer (dds.rtps.reliable:make-rtps-writer
+                  :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (reader (dds.rtps.reliable:make-rtps-reader))
+         (wid 1) (rid 2) (n 10))
+    (dotimes (i n) (dds.rtps.reliable:writer-write writer (format nil "m~d" (1+ i))))
+    (labels ((deliver (sn payload round)
+               (when (or (>= round 3) (zerop (logand 1 (+ (* sn 7) (* round 13)))))
+                 (dds.rtps.reliable:reader-on-data reader wid sn payload))))
+      ;; initial blast: reversed (reorder) + a duplicate delivery of SN 1
+      (deliver 1 "m1" 0)
+      (dolist (cell (reverse (dds.rtps.reliable:writer-data-list writer rid)))
+        (deliver (car cell) (cdr cell) 0))
+      (let ((done nil))
+        (dotimes (round 8)
+          (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
+            (declare (ignore count))
+            (dds.rtps.reliable:reader-on-heartbeat reader wid first last))
+          (when (dds.rtps.reliable:reader-complete-p reader wid) (setf done t) (return))
+          (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
+            (multiple-value-bind (resends gaps)
+                (dds.rtps.reliable:writer-on-acknack writer rid base numbits bitmap)
+              (declare (ignore gaps))
+              (dolist (cell resends) (deliver (car cell) (cdr cell) (1+ round))))))
+        (when (dds.rtps.reliable:reader-complete-p reader wid) (setf done t))
+        (%check :reliable-converged done "reliable delivery did not converge")
+        (let ((recv (dds.rtps.reliable:writer-proxy-received
+                     (dds.rtps.reliable:get-writer-proxy reader wid))))
+          (%check :reliable-all (loop for sn from 1 to n always (gethash sn recv))
+                  "reader missing SNs after convergence"))))
+    t))
+
+;;; GAP: a reader NACKing evicted samples gets a GAP for them and a resend for the
+;;; samples still in the HistoryCache (RTPS 2.5 §8.3.7.4).
+
+(declaim (ftype (function () t) run-gap-handling-test))
+(defun run-gap-handling-test ()
+  (let* ((writer (dds.rtps.reliable:make-rtps-writer
+                  :hc (dds.rtps.history:make-history-cache :keep-last 2 nil nil)))
+         (reader (dds.rtps.reliable:make-rtps-reader))
+         (wid 1) (rid 2))
+    (dotimes (i 5) (dds.rtps.reliable:writer-write writer (format nil "m~d" (1+ i))))  ; hc holds 4,5
+    (dds.rtps.reliable:reader-on-heartbeat reader wid 1 5)        ; reader still thinks [1,5] avail
+    (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
+      (%check :gap-acknack (and (= base 1) (= numbits 5)) "reader NACKs all of [1,5]")
+      (multiple-value-bind (resends gaps)
+          (dds.rtps.reliable:writer-on-acknack writer rid base numbits bitmap)
+        (%check :gap-resends (equal '(4 5) (mapcar #'car resends)) "present SNs resent")
+        (%check :gap-gaps (equal '(1 2 3) gaps) "evicted SNs gapped")
+        (dolist (cell resends) (dds.rtps.reliable:reader-on-data reader wid (car cell) (cdr cell)))
+        (dds.rtps.reliable:reader-on-gap
+         reader wid 1 4 0 (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0))
+        (%check :gap-complete (dds.rtps.reliable:reader-complete-p reader wid)
+                "reader complete after GAP(1..3) + DATA(4,5)")))
+    t))
+
 ;;; HEARTBEAT / ACKNACK / GAP submessage round-trips (RTPS 2.5 §9.4.5.7/.3/.6).
 ;;; Writes a complete submessage, re-reads the SubmessageHeader, then the body.
 

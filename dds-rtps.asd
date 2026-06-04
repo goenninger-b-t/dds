@@ -6,5 +6,6 @@
   :serial t
   :components ((:file "packages")
                (:file "history")
-               (:file "message"))
+               (:file "message")
+               (:file "reliable"))
   :in-order-to ((test-op (test-op "dds-tests"))))

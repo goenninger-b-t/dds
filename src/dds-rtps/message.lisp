@@ -171,6 +171,11 @@
     (and (<= base seqnum) (< delta numbits)
          (logbitp (- 31 (mod delta 32)) (aref bitmap (floor delta 32))))))
 
+(declaim (ftype (function ((simple-array (unsigned-byte 32) (*)) (integer 0)) t) seqnum-set-bit-p))
+(defun seqnum-set-bit-p (bitmap delta)
+  "T iff the bit for offset DELTA is set: word DELTA/32, bit (31-DELTA%32) (§9.4.2.6)."
+  (logbitp (- 31 (mod delta 32)) (aref bitmap (floor delta 32))))
+
 (declaim (ftype (function (dds.core.buffer:cursor integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum) write-sequence-number-set))
 (defun write-sequence-number-set (cursor base numbits bitmap)
   "Write a SequenceNumberSet: bitmapBase + numBits + M longs (RTPS 2.5 §9.4.2.6)."
