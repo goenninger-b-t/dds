@@ -66,6 +66,11 @@
            (type (unsigned-byte 8) value))
   (setf (aref vec index) value))
 
+(declaim (ftype (function () integer) bytes-consed))
+(defun bytes-consed ()
+  "Total bytes consed so far (sb-ext:get-bytes-consed) — the NFR-PERF-8 oracle."
+  (sb-ext:get-bytes-consed))
+
 ;;; ---- clock ----
 
 (defun monotonic-ns ()

@@ -109,3 +109,70 @@
         (dds.core.arena:pool-release pool buf)))
     (dds.core.arena:teardown-arena arena)
     t))
+
+;;; Pooled zero-alloc deserialize (NFR-PERF-8). mpoint/mline are fully fixed-size
+;;; (no strings/sequences), so deserialize-into-mline fills a loaned struct in
+;;; place with no per-sample allocation.
+
+(dds.gen:define-dds-type mpoint (:extensibility :final)
+  (x :i32)
+  (y :i32))
+
+(dds.gen:define-dds-type mline (:extensibility :final)
+  (a mpoint)
+  (b mpoint)
+  (n :i32))
+
+(declaim (ftype (function () t) run-generated-into-test))
+(defun run-generated-into-test ()
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 512 1))
+         (ts (dds.types:find-type-support "mline"))
+         (src (make-mline :a (make-mpoint :x 1 :y 2) :b (make-mpoint :x 3 :y 4) :n 5))
+         (sample (funcall (dds.types:type-support-sample-pool-alloc ts))))
+    (%check :into-loan (and sample (mline-p sample)) "sample-pool-alloc returned non-sample")
+    (let* ((buf (dds.core.arena:pool-acquire pool))
+           (wc (dds.core.buffer:cursor buf :endianness :little)))
+      (serialize-mline src wc :xcdr2)
+      (let ((rc (dds.core.buffer:cursor buf :endianness :little)))
+        (deserialize-into-mline sample rc :xcdr2))
+      (%check :into-roundtrip
+              (and (= (mpoint-x (mline-a sample)) 1) (= (mpoint-y (mline-a sample)) 2)
+                   (= (mpoint-x (mline-b sample)) 3) (= (mpoint-y (mline-b sample)) 4)
+                   (= (mline-n sample) 5))
+              "deserialize-into round-trip mismatch")
+      (dds.core.arena:pool-release pool buf))
+    (funcall (dds.types:type-support-sample-pool-free ts) sample)
+    (dds.core.arena:teardown-arena arena)
+    t))
+
+(declaim (ftype (function () t) run-mem-test))
+(defun run-mem-test ()
+  "Measured zero-alloc deserialize (NFR-PERF-8). Asserted on SBCL (exact
+   bytes-consed); on Clasp bytes-consed is 0 (documented gap) so it only smokes."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 512 1))
+         (ts (dds.types:find-type-support "mline"))
+         (src (make-mline :a (make-mpoint :x 7 :y 8) :b (make-mpoint :x 9 :y 10) :n 11))
+         (sample (funcall (dds.types:type-support-sample-pool-alloc ts)))
+         (buf (dds.core.arena:pool-acquire pool))
+         (wc (dds.core.buffer:cursor buf :endianness :little))
+         (rc (dds.core.buffer:cursor buf :endianness :little))
+         (iters 100000))
+    (serialize-mline src wc :xcdr2)
+    (deserialize-into-mline sample rc :xcdr2)        ; warm up
+    (let ((before (dds.pal:bytes-consed)))
+      (dotimes (i iters)
+        (dds.core.buffer:cursor-reset rc)
+        (deserialize-into-mline sample rc :xcdr2))
+      (let* ((delta (- (dds.pal:bytes-consed) before))
+             (per (/ (float delta) iters)))
+        (format t "~&  mem: ~d bytes over ~d deserialize-into (~,4f bytes/sample), impl=~a~%"
+                delta iters per (dds.pal:pal-impl-name))
+        (when (eq (dds.pal:pal-impl-name) :sbcl)
+          (%check :zero-alloc-deserialize (< per 1.0)
+                  (format nil "~,4f bytes/sample (expected ~~0)" per)))))
+    (funcall (dds.types:type-support-sample-pool-free ts) sample)
+    (dds.core.arena:pool-release pool buf)
+    (dds.core.arena:teardown-arena arena)
+    t))

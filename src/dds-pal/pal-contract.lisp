@@ -24,8 +24,8 @@
    #:spawn #:join #:make-lock #:with-lock #:make-condvar #:condvar-wait #:condvar-signal
    ;; clock
    #:monotonic-ns
-   ;; gc control
-   #:gc-suggest #:with-gc-inhibited
+   ;; gc control / measurement
+   #:gc-suggest #:with-gc-inhibited #:bytes-consed
    ;; optimization hints
    #:with-hot-optimizations))
 

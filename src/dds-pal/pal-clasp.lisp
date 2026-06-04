@@ -63,6 +63,12 @@
            (type (unsigned-byte 8) value))
   (setf (aref vec index) value))
 
+(declaim (ftype (function () integer) bytes-consed))
+(defun bytes-consed ()
+  "Total bytes allocated so far. Clasp/Boehm exposes no cheap exact counter here;
+   returns 0 — a documented NFR-PORT measurement gap (the mem gate runs on SBCL)."
+  0)
+
 ;;; ---- clock ----
 
 (defun monotonic-ns ()

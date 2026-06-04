@@ -11,7 +11,7 @@ LISP  ?= $(CLASP)
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz interop bench mem clean
 
-all: build-all test-all gate-hotpath gate-types
+all: build-all test-all gate-hotpath gate-types mem
 
 build:
 	$(LISP) --eval '(ql:quickload :dds :silent t)' --eval '(uiop:quit 0)'
@@ -45,7 +45,8 @@ bench:
 	@echo "bench: perftest-equivalent harness — not yet implemented (M5, NFR-PERF)"
 
 mem:
-	@echo "mem: arena high-water / no-heap-fallback assertion — not yet implemented (M4+, NFR-MEM)"
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(handler-case (progn (dds.tests:run-mem-test) (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 clean:
 	find . -name '*.fasl' -o -name '*.fasp' -o -name '*.faso' -o -name '*.fasc' | xargs -r rm -f

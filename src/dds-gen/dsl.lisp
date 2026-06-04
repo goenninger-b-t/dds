@@ -16,6 +16,10 @@
    alignment, and serialized size (:var = data-dependent). Sizes/alignment follow
    REQUIREMENTS FR-CDR-1/2; string size = 4 (length) + octets + 1 (NUL).")
 
+(defparameter *sample-pool-capacity* 64
+  "Per-type sample-pool size, pre-allocated at registration (NFR-MEM). A later
+   ADR derives this from the RESOURCE_LIMITS QoS.")
+
 (declaim (ftype (function (package &rest t) symbol) %sym))
 (defun %sym (package &rest parts)
   "Intern the concatenation of PARTS (string designators) as a symbol in PACKAGE."
@@ -55,6 +59,7 @@
                :default (list (%sym tpkg "MAKE-" (string dds-type)))
                :ser (%sym tpkg "SERIALIZE-" (string dds-type))
                :des (%sym tpkg "DESERIALIZE-" (string dds-type))
+               :des-into (%sym tpkg "DESERIALIZE-INTO-" (string dds-type))
                :ssize (%sym tpkg "%SSIZE-" (string dds-type))
                :key (getf opts :key))))
       (t (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec)))))
@@ -74,6 +79,7 @@
          (des  (%sym pkg "DESERIALIZE-" (string name)))
          (ssz  (%sym pkg "SERIALIZED-SIZE-" (string name)))
          (sszi (%sym pkg "%SSIZE-" (string name)))
+         (dnto (%sym pkg "DESERIALIZE-INTO-" (string name)))
          (tname (string-downcase (string name))))
     (unless (eq ext :final)
       (error "define-dds-type: only :final extensibility is supported in v1 (got ~s)" ext))
@@ -103,6 +109,16 @@
              (,ctor ,@(loop for m in parsed
                             append (list (intern (string (getf m :slot)) :keyword)
                                          (getf m :slot))))))
+         (declaim (ftype (function (,name dds.core.buffer:cursor &optional symbol) ,name) ,dnto))
+         (defun ,dnto (sample cursor &optional (mode :xcdr2))
+           ,@(loop for m in parsed collect
+                   (ecase (getf m :kind)
+                     (:scalar `(setf (,(acc m) sample) (,(getf m :get) cursor mode)))
+                     (:sequence `(setf (,(acc m) sample)
+                                       (dds.cdr:cdr-get-sequence
+                                        cursor (function ,(getf m :elt-get)) mode)))
+                     (:nested `(,(getf m :des-into) (,(acc m) sample) cursor mode))))
+           sample)
          (declaim (ftype (function (,name (integer 0) &optional symbol) (integer 0)) ,sszi))
          (defun ,sszi (sample pos &optional (mode :xcdr2))
            (declare (type (integer 0) pos) (ignorable sample))
@@ -126,10 +142,13 @@
          (declaim (ftype (function (,name &optional symbol) (integer 0)) ,ssz))
          (defun ,ssz (sample &optional (mode :xcdr2))
            (,sszi sample 0 mode))
-         (dds.types:register-type
-          (dds.types:make-type-support
-           :name ,tname :type-name ,tname :extensibility ,ext
-           :serialize (function ,ser)
-           :deserialize (function ,des)
-           :serialized-size (function ,ssz)))
+         (let ((%pool (dds.types:make-sample-pool (function ,ctor) ,*sample-pool-capacity*)))
+           (dds.types:register-type
+            (dds.types:make-type-support
+             :name ,tname :type-name ,tname :extensibility ,ext
+             :serialize (function ,ser)
+             :deserialize (function ,des)
+             :serialized-size (function ,ssz)
+             :sample-pool-alloc (lambda () (dds.types:sample-pool-acquire %pool))
+             :sample-pool-free (lambda (s) (dds.types:sample-pool-release %pool s)))))
          ',name))))
