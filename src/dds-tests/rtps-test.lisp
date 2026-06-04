@@ -53,6 +53,55 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+;;; HEARTBEAT / ACKNACK / GAP submessage round-trips (RTPS 2.5 §9.4.5.7/.3/.6).
+;;; Writes a complete submessage, re-reads the SubmessageHeader, then the body.
+
+(declaim (ftype (function () t) run-rtps-submessage-test))
+(defun run-rtps-submessage-test ()
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 128 1))
+         (buf (dds.core.arena:pool-acquire pool))
+         (c (dds.core.buffer:cursor buf :endianness :little))
+         (rid dds.rtps.message:+entityid-participant+)
+         (wid dds.rtps.message:+entityid-unknown+)
+         (bm (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+    (dds.rtps.message:seqnum-set-bit bm 0)            ; offset 0 (= base) in set
+    ;; HEARTBEAT: header (id 0x07, flags E|F) + body 28; octetsToNextHeader=28
+    (dds.rtps.message:write-heartbeat c rid wid 1 10 7 :final t)
+    (dds.core.buffer:cursor-reset c)
+    (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+      (%check :hb-hdr (and (= id #x07) (= flags #x03) (= octets 28) le) "HEARTBEAT header")
+      (multiple-value-bind (r w f l count fin liv) (dds.rtps.message:parse-heartbeat-body c flags)
+        (%check :hb-body
+                (and (= r rid) (= w wid) (= f 1) (= l 10) (= count 7) fin (not liv))
+                "HEARTBEAT body round-trip")))
+    ;; ACKNACK: readerSNState base=5 numBits=1 (offset 0 set), count=3, final
+    (dds.core.buffer:cursor-reset c)
+    (dds.rtps.message:write-acknack c rid wid 5 1 bm 3 :final t)
+    (dds.core.buffer:cursor-reset c)
+    (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+      (declare (ignore le))
+      (%check :an-hdr (and (= id #x06) (= octets 28)) "ACKNACK header") ; 24+4*1
+      (multiple-value-bind (r w base nb b count fin) (dds.rtps.message:parse-acknack-body c flags)
+        (%check :an-body
+                (and (= r rid) (= w wid) (= base 5) (= nb 1) (= (aref b 0) #x80000000)
+                     (= count 3) fin)
+                "ACKNACK body round-trip")))
+    ;; GAP: gapStart=2 gapList base=4 numBits=1
+    (dds.core.buffer:cursor-reset c)
+    (dds.rtps.message:write-gap c rid wid 2 4 1 bm)
+    (dds.core.buffer:cursor-reset c)
+    (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+      (declare (ignore le))
+      (%check :gap-hdr (and (= id #x08) (= octets 32)) "GAP header") ; 28+4*1
+      (multiple-value-bind (r w gstart base nb b) (dds.rtps.message:parse-gap-body c flags)
+        (%check :gap-body
+                (and (= r rid) (= w wid) (= gstart 2) (= base 4) (= nb 1) (= (aref b 0) #x80000000))
+                "GAP body round-trip")))
+    (dds.core.arena:pool-release pool buf)
+    (dds.core.arena:teardown-arena arena)
+    t))
+
 ;;; SequenceNumber + SequenceNumberSet byte-exact + exhaustive bitmap boundaries
 ;;; (RTPS 2.5 §9.3.2.10 / §9.4.2.6) — the classic off-by-one source (FR-RTPS-7, R4).
 

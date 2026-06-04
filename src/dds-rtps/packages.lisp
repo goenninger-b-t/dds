@@ -42,4 +42,9 @@
            #:+sequence-number-unknown+ #:+seqnum-set-max-bits+
            #:write-sequence-number #:read-sequence-number
            #:write-sequence-number-set #:read-sequence-number-set
-           #:seqnum-set-bit #:seqnum-set-member-p))
+           #:seqnum-set-bit #:seqnum-set-member-p
+           #:+heartbeat-flag-final+ #:+heartbeat-flag-liveliness+ #:+heartbeat-flag-group-info+
+           #:+acknack-flag-final+ #:+gap-flag-group-info+ #:+gap-flag-filtered+
+           #:write-heartbeat #:parse-heartbeat-body
+           #:write-acknack #:parse-acknack-body
+           #:write-gap #:parse-gap-body))

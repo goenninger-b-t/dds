@@ -34,6 +34,7 @@
 (declaim (ftype (function (cursor) fixnum) cursor-position))
 (declaim (ftype (function (cursor) fixnum) cursor-reset))
 (declaim (ftype (function (cursor) fixnum) cursor-set-origin))
+(declaim (ftype (function (cursor (member :little :big)) (member :little :big)) cursor-set-endianness))
 (declaim (ftype (function (cursor (integer 0)) t) %check-room))
 (declaim (ftype (function (cursor (integer 1 8)) fixnum) align))
 (declaim (ftype (function (cursor (integer 0) (integer 1 8)) (integer 0)) %put-uint))
@@ -53,13 +54,17 @@
   "Create a cursor over BUFFER at position 0, alignment origin 0."
   (%make-cursor :buffer buffer :pos 0 :origin 0 :endianness endianness))
 
-(declaim (inline cursor-position cursor-reset cursor-set-origin))
+(declaim (inline cursor-position cursor-reset cursor-set-origin cursor-set-endianness))
 (defun cursor-position (cursor) (cursor-pos cursor))
 (defun cursor-reset (cursor) (setf (cursor-pos cursor) 0 (cursor-origin cursor) 0))
 (defun cursor-set-origin (cursor)
   "Set the alignment origin to the current position. Used after writing the
    4-byte encapsulation header so CDR alignment resets per RTPS 2.5 §10.2."
   (setf (cursor-origin cursor) (cursor-pos cursor)))
+(defun cursor-set-endianness (cursor endianness)
+  "Set the cursor endianness; used by the receive loop after reading a Submessage
+   header's E flag (RTPS 2.5 §9.4.5.1.2)."
+  (setf (cursor-endianness cursor) endianness))
 
 (declaim (inline %check-room))
 (defun %check-room (cursor n)

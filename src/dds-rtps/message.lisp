@@ -197,3 +197,100 @@
       (let ((bitmap (make-array (max 1 m) :element-type '(unsigned-byte 32) :initial-element 0)))
         (dotimes (i m) (setf (aref bitmap i) (dds.core.buffer:get-u32 cursor)))
         (values base numbits bitmap)))))
+
+;;; ---- Reliability submessages (base forms): HEARTBEAT §9.4.5.7, ACKNACK
+;;; §9.4.5.3, GAP §9.4.5.6. Count is a 32-bit value (§9.4.2.13). The E flag
+;;; derives from the cursor endianness so the two stay consistent. The GroupInfo
+;;; (G) and FilteredCount (F) extensions are not emitted/parsed in v1.
+
+(defconstant +heartbeat-flag-final+      #x02)
+(defconstant +heartbeat-flag-liveliness+ #x04)
+(defconstant +heartbeat-flag-group-info+ #x08)
+(defconstant +acknack-flag-final+        #x02)
+(defconstant +gap-flag-group-info+       #x02)
+(defconstant +gap-flag-filtered+         #x04)
+
+(declaim (inline %e-flag))
+(declaim (ftype (function (dds.core.buffer:cursor) (unsigned-byte 8)) %e-flag))
+(defun %e-flag (cursor)
+  (if (eq (dds.core.buffer:cursor-endianness cursor) :little) +flag-endianness+ 0))
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer integer (unsigned-byte 32) &key (:final t) (:liveliness t)) fixnum) write-heartbeat))
+(defun write-heartbeat (cursor reader-id writer-id first-sn last-sn count &key final liveliness)
+  "Write a complete HEARTBEAT submessage (base form). RTPS 2.5 §9.4.5.7; body=28."
+  (write-submessage-header cursor +submsg-heartbeat+
+                           (logior (%e-flag cursor)
+                                   (if final +heartbeat-flag-final+ 0)
+                                   (if liveliness +heartbeat-flag-liveliness+ 0))
+                           28)
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (write-sequence-number cursor first-sn)
+  (write-sequence-number cursor last-sn)
+  (dds.core.buffer:put-u32 cursor (logand count #xFFFFFFFF))
+  (dds.core.buffer:cursor-position cursor))
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8)) t) parse-heartbeat-body))
+(defun parse-heartbeat-body (cursor flags)
+  "Parse a HEARTBEAT body after its header (base form). Returns (values reader-id
+   writer-id first-sn last-sn count final-p liveliness-p) or NIL. Cursor endianness
+   must match the E flag. RTPS 2.5 §9.4.5.7."
+  (when (< (%remaining cursor) 28) (return-from parse-heartbeat-body nil))
+  (let ((reader-id (read-entity-id cursor))
+        (writer-id (read-entity-id cursor))
+        (first-sn (read-sequence-number cursor))
+        (last-sn (read-sequence-number cursor))
+        (count (dds.core.buffer:get-u32 cursor)))
+    (values reader-id writer-id first-sn last-sn count
+            (logtest flags +heartbeat-flag-final+)
+            (logtest flags +heartbeat-flag-liveliness+))))
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32) &key (:final t)) fixnum) write-acknack))
+(defun write-acknack (cursor reader-id writer-id base numbits bitmap count &key final)
+  "Write a complete ACKNACK submessage. RTPS 2.5 §9.4.5.3; body=24+4*M."
+  (write-submessage-header cursor +submsg-acknack+
+                           (logior (%e-flag cursor) (if final +acknack-flag-final+ 0))
+                           (+ 24 (* 4 (%seqnum-set-words numbits))))
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (write-sequence-number-set cursor base numbits bitmap)
+  (dds.core.buffer:put-u32 cursor (logand count #xFFFFFFFF))
+  (dds.core.buffer:cursor-position cursor))
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8)) t) parse-acknack-body))
+(defun parse-acknack-body (cursor flags)
+  "Parse an ACKNACK body. Returns (values reader-id writer-id base numbits bitmap
+   count final-p) or NIL on short/invalid buffer. RTPS 2.5 §9.4.5.3."
+  (when (< (%remaining cursor) 8) (return-from parse-acknack-body nil))
+  (let ((reader-id (read-entity-id cursor))
+        (writer-id (read-entity-id cursor)))
+    (multiple-value-bind (base numbits bitmap) (read-sequence-number-set cursor)
+      (when (null base) (return-from parse-acknack-body nil))
+      (when (< (%remaining cursor) 4) (return-from parse-acknack-body nil))
+      (values reader-id writer-id base numbits bitmap
+              (dds.core.buffer:get-u32 cursor)
+              (logtest flags +acknack-flag-final+)))))
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum) write-gap))
+(defun write-gap (cursor reader-id writer-id gap-start base numbits bitmap)
+  "Write a complete GAP submessage (base form). RTPS 2.5 §9.4.5.6; body=28+4*M."
+  (write-submessage-header cursor +submsg-gap+ (%e-flag cursor)
+                           (+ 28 (* 4 (%seqnum-set-words numbits))))
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (write-sequence-number cursor gap-start)
+  (write-sequence-number-set cursor base numbits bitmap)
+  (dds.core.buffer:cursor-position cursor))
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8)) t) parse-gap-body))
+(defun parse-gap-body (cursor flags)
+  "Parse a GAP body (base form). Returns (values reader-id writer-id gap-start base
+   numbits bitmap) or NIL. RTPS 2.5 §9.4.5.6."
+  (declare (ignore flags))
+  (when (< (%remaining cursor) 16) (return-from parse-gap-body nil))
+  (let ((reader-id (read-entity-id cursor))
+        (writer-id (read-entity-id cursor))
+        (gap-start (read-sequence-number cursor)))
+    (multiple-value-bind (base numbits bitmap) (read-sequence-number-set cursor)
+      (when (null base) (return-from parse-gap-body nil))
+      (values reader-id writer-id gap-start base numbits bitmap))))
