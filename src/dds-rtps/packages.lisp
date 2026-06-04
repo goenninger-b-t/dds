@@ -17,3 +17,25 @@
            #:hc-add-change #:hc-remove-change #:hc-get-change
            #:hc-min-seq #:hc-max-seq #:hc-changes-for-reader
            #:history-not-implemented))
+
+;;;; dds.rtps.message is a HOT-PATH package: the submessage parser is the network
+;;;; attack surface — defstruct + monomorphic functions, no CLOS, every parser
+;;;; bounds-checked before trusting wire data (NFR-SEC-POSTURE).
+
+(defpackage #:net.goenninger.dds.rtps.message
+  (:nicknames #:dds.rtps.message)
+  (:use #:common-lisp)
+  (:documentation
+   "RTPS Message Header + Submessage framing + GUID/EntityId codec (RTPS 2.5
+    §9.4.4/§9.4.5/§9.3.1.2). All wire constants are pinned from the in-repo spec
+    (docs/specs/rtps-2_5.pdf), never memorized.")
+  (:export #:+protocol-id+ #:+protocol-version-major+ #:+protocol-version-minor+
+           #:+vendor-id-unknown+ #:*vendor-id*
+           #:+submsg-pad+ #:+submsg-acknack+ #:+submsg-heartbeat+ #:+submsg-gap+
+           #:+submsg-info-ts+ #:+submsg-info-src+ #:+submsg-info-reply-ip4+
+           #:+submsg-info-dst+ #:+submsg-info-reply+ #:+submsg-nack-frag+
+           #:+submsg-heartbeat-frag+ #:+submsg-data+ #:+submsg-data-frag+
+           #:+flag-endianness+ #:+entityid-unknown+ #:+entityid-participant+
+           #:write-header #:parse-header
+           #:write-submessage-header #:parse-submessage-header
+           #:write-entity-id #:read-entity-id))

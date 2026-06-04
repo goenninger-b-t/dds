@@ -6,7 +6,8 @@
   :serial t
   :components ((:file "packages")
                (:file "echo-test")
-               (:file "gen-test"))
+               (:file "gen-test")
+               (:file "rtps-test"))
   :perform (test-op (o c)
              (declare (ignore o c))
              (uiop:symbol-call '#:dds.tests '#:run-all-tests)))

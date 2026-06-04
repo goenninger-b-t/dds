@@ -5,5 +5,6 @@
   :pathname "src/dds-rtps"
   :serial t
   :components ((:file "packages")
-               (:file "history"))
+               (:file "history")
+               (:file "message"))
   :in-order-to ((test-op (test-op "dds-tests"))))
