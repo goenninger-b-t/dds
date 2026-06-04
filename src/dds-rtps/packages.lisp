@@ -50,7 +50,15 @@
            #:write-gap #:parse-gap-body
            #:+data-flag-inline-qos+ #:+data-flag-data+ #:+data-flag-key+
            #:+data-flag-non-standard+
-           #:write-data #:parse-data-body))
+           #:write-data #:parse-data-body
+           #:+pid-pad+ #:+pid-sentinel+ #:+pid-participant-lease-duration+
+           #:+pid-topic-name+ #:+pid-type-name+ #:+pid-protocol-version+
+           #:+pid-vendorid+ #:+pid-reliability+ #:+pid-default-unicast-locator+
+           #:+pid-metatraffic-unicast-locator+ #:+pid-participant-guid+
+           #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
+           #:write-parameter #:write-parameter-sentinel #:parse-parameter-list
+           #:spdp-multicast-port #:spdp-unicast-port
+           #:user-multicast-port #:user-unicast-port))
 
 ;;;; dds.rtps.reliable — the stateful reliable writer/reader protocol logic
 ;;;; (RTPS 2.5 §8.4). Value-level state machines over the HistoryCache; the

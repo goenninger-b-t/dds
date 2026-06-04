@@ -343,3 +343,85 @@
          (len (if (plusp octets-to-next) (- octets-to-next 20) (%remaining cursor))))
     (values reader writer sn has-payload (dds.core.buffer:cursor-position cursor)
             (if has-payload len 0) (logtest flags +data-flag-key+))))
+
+;;; ---- ParameterList (§9.4.2.11, FR-RTPS-9): a list of (parameterId, length,
+;;; value) Parameters, each 4-byte aligned, terminated by PID_SENTINEL. PID
+;;; constants from the RTPS 2.5 §9.6.2.2 table, never memorized. ----
+
+(defconstant +pid-pad+                        #x0000)
+(defconstant +pid-sentinel+                   #x0001)
+(defconstant +pid-participant-lease-duration+ #x0002)
+(defconstant +pid-topic-name+                 #x0005)
+(defconstant +pid-type-name+                  #x0007)
+(defconstant +pid-protocol-version+           #x0015)
+(defconstant +pid-vendorid+                   #x0016)
+(defconstant +pid-reliability+                #x001a)
+(defconstant +pid-default-unicast-locator+    #x0031)
+(defconstant +pid-metatraffic-unicast-locator+ #x0032)
+(defconstant +pid-participant-guid+           #x0050)
+(defconstant +pid-builtin-endpoint-set+       #x0058)
+(defconstant +pid-endpoint-guid+              #x005a)
+(defconstant +pid-key-hash+                   #x0070)
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) fixnum) write-parameter))
+(defun write-parameter (cursor pid value off len)
+  "Write one Parameter: pid + length (padded to a multiple of 4) + value +
+   padding. RTPS 2.5 §9.4.2.11; the ParameterList must start 4-byte aligned."
+  (let ((padded (* 4 (ceiling len 4))))
+    (dds.core.buffer:put-u16 cursor pid)
+    (dds.core.buffer:put-u16 cursor padded)
+    (dds.core.buffer:put-octets cursor value off len)
+    (dotimes (i (- padded len)) (dds.core.buffer:put-u8 cursor 0))
+    (dds.core.buffer:cursor-position cursor)))
+
+(declaim (ftype (function (dds.core.buffer:cursor) fixnum) write-parameter-sentinel))
+(defun write-parameter-sentinel (cursor)
+  "Write PID_SENTINEL, terminating a ParameterList (RTPS 2.5 §9.4.2.11)."
+  (dds.core.buffer:put-u16 cursor +pid-sentinel+)
+  (dds.core.buffer:put-u16 cursor 0)
+  (dds.core.buffer:cursor-position cursor))
+
+(declaim (ftype (function (dds.core.buffer:cursor function) t) parse-parameter-list))
+(defun parse-parameter-list (cursor handler)
+  "Iterate Parameters until PID_SENTINEL, calling (HANDLER pid cursor len) with the
+   cursor at the value. Returns T on clean termination, NIL on a truncated list.
+   Bounds-checked; never reads OOB (NFR-SEC-POSTURE). RTPS 2.5 §9.4.2.11."
+  (loop
+    (when (< (%remaining cursor) 4) (return nil))
+    (let ((pid (dds.core.buffer:get-u16 cursor))
+          (len (dds.core.buffer:get-u16 cursor)))
+      (when (= pid +pid-sentinel+) (return t))
+      (when (> len (%remaining cursor)) (return nil))
+      (let ((off (dds.core.buffer:cursor-position cursor)))
+        (funcall handler pid cursor len)
+        (dds.core.buffer:cursor-set-position cursor (+ off len))))))
+
+;;; ---- RTPS port mapping (§9.6.1.1): PB=7400 DG=250 PG=2 d0=0 d1=10 d2=1 d3=11 ----
+
+(defconstant +port-base+ 7400)
+(defconstant +port-domain-gain+ 250)
+(defconstant +port-participant-gain+ 2)
+(defconstant +port-d0+ 0)
+(defconstant +port-d1+ 10)
+(defconstant +port-d2+ 1)
+(defconstant +port-d3+ 11)
+
+(declaim (ftype (function ((integer 0)) (integer 0)) spdp-multicast-port))
+(defun spdp-multicast-port (domain)
+  "Discovery (SPDP) multicast port: PB + DG*domain + d0 (RTPS 2.5 §9.6.1.1)."
+  (+ +port-base+ (* +port-domain-gain+ domain) +port-d0+))
+
+(declaim (ftype (function ((integer 0) (integer 0)) (integer 0)) spdp-unicast-port))
+(defun spdp-unicast-port (domain participant-id)
+  "Discovery (SPDP) unicast port: PB + DG*domain + d1 + PG*participantId."
+  (+ +port-base+ (* +port-domain-gain+ domain) +port-d1+ (* +port-participant-gain+ participant-id)))
+
+(declaim (ftype (function ((integer 0)) (integer 0)) user-multicast-port))
+(defun user-multicast-port (domain)
+  "User-traffic multicast port: PB + DG*domain + d2 (RTPS 2.5 §9.6.1.1)."
+  (+ +port-base+ (* +port-domain-gain+ domain) +port-d2+))
+
+(declaim (ftype (function ((integer 0) (integer 0)) (integer 0)) user-unicast-port))
+(defun user-unicast-port (domain participant-id)
+  "User-traffic unicast port: PB + DG*domain + d3 + PG*participantId."
+  (+ +port-base+ (* +port-domain-gain+ domain) +port-d3+ (* +port-participant-gain+ participant-id)))

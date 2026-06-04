@@ -93,6 +93,56 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+;;; ParameterList (PID) codec byte-exact + round-trip (RTPS 2.5 §9.4.2.11) and the
+;;; RTPS port-mapping formula (§9.6.1.1).
+
+(declaim (ftype (function () t) run-paramlist-test))
+(defun run-paramlist-test ()
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 128 1))
+         (buf (dds.core.arena:pool-acquire pool))
+         (c (dds.core.buffer:cursor buf :endianness :little))
+         (val (make-array 1 :element-type '(unsigned-byte 8) :initial-contents '(#x54)))) ; "T"
+    ;; one parameter PID_TOPIC_NAME (0x0005), value "T" padded to 4, then sentinel
+    (dds.rtps.message:write-parameter c dds.rtps.message:+pid-topic-name+ val 0 1)
+    (dds.rtps.message:write-parameter-sentinel c)
+    (%check :pl-bytes
+            (equal '(#x05 #x00 #x04 #x00 #x54 #x00 #x00 #x00 #x01 #x00 #x00 #x00)
+                   (%first-bytes buf 12))
+            "ParameterList bytes (PID 0x0005 len 4 'T' + SENTINEL)")
+    ;; parse it back
+    (dds.core.buffer:cursor-reset c)
+    (let ((seen '()))
+      (let ((ok (dds.rtps.message:parse-parameter-list
+                 c (lambda (pid cur len)
+                     (push (list pid (dds.core.buffer:get-u8 cur) len) seen)))))
+        (%check :pl-parse (and ok (equal (list (list dds.rtps.message:+pid-topic-name+ #x54 4))
+                                         (nreverse seen)))
+                "ParameterList parse round-trip")))
+    ;; bounds: a 2-octet buffer cannot hold a Parameter header -> NIL
+    (let* ((b2 (dds.core.arena:make-buffer-pool arena 2 1))
+           (sb (dds.core.arena:pool-acquire b2))
+           (sc (dds.core.buffer:cursor sb :endianness :little)))
+      (%check :pl-bounds (null (dds.rtps.message:parse-parameter-list sc (lambda (p c l) (declare (ignore p c l)))))
+              "short ParameterList -> NIL"))
+    (dds.core.arena:pool-release pool buf)
+    (dds.core.arena:teardown-arena arena)
+    t))
+
+(declaim (ftype (function () t) run-port-mapping-test))
+(defun run-port-mapping-test ()
+  (%check :port-spdp-mc (and (= 7400 (dds.rtps.message:spdp-multicast-port 0))
+                             (= 7650 (dds.rtps.message:spdp-multicast-port 1)))
+          "SPDP multicast port")
+  (%check :port-spdp-uc (and (= 7410 (dds.rtps.message:spdp-unicast-port 0 0))
+                             (= 7412 (dds.rtps.message:spdp-unicast-port 0 1)))
+          "SPDP unicast port")
+  (%check :port-user-mc (= 7401 (dds.rtps.message:user-multicast-port 0)) "user multicast port")
+  (%check :port-user-uc (and (= 7411 (dds.rtps.message:user-unicast-port 0 0))
+                             (= 7413 (dds.rtps.message:user-unicast-port 0 1)))
+          "user unicast port")
+  t)
+
 ;;; HistoryCache: HISTORY (KEEP_LAST/KEEP_ALL) + RESOURCE_LIMITS (FR-RTPS-5).
 
 (declaim (ftype (function () t) run-history-test))
