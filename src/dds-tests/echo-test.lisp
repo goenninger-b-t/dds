@@ -176,7 +176,8 @@
   "Run every landed test; signal on first failure, else report and return T."
   (let ((tests '(("echo-over-mock-transport" . run-echo-test)
                  ("xcdr-codec-roundtrip"     . run-codec-roundtrip-test)
-                 ("xcdr-byte-exact-seed"     . run-byte-exact-test))))
+                 ("xcdr-byte-exact-seed"     . run-byte-exact-test)
+                 ("xcdr-generated-type"      . run-generated-type-test))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))
       (funcall (cdr test))

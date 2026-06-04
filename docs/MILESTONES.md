@@ -5,7 +5,7 @@ Exit gates are defined in `IMPLEMENTATION-PLAN.md` §4. This file tracks status.
 | Milestone | Scope | Status |
 |---|---|---|
 | **M0** | Contracts, skeleton, CI | ✅ **PASSED** — Clasp + SBCL green. **AllegroCL exception, by explicit owner command (DG1SBG), 2026-06-04** — see ADR 0004. |
-| **M1** | P0 XCDR byte-exact + real PALs | 🟡 **IN PROGRESS** — codec primitive layer landing; byte-exact corpus gated on the reference oracle (see below). |
+| **M1** | P0 XCDR byte-exact + real PALs | 🟡 **IN PROGRESS** — XCDR1/2 codec + spec-pinned encapsulation + s-expr type compiler (`define-dds-type` → defstruct + monomorphic codecs + type-support) round-tripping on Clasp+SBCL. Remaining: full RTI byte-exact vectors (oracle), pooled zero-alloc deserialize, IDL parser, sequences/nested/mutable, key-hash. |
 | M2 | P1 minimal RTPS + Connext Shapes interop | ⬜ not started |
 | M3 | P2 DCPS + QoS + conditions + content-filter | ⬜ not started |
 | M4 | P3 XTypes + TypeLookup + assignability | ⬜ not started |

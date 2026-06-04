@@ -1,6 +1,7 @@
 Req,Method,Artifact,Gate,Status,Notes
 FR-CDR-1/2/3,XCDR codec + encap header + byte-exact seed,src/dds-cdr/; dds-tests byte-exact,P0,partial,XCDR1/2 primitives+string+seq+encap header (XTypes 1.3 Table 39 / RTPS 2.5 §10.2) + EMHEADER1/DHEADER pinned; green Clasp+SBCL; full RTI byte-exact vectors pending
 FR-CDR-8,RTI reference vectors,tests/cdr/,P0,not-started,awaiting RTI-generated vectors for full payload byte-exactness
+FR-TOOL-1,s-expr type compiler round-trip,src/dds-gen/; dds-tests gen-test,P0,partial,define-dds-type -> defstruct+codecs+serialized-size+type-support (:final + primitive/string members); round-trip + vtable green Clasp+SBCL; IDL parser/sequences/nested/mutable/key-hash + pooled (zero-alloc) deserialize are later increments
 FR-LANG-1,hotpath-purity static scan,scripts/gate-hotpath.sh,all,partial,lexical gate live on 4 hot-path files; AST-aware later
 FR-LANG-8,ftype on every defun,scripts/gate-types.sh,all,done,125/125 defuns ftype-declared; gate-types green; no SBCL type warnings; Clasp+SBCL
 NFR-MEM,startup arena report + per-pool high-water,src/dds-core/arena.lisp; dds-tests echo,P4,partial,M0 arena+pool+high-water working on Clasp+SBCL; no-heap-fallback assertion in M4

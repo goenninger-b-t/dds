@@ -52,6 +52,14 @@
   "Align CURSOR to N bytes, capped by MODE's maximum alignment."
   (dds.core.buffer:align cursor (min n (%max-align mode))))
 
+(declaim (ftype (function ((integer 0) (integer 1 8) cdr-mode) (integer 0)) cdr-size-align))
+(defun cdr-size-align (pos n mode)
+  "Round POS up to the MODE-capped N-byte boundary; the size-path analogue of
+   cdr-align, used by generated serialized-size functions (FR-CDR-5)."
+  (let* ((m (min n (%max-align mode)))
+         (rem (mod pos m)))
+    (if (zerop rem) pos (+ pos (- m rem)))))
+
 ;;; unsigned integers
 (defun cdr-put-u8  (c v mode) (declare (ignore mode)) (dds.core.buffer:put-u8 c v))
 (defun cdr-get-u8  (c mode)   (declare (ignore mode)) (dds.core.buffer:get-u8 c))

@@ -15,7 +15,7 @@
            #:make-encapsulation-header #:parse-encapsulation-header
            #:cdr-not-implemented
            ;; XCDR primitive + composite codec (FR-CDR-1/2)
-           #:cdr-mode #:cdr-align
+           #:cdr-mode #:cdr-align #:cdr-size-align
            #:cdr-put-u8 #:cdr-get-u8 #:cdr-put-u16 #:cdr-get-u16
            #:cdr-put-u32 #:cdr-get-u32 #:cdr-put-u64 #:cdr-get-u64
            #:cdr-put-i8 #:cdr-get-i8 #:cdr-put-i16 #:cdr-get-i16
