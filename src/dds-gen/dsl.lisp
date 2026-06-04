@@ -24,7 +24,8 @@
 (declaim (ftype (function (list) list) %parse-member))
 (defun %parse-member (spec)
   "Parse a member spec into a codegen plist. Member type is a primitive keyword,
-   or (:sequence ELEMENT-KEYWORD) for a sequence of fixed-size primitives."
+   (:sequence ELEMENT-KEYWORD) for a sequence of fixed-size primitives, or the
+   symbol of a previously-defined dds type for a nested struct."
   (destructuring-bind (slot dds-type &rest opts) spec
     (cond
       ((and (consp dds-type) (eq (car dds-type) :sequence))
@@ -48,14 +49,23 @@
            (list :slot slot :kind :scalar :ltype ltype :default default :put put :get get
                  :align align :var (eq size :var) :size (if (eq size :var) 0 size)
                  :key (getf opts :key)))))
+      ((symbolp dds-type)            ; nested, previously-defined dds type
+       (let ((tpkg (or (symbol-package dds-type) *package*)))
+         (list :slot slot :kind :nested :ltype dds-type
+               :default (list (%sym tpkg "MAKE-" (string dds-type)))
+               :ser (%sym tpkg "SERIALIZE-" (string dds-type))
+               :des (%sym tpkg "DESERIALIZE-" (string dds-type))
+               :ssize (%sym tpkg "%SSIZE-" (string dds-type))
+               :key (getf opts :key))))
       (t (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec)))))
 
 (defmacro define-dds-type (name options &body members)
   "Define a DDS topic type NAME from an s-expr spec. OPTIONS is a plist (only
    :extensibility, default :final, in v1). Each MEMBER is (slot-name member-type
-   &key key), where member-type is a primitive keyword or (:sequence element).
-   Emits a defstruct, ftype-declared serialize/deserialize/serialized-size
-   monomorphic functions, and a registered type-support."
+   &key key), where member-type is a primitive keyword, (:sequence element), or
+   the name of a previously-defined dds type (nested struct). Emits a defstruct,
+   ftype-declared serialize/deserialize/serialized-size monomorphic functions
+   (plus an internal %ssize position-threading helper), and a type-support."
   (let* ((pkg (or (symbol-package name) *package*))
          (ext (getf options :extensibility :final))
          (parsed (mapcar #'%parse-member members))
@@ -63,6 +73,7 @@
          (ser  (%sym pkg "SERIALIZE-" (string name)))
          (des  (%sym pkg "DESERIALIZE-" (string name)))
          (ssz  (%sym pkg "SERIALIZED-SIZE-" (string name)))
+         (sszi (%sym pkg "%SSIZE-" (string name)))
          (tname (string-downcase (string name))))
     (unless (eq ext :final)
       (error "define-dds-type: only :final extensibility is supported in v1 (got ~s)" ext))
@@ -77,7 +88,8 @@
                    (ecase (getf m :kind)
                      (:scalar `(,(getf m :put) cursor (,(acc m) sample) mode))
                      (:sequence `(dds.cdr:cdr-put-sequence
-                                  cursor (,(acc m) sample) (function ,(getf m :elt-put)) mode))))
+                                  cursor (,(acc m) sample) (function ,(getf m :elt-put)) mode))
+                     (:nested `(,(getf m :ser) (,(acc m) sample) cursor mode))))
            sample)
          (declaim (ftype (function (dds.core.buffer:cursor &optional symbol) ,name) ,des))
          (defun ,des (cursor &optional (mode :xcdr2))
@@ -86,30 +98,34 @@
                          (:scalar `(,(getf m :slot) (,(getf m :get) cursor mode)))
                          (:sequence `(,(getf m :slot)
                                       (dds.cdr:cdr-get-sequence
-                                       cursor (function ,(getf m :elt-get)) mode)))))
+                                       cursor (function ,(getf m :elt-get)) mode)))
+                         (:nested `(,(getf m :slot) (,(getf m :des) cursor mode)))))
              (,ctor ,@(loop for m in parsed
                             append (list (intern (string (getf m :slot)) :keyword)
                                          (getf m :slot))))))
+         (declaim (ftype (function (,name (integer 0) &optional symbol) (integer 0)) ,sszi))
+         (defun ,sszi (sample pos &optional (mode :xcdr2))
+           (declare (type (integer 0) pos) (ignorable sample))
+           ,@(loop for m in parsed append
+                   (ecase (getf m :kind)
+                     (:scalar
+                      (if (getf m :var)
+                          `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
+                            (incf pos (+ 5 (length (,(acc m) sample)))))
+                          `((setf pos (dds.cdr:cdr-size-align pos ,(getf m :align) mode))
+                            (incf pos ,(getf m :size)))))
+                     (:sequence
+                      `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
+                        (incf pos 4)
+                        (loop repeat (length (,(acc m) sample))
+                              do (setf pos (dds.cdr:cdr-size-align pos ,(getf m :elt-align) mode))
+                                 (incf pos ,(getf m :elt-size)))))
+                     (:nested
+                      `((setf pos (,(getf m :ssize) (,(acc m) sample) pos mode))))))
+           pos)
          (declaim (ftype (function (,name &optional symbol) (integer 0)) ,ssz))
          (defun ,ssz (sample &optional (mode :xcdr2))
-           (declare (ignorable sample))
-           (let ((pos 0))
-             (declare (type (integer 0) pos))
-             ,@(loop for m in parsed append
-                     (ecase (getf m :kind)
-                       (:scalar
-                        (if (getf m :var)
-                            `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
-                              (incf pos (+ 5 (length (,(acc m) sample)))))
-                            `((setf pos (dds.cdr:cdr-size-align pos ,(getf m :align) mode))
-                              (incf pos ,(getf m :size)))))
-                       (:sequence
-                        `((setf pos (dds.cdr:cdr-size-align pos 4 mode))
-                          (incf pos 4)
-                          (loop repeat (length (,(acc m) sample))
-                                do (setf pos (dds.cdr:cdr-size-align pos ,(getf m :elt-align) mode))
-                                   (incf pos ,(getf m :elt-size)))))))
-             pos))
+           (,sszi sample 0 mode))
          (dds.types:register-type
           (dds.types:make-type-support
            :name ,tname :type-name ,tname :extensibility ,ext
