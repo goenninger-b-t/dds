@@ -1,0 +1,16 @@
+# Lisp compiled artifacts
+*.fasl
+*.fasp
+*.faso
+*.fasc
+*.fas
+*.lx64fsl
+*.o
+*.a
+
+# ASDF/Clasp caches
+.cache/
+/bench/report/*.tmp
+
+# OS noise
+.DS_Store
