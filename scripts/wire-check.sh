@@ -15,6 +15,13 @@ for c in tshark /Applications/Wireshark.app/Contents/MacOS/tshark; do
 done
 if [[ -z "$TS" ]]; then echo "wire: SKIP — tshark not found (install Wireshark to validate)"; exit 0; fi
 
+# Use a clean Wireshark config dir so the gate is immune to the user's local
+# profile (a stray ~/.config/wireshark/disabled_protos can globally disable
+# dissection — exactly the kind of environment trap that produces false failures).
+WSCFG="$(mktemp -d)"
+export WIRESHARK_CONFIG_DIR="$WSCFG"
+trap 'rm -rf "$WSCFG"' EXIT
+
 PCAP=/tmp/rtps_wire.pcap
 if ! sbcl --non-interactive --load tools/rtps-pcap.lisp >/dev/null 2>&1; then
   echo "wire: FAIL — pcap generation (tools/rtps-pcap.lisp)"; exit 1

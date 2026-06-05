@@ -28,34 +28,37 @@
                     (dds.xport.udp:make-udp-locator :host host :port port)
                     buf 0 (dds.core.buffer:cursor-position mc))))
 
-(declaim (ftype (function (dds.rtps.discovery:spdp-data) t) %usable-host))
-(defun %usable-host (p)
-  "A sendable UDPv4 dotted-quad for participant P: prefer its default-unicast
-   address, else its metatraffic address; require LOCATOR_KIND_UDPv4 and reject the
-   unspecified address 0.0.0.0 (foreign stacks advertise it as a placeholder /
-   non-routable entry). Returns the host string, or NIL if neither is usable."
-  (flet ((ok (kind addr)
-           (and (= kind dds.rtps.discovery:+locator-kind-udpv4+)
-                (let ((s (%locator-ipv4-string addr)))
-                  (and (not (string= s "0.0.0.0")) s)))))
-    (or (ok (dds.rtps.discovery:spdp-data-default-unicast-kind p)
-            (dds.rtps.discovery:spdp-data-default-unicast-address p))
-        (ok (dds.rtps.discovery:spdp-data-metatraffic-unicast-kind p)
-            (dds.rtps.discovery:spdp-data-metatraffic-unicast-address p)))))
+(declaim (ftype (function (dds.rtps.discovery:spdp-data) t) %usable-destination))
+(defun %usable-destination (p)
+  "A sendable (host . port) for user traffic to participant P, selected from its
+   advertised locator LISTS: a routable UDPv4 default-unicast locator (host+port
+   from that locator); else — if every default-unicast locator is non-routable — a
+   routable metatraffic ADDRESS paired with a default-unicast PORT (same host, user
+   port). NIL if none is usable. Foreign stacks (RTI) advertise several locators
+   including 0.0.0.0 placeholders; this picks one that can actually be reached."
+  (let* ((dlocs (dds.rtps.discovery:spdp-data-default-unicast-locators p))
+         (mlocs (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))
+         (d (dds.rtps.discovery:usable-udpv4-locator dlocs))
+         (m (dds.rtps.discovery:usable-udpv4-locator mlocs)))
+    (cond
+      (d (cons (dds.rtps.discovery:locator-ipv4-string d)
+               (%locator-port (dds.rtps.discovery:locator-port d))))
+      ((and m dlocs)
+       (cons (dds.rtps.discovery:locator-ipv4-string m)
+             (%locator-port (dds.rtps.discovery:locator-port (first dlocs)))))
+      (t nil))))
 
 (declaim (ftype (function (disc-node) list) %data-destinations))
 (defun %data-destinations (node)
   "Where to send user DATA/HEARTBEAT: the union of static PEERS and each discovered
-   participant's usable default-unicast (user-traffic) locator, deduped by
-   (host . port). Participants advertising only an unspecified/non-UDPv4 locator are
-   skipped (not crashed on). Discovery-driven routing is what lets the data plane
-   work against a foreign participant (e.g. Connext), not just hand-wired peers."
+   participant's usable user-traffic (host . port), deduped. Participants with no
+   routable UDPv4 locator are skipped (not crashed on). Discovery-driven routing is
+   what lets the data plane reach a foreign participant (e.g. Connext)."
   (let ((dests (copy-list (disc-node-peers node))))
     (dolist (p (%discovered-participants node) dests)
-      (let ((host (%usable-host p))
-            (port (%locator-port (dds.rtps.discovery:spdp-data-default-unicast-port p))))
-        (when (and host (plusp port))
-          (pushnew (cons host port) dests :test #'equal))))))
+      (let ((hp (%usable-destination p)))
+        (when (and hp (plusp (cdr hp)))
+          (pushnew hp dests :test #'equal))))))
 
 (declaim (ftype (function (disc-node) t) %push-data))
 (defun %push-data (node)
@@ -234,28 +237,29 @@
 
 (declaim (ftype (function () (eql t)) run-locator-filter-test))
 (defun run-locator-filter-test ()
-  "Foreign-participant robustness (regression for the EHOSTUNREACH crash hit against
-   RTI DDSSpy): (1) %usable-host skips an unspecified (0.0.0.0) default-unicast
-   locator, falling back to a usable metatraffic address or NIL; (2) a UDP send to
-   0.0.0.0 (which RTI advertises) is non-fatal — it must not signal."
-  (let* ((real (dds.rtps.discovery:make-ipv4-locator
-                (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(192 168 1 7))))
-         (zero (dds.rtps.discovery:make-ipv4-locator
-                (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(0 0 0 0))))
-         (p1 (dds.rtps.discovery:make-spdp-data
-              :default-unicast-kind dds.rtps.discovery:+locator-kind-udpv4+
-              :default-unicast-address zero :default-unicast-port 7411
-              :metatraffic-unicast-kind dds.rtps.discovery:+locator-kind-udpv4+
-              :metatraffic-unicast-address real :metatraffic-unicast-port 7410))
-         (p2 (dds.rtps.discovery:make-spdp-data
-              :default-unicast-kind dds.rtps.discovery:+locator-kind-udpv4+
-              :default-unicast-address zero :default-unicast-port 7411
-              :metatraffic-unicast-kind dds.rtps.discovery:+locator-kind-udpv4+
-              :metatraffic-unicast-address zero :metatraffic-unicast-port 7410)))
-    (assert (equal (%usable-host p1) "192.168.1.7") ()
-            "%usable-host must fall back to the metatraffic address when default is 0.0.0.0")
-    (assert (null (%usable-host p2)) ()
-            "all-0.0.0.0 participant must yield NIL (skipped), not a bad destination")
+  "Locator-list selection + foreign-participant robustness (regression for the
+   EHOSTUNREACH crash vs RTI DDSSpy, which advertises several locators incl.
+   0.0.0.0): %usable-destination (1) picks a routable default-unicast locator,
+   skipping a 0.0.0.0 entry; (2) falls back to a routable metatraffic ADDRESS + a
+   default-unicast PORT when every default-unicast locator is non-routable; (3)
+   yields NIL when nothing is routable; (4) a UDP send to 0.0.0.0 is non-fatal."
+  (flet ((loc (a b c d port)
+           (dds.rtps.discovery:make-locator
+            :kind dds.rtps.discovery:+locator-kind-udpv4+ :port port
+            :address (dds.rtps.discovery:make-ipv4-locator
+                      (make-array 4 :element-type '(unsigned-byte 8)
+                                  :initial-contents (list a b c d)))))
+         (sd (du mt)
+           (dds.rtps.discovery:make-spdp-data :default-unicast-locators du
+                                              :metatraffic-unicast-locators mt)))
+    (assert (equal (%usable-destination (sd (list (loc 0 0 0 0 7411) (loc 192 168 1 7 7411)) '()))
+                   '("192.168.1.7" . 7411))
+            () "must pick the routable default-unicast locator, skipping 0.0.0.0")
+    (assert (equal (%usable-destination (sd (list (loc 0 0 0 0 7411)) (list (loc 192 168 1 7 7410))))
+                   '("192.168.1.7" . 7411))
+            () "must fall back to metatraffic address + default-unicast port")
+    (assert (null (%usable-destination (sd (list (loc 0 0 0 0 7411)) (list (loc 0 0 0 0 7410)))))
+            () "all-0.0.0.0 must yield NIL, not a bad destination")
     (multiple-value-bind (tr sock) (dds.xport.udp:make-udp-transport :host "127.0.0.1" :port 0)
       (unwind-protect
            (let ((buf (dds.core.buffer:make-octet-buffer 16)))

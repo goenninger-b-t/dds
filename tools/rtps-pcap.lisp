@@ -27,8 +27,8 @@
                 (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(127 0 0 1))))
          (data (dds.rtps.discovery:make-spdp-data
                 :guid-prefix (prefix12 #x11) :version-major 2 :version-minor 5 :vendor-id #x010f
-                :default-unicast-kind 1 :default-unicast-port 7411 :default-unicast-address addr
-                :metatraffic-unicast-kind 1 :metatraffic-unicast-port 7410 :metatraffic-unicast-address addr
+                :default-unicast-locators (list (dds.rtps.discovery:make-locator :kind 1 :port 7411 :address addr))
+                :metatraffic-unicast-locators (list (dds.rtps.discovery:make-locator :kind 1 :port 7410 :address addr))
                 :lease-duration-seconds 100 :builtin-endpoint-set #x0000043f)))
     (dds.cdr:make-encapsulation-header pc :pl-cdr-le)
     (dds.rtps.discovery:serialize-spdp-data pc data)
@@ -99,13 +99,19 @@
              (le16 (v) (p8 (ldb (byte 8 0) v)) (p8 (ldb (byte 8 8) v)))
              (le32 (v) (p8 (ldb (byte 8 0) v)) (p8 (ldb (byte 8 8) v)) (p8 (ldb (byte 8 16) v)) (p8 (ldb (byte 8 24) v)))
              (be16 (v) (p8 (ldb (byte 8 8) v)) (p8 (ldb (byte 8 0) v))))
-      ;; global header: magic, ver 2.4, zone 0, sig 0, snaplen 65535, linktype 101 (DLT_RAW)
-      (le32 #xa1b2c3d4) (le16 2) (le16 4) (le32 0) (le32 0) (le32 65535) (le32 101)
+      ;; global header: magic, ver 2.4, zone 0, sig 0, snaplen 65535, linktype 1
+      ;; (LINKTYPE_ETHERNET — universally decoded; DLT_RAW proved flaky in tshark).
+      (le32 #xa1b2c3d4) (le16 2) (le16 4) (le32 0) (le32 0) (le32 65535) (le32 1)
       (dolist (pkt (reverse packets))
         (let* ((port (car pkt)) (rtps (cdr pkt))
-               (rlen (length rtps)) (ulen (+ 8 rlen)) (iplen (+ 20 ulen)))
+               (rlen (length rtps)) (ulen (+ 8 rlen)) (iplen (+ 20 ulen))
+               (caplen (+ 14 iplen)))   ; + Ethernet header
           ;; record header
-          (le32 0) (le32 0) (le32 iplen) (le32 iplen)
+          (le32 0) (le32 0) (le32 caplen) (le32 caplen)
+          ;; Ethernet II: dst MAC, src MAC (locally-administered), ethertype IPv4
+          (p8 #x02)(p8 0)(p8 0)(p8 0)(p8 0)(p8 1)
+          (p8 #x02)(p8 0)(p8 0)(p8 0)(p8 0)(p8 2)
+          (p8 #x08)(p8 0)
           ;; IPv4
           (p8 #x45) (p8 0) (be16 iplen) (be16 0) (be16 0) (p8 64) (p8 17) (be16 0)
           (p8 127)(p8 0)(p8 0)(p8 1) (p8 127)(p8 0)(p8 0)(p8 1)

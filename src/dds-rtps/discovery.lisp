@@ -53,6 +53,37 @@
     (replace address ip :start1 12 :end1 16 :start2 0 :end2 4)
     address))
 
+;;; ---- Locator_t (RTPS 2.5 §9.3.2.4). A participant advertises a LIST of locators
+;;; per traffic class (one per interface); selecting a routable one is a peer-
+;;; interop necessity (foreign stacks list non-routable / 0.0.0.0 / non-UDPv4
+;;; placeholders that must be skipped, not sent to). ----
+
+(defstruct (locator (:constructor make-locator))
+  "An RTPS Locator_t: transport KIND, PORT (u32), 16-octet ADDRESS (UDPv4 in the
+   low 4 octets). RTPS 2.5 §9.3.2.4."
+  (kind +locator-kind-udpv4+ :type (integer 0))
+  (port 0 :type (unsigned-byte 32))
+  (address (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+           :type (simple-array (unsigned-byte 8) (16))))
+
+(declaim (ftype (function (locator) string) locator-ipv4-string))
+(defun locator-ipv4-string (loc)
+  "Dotted-quad for a UDPv4 LOCATOR (IPv4 in address octets 12..15)."
+  (let ((a (locator-address loc)))
+    (format nil "~d.~d.~d.~d" (aref a 12) (aref a 13) (aref a 14) (aref a 15))))
+
+(declaim (ftype (function (locator) t) locator-usable-udpv4-p))
+(defun locator-usable-udpv4-p (loc)
+  "T iff LOC is a UDPv4 locator with a routable (non-0.0.0.0) address."
+  (and (= (locator-kind loc) +locator-kind-udpv4+)
+       (not (string= (locator-ipv4-string loc) "0.0.0.0"))))
+
+(declaim (ftype (function (list) t) usable-udpv4-locator))
+(defun usable-udpv4-locator (locators)
+  "The first routable UDPv4 LOCATOR in LOCATORS, or NIL — the locator-list selection
+   that lets the data plane reach a foreign participant advertising several."
+  (find-if #'locator-usable-udpv4-p locators))
+
 ;;; ---- SPDPdiscoveredParticipantData (RTPS 2.5 §8.5.3.2 / §9.6.2.2). A subset of
 ;;; the ParticipantBuiltinTopicData carried as a ParameterList in the SPDP DATA. ----
 
@@ -62,14 +93,8 @@
   (version-major 2 :type (unsigned-byte 8))
   (version-minor 5 :type (unsigned-byte 8))
   (vendor-id 0 :type (unsigned-byte 16))
-  (default-unicast-kind +locator-kind-udpv4+ :type (integer 0))
-  (default-unicast-port 0 :type (unsigned-byte 32))
-  (default-unicast-address (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
-                           :type (simple-array (unsigned-byte 8) (16)))
-  (metatraffic-unicast-kind +locator-kind-udpv4+ :type (integer 0))
-  (metatraffic-unicast-port 0 :type (unsigned-byte 32))
-  (metatraffic-unicast-address (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
-                               :type (simple-array (unsigned-byte 8) (16)))
+  (default-unicast-locators '() :type list)       ; list of LOCATOR (user traffic)
+  (metatraffic-unicast-locators '() :type list)   ; list of LOCATOR (discovery)
   (lease-duration-seconds 100 :type (signed-byte 32))
   (builtin-endpoint-set 0 :type (unsigned-byte 32)))
 
@@ -101,20 +126,19 @@
     (dds.core.buffer:put-u8 c (ldb (byte 8 8) (spdp-data-vendor-id data)))
     (dds.core.buffer:put-u8 c (ldb (byte 8 0) (spdp-data-vendor-id data)))
     (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-vendorid+ vec 0 2))
-  ;; PID_DEFAULT_UNICAST_LOCATOR: Locator_t (24 octets) (§9.3.2.1 / §9.6.2.2).
-  (multiple-value-bind (c vec) (%make-scratch +locator-bytes+)
-    (write-locator c (spdp-data-default-unicast-kind data)
-                   (spdp-data-default-unicast-port data)
-                   (spdp-data-default-unicast-address data))
-    (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-default-unicast-locator+
-                                      vec 0 +locator-bytes+))
-  ;; PID_METATRAFFIC_UNICAST_LOCATOR: Locator_t (24 octets) (§9.6.2.2).
-  (multiple-value-bind (c vec) (%make-scratch +locator-bytes+)
-    (write-locator c (spdp-data-metatraffic-unicast-kind data)
-                   (spdp-data-metatraffic-unicast-port data)
-                   (spdp-data-metatraffic-unicast-address data))
-    (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-metatraffic-unicast-locator+
-                                      vec 0 +locator-bytes+))
+  ;; PID_DEFAULT_UNICAST_LOCATOR x N: one Locator_t (24 octets) per list entry
+  ;; (§9.3.2.1 / §9.6.2.2). A participant may advertise several (one per interface).
+  (dolist (loc (spdp-data-default-unicast-locators data))
+    (multiple-value-bind (c vec) (%make-scratch +locator-bytes+)
+      (write-locator c (locator-kind loc) (locator-port loc) (locator-address loc))
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-default-unicast-locator+
+                                        vec 0 +locator-bytes+)))
+  ;; PID_METATRAFFIC_UNICAST_LOCATOR x N: Locator_t (24 octets) per entry (§9.6.2.2).
+  (dolist (loc (spdp-data-metatraffic-unicast-locators data))
+    (multiple-value-bind (c vec) (%make-scratch +locator-bytes+)
+      (write-locator c (locator-kind loc) (locator-port loc) (locator-address loc))
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-metatraffic-unicast-locator+
+                                        vec 0 +locator-bytes+)))
   ;; PID_PARTICIPANT_LEASE_DURATION: Duration_t {long seconds; unsigned long fraction;} (§9.3.2.3).
   (multiple-value-bind (c vec) (%make-scratch 8)
     (dds.core.buffer:put-u32 c (logand (spdp-data-lease-duration-seconds data) #xFFFFFFFF))
@@ -146,16 +170,14 @@
      (when (>= len +locator-bytes+)
        (multiple-value-bind (k p a) (read-locator cursor)
          (when k
-           (setf (spdp-data-default-unicast-kind data) (logand k #xFFFFFFFF))
-           (setf (spdp-data-default-unicast-port data) p)
-           (setf (spdp-data-default-unicast-address data) a)))))
+           (push (make-locator :kind (logand k #xFFFFFFFF) :port p :address a)
+                 (spdp-data-default-unicast-locators data))))))
     ((= pid dds.rtps.message:+pid-metatraffic-unicast-locator+)
      (when (>= len +locator-bytes+)
        (multiple-value-bind (k p a) (read-locator cursor)
          (when k
-           (setf (spdp-data-metatraffic-unicast-kind data) (logand k #xFFFFFFFF))
-           (setf (spdp-data-metatraffic-unicast-port data) p)
-           (setf (spdp-data-metatraffic-unicast-address data) a)))))
+           (push (make-locator :kind (logand k #xFFFFFFFF) :port p :address a)
+                 (spdp-data-metatraffic-unicast-locators data))))))
     ((= pid dds.rtps.message:+pid-participant-lease-duration+)
      (when (>= len 8)
        (let ((su (dds.core.buffer:get-u32 cursor)))
@@ -173,7 +195,12 @@
   (let ((data (make-spdp-data)))
     (if (dds.rtps.message:parse-parameter-list
          cursor (lambda (pid c len) (%fill-spdp-param data pid c len)))
-        data
+        (progn   ; locators were accumulated LIFO; restore advertised order
+          (setf (spdp-data-default-unicast-locators data)
+                (nreverse (spdp-data-default-unicast-locators data))
+                (spdp-data-metatraffic-unicast-locators data)
+                (nreverse (spdp-data-metatraffic-unicast-locators data)))
+          data)
         nil)))
 
 ;;; ---- Standalone round-trip + byte-exact test (no external test framework) ----
@@ -208,41 +235,46 @@
    also byte-exact-check the Locator encoding. Returns T on success (ASSERT
    signals otherwise)."
   (%check-locator-bytes)
-  (let* ((prefix (make-array 12 :element-type '(unsigned-byte 8)
-                             :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12)))
-         (du-addr (make-ipv4-locator (make-array 4 :element-type '(unsigned-byte 8)
-                                                 :initial-contents '(192 168 1 50))))
-         (mt-addr (make-ipv4-locator (%ip-127-0-0-1)))
-         (data (make-spdp-data :guid-prefix prefix
-                               :version-major 2 :version-minor 5
-                               :vendor-id #x010F
-                               :default-unicast-kind +locator-kind-udpv4+
-                               :default-unicast-port 7411
-                               :default-unicast-address du-addr
-                               :metatraffic-unicast-kind +locator-kind-udpv4+
-                               :metatraffic-unicast-port 7410
-                               :metatraffic-unicast-address mt-addr
-                               :lease-duration-seconds 30
-                               :builtin-endpoint-set #x0000043F))
-         (ob (dds.core.buffer:make-octet-buffer 512))
-         (wc (dds.core.buffer:cursor ob :endianness :little)))
-    (serialize-spdp-data wc data)
-    (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
-           (back (parse-spdp-data rc)))
-      (assert back () "parse-spdp-data returned NIL")
-      (assert (equalp (spdp-data-guid-prefix back) prefix) () "guid-prefix mismatch")
-      (assert (= (spdp-data-version-major back) 2) () "version-major mismatch")
-      (assert (= (spdp-data-version-minor back) 5) () "version-minor mismatch")
-      (assert (= (spdp-data-vendor-id back) #x010F) () "vendor-id mismatch")
-      (assert (= (spdp-data-default-unicast-kind back) +locator-kind-udpv4+) () "default kind mismatch")
-      (assert (= (spdp-data-default-unicast-port back) 7411) () "default port mismatch")
-      (assert (equalp (spdp-data-default-unicast-address back) du-addr) () "default addr mismatch")
-      (assert (= (spdp-data-metatraffic-unicast-kind back) +locator-kind-udpv4+) () "meta kind mismatch")
-      (assert (= (spdp-data-metatraffic-unicast-port back) 7410) () "meta port mismatch")
-      (assert (equalp (spdp-data-metatraffic-unicast-address back) mt-addr) () "meta addr mismatch")
-      (assert (= (spdp-data-lease-duration-seconds back) 30) () "lease mismatch")
-      (assert (= (spdp-data-builtin-endpoint-set back) #x0000043F) () "endpoint-set mismatch")
-      (values t back))))
+  (flet ((ip4 (a b c d) (make-ipv4-locator
+                         (make-array 4 :element-type '(unsigned-byte 8)
+                                     :initial-contents (list a b c d)))))
+    (let* ((prefix (make-array 12 :element-type '(unsigned-byte 8)
+                               :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12)))
+           ;; two default-unicast locators: a 0.0.0.0 placeholder then a real one
+           ;; (exactly the multi-locator shape a foreign stack advertises).
+           (du0 (make-locator :kind +locator-kind-udpv4+ :port 7411 :address (ip4 0 0 0 0)))
+           (du1 (make-locator :kind +locator-kind-udpv4+ :port 7411 :address (ip4 192 168 1 50)))
+           (mt  (make-locator :kind +locator-kind-udpv4+ :port 7410 :address (ip4 127 0 0 1)))
+           (data (make-spdp-data :guid-prefix prefix
+                                 :version-major 2 :version-minor 5 :vendor-id #x010F
+                                 :default-unicast-locators (list du0 du1)
+                                 :metatraffic-unicast-locators (list mt)
+                                 :lease-duration-seconds 30 :builtin-endpoint-set #x0000043F))
+           (ob (dds.core.buffer:make-octet-buffer 512))
+           (wc (dds.core.buffer:cursor ob :endianness :little)))
+      (serialize-spdp-data wc data)
+      (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
+             (back (parse-spdp-data rc)))
+        (assert back () "parse-spdp-data returned NIL")
+        (assert (equalp (spdp-data-guid-prefix back) prefix) () "guid-prefix mismatch")
+        (assert (= (spdp-data-version-major back) 2) () "version-major mismatch")
+        (assert (= (spdp-data-version-minor back) 5) () "version-minor mismatch")
+        (assert (= (spdp-data-vendor-id back) #x010F) () "vendor-id mismatch")
+        (let ((dlocs (spdp-data-default-unicast-locators back)))
+          (assert (= 2 (length dlocs)) () "expected 2 default-unicast locators, got ~d" (length dlocs))
+          (assert (= (locator-port (first dlocs)) 7411) () "default[0] port mismatch")
+          (assert (string= (locator-ipv4-string (first dlocs)) "0.0.0.0") () "default[0] addr (order)")
+          (assert (string= (locator-ipv4-string (second dlocs)) "192.168.1.50") () "default[1] addr (order)")
+          ;; the selection skips the 0.0.0.0 placeholder and picks the routable one
+          (assert (string= (locator-ipv4-string (usable-udpv4-locator dlocs)) "192.168.1.50")
+                  () "usable-udpv4-locator must skip 0.0.0.0"))
+        (let ((mlocs (spdp-data-metatraffic-unicast-locators back)))
+          (assert (= 1 (length mlocs)) () "expected 1 metatraffic locator")
+          (assert (= (locator-port (first mlocs)) 7410) () "metatraffic port mismatch")
+          (assert (string= (locator-ipv4-string (first mlocs)) "127.0.0.1") () "metatraffic addr mismatch"))
+        (assert (= (spdp-data-lease-duration-seconds back) 30) () "lease mismatch")
+        (assert (= (spdp-data-builtin-endpoint-set back) #x0000043F) () "endpoint-set mismatch")
+        (values t back)))))
 
 ;;;; ---- SEDP: Simple Endpoint Discovery Protocol (RTPS 2.5 §8.5.4 / §9.6.2.2).
 ;;;; DiscoveredWriterData / DiscoveredReaderData carried as a ParameterList in the

@@ -84,11 +84,6 @@
   "The bound metatraffic UDP port of NODE."
   (dds.xport.udp:udp-transport-local-port (disc-node-socket node)))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 8) (*))) string) %locator-ipv4-string))
-(defun %locator-ipv4-string (addr)
-  "Dotted-quad string for a UDPv4 Locator address (IPv4 in octets 12..15)."
-  (format nil "~d.~d.~d.~d" (aref addr 12) (aref addr 13) (aref addr 14) (aref addr 15)))
-
 (declaim (ftype (function ((unsigned-byte 32)) (unsigned-byte 16)) %locator-port))
 (defun %locator-port (p)
   "Narrow a wire Locator port (u32) to the UDP port range (u16)."
@@ -116,19 +111,17 @@
 (defun %node-spdp-data (node)
   "Build NODE's SPDPdiscoveredParticipantData: its GUID prefix + a unicast locator
    at <advertise-address>:<bound port> (default 127.0.0.1), protocol version 2.5."
-  (let ((addr (dds.rtps.discovery:make-ipv4-locator
-               (%ipv4-octets (disc-node-advertise-address node))))
-        (port (disc-node-port node)))
+  (let* ((addr (dds.rtps.discovery:make-ipv4-locator
+                (%ipv4-octets (disc-node-advertise-address node))))
+         (port (disc-node-port node))
+         (loc (dds.rtps.discovery:make-locator
+               :kind dds.rtps.discovery:+locator-kind-udpv4+ :port port :address addr)))
     (dds.rtps.discovery:make-spdp-data
      :guid-prefix (disc-node-guid-prefix node)
      :version-major 2 :version-minor 5
      :vendor-id dds.rtps.message:*vendor-id*
-     :default-unicast-kind dds.rtps.discovery:+locator-kind-udpv4+
-     :default-unicast-port port
-     :default-unicast-address addr
-     :metatraffic-unicast-kind dds.rtps.discovery:+locator-kind-udpv4+
-     :metatraffic-unicast-port port
-     :metatraffic-unicast-address addr
+     :default-unicast-locators (list loc)
+     :metatraffic-unicast-locators (list loc)
      :lease-duration-seconds 100
      :builtin-endpoint-set #x0000043F)))
 
@@ -219,18 +212,21 @@
    (SEDP subscriptions writer) to every discovered participant's metatraffic
    unicast locator (RTPS 2.5 §8.5.4)."
   (dolist (p (%discovered-participants node))
-    (let ((host (%locator-ipv4-string (dds.rtps.discovery:spdp-data-metatraffic-unicast-address p)))
-          (port (%locator-port (dds.rtps.discovery:spdp-data-metatraffic-unicast-port p))))
-      (dolist (w (disc-node-local-writers node))
-        (%send-endpoint node
-                        dds.rtps.discovery:+entityid-sedp-pub-reader+
-                        dds.rtps.discovery:+entityid-sedp-pub-writer+
-                        w host port))
-      (dolist (r (disc-node-local-readers node))
-        (%send-endpoint node
-                        dds.rtps.discovery:+entityid-sedp-sub-reader+
-                        dds.rtps.discovery:+entityid-sedp-sub-writer+
-                        r host port))))
+    (let ((loc (dds.rtps.discovery:usable-udpv4-locator
+                (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))))
+      (when loc
+        (let ((host (dds.rtps.discovery:locator-ipv4-string loc))
+              (port (%locator-port (dds.rtps.discovery:locator-port loc))))
+          (dolist (w (disc-node-local-writers node))
+            (%send-endpoint node
+                            dds.rtps.discovery:+entityid-sedp-pub-reader+
+                            dds.rtps.discovery:+entityid-sedp-pub-writer+
+                            w host port))
+          (dolist (r (disc-node-local-readers node))
+            (%send-endpoint node
+                            dds.rtps.discovery:+entityid-sedp-sub-reader+
+                            dds.rtps.discovery:+entityid-sedp-sub-writer+
+                            r host port))))))
   t)
 
 (declaim (ftype (function (disc-node dds.rtps.discovery:spdp-data) t) %record-participant))

@@ -96,13 +96,13 @@
            #:+entityid-sedp-pub-writer+ #:+entityid-sedp-pub-reader+
            #:+entityid-sedp-sub-writer+ #:+entityid-sedp-sub-reader+
            #:write-locator #:read-locator #:make-ipv4-locator
+           #:locator #:make-locator #:locator-p
+           #:locator-kind #:locator-port #:locator-address
+           #:locator-ipv4-string #:locator-usable-udpv4-p #:usable-udpv4-locator
            #:spdp-data #:make-spdp-data #:spdp-data-p
            #:spdp-data-guid-prefix #:spdp-data-version-major #:spdp-data-version-minor
            #:spdp-data-vendor-id
-           #:spdp-data-default-unicast-kind #:spdp-data-default-unicast-port
-           #:spdp-data-default-unicast-address
-           #:spdp-data-metatraffic-unicast-kind #:spdp-data-metatraffic-unicast-port
-           #:spdp-data-metatraffic-unicast-address
+           #:spdp-data-default-unicast-locators #:spdp-data-metatraffic-unicast-locators
            #:spdp-data-lease-duration-seconds #:spdp-data-builtin-endpoint-set
            #:serialize-spdp-data #:parse-spdp-data
            #:run-discovery-test
