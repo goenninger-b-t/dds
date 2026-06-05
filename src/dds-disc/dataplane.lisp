@@ -14,8 +14,10 @@
 (in-package #:dds.disc)
 
 ;; User-defined EntityIds: entityKey[3] << 8 | entityKind (RTPS 2.5 §9.3.1.2).
-(defconstant +user-writer-id+ #x00000103)   ; key 000001, kind 03 (user writer, no key)
-(defconstant +user-reader-id+ #x00000204)   ; key 000002, kind 04 (user reader, with key)
+;; ShapeType is keyed (color), so the endpoints are WITH-KEY kinds (0x02 / 0x07) —
+;; a no-key writer on a keyed topic is what RTI is fed otherwise.
+(defconstant +user-writer-id+ #x00000102)   ; key 000001, kind 02 (user writer WITH key)
+(defconstant +user-reader-id+ #x00000207)   ; key 000002, kind 07 (user reader WITH key)
 
 (declaim (ftype (function (disc-node dds.core.buffer:octet-buffer function string (unsigned-byte 16)) t) %send-msg-buf))
 (defun %send-msg-buf (node buf build-fn host port)

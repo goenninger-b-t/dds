@@ -74,9 +74,10 @@
       (dds.rtps.message:write-header mc (prefix12 #x22))
       ;; readerId = ENTITYID_UNKNOWN: a writer broadcasts to all its matched readers
       ;; (a specific readerId is filtered out by a foreign reader; RTI did exactly that).
-      (dds.rtps.message:write-data mc dds.rtps.message:+entityid-unknown+ #x00000103 7
+      ;; writerId 0x00000102 = user writer WITH key (ShapeType is keyed).
+      (dds.rtps.message:write-data mc dds.rtps.message:+entityid-unknown+ #x00000102 7
                                    (dds.core.buffer:octet-buffer-vec pl) 0 pl-len)
-      (dds.rtps.message:write-heartbeat mc dds.rtps.message:+entityid-unknown+ #x00000103 1 7 1 :final nil)
+      (dds.rtps.message:write-heartbeat mc dds.rtps.message:+entityid-unknown+ #x00000102 1 7 1 :final nil)
       (emit 7413 (dds.core.buffer:octet-buffer-vec msg) (dds.core.buffer:cursor-position mc)))))
 
 (defun build-acknack ()
@@ -87,7 +88,7 @@
     (dds.rtps.message:seqnum-set-bit bitmap 2)        ; SN base+2 = 3
     (dds.rtps.message:seqnum-set-bit bitmap 4)        ; SN base+4 = 5
     (dds.rtps.message:write-header mc (prefix12 #x22))
-    (dds.rtps.message:write-acknack mc #x00000204 #x00000103 1 6 bitmap 1 :final t)
+    (dds.rtps.message:write-acknack mc #x00000207 #x00000102 1 6 bitmap 1 :final t)
     (emit 7413 (dds.core.buffer:octet-buffer-vec msg) (dds.core.buffer:cursor-position mc))))
 
 ;;; ---- DLT_RAW pcap framing (IPv4 + UDP, checksums 0; tshark dissects regardless) ----
