@@ -203,6 +203,7 @@
                  ("spdp-discovery-over-udp"  . dds.disc:run-spdp-discovery-test)
                  ("sedp-matching-over-udp"   . dds.disc:run-sedp-discovery-test)
                  ("multicast-spdp-discovery" . dds.disc:run-mcast-discovery-test)
+                 ("foreign-locator-robust"   . dds.disc:run-locator-filter-test)
                  ("reliable-data-over-udp"   . dds.disc:run-dataplane-test)
                  ("typed-shape-over-udp"     . run-typed-dataplane-test))))
     (dolist (test tests)

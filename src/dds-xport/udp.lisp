@@ -24,12 +24,19 @@
       :max-message-size 65507
       :send (lambda (locator buffer off len)
               (declare (ignore off))
-              (dds.pal:udp-send-to socket
-                                   (dds.core.buffer:octet-buffer-vec buffer)
-                                   len
-                                   (udp-locator-host locator)
-                                   (udp-locator-port locator))
-              len)
+              ;; UDP is best-effort: a sendto failure to one destination (an
+              ;; unreachable/stale/placeholder locator, e.g. a foreign participant
+              ;; advertising 0.0.0.0 or a down interface) must NOT be fatal — drop
+              ;; the datagram; the reliable layer recovers via HEARTBEAT/ACKNACK.
+              (handler-case
+                  (progn
+                    (dds.pal:udp-send-to socket
+                                         (dds.core.buffer:octet-buffer-vec buffer)
+                                         len
+                                         (udp-locator-host locator)
+                                         (udp-locator-port locator))
+                    len)
+                (error () 0)))
       :receive-loop (lambda () (values))
       :open-receive-resource (lambda (&rest args) (declare (ignore args)) (values))
       :close (lambda () (dds.pal:udp-close socket)))
