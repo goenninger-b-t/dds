@@ -55,6 +55,31 @@ Direct invocation (e.g. bounded for scripting):
 # run-subscriber takes :domain :seconds :advertise-address
 ```
 
+## Diagnosing discovery (`make square-spy`)
+
+Before chasing data, see what the stack actually extracts from each participant's
+SPDP announcement — its advertised locator lists and the destination we resolve:
+
+```bash
+make square-spy DOMAIN=0          # prints each discovered participant, Ctrl-C to stop
+```
+
+Sample output (against another harness participant):
+
+```
+[spy] participant 4742501d2fcded0000000000
+        vendor=00.00 version=2.5 lease=100s endpoints=#x0000043F
+        default-unicast:     UDPv4 127.0.0.1:51296
+        metatraffic-unicast: UDPv4 127.0.0.1:51296
+        -> resolved data destination: 127.0.0.1:51296
+```
+
+Run it while RTI DDSSpy (or rtishapesdemo) is up: a non-UDPv4 entry shows as
+`kind=#x.. port=..`, a placeholder as `UDPv4 0.0.0.0:..`, and the resolved line
+tells you whether we found a routable address (or `NONE` — meaning RTI advertised
+only shmem/0.0.0.0 on your box, so you'd need `allow_interfaces`/UDPv4 enabled on
+the RTI side). This is the fastest way to tell *why* interop isn't flowing.
+
 ## Against RTI Shapes Demo
 
 1. Start `rtishapesdemo`, set its **domain** to match `DOMAIN` (default 0).

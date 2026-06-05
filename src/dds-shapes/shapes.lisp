@@ -124,6 +124,78 @@
           (format t "~&[pub] stopped after ~d samples (uuid=~a).~%" n uuid))))
     t))
 
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (12))) string) %hex-prefix))
+(defun %hex-prefix (prefix)
+  "Lowercase hex of a 12-octet GUID prefix."
+  (format nil "~(~{~2,'0x~}~)" (coerce prefix 'list)))
+
+(declaim (ftype (function (dds.rtps.discovery:locator) string) %fmt-locator))
+(defun %fmt-locator (loc)
+  "Human-readable locator: 'UDPv4 a.b.c.d:port', or 'kind=#xK port=P' for non-UDPv4
+   (e.g. SHMEM / UDPv6 — exactly the entries a foreign stack may also advertise)."
+  (let ((kind (dds.rtps.discovery:locator-kind loc))
+        (port (dds.rtps.discovery:locator-port loc)))
+    (if (= kind dds.rtps.discovery:+locator-kind-udpv4+)
+        (format nil "UDPv4 ~a:~d" (dds.rtps.discovery:locator-ipv4-string loc) port)
+        (format nil "kind=#x~x port=~d" kind port))))
+
+(declaim (ftype (function (list) string) %fmt-locators))
+(defun %fmt-locators (locs)
+  "Comma-separated locator list, or '(none)'."
+  (if (null locs) "(none)" (format nil "~{~a~^, ~}" (mapcar #'%fmt-locator locs))))
+
+(declaim (ftype (function (dds.rtps.discovery:spdp-data) t) %print-participant))
+(defun %print-participant (p)
+  "Print a discovered participant's advertised locators + the data destination this
+   stack resolves for it."
+  (format t "~&[spy] participant ~a~%" (%hex-prefix (dds.rtps.discovery:spdp-data-guid-prefix p)))
+  (format t "        vendor=~2,'0x.~2,'0x version=~d.~d lease=~ds endpoints=#x~8,'0x~%"
+          (ldb (byte 8 8) (dds.rtps.discovery:spdp-data-vendor-id p))
+          (ldb (byte 8 0) (dds.rtps.discovery:spdp-data-vendor-id p))
+          (dds.rtps.discovery:spdp-data-version-major p)
+          (dds.rtps.discovery:spdp-data-version-minor p)
+          (dds.rtps.discovery:spdp-data-lease-duration-seconds p)
+          (dds.rtps.discovery:spdp-data-builtin-endpoint-set p))
+  (format t "        default-unicast:     ~a~%"
+          (%fmt-locators (dds.rtps.discovery:spdp-data-default-unicast-locators p)))
+  (format t "        metatraffic-unicast: ~a~%"
+          (%fmt-locators (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p)))
+  (let ((dest (dds.disc:resolved-destination p)))
+    (format t "        -> resolved data destination: ~a~%"
+            (if dest (format nil "~a:~d" (car dest) (cdr dest))
+                "NONE (no routable UDPv4 locator advertised)"))))
+
+(declaim (ftype (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string)) t) run-spy))
+(defun run-spy (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1"))
+  "Discovery diagnostic: join multicast SPDP on DOMAIN and print every discovered
+   participant's advertised locators + the destination this stack resolves for it
+   (no reader/writer). Use it to see exactly what we extract from a foreign SPDP
+   announcement, e.g. RTI DDSSpy. SECONDS 0 = forever (Ctrl-C to stop)."
+  (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x59) :domain domain
+                                       :multicast t :advertise-address advertise-address)))
+    (dds.disc:start-node node)
+    (format t "~&[spy] watching domain ~d (multicast 239.255.0.1). Ctrl-C to stop.~%" domain)
+    (let ((seen (make-hash-table :test 'equalp)) (last 0) (start (get-internal-real-time)))
+      (unwind-protect
+           (loop
+             (let ((now (get-internal-real-time)))
+               (when (> (- now last) (round (* 1.5 internal-time-units-per-second)))
+                 (dds.disc:announce-participant node)
+                 (setf last now)))
+             (dolist (p (dds.disc:node-discovered-participants node))
+               (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix p)))
+                 (unless (gethash prefix seen)
+                   (setf (gethash prefix seen) t)
+                   (%print-participant p))))
+             (when (and (plusp seconds)
+                        (> (/ (- (get-internal-real-time) start) internal-time-units-per-second)
+                           seconds))
+               (return))
+             (sleep 0.1))
+        (dds.disc:stop-node node)
+        (format t "~&[spy] stopped; ~d participant(s) discovered.~%" (hash-table-count seen)))
+      t)))
+
 (declaim (ftype (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string)) t) run-subscriber))
 (defun run-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1"))
   "Subscribe to Square ShapeType on DOMAIN via multicast discovery and print every

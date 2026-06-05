@@ -184,6 +184,17 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for k being the hash-keys of (disc-node-samples node) collect k)))
 
+(declaim (ftype (function (disc-node) list) node-discovered-participants))
+(defun node-discovered-participants (node)
+  "Snapshot of the SPDP data for every participant NODE has discovered (diagnostic)."
+  (%discovered-participants node))
+
+(declaim (ftype (function (dds.rtps.discovery:spdp-data) t) resolved-destination))
+(defun resolved-destination (p)
+  "The (host . port) this stack would send user data to for participant P (its
+   resolved routable locator), or NIL — exactly what the data plane uses. Diagnostic."
+  (%usable-destination p))
+
 (declaim (ftype (function () (eql t)) run-dataplane-test))
 (defun run-dataplane-test ()
   "Full stack over UDP: two participants discover (SPDP) and match (SEDP), then the

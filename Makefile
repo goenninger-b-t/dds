@@ -10,7 +10,7 @@ LISP  ?= $(CLASP)
 
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
-        square-pub square-sub bench mem clean
+        square-pub square-sub square-spy bench mem clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -57,6 +57,12 @@ square-pub:
 square-sub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
+
+# Discovery diagnostic: print each discovered participant's locators + resolved dest.
+square-spy:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-spy :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
 	        --eval '(uiop:quit 0)'
 
 interop: wire
