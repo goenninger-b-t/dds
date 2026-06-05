@@ -287,15 +287,25 @@
 ;; RELIABLE_RELIABILITY_QOS = 2 (DDS-XTypes 1.3 §7.6.3.1.2; same IDL L127).
 (defconstant +reliability-reliable+ 2)
 
+;; QoS <-> on-the-wire kind mappings (DDS-XTypes 1.3 discovery IDL enum order, a
+;; big-endian long per policy). reliability is 1/2 (not 0-based); durability is 0-3.
+(declaim (ftype (function (symbol) (unsigned-byte 32)) %reliability-wire))
+(defun %reliability-wire (k) (ecase k (:best-effort +reliability-best-effort+) (:reliable +reliability-reliable+)))
+(declaim (ftype (function ((unsigned-byte 32)) symbol) %wire-reliability))
+(defun %wire-reliability (n) (if (>= n +reliability-reliable+) :reliable :best-effort))
+(declaim (ftype (function (symbol) (unsigned-byte 32)) %durability-wire))
+(defun %durability-wire (k) (ecase k (:volatile 0) (:transient-local 1) (:transient 2) (:persistent 3)))
+(declaim (ftype (function ((unsigned-byte 32)) symbol) %wire-durability))
+(defun %wire-durability (n) (case n (1 :transient-local) (2 :transient) (3 :persistent) (t :volatile)))
+
 (defstruct (endpoint-data (:constructor make-endpoint-data))
-  "DiscoveredWriterData / DiscoveredReaderData core fields (RTPS 2.5 §8.5.4 /
-   §9.6.2.2): a 16-octet GUID (12-octet participant prefix + 4-octet entity id),
-   topic + type names, and the RELIABILITY kind for RxO matching."
+  "DiscoveredWriterData / DiscoveredReaderData (RTPS 2.5 §8.5.4 / §9.6.2.2): a 16-octet
+   GUID, topic + type names, and the QoS carried for RxO matching (FR-QOS-2)."
   (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
         :type (simple-array (unsigned-byte 8) (16)))
   (topic-name "" :type string)
   (type-name "" :type string)
-  (reliability-kind +reliability-best-effort+ :type integer))
+  (qos (dds.qos:make-qos) :type dds.qos:qos))
 
 (declaim (ftype (function (dds.core.buffer:cursor endpoint-data) fixnum) serialize-endpoint-data))
 (defun serialize-endpoint-data (cursor data)
@@ -318,13 +328,16 @@
       (dds.cdr:cdr-put-string c s :xcdr1)
       (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-type-name+
                                         vec 0 (dds.core.buffer:cursor-position c))))
-  ;; PID_RELIABILITY: ReliabilityQosPolicy {long kind; Duration_t max_blocking_time;}
-  ;; = 4 + (long sec + ulong nanosec) = 12 octets (DDS-XTypes 1.3 §7.6.3.1.2, idl L131-134).
+  ;; PID_RELIABILITY (0x001a): {long kind; Duration_t max_blocking_time;} = 12 octets.
   (multiple-value-bind (c vec) (%make-scratch 12)
-    (dds.core.buffer:put-u32 c (logand (endpoint-data-reliability-kind data) #xFFFFFFFF))
+    (dds.core.buffer:put-u32 c (%reliability-wire (dds.qos:qos-reliability (endpoint-data-qos data))))
     (dds.core.buffer:put-u32 c 0)
     (dds.core.buffer:put-u32 c 0)
     (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-reliability+ vec 0 12))
+  ;; PID_DURABILITY (0x001d): {long kind;} = 4 octets (RTPS 2.5 §9.6.3.2).
+  (multiple-value-bind (c vec) (%make-scratch 4)
+    (dds.core.buffer:put-u32 c (%durability-wire (dds.qos:qos-durability (endpoint-data-qos data))))
+    (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-durability+ vec 0 4))
   (dds.rtps.message:write-parameter-sentinel cursor))
 
 (declaim (ftype (function (endpoint-data (unsigned-byte 16) dds.core.buffer:cursor (integer 0)) t) %fill-endpoint-param))
@@ -343,7 +356,12 @@
        (setf (endpoint-data-type-name data) (dds.cdr:cdr-get-string cursor :xcdr1))))
     ((= pid dds.rtps.message:+pid-reliability+)
      (when (>= len 4)
-       (setf (endpoint-data-reliability-kind data) (dds.core.buffer:get-u32 cursor)))))
+       (setf (dds.qos:qos-reliability (endpoint-data-qos data))
+             (%wire-reliability (dds.core.buffer:get-u32 cursor)))))
+    ((= pid dds.rtps.message:+pid-durability+)
+     (when (>= len 4)
+       (setf (dds.qos:qos-durability (endpoint-data-qos data))
+             (%wire-durability (dds.core.buffer:get-u32 cursor))))))
   data)
 
 (declaim (ftype (function (dds.core.buffer:cursor) t) parse-endpoint-data))
@@ -356,16 +374,17 @@
         data
         nil)))
 
-(declaim (ftype (function (endpoint-data endpoint-data) t) endpoint-match-p))
+(declaim (ftype (function (endpoint-data endpoint-data) (values boolean list)) endpoint-match-p))
 (defun endpoint-match-p (writer-data reader-data)
-  "T iff topic + type names are equal and RELIABILITY RxO is compatible: offered
-   (writer) kind >= requested (reader) kind, so a RELIABLE writer satisfies a
-   BEST_EFFORT or RELIABLE reader (FR-QOS-2; RTPS 2.5 §8.7.5.1 RxO ordering)."
-  (and (string= (endpoint-data-topic-name writer-data) (endpoint-data-topic-name reader-data))
-       (string= (endpoint-data-type-name writer-data) (endpoint-data-type-name reader-data))
-       (>= (endpoint-data-reliability-kind writer-data)
-           (endpoint-data-reliability-kind reader-data))
-       t))
+  "(values MATCH-P INCOMPATIBLE): topic + type names equal AND the offered (writer)
+   QoS is RxO-compatible with the requested (reader) QoS — the full DDS 1.4 §2.2.3
+   table via dds.qos:qos-rxo-compatible (FR-QOS-2). INCOMPATIBLE is the failing-policy
+   list (drives OFFERED/REQUESTED_INCOMPATIBLE_QOS); '(:topic-or-type) on a name
+   mismatch. The boolean first value preserves the existing (when (match-p ...)) callers."
+  (if (and (string= (endpoint-data-topic-name writer-data) (endpoint-data-topic-name reader-data))
+           (string= (endpoint-data-type-name writer-data) (endpoint-data-type-name reader-data)))
+      (dds.qos:qos-rxo-compatible (endpoint-data-qos writer-data) (endpoint-data-qos reader-data))
+      (values nil '(:topic-or-type))))
 
 (declaim (ftype (function () (simple-array (unsigned-byte 8) (16))) %sample-guid))
 (defun %sample-guid ()
@@ -379,10 +398,9 @@
    type, and reliability kind survive; then exercise the RxO matching truth table.
    Returns T on success (ASSERT signals otherwise)."
   (let* ((guid (%sample-guid))
-         (data (make-endpoint-data :guid guid
-                                   :topic-name "Square"
-                                   :type-name "ShapeType"
-                                   :reliability-kind +reliability-reliable+))
+         (data (make-endpoint-data :guid guid :topic-name "Square" :type-name "ShapeType"
+                                   :qos (dds.qos:make-qos :reliability :reliable
+                                                          :durability :transient-local)))
          (ob (dds.core.buffer:make-octet-buffer 256))
          (wc (dds.core.buffer:cursor ob :endianness :little)))
     (serialize-endpoint-data wc data)
@@ -392,17 +410,21 @@
       (assert (equalp (endpoint-data-guid back) guid) () "guid mismatch")
       (assert (string= (endpoint-data-topic-name back) "Square") () "topic-name mismatch")
       (assert (string= (endpoint-data-type-name back) "ShapeType") () "type-name mismatch")
-      (assert (= (endpoint-data-reliability-kind back) +reliability-reliable+) () "reliability mismatch")))
-  ;; Matching truth table (FR-QOS-2 RxO: offered >= requested).
-  (let ((w-rel (make-endpoint-data :topic-name "T" :type-name "Y" :reliability-kind +reliability-reliable+))
-        (w-be  (make-endpoint-data :topic-name "T" :type-name "Y" :reliability-kind +reliability-best-effort+))
-        (r-rel (make-endpoint-data :topic-name "T" :type-name "Y" :reliability-kind +reliability-reliable+))
-        (r-be  (make-endpoint-data :topic-name "T" :type-name "Y" :reliability-kind +reliability-best-effort+))
-        (r-topic (make-endpoint-data :topic-name "OTHER" :type-name "Y" :reliability-kind +reliability-best-effort+))
-        (r-type  (make-endpoint-data :topic-name "T" :type-name "OTHER" :reliability-kind +reliability-best-effort+)))
-    (assert (endpoint-match-p w-rel r-be) () "(a) RELIABLE writer + BEST_EFFORT reader should match")
-    (assert (endpoint-match-p w-rel r-rel) () "(b) RELIABLE writer + RELIABLE reader should match")
-    (assert (not (endpoint-match-p w-be r-rel)) () "(c) BEST_EFFORT writer + RELIABLE reader must not match")
-    (assert (not (endpoint-match-p w-rel r-topic)) () "(d) different topic-name must not match")
-    (assert (not (endpoint-match-p w-rel r-type)) () "(e) different type-name must not match"))
+      (assert (eq (dds.qos:qos-reliability (endpoint-data-qos back)) :reliable) () "reliability mismatch")
+      (assert (eq (dds.qos:qos-durability (endpoint-data-qos back)) :transient-local) () "durability mismatch")))
+  ;; RxO matching truth table over the wire QoS (FR-QOS-2): reliability + durability.
+  (flet ((ep (topic q) (make-endpoint-data :topic-name topic :type-name "Y" :qos q)))
+    (let ((w-rel (ep "T" (dds.qos:make-qos :reliability :reliable)))
+          (w-be  (ep "T" (dds.qos:make-qos :reliability :best-effort)))
+          (r-rel (ep "T" (dds.qos:make-qos :reliability :reliable)))
+          (r-be  (ep "T" (dds.qos:make-qos :reliability :best-effort)))
+          (r-topic (ep "OTHER" (dds.qos:make-qos)))
+          (w-vol (ep "T" (dds.qos:make-qos :durability :volatile)))
+          (r-tl  (ep "T" (dds.qos:make-qos :durability :transient-local))))
+      (assert (endpoint-match-p w-rel r-be) () "(a) RELIABLE writer + BEST_EFFORT reader should match")
+      (assert (endpoint-match-p w-rel r-rel) () "(b) RELIABLE writer + RELIABLE reader should match")
+      (assert (not (endpoint-match-p w-be r-rel)) () "(c) BEST_EFFORT writer + RELIABLE reader must not match")
+      (assert (not (endpoint-match-p w-rel r-topic)) () "(d) different topic-name must not match")
+      (assert (not (endpoint-match-p w-vol r-tl)) () "(e) VOLATILE writer + TRANSIENT_LOCAL reader must not match (durability RxO)")
+      (assert (endpoint-match-p r-tl w-vol) () "(f) TRANSIENT_LOCAL writer + VOLATILE reader should match")))
   t)

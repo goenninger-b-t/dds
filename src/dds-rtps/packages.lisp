@@ -53,7 +53,7 @@
            #:write-data #:parse-data-body
            #:+pid-pad+ #:+pid-sentinel+ #:+pid-participant-lease-duration+
            #:+pid-topic-name+ #:+pid-type-name+ #:+pid-protocol-version+
-           #:+pid-vendorid+ #:+pid-reliability+ #:+pid-default-unicast-locator+
+           #:+pid-vendorid+ #:+pid-reliability+ #:+pid-durability+ #:+pid-default-unicast-locator+
            #:+pid-metatraffic-unicast-locator+ #:+pid-participant-guid+
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
            #:write-parameter #:write-parameter-sentinel #:parse-parameter-list
@@ -109,6 +109,6 @@
            #:+reliability-best-effort+ #:+reliability-reliable+
            #:endpoint-data #:make-endpoint-data #:endpoint-data-p
            #:endpoint-data-guid #:endpoint-data-topic-name
-           #:endpoint-data-type-name #:endpoint-data-reliability-kind
+           #:endpoint-data-type-name #:endpoint-data-qos
            #:serialize-endpoint-data #:parse-endpoint-data #:endpoint-match-p
            #:run-sedp-test))

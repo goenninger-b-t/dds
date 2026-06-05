@@ -169,27 +169,36 @@
                    (dds.rtps.message:spdp-multicast-port (disc-node-domain node))))))
   t)
 
-(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8))) dds.rtps.discovery:endpoint-data) add-local-writer))
+(declaim (ftype (function (integer) dds.qos:qos) %qos-from-reliability))
+(defun %qos-from-reliability (reliability)
+  "Build a QoS from a legacy wire reliability constant (back-compat for callers that
+   pass :reliability rather than a full :qos)."
+  (dds.qos:make-qos :reliability (if (>= reliability dds.rtps.discovery:+reliability-reliable+)
+                                     :reliable :best-effort)))
+
+(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t)) dds.rtps.discovery:endpoint-data) add-local-writer))
 (defun add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
-                                   (key 1))
-  "Register a local publication (writer endpoint) on NODE; announce-endpoints
-   sends it via SEDP to discovered participants. Returns the endpoint-data."
+                                   (key 1) qos)
+  "Register a local publication (writer endpoint) on NODE with QOS (or a QoS derived
+   from the legacy :reliability constant). announce-endpoints sends it via SEDP."
   (let ((ep (dds.rtps.discovery:make-endpoint-data
              :guid (%make-endpoint-guid (disc-node-guid-prefix node) key #x03)
-             :topic-name topic :type-name type :reliability-kind reliability)))
+             :topic-name topic :type-name type
+             :qos (or qos (%qos-from-reliability reliability)))))
     (push ep (disc-node-local-writers node))
     ep))
 
-(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8))) dds.rtps.discovery:endpoint-data) add-local-reader))
+(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t)) dds.rtps.discovery:endpoint-data) add-local-reader))
 (defun add-local-reader (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-best-effort+)
-                                   (key 1))
-  "Register a local subscription (reader endpoint) on NODE; announce-endpoints
-   sends it via SEDP to discovered participants. Returns the endpoint-data."
+                                   (key 1) qos)
+  "Register a local subscription (reader endpoint) on NODE with QOS (or a QoS derived
+   from the legacy :reliability constant). announce-endpoints sends it via SEDP."
   (let ((ep (dds.rtps.discovery:make-endpoint-data
              :guid (%make-endpoint-guid (disc-node-guid-prefix node) key #x07)
-             :topic-name topic :type-name type :reliability-kind reliability)))
+             :topic-name topic :type-name type
+             :qos (or qos (%qos-from-reliability reliability)))))
     (push ep (disc-node-local-readers node))
     ep))
 

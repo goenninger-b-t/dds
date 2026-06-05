@@ -96,13 +96,6 @@
     (prog1 (funcall (dds.types:type-support-deserialize ts) rc :xcdr2)
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))
 
-(declaim (ftype (function (t) integer) %reliability-of))
-(defun %reliability-of (qos)
-  "Map a QoS RELIABILITY kind to the discovery reliability constant."
-  (ecase (dds.qos:qos-reliability qos)
-    (:reliable    dds.rtps.discovery:+reliability-reliable+)
-    (:best-effort dds.rtps.discovery:+reliability-best-effort+)))
-
 ;;; ---- DomainParticipantFactory + participant lifecycle ----
 
 (defvar *participant-counter* 0
@@ -187,7 +180,7 @@
    topic's name/type with the QoS reliability (v1: the single user writer)."
   (let ((node (dp-node (pub-participant pub))))
     (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
-                               :reliability (%reliability-of qos))
+                               :qos qos)
     (dds.disc:enable-publisher node)
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
       (push dw (pub-writers pub))
@@ -199,7 +192,7 @@
    topic's name/type with the QoS reliability (v1: the single user reader)."
   (let ((node (dp-node (sub-participant sub))))
     (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
-                               :reliability (%reliability-of qos))
+                               :qos qos)
     (dds.disc:enable-subscriber node)
     (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos :enabled t)))
       (push dr (sub-readers sub))

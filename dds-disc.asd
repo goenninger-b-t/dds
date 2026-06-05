@@ -4,7 +4,7 @@
 ;;;; records the participants it discovers from inbound SPDP (FR-DISC-1/4).
 (defsystem "dds-disc"
   :description "DDS.DISC — SPDP participant discovery wired over the UDP transport."
-  :depends-on ("dds-pal" "dds-core" "dds-cdr" "dds-rtps" "dds-xport")
+  :depends-on ("dds-pal" "dds-core" "dds-cdr" "dds-qos" "dds-rtps" "dds-xport")
   :pathname "src/dds-disc"
   :serial t
   :components ((:file "packages")

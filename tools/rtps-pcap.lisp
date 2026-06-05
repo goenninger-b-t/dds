@@ -49,7 +49,7 @@
                            :initial-contents '(#x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 0 0 1 3)))
          (ep (dds.rtps.discovery:make-endpoint-data
               :guid guid :topic-name "Square" :type-name "ShapeType"
-              :reliability-kind dds.rtps.discovery:+reliability-reliable+)))
+              :qos (dds.qos:make-qos :reliability :reliable :durability :transient-local))))
     (dds.cdr:make-encapsulation-header pc :pl-cdr-le)
     (dds.rtps.discovery:serialize-endpoint-data pc ep)
     (let* ((pl-len (dds.core.buffer:cursor-position pc))

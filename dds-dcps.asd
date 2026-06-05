@@ -4,10 +4,9 @@
 ;;;; + Requested/Offered (RxO) matching (FR-QOS-1/2).
 (defsystem "dds-dcps"
   :description "DDS.DCPS — DDS 1.4 entities + QoS (P2)."
-  :depends-on ("dds-pal" "dds-core" "dds-cdr" "dds-types" "dds-rtps" "dds-disc")
+  :depends-on ("dds-pal" "dds-core" "dds-cdr" "dds-qos" "dds-types" "dds-rtps" "dds-disc")
   :pathname "src/dds-dcps"
   :serial t
   :components ((:file "packages")
-               (:file "qos")
                (:file "entities"))
   :in-order-to ((test-op (test-op "dds-tests"))))

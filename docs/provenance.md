@@ -76,6 +76,14 @@ DDS 1.4 DCPS spec added to `docs/specs/` by the owner (`dds-1_4-dcps.pdf`,
   XTypes FR-TYPE-5**: @key members serialized big-endian, ≤16 bytes used directly
   (the >16 → MD5 path is a later increment, needs ironclad) → emitted by
   `define-dds-type` into the type-support `key-hash` slot (`src/dds-gen/dsl.lisp`).
+- **SEDP QoS PIDs** pinned from **RTPS 2.5 §9.6.3.2** (the PID table): PID_RELIABILITY
+  0x001a, PID_DURABILITY 0x001d (DEADLINE 0x0023, LATENCY_BUDGET 0x0027, LIVELINESS
+  0x001b, DESTINATION_ORDER 0x0025, OWNERSHIP 0x001f, PRESENTATION 0x0021, PARTITION
+  0x0029 are recorded for the follow-up). QoS-policy enum kind values from the
+  **DDS-XTypes 1.3 discovery builtin-topic IDL** (durability VOLATILE..PERSISTENT
+  0–3, etc.). DiscoveredWriter/ReaderData now carry reliability + durability; matching
+  uses dds.qos:qos-rxo-compatible. Confirmed against the tshark RTPS dissector
+  (PID_DURABILITY: TRANSIENT_LOCAL). → `src/dds-rtps/discovery.lisp`.
 - Still **no RTI/Fast DDS/Cyclone/OpenDDS source** consulted.
 
 ## Third-party runtime dependencies (licenses apply; not vendored yet)

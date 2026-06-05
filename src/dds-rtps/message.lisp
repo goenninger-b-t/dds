@@ -356,6 +356,7 @@
 (defconstant +pid-protocol-version+           #x0015)
 (defconstant +pid-vendorid+                   #x0016)
 (defconstant +pid-reliability+                #x001a)
+(defconstant +pid-durability+                 #x001d)  ; RTPS 2.5 §9.6.3.2
 (defconstant +pid-default-unicast-locator+    #x0031)
 (defconstant +pid-metatraffic-unicast-locator+ #x0032)
 (defconstant +pid-participant-guid+           #x0050)
