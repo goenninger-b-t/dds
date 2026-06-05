@@ -163,3 +163,45 @@
            t)
       (dds.disc:stop-node node1)
       (dds.disc:stop-node node2))))
+
+;;; DCPS entity model (M3/P2, FR-DCPS-1): the full DDS API path — participant ->
+;;; topic/publisher/subscriber -> datawriter/datareader -> write/take — over the
+;;; engine, with the generated type-support doing serialization.
+
+(dds.gen:define-dds-type dcps-msg (:extensibility :final)
+  (id :i32)
+  (text :string))
+
+(declaim (ftype (function () t) run-dcps-entity-test))
+(defun run-dcps-entity-test ()
+  "Two DomainParticipants discover via multicast; a DataWriter writes a generated
+   dcps-msg that a DataReader takes — entirely through the CLOS DCPS entity model and
+   the typed type-support codec. Proves the DDS API layer over the RTPS engine."
+  (let* ((ts (dds.types:find-type-support "dcps-msg"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "DcpsTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "DcpsTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr)))
+           (loop repeat 100
+                 until (and (plusp (dds.dcps:discovered-count p1))
+                            (plusp (dds.dcps:discovered-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :dcps-discovered (plusp (dds.dcps:discovered-count p1))
+                   "participants did not discover via DCPS/multicast")
+           (dds.dcps:write-sample dw (make-dcps-msg :id 42 :text "hello-dcps"))
+           (let ((got nil))
+             (loop repeat 150 until got
+                   do (let ((s (dds.dcps:take-samples dr))) (when s (setf got (first s))))
+                      (sleep 0.02))
+             (%check :dcps-take (and got t) "DataReader::take returned no sample over DCPS")
+             (%check :dcps-fields
+                     (and (= 42 (dcps-msg-id got)) (string= "hello-dcps" (dcps-msg-text got)))
+                     "DCPS sample fields did not survive write/take")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
