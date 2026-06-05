@@ -50,17 +50,40 @@
              (%locator-port (dds.rtps.discovery:locator-port (first dlocs)))))
       (t nil))))
 
-(declaim (ftype (function (disc-node) list) %data-destinations))
-(defun %data-destinations (node)
-  "Where to send user DATA/HEARTBEAT: the union of static PEERS and each discovered
-   participant's usable user-traffic (host . port), deduped. Participants with no
-   routable UDPv4 locator are skipped (not crashed on). Discovery-driven routing is
-   what lets the data plane reach a foreign participant (e.g. Connext)."
-  (let ((dests (copy-list (disc-node-peers node))))
-    (dolist (p (%discovered-participants node) dests)
-      (let ((hp (%usable-destination p)))
-        (when (and hp (plusp (cdr hp)))
-          (pushnew hp dests :test #'equal))))))
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (16))) t) %reader-guid-p))
+(defun %reader-guid-p (guid)
+  "T iff the GUID's entity kind is a user reader (0x04 no-key / 0x07 with-key)."
+  (let ((k (aref guid 15))) (or (= k #x04) (= k #x07))))
+
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (16))) t) %writer-guid-p))
+(defun %writer-guid-p (guid)
+  "T iff the GUID's entity kind is a user writer (0x02 with-key / 0x03 no-key)."
+  (let ((k (aref guid 15))) (or (= k #x02) (= k #x03))))
+
+(declaim (ftype (function (disc-node) list) %matched-endpoints))
+(defun %matched-endpoints (node)
+  "Snapshot of the remote endpoints matched to one of NODE's local endpoints."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (loop for v being the hash-values of (disc-node-matches node) collect v)))
+
+(declaim (ftype (function (disc-node t) list) %match-destinations))
+(defun %match-destinations (node want-readers)
+  "User-traffic (host . port) destinations gated on MATCHING: the union of static
+   PEERS and the participants holding a matched remote endpoint of the wanted kind —
+   readers (WANT-READERS t) for a writer's DATA/HEARTBEAT, writers (nil) for a
+   reader's ACKNACK. RxO-incompatible / topic-mismatched peers never match, so they
+   receive nothing (FR-QOS-2: RxO now blocks delivery, not just the match)."
+  (let ((dests (copy-list (disc-node-peers node)))
+        (parts (%discovered-participants node)))
+    (dolist (remote (%matched-endpoints node) dests)
+      (let ((guid (dds.rtps.discovery:endpoint-data-guid remote)))
+        (when (if want-readers (%reader-guid-p guid) (%writer-guid-p guid))
+          (let ((spdp (find (subseq guid 0 12) parts
+                            :key #'dds.rtps.discovery:spdp-data-guid-prefix :test #'equalp)))
+            (when spdp
+              (let ((hp (%usable-destination spdp)))
+                (when (and hp (plusp (cdr hp)))
+                  (pushnew hp dests :test #'equal))))))))))
 
 (declaim (ftype (function (disc-node) t) %push-data))
 (defun %push-data (node)
@@ -69,7 +92,7 @@
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (let ((datas (dds.rtps.reliable:writer-data-list writer +user-reader-id+)))
-        (dolist (peer (%data-destinations node))
+        (dolist (peer (%match-destinations node t))   ; DATA + HEARTBEAT -> matched readers
           (dolist (d datas)
             (let ((sn (car d)) (pl (cdr d)))
               (declare (type (simple-array (unsigned-byte 8) (*)) pl))
@@ -115,7 +138,7 @@
         (dds.rtps.reliable:reader-on-heartbeat reader wid first last)
         (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
           (let ((cnt (incf (disc-node-ack-count node))))
-            (dolist (peer (%data-destinations node))
+            (dolist (peer (%match-destinations node nil))   ; ACKNACK -> matched writers
               (%send-msg-buf node (disc-node-rx-tx-msg node)
                              (lambda (mc)
                                (dds.rtps.message:write-acknack
@@ -136,7 +159,7 @@
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
                                                +user-reader-id+ base numbits bitmap)
         (declare (ignore gaps))
-        (dolist (peer (%data-destinations node))
+        (dolist (peer (%match-destinations node t))   ; retransmit DATA -> matched readers
           (dolist (d resends)
             (let ((sn (car d)) (pl (cdr d)))
               (declare (type (simple-array (unsigned-byte 8) (*)) pl))

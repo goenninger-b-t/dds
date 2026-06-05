@@ -187,12 +187,12 @@
                 (sub (dds.dcps:create-subscriber p2))
                 (dw (dds.dcps:create-datawriter pub tw))
                 (dr (dds.dcps:create-datareader sub tr)))
-           (loop repeat 100
-                 until (and (plusp (dds.dcps:discovered-count p1))
-                            (plusp (dds.dcps:discovered-count p2)))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1))
+                            (plusp (dds.dcps:matched-count p2)))
                  do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
-           (%check :dcps-discovered (plusp (dds.dcps:discovered-count p1))
-                   "participants did not discover via DCPS/multicast")
+           (%check :dcps-matched (plusp (dds.dcps:matched-count p1))
+                   "DataWriter/DataReader did not match via DCPS")
            (dds.dcps:write-sample dw (make-dcps-msg :id 42 :text "hello-dcps"))
            (let ((got nil))
              (loop repeat 150 until got
@@ -235,7 +235,7 @@
                 (dw (dds.dcps:create-datawriter pub tw))
                 (dr (dds.dcps:create-datareader sub tr)))
            (loop repeat 100
-                 until (and (plusp (dds.dcps:discovered-count p1)) (plusp (dds.dcps:discovered-count p2)))
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
                  do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
            (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
            (dds.dcps:write-sample dw (make-shape-type :color "RED"  :x 2 :y 2 :shapesize 20))
@@ -272,10 +272,11 @@
 ;;; blocks endpoint matching even when topic+type agree. (Gating DATA delivery on the
 ;;; match — so RxO also blocks delivery, not just matching — is the immediate follow-up.)
 
-(declaim (ftype (function (t t) (integer 0)) %rxo-scenario))
+(declaim (ftype (function (t t) (values integer t)) %rxo-scenario))
 (defun %rxo-scenario (writer-qos reader-qos)
-  "Create a writer/reader pair with the given QoS on a shared topic; spin discovery
-   and return the total matched-endpoint count across both participants."
+  "Create a writer/reader pair with the given QoS on a shared topic; spin discovery,
+   write one sample, and return (values MATCHED-COUNT DATA-RECEIVED-P) — so the test
+   can assert RxO blocks both the match AND delivery."
   (let ((p1 (dds.dcps:create-participant :domain 0))
         (p2 (dds.dcps:create-participant :domain 0))
         (ts (dds.types:find-type-support "dcps-msg")))
@@ -283,24 +284,29 @@
          (let ((pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
                (tw (dds.dcps:create-topic p1 "RxoTopic" "dcps-msg" ts))
                (tr (dds.dcps:create-topic p2 "RxoTopic" "dcps-msg" ts)))
-           (dds.dcps:create-datawriter pub tw :qos writer-qos)
-           (dds.dcps:create-datareader sub tr :qos reader-qos)
-           (loop repeat 120
-                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
-                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
-           (+ (dds.dcps:matched-count p1) (dds.dcps:matched-count p2)))
+           (let ((dw (dds.dcps:create-datawriter pub tw :qos writer-qos))
+                 (dr (dds.dcps:create-datareader sub tr :qos reader-qos)))
+             (loop repeat 120
+                   until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (dds.dcps:write-sample dw (make-dcps-msg :id 1 :text "rxo"))
+             (loop repeat 60 until (plusp (dds.dcps:samples-available dr))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (values (+ (dds.dcps:matched-count p1) (dds.dcps:matched-count p2))
+                     (plusp (dds.dcps:samples-available dr)))))
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))))
 
 (declaim (ftype (function () t) run-dcps-rxo-test))
 (defun run-dcps-rxo-test ()
-  "RxO blocks matching (FR-QOS-2): compatible QoS endpoints match; a VOLATILE writer
-   vs a reader requesting TRANSIENT_LOCAL do NOT match despite agreeing on topic+type."
-  (%check :rxo-compatible
-          (plusp (%rxo-scenario (dds.qos:make-writer-qos) (dds.qos:make-reader-qos)))
-          "compatible QoS endpoints must match over the wire")
-  (%check :rxo-incompatible-durability
-          (zerop (%rxo-scenario (dds.qos:make-writer-qos :durability :volatile)
-                                (dds.qos:make-reader-qos :durability :transient-local)))
-          "durability-incompatible endpoints must not match (RxO blocks the match)")
+  "RxO blocks matching AND delivery (FR-QOS-2): a compatible writer/reader match and
+   the sample is delivered; a VOLATILE writer vs a reader requesting TRANSIENT_LOCAL
+   neither match nor deliver, despite agreeing on topic+type."
+  (multiple-value-bind (m d) (%rxo-scenario (dds.qos:make-writer-qos) (dds.qos:make-reader-qos))
+    (%check :rxo-compatible-match (plusp m) "compatible QoS endpoints must match")
+    (%check :rxo-compatible-deliver d "compatible reader must receive the sample"))
+  (multiple-value-bind (m d) (%rxo-scenario (dds.qos:make-writer-qos :durability :volatile)
+                                            (dds.qos:make-reader-qos :durability :transient-local))
+    (%check :rxo-incompatible-match (zerop m) "durability-incompatible endpoints must not match")
+    (%check :rxo-incompatible-deliver (not d) "incompatible reader must receive nothing (RxO blocks delivery)"))
   t)
