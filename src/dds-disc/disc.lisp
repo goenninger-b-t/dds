@@ -40,6 +40,7 @@
   (user-reader nil)
   (samples (make-hash-table :test 'eql) :type hash-table)
   (ack-count 0 :type integer)
+  (acks-in 0 :type integer)
   (on-data nil :type (or null function))
   (on-heartbeat nil :type (or null function))
   (on-acknack nil :type (or null function))

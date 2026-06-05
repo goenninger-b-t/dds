@@ -22,7 +22,7 @@
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:publish-sample #:node-sample-count #:node-sample #:node-sample-sns
-           #:node-discovered-participants #:resolved-destination
+           #:node-discovered-participants #:resolved-destination #:node-acks-in
            #:run-spdp-discovery-test #:run-sedp-discovery-test
            #:run-mcast-discovery-test #:run-dataplane-test
            #:run-locator-filter-test))

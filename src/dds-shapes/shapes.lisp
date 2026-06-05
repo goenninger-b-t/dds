@@ -113,10 +113,20 @@
     (let ((uuid (%make-uuid)))
       (format t "~&[pub] Square/ShapeType[~(~a~)] color=~a domain=~d uuid=~a (multicast 239.255.0.1). Ctrl-C to stop.~%"
               type color domain uuid)
-      (let ((x 50) (y 50) (dx 3) (dy 2) (period (/ 1.0 rate)) (n 0) (last 0) (seq 0))
+      (let ((x 50) (y 50) (dx 3) (dy 2) (period (/ 1.0 rate)) (n 0) (last 0) (seq 0)
+            (dests (make-hash-table :test 'equalp)))
         (unwind-protect
              (loop
                (setf last (%reannounce node last))
+               ;; report the data destination we resolve for each discovered peer
+               (dolist (p (dds.disc:node-discovered-participants node))
+                 (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix p)))
+                   (unless (gethash prefix dests)
+                     (setf (gethash prefix dests) t)
+                     (let ((d (dds.disc:resolved-destination p)))
+                       (format t "~&[pub] peer discovered -> DATA destination ~a~%"
+                               (if d (format nil "~a:~d" (car d) (cdr d))
+                                   "NONE (no routable UDPv4 locator)"))))))
                (setf x (+ x dx) y (+ y dy))
                (when (or (<= x 0) (>= x 240)) (setf dx (- dx) x (min 240 (max 0 x))))
                (when (or (<= y 0) (>= y 240)) (setf dy (- dy) y (min 240 (max 0 y))))
@@ -136,11 +146,13 @@
                                        wc :xcdr2))))))
                (incf n)
                (when (zerop (mod n 30))
-                 (format t "~&[pub] seq=~d sent (~d total); Square ~a (~d,~d)~%" seq n color x y))
+                 (format t "~&[pub] sent ~d samples; peers=~d; ACKNACKs received=~d~%"
+                         n (hash-table-count dests) (dds.disc:node-acks-in node)))
                (when (and (plusp count) (>= n count)) (return))
                (sleep period))
           (dds.disc:stop-node node)
-          (format t "~&[pub] stopped after ~d samples (uuid=~a).~%" n uuid))))
+          (format t "~&[pub] stopped after ~d samples; ACKNACKs received=~d (uuid=~a).~%"
+                  n (dds.disc:node-acks-in node) uuid))))
     t))
 
 (declaim (ftype (function ((simple-array (unsigned-byte 8) (12))) string) %hex-prefix))

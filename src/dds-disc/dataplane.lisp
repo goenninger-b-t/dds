@@ -129,6 +129,7 @@
       (dds.rtps.message:parse-acknack-body c flags)
     (declare (ignore rid count finalp))
     (when (= wid +user-writer-id+)
+      (incf (disc-node-acks-in node))   ; a matched reader (incl. RTI) acked our writer
       (multiple-value-bind (resends gaps)
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
                                                +user-reader-id+ base numbits bitmap)
@@ -194,6 +195,13 @@
   "The (host . port) this stack would send user data to for participant P (its
    resolved routable locator), or NIL — exactly what the data plane uses. Diagnostic."
   (%usable-destination p))
+
+(declaim (ftype (function (disc-node) integer) node-acks-in))
+(defun node-acks-in (node)
+  "Count of ACKNACKs received for this node's user writer — i.e. how many times a
+   matched reader (incl. a foreign one like RTI) acknowledged our data. >0 proves a
+   remote reliable reader is actually receiving our samples. Diagnostic."
+  (disc-node-acks-in node))
 
 (declaim (ftype (function () (eql t)) run-dataplane-test))
 (defun run-dataplane-test ()
