@@ -250,24 +250,31 @@
              (dolist (sn (sort (dds.disc:node-sample-sns node) #'<))
                (unless (gethash sn printed)
                  (setf (gethash sn printed) t)
-                 (ecase type
-                   (:canonical
-                    (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-shape-type)))
-                      (declare (type shape-type s))
-                      (format t "~&[sub] Square ~a x=~d y=~d size=~d~%"
-                              (shape-type-color s) (shape-type-x s)
-                              (shape-type-y s) (shape-type-shapesize s))))
-                   (:tagged
-                    (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-tagged-shape)))
-                      (declare (type tagged-shape s))
-                      (let* ((u (tagged-shape-uuid s)) (q (tagged-shape-seq s)) (exp (gethash u expected)))
-                        (when (and exp (/= q exp))
-                          (format t "~&[sub] GAP from ~a: expected seq ~d, got ~d~%" u exp q))
-                        (setf (gethash u expected) (1+ q))
-                        (format t "~&[sub] Square ~a x=~d y=~d size=~d uuid=~a seq=~d~%"
-                                (tagged-shape-color s) (tagged-shape-x s) (tagged-shape-y s)
-                                (tagged-shape-shapesize s) u q)))))
-                 (incf seen)))
+                 ;; a sample we cannot parse (wrong TYPE, foreign encoding, malformed)
+                 ;; must never crash the subscriber — skip it with a hint.
+                 (handler-case
+                     (ecase type
+                       (:canonical
+                        (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-shape-type)))
+                          (declare (type shape-type s))
+                          (format t "~&[sub] Square ~a x=~d y=~d size=~d~%"
+                                  (shape-type-color s) (shape-type-x s)
+                                  (shape-type-y s) (shape-type-shapesize s))
+                          (incf seen)))
+                       (:tagged
+                        (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-tagged-shape)))
+                          (declare (type tagged-shape s))
+                          (let* ((u (tagged-shape-uuid s)) (q (tagged-shape-seq s)) (exp (gethash u expected)))
+                            (when (and exp (/= q exp))
+                              (format t "~&[sub] GAP from ~a: expected seq ~d, got ~d~%" u exp q))
+                            (setf (gethash u expected) (1+ q))
+                            (format t "~&[sub] Square ~a x=~d y=~d size=~d uuid=~a seq=~d~%"
+                                    (tagged-shape-color s) (tagged-shape-x s) (tagged-shape-y s)
+                                    (tagged-shape-shapesize s) u q)
+                            (incf seen)))))
+                   (error (e)
+                     (format t "~&[sub] sn=~d: cannot parse as ~(~a~) (~a) — TYPE mismatch? RTI Squares are canonical: run TYPE=canonical~%"
+                             sn type (type-of e))))))
              (when (and (plusp seconds)
                         (> (/ (- (get-internal-real-time) start) internal-time-units-per-second)
                            seconds))

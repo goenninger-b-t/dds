@@ -97,13 +97,14 @@
    (lambda ()
      (let ((buf (dds.core.buffer:make-octet-buffer 65507)))
        (unwind-protect
-            (handler-case
-                (loop
-                  (multiple-value-bind (size a p)
-                      (dds.pal:udp-recv socket (dds.core.buffer:octet-buffer-vec buf) 65507)
-                    (declare (ignore a p))
-                    (funcall on-datagram buf size)))
-              (error () nil))
+            (loop
+              (let ((size (handler-case
+                              (nth-value 0 (dds.pal:udp-recv socket
+                                                             (dds.core.buffer:octet-buffer-vec buf) 65507))
+                            (error () (return)))))   ; socket closed / recv error -> exit thread
+                ;; one malformed or unexpected datagram must not kill the receiver
+                (handler-case (funcall on-datagram buf size)
+                  (error () nil))))
          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
    :name "dds-udp-rx"))
 
