@@ -72,9 +72,11 @@
            (msg (dds.core.buffer:make-octet-buffer 512))
            (mc (dds.core.buffer:cursor msg :endianness :little)))
       (dds.rtps.message:write-header mc (prefix12 #x22))
-      (dds.rtps.message:write-data mc #x00000204 #x00000103 7
+      ;; readerId = ENTITYID_UNKNOWN: a writer broadcasts to all its matched readers
+      ;; (a specific readerId is filtered out by a foreign reader; RTI did exactly that).
+      (dds.rtps.message:write-data mc dds.rtps.message:+entityid-unknown+ #x00000103 7
                                    (dds.core.buffer:octet-buffer-vec pl) 0 pl-len)
-      (dds.rtps.message:write-heartbeat mc #x00000204 #x00000103 1 7 1 :final nil)
+      (dds.rtps.message:write-heartbeat mc dds.rtps.message:+entityid-unknown+ #x00000103 1 7 1 :final nil)
       (emit 7413 (dds.core.buffer:octet-buffer-vec msg) (dds.core.buffer:cursor-position mc)))))
 
 (defun build-acknack ()

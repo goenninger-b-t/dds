@@ -74,12 +74,12 @@
               (%send-msg-buf node (disc-node-tx-msg node)
                              (lambda (mc)
                                (dds.rtps.message:write-data
-                                mc +user-reader-id+ +user-writer-id+ sn pl 0 (length pl)))
+                                mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn pl 0 (length pl)))
                              (car peer) (cdr peer))))
           (%send-msg-buf node (disc-node-tx-msg node)
                          (lambda (mc)
                            (dds.rtps.message:write-heartbeat
-                            mc +user-reader-id+ +user-writer-id+ first last count :final nil))
+                            mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ first last count :final nil))
                          (car peer) (cdr peer)))))))
 
 (declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (*))) (eql t)) publish-sample))
@@ -140,7 +140,7 @@
               (%send-msg-buf node (disc-node-rx-tx-msg node)
                              (lambda (mc)
                                (dds.rtps.message:write-data
-                                mc +user-reader-id+ +user-writer-id+ sn pl 0 (length pl)))
+                                mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn pl 0 (length pl)))
                              (car peer) (cdr peer))))))))
   t)
 
