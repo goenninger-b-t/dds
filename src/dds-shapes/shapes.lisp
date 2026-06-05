@@ -7,14 +7,33 @@
 
 (in-package #:dds.shapes)
 
-;; The canonical OMG Shapes type. color is the @key (string<128>); the demo tools
-;; use it to distinguish instances. :final extensibility => PLAIN_CDR/PLAIN_CDR2
-;; (no DHEADER), and with only 32-bit members the XCDR1 and XCDR2 bytes coincide.
+;; The Shapes type, EXTENDED with a per-publisher UUID + a per-sample sequence
+;; number (uuid identifies the source stream; seq orders it / exposes loss). NOTE:
+;; the two trailing fields make this DIVERGE from RTI's canonical ShapeType — it
+;; interops harness<->harness, but a stock rtishapesdemo Square reader would reject
+;; the type (extra members) unless RTI registers a matching IDL. color is the @key.
+;; :final + only 32-bit/string members => XCDR1 and XCDR2 bytes coincide (no DHEADER).
 (dds.gen:define-dds-type shape-type (:extensibility :final)
   (color :string :key t)
   (x :i32)
   (y :i32)
-  (shapesize :i32))
+  (shapesize :i32)
+  (uuid :string)
+  (seq :u32))
+
+(declaim (ftype (function () string) %make-uuid))
+(defun %make-uuid ()
+  "A random RFC-4122 v4 UUID string identifying one publisher stream. Demo-grade
+   (seeds from make-random-state t; production wants a vetted UUID source)."
+  (let ((rs (make-random-state t))
+        (b (make-array 16 :element-type '(unsigned-byte 8))))
+    (dotimes (i 16) (setf (aref b i) (random 256 rs)))
+    (setf (aref b 6) (logior #x40 (logand (aref b 6) #x0f)))   ; version 4
+    (setf (aref b 8) (logior #x80 (logand (aref b 8) #x3f)))   ; variant 10x
+    (format nil "~(~2,'0x~2,'0x~2,'0x~2,'0x-~2,'0x~2,'0x-~2,'0x~2,'0x-~2,'0x~2,'0x-~2,'0x~2,'0x~2,'0x~2,'0x~2,'0x~2,'0x~)"
+            (aref b 0) (aref b 1) (aref b 2) (aref b 3) (aref b 4) (aref b 5)
+            (aref b 6) (aref b 7) (aref b 8) (aref b 9) (aref b 10) (aref b 11)
+            (aref b 12) (aref b 13) (aref b 14) (aref b 15))))
 
 (declaim (ftype (function ((unsigned-byte 8)) (simple-array (unsigned-byte 8) (12))) %make-prefix))
 (defun %make-prefix (role)
@@ -82,25 +101,28 @@
                                :reliability dds.rtps.discovery:+reliability-reliable+)
     (dds.disc:enable-publisher node)
     (dds.disc:start-node node)
-    (format t "~&[pub] Square/ShapeType color=~a domain=~d (multicast 239.255.0.1). Ctrl-C to stop.~%"
-            color domain)
-    (let ((x 50) (y 50) (dx 3) (dy 2) (period (/ 1.0 rate)) (n 0) (last 0))
-      (unwind-protect
-           (loop
-             (setf last (%reannounce node last))
-             (setf x (+ x dx) y (+ y dy))
-             (when (or (<= x 0) (>= x 240)) (setf dx (- dx) x (min 240 (max 0 x))))
-             (when (or (<= y 0) (>= y 240)) (setf dy (- dy) y (min 240 (max 0 y))))
-             (dds.disc:publish-sample
-              node (%serialize-shape (make-shape-type :color color :x x :y y :shapesize shapesize)))
-             (incf n)
-             (when (zerop (mod n 30))
-               (format t "~&[pub] ~d samples sent; Square ~a (~d,~d)~%" n color x y))
-             (when (and (plusp count) (>= n count)) (return))
-             (sleep period))
-        (dds.disc:stop-node node)
-        (format t "~&[pub] stopped after ~d samples.~%" n))
-      t)))
+    (let ((uuid (%make-uuid)))
+      (format t "~&[pub] Square/ShapeType color=~a domain=~d uuid=~a (multicast 239.255.0.1). Ctrl-C to stop.~%"
+              color domain uuid)
+      (let ((x 50) (y 50) (dx 3) (dy 2) (period (/ 1.0 rate)) (n 0) (last 0) (seq 0))
+        (unwind-protect
+             (loop
+               (setf last (%reannounce node last))
+               (setf x (+ x dx) y (+ y dy))
+               (when (or (<= x 0) (>= x 240)) (setf dx (- dx) x (min 240 (max 0 x))))
+               (when (or (<= y 0) (>= y 240)) (setf dy (- dy) y (min 240 (max 0 y))))
+               (incf seq)
+               (dds.disc:publish-sample
+                node (%serialize-shape (make-shape-type :color color :x x :y y
+                                                        :shapesize shapesize :uuid uuid :seq seq)))
+               (incf n)
+               (when (zerop (mod n 30))
+                 (format t "~&[pub] seq=~d sent (~d total); Square ~a (~d,~d)~%" seq n color x y))
+               (when (and (plusp count) (>= n count)) (return))
+               (sleep period))
+          (dds.disc:stop-node node)
+          (format t "~&[pub] stopped after ~d samples (uuid=~a).~%" n uuid))))
+    t))
 
 (declaim (ftype (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string)) t) run-subscriber))
 (defun run-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1"))
@@ -114,18 +136,24 @@
     (dds.disc:enable-subscriber node)
     (dds.disc:start-node node)
     (format t "~&[sub] Square/ShapeType domain=~d (multicast 239.255.0.1). Ctrl-C to stop.~%" domain)
-    (let ((printed (make-hash-table :test 'eql)) (last 0) (seen 0)
-          (start (get-internal-real-time)))
+    (let ((printed (make-hash-table :test 'eql))
+          (expected (make-hash-table :test 'equal))   ; uuid -> next expected app seq
+          (last 0) (seen 0) (start (get-internal-real-time)))
       (unwind-protect
            (loop
              (setf last (%reannounce node last))
              (dolist (sn (sort (dds.disc:node-sample-sns node) #'<))
                (unless (gethash sn printed)
                  (setf (gethash sn printed) t)
-                 (let ((s (%deserialize-shape (dds.disc:node-sample node sn))))
-                   (format t "~&[sub] Square ~a x=~d y=~d size=~d~%"
-                           (shape-type-color s) (shape-type-x s)
-                           (shape-type-y s) (shape-type-shapesize s)))
+                 (let* ((s (%deserialize-shape (dds.disc:node-sample node sn)))
+                        (u (shape-type-uuid s)) (q (shape-type-seq s))
+                        (exp (gethash u expected)))
+                   (when (and exp (/= q exp))
+                     (format t "~&[sub] GAP from ~a: expected seq ~d, got ~d~%" u exp q))
+                   (setf (gethash u expected) (1+ q))
+                   (format t "~&[sub] Square ~a x=~d y=~d size=~d uuid=~a seq=~d~%"
+                           (shape-type-color s) (shape-type-x s) (shape-type-y s)
+                           (shape-type-shapesize s) u q))
                  (incf seen)))
              (when (and (plusp seconds)
                         (> (/ (- (get-internal-real-time) start) internal-time-units-per-second)

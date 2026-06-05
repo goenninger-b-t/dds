@@ -15,11 +15,22 @@ struct ShapeType {            // @final extensibility
   long x;
   long y;
   long shapesize;
+  string uuid;                // per-PUBLISHER identity (RFC-4122 v4), constant per stream
+  unsigned long seq;          // per-SAMPLE counter, 1,2,3,...  (ordering / loss detection)
 };
 ```
-Topic `Square`, registered type name `ShapeType`. Because the type is `@final` and
-has only 32-bit members, its XCDR1 (`PLAIN_CDR`) and XCDR2 (`PLAIN_CDR2`) byte
-layouts are identical; the subscriber accepts CDR_LE/BE and CDR2_LE/BE.
+Topic `Square`. Each publisher mints one `uuid` at startup and stamps every sample
+with that uuid plus an incrementing `seq`; the subscriber prints both and flags any
+per-uuid sequence gap (`[sub] GAP from <uuid>: expected seq N, got M`).
+
+**⚠ This diverges from RTI's canonical `ShapeType`** (the two trailing fields). It
+interops harness↔harness, but a stock `rtishapesdemo` Square reader rejects the type
+(extra members) unless RTI registers a matching IDL. To talk to stock rtishapesdemo,
+drop `uuid`/`seq` from the `define-dds-type` in `src/dds-shapes/shapes.lisp`.
+
+Because the type is `@final` with only 32-bit + string members, its XCDR1
+(`PLAIN_CDR`) and XCDR2 (`PLAIN_CDR2`) byte layouts are identical; the subscriber
+accepts CDR_LE/BE and CDR2_LE/BE.
 
 ## Run it
 
