@@ -310,3 +310,49 @@
     (%check :rxo-incompatible-match (zerop m) "durability-incompatible endpoints must not match")
     (%check :rxo-incompatible-deliver (not d) "incompatible reader must receive nothing (RxO blocks delivery)"))
   t)
+
+;;; Conditions + WaitSet (M3 #3, FR-DCPS-2): a GuardCondition triggers on demand; a
+;;; ReadCondition + WaitSet block until a written sample arrives (DATA_AVAILABLE),
+;;; then return the triggered condition; wait times out (empty) when there is no data.
+
+(declaim (ftype (function () t) run-dcps-waitset-test))
+(defun run-dcps-waitset-test ()
+  "DDS Conditions + WaitSet: guard-condition on-demand trigger + read-condition that
+   fires when a sample arrives, surfaced through WaitSet::wait with a timeout."
+  ;; GuardCondition
+  (let ((gc (dds.dcps:make-guard-condition)) (ws (dds.dcps:make-wait-set)))
+    (dds.dcps:attach-condition ws gc)
+    (%check :ws-guard-off (null (dds.dcps:wait-set-wait ws 0.1))
+            "guard-condition must not trigger before set")
+    (dds.dcps:set-trigger-value gc t)
+    (%check :ws-guard-on (and (member gc (dds.dcps:wait-set-wait ws 0.5)) t)
+            "guard-condition must trigger after set_trigger_value"))
+  ;; ReadCondition + WaitSet over real data
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "WsTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "WsTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (rc (dds.dcps:create-readcondition dr))
+                (ws (dds.dcps:make-wait-set)))
+           (dds.dcps:attach-condition ws rc)
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :ws-nodata (null (dds.dcps:wait-set-wait ws 0.2))
+                   "read-condition must not trigger before any data")
+           (dds.dcps:write-sample dw (make-dcps-msg :id 99 :text "ws"))
+           (let ((triggered (dds.dcps:wait-set-wait ws 3.0)))
+             (%check :ws-triggered (and (member rc triggered) t)
+                     "WaitSet::wait must return the read-condition once data arrives")
+             (let ((s (dds.dcps:read-samples dr :states '(:not-read))))
+               (%check :ws-read
+                       (and s (= 99 (dcps-msg-id (dds.dcps:cached-sample-data (first s)))))
+                       "read after WaitSet must return the awaited sample"))))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2)))
+  t)

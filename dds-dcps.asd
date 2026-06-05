@@ -8,5 +8,6 @@
   :pathname "src/dds-dcps"
   :serial t
   :components ((:file "packages")
-               (:file "entities"))
+               (:file "entities")
+               (:file "conditions"))
   :in-order-to ((test-op (test-op "dds-tests"))))
