@@ -7,13 +7,19 @@
 
 (in-package #:dds.shapes)
 
-;; The Shapes type, EXTENDED with a per-publisher UUID + a per-sample sequence
-;; number (uuid identifies the source stream; seq orders it / exposes loss). NOTE:
-;; the two trailing fields make this DIVERGE from RTI's canonical ShapeType — it
-;; interops harness<->harness, but a stock rtishapesdemo Square reader would reject
-;; the type (extra members) unless RTI registers a matching IDL. color is the @key.
-;; :final + only 32-bit/string members => XCDR1 and XCDR2 bytes coincide (no DHEADER).
+;; Two selectable Square payload types (:type :canonical | :tagged at runtime):
+;;  - shape-type   : the EXACT RTI canonical ShapeType (color @key; x; y; shapesize).
+;;                   Use for interop with rtishapesdemo / DDSSpy.
+;;  - tagged-shape : the same + a per-publisher uuid + per-sample seq (stream id +
+;;                   ordering/loss). DIVERGES from canonical => harness<->harness only.
+;; Both :final with only 32-bit/string members => XCDR1 and XCDR2 bytes coincide.
 (dds.gen:define-dds-type shape-type (:extensibility :final)
+  (color :string :key t)
+  (x :i32)
+  (y :i32)
+  (shapesize :i32))
+
+(dds.gen:define-dds-type tagged-shape (:extensibility :final)
   (color :string :key t)
   (x :i32)
   (y :i32)
@@ -47,25 +53,26 @@
           do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
-(declaim (ftype (function (shape-type) (simple-array (unsigned-byte 8) (*))) %serialize-shape))
-(defun %serialize-shape (shape)
-  "Serialize SHAPE as a PLAIN_CDR2_LE SerializedPayload (encapsulation header +
-   XCDR2 body) into a fresh octet vector — the data-plane publish payload."
+(declaim (ftype (function (function) (simple-array (unsigned-byte 8) (*))) %serialize-payload))
+(defun %serialize-payload (serialize-fn)
+  "Build a PLAIN_CDR2_LE SerializedPayload: an encapsulation header + whatever
+   SERIALIZE-FN writes (called with the XCDR2 cursor). Returns a fresh octet vector
+   — the data-plane publish payload. Works for either shape type."
   (let* ((buf (dds.core.buffer:make-octet-buffer 256))
          (wc (dds.core.buffer:cursor buf :endianness :little)))
     (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
-    (serialize-shape-type shape wc :xcdr2)
+    (funcall serialize-fn wc)
     (let* ((len (dds.core.buffer:cursor-position wc))
            (out (make-array len :element-type '(unsigned-byte 8))))
       (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
       out)))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 8) (*))) shape-type) %deserialize-shape))
-(defun %deserialize-shape (bytes)
-  "Parse a SerializedPayload into a shape-type, honoring the encapsulation header's
-   representation + endianness so a foreign sender (CDR_LE/BE or CDR2_LE/BE) is
-   handled. ShapeType is :final so there is no DHEADER in any of these encodings."
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (*)) function) t) %deserialize-with))
+(defun %deserialize-with (bytes deserialize-fn)
+  "Parse a SerializedPayload's encapsulation header (honoring representation +
+   endianness, so a foreign CDR_LE/BE or CDR2_LE/BE sender is handled), then call
+   DESERIALIZE-FN with (cursor mode). Both shape types are :final (no DHEADER)."
   (let* ((ob (dds.core.buffer:make-octet-buffer (length bytes)))
          (rc (dds.core.buffer:cursor ob :endianness :little)))
     (replace (dds.core.buffer:octet-buffer-vec ob) bytes)
@@ -74,7 +81,7 @@
        rc (if (member rep '(:plain-cdr-be :plain-cdr2-be :pl-cdr-be :pl-cdr2-be :delimited-cdr-be))
               :big :little))
       (let ((mode (if (member rep '(:plain-cdr-le :plain-cdr-be)) :xcdr1 :xcdr2)))
-        (prog1 (deserialize-shape-type rc mode)
+        (prog1 (funcall deserialize-fn rc mode)
           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))))
 
 (declaim (ftype (function (dds.disc:disc-node (integer 0)) t) %reannounce))
@@ -89,12 +96,14 @@
                now)
         last)))
 
-(declaim (ftype (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string)) t) run-publisher))
+(declaim (ftype (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol)) t) run-publisher))
 (defun run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
-                           (advertise-address "127.0.0.1"))
-  "Publish an animated Square ShapeType on DOMAIN via multicast discovery. RATE is
-   updates/sec; COUNT 0 means run forever (Ctrl-C to stop). Watchable in RTI
-   rtishapesdemo (subscribe to Square on the same domain)."
+                           (advertise-address "127.0.0.1") (type :tagged))
+  "Publish an animated Square on DOMAIN via multicast discovery. TYPE selects the
+   payload: :canonical = the exact RTI ShapeType (color/x/y/shapesize — for interop
+   with rtishapesdemo / DDSSpy); :tagged = + per-publisher uuid + per-sample seq
+   (harness<->harness). RATE updates/sec; COUNT 0 = forever (Ctrl-C)."
+  (check-type type (member :canonical :tagged))
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
                                        :multicast t :advertise-address advertise-address)))
     (dds.disc:add-local-writer node :topic "Square" :type "ShapeType"
@@ -102,8 +111,8 @@
     (dds.disc:enable-publisher node)
     (dds.disc:start-node node)
     (let ((uuid (%make-uuid)))
-      (format t "~&[pub] Square/ShapeType color=~a domain=~d uuid=~a (multicast 239.255.0.1). Ctrl-C to stop.~%"
-              color domain uuid)
+      (format t "~&[pub] Square/ShapeType[~(~a~)] color=~a domain=~d uuid=~a (multicast 239.255.0.1). Ctrl-C to stop.~%"
+              type color domain uuid)
       (let ((x 50) (y 50) (dx 3) (dy 2) (period (/ 1.0 rate)) (n 0) (last 0) (seq 0))
         (unwind-protect
              (loop
@@ -113,8 +122,18 @@
                (when (or (<= y 0) (>= y 240)) (setf dy (- dy) y (min 240 (max 0 y))))
                (incf seq)
                (dds.disc:publish-sample
-                node (%serialize-shape (make-shape-type :color color :x x :y y
-                                                        :shapesize shapesize :uuid uuid :seq seq)))
+                node (ecase type
+                       (:canonical
+                        (%serialize-payload
+                         (lambda (wc) (serialize-shape-type
+                                       (make-shape-type :color color :x x :y y :shapesize shapesize)
+                                       wc :xcdr2))))
+                       (:tagged
+                        (%serialize-payload
+                         (lambda (wc) (serialize-tagged-shape
+                                       (make-tagged-shape :color color :x x :y y :shapesize shapesize
+                                                          :uuid uuid :seq seq)
+                                       wc :xcdr2))))))
                (incf n)
                (when (zerop (mod n 30))
                  (format t "~&[pub] seq=~d sent (~d total); Square ~a (~d,~d)~%" seq n color x y))
@@ -196,18 +215,20 @@
         (format t "~&[spy] stopped; ~d participant(s) discovered.~%" (hash-table-count seen)))
       t)))
 
-(declaim (ftype (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string)) t) run-subscriber))
-(defun run-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1"))
-  "Subscribe to Square ShapeType on DOMAIN via multicast discovery and print every
-   shape received. SECONDS 0 means run forever (Ctrl-C to stop). Receives from RTI
-   rtishapesdemo (publish Square on the same domain) or this harness's publisher."
+(declaim (ftype (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string) (:type symbol)) t) run-subscriber))
+(defun run-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1") (type :tagged))
+  "Subscribe to Square on DOMAIN via multicast discovery and print every shape.
+   TYPE selects the payload codec (:canonical | :tagged) and must match the
+   publisher. SECONDS 0 = forever (Ctrl-C). Receives from rtishapesdemo / DDSSpy
+   (use :canonical) or this harness's publisher."
+  (check-type type (member :canonical :tagged))
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x53) :domain domain
                                        :multicast t :advertise-address advertise-address)))
     (dds.disc:add-local-reader node :topic "Square" :type "ShapeType"
                                :reliability dds.rtps.discovery:+reliability-reliable+)
     (dds.disc:enable-subscriber node)
     (dds.disc:start-node node)
-    (format t "~&[sub] Square/ShapeType domain=~d (multicast 239.255.0.1). Ctrl-C to stop.~%" domain)
+    (format t "~&[sub] Square/ShapeType[~(~a~)] domain=~d (multicast 239.255.0.1). Ctrl-C to stop.~%" type domain)
     (let ((printed (make-hash-table :test 'eql))
           (expected (make-hash-table :test 'equal))   ; uuid -> next expected app seq
           (last 0) (seen 0) (start (get-internal-real-time)))
@@ -217,15 +238,23 @@
              (dolist (sn (sort (dds.disc:node-sample-sns node) #'<))
                (unless (gethash sn printed)
                  (setf (gethash sn printed) t)
-                 (let* ((s (%deserialize-shape (dds.disc:node-sample node sn)))
-                        (u (shape-type-uuid s)) (q (shape-type-seq s))
-                        (exp (gethash u expected)))
-                   (when (and exp (/= q exp))
-                     (format t "~&[sub] GAP from ~a: expected seq ~d, got ~d~%" u exp q))
-                   (setf (gethash u expected) (1+ q))
-                   (format t "~&[sub] Square ~a x=~d y=~d size=~d uuid=~a seq=~d~%"
-                           (shape-type-color s) (shape-type-x s) (shape-type-y s)
-                           (shape-type-shapesize s) u q))
+                 (ecase type
+                   (:canonical
+                    (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-shape-type)))
+                      (declare (type shape-type s))
+                      (format t "~&[sub] Square ~a x=~d y=~d size=~d~%"
+                              (shape-type-color s) (shape-type-x s)
+                              (shape-type-y s) (shape-type-shapesize s))))
+                   (:tagged
+                    (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-tagged-shape)))
+                      (declare (type tagged-shape s))
+                      (let* ((u (tagged-shape-uuid s)) (q (tagged-shape-seq s)) (exp (gethash u expected)))
+                        (when (and exp (/= q exp))
+                          (format t "~&[sub] GAP from ~a: expected seq ~d, got ~d~%" u exp q))
+                        (setf (gethash u expected) (1+ q))
+                        (format t "~&[sub] Square ~a x=~d y=~d size=~d uuid=~a seq=~d~%"
+                                (tagged-shape-color s) (tagged-shape-x s) (tagged-shape-y s)
+                                (tagged-shape-shapesize s) u q)))))
                  (incf seen)))
              (when (and (plusp seconds)
                         (> (/ (- (get-internal-real-time) start) internal-time-units-per-second)

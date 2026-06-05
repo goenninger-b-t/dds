@@ -15,6 +15,7 @@ LISP  ?= $(CLASP)
 DOMAIN   ?= 0
 COLOR    ?= BLUE
 ADVERTISE ?= 127.0.0.1
+TYPE     ?= tagged
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -51,12 +52,12 @@ wire:
 # Ctrl-C to stop. Override DOMAIN=.. COLOR=.. ; LISP=$(SBCL) used (CFFI multicast).
 square-pub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE))' \
 	        --eval '(uiop:quit 0)'
 
 square-sub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)" :type :$(TYPE))' \
 	        --eval '(uiop:quit 0)'
 
 # Discovery diagnostic: print each discovered participant's locators + resolved dest.

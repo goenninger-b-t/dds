@@ -12,5 +12,7 @@
     a Square; run-subscriber prints received Squares.")
   (:export #:shape-type #:make-shape-type
            #:shape-type-color #:shape-type-x #:shape-type-y #:shape-type-shapesize
-           #:shape-type-uuid #:shape-type-seq
+           #:tagged-shape #:make-tagged-shape
+           #:tagged-shape-color #:tagged-shape-x #:tagged-shape-y #:tagged-shape-shapesize
+           #:tagged-shape-uuid #:tagged-shape-seq
            #:run-publisher #:run-subscriber #:run-spy))

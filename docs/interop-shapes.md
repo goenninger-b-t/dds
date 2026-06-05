@@ -9,26 +9,30 @@ it doubles as a cross-process self-test.
 
 ## The type
 
+Two payload types, selected with `TYPE=canonical|tagged` (topic `Square` for both):
+
 ```idl
-struct ShapeType {            // @final extensibility
+// TYPE=canonical — the EXACT RTI ShapeType (interop with rtishapesdemo / DDSSpy)
+struct ShapeType {            // @final
   @key string<128> color;     // "BLUE", "RED", ...
-  long x;
-  long y;
-  long shapesize;
+  long x; long y; long shapesize;
+};
+
+// TYPE=tagged (default) — same + stream id / ordering (harness<->harness only)
+struct TaggedShape {          // @final
+  @key string<128> color; long x; long y; long shapesize;
   string uuid;                // per-PUBLISHER identity (RFC-4122 v4), constant per stream
-  unsigned long seq;          // per-SAMPLE counter, 1,2,3,...  (ordering / loss detection)
+  unsigned long seq;          // per-SAMPLE counter 1,2,3,... (ordering / loss detection)
 };
 ```
-Topic `Square`. Each publisher mints one `uuid` at startup and stamps every sample
-with that uuid plus an incrementing `seq`; the subscriber prints both and flags any
-per-uuid sequence gap (`[sub] GAP from <uuid>: expected seq N, got M`).
 
-**⚠ This diverges from RTI's canonical `ShapeType`** (the two trailing fields). It
-interops harness↔harness, but a stock `rtishapesdemo` Square reader rejects the type
-(extra members) unless RTI registers a matching IDL. To talk to stock rtishapesdemo,
-drop `uuid`/`seq` from the `define-dds-type` in `src/dds-shapes/shapes.lisp`.
+In `tagged` mode each publisher mints one `uuid` at startup and stamps every sample
+with that uuid + an incrementing `seq`; the subscriber prints both and flags any
+per-uuid gap (`[sub] GAP from <uuid>: expected seq N, got M`). The two trailing
+fields **diverge from RTI's canonical `ShapeType`**, so a stock `rtishapesdemo`
+reader rejects them — use `TYPE=canonical` for RTI interop (no source edit needed).
 
-Because the type is `@final` with only 32-bit + string members, its XCDR1
+Because both are `@final` with only 32-bit + string members, their XCDR1
 (`PLAIN_CDR`) and XCDR2 (`PLAIN_CDR2`) byte layouts are identical; the subscriber
 accepts CDR_LE/BE and CDR2_LE/BE.
 
@@ -39,8 +43,19 @@ Two terminals, same machine (loopback — the default):
 ```bash
 make square-sub                 # terminal 1: prints received Squares
 make square-pub                 # terminal 2: publishes an animated BLUE Square
-# overrides:  make square-pub DOMAIN=2 COLOR=RED
+# overrides:  make square-pub DOMAIN=2 COLOR=RED ADVERTISE=192.168.2.148
 ```
+
+**Type toggle (`TYPE=canonical|tagged`, default `tagged`).** `tagged` carries the
+extra `uuid`/`seq` (harness↔harness). `canonical` publishes the **exact** RTI
+`ShapeType` (color/x/y/shapesize only) — use it for interop with `rtishapesdemo` /
+DDSSpy:
+
+```bash
+make square-pub TYPE=canonical ADVERTISE=<your-LAN-ip>   # RTI-compatible payload
+make square-sub TYPE=canonical                           # to read RTI's Squares
+```
+The publisher and subscriber must use the **same** `TYPE` to talk to each other.
 
 Both run until Ctrl-C. Verified cross-process result: a 200-sample run delivers
 **200/200** shapes reliably (no loss) between two separate processes.
