@@ -356,3 +356,133 @@
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2)))
   t)
+
+;;; Statuses + Listeners (M3 #3 follow-up, FR-DCPS-2/3): the SEDP match / RxO-
+;;; incompatible events surfaced to the application as DDS communication statuses
+;;; (SUBSCRIPTION/PUBLICATION_MATCHED, REQUESTED/OFFERED_INCOMPATIBLE_QOS), with
+;;; overridable CLOS listeners fired from the receiver thread. Thread-safe capture.
+
+(defclass capture-mixin ()
+  ((hits :initform '() :accessor cap-hits)
+   (lock :initform (dds.pal:make-lock "test-capture") :accessor cap-lock)))
+(defclass capturing-reader-listener (capture-mixin dds.dcps:data-reader-listener) ())
+(defclass capturing-writer-listener (capture-mixin dds.dcps:data-writer-listener) ())
+
+(defmethod dds.dcps:on-subscription-matched ((l capturing-reader-listener) reader status)
+  (declare (ignore reader))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :sub-matched status) (cap-hits l))))
+(defmethod dds.dcps:on-requested-incompatible-qos ((l capturing-reader-listener) reader status)
+  (declare (ignore reader))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :req-incompat status) (cap-hits l))))
+(defmethod dds.dcps:on-publication-matched ((l capturing-writer-listener) writer status)
+  (declare (ignore writer))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :pub-matched status) (cap-hits l))))
+
+(declaim (ftype (function (capture-mixin) list) cap-snapshot))
+(defun cap-snapshot (l)
+  "Thread-safe snapshot of a capturing listener's recorded events."
+  (dds.pal:with-lock ((cap-lock l)) (copy-list (cap-hits l))))
+
+(declaim (ftype (function () t) run-dcps-matched-status-test))
+(defun run-dcps-matched-status-test ()
+  "SUBSCRIPTION/PUBLICATION_MATCHED + their listeners (FR-DCPS-2/3): a compatible
+   writer/reader pair match; the reader's subscription-matched-status and the writer's
+   publication-matched-status each report total_count 1 / current_count 1; the
+   on_subscription_matched + on_publication_matched listeners fire; and get_*_status
+   resets the *_change counters while leaving the cumulative counts intact."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0))
+        (rl (make-instance 'capturing-reader-listener))
+        (wl (make-instance 'capturing-writer-listener)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "MatchTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "MatchTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr)))
+           (dds.dcps:set-reader-listener dr rl '(:subscription-matched))
+           (dds.dcps:set-writer-listener dw wl '(:publication-matched))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (let ((sm (dds.dcps:get-subscription-matched-status dr))
+                 (pm (dds.dcps:get-publication-matched-status dw)))
+             (%check :match-sub-total (= 1 (dds.dcps:subscription-matched-status-total-count sm))
+                     "reader SUBSCRIPTION_MATCHED total_count must be 1")
+             (%check :match-sub-current (= 1 (dds.dcps:subscription-matched-status-current-count sm))
+                     "reader SUBSCRIPTION_MATCHED current_count must be 1")
+             (%check :match-pub-total (= 1 (dds.dcps:publication-matched-status-total-count pm))
+                     "writer PUBLICATION_MATCHED total_count must be 1")
+             (%check :match-pub-current (= 1 (dds.dcps:publication-matched-status-current-count pm))
+                     "writer PUBLICATION_MATCHED current_count must be 1"))
+           (loop repeat 60
+                 until (and (assoc :sub-matched (cap-snapshot rl))
+                            (assoc :pub-matched (cap-snapshot wl)))
+                 do (sleep 0.02))
+           (%check :match-sub-listener (and (assoc :sub-matched (cap-snapshot rl)) t)
+                   "on_subscription_matched must fire from the receiver thread")
+           (%check :match-pub-listener (and (assoc :pub-matched (cap-snapshot wl)) t)
+                   "on_publication_matched must fire from the receiver thread")
+           (let ((sm2 (dds.dcps:get-subscription-matched-status dr)))
+             (%check :match-counts-stable
+                     (and (= 1 (dds.dcps:subscription-matched-status-total-count sm2))
+                          (= 1 (dds.dcps:subscription-matched-status-current-count sm2))
+                          (zerop (dds.dcps:subscription-matched-status-total-count-change sm2)))
+                     "counts stay 1 across reads; get_*_status resets *_change")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
+(declaim (ftype (function () t) run-dcps-incompatible-qos-test))
+(defun run-dcps-incompatible-qos-test ()
+  "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a
+   VOLATILE writer and a reader requesting TRANSIENT_LOCAL agree on topic+type but fail
+   durability RxO. The reader's requested-incompatible-qos-status and the writer's
+   offered-incompatible-qos-status each report total_count>=1 with last_policy_id =
+   DURABILITY_QOS_POLICY_ID and a DURABILITY entry in policies, and the
+   on_requested_incompatible_qos listener fires — closing the RxO loop to the app."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0))
+        (rl (make-instance 'capturing-reader-listener)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "IncompatTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "IncompatTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw
+                       :qos (dds.qos:make-writer-qos :durability :volatile)))
+                (dr (dds.dcps:create-datareader sub tr
+                       :qos (dds.qos:make-reader-qos :durability :transient-local))))
+           (dds.dcps:set-reader-listener dr rl '(:requested-incompatible-qos))
+           (loop repeat 150
+                 until (plusp (dds.dcps:requested-incompatible-qos-status-total-count
+                               (dds.dcps:get-requested-incompatible-qos-status dr)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (let ((rs (dds.dcps:get-requested-incompatible-qos-status dr))
+                 (os (dds.dcps:get-offered-incompatible-qos-status dw)))
+             (%check :req-incompat-total
+                     (plusp (dds.dcps:requested-incompatible-qos-status-total-count rs))
+                     "reader REQUESTED_INCOMPATIBLE_QOS total_count must be >= 1")
+             (%check :req-incompat-policy
+                     (= dds.dcps:+qos-policy-id-durability+
+                        (dds.dcps:requested-incompatible-qos-status-last-policy-id rs))
+                     "reader last_policy_id must be DURABILITY_QOS_POLICY_ID")
+             (%check :req-incompat-policies
+                     (find dds.dcps:+qos-policy-id-durability+
+                           (dds.dcps:requested-incompatible-qos-status-policies rs)
+                           :key #'dds.dcps:qos-policy-count-policy-id)
+                     "policies must carry a DURABILITY QosPolicyCount")
+             (%check :off-incompat-total
+                     (plusp (dds.dcps:offered-incompatible-qos-status-total-count os))
+                     "writer OFFERED_INCOMPATIBLE_QOS total_count must be >= 1")
+             (%check :off-incompat-policy
+                     (= dds.dcps:+qos-policy-id-durability+
+                        (dds.dcps:offered-incompatible-qos-status-last-policy-id os))
+                     "writer last_policy_id must be DURABILITY_QOS_POLICY_ID"))
+           (loop repeat 60 until (assoc :req-incompat (cap-snapshot rl)) do (sleep 0.02))
+           (%check :req-incompat-listener (and (assoc :req-incompat (cap-snapshot rl)) t)
+                   "on_requested_incompatible_qos must fire from the receiver thread"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))

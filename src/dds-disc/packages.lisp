@@ -17,6 +17,7 @@
            #:disc-node-guid-prefix #:disc-node-peers #:disc-node-port
            #:disc-node-discovered-count #:disc-node-discovered-prefixes
            #:disc-node-matched-count #:disc-node-matched-topics
+           #:disc-node-on-match #:disc-node-on-incompatible-qos
            #:add-local-writer #:add-local-reader
            #:start-node #:stop-node
            #:announce-participant #:announce-endpoints

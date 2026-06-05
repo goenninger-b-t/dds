@@ -17,7 +17,11 @@
    PEERS are unicast SPDP targets; DISCOVERED maps a remote 12-octet GUID prefix
    to its SPDP data; LOCAL-WRITERS/LOCAL-READERS are this node's endpoints; MATCHES
    maps a remote 16-octet endpoint GUID to the remote endpoint-data that matched a
-   local endpoint. LOCK guards DISCOVERED + MATCHES across the receiver thread.
+   local endpoint; INCOMPAT maps a remote GUID whose topic+type agreed but whose QoS
+   failed RxO (drives OFFERED/REQUESTED_INCOMPATIBLE_QOS). LOCK guards DISCOVERED +
+   MATCHES + INCOMPAT across the receiver thread. ON-MATCH / ON-INCOMPATIBLE-QOS are
+   optional control-plane hooks the DCPS layer installs to surface matched/incompatible
+   events to the application as DDS statuses; each fires once per remote endpoint.
    TX-PAYLOAD/TX-MSG are the reused announce scratch buffers."
   (guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)
                :type (simple-array (unsigned-byte 8) (12)))
@@ -30,6 +34,7 @@
   (peers '() :type list)
   (discovered (make-hash-table :test 'equalp) :type hash-table)
   (matches (make-hash-table :test 'equalp) :type hash-table)
+  (incompat (make-hash-table :test 'equalp) :type hash-table)
   (local-writers '() :type list)
   (local-readers '() :type list)
   (lock (dds.pal:make-lock "disc-node"))
@@ -44,6 +49,8 @@
   (on-data nil :type (or null function))
   (on-heartbeat nil :type (or null function))
   (on-acknack nil :type (or null function))
+  (on-match nil :type (or null function))
+  (on-incompatible-qos nil :type (or null function))
   (mcast-socket nil)
   (mcast-rx-thread nil)
   (rx-thread nil))
@@ -248,31 +255,74 @@
       (dds.pal:with-lock ((disc-node-lock node))
         (setf (gethash (copy-seq prefix) (disc-node-discovered node)) spdp)))))
 
-(declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) t) %record-match))
+(declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) boolean) %record-match))
 (defun %record-match (node remote)
-  "Record a matched REMOTE endpoint keyed by its 16-octet GUID (lock-guarded)."
+  "Record a matched REMOTE endpoint keyed by its 16-octet GUID (lock-guarded). Returns
+   T only the FIRST time REMOTE is recorded (so a MATCHED status fires once, not once
+   per re-announce); NIL if REMOTE was already matched."
   (dds.pal:with-lock ((disc-node-lock node))
-    (setf (gethash (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
-                   (disc-node-matches node))
-          remote)))
+    (let ((key (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
+      (if (nth-value 1 (gethash key (disc-node-matches node)))
+          nil
+          (progn (setf (gethash key (disc-node-matches node)) remote) t)))))
+
+(declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) boolean) %record-incompat))
+(defun %record-incompat (node remote)
+  "Record REMOTE as RxO-incompatible (topic+type matched, QoS failed), keyed by its
+   GUID (lock-guarded). Returns T only the first time, so INCOMPATIBLE_QOS fires once
+   per remote endpoint, not once per re-announce."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((key (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
+      (if (nth-value 1 (gethash key (disc-node-incompat node)))
+          nil
+          (progn (setf (gethash key (disc-node-incompat node)) remote) t)))))
+
+(declaim (ftype (function (disc-node keyword dds.rtps.discovery:endpoint-data) t) %fire-match))
+(defun %fire-match (node kind remote)
+  "Invoke the ON-MATCH hook (if installed) once for a newly-matched REMOTE endpoint."
+  (when (disc-node-on-match node)
+    (funcall (disc-node-on-match node) kind remote)))
+
+(declaim (ftype (function (disc-node keyword dds.rtps.discovery:endpoint-data list) t) %fire-incompat))
+(defun %fire-incompat (node kind remote bad)
+  "Invoke the ON-INCOMPATIBLE-QOS hook (if installed) for a newly-detected RxO
+   incompatibility, passing the failing-policy keyword list BAD (FR-QOS-2 / FR-DCPS-3)."
+  (when (disc-node-on-incompatible-qos node)
+    (funcall (disc-node-on-incompatible-qos node) kind remote bad)))
 
 (declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) t) %match-remote-writer))
 (defun %match-remote-writer (node remote)
-  "REMOTE is a discovered publication; record a match if any local reader's RxO is
-   compatible (offered >= requested)."
-  (dolist (lr (disc-node-local-readers node))
-    (when (dds.rtps.discovery:endpoint-match-p remote lr)
-      (%record-match node remote)
-      (return))))
+  "REMOTE is a discovered publication. Test it against each local reader: on the first
+   RxO-compatible reader record + announce a match (:remote-writer). If none matched
+   but topic+type agreed with at least one reader, record + announce an incompatible-QoS
+   event carrying the failing policies (-> the reader's REQUESTED_INCOMPATIBLE_QOS)."
+  (let ((incompat nil))
+    (dolist (lr (disc-node-local-readers node))
+      (multiple-value-bind (ok bad) (dds.rtps.discovery:endpoint-match-p remote lr)
+        (cond
+          (ok (when (%record-match node remote) (%fire-match node :remote-writer remote))
+              (return-from %match-remote-writer t))
+          ((not (equal bad '(:topic-or-type))) (setf incompat bad)))))
+    (when (and incompat (%record-incompat node remote))
+      (%fire-incompat node :remote-writer remote incompat)))
+  t)
 
 (declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) t) %match-remote-reader))
 (defun %match-remote-reader (node remote)
-  "REMOTE is a discovered subscription; record a match if any local writer's RxO is
-   compatible (offered >= requested)."
-  (dolist (lw (disc-node-local-writers node))
-    (when (dds.rtps.discovery:endpoint-match-p lw remote)
-      (%record-match node remote)
-      (return))))
+  "REMOTE is a discovered subscription. Test it against each local writer: on the first
+   RxO-compatible writer record + announce a match (:remote-reader). If none matched
+   but topic+type agreed with at least one writer, record + announce an incompatible-QoS
+   event carrying the failing policies (-> the writer's OFFERED_INCOMPATIBLE_QOS)."
+  (let ((incompat nil))
+    (dolist (lw (disc-node-local-writers node))
+      (multiple-value-bind (ok bad) (dds.rtps.discovery:endpoint-match-p lw remote)
+        (cond
+          (ok (when (%record-match node remote) (%fire-match node :remote-reader remote))
+              (return-from %match-remote-reader t))
+          ((not (equal bad '(:topic-or-type))) (setf incompat bad)))))
+    (when (and incompat (%record-incompat node remote))
+      (%fire-incompat node :remote-reader remote incompat)))
+  t)
 
 (declaim (ftype (function (disc-node dds.core.buffer:octet-buffer (integer 0)) t) %handle-datagram))
 (defun %handle-datagram (node buf size)

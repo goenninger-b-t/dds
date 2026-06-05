@@ -30,4 +30,39 @@
            #:wait-condition #:guard-condition #:read-condition #:status-condition #:wait-set
            #:make-guard-condition #:set-trigger-value #:create-readcondition
            #:make-status-condition #:make-wait-set
-           #:attach-condition #:detach-condition #:wait-set-wait #:condition-trigger-value))
+           #:attach-condition #:detach-condition #:wait-set-wait #:condition-trigger-value
+           ;; Communication statuses (FR-DCPS-3)
+           #:subscription-matched-status #:publication-matched-status
+           #:requested-incompatible-qos-status #:offered-incompatible-qos-status
+           #:qos-policy-count #:make-qos-policy-count
+           #:qos-policy-count-policy-id #:qos-policy-count-count
+           #:subscription-matched-status-total-count #:subscription-matched-status-total-count-change
+           #:subscription-matched-status-current-count #:subscription-matched-status-current-count-change
+           #:subscription-matched-status-last-publication-handle
+           #:publication-matched-status-total-count #:publication-matched-status-total-count-change
+           #:publication-matched-status-current-count #:publication-matched-status-current-count-change
+           #:publication-matched-status-last-subscription-handle
+           #:requested-incompatible-qos-status-total-count
+           #:requested-incompatible-qos-status-total-count-change
+           #:requested-incompatible-qos-status-last-policy-id
+           #:requested-incompatible-qos-status-policies
+           #:offered-incompatible-qos-status-total-count
+           #:offered-incompatible-qos-status-total-count-change
+           #:offered-incompatible-qos-status-last-policy-id
+           #:offered-incompatible-qos-status-policies
+           #:rxo-policy-id
+           #:+qos-policy-id-durability+ #:+qos-policy-id-reliability+
+           #:+qos-policy-id-deadline+ #:+qos-policy-id-latency-budget+
+           #:+qos-policy-id-ownership+ #:+qos-policy-id-liveliness+
+           #:+qos-policy-id-destination-order+ #:+qos-policy-id-presentation+
+           #:+qos-policy-id-data-representation+
+           #:get-subscription-matched-status #:get-publication-matched-status
+           #:get-requested-incompatible-qos-status #:get-offered-incompatible-qos-status
+           ;; Listeners (FR-DCPS-2)
+           #:listener #:data-reader-listener #:data-writer-listener
+           #:on-data-available #:on-subscription-matched #:on-requested-incompatible-qos
+           #:on-requested-deadline-missed #:on-sample-rejected #:on-sample-lost
+           #:on-liveliness-changed
+           #:on-publication-matched #:on-offered-incompatible-qos
+           #:on-offered-deadline-missed #:on-liveliness-lost
+           #:set-reader-listener #:set-writer-listener))

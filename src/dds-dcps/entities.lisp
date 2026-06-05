@@ -17,7 +17,9 @@
 (defclass domain-participant (entity)
   ((domain :initarg :domain :reader dp-domain)
    (node :initarg :node :accessor dp-node)
-   (children :initform '() :accessor dp-children)))
+   (children :initform '() :accessor dp-children)
+   (user-reader :initform nil :accessor dp-user-reader)   ; v1: one DataReader per participant
+   (user-writer :initform nil :accessor dp-user-writer))) ; v1: one DataWriter per participant
 
 (defclass publisher (entity)
   ((participant :initarg :participant :reader pub-participant)
@@ -35,14 +37,24 @@
 
 (defclass data-writer (entity)
   ((topic :initarg :topic :reader dw-topic)
-   (publisher :initarg :publisher :reader dw-publisher)))
+   (publisher :initarg :publisher :reader dw-publisher)
+   (pub-matched :initform (make-publication-matched-status) :accessor dw-pub-matched)
+   (off-incompat :initform (make-offered-incompatible-qos-status) :accessor dw-off-incompat)
+   (listener :initform nil :accessor dw-listener)
+   (listener-mask :initform '() :accessor dw-listener-mask)
+   (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock)))
 
 (defclass data-reader (entity)
   ((topic :initarg :topic :reader dr-topic)
    (subscriber :initarg :subscriber :reader dr-subscriber)
    (cache :initform '() :accessor dr-cache)                       ; list of cached-sample
    (instances :initform (make-hash-table :test 'equalp) :accessor dr-instances) ; handle -> accessed-p
-   (drained :initform 0 :accessor dr-drained)))                  ; highest engine SN drained
+   (drained :initform 0 :accessor dr-drained)                    ; highest engine SN drained
+   (sub-matched :initform (make-subscription-matched-status) :accessor dr-sub-matched)
+   (req-incompat :initform (make-requested-incompatible-qos-status) :accessor dr-req-incompat)
+   (listener :initform nil :accessor dr-listener)
+   (listener-mask :initform '() :accessor dr-listener-mask)
+   (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock)))
 
 ;;; ---- SampleInfo + cached samples (FR-DCPS-4) ----
 
@@ -116,12 +128,19 @@
 (declaim (ftype (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string)) domain-participant) create-participant))
 (defun create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1"))
   "DomainParticipantFactory::create_participant — open the RTPS engine (a multicast
-   disc-node) for DOMAIN, start its receiver, and return an enabled participant."
-  (let ((node (dds.disc:make-disc-node :domain domain :multicast t
-                                       :advertise-address advertise-address
-                                       :guid-prefix (%make-guid-prefix))))
+   disc-node) for DOMAIN, install the match/incompatible-QoS hooks that surface DDS
+   statuses to the application, start the receiver, and return an enabled participant."
+  (let* ((node (dds.disc:make-disc-node :domain domain :multicast t
+                                        :advertise-address advertise-address
+                                        :guid-prefix (%make-guid-prefix)))
+         (p (make-instance 'domain-participant :domain domain :node node :qos qos :enabled t)))
+    ;; Install hooks BEFORE the receiver thread starts so no early SEDP match is lost.
+    (setf (dds.disc:disc-node-on-match node)
+          (lambda (kind remote) (%on-disc-match p kind remote)))
+    (setf (dds.disc:disc-node-on-incompatible-qos node)
+          (lambda (kind remote bad) (%on-disc-incompatible p kind remote bad)))
     (dds.disc:start-node node)
-    (make-instance 'domain-participant :domain domain :node node :qos qos :enabled t)))
+    p))
 
 (declaim (ftype (function (domain-participant) (eql t)) delete-participant))
 (defun delete-participant (p)
@@ -184,6 +203,7 @@
     (dds.disc:enable-publisher node)
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
       (push dw (pub-writers pub))
+      (setf (dp-user-writer (pub-participant pub)) dw)   ; v1 back-ref for status hooks
       dw)))
 
 (declaim (ftype (function (subscriber topic &key (:qos t)) data-reader) create-datareader))
@@ -196,6 +216,7 @@
     (dds.disc:enable-subscriber node)
     (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos :enabled t)))
       (push dr (sub-readers sub))
+      (setf (dp-user-reader (sub-participant sub)) dr)   ; v1 back-ref for status hooks
       dr)))
 
 (declaim (ftype (function (data-writer t) (eql t)) write-sample))
@@ -287,3 +308,189 @@
    marking anything READ — for polling before a read/take."
   (%drain dr)
   (length (dr-cache dr)))
+
+;;; ---- Status surfacing: SEDP match / incompatible-QoS events -> entity statuses +
+;;;      listeners (M3 #3, FR-DCPS-3). These fire on the disc receiver thread; status
+;;;      mutation is guarded by the entity STATUS-LOCK and any listener is invoked with
+;;;      a snapshot OUTSIDE the lock (a listener must never deadlock the receiver).
+;;;      Reading a status (get_*_status) resets its *_change counters per DDS 1.4.
+
+(declaim (ftype (function (domain-participant keyword dds.rtps.discovery:endpoint-data) t) %on-disc-match))
+(defun %on-disc-match (p kind remote)
+  "ON-MATCH hook: a remote endpoint matched a local one. :remote-writer -> our reader
+   gained a publication (SUBSCRIPTION_MATCHED); :remote-reader -> our writer gained a
+   subscription (PUBLICATION_MATCHED). The 16-octet remote GUID is the matched handle."
+  (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
+    (ecase kind
+      (:remote-writer (let ((dr (dp-user-reader p))) (when dr (%reader-matched dr handle))))
+      (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-matched dw handle))))))
+  t)
+
+(declaim (ftype (function (domain-participant keyword dds.rtps.discovery:endpoint-data list) t) %on-disc-incompatible))
+(defun %on-disc-incompatible (p kind remote bad)
+  "ON-INCOMPATIBLE-QOS hook: topic+type agreed but RxO failed. :remote-writer -> our
+   reader's REQUESTED_INCOMPATIBLE_QOS; :remote-reader -> our writer's OFFERED_
+   INCOMPATIBLE_QOS. BAD is the failing-policy keyword list (dds.qos:qos-rxo-compatible)."
+  (declare (ignore remote))
+  (ecase kind
+    (:remote-writer (let ((dr (dp-user-reader p))) (when dr (%reader-incompatible dr bad))))
+    (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-incompatible dw bad)))))
+  t)
+
+(declaim (ftype (function (data-reader t) t) %reader-matched))
+(defun %reader-matched (dr handle)
+  "Bump DR's SUBSCRIPTION_MATCHED status; if a listener is installed for it, fire
+   on-subscription-matched with a snapshot (resetting the *_change counters per DDS)."
+  (let ((snapshot nil))
+    (dds.pal:with-lock ((dr-status-lock dr))
+      (let ((s (dr-sub-matched dr)))
+        (incf (subscription-matched-status-total-count s))
+        (incf (subscription-matched-status-total-count-change s))
+        (incf (subscription-matched-status-current-count s))
+        (incf (subscription-matched-status-current-count-change s))
+        (setf (subscription-matched-status-last-publication-handle s) handle)
+        (when (and (dr-listener dr) (member :subscription-matched (dr-listener-mask dr)))
+          (setf snapshot (copy-subscription-matched-status s))
+          (setf (subscription-matched-status-total-count-change s) 0
+                (subscription-matched-status-current-count-change s) 0))))
+    (when snapshot (on-subscription-matched (dr-listener dr) dr snapshot)))
+  t)
+
+(declaim (ftype (function (data-writer t) t) %writer-matched))
+(defun %writer-matched (dw handle)
+  "Bump DW's PUBLICATION_MATCHED status; if a listener is installed for it, fire
+   on-publication-matched with a snapshot (resetting the *_change counters per DDS)."
+  (let ((snapshot nil))
+    (dds.pal:with-lock ((dw-status-lock dw))
+      (let ((s (dw-pub-matched dw)))
+        (incf (publication-matched-status-total-count s))
+        (incf (publication-matched-status-total-count-change s))
+        (incf (publication-matched-status-current-count s))
+        (incf (publication-matched-status-current-count-change s))
+        (setf (publication-matched-status-last-subscription-handle s) handle)
+        (when (and (dw-listener dw) (member :publication-matched (dw-listener-mask dw)))
+          (setf snapshot (copy-publication-matched-status s))
+          (setf (publication-matched-status-total-count-change s) 0
+                (publication-matched-status-current-count-change s) 0))))
+    (when snapshot (on-publication-matched (dw-listener dw) dw snapshot)))
+  t)
+
+(declaim (ftype (function (requested-incompatible-qos-status list) t) %apply-requested-incompatible))
+(defun %apply-requested-incompatible (s bad)
+  "Accumulate the failing policies BAD into a REQUESTED_INCOMPATIBLE_QOS status S
+   (one detection event): total_count++, per-policy QosPolicyCount bumps, last_policy_id."
+  (incf (requested-incompatible-qos-status-total-count s))
+  (incf (requested-incompatible-qos-status-total-count-change s))
+  (dolist (k bad)
+    (let ((pid (rxo-policy-id k)))
+      (setf (requested-incompatible-qos-status-policies s)
+            (bump-policy-count (requested-incompatible-qos-status-policies s) pid))
+      (setf (requested-incompatible-qos-status-last-policy-id s) pid)))
+  t)
+
+(declaim (ftype (function (offered-incompatible-qos-status list) t) %apply-offered-incompatible))
+(defun %apply-offered-incompatible (s bad)
+  "Accumulate the failing policies BAD into an OFFERED_INCOMPATIBLE_QOS status S."
+  (incf (offered-incompatible-qos-status-total-count s))
+  (incf (offered-incompatible-qos-status-total-count-change s))
+  (dolist (k bad)
+    (let ((pid (rxo-policy-id k)))
+      (setf (offered-incompatible-qos-status-policies s)
+            (bump-policy-count (offered-incompatible-qos-status-policies s) pid))
+      (setf (offered-incompatible-qos-status-last-policy-id s) pid)))
+  t)
+
+(declaim (ftype (function (data-reader list) t) %reader-incompatible))
+(defun %reader-incompatible (dr bad)
+  "Bump DR's REQUESTED_INCOMPATIBLE_QOS status; fire on-requested-incompatible-qos if a
+   listener is installed for it (snapshot OUTSIDE the lock, deep-copying the policies)."
+  (let ((snapshot nil))
+    (dds.pal:with-lock ((dr-status-lock dr))
+      (let ((s (dr-req-incompat dr)))
+        (%apply-requested-incompatible s bad)
+        (when (and (dr-listener dr) (member :requested-incompatible-qos (dr-listener-mask dr)))
+          (setf snapshot (copy-requested-incompatible-qos-status s))
+          (setf (requested-incompatible-qos-status-policies snapshot)
+                (mapcar #'copy-qos-policy-count (requested-incompatible-qos-status-policies s)))
+          (setf (requested-incompatible-qos-status-total-count-change s) 0))))
+    (when snapshot (on-requested-incompatible-qos (dr-listener dr) dr snapshot)))
+  t)
+
+(declaim (ftype (function (data-writer list) t) %writer-incompatible))
+(defun %writer-incompatible (dw bad)
+  "Bump DW's OFFERED_INCOMPATIBLE_QOS status; fire on-offered-incompatible-qos if a
+   listener is installed for it (snapshot OUTSIDE the lock, deep-copying the policies)."
+  (let ((snapshot nil))
+    (dds.pal:with-lock ((dw-status-lock dw))
+      (let ((s (dw-off-incompat dw)))
+        (%apply-offered-incompatible s bad)
+        (when (and (dw-listener dw) (member :offered-incompatible-qos (dw-listener-mask dw)))
+          (setf snapshot (copy-offered-incompatible-qos-status s))
+          (setf (offered-incompatible-qos-status-policies snapshot)
+                (mapcar #'copy-qos-policy-count (offered-incompatible-qos-status-policies s)))
+          (setf (offered-incompatible-qos-status-total-count-change s) 0))))
+    (when snapshot (on-offered-incompatible-qos (dw-listener dw) dw snapshot)))
+  t)
+
+;;; ---- get_*_status (app thread): snapshot + reset the *_change counters (DDS 1.4) ----
+
+(declaim (ftype (function (data-reader) subscription-matched-status) get-subscription-matched-status))
+(defun get-subscription-matched-status (dr)
+  "DataReader::get_subscription_matched_status — a snapshot; resets the *_change
+   counters per DDS read-resets-change semantics."
+  (dds.pal:with-lock ((dr-status-lock dr))
+    (let ((s (dr-sub-matched dr)))
+      (prog1 (copy-subscription-matched-status s)
+        (setf (subscription-matched-status-total-count-change s) 0
+              (subscription-matched-status-current-count-change s) 0)))))
+
+(declaim (ftype (function (data-writer) publication-matched-status) get-publication-matched-status))
+(defun get-publication-matched-status (dw)
+  "DataWriter::get_publication_matched_status — snapshot + reset the *_change counters."
+  (dds.pal:with-lock ((dw-status-lock dw))
+    (let ((s (dw-pub-matched dw)))
+      (prog1 (copy-publication-matched-status s)
+        (setf (publication-matched-status-total-count-change s) 0
+              (publication-matched-status-current-count-change s) 0)))))
+
+(declaim (ftype (function (data-reader) requested-incompatible-qos-status) get-requested-incompatible-qos-status))
+(defun get-requested-incompatible-qos-status (dr)
+  "DataReader::get_requested_incompatible_qos_status — snapshot (policies deep-copied)
+   + reset total_count_change; the cumulative policies counts are retained per DDS."
+  (dds.pal:with-lock ((dr-status-lock dr))
+    (let* ((s (dr-req-incompat dr))
+           (snap (copy-requested-incompatible-qos-status s)))
+      (setf (requested-incompatible-qos-status-policies snap)
+            (mapcar #'copy-qos-policy-count (requested-incompatible-qos-status-policies s)))
+      (setf (requested-incompatible-qos-status-total-count-change s) 0)
+      snap)))
+
+(declaim (ftype (function (data-writer) offered-incompatible-qos-status) get-offered-incompatible-qos-status))
+(defun get-offered-incompatible-qos-status (dw)
+  "DataWriter::get_offered_incompatible_qos_status — snapshot (policies deep-copied)
+   + reset total_count_change; the cumulative policies counts are retained per DDS."
+  (dds.pal:with-lock ((dw-status-lock dw))
+    (let* ((s (dw-off-incompat dw))
+           (snap (copy-offered-incompatible-qos-status s)))
+      (setf (offered-incompatible-qos-status-policies snap)
+            (mapcar #'copy-qos-policy-count (offered-incompatible-qos-status-policies s)))
+      (setf (offered-incompatible-qos-status-total-count-change s) 0)
+      snap)))
+
+;;; ---- set_listener (DDS 1.4 Entity::set_listener) ----
+
+(declaim (ftype (function (data-reader (or null listener) list) data-reader) set-reader-listener))
+(defun set-reader-listener (dr listener mask)
+  "DataReader::set_listener — install LISTENER for the statuses named in MASK (a list
+   of status keywords, e.g. (:subscription-matched :requested-incompatible-qos))."
+  (dds.pal:with-lock ((dr-status-lock dr))
+    (setf (dr-listener dr) listener (dr-listener-mask dr) mask))
+  dr)
+
+(declaim (ftype (function (data-writer (or null listener) list) data-writer) set-writer-listener))
+(defun set-writer-listener (dw listener mask)
+  "DataWriter::set_listener — install LISTENER for the statuses named in MASK (a list
+   of status keywords, e.g. (:publication-matched :offered-incompatible-qos))."
+  (dds.pal:with-lock ((dw-status-lock dw))
+    (setf (dw-listener dw) listener (dw-listener-mask dw) mask))
+  dw)

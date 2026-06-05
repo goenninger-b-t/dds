@@ -22,7 +22,11 @@
 (defclass status-condition (wait-condition)
   ((entity :initarg :entity :reader sc-entity)
    (mask :initarg :mask :initform '(:data-available) :reader sc-mask))
-  (:documentation "Triggers when an enabled status of ENTITY is active (v1: DATA_AVAILABLE)."))
+  (:documentation "Triggers when an enabled status named in MASK is active on ENTITY.
+   v1 supports :data-available (reader has unread samples) plus the change-driven
+   statuses :subscription-matched / :requested-incompatible-qos (reader) and
+   :publication-matched / :offered-incompatible-qos (writer) — each active while its
+   status has an unread *_change, i.e. until the app calls the matching get_*_status."))
 
 (defclass wait-set ()
   ((conditions :initform '() :accessor ws-conditions))
@@ -58,11 +62,30 @@
 (defmethod condition-trigger-value ((c guard-condition)) (%wc-trigger c))
 (defmethod condition-trigger-value ((c read-condition))
   (plusp (%count-matching (rc-reader c) (rc-states c))))
+(declaim (ftype (function (entity keyword) t) %status-active-p))
+(defun %status-active-p (entity kind)
+  "Whether the communication status KIND is currently active on ENTITY (the trigger
+   predicate for a StatusCondition). :data-available follows unread samples; the
+   matched/incompatible kinds follow their *_change counter (reset by get_*_status)."
+  (case kind
+    (:data-available
+     (and (typep entity 'data-reader) (plusp (%count-matching entity '(:not-read)))))
+    (:subscription-matched
+     (and (typep entity 'data-reader)
+          (plusp (subscription-matched-status-total-count-change (dr-sub-matched entity)))))
+    (:requested-incompatible-qos
+     (and (typep entity 'data-reader)
+          (plusp (requested-incompatible-qos-status-total-count-change (dr-req-incompat entity)))))
+    (:publication-matched
+     (and (typep entity 'data-writer)
+          (plusp (publication-matched-status-total-count-change (dw-pub-matched entity)))))
+    (:offered-incompatible-qos
+     (and (typep entity 'data-writer)
+          (plusp (offered-incompatible-qos-status-total-count-change (dw-off-incompat entity)))))
+    (t nil)))
+
 (defmethod condition-trigger-value ((c status-condition))
-  (and (member :data-available (sc-mask c))
-       (typep (sc-entity c) 'data-reader)
-       (plusp (%count-matching (sc-entity c) '(:not-read)))
-       t))
+  (and (some (lambda (kind) (%status-active-p (sc-entity c) kind)) (sc-mask c)) t))
 
 (declaim (ftype (function () wait-set) make-wait-set))
 (defun make-wait-set () (make-instance 'wait-set))
