@@ -80,9 +80,13 @@
          (ssz  (%sym pkg "SERIALIZED-SIZE-" (string name)))
          (sszi (%sym pkg "%SSIZE-" (string name)))
          (dnto (%sym pkg "DESERIALIZE-INTO-" (string name)))
+         (khf  (%sym pkg "KEY-HASH-" (string name)))
+         (keys (remove-if-not (lambda (m) (getf m :key)) parsed))
          (tname (string-downcase (string name))))
     (unless (eq ext :final)
       (error "define-dds-type: only :final extensibility is supported in v1 (got ~s)" ext))
+    (when (some (lambda (m) (not (eq (getf m :kind) :scalar))) keys)
+      (error "define-dds-type: only scalar/string @key members are supported in v1"))
     (flet ((acc (m) (%sym pkg (string name) "-" (string (getf m :slot)))))
       `(progn
          (defstruct (,name (:constructor ,ctor))
@@ -142,6 +146,23 @@
          (declaim (ftype (function (,name &optional symbol) (integer 0)) ,ssz))
          (defun ,ssz (sample &optional (mode :xcdr2))
            (,sszi sample 0 mode))
+         ,@(when keys
+             `((declaim (ftype (function (,name) (simple-array (unsigned-byte 8) (16))) ,khf))
+               (defun ,khf (sample)
+                 "16-octet instance handle (DDS keyhash, FR-TYPE-5 / RTPS 2.5 §9.6.3.3):
+                  the @key members serialized big-endian; <=16 bytes used directly,
+                  zero-padded. >16 (MD5) is a later increment."
+                 (let ((buf (dds.core.buffer:make-octet-buffer 64))
+                       (out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+                   (let ((wc (dds.core.buffer:cursor buf :endianness :big)))
+                     ,@(loop for m in keys
+                             collect `(,(getf m :put) wc (,(acc m) sample) :xcdr1))
+                     (let ((len (dds.core.buffer:cursor-position wc)))
+                       (when (> len 16)
+                         (error "key-hash >16 octets requires MD5 (FR-TYPE-5, not yet implemented)"))
+                       (replace out (dds.core.buffer:octet-buffer-vec buf) :end2 len)))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
+                   out))))
          (let ((%pool (dds.types:make-sample-pool (function ,ctor) ,*sample-pool-capacity*)))
            (dds.types:register-type
             (dds.types:make-type-support
@@ -149,6 +170,7 @@
              :serialize (function ,ser)
              :deserialize (function ,des)
              :serialized-size (function ,ssz)
+             :key-hash ,(when keys `(function ,khf))
              :sample-pool-alloc (lambda () (dds.types:sample-pool-acquire %pool))
              :sample-pool-free (lambda (s) (dds.types:sample-pool-release %pool s)))))
          ',name))))

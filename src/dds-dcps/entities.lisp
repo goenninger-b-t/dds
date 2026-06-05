@@ -40,7 +40,36 @@
 (defclass data-reader (entity)
   ((topic :initarg :topic :reader dr-topic)
    (subscriber :initarg :subscriber :reader dr-subscriber)
-   (last-taken :initform 0 :accessor dr-last-taken)))
+   (cache :initform '() :accessor dr-cache)                       ; list of cached-sample
+   (instances :initform (make-hash-table :test 'equalp) :accessor dr-instances) ; handle -> accessed-p
+   (drained :initform 0 :accessor dr-drained)))                  ; highest engine SN drained
+
+;;; ---- SampleInfo + cached samples (FR-DCPS-4) ----
+
+(defstruct (sample-info (:constructor make-sample-info))
+  "DDS 1.4 SampleInfo (dds_rtf2_dcps.idl §SampleInfo). v1 populates the three states +
+   valid-data + instance-handle; source/publication handle, generation counts and the
+   ranks default to 0/nil and are filled in by later increments. State kinds are kept
+   as keywords (READ/NOT_READ, NEW/NOT_NEW, ALIVE/NOT_ALIVE_DISPOSED/_NO_WRITERS).
+   sequence-number is a vendor extension (the RTPS writer SN)."
+  (sample-state :not-read :type (member :read :not-read))
+  (view-state :new :type (member :new :not-new))
+  (instance-state :alive :type (member :alive :not-alive-disposed :not-alive-no-writers))
+  (source-timestamp nil)
+  (instance-handle nil)
+  (publication-handle nil)
+  (disposed-generation-count 0 :type integer)
+  (no-writers-generation-count 0 :type integer)
+  (sample-rank 0 :type integer)
+  (generation-rank 0 :type integer)
+  (absolute-generation-rank 0 :type integer)
+  (valid-data t)
+  (sequence-number 0 :type integer))
+
+(defstruct (cached-sample (:constructor make-cached-sample))
+  "A read/take result element: the deserialized DATA + its SAMPLE-INFO."
+  (data nil)
+  (info nil :type (or null sample-info)))
 
 ;;; ---- type-support serialization helpers (PLAIN_CDR2_LE SerializedPayload) ----
 
@@ -184,16 +213,84 @@
     (dds.disc:publish-sample node (%serialize-sample (topic-type-support (dw-topic dw)) sample))
     t))
 
-(declaim (ftype (function (data-reader) list) take-samples))
-(defun take-samples (dr)
-  "DataReader::take — return the list of newly-received samples (deserialized via the
-   topic type-support), in SN order; each is returned once (take semantics). v1 has
-   no SampleInfo / instance-state selection yet."
+(defparameter +instance-handle-nil+
+  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+  "HANDLE_NIL — the instance handle for an unkeyed type (single instance).")
+
+(declaim (ftype (function (t t) (simple-array (unsigned-byte 8) (16))) %instance-handle))
+(defun %instance-handle (ts sample)
+  "16-octet instance handle for SAMPLE via the type-support key-hash, or HANDLE_NIL
+   for an unkeyed type."
+  (let ((kh (dds.types:type-support-key-hash ts)))
+    (if kh (funcall kh sample) +instance-handle-nil+)))
+
+(declaim (ftype (function (data-reader) t) %drain))
+(defun %drain (dr)
+  "Pull newly-received raw samples from the engine, deserialize, assign each to its
+   instance, and append to the reader cache with fresh SampleInfo (NOT_READ, ALIVE)."
   (let* ((node (dp-node (sub-participant (dr-subscriber dr))))
-         (ts (topic-type-support (dr-topic dr)))
-         (out '()))
-    (dolist (sn (sort (dds.disc:node-sample-sns node) #'<) (nreverse out))
-      (when (> sn (dr-last-taken dr))
-        (setf (dr-last-taken dr) sn)
+         (ts (topic-type-support (dr-topic dr))))
+    (dolist (sn (sort (dds.disc:node-sample-sns node) #'<))
+      (when (> sn (dr-drained dr))
+        (setf (dr-drained dr) sn)
         (let ((bytes (dds.disc:node-sample node sn)))
-          (when bytes (push (%deserialize-sample ts bytes) out)))))))
+          (when bytes
+            (let* ((data (%deserialize-sample ts bytes))
+                   (handle (%instance-handle ts data)))
+              (unless (nth-value 1 (gethash handle (dr-instances dr)))
+                (setf (gethash handle (dr-instances dr)) nil))   ; nil = not yet accessed
+              (setf (dr-cache dr)
+                    (nconc (dr-cache dr)
+                           (list (make-cached-sample
+                                  :data data
+                                  :info (make-sample-info
+                                         :sample-state :not-read :view-state :new
+                                         :instance-state :alive :valid-data t
+                                         :instance-handle handle :sequence-number sn))))))))))))
+
+(declaim (ftype (function (data-reader &key (:states list)) list) read-samples))
+(defun read-samples (dr &key (states '(:read :not-read)))
+  "DataReader::read — return the cached samples whose sample-state is in STATES
+   (default ANY_SAMPLE_STATE, both read + not-read, per DDS 1.4) WITHOUT removing
+   them; mark each READ and set its SampleInfo view-state (NEW the first time the
+   instance is accessed, else NOT_NEW). Returns a list of cached-sample (data + info)."
+  (%drain dr)
+  (let ((out '()) (touched '()))
+    (dolist (cs (dr-cache dr))
+      (let ((info (cached-sample-info cs)))
+        (when (member (sample-info-sample-state info) states)
+          (let ((handle (sample-info-instance-handle info)))
+            (setf (sample-info-view-state info)
+                  (if (gethash handle (dr-instances dr)) :not-new :new))
+            (pushnew handle touched :test #'equalp))
+          (setf (sample-info-sample-state info) :read)
+          (push cs out))))
+    (dolist (h touched) (setf (gethash h (dr-instances dr)) t))   ; mark accessed after snapshot
+    (nreverse out)))
+
+(declaim (ftype (function (data-reader &key (:states list)) list) take-samples))
+(defun take-samples (dr &key (states '(:read :not-read)))
+  "DataReader::take — like read-samples but REMOVE the returned samples from the
+   cache (default takes both read and unread). Returns a list of cached-sample."
+  (%drain dr)
+  (let ((keep '()) (out '()) (touched '()))
+    (dolist (cs (dr-cache dr))
+      (let ((info (cached-sample-info cs)))
+        (if (member (sample-info-sample-state info) states)
+            (progn
+              (let ((handle (sample-info-instance-handle info)))
+                (setf (sample-info-view-state info)
+                      (if (gethash handle (dr-instances dr)) :not-new :new))
+                (pushnew handle touched :test #'equalp))
+              (push cs out))
+            (push cs keep))))
+    (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
+    (setf (dr-cache dr) (nreverse keep))
+    (nreverse out)))
+
+(declaim (ftype (function (data-reader) (integer 0)) samples-available))
+(defun samples-available (dr)
+  "Drain newly-received samples into the cache and return the cache size, WITHOUT
+   marking anything READ — for polling before a read/take."
+  (%drain dr)
+  (length (dr-cache dr)))

@@ -41,5 +41,13 @@
            #:create-participant #:delete-participant
            #:create-publisher #:create-subscriber #:create-topic
            #:create-datawriter #:create-datareader
-           #:write-sample #:take-samples
+           #:write-sample #:read-samples #:take-samples #:samples-available
+           #:sample-info #:make-sample-info
+           #:sample-info-sample-state #:sample-info-view-state #:sample-info-instance-state
+           #:sample-info-source-timestamp #:sample-info-instance-handle
+           #:sample-info-publication-handle #:sample-info-valid-data
+           #:sample-info-disposed-generation-count #:sample-info-no-writers-generation-count
+           #:sample-info-sample-rank #:sample-info-generation-rank
+           #:sample-info-absolute-generation-rank #:sample-info-sequence-number
+           #:cached-sample #:cached-sample-data #:cached-sample-info
            #:spin #:discovered-count #:matched-count))

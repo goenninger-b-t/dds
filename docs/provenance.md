@@ -59,6 +59,25 @@ No RTI artifacts involved; the dissector is the OMG-spec-derived oracle.
   recognized as `ENTITYID_BUILTIN_PARTICIPANT_WRITER (0x000100c2)`, guidPrefix,
   flags, and sequence numbers all parse correctly. Repeatable via `make wire`.
 
+## M3 (2026-06-05) — DCPS (P2)
+
+DDS 1.4 DCPS spec added to `docs/specs/` by the owner (`dds-1_4-dcps.pdf`,
+`dds_rtf2_dcps.idl`, `dds_rtf2_dlrl.idl`) — the required clean-room source for P2.
+
+- **QoS RxO** pinned from **DDS 1.4 §2.2.3** (the RxO compatibility table) →
+  `src/dds-dcps/qos.lisp`. (Implemented before the spec PDF was in-repo; the table is
+  standard and was cited inline — now backed by the in-repo spec.)
+- **SampleInfo + state kinds** pinned from the machine-readable **`dds_rtf2_dcps.idl
+  §SampleInfo`** (the 12 fields) and the SampleState/ViewState/InstanceState kind
+  constants (READ/NOT_READ, NEW/NOT_NEW, ALIVE/NOT_ALIVE_DISPOSED/_NO_WRITERS) →
+  `src/dds-dcps/entities.lisp`. State kinds kept as keywords in-Lisp; `sequence-number`
+  is a documented vendor extension.
+- **Instance keyhash** (the 16-octet instance handle) from **RTPS 2.5 §9.6.3.3 /
+  XTypes FR-TYPE-5**: @key members serialized big-endian, ≤16 bytes used directly
+  (the >16 → MD5 path is a later increment, needs ironclad) → emitted by
+  `define-dds-type` into the type-support `key-hash` slot (`src/dds-gen/dsl.lisp`).
+- Still **no RTI/Fast DDS/Cyclone/OpenDDS source** consulted.
+
 ## Third-party runtime dependencies (licenses apply; not vendored yet)
 
 | Dependency | Use | License |

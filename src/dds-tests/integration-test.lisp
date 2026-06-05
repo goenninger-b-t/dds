@@ -196,12 +196,73 @@
            (dds.dcps:write-sample dw (make-dcps-msg :id 42 :text "hello-dcps"))
            (let ((got nil))
              (loop repeat 150 until got
-                   do (let ((s (dds.dcps:take-samples dr))) (when s (setf got (first s))))
+                   do (let ((s (dds.dcps:take-samples dr)))
+                        (when s (setf got (dds.dcps:cached-sample-data (first s)))))
                       (sleep 0.02))
              (%check :dcps-take (and got t) "DataReader::take returned no sample over DCPS")
              (%check :dcps-fields
                      (and (= 42 (dcps-msg-id got)) (string= "hello-dcps" (dcps-msg-text got)))
                      "DCPS sample fields did not survive write/take")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
+;;; Instance lifecycle + read/take + SampleInfo (M3 #2, FR-DCPS-4). Uses the keyed
+;;; shape-type (key = color): two colors -> two instances; read is non-destructive +
+;;; marks samples READ + transitions per-instance view-state NEW->NOT_NEW; take removes.
+
+(declaim (ftype (function (dds.dcps:cached-sample) t) %cs-vs))
+(defun %cs-vs (cs) (dds.dcps:sample-info-view-state (dds.dcps:cached-sample-info cs)))
+(declaim (ftype (function (dds.dcps:cached-sample) t) %cs-ss))
+(defun %cs-ss (cs) (dds.dcps:sample-info-sample-state (dds.dcps:cached-sample-info cs)))
+(declaim (ftype (function (dds.dcps:cached-sample) t) %cs-ih))
+(defun %cs-ih (cs) (dds.dcps:sample-info-instance-handle (dds.dcps:cached-sample-info cs)))
+
+(declaim (ftype (function () t) run-dcps-instance-test))
+(defun run-dcps-instance-test ()
+  "DCPS instance lifecycle + read/take + SampleInfo (FR-DCPS-4) on the keyed
+   shape-type: write 3 samples in 2 instances (BLUE x2, RED x1); assert instance
+   grouping, READ marking + non-destructive read, view-state NEW->NOT_NEW, and take
+   removal."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr)))
+           (loop repeat 100
+                 until (and (plusp (dds.dcps:discovered-count p1)) (plusp (dds.dcps:discovered-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+           (dds.dcps:write-sample dw (make-shape-type :color "RED"  :x 2 :y 2 :shapesize 20))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 3 :y 3 :shapesize 30))
+           (loop repeat 200 until (>= (dds.dcps:samples-available dr) 3) do (sleep 0.02))
+           (%check :inst-available (>= (dds.dcps:samples-available dr) 3)
+                   "reader did not receive 3 samples")
+           ;; first read of the unread samples
+           (let ((r1 (dds.dcps:read-samples dr :states '(:not-read))))
+             (%check :inst-count (= 3 (length r1)) "expected 3 unread samples")
+             (%check :inst-2-instances
+                     (= 2 (length (remove-duplicates (mapcar #'%cs-ih r1) :test #'equalp)))
+                     "expected 2 instances (BLUE, RED)")
+             (%check :inst-view-new (every (lambda (cs) (eq :new (%cs-vs cs))) r1)
+                     "first read view-state must be NEW")
+             (%check :inst-marked-read (every (lambda (cs) (eq :read (%cs-ss cs))) r1)
+                     "read must mark samples READ"))
+           ;; no unread remain; read is non-destructive (ANY default still returns 3, now NOT_NEW)
+           (%check :inst-no-unread (null (dds.dcps:read-samples dr :states '(:not-read)))
+                   "no unread samples should remain after read")
+           (let ((r2 (dds.dcps:read-samples dr)))
+             (%check :inst-nondestructive (= 3 (length r2)) "read must not remove samples")
+             (%check :inst-view-notnew (every (lambda (cs) (eq :not-new (%cs-vs cs))) r2)
+                     "view-state must be NOT_NEW after first instance access"))
+           ;; take removes everything
+           (%check :inst-take (= 3 (length (dds.dcps:take-samples dr))) "take must return all 3")
+           (%check :inst-emptied (zerop (dds.dcps:samples-available dr)) "take must remove all"))
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))
     t))
