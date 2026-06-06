@@ -486,3 +486,55 @@
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))
     t))
+
+;;; QueryCondition (M3 #3 follow-up, FR-DCPS-2/5): a ReadCondition + a query predicate.
+;;; A sample failing the predicate must NOT trigger the WaitSet even while unread; a
+;;; matching sample triggers it; read_w_condition returns only the matching samples.
+;;; v1 takes a Lisp predicate (the DDS SQL-subset grammar is #4).
+
+(declaim (ftype (function () t) run-dcps-query-condition-test))
+(defun run-dcps-query-condition-test ()
+  "QueryCondition (FR-DCPS-2/5): a ReadCondition + a predicate (id > 50). A sample that
+   fails the predicate does NOT trigger the WaitSet though unread; a sample that passes
+   triggers it; read_w_condition returns only the matching samples and marks them read,
+   leaving the non-matching sample in the cache."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "QueryTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "QueryTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (qc (dds.dcps:create-querycondition
+                     dr :states '(:not-read) :query (lambda (m) (> (dcps-msg-id m) 50))))
+                (ws (dds.dcps:make-wait-set)))
+           (dds.dcps:attach-condition ws qc)
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           ;; a non-matching sample (id=10) arrives but must NOT trigger the query
+           (dds.dcps:write-sample dw (make-dcps-msg :id 10 :text "low"))
+           (loop repeat 150 until (plusp (dds.dcps:samples-available dr)) do (sleep 0.02))
+           (%check :qc-nonmatch-present (plusp (dds.dcps:samples-available dr))
+                   "the low (id=10) sample must have arrived")
+           (%check :qc-nontrigger (null (dds.dcps:wait-set-wait ws 0.2))
+                   "QueryCondition must NOT trigger on a sample failing the predicate")
+           ;; a matching sample (id=99) triggers it
+           (dds.dcps:write-sample dw (make-dcps-msg :id 99 :text "high"))
+           (%check :qc-trigger (and (member qc (dds.dcps:wait-set-wait ws 3.0)) t)
+                   "QueryCondition must trigger once a matching sample arrives")
+           ;; read_w_condition returns only the matching sample and marks it read
+           (let ((got (dds.dcps:read-w-condition dr qc)))
+             (%check :qc-read-one (= 1 (length got))
+                     "read_w_condition must return exactly the matching sample")
+             (%check :qc-read-id (= 99 (dcps-msg-id (dds.dcps:cached-sample-data (first got))))
+                     "read_w_condition must return the id=99 sample"))
+           (%check :qc-cache-intact (= 2 (dds.dcps:samples-available dr))
+                   "read_w_condition must not remove samples (both remain cached)")
+           (%check :qc-reread-empty (null (dds.dcps:read-w-condition dr qc))
+                   "no unread matching samples remain after read_w_condition"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))

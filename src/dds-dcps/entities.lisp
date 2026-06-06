@@ -262,17 +262,26 @@
                                          :instance-state :alive :valid-data t
                                          :instance-handle handle :sequence-number sn))))))))))))
 
-(declaim (ftype (function (data-reader &key (:states list)) list) read-samples))
-(defun read-samples (dr &key (states '(:read :not-read)))
+(declaim (ftype (function (t) (eql t)) %where-any))
+(defun %where-any (sample)
+  "The default read/take WHERE predicate — selects every sample (no query filter)."
+  (declare (ignore sample))
+  t)
+
+(declaim (ftype (function (data-reader &key (:states list) (:where function)) list) read-samples))
+(defun read-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
   "DataReader::read — return the cached samples whose sample-state is in STATES
-   (default ANY_SAMPLE_STATE, both read + not-read, per DDS 1.4) WITHOUT removing
-   them; mark each READ and set its SampleInfo view-state (NEW the first time the
-   instance is accessed, else NOT_NEW). Returns a list of cached-sample (data + info)."
+   (default ANY_SAMPLE_STATE, both read + not-read, per DDS 1.4) and whose data
+   satisfies WHERE (a predicate over the deserialized sample; %where-any by default —
+   the query-condition filter for read_w_condition) WITHOUT removing them; mark each
+   READ and set its SampleInfo view-state (NEW the first time the instance is accessed,
+   else NOT_NEW). Returns a list of cached-sample (data + info)."
   (%drain dr)
   (let ((out '()) (touched '()))
     (dolist (cs (dr-cache dr))
       (let ((info (cached-sample-info cs)))
-        (when (member (sample-info-sample-state info) states)
+        (when (and (member (sample-info-sample-state info) states)
+                   (funcall where (cached-sample-data cs)))
           (let ((handle (sample-info-instance-handle info)))
             (setf (sample-info-view-state info)
                   (if (gethash handle (dr-instances dr)) :not-new :new))
@@ -282,15 +291,17 @@
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))   ; mark accessed after snapshot
     (nreverse out)))
 
-(declaim (ftype (function (data-reader &key (:states list)) list) take-samples))
-(defun take-samples (dr &key (states '(:read :not-read)))
+(declaim (ftype (function (data-reader &key (:states list) (:where function)) list) take-samples))
+(defun take-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
   "DataReader::take — like read-samples but REMOVE the returned samples from the
-   cache (default takes both read and unread). Returns a list of cached-sample."
+   cache (default takes both read and unread). WHERE is the same optional query
+   predicate (take_w_condition filter). Returns a list of cached-sample."
   (%drain dr)
   (let ((keep '()) (out '()) (touched '()))
     (dolist (cs (dr-cache dr))
       (let ((info (cached-sample-info cs)))
-        (if (member (sample-info-sample-state info) states)
+        (if (and (member (sample-info-sample-state info) states)
+                 (funcall where (cached-sample-data cs)))
             (progn
               (let ((handle (sample-info-instance-handle info)))
                 (setf (sample-info-view-state info)

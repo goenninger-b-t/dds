@@ -27,8 +27,10 @@
            #:sample-info-absolute-generation-rank #:sample-info-sequence-number
            #:cached-sample #:cached-sample-data #:cached-sample-info
            #:spin #:discovered-count #:matched-count
-           #:wait-condition #:guard-condition #:read-condition #:status-condition #:wait-set
+           #:wait-condition #:guard-condition #:read-condition #:query-condition
+           #:status-condition #:wait-set
            #:make-guard-condition #:set-trigger-value #:create-readcondition
+           #:create-querycondition #:qc-query-fn #:read-w-condition #:take-w-condition
            #:make-status-condition #:make-wait-set
            #:attach-condition #:detach-condition #:wait-set-wait #:condition-trigger-value
            ;; Communication statuses (FR-DCPS-3)
