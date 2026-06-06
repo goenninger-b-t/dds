@@ -813,3 +813,45 @@
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))
     t))
+
+;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
+;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
+
+(declaim (ftype (function () t) run-dcps-builtin-topics-test))
+(defun run-dcps-builtin-topics-test ()
+  "Builtin-topic readers (FR-DCPS-6): two participants discover each other; the
+   DCPSParticipant / DCPSPublication / DCPSSubscription / DCPSTopic readers expose the
+   discovered participant, the remote writer/reader (topic+type), and the topic."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "BTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "BTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr)))
+           (declare (ignore dw dr))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :bi-participants (plusp (length (dds.dcps:get-builtin-participant-data p1)))
+                   "DCPSParticipant must list the discovered remote participant")
+           (%check :bi-subscription
+                   (find-if (lambda (s)
+                              (and (string= "BTopic" (dds.dcps:subscription-builtin-topic-data-topic-name s))
+                                   (string= "dcps-msg" (dds.dcps:subscription-builtin-topic-data-type-name s))))
+                            (dds.dcps:get-builtin-subscription-data p1))
+                   "DCPSSubscription on p1 must list p2's reader (BTopic, dcps-msg)")
+           (%check :bi-publication
+                   (find-if (lambda (pp)
+                              (string= "BTopic" (dds.dcps:publication-builtin-topic-data-topic-name pp)))
+                            (dds.dcps:get-builtin-publication-data p2))
+                   "DCPSPublication on p2 must list p1's writer (BTopic)")
+           (%check :bi-topic
+                   (find "BTopic" (dds.dcps:get-builtin-topic-data p1)
+                         :key #'dds.dcps:topic-builtin-topic-data-name :test #'string=)
+                   "DCPSTopic on p1 must include BTopic"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))

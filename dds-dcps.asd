@@ -12,5 +12,6 @@
                (:file "listeners")
                (:file "entities")
                (:file "conditions")
-               (:file "filter"))
+               (:file "filter")
+               (:file "builtin"))
   :in-order-to ((test-op (test-op "dds-tests"))))

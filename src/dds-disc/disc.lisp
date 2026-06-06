@@ -38,6 +38,8 @@
   (matches (make-hash-table :test 'equalp) :type hash-table)
   (incompat (make-hash-table :test 'equalp) :type hash-table)
   (inconsistent (make-hash-table :test 'equalp) :type hash-table)
+  (discovered-writers (make-hash-table :test 'equalp) :type hash-table) ; all remote publications
+  (discovered-readers (make-hash-table :test 'equalp) :type hash-table) ; all remote subscriptions
   (local-writers '() :type list)
   (local-readers '() :type list)
   (lock (dds.pal:make-lock "disc-node"))
@@ -313,6 +315,25 @@
   (when (disc-node-on-incompatible-qos node)
     (funcall (disc-node-on-incompatible-qos node) kind remote bad)))
 
+(declaim (ftype (function (hash-table dds.rtps.discovery:endpoint-data) t) %record-discovered))
+(defun %record-discovered (table remote)
+  "Record a discovered remote endpoint REMOTE in TABLE keyed by its 16-octet GUID
+   (lock-free; TABLE is guarded by the caller). Latest data wins; used by the builtin-
+   topic readers (FR-DCPS-6) to surface ALL discovered endpoints, matched or not."
+  (setf (gethash (copy-seq (dds.rtps.discovery:endpoint-data-guid remote)) table) remote))
+
+(declaim (ftype (function (disc-node) list) disc-node-discovered-writers-list))
+(defun disc-node-discovered-writers-list (node)
+  "Snapshot of every discovered remote publication (endpoint-data), lock-guarded."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (loop for v being the hash-values of (disc-node-discovered-writers node) collect v)))
+
+(declaim (ftype (function (disc-node) list) disc-node-discovered-readers-list))
+(defun disc-node-discovered-readers-list (node)
+  "Snapshot of every discovered remote subscription (endpoint-data), lock-guarded."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (loop for v being the hash-values of (disc-node-discovered-readers node) collect v)))
+
 (declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) t) %match-remote-writer))
 (defun %match-remote-writer (node remote)
   "REMOTE is a discovered publication. Test it against each local reader: on the first
@@ -392,13 +413,19 @@
                    (dds.core.buffer:cursor-set-position pc poff)
                    (dds.cdr:parse-encapsulation-header pc)
                    (let ((ep (dds.rtps.discovery:parse-endpoint-data pc)))
-                     (when ep (%match-remote-writer node ep)))))
+                     (when ep
+                       (dds.pal:with-lock ((disc-node-lock node))
+                         (%record-discovered (disc-node-discovered-writers node) ep))
+                       (%match-remote-writer node ep)))))
                 ((= wtr dds.rtps.discovery:+entityid-sedp-sub-writer+)
                  (let ((pc (dds.core.buffer:cursor buf :endianness :little)))
                    (dds.core.buffer:cursor-set-position pc poff)
                    (dds.cdr:parse-encapsulation-header pc)
                    (let ((ep (dds.rtps.discovery:parse-endpoint-data pc)))
-                     (when ep (%match-remote-reader node ep)))))
+                     (when ep
+                       (dds.pal:with-lock ((disc-node-lock node))
+                         (%record-discovered (disc-node-discovered-readers node) ep))
+                       (%match-remote-reader node ep)))))
                 ((disc-node-on-data node)
                  (funcall (disc-node-on-data node) wtr sn buf poff plen))))))
          ((and (= id dds.rtps.message:+submsg-heartbeat+) (disc-node-on-heartbeat node))

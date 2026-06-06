@@ -80,4 +80,17 @@
            #:compile-filter #:lex-filter #:filter-error #:filter-error-detail
            #:content-filtered-topic #:create-contentfilteredtopic
            #:set-cft-expression-parameters
-           #:cft-name #:cft-related-topic #:cft-expression #:cft-parameters))
+           #:cft-name #:cft-related-topic #:cft-expression #:cft-parameters
+           ;; Builtin topics (FR-DCPS-6)
+           #:participant-builtin-topic-data #:participant-builtin-topic-data-key
+           #:publication-builtin-topic-data #:subscription-builtin-topic-data
+           #:topic-builtin-topic-data
+           #:publication-builtin-topic-data-key #:publication-builtin-topic-data-participant-key
+           #:publication-builtin-topic-data-topic-name #:publication-builtin-topic-data-type-name
+           #:publication-builtin-topic-data-reliability #:publication-builtin-topic-data-durability
+           #:subscription-builtin-topic-data-key #:subscription-builtin-topic-data-participant-key
+           #:subscription-builtin-topic-data-topic-name #:subscription-builtin-topic-data-type-name
+           #:subscription-builtin-topic-data-reliability #:subscription-builtin-topic-data-durability
+           #:topic-builtin-topic-data-name #:topic-builtin-topic-data-type-name
+           #:get-builtin-participant-data #:get-builtin-publication-data
+           #:get-builtin-subscription-data #:get-builtin-topic-data))
