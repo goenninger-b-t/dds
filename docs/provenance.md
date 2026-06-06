@@ -86,6 +86,23 @@ DDS 1.4 DCPS spec added to `docs/specs/` by the owner (`dds-1_4-dcps.pdf`,
   (PID_DURABILITY: TRANSIENT_LOCAL). → `src/dds-rtps/discovery.lisp`.
 - Still **no RTI/Fast DDS/Cyclone/OpenDDS source** consulted.
 
+## M4 (2026-06-06) — XTypes (P3), start
+
+- **MD5 (RFC 1321)** implemented **clean-room from the algorithm description in RFC
+  1321** (the public byte/round/constant definition: the K[i]=floor(2^32·|sin(i+1)|)
+  table, the per-round shifts, the F/G/H/I round functions, little-endian length
+  padding). No third-party MD5 source (ironclad/openssl/etc.) was read or copied —
+  owner chose to vendor rather than add a dependency. Used as a **content/identity
+  hash only** (XTypes EquivalenceHash/NameHash FR-TYPE-2, the >16-byte keyhash
+  FR-TYPE-5); it is explicitly **NOT** a DDS-Security primitive (FR-SEC-2 still
+  mandates vetted native crypto for the security profile). → `src/dds-core/md5.lisp`.
+  Verified byte-exact against the **RFC 1321 §A.5 test suite** and the **XTypes 1.3
+  TypeObject NameHash example** (MD5("color")[0:4] = {0x70,0xDD,0xA5,0xDF}).
+- **XTypes 1.3 TypeObject IDL** (`docs/specs/xtypes-1_3_typeobject.idl`) read to pin
+  the TypeIdentifier/TypeObject data model, the EquivalenceKind/TypeKind octets, and
+  the EquivalenceHash rule (first 14 octets of MD5 of the XCDR2-LE MinimalTypeObject).
+- Still **no RTI/Fast DDS/Cyclone/OpenDDS source** consulted.
+
 ## Third-party runtime dependencies (licenses apply; not vendored yet)
 
 | Dependency | Use | License |

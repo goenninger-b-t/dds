@@ -174,9 +174,45 @@
       (dds.core.arena:teardown-arena arena)
       t)))
 
+;;; MD5 (RFC 1321) — vendored clean-room (M4 foundation for XTypes EquivalenceHash/
+;;; NameHash + the >16-byte keyhash). Verified byte-exact against the RFC 1321 test
+;;; suite AND the XTypes spec NameHash example ("color" -> 70 dd a5 df).
+
+(declaim (ftype (function (string) (simple-array (unsigned-byte 8) (*))) %ascii-octets))
+(defun %ascii-octets (s)
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code s))
+
+(declaim (ftype (function (string) (simple-array (unsigned-byte 8) (*))) %hex-octets))
+(defun %hex-octets (hex)
+  (let ((out (make-array (floor (length hex) 2) :element-type '(unsigned-byte 8))))
+    (dotimes (i (length out) out)
+      (setf (aref out i) (parse-integer hex :start (* 2 i) :end (+ 2 (* 2 i)) :radix 16)))))
+
+(declaim (ftype (function () t) run-md5-test))
+(defun run-md5-test ()
+  "MD5 byte-exactness vs the RFC 1321 test suite + the XTypes NameHash example."
+  (flet ((chk (name input expected-hex)
+           (%check name (equalp (dds.core.md5:md5 (%ascii-octets input)) (%hex-octets expected-hex))
+                   (format nil "MD5(~s) mismatch" input))))
+    (chk :md5-empty  "" "d41d8cd98f00b204e9800998ecf8427e")
+    (chk :md5-a      "a" "0cc175b9c0f1b6a831c399e269772661")
+    (chk :md5-abc    "abc" "900150983cd24fb0d6963f7d28e17f72")
+    (chk :md5-msg    "message digest" "f96b697d7cb7938d525a2f31aaf161d0")
+    (chk :md5-alpha  "abcdefghijklmnopqrstuvwxyz" "c3fcd3d76192e4007dfb496cca67e13b")
+    ;; 80 octets -> spans two blocks (exercises the multi-block + padding path)
+    (chk :md5-80     "12345678901234567890123456789012345678901234567890123456789012345678901234567890"
+                     "57edf4a22be3c955ac49da2e2107b67a")
+    ;; XTypes 1.3 §TypeObject NameHash example: MD5("color")[0:4] = 70 dd a5 df
+    (%check :md5-namehash-color
+            (equalp (subseq (dds.core.md5:md5 (%ascii-octets "color")) 0 4)
+                    (octets #x70 #xdd #xa5 #xdf))
+            "XTypes NameHash example color -> 70 dd a5 df"))
+  t)
+
 (defun run-all-tests ()
   "Run every landed test; signal on first failure, else report and return T."
-  (let ((tests '(("echo-over-mock-transport" . run-echo-test)
+  (let ((tests '(("md5-rfc1321"               . run-md5-test)
+                 ("echo-over-mock-transport" . run-echo-test)
                  ("xcdr-codec-roundtrip"     . run-codec-roundtrip-test)
                  ("xcdr-byte-exact-seed"     . run-byte-exact-test)
                  ("xcdr-generated-type"      . run-generated-type-test)

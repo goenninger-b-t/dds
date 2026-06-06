@@ -19,6 +19,15 @@
            #:put-u64 #:get-u64 #:put-octets #:get-octets
            #:buffer-overflow))
 
+(defpackage #:net.goenninger.dds.core.md5
+  (:nicknames #:dds.core.md5)
+  (:use #:common-lisp)
+  (:documentation
+   "MD5 (RFC 1321), vendored clean-room. Content/identity hash for the XTypes
+    EquivalenceHash/NameHash (FR-TYPE-2) + the DDS keyhash >16-byte case (FR-TYPE-5).
+    NOT a DDS-Security primitive (FR-SEC-2 requires vetted native crypto).")
+  (:export #:md5))
+
 (defpackage #:net.goenninger.dds.core.arena
   (:nicknames #:dds.core.arena)
   (:use #:common-lisp)

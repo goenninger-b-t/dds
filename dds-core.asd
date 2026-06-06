@@ -6,5 +6,6 @@
   :serial t
   :components ((:file "packages")
                (:file "buffer")
-               (:file "arena"))
+               (:file "arena")
+               (:file "md5"))
   :in-order-to ((test-op (test-op "dds-tests"))))
