@@ -855,3 +855,34 @@
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))
     t))
+
+;;; DDS keyhash (M4, FR-TYPE-5 / RTPS 2.5 §9.6.4.8): the <=16-byte direct/zero-padded
+;;; path (spec Example 1, byte-exact) and the >16 MD5 path (an unbounded string key,
+;;; max size > 16 -> always MD5 of the PLAIN_CDR2 big-endian key serialization).
+
+(dds.gen:define-dds-type kh-keyed (:extensibility :final)
+  (id :i32 :key t)
+  (x :i32))
+
+(declaim (ftype (function () t) run-keyhash-test))
+(defun run-keyhash-test ()
+  "DDS keyhash byte-exactness (RTPS 2.5 §9.6.4.8): the <=16 direct path (Example 1) and
+   the >16 MD5 path; the handle depends only on the key value, distinctly."
+  ;; Example 1 (spec, byte-exact): @key long id=0x12345678 -> {12 34 56 78 00..00}
+  (%check :kh-direct
+          (equalp (key-hash-kh-keyed (make-kh-keyed :id #x12345678 :x 10))
+                  (octets #x12 #x34 #x56 #x78 0 0 0 0 0 0 0 0 0 0 0 0))
+          "fixed <=16 key = big-endian XCDR2 bytes zero-padded to 16")
+  ;; unbounded string key (max > 16) -> MD5 of PLAIN_CDR2 BE: u32 len(incl NUL)=5, BLUE, NUL
+  (%check :kh-md5
+          (equalp (key-hash-shape-type (make-shape-type :color "BLUE" :x 1 :y 2 :shapesize 3))
+                  (dds.core.md5:md5 (octets #x00 #x00 #x00 #x05 #x42 #x4c #x55 #x45 #x00)))
+          "string key = MD5 of its big-endian XCDR2 serialization")
+  ;; identity: depends only on the key; distinct per key value
+  (%check :kh-identity
+          (and (equalp (key-hash-shape-type (make-shape-type :color "RED" :x 1 :y 1 :shapesize 1))
+                       (key-hash-shape-type (make-shape-type :color "RED" :x 9 :y 9 :shapesize 9)))
+               (not (equalp (key-hash-shape-type (make-shape-type :color "RED" :x 0 :y 0 :shapesize 0))
+                            (key-hash-shape-type (make-shape-type :color "BLUE" :x 0 :y 0 :shapesize 0)))))
+          "keyhash depends only on the key, distinctly per value")
+  t)

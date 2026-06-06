@@ -218,6 +218,7 @@
                  ("xcdr-generated-type"      . run-generated-type-test)
                  ("xcdr-generated-sequence"  . run-generated-sequence-test)
                  ("xcdr-generated-nested"    . run-generated-nested-test)
+                 ("dds-keyhash"              . run-keyhash-test)
                  ("zero-alloc-into"          . run-generated-into-test)
                  ("rtps-wire-byte-exact"     . run-rtps-wire-test)
                  ("rtps-seqnum-bitmap"       . run-rtps-seqnum-test)

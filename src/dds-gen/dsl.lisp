@@ -64,6 +64,19 @@
                :key (getf opts :key))))
       (t (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec)))))
 
+(declaim (ftype (function (list) t) %key-max-size))
+(defun %key-max-size (keys)
+  "Maximum PLAIN_CDR2 (XCDR2, max alignment 4) serialized size of the key holder built
+   from the scalar @key members KEYS, or :UNBOUNDED if any key is variable-size (a
+   string). Drives the RTPS 2.5 §9.6.4.8 <=16-direct vs >16-MD5 keyhash decision, which
+   is a per-TYPE property (the max size), not a per-sample one."
+  (let ((pos 0))
+    (dolist (m keys pos)
+      (when (getf m :var) (return :unbounded))
+      (let ((a (min (getf m :align) 4)))
+        (setf pos (* (ceiling pos a) a))
+        (incf pos (getf m :size))))))
+
 (defmacro define-dds-type (name options &body members)
   "Define a DDS topic type NAME from an s-expr spec. OPTIONS is a plist (only
    :extensibility, default :final, in v1). Each MEMBER is (slot-name member-type
@@ -82,6 +95,8 @@
          (dnto (%sym pkg "DESERIALIZE-INTO-" (string name)))
          (khf  (%sym pkg "KEY-HASH-" (string name)))
          (keys (remove-if-not (lambda (m) (getf m :key)) parsed))
+         (keymax (%key-max-size keys))
+         (key-direct-p (and (integerp keymax) (<= keymax 16)))
          (tname (string-downcase (string name))))
     (unless (eq ext :final)
       (error "define-dds-type: only :final extensibility is supported in v1 (got ~s)" ext))
@@ -149,18 +164,22 @@
          ,@(when keys
              `((declaim (ftype (function (,name) (simple-array (unsigned-byte 8) (16))) ,khf))
                (defun ,khf (sample)
-                 "16-octet instance handle (DDS keyhash, FR-TYPE-5 / RTPS 2.5 §9.6.3.3):
-                  the @key members serialized big-endian; <=16 bytes used directly,
-                  zero-padded. >16 (MD5) is a later increment."
-                 (let ((buf (dds.core.buffer:make-octet-buffer 64))
+                 ,(format nil "16-octet DDS keyhash / instance handle (RTPS 2.5 §9.6.4.8, ~
+                   FR-TYPE-5): the @key members in member order, PLAIN_CDR2 (XCDR2) ~
+                   big-endian, no encapsulation/type/member headers, origin-0 (4-aligned). ~
+                   Key holder max serialized size = ~a -> ~a path."
+                          (if (integerp keymax) keymax :unbounded)
+                          (if key-direct-p "<=16 direct/zero-padded" "MD5"))
+                 (let ((buf (dds.core.buffer:make-octet-buffer 256))
                        (out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
                    (let ((wc (dds.core.buffer:cursor buf :endianness :big)))
                      ,@(loop for m in keys
-                             collect `(,(getf m :put) wc (,(acc m) sample) :xcdr1))
-                     (let ((len (dds.core.buffer:cursor-position wc)))
-                       (when (> len 16)
-                         (error "key-hash >16 octets requires MD5 (FR-TYPE-5, not yet implemented)"))
-                       (replace out (dds.core.buffer:octet-buffer-vec buf) :end2 len)))
+                             collect `(,(getf m :put) wc (,(acc m) sample) :xcdr2))
+                     (let ((len (dds.core.buffer:cursor-position wc))
+                           (vec (dds.core.buffer:octet-buffer-vec buf)))
+                       ,(if key-direct-p
+                            `(replace out vec :end2 len)
+                            `(replace out (dds.core.md5:md5 (subseq vec 0 len))))))
                    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
                    out))))
          (let ((%pool (dds.types:make-sample-pool (function ,ctor) ,*sample-pool-capacity*)))
