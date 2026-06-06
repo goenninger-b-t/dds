@@ -45,11 +45,14 @@
    a TI_STRING8_*/TI_PLAIN_SEQUENCE_*, or an EK_* for a hash-defined type). BOUND is the
    string/collection bound (0 = unbounded). ELEMENT is the collection element TI. HASH is
    the 14-octet EquivalenceHash for an EK_* kind, or NIL when the hash is pending (the
-   serializer that computes it is deferred to a Connext oracle)."
+   serializer that computes it is deferred to a Connext oracle). REFERENCED is the in-memory
+   minimal-struct-type an EK_* kind resolves to, so type assignability (FR-TYPE-4) can
+   recurse into nested structs ahead of that deferred hash; NIL for non-aggregated kinds."
   (kind 0 :type (unsigned-byte 8))
   (bound 0 :type (integer 0))
   (element nil :type (or null type-identifier))
-  (hash nil))
+  (hash nil)
+  (referenced nil))
 
 (declaim (ftype (function (keyword) type-identifier) primitive-type-identifier))
 (defun primitive-type-identifier (keyword)
@@ -70,22 +73,27 @@
   "A plain-sequence TypeIdentifier with ELEMENT element TI and BOUND (0 = unbounded)."
   (%make-type-identifier :kind +ti-plain-sequence-small+ :bound bound :element element))
 
-(declaim (ftype (function ((unsigned-byte 8) &optional t) type-identifier) hash-type-identifier))
-(defun hash-type-identifier (ek &optional hash)
+(declaim (ftype (function ((unsigned-byte 8) &key (:hash t) (:referenced t)) type-identifier) hash-type-identifier))
+(defun hash-type-identifier (ek &key hash referenced)
   "A hash-defined TypeIdentifier (EK_MINIMAL/EK_COMPLETE). HASH is the 14-octet
-   EquivalenceHash, or NIL when pending (the serializer is deferred)."
-  (%make-type-identifier :kind ek :hash hash))
+   EquivalenceHash, or NIL when pending (the serializer is deferred). REFERENCED is the
+   in-memory minimal-struct-type the identifier resolves to, letting assignability recurse
+   ahead of the deferred hash."
+  (%make-type-identifier :kind ek :hash hash :referenced referenced))
 
 (declaim (ftype (function (type-identifier type-identifier) t) type-identifier=))
 (defun type-identifier= (a b)
   "Structural equality of two TypeIdentifiers (FR-TYPE-2): same kind + bound, equal
-   element (recursively), and equal EquivalenceHash (both NIL or both equal)."
+   element (recursively), equal EquivalenceHash (both NIL or both equal), and the same
+   referenced struct (compared by identity — distinct instances of the same nested type
+   are EQ in this stack)."
   (and (= (type-identifier-kind a) (type-identifier-kind b))
        (= (type-identifier-bound a) (type-identifier-bound b))
        (eq (null (type-identifier-element a)) (null (type-identifier-element b)))
        (or (null (type-identifier-element a))
            (type-identifier= (type-identifier-element a) (type-identifier-element b)))
        (equalp (type-identifier-hash a) (type-identifier-hash b))
+       (eq (type-identifier-referenced a) (type-identifier-referenced b))
        t))
 
 ;;; ---- Member name hash + the Minimal struct-type structural model ----
@@ -101,19 +109,21 @@
 
 (defstruct (minimal-struct-member (:constructor %make-minimal-struct-member))
   "A member of a Minimal struct type (idl §454): the IDL name + member id + member
-   TypeIdentifier + key/optional flags + the NameHash (the MINIMAL detail)."
+   TypeIdentifier + key/optional/must-understand flags + the NameHash (the MINIMAL detail)."
   (name "" :type string)
   (id 0 :type (unsigned-byte 32))
   (type-identifier nil :type (or null type-identifier))
   (key-p nil)
   (optional-p nil)
+  (must-understand-p nil)
   (name-hash nil))
 
-(declaim (ftype (function (string (unsigned-byte 32) type-identifier &key (:key-p t) (:optional-p t)) minimal-struct-member) make-struct-member))
-(defun make-struct-member (name id type-identifier &key key-p optional-p)
+(declaim (ftype (function (string (unsigned-byte 32) type-identifier &key (:key-p t) (:optional-p t) (:must-understand-p t)) minimal-struct-member) make-struct-member))
+(defun make-struct-member (name id type-identifier &key key-p optional-p must-understand-p)
   "Build a Minimal struct member, computing its NameHash from NAME."
   (%make-minimal-struct-member :name name :id id :type-identifier type-identifier
                                :key-p key-p :optional-p optional-p
+                               :must-understand-p must-understand-p
                                :name-hash (member-name-hash name)))
 
 (defstruct (minimal-struct-type (:constructor make-minimal-struct-type))

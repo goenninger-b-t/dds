@@ -220,6 +220,7 @@
                  ("xcdr-generated-nested"    . run-generated-nested-test)
                  ("dds-keyhash"              . run-keyhash-test)
                  ("xtypes-model"             . run-xtypes-model-test)
+                 ("xtypes-assignability"     . run-assignability-test)
                  ("zero-alloc-into"          . run-generated-into-test)
                  ("rtps-wire-byte-exact"     . run-rtps-wire-test)
                  ("rtps-seqnum-bitmap"       . run-rtps-seqnum-test)

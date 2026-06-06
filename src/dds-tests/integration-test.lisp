@@ -934,3 +934,120 @@
                      (dds.types:sequence-type-identifier (dds.types:primitive-type-identifier :i16)))))
           "TypeIdentifier structural equality (primitive / string / sequence)")
   t)
+
+;;; Type assignability + TYPE_CONSISTENCY_ENFORCEMENT (M4, FR-TYPE-4): the structural
+;;; is-assignable-from relation over Minimal TypeObjects (XTypes 1.3 §7.2.4.4) and the
+;;; enforcement Step-1 decision (§7.6.3.4.2). TypeObjects are built by hand so the engine
+;;; is exercised in isolation against the spec's worked examples + every enforcement option.
+
+(declaim (ftype (function () t) run-assignability-test))
+(defun run-assignability-test ()
+  "FR-TYPE-4 assignability matrix: FINAL/APPENDABLE/MUTABLE member matching, truncation,
+   prevent_type_widening, ignore_member_names, the string/sequence bound rules, nested-struct
+   recursion + strong-assignability (delimited), structural equivalence, and the
+   TypeConsistencyEnforcement Step-1 decision + the QoS policy defaults."
+  (labels ((i32 () (dds.types:primitive-type-identifier :i32))
+           (sq (b) (dds.types:sequence-type-identifier (dds.types:primitive-type-identifier :i32) b))
+           (strb (b) (let ((ti (dds.types:primitive-type-identifier :string)))
+                       (setf (dds.types:type-identifier-bound ti) b) ti))
+           (agg (s) (dds.types:hash-type-identifier dds.types:+ek-minimal+ :referenced s))
+           (mem (name id ti &rest opts) (apply #'dds.types:make-struct-member name id ti opts))
+           (sty (ext &rest members) (dds.types:make-minimal-struct-type :extensibility ext :members members))
+           (asg (a b o) (and (dds.types:struct-assignable-from a b o) t)))
+    (let ((opts (dds.types:default-assignability-options))
+          (pw   (dds.types:make-assignability-options :prevent-type-widening t))
+          (ign  (dds.types:make-assignability-options :ignore-member-names t))
+          (sb   (dds.types:make-assignability-options :ignore-string-bounds nil))
+          (qb   (dds.types:make-assignability-options :ignore-sequence-bounds nil)))
+      ;; FINAL: identical -> mutually assignable; differing ID set -> neither direction
+      (let ((a  (sty :final (mem "x" 0 (i32)) (mem "y" 1 (i32))))
+            (b  (sty :final (mem "x" 0 (i32)) (mem "y" 1 (i32))))
+            (a3 (sty :final (mem "x" 0 (i32)) (mem "y" 1 (i32)) (mem "z" 2 (i32)))))
+        (%check :asg-final-equal (and (asg a b opts) (asg b a opts))
+                "identical FINAL structs are mutually assignable")
+        (%check :asg-final-diffset (and (not (asg a a3 opts)) (not (asg a3 a opts)))
+                "FINAL requires an identical member-ID set"))
+      ;; APPENDABLE: truncation both ways; index misalignment fails; widening control
+      (let ((p2  (sty :appendable (mem "x" 0 (i32)) (mem "y" 1 (i32))))
+            (p3  (sty :appendable (mem "x" 0 (i32)) (mem "y" 1 (i32)) (mem "z" 2 (i32))))
+            (rev (sty :appendable (mem "y" 1 (i32)) (mem "x" 0 (i32)))))
+        (%check :asg-append-truncate (and (asg p2 p3 opts) (asg p3 p2 opts))
+                "APPENDABLE truncation is assignable both ways (Coordinate2D/3D)")
+        (%check :asg-append-misaligned (not (asg p2 rev opts))
+                "APPENDABLE requires the same ID at the same member index")
+        (%check :asg-prevent-widening (and (not (asg p2 p3 pw)) (asg p3 p2 pw))
+                "prevent_type_widening blocks a wider T2 from building a narrower T1"))
+      ;; MUTABLE: reorder + add/remove members stay assignable (matched by ID)
+      (let ((m1 (sty :mutable (mem "x" 0 (i32)) (mem "y" 1 (i32))))
+            (m2 (sty :mutable (mem "y" 1 (i32)) (mem "x" 0 (i32))))
+            (m3 (sty :mutable (mem "x" 0 (i32)) (mem "y" 1 (i32)) (mem "z" 2 (i32)))))
+        (%check :asg-mutable-reorder (and (asg m1 m2 opts) (asg m2 m1 opts))
+                "MUTABLE matches members by ID regardless of order")
+        (%check :asg-mutable-evolve (and (asg m1 m3 opts) (asg m3 m1 opts))
+                "MUTABLE add/remove member stays assignable"))
+      ;; extensibility kinds must match
+      (%check :asg-ext-mismatch
+              (not (asg (sty :final (mem "x" 0 (i32))) (sty :appendable (mem "x" 0 (i32))) opts))
+              "differing extensibility kinds are not assignable")
+      ;; member name<->id consistency, toggled by ignore_member_names
+      (let ((n1 (sty :mutable (mem "a" 0 (i32))))
+            (n2 (sty :mutable (mem "b" 0 (i32)))))
+        (%check :asg-name-id (and (not (asg n1 n2 opts)) (asg n1 n2 ign))
+                "same ID with a different name fails unless ignore_member_names"))
+      ;; string bound rule (Table 16) under ignore_string_bounds
+      (let ((s10 (sty :mutable (mem "s" 0 (strb 10))))
+            (s5  (sty :mutable (mem "s" 0 (strb 5)))))
+        (%check :asg-string-bound
+                (and (asg s5 s10 opts) (asg s10 s5 sb) (not (asg s5 s10 sb)))
+                "string bounds ignored by default; enforced needs T1.len >= T2.len"))
+      ;; sequence bound rule (Table 17) under ignore_sequence_bounds
+      (let ((q10 (sty :mutable (mem "v" 0 (sq 10))))
+            (q5  (sty :mutable (mem "v" 0 (sq 5)))))
+        (%check :asg-seq-bound
+                (and (asg q5 q10 opts) (asg q10 q5 qb) (not (asg q5 q10 qb)))
+                "sequence bounds ignored by default; enforced needs T1.len >= T2.len"))
+      ;; nested struct: assignability recurses through the referenced TypeObject
+      (let* ((inner-pq  (sty :appendable (mem "p" 0 (i32)) (mem "q" 1 (i32))))
+             (inner-p   (sty :appendable (mem "p" 0 (i32))))
+             (inner-bad (sty :appendable (mem "p" 0 (strb 0))))
+             (outer-pq  (sty :mutable (mem "n" 0 (agg inner-pq))))
+             (outer-p   (sty :mutable (mem "n" 0 (agg inner-p))))
+             (outer-bad (sty :mutable (mem "n" 0 (agg inner-bad)))))
+        (%check :asg-nested (and (asg outer-pq outer-p opts) (not (asg outer-pq outer-bad opts)))
+                "assignability recurses into nested struct members"))
+      ;; strong-assignability: a nested APPENDABLE element is delimited (ok); a nested FINAL
+      ;; element is not delimited, so an APPENDABLE container is not even self-assignable
+      (let ((app-app (sty :appendable (mem "n" 0 (agg (sty :appendable (mem "p" 0 (i32)))))))
+            (app-fin (sty :appendable (mem "n" 0 (agg (sty :final (mem "p" 0 (i32))))))))
+        (%check :asg-strong-delimited (and (asg app-app app-app opts) (not (asg app-fin app-fin opts)))
+                "strong-assignability requires the element type to be delimited"))
+      ;; enforcement Step-1 decision (ALLOW coercion vs DISALLOW equivalence)
+      (let ((p2  (sty :appendable (mem "x" 0 (i32)) (mem "y" 1 (i32))))
+            (p2b (sty :appendable (mem "x" 0 (i32)) (mem "y" 1 (i32))))
+            (p3  (sty :appendable (mem "x" 0 (i32)) (mem "y" 1 (i32)) (mem "z" 2 (i32)))))
+        (%check :asg-enforce-allow
+                (and (dds.types:enforce-type-consistency p2 p3 :kind :allow-type-coercion) t)
+                "ALLOW_TYPE_COERCION: reader assignable-from writer is consistent")
+        (%check :asg-enforce-default
+                (and (dds.types:enforce-type-consistency p2 p3) t)
+                "the default enforcement kind is ALLOW_TYPE_COERCION")
+        (%check :asg-enforce-disallow
+                (and (dds.types:enforce-type-consistency p2 p2b :kind :disallow-type-coercion)
+                     (not (dds.types:enforce-type-consistency p2 p3 :kind :disallow-type-coercion)))
+                "DISALLOW_TYPE_COERCION requires structural equivalence"))
+      ;; the QoS policy carrier + spec defaults (§7.6.3.4.1)
+      (let ((tce (dds.qos:make-type-consistency-enforcement)))
+        (%check :asg-qos-defaults
+                (and (eq :allow-type-coercion (dds.qos:type-consistency-enforcement-kind tce))
+                     (dds.qos:type-consistency-enforcement-ignore-sequence-bounds tce)
+                     (dds.qos:type-consistency-enforcement-ignore-string-bounds tce)
+                     (not (dds.qos:type-consistency-enforcement-ignore-member-names tce))
+                     (not (dds.qos:type-consistency-enforcement-prevent-type-widening tce))
+                     (not (dds.qos:type-consistency-enforcement-force-type-validation tce)))
+                "TypeConsistencyEnforcement QoS defaults (XTypes §7.6.3.4.1)")
+        (%check :asg-qos-reader-slot
+                (eq :allow-type-coercion
+                    (dds.qos:type-consistency-enforcement-kind
+                     (dds.qos:qos-type-consistency (dds.qos:make-reader-qos))))
+                "the QoS set carries TYPE_CONSISTENCY_ENFORCEMENT (reader default)"))))
+  t)

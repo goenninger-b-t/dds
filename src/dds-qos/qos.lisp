@@ -45,6 +45,25 @@
 (declaim (ftype (function (symbol) (integer 0)) presentation-rank))
 (defun presentation-rank (k) (ecase k (:instance 0) (:topic 1) (:group 2)))
 
+;;; ---- TYPE_CONSISTENCY_ENFORCEMENT (XTypes 1.3 §7.6.3.4): reader-only, NOT an RxO
+;;;      policy (so it is absent from qos-rxo-compatible); defaults per §7.6.3.4.1. ----
+
+(defstruct (type-consistency-enforcement
+            (:constructor make-type-consistency-enforcement)
+            (:copier copy-type-consistency-enforcement))
+  "DDS XTypes TYPE_CONSISTENCY_ENFORCEMENT QoS policy (XTypes 1.3 §7.6.3.4, policy id 24).
+   Applies to DataReaders only; it has NO request/offered (RxO) semantics and is immutable
+   after enable, so it is deliberately absent from qos-rxo-compatible. KIND selects coercion
+   vs equivalence; the four flags modulate ALLOW_TYPE_COERCION assignability; force-type-
+   validation requires type info to be present in order to match. Defaults per §7.6.3.4.1:
+   ALLOW_TYPE_COERCION, bounds ignored, names enforced, widening permitted, validation off."
+  (kind :allow-type-coercion :type (member :allow-type-coercion :disallow-type-coercion))
+  (ignore-sequence-bounds t)
+  (ignore-string-bounds t)
+  (ignore-member-names nil)
+  (prevent-type-widening nil)
+  (force-type-validation nil))
+
 ;;; ---- The QoS set (the RxO-relevant + commonly-held policies; full 22+2 set is
 ;;;      filled in as the entity model lands). Defaults per DDS 1.4 §2.2.3. ----
 
@@ -74,7 +93,9 @@
   ;; RESOURCE_LIMITS (not an RxO policy). LENGTH_UNLIMITED = -1 is the DDS default.
   (resource-max-samples -1 :type integer)
   (resource-max-instances -1 :type integer)
-  (resource-max-samples-per-instance -1 :type integer))
+  (resource-max-samples-per-instance -1 :type integer)
+  ;; TYPE_CONSISTENCY_ENFORCEMENT (XTypes, reader-only, not RxO; see FR-TYPE-4).
+  (type-consistency (make-type-consistency-enforcement) :type type-consistency-enforcement))
 
 (declaim (ftype (function (&rest t) qos) make-writer-qos))
 (defun make-writer-qos (&rest args)

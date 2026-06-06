@@ -56,6 +56,7 @@
       ((symbolp dds-type)            ; nested, previously-defined dds type
        (let ((tpkg (or (symbol-package dds-type) *package*)))
          (list :slot slot :kind :nested :ltype dds-type
+               :type-name (string-downcase (string dds-type))
                :default (list (%sym tpkg "MAKE-" (string dds-type)))
                :ser (%sym tpkg "SERIALIZE-" (string dds-type))
                :des (%sym tpkg "DESERIALIZE-" (string dds-type))
@@ -217,6 +218,10 @@
                                                       (dds.types:primitive-type-identifier
                                                        ,(getf m :elt-type))))
                                          (:nested `(dds.types:hash-type-identifier
-                                                    dds.types:+ek-minimal+)))
+                                                    dds.types:+ek-minimal+
+                                                    :referenced
+                                                    (dds.types:type-support-typeobject
+                                                     (dds.types:find-type-support
+                                                      ,(getf m :type-name))))))
                                       ,@(when (getf m :key) '(:key-p t)))))))))
          ',name))))

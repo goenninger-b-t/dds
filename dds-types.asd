@@ -6,5 +6,6 @@
   :serial t
   :components ((:file "packages")
                (:file "type-support")
-               (:file "xtypes"))
+               (:file "xtypes")
+               (:file "assignability"))
   :in-order-to ((test-op (test-op "dds-tests"))))

@@ -22,5 +22,15 @@
            #:qos-history-kind #:qos-history-depth #:qos-lifespan
            #:qos-resource-max-samples #:qos-resource-max-instances
            #:qos-resource-max-samples-per-instance
+           #:qos-type-consistency
+           ;; TYPE_CONSISTENCY_ENFORCEMENT policy (XTypes, reader-only; FR-TYPE-4)
+           #:type-consistency-enforcement #:make-type-consistency-enforcement
+           #:copy-type-consistency-enforcement
+           #:type-consistency-enforcement-kind
+           #:type-consistency-enforcement-ignore-sequence-bounds
+           #:type-consistency-enforcement-ignore-string-bounds
+           #:type-consistency-enforcement-ignore-member-names
+           #:type-consistency-enforcement-prevent-type-widening
+           #:type-consistency-enforcement-force-type-validation
            #:qos-rxo-compatible #:partition-match-p
            #:run-qos-rxo-test))

@@ -25,15 +25,25 @@
            #:type-identifier #:type-identifier-p #:type-identifier-kind
            #:type-identifier-bound #:type-identifier-element #:type-identifier-hash
            #:primitive-type-identifier #:sequence-type-identifier #:hash-type-identifier
-           #:type-identifier=
+           #:type-identifier= #:type-identifier-referenced
            #:member-name-hash
            #:minimal-struct-member #:make-struct-member
            #:minimal-struct-member-name #:minimal-struct-member-id
            #:minimal-struct-member-type-identifier #:minimal-struct-member-key-p
-           #:minimal-struct-member-optional-p #:minimal-struct-member-name-hash
+           #:minimal-struct-member-optional-p #:minimal-struct-member-must-understand-p
+           #:minimal-struct-member-name-hash
            #:minimal-struct-type #:make-minimal-struct-type
            #:minimal-struct-type-name #:minimal-struct-type-extensibility
            #:minimal-struct-type-members
+           ;; XTypes type assignability + TYPE_CONSISTENCY_ENFORCEMENT (FR-TYPE-4)
+           #:assignability-options #:make-assignability-options
+           #:assignability-options-ignore-sequence-bounds
+           #:assignability-options-ignore-string-bounds
+           #:assignability-options-ignore-member-names
+           #:assignability-options-prevent-type-widening
+           #:default-assignability-options
+           #:ti-assignable-from #:strongly-assignable-from #:struct-assignable-from
+           #:ti-equivalent-p #:struct-equivalent-p #:enforce-type-consistency
            #:+tk-boolean+ #:+tk-byte+ #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
            #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
            #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+
