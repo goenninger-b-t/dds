@@ -220,13 +220,23 @@
 
 ;;; ---- DataWriter / DataReader ----
 
+(declaim (ftype (function (t) (or null (simple-array (unsigned-byte 8) (*)))) %topic-type-information))
+(defun %topic-type-information (topic)
+  "Opaque serialized XTypes TypeInformation for TOPIC's type-support (PID_TYPE_INFORMATION),
+   or NIL if unavailable or not yet serializable (e.g. a type with sequence members, whose
+   TypeObject serializer is oracle-deferred, or a ContentFilteredTopic)."
+  (handler-case
+      (let ((ts (topic-type-support topic)))
+        (and ts (dds.types:serialize-type-information (dds.types:type-support-typeobject ts))))
+    (error () nil)))
+
 (declaim (ftype (function (publisher topic &key (:qos t)) data-writer) create-datawriter))
 (defun create-datawriter (pub topic &key (qos (dds.qos:make-writer-qos)))
   "Publisher::create_datawriter — register a local writer in the engine on the
    topic's name/type with the QoS reliability (v1: the single user writer)."
   (let ((node (dp-node (pub-participant pub))))
     (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
-                               :qos qos)
+                               :qos qos :type-information (%topic-type-information topic))
     (dds.disc:enable-publisher node)
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
       (push dw (pub-writers pub))
@@ -241,7 +251,7 @@
    filter predicate reader-side (only matching samples reach read/take)."
   (let ((node (dp-node (sub-participant sub))))
     (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
-                               :qos qos)
+                               :qos qos :type-information (%topic-type-information topic))
     (dds.disc:enable-subscriber node)
     (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos :enabled t)))
       (setf (dr-filter dr) (td-filter-predicate topic))   ; nil for a plain Topic

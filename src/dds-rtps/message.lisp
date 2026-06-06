@@ -363,6 +363,7 @@
 (defconstant +pid-builtin-endpoint-set+       #x0058)
 (defconstant +pid-endpoint-guid+              #x005a)
 (defconstant +pid-key-hash+                   #x0070)
+(defconstant +pid-type-information+           #x0075)  ; DDS-XTypes 1.3 BuiltinTopicData @id(0x0075)
 
 (declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) fixnum) write-parameter))
 (defun write-parameter (cursor pid value off len)

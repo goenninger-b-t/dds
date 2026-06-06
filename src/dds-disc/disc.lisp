@@ -190,28 +190,30 @@
   (dds.qos:make-qos :reliability (if (>= reliability dds.rtps.discovery:+reliability-reliable+)
                                      :reliable :best-effort)))
 
-(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t)) dds.rtps.discovery:endpoint-data) add-local-writer))
+(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t)) dds.rtps.discovery:endpoint-data) add-local-writer))
 (defun add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
-                                   (key 1) qos)
-  "Register a local publication (writer endpoint) on NODE with QOS (or a QoS derived
-   from the legacy :reliability constant). announce-endpoints sends it via SEDP."
+                                   (key 1) qos type-information)
+  "Register a local publication (writer endpoint) on NODE with QOS (or a QoS derived from
+   the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
+   TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP."
   (let ((ep (dds.rtps.discovery:make-endpoint-data
              :guid (%make-endpoint-guid (disc-node-guid-prefix node) key #x03)
-             :topic-name topic :type-name type
+             :topic-name topic :type-name type :type-information type-information
              :qos (or qos (%qos-from-reliability reliability)))))
     (push ep (disc-node-local-writers node))
     ep))
 
-(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t)) dds.rtps.discovery:endpoint-data) add-local-reader))
+(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t)) dds.rtps.discovery:endpoint-data) add-local-reader))
 (defun add-local-reader (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-best-effort+)
-                                   (key 1) qos)
-  "Register a local subscription (reader endpoint) on NODE with QOS (or a QoS derived
-   from the legacy :reliability constant). announce-endpoints sends it via SEDP."
+                                   (key 1) qos type-information)
+  "Register a local subscription (reader endpoint) on NODE with QOS (or a QoS derived from
+   the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
+   TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP."
   (let ((ep (dds.rtps.discovery:make-endpoint-data
              :guid (%make-endpoint-guid (disc-node-guid-prefix node) key #x07)
-             :topic-name topic :type-name type
+             :topic-name topic :type-name type :type-information type-information
              :qos (or qos (%qos-from-reliability reliability)))))
     (push ep (disc-node-local-readers node))
     ep))

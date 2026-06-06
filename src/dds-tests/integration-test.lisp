@@ -1135,3 +1135,35 @@
               (> (length ginfo) (length (dds.types:serialize-type-information (to "dcps-msg"))))
               "a type with a nested dependency carries a larger TypeInformation")))
   t)
+
+;;; PID_TYPE_INFORMATION end-to-end (M4 step b2a, FR-TYPE-3): a generated type's
+;;; TypeInformation rides the SEDP endpoint ParameterList. Proves the dds-types codec and
+;;; the dds-rtps opaque wire mechanism interoperate (emit only; match enforcement deferred
+;;; until the EquivalenceHash is Connext-confirmed).
+
+(declaim (ftype (function () t) run-sedp-type-information-test))
+(defun run-sedp-type-information-test ()
+  "serialize-endpoint-data carries the TypeInformation as PID_TYPE_INFORMATION;
+   parse-endpoint-data recovers the opaque octets; deserialize-type-information-hash yields
+   the type's EquivalenceHash, alongside the still-round-tripping type-name."
+  (let* ((to (dds.types:type-support-typeobject (dds.types:find-type-support "dcps-msg")))
+         (ti (dds.types:serialize-type-information to))
+         (ep (dds.rtps.discovery:make-endpoint-data
+              :topic-name "TiTopic" :type-name "dcps-msg" :type-information ti
+              :qos (dds.qos:make-qos :reliability :reliable)))
+         (buf (dds.core.buffer:make-octet-buffer 1024)))
+    (dds.rtps.discovery:serialize-endpoint-data (dds.core.buffer:cursor buf :endianness :little) ep)
+    (let ((back (dds.rtps.discovery:parse-endpoint-data
+                 (dds.core.buffer:cursor buf :endianness :little))))
+      (%check :sedp-ti-present
+              (and back (dds.rtps.discovery:endpoint-data-type-information back) t)
+              "the parsed endpoint must carry PID_TYPE_INFORMATION")
+      (%check :sedp-ti-hash
+              (equalp (dds.types:deserialize-type-information-hash
+                       (dds.rtps.discovery:endpoint-data-type-information back))
+                      (dds.types:equivalence-hash to))
+              "the SEDP-carried TypeInformation recovers the type's EquivalenceHash")
+      (%check :sedp-ti-typename
+              (string= "dcps-msg" (dds.rtps.discovery:endpoint-data-type-name back))
+              "type-name still round-trips alongside type-information")))
+  t)

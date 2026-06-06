@@ -305,7 +305,10 @@
         :type (simple-array (unsigned-byte 8) (16)))
   (topic-name "" :type string)
   (type-name "" :type string)
-  (qos (dds.qos:make-qos) :type dds.qos:qos))
+  (qos (dds.qos:make-qos) :type dds.qos:qos)
+  ;; Opaque pre-serialized XTypes TypeInformation (PID_TYPE_INFORMATION, idl @id 0x0075).
+  ;; dds-rtps (L4) must not depend on dds-types (L3); dds-disc/dds-dcps build + interpret it.
+  (type-information nil :type (or null (simple-array (unsigned-byte 8) (*)))))
 
 (declaim (ftype (function (dds.core.buffer:cursor endpoint-data) fixnum) serialize-endpoint-data))
 (defun serialize-endpoint-data (cursor data)
@@ -338,6 +341,12 @@
   (multiple-value-bind (c vec) (%make-scratch 4)
     (dds.core.buffer:put-u32 c (%durability-wire (dds.qos:qos-durability (endpoint-data-qos data))))
     (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-durability+ vec 0 4))
+  ;; PID_TYPE_INFORMATION (idl @id 0x0075): opaque pre-serialized XTypes TypeInformation,
+  ;; emitted only when present (peers skip unknown PIDs — backward-compatible).
+  (let ((ti (endpoint-data-type-information data)))
+    (when ti
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-type-information+
+                                        ti 0 (length ti))))
   (dds.rtps.message:write-parameter-sentinel cursor))
 
 (declaim (ftype (function (endpoint-data (unsigned-byte 16) dds.core.buffer:cursor (integer 0)) t) %fill-endpoint-param))
@@ -361,7 +370,12 @@
     ((= pid dds.rtps.message:+pid-durability+)
      (when (>= len 4)
        (setf (dds.qos:qos-durability (endpoint-data-qos data))
-             (%wire-durability (dds.core.buffer:get-u32 cursor))))))
+             (%wire-durability (dds.core.buffer:get-u32 cursor)))))
+    ((= pid dds.rtps.message:+pid-type-information+)
+     (when (> len 0)
+       (let ((ti (make-array len :element-type '(unsigned-byte 8))))
+         (dds.core.buffer:get-octets cursor ti 0 len)
+         (setf (endpoint-data-type-information data) ti)))))
   data)
 
 (declaim (ftype (function (dds.core.buffer:cursor) t) parse-endpoint-data))
@@ -398,7 +412,10 @@
    type, and reliability kind survive; then exercise the RxO matching truth table.
    Returns T on success (ASSERT signals otherwise)."
   (let* ((guid (%sample-guid))
+         (tinfo (make-array 12 :element-type '(unsigned-byte 8)
+                            :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12)))
          (data (make-endpoint-data :guid guid :topic-name "Square" :type-name "ShapeType"
+                                   :type-information tinfo
                                    :qos (dds.qos:make-qos :reliability :reliable
                                                           :durability :transient-local)))
          (ob (dds.core.buffer:make-octet-buffer 256))
@@ -411,7 +428,9 @@
       (assert (string= (endpoint-data-topic-name back) "Square") () "topic-name mismatch")
       (assert (string= (endpoint-data-type-name back) "ShapeType") () "type-name mismatch")
       (assert (eq (dds.qos:qos-reliability (endpoint-data-qos back)) :reliable) () "reliability mismatch")
-      (assert (eq (dds.qos:qos-durability (endpoint-data-qos back)) :transient-local) () "durability mismatch")))
+      (assert (eq (dds.qos:qos-durability (endpoint-data-qos back)) :transient-local) () "durability mismatch")
+      (assert (equalp (endpoint-data-type-information back) tinfo) ()
+              "PID_TYPE_INFORMATION opaque round-trip mismatch")))
   ;; RxO matching truth table over the wire QoS (FR-QOS-2): reliability + durability.
   (flet ((ep (topic q) (make-endpoint-data :topic-name topic :type-name "Y" :qos q)))
     (let ((w-rel (ep "T" (dds.qos:make-qos :reliability :reliable)))

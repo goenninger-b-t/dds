@@ -27,6 +27,16 @@
   (uuid :string)
   (seq :u32))
 
+(declaim (ftype (function () (or null (simple-array (unsigned-byte 8) (*)))) %shape-type-information))
+(defun %shape-type-information ()
+  "Opaque serialized XTypes TypeInformation for the canonical ShapeType, advertised in
+   PID_TYPE_INFORMATION so rtishapesdemo / DDSSpy see our type; NIL if unavailable.
+   PROVISIONAL bytes (see typeobject-cdr.lisp) — capture with tshark to compare vs Connext."
+  (handler-case
+      (let ((ts (dds.types:find-type-support "shape-type")))
+        (and ts (dds.types:serialize-type-information (dds.types:type-support-typeobject ts))))
+    (error () nil)))
+
 (declaim (ftype (function () string) %make-uuid))
 (defun %make-uuid ()
   "A random RFC-4122 v4 UUID string identifying one publisher stream. Demo-grade
@@ -107,7 +117,8 @@
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
                                        :multicast t :advertise-address advertise-address)))
     (dds.disc:add-local-writer node :topic "Square" :type "ShapeType"
-                               :reliability dds.rtps.discovery:+reliability-reliable+)
+                               :reliability dds.rtps.discovery:+reliability-reliable+
+                               :type-information (%shape-type-information))
     (dds.disc:enable-publisher node)
     (dds.disc:start-node node)
     (let ((uuid (%make-uuid)))
@@ -237,7 +248,8 @@
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x53) :domain domain
                                        :multicast t :advertise-address advertise-address)))
     (dds.disc:add-local-reader node :topic "Square" :type "ShapeType"
-                               :reliability dds.rtps.discovery:+reliability-reliable+)
+                               :reliability dds.rtps.discovery:+reliability-reliable+
+                               :type-information (%shape-type-information))
     (dds.disc:enable-subscriber node)
     (dds.disc:start-node node)
     (format t "~&[sub] Square/ShapeType[~(~a~)] domain=~d (multicast 239.255.0.1). Ctrl-C to stop.~%" type domain)
