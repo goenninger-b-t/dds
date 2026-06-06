@@ -538,3 +538,51 @@
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))
     t))
+
+;;; Condvar-driven WaitSet wake + on_data_available (M3 #3 follow-up, FR-DCPS-2/3,
+;;; ADR 0007): a ReadCondition attached to a WaitSet wakes when a written sample
+;;; arrives — the disc receiver thread signals the WaitSet condvar — replacing the
+;;; ~10 ms poll; the reader's on_data_available listener fires from that thread.
+
+(defclass data-available-listener (capture-mixin dds.dcps:data-reader-listener) ())
+(defmethod dds.dcps:on-data-available ((l data-available-listener) reader)
+  (declare (ignore reader))
+  (dds.pal:with-lock ((cap-lock l)) (push :data-available (cap-hits l))))
+
+(declaim (ftype (function () t) run-dcps-condvar-wake-test))
+(defun run-dcps-condvar-wake-test ()
+  "Condvar-driven WaitSet wake + on_data_available (ADR 0007): a ReadCondition attached
+   to a WaitSet wakes when a written sample arrives (the receiver thread signals the
+   WaitSet condvar), the reader's on_data_available listener fires from that thread,
+   read_w_condition returns the sample, and an empty WaitSet still times out."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0))
+        (dal (make-instance 'data-available-listener)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "WakeTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "WakeTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (rc (dds.dcps:create-readcondition dr))
+                (ws (dds.dcps:make-wait-set)))
+           (dds.dcps:set-reader-listener dr dal '(:data-available))
+           (dds.dcps:attach-condition ws rc)
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :wake-empty-timeout (null (dds.dcps:wait-set-wait ws 0.2))
+                   "an empty WaitSet must time out (return nil)")
+           (dds.dcps:write-sample dw (make-dcps-msg :id 7 :text "wake"))
+           (%check :wake-triggered (and (member rc (dds.dcps:wait-set-wait ws 3.0)) t)
+                   "the ReadCondition must wake the WaitSet once the sample arrives")
+           (loop repeat 50 until (member :data-available (cap-snapshot dal)) do (sleep 0.02))
+           (%check :wake-on-data-available (and (member :data-available (cap-snapshot dal)) t)
+                   "on_data_available must fire from the receiver thread")
+           (let ((s (dds.dcps:read-w-condition dr rc)))
+             (%check :wake-read (and s (= 7 (dcps-msg-id (dds.dcps:cached-sample-data (first s)))))
+                     "read_w_condition after the wake must return the awaited sample")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))

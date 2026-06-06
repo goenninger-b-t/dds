@@ -54,7 +54,12 @@
    (req-incompat :initform (make-requested-incompatible-qos-status) :accessor dr-req-incompat)
    (listener :initform nil :accessor dr-listener)
    (listener-mask :initform '() :accessor dr-listener-mask)
+   (conditions :initform '() :accessor dr-conditions)      ; read/query/status conditions bound here
    (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock)))
+
+;; Defined in conditions.lisp (loaded after this file); forward-declared so the data-
+;; arrival hook below can wake the reader's WaitSets without a compile-time warning.
+(declaim (ftype (function (data-reader) t) %notify-reader-conditions))
 
 ;;; ---- SampleInfo + cached samples (FR-DCPS-4) ----
 
@@ -139,6 +144,8 @@
           (lambda (kind remote) (%on-disc-match p kind remote)))
     (setf (dds.disc:disc-node-on-incompatible-qos node)
           (lambda (kind remote bad) (%on-disc-incompatible p kind remote bad)))
+    (setf (dds.disc:disc-node-on-sample node)
+          (lambda () (%on-participant-sample p)))
     (dds.disc:start-node node)
     p))
 
@@ -348,6 +355,22 @@
     (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-incompatible dw bad)))))
   t)
 
+(declaim (ftype (function (domain-participant) t) %on-participant-sample))
+(defun %on-participant-sample (p)
+  "ON-SAMPLE hook (disc receiver thread): new user data arrived for P's reader. Fire
+   on_data_available if a listener is masked for it (snapshot under the status lock,
+   call OUTSIDE it), then wake the reader's WaitSets (DATA_AVAILABLE / ReadCondition /
+   QueryCondition). Holds no node lock here (the disc layer released it before calling)."
+  (let ((dr (dp-user-reader p)))
+    (when dr
+      (let ((fire nil))
+        (dds.pal:with-lock ((dr-status-lock dr))
+          (when (and (dr-listener dr) (member :data-available (dr-listener-mask dr)))
+            (setf fire t)))
+        (when fire (on-data-available (dr-listener dr) dr))
+        (%notify-reader-conditions dr))))
+  t)
+
 (declaim (ftype (function (data-reader t) t) %reader-matched))
 (defun %reader-matched (dr handle)
   "Bump DR's SUBSCRIPTION_MATCHED status; if a listener is installed for it, fire
@@ -364,7 +387,8 @@
           (setf snapshot (copy-subscription-matched-status s))
           (setf (subscription-matched-status-total-count-change s) 0
                 (subscription-matched-status-current-count-change s) 0))))
-    (when snapshot (on-subscription-matched (dr-listener dr) dr snapshot)))
+    (when snapshot (on-subscription-matched (dr-listener dr) dr snapshot))
+    (%notify-reader-conditions dr))   ; wake a StatusCondition(:subscription-matched) waiter
   t)
 
 (declaim (ftype (function (data-writer t) t) %writer-matched))
@@ -424,7 +448,8 @@
           (setf (requested-incompatible-qos-status-policies snapshot)
                 (mapcar #'copy-qos-policy-count (requested-incompatible-qos-status-policies s)))
           (setf (requested-incompatible-qos-status-total-count-change s) 0))))
-    (when snapshot (on-requested-incompatible-qos (dr-listener dr) dr snapshot)))
+    (when snapshot (on-requested-incompatible-qos (dr-listener dr) dr snapshot))
+    (%notify-reader-conditions dr))   ; wake a StatusCondition(:requested-incompatible-qos) waiter
   t)
 
 (declaim (ftype (function (data-writer list) t) %writer-incompatible))

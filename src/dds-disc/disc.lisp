@@ -19,9 +19,11 @@
    maps a remote 16-octet endpoint GUID to the remote endpoint-data that matched a
    local endpoint; INCOMPAT maps a remote GUID whose topic+type agreed but whose QoS
    failed RxO (drives OFFERED/REQUESTED_INCOMPATIBLE_QOS). LOCK guards DISCOVERED +
-   MATCHES + INCOMPAT across the receiver thread. ON-MATCH / ON-INCOMPATIBLE-QOS are
-   optional control-plane hooks the DCPS layer installs to surface matched/incompatible
-   events to the application as DDS statuses; each fires once per remote endpoint.
+   MATCHES + INCOMPAT across the receiver thread. ON-MATCH / ON-INCOMPATIBLE-QOS /
+   ON-SAMPLE are optional control-plane hooks the DCPS layer installs to surface
+   matched/incompatible events and newly-arrived user data to the application (DDS
+   statuses, listeners, and the condvar-driven WaitSet wake); each match/incompatible
+   hook fires once per remote endpoint, ON-SAMPLE once per stored user sample.
    TX-PAYLOAD/TX-MSG are the reused announce scratch buffers."
   (guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)
                :type (simple-array (unsigned-byte 8) (12)))
@@ -51,6 +53,7 @@
   (on-acknack nil :type (or null function))
   (on-match nil :type (or null function))
   (on-incompatible-qos nil :type (or null function))
+  (on-sample nil :type (or null function))
   (mcast-socket nil)
   (mcast-rx-thread nil)
   (rx-thread nil))

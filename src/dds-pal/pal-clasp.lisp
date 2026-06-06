@@ -22,7 +22,7 @@
 (declaim (ftype (function (t) t) join))
 (declaim (ftype (function (&optional (or null string)) t) make-lock))
 (declaim (ftype (function () t) make-condvar))
-(declaim (ftype (function (t t) t) condvar-wait))
+(declaim (ftype (function (t t &optional t) t) condvar-wait))
 (declaim (ftype (function (t) t) condvar-signal))
 (declaim (ftype (function () (values)) gc-suggest))
 
@@ -93,7 +93,10 @@
 (defmacro with-lock ((lock) &body body)
   `(bordeaux-threads:with-lock-held (,lock) ,@body))
 (defun make-condvar () (bordeaux-threads:make-condition-variable))
-(defun condvar-wait (cv lock) (bordeaux-threads:condition-wait cv lock))
+(defun condvar-wait (cv lock &optional timeout-seconds)
+  (if timeout-seconds
+      (bordeaux-threads:condition-wait cv lock :timeout timeout-seconds)
+      (bordeaux-threads:condition-wait cv lock)))
 (defun condvar-signal (cv) (bordeaux-threads:condition-notify cv))
 
 (defun gc-suggest () (values))

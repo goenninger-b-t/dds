@@ -118,12 +118,15 @@
 (declaim (ftype (function (disc-node (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)) t) %on-user-data))
 (defun %on-user-data (node writer-id sn buf poff plen)
   "Reader side: copy the [poff,plen) SerializedPayload out of the receive buffer,
-   feed it to the reliable reader (dedup/reorder), and record it by SN."
+   feed it to the reliable reader (dedup/reorder), record it by SN, then fire the
+   ON-SAMPLE hook (DATA_AVAILABLE + the condvar WaitSet wake) — OUTSIDE the node lock
+   so the DCPS hook may take a WaitSet lock without a lock-order inversion."
   (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
     (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
     (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn vec)
     (dds.pal:with-lock ((disc-node-lock node))
       (setf (gethash sn (disc-node-samples node)) vec))
+    (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))
     t))
 
 (declaim (ftype (function (disc-node dds.core.buffer:cursor (unsigned-byte 8)) t) %on-user-heartbeat))
