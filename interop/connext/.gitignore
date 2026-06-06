@@ -1,0 +1,18 @@
+# rtiddsgen-generated type support (clean-room: produced at build time, never committed)
+ShapeType.hpp
+ShapeType.cxx
+ShapeTypePlugin.hpp
+ShapeTypePlugin.cxx
+*.idl.*
+.gen.stamp
+
+# build artifacts
+*.o
+*.so
+*.dylib
+
+# the built executables
+typeobject-probe/typeobject_probe
+shapes-pub/shapes_pub
+shapes-sub/shapes_sub
+cdr-capture/cdr_capture

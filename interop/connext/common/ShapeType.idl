@@ -1,0 +1,22 @@
+// ShapeType for the Connext interop/oracle harness.
+//
+// Defined to match THIS stack's generated `shape-type` EXACTLY, so the Connext
+// EquivalenceHash / TypeObject is an apples-to-apples reference for ours:
+//   - @final extensibility (our define-dds-type uses :final)
+//   - @key on color
+//   - color is an UNBOUNDED string  (our :string member -> TI_STRING8_SMALL bound 0)
+//   - three 32-bit longs
+//   - default @autoid(SEQUENTIAL) -> member ids 0,1,2,3 (matches our decl-index ids)
+//
+// NOTE: RTI's rtishapesdemo uses `string<128> color`. The bound differs (changes the
+// TypeObject/hash, NOT the wire payload) and is absorbed by ignore_string_bounds during
+// type coercion, so live pub/sub interop with rtishapesdemo still works. For an exact
+// hash comparison against our serializer, keep this UNBOUNDED.
+
+@final
+struct ShapeType {
+    @key string color;
+    long x;
+    long y;
+    long shapesize;
+};

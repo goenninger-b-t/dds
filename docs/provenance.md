@@ -103,6 +103,26 @@ DDS 1.4 DCPS spec added to `docs/specs/` by the owner (`dds-1_4-dcps.pdf`,
   the EquivalenceHash rule (first 14 octets of MD5 of the XCDR2-LE MinimalTypeObject).
 - Still **no RTI/Fast DDS/Cyclone/OpenDDS source** consulted.
 
+## M4 (2026-06-06) — Connext interop/oracle harness (`interop/connext/`)
+
+Connext-side test apps (`typeobject-probe`, `shapes-pub`, `shapes-sub`, `cdr-capture`)
+built **against the RTI Connext public API + our own `ShapeType.idl`** to use Connext as
+the gold interop/oracle reference (REQUIREMENTS §8, FR-IO-1). This is the allowed
+behavioural-reference-via-interop use, not a clean-room breach:
+
+- **No Connext source, headers, or `rtiddsgen` output is copied into this repo.** The
+  committed files are clean-room (our `.cxx` + `ShapeType.idl` + Makefiles only). The
+  `rtiddsgen`-generated type support is produced at build time on the machine where Connext
+  is installed and is **git-ignored** (`interop/connext/.gitignore`) — never committed.
+- Purpose: produce reference bytes to **confirm or correct** the PROVISIONAL XTypes
+  serializers (TypeObject/EquivalenceHash FR-TYPE-2, TypeInformation FR-TYPE-3) and the XCDR
+  payload (FR-CDR-8), and to validate bidirectional Shapes interop. The authoritative byte
+  read uses the **same Wireshark/tshark RTPS dissector** already used by `make wire`.
+- Built and run only where Connext lives (the owner's environment); **not** part of this
+  repo's CI. `ShapeType.idl` is defined to match this stack's `shape-type` exactly so the
+  EquivalenceHash is an apples-to-apples comparison.
+- Still **no RTI/Fast DDS/Cyclone/OpenDDS source** read or copied.
+
 ## Third-party runtime dependencies (licenses apply; not vendored yet)
 
 | Dependency | Use | License |
