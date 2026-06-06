@@ -719,3 +719,47 @@
                    "text=skip fails text<>skip"))
       (dds.dcps:delete-participant p))
     t))
+
+;;; INCONSISTENT_TOPIC (M3 #4 follow-up, FR-DCPS-3): two participants register the same
+;;; topic name with DIFFERENT types; discovery detects the type collision and raises
+;;; INCONSISTENT_TOPIC on the local Topic, firing the TopicListener.
+
+(defclass capturing-topic-listener (capture-mixin dds.dcps:topic-listener) ())
+(defmethod dds.dcps:on-inconsistent-topic ((l capturing-topic-listener) topic status)
+  (declare (ignore topic))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :inconsistent status) (cap-hits l))))
+
+(declaim (ftype (function () t) run-dcps-inconsistent-topic-test))
+(defun run-dcps-inconsistent-topic-test ()
+  "INCONSISTENT_TOPIC (FR-DCPS-3): p1 registers topic IncTopic as shape-type, p2 as
+   dcps-msg (same name, different type). Discovery flags the collision: the local Topic's
+   inconsistent-topic-status total_count goes >= 1 and on_inconsistent_topic fires."
+  (let ((sts (dds.types:find-type-support "shape-type"))
+        (mts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0))
+        (tl (make-instance 'capturing-topic-listener)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "IncTopic" "shape-type" sts))
+                (tr (dds.dcps:create-topic p2 "IncTopic" "dcps-msg" mts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr)))
+           (declare (ignore dw dr))
+           (dds.dcps:set-topic-listener tw tl '(:inconsistent-topic))
+           (loop repeat 150
+                 until (plusp (dds.dcps:inconsistent-topic-status-total-count
+                               (dds.dcps:get-inconsistent-topic-status tw)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :inc-total
+                   (plusp (dds.dcps:inconsistent-topic-status-total-count
+                           (dds.dcps:get-inconsistent-topic-status tw)))
+                   "INCONSISTENT_TOPIC total_count must be >= 1 after a same-name/diff-type peer")
+           (%check :inc-no-match (zerop (dds.dcps:matched-count p1))
+                   "a type-mismatched endpoint must NOT match")
+           (loop repeat 60 until (assoc :inconsistent (cap-snapshot tl)) do (sleep 0.02))
+           (%check :inc-listener (and (assoc :inconsistent (cap-snapshot tl)) t)
+                   "on_inconsistent_topic must fire from the receiver thread"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))

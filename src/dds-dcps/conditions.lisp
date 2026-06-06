@@ -165,6 +165,9 @@
     (:offered-incompatible-qos
      (and (typep entity 'data-writer)
           (plusp (offered-incompatible-qos-status-total-count-change (dw-off-incompat entity)))))
+    (:inconsistent-topic
+     (and (typep entity 'topic)
+          (plusp (inconsistent-topic-status-total-count-change (topic-inconsistent-status entity)))))
     (t nil)))
 
 (defmethod condition-trigger-value ((c status-condition))

@@ -18,6 +18,7 @@
            #:disc-node-discovered-count #:disc-node-discovered-prefixes
            #:disc-node-matched-count #:disc-node-matched-topics
            #:disc-node-on-match #:disc-node-on-incompatible-qos #:disc-node-on-sample
+           #:disc-node-on-inconsistent-topic
            #:add-local-writer #:add-local-reader
            #:start-node #:stop-node
            #:announce-participant #:announce-endpoints

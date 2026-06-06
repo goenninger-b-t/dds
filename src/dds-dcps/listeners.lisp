@@ -20,6 +20,13 @@
 (defclass data-writer-listener (listener) ()
   (:documentation "DDS DataWriterListener (dds_rtf2_dcps.idl §206)."))
 
+(defclass topic-listener (listener) ()
+  (:documentation "DDS TopicListener (dds_rtf2_dcps.idl §201)."))
+
+(defgeneric on-inconsistent-topic (listener topic status)
+  (:documentation "TopicListener::on_inconsistent_topic.")
+  (:method ((listener listener) topic status) (declare (ignore topic status)) nil))
+
 ;;; ---- DataReaderListener methods (§224-245); base methods are no-ops ----
 
 (defgeneric on-data-available (listener reader)

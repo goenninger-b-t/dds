@@ -37,6 +37,7 @@
   (discovered (make-hash-table :test 'equalp) :type hash-table)
   (matches (make-hash-table :test 'equalp) :type hash-table)
   (incompat (make-hash-table :test 'equalp) :type hash-table)
+  (inconsistent (make-hash-table :test 'equalp) :type hash-table)
   (local-writers '() :type list)
   (local-readers '() :type list)
   (lock (dds.pal:make-lock "disc-node"))
@@ -53,6 +54,7 @@
   (on-acknack nil :type (or null function))
   (on-match nil :type (or null function))
   (on-incompatible-qos nil :type (or null function))
+  (on-inconsistent-topic nil :type (or null function))
   (on-sample nil :type (or null function))
   (mcast-socket nil)
   (mcast-rx-thread nil)
@@ -280,11 +282,29 @@
           nil
           (progn (setf (gethash key (disc-node-incompat node)) remote) t)))))
 
+(declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) boolean) %record-inconsistent))
+(defun %record-inconsistent (node remote)
+  "Record REMOTE as an inconsistent-topic source (same topic name as a local endpoint,
+   different type name), keyed by its GUID. Returns T only the first time, so
+   INCONSISTENT_TOPIC fires once per remote endpoint."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((key (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
+      (if (nth-value 1 (gethash key (disc-node-inconsistent node)))
+          nil
+          (progn (setf (gethash key (disc-node-inconsistent node)) remote) t)))))
+
 (declaim (ftype (function (disc-node keyword dds.rtps.discovery:endpoint-data) t) %fire-match))
 (defun %fire-match (node kind remote)
   "Invoke the ON-MATCH hook (if installed) once for a newly-matched REMOTE endpoint."
   (when (disc-node-on-match node)
     (funcall (disc-node-on-match node) kind remote)))
+
+(declaim (ftype (function (disc-node string) t) %fire-inconsistent))
+(defun %fire-inconsistent (node topic-name)
+  "Invoke the ON-INCONSISTENT-TOPIC hook (if installed) for a newly-detected topic-name
+   collision (same name, different type) — drives INCONSISTENT_TOPIC (FR-DCPS-3)."
+  (when (disc-node-on-inconsistent-topic node)
+    (funcall (disc-node-on-inconsistent-topic node) topic-name)))
 
 (declaim (ftype (function (disc-node keyword dds.rtps.discovery:endpoint-data list) t) %fire-incompat))
 (defun %fire-incompat (node kind remote bad)
@@ -296,35 +316,51 @@
 (declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) t) %match-remote-writer))
 (defun %match-remote-writer (node remote)
   "REMOTE is a discovered publication. Test it against each local reader: on the first
-   RxO-compatible reader record + announce a match (:remote-writer). If none matched
-   but topic+type agreed with at least one reader, record + announce an incompatible-QoS
-   event carrying the failing policies (-> the reader's REQUESTED_INCOMPATIBLE_QOS)."
-  (let ((incompat nil))
+   RxO-compatible reader record + announce a match (:remote-writer). Else, against a
+   reader on the SAME topic name: a different type name is an INCONSISTENT_TOPIC; a
+   matching type whose QoS failed RxO is REQUESTED_INCOMPATIBLE_QOS (failing policies)."
+  (let ((incompat nil) (inconsistent nil))
     (dolist (lr (disc-node-local-readers node))
       (multiple-value-bind (ok bad) (dds.rtps.discovery:endpoint-match-p remote lr)
         (cond
           (ok (when (%record-match node remote) (%fire-match node :remote-writer remote))
               (return-from %match-remote-writer t))
-          ((not (equal bad '(:topic-or-type))) (setf incompat bad)))))
-    (when (and incompat (%record-incompat node remote))
-      (%fire-incompat node :remote-writer remote incompat)))
+          ((string= (dds.rtps.discovery:endpoint-data-topic-name remote)
+                    (dds.rtps.discovery:endpoint-data-topic-name lr))
+           (if (string= (dds.rtps.discovery:endpoint-data-type-name remote)
+                        (dds.rtps.discovery:endpoint-data-type-name lr))
+               (setf incompat bad)
+               (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name lr)))))))
+    (cond
+      ((and incompat (%record-incompat node remote))
+       (%fire-incompat node :remote-writer remote incompat))
+      ((and inconsistent (%record-inconsistent node remote))
+       (%fire-inconsistent node inconsistent))))
   t)
 
 (declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) t) %match-remote-reader))
 (defun %match-remote-reader (node remote)
   "REMOTE is a discovered subscription. Test it against each local writer: on the first
-   RxO-compatible writer record + announce a match (:remote-reader). If none matched
-   but topic+type agreed with at least one writer, record + announce an incompatible-QoS
-   event carrying the failing policies (-> the writer's OFFERED_INCOMPATIBLE_QOS)."
-  (let ((incompat nil))
+   RxO-compatible writer record + announce a match (:remote-reader). Else, against a
+   writer on the SAME topic name: a different type name is an INCONSISTENT_TOPIC; a
+   matching type whose QoS failed RxO is OFFERED_INCOMPATIBLE_QOS (failing policies)."
+  (let ((incompat nil) (inconsistent nil))
     (dolist (lw (disc-node-local-writers node))
       (multiple-value-bind (ok bad) (dds.rtps.discovery:endpoint-match-p lw remote)
         (cond
           (ok (when (%record-match node remote) (%fire-match node :remote-reader remote))
               (return-from %match-remote-reader t))
-          ((not (equal bad '(:topic-or-type))) (setf incompat bad)))))
-    (when (and incompat (%record-incompat node remote))
-      (%fire-incompat node :remote-reader remote incompat)))
+          ((string= (dds.rtps.discovery:endpoint-data-topic-name lw)
+                    (dds.rtps.discovery:endpoint-data-topic-name remote))
+           (if (string= (dds.rtps.discovery:endpoint-data-type-name lw)
+                        (dds.rtps.discovery:endpoint-data-type-name remote))
+               (setf incompat bad)
+               (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name lw)))))))
+    (cond
+      ((and incompat (%record-incompat node remote))
+       (%fire-incompat node :remote-reader remote incompat))
+      ((and inconsistent (%record-inconsistent node remote))
+       (%fire-inconsistent node inconsistent))))
   t)
 
 (declaim (ftype (function (disc-node dds.core.buffer:octet-buffer (integer 0)) t) %handle-datagram))

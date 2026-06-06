@@ -33,7 +33,11 @@
   ((name :initarg :name :reader topic-name)
    (type-name :initarg :type-name :reader topic-type-name)
    (type-support :initarg :type-support :reader topic-type-support)
-   (participant :initarg :participant :reader topic-participant)))
+   (participant :initarg :participant :reader topic-participant)
+   (inconsistent-status :initform (make-inconsistent-topic-status) :accessor topic-inconsistent-status)
+   (listener :initform nil :accessor topic-listener-obj)
+   (listener-mask :initform '() :accessor topic-listener-mask)
+   (status-lock :initform (dds.pal:make-lock "topic-status") :accessor topic-status-lock)))
 
 (defclass data-writer (entity)
   ((topic :initarg :topic :reader dw-topic)
@@ -159,6 +163,8 @@
           (lambda (kind remote bad) (%on-disc-incompatible p kind remote bad)))
     (setf (dds.disc:disc-node-on-sample node)
           (lambda () (%on-participant-sample p)))
+    (setf (dds.disc:disc-node-on-inconsistent-topic node)
+          (lambda (topic-name) (%on-disc-inconsistent-topic p topic-name)))
     (dds.disc:start-node node)
     p))
 
@@ -548,3 +554,45 @@
   (dds.pal:with-lock ((dw-status-lock dw))
     (setf (dw-listener dw) listener (dw-listener-mask dw) mask))
   dw)
+
+;;; ---- INCONSISTENT_TOPIC (FR-DCPS-3): a remote topic of the same name but a
+;;;      different type, detected in SEDP and surfaced on the local Topic. ----
+
+(declaim (ftype (function (domain-participant string) (or null topic)) %find-topic))
+(defun %find-topic (p name)
+  "The participant's local Topic registered under NAME (a plain Topic, not a CFT), or NIL."
+  (find-if (lambda (c) (and (typep c 'topic) (string= (topic-name c) name))) (dp-children p)))
+
+(declaim (ftype (function (domain-participant string) t) %on-disc-inconsistent-topic))
+(defun %on-disc-inconsistent-topic (p name)
+  "ON-INCONSISTENT-TOPIC hook (disc receiver thread): a remote endpoint announced topic
+   NAME with a different type than P's local Topic of that name. Bump the Topic's
+   INCONSISTENT_TOPIC status and, if a listener is masked for it, fire on_inconsistent_topic."
+  (let ((tp (%find-topic p name)))
+    (when tp
+      (let ((snapshot nil))
+        (dds.pal:with-lock ((topic-status-lock tp))
+          (let ((s (topic-inconsistent-status tp)))
+            (incf (inconsistent-topic-status-total-count s))
+            (incf (inconsistent-topic-status-total-count-change s))
+            (when (and (topic-listener-obj tp) (member :inconsistent-topic (topic-listener-mask tp)))
+              (setf snapshot (copy-inconsistent-topic-status s))
+              (setf (inconsistent-topic-status-total-count-change s) 0))))
+        (when snapshot (on-inconsistent-topic (topic-listener-obj tp) tp snapshot)))))
+  t)
+
+(declaim (ftype (function (topic) inconsistent-topic-status) get-inconsistent-topic-status))
+(defun get-inconsistent-topic-status (tp)
+  "Topic::get_inconsistent_topic_status — snapshot + reset the total_count_change."
+  (dds.pal:with-lock ((topic-status-lock tp))
+    (let ((s (topic-inconsistent-status tp)))
+      (prog1 (copy-inconsistent-topic-status s)
+        (setf (inconsistent-topic-status-total-count-change s) 0)))))
+
+(declaim (ftype (function (topic (or null listener) list) topic) set-topic-listener))
+(defun set-topic-listener (tp listener mask)
+  "Topic::set_listener — install LISTENER for the statuses named in MASK (v1:
+   (:inconsistent-topic))."
+  (dds.pal:with-lock ((topic-status-lock tp))
+    (setf (topic-listener-obj tp) listener (topic-listener-mask tp) mask))
+  tp)

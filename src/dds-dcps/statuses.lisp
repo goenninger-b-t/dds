@@ -77,6 +77,13 @@
   (current-count-change 0 :type integer)
   (last-subscription-handle nil))
 
+(defstruct (inconsistent-topic-status (:constructor make-inconsistent-topic-status)
+                                      (:copier copy-inconsistent-topic-status))
+  "Topic INCONSISTENT_TOPIC status (dds_rtf2_dcps.idl §94): a remote topic of the same
+   name but a different type was discovered."
+  (total-count 0 :type integer)
+  (total-count-change 0 :type integer))
+
 (defstruct (qos-policy-count (:constructor make-qos-policy-count (policy-id count))
                              (:copier copy-qos-policy-count))
   "DDS QosPolicyCount (dds_rtf2_dcps.idl §143): a policy id + how many times it failed."

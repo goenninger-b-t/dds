@@ -60,13 +60,17 @@
            #:+qos-policy-id-data-representation+
            #:get-subscription-matched-status #:get-publication-matched-status
            #:get-requested-incompatible-qos-status #:get-offered-incompatible-qos-status
+           #:inconsistent-topic-status #:inconsistent-topic-status-total-count
+           #:inconsistent-topic-status-total-count-change
+           #:get-inconsistent-topic-status #:set-topic-listener
            ;; Listeners (FR-DCPS-2)
-           #:listener #:data-reader-listener #:data-writer-listener
+           #:listener #:data-reader-listener #:data-writer-listener #:topic-listener
            #:on-data-available #:on-subscription-matched #:on-requested-incompatible-qos
            #:on-requested-deadline-missed #:on-sample-rejected #:on-sample-lost
            #:on-liveliness-changed
            #:on-publication-matched #:on-offered-incompatible-qos
            #:on-offered-deadline-missed #:on-liveliness-lost
+           #:on-inconsistent-topic
            #:set-reader-listener #:set-writer-listener
            ;; Content-filter / query SQL-subset grammar (FR-DCPS-5)
            #:compile-filter #:lex-filter #:filter-error #:filter-error-detail
