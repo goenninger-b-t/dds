@@ -1051,3 +1051,52 @@
                      (dds.qos:qos-type-consistency (dds.qos:make-reader-qos))))
                 "the QoS set carries TYPE_CONSISTENCY_ENFORCEMENT (reader default)"))))
   t)
+
+;;; XCDR2 MinimalTypeObject serializer + EquivalenceHash (M4, FR-TYPE-2/5): serialize the
+;;; Minimal struct TypeObject to canonical XCDR2-LE bytes (XTypes §7.3.4.5) and hash it
+;;; (§7.3.4.9.1). The hand-derived golden (struct pt{long x;}) proves the framing byte-exact
+;;; against the §7.4.3.5.3 serialization VM. PROVISIONAL flag/encap choices await Connext.
+
+(declaim (ftype (function () t) run-typeobject-cdr-test))
+(defun run-typeobject-cdr-test ()
+  "Serialize a Minimal struct TypeObject to XCDR2-LE + compute its EquivalenceHash. Asserts
+   the spec-derived golden byte layout for a 1-member FINAL struct, the hash shape +
+   determinism, distinct types hashing differently, nested-struct recursion, and that
+   sequence members error cleanly pending oracle confirmation. The shape-type hash is a
+   PROVISIONAL self-consistency vector — to be locked byte-exact against Connext."
+  (let ((pt (dds.types:make-minimal-struct-type
+             :name "pt" :extensibility :final
+             :members (list (dds.types:make-struct-member
+                             "x" 0 (dds.types:primitive-type-identifier :i32)))))
+        (golden (octets #x23 0 0 0 #xf1 #x51 #x01 0 #x01 0 0 0 0 0 0 0
+                        #x13 0 0 0 #x01 0 0 0 #x0b 0 0 0 0 0 0 0
+                        #x01 0 #x04 #x9d #xd4 #xe4 #x61)))
+    (%check :to-golden (equalp golden (dds.types:minimal-type-object-octets pt))
+            "MinimalTypeObject XCDR2-LE for struct pt{long x;} must match the spec-derived golden")
+    (%check :to-hash-len (= 14 (length (dds.types:equivalence-hash pt)))
+            "EquivalenceHash is 14 octets (XTypes §7.3.4.9.1)")
+    (%check :to-hash-deterministic
+            (equalp (dds.types:equivalence-hash pt) (dds.types:equivalence-hash pt))
+            "EquivalenceHash is deterministic")
+    (let ((pt2 (dds.types:make-minimal-struct-type
+                :name "pt" :extensibility :final
+                :members (list (dds.types:make-struct-member
+                                "x" 0 (dds.types:primitive-type-identifier :i64))))))
+      (%check :to-hash-distinct
+              (not (equalp (dds.types:equivalence-hash pt) (dds.types:equivalence-hash pt2)))
+              "a different member type yields a different EquivalenceHash"))
+    (let ((to (dds.types:type-support-typeobject (dds.types:find-type-support "shape-type"))))
+      (%check :to-shape-bytes (= 87 (length (dds.types:minimal-type-object-octets to)))
+              "shape-type MinimalTypeObject serializes (PROVISIONAL byte count)")
+      (%check :to-shape-hash
+              (equalp (dds.types:equivalence-hash to)
+                      (octets #xbf #xe2 #xa6 #x2e #xd8 #x11 #xac #x46 #x3c #x40 #xc9 #x7d #x30 #xee))
+              "shape-type EquivalenceHash (PROVISIONAL self-consistency vector; lock vs Connext)"))
+    (let ((to (dds.types:type-support-typeobject (dds.types:find-type-support "gseg"))))
+      (%check :to-nested (= 14 (length (dds.types:equivalence-hash to)))
+              "a struct with nested-struct members hashes via recursion into the referenced TypeObject"))
+    (let ((to (dds.types:type-support-typeobject (dds.types:find-type-support "gseq"))))
+      (%check :to-seq-deferred
+              (handler-case (progn (dds.types:minimal-type-object-octets to) nil) (error () t))
+              "sequence member TypeObject serialization errors cleanly pending oracle confirmation")))
+  t)

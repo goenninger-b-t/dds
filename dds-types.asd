@@ -7,5 +7,6 @@
   :components ((:file "packages")
                (:file "type-support")
                (:file "xtypes")
-               (:file "assignability"))
+               (:file "assignability")
+               (:file "typeobject-cdr"))
   :in-order-to ((test-op (test-op "dds-tests"))))
