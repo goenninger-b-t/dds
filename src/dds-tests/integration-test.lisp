@@ -1100,3 +1100,38 @@
               (handler-case (progn (dds.types:minimal-type-object-octets to) nil) (error () t))
               "sequence member TypeObject serialization errors cleanly pending oracle confirmation")))
   t)
+
+;;; TypeInformation codec (M4 step b1, FR-TYPE-3 foundation): serialize the TypeInformation
+;;; carried in PID_TYPE_INFORMATION (idl @id 0x0075) and recover the minimal EquivalenceHash.
+;;; Round-trip-verifiable offline; the wire layout is PROVISIONAL (minimal-only, LC=4) pending
+;;; Connext confirmation, like the TypeObject serializer.
+
+(declaim (ftype (function () t) run-type-information-test))
+(defun run-type-information-test ()
+  "TypeInformation codec: serialize + recover the minimal EquivalenceHash. The round-trip
+   must yield the type's EquivalenceHash, be deterministic, distinguish types, and serialize
+   nested dependencies (gseg depends on gpoint)."
+  (flet ((to (name) (dds.types:type-support-typeobject (dds.types:find-type-support name))))
+    (let* ((mto (to "dcps-msg"))
+           (info (dds.types:serialize-type-information mto)))
+      (%check :ti-roundtrip
+              (equalp (dds.types:deserialize-type-information-hash info)
+                      (dds.types:equivalence-hash mto))
+              "TypeInformation round-trip recovers the type's EquivalenceHash")
+      (%check :ti-deterministic (equalp info (dds.types:serialize-type-information mto))
+              "TypeInformation serialization is deterministic")
+      (%check :ti-distinct
+              (not (equalp (dds.types:deserialize-type-information-hash info)
+                           (dds.types:deserialize-type-information-hash
+                            (dds.types:serialize-type-information (to "shape-type")))))
+              "different types yield different TypeInformation hashes"))
+    (let* ((gto (to "gseg"))
+           (ginfo (dds.types:serialize-type-information gto)))
+      (%check :ti-nested-roundtrip
+              (equalp (dds.types:deserialize-type-information-hash ginfo)
+                      (dds.types:equivalence-hash gto))
+              "a nested type's TypeInformation round-trips (dependencies serialized)")
+      (%check :ti-nested-larger
+              (> (length ginfo) (length (dds.types:serialize-type-information (to "dcps-msg"))))
+              "a type with a nested dependency carries a larger TypeInformation")))
+  t)

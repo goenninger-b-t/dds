@@ -46,6 +46,8 @@
            #:ti-equivalent-p #:struct-equivalent-p #:enforce-type-consistency
            ;; XCDR2 MinimalTypeObject serializer + EquivalenceHash (FR-TYPE-2/5)
            #:minimal-type-object-octets #:equivalence-hash
+           ;; TypeInformation codec for PID_TYPE_INFORMATION (FR-TYPE-3 foundation)
+           #:serialize-type-information #:deserialize-type-information-hash
            #:+tk-boolean+ #:+tk-byte+ #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
            #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
            #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+

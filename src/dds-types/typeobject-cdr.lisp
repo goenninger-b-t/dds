@@ -180,3 +180,114 @@
   "EquivalenceHash(S) = first 14 octets of MD5 of the serialized MinimalTypeObject
    (XTypes §7.3.4.9.1). Nested struct members recurse to the referenced struct's hash."
   (subseq (dds.core.md5:md5 (minimal-type-object-octets s)) 0 14))
+
+;;;; TypeInformation codec (M4 step b1, FR-TYPE-3 foundation). The TypeInformation carried
+;;;; in PublicationBuiltinTopicData/SubscriptionBuiltinTopicData (PID_TYPE_INFORMATION,
+;;;; idl @id(0x0075)) so peers learn a type's EquivalenceHash-based TypeIdentifier without
+;;;; the full TypeObject (XTypes §7.6.3.4 / §7.3.4.9.1). Structure (xtypes-1_3_typeobject.idl):
+;;;; TypeInformation (MUTABLE) { @id(0x1001) minimal; @id(0x1002) complete; }; each member is
+;;;; a TypeIdentifierWithDependencies (APPENDABLE) { TypeIdentfierWithSize typeid_with_size;
+;;;; long dependent_typeid_count; sequence<TypeIdentfierWithSize> dependent_typeids; };
+;;;; TypeIdentfierWithSize (APPENDABLE) { TypeIdentifier type_id; unsigned long
+;;;; typeobject_serialized_size; }. PROVISIONAL like the TypeObject serializer: minimal-only
+;;;; (the complete member is omitted, MUTABLE permits it); the mutable member uses LC=4
+;;;; (explicit NEXTINT length); dependent ordering is insertion order. Confirm vs Connext.
+
+(declaim (ftype (function (dds.core.buffer:cursor minimal-struct-type) t) %put-type-id-with-size))
+(declaim (ftype (function (minimal-struct-type) list) %collect-dependencies))
+(declaim (ftype (function (dds.core.buffer:cursor minimal-struct-type) t) %put-type-id-with-deps))
+(declaim (ftype (function (minimal-struct-type) (simple-array (unsigned-byte 8) (*))) serialize-type-information))
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*))) deserialize-type-information-hash))
+
+(defun %put-type-id-with-size (c s)
+  "TypeIdentfierWithSize (APPENDABLE): DHEADER + EK_MINIMAL TypeIdentifier (disc + 14-octet
+   hash) + typeobject_serialized_size (UInt32, the MinimalTypeObject byte length)."
+  (let* ((bytes (minimal-type-object-octets s))
+         (hash (subseq (dds.core.md5:md5 bytes) 0 14))
+         (p (%dheader-begin c)))
+    (dds.core.buffer:put-u8 c +ek-minimal+)
+    (dds.core.buffer:put-octets c hash 0 14)
+    (dds.cdr:cdr-put-u32 c (length bytes) :xcdr2)
+    (%dheader-end c p))
+  t)
+
+(defun %collect-dependencies (s)
+  "The dependent struct TypeObjects reachable from S (nested-struct members), deduped by
+   EquivalenceHash, in stable insertion order. Excludes S itself; the DSL is acyclic."
+  (let ((acc '()) (seen '()))
+    (labels ((visit (st)
+               (dolist (m (minimal-struct-type-members st))
+                 (let* ((ti (minimal-struct-member-type-identifier m))
+                        (ref (and ti (ti-aggregated-p ti) (type-identifier-referenced ti))))
+                   (when (minimal-struct-type-p ref)
+                     (let ((h (equivalence-hash ref)))
+                       (unless (member h seen :test #'equalp)
+                         (push h seen)
+                         (push ref acc)
+                         (visit ref))))))))
+      (visit s))
+    (nreverse acc)))
+
+(defun %put-type-id-with-deps (c s)
+  "TypeIdentifierWithDependencies (APPENDABLE): DHEADER + TypeIdentfierWithSize(S) +
+   dependent_typeid_count (Int32) + sequence<TypeIdentfierWithSize> (DHEADER + length +
+   each dependency's TypeIdentfierWithSize)."
+  (let ((deps (%collect-dependencies s))
+        (p (%dheader-begin c)))
+    (%put-type-id-with-size c s)
+    (dds.cdr:cdr-put-u32 c (length deps) :xcdr2)
+    (let ((sp (%dheader-begin c)))
+      (dds.cdr:cdr-put-u32 c (length deps) :xcdr2)
+      (dolist (d deps) (%put-type-id-with-size c d))
+      (%dheader-end c sp))
+    (%dheader-end c p))
+  t)
+
+(defun serialize-type-information (s)
+  "Serialize the TypeInformation for struct S (minimal only) as the octets carried in
+   PID_TYPE_INFORMATION: a MUTABLE struct DHEADER + the @id(0x1001) minimal member
+   (EMHEADER1 LC=4 + NEXTINT length + TypeIdentifierWithDependencies)."
+  (let* ((buf (dds.core.buffer:make-octet-buffer 16384))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    (let ((p (%dheader-begin c)))
+      (dds.cdr:cdr-align c 4 :xcdr2)
+      (dds.core.buffer:put-u32 c (dds.cdr:emheader1-encode t 4 #x1001))
+      (let ((np (dds.core.buffer:cursor-position c)))
+        (dds.core.buffer:put-u32 c 0)
+        (%put-type-id-with-deps c s)
+        (let ((e (dds.core.buffer:cursor-position c)))
+          (dds.core.buffer:cursor-set-position c np)
+          (dds.core.buffer:put-u32 c (- e np 4))
+          (dds.core.buffer:cursor-set-position c e)))
+      (%dheader-end c p))
+    (let* ((e (dds.core.buffer:cursor-position c))
+           (out (make-array e :element-type '(unsigned-byte 8))))
+      (replace out (dds.core.buffer:octet-buffer-vec buf) :end2 e)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
+      out)))
+
+(defun deserialize-type-information-hash (octets)
+  "Parse a serialized TypeInformation and return its minimal EK_MINIMAL TypeIdentifier's
+   14-octet EquivalenceHash (the value endpoint matching needs). Lenient: walks the top
+   DHEADER, the @id(0x1001) member EMHEADER1 (+NEXTINT), and the two APPENDABLE DHEADERs."
+  (let* ((buf (dds.core.buffer:make-octet-buffer (max 16 (length octets))))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    (replace (dds.core.buffer:octet-buffer-vec buf) octets)
+    (unwind-protect
+         (progn
+           (dds.cdr:cdr-get-dheader c :xcdr2)
+           (dds.cdr:cdr-align c 4 :xcdr2)
+           (multiple-value-bind (mu lc id) (dds.cdr:emheader1-decode (dds.core.buffer:get-u32 c))
+             (declare (ignore mu))
+             (unless (= id #x1001)
+               (error "TypeInformation parse: expected minimal member 0x1001, got #x~x" id))
+             (when (>= lc 4) (dds.core.buffer:get-u32 c))
+             (dds.cdr:cdr-get-dheader c :xcdr2)
+             (dds.cdr:cdr-get-dheader c :xcdr2)
+             (let ((disc (dds.core.buffer:get-u8 c)))
+               (unless (= disc +ek-minimal+)
+                 (error "TypeInformation parse: expected EK_MINIMAL type_id, got #x~x" disc))
+               (let ((h (make-array 14 :element-type '(unsigned-byte 8))))
+                 (dds.core.buffer:get-octets c h 0 14)
+                 h))))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
