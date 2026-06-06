@@ -67,4 +67,6 @@
            #:on-liveliness-changed
            #:on-publication-matched #:on-offered-incompatible-qos
            #:on-offered-deadline-missed #:on-liveliness-lost
-           #:set-reader-listener #:set-writer-listener))
+           #:set-reader-listener #:set-writer-listener
+           ;; Content-filter / query SQL-subset grammar (FR-DCPS-5)
+           #:compile-filter #:lex-filter #:filter-error #:filter-error-detail))

@@ -586,3 +586,68 @@
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))
     t))
+
+;;; DDS Annex B content-filter / query grammar (M3 #4, FR-DCPS-5): compile filter
+;;; expressions against the generated dcps-msg / shape-type field-accessors and
+;;; evaluate them — comparisons, %n parameters, AND/OR/NOT, parens, BETWEEN, LIKE,
+;;; field-vs-field, and the lexical/syntactic/field-resolution error paths. No network.
+
+(declaim (ftype (function (t) function) %ts-resolver))
+(defun %ts-resolver (ts)
+  "A FIELDNAME resolver over a type-support's generated field-accessors (ADR 0008)."
+  (let ((fa (dds.types:type-support-field-accessors ts)))
+    (lambda (name) (cdr (assoc name fa :test #'string-equal)))))
+
+(declaim (ftype (function (function t) t) %match-p))
+(defun %match-p (pred sample) (and (funcall pred sample) t))
+
+(declaim (ftype (function () t) run-dcps-filter-test))
+(defun run-dcps-filter-test ()
+  "Compile + evaluate DDS Annex B filter/query expressions (FR-DCPS-5) over generated
+   types, covering every production exercised by ContentFilteredTopic / QueryCondition."
+  (let* ((mts (dds.types:find-type-support "dcps-msg"))
+         (sts (dds.types:find-type-support "shape-type"))
+         (mres (%ts-resolver mts))
+         (sres (%ts-resolver sts))
+         (m42 (make-dcps-msg :id 42 :text "hello"))
+         (m7  (make-dcps-msg :id 7  :text "world"))
+         (blue (make-shape-type :color "BLUE" :x 100 :y 5 :shapesize 30))
+         (red  (make-shape-type :color "RED"  :x 10  :y 5 :shapesize 30)))
+    (flet ((c (expr params res) (dds.dcps:compile-filter expr params res)))
+      (let ((p (c "id > %0" '("40") mres)))
+        (%check :flt-gt-param (%match-p p m42) "id=42 > 40")
+        (%check :flt-gt-param-neg (not (%match-p p m7)) "id=7 not > 40"))
+      (let ((p (c "id = 42 AND text = 'hello'" '() mres)))
+        (%check :flt-and (%match-p p m42) "id=42 AND text=hello")
+        (%check :flt-and-neg (not (%match-p p m7)) "id=7 fails the AND"))
+      (let ((p (c "id = 7 OR id <> 42" '() mres)))
+        (%check :flt-or (%match-p p m7) "id=7 matches the OR"))
+      (let ((p (c "text <> 'hello'" '() mres)))
+        (%check :flt-ne (%match-p p m7) "text=world <> hello")
+        (%check :flt-ne-neg (not (%match-p p m42)) "text=hello not <> hello"))
+      (let ((p (c "NOT (id < 10)" '() mres)))
+        (%check :flt-not (%match-p p m42) "NOT(42<10) is true")
+        (%check :flt-not-neg (not (%match-p p m7)) "NOT(7<10) is false"))
+      (let ((p (c "id BETWEEN %0 AND %1" '("10" "50") mres)))
+        (%check :flt-between (%match-p p m42) "42 in [10,50]")
+        (%check :flt-between-neg (not (%match-p p m7)) "7 not in [10,50]"))
+      (let ((p (c "id NOT BETWEEN 10 AND 50" '() mres)))
+        (%check :flt-not-between (%match-p p m7) "7 NOT BETWEEN 10 AND 50 -> true"))
+      (let ((p (c "color LIKE 'BL%'" '() sres)))
+        (%check :flt-like (%match-p p blue) "BLUE LIKE BL%")
+        (%check :flt-like-neg (not (%match-p p red)) "RED not LIKE BL%"))
+      (let ((p (c "color LIKE 'R_D'" '() sres)))
+        (%check :flt-like-underscore (%match-p p red) "RED LIKE R_D"))
+      (let ((p (c "x > shapesize" '() sres)))
+        (%check :flt-field-field (%match-p p blue) "x=100 > shapesize=30")
+        (%check :flt-field-field-neg (not (%match-p p red)) "x=10 not > shapesize=30"))
+      (%check :flt-err-field
+              (handler-case (progn (c "nope > 1" '() mres) nil) (dds.dcps:filter-error () t))
+              "an unknown field must signal filter-error")
+      (%check :flt-err-syntax
+              (handler-case (progn (c "id >" '() mres) nil) (dds.dcps:filter-error () t))
+              "a truncated expression must signal filter-error")
+      (%check :flt-err-trailing
+              (handler-case (progn (c "id = 1 2" '() mres) nil) (dds.dcps:filter-error () t))
+              "trailing tokens must signal filter-error")))
+  t)

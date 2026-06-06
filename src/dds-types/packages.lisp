@@ -18,6 +18,6 @@
            #:type-support-typeobject #:type-support-typeidentifier
            #:type-support-sample-pool-alloc #:type-support-sample-pool-free
            #:type-support-flatdata-offset #:type-support-flatdata-builder
-           #:type-support-data-representation-mask
+           #:type-support-data-representation-mask #:type-support-field-accessors
            #:register-type #:find-type-support #:registered-type-names
            #:sample-pool #:make-sample-pool #:sample-pool-acquire #:sample-pool-release))

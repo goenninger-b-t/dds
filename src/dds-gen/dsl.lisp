@@ -172,5 +172,12 @@
              :serialized-size (function ,ssz)
              :key-hash ,(when keys `(function ,khf))
              :sample-pool-alloc (lambda () (dds.types:sample-pool-acquire %pool))
-             :sample-pool-free (lambda (s) (dds.types:sample-pool-release %pool s)))))
+             :sample-pool-free (lambda (s) (dds.types:sample-pool-release %pool s))
+             ;; (field-name . accessor) per scalar/string member for content filters
+             ;; (FR-DCPS-5, ADR 0008); sequence/nested members are not filterable in v1.
+             :field-accessors
+             (list ,@(loop for m in parsed
+                           when (member (getf m :kind) '(:scalar))
+                             collect `(cons ,(string-downcase (string (getf m :slot)))
+                                            (function ,(acc m))))))))
          ',name))))

@@ -14,7 +14,10 @@
   (sample-pool-free nil :type (or null function))
   (flatdata-offset nil :type (or null function))
   (flatdata-builder nil :type (or null function))
-  (data-representation-mask 0 :type integer))
+  (data-representation-mask 0 :type integer)
+  ;; (FIELD-NAME-STRING . unary accessor) per scalar/string member, for content
+  ;; filters / query conditions (FR-DCPS-5, ADR 0008). Off the hot path; nil otherwise.
+  (field-accessors '() :type list))
 
 (defvar *type-registry* (make-hash-table :test 'equal)
   "Maps a type name to its type-support. Control-plane structure (off hot path).")
