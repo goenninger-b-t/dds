@@ -69,4 +69,7 @@
            #:on-offered-deadline-missed #:on-liveliness-lost
            #:set-reader-listener #:set-writer-listener
            ;; Content-filter / query SQL-subset grammar (FR-DCPS-5)
-           #:compile-filter #:lex-filter #:filter-error #:filter-error-detail))
+           #:compile-filter #:lex-filter #:filter-error #:filter-error-detail
+           #:content-filtered-topic #:create-contentfilteredtopic
+           #:set-cft-expression-parameters
+           #:cft-name #:cft-related-topic #:cft-expression #:cft-parameters))

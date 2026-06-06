@@ -55,11 +55,24 @@
    (listener :initform nil :accessor dr-listener)
    (listener-mask :initform '() :accessor dr-listener-mask)
    (conditions :initform '() :accessor dr-conditions)      ; read/query/status conditions bound here
+   (filter :initform nil :accessor dr-filter)              ; ContentFilteredTopic predicate, or nil
    (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock)))
 
 ;; Defined in conditions.lisp (loaded after this file); forward-declared so the data-
 ;; arrival hook below can wake the reader's WaitSets without a compile-time warning.
 (declaim (ftype (function (data-reader) t) %notify-reader-conditions))
+
+(declaim (ftype (function (t) function) %field-resolver))
+(defun %field-resolver (ts)
+  "A content-filter FIELDNAME resolver over a type-support's field-accessors (ADR 0008):
+   maps a field name (case-insensitively) to its unary accessor, or NIL."
+  (let ((fa (dds.types:type-support-field-accessors ts)))
+    (lambda (name) (cdr (assoc name fa :test #'string-equal)))))
+
+;; A TopicDescription's content-filter predicate: NIL for a plain Topic; the compiled
+;; predicate for a ContentFilteredTopic (the method is added in filter.lisp).
+(defgeneric td-filter-predicate (topic-description)
+  (:method ((td t)) nil))
 
 ;;; ---- SampleInfo + cached samples (FR-DCPS-4) ----
 
@@ -213,15 +226,18 @@
       (setf (dp-user-writer (pub-participant pub)) dw)   ; v1 back-ref for status hooks
       dw)))
 
-(declaim (ftype (function (subscriber topic &key (:qos t)) data-reader) create-datareader))
+(declaim (ftype (function (subscriber t &key (:qos t)) data-reader) create-datareader))
 (defun create-datareader (sub topic &key (qos (dds.qos:make-reader-qos)))
   "Subscriber::create_datareader — register a local reader in the engine on the
-   topic's name/type with the QoS reliability (v1: the single user reader)."
+   topic's name/type with the QoS reliability (v1: the single user reader). TOPIC may
+   be a Topic or a ContentFilteredTopic; in the latter case the reader applies the
+   filter predicate reader-side (only matching samples reach read/take)."
   (let ((node (dp-node (sub-participant sub))))
     (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
                                :qos qos)
     (dds.disc:enable-subscriber node)
     (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos :enabled t)))
+      (setf (dr-filter dr) (td-filter-predicate topic))   ; nil for a plain Topic
       (push dr (sub-readers sub))
       (setf (dp-user-reader (sub-participant sub)) dr)   ; v1 back-ref for status hooks
       dr)))
@@ -256,18 +272,20 @@
         (setf (dr-drained dr) sn)
         (let ((bytes (dds.disc:node-sample node sn)))
           (when bytes
-            (let* ((data (%deserialize-sample ts bytes))
-                   (handle (%instance-handle ts data)))
-              (unless (nth-value 1 (gethash handle (dr-instances dr)))
-                (setf (gethash handle (dr-instances dr)) nil))   ; nil = not yet accessed
-              (setf (dr-cache dr)
-                    (nconc (dr-cache dr)
-                           (list (make-cached-sample
-                                  :data data
-                                  :info (make-sample-info
-                                         :sample-state :not-read :view-state :new
-                                         :instance-state :alive :valid-data t
-                                         :instance-handle handle :sequence-number sn))))))))))))
+            (let ((data (%deserialize-sample ts bytes)))
+              ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
+              (when (or (null (dr-filter dr)) (funcall (dr-filter dr) data))
+                (let ((handle (%instance-handle ts data)))
+                  (unless (nth-value 1 (gethash handle (dr-instances dr)))
+                    (setf (gethash handle (dr-instances dr)) nil))   ; nil = not yet accessed
+                  (setf (dr-cache dr)
+                        (nconc (dr-cache dr)
+                               (list (make-cached-sample
+                                      :data data
+                                      :info (make-sample-info
+                                             :sample-state :not-read :view-state :new
+                                             :instance-state :alive :valid-data t
+                                             :instance-handle handle :sequence-number sn))))))))))))))
 
 (declaim (ftype (function (t) (eql t)) %where-any))
 (defun %where-any (sample)

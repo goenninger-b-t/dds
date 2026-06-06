@@ -651,3 +651,71 @@
               (handler-case (progn (c "id = 1 2" '() mres) nil) (dds.dcps:filter-error () t))
               "trailing tokens must signal filter-error")))
   t)
+
+;;; ContentFilteredTopic over the wire (M3 #4, FR-DCPS-5): a DataReader on a CFT
+;;; ("x > %0", params ("50")) over the Square topic matches the writer on the related
+;;; topic but surfaces only the samples passing the filter (reader-side).
+
+(declaim (ftype (function () t) run-dcps-content-filtered-topic-test))
+(defun run-dcps-content-filtered-topic-test ()
+  "A ContentFilteredTopic delivers only matching samples: a reader on a CFT over Square
+   with filter \"x > %0\" / params (50) receives the x=100 and x=200 shapes but not the
+   x=10 shape, while still matching the writer on the related topic (FR-DCPS-5)."
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                (cft (dds.dcps:create-contentfilteredtopic p2 "FastSquare" tr "x > %0" '("50")))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub cft)))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :cft-matched (plusp (dds.dcps:matched-count p2))
+                   "the CFT reader must match the writer on the related topic")
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 100 :y 1 :shapesize 10))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 10  :y 2 :shapesize 10))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 200 :y 3 :shapesize 10))
+           ;; two matches (x=100, x=200) arriving proves the x=10 (SN between) was drained + dropped
+           (loop repeat 250 until (>= (dds.dcps:samples-available dr) 2) do (sleep 0.02))
+           (%check :cft-count (= 2 (dds.dcps:samples-available dr))
+                   "CFT must surface exactly the 2 matching samples (x>50)")
+           (let ((xs (mapcar (lambda (cs) (shape-type-x (dds.dcps:cached-sample-data cs)))
+                             (dds.dcps:take-samples dr))))
+             (%check :cft-values
+                     (and (= 2 (length xs)) (every (lambda (x) (> x 50)) xs)
+                          (member 100 xs) (member 200 xs) (not (member 10 xs)))
+                     "CFT delivered only x>50 (100,200), excluded x=10")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
+;;; QueryCondition with a DDS query_expression (M3 #4, FR-DCPS-5): create_querycondition
+;;; now accepts an Annex B expression + parameters, compiled against the reader's topic
+;;; type (not just a Lisp predicate). No discovery/data needed — checks the predicate.
+
+(declaim (ftype (function () t) run-dcps-querycondition-sql-test))
+(defun run-dcps-querycondition-sql-test ()
+  "create_querycondition with :expression compiles the DDS query against the reader's
+   topic type; the resulting query-fn filters by the SQL expression (FR-DCPS-5)."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "QcSqlTopic" "dcps-msg" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp))
+                (qc (dds.dcps:create-querycondition
+                     dr :states '(:not-read)
+                        :expression "id > %0 AND text <> 'skip'" :parameters '("50")))
+                (pred (dds.dcps:qc-query-fn qc)))
+           (%check :qcsql-match (and (funcall pred (make-dcps-msg :id 99 :text "ok")) t)
+                   "id=99,text=ok matches id>50 AND text<>skip")
+           (%check :qcsql-low (not (funcall pred (make-dcps-msg :id 10 :text "ok")))
+                   "id=10 fails id>50")
+           (%check :qcsql-skip (not (funcall pred (make-dcps-msg :id 99 :text "skip")))
+                   "text=skip fails text<>skip"))
+      (dds.dcps:delete-participant p))
+    t))

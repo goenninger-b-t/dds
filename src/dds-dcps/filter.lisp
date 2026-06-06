@@ -282,3 +282,56 @@
           (error 'filter-error
                  :detail (format nil "trailing tokens after expression: ~a" (pstate-rest ps))))
         (lambda (sample) (and (funcall pred sample) t))))))
+
+;;; ---- ContentFilteredTopic (FR-DCPS-5): a TopicDescription over a related Topic +
+;;;      a compiled filter predicate; a DataReader created on it filters reader-side. ----
+
+(defclass content-filtered-topic ()
+  ((name :initarg :name :reader cft-name)
+   (related-topic :initarg :related-topic :reader cft-related-topic)
+   (expression :initarg :expression :accessor cft-expression)
+   (parameters :initarg :parameters :initform '() :accessor cft-parameters)
+   (predicate :initarg :predicate :accessor cft-predicate))
+  (:documentation "DDS ContentFilteredTopic (dds_rtf2_dcps.idl §2.2.2.3.3): a related
+   Topic + a filter_expression + expression_parameters compiled to a reader-side
+   predicate (DDS 1.4 Annex B). For SEDP matching it presents the RELATED topic's
+   name/type, so it matches writers on the related topic; the filter is applied in the
+   reader drain. v1 filters reader-side only."))
+
+;; A CFT presents the related Topic's name/type/type-support/participant so
+;; create-datareader and the drain treat it like its related Topic.
+(defmethod topic-name ((cft content-filtered-topic)) (topic-name (cft-related-topic cft)))
+(defmethod topic-type-name ((cft content-filtered-topic)) (topic-type-name (cft-related-topic cft)))
+(defmethod topic-type-support ((cft content-filtered-topic)) (topic-type-support (cft-related-topic cft)))
+(defmethod topic-participant ((cft content-filtered-topic)) (topic-participant (cft-related-topic cft)))
+
+;; The reader applies the CFT's CURRENT predicate, so set_expression_parameters takes
+;; effect on already-created DataReaders.
+(defmethod td-filter-predicate ((cft content-filtered-topic))
+  (lambda (sample) (funcall (cft-predicate cft) sample)))
+
+(declaim (ftype (function (domain-participant string topic string &optional list) content-filtered-topic) create-contentfilteredtopic))
+(defun create-contentfilteredtopic (participant name related-topic filter-expression
+                                    &optional (parameters '()))
+  "DomainParticipant::create_contentfilteredtopic — a ContentFilteredTopic named NAME
+   over RELATED-TOPIC, filtered by FILTER-EXPRESSION (DDS Annex B) + PARAMETERS. The
+   predicate is compiled now against the related topic's type (FR-DCPS-5)."
+  (let* ((pred (compile-filter filter-expression parameters
+                               (%field-resolver (topic-type-support related-topic))))
+         (cft (make-instance 'content-filtered-topic
+                             :name name :related-topic related-topic
+                             :expression filter-expression :parameters parameters
+                             :predicate pred)))
+    (push cft (dp-children participant))
+    cft))
+
+(declaim (ftype (function (content-filtered-topic list) content-filtered-topic) set-cft-expression-parameters))
+(defun set-cft-expression-parameters (cft parameters)
+  "ContentFilteredTopic::set_expression_parameters — recompile the predicate with new
+   PARAMETERS; DataReaders created on CFT pick up the new predicate (they call through
+   to CFT's current predicate)."
+  (setf (cft-parameters cft) parameters
+        (cft-predicate cft) (compile-filter (cft-expression cft) parameters
+                                            (%field-resolver
+                                             (topic-type-support (cft-related-topic cft)))))
+  cft)

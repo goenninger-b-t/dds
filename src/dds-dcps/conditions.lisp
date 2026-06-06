@@ -92,13 +92,24 @@
     (push c (dr-conditions reader))
     c))
 
-(declaim (ftype (function (data-reader &key (:states list) (:query function)) query-condition) create-querycondition))
-(defun create-querycondition (reader &key (states '(:not-read)) (query #'%where-any))
-  "DataReader::create_querycondition — a ReadCondition that also filters by QUERY (a
-   predicate over the deserialized sample). Triggers / selects only samples whose
-   sample-state is in STATES AND that satisfy QUERY. v1 takes a Lisp predicate; the
-   DDS SQL-subset query expression + parameters are deferred to #4 (FR-DCPS-5)."
-  (let ((c (make-instance 'query-condition :reader reader :states states :query-fn query)))
+;; Defined in filter.lisp (loaded after this file); forward-declared so the SQL form
+;; of create-querycondition can compile a query_expression without a compile warning.
+(declaim (ftype (function (string list function) function) compile-filter))
+
+(declaim (ftype (function (data-reader &key (:states list) (:query function) (:expression (or null string)) (:parameters list)) query-condition) create-querycondition))
+(defun create-querycondition (reader &key (states '(:not-read)) (query #'%where-any)
+                                          expression (parameters '()))
+  "DataReader::create_querycondition — a ReadCondition that also filters by a query.
+   With :EXPRESSION (a DDS Annex B query_expression) + :PARAMETERS (the DDS
+   expression_parameters), the query is compiled against the reader's topic type via
+   the SQL-subset grammar (FR-DCPS-5); otherwise :QUERY is a Lisp predicate over the
+   deserialized sample (%where-any selects all). Triggers / selects only samples whose
+   sample-state is in STATES AND that satisfy the query."
+  (let* ((qfn (if expression
+                  (compile-filter expression parameters
+                                  (%field-resolver (topic-type-support (dr-topic reader))))
+                  query))
+         (c (make-instance 'query-condition :reader reader :states states :query-fn qfn)))
     (push c (dr-conditions reader))
     c))
 
