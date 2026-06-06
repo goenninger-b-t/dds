@@ -63,6 +63,10 @@
            #:inconsistent-topic-status #:inconsistent-topic-status-total-count
            #:inconsistent-topic-status-total-count-change
            #:get-inconsistent-topic-status #:set-topic-listener
+           #:sample-rejected-status #:sample-rejected-reason
+           #:sample-rejected-status-total-count #:sample-rejected-status-total-count-change
+           #:sample-rejected-status-last-reason #:sample-rejected-status-last-instance-handle
+           #:get-sample-rejected-status
            ;; Listeners (FR-DCPS-2)
            #:listener #:data-reader-listener #:data-writer-listener #:topic-listener
            #:on-data-available #:on-subscription-matched #:on-requested-incompatible-qos

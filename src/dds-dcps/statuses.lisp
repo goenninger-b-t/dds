@@ -77,6 +77,20 @@
   (current-count-change 0 :type integer)
   (last-subscription-handle nil))
 
+(deftype sample-rejected-reason ()
+  "DDS SampleRejectedStatusKind (dds_rtf2_dcps.idl §104)."
+  '(member :not-rejected :rejected-by-instances-limit
+    :rejected-by-samples-limit :rejected-by-samples-per-instance-limit))
+
+(defstruct (sample-rejected-status (:constructor make-sample-rejected-status)
+                                   (:copier copy-sample-rejected-status))
+  "DataReader SAMPLE_REJECTED status (dds_rtf2_dcps.idl §111): a sample was rejected
+   because a RESOURCE_LIMITS bound would have been exceeded."
+  (total-count 0 :type integer)
+  (total-count-change 0 :type integer)
+  (last-reason :not-rejected :type sample-rejected-reason)
+  (last-instance-handle nil))
+
 (defstruct (inconsistent-topic-status (:constructor make-inconsistent-topic-status)
                                       (:copier copy-inconsistent-topic-status))
   "Topic INCONSISTENT_TOPIC status (dds_rtf2_dcps.idl §94): a remote topic of the same

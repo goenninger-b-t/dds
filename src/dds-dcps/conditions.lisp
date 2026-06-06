@@ -159,6 +159,9 @@
     (:requested-incompatible-qos
      (and (typep entity 'data-reader)
           (plusp (requested-incompatible-qos-status-total-count-change (dr-req-incompat entity)))))
+    (:sample-rejected
+     (and (typep entity 'data-reader)
+          (plusp (sample-rejected-status-total-count-change (dr-sample-rejected entity)))))
     (:publication-matched
      (and (typep entity 'data-writer)
           (plusp (publication-matched-status-total-count-change (dw-pub-matched entity)))))

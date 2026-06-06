@@ -20,5 +20,7 @@
            #:qos-presentation-coherent #:qos-presentation-ordered
            #:qos-data-representation #:qos-partition
            #:qos-history-kind #:qos-history-depth #:qos-lifespan
+           #:qos-resource-max-samples #:qos-resource-max-instances
+           #:qos-resource-max-samples-per-instance
            #:qos-rxo-compatible #:partition-match-p
            #:run-qos-rxo-test))

@@ -70,7 +70,11 @@
   ;; held (non-RxO) policies
   (history-kind :keep-last :type (member :keep-last :keep-all))
   (history-depth 1 :type (integer 1))
-  (lifespan +duration-infinite+ :type qos-duration))
+  (lifespan +duration-infinite+ :type qos-duration)
+  ;; RESOURCE_LIMITS (not an RxO policy). LENGTH_UNLIMITED = -1 is the DDS default.
+  (resource-max-samples -1 :type integer)
+  (resource-max-instances -1 :type integer)
+  (resource-max-samples-per-instance -1 :type integer))
 
 (declaim (ftype (function (&rest t) qos) make-writer-qos))
 (defun make-writer-qos (&rest args)

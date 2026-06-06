@@ -56,6 +56,7 @@
    (drained :initform 0 :accessor dr-drained)                    ; highest engine SN drained
    (sub-matched :initform (make-subscription-matched-status) :accessor dr-sub-matched)
    (req-incompat :initform (make-requested-incompatible-qos-status) :accessor dr-req-incompat)
+   (sample-rejected :initform (make-sample-rejected-status) :accessor dr-sample-rejected)
    (listener :initform nil :accessor dr-listener)
    (listener-mask :initform '() :accessor dr-listener-mask)
    (conditions :initform '() :accessor dr-conditions)      ; read/query/status conditions bound here
@@ -267,6 +268,47 @@
   (let ((kh (dds.types:type-support-key-hash ts)))
     (if kh (funcall kh sample) +instance-handle-nil+)))
 
+(declaim (ftype (function (data-reader t) symbol) %resource-reject-reason))
+(defun %resource-reject-reason (dr handle)
+  "A SampleRejectedStatusKind keyword if caching a sample for instance HANDLE would
+   exceed the reader's RESOURCE_LIMITS (DCPS-cache-level, v1), else NIL. -1 = unlimited."
+  (let ((qos (entity-qos dr)))
+    (when (typep qos 'dds.qos:qos)
+      (let ((max-s (dds.qos:qos-resource-max-samples qos))
+            (max-i (dds.qos:qos-resource-max-instances qos))
+            (max-spi (dds.qos:qos-resource-max-samples-per-instance qos))
+            (cache (dr-cache dr)))
+        (cond
+          ((and (>= max-s 0) (>= (length cache) max-s)) :rejected-by-samples-limit)
+          ((and (>= max-spi 0)
+                (>= (count handle cache :test #'equalp
+                                        :key (lambda (cs)
+                                               (sample-info-instance-handle (cached-sample-info cs))))
+                    max-spi))
+           :rejected-by-samples-per-instance-limit)
+          ((and (>= max-i 0)
+                (not (nth-value 1 (gethash handle (dr-instances dr))))
+                (>= (hash-table-count (dr-instances dr)) max-i))
+           :rejected-by-instances-limit)
+          (t nil))))))
+
+(declaim (ftype (function (data-reader symbol t) t) %reader-sample-rejected))
+(defun %reader-sample-rejected (dr reason handle)
+  "Bump DR's SAMPLE_REJECTED status (reason + instance handle) and fire on_sample_rejected
+   if a listener is masked for it."
+  (let ((snapshot nil))
+    (dds.pal:with-lock ((dr-status-lock dr))
+      (let ((s (dr-sample-rejected dr)))
+        (incf (sample-rejected-status-total-count s))
+        (incf (sample-rejected-status-total-count-change s))
+        (setf (sample-rejected-status-last-reason s) reason
+              (sample-rejected-status-last-instance-handle s) handle)
+        (when (and (dr-listener dr) (member :sample-rejected (dr-listener-mask dr)))
+          (setf snapshot (copy-sample-rejected-status s))
+          (setf (sample-rejected-status-total-count-change s) 0))))
+    (when snapshot (on-sample-rejected (dr-listener dr) dr snapshot)))
+  t)
+
 (declaim (ftype (function (data-reader) t) %drain))
 (defun %drain (dr)
   "Pull newly-received raw samples from the engine, deserialize, assign each to its
@@ -281,17 +323,22 @@
             (let ((data (%deserialize-sample ts bytes)))
               ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
               (when (or (null (dr-filter dr)) (funcall (dr-filter dr) data))
-                (let ((handle (%instance-handle ts data)))
-                  (unless (nth-value 1 (gethash handle (dr-instances dr)))
-                    (setf (gethash handle (dr-instances dr)) nil))   ; nil = not yet accessed
-                  (setf (dr-cache dr)
-                        (nconc (dr-cache dr)
-                               (list (make-cached-sample
-                                      :data data
-                                      :info (make-sample-info
-                                             :sample-state :not-read :view-state :new
-                                             :instance-state :alive :valid-data t
-                                             :instance-handle handle :sequence-number sn))))))))))))))
+                (let* ((handle (%instance-handle ts data))
+                       (reason (%resource-reject-reason dr handle)))
+                  (if reason
+                      ;; RESOURCE_LIMITS would be exceeded -> reject (SAMPLE_REJECTED).
+                      (%reader-sample-rejected dr reason handle)
+                      (progn
+                        (unless (nth-value 1 (gethash handle (dr-instances dr)))
+                          (setf (gethash handle (dr-instances dr)) nil))   ; nil = not yet accessed
+                        (setf (dr-cache dr)
+                              (nconc (dr-cache dr)
+                                     (list (make-cached-sample
+                                            :data data
+                                            :info (make-sample-info
+                                                   :sample-state :not-read :view-state :new
+                                                   :instance-state :alive :valid-data t
+                                                   :instance-handle handle :sequence-number sn))))))))))))))))
 
 (declaim (ftype (function (t) (eql t)) %where-any))
 (defun %where-any (sample)
@@ -536,6 +583,14 @@
             (mapcar #'copy-qos-policy-count (offered-incompatible-qos-status-policies s)))
       (setf (offered-incompatible-qos-status-total-count-change s) 0)
       snap)))
+
+(declaim (ftype (function (data-reader) sample-rejected-status) get-sample-rejected-status))
+(defun get-sample-rejected-status (dr)
+  "DataReader::get_sample_rejected_status — snapshot + reset total_count_change."
+  (dds.pal:with-lock ((dr-status-lock dr))
+    (let ((s (dr-sample-rejected dr)))
+      (prog1 (copy-sample-rejected-status s)
+        (setf (sample-rejected-status-total-count-change s) 0)))))
 
 ;;; ---- set_listener (DDS 1.4 Entity::set_listener) ----
 

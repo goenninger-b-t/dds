@@ -763,3 +763,53 @@
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))
     t))
+
+;;; SAMPLE_REJECTED + RESOURCE_LIMITS (M3 #4 follow-up, FR-DCPS-3): a reader bounded by
+;;; max_samples rejects the overflow sample at the DCPS cache and raises SAMPLE_REJECTED.
+
+(defmethod dds.dcps:on-sample-rejected ((l capturing-reader-listener) reader status)
+  (declare (ignore reader))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :sample-rejected status) (cap-hits l))))
+
+(declaim (ftype (function () t) run-dcps-sample-rejected-test))
+(defun run-dcps-sample-rejected-test ()
+  "SAMPLE_REJECTED + RESOURCE_LIMITS (FR-DCPS-3): a reliable reader with max_samples=2
+   receives 3 samples; the 3rd is rejected at the DCPS cache (cache stays at 2),
+   SAMPLE_REJECTED reports REJECTED_BY_SAMPLES_LIMIT, and on_sample_rejected fires."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0))
+        (rl (make-instance 'capturing-reader-listener)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "RejTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "RejTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr
+                      :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                    :resource-max-samples 2))))
+           (dds.dcps:set-reader-listener dr rl '(:sample-rejected))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (dds.dcps:write-sample dw (make-dcps-msg :id 1 :text "a"))
+           (dds.dcps:write-sample dw (make-dcps-msg :id 2 :text "b"))
+           (dds.dcps:write-sample dw (make-dcps-msg :id 3 :text "c"))
+           (loop repeat 250
+                 until (plusp (dds.dcps:sample-rejected-status-total-count
+                               (dds.dcps:get-sample-rejected-status dr)))
+                 do (dds.dcps:samples-available dr) (sleep 0.02))
+           (%check :rej-cache-bounded (= 2 (dds.dcps:samples-available dr))
+                   "the reader cache must be bounded at max_samples=2")
+           (let ((st (dds.dcps:get-sample-rejected-status dr)))
+             (%check :rej-total (plusp (dds.dcps:sample-rejected-status-total-count st))
+                     "SAMPLE_REJECTED total_count must be >= 1")
+             (%check :rej-reason
+                     (eq :rejected-by-samples-limit (dds.dcps:sample-rejected-status-last-reason st))
+                     "last_reason must be REJECTED_BY_SAMPLES_LIMIT"))
+           (loop repeat 60 until (assoc :sample-rejected (cap-snapshot rl)) do (sleep 0.02))
+           (%check :rej-listener (and (assoc :sample-rejected (cap-snapshot rl)) t)
+                   "on_sample_rejected must fire"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
