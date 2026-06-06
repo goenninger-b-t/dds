@@ -886,3 +886,51 @@
                             (key-hash-shape-type (make-shape-type :color "BLUE" :x 0 :y 0 :shapesize 0)))))
           "keyhash depends only on the key, distinctly per value")
   t)
+
+;;; XTypes structural TypeObject model (M4, FR-TYPE-2): define-dds-type now builds a
+;;; Minimal struct TypeObject (member TypeIdentifiers + byte-exact NameHashes) into the
+;;; type-support; plus TypeIdentifier structural equality.
+
+(declaim (ftype (function () t) run-xtypes-model-test))
+(defun run-xtypes-model-test ()
+  "The Minimal struct TypeObject built by define-dds-type carries the right member
+   TypeIdentifier kinds, key flags, and byte-exact NameHashes; TypeIdentifier equality
+   is structural (FR-TYPE-2)."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (to (dds.types:type-support-typeobject ts))
+         (members (dds.types:minimal-struct-type-members to)))
+    (flet ((m (name) (find name members :key #'dds.types:minimal-struct-member-name :test #'string=)))
+      (%check :xt-name (string= "shape-type" (dds.types:minimal-struct-type-name to)) "type name")
+      (%check :xt-ext (eq :final (dds.types:minimal-struct-type-extensibility to)) "extensibility FINAL")
+      (%check :xt-count (= 4 (length members)) "4 members")
+      (%check :xt-color-key (and (dds.types:minimal-struct-member-key-p (m "color")) t) "color is @key")
+      (%check :xt-nonkey (not (dds.types:minimal-struct-member-key-p (m "x"))) "x is not @key")
+      (%check :xt-color-string
+              (= dds.types:+ti-string8-small+
+                 (dds.types:type-identifier-kind
+                  (dds.types:minimal-struct-member-type-identifier (m "color"))))
+              "color's TypeIdentifier is a string8")
+      (%check :xt-x-int32
+              (= dds.types:+tk-int32+
+                 (dds.types:type-identifier-kind
+                  (dds.types:minimal-struct-member-type-identifier (m "x"))))
+              "x's TypeIdentifier is TK_INT32")
+      (%check :xt-namehash
+              (equalp (dds.types:minimal-struct-member-name-hash (m "color"))
+                      (octets #x70 #xdd #xa5 #xdf))
+              "color's NameHash = MD5(\"color\")[0:4] = 70 dd a5 df")))
+  (%check :xt-ti-equality
+          (and (dds.types:type-identifier= (dds.types:primitive-type-identifier :i32)
+                                           (dds.types:primitive-type-identifier :i32))
+               (not (dds.types:type-identifier= (dds.types:primitive-type-identifier :i32)
+                                                (dds.types:primitive-type-identifier :i64)))
+               (dds.types:type-identifier= (dds.types:primitive-type-identifier :string)
+                                           (dds.types:primitive-type-identifier :string))
+               (dds.types:type-identifier=
+                (dds.types:sequence-type-identifier (dds.types:primitive-type-identifier :u8))
+                (dds.types:sequence-type-identifier (dds.types:primitive-type-identifier :u8)))
+               (not (dds.types:type-identifier=
+                     (dds.types:sequence-type-identifier (dds.types:primitive-type-identifier :u8))
+                     (dds.types:sequence-type-identifier (dds.types:primitive-type-identifier :i16)))))
+          "TypeIdentifier structural equality (primitive / string / sequence)")
+  t)

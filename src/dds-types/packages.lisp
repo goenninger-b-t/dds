@@ -20,4 +20,21 @@
            #:type-support-flatdata-offset #:type-support-flatdata-builder
            #:type-support-data-representation-mask #:type-support-field-accessors
            #:register-type #:find-type-support #:registered-type-names
-           #:sample-pool #:make-sample-pool #:sample-pool-acquire #:sample-pool-release))
+           #:sample-pool #:make-sample-pool #:sample-pool-acquire #:sample-pool-release
+           ;; XTypes structural TypeIdentifier / TypeObject model (FR-TYPE-2)
+           #:type-identifier #:type-identifier-p #:type-identifier-kind
+           #:type-identifier-bound #:type-identifier-element #:type-identifier-hash
+           #:primitive-type-identifier #:sequence-type-identifier #:hash-type-identifier
+           #:type-identifier=
+           #:member-name-hash
+           #:minimal-struct-member #:make-struct-member
+           #:minimal-struct-member-name #:minimal-struct-member-id
+           #:minimal-struct-member-type-identifier #:minimal-struct-member-key-p
+           #:minimal-struct-member-optional-p #:minimal-struct-member-name-hash
+           #:minimal-struct-type #:make-minimal-struct-type
+           #:minimal-struct-type-name #:minimal-struct-type-extensibility
+           #:minimal-struct-type-members
+           #:+tk-boolean+ #:+tk-byte+ #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
+           #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
+           #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+
+           #:+ti-string8-small+ #:+ti-plain-sequence-small+))

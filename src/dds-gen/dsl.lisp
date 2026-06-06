@@ -44,7 +44,7 @@
                     elt))
            (list :slot slot :kind :sequence :ltype 'vector :default '(vector)
                  :elt-put eput :elt-get eget :elt-align ealign :elt-size esize
-                 :key (getf opts :key)))))
+                 :elt-type elt :key (getf opts :key)))))
       ((keywordp dds-type)
        (let ((row (cdr (assoc dds-type *dds-type-map*))))
          (unless row
@@ -52,7 +52,7 @@
          (destructuring-bind (ltype default put get align size) row
            (list :slot slot :kind :scalar :ltype ltype :default default :put put :get get
                  :align align :var (eq size :var) :size (if (eq size :var) 0 size)
-                 :key (getf opts :key)))))
+                 :dds-type dds-type :key (getf opts :key)))))
       ((symbolp dds-type)            ; nested, previously-defined dds type
        (let ((tpkg (or (symbol-package dds-type) *package*)))
          (list :slot slot :kind :nested :ltype dds-type
@@ -198,5 +198,25 @@
              (list ,@(loop for m in parsed
                            when (member (getf m :kind) '(:scalar))
                              collect `(cons ,(string-downcase (string (getf m :slot)))
-                                            (function ,(acc m))))))))
+                                            (function ,(acc m)))))
+             ;; Structural Minimal TypeObject (FR-TYPE-2): member TIs for primitives/
+             ;; strings/sequences; a nested-struct member carries a PENDING EK_MINIMAL
+             ;; hash (the XCDR2 serializer that computes it is Connext-oracle-deferred).
+             :typeobject
+             (dds.types:make-minimal-struct-type
+              :name ,tname :extensibility ,ext
+              :members
+              (list ,@(loop for m in parsed for idx from 0
+                            collect `(dds.types:make-struct-member
+                                      ,(string-downcase (string (getf m :slot)))
+                                      ,idx
+                                      ,(ecase (getf m :kind)
+                                         (:scalar `(dds.types:primitive-type-identifier
+                                                    ,(getf m :dds-type)))
+                                         (:sequence `(dds.types:sequence-type-identifier
+                                                      (dds.types:primitive-type-identifier
+                                                       ,(getf m :elt-type))))
+                                         (:nested `(dds.types:hash-type-identifier
+                                                    dds.types:+ek-minimal+)))
+                                      ,@(when (getf m :key) '(:key-p t)))))))))
          ',name))))

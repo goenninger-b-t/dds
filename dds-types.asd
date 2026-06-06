@@ -5,5 +5,6 @@
   :pathname "src/dds-types"
   :serial t
   :components ((:file "packages")
-               (:file "type-support"))
+               (:file "type-support")
+               (:file "xtypes"))
   :in-order-to ((test-op (test-op "dds-tests"))))
