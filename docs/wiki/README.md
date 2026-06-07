@@ -4,7 +4,7 @@ The API + use-case guide for **Common Lisp DDS** (the OMG DDS/RTPS/XCDR stack). 
 one layer/feature area: what it's for, the public API (grounded in the source docstrings),
 and worked examples (grounded in the verified test suite under `src/dds-tests/`).
 
-> Maintained per **CLAUDE.md §5.1**: kept in lockstep with the source on every change. If a
+> Maintained per **the operating contract §5.1**: kept in lockstep with the source on every change. If a
 > page disagrees with a docstring, the docstring (and the in-repo spec it cites) wins —
 > please fix the page. The project overview, scope, and status live in the top-level
 > [`README.md`](../../README.md); the normative contracts are

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # make wire — validate the project's RTPS wire output against the Wireshark/tshark
 # RTPS dissector, the SAME reference dissector used to validate Connext interop
-# (CLAUDE.md §4: "the wire is the oracle"). Builds a pcap from the project codecs
+# (the operating contract §4: "the wire is the oracle"). Builds a pcap from the project codecs
 # (tools/rtps-pcap.lisp) and asserts the dissector parses every submessage shape
 # with no Unknown encapsulation and no Malformed marker. This is a necessary (not
 # sufficient) condition for M2 Connext interop. Skips cleanly if tshark is absent.

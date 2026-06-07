@@ -263,7 +263,7 @@ The transport record wraps these, but the PAL UDP layer is usable directly — t
   path. None are present yet — today's UDP send is one datagram per `socket-send`.
 - **Per-impl rule:** `#+sbcl`/`#+clasp` reader conditionals live **only** under `dds-pal/` (`pal-sbcl.lisp` and
   the per-impl PALs). The shared `pal-net.lisp` and everything in `dds-xport` carry none. CI lint enforces this
-  (NFR-PORT, CLAUDE.md §10).
+  (NFR-PORT, the operating contract §10).
 - **PAL maturity:** the **SBCL** PAL is the reference; Clasp shares the native socket layer. The **AllegroCL**
   PAL is a planned target and **not yet present**. Several capabilities are explicit M0 stubs pending M1 native
   fast paths: `cas` and `atomic-incf` signal `pal-unimplemented`; `fence`, `gc-suggest`, and `with-gc-inhibited`

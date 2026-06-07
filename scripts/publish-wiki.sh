@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Publish docs/wiki/ to this repo's GitHub Wiki (the separate <repo>.wiki.git repo).
 #
-# docs/wiki/ stays the source of truth (versioned with the code, CLAUDE.md §5.1); this
+# docs/wiki/ stays the source of truth (versioned with the code, the operating contract §5.1); this
 # mirrors it into the GitHub Wiki, transforming for GitHub-Wiki conventions:
 #   - docs/wiki/README.md          -> Home.md            (the wiki landing page)
 #   - intra-wiki links  (foo.md)   -> (foo)              (wiki page slugs carry no .md)

@@ -1,4 +1,4 @@
-# M0 quality gates (CLAUDE.md §6). Landed targets: Clasp + SBCL. Allegro later.
+# M0 quality gates (the operating contract §6). Landed targets: Clasp + SBCL. Allegro later.
 # Live gates this milestone: build, test, gate-hotpath. The rest are M1+ stubs.
 #
 # Bare `build`/`test` use $(LISP) (default Clasp); override with LISP=... or use

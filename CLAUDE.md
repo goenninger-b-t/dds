@@ -131,6 +131,7 @@ Rules: **no agent edits another agent's package** (file an issue or open a contr
 - Never change an API symbol (special variable, API-visible constant, API-relevant function) without updating its docstring + the affected `docs/wiki/` page and `README.md` (§5.1).
 - Never mark work done with a red gate or a skipped interop/byte-exact check.
 - Never put reader conditionals outside `dds-pal/`.
+- Never introduce a "Claude" reference — or any AI-assistant attribution — into wiki pages or source/build files (`docs/wiki/`, `src/`, `scripts/`, `Makefile`, `.github/`). Cite the operating contract neutrally (e.g. "the operating contract §N"), not by the `CLAUDE.md` filename. This `CLAUDE.md` agent-config file is the sole exemption. Extends the global no-AI-attribution rule (commits/PRs) to the repo's wiki + code. *(Owner directive, 2026-06-07.)*
 
 ---
 

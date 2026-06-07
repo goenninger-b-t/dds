@@ -1,7 +1,7 @@
 name: Publish Wiki
 
 # Mirror docs/wiki/ into the repo's GitHub Wiki on every push that touches it, so the
-# wiki is always in sync with the source of truth in the main repo (CLAUDE.md §5.1).
+# wiki is always in sync with the source of truth in the main repo (the operating contract §5.1).
 #
 # One-time setup: enable the repo Wiki (Settings > Features > Wikis) and create one page
 # in the web UI (e.g. "Home") so the <repo>.wiki.git repo exists. If GITHUB_TOKEN cannot
