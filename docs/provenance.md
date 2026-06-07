@@ -16,7 +16,7 @@ headers, or `rtiddsgen` output.
 ## M1 (2026-06-04)
 
 Normative OMG specs added to `docs/specs/` (PDF + machine-readable) and read
-directly to pin wire constants — the required clean-room source (CLAUDE.md §4):
+directly to pin wire constants — the required clean-room source (the operating contract §4):
 
 - **XTypes 1.3 §7.4.3.4 (ENC_HEADER illustration)** — the encapsulation
   representation identifiers. **⚠ SUPERSEDED in M2 — the XCDR2 values pinned here
@@ -52,7 +52,7 @@ No RTI artifacts involved; the dissector is the OMG-spec-derived oracle.
   trusted the wrong (§7.4) table; **corrected to Table 60 values** in
   `src/dds-cdr/cdr.lisp`, re-confirmed: tshark now reads our payload as
   `CDR2_LE (0x0007)`. Lesson: a spec can be internally inconsistent — the wire
-  (dissector / interop) is the final arbiter (CLAUDE.md §4).
+  (dissector / interop) is the final arbiter (the operating contract §4).
 - All four submessage shapes dissect cleanly: `DATA(p)` (SPDP participant data),
   `DATA(w) -> Square` (SEDP — the dissector extracted our PID_TOPIC_NAME),
   `DATA, HEARTBEAT`, and `ACKNACK` (SequenceNumberSet). Our SPDP writer EntityId is

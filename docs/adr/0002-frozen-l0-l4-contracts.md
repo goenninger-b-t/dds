@@ -2,11 +2,11 @@
 
 - **Status:** Accepted (2026-06-04)
 - **Deciders:** A0 (integrator)
-- **Relates to:** IMPLEMENTATION-PLAN §3.2, §7; CLAUDE.md §3 rule 1
+- **Relates to:** IMPLEMENTATION-PLAN §3.2, §7; the operating contract §3 rule 1
 
 ## Context
 
-CLAUDE.md §3 rule 1 forbids any parallel implementation fan-out before the M0
+The operating contract §3 rule 1 forbids any parallel implementation fan-out before the M0
 interface contracts are frozen. This ADR is the freeze record: the exported
 symbol surface below is the contract every later work package codes against.
 Changes require a superseding ADR enumerating every consumer + migration.

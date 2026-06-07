@@ -217,7 +217,7 @@ interop/connext/  the RTI Connext live-test / oracle harness (C++; needs Connext
 scripts/        per-impl launchers + the quality-gate scripts
 tools/          rtps-pcap (wire-conformance pcap builder)
 bench/          performance reports (P4)
-REQUIREMENTS.md, IMPLEMENTATION-PLAN.md, CLAUDE.md   the operating contract
+REQUIREMENTS.md, IMPLEMENTATION-PLAN.md   the operating contract
 ```
 
 ---

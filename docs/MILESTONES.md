@@ -25,6 +25,6 @@ pass** (Clasp + SBCL), deferring AllegroCL. The deferral closes automatically wh
 
 The P0 **exit gate** is XCDR **byte-exactness vs. RTI-generated vectors** + the
 exact 16-bit encapsulation representation IDs — both of which must come from the
-spec/wire oracle, never from memory (CLAUDE.md §4, FR-CDR-3). Codec machinery and
+spec/wire oracle, never from memory (the operating contract §4, FR-CDR-3). Codec machinery and
 codegen proceed now (round-trip-verified); the byte-exact corpus slots in once the
 oracle source is chosen.
