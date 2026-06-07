@@ -1,0 +1,432 @@
+# DCPS — the DDS entity API
+
+`dds-dcps` (package nickname `dds.dcps`) is the **DDS 1.4 application API** (layer L6): the
+CLOS entity model — `DomainParticipant`, `Publisher`/`Subscriber`, `Topic`,
+`DataWriter`/`DataReader` — sitting over the RTPS engine and discovery
+([Discovery](discovery.md)). It is control-plane, so it is CLOS throughout; the *typed*
+`write`/`read`/`take` path reaches the monomorphic XCDR codec through the `type-support`
+vtable stored on the `Topic` (see [Type system](type-system.md)). Two simplifications hold in
+v1: each participant carries **one `DataWriter` + one `DataReader`** (the engine's single user
+endpoint), and **discovery is caller-driven** — you call `dds.dcps:spin` to drive each
+SPDP/SEDP announcement cycle (there is no background announcer yet). RxO QoS compatibility
+gates matching and delivery; see [QoS](qos.md).
+
+## API reference
+
+All symbols below are exported from `dds.dcps`. One-line descriptions are condensed from the
+source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
+
+### Lifecycle (participants, pub/sub, topics, endpoints)
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:create-participant` (`&key domain qos advertise-address`) | Open the RTPS engine (a multicast disc-node) for `domain`, install the status hooks, start the receiver, return an enabled `domain-participant`. |
+| `dds.dcps:delete-participant` (`p`) | Delete the participant and its contained entities; stop the engine. |
+| `dds.dcps:create-publisher` (`p`) | Create an enabled `publisher` (DataWriter factory) in `p`. |
+| `dds.dcps:create-subscriber` (`p`) | Create an enabled `subscriber` (DataReader factory) in `p`. |
+| `dds.dcps:create-topic` (`p name type-name type-support`) | Bind a topic `name` + `type-name` to a registered `type-support` (the generated codec bundle). |
+| `dds.dcps:create-datawriter` (`pub topic &key qos`) | Register the local writer in the engine on the topic's name/type with `qos` (v1: the single user writer). |
+| `dds.dcps:create-datareader` (`sub topic &key qos`) | Register the local reader (v1: the single user reader). `topic` may be a `topic` or a `content-filtered-topic`. |
+| `dds.dcps:spin` (`p`) | Drive **one** discovery announcement cycle (SPDP + SEDP) for `p`. Caller-driven in v1. |
+| `dds.dcps:discovered-count` (`p`) | Number of remote participants `p` has discovered. |
+| `dds.dcps:matched-count` (`p`) | Number of remote endpoints matched against `p`'s local endpoints. |
+| `dds.dcps:entity` / `domain-participant` / `publisher` / `subscriber` / `topic` / `data-writer` / `data-reader` | The CLOS entity classes (base `entity` carries QoS + the enabled flag). |
+| `dds.dcps:entity-qos` (`e`) | The entity's QoS object. |
+| `dds.dcps:entity-enabled-p` (`e`) | The entity's enabled flag. |
+
+### Write / read / take + SampleInfo
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:write-sample` (`dw sample`) | `DataWriter::write` — serialize `sample` via the topic type-support and publish it reliably to matched readers. |
+| `dds.dcps:read-samples` (`dr &key states where`) | `DataReader::read` — return the cached samples whose sample-state is in `states` (default `(:read :not-read)` = ANY) and whose data satisfies `where`, **without** removing them; mark each `:read` and set its view-state. Returns a list of `cached-sample`. |
+| `dds.dcps:take-samples` (`dr &key states where`) | `DataReader::take` — like `read-samples` but **removes** the returned samples from the cache. |
+| `dds.dcps:samples-available` (`dr`) | Drain newly-received samples into the cache and return the cache size, **without** marking anything `:read` — for polling before a read/take. |
+| `dds.dcps:cached-sample` | A read/take result element: the deserialized data + its `sample-info`. |
+| `dds.dcps:cached-sample-data` (`cs`) | The deserialized sample struct out of a `cached-sample`. |
+| `dds.dcps:cached-sample-info` (`cs`) | The `sample-info` out of a `cached-sample`. |
+| `dds.dcps:sample-info` / `make-sample-info` | The DDS 1.4 `SampleInfo` struct + its constructor. |
+| `dds.dcps:sample-info-sample-state` (`si`) | `:read` or `:not-read`. |
+| `dds.dcps:sample-info-view-state` (`si`) | `:new` or `:not-new` (first access of the instance vs. later). |
+| `dds.dcps:sample-info-instance-state` (`si`) | `:alive` / `:not-alive-disposed` / `:not-alive-no-writers` (v1 only ever produces `:alive`). |
+| `dds.dcps:sample-info-instance-handle` (`si`) | The 16-octet instance handle (key-hash; `HANDLE_NIL` for an unkeyed type). |
+| `dds.dcps:sample-info-valid-data` (`si`) | Whether the data is valid (v1: always `t`). |
+| `dds.dcps:sample-info-source-timestamp` (`si`) | Source timestamp (v1: `nil`). |
+| `dds.dcps:sample-info-publication-handle` (`si`) | Writer handle (v1: `nil`). |
+| `dds.dcps:sample-info-sequence-number` (`si`) | Vendor extension: the RTPS writer sequence number of the sample. |
+| `dds.dcps:sample-info-disposed-generation-count` / `-no-writers-generation-count` / `-sample-rank` / `-generation-rank` / `-absolute-generation-rank` (`si`) | DDS generation counts + ranks (v1: default `0`). |
+
+### Conditions + WaitSets
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:wait-condition` | Base DDS `Condition` (CLOS class; named `wait-condition` to avoid clashing with `cl:condition`). |
+| `dds.dcps:guard-condition` | App-controlled trigger. |
+| `dds.dcps:read-condition` | Triggers when its `DataReader` holds samples matching a sample-state mask. |
+| `dds.dcps:query-condition` | A `read-condition` that also filters by a query predicate. |
+| `dds.dcps:status-condition` | Triggers when an enabled status in its mask is active on an entity. |
+| `dds.dcps:wait-set` | A set of conditions to wait on (condvar-driven). |
+| `dds.dcps:make-guard-condition` () | Create a `GuardCondition`. |
+| `dds.dcps:set-trigger-value` (`gc value`) | `GuardCondition::set_trigger_value` — set the trigger and wake any waiting WaitSet. |
+| `dds.dcps:create-readcondition` (`reader &key states`) | `DataReader::create_readcondition` — triggers when samples matching `states` (default `(:not-read)`) exist. |
+| `dds.dcps:create-querycondition` (`reader &key states query expression parameters`) | `DataReader::create_querycondition`. With `:expression` (a DDS Annex B query) + `:parameters`, compiles against the topic type; otherwise `:query` is a Lisp predicate over the deserialized sample. |
+| `dds.dcps:qc-query-fn` (`qc`) | The compiled query predicate of a `query-condition`. |
+| `dds.dcps:make-status-condition` (`entity &key mask`) | A `StatusCondition` for `entity` enabled for the statuses in `mask` (default `(:data-available)`). |
+| `dds.dcps:make-wait-set` () | Create a `WaitSet`. |
+| `dds.dcps:attach-condition` (`ws c`) | `WaitSet::attach_condition`. |
+| `dds.dcps:detach-condition` (`ws c`) | `WaitSet::detach_condition`. |
+| `dds.dcps:wait-set-wait` (`ws timeout-seconds`) | `WaitSet::wait` — block until ≥1 attached condition triggers or the timeout elapses; return the list of triggered conditions (empty on timeout). |
+| `dds.dcps:condition-trigger-value` (`c`) | `Condition::get_trigger_value`. |
+| `dds.dcps:read-w-condition` (`dr condition`) | `DataReader::read_w_condition` — non-destructive read of the samples a condition selects (its state mask + a QueryCondition's predicate). |
+| `dds.dcps:take-w-condition` (`dr condition`) | `DataReader::take_w_condition` — take (remove) those samples. |
+
+> WaitSet semantics: `wait-set-wait` is condvar-driven (ADR 0007). The disc receiver thread
+> signals the WaitSet when new user data arrives (DATA_AVAILABLE), and `set-trigger-value`
+> signals for a `guard-condition`; each wait is also capped internally (~0.5 s) so that the
+> change-driven statuses, which are not explicitly signalled, still surface. Create + attach
+> conditions before waiting (single-threaded setup, single waiter per WaitSet).
+
+### Statuses + listeners
+
+Communication statuses (FR-DCPS-3) are value structs mutated on the receiver thread under the
+entity's status lock; reading a status via a `get-*-status` accessor snapshots it and resets
+its `*_change` counters (DDS read-resets-change semantics).
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:get-subscription-matched-status` (`dr`) | Snapshot the reader's SUBSCRIPTION_MATCHED status (resets `*_change`). |
+| `dds.dcps:get-publication-matched-status` (`dw`) | Snapshot the writer's PUBLICATION_MATCHED status. |
+| `dds.dcps:get-requested-incompatible-qos-status` (`dr`) | Snapshot the reader's REQUESTED_INCOMPATIBLE_QOS status. |
+| `dds.dcps:get-offered-incompatible-qos-status` (`dw`) | Snapshot the writer's OFFERED_INCOMPATIBLE_QOS status. |
+| `dds.dcps:get-inconsistent-topic-status` (`tp`) | Snapshot the topic's INCONSISTENT_TOPIC status. |
+| `dds.dcps:get-sample-rejected-status` (`dr`) | Snapshot the reader's SAMPLE_REJECTED status. |
+| `dds.dcps:subscription-matched-status` / `publication-matched-status` | The matched-status structs (`-total-count`, `-total-count-change`, `-current-count`, `-current-count-change`, and `-last-publication-handle` / `-last-subscription-handle`). |
+| `dds.dcps:requested-incompatible-qos-status` / `offered-incompatible-qos-status` | The incompatible-QoS structs (`-total-count`, `-total-count-change`, `-last-policy-id`, `-policies`). |
+| `dds.dcps:inconsistent-topic-status` | INCONSISTENT_TOPIC struct (`-total-count`, `-total-count-change`). |
+| `dds.dcps:sample-rejected-status` | SAMPLE_REJECTED struct (`-total-count`, `-total-count-change`, `-last-reason`, `-last-instance-handle`). |
+| `dds.dcps:sample-rejected-reason` | The reason type: `:not-rejected` / `:rejected-by-instances-limit` / `:rejected-by-samples-limit` / `:rejected-by-samples-per-instance-limit`. |
+| `dds.dcps:qos-policy-count` / `make-qos-policy-count` / `qos-policy-count-policy-id` / `qos-policy-count-count` | A `{policy-id, count}` entry in an incompatible-QoS `policies` list. |
+| `dds.dcps:rxo-policy-id` (`keyword`) | The DDS `QosPolicyId_t` for an RxO failing-policy keyword. |
+| `dds.dcps:+qos-policy-id-durability+` / `-reliability+` / `-deadline+` / `-latency-budget+` / `-ownership+` / `-liveliness+` / `-destination-order+` / `-presentation+` / `-data-representation+` | The DDS `QosPolicyId_t` constants. |
+| `dds.dcps:listener` / `data-reader-listener` / `data-writer-listener` / `topic-listener` | The CLOS listener base classes; subclass and override the `on-*` methods you care about (base methods are no-ops). |
+| `dds.dcps:set-reader-listener` (`dr listener mask`) | `DataReader::set_listener` — install `listener` for the status keywords in `mask`. |
+| `dds.dcps:set-writer-listener` (`dw listener mask`) | `DataWriter::set_listener`. |
+| `dds.dcps:set-topic-listener` (`tp listener mask`) | `Topic::set_listener` (v1 mask: `(:inconsistent-topic)`). |
+| `dds.dcps:on-data-available` (`l reader`) | DataReaderListener callback — fires from the receiver thread on new user data. |
+| `dds.dcps:on-subscription-matched` / `on-requested-incompatible-qos` / `on-sample-rejected` (`l reader status`) | DataReaderListener callbacks that fire in v1. |
+| `dds.dcps:on-publication-matched` / `on-offered-incompatible-qos` (`l writer status`) | DataWriterListener callbacks that fire in v1. |
+| `dds.dcps:on-inconsistent-topic` (`l topic status`) | TopicListener callback that fires in v1. |
+| `dds.dcps:on-requested-deadline-missed` / `on-sample-lost` / `on-liveliness-changed` (`l reader status`); `dds.dcps:on-offered-deadline-missed` / `on-liveliness-lost` (`l writer status`) | Defined for subclassing; **not yet fired** in v1 (the underlying statuses are deferred). |
+
+### Content-filtered topics + query conditions
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:content-filtered-topic` | A `TopicDescription` over a related `Topic` + a compiled filter predicate; v1 filters reader-side. |
+| `dds.dcps:create-contentfilteredtopic` (`participant name related-topic filter-expression &optional parameters`) | `DomainParticipant::create_contentfilteredtopic` — compile a DDS Annex B `filter-expression` + `parameters` against the related topic's type. |
+| `dds.dcps:set-cft-expression-parameters` (`cft parameters`) | `ContentFilteredTopic::set_expression_parameters` — recompile with new parameters; already-created readers pick it up. |
+| `dds.dcps:cft-name` / `cft-related-topic` / `cft-expression` / `cft-parameters` (`cft`) | Accessors on a `content-filtered-topic`. |
+| `dds.dcps:compile-filter` (`expression parameters resolver`) | Compile a DDS Annex B filter/query expression into a predicate `(lambda (sample) -> boolean)`. `resolver` maps a FIELDNAME to a unary accessor. |
+| `dds.dcps:lex-filter` (`str`) | Tokenize a filter/query expression. |
+| `dds.dcps:filter-error` / `filter-error-detail` | The condition signalled on a lexical/syntactic/field-resolution error, and its detail accessor. |
+
+> The grammar is the DDS 1.4 Annex B subset: comparisons (`= > >= < <= <> !=`), `LIKE`
+> (`%`/`_` wildcards), `BETWEEN … AND …`, `AND`/`OR`/`NOT`, parentheses, `%n` positional
+> parameters, and field-vs-field comparisons. v1 supports single-level field names.
+
+### Builtin topics
+
+The builtin-topic readers (FR-DCPS-6) surface what discovery already collected. Each returns a
+list of value structs.
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:get-builtin-participant-data` (`p`) | DCPSParticipant — one entry per discovered remote participant. |
+| `dds.dcps:get-builtin-publication-data` (`p`) | DCPSPublication — one entry per discovered remote writer. |
+| `dds.dcps:get-builtin-subscription-data` (`p`) | DCPSSubscription — one entry per discovered remote reader. |
+| `dds.dcps:get-builtin-topic-data` (`p`) | DCPSTopic — one entry per distinct (topic, type) discovered. |
+| `dds.dcps:participant-builtin-topic-data` / `-key` | DCPSParticipant struct + its `BuiltinTopicKey_t` accessor. |
+| `dds.dcps:publication-builtin-topic-data` + `-key` / `-participant-key` / `-topic-name` / `-type-name` / `-reliability` / `-durability` | DCPSPublication struct + accessors. |
+| `dds.dcps:subscription-builtin-topic-data` + `-key` / `-participant-key` / `-topic-name` / `-type-name` / `-reliability` / `-durability` | DCPSSubscription struct + accessors. |
+| `dds.dcps:topic-builtin-topic-data` + `-name` / `-type-name` | DCPSTopic struct + accessors. |
+
+## Examples
+
+All examples assume `(ql:quickload :dds)` and use the package nicknames. They are adapted from
+the passing tests in `src/dds-tests/integration-test.lisp`. The topic type is defined with
+`define-dds-type` (see [Type system](type-system.md)), which registers a `type-support`
+retrieved by name with `dds.types:find-type-support`.
+
+### 1. Basic write / take
+
+Two participants discover each other over UDP loopback; a writer writes one sample and the
+reader takes it. (Adapted from `run-dcps-entity-test`.)
+
+```lisp
+(dds.gen:define-dds-type dcps-msg (:extensibility :final)
+  (id   :i32)
+  (text :string))
+
+(let* ((ts (dds.types:find-type-support "dcps-msg"))
+       (p1 (dds.dcps:create-participant :domain 0))
+       (p2 (dds.dcps:create-participant :domain 0)))
+  (unwind-protect
+       (let* ((tw  (dds.dcps:create-topic p1 "DcpsTopic" "dcps-msg" ts))
+              (tr  (dds.dcps:create-topic p2 "DcpsTopic" "dcps-msg" ts))
+              (dw  (dds.dcps:create-datawriter (dds.dcps:create-publisher  p1) tw))
+              (dr  (dds.dcps:create-datareader (dds.dcps:create-subscriber p2) tr)))
+         ;; caller-driven discovery: spin until the endpoints match
+         (loop repeat 150
+               until (and (plusp (dds.dcps:matched-count p1))
+                          (plusp (dds.dcps:matched-count p2)))
+               do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+         (dds.dcps:write-sample dw (make-dcps-msg :id 42 :text "hello-dcps"))
+         (let ((got nil))
+           (loop repeat 150 until got
+                 do (let ((s (dds.dcps:take-samples dr)))
+                      (when s (setf got (dds.dcps:cached-sample-data (first s)))))
+                    (sleep 0.02))
+           (format t "~&got id=~d text=~s~%" (dcps-msg-id got) (dcps-msg-text got))))
+    (dds.dcps:delete-participant p1)
+    (dds.dcps:delete-participant p2)))
+```
+
+### 2. Instances + read vs. take + SampleInfo states
+
+A keyed type (`color` is the `@key`) groups samples into instances. `read-samples` is
+non-destructive and marks samples `:read`, transitioning the per-instance view-state from
+`:new` to `:not-new`; `take-samples` removes them. (Adapted from `run-dcps-instance-test`.)
+
+```lisp
+(dds.gen:define-dds-type shape-type (:extensibility :final)
+  (color :string :key t)
+  (x :i32) (y :i32) (shapesize :i32))
+
+;; helper accessors over a cached-sample's SampleInfo (as used in the tests)
+(flet ((view-state (cs) (dds.dcps:sample-info-view-state    (dds.dcps:cached-sample-info cs)))
+       (sample-state (cs) (dds.dcps:sample-info-sample-state (dds.dcps:cached-sample-info cs)))
+       (handle (cs) (dds.dcps:sample-info-instance-handle    (dds.dcps:cached-sample-info cs))))
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher  p1) tw))
+                (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber p2) tr)))
+           (loop repeat 100
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           ;; 3 samples in 2 instances (BLUE x2, RED x1)
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+           (dds.dcps:write-sample dw (make-shape-type :color "RED"  :x 2 :y 2 :shapesize 20))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 3 :y 3 :shapesize 30))
+           (loop repeat 200 until (>= (dds.dcps:samples-available dr) 3) do (sleep 0.02))
+
+           ;; first read of the unread samples: all :new, now marked :read; 2 distinct handles
+           (let ((r1 (dds.dcps:read-samples dr :states '(:not-read))))
+             (assert (= 3 (length r1)))
+             (assert (= 2 (length (remove-duplicates (mapcar #'handle r1) :test #'equalp))))
+             (assert (every (lambda (cs) (eq :new  (view-state cs)))   r1))
+             (assert (every (lambda (cs) (eq :read (sample-state cs))) r1)))
+
+           ;; non-destructive: a plain read still returns all 3, now :not-new
+           (let ((r2 (dds.dcps:read-samples dr)))   ; default :states = (:read :not-read)
+             (assert (= 3 (length r2)))
+             (assert (every (lambda (cs) (eq :not-new (view-state cs))) r2)))
+
+           ;; take removes everything
+           (assert (= 3 (length (dds.dcps:take-samples dr))))
+           (assert (zerop (dds.dcps:samples-available dr))))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))))
+```
+
+### 3. A WaitSet + ReadCondition
+
+Block on a `WaitSet` until a sample arrives (the receiver thread wakes the WaitSet's condvar),
+then read it. (Adapted from `run-dcps-waitset-test` / `run-dcps-condvar-wake-test`.)
+
+```lisp
+(let ((ts (dds.types:find-type-support "dcps-msg"))
+      (p1 (dds.dcps:create-participant :domain 0))
+      (p2 (dds.dcps:create-participant :domain 0)))
+  (unwind-protect
+       (let* ((tw (dds.dcps:create-topic p1 "WsTopic" "dcps-msg" ts))
+              (tr (dds.dcps:create-topic p2 "WsTopic" "dcps-msg" ts))
+              (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher  p1) tw))
+              (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber p2) tr))
+              (rc (dds.dcps:create-readcondition dr))     ; default states '(:not-read)
+              (ws (dds.dcps:make-wait-set)))
+         (dds.dcps:attach-condition ws rc)
+         (loop repeat 150
+               until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+               do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+         ;; no data yet -> wait times out (empty list)
+         (assert (null (dds.dcps:wait-set-wait ws 0.2)))
+         (dds.dcps:write-sample dw (make-dcps-msg :id 99 :text "ws"))
+         ;; the ReadCondition is in the returned trigger list once the sample arrives
+         (let ((triggered (dds.dcps:wait-set-wait ws 3.0)))
+           (assert (member rc triggered))
+           (let ((s (dds.dcps:read-w-condition dr rc)))
+             (format t "~&awaited id=~d~%" (dcps-msg-id (dds.dcps:cached-sample-data (first s)))))))
+    (dds.dcps:delete-participant p1)
+    (dds.dcps:delete-participant p2)))
+```
+
+A `query-condition` works the same way but adds a predicate; with a Lisp predicate
+(`run-dcps-query-condition-test`):
+
+```lisp
+(let ((qc (dds.dcps:create-querycondition
+           dr :states '(:not-read) :query (lambda (m) (> (dcps-msg-id m) 50)))))
+  ;; ... attach to a WaitSet; only samples with id > 50 trigger it.
+  ;; read_w_condition returns just the matching, unread samples:
+  (dds.dcps:read-w-condition dr qc))
+```
+
+…or with a DDS Annex B query expression compiled against the topic type
+(`run-dcps-querycondition-sql-test`):
+
+```lisp
+(let ((qc (dds.dcps:create-querycondition
+           dr :states '(:not-read)
+              :expression "id > %0 AND text <> 'skip'" :parameters '("50"))))
+  (funcall (dds.dcps:qc-query-fn qc) (make-dcps-msg :id 99 :text "ok")))   ; => T
+```
+
+### 4. A ContentFilteredTopic
+
+A reader created on a `content-filtered-topic` matches writers on the **related** topic but
+only surfaces samples passing the filter (reader-side). (Adapted from
+`run-dcps-content-filtered-topic-test`.)
+
+```lisp
+(let ((ts (dds.types:find-type-support "shape-type"))
+      (p1 (dds.dcps:create-participant :domain 0))
+      (p2 (dds.dcps:create-participant :domain 0)))
+  (unwind-protect
+       (let* ((tw  (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+              (tr  (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+              ;; filter: x > %0, parameter 0 = "50"
+              (cft (dds.dcps:create-contentfilteredtopic p2 "FastSquare" tr "x > %0" '("50")))
+              (dw  (dds.dcps:create-datawriter (dds.dcps:create-publisher  p1) tw))
+              (dr  (dds.dcps:create-datareader (dds.dcps:create-subscriber p2) cft)))
+         (loop repeat 150
+               until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+               do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+         (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 100 :y 1 :shapesize 10))
+         (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 10  :y 2 :shapesize 10))  ; filtered out
+         (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 200 :y 3 :shapesize 10))
+         (loop repeat 250 until (>= (dds.dcps:samples-available dr) 2) do (sleep 0.02))
+         ;; only x=100 and x=200 reach read/take; x=10 was drained + dropped
+         (let ((xs (mapcar (lambda (cs) (shape-type-x (dds.dcps:cached-sample-data cs)))
+                           (dds.dcps:take-samples dr))))
+           (format t "~&delivered x values: ~a~%" xs)))   ; => (100 200)
+    (dds.dcps:delete-participant p1)
+    (dds.dcps:delete-participant p2)))
+```
+
+`set-cft-expression-parameters` recompiles the predicate (e.g. raise the threshold), and
+readers already created on the CFT pick up the new predicate.
+
+### 5. A CLOS listener for SUBSCRIPTION_MATCHED
+
+Subclass `data-reader-listener`, override the callback, and install it with a status mask. The
+callback fires from the receiver thread, so guard shared state with a lock. (Adapted from
+`run-dcps-matched-status-test`.)
+
+```lisp
+(defclass matched-listener (dds.dcps:data-reader-listener)
+  ((hits :initform '() :accessor ml-hits)
+   (lock :initform (dds.pal:make-lock "matched") :accessor ml-lock)))
+
+(defmethod dds.dcps:on-subscription-matched ((l matched-listener) reader status)
+  (declare (ignore reader))
+  (dds.pal:with-lock ((ml-lock l))
+    (push (dds.dcps:subscription-matched-status-current-count status) (ml-hits l))))
+
+(let ((ts (dds.types:find-type-support "dcps-msg"))
+      (p1 (dds.dcps:create-participant :domain 0))
+      (p2 (dds.dcps:create-participant :domain 0))
+      (rl (make-instance 'matched-listener)))
+  (unwind-protect
+       (let* ((tw (dds.dcps:create-topic p1 "MatchTopic" "dcps-msg" ts))
+              (tr (dds.dcps:create-topic p2 "MatchTopic" "dcps-msg" ts))
+              (dw (dds.dcps:create-datawriter (dds.dcps:create-publisher  p1) tw))
+              (dr (dds.dcps:create-datareader (dds.dcps:create-subscriber p2) tr)))
+         (declare (ignore dw))
+         (dds.dcps:set-reader-listener dr rl '(:subscription-matched))
+         (loop repeat 150
+               until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+               do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+         ;; the listener has fired; the status also reports the match:
+         (let ((sm (dds.dcps:get-subscription-matched-status dr)))
+           (format t "~&total=~d current=~d (listener hits: ~a)~%"
+                   (dds.dcps:subscription-matched-status-total-count sm)
+                   (dds.dcps:subscription-matched-status-current-count sm)
+                   (dds.pal:with-lock ((ml-lock rl)) (copy-list (ml-hits rl))))))
+    (dds.dcps:delete-participant p1)
+    (dds.dcps:delete-participant p2)))
+```
+
+### 6. Builtin topics
+
+After discovery, read the DCPS builtin topics to enumerate the discovered participants and
+endpoints. (Adapted from `run-dcps-builtin-topics-test`.)
+
+```lisp
+;; p1 and p2 are matched participants (writer on p1, reader on p2, topic "BTopic"/"dcps-msg")
+(dds.dcps:get-builtin-participant-data p1)   ; => list of participant-builtin-topic-data
+
+;; p1's view of remote readers:
+(find-if (lambda (s)
+           (and (string= "BTopic"   (dds.dcps:subscription-builtin-topic-data-topic-name s))
+                (string= "dcps-msg" (dds.dcps:subscription-builtin-topic-data-type-name s))))
+         (dds.dcps:get-builtin-subscription-data p1))
+
+;; p2's view of remote writers:
+(find-if (lambda (pp) (string= "BTopic" (dds.dcps:publication-builtin-topic-data-topic-name pp)))
+         (dds.dcps:get-builtin-publication-data p2))
+
+;; distinct (topic, type) pairs seen by p1:
+(find "BTopic" (dds.dcps:get-builtin-topic-data p1)
+      :key #'dds.dcps:topic-builtin-topic-data-name :test #'string=)
+```
+
+## Notes / status
+
+This is a v1 of the DCPS layer (M3/P2, with M4 XTypes plumbing). The following are visible in
+the source as deferred or simplified — do not rely on them yet:
+
+- **One endpoint pair per participant.** Each `DomainParticipant` holds exactly one
+  `DataWriter` and one `DataReader` (the engine's single user endpoint). Creating a second
+  writer/reader overwrites the back-reference the status hooks use; true multi-endpoint needs
+  per-endpoint RTPS `EntityId`s.
+- **Caller-driven discovery.** You must call `dds.dcps:spin` to drive SPDP/SEDP; there is no
+  background announcer (the engine's announce buffers are not yet thread-isolated).
+- **No instance lifecycle beyond `:alive`.** There is no `dispose`/`unregister_instance` API,
+  no `write_w_timestamp`, and the drain always builds `SampleInfo` with
+  `instance-state :alive` / `valid-data t`. The `:not-alive-disposed` / `:not-alive-no-writers`
+  state kinds exist in the type but are never produced; the disposed/no-writers generation
+  counts, the ranks, `source-timestamp`, and `publication-handle` all stay at their defaults
+  (`0` / `nil`).
+- **Some statuses are scaffolding only.** Only MATCHED, INCOMPATIBLE_QOS, INCONSISTENT_TOPIC,
+  and SAMPLE_REJECTED are produced and surfaced. DEADLINE (`on_*_deadline_missed`), LIVELINESS
+  (`on_liveliness_changed` / `on_liveliness_lost`), and SAMPLE_LOST (`on_sample_lost`) have
+  listener methods defined for subclassing but are **not fired**, and there are no
+  `get-*-status` accessors for them. `on-data-available` does fire (on new user data).
+- **Content filtering is reader-side only.** A `ContentFilteredTopic` presents its related
+  topic's name/type for SEDP matching and applies the filter in the reader's drain; the writer
+  sends every sample. Writer-side filtering is a later increment.
+- **RESOURCE_LIMITS rejection is at the DCPS cache.** `SAMPLE_REJECTED` enforcement
+  (`max_samples`, `max_instances`, `max_samples_per_instance`) happens in the reader's drain,
+  not in the RTPS HistoryCache.
+- **Types: `:final` extensibility only.** `define-dds-type` rejects `:appendable`/`:mutable`,
+  and only scalar/string `@key` members are supported (see [Type system](type-system.md)).
+
+## See also
+
+- [QoS & RxO matching](qos.md) — the policies behind `matched-count`, REQUESTED/OFFERED_INCOMPATIBLE_QOS.
+- [Type system & code generation](type-system.md) — `define-dds-type`, the `type-support` vtable, `find-type-support`.
+- [Discovery](discovery.md) — SPDP/SEDP, the `disc-node`, and what `spin` drives.

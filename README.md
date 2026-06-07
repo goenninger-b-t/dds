@@ -1,4 +1,4 @@
-# Hofvarpnir — a Common Lisp DDS / RTPS middleware
+# Common Lisp DDS
 
 A from-scratch, **data-centric publish/subscribe** middleware in Common Lisp implementing
 the **OMG DDS 1.4** application model over the **OMG DDSI-RTPS 2.5** wire protocol, with
@@ -22,8 +22,7 @@ DDS is a peer-to-peer, brokerless pub/sub standard: applications declare **Topic
 + a strongly-typed schema) and exchange **samples** through **DataWriters** and
 **DataReaders** whose **QoS** policies must be compatible for them to match. Underneath,
 **RTPS** is the interoperable wire protocol (discovery, reliability, fragmentation) and
-**XCDR** is the binary serialization. Hofvarpnir implements that stack natively in Common
-Lisp:
+**XCDR** is the binary serialization. **Common Lisp DDS** implements that stack natively:
 
 - **CLOS where it's free, `defstruct` where it counts.** The control plane (entities, QoS,
   listeners, conditions, discovery, the type compiler, tooling) is idiomatic CLOS. The
