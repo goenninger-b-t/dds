@@ -89,6 +89,8 @@ def main():
     tool = NS + "tool/generate-sbom"
     lic_mit = NS + "license/MIT"
     lic_cc0 = NS + "license/CC0-1.0"
+    lic_proj = NS + "license/CC-BY-ND-4.0"
+    author = NS + "agent/frank-goenninger"
     sbom_id = NS + "sbom"
     doc_id = NS + "document"
     root_pkg = NS + "package/common-lisp-dds"
@@ -101,10 +103,13 @@ def main():
                   "created": created, "createdBy": [org_root], "createdUsing": [tool]})
 
     # Agents (root supplier + one Organization per distinct dependency supplier) + tool.
-    suppliers = {"goenninger-b-t": org_root}
+    suppliers = {"Gönninger B&T GmbH, Deutschland": org_root}
     graph.append({"spdxId": org_root, "type": "Organization", "creationInfo": ci,
-                  "name": "goenninger-b-t"})
-    elements.append(org_root)
+                  "name": "Gönninger B&T GmbH, Deutschland"})
+    graph.append({"spdxId": author, "type": "Person", "creationInfo": ci,
+                  "name": "Frank Gönninger",
+                  "comment": "Author. Contact: frank.goenninger@goenninger.net"})
+    elements += [org_root, author]
     for name in deps:
         sup = COMPONENTS.get(name, {}).get("supplier")
         if sup and sup not in suppliers:
@@ -121,7 +126,9 @@ def main():
                   "creationInfo": ci, "simplelicensing_licenseExpression": "MIT"})
     graph.append({"spdxId": lic_cc0, "type": "simplelicensing_LicenseExpression",
                   "creationInfo": ci, "simplelicensing_licenseExpression": "CC0-1.0"})
-    elements += [lic_mit, lic_cc0]
+    graph.append({"spdxId": lic_proj, "type": "simplelicensing_LicenseExpression",
+                  "creationInfo": ci, "simplelicensing_licenseExpression": "CC-BY-ND-4.0"})
+    elements += [lic_mit, lic_cc0, lic_proj]
 
     # Root product package.
     root = {"spdxId": root_pkg, "type": "software_Package", "creationInfo": ci,
@@ -129,9 +136,10 @@ def main():
             "software_downloadLocation": REPO_URL, "software_homePage": REPO_URL,
             "software_packageUrl": "pkg:github/goenninger-b-t/dds@" + revision,
             "software_primaryPurpose": "library", "suppliedBy": org_root,
+            "originatedBy": [author], "software_declaredLicense": lic_proj,
             "comment": "OMG DDS 1.4 / DDSI-RTPS 2.5 / XCDR middleware in Common Lisp. "
-                       "No LICENSE file declared in-repo yet -> declared licence omitted "
-                       "(NOASSERTION)."}
+                       "Project code + documentation licensed CC-BY-ND-4.0 (see LICENSE.md / "
+                       "COPYRIGHT.md). Third-party dependencies retain their own licences."}
     graph.append(root)
     elements.append(root_pkg)
 

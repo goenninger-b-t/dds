@@ -3,7 +3,7 @@
   "@graph": [
     {
       "@id": "_:creationinfo",
-      "created": "2026-06-07T15:43:24Z",
+      "created": "2026-06-07T17:32:08Z",
       "createdBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
       ],
@@ -15,9 +15,16 @@
     },
     {
       "creationInfo": "_:creationinfo",
-      "name": "goenninger-b-t",
+      "name": "Gönninger B&T GmbH, Deutschland",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
       "type": "Organization"
+    },
+    {
+      "comment": "Author. Contact: frank.goenninger@goenninger.net",
+      "creationInfo": "_:creationinfo",
+      "name": "Frank Gönninger",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/frank-goenninger",
+      "type": "Person"
     },
     {
       "creationInfo": "_:creationinfo",
@@ -56,13 +63,23 @@
       "type": "simplelicensing_LicenseExpression"
     },
     {
-      "comment": "OMG DDS 1.4 / DDSI-RTPS 2.5 / XCDR middleware in Common Lisp. No LICENSE file declared in-repo yet -> declared licence omitted (NOASSERTION).",
+      "creationInfo": "_:creationinfo",
+      "simplelicensing_licenseExpression": "CC-BY-ND-4.0",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
+      "type": "simplelicensing_LicenseExpression"
+    },
+    {
+      "comment": "OMG DDS 1.4 / DDSI-RTPS 2.5 / XCDR middleware in Common Lisp. Project code + documentation licensed CC-BY-ND-4.0 (see LICENSE.md / COPYRIGHT.md). Third-party dependencies retain their own licences.",
       "creationInfo": "_:creationinfo",
       "name": "common-lisp-dds",
+      "originatedBy": [
+        "https://github.com/goenninger-b-t/dds/sbom#agent/frank-goenninger"
+      ],
+      "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
       "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
       "software_homePage": "https://github.com/goenninger-b-t/dds",
-      "software_packageUrl": "pkg:github/goenninger-b-t/dds@3132699",
-      "software_packageVersion": "0.0.0-dev+git.3132699",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@00e3e51",
+      "software_packageVersion": "0.0.0-dev+git.00e3e51",
       "software_primaryPurpose": "library",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
@@ -182,12 +199,14 @@
       "dataLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC0-1.0",
       "element": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/frank-goenninger",
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-bordeaux-threads-authors",
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-CFFI-authors",
         "https://github.com/goenninger-b-t/dds/sbom#agent/Stelian-Ionescu-sionescu",
         "https://github.com/goenninger-b-t/dds/sbom#tool/generate-sbom",
         "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
         "https://github.com/goenninger-b-t/dds/sbom#license/CC0-1.0",
+        "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
         "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
         "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",

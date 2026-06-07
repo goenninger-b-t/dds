@@ -233,6 +233,16 @@ Regenerate manually with `make sbom`. Do not hand-edit it.
 
 ---
 
+## License
+
+The Common Lisp DDS code and documentation are © 2026 **Gönninger B&T GmbH, Deutschland**
+(author: Frank Gönninger), licensed under **Creative Commons Attribution-NoDerivatives 4.0
+International (CC BY-ND 4.0)** — share verbatim with attribution; no derivatives. See
+[`LICENSE.md`](LICENSE.md) and [`COPYRIGHT.md`](COPYRIGHT.md). Third-party dependencies keep
+their own licenses (enumerated in [`sbom.spdx.json`](sbom.spdx.json)).
+
+---
+
 ## Intellectual-property posture (clean-room)
 
 Implemented **clean-room from the OMG specifications** (in `docs/specs/`). RTI Connext is a
