@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Regenerate + stage the EU CRA / BSI TR-03183-2 SBOM (sbom.spdx.json, SPDX 3.0.1 JSON-LD)
+# before every commit, so the SBOM is always current (the operating contract §5.2).
+# Activate once per clone:  git config core.hooksPath scripts/git-hooks   (or: make hooks)
+# Bypass:  SKIP_SBOM=1 git commit ...   |   git commit --no-verify
+set -euo pipefail
+[ "${SKIP_SBOM:-0}" = "1" ] && exit 0
+cd "$(git rev-parse --show-toplevel)"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "pre-commit: python3 not found — cannot regenerate sbom.spdx.json (SKIP_SBOM=1 to bypass)." >&2
+  exit 1
+fi
+if ! python3 scripts/generate-sbom.py; then
+  echo "pre-commit: SBOM generation failed (SKIP_SBOM=1 or 'git commit --no-verify' to bypass)." >&2
+  exit 1
+fi
+git add sbom.spdx.json

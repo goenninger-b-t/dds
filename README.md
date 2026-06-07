@@ -214,7 +214,22 @@ scripts/        per-impl launchers + the quality-gate scripts
 tools/          rtps-pcap (wire-conformance pcap builder)
 bench/          performance reports (P4)
 REQUIREMENTS.md, IMPLEMENTATION-PLAN.md   the operating contract
+sbom.spdx.json    SPDX 3.0.1 JSON-LD SBOM (EU CRA / BSI TR-03183-2; auto-generated)
 ```
+
+---
+
+## Software Bill of Materials (SBOM)
+
+[`sbom.spdx.json`](sbom.spdx.json) is an **SPDX 3.0.1 JSON-LD** Software Bill of Materials,
+structured to the EU **Cyber Resilience Act** (Reg. (EU) 2024/2847, Annex I) and **BSI
+TR-03183-2** data-field requirements (SBOM author + timestamp; per component: supplier, name,
+version, dependency relationships, licence where determinable, a unique identifier). It covers
+the top-level dependencies (`static-vectors`, `cffi`, `bordeaux-threads`) and the Common Lisp
+runtime. It is produced by `scripts/generate-sbom.py` from the live `*.asd` top-level
+`:depends-on` set, and **kept current automatically**: the `scripts/git-hooks/pre-commit` hook
+regenerates + stages it before every commit (activate once per clone with `make hooks`).
+Regenerate manually with `make sbom`. Do not hand-edit it.
 
 ---
 

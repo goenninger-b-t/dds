@@ -1,0 +1,212 @@
+{
+  "@context": "https://spdx.org/rdf/3.0.1/spdx-context.jsonld",
+  "@graph": [
+    {
+      "@id": "_:creationinfo",
+      "created": "2026-06-07T15:43:24Z",
+      "createdBy": [
+        "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
+      ],
+      "createdUsing": [
+        "https://github.com/goenninger-b-t/dds/sbom#tool/generate-sbom"
+      ],
+      "specVersion": "3.0.1",
+      "type": "CreationInfo"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "goenninger-b-t",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
+      "type": "Organization"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "The bordeaux-threads authors",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/The-bordeaux-threads-authors",
+      "type": "Organization"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "The CFFI authors",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/The-CFFI-authors",
+      "type": "Organization"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "Stelian Ionescu (sionescu)",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/Stelian-Ionescu-sionescu",
+      "type": "Organization"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "common-lisp-dds scripts/generate-sbom.py",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#tool/generate-sbom",
+      "type": "Tool"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "simplelicensing_licenseExpression": "MIT",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
+      "type": "simplelicensing_LicenseExpression"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "simplelicensing_licenseExpression": "CC0-1.0",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#license/CC0-1.0",
+      "type": "simplelicensing_LicenseExpression"
+    },
+    {
+      "comment": "OMG DDS 1.4 / DDSI-RTPS 2.5 / XCDR middleware in Common Lisp. No LICENSE file declared in-repo yet -> declared licence omitted (NOASSERTION).",
+      "creationInfo": "_:creationinfo",
+      "name": "common-lisp-dds",
+      "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
+      "software_homePage": "https://github.com/goenninger-b-t/dds",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@3132699",
+      "software_packageVersion": "0.0.0-dev+git.3132699",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
+      "type": "software_Package"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "bordeaux-threads",
+      "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
+      "software_downloadLocation": "https://github.com/sionescu/bordeaux-threads",
+      "software_packageUrl": "pkg:generic/bordeaux-threads",
+      "software_packageVersion": "0.9.4",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/The-bordeaux-threads-authors",
+      "type": "software_Package"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-bordeaux-threads",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "cffi",
+      "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
+      "software_downloadLocation": "https://github.com/cffi/cffi",
+      "software_packageUrl": "pkg:generic/cffi",
+      "software_packageVersion": "NOASSERTION",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/The-CFFI-authors",
+      "type": "software_Package"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-cffi",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/cffi"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "static-vectors",
+      "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
+      "software_downloadLocation": "https://github.com/sionescu/static-vectors",
+      "software_packageUrl": "pkg:generic/static-vectors",
+      "software_packageVersion": "1.9.3",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/Stelian-Ionescu-sionescu",
+      "type": "software_Package"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-static-vectors",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "comment": "Common Lisp runtime (alternative landed target: Clasp). SBCL is public-domain with BSD/MIT portions -> declared licence omitted (NOASSERTION).",
+      "creationInfo": "_:creationinfo",
+      "name": "sbcl",
+      "software_downloadLocation": "https://www.sbcl.org/",
+      "software_homePage": "https://www.sbcl.org/",
+      "software_packageVersion": "2.6.5-85913ede1",
+      "software_primaryPurpose": "application",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
+      "type": "software_Package"
+    },
+    {
+      "comment": "runtime dependency",
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/sbcl"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "element": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
+        "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
+        "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
+        "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-bordeaux-threads",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-cffi",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-static-vectors",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl"
+      ],
+      "rootElement": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds"
+      ],
+      "software_sbomType": [
+        "source"
+      ],
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#sbom",
+      "type": "software_Sbom"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "dataLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC0-1.0",
+      "element": [
+        "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/The-bordeaux-threads-authors",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/The-CFFI-authors",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/Stelian-Ionescu-sionescu",
+        "https://github.com/goenninger-b-t/dds/sbom#tool/generate-sbom",
+        "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
+        "https://github.com/goenninger-b-t/dds/sbom#license/CC0-1.0",
+        "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+        "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
+        "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
+        "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
+        "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
+        "https://github.com/goenninger-b-t/dds/sbom#sbom",
+        "https://github.com/goenninger-b-t/dds/sbom#sbom"
+      ],
+      "name": "common-lisp-dds SBOM",
+      "profileConformance": [
+        "core",
+        "software",
+        "simplelicensing"
+      ],
+      "rootElement": [
+        "https://github.com/goenninger-b-t/dds/sbom#sbom"
+      ],
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#document",
+      "type": "SpdxDocument"
+    }
+  ]
+}

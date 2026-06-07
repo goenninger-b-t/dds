@@ -53,6 +53,7 @@ A unit of work is **done** only when **all** hold:
 - All applicable **quality gates green** (§6).
 - The interface contract is **unchanged**, or the change is captured in an **ADR** (`docs/adr/NNNN-*.md`) listing every consumer + migration.
 - **Docs updated** (§5.1): API docstrings for any added/changed special variable, API-visible constant, or API-relevant function; the affected `docs/wiki/` page(s) and `README.md`; the verification matrix (`docs/verification.csv`); the provenance log if external sources were consulted; and any affected spec cross-reference.
+- **SBOM current** (§5.2): `sbom.spdx.json` regenerated + staged (the pre-commit hook does this automatically); never hand-edit it.
 - For any **hot-path** change: a **before/after bench number** in `bench/report/` (no perf change lands on intuition — `REQUIREMENTS` FR-LANG-7).
 - No new reader conditionals (`#+sbcl`/`#+allegro`/`#+clasp`) outside `dds-pal/` (CI lint enforces this).
 
@@ -63,6 +64,10 @@ A **milestone** is done only when its exit gate in `IMPLEMENTATION-PLAN.md` §4 
 **Every special variable, every API-visible (exported) constant, and every API-relevant (exported / cross-package) function carries a docstring** stating what it is, its contract, and — for any wire constant — the spec clause it is pinned from. Same clean-room rule as code: cite the clause, never invent a value or a meaning. This extends FR-LANG-6 ("the signature *is* the documented contract") from functions to special variables and constants.
 
 **Documentation is kept in lockstep with the source on every change.** When you add or change any such symbol you **MUST**, in the same unit of work, update: (a) its docstring; (b) the relevant `docs/wiki/` page(s) — API reference + use-case + a worked example; and (c) `README.md` if scope/architecture/status shifted. A source change that lands without its docs updated is **not done** (§5). The wiki and `README.md` are maintained from the docstrings + the in-repo specs, never from memory. The published **GitHub Wiki is generated** from `docs/wiki/` by the `Publish Wiki` Action (`scripts/publish-wiki.sh`) on every push — edit `docs/wiki/`, never the GitHub Wiki directly. *(Owner directive, 2026-06-07.)*
+
+### 5.2 SBOM discipline (EU Cyber Resilience Act, first-class, MUST)
+
+The repo ships **`sbom.spdx.json`** — an **SPDX 3.0.1 JSON-LD** Software Bill of Materials structured to the **EU CRA** (Reg. (EU) 2024/2847, Annex I Part II) + **BSI TR-03183-2** mandatory data-field set (SBOM author + timestamp; per component: supplier, name, version, dependency relationships, licence where determinable, a unique identifier). It is **regenerated and staged before every commit** by `scripts/git-hooks/pre-commit` (activate once per clone with `make hooks`, i.e. `git config core.hooksPath scripts/git-hooks`); regenerate manually with `make sbom`. It is produced by `scripts/generate-sbom.py` from the live `*.asd` top-level `:depends-on` set + a pinned version/licence/supplier table — **never hand-edit it**; keep the pinned table current when the Quicklisp dist or a dependency changes. *(Owner directive, 2026-06-07.)*
 
 ---
 

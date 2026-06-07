@@ -10,7 +10,7 @@ LISP  ?= $(CLASP)
 
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
-        square-pub square-sub square-spy bench mem clean
+        square-pub square-sub square-spy bench mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -18,6 +18,15 @@ ADVERTISE ?= 127.0.0.1
 TYPE     ?= tagged
 
 all: build-all test-all gate-hotpath gate-types mem
+
+# EU CRA / BSI TR-03183-2 SBOM (SPDX 3.0.1 JSON-LD). Regenerate sbom.spdx.json.
+sbom:
+	python3 scripts/generate-sbom.py
+
+# Activate the git hooks (regenerate+stage the SBOM before every commit).
+hooks:
+	git config core.hooksPath scripts/git-hooks
+	@echo "hooks active (core.hooksPath=scripts/git-hooks): SBOM regenerated before each commit."
 
 build:
 	$(LISP) --eval '(ql:quickload :dds :silent t)' --eval '(uiop:quit 0)'
