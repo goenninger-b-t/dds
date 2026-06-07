@@ -11,36 +11,53 @@
   "The 4-octet RTPS message magic 'R','T','P','S' (RTPS 2.5 §9.4.4).")
 
 ;; ProtocolVersion 2.5: major = 2, minor = 5 (RTPS 2.5 §9.4.4).
-(defconstant +protocol-version-major+ 2)
-(defconstant +protocol-version-minor+ 5)
+(defconstant +protocol-version-major+ 2
+  "ProtocolVersion major = 2 (RTPS 2.5 §9.4.4).")
+(defconstant +protocol-version-minor+ 5
+  "ProtocolVersion minor = 5 (RTPS 2.5 §9.4.4).")
 
-;; VENDORID_UNKNOWN = {0,0} (RTPS 2.5 §8.3.5.2). A compliant id is OMG-assigned.
-(defconstant +vendor-id-unknown+ #x0000)
+(defconstant +vendor-id-unknown+ #x0000
+  "VENDORID_UNKNOWN = {0,0} (RTPS 2.5 §8.3.5.2); a compliant id is OMG-assigned.")
 (defparameter *vendor-id* +vendor-id-unknown+
   "16-bit VendorId written in the header. Provisional VENDORID_UNKNOWN until an
    OMG-assigned id is obtained (FR-RTPS-2, owner action).")
 
 ;; SubmessageKind ids (RTPS 2.5 §9.4.5.1.1, enum SubmessageKind).
-(defconstant +submsg-pad+            #x01)
-(defconstant +submsg-acknack+        #x06)
-(defconstant +submsg-heartbeat+      #x07)
-(defconstant +submsg-gap+            #x08)
-(defconstant +submsg-info-ts+        #x09)
-(defconstant +submsg-info-src+       #x0c)
-(defconstant +submsg-info-reply-ip4+ #x0d)
-(defconstant +submsg-info-dst+       #x0e)
-(defconstant +submsg-info-reply+     #x0f)
-(defconstant +submsg-nack-frag+      #x12)
-(defconstant +submsg-heartbeat-frag+ #x13)
-(defconstant +submsg-data+           #x15)
-(defconstant +submsg-data-frag+      #x16)
+(defconstant +submsg-pad+            #x01
+  "SubmessageKind PAD (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-acknack+        #x06
+  "SubmessageKind ACKNACK (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-heartbeat+      #x07
+  "SubmessageKind HEARTBEAT (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-gap+            #x08
+  "SubmessageKind GAP (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-info-ts+        #x09
+  "SubmessageKind INFO_TS / InfoTimestamp (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-info-src+       #x0c
+  "SubmessageKind INFO_SRC / InfoSource (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-info-reply-ip4+ #x0d
+  "SubmessageKind INFO_REPLY_IP4 (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-info-dst+       #x0e
+  "SubmessageKind INFO_DST / InfoDestination (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-info-reply+     #x0f
+  "SubmessageKind INFO_REPLY (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-nack-frag+      #x12
+  "SubmessageKind NACK_FRAG (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-heartbeat-frag+ #x13
+  "SubmessageKind HEARTBEAT_FRAG (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-data+           #x15
+  "SubmessageKind DATA (RTPS 2.5 §9.4.5.1.1).")
+(defconstant +submsg-data-frag+      #x16
+  "SubmessageKind DATA_FRAG (RTPS 2.5 §9.4.5.1.1).")
 
-;; Submessage flags: bit 0 = E (EndiannessFlag), 1 = little-endian (§9.4.5.1.2).
-(defconstant +flag-endianness+ #x01)
+(defconstant +flag-endianness+ #x01
+  "Submessage E (EndiannessFlag), bit 0; 1 = little-endian (RTPS 2.5 §9.4.5.1.2).")
 
 ;; EntityId (RTPS 2.5 §9.3.1.2): entityKey[3] + entityKind, 4 octets MSB-first.
-(defconstant +entityid-unknown+     #x00000000)
-(defconstant +entityid-participant+ #x000001c1)
+(defconstant +entityid-unknown+     #x00000000
+  "ENTITYID_UNKNOWN (RTPS 2.5 §9.3.1.2): entityKey[3]+entityKind, MSB-first u32.")
+(defconstant +entityid-participant+ #x000001c1
+  "ENTITYID_PARTICIPANT (RTPS 2.5 §9.3.1.2): entityKey[3]+entityKind, MSB-first u32.")
 
 (declaim (inline %remaining))
 (declaim (ftype (function (dds.core.buffer:cursor) fixnum) %remaining))
@@ -151,7 +168,8 @@
 ;;; ---- SequenceNumberSet (§9.4.2.6): bitmapBase + numBits + M=(numBits+31)/32 longs.
 ;;; Offset deltaN maps to bitmap[deltaN/32], bit (31 - deltaN%32) — MSB-first. ----
 
-(defconstant +seqnum-set-max-bits+ 256)
+(defconstant +seqnum-set-max-bits+ 256
+  "Maximum numBits in a SequenceNumberSet (RTPS 2.5 §9.4.2.6).")
 
 (declaim (ftype (function ((unsigned-byte 32)) fixnum) %seqnum-set-words))
 (defun %seqnum-set-words (numbits)
@@ -208,12 +226,18 @@
 ;;; derives from the cursor endianness so the two stay consistent. The GroupInfo
 ;;; (G) and FilteredCount (F) extensions are not emitted/parsed in v1.
 
-(defconstant +heartbeat-flag-final+      #x02)
-(defconstant +heartbeat-flag-liveliness+ #x04)
-(defconstant +heartbeat-flag-group-info+ #x08)
-(defconstant +acknack-flag-final+        #x02)
-(defconstant +gap-flag-group-info+       #x02)
-(defconstant +gap-flag-filtered+         #x04)
+(defconstant +heartbeat-flag-final+      #x02
+  "HEARTBEAT FinalFlag (F) (RTPS 2.5 §9.4.5.7).")
+(defconstant +heartbeat-flag-liveliness+ #x04
+  "HEARTBEAT LivelinessFlag (L) (RTPS 2.5 §9.4.5.7).")
+(defconstant +heartbeat-flag-group-info+ #x08
+  "HEARTBEAT GroupInfoFlag (G); not emitted/parsed in v1 (RTPS 2.5 §9.4.5.7).")
+(defconstant +acknack-flag-final+        #x02
+  "ACKNACK FinalFlag (F) (RTPS 2.5 §9.4.5.3).")
+(defconstant +gap-flag-group-info+       #x02
+  "GAP GroupInfoFlag (G) (RTPS 2.5 §9.4.5.6).")
+(defconstant +gap-flag-filtered+         #x04
+  "GAP FilteredCount/Filtered extension flag (F); not parsed in v1 (RTPS 2.5 §9.4.5.6).")
 
 (declaim (inline %e-flag))
 (declaim (ftype (function (dds.core.buffer:cursor) (unsigned-byte 8)) %e-flag))
@@ -305,10 +329,14 @@
 ;;; and parses the base form (Q=0; inlineQos parsing lands with the ParameterList
 ;;; / discovery increment). serializedPayload is passed/returned as a byte region.
 
-(defconstant +data-flag-inline-qos+    #x02)
-(defconstant +data-flag-data+          #x04)
-(defconstant +data-flag-key+           #x08)
-(defconstant +data-flag-non-standard+  #x10)
+(defconstant +data-flag-inline-qos+    #x02
+  "DATA InlineQosFlag (Q): inlineQos present (RTPS 2.5 §9.4.5.4).")
+(defconstant +data-flag-data+          #x04
+  "DATA DataFlag (D): serializedPayload carries data (RTPS 2.5 §9.4.5.4).")
+(defconstant +data-flag-key+           #x08
+  "DATA KeyFlag (K): serializedPayload carries a key (RTPS 2.5 §9.4.5.4).")
+(defconstant +data-flag-non-standard+  #x10
+  "DATA NonStandardPayloadFlag (N) (RTPS 2.5 §9.4.5.4).")
 
 (declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum) write-data))
 (defun write-data (cursor reader-id writer-id writer-sn payload payload-off payload-len &key key)
@@ -348,22 +376,38 @@
 ;;; value) Parameters, each 4-byte aligned, terminated by PID_SENTINEL. PID
 ;;; constants from the RTPS 2.5 §9.6.2.2 table, never memorized. ----
 
-(defconstant +pid-pad+                        #x0000)
-(defconstant +pid-sentinel+                   #x0001)
-(defconstant +pid-participant-lease-duration+ #x0002)
-(defconstant +pid-topic-name+                 #x0005)
-(defconstant +pid-type-name+                  #x0007)
-(defconstant +pid-protocol-version+           #x0015)
-(defconstant +pid-vendorid+                   #x0016)
-(defconstant +pid-reliability+                #x001a)
-(defconstant +pid-durability+                 #x001d)  ; RTPS 2.5 §9.6.3.2
-(defconstant +pid-default-unicast-locator+    #x0031)
-(defconstant +pid-metatraffic-unicast-locator+ #x0032)
-(defconstant +pid-participant-guid+           #x0050)
-(defconstant +pid-builtin-endpoint-set+       #x0058)
-(defconstant +pid-endpoint-guid+              #x005a)
-(defconstant +pid-key-hash+                   #x0070)
-(defconstant +pid-type-information+           #x0075)  ; DDS-XTypes 1.3 BuiltinTopicData @id(0x0075)
+(defconstant +pid-pad+                        #x0000
+  "PID_PAD (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-sentinel+                   #x0001
+  "PID_SENTINEL, terminates a ParameterList (RTPS 2.5 §9.6.2.2 / §9.4.2.11).")
+(defconstant +pid-participant-lease-duration+ #x0002
+  "PID_PARTICIPANT_LEASE_DURATION (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-topic-name+                 #x0005
+  "PID_TOPIC_NAME (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-type-name+                  #x0007
+  "PID_TYPE_NAME (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-protocol-version+           #x0015
+  "PID_PROTOCOL_VERSION (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-vendorid+                   #x0016
+  "PID_VENDORID (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-reliability+                #x001a
+  "PID_RELIABILITY (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-durability+                 #x001d
+  "PID_DURABILITY (RTPS 2.5 §9.6.3.2).")
+(defconstant +pid-default-unicast-locator+    #x0031
+  "PID_DEFAULT_UNICAST_LOCATOR (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-metatraffic-unicast-locator+ #x0032
+  "PID_METATRAFFIC_UNICAST_LOCATOR (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-participant-guid+           #x0050
+  "PID_PARTICIPANT_GUID (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-builtin-endpoint-set+       #x0058
+  "PID_BUILTIN_ENDPOINT_SET (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-endpoint-guid+              #x005a
+  "PID_ENDPOINT_GUID (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-key-hash+                   #x0070
+  "PID_KEY_HASH (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-type-information+           #x0075
+  "PID_TYPE_INFORMATION (DDS-XTypes 1.3 BuiltinTopicData @id(0x0075)).")
 
 (declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) fixnum) write-parameter))
 (defun write-parameter (cursor pid value off len)

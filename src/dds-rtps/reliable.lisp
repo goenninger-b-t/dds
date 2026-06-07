@@ -8,9 +8,13 @@
 ;;; ---- Writer side (§8.4.2): one ReaderProxy per matched reader ----
 
 (defstruct (reader-proxy (:constructor make-reader-proxy))
+  "Writer-side proxy for one matched reader (RTPS 2.5 §8.4.2). ACKED-BASE is the
+   reader's acknowledged watermark: it has acknowledged all SN < acked-base."
   (acked-base 1 :type integer))            ; reader has acknowledged all SN < acked-base
 
 (defstruct (rtps-writer (:constructor make-rtps-writer))
+  "Stateful reliable RTPS writer (RTPS 2.5 §8.4.2): a HistoryCache, the last SN
+   written, the HEARTBEAT count, and a reader-id -> ReaderProxy table."
   (hc nil)                                  ; a HistoryCache
   (last-sn 0 :type integer)
   (hb-count 0 :type integer)
@@ -68,11 +72,14 @@
 ;;; ---- Reader side (§8.4.10): one WriterProxy per matched writer ----
 
 (defstruct (writer-proxy (:constructor make-writer-proxy))
+  "Reader-side proxy for one matched writer (RTPS 2.5 §8.4.10). RECEIVED maps SN ->
+   payload | :gap; FIRST-SN/LAST-SN bound the available range from HEARTBEAT."
   (received (make-hash-table :test 'eql) :type hash-table)   ; SN -> payload | :gap
   (first-sn 1 :type integer)
   (last-sn 0 :type integer))                ; available range from HEARTBEAT
 
 (defstruct (rtps-reader (:constructor make-rtps-reader))
+  "Stateful reliable RTPS reader (RTPS 2.5 §8.4.10): a writer-id -> WriterProxy table."
   (proxies (make-hash-table :test 'eql) :type hash-table))   ; writer-id -> writer-proxy
 
 (declaim (ftype (function (rtps-reader (unsigned-byte 32)) writer-proxy) get-writer-proxy))

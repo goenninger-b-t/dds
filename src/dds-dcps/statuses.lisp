@@ -29,15 +29,24 @@
 ;;;      xtypes-1_3-discovery-builtin-topic.idl §177) ----
 
 (defconstant +qos-policy-id-invalid+ 0)
-(defconstant +qos-policy-id-durability+ 2)
-(defconstant +qos-policy-id-presentation+ 3)
-(defconstant +qos-policy-id-deadline+ 4)
-(defconstant +qos-policy-id-latency-budget+ 5)
-(defconstant +qos-policy-id-ownership+ 6)
-(defconstant +qos-policy-id-liveliness+ 8)
-(defconstant +qos-policy-id-reliability+ 11)
-(defconstant +qos-policy-id-destination-order+ 12)
-(defconstant +qos-policy-id-data-representation+ 23)
+(defconstant +qos-policy-id-durability+ 2
+  "DDS QosPolicyId_t for DURABILITY (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-presentation+ 3
+  "DDS QosPolicyId_t for PRESENTATION (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-deadline+ 4
+  "DDS QosPolicyId_t for DEADLINE (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-latency-budget+ 5
+  "DDS QosPolicyId_t for LATENCY_BUDGET (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-ownership+ 6
+  "DDS QosPolicyId_t for OWNERSHIP (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-liveliness+ 8
+  "DDS QosPolicyId_t for LIVELINESS (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-reliability+ 11
+  "DDS QosPolicyId_t for RELIABILITY (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-destination-order+ 12
+  "DDS QosPolicyId_t for DESTINATION_ORDER (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-data-representation+ 23
+  "DDS QosPolicyId_t for DATA_REPRESENTATION (xtypes-1_3-discovery-builtin-topic.idl §177).")
 
 (defparameter *rxo-keyword->policy-id*
   (list (cons :reliability +qos-policy-id-reliability+)

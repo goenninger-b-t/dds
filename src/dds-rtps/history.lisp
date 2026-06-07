@@ -5,6 +5,10 @@
   (:report (lambda (c s) (format s "HistoryCache: ~a" (history-not-implemented-what c)))))
 
 (defstruct (cache-change (:constructor make-cache-change))
+  "An RTPS CacheChange (IMPLEMENTATION-PLAN §7.4): the pooled per-sample record held
+   in a HistoryCache — change KIND (:data/:dispose/:unregister), writer GUID,
+   sequence number, instance key hash, serialized payload, source timestamp, and
+   inline QoS."
   (kind :data :type (member :data :dispose :unregister))
   (writer-guid nil)
   (sn 0 :type (integer 0))
@@ -19,6 +23,9 @@
 ;;;; per-instance KEEP_LAST, and LIFESPAN expiry are tracked follow-ups.
 
 (defstruct (history-cache (:constructor %make-history-cache))
+  "A HistoryCache (FR-RTPS-5): a change store honouring HISTORY (KIND :keep-last with
+   DEPTH / :keep-all) and RESOURCE_LIMITS (MAX-SAMPLES; nil = unlimited). v1 keys
+   changes by sequence number in a hash-table. Build via MAKE-HISTORY-CACHE."
   (kind :keep-last :type (member :keep-last :keep-all))
   (depth 1 :type (integer 1))
   (max-samples nil)                                  ; resource limit; nil = unlimited
@@ -42,7 +49,9 @@
                        :type-support type-support))
 
 (declaim (ftype (function (history-cache) (integer 0)) hc-change-count))
-(defun hc-change-count (hc) (history-cache-count hc))
+(defun hc-change-count (hc)
+  "The number of changes currently stored in the HistoryCache HC."
+  (history-cache-count hc))
 
 (declaim (ftype (function (history-cache integer) t) hc-get-change))
 (defun hc-get-change (hc seqnum)

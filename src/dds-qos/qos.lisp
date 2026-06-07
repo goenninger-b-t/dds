@@ -15,8 +15,10 @@
   (sec 0 :type (integer 0))
   (nanosec 0 :type (integer 0)))
 
-(defparameter +duration-zero+ (make-qos-duration 0 0))
-(defparameter +duration-infinite+ (make-qos-duration #x7fffffff #x7fffffff))
+(defparameter +duration-zero+ (make-qos-duration 0 0)
+  "The zero Duration_t {0, 0}; the minimum of the Duration_t total order.")
+(defparameter +duration-infinite+ (make-qos-duration #x7fffffff #x7fffffff)
+  "DURATION_INFINITE {0x7fffffff, 0x7fffffff}; the maximum of the Duration_t total order.")
 
 (declaim (ftype (function (qos-duration qos-duration) t) duration<=))
 (defun duration<= (a b)
@@ -68,6 +70,8 @@
 ;;;      filled in as the entity model lands). Defaults per DDS 1.4 §2.2.3. ----
 
 (defstruct (qos (:constructor make-qos) (:copier copy-qos))
+  "The DDS QoS set: the RxO-relevant + commonly-held policies (the full 22+2 set is
+   filled in as the entity model lands). Slot defaults follow DDS 1.4 §2.2.3."
   (reliability :best-effort :type (member :best-effort :reliable))
   (reliability-max-blocking (make-qos-duration 0 100000000) :type qos-duration) ; 100 ms
   (durability :volatile :type (member :volatile :transient-local :transient :persistent))

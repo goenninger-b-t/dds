@@ -61,14 +61,14 @@
     (if (zerop rem) pos (+ pos (- m rem)))))
 
 ;;; unsigned integers
-(defun cdr-put-u8  (c v mode) (declare (ignore mode)) (dds.core.buffer:put-u8 c v))
-(defun cdr-get-u8  (c mode)   (declare (ignore mode)) (dds.core.buffer:get-u8 c))
-(defun cdr-put-u16 (c v mode) (cdr-align c 2 mode) (dds.core.buffer:put-u16 c v))
-(defun cdr-get-u16 (c mode)   (cdr-align c 2 mode) (dds.core.buffer:get-u16 c))
-(defun cdr-put-u32 (c v mode) (cdr-align c 4 mode) (dds.core.buffer:put-u32 c v))
-(defun cdr-get-u32 (c mode)   (cdr-align c 4 mode) (dds.core.buffer:get-u32 c))
-(defun cdr-put-u64 (c v mode) (cdr-align c 8 mode) (dds.core.buffer:put-u64 c v))
-(defun cdr-get-u64 (c mode)   (cdr-align c 8 mode) (dds.core.buffer:get-u64 c))
+(defun cdr-put-u8  (c v mode) "Write a u8 to cursor C (no alignment); MODE ignored." (declare (ignore mode)) (dds.core.buffer:put-u8 c v))
+(defun cdr-get-u8  (c mode)   "Read a u8 from cursor C; MODE ignored." (declare (ignore mode)) (dds.core.buffer:get-u8 c))
+(defun cdr-put-u16 (c v mode) "Write a u16 to cursor C, MODE-aware 2-byte alignment (XCDR1/2)." (cdr-align c 2 mode) (dds.core.buffer:put-u16 c v))
+(defun cdr-get-u16 (c mode)   "Read a u16 from cursor C, MODE-aware 2-byte alignment." (cdr-align c 2 mode) (dds.core.buffer:get-u16 c))
+(defun cdr-put-u32 (c v mode) "Write a u32 to cursor C, MODE-aware 4-byte alignment (XCDR1/2)." (cdr-align c 4 mode) (dds.core.buffer:put-u32 c v))
+(defun cdr-get-u32 (c mode)   "Read a u32 from cursor C, MODE-aware 4-byte alignment." (cdr-align c 4 mode) (dds.core.buffer:get-u32 c))
+(defun cdr-put-u64 (c v mode) "Write a u64 to cursor C, MODE-capped alignment (8 for XCDR1, 4 for XCDR2)." (cdr-align c 8 mode) (dds.core.buffer:put-u64 c v))
+(defun cdr-get-u64 (c mode)   "Read a u64 from cursor C, MODE-capped alignment (8 for XCDR1, 4 for XCDR2)." (cdr-align c 8 mode) (dds.core.buffer:get-u64 c))
 
 ;;; signed integers (two's complement)
 (declaim (inline %to-signed %to-unsigned))
@@ -76,24 +76,26 @@
   (if (>= v (ash 1 (1- bits))) (- v (ash 1 bits)) v))
 (defun %to-unsigned (v bits)
   (logand v (1- (ash 1 bits))))
-(defun cdr-put-i8  (c v mode) (cdr-put-u8  c (%to-unsigned v 8)  mode))
-(defun cdr-get-i8  (c mode)   (%to-signed (cdr-get-u8  c mode) 8))
-(defun cdr-put-i16 (c v mode) (cdr-put-u16 c (%to-unsigned v 16) mode))
-(defun cdr-get-i16 (c mode)   (%to-signed (cdr-get-u16 c mode) 16))
-(defun cdr-put-i32 (c v mode) (cdr-put-u32 c (%to-unsigned v 32) mode))
-(defun cdr-get-i32 (c mode)   (%to-signed (cdr-get-u32 c mode) 32))
-(defun cdr-put-i64 (c v mode) (cdr-put-u64 c (%to-unsigned v 64) mode))
-(defun cdr-get-i64 (c mode)   (%to-signed (cdr-get-u64 c mode) 64))
+(defun cdr-put-i8  (c v mode) "Write a two's-complement i8 to cursor C, MODE-aware alignment." (cdr-put-u8  c (%to-unsigned v 8)  mode))
+(defun cdr-get-i8  (c mode)   "Read a two's-complement i8 from cursor C, MODE-aware alignment." (%to-signed (cdr-get-u8  c mode) 8))
+(defun cdr-put-i16 (c v mode) "Write a two's-complement i16 to cursor C, MODE-aware alignment." (cdr-put-u16 c (%to-unsigned v 16) mode))
+(defun cdr-get-i16 (c mode)   "Read a two's-complement i16 from cursor C, MODE-aware alignment." (%to-signed (cdr-get-u16 c mode) 16))
+(defun cdr-put-i32 (c v mode) "Write a two's-complement i32 to cursor C, MODE-aware alignment." (cdr-put-u32 c (%to-unsigned v 32) mode))
+(defun cdr-get-i32 (c mode)   "Read a two's-complement i32 from cursor C, MODE-aware alignment." (%to-signed (cdr-get-u32 c mode) 32))
+(defun cdr-put-i64 (c v mode) "Write a two's-complement i64 to cursor C, MODE-aware alignment." (cdr-put-u64 c (%to-unsigned v 64) mode))
+(defun cdr-get-i64 (c mode)   "Read a two's-complement i64 from cursor C, MODE-aware alignment." (%to-signed (cdr-get-u64 c mode) 64))
 
 ;;; boolean (1 octet) and enum (32-bit; bit_bound refinement later)
-(defun cdr-put-bool (c v mode) (cdr-put-u8 c (if v 1 0) mode))
-(defun cdr-get-bool (c mode)   (/= 0 (cdr-get-u8 c mode)))
-(defun cdr-put-enum (c v mode) (cdr-put-u32 c v mode))
-(defun cdr-get-enum (c mode)   (cdr-get-u32 c mode))
+(defun cdr-put-bool (c v mode) "Write a boolean as one octet (1/0) to cursor C." (cdr-put-u8 c (if v 1 0) mode))
+(defun cdr-get-bool (c mode)   "Read a one-octet boolean from cursor C (non-zero is true)." (/= 0 (cdr-get-u8 c mode)))
+(defun cdr-put-enum (c v mode) "Write an enum as a 32-bit value to cursor C (bit_bound refinement later)." (cdr-put-u32 c v mode))
+(defun cdr-get-enum (c mode)   "Read a 32-bit enum from cursor C." (cdr-get-u32 c mode))
 
 ;;; string: 4-byte length (INCLUDING the NUL) + octets + NUL (FR-CDR-1).
 ;;; Latin-1 for M1; UTF-8 byte-exactness is pinned by the corpus (FR-CDR-8).
 (defun cdr-put-string (c s mode)
+  "Write string S to cursor C: 4-byte length (including the NUL) + octets + NUL
+   (FR-CDR-1). Latin-1 for M1; signals cdr-not-implemented on non-Latin-1 input."
   (cdr-align c 4 mode)
   (let ((n (length s)))
     (dds.core.buffer:put-u32 c (1+ n))
@@ -117,6 +119,8 @@
 
 ;;; sequence: 4-byte element count + elements (FR-CDR-1)
 (defun cdr-put-sequence (c vec elem-writer mode)
+  "Write sequence VEC to cursor C: 4-byte element count + elements, each written
+   via (funcall ELEM-WRITER c element mode) (FR-CDR-1)."
   (cdr-align c 4 mode)
   (let ((n (length vec)))
     (dds.core.buffer:put-u32 c n)
@@ -140,6 +144,7 @@
   (cdr-align c 4 mode)
   (dds.core.buffer:put-u32 c ssize))
 (defun cdr-get-dheader (c mode)
+  "Read a DHEADER = UInt32 serialized size of the object that follows."
   (cdr-align c 4 mode)
   (dds.core.buffer:get-u32 c))
 

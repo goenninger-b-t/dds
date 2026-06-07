@@ -11,31 +11,34 @@
 (in-package #:dds.types)
 
 ;;; ---- TypeKind octets (idl §13-51) ----
-(defconstant +tk-boolean+ #x01)
-(defconstant +tk-byte+    #x02)            ; XTypes 1.3 8-bit kind (no distinct INT8/UINT8)
-(defconstant +tk-int16+   #x03)
-(defconstant +tk-int32+   #x04)
-(defconstant +tk-int64+   #x05)
-(defconstant +tk-uint16+  #x06)
-(defconstant +tk-uint32+  #x07)
-(defconstant +tk-uint64+  #x08)
+(defconstant +tk-boolean+ #x01 "XTypes TypeKind octet TK_BOOLEAN (idl §13-51).")
+(defconstant +tk-byte+    #x02
+  "XTypes TypeKind octet TK_BYTE (idl §13-51): the 1.3 8-bit kind (no distinct INT8/UINT8).")
+(defconstant +tk-int16+   #x03 "XTypes TypeKind octet TK_INT16 (idl §13-51).")
+(defconstant +tk-int32+   #x04 "XTypes TypeKind octet TK_INT32 (idl §13-51).")
+(defconstant +tk-int64+   #x05 "XTypes TypeKind octet TK_INT64 (idl §13-51).")
+(defconstant +tk-uint16+  #x06 "XTypes TypeKind octet TK_UINT16 (idl §13-51).")
+(defconstant +tk-uint32+  #x07 "XTypes TypeKind octet TK_UINT32 (idl §13-51).")
+(defconstant +tk-uint64+  #x08 "XTypes TypeKind octet TK_UINT64 (idl §13-51).")
 (defconstant +tk-float32+ #x09)
 (defconstant +tk-float64+ #x0a)
 (defconstant +tk-float128+ #x0b)
 (defconstant +tk-char8+   #x10)
 (defconstant +tk-char16+  #x11)
-(defconstant +tk-string8+ #x20)
+(defconstant +tk-string8+ #x20 "XTypes TypeKind octet TK_STRING8 (idl §13-51): narrow string.")
 (defconstant +tk-string16+ #x21)
-(defconstant +tk-structure+ #x51)
-(defconstant +tk-sequence+ #x60)
+(defconstant +tk-structure+ #x51 "XTypes TypeKind octet TK_STRUCTURE (idl §13-51).")
+(defconstant +tk-sequence+ #x60 "XTypes TypeKind octet TK_SEQUENCE (idl §13-51).")
 (defconstant +tk-array+   #x61)
 ;;; ---- EquivalenceKind (idl §8-10) ----
-(defconstant +ek-minimal+ #xf1)
-(defconstant +ek-complete+ #xf2)
+(defconstant +ek-minimal+ #xf1 "XTypes EquivalenceKind octet EK_MINIMAL (idl §8-10).")
+(defconstant +ek-complete+ #xf2 "XTypes EquivalenceKind octet EK_COMPLETE (idl §8-10).")
 ;;; ---- TypeIdentifierKind (idl §56-70) ----
-(defconstant +ti-string8-small+ #x70)
+(defconstant +ti-string8-small+ #x70
+  "XTypes TypeIdentifierKind octet TI_STRING8_SMALL (idl §56-70): narrow string, SBound.")
 (defconstant +ti-string8-large+ #x71)
-(defconstant +ti-plain-sequence-small+ #x80)
+(defconstant +ti-plain-sequence-small+ #x80
+  "XTypes TypeIdentifierKind octet TI_PLAIN_SEQUENCE_SMALL (idl §56-70): plain sequence, SBound.")
 (defconstant +ti-plain-sequence-large+ #x81)
 
 ;;; ---- TypeIdentifier (idl §269 union, structural in-memory form) ----

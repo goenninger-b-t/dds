@@ -12,22 +12,28 @@
 
 (defclass entity ()
   ((qos :initarg :qos :initform nil :accessor entity-qos)
-   (enabled :initarg :enabled :initform nil :accessor entity-enabled-p)))
+   (enabled :initarg :enabled :initform nil :accessor entity-enabled-p))
+  (:documentation "Base DDS Entity: carries the QoS and the enabled flag shared by all
+   DCPS entities (DomainParticipant, Publisher/Subscriber, Topic, DataWriter/DataReader)."))
 
 (defclass domain-participant (entity)
   ((domain :initarg :domain :reader dp-domain)
    (node :initarg :node :accessor dp-node)
    (children :initform '() :accessor dp-children)
    (user-reader :initform nil :accessor dp-user-reader)   ; v1: one DataReader per participant
-   (user-writer :initform nil :accessor dp-user-writer))) ; v1: one DataWriter per participant
+   (user-writer :initform nil :accessor dp-user-writer))  ; v1: one DataWriter per participant
+  (:documentation "DDS DomainParticipant: owns a multicast disc-node for its domain and
+   its contained entities. v1 holds one DataReader + one DataWriter per participant."))
 
 (defclass publisher (entity)
   ((participant :initarg :participant :reader pub-participant)
-   (writers :initform '() :accessor pub-writers)))
+   (writers :initform '() :accessor pub-writers))
+  (:documentation "DDS Publisher: a factory/container for DataWriters in its participant."))
 
 (defclass subscriber (entity)
   ((participant :initarg :participant :reader sub-participant)
-   (readers :initform '() :accessor sub-readers)))
+   (readers :initform '() :accessor sub-readers))
+  (:documentation "DDS Subscriber: a factory/container for DataReaders in its participant."))
 
 (defclass topic (entity)
   ((name :initarg :name :reader topic-name)
@@ -37,7 +43,9 @@
    (inconsistent-status :initform (make-inconsistent-topic-status) :accessor topic-inconsistent-status)
    (listener :initform nil :accessor topic-listener-obj)
    (listener-mask :initform '() :accessor topic-listener-mask)
-   (status-lock :initform (dds.pal:make-lock "topic-status") :accessor topic-status-lock)))
+   (status-lock :initform (dds.pal:make-lock "topic-status") :accessor topic-status-lock))
+  (:documentation "DDS Topic: a named type binding (name + type-name + type-support)
+   within a participant, carrying its INCONSISTENT_TOPIC status and optional listener."))
 
 (defclass data-writer (entity)
   ((topic :initarg :topic :reader dw-topic)
@@ -46,7 +54,9 @@
    (off-incompat :initform (make-offered-incompatible-qos-status) :accessor dw-off-incompat)
    (listener :initform nil :accessor dw-listener)
    (listener-mask :initform '() :accessor dw-listener-mask)
-   (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock)))
+   (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock))
+  (:documentation "DDS DataWriter: publishes typed samples on a Topic, carrying its
+   PUBLICATION_MATCHED and OFFERED_INCOMPATIBLE_QOS statuses and optional listener."))
 
 (defclass data-reader (entity)
   ((topic :initarg :topic :reader dr-topic)
@@ -61,7 +71,10 @@
    (listener-mask :initform '() :accessor dr-listener-mask)
    (conditions :initform '() :accessor dr-conditions)      ; read/query/status conditions bound here
    (filter :initform nil :accessor dr-filter)              ; ContentFilteredTopic predicate, or nil
-   (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock)))
+   (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock))
+  (:documentation "DDS DataReader: receives typed samples on a Topic into a read/take
+   cache with per-instance SampleInfo, carrying its SUBSCRIPTION_MATCHED,
+   REQUESTED_INCOMPATIBLE_QOS and SAMPLE_REJECTED statuses, conditions and listener."))
 
 ;; Defined in conditions.lisp (loaded after this file); forward-declared so the data-
 ;; arrival hook below can wake the reader's WaitSets without a compile-time warning.
@@ -199,12 +212,14 @@
 
 (declaim (ftype (function (domain-participant) publisher) create-publisher))
 (defun create-publisher (p)
+  "DomainParticipant::create_publisher — create an enabled Publisher in P."
   (let ((pub (make-instance 'publisher :participant p :enabled t)))
     (push pub (dp-children p))
     pub))
 
 (declaim (ftype (function (domain-participant) subscriber) create-subscriber))
 (defun create-subscriber (p)
+  "DomainParticipant::create_subscriber — create an enabled Subscriber in P."
   (let ((sub (make-instance 'subscriber :participant p :enabled t)))
     (push sub (dp-children p))
     sub))

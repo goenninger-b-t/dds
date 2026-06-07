@@ -62,9 +62,9 @@
   (mcast-rx-thread nil)
   (rx-thread nil))
 
-;; Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
-;; participants announce + listen on UDPv4 239.255.0.1 : spdp-multicast-port.
-(defparameter +spdp-multicast-group+ "239.255.0.1")
+(defparameter +spdp-multicast-group+ "239.255.0.1"
+  "Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
+   participants announce + listen on UDPv4 239.255.0.1 : spdp-multicast-port.")
 
 (declaim (ftype (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string)) disc-node) make-disc-node))
 (defun make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)

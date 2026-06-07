@@ -13,6 +13,8 @@
   (:documentation "Raised at provisioning time when a pool exceeds the budget."))
 
 (defstruct (arena (:constructor %make-arena))
+  "Static, startup-allocated off-heap memory region with a fixed byte budget;
+   pools are carved from it via make-buffer-pool (NFR-MEM)."
   (byte-budget 0 :type fixnum)
   (bytes-used 0 :type fixnum)
   (pools '() :type list)
@@ -37,10 +39,10 @@
 (declaim (ftype (function (buffer-pool t) (values)) pool-release))
 (declaim (ftype (function (arena) list) arena-report))
 
-(defun arena-initialized-p (arena) (arena-initialized arena))
-(defun pool-capacity (pool) (buffer-pool-capacity pool))
-(defun pool-in-use (pool) (buffer-pool-in-use pool))
-(defun pool-high-water (pool) (buffer-pool-high-water pool))
+(defun arena-initialized-p (arena) "True while ARENA is live (between init-arena and teardown-arena)." (arena-initialized arena))
+(defun pool-capacity (pool) "Fixed number of buffers POOL was provisioned with." (buffer-pool-capacity pool))
+(defun pool-in-use (pool) "Number of buffers currently checked out of POOL." (buffer-pool-in-use pool))
+(defun pool-high-water (pool) "Peak in-use count seen for POOL (NFR-OBS / budget tracking)." (buffer-pool-high-water pool))
 
 (defun init-arena (&key (bytes *static-arena-bytes*))
   "Create the arena with a fixed BYTE budget (defaults from *static-arena-bytes*,

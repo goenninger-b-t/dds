@@ -1,6 +1,10 @@
 (in-package #:dds.xport)
 
 (defstruct (transport (:constructor %make-transport))
+  "Pluggable transport record (IMPLEMENTATION-PLAN §7.5, FR-XPORT-5): the per-packet
+   SEND and lifecycle operations are stored function slots, so the latency path stays
+   dispatch-free. Adding a transport = constructing one record; the RTPS engine is
+   untouched. Use make-transport / make-mock-transport, not %make-transport directly."
   (kind :mock)
   (send nil :type (or null function))
   (receive-loop nil :type (or null function))

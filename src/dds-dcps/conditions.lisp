@@ -77,7 +77,9 @@
   t)
 
 (declaim (ftype (function () guard-condition) make-guard-condition))
-(defun make-guard-condition () (make-instance 'guard-condition))
+(defun make-guard-condition ()
+  "Create a DDS GuardCondition (an app-controlled trigger)."
+  (make-instance 'guard-condition))
 
 (declaim (ftype (function (guard-condition t) t) set-trigger-value))
 (defun set-trigger-value (gc value)
@@ -177,7 +179,9 @@
   (and (some (lambda (kind) (%status-active-p (sc-entity c) kind)) (sc-mask c)) t))
 
 (declaim (ftype (function () wait-set) make-wait-set))
-(defun make-wait-set () (make-instance 'wait-set))
+(defun make-wait-set ()
+  "Create a DDS WaitSet (a set of conditions to wait on)."
+  (make-instance 'wait-set))
 
 (declaim (ftype (function (wait-set wait-condition) wait-set) attach-condition))
 (defun attach-condition (ws c)

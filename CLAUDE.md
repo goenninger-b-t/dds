@@ -52,11 +52,17 @@ A unit of work is **done** only when **all** hold:
 - Code compiles and unit tests pass on **SBCL and AllegroCL** (Clasp too, or a documented gap per NFR-PORT — Clasp may trail one profile).
 - All applicable **quality gates green** (§6).
 - The interface contract is **unchanged**, or the change is captured in an **ADR** (`docs/adr/NNNN-*.md`) listing every consumer + migration.
-- **Docs updated**: the verification matrix (`docs/verification.csv`), provenance log if external sources were consulted, and any affected spec cross-reference.
+- **Docs updated** (§5.1): API docstrings for any added/changed special variable, API-visible constant, or API-relevant function; the affected `docs/wiki/` page(s) and `README.md`; the verification matrix (`docs/verification.csv`); the provenance log if external sources were consulted; and any affected spec cross-reference.
 - For any **hot-path** change: a **before/after bench number** in `bench/report/` (no perf change lands on intuition — `REQUIREMENTS` FR-LANG-7).
 - No new reader conditionals (`#+sbcl`/`#+allegro`/`#+clasp`) outside `dds-pal/` (CI lint enforces this).
 
 A **milestone** is done only when its exit gate in `IMPLEMENTATION-PLAN.md` §4 passes (e.g., M2 = Connext Shapes interop both directions, reliable + best-effort, tshark-validated).
+
+### 5.1 Documentation discipline (first-class, MUST)
+
+**Every special variable, every API-visible (exported) constant, and every API-relevant (exported / cross-package) function carries a docstring** stating what it is, its contract, and — for any wire constant — the spec clause it is pinned from. Same clean-room rule as code: cite the clause, never invent a value or a meaning. This extends FR-LANG-6 ("the signature *is* the documented contract") from functions to special variables and constants.
+
+**Documentation is kept in lockstep with the source on every change.** When you add or change any such symbol you **MUST**, in the same unit of work, update: (a) its docstring; (b) the relevant `docs/wiki/` page(s) — API reference + use-case + a worked example; and (c) `README.md` if scope/architecture/status shifted. A source change that lands without its docs updated is **not done** (§5). The wiki and `README.md` are maintained from the docstrings + the in-repo specs, never from memory. *(Owner directive, 2026-06-07.)*
 
 ---
 
@@ -122,6 +128,7 @@ Rules: **no agent edits another agent's package** (file an issue or open a contr
 - Never copy RTI Connext source/headers/generated code.
 - Never start a Connext *Professional* service (Routing/Recording/Persistence/etc.).
 - Never land a performance change without a before/after measurement.
+- Never change an API symbol (special variable, API-visible constant, API-relevant function) without updating its docstring + the affected `docs/wiki/` page and `README.md` (§5.1).
 - Never mark work done with a red gate or a skipped interop/byte-exact check.
 - Never put reader conditionals outside `dds-pal/`.
 

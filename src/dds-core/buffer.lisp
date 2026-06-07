@@ -9,6 +9,8 @@
   (:documentation "Signalled when an op would read/write past the buffer extent."))
 
 (defstruct (octet-buffer (:constructor %make-octet-buffer))
+  "Off-heap octet buffer with a stable foreign address (PAL-backed), of fixed
+   CAPACITY. The unit of hot-path serialization memory (HOT PATH)."
   (vec (dds.pal:alloc-static 0) :type (simple-array (unsigned-byte 8) (*)))
   (capacity 0 :type fixnum))
 
@@ -25,6 +27,8 @@
   (dds.pal:static-pointer (octet-buffer-vec buffer)))
 
 (defstruct (cursor (:constructor %make-cursor))
+  "Read/write position over an octet-buffer, with the endianness and the
+   alignment origin (alignment is relative to ORIGIN, default 0) (HOT PATH)."
   (buffer nil :type octet-buffer)
   (pos 0 :type fixnum)
   (origin 0 :type fixnum)
@@ -57,8 +61,8 @@
 
 (declaim (inline cursor-position cursor-reset cursor-set-origin cursor-set-endianness
                  cursor-set-position))
-(defun cursor-position (cursor) (cursor-pos cursor))
-(defun cursor-reset (cursor) (setf (cursor-pos cursor) 0 (cursor-origin cursor) 0))
+(defun cursor-position (cursor) "Current byte position of CURSOR in its buffer." (cursor-pos cursor))
+(defun cursor-reset (cursor) "Reset CURSOR to position 0 and alignment origin 0." (setf (cursor-pos cursor) 0 (cursor-origin cursor) 0))
 (defun cursor-set-origin (cursor)
   "Set the alignment origin to the current position. Used after writing the
    4-byte encapsulation header so CDR alignment resets per RTPS 2.5 §10.2."
@@ -124,14 +128,14 @@
       (setf (cursor-pos cursor) (+ pos nbytes))
       v)))
 
-(defun put-u8  (cursor v) (%put-uint cursor v 1))
-(defun get-u8  (cursor)   (%get-uint cursor 1))
-(defun put-u16 (cursor v) (%put-uint cursor v 2))
-(defun get-u16 (cursor)   (%get-uint cursor 2))
-(defun put-u32 (cursor v) (%put-uint cursor v 4))
-(defun get-u32 (cursor)   (%get-uint cursor 4))
-(defun put-u64 (cursor v) (%put-uint cursor v 8))
-(defun get-u64 (cursor)   (%get-uint cursor 8))
+(defun put-u8  (cursor v) "Write V as 1 octet at CURSOR (bounds-checked)." (%put-uint cursor v 1))
+(defun get-u8  (cursor)   "Read 1 octet at CURSOR (bounds-checked)." (%get-uint cursor 1))
+(defun put-u16 (cursor v) "Write V as 2 octets at CURSOR in cursor endianness (bounds-checked)." (%put-uint cursor v 2))
+(defun get-u16 (cursor)   "Read 2 octets at CURSOR in cursor endianness (bounds-checked)." (%get-uint cursor 2))
+(defun put-u32 (cursor v) "Write V as 4 octets at CURSOR in cursor endianness (bounds-checked)." (%put-uint cursor v 4))
+(defun get-u32 (cursor)   "Read 4 octets at CURSOR in cursor endianness (bounds-checked)." (%get-uint cursor 4))
+(defun put-u64 (cursor v) "Write V as 8 octets at CURSOR in cursor endianness (bounds-checked)." (%put-uint cursor v 8))
+(defun get-u64 (cursor)   "Read 8 octets at CURSOR in cursor endianness (bounds-checked)." (%get-uint cursor 8))
 
 (defun put-octets (cursor src off len)
   "Copy LEN octets from SRC[OFF..] into the buffer at the cursor."

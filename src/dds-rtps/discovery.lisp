@@ -5,19 +5,25 @@
 ;;;; (clauses cited inline), never memorized. CLOS-free: defstruct + monomorphic
 ;;;; functions; every parser bounds-checks before trusting wire data.
 
-;; LOCATOR_KIND_UDPv4 = 1 (RTPS 2.5 §9.3.2.1 IDL / §9.3.2.4).
-(defconstant +locator-kind-udpv4+ 1)
+(defconstant +locator-kind-udpv4+ 1
+  "LOCATOR_KIND_UDPv4 = 1 (RTPS 2.5 §9.3.2.1 IDL / §9.3.2.4).")
 
 ;; Builtin EntityIds (RTPS 2.5 §9.3.1.3 Table 9.2): entityKey[3]+entityKind, MSB-first u32.
-(defconstant +entityid-spdp-writer+     #x000100c2) ; SPDPbuiltinParticipantWriter {{00,01,00},c2}
-(defconstant +entityid-spdp-reader+     #x000100c7) ; SPDPbuiltinParticipantReader {{00,01,00},c7}
-(defconstant +entityid-sedp-pub-writer+ #x000003c2) ; SEDPbuiltinPublicationsWriter {{00,00,03},c2}
-(defconstant +entityid-sedp-pub-reader+ #x000003c7) ; SEDPbuiltinPublicationsReader {{00,00,03},c7}
-(defconstant +entityid-sedp-sub-writer+ #x000004c2) ; SEDPbuiltinSubscriptionsWriter {{00,00,04},c2}
-(defconstant +entityid-sedp-sub-reader+ #x000004c7) ; SEDPbuiltinSubscriptionsReader {{00,00,04},c7}
+(defconstant +entityid-spdp-writer+     #x000100c2
+  "SPDPbuiltinParticipantWriter EntityId {{00,01,00},c2} (RTPS 2.5 §9.3.1.3 Table 9.2).")
+(defconstant +entityid-spdp-reader+     #x000100c7
+  "SPDPbuiltinParticipantReader EntityId {{00,01,00},c7} (RTPS 2.5 §9.3.1.3 Table 9.2).")
+(defconstant +entityid-sedp-pub-writer+ #x000003c2
+  "SEDPbuiltinPublicationsWriter EntityId {{00,00,03},c2} (RTPS 2.5 §9.3.1.3 Table 9.2).")
+(defconstant +entityid-sedp-pub-reader+ #x000003c7
+  "SEDPbuiltinPublicationsReader EntityId {{00,00,03},c7} (RTPS 2.5 §9.3.1.3 Table 9.2).")
+(defconstant +entityid-sedp-sub-writer+ #x000004c2
+  "SEDPbuiltinSubscriptionsWriter EntityId {{00,00,04},c2} (RTPS 2.5 §9.3.1.3 Table 9.2).")
+(defconstant +entityid-sedp-sub-reader+ #x000004c7
+  "SEDPbuiltinSubscriptionsReader EntityId {{00,00,04},c7} (RTPS 2.5 §9.3.1.3 Table 9.2).")
 
-;; Locator_t = {long kind; unsigned long port; octet address[16];} = 24 octets (§9.3.2.1).
-(defconstant +locator-bytes+ 24)
+(defconstant +locator-bytes+ 24
+  "Locator_t size = {long kind; unsigned long port; octet address[16];} = 24 octets (RTPS 2.5 §9.3.2.1).")
 
 (declaim (ftype (function (dds.core.buffer:cursor (integer 0) (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) fixnum) write-locator))
 (defun write-locator (cursor kind port address)
@@ -88,6 +94,10 @@
 ;;; the ParticipantBuiltinTopicData carried as a ParameterList in the SPDP DATA. ----
 
 (defstruct (spdp-data (:constructor make-spdp-data))
+  "SPDPdiscoveredParticipantData (RTPS 2.5 §8.5.3.2 / §9.6.2.2): the subset of
+   ParticipantBuiltinTopicData carried as a ParameterList in the SPDP DATA — GUID
+   prefix, protocol version, vendor id, default/metatraffic unicast locator lists,
+   lease duration, and the builtin-endpoint set."
   (guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)
                :type (simple-array (unsigned-byte 8) (12)))
   (version-major 2 :type (unsigned-byte 8))
@@ -283,9 +293,10 @@
 
 ;; ReliabilityQosPolicyKind: BEST_EFFORT=1, RELIABLE=2 (RELIABLE is the stronger/
 ;; higher value for RxO) — DDS-XTypes 1.3 §7.6.3.1.2 IDL, xtypes-1_3-discovery-builtin-topic.idl L126.
-(defconstant +reliability-best-effort+ 1)
-;; RELIABLE_RELIABILITY_QOS = 2 (DDS-XTypes 1.3 §7.6.3.1.2; same IDL L127).
-(defconstant +reliability-reliable+ 2)
+(defconstant +reliability-best-effort+ 1
+  "BEST_EFFORT_RELIABILITY_QOS = 1 (DDS-XTypes 1.3 §7.6.3.1.2 IDL).")
+(defconstant +reliability-reliable+ 2
+  "RELIABLE_RELIABILITY_QOS = 2; the stronger/higher RxO value (DDS-XTypes 1.3 §7.6.3.1.2 IDL).")
 
 ;; QoS <-> on-the-wire kind mappings (DDS-XTypes 1.3 discovery IDL enum order, a
 ;; big-endian long per policy). reliability is 1/2 (not 0-based); durability is 0-3.

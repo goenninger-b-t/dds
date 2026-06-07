@@ -1,6 +1,11 @@
 (in-package #:dds.types)
 
 (defstruct (type-support (:constructor make-type-support))
+  "Per-type manual vtable the engine funcalls per sample (IMPLEMENTATION-PLAN §7.3): a
+   plain defstruct of function objects (serialize/deserialize/serialized-size/key-hash,
+   sample-pool alloc+free, FlatData hooks, field accessors) plus the type name,
+   extensibility, structural TypeObject/TypeIdentifier, and data-representation mask. The
+   hot path sees only this struct, never the concrete sample type."
   (name nil)
   (type-name nil :type (or null string))
   (extensibility :appendable)
@@ -44,6 +49,10 @@
 ;;; allocation in steady state (NFR-MEM / NFR-DET). Carved once at registration.
 
 (defstruct (sample-pool (:constructor %make-sample-pool))
+  "A fixed-capacity freelist of pre-allocated sample structs: a reader loans a struct,
+   deserializes into it, and returns it — zero per-sample allocation in steady state
+   (NFR-MEM / NFR-DET). SLOTS is the backing vector, TOP the freelist stack pointer.
+   Carved once at registration."
   (slots #() :type simple-vector)
   (top 0 :type fixnum))
 

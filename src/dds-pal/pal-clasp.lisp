@@ -81,25 +81,48 @@
 ;;; ---- atomics / threads / gc: M0 stubs over portable libs ----
 ;;; bordeaux-threads is available; native CAS/fence fast paths land in M1.
 
-(defun cas (place-fn old new) (declare (ignore place-fn old new))
+(defun cas (place-fn old new)
+  "Atomic compare-and-swap. M0 stub: signals PAL-UNIMPLEMENTED; a native CAS fast
+   path lands in M1."
+  (declare (ignore place-fn old new))
   (error 'pal-unimplemented :op 'cas))
-(defun atomic-incf (place-fn &optional (delta 1)) (declare (ignore place-fn delta))
+(defun atomic-incf (place-fn &optional (delta 1))
+  "Atomic increment by DELTA. M0 stub: signals PAL-UNIMPLEMENTED; a native fast path
+   lands in M1."
+  (declare (ignore place-fn delta))
   (error 'pal-unimplemented :op 'atomic-incf))
-(defun fence (&optional (kind :full)) (declare (ignore kind)) (values))
+(defun fence (&optional (kind :full))
+  "Memory fence of the given KIND. M0 no-op; a native fence fast path lands in M1."
+  (declare (ignore kind)) (values))
 
-(defun spawn (fn &key name) (bordeaux-threads:make-thread fn :name (or name "dds")))
-(defun join (thread) (bordeaux-threads:join-thread thread))
-(defun make-lock (&optional name) (bordeaux-threads:make-lock (or name "dds-lock")))
+(defun spawn (fn &key name)
+  "Spawn a thread running FN, named NAME (default \"dds\"). Returns the thread."
+  (bordeaux-threads:make-thread fn :name (or name "dds")))
+(defun join (thread)
+  "Block until THREAD finishes; return its result."
+  (bordeaux-threads:join-thread thread))
+(defun make-lock (&optional name)
+  "Create a mutex named NAME (default \"dds-lock\")."
+  (bordeaux-threads:make-lock (or name "dds-lock")))
 (defmacro with-lock ((lock) &body body)
+  "Evaluate BODY with LOCK held."
   `(bordeaux-threads:with-lock-held (,lock) ,@body))
-(defun make-condvar () (bordeaux-threads:make-condition-variable))
+(defun make-condvar ()
+  "Create a condition variable for use with CONDVAR-WAIT / CONDVAR-SIGNAL."
+  (bordeaux-threads:make-condition-variable))
 (defun condvar-wait (cv lock &optional timeout-seconds)
+  "Wait on condition variable CV releasing LOCK. NIL TIMEOUT-SECONDS waits forever,
+   else a bounded wait; re-check the predicate on wake (ADR 0007)."
   (if timeout-seconds
       (bordeaux-threads:condition-wait cv lock :timeout timeout-seconds)
       (bordeaux-threads:condition-wait cv lock)))
-(defun condvar-signal (cv) (bordeaux-threads:condition-notify cv))
+(defun condvar-signal (cv)
+  "Wake one thread waiting on condition variable CV."
+  (bordeaux-threads:condition-notify cv))
 
-(defun gc-suggest () (values))
+(defun gc-suggest ()
+  "Suggest a GC to the implementation. M0 no-op."
+  (values))
 (defmacro with-gc-inhibited (&body body)
   "M0: no-op wrapper. A bounded, audited GC-inhibition window lands behind an
    explicit unsafe flag in a later ADR (REQUIREMENTS NFR-DET)."
