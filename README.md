@@ -240,3 +240,10 @@ Read `CLAUDE.md` (the operating contract), then `REQUIREMENTS.md` and
 alloc), static-arena memory, no hardcoded wire constants, bounds-checked network parsers,
 and — per CLAUDE.md §5.1 — **every API symbol carries a docstring and the `docs/wiki/` +
 this README are kept in lockstep with the source on every change.**
+
+The `docs/wiki/` pages are the source of truth for the project wiki; the **`Publish Wiki`**
+GitHub Action (`scripts/publish-wiki.sh`) mirrors them to the repository's **GitHub Wiki** on
+every push to `main`. One-time setup: enable **Settings → Features → Wikis** and create one
+page (e.g. `Home`) in the web UI so the wiki repo exists; if `GITHUB_TOKEN` can't write the
+wiki in your org, add a `repo`-scoped PAT as the `WIKI_TOKEN` secret. You can also publish
+manually with `./scripts/publish-wiki.sh` (or preview with `DRY_RUN=1`).

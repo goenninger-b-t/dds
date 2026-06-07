@@ -1,0 +1,39 @@
+name: Publish Wiki
+
+# Mirror docs/wiki/ into the repo's GitHub Wiki on every push that touches it, so the
+# wiki is always in sync with the source of truth in the main repo (CLAUDE.md §5.1).
+#
+# One-time setup: enable the repo Wiki (Settings > Features > Wikis) and create one page
+# in the web UI (e.g. "Home") so the <repo>.wiki.git repo exists. If GITHUB_TOKEN cannot
+# push to the wiki in your org, add a PAT (repo scope) as the secret WIKI_TOKEN — this
+# workflow prefers it when present.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/wiki/**'
+      - 'scripts/publish-wiki.sh'
+      - '.github/workflows/publish-wiki.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-wiki
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mirror docs/wiki -> GitHub Wiki
+        env:
+          WIKI_REMOTE: https://x-access-token:${{ secrets.WIKI_TOKEN || secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git
+          OWNER_REPO: ${{ github.repository }}
+          WIKI_SOURCE_BRANCH: ${{ github.ref_name }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: bash scripts/publish-wiki.sh

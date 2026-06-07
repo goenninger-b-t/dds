@@ -37,3 +37,9 @@ and worked examples (grounded in the verified test suite under `src/dds-tests/`)
 - Examples that talk over the network use UDP loopback on a domain id; two participants in
   one image is the normal test/demo pattern.
 - Every example here is adapted from a test in `src/dds-tests/` that passes on SBCL + Clasp.
+
+---
+
+*This wiki is **generated** from `docs/wiki/` in the main repository and mirrored to the
+GitHub Wiki by the `Publish Wiki` GitHub Action on every push. Edit the source pages under
+`docs/wiki/` — changes made directly in the GitHub Wiki are overwritten on the next sync.*
