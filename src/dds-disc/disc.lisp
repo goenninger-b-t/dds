@@ -226,11 +226,14 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for v being the hash-values of (disc-node-discovered node) collect v)))
 
-(declaim (ftype (function (disc-node (unsigned-byte 32) (unsigned-byte 32) dds.rtps.discovery:endpoint-data string (unsigned-byte 16)) t) %send-endpoint))
-(defun %send-endpoint (node reader-id writer-id ep host port)
-  "Announce one local endpoint EP via a SEDP DATA submessage to HOST:PORT."
-  (incf (disc-node-sedp-sn node))
-  (%send-paramlist node reader-id writer-id (disc-node-sedp-sn node)
+(declaim (ftype (function (disc-node (unsigned-byte 32) (unsigned-byte 32) dds.rtps.discovery:endpoint-data integer string (unsigned-byte 16)) t) %send-endpoint))
+(defun %send-endpoint (node reader-id writer-id ep sn host port)
+  "Announce one local endpoint EP via a SEDP DATA submessage to HOST:PORT with the STABLE
+   per-writer sequence number SN. Re-announcing an endpoint RESENDS the same SN (a
+   retransmission), never a fresh one: a remote RELIABLE SEDP reader cannot deliver any
+   sample while an earlier SN is missing, so an ever-incrementing SN plus one lost push
+   would gap it permanently (RTPS 2.5 §8.5.4 — each endpoint is one writer sample)."
+  (%send-paramlist node reader-id writer-id sn
                    (lambda (c) (dds.rtps.discovery:serialize-endpoint-data c ep))
                    host port))
 
@@ -332,16 +335,20 @@
       (when loc
         (let ((host (dds.rtps.discovery:locator-ipv4-string loc))
               (port (%locator-port (dds.rtps.discovery:locator-port loc))))
-          (dolist (w (disc-node-local-writers node))
+          ;; STABLE per-writer SNs: reverse -> add-order (oldest first); each endpoint's
+          ;; 1-based add-order index is its fixed SN, unchanged as later endpoints are
+          ;; pushed on. The publications (0x3c2) and subscriptions (0x4c2) writers each
+          ;; have their own 1-based SN space.
+          (loop for w in (reverse (disc-node-local-writers node)) for wsn from 1 do
             (%send-endpoint node
                             dds.rtps.discovery:+entityid-sedp-pub-reader+
                             dds.rtps.discovery:+entityid-sedp-pub-writer+
-                            w host port))
-          (dolist (r (disc-node-local-readers node))
+                            w wsn host port))
+          (loop for r in (reverse (disc-node-local-readers node)) for rsn from 1 do
             (%send-endpoint node
                             dds.rtps.discovery:+entityid-sedp-sub-reader+
                             dds.rtps.discovery:+entityid-sedp-sub-writer+
-                            r host port))
+                            r rsn host port))
           ;; Pre-emptive ACKNACK to the peer's reliable builtin SEDP writers so it
           ;; pushes its publication/subscription endpoint data (RTPS 2.5 §8.4.10.4).
           ;; non-final -> solicit a HEARTBEAT; the per-remote reader advances the ACK
