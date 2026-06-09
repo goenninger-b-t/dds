@@ -27,7 +27,8 @@
   (hc nil :type (or null dds.rtps.history:history-cache))  ; a HistoryCache
   (last-sn 0 :type integer)
   (hb-count 0 :type integer)
-  (proxies (make-hash-table :test 'eql) :type hash-table))   ; reader-id -> reader-proxy
+  (proxies (make-hash-table :test 'eql) :type hash-table)   ; reader-id -> reader-proxy
+  (frag-hb-count 0 :type integer))   ; HEARTBEAT_FRAG Count, separate from hb-count
 
 (defun* get-reader-proxy (writer reader-id)
     (function (rtps-writer (unsigned-byte 32)) reader-proxy)
@@ -238,6 +239,30 @@
         (values base numbits bitmap)))))
 
 ;;; ---- Writer-side fragmentation planners (RTPS 2.5 §8.3.8.3) ----
+
+(defun* writer-frag-heartbeat (writer sn)
+    (function (rtps-writer integer) t)
+  "Compute a HEARTBEAT_FRAG for the sample at SN: (values last-fragment-num count) where
+   last-fragment-num is the sample's total fragment count at *fragment-size* and count is the
+   writer's monotonically increasing HEARTBEAT_FRAG counter; NIL if SN is absent/empty.
+   RTPS 2.5 §8.3.7.5 (fragment variant)."
+  (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
+    (when (null ch) (return-from writer-frag-heartbeat nil))
+    (let ((payload (dds.rtps.history:cache-change-serialized-payload ch)))
+      (when (null payload) (return-from writer-frag-heartbeat nil))
+      (values (ceiling (length payload) *fragment-size*)
+              (incf (rtps-writer-frag-hb-count writer))))))
+
+(defun* writer-on-nack-frag (writer sn base numbits bitmap)
+    (function (rtps-writer integer (unsigned-byte 32) (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) list)
+  "Plan the DATA_FRAG resends for a NACK_FRAG naming missing fragments of the sample at SN:
+   the writer-frag-plan-for descriptors over SN's payload, or NIL if SN is absent/empty.
+   RTPS 2.5 §8.3.8.x."
+  (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
+    (when (null ch) (return-from writer-on-nack-frag nil))
+    (let ((payload (dds.rtps.history:cache-change-serialized-payload ch)))
+      (when (null payload) (return-from writer-on-nack-frag nil))
+      (writer-frag-plan-for (length payload) *fragment-size* base numbits bitmap))))
 
 (defun* writer-frag-plan (sample-size fragment-size budget)
     (function ((unsigned-byte 32) (unsigned-byte 32) (integer 1)) list)

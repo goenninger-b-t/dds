@@ -586,6 +586,28 @@
               "NACK resend plans exactly frags 2 and 4, one per submessage")))
   t)
 
+;;; writer-frag-heartbeat + writer-on-nack-frag: glue writer to HEARTBEAT_FRAG/NACK_FRAG.
+
+(defun* run-writer-frag-glue-test ()
+    (function () t)
+  "Test: writer-frag-heartbeat reports the sample's fragment count + a rising count;
+   writer-on-nack-frag plans the DATA_FRAG resends for exactly the NACKed fragments."
+  (let* ((dds.rtps.reliable:*fragment-size* 1024)
+         (writer (dds.rtps.reliable:make-rtps-writer
+                  :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (payload (make-array 2500 :element-type '(unsigned-byte 8) :initial-element 9))
+         (sn (dds.rtps.reliable:writer-write writer payload)))   ; 3 fragments @1024
+    (multiple-value-bind (lastfrag c1) (dds.rtps.reliable:writer-frag-heartbeat writer sn)
+      (%check :wfh-last (= lastfrag 3) "HEARTBEAT_FRAG lastFragmentNum = 3 for 2500B@1024")
+      (multiple-value-bind (lastfrag2 c2) (dds.rtps.reliable:writer-frag-heartbeat writer sn)
+        (declare (ignore lastfrag2))
+        (%check :wfh-count (> c2 c1) "HEARTBEAT_FRAG count increases")))
+    (let ((bitmap (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+      (dds.rtps.message:fragnum-set-bit bitmap 0)   ; frag 2 (base 2, delta 0)
+      (%check :wonf (equal '((2 1 1024 1024)) (dds.rtps.reliable:writer-on-nack-frag writer sn 2 1 bitmap))
+              "NACK_FRAG for frag 2 resends one DATA_FRAG (frag 2, off 1024, len 1024)")))
+  t)
+
 ;;; NACK_FRAG round-trip (RTPS 2.5 §9.4.5.14): 24+4*M body, only E flag.
 
 (defun* run-nack-frag-test ()
