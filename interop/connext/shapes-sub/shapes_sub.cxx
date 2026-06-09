@@ -12,10 +12,14 @@
 #include <cstdlib>
 
 #include <dds/dds.hpp>
+#include <rti/config/Logger.hpp>
 #include "ShapeType.hpp"
 
 int main(int argc, char **argv)
 {
+    if (std::getenv("CONNEXT_VERBOSE"))
+        rti::config::Logger::instance().verbosity(rti::config::Verbosity::STATUS_ALL);
+
     const int domain  = (argc > 1) ? std::atoi(argv[1]) : 0;
     const int seconds = (argc > 2) ? std::atoi(argv[2]) : 0;
 

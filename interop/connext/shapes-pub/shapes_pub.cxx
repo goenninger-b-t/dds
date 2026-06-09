@@ -13,10 +13,15 @@
 #include <cstdlib>
 
 #include <dds/dds.hpp>
+#include <rti/config/Logger.hpp>
 #include "ShapeType.hpp"
 
 int main(int argc, char **argv)
 {
+    // Set CONNEXT_VERBOSE=1 to surface Connext's discovery/match decisions on stderr.
+    if (std::getenv("CONNEXT_VERBOSE"))
+        rti::config::Logger::instance().verbosity(rti::config::Verbosity::STATUS_ALL);
+
     const int   domain    = (argc > 1) ? std::atoi(argv[1]) : 0;
     const std::string color = (argc > 2) ? argv[2] : "BLUE";
     const int   shapesize = (argc > 3) ? std::atoi(argv[3]) : 30;
