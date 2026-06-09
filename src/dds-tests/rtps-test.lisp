@@ -608,6 +608,38 @@
               "NACK_FRAG for frag 2 resends one DATA_FRAG (frag 2, off 1024, len 1024)")))
   t)
 
+;;; Offline integration: fragment a large sample and reassemble byte-exact using the
+;;; real codec + planner + reassembly (RTPS 2.5 §9.4.5.5 / §8.3.8.3).
+
+(defun* run-frag-roundtrip-test ()
+    (function () t)
+  "Test: a large sample fragmented via writer-frag-plan + write-data-frag round-trips through
+   parse-data-frag-body + reader-on-data-frag to the byte-exact original (RTPS 2.5 §9.4.5.5)."
+  (let* ((dds.rtps.reliable:*fragment-size* 1024)
+         (fsize 1024) (budget 2048) (ssize 2500)
+         (wid #x102) (rid #x107) (sn 1)
+         (reader (dds.rtps.reliable:make-rtps-reader))
+         (orig (make-array ssize :element-type '(unsigned-byte 8)))
+         (done nil))
+    (dotimes (i ssize) (setf (aref orig i) (logand (* i 7) #xff)))
+    (dolist (desc (dds.rtps.reliable:writer-frag-plan ssize fsize budget))
+      (destructuring-bind (fstart fcount off len) desc
+        (let* ((buf (dds.core.buffer:make-octet-buffer 4096))
+               (wc (dds.core.buffer:cursor buf :endianness :little)))
+          (dds.rtps.message:write-data-frag wc rid wid sn ssize fstart fcount fsize orig off len)
+          (dds.core.buffer:cursor-reset wc)
+          (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header wc)
+            (declare (ignore id le))
+            (multiple-value-bind (r w psn pssize pfstart pfrags pfsize poff plen keyp)
+                (dds.rtps.message:parse-data-frag-body wc flags octets)
+              (declare (ignore r keyp))
+              (let ((region (subseq (dds.core.buffer:octet-buffer-vec buf) poff (+ poff plen))))
+                (setf done (dds.rtps.reliable:reader-on-data-frag
+                            reader w psn pfstart pfrags pfsize pssize region))))))))
+    (%check :frt-complete (and done (equalp done orig))
+            "fragmented large sample reassembles byte-exact our-writer -> our-reader"))
+  t)
+
 ;;; NACK_FRAG round-trip (RTPS 2.5 §9.4.5.14): 24+4*M body, only E flag.
 
 (defun* run-nack-frag-test ()

@@ -250,6 +250,7 @@
                  ("rtps-frag-acknack"        . run-frag-acknack-test)
                  ("rtps-frag-plan"           . run-frag-plan-test)
                  ("rtps-writer-frag-glue"    . run-writer-frag-glue-test)
+                 ("rtps-frag-roundtrip"      . run-frag-roundtrip-test)
                  ("rtps-message-dispatch"    . run-rtps-dispatch-test)
                  ("rtps-parameterlist"       . run-paramlist-test)
                  ("rtps-port-mapping"        . run-port-mapping-test)
