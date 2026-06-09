@@ -48,6 +48,9 @@
            #:minimal-type-object-octets #:equivalence-hash
            ;; TypeInformation codec for PID_TYPE_INFORMATION (FR-TYPE-3 foundation)
            #:serialize-type-information #:deserialize-type-information-hash
+           ;; Inbound RTI PID_TYPE_OBJECT_LB inflate (ADR 0009)
+           #:inflate-type-object-lb #:*max-type-object-bytes*
+           #:+type-object-lb-compression-zlib+
            #:+tk-boolean+ #:+tk-byte+ #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
            #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
            #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+

@@ -3,7 +3,7 @@
   "@graph": [
     {
       "@id": "_:creationinfo",
-      "created": "2026-06-09T10:00:45Z",
+      "created": "2026-06-09T10:22:59Z",
       "createdBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
       ],
@@ -36,6 +36,12 @@
       "creationInfo": "_:creationinfo",
       "name": "The CFFI authors",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/The-CFFI-authors",
+      "type": "Organization"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "Nathan Froyd",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/Nathan-Froyd",
       "type": "Organization"
     },
     {
@@ -78,8 +84,8 @@
       "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
       "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
       "software_homePage": "https://github.com/goenninger-b-t/dds",
-      "software_packageUrl": "pkg:github/goenninger-b-t/dds@f8dd86c",
-      "software_packageVersion": "0.0.0-dev+git.f8dd86c",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@0e325de",
+      "software_packageVersion": "0.0.0-dev+git.0e325de",
       "software_primaryPurpose": "library",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
@@ -126,6 +132,27 @@
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-cffi",
       "to": [
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "chipz",
+      "software_downloadLocation": "https://github.com/froydnj/chipz",
+      "software_packageUrl": "pkg:generic/chipz",
+      "software_packageVersion": "0.8",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/Nathan-Froyd",
+      "type": "software_Package"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-chipz",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/chipz"
       ],
       "type": "Relationship"
     },
@@ -178,10 +205,12 @@
       "element": [
         "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
+        "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-cffi",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-chipz",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl"
       ],
@@ -202,6 +231,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#agent/frank-goenninger",
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-bordeaux-threads-authors",
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-CFFI-authors",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/Nathan-Froyd",
         "https://github.com/goenninger-b-t/dds/sbom#agent/Stelian-Ionescu-sionescu",
         "https://github.com/goenninger-b-t/dds/sbom#tool/generate-sbom",
         "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
@@ -210,6 +240,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
         "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
+        "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
         "https://github.com/goenninger-b-t/dds/sbom#sbom",

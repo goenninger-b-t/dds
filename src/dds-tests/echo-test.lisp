@@ -223,6 +223,7 @@
                  ("xtypes-assignability"     . run-assignability-test)
                  ("xtypes-typeobject-cdr"    . run-typeobject-cdr-test)
                  ("xtypes-type-information"  . run-type-information-test)
+                 ("xtypes-type-object-lb"    . run-type-object-lb-test)
                  ("sedp-type-information"    . run-sedp-type-information-test)
                  ("zero-alloc-into"          . run-generated-into-test)
                  ("rtps-wire-byte-exact"     . run-rtps-wire-test)

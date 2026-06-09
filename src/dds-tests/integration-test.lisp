@@ -1136,6 +1136,37 @@
               "a type with a nested dependency carries a larger TypeInformation")))
   t)
 
+;;; Inbound RTI PID_TYPE_OBJECT_LB inflate (ADR 0009, FR-TYPE-3): a ZLIB-compressed
+;;; COMPLETE TypeObject inflates byte-exact, and a malformed / oversized / wrong-class /
+;;; truncated LB rejects (bounds + resource guard, NFR-SEC-POSTURE). The LB vector below is
+;;; a deterministic ZLIB stream (header + stored block) for the 60-octet i*7 pattern.
+
+(declaim (ftype (function () t) run-type-object-lb-test))
+(defun run-type-object-lb-test ()
+  (let ((lb (coerce '(1 0 0 0 60 0 0 0 71 0 0 0 120 218 1 60 0 195 255
+                      0 7 14 21 28 35 42 49 56 63 70 77 84 91 98 105 112 119 126 133
+                      140 147 154 161 168 175 182 189 196 203 210 217 224 231 238 245
+                      252 3 10 17 24 31 38 45 52 59 66 73 80 87 94 101 108 115 122 129
+                      136 143 150 157 196 116 25 103)
+                    '(simple-array (unsigned-byte 8) (*))))
+        (expected (coerce (loop for i below 60 collect (mod (* i 7) 256))
+                          '(simple-array (unsigned-byte 8) (*)))))
+    (%check :tol-inflate (equalp (dds.types:inflate-type-object-lb lb) expected)
+            "PID_TYPE_OBJECT_LB ZLIB inflate recovers the declared bytes byte-exact")
+    (let ((bad (copy-seq lb)))
+      (setf (aref bad 0) 2)
+      (%check :tol-bad-class (null (dds.types:inflate-type-object-lb bad))
+              "non-ZLIB compression class rejects"))
+    (let ((bad (copy-seq lb)))
+      (setf (aref bad 4) 0 (aref bad 5) 0 (aref bad 6) 0 (aref bad 7) #xff)
+      (%check :tol-guard (null (dds.types:inflate-type-object-lb bad))
+              "uncompressed length over *max-type-object-bytes* rejects before inflate"))
+    (%check :tol-short (null (dds.types:inflate-type-object-lb lb 0 20))
+            "a truncated LB (compressed_length exceeds extent) rejects")
+    (%check :tol-tiny (null (dds.types:inflate-type-object-lb lb 0 8))
+            "a sub-header LB rejects"))
+  t)
+
 ;;; PID_TYPE_INFORMATION end-to-end (M4 step b2a, FR-TYPE-3): a generated type's
 ;;; TypeInformation rides the SEDP endpoint ParameterList. Proves the dds-types codec and
 ;;; the dds-rtps opaque wire mechanism interoperate (emit only; match enforcement deferred

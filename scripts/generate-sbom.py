@@ -39,6 +39,9 @@ COMPONENTS = {
     "bordeaux-threads": {"version": "0.9.4", "license": "MIT",
                          "download": "https://github.com/sionescu/bordeaux-threads",
                          "supplier": "The bordeaux-threads authors"},
+    "chipz":            {"version": "0.8", "license": "BSD-3-Clause",
+                         "download": "https://github.com/froydnj/chipz",
+                         "supplier": "Nathan Froyd"},
 }
 
 

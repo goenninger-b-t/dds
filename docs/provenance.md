@@ -155,7 +155,20 @@ behavioural-reference-via-interop use, not a clean-room breach:
 | `static-vectors` | off-heap octet buffers (NFR-MEM) | MIT |
 | `cffi` | FFI (sockets/SHMEM/crypto later) | MIT |
 | `bordeaux-threads` | portable threads/locks | MIT |
+| `chipz` | pure-Lisp ZLIB inflate of inbound RTI `PID_TYPE_OBJECT_LB` (ADR 0009; control plane, off the hot path) | BSD-3-Clause |
 | Quicklisp | dependency loading (dev) | — |
 | Clasp `boehmprecise` | the M0 target implementation | LGPL-2.1 (runtime) |
 
 Pinning/vendoring of hot-path dependencies (NFR-BUILD) is a tracked M1 follow-up.
+
+## M4 (2026-06-09) — inbound RTI PID_TYPE_OBJECT_LB (ADR 0009)
+
+- **`chipz` 0.8 (BSD-3-Clause, Nathan Froyd)** added as a runtime dependency for ZLIB
+  inflate of Connext's vendor `PID_TYPE_OBJECT_LB` (the compressed COMPLETE TypeObject).
+  Pure-Lisp (no native libz), control plane only — justified per the operating contract §9.
+- **RTI `PID_TYPE_OBJECT_LB` (0x8021) wire layout is reverse-engineered from the live
+  Connext 7.3.1 wire** (clean-room — observed bytes via tshark, no RTI source/headers): a
+  little-endian header `compression_class_id u32 (1=ZLIB) + uncompressed_length u32 +
+  compressed_length u32` followed by the zlib stream. This is an RTI-vendor parameter, NOT
+  an OMG-spec construct; treated as a behavioural interop reference (NFR-IP). →
+  `src/dds-types/type-object-lb.lisp` (`inflate-type-object-lb`).
