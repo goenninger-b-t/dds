@@ -82,6 +82,17 @@ unconfirmed (no wire oracle exists for it in this Connext configuration).
   (0x0075) to a **foreign-vendor** peer (our non-RTI `square-sub` ↔ Connext
   `shapes-pub`) and/or for a type larger than its inline-TypeObject threshold. If yes,
   the hash fast-path is reachable in real deployments; if no, it is RTI-unreachable.
+  - **RESOLVED (2026-06-09): NO.** With our stack advertising a non-zero VendorId
+    (`0x01FF`, FR-RTPS-2) and reliable builtin-SEDP ACKNACK in place, Connext **did**
+    push its SEDP publication `DATA(w)` to our foreign-vendor reader — and it carried
+    **`PID_TYPE_OBJECT_LB` (0x8021)**, the compressed complete TypeObject, **and no
+    `PID_TYPE_INFORMATION` (0x0075)**. So Connext 7.3.1 uses the vendor LB form
+    **universally** for this (small) type — foreign vendor or not. The minimal-hash
+    fast-path is therefore **not reachable against Connext**; the decision above (match
+    by name + structural assignability over the LB-carried complete TypeObject) stands,
+    and the `PID_TYPE_OBJECT_LB` inbound reader is the **required** path, not optional.
+    (A large type past Connext's inline threshold may still elicit TypeLookup/0x0075 —
+    untested — but cannot be relied on.)
 - **Align the oracle type:** `interop/connext/common/ShapeType.idl` must be made to match
   our generated type exactly for any future byte comparison — either bound our `color` at
   255 to match `rtiddsgen`'s default, or generate Connext with a truly-unbounded string

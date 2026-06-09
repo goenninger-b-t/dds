@@ -51,6 +51,8 @@
   (samples (make-hash-table :test 'eql) :type hash-table)
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
+  (builtin-readers (make-hash-table :test 'equalp) :type hash-table) ; remote 12-octet prefix -> reliable SEDP reader
+
   (on-data nil :type (or null function))
   (on-heartbeat nil :type (or null function))
   (on-acknack nil :type (or null function))
@@ -232,6 +234,93 @@
                    (lambda (c) (dds.rtps.discovery:serialize-endpoint-data c ep))
                    host port))
 
+;;; ---- Reliable builtin (SEDP) discovery: ACKNACK remote builtin writers so a
+;;; reliable peer (e.g. RTI Connext) pushes its SEDP DATA(w)/(r). A remote builtin
+;;; writer (pub 0x...03c2 / sub 0x...04c2) is RELIABLE; without an ACKNACK it never
+;;; sends its endpoint data. Builtin writers share their EntityId across participants,
+;;; so SN state is tracked per remote participant (12-octet source GUID prefix).
+
+(declaim (ftype (function ((unsigned-byte 32)) (or null (unsigned-byte 32))) %sedp-reader-id-for))
+(defun %sedp-reader-id-for (writer-id)
+  "The local SEDP reader EntityId matching a remote builtin SEDP writer WRITER-ID
+   (publications/subscriptions), or NIL if WRITER-ID is not a builtin SEDP writer."
+  (cond ((= writer-id dds.rtps.discovery:+entityid-sedp-pub-writer+)
+         dds.rtps.discovery:+entityid-sedp-pub-reader+)
+        ((= writer-id dds.rtps.discovery:+entityid-sedp-sub-writer+)
+         dds.rtps.discovery:+entityid-sedp-sub-reader+)
+        (t nil)))
+
+(declaim (ftype (function (dds.core.buffer:octet-buffer) (simple-array (unsigned-byte 8) (12))) %source-prefix))
+(defun %source-prefix (buf)
+  "The 12-octet source GUID prefix from the RTPS header of datagram BUF (offset 8; §9.4.4)."
+  (let ((p (make-array 12 :element-type '(unsigned-byte 8))))
+    (replace p (dds.core.buffer:octet-buffer-vec buf) :start2 8 :end2 20)
+    p))
+
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12))) t) %builtin-reader-nl))
+(defun %builtin-reader-nl (node prefix)
+  "Get/create the per-remote reliable SEDP reader for PREFIX. CALLER HOLDS the node lock."
+  (or (gethash prefix (disc-node-builtin-readers node))
+      (setf (gethash (copy-seq prefix) (disc-node-builtin-readers node))
+            (dds.rtps.reliable:make-rtps-reader))))
+
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) &optional (or null integer) (or null integer))
+                          (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32))) %builtin-acknack-values))
+(defun %builtin-acknack-values (node prefix wid &optional hb-first hb-last)
+  "Under the node lock: optionally apply a HEARTBEAT range [HB-FIRST, HB-LAST] to the
+   per-remote SEDP reader for WID, then compute its ACKNACK. Returns (values base numbits
+   bitmap count). BITMAP is freshly allocated so it is safe to use outside the lock."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((reader (%builtin-reader-nl node prefix)))
+      (when (and hb-first hb-last)
+        (dds.rtps.reliable:reader-on-heartbeat reader wid hb-first hb-last))
+      (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
+        (values base numbits bitmap (incf (disc-node-ack-count node)))))))
+
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer) t) %builtin-on-data))
+(defun %builtin-on-data (node prefix wid sn)
+  "Under the node lock: record a received builtin SEDP DATA SN from remote PREFIX's
+   writer WID so the next ACKNACK advances past it (stops the reliable retransmit)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (dds.rtps.reliable:reader-on-data (%builtin-reader-nl node prefix) wid sn :sedp)))
+
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12))) (or null cons)) %remote-metatraffic))
+(defun %remote-metatraffic (node prefix)
+  "The (host . port) of participant PREFIX's metatraffic unicast locator, or NIL."
+  (let ((spdp (dds.pal:with-lock ((disc-node-lock node))
+                (gethash prefix (disc-node-discovered node)))))
+    (when spdp
+      (let ((loc (dds.rtps.discovery:usable-udpv4-locator
+                  (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators spdp))))
+        (when loc
+          (let ((port (%locator-port (dds.rtps.discovery:locator-port loc))))
+            (when (plusp port)
+              (cons (dds.rtps.discovery:locator-ipv4-string loc) port))))))))
+
+(declaim (ftype (function (disc-node dds.core.buffer:octet-buffer (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32) t string (unsigned-byte 16)) t) %send-acknack))
+(defun %send-acknack (node buf reader-id writer-id base numbits bitmap count final host port)
+  "Build an RTPS message (Header + ACKNACK) into BUF and send it to HOST:PORT. BUF is the
+   caller-thread scratch buffer (tx-msg on the announce thread, rx-tx-msg on the receiver)."
+  (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
+    (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
+    (dds.rtps.message:write-acknack mc reader-id writer-id base numbits bitmap count :final final)
+    (dds.xport:send (disc-node-transport node)
+                    (dds.xport.udp:make-udp-locator :host host :port port)
+                    buf 0 (dds.core.buffer:cursor-position mc))))
+
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer integer) t) %on-builtin-heartbeat))
+(defun %on-builtin-heartbeat (node prefix wid first last)
+  "Receiver-thread: a HEARTBEAT from remote PREFIX's builtin SEDP writer WID. Apply its
+   range, then ACKNACK to that participant's metatraffic locator to pull its SEDP. Uses
+   the receiver-thread rx-tx-msg buffer."
+  (let ((rid (%sedp-reader-id-for wid))
+        (hp (%remote-metatraffic node prefix)))
+    (when (and rid hp)
+      (multiple-value-bind (base numbits bitmap count)
+          (%builtin-acknack-values node prefix wid first last)
+        (%send-acknack node (disc-node-rx-tx-msg node) rid wid base numbits bitmap count
+                       t (car hp) (cdr hp))))))
+
 (declaim (ftype (function (disc-node) (eql t)) announce-endpoints))
 (defun announce-endpoints (node)
   "Send NODE's local publications (SEDP publications writer) and subscriptions
@@ -252,7 +341,19 @@
             (%send-endpoint node
                             dds.rtps.discovery:+entityid-sedp-sub-reader+
                             dds.rtps.discovery:+entityid-sedp-sub-writer+
-                            r host port))))))
+                            r host port))
+          ;; Pre-emptive ACKNACK to the peer's reliable builtin SEDP writers so it
+          ;; pushes its publication/subscription endpoint data (RTPS 2.5 §8.4.10.4).
+          ;; non-final -> solicit a HEARTBEAT; the per-remote reader advances the ACK
+          ;; as the SEDP arrives, so this stops soliciting once endpoints are in.
+          (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix p)))
+            (dolist (wid (list dds.rtps.discovery:+entityid-sedp-pub-writer+
+                               dds.rtps.discovery:+entityid-sedp-sub-writer+))
+              (multiple-value-bind (base numbits bitmap count)
+                  (%builtin-acknack-values node prefix wid)
+                (%send-acknack node (disc-node-tx-msg node)
+                               (%sedp-reader-id-for wid) wid base numbits bitmap count
+                               nil host port))))))))
   t)
 
 (declaim (ftype (function (disc-node dds.rtps.discovery:spdp-data) t) %record-participant))
@@ -393,7 +494,8 @@
    plus HEARTBEAT/ACKNACK -> the installed data-plane hooks (nil = ignore). The
    discovery SerializedPayloads are ParameterLists (encap header + list); a user
    DATA payload is opaque bytes handed to the on-data hook as a [poff,plen) region."
-  (let ((cursor (dds.core.buffer:cursor buf :endianness :little)))
+  (let ((cursor (dds.core.buffer:cursor buf :endianness :little))
+        (src-prefix (%source-prefix buf)))
     (dds.rtps.message:dispatch-message
      cursor
      (lambda (id flags c body-len)
@@ -418,7 +520,8 @@
                      (when ep
                        (dds.pal:with-lock ((disc-node-lock node))
                          (%record-discovered (disc-node-discovered-writers node) ep))
-                       (%match-remote-writer node ep)))))
+                       (%match-remote-writer node ep))
+                     (%builtin-on-data node src-prefix wtr sn))))
                 ((= wtr dds.rtps.discovery:+entityid-sedp-sub-writer+)
                  (let ((pc (dds.core.buffer:cursor buf :endianness :little)))
                    (dds.core.buffer:cursor-set-position pc poff)
@@ -427,11 +530,21 @@
                      (when ep
                        (dds.pal:with-lock ((disc-node-lock node))
                          (%record-discovered (disc-node-discovered-readers node) ep))
-                       (%match-remote-reader node ep)))))
+                       (%match-remote-reader node ep))
+                     (%builtin-on-data node src-prefix wtr sn))))
                 ((disc-node-on-data node)
                  (funcall (disc-node-on-data node) wtr sn buf poff plen))))))
-         ((and (= id dds.rtps.message:+submsg-heartbeat+) (disc-node-on-heartbeat node))
-          (funcall (disc-node-on-heartbeat node) c flags))
+         ((= id dds.rtps.message:+submsg-heartbeat+)
+          (let ((pos (dds.core.buffer:cursor-position c)))
+            (multiple-value-bind (rid wid first last hcount hfinal hlive)
+                (dds.rtps.message:parse-heartbeat-body c flags)
+              (declare (ignore rid hcount hfinal hlive))
+              (cond
+                ((%sedp-reader-id-for wid)
+                 (%on-builtin-heartbeat node src-prefix wid first last))
+                ((disc-node-on-heartbeat node)
+                 (dds.core.buffer:cursor-set-position c pos)
+                 (funcall (disc-node-on-heartbeat node) c flags))))))
          ((and (= id dds.rtps.message:+submsg-acknack+) (disc-node-on-acknack node))
           (funcall (disc-node-on-acknack node) c flags))))
      size)
