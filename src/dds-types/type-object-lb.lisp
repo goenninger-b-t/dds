@@ -50,3 +50,38 @@
                            (error () nil))))
           (when (and inflated (= (length inflated) ulen))
             (coerce inflated '(simple-array (unsigned-byte 8) (*)))))))))
+
+;;;; Type FINGERPRINT (heuristic, not a structural parse). RTI's legacy TypeObject (what
+;;;; PID_TYPE_OBJECT_LB carries) is a vendor-proprietary "TypeLibrary" binary, NOT the OMG
+;;;; CompleteTypeObject — a full parse is a large RTI-format reverse-engineering effort (see
+;;;; ADR 0009). As a lightweight stand-in, these extract the literal strings RTI embeds (the
+;;;; type name + multi-octet member names + dependent type names) for a type-aware match
+;;;; heuristic and for diagnostics. Coarse on purpose: 1-octet member names and the structure
+;;;; are not recovered; presence is confirmed, not order or shape.
+
+(declaim (ftype (function ((array (unsigned-byte 8) (*)) &optional (integer 1 #.array-dimension-limit))
+                          list) type-object-strings))
+(defun type-object-strings (octets &optional (min-length 3))
+  "The printable-ASCII runs (length >= MIN-LENGTH) in an inflated TypeObject's OCTETS, in
+   order of appearance — a coarse fingerprint of the embedded names. Heuristic, not a parse."
+  (let ((out '()) (start nil) (n (length octets)))
+    (flet ((emit (end)
+             (when (and start (>= (- end start) min-length))
+               (push (map 'string #'code-char (subseq octets start end)) out))
+             (setf start nil)))
+      (dotimes (i n)
+        (if (<= 32 (aref octets i) 126)
+            (unless start (setf start i))
+            (emit i)))
+      (emit n))
+    (nreverse out)))
+
+(declaim (ftype (function ((array (unsigned-byte 8) (*)) list) t) type-object-mentions-all-p))
+(defun type-object-mentions-all-p (octets names)
+  "T iff every string in NAMES occurs as a contiguous byte substring of the inflated
+   TypeObject OCTETS — a heuristic 'is this plausibly the type whose name + (multi-octet)
+   member names are NAMES' check (e.g. for SEDP match-time, beyond the bare type-name).
+   Coarse: it confirms presence, not structure/order, and cannot see 1-octet member names."
+  (every (lambda (name)
+           (search (map '(simple-array (unsigned-byte 8) (*)) #'char-code name) octets))
+         names))

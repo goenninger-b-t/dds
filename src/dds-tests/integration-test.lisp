@@ -1186,7 +1186,19 @@
          (needle (map '(simple-array (unsigned-byte 8) (*)) #'char-code "ShapeType")))
     (%check :tol-connext
             (and inflated (= (length inflated) 540) (search needle inflated))
-            "real Connext ShapeType PID_TYPE_OBJECT_LB inflates to the declared 540-octet TypeObject"))
+            "real Connext ShapeType PID_TYPE_OBJECT_LB inflates to the declared 540-octet TypeObject")
+    ;; lightweight type FINGERPRINT (heuristic): the embedded names identify the type.
+    (let ((strs (and inflated (dds.types:type-object-strings inflated))))
+      (%check :tol-fingerprint
+              (and (member "ShapeType" strs :test #'string=)
+                   (member "color" strs :test #'string=)
+                   (member "shapesize" strs :test #'string=)
+                   (member "string_255_character" strs :test #'string=))
+              "type-object-strings recovers the ShapeType type/member/dependent names")
+      (%check :tol-mentions
+              (and (dds.types:type-object-mentions-all-p inflated '("ShapeType" "color" "shapesize"))
+                   (not (dds.types:type-object-mentions-all-p inflated '("ShapeType" "NotAMember"))))
+              "type-object-mentions-all-p: plausible names match, a bogus name does not")))
   t)
 
 ;;; PID_TYPE_INFORMATION end-to-end (M4 step b2a, FR-TYPE-3): a generated type's
