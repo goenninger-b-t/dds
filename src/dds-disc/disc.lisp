@@ -269,8 +269,7 @@
       (setf (gethash (copy-seq prefix) (disc-node-builtin-readers node))
             (dds.rtps.reliable:make-rtps-reader))))
 
-(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) &optional (or null integer) (or null integer))
-                          (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32))) %builtin-acknack-values))
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) &optional (or null integer) (or null integer)) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32))) %builtin-acknack-values))
 (defun %builtin-acknack-values (node prefix wid &optional hb-first hb-last)
   "Under the node lock: optionally apply a HEARTBEAT range [HB-FIRST, HB-LAST] to the
    per-remote SEDP reader for WID, then compute its ACKNACK. Returns (values base numbits

@@ -12,9 +12,13 @@
 
 (defclass entity ()
   ((qos :initarg :qos :initform nil :accessor entity-qos)
-   (enabled :initarg :enabled :initform nil :accessor entity-enabled-p))
+   (enabled :initarg :enabled :initform nil :accessor entity-enabled-p)
+   (type-compat :initform nil :accessor entity-type-compat))
   (:documentation "Base DDS Entity: carries the QoS and the enabled flag shared by all
-   DCPS entities (DomainParticipant, Publisher/Subscriber, Topic, DataWriter/DataReader)."))
+   DCPS entities (DomainParticipant, Publisher/Subscriber, Topic, DataWriter/DataReader).
+   TYPE-COMPAT holds the ADVISORY type-object fingerprint verdict for the most recently
+   matched remote endpoint (ADR 0009; DataReader/DataWriter only, NIL on other entities and
+   until a first match) — a heuristic signal, never a match gate; see ENTITY-TYPE-COMPAT."))
 
 (defclass domain-participant (entity)
   ((domain :initarg :domain :reader dp-domain)
@@ -429,15 +433,58 @@
 ;;;      a snapshot OUTSIDE the lock (a listener must never deadlock the receiver).
 ;;;      Reading a status (get_*_status) resets its *_change counters per DDS 1.4.
 
-(declaim (ftype (function (domain-participant keyword dds.rtps.discovery:endpoint-data) t) %on-disc-match))
-(defun %on-disc-match (p kind remote)
+(defvar *type-compat-log* nil
+  "When bound/set to a stream, %ON-DISC-MATCH writes a one-line ADVISORY type-object
+   fingerprint verdict (ADR 0009) for each freshly matched remote to it; NIL (the default)
+   silences it. A diagnostics opt-in only — the verdict never affects matching, and is also
+   recorded on the matched entity for inspection via ENTITY-TYPE-COMPAT. NOTE: %ON-DISC-MATCH
+   runs on the discovery receiver thread, so set this with a process-global SETF (not a
+   thread-local LET in another thread) to observe it from a live participant.")
+
+(defun* %entity-type-support (entity)
+    (function (entity) (or null dds.types:type-support))
+  "The type-support behind a matched ENTITY's Topic, for the soft type-compat check; NIL
+   unless ENTITY is a DataReader/DataWriter (the only entities %ON-DISC-MATCH records against)."
+  (typecase entity
+    (data-reader (topic-type-support (dr-topic entity)))
+    (data-writer (topic-type-support (dw-topic entity)))
+    (t nil)))
+
+(defun* %assess-and-record-type-compat (entity remote)
+    (function (entity dds.rtps.discovery:endpoint-data) (or null keyword))
+  "ADVISORY (ADR 0009): assess REMOTE's advertised complete TypeObject (the RTI vendor
+   PID_TYPE_OBJECT_LB it carries, if any) against ENTITY's local type and record the verdict
+   on ENTITY (ENTITY-TYPE-COMPAT) for inspection. NEVER affects matching — the peer already
+   passed the topic+type-name gate in dds-disc. Logs one line to *TYPE-COMPAT-LOG* when set.
+   Returns the verdict keyword (see DDS.TYPES:ASSESS-TYPE-OBJECT-LB), or NIL when ENTITY has
+   no type-support."
+  (let ((ts (%entity-type-support entity)))
+    (when ts
+      (multiple-value-bind (verdict missing)
+          (dds.types:assess-type-object-lb
+           ts (dds.rtps.discovery:endpoint-data-type-object-lb remote))
+        (setf (entity-type-compat entity) verdict)
+        (when *type-compat-log*
+          (format *type-compat-log* "~&; type-compat[~a/~a]: ~a~@[ — missing ~{~a~^, ~}~]~%"
+                  (dds.rtps.discovery:endpoint-data-topic-name remote)
+                  (dds.rtps.discovery:endpoint-data-type-name remote)
+                  verdict missing))
+        verdict))))
+
+(defun* %on-disc-match (p kind remote)
+    (function (domain-participant keyword dds.rtps.discovery:endpoint-data) t)
   "ON-MATCH hook: a remote endpoint matched a local one. :remote-writer -> our reader
    gained a publication (SUBSCRIPTION_MATCHED); :remote-reader -> our writer gained a
-   subscription (PUBLICATION_MATCHED). The 16-octet remote GUID is the matched handle."
+   subscription (PUBLICATION_MATCHED). The 16-octet remote GUID is the matched handle.
+   Also records an ADVISORY type-object fingerprint verdict on the local entity (ADR 0009)."
   (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
     (ecase kind
-      (:remote-writer (let ((dr (dp-user-reader p))) (when dr (%reader-matched dr handle))))
-      (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-matched dw handle))))))
+      (:remote-writer (let ((dr (dp-user-reader p)))
+                        (when dr (%reader-matched dr handle)
+                              (%assess-and-record-type-compat dr remote))))
+      (:remote-reader (let ((dw (dp-user-writer p)))
+                        (when dw (%writer-matched dw handle)
+                              (%assess-and-record-type-compat dw remote))))))
   t)
 
 (declaim (ftype (function (domain-participant keyword dds.rtps.discovery:endpoint-data list) t) %on-disc-incompatible))

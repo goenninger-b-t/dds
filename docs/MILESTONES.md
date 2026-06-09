@@ -48,3 +48,16 @@ TypeLookup, with minimal-hash equality only an opportunistic fast-path (ADR 0009
 decompressed complete TypeObject **did** confirm `@final`, member ids 0..3, `@key color`,
 three `INT_32`. Open: does Connext emit `0x0075` to a **foreign-vendor** peer or for a
 larger type? That decides whether the hash fast-path is ever reachable.
+
+**Update (2026-06-09).** The foreign-vendor question is **resolved: no** — with our stack
+on VendorId `0x01FF` + reliable SEDP, Connext pushed its SEDP to our foreign-vendor reader
+carrying `PID_TYPE_OBJECT_LB` and **no** `0x0075`, so the LB reader is the **required** path,
+not optional. The inbound LB path landed in increments: `inflate-type-object-lb` (ZLIB +
+`*max-type-object-bytes*` guard, `chipz`), SEDP capture (`+pid-type-object-lb+` 0x8021 →
+`endpoint-data-type-object-lb`, opaque at L4), and a type **fingerprint**
+(`type-object-strings` / `type-object-mentions-all-p`) — the inflated payload is RTI's
+proprietary legacy TypeObject, so the full structural parse is deferred (robustness-only).
+On top of that an **advisory** match-time hook landed: `assess-type-object-lb` +
+`type-support-fingerprint-names` yield a verdict that DCPS `%on-disc-match` records per matched
+endpoint (`entity-type-compat`) and can log (`*type-compat-log*`) — **advisory only, never a
+match gate** (ADR 0009). `b2b` (minimal-hash equality enforcement) stays retired.

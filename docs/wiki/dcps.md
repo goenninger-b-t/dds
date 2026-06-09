@@ -118,6 +118,15 @@ its `*_change` counters (DDS read-resets-change semantics).
 | `dds.dcps:on-inconsistent-topic` (`l topic status`) | TopicListener callback that fires in v1. |
 | `dds.dcps:on-requested-deadline-missed` / `on-sample-lost` / `on-liveliness-changed` (`l reader status`); `dds.dcps:on-offered-deadline-missed` / `on-liveliness-lost` (`l writer status`) | Defined for subclassing; **not yet fired** in v1 (the underlying statuses are deferred). |
 
+### Advisory type-compatibility (ADR 0009)
+
+When a remote endpoint matches a local DataReader/DataWriter, the matcher assesses the peer's advertised complete TypeObject (the RTI vendor `PID_TYPE_OBJECT_LB`, when the peer carries one) against the local type's member-name fingerprint and records the verdict on the local entity. This is **purely advisory / diagnostic** — the peer is already matched on topic + type name, and the heuristic **never gates or rejects a match** (RTI's legacy TypeObject is not the OMG CompleteTypeObject, so a missing name is inconclusive). See [type system](type-system.md) for the fingerprint and the verdict keywords.
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:entity-type-compat` (`entity`) | The advisory type-object fingerprint verdict for the most recently matched remote, recorded per DataReader/DataWriter (one of the `assess-type-object-lb` verdict keywords); `NIL` on other entities and until a first match. Inspection only — it never affects matching. |
+| `dds.dcps:*type-compat-log*` | When set to a stream (default `NIL` = silent), the matcher writes one advisory verdict line per freshly matched remote to it. Diagnostics opt-in only. The matcher runs on the discovery receiver thread, so set this with a process-global `setf`, not a thread-local `let` in another thread. |
+
 ### Content-filtered topics + query conditions
 
 | Symbol | Description |

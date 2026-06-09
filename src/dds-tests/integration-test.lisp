@@ -1231,6 +1231,84 @@
                 "captured LB inflates + fingerprints to the peer's ShapeType type"))))
   t)
 
+;;; ADVISORY soft type-compatibility (ADR 0009): the LOCAL type's >=2-octet member-name
+;;; fingerprint vs a peer's inbound RTI PID_TYPE_OBJECT_LB. A heuristic confirmation /
+;;; diagnostic — NEVER a match gate (the peer already matched on topic + type name, and
+;;; RTI's legacy TypeObject is not the OMG CompleteTypeObject), so a missing name is
+;;; inconclusive and must not reject a peer.
+
+(declaim (ftype (function () t) run-type-compat-soft-test))
+(defun run-type-compat-soft-test ()
+  "ASSESS-TYPE-OBJECT-LB verdicts + TYPE-SUPPORT-FINGERPRINT-NAMES against the real Connext
+   ShapeType LB: the local shape-type's member names are present in the peer's inflated
+   TypeObject (:names-present); a type whose member is absent yields :names-absent (+ the
+   missing list); no LB / an un-inflatable LB / a local type with no struct TypeObject yield
+   the other documented advisory verdicts. None ever rejects a peer (ADR 0009)."
+  (let ((shape (dds.types:find-type-support "shape-type"))
+        (msg   (dds.types:find-type-support "dcps-msg"))
+        (rti-lb (%connext-shape-type-lb)))
+    (let ((names (dds.types:type-support-fingerprint-names shape)))
+      (%check :tcs-fingerprint
+              (and (member "color" names :test #'string=)
+                   (member "shapesize" names :test #'string=)
+                   (not (member "x" names :test #'string=))            ; 1-octet name dropped
+                   (not (member "shape-type" names :test #'string=)))  ; struct type name excluded
+              "fingerprint = >=2-octet MEMBER names; 1-octet names + the struct type name excluded"))
+    (%check :tcs-names-present
+            (eq :names-present (dds.types:assess-type-object-lb shape rti-lb))
+            "every local shape-type member name present in the Connext ShapeType LB -> :names-present")
+    (multiple-value-bind (verdict missing) (dds.types:assess-type-object-lb msg rti-lb)
+      (%check :tcs-names-absent
+              (and (eq :names-absent verdict) (member "text" missing :test #'string=))
+              "dcps-msg's 'text' member is absent from the ShapeType LB -> :names-absent (+ missing)"))
+    (%check :tcs-no-type-object
+            (eq :no-type-object (dds.types:assess-type-object-lb shape nil))
+            "a peer that advertised no PID_TYPE_OBJECT_LB -> :no-type-object")
+    (%check :tcs-inflate-failed
+            (eq :inflate-failed
+                (dds.types:assess-type-object-lb
+                 shape (coerce '(1 0 0 0 4 0 0 0 4 0 0 0 9 9 9 9)
+                               '(simple-array (unsigned-byte 8) (*)))))
+            "a present-but-uninflatable LB (ZLIB class, bad deflate stream) -> :inflate-failed")
+    (%check :tcs-not-assessable
+            (eq :not-assessable
+                (dds.types:assess-type-object-lb (dds.types:make-type-support :name "empty") rti-lb))
+            "a local type with no struct TypeObject -> :not-assessable"))
+  t)
+
+;;; DCPS wiring of the advisory verdict (ADR 0009): %ON-DISC-MATCH records the matched
+;;; peer's PID_TYPE_OBJECT_LB fingerprint verdict on the local DataReader/DataWriter via
+;;; ENTITY-TYPE-COMPAT (inspection) and writes one line to *TYPE-COMPAT-LOG* when bound.
+
+(declaim (ftype (function () t) run-dcps-type-compat-test))
+(defun run-dcps-type-compat-test ()
+  "%ON-DISC-MATCH assesses a freshly matched peer's PID_TYPE_OBJECT_LB against the local
+   type and records the verdict on the local DataReader (ENTITY-TYPE-COMPAT), also writing
+   one advisory line to *TYPE-COMPAT-LOG* when bound; it never gates the match (ADR 0009)."
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "CompatTopic" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp))
+                (remote (dds.rtps.discovery:make-endpoint-data
+                         :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7)
+                         :topic-name "CompatTopic" :type-name "ShapeType"
+                         :type-object-lb (%connext-shape-type-lb)))
+                (log (make-string-output-stream)))
+           (%check :tc-initial (null (dds.dcps:entity-type-compat dr))
+                   "type-compat is NIL on a fresh DataReader (no match assessed yet)")
+           (let ((dds.dcps:*type-compat-log* log))
+             (dds.dcps::%on-disc-match p :remote-writer remote))
+           (%check :tc-recorded (eq :names-present (dds.dcps:entity-type-compat dr))
+                   "the matched peer's ShapeType LB fingerprints :names-present and is recorded")
+           (%check :tc-logged
+                   (let ((s (string-downcase (get-output-stream-string log))))
+                     (and (search "type-compat" s) (search "names-present" s)))
+                   "*type-compat-log*, when bound, receives one advisory verdict line"))
+      (dds.dcps:delete-participant p))
+    t))
+
 ;;; PID_TYPE_INFORMATION end-to-end (M4 step b2a, FR-TYPE-3): a generated type's
 ;;; TypeInformation rides the SEDP endpoint ParameterList. Proves the dds-types codec and
 ;;; the dds-rtps opaque wire mechanism interoperate (emit only; match enforcement deferred

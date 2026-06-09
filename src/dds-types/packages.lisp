@@ -5,7 +5,7 @@
 
 (defpackage #:net.goenninger.dds.types
   (:nicknames #:dds.types)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "Per-type type-support vtable + registry (IMPLEMENTATION-PLAN §7.3). Engine
     hot-path code sees only a type-support and funcalls its slots; it never sees
@@ -52,6 +52,7 @@
            #:inflate-type-object-lb #:*max-type-object-bytes*
            #:+type-object-lb-compression-zlib+
            #:type-object-strings #:type-object-mentions-all-p
+           #:type-support-fingerprint-names #:assess-type-object-lb
            #:+tk-boolean+ #:+tk-byte+ #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
            #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
            #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+

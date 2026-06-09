@@ -100,6 +100,16 @@ unconfirmed (no wire oracle exists for it in this Connext configuration).
   harness README is wrong and is corrected alongside this ADR.
 - **Implement** the `PID_TYPE_OBJECT_LB` inbound reader (ZLIB + complete TypeObject parse)
   and wire it into SEDP match-time assignability.
+  - **PARTIAL (2026-06-09).** The inbound reader landed as ZLIB inflate + SEDP capture
+    (`inflate-type-object-lb`, `+pid-type-object-lb+`, `endpoint-data-type-object-lb`).
+    The full **structural** parse is deferred (the inflated payload is RTI's proprietary
+    legacy TypeObject, not the OMG `CompleteTypeObject` — a large reverse-engineering effort,
+    robustness-only). In its place an **advisory** match-time hook landed: `assess-type-object-lb`
+    + `type-support-fingerprint-names` (dds-types) yield a fingerprint verdict that DCPS
+    `%on-disc-match` records per matched DataReader/DataWriter (`entity-type-compat`) and can
+    log (`*type-compat-log*`). It is **advisory only — never a match gate** (consistent with
+    the Decision: name + structural is the rule, and a fingerprint miss against RTI's legacy
+    format is inconclusive). Tests `xtypes-type-compat-soft` + `dcps-type-compat`.
 
 ## Verification
 

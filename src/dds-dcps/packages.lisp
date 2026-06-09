@@ -3,7 +3,7 @@
 
 (defpackage #:net.goenninger.dds.dcps
   (:nicknames #:dds.dcps)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "DDS 1.4 DCPS entity model (M3/P2, FR-DCPS-1) — CLOS, control-plane. Entities
     (DomainParticipant, Publisher/Subscriber, Topic, DataWriter/DataReader) over the
@@ -13,7 +13,7 @@
     SampleInfo, conditions/WaitSets, and content-filter are later increments.")
   (:export #:entity #:domain-participant #:publisher #:subscriber
            #:topic #:data-writer #:data-reader
-           #:entity-qos #:entity-enabled-p
+           #:entity-qos #:entity-enabled-p #:entity-type-compat #:*type-compat-log*
            #:create-participant #:delete-participant
            #:create-publisher #:create-subscriber #:create-topic
            #:create-datawriter #:create-datareader

@@ -413,10 +413,7 @@
 (defconstant +data-frag-flag-key+        #x04
   "DATA_FRAG KeyFlag (K): the fragments carry the key, not the data (RTPS 2.5 §9.4.5.5).")
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer
-                           (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 16) (unsigned-byte 16)
-                           (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum)
-                write-data-frag))
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 16) (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum) write-data-frag))
 (defun write-data-frag (cursor reader-id writer-id sn sample-size frag-start frags-in-submsg frag-size
                         payload payload-off payload-len &key key)
   "Write one DATA_FRAG submessage (RTPS 2.5 §9.4.5.5), no inlineQos. Carries the bytes
