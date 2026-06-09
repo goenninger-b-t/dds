@@ -565,6 +565,27 @@
             "a fully-received sample yields NIL (entry already removed)"))
   t)
 
+;;; Writer-side fragmentation planner (RTPS 2.5 §8.3.8.3).
+
+(defun* run-frag-plan-test ()
+    (function () t)
+  "Test: writer-frag-plan packs fragments per budget and covers the sample; writer-frag-plan-for
+   re-plans exactly the NACKed fragments (RTPS 2.5 §8.3.8.3)."
+  (let ((plan (dds.rtps.reliable:writer-frag-plan 2500 1024 2048)))
+    (%check :wfp-count (= 2 (length plan)) "two submessages for 2500B @1024, budget 2048")
+    (destructuring-bind ((f1 c1 o1 l1) (f2 c2 o2 l2)) plan
+      (%check :wfp-s1 (and (= f1 1) (= c1 2) (= o1 0) (= l1 2048)) "submsg1: frags 1-2, 2048B")
+      (%check :wfp-s2 (and (= f2 3) (= c2 1) (= o2 2048) (= l2 452)) "submsg2: frag 3, 452B")))
+  (let ((plan (dds.rtps.reliable:writer-frag-plan 2500 1024 1024)))
+    (%check :wfp-perfrag (= 3 (length plan)) "budget=fragment-size -> one fragment per submessage"))
+  (let ((bitmap (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+    (dds.rtps.message:fragnum-set-bit bitmap 0)   ; frag 2 (base 2, delta 0)
+    (dds.rtps.message:fragnum-set-bit bitmap 2)   ; frag 4 (delta 2)
+    (let ((plan (dds.rtps.reliable:writer-frag-plan-for 500 100 2 3 bitmap)))
+      (%check :wfpf (equal '((2 1 100 100) (4 1 300 100)) plan)
+              "NACK resend plans exactly frags 2 and 4, one per submessage")))
+  t)
+
 ;;; NACK_FRAG round-trip (RTPS 2.5 §9.4.5.14): 24+4*M body, only E flag.
 
 (defun* run-nack-frag-test ()

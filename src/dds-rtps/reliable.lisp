@@ -236,3 +236,38 @@
               when (zerop (sbit rcv (1- f)))
                 do (dds.rtps.message:fragnum-set-bit bitmap (- f base)))
         (values base numbits bitmap)))))
+
+;;; ---- Writer-side fragmentation planners (RTPS 2.5 §8.3.8.3) ----
+
+(defun* writer-frag-plan (sample-size fragment-size budget)
+    (function ((unsigned-byte 32) (unsigned-byte 32) (integer 1)) list)
+  "Plan the DATA_FRAG submessages for a SAMPLE-SIZE-octet sample at FRAGMENT-SIZE, packing as
+   many whole fragments as fit BUDGET octets per submessage (>=1). Returns a list of
+   (fragment-starting-num fragments-in-submsg payload-offset payload-length) in fragment order;
+   the final fragment of the sample may be short. fragmentSize is constant across the sample
+   (RTPS 2.5 §8.3.8.3)."
+  (let ((total (ceiling sample-size fragment-size))
+        (per (max 1 (floor budget fragment-size)))
+        (out '()))
+    (loop for fstart from 1 to total by per
+          for fcount = (min per (1+ (- total fstart)))
+          for off = (* (1- fstart) fragment-size)
+          for len = (min (* fcount fragment-size) (- sample-size off))
+          do (push (list fstart fcount off len) out))
+    (nreverse out)))
+
+(defun* writer-frag-plan-for (sample-size fragment-size base numbits bitmap)
+    (function ((unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)
+               (simple-array (unsigned-byte 32) (*))) list)
+  "Plan DATA_FRAG submessages re-sending ONLY the fragments named in a NACK_FRAG
+   FragmentNumberSet (BASE/NUMBITS/BITMAP); one fragment per submessage. Returns
+   (fragment-starting-num fragments-in-submsg payload-offset payload-length) descriptors in
+   fragment order; the final fragment may be short. RTPS 2.5 §8.3.8.3."
+  (let ((total (ceiling sample-size fragment-size))
+        (out '()))
+    (loop for f from base below (+ base numbits)
+          when (and (<= 1 f total) (dds.rtps.message:fragnum-set-member-p base numbits bitmap f))
+            do (let* ((off (* (1- f) fragment-size))
+                      (len (min fragment-size (- sample-size off))))
+                 (push (list f 1 off len) out)))
+    (nreverse out)))

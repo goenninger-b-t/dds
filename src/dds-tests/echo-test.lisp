@@ -248,6 +248,7 @@
                  ("rtps-nack-frag"           . run-nack-frag-test)
                  ("rtps-reassembly"          . run-reassembly-test)
                  ("rtps-frag-acknack"        . run-frag-acknack-test)
+                 ("rtps-frag-plan"           . run-frag-plan-test)
                  ("rtps-message-dispatch"    . run-rtps-dispatch-test)
                  ("rtps-parameterlist"       . run-paramlist-test)
                  ("rtps-port-mapping"        . run-port-mapping-test)

@@ -86,7 +86,8 @@
            #:reader-acknack #:reader-on-gap #:reader-complete-p
            #:get-writer-proxy #:writer-proxy #:writer-proxy-received
            #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments*
-           #:reader-on-data-frag #:reader-frag-acknack))
+           #:reader-on-data-frag #:reader-frag-acknack
+           #:writer-frag-plan #:writer-frag-plan-for))
 
 ;;;; dds.rtps.discovery — SPDP Locator_t codec + SPDPdiscoveredParticipantData
 ;;;; build/parse (RTPS 2.5 §8.5.3 / §9.6.2). Wire constants pinned from the in-repo
