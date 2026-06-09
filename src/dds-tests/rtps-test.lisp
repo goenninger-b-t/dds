@@ -499,3 +499,35 @@
     (%check :hbf-short (null (dds.rtps.message:parse-heartbeat-frag-body c 0))
             "a sub-24-octet HEARTBEAT_FRAG body rejects"))
   t)
+
+;;; NACK_FRAG round-trip (RTPS 2.5 §9.4.5.14): 24+4*M body, only E flag.
+
+(defun* run-nack-frag-test ()
+    (function () t)
+  "Test: NACK_FRAG write/parse round-trip incl. FragmentNumberSet (RTPS 2.5 §9.4.5.14)."
+  (let* ((buf (dds.core.buffer:make-octet-buffer 64))
+         (c (dds.core.buffer:cursor buf :endianness :little))
+         (rid #x107) (wid #x102) (sn 9) (count 4)
+         (bitmap (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+    ;; missing fragments {2,4}: base 2, numbits 3, deltas 0 and 2
+    (dds.rtps.message:fragnum-set-bit bitmap 0)
+    (dds.rtps.message:fragnum-set-bit bitmap 2)
+    (dds.rtps.message:write-nack-frag c rid wid sn 2 3 bitmap count)
+    (dds.core.buffer:cursor-reset c)
+    (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+      (declare (ignore le))
+      (%check :nf-kind (= id dds.rtps.message:+submsg-nack-frag+) "NACK_FRAG kind")
+      (%check :nf-octets (= octets 28) "NACK_FRAG body length 24+4*1=28")
+      (multiple-value-bind (r w s base numbits bm cnt) (dds.rtps.message:parse-nack-frag-body c flags)
+        (declare (ignore octets))
+        (%check :nf-fields (and (= r rid) (= w wid) (= s sn) (= cnt count)) "NACK_FRAG scalar fields")
+        (%check :nf-set
+                (and (dds.rtps.message:fragnum-set-member-p base numbits bm 2)
+                     (not (dds.rtps.message:fragnum-set-member-p base numbits bm 3))
+                     (dds.rtps.message:fragnum-set-member-p base numbits bm 4))
+                "NACK_FRAG fragment set: 2 and 4 missing, 3 not"))))
+  (let* ((buf (dds.core.buffer:make-octet-buffer 8))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    (%check :nf-short (null (dds.rtps.message:parse-nack-frag-body c 0))
+            "a sub-16-octet NACK_FRAG body rejects"))
+  t)

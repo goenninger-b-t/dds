@@ -403,6 +403,36 @@
         (count (dds.core.buffer:get-u32 cursor)))
     (values reader-id writer-id writer-sn last-fragment-num count)))
 
+;;; ---- NACK_FRAG submessage (§9.4.5.14): readerId(4)+writerId(4)+writerSN(8)+
+;;; fragmentNumberState(8+4*M)+count(4) = 24+4*M octets; only the E flag.
+
+(defun* write-nack-frag (cursor reader-id writer-id writer-sn base numbits bitmap count)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32)) fixnum)
+  "Write a NACK_FRAG submessage. RTPS 2.5 §9.4.5.14; body=24+4*M."
+  (write-submessage-header cursor +submsg-nack-frag+ (%e-flag cursor)
+                           (+ 24 (* 4 (%seqnum-set-words numbits))))
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (write-sequence-number cursor writer-sn)
+  (write-fragment-number-set cursor base numbits bitmap)
+  (dds.core.buffer:put-u32 cursor (logand count #xFFFFFFFF))
+  (dds.core.buffer:cursor-position cursor))
+
+(defun* parse-nack-frag-body (cursor flags)
+    (function (dds.core.buffer:cursor (unsigned-byte 8)) t)
+  "Parse a NACK_FRAG body. Returns (values reader-id writer-id writer-sn base numbits
+   bitmap count) or NIL on short/invalid buffer. RTPS 2.5 §9.4.5.14."
+  (declare (ignore flags))
+  (when (< (%remaining cursor) 16) (return-from parse-nack-frag-body nil))
+  (let ((reader-id (read-entity-id cursor))
+        (writer-id (read-entity-id cursor))
+        (writer-sn (read-sequence-number cursor)))
+    (multiple-value-bind (base numbits bitmap) (read-fragment-number-set cursor)
+      (when (null base) (return-from parse-nack-frag-body nil))
+      (when (< (%remaining cursor) 4) (return-from parse-nack-frag-body nil))
+      (values reader-id writer-id writer-sn base numbits bitmap
+              (dds.core.buffer:get-u32 cursor)))))
+
 ;;; ---- DATA submessage (§9.4.5.4): extraFlags + octetsToInlineQos + readerId +
 ;;; writerId + writerSN + [inlineQos if Q] + serializedPayload [if D||K]. v1 emits
 ;;; and parses the base form (Q=0; inlineQos parsing lands with the ParameterList
