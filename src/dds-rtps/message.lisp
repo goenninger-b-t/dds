@@ -230,6 +230,46 @@
         (dotimes (i m) (setf (aref bitmap i) (dds.core.buffer:get-u32 cursor)))
         (values base numbits bitmap)))))
 
+;;; ---- FragmentNumberSet (§9.4.2.8): bitmapBase (FragmentNumber, u32) + numBits
+;;; + M=ceil(numBits/32) longs; same MSB-first delta bitmap as SequenceNumberSet.
+
+(defun* fragnum-set-bit (bitmap delta)
+    (function ((simple-array (unsigned-byte 32) (*)) (integer 0)) (unsigned-byte 32))
+  "Set the bit for fragment-offset DELTA: word DELTA/32, bit (31 - DELTA%32) (§9.4.2.8)."
+  (let ((w (floor delta 32)))
+    (setf (aref bitmap w) (logior (aref bitmap w) (ash 1 (- 31 (mod delta 32)))))))
+
+(defun* fragnum-set-member-p (base numbits bitmap fragnum)
+    (function ((unsigned-byte 32) (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32)) t)
+  "T iff FRAGNUM is in the FragmentNumberSet (§9.4.2.8 membership rule)."
+  (let ((delta (- fragnum base)))
+    (and (<= base fragnum) (< delta numbits)
+         (logbitp (- 31 (mod delta 32)) (aref bitmap (floor delta 32))))))
+
+(defun* write-fragment-number-set (cursor base numbits bitmap)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum)
+  "Write a FragmentNumberSet: bitmapBase (u32) + numBits + M longs (RTPS 2.5 §9.4.2.8)."
+  (assert (<= numbits +seqnum-set-max-bits+))
+  (dds.core.buffer:put-u32 cursor base)
+  (dds.core.buffer:put-u32 cursor numbits)
+  (dotimes (i (%seqnum-set-words numbits))
+    (dds.core.buffer:put-u32 cursor (aref bitmap i)))
+  (dds.core.buffer:cursor-position cursor))
+
+(defun* read-fragment-number-set (cursor)
+    (function (dds.core.buffer:cursor) t)
+  "Parse a FragmentNumberSet. (values base numBits bitmap) or NIL on short buffer /
+   numBits>256 (§9.4.2.8). Bounds-checked; never reads OOB."
+  (when (< (%remaining cursor) 8) (return-from read-fragment-number-set nil))
+  (let* ((base (dds.core.buffer:get-u32 cursor))
+         (numbits (dds.core.buffer:get-u32 cursor)))
+    (when (> numbits +seqnum-set-max-bits+) (return-from read-fragment-number-set nil))
+    (let ((m (%seqnum-set-words numbits)))
+      (when (< (%remaining cursor) (* m 4)) (return-from read-fragment-number-set nil))
+      (let ((bitmap (make-array (max 1 m) :element-type '(unsigned-byte 32) :initial-element 0)))
+        (dotimes (i m) (setf (aref bitmap i) (dds.core.buffer:get-u32 cursor)))
+        (values base numbits bitmap)))))
+
 ;;; ---- Reliability submessages (base forms): HEARTBEAT §9.4.5.7, ACKNACK
 ;;; §9.4.5.3, GAP §9.4.5.6. Count is a 32-bit value (§9.4.2.13). The E flag
 ;;; derives from the cursor endianness so the two stay consistent. The GroupInfo

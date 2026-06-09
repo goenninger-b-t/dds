@@ -43,6 +43,8 @@
            #:write-sequence-number #:read-sequence-number
            #:write-sequence-number-set #:read-sequence-number-set
            #:seqnum-set-bit #:seqnum-set-bit-p #:seqnum-set-member-p
+           #:write-fragment-number-set #:read-fragment-number-set
+           #:fragnum-set-bit #:fragnum-set-member-p
            #:+heartbeat-flag-final+ #:+heartbeat-flag-liveliness+ #:+heartbeat-flag-group-info+
            #:+acknack-flag-final+ #:+gap-flag-group-info+ #:+gap-flag-filtered+
            #:write-heartbeat #:parse-heartbeat-body

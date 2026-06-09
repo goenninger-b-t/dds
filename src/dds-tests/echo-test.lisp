@@ -240,6 +240,7 @@
                  ("zero-alloc-into"          . run-generated-into-test)
                  ("rtps-wire-byte-exact"     . run-rtps-wire-test)
                  ("rtps-seqnum-bitmap"       . run-rtps-seqnum-test)
+                 ("rtps-fragnum-set"         . run-fragnum-set-test)
                  ("rtps-submessages"         . run-rtps-submessage-test)
                  ("rtps-data"                . run-rtps-data-test)
                  ("rtps-data-frag"           . run-rtps-data-frag-test)
