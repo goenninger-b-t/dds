@@ -374,6 +374,35 @@
       (when (null base) (return-from parse-gap-body nil))
       (values reader-id writer-id gap-start base numbits bitmap))))
 
+;;; ---- HEARTBEAT_FRAG submessage (§9.4.5.8): readerId(4) + writerId(4) + writerSN(8) +
+;;; lastFragmentNum(4) + count(4) = 24 octets; only the E flag (§9.4.5.8). ----
+
+(defun* write-heartbeat-frag (cursor reader-id writer-id writer-sn last-fragment-num count)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (unsigned-byte 32)) fixnum)
+  "Write a HEARTBEAT_FRAG submessage. RTPS 2.5 §9.4.5.8; body=24."
+  ;; §9.4.5.8: readerId(4)+writerId(4)+writerSN(8)+lastFragmentNum(4)+count(4)=24
+  (write-submessage-header cursor +submsg-heartbeat-frag+ (%e-flag cursor) 24)
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (write-sequence-number cursor writer-sn)
+  (dds.core.buffer:put-u32 cursor last-fragment-num)
+  (dds.core.buffer:put-u32 cursor (logand count #xFFFFFFFF))
+  (dds.core.buffer:cursor-position cursor))
+
+(defun* parse-heartbeat-frag-body (cursor flags)
+    (function (dds.core.buffer:cursor (unsigned-byte 8)) t)
+  "Parse a HEARTBEAT_FRAG body. Returns (values reader-id writer-id writer-sn
+   last-fragment-num count) or NIL on short buffer. RTPS 2.5 §9.4.5.8."
+  (declare (ignore flags))
+  ;; §9.4.5.8: body must be exactly 24 octets
+  (when (< (%remaining cursor) 24) (return-from parse-heartbeat-frag-body nil))
+  (let ((reader-id (read-entity-id cursor))
+        (writer-id (read-entity-id cursor))
+        (writer-sn (read-sequence-number cursor))
+        (last-fragment-num (dds.core.buffer:get-u32 cursor))
+        (count (dds.core.buffer:get-u32 cursor)))
+    (values reader-id writer-id writer-sn last-fragment-num count)))
+
 ;;; ---- DATA submessage (§9.4.5.4): extraFlags + octetsToInlineQos + readerId +
 ;;; writerId + writerSN + [inlineQos if Q] + serializedPayload [if D||K]. v1 emits
 ;;; and parses the base form (Q=0; inlineQos parsing lands with the ParameterList

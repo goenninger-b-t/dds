@@ -473,3 +473,29 @@
     (%check :fns-short (null (dds.rtps.message:read-fragment-number-set rc))
             "a sub-8-octet FragmentNumberSet rejects"))
   t)
+
+;;; HEARTBEAT_FRAG round-trip (RTPS 2.5 §9.4.5.8): 24-octet body, only E flag.
+
+(defun* run-heartbeat-frag-test ()
+    (function () t)
+  "Test: HEARTBEAT_FRAG write/parse round-trip (RTPS 2.5 §9.4.5.8; body=24)."
+  ;; round-trip: write then parse back
+  (let* ((buf (dds.core.buffer:make-octet-buffer 64))
+         (c (dds.core.buffer:cursor buf :endianness :little))
+         (rid #x107) (wid #x102) (sn 7) (lastfrag 5) (count 3))
+    (dds.rtps.message:write-heartbeat-frag c rid wid sn lastfrag count)
+    (dds.core.buffer:cursor-reset c)
+    (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+      (declare (ignore le))
+      (%check :hbf-kind (= id dds.rtps.message:+submsg-heartbeat-frag+) "HEARTBEAT_FRAG kind")
+      (%check :hbf-octets (= octets 24) "HEARTBEAT_FRAG body length 24")
+      (multiple-value-bind (r w s lf cnt) (dds.rtps.message:parse-heartbeat-frag-body c flags)
+        (%check :hbf-fields
+                (and (= r rid) (= w wid) (= s sn) (= lf lastfrag) (= cnt count))
+                "HEARTBEAT_FRAG fields round-trip"))))
+  ;; bounds: a sub-24-octet buffer must yield NIL
+  (let* ((buf (dds.core.buffer:make-octet-buffer 10))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    (%check :hbf-short (null (dds.rtps.message:parse-heartbeat-frag-body c 0))
+            "a sub-24-octet HEARTBEAT_FRAG body rejects"))
+  t)

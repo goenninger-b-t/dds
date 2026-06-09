@@ -50,6 +50,7 @@
            #:write-heartbeat #:parse-heartbeat-body
            #:write-acknack #:parse-acknack-body
            #:write-gap #:parse-gap-body
+           #:write-heartbeat-frag #:parse-heartbeat-frag-body
            #:+data-flag-inline-qos+ #:+data-flag-data+ #:+data-flag-key+
            #:+data-flag-non-standard+
            #:write-data #:parse-data-body
