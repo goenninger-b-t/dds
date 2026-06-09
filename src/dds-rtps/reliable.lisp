@@ -27,7 +27,7 @@
       (setf (gethash reader-id (rtps-writer-proxies writer)) (make-reader-proxy))))
 
 (defun* writer-write (writer payload)
-    (function (rtps-writer t) integer)
+    (function (rtps-writer (array (unsigned-byte 8) (*))) integer)
   "Add a new change to the writer's HistoryCache; return its sequence number."
   (let ((sn (incf (rtps-writer-last-sn writer))))
     (dds.rtps.history:hc-add-change
@@ -89,7 +89,7 @@
       (setf (gethash writer-id (rtps-reader-proxies reader)) (make-writer-proxy))))
 
 (defun* reader-on-data (reader writer-id sn payload)
-    (function (rtps-reader (unsigned-byte 32) integer t) t)
+    (function (rtps-reader (unsigned-byte 32) integer (array (unsigned-byte 8) (*))) t)
   "Accept a DATA. Idempotent (duplicate SN overwrites — dedup); tracks the highest
    SN seen so reordered delivery is harmless (stored by SN)."
   (let ((proxy (get-writer-proxy reader writer-id)))

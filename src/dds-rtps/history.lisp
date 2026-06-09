@@ -13,9 +13,9 @@
   (writer-guid nil :type (or null (array (unsigned-byte 8) (*))))
   (sn 0 :type (integer 0))
   (instance-key-hash nil :type (or null (array (unsigned-byte 8) (*))))
-  (serialized-payload nil :type t)                ; opaque: writer-write takes payload as t
+  (serialized-payload nil :type (or null (array (unsigned-byte 8) (*))))  ; SerializedPayload octets
   (source-timestamp 0 :type integer)
-  (inline-qos nil :type t))                       ; opaque QoS blob (never interpreted here)
+  (inline-qos nil :type (or null (array (unsigned-byte 8) (*)))))         ; serialized inline-QoS ParameterList
 
 ;;;; HistoryCache (FR-RTPS-5): a change store honouring HISTORY (KEEP_LAST depth /
 ;;;; KEEP_ALL) and RESOURCE_LIMITS (max_samples). v1 keys changes by sequence

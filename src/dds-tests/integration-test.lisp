@@ -31,7 +31,8 @@
                 (dds.cdr:make-encapsulation-header pc :plain-cdr2-le)
                 (serialize-gsample sample pc :xcdr2)
                 (let ((pl-len (dds.core.buffer:cursor-position pc)))
-                  (dds.rtps.reliable:writer-write writer pl-buf)
+                  (dds.rtps.reliable:writer-write
+                   writer (subseq (dds.core.buffer:octet-buffer-vec pl-buf) 0 pl-len))
                   (let ((mc (dds.core.buffer:cursor msg-buf :endianness :little)))
                     (dds.rtps.message:write-header mc prefix :vendor 0)
                     (dds.rtps.message:write-data mc rid wid 1
@@ -49,13 +50,14 @@
                       (when (= id dds.rtps.message:+submsg-data+)
                         (multiple-value-bind (r w sn has off len key)
                             (dds.rtps.message:parse-data-body cur flags body-len)
-                          (declare (ignore r len key))
+                          (declare (ignore r key))
                           (when has
                             (let ((vc (dds.core.buffer:cursor in-buf :endianness :little)))
                               (dds.core.buffer:cursor-set-position vc off)
                               (dds.cdr:parse-encapsulation-header vc)
                               (setf got (deserialize-gsample vc :xcdr2)))
-                            (dds.rtps.reliable:reader-on-data reader w sn got)))))))
+                            (dds.rtps.reliable:reader-on-data
+                             reader w sn (subseq (dds.core.buffer:octet-buffer-vec in-buf) off (+ off len)))))))))
               (%check :e2e-deserialized (and got t) "DATA payload not deserialized")
               (%check :e2e-sample
                       (and (= (gsample-id got) 1234567)

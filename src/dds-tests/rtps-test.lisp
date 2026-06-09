@@ -279,12 +279,13 @@
                   :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
          (reader (dds.rtps.reliable:make-rtps-reader))
          (wid 1) (rid 2) (n 10))
-    (dotimes (i n) (dds.rtps.reliable:writer-write writer (format nil "m~d" (1+ i))))
+    (dotimes (i n) (dds.rtps.reliable:writer-write
+                    writer (map '(simple-array (unsigned-byte 8) (*)) #'char-code (format nil "m~d" (1+ i)))))
     (labels ((deliver (sn payload round)
                (when (or (>= round 3) (zerop (logand 1 (+ (* sn 7) (* round 13)))))
                  (dds.rtps.reliable:reader-on-data reader wid sn payload))))
       ;; initial blast: reversed (reorder) + a duplicate delivery of SN 1
-      (deliver 1 "m1" 0)
+      (deliver 1 (map '(simple-array (unsigned-byte 8) (*)) #'char-code "m1") 0)
       (dolist (cell (reverse (dds.rtps.reliable:writer-data-list writer rid)))
         (deliver (car cell) (cdr cell) 0))
       (let ((done nil))
@@ -316,7 +317,8 @@
                   :hc (dds.rtps.history:make-history-cache :keep-last 2 nil nil)))
          (reader (dds.rtps.reliable:make-rtps-reader))
          (wid 1) (rid 2))
-    (dotimes (i 5) (dds.rtps.reliable:writer-write writer (format nil "m~d" (1+ i))))  ; hc holds 4,5
+    (dotimes (i 5) (dds.rtps.reliable:writer-write              ; hc holds 4,5
+                    writer (map '(simple-array (unsigned-byte 8) (*)) #'char-code (format nil "m~d" (1+ i)))))
     (dds.rtps.reliable:reader-on-heartbeat reader wid 1 5)        ; reader still thinks [1,5] avail
     (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
       (%check :gap-acknack (and (= base 1) (= numbits 5)) "reader NACKs all of [1,5]")
