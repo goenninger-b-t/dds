@@ -4,7 +4,7 @@
 
 (defpackage #:net.goenninger.dds.rtps.history
   (:nicknames #:dds.rtps.history)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "HistoryCache protocol (IMPLEMENTATION-PLAN §7.4). A CacheChange is a pooled
     struct; the cache honours HISTORY (KEEP_LAST/KEEP_ALL), RESOURCE_LIMITS, and
@@ -24,7 +24,7 @@
 
 (defpackage #:net.goenninger.dds.rtps.message
   (:nicknames #:dds.rtps.message)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "RTPS Message Header + Submessage framing + GUID/EntityId codec (RTPS 2.5
     §9.4.4/§9.4.5/§9.3.1.2). All wire constants are pinned from the in-repo spec
@@ -70,7 +70,7 @@
 
 (defpackage #:net.goenninger.dds.rtps.reliable
   (:nicknames #:dds.rtps.reliable)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "Stateful reliable RTPS writer + reader (RTPS 2.5 §8.4.2/§8.4.10): ReaderProxy/
     WriterProxy, changes-for-reader, HEARTBEAT/ACKNACK/GAP-driven retransmit and
@@ -89,7 +89,7 @@
 
 (defpackage #:net.goenninger.dds.rtps.discovery
   (:nicknames #:dds.rtps.discovery)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "Simple Participant Discovery Protocol (SPDP): the Locator_t codec (RTPS 2.5
     §9.3.2.4) and SPDPdiscoveredParticipantData ParameterList build/parse (§8.5.3/

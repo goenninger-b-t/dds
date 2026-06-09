@@ -10,7 +10,7 @@
 
 ;;; ---- Duration_t with a total order (DURATION_INFINITE = the maximum) ----
 
-(defstruct (qos-duration (:constructor make-qos-duration (&optional (sec 0) (nanosec 0))))
+(defstruct* (qos-duration (:constructor make-qos-duration (&optional (sec 0) (nanosec 0))))
   "DDS Duration_t: SEC + NANOSEC. DURATION_INFINITE is {0x7fffffff, 0x7fffffff}."
   (sec 0 :type (integer 0))
   (nanosec 0 :type (integer 0)))
@@ -20,8 +20,8 @@
 (defparameter +duration-infinite+ (make-qos-duration #x7fffffff #x7fffffff)
   "DURATION_INFINITE {0x7fffffff, 0x7fffffff}; the maximum of the Duration_t total order.")
 
-(declaim (ftype (function (qos-duration qos-duration) t) duration<=))
-(defun duration<= (a b)
+(defun* duration<= (a b)
+    (function (qos-duration qos-duration) t)
   "Total order on Duration_t: A <= B (DURATION_INFINITE compares as the maximum,
    since 0x7fffffff is the largest second value)."
   (let ((as (qos-duration-sec a)) (bs (qos-duration-sec b)))
@@ -29,28 +29,33 @@
 
 ;;; ---- Ordinal ranks for the kind-ordered policies (offered >= requested) ----
 
-(declaim (ftype (function (symbol) (integer 0)) reliability-rank))
-(defun reliability-rank (k) (ecase k (:best-effort 1) (:reliable 2)))
+(defun* reliability-rank (k)
+    (function (symbol) (integer 0))
+  "RxO strength rank of a RELIABILITY kind (:best-effort 1 < :reliable 2); offered must rank >= requested." (ecase k (:best-effort 1) (:reliable 2)))
 
-(declaim (ftype (function (symbol) (integer 0)) durability-rank))
-(defun durability-rank (k)
+(defun* durability-rank (k)
+    (function (symbol) (integer 0))
+  "RxO strength rank of a DURABILITY kind (:volatile 0 < :transient-local 1 < :transient 2 < :persistent 3)."
   (ecase k (:volatile 0) (:transient-local 1) (:transient 2) (:persistent 3)))
 
-(declaim (ftype (function (symbol) (integer 0)) liveliness-rank))
-(defun liveliness-rank (k)
+(defun* liveliness-rank (k)
+    (function (symbol) (integer 0))
+  "RxO strength rank of a LIVELINESS kind (:automatic 0 < :manual-by-participant 1 < :manual-by-topic 2)."
   (ecase k (:automatic 0) (:manual-by-participant 1) (:manual-by-topic 2)))
 
-(declaim (ftype (function (symbol) (integer 0)) destination-order-rank))
-(defun destination-order-rank (k)
+(defun* destination-order-rank (k)
+    (function (symbol) (integer 0))
+  "RxO strength rank of a DESTINATION_ORDER kind (:by-reception-timestamp 0 < :by-source-timestamp 1)."
   (ecase k (:by-reception-timestamp 0) (:by-source-timestamp 1)))
 
-(declaim (ftype (function (symbol) (integer 0)) presentation-rank))
-(defun presentation-rank (k) (ecase k (:instance 0) (:topic 1) (:group 2)))
+(defun* presentation-rank (k)
+    (function (symbol) (integer 0))
+  "RxO strength rank of a PRESENTATION access_scope (:instance 0 < :topic 1 < :group 2)." (ecase k (:instance 0) (:topic 1) (:group 2)))
 
 ;;; ---- TYPE_CONSISTENCY_ENFORCEMENT (XTypes 1.3 §7.6.3.4): reader-only, NOT an RxO
 ;;;      policy (so it is absent from qos-rxo-compatible); defaults per §7.6.3.4.1. ----
 
-(defstruct (type-consistency-enforcement
+(defstruct* (type-consistency-enforcement
             (:constructor make-type-consistency-enforcement)
             (:copier copy-type-consistency-enforcement))
   "DDS XTypes TYPE_CONSISTENCY_ENFORCEMENT QoS policy (XTypes 1.3 §7.6.3.4, policy id 24).
@@ -60,16 +65,16 @@
    validation requires type info to be present in order to match. Defaults per §7.6.3.4.1:
    ALLOW_TYPE_COERCION, bounds ignored, names enforced, widening permitted, validation off."
   (kind :allow-type-coercion :type (member :allow-type-coercion :disallow-type-coercion))
-  (ignore-sequence-bounds t)
-  (ignore-string-bounds t)
-  (ignore-member-names nil)
-  (prevent-type-widening nil)
-  (force-type-validation nil))
+  (ignore-sequence-bounds t :type boolean)
+  (ignore-string-bounds t :type boolean)
+  (ignore-member-names nil :type boolean)
+  (prevent-type-widening nil :type boolean)
+  (force-type-validation nil :type boolean))
 
 ;;; ---- The QoS set (the RxO-relevant + commonly-held policies; full 22+2 set is
 ;;;      filled in as the entity model lands). Defaults per DDS 1.4 §2.2.3. ----
 
-(defstruct (qos (:constructor make-qos) (:copier copy-qos))
+(defstruct* (qos (:constructor make-qos) (:copier copy-qos))
   "The DDS QoS set: the RxO-relevant + commonly-held policies (the full 22+2 set is
    filled in as the entity model lands). Slot defaults follow DDS 1.4 §2.2.3."
   (reliability :best-effort :type (member :best-effort :reliable))
@@ -84,8 +89,8 @@
   (destination-order :by-reception-timestamp
                      :type (member :by-reception-timestamp :by-source-timestamp))
   (presentation-scope :instance :type (member :instance :topic :group))
-  (presentation-coherent nil)
-  (presentation-ordered nil)
+  (presentation-coherent nil :type boolean)
+  (presentation-ordered nil :type boolean)
   ;; DataWriter: the OFFERED representation is (first data-representation);
   ;; DataReader: data-representation is the SET of accepted representations.
   (data-representation (list :xcdr1) :type list)
@@ -101,20 +106,20 @@
   ;; TYPE_CONSISTENCY_ENFORCEMENT (XTypes, reader-only, not RxO; see FR-TYPE-4).
   (type-consistency (make-type-consistency-enforcement) :type type-consistency-enforcement))
 
-(declaim (ftype (function (&rest t) qos) make-writer-qos))
-(defun make-writer-qos (&rest args)
+(defun* make-writer-qos (&rest args)
+    (function (&rest t) qos)
   "QoS with DataWriter defaults (RELIABILITY defaults to RELIABLE). ARGS override."
   (apply #'make-qos :reliability :reliable args))
 
-(declaim (ftype (function (&rest t) qos) make-reader-qos))
-(defun make-reader-qos (&rest args)
+(defun* make-reader-qos (&rest args)
+    (function (&rest t) qos)
   "QoS with DataReader defaults (RELIABILITY defaults to BEST_EFFORT). ARGS override."
   (apply #'make-qos :reliability :best-effort args))
 
 ;;; ---- RxO compatibility (FR-QOS-2) ----
 
-(declaim (ftype (function (qos qos) (values boolean list)) qos-rxo-compatible))
-(defun qos-rxo-compatible (offered requested)
+(defun* qos-rxo-compatible (offered requested)
+    (function (qos qos) (values boolean list))
   "RxO compatibility of an OFFERED (writer) QoS against a REQUESTED (reader) QoS,
    DDS 1.4 §2.2.3. Returns (values COMPATIBLE-P INCOMPATIBLE), where INCOMPATIBLE is
    the ordered list of policy keywords that fail — i.e. the policies that would raise
@@ -148,8 +153,8 @@
       (push :data-representation bad))
     (values (null bad) (nreverse bad))))
 
-(declaim (ftype (function (qos qos) t) partition-match-p))
-(defun partition-match-p (a b)
+(defun* partition-match-p (a b)
+    (function (qos qos) t)
   "Partitions overlap (DDS 1.4 §2.2.3 PARTITION). An empty partition list denotes the
    default partition, which matches another empty list. (Wildcard/fnmatch names are a
    later increment; v1 does exact name matching.) NOT part of RxO incompatibility."
@@ -158,16 +163,16 @@
 
 ;;; ---- RxO truth-table test (FR-QOS-2) ----
 
-(declaim (ftype (function (t t t) t) %assert-rxo))
-(defun %assert-rxo (label expect-bad got-bad)
+(defun* %assert-rxo (label expect-bad got-bad)
+    (function (t t t) t)
   "Assert the RxO incompatible-list GOT-BAD equals the EXPECT-BAD set (order-free)."
   (assert (and (= (length expect-bad) (length got-bad))
                (every (lambda (p) (member p got-bad)) expect-bad))
           () "RxO[~a]: expected incompatible ~a, got ~a" label expect-bad got-bad)
   t)
 
-(declaim (ftype (function () (eql t)) run-qos-rxo-test))
-(defun run-qos-rxo-test ()
+(defun* run-qos-rxo-test ()
+    (function () (eql t))
   "Exercise the DDS 1.4 §2.2.3 RxO truth table (FR-QOS-2): each kind-ordered policy
    (reliability/durability/liveliness/destination-order/presentation), each duration
    policy (deadline/latency-budget), ownership equality, and data-representation set

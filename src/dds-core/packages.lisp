@@ -3,7 +3,7 @@
 
 (defpackage #:net.goenninger.dds.core.buffer
   (:nicknames #:dds.core.buffer)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "Off-heap octet buffers + cursors (IMPLEMENTATION-PLAN §7.1). HOT PATH:
     no defclass/defgeneric/defmethod, no per-sample allocation. Every op is
@@ -21,7 +21,7 @@
 
 (defpackage #:net.goenninger.dds.core.md5
   (:nicknames #:dds.core.md5)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "MD5 (RFC 1321), vendored clean-room. Content/identity hash for the XTypes
     EquivalenceHash/NameHash (FR-TYPE-2) + the DDS keyhash >16-byte case (FR-TYPE-5).
@@ -30,7 +30,7 @@
 
 (defpackage #:net.goenninger.dds.core.arena
   (:nicknames #:dds.core.arena)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "Static, startup-allocated, non-GC'd arena + fixed-capacity pools
     (IMPLEMENTATION-PLAN §7.7, REQUIREMENTS NFR-MEM). The home of

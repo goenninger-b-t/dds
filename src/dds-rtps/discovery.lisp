@@ -25,8 +25,8 @@
 (defconstant +locator-bytes+ 24
   "Locator_t size = {long kind; unsigned long port; octet address[16];} = 24 octets (RTPS 2.5 §9.3.2.1).")
 
-(declaim (ftype (function (dds.core.buffer:cursor (integer 0) (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) fixnum) write-locator))
-(defun write-locator (cursor kind port address)
+(defun* write-locator (cursor kind port address)
+    (function (dds.core.buffer:cursor (integer 0) (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) fixnum)
   "Write a 24-octet Locator_t: kind (i32) + port (u32) in cursor endianness, then
    16 raw address octets (RTPS 2.5 §9.3.2.1 / §9.4.2.18)."
   (dds.core.buffer:put-u32 cursor (logand kind #xFFFFFFFF))
@@ -34,8 +34,8 @@
   (dds.core.buffer:put-octets cursor address 0 16)
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor) t) read-locator))
-(defun read-locator (cursor)
+(defun* read-locator (cursor)
+    (function (dds.core.buffer:cursor) t)
   "Read a 24-octet Locator_t. Returns (values kind port address) where KIND is the
    signed i32, or NIL if fewer than 24 octets remain. Bounds-checked; never reads
    OOB (RTPS 2.5 §9.3.2.1, NFR-SEC-POSTURE)."
@@ -50,8 +50,8 @@
     (dds.core.buffer:get-octets cursor address 0 16)
     (values kind port address)))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (16))) make-ipv4-locator))
-(defun make-ipv4-locator (ip)
+(defun* make-ipv4-locator (ip)
+    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (16)))
   "Build a 16-octet Locator address from a 4-octet IPv4 vector: 12 leading zeros
    then a.b.c.d at [12..15] (RTPS 2.5 §9.3.2.4)."
   (assert (= 4 (length ip)))
@@ -64,7 +64,7 @@
 ;;; interop necessity (foreign stacks list non-routable / 0.0.0.0 / non-UDPv4
 ;;; placeholders that must be skipped, not sent to). ----
 
-(defstruct (locator (:constructor make-locator))
+(defstruct* (locator (:constructor make-locator))
   "An RTPS Locator_t: transport KIND, PORT (u32), 16-octet ADDRESS (UDPv4 in the
    low 4 octets). RTPS 2.5 §9.3.2.4."
   (kind +locator-kind-udpv4+ :type (integer 0))
@@ -72,20 +72,20 @@
   (address (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
            :type (simple-array (unsigned-byte 8) (16))))
 
-(declaim (ftype (function (locator) string) locator-ipv4-string))
-(defun locator-ipv4-string (loc)
+(defun* locator-ipv4-string (loc)
+    (function (locator) string)
   "Dotted-quad for a UDPv4 LOCATOR (IPv4 in address octets 12..15)."
   (let ((a (locator-address loc)))
     (format nil "~d.~d.~d.~d" (aref a 12) (aref a 13) (aref a 14) (aref a 15))))
 
-(declaim (ftype (function (locator) t) locator-usable-udpv4-p))
-(defun locator-usable-udpv4-p (loc)
+(defun* locator-usable-udpv4-p (loc)
+    (function (locator) t)
   "T iff LOC is a UDPv4 locator with a routable (non-0.0.0.0) address."
   (and (= (locator-kind loc) +locator-kind-udpv4+)
        (not (string= (locator-ipv4-string loc) "0.0.0.0"))))
 
-(declaim (ftype (function (list) t) usable-udpv4-locator))
-(defun usable-udpv4-locator (locators)
+(defun* usable-udpv4-locator (locators)
+    (function (list) t)
   "The first routable UDPv4 LOCATOR in LOCATORS, or NIL — the locator-list selection
    that lets the data plane reach a foreign participant advertising several."
   (find-if #'locator-usable-udpv4-p locators))
@@ -93,7 +93,7 @@
 ;;; ---- SPDPdiscoveredParticipantData (RTPS 2.5 §8.5.3.2 / §9.6.2.2). A subset of
 ;;; the ParticipantBuiltinTopicData carried as a ParameterList in the SPDP DATA. ----
 
-(defstruct (spdp-data (:constructor make-spdp-data))
+(defstruct* (spdp-data (:constructor make-spdp-data))
   "SPDPdiscoveredParticipantData (RTPS 2.5 §8.5.3.2 / §9.6.2.2): the subset of
    ParticipantBuiltinTopicData carried as a ParameterList in the SPDP DATA — GUID
    prefix, protocol version, vendor id, default/metatraffic unicast locator lists,
@@ -108,16 +108,16 @@
   (lease-duration-seconds 100 :type (signed-byte 32))
   (builtin-endpoint-set 0 :type (unsigned-byte 32)))
 
-(declaim (ftype (function ((integer 0)) (values dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)))) %make-scratch))
-(defun %make-scratch (n)
+(defun* %make-scratch (n)
+    (function ((integer 0)) (values dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*))))
   "A scratch octet buffer of N octets and a cursor over it (LE), for building one
    Parameter value at a time before handing it to WRITE-PARAMETER."
   (let* ((ob (dds.core.buffer:make-octet-buffer n))
          (cur (dds.core.buffer:cursor ob :endianness :little)))
     (values cur (dds.core.buffer:octet-buffer-vec ob))))
 
-(declaim (ftype (function (dds.core.buffer:cursor spdp-data) fixnum) serialize-spdp-data))
-(defun serialize-spdp-data (cursor data)
+(defun* serialize-spdp-data (cursor data)
+    (function (dds.core.buffer:cursor spdp-data) fixnum)
   "Serialize SPDP data as a ParameterList terminated by PID_SENTINEL (RTPS 2.5
    §8.5.3.2 / §9.4.2.11). Each Parameter value is built in a scratch buffer then
    emitted via WRITE-PARAMETER (which adds pid+length+padding)."
@@ -160,8 +160,8 @@
     (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-builtin-endpoint-set+ vec 0 4))
   (dds.rtps.message:write-parameter-sentinel cursor))
 
-(declaim (ftype (function (spdp-data (unsigned-byte 16) dds.core.buffer:cursor (integer 0)) t) %fill-spdp-param))
-(defun %fill-spdp-param (data pid cursor len)
+(defun* %fill-spdp-param (data pid cursor len)
+    (function (spdp-data (unsigned-byte 16) dds.core.buffer:cursor (integer 0)) t)
   "ParameterList handler: fill DATA from one Parameter. Bounds is enforced by the
    caller (LEN octets are guaranteed present); inner reads re-check (§9.4.2.11)."
   (cond
@@ -198,8 +198,8 @@
        (setf (spdp-data-builtin-endpoint-set data) (dds.core.buffer:get-u32 cursor)))))
   data)
 
-(declaim (ftype (function (dds.core.buffer:cursor) t) parse-spdp-data))
-(defun parse-spdp-data (cursor)
+(defun* parse-spdp-data (cursor)
+    (function (dds.core.buffer:cursor) t)
   "Parse an SPDP ParameterList into an SPDP-DATA struct, or NIL if the list is
    truncated (RTPS 2.5 §8.5.3.2 / §9.4.2.11). Bounds-checked via PARSE-PARAMETER-LIST."
   (let ((data (make-spdp-data)))
@@ -215,13 +215,13 @@
 
 ;;; ---- Standalone round-trip + byte-exact test (no external test framework) ----
 
-(declaim (ftype (function () (simple-array (unsigned-byte 8) (4))) %ip-127-0-0-1))
-(defun %ip-127-0-0-1 ()
+(defun* %ip-127-0-0-1 ()
+    (function () (simple-array (unsigned-byte 8) (4)))
   "The IPv4 vector 127.0.0.1."
   (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(127 0 0 1)))
 
-(declaim (ftype (function () t) %check-locator-bytes))
-(defun %check-locator-bytes ()
+(defun* %check-locator-bytes ()
+    (function () t)
   "Byte-exact check: a UDPv4 locator (port 7410, 127.0.0.1) is 24 little-endian
    octets: kind LE, port LE, 12 zeros, 127 0 0 1 (RTPS 2.5 §9.3.2.1 / §9.3.2.4)."
   (let* ((ob (dds.core.buffer:make-octet-buffer 24))
@@ -239,8 +239,8 @@
                 "Locator byte ~d: got ~d want ~d" i (aref vec i) (aref expected i))))
     t))
 
-(declaim (ftype (function () (values t t)) run-discovery-test))
-(defun run-discovery-test ()
+(defun* run-discovery-test ()
+    (function () (values t t))
   "Build SPDP data, serialize, parse back, and assert every field round-trips;
    also byte-exact-check the Locator encoding. Returns T on success (ASSERT
    signals otherwise)."
@@ -300,16 +300,20 @@
 
 ;; QoS <-> on-the-wire kind mappings (DDS-XTypes 1.3 discovery IDL enum order, a
 ;; big-endian long per policy). reliability is 1/2 (not 0-based); durability is 0-3.
-(declaim (ftype (function (symbol) (unsigned-byte 32)) %reliability-wire))
-(defun %reliability-wire (k) (ecase k (:best-effort +reliability-best-effort+) (:reliable +reliability-reliable+)))
-(declaim (ftype (function ((unsigned-byte 32)) symbol) %wire-reliability))
-(defun %wire-reliability (n) (if (>= n +reliability-reliable+) :reliable :best-effort))
-(declaim (ftype (function (symbol) (unsigned-byte 32)) %durability-wire))
-(defun %durability-wire (k) (ecase k (:volatile 0) (:transient-local 1) (:transient 2) (:persistent 3)))
-(declaim (ftype (function ((unsigned-byte 32)) symbol) %wire-durability))
-(defun %wire-durability (n) (case n (1 :transient-local) (2 :transient) (3 :persistent) (t :volatile)))
+(defun* %reliability-wire (k)
+    (function (symbol) (unsigned-byte 32))
+  "Map a RELIABILITY kind keyword to its PID_RELIABILITY wire code (RTPS 2.5 §9.6.2.2)." (ecase k (:best-effort +reliability-best-effort+) (:reliable +reliability-reliable+)))
+(defun* %wire-reliability (n)
+    (function ((unsigned-byte 32)) symbol)
+  "Map a PID_RELIABILITY wire code to a RELIABILITY kind keyword (>= the reliable code is :reliable)." (if (>= n +reliability-reliable+) :reliable :best-effort))
+(defun* %durability-wire (k)
+    (function (symbol) (unsigned-byte 32))
+  "Map a DURABILITY kind keyword to its PID_DURABILITY wire code (0..3)." (ecase k (:volatile 0) (:transient-local 1) (:transient 2) (:persistent 3)))
+(defun* %wire-durability (n)
+    (function ((unsigned-byte 32)) symbol)
+  "Map a PID_DURABILITY wire code (0..3) to a DURABILITY kind keyword (default :volatile)." (case n (1 :transient-local) (2 :transient) (3 :persistent) (t :volatile)))
 
-(defstruct (endpoint-data (:constructor make-endpoint-data))
+(defstruct* (endpoint-data (:constructor make-endpoint-data))
   "DiscoveredWriterData / DiscoveredReaderData (RTPS 2.5 §8.5.4 / §9.6.2.2): a 16-octet
    GUID, topic + type names, and the QoS carried for RxO matching (FR-QOS-2)."
   (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
@@ -325,8 +329,8 @@
   ;; (dds.types, ADR 0009). Never EMITTED — RTI-vendor + clean-room; inbound only.
   (type-object-lb nil :type (or null (simple-array (unsigned-byte 8) (*)))))
 
-(declaim (ftype (function (dds.core.buffer:cursor endpoint-data) fixnum) serialize-endpoint-data))
-(defun serialize-endpoint-data (cursor data)
+(defun* serialize-endpoint-data (cursor data)
+    (function (dds.core.buffer:cursor endpoint-data) fixnum)
   "Serialize ENDPOINT-DATA as a ParameterList terminated by PID_SENTINEL (RTPS 2.5
    §8.5.4 / §9.4.2.11). Each Parameter value is built in a scratch buffer then
    emitted via WRITE-PARAMETER (which adds pid+length+padding)."
@@ -364,8 +368,8 @@
                                         ti 0 (length ti))))
   (dds.rtps.message:write-parameter-sentinel cursor))
 
-(declaim (ftype (function (endpoint-data (unsigned-byte 16) dds.core.buffer:cursor (integer 0)) t) %fill-endpoint-param))
-(defun %fill-endpoint-param (data pid cursor len)
+(defun* %fill-endpoint-param (data pid cursor len)
+    (function (endpoint-data (unsigned-byte 16) dds.core.buffer:cursor (integer 0)) t)
   "ParameterList handler: fill DATA from one Parameter. The caller guarantees LEN
    octets are present; inner reads gate on the minimum size (§9.4.2.11)."
   (cond
@@ -398,8 +402,8 @@
          (setf (endpoint-data-type-object-lb data) lb)))))
   data)
 
-(declaim (ftype (function (dds.core.buffer:cursor) t) parse-endpoint-data))
-(defun parse-endpoint-data (cursor)
+(defun* parse-endpoint-data (cursor)
+    (function (dds.core.buffer:cursor) t)
   "Parse a SEDP ParameterList into an ENDPOINT-DATA struct, or NIL if the list is
    truncated (RTPS 2.5 §8.5.4 / §9.4.2.11). Bounds-checked via PARSE-PARAMETER-LIST."
   (let ((data (make-endpoint-data)))
@@ -408,8 +412,8 @@
         data
         nil)))
 
-(declaim (ftype (function (endpoint-data endpoint-data) (values boolean list)) endpoint-match-p))
-(defun endpoint-match-p (writer-data reader-data)
+(defun* endpoint-match-p (writer-data reader-data)
+    (function (endpoint-data endpoint-data) (values boolean list))
   "(values MATCH-P INCOMPATIBLE): topic + type names equal AND the offered (writer)
    QoS is RxO-compatible with the requested (reader) QoS — the full DDS 1.4 §2.2.3
    table via dds.qos:qos-rxo-compatible (FR-QOS-2). INCOMPATIBLE is the failing-policy
@@ -420,14 +424,14 @@
       (dds.qos:qos-rxo-compatible (endpoint-data-qos writer-data) (endpoint-data-qos reader-data))
       (values nil '(:topic-or-type))))
 
-(declaim (ftype (function () (simple-array (unsigned-byte 8) (16))) %sample-guid))
-(defun %sample-guid ()
+(defun* %sample-guid ()
+    (function () (simple-array (unsigned-byte 8) (16)))
   "A deterministic 16-octet GUID for the SEDP round-trip test."
   (make-array 16 :element-type '(unsigned-byte 8)
               :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 0 0 1 2)))
 
-(declaim (ftype (function () t) run-sedp-test))
-(defun run-sedp-test ()
+(defun* run-sedp-test ()
+    (function () t)
   "Round-trip an ENDPOINT-DATA through serialize/parse and assert the GUID, topic,
    type, and reliability kind survive; then exercise the RxO matching truth table.
    Returns T on success (ASSERT signals otherwise)."

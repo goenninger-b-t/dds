@@ -7,7 +7,7 @@
 
 (defpackage #:net.goenninger.dds.disc
   (:nicknames #:dds.disc)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "Simple Participant Discovery over UDP (FR-DISC-1/4): make-disc-node opens a
     metatraffic UDPv4 socket; start-node spawns a receiver thread; announce-

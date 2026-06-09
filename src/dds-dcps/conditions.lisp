@@ -58,8 +58,8 @@
   (:documentation "DDS WaitSet — a set of conditions to wait on, with a condition
    variable a signaler pulses when an attached condition may have become triggered."))
 
-(declaim (ftype (function (wait-condition) t) %notify-condition))
-(defun %notify-condition (c)
+(defun* %notify-condition (c)
+    (function (wait-condition) t)
   "Wake every WaitSet C is attached to: take each WaitSet's lock (holding no other
    lock — see the file header's locking discipline) and signal its condvar. Safe to
    call from the receiver thread or an app thread."
@@ -68,27 +68,27 @@
       (dds.pal:condvar-signal (ws-cv ws))))
   t)
 
-(declaim (ftype (function (data-reader) t) %notify-reader-conditions))
-(defun %notify-reader-conditions (dr)
+(defun* %notify-reader-conditions (dr)
+    (function (data-reader) t)
   "New data arrived for DR: wake the WaitSets of every condition bound to DR (its
    read/query conditions + any reader StatusCondition). Called from the receiver
    thread via the disc ON-SAMPLE hook, holding no node lock."
   (dolist (c (dr-conditions dr)) (%notify-condition c))
   t)
 
-(declaim (ftype (function () guard-condition) make-guard-condition))
-(defun make-guard-condition ()
+(defun* make-guard-condition ()
+    (function () guard-condition)
   "Create a DDS GuardCondition (an app-controlled trigger)."
   (make-instance 'guard-condition))
 
-(declaim (ftype (function (guard-condition t) t) set-trigger-value))
-(defun set-trigger-value (gc value)
+(defun* set-trigger-value (gc value)
+    (function (guard-condition t) t)
   "DDS GuardCondition::set_trigger_value — set the trigger and wake any waiting WaitSet."
   (setf (%wc-trigger gc) (and value t))
   (%notify-condition gc))
 
-(declaim (ftype (function (data-reader &key (:states list)) read-condition) create-readcondition))
-(defun create-readcondition (reader &key (states '(:not-read)))
+(defun* create-readcondition (reader &key (states '(:not-read)))
+    (function (data-reader &key (:states list)) read-condition)
   "DataReader::create_readcondition — triggers when samples matching STATES exist."
   (let ((c (make-instance 'read-condition :reader reader :states states)))
     (push c (dr-conditions reader))
@@ -98,9 +98,9 @@
 ;; of create-querycondition can compile a query_expression without a compile warning.
 (declaim (ftype (function (string list function) function) compile-filter))
 
-(declaim (ftype (function (data-reader &key (:states list) (:query function) (:expression (or null string)) (:parameters list)) query-condition) create-querycondition))
-(defun create-querycondition (reader &key (states '(:not-read)) (query #'%where-any)
+(defun* create-querycondition (reader &key (states '(:not-read)) (query #'%where-any)
                                           expression (parameters '()))
+    (function (data-reader &key (:states list) (:query function) (:expression (or null string)) (:parameters list)) query-condition)
   "DataReader::create_querycondition — a ReadCondition that also filters by a query.
    With :EXPRESSION (a DDS Annex B query_expression) + :PARAMETERS (the DDS
    expression_parameters), the query is compiled against the reader's topic type via
@@ -115,23 +115,23 @@
     (push c (dr-conditions reader))
     c))
 
-(declaim (ftype (function (entity &key (:mask list)) status-condition) make-status-condition))
-(defun make-status-condition (entity &key (mask '(:data-available)))
+(defun* make-status-condition (entity &key (mask '(:data-available)))
+    (function (entity &key (:mask list)) status-condition)
   "A StatusCondition for ENTITY enabled for the statuses in MASK. A reader-bound status
    condition is registered for the data-arrival wake (its :data-available case)."
   (let ((c (make-instance 'status-condition :entity entity :mask mask)))
     (when (typep entity 'data-reader) (push c (dr-conditions entity)))
     c))
 
-(declaim (ftype (function (data-reader list) (integer 0)) %count-matching))
-(defun %count-matching (dr states)
+(defun* %count-matching (dr states)
+    (function (data-reader list) (integer 0))
   "Drain newly-received samples and count those whose sample-state is in STATES."
   (%drain dr)
   (count-if (lambda (cs) (member (sample-info-sample-state (cached-sample-info cs)) states))
             (dr-cache dr)))
 
-(declaim (ftype (function (data-reader list function) (integer 0)) %count-matching-query))
-(defun %count-matching-query (dr states query-fn)
+(defun* %count-matching-query (dr states query-fn)
+    (function (data-reader list function) (integer 0))
   "Drain newly-received samples and count those whose sample-state is in STATES and
    whose data satisfies QUERY-FN (the query-condition trigger predicate)."
   (%drain dr)
@@ -147,8 +147,8 @@
   (plusp (%count-matching (rc-reader c) (rc-states c))))
 (defmethod condition-trigger-value ((c query-condition))
   (plusp (%count-matching-query (rc-reader c) (rc-states c) (qc-query-fn c))))
-(declaim (ftype (function (entity keyword) t) %status-active-p))
-(defun %status-active-p (entity kind)
+(defun* %status-active-p (entity kind)
+    (function (entity keyword) t)
   "Whether the communication status KIND is currently active on ENTITY (the trigger
    predicate for a StatusCondition). :data-available follows unread samples; the
    matched/incompatible kinds follow their *_change counter (reset by get_*_status)."
@@ -178,28 +178,28 @@
 (defmethod condition-trigger-value ((c status-condition))
   (and (some (lambda (kind) (%status-active-p (sc-entity c) kind)) (sc-mask c)) t))
 
-(declaim (ftype (function () wait-set) make-wait-set))
-(defun make-wait-set ()
+(defun* make-wait-set ()
+    (function () wait-set)
   "Create a DDS WaitSet (a set of conditions to wait on)."
   (make-instance 'wait-set))
 
-(declaim (ftype (function (wait-set wait-condition) wait-set) attach-condition))
-(defun attach-condition (ws c)
+(defun* attach-condition (ws c)
+    (function (wait-set wait-condition) wait-set)
   "WaitSet::attach_condition — add C to WS and back-link WS onto C (so a notify can
    wake WS). Done at setup, before the wait."
   (dds.pal:with-lock ((ws-lock ws)) (pushnew c (ws-conditions ws)))
   (pushnew ws (wc-wait-sets c))
   ws)
 
-(declaim (ftype (function (wait-set wait-condition) wait-set) detach-condition))
-(defun detach-condition (ws c)
+(defun* detach-condition (ws c)
+    (function (wait-set wait-condition) wait-set)
   "WaitSet::detach_condition — remove C from WS and unlink WS from C."
   (dds.pal:with-lock ((ws-lock ws)) (setf (ws-conditions ws) (remove c (ws-conditions ws))))
   (setf (wc-wait-sets c) (remove ws (wc-wait-sets c)))
   ws)
 
-(declaim (ftype (function (wait-set real) list) wait-set-wait))
-(defun wait-set-wait (ws timeout-seconds)
+(defun* wait-set-wait (ws timeout-seconds)
+    (function (wait-set real) list)
   "WaitSet::wait — block until >=1 attached condition triggers or TIMEOUT-SECONDS
    elapses; return the list of triggered conditions (empty on timeout). Condvar-driven
    (ADR 0007): holds the WaitSet lock across each predicate check and the atomic
@@ -218,20 +218,20 @@
             (dds.pal:condvar-wait (ws-cv ws) (ws-lock ws)
                                   (min remaining +waitset-wake-cap-seconds+))))))))
 
-(declaim (ftype (function (read-condition) function) %condition-predicate))
-(defun %condition-predicate (condition)
+(defun* %condition-predicate (condition)
+    (function (read-condition) function)
   "The sample predicate a ReadCondition imposes on read/take: a QueryCondition's
    QUERY-FN, or %where-any (select all) for a plain ReadCondition."
   (if (typep condition 'query-condition) (qc-query-fn condition) #'%where-any))
 
-(declaim (ftype (function (data-reader read-condition) list) read-w-condition))
-(defun read-w-condition (dr condition)
+(defun* read-w-condition (dr condition)
+    (function (data-reader read-condition) list)
   "DataReader::read_w_condition — non-destructively read the cached samples selected by
    CONDITION (its sample-state mask, plus a QueryCondition's query predicate)."
   (read-samples dr :states (rc-states condition) :where (%condition-predicate condition)))
 
-(declaim (ftype (function (data-reader read-condition) list) take-w-condition))
-(defun take-w-condition (dr condition)
+(defun* take-w-condition (dr condition)
+    (function (data-reader read-condition) list)
   "DataReader::take_w_condition — take (remove) the cached samples selected by CONDITION
    (its sample-state mask, plus a QueryCondition's query predicate)."
   (take-samples dr :states (rc-states condition) :where (%condition-predicate condition)))

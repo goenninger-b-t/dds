@@ -33,20 +33,9 @@
 (defconstant +type-flag-is-appendable+ #x0002)            ; @position(1)
 (defconstant +type-flag-is-mutable+ #x0004)               ; @position(2)
 
-(declaim (ftype (function (symbol) (unsigned-byte 16)) %struct-type-flag))
-(declaim (ftype (function (minimal-struct-member) (unsigned-byte 16)) %member-flag))
-(declaim (ftype (function (dds.core.buffer:cursor) (integer 0)) %dheader-begin))
-(declaim (ftype (function (dds.core.buffer:cursor (integer 0)) (integer 0)) %dheader-end))
-(declaim (ftype (function (dds.core.buffer:cursor type-identifier) t) %put-type-identifier))
-(declaim (ftype (function (dds.core.buffer:cursor minimal-struct-member) t) %put-common-struct-member))
-(declaim (ftype (function (dds.core.buffer:cursor minimal-struct-member) t) %put-minimal-member-detail))
-(declaim (ftype (function (dds.core.buffer:cursor minimal-struct-type) t) %put-minimal-struct-type))
-(declaim (ftype (function (dds.core.buffer:cursor minimal-struct-type) t) %put-minimal-type-object))
-(declaim (ftype (function (dds.core.buffer:cursor minimal-struct-type) t) %put-type-object))
-(declaim (ftype (function (minimal-struct-type) (simple-array (unsigned-byte 8) (*))) minimal-type-object-octets))
-(declaim (ftype (function (minimal-struct-type) (simple-array (unsigned-byte 8) (*))) equivalence-hash))
 
-(defun %struct-type-flag (extensibility)
+(defun* %struct-type-flag (extensibility)
+    (function (symbol) (unsigned-byte 16))
   "Minimal-masked StructTypeFlag (idl §163, TypeFlagMinimalMask 0x0007): the
    extensibility bit only (no IS_NESTED/IS_AUTOID_HASH, which do not affect assignability)."
   (ecase extensibility
@@ -54,7 +43,8 @@
     (:appendable +type-flag-is-appendable+)
     (:mutable +type-flag-is-mutable+)))
 
-(defun %member-flag (m)
+(defun* %member-flag (m)
+    (function (minimal-struct-member) (unsigned-byte 16))
   "Minimal-masked StructMemberFlag (idl §139, MemberFlagMinimalMask 0x003f): TRY_CONSTRUCT
    DISCARD OR'd with @optional/@must_understand/@key. PROVISIONAL: the TRY_CONSTRUCT default
    and whether non-optional members carry @must_understand are Connext-confirmable."
@@ -65,14 +55,16 @@
 
 ;;; ---- DHEADER backpatching: write a placeholder, fill the size after the content ----
 
-(defun %dheader-begin (cursor)
+(defun* %dheader-begin (cursor)
+    (function (dds.core.buffer:cursor) (integer 0))
   "Align to 4 and write a placeholder DHEADER UInt32; return its byte position."
   (dds.cdr:cdr-align cursor 4 :xcdr2)
   (let ((p (dds.core.buffer:cursor-position cursor)))
     (dds.core.buffer:put-u32 cursor 0)
     p))
 
-(defun %dheader-end (cursor start)
+(defun* %dheader-end (cursor start)
+    (function (dds.core.buffer:cursor (integer 0)) (integer 0))
   "Backpatch the DHEADER at START with the serialized size of the content that follows it
    (XTypes §7.4.3.4.1: the size excludes the DHEADER itself)."
   (let ((e (dds.core.buffer:cursor-position cursor)))
@@ -83,7 +75,8 @@
 
 ;;; ---- TypeIdentifier (FINAL union, rule 26): discriminator octet + arm ----
 
-(defun %put-type-identifier (cursor ti)
+(defun* %put-type-identifier (cursor ti)
+    (function (dds.core.buffer:cursor type-identifier) t)
   "Serialize a TypeIdentifier: primitives are the bare discriminator octet; a narrow
    string is disc + bound (SBound octet for SMALL, LBound UInt32 for LARGE); a hash-defined
    (EK_MINIMAL/EK_COMPLETE) type is disc + the 14-octet EquivalenceHash (computed from the
@@ -112,21 +105,24 @@
 
 ;;; ---- CommonStructMember (FINAL, rule 17) + MinimalMemberDetail (FINAL) ----
 
-(defun %put-common-struct-member (cursor m)
+(defun* %put-common-struct-member (cursor m)
+    (function (dds.core.buffer:cursor minimal-struct-member) t)
   "CommonStructMember: member_id (UInt32) + member_flags (UInt16) + member_type_id."
   (dds.cdr:cdr-put-u32 cursor (minimal-struct-member-id m) :xcdr2)
   (dds.cdr:cdr-put-u16 cursor (%member-flag m) :xcdr2)
   (%put-type-identifier cursor (minimal-struct-member-type-identifier m))
   t)
 
-(defun %put-minimal-member-detail (cursor m)
+(defun* %put-minimal-member-detail (cursor m)
+    (function (dds.core.buffer:cursor minimal-struct-member) t)
   "MinimalMemberDetail: the 4-octet NameHash."
   (dds.core.buffer:put-octets cursor (minimal-struct-member-name-hash m) 0 4)
   t)
 
 ;;; ---- MinimalStructType (FINAL, rule 17): struct_flags + header + member_seq ----
 
-(defun %put-minimal-struct-type (cursor s)
+(defun* %put-minimal-struct-type (cursor s)
+    (function (dds.core.buffer:cursor minimal-struct-type) t)
   "MinimalStructType: StructTypeFlag (UInt16) + MinimalStructHeader (APPENDABLE: DHEADER +
    TK_NONE base_type + empty MinimalTypeDetail) + MinimalStructMemberSeq (sequence of
    APPENDABLE members: DHEADER + UInt32 length + each member as DHEADER + common + detail).
@@ -149,13 +145,15 @@
 
 ;;; ---- MinimalTypeObject (FINAL union, rule 26) + TypeObject (APPENDABLE, rule 30) ----
 
-(defun %put-minimal-type-object (cursor s)
+(defun* %put-minimal-type-object (cursor s)
+    (function (dds.core.buffer:cursor minimal-struct-type) t)
   "MinimalTypeObject FINAL union: TK_STRUCTURE discriminator + MinimalStructType arm."
   (dds.core.buffer:put-u8 cursor +tk-structure+)
   (%put-minimal-struct-type cursor s)
   t)
 
-(defun %put-type-object (cursor s)
+(defun* %put-type-object (cursor s)
+    (function (dds.core.buffer:cursor minimal-struct-type) t)
   "TypeObject APPENDABLE union: DHEADER + EK_MINIMAL discriminator + MinimalTypeObject."
   (let ((p (%dheader-begin cursor)))
     (dds.core.buffer:put-u8 cursor +ek-minimal+)
@@ -163,7 +161,8 @@
     (%dheader-end cursor p))
   t)
 
-(defun minimal-type-object-octets (s)
+(defun* minimal-type-object-octets (s)
+    (function (minimal-struct-type) (simple-array (unsigned-byte 8) (*)))
   "The canonical XCDR2 little-endian serialization of the EK_MINIMAL TypeObject for struct
    S (XTypes §7.3.4.5), with NO encapsulation header. The buffer the EquivalenceHash is
    computed over."
@@ -176,7 +175,8 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
       out)))
 
-(defun equivalence-hash (s)
+(defun* equivalence-hash (s)
+    (function (minimal-struct-type) (simple-array (unsigned-byte 8) (*)))
   "EquivalenceHash(S) = first 14 octets of MD5 of the serialized MinimalTypeObject
    (XTypes §7.3.4.9.1). Nested struct members recurse to the referenced struct's hash."
   (subseq (dds.core.md5:md5 (minimal-type-object-octets s)) 0 14))
@@ -193,13 +193,9 @@
 ;;;; (the complete member is omitted, MUTABLE permits it); the mutable member uses LC=4
 ;;;; (explicit NEXTINT length); dependent ordering is insertion order. Confirm vs Connext.
 
-(declaim (ftype (function (dds.core.buffer:cursor minimal-struct-type) t) %put-type-id-with-size))
-(declaim (ftype (function (minimal-struct-type) list) %collect-dependencies))
-(declaim (ftype (function (dds.core.buffer:cursor minimal-struct-type) t) %put-type-id-with-deps))
-(declaim (ftype (function (minimal-struct-type) (simple-array (unsigned-byte 8) (*))) serialize-type-information))
-(declaim (ftype (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*))) deserialize-type-information-hash))
 
-(defun %put-type-id-with-size (c s)
+(defun* %put-type-id-with-size (c s)
+    (function (dds.core.buffer:cursor minimal-struct-type) t)
   "TypeIdentfierWithSize (APPENDABLE): DHEADER + EK_MINIMAL TypeIdentifier (disc + 14-octet
    hash) + typeobject_serialized_size (UInt32, the MinimalTypeObject byte length)."
   (let* ((bytes (minimal-type-object-octets s))
@@ -211,7 +207,8 @@
     (%dheader-end c p))
   t)
 
-(defun %collect-dependencies (s)
+(defun* %collect-dependencies (s)
+    (function (minimal-struct-type) list)
   "The dependent struct TypeObjects reachable from S (nested-struct members), deduped by
    EquivalenceHash, in stable insertion order. Excludes S itself; the DSL is acyclic."
   (let ((acc '()) (seen '()))
@@ -228,7 +225,8 @@
       (visit s))
     (nreverse acc)))
 
-(defun %put-type-id-with-deps (c s)
+(defun* %put-type-id-with-deps (c s)
+    (function (dds.core.buffer:cursor minimal-struct-type) t)
   "TypeIdentifierWithDependencies (APPENDABLE): DHEADER + TypeIdentfierWithSize(S) +
    dependent_typeid_count (Int32) + sequence<TypeIdentfierWithSize> (DHEADER + length +
    each dependency's TypeIdentfierWithSize)."
@@ -243,7 +241,8 @@
     (%dheader-end c p))
   t)
 
-(defun serialize-type-information (s)
+(defun* serialize-type-information (s)
+    (function (minimal-struct-type) (simple-array (unsigned-byte 8) (*)))
   "Serialize the TypeInformation for struct S (minimal only) as the octets carried in
    PID_TYPE_INFORMATION: a MUTABLE struct DHEADER + the @id(0x1001) minimal member
    (EMHEADER1 LC=4 + NEXTINT length + TypeIdentifierWithDependencies)."
@@ -266,7 +265,8 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
       out)))
 
-(defun deserialize-type-information-hash (octets)
+(defun* deserialize-type-information-hash (octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
   "Parse a serialized TypeInformation and return its minimal EK_MINIMAL TypeIdentifier's
    14-octet EquivalenceHash (the value endpoint matching needs). Lenient: walks the top
    DHEADER, the @id(0x1001) member EMHEADER1 (+NEXTINT), and the two APPENDABLE DHEADERs."

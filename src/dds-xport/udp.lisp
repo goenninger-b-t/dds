@@ -6,13 +6,13 @@
 
 (in-package #:dds.xport.udp)
 
-(defstruct udp-locator
+(defstruct* udp-locator
   "Destination address for a UDPv4 send: dotted-quad HOST and PORT."
   (host "127.0.0.1" :type string)
   (port 0 :type (unsigned-byte 16)))
 
-(declaim (ftype (function (&key (:host string) (:port (unsigned-byte 16))) (values dds.xport:transport t)) make-udp-transport))
-(defun make-udp-transport (&key (host "0.0.0.0") (port 0))
+(defun* make-udp-transport (&key (host "0.0.0.0") (port 0))
+    (function (&key (:host string) (:port (unsigned-byte 16))) (values dds.xport:transport t))
   "Open a UDPv4 socket bound to HOST:PORT and wrap it in a transport record.
    SEND assumes OFF is 0 for v1 (whole-buffer datagram from index 0). Returns
    (values transport socket); the socket has no slot in the frozen record."
@@ -42,21 +42,21 @@
       :close (lambda () (dds.pal:udp-close socket)))
      socket)))
 
-(declaim (ftype (function (t) (integer 0 65535)) udp-transport-local-port))
-(defun udp-transport-local-port (socket)
+(defun* udp-transport-local-port (socket)
+    (function (t) (integer 0 65535))
   "The bound local port of the UDP SOCKET."
   (dds.pal:udp-local-port socket))
 
-(declaim (ftype (function (t dds.core.buffer:octet-buffer) (values (integer 0) t t)) udp-transport-recv))
-(defun udp-transport-recv (socket buffer)
+(defun* udp-transport-recv (socket buffer)
+    (function (t dds.core.buffer:octet-buffer) (values (integer 0) t t))
   "Block until a datagram arrives; read it into BUFFER up to its capacity.
    Returns (values size sender-address sender-port)."
   (dds.pal:udp-recv socket
                     (dds.core.buffer:octet-buffer-vec buffer)
                     (dds.core.buffer:octet-buffer-capacity buffer)))
 
-(declaim (ftype (function () (eql t)) run-udp-transport-test))
-(defun run-udp-transport-test ()
+(defun* run-udp-transport-test ()
+    (function () (eql t))
   "Transport-level UDP loopback: sender SEND -> receiver recv on 127.0.0.1.
    Sends 4 known octets and asserts they round-trip. Returns T."
   (multiple-value-bind (rx-transport rx-socket) (make-udp-transport :host "127.0.0.1" :port 0)
@@ -88,8 +88,8 @@
         (dds.pal:udp-close rx-socket)
         (dds.pal:udp-close tx-socket)))))
 
-(declaim (ftype (function (t function) t) start-udp-receiver))
-(defun start-udp-receiver (socket on-datagram)
+(defun* start-udp-receiver (socket on-datagram)
+    (function (t function) t)
   "Spawn a thread that blocks on SOCKET, receiving each datagram into a 64 KiB
    octet-buffer and calling (ON-DATAGRAM buffer size). The thread exits when the
    socket is closed (udp-recv then signals). Returns the thread (FR-XPORT-5)."
@@ -108,8 +108,8 @@
          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
    :name "dds-udp-rx"))
 
-(declaim (ftype (function () (eql t)) run-udp-receiver-test))
-(defun run-udp-receiver-test ()
+(defun* run-udp-receiver-test ()
+    (function () (eql t))
   "Receiver-thread loopback: a background thread receives a datagram and records
    it; assert it arrives within a bounded wait. Returns T."
   (multiple-value-bind (rx-tr rx-sock) (make-udp-transport :host "127.0.0.1" :port 0)

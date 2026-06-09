@@ -4,7 +4,7 @@
 
 (defpackage #:net.goenninger.dds.xport
   (:nicknames #:dds.xport)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "Pluggable transport record (IMPLEMENTATION-PLAN §7.5). Adding a transport =
     constructing one record; the RTPS engine is untouched (FR-XPORT-5). M0 ships
@@ -17,7 +17,7 @@
 
 (defpackage #:net.goenninger.dds.xport.udp
   (:nicknames #:dds.xport.udp)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "UDPv4 transport (ADR 0006): wraps the frozen DDS.XPORT transport record
     around the native DDS.PAL UDP socket layer. make-udp-transport returns the

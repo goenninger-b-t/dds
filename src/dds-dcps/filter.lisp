@@ -29,35 +29,36 @@
 
 ;;; ---- Lexer: a filter string -> a list of (TYPE . VALUE) tokens ----
 
-(declaim (ftype (function (character) t) %whitespace-p))
-(defun %whitespace-p (ch)
+(defun* %whitespace-p (ch)
+    (function (character) t)
+  "True iff character CH is content-filter SQL lexer whitespace (space, tab, newline, return, page)."
   (member ch '(#\Space #\Tab #\Newline #\Return #\Page)))
 
-(declaim (ftype (function (string fixnum fixnum) (values string fixnum)) %lex-string))
-(defun %lex-string (str start n)
+(defun* %lex-string (str start n)
+    (function (string fixnum fixnum) (values string fixnum))
   "Lex a single-quoted STRING starting at START (just past the opening quote)."
   (let ((end (position #\' str :start start :end n)))
     (unless end (error 'filter-error :detail "unterminated string literal"))
     (values (subseq str start end) (1+ end))))
 
-(declaim (ftype (function (string fixnum fixnum) (values fixnum fixnum)) %lex-param))
-(defun %lex-param (str start n)
+(defun* %lex-param (str start n)
+    (function (string fixnum fixnum) (values fixnum fixnum))
   "Lex the digits of a %n PARAMETER starting at START (just past the '%')."
   (let ((i start))
     (loop while (and (< i n) (digit-char-p (char str i))) do (incf i))
     (when (= i start) (error 'filter-error :detail "expected digits after '%'"))
     (values (parse-integer str :start start :end i) i)))
 
-(declaim (ftype (function (string fixnum fixnum) double-float) %parse-float))
-(defun %parse-float (str start end)
+(defun* %parse-float (str start end)
+    (function (string fixnum fixnum) double-float)
   "Parse the validated numeric substring [START,END) as a double-float."
   (let ((*read-eval* nil) (*read-default-float-format* 'double-float))
     (let ((v (read-from-string (subseq str start end))))
       (unless (realp v) (error 'filter-error :detail "malformed float literal"))
       (coerce v 'double-float))))
 
-(declaim (ftype (function (string fixnum fixnum) (values cons fixnum)) %lex-number))
-(defun %lex-number (str start n)
+(defun* %lex-number (str start n)
+    (function (string fixnum fixnum) (values cons fixnum))
   "Lex an INTEGERVALUE (decimal or 0x-hex) or FLOATVALUE starting at START."
   (let ((i start) (sign 1) (floatp nil))
     (when (< i n)
@@ -84,8 +85,8 @@
              (values (cons :float (* sign (%parse-float str ds i))) i)
              (values (cons :int (* sign (parse-integer str :start ds :end i))) i)))))))
 
-(declaim (ftype (function (string fixnum fixnum) (values cons fixnum)) %lex-relop))
-(defun %lex-relop (str i n)
+(defun* %lex-relop (str i n)
+    (function (string fixnum fixnum) (values cons fixnum))
   "Lex a relational operator (=, >, >=, <, <=, <>, and '!=' as a synonym for <>)."
   (let ((c (char str i)) (c2 (when (< (1+ i) n) (char str (1+ i)))))
     (cond
@@ -98,8 +99,8 @@
       ((char= c #\<) (values (cons :relop :<) (1+ i)))
       (t (error 'filter-error :detail (format nil "bad operator at ~d" i))))))
 
-(declaim (ftype (function (string fixnum fixnum) (values cons fixnum)) %lex-ident))
-(defun %lex-ident (str start n)
+(defun* %lex-ident (str start n)
+    (function (string fixnum fixnum) (values cons fixnum))
   "Lex an identifier (FIELDNAME, dots allowed) or a reserved keyword (AND/OR/NOT/
    BETWEEN/LIKE, case-insensitive)."
   (let ((i start))
@@ -115,8 +116,8 @@
                     (t (cons :field s)))
               i))))
 
-(declaim (ftype (function (string) list) lex-filter))
-(defun lex-filter (str)
+(defun* lex-filter (str)
+    (function (string) list)
   "Tokenize a DDS filter/query expression STR into a list of (TYPE . VALUE) tokens."
   (let ((toks '()) (i 0) (n (length str)))
     (declare (type fixnum i n))
@@ -145,8 +146,8 @@
           (t (error 'filter-error :detail (format nil "unexpected character ~a at ~d" ch i))))))
     (nreverse toks)))
 
-(declaim (ftype (function (string) t) %lex-single-value))
-(defun %lex-single-value (str)
+(defun* %lex-single-value (str)
+    (function (string) t)
   "Lex a DDS expression-parameter string STR as exactly one literal value (the value a
    %n placeholder denotes); returns the integer / double-float / string value."
   (let ((toks (lex-filter str)))
@@ -156,8 +157,8 @@
 
 ;;; ---- Value comparison (type-aware; a cross-type comparison yields no match) ----
 
-(declaim (ftype (function (string string) t) %like-match))
-(defun %like-match (s pat)
+(defun* %like-match (s pat)
+    (function (string string) t)
   "SQL LIKE: match string S against pattern PAT, '%' = any sequence (incl. empty),
    '_' = exactly one character. Iterative two-pointer match with backtracking."
   (let ((slen (length s)) (plen (length pat)) (si 0) (pp 0) (star -1) (mat 0))
@@ -176,8 +177,8 @@
          (loop while (and (< pp plen) (char= (char pat pp) #\%)) do (incf pp))
          (return (= pp plen)))))))
 
-(declaim (ftype (function (symbol t t) t) %relop-apply))
-(defun %relop-apply (op a b)
+(defun* %relop-apply (op a b)
+    (function (symbol t t) t)
   "Apply RelOp OP to operand values A and B. Numbers compare numerically, strings
    lexicographically; LIKE matches a string against a pattern. A type mismatch (e.g. a
    number vs a string) is not a match (NIL) — robust for filtering."
@@ -195,11 +196,12 @@
 
 ;;; ---- Parser + compiler: expression -> predicate closure (lambda (sample) -> bool) ----
 
-(defstruct (pstate (:constructor make-pstate (rest)))
+(defstruct* (pstate (:constructor make-pstate (rest)))
+  "Mutable token-stream state for the content-filter SQL recursive-descent parser (the remaining unconsumed token list)."
   (rest nil :type list))
 
-(declaim (ftype (function (string list function) function) compile-filter))
-(defun compile-filter (expression parameters resolver)
+(defun* compile-filter (expression parameters resolver)
+    (function (string list function) function)
   "Compile a DDS Annex B filter/query EXPRESSION into a predicate (lambda (sample) ->
    generalized boolean). PARAMETERS are the DDS expression_parameters (strings; a %n
    token denotes PARAMETERS[n], lexed as a literal). RESOLVER maps a FIELDNAME string
@@ -310,9 +312,9 @@
 (defmethod td-filter-predicate ((cft content-filtered-topic))
   (lambda (sample) (funcall (cft-predicate cft) sample)))
 
-(declaim (ftype (function (domain-participant string topic string &optional list) content-filtered-topic) create-contentfilteredtopic))
-(defun create-contentfilteredtopic (participant name related-topic filter-expression
+(defun* create-contentfilteredtopic (participant name related-topic filter-expression
                                     &optional (parameters '()))
+    (function (domain-participant string topic string &optional list) content-filtered-topic)
   "DomainParticipant::create_contentfilteredtopic — a ContentFilteredTopic named NAME
    over RELATED-TOPIC, filtered by FILTER-EXPRESSION (DDS Annex B) + PARAMETERS. The
    predicate is compiled now against the related topic's type (FR-DCPS-5)."
@@ -325,8 +327,8 @@
     (push cft (dp-children participant))
     cft))
 
-(declaim (ftype (function (content-filtered-topic list) content-filtered-topic) set-cft-expression-parameters))
-(defun set-cft-expression-parameters (cft parameters)
+(defun* set-cft-expression-parameters (cft parameters)
+    (function (content-filtered-topic list) content-filtered-topic)
   "ContentFilteredTopic::set_expression_parameters — recompile the predicate with new
    PARAMETERS; DataReaders created on CFT pick up the new predicate (they call through
    to CFT's current predicate)."

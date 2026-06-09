@@ -7,8 +7,9 @@
 ;;; together the type compiler, CDR/encapsulation, the submessage codec + dispatch
 ;;; loop, the UDP transport, and the reliable engine.
 
-(declaim (ftype (function () t) run-end-to-end-test))
-(defun run-end-to-end-test ()
+(defun* run-end-to-end-test ()
+    (function () t)
+  "Test: a sample flows through the full participant stack over UDP (SPDP/SEDP + reliable data plane)."
   (let* ((wid #x00000102)
          (rid dds.rtps.message:+entityid-participant+)
          (sample (make-gsample :id 1234567 :ts -98765432101 :label "shapes"))
@@ -80,8 +81,8 @@
   (y :i32)
   (shapesize :i32))
 
-(declaim (ftype (function (shape-type) (simple-array (unsigned-byte 8) (*))) %serialize-shape))
-(defun %serialize-shape (shape)
+(defun* %serialize-shape (shape)
+    (function (shape-type) (simple-array (unsigned-byte 8) (*)))
   "Serialize SHAPE as a PLAIN_CDR2_LE SerializedPayload (encapsulation header +
    XCDR2 body) into a fresh octet vector — the data-plane publish payload."
   (let* ((buf (dds.core.buffer:make-octet-buffer 256))
@@ -94,8 +95,8 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
       out)))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 8) (*))) shape-type) %deserialize-shape))
-(defun %deserialize-shape (bytes)
+(defun* %deserialize-shape (bytes)
+    (function ((simple-array (unsigned-byte 8) (*))) shape-type)
   "Parse a PLAIN_CDR2_LE SerializedPayload (encapsulation header + XCDR2 body) into
    a shape-type. The deserialized struct copies its fields out, so the scratch
    buffer is freed immediately."
@@ -106,8 +107,8 @@
     (prog1 (deserialize-shape-type rc :xcdr2)
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))
 
-(declaim (ftype (function () t) run-typed-dataplane-test))
-(defun run-typed-dataplane-test ()
+(defun* run-typed-dataplane-test ()
+    (function () t)
   "A generated ShapeType flows fully typed across the participant data plane: two
    participants discover (SPDP) + match (SEDP), then node1 publishes an XCDR2-encoded
    Shape that node2 receives reliably and deserializes; assert every field survives.
@@ -172,8 +173,8 @@
   (id :i32)
   (text :string))
 
-(declaim (ftype (function () t) run-dcps-entity-test))
-(defun run-dcps-entity-test ()
+(defun* run-dcps-entity-test ()
+    (function () t)
   "Two DomainParticipants discover via multicast; a DataWriter writes a generated
    dcps-msg that a DataReader takes — entirely through the CLOS DCPS entity model and
    the typed type-support codec. Proves the DDS API layer over the RTPS engine."
@@ -211,15 +212,18 @@
 ;;; shape-type (key = color): two colors -> two instances; read is non-destructive +
 ;;; marks samples READ + transitions per-instance view-state NEW->NOT_NEW; take removes.
 
-(declaim (ftype (function (dds.dcps:cached-sample) t) %cs-vs))
-(defun %cs-vs (cs) (dds.dcps:sample-info-view-state (dds.dcps:cached-sample-info cs)))
-(declaim (ftype (function (dds.dcps:cached-sample) t) %cs-ss))
-(defun %cs-ss (cs) (dds.dcps:sample-info-sample-state (dds.dcps:cached-sample-info cs)))
-(declaim (ftype (function (dds.dcps:cached-sample) t) %cs-ih))
-(defun %cs-ih (cs) (dds.dcps:sample-info-instance-handle (dds.dcps:cached-sample-info cs)))
+(defun* %cs-vs (cs)
+    (function (dds.dcps:cached-sample) t)
+  "The view-state of a cached-sample CS (test accessor)." (dds.dcps:sample-info-view-state (dds.dcps:cached-sample-info cs)))
+(defun* %cs-ss (cs)
+    (function (dds.dcps:cached-sample) t)
+  "The sample-state of a cached-sample CS (test accessor)." (dds.dcps:sample-info-sample-state (dds.dcps:cached-sample-info cs)))
+(defun* %cs-ih (cs)
+    (function (dds.dcps:cached-sample) t)
+  "The instance-handle of a cached-sample CS (test accessor)." (dds.dcps:sample-info-instance-handle (dds.dcps:cached-sample-info cs)))
 
-(declaim (ftype (function () t) run-dcps-instance-test))
-(defun run-dcps-instance-test ()
+(defun* run-dcps-instance-test ()
+    (function () t)
   "DCPS instance lifecycle + read/take + SampleInfo (FR-DCPS-4) on the keyed
    shape-type: write 3 samples in 2 instances (BLUE x2, RED x1); assert instance
    grouping, READ marking + non-destructive read, view-state NEW->NOT_NEW, and take
@@ -272,8 +276,8 @@
 ;;; blocks endpoint matching even when topic+type agree. (Gating DATA delivery on the
 ;;; match — so RxO also blocks delivery, not just matching — is the immediate follow-up.)
 
-(declaim (ftype (function (t t) (values integer t)) %rxo-scenario))
-(defun %rxo-scenario (writer-qos reader-qos)
+(defun* %rxo-scenario (writer-qos reader-qos)
+    (function (t t) (values integer t))
   "Create a writer/reader pair with the given QoS on a shared topic; spin discovery,
    write one sample, and return (values MATCHED-COUNT DATA-RECEIVED-P) — so the test
    can assert RxO blocks both the match AND delivery."
@@ -297,8 +301,8 @@
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))))
 
-(declaim (ftype (function () t) run-dcps-rxo-test))
-(defun run-dcps-rxo-test ()
+(defun* run-dcps-rxo-test ()
+    (function () t)
   "RxO blocks matching AND delivery (FR-QOS-2): a compatible writer/reader match and
    the sample is delivered; a VOLATILE writer vs a reader requesting TRANSIENT_LOCAL
    neither match nor deliver, despite agreeing on topic+type."
@@ -315,8 +319,8 @@
 ;;; ReadCondition + WaitSet block until a written sample arrives (DATA_AVAILABLE),
 ;;; then return the triggered condition; wait times out (empty) when there is no data.
 
-(declaim (ftype (function () t) run-dcps-waitset-test))
-(defun run-dcps-waitset-test ()
+(defun* run-dcps-waitset-test ()
+    (function () t)
   "DDS Conditions + WaitSet: guard-condition on-demand trigger + read-condition that
    fires when a sample arrives, surfaced through WaitSet::wait with a timeout."
   ;; GuardCondition
@@ -378,13 +382,13 @@
   (declare (ignore writer))
   (dds.pal:with-lock ((cap-lock l)) (push (cons :pub-matched status) (cap-hits l))))
 
-(declaim (ftype (function (capture-mixin) list) cap-snapshot))
-(defun cap-snapshot (l)
+(defun* cap-snapshot (l)
+    (function (capture-mixin) list)
   "Thread-safe snapshot of a capturing listener's recorded events."
   (dds.pal:with-lock ((cap-lock l)) (copy-list (cap-hits l))))
 
-(declaim (ftype (function () t) run-dcps-matched-status-test))
-(defun run-dcps-matched-status-test ()
+(defun* run-dcps-matched-status-test ()
+    (function () t)
   "SUBSCRIPTION/PUBLICATION_MATCHED + their listeners (FR-DCPS-2/3): a compatible
    writer/reader pair match; the reader's subscription-matched-status and the writer's
    publication-matched-status each report total_count 1 / current_count 1; the
@@ -434,8 +438,8 @@
       (dds.dcps:delete-participant p2))
     t))
 
-(declaim (ftype (function () t) run-dcps-incompatible-qos-test))
-(defun run-dcps-incompatible-qos-test ()
+(defun* run-dcps-incompatible-qos-test ()
+    (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a
    VOLATILE writer and a reader requesting TRANSIENT_LOCAL agree on topic+type but fail
    durability RxO. The reader's requested-incompatible-qos-status and the writer's
@@ -492,8 +496,8 @@
 ;;; matching sample triggers it; read_w_condition returns only the matching samples.
 ;;; v1 takes a Lisp predicate (the DDS SQL-subset grammar is #4).
 
-(declaim (ftype (function () t) run-dcps-query-condition-test))
-(defun run-dcps-query-condition-test ()
+(defun* run-dcps-query-condition-test ()
+    (function () t)
   "QueryCondition (FR-DCPS-2/5): a ReadCondition + a predicate (id > 50). A sample that
    fails the predicate does NOT trigger the WaitSet though unread; a sample that passes
    triggers it; read_w_condition returns only the matching samples and marks them read,
@@ -549,8 +553,8 @@
   (declare (ignore reader))
   (dds.pal:with-lock ((cap-lock l)) (push :data-available (cap-hits l))))
 
-(declaim (ftype (function () t) run-dcps-condvar-wake-test))
-(defun run-dcps-condvar-wake-test ()
+(defun* run-dcps-condvar-wake-test ()
+    (function () t)
   "Condvar-driven WaitSet wake + on_data_available (ADR 0007): a ReadCondition attached
    to a WaitSet wakes when a written sample arrives (the receiver thread signals the
    WaitSet condvar), the reader's on_data_available listener fires from that thread,
@@ -592,17 +596,18 @@
 ;;; evaluate them — comparisons, %n parameters, AND/OR/NOT, parens, BETWEEN, LIKE,
 ;;; field-vs-field, and the lexical/syntactic/field-resolution error paths. No network.
 
-(declaim (ftype (function (t) function) %ts-resolver))
-(defun %ts-resolver (ts)
+(defun* %ts-resolver (ts)
+    (function (t) function)
   "A FIELDNAME resolver over a type-support's generated field-accessors (ADR 0008)."
   (let ((fa (dds.types:type-support-field-accessors ts)))
     (lambda (name) (cdr (assoc name fa :test #'string-equal)))))
 
-(declaim (ftype (function (function t) t) %match-p))
-(defun %match-p (pred sample) (and (funcall pred sample) t))
+(defun* %match-p (pred sample)
+    (function (function t) t)
+  "True iff content-filter predicate PRED accepts SAMPLE (test helper)." (and (funcall pred sample) t))
 
-(declaim (ftype (function () t) run-dcps-filter-test))
-(defun run-dcps-filter-test ()
+(defun* run-dcps-filter-test ()
+    (function () t)
   "Compile + evaluate DDS Annex B filter/query expressions (FR-DCPS-5) over generated
    types, covering every production exercised by ContentFilteredTopic / QueryCondition."
   (let* ((mts (dds.types:find-type-support "dcps-msg"))
@@ -656,8 +661,8 @@
 ;;; ("x > %0", params ("50")) over the Square topic matches the writer on the related
 ;;; topic but surfaces only the samples passing the filter (reader-side).
 
-(declaim (ftype (function () t) run-dcps-content-filtered-topic-test))
-(defun run-dcps-content-filtered-topic-test ()
+(defun* run-dcps-content-filtered-topic-test ()
+    (function () t)
   "A ContentFilteredTopic delivers only matching samples: a reader on a CFT over Square
    with filter \"x > %0\" / params (50) receives the x=100 and x=200 shapes but not the
    x=10 shape, while still matching the writer on the related topic (FR-DCPS-5)."
@@ -697,8 +702,8 @@
 ;;; now accepts an Annex B expression + parameters, compiled against the reader's topic
 ;;; type (not just a Lisp predicate). No discovery/data needed — checks the predicate.
 
-(declaim (ftype (function () t) run-dcps-querycondition-sql-test))
-(defun run-dcps-querycondition-sql-test ()
+(defun* run-dcps-querycondition-sql-test ()
+    (function () t)
   "create_querycondition with :expression compiles the DDS query against the reader's
    topic type; the resulting query-fn filters by the SQL expression (FR-DCPS-5)."
   (let ((ts (dds.types:find-type-support "dcps-msg"))
@@ -729,8 +734,8 @@
   (declare (ignore topic))
   (dds.pal:with-lock ((cap-lock l)) (push (cons :inconsistent status) (cap-hits l))))
 
-(declaim (ftype (function () t) run-dcps-inconsistent-topic-test))
-(defun run-dcps-inconsistent-topic-test ()
+(defun* run-dcps-inconsistent-topic-test ()
+    (function () t)
   "INCONSISTENT_TOPIC (FR-DCPS-3): p1 registers topic IncTopic as shape-type, p2 as
    dcps-msg (same name, different type). Discovery flags the collision: the local Topic's
    inconsistent-topic-status total_count goes >= 1 and on_inconsistent_topic fires."
@@ -771,8 +776,8 @@
   (declare (ignore reader))
   (dds.pal:with-lock ((cap-lock l)) (push (cons :sample-rejected status) (cap-hits l))))
 
-(declaim (ftype (function () t) run-dcps-sample-rejected-test))
-(defun run-dcps-sample-rejected-test ()
+(defun* run-dcps-sample-rejected-test ()
+    (function () t)
   "SAMPLE_REJECTED + RESOURCE_LIMITS (FR-DCPS-3): a reliable reader with max_samples=2
    receives 3 samples; the 3rd is rejected at the DCPS cache (cache stays at 2),
    SAMPLE_REJECTED reports REJECTED_BY_SAMPLES_LIMIT, and on_sample_rejected fires."
@@ -817,8 +822,8 @@
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 
-(declaim (ftype (function () t) run-dcps-builtin-topics-test))
-(defun run-dcps-builtin-topics-test ()
+(defun* run-dcps-builtin-topics-test ()
+    (function () t)
   "Builtin-topic readers (FR-DCPS-6): two participants discover each other; the
    DCPSParticipant / DCPSPublication / DCPSSubscription / DCPSTopic readers expose the
    discovered participant, the remote writer/reader (topic+type), and the topic."
@@ -864,8 +869,8 @@
   (id :i32 :key t)
   (x :i32))
 
-(declaim (ftype (function () t) run-keyhash-test))
-(defun run-keyhash-test ()
+(defun* run-keyhash-test ()
+    (function () t)
   "DDS keyhash byte-exactness (RTPS 2.5 §9.6.4.8): the <=16 direct path (Example 1) and
    the >16 MD5 path; the handle depends only on the key value, distinctly."
   ;; Example 1 (spec, byte-exact): @key long id=0x12345678 -> {12 34 56 78 00..00}
@@ -891,8 +896,8 @@
 ;;; Minimal struct TypeObject (member TypeIdentifiers + byte-exact NameHashes) into the
 ;;; type-support; plus TypeIdentifier structural equality.
 
-(declaim (ftype (function () t) run-xtypes-model-test))
-(defun run-xtypes-model-test ()
+(defun* run-xtypes-model-test ()
+    (function () t)
   "The Minimal struct TypeObject built by define-dds-type carries the right member
    TypeIdentifier kinds, key flags, and byte-exact NameHashes; TypeIdentifier equality
    is structural (FR-TYPE-2)."
@@ -940,8 +945,8 @@
 ;;; enforcement Step-1 decision (§7.6.3.4.2). TypeObjects are built by hand so the engine
 ;;; is exercised in isolation against the spec's worked examples + every enforcement option.
 
-(declaim (ftype (function () t) run-assignability-test))
-(defun run-assignability-test ()
+(defun* run-assignability-test ()
+    (function () t)
   "FR-TYPE-4 assignability matrix: FINAL/APPENDABLE/MUTABLE member matching, truncation,
    prevent_type_widening, ignore_member_names, the string/sequence bound rules, nested-struct
    recursion + strong-assignability (delimited), structural equivalence, and the
@@ -1057,8 +1062,8 @@
 ;;; (§7.3.4.9.1). The hand-derived golden (struct pt{long x;}) proves the framing byte-exact
 ;;; against the §7.4.3.5.3 serialization VM. PROVISIONAL flag/encap choices await Connext.
 
-(declaim (ftype (function () t) run-typeobject-cdr-test))
-(defun run-typeobject-cdr-test ()
+(defun* run-typeobject-cdr-test ()
+    (function () t)
   "Serialize a Minimal struct TypeObject to XCDR2-LE + compute its EquivalenceHash. Asserts
    the spec-derived golden byte layout for a 1-member FINAL struct, the hash shape +
    determinism, distinct types hashing differently, nested-struct recursion, and that
@@ -1106,8 +1111,8 @@
 ;;; Round-trip-verifiable offline; the wire layout is PROVISIONAL (minimal-only, LC=4) pending
 ;;; Connext confirmation, like the TypeObject serializer.
 
-(declaim (ftype (function () t) run-type-information-test))
-(defun run-type-information-test ()
+(defun* run-type-information-test ()
+    (function () t)
   "TypeInformation codec: serialize + recover the minimal EquivalenceHash. The round-trip
    must yield the type's EquivalenceHash, be deterministic, distinguish types, and serialize
    nested dependencies (gseg depends on gpoint)."
@@ -1141,8 +1146,8 @@
 ;;; truncated LB rejects (bounds + resource guard, NFR-SEC-POSTURE). The LB vector below is
 ;;; a deterministic ZLIB stream (header + stored block) for the 60-octet i*7 pattern.
 
-(declaim (ftype (function () (simple-array (unsigned-byte 8) (*))) %connext-shape-type-lb))
-(defun %connext-shape-type-lb ()
+(defun* %connext-shape-type-lb ()
+    (function () (simple-array (unsigned-byte 8) (*)))
   "The live RTI Connext 7.3.1 ShapeType PID_TYPE_OBJECT_LB parameter value (232 octets),
    captured 2026-06-09 via the typeobject-probe (ADR 0009); inflates to a 540-octet TypeObject."
   (coerce
@@ -1159,8 +1164,9 @@
      0 0)
    '(simple-array (unsigned-byte 8) (*))))
 
-(declaim (ftype (function () t) run-type-object-lb-test))
-(defun run-type-object-lb-test ()
+(defun* run-type-object-lb-test ()
+    (function () t)
+  "Test: inflate-type-object-lb + fingerprint against a real Connext ShapeType PID_TYPE_OBJECT_LB (ADR 0009)."
   (let ((lb (coerce '(1 0 0 0 60 0 0 0 71 0 0 0 120 218 1 60 0 195 255
                       0 7 14 21 28 35 42 49 56 63 70 77 84 91 98 105 112 119 126 133
                       140 147 154 161 168 175 182 189 196 203 210 217 224 231 238 245
@@ -1211,8 +1217,9 @@
 ;;; rides the endpoint ParameterList; parse-endpoint-data captures it OPAQUE (L4, no dds-types
 ;;; dep), and the higher layer inflates + fingerprints it to recover the peer's type.
 
-(declaim (ftype (function () t) run-sedp-type-object-lb-test))
-(defun run-sedp-type-object-lb-test ()
+(defun* run-sedp-type-object-lb-test ()
+    (function () t)
+  "Test: SEDP capture of an inbound PID_TYPE_OBJECT_LB, end to end (capture -> inflate -> fingerprint)."
   (let* ((lb (%connext-shape-type-lb))
          (ob (dds.core.buffer:make-octet-buffer 512))
          (wc (dds.core.buffer:cursor ob :endianness :little)))
@@ -1237,8 +1244,8 @@
 ;;; RTI's legacy TypeObject is not the OMG CompleteTypeObject), so a missing name is
 ;;; inconclusive and must not reject a peer.
 
-(declaim (ftype (function () t) run-type-compat-soft-test))
-(defun run-type-compat-soft-test ()
+(defun* run-type-compat-soft-test ()
+    (function () t)
   "ASSESS-TYPE-OBJECT-LB verdicts + TYPE-SUPPORT-FINGERPRINT-NAMES against the real Connext
    ShapeType LB: the local shape-type's member names are present in the peer's inflated
    TypeObject (:names-present); a type whose member is absent yields :names-absent (+ the
@@ -1280,8 +1287,8 @@
 ;;; peer's PID_TYPE_OBJECT_LB fingerprint verdict on the local DataReader/DataWriter via
 ;;; ENTITY-TYPE-COMPAT (inspection) and writes one line to *TYPE-COMPAT-LOG* when bound.
 
-(declaim (ftype (function () t) run-dcps-type-compat-test))
-(defun run-dcps-type-compat-test ()
+(defun* run-dcps-type-compat-test ()
+    (function () t)
   "%ON-DISC-MATCH assesses a freshly matched peer's PID_TYPE_OBJECT_LB against the local
    type and records the verdict on the local DataReader (ENTITY-TYPE-COMPAT), also writing
    one advisory line to *TYPE-COMPAT-LOG* when bound; it never gates the match (ADR 0009)."
@@ -1314,8 +1321,8 @@
 ;;; the dds-rtps opaque wire mechanism interoperate (emit only; match enforcement deferred
 ;;; until the EquivalenceHash is Connext-confirmed).
 
-(declaim (ftype (function () t) run-sedp-type-information-test))
-(defun run-sedp-type-information-test ()
+(defun* run-sedp-type-information-test ()
+    (function () t)
   "serialize-endpoint-data carries the TypeInformation as PID_TYPE_INFORMATION;
    parse-endpoint-data recovers the opaque octets; deserialize-type-information-hash yields
    the type's EquivalenceHash, alongside the still-round-tripping type-name."

@@ -3,7 +3,7 @@
 
 (defpackage #:net.goenninger.dds.cdr
   (:nicknames #:dds.cdr)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "XCDR1 + XCDR2 codec substrate (IMPLEMENTATION-PLAN §7.2). The codec is NOT
     generic-function based: generated per-type functions (serialize-T /

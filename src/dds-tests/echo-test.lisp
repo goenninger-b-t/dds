@@ -6,23 +6,21 @@
   (:report (lambda (c s) (format s "TEST FAILED [~a]: ~a"
                                  (test-failure-name c) (test-failure-detail c)))))
 
-(declaim (ftype (function (t t t) t) %check))
-(declaim (ftype (function (&rest (unsigned-byte 8)) (simple-array (unsigned-byte 8) (*))) octets))
-(declaim (ftype (function () t) run-echo-test))
-(declaim (ftype (function (dds.core.buffer:octet-buffer (integer 0)) list) %first-bytes))
-(declaim (ftype (function () t) run-byte-exact-test))
-(declaim (ftype (function () t) run-codec-roundtrip-test))
-(declaim (ftype (function () t) run-all-tests))
 
-(defun %check (name ok detail)
+(defun* %check (name ok detail)
+    (function (t t t) t)
+  "Test assertion: unless OK, signal TEST-FAILURE named NAME with DETAIL; otherwise return T."
   (unless ok (error 'test-failure :name name :detail detail))
   t)
 
-(defun octets (&rest bytes)
+(defun* octets (&rest bytes)
+    (function (&rest (unsigned-byte 8)) (simple-array (unsigned-byte 8) (*)))
+  "Build a (simple-array (unsigned-byte 8) (*)) from the BYTES argument list (test fixture)."
   (make-array (length bytes) :element-type '(unsigned-byte 8)
                              :initial-contents bytes))
 
-(defun run-echo-test ()
+(defun* run-echo-test ()
+    (function () t)
   "M0 exit test: octets -> static pooled buffer -> mock loopback transport ->
    read back -> verify identity -> release -> verify zero leak."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 256 1024)))
@@ -59,32 +57,37 @@
 ;;; tsample's i64 follows one i32, so it sits at a 4-aligned/not-8-aligned offset:
 ;;; XCDR1 pads to 8, XCDR2 does not — the encodings MUST differ in length (R3).
 
-(defstruct (tsample (:constructor make-tsample))
+(defstruct* (tsample (:constructor make-tsample))
+  "Test fixture struct (i32 id; i64 ts; string label) exercising the hand-written XCDR byte-exact reference codec."
   (id 0 :type (signed-byte 32))
   (ts 0 :type (signed-byte 64))
   (label "" :type string))
 
-(declaim (ftype (function (tsample tsample) boolean) tsample=))
-(declaim (ftype (function (tsample dds.core.buffer:cursor symbol) t) serialize-tsample))
-(declaim (ftype (function (dds.core.buffer:cursor symbol) tsample) deserialize-tsample))
 
-(defun tsample= (a b)
+(defun* tsample= (a b)
+    (function (tsample tsample) boolean)
+  "Field-by-field equality of two TSAMPLE test structs."
   (and (= (tsample-id a) (tsample-id b))
        (= (tsample-ts a) (tsample-ts b))
        (string= (tsample-label a) (tsample-label b))))
 
-(defun serialize-tsample (p c mode)
+(defun* serialize-tsample (p c mode)
+    (function (tsample dds.core.buffer:cursor symbol) t)
+  "Serialize TSAMPLE P into cursor C in XCDR MODE via the hand-written reference codec (byte-exact test)."
   (dds.cdr:cdr-put-i32 c (tsample-id p) mode)
   (dds.cdr:cdr-put-i64 c (tsample-ts p) mode)
   (dds.cdr:cdr-put-string c (tsample-label p) mode))
 
-(defun deserialize-tsample (c mode)
+(defun* deserialize-tsample (c mode)
+    (function (dds.core.buffer:cursor symbol) tsample)
+  "Deserialize a TSAMPLE from cursor C in XCDR MODE via the hand-written reference codec."
   (let* ((id (dds.cdr:cdr-get-i32 c mode))
          (ts (dds.cdr:cdr-get-i64 c mode))
          (label (dds.cdr:cdr-get-string c mode)))
     (make-tsample :id id :ts ts :label label)))
 
-(defun run-codec-roundtrip-test ()
+(defun* run-codec-roundtrip-test ()
+    (function () t)
   "Serialize/deserialize a struct in both XCDR modes; verify identity and that
    the 8-byte member forces an XCDR1/XCDR2 length divergence (FR-CDR-2, R3)."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 256 1024)))
@@ -115,11 +118,15 @@
 ;;; This is the spec-sourced seed of FR-CDR-8; full payload byte-exactness vs. RTI
 ;;; vectors is the interop follow-up.
 
-(defun %first-bytes (buf n)
+(defun* %first-bytes (buf n)
+    (function (dds.core.buffer:octet-buffer (integer 0)) list)
+  "The first N octets of octet-buffer BUF as a list (test diagnostic)."
   (let ((vec (dds.core.buffer:octet-buffer-vec buf)))
     (loop for i below n collect (aref vec i))))
 
-(defun run-byte-exact-test ()
+(defun* run-byte-exact-test ()
+    (function () t)
+  "Test: XCDR1 vs XCDR2 byte-exact seed vectors + the 8-byte-alignment divergence (FR-CDR, P0)."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 64 6)))
     (flet ((fresh (&optional (e :little))
@@ -178,18 +185,20 @@
 ;;; NameHash + the >16-byte keyhash). Verified byte-exact against the RFC 1321 test
 ;;; suite AND the XTypes spec NameHash example ("color" -> 70 dd a5 df).
 
-(declaim (ftype (function (string) (simple-array (unsigned-byte 8) (*))) %ascii-octets))
-(defun %ascii-octets (s)
+(defun* %ascii-octets (s)
+    (function (string) (simple-array (unsigned-byte 8) (*)))
+  "The ASCII code points of string S as a (simple-array (unsigned-byte 8) (*))."
   (map '(simple-array (unsigned-byte 8) (*)) #'char-code s))
 
-(declaim (ftype (function (string) (simple-array (unsigned-byte 8) (*))) %hex-octets))
-(defun %hex-octets (hex)
+(defun* %hex-octets (hex)
+    (function (string) (simple-array (unsigned-byte 8) (*)))
+  "Parse hex string HEX (whitespace ignored) into a (simple-array (unsigned-byte 8) (*))."
   (let ((out (make-array (floor (length hex) 2) :element-type '(unsigned-byte 8))))
     (dotimes (i (length out) out)
       (setf (aref out i) (parse-integer hex :start (* 2 i) :end (+ 2 (* 2 i)) :radix 16)))))
 
-(declaim (ftype (function () t) run-md5-test))
-(defun run-md5-test ()
+(defun* run-md5-test ()
+    (function () t)
   "MD5 byte-exactness vs the RFC 1321 test suite + the XTypes NameHash example."
   (flet ((chk (name input expected-hex)
            (%check name (equalp (dds.core.md5:md5 (%ascii-octets input)) (%hex-octets expected-hex))
@@ -209,7 +218,8 @@
             "XTypes NameHash example color -> 70 dd a5 df"))
   t)
 
-(defun run-all-tests ()
+(defun* run-all-tests ()
+    (function () t)
   "Run every landed test; signal on first failure, else report and return T."
   (let ((tests '(("md5-rfc1321"               . run-md5-test)
                  ("echo-over-mock-transport" . run-echo-test)

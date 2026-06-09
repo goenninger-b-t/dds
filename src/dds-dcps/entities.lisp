@@ -84,8 +84,8 @@
 ;; arrival hook below can wake the reader's WaitSets without a compile-time warning.
 (declaim (ftype (function (data-reader) t) %notify-reader-conditions))
 
-(declaim (ftype (function (t) function) %field-resolver))
-(defun %field-resolver (ts)
+(defun* %field-resolver (ts)
+    (function (t) function)
   "A content-filter FIELDNAME resolver over a type-support's field-accessors (ADR 0008):
    maps a field name (case-insensitively) to its unary accessor, or NIL."
   (let ((fa (dds.types:type-support-field-accessors ts)))
@@ -98,7 +98,7 @@
 
 ;;; ---- SampleInfo + cached samples (FR-DCPS-4) ----
 
-(defstruct (sample-info (:constructor make-sample-info))
+(defstruct* (sample-info (:constructor make-sample-info))
   "DDS 1.4 SampleInfo (dds_rtf2_dcps.idl §SampleInfo). v1 populates the three states +
    valid-data + instance-handle; source/publication handle, generation counts and the
    ranks default to 0/nil and are filled in by later increments. State kinds are kept
@@ -107,26 +107,26 @@
   (sample-state :not-read :type (member :read :not-read))
   (view-state :new :type (member :new :not-new))
   (instance-state :alive :type (member :alive :not-alive-disposed :not-alive-no-writers))
-  (source-timestamp nil)
-  (instance-handle nil)
-  (publication-handle nil)
+  (source-timestamp nil :type t)
+  (instance-handle nil :type t)
+  (publication-handle nil :type t)
   (disposed-generation-count 0 :type integer)
   (no-writers-generation-count 0 :type integer)
   (sample-rank 0 :type integer)
   (generation-rank 0 :type integer)
   (absolute-generation-rank 0 :type integer)
-  (valid-data t)
+  (valid-data t :type boolean)
   (sequence-number 0 :type integer))
 
-(defstruct (cached-sample (:constructor make-cached-sample))
+(defstruct* (cached-sample (:constructor make-cached-sample))
   "A read/take result element: the deserialized DATA + its SAMPLE-INFO."
-  (data nil)
+  (data nil :type t)
   (info nil :type (or null sample-info)))
 
 ;;; ---- type-support serialization helpers (PLAIN_CDR2_LE SerializedPayload) ----
 
-(declaim (ftype (function (t t) (simple-array (unsigned-byte 8) (*))) %serialize-sample))
-(defun %serialize-sample (ts sample)
+(defun* %serialize-sample (ts sample)
+    (function (t t) (simple-array (unsigned-byte 8) (*)))
   "Serialize SAMPLE via type-support TS as a PLAIN_CDR2_LE SerializedPayload."
   (let* ((buf (dds.core.buffer:make-octet-buffer 2048))
          (wc (dds.core.buffer:cursor buf :endianness :little)))
@@ -138,8 +138,8 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
       out)))
 
-(declaim (ftype (function (t (simple-array (unsigned-byte 8) (*))) t) %deserialize-sample))
-(defun %deserialize-sample (ts bytes)
+(defun* %deserialize-sample (ts bytes)
+    (function (t (simple-array (unsigned-byte 8) (*))) t)
   "Deserialize a SerializedPayload (encap header + body) into a sample via TS."
   (let* ((ob (dds.core.buffer:make-octet-buffer (length bytes)))
          (rc (dds.core.buffer:cursor ob :endianness :little)))
@@ -153,8 +153,8 @@
 (defvar *participant-counter* 0
   "Process-local counter for GUID-prefix uniqueness (single creation thread assumed).")
 
-(declaim (ftype (function () (simple-array (unsigned-byte 8) (12))) %make-guid-prefix))
-(defun %make-guid-prefix ()
+(defun* %make-guid-prefix ()
+    (function () (simple-array (unsigned-byte 8) (12)))
   "A unique-enough 12-octet GUID prefix per participant: vendor marker + a process
    counter + the wall clock. Without this every participant defaults to the all-zero
    prefix and the self-check makes them ignore each other's SPDP. Demo-grade."
@@ -165,8 +165,8 @@
     (loop for i from 3 below 12 do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
-(declaim (ftype (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string)) domain-participant) create-participant))
-(defun create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1"))
+(defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string)) domain-participant)
   "DomainParticipantFactory::create_participant — open the RTPS engine (a multicast
    disc-node) for DOMAIN, install the match/incompatible-QoS hooks that surface DDS
    statuses to the application, start the receiver, and return an enabled participant."
@@ -186,25 +186,25 @@
     (dds.disc:start-node node)
     p))
 
-(declaim (ftype (function (domain-participant) (eql t)) delete-participant))
-(defun delete-participant (p)
+(defun* delete-participant (p)
+    (function (domain-participant) (eql t))
   "Delete the participant and its contained entities; stop the engine."
   (dds.disc:stop-node (dp-node p))
   (setf (entity-enabled-p p) nil)
   t)
 
-(declaim (ftype (function (domain-participant) (integer 0)) discovered-count))
-(defun discovered-count (p)
+(defun* discovered-count (p)
+    (function (domain-participant) (integer 0))
   "Number of remote participants P has discovered."
   (dds.disc:disc-node-discovered-count (dp-node p)))
 
-(declaim (ftype (function (domain-participant) (integer 0)) matched-count))
-(defun matched-count (p)
+(defun* matched-count (p)
+    (function (domain-participant) (integer 0))
   "Number of remote endpoints matched against P's local endpoints."
   (dds.disc:disc-node-matched-count (dp-node p)))
 
-(declaim (ftype (function (domain-participant) (eql t)) spin))
-(defun spin (p)
+(defun* spin (p)
+    (function (domain-participant) (eql t))
   "Drive one discovery announcement cycle (SPDP + SEDP) for P. Discovery is
    caller-driven in v1 — an automatic background announcer with isolated send buffers
    is a follow-up (the engine's announce buffers are not yet thread-isolated)."
@@ -214,22 +214,22 @@
 
 ;;; ---- Publisher / Subscriber / Topic ----
 
-(declaim (ftype (function (domain-participant) publisher) create-publisher))
-(defun create-publisher (p)
+(defun* create-publisher (p)
+    (function (domain-participant) publisher)
   "DomainParticipant::create_publisher — create an enabled Publisher in P."
   (let ((pub (make-instance 'publisher :participant p :enabled t)))
     (push pub (dp-children p))
     pub))
 
-(declaim (ftype (function (domain-participant) subscriber) create-subscriber))
-(defun create-subscriber (p)
+(defun* create-subscriber (p)
+    (function (domain-participant) subscriber)
   "DomainParticipant::create_subscriber — create an enabled Subscriber in P."
   (let ((sub (make-instance 'subscriber :participant p :enabled t)))
     (push sub (dp-children p))
     sub))
 
-(declaim (ftype (function (domain-participant string string t) topic) create-topic))
-(defun create-topic (p name type-name type-support)
+(defun* create-topic (p name type-name type-support)
+    (function (domain-participant string string t) topic)
   "DomainParticipant::create_topic. TYPE-SUPPORT is a registered dds.types
    type-support (the generated codec bundle) used by write/take."
   (let ((tp (make-instance 'topic :name name :type-name type-name
@@ -239,8 +239,8 @@
 
 ;;; ---- DataWriter / DataReader ----
 
-(declaim (ftype (function (t) (or null (simple-array (unsigned-byte 8) (*)))) %topic-type-information))
-(defun %topic-type-information (topic)
+(defun* %topic-type-information (topic)
+    (function (t) (or null (simple-array (unsigned-byte 8) (*))))
   "Opaque serialized XTypes TypeInformation for TOPIC's type-support (PID_TYPE_INFORMATION),
    or NIL if unavailable or not yet serializable (e.g. a type with sequence members, whose
    TypeObject serializer is oracle-deferred, or a ContentFilteredTopic)."
@@ -249,8 +249,8 @@
         (and ts (dds.types:serialize-type-information (dds.types:type-support-typeobject ts))))
     (error () nil)))
 
-(declaim (ftype (function (publisher topic &key (:qos t)) data-writer) create-datawriter))
-(defun create-datawriter (pub topic &key (qos (dds.qos:make-writer-qos)))
+(defun* create-datawriter (pub topic &key (qos (dds.qos:make-writer-qos)))
+    (function (publisher topic &key (:qos t)) data-writer)
   "Publisher::create_datawriter — register a local writer in the engine on the
    topic's name/type with the QoS reliability (v1: the single user writer)."
   (let ((node (dp-node (pub-participant pub))))
@@ -262,8 +262,8 @@
       (setf (dp-user-writer (pub-participant pub)) dw)   ; v1 back-ref for status hooks
       dw)))
 
-(declaim (ftype (function (subscriber t &key (:qos t)) data-reader) create-datareader))
-(defun create-datareader (sub topic &key (qos (dds.qos:make-reader-qos)))
+(defun* create-datareader (sub topic &key (qos (dds.qos:make-reader-qos)))
+    (function (subscriber t &key (:qos t)) data-reader)
   "Subscriber::create_datareader — register a local reader in the engine on the
    topic's name/type with the QoS reliability (v1: the single user reader). TOPIC may
    be a Topic or a ContentFilteredTopic; in the latter case the reader applies the
@@ -278,8 +278,8 @@
       (setf (dp-user-reader (sub-participant sub)) dr)   ; v1 back-ref for status hooks
       dr)))
 
-(declaim (ftype (function (data-writer t) (eql t)) write-sample))
-(defun write-sample (dw sample)
+(defun* write-sample (dw sample)
+    (function (data-writer t) (eql t))
   "DataWriter::write — serialize SAMPLE via the topic type-support and publish it
    reliably over the engine to all matched/discovered readers."
   (let ((node (dp-node (pub-participant (dw-publisher dw)))))
@@ -290,15 +290,15 @@
   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
   "HANDLE_NIL — the instance handle for an unkeyed type (single instance).")
 
-(declaim (ftype (function (t t) (simple-array (unsigned-byte 8) (16))) %instance-handle))
-(defun %instance-handle (ts sample)
+(defun* %instance-handle (ts sample)
+    (function (t t) (simple-array (unsigned-byte 8) (16)))
   "16-octet instance handle for SAMPLE via the type-support key-hash, or HANDLE_NIL
    for an unkeyed type."
   (let ((kh (dds.types:type-support-key-hash ts)))
     (if kh (funcall kh sample) +instance-handle-nil+)))
 
-(declaim (ftype (function (data-reader t) symbol) %resource-reject-reason))
-(defun %resource-reject-reason (dr handle)
+(defun* %resource-reject-reason (dr handle)
+    (function (data-reader t) symbol)
   "A SampleRejectedStatusKind keyword if caching a sample for instance HANDLE would
    exceed the reader's RESOURCE_LIMITS (DCPS-cache-level, v1), else NIL. -1 = unlimited."
   (let ((qos (entity-qos dr)))
@@ -321,8 +321,8 @@
            :rejected-by-instances-limit)
           (t nil))))))
 
-(declaim (ftype (function (data-reader symbol t) t) %reader-sample-rejected))
-(defun %reader-sample-rejected (dr reason handle)
+(defun* %reader-sample-rejected (dr reason handle)
+    (function (data-reader symbol t) t)
   "Bump DR's SAMPLE_REJECTED status (reason + instance handle) and fire on_sample_rejected
    if a listener is masked for it."
   (let ((snapshot nil))
@@ -338,8 +338,8 @@
     (when snapshot (on-sample-rejected (dr-listener dr) dr snapshot)))
   t)
 
-(declaim (ftype (function (data-reader) t) %drain))
-(defun %drain (dr)
+(defun* %drain (dr)
+    (function (data-reader) t)
   "Pull newly-received raw samples from the engine, deserialize, assign each to its
    instance, and append to the reader cache with fresh SampleInfo (NOT_READ, ALIVE)."
   (let* ((node (dp-node (sub-participant (dr-subscriber dr))))
@@ -369,14 +369,14 @@
                                                    :instance-state :alive :valid-data t
                                                    :instance-handle handle :sequence-number sn))))))))))))))))
 
-(declaim (ftype (function (t) (eql t)) %where-any))
-(defun %where-any (sample)
+(defun* %where-any (sample)
+    (function (t) (eql t))
   "The default read/take WHERE predicate — selects every sample (no query filter)."
   (declare (ignore sample))
   t)
 
-(declaim (ftype (function (data-reader &key (:states list) (:where function)) list) read-samples))
-(defun read-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
+(defun* read-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
+    (function (data-reader &key (:states list) (:where function)) list)
   "DataReader::read — return the cached samples whose sample-state is in STATES
    (default ANY_SAMPLE_STATE, both read + not-read, per DDS 1.4) and whose data
    satisfies WHERE (a predicate over the deserialized sample; %where-any by default —
@@ -398,8 +398,8 @@
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))   ; mark accessed after snapshot
     (nreverse out)))
 
-(declaim (ftype (function (data-reader &key (:states list) (:where function)) list) take-samples))
-(defun take-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
+(defun* take-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
+    (function (data-reader &key (:states list) (:where function)) list)
   "DataReader::take — like read-samples but REMOVE the returned samples from the
    cache (default takes both read and unread). WHERE is the same optional query
    predicate (take_w_condition filter). Returns a list of cached-sample."
@@ -420,8 +420,8 @@
     (setf (dr-cache dr) (nreverse keep))
     (nreverse out)))
 
-(declaim (ftype (function (data-reader) (integer 0)) samples-available))
-(defun samples-available (dr)
+(defun* samples-available (dr)
+    (function (data-reader) (integer 0))
   "Drain newly-received samples into the cache and return the cache size, WITHOUT
    marking anything READ — for polling before a read/take."
   (%drain dr)
@@ -487,8 +487,8 @@
                               (%assess-and-record-type-compat dw remote))))))
   t)
 
-(declaim (ftype (function (domain-participant keyword dds.rtps.discovery:endpoint-data list) t) %on-disc-incompatible))
-(defun %on-disc-incompatible (p kind remote bad)
+(defun* %on-disc-incompatible (p kind remote bad)
+    (function (domain-participant keyword dds.rtps.discovery:endpoint-data list) t)
   "ON-INCOMPATIBLE-QOS hook: topic+type agreed but RxO failed. :remote-writer -> our
    reader's REQUESTED_INCOMPATIBLE_QOS; :remote-reader -> our writer's OFFERED_
    INCOMPATIBLE_QOS. BAD is the failing-policy keyword list (dds.qos:qos-rxo-compatible)."
@@ -498,8 +498,8 @@
     (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-incompatible dw bad)))))
   t)
 
-(declaim (ftype (function (domain-participant) t) %on-participant-sample))
-(defun %on-participant-sample (p)
+(defun* %on-participant-sample (p)
+    (function (domain-participant) t)
   "ON-SAMPLE hook (disc receiver thread): new user data arrived for P's reader. Fire
    on_data_available if a listener is masked for it (snapshot under the status lock,
    call OUTSIDE it), then wake the reader's WaitSets (DATA_AVAILABLE / ReadCondition /
@@ -514,8 +514,8 @@
         (%notify-reader-conditions dr))))
   t)
 
-(declaim (ftype (function (data-reader t) t) %reader-matched))
-(defun %reader-matched (dr handle)
+(defun* %reader-matched (dr handle)
+    (function (data-reader t) t)
   "Bump DR's SUBSCRIPTION_MATCHED status; if a listener is installed for it, fire
    on-subscription-matched with a snapshot (resetting the *_change counters per DDS)."
   (let ((snapshot nil))
@@ -534,8 +534,8 @@
     (%notify-reader-conditions dr))   ; wake a StatusCondition(:subscription-matched) waiter
   t)
 
-(declaim (ftype (function (data-writer t) t) %writer-matched))
-(defun %writer-matched (dw handle)
+(defun* %writer-matched (dw handle)
+    (function (data-writer t) t)
   "Bump DW's PUBLICATION_MATCHED status; if a listener is installed for it, fire
    on-publication-matched with a snapshot (resetting the *_change counters per DDS)."
   (let ((snapshot nil))
@@ -553,8 +553,8 @@
     (when snapshot (on-publication-matched (dw-listener dw) dw snapshot)))
   t)
 
-(declaim (ftype (function (requested-incompatible-qos-status list) t) %apply-requested-incompatible))
-(defun %apply-requested-incompatible (s bad)
+(defun* %apply-requested-incompatible (s bad)
+    (function (requested-incompatible-qos-status list) t)
   "Accumulate the failing policies BAD into a REQUESTED_INCOMPATIBLE_QOS status S
    (one detection event): total_count++, per-policy QosPolicyCount bumps, last_policy_id."
   (incf (requested-incompatible-qos-status-total-count s))
@@ -566,8 +566,8 @@
       (setf (requested-incompatible-qos-status-last-policy-id s) pid)))
   t)
 
-(declaim (ftype (function (offered-incompatible-qos-status list) t) %apply-offered-incompatible))
-(defun %apply-offered-incompatible (s bad)
+(defun* %apply-offered-incompatible (s bad)
+    (function (offered-incompatible-qos-status list) t)
   "Accumulate the failing policies BAD into an OFFERED_INCOMPATIBLE_QOS status S."
   (incf (offered-incompatible-qos-status-total-count s))
   (incf (offered-incompatible-qos-status-total-count-change s))
@@ -578,8 +578,8 @@
       (setf (offered-incompatible-qos-status-last-policy-id s) pid)))
   t)
 
-(declaim (ftype (function (data-reader list) t) %reader-incompatible))
-(defun %reader-incompatible (dr bad)
+(defun* %reader-incompatible (dr bad)
+    (function (data-reader list) t)
   "Bump DR's REQUESTED_INCOMPATIBLE_QOS status; fire on-requested-incompatible-qos if a
    listener is installed for it (snapshot OUTSIDE the lock, deep-copying the policies)."
   (let ((snapshot nil))
@@ -595,8 +595,8 @@
     (%notify-reader-conditions dr))   ; wake a StatusCondition(:requested-incompatible-qos) waiter
   t)
 
-(declaim (ftype (function (data-writer list) t) %writer-incompatible))
-(defun %writer-incompatible (dw bad)
+(defun* %writer-incompatible (dw bad)
+    (function (data-writer list) t)
   "Bump DW's OFFERED_INCOMPATIBLE_QOS status; fire on-offered-incompatible-qos if a
    listener is installed for it (snapshot OUTSIDE the lock, deep-copying the policies)."
   (let ((snapshot nil))
@@ -613,8 +613,8 @@
 
 ;;; ---- get_*_status (app thread): snapshot + reset the *_change counters (DDS 1.4) ----
 
-(declaim (ftype (function (data-reader) subscription-matched-status) get-subscription-matched-status))
-(defun get-subscription-matched-status (dr)
+(defun* get-subscription-matched-status (dr)
+    (function (data-reader) subscription-matched-status)
   "DataReader::get_subscription_matched_status — a snapshot; resets the *_change
    counters per DDS read-resets-change semantics."
   (dds.pal:with-lock ((dr-status-lock dr))
@@ -623,8 +623,8 @@
         (setf (subscription-matched-status-total-count-change s) 0
               (subscription-matched-status-current-count-change s) 0)))))
 
-(declaim (ftype (function (data-writer) publication-matched-status) get-publication-matched-status))
-(defun get-publication-matched-status (dw)
+(defun* get-publication-matched-status (dw)
+    (function (data-writer) publication-matched-status)
   "DataWriter::get_publication_matched_status — snapshot + reset the *_change counters."
   (dds.pal:with-lock ((dw-status-lock dw))
     (let ((s (dw-pub-matched dw)))
@@ -632,8 +632,8 @@
         (setf (publication-matched-status-total-count-change s) 0
               (publication-matched-status-current-count-change s) 0)))))
 
-(declaim (ftype (function (data-reader) requested-incompatible-qos-status) get-requested-incompatible-qos-status))
-(defun get-requested-incompatible-qos-status (dr)
+(defun* get-requested-incompatible-qos-status (dr)
+    (function (data-reader) requested-incompatible-qos-status)
   "DataReader::get_requested_incompatible_qos_status — snapshot (policies deep-copied)
    + reset total_count_change; the cumulative policies counts are retained per DDS."
   (dds.pal:with-lock ((dr-status-lock dr))
@@ -644,8 +644,8 @@
       (setf (requested-incompatible-qos-status-total-count-change s) 0)
       snap)))
 
-(declaim (ftype (function (data-writer) offered-incompatible-qos-status) get-offered-incompatible-qos-status))
-(defun get-offered-incompatible-qos-status (dw)
+(defun* get-offered-incompatible-qos-status (dw)
+    (function (data-writer) offered-incompatible-qos-status)
   "DataWriter::get_offered_incompatible_qos_status — snapshot (policies deep-copied)
    + reset total_count_change; the cumulative policies counts are retained per DDS."
   (dds.pal:with-lock ((dw-status-lock dw))
@@ -656,8 +656,8 @@
       (setf (offered-incompatible-qos-status-total-count-change s) 0)
       snap)))
 
-(declaim (ftype (function (data-reader) sample-rejected-status) get-sample-rejected-status))
-(defun get-sample-rejected-status (dr)
+(defun* get-sample-rejected-status (dr)
+    (function (data-reader) sample-rejected-status)
   "DataReader::get_sample_rejected_status — snapshot + reset total_count_change."
   (dds.pal:with-lock ((dr-status-lock dr))
     (let ((s (dr-sample-rejected dr)))
@@ -666,16 +666,16 @@
 
 ;;; ---- set_listener (DDS 1.4 Entity::set_listener) ----
 
-(declaim (ftype (function (data-reader (or null listener) list) data-reader) set-reader-listener))
-(defun set-reader-listener (dr listener mask)
+(defun* set-reader-listener (dr listener mask)
+    (function (data-reader (or null listener) list) data-reader)
   "DataReader::set_listener — install LISTENER for the statuses named in MASK (a list
    of status keywords, e.g. (:subscription-matched :requested-incompatible-qos))."
   (dds.pal:with-lock ((dr-status-lock dr))
     (setf (dr-listener dr) listener (dr-listener-mask dr) mask))
   dr)
 
-(declaim (ftype (function (data-writer (or null listener) list) data-writer) set-writer-listener))
-(defun set-writer-listener (dw listener mask)
+(defun* set-writer-listener (dw listener mask)
+    (function (data-writer (or null listener) list) data-writer)
   "DataWriter::set_listener — install LISTENER for the statuses named in MASK (a list
    of status keywords, e.g. (:publication-matched :offered-incompatible-qos))."
   (dds.pal:with-lock ((dw-status-lock dw))
@@ -685,13 +685,13 @@
 ;;; ---- INCONSISTENT_TOPIC (FR-DCPS-3): a remote topic of the same name but a
 ;;;      different type, detected in SEDP and surfaced on the local Topic. ----
 
-(declaim (ftype (function (domain-participant string) (or null topic)) %find-topic))
-(defun %find-topic (p name)
+(defun* %find-topic (p name)
+    (function (domain-participant string) (or null topic))
   "The participant's local Topic registered under NAME (a plain Topic, not a CFT), or NIL."
   (find-if (lambda (c) (and (typep c 'topic) (string= (topic-name c) name))) (dp-children p)))
 
-(declaim (ftype (function (domain-participant string) t) %on-disc-inconsistent-topic))
-(defun %on-disc-inconsistent-topic (p name)
+(defun* %on-disc-inconsistent-topic (p name)
+    (function (domain-participant string) t)
   "ON-INCONSISTENT-TOPIC hook (disc receiver thread): a remote endpoint announced topic
    NAME with a different type than P's local Topic of that name. Bump the Topic's
    INCONSISTENT_TOPIC status and, if a listener is masked for it, fire on_inconsistent_topic."
@@ -708,16 +708,16 @@
         (when snapshot (on-inconsistent-topic (topic-listener-obj tp) tp snapshot)))))
   t)
 
-(declaim (ftype (function (topic) inconsistent-topic-status) get-inconsistent-topic-status))
-(defun get-inconsistent-topic-status (tp)
+(defun* get-inconsistent-topic-status (tp)
+    (function (topic) inconsistent-topic-status)
   "Topic::get_inconsistent_topic_status — snapshot + reset the total_count_change."
   (dds.pal:with-lock ((topic-status-lock tp))
     (let ((s (topic-inconsistent-status tp)))
       (prog1 (copy-inconsistent-topic-status s)
         (setf (inconsistent-topic-status-total-count-change s) 0)))))
 
-(declaim (ftype (function (topic (or null listener) list) topic) set-topic-listener))
-(defun set-topic-listener (tp listener mask)
+(defun* set-topic-listener (tp listener mask)
+    (function (topic (or null listener) list) topic)
   "Topic::set_listener — install LISTENER for the statuses named in MASK (v1:
    (:inconsistent-topic))."
   (dds.pal:with-lock ((topic-status-lock tp))

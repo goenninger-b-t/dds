@@ -68,15 +68,16 @@
   "ENTITYID_PARTICIPANT (RTPS 2.5 §9.3.1.2): entityKey[3]+entityKind, MSB-first u32.")
 
 (declaim (inline %remaining))
-(declaim (ftype (function (dds.core.buffer:cursor) fixnum) %remaining))
-(defun %remaining (cursor)
+(defun* %remaining (cursor)
+    (function (dds.core.buffer:cursor) fixnum)
+  "Octets between CURSOR's current position and its buffer capacity (bytes still available)."
   (- (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor))
      (dds.core.buffer:cursor-position cursor)))
 
 ;;; ---- RTPS Message Header (§9.4.4): magic + version + vendorId + guidPrefix ----
 
-(declaim (ftype (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)) &key (:vendor (unsigned-byte 16))) fixnum) write-header))
-(defun write-header (cursor guid-prefix &key (vendor *vendor-id*))
+(defun* write-header (cursor guid-prefix &key (vendor *vendor-id*))
+    (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)) &key (:vendor (unsigned-byte 16))) fixnum)
   "Write the 20-octet RTPS Header (RTPS 2.5 §9.4.4). GUID-PREFIX is 12 octets; all
    header fields are octet arrays, so there is no endianness."
   (assert (= 12 (length guid-prefix)))
@@ -88,8 +89,8 @@
   (dds.core.buffer:put-octets cursor guid-prefix 0 12)
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor) t) parse-header))
-(defun parse-header (cursor)
+(defun* parse-header (cursor)
+    (function (dds.core.buffer:cursor) t)
   "Parse a 20-octet RTPS Header. Returns (values major minor vendor guid-prefix),
    or NIL if fewer than 20 octets remain or the magic is wrong. Bounds-checked;
    never reads OOB (NFR-SEC-POSTURE)."
@@ -110,8 +111,8 @@
 
 ;;; ---- SubmessageHeader (§9.4.5.1): submessageId, flags, octetsToNextHeader ----
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 16)) fixnum) write-submessage-header))
-(defun write-submessage-header (cursor submessage-id flags octets-to-next)
+(defun* write-submessage-header (cursor submessage-id flags octets-to-next)
+    (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 16)) fixnum)
   "Write a 4-octet SubmessageHeader (RTPS 2.5 §9.4.5.1). octetsToNextHeader is a
    u16 in the cursor's endianness, which the caller MUST keep consistent with the
    E flag (bit 0 of FLAGS)."
@@ -120,8 +121,8 @@
   (dds.core.buffer:put-u16 cursor octets-to-next)
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor) t) parse-submessage-header))
-(defun parse-submessage-header (cursor)
+(defun* parse-submessage-header (cursor)
+    (function (dds.core.buffer:cursor) t)
   "Parse a 4-octet SubmessageHeader. Returns (values submessage-id flags
    octets-to-next little-endian-p), or NIL if fewer than 4 octets remain.
    octetsToNextHeader is read with the endianness from the E flag (§9.4.5.1.2),
@@ -137,8 +138,8 @@
 
 ;;; ---- EntityId (§9.3.1.2): 4 octets entityKey[3]+entityKind, MSB-first ----
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32)) fixnum) write-entity-id))
-(defun write-entity-id (cursor entity-id)
+(defun* write-entity-id (cursor entity-id)
+    (function (dds.core.buffer:cursor (unsigned-byte 32)) fixnum)
   "Write a 4-octet EntityId MSB-first (RTPS 2.5 §9.3.1.2)."
   (dds.core.buffer:put-u8 cursor (ldb (byte 8 24) entity-id))
   (dds.core.buffer:put-u8 cursor (ldb (byte 8 16) entity-id))
@@ -146,8 +147,8 @@
   (dds.core.buffer:put-u8 cursor (ldb (byte 8 0) entity-id))
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor) (unsigned-byte 32)) read-entity-id))
-(defun read-entity-id (cursor)
+(defun* read-entity-id (cursor)
+    (function (dds.core.buffer:cursor) (unsigned-byte 32))
   "Read a 4-octet EntityId as a u32 (MSB-first) (RTPS 2.5 §9.3.1.2)."
   (let ((b0 (dds.core.buffer:get-u8 cursor)) (b1 (dds.core.buffer:get-u8 cursor))
         (b2 (dds.core.buffer:get-u8 cursor)) (b3 (dds.core.buffer:get-u8 cursor)))
@@ -158,15 +159,15 @@
 (defconstant +sequence-number-unknown+ (- (ash 1 32))
   "SEQUENCENUMBER_UNKNOWN = {high=-1, low=0} (RTPS 2.5 §8.3.5.4).")
 
-(declaim (ftype (function (dds.core.buffer:cursor integer) fixnum) write-sequence-number))
-(defun write-sequence-number (cursor seqnum)
+(defun* write-sequence-number (cursor seqnum)
+    (function (dds.core.buffer:cursor integer) fixnum)
   "Write an 8-octet SequenceNumber: high (i32) then low (u32), cursor endianness."
   (dds.core.buffer:put-u32 cursor (logand (ash seqnum -32) #xFFFFFFFF))
   (dds.core.buffer:put-u32 cursor (logand seqnum #xFFFFFFFF))
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor) integer) read-sequence-number))
-(defun read-sequence-number (cursor)
+(defun* read-sequence-number (cursor)
+    (function (dds.core.buffer:cursor) integer)
   "Read an 8-octet SequenceNumber as a signed 64-bit value (RTPS 2.5 §9.3.2.10)."
   (let* ((hu (dds.core.buffer:get-u32 cursor))
          (low (dds.core.buffer:get-u32 cursor))
@@ -179,31 +180,31 @@
 (defconstant +seqnum-set-max-bits+ 256
   "Maximum numBits in a SequenceNumberSet (RTPS 2.5 §9.4.2.6).")
 
-(declaim (ftype (function ((unsigned-byte 32)) fixnum) %seqnum-set-words))
-(defun %seqnum-set-words (numbits)
+(defun* %seqnum-set-words (numbits)
+    (function ((unsigned-byte 32)) fixnum)
   "M = (numBits+31)/32 longs (RTPS 2.5 §9.4.2.6)."
   (ceiling numbits 32))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 32) (*)) (integer 0)) (unsigned-byte 32)) seqnum-set-bit))
-(defun seqnum-set-bit (bitmap delta)
+(defun* seqnum-set-bit (bitmap delta)
+    (function ((simple-array (unsigned-byte 32) (*)) (integer 0)) (unsigned-byte 32))
   "Set the bit for offset DELTA: word DELTA/32, bit (31 - DELTA%32) (§9.4.2.6)."
   (let ((w (floor delta 32)))
     (setf (aref bitmap w) (logior (aref bitmap w) (ash 1 (- 31 (mod delta 32)))))))
 
-(declaim (ftype (function (integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) integer) t) seqnum-set-member-p))
-(defun seqnum-set-member-p (base numbits bitmap seqnum)
+(defun* seqnum-set-member-p (base numbits bitmap seqnum)
+    (function (integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) integer) t)
   "T iff SEQNUM is in the SequenceNumberSet, per the §9.4.2.6 membership rule."
   (let ((delta (- seqnum base)))
     (and (<= base seqnum) (< delta numbits)
          (logbitp (- 31 (mod delta 32)) (aref bitmap (floor delta 32))))))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 32) (*)) (integer 0)) t) seqnum-set-bit-p))
-(defun seqnum-set-bit-p (bitmap delta)
+(defun* seqnum-set-bit-p (bitmap delta)
+    (function ((simple-array (unsigned-byte 32) (*)) (integer 0)) t)
   "T iff the bit for offset DELTA is set: word DELTA/32, bit (31-DELTA%32) (§9.4.2.6)."
   (logbitp (- 31 (mod delta 32)) (aref bitmap (floor delta 32))))
 
-(declaim (ftype (function (dds.core.buffer:cursor integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum) write-sequence-number-set))
-(defun write-sequence-number-set (cursor base numbits bitmap)
+(defun* write-sequence-number-set (cursor base numbits bitmap)
+    (function (dds.core.buffer:cursor integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum)
   "Write a SequenceNumberSet: bitmapBase + numBits + M longs (RTPS 2.5 §9.4.2.6)."
   (assert (<= numbits +seqnum-set-max-bits+))
   (write-sequence-number cursor base)
@@ -212,8 +213,8 @@
     (dds.core.buffer:put-u32 cursor (aref bitmap i)))
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor) t) read-sequence-number-set))
-(defun read-sequence-number-set (cursor)
+(defun* read-sequence-number-set (cursor)
+    (function (dds.core.buffer:cursor) t)
   "Parse a SequenceNumberSet. Returns (values base numBits bitmap-words) or NIL on
    short buffer / numBits>256 (§9.4.2.6). Bounds-checked; never reads OOB."
   (when (< (%remaining cursor) 12)
@@ -248,12 +249,13 @@
   "GAP FilteredCount/Filtered extension flag (F); not parsed in v1 (RTPS 2.5 §9.4.5.6).")
 
 (declaim (inline %e-flag))
-(declaim (ftype (function (dds.core.buffer:cursor) (unsigned-byte 8)) %e-flag))
-(defun %e-flag (cursor)
+(defun* %e-flag (cursor)
+    (function (dds.core.buffer:cursor) (unsigned-byte 8))
+  "The submessage EndiannessFlag (E) value for CURSOR: +flag-endianness+ when little-endian, else 0 (RTPS 2.5 §9.4.5.1.1)."
   (if (eq (dds.core.buffer:cursor-endianness cursor) :little) +flag-endianness+ 0))
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer integer (unsigned-byte 32) &key (:final t) (:liveliness t)) fixnum) write-heartbeat))
-(defun write-heartbeat (cursor reader-id writer-id first-sn last-sn count &key final liveliness)
+(defun* write-heartbeat (cursor reader-id writer-id first-sn last-sn count &key final liveliness)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer integer (unsigned-byte 32) &key (:final t) (:liveliness t)) fixnum)
   "Write a complete HEARTBEAT submessage (base form). RTPS 2.5 §9.4.5.7; body=28."
   (write-submessage-header cursor +submsg-heartbeat+
                            (logior (%e-flag cursor)
@@ -267,8 +269,8 @@
   (dds.core.buffer:put-u32 cursor (logand count #xFFFFFFFF))
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8)) t) parse-heartbeat-body))
-(defun parse-heartbeat-body (cursor flags)
+(defun* parse-heartbeat-body (cursor flags)
+    (function (dds.core.buffer:cursor (unsigned-byte 8)) t)
   "Parse a HEARTBEAT body after its header (base form). Returns (values reader-id
    writer-id first-sn last-sn count final-p liveliness-p) or NIL. Cursor endianness
    must match the E flag. RTPS 2.5 §9.4.5.7."
@@ -282,8 +284,8 @@
             (logtest flags +heartbeat-flag-final+)
             (logtest flags +heartbeat-flag-liveliness+))))
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32) &key (:final t)) fixnum) write-acknack))
-(defun write-acknack (cursor reader-id writer-id base numbits bitmap count &key final)
+(defun* write-acknack (cursor reader-id writer-id base numbits bitmap count &key final)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32) &key (:final t)) fixnum)
   "Write a complete ACKNACK submessage. RTPS 2.5 §9.4.5.3; body=24+4*M."
   (write-submessage-header cursor +submsg-acknack+
                            (logior (%e-flag cursor) (if final +acknack-flag-final+ 0))
@@ -294,8 +296,8 @@
   (dds.core.buffer:put-u32 cursor (logand count #xFFFFFFFF))
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8)) t) parse-acknack-body))
-(defun parse-acknack-body (cursor flags)
+(defun* parse-acknack-body (cursor flags)
+    (function (dds.core.buffer:cursor (unsigned-byte 8)) t)
   "Parse an ACKNACK body. Returns (values reader-id writer-id base numbits bitmap
    count final-p) or NIL on short/invalid buffer. RTPS 2.5 §9.4.5.3."
   (when (< (%remaining cursor) 8) (return-from parse-acknack-body nil))
@@ -308,8 +310,8 @@
               (dds.core.buffer:get-u32 cursor)
               (logtest flags +acknack-flag-final+)))))
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum) write-gap))
-(defun write-gap (cursor reader-id writer-id gap-start base numbits bitmap)
+(defun* write-gap (cursor reader-id writer-id gap-start base numbits bitmap)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum)
   "Write a complete GAP submessage (base form). RTPS 2.5 §9.4.5.6; body=28+4*M."
   (write-submessage-header cursor +submsg-gap+ (%e-flag cursor)
                            (+ 28 (* 4 (%seqnum-set-words numbits))))
@@ -319,8 +321,8 @@
   (write-sequence-number-set cursor base numbits bitmap)
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8)) t) parse-gap-body))
-(defun parse-gap-body (cursor flags)
+(defun* parse-gap-body (cursor flags)
+    (function (dds.core.buffer:cursor (unsigned-byte 8)) t)
   "Parse a GAP body (base form). Returns (values reader-id writer-id gap-start base
    numbits bitmap) or NIL. RTPS 2.5 §9.4.5.6."
   (declare (ignore flags))
@@ -346,8 +348,8 @@
 (defconstant +data-flag-non-standard+  #x10
   "DATA NonStandardPayloadFlag (N) (RTPS 2.5 §9.4.5.4).")
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum) write-data))
-(defun write-data (cursor reader-id writer-id writer-sn payload payload-off payload-len &key key)
+(defun* write-data (cursor reader-id writer-id writer-sn payload payload-off payload-len &key key)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum)
   "Write a complete DATA submessage with a serializedPayload, no inlineQos. KEY t
    emits a key payload (K=1,D=0); else data (D=1,K=0). RTPS 2.5 §9.4.5.4."
   (write-submessage-header cursor +submsg-data+
@@ -362,8 +364,8 @@
   (dds.core.buffer:put-octets cursor payload payload-off payload-len)
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor fixnum) t) %skip-inline-qos))
-(defun %skip-inline-qos (cursor body-end)
+(defun* %skip-inline-qos (cursor body-end)
+    (function (dds.core.buffer:cursor fixnum) t)
   "Advance CURSOR past an inlineQos ParameterList (each Parameter = id+len header then len
    value octets, already 4-aligned) up to PID_SENTINEL. Every read is bounds-checked
    against BODY-END FIRST (NFR-SEC-POSTURE). Returns T on success, NIL if it would read
@@ -377,8 +379,8 @@
         (when (> next body-end) (return nil))
         (dds.core.buffer:cursor-set-position cursor next)))))
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t) parse-data-body))
-(defun parse-data-body (cursor flags octets-to-next)
+(defun* parse-data-body (cursor flags octets-to-next)
+    (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t)
   "Parse a DATA body. Returns (values reader-id writer-id writer-sn has-payload
    payload-offset payload-len key-p), or NIL if the buffer is short / malformed. When
    the InlineQos flag (Q) is set the inlineQos ParameterList is SKIPPED (bounds-checked,
@@ -413,9 +415,9 @@
 (defconstant +data-frag-flag-key+        #x04
   "DATA_FRAG KeyFlag (K): the fragments carry the key, not the data (RTPS 2.5 §9.4.5.5).")
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 16) (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum) write-data-frag))
-(defun write-data-frag (cursor reader-id writer-id sn sample-size frag-start frags-in-submsg frag-size
+(defun* write-data-frag (cursor reader-id writer-id sn sample-size frag-start frags-in-submsg frag-size
                         payload payload-off payload-len &key key)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 16) (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum)
   "Write one DATA_FRAG submessage (RTPS 2.5 §9.4.5.5), no inlineQos. Carries the bytes
    [PAYLOAD-OFF, PAYLOAD-OFF+PAYLOAD-LEN) — FRAGS-IN-SUBMSG consecutive fragments of size
    FRAG-SIZE starting at the 1-based FRAG-START — of the SAMPLE-SIZE-byte serialized sample.
@@ -435,8 +437,8 @@
   (dds.core.buffer:put-octets cursor payload payload-off payload-len)
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t) parse-data-frag-body))
-(defun parse-data-frag-body (cursor flags octets-to-next)
+(defun* parse-data-frag-body (cursor flags octets-to-next)
+    (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t)
   "Parse a DATA_FRAG body (RTPS 2.5 §9.4.5.5). Returns (values reader-id writer-id writer-sn
    sample-size frag-start frags-in-submsg frag-size payload-offset payload-len key-p), or NIL
    if short / malformed / spec-invalid (frag-start not strictly positive, frag-size > sample-
@@ -506,8 +508,8 @@
    a ZLIB-compressed complete TypeObject. NOT an OMG-spec PID; value observed on the live
    Connext 7.3.1 wire (ADR 0009). Parsed inbound only; never emitted (clean-room).")
 
-(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) fixnum) write-parameter))
-(defun write-parameter (cursor pid value off len)
+(defun* write-parameter (cursor pid value off len)
+    (function (dds.core.buffer:cursor (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) fixnum)
   "Write one Parameter: pid + length (padded to a multiple of 4) + value +
    padding. RTPS 2.5 §9.4.2.11; the ParameterList must start 4-byte aligned."
   (let ((padded (* 4 (ceiling len 4))))
@@ -517,15 +519,15 @@
     (dotimes (i (- padded len)) (dds.core.buffer:put-u8 cursor 0))
     (dds.core.buffer:cursor-position cursor)))
 
-(declaim (ftype (function (dds.core.buffer:cursor) fixnum) write-parameter-sentinel))
-(defun write-parameter-sentinel (cursor)
+(defun* write-parameter-sentinel (cursor)
+    (function (dds.core.buffer:cursor) fixnum)
   "Write PID_SENTINEL, terminating a ParameterList (RTPS 2.5 §9.4.2.11)."
   (dds.core.buffer:put-u16 cursor +pid-sentinel+)
   (dds.core.buffer:put-u16 cursor 0)
   (dds.core.buffer:cursor-position cursor))
 
-(declaim (ftype (function (dds.core.buffer:cursor function) t) parse-parameter-list))
-(defun parse-parameter-list (cursor handler)
+(defun* parse-parameter-list (cursor handler)
+    (function (dds.core.buffer:cursor function) t)
   "Iterate Parameters until PID_SENTINEL, calling (HANDLER pid cursor len) with the
    cursor at the value. Returns T on clean termination, NIL on a truncated list.
    Bounds-checked; never reads OOB (NFR-SEC-POSTURE). RTPS 2.5 §9.4.2.11."
@@ -549,23 +551,23 @@
 (defconstant +port-d2+ 1)
 (defconstant +port-d3+ 11)
 
-(declaim (ftype (function ((integer 0)) (integer 0)) spdp-multicast-port))
-(defun spdp-multicast-port (domain)
+(defun* spdp-multicast-port (domain)
+    (function ((integer 0)) (integer 0))
   "Discovery (SPDP) multicast port: PB + DG*domain + d0 (RTPS 2.5 §9.6.1.1)."
   (+ +port-base+ (* +port-domain-gain+ domain) +port-d0+))
 
-(declaim (ftype (function ((integer 0) (integer 0)) (integer 0)) spdp-unicast-port))
-(defun spdp-unicast-port (domain participant-id)
+(defun* spdp-unicast-port (domain participant-id)
+    (function ((integer 0) (integer 0)) (integer 0))
   "Discovery (SPDP) unicast port: PB + DG*domain + d1 + PG*participantId."
   (+ +port-base+ (* +port-domain-gain+ domain) +port-d1+ (* +port-participant-gain+ participant-id)))
 
-(declaim (ftype (function ((integer 0)) (integer 0)) user-multicast-port))
-(defun user-multicast-port (domain)
+(defun* user-multicast-port (domain)
+    (function ((integer 0)) (integer 0))
   "User-traffic multicast port: PB + DG*domain + d2 (RTPS 2.5 §9.6.1.1)."
   (+ +port-base+ (* +port-domain-gain+ domain) +port-d2+))
 
-(declaim (ftype (function ((integer 0) (integer 0)) (integer 0)) user-unicast-port))
-(defun user-unicast-port (domain participant-id)
+(defun* user-unicast-port (domain participant-id)
+    (function ((integer 0) (integer 0)) (integer 0))
   "User-traffic unicast port: PB + DG*domain + d3 + PG*participantId."
   (+ +port-base+ (* +port-domain-gain+ domain) +port-d3+ (* +port-participant-gain+ participant-id)))
 
@@ -574,8 +576,8 @@
 ;;; comes from its E flag; octetsToNextHeader (0 = extends to the end) frames the
 ;;; next one. Bounds-checked throughout (NFR-SEC-POSTURE). ----
 
-(declaim (ftype (function (dds.core.buffer:cursor function &optional (integer 0)) t) dispatch-message))
-(defun dispatch-message (cursor handler &optional msg-end)
+(defun* dispatch-message (cursor handler &optional msg-end)
+    (function (dds.core.buffer:cursor function &optional (integer 0)) t)
   "Parse an RTPS message; for each submessage call (HANDLER id flags cursor
    body-len) with the cursor at the body and its endianness set per the E flag.
    MSG-END bounds the message (e.g. a UDP datagram size); defaults to the buffer

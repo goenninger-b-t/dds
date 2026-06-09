@@ -31,13 +31,13 @@
   "MD5 per-round left-rotate amounts s[i] (RFC 1321).")
 
 (declaim (inline %rotl32))
-(declaim (ftype (function ((unsigned-byte 32) (integer 0 31)) (unsigned-byte 32)) %rotl32))
-(defun %rotl32 (x n)
+(defun* %rotl32 (x n)
+    (function ((unsigned-byte 32) (integer 0 31)) (unsigned-byte 32))
   "Left-rotate the 32-bit X by N bits."
   (logand (logior (ash x n) (ash x (- n 32))) #xffffffff))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 32) (4)) (simple-array (unsigned-byte 8) (*)) fixnum) t) %md5-block))
-(defun %md5-block (state bytes off)
+(defun* %md5-block (state bytes off)
+    (function ((simple-array (unsigned-byte 32) (4)) (simple-array (unsigned-byte 8) (*)) fixnum) t)
   "Process the 64-octet block of BYTES at OFF, updating STATE (a,b,c,d) in place."
   (declare (optimize (speed 3) (safety 1)))
   (let ((m (make-array 16 :element-type '(unsigned-byte 32))))
@@ -69,8 +69,8 @@
             (aref state 3) (logand (+ (aref state 3) d) #xffffffff))))
   t)
 
-(declaim (ftype (function ((array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (16))) md5))
-(defun md5 (octets)
+(defun* md5 (octets)
+    (function ((array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (16)))
   "MD5 digest (RFC 1321) of OCTETS — returns a fresh 16-octet vector."
   (let* ((len (length octets))
          (bitlen (logand (* len 8) #xffffffffffffffff))

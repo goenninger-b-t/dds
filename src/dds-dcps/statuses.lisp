@@ -61,59 +61,59 @@
   "Maps an RxO incompatible-policy keyword (dds.qos:qos-rxo-compatible's second value)
    to its DDS QosPolicyId_t for the (OFFERED|REQUESTED)_INCOMPATIBLE_QOS status.")
 
-(declaim (ftype (function (keyword) integer) rxo-policy-id))
-(defun rxo-policy-id (keyword)
+(defun* rxo-policy-id (keyword)
+    (function (keyword) integer)
   "The DDS QosPolicyId_t for an RxO failing-policy KEYWORD, or +qos-policy-id-invalid+."
   (or (cdr (assoc keyword *rxo-keyword->policy-id*)) +qos-policy-id-invalid+))
 
 ;;; ---- Status structs (one-to-one with the IDL §94-180) ----
 
-(defstruct (subscription-matched-status (:constructor make-subscription-matched-status)
+(defstruct* (subscription-matched-status (:constructor make-subscription-matched-status)
                                         (:copier copy-subscription-matched-status))
   "DataReader SUBSCRIPTION_MATCHED status (dds_rtf2_dcps.idl §174)."
   (total-count 0 :type integer)
   (total-count-change 0 :type integer)
   (current-count 0 :type integer)
   (current-count-change 0 :type integer)
-  (last-publication-handle nil))
+  (last-publication-handle nil :type t))
 
-(defstruct (publication-matched-status (:constructor make-publication-matched-status)
+(defstruct* (publication-matched-status (:constructor make-publication-matched-status)
                                        (:copier copy-publication-matched-status))
   "DataWriter PUBLICATION_MATCHED status (dds_rtf2_dcps.idl §165)."
   (total-count 0 :type integer)
   (total-count-change 0 :type integer)
   (current-count 0 :type integer)
   (current-count-change 0 :type integer)
-  (last-subscription-handle nil))
+  (last-subscription-handle nil :type t))
 
 (deftype sample-rejected-reason ()
   "DDS SampleRejectedStatusKind (dds_rtf2_dcps.idl §104)."
   '(member :not-rejected :rejected-by-instances-limit
     :rejected-by-samples-limit :rejected-by-samples-per-instance-limit))
 
-(defstruct (sample-rejected-status (:constructor make-sample-rejected-status)
+(defstruct* (sample-rejected-status (:constructor make-sample-rejected-status)
                                    (:copier copy-sample-rejected-status))
   "DataReader SAMPLE_REJECTED status (dds_rtf2_dcps.idl §111): a sample was rejected
    because a RESOURCE_LIMITS bound would have been exceeded."
   (total-count 0 :type integer)
   (total-count-change 0 :type integer)
   (last-reason :not-rejected :type sample-rejected-reason)
-  (last-instance-handle nil))
+  (last-instance-handle nil :type t))
 
-(defstruct (inconsistent-topic-status (:constructor make-inconsistent-topic-status)
+(defstruct* (inconsistent-topic-status (:constructor make-inconsistent-topic-status)
                                       (:copier copy-inconsistent-topic-status))
   "Topic INCONSISTENT_TOPIC status (dds_rtf2_dcps.idl §94): a remote topic of the same
    name but a different type was discovered."
   (total-count 0 :type integer)
   (total-count-change 0 :type integer))
 
-(defstruct (qos-policy-count (:constructor make-qos-policy-count (policy-id count))
+(defstruct* (qos-policy-count (:constructor make-qos-policy-count (policy-id count))
                              (:copier copy-qos-policy-count))
   "DDS QosPolicyCount (dds_rtf2_dcps.idl §143): a policy id + how many times it failed."
   (policy-id 0 :type integer)
   (count 0 :type integer))
 
-(defstruct (requested-incompatible-qos-status
+(defstruct* (requested-incompatible-qos-status
             (:constructor make-requested-incompatible-qos-status)
             (:copier copy-requested-incompatible-qos-status))
   "DataReader REQUESTED_INCOMPATIBLE_QOS status (dds_rtf2_dcps.idl §157)."
@@ -122,7 +122,7 @@
   (last-policy-id 0 :type integer)
   (policies '() :type list))
 
-(defstruct (offered-incompatible-qos-status
+(defstruct* (offered-incompatible-qos-status
             (:constructor make-offered-incompatible-qos-status)
             (:copier copy-offered-incompatible-qos-status))
   "DataWriter OFFERED_INCOMPATIBLE_QOS status (dds_rtf2_dcps.idl §150)."
@@ -131,8 +131,8 @@
   (last-policy-id 0 :type integer)
   (policies '() :type list))
 
-(declaim (ftype (function (list integer) list) bump-policy-count))
-(defun bump-policy-count (policies policy-id)
+(defun* bump-policy-count (policies policy-id)
+    (function (list integer) list)
   "Increment the QosPolicyCount for POLICY-ID in POLICIES (a QosPolicyCountSeq),
    appending {policy-id, 1} when absent. Returns the (possibly extended) list."
   (let ((pc (find policy-id policies :key #'qos-policy-count-policy-id)))

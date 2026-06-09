@@ -5,7 +5,7 @@
 
 (defpackage #:net.goenninger.dds.qos
   (:nicknames #:dds.qos)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "DDS 1.4 QoS policies + Requested/Offered (RxO) compatibility (FR-QOS-1/2).
     qos-rxo-compatible returns the incompatible-policy list that drives

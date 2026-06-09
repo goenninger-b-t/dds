@@ -5,7 +5,7 @@
 
 (defpackage #:net.goenninger.dds.gen
   (:nicknames #:dds.gen)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "s-expr type DSL -> defstruct + serialize/deserialize/serialized-size +
     type-support (IMPLEMENTATION-PLAN §7.2/§7.3, FR-TOOL-1). v1 supports :final

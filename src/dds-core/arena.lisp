@@ -12,7 +12,7 @@
                      (arena-exhausted-requested c) (arena-exhausted-remaining c))))
   (:documentation "Raised at provisioning time when a pool exceeds the budget."))
 
-(defstruct (arena (:constructor %make-arena))
+(defstruct* (arena (:constructor %make-arena))
   "Static, startup-allocated off-heap memory region with a fixed byte budget;
    pools are carved from it via make-buffer-pool (NFR-MEM)."
   (byte-budget 0 :type fixnum)
@@ -20,7 +20,8 @@
   (pools '() :type list)
   (initialized nil :type boolean))
 
-(defstruct (buffer-pool (:constructor %make-buffer-pool))
+(defstruct* (buffer-pool (:constructor %make-buffer-pool))
+  "Fixed-capacity pool of equal-size octet buffers carved from a static arena; pool-acquire/pool-release reuse them with zero per-acquisition allocation (NFR-MEM)."
   (element-bytes 0 :type fixnum)
   (capacity 0 :type fixnum)
   (slots #() :type simple-vector)
@@ -28,29 +29,25 @@
   (in-use 0 :type fixnum)
   (high-water 0 :type fixnum))
 
-(declaim (ftype (function (arena) boolean) arena-initialized-p))
-(declaim (ftype (function (buffer-pool) fixnum) pool-capacity))
-(declaim (ftype (function (buffer-pool) fixnum) pool-in-use))
-(declaim (ftype (function (buffer-pool) fixnum) pool-high-water))
-(declaim (ftype (function (&key (:bytes (integer 0))) arena) init-arena))
-(declaim (ftype (function (arena) arena) teardown-arena))
-(declaim (ftype (function (arena (integer 1) (integer 1)) buffer-pool) make-buffer-pool))
-(declaim (ftype (function (buffer-pool) t) pool-acquire))
-(declaim (ftype (function (buffer-pool t) (values)) pool-release))
-(declaim (ftype (function (arena) list) arena-report))
 
-(defun arena-initialized-p (arena) "True while ARENA is live (between init-arena and teardown-arena)." (arena-initialized arena))
-(defun pool-capacity (pool) "Fixed number of buffers POOL was provisioned with." (buffer-pool-capacity pool))
-(defun pool-in-use (pool) "Number of buffers currently checked out of POOL." (buffer-pool-in-use pool))
-(defun pool-high-water (pool) "Peak in-use count seen for POOL (NFR-OBS / budget tracking)." (buffer-pool-high-water pool))
+(defun* arena-initialized-p (arena)
+    (function (arena) boolean) "True while ARENA is live (between init-arena and teardown-arena)." (arena-initialized arena))
+(defun* pool-capacity (pool)
+    (function (buffer-pool) fixnum) "Fixed number of buffers POOL was provisioned with." (buffer-pool-capacity pool))
+(defun* pool-in-use (pool)
+    (function (buffer-pool) fixnum) "Number of buffers currently checked out of POOL." (buffer-pool-in-use pool))
+(defun* pool-high-water (pool)
+    (function (buffer-pool) fixnum) "Peak in-use count seen for POOL (NFR-OBS / budget tracking)." (buffer-pool-high-water pool))
 
-(defun init-arena (&key (bytes *static-arena-bytes*))
+(defun* init-arena (&key (bytes *static-arena-bytes*))
+    (function (&key (:bytes (integer 0))) arena)
   "Create the arena with a fixed BYTE budget (defaults from *static-arena-bytes*,
    read once here). One-shot; pools are carved from it via make-buffer-pool."
   (declare (type (integer 0) bytes))
   (%make-arena :byte-budget bytes :bytes-used 0 :pools '() :initialized t))
 
-(defun teardown-arena (arena)
+(defun* teardown-arena (arena)
+    (function (arena) arena)
   "Free every pool's static buffers and mark the arena uninitialized."
   (dolist (pool (arena-pools arena))
     (loop for b across (buffer-pool-slots pool)
@@ -60,7 +57,8 @@
         (arena-initialized arena) nil)
   arena)
 
-(defun make-buffer-pool (arena element-bytes capacity)
+(defun* make-buffer-pool (arena element-bytes capacity)
+    (function (arena (integer 1) (integer 1)) buffer-pool)
   "Carve a fixed-capacity pool of CAPACITY octet-buffers of ELEMENT-BYTES each,
    pre-allocated once from off-heap static memory. Steady-state acquire/release
    is index manipulation with zero allocation."
@@ -80,7 +78,8 @@
         (push pool (arena-pools arena))
         pool))))
 
-(defun pool-acquire (pool)
+(defun* pool-acquire (pool)
+    (function (buffer-pool) t)
   "Pop a buffer from POOL. Return NIL on exhaustion — the caller applies
    RESOURCE_LIMITS, never a GC-heap fallback (NFR-MEM)."
   (let ((top (buffer-pool-top pool)))
@@ -95,7 +94,8 @@
           (setf (buffer-pool-high-water pool) (buffer-pool-in-use pool)))
         obj))))
 
-(defun pool-release (pool obj)
+(defun* pool-release (pool obj)
+    (function (buffer-pool t) (values))
   "Return OBJ to POOL."
   (let ((top (buffer-pool-top pool)))
     (setf (svref (buffer-pool-slots pool) top) obj
@@ -103,7 +103,8 @@
     (decf (buffer-pool-in-use pool))
     (values)))
 
-(defun arena-report (arena)
+(defun* arena-report (arena)
+    (function (arena) list)
   "Plist of reserved sizes per pool for startup logging (NFR-OBS)."
   (list :byte-budget (arena-byte-budget arena)
         :bytes-used (arena-bytes-used arena)

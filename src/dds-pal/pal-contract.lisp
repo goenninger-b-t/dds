@@ -4,7 +4,7 @@
 
 (defpackage #:net.goenninger.dds.pal
   (:nicknames #:dds.pal)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "Platform Abstraction Layer: the single frozen contract (REQUIREMENTS NFR-PORT,
     IMPLEMENTATION-PLAN §7.6). Every layer above L0 depends ONLY on these symbols.

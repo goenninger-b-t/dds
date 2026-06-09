@@ -12,7 +12,7 @@
 
 (in-package #:dds.disc)
 
-(defstruct (disc-node (:constructor %make-disc-node))
+(defstruct* (disc-node (:constructor %make-disc-node))
   "A minimal RTPS participant for discovery. SOCKET/TRANSPORT carry metatraffic;
    PEERS are unicast SPDP targets; DISCOVERED maps a remote 12-octet GUID prefix
    to its SPDP data; LOCAL-WRITERS/LOCAL-READERS are this node's endpoints; MATCHES
@@ -29,8 +29,8 @@
                :type (simple-array (unsigned-byte 8) (12)))
   (domain 0 :type (integer 0))
   (advertise-address "127.0.0.1" :type string)
-  (socket nil)
-  (transport nil)
+  (socket nil :type t)
+  (transport nil :type t)
   (spdp-sn 0 :type integer)
   (sedp-sn 0 :type integer)
   (peers '() :type list)
@@ -42,12 +42,12 @@
   (discovered-readers (make-hash-table :test 'equalp) :type hash-table) ; all remote subscriptions
   (local-writers '() :type list)
   (local-readers '() :type list)
-  (lock (dds.pal:make-lock "disc-node"))
+  (lock (dds.pal:make-lock "disc-node") :type t)
   (tx-payload nil :type (or null dds.core.buffer:octet-buffer))
   (tx-msg nil :type (or null dds.core.buffer:octet-buffer))
   (rx-tx-msg nil :type (or null dds.core.buffer:octet-buffer))
-  (user-writer nil)
-  (user-reader nil)
+  (user-writer nil :type t)
+  (user-reader nil :type t)
   (samples (make-hash-table :test 'eql) :type hash-table)
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
@@ -60,19 +60,19 @@
   (on-incompatible-qos nil :type (or null function))
   (on-inconsistent-topic nil :type (or null function))
   (on-sample nil :type (or null function))
-  (mcast-socket nil)
-  (mcast-rx-thread nil)
-  (rx-thread nil))
+  (mcast-socket nil :type t)
+  (mcast-rx-thread nil :type t)
+  (rx-thread nil :type t))
 
 (defparameter +spdp-multicast-group+ "239.255.0.1"
   "Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
    participants announce + listen on UDPv4 239.255.0.1 : spdp-multicast-port.")
 
-(declaim (ftype (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string)) disc-node) make-disc-node))
-(defun make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
+(defun* make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
                                                      :initial-element 0))
                             (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast
                             (advertise-address "127.0.0.1"))
+    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string)) disc-node)
   "Open a metatraffic UDPv4 socket bound to HOST:PORT and build a discovery node.
    PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4).
    MULTICAST opens a second socket bound to the SPDP multicast port and joins the
@@ -96,18 +96,18 @@
           (setf (disc-node-mcast-socket node) ms)))
       node)))
 
-(declaim (ftype (function (disc-node) (integer 0 65535)) disc-node-port))
-(defun disc-node-port (node)
+(defun* disc-node-port (node)
+    (function (disc-node) (integer 0 65535))
   "The bound metatraffic UDP port of NODE."
   (dds.xport.udp:udp-transport-local-port (disc-node-socket node)))
 
-(declaim (ftype (function ((unsigned-byte 32)) (unsigned-byte 16)) %locator-port))
-(defun %locator-port (p)
+(defun* %locator-port (p)
+    (function ((unsigned-byte 32)) (unsigned-byte 16))
   "Narrow a wire Locator port (u32) to the UDP port range (u16)."
   (ldb (byte 16 0) p))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 8) (unsigned-byte 8)) (simple-array (unsigned-byte 8) (16))) %make-endpoint-guid))
-(defun %make-endpoint-guid (prefix key kind)
+(defun* %make-endpoint-guid (prefix key kind)
+    (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 8) (unsigned-byte 8)) (simple-array (unsigned-byte 8) (16)))
   "GUID_t = 12-octet participant PREFIX + 4-octet entity id (00 00 KEY KIND),
    RTPS 2.5 §9.3.1.2."
   (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -115,8 +115,8 @@
     (setf (aref g 14) key (aref g 15) kind)
     g))
 
-(declaim (ftype (function (string) (simple-array (unsigned-byte 8) (4))) %ipv4-octets))
-(defun %ipv4-octets (host)
+(defun* %ipv4-octets (host)
+    (function (string) (simple-array (unsigned-byte 8) (4)))
   "Parse a dotted-quad 'a.b.c.d' string into a 4-octet vector."
   (let ((v (make-array 4 :element-type '(unsigned-byte 8))) (start 0))
     (dotimes (i 4 v)
@@ -124,8 +124,8 @@
         (setf (aref v i) (parse-integer host :start start :end dot)
               start (if dot (1+ dot) (length host)))))))
 
-(declaim (ftype (function (disc-node) dds.rtps.discovery:spdp-data) %node-spdp-data))
-(defun %node-spdp-data (node)
+(defun* %node-spdp-data (node)
+    (function (disc-node) dds.rtps.discovery:spdp-data)
   "Build NODE's SPDPdiscoveredParticipantData: its GUID prefix + a unicast locator
    at <advertise-address>:<bound port> (default 127.0.0.1), protocol version 2.5."
   (let* ((addr (dds.rtps.discovery:make-ipv4-locator
@@ -142,8 +142,8 @@
      :lease-duration-seconds 100
      :builtin-endpoint-set #x0000043F)))
 
-(declaim (ftype (function (disc-node (unsigned-byte 32) (unsigned-byte 32) integer function string (unsigned-byte 16)) t) %send-paramlist))
-(defun %send-paramlist (node reader-id writer-id sn serialize-fn host port)
+(defun* %send-paramlist (node reader-id writer-id sn serialize-fn host port)
+    (function (disc-node (unsigned-byte 32) (unsigned-byte 32) integer function string (unsigned-byte 16)) t)
   "Build a PL_CDR_LE SerializedPayload by calling SERIALIZE-FN on a fresh cursor
    over the node's reusable payload buffer, wrap it in a DATA submessage
    (READER-ID/WRITER-ID/SN) in the node's reusable message buffer, and send it to
@@ -162,8 +162,8 @@
                       (dds.xport.udp:make-udp-locator :host host :port port)
                       msg 0 (dds.core.buffer:cursor-position mc)))))
 
-(declaim (ftype (function (disc-node) (eql t)) announce-participant))
-(defun announce-participant (node)
+(defun* announce-participant (node)
+    (function (disc-node) (eql t))
   "Announce NODE's SPDPdiscoveredParticipantData (writer = SPDP builtin participant
    writer) to every unicast peer (FR-DISC-1/4) and, if multicast is enabled, to the
    well-known SPDP multicast group (FR-DISC-3). The SPDP data advertises the node's
@@ -185,17 +185,17 @@
                    (dds.rtps.message:spdp-multicast-port (disc-node-domain node))))))
   t)
 
-(declaim (ftype (function (integer) dds.qos:qos) %qos-from-reliability))
-(defun %qos-from-reliability (reliability)
+(defun* %qos-from-reliability (reliability)
+    (function (integer) dds.qos:qos)
   "Build a QoS from a legacy wire reliability constant (back-compat for callers that
    pass :reliability rather than a full :qos)."
   (dds.qos:make-qos :reliability (if (>= reliability dds.rtps.discovery:+reliability-reliable+)
                                      :reliable :best-effort)))
 
-(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t)) dds.rtps.discovery:endpoint-data) add-local-writer))
-(defun add-local-writer (node &key (topic "") (type "")
+(defun* add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
                                    (key 1) qos type-information)
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t)) dds.rtps.discovery:endpoint-data)
   "Register a local publication (writer endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
    TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP.
@@ -208,10 +208,10 @@
     (push ep (disc-node-local-writers node))
     ep))
 
-(declaim (ftype (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t)) dds.rtps.discovery:endpoint-data) add-local-reader))
-(defun add-local-reader (node &key (topic "") (type "")
+(defun* add-local-reader (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-best-effort+)
                                    (key 1) qos type-information)
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t)) dds.rtps.discovery:endpoint-data)
   "Register a local subscription (reader endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
    TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP."
@@ -222,14 +222,14 @@
     (push ep (disc-node-local-readers node))
     ep))
 
-(declaim (ftype (function (disc-node) list) %discovered-participants))
-(defun %discovered-participants (node)
+(defun* %discovered-participants (node)
+    (function (disc-node) list)
   "Snapshot the discovered participants' SPDP data (lock-guarded)."
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for v being the hash-values of (disc-node-discovered node) collect v)))
 
-(declaim (ftype (function (disc-node (unsigned-byte 32) (unsigned-byte 32) dds.rtps.discovery:endpoint-data integer string (unsigned-byte 16)) t) %send-endpoint))
-(defun %send-endpoint (node reader-id writer-id ep sn host port)
+(defun* %send-endpoint (node reader-id writer-id ep sn host port)
+    (function (disc-node (unsigned-byte 32) (unsigned-byte 32) dds.rtps.discovery:endpoint-data integer string (unsigned-byte 16)) t)
   "Announce one local endpoint EP via a SEDP DATA submessage to HOST:PORT with the STABLE
    per-writer sequence number SN. Re-announcing an endpoint RESENDS the same SN (a
    retransmission), never a fresh one: a remote RELIABLE SEDP reader cannot deliver any
@@ -245,8 +245,8 @@
 ;;; sends its endpoint data. Builtin writers share their EntityId across participants,
 ;;; so SN state is tracked per remote participant (12-octet source GUID prefix).
 
-(declaim (ftype (function ((unsigned-byte 32)) (or null (unsigned-byte 32))) %sedp-reader-id-for))
-(defun %sedp-reader-id-for (writer-id)
+(defun* %sedp-reader-id-for (writer-id)
+    (function ((unsigned-byte 32)) (or null (unsigned-byte 32)))
   "The local SEDP reader EntityId matching a remote builtin SEDP writer WRITER-ID
    (publications/subscriptions), or NIL if WRITER-ID is not a builtin SEDP writer."
   (cond ((= writer-id dds.rtps.discovery:+entityid-sedp-pub-writer+)
@@ -255,22 +255,22 @@
          dds.rtps.discovery:+entityid-sedp-sub-reader+)
         (t nil)))
 
-(declaim (ftype (function (dds.core.buffer:octet-buffer) (simple-array (unsigned-byte 8) (12))) %source-prefix))
-(defun %source-prefix (buf)
+(defun* %source-prefix (buf)
+    (function (dds.core.buffer:octet-buffer) (simple-array (unsigned-byte 8) (12)))
   "The 12-octet source GUID prefix from the RTPS header of datagram BUF (offset 8; §9.4.4)."
   (let ((p (make-array 12 :element-type '(unsigned-byte 8))))
     (replace p (dds.core.buffer:octet-buffer-vec buf) :start2 8 :end2 20)
     p))
 
-(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12))) t) %builtin-reader-nl))
-(defun %builtin-reader-nl (node prefix)
+(defun* %builtin-reader-nl (node prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
   "Get/create the per-remote reliable SEDP reader for PREFIX. CALLER HOLDS the node lock."
   (or (gethash prefix (disc-node-builtin-readers node))
       (setf (gethash (copy-seq prefix) (disc-node-builtin-readers node))
             (dds.rtps.reliable:make-rtps-reader))))
 
-(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) &optional (or null integer) (or null integer)) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32))) %builtin-acknack-values))
-(defun %builtin-acknack-values (node prefix wid &optional hb-first hb-last)
+(defun* %builtin-acknack-values (node prefix wid &optional hb-first hb-last)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) &optional (or null integer) (or null integer)) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32)))
   "Under the node lock: optionally apply a HEARTBEAT range [HB-FIRST, HB-LAST] to the
    per-remote SEDP reader for WID, then compute its ACKNACK. Returns (values base numbits
    bitmap count). BITMAP is freshly allocated so it is safe to use outside the lock."
@@ -281,15 +281,15 @@
       (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
         (values base numbits bitmap (incf (disc-node-ack-count node)))))))
 
-(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer) t) %builtin-on-data))
-(defun %builtin-on-data (node prefix wid sn)
+(defun* %builtin-on-data (node prefix wid sn)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer) t)
   "Under the node lock: record a received builtin SEDP DATA SN from remote PREFIX's
    writer WID so the next ACKNACK advances past it (stops the reliable retransmit)."
   (dds.pal:with-lock ((disc-node-lock node))
     (dds.rtps.reliable:reader-on-data (%builtin-reader-nl node prefix) wid sn :sedp)))
 
-(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12))) (or null cons)) %remote-metatraffic))
-(defun %remote-metatraffic (node prefix)
+(defun* %remote-metatraffic (node prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) (or null cons))
   "The (host . port) of participant PREFIX's metatraffic unicast locator, or NIL."
   (let ((spdp (dds.pal:with-lock ((disc-node-lock node))
                 (gethash prefix (disc-node-discovered node)))))
@@ -301,8 +301,8 @@
             (when (plusp port)
               (cons (dds.rtps.discovery:locator-ipv4-string loc) port))))))))
 
-(declaim (ftype (function (disc-node dds.core.buffer:octet-buffer (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32) t string (unsigned-byte 16)) t) %send-acknack))
-(defun %send-acknack (node buf reader-id writer-id base numbits bitmap count final host port)
+(defun* %send-acknack (node buf reader-id writer-id base numbits bitmap count final host port)
+    (function (disc-node dds.core.buffer:octet-buffer (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32) t string (unsigned-byte 16)) t)
   "Build an RTPS message (Header + ACKNACK) into BUF and send it to HOST:PORT. BUF is the
    caller-thread scratch buffer (tx-msg on the announce thread, rx-tx-msg on the receiver)."
   (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
@@ -312,8 +312,8 @@
                     (dds.xport.udp:make-udp-locator :host host :port port)
                     buf 0 (dds.core.buffer:cursor-position mc))))
 
-(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer integer) t) %on-builtin-heartbeat))
-(defun %on-builtin-heartbeat (node prefix wid first last)
+(defun* %on-builtin-heartbeat (node prefix wid first last)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer integer) t)
   "Receiver-thread: a HEARTBEAT from remote PREFIX's builtin SEDP writer WID. Apply its
    range, then ACKNACK to that participant's metatraffic locator to pull its SEDP. Uses
    the receiver-thread rx-tx-msg buffer."
@@ -325,8 +325,8 @@
         (%send-acknack node (disc-node-rx-tx-msg node) rid wid base numbits bitmap count
                        t (car hp) (cdr hp))))))
 
-(declaim (ftype (function (disc-node) (eql t)) announce-endpoints))
-(defun announce-endpoints (node)
+(defun* announce-endpoints (node)
+    (function (disc-node) (eql t))
   "Send NODE's local publications (SEDP publications writer) and subscriptions
    (SEDP subscriptions writer) to every discovered participant's metatraffic
    unicast locator (RTPS 2.5 §8.5.4)."
@@ -364,8 +364,8 @@
                                nil host port))))))))
   t)
 
-(declaim (ftype (function (disc-node dds.rtps.discovery:spdp-data) t) %record-participant))
-(defun %record-participant (node spdp)
+(defun* %record-participant (node spdp)
+    (function (disc-node dds.rtps.discovery:spdp-data) t)
   "Record a discovered participant (its SPDP data) keyed by GUID prefix, ignoring
    this node's own announcements (loopback echo / self in peers)."
   (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix spdp)))
@@ -373,8 +373,8 @@
       (dds.pal:with-lock ((disc-node-lock node))
         (setf (gethash (copy-seq prefix) (disc-node-discovered node)) spdp)))))
 
-(declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) boolean) %record-match))
-(defun %record-match (node remote)
+(defun* %record-match (node remote)
+    (function (disc-node dds.rtps.discovery:endpoint-data) boolean)
   "Record a matched REMOTE endpoint keyed by its 16-octet GUID (lock-guarded). Returns
    T only the FIRST time REMOTE is recorded (so a MATCHED status fires once, not once
    per re-announce); NIL if REMOTE was already matched."
@@ -384,8 +384,8 @@
           nil
           (progn (setf (gethash key (disc-node-matches node)) remote) t)))))
 
-(declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) boolean) %record-incompat))
-(defun %record-incompat (node remote)
+(defun* %record-incompat (node remote)
+    (function (disc-node dds.rtps.discovery:endpoint-data) boolean)
   "Record REMOTE as RxO-incompatible (topic+type matched, QoS failed), keyed by its
    GUID (lock-guarded). Returns T only the first time, so INCOMPATIBLE_QOS fires once
    per remote endpoint, not once per re-announce."
@@ -395,8 +395,8 @@
           nil
           (progn (setf (gethash key (disc-node-incompat node)) remote) t)))))
 
-(declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) boolean) %record-inconsistent))
-(defun %record-inconsistent (node remote)
+(defun* %record-inconsistent (node remote)
+    (function (disc-node dds.rtps.discovery:endpoint-data) boolean)
   "Record REMOTE as an inconsistent-topic source (same topic name as a local endpoint,
    different type name), keyed by its GUID. Returns T only the first time, so
    INCONSISTENT_TOPIC fires once per remote endpoint."
@@ -406,47 +406,47 @@
           nil
           (progn (setf (gethash key (disc-node-inconsistent node)) remote) t)))))
 
-(declaim (ftype (function (disc-node keyword dds.rtps.discovery:endpoint-data) t) %fire-match))
-(defun %fire-match (node kind remote)
+(defun* %fire-match (node kind remote)
+    (function (disc-node keyword dds.rtps.discovery:endpoint-data) t)
   "Invoke the ON-MATCH hook (if installed) once for a newly-matched REMOTE endpoint."
   (when (disc-node-on-match node)
     (funcall (disc-node-on-match node) kind remote)))
 
-(declaim (ftype (function (disc-node string) t) %fire-inconsistent))
-(defun %fire-inconsistent (node topic-name)
+(defun* %fire-inconsistent (node topic-name)
+    (function (disc-node string) t)
   "Invoke the ON-INCONSISTENT-TOPIC hook (if installed) for a newly-detected topic-name
    collision (same name, different type) — drives INCONSISTENT_TOPIC (FR-DCPS-3)."
   (when (disc-node-on-inconsistent-topic node)
     (funcall (disc-node-on-inconsistent-topic node) topic-name)))
 
-(declaim (ftype (function (disc-node keyword dds.rtps.discovery:endpoint-data list) t) %fire-incompat))
-(defun %fire-incompat (node kind remote bad)
+(defun* %fire-incompat (node kind remote bad)
+    (function (disc-node keyword dds.rtps.discovery:endpoint-data list) t)
   "Invoke the ON-INCOMPATIBLE-QOS hook (if installed) for a newly-detected RxO
    incompatibility, passing the failing-policy keyword list BAD (FR-QOS-2 / FR-DCPS-3)."
   (when (disc-node-on-incompatible-qos node)
     (funcall (disc-node-on-incompatible-qos node) kind remote bad)))
 
-(declaim (ftype (function (hash-table dds.rtps.discovery:endpoint-data) t) %record-discovered))
-(defun %record-discovered (table remote)
+(defun* %record-discovered (table remote)
+    (function (hash-table dds.rtps.discovery:endpoint-data) t)
   "Record a discovered remote endpoint REMOTE in TABLE keyed by its 16-octet GUID
    (lock-free; TABLE is guarded by the caller). Latest data wins; used by the builtin-
    topic readers (FR-DCPS-6) to surface ALL discovered endpoints, matched or not."
   (setf (gethash (copy-seq (dds.rtps.discovery:endpoint-data-guid remote)) table) remote))
 
-(declaim (ftype (function (disc-node) list) disc-node-discovered-writers-list))
-(defun disc-node-discovered-writers-list (node)
+(defun* disc-node-discovered-writers-list (node)
+    (function (disc-node) list)
   "Snapshot of every discovered remote publication (endpoint-data), lock-guarded."
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for v being the hash-values of (disc-node-discovered-writers node) collect v)))
 
-(declaim (ftype (function (disc-node) list) disc-node-discovered-readers-list))
-(defun disc-node-discovered-readers-list (node)
+(defun* disc-node-discovered-readers-list (node)
+    (function (disc-node) list)
   "Snapshot of every discovered remote subscription (endpoint-data), lock-guarded."
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for v being the hash-values of (disc-node-discovered-readers node) collect v)))
 
-(declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) t) %match-remote-writer))
-(defun %match-remote-writer (node remote)
+(defun* %match-remote-writer (node remote)
+    (function (disc-node dds.rtps.discovery:endpoint-data) t)
   "REMOTE is a discovered publication. Test it against each local reader: on the first
    RxO-compatible reader record + announce a match (:remote-writer). Else, against a
    reader on the SAME topic name: a different type name is an INCONSISTENT_TOPIC; a
@@ -470,8 +470,8 @@
        (%fire-inconsistent node inconsistent))))
   t)
 
-(declaim (ftype (function (disc-node dds.rtps.discovery:endpoint-data) t) %match-remote-reader))
-(defun %match-remote-reader (node remote)
+(defun* %match-remote-reader (node remote)
+    (function (disc-node dds.rtps.discovery:endpoint-data) t)
   "REMOTE is a discovered subscription. Test it against each local writer: on the first
    RxO-compatible writer record + announce a match (:remote-reader). Else, against a
    writer on the SAME topic name: a different type name is an INCONSISTENT_TOPIC; a
@@ -495,8 +495,8 @@
        (%fire-inconsistent node inconsistent))))
   t)
 
-(declaim (ftype (function (disc-node dds.core.buffer:octet-buffer (integer 0)) t) %handle-datagram))
-(defun %handle-datagram (node buf size)
+(defun* %handle-datagram (node buf size)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0)) t)
   "Dispatch an inbound datagram (bounded by SIZE). DATA is routed by writerId: SPDP
    -> record participant; SEDP publications/subscriptions -> match; any other DATA
    plus HEARTBEAT/ACKNACK -> the installed data-plane hooks (nil = ignore). The
@@ -558,8 +558,8 @@
      size)
     t))
 
-(declaim (ftype (function (disc-node) disc-node) start-node))
-(defun start-node (node)
+(defun* start-node (node)
+    (function (disc-node) disc-node)
   "Spawn the background receiver thread(s) that process inbound datagrams for NODE:
    the unicast metatraffic socket always, plus the multicast socket if enabled.
    Both feed the same %handle-datagram. Returns NODE."
@@ -574,8 +574,8 @@
            (lambda (buf size) (%handle-datagram node buf size)))))
   node)
 
-(declaim (ftype (function (disc-node) (eql t)) stop-node))
-(defun stop-node (node)
+(defun* stop-node (node)
+    (function (disc-node) (eql t))
   "Close NODE's socket(s) (terminating its receiver thread(s)) and free the reusable
    announce scratch buffers. Idempotent."
   (dds.pal:udp-close (disc-node-socket node))
@@ -593,33 +593,33 @@
     (setf (disc-node-rx-tx-msg node) nil))
   t)
 
-(declaim (ftype (function (disc-node) (integer 0)) disc-node-discovered-count))
-(defun disc-node-discovered-count (node)
+(defun* disc-node-discovered-count (node)
+    (function (disc-node) (integer 0))
   "Number of remote participants NODE has discovered."
   (dds.pal:with-lock ((disc-node-lock node))
     (hash-table-count (disc-node-discovered node))))
 
-(declaim (ftype (function (disc-node) list) disc-node-discovered-prefixes))
-(defun disc-node-discovered-prefixes (node)
+(defun* disc-node-discovered-prefixes (node)
+    (function (disc-node) list)
   "List of the 12-octet GUID prefixes NODE has discovered."
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for k being the hash-keys of (disc-node-discovered node) collect k)))
 
-(declaim (ftype (function (disc-node) (integer 0)) disc-node-matched-count))
-(defun disc-node-matched-count (node)
+(defun* disc-node-matched-count (node)
+    (function (disc-node) (integer 0))
   "Number of remote endpoints that matched one of NODE's local endpoints."
   (dds.pal:with-lock ((disc-node-lock node))
     (hash-table-count (disc-node-matches node))))
 
-(declaim (ftype (function (disc-node) list) disc-node-matched-topics))
-(defun disc-node-matched-topics (node)
+(defun* disc-node-matched-topics (node)
+    (function (disc-node) list)
   "Topic names of the remote endpoints NODE has matched."
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for v being the hash-values of (disc-node-matches node)
           collect (dds.rtps.discovery:endpoint-data-topic-name v))))
 
-(declaim (ftype (function () (eql t)) run-spdp-discovery-test))
-(defun run-spdp-discovery-test ()
+(defun* run-spdp-discovery-test ()
+    (function () (eql t))
   "Two participants on 127.0.0.1, each carrying the other as a unicast peer. Both
    announce SPDP; assert each discovers the other's GUID prefix within a bounded
    wait. Exercises announce -> datagram -> receiver thread -> dispatch -> parse
@@ -654,8 +654,8 @@
       (stop-node node1)
       (stop-node node2))))
 
-(declaim (ftype (function () (eql t)) run-sedp-discovery-test))
-(defun run-sedp-discovery-test ()
+(defun* run-sedp-discovery-test ()
+    (function () (eql t))
   "Full discovery handshake over UDP: two participants on 127.0.0.1 first discover
    each other via SPDP, then exchange endpoints via SEDP. node1 offers a RELIABLE
    writer on (Square, ShapeType); node2 requests a BEST_EFFORT reader on the same
@@ -704,8 +704,8 @@
       (stop-node node1)
       (stop-node node2))))
 
-(declaim (ftype (function () (eql t)) run-mcast-discovery-test))
-(defun run-mcast-discovery-test ()
+(defun* run-mcast-discovery-test ()
+    (function () (eql t))
   "Two participants with NO unicast peers discover each other purely via multicast
    SPDP (well-known group 239.255.0.1 : spdp-multicast-port, RTPS 2.5 §9.6.1.1),
    then match endpoints via unicast SEDP routed to the multicast-discovered unicast

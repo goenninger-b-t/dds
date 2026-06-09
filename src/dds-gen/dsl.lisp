@@ -20,13 +20,13 @@
   "Per-type sample-pool size, pre-allocated at registration (NFR-MEM). A later
    ADR derives this from the RESOURCE_LIMITS QoS.")
 
-(declaim (ftype (function (package &rest t) symbol) %sym))
-(defun %sym (package &rest parts)
+(defun* %sym (package &rest parts)
+    (function (package &rest t) symbol)
   "Intern the concatenation of PARTS (string designators) as a symbol in PACKAGE."
   (intern (apply #'concatenate 'string (mapcar #'string parts)) package))
 
-(declaim (ftype (function (list) list) %parse-member))
-(defun %parse-member (spec)
+(defun* %parse-member (spec)
+    (function (list) list)
   "Parse a member spec into a codegen plist. Member type is a primitive keyword,
    (:sequence ELEMENT-KEYWORD) for a sequence of fixed-size primitives, or the
    symbol of a previously-defined dds type for a nested struct."
@@ -65,8 +65,8 @@
                :key (getf opts :key))))
       (t (error "define-dds-type: unsupported member type ~s in ~s" dds-type spec)))))
 
-(declaim (ftype (function (list) t) %key-max-size))
-(defun %key-max-size (keys)
+(defun* %key-max-size (keys)
+    (function (list) t)
   "Maximum PLAIN_CDR2 (XCDR2, max alignment 4) serialized size of the key holder built
    from the scalar @key members KEYS, or :UNBOUNDED if any key is variable-size (a
    string). Drives the RTPS 2.5 §9.6.4.8 <=16-direct vs >16-MD5 keyhash decision, which

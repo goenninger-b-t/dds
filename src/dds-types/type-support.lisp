@@ -1,20 +1,20 @@
 (in-package #:dds.types)
 
-(defstruct (type-support (:constructor make-type-support))
+(defstruct* (type-support (:constructor make-type-support))
   "Per-type manual vtable the engine funcalls per sample (IMPLEMENTATION-PLAN §7.3): a
    plain defstruct of function objects (serialize/deserialize/serialized-size/key-hash,
    sample-pool alloc+free, FlatData hooks, field accessors) plus the type name,
    extensibility, structural TypeObject/TypeIdentifier, and data-representation mask. The
    hot path sees only this struct, never the concrete sample type."
-  (name nil)
+  (name nil :type t)
   (type-name nil :type (or null string))
-  (extensibility :appendable)
+  (extensibility :appendable :type (member :final :appendable :mutable))
   (serialize nil :type (or null function))
   (deserialize nil :type (or null function))
   (serialized-size nil :type (or null function))
   (key-hash nil :type (or null function))
-  (typeobject nil)
-  (typeidentifier nil)
+  (typeobject nil :type t)
+  (typeidentifier nil :type t)
   (sample-pool-alloc nil :type (or null function))
   (sample-pool-free nil :type (or null function))
   (flatdata-offset nil :type (or null function))
@@ -27,20 +27,20 @@
 (defvar *type-registry* (make-hash-table :test 'equal)
   "Maps a type name to its type-support. Control-plane structure (off hot path).")
 
-(declaim (ftype (function (type-support) type-support) register-type))
-(declaim (ftype (function (t) t) find-type-support))
-(declaim (ftype (function () list) registered-type-names))
 
-(defun register-type (ts)
+(defun* register-type (ts)
+    (function (type-support) type-support)
   "Register type-support TS under its NAME. Returns TS."
   (setf (gethash (type-support-name ts) *type-registry*) ts)
   ts)
 
-(defun find-type-support (name)
+(defun* find-type-support (name)
+    (function (t) t)
   "Look up the type-support registered under NAME, or NIL."
   (values (gethash name *type-registry*)))
 
-(defun registered-type-names ()
+(defun* registered-type-names ()
+    (function () list)
   "List of all registered type names."
   (loop for k being the hash-keys of *type-registry* collect k))
 
@@ -48,7 +48,7 @@
 ;;; reader loans a struct, deserializes into it, and returns it — zero per-sample
 ;;; allocation in steady state (NFR-MEM / NFR-DET). Carved once at registration.
 
-(defstruct (sample-pool (:constructor %make-sample-pool))
+(defstruct* (sample-pool (:constructor %make-sample-pool))
   "A fixed-capacity freelist of pre-allocated sample structs: a reader loans a struct,
    deserializes into it, and returns it — zero per-sample allocation in steady state
    (NFR-MEM / NFR-DET). SLOTS is the backing vector, TOP the freelist stack pointer.
@@ -56,15 +56,15 @@
   (slots #() :type simple-vector)
   (top 0 :type fixnum))
 
-(declaim (ftype (function (function (integer 1)) sample-pool) make-sample-pool))
-(defun make-sample-pool (ctor capacity)
+(defun* make-sample-pool (ctor capacity)
+    (function (function (integer 1)) sample-pool)
   "Pre-allocate CAPACITY samples via the thunk CTOR for zero-per-sample reuse."
   (let ((slots (make-array capacity)))
     (dotimes (i capacity) (setf (svref slots i) (funcall ctor)))
     (%make-sample-pool :slots slots :top capacity)))
 
-(declaim (ftype (function (sample-pool) t) sample-pool-acquire))
-(defun sample-pool-acquire (pool)
+(defun* sample-pool-acquire (pool)
+    (function (sample-pool) t)
   "Pop a pre-allocated sample; NIL on exhaustion (caller applies RESOURCE_LIMITS)."
   (let ((top (sample-pool-top pool)))
     (if (zerop top)
@@ -75,8 +75,8 @@
             (setf (svref (sample-pool-slots pool) nt) nil)
             obj)))))
 
-(declaim (ftype (function (sample-pool t) (values)) sample-pool-release))
-(defun sample-pool-release (pool obj)
+(defun* sample-pool-release (pool obj)
+    (function (sample-pool t) (values))
   "Return a loaned sample to POOL."
   (let ((top (sample-pool-top pool)))
     (setf (svref (sample-pool-slots pool) top) obj

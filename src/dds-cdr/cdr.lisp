@@ -26,21 +26,20 @@
    0x06/0x07, D_CDR2 0x08/0x09, PL_CDR2 0x0a/0x0b, XML 0x04) is what every DDS wire
    uses, confirmed against the Wireshark RTPS dissector. See docs/provenance.md.")
 
-(declaim (ftype (function (symbol) t) representation-id-value))
-(declaim (ftype (function (integer) t) representation-id-name))
-(declaim (ftype (function (dds.core.buffer:cursor symbol &optional integer) dds.core.buffer:cursor) make-encapsulation-header))
-(declaim (ftype (function (dds.core.buffer:cursor) (values t integer)) parse-encapsulation-header))
 
-(defun representation-id-value (name)
+(defun* representation-id-value (name)
+    (function (symbol) t)
   "16-bit wire value for representation NAME (XTypes 1.3 §7.6 Table 60)."
   (or (cdr (assoc name +representation-ids+))
       (error 'cdr-not-implemented :what (format nil "unknown representation ~s" name))))
 
-(defun representation-id-name (value)
+(defun* representation-id-name (value)
+    (function (integer) t)
   "Inverse of representation-id-value, or NIL if VALUE is unrecognised."
   (car (rassoc value +representation-ids+)))
 
-(defun make-encapsulation-header (cursor representation &optional (options 0))
+(defun* make-encapsulation-header (cursor representation &optional (options 0))
+    (function (dds.core.buffer:cursor symbol &optional integer) dds.core.buffer:cursor)
   "Write the 4-octet SerializedPayloadHeader: 2-octet representation_identifier in
    network order + 2-octet representation_options (RTPS 2.5 §10.2; sender sets
    options to 0 per §10.2/§10.3), then reset the CDR alignment origin to the byte
@@ -53,7 +52,8 @@
     (dds.core.buffer:cursor-set-origin cursor)
     cursor))
 
-(defun parse-encapsulation-header (cursor)
+(defun* parse-encapsulation-header (cursor)
+    (function (dds.core.buffer:cursor) (values t integer))
   "Read and validate the 4-octet SerializedPayloadHeader; reset the CDR alignment
    origin past it (RTPS 2.5 §10.2). Return (values representation-keyword options).
    Bounds-checked at the boundary (NFR-SEC-POSTURE)."

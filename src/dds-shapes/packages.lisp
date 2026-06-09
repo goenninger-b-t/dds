@@ -5,7 +5,7 @@
 
 (defpackage #:net.goenninger.dds.shapes
   (:nicknames #:dds.shapes)
-  (:use #:common-lisp)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
   (:documentation
    "Standalone Square/ShapeType publisher + subscriber on the participant data
     plane (dds.disc) for cross-process and Connext interop. run-publisher animates

@@ -4,8 +4,9 @@
 ;;; against RTPS 2.5 (§9.4.4 / §9.4.5.1 / §9.3.1.2). The wire-layer analogue of
 ;;; the byte-exact CDR corpus; values pinned from docs/specs, not memory.
 
-(declaim (ftype (function () t) run-rtps-wire-test))
-(defun run-rtps-wire-test ()
+(defun* run-rtps-wire-test ()
+    (function () t)
+  "Test: RTPS message header + submessage byte-exactness against spec-pinned vectors."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 64 1))
          (prefix (make-array 12 :element-type '(unsigned-byte 8)
@@ -55,8 +56,9 @@
 
 ;;; DATA submessage byte-exact + parse (RTPS 2.5 §9.4.5.4, base form, Q=0).
 
-(declaim (ftype (function () t) run-rtps-data-test))
-(defun run-rtps-data-test ()
+(defun* run-rtps-data-test ()
+    (function () t)
+  "Test: RTPS DATA submessage write/parse round-trip, including inline-QoS handling."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 128 1))
          (buf (dds.core.arena:pool-acquire pool))
@@ -96,8 +98,9 @@
 ;;; DATA_FRAG codec + reassembly (RTPS 2.5 §9.4.5.5): write/parse each fragment, then
 ;;; reassemble byte-exact; plus spec-validity (fragmentStartingNum=0) rejection.
 
-(declaim (ftype (function () t) run-rtps-data-frag-test))
-(defun run-rtps-data-frag-test ()
+(defun* run-rtps-data-frag-test ()
+    (function () t)
+  "Test: RTPS DATA_FRAG submessage write/parse round-trip (RTPS 2.5 §9.4.5.5)."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 256 1))
          (rid dds.rtps.message:+entityid-unknown+)
@@ -148,8 +151,9 @@
 ;;; RTPS message framing: build Header + DATA + HEARTBEAT into one buffer, then
 ;;; dispatch-message walks the submessages back out (RTPS 2.5 §8.3.4 / §9.4.5).
 
-(declaim (ftype (function () t) run-rtps-dispatch-test))
-(defun run-rtps-dispatch-test ()
+(defun* run-rtps-dispatch-test ()
+    (function () t)
+  "Test: RTPS message dispatch routes each submessage to its handler."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 256 1))
          (buf (dds.core.arena:pool-acquire pool))
@@ -185,8 +189,9 @@
 ;;; ParameterList (PID) codec byte-exact + round-trip (RTPS 2.5 §9.4.2.11) and the
 ;;; RTPS port-mapping formula (§9.6.1.1).
 
-(declaim (ftype (function () t) run-paramlist-test))
-(defun run-paramlist-test ()
+(defun* run-paramlist-test ()
+    (function () t)
+  "Test: ParameterList write/parse round-trip, including the PID_SENTINEL terminator."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 128 1))
          (buf (dds.core.arena:pool-acquire pool))
@@ -218,8 +223,9 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
-(declaim (ftype (function () t) run-port-mapping-test))
-(defun run-port-mapping-test ()
+(defun* run-port-mapping-test ()
+    (function () t)
+  "Test: the RTPS well-known port-mapping formulas (RTPS 2.5 §9.6.1.1)."
   (%check :port-spdp-mc (and (= 7400 (dds.rtps.message:spdp-multicast-port 0))
                              (= 7650 (dds.rtps.message:spdp-multicast-port 1)))
           "SPDP multicast port")
@@ -234,8 +240,9 @@
 
 ;;; HistoryCache: HISTORY (KEEP_LAST/KEEP_ALL) + RESOURCE_LIMITS (FR-RTPS-5).
 
-(declaim (ftype (function () t) run-history-test))
-(defun run-history-test ()
+(defun* run-history-test ()
+    (function () t)
+  "Test: HistoryCache HISTORY + RESOURCE_LIMITS behaviour (KEEP_LAST/KEEP_ALL)."
   (flet ((mk (sn) (dds.rtps.history:make-cache-change :sn sn)))
     ;; KEEP_LAST depth 3: adding 1..4 evicts SN 1
     (let ((hc (dds.rtps.history:make-history-cache :keep-last 3 nil nil)))
@@ -265,8 +272,9 @@
 ;;; (RTPS 2.5 §8.4; NFR-TEST reliability suite). Deterministic loss pattern that
 ;;; clears by round 3, so convergence is guaranteed and the loop is bounded.
 
-(declaim (ftype (function () t) run-reliability-test))
-(defun run-reliability-test ()
+(defun* run-reliability-test ()
+    (function () t)
+  "Test: the reliable writer/reader HEARTBEAT/ACKNACK delivery state machine."
   (let* ((writer (dds.rtps.reliable:make-rtps-writer
                   :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
          (reader (dds.rtps.reliable:make-rtps-reader))
@@ -301,8 +309,9 @@
 ;;; GAP: a reader NACKing evicted samples gets a GAP for them and a resend for the
 ;;; samples still in the HistoryCache (RTPS 2.5 §8.3.7.4).
 
-(declaim (ftype (function () t) run-gap-handling-test))
-(defun run-gap-handling-test ()
+(defun* run-gap-handling-test ()
+    (function () t)
+  "Test: reliable reader GAP handling and SequenceNumberSet bitmap edges."
   (let* ((writer (dds.rtps.reliable:make-rtps-writer
                   :hc (dds.rtps.history:make-history-cache :keep-last 2 nil nil)))
          (reader (dds.rtps.reliable:make-rtps-reader))
@@ -325,8 +334,9 @@
 ;;; HEARTBEAT / ACKNACK / GAP submessage round-trips (RTPS 2.5 §9.4.5.7/.3/.6).
 ;;; Writes a complete submessage, re-reads the SubmessageHeader, then the body.
 
-(declaim (ftype (function () t) run-rtps-submessage-test))
-(defun run-rtps-submessage-test ()
+(defun* run-rtps-submessage-test ()
+    (function () t)
+  "Test: individual RTPS submessage codecs (HEARTBEAT/ACKNACK/GAP/INFO_*)."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 128 1))
          (buf (dds.core.arena:pool-acquire pool))
@@ -374,8 +384,9 @@
 ;;; SequenceNumber + SequenceNumberSet byte-exact + exhaustive bitmap boundaries
 ;;; (RTPS 2.5 §9.3.2.10 / §9.4.2.6) — the classic off-by-one source (FR-RTPS-7, R4).
 
-(declaim (ftype (function () t) run-rtps-seqnum-test))
-(defun run-rtps-seqnum-test ()
+(defun* run-rtps-seqnum-test ()
+    (function () t)
+  "Test: SequenceNumber + SequenceNumberSet bitmap encode/decode edge cases."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 64 1))
          (buf (dds.core.arena:pool-acquire pool))

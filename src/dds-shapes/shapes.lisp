@@ -27,8 +27,8 @@
   (uuid :string)
   (seq :u32))
 
-(declaim (ftype (function () (or null (simple-array (unsigned-byte 8) (*)))) %shape-type-information))
-(defun %shape-type-information ()
+(defun* %shape-type-information ()
+    (function () (or null (simple-array (unsigned-byte 8) (*))))
   "Opaque serialized XTypes TypeInformation for the canonical ShapeType, advertised in
    PID_TYPE_INFORMATION so rtishapesdemo / DDSSpy see our type; NIL if unavailable.
    PROVISIONAL bytes (see typeobject-cdr.lisp) — capture with tshark to compare vs Connext."
@@ -37,8 +37,8 @@
         (and ts (dds.types:serialize-type-information (dds.types:type-support-typeobject ts))))
     (error () nil)))
 
-(declaim (ftype (function () string) %make-uuid))
-(defun %make-uuid ()
+(defun* %make-uuid ()
+    (function () string)
   "A random RFC-4122 v4 UUID string identifying one publisher stream. Demo-grade
    (seeds from make-random-state t; production wants a vetted UUID source)."
   (let ((rs (make-random-state t))
@@ -51,8 +51,8 @@
             (aref b 6) (aref b 7) (aref b 8) (aref b 9) (aref b 10) (aref b 11)
             (aref b 12) (aref b 13) (aref b 14) (aref b 15))))
 
-(declaim (ftype (function ((unsigned-byte 8)) (simple-array (unsigned-byte 8) (12))) %make-prefix))
-(defun %make-prefix (role)
+(defun* %make-prefix (role)
+    (function ((unsigned-byte 8)) (simple-array (unsigned-byte 8) (12)))
   "A 12-octet GUID prefix: marker 'G' 'B' + ROLE byte + wall-clock-derived tail, so
    a publisher (role #x50) and subscriber (role #x53), and successive runs, get
    distinct prefixes. Demo-grade, not a real GUID allocator."
@@ -63,8 +63,8 @@
           do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
-(declaim (ftype (function (function) (simple-array (unsigned-byte 8) (*))) %serialize-payload))
-(defun %serialize-payload (serialize-fn)
+(defun* %serialize-payload (serialize-fn)
+    (function (function) (simple-array (unsigned-byte 8) (*)))
   "Build a PLAIN_CDR2_LE SerializedPayload: an encapsulation header + whatever
    SERIALIZE-FN writes (called with the XCDR2 cursor). Returns a fresh octet vector
    — the data-plane publish payload. Works for either shape type."
@@ -78,8 +78,8 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
       out)))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 8) (*)) function) t) %deserialize-with))
-(defun %deserialize-with (bytes deserialize-fn)
+(defun* %deserialize-with (bytes deserialize-fn)
+    (function ((simple-array (unsigned-byte 8) (*)) function) t)
   "Parse a SerializedPayload's encapsulation header (honoring representation +
    endianness, so a foreign CDR_LE/BE or CDR2_LE/BE sender is handled), then call
    DESERIALIZE-FN with (cursor mode). Both shape types are :final (no DHEADER)."
@@ -94,8 +94,8 @@
         (prog1 (funcall deserialize-fn rc mode)
           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))))
 
-(declaim (ftype (function (dds.disc:disc-node (integer 0)) t) %reannounce))
-(defun %reannounce (node last)
+(defun* %reannounce (node last)
+    (function (dds.disc:disc-node (integer 0)) t)
   "Re-announce SPDP + SEDP if more than ~1.5 s have passed since LAST (an internal
    real-time stamp). Returns the new stamp (LAST if no announce). Keeps a late-
    joining peer (or Connext) discovering + matching this participant."
@@ -106,9 +106,9 @@
                now)
         last)))
 
-(declaim (ftype (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol)) t) run-publisher))
-(defun run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
+(defun* run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
                            (advertise-address "127.0.0.1") (type :tagged))
+    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol)) t)
   "Publish an animated Square on DOMAIN via multicast discovery. TYPE selects the
    payload: :canonical = the exact RTI ShapeType (color/x/y/shapesize — for interop
    with rtishapesdemo / DDSSpy); :tagged = + per-publisher uuid + per-sample seq
@@ -166,13 +166,13 @@
                   n (dds.disc:node-acks-in node) uuid))))
     t))
 
-(declaim (ftype (function ((simple-array (unsigned-byte 8) (12))) string) %hex-prefix))
-(defun %hex-prefix (prefix)
+(defun* %hex-prefix (prefix)
+    (function ((simple-array (unsigned-byte 8) (12))) string)
   "Lowercase hex of a 12-octet GUID prefix."
   (format nil "~(~{~2,'0x~}~)" (coerce prefix 'list)))
 
-(declaim (ftype (function (dds.rtps.discovery:locator) string) %fmt-locator))
-(defun %fmt-locator (loc)
+(defun* %fmt-locator (loc)
+    (function (dds.rtps.discovery:locator) string)
   "Human-readable locator: 'UDPv4 a.b.c.d:port', or 'kind=#xK port=P' for non-UDPv4
    (e.g. SHMEM / UDPv6 — exactly the entries a foreign stack may also advertise)."
   (let ((kind (dds.rtps.discovery:locator-kind loc))
@@ -181,13 +181,13 @@
         (format nil "UDPv4 ~a:~d" (dds.rtps.discovery:locator-ipv4-string loc) port)
         (format nil "kind=#x~x port=~d" kind port))))
 
-(declaim (ftype (function (list) string) %fmt-locators))
-(defun %fmt-locators (locs)
+(defun* %fmt-locators (locs)
+    (function (list) string)
   "Comma-separated locator list, or '(none)'."
   (if (null locs) "(none)" (format nil "~{~a~^, ~}" (mapcar #'%fmt-locator locs))))
 
-(declaim (ftype (function (dds.rtps.discovery:spdp-data) t) %print-participant))
-(defun %print-participant (p)
+(defun* %print-participant (p)
+    (function (dds.rtps.discovery:spdp-data) t)
   "Print a discovered participant's advertised locators + the data destination this
    stack resolves for it."
   (format t "~&[spy] participant ~a~%" (%hex-prefix (dds.rtps.discovery:spdp-data-guid-prefix p)))
@@ -207,8 +207,8 @@
             (if dest (format nil "~a:~d" (car dest) (cdr dest))
                 "NONE (no routable UDPv4 locator advertised)"))))
 
-(declaim (ftype (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string)) t) run-spy))
-(defun run-spy (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1"))
+(defun* run-spy (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string)) t)
   "Discovery diagnostic: join multicast SPDP on DOMAIN and print every discovered
    participant's advertised locators + the destination this stack resolves for it
    (no reader/writer). Use it to see exactly what we extract from a foreign SPDP
@@ -238,8 +238,8 @@
         (format t "~&[spy] stopped; ~d participant(s) discovered.~%" (hash-table-count seen)))
       t)))
 
-(declaim (ftype (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string) (:type symbol)) t) run-subscriber))
-(defun run-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1") (type :tagged))
+(defun* run-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1") (type :tagged))
+    (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string) (:type symbol)) t)
   "Subscribe to Square on DOMAIN via multicast discovery and print every shape.
    TYPE selects the payload codec (:canonical | :tagged) and must match the
    publisher. SECONDS 0 = forever (Ctrl-C). Receives from rtishapesdemo / DDSSpy

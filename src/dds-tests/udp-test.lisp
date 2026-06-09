@@ -4,8 +4,9 @@
 ;;; a second socket to 127.0.0.1:<rx-port>, receive it, verify the octets. Uses
 ;;; each implementation's own sb-bsd-sockets; no portability library.
 
-(declaim (ftype (function () t) run-udp-loopback-test))
-(defun run-udp-loopback-test ()
+(defun* run-udp-loopback-test ()
+    (function () t)
+  "Test: the UDPv4 PAL sends and receives a datagram over loopback."
   (let ((rx (dds.pal:udp-open :host "127.0.0.1" :port 0)))
     (unwind-protect
         (let ((tx (dds.pal:udp-open :host "127.0.0.1" :port 0))

@@ -43,7 +43,7 @@
 
 ;;; ---- TypeIdentifier (idl §269 union, structural in-memory form) ----
 
-(defstruct (type-identifier (:constructor %make-type-identifier) (:copier nil))
+(defstruct* (type-identifier (:constructor %make-type-identifier) (:copier nil))
   "Structural XTypes TypeIdentifier. KIND is the discriminant octet (a TK_* primitive,
    a TI_STRING8_*/TI_PLAIN_SEQUENCE_*, or an EK_* for a hash-defined type). BOUND is the
    string/collection bound (0 = unbounded). ELEMENT is the collection element TI. HASH is
@@ -54,11 +54,11 @@
   (kind 0 :type (unsigned-byte 8))
   (bound 0 :type (integer 0))
   (element nil :type (or null type-identifier))
-  (hash nil)
-  (referenced nil))
+  (hash nil :type t)
+  (referenced nil :type t))
 
-(declaim (ftype (function (keyword) type-identifier) primitive-type-identifier))
-(defun primitive-type-identifier (keyword)
+(defun* primitive-type-identifier (keyword)
+    (function (keyword) type-identifier)
   "The TypeIdentifier for a primitive / string DSL member KEYWORD. :u8/:i8 map to
    TK_BYTE (XTypes 1.3 has no distinct 8-bit int kind). :string is an unbounded STRING8."
   (let ((tk (ecase keyword
@@ -71,21 +71,21 @@
         (%make-type-identifier :kind +ti-string8-small+ :bound 0)   ; 0 = unbounded
         (%make-type-identifier :kind tk))))
 
-(declaim (ftype (function (type-identifier &optional (integer 0)) type-identifier) sequence-type-identifier))
-(defun sequence-type-identifier (element &optional (bound 0))
+(defun* sequence-type-identifier (element &optional (bound 0))
+    (function (type-identifier &optional (integer 0)) type-identifier)
   "A plain-sequence TypeIdentifier with ELEMENT element TI and BOUND (0 = unbounded)."
   (%make-type-identifier :kind +ti-plain-sequence-small+ :bound bound :element element))
 
-(declaim (ftype (function ((unsigned-byte 8) &key (:hash t) (:referenced t)) type-identifier) hash-type-identifier))
-(defun hash-type-identifier (ek &key hash referenced)
+(defun* hash-type-identifier (ek &key hash referenced)
+    (function ((unsigned-byte 8) &key (:hash t) (:referenced t)) type-identifier)
   "A hash-defined TypeIdentifier (EK_MINIMAL/EK_COMPLETE). HASH is the 14-octet
    EquivalenceHash, or NIL when pending (the serializer is deferred). REFERENCED is the
    in-memory minimal-struct-type the identifier resolves to, letting assignability recurse
    ahead of the deferred hash."
   (%make-type-identifier :kind ek :hash hash :referenced referenced))
 
-(declaim (ftype (function (type-identifier type-identifier) t) type-identifier=))
-(defun type-identifier= (a b)
+(defun* type-identifier= (a b)
+    (function (type-identifier type-identifier) t)
   "Structural equality of two TypeIdentifiers (FR-TYPE-2): same kind + bound, equal
    element (recursively), equal EquivalenceHash (both NIL or both equal), and the same
    referenced struct (compared by identity — distinct instances of the same nested type
@@ -101,8 +101,8 @@
 
 ;;; ---- Member name hash + the Minimal struct-type structural model ----
 
-(declaim (ftype (function (string) (simple-array (unsigned-byte 8) (4))) member-name-hash))
-(defun member-name-hash (name)
+(defun* member-name-hash (name)
+    (function (string) (simple-array (unsigned-byte 8) (4)))
   "NameHash = first 4 octets of MD5(UTF-8 NAME without NUL) (idl §90-93). IDL member
    names are ASCII, so UTF-8 = the char codes. Example: \"color\" -> 70 dd a5 df."
   (let* ((bytes (map '(simple-array (unsigned-byte 8) (*)) #'char-code name))
@@ -110,28 +110,28 @@
     (replace out (dds.core.md5:md5 bytes) :end2 4)
     out))
 
-(defstruct (minimal-struct-member (:constructor %make-minimal-struct-member))
+(defstruct* (minimal-struct-member (:constructor %make-minimal-struct-member))
   "A member of a Minimal struct type (idl §454): the IDL name + member id + member
    TypeIdentifier + key/optional/must-understand flags + the NameHash (the MINIMAL detail)."
   (name "" :type string)
   (id 0 :type (unsigned-byte 32))
   (type-identifier nil :type (or null type-identifier))
-  (key-p nil)
-  (optional-p nil)
-  (must-understand-p nil)
-  (name-hash nil))
+  (key-p nil :type boolean)
+  (optional-p nil :type boolean)
+  (must-understand-p nil :type boolean)
+  (name-hash nil :type t))
 
-(declaim (ftype (function (string (unsigned-byte 32) type-identifier &key (:key-p t) (:optional-p t) (:must-understand-p t)) minimal-struct-member) make-struct-member))
-(defun make-struct-member (name id type-identifier &key key-p optional-p must-understand-p)
+(defun* make-struct-member (name id type-identifier &key key-p optional-p must-understand-p)
+    (function (string (unsigned-byte 32) type-identifier &key (:key-p t) (:optional-p t) (:must-understand-p t)) minimal-struct-member)
   "Build a Minimal struct member, computing its NameHash from NAME."
   (%make-minimal-struct-member :name name :id id :type-identifier type-identifier
                                :key-p key-p :optional-p optional-p
                                :must-understand-p must-understand-p
                                :name-hash (member-name-hash name)))
 
-(defstruct (minimal-struct-type (:constructor make-minimal-struct-type))
+(defstruct* (minimal-struct-type (:constructor make-minimal-struct-type))
   "A Minimal struct TypeObject (idl §499), structural form: the qualified type name,
    extensibility (:final/:appendable/:mutable), and the member list in member order."
   (name "" :type string)
-  (extensibility :final)
+  (extensibility :final :type (member :final :appendable :mutable))
   (members '() :type list))

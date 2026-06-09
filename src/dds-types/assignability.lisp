@@ -12,56 +12,43 @@
 
 (in-package #:dds.types)
 
-(defstruct (assignability-options (:constructor make-assignability-options))
+(defstruct* (assignability-options (:constructor make-assignability-options))
   "The four TypeConsistencyEnforcement fields that modulate is-assignable-from under
    ALLOW_TYPE_COERCION (XTypes §7.6.3.4.1). Spec defaults: bounds ignored, member names
    enforced, type widening permitted."
-  (ignore-sequence-bounds t)
-  (ignore-string-bounds t)
-  (ignore-member-names nil)
-  (prevent-type-widening nil))
+  (ignore-sequence-bounds t :type boolean)
+  (ignore-string-bounds t :type boolean)
+  (ignore-member-names nil :type boolean)
+  (prevent-type-widening nil :type boolean))
 
-(declaim (ftype (function () assignability-options) default-assignability-options))
-(declaim (ftype (function (type-identifier) t) ti-primitive-p))
-(declaim (ftype (function (type-identifier) t) ti-string-p))
-(declaim (ftype (function (type-identifier) t) ti-sequence-p))
-(declaim (ftype (function (type-identifier) t) ti-aggregated-p))
-(declaim (ftype (function ((integer 0) (integer 0)) t) bound>=))
-(declaim (ftype (function (type-identifier) t) ti-delimited-p))
-(declaim (ftype (function (type-identifier type-identifier assignability-options) t) ti-assignable-from))
-(declaim (ftype (function (type-identifier type-identifier assignability-options) t) strongly-assignable-from))
-(declaim (ftype (function ((unsigned-byte 32) list) (or null minimal-struct-member) ) member-by-id))
-(declaim (ftype (function (minimal-struct-type) minimal-struct-type) key-erase-struct))
-(declaim (ftype (function (type-identifier) type-identifier) key-erase-ti))
-(declaim (ftype (function (list list t) t) member-names-ids-consistent-p))
-(declaim (ftype (function (minimal-struct-member minimal-struct-member) t) key-member-bound-ok-p))
-(declaim (ftype (function (minimal-struct-type minimal-struct-type assignability-options) t) struct-assignable-from))
-(declaim (ftype (function (type-identifier type-identifier) t) ti-equivalent-p))
-(declaim (ftype (function (minimal-struct-type minimal-struct-type) t) struct-equivalent-p))
-(declaim (ftype (function (minimal-struct-type minimal-struct-type &key (:kind symbol) (:ignore-sequence-bounds t) (:ignore-string-bounds t) (:ignore-member-names t) (:prevent-type-widening t)) t) enforce-type-consistency))
 
-(defun default-assignability-options ()
+(defun* default-assignability-options ()
+    (function () assignability-options)
   "A fresh options struct carrying the XTypes §7.6.3.4.1 defaults."
   (make-assignability-options))
 
 ;;; ---- TypeIdentifier kind predicates (octets defined in xtypes.lisp) ----
 
-(defun ti-primitive-p (ti)
+(defun* ti-primitive-p (ti)
+    (function (type-identifier) t)
   "True if TI is a primitive TypeKind (boolean..float128, char8/char16)."
   (let ((k (type-identifier-kind ti)))
     (or (<= +tk-boolean+ k +tk-float128+) (= k +tk-char8+) (= k +tk-char16+))))
 
-(defun ti-string-p (ti)
+(defun* ti-string-p (ti)
+    (function (type-identifier) t)
   "True if TI is a narrow string (TI_STRING8_SMALL/LARGE)."
   (let ((k (type-identifier-kind ti)))
     (or (= k +ti-string8-small+) (= k +ti-string8-large+))))
 
-(defun ti-sequence-p (ti)
+(defun* ti-sequence-p (ti)
+    (function (type-identifier) t)
   "True if TI is a plain sequence (TI_PLAIN_SEQUENCE_SMALL/LARGE)."
   (let ((k (type-identifier-kind ti)))
     (or (= k +ti-plain-sequence-small+) (= k +ti-plain-sequence-large+))))
 
-(defun ti-aggregated-p (ti)
+(defun* ti-aggregated-p (ti)
+    (function (type-identifier) t)
   "True if TI is a hash-defined aggregated type (EK_MINIMAL/EK_COMPLETE) carrying a
    resolved in-memory referenced struct."
   (let ((k (type-identifier-kind ti)))
@@ -70,14 +57,16 @@
 
 ;;; ---- Bound comparison (0 = unbounded = the maximum) ----
 
-(defun bound>= (b1 b2)
+(defun* bound>= (b1 b2)
+    (function ((integer 0) (integer 0)) t)
   "T1.bound >= T2.bound, with 0 meaning unbounded (the maximum): an unbounded T1 always
    satisfies it; a bounded T1 never satisfies an unbounded T2."
   (cond ((zerop b1) t) ((zerop b2) nil) (t (>= b1 b2))))
 
 ;;; ---- Delimited types (XTypes §7.2.4.2), assuming XCDR2 (the stack default) ----
 
-(defun ti-delimited-p (ti)
+(defun* ti-delimited-p (ti)
+    (function (type-identifier) t)
   "Whether an object of type TI is self-delimiting under XCDR2 (§7.2.4.2): primitives and
    strings are; a sequence is iff its element is; an aggregated type is iff its
    extensibility is APPENDABLE or MUTABLE (FINAL aggregated types are not delimited)."
@@ -93,7 +82,8 @@
 
 ;;; ---- is-assignable-from at the TypeIdentifier level (Tables 15-17 + nested 19) ----
 
-(defun ti-assignable-from (t1 t2 opts)
+(defun* ti-assignable-from (t1 t2 opts)
+    (function (type-identifier type-identifier assignability-options) t)
   "T1 is-assignable-from T2 at the TypeIdentifier level (XTypes §7.2.4.4): primitives are
    assignable from the same primitive kind (Table 15); narrow strings from narrow strings
    under the bound rule gated by ignore_string_bounds (Table 16); plain sequences when the
@@ -118,18 +108,21 @@
                              (type-identifier-referenced t2) opts))
     (t nil)))
 
-(defun strongly-assignable-from (t1 t2 opts)
+(defun* strongly-assignable-from (t1 t2 opts)
+    (function (type-identifier type-identifier assignability-options) t)
   "T1 is strongly-assignable-from T2 (§7.2.4.3): assignable-from AND T2 is a delimited
    type. Required for collection elements and aggregated key members."
   (and (ti-assignable-from t1 t2 opts) (ti-delimited-p t2) t))
 
 ;;; ---- Struct (aggregated) assignability (XTypes §7.2.4.4.8, Table 19) ----
 
-(defun member-by-id (id members)
+(defun* member-by-id (id members)
+    (function ((unsigned-byte 32) list) (or null minimal-struct-member) )
   "The member in MEMBERS whose id = ID, or NIL."
   (find id members :key #'minimal-struct-member-id :test #'=))
 
-(defun key-erase-struct (s)
+(defun* key-erase-struct (s)
+    (function (minimal-struct-type) minimal-struct-type)
   "A copy of struct S with @key cleared on every immediate member (XTypes KeyErased;
    deeper levels are erased as the relation recurses through them)."
   (make-minimal-struct-type
@@ -141,7 +134,8 @@
                         c))
                     (minimal-struct-type-members s))))
 
-(defun key-erase-ti (ti)
+(defun* key-erase-ti (ti)
+    (function (type-identifier) type-identifier)
   "KeyErased(TI): for an aggregated type, the same kind referencing a key-erased struct;
    for any other type, TI unchanged (no keys to erase)."
   (if (ti-aggregated-p ti)
@@ -149,7 +143,8 @@
                             :referenced (key-erase-struct (type-identifier-referenced ti)))
       ti))
 
-(defun member-names-ids-consistent-p (members1 members2 ignore-names)
+(defun* member-names-ids-consistent-p (members1 members2 ignore-names)
+    (function (list list t) t)
   "Member name<->id correspondence (§7.2.4.4.8): across the two lists, members with the
    same name have the same id and members with the same id have the same name. When
    IGNORE-NAMES is true, names are not consulted at all (only ids matter, §7.6.3.4.2)."
@@ -164,7 +159,8 @@
                      (not (= (minimal-struct-member-id a) (minimal-struct-member-id b))))
             (return-from member-names-ids-consistent-p nil))))))
 
-(defun key-member-bound-ok-p (m1 m2)
+(defun* key-member-bound-ok-p (m1 m2)
+    (function (minimal-struct-member minimal-struct-member) t)
   "Key sub-bound rule (§7.2.4.4.8): for a string or sequence key member, the T1 member's
    bound must be >= the T2 member's bound (0 = unbounded). Scalar key members carry no
    bound and pass. (The DSL restricts @key to scalar/string, so struct/union/enum key
@@ -176,7 +172,8 @@
         (bound>= (type-identifier-bound ti1) (type-identifier-bound ti2))
         t)))
 
-(defun struct-assignable-from (s1 s2 opts)
+(defun* struct-assignable-from (s1 s2 opts)
+    (function (minimal-struct-type minimal-struct-type assignability-options) t)
   "STRUCTURE_TYPE is-assignable-from (XTypes §7.2.4.4.8, Table 19): T1=S1 is-assignable-from
    T2=S2. Checks the common conditions (same extensibility; name/id correspondence; >=1
    corresponding member; KeyErased member-type assignability; must_understand and key
@@ -242,7 +239,8 @@
 
 ;;; ---- Structural MINIMAL-equivalence (a verifiable stand-in for EquivalenceHash) ----
 
-(defun ti-equivalent-p (t1 t2)
+(defun* ti-equivalent-p (t1 t2)
+    (function (type-identifier type-identifier) t)
   "Structural MINIMAL-equivalence of two TypeIdentifiers (§7.3.4.7 stand-in for the
    deferred EquivalenceHash): same kind + bound, recursively-equivalent element, and an
    equivalent referenced struct (both NIL or both equivalent structs)."
@@ -257,7 +255,8 @@
                 (struct-equivalent-p r1 r2))
                (t nil)))))
 
-(defun struct-equivalent-p (s1 s2)
+(defun* struct-equivalent-p (s1 s2)
+    (function (minimal-struct-type minimal-struct-type) t)
   "Structural MINIMAL-equivalence of two struct TypeObjects (§7.3.4.7 stand-in): same
    extensibility, same member count, and pairwise (in member order) same id, same @key,
    same @optional, and equivalent member type. Member NAMES are not compared (MINIMAL
@@ -278,12 +277,13 @@
 
 ;;; ---- TYPE_CONSISTENCY_ENFORCEMENT Step-1 decision (XTypes §7.6.3.4.2) ----
 
-(defun enforce-type-consistency (reader-type writer-type
+(defun* enforce-type-consistency (reader-type writer-type
                                  &key (kind :allow-type-coercion)
                                       (ignore-sequence-bounds t)
                                       (ignore-string-bounds t)
                                       (ignore-member-names nil)
                                       (prevent-type-widening nil))
+    (function (minimal-struct-type minimal-struct-type &key (:kind symbol) (:ignore-sequence-bounds t) (:ignore-string-bounds t) (:ignore-member-names t) (:prevent-type-widening t)) t)
   "TypeConsistencyEnforcement Step-1 decision (XTypes §7.6.3.4.2) for the TypeObject-present
    case: under ALLOW_TYPE_COERCION the READER-TYPE must be is-assignable-from the
    WRITER-TYPE, taking the four options into account; under DISALLOW_TYPE_COERCION the two

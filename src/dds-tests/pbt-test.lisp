@@ -6,15 +6,17 @@
 ;;;; robustness against random bytes (the fuzz gate, NFR-SEC-POSTURE). Shrinking
 ;;;; is not implemented; the first failing input is reported verbatim.
 
-(defstruct (prng (:constructor %make-prng))
+(defstruct* (prng (:constructor %make-prng))
+  "Deterministic PRNG state for reproducible property-based-test generators (seeded; no Math.random/time dependency)."
   (state 1 :type (unsigned-byte 32)))
 
-(declaim (ftype (function (integer) prng) make-prng))
-(defun make-prng (seed)
+(defun* make-prng (seed)
+    (function (integer) prng)
+  "Construct a deterministic test PRNG seeded by SEED (reproducible property-based-test generator)."
   (%make-prng :state (logand #xFFFFFFFF (max 1 seed))))
 
-(declaim (ftype (function (prng) (unsigned-byte 32)) prng-next))
-(defun prng-next (prng)
+(defun* prng-next (prng)
+    (function (prng) (unsigned-byte 32))
   "xorshift32 — portable, deterministic, fixnum-friendly on 64-bit."
   (let ((x (prng-state prng)))
     (setf x (logand #xFFFFFFFF (logxor x (ash x 13))))
@@ -22,30 +24,35 @@
     (setf x (logand #xFFFFFFFF (logxor x (ash x 5))))
     (setf (prng-state prng) x)))
 
-(declaim (ftype (function (prng integer integer) integer) prng-int))
-(defun prng-int (prng lo hi)
+(defun* prng-int (prng lo hi)
+    (function (prng integer integer) integer)
+  "A pseudo-random integer in [LO, HI] from PRNG (advances its state)."
   (+ lo (mod (prng-next prng) (1+ (- hi lo)))))
 
-(declaim (ftype (function (prng) (signed-byte 32)) prng-i32))
-(defun prng-i32 (prng)
+(defun* prng-i32 (prng)
+    (function (prng) (signed-byte 32))
+  "A pseudo-random signed 32-bit integer from PRNG."
   (let ((u (prng-next prng))) (if (>= u #x80000000) (- u #x100000000) u)))
 
-(declaim (ftype (function (prng) (unsigned-byte 64)) prng-u64))
-(defun prng-u64 (prng)
+(defun* prng-u64 (prng)
+    (function (prng) (unsigned-byte 64))
+  "A pseudo-random unsigned 64-bit integer from PRNG."
   (logior (ash (prng-next prng) 32) (prng-next prng)))
 
-(declaim (ftype (function (prng) (signed-byte 64)) prng-i64))
-(defun prng-i64 (prng)
+(defun* prng-i64 (prng)
+    (function (prng) (signed-byte 64))
+  "A pseudo-random signed 64-bit integer from PRNG."
   (let ((u (prng-u64 prng))) (if (>= u (ash 1 63)) (- u (ash 1 64)) u)))
 
-(declaim (ftype (function (prng (integer 0)) string) prng-ascii-string))
-(defun prng-ascii-string (prng maxlen)
+(defun* prng-ascii-string (prng maxlen)
+    (function (prng (integer 0)) string)
+  "A pseudo-random printable-ASCII string of length up to MAX from PRNG."
   (let* ((n (prng-int prng 0 maxlen)) (s (make-string n)))
     (dotimes (i n) (setf (char s i) (code-char (prng-int prng 32 126))))
     s))
 
-(declaim (ftype (function (t prng (integer 0) function function) t) check-property))
-(defun check-property (name prng n generator property)
+(defun* check-property (name prng n generator property)
+    (function (t prng (integer 0) function function) t)
   "Run PROPERTY over N inputs from (GENERATOR prng). PROPERTY returns generalized
    boolean; a NIL result or any signalled error fails the property, reporting the
    first offending input (no shrinking)."
@@ -62,30 +69,35 @@
 
 ;;; ---- generators + properties ----
 
-(declaim (ftype (function (gsample gsample) t) gsample=))
-(defun gsample= (a b)
+(defun* gsample= (a b)
+    (function (gsample gsample) t)
+  "Field-by-field equality of two GSAMPLE generated test structs."
   (and (= (gsample-id a) (gsample-id b))
        (= (gsample-ts a) (gsample-ts b))
        (string= (gsample-label a) (gsample-label b))))
 
-(declaim (ftype (function (prng) gsample) gen-gsample))
-(defun gen-gsample (prng)
+(defun* gen-gsample (prng)
+    (function (prng) gsample)
+  "Generate a pseudo-random GSAMPLE from PRNG (property-based-test input)."
   (make-gsample :id (prng-i32 prng) :ts (prng-i64 prng)
                 :label (prng-ascii-string prng 16)))
 
-(declaim (ftype (function (gsample dds.core.buffer:octet-buffer symbol) t) %cdr-rt))
-(defun %cdr-rt (s buf mode)
+(defun* %cdr-rt (s buf mode)
+    (function (gsample dds.core.buffer:octet-buffer symbol) t)
+  "Round-trip GSAMPLE S through the XCDR codec into BUF in MODE and return the decoded value."
   (serialize-gsample s (dds.core.buffer:cursor buf :endianness :little) mode)
   (gsample= s (deserialize-gsample (dds.core.buffer:cursor buf :endianness :little) mode)))
 
-(declaim (ftype (function (integer dds.core.buffer:octet-buffer) t) %seqnum-rt))
-(defun %seqnum-rt (v buf)
+(defun* %seqnum-rt (v buf)
+    (function (integer dds.core.buffer:octet-buffer) t)
+  "Round-trip a sequence number through its RTPS wire codec and return the decoded value."
   (dds.rtps.message:write-sequence-number (dds.core.buffer:cursor buf :endianness :little) v)
   (= v (dds.rtps.message:read-sequence-number
         (dds.core.buffer:cursor buf :endianness :little))))
 
-(declaim (ftype (function (prng) list) gen-snset))
-(defun gen-snset (prng)
+(defun* gen-snset (prng)
+    (function (prng) list)
+  "Generate a pseudo-random RTPS SequenceNumberSet from PRNG."
   (let* ((base (prng-int prng 1 1000000))
          (numbits (prng-int prng 0 256))
          (words (ceiling numbits 32))
@@ -93,8 +105,9 @@
     (dotimes (i words) (setf (aref bm i) (prng-next prng)))
     (list base numbits bm)))
 
-(declaim (ftype (function (list dds.core.buffer:octet-buffer) t) %snset-rt))
-(defun %snset-rt (snset buf)
+(defun* %snset-rt (snset buf)
+    (function (list dds.core.buffer:octet-buffer) t)
+  "Round-trip SNSET through its RTPS wire codec and return the decoded value."
   (destructuring-bind (base numbits bm) snset
     (dds.rtps.message:write-sequence-number-set
      (dds.core.buffer:cursor buf :endianness :little) base numbits bm)
@@ -104,13 +117,14 @@
       (and b2 (= base b2) (= numbits nb2)
            (loop for i below (ceiling numbits 32) always (= (aref bm i) (aref bm2 i)))))))
 
-(declaim (ftype (function () simple-vector) gen-fuzz-buffers))
-(defun gen-fuzz-buffers ()
+(defun* gen-fuzz-buffers ()
+    (function () simple-vector)
+  "Generate a list of pseudo-random octet buffers for the parser fuzz tests."
   (map 'simple-vector (lambda (n) (dds.core.buffer:make-octet-buffer n))
        #(1 3 4 8 12 16 20 24 28 32 48 64)))
 
-(declaim (ftype (function (prng simple-vector) list) gen-fuzz))
-(defun gen-fuzz (prng fuzzbufs)
+(defun* gen-fuzz (prng fuzzbufs)
+    (function (prng simple-vector) list)
   "Pick a pre-allocated buffer, overwrite it with random octets; return
    (buffer random-flags random-octets-to-next)."
   (let* ((buf (svref fuzzbufs (prng-int prng 0 (1- (length fuzzbufs)))))
@@ -119,8 +133,8 @@
       (setf (aref vec i) (prng-int prng 0 255)))
     (list buf (prng-int prng 0 255) (prng-int prng 0 65535))))
 
-(declaim (ftype (function () t) run-pbt-tests))
-(defun run-pbt-tests ()
+(defun* run-pbt-tests ()
+    (function () t)
   "Run all property-based tests; signal test-failure on the first falsification."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 256 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 1024 1))

@@ -9,8 +9,9 @@
   (ts :i64)
   (label :string))
 
-(declaim (ftype (function () t) run-generated-type-test))
-(defun run-generated-type-test ()
+(defun* run-generated-type-test ()
+    (function () t)
+  "Test: a define-dds-type-generated struct serializes/deserializes byte-exactly via its type-support."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 512 2))
          (s (make-gsample :id -42 :ts 9999999999 :label "gen")))
@@ -53,8 +54,9 @@
   (vals (:sequence :i32))
   (tag :string))
 
-(declaim (ftype (function () t) run-generated-sequence-test))
-(defun run-generated-sequence-test ()
+(defun* run-generated-sequence-test ()
+    (function () t)
+  "Test: a generated type with a sequence member round-trips through its XCDR codec."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 512 1))
          (s (make-gseq :n 3 :vals #(10 -20 30) :tag "seq")))
@@ -85,8 +87,9 @@
   (b gpoint)
   (tag :string))
 
-(declaim (ftype (function () t) run-generated-nested-test))
-(defun run-generated-nested-test ()
+(defun* run-generated-nested-test ()
+    (function () t)
+  "Test: a generated type with a nested-struct member round-trips through its XCDR codec."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 512 1))
          (s (make-gseg :a (make-gpoint :x 1 :y 2)
@@ -123,8 +126,9 @@
   (b mpoint)
   (n :i32))
 
-(declaim (ftype (function () t) run-generated-into-test))
-(defun run-generated-into-test ()
+(defun* run-generated-into-test ()
+    (function () t)
+  "Test: the generated zero-alloc serialize-into path consumes no heap (NFR-MEM)."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
          (pool (dds.core.arena:make-buffer-pool arena 512 1))
          (ts (dds.types:find-type-support "mline"))
@@ -146,8 +150,8 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
-(declaim (ftype (function () t) run-mem-test))
-(defun run-mem-test ()
+(defun* run-mem-test ()
+    (function () t)
   "Measured zero-alloc serialize + deserialize (NFR-PERF-8). Asserted on SBCL
    (exact bytes-consed); on Clasp bytes-consed is 0 (gap) so it only smokes."
   (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))

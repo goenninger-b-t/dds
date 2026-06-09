@@ -7,8 +7,8 @@
 
 (in-package #:dds.pal)
 
-(declaim (ftype (function (string) (simple-array (unsigned-byte 8) (4))) %parse-ipv4))
-(defun %parse-ipv4 (host)
+(defun* %parse-ipv4 (host)
+    (function (string) (simple-array (unsigned-byte 8) (4)))
   "Parse a dotted-quad string into a 4-octet address vector."
   (let ((v (make-array 4 :element-type '(unsigned-byte 8)))
         (start 0))
@@ -37,8 +37,8 @@
   (defconstant +ip-add-membership+ 35)
   (defconstant +ip-multicast-loop+ 34))
 
-(declaim (ftype (function (t fixnum fixnum list) t) %setsockopt))
-(defun %setsockopt (socket level opt bytes)
+(defun* %setsockopt (socket level opt bytes)
+    (function (t fixnum fixnum list) t)
   "Raw setsockopt(fd, LEVEL, OPT, BYTES) via CFFI for options sb-bsd-sockets does
    not expose. BYTES is the option value as a list of octets. Signals on failure."
   (let ((fd (sb-bsd-sockets:socket-file-descriptor socket))
@@ -50,14 +50,14 @@
         (unless (zerop rc) (error "setsockopt(level=~a opt=~a) failed rc=~a" level opt rc))
         rc))))
 
-(declaim (ftype (function (t) t) udp-set-reuse-port))
-(defun udp-set-reuse-port (socket)
+(defun* udp-set-reuse-port (socket)
+    (function (t) t)
   "Enable SO_REUSEPORT so multiple participants on one host can share the SPDP
    multicast port. Must be called before bind."
   (%setsockopt socket +sol-socket+ +so-reuseport+ '(1 0 0 0)))
 
-(declaim (ftype (function (&key (:host string) (:port (integer 0 65535)) (:reuse-port t)) t) udp-open))
-(defun udp-open (&key (host "0.0.0.0") (port 0) reuse-port)
+(defun* udp-open (&key (host "0.0.0.0") (port 0) reuse-port)
+    (function (&key (:host string) (:port (integer 0 65535)) (:reuse-port t)) t)
   "Open a UDPv4 socket bound to HOST:PORT (port 0 = ephemeral). REUSE-PORT enables
    SO_REUSEPORT before bind (shared multicast port). Returns the socket."
   (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
@@ -66,26 +66,26 @@
     (sb-bsd-sockets:socket-bind s (%parse-ipv4 host) port)
     s))
 
-(declaim (ftype (function (t) (integer 0 65535)) udp-local-port))
-(defun udp-local-port (socket)
+(defun* udp-local-port (socket)
+    (function (t) (integer 0 65535))
   "The bound local port of SOCKET."
   (nth-value 1 (sb-bsd-sockets:socket-name socket)))
 
-(declaim (ftype (function (t (simple-array (unsigned-byte 8) (*)) (integer 0) string (integer 0 65535)) t) udp-send-to))
-(defun udp-send-to (socket buffer length host port)
+(defun* udp-send-to (socket buffer length host port)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0) string (integer 0 65535)) t)
   "Send LENGTH octets of BUFFER from SOCKET to HOST:PORT."
   (sb-bsd-sockets:socket-send socket buffer length :address (list (%parse-ipv4 host) port)))
 
-(declaim (ftype (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) t) udp-recv))
-(defun udp-recv (socket buffer length)
+(defun* udp-recv (socket buffer length)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) t)
   "Block until a datagram arrives; return (values size sender-address sender-port).
    Used from a dedicated receiver thread."
   (multiple-value-bind (buf size addr port) (sb-bsd-sockets:socket-receive socket buffer length)
     (declare (ignore buf))
     (values size addr port)))
 
-(declaim (ftype (function (t string) t) udp-join-multicast))
-(defun udp-join-multicast (socket group)
+(defun* udp-join-multicast (socket group)
+    (function (t string) t)
   "Join the IPv4 multicast GROUP (dotted-quad) on the default interface and enable
    loopback (RTPS 2.5 §9.6.1.1). ip_mreq = imr_multiaddr(group) + imr_interface
    (INADDR_ANY). The socket must already be bound to the multicast port."
@@ -94,7 +94,7 @@
                  (list (aref g 0) (aref g 1) (aref g 2) (aref g 3) 0 0 0 0))
     (%setsockopt socket +ipproto-ip+ +ip-multicast-loop+ '(1))))
 
-(declaim (ftype (function (t) t) udp-close))
-(defun udp-close (socket)
+(defun* udp-close (socket)
+    (function (t) t)
   "Close SOCKET."
   (sb-bsd-sockets:socket-close socket))
