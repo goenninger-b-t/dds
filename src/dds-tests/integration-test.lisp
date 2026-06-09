@@ -1165,6 +1165,28 @@
             "a truncated LB (compressed_length exceeds extent) rejects")
     (%check :tol-tiny (null (dds.types:inflate-type-object-lb lb 0 8))
             "a sub-header LB rejects"))
+  ;; Real RTI Connext 7.3.1 ShapeType PID_TYPE_OBJECT_LB (captured 2026-06-09 via the
+  ;; typeobject-probe). Locks the reverse-engineered LB header against the LIVE wire: the
+  ;; inflate must recover the declared 540-octet (RTI legacy) complete TypeObject, which
+  ;; carries the type name. (The legacy-TypeObject PARSE is a later increment.)
+  (let* ((rti-lb (coerce
+                  '(1 0 0 0 28 2 0 0 218 0 0 0 120 218 99 172 231 96 0 129 15 140 12 12 76 96
+                    22 11 131 24 144 100 4 138 115 2 105 15 70 8 27 4 20 64 226 96 89 6 134 184
+                    93 247 206 59 73 120 127 226 2 178 131 51 18 11 82 67 42 11 82 161 250 24
+                    193 166 64 0 136 159 130 198 7 169 123 3 21 131 153 173 2 54 27 2 132 161
+                    116 197 85 159 52 75 166 45 149 108 64 118 114 126 78 126 17 22 243 153 234
+                    17 102 136 192 236 0 98 86 32 4 249 167 130 72 61 76 72 122 42 9 232 145 129
+                    138 49 67 245 128 194 160 24 20 6 197 153 85 169 56 244 194 48 72 84 24 170 6
+                    100 90 9 82 24 232 128 221 33 140 226 119 81 144 217 37 69 153 121 233 241 70
+                    166 166 241 201 25 137 69 137 201 37 169 69 12 4 194 154 7 8 83 161 50 32 241
+                    19 80 241 255 72 238 129 233 23 0 98 49 168 25 176 120 5 201 3 0 156 19 56 176
+                    0 0)
+                  '(simple-array (unsigned-byte 8) (*))))
+         (inflated (dds.types:inflate-type-object-lb rti-lb))
+         (needle (map '(simple-array (unsigned-byte 8) (*)) #'char-code "ShapeType")))
+    (%check :tol-connext
+            (and inflated (= (length inflated) 540) (search needle inflated))
+            "real Connext ShapeType PID_TYPE_OBJECT_LB inflates to the declared 540-octet TypeObject"))
   t)
 
 ;;; PID_TYPE_INFORMATION end-to-end (M4 step b2a, FR-TYPE-3): a generated type's
