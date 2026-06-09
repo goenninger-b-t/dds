@@ -211,3 +211,28 @@
         (when (= (frag-reassembly-received-count entry) total)
           (remhash sn table)
           buf)))))
+
+(defun* reader-frag-acknack (reader writer-id sn)
+    (function (rtps-reader (unsigned-byte 32) integer) t)
+  "Compute a NACK_FRAG fragment set for the in-progress reassembly of (WRITER-ID, SN):
+   (values base numBits bitmap) naming the 1-based fragment numbers NOT yet received, or
+   NIL if there is no such reassembly (unknown or already complete). The window
+   [base, base+numBits) is capped at 256 fragments per NACK_FRAG (§9.4.2.8). RTPS 2.5 §8.3.7.2."
+  (let* ((proxy (get-writer-proxy reader writer-id))
+         (entry (gethash sn (writer-proxy-reassembly proxy))))
+    (when (null entry) (return-from reader-frag-acknack nil))
+    (let* ((rcv (frag-reassembly-received entry))
+           (total (frag-reassembly-total-fragments entry))
+           (first-missing (loop for f from 1 to total
+                                when (zerop (sbit rcv (1- f))) return f)))
+      (when (null first-missing) (return-from reader-frag-acknack nil))
+      (let* ((base first-missing)
+             (last-missing (loop for f from total downto base
+                                 when (zerop (sbit rcv (1- f))) return f))
+             (numbits (min 256 (1+ (- last-missing base))))
+             (words (ceiling numbits 32))
+             (bitmap (make-array (max 1 words) :element-type '(unsigned-byte 32) :initial-element 0)))
+        (loop for f from base below (+ base numbits)
+              when (zerop (sbit rcv (1- f)))
+                do (dds.rtps.message:fragnum-set-bit bitmap (- f base)))
+        (values base numbits bitmap)))))

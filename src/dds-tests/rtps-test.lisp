@@ -531,6 +531,40 @@
             "sampleSize over *max-reassembly-bytes* rejects without allocating"))
   t)
 
+;;; reader-frag-acknack: compute NACK_FRAG fragment set for missing fragments (RTPS 2.5 §8.3.7.2).
+
+(defun* run-frag-acknack-test ()
+    (function () t)
+  "Test: reader-frag-acknack names exactly the missing fragment numbers, NIL when complete/unknown."
+  (let* ((reader (dds.rtps.reliable:make-rtps-reader))
+         (wid 1) (sn 9) (fsize 100) (ssize 500)   ; 5 fragments
+         (orig (make-array ssize :element-type '(unsigned-byte 8) :initial-element 7)))
+    (flet ((frag (fnum)
+             (let* ((off (* (1- fnum) fsize)) (len (min fsize (- ssize off))))
+               (subseq orig off (+ off len)))))
+      (dds.rtps.reliable:reader-on-data-frag reader wid sn 1 1 fsize ssize (frag 1))
+      (dds.rtps.reliable:reader-on-data-frag reader wid sn 3 1 fsize ssize (frag 3))
+      (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-frag-acknack reader wid sn)
+        (%check :rfa-missing
+                (and base
+                     (dds.rtps.message:fragnum-set-member-p base numbits bitmap 2)
+                     (dds.rtps.message:fragnum-set-member-p base numbits bitmap 4)
+                     (dds.rtps.message:fragnum-set-member-p base numbits bitmap 5)
+                     (not (dds.rtps.message:fragnum-set-member-p base numbits bitmap 1))
+                     (not (dds.rtps.message:fragnum-set-member-p base numbits bitmap 3)))
+                "NACK_FRAG names exactly the missing fragments {2,4,5}"))
+      (%check :rfa-unknown (null (dds.rtps.reliable:reader-frag-acknack reader wid 999))
+              "unknown SN yields NIL")))
+  (let ((r2 (dds.rtps.reliable:make-rtps-reader)) (fs 100) (ss 200))   ; 2 fragments, fully delivered
+    (let ((src (make-array ss :element-type '(unsigned-byte 8) :initial-element 3)))
+      (flet ((fr (fnum) (let* ((off (* (1- fnum) fs)) (len (min fs (- ss off))))
+                          (subseq src off (+ off len)))))
+        (dds.rtps.reliable:reader-on-data-frag r2 1 5 1 1 fs ss (fr 1))
+        (dds.rtps.reliable:reader-on-data-frag r2 1 5 2 1 fs ss (fr 2))))
+    (%check :rfa-complete (null (dds.rtps.reliable:reader-frag-acknack r2 1 5))
+            "a fully-received sample yields NIL (entry already removed)"))
+  t)
+
 ;;; NACK_FRAG round-trip (RTPS 2.5 §9.4.5.14): 24+4*M body, only E flag.
 
 (defun* run-nack-frag-test ()

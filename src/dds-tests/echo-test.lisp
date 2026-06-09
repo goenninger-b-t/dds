@@ -247,6 +247,7 @@
                  ("rtps-heartbeat-frag"      . run-heartbeat-frag-test)
                  ("rtps-nack-frag"           . run-nack-frag-test)
                  ("rtps-reassembly"          . run-reassembly-test)
+                 ("rtps-frag-acknack"        . run-frag-acknack-test)
                  ("rtps-message-dispatch"    . run-rtps-dispatch-test)
                  ("rtps-parameterlist"       . run-paramlist-test)
                  ("rtps-port-mapping"        . run-port-mapping-test)
