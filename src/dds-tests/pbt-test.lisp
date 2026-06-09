@@ -169,7 +169,13 @@
                                (safe (lambda () (dds.rtps.message:parse-data-body
                                                  (dds.core.buffer:cursor b) flags octets)))
                                (safe (lambda () (dds.rtps.message:parse-data-frag-body
-                                                 (dds.core.buffer:cursor b) flags octets))))))))
+                                                 (dds.core.buffer:cursor b) flags octets)))
+                               (safe (lambda () (dds.rtps.message:read-fragment-number-set
+                                                 (dds.core.buffer:cursor b))))
+                               (safe (lambda () (dds.rtps.message:parse-heartbeat-frag-body
+                                                 (dds.core.buffer:cursor b) flags)))
+                               (safe (lambda () (dds.rtps.message:parse-nack-frag-body
+                                                 (dds.core.buffer:cursor b) flags))))))))
     (format t "~&  pbt: 4 properties x ~d cases each, deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
