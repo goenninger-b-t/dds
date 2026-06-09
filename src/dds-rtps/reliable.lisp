@@ -5,6 +5,15 @@
 ;;;; testable; the byte/transport wiring is a later increment. CLOS-free; the
 ;;;; consing here (per-reader proxies, resend lists) is a documented v1 concern.
 
+(defparameter *fragment-size* 1024
+  "Outbound RTPS fragmentSize in octets (uint16, <=65535; RTPS 2.5 §9.4.5.5 DATA_FRAG). A sample whose serialized size exceeds this is sent as DATA_FRAG submessages.")
+
+(defparameter *max-reassembly-bytes* (* 4 1024 1024)
+  "Reject an inbound DATA_FRAG sampleSize larger than this BEFORE allocating the reassembly buffer (resource-exhaustion guard, NFR-SEC-POSTURE).")
+
+(defparameter *max-reassembly-fragments* 8192
+  "Cap on the fragment count per reassembled sample (NFR-SEC-POSTURE).")
+
 ;;; ---- Writer side (§8.4.2): one ReaderProxy per matched reader ----
 
 (defstruct* (reader-proxy (:constructor make-reader-proxy))
@@ -71,12 +80,23 @@
 
 ;;; ---- Reader side (§8.4.10): one WriterProxy per matched writer ----
 
+(defstruct* (frag-reassembly (:constructor %make-frag-reassembly))
+  "Reader-side reassembly state for one in-progress fragmented sample (RTPS 2.5 §9.4.5.5): declared total SAMPLE-SIZE and FRAGMENT-SIZE, accumulating BUFFER, a RECEIVED bitmap (one bit per 1-based fragment), and the count received."
+  (sample-size 0 :type (integer 0))
+  (fragment-size 0 :type (integer 0))
+  (total-fragments 0 :type (integer 0))
+  (buffer (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*)))
+  (received (make-array 0 :element-type 'bit) :type (simple-array bit (*)))
+  (received-count 0 :type (integer 0)))
+
 (defstruct* (writer-proxy (:constructor make-writer-proxy))
   "Reader-side proxy for one matched writer (RTPS 2.5 §8.4.10). RECEIVED maps SN ->
-   payload | :gap; FIRST-SN/LAST-SN bound the available range from HEARTBEAT."
+   payload | :gap; FIRST-SN/LAST-SN bound the available range from HEARTBEAT;
+   REASSEMBLY maps SN -> frag-reassembly for in-progress DATA_FRAG samples."
   (received (make-hash-table :test 'eql) :type hash-table)   ; SN -> payload | :gap
   (first-sn 1 :type integer)
-  (last-sn 0 :type integer))                ; available range from HEARTBEAT
+  (last-sn 0 :type integer)                ; available range from HEARTBEAT
+  (reassembly (make-hash-table :test 'eql) :type hash-table)) ; SN -> frag-reassembly
 
 (defstruct* (rtps-reader (:constructor make-rtps-reader))
   "Stateful reliable RTPS reader (RTPS 2.5 §8.4.10): a writer-id -> WriterProxy table."
