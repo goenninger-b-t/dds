@@ -136,6 +136,18 @@ behavioural-reference-via-interop use, not a clean-room breach:
   `PID_TYPE_OBJECT_LB` (ZLIB complete TypeObject) and not the minimal hash → our
   type-matching must be name + structural, not a minimal-hash gate (ADR 0009).
 
+## M4 — VendorId selection + live discovery finding (2026-06-09)
+
+- **OMG DDS-RTPS vendor-id registry** read from the **DDS Foundation** page
+  (`dds-foundation.org/dds-rtps-vendor-and-product-ids`) and cross-checked against the
+  **Wireshark `packet-rtps.c` vendor table** — public registries, not vendor source. Used
+  only to choose a **non-conflicting** provisional development VendorId (`0x01FF`) per
+  FR-RTPS-2; the registry's sequential assignments reach `0x0119`. No code copied.
+- **Live Connext 7.3.1 behavioural observation** (interop, NFR-IP): a participant
+  advertising `VENDORID_UNKNOWN` (`0x0000`) is ignored by Connext (no unicast discovery);
+  with a non-zero id (`0x01FF`) Connext accepts it and runs the reliable discovery channel.
+  Read off the wire via tshark; no RTI artifact consulted.
+
 ## Third-party runtime dependencies (licenses apply; not vendored yet)
 
 | Dependency | Use | License |

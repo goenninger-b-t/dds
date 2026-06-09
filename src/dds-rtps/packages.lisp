@@ -30,7 +30,7 @@
     §9.4.4/§9.4.5/§9.3.1.2). All wire constants are pinned from the in-repo spec
     (docs/specs/rtps-2_5.pdf), never memorized.")
   (:export #:+protocol-id+ #:+protocol-version-major+ #:+protocol-version-minor+
-           #:+vendor-id-unknown+ #:*vendor-id*
+           #:+vendor-id-unknown+ #:+vendor-id-dev-provisional+ #:*vendor-id*
            #:+submsg-pad+ #:+submsg-acknack+ #:+submsg-heartbeat+ #:+submsg-gap+
            #:+submsg-info-ts+ #:+submsg-info-src+ #:+submsg-info-reply-ip4+
            #:+submsg-info-dst+ #:+submsg-info-reply+ #:+submsg-nack-frag+

@@ -18,9 +18,17 @@
 
 (defconstant +vendor-id-unknown+ #x0000
   "VENDORID_UNKNOWN = {0,0} (RTPS 2.5 §8.3.5.2); a compliant id is OMG-assigned.")
-(defparameter *vendor-id* +vendor-id-unknown+
-  "16-bit VendorId written in the header. Provisional VENDORID_UNKNOWN until an
-   OMG-assigned id is obtained (FR-RTPS-2, owner action).")
+(defconstant +vendor-id-dev-provisional+ #x01ff
+  "Provisional development VendorId for this stack (FR-RTPS-2). Non-conflicting with the
+   OMG DDS-RTPS vendor-id registry, whose sequential assignments reach 0x0119 as of
+   2026-06-09 (dds-foundation.org/dds-rtps-vendor-and-product-ids); 0x01FF sits at the top
+   of the conventional 0x01xx block, far clear of the active range. Replace with an
+   OMG-assigned id once obtained.")
+(defparameter *vendor-id* +vendor-id-dev-provisional+
+  "16-bit VendorId written in the RTPS message header (write-header) and the SPDP
+   PID_VENDORID (dds-disc). A NON-ZERO id is required for conformant peers (notably RTI
+   Connext) to accept this participant — VENDORID_UNKNOWN (0,0) is ignored. Currently the
+   provisional +vendor-id-dev-provisional+ (0x01FF) pending an OMG allocation (FR-RTPS-2).")
 
 ;; SubmessageKind ids (RTPS 2.5 §9.4.5.1.1, enum SubmessageKind).
 (defconstant +submsg-pad+            #x01

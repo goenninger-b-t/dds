@@ -32,8 +32,9 @@ The 20-octet RTPS Header and the 4-octet SubmessageHeader (RTPS 2.5 §9.4.4 / §
 
 - `dds.rtps.message:+protocol-id+` — the 4-octet RTPS message magic `'R','T','P','S'` (§9.4.4).
 - `dds.rtps.message:+protocol-version-major+` / `+protocol-version-minor+` — ProtocolVersion 2.5 (§9.4.4).
-- `dds.rtps.message:+vendor-id-unknown+` — `VENDORID_UNKNOWN = {0,0}` (§8.3.5.2).
-- `dds.rtps.message:*vendor-id*` — the 16-bit VendorId written into the header; provisional `VENDORID_UNKNOWN` until an OMG-assigned id is obtained.
+- `dds.rtps.message:+vendor-id-unknown+` — `VENDORID_UNKNOWN = {0,0}` (§8.3.5.2). A conformant peer (e.g. RTI Connext) ignores a participant that advertises this; a non-zero id is required.
+- `dds.rtps.message:+vendor-id-dev-provisional+` — `0x01FF`, this stack's provisional development VendorId (FR-RTPS-2), non-conflicting with the OMG DDS-RTPS registry (sequential assignments reach `0x0119` as of 2026-06-09). Replaced by an OMG-assigned id once obtained.
+- `dds.rtps.message:*vendor-id*` — the 16-bit VendorId written into the RTPS header and the SPDP `PID_VENDORID`; defaults to `+vendor-id-dev-provisional+` (`0x01FF`).
 - `dds.rtps.message:write-header` *(cursor guid-prefix &key vendor)* — write the 20-octet RTPS Header (12-octet GUID prefix; header fields are octet arrays, so no endianness).
 - `dds.rtps.message:parse-header` *(cursor)* — parse a 20-octet Header; returns `(values major minor vendor guid-prefix)`, or `NIL` on a short buffer / wrong magic. Bounds-checked.
 - `dds.rtps.message:write-submessage-header` *(cursor submessage-id flags octets-to-next)* — write a 4-octet SubmessageHeader; `octetsToNextHeader` is a u16 in the cursor's endianness, which the caller keeps consistent with the E flag.
@@ -319,8 +320,12 @@ resend) for the evicted range and a resend for what is still cached. Adapted fro
   the §9.4.2.6 SequenceNumberSet bytes in `rtps-test.lisp`) and by an offline UDP-loopback
   end-to-end path (`run-end-to-end-test`), not yet by a live RTI Connext capture. The wire
   oracle (tshark RTPS dissector + Connext) is wired separately — see [Interop](interop.md).
-- **VendorId is provisional.** `dds.rtps.message:*vendor-id*` defaults to `VENDORID_UNKNOWN`
-  until an OMG-assigned id is obtained (an owner action). Tests write `:vendor 0`.
+- **VendorId is a provisional development value.** `dds.rtps.message:*vendor-id*` defaults to
+  `+vendor-id-dev-provisional+` = `0x01FF` (FR-RTPS-2), pending an OMG-assigned id. This was changed
+  from `VENDORID_UNKNOWN` (`0x0000`) after a live Connext 7.3.1 capture (2026-06-09) showed Connext
+  ignores a participant advertising the zero/unknown VendorId — establishing no unicast discovery
+  channel at all; with `0x01FF` Connext accepts the participant and runs the reliable channel. Some
+  unit tests still write `:vendor 0` to the header codec directly (codec round-trip, not discovery).
 - **DATA is base-form only (Q=0).** `parse-data-body` returns `NIL` if the InlineQos (Q) flag
   is set; inline-QoS parsing is deferred. `serializedPayload` is handed back as a
   `[offset, len)` region in the receive buffer, left in place for the caller to deserialize.
