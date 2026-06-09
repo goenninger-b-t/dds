@@ -28,4 +28,5 @@
            #:disc-node-discovered-writers-list #:disc-node-discovered-readers-list
            #:run-spdp-discovery-test #:run-sedp-discovery-test
            #:run-mcast-discovery-test #:run-dataplane-test
+           #:run-large-dataplane-test
            #:run-locator-filter-test))

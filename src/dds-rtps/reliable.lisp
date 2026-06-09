@@ -264,6 +264,12 @@
       (when (null payload) (return-from writer-on-nack-frag nil))
       (writer-frag-plan-for (length payload) *fragment-size* base numbits bitmap))))
 
+(defun* writer-sample-payload (writer sn)
+    (function (rtps-writer integer) (or null (array (unsigned-byte 8) (*))))
+  "The stored SerializedPayload octets for the writer's sample SN, or NIL if absent."
+  (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
+    (and ch (dds.rtps.history:cache-change-serialized-payload ch))))
+
 (defun* writer-frag-plan (sample-size fragment-size budget)
     (function ((unsigned-byte 32) (unsigned-byte 32) (integer 1)) list)
   "Plan the DATA_FRAG submessages for a SAMPLE-SIZE-octet sample at FRAGMENT-SIZE, packing as

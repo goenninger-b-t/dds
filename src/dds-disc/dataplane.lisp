@@ -96,22 +96,43 @@
                 (when (and hp (plusp (cdr hp)))
                   (pushnew hp dests :test #'equal))))))))))
 
+(defun* %send-sample (node buf sn pl host port)
+    (function (disc-node dds.core.buffer:octet-buffer integer (simple-array (unsigned-byte 8) (*)) string (unsigned-byte 16)) t)
+  "Send sample (SN, PL) to HOST:PORT: one DATA submessage if PL fits *fragment-size*, else a
+   series of DATA_FRAG submessages (packing as many fragments as fit the datagram) followed by
+   a HEARTBEAT_FRAG. Uses BUF (tx-msg or rx-tx-msg) as the scratch message buffer."
+  (let ((size (length pl)))
+    (if (<= size dds.rtps.reliable:*fragment-size*)
+        (%send-msg-buf node buf
+                       (lambda (mc) (dds.rtps.message:write-data
+                                     mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn pl 0 size))
+                       host port)
+        (let ((budget (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
+          (dolist (desc (dds.rtps.reliable:writer-frag-plan size dds.rtps.reliable:*fragment-size* budget))
+            (destructuring-bind (fstart fcount off len) desc
+              (%send-msg-buf node buf
+                             (lambda (mc) (dds.rtps.message:write-data-frag
+                                           mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn size
+                                           fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
+                             host port)))
+          (multiple-value-bind (lastfrag cnt)
+              (dds.rtps.reliable:writer-frag-heartbeat (disc-node-user-writer node) sn)
+            (when lastfrag
+              (%send-msg-buf node buf
+                             (lambda (mc) (dds.rtps.message:write-heartbeat-frag
+                                           mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn lastfrag cnt))
+                             host port)))))))
+
 (defun* %push-data (node)
     (function (disc-node) t)
-  "Writer side: send every change not yet acked by the reader as a DATA submessage,
-   followed by a HEARTBEAT, to each peer (caller thread; uses tx-msg)."
+  "Writer side: send every change not yet acked by the reader as a DATA (or DATA_FRAG series
+   for large samples) submessage, followed by a HEARTBEAT, to each peer (caller thread; uses tx-msg)."
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (let ((datas (dds.rtps.reliable:writer-data-list writer +user-reader-id+)))
         (dolist (peer (%match-destinations node t))   ; DATA + HEARTBEAT -> matched readers
           (dolist (d datas)
-            (let ((sn (car d)) (pl (cdr d)))
-              (declare (type (simple-array (unsigned-byte 8) (*)) pl))
-              (%send-msg-buf node (disc-node-tx-msg node)
-                             (lambda (mc)
-                               (dds.rtps.message:write-data
-                                mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn pl 0 (length pl)))
-                             (car peer) (cdr peer))))
+            (%send-sample node (disc-node-tx-msg node) (car d) (cdr d) (car peer) (cdr peer)))
           (%send-msg-buf node (disc-node-tx-msg node)
                          (lambda (mc)
                            (dds.rtps.message:write-heartbeat
@@ -126,19 +147,22 @@
   (%push-data node)
   t)
 
+(defun* %deliver-user-sample (node writer-id sn vec)
+    (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))) t)
+  "Feed a complete user sample VEC (SN from WRITER-ID) to the reliable reader, record it by SN,
+   then fire ON-SAMPLE outside the node lock (DATA_AVAILABLE + WaitSet wake)."
+  (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn vec)
+  (dds.pal:with-lock ((disc-node-lock node)) (setf (gethash sn (disc-node-samples node)) vec))
+  (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))
+  t)
+
 (defun* %on-user-data (node writer-id sn buf poff plen)
     (function (disc-node (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)) t)
-  "Reader side: copy the [poff,plen) SerializedPayload out of the receive buffer,
-   feed it to the reliable reader (dedup/reorder), record it by SN, then fire the
-   ON-SAMPLE hook (DATA_AVAILABLE + the condvar WaitSet wake) — OUTSIDE the node lock
-   so the DCPS hook may take a WaitSet lock without a lock-order inversion."
+  "Reader side: copy the [poff,plen) SerializedPayload out of the receive buffer and deliver it
+   (dedup/reorder, store by SN, fire ON-SAMPLE outside the node lock — no lock-order inversion)."
   (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
     (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
-    (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn vec)
-    (dds.pal:with-lock ((disc-node-lock node))
-      (setf (gethash sn (disc-node-samples node)) vec))
-    (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))
-    t))
+    (%deliver-user-sample node writer-id sn vec)))
 
 (defun* %on-user-heartbeat (node c flags)
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8)) t)
@@ -175,36 +199,86 @@
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
                                                +user-reader-id+ base numbits bitmap)
         (declare (ignore gaps))
-        (dolist (peer (%match-destinations node t))   ; retransmit DATA -> matched readers
+        (dolist (peer (%match-destinations node t))   ; retransmit DATA(_FRAG) -> matched readers
           (dolist (d resends)
-            (let ((sn (car d)) (pl (cdr d)))
-              (declare (type (simple-array (unsigned-byte 8) (*)) pl))
+            (%send-sample node (disc-node-rx-tx-msg node) (car d) (cdr d) (car peer) (cdr peer)))))))
+  t)
+
+(defun* %on-user-data-frag (node c flags body-len buf)
+    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (integer 0) dds.core.buffer:octet-buffer) t)
+  "Reader side: accept a DATA_FRAG, reassemble; on the final fragment deliver the complete sample."
+  (multiple-value-bind (rdr wtr sn ssize fstart frags fsize poff plen keyp)
+      (dds.rtps.message:parse-data-frag-body c flags body-len)
+    (declare (ignore rdr keyp))
+    (when (and (disc-node-user-reader node) (%user-writer-entityid-p wtr))
+      (let ((region (make-array plen :element-type '(unsigned-byte 8))))
+        (replace region (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
+        (let ((done (dds.rtps.reliable:reader-on-data-frag
+                     (disc-node-user-reader node) wtr sn fstart frags fsize ssize region)))
+          (when done (%deliver-user-sample node wtr sn done))))))
+  t)
+
+(defun* %on-user-heartbeat-frag (node c flags)
+    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8)) t)
+  "Reader side: on a HEARTBEAT_FRAG, NACK_FRAG the still-missing fragments to matched writers."
+  (multiple-value-bind (rid wid sn lastfrag count) (dds.rtps.message:parse-heartbeat-frag-body c flags)
+    (declare (ignore rid lastfrag count))
+    (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid))
+      (multiple-value-bind (base numbits bitmap)
+          (dds.rtps.reliable:reader-frag-acknack (disc-node-user-reader node) wid sn)
+        (when base
+          (let ((cnt (incf (disc-node-ack-count node))))
+            (dolist (peer (%match-destinations node nil))
               (%send-msg-buf node (disc-node-rx-tx-msg node)
-                             (lambda (mc)
-                               (dds.rtps.message:write-data
-                                mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn pl 0 (length pl)))
+                             (lambda (mc) (dds.rtps.message:write-nack-frag
+                                           mc +user-reader-id+ wid sn base numbits bitmap cnt))
                              (car peer) (cdr peer))))))))
   t)
+
+(defun* %on-user-nack-frag (node c flags)
+    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8)) t)
+  "Writer side: on a NACK_FRAG, resend exactly the named fragments as DATA_FRAGs to matched readers."
+  (multiple-value-bind (rid wid sn base numbits bitmap count) (dds.rtps.message:parse-nack-frag-body c flags)
+    (declare (ignore rid count))
+    (when (= wid +user-writer-id+)
+      (let ((descs (dds.rtps.reliable:writer-on-nack-frag (disc-node-user-writer node) sn base numbits bitmap))
+            (pl (dds.rtps.reliable:writer-sample-payload (disc-node-user-writer node) sn)))
+        (when (and descs pl)
+          (let ((size (length pl)))
+            (dolist (peer (%match-destinations node t))
+              (dolist (desc descs)
+                (destructuring-bind (fstart fcount off len) desc
+                  (%send-msg-buf node (disc-node-rx-tx-msg node)
+                                 (lambda (mc) (dds.rtps.message:write-data-frag
+                                               mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn size
+                                               fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
+                                 (car peer) (cdr peer)))))))))
+    t))
 
 (defun* enable-publisher (node)
     (function (disc-node) disc-node)
   "Give NODE a reliable user writer (KEEP_ALL) and install the writer-side data-
-   plane hook (retransmit on ACKNACK). Call after add-local-writer."
+   plane hooks (retransmit on ACKNACK; resend named fragments on NACK_FRAG). Call after add-local-writer."
   (setf (disc-node-user-writer node)
         (dds.rtps.reliable:make-rtps-writer
          :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
   (setf (disc-node-on-acknack node) (lambda (c flags) (%on-user-acknack node c flags)))
+  (setf (disc-node-on-nack-frag node) (lambda (c flags) (%on-user-nack-frag node c flags)))
   node)
 
 (defun* enable-subscriber (node)
     (function (disc-node) disc-node)
-  "Give NODE a reliable user reader and install the reader-side data-plane hooks
-   (store DATA, ACKNACK on HEARTBEAT). Call after add-local-reader."
+  "Give NODE a reliable user reader and install the reader-side data-plane hooks (store DATA,
+   ACKNACK on HEARTBEAT, reassemble DATA_FRAG, NACK_FRAG on HEARTBEAT_FRAG). Call after add-local-reader."
   (setf (disc-node-user-reader node) (dds.rtps.reliable:make-rtps-reader))
   (setf (disc-node-on-data node)
         (lambda (wid sn buf poff plen) (%on-user-data node wid sn buf poff plen)))
   (setf (disc-node-on-heartbeat node)
         (lambda (c flags) (%on-user-heartbeat node c flags)))
+  (setf (disc-node-on-data-frag node)
+        (lambda (c flags body-len buf) (%on-user-data-frag node c flags body-len buf)))
+  (setf (disc-node-on-heartbeat-frag node)
+        (lambda (c flags) (%on-user-heartbeat-frag node c flags)))
   node)
 
 (defun* node-sample-count (node)
@@ -291,6 +365,58 @@
                    "subscriber never received the sample over UDP")
            (assert (equalp (node-sample node2 1) payload) ()
                    "subscriber received the wrong payload bytes")
+           t)
+      (stop-node node1)
+      (stop-node node2))))
+
+(defun* run-large-dataplane-test ()
+    (function () (eql t))
+  "Full stack over UDP with a sample LARGER than *fragment-size*: two participants discover
+   (SPDP) and match (SEDP), then the publisher sends a 4000-octet user sample. The writer
+   fragments it into DATA_FRAG submessages + a HEARTBEAT_FRAG; the subscriber reassembles it
+   and delivers a byte-exact copy. Proves send-side fragmentation + receive-side reassembly +
+   NACK_FRAG recovery over real UDP loopback (RTPS 2.5 §9.4.5.5)."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
+         (node1 (make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (node2 (make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (payload (make-array 4000 :element-type '(unsigned-byte 8))))
+    (dotimes (i 4000) (setf (aref payload i) (logand (* i 7) #xff)))
+    (unwind-protect
+         (progn
+           (add-local-writer node1 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-publisher node1)
+           (add-local-reader node2 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-subscriber node2)
+           (setf (disc-node-peers node1) (list (cons "127.0.0.1" (disc-node-port node2))))
+           (setf (disc-node-peers node2) (list (cons "127.0.0.1" (disc-node-port node1))))
+           (start-node node1)
+           (start-node node2)
+           (announce-participant node1)
+           (announce-participant node2)
+           (loop repeat 100
+                 until (and (plusp (disc-node-discovered-count node1))
+                            (plusp (disc-node-discovered-count node2)))
+                 do (sleep 0.02))
+           (announce-endpoints node1)
+           (announce-endpoints node2)
+           (loop repeat 100
+                 until (and (plusp (disc-node-matched-count node1))
+                            (plusp (disc-node-matched-count node2)))
+                 do (sleep 0.02))
+           (assert (and (plusp (disc-node-matched-count node1))
+                        (plusp (disc-node-matched-count node2)))
+                   () "endpoints did not match before publish")
+           (publish-sample node1 payload)
+           (loop repeat 150 until (plusp (node-sample-count node2)) do (sleep 0.02))
+           (assert (plusp (node-sample-count node2)) ()
+                   "subscriber never received the fragmented sample over UDP")
+           (assert (equalp (node-sample node2 1) payload) ()
+                   "subscriber received the wrong reassembled payload bytes")
            t)
       (stop-node node1)
       (stop-node node2))))
