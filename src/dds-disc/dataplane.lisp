@@ -17,7 +17,10 @@
 ;; ShapeType is keyed (color), so the endpoints are WITH-KEY kinds (0x02 / 0x07) —
 ;; a no-key writer on a keyed topic is what RTI is fed otherwise.
 (defconstant +user-writer-id+ #x00000102)   ; key 000001, kind 02 (user writer WITH key)
-(defconstant +user-reader-id+ #x00000207)   ; key 000002, kind 07 (user reader WITH key)
+(defconstant +user-reader-id+ #x00000107)   ; key 000001, kind 07 (user reader WITH key)
+;; These MUST equal the EntityIds that add-local-writer/add-local-reader announce via
+;; SEDP (key 1, kinds 0x02/0x07): a peer matches the announced endpoint and routes its
+;; HEARTBEAT/ACKNACK by that EntityId, so the data-plane endpoint must carry the same id.
 
 (declaim (ftype (function (disc-node dds.core.buffer:octet-buffer function string (unsigned-byte 16)) t) %send-msg-buf))
 (defun %send-msg-buf (node buf build-fn host port)

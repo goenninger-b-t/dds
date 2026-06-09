@@ -198,9 +198,11 @@
                                    (key 1) qos type-information)
   "Register a local publication (writer endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
-   TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP."
+   TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP.
+   Entity kind 0x02 (writer WITH key): the data plane is keyed (matching the keyed reader
+   kind 0x07), and a keyed remote reader (RTI Connext) will not match a no-key writer."
   (let ((ep (dds.rtps.discovery:make-endpoint-data
-             :guid (%make-endpoint-guid (disc-node-guid-prefix node) key #x03)
+             :guid (%make-endpoint-guid (disc-node-guid-prefix node) key #x02)
              :topic-name topic :type-name type :type-information type-information
              :qos (or qos (%qos-from-reliability reliability)))))
     (push ep (disc-node-local-writers node))
