@@ -319,7 +319,11 @@
   (qos (dds.qos:make-qos) :type dds.qos:qos)
   ;; Opaque pre-serialized XTypes TypeInformation (PID_TYPE_INFORMATION, idl @id 0x0075).
   ;; dds-rtps (L4) must not depend on dds-types (L3); dds-disc/dds-dcps build + interpret it.
-  (type-information nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+  (type-information nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  ;; Opaque inbound RTI PID_TYPE_OBJECT_LB (0x8021): the ZLIB-compressed complete TypeObject
+  ;; a Connext peer advertises. Stored verbatim here (L4); dds-disc inflates + fingerprints it
+  ;; (dds.types, ADR 0009). Never EMITTED — RTI-vendor + clean-room; inbound only.
+  (type-object-lb nil :type (or null (simple-array (unsigned-byte 8) (*)))))
 
 (declaim (ftype (function (dds.core.buffer:cursor endpoint-data) fixnum) serialize-endpoint-data))
 (defun serialize-endpoint-data (cursor data)
@@ -386,7 +390,12 @@
      (when (> len 0)
        (let ((ti (make-array len :element-type '(unsigned-byte 8))))
          (dds.core.buffer:get-octets cursor ti 0 len)
-         (setf (endpoint-data-type-information data) ti)))))
+         (setf (endpoint-data-type-information data) ti))))
+    ((= pid dds.rtps.message:+pid-type-object-lb+)
+     (when (> len 0)
+       (let ((lb (make-array len :element-type '(unsigned-byte 8))))
+         (dds.core.buffer:get-octets cursor lb 0 len)
+         (setf (endpoint-data-type-object-lb data) lb)))))
   data)
 
 (declaim (ftype (function (dds.core.buffer:cursor) t) parse-endpoint-data))

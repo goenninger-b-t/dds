@@ -58,7 +58,7 @@
            #:+pid-vendorid+ #:+pid-reliability+ #:+pid-durability+ #:+pid-default-unicast-locator+
            #:+pid-metatraffic-unicast-locator+ #:+pid-participant-guid+
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
-           #:+pid-type-information+
+           #:+pid-type-information+ #:+pid-type-object-lb+
            #:write-parameter #:write-parameter-sentinel #:parse-parameter-list
            #:spdp-multicast-port #:spdp-unicast-port
            #:user-multicast-port #:user-unicast-port
@@ -113,6 +113,6 @@
            #:endpoint-data #:make-endpoint-data #:endpoint-data-p
            #:endpoint-data-guid #:endpoint-data-topic-name
            #:endpoint-data-type-name #:endpoint-data-qos
-           #:endpoint-data-type-information
+           #:endpoint-data-type-information #:endpoint-data-type-object-lb
            #:serialize-endpoint-data #:parse-endpoint-data #:endpoint-match-p
            #:run-sedp-test))

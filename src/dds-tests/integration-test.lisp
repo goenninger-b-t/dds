@@ -1141,6 +1141,24 @@
 ;;; truncated LB rejects (bounds + resource guard, NFR-SEC-POSTURE). The LB vector below is
 ;;; a deterministic ZLIB stream (header + stored block) for the 60-octet i*7 pattern.
 
+(declaim (ftype (function () (simple-array (unsigned-byte 8) (*))) %connext-shape-type-lb))
+(defun %connext-shape-type-lb ()
+  "The live RTI Connext 7.3.1 ShapeType PID_TYPE_OBJECT_LB parameter value (232 octets),
+   captured 2026-06-09 via the typeobject-probe (ADR 0009); inflates to a 540-octet TypeObject."
+  (coerce
+   '(1 0 0 0 28 2 0 0 218 0 0 0 120 218 99 172 231 96 0 129 15 140 12 12 76 96
+     22 11 131 24 144 100 4 138 115 2 105 15 70 8 27 4 20 64 226 96 89 6 134 184
+     93 247 206 59 73 120 127 226 2 178 131 51 18 11 82 67 42 11 82 161 250 24
+     193 166 64 0 136 159 130 198 7 169 123 3 21 131 153 173 2 54 27 2 132 161
+     116 197 85 159 52 75 166 45 149 108 64 118 114 126 78 126 17 22 243 153 234
+     17 102 136 192 236 0 98 86 32 4 249 167 130 72 61 76 72 122 42 9 232 145 129
+     138 49 67 245 128 194 160 24 20 6 197 153 85 169 56 244 194 48 72 84 24 170 6
+     100 90 9 82 24 232 128 221 33 140 226 119 81 144 217 37 69 153 121 233 241 70
+     166 166 241 201 25 137 69 137 201 37 169 69 12 4 194 154 7 8 83 161 50 32 241
+     19 80 241 255 72 238 129 233 23 0 98 49 168 25 176 120 5 201 3 0 156 19 56 176
+     0 0)
+   '(simple-array (unsigned-byte 8) (*))))
+
 (declaim (ftype (function () t) run-type-object-lb-test))
 (defun run-type-object-lb-test ()
   (let ((lb (coerce '(1 0 0 0 60 0 0 0 71 0 0 0 120 218 1 60 0 195 255
@@ -1169,19 +1187,7 @@
   ;; typeobject-probe). Locks the reverse-engineered LB header against the LIVE wire: the
   ;; inflate must recover the declared 540-octet (RTI legacy) complete TypeObject, which
   ;; carries the type name. (The legacy-TypeObject PARSE is a later increment.)
-  (let* ((rti-lb (coerce
-                  '(1 0 0 0 28 2 0 0 218 0 0 0 120 218 99 172 231 96 0 129 15 140 12 12 76 96
-                    22 11 131 24 144 100 4 138 115 2 105 15 70 8 27 4 20 64 226 96 89 6 134 184
-                    93 247 206 59 73 120 127 226 2 178 131 51 18 11 82 67 42 11 82 161 250 24
-                    193 166 64 0 136 159 130 198 7 169 123 3 21 131 153 173 2 54 27 2 132 161
-                    116 197 85 159 52 75 166 45 149 108 64 118 114 126 78 126 17 22 243 153 234
-                    17 102 136 192 236 0 98 86 32 4 249 167 130 72 61 76 72 122 42 9 232 145 129
-                    138 49 67 245 128 194 160 24 20 6 197 153 85 169 56 244 194 48 72 84 24 170 6
-                    100 90 9 82 24 232 128 221 33 140 226 119 81 144 217 37 69 153 121 233 241 70
-                    166 166 241 201 25 137 69 137 201 37 169 69 12 4 194 154 7 8 83 161 50 32 241
-                    19 80 241 255 72 238 129 233 23 0 98 49 168 25 176 120 5 201 3 0 156 19 56 176
-                    0 0)
-                  '(simple-array (unsigned-byte 8) (*))))
+  (let* ((rti-lb (%connext-shape-type-lb))
          (inflated (dds.types:inflate-type-object-lb rti-lb))
          (needle (map '(simple-array (unsigned-byte 8) (*)) #'char-code "ShapeType")))
     (%check :tol-connext
@@ -1199,6 +1205,30 @@
               (and (dds.types:type-object-mentions-all-p inflated '("ShapeType" "color" "shapesize"))
                    (not (dds.types:type-object-mentions-all-p inflated '("ShapeType" "NotAMember"))))
               "type-object-mentions-all-p: plausible names match, a bogus name does not")))
+  t)
+
+;;; SEDP capture of the inbound RTI PID_TYPE_OBJECT_LB, end to end (ADR 0009): a peer's LB
+;;; rides the endpoint ParameterList; parse-endpoint-data captures it OPAQUE (L4, no dds-types
+;;; dep), and the higher layer inflates + fingerprints it to recover the peer's type.
+
+(declaim (ftype (function () t) run-sedp-type-object-lb-test))
+(defun run-sedp-type-object-lb-test ()
+  (let* ((lb (%connext-shape-type-lb))
+         (ob (dds.core.buffer:make-octet-buffer 512))
+         (wc (dds.core.buffer:cursor ob :endianness :little)))
+    (dds.rtps.message:write-parameter wc dds.rtps.message:+pid-type-object-lb+ lb 0 (length lb))
+    (dds.rtps.message:write-parameter-sentinel wc)
+    (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
+           (ep (dds.rtps.discovery:parse-endpoint-data rc)))
+      (%check :tol-sedp-capture
+              (equalp (dds.rtps.discovery:endpoint-data-type-object-lb ep) lb)
+              "parse-endpoint-data captures PID_TYPE_OBJECT_LB opaque")
+      (let ((inflated (dds.types:inflate-type-object-lb
+                       (dds.rtps.discovery:endpoint-data-type-object-lb ep))))
+        (%check :tol-sedp-chain
+                (and inflated (= (length inflated) 540)
+                     (dds.types:type-object-mentions-all-p inflated '("ShapeType" "color" "shapesize")))
+                "captured LB inflates + fingerprints to the peer's ShapeType type"))))
   t)
 
 ;;; PID_TYPE_INFORMATION end-to-end (M4 step b2a, FR-TYPE-3): a generated type's

@@ -504,6 +504,10 @@
   "PID_KEY_HASH (RTPS 2.5 §9.6.2.2 table).")
 (defconstant +pid-type-information+           #x0075
   "PID_TYPE_INFORMATION (DDS-XTypes 1.3 BuiltinTopicData @id(0x0075)).")
+(defconstant +pid-type-object-lb+             #x8021
+  "PID_TYPE_OBJECT_LB — RTI Connext VENDOR parameter (high-bit 0x8000 vendor range) carrying
+   a ZLIB-compressed complete TypeObject. NOT an OMG-spec PID; value observed on the live
+   Connext 7.3.1 wire (ADR 0009). Parsed inbound only; never emitted (clean-room).")
 
 (declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) fixnum) write-parameter))
 (defun write-parameter (cursor pid value off len)
