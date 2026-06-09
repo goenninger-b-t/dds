@@ -163,3 +163,51 @@
          (received (writer-proxy-received proxy)))
     (loop for sn from (writer-proxy-first-sn proxy) to (writer-proxy-last-sn proxy)
           always (gethash sn received))))
+
+(defun* reader-on-data-frag (reader writer-id sn fragment-starting-num fragments-in-submsg
+                                    fragment-size sample-size payload)
+    (function (rtps-reader (unsigned-byte 32) integer (unsigned-byte 32) (unsigned-byte 32)
+               (unsigned-byte 32) (unsigned-byte 32) (array (unsigned-byte 8) (*)))
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "Accept one DATA_FRAG submessage's fragment range for (WRITER-ID, SN). Reassembles into the
+   per-(writer,sn) frag-reassembly; returns the complete SAMPLE-SIZE octet vector once all
+   fragments have arrived, else NIL. Guards (NFR-SEC-POSTURE): rejects (NIL) a zero/over-limit
+   SAMPLE-SIZE (> *max-reassembly-bytes*), a fragment count over *max-reassembly-fragments*, a
+   zero FRAGMENT-SIZE, or a fragment range exceeding the sample; a sample whose declared
+   fragment/sample size changes mid-stream is dropped. Duplicate fragments are idempotent.
+   RTPS 2.5 §8.3.8.3 / §9.4.5.5."
+  (when (or (zerop fragment-size) (zerop sample-size) (> sample-size *max-reassembly-bytes*))
+    (return-from reader-on-data-frag nil))
+  (let ((total (ceiling sample-size fragment-size)))
+    (when (> total *max-reassembly-fragments*) (return-from reader-on-data-frag nil))
+    (when (or (< fragment-starting-num 1) (zerop fragments-in-submsg)
+              (> (+ fragment-starting-num fragments-in-submsg -1) total))
+      (return-from reader-on-data-frag nil))
+    (let* ((proxy (get-writer-proxy reader writer-id))
+           (table (writer-proxy-reassembly proxy))
+           (entry (or (gethash sn table)
+                      (setf (gethash sn table)
+                            (%make-frag-reassembly
+                             :sample-size sample-size :fragment-size fragment-size
+                             :total-fragments total
+                             :buffer (make-array sample-size :element-type '(unsigned-byte 8))
+                             :received (make-array total :element-type 'bit :initial-element 0))))))
+      (when (or (/= (frag-reassembly-sample-size entry) sample-size)
+                (/= (frag-reassembly-fragment-size entry) fragment-size))
+        (remhash sn table)
+        (return-from reader-on-data-frag nil))
+      (let ((buf (frag-reassembly-buffer entry))
+            (rcv (frag-reassembly-received entry)))
+        (dotimes (k fragments-in-submsg)
+          (let* ((fnum (+ fragment-starting-num k))
+                 (dst (* (1- fnum) fragment-size))
+                 (this (min fragment-size (- sample-size dst)))
+                 (src (* k fragment-size)))
+            (when (<= (+ src this) (length payload))
+              (replace buf payload :start1 dst :end1 (+ dst this) :start2 src :end2 (+ src this))
+              (when (zerop (sbit rcv (1- fnum)))
+                (setf (sbit rcv (1- fnum)) 1)
+                (incf (frag-reassembly-received-count entry))))))
+        (when (= (frag-reassembly-received-count entry) total)
+          (remhash sn table)
+          buf)))))

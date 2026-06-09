@@ -286,7 +286,8 @@
   "Under the node lock: record a received builtin SEDP DATA SN from remote PREFIX's
    writer WID so the next ACKNACK advances past it (stops the reliable retransmit)."
   (dds.pal:with-lock ((disc-node-lock node))
-    (dds.rtps.reliable:reader-on-data (%builtin-reader-nl node prefix) wid sn :sedp)))
+    (dds.rtps.reliable:reader-on-data (%builtin-reader-nl node prefix) wid sn
+                                       #.(make-array 0 :element-type '(unsigned-byte 8)))))
 
 (defun* %remote-metatraffic (node prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) (or null cons))

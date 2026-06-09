@@ -500,6 +500,37 @@
             "a sub-24-octet HEARTBEAT_FRAG body rejects"))
   t)
 
+;;; Reader-side DATA_FRAG fragment reassembly (RTPS 2.5 §8.3.8.3 / §9.4.5.5).
+;;; Out-of-order delivery, oversize-sampleSize rejection (NFR-SEC-POSTURE).
+
+(defun* run-reassembly-test ()
+    (function () t)
+  "Test: reader-on-data-frag reassembles out-of-order fragments into the original sample,
+   returns NIL until complete, and rejects an oversize sampleSize (NFR-SEC-POSTURE)."
+  (let* ((reader (dds.rtps.reliable:make-rtps-reader))
+         (wid 1) (sn 7) (fsize 1024) (ssize 2500)
+         (orig (make-array ssize :element-type '(unsigned-byte 8))))
+    (dotimes (i ssize) (setf (aref orig i) (logand (* i 7) #xff)))
+    (flet ((frag (fnum)
+             (let* ((off (* (1- fnum) fsize)) (len (min fsize (- ssize off))))
+               (subseq orig off (+ off len)))))
+      (%check :rsm-partial1
+              (null (dds.rtps.reliable:reader-on-data-frag reader wid sn 3 1 fsize ssize (frag 3)))
+              "incomplete after fragment 3 of 3")
+      (%check :rsm-partial2
+              (null (dds.rtps.reliable:reader-on-data-frag reader wid sn 1 1 fsize ssize (frag 1)))
+              "incomplete after fragment 1")
+      (let ((done (dds.rtps.reliable:reader-on-data-frag reader wid sn 2 1 fsize ssize (frag 2))))
+        (%check :rsm-complete (and done (equalp done orig))
+                "complete + byte-exact after the final fragment"))))
+  (let ((r2 (dds.rtps.reliable:make-rtps-reader)))
+    (%check :rsm-oversize
+            (null (dds.rtps.reliable:reader-on-data-frag
+                   r2 1 1 1 1 1024 (1+ dds.rtps.reliable:*max-reassembly-bytes*)
+                   (make-array 1024 :element-type '(unsigned-byte 8))))
+            "sampleSize over *max-reassembly-bytes* rejects without allocating"))
+  t)
+
 ;;; NACK_FRAG round-trip (RTPS 2.5 §9.4.5.14): 24+4*M body, only E flag.
 
 (defun* run-nack-frag-test ()
