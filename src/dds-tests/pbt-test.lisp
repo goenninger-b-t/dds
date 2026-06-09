@@ -153,6 +153,8 @@
                                (safe (lambda () (dds.rtps.message:parse-gap-body
                                                  (dds.core.buffer:cursor b) flags)))
                                (safe (lambda () (dds.rtps.message:parse-data-body
+                                                 (dds.core.buffer:cursor b) flags octets)))
+                               (safe (lambda () (dds.rtps.message:parse-data-frag-body
                                                  (dds.core.buffer:cursor b) flags octets))))))))
     (format t "~&  pbt: 4 properties x ~d cases each, deterministic seed.~%" runs)
     (loop for b across fuzzbufs

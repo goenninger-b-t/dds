@@ -93,6 +93,58 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+;;; DATA_FRAG codec + reassembly (RTPS 2.5 §9.4.5.5): write/parse each fragment, then
+;;; reassemble byte-exact; plus spec-validity (fragmentStartingNum=0) rejection.
+
+(declaim (ftype (function () t) run-rtps-data-frag-test))
+(defun run-rtps-data-frag-test ()
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 256 1))
+         (rid dds.rtps.message:+entityid-unknown+)
+         (wid #x00000102)
+         (sample-size 100)
+         (frag-size 30)
+         (payload (make-array sample-size :element-type '(unsigned-byte 8))))
+    (dotimes (i sample-size) (setf (aref payload i) (logand (* i 7) #xff)))
+    (let ((reassembled (make-array sample-size :element-type '(unsigned-byte 8) :initial-element 0))
+          (nfrags (ceiling sample-size frag-size))
+          (ok t))
+      (loop for fnum from 1 to nfrags
+            for off = (* (1- fnum) frag-size)
+            for len = (min frag-size (- sample-size off))
+            do (let* ((buf (dds.core.arena:pool-acquire pool))
+                      (c (dds.core.buffer:cursor buf :endianness :little)))
+                 (dds.rtps.message:write-data-frag c rid wid 9 sample-size fnum 1 frag-size payload off len)
+                 (dds.core.buffer:cursor-reset c)
+                 (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+                   (declare (ignore le))
+                   (unless (= id dds.rtps.message:+submsg-data-frag+) (setf ok nil))
+                   (multiple-value-bind (r w sn ssize fstart frags fsize poff plen keyp)
+                       (dds.rtps.message:parse-data-frag-body c flags octets)
+                     (declare (ignore r w keyp))
+                     (unless (and (= sn 9) (= ssize sample-size) (= fstart fnum) (= frags 1)
+                                  (= fsize frag-size) (= plen len))
+                       (setf ok nil))
+                     (replace reassembled (dds.core.buffer:octet-buffer-vec buf)
+                              :start1 (* (1- fstart) fsize) :start2 poff :end2 (+ poff plen))))
+                 (dds.core.arena:pool-release pool buf)))
+      (%check :data-frag-reassembly (and ok (equalp reassembled payload))
+              "DATA_FRAG fragment/reassemble byte-exact")
+      (let* ((buf (dds.core.arena:pool-acquire pool))
+             (c (dds.core.buffer:cursor buf :endianness :little)))
+        (dds.rtps.message:write-data-frag c rid wid 9 sample-size 1 1 frag-size payload 0 frag-size)
+        ;; fragmentStartingNum is at buffer offset 24 (hdr4 + extra/oti4 + rid4 + wid4 + sn8)
+        (fill (dds.core.buffer:octet-buffer-vec buf) 0 :start 24 :end 28)
+        (dds.core.buffer:cursor-reset c)
+        (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+          (declare (ignore id le))
+          (%check :data-frag-validity
+                  (null (dds.rtps.message:parse-data-frag-body c flags octets))
+                  "DATA_FRAG with fragmentStartingNum=0 must reject"))
+        (dds.core.arena:pool-release pool buf)))
+    (dds.core.arena:teardown-arena arena)
+    t))
+
 ;;; RTPS message framing: build Header + DATA + HEARTBEAT into one buffer, then
 ;;; dispatch-message walks the submessages back out (RTPS 2.5 §8.3.4 / §9.4.5).
 

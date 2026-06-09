@@ -330,8 +330,14 @@ resend) for the evicted range and a resend for what is still cached. Adapted fro
   ParameterList (every read bounds-checked against the submessage extent first) and reports the
   `serializedPayload` that follows it. Required for keyed types: RTI Connext sends keyed user
   DATA with inlineQos carrying `PID_KEY_HASH`. The payload is handed back as a `[offset, len)`
-  region in the receive buffer, left in place for the caller to deserialize. (Emitting inlineQos,
-  and `DATA_FRAG`, are still v1 gaps.)
+  region in the receive buffer, left in place for the caller to deserialize. (Emitting inlineQos
+  is still a v1 gap.)
+- **DATA_FRAG codec (RTPS 2.5 §9.4.5.5).** `write-data-frag` / `parse-data-frag-body` implement the
+  fragmented-DATA submessage (flags E=0x01/Q=0x02/K=0x04 pinned from §9.4.5.5; wire order
+  `fragmentStartingNum/fragmentsInSubmessage/fragmentSize/sampleSize`); the parser is
+  bounds-checked, fuzzed, and rejects the spec-invalid cases (fragmentStartingNum 0, frags 0,
+  fragmentSize > sampleSize). The data-plane reassembly (with `max-fragments`/`max-reassembly-bytes`
+  resource guards) and send-side fragmentation are the next increment.
 - **HEARTBEAT/ACKNACK/GAP are base forms.** The GroupInfo (G) and Filtered/FilteredCount (F)
   extensions are neither emitted nor parsed in v1.
 - **The reliable state machines are value-level, not byte-level.** `dds.rtps.reliable`

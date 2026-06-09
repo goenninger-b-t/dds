@@ -51,6 +51,8 @@
            #:+data-flag-inline-qos+ #:+data-flag-data+ #:+data-flag-key+
            #:+data-flag-non-standard+
            #:write-data #:parse-data-body
+           #:write-data-frag #:parse-data-frag-body
+           #:+data-frag-flag-key+ #:+data-frag-flag-inline-qos+
            #:+pid-pad+ #:+pid-sentinel+ #:+pid-participant-lease-duration+
            #:+pid-topic-name+ #:+pid-type-name+ #:+pid-protocol-version+
            #:+pid-vendorid+ #:+pid-reliability+ #:+pid-durability+ #:+pid-default-unicast-locator+

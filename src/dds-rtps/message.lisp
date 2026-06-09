@@ -362,14 +362,28 @@
   (dds.core.buffer:put-octets cursor payload payload-off payload-len)
   (dds.core.buffer:cursor-position cursor))
 
+(declaim (ftype (function (dds.core.buffer:cursor fixnum) t) %skip-inline-qos))
+(defun %skip-inline-qos (cursor body-end)
+  "Advance CURSOR past an inlineQos ParameterList (each Parameter = id+len header then len
+   value octets, already 4-aligned) up to PID_SENTINEL. Every read is bounds-checked
+   against BODY-END FIRST (NFR-SEC-POSTURE). Returns T on success, NIL if it would read
+   past BODY-END or runs off the end without a sentinel. RTPS 2.5 §9.4.2.11."
+  (loop
+    (when (> (+ (dds.core.buffer:cursor-position cursor) 4) body-end) (return nil))
+    (let ((pid (dds.core.buffer:get-u16 cursor))
+          (plen (dds.core.buffer:get-u16 cursor)))
+      (when (= pid +pid-sentinel+) (return t))
+      (let ((next (+ (dds.core.buffer:cursor-position cursor) plen)))
+        (when (> next body-end) (return nil))
+        (dds.core.buffer:cursor-set-position cursor next)))))
+
 (declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t) parse-data-body))
 (defun parse-data-body (cursor flags octets-to-next)
   "Parse a DATA body. Returns (values reader-id writer-id writer-sn has-payload
    payload-offset payload-len key-p), or NIL if the buffer is short / malformed. When
-   the InlineQos flag (Q) is set the inlineQos ParameterList is SKIPPED (every read is
-   bounds-checked against the submessage extent first, per NFR-SEC-POSTURE) and the
-   serializedPayload that follows it is reported. The payload is left in place (the
-   caller reads it from PAYLOAD-OFFSET). RTPS 2.5 §9.4.5.4."
+   the InlineQos flag (Q) is set the inlineQos ParameterList is SKIPPED (bounds-checked,
+   %skip-inline-qos) and the serializedPayload that follows it is reported. The payload is
+   left in place (the caller reads it from PAYLOAD-OFFSET). RTPS 2.5 §9.4.5.4."
   (let* ((body-start (dds.core.buffer:cursor-position cursor))
          (cap (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor)))
          (body-end (if (plusp octets-to-next) (min (+ body-start octets-to-next) cap) cap)))
@@ -380,23 +394,79 @@
           (writer (read-entity-id cursor))
           (sn (read-sequence-number cursor)))
       (when (logtest flags +data-flag-inline-qos+)
-        ;; Skip the inlineQos ParameterList (id+len header then len value octets, each
-        ;; already 4-aligned) up to PID_SENTINEL, bounds-checked against BODY-END.
-        (loop
-          (when (> (+ (dds.core.buffer:cursor-position cursor) 4) body-end)
-            (return-from parse-data-body nil))
-          (let ((pid (dds.core.buffer:get-u16 cursor))
-                (plen (dds.core.buffer:get-u16 cursor)))
-            (when (= pid +pid-sentinel+) (return))
-            (let ((next (+ (dds.core.buffer:cursor-position cursor) plen)))
-              (when (> next body-end) (return-from parse-data-body nil))
-              (dds.core.buffer:cursor-set-position cursor next)))))
+        (unless (%skip-inline-qos cursor body-end) (return-from parse-data-body nil)))
       (let* ((has-payload (logtest flags (logior +data-flag-data+ +data-flag-key+)))
              (poff (dds.core.buffer:cursor-position cursor))
              (len (- body-end poff)))
         (when (< len 0) (return-from parse-data-body nil))
         (values reader writer sn has-payload poff
                 (if has-payload len 0) (logtest flags +data-flag-key+))))))
+
+;;; ---- DATA_FRAG submessage (§9.4.5.5): extraFlags + octetsToInlineQos + readerId +
+;;; writerId + writerSN + fragmentStartingNum(u32) + fragmentsInSubmessage(u16) +
+;;; fragmentSize(u16) + sampleSize(u32) + [inlineQos if Q] + serializedPayload. Flags
+;;; pinned from §9.4.5.5: E=0x01, Q=0x02, K=0x04, N=0x08. One fragment series per
+;;; submessage; reassembly + resource guards live in the data plane. ----
+
+(defconstant +data-frag-flag-inline-qos+ #x02
+  "DATA_FRAG InlineQosFlag (Q) (RTPS 2.5 §9.4.5.5).")
+(defconstant +data-frag-flag-key+        #x04
+  "DATA_FRAG KeyFlag (K): the fragments carry the key, not the data (RTPS 2.5 §9.4.5.5).")
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer
+                           (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 16) (unsigned-byte 16)
+                           (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum)
+                write-data-frag))
+(defun write-data-frag (cursor reader-id writer-id sn sample-size frag-start frags-in-submsg frag-size
+                        payload payload-off payload-len &key key)
+  "Write one DATA_FRAG submessage (RTPS 2.5 §9.4.5.5), no inlineQos. Carries the bytes
+   [PAYLOAD-OFF, PAYLOAD-OFF+PAYLOAD-LEN) — FRAGS-IN-SUBMSG consecutive fragments of size
+   FRAG-SIZE starting at the 1-based FRAG-START — of the SAMPLE-SIZE-byte serialized sample.
+   KEY t sets the K flag (key fragments). Body = 32 + PAYLOAD-LEN."
+  (write-submessage-header cursor +submsg-data-frag+
+                           (logior (%e-flag cursor) (if key +data-frag-flag-key+ 0))
+                           (+ 32 payload-len))
+  (dds.core.buffer:put-u16 cursor 0)             ; extraFlags
+  (dds.core.buffer:put-u16 cursor 28)            ; octetsToInlineQos (to inlineQos start)
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (write-sequence-number cursor sn)
+  (dds.core.buffer:put-u32 cursor frag-start)
+  (dds.core.buffer:put-u16 cursor frags-in-submsg)
+  (dds.core.buffer:put-u16 cursor frag-size)
+  (dds.core.buffer:put-u32 cursor sample-size)
+  (dds.core.buffer:put-octets cursor payload payload-off payload-len)
+  (dds.core.buffer:cursor-position cursor))
+
+(declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t) parse-data-frag-body))
+(defun parse-data-frag-body (cursor flags octets-to-next)
+  "Parse a DATA_FRAG body (RTPS 2.5 §9.4.5.5). Returns (values reader-id writer-id writer-sn
+   sample-size frag-start frags-in-submsg frag-size payload-offset payload-len key-p), or NIL
+   if short / malformed / spec-invalid (frag-start not strictly positive, frag-size > sample-
+   size, frags-in-submsg 0). inlineQos (Q) is skipped, bounds-checked (NFR-SEC-POSTURE). The
+   payload (the fragment bytes) is left in place at PAYLOAD-OFFSET."
+  (let* ((body-start (dds.core.buffer:cursor-position cursor))
+         (cap (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor)))
+         (body-end (if (plusp octets-to-next) (min (+ body-start octets-to-next) cap) cap)))
+    (when (< (- body-end body-start) 32) (return-from parse-data-frag-body nil))
+    (dds.core.buffer:get-u16 cursor)             ; extraFlags
+    (dds.core.buffer:get-u16 cursor)             ; octetsToInlineQos
+    (let ((reader (read-entity-id cursor))
+          (writer (read-entity-id cursor))
+          (sn (read-sequence-number cursor))
+          (frag-start (dds.core.buffer:get-u32 cursor))
+          (frags (dds.core.buffer:get-u16 cursor))
+          (frag-size (dds.core.buffer:get-u16 cursor))
+          (sample-size (dds.core.buffer:get-u32 cursor)))
+      (when (or (zerop frag-start) (zerop frags) (> frag-size sample-size))
+        (return-from parse-data-frag-body nil))
+      (when (logtest flags +data-frag-flag-inline-qos+)
+        (unless (%skip-inline-qos cursor body-end) (return-from parse-data-frag-body nil)))
+      (let* ((poff (dds.core.buffer:cursor-position cursor))
+             (len (- body-end poff)))
+        (when (< len 0) (return-from parse-data-frag-body nil))
+        (values reader writer sn sample-size frag-start frags frag-size poff len
+                (logtest flags +data-frag-flag-key+))))))
 
 ;;; ---- ParameterList (§9.4.2.11, FR-RTPS-9): a list of (parameterId, length,
 ;;; value) Parameters, each 4-byte aligned, terminated by PID_SENTINEL. PID
