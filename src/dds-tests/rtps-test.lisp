@@ -640,6 +640,55 @@
             "fragmented large sample reassembles byte-exact our-writer -> our-reader"))
   t)
 
+;;; Lossy-delivery integration: fragment transfer with deliberate drops recovers via NACK_FRAG.
+
+(defun* run-frag-lossy-test ()
+    (function () t)
+  "Test: a lost-fragment transfer recovers via NACK_FRAG — the reader NACKs exactly the dropped
+   fragments, the writer resends only those, and the sample completes (RTPS 2.5 §8.3.8)."
+  (let* ((dds.rtps.reliable:*fragment-size* 100)
+         (fsize 100) (ssize 500) (wid #x102) (rid #x107)
+         (writer (dds.rtps.reliable:make-rtps-writer
+                  :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (reader (dds.rtps.reliable:make-rtps-reader))
+         (orig (make-array ssize :element-type '(unsigned-byte 8)))
+         (dropped '(2 4)))
+    (dotimes (i ssize) (setf (aref orig i) (logand (* i 3) #xff)))
+    (let ((sn (dds.rtps.reliable:writer-write writer orig)))
+      (flet ((deliver (desc)
+               (destructuring-bind (fstart fcount off len) desc
+                 (let* ((buf (dds.core.buffer:make-octet-buffer 256))
+                        (wc (dds.core.buffer:cursor buf :endianness :little)))
+                   (dds.rtps.message:write-data-frag wc rid wid sn ssize fstart fcount fsize orig off len)
+                   (dds.core.buffer:cursor-reset wc)
+                   (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header wc)
+                     (declare (ignore id le))
+                     (multiple-value-bind (r w psn pssize pfstart pfrags pfsize poff plen keyp)
+                         (dds.rtps.message:parse-data-frag-body wc flags octets)
+                       (declare (ignore r keyp))
+                       (dds.rtps.reliable:reader-on-data-frag
+                        reader w psn pfstart pfrags pfsize pssize
+                        (subseq (dds.core.buffer:octet-buffer-vec buf) poff (+ poff plen)))))))))
+        (dolist (desc (dds.rtps.reliable:writer-frag-plan ssize fsize fsize))
+          (unless (member (first desc) dropped) (deliver desc)))
+        (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-frag-acknack reader wid sn)
+          (%check :lossy-nack
+                  (and base
+                       (dds.rtps.message:fragnum-set-member-p base numbits bitmap 2)
+                       (dds.rtps.message:fragnum-set-member-p base numbits bitmap 4)
+                       (not (dds.rtps.message:fragnum-set-member-p base numbits bitmap 1))
+                       (not (dds.rtps.message:fragnum-set-member-p base numbits bitmap 3))
+                       (not (dds.rtps.message:fragnum-set-member-p base numbits bitmap 5)))
+                  "reader NACK_FRAG names exactly the dropped fragments {2,4}")
+          (let ((resends (dds.rtps.reliable:writer-on-nack-frag writer sn base numbits bitmap)))
+            (%check :lossy-resend-set (equal '(2 4) (mapcar #'first resends))
+                    "writer resends exactly fragments 2 and 4, nothing else")
+            (let ((done nil))
+              (dolist (desc resends) (setf done (deliver desc)))
+              (%check :lossy-complete (and done (equalp done orig))
+                      "sample completes byte-exact after the NACK_FRAG resend")))))))
+  t)
+
 ;;; NACK_FRAG round-trip (RTPS 2.5 §9.4.5.14): 24+4*M body, only E flag.
 
 (defun* run-nack-frag-test ()
