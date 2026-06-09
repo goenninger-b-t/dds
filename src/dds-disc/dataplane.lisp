@@ -60,6 +60,14 @@
   "T iff the GUID's entity kind is a user writer (0x02 with-key / 0x03 no-key)."
   (let ((k (aref guid 15))) (or (= k #x02) (= k #x03))))
 
+(declaim (ftype (function ((unsigned-byte 32)) t) %user-writer-entityid-p))
+(defun %user-writer-entityid-p (entity-id)
+  "T iff ENTITY-ID's kind is an application-defined writer (0x02 with-key / 0x03 no-key) —
+   a user-data writer, not a builtin (kind 0xc2). Lets the reader ACKNACK ANY matched
+   remote writer's HEARTBEAT, not only a writer sharing this stack's local EntityId
+   convention (a peer such as RTI Connext picks its own writer EntityIds)."
+  (let ((k (logand entity-id #xff))) (or (= k #x02) (= k #x03))))
+
 (declaim (ftype (function (disc-node) list) %matched-endpoints))
 (defun %matched-endpoints (node)
   "Snapshot of the remote endpoints matched to one of NODE's local endpoints."
@@ -136,7 +144,7 @@
   (multiple-value-bind (rid wid first last count finalp livep)
       (dds.rtps.message:parse-heartbeat-body c flags)
     (declare (ignore rid count finalp livep))
-    (when (= wid +user-writer-id+)
+    (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid))
       (let ((reader (disc-node-user-reader node)))
         (dds.rtps.reliable:reader-on-heartbeat reader wid first last)
         (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
@@ -144,8 +152,10 @@
             (dolist (peer (%match-destinations node nil))   ; ACKNACK -> matched writers
               (%send-msg-buf node (disc-node-rx-tx-msg node)
                              (lambda (mc)
+                               ;; writerEntityId = the REMOTE writer's id (WID), so the peer
+                               ;; routes the ACKNACK to its writer (not our local convention).
                                (dds.rtps.message:write-acknack
-                                mc +user-reader-id+ +user-writer-id+ base numbits bitmap cnt :final t))
+                                mc +user-reader-id+ wid base numbits bitmap cnt :final t))
                              (car peer) (cdr peer))))))))
   t)
 
