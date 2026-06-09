@@ -75,7 +75,7 @@
   (total-count-change 0 :type integer)
   (current-count 0 :type integer)
   (current-count-change 0 :type integer)
-  (last-publication-handle nil :type t))
+  (last-publication-handle nil :type (or null (array (unsigned-byte 8) (*)))))
 
 (defstruct* (publication-matched-status (:constructor make-publication-matched-status)
                                        (:copier copy-publication-matched-status))
@@ -84,7 +84,7 @@
   (total-count-change 0 :type integer)
   (current-count 0 :type integer)
   (current-count-change 0 :type integer)
-  (last-subscription-handle nil :type t))
+  (last-subscription-handle nil :type (or null (array (unsigned-byte 8) (*)))))
 
 (deftype sample-rejected-reason ()
   "DDS SampleRejectedStatusKind (dds_rtf2_dcps.idl §104)."
@@ -98,7 +98,7 @@
   (total-count 0 :type integer)
   (total-count-change 0 :type integer)
   (last-reason :not-rejected :type sample-rejected-reason)
-  (last-instance-handle nil :type t))
+  (last-instance-handle nil :type (or null (array (unsigned-byte 8) (*)))))
 
 (defstruct* (inconsistent-topic-status (:constructor make-inconsistent-topic-status)
                                       (:copier copy-inconsistent-topic-status))

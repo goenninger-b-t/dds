@@ -6,7 +6,7 @@
    sample-pool alloc+free, FlatData hooks, field accessors) plus the type name,
    extensibility, structural TypeObject/TypeIdentifier, and data-representation mask. The
    hot path sees only this struct, never the concrete sample type."
-  (name nil :type t)
+  (name nil :type (or null string))
   (type-name nil :type (or null string))
   (extensibility :appendable :type (member :final :appendable :mutable))
   (serialize nil :type (or null function))

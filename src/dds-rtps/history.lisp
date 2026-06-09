@@ -10,12 +10,12 @@
    sequence number, instance key hash, serialized payload, source timestamp, and
    inline QoS."
   (kind :data :type (member :data :dispose :unregister))
-  (writer-guid nil :type t)
+  (writer-guid nil :type (or null (array (unsigned-byte 8) (*))))
   (sn 0 :type (integer 0))
-  (instance-key-hash nil :type t)
-  (serialized-payload nil :type t)
+  (instance-key-hash nil :type (or null (array (unsigned-byte 8) (*))))
+  (serialized-payload nil :type t)                ; opaque: writer-write takes payload as t
   (source-timestamp 0 :type integer)
-  (inline-qos nil :type t))
+  (inline-qos nil :type t))                       ; opaque QoS blob (never interpreted here)
 
 ;;;; HistoryCache (FR-RTPS-5): a change store honouring HISTORY (KEEP_LAST depth /
 ;;;; KEEP_ALL) and RESOURCE_LIMITS (max_samples). v1 keys changes by sequence
@@ -29,7 +29,7 @@
   (kind :keep-last :type (member :keep-last :keep-all))
   (depth 1 :type (integer 1))
   (max-samples nil :type (or null (integer 0)))                                  ; resource limit; nil = unlimited
-  (type-support nil :type t)
+  (type-support nil :type (or null dds.types:type-support))
   (changes (make-hash-table :test 'eql) :type hash-table)
   (count 0 :type (integer 0)))
 

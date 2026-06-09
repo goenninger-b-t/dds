@@ -54,7 +54,7 @@
   (kind 0 :type (unsigned-byte 8))
   (bound 0 :type (integer 0))
   (element nil :type (or null type-identifier))
-  (hash nil :type t)
+  (hash nil :type (or null (array (unsigned-byte 8) (*))))
   (referenced nil :type t))
 
 (defun* primitive-type-identifier (keyword)
@@ -119,7 +119,7 @@
   (key-p nil :type boolean)
   (optional-p nil :type boolean)
   (must-understand-p nil :type boolean)
-  (name-hash nil :type t))
+  (name-hash nil :type (or null (simple-array (unsigned-byte 8) (4)))))
 
 (defun* make-struct-member (name id type-identifier &key key-p optional-p must-understand-p)
     (function (string (unsigned-byte 32) type-identifier &key (:key-p t) (:optional-p t) (:must-understand-p t)) minimal-struct-member)

@@ -15,7 +15,7 @@
 (defstruct* (rtps-writer (:constructor make-rtps-writer))
   "Stateful reliable RTPS writer (RTPS 2.5 §8.4.2): a HistoryCache, the last SN
    written, the HEARTBEAT count, and a reader-id -> ReaderProxy table."
-  (hc nil :type t)                                  ; a HistoryCache
+  (hc nil :type (or null dds.rtps.history:history-cache))  ; a HistoryCache
   (last-sn 0 :type integer)
   (hb-count 0 :type integer)
   (proxies (make-hash-table :test 'eql) :type hash-table))   ; reader-id -> reader-proxy

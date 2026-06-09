@@ -13,18 +13,18 @@
 (defstruct* (participant-builtin-topic-data (:constructor make-participant-builtin-topic-data))
   "DCPSParticipant builtin data (idl §164). v1: the BuiltinTopicKey_t (participant GUID
    prefix, 16 octets zero-padded); user_data not yet captured."
-  (key nil :type t))
+  (key nil :type (or null (array (unsigned-byte 8) (*)))))
 
 (defstruct* (publication-builtin-topic-data (:constructor make-publication-builtin-topic-data))
   "DCPSPublication builtin data (idl §237). v1 subset: key / participant_key / topic_name
    / type_name + the SEDP-propagated reliability + durability."
-  (key nil :type t) (participant-key nil :type t)
+  (key nil :type (or null (array (unsigned-byte 8) (*)))) (participant-key nil :type (or null (array (unsigned-byte 8) (*))))
   (topic-name "" :type string) (type-name "" :type string)
   (reliability :best-effort :type (member :best-effort :reliable)) (durability :volatile :type (member :volatile :transient-local :transient :persistent)))
 
 (defstruct* (subscription-builtin-topic-data (:constructor make-subscription-builtin-topic-data))
   "DCPSSubscription builtin data (idl §271). Same v1 subset as the publication data."
-  (key nil :type t) (participant-key nil :type t)
+  (key nil :type (or null (array (unsigned-byte 8) (*)))) (participant-key nil :type (or null (array (unsigned-byte 8) (*))))
   (topic-name "" :type string) (type-name "" :type string)
   (reliability :best-effort :type (member :best-effort :reliable)) (durability :volatile :type (member :volatile :transient-local :transient :persistent)))
 
