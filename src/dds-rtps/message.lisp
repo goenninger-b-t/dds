@@ -364,21 +364,39 @@
 
 (declaim (ftype (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t) parse-data-body))
 (defun parse-data-body (cursor flags octets-to-next)
-  "Parse a DATA body (base form, Q=0). Returns (values reader-id writer-id writer-sn
-   has-payload payload-offset payload-len key-p), or NIL if Q is set (inlineQos
-   deferred) or the buffer is short. The serializedPayload is left in place (the
+  "Parse a DATA body. Returns (values reader-id writer-id writer-sn has-payload
+   payload-offset payload-len key-p), or NIL if the buffer is short / malformed. When
+   the InlineQos flag (Q) is set the inlineQos ParameterList is SKIPPED (every read is
+   bounds-checked against the submessage extent first, per NFR-SEC-POSTURE) and the
+   serializedPayload that follows it is reported. The payload is left in place (the
    caller reads it from PAYLOAD-OFFSET). RTPS 2.5 §9.4.5.4."
-  (when (logtest flags +data-flag-inline-qos+) (return-from parse-data-body nil))
-  (when (< (%remaining cursor) 20) (return-from parse-data-body nil))
-  (dds.core.buffer:get-u16 cursor)               ; extraFlags (reserved)
-  (dds.core.buffer:get-u16 cursor)               ; octetsToInlineQos
-  (let* ((reader (read-entity-id cursor))
-         (writer (read-entity-id cursor))
-         (sn (read-sequence-number cursor))
-         (has-payload (logtest flags (logior +data-flag-data+ +data-flag-key+)))
-         (len (if (plusp octets-to-next) (- octets-to-next 20) (%remaining cursor))))
-    (values reader writer sn has-payload (dds.core.buffer:cursor-position cursor)
-            (if has-payload len 0) (logtest flags +data-flag-key+))))
+  (let* ((body-start (dds.core.buffer:cursor-position cursor))
+         (cap (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor)))
+         (body-end (if (plusp octets-to-next) (min (+ body-start octets-to-next) cap) cap)))
+    (when (< (- body-end body-start) 20) (return-from parse-data-body nil))
+    (dds.core.buffer:get-u16 cursor)             ; extraFlags (reserved)
+    (dds.core.buffer:get-u16 cursor)             ; octetsToInlineQos
+    (let ((reader (read-entity-id cursor))
+          (writer (read-entity-id cursor))
+          (sn (read-sequence-number cursor)))
+      (when (logtest flags +data-flag-inline-qos+)
+        ;; Skip the inlineQos ParameterList (id+len header then len value octets, each
+        ;; already 4-aligned) up to PID_SENTINEL, bounds-checked against BODY-END.
+        (loop
+          (when (> (+ (dds.core.buffer:cursor-position cursor) 4) body-end)
+            (return-from parse-data-body nil))
+          (let ((pid (dds.core.buffer:get-u16 cursor))
+                (plen (dds.core.buffer:get-u16 cursor)))
+            (when (= pid +pid-sentinel+) (return))
+            (let ((next (+ (dds.core.buffer:cursor-position cursor) plen)))
+              (when (> next body-end) (return-from parse-data-body nil))
+              (dds.core.buffer:cursor-set-position cursor next)))))
+      (let* ((has-payload (logtest flags (logior +data-flag-data+ +data-flag-key+)))
+             (poff (dds.core.buffer:cursor-position cursor))
+             (len (- body-end poff)))
+        (when (< len 0) (return-from parse-data-body nil))
+        (values reader writer sn has-payload poff
+                (if has-payload len 0) (logtest flags +data-flag-key+))))))
 
 ;;; ---- ParameterList (§9.4.2.11, FR-RTPS-9): a list of (parameterId, length,
 ;;; value) Parameters, each 4-byte aligned, terminated by PID_SENTINEL. PID

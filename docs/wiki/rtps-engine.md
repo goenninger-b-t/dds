@@ -326,9 +326,12 @@ resend) for the evicted range and a resend for what is still cached. Adapted fro
   ignores a participant advertising the zero/unknown VendorId — establishing no unicast discovery
   channel at all; with `0x01FF` Connext accepts the participant and runs the reliable channel. Some
   unit tests still write `:vendor 0` to the header codec directly (codec round-trip, not discovery).
-- **DATA is base-form only (Q=0).** `parse-data-body` returns `NIL` if the InlineQos (Q) flag
-  is set; inline-QoS parsing is deferred. `serializedPayload` is handed back as a
-  `[offset, len)` region in the receive buffer, left in place for the caller to deserialize.
+- **DATA handles InlineQos (Q).** When the Q flag is set, `parse-data-body` SKIPS the inlineQos
+  ParameterList (every read bounds-checked against the submessage extent first) and reports the
+  `serializedPayload` that follows it. Required for keyed types: RTI Connext sends keyed user
+  DATA with inlineQos carrying `PID_KEY_HASH`. The payload is handed back as a `[offset, len)`
+  region in the receive buffer, left in place for the caller to deserialize. (Emitting inlineQos,
+  and `DATA_FRAG`, are still v1 gaps.)
 - **HEARTBEAT/ACKNACK/GAP are base forms.** The GroupInfo (G) and Filtered/FilteredCount (F)
   extensions are neither emitted nor parsed in v1.
 - **The reliable state machines are value-level, not byte-level.** `dds.rtps.reliable`
