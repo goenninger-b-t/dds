@@ -123,6 +123,19 @@ behavioural-reference-via-interop use, not a clean-room breach:
   EquivalenceHash is an apples-to-apples comparison.
 - Still **no RTI/Fast DDS/Cyclone/OpenDDS source** read or copied.
 
+## M4 — Connext 7.3.1 wire capture (2026-06-08)
+
+- `interop/connext/typeobject-probe` was **built and run against live RTI Connext 7.3.1**
+  (arm64 macOS) and its SEDP read with the Wireshark/tshark RTPS dissector. This is a
+  **behavioural reference via the wire only** (NFR-IP) — the influence is recorded in
+  **ADR 0009**. **No Connext source, headers, or `rtiddsgen` output was copied**; the
+  generated type support stays git-ignored. The decompressed `PID_TYPE_OBJECT_LB` complete
+  TypeObject and the absence of `PID_TYPE_INFORMATION` are facts read off the wire, not from
+  any RTI artifact.
+- The only design input taken: Connext advertises small types via the vendor
+  `PID_TYPE_OBJECT_LB` (ZLIB complete TypeObject) and not the minimal hash → our
+  type-matching must be name + structural, not a minimal-hash gate (ADR 0009).
+
 ## Third-party runtime dependencies (licenses apply; not vendored yet)
 
 | Dependency | Use | License |

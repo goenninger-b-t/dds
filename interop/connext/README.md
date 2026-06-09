@@ -14,20 +14,31 @@ reference via its API/wire is exactly the allowed clean-room use.
 Several XTypes wire artifacts in this stack are **PROVISIONAL** — spec-faithful but
 unconfirmed against a conformant peer (see `docs/verification.csv` FR-TYPE-2/3 and the
 `typeobject-cdr.lisp` header). This harness produces the reference bytes to **lock or
-correct** them:
+correct** them.
 
-| Our value (committed) | Confirm with |
-|---|---|
-| `ShapeType` MinimalTypeObject = **87 bytes** (no encap header) | `typeobject-probe` + tshark |
-| `ShapeType` EquivalenceHash = **`BF E2 A6 2E D8 11 AC 46 3C 40 C9 7D 30 EE`** | `typeobject-probe` + tshark |
-| `serialize-type-information` (PID_TYPE_INFORMATION) bytes | `typeobject-probe` vs our `make square-pub` capture |
-| XCDR2 ShapeType payload (FR-CDR-8) | `cdr-capture` + tshark |
-| Bidirectional Shapes interop (FR-IO-1) | `shapes-pub` / `shapes-sub` ↔ our `make square-pub/sub` |
+> **Finding (2026-06-08, ADR 0009).** `typeobject-probe` was driven against live RTI
+> Connext 7.3.1. **Default Connext (RTI↔RTI, same host) does not emit
+> `PID_TYPE_INFORMATION` (0x0075) at all** — it advertises the type via the vendor
+> parameter **`PID_TYPE_OBJECT_LB` (0x8021)**, a ZLIB-compressed **complete** TypeObject
+> (540 B uncompressed). **The EK_MINIMAL `EquivalenceHash` is therefore not on this wire**,
+> so it cannot be read back to confirm our minimal serializer here. Separately,
+> `rtiddsgen` bounds the unbounded `string color` at **255** (`string_255_character`), so
+> Connext's `ShapeType` is structurally different from our unbounded-`color` type — our
+> committed `87 B` / `BF E2 A6 2E …` values describe a different type. Consequence:
+> minimal-hash equality must **not** be a hard endpoint-match gate (it would false-reject
+> every stock Connext peer); matching is by type-name + structural assignability,
+> consuming `PID_TYPE_OBJECT_LB` / TypeLookup. The provisional minimal serializer stays
+> gated; "b2b = enforce hash equality" is retired (ADR 0009).
 
-If Connext's bytes match ours → the serializers lock and `(b2b)` hash-based match
-enforcement unblocks. If they differ, the diff points at exactly one of three one-line
-knobs in `src/dds-types/typeobject-cdr.lisp` (encapsulation-header / `struct_flags` /
-`member_flags`).
+What the capture **can** confirm (oracle still useful):
+
+| Target | How | Status |
+|---|---|---|
+| `ShapeType` **complete** TypeObject structure (extensibility, member ids, key, kinds) | `typeobject-probe` → decompress `PID_TYPE_OBJECT_LB` + tshark | ✅ confirms `@final`, ids 0..3, `@key color`, three `INT_32` |
+| `ShapeType` **minimal** TypeObject (87 B) + EquivalenceHash | needs a peer that emits `0x0075` (foreign-vendor, or a larger type) | ⛔ not on the default RTI↔RTI wire |
+| `serialize-type-information` (PID_TYPE_INFORMATION) bytes | `typeobject-probe` vs our `make square-pub` capture | blocked on the above |
+| XCDR2 ShapeType payload (FR-CDR-8) | `cdr-capture` + tshark | pending |
+| Bidirectional Shapes interop (FR-IO-1) | `shapes-pub` / `shapes-sub` ↔ our `make square-pub/sub` | pending |
 
 ## Prerequisites
 
@@ -39,6 +50,13 @@ export CONNEXTDDS_ARCH=x64Linux4gcc7.3.0                # ls $NDDSHOME/lib to fi
 ```
 `tshark`/`wireshark` (with the RTPS dissector, as already used by `make wire`) is the
 authoritative way to read the on-the-wire TypeObject/TypeInformation bytes.
+
+**Runtime (macOS).** RTI's dylibs use `@loader_path` install names, so the built apps
+need the lib dir on the loader path at run time:
+
+```sh
+export DYLD_LIBRARY_PATH="$NDDSHOME/lib/$CONNEXTDDS_ARCH"
+```
 
 ## Layout
 
@@ -61,21 +79,40 @@ make -C shapes-pub      # or build one app
 ```
 Per-app usage is in each subdirectory's `README.md`.
 
-## The ShapeType definition (IMPORTANT)
+## The ShapeType definition (IMPORTANT — and a correction)
 
-`common/ShapeType.idl` is deliberately written to match **this stack's** `shape-type`
-(`@final`; `@key` **unbounded** `string color`; three `long`s; sequential member ids
-0..3) so the EquivalenceHash is an apples-to-apples comparison. RTI's `rtishapesdemo`
-uses `string<128> color`; that bound difference changes the TypeObject/hash but **not**
-the wire payload, and is absorbed by `ignore_string_bounds` (default) during type
-coercion — so live pub/sub interop with `rtishapesdemo` still works.
+`common/ShapeType.idl` is written to mirror **this stack's** `shape-type` (`@final`;
+`@key string color`; three `long`s; sequential member ids 0..3).
 
-## Extracting the EquivalenceHash with tshark
+**Correction (2026-06-08):** the original intent — *"keep `color` UNBOUNDED so the
+EquivalenceHash is an apples-to-apples comparison"* — does **not** hold. `rtiddsgen`
+maps an unbounded `string` to a **255-bounded** string by default (`string_255_character`,
+Bound 255), so Connext's TypeObject is **not** the unbounded-`color` type this stack
+generates, and the hashes cannot match by construction. For any future byte-exact
+comparison, first **align the type**: either bound our `color` at 255 to match
+`rtiddsgen`'s default, or generate Connext truly-unbounded (`-unboundedSupport` /
+explicit bound). The bound difference does **not** change the XCDR wire payload, so live
+pub/sub interop (absorbed by `ignore_string_bounds` during coercion) still works.
+
+## Capturing the SEDP TypeObject with tshark
 
 ```sh
-# capture loopback discovery while typeobject-probe (or shapes-pub) runs:
-tshark -i lo -f "udp" -O rtps -V | less     # Linux loopback; use lo0 on macOS
-# look in DATA(w) -> PID_TYPE_INFORMATION -> TypeIdentifier (EK_MINIMAL) -> the 14-byte hash
+# 1. force discovery onto loopback UDP so SEDP is on the wire (default same-host
+#    Connext prefers SHMEM, which tshark cannot see). typeobject-probe/USER_QOS_PROFILES.xml
+#    already sets UDPv4-only + loopback peers + no multicast; Connext auto-loads it from CWD.
+# 2. capture while the probe runs (lo on Linux, lo0 on macOS):
+tshark -i lo0 -w probe.pcap -a duration:18 -f "udp"   &
+DYLD_LIBRARY_PATH="$NDDSHOME/lib/$CONNEXTDDS_ARCH" ./typeobject_probe 0
+# 3. decode. NOTE: if this host's Wireshark profile disables link/net dissectors
+#    (disabled_protos), re-enable them explicitly or the RTPS heuristic never fires:
+tshark -r probe.pcap --enable-protocol null --enable-protocol ip --enable-protocol udp -V \
+  | less
 ```
-Compare those 14 bytes to `BF E2 A6 2E D8 11 AC 46 3C 40 C9 7D 30 EE` and the serialized
-TypeObject length to 87. Report back the diff and I'll lock or correct the serializer.
+
+In the SEDP `DATA(w)` look for the type parameters. **As of Connext 7.3.1 (default,
+RTI↔RTI) you will find `PID_TYPE_OBJECT_LB` (0x8021) — a ZLIB-compressed _complete_
+TypeObject — and NO `PID_TYPE_INFORMATION` (0x0075)**; the dissector decompresses it under
+`[Uncompressed type object] → Type Object`. The EK_MINIMAL `EquivalenceHash` is **not on
+this wire** (see the Finding above and ADR 0009). To obtain a minimal hash you need a peer
+that emits `0x0075` — test a **foreign-vendor** subscriber (our `make square-sub`) or a
+type past Connext's inline-TypeObject size threshold.

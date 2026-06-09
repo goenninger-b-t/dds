@@ -16,3 +16,11 @@ typeobject-probe/typeobject_probe
 shapes-pub/shapes_pub
 shapes-sub/shapes_sub
 cdr-capture/cdr_capture
+
+# transient capture artifacts (pcaps + tshark decodes produced while probing)
+*.pcap
+*.pcapng
+decode.txt
+decode.err
+tshark.err
+probe.out
