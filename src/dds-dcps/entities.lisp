@@ -128,7 +128,10 @@
 (defun* %serialize-sample (ts sample)
     (function (t t) (simple-array (unsigned-byte 8) (*)))
   "Serialize SAMPLE via type-support TS as a PLAIN_CDR2_LE SerializedPayload."
-  (let* ((buf (dds.core.buffer:make-octet-buffer 2048))
+  (let* ((ssz-fn (dds.types:type-support-serialized-size ts))
+         (body-size (if ssz-fn (funcall ssz-fn sample :xcdr2) 2044))
+         (cap (+ 4 body-size 8))   ; 4 encap + body + 8 slack for alignment
+         (buf (dds.core.buffer:make-octet-buffer cap))
          (wc (dds.core.buffer:cursor buf :endianness :little)))
     (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
     (funcall (dds.types:type-support-serialize ts) sample wc :xcdr2)

@@ -1318,6 +1318,61 @@
       (dds.dcps:delete-participant p))
     t))
 
+;;; DCPS large-sample e2e (DATA_FRAG gate, FR-DCPS-1 + RTPS 2.5 §9.4.5.5): a payload
+;;; larger than *fragment-size* flows through write-sample -> DCPS serialize -> UDP
+;;; DATA_FRAG fragmentation -> reassembly -> take-samples byte-exact. Proves the DCPS
+;;; write/take path fragments and reassembles transparently without app involvement.
+
+(dds.gen:define-dds-type dcps-large (:extensibility :final)
+  (id :i32 :key t)
+  (payload (:sequence :u8)))
+
+(defun* run-dcps-large-test ()
+    (function () t)
+  "DCPS write -> DATA_FRAG fragmentation -> reassembly -> take, byte-exact (FR-DCPS-1 /
+   RTPS 2.5 §9.4.5.5): write one dcps-large sample whose payload exceeds *fragment-size*
+   (1024); assert the reader takes exactly one sample with the original id and byte-exact
+   payload. Proves the DCPS API layer fragments transparently."
+  (let* ((ts (dds.types:find-type-support "dcps-large"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0))
+         (payload-size 4000)   ; > *fragment-size* 1024 -> fragments into 4 DATA_FRAG
+         (payload (make-array payload-size :element-type '(unsigned-byte 8)))
+         (orig-id 77))
+    (dotimes (i payload-size) (setf (aref payload i) (logand (* i 7) #xff)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "LargeTopic" "dcps-large" ts))
+                (tr (dds.dcps:create-topic p2 "LargeTopic" "dcps-large" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr)))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1))
+                            (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :dcps-large-matched (plusp (dds.dcps:matched-count p1))
+                   "DataWriter/DataReader did not match before publish")
+           (dds.dcps:write-sample dw (make-dcps-large :id orig-id :payload payload))
+           (let ((got nil))
+             (loop repeat 250 until got
+                   do (let ((s (dds.dcps:take-samples dr)))
+                        (when s (setf got (dds.dcps:cached-sample-data (first s)))))
+                      (sleep 0.02))
+             (%check :dcps-large-take (and got t)
+                     "DataReader::take returned no sample (fragmented large sample not delivered)")
+             (%check :dcps-large-id (= orig-id (dcps-large-id got))
+                     "dcps-large id field did not survive fragment->reassemble->take")
+             (%check :dcps-large-payload-length
+                     (= payload-size (length (dcps-large-payload got)))
+                     "reassembled payload length does not match original")
+             (%check :dcps-large-payload-exact
+                     (equalp payload (dcps-large-payload got))
+                     "reassembled payload bytes differ from original (not byte-exact)")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
 ;;; PID_TYPE_INFORMATION end-to-end (M4 step b2a, FR-TYPE-3): a generated type's
 ;;; TypeInformation rides the SEDP endpoint ParameterList. Proves the dds-types codec and
 ;;; the dds-rtps opaque wire mechanism interoperate (emit only; match enforcement deferred

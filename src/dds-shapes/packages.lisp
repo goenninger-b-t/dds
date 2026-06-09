@@ -15,4 +15,7 @@
            #:tagged-shape #:make-tagged-shape
            #:tagged-shape-color #:tagged-shape-x #:tagged-shape-y #:tagged-shape-shapesize
            #:tagged-shape-uuid #:tagged-shape-seq
-           #:run-publisher #:run-subscriber #:run-spy))
+           #:large-data #:make-large-data #:large-data-id #:large-data-payload
+           #:serialize-large-data #:deserialize-large-data
+           #:run-publisher #:run-subscriber #:run-spy
+           #:run-large-publisher #:run-large-subscriber))

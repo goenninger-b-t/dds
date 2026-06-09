@@ -1,4 +1,5 @@
 ;;;; Standalone Square/ShapeType publisher + subscriber over multicast discovery.
+;;;; Also includes LargeData publisher/subscriber harness for DATA_FRAG interop testing.
 ;;;; Built entirely on the participant data plane (dds.disc) + the generated codec
 ;;;; (dds.gen). Two processes discover each other via SPDP multicast on the domain's
 ;;;; well-known group, match the "Square" topic via SEDP, and exchange ShapeType
@@ -294,4 +295,89 @@
              (sleep 0.05))
         (dds.disc:stop-node node)
         (format t "~&[sub] stopped; received ~d shapes.~%" seen))
+      t)))
+
+;;; LargeData type: keyed (id) + unbounded octet sequence payload for DATA_FRAG testing.
+(dds.gen:define-dds-type large-data (:extensibility :final)
+  (id :i32 :key t)
+  (payload (:sequence :u8)))
+
+(defun* run-large-publisher (&key (domain 0) (size 8000) (rate 2) (count 0)
+                                  (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:size (integer 1)) (:rate (integer 1))
+                    (:count (integer 0)) (:advertise-address string)) t)
+  "Publish LargeData samples on DOMAIN via multicast discovery. SIZE is the octet count of
+   the payload (default 8000, well above *fragment-size*=1024); RATE updates/sec; COUNT 0
+   = forever (Ctrl-C). The payload is filled with i*7 mod 256 so the subscriber can verify."
+  (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x4c) :domain domain
+                                       :multicast t :advertise-address advertise-address)))
+    (dds.disc:add-local-writer node :topic "LargeData" :type "LargeData"
+                               :reliability dds.rtps.discovery:+reliability-reliable+)
+    (dds.disc:enable-publisher node)
+    (dds.disc:start-node node)
+    (format t "~&[large-pub] LargeData domain=~d size=~d (multicast 239.255.0.1). Ctrl-C to stop.~%"
+            domain size)
+    (let ((period (/ 1.0 rate)) (n 0) (last 0)
+          (dests (make-hash-table :test 'equalp)))
+      (unwind-protect
+           (loop
+             (setf last (%reannounce node last))
+             (dolist (p (dds.disc:node-discovered-participants node))
+               (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix p)))
+                 (unless (gethash prefix dests)
+                   (setf (gethash prefix dests) t)
+                   (let ((d (dds.disc:resolved-destination p)))
+                     (format t "~&[large-pub] peer discovered -> DATA destination ~a~%"
+                             (if d (format nil "~a:~d" (car d) (cdr d))
+                                 "NONE (no routable UDPv4 locator)"))))))
+             (incf n)
+             (let* ((pv (make-array size :element-type '(unsigned-byte 8)))
+                    (sample (make-large-data :id n :payload pv)))
+               (dotimes (i size) (setf (aref pv i) (logand (* i 7) #xff)))
+               (dds.disc:publish-sample
+                node (%serialize-payload
+                      (lambda (wc) (serialize-large-data sample wc :xcdr2)))))
+             (when (zerop (mod n 10))
+               (format t "~&[large-pub] sent ~d samples; size=~d; peers=~d~%"
+                       n size (hash-table-count dests)))
+             (when (and (plusp count) (>= n count)) (return))
+             (sleep period))
+        (dds.disc:stop-node node)
+        (format t "~&[large-pub] stopped after ~d samples.~%" n)))
+    t))
+
+(defun* run-large-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string)) t)
+  "Subscribe to LargeData on DOMAIN via multicast discovery and print a one-line summary
+   (id + payload length) per received sample. SECONDS 0 = forever (Ctrl-C)."
+  (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x6c) :domain domain
+                                       :multicast t :advertise-address advertise-address)))
+    (dds.disc:add-local-reader node :topic "LargeData" :type "LargeData"
+                               :reliability dds.rtps.discovery:+reliability-reliable+)
+    (dds.disc:enable-subscriber node)
+    (dds.disc:start-node node)
+    (format t "~&[large-sub] LargeData domain=~d (multicast 239.255.0.1). Ctrl-C to stop.~%" domain)
+    (let ((printed (make-hash-table :test 'eql))
+          (last 0) (seen 0) (start (get-internal-real-time)))
+      (unwind-protect
+           (loop
+             (setf last (%reannounce node last))
+             (dolist (sn (sort (dds.disc:node-sample-sns node) #'<))
+               (unless (gethash sn printed)
+                 (setf (gethash sn printed) t)
+                 (handler-case
+                     (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-large-data)))
+                       (declare (type large-data s))
+                       (format t "~&[large-sub] id=~d payload-length=~d~%"
+                               (large-data-id s) (length (large-data-payload s)))
+                       (incf seen))
+                   (error (e)
+                     (format t "~&[large-sub] sn=~d: cannot parse LargeData (~a)~%" sn (type-of e))))))
+             (when (and (plusp seconds)
+                        (> (/ (- (get-internal-real-time) start) internal-time-units-per-second)
+                           seconds))
+               (return))
+             (sleep 0.05))
+        (dds.disc:stop-node node)
+        (format t "~&[large-sub] stopped; received ~d samples.~%" seen))
       t)))

@@ -10,12 +10,13 @@ LISP  ?= $(CLASP)
 
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
-        square-pub square-sub square-spy bench mem sbom hooks clean
+        square-pub square-sub square-spy large-pub large-sub bench mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
 ADVERTISE ?= 127.0.0.1
 TYPE     ?= tagged
+SIZE     ?= 8000
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -73,6 +74,17 @@ square-sub:
 square-spy:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-spy :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
+
+# LargeData pub/sub harness (DATA_FRAG interop testing). SIZE overrides payload octets.
+large-pub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-large-publisher :domain $(DOMAIN) :size $(SIZE) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
+
+large-sub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-large-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
 	        --eval '(uiop:quit 0)'
 
 interop: wire
