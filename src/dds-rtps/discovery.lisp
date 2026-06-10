@@ -22,6 +22,24 @@
 (defconstant +entityid-sedp-sub-reader+ #x000004c7
   "SEDPbuiltinSubscriptionsReader EntityId {{00,00,04},c7} (RTPS 2.5 §9.3.1.3 Table 9.2).")
 
+;; TypeLookup builtin-endpoint bits (XTypes 1.3 §7.6.3.3.4 Table 62).
+(defconstant +be-tl-request-writer+ (ash 1 12)
+  "TypeLookupServiceRequestDataWriter availableBuiltinEndpoints bit (XTypes 1.3 Table 62).")
+(defconstant +be-tl-request-reader+ (ash 1 13)
+  "TypeLookupServiceRequestDataReader availableBuiltinEndpoints bit (XTypes 1.3 Table 62).")
+(defconstant +be-tl-reply-writer+ (ash 1 14)
+  "TypeLookupServiceReplyDataWriter availableBuiltinEndpoints bit (XTypes 1.3 Table 62).")
+(defconstant +be-tl-reply-reader+ (ash 1 15)
+  "TypeLookupServiceReplyDataReader availableBuiltinEndpoints bit (XTypes 1.3 Table 62).")
+(defconstant +builtin-endpoint-set-default+
+  (logior #x0000043F
+          +be-tl-request-writer+ +be-tl-request-reader+
+          +be-tl-reply-writer+ +be-tl-reply-reader+)
+  "Default availableBuiltinEndpoints mask we announce in SPDP: SPDP/SEDP announcer+
+   detector bits 0-5 and ParticipantMessage writer bit 10 (BuiltinEndpointSet_t,
+   RTPS 2.5 §9.3.2.12) plus the four TypeLookup service bits 12-15 (XTypes 1.3
+   §7.6.3.3.4 Table 62).")
+
 (defconstant +locator-bytes+ 24
   "Locator_t size = {long kind; unsigned long port; octet address[16];} = 24 octets (RTPS 2.5 §9.3.2.1).")
 
@@ -259,7 +277,7 @@
                                  :version-major 2 :version-minor 5 :vendor-id #x010F
                                  :default-unicast-locators (list du0 du1)
                                  :metatraffic-unicast-locators (list mt)
-                                 :lease-duration-seconds 30 :builtin-endpoint-set #x0000043F))
+                                 :lease-duration-seconds 30 :builtin-endpoint-set +builtin-endpoint-set-default+))
            (ob (dds.core.buffer:make-octet-buffer 512))
            (wc (dds.core.buffer:cursor ob :endianness :little)))
       (serialize-spdp-data wc data)
@@ -283,7 +301,7 @@
           (assert (= (locator-port (first mlocs)) 7410) () "metatraffic port mismatch")
           (assert (string= (locator-ipv4-string (first mlocs)) "127.0.0.1") () "metatraffic addr mismatch"))
         (assert (= (spdp-data-lease-duration-seconds back) 30) () "lease mismatch")
-        (assert (= (spdp-data-builtin-endpoint-set back) #x0000043F) () "endpoint-set mismatch")
+        (assert (= (spdp-data-builtin-endpoint-set back) +builtin-endpoint-set-default+) () "endpoint-set mismatch")
         (values t back)))))
 
 ;;;; ---- SEDP: Simple Endpoint Discovery Protocol (RTPS 2.5 §8.5.4 / §9.6.2.2).

@@ -1,7 +1,7 @@
 # XTypes TypeLookup service with assignability-gated matching + Connext interop
 
 - **Date:** 2026-06-10
-- **Status:** Design — approved for planning
+- **Status:** Design — approved for planning. **AMENDED by ADR 0010 (same day): the Stage-0 probe proved Connext 7.3.1 does not implement the standard TypeLookup service (vendor-documented). DoD re-scoped: offline conformance now + Fast DDS under FR-IO-2; Connext type-gating via the legacy-0x8021 parse (follow-on feature). §10 risk 1 materialized as designed.**
 - **Area:** L3 type system (service-type codecs, MinimalTypeObject deserializer), L5 discovery (builtin request/reply endpoints, match gating), interop harness
 - **Requirements:** FR-TYPE-3 (TypeLookup service), FR-TYPE-4 (assignability / TYPE_CONSISTENCY_ENFORCEMENT at match time), FR-IO-1 (Connext interop), NFR-SEC-POSTURE (bounds + resource guards), the operating contract §4 (the wire is the oracle) and §6 (gates)
 

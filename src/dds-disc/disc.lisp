@@ -143,7 +143,7 @@
      :default-unicast-locators (list loc)
      :metatraffic-unicast-locators (list loc)
      :lease-duration-seconds 100
-     :builtin-endpoint-set #x0000043F)))
+     :builtin-endpoint-set dds.rtps.discovery:+builtin-endpoint-set-default+)))
 
 (defun* %send-paramlist (node reader-id writer-id sn serialize-fn host port)
     (function (disc-node (unsigned-byte 32) (unsigned-byte 32) integer function string (unsigned-byte 16)) t)

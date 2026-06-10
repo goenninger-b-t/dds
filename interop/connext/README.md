@@ -139,3 +139,34 @@ TypeObject — and NO `PID_TYPE_INFORMATION` (0x0075)**; the dissector decompres
 this wire** (see the Finding above and ADR 0009). To obtain a minimal hash you need a peer
 that emits `0x0075` — test a **foreign-vendor** subscriber (our `make square-sub`) or a
 type past Connext's inline-TypeObject size threshold.
+
+## TypeLookup probe (2026-06-10)
+
+**Task 0.1 of the TypeLookup plan** (`docs/superpowers/plans/2026-06-10-typelookup-service.md`).
+We announced `availableBuiltinEndpoints = #x0000F43F` — the base RTPS 2.5 §9.3.2.12
+builtin-endpoint mask plus the four XTypes 1.3 Table 62 bits (12–15) for the standard
+TypeLookup service — and probed live RTI Connext 7.3.1 in both pub and sub directions.
+
+**What the wire showed (pcaps `tl-probe-runA-lo0.pcap`, `tl-probe-runB-lo0.pcap`, git-ignored):**
+
+- Connext's own `availableBuiltinEndpoints` = `0x00000c3f` — **bits 12–15 clear**: it
+  announces no TypeLookup endpoints.
+- Connext emitted **no `PID_TYPE_INFORMATION` (0x0075)** even with our bits set — only the
+  vendor **`PID_TYPE_OBJECT_LB` (0x8021)** (ZLIB-compressed complete TypeObject), unchanged
+  from the ADR 0009 finding.
+- Connext instead announces a vendor service channel: **`PID_VENDOR_BUILTIN_ENDPOINT_SET`
+  (0x8017) = 0x3**, carrying vendor ServiceRequest endpoints `0x00020082` and `0x00020087`.
+- **No standard TypeLookup submessages** were observed in either direction across either run.
+
+**Confirmation from RTI documentation:** RTI's Extensible Types Guide (7.3.1, ch. 1) lists
+**"TypeObject v2"** and **"Builtin TypeLookup service"** as unsupported. This is vendor
+policy, not configuration.
+
+**ShapeType minimal EquivalenceHash recorded for future oracle:**
+`BF E2 A6 2E D8 11 AC 46 3C 40 C9 7D 30 EE` (self-consistent regression vector; not
+confirmable against RTI peers — see ADR 0009 re. string-255 type divergence).
+
+**Consequence (ADR 0010):** the standard TypeLookup service is proven offline and will be
+validated against a compliant peer (Fast DDS, under FR-IO-2). Connext type-compatibility
+gating continues via the legacy `PID_TYPE_OBJECT_LB` (0x8021) path established in ADR 0009.
+The STOP-gate from Task 0.1 is accepted; see `docs/adr/0010-typelookup-connext-gap.md`.

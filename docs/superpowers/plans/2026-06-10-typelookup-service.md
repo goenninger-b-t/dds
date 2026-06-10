@@ -238,9 +238,19 @@ with a docstring on `+builtin-endpoint-set-default+` (it is API-visible) citing 
 
 ---
 
-## STAGE 5 — Live bidirectional Connext gate
+## STAGE 5 — Conformance closeout (RE-SCOPED by ADR 0010)
 
-### Task 5.1: Connext consumes our server
+> **ADR 0010 (2026-06-10):** the Stage-0 probe proved (wire + RTI's Extensible Types Guide) that Connext 7.3.1 does not implement the standard TypeLookup service — bits 12–15 clear, no 0x0075, vendor ServiceRequest channel instead. Tasks 5.1/5.2's Connext-live directions are RETIRED; live peer proof moves to the FR-IO-2 Fast DDS work, and live Connext type-gating moves to the legacy-0x8021 follow-on plan. Replacement closeout below.
+
+### Task 5.1 (revised): Offline conformance closeout + self-pinned vectors
+
+- [ ] **Step 1:** Lock our own emitted request and reply octets (from the Task 3.2 offline two-node run) as byte-shape regression vectors in `xtypes-test.lisp` (decode-field assertions + re-encode equality), marked `CONFIRM-VS-PEER` pending a Fast DDS oracle.
+- [ ] **Step 2:** `make wire`: our TypeLookup DATA submessages must dissect cleanly in tshark (the dissector decodes standard TypeLookup — its parse IS an independent oracle for the framing; fix discrepancies it reveals, clause-cited).
+- [ ] **Step 3:** Suite + all gates; commit — `test(types): self-pinned TypeLookup vectors + tshark framing validation (ADR 0010)`.
+
+### ~~Task 5.2: We consume Connext's server~~ (RETIRED by ADR 0010 — moves to the Fast DDS / FR-IO-2 plan)
+
+### Task 5.3: Docs + verification closeout
 
 - [ ] **Step 1:** `make square-pub` (ours) ↔ `CONNEXT_VERBOSE=1 rtiddsspy` (in `$NDDSHOME/bin`) AND/OR `shapes_sub`; capture lo0. Acceptance: Connext issues `TypeLookup_Request` to us (capture shows DATA to `0x000300c4`), our reply DATA from `0x000301c3` follows, no RTI error logged, and — the end-to-end proof — **rtiddsspy prints our ShapeType samples with decoded fields** (spy needs the TypeObject; name-matching alone cannot decode). If Connext never queries despite the Stage-0 findings, re-check our SPDP bits + its STATUS_ALL log before concluding; record whatever the wire shows.
 - [ ] **Step 2:** Lock the captured Connext request as a byte-exact vector test (decode + our `parse-type-lookup-request` field assertions; mirror `connext-data-frag-vector`'s provenance style), and our accepted reply bytes as the encode pin. Fix any codec discrepancy revealed (clause-cited).

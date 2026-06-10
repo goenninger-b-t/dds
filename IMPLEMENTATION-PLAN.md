@@ -138,7 +138,7 @@ Effort is expressed in **sequence and dependency**, not calendar dates (calendar
 
 ### M4 — P3 XTypes
 - A5 delivers TypeObject/TypeIdentifier (Minimal+Complete), TypeLookup builtin endpoints, assignability + TYPE_CONSISTENCY_ENFORCEMENT, full annotation set, DynamicType/DynamicData (reflective, off hot path).
-- **Exit (P3):** assignability matrix passes; remote type discovery via TypeLookup interoperates with Connext; appendable/mutable evolution scenarios pass both directions.
+- **Exit (P3):** assignability matrix passes; remote type discovery via TypeLookup interoperates with a compliant peer (offline conformance now; Fast DDS under FR-IO-2) and type-compatibility assessment interoperates with Connext via its legacy TypeObject announcement (ADR 0010 — Connext does not implement the standard TypeLookup service); appendable/mutable evolution scenarios pass both directions.
 
 ### M5 — P4 Performance differentiators (the "Professional delta")
 - A10 delivers, in this order: **batching** → **async + flow controllers** → **DATA_FRAG fragmentation pacing** (coordinated with A6) → **SHMEM transport** (A9) → **Zero-Copy-over-SHMEM** → **FlatData-equivalent binding** (A5 emits Offset/Builder) → **LZ4 compression**.

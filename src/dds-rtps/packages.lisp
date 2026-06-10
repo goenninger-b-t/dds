@@ -106,6 +106,9 @@
            #:+entityid-spdp-writer+ #:+entityid-spdp-reader+
            #:+entityid-sedp-pub-writer+ #:+entityid-sedp-pub-reader+
            #:+entityid-sedp-sub-writer+ #:+entityid-sedp-sub-reader+
+           #:+be-tl-request-writer+ #:+be-tl-request-reader+
+           #:+be-tl-reply-writer+ #:+be-tl-reply-reader+
+           #:+builtin-endpoint-set-default+
            #:write-locator #:read-locator #:make-ipv4-locator
            #:locator #:make-locator #:locator-p
            #:locator-kind #:locator-port #:locator-address
