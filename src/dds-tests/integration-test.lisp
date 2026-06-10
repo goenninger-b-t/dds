@@ -1228,7 +1228,7 @@
     (dds.rtps.message:write-parameter wc dds.rtps.message:+pid-type-object-lb+ lb 0 (length lb))
     (dds.rtps.message:write-parameter-sentinel wc)
     (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
-           (ep (dds.rtps.discovery:parse-endpoint-data rc)))
+           (ep (dds.rtps.discovery:parse-endpoint-data rc :writer)))
       (%check :tol-sedp-capture
               (equalp (dds.rtps.discovery:endpoint-data-type-object-lb ep) lb)
               "parse-endpoint-data captures PID_TYPE_OBJECT_LB opaque")
@@ -1391,7 +1391,7 @@
          (buf (dds.core.buffer:make-octet-buffer 1024)))
     (dds.rtps.discovery:serialize-endpoint-data (dds.core.buffer:cursor buf :endianness :little) ep)
     (let ((back (dds.rtps.discovery:parse-endpoint-data
-                 (dds.core.buffer:cursor buf :endianness :little))))
+                 (dds.core.buffer:cursor buf :endianness :little) :writer)))
       (%check :sedp-ti-present
               (and back (dds.rtps.discovery:endpoint-data-type-information back) t)
               "the parsed endpoint must carry PID_TYPE_INFORMATION")
@@ -1403,4 +1403,65 @@
       (%check :sedp-ti-typename
               (string= "dcps-msg" (dds.rtps.discovery:endpoint-data-type-name back))
               "type-name still round-trips alongside type-information")))
+  t)
+
+;;; SEDP per-role QoS defaults: an ABSENT parameter assumes its default (RTPS 2.5 §9.4.2.11.2).
+
+(defun* %paramlist-without-pid (ep pid)
+    (function (dds.rtps.discovery:endpoint-data (unsigned-byte 16)) dds.core.buffer:octet-buffer)
+  "Serialize EP as a SEDP ParameterList, re-emitted with every parameter whose id equals PID removed."
+  (let* ((src (dds.core.buffer:make-octet-buffer 512))
+         (dst (dds.core.buffer:make-octet-buffer 512))
+         (out (dds.core.buffer:cursor dst :endianness :little)))
+    (dds.rtps.discovery:serialize-endpoint-data (dds.core.buffer:cursor src :endianness :little) ep)
+    (dds.rtps.message:parse-parameter-list
+     (dds.core.buffer:cursor src :endianness :little)
+     (lambda (p c len)
+       (unless (= p pid)
+         (let ((v (make-array len :element-type '(unsigned-byte 8))))
+           (dds.core.buffer:get-octets c v 0 len)
+           (dds.rtps.message:write-parameter out p v 0 len)))))
+    (dds.rtps.message:write-parameter-sentinel out)
+    dst))
+
+(defun* run-sedp-default-reliability-test ()
+    (function () t)
+  "An SEDP ParameterList WITHOUT PID_RELIABILITY assumes the per-role default (RTPS 2.5
+   §9.4.2.11.2; DDS 1.4 §2.2.3): role :writer -> RELIABLE, role :reader -> BEST_EFFORT —
+   RTI Connext elides default-valued PIDs. An explicit PID_RELIABILITY still overrides."
+  (flet ((parse (buf role)
+           (dds.rtps.discovery:parse-endpoint-data
+            (dds.core.buffer:cursor buf :endianness :little) role))
+         (ser (rel)
+           (let ((buf (dds.core.buffer:make-octet-buffer 512)))
+             (dds.rtps.discovery:serialize-endpoint-data
+              (dds.core.buffer:cursor buf :endianness :little)
+              (dds.rtps.discovery:make-endpoint-data
+               :topic-name "Square" :type-name "ShapeType"
+               :qos (dds.qos:make-qos :reliability rel)))
+             buf)))
+    (let* ((ep (dds.rtps.discovery:make-endpoint-data
+                :topic-name "Square" :type-name "ShapeType"
+                :qos (dds.qos:make-qos :reliability :reliable)))
+           (stripped (%paramlist-without-pid ep dds.rtps.message:+pid-reliability+))
+           (w (parse stripped :writer))
+           (r (parse stripped :reader)))
+      (%check :sedp-default-writer
+              (and w (eq :reliable (dds.qos:qos-reliability (dds.rtps.discovery:endpoint-data-qos w))))
+              "absent PID_RELIABILITY on a DCPSPublication must default to RELIABLE")
+      (%check :sedp-default-reader
+              (and r (eq :best-effort (dds.qos:qos-reliability (dds.rtps.discovery:endpoint-data-qos r))))
+              "absent PID_RELIABILITY on a DCPSSubscription must default to BEST_EFFORT")
+      (%check :sedp-default-topic
+              (and w (string= "Square" (dds.rtps.discovery:endpoint-data-topic-name w))
+                   (string= "ShapeType" (dds.rtps.discovery:endpoint-data-type-name w)))
+              "topic/type names still parse from the stripped ParameterList"))
+    (let ((w (parse (ser :best-effort) :writer))
+          (r (parse (ser :reliable) :reader)))
+      (%check :sedp-explicit-writer
+              (eq :best-effort (dds.qos:qos-reliability (dds.rtps.discovery:endpoint-data-qos w)))
+              "an explicit BEST_EFFORT PID_RELIABILITY overrides the writer RELIABLE default")
+      (%check :sedp-explicit-reader
+              (eq :reliable (dds.qos:qos-reliability (dds.rtps.discovery:endpoint-data-qos r)))
+              "an explicit RELIABLE PID_RELIABILITY overrides the reader BEST_EFFORT default")))
   t)

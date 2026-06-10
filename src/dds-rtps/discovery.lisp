@@ -402,11 +402,17 @@
          (setf (endpoint-data-type-object-lb data) lb)))))
   data)
 
-(defun* parse-endpoint-data (cursor)
-    (function (dds.core.buffer:cursor) t)
+(defun* parse-endpoint-data (cursor role)
+    (function (dds.core.buffer:cursor (member :writer :reader)) t)
   "Parse a SEDP ParameterList into an ENDPOINT-DATA struct, or NIL if the list is
-   truncated (RTPS 2.5 §8.5.4 / §9.4.2.11). Bounds-checked via PARSE-PARAMETER-LIST."
-  (let ((data (make-endpoint-data)))
+   truncated (RTPS 2.5 §8.5.4 / §9.4.2.11). Bounds-checked via PARSE-PARAMETER-LIST.
+   The required ROLE seeds the QoS defaults an ABSENT parameter must assume (RTPS 2.5 §9.4.2.11.2):
+   a DCPSPublication (:writer) defaults RELIABILITY to RELIABLE, a DCPSSubscription
+   (:reader) to BEST_EFFORT (DDS 1.4 §2.2.3 RELIABILITY) — RTI Connext elides
+   default-valued PIDs, so a reliable Connext writer carries NO PID_RELIABILITY."
+  (let ((data (make-endpoint-data :qos (if (eq role :writer)
+                                           (dds.qos:make-writer-qos)
+                                           (dds.qos:make-reader-qos)))))
     (if (dds.rtps.message:parse-parameter-list
          cursor (lambda (pid c len) (%fill-endpoint-param data pid c len)))
         data
@@ -446,7 +452,7 @@
          (wc (dds.core.buffer:cursor ob :endianness :little)))
     (serialize-endpoint-data wc data)
     (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
-           (back (parse-endpoint-data rc)))
+           (back (parse-endpoint-data rc :writer)))
       (assert back () "parse-endpoint-data returned NIL")
       (assert (equalp (endpoint-data-guid back) guid) () "guid mismatch")
       (assert (string= (endpoint-data-topic-name back) "Square") () "topic-name mismatch")

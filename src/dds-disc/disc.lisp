@@ -528,7 +528,7 @@
                  (let ((pc (dds.core.buffer:cursor buf :endianness :little)))
                    (dds.core.buffer:cursor-set-position pc poff)
                    (dds.cdr:parse-encapsulation-header pc)
-                   (let ((ep (dds.rtps.discovery:parse-endpoint-data pc)))
+                   (let ((ep (dds.rtps.discovery:parse-endpoint-data pc :writer)))
                      (when ep
                        (dds.pal:with-lock ((disc-node-lock node))
                          (%record-discovered (disc-node-discovered-writers node) ep))
@@ -538,7 +538,7 @@
                  (let ((pc (dds.core.buffer:cursor buf :endianness :little)))
                    (dds.core.buffer:cursor-set-position pc poff)
                    (dds.cdr:parse-encapsulation-header pc)
-                   (let ((ep (dds.rtps.discovery:parse-endpoint-data pc)))
+                   (let ((ep (dds.rtps.discovery:parse-endpoint-data pc :reader)))
                      (when ep
                        (dds.pal:with-lock ((disc-node-lock node))
                          (%record-discovered (disc-node-discovered-readers node) ep))

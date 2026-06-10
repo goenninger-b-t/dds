@@ -237,6 +237,7 @@
                  ("sedp-type-object-lb"      . run-sedp-type-object-lb-test)
                  ("xtypes-type-compat-soft"  . run-type-compat-soft-test)
                  ("sedp-type-information"    . run-sedp-type-information-test)
+                 ("sedp-default-reliability" . run-sedp-default-reliability-test)
                  ("zero-alloc-into"          . run-generated-into-test)
                  ("rtps-wire-byte-exact"     . run-rtps-wire-test)
                  ("rtps-seqnum-bitmap"       . run-rtps-seqnum-test)

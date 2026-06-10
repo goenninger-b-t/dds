@@ -67,7 +67,7 @@ type names, the QoS carried for RxO matching, and optional `PID_TYPE_INFORMATION
 - `dds.rtps.discovery:endpoint-data` / `endpoint-data-p` — the struct type and predicate.
 - Accessors: `endpoint-data-guid`, `endpoint-data-topic-name`, `endpoint-data-type-name`, `endpoint-data-qos`, `endpoint-data-type-information`.
 - `dds.rtps.discovery:serialize-endpoint-data` *(cursor data)* — serialize as a `ParameterList` terminated by `PID_SENTINEL` (§8.5.4 / §9.4.2.11). Emits `PID_TYPE_INFORMATION` only when present (peers skip unknown PIDs).
-- `dds.rtps.discovery:parse-endpoint-data` *(cursor)* — parse a SEDP `ParameterList` into an `endpoint-data` struct, or `NIL` if truncated. Bounds-checked.
+- `dds.rtps.discovery:parse-endpoint-data` *(cursor role)* — parse a SEDP `ParameterList` into an `endpoint-data` struct, or `NIL` if truncated. Bounds-checked. The required `ROLE` (`:writer` / `:reader`) seeds the QoS defaults an **absent** parameter must assume (RTPS 2.5 §9.4.2.11.2): a DCPSPublication defaults RELIABILITY to RELIABLE, a DCPSSubscription to BEST_EFFORT (DDS 1.4 §2.2.3). RTI Connext elides default-valued PIDs, so a reliable Connext writer carries **no** `PID_RELIABILITY` — parsing it with reader defaults would fail the RxO check and silently prevent the match.
 - `dds.rtps.discovery:endpoint-match-p` *(writer-data reader-data)* — `(values MATCH-P INCOMPATIBLE)`: topic + type names equal AND the offered (writer) QoS is RxO-compatible with the requested (reader) QoS (the full DDS 1.4 §2.2.3 table via `dds.qos:qos-rxo-compatible`). `INCOMPATIBLE` is the failing-policy list; `'(:topic-or-type)` on a name mismatch.
 - `dds.rtps.discovery:run-sedp-test` — standalone round-trip + RxO truth-table check.
 
