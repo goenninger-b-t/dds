@@ -70,10 +70,10 @@ Conformance profiles and where they stand (the canonical, per-requirement matrix
 | Profile | What | State |
 |---|---|---|
 | **P0** CDR core | XCDR1 + XCDR2 codec, encapsulation, alignment | **partial** — primitives/strings/sequences/structs + DHEADER/EMHEADER pinned & spec-seed byte-exact; full RTI reference-vector corpus pending |
-| **P1** Minimal RTPS | submessages, reliable + best-effort writer/reader, SPDP+SEDP, UDPv4 uni/multicast | **partial** — engine + discovery + data plane run over real UDP, tshark-validated; **bidirectional Connext Shapes interop pending a Connext install** |
+| **P1** Minimal RTPS | submessages, reliable + best-effort writer/reader, SPDP+SEDP, UDPv4 uni/multicast | **partial** — engine + discovery + data plane run over real UDP, tshark-validated; **bidirectional Connext Shapes interop achieved 2026-06-09** (live RTI Connext 7.3.1, reliable, both directions); **fragmented large-sample interop (DATA_FRAG + HEARTBEAT_FRAG + NACK_FRAG) achieved 2026-06-10** — 8000-octet LargeData byte-exact both ways, incl. forced-fragment-loss recovery where Connext's NACK_FRAG is answered with exactly the missing fragments |
 | **P2** DCPS | entities, full QoS + RxO matching, conditions/WaitSets, instances, read/take, content-filtered topics, builtin topics | **complete** (offline conformance) |
 | **P3** XTypes | TypeObject/TypeIdentifier, assignability + `TYPE_CONSISTENCY_ENFORCEMENT`, XCDR2 TypeObject serializer + EquivalenceHash, `TypeInformation` over SEDP, inbound Connext `PID_TYPE_OBJECT_LB` reader + advisory type-compat | **in progress** — all of the above landed; the serializer's canonical bytes are **provisional pending Connext confirmation**; the inbound `PID_TYPE_OBJECT_LB` path is ZLIB-inflate + a name fingerprint feeding an **advisory** match-time verdict (never a gate — ADR 0009), the full RTI-legacy structural parse + TypeLookup + DynamicData deferred |
-| **P4** Performance differentiators | batching, async/flow-control, SHMEM, Zero-Copy, FlatData, LZ4, DATA_FRAG | **not started** |
+| **P4** Performance differentiators | batching, async/flow-control, SHMEM, Zero-Copy, FlatData, LZ4 | **not started** — except large-sample fragmentation (DATA_FRAG), pulled forward and Connext-validated under P1 |
 | **P5** Durability/late-joiner | TRANSIENT_LOCAL, durable writer history, large-data | **not started** |
 | **P6** Security (gated) | the five DDS-Security plugins | **not started** |
 | **P7** Tooling/services (gated) | spy, IDL parser, monitoring | partial (a Shapes harness + tshark wire gate exist) |
@@ -81,8 +81,11 @@ Conformance profiles and where they stand (the canonical, per-requirement matrix
 **Verification right now:** unit/integration suite **green on SBCL and Clasp** (latest run:
 all tests passing); quality gates green — `gate-types` (every function is `ftype`-declared),
 `gate-hotpath` (no CLOS/alloc in hot-path packages), `mem` (0 bytes/sample), `wire` (tshark
-RTPS dissector). Connext interop is staged but **not yet run** (needs a Connext install; the
-harness is in [`interop/connext/`](interop/connext/)).
+RTPS dissector). **Live Connext interop has run** against RTI Connext 7.3.1 (the harness +
+oracle apps are in [`interop/connext/`](interop/connext/)): bidirectional reliable ShapeType
+exchange and bidirectional fragmented LargeData exchange (`make large-pub` / `make large-sub`;
+`DROP=3` injects fragment loss to exercise NACK_FRAG recovery), tshark-validated on `lo0`
+captures.
 
 ---
 
