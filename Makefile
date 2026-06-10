@@ -17,6 +17,7 @@ COLOR    ?= BLUE
 ADVERTISE ?= 127.0.0.1
 TYPE     ?= tagged
 SIZE     ?= 8000
+DROP     ?=
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -76,10 +77,10 @@ square-spy:
 	        --eval '(uiop:symbol-call :dds.shapes :run-spy :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
 	        --eval '(uiop:quit 0)'
 
-# LargeData pub/sub harness (DATA_FRAG interop testing). SIZE overrides payload octets.
+# LargeData DATA_FRAG harness; SIZE=payload octets, DROP=3 injects fragment loss for NACK_FRAG recovery
 large-pub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-large-publisher :domain $(DOMAIN) :size $(SIZE) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-large-publisher :domain $(DOMAIN) :size $(SIZE) :advertise-address "$(ADVERTISE)" :drop-fragments (quote ($(DROP))))' \
 	        --eval '(uiop:quit 0)'
 
 large-sub:

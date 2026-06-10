@@ -96,11 +96,20 @@
                 (when (and hp (plusp (cdr hp)))
                   (pushnew hp dests :test #'equal))))))))))
 
+(defparameter *debug-drop-fragment-numbers* nil
+  "Debug-only fragment-loss injection (default NIL = off): a list of 1-based fragment
+   numbers that %SEND-SAMPLE silently SKIPS when fragmenting a sample into DATA_FRAGs
+   (both the initial push and sample-level ACKNACK retransmits). NACK_FRAG-driven
+   resends (%ON-USER-NACK-FRAG) are NOT filtered, so the only recovery path for a
+   dropped fragment is the peer's NACK_FRAG — proving fragment-level reliability
+   against a live peer (RTPS 2.5 §8.3.8.12 NackFrag). Never set in production.")
+
 (defun* %send-sample (node buf sn pl host port)
     (function (disc-node dds.core.buffer:octet-buffer integer (simple-array (unsigned-byte 8) (*)) string (unsigned-byte 16)) t)
   "Send sample (SN, PL) to HOST:PORT: one DATA submessage if PL fits *fragment-size*, else a
    series of DATA_FRAG submessages (packing as many fragments as fit the datagram) followed by
-   a HEARTBEAT_FRAG. Uses BUF (tx-msg or rx-tx-msg) as the scratch message buffer."
+   a HEARTBEAT_FRAG. Uses BUF (tx-msg or rx-tx-msg) as the scratch message buffer. A submessage
+   containing a fragment named in *DEBUG-DROP-FRAGMENT-NUMBERS* is skipped (loss injection)."
   (let ((size (length pl)))
     (if (<= size dds.rtps.reliable:*fragment-size*)
         (%send-msg-buf node buf
@@ -110,11 +119,14 @@
         (let ((budget (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
           (dolist (desc (dds.rtps.reliable:writer-frag-plan size dds.rtps.reliable:*fragment-size* budget))
             (destructuring-bind (fstart fcount off len) desc
-              (%send-msg-buf node buf
-                             (lambda (mc) (dds.rtps.message:write-data-frag
-                                           mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn size
-                                           fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
-                             host port)))
+              (unless (and *debug-drop-fragment-numbers*
+                           (loop for f from fstart below (+ fstart fcount)
+                                   thereis (member f *debug-drop-fragment-numbers*)))
+                (%send-msg-buf node buf
+                               (lambda (mc) (dds.rtps.message:write-data-frag
+                                             mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn size
+                                             fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
+                               host port))))
           (multiple-value-bind (lastfrag cnt)
               (dds.rtps.reliable:writer-frag-heartbeat (disc-node-user-writer node) sn)
             (when lastfrag

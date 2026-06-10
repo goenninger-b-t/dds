@@ -24,6 +24,7 @@
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:publish-sample #:node-sample-count #:node-sample #:node-sample-sns
+           #:*debug-drop-fragment-numbers*
            #:node-discovered-participants #:resolved-destination #:node-acks-in
            #:disc-node-discovered-writers-list #:disc-node-discovered-readers-list
            #:run-spdp-discovery-test #:run-sedp-discovery-test

@@ -116,11 +116,19 @@ Optional callbacks the [DCPS](dcps.md) layer installs to surface events to the a
 
 Wires the value-level reliable writer/reader (`dds.rtps.reliable`) to UDP. For v1 the
 user/metatraffic share one socket (routing is by EntityId), peers double as the data
-destination, and the `SerializedPayload` is opaque bytes.
+destination, and the `SerializedPayload` is opaque bytes. A sample larger than
+`dds.rtps.reliable:*fragment-size*` is sent as a series of **DATA_FRAG** submessages plus a
+**HEARTBEAT_FRAG** (then the usual sample-level HEARTBEAT); inbound DATA_FRAGs are reassembled
+per (writer, SN) with `*max-reassembly-bytes*`/`*max-reassembly-fragments*` guards, a
+HEARTBEAT_FRAG is answered with a NACK_FRAG naming the still-missing fragments, and a peer's
+NACK_FRAG is answered by resending exactly the named fragments (RTPS 2.5 §8.3.8.3 / §9.4.5.5;
+validated live against RTI Connext 7.3.1 in both directions, including forced-loss NACK_FRAG
+recovery).
 
-- `dds.disc:enable-publisher` *(node)* — give the node a reliable user writer (KEEP_ALL) and install the writer-side data-plane hook (retransmit on ACKNACK). Call after `add-local-writer`.
-- `dds.disc:enable-subscriber` *(node)* — give the node a reliable user reader and install the reader-side hooks (store DATA, ACKNACK on HEARTBEAT). Call after `add-local-reader`.
-- `dds.disc:publish-sample` *(node payload)* — publish an opaque `SerializedPayload` on the node's user writer: add it to the writer HistoryCache, then push DATA + HEARTBEAT to matched peers (FR-RTPS-8).
+- `dds.disc:enable-publisher` *(node)* — give the node a reliable user writer (KEEP_ALL) and install the writer-side data-plane hooks (retransmit on ACKNACK; resend named fragments on NACK_FRAG). Call after `add-local-writer`.
+- `dds.disc:enable-subscriber` *(node)* — give the node a reliable user reader and install the reader-side hooks (store DATA, ACKNACK on HEARTBEAT, reassemble DATA_FRAG, NACK_FRAG on HEARTBEAT_FRAG). Call after `add-local-reader`.
+- `dds.disc:publish-sample` *(node payload)* — publish an opaque `SerializedPayload` on the node's user writer: add it to the writer HistoryCache, then push DATA (or DATA_FRAGs + HEARTBEAT_FRAG) + HEARTBEAT to matched peers (FR-RTPS-8).
+- `dds.disc:*debug-drop-fragment-numbers*` — debug-only fragment-loss injection (default `NIL` = off): a list of 1-based fragment numbers the send path silently withholds when fragmenting (initial push **and** sample-level ACKNACK retransmits) — the whole packed `DATA_FRAG` submessage is withheld if **any** fragment it contains is named; NACK_FRAG-driven resends are not filtered, so the peer's NACK_FRAG is the only recovery path — the live proof of fragment-level reliability. Never set in production. (`make large-pub DROP=3` sets it via `run-large-publisher :drop-fragments`.)
 - `dds.disc:node-sample-count` *(node)* — number of distinct user samples the subscriber has received.
 - `dds.disc:node-sample` *(node sn)* — the received payload for sequence number `SN`, or `NIL`.
 - `dds.disc:node-sample-sns` *(node)* — sequence numbers of the user samples received so far (unordered; SNs may not start at 1 against Connext).
@@ -134,6 +142,7 @@ Self-contained, runnable end-to-end checks over UDP loopback (no external framew
 - `dds.disc:run-sedp-discovery-test` — SPDP then SEDP: a RELIABLE writer + a BEST_EFFORT reader on the same topic/type match.
 - `dds.disc:run-mcast-discovery-test` — two participants with **no** unicast peers discover purely via multicast SPDP, then match via unicast SEDP.
 - `dds.disc:run-dataplane-test` — full stack: discover, match, then publish a user sample the subscriber receives reliably (asserts exact payload bytes).
+- `dds.disc:run-large-dataplane-test` — same full stack with a 4000-octet sample: the writer fragments into DATA_FRAGs + HEARTBEAT_FRAG, the subscriber reassembles byte-exactly (RTPS 2.5 §9.4.5.5).
 - `dds.disc:run-locator-filter-test` — locator-list selection + foreign-participant robustness (skip `0.0.0.0`, fall back, yield `NIL`, non-fatal send to `0.0.0.0`).
 
 ---

@@ -64,12 +64,13 @@
           do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
-(defun* %serialize-payload (serialize-fn)
-    (function (function) (simple-array (unsigned-byte 8) (*)))
+(defun* %serialize-payload (serialize-fn &optional (capacity 256))
+    (function (function &optional (integer 1)) (simple-array (unsigned-byte 8) (*)))
   "Build a PLAIN_CDR2_LE SerializedPayload: an encapsulation header + whatever
-   SERIALIZE-FN writes (called with the XCDR2 cursor). Returns a fresh octet vector
-   — the data-plane publish payload. Works for either shape type."
-  (let* ((buf (dds.core.buffer:make-octet-buffer 256))
+   SERIALIZE-FN writes (called with the XCDR2 cursor) into a CAPACITY-octet scratch
+   buffer (default 256; pass a larger CAPACITY for large samples). Returns a fresh
+   octet vector — the data-plane publish payload. Works for either shape type."
+  (let* ((buf (dds.core.buffer:make-octet-buffer capacity))
          (wc (dds.core.buffer:cursor buf :endianness :little)))
     (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
     (funcall serialize-fn wc)
@@ -303,12 +304,16 @@
   (payload (:sequence :u8)))
 
 (defun* run-large-publisher (&key (domain 0) (size 8000) (rate 2) (count 0)
-                                  (advertise-address "127.0.0.1"))
+                                  (advertise-address "127.0.0.1") drop-fragments)
     (function (&key (:domain (integer 0)) (:size (integer 1)) (:rate (integer 1))
-                    (:count (integer 0)) (:advertise-address string)) t)
+                    (:count (integer 0)) (:advertise-address string) (:drop-fragments list)) t)
   "Publish LargeData samples on DOMAIN via multicast discovery. SIZE is the octet count of
    the payload (default 8000, well above *fragment-size*=1024); RATE updates/sec; COUNT 0
-   = forever (Ctrl-C). The payload is filled with i*7 mod 256 so the subscriber can verify."
+   = forever (Ctrl-C). The payload is filled with i*7 mod 256 so the subscriber can verify.
+   DROP-FRAGMENTS (a list of 1-based fragment numbers) sets
+   dds.disc:*debug-drop-fragment-numbers* for the duration of the run (globally — the
+   ACKNACK retransmit path runs on the receiver thread): those fragments are never
+   pushed, so a reliable peer must NACK_FRAG them back (fragment-loss injection)."
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x4c) :domain domain
                                        :multicast t :advertise-address advertise-address)))
     (dds.disc:add-local-writer node :topic "LargeData" :type "LargeData"
@@ -320,28 +325,34 @@
     (let ((period (/ 1.0 rate)) (n 0) (last 0)
           (dests (make-hash-table :test 'equalp)))
       (unwind-protect
-           (loop
-             (setf last (%reannounce node last))
-             (dolist (p (dds.disc:node-discovered-participants node))
-               (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix p)))
-                 (unless (gethash prefix dests)
-                   (setf (gethash prefix dests) t)
-                   (let ((d (dds.disc:resolved-destination p)))
-                     (format t "~&[large-pub] peer discovered -> DATA destination ~a~%"
-                             (if d (format nil "~a:~d" (car d) (cdr d))
-                                 "NONE (no routable UDPv4 locator)"))))))
-             (incf n)
-             (let* ((pv (make-array size :element-type '(unsigned-byte 8)))
-                    (sample (make-large-data :id n :payload pv)))
-               (dotimes (i size) (setf (aref pv i) (logand (* i 7) #xff)))
-               (dds.disc:publish-sample
-                node (%serialize-payload
-                      (lambda (wc) (serialize-large-data sample wc :xcdr2)))))
-             (when (zerop (mod n 10))
-               (format t "~&[large-pub] sent ~d samples; size=~d; peers=~d~%"
-                       n size (hash-table-count dests)))
-             (when (and (plusp count) (>= n count)) (return))
-             (sleep period))
+           (progn
+             (when drop-fragments
+               (setf dds.disc:*debug-drop-fragment-numbers* drop-fragments)
+               (format t "~&[large-pub] LOSS INJECTION: dropping fragment(s) ~a on push.~%" drop-fragments))
+             (loop
+               (setf last (%reannounce node last))
+               (dolist (p (dds.disc:node-discovered-participants node))
+                 (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix p)))
+                   (unless (gethash prefix dests)
+                     (setf (gethash prefix dests) t)
+                     (let ((d (dds.disc:resolved-destination p)))
+                       (format t "~&[large-pub] peer discovered -> DATA destination ~a~%"
+                               (if d (format nil "~a:~d" (car d) (cdr d))
+                                   "NONE (no routable UDPv4 locator)"))))))
+               (incf n)
+               (let* ((pv (make-array size :element-type '(unsigned-byte 8)))
+                      (sample (make-large-data :id n :payload pv)))
+                 (dotimes (i size) (setf (aref pv i) (logand (* i 7) #xff)))
+                 (dds.disc:publish-sample
+                  node (%serialize-payload
+                        (lambda (wc) (serialize-large-data sample wc :xcdr2))
+                        (+ size 64))))
+               (when (zerop (mod n 10))
+                 (format t "~&[large-pub] sent ~d samples; size=~d; peers=~d~%"
+                         n size (hash-table-count dests)))
+               (when (and (plusp count) (>= n count)) (return))
+               (sleep period)))
+        (setf dds.disc:*debug-drop-fragment-numbers* nil)
         (dds.disc:stop-node node)
         (format t "~&[large-pub] stopped after ~d samples.~%" n)))
     t))
@@ -349,7 +360,8 @@
 (defun* run-large-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1"))
     (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string)) t)
   "Subscribe to LargeData on DOMAIN via multicast discovery and print a one-line summary
-   (id + payload length) per received sample. SECONDS 0 = forever (Ctrl-C)."
+   (id + payload length + octet-by-octet (i*7) mod 256 pattern verdict) per received
+   sample. SECONDS 0 = forever (Ctrl-C)."
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x6c) :domain domain
                                        :multicast t :advertise-address advertise-address)))
     (dds.disc:add-local-reader node :topic "LargeData" :type "LargeData"
@@ -368,8 +380,12 @@
                  (handler-case
                      (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-large-data)))
                        (declare (type large-data s))
-                       (format t "~&[large-sub] id=~d payload-length=~d~%"
-                               (large-data-id s) (length (large-data-payload s)))
+                       (let* ((pv (large-data-payload s))
+                              (bad (loop for i from 0 below (length pv)
+                                         unless (= (aref pv i) (logand (* i 7) #xff)) return i)))
+                         (format t "~&[large-sub] id=~d payload-length=~d pattern=~a~%"
+                                 (large-data-id s) (length pv)
+                                 (if bad (format nil "BAD@~d" bad) "OK")))
                        (incf seen))
                    (error (e)
                      (format t "~&[large-sub] sn=~d: cannot parse LargeData (~a)~%" sn (type-of e))))))
