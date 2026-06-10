@@ -336,8 +336,19 @@ resend) for the evicted range and a resend for what is still cached. Adapted fro
   fragmented-DATA submessage (flags E=0x01/Q=0x02/K=0x04 pinned from §9.4.5.5; wire order
   `fragmentStartingNum/fragmentsInSubmessage/fragmentSize/sampleSize`); the parser is
   bounds-checked, fuzzed, and rejects the spec-invalid cases (fragmentStartingNum 0, frags 0,
-  fragmentSize > sampleSize). The data-plane reassembly (with `max-fragments`/`max-reassembly-bytes`
-  resource guards) and send-side fragmentation are the next increment.
+  fragmentSize > sampleSize). The reliable engine carries the rest: `reader-on-data-frag`
+  reassembly (guarded by `*max-reassembly-bytes*` / `*max-reassembly-fragments*`),
+  `reader-frag-acknack` (NACK_FRAG generation), `writer-frag-plan` / `writer-frag-plan-for`
+  (fragment packing + NACK_FRAG-named resends), `writer-frag-heartbeat`, `writer-on-nack-frag`;
+  the UDP data plane wires them up (see [Discovery](discovery.md), including the debug-only
+  `dds.disc:*debug-drop-fragment-numbers*` fragment-loss injection used for the live NACK_FRAG
+  proof). Validated bidirectionally against live RTI Connext 7.3.1 (2026-06-10), including
+  forced-fragment-loss recovery driven by Connext's NACK_FRAG. Real Connext-emitted DATA_FRAG
+  and NACK_FRAG submessages are locked as byte-exact regression vectors (decode + re-encode);
+  the NACK_FRAG capture exposed and fixed a wrong `write-nack-frag` octetsToNextHeader
+  (24+4\*M → the spec-correct 28+4\*M, §9.4.5.14 + §9.4.2.8). HEARTBEAT_FRAG has no Connext
+  vector: Connext 7.3.1 heartbeats fragmented samples with plain HEARTBEAT (our stack emits
+  HEARTBEAT_FRAG and Connext accepts it).
 - **HEARTBEAT/ACKNACK/GAP are base forms.** The GroupInfo (G) and Filtered/FilteredCount (F)
   extensions are neither emitted nor parsed in v1.
 - **The reliable state machines are value-level, not byte-level.** `dds.rtps.reliable`

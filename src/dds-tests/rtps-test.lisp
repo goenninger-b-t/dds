@@ -148,6 +148,133 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+;;; Real RTI Connext 7.3.1 DATA_FRAG wire vector (RTPS 2.5 §9.4.5.5): the final
+;;; (7th) fragment of LargeData sample writerSN=2, locked byte-exact in BOTH
+;;; directions. The NACK_FRAG vector is locked below (step3-nackfrag.pcap frame 149).
+;;; HEARTBEAT_FRAG is N/A: Connext 7.3.1 never emitted one in any run — it
+;;; heartbeats fragmented samples with plain HEARTBEAT.
+
+(defun* %connext-data-frag-vector ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The live RTI Connext 7.3.1 DATA_FRAG submessage (320 octets) from frame 101 of
+   interop/connext/large-data/largedata.pcap (captured 2026-06-10): flags=0x01 (E),
+   octetsToNextHeader=316, writerId 0x80000002, writerSN=2, fragmentStartingNum=7,
+   fragmentsInSubmessage=1, fragmentSize=1288, sampleSize=8012, 284-octet payload."
+  (%hex-octets
+   (concatenate 'string
+    "16013c0100001c00000000008000000200000000020000000700000001000805"
+    "4c1f0000fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9"
+    "c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299"
+    "a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b7279"
+    "80878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b5259"
+    "60676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b3239"
+    "40474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b1219"
+    "20272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f9"
+    "00070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9"
+    "e0e7eef5fc030a11181f262d343b424950575e656c737a81888f969da4abb2b9")))
+
+(defun* run-connext-data-frag-vector-test ()
+    (function () t)
+  "Test: byte-exact DATA_FRAG regression vector from a real Connext 7.3.1 capture
+   (largedata.pcap frame 101, tshark-dissected): decode recovers every dissected
+   field + the fragment payload, encode reproduces the submessage byte-for-byte."
+  (let* ((vec (%connext-data-frag-vector))
+         (arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 512 2)))
+    ;; decode: the captured octets must parse to the tshark-dissected field values
+    (let* ((buf (dds.core.arena:pool-acquire pool))
+           (c (dds.core.buffer:cursor buf :endianness :little)))
+      (replace (dds.core.buffer:octet-buffer-vec buf) vec)
+      (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+        (%check :connext-frag-hdr
+                (and (= id dds.rtps.message:+submsg-data-frag+) (= flags #x01)
+                     (= octets 316) le)
+                "captured DATA_FRAG header: id=0x16, flags=0x01 (E), octetsToNextHeader=316")
+        (multiple-value-bind (r w sn ssize fstart frags fsize poff plen keyp)
+            (dds.rtps.message:parse-data-frag-body c flags octets)
+          (%check :connext-frag-body
+                  (and (= r dds.rtps.message:+entityid-unknown+) (= w #x80000002)
+                       (= sn 2) (= ssize 8012) (= fstart 7) (= frags 1)
+                       (= fsize 1288) (= poff 36) (= plen 284) (not keyp))
+                  "captured DATA_FRAG body: dissected field values")
+          (%check :connext-frag-payload
+                  (and (= poff 36) (= (+ poff plen) (length vec)))
+                  "captured DATA_FRAG payload offset/extent (content locked by the encode check)")))
+      (dds.core.arena:pool-release pool buf))
+    ;; encode: write-data-frag with the same inputs must reproduce the capture
+    (let* ((buf (dds.core.arena:pool-acquire pool))
+           (c (dds.core.buffer:cursor buf :endianness :little))
+           (payload (subseq vec 36)))
+      (dds.rtps.message:write-data-frag c dds.rtps.message:+entityid-unknown+
+                                        #x80000002 2 8012 7 1 1288 payload 0 284)
+      (%check :connext-frag-encode
+              (and (= (dds.core.buffer:cursor-position c) (length vec))
+                   (loop for i below (length vec)
+                         always (= (aref (dds.core.buffer:octet-buffer-vec buf) i)
+                                   (aref vec i))))
+              "write-data-frag reproduces the captured submessage byte-for-byte")
+      (dds.core.arena:pool-release pool buf))
+    (dds.core.arena:teardown-arena arena)
+    t))
+
+;;; Real RTI Connext 7.3.1 NACK_FRAG wire vector (RTPS 2.5 §9.4.5.14): emitted by
+;;; Connext's reliable reader after our writer withheld fragment 3 of writerSN=1.
+
+(defun* %connext-nack-frag-vector ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The live RTI Connext 7.3.1 NACK_FRAG submessage (36 octets) from frame 149 of
+   interop/connext/large-data/step3-nackfrag.pcap (captured 2026-06-10): flags=0x01 (E),
+   octetsToNextHeader=32, readerId 0x80000007, writerId 0x00000102, writerSN=1,
+   fragmentNumberState bitmapBase=3 numBits=1 (exactly fragment 3 missing), count=1."
+  (%hex-octets
+   (concatenate 'string
+    "12012000800000070000010200000000010000000300000001000000"
+    "ffffff8301000000")))
+
+(defun* run-connext-nack-frag-vector-test ()
+    (function () t)
+  "Test: byte-exact NACK_FRAG regression vector from a real Connext 7.3.1 capture
+   (step3-nackfrag.pcap frame 149, tshark-dissected): decode recovers every dissected
+   field, encode from the parsed fields reproduces the submessage byte-for-byte."
+  (let* ((vec (%connext-nack-frag-vector))
+         (arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 64 2)))
+    ;; decode: the captured octets must parse to the tshark-dissected field values
+    (let* ((buf (dds.core.arena:pool-acquire pool))
+           (c (dds.core.buffer:cursor buf :endianness :little)))
+      (replace (dds.core.buffer:octet-buffer-vec buf) vec)
+      (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+        (%check :connext-nf-hdr
+                (and (= id dds.rtps.message:+submsg-nack-frag+) (= flags #x01)
+                     (= octets 32) le)
+                "captured NACK_FRAG header: id=0x12, flags=0x01 (E), octetsToNextHeader=32")
+        (multiple-value-bind (r w sn base numbits bitmap count)
+            (dds.rtps.message:parse-nack-frag-body c flags)
+          (%check :connext-nf-body
+                  (and (= r #x80000007) (= w #x00000102) (= sn 1)
+                       (= base 3) (= numbits 1) (= count 1))
+                  "captured NACK_FRAG body: dissected field values")
+          (%check :connext-nf-set
+                  (and (dds.rtps.message:fragnum-set-member-p base numbits bitmap 3)
+                       (not (dds.rtps.message:fragnum-set-member-p base numbits bitmap 2))
+                       (not (dds.rtps.message:fragnum-set-member-p base numbits bitmap 4)))
+                  "captured NACK_FRAG set: 3 member; 2 below base, 4 beyond numBits (range-excluded)")
+          ;; encode: write-nack-frag from the parsed fields must reproduce the capture
+          ;; (the parsed bitmap word 0x83ffffff keeps Connext's insignificant pad bits past numBits, §9.4.2.8)
+          (let* ((buf2 (dds.core.arena:pool-acquire pool))
+                 (c2 (dds.core.buffer:cursor buf2 :endianness :little)))
+            (dds.rtps.message:write-nack-frag c2 r w sn base numbits bitmap count)
+            (%check :connext-nf-encode
+                    (and (= (dds.core.buffer:cursor-position c2) (length vec))
+                         (loop for i below (length vec)
+                               always (= (aref (dds.core.buffer:octet-buffer-vec buf2) i)
+                                         (aref vec i))))
+                    "write-nack-frag reproduces the captured submessage byte-for-byte")
+            (dds.core.arena:pool-release pool buf2))))
+      (dds.core.arena:pool-release pool buf))
+    (dds.core.arena:teardown-arena arena)
+    t))
+
 ;;; RTPS message framing: build Header + DATA + HEARTBEAT into one buffer, then
 ;;; dispatch-message walks the submessages back out (RTPS 2.5 §8.3.4 / §9.4.5).
 
@@ -689,7 +816,7 @@
                       "sample completes byte-exact after the NACK_FRAG resend")))))))
   t)
 
-;;; NACK_FRAG round-trip (RTPS 2.5 §9.4.5.14): 24+4*M body, only E flag.
+;;; NACK_FRAG round-trip (RTPS 2.5 §9.4.5.14): 28+4*M body, only E flag.
 
 (defun* run-nack-frag-test ()
     (function () t)
@@ -706,7 +833,7 @@
     (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
       (declare (ignore le))
       (%check :nf-kind (= id dds.rtps.message:+submsg-nack-frag+) "NACK_FRAG kind")
-      (%check :nf-octets (= octets 28) "NACK_FRAG body length 24+4*1=28")
+      (%check :nf-octets (= octets 32) "NACK_FRAG body length 28+4*1=32")
       (multiple-value-bind (r w s base numbits bm cnt) (dds.rtps.message:parse-nack-frag-body c flags)
         (declare (ignore octets))
         (%check :nf-fields (and (= r rid) (= w wid) (= s sn) (= cnt count)) "NACK_FRAG scalar fields")

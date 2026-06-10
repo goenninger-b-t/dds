@@ -404,13 +404,14 @@
     (values reader-id writer-id writer-sn last-fragment-num count)))
 
 ;;; ---- NACK_FRAG submessage (§9.4.5.14): readerId(4)+writerId(4)+writerSN(8)+
-;;; fragmentNumberState(8+4*M)+count(4) = 24+4*M octets; only the E flag.
+;;; fragmentNumberState(8+4*M)+count(4) = 28+4*M octets; only the E flag.
 
 (defun* write-nack-frag (cursor reader-id writer-id writer-sn base numbits bitmap count)
     (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32) (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32)) fixnum)
-  "Write a NACK_FRAG submessage. RTPS 2.5 §9.4.5.14; body=24+4*M."
+  "Write a NACK_FRAG submessage. RTPS 2.5 §9.4.5.14; body=28+4*M."
+  ;; §9.4.5.14 + §9.4.2.8: 4+4+8 + (8+4*M) + 4 = 28+4*M (Connext emits 32 for M=1)
   (write-submessage-header cursor +submsg-nack-frag+ (%e-flag cursor)
-                           (+ 24 (* 4 (%seqnum-set-words numbits))))
+                           (+ 28 (* 4 (%seqnum-set-words numbits))))
   (write-entity-id cursor reader-id)
   (write-entity-id cursor writer-id)
   (write-sequence-number cursor writer-sn)
