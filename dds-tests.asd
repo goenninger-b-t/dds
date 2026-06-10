@@ -10,6 +10,7 @@
                (:file "rtps-test")
                (:file "pbt-test")
                (:file "udp-test")
+               (:file "xtypes-test")
                (:file "integration-test"))
   :perform (test-op (o c)
              (declare (ignore o c))

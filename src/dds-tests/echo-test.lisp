@@ -233,6 +233,8 @@
                  ("xtypes-assignability"     . run-assignability-test)
                  ("xtypes-typeobject-cdr"    . run-typeobject-cdr-test)
                  ("xtypes-type-information"  . run-type-information-test)
+                 ("typelookup-request"       . run-typelookup-request-test)
+                 ("typelookup-reply"         . run-typelookup-reply-test)
                  ("xtypes-type-object-lb"    . run-type-object-lb-test)
                  ("sedp-type-object-lb"      . run-sedp-type-object-lb-test)
                  ("xtypes-type-compat-soft"  . run-type-compat-soft-test)

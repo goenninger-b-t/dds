@@ -9,5 +9,6 @@
                (:file "xtypes")
                (:file "assignability")
                (:file "typeobject-cdr")
+               (:file "typelookup")
                (:file "type-object-lb"))
   :in-order-to ((test-op (test-op "dds-tests"))))

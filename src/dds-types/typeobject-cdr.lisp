@@ -73,6 +73,30 @@
     (dds.core.buffer:cursor-set-position cursor e)
     e))
 
+;;; ---- MUTABLE member framing: EMHEADER1 LC=4 + backpatched NEXTINT (§7.4.3.4.2) ----
+
+(defun* %mutable-member-begin (c id &optional mu)
+    (function (dds.core.buffer:cursor (unsigned-byte 28) &optional t) (integer 0))
+  "Write EMHEADER1 (M_FLAG=MU, LC=4) for member ID plus a placeholder NEXTINT; return
+   the NEXTINT's byte position for %mutable-member-end. MU defaults to NIL: the member
+   must_understand attribute defaults to false (XTypes 1.3 §7.2.2.4.4.4 / §7.2.2.4.4.4.6)
+   absent an @must_understand annotation; pass T only for annotated members."
+  (dds.cdr:cdr-align c 4 :xcdr2)
+  (dds.core.buffer:put-u32 c (dds.cdr:emheader1-encode mu 4 id))
+  (let ((np (dds.core.buffer:cursor-position c)))
+    (dds.core.buffer:put-u32 c 0)
+    np))
+
+(defun* %mutable-member-end (c np)
+    (function (dds.core.buffer:cursor (integer 0)) (integer 0))
+  "Backpatch the NEXTINT at NP with the member's serialized length (LC=4: NEXTINT is
+   the byte length of the member that follows it, §7.4.3.4.2)."
+  (let ((e (dds.core.buffer:cursor-position c)))
+    (dds.core.buffer:cursor-set-position c np)
+    (dds.core.buffer:put-u32 c (- e np 4))
+    (dds.core.buffer:cursor-set-position c e)
+    e))
+
 ;;; ---- TypeIdentifier (FINAL union, rule 26): discriminator octet + arm ----
 
 (defun* %put-type-identifier (cursor ti)
@@ -186,25 +210,32 @@
 ;;;; idl @id(0x0075)) so peers learn a type's EquivalenceHash-based TypeIdentifier without
 ;;;; the full TypeObject (XTypes §7.6.3.4 / §7.3.4.9.1). Structure (xtypes-1_3_typeobject.idl):
 ;;;; TypeInformation (MUTABLE) { @id(0x1001) minimal; @id(0x1002) complete; }; each member is
-;;;; a TypeIdentifierWithDependencies (APPENDABLE) { TypeIdentfierWithSize typeid_with_size;
+;;;; a TypeIdentifierWithDependencies (APPENDABLE) { TypeIdentfierWithSize [sic] typeid_with_size;
 ;;;; long dependent_typeid_count; sequence<TypeIdentfierWithSize> dependent_typeids; };
 ;;;; TypeIdentfierWithSize (APPENDABLE) { TypeIdentifier type_id; unsigned long
 ;;;; typeobject_serialized_size; }. PROVISIONAL like the TypeObject serializer: minimal-only
 ;;;; (the complete member is omitted, MUTABLE permits it); the mutable member uses LC=4
-;;;; (explicit NEXTINT length); dependent ordering is insertion order. Confirm vs Connext.
+;;;; (explicit NEXTINT length) with M_FLAG=0 (the §7.2.2.4.4.4.6 must_understand default;
+;;;; the IDL has no @must_understand); dependent ordering is insertion order. Confirm vs
+;;;; Connext.
 
+
+(defun* %put-type-id-with-size-octets (c hash size)
+    (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)) (unsigned-byte 32)) t)
+  "TypeIdentfierWithSize [sic] (APPENDABLE): DHEADER + EK_MINIMAL TypeIdentifier (disc + 14-octet
+   HASH) + typeobject_serialized_size SIZE (UInt32)."
+  (let ((p (%dheader-begin c)))
+    (dds.core.buffer:put-u8 c +ek-minimal+)
+    (dds.core.buffer:put-octets c hash 0 14)
+    (dds.cdr:cdr-put-u32 c size :xcdr2)
+    (%dheader-end c p))
+  t)
 
 (defun* %put-type-id-with-size (c s)
     (function (dds.core.buffer:cursor minimal-struct-type) t)
-  "TypeIdentfierWithSize (APPENDABLE): DHEADER + EK_MINIMAL TypeIdentifier (disc + 14-octet
-   hash) + typeobject_serialized_size (UInt32, the MinimalTypeObject byte length)."
-  (let* ((bytes (minimal-type-object-octets s))
-         (hash (subseq (dds.core.md5:md5 bytes) 0 14))
-         (p (%dheader-begin c)))
-    (dds.core.buffer:put-u8 c +ek-minimal+)
-    (dds.core.buffer:put-octets c hash 0 14)
-    (dds.cdr:cdr-put-u32 c (length bytes) :xcdr2)
-    (%dheader-end c p))
+  "TypeIdentfierWithSize [sic] for struct S: hash + size computed from its MinimalTypeObject."
+  (let ((bytes (minimal-type-object-octets s)))
+    (%put-type-id-with-size-octets c (subseq (dds.core.md5:md5 bytes) 0 14) (length bytes)))
   t)
 
 (defun* %collect-dependencies (s)
@@ -227,7 +258,7 @@
 
 (defun* %put-type-id-with-deps (c s)
     (function (dds.core.buffer:cursor minimal-struct-type) t)
-  "TypeIdentifierWithDependencies (APPENDABLE): DHEADER + TypeIdentfierWithSize(S) +
+  "TypeIdentifierWithDependencies (APPENDABLE): DHEADER + TypeIdentfierWithSize [sic] (S) +
    dependent_typeid_count (Int32) + sequence<TypeIdentfierWithSize> (DHEADER + length +
    each dependency's TypeIdentfierWithSize)."
   (let ((deps (%collect-dependencies s))
@@ -245,19 +276,15 @@
     (function (minimal-struct-type) (simple-array (unsigned-byte 8) (*)))
   "Serialize the TypeInformation for struct S (minimal only) as the octets carried in
    PID_TYPE_INFORMATION: a MUTABLE struct DHEADER + the @id(0x1001) minimal member
-   (EMHEADER1 LC=4 + NEXTINT length + TypeIdentifierWithDependencies)."
+   (EMHEADER1 M_FLAG=0 LC=4 + NEXTINT length + TypeIdentifierWithDependencies).
+   M_FLAG=0 is the must_understand default (§7.2.2.4.4.4.6; the TypeInformation IDL
+   carries no @must_understand on its members). CONFIRM-VS-PEER."
   (let* ((buf (dds.core.buffer:make-octet-buffer 16384))
          (c (dds.core.buffer:cursor buf :endianness :little)))
     (let ((p (%dheader-begin c)))
-      (dds.cdr:cdr-align c 4 :xcdr2)
-      (dds.core.buffer:put-u32 c (dds.cdr:emheader1-encode t 4 #x1001))
-      (let ((np (dds.core.buffer:cursor-position c)))
-        (dds.core.buffer:put-u32 c 0)
+      (let ((np (%mutable-member-begin c #x1001)))
         (%put-type-id-with-deps c s)
-        (let ((e (dds.core.buffer:cursor-position c)))
-          (dds.core.buffer:cursor-set-position c np)
-          (dds.core.buffer:put-u32 c (- e np 4))
-          (dds.core.buffer:cursor-set-position c e)))
+        (%mutable-member-end c np))
       (%dheader-end c p))
     (let* ((e (dds.core.buffer:cursor-position c))
            (out (make-array e :element-type '(unsigned-byte 8))))

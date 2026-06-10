@@ -48,6 +48,10 @@
            #:minimal-type-object-octets #:equivalence-hash
            ;; TypeInformation codec for PID_TYPE_INFORMATION (FR-TYPE-3 foundation)
            #:serialize-type-information #:deserialize-type-information-hash
+           ;; Built-in TypeLookup service request/reply codecs (XTypes 1.3 §7.6.3.3, FR-TYPE-3)
+           #:serialize-type-lookup-request #:parse-type-lookup-request
+           #:serialize-type-lookup-reply #:parse-type-lookup-reply
+           #:+tl-gettypes-hash+ #:+tl-getdeps-hash+
            ;; Inbound RTI PID_TYPE_OBJECT_LB inflate + fingerprint (ADR 0009)
            #:inflate-type-object-lb #:*max-type-object-bytes*
            #:+type-object-lb-compression-zlib+

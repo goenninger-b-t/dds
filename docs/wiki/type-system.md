@@ -73,6 +73,16 @@ The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, 
 - **`dds.types:serialize-type-information`** — serialize the TypeInformation for a struct (minimal only) as the octets carried in `PID_TYPE_INFORMATION` (a MUTABLE struct DHEADER + the `@id(0x1001)` minimal member + its TypeIdentifierWithDependencies).
 - **`dds.types:deserialize-type-information-hash`** — parse a serialized TypeInformation and return its minimal `EK_MINIMAL` TypeIdentifier's 14-octet EquivalenceHash (the value endpoint matching needs).
 
+### Built-in TypeLookup service request/reply codecs (`dds.types`)
+
+The XTypes 1.3 §7.6.3.3 built-in TypeLookup service types, `TypeLookup_Request { dds::rpc::RequestHeader header; TypeLookup_Call data; }` and `TypeLookup_Reply { header; TypeLookup_Return return; }`, serialized as XCDR2 little-endian with the `D_CDR2_LE` encapsulation (the types are unannotated, so they take the §7.3.1.2.1.8 default extensibility, appendable). No Connext oracle exists for this protocol (ADR 0010); the layout is pinned from the spec text and marked `CONFIRM-VS-PEER` pending a compliant peer (Fast DDS). Note: the §7.6.3.3.3 IDL names the reply header `dds::rpc::RequestHeader` — a spec editorial defect; the codec uses the `ReplyHeader` copied from DDS-RPC in §7.6.3.3.2 (`relatedRequestId` + `remoteEx`), the only header that can carry the remote exception code.
+
+- **`dds.types:serialize-type-lookup-request`** — serialize a request: `:writer-guid` (16 octets), `:sn` (request SequenceNumber), `:instance-name` (`string<255>`), `:operation` (`:get-types` | `:get-deps`), `:type-ids` (list of 14-octet EquivalenceHashes, sent as `EK_MINIMAL` TypeIdentifiers), `:continuation` (optional `sequence<octet,32>` continuation point, `:get-deps` only). Returns a fresh octet vector including the 4-octet encapsulation header.
+- **`dds.types:parse-type-lookup-request`** — parse a serialized request to `(values operation type-ids writer-guid sn instance-name continuation)`; `:unknown` for an unrecognized union discriminator; `NIL` on any malformed or truncated input (network-facing — every read is bounds-checked, and an unknown mutable member with the must-understand flag set rejects the sample per §7.2.2.4.4.4.6).
+- **`dds.types:serialize-type-lookup-reply`** — serialize a reply: `:related-guid`/`:related-sn` (the request's SampleIdentity, echoed as `relatedRequestId`), `:remote-ex` (`:ok` | `:unsupported` | `:invalid-argument` | `:out-of-resources` | `:unknown-operation` | `:unknown-exception`, the §7.6.3.3.2 `RemoteExceptionCode_t` in declaration order 0–5), `:operation` (`:get-types` | `:get-deps`, required for `:ok`), `:pairs` (list of `(hash . typeobject-octets)` `TypeIdentifierTypeObjectPair`s, `:get-types`), `:dependencies` (list of `(hash . size)` `TypeIdentfierWithSize` [sic — the IDL's own spelling] entries, `:get-deps`), `:continuation` (optional, `:get-deps`). For any non-`:ok` `:remote-ex` the `TypeLookup_Return` is omitted entirely (DDS-RPC signals failure via `remoteEx`; the Return union has no default arm; absent trailing members of the appendable reply take default values per §7.2.2.4.4.4.7). `:writer-guid` is accepted for call-site symmetry but not serialized — the ReplyHeader carries no replier identity.
+- **`dds.types:parse-type-lookup-reply`** — parse a serialized reply to `(values operation result related-guid related-sn remote-ex continuation)`: `result` is the pairs list for `:get-types` or the `(hash . size)` list for `:get-deps`; `:unknown` for an unrecognized Return discriminator; `operation` `NIL` with the header values still returned for a non-OK header-only reply; `NIL` on any malformed or truncated input (every read bounds-checked; sequence counts pre-checked against the enclosing DHEADER extent before allocation; per-pair TypeObject extents bounded by `*max-type-object-bytes*`).
+- **`dds.types:+tl-gettypes-hash+`** / **`dds.types:+tl-getdeps-hash+`** — the `TypeLookup_Call`/`TypeLookup_Return` union discriminators `TypeLookup_getTypes_HashId` `#x018252d3` and `TypeLookup_getDependencies_HashId` `#x05aafb31` (§7.6.3.3.3, derived via the §7.3.1.2.1.1 `@hashid` rule).
+
 ### Exported constants (`dds.types`)
 
 TypeKind octets: **`+tk-boolean+`**, **`+tk-byte+`**, **`+tk-int16+`**, **`+tk-int32+`**, **`+tk-int64+`**, **`+tk-uint16+`**, **`+tk-uint32+`**, **`+tk-uint64+`**, **`+tk-string8+`**, **`+tk-structure+`**, **`+tk-sequence+`**. EquivalenceKind octets: **`+ek-minimal+`**, **`+ek-complete+`**. TypeIdentifierKind octets: **`+ti-string8-small+`**, **`+ti-plain-sequence-small+`**.
@@ -222,6 +232,44 @@ The TypeInformation carried in the SEDP builtin-topic data lets a peer learn a t
                (length (dds.types:serialize-type-information (to "dcps-msg")))))))
 ```
 
+### 7. Round-trip a TypeLookup_Request (built-in TypeLookup service)
+
+A getTypes request names the wanted types by their 14-octet EquivalenceHashes; the parse returns the operation, the hashes, and the DDS-RPC request header fields (adapted from `run-typelookup-request-test` in `src/dds-tests/xtypes-test.lisp`).
+
+```lisp
+(let* ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+       (hash (dds.types:equivalence-hash
+              (dds.types:type-support-typeobject (dds.types:find-type-support "dcps-msg"))))
+       (octets (dds.types:serialize-type-lookup-request
+                :writer-guid guid :sn 5 :instance-name "dds.builtin.TOS.x"
+                :operation :get-types :type-ids (list hash))))
+  (multiple-value-bind (op ids wguid sn iname)
+      (dds.types:parse-type-lookup-request octets)
+    (assert (eq op :get-types))
+    (assert (equalp (first ids) hash))
+    (assert (and (equalp wguid guid) (= sn 5) (string= iname "dds.builtin.TOS.x"))))
+  ;; truncated / malformed input rejects with NIL, never an error
+  (assert (null (dds.types:parse-type-lookup-request (subseq octets 0 7)))))
+```
+
+The matching getTypes reply carries `TypeIdentifierTypeObjectPair`s — each the hash plus the verbatim `minimal-type-object-octets` — under the request's SampleIdentity (adapted from `run-typelookup-reply-test`):
+
+```lisp
+(let* ((rg (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
+       (ts (dds.types:type-support-typeobject (dds.types:find-type-support "dcps-msg")))
+       (to (dds.types:minimal-type-object-octets ts))
+       (hash (dds.types:equivalence-hash ts))
+       (octets (dds.types:serialize-type-lookup-reply
+                :related-guid rg :related-sn 5
+                :operation :get-types :remote-ex :ok
+                :pairs (list (cons hash to)))))
+  (multiple-value-bind (op pairs rguid rsn remote-ex)
+      (dds.types:parse-type-lookup-reply octets)
+    (assert (eq op :get-types))
+    (assert (and (equalp (car (first pairs)) hash) (equalp (cdr (first pairs)) to)))
+    (assert (and (equalp rguid rg) (= rsn 5) (eq remote-ex :ok)))))
+```
+
 ## Notes / status
 
 This is mid-M4 (P3 XTypes), built **verifiable-first**: anything checkable offline against the spec's own worked examples is landed and tested; anything that needs a conformant peer to lock the exact wire bytes is built but flagged PROVISIONAL.
@@ -242,4 +290,5 @@ This is mid-M4 (P3 XTypes), built **verifiable-first**: anything checkable offli
   - **The inflated payload is RTI's *proprietary legacy* TypeObject** (a vendor "TypeLibrary" binary), **not** the OMG `CompleteTypeObject` — and this Connext sends no `PID_TYPE_OBJECT` (0x0072) or `PID_TYPE_INFORMATION` (0x0075) for small types, so no spec-conformant type representation is on the wire. A full structural parse is therefore a large RTI-format reverse-engineering effort (deferred, robustness-only — interop already works via type-name + QoS matching).
   - **In its place, a lightweight type *fingerprint*** (`type-object-strings`, `type-object-mentions-all-p`) extracts the literal names RTI embeds (type name + multi-octet member names + dependent type names) for a heuristic type-aware match / diagnostics — coarse on purpose (1-octet member names and the structure are not recovered).
   - **Match-time advisory verdict (`assess-type-object-lb`, `type-support-fingerprint-names`).** The fingerprint is applied against the *local* type: `type-support-fingerprint-names` lists the local struct's ≥2-octet member names (the struct type name is excluded — peers like Connext spell it `ShapeType` where a local registration says `shape-type`), and `assess-type-object-lb` checks whether the peer's inflated TypeObject mentions all of them, returning one of `:names-present` / `:names-absent` (with the missing names) / `:no-type-object` / `:inflate-failed` / `:not-assessable`. It is **purely advisory** — a heuristic confirmation/diagnostic, **never** a match gate (the peer already matched on topic + type name, and a missing name is inconclusive against RTI's legacy TypeObject). The DCPS layer records the verdict per matched DataReader/DataWriter for inspection and can log it; see [DCPS](dcps.md). Tested against the real Connext ShapeType LB (`xtypes-type-compat-soft`, `dcps-type-compat`).
-- **Deferred entirely (not yet present):** TypeLookup (the request/reply service to fetch a full TypeObject by TypeIdentifier) and DynamicData (runtime-typed sample access without a generated struct). Today every type is generated ahead of time via `define-dds-type`.
+- **The built-in TypeLookup service is landing incrementally (FR-TYPE-3, ADR 0010).** The `TypeLookup_Request` **and** `TypeLookup_Reply` XCDR2 codecs are in (see the API section above), pinned from the spec text alone — Connext does not implement this protocol, so the byte-level choices (default-appendable top level with `D_CDR2_LE`, flat DDS-RPC header/union nesting, `LC=4` mutable members, the §7.6.3.3.2 `ReplyHeader` over the §7.6.3.3.3 IDL's `RequestHeader` misprint, the omitted `TypeLookup_Return` on a non-OK `remoteEx`) are marked `CONFIRM-VS-PEER` until a compliant peer (Fast DDS) is available. The four built-in endpoints and the service logic follow.
+- **Deferred entirely (not yet present):** DynamicData (runtime-typed sample access without a generated struct). Today every type is generated ahead of time via `define-dds-type`.

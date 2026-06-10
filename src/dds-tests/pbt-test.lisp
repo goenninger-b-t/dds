@@ -133,6 +133,40 @@
       (setf (aref vec i) (prng-int prng 0 255)))
     (list buf (prng-int prng 0 255) (prng-int prng 0 65535))))
 
+(defun* gen-tl-seeds ()
+    (function () simple-vector)
+  "Build one VALID serialized TypeLookup_Request and TypeLookup_Reply each (small
+   inputs via the dds.types serializers); the truncation/mutation fuzz seeds."
+  (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+        (hash (make-array 14 :element-type '(unsigned-byte 8) :initial-element 3))
+        (cont (make-array 4 :element-type '(unsigned-byte 8) :initial-element 9))
+        (tobj (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
+    ;; tobj = DHEADER-prefixed TypeObject octets: LE size 4 + 4 payload octets
+    (setf (aref tobj 0) 4)
+    (vector (dds.types:serialize-type-lookup-request
+             :writer-guid guid :sn 1 :instance-name "tl" :operation :get-deps
+             :type-ids (list hash) :continuation cont)
+            (dds.types:serialize-type-lookup-reply
+             :related-guid guid :related-sn 1 :operation :get-types
+             :pairs (list (cons hash tobj))))))
+
+(defun* gen-tl-fuzz (prng seeds)
+    (function (prng simple-vector) (simple-array (unsigned-byte 8) (*)))
+  "A TypeLookup-parser fuzz input from one of three families: pure-random octets,
+   a truncation of a valid sample, or a byte-mutated copy of a valid sample."
+  (let ((seed (svref seeds (prng-int prng 0 (1- (length seeds))))))
+    (ecase (prng-int prng 0 2)
+      (0 (let* ((n (prng-int prng 0 96))
+                (v (make-array n :element-type '(unsigned-byte 8))))
+           (dotimes (i n) (setf (aref v i) (prng-int prng 0 255)))
+           v))
+      (1 (subseq seed 0 (prng-int prng 0 (length seed))))
+      (2 (let ((v (copy-seq seed)))
+           (dotimes (k (prng-int prng 1 8))
+             (setf (aref v (prng-int prng 0 (1- (length v))))
+                   (prng-int prng 0 255)))
+           v)))))
+
 (defun* run-pbt-tests ()
     (function () t)
   "Run all property-based tests; signal test-failure on the first falsification."
@@ -141,7 +175,8 @@
          (buf (dds.core.arena:pool-acquire pool))
          (prng (make-prng #x12345678))
          (runs 400)
-         (fuzzbufs (gen-fuzz-buffers)))
+         (fuzzbufs (gen-fuzz-buffers))
+         (tlseeds (gen-tl-seeds)))
     (check-property "cdr-roundtrip-xcdr1+2" prng runs #'gen-gsample
                     (lambda (s) (and (%cdr-rt s buf :xcdr1) (%cdr-rt s buf :xcdr2))))
     (check-property "sequence-number-roundtrip" prng runs #'prng-i64
@@ -176,7 +211,17 @@
                                                  (dds.core.buffer:cursor b) flags)))
                                (safe (lambda () (dds.rtps.message:parse-nack-frag-body
                                                  (dds.core.buffer:cursor b) flags))))))))
-    (format t "~&  pbt: 4 properties x ~d cases each, deterministic seed.~%" runs)
+    ;; TypeLookup parsers contract NEVER-signal: no safe-wrap, a signal fails the property
+    ;; RUNS (not 4x): each case feeds BOTH parsers and rejects signal internally (Clasp cost)
+    (check-property "typelookup-parser-fuzz-no-signal" prng runs
+                    (lambda (p) (gen-tl-fuzz p tlseeds))
+                    (lambda (v)
+                      (let ((rq (dds.types:parse-type-lookup-request v))
+                            (rp (dds.types:parse-type-lookup-reply v)))
+                        (and (member rq '(nil :get-types :get-deps :unknown))
+                             (member rp '(nil :get-types :get-deps :unknown))
+                             t))))
+    (format t "~&  pbt: 5 properties x ~d cases each, deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)
