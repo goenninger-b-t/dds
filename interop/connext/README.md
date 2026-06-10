@@ -68,6 +68,7 @@ interop/connext/
   shapes-pub/              Connext publishes ShapeType  -> this stack's `make square-sub`
   shapes-sub/              Connext subscribes ShapeType <- this stack's `make square-pub`
   cdr-capture/             publishes one fixed sample for a byte-exact XCDR payload capture
+  large-data/              LargeData pub+sub under forced fragmentation (the DATA_FRAG oracle)
 ```
 
 ## Build & run
@@ -93,6 +94,28 @@ comparison, first **align the type**: either bound our `color` at 255 to match
 `rtiddsgen`'s default, or generate Connext truly-unbounded (`-unboundedSupport` /
 explicit bound). The bound difference does **not** change the XCDR wire payload, so live
 pub/sub interop (absorbed by `ignore_string_bounds` during coercion) still works.
+
+## LargeData under forced fragmentation (the DATA_FRAG oracle)
+
+`large-data/` builds **both** `large_pub` and `large_sub` (one dir, one IDL, shared
+generated type — `common.mk` supports multi-binary dirs via `APPS`). The type mirrors
+this stack's `large-data` (`@final`; `@key long id`; unbounded `sequence<octet> payload`;
+`make large-pub`/`make large-sub` on our side). Its `USER_QOS_PROFILES.xml` forces the
+fragmented wire: UDPv4-only (same-host SHMEM would bypass `lo0`), builtin-UDPv4
+`message_size_max = 1400` (an 8000-octet sample → 7 DATA_FRAGs of `fragmentSize=1288`),
+and **asynchronous publish mode** (Connext refuses reliable fragmented data on a
+synchronous writer). Two `rtiddsgen` traps recorded in `large-data/README.md`: the
+unbounded sequence is silently bounded at **100** without `-unboundedSupport` (the
+ShapeType string-255 finding again, ADR 0009), and lossless RTI↔RTI loopback shows
+DATA_FRAG + plain HEARTBEAT but **no HEARTBEAT_FRAG/NACK_FRAG**.
+
+```sh
+make -C large-data
+# terminal 1 (run from inside large-data/ — Connext loads USER_QOS_PROFILES.xml from the cwd):
+cd large-data && ./large_sub 0 20        # domain, seconds (0 = forever)
+# terminal 2:
+cd large-data && ./large_pub 0 8000 15   # domain, octets, count (0 = forever)
+```
 
 ## Capturing the SEDP TypeObject with tshark
 

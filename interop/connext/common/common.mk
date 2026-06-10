@@ -1,5 +1,6 @@
 # Shared build rules for the RTI Connext test harness (RTI 7.x, Modern C++ / C++11).
-# Each app's Makefile sets APP + COMMON and includes this file.
+# Each app's Makefile sets APP (or APPS for several binaries) + COMMON and includes this
+# file; IDL and RTIDDSGEN_FLAGS are overridable (default: the shared ShapeType).
 #
 # Required:
 #   NDDSHOME         RTI Connext install dir
@@ -20,7 +21,10 @@ endif
 
 RTI_BUILD ?= release
 RTIDDSGEN := $(NDDSHOME)/bin/rtiddsgen
-IDL       := $(COMMON)/ShapeType.idl
+RTIDDSGEN_FLAGS ?=
+IDL       ?= $(COMMON)/ShapeType.idl
+IDL_BASE  := $(basename $(notdir $(IDL)))
+APPS      ?= $(APP)
 UNAME_S   := $(shell uname -s)
 
 CXX      ?= c++
@@ -51,30 +55,28 @@ endif
 
 LDLIBS += -L$(LIBDIR) $(RTILIBS) $(SYSLIBS)
 
-# rtiddsgen output for the shared IDL (one run via a sentinel; files git-ignored).
-GEN_SRCS := ShapeType.cxx ShapeTypePlugin.cxx
-GEN_HDRS := ShapeType.hpp ShapeTypePlugin.hpp
-OBJS     := $(APP).o $(GEN_SRCS:.cxx=.o)
+# rtiddsgen output for the app's IDL (one run via a sentinel; files git-ignored).
+GEN_SRCS := $(IDL_BASE).cxx $(IDL_BASE)Plugin.cxx
+GEN_HDRS := $(IDL_BASE).hpp $(IDL_BASE)Plugin.hpp
+GEN_OBJS := $(GEN_SRCS:.cxx=.o)
+OBJS     := $(addsuffix .o,$(APPS)) $(GEN_OBJS)
 
 .PHONY: all clean generate
-all: $(APP)
+all: $(APPS)
 
 generate: .gen.stamp
 .gen.stamp: $(IDL)
-	$(RTIDDSGEN) -language C++11 -replace -d . $(IDL)
+	$(RTIDDSGEN) -language C++11 -replace $(RTIDDSGEN_FLAGS) -d . $(IDL)
 	@touch $@
 
 $(GEN_SRCS) $(GEN_HDRS): .gen.stamp
 
-$(APP).o: $(APP).cxx $(GEN_HDRS)
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
-
 %.o: %.cxx $(GEN_HDRS)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
 
-$(APP): $(OBJS)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+$(APPS): %: %.o $(GEN_OBJS)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 clean:
-	rm -f $(APP) $(OBJS) .gen.stamp $(GEN_SRCS) $(GEN_HDRS) \
-	      ShapeType*.hpp ShapeType*.cxx *.o
+	rm -f $(APPS) $(OBJS) .gen.stamp $(GEN_SRCS) $(GEN_HDRS) \
+	      $(IDL_BASE)*.hpp $(IDL_BASE)*.cxx *.o

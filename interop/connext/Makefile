@@ -1,7 +1,7 @@
 # Build every Connext harness app (each lives in its own subdir with its own Makefile).
 # Requires NDDSHOME + CONNEXTDDS_ARCH (see README.md).
 
-APPS := typeobject-probe shapes-pub shapes-sub cdr-capture
+APPS := typeobject-probe shapes-pub shapes-sub cdr-capture large-data
 
 .PHONY: all clean $(APPS)
 

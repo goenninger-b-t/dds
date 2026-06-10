@@ -3,6 +3,10 @@ ShapeType.hpp
 ShapeType.cxx
 ShapeTypePlugin.hpp
 ShapeTypePlugin.cxx
+LargeData.hpp
+LargeData.cxx
+LargeDataPlugin.hpp
+LargeDataPlugin.cxx
 *.idl.*
 .gen.stamp
 
@@ -16,6 +20,8 @@ typeobject-probe/typeobject_probe
 shapes-pub/shapes_pub
 shapes-sub/shapes_sub
 cdr-capture/cdr_capture
+large-data/large_pub
+large-data/large_sub
 
 # transient capture artifacts (pcaps + tshark decodes produced while probing)
 *.pcap
