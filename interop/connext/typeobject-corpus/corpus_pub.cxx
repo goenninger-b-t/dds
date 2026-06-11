@@ -73,8 +73,15 @@ int main(int argc, char **argv)
         return run_corpus<C_Shape>(domain, topic, type, sample);
     }
 
+    if (type == "C_Shape2") {
+        C_Shape2 sample;
+        sample.colour("BLUE");
+        sample.x(50); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_Shape2>(domain, topic, type, sample);
+    }
+
     std::cerr << "usage: " << argv[0] << " <domain> <topic> <typename>\n"
-              << "  unknown typename '" << type << "'; this build knows: C_Shape\n"
+              << "  unknown typename '" << type << "'; this build knows: C_Shape, C_Shape2\n"
               << "  (later corpus tasks add types to Corpus.idl + a dispatch arm here)\n";
     return 1;
 }

@@ -10,5 +10,6 @@
                (:file "assignability")
                (:file "typeobject-cdr")
                (:file "typelookup")
-               (:file "type-object-lb"))
+               (:file "type-object-lb")
+               (:file "legacy-type-object"))
   :in-order-to ((test-op (test-op "dds-tests"))))

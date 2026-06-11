@@ -23,3 +23,14 @@ struct C_Shape {
     long y;
     long shapesize;
 };
+
+// C_Shape2 — differential variant: identical to C_Shape but the key member is renamed
+// color -> colour (one octet longer). Used to localize the member-name string in the
+// captured legacy TypeObject by diffing the two inflated TypeObjects (lto-diff).
+@final
+struct C_Shape2 {
+    @key string colour;
+    long x;
+    long y;
+    long shapesize;
+};

@@ -239,6 +239,7 @@
                  ("typeobject-parse"         . run-typeobject-parse-test)
                  ("typelookup-server"        . run-typelookup-server-test)
                  ("xtypes-type-object-lb"    . run-type-object-lb-test)
+                 ("lto-tokenize"             . run-lto-tokenize-test)
                  ("sedp-type-object-lb"      . run-sedp-type-object-lb-test)
                  ("xtypes-type-compat-soft"  . run-type-compat-soft-test)
                  ("sedp-type-information"    . run-sedp-type-information-test)

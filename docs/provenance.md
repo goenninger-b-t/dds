@@ -190,3 +190,47 @@ Pinning/vendoring of hot-path dependencies (NFR-BUILD) is a tracked M1 follow-up
   top-level DHEADER, union DHEADERs, NEXTINT-as-count members). Used as the independent
   framing/payload oracle for the self-pinned vectors (`make wire`; no live peer exists,
   ADR 0010). → `src/dds-types/typelookup.lisp`.
+
+## M4 (2026-06-11) — legacy-TypeObject TLV framing, derived by differential capture (ADR 0009)
+
+Clean-room reverse engineering of RTI's proprietary legacy TypeObject (the inflated
+`PID_TYPE_OBJECT_LB` / 0x8021). The byte structure's meaning is derived **only** from
+captured bytes + a differential experiment — no RTI source/headers/`rtiddsgen` output read,
+and the GPL Wireshark RTPS dissector was **not** used to decode the TypeObject. Tools used:
+our own `dds.types:inflate-type-object-lb`, `tools/legacy-typeobject-diff.lisp` (`lto-diff`),
+and live captures via `make corpus-capture` against our own `corpus_pub`.
+
+### Experiment: C_Shape vs C_Shape2 (member rename color→colour)
+
+- **IDL change** (`interop/connext/typeobject-corpus/Corpus.idl`): added a sibling
+  `@final struct C_Shape2 { @key string colour; long x; long y; long shapesize; }` —
+  identical to `C_Shape` except the key member is renamed `color`→`colour` (one octet
+  longer) and the type `C_Shape`→`C_Shape2`. Captured both with `corpus_pub 0 Square
+  C_Shape{,2}` ↔ `make corpus-capture` (loopback), then `lto-diff` on the two inflated
+  TypeObjects (C_Shape = 536 octets, C_Shape2 = 540 octets).
+- **`lto-diff` reported** (common prefix 8 octets, common suffix 4 octets): the changed
+  middle differs in exactly the expected places —
+  - type-name string: A `08 00 00 00 "C_Shape\0"` (len=8, 4-aligned) vs
+    B `09 00 00 00 "C_Shape2\0\0\0\0"` (len=9, NUL-padded to 12);
+  - member-name string: A `06 00 00 00 "color\0\0\0"` (len=6, padded to 8) vs
+    B `07 00 00 00 "colour\0\0"` (len=7, padded to 8);
+  - the +1 octet of `colour` cascaded `+4` through every enclosing length field
+    (outer node 492→496, type-def node 324→328, struct-header node 28→32);
+  - the struct's 8-octet type-hash changed (A `7B 0B 1F 98 CC 73 2D ED`, B
+    `EB 69 87 1D 0D 30 FE 5D`) and recurs at both the struct head and the trailing node.
+- **Framing conclusion** (offsets cite the 536-octet C_Shape inflate; identical structure
+  in the 540-octet ShapeType per the corpus README hexdump): the payload is a back-to-back
+  **sequence of nodes**, each one of two TAG-distinguished forms —
+  - LONG `tag = 01 7F 08 00` : `tag(4) + code:u32(4) + length:u32(4) + value[length]`;
+  - SHORT `tag = 02 7F 00 00` : a bare 4-octet leaf/terminator marker, empty value.
+  A LONG value is a kind-specific fixed-field header (counts/ids/8-octet type-hashes, NOT
+  interpreted) interleaved with nested LONG/SHORT child nodes. Length-prefixed strings are
+  `len:u32 + len octets (trailing NUL counted) NUL-padded to the next 4-octet boundary`; the
+  differential proves `length` is the real content extent. This is **not pure generic TLV**
+  — the only structural anchoring is the two known TAG words, used to separate nested nodes
+  from the opaque header/hash bytes; no per-type-kind semantics are decoded. The tokenizer
+  rejects a `len=1` (bare-NUL) degenerate as a non-name (a real name is ≥1 printable octet +
+  NUL, so single-char members like `x`/`y` are length-2). →
+  `src/dds-types/legacy-type-object.lisp` (`tokenize-legacy-type-object`).
+- **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked;
+  all `rtiddsgen` output and the `corpus_pub` binary stay git-ignored (NFR-IP).

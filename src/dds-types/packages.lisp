@@ -63,6 +63,11 @@
            #:+type-object-lb-compression-zlib+
            #:type-object-strings #:type-object-mentions-all-p
            #:type-support-fingerprint-names #:assess-type-object-lb
+           ;; Legacy-TypeObject structural TLV tokenizer (ADR 0009, NFR-SEC-POSTURE)
+           #:tokenize-legacy-type-object
+           #:lto-node #:lto-node-p #:lto-node-tag #:lto-node-code
+           #:lto-node-value-start #:lto-node-value-end #:lto-node-children #:lto-node-name
+           #:*lto-max-depth* #:*lto-max-elements* #:*lto-max-string-bytes*
            #:+tk-boolean+ #:+tk-byte+ #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
            #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
            #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+
