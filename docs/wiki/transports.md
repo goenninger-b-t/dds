@@ -73,8 +73,8 @@ per-impl bodies live in `pal-<impl>.lisp`.
 
 | Symbol | Kind | Description |
 |---|---|---|
-| `dds.pal:alloc-static` | function | `(n-bytes)` — allocate `n-bytes` of off-heap octet memory the GC neither scans, moves, nor reclaims; returns a foreign-backed `(unsigned-byte 8)` vector with a GC-stable address. |
-| `dds.pal:free-static` | function | `(vec)` — release memory from `alloc-static`. Idempotency is the caller's job. |
+| `dds.pal:alloc-static` | function | `(n-bytes)` — allocate `n-bytes` of off-heap octet memory the GC neither scans, moves, nor reclaims; returns a foreign-backed `(unsigned-byte 8)` vector with a GC-stable address; contents unspecified. On Clasp, satisfied from a length-keyed recycle pool when possible. |
+| `dds.pal:free-static` | function | `(vec)` — release memory from `alloc-static`. Idempotency is the caller's job. On Clasp this recycles `vec` into the pool instead of deallocating: the runtime's `gctools:deallocate-unmanaged-instance` GC_frees an interior pointer and corrupts the Boehm heap (documented NFR-PORT gap until fixed upstream). |
 | `dds.pal:static-pointer` | function | `(vec)` — the raw foreign pointer (a system-area-pointer on SBCL) to `vec`, for syscalls. |
 | `dds.pal:static-length` | function | `(vec)` — octet length of a static region. |
 | `dds.pal:mem-ref-u8` | function | `(vec index)` — typed raw read of one octet (declared `inline`). |

@@ -660,12 +660,20 @@
 
 (defun* stop-node (node)
     (function (disc-node) (eql t))
-  "Close NODE's socket(s) (terminating its receiver thread(s)) and free the reusable
-   announce scratch buffers. Idempotent."
+  "Close NODE's socket(s), join its receiver thread(s), then free the reusable
+   announce scratch buffers. The join MUST precede the frees: an in-flight
+   %HANDLE-DATAGRAM on a receiver thread writes into RX-TX-MSG/TX-MSG, so freeing
+   first is a use-after-free (observed via canary instrumentation). Idempotent."
   (dds.pal:udp-close (disc-node-socket node))
   (when (disc-node-mcast-socket node)
     (dds.pal:udp-close (disc-node-mcast-socket node))
     (setf (disc-node-mcast-socket node) nil))
+  (when (disc-node-rx-thread node)
+    (dds.pal:join (disc-node-rx-thread node))
+    (setf (disc-node-rx-thread node) nil))
+  (when (disc-node-mcast-rx-thread node)
+    (dds.pal:join (disc-node-mcast-rx-thread node))
+    (setf (disc-node-mcast-rx-thread node) nil))
   (when (disc-node-tx-payload node)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-payload node)))
     (setf (disc-node-tx-payload node) nil))

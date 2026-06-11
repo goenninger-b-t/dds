@@ -16,18 +16,45 @@
 
 ;;; ---- memory: off-heap, non-GC'd, raw-pointer-addressable ----
 
+(defvar *static-pool* (make-hash-table :test #'eql)
+  "Length-keyed recycle pool for ALLOC-STATIC vectors on Clasp (length -> list of
+   free vectors). Clasp's GCTOOLS:DEALLOCATE-UNMANAGED-INSTANCE (the backend of
+   STATIC-VECTORS:FREE-STATIC-VECTOR) passes the object pointer — an interior
+   pointer of the malloc'd header block — to GC_free, which corrupts Boehm's
+   small-object freelists and crashes later allocations (SIGILL/SIGSEGV inside
+   GC_malloc_kind). FREE-STATIC therefore never truly deallocates on Clasp; it
+   recycles through this pool. Bounded by the peak number of live static vectors
+   per size. Documented NFR-PORT gap until the upstream deallocator is fixed.")
+
+(defvar *static-pool-lock* (bordeaux-threads:make-lock "dds-static-pool")
+  "Guards *STATIC-POOL*: FREE-STATIC also runs on receiver threads.")
+
 (defun* alloc-static (n-bytes)
     (function ((integer 0)) (simple-array (unsigned-byte 8) (*)))
   "Allocate N-BYTES of off-heap octet memory the GC neither scans, moves, nor
    reclaims. Returns a foreign-backed (unsigned-byte 8) vector with a stable
-   address. The single representation stable across all three target GCs."
+   address; contents unspecified. The single representation stable across all
+   three target GCs. On Clasp, satisfied from *STATIC-POOL* when a free vector
+   of exactly N-BYTES exists (recycled vectors are zero-filled as hygiene)."
   (declare (type (integer 0) n-bytes))
-  (static-vectors:make-static-vector n-bytes :element-type '(unsigned-byte 8)))
+  (let ((recycled (bordeaux-threads:with-lock-held (*static-pool-lock*)
+                    (let ((free (gethash n-bytes *static-pool*)))
+                      (when free
+                        (setf (gethash n-bytes *static-pool*) (rest free))
+                        (first free))))))
+    (if recycled
+        (fill (the (simple-array (unsigned-byte 8) (*)) recycled) 0)
+        (static-vectors:make-static-vector n-bytes :element-type '(unsigned-byte 8)))))
 
 (defun* free-static (vec)
     (function ((simple-array (unsigned-byte 8) (*))) t)
-  "Release memory obtained from ALLOC-STATIC. Idempotency is the caller's job."
-  (static-vectors:free-static-vector vec))
+  "Release memory obtained from ALLOC-STATIC. Idempotency is the caller's job.
+   On Clasp this recycles VEC into *STATIC-POOL* instead of deallocating, because
+   GCTOOLS:DEALLOCATE-UNMANAGED-INSTANCE GC_frees an interior pointer and corrupts
+   the Boehm heap (see *STATIC-POOL*)."
+  (bordeaux-threads:with-lock-held (*static-pool-lock*)
+    (push vec (gethash (length vec) *static-pool*)))
+  t)
 
 (defun* static-pointer (vec)
     (function ((simple-array (unsigned-byte 8) (*))) t)
