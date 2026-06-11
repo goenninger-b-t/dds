@@ -193,6 +193,16 @@ serializer produces. That is the live foreign-vendor confirmation of our provisi
 minimal TypeObject serializer + hash (FR-TYPE-2/3) that the stock Connext wire could
 not provide (ADR 0009/0010); the byte-level S3 pass locks it in the matrix.
 
+**S3 DONE (2026-06-12):** the 92-octet fr 236/237 parameter value (byte-identical in
+`s2-forward-lo0.pcap` fr 68) is locked as the regression vector in test
+`fastdds-type-information-vector`; `deserialize-type-information-hash` was extended
+(failing-test-first) to consume the `LC=5` NEXTINT-reuse framing alongside our `LC=4`,
+and our own ShapeType serializer reproduces the hash + size 87 byte-for-byte. The
+`verification.csv` FR-TYPE-2/3 PROVISIONAL caveat is narrowed to the unexercised
+serialization-VM edges. Suite: **92 green on SBCL and on Clasp** (`GC_DONT_GC=1`) —
+a Clasp crash first seen at this test was root-caused to the runtime's unmanaged-free
+heap corruption, not the test (see the NFR-PORT row in `docs/verification.csv`).
+
 **Not a bug:** Wireshark 4.6.x renders our `LC=4` TypeInformation as garbage (it only
 understands the `LC=5` DHEADER-reuse layout) while decoding Fast DDS's cleanly. The
 encoding is conformant per §7.4.3.4.2 and Fast DDS consumed it — it matched our

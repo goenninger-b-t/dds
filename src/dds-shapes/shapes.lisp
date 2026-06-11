@@ -39,7 +39,8 @@
     (function () (or null (simple-array (unsigned-byte 8) (*))))
   "Opaque serialized XTypes TypeInformation for the canonical ShapeType, advertised in
    PID_TYPE_INFORMATION so rtishapesdemo / DDSSpy see our type; NIL if unavailable.
-   PROVISIONAL bytes (see typeobject-cdr.lisp) — capture with tshark to compare vs Connext."
+   The EK_MINIMAL hash + size inside are externally confirmed vs live Fast DDS 3.6.1
+   (FR-IO-2 S3; test fastdds-type-information-vector — see typeobject-cdr.lisp)."
   (handler-case
       (let ((ts (dds.types:find-type-support "shape-type")))
         (and ts (dds.types:serialize-type-information (dds.types:type-support-typeobject ts))))

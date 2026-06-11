@@ -233,6 +233,7 @@
                  ("xtypes-assignability"     . run-assignability-test)
                  ("xtypes-typeobject-cdr"    . run-typeobject-cdr-test)
                  ("xtypes-type-information"  . run-type-information-test)
+                 ("fastdds-type-information-vector" . run-fastdds-type-information-vector-test)
                  ("typelookup-request"       . run-typelookup-request-test)
                  ("typelookup-reply"         . run-typelookup-reply-test)
                  ("typelookup-vectors"       . run-typelookup-vector-test)

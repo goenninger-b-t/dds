@@ -9,13 +9,18 @@
 ;;;; MinimalTypeObject + MinimalStructType + CommonStructMember + MinimalMemberDetail +
 ;;;; MinimalTypeDetail FINAL; MinimalStructHeader + MinimalStructMember APPENDABLE).
 ;;;;
-;;;; PROVISIONAL pending a Connext oracle (owner decision 2026-06-06 "build now, confirm
-;;;; vs Connext"). Three byte-level choices are spec-faithful but unconfirmed against a
-;;;; conformant peer, and are the single points to flip when Connext reference vectors
-;;;; arrive: (1) the hash is over the raw TypeObject XCDR2-LE bytes with NO 4-byte
-;;;; encapsulation header; (2) struct_flags = the extensibility bit only (minimal-masked,
-;;;; XTypes TypeFlagMinimalMask 0x0007); (3) member_flags = TRY_CONSTRUCT=DISCARD (0x01)
-;;;; OR'd with @optional/@must_understand/@key (minimal-masked 0x003f). Sequence-member
+;;;; EXTERNALLY CONFIRMED vs live Fast DDS 3.6.1 for the exercised path (FR-IO-2 S3,
+;;;; 2026-06-12; Connext never emits the minimal hash, ADR 0009): for the identical
+;;;; ShapeType IDL (FINAL struct + i32 + unbounded string8) Fast DDS announces the SAME
+;;;; EK_MINIMAL hash + typeobject_serialized_size 87 (test fastdds-type-information-vector,
+;;;; locked from interop/fastdds/captures/s1-forward-lo0.pcap frame 236) — MD5 equality
+;;;; pins the whole 87-octet serialization, confirming the three formerly-provisional
+;;;; byte-level choices for that path: (1) the hash is over the raw TypeObject XCDR2-LE
+;;;; bytes with NO 4-byte encapsulation header; (2) struct_flags = the extensibility bit
+;;;; only (minimal-masked, XTypes TypeFlagMinimalMask 0x0007); (3) member_flags =
+;;;; TRY_CONSTRUCT=DISCARD (0x01) OR'd with @optional/@must_understand/@key (minimal-masked
+;;;; 0x003f). Still PROVISIONAL: the unexercised serialization-VM edges (unions, MUTABLE
+;;;; structs, TK_NONE base under the hash, nested-dependency hashes). Sequence-member
 ;;;; TypeIdentifiers (plain-collection element_flags / EK_BOTH / @external framing) are
 ;;;; the most oracle-sensitive and error cleanly until confirmed. SCC/cyclic types
 ;;;; (§7.3.4.9.2) are out of scope: the DSL is acyclic (define-before-use).
@@ -46,8 +51,10 @@
 (defun* %member-flag (m)
     (function (minimal-struct-member) (unsigned-byte 16))
   "Minimal-masked StructMemberFlag (idl §139, MemberFlagMinimalMask 0x003f): TRY_CONSTRUCT
-   DISCARD OR'd with @optional/@must_understand/@key. PROVISIONAL: the TRY_CONSTRUCT default
-   and whether non-optional members carry @must_understand are Connext-confirmable."
+   DISCARD OR'd with @optional/@must_understand/@key. The TRY_CONSTRUCT-DISCARD default and
+   the bare non-optional flags are externally confirmed for key + plain members via the Fast
+   DDS hash lock (test fastdds-type-information-vector); @optional/@must_understand
+   combinations remain peer-unexercised."
   (logior +member-flag-try-construct-discard+
           (if (minimal-struct-member-optional-p m) +member-flag-is-optional+ 0)
           (if (minimal-struct-member-must-understand-p m) +member-flag-is-must-understand+ 0)
@@ -207,7 +214,9 @@
 (defun* equivalence-hash (s)
     (function (minimal-struct-type) (simple-array (unsigned-byte 8) (*)))
   "EquivalenceHash(S) = first 14 octets of MD5 of the serialized MinimalTypeObject
-   (XTypes §7.3.4.9.1). Nested struct members recurse to the referenced struct's hash."
+   (XTypes §7.3.4.9.1). Nested struct members recurse to the referenced struct's hash.
+   Externally confirmed vs live Fast DDS 3.6.1 for the exercised path (FR-IO-2 S3;
+   test fastdds-type-information-vector)."
   (subseq (dds.core.md5:md5 (minimal-type-object-octets s)) 0 14))
 
 ;;;; MinimalTypeObject deserializer (TypeLookup Task 2.1, FR-TYPE-2/3): the exact inverse
@@ -367,11 +376,13 @@
 ;;;; a TypeIdentifierWithDependencies (APPENDABLE) { TypeIdentfierWithSize [sic] typeid_with_size;
 ;;;; long dependent_typeid_count; sequence<TypeIdentfierWithSize> dependent_typeids; };
 ;;;; TypeIdentfierWithSize (APPENDABLE) { TypeIdentifier type_id; unsigned long
-;;;; typeobject_serialized_size; }. PROVISIONAL like the TypeObject serializer: minimal-only
-;;;; (the complete member is omitted, MUTABLE permits it); the mutable member uses LC=4
-;;;; (explicit NEXTINT length) with M_FLAG=0 (the §7.2.2.4.4.4.6 must_understand default;
-;;;; the IDL has no @must_understand); dependent ordering is insertion order. Confirm vs
-;;;; Connext.
+;;;; typeobject_serialized_size; }. Emission: minimal-only (the complete member is omitted,
+;;;; MUTABLE permits it); the mutable member uses LC=4 (explicit NEXTINT length) with
+;;;; M_FLAG=0 (the §7.2.2.4.4.4.6 must_understand default; the IDL has no @must_understand);
+;;;; dependent ordering is insertion order. Spec-legal and consumed by live Fast DDS 3.6.1
+;;;; (FR-IO-2 S1/S2). Parsing accepts BOTH LC=4 and the LC>=5 NEXTINT-reuse framing
+;;;; (§7.4.3.4.2) that Fast DDS emits — its live 92-octet value (minimal+complete members,
+;;;; dependent_typeid_count -1) is locked in test fastdds-type-information-vector.
 
 
 (defun* %put-type-id-with-size-octets (c hash size)
@@ -432,7 +443,9 @@
    PID_TYPE_INFORMATION: a MUTABLE struct DHEADER + the @id(0x1001) minimal member
    (EMHEADER1 M_FLAG=0 LC=4 + NEXTINT length + TypeIdentifierWithDependencies).
    M_FLAG=0 is the must_understand default (§7.2.2.4.4.4.6; the TypeInformation IDL
-   carries no @must_understand on its members). CONFIRM-VS-PEER."
+   carries no @must_understand on its members). LC=4 is spec-legal alongside the LC=5
+   NEXTINT-reuse framing Fast DDS emits (§7.4.3.4.2); live Fast DDS 3.6.1 consumed this
+   emission (FR-IO-2 S1/S2)."
   (let* ((buf (dds.core.buffer:make-octet-buffer 16384))
          (c (dds.core.buffer:cursor buf :endianness :little)))
     (let ((p (%dheader-begin c)))
@@ -450,7 +463,10 @@
     (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
   "Parse a serialized TypeInformation and return its minimal EK_MINIMAL TypeIdentifier's
    14-octet EquivalenceHash (the value endpoint matching needs). Lenient: walks the top
-   DHEADER, the @id(0x1001) member EMHEADER1 (+NEXTINT), and the two APPENDABLE DHEADERs."
+   DHEADER, the @id(0x1001) member EMHEADER1 (+NEXTINT), and the two APPENDABLE DHEADERs.
+   Accepts both mutable-member framings (XTypes 1.3 §7.4.3.4.2): LC=4 (NEXTINT is the
+   member length; the member's own DHEADER follows — our emission) and LC>=5 (NEXTINT is
+   REUSED as the member's leading UInt32, i.e. its DHEADER — Fast DDS 3.6.1 emission)."
   (let* ((buf (dds.core.buffer:make-octet-buffer (max 16 (length octets))))
          (c (dds.core.buffer:cursor buf :endianness :little)))
     (replace (dds.core.buffer:octet-buffer-vec buf) octets)
@@ -462,8 +478,10 @@
              (declare (ignore mu))
              (unless (= id #x1001)
                (error "TypeInformation parse: expected minimal member 0x1001, got #x~x" id))
+             ;; LC>=4: NEXTINT carries the member length (§7.4.3.4.2)
              (when (>= lc 4) (dds.core.buffer:get-u32 c))
-             (dds.cdr:cdr-get-dheader c :xcdr2)
+             ;; LC=4: a separate member DHEADER follows; LC>=5: NEXTINT was the DHEADER
+             (when (= lc 4) (dds.cdr:cdr-get-dheader c :xcdr2))
              (dds.cdr:cdr-get-dheader c :xcdr2)
              (let ((disc (dds.core.buffer:get-u8 c)))
                (unless (= disc +ek-minimal+)

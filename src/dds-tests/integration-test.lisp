@@ -1062,15 +1062,16 @@
 ;;; XCDR2 MinimalTypeObject serializer + EquivalenceHash (M4, FR-TYPE-2/5): serialize the
 ;;; Minimal struct TypeObject to canonical XCDR2-LE bytes (XTypes §7.3.4.5) and hash it
 ;;; (§7.3.4.9.1). The hand-derived golden (struct pt{long x;}) proves the framing byte-exact
-;;; against the §7.4.3.5.3 serialization VM. PROVISIONAL flag/encap choices await Connext.
+;;; against the §7.4.3.5.3 serialization VM. The flag/encap choices are externally confirmed
+;;; for the exercised path by the Fast DDS vector test below (fastdds-type-information-vector).
 
 (defun* run-typeobject-cdr-test ()
     (function () t)
   "Serialize a Minimal struct TypeObject to XCDR2-LE + compute its EquivalenceHash. Asserts
    the spec-derived golden byte layout for a 1-member FINAL struct, the hash shape +
    determinism, distinct types hashing differently, nested-struct recursion, and that
-   sequence members error cleanly pending oracle confirmation. The shape-type hash is a
-   PROVISIONAL self-consistency vector — to be locked byte-exact against Connext."
+   sequence members error cleanly pending oracle confirmation. The shape-type hash is
+   externally locked vs live Fast DDS 3.6.1 (test fastdds-type-information-vector)."
   (let ((pt (dds.types:make-minimal-struct-type
              :name "pt" :extensibility :final
              :members (list (dds.types:make-struct-member
@@ -1094,11 +1095,11 @@
               "a different member type yields a different EquivalenceHash"))
     (let ((to (dds.types:type-support-typeobject (dds.types:find-type-support "shape-type"))))
       (%check :to-shape-bytes (= 87 (length (dds.types:minimal-type-object-octets to)))
-              "shape-type MinimalTypeObject serializes (PROVISIONAL byte count)")
+              "shape-type MinimalTypeObject serializes to 87 octets (= Fast DDS's typeobject_serialized_size)")
       (%check :to-shape-hash
               (equalp (dds.types:equivalence-hash to)
                       (octets #xbf #xe2 #xa6 #x2e #xd8 #x11 #xac #x46 #x3c #x40 #xc9 #x7d #x30 #xee))
-              "shape-type EquivalenceHash (PROVISIONAL self-consistency vector; lock vs Connext)"))
+              "shape-type EquivalenceHash (externally confirmed vs live Fast DDS 3.6.1, FR-IO-2 S3)"))
     (let ((to (dds.types:type-support-typeobject (dds.types:find-type-support "gseg"))))
       (%check :to-nested (= 14 (length (dds.types:equivalence-hash to)))
               "a struct with nested-struct members hashes via recursion into the referenced TypeObject"))
@@ -1110,8 +1111,9 @@
 
 ;;; TypeInformation codec (M4 step b1, FR-TYPE-3 foundation): serialize the TypeInformation
 ;;; carried in PID_TYPE_INFORMATION (idl @id 0x0075) and recover the minimal EquivalenceHash.
-;;; Round-trip-verifiable offline; the wire layout is PROVISIONAL (minimal-only, LC=4) pending
-;;; Connext confirmation, like the TypeObject serializer.
+;;; Round-trip-verifiable offline; the LC=4 minimal-only emission is spec-legal and was
+;;; consumed by live Fast DDS 3.6.1 (FR-IO-2 S1/S2); the parser is additionally locked
+;;; against Fast DDS's own LC=5 value (fastdds-type-information-vector below).
 
 (defun* run-type-information-test ()
     (function () t)
@@ -1141,6 +1143,51 @@
       (%check :ti-nested-larger
               (> (length ginfo) (length (dds.types:serialize-type-information (to "dcps-msg"))))
               "a type with a nested dependency carries a larger TypeInformation")))
+  t)
+
+;;; Live Fast DDS 3.6.1 TypeInformation vector (FR-IO-2 S3, FR-TYPE-2/3): the external
+;;; oracle for the XCDR2 MinimalTypeObject serializer + EquivalenceHash. Fast DDS announced
+;;; the IDENTICAL ShapeType IDL (@final, @key string color; long x; long y; long shapesize)
+;;; and its SEDP PID_TYPE_INFORMATION carries EK_MINIMAL hash bfe2a62ed811ac463c40c97d30ee /
+;;; typeobject_serialized_size 87 — byte-identical to ours, closing the ADR 0009 PROVISIONAL
+;;; thread for the exercised path (FINAL struct + i32 + unbounded string8). Their framing is
+;;; EMHEADER1 LC=5 (NEXTINT reused as the member's leading DHEADER, XTypes 1.3 §7.4.3.4.2),
+;;; unlike our LC=4 emission — the parser must consume both.
+
+(defun* %fastdds-type-information-vector ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The live Fast DDS 3.6.1 PID_TYPE_INFORMATION parameter value (92 octets) from
+   interop/fastdds/captures/s1-forward-lo0.pcap frames 236/237 (SEDP DATA, TLV
+   `75 00 5c 00` at frame offset 0x110, value at 0x114..0x16f); byte-identical in
+   s2-forward-lo0.pcap frame 68. Layout: DHEADER + EMHEADER1 0x50001001 (minimal,
+   LC=5) + members minimal(0x1001)/complete(0x1002), each a
+   TypeIdentifierWithDependencies with dependent_typeid_count -1."
+  (%hex-octets
+   (concatenate 'string
+    "580000000110005024000000"
+    "14000000f1bfe2a62ed811ac463c40c97d30ee0057000000ffffffff0400000000000000"
+    "021000502400000014000000f24945808c7622315d6220054f6aad00"
+    "84000000ffffffff0400000000000000")))
+
+(defun* run-fastdds-type-information-vector-test ()
+    (function () t)
+  "Test: the live Fast DDS 3.6.1 PID_TYPE_INFORMATION vector (LC=5) parses to the
+   EK_MINIMAL hash, and our own ShapeType serializer reproduces that hash + size 87 —
+   the external EquivalenceHash confirmation (FR-IO-2 S3, FR-TYPE-2/3)."
+  (let ((vec (%fastdds-type-information-vector))
+        (hash (octets #xbf #xe2 #xa6 #x2e #xd8 #x11 #xac #x46 #x3c #x40 #xc9 #x7d #x30 #xee)))
+    (%check :fastdds-ti-len (= 92 (length vec))
+            "the locked parameter value is 92 octets (TLV length 0x005c)")
+    (%check :fastdds-ti-parse
+            (equalp (dds.types:deserialize-type-information-hash vec) hash)
+            "our parser consumes the foreign LC=5 TypeInformation and recovers EK_MINIMAL")
+    (let ((to (dds.types:type-support-typeobject (dds.types:find-type-support "shape-type"))))
+      (%check :fastdds-ti-our-hash
+              (equalp (dds.types:equivalence-hash to) hash)
+              "our ShapeType EquivalenceHash equals Fast DDS's for the identical IDL")
+      (%check :fastdds-ti-our-size
+              (= 87 (length (dds.types:minimal-type-object-octets to)))
+              "our serialized MinimalTypeObject size equals their typeobject_serialized_size 87")))
   t)
 
 ;;; Inbound RTI PID_TYPE_OBJECT_LB inflate (ADR 0009, FR-TYPE-3): a ZLIB-compressed
