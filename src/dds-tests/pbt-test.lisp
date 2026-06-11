@@ -232,7 +232,16 @@
                              (or (member rm '(nil :unsupported))
                                  (typep rm 'dds.types:minimal-struct-type))
                              t))))
-    (format t "~&  pbt: 5 properties x ~d cases each, deterministic seed.~%" runs)
+    ;; legacy-TypeObject tokenizer NEVER-signal: result is NIL or an lto-node (no error type)
+    ;; seeds: inflated C_Shape LB (the real wire capture) + the three TypeLookup seeds (cross-feed)
+    (let* ((lto-inflated (dds.types:inflate-type-object-lb (%connext-c-shape-lb)))
+           (lto-seeds (concatenate 'simple-vector (vector lto-inflated) tlseeds)))
+      (check-property "lto-tokenizer-fuzz-no-signal" prng runs
+                      (lambda (p) (gen-tl-fuzz p lto-seeds))
+                      (lambda (v)
+                        (let ((result (dds.types:tokenize-legacy-type-object v)))
+                          (or (null result) (dds.types:lto-node-p result))))))
+    (format t "~&  pbt: 6 properties x ~d cases each, deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)
