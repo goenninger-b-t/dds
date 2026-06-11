@@ -132,3 +132,72 @@ Subscriber (trimmed):
 Received 48/50 (≥ 40 required): the first two samples pre-date the endpoint match and
 are not delivered under the default VOLATILE durability — expected. The shipped
 `interfaceWhiteList` worked unmodified.
+
+## S1 discovery census (Task 1.1, FR-IO-2 — 2026-06-11, same host, lo0)
+
+Mutual SPDP/SEDP discovery vs Fast DDS 3.6.1, both directions, from the wire.
+Captures + run logs are archived under `captures/` (carved out of this directory's
+`.gitignore` — pcaps here are the recorded evidence, not transient probe output).
+An `en7` capture was taken alongside each run and contained **zero** RTPS frames:
+on this host every RTPS packet (multicast SPDP included) rides `lo0`, so only the
+`lo0` pcaps are archived.
+
+| Run | Peers | Capture | Result |
+|---|---|---|---|
+| forward | `fastdds-pub COLOR=GREEN COUNT=200` → our `run-subscriber` (`:canonical`, 45 s) | `captures/s1-forward-lo0.pcap` | matched; **194/200** delivered, zero Lisp warnings/errors (`captures/s1-forward-oursub.out`) |
+| reverse | our `run-publisher` (ORANGE, 250) → `fastdds-sub SECONDS=45` | `captures/s1-reverse-lo0.pcap` | `matched change: 1`; **250/250** delivered, 428 ACKNACKs consumed by our writer (`captures/s1-reverse-fastsub.out`, `-ourpub.out`) |
+
+GuidPrefixes: ours `474253aa…` (fwd sub) / `47425013…` (rev pub); Fast DDS
+`010f5493af30cb08…` (fwd) / `010f5493a1311f93…` (rev).
+
+### What Fast DDS announces
+
+| Item | Observed | Evidence (pcap, frame) |
+|---|---|---|
+| VendorId | **`01.0f`** (eProsima — Fast-RTPS); RTPS protocol version **2.2** | forward fr 168 (first SPDP, `127.0.0.1:65343 → 239.255.0.1:7400`); every header |
+| Product version (vendor PID `0x8000`) | `03 06 01 00` = **3.6.1.0** — confirms the pinned toolchain on the wire | forward fr 168 |
+| `PID_BUILTIN_ENDPOINT_SET` (0x0058) | **`0x0000fc3f`**. XTypes 1.3 Table 62 TypeLookup bits **12–15 all set**: Request DataWriter (1<<12), Request DataReader (1<<13), Reply DataWriter (1<<14), Reply DataReader (1<<15); plus the RTPS Table 9.4 SPDP/SEDP bits 0–5 and ParticipantMessage bits 10–11 | forward fr 168 |
+| SPDP extras | `PID_DOMAIN_ID` 0; lease 20 s; metatraffic `192.168.2.148:7410`, user `…:7411`; entityName `RTPSParticipant`; property list `PARTICIPANT_TYPE=SIMPLE` + `fastdds.physical_data.{host,user,process}`; vendor PIDs `0x8003` (44 B host GUID string), `0x8007` (4 B `01000000`) | forward fr 168 |
+| SEDP publication carries **`PID_TYPE_INFORMATION` (0x0075)** | **YES, parameterLength 92** (the Stage-S3 input). Mutable `TypeInformation` with BOTH members: `0x1001` minimal **and** `0x1002` complete, each `EMHEADER1 LC=5` (NEXTINT doubles as the member DHEADER, XTypes 1.3 §7.4.3.4.2), `dependent_typeid_count = -1` ("not provided", §7.6.3.2.1), empty dependent list | forward fr 236/237 (SEDP `DATA(w)`, writer `…00000102`, seq 1, topic `Square`, type `ShapeType`, TRANSIENT_LOCAL) |
+| — minimal TypeIdentifier | `EK_MINIMAL (0xf1)`, EquivalenceHash **`bfe2a62ed811ac463c40c97d30ee`**, `typeobject_serialized_size` **87** | forward fr 236 |
+| — complete TypeIdentifier | `EK_COMPLETE (0xf2)`, EquivalenceHash `4945808c7622315d6220054f6aad`, size 132 | forward fr 236 |
+| SEDP subscription carries 0x0075 too | YES, parameterLength 92, same two hashes; reader `…00000107`, RELIABLE + VOLATILE | reverse fr 213/214 (SEDP `DATA(r)`) |
+| TypeLookup_Request traffic | **NONE in either direction** — no `DATA` ever flows on the TL writers (`0x000300c3`/`0x000301c3`), so no `instanceName` was observable. Fast DDS *does* create the endpoints: it HEARTBEATs its empty TL request writer (first=1, last=0) and our stack ACKNACKs it. Expected: both sides' 0x0075 hashes resolve locally (identical type), so `getTypes`/`getTypeDependencies` is never needed | forward fr 206 (their HB), fr 210 (our ACKNACK); reverse fr 185/186 |
+
+### Mutual-discovery evidence (the S1 exit gate)
+
+- **Forward:** Fast DDS processed our SPDP — its SEDP toward us is unicast with
+  `INFO_DST` = our guidPrefix (fr 236); we matched its writer and ACKNACK its user
+  DATA (fr 240/241); first user `DATA` at fr 224/225; 194/200 samples delivered (the
+  first ~6 pre-date the match; our reader is VOLATILE).
+- **Reverse:** Fast DDS unicast its SEDP `DATA(r)` at our prefix (fr 213/214) and
+  ACKNACKed our user writer `…00000102` from fr 211/212 on (428 total); its
+  `shapes_sub` printed `matched change: 1` and received **250/250** (RELIABLE).
+- **Data plane already flows in both directions** — Stage S2 is de-risked to QoS/edge
+  cases.
+
+### Our 0x0075 vs theirs (S3 input)
+
+Our SEDP (e.g. forward fr 201, 52 B) and Fast DDS's (fr 236, 92 B) encode the same
+`TypeInformation` type with three deliberate differences, all spec-legal:
+
+| | ours | Fast DDS 3.6.1 |
+|---|---|---|
+| members | minimal (`0x1001`) only | minimal + complete |
+| EMHEADER length code | `LC=4` + explicit member DHEADER (§7.4.3.4.2: "serialized member length is NEXTINT") | `LC=5` (NEXTINT reused as the member's leading DHEADER, saves 4 B) |
+| `dependent_typeid_count` | 0 (+ empty list) | −1 = not provided (legal per §7.6.3.2.1) |
+
+**The EK_MINIMAL EquivalenceHash and serialized size agree exactly** — Fast DDS
+independently computes `bfe2a62ed811ac463c40c97d30ee` / 87 B for the same IDL our
+serializer produces. That is the live foreign-vendor confirmation of our provisional
+minimal TypeObject serializer + hash (FR-TYPE-2/3) that the stock Connext wire could
+not provide (ADR 0009/0010); the byte-level S3 pass locks it in the matrix.
+
+**Not a bug:** Wireshark 4.6.x renders our `LC=4` TypeInformation as garbage (it only
+understands the `LC=5` DHEADER-reuse layout) while decoding Fast DDS's cleanly. The
+encoding is conformant per §7.4.3.4.2 and Fast DDS consumed it — it matched our
+endpoints and delivered 250/250 against the very announcement carrying it. Cosmetic
+dissector limitation only.
+
+Our parser handled every Fast DDS announcement cleanly: no Lisp error, warning, or
+mis-parse in either run (`captures/*-oursub.out` / `*-ourpub.out`).

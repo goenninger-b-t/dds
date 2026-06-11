@@ -2,10 +2,14 @@
 shapes/shapes_pub
 shapes/shapes_sub
 
-# transient capture artifacts (pcaps + tshark decodes produced while probing)
+# transient capture artifacts (pcaps + tshark decodes produced while probing).
+# captures/ is the exception: archived evidence cited by the README census tables.
 *.pcap
 *.pcapng
 decode.txt
 decode.err
 tshark.err
 *.out
+!captures/
+!captures/*.pcap
+!captures/*.out

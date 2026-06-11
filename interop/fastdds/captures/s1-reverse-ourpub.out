@@ -1,0 +1,11 @@
+[pub] Square/ShapeType[canonical] color=ORANGE domain=0 uuid=ba5fa42c-5974-4a8b-8677-8d6b03bd51ec (multicast 239.255.0.1). Ctrl-C to stop.
+[pub] peer discovered -> DATA destination 192.168.2.148:7411
+[pub] sent 30 samples; peers=1; ACKNACKs received=0
+[pub] sent 60 samples; peers=1; ACKNACKs received=48
+[pub] sent 90 samples; peers=1; ACKNACKs received=108
+[pub] sent 120 samples; peers=1; ACKNACKs received=168
+[pub] sent 150 samples; peers=1; ACKNACKs received=228
+[pub] sent 180 samples; peers=1; ACKNACKs received=288
+[pub] sent 210 samples; peers=1; ACKNACKs received=348
+[pub] sent 240 samples; peers=1; ACKNACKs received=408
+[pub] stopped after 250 samples; ACKNACKs received=428 (uuid=ba5fa42c-5974-4a8b-8677-8d6b03bd51ec).
