@@ -135,8 +135,8 @@
 
 (defun* gen-tl-seeds ()
     (function () simple-vector)
-  "Build one VALID serialized TypeLookup_Request and TypeLookup_Reply each (small
-   inputs via the dds.types serializers); the truncation/mutation fuzz seeds."
+  "Build one VALID serialized TypeLookup_Request, TypeLookup_Reply, and MinimalTypeObject
+   each (small inputs via the dds.types serializers); the truncation/mutation fuzz seeds."
   (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
         (hash (make-array 14 :element-type '(unsigned-byte 8) :initial-element 3))
         (cont (make-array 4 :element-type '(unsigned-byte 8) :initial-element 9))
@@ -148,7 +148,15 @@
              :type-ids (list hash) :continuation cont)
             (dds.types:serialize-type-lookup-reply
              :related-guid guid :related-sn 1 :operation :get-types
-             :pairs (list (cons hash tobj))))))
+             :pairs (list (cons hash tobj)))
+            (dds.types:minimal-type-object-octets
+             (dds.types:make-minimal-struct-type
+              :name "z" :extensibility :final
+              :members (list (dds.types:make-struct-member
+                              "x" 0 (dds.types:primitive-type-identifier :i32))
+                             (dds.types:make-struct-member
+                              "s" 1 (dds.types:primitive-type-identifier :string)
+                              :key-p t)))))))
 
 (defun* gen-tl-fuzz (prng seeds)
     (function (prng simple-vector) (simple-array (unsigned-byte 8) (*)))
@@ -211,15 +219,18 @@
                                                  (dds.core.buffer:cursor b) flags)))
                                (safe (lambda () (dds.rtps.message:parse-nack-frag-body
                                                  (dds.core.buffer:cursor b) flags))))))))
-    ;; TypeLookup parsers contract NEVER-signal: no safe-wrap, a signal fails the property
-    ;; RUNS (not 4x): each case feeds BOTH parsers and rejects signal internally (Clasp cost)
+    ;; TypeLookup + TypeObject parsers contract NEVER-signal: no safe-wrap, a signal fails
+    ;; RUNS (not 4x): each case feeds all three parsers and rejects signal internally (Clasp cost)
     (check-property "typelookup-parser-fuzz-no-signal" prng runs
                     (lambda (p) (gen-tl-fuzz p tlseeds))
                     (lambda (v)
                       (let ((rq (dds.types:parse-type-lookup-request v))
-                            (rp (dds.types:parse-type-lookup-reply v)))
+                            (rp (dds.types:parse-type-lookup-reply v))
+                            (rm (dds.types:parse-minimal-type-object v)))
                         (and (member rq '(nil :get-types :get-deps :unknown))
                              (member rp '(nil :get-types :get-deps :unknown))
+                             (or (member rm '(nil :unsupported))
+                                 (typep rm 'dds.types:minimal-struct-type))
                              t))))
     (format t "~&  pbt: 5 properties x ~d cases each, deterministic seed.~%" runs)
     (loop for b across fuzzbufs

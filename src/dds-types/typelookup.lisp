@@ -675,3 +675,86 @@
                               (t (values :unknown nil guid sn rex nil))))))))))
              (dds.core.buffer:buffer-overflow () nil))
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))
+
+;;;; TypeLookup server core (Task 3.1, FR-TYPE-3): a memoized EquivalenceHash index over
+;;;; *type-registry* plus the pure request->reply function the builtin service endpoints
+;;;; will call (XTypes 1.3 §7.6.3.3.4: a participant SHALL answer getTypes /
+;;;; getTypeDependencies for any TypeIdentifier it announced). No transport here.
+
+(defparameter *max-typelookup-request-ids* 32
+  "Max type_ids accepted in one inbound TypeLookup request before the request is
+   dropped unanswered (resource-exhaustion guard, NFR-SEC-POSTURE).")
+
+(defvar *tl-hash-index* (cons -1 '())
+  "Memoized EquivalenceHash index: (registry-generation . ((hash14 . type-name) ...)),
+   rebuilt by %TL-HASH-INDEX whenever *TYPE-REGISTRY-GENERATION* changes (re-registering
+   an existing name bumps the generation though the registry count is unchanged).")
+
+(defun* %tl-hash-index ()
+    (function () list)
+  "The ((hash14 . type-name) ...) alist over *TYPE-REGISTRY*, memoized in
+   *TL-HASH-INDEX* and invalidated when *TYPE-REGISTRY-GENERATION* changes.
+   Types without a serializable minimal TypeObject (EQUIVALENCE-HASH errors, e.g.
+   sequence member TypeIdentifiers pending oracle confirmation) are skipped."
+  (let ((n *type-registry-generation*))
+    (unless (= n (car *tl-hash-index*))
+      (let ((acc '()))
+        (loop for name being the hash-keys of *type-registry* using (hash-value ts)
+              do (let ((to (type-support-typeobject ts)))
+                   (when (minimal-struct-type-p to)
+                     ;; unserializable TypeObject: the type is not served by hash
+                     (handler-case (push (cons (equivalence-hash to) name) acc)
+                       (error () nil)))))
+        (setf *tl-hash-index* (cons n (nreverse acc)))))
+    (cdr *tl-hash-index*)))
+
+(defun* find-type-support-by-hash (hash)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "The registered type-support whose minimal EquivalenceHash equals HASH (first 14
+   octets compared), or NIL. Types whose TypeObject cannot serialize are skipped."
+  (when (>= (length hash) 14)
+    (let* ((h (if (= 14 (length hash)) hash (subseq hash 0 14)))
+           (entry (assoc h (%tl-hash-index) :test #'equalp)))
+      (and entry (find-type-support (cdr entry))))))
+
+(defun* type-lookup-respond (request-octets)
+    (function ((simple-array (unsigned-byte 8) (*)))
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "Answer one inbound TypeLookup request: getTypes/getTypeDependencies over the local
+   type registry (XTypes 1.3 §7.6.3.3.4: a participant SHALL answer for any
+   TypeIdentifier it announced). NIL = drop (malformed or guard-rejected). The reply's
+   relatedRequestId echoes the request's writer GUID + SN (§7.6.3.3.2); hashes not
+   found locally are silently omitted (zero pairs/deps still answers REMOTE_EX_OK);
+   an unrecognized TypeLookup_Call discriminator answers REMOTE_EX_UNKNOWN_OPERATION
+   with no TypeLookup_Return arm. getTypeDependencies dependencies are the
+   %COLLECT-DEPENDENCIES closure of each found type, deduped by hash, as
+   (hash . typeobject-serialized-size) TypeIdentfierWithSize entries; the
+   continuation_point is always empty (v1 serves the full set in one reply)."
+  (multiple-value-bind (op ids guid sn) (parse-type-lookup-request request-octets)
+    (cond
+      ((null op) nil)
+      ((> (length ids) *max-typelookup-request-ids*) nil)
+      ((eq op :unknown)
+       (serialize-type-lookup-reply :related-guid guid :related-sn sn
+                                    :remote-ex :unknown-operation))
+      ((eq op :get-types)
+       (let ((pairs (loop for h in ids
+                          for ts = (find-type-support-by-hash h)
+                          when ts
+                            collect (cons h (minimal-type-object-octets
+                                             (type-support-typeobject ts))))))
+         (serialize-type-lookup-reply :related-guid guid :related-sn sn
+                                      :operation :get-types :remote-ex :ok
+                                      :pairs pairs)))
+      (t
+       (let ((deps '()))
+         (dolist (h ids)
+           (let ((ts (find-type-support-by-hash h)))
+             (when ts
+               (dolist (d (%collect-dependencies (type-support-typeobject ts)))
+                 (let ((dh (equivalence-hash d)))
+                   (unless (assoc dh deps :test #'equalp)
+                     (push (cons dh (length (minimal-type-object-octets d))) deps)))))))
+         (serialize-type-lookup-reply :related-guid guid :related-sn sn
+                                      :operation :get-deps :remote-ex :ok
+                                      :dependencies (nreverse deps)))))))

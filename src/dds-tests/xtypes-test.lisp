@@ -287,3 +287,300 @@
                       "77658e5b0400000000000000")))
             "canonical getTypes REPLY drifted from the pinned 132-octet vector"))
   t)
+
+;;;; TypeLookup hash index + pure server core (Task 3.1, FR-TYPE-3): pure functions over
+;;;; the type registry — no sockets, no disc-node. The registry is populated by the
+;;;; define-dds-type forms across the suite: "shape-type" (serializable TypeObject, no
+;;;; dependencies), "gseg"/"gpoint" (nested-struct dependency), and "dcps-large" whose
+;;;; (:sequence :u8) member makes its TypeObject serializer error — the skip case.
+
+(defun* run-typelookup-server-test ()
+    (function () t)
+  "Test: FIND-TYPE-SUPPORT-BY-HASH + TYPE-LOOKUP-RESPOND answer getTypes /
+   getTypeDependencies over the local registry (XTypes 1.3 §7.6.3.3.4, Task 3.1)."
+  (let* ((shape-ts (dds.types:find-type-support "shape-type"))
+         (shape-to (dds.types:type-support-typeobject shape-ts))
+         (shape-hash (dds.types:equivalence-hash shape-to))
+         (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x2A))
+         (unknown (make-array 14 :element-type '(unsigned-byte 8) :initial-element #x5E)))
+    ;; the (:sequence :u8) dcps-large TypeObject must really be the unserializable skip case
+    (%check :tls-skip-case-registered (dds.types:find-type-support "dcps-large")
+            "precondition: dcps-large (sequence member) is registered")
+    (%check :tls-skip-case-errors
+            (handler-case
+                (progn (dds.types:minimal-type-object-octets
+                        (dds.types:type-support-typeobject
+                         (dds.types:find-type-support "dcps-large")))
+                       nil)
+              (error () t))
+            "precondition: dcps-large's TypeObject serializer errors (sequence TI)")
+    (%check :tls-index-hit
+            (eq shape-ts (dds.types:find-type-support-by-hash shape-hash))
+            "find-type-support-by-hash resolves shape-type's EquivalenceHash")
+    (%check :tls-index-miss (null (dds.types:find-type-support-by-hash unknown))
+            "an unknown hash returns NIL without signalling (unserializable types skipped)")
+    ;; getTypes: known hash -> one byte-exact pair, relatedRequestId echoed
+    (let ((rep (dds.types:type-lookup-respond
+                (dds.types:serialize-type-lookup-request
+                 :writer-guid guid :sn 21 :instance-name "dds.builtin.TOS"
+                 :operation :get-types :type-ids (list shape-hash)))))
+      (%check :tls-types-replied rep "getTypes for a known hash is answered")
+      (multiple-value-bind (op pairs rguid rsn rex) (dds.types:parse-type-lookup-reply rep)
+        (%check :tls-types-op (eq op :get-types) "reply selects the getTypes Return arm")
+        (%check :tls-types-pair
+                (and (= 1 (length pairs))
+                     (equalp (car (first pairs)) shape-hash)
+                     (equalp (cdr (first pairs)) (dds.types:minimal-type-object-octets shape-to)))
+                "the pair carries the requested hash + the serialized TypeObject")
+        (%check :tls-types-hdr (and (equalp rguid guid) (= rsn 21) (eq rex :ok))
+                "relatedRequestId echoes the request writer GUID/SN, remoteEx OK")))
+    ;; unknown hash -> :ok with zero pairs
+    (let ((rep (dds.types:type-lookup-respond
+                (dds.types:serialize-type-lookup-request
+                 :writer-guid guid :sn 22 :instance-name "dds.builtin.TOS"
+                 :operation :get-types :type-ids (list unknown)))))
+      (multiple-value-bind (op pairs rguid rsn rex) (dds.types:parse-type-lookup-reply rep)
+        (declare (ignore rguid))
+        (%check :tls-unknown-hash (and (eq op :get-types) (null pairs) (= rsn 22) (eq rex :ok))
+                "an unknown hash answers :ok with zero pairs")))
+    ;; mixed known+unknown -> exactly the known pair
+    (let ((rep (dds.types:type-lookup-respond
+                (dds.types:serialize-type-lookup-request
+                 :writer-guid guid :sn 23 :instance-name "dds.builtin.TOS"
+                 :operation :get-types :type-ids (list unknown shape-hash)))))
+      (multiple-value-bind (op pairs) (dds.types:parse-type-lookup-reply rep)
+        (%check :tls-mixed (and (eq op :get-types) (= 1 (length pairs))
+                                (equalp (car (first pairs)) shape-hash))
+                "a mixed known+unknown request answers with the known pair only")))
+    ;; getTypeDependencies: shape-type has no nested members -> zero deps, :ok
+    (let ((rep (dds.types:type-lookup-respond
+                (dds.types:serialize-type-lookup-request
+                 :writer-guid guid :sn 24 :instance-name "dds.builtin.TOS"
+                 :operation :get-deps :type-ids (list shape-hash)))))
+      (multiple-value-bind (op deps rguid rsn rex) (dds.types:parse-type-lookup-reply rep)
+        (declare (ignore rguid))
+        (%check :tls-deps-none (and (eq op :get-deps) (null deps) (= rsn 24) (eq rex :ok))
+                "a dependency-free type answers :ok with zero dependent_typeids")))
+    ;; getTypeDependencies on the nested gseg: dep = gpoint's hash + serialized size
+    (let* ((gseg-to (dds.types:type-support-typeobject (dds.types:find-type-support "gseg")))
+           (gpoint-to (dds.types:type-support-typeobject (dds.types:find-type-support "gpoint")))
+           (gpoint-hash (dds.types:equivalence-hash gpoint-to))
+           (gpoint-size (length (dds.types:minimal-type-object-octets gpoint-to)))
+           (rep (dds.types:type-lookup-respond
+                 (dds.types:serialize-type-lookup-request
+                  :writer-guid guid :sn 25 :instance-name "dds.builtin.TOS"
+                  :operation :get-deps
+                  :type-ids (list (dds.types:equivalence-hash gseg-to))))))
+      (multiple-value-bind (op deps) (dds.types:parse-type-lookup-reply rep)
+        (%check :tls-deps-nested
+                (and (eq op :get-deps) (= 1 (length deps))
+                     (equalp (car (first deps)) gpoint-hash)
+                     (= (cdr (first deps)) gpoint-size))
+                "gseg's dependency list carries gpoint's hash + serialized size")))
+    ;; unknown operation: byte-flipped discriminator -> REMOTE_EX_UNKNOWN_OPERATION, no arm
+    (let* ((req (dds.types:serialize-type-lookup-request
+                 :writer-guid guid :sn 26 :instance-name "dds.builtin.TOS"
+                 :operation :get-types :type-ids (list shape-hash)))
+           (dpos (%find-le-u32 req dds.types:+tl-gettypes-hash+))
+           (rep (dds.types:type-lookup-respond (%patch-le-u32 req dpos #x7FFFFFFF))))
+      (%check :tls-unknown-op-replied rep "an unknown operation is answered, not dropped")
+      (multiple-value-bind (op pairs rguid rsn rex) (dds.types:parse-type-lookup-reply rep)
+        (%check :tls-unknown-op
+                (and (null op) (null pairs) (equalp rguid guid) (= rsn 26)
+                     (eq rex :unknown-operation))
+                "REMOTE_EX_UNKNOWN_OPERATION with relatedRequestId echoed and no Return arm")))
+    ;; resource guard: 33 ids (> *max-typelookup-request-ids*) -> dropped (NIL)
+    (let ((ids (loop for i below (1+ dds.types:*max-typelookup-request-ids*)
+                     collect (make-array 14 :element-type '(unsigned-byte 8)
+                                            :initial-element (mod i 256)))))
+      (%check :tls-guard
+              (null (dds.types:type-lookup-respond
+                     (dds.types:serialize-type-lookup-request
+                      :writer-guid guid :sn 27 :instance-name "dds.builtin.TOS"
+                      :operation :get-types :type-ids ids)))
+              "a request with more ids than *max-typelookup-request-ids* is dropped"))
+    ;; malformed (truncated) request -> dropped (NIL)
+    (let ((req (dds.types:serialize-type-lookup-request
+                :writer-guid guid :sn 28 :instance-name "dds.builtin.TOS"
+                :operation :get-types :type-ids (list shape-hash))))
+      (%check :tls-malformed
+              (null (dds.types:type-lookup-respond (subseq req 0 9)))
+              "a truncated request is dropped"))
+    ;; memo invalidation: fresh-name AND same-name re-registration (count unchanged) rebuild
+    (let* ((m1 (dds.types:make-minimal-struct-type
+                :name "tls-memo" :extensibility :final
+                :members (list (dds.types:make-struct-member
+                                "a" 0 (dds.types:primitive-type-identifier :i32)))))
+           (m2 (dds.types:make-minimal-struct-type
+                :name "tls-memo" :extensibility :final
+                :members (list (dds.types:make-struct-member
+                                "b" 0 (dds.types:primitive-type-identifier :u64)))))
+           (h1 (dds.types:equivalence-hash m1))
+           (h2 (dds.types:equivalence-hash m2))
+           (ts1 (dds.types:register-type
+                 (dds.types:make-type-support :name "tls-memo" :typeobject m1))))
+      (%check :tls-memo-new (eq ts1 (dds.types:find-type-support-by-hash h1))
+              "the index rebuilds after registering a NEW type name")
+      (let ((ts2 (dds.types:register-type
+                  (dds.types:make-type-support :name "tls-memo" :typeobject m2))))
+        (%check :tls-memo-rereg-new (eq ts2 (dds.types:find-type-support-by-hash h2))
+                "re-registering an existing name invalidates the memo: the NEW hash resolves")
+        (%check :tls-memo-rereg-old (null (dds.types:find-type-support-by-hash h1))
+                "after re-registration the OLD hash no longer resolves"))))
+  t)
+
+;;;; MinimalTypeObject deserializer (TypeLookup Task 2.1, FR-TYPE-2/3): the inverse of
+;;;; the XCDR2 serializer. Round-trip equality is proven structurally (%struct-model-equal-p)
+;;;; AND byte-exactly (re-serializing the parsed model reproduces the original octets).
+
+(defun* %ti-effective-hash (ti)
+    (function (dds.types:type-identifier) t)
+  "An EK_* TypeIdentifier's 14-octet hash: the cached slot, or EQUIVALENCE-HASH of the
+   referenced struct (the original model side); NIL for non-hash kinds."
+  (or (dds.types:type-identifier-hash ti)
+      (let ((ref (dds.types:type-identifier-referenced ti)))
+        (and (typep ref 'dds.types:minimal-struct-type) (dds.types:equivalence-hash ref)))))
+
+(defun* %ti-model-equal-p (a b)
+    (function (dds.types:type-identifier dds.types:type-identifier) t)
+  "Structural TI equality across a parse round-trip: kind + bound + element (recursive) +
+   effective hash (REFERENCED is erased by Minimal serialization, so hashes are compared)."
+  (and (= (dds.types:type-identifier-kind a) (dds.types:type-identifier-kind b))
+       (= (dds.types:type-identifier-bound a) (dds.types:type-identifier-bound b))
+       (let ((ea (dds.types:type-identifier-element a))
+             (eb (dds.types:type-identifier-element b)))
+         (if (and ea eb) (%ti-model-equal-p ea eb) (and (null ea) (null eb))))
+       (equalp (%ti-effective-hash a) (%ti-effective-hash b))))
+
+(defun* %struct-model-equal-p (a b)
+    (function (dds.types:minimal-struct-type dds.types:minimal-struct-type) t)
+  "Structural model equality across a parse round-trip: extensibility, member count, and
+   per id-sorted member: id, key/optional/must-understand flags, 4-octet NameHash bytes,
+   and the member TypeIdentifier per %TI-MODEL-EQUAL-P. Names are NOT compared (Minimal)."
+  (flet ((sorted (s) (sort (copy-list (dds.types:minimal-struct-type-members s)) #'<
+                           :key #'dds.types:minimal-struct-member-id)))
+    (and (eq (dds.types:minimal-struct-type-extensibility a)
+             (dds.types:minimal-struct-type-extensibility b))
+         (= (length (dds.types:minimal-struct-type-members a))
+            (length (dds.types:minimal-struct-type-members b)))
+         (every (lambda (ma mb)
+                  (and (= (dds.types:minimal-struct-member-id ma)
+                          (dds.types:minimal-struct-member-id mb))
+                       (eq (not (dds.types:minimal-struct-member-key-p ma))
+                           (not (dds.types:minimal-struct-member-key-p mb)))
+                       (eq (not (dds.types:minimal-struct-member-optional-p ma))
+                           (not (dds.types:minimal-struct-member-optional-p mb)))
+                       (eq (not (dds.types:minimal-struct-member-must-understand-p ma))
+                           (not (dds.types:minimal-struct-member-must-understand-p mb)))
+                       (equalp (dds.types:minimal-struct-member-name-hash ma)
+                               (dds.types:minimal-struct-member-name-hash mb))
+                       (%ti-model-equal-p
+                        (dds.types:minimal-struct-member-type-identifier ma)
+                        (dds.types:minimal-struct-member-type-identifier mb))))
+                (sorted a) (sorted b)))))
+
+(defun* %seq-typeobject-octets ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "Hand-laid XCDR2-LE EK_MINIMAL TypeObject for struct s { sequence<long> v; }: the
+   plain-sequence member TI the serializer cannot emit yet. Framing per
+   xtypes-1_3_typeobject.idl §187-189 (PlainSequenceSElemDefn FINAL: PlainCollectionHeader
+   { equiv_kind octet; element_flags UInt16 } + SBound octet + element TypeIdentifier)."
+  (let ((nh (dds.types:member-name-hash "v")))
+    (octets 40 0 0 0                ; TypeObject DHEADER (content = 40 octets)
+            #xf1 #x51 1 0           ; EK_MINIMAL + TK_STRUCTURE + struct_flags IS_FINAL
+            1 0 0 0 0 0 0 0         ; header DHEADER(1) + TK_NONE base + pad
+            24 0 0 0 1 0 0 0        ; member-seq DHEADER(24) + count 1
+            16 0 0 0                ; member DHEADER(16)
+            0 0 0 0 1 0             ; member id 0 + flags TRY_CONSTRUCT=DISCARD
+            #x80 #xf3 1 0           ; TI_PLAIN_SEQUENCE_SMALL + EK_BOTH + element_flags
+            0 #x04                  ; SBound 0 (unbounded) + element TK_INT32
+            (aref nh 0) (aref nh 1) (aref nh 2) (aref nh 3))))
+
+(defun* run-typeobject-parse-test ()
+    (function () t)
+  "Test: PARSE-MINIMAL-TYPE-OBJECT is the exact inverse of MINIMAL-TYPE-OBJECT-OCTETS —
+   structural equality, byte-identical re-serialization, plain-sequence member TIs,
+   :unsupported for unmodeled kinds, NIL for malformed/truncated input."
+  (flet ((roundtrip (tag m)
+           (let* ((bytes (dds.types:minimal-type-object-octets m))
+                  (parsed (dds.types:parse-minimal-type-object bytes)))
+             (%check tag (typep parsed 'dds.types:minimal-struct-type)
+                     "parse returns a minimal-struct-type")
+             (%check tag (%struct-model-equal-p m parsed)
+                     "parsed model is structurally equal to the original")
+             (%check tag (equalp bytes (dds.types:minimal-type-object-octets parsed))
+                     "re-serializing the parsed model reproduces the original octets"))))
+    ;; the registered shape-type model (string + 3 longs, key member)
+    (roundtrip :top-shape
+               (dds.types:type-support-typeobject (dds.types:find-type-support "shape-type")))
+    ;; a hand-built nested-struct model: one member is a hash TI of another struct
+    (let* ((inner (dds.types:make-minimal-struct-type
+                   :name "gp" :extensibility :final
+                   :members (list (dds.types:make-struct-member
+                                   "x" 0 (dds.types:primitive-type-identifier :i32)))))
+           (outer (dds.types:make-minimal-struct-type
+                   :name "seg" :extensibility :appendable
+                   :members (list (dds.types:make-struct-member
+                                   "a" 0 (dds.types:hash-type-identifier
+                                          dds.types:+ek-minimal+ :referenced inner))
+                                  (dds.types:make-struct-member
+                                   "n" 1 (dds.types:primitive-type-identifier :u16))))))
+      (roundtrip :top-nested outer))
+    ;; flag variety + bounded small string + LARGE string, MUTABLE extensibility
+    (let ((bstr (dds.types:primitive-type-identifier :string))
+          (lstr (dds.types:primitive-type-identifier :string)))
+      (setf (dds.types:type-identifier-bound bstr) 32)
+      (setf (dds.types:type-identifier-kind lstr) dds.types:+ti-string8-large+
+            (dds.types:type-identifier-bound lstr) 300)
+      (roundtrip :top-flags
+                 (dds.types:make-minimal-struct-type
+                  :name "fv" :extensibility :mutable
+                  :members (list (dds.types:make-struct-member "color" 0 bstr :key-p t)
+                                 (dds.types:make-struct-member "note" 1 lstr :optional-p t)
+                                 (dds.types:make-struct-member
+                                  "flags" 2 (dds.types:primitive-type-identifier :u64)
+                                  :must-understand-p t))))))
+  ;; plain-sequence member TI: parses into a sequence-type-identifier (serializer can't emit)
+  (let* ((bytes (%seq-typeobject-octets))
+         (parsed (dds.types:parse-minimal-type-object bytes)))
+    (%check :top-seq-parses (typep parsed 'dds.types:minimal-struct-type)
+            "hand-laid plain-sequence TypeObject parses")
+    (let* ((m (first (dds.types:minimal-struct-type-members parsed)))
+           (ti (dds.types:minimal-struct-member-type-identifier m)))
+      (%check :top-seq-ti
+              (and (= (dds.types:type-identifier-kind ti) dds.types:+ti-plain-sequence-small+)
+                   (zerop (dds.types:type-identifier-bound ti))
+                   (= (dds.types:type-identifier-kind (dds.types:type-identifier-element ti))
+                      dds.types:+tk-int32+)
+                   (equalp (dds.types:minimal-struct-member-name-hash m)
+                           (dds.types:member-name-hash "v")))
+              "sequence member TI carries kind + bound + element + the wire NameHash"))
+    ;; element TI unmodeled (TI_STRONGLY_CONNECTED_COMPONENT, idl §70) -> whole parse :unsupported
+    (let ((bad (copy-seq bytes)))
+      (setf (aref bad 39) #xb0)
+      (%check :top-seq-unmodeled-element
+              (eq :unsupported (dds.types:parse-minimal-type-object bad))
+              "an unmodeled sequence element TI makes the whole parse :unsupported")))
+  ;; :unsupported and NIL rejection cases, patched off the shape-type octets
+  (let ((bytes (dds.types:minimal-type-object-octets
+                (dds.types:type-support-typeobject (dds.types:find-type-support "shape-type")))))
+    (let ((bad (copy-seq bytes)))
+      (setf (aref bad 4) dds.types:+ek-complete+)
+      (%check :top-ek-complete (eq :unsupported (dds.types:parse-minimal-type-object bad))
+              "an EK_COMPLETE TypeObject discriminator is :unsupported"))
+    (let ((bad (copy-seq bytes)))
+      (setf (aref bad 5) #x52)   ; TK_UNION (xtypes-1_3_typeobject.idl §45)
+      (%check :top-tk-union (eq :unsupported (dds.types:parse-minimal-type-object bad))
+              "a TK_UNION MinimalTypeObject payload is :unsupported"))
+    (let ((dds.types:*max-type-object-bytes* 16))
+      (%check :top-oversize (eq :unsupported (dds.types:parse-minimal-type-object bytes))
+              "octets exceeding *max-type-object-bytes* reject as :unsupported"))
+    (%check :top-prefixes
+            (loop for end in (%truncation-offsets (length bytes))
+                  always (null (dds.types:parse-minimal-type-object (subseq bytes 0 end))))
+            "every sampled proper prefix rejects (NIL)")
+    ;; member count u32 sits at offset 20 (DHEADER 4 + EK/TK 2 + flags 2 + pad/header 8 + seq DHEADER 4)
+    (%check :top-huge-count
+            (null (dds.types:parse-minimal-type-object (%patch-le-u32 bytes 20 #xffffffff)))
+            "a member count exceeding the DHEADER extent rejects (NIL) before allocation"))
+  t)

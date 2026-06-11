@@ -27,11 +27,16 @@
 (defvar *type-registry* (make-hash-table :test 'equal)
   "Maps a type name to its type-support. Control-plane structure (off hot path).")
 
+(defvar *type-registry-generation* 0
+  "Monotonic counter bumped by every REGISTER-TYPE call — including re-registration of
+   an existing name, which leaves HASH-TABLE-COUNT unchanged — so caches derived from
+   *TYPE-REGISTRY* (e.g. the TypeLookup hash index) can detect any mutation.")
 
 (defun* register-type (ts)
     (function (type-support) type-support)
-  "Register type-support TS under its NAME. Returns TS."
+  "Register type-support TS under its NAME, bumping *TYPE-REGISTRY-GENERATION*. Returns TS."
   (setf (gethash (type-support-name ts) *type-registry*) ts)
+  (incf *type-registry-generation*)
   ts)
 
 (defun* find-type-support (name)

@@ -11,6 +11,7 @@
                (:file "statuses")
                (:file "listeners")
                (:file "entities")
+               (:file "type-gate")
                (:file "conditions")
                (:file "filter")
                (:file "builtin"))

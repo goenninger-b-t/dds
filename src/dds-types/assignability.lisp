@@ -143,19 +143,36 @@
                             :referenced (key-erase-struct (type-identifier-referenced ti)))
       ti))
 
+(defun* member-names-agree-p (a b)
+    (function (minimal-struct-member minimal-struct-member) t)
+  "Whether members A and B count as having 'the same name' for the §7.2.4.4.8 Table 19
+   name<->id correspondence. A Minimal TypeObject erases member names, carrying only the
+   4-octet MinimalMemberDetail.name_hash (xtypes-1_3_typeobject.idl MinimalMemberDetail;
+   hash rule XTypes 1.3 §7.2.2.4.4.4.5: first 4 octets of MD5(UTF-8 name)), so when BOTH
+   sides carry a NameHash that hash IS the member-name identity (EQUALP); the string
+   names are compared only when either side's hash is absent. Keeps a wire-parsed model
+   (name \"\" + wire NameHash) comparable against a locally-built one."
+  (let ((ha (minimal-struct-member-name-hash a))
+        (hb (minimal-struct-member-name-hash b)))
+    (if (and ha hb)
+        (equalp ha hb)
+        (string= (minimal-struct-member-name a) (minimal-struct-member-name b)))))
+
 (defun* member-names-ids-consistent-p (members1 members2 ignore-names)
     (function (list list t) t)
   "Member name<->id correspondence (§7.2.4.4.8): across the two lists, members with the
-   same name have the same id and members with the same id have the same name. When
-   IGNORE-NAMES is true, names are not consulted at all (only ids matter, §7.6.3.4.2)."
+   same name have the same id and members with the same id have the same name — name
+   identity per MEMBER-NAMES-AGREE-P (NameHash when both sides carry one; Minimal erases
+   names). When IGNORE-NAMES is true, names/hashes are not consulted at all (only ids
+   matter, §7.6.3.4.2)."
   (if ignore-names
       t
       (dolist (a members1 t)
         (dolist (b members2)
           (when (and (= (minimal-struct-member-id a) (minimal-struct-member-id b))
-                     (not (string= (minimal-struct-member-name a) (minimal-struct-member-name b))))
+                     (not (member-names-agree-p a b)))
             (return-from member-names-ids-consistent-p nil))
-          (when (and (string= (minimal-struct-member-name a) (minimal-struct-member-name b))
+          (when (and (member-names-agree-p a b)
                      (not (= (minimal-struct-member-id a) (minimal-struct-member-id b))))
             (return-from member-names-ids-consistent-p nil))))))
 

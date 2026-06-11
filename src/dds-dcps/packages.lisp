@@ -14,6 +14,7 @@
   (:export #:entity #:domain-participant #:publisher #:subscriber
            #:topic #:data-writer #:data-reader
            #:entity-qos #:entity-enabled-p #:entity-type-compat #:*type-compat-log*
+           #:*max-typeobject-cache-entries* #:*typelookup-max-depth*
            #:create-participant #:delete-participant
            #:create-publisher #:create-subscriber #:create-topic
            #:create-datawriter #:create-datareader

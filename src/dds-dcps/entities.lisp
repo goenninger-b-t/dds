@@ -25,9 +25,11 @@
    (node :initarg :node :accessor dp-node)
    (children :initform '() :accessor dp-children)
    (user-reader :initform nil :accessor dp-user-reader)   ; v1: one DataReader per participant
-   (user-writer :initform nil :accessor dp-user-writer))  ; v1: one DataWriter per participant
+   (user-writer :initform nil :accessor dp-user-writer)   ; v1: one DataWriter per participant
+   (type-gate-state :initform nil :accessor dp-type-gate-state))  ; FR-TYPE-4 gate (type-gate.lisp)
   (:documentation "DDS DomainParticipant: owns a multicast disc-node for its domain and
-   its contained entities. v1 holds one DataReader + one DataWriter per participant."))
+   its contained entities. v1 holds one DataReader + one DataWriter per participant.
+   TYPE-GATE-STATE carries the FR-TYPE-4 assignability gate's TypeObject/verdict caches."))
 
 (defclass publisher (entity)
   ((participant :initarg :participant :reader pub-participant)
@@ -83,6 +85,10 @@
 ;; Defined in conditions.lisp (loaded after this file); forward-declared so the data-
 ;; arrival hook below can wake the reader's WaitSets without a compile-time warning.
 (declaim (ftype (function (data-reader) t) %notify-reader-conditions))
+
+;; Defined in type-gate.lisp (loaded after this file); forward-declared so
+;; create-participant can install the FR-TYPE-4 assignability gate.
+(declaim (ftype (function (domain-participant) domain-participant) %install-type-gate))
 
 (defun* %field-resolver (ts)
     (function (t) function)
@@ -186,6 +192,7 @@
           (lambda () (%on-participant-sample p)))
     (setf (dds.disc:disc-node-on-inconsistent-topic node)
           (lambda (topic-name) (%on-disc-inconsistent-topic p topic-name)))
+    (%install-type-gate p)   ; FR-TYPE-4 assignability gate (type-gate.lisp)
     (dds.disc:start-node node)
     p))
 

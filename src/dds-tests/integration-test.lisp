@@ -1465,3 +1465,394 @@
               (eq :reliable (dds.qos:qos-reliability (dds.rtps.discovery:endpoint-data-qos r)))
               "an explicit RELIABLE PID_RELIABILITY overrides the reader BEST_EFFORT default")))
   t)
+
+;;; TypeLookup builtin endpoints over UDP (M4 Task 3.2, FR-TYPE-3): the four
+;;; XTypes 1.3 Table 61 service endpoints wired into the discovery node — a client
+;;; type-lookup-query fetches a peer's TypeObject by EquivalenceHash; the peer's
+;;; server core answers over the reply writer; tl-sweep expires unanswered queries.
+
+(defun* %tl-capture ()
+    (function () (values function function))
+  "A thread-safe one-shot continuation capture: (values continuation result-fn).
+   RESULT-FN returns (values called-p pairs okp)."
+  (let ((lock (dds.pal:make-lock "tl-capture")) (called nil) (pairs nil) (okp nil))
+    (values (lambda (p ok)
+              (dds.pal:with-lock (lock) (setf called t pairs p okp ok)))
+            (lambda ()
+              (dds.pal:with-lock (lock) (values called pairs okp))))))
+
+(defun* run-typelookup-endpoints-test ()
+    (function () t)
+  "Two discovery nodes on UDP loopback: B queries A's TypeLookup service for the
+   registered shape-type's EquivalenceHash and gets back the byte-exact TypeObject
+   (parse + re-hash equals the query); an unknown hash answers :ok with ZERO pairs
+   (okp T — distinct from a timeout); a query toward an undiscovered prefix expires
+   via tl-sweep with (NIL NIL); the *max-typelookup-pending* cap rejects immediately."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
+         (ghost (make-array 12 :element-type '(unsigned-byte 8) :initial-element 9))
+         (node1 (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (node2 (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (shape-hash (dds.types:equivalence-hash
+                      (dds.types:type-support-typeobject
+                       (dds.types:find-type-support "shape-type"))))
+         (unknown (make-array 14 :element-type '(unsigned-byte 8) :initial-element #xEE)))
+    (unwind-protect
+         (progn
+           (setf (dds.disc:disc-node-peers node1)
+                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node2))))
+           (setf (dds.disc:disc-node-peers node2)
+                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node1))))
+           (dds.disc:start-node node1)
+           (dds.disc:start-node node2)
+           (dds.disc:announce-participant node1)
+           (dds.disc:announce-participant node2)
+           (loop repeat 100
+                 until (and (plusp (dds.disc:disc-node-discovered-count node1))
+                            (plusp (dds.disc:disc-node-discovered-count node2)))
+                 do (sleep 0.02))
+           (%check :tle-discovered
+                   (and (plusp (dds.disc:disc-node-discovered-count node1))
+                        (plusp (dds.disc:disc-node-discovered-count node2)))
+                   "SPDP did not complete before the TypeLookup query")
+           ;; known hash: B asks A; one byte-exact pair whose TypeObject re-hashes
+           (multiple-value-bind (k kres) (%tl-capture)
+             (%check :tle-query-sent (dds.disc:type-lookup-query node2 p1 (list shape-hash) k)
+                     "type-lookup-query toward a live peer must record + send")
+             (loop repeat 150 until (nth-value 0 (funcall kres)) do (sleep 0.02))
+             (multiple-value-bind (called pairs okp) (funcall kres)
+               (%check :tle-replied called
+                       (format nil "no TypeLookup reply arrived over UDP (called=~s pairs=~s okp=~s)"
+                               called pairs okp))
+               (%check :tle-ok okp "the reply must be REMOTE_EX_OK")
+               (%check :tle-one-pair (= 1 (length pairs))
+                       "exactly one (hash . TypeObject) pair expected")
+               (%check :tle-pair-hash (equalp (car (first pairs)) shape-hash)
+                       "the pair must echo the queried hash")
+               (let ((model (dds.types:parse-minimal-type-object (cdr (first pairs)))))
+                 (%check :tle-typeobject
+                         (and (typep model 'dds.types:minimal-struct-type)
+                              (equalp (dds.types:equivalence-hash model) shape-hash))
+                         "the fetched TypeObject must parse + re-hash to the queried hash"))))
+           ;; unknown hash: :ok with ZERO pairs (okp T distinguishes from timeout-NIL)
+           (multiple-value-bind (k kres) (%tl-capture)
+             (dds.disc:type-lookup-query node2 p1 (list unknown) k)
+             (loop repeat 150 until (nth-value 0 (funcall kres)) do (sleep 0.02))
+             (multiple-value-bind (called pairs okp) (funcall kres)
+               (%check :tle-unknown (and called okp (null pairs))
+                       "an unknown hash answers :ok with zero pairs, not a timeout")))
+           ;; undiscovered prefix: never sent, expires via tl-sweep with (NIL NIL)
+           (let ((dds.disc:*typelookup-timeout* 1))
+             (multiple-value-bind (k kres) (%tl-capture)
+               (%check :tle-ghost-recorded (dds.disc:type-lookup-query node2 ghost (list shape-hash) k)
+                       "a query toward an undiscovered prefix is recorded (awaiting expiry)")
+               (loop repeat 150 until (nth-value 0 (funcall kres))
+                     do (dds.disc:tl-sweep node2) (sleep 0.02))
+               (multiple-value-bind (called pairs okp) (funcall kres)
+                 (%check :tle-timeout (and called (null pairs) (not okp))
+                         "an unanswerable query must expire to (NIL NIL) via tl-sweep"))))
+           ;; pending cap: immediate (NIL NIL) continuation + NIL return
+           (let ((dds.disc:*max-typelookup-pending* 0))
+             (multiple-value-bind (k kres) (%tl-capture)
+               (%check :tle-cap-reject
+                       (null (dds.disc:type-lookup-query node2 p1 (list shape-hash) k))
+                       "the pending cap must reject the query (return NIL)")
+               (multiple-value-bind (called pairs okp) (funcall kres)
+                 (%check :tle-cap-continuation (and called (null pairs) (not okp))
+                         "the cap rejection must call the continuation with (NIL NIL) immediately"))))
+           t)
+      (dds.disc:stop-node node1)
+      (dds.disc:stop-node node2))))
+
+;;; TYPE-GATE on the SEDP match path (M4 Task 4.1, FR-TYPE-4 step 1): a dds-types-aware
+;;; layer interposes a type-compatibility verdict BEFORE a match is recorded; :pending
+;;; parks the decision (deduped by remote GUID) until resume-parked-matches re-runs it.
+
+(defun* %tg-nodes ()
+    (function () (values dds.disc:disc-node dds.disc:disc-node))
+  "Two started 127.0.0.1 discovery nodes — node1 offers a RELIABLE writer, node2 a
+   BEST_EFFORT reader on (Square, ShapeType) — peered and SPDP-discovered, ready for
+   announce-endpoints (the run-sedp-discovery-test shape). On any failure — including
+   SPDP not completing — both nodes are stopped before the error propagates."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 1))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 2))
+         (node1 (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (node2 nil)
+         (donep nil))
+    ;; stop node1 (and node2 if created) on any non-local exit; normal return = both live
+    (unwind-protect
+         (progn
+           (setf node2 (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+           (dds.disc:add-local-writer node1 :topic "Square" :type "ShapeType"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:add-local-reader node2 :topic "Square" :type "ShapeType"
+                                      :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (setf (dds.disc:disc-node-peers node1) (list (cons "127.0.0.1" (dds.disc:disc-node-port node2))))
+           (setf (dds.disc:disc-node-peers node2) (list (cons "127.0.0.1" (dds.disc:disc-node-port node1))))
+           (dds.disc:start-node node1)
+           (dds.disc:start-node node2)
+           (dds.disc:announce-participant node1)
+           (dds.disc:announce-participant node2)
+           (loop repeat 100
+                 until (and (plusp (dds.disc:disc-node-discovered-count node1))
+                            (plusp (dds.disc:disc-node-discovered-count node2)))
+                 do (sleep 0.02))
+           (unless (and (plusp (dds.disc:disc-node-discovered-count node1))
+                        (plusp (dds.disc:disc-node-discovered-count node2)))
+             (error "SPDP did not complete in %tg-nodes"))
+           (setf donep t)
+           (values node1 node2))
+      (unless donep
+        (when node2 (dds.disc:stop-node node2))
+        (dds.disc:stop-node node1)))))
+
+(defun* run-type-gate-test ()
+    (function () t)
+  "The disc-node TYPE-GATE hook (FR-TYPE-4 step 1): :incompatible routes a would-be
+   match to the INCONSISTENT_TOPIC path; :pending parks the decision (deduped by
+   remote GUID across re-announce AND re-park on resume) until resume-parked-matches
+   re-runs it with the gate's later verdict; a NIL gate matches as plain SEDP."
+  ;; :incompatible -> no match recorded; the inconsistent-topic callback fires
+  (multiple-value-bind (node1 node2) (%tg-nodes)
+    (unwind-protect
+         (let ((hits '()) (hits-lock (dds.pal:make-lock "tg-hits")))
+           (setf (dds.disc:disc-node-type-gate node2)
+                 (lambda (node remote local)
+                   (declare (ignore node remote local)) :incompatible))
+           (setf (dds.disc:disc-node-on-inconsistent-topic node2)
+                 (lambda (topic) (dds.pal:with-lock (hits-lock) (push topic hits))))
+           (dds.disc:announce-endpoints node1)
+           (dds.disc:announce-endpoints node2)
+           (loop repeat 100 until (dds.pal:with-lock (hits-lock) hits) do (sleep 0.02))
+           (%check :tg-incompat-no-match (zerop (dds.disc:disc-node-matched-count node2))
+                   "a gate verdict of :incompatible must not record a match")
+           (%check :tg-incompat-fires
+                   (member "Square" (dds.pal:with-lock (hits-lock) hits) :test #'string=)
+                   "a gate verdict of :incompatible must fire on-inconsistent-topic"))
+      (dds.disc:stop-node node1)
+      (dds.disc:stop-node node2)))
+  ;; :pending parks (deduped); NIL gate (node1) matches; resume after :compatible matches
+  (multiple-value-bind (node1 node2) (%tg-nodes)
+    (unwind-protect
+         (let ((verdict :pending) (matches '()) (m-lock (dds.pal:make-lock "tg-m")))
+           (setf (dds.disc:disc-node-type-gate node2)
+                 (lambda (node remote local)
+                   (declare (ignore node remote local)) verdict))
+           (setf (dds.disc:disc-node-on-match node2)
+                 (lambda (kind remote)
+                   (declare (ignore remote))
+                   (dds.pal:with-lock (m-lock) (push kind matches))))
+           (dds.disc:announce-endpoints node1)
+           (dds.disc:announce-endpoints node2)
+           (loop repeat 100 until (plusp (dds.disc:disc-node-parked-count node2))
+                 do (sleep 0.02))
+           ;; NIL gate on node1: it matches node2's reader exactly as plain SEDP
+           (loop repeat 100 until (plusp (dds.disc:disc-node-matched-count node1))
+                 do (sleep 0.02))
+           (%check :tg-nil-gate (plusp (dds.disc:disc-node-matched-count node1))
+                   "a NIL gate must match exactly as the plain SEDP path")
+           (%check :tg-parked (= 1 (dds.disc:disc-node-parked-count node2))
+                   "a :pending verdict must park the decision exactly once")
+           (%check :tg-pending-no-match (zerop (dds.disc:disc-node-matched-count node2))
+                   "a :pending verdict must not record a match")
+           ;; re-announce: the same remote writer must not park twice
+           (dds.disc:announce-endpoints node1)
+           (sleep 0.1)
+           (%check :tg-park-dedupe (= 1 (dds.disc:disc-node-parked-count node2))
+                   "re-announce of a parked remote must dedupe by GUID")
+           ;; resume with the gate still :pending -> the entry re-parks exactly once
+           (dds.disc:resume-parked-matches node2)
+           (%check :tg-repark (= 1 (dds.disc:disc-node-parked-count node2))
+                   "resume with a still-:pending gate must re-park the entry once")
+           (%check :tg-repark-no-match (zerop (dds.disc:disc-node-matched-count node2))
+                   "a re-parked decision must still not match")
+           ;; flip the verdict: resume records + fires the match and drains the list
+           (setf verdict :compatible)
+           (dds.disc:resume-parked-matches node2)
+           (%check :tg-resumed-match (plusp (dds.disc:disc-node-matched-count node2))
+                   "resume with a :compatible verdict must record the match")
+           (%check :tg-resumed-fired
+                   (equal '(:remote-writer) (dds.pal:with-lock (m-lock) matches))
+                   "the resumed match must fire on-match exactly once (:remote-writer)")
+           (%check :tg-drained (zerop (dds.disc:disc-node-parked-count node2))
+                   "resume must drain the parked list"))
+      (dds.disc:stop-node node1)
+      (dds.disc:stop-node node2)))
+  t)
+
+;;; DCPS assignability-gated matching (M4 Task 4.2, FR-TYPE-4): the DCPS layer installs
+;;; an assignability gate on the disc-node TYPE-GATE hook — equal EquivalenceHashes match
+;;; with zero wire traffic; differing hashes fetch the remote Minimal TypeObject via
+;;; TypeLookup and decide with is-assignable-from under the reader's
+;;; TYPE_CONSISTENCY_ENFORCEMENT (XTypes 1.3 §7.6.3.4.2 Step 1); a TypeLookup timeout
+;;; falls back to name-based matching.
+
+(dds.gen:define-dds-type gate-eq-type (:extensibility :final)
+  (id :i32 :key t)
+  (val :i32))
+
+(dds.gen:define-dds-type gate-w-type (:extensibility :final)
+  (id :i32 :key t)
+  (val :i32))
+
+(dds.gen:define-dds-type gate-r-type (:extensibility :final)
+  (id :i32 :key t)
+  (val :i64))   ; same member id, different primitive kind -> NOT assignable (Table 15)
+
+(dds.gen:define-dds-type gate-cw-type (:extensibility :final)
+  (id :i32 :key t)
+  (count :u32))
+
+(dds.gen:define-dds-type gate-cr-type (:extensibility :final)
+  (id :i32 :key t)
+  (total :u32))  ; same id, same kind, different NAME -> assignable only under ignore_member_names
+
+(defun* %gate-queries (p)
+    (function (dds.dcps:domain-participant) (integer 0))
+  "The getTypes-query count of P's type-gate state (diagnostic observable)."
+  (dds.dcps::type-gate-state-queries (dds.dcps::dp-type-gate-state p)))
+
+(defun* run-dcps-type-gate-test ()
+    (function () t)
+  "FR-TYPE-4 gated matching end-to-end: (e) a wire-parsed (name-erased) model is
+   assignable to/from its named original via the NameHash correspondence; (a) equal
+   hashes match with ZERO TypeLookup queries; (b) same topic+type NAME but a
+   non-assignable structure (same member id, different primitive kind) runs a
+   TypeLookup query, blocks the match, and raises INCONSISTENT_TOPIC at DCPS level;
+   (c) a member-NAME-only difference matches when the reader's
+   TYPE_CONSISTENCY_ENFORCEMENT sets ignore_member_names; (d) an unreachable
+   TypeLookup service times out to the name-based fallback and the match completes."
+  ;; (e) NameHash regression: parse-minimal-type-object erases names, keeps the wire hash
+  (let* ((m (dds.types:type-support-typeobject (dds.types:find-type-support "shape-type")))
+         (wire (dds.types:parse-minimal-type-object (dds.types:minimal-type-object-octets m)))
+         (opts (dds.types:default-assignability-options)))
+    (%check :tg4-namehash
+            (and (typep wire 'dds.types:minimal-struct-type)
+                 (dds.types:struct-assignable-from wire m opts)
+                 (dds.types:struct-assignable-from m wire opts))
+            "a name-erased wire model must be assignable to/from its named original (NameHash)"))
+  ;; (a) identical types both sides: match completes, zero TypeLookup queries
+  (let ((ts (dds.types:find-type-support "gate-eq-type"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((t1 (dds.dcps:create-topic p1 "GateEqTopic" "gate-eq-type" ts))
+                (t2 (dds.dcps:create-topic p2 "GateEqTopic" "gate-eq-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2)))
+           (dds.dcps:create-datawriter pub t1)
+           (dds.dcps:create-datareader sub t2)
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1))
+                            (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :tg4-eq-matched
+                   (and (plusp (dds.dcps:matched-count p1))
+                        (plusp (dds.dcps:matched-count p2)))
+                   "identical types must match through the gate")
+           (%check :tg4-eq-no-query
+                   (and (zerop (%gate-queries p1)) (zerop (%gate-queries p2)))
+                   "equal EquivalenceHashes must match without any TypeLookup query"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2)))
+  ;; (b) same names, non-assignable structures: query runs, no match, INCONSISTENT_TOPIC
+  (let ((ts-w (dds.types:find-type-support "gate-w-type"))
+        (ts-r (dds.types:find-type-support "gate-r-type"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((t1 (dds.dcps:create-topic p1 "GateBadTopic" "GateBadType" ts-w))
+                (t2 (dds.dcps:create-topic p2 "GateBadTopic" "GateBadType" ts-r))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2)))
+           (dds.dcps:create-datawriter pub t1)
+           (dds.dcps:create-datareader sub t2)
+           (loop repeat 150
+                 until (plusp (dds.dcps:inconsistent-topic-status-total-count
+                               (dds.dcps:get-inconsistent-topic-status t2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :tg4-bad-query (plusp (%gate-queries p2))
+                   "differing hashes must run a TypeLookup query")
+           (%check :tg4-bad-no-match
+                   (and (zerop (dds.dcps:matched-count p1))
+                        (zerop (dds.dcps:matched-count p2)))
+                   "a non-assignable remote type must not match despite equal names")
+           ;; the status read above reset the change counter; re-read the cumulative count
+           (%check :tg4-bad-inconsistent
+                   (plusp (dds.dcps:inconsistent-topic-status-total-count
+                           (dds.dcps:get-inconsistent-topic-status t2)))
+                   "the blocked match must surface INCONSISTENT_TOPIC on the reader-side Topic"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2)))
+  ;; (c) member-name-only difference: assignable under the reader's ignore_member_names.
+  ;; Only the reader side matches: TYPE_CONSISTENCY_ENFORCEMENT is not in our SEDP
+  ;; ParameterList yet, so the writer side assesses with the §7.6.3.4.1 defaults.
+  (let ((ts-w (dds.types:find-type-support "gate-cw-type"))
+        (ts-r (dds.types:find-type-support "gate-cr-type"))
+        (p1 (dds.dcps:create-participant :domain 0))
+        (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((t1 (dds.dcps:create-topic p1 "GateImnTopic" "GateImnType" ts-w))
+                (t2 (dds.dcps:create-topic p2 "GateImnTopic" "GateImnType" ts-r))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2)))
+           (dds.dcps:create-datawriter pub t1)
+           (dds.dcps:create-datareader sub t2
+            :qos (dds.qos:make-reader-qos
+                  :type-consistency (dds.qos:make-type-consistency-enforcement
+                                     :ignore-member-names t)))
+           (loop repeat 150
+                 until (plusp (dds.dcps:matched-count p2))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :tg4-imn-query (plusp (%gate-queries p2))
+                   "differing hashes must run a TypeLookup query before the verdict")
+           (%check :tg4-imn-matched (plusp (dds.dcps:matched-count p2))
+                   "ignore_member_names on the reader must admit a name-only type difference"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2)))
+  ;; (d) timeout fallback: the remote participant IS discovered but its metatraffic
+  ;; locator points at a dead port, so the getTypes goes unanswered and expires via
+  ;; tl-sweep -> the gate records the name-based :compatible fallback and the match completes
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p (dds.dcps:create-participant :domain 0))
+        ;; a freshly released ephemeral port: discovered yet unreachable
+        (dead-port (let ((dead (dds.disc:make-disc-node :host "127.0.0.1" :port 0)))
+                     (prog1 (dds.disc:disc-node-port dead) (dds.disc:stop-node dead)))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "GateTimeoutTopic" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (node (dds.dcps::dp-node p))
+                (other-ti (dds.types:serialize-type-information
+                           (dds.types:type-support-typeobject
+                            (dds.types:find-type-support "dcps-msg"))))
+                (prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 9))
+                (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
+                (dead-loc (dds.rtps.discovery:make-locator
+                           :kind dds.rtps.discovery:+locator-kind-udpv4+ :port dead-port
+                           :address (dds.rtps.discovery:make-ipv4-locator
+                                     (coerce #(127 0 0 1) '(simple-array (unsigned-byte 8) (4))))))
+                (remote (dds.rtps.discovery:make-endpoint-data
+                         :guid guid :topic-name "GateTimeoutTopic" :type-name "shape-type"
+                         :type-information other-ti :qos (dds.qos:make-writer-qos))))
+           (setf (aref guid 15) #x02)   ; entityKind: user writer with key (RTPS 2.5 §9.3.1.2)
+           (dds.dcps:create-datareader sub tp)
+           ;; the gate only queries a discovered participant: inject the dead one's SPDP
+           (dds.disc::%record-participant
+            node (dds.rtps.discovery:make-spdp-data
+                  :guid-prefix prefix :version-major 2 :version-minor 5
+                  :metatraffic-unicast-locators (list dead-loc)
+                  :default-unicast-locators (list dead-loc)))
+           (let ((dds.disc:*typelookup-timeout* 0))
+             (dds.disc::%match-remote-writer node remote)   ; gate -> query -> :pending parks
+             (%check :tg4-timeout-parked
+                     (and (= 1 (dds.disc:disc-node-parked-count node))
+                          (zerop (dds.dcps:matched-count p)))
+                     "an unanswerable TypeLookup must park the match decision")
+             (sleep 0.05)
+             (dds.disc:tl-sweep node))   ; expiry -> fallback :compatible -> resume -> match
+           (%check :tg4-timeout-match (plusp (dds.dcps:matched-count p))
+                   "a TypeLookup timeout must fall back to name-based matching"))
+      (dds.dcps:delete-participant p)))
+  t)

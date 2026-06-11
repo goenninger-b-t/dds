@@ -19,12 +19,20 @@
    maps a remote 16-octet endpoint GUID to the remote endpoint-data that matched a
    local endpoint; INCOMPAT maps a remote GUID whose topic+type agreed but whose QoS
    failed RxO (drives OFFERED/REQUESTED_INCOMPATIBLE_QOS). LOCK guards DISCOVERED +
-   MATCHES + INCOMPAT across the receiver thread. ON-MATCH / ON-INCOMPATIBLE-QOS /
-   ON-SAMPLE are optional control-plane hooks the DCPS layer installs to surface
-   matched/incompatible events and newly-arrived user data to the application (DDS
-   statuses, listeners, and the condvar-driven WaitSet wake); each match/incompatible
-   hook fires once per remote endpoint, ON-SAMPLE once per stored user sample.
-   TX-PAYLOAD/TX-MSG are the reused announce scratch buffers."
+   MATCHES + INCOMPAT + PARKED-MATCHES plus the TypeLookup service state (TL-PENDING,
+   TL-REQ-SN, TL-REPLY-SN, TL-SENT) across the receiver thread. ON-MATCH /
+   ON-INCOMPATIBLE-QOS / ON-SAMPLE are optional control-plane hooks the DCPS layer
+   installs to surface matched/incompatible events and newly-arrived user data to the
+   application (DDS statuses, listeners, and the condvar-driven WaitSet wake); each
+   match/incompatible hook fires once per remote endpoint, ON-SAMPLE once per stored
+   user sample. TYPE-GATE is an optional type-compatibility gate consulted OUTSIDE
+   the lock (user code, like the ON-* hooks) as (funcall gate node remote local) —
+   REMOTE + LOCAL are dds.rtps.discovery:endpoint-data — before a match is recorded
+   in EITHER direction; verdicts: :compatible (record + fire as usual), :incompatible
+   (routed to the INCONSISTENT_TOPIC path, like a type-name mismatch), :pending (the
+   (direction . remote) decision is parked on PARKED-MATCHES, deduped by remote GUID,
+   until resume-parked-matches re-runs it); a NIL gate (default) behaves exactly as
+   :compatible. TX-PAYLOAD/TX-MSG are the reused announce scratch buffers."
   (guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)
                :type (simple-array (unsigned-byte 8) (12)))
   (domain 0 :type (integer 0))
@@ -38,6 +46,8 @@
   (matches (make-hash-table :test 'equalp) :type hash-table)
   (incompat (make-hash-table :test 'equalp) :type hash-table)
   (inconsistent (make-hash-table :test 'equalp) :type hash-table)
+  (parked-matches '() :type list) ; (direction . remote endpoint-data), TYPE-GATE :pending; stale snapshots are pre-empted by SEDP re-announce
+
   (discovered-writers (make-hash-table :test 'equalp) :type hash-table) ; all remote publications
   (discovered-readers (make-hash-table :test 'equalp) :type hash-table) ; all remote subscriptions
   (local-writers '() :type list)
@@ -52,6 +62,11 @@
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
   (builtin-readers (make-hash-table :test 'equalp) :type hash-table) ; remote 12-octet prefix -> reliable SEDP reader
+  ;; TypeLookup service endpoint state (typelookup-endpoints.lisp, XTypes 1.3 §7.6.3.3)
+  (tl-pending (make-hash-table :test 'eql) :type hash-table) ; request SN -> tl-pending-entry
+  (tl-req-sn 1 :type integer)
+  (tl-reply-sn 1 :type integer)
+  (tl-sent '() :type list) ; reply writer resend store: newest-first (sn . reply-octets)
 
   (on-data nil :type (or null function))
   (on-heartbeat nil :type (or null function))
@@ -60,6 +75,7 @@
   (on-heartbeat-frag nil :type (or null function))
   (on-nack-frag nil :type (or null function))
   (on-match nil :type (or null function))
+  (type-gate nil :type (or null function))
   (on-incompatible-qos nil :type (or null function))
   (on-inconsistent-topic nil :type (or null function))
   (on-sample nil :type (or null function))
@@ -265,6 +281,13 @@
     (replace p (dds.core.buffer:octet-buffer-vec buf) :start2 8 :end2 20)
     p))
 
+;; TypeLookup endpoint handlers: defined in typelookup-endpoints.lisp (loaded after this file).
+(declaim (ftype (function ((unsigned-byte 32)) t) %tl-writer-p)
+         (ftype (function ((unsigned-byte 32)) (or null (unsigned-byte 32))) %tl-reader-id-for)
+         (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)) t) %on-tl-data)
+         (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) dds.core.buffer:cursor (unsigned-byte 8)) t) %on-tl-acknack)
+         (ftype (function (disc-node) (eql t)) tl-sweep))
+
 (defun* %builtin-reader-nl (node prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
   "Get/create the per-remote reliable SEDP reader for PREFIX. CALLER HOLDS the node lock."
@@ -316,14 +339,14 @@
                     (dds.xport.udp:make-udp-locator :host host :port port)
                     buf 0 (dds.core.buffer:cursor-position mc))))
 
-(defun* %on-builtin-heartbeat (node prefix wid first last)
-    (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer integer) t)
-  "Receiver-thread: a HEARTBEAT from remote PREFIX's builtin SEDP writer WID. Apply its
-   range, then ACKNACK to that participant's metatraffic locator to pull its SEDP. Uses
-   the receiver-thread rx-tx-msg buffer."
-  (let ((rid (%sedp-reader-id-for wid))
-        (hp (%remote-metatraffic node prefix)))
-    (when (and rid hp)
+(defun* %on-builtin-heartbeat (node prefix rid wid first last)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) (unsigned-byte 32) integer integer) t)
+  "Receiver-thread: a HEARTBEAT from remote PREFIX's builtin writer WID (SEDP or
+   TypeLookup). Apply its range, then ACKNACK from our matching builtin reader RID to
+   that participant's metatraffic locator to pull what is missing. Uses the
+   receiver-thread rx-tx-msg buffer."
+  (let ((hp (%remote-metatraffic node prefix)))
+    (when hp
       (multiple-value-bind (base numbits bitmap count)
           (%builtin-acknack-values node prefix wid first last)
         (%send-acknack node (disc-node-rx-tx-msg node) rid wid base numbits bitmap count
@@ -333,7 +356,8 @@
     (function (disc-node) (eql t))
   "Send NODE's local publications (SEDP publications writer) and subscriptions
    (SEDP subscriptions writer) to every discovered participant's metatraffic
-   unicast locator (RTPS 2.5 §8.5.4)."
+   unicast locator (RTPS 2.5 §8.5.4). Also drives tl-sweep, expiring overdue
+   TypeLookup queries on the periodic announce cadence."
   (dolist (p (%discovered-participants node))
     (let ((loc (dds.rtps.discovery:usable-udpv4-locator
                 (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))))
@@ -366,6 +390,7 @@
                 (%send-acknack node (disc-node-tx-msg node)
                                (%sedp-reader-id-for wid) wid base numbits bitmap count
                                nil host port))))))))
+  (tl-sweep node)
   t)
 
 (defun* %record-participant (node spdp)
@@ -449,55 +474,98 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for v being the hash-values of (disc-node-discovered-readers node) collect v)))
 
-(defun* %match-remote-writer (node remote)
-    (function (disc-node dds.rtps.discovery:endpoint-data) t)
-  "REMOTE is a discovered publication. Test it against each local reader: on the first
-   RxO-compatible reader record + announce a match (:remote-writer). Else, against a
-   reader on the SAME topic name: a different type name is an INCONSISTENT_TOPIC; a
-   matching type whose QoS failed RxO is REQUESTED_INCOMPATIBLE_QOS (failing policies)."
-  (let ((incompat nil) (inconsistent nil))
-    (dolist (lr (disc-node-local-readers node))
-      (multiple-value-bind (ok bad) (dds.rtps.discovery:endpoint-match-p remote lr)
+(defun* %consult-type-gate (node remote local)
+    (function (disc-node dds.rtps.discovery:endpoint-data dds.rtps.discovery:endpoint-data) t)
+  "Ask the TYPE-GATE hook for a type-compatibility verdict on the (REMOTE, LOCAL)
+   endpoint pair. Called OUTSIDE the node lock on the receiver thread (the gate is
+   user code, like the ON-* hooks — see %fire-match). A NIL gate — and any verdict
+   other than :incompatible / :pending — proceeds as :compatible."
+  (let ((gate (disc-node-type-gate node)))
+    (if gate (funcall gate node remote local) :compatible)))
+
+(defun* %park-match (node direction remote)
+    (function (disc-node (member :remote-writer :remote-reader) dds.rtps.discovery:endpoint-data) (eql t))
+  "Park a TYPE-GATE :pending match decision as (DIRECTION . REMOTE) (lock-guarded),
+   deduped by the remote 16-octet GUID; resume-parked-matches re-runs it. A parked
+   REMOTE snapshot may go stale, but a fresh SEDP re-announcement re-runs the match
+   through the normal path anyway (pre-emption), so resume callers need no refresh."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((guid (dds.rtps.discovery:endpoint-data-guid remote)))
+      (unless (member guid (disc-node-parked-matches node)
+                      :key (lambda (e) (dds.rtps.discovery:endpoint-data-guid (cdr e)))
+                      :test #'equalp)
+        (push (cons direction remote) (disc-node-parked-matches node)))))
+  t)
+
+(defun* %match-remote-endpoint (node remote direction)
+    (function (disc-node dds.rtps.discovery:endpoint-data (member :remote-writer :remote-reader)) (eql t))
+  "Test discovered REMOTE against each local endpoint of the opposite kind (DIRECTION
+   :remote-writer -> local readers; :remote-reader -> local writers). On the first
+   RxO-compatible local, consult the TYPE-GATE: :compatible (or no gate) records +
+   announces the match; :incompatible joins the INCONSISTENT_TOPIC path; :pending
+   parks the decision for resume-parked-matches. Else, against a local on the SAME
+   topic name: a different type name is an INCONSISTENT_TOPIC; a matching type whose
+   QoS failed RxO is OFFERED/REQUESTED_INCOMPATIBLE_QOS (failing policies)."
+  (let ((incompat nil) (inconsistent nil) (writer-p (eq direction :remote-writer)))
+    (dolist (local (if writer-p (disc-node-local-readers node) (disc-node-local-writers node)))
+      (multiple-value-bind (ok bad)
+          (if writer-p
+              ;; endpoint-match-p wants writer-data first: REMOTE is the writer here
+              (dds.rtps.discovery:endpoint-match-p remote local)
+              ;; LOCAL is the writer here (REMOTE is a reader); writer-data still first
+              (dds.rtps.discovery:endpoint-match-p local remote))
         (cond
-          (ok (when (%record-match node remote) (%fire-match node :remote-writer remote))
-              (return-from %match-remote-writer t))
+          (ok (case (%consult-type-gate node remote local)
+                (:incompatible
+                 (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name local)))
+                (:pending
+                 (%park-match node direction remote)
+                 ;; deliberately short-circuits the incompat/inconsistent bookkeeping below
+                 (return-from %match-remote-endpoint t))
+                (t (when (%record-match node remote) (%fire-match node direction remote))
+                   (return-from %match-remote-endpoint t))))
           ((string= (dds.rtps.discovery:endpoint-data-topic-name remote)
-                    (dds.rtps.discovery:endpoint-data-topic-name lr))
+                    (dds.rtps.discovery:endpoint-data-topic-name local))
            (if (string= (dds.rtps.discovery:endpoint-data-type-name remote)
-                        (dds.rtps.discovery:endpoint-data-type-name lr))
+                        (dds.rtps.discovery:endpoint-data-type-name local))
                (setf incompat bad)
-               (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name lr)))))))
+               (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name local)))))))
     (cond
       ((and incompat (%record-incompat node remote))
-       (%fire-incompat node :remote-writer remote incompat))
+       (%fire-incompat node direction remote incompat))
       ((and inconsistent (%record-inconsistent node remote))
        (%fire-inconsistent node inconsistent))))
   t)
 
+(defun* %match-remote-writer (node remote)
+    (function (disc-node dds.rtps.discovery:endpoint-data) (eql t))
+  "REMOTE is a discovered publication: match it against the local readers (:remote-writer)."
+  (%match-remote-endpoint node remote :remote-writer))
+
 (defun* %match-remote-reader (node remote)
-    (function (disc-node dds.rtps.discovery:endpoint-data) t)
-  "REMOTE is a discovered subscription. Test it against each local writer: on the first
-   RxO-compatible writer record + announce a match (:remote-reader). Else, against a
-   writer on the SAME topic name: a different type name is an INCONSISTENT_TOPIC; a
-   matching type whose QoS failed RxO is OFFERED_INCOMPATIBLE_QOS (failing policies)."
-  (let ((incompat nil) (inconsistent nil))
-    (dolist (lw (disc-node-local-writers node))
-      (multiple-value-bind (ok bad) (dds.rtps.discovery:endpoint-match-p lw remote)
-        (cond
-          (ok (when (%record-match node remote) (%fire-match node :remote-reader remote))
-              (return-from %match-remote-reader t))
-          ((string= (dds.rtps.discovery:endpoint-data-topic-name lw)
-                    (dds.rtps.discovery:endpoint-data-topic-name remote))
-           (if (string= (dds.rtps.discovery:endpoint-data-type-name lw)
-                        (dds.rtps.discovery:endpoint-data-type-name remote))
-               (setf incompat bad)
-               (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name lw)))))))
-    (cond
-      ((and incompat (%record-incompat node remote))
-       (%fire-incompat node :remote-reader remote incompat))
-      ((and inconsistent (%record-inconsistent node remote))
-       (%fire-inconsistent node inconsistent))))
+    (function (disc-node dds.rtps.discovery:endpoint-data) (eql t))
+  "REMOTE is a discovered subscription: match it against the local writers (:remote-reader)."
+  (%match-remote-endpoint node remote :remote-reader))
+
+(defun* resume-parked-matches (node)
+    (function (disc-node) (eql t))
+  "Re-run every parked (TYPE-GATE :pending) match decision: take + clear the parked
+   list under the node lock, then outside the lock re-run the SEDP match for each
+   entry — the gate is consulted again; a still-:pending verdict re-parks the entry
+   (still deduped by remote GUID). Call once the gate installer has a verdict (e.g.
+   a TypeLookup reply arrived)."
+  (let ((parked (dds.pal:with-lock ((disc-node-lock node))
+                  (shiftf (disc-node-parked-matches node) '()))))
+    (dolist (entry parked)
+      (%match-remote-endpoint node (cdr entry) (car entry))))
   t)
+
+(defun* disc-node-parked-count (node)
+    (function (disc-node) (integer 0))
+  "Number of parked (TYPE-GATE :pending) match decisions awaiting resume-parked-matches
+   (lock-guarded; diagnostic)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (length (disc-node-parked-matches node))))
 
 (defun* %handle-datagram (node buf size)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0)) t)
@@ -544,6 +612,8 @@
                          (%record-discovered (disc-node-discovered-readers node) ep))
                        (%match-remote-reader node ep))
                      (%builtin-on-data node src-prefix wtr sn))))
+                ((%tl-writer-p wtr)
+                 (%on-tl-data node src-prefix wtr sn buf poff plen))
                 ((disc-node-on-data node)
                  (funcall (disc-node-on-data node) wtr sn buf poff plen))))))
          ((= id dds.rtps.message:+submsg-heartbeat+)
@@ -551,14 +621,18 @@
             (multiple-value-bind (rid wid first last hcount hfinal hlive)
                 (dds.rtps.message:parse-heartbeat-body c flags)
               (declare (ignore rid hcount hfinal hlive))
-              (cond
-                ((%sedp-reader-id-for wid)
-                 (%on-builtin-heartbeat node src-prefix wid first last))
-                ((disc-node-on-heartbeat node)
-                 (dds.core.buffer:cursor-set-position c pos)
-                 (funcall (disc-node-on-heartbeat node) c flags))))))
-         ((and (= id dds.rtps.message:+submsg-acknack+) (disc-node-on-acknack node))
-          (funcall (disc-node-on-acknack node) c flags))
+              (let ((bid (or (%sedp-reader-id-for wid) (%tl-reader-id-for wid))))
+                (cond
+                  (bid (%on-builtin-heartbeat node src-prefix bid wid first last))
+                  ((disc-node-on-heartbeat node)
+                   (dds.core.buffer:cursor-set-position c pos)
+                   (funcall (disc-node-on-heartbeat node) c flags)))))))
+         ((= id dds.rtps.message:+submsg-acknack+)
+          (let ((pos (dds.core.buffer:cursor-position c)))
+            (unless (%on-tl-acknack node src-prefix c flags)
+              (when (disc-node-on-acknack node)
+                (dds.core.buffer:cursor-set-position c pos)
+                (funcall (disc-node-on-acknack node) c flags)))))
          ((and (= id dds.rtps.message:+submsg-data-frag+) (disc-node-on-data-frag node))
           (funcall (disc-node-on-data-frag node) c flags body-len buf))
          ((and (= id dds.rtps.message:+submsg-heartbeat-frag+) (disc-node-on-heartbeat-frag node))

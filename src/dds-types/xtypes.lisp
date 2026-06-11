@@ -33,6 +33,9 @@
 ;;; ---- EquivalenceKind (idl §8-10) ----
 (defconstant +ek-minimal+ #xf1 "XTypes EquivalenceKind octet EK_MINIMAL (idl §8-10).")
 (defconstant +ek-complete+ #xf2 "XTypes EquivalenceKind octet EK_COMPLETE (idl §8-10).")
+(defconstant +ek-both+ #xf3
+  "XTypes EquivalenceKind octet EK_BOTH (idl §8-10): carried as the PlainCollectionHeader
+   equiv_kind of fully-descriptive plain-collection elements (idl §181-183).")
 ;;; ---- TypeIdentifierKind (idl §56-70) ----
 (defconstant +ti-string8-small+ #x70
   "XTypes TypeIdentifierKind octet TI_STRING8_SMALL (idl §56-70): narrow string, SBound.")

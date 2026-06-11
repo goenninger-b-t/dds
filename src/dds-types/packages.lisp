@@ -43,15 +43,21 @@
            #:assignability-options-prevent-type-widening
            #:default-assignability-options
            #:ti-assignable-from #:strongly-assignable-from #:struct-assignable-from
+           #:member-names-agree-p
            #:ti-equivalent-p #:struct-equivalent-p #:enforce-type-consistency
            ;; XCDR2 MinimalTypeObject serializer + EquivalenceHash (FR-TYPE-2/5)
            #:minimal-type-object-octets #:equivalence-hash
+           ;; MinimalTypeObject deserializer, the serializer's inverse (FR-TYPE-2/3)
+           #:parse-minimal-type-object
            ;; TypeInformation codec for PID_TYPE_INFORMATION (FR-TYPE-3 foundation)
            #:serialize-type-information #:deserialize-type-information-hash
            ;; Built-in TypeLookup service request/reply codecs (XTypes 1.3 §7.6.3.3, FR-TYPE-3)
            #:serialize-type-lookup-request #:parse-type-lookup-request
            #:serialize-type-lookup-reply #:parse-type-lookup-reply
            #:+tl-gettypes-hash+ #:+tl-getdeps-hash+
+           ;; TypeLookup hash index + pure server core (XTypes 1.3 §7.6.3.3.4, FR-TYPE-3)
+           #:find-type-support-by-hash #:type-lookup-respond
+           #:*max-typelookup-request-ids*
            ;; Inbound RTI PID_TYPE_OBJECT_LB inflate + fingerprint (ADR 0009)
            #:inflate-type-object-lb #:*max-type-object-bytes*
            #:+type-object-lb-compression-zlib+
@@ -60,4 +66,4 @@
            #:+tk-boolean+ #:+tk-byte+ #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
            #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
            #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+
-           #:+ti-string8-small+ #:+ti-plain-sequence-small+))
+           #:+ti-string8-small+ #:+ti-string8-large+ #:+ti-plain-sequence-small+))

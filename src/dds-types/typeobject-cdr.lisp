@@ -210,6 +210,155 @@
    (XTypes §7.3.4.9.1). Nested struct members recurse to the referenced struct's hash."
   (subseq (dds.core.md5:md5 (minimal-type-object-octets s)) 0 14))
 
+;;;; MinimalTypeObject deserializer (TypeLookup Task 2.1, FR-TYPE-2/3): the exact inverse
+;;;; of MINIMAL-TYPE-OBJECT-OCTETS for the modeled subset, so a TypeObject received via
+;;;; TypeLookup can feed assignability (FR-TYPE-4; the service logic wiring the two
+;;;; together is a subsequent task). Additionally parses the plain-sequence
+;;;; member TypeIdentifiers the serializer cannot emit yet, pinned from the idl:
+;;;; PlainSequenceSElemDefn (FINAL, rule 17) = PlainCollectionHeader { EquivalenceKind
+;;;; equiv_kind (octet); CollectionElementFlag element_flags (UInt16) } + SBound bound
+;;;; (octet) + @external TypeIdentifier element_identifier; the LARGE form carries an
+;;;; LBound (UInt32) instead (xtypes-1_3_typeobject.idl §181-197). Network-facing: every
+;;;; read is bounds-checked (NFR-SEC-POSTURE) — DHEADER extents explicitly, the buffer
+;;;; extent via the cursor's BUFFER-OVERFLOW signal.
+
+(defconstant +max-plain-collection-nesting+ 32
+  "Resource guard (NFR-SEC-POSTURE): the maximum plain-collection element nesting
+   PARSE-MINIMAL-TYPE-OBJECT recurses into before deeming the type :UNSUPPORTED.")
+
+(defun* %struct-flag-extensibility (flags)
+    (function ((unsigned-byte 16)) (or null (member :final :appendable :mutable)))
+  "Inverse of %STRUCT-TYPE-FLAG: the extensibility encoded in StructTypeFlag FLAGS, or
+   NIL unless exactly one extensibility bit is set (idl §163); other bits are ignored."
+  (let ((e (logand flags (logior +type-flag-is-final+ +type-flag-is-appendable+
+                                 +type-flag-is-mutable+))))
+    (cond ((= e +type-flag-is-final+) :final)
+          ((= e +type-flag-is-appendable+) :appendable)
+          ((= e +type-flag-is-mutable+) :mutable)
+          (t nil))))
+
+(defun* %get-type-identifier (c depth)
+    (function (dds.core.buffer:cursor (integer 0)) (or type-identifier (member :unsupported)))
+  "Parse one TypeIdentifier at cursor C: the inverse of %PUT-TYPE-IDENTIFIER plus the
+   plain-sequence forms (idl §187-197). DEPTH bounds collection-element recursion;
+   :UNSUPPORTED for any unmodeled kind; reads past the buffer signal BUFFER-OVERFLOW."
+  (let* ((k (dds.core.buffer:get-u8 c))
+         (ti (%make-type-identifier :kind k)))
+    (cond
+      ((ti-primitive-p ti) ti)
+      ((= k +ti-string8-small+)
+       (setf (type-identifier-bound ti) (dds.core.buffer:get-u8 c))
+       ti)
+      ((= k +ti-string8-large+)
+       (setf (type-identifier-bound ti) (dds.cdr:cdr-get-u32 c :xcdr2))
+       ti)
+      ((or (= k +ek-minimal+) (= k +ek-complete+))
+       (let ((h (make-array 14 :element-type '(unsigned-byte 8))))
+         (dds.core.buffer:get-octets c h 0 14)
+         (hash-type-identifier k :hash h)))
+      ((ti-sequence-p ti)
+       (if (zerop depth)
+           :unsupported
+           (let ((ek (dds.core.buffer:get-u8 c)))
+             (dds.cdr:cdr-get-u16 c :xcdr2)   ; element_flags: beyond the minimal model, ignored
+             (if (not (or (= ek +ek-minimal+) (= ek +ek-complete+) (= ek +ek-both+)))
+                 :unsupported
+                 (let* ((bound (if (= k +ti-plain-sequence-small+)
+                                   (dds.core.buffer:get-u8 c)
+                                   (dds.cdr:cdr-get-u32 c :xcdr2)))
+                        (el (%get-type-identifier c (1- depth))))
+                   (if (type-identifier-p el)
+                       (let ((sti (sequence-type-identifier el bound)))
+                         (setf (type-identifier-kind sti) k)   ; preserve SMALL vs LARGE
+                         sti)
+                       el))))))
+      (t :unsupported))))
+
+(defun* %get-minimal-struct-member (c send)
+    (function (dds.core.buffer:cursor (integer 0))
+              (or null minimal-struct-member (member :unsupported)))
+  "Parse one APPENDABLE MinimalStructMember (DHEADER + CommonStructMember + the 4-octet
+   MinimalMemberDetail NameHash), skipping to the DHEADER extent afterwards (APPENDABLE
+   tolerance for future extra fields). NIL on framing past SEND or past the member extent;
+   :UNSUPPORTED on an unmodeled member TypeIdentifier. The name is unknown in Minimal, so
+   the member is built with NAME \"\" and the PARSED NameHash (never recomputed)."
+  (let* ((msize (dds.cdr:cdr-get-dheader c :xcdr2))
+         (mend (+ (dds.core.buffer:cursor-position c) msize)))
+    (when (> mend send) (return-from %get-minimal-struct-member nil))
+    (let* ((id (dds.cdr:cdr-get-u32 c :xcdr2))
+           (flags (dds.cdr:cdr-get-u16 c :xcdr2))
+           (ti (%get-type-identifier c +max-plain-collection-nesting+))
+           (nh (make-array 4 :element-type '(unsigned-byte 8))))
+      (unless (type-identifier-p ti) (return-from %get-minimal-struct-member ti))
+      (dds.core.buffer:get-octets c nh 0 4)
+      (when (> (dds.core.buffer:cursor-position c) mend)
+        (return-from %get-minimal-struct-member nil))
+      (dds.core.buffer:cursor-set-position c mend)
+      (%make-minimal-struct-member
+       :name "" :id id :type-identifier ti
+       :key-p (logtest flags +member-flag-is-key+)
+       :optional-p (logtest flags +member-flag-is-optional+)
+       :must-understand-p (logtest flags +member-flag-is-must-understand+)
+       :name-hash nh))))
+
+(defun* parse-minimal-type-object (octets)
+    (function ((simple-array (unsigned-byte 8) (*)))
+              (or null minimal-struct-type (member :unsupported)))
+  "Parse a serialized EK_MINIMAL TypeObject into a minimal-struct-type; :UNSUPPORTED for
+   any kind outside the modeled subset (EK_COMPLETE, non-struct TK, a non-TK_NONE base,
+   an unmodeled member TypeIdentifier) and for input over *MAX-TYPE-OBJECT-BYTES*;
+   NIL on malformed/truncated input. Inverse of MINIMAL-TYPE-OBJECT-OCTETS (XTypes 1.3
+   §7.3.4.5; framing per the §7.4.3.5.3 rules cited on the serializer). The parsed model
+   carries NAME \"\" (Minimal erases names), the wire NameHashes, and member EK_* hashes
+   with REFERENCED=NIL, so it re-serializes byte-identically."
+  (let ((len (length octets)))
+    (when (> len *max-type-object-bytes*)
+      (return-from parse-minimal-type-object :unsupported))
+    ;; absolute minimum onset: DHEADER 4 + EK 1 + TK 1 + struct_flags 2
+    (when (< len 8) (return-from parse-minimal-type-object nil))
+    (let* ((buf (dds.core.buffer:make-octet-buffer len))
+           (c (dds.core.buffer:cursor buf :endianness :little)))
+      (replace (dds.core.buffer:octet-buffer-vec buf) octets)
+      (unwind-protect
+           ;; the cursor signals BUFFER-OVERFLOW on any read past LEN -> NIL
+           (handler-case
+               (let* ((tsize (dds.cdr:cdr-get-dheader c :xcdr2))
+                      (tend (+ (dds.core.buffer:cursor-position c) tsize)))
+                 (when (> tend len) (return-from parse-minimal-type-object nil))
+                 (let ((ek (dds.core.buffer:get-u8 c)))
+                   (unless (= ek +ek-minimal+)
+                     (return-from parse-minimal-type-object
+                       (if (= ek +ek-complete+) :unsupported nil))))
+                 (unless (= (dds.core.buffer:get-u8 c) +tk-structure+)
+                   (return-from parse-minimal-type-object :unsupported))
+                 (let ((ext (%struct-flag-extensibility (dds.cdr:cdr-get-u16 c :xcdr2))))
+                   (unless ext (return-from parse-minimal-type-object nil))
+                   ;; MinimalStructHeader (APPENDABLE): TK_NONE base, extras skipped
+                   (let* ((hsize (dds.cdr:cdr-get-dheader c :xcdr2))
+                          (hend (+ (dds.core.buffer:cursor-position c) hsize)))
+                     (when (or (zerop hsize) (> hend tend))
+                       (return-from parse-minimal-type-object nil))
+                     (unless (= (dds.core.buffer:get-u8 c) +tk-none+)
+                       (return-from parse-minimal-type-object :unsupported))
+                     (dds.core.buffer:cursor-set-position c hend))
+                   (let* ((ssize (dds.cdr:cdr-get-dheader c :xcdr2))
+                          (send (+ (dds.core.buffer:cursor-position c) ssize)))
+                     (when (> send tend) (return-from parse-minimal-type-object nil))
+                     (let ((count (dds.cdr:cdr-get-u32 c :xcdr2))
+                           (members '()))
+                       ;; each member >= 15 octets (DHEADER 4 + id 4 + flags 2 + TI 1 + NameHash 4)
+                       (when (> (* count 15) (- send (dds.core.buffer:cursor-position c)))
+                         (return-from parse-minimal-type-object nil))
+                       (dotimes (i count)
+                         (let ((m (%get-minimal-struct-member c send)))
+                           (unless (minimal-struct-member-p m)
+                             (return-from parse-minimal-type-object m))
+                           (push m members)))
+                       (make-minimal-struct-type :name "" :extensibility ext
+                                                 :members (nreverse members))))))
+             (dds.core.buffer:buffer-overflow () nil))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))
+
 ;;;; TypeInformation codec (M4 step b1, FR-TYPE-3 foundation). The TypeInformation carried
 ;;;; in PublicationBuiltinTopicData/SubscriptionBuiltinTopicData (PID_TYPE_INFORMATION,
 ;;;; idl @id(0x0075)) so peers learn a type's EquivalenceHash-based TypeIdentifier without
