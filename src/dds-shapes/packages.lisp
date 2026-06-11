@@ -18,4 +18,5 @@
            #:large-data #:make-large-data #:large-data-id #:large-data-payload
            #:serialize-large-data #:deserialize-large-data
            #:run-publisher #:run-subscriber #:run-spy
-           #:run-large-publisher #:run-large-subscriber))
+           #:run-large-publisher #:run-large-subscriber
+           #:run-corpus-capture-subscriber))

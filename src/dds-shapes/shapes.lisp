@@ -397,3 +397,39 @@
         (dds.disc:stop-node node)
         (format t "~&[large-sub] stopped; received ~d samples.~%" seen))
       t)))
+
+(defun* run-corpus-capture-subscriber (&key (domain 0) (topic "Square") (type "ShapeType")
+                                            (seconds 20))
+    (function (&key (:domain (integer 0)) (:topic string) (:type string) (:seconds (integer 0)))
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "Subscribe on TOPIC/TYPE, spin up to SECONDS, and on the first matched remote writer that
+   announced a PID_TYPE_OBJECT_LB print it as a Lisp byte vector (for the corpus) and return
+   it; NIL if none seen. Clean-room capture: reuses our own SEDP parser, no external dissector."
+  (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x43) :domain domain
+                                       :multicast t :advertise-address "127.0.0.1")))
+    (dds.disc:add-local-reader node :topic topic :type type
+                               :reliability dds.rtps.discovery:+reliability-reliable+
+                               :type-information (%shape-type-information))
+    (dds.disc:enable-subscriber node)
+    (dds.disc:start-node node)
+    (format t "~&[corpus] watching ~a/~a domain=~d for a peer PID_TYPE_OBJECT_LB (multicast 239.255.0.1).~%"
+            topic type domain)
+    (let ((last 0) (start (get-internal-real-time)))
+      (unwind-protect
+           (loop
+             (setf last (%reannounce node last))
+             (dolist (w (dds.disc:disc-node-discovered-writers-list node))
+               (let ((lb (dds.rtps.discovery:endpoint-data-type-object-lb w)))
+                 (when lb
+                   (format t "~&;; corpus LB: ~a / ~a (~a octets)~%(~{~a~^ ~})~%"
+                           topic type (length lb) (coerce lb 'list))
+                   (return-from run-corpus-capture-subscriber
+                     (coerce lb '(simple-array (unsigned-byte 8) (*)))))))
+             (when (and (plusp seconds)
+                        (> (/ (- (get-internal-real-time) start) internal-time-units-per-second)
+                           seconds))
+               (return))
+             (sleep 0.05))
+        (dds.disc:stop-node node)
+        (format t "~&[corpus] stopped; no PID_TYPE_OBJECT_LB captured.~%"))
+      nil)))

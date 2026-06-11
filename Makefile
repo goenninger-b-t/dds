@@ -10,7 +10,7 @@ LISP  ?= $(CLASP)
 
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
-        square-pub square-sub square-spy large-pub large-sub bench mem sbom hooks clean
+        square-pub square-sub square-spy large-pub large-sub corpus-capture bench mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -18,6 +18,8 @@ ADVERTISE ?= 127.0.0.1
 TYPE     ?= tagged
 SIZE     ?= 8000
 DROP     ?=
+TOPIC    ?= Square
+SECONDS  ?= 20
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -86,6 +88,12 @@ large-pub:
 large-sub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-large-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
+
+# Clean-room legacy-TypeObject capture: dump a peer's PID_TYPE_OBJECT_LB as a Lisp byte vector.
+corpus-capture:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-corpus-capture-subscriber :domain $(DOMAIN) :topic "$(TOPIC)" :type "$(TYPE)" :seconds $(SECONDS))' \
 	        --eval '(uiop:quit 0)'
 
 interop: wire
