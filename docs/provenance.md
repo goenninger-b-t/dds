@@ -777,3 +777,28 @@ eProsima sources and examples **may be consulted read-only** for harness API
 usage (FR-IO-2 peer apps); **no eProsima source is copied into `src/`**. No
 RTI source or headers were consulted. The GPL Wireshark RTPS dissector source
 was not used (only the binary dissector, as before).
+
+## M4 (2026-06-11) — Fast DDS shapes harness (`interop/fastdds/`, FR-IO-2 S0)
+
+The harness apps (`shapes_pub.cpp`, `shapes_sub.cpp`, `profiles.xml`, Makefiles) were
+**written fresh** against the installed public headers; eProsima sources were consulted
+**read-only** to reconcile 3.x API drift, per the clean-room note above. Files consulted
+(all Apache-2.0, in the pinned Fast-DDS v3.6.1 tree):
+
+- `examples/cpp/hello_world/PublisherApp.cpp` + the `hello_world/` file listing —
+  3.x entity-creation idioms (`create_participant_with_default_profile`, `TypeSupport`,
+  `RETCODE_OK`, listener signatures).
+- `examples/cpp/hello_world/hello_world_profile.xml` — profile XML shape.
+- `share/fastdds/fastdds_profiles.xsd` (installed) — element names for
+  `transport_descriptors`/`interfaceWhiteList`/`propertiesPolicy`; confirmed the 2.x
+  `<typelookup_config>` element no longer exists.
+- `src/cpp/rtps/builtin/BuiltinProtocols.cpp`, `src/cpp/fastdds/utils/TypePropagation.cpp`,
+  `include/fastdds/dds/core/policy/ParameterTypes.hpp`, `src/cpp/xmlparser/XMLParser.cpp`,
+  `src/cpp/xmlparser/XMLParserCommon.cpp` — how TypeLookup client+server are enabled in
+  3.x (participant property `fastdds.type_propagation`, default `enabled`).
+- Installed headers `fastdds/dds/domain/DomainParticipantFactory.hpp`,
+  `fastdds/dds/core/policy/QosPolicies.hpp` — API signature verification.
+
+The `fastddsgen` 4.3.0 output under `interop/fastdds/shapes/gen/` is **committed
+verbatim** (Apache-2.0 generator output, header notice retained) so the harness builds
+without a JDK. No RTI source/headers/generated code was consulted or copied.

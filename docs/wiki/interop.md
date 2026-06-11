@@ -1,8 +1,9 @@
 # Interop with RTI Connext (and other DDS)
 
 Common Lisp DDS is built to **interoperate on the wire with RTI Connext 7.x** and at least
-one open-source DDS (FR-IO). Two assets support that: the **Connext oracle/interop harness**
-under [`interop/connext/`](../../interop/connext/) and the standalone **Shapes harness**
+one open-source DDS (FR-IO). Three assets support that: the **Connext oracle/interop harness**
+under [`interop/connext/`](../../interop/connext/), the **Fast DDS peer harness** under
+[`interop/fastdds/`](../../interop/fastdds/), and the standalone **Shapes harness**
 (`dds-shapes`, the `make square-*` targets). Wire correctness is judged with the Wireshark/
 tshark RTPS dissector — the same dissector `make wire` uses — not by eye.
 
@@ -56,6 +57,27 @@ tshark -i lo -O rtps -V | grep -A60 PID_TYPE_INFORMATION   # lo0 on macOS
 
 See [`interop/connext/README.md`](../../interop/connext/README.md) for the full guide.
 
+## The Fast DDS harness (`interop/fastdds/`, FR-IO-2)
+
+eProsima Fast DDS-side C++ test apps (pinned **Fast DDS 3.6.1** toolchain via
+`scripts/with-fastdds.sh`). Where Connext is the gold oracle that does **not** speak the
+standard TypeLookup service (ADR 0010), Fast DDS implements XTypes 1.3
+`PID_TYPE_INFORMATION` + the builtin TypeLookup endpoints — this peer is the oracle for our
+TypeLookup CONFIRM-VS-PEER path and the provisional EquivalenceHash values. The apps run
+RELIABLE `ShapeType` on topic `Square`, UDPv4-only (tshark-observable; no SHMEM), with
+TypeLookup client+server pinned on via `fastdds.type_propagation=enabled`, and — unlike
+`rtiddsgen` — with `color` truly **unbounded**, matching our local type exactly.
+
+```sh
+./scripts/with-fastdds.sh make -C interop/fastdds   # build (pinned toolchain)
+make fastdds-sub SECONDS=15                         # subscribe + print samples (0 = forever)
+make fastdds-pub COLOR=GREEN COUNT=50               # publish ~10 samples/s (0 = forever)
+```
+
+Same-host Fast DDS↔Fast DDS smoke is green (S0 gate; 48/50 over `lo0`). See
+[`interop/fastdds/README.md`](../../interop/fastdds/README.md) for the toolchain pin, the
+per-machine `profiles.xml` `interfaceWhiteList` note, and the smoke evidence.
+
 ## Live Connext legacy-TypeObject type-gating (ACHIEVED 2026-06-11, ADR 0011)
 
 RTI Connext announces its type only through the vendor `PID_TYPE_OBJECT_LB` (0x8021), never
@@ -100,7 +122,9 @@ the diff isolates one of three one-line knobs (encapsulation-header / `struct_fl
 - **Shapes wire format**: validated against the tshark RTPS dissector (`make wire`).
 - **Bidirectional Connext interop**: staged (the harness exists) but **not yet run** — needs
   a Connext install. Same gate applies to full DCPS/content-filter interop.
-- **Open peer (Fast DDS / Cyclone / OpenDDS)** interop: planned (FR-IO-2).
+- **Open peer (Fast DDS)** interop: harness landed (`interop/fastdds/`, pinned Fast DDS
+  3.6.1; Fast DDS↔Fast DDS same-host smoke green); interop against **this stack** is the
+  next FR-IO-2 step.
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

@@ -1,0 +1,23 @@
+// ShapeType for the Fast DDS interop harness (FR-IO-2).
+//
+// Defined to match THIS stack generated `shape-type` EXACTLY (and the
+// canonical interop/connext/common/ShapeType.idl):
+//   - @final extensibility (our define-dds-type uses :final)
+//   - @key on color
+//   - color is an UNBOUNDED string  (our :string member -> TI_STRING8_SMALL bound 0)
+//   - three 32-bit longs
+//   - default @autoid(SEQUENTIAL) -> member ids 0,1,2,3 (matches our decl-index ids)
+//
+// Unlike rtiddsgen (which silently bounds an unbounded string at 255, see
+// ADR 0009), fastddsgen keeps the string unbounded — so the TypeObject of this
+// peer is the apples-to-apples oracle for our unbounded-color type.
+// (No apostrophes in these comments: the fastddsgen preprocessor warns on them.)
+
+@final
+struct ShapeType
+{
+    @key string color;
+    long x;
+    long y;
+    long shapesize;
+};

@@ -1,0 +1,11 @@
+# the built executables (gen/ is COMMITTED verbatim, unlike interop/connext — see README.md)
+shapes/shapes_pub
+shapes/shapes_sub
+
+# transient capture artifacts (pcaps + tshark decodes produced while probing)
+*.pcap
+*.pcapng
+decode.txt
+decode.err
+tshark.err
+*.out

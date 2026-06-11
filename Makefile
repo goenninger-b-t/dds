@@ -10,7 +10,8 @@ LISP  ?= $(CLASP)
 
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
-        square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture bench mem sbom hooks clean
+        square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
+        fastdds-pub fastdds-sub bench mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -22,6 +23,7 @@ TOPIC    ?= Square
 SECONDS  ?= 20
 TYPENAME  ?= C_Shape
 LOCALTYPE ?= shape-type
+COUNT    ?= 0
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -104,6 +106,14 @@ corpus-capture:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-corpus-capture-subscriber :domain $(DOMAIN) :topic "$(TOPIC)" :type "$(TYPE)" :seconds $(SECONDS))' \
 	        --eval '(uiop:quit 0)'
+
+# Fast DDS interop peers (interop/fastdds/README.md). FASTDDS_PREFIX via with-fastdds.sh;
+# the apps read profiles.xml from their cwd. COUNT=0 / SECONDS=0 = run forever.
+fastdds-pub:
+	./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/shapes && ./shapes_pub $(COLOR) $(COUNT)'
+
+fastdds-sub:
+	./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/shapes && ./shapes_sub $(SECONDS)'
 
 interop: wire
 	@echo "interop: 'wire' validates our output vs the tshark RTPS dissector."

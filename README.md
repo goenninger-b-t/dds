@@ -85,7 +85,9 @@ RTPS dissector). **Live Connext interop has run** against RTI Connext 7.3.1 (the
 oracle apps are in [`interop/connext/`](interop/connext/)): bidirectional reliable ShapeType
 exchange and bidirectional fragmented LargeData exchange (`make large-pub` / `make large-sub`;
 `DROP=3` injects fragment loss to exercise NACK_FRAG recovery), tshark-validated on `lo0`
-captures.
+captures. The **Fast DDS peer harness** ([`interop/fastdds/`](interop/fastdds/), pinned Fast
+DDS 3.6.1; FR-IO-2) is landed with a green same-host Fast DDS↔Fast DDS smoke (`make
+fastdds-pub` / `make fastdds-sub`); interop against this stack is the next FR-IO-2 step.
 
 ---
 
@@ -200,6 +202,12 @@ as the gold interop/oracle reference: a TypeObject/EquivalenceHash probe, bidire
 Shapes pub/sub, and a byte-exact XCDR payload capture. It requires a Connext install and is
 **not** part of this repo's CI. See [`interop/connext/README.md`](interop/connext/README.md).
 
+[`interop/fastdds/`](interop/fastdds/) is the equivalent **eProsima Fast DDS 3.6.1** peer
+harness (FR-IO-2): a standards-conformant peer that — unlike Connext (ADR 0010) — speaks the
+builtin TypeLookup service, making it the oracle for our TypeLookup CONFIRM-VS-PEER path. It
+runs through the pinned toolchain in `scripts/with-fastdds.sh` and is **not** part of CI.
+See [`interop/fastdds/README.md`](interop/fastdds/README.md).
+
 ---
 
 ## Repository layout
@@ -213,6 +221,7 @@ docs/
   verification.csv   the requirement -> evidence -> gate matrix
   provenance.md      clean-room provenance log (NFR-IP)
 interop/connext/  the RTI Connext live-test / oracle harness (C++; needs Connext)
+interop/fastdds/  the Fast DDS peer harness (C++; pinned toolchain via scripts/with-fastdds.sh)
 scripts/        per-impl launchers + the quality-gate scripts
 tools/          rtps-pcap (wire-conformance pcap builder)
 bench/          performance reports (P4)

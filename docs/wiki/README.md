@@ -26,7 +26,7 @@ and worked examples (grounded in the verified test suite under `src/dds-tests/`)
 | [RTPS engine](rtps-engine.md) | `dds-rtps` | submessage codec, the reliable + best-effort writer/reader, HistoryCache, HEARTBEAT/ACKNACK/GAP, SequenceNumberSet |
 | [Discovery](discovery.md) | `dds-disc` | SPDP + SEDP over UDP, the `disc-node`, endpoint matching, the reliable data plane, `PID_TYPE_INFORMATION` |
 | [Transports](transports.md) | `dds-xport`, `dds-pal` | the pluggable transport record, UDPv4, and the platform abstraction layer |
-| [Interop with RTI Connext](interop.md) | `interop/connext`, `dds-shapes` | the Connext oracle/interop harness, the Shapes harness, tshark wire validation |
+| [Interop with RTI Connext](interop.md) | `interop/connext`, `interop/fastdds`, `dds-shapes` | the Connext oracle/interop harness, the Fast DDS peer harness, the Shapes harness, tshark wire validation |
 
 ## Conventions used in the examples
 
