@@ -1,0 +1,25 @@
+// Corpus.idl — the type corpus for reverse-engineering RTI's proprietary legacy
+// TypeObject (the inflated PID_TYPE_OBJECT_LB / 0x8021 it emits in SEDP).
+//
+// C_Shape is the BASE type: it reproduces ShapeType (../common/ShapeType.idl) so its
+// captured legacy TypeObject cross-checks against the already-locked
+// `%connext-shape-type-lb`, proving the corpus capture pipeline is faithful before
+// later tasks add more elaborate types here.
+//
+//   - @final extensibility (matches this stack's :final / the ShapeType oracle)
+//   - @key on color
+//   - color is an UNBOUNDED string (rtiddsgen's actual bound treatment is recorded in
+//     README.md per the large-data precedent)
+//   - three 32-bit longs
+//   - default @autoid(SEQUENTIAL) -> member ids 0,1,2,3
+//
+// Later corpus tasks append more @final/@mutable/@appendable structs here and rebuild;
+// corpus_pub selects the type by argv so one binary serves every corpus type.
+
+@final
+struct C_Shape {
+    @key string color;
+    long x;
+    long y;
+    long shapesize;
+};

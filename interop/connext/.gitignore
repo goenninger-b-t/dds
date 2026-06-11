@@ -7,6 +7,10 @@ LargeData.hpp
 LargeData.cxx
 LargeDataPlugin.hpp
 LargeDataPlugin.cxx
+Corpus.hpp
+Corpus.cxx
+CorpusPlugin.hpp
+CorpusPlugin.cxx
 *.idl.*
 .gen.stamp
 
@@ -22,6 +26,7 @@ shapes-sub/shapes_sub
 cdr-capture/cdr_capture
 large-data/large_pub
 large-data/large_sub
+typeobject-corpus/corpus_pub
 
 # transient capture artifacts (pcaps + tshark decodes produced while probing)
 *.pcap
@@ -29,4 +34,4 @@ large-data/large_sub
 decode.txt
 decode.err
 tshark.err
-probe.out
+*.out
