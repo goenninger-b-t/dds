@@ -1709,6 +1709,22 @@
   (id :i32 :key t)
   (total :u32))  ; same id, same kind, different NAME -> assignable only under ignore_member_names
 
+;;; Legacy-TypeObject gate locals (FR-TYPE-4, ADR 0009): both mirror the live Connext
+;;; C_Shape shape (color/x/y/shapesize, :final) so they correspond by name+id to the
+;;; parsed legacy TypeObject; legacy-good is assignable, legacy-bad retypes x to i64
+;;; (same id, different primitive kind -> NOT assignable, Table 15).
+(dds.gen:define-dds-type legacy-good-type (:extensibility :final)
+  (color :string :key t)
+  (x :i32)
+  (y :i32)
+  (shapesize :i32))
+
+(dds.gen:define-dds-type legacy-bad-type (:extensibility :final)
+  (color :string :key t)
+  (x :i64)   ; same id as C_Shape's x but i64 vs i32 -> NOT assignable (Table 15)
+  (y :i32)
+  (shapesize :i32))
+
 (defun* %gate-queries (p)
     (function (dds.dcps:domain-participant) (integer 0))
   "The getTypes-query count of P's type-gate state (diagnostic observable)."
@@ -1836,7 +1852,7 @@
                 (remote (dds.rtps.discovery:make-endpoint-data
                          :guid guid :topic-name "GateTimeoutTopic" :type-name "shape-type"
                          :type-information other-ti :qos (dds.qos:make-writer-qos))))
-           (setf (aref guid 15) #x02)   ; entityKind: user writer with key (RTPS 2.5 §9.3.1.2)
+           (setf (aref guid 15) #x02)   ; entityKind: user no-key writer 0x02 (RTPS 2.5 §9.3.1.2; %remote-writer-p treats 0x02/0x03 as writers)
            (dds.dcps:create-datareader sub tp)
            ;; the gate only queries a discovered participant: inject the dead one's SPDP
            (dds.disc::%record-participant
@@ -1854,5 +1870,100 @@
              (dds.disc:tl-sweep node))   ; expiry -> fallback :compatible -> resume -> match
            (%check :tg4-timeout-match (plusp (dds.dcps:matched-count p))
                    "a TypeLookup timeout must fall back to name-based matching"))
+      (dds.dcps:delete-participant p)))
+  t)
+
+;;; DCPS FAIL-OPEN legacy-TypeObject assignability gate (FR-TYPE-4, ADR 0009): a stock
+;;; Connext peer advertises PID_TYPE_OBJECT_LB (0x8021) and NO PID_TYPE_INFORMATION, so
+;;; the gate inflates + structurally parses the legacy TypeObject and gates ONLY on a
+;;; confident minimal-struct-type — every other parse outcome (:unsupported / NIL / no
+;;; local model) falls OPEN to :compatible (name-match), never rejecting. Driven through
+;;; the installed gate hook directly with synthesized writer endpoint-data (the legacy
+;;; rung needs no TypeLookup query — there is no TypeInformation).
+
+;; corpus LB fixtures live in legacy-typeobject-test.lisp (loaded later); forward-declare
+(declaim (ftype (function () (simple-array (unsigned-byte 8) (*)))
+                %connext-c-shape-lb %lto-connext-c-enum-lb))
+
+(defun* %legacy-gate-remote (topic-name lb)
+    (function (string (or null (simple-array (unsigned-byte 8) (*))))
+              dds.rtps.discovery:endpoint-data)
+  "A synthesized REMOTE writer endpoint-data (entityKind 0x02) carrying LB as its
+   PID_TYPE_OBJECT_LB and NO TypeInformation — the stock-Connext-peer shape the
+   fail-open legacy gate rung handles (test fixture)."
+  (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 5)))
+    (setf (aref guid 15) #x02)   ; entityKind: user no-key writer 0x02 (RTPS 2.5 §9.3.1.2; %remote-writer-p treats 0x02/0x03 as writers)
+    (dds.rtps.discovery:make-endpoint-data
+     :guid guid :topic-name topic-name :type-name "C_Shape"
+     :qos (dds.qos:make-writer-qos) :type-object-lb lb)))
+
+(defun* %legacy-gate-verdict (p topic-name type-name ts lb)
+    (function (dds.dcps:domain-participant string string t
+               (or null (simple-array (unsigned-byte 8) (*))))
+              symbol)
+  "Register a Topic binding TYPE-NAME's TS under TOPIC-NAME on P, then invoke P's
+   installed type-gate directly on a synthesized stock-Connext writer (LB, no
+   TypeInformation) against a local reader endpoint-data on the same topic; return the
+   gate verdict (test fixture: the legacy rung needs no wire query, so the verdict is
+   synchronous)."
+  (dds.dcps:create-topic p topic-name type-name ts)
+  (let ((remote (%legacy-gate-remote topic-name lb))
+        (local (dds.rtps.discovery:make-endpoint-data
+                :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+                :topic-name topic-name :type-name type-name
+                :qos (dds.qos:make-reader-qos))))
+    (dds.dcps::%participant-type-gate p (dds.dcps::dp-node p) remote local)))
+
+(defun* run-dcps-legacy-gate-test ()
+    (function () t)
+  "FR-TYPE-4 FAIL-OPEN legacy-TypeObject gate (ADR 0009): a stock Connext peer's
+   PID_TYPE_OBJECT_LB (no TypeInformation) is inflated + structurally parsed and gated
+   ONLY on a confident minimal-struct-type. (1) the live C_Shape LB vs a structurally
+   COMPATIBLE local -> :compatible; (2) the same LB vs a local with a member retyped ->
+   :incompatible (surfaces INCONSISTENT_TOPIC via the shared %match-remote-endpoint
+   path); (3) a live C_Enum LB (parses to :unsupported) -> :compatible (the critical
+   fail-open assertion); (4) garbage-but-present LB (won't inflate) -> :compatible. A
+   non-model parse result can NEVER reject."
+  ;; (1) compatible local struct (C_Shape shape) -> assignable -> :compatible
+  (let ((ts (dds.types:find-type-support "legacy-good-type"))
+        (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (%check :lg-compatible
+                 (eq :compatible
+                     (%legacy-gate-verdict p "LegacyGoodTopic" "legacy-good-type" ts
+                                           (%connext-c-shape-lb)))
+                 "a confident C_Shape parse assignable to the local type gates :compatible")
+      (dds.dcps:delete-participant p)))
+  ;; (2) incompatible local struct (x retyped i64) -> NOT assignable -> :incompatible
+  (let ((ts (dds.types:find-type-support "legacy-bad-type"))
+        (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (%check :lg-incompatible
+                 (eq :incompatible
+                     (%legacy-gate-verdict p "LegacyBadTopic" "legacy-bad-type" ts
+                                           (%connext-c-shape-lb)))
+                 "a confident C_Shape parse NOT assignable to the local type gates :incompatible")
+      (dds.dcps:delete-participant p)))
+  ;; (3) CRITICAL fail-open: C_Enum LB parses to :unsupported -> name-match :compatible
+  (let ((ts (dds.types:find-type-support "legacy-good-type"))
+        (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (%check :lg-unsupported-failopen
+                 (eq :compatible
+                     (%legacy-gate-verdict p "LegacyEnumTopic" "legacy-good-type" ts
+                                           (%lto-connext-c-enum-lb)))
+                 "an :unsupported legacy-TypeObject parse falls OPEN to :compatible (name-match)")
+      (dds.dcps:delete-participant p)))
+  ;; (4) garbage-but-present LB (won't inflate) -> fail-open :compatible
+  (let ((ts (dds.types:find-type-support "legacy-good-type"))
+        (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (%check :lg-garbage-failopen
+                 (eq :compatible
+                     (%legacy-gate-verdict
+                      p "LegacyJunkTopic" "legacy-good-type" ts
+                      (coerce '(1 0 0 0 4 0 0 0 4 0 0 0 9 9 9 9)
+                              '(simple-array (unsigned-byte 8) (*)))))
+                 "a present-but-uninflatable legacy LB falls OPEN to :compatible")
       (dds.dcps:delete-participant p)))
   t)

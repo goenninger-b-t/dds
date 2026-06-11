@@ -292,15 +292,52 @@
      (%gate-continuation p node state remote local local-to key hashes depth pairs okp)))
   :pending)
 
+(defun* %gate-legacy-type-object (p state remote local lb)
+    (function (domain-participant type-gate-state dds.rtps.discovery:endpoint-data
+               dds.rtps.discovery:endpoint-data (simple-array (unsigned-byte 8) (*)))
+              (member :compatible :incompatible))
+  "The FR-TYPE-4 FAIL-OPEN legacy-TypeObject gate rung for a stock Connext peer that
+   advertised PID_TYPE_OBJECT_LB (0x8021) but NO PID_TYPE_INFORMATION (ADR 0009).
+   Inflate + structurally parse LB (DDS.TYPES:INFLATE-TYPE-OBJECT-LB ->
+   PARSE-LEGACY-TYPE-OBJECT): ONLY a confident MINIMAL-STRUCT-TYPE parse gates — it
+   is assessed against the LOCAL type-support's TypeObject under the reader-side
+   TYPE_CONSISTENCY_ENFORCEMENT (the SAME %GATE-ASSESS derivation the TypeInformation
+   path uses); the verdict is recorded per remote GUID (the verdict-table replay rung
+   above short-circuits the re-parse on every re-run). EVERY non-model outcome —
+   :unsupported / NIL (degraded or untokenizable parse), or no local TypeObject to
+   assess against — falls OPEN to :compatible (name-match, logged); a non-model parse
+   result can NEVER reject. The advisory ASSESS-TYPE-OBJECT-LB fingerprint (run at
+   %ON-DISC-MATCH per ADR 0009) is a separate diagnostic."
+  (let* ((inflated (handler-case (dds.types:inflate-type-object-lb lb) (error () nil)))
+         (model (and inflated
+                     (handler-case (dds.types:parse-legacy-type-object inflated)
+                       (error () nil)))))
+    (if (not (typep model 'dds.types:minimal-struct-type))
+        (%gate-record-verdict state remote :compatible
+                              "legacy TypeObject not a modelable struct (fail-open)")
+        (let* ((ts (%gate-local-type-support p local))
+               (local-to (and (typep ts 'dds.types:type-support)
+                              (dds.types:type-support-typeobject ts))))
+          (if (not (typep local-to 'dds.types:minimal-struct-type))
+              (%gate-record-verdict state remote :compatible
+                                    "no local TypeObject to assess legacy peer (fail-open)")
+              (%gate-record-verdict state remote
+                                    (%gate-assess remote local local-to model)
+                                    "legacy-TypeObject assignability"))))))
+
 (defun* %participant-type-gate (p node remote local)
     (function (domain-participant dds.disc:disc-node
                dds.rtps.discovery:endpoint-data dds.rtps.discovery:endpoint-data)
               (member :compatible :incompatible :pending))
   "The FR-TYPE-4 assignability gate installed on P's disc-node TYPE-GATE hook (both
-   match directions, receiver thread, OUTSIDE the node lock). Verdict ladder:
-   no remote TypeInformation -> :compatible (name-based, the pre-XTypes behavior);
-   a recorded verdict for this remote GUID replays (the post-resume re-run);
-   malformed TypeInformation / no local TypeObject / a local hash failure ->
+   match directions, receiver thread, OUTSIDE the node lock). Verdict ladder, IN CODE
+   ORDER: first, a recorded verdict for this remote GUID replays (the post-resume
+   re-run, no re-parse); then, when there is no remote TypeInformation: a remote
+   PID_TYPE_OBJECT_LB (a stock Connext peer, ADR 0009) -> the FAIL-OPEN
+   legacy-TypeObject rung (%GATE-LEGACY-TYPE-OBJECT): a confident minimal-struct-type
+   parse gates by assignability, every other outcome falls open to :compatible; no LB
+   -> :compatible (name-based, the pre-XTypes behavior). Otherwise (TypeInformation
+   present): malformed TypeInformation / no local TypeObject / a local hash failure ->
    :compatible (cannot assess, logged); equal EquivalenceHashes -> :compatible
    (fast path, no wire traffic); a cached remote model -> assess now; the remote
    participant not yet SPDP-discovered -> :pending without querying (the SEDP
@@ -308,13 +345,18 @@
    the remote participant (deduped per hash) -> :pending until the reply, a timeout,
    or the depth bound decides it."
   (let ((state (dp-type-gate-state p))
-        (ti-octets (dds.rtps.discovery:endpoint-data-type-information remote)))
+        (ti-octets (dds.rtps.discovery:endpoint-data-type-information remote))
+        (lb (dds.rtps.discovery:endpoint-data-type-object-lb remote)))
     (block gate
-      (when (or (null state) (null ti-octets)) (return-from gate :compatible))
+      (when (null state) (return-from gate :compatible))
       (let ((v (dds.pal:with-lock ((type-gate-state-lock state))
                  (gethash (dds.rtps.discovery:endpoint-data-guid remote)
                           (type-gate-state-verdicts state)))))
         (when v (return-from gate v)))
+      ;; no TypeInformation: a stock Connext peer's PID_TYPE_OBJECT_LB gates fail-open, else name-match
+      (when (null ti-octets)
+        (return-from gate
+          (if lb (%gate-legacy-type-object p state remote local lb) :compatible)))
       (let ((h (handler-case (dds.types:deserialize-type-information-hash ti-octets)
                  (error () nil))))
         (unless h
