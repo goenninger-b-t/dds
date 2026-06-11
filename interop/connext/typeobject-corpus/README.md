@@ -190,6 +190,39 @@ vectors + the full analysis are in `docs/provenance.md` (2026-06-11); they drive
 stay a gap (member TI NIL, fail-open). NOTE: on macOS symlink the RTI dylibs next to `corpus_pub`
 (SIP strips `DYLD_LIBRARY_PATH`), as for the earlier experiments.
 
+### `C_Enum` — enum member-kind + the degrading policy (Task 4.1)
+
+One more sibling: `C_Enum` (`@key long id; SomeEnum e`) with `enum SomeEnum { RED, GREEN, BLUE }`.
+The enum member `e` carries member-kind **`0x0E` (14)** at `VALUE-START+8` (primitives `1`–`0x0C`,
+string `0x13`, sequence `0x12`, nested struct `0x16`, **enum `0x0E`**). The inflated capture's
+fingerprint strings are `("C_Enum" "SomeEnum" "RED" "GREEN" "BLUE")`. **Decision (the operating
+contract, Task 4.1):** our assignability model (`src/dds-types/assignability.lisp`) has **no enum
+TypeIdentifier** — it models only primitives / narrow strings / plain sequences / structs and treats
+enum as conservatively non-assignable. Per the rule "never emit a TI assignability will mis-handle",
+an enum member is therefore **unmodelable** and `parse-legacy-type-object` degrades the WHOLE type to
+**`:unsupported`** (fail-open to name-match), recorded as a gap (decode-as-int is unlocked the day
+assignability gains an enum TI). This is the **degrading policy**: any member that declares a type the
+model cannot represent (an unmapped kind, an unresolvable hash, an over-depth/cyclic nested struct)
+makes the whole parse `:unsupported`, so the Stage-5 gate never sees a partial model with a NIL-TI
+member. Captured vector + analysis in `docs/provenance.md` (2026-06-11). NOTE: on macOS symlink the
+RTI dylibs next to `corpus_pub` (SIP strips `DYLD_LIBRARY_PATH`), as for the earlier experiments.
+
+### `C_Union` / `C_Array` — union/array member-kinds, degrading tier (Task 4.2)
+
+Two more siblings: `C_Union` (`@key long id; SomeUnion u` with `union SomeUnion switch(long) { case
+0: long a; case 1: double b; }`) and `C_Array` (`@key long id; long arr[4]`). The captures
+confirm: union member `u` carries member-kind **`0x15` (21)** at `VALUE-START+8`; array member `arr`
+carries member-kind **`0x11` (17)** at `VALUE-START+8`. Neither value is in `*lto-primitive-kind-keyword*`
+(range `1`–`0x0C`) or any other mapped arm, so `%lto-member-type-identifier` returns `NIL`; the
+Task-4.1 policy flip fires → `:unsupported` (fail-open). No guard was added to `%lto-member-type-identifier`
+(no kind collision). **Bitmask** (`bitmask SomeBits { FLAG_A, FLAG_B, FLAG_C }`) was attempted but
+**NOT CAPTURABLE**: `rtiddsgen 4.3.1` rejects the `bitmask` keyword with `"mismatched input 'bitmask'
+expecting EOF"` (IDL4 construct, unsupported by this version) — gap recorded in `docs/provenance.md`
+(2026-06-11). A newer `rtiddsgen` can add that capture. Captured vectors + analysis in
+`docs/provenance.md` (2026-06-11). **Degrading tier complete**: all non-{primitive,string,sequence,
+struct} constructs (enum `0x0E`, union `0x15`, array `0x11`, bitmask gap) verifiably fail open to
+`:unsupported` (test `lto-parse-aggregates-unsupported`). 90 tests green SBCL.
+
 ## Files
 
 `Corpus.idl`, `corpus_pub.cxx`, `USER_QOS_PROFILES.xml`, `Makefile`, `README.md` are the

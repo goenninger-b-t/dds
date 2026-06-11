@@ -576,3 +576,128 @@ the 536-octet C_Shape inflate):
   ids) — NOT captured here.
 - **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked; all
   `rtiddsgen` output, the `corpus_pub` binary, and the symlinked RTI dylibs stay git-ignored (NFR-IP).
+
+### Experiment set: C_Enum — enum member-kind + the degrading policy (Task 4.1, 2026-06-11)
+
+Method: clean-room differential, meanings ONLY from captured bytes (no RTI source / GPL dissector).
+Added `enum SomeEnum { RED, GREEN, BLUE };` + `@final struct C_Enum { @key long id; SomeEnum e; };`
+to `Corpus.idl` (+ one `corpus_pub` dispatch arm), rebuilt with `rtiddsgen`, captured the live
+SEDP `PID_TYPE_OBJECT_LB` via `make corpus-capture TOPIC=Square TYPE=C_Enum`.
+
+- **Capture**: 208-octet LB; inflates to a **444-octet** legacy TypeObject. `type-object-strings`
+  fingerprint = `("C_Enum" "SomeEnum" "RED" "GREEN" "BLUE")` — the enum type name + the three
+  enumerator names travel in-band.
+- **Member walk** (tokenized; member-list container's CODE-0 named children):
+  - `id`: `+0` key=1, `+4` id=0, `+8` u16 kind = **0x05** = RTI `long` → decodes to `TK_INT32` (as
+    before; the flat @key long).
+  - `e` (the enum member): `+0` key=0, `+4` id=1, `+8` u16 kind = **0x0E (14)**. This is the
+    ENUM member-kind word, at the SAME `VALUE-START+8` offset every member-kind lives at (primitive
+    1–0x0C, string 0x13, sequence 0x12, nested struct 0x16, **enum 0x0E**). It is ABSENT from
+    `*lto-primitive-kind-keyword*` (1–10, 0x0C) so it is NOT mis-decoded as a primitive.
+- **Decision rule (the operating contract, Task 4.1 — never emit a TI assignability will mis-handle)**:
+  `src/dds-types/assignability.lisp` models ONLY primitives, narrow strings, plain sequences, and
+  (nested) structs (its own header: "Union/enum/bitmask/array/map/alias assignability awaits their
+  type model … conservatively non-assignable"). There is **no enum TypeIdentifier** and no
+  `+tk-enum+`/`bit_bound` representation. Therefore an enum member is **UNMODELABLE**: we do NOT
+  decode it to its underlying integer (that would silently widen an enum to `long` and let the gate
+  pass an enum-vs-long mismatch), and we do NOT invent an enum TI the gate cannot use. Outcome:
+  **enum member → the whole `parse-legacy-type-object` returns `:unsupported`** (fail-open to
+  name-match at the Stage-5 gate). Recorded as a **gap**: enum decode-as-int is unlocked the day
+  assignability gains an enum TI.
+- **GATE-SAFETY policy flip (Part A, the crux of "degrading correctly")**: previously an unmodeled
+  member kind left that member's `type-identifier` NIL and `parse-legacy-type-object` CONTINUED,
+  returning a struct with a NIL-TI member. That is a gate hazard once the model feeds
+  `struct-assignable-from` (a NIL-TI member could mis-gate or error). New policy: in
+  `%lto-parse-struct-node`, a member that DECLARES a type (kind word present at `+8`,
+  `%lto-member-has-kind-p`) but whose TI cannot be built (`%lto-member-type-identifier` NIL — an
+  unmapped kind like enum/union/array/bitmask, an unresolvable hash, a sequence-of-aggregate, or an
+  over-depth/cyclic nested struct) degrades the WHOLE parse to `:unsupported`. The Stage-5 gate then
+  falls OPEN to name-match — never gates on a partial model.
+- **Regression of prior tests**: all 7 tier-1/2/3 lto tests stay green (C_Shape and its primitive /
+  string / extensibility / sequence / nested variants have only modelable members — they were never
+  NIL-TI, so the flip does not touch them). ONE existing sub-check flipped: the nested depth-guard
+  (`:lto-nested-depth-guard`) previously asserted `*lto-max-type-depth* 0` left the nested member's
+  TI NIL with the parse CONTINUING; under the policy that over-depth nested member is unmodelable, so
+  the parse now correctly degrades to `:unsupported` — the test was updated to assert that (the
+  over-depth nested struct IS unmodelable at that depth, not a decode gap; degrading is the correct
+  verdict). No test relied on a NIL-but-continue that masked a type we DO model.
+- **Decoded coverage update**: still `:unsupported` (fail-open) — enum (0x0E), and every Stage-4
+  aggregate variant (union/bitmask/array/map/typedef) plus sequence-of-aggregate. The difference
+  from before is the FAILURE MODE: these now degrade the WHOLE type to `:unsupported` instead of
+  emitting a partial model — strictly safer for the gate.
+- **Corpus artifacts (C_Enum)**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked;
+  all `rtiddsgen` output, `corpus_pub`, and the symlinked RTI dylibs stay git-ignored (NFR-IP).
+
+### Experiment set: C_Union + C_Array — union/array member-kinds, degrading tier (Task 4.2, 2026-06-11)
+
+Method: clean-room differential, meanings ONLY from captured bytes (no RTI source / GPL dissector).
+Added `union SomeUnion switch(long) { case 0: long a; case 1: double b; }` + `@final struct C_Union
+{ @key long id; SomeUnion u; }` and `@final struct C_Array { @key long id; long arr[4]; }` to
+`Corpus.idl` (+ two `corpus_pub` dispatch arms), rebuilt with `rtiddsgen 4.3.1`, captured via
+`make corpus-capture TOPIC=UnionTopic TYPE=C_Union` and `make corpus-capture TOPIC=ArrayTopic
+TYPE=C_Array`. A third construct, C_Bitmask (`bitmask SomeBits { FLAG_A, FLAG_B, FLAG_C }`), was
+attempted but **NOT CAPTURABLE**: `rtiddsgen 4.3.1` rejects the `bitmask` keyword with
+`"mismatched input 'bitmask' expecting EOF"` (IDL4 construct, not supported by this version). The
+gap is recorded here; a newer `rtiddsgen` can add that capture.
+
+**C_Union capture (232 octets, inflates to 608 octets, 2026-06-11)**:
+```lisp
+(1 0 0 0 96 2 0 0 219 0 0 0 120 218 99 172 231 96 0 1 19 38 6 6 38 48 139 133 65 12 72 50 2 197 57
+ 129 244 5 40 27 4 100 64 108 176 44 3 131 157 71 4 51 115 185 137 34 72 198 57 62 52 47 51 63 15
+ 172 142 17 108 2 4 128 248 41 104 252 84 32 93 193 0 177 11 102 174 8 216 92 8 96 5 66 102 32 157
+ 153 194 128 97 30 83 61 66 143 2 204 76 32 22 133 178 253 237 184 230 77 58 187 44 16 100 118 41
+ 3 118 253 48 12 18 21 133 170 225 2 210 6 140 232 102 139 162 152 9 82 19 156 159 155 10 241 41 3
+ 78 191 62 1 98 102 6 76 119 194 252 198 7 164 83 50 139 147 139 50 115 51 243 18 75 242 139 240
+ 152 133 205 223 34 72 254 6 153 7 242 107 34 30 51 56 144 194 22 155 57 32 253 92 64 8 162 147
+ 136 48 135 17 45 28 97 234 5 128 88 12 170 7 150 54 64 242 0 101 206 48 253 0)
+```
+- `type-object-strings`: `("C_Union" "SomeUnion" "discriminator" ...)` — the union type name and
+  the discriminator member surface as strings (the opaque hash tokens `">HX"` / `"w4!"` are
+  internal fingerprints, not type names).
+- **Member walk** (tokenized member-list):
+  - `id`: `+8` u16 kind = **0x05 (5)** = RTI `long` → TK_INT32 (as expected).
+  - `u` (the union member): `+8` u16 kind = **0x15 (21)**. This is the UNION member-kind word.
+    It is ABSENT from `*lto-primitive-kind-keyword*` (range 1–0x0C); `%lto-member-type-identifier`
+    returns NIL; `%lto-member-has-kind-p` is T → the **degrading policy** fires → the whole
+    `parse-legacy-type-object` returns `:unsupported` (fail-open). No collision with any mapped
+    kind (0x12 sequence / 0x13 string / 0x16 nested struct).
+
+**C_Array capture (200 octets, inflates to 416 octets, 2026-06-11)**:
+```lisp
+(1 0 0 0 160 1 0 0 185 0 0 0 120 218 99 172 231 96 0 129 18 70 6 6 38 48 139 133 65 12 72 50 2 197
+ 57 129 244 5 40 27 4 100 64 108 176 44 3 131 80 130 235 165 205 237 21 9 32 25 231 120 199 162 162
+ 196 74 176 58 70 176 9 16 0 226 167 160 241 83 129 116 5 3 196 46 152 185 34 96 115 33 128 21 8
+ 153 129 116 102 10 3 134 121 76 245 8 61 10 48 51 129 88 16 202 142 62 203 46 106 245 234 154 49
+ 72 125 98 81 17 86 253 48 12 18 21 132 186 1 100 95 1 146 123 84 192 238 19 68 49 147 15 98 102
+ 98 101 188 73 188 103 94 137 177 17 3 3 94 255 130 252 145 10 149 1 137 159 0 210 28 80 247 178
+ 32 185 5 102 134 0 16 139 65 205 129 133 45 72 30 0 170 113 41 112 0 0 0)
+```
+- `type-object-strings`: `("C_Array" "arr" "array_4_Int32")` — the array member name and RTI's
+  internal array-type token `array_4_Int32` (confirming `long arr[4]`).
+- **Member walk** (tokenized member-list):
+  - `id`: `+8` u16 kind = **0x05 (5)** = RTI `long` → TK_INT32 (as expected).
+  - `arr` (the array member): `+8` u16 kind = **0x11 (17)**. This is the ARRAY member-kind word.
+    It is ABSENT from `*lto-primitive-kind-keyword*` (range 1–0x0C); `%lto-member-type-identifier`
+    returns NIL; `%lto-member-has-kind-p` is T → **degrading policy** fires → `:unsupported`
+    (fail-open). No collision with any mapped kind.
+
+**Kind table for this task (all at member node VALUE-START+8, little-endian u16)**:
+| Construct | Member-kind u16 | Hex | In primitive map? | In any mapped kind? | Result |
+|-----------|----------------|-----|-------------------|---------------------|--------|
+| enum      | 14             | 0x0E| no                | no                  | :unsupported |
+| union     | 21             | 0x15| no                | no                  | :unsupported |
+| array     | 17             | 0x11| no                | no                  | :unsupported |
+| bitmask   | (not captured — rtiddsgen 4.3.1 rejects `bitmask`)| —  | —  | — | gap |
+
+**No guard needed in `%lto-member-type-identifier`**: none of these kind values collide with any
+mapped kind (0x12 sequence, 0x13 string, 0x16 nested struct, 0x01–0x0C primitives). The Task-4.1
+policy flip in `%lto-parse-struct-node` (`%lto-member-has-kind-p` present but `%lto-member-type-identifier`
+NIL → `:unsupported`) already handles all three correctly without any new code.
+
+**Degrading tier complete** (2026-06-11): every non-{primitive,string,sequence,struct} construct
+(enum 0x0E, union 0x15, array 0x11, bitmask — not capturable) fails open to `:unsupported`, so
+the Stage-5 gate falls open to name-match and never sees a partial model with a NIL-TI member.
+
+- **Corpus artifacts (C_Union, C_Array)**: only the `Corpus.idl` + `corpus_pub.cxx` source edits
+  are tracked; all `rtiddsgen` output, `corpus_pub`, and the symlinked RTI dylibs stay git-ignored
+  (NFR-IP).

@@ -204,11 +204,34 @@ int main(int argc, char **argv)
         return run_corpus<C_Nested2>(domain, topic, type, sample);
     }
 
+    // Task 4.1 enum-member differential.
+    if (type == "C_Enum") {
+        C_Enum sample;
+        sample.id(7); sample.e(SomeEnum::GREEN);
+        return run_corpus<C_Enum>(domain, topic, type, sample);
+    }
+
+    // Task 4.2 union/array/bitmask degrading-tier differentials.
+    if (type == "C_Union") {
+        C_Union sample;
+        sample.id(7);
+        SomeUnion u; u.a(42);
+        sample.u(u);
+        return run_corpus<C_Union>(domain, topic, type, sample);
+    }
+    if (type == "C_Array") {
+        C_Array sample;
+        sample.id(7);
+        sample.arr()[0] = 1; sample.arr()[1] = 2; sample.arr()[2] = 3; sample.arr()[3] = 4;
+        return run_corpus<C_Array>(domain, topic, type, sample);
+    }
+    // C_Bitmask: NOT capturable — rtiddsgen 4.3.1 rejects the `bitmask` keyword. Gap in provenance.
+
     std::cerr << "usage: " << argv[0] << " <domain> <topic> <typename>\n"
               << "  unknown typename '" << type << "'; this build knows: C_Shape, C_Shape2, C_Shape3, C_Shape4,\n"
               << "  C_ShapeP_{short,ushort,ulong,longlong,ulonglong,octet,float,double,boolean,char},\n"
               << "  C_ShapeS32, C_ShapeS300, C_ShapeNoKey, C_ShapeAppend, C_ShapeMutable,\n"
-              << "  C_Seq, C_SeqL, C_SeqL100, C_Nested, C_Nested2\n"
-              << "  (later corpus tasks add types to Corpus.idl + a dispatch arm here)\n";
+              << "  C_Seq, C_SeqL, C_SeqL100, C_Nested, C_Nested2, C_Enum, C_Union, C_Array\n"
+              << "  (C_Bitmask not capturable: rtiddsgen 4.3.1 rejects `bitmask` keyword)\n";
     return 1;
 }

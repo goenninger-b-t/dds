@@ -643,22 +643,18 @@
           (%check :lto-nested-asgn-incompat-members
                   (not (dds.types:struct-assignable-from local-bad-b reference opts))
                   "a NESTED-incompatible local (C_Inner.b long->double) is NOT assignable (recurses into 2nd member -> NIL)"))))
-    ;; resource/cycle guard (NFR-SEC-POSTURE): *lto-max-type-depth* 0 forces EVERY nested-struct
-    ;; member to fail open (TI NIL) — the depth guard that, together with the visited-hash set,
-    ;; makes a hostile self-/mutually-referential TypeObject terminate (never hang) and never OOB.
+    ;; resource/cycle guard (NFR-SEC-POSTURE) + degrading policy (the operating contract, Task 4.1):
+    ;; *lto-max-type-depth* 0 makes the nested-struct member UNMODELABLE (its kind word is present
+    ;; but the over-depth resolution yields no TI) — so the WHOLE parse degrades to :unsupported, the
+    ;; correct fail-open verdict (the Stage-5 gate falls open to name-match, never gates on a partial
+    ;; model with a NIL-TI member). The depth guard, together with the visited-hash set, makes a
+    ;; hostile self-/mutually-referential TypeObject terminate (never hang) and never OOB.
     (let ((dds.types:*lto-max-type-depth* 0))
       (let* ((inflated (dds.types:inflate-type-object-lb (%lto-connext-c-nested-lb)))
-             (parsed (dds.types:parse-legacy-type-object inflated))
-             (inner (and (dds.types:minimal-struct-type-p parsed)
-                         (%lto-member-named parsed "inner"))))
+             (parsed (dds.types:parse-legacy-type-object inflated)))
         (%check :lto-nested-depth-guard
-                (and inner (null (dds.types:minimal-struct-member-type-identifier inner)))
-                "*lto-max-type-depth* 0 fails the nested member open (TI NIL) — depth guard wired")
-        (%check :lto-nested-depth-guard-flat
-                (let ((id (and (dds.types:minimal-struct-type-p parsed)
-                               (%lto-member-named parsed "id"))))
-                  (and id (dds.types:minimal-struct-member-type-identifier id)))
-                "the flat @key long id member still decodes under the depth guard (only nesting fails open)")))
+                (eq parsed :unsupported)
+                "*lto-max-type-depth* 0 degrades the whole parse to :unsupported (unmodelable nested member, fail-open)")))
     ;; C_Nested2: two members both resolve the SAME C_Inner def (visited-hash guard does not block
     ;; a legitimate repeated reference) — both `inner` and `inner2` carry a C_Inner aggregate TI.
     (let* ((lb2 (%lto-connext-c-nested2-lb))
@@ -677,4 +673,198 @@
                                 (string= (dds.types:minimal-struct-type-name ref) "C_Inner"))))
                        '("inner" "inner2"))
                 "both inner/inner2 resolve the shared C_Inner def (repeated reference, not blocked)"))))
+  t)
+
+;;; Legacy-TypeObject degrading policy + ENUM decode (Task 4.1). Two facets of "degrading
+;;; correctly" (the operating contract):
+;;;  (A) policy flip — a member that declares a type the model cannot represent (kind word present
+;;;      but %lto-member-type-identifier NIL: an unmapped kind, an unresolvable hash, an
+;;;      over-depth/cyclic nested struct) degrades the WHOLE parse-legacy-type-object to
+;;;      :unsupported, so the Stage-5 gate falls OPEN to name-match instead of gating on a partial
+;;;      model with a NIL-TI member. The C_Enum capture is the live driver: assignability.lisp models
+;;;      NO enum (it treats enum as conservatively non-assignable — there is no enum TypeIdentifier),
+;;;      so per the decision rule (never emit a TI assignability will mis-handle) an enum member is
+;;;      UNMODELABLE -> :unsupported, recorded as a fail-open gap (docs/provenance.md 2026-06-11).
+;;;  (B) enum decode — the C_Enum live capture (`@key long id; SomeEnum e`, SomeEnum { RED, GREEN,
+;;;      BLUE }) parses to :unsupported. The differential localized the enum member-kind word to the
+;;;      member node's VALUE-START+8 = 0x0E (14), absent from *lto-primitive-kind-keyword* (so it is
+;;;      not mis-decoded as a primitive) and unmodelable by assignability (so it is not emitted as any
+;;;      TI). Pinned to the live Connext 7.3.1 corpus (docs/provenance.md 2026-06-11).
+
+(defun* %lto-connext-c-enum-lb ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The live RTI Connext 7.3.1 C_Enum PID_TYPE_OBJECT_LB parameter value (208 octets), captured
+   2026-06-11 (interop/connext/typeobject-corpus/README.md): `@final struct C_Enum { @key long id;
+   SomeEnum e; }` with `enum SomeEnum { RED, GREEN, BLUE }`. Inflates to a 444-octet legacy
+   TypeObject (ADR 0009); the enum member `e` carries member-kind 0x0E (14) at VALUE-START+8 — an
+   UNMODELABLE kind (assignability has no enum TI), so the whole parse degrades to :unsupported."
+  (coerce
+   '(1 0 0 0 188 1 0 0 193 0 0 0 120 218 99 172 231 96 0 129 9 140 12 12 76 96 22 11 131 24 144
+     100 4 138 115 2 233 11 80 54 8 200 128 216 96 89 6 134 181 157 21 123 130 166 104 186 179 3
+     217 206 241 174 121 165 185 16 117 140 96 19 32 0 196 79 65 227 167 2 233 10 6 136 93 48 115
+     69 192 230 66 0 43 16 50 3 233 204 20 76 243 152 234 17 122 20 96 102 2 49 31 148 61 109 231
+     250 3 134 115 143 138 128 204 78 101 192 174 31 134 65 162 124 80 53 172 64 186 135 1 221 108
+     62 20 51 65 97 17 156 159 155 10 241 41 126 191 42 32 249 213 0 136 153 161 106 64 114 65 174
+     46 96 125 108 64 236 30 228 234 234 7 13 11 144 27 156 124 66 93 145 221 9 179 67 0 136 197
+     160 102 192 194 29 36 15 0 13 112 43 249 0 0 0)
+   '(simple-array (unsigned-byte 8) (*))))
+
+(defun* run-lto-unmodelable-unsupported-test ()
+    (function () t)
+  "Test: the degrading policy (the operating contract, Task 4.1). A struct whose member declares a
+   type the model cannot represent degrades the WHOLE parse to :unsupported (fail-open to
+   name-match), never a partial minimal-struct-type with a NIL-TI member. The live C_Enum capture is
+   the driver — an enum member (kind 0x0E, no enum TI in assignability.lisp) is UNMODELABLE; plus the
+   *lto-max-type-depth* 0 case (an over-depth nested-struct member is also unmodelable). A purely
+   well-modeled type (C_Shape) is unaffected (still a minimal-struct-type)."
+  (let* ((enum-lb (%lto-connext-c-enum-lb))
+         (enum-inf (dds.types:inflate-type-object-lb enum-lb))
+         (enum-parsed (and enum-inf (dds.types:parse-legacy-type-object enum-inf))))
+    (%check :lto-unmodelable-enum-inflate
+            (and enum-inf (= (length enum-inf) 444))
+            "C_Enum PID_TYPE_OBJECT_LB inflates to the 444-octet legacy TypeObject")
+    (%check :lto-unmodelable-enum-unsupported
+            (eq enum-parsed :unsupported)
+            "a struct with an UNMODELABLE enum member degrades the whole parse to :unsupported (fail-open)"))
+  ;; cross-check: a fully-modelable type (C_Shape) is NOT degraded — the policy fires only on an
+  ;; unmodelable member, not on every type.
+  (let* ((shape-lb (%connext-c-shape-lb))
+         (shape-inf (dds.types:inflate-type-object-lb shape-lb))
+         (shape-parsed (and shape-inf (dds.types:parse-legacy-type-object shape-inf))))
+    (%check :lto-unmodelable-shape-ok
+            (dds.types:minimal-struct-type-p shape-parsed)
+            "a fully-modelable C_Shape still parses to a minimal-struct-type (policy fires only on unmodelable members)"))
+  ;; an over-depth nested-struct member is unmodelable too -> :unsupported (degrading policy)
+  (let ((dds.types:*lto-max-type-depth* 0))
+    (let* ((inf (dds.types:inflate-type-object-lb (%lto-connext-c-nested-lb)))
+           (parsed (and inf (dds.types:parse-legacy-type-object inf))))
+      (%check :lto-unmodelable-overdepth-unsupported
+              (eq parsed :unsupported)
+              "an over-depth nested-struct member is unmodelable -> :unsupported (degrading policy)")))
+  t)
+
+(defun* run-lto-parse-enum-test ()
+    (function () t)
+  "Test: parse-legacy-type-object on the live C_Enum legacy TypeObject (Task 4.1, Part B). Per the
+   decision rule, our assignability model has NO enum TypeIdentifier (assignability.lisp models only
+   primitives/strings/sequences/structs; enum is conservatively non-assignable), so the enum member
+   `e` is UNMODELABLE and the whole parse is :unsupported (fail-open) — we never invent an enum TI
+   the gate would mis-handle. The capture's fingerprint strings (C_Enum / SomeEnum / RED/GREEN/BLUE)
+   confirm it really is the enum type. Pinned to the live Connext 7.3.1 corpus (docs/provenance.md
+   2026-06-11)."
+  (let* ((lb (%lto-connext-c-enum-lb))
+         (inflated (dds.types:inflate-type-object-lb lb)))
+    (%check :lto-enum-inflate
+            (and inflated (= (length inflated) 444))
+            "C_Enum inflates to the 444-octet legacy TypeObject")
+    ;; fingerprint: the enum + its enumerators surface as strings (proves this is the enum type)
+    (let ((strs (dds.types:type-object-strings inflated)))
+      (%check :lto-enum-fingerprint
+              (every (lambda (s) (member s strs :test #'string=))
+                     '("C_Enum" "SomeEnum" "RED" "GREEN" "BLUE"))
+              "the C_Enum capture carries the SomeEnum / RED/GREEN/BLUE fingerprint strings"))
+    ;; the decision rule: enum is unmodelable by assignability -> the whole parse is :unsupported
+    (%check :lto-enum-unsupported
+            (eq (dds.types:parse-legacy-type-object inflated) :unsupported)
+            "C_Enum parses to :unsupported — enum is unmodelable (no enum TI), fail-open per the decision rule"))
+  t)
+
+;;; Legacy-TypeObject union/array degrading tier (Task 4.2). Two live Connext 7.3.1 captures
+;;; confirm the fail-open policy holds for UNION and ARRAY members (docs/provenance.md 2026-06-11):
+;;;
+;;;   C_Union  (@key long id; SomeUnion u)  — union member-kind = 0x15 (21).
+;;;   C_Array  (@key long id; long arr[4])  — array member-kind = 0x11 (17).
+;;;
+;;; Neither kind is in *lto-primitive-kind-keyword* (1–0x0C) nor in any other mapped arm
+;;; (0x12 sequence / 0x13 string / 0x16 nested struct), so %lto-member-type-identifier returns NIL;
+;;; %lto-member-has-kind-p is T; the Task-4.1 policy flip fires -> :unsupported. No guard needed
+;;; in %lto-member-type-identifier (no collision). Bitmask is NOT capturable (rtiddsgen 4.3.1
+;;; rejects the `bitmask` keyword): the gap is recorded in docs/provenance.md; the policy flip
+;;; will apply to whatever kind value bitmask would carry when a newer rtiddsgen is available.
+
+(defun* %lto-connext-c-union-lb ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The live RTI Connext 7.3.1 C_Union PID_TYPE_OBJECT_LB parameter value (232 octets), captured
+   2026-06-11: `@final struct C_Union { @key long id; SomeUnion u; }` with `union SomeUnion
+   switch(long) { case 0: long a; case 1: double b; }`. Inflates to a 608-octet legacy TypeObject;
+   the union member `u` carries member-kind 0x15 (21) at VALUE-START+8 — an UNMODELABLE kind
+   (no union TI in assignability), so the whole parse degrades to :unsupported (docs/provenance.md
+   2026-06-11)."
+  (coerce
+   '(1 0 0 0 96 2 0 0 219 0 0 0 120 218 99 172 231 96 0 1 19 38 6 6 38 48 139 133 65 12 72 50 2 197
+     57 129 244 5 40 27 4 100 64 108 176 44 3 131 157 71 4 51 115 185 137 34 72 198 57 62 52 47 51
+     63 15 172 142 17 108 2 4 128 248 41 104 252 84 32 93 193 0 177 11 102 174 8 216 92 8 96 5 66
+     102 32 157 153 194 128 97 30 83 61 66 143 2 204 76 32 22 133 178 253 237 184 230 77 58 187 44
+     16 100 118 41 3 118 253 48 12 18 21 133 170 225 2 210 6 140 232 102 139 162 152 9 82 19 156
+     159 155 10 241 41 3 78 191 62 1 98 102 6 76 119 194 252 198 7 164 83 50 139 147 139 50 115 51
+     243 18 75 242 139 240 152 133 205 223 34 72 254 6 153 7 242 107 34 30 51 56 144 194 22 155 57
+     32 253 92 64 8 162 147 136 48 135 17 45 28 97 234 5 128 88 12 170 7 150 54 64 242 0 101 206
+     48 253 0)
+   '(simple-array (unsigned-byte 8) (*))))
+
+(defun* %lto-connext-c-array-lb ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The live RTI Connext 7.3.1 C_Array PID_TYPE_OBJECT_LB parameter value (200 octets), captured
+   2026-06-11: `@final struct C_Array { @key long id; long arr[4]; }`. Inflates to a 416-octet
+   legacy TypeObject; the array member `arr` carries member-kind 0x11 (17) at VALUE-START+8 —
+   an UNMODELABLE kind (no array TI in assignability), so the whole parse degrades to :unsupported
+   (docs/provenance.md 2026-06-11)."
+  (coerce
+   '(1 0 0 0 160 1 0 0 185 0 0 0 120 218 99 172 231 96 0 129 18 70 6 6 38 48 139 133 65 12 72 50
+     2 197 57 129 244 5 40 27 4 100 64 108 176 44 3 131 80 130 235 165 205 237 21 9 32 25 231 120
+     199 162 162 196 74 176 58 70 176 9 16 0 226 167 160 241 83 129 116 5 3 196 46 152 185 34 96
+     115 33 128 21 8 153 129 116 102 10 3 134 121 76 245 8 61 10 48 51 129 88 16 202 142 62 203
+     46 106 245 234 154 49 72 125 98 81 17 86 253 48 12 18 21 132 186 1 100 95 1 146 123 84 192
+     238 19 68 49 147 15 98 102 98 101 188 73 188 103 94 137 177 17 3 3 94 255 130 252 145 10 149
+     1 137 159 0 210 28 80 247 178 32 185 5 102 134 0 16 139 65 205 129 133 45 72 30 0 170 113
+     41 112 0 0 0)
+   '(simple-array (unsigned-byte 8) (*))))
+
+(defun* run-lto-parse-aggregates-unsupported-test ()
+    (function () t)
+  "Test: the degrading policy holds for UNION and ARRAY members (Task 4.2). For each of the two live
+   Connext 7.3.1 captures (C_Union / C_Array), parse-legacy-type-object returns :unsupported because
+   the respective member-kind (union=0x15, array=0x11) is UNMODELABLE — absent from all mapped arms
+   and from *lto-primitive-kind-keyword* — so %lto-member-type-identifier NIL + %lto-member-has-kind-p
+   T triggers the Task-4.1 policy flip. The fingerprint strings confirm each capture is the right type.
+   No guard was added to %lto-member-type-identifier (no kind collision). Bitmask is recorded as a
+   gap (rtiddsgen 4.3.1 rejects `bitmask`). Pinned to the live Connext 7.3.1 corpus
+   (docs/provenance.md 2026-06-11)."
+  ;; C_Union: member-kind 0x15 (union), unmodelable -> :unsupported
+  (let* ((lb (%lto-connext-c-union-lb))
+         (inflated (dds.types:inflate-type-object-lb lb)))
+    (%check :lto-union-inflate
+            (and inflated (= (length inflated) 608))
+            "C_Union inflates to the 608-octet legacy TypeObject")
+    (when inflated
+      (let ((strs (dds.types:type-object-strings inflated)))
+        (%check :lto-union-fingerprint
+                (every (lambda (s) (member s strs :test #'string=))
+                       '("C_Union" "SomeUnion"))
+                "the C_Union capture carries C_Union / SomeUnion fingerprint strings"))
+      (%check :lto-union-unsupported
+              (eq (dds.types:parse-legacy-type-object inflated) :unsupported)
+              "C_Union parses to :unsupported — union member-kind 0x15 is unmodelable, fail-open")))
+  ;; C_Array: member-kind 0x11 (array), unmodelable -> :unsupported
+  (let* ((lb (%lto-connext-c-array-lb))
+         (inflated (dds.types:inflate-type-object-lb lb)))
+    (%check :lto-array-inflate
+            (and inflated (= (length inflated) 416))
+            "C_Array inflates to the 416-octet legacy TypeObject")
+    (when inflated
+      (let ((strs (dds.types:type-object-strings inflated)))
+        (%check :lto-array-fingerprint
+                (every (lambda (s) (member s strs :test #'string=))
+                       '("C_Array" "arr"))
+                "the C_Array capture carries C_Array / arr fingerprint strings"))
+      (%check :lto-array-unsupported
+              (eq (dds.types:parse-legacy-type-object inflated) :unsupported)
+              "C_Array parses to :unsupported — array member-kind 0x11 is unmodelable, fail-open")))
+  ;; cross-check: the flat @key long id members (kind 0x05 = TK_INT32) are not the cause;
+  ;; C_Shape (only long/string members) still parses to a full minimal-struct-type.
+  (let* ((shape-inf (dds.types:inflate-type-object-lb (%connext-c-shape-lb))))
+    (%check :lto-aggregates-shape-unaffected
+            (dds.types:minimal-struct-type-p
+             (and shape-inf (dds.types:parse-legacy-type-object shape-inf)))
+            "a type with only modelable members (C_Shape) is unaffected — policy fires only on unmodelable members"))
   t)

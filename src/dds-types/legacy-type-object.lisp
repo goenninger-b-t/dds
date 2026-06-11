@@ -307,6 +307,15 @@
    — bounds-checked against VALUE-END FIRST (NFR-SEC-POSTURE)."
   (%lto-u32 octets (+ (lto-node-value-start node) 4) (lto-node-value-end node)))
 
+(defun* %lto-member-has-kind-p (octets node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node) t)
+  "T iff member NODE has a present (in-bounds) type-kind word at VALUE-START+8: i.e. the member
+   declares a type. Used by the degrading policy (the operating contract, Task 4.1): a member
+   that HAS a kind word but whose type cannot be modeled (%LTO-MEMBER-TYPE-IDENTIFIER returns NIL)
+   is UNMODELABLE -> the whole parse degrades to :unsupported (fail-open). Bounds-checked FIRST
+   (NFR-SEC-POSTURE)."
+  (and (%lto-u16 octets (+ (lto-node-value-start node) 8) (lto-node-value-end node)) t))
+
 (defun* %lto-member-key-p (octets node)
     (function ((simple-array (unsigned-byte 8) (*)) lto-node) t)
   "T iff member NODE is a @key member: the u32 @key flag at the member node's VALUE-START+0 is
@@ -530,7 +539,12 @@
    VISITED bound nested-struct recursion (passed through to %LTO-MEMBER-TYPE-IDENTIFIER's nested
    arm). Returns a MINIMAL-STRUCT-TYPE on success, :UNSUPPORTED when SDEF carries no type name /
    no member-list container / no members / a member-count mismatch (mirroring the top-level
-   discipline). Every wire read is bounds-checked inside the helpers (NFR-SEC-POSTURE)."
+   discipline) OR when any member declares a type (kind word present) that cannot be modeled
+   (%LTO-MEMBER-TYPE-IDENTIFIER NIL: an unmapped kind — enum/union/array/bitmask — an unresolvable
+   hash, or an over-depth/cyclic nested struct) — the degrading policy (the operating contract,
+   Task 4.1): an unmodelable member fails the WHOLE parse open to :unsupported rather than emit a
+   partial model with a NIL-TI member the Stage-5 gate could mis-handle. Every wire read is
+   bounds-checked inside the helpers (NFR-SEC-POSTURE)."
   (let ((tname (%lto-first-named sdef))
         (container (%lto-find-code sdef +lto-code-members+)))
     (when (or (null tname) (null container))
@@ -543,13 +557,16 @@
           (let ((id (%lto-member-id octets c)))
             (when (null id)
               (return-from %lto-parse-struct-node :unsupported))
-            (push (%make-minimal-struct-member
-                   :name (lto-node-name c) :id id
-                   ;; primitive/string/sequence/nested-struct members get a TI; others stay NIL (Task 3.x)
-                   :type-identifier (%lto-member-type-identifier octets root c depth visited)
-                   :key-p (%lto-member-key-p octets c)
-                   :name-hash (member-name-hash (lto-node-name c)))
-                  members))))
+            (let ((ti (%lto-member-type-identifier octets root c depth visited)))
+              ;; degrading policy: an unmodelable typed member -> whole parse :unsupported (gate falls open)
+              (when (and (null ti) (%lto-member-has-kind-p octets c))
+                (return-from %lto-parse-struct-node :unsupported))
+              (push (%make-minimal-struct-member
+                     :name (lto-node-name c) :id id
+                     :type-identifier ti
+                     :key-p (%lto-member-key-p octets c)
+                     :name-hash (member-name-hash (lto-node-name c)))
+                    members)))))
       (when (null members)
         (return-from %lto-parse-struct-node :unsupported))
       ;; cross-check: container's first value word is the declared member count (docs/provenance.md 2026-06-11)
@@ -577,8 +594,11 @@
    a NESTED-STRUCT member gets an EK_MINIMAL HASH-TYPE-IDENTIFIER whose REFERENCED slot is the
    parsed nested MINIMAL-STRUCT-TYPE — resolved from the referenced +LTO-CODE-STRUCT+ TypeLibrary-
    sibling node, recursively, under *LTO-MAX-TYPE-DEPTH* + a visited-hash cycle guard (Task 3.2);
-   a still-unmodeled member (sequence-of-aggregate, over-depth/cyclic nested struct) leaves its
-   type-identifier NIL. Each member's @key flag is set from the wire (%LTO-MEMBER-KEY-P). EXTENSIBILITY is
+   a member that declares a type the model cannot represent — an unmapped member-kind word
+   (enum/union/array/bitmask), an unresolvable hash, a sequence-of-aggregate, or an over-depth/cyclic
+   nested struct — degrades the WHOLE result to :UNSUPPORTED (the operating contract, Task 4.1: fail
+   the unmodelable member OPEN to name-match at the Stage-5 gate, never gate on a partial model with
+   a NIL-TI member). Each member's @key flag is set from the wire (%LTO-MEMBER-KEY-P). EXTENSIBILITY is
    decoded from the wire (%LTO-STRUCT-EXTENSIBILITY: :final/:appendable/:mutable; an unknown flag
    fails open to :final). The struct-node→model fold is the shared %LTO-PARSE-STRUCT-NODE helper
    (reused by the nested resolver so nesting recurses naturally). The node-to-model

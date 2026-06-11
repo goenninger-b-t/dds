@@ -247,3 +247,51 @@ struct C_Nested2 {
     C_Inner inner;
     C_Inner inner2;
 };
+
+// C_Enum — Task 4.1 enum-member differential. SomeEnum is a plain 3-enumerator enum (default
+// SEQUENTIAL values RED=0, GREEN=1, BLUE=2); C_Enum embeds it as member `e`. Diffing C_Enum
+// vs the base C_Shape localizes the enum member-kind word at the member node's VALUE-START+8.
+// The degrading policy (the operating contract, Task 4.1): our assignability model has NO enum
+// TypeIdentifier (assignability.lisp models only primitives/strings/sequences/structs, treating
+// enum as conservatively non-assignable), so an enum member is UNMODELABLE -> the whole
+// parse-legacy-type-object returns :unsupported (fail-open to name-match), recorded as a gap.
+enum SomeEnum { RED, GREEN, BLUE };
+
+@final
+struct C_Enum {
+    @key long id;
+    SomeEnum e;
+};
+
+// C_Union — Task 4.2 union-member differential (degrading tier). SomeUnion is a discriminated
+// union over long; C_Union embeds it as member `u`. The union member-kind word at
+// VALUE-START+8 is captured and recorded in docs/provenance.md; it is NOT in
+// *lto-primitive-kind-keyword* (not a primitive) and our assignability model has no union TI,
+// so the member is UNMODELABLE -> the whole parse degrades to :unsupported (fail-open).
+union SomeUnion switch(long) {
+    case 0: long a;
+    case 1: double b;
+};
+
+@final
+struct C_Union {
+    @key long id;
+    SomeUnion u;
+};
+
+// C_Array — Task 4.2 array-member differential (degrading tier). The fixed-size array `arr[4]`
+// carries a member-kind word at VALUE-START+8 that is NOT a primitive kind; our assignability
+// model has no array TI -> UNMODELABLE -> :unsupported (fail-open).
+@final
+struct C_Array {
+    @key long id;
+    long arr[4];
+};
+
+// C_Bitmask — Task 4.2 bitmask-member (NOT CAPTURABLE: rtiddsgen 4.3.1 rejects the `bitmask`
+// keyword: "mismatched input 'bitmask' expecting EOF"). The IDL construct is therefore excluded
+// from the compiled corpus; the gap is documented in docs/provenance.md (2026-06-11). A future
+// Connext install with a newer rtiddsgen that accepts `bitmask` can add the capture then.
+// (When captured: the bitmask member-kind word at VALUE-START+8 is expected to be an unmapped
+// kind not in *lto-primitive-kind-keyword*; since our assignability model has no bitmask TI,
+// the member would be UNMODELABLE -> the whole parse degrades to :unsupported, fail-open.)
