@@ -721,3 +721,59 @@ the Stage-5 gate falls open to name-match and never sees a partial model with a 
 - **Artifacts**: `corpus_pub`, `rtiddsgen` output, pcaps, the symlinked RTI dylibs, and the run logs
   remain git-ignored (NFR-IP). Only the harness source (`src/dds-shapes/`, `Makefile`) + docs are
   tracked.
+
+## M4 (2026-06-11) — Fast DDS 3.6.1 test-peer toolchain (FR-IO-2)
+
+A pinned Fast DDS toolchain built from source **outside this repo** to serve as the second
+interop peer for FR-IO-2 (confirms TypeLookup `CONFIRM_VS_PEER` + provisional EquivalenceHash
+against a non-Connext implementation). This is a **test peer only** — it is **not** a code
+dependency of the shipped systems and receives **no SBOM entry**; provenance is recorded here
+per the clean-room and IP rules (the operating contract §4, §5.2).
+
+### Toolchain location
+
+Outside this repository, as a sibling project of the repo's parent
+`projects/` directory (`projects/fastdds/`) — `src/` holds the clones,
+`install/` is the shared CMake install prefix (`$FASTDDS_PREFIX`,
+overridable). The env helper
+`scripts/with-fastdds.sh` (mode 755) sets `FASTDDS_PREFIX`, `FASTDDSGEN`, and
+`DYLD_LIBRARY_PATH` for any command run against this peer.
+
+### Repository pins
+
+| Repository | Tag | Commit |
+|---|---|---|
+| https://github.com/eProsima/Fast-DDS | v3.6.1 | 4e81e8b71bcd6e7c5213c000503cba8e49d6022a |
+| https://github.com/eProsima/Fast-CDR | v2.3.5 | 7d33a3b51a1585f5631b0a8d905bcc4f249d0f34 |
+| https://github.com/eProsima/foonathan_memory_vendor | v1.4.1 | 347cb67581e51273a612780eb256a3c134c10bae |
+| https://github.com/eProsima/Fast-DDS-Gen | v4.3.0 | cc0072b8849b35c67bd7e187990efad58e2871ae |
+
+Fast-CDR and foonathan_memory_vendor tags taken from the Fast-DDS v3.6.1
+`fastdds.repos` manifest. Fast-DDS-Gen v4.3.0 selected per the eProsima
+versions compatibility table (see docs consulted below). All four repositories
+are **Apache-2.0**.
+
+### Build configuration
+
+- CMake 4.3.3, build type Release, `BUILD_SHARED_LIBS=ON`, single shared
+  install prefix (`fastdds/install/`).
+- Brew packages installed for the build (host macOS arm64):
+  - `openjdk` 26.0.1 — Fast-DDS-Gen JVM (NOT symlinked into `/Library`; used
+    via `PATH=/opt/homebrew/opt/openjdk/bin`).
+  - `asio` 1.36.0 — header-only async I/O.
+  - `tinyxml2` 11.0.0 — XML parsing.
+  - `openssl@3` 3.6.2 — TLS/crypto support.
+
+### Docs consulted
+
+- https://fast-dds.docs.eprosima.com/en/stable/installation/sources/sources_mac.html —
+  macOS source-build instructions.
+- https://fast-dds.docs.eprosima.com/en/stable/notes/versions.html — versions
+  compatibility table (used to select the matching Fast-DDS-Gen v4.3.0 tag).
+
+### Clean-room note
+
+eProsima sources and examples **may be consulted read-only** for harness API
+usage (FR-IO-2 peer apps); **no eProsima source is copied into `src/`**. No
+RTI source or headers were consulted. The GPL Wireshark RTPS dissector source
+was not used (only the binary dissector, as before).
