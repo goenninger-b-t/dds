@@ -7,7 +7,10 @@
 
 (require :asdf)
 (push (truename ".") asdf:*central-registry*)
-(asdf:load-system :dds-disc)
+;; quickload when available: external deps (e.g. chipz via dds-types) auto-install
+(if (find-package '#:quicklisp)
+    (uiop:symbol-call '#:quicklisp '#:quickload :dds-disc :silent t)
+    (asdf:load-system :dds-disc))
 
 (in-package :cl-user)
 
@@ -91,6 +94,37 @@
     (dds.rtps.message:write-acknack mc #x00000207 #x00000102 1 6 bitmap 1 :final t)
     (emit 7413 (dds.core.buffer:octet-buffer-vec msg) (dds.core.buffer:cursor-position mc))))
 
+(defun build-typelookup ()
+  "Two messages: DATA(TypeLookup_Request getTypes) and DATA(TypeLookup_Reply) on the
+   XTypes 1.3 Table 61 builtin EntityIds — the dissector decodes both payloads fully."
+  (let* ((guid (make-array 16 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 #x11 0 3 0 #xc3)))
+         (h (make-array 14 :element-type '(unsigned-byte 8) :initial-element #xA5))
+         (req (dds.types:serialize-type-lookup-request
+               :writer-guid guid :sn 1
+               :instance-name "dds.builtin.TOS.222222222222222222222222"
+               :operation :get-types :type-ids (list h)))
+         (m (dds.types:make-minimal-struct-type
+             :name "tlv" :extensibility :final
+             :members (list (dds.types:make-struct-member
+                             "x" 0 (dds.types:primitive-type-identifier :i32)))))
+         (rep (dds.types:serialize-type-lookup-reply
+               :related-guid guid :related-sn 1
+               :operation :get-types :remote-ex :ok
+               :pairs (list (cons (dds.types:equivalence-hash m)
+                                  (dds.types:minimal-type-object-octets m))))))
+    (flet ((one (prefix-fill reader-id writer-id payload)
+             (let* ((msg (dds.core.buffer:make-octet-buffer 1024))
+                    (mc (dds.core.buffer:cursor msg :endianness :little)))
+               (dds.rtps.message:write-header mc (prefix12 prefix-fill))
+               (dds.rtps.message:write-data mc reader-id writer-id 1
+                                            payload 0 (length payload))
+               (emit 7410 (dds.core.buffer:octet-buffer-vec msg)
+                     (dds.core.buffer:cursor-position mc)))))
+      ;; EntityIds per XTypes 1.3 §7.6.3.3.3 Table 61
+      (one #x11 #x000300c4 #x000300c3 req)
+      (one #x22 #x000301c4 #x000301c3 rep))))
+
 ;;; ---- DLT_RAW pcap framing (IPv4 + UDP, checksums 0; tshark dissects regardless) ----
 
 (defun write-pcap (path packets)
@@ -129,4 +163,5 @@
 (build-sedp)
 (build-data+heartbeat)
 (build-acknack)
+(build-typelookup)
 (write-pcap "/tmp/rtps_wire.pcap" *packets*)

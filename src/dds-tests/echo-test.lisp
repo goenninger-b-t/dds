@@ -235,6 +235,7 @@
                  ("xtypes-type-information"  . run-type-information-test)
                  ("typelookup-request"       . run-typelookup-request-test)
                  ("typelookup-reply"         . run-typelookup-reply-test)
+                 ("typelookup-vectors"       . run-typelookup-vector-test)
                  ("xtypes-type-object-lb"    . run-type-object-lb-test)
                  ("sedp-type-object-lb"      . run-sedp-type-object-lb-test)
                  ("xtypes-type-compat-soft"  . run-type-compat-soft-test)

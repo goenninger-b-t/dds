@@ -73,24 +73,29 @@
     (dds.core.buffer:cursor-set-position cursor e)
     e))
 
-;;; ---- MUTABLE member framing: EMHEADER1 LC=4 + backpatched NEXTINT (§7.4.3.4.2) ----
+;;; ---- MUTABLE member framing: EMHEADER1 + backpatched NEXTINT (§7.4.3.4.2) ----
 
-(defun* %mutable-member-begin (c id &optional mu)
-    (function (dds.core.buffer:cursor (unsigned-byte 28) &optional t) (integer 0))
-  "Write EMHEADER1 (M_FLAG=MU, LC=4) for member ID plus a placeholder NEXTINT; return
-   the NEXTINT's byte position for %mutable-member-end. MU defaults to NIL: the member
-   must_understand attribute defaults to false (XTypes 1.3 §7.2.2.4.4.4 / §7.2.2.4.4.4.6)
-   absent an @must_understand annotation; pass T only for annotated members."
+(defun* %mutable-member-begin (c id &optional mu (lc 4))
+    (function (dds.core.buffer:cursor (unsigned-byte 28) &optional t (integer 4 5))
+              (integer 0))
+  "Write EMHEADER1 (M_FLAG=MU, length code LC) for member ID plus a placeholder NEXTINT;
+   return the NEXTINT's byte position for %mutable-member-end. LC 4: NEXTINT is the
+   member byte length and the value follows it. LC 5: NEXTINT doubles as the value's own
+   leading UInt32 (DHEADER / element count, serialization rule (22), XTypes 1.3
+   §7.4.3.5.3) — the caller writes the value WITHOUT that leading UInt32. MU defaults
+   to NIL: the member must_understand attribute defaults to false (§7.2.2.4.4.4 /
+   §7.2.2.4.4.4.6) absent an @must_understand annotation; pass T only for annotated members."
   (dds.cdr:cdr-align c 4 :xcdr2)
-  (dds.core.buffer:put-u32 c (dds.cdr:emheader1-encode mu 4 id))
+  (dds.core.buffer:put-u32 c (dds.cdr:emheader1-encode mu lc id))
   (let ((np (dds.core.buffer:cursor-position c)))
     (dds.core.buffer:put-u32 c 0)
     np))
 
 (defun* %mutable-member-end (c np)
     (function (dds.core.buffer:cursor (integer 0)) (integer 0))
-  "Backpatch the NEXTINT at NP with the member's serialized length (LC=4: NEXTINT is
-   the byte length of the member that follows it, §7.4.3.4.2)."
+  "Backpatch the NEXTINT at NP with the byte length of the content that follows it
+   (LC=4: the member length, §7.4.3.4.2; LC=5: the same value doubling as the value's
+   own leading UInt32 — DHEADER or element count — per rule (22), §7.4.3.5.3)."
   (let ((e (dds.core.buffer:cursor-position c)))
     (dds.core.buffer:cursor-set-position c np)
     (dds.core.buffer:put-u32 c (- e np 4))

@@ -5,18 +5,21 @@
 ;;;; + unsigned long low; RequestHeader = SampleIdentity requestId + string<255> instanceName).
 ;;;;
 ;;;; NO Connext oracle exists for this protocol (ADR 0010: RTI does not implement the
-;;;; builtin TypeLookup service); everything here is pinned from the spec text and marked
-;;;; CONFIRM-VS-PEER where a byte-level choice awaits a compliant peer (Fast DDS, FR-IO-2):
-;;;; (1) TypeLookup_Request is unannotated, so it takes the §7.3.1.2.1.8 default ("the type
-;;;; shall be considered appendable") => DELIMITED_CDR, encapsulation D_CDR2_LE {0x00,0x09}
-;;;; (Table 60, §7.6.3.1.2), one top-level DHEADER. (2) The nested DDS-RPC header types and
-;;;; the TypeLookup_Call union are serialized FLAT (no per-struct DHEADERs, union = bare
-;;;; discriminator + arm), matching Fast DDS practice for these RPC types rather than the
-;;;; strict default-appendable recursion. (3) The MUTABLE *_In members use EMHEADER1 LC=4
-;;;; + explicit NEXTINT, M_FLAG=0 (the §7.2.2.4.4.4.6 default), mirroring
-;;;; serialize-type-information. (4) type_ids elements are EK_MINIMAL/EK_COMPLETE
-;;;; hash-defined TypeIdentifiers only (the only kinds a request for a TypeObject can name
-;;;; that we serve); other TypeIdentifier kinds reject on parse.
+;;;; builtin TypeLookup service); the framing follows the de-facto interop convention of
+;;;; the designated FR-IO-2 oracle, Fast DDS (whose rpc_types.idl/TypeLookupTypes.idl pin
+;;;; every RPC header struct and the top-level Request/Reply @final), which the
+;;;; Wireshark/tshark RTPS dissector implements verbatim. CONFIRM-VS-PEER stays where a
+;;;; byte-level choice still awaits a live peer capture: (1) the spec IDL (§7.6.3.3.3)
+;;;; leaves TypeLookup_Request/Reply unannotated — the §7.3.1.2.1.8 default would be
+;;;; appendable — but the implemented convention is FINAL => PLAIN_CDR2, encapsulation
+;;;; CDR2_LE {0x00,0x07} (Table 60, §7.6.3.1.2), NO top-level DHEADER. (2) The DDS-RPC
+;;;; header structs are FINAL => flat; the TypeLookup_Call/Return/Result unions are
+;;;; unannotated => default appendable => each carries a DHEADER before its discriminator
+;;;; (§7.4.3.4.1 + §7.4.3.5.3 rule (30)). (3) The MUTABLE *_In/*_Out members use EMHEADER1 LC=5: NEXTINT doubles
+;;;; as the member value's leading UInt32 (DHEADER / element count) per serialization
+;;;; rule (22) (§7.4.3.5.3), matching the Fast CDR encoder. (4) type_ids elements are
+;;;; EK_MINIMAL/EK_COMPLETE hash-defined TypeIdentifiers only (the only kinds a request
+;;;; for a TypeObject can name that we serve); other TypeIdentifier kinds reject on parse.
 
 (in-package #:dds.types)
 
@@ -38,10 +41,12 @@
   "Member id of the @hashid continuation_point member of TypeLookup_getTypeDependencies_In
    (XTypes 1.3 §7.6.3.3.3 + §7.3.1.2.1.1).")
 
-;; Default extensibility (§7.3.1.2.1.8) => APPENDABLE => DELIMITED_CDR. CONFIRM-VS-PEER.
-(defconstant +tl-encap-d-cdr2-le+ #x0009
-  "RTPS encapsulation identifier D_CDR2_LE {0x00,0x09}: DELIMITED_CDR, XCDR2, little
-   endian (XTypes 1.3 §7.6.3.1.2 Table 60). TypeLookup_Request's encapsulation.")
+;; FINAL top level (Fast DDS @final convention; spec IDL unannotated). CONFIRM-VS-PEER.
+(defconstant +tl-encap-cdr2-le+ #x0007
+  "RTPS encapsulation identifier CDR2_LE {0x00,0x07}: PLAIN_CDR2, XCDR2, little endian
+   (XTypes 1.3 §7.6.3.1.2 Table 60). TypeLookup_Request/Reply's encapsulation — the
+   top-level types are FINAL per the implemented convention (Fast DDS pins them @final;
+   the tshark RTPS dissector expects exactly this), so no top-level DHEADER follows.")
 
 (defconstant +tl-max-instance-name+ 255
   "InstanceName bound: typedef string<255> InstanceName (XTypes 1.3 §7.6.3.3.2).")
@@ -65,23 +70,22 @@
     (function (dds.core.buffer:cursor list) t)
   "The @hashid type_ids member: sequence<TypeIdentifier> = DHEADER + UInt32 count +
    elements (§7.4.3.5.3 rule 12, non-primitive elements); each element an EK_MINIMAL
-   TypeIdentifier = discriminator octet + 14-octet EquivalenceHash (§7.3.4.9.1)."
-  (let ((np (%mutable-member-begin c +tl-member-type-ids+)))
-    (let ((sp (%dheader-begin c)))
-      (dds.cdr:cdr-put-u32 c (length type-ids) :xcdr2)
-      (dolist (h type-ids)
-        (dds.core.buffer:put-u8 c +ek-minimal+)
-        (dds.core.buffer:put-octets c h 0 14))
-      (%dheader-end c sp))
+   TypeIdentifier = discriminator octet + 14-octet EquivalenceHash (§7.3.4.9.1).
+   EMHEADER1 LC=5: the backpatched NEXTINT doubles as the DHEADER (rule (22))."
+  (let ((np (%mutable-member-begin c +tl-member-type-ids+ nil 5)))
+    (dds.cdr:cdr-put-u32 c (length type-ids) :xcdr2)
+    (dolist (h type-ids)
+      (dds.core.buffer:put-u8 c +ek-minimal+)
+      (dds.core.buffer:put-octets c h 0 14))
     (%mutable-member-end c np))
   t)
 
 (defun* %put-tl-continuation-member (c continuation)
     (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*))) t)
   "The @hashid continuation_point member: sequence<octet,32> = UInt32 length + octets
-   (§7.4.3.5.3 rule 11, primitive elements: no DHEADER)."
-  (let ((np (%mutable-member-begin c +tl-member-continuation-point+)))
-    (dds.cdr:cdr-put-u32 c (length continuation) :xcdr2)
+   (§7.4.3.5.3 rule 11, primitive elements: no DHEADER). EMHEADER1 LC=5: the backpatched
+   NEXTINT doubles as the element count (octet elements: count = byte length, rule (22))."
+  (let ((np (%mutable-member-begin c +tl-member-continuation-point+ nil 5)))
     (dds.core.buffer:put-octets c continuation 0 (length continuation))
     (%mutable-member-end c np))
   t)
@@ -96,7 +100,7 @@
                     (:continuation (or null (simple-array (unsigned-byte 8) (*)))))
               (simple-array (unsigned-byte 8) (*)))
   "Serialize a TypeLookup_Request (XTypes 1.3 §7.6.3.3.3) as XCDR2-LE octets, including
-   the 4-octet D_CDR2_LE encapsulation header. WRITER-GUID is the 16-octet requester GUID,
+   the 4-octet CDR2_LE encapsulation header. WRITER-GUID is the 16-octet requester GUID,
    SN the request SequenceNumber, INSTANCE-NAME the bounded<255> service instance name,
    OPERATION :get-types or :get-deps, TYPE-IDS a list of 14-octet EquivalenceHashes
    (serialized as EK_MINIMAL TypeIdentifiers), CONTINUATION an optional continuation_point
@@ -116,12 +120,14 @@
          (c (dds.core.buffer:cursor buf :endianness :little)))
     (unwind-protect
          (progn
-           (dds.core.buffer:put-u8 c (ldb (byte 8 8) +tl-encap-d-cdr2-le+))
-           (dds.core.buffer:put-u8 c (ldb (byte 8 0) +tl-encap-d-cdr2-le+))
+           (dds.core.buffer:put-u8 c (ldb (byte 8 8) +tl-encap-cdr2-le+))
+           (dds.core.buffer:put-u8 c (ldb (byte 8 0) +tl-encap-cdr2-le+))
            (dds.core.buffer:put-u16 c 0)
            (dds.core.buffer:cursor-set-origin c)
-           (let ((tp (%dheader-begin c)))
-             (%put-tl-request-header c writer-guid sn instance-name)
+           ;; FINAL top level: no DHEADER; header flat (Fast DDS @final convention)
+           (%put-tl-request-header c writer-guid sn instance-name)
+           ;; TypeLookup_Call: default-appendable union => DHEADER + discriminator
+           (let ((up (%dheader-begin c)))
              (dds.cdr:cdr-put-u32 c (ecase operation
                                       (:get-types +tl-gettypes-hash+)
                                       (:get-deps +tl-getdeps-hash+))
@@ -131,7 +137,7 @@
                (when (and (eq operation :get-deps) continuation (plusp (length continuation)))
                  (%put-tl-continuation-member c continuation))
                (%dheader-end c ip))
-             (%dheader-end c tp))
+             (%dheader-end c up))
            (let* ((e (dds.core.buffer:cursor-position c))
                   (out (make-array e :element-type '(unsigned-byte 8))))
              (replace out (dds.core.buffer:octet-buffer-vec buf) :end2 e)
@@ -257,7 +263,7 @@
               (values (or null (member :get-types :get-deps :unknown)) list
                       (or null (simple-array (unsigned-byte 8) (*))) (or null integer)
                       (or null string) (or null (simple-array (unsigned-byte 8) (*)))))
-  "Parse a serialized TypeLookup_Request (XTypes 1.3 §7.6.3.3.3, D_CDR2_LE) and return
+  "Parse a serialized TypeLookup_Request (XTypes 1.3 §7.6.3.3.3, CDR2_LE) and return
    (values operation type-ids writer-guid sn instance-name continuation) where OPERATION
    is :get-types or :get-deps and TYPE-IDS a list of 14-octet EquivalenceHashes; (values
    :unknown NIL writer-guid sn instance-name NIL) for an unrecognized union discriminator;
@@ -265,9 +271,9 @@
    bounds-checked against the input extent, NFR-SEC-POSTURE)."
   (let ((len (length octets)))
     (when (< len 8) (return-from parse-type-lookup-request nil))
-    ;; encapsulation: D_CDR2_LE only (what we emit; other encodings CONFIRM-VS-PEER)
-    (unless (and (= (aref octets 0) (ldb (byte 8 8) +tl-encap-d-cdr2-le+))
-                 (= (aref octets 1) (ldb (byte 8 0) +tl-encap-d-cdr2-le+)))
+    ;; encapsulation: CDR2_LE only (what we emit; other encodings CONFIRM-VS-PEER)
+    (unless (and (= (aref octets 0) (ldb (byte 8 8) +tl-encap-cdr2-le+))
+                 (= (aref octets 1) (ldb (byte 8 0) +tl-encap-cdr2-le+)))
       (return-from parse-type-lookup-request nil))
     (let* ((buf (dds.core.buffer:make-octet-buffer len))
            (c (dds.core.buffer:cursor buf :endianness :little)))
@@ -278,31 +284,33 @@
                (progn
                  (dds.core.buffer:cursor-set-position c 4)
                  (dds.core.buffer:cursor-set-origin c)
-                 (let* ((tsize (dds.cdr:cdr-get-dheader c :xcdr2))
-                        (tend (+ (dds.core.buffer:cursor-position c) tsize)))
-                   (when (> tend len) (return-from parse-type-lookup-request nil))
-                   (let ((guid (make-array 16 :element-type '(unsigned-byte 8))))
-                     (dds.core.buffer:get-octets c guid 0 16)
-                     (let* ((high (dds.cdr:cdr-get-i32 c :xcdr2))
-                            (low (dds.cdr:cdr-get-u32 c :xcdr2))
-                            (sn (+ low (* high #x100000000)))
-                            (slen (dds.cdr:cdr-get-u32 c :xcdr2))
-                            (spos (dds.core.buffer:cursor-position c)))
-                       ;; string<255>: length includes the NUL, so 1..256 (§7.6.3.3.2),
-                       ;; NUL-terminated, and inside the top-level DHEADER extent
-                       (when (or (zerop slen) (> slen (1+ +tl-max-instance-name+))
-                                 (> (+ spos slen) tend)
-                                 (plusp (aref octets (+ spos slen -1))))
-                         (return-from parse-type-lookup-request nil))
-                       ;; rewind to the length and re-read via the cdr-put-string inverse
-                       (dds.core.buffer:cursor-set-position c (- spos 4))
-                       (let ((iname (dds.cdr:cdr-get-string c :xcdr2))
-                             (disc (dds.cdr:cdr-get-u32 c :xcdr2)))
+                 ;; FINAL top level: the input extent is the bound (no top DHEADER)
+                 (let ((guid (make-array 16 :element-type '(unsigned-byte 8))))
+                   (dds.core.buffer:get-octets c guid 0 16)
+                   (let* ((high (dds.cdr:cdr-get-i32 c :xcdr2))
+                          (low (dds.cdr:cdr-get-u32 c :xcdr2))
+                          (sn (+ low (* high #x100000000)))
+                          (slen (dds.cdr:cdr-get-u32 c :xcdr2))
+                          (spos (dds.core.buffer:cursor-position c)))
+                     ;; string<255>: length includes the NUL, so 1..256 (§7.6.3.3.2),
+                     ;; NUL-terminated, and inside the input extent
+                     (when (or (zerop slen) (> slen (1+ +tl-max-instance-name+))
+                               (> (+ spos slen) len)
+                               (plusp (aref octets (+ spos slen -1))))
+                       (return-from parse-type-lookup-request nil))
+                     ;; rewind to the length and re-read via the cdr-put-string inverse
+                     (dds.core.buffer:cursor-set-position c (- spos 4))
+                     (let* ((iname (dds.cdr:cdr-get-string c :xcdr2))
+                            ;; TypeLookup_Call: appendable union DHEADER bounds disc + arm
+                            (usize (dds.cdr:cdr-get-dheader c :xcdr2))
+                            (uend (+ (dds.core.buffer:cursor-position c) usize)))
+                       (when (> uend len) (return-from parse-type-lookup-request nil))
+                       (let ((disc (dds.cdr:cdr-get-u32 c :xcdr2)))
                          (cond
                            ((or (= disc +tl-gettypes-hash+) (= disc +tl-getdeps-hash+))
                             (let ((op (if (= disc +tl-gettypes-hash+) :get-types :get-deps)))
                               (multiple-value-bind (ids continuation ok)
-                                  (%tl-parse-in-struct c tend op)
+                                  (%tl-parse-in-struct c uend op)
                                 (if ok
                                     (values op ids guid sn iname continuation)
                                     nil))))
@@ -315,7 +323,8 @@
 ;;;; { dds::SampleIdentity relatedRequestId; RemoteExceptionCode_t remoteEx; } from
 ;;;; DDS-RPC precisely for the @RPCReplyType, and only ReplyHeader can carry remoteEx.
 ;;;; We serialize the §7.6.3.3.2 ReplyHeader. CONFIRM-VS-PEER. The nested Return/Result
-;;;; unions are FLAT (bare discriminator + arm) like the request's TypeLookup_Call.
+;;;; unions are default-appendable: each carries a DHEADER before its discriminator
+;;;; (§7.4.3.4.1 + §7.4.3.5.3 rule (30)), like the request's TypeLookup_Call (the Fast DDS / dissector layout).
 
 ;; @hashid("types") §7.3.1.2.1.1: MD5[0:4]={d1 4a 80 22} LE=#x22804AD1 AND #x0FFFFFFF (test re-derives)
 (defconstant +tl-member-types+ #x02804AD1
@@ -376,16 +385,15 @@
    so no struct DHEADER (rule 17): the TypeIdentifier (FINAL union, rule 26: EK_MINIMAL
    octet + 14-octet hash) then the TypeObject (APPENDABLE union, rule 30) as the raw
    minimal-type-object-octets, which begin with that rule-30 DHEADER — spliced 4-aligned
-   so the embedded XCDR2 alignment phase (max 4, §7.4.3.3) is preserved."
-  (let ((np (%mutable-member-begin c +tl-member-types+)))
-    (let ((sp (%dheader-begin c)))
-      (dds.cdr:cdr-put-u32 c (length pairs) :xcdr2)
-      (dolist (p pairs)
-        (dds.core.buffer:put-u8 c +ek-minimal+)
-        (dds.core.buffer:put-octets c (car p) 0 14)
-        (dds.cdr:cdr-align c 4 :xcdr2)
-        (dds.core.buffer:put-octets c (cdr p) 0 (length (cdr p))))
-      (%dheader-end c sp))
+   so the embedded XCDR2 alignment phase (max 4, §7.4.3.3) is preserved. EMHEADER1 LC=5:
+   the backpatched NEXTINT doubles as the sequence DHEADER (rule (22))."
+  (let ((np (%mutable-member-begin c +tl-member-types+ nil 5)))
+    (dds.cdr:cdr-put-u32 c (length pairs) :xcdr2)
+    (dolist (p pairs)
+      (dds.core.buffer:put-u8 c +ek-minimal+)
+      (dds.core.buffer:put-octets c (car p) 0 14)
+      (dds.cdr:cdr-align c 4 :xcdr2)
+      (dds.core.buffer:put-octets c (cdr p) 0 (length (cdr p))))
     (%mutable-member-end c np))
   t)
 
@@ -393,11 +401,10 @@
     (function (dds.core.buffer:cursor) t)
   "The @hashid complete_to_minimal member, emitted empty (v1 serves EK_MINIMAL TypeObjects
    only, so no complete-to-minimal mapping exists, §7.6.3.3.4.2): DHEADER + count 0
-   (sequence of non-primitive elements, §7.4.3.5.3 rule 12)."
-  (let ((np (%mutable-member-begin c +tl-member-complete-to-minimal+)))
-    (let ((sp (%dheader-begin c)))
-      (dds.cdr:cdr-put-u32 c 0 :xcdr2)
-      (%dheader-end c sp))
+   (sequence of non-primitive elements, §7.4.3.5.3 rule 12). EMHEADER1 LC=5: the
+   backpatched NEXTINT doubles as the sequence DHEADER (rule (22))."
+  (let ((np (%mutable-member-begin c +tl-member-complete-to-minimal+ nil 5)))
+    (dds.cdr:cdr-put-u32 c 0 :xcdr2)
     (%mutable-member-end c np))
   t)
 
@@ -405,13 +412,12 @@
     (function (dds.core.buffer:cursor list) t)
   "The @hashid dependent_typeids member: sequence<TypeIdentfierWithSize> [sic] = DHEADER +
    UInt32 count + elements (§7.4.3.5.3 rule 12); each element via
-   %put-type-id-with-size-octets (APPENDABLE framing, typeobject-cdr.lisp)."
-  (let ((np (%mutable-member-begin c +tl-member-dependent-typeids+)))
-    (let ((sp (%dheader-begin c)))
-      (dds.cdr:cdr-put-u32 c (length dependencies) :xcdr2)
-      (dolist (d dependencies)
-        (%put-type-id-with-size-octets c (car d) (cdr d)))
-      (%dheader-end c sp))
+   %put-type-id-with-size-octets (APPENDABLE framing, typeobject-cdr.lisp). EMHEADER1
+   LC=5: the backpatched NEXTINT doubles as the sequence DHEADER (rule (22))."
+  (let ((np (%mutable-member-begin c +tl-member-dependent-typeids+ nil 5)))
+    (dds.cdr:cdr-put-u32 c (length dependencies) :xcdr2)
+    (dolist (d dependencies)
+      (%put-type-id-with-size-octets c (car d) (cdr d)))
     (%mutable-member-end c np))
   t)
 
@@ -428,7 +434,7 @@
                     (:continuation (or null (simple-array (unsigned-byte 8) (*)))))
               (simple-array (unsigned-byte 8) (*)))
   "Serialize a TypeLookup_Reply (XTypes 1.3 §7.6.3.3.3) as XCDR2-LE octets, including the
-   4-octet D_CDR2_LE encapsulation header. The header is the §7.6.3.3.2 ReplyHeader —
+   4-octet CDR2_LE encapsulation header. The header is the §7.6.3.3.2 ReplyHeader —
    relatedRequestId (RELATED-GUID, 16 octets + RELATED-SN, the request's SampleIdentity)
    + REMOTE-EX — not the RequestHeader the §7.6.3.3.3 IDL names (spec editorial defect;
    see the section comment). WRITER-GUID is accepted for request/reply call-site symmetry
@@ -439,9 +445,9 @@
    (14-octet-hash . typeobject-serialized-size), plus CONTINUATION (<=32 octets, omitted
    when NIL or empty, §7.6.3.3.4.1). For any non-:ok REMOTE-EX the TypeLookup_Return is
    omitted entirely: DDS-RPC (referenced by §7.6.3.3.2/.4) signals failure via remoteEx,
-   the Return union has no default arm to select (§7.6.3.3.3), and the reply struct's
-   default-APPENDABLE DHEADER extent (§7.3.1.2.1.8 + §7.4.3.4.1) lets absent trailing
-   members take default values (§7.2.2.4.4.4.7). CONFIRM-VS-PEER. Returns a fresh vector."
+   the Return union has no default arm to select (§7.6.3.3.3), and the reply then ends at
+   the input extent (FINAL top level: absence = nothing after the header).
+   CONFIRM-VS-PEER. Returns a fresh vector."
   (when writer-guid
     (unless (= 16 (length writer-guid))
       (error "TypeLookup_Reply: writer-guid must be 16 octets (GUID_t, XTypes §7.6.3.3.2)")))
@@ -465,29 +471,34 @@
          (c (dds.core.buffer:cursor buf :endianness :little)))
     (unwind-protect
          (progn
-           (dds.core.buffer:put-u8 c (ldb (byte 8 8) +tl-encap-d-cdr2-le+))
-           (dds.core.buffer:put-u8 c (ldb (byte 8 0) +tl-encap-d-cdr2-le+))
+           (dds.core.buffer:put-u8 c (ldb (byte 8 8) +tl-encap-cdr2-le+))
+           (dds.core.buffer:put-u8 c (ldb (byte 8 0) +tl-encap-cdr2-le+))
            (dds.core.buffer:put-u16 c 0)
            (dds.core.buffer:cursor-set-origin c)
-           (let ((tp (%dheader-begin c)))
-             (%put-tl-reply-header c related-guid related-sn remote-ex)
-             (when (eq remote-ex :ok)
+           ;; FINAL top level: no DHEADER; header flat (Fast DDS @final convention)
+           (%put-tl-reply-header c related-guid related-sn remote-ex)
+           (when (eq remote-ex :ok)
+             ;; TypeLookup_Return then TypeLookup_get*_Result: appendable unions,
+             ;; each = DHEADER + discriminator (§7.4.3.4.1 + §7.4.3.5.3 rule (30))
+             (let ((up (%dheader-begin c)))
                (dds.cdr:cdr-put-u32 c (ecase operation
                                         (:get-types +tl-gettypes-hash+)
                                         (:get-deps +tl-getdeps-hash+))
                                     :xcdr2)
-               (dds.cdr:cdr-put-u32 c +tl-retcode-ok+ :xcdr2)
-               (let ((op (%dheader-begin c)))
-                 (ecase operation
-                   (:get-types
-                    (%put-tl-pairs-member c pairs)
-                    (%put-tl-c2m-member c))
-                   (:get-deps
-                    (%put-tl-deps-member c dependencies)
-                    (when (and continuation (plusp (length continuation)))
-                      (%put-tl-continuation-member c continuation))))
-                 (%dheader-end c op)))
-             (%dheader-end c tp))
+               (let ((rp (%dheader-begin c)))
+                 (dds.cdr:cdr-put-u32 c +tl-retcode-ok+ :xcdr2)
+                 (let ((op (%dheader-begin c)))
+                   (ecase operation
+                     (:get-types
+                      (%put-tl-pairs-member c pairs)
+                      (%put-tl-c2m-member c))
+                     (:get-deps
+                      (%put-tl-deps-member c dependencies)
+                      (when (and continuation (plusp (length continuation)))
+                        (%put-tl-continuation-member c continuation))))
+                   (%dheader-end c op))
+                 (%dheader-end c rp))
+               (%dheader-end c up)))
            (let* ((e (dds.core.buffer:cursor-position c))
                   (out (make-array e :element-type '(unsigned-byte 8))))
              (replace out (dds.core.buffer:octet-buffer-vec buf) :end2 e)
@@ -600,21 +611,22 @@
               (values (or null (member :get-types :get-deps :unknown)) list
                       (or null (simple-array (unsigned-byte 8) (*))) (or null integer)
                       (or null keyword) (or null (simple-array (unsigned-byte 8) (*)))))
-  "Parse a serialized TypeLookup_Reply (XTypes 1.3 §7.6.3.3.3, D_CDR2_LE) and return
+  "Parse a serialized TypeLookup_Reply (XTypes 1.3 §7.6.3.3.3, CDR2_LE) and return
    (values operation result related-guid related-sn remote-ex continuation): OPERATION
    :get-types with RESULT a list of (14-octet-hash . typeobject-octets) pairs, or
    :get-deps with RESULT a list of (14-octet-hash . size) and an optional CONTINUATION;
    :unknown for an unrecognized TypeLookup_Return discriminator; OPERATION NIL with
    RELATED-GUID/RELATED-SN/REMOTE-EX still returned when the Return union is absent (a
-   non-OK reply, see serialize-type-lookup-reply); plain NIL on any malformed, truncated,
-   or out-of-bounds input (network-facing: every read is bounds-checked, NFR-SEC-POSTURE).
-   A Result union discriminator other than DDS_RETCODE_OK selects no arm (the union has
-   only that case, §7.6.3.3.3) and yields an empty RESULT."
+   non-OK reply, see serialize-type-lookup-reply; an :ok reply without a Return is
+   malformed); plain NIL on any malformed, truncated, or out-of-bounds input
+   (network-facing: every read is bounds-checked, NFR-SEC-POSTURE). A Result union
+   discriminator other than DDS_RETCODE_OK selects no arm (the union has only that case,
+   §7.6.3.3.3) and yields an empty RESULT."
   (let ((len (length octets)))
     (when (< len 8) (return-from parse-type-lookup-reply nil))
-    ;; encapsulation: D_CDR2_LE only (what we emit; other encodings CONFIRM-VS-PEER)
-    (unless (and (= (aref octets 0) (ldb (byte 8 8) +tl-encap-d-cdr2-le+))
-                 (= (aref octets 1) (ldb (byte 8 0) +tl-encap-d-cdr2-le+)))
+    ;; encapsulation: CDR2_LE only (what we emit; other encodings CONFIRM-VS-PEER)
+    (unless (and (= (aref octets 0) (ldb (byte 8 8) +tl-encap-cdr2-le+))
+                 (= (aref octets 1) (ldb (byte 8 0) +tl-encap-cdr2-le+)))
       (return-from parse-type-lookup-reply nil))
     (let* ((buf (dds.core.buffer:make-octet-buffer len))
            (c (dds.core.buffer:cursor buf :endianness :little)))
@@ -625,35 +637,41 @@
                (progn
                  (dds.core.buffer:cursor-set-position c 4)
                  (dds.core.buffer:cursor-set-origin c)
-                 (let* ((tsize (dds.cdr:cdr-get-dheader c :xcdr2))
-                        (tend (+ (dds.core.buffer:cursor-position c) tsize)))
-                   (when (or (> tend len) (< tsize 28))
-                     (return-from parse-type-lookup-reply nil))
-                   (let ((guid (make-array 16 :element-type '(unsigned-byte 8))))
-                     (dds.core.buffer:get-octets c guid 0 16)
-                     (let* ((high (dds.cdr:cdr-get-i32 c :xcdr2))
-                            (low (dds.cdr:cdr-get-u32 c :xcdr2))
-                            (sn (+ low (* high #x100000000)))
-                            (rex (%tl-remote-ex-keyword (dds.cdr:cdr-get-u32 c :xcdr2))))
-                       (unless rex (return-from parse-type-lookup-reply nil))
-                       (cond
-                         ;; Return omitted (non-OK reply): header only inside the extent
-                         ((>= (dds.core.buffer:cursor-position c) tend)
-                          (values nil nil guid sn rex nil))
-                         (t
+                 ;; FINAL top level: the input extent is the bound (no top DHEADER)
+                 (let ((guid (make-array 16 :element-type '(unsigned-byte 8))))
+                   (dds.core.buffer:get-octets c guid 0 16)
+                   (let* ((high (dds.cdr:cdr-get-i32 c :xcdr2))
+                          (low (dds.cdr:cdr-get-u32 c :xcdr2))
+                          (sn (+ low (* high #x100000000)))
+                          (rex (%tl-remote-ex-keyword (dds.cdr:cdr-get-u32 c :xcdr2))))
+                     (unless rex (return-from parse-type-lookup-reply nil))
+                     (cond
+                       ;; Return omitted: valid only for a non-OK reply (header-only)
+                       ((>= (dds.core.buffer:cursor-position c) len)
+                        (if (eq rex :ok) nil (values nil nil guid sn rex nil)))
+                       (t
+                        ;; TypeLookup_Return: appendable union DHEADER bounds disc + arm
+                        (let* ((usize (dds.cdr:cdr-get-dheader c :xcdr2))
+                               (uend (+ (dds.core.buffer:cursor-position c) usize)))
+                          (when (> uend len) (return-from parse-type-lookup-reply nil))
                           (let ((disc (dds.cdr:cdr-get-u32 c :xcdr2)))
                             (cond
                               ((or (= disc +tl-gettypes-hash+) (= disc +tl-getdeps-hash+))
-                               (let ((op (if (= disc +tl-gettypes-hash+) :get-types :get-deps))
-                                     (ret (dds.cdr:cdr-get-i32 c :xcdr2)))
-                                 (if (/= ret +tl-retcode-ok+)
-                                     ;; no DDS_RETCODE_OK arm: bare Result discriminator
-                                     (values op nil guid sn rex nil)
-                                     (multiple-value-bind (result continuation ok)
-                                         (%tl-parse-out-struct c tend op)
-                                       (if ok
-                                           (values op result guid sn rex continuation)
-                                           nil)))))
+                               (let* ((op (if (= disc +tl-gettypes-hash+) :get-types :get-deps))
+                                      ;; TypeLookup_get*_Result: appendable union DHEADER
+                                      (rsize (dds.cdr:cdr-get-dheader c :xcdr2))
+                                      (rend (+ (dds.core.buffer:cursor-position c) rsize)))
+                                 (when (> rend uend)
+                                   (return-from parse-type-lookup-reply nil))
+                                 (let ((ret (dds.cdr:cdr-get-i32 c :xcdr2)))
+                                   (if (/= ret +tl-retcode-ok+)
+                                       ;; no DDS_RETCODE_OK arm: bare Result discriminator
+                                       (values op nil guid sn rex nil)
+                                       (multiple-value-bind (result continuation ok)
+                                           (%tl-parse-out-struct c rend op)
+                                         (if ok
+                                             (values op result guid sn rex continuation)
+                                             nil))))))
                               (t (values :unknown nil guid sn rex nil))))))))))
              (dds.core.buffer:buffer-overflow () nil))
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))

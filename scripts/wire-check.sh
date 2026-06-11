@@ -44,6 +44,9 @@ have 'submessageId: ACKNACK'                'ACKNACK submessage + SequenceNumber
 have 'CDR2_LE \(0x0007\)'                   'XCDR2 encapsulation = CDR2_LE (0x0007)'
 have 'PL_CDR_LE \(0x0003\)'                 'discovery encapsulation = PL_CDR_LE (0x0003)'
 have 'ENTITYID_BUILTIN_PARTICIPANT_WRITER'  'SPDP builtin writer EntityId recognized'
+have 'ENTITYID_TL_SVC_REQ_WRITER'           'TypeLookup builtin EntityIds recognized'
+have 'Type Lookup Request'                  'TypeLookup_Request payload dissected (CDR2_LE)'
+have 'Type Lookup Reply'                    'TypeLookup_Reply payload dissected (CDR2_LE)'
 lack 'encapsulation kind: Unknown'          'no Unknown encapsulation kind'
 lack 'Malformed'                            'no Malformed submessage'
 
