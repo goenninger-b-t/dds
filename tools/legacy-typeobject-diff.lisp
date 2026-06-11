@@ -70,6 +70,66 @@
             regions))
     (nreverse regions)))
 
+;;; -- structural localization helpers ------------------------------------
+
+(declaim (ftype (function (dds.types:lto-node integer &optional list) list) lto-node-path-at))
+(defun lto-node-path-at (root offset &optional ancestors)
+  "Return the deepest LTO-NODE containing OFFSET with its name-path from named ancestors.
+   A node contains OFFSET iff VALUE-START <= OFFSET < VALUE-END.  Walk children depth-first;
+   return (node . name-path) where name-path is the list of non-NIL names from root to that
+   node (nearest ancestor first = leftmost in the list).  Returns NIL if OFFSET not contained."
+  (when (and (>= offset (dds.types:lto-node-value-start root))
+             (< offset (dds.types:lto-node-value-end root)))
+    (let ((path (if (dds.types:lto-node-name root)
+                    (cons (dds.types:lto-node-name root) ancestors)
+                    ancestors)))
+      ;; try children depth-first; return deepest hit
+      (dolist (child (dds.types:lto-node-children root))
+        (let ((hit (lto-node-path-at child offset path)))
+          (when hit (return-from lto-node-path-at hit))))
+      ;; no child matched — this node is the deepest container
+      (cons root (nreverse path)))))
+
+(declaim (ftype (function (dds.types:lto-node integer integer) string) lto-localize-range))
+(defun lto-localize-range (tree start end)
+  "Describe the structural location of [START,END) within TREE as a human-readable string.
+   Uses the deepest node containing START (the most specific localization).  Falls back to
+   the node containing just START when START..END spans multiple nodes."
+  (declare (ignore end))
+  (let ((hit (lto-node-path-at tree start nil)))
+    (if (null hit)
+        (format nil "offset ~d (outside all parsed nodes)" start)
+        (destructuring-bind (node . path) hit
+          (let ((name (dds.types:lto-node-name node))
+                (vstart (dds.types:lto-node-value-start node))
+                (vend (dds.types:lto-node-value-end node)))
+            (format nil "node[~d..~d] name=~a path=(~{~a~^ > ~})"
+                    vstart vend (or name "?")
+                    path))))))
+
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (*))
+                           (simple-array (unsigned-byte 8) (*))
+                           list)
+                          t)
+                print-structural-annotations))
+(defun print-structural-annotations (a b regions)
+  "Given REGIONS (raw byte-diff list), tokenize A and B and annotate each region with the
+   deepest LTO-NODE that contains the changed range.  Falls back gracefully when either side
+   fails to tokenize."
+  (let ((ta (dds.types:tokenize-legacy-type-object a))
+        (tb (dds.types:tokenize-legacy-type-object b)))
+    (cond
+      ((or (null ta) (null tb))
+       (format t "  structural: (unparseable — raw diff only)~%"))
+      (t
+       (dolist (r regions)
+         (destructuring-bind (s e ha hb aa ab) r
+           (declare (ignore ha hb aa ab))
+           (let ((loc-a (lto-localize-range ta s e))
+                 (loc-b (lto-localize-range tb s e)))
+             (format t "  structural ~d..~d : A in ~a~%" s e loc-a)
+             (format t "             ~d..~d : B in ~a~%" s e loc-b))))))))
+
 ;;; -- main entry point ----------------------------------------------------
 
 (declaim (ftype (function ((array * (*))
@@ -86,10 +146,12 @@
 
    Equal-length case: prints every maximal run of differing offsets as
      offset-start..offset-end : A=[hex bytes] (ascii) / B=[hex bytes] (ascii)
+   followed by structural annotations locating each changed range to the deepest LTO-NODE.
    Returns the list of diff regions as (start end hex-a hex-b ascii-a ascii-b).
 
    Unequal-length case: prints the common-prefix length, common-suffix length, and the
-   differing middle region of each side (hex + ASCII).  Returns NIL."
+   differing middle region of each side (hex + ASCII), then structural annotations for the
+   middle region against both inflated buffers.  Returns NIL."
   (let* ((a (inflate-or-passthrough lb-a))
          (b (inflate-or-passthrough lb-b))
          (la (length a))
@@ -100,9 +162,11 @@
        (let ((regions (diff-equal-length a b)))
          (if (null regions)
              (format t "IDENTICAL — no differences~%")
-             (dolist (r regions)
-               (destructuring-bind (s e ha hb aa ab) r
-                 (format t "~d..~d : A=[~a] (~a) / B=[~a] (~a)~%" s e ha aa hb ab))))
+             (progn
+               (dolist (r regions)
+                 (destructuring-bind (s e ha hb aa ab) r
+                   (format t "~d..~d : A=[~a] (~a) / B=[~a] (~a)~%" s e ha aa hb ab)))
+               (print-structural-annotations a b regions)))
          regions))
       (t
        ;; find common prefix length
@@ -126,5 +190,10 @@
          (format t "Middle B (~d byte(s)): [~a] (~a)~%"
                  (- mb-end mb-start)
                  (hex-region b mb-start mb-end)
-                 (ascii-region b mb-start mb-end)))
+                 (ascii-region b mb-start mb-end))
+         ;; structural annotations on the differing middle
+         (print-structural-annotations a b
+           (list (list prefix (- la suffix)
+                       (hex-region a ma-start ma-end) (hex-region b mb-start mb-end)
+                       (ascii-region a ma-start ma-end) (ascii-region b mb-start mb-end)))))
        nil))))
