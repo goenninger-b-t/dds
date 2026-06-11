@@ -234,3 +234,219 @@ and live captures via `make corpus-capture` against our own `corpus_pub`.
   `src/dds-types/legacy-type-object.lisp` (`tokenize-legacy-type-object`).
 - **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked;
   all `rtiddsgen` output and the `corpus_pub` binary stay git-ignored (NFR-IP).
+
+### Experiment: C_Shape3 (+ a 5th member `long w`) — member counting + appended id
+
+- **IDL change** (`interop/connext/typeobject-corpus/Corpus.idl`): added
+  `@final struct C_Shape3 { @key string color; long x; long y; long shapesize; long w; }` —
+  C_Shape plus a trailing `long w`. Captured `corpus_pub 0 Square C_Shape3` ↔ `make
+  corpus-capture TOPIC=Square TYPE=C_Shape3 SECONDS=25` (loopback), then inflated +
+  tokenized (`inflate-type-object-lb` → `tokenize-legacy-type-object`); C_Shape3 inflates
+  to 592 octets (vs C_Shape 536).
+- **Captured PID_TYPE_OBJECT_LB (240 octets)**: `(1 0 0 0 80 2 0 0 225 0 0 0 120 218 99 172
+  231 96 0 1 21 38 6 6 38 48 139 133 65 12 72 50 2 197 57 129 116 13 35 132 13 2 10 32 113
+  176 44 3 67 167 140 225 234 237 252 250 151 65 106 156 227 131 51 18 11 82 141 25 160 250
+  24 193 166 64 0 136 159 130 198 79 5 153 5 84 196 202 128 48 91 5 108 54 4 8 67 233 138
+  171 62 105 150 76 91 42 217 128 236 228 252 156 252 34 44 230 51 213 35 204 16 129 217 193
+  0 50 155 21 236 159 10 34 245 48 33 233 169 36 160 71 6 42 198 12 213 195 5 164 139 65 33
+  80 156 89 149 74 164 125 44 72 246 149 227 208 3 195 32 81 97 168 26 144 41 37 72 225 166 3
+  118 187 48 74 120 137 130 220 83 82 148 153 151 30 111 100 106 26 159 156 145 88 148 152 92
+  146 90 68 40 126 120 128 48 21 42 3 18 63 1 21 255 143 228 30 152 126 1 32 22 131 154 1 75
+  11 32 121 0 25 248 54 140 0 0 0)`.
+- **Observed**: the member-list container (the node with `CODE 101`) has its first value
+  word = **5** (was 4 for C_Shape) — confirming **the container's first value word is the
+  member count**. The members tokenize in declaration order with the per-member id at the
+  member node's `VALUE-START+4`: `color 0, x 1, y 2, shapesize 3, w 4`. The appended `w`
+  took the next sequential id **4** — i.e. `@autoid(SEQUENTIAL)` assigns the **0-based
+  declaration index**, and a trailing append does not perturb the earlier ids.
+
+### Experiment: C_Shape4 (reorder x before the @key) — positional vs explicit id
+
+- **IDL change**: added `@final struct C_Shape4 { long x; @key string color; long y; long
+  shapesize; }` — C_Shape with `x` moved ahead of the `@key` member. Captured `corpus_pub 0
+  Square C_Shape4` ↔ `make corpus-capture TOPIC=Square TYPE=C_Shape4 SECONDS=25`; C_Shape4
+  inflates to 540 octets.
+- **Captured PID_TYPE_OBJECT_LB (232 octets)**: `(1 0 0 0 28 2 0 0 218 0 0 0 120 218 99 172
+  231 96 0 129 15 140 12 12 76 96 22 11 131 24 144 100 4 138 115 2 105 15 70 8 27 4 20 64
+  226 96 89 6 6 245 93 42 223 158 238 125 252 17 164 198 57 62 56 35 177 32 213 132 1 170
+  143 17 108 10 4 128 248 41 104 252 84 32 253 6 42 6 51 91 132 1 1 88 129 16 228 150 10 44
+  230 49 213 35 244 168 128 221 3 193 194 80 249 138 171 62 105 150 76 91 42 217 128 236 228
+  252 156 252 34 2 102 192 236 101 66 178 183 146 128 30 25 168 24 51 84 15 23 144 46 6 133
+  64 113 102 85 42 14 189 48 12 18 21 134 170 1 153 86 130 20 6 58 96 119 8 163 248 67 20 100
+  118 73 81 102 94 122 188 145 169 105 124 114 70 98 81 98 114 73 106 17 161 176 230 1 194 84
+  168 12 72 252 4 84 252 63 146 123 96 250 5 128 88 12 106 6 44 94 65 242 0 69 46 58 13 0 0)`.
+- **Observed**: the members tokenize in declaration order with ids `x 0, color 1, y 2,
+  shapesize 3`. `color`'s id moved **0→1** when it moved to declaration index 1, and `x`'s
+  moved **1→0** — so **the member id is POSITIONAL** (the declaration index), NOT a stable
+  per-member assignment carried across a reorder. The member node's `VALUE-START+0` word is
+  the `@key` flag (color/`@key` = 1, the longs = 0); the **id is the `VALUE-START+4` word**,
+  consistent across both the key/string member layout and the plain-`long` member layout.
+
+### Conclusion — legacy-TypeObject struct skeleton (Task 2.1, drives `parse-legacy-type-object`)
+
+Combining the three experiments (the type-name node + the member-id encoding; offsets cite
+the 536-octet C_Shape inflate):
+
+- **Type name**: the struct-definition node is the unique LONG node with `CODE 9`; its
+  **first NAMED child** carries the qualified type name (`C_Shape` @ value `[48..76]`,
+  len-prefixed `08 00 00 00 "C_Shape\0"`).
+- **Members**: the struct node's child with `CODE 101` is the member-list container; its
+  **NAMED `CODE 0` children** are the members in declaration order (the interleaved unnamed
+  `CODE 0`/`CODE 1` and SHORT nodes are framing/terminators, not members). The container's
+  first value word is the member count (cross-check). Each member node carries the **0-based
+  declaration-order member id** as the u32 at `VALUE-START+4` (the `100`/`101` values seen in
+  the framing dump are node **CODE**s — container kinds — NOT member ids; the member nodes are
+  `CODE 0`). The id is positional (C_Shape4) and sequential-on-append (C_Shape3).
+- **Extensibility**: every captured corpus type is `@final`; `parse-legacy-type-object`
+  defaults `:final` for Task 2.1 and leaves `@appendable`/`@mutable` derivation (the
+  struct-node flag field) to Task 2.4.
+- **Out of scope here**: member TYPES (the `05 00 05 00` / `13 00 00 00` / 8-octet type-hash
+  descriptors in the member node values) are NOT decoded — that is Task 2.2/2.3; the parsed
+  member `type-identifier` slot is left NIL. →
+  `src/dds-types/legacy-type-object.lisp` (`parse-legacy-type-object`).
+- **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked;
+  the C_Shape3/C_Shape4 `rtiddsgen` output and the `corpus_pub` binary stay git-ignored (NFR-IP).
+
+### Experiment set: C_ShapeP_<prim> — primitive member type-kind (Task 2.2, 2026-06-11)
+
+- **IDL change** (`interop/connext/typeobject-corpus/Corpus.idl`): added one
+  `@final struct C_ShapeP_<prim> { @key string color; <prim> x; long y; long shapesize; }`
+  per primitive — each is C_Shape with member `x` (a `long` in the base) RETYPED to one
+  primitive, isolating the type-kind change in member x's node. Built with
+  `make -C interop/connext/typeobject-corpus` (rtiddsgen 4.3.1) and captured each live via
+  `corpus_pub 0 Square C_ShapeP_<prim>` ↔ `make corpus-capture TOPIC=Square TYPE=C_ShapeP_<prim>
+  SECONDS=20` (loopback), then `inflate-type-object-lb` + `tokenize-legacy-type-object`.
+- **Localization**: in every capture, member x's node value (the `CODE 0` named member node)
+  has the fixed layout `[ @key:u32 @ +0 ][ id:u32 @ +4 ][ KIND:u16 @ +8 ][ KIND:u16 @ +10
+  (repeated) ][ name-len:u32 @ +12 ][ name… ]`. The base `long x` node was
+  `00 00 00 00 | 01 00 00 00 | 05 00 05 00 | 02 00 00 00 | 78 00 00 00` (id=1, kind=`05 00`,
+  name-len=2 "x\0"). Retyping x changed ONLY the `+8`/`+10` kind word; id, name-len and name
+  were unchanged. So **the primitive type-kind is the u16 at the member node's VALUE-START+8**
+  (redundantly repeated at +10).
+- **RTI kind octet → keyword (the differential, member x node `+8` u16, low octet):**
+
+  | IDL primitive       | x-node bytes (`+0..`)                                   | RTI kind | our keyword | +tk-* (octet) |
+  |---------------------|---------------------------------------------------------|----------|-------------|---------------|
+  | `boolean`           | `00..|01..|`**`01 00 01 00`**`|02..`                    | `0x01`   | `:bool`     | TK_BOOLEAN 0x01 |
+  | `octet`             | `00..|01..|`**`02 00 02 00`**`|02..`                    | `0x02`   | `:u8`       | TK_BYTE 0x02 |
+  | `short`             | `00..|01..|`**`03 00 03 00`**`|02..`                    | `0x03`   | `:i16`      | TK_INT16 0x03 |
+  | `unsigned short`    | `00..|01..|`**`04 00 04 00`**`|02..`                    | `0x04`   | `:u16`      | TK_UINT16 0x06 |
+  | `long` (base)       | `00..|01..|`**`05 00 05 00`**`|02..`                    | `0x05`   | `:i32`      | TK_INT32 0x04 |
+  | `unsigned long`     | `00..|01..|`**`06 00 06 00`**`|02..`                    | `0x06`   | `:u32`      | TK_UINT32 0x07 |
+  | `long long`         | `00..|01..|`**`07 00 07 00`**`|02..`                    | `0x07`   | `:i64`      | TK_INT64 0x05 |
+  | `unsigned long long`| `00..|01..|`**`08 00 08 00`**`|02..`                    | `0x08`   | `:u64`      | TK_UINT64 0x08 |
+  | `float`             | `00..|01..|`**`09 00 09 00`**`|02..`                    | `0x09`   | `:f32`      | TK_FLOAT32 0x09 |
+  | `double`            | `00..|01..|`**`0A 00 0A 00`**`|02..`                    | `0x0A`   | `:f64`      | TK_FLOAT64 0x0A |
+  | `char`              | `00..|01..|`**`0C 00 0C 00`**`|02..`                    | `0x0C`   | `:char`     | TK_CHAR8 0x10 |
+
+- **Key finding**: the kind octet is **RTI's OWN internal primitive enumeration, NOT the XTypes
+  TK_* octets** — they coincide for boolean/byte/short/int64/uint64/float32/float64 but DIVERGE
+  for long (RTI 5 vs TK_INT32 4), unsigned long (RTI 6 vs TK_UINT32 7), unsigned short (RTI 4 vs
+  TK_UINT16 6) and char (RTI 0x0C vs TK_CHAR8 0x10). The table `*lto-primitive-kind-keyword*` maps
+  RTI's octet to our `primitive-type-identifier` keyword, which then yields the correct in-memory
+  `+tk-*+` kind. → `src/dds-types/legacy-type-object.lisp` (`%lto-member-type-identifier`).
+- **Gaps**: `int8`/`uint8` were NOT captured (corpus uses `octet` for the 8-bit kind). Per RTI's
+  Extensible Types Guide (cited earlier in this file) `int8`/`uint8` map to `octet` on the wire,
+  i.e. RTI kind `0x02` (TK_BYTE) — consistent with the `octet` capture above; untested here, so
+  recorded as a fail-open gap. RTI value `0x0B` (`char16`/`wchar`) and `0x0A`-vs-`0x0B` boundaries
+  were not exercised; any kind not in the table is treated as non-primitive (TI left NIL).
+- **C_Shape-string-handling decision (a)**: a member whose `+8` kind word is not in the primitive
+  table — the `@key string color` member, whose node instead carries `13 00 00 00` + an 8-octet
+  type-hash at `+8` — leaves its `type-identifier` NIL and parsing CONTINUES (it does NOT make the
+  whole parse `:unsupported`). So the base C_Shape still parses (color NIL; x/y/shapesize TK_INT32)
+  while the primitive variants assert their kinds. Task 2.3 decodes string/sequence/nested members;
+  a TRULY unmodelable kind becomes `:unsupported` then.
+- **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked; all
+  `rtiddsgen` output and the `corpus_pub` binary stay git-ignored (NFR-IP).
+
+### Experiment set: C_ShapeS32 / C_ShapeS300 / C_ShapeNoKey — string bound + @key flag (Task 2.3, 2026-06-11)
+
+- **IDL change** (`interop/connext/typeobject-corpus/Corpus.idl`): three differentials of the base
+  `C_Shape` (`@key string color; long x,y,shapesize`):
+  - `C_ShapeS32` — `color` is `string<32>` (bounded).
+  - `C_ShapeS300` — `color` is `string<300>` (bounded > 255, forces the large form in our model).
+  - `C_ShapeNoKey` — `color` is a plain `string` (not @key); the @key moves to `long x`.
+  Each captured live: `corpus_pub 0 Square <type>` ↔ `make corpus-capture TOPIC=Square TYPE=<type>
+  SECONDS=30` (loopback), then `inflate-type-object-lb` + `tokenize-legacy-type-object`. (RTI
+  install at `/Applications/rti_connext_dds-7.3.1`, arch `arm64Darwin20clang12.0`; corpus_pub's
+  `@loader_path` RTI dylibs were symlinked next to the binary — git-ignored — since macOS SIP
+  strips `DYLD_LIBRARY_PATH`.) Cross-check: `Corpus.cxx` generated
+  `initialize_string_typecode((32L))` / `((300L))` / `((255L))` respectively — confirming
+  C_ShapeNoKey's `color` stays the RTI-default 255.
+- **String-bound localization — the bound is NOT inline in the member node.** The string member
+  node (the `CODE 0` named member whose `+8` kind u16 is `0x13`) has the layout
+  `[ @key:u32 @+0 ][ id:u32 @+4 ][ kind=0x13:u16 @+8 ][ 0:u16 @+10 ][ 0:u32 @+12 ][ 8-octet
+  type-hash @+16 ][ name-len:u32 @+28 ][ name… ]`. The 8-octet hash at `+16` REFERENCES a separate
+  **string-definition node** (`CODE 8`, `+lto-code-string-def+`): that node's `CODE 0` child
+  echoes the same 8-octet hash at its own `VALUE-START+8` and carries the `string_<N>_character`
+  name; its `CODE 100` child holds the element kind (`0C 00` = char); and its **`CODE 200` child
+  (`+lto-code-string-bound+`) holds the bound as a u32 at its `VALUE-START`**. Evidence (the
+  `CODE 200` child's bound u32): C_Shape `FF 00 00 00` = **255**; C_ShapeS32 `20 00 00 00` = **32**;
+  C_ShapeS300 `2C 01 00 00` = **300**. Member-node `+8` kind, id, name-len and the hash mechanism
+  were unchanged across all three — only the referenced node's `CODE 200` value moved.
+- **Small/large threshold — RTI uses a u32 bound at ALL magnitudes; the small/large split is OURS.**
+  32, 255, and 300 are all encoded as a plain little-endian u32 in the `CODE 200` child; RTI's
+  legacy encoding has NO small/large byte-form distinction. The XTypes 255 boundary (idl §56-70,
+  `TI_STRING8_SMALL` SBound ≤255 vs `TI_STRING8_LARGE` LBound >255) is applied only when we BUILD
+  the in-memory `type-identifier` (`string8-type-identifier`): bound 32/255 → `+ti-string8-small+`,
+  bound 300 → `+ti-string8-large+`. The decoder reads RTI's u32 and selects our kind by `> 255`.
+- **@key flag localization — the member node's `+0` word.** Across all members of all four types,
+  the `VALUE-START+0` u32 is **1 for the @key member, 0 for the rest**:
+  - C_Shape / C_ShapeS32 / C_ShapeS300: `color +0=1`, `x/y/shapesize +0=0`.
+  - C_ShapeNoKey: `color +0=0`, `x +0=1`, `y/shapesize +0=0` — confirming the @key moved to `x`
+    drops color's `+0` to 0 and raises x's to 1, both directions.
+  This corroborates the Task 2.1 note (color/`@key`=1, the longs=0) and is now DECODED into
+  `minimal-struct-member-key-p` via `%lto-member-key-p`.
+- **Decode** → `src/dds-types/legacy-type-object.lisp`: `%lto-member-type-identifier` (string arm),
+  `%lto-find-string-bound` (hash→string-def→bound, every span bounds-checked), `%lto-member-key-p`,
+  and constants `+lto-member-kind-string+` (0x13), `+lto-code-string-def+` (8), `+lto-code-string-bound+`
+  (200). The model constructor `string8-type-identifier` lives in `src/dds-types/xtypes.lisp`.
+- **Gaps**: only the `char`-element narrow `string` (RTI element kind `0x0C`) was exercised;
+  `wstring` (`string16`) and a string with a non-default element were NOT captured. A string member
+  whose referenced string-def node or `CODE 200` bound child is missing leaves its `type-identifier`
+  NIL (fail-open, parsing continues) — recorded as a gap, not an error.
+- **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked; all
+  `rtiddsgen` output, the `corpus_pub` binary, and the symlinked RTI dylibs stay git-ignored (NFR-IP).
+
+### Experiment set: C_ShapeAppend / C_ShapeMutable — struct extensibility flag (Task 2.4, 2026-06-11)
+
+- **IDL change** (`interop/connext/typeobject-corpus/Corpus.idl`): two differentials of the base
+  `C_Shape` (`@key string color; long x,y,shapesize`) with only the struct extensibility changed:
+  - `C_ShapeAppend` — `@appendable struct` (members otherwise identical to the base).
+  - `C_ShapeMutable` — `@mutable struct` (members otherwise identical).
+  Each captured live: `corpus_pub 0 Square <type>` ↔ `make corpus-capture TOPIC=Square TYPE=<type>
+  SECONDS=25` (loopback), then `inflate-type-object-lb` + `tokenize-legacy-type-object`. (RTI
+  install at `/Applications/rti_connext_dds-7.3.1`, arch `arm64Darwin20clang12.0`; the `@loader_path`
+  RTI dylibs were symlinked next to `corpus_pub` — git-ignored — since macOS SIP strips
+  `DYLD_LIBRARY_PATH`.)
+- **Extensibility-flag localization — the FIRST child of the struct-def node (CODE 9).** The
+  struct-definition node (`+lto-code-struct+` = 9) has as its FIRST child a `LONG` `CODE 0` node
+  (the one carrying the struct type-name). The **u16 at that first child's `VALUE-START+0`** is the
+  extensibility flag; the u16 at `+2` is a constant `0x0016` (then the type-name follows). The
+  member nodes were **byte-for-byte identical** across @final/@appendable/@mutable — only this flag
+  word and the type-name string changed; @mutable did NOT alter member encoding here.
+- **Wire values** (the first-child `VALUE-START+0` u16):
+  - `@final` (base `C_Shape`):    **0x0001**
+  - `@appendable` (`C_ShapeAppend`): **0x0000**
+  - `@mutable` (`C_ShapeMutable`):  **0x0002**
+  This is RTI's OWN internal extensibility enumeration (`appendable=0, final=1, mutable=2`), NOT the
+  XTypes `IS_FINAL`/`IS_APPENDABLE`/`IS_MUTABLE` struct-flag bits (XCDR2 TypeObject, `typeobject-cdr.lisp`:
+  final=0x0001, appendable=0x0002, mutable=0x0004) — the two enumerations COINCIDE only for `final`
+  and DIFFER for the others, so the value must be read from this differential, never assumed from the
+  XTypes flag. The high `0x0016` halfword is opaque (not interpreted).
+- **Decode** → `src/dds-types/legacy-type-object.lisp`: `%lto-struct-extensibility` reads the u16 at
+  the struct-def node's first `CODE 0` child's `VALUE-START+0` (bounds-checked against that child's
+  `VALUE-END` FIRST), mapping `0→:appendable, 1→:final, 2→:mutable`; any other value (or an OOB/missing
+  read) → `:final` (fail-open: `:final` is the strictest extensibility for gating, so a wrong-but-final
+  guess never widens evolution rules). `parse-legacy-type-object` replaces its hardcoded `:final` with
+  this decode. The parsed model is the SAME `minimal-struct-type` the local generator builds, so it
+  flows into `struct-assignable-from` (`assignability.lisp`) unchanged — the assignability gate keys
+  off `minimal-struct-type-extensibility` (same-extensibility precondition + FINAL/APPENDABLE/MUTABLE
+  member-matching) directly on the wire-derived value.
+- **Gaps**: only flat-struct extensibility was exercised. `@mutable` here left member encoding identical
+  to `@final` (the corpus members are scalar/string); a `@mutable` struct with members that DO carry
+  explicit per-member EMHEADER-like ids (e.g. optional/large members) was NOT captured — if such a
+  member-encoding divergence exists it is unexercised and would be a Stage-3+ finding. Unknown flag
+  values fail open to `:final` (recorded above).
+- **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked; all
+  `rtiddsgen` output, the `corpus_pub` binary, and the symlinked RTI dylibs stay git-ignored (NFR-IP).

@@ -24,15 +24,16 @@
            ;; XTypes structural TypeIdentifier / TypeObject model (FR-TYPE-2)
            #:type-identifier #:type-identifier-p #:type-identifier-kind
            #:type-identifier-bound #:type-identifier-element #:type-identifier-hash
-           #:primitive-type-identifier #:sequence-type-identifier #:hash-type-identifier
+           #:primitive-type-identifier #:string8-type-identifier
+           #:sequence-type-identifier #:hash-type-identifier
            #:type-identifier= #:type-identifier-referenced
            #:member-name-hash
-           #:minimal-struct-member #:make-struct-member
+           #:minimal-struct-member #:make-struct-member #:minimal-struct-member-p
            #:minimal-struct-member-name #:minimal-struct-member-id
            #:minimal-struct-member-type-identifier #:minimal-struct-member-key-p
            #:minimal-struct-member-optional-p #:minimal-struct-member-must-understand-p
            #:minimal-struct-member-name-hash
-           #:minimal-struct-type #:make-minimal-struct-type
+           #:minimal-struct-type #:make-minimal-struct-type #:minimal-struct-type-p
            #:minimal-struct-type-name #:minimal-struct-type-extensibility
            #:minimal-struct-type-members
            ;; XTypes type assignability + TYPE_CONSISTENCY_ENFORCEMENT (FR-TYPE-4)
@@ -65,10 +66,13 @@
            #:type-support-fingerprint-names #:assess-type-object-lb
            ;; Legacy-TypeObject structural TLV tokenizer (ADR 0009, NFR-SEC-POSTURE)
            #:tokenize-legacy-type-object
+           ;; Legacy-TypeObject semantic interpreter — struct skeleton (ADR 0009)
+           #:parse-legacy-type-object
            #:lto-node #:lto-node-p #:lto-node-tag #:lto-node-code
            #:lto-node-value-start #:lto-node-value-end #:lto-node-children #:lto-node-name
            #:*lto-max-depth* #:*lto-max-elements* #:*lto-max-string-bytes*
            #:+tk-boolean+ #:+tk-byte+ #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
            #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
+           #:+tk-float32+ #:+tk-float64+ #:+tk-char8+
            #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+
            #:+ti-string8-small+ #:+ti-string8-large+ #:+ti-plain-sequence-small+))

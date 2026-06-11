@@ -90,6 +90,14 @@
             (ash (aref octets (+ pos 2)) 16)
             (ash (aref octets (+ pos 3)) 24))))
 
+(defun* %lto-u16 (octets pos end)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0 #.array-dimension-limit) (integer 0 #.array-dimension-limit))
+              (or null (unsigned-byte 16)))
+  "The little-endian u16 at OCTETS[POS..POS+2), or NIL if [POS,POS+2) is not wholly within
+   [0,END) — bounds-checked before trusting the 2-octet field (NFR-SEC-POSTURE)."
+  (when (and (<= 0 pos) (<= (+ pos 2) end))
+    (logior (aref octets pos) (ash (aref octets (+ pos 1)) 8))))
+
 (defun* %lto-read-name (octets pos end)
     (function ((simple-array (unsigned-byte 8) (*)) (integer 0 #.array-dimension-limit) (integer 0 #.array-dimension-limit))
               (values (or null string) (integer 0 #.array-dimension-limit)))
@@ -200,3 +208,239 @@
       (return-from tokenize-legacy-type-object nil))
     (%make-lto-node :tag 0 :code 0 :value-start 0 :value-end end
                     :children (nreverse children) :name nil)))
+
+;;;; Semantic interpreter, stage 2 part 1 (legacy-TypeObject Task 2.1): fold the tokenized
+;;;; legacy-TypeObject tree into a MINIMAL-STRUCT-TYPE skeleton — the type name, member
+;;;; names, and member ids — MIRRORING parse-minimal-type-object's contract (typeobject-cdr.lisp):
+;;;; minimal-struct-type on success, :UNSUPPORTED on a recognized-but-unmodeled shape, NIL on
+;;;; malformed/untokenizable input. Member TYPES are NOT decoded here (the member type-identifier
+;;;; is left NIL; that is Task 2.2/2.3); extensibility is decoded from the struct-node flag
+;;;; (Task 2.4: @final/@appendable/@mutable). Clean-room: the node mapping below is derived
+;;;; ONLY from captured bytes + the C_Shape / C_Shape3 / C_Shape4 differential experiments
+;;;; (docs/provenance.md 2026-06-11), no RTI source / GPL dissector.
+;;;; STRUCTURE (offsets cite the 536-octet C_Shape inflate; identical across the C_Shape3/4
+;;;; variants): the struct definition is the unique LONG node with CODE +LTO-CODE-STRUCT+ (9);
+;;;; its first NAMED child carries the struct type name; its child with CODE +LTO-CODE-MEMBERS+
+;;;; (101) is the member-list container whose NAMED CODE-0 children are the members in order.
+;;;; Each member node's value carries the 0-based declaration-order member id as the u32 at
+;;;; VALUE-START+4 (the +0 word is the @key flag — not interpreted here). The C_Shape4 reorder
+;;;; (x first, @key color second) proved the id is POSITIONAL (declaration index, autoid
+;;;; SEQUENTIAL), not a stable per-member assignment: color's id moved 0->1 when it moved to
+;;;; declaration index 1. The container's first value word is the member count (cross-check only).
+
+(defconstant +lto-code-struct+ 9
+  "Legacy-TypeObject node CODE marking the struct-definition node (the one whose first named
+   child is the type name and which holds the member-list container). Reverse-engineered from
+   the Connext wire (clean-room, docs/provenance.md 2026-06-11), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-members+ 101
+  "Legacy-TypeObject node CODE marking the member-list container (its named CODE-0 children
+   are the struct members, its first value word the member count). Reverse-engineered from the
+   Connext wire (clean-room, docs/provenance.md 2026-06-11), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-string-def+ 8
+  "Legacy-TypeObject node CODE marking a STRING-definition node: a string member's node carries
+   an 8-octet type-hash (at member VALUE-START+16) referencing this node, whose CODE-0 child
+   echoes that hash at its VALUE-START+8 and whose CODE-200 child holds the string bound (u32).
+   Reverse-engineered clean-room from the C_Shape / C_ShapeS32 / C_ShapeS300 differentials
+   (docs/provenance.md 2026-06-11), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-string-bound+ 200
+  "Legacy-TypeObject node CODE marking the string-bound child of a +LTO-CODE-STRING-DEF+ node:
+   the string bound is the u32 at this child's VALUE-START (255 for an unbounded string — RTI's
+   default — 32 / 300 for string<32>/string<300>; ALWAYS a u32 regardless of magnitude — the
+   small/large split is OUR XTypes model, not RTI's wire). Reverse-engineered clean-room from
+   the C_ShapeS32 / C_ShapeS300 differentials (docs/provenance.md 2026-06-11), NOT an OMG constant.")
+
+(defconstant +lto-member-kind-string+ #x13
+  "Legacy-TypeObject member type-kind u16 (at a member node's VALUE-START+8) marking a STRING8
+   member: its bound lives in a referenced +LTO-CODE-STRING-DEF+ node (NOT inline). Reverse-
+   engineered clean-room from the C_Shape capture (docs/provenance.md 2026-06-11), NOT an OMG constant.")
+
+(defun* %lto-member-id (octets node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node) (or null (unsigned-byte 32)))
+  "The 0-based declaration-order member id encoded as the u32 at the member NODE's VALUE-START+4
+   (docs/provenance.md 2026-06-11), or NIL if that field falls outside the node's value extent
+   — bounds-checked against VALUE-END FIRST (NFR-SEC-POSTURE)."
+  (%lto-u32 octets (+ (lto-node-value-start node) 4) (lto-node-value-end node)))
+
+(defun* %lto-member-key-p (octets node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node) t)
+  "T iff member NODE is a @key member: the u32 @key flag at the member node's VALUE-START+0 is
+   non-zero (1 for the key member, 0 otherwise — docs/provenance.md 2026-06-11). NIL if that
+   field is OOB — bounds-checked against VALUE-END FIRST (NFR-SEC-POSTURE)."
+  (let ((flag (%lto-u32 octets (lto-node-value-start node) (lto-node-value-end node))))
+    (and flag (/= flag 0))))
+
+(defparameter *lto-primitive-kind-keyword*
+  '((#x01 . :bool) (#x02 . :u8) (#x03 . :i16) (#x04 . :u16) (#x05 . :i32)
+    (#x06 . :u32) (#x07 . :i64) (#x08 . :u64) (#x09 . :f32) (#x0A . :f64) (#x0C . :char))
+  "RTI legacy-TypeObject primitive type-kind octet -> our PRIMITIVE-TYPE-IDENTIFIER keyword.
+   This is RTI's OWN internal type-kind enumeration (NOT the XTypes TK_* octets — they differ,
+   e.g. RTI long=5 vs XTypes TK_INT32=4, RTI char=0x0C vs TK_CHAR8=0x10). Reverse-engineered
+   clean-room from the C_ShapeP_<prim> differentials (each retypes member x; the kind sits at
+   the member node's VALUE-START+8 as a u16, repeated at +10): boolean 1, octet 2, short 3,
+   unsigned short 4, long 5, unsigned long 6, long long 7, unsigned long long 8, float 9,
+   double 0x0A, char 0x0C (docs/provenance.md 2026-06-11). A kind not in this table (strings,
+   sequences, nested aggregates, char16/wstring/enum) is NON-PRIMITIVE here and leaves the
+   member type-identifier NIL — Task 2.3 decodes those. NOT an OMG-spec constant.")
+
+(defun* %lto-octets-equal-p (octets a-start b-start n end)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0 #.array-dimension-limit) (integer 0 #.array-dimension-limit) (integer 0 #.array-dimension-limit) (integer 0 #.array-dimension-limit)) t)
+  "T iff the N octets at OCTETS[A-START..) equal those at OCTETS[B-START..), with BOTH spans
+   wholly within [0,END) — bounds-checked FIRST (NFR-SEC-POSTURE); NIL if either span is OOB."
+  (and (<= 0 a-start) (<= (+ a-start n) end) (<= 0 b-start) (<= (+ b-start n) end)
+       (loop for i from 0 below n
+             always (= (aref octets (+ a-start i)) (aref octets (+ b-start i))))))
+
+(defun* %lto-find-string-bound (octets root member-node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node lto-node) (or null (unsigned-byte 32)))
+  "The string bound for a STRING member-node: read its 8-octet type-hash at VALUE-START+16,
+   find the +LTO-CODE-STRING-DEF+ node whose CODE-0 child echoes that hash at its VALUE-START+8,
+   and return the u32 bound at that node's +LTO-CODE-STRING-BOUND+ child's VALUE-START. NIL if
+   the hash, the referenced node, or the bound field is missing or OOB — every span bounds-checked
+   against the relevant VALUE-END FIRST (NFR-SEC-POSTURE). Clean-room (docs/provenance.md 2026-06-11)."
+  (let ((hash-pos (+ (lto-node-value-start member-node) 16))
+        (mend (lto-node-value-end member-node))
+        (buf-end (length octets)))
+    (when (> (+ hash-pos 8) mend)
+      (return-from %lto-find-string-bound nil))
+    (labels ((find-sdef (n)
+               (when (and (= (lto-node-tag n) +lto-tag-long+)
+                          (= (lto-node-code n) +lto-code-string-def+))
+                 (dolist (c (lto-node-children n))
+                   (when (and (= (lto-node-tag c) +lto-tag-long+) (= (lto-node-code c) 0)
+                              (%lto-octets-equal-p octets hash-pos
+                                                   (+ (lto-node-value-start c) 8) 8
+                                                   buf-end))
+                     (return-from find-sdef n))))
+               (dolist (ch (lto-node-children n))
+                 (let ((hit (find-sdef ch))) (when hit (return-from find-sdef hit))))
+               nil))
+      (let ((sdef (find-sdef root)))
+        (when sdef
+          (dolist (c (lto-node-children sdef))
+            (when (and (= (lto-node-tag c) +lto-tag-long+)
+                       (= (lto-node-code c) +lto-code-string-bound+))
+              (return-from %lto-find-string-bound
+                (%lto-u32 octets (lto-node-value-start c) (lto-node-value-end c))))))))
+    nil))
+
+(defun* %lto-member-type-identifier (octets root node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node lto-node) (or null type-identifier))
+  "The TypeIdentifier for a struct member NODE: a PRIMITIVE-TYPE-IDENTIFIER for a primitive
+   member, a STRING8 TypeIdentifier (with the decoded bound, small/large per the 255 threshold)
+   for a string member, else NIL. The type-kind is the u16 at the member node's VALUE-START+8
+   (the @key flag is +0, the id +4; the +10 copy is a redundant mirror, +8 is canonical). A
+   primitive kind maps via *LTO-PRIMITIVE-KIND-KEYWORD*; kind +LTO-MEMBER-KIND-STRING+ (0x13)
+   resolves the bound from the referenced +LTO-CODE-STRING-DEF+ node (%LTO-FIND-STRING-BOUND)
+   under ROOT. Returns NIL for any other non-primitive member (sequence/nested — Task 3.x) or
+   when the kind field is OOB — bounds-checked against VALUE-END FIRST (NFR-SEC-POSTURE)."
+  (let ((kind (%lto-u16 octets (+ (lto-node-value-start node) 8) (lto-node-value-end node))))
+    (cond
+      ((null kind) nil)
+      ((= kind +lto-member-kind-string+)
+       (let ((bound (%lto-find-string-bound octets root node)))
+         (and bound (string8-type-identifier bound))))
+      (t (let ((kw (cdr (assoc kind *lto-primitive-kind-keyword*))))
+           (and kw (primitive-type-identifier kw)))))))
+
+(defparameter *lto-extensibility-keyword*
+  '((0 . :appendable) (1 . :final) (2 . :mutable))
+  "RTI legacy-TypeObject struct extensibility flag (u16) -> our minimal-struct-type extensibility
+   keyword. This is RTI's OWN internal enumeration (appendable 0, final 1, mutable 2), NOT the
+   XTypes IS_FINAL/IS_APPENDABLE/IS_MUTABLE struct-flag bits (typeobject-cdr.lisp: final 0x0001,
+   appendable 0x0002, mutable 0x0004 — they COINCIDE only for :final). Reverse-engineered clean-room
+   from the C_Shape (@final) / C_ShapeAppend (@appendable) / C_ShapeMutable (@mutable) differentials
+   (docs/provenance.md 2026-06-11), NOT an OMG-spec constant. A value not in this table -> :final
+   (fail-open; :final is the strictest extensibility for assignability gating).")
+
+(defun* %lto-struct-extensibility (octets sdef)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node) (member :final :appendable :mutable))
+  "The struct extensibility for struct-definition node SDEF: the u16 at VALUE-START+0 of SDEF's
+   first NAMED child (the type-name-bearing CODE-0 node) mapped via *LTO-EXTENSIBILITY-KEYWORD*
+   (docs/provenance.md 2026-06-11). Returns :FINAL when the flag is missing/OOB or carries an
+   unknown value (fail-open — :final is the strictest/safest for gating). Bounds-checked against
+   the child's VALUE-END FIRST (NFR-SEC-POSTURE)."
+  (let ((c0 (find-if #'lto-node-name (lto-node-children sdef))))
+    (or (and c0
+             (let ((flag (%lto-u16 octets (lto-node-value-start c0) (lto-node-value-end c0))))
+               (and flag (cdr (assoc flag *lto-extensibility-keyword*)))))
+        :final)))
+
+(defun* %lto-find-code (node code)
+    (function (lto-node (unsigned-byte 32)) (or null lto-node))
+  "The first descendant of NODE (pre-order, NODE included) whose TAG is +LTO-TAG-LONG+ and
+   whose CODE equals CODE, or NIL. CODE is read only for LONG nodes (the SHORT-node guard).
+   Note: code=0 is ambiguous (also the outer wrapper node), so do NOT pass 0 to locate members."
+  (when (and (= (lto-node-tag node) +lto-tag-long+) (= (lto-node-code node) code))
+    (return-from %lto-find-code node))
+  (dolist (c (lto-node-children node))
+    (let ((hit (%lto-find-code c code)))
+      (when hit (return-from %lto-find-code hit))))
+  nil)
+
+(defun* %lto-first-named (node)
+    (function (lto-node) (or null string))
+  "The NAME of the first NAMED child of NODE (the struct-definition node's type name), or NIL."
+  (dolist (c (lto-node-children node))
+    (when (lto-node-name c) (return-from %lto-first-named (lto-node-name c))))
+  nil)
+
+(defun* parse-legacy-type-object (octets)
+    (function ((simple-array (unsigned-byte 8) (*)))
+              (or null minimal-struct-type (member :unsupported)))
+  "Interpret an INFLATED RTI legacy TypeObject (the inflated PID_TYPE_OBJECT_LB / 0x8021
+   payload, ADR 0009) into a MINIMAL-STRUCT-TYPE skeleton: the struct type name, its member
+   names, member ids (0-based declaration order), member TypeIdentifiers, and @key flags. MIRRORS
+   parse-minimal-type-object's discipline: a minimal-struct-type on success, :UNSUPPORTED for a
+   tree that tokenizes but carries no recognizable struct shape (no +LTO-CODE-STRUCT+ node, no
+   member-list container, no type name), and NIL for input that does not tokenize cleanly
+   (bounds/framing/resource violation per TOKENIZE-LEGACY-TYPE-OBJECT). PRIMITIVE member
+   TYPE-IDENTIFIERs (Task 2.2) and STRING member TypeIdentifiers — with the decoded bound,
+   small/large per the 255 threshold (Task 2.3) — are decoded via %LTO-MEMBER-TYPE-IDENTIFIER;
+   a still-unmodeled non-primitive member (sequence/nested) leaves its type-identifier NIL pending
+   Task 3.x. Each member's @key flag is set from the wire (%LTO-MEMBER-KEY-P). EXTENSIBILITY is
+   decoded from the wire (%LTO-STRUCT-EXTENSIBILITY: :final/:appendable/:mutable; an unknown flag
+   fails open to :final). The node-to-model
+   mapping is reverse-engineered clean-room from the C_Shape / C_Shape3 / C_Shape4 / C_ShapeP_<prim>
+   / C_ShapeS32 / C_ShapeS300 / C_ShapeNoKey differentials (docs/provenance.md 2026-06-11): the
+   +LTO-CODE-STRUCT+ node's first named child is the type name; its +LTO-CODE-MEMBERS+ container's
+   named CODE-0 children are the members in order; each member's @key flag is the u32 at
+   VALUE-START+0, its id the u32 at VALUE-START+4, its type-kind the u16 at VALUE-START+8 (string
+   members reference a +LTO-CODE-STRING-DEF+ node for the bound). Pair OCTETS with INFLATE-TYPE-OBJECT-LB."
+  (let ((root (tokenize-legacy-type-object octets)))
+    (when (null root)
+      (return-from parse-legacy-type-object nil))
+    (let ((sdef (%lto-find-code root +lto-code-struct+)))
+      (when (null sdef)
+        (return-from parse-legacy-type-object :unsupported))
+      (let ((tname (%lto-first-named sdef))
+            (container (%lto-find-code sdef +lto-code-members+)))
+        (when (or (null tname) (null container))
+          (return-from parse-legacy-type-object :unsupported))
+        (let ((members '()))
+          (dolist (c (lto-node-children container))
+            ;; code=0 is the observed member discriminator (docs/provenance.md 2026-06-11)
+            (when (and (lto-node-name c) (= (lto-node-tag c) +lto-tag-long+)
+                       (= (lto-node-code c) 0))
+              (let ((id (%lto-member-id octets c)))
+                (when (null id)
+                  (return-from parse-legacy-type-object :unsupported))
+                (push (%make-minimal-struct-member
+                       :name (lto-node-name c) :id id
+                       ;; primitive/string members get a TI; other non-primitives (seq/nested) stay NIL (Task 3.x)
+                       :type-identifier (%lto-member-type-identifier octets root c)
+                       :key-p (%lto-member-key-p octets c)
+                       :name-hash (member-name-hash (lto-node-name c)))
+                      members))))
+          (when (null members)
+            (return-from parse-legacy-type-object :unsupported))
+          ;; cross-check: container's first value word is the declared member count (docs/provenance.md 2026-06-11)
+          (let ((wire-count (%lto-u32 octets (lto-node-value-start container)
+                                     (lto-node-value-end container))))
+            (when (and wire-count (/= wire-count (length members)))
+              (return-from parse-legacy-type-object :unsupported)))
+          (make-minimal-struct-type :name tname
+                                    :extensibility (%lto-struct-extensibility octets sdef)
+                                    :members (nreverse members)))))))

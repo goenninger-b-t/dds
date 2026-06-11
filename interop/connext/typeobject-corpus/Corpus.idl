@@ -34,3 +34,165 @@ struct C_Shape2 {
     long y;
     long shapesize;
 };
+
+// C_Shape3 — differential variant: C_Shape + a 5th member `long w`. Reveals how members
+// are counted/listed (the member-count word in the member-list container) and that the
+// appended member takes the next sequential id (4). Diff vs C_Shape (lto-diff).
+@final
+struct C_Shape3 {
+    @key string color;
+    long x;
+    long y;
+    long shapesize;
+    long w;
+};
+
+// C_Shape4 — differential variant: C_Shape with two members reordered (x before the key,
+// y/shapesize after). Reveals whether the member id is positional (declaration order) or a
+// stable per-member assignment: under @autoid(SEQUENTIAL) the id is the declaration index,
+// so reordering changes which member carries which id. Diff vs C_Shape (lto-diff).
+@final
+struct C_Shape4 {
+    long x;
+    @key string color;
+    long y;
+    long shapesize;
+};
+
+// C_ShapeP_<prim> — Task 2.2 primitive-kind differentials: each is C_Shape with member `x`
+// (a `long` in the base) RETYPED to one primitive. Diffing each inflated legacy TypeObject
+// against the base C_Shape localizes the type-kind word in member x's node and maps RTI's
+// encoding to our +tk-*+ octet (docs/provenance.md 2026-06-11). One struct per primitive so
+// each kind is isolated; corpus_pub selects by typename argv.
+@final
+struct C_ShapeP_short {
+    @key string color;
+    short x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeP_ushort {
+    @key string color;
+    unsigned short x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeP_ulong {
+    @key string color;
+    unsigned long x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeP_longlong {
+    @key string color;
+    long long x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeP_ulonglong {
+    @key string color;
+    unsigned long long x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeP_octet {
+    @key string color;
+    octet x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeP_float {
+    @key string color;
+    float x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeP_double {
+    @key string color;
+    double x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeP_boolean {
+    @key string color;
+    boolean x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeP_char {
+    @key string color;
+    char x;
+    long y;
+    long shapesize;
+};
+
+// C_ShapeS<N> — Task 2.3 string-bound differentials: C_Shape with `color` given an explicit
+// string bound. The base `string color` is unbounded -> RTI default bound 255; bounding it
+// localizes where the bound is encoded (the referenced string-definition node) and reveals
+// the small(<=255)/large(>255) form boundary. Diff each inflated TypeObject vs the base.
+@final
+struct C_ShapeS32 {
+    @key string<32> color;
+    long x;
+    long y;
+    long shapesize;
+};
+
+@final
+struct C_ShapeS300 {
+    @key string<300> color;
+    long x;
+    long y;
+    long shapesize;
+};
+
+// C_ShapeNoKey — Task 2.3 @key-flag differential: `color` is NOT @key; the key moves to `x`.
+// Reveals the @key flag encoding (the member node's +0 word: 1 for the key member, 0 for the
+// rest) by showing color's +0 word drop to 0 and x's rise to 1. Diff vs the base C_Shape.
+@final
+struct C_ShapeNoKey {
+    string color;
+    @key long x;
+    long y;
+    long shapesize;
+};
+
+// C_ShapeAppend / C_ShapeMutable — Task 2.4 extensibility differentials: C_Shape with the
+// struct extensibility changed to @appendable / @mutable (members otherwise identical). The
+// base C_Shape is @final, so diffing each inflated TypeObject vs the base localizes the
+// extensibility flag in the struct-definition node and reads its @final/@appendable/@mutable
+// wire values. A non-final struct may also change member encoding (mutable members carry
+// explicit member-ids); the extensibility flag itself is the deliverable. Diff vs C_Shape.
+@appendable
+struct C_ShapeAppend {
+    @key string color;
+    long x;
+    long y;
+    long shapesize;
+};
+
+@mutable
+struct C_ShapeMutable {
+    @key string color;
+    long x;
+    long y;
+    long shapesize;
+};

@@ -101,6 +101,60 @@ Cross-check (this stack, no external dissector):
 confirms the 255 default string bound above. (`x`/`y` are single-char member names below the
 `type-object-strings` min-length-3 filter; expected.) Later parser tasks embed this vector.
 
+## Differential variants (member id / member counting)
+
+`Corpus.idl` also carries three differential siblings of `C_Shape`, each capturable via the
+same `corpus_pub <domain> Square <typename>` ↔ `make corpus-capture` flow:
+
+- `C_Shape2` — `color` renamed to `colour` (localizes the member-name string).
+- `C_Shape3` — `C_Shape` + a 5th member `long w`. Proves the member-list container's first
+  value word is the **member count** and that an appended member takes the next sequential id
+  (`color 0, x 1, y 2, shapesize 3, w 4`).
+- `C_Shape4` — `C_Shape` with `x` moved ahead of the `@key color`. Proves the member id is
+  **positional** (the 0-based declaration index): `x 0, color 1, y 2, shapesize 3`.
+
+Captured vectors + the full analysis are in `docs/provenance.md` (2026-06-11); they drive
+`dds.types:parse-legacy-type-object` (the struct-skeleton interpreter, Task 2.1).
+
+### `C_ShapeP_<prim>` — primitive member type-kind (Task 2.2)
+
+Ten more siblings, each C_Shape with member `x` retyped to one primitive:
+`C_ShapeP_{short,ushort,ulong,longlong,ulonglong,octet,float,double,boolean,char}`. Diffing
+each against the base C_Shape localizes the primitive type-kind to member x's node at
+`VALUE-START+8` (a u16) and reveals RTI's OWN kind enumeration (boolean 1, octet 2, short 3,
+ushort 4, long 5, ulong 6, longlong 7, ulonglong 8, float 9, double 0x0A, char 0x0C — which
+DIFFERS from the XTypes TK_* octets). Captured vectors + the full RTI-kind→`+tk-*+` table are
+in `docs/provenance.md` (2026-06-11); they drive `%lto-member-type-identifier`. `int8`/`uint8`
+are not captured (corpus uses `octet`); per RTI's Extensible Types Guide they map to `octet`
+(kind 2) — recorded there as a fail-open gap.
+
+### `C_ShapeS32` / `C_ShapeS300` / `C_ShapeNoKey` — string bound + `@key` flag (Task 2.3)
+
+Three more siblings: `C_ShapeS32` (`color` is `string<32>`), `C_ShapeS300` (`string<300>`,
+bound > 255), and `C_ShapeNoKey` (`color` is a plain `string`, `@key` moved to `long x`). The
+string member's node carries kind `0x13` at `VALUE-START+8` plus an 8-octet type-hash at `+16`
+that references a string-definition node (`CODE 8`); that node's `CODE 200` child holds the bound
+as a u32 (255 default-unbounded / 32 / 300 — **always** a u32, the small/large split is ours).
+The `@key` flag is the u32 at the member node's `VALUE-START+0` (1 key / 0 non-key). Captured
+vectors + the full analysis are in `docs/provenance.md` (2026-06-11); they drive
+`%lto-member-type-identifier` (string arm) + `%lto-member-key-p`. Only the `char`-element narrow
+`string` was exercised; `wstring` / a non-default element are an untested gap. NOTE: on macOS the
+RTI dylibs use `@loader_path` install names and SIP strips `DYLD_LIBRARY_PATH`, so symlink
+`libnddscpp2.dylib` / `libnddsc.dylib` / `libnddscore.dylib` from `$NDDSHOME/lib/$CONNEXTDDS_ARCH`
+next to `corpus_pub` before running (git-ignored, like all build artifacts).
+
+### `C_ShapeAppend` / `C_ShapeMutable` — struct extensibility (Task 2.4)
+
+Two more siblings: `C_ShapeAppend` (`@appendable struct`) and `C_ShapeMutable` (`@mutable struct`),
+members otherwise identical to the base `@final` `C_Shape`. The extensibility flag is the u16 at the
+struct-definition node (`CODE 9`)'s **first `CODE 0` child's `VALUE-START+0`** — RTI's own enum
+(`@appendable`=0, `@final`=1, `@mutable`=2), which coincides with the XTypes `IS_*` struct-flag bits
+only for `:final`. The member encoding was **byte-identical** across all three (these scalar/string
+members do not change layout under `@mutable`). Captured vectors + the full analysis are in
+`docs/provenance.md` (2026-06-11); they drive `%lto-struct-extensibility`, completing the tier-1
+flat-struct parse (names / ids / primitives / strings / keys / extensibility) that feeds
+`struct-assignable-from`.
+
 ## Files
 
 `Corpus.idl`, `corpus_pub.cxx`, `USER_QOS_PROFILES.xml`, `Makefile`, `README.md` are the

@@ -80,8 +80,103 @@ int main(int argc, char **argv)
         return run_corpus<C_Shape2>(domain, topic, type, sample);
     }
 
+    if (type == "C_Shape3") {
+        C_Shape3 sample;
+        sample.color("BLUE");
+        sample.x(50); sample.y(50); sample.shapesize(30); sample.w(7);
+        return run_corpus<C_Shape3>(domain, topic, type, sample);
+    }
+
+    if (type == "C_Shape4") {
+        C_Shape4 sample;
+        sample.color("BLUE");
+        sample.x(50); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_Shape4>(domain, topic, type, sample);
+    }
+
+    // Task 2.2 primitive-kind differentials: each retypes member x to one primitive.
+    if (type == "C_ShapeP_short") {
+        C_ShapeP_short sample;
+        sample.color("BLUE"); sample.x(7); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_short>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeP_ushort") {
+        C_ShapeP_ushort sample;
+        sample.color("BLUE"); sample.x(7); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_ushort>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeP_ulong") {
+        C_ShapeP_ulong sample;
+        sample.color("BLUE"); sample.x(7); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_ulong>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeP_longlong") {
+        C_ShapeP_longlong sample;
+        sample.color("BLUE"); sample.x(7); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_longlong>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeP_ulonglong") {
+        C_ShapeP_ulonglong sample;
+        sample.color("BLUE"); sample.x(7); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_ulonglong>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeP_octet") {
+        C_ShapeP_octet sample;
+        sample.color("BLUE"); sample.x(7); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_octet>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeP_float") {
+        C_ShapeP_float sample;
+        sample.color("BLUE"); sample.x(7.0f); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_float>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeP_double") {
+        C_ShapeP_double sample;
+        sample.color("BLUE"); sample.x(7.0); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_double>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeP_boolean") {
+        C_ShapeP_boolean sample;
+        sample.color("BLUE"); sample.x(true); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_boolean>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeP_char") {
+        C_ShapeP_char sample;
+        sample.color("BLUE"); sample.x('Q'); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeP_char>(domain, topic, type, sample);
+    }
+
+    // Task 2.3 string-bound + @key-flag differentials.
+    if (type == "C_ShapeS32") {
+        C_ShapeS32 sample;
+        sample.color("BLUE"); sample.x(50); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeS32>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeS300") {
+        C_ShapeS300 sample;
+        sample.color("BLUE"); sample.x(50); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeS300>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeNoKey") {
+        C_ShapeNoKey sample;
+        sample.color("BLUE"); sample.x(50); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeNoKey>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeAppend") {
+        C_ShapeAppend sample;
+        sample.color("BLUE"); sample.x(50); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeAppend>(domain, topic, type, sample);
+    }
+    if (type == "C_ShapeMutable") {
+        C_ShapeMutable sample;
+        sample.color("BLUE"); sample.x(50); sample.y(50); sample.shapesize(30);
+        return run_corpus<C_ShapeMutable>(domain, topic, type, sample);
+    }
+
     std::cerr << "usage: " << argv[0] << " <domain> <topic> <typename>\n"
-              << "  unknown typename '" << type << "'; this build knows: C_Shape, C_Shape2\n"
+              << "  unknown typename '" << type << "'; this build knows: C_Shape, C_Shape2, C_Shape3, C_Shape4,\n"
+              << "  C_ShapeP_{short,ushort,ulong,longlong,ulonglong,octet,float,double,boolean,char},\n"
+              << "  C_ShapeS32, C_ShapeS300, C_ShapeNoKey, C_ShapeAppend, C_ShapeMutable\n"
               << "  (later corpus tasks add types to Corpus.idl + a dispatch arm here)\n";
     return 1;
 }

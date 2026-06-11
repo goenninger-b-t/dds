@@ -20,10 +20,10 @@
 (defconstant +tk-uint16+  #x06 "XTypes TypeKind octet TK_UINT16 (idl §13-51).")
 (defconstant +tk-uint32+  #x07 "XTypes TypeKind octet TK_UINT32 (idl §13-51).")
 (defconstant +tk-uint64+  #x08 "XTypes TypeKind octet TK_UINT64 (idl §13-51).")
-(defconstant +tk-float32+ #x09)
-(defconstant +tk-float64+ #x0a)
+(defconstant +tk-float32+ #x09 "XTypes TypeKind octet TK_FLOAT32 (idl §13-51).")
+(defconstant +tk-float64+ #x0a "XTypes TypeKind octet TK_FLOAT64 (idl §13-51).")
 (defconstant +tk-float128+ #x0b)
-(defconstant +tk-char8+   #x10)
+(defconstant +tk-char8+   #x10 "XTypes TypeKind octet TK_CHAR8 (idl §13-51).")
 (defconstant +tk-char16+  #x11)
 (defconstant +tk-string8+ #x20 "XTypes TypeKind octet TK_STRING8 (idl §13-51): narrow string.")
 (defconstant +tk-string16+ #x21)
@@ -60,19 +60,29 @@
   (hash nil :type (or null (array (unsigned-byte 8) (*))))
   (referenced nil :type t))
 
+(defun* string8-type-identifier (&optional (bound 0))
+    (function (&optional (integer 0)) type-identifier)
+  "A narrow-string (STRING8) TypeIdentifier with BOUND (0 = unbounded). KIND is
+   TI_STRING8_SMALL when BOUND <= 255 (the SBound form), TI_STRING8_LARGE when BOUND
+   > 255 (the LBound form) — the 255 small/large threshold of idl §56-70, mirroring
+   the %get-type-identifier/%put-type-identifier wire model (typeobject-cdr.lisp)."
+  (%make-type-identifier :kind (if (> bound 255) +ti-string8-large+ +ti-string8-small+)
+                         :bound bound))
+
 (defun* primitive-type-identifier (keyword)
     (function (keyword) type-identifier)
   "The TypeIdentifier for a primitive / string DSL member KEYWORD. :u8/:i8 map to
-   TK_BYTE (XTypes 1.3 has no distinct 8-bit int kind). :string is an unbounded STRING8."
-  (let ((tk (ecase keyword
-              (:bool +tk-boolean+) (:u8 +tk-byte+) (:i8 +tk-byte+)
-              (:i16 +tk-int16+) (:u16 +tk-uint16+)
-              (:i32 +tk-int32+) (:u32 +tk-uint32+)
-              (:i64 +tk-int64+) (:u64 +tk-uint64+)
-              (:string +tk-string8+))))
-    (if (= tk +tk-string8+)
-        (%make-type-identifier :kind +ti-string8-small+ :bound 0)   ; 0 = unbounded
-        (%make-type-identifier :kind tk))))
+   TK_BYTE (XTypes 1.3 has no distinct 8-bit int kind). :f32/:f64 are FLOAT32/FLOAT64,
+   :char is CHAR8. :string is an unbounded STRING8."
+  (if (eq keyword :string)
+      (string8-type-identifier 0)
+      (%make-type-identifier
+       :kind (ecase keyword
+               (:bool +tk-boolean+) (:u8 +tk-byte+) (:i8 +tk-byte+)
+               (:i16 +tk-int16+) (:u16 +tk-uint16+)
+               (:i32 +tk-int32+) (:u32 +tk-uint32+)
+               (:i64 +tk-int64+) (:u64 +tk-uint64+)
+               (:f32 +tk-float32+) (:f64 +tk-float64+) (:char +tk-char8+)))))
 
 (defun* sequence-type-identifier (element &optional (bound 0))
     (function (type-identifier &optional (integer 0)) type-identifier)
