@@ -5,7 +5,7 @@
 ;;;; interop gate: my shapes on the wire, watchable in a foreign Shapes tool.
 (defsystem "dds-shapes"
   :description "DDS.SHAPES — standalone Square/ShapeType pub/sub for interop."
-  :depends-on ("dds-core" "dds-cdr" "dds-gen" "dds-disc")
+  :depends-on ("dds-core" "dds-cdr" "dds-gen" "dds-disc" "dds-qos" "dds-types" "dds-dcps")
   :pathname "src/dds-shapes"
   :serial t
   :components ((:file "packages")

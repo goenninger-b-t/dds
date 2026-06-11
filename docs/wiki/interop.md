@@ -16,7 +16,17 @@ demos.
 make square-pub COLOR=BLUE     # publish an animated Square (ShapeType)
 make square-sub                # subscribe + print received shapes
 make square-spy                # discovery diagnostic: discovered participants + locators
+make gated-sub                 # DCPS-level type-GATED subscriber (FR-TYPE-4): the assignability
+                               # gate fires on a stock Connext peer's PID_TYPE_OBJECT_LB (0x8021)
 ```
+
+`make gated-sub` builds a **DCPS** participant (whose `create-participant` installs the
+FR-TYPE-4 assignability gate — the standalone `square-sub` is a bare `dds.disc` node with no
+gate) and binds a local type under a chosen wire topic/type-name. Override
+`LOCALTYPE=shape-type` (the compatible C_Shape; matches + delivers) or
+`LOCALTYPE=shape-mismatch` (`shapesize` retyped i64; the gate rejects → INCONSISTENT_TOPIC, no
+data), with `TYPENAME=C_Shape TOPIC=Square` to face the Connext legacy-TypeObject corpus
+(below). It sets `*type-compat-log*` to stdout so the gate verdict line is visible.
 
 The publisher/subscriber also advertise the canonical ShapeType `PID_TYPE_INFORMATION` on
 SEDP (see [Type system](type-system.md) and [Discovery](discovery.md)), so a peer can read
@@ -45,6 +55,29 @@ tshark -i lo -O rtps -V | grep -A60 PID_TYPE_INFORMATION   # lo0 on macOS
 ```
 
 See [`interop/connext/README.md`](../../interop/connext/README.md) for the full guide.
+
+## Live Connext legacy-TypeObject type-gating (ACHIEVED 2026-06-11, ADR 0011)
+
+RTI Connext announces its type only through the vendor `PID_TYPE_OBJECT_LB` (0x8021), never
+the standard `PID_TYPE_INFORMATION` / TypeLookup (ADR 0010). The FR-TYPE-4 gate's fail-open
+legacy rung — which parses that 0x8021 TypeObject and decides the match by structural
+assignability — was proven against **live RTI Connext 7.3.1**:
+
+```sh
+# terminal 1 (from interop/connext/typeobject-corpus, with the RTI env + dylib symlinks):
+./corpus_pub 0 Square C_Shape                       # Connext writes C_Shape on topic Square
+# terminal 2 (repo root) — compatible local type:
+make gated-sub TOPIC=Square TYPENAME=C_Shape LOCALTYPE=shape-type     SECONDS=25
+# terminal 2 — incompatible local type (shapesize i64):
+make gated-sub TOPIC=Square TYPENAME=C_Shape LOCALTYPE=shape-mismatch SECONDS=25
+```
+
+Compatible → `type-gate[...]: COMPATIBLE`, the endpoints match and C_Shape samples are
+delivered. Incompatible → `type-gate[...]: INCOMPATIBLE`, INCONSISTENT_TOPIC is raised and no
+samples are delivered. Re-running the compatible case after the incompatible one still matches:
+a genuinely compatible Connext peer is never false-rejected. See
+[`interop/connext/typeobject-corpus/README.md`](../../interop/connext/typeobject-corpus/README.md)
+and [DCPS → Assignability-gated matching](dcps.md) for the full evidence.
 
 ## Confirming the XTypes wire bytes (the current open item)
 

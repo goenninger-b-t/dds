@@ -701,3 +701,23 @@ the Stage-5 gate falls open to name-match and never sees a partial model with a 
 - **Corpus artifacts (C_Union, C_Array)**: only the `Corpus.idl` + `corpus_pub.cxx` source edits
   are tracked; all `rtiddsgen` output, `corpus_pub`, and the symlinked RTI dylibs stay git-ignored
   (NFR-IP).
+
+### Live legacy-TypeObject type-gating acceptance test (Task 6.1, ADR 0011, 2026-06-11)
+
+- **What was consulted**: live RTI Connext 7.3.1 on the wire only — its SEDP `PID_TYPE_OBJECT_LB`
+  (0x8021) and reliable DATA, via `interop/connext/typeobject-corpus/corpus_pub 0 Square C_Shape`
+  (which both announces the legacy TypeObject and writes C_Shape samples). The test observes
+  Connext's wire behaviour and our own gate's verdict; **no RTI source, header, or `rtiddsgen`
+  output was read or copied** to build or interpret anything (clean-room, NFR-IP — same posture as
+  every earlier corpus experiment).
+- **Our side**: the new DCPS-level gated subscriber `dds.shapes:run-gated-subscriber` (`make
+  gated-sub`) — the standalone `run-subscriber` is a bare `dds.disc` node with no gate; only a
+  DCPS participant installs the FR-TYPE-4 gate (`%install-type-gate`).
+- **Result** (verbatim gate verdicts + counts in `interop/connext/typeobject-corpus/README.md` and
+  `docs/adr/0011-legacy-typeobject-live-gating.md`): a compatible local `C_Shape` gated
+  `:compatible` (matched, 25 samples), an incompatible local (`shapesize` long→`i64`) gated
+  `:incompatible` (INCONSISTENT_TOPIC, 0 samples), and the compatible peer was not false-rejected on
+  a re-run. No new external dependency was introduced.
+- **Artifacts**: `corpus_pub`, `rtiddsgen` output, pcaps, the symlinked RTI dylibs, and the run logs
+  remain git-ignored (NFR-IP). Only the harness source (`src/dds-shapes/`, `Makefile`) + docs are
+  tracked.

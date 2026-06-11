@@ -10,7 +10,7 @@ LISP  ?= $(CLASP)
 
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
-        square-pub square-sub square-spy large-pub large-sub corpus-capture bench mem sbom hooks clean
+        square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture bench mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -20,6 +20,8 @@ SIZE     ?= 8000
 DROP     ?=
 TOPIC    ?= Square
 SECONDS  ?= 20
+TYPENAME  ?= C_Shape
+LOCALTYPE ?= shape-type
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -88,6 +90,13 @@ large-pub:
 large-sub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-large-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
+
+# DCPS-level gated live subscriber (FR-TYPE-4, ADR 0010 live DoD): the type-gate fires on a
+# stock Connext peer's PID_TYPE_OBJECT_LB. LOCALTYPE=shape-type (compatible) | shape-mismatch.
+gated-sub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-gated-subscriber :domain $(DOMAIN) :topic "$(TOPIC)" :type-name "$(TYPENAME)" :local-type "$(LOCALTYPE)" :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
 	        --eval '(uiop:quit 0)'
 
 # Clean-room legacy-TypeObject capture: dump a peer's PID_TYPE_OBJECT_LB as a Lisp byte vector.

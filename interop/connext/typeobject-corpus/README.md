@@ -223,6 +223,51 @@ expecting EOF"` (IDL4 construct, unsupported by this version) — gap recorded i
 struct} constructs (enum `0x0E`, union `0x15`, array `0x11`, bitmask gap) verifiably fail open to
 `:unsupported` (test `lto-parse-aggregates-unsupported`). 90 tests green SBCL.
 
+## Live type-gating acceptance test, 2026-06-11 (Task 6.1, ADR 0011 — completes ADR 0010)
+
+`corpus_pub` is also the live peer for the FR-TYPE-4 **type-gate** acceptance test: it both
+publishes a legacy TypeObject on SEDP **and writes one C_Shape sample/second**, so our gated
+subscriber discovers it, the gate fires on the real `PID_TYPE_OBJECT_LB`, and (when compatible)
+samples are delivered. Our side is the DCPS-level gated subscriber `make gated-sub` (the
+standalone `make square-sub` is a bare `dds.disc` node with no gate; only a DCPS participant
+installs the gate). Addressing is unchanged from `make corpus-capture` (this dir's
+`USER_QOS_PROFILES.xml`).
+
+```sh
+# terminal 1 (this dir, RTI env + dylib symlinks):
+./corpus_pub 0 Square C_Shape
+
+# terminal 2 (repo root) — Step 1 COMPATIBLE: local type matches C_Shape
+make gated-sub TOPIC=Square TYPENAME=C_Shape LOCALTYPE=shape-type     SECONDS=25
+# Step 2 INCOMPATIBLE: local `shapesize` retyped long->i64 (not assignable)
+make gated-sub TOPIC=Square TYPENAME=C_Shape LOCALTYPE=shape-mismatch SECONDS=25
+# Step 3 NO-FALSE-REJECT: re-run Step 1 — still matches + delivers
+```
+
+Observed (verbatim gate verdict + match + sample counts):
+
+```
+# Step 1 (compatible):
+; type-gate[Square/C_Shape]: COMPATIBLE — legacy-TypeObject assignability
+[gated-sub] MATCHED 1 remote endpoint(s) (gate verdict :compatible).
+[gated-sub] stopped: received 25 sample(s); matched=1; INCONSISTENT_TOPIC total=0.
+
+# Step 2 (incompatible — the key proof):
+; type-gate[Square/C_Shape]: INCOMPATIBLE — legacy-TypeObject assignability
+[gated-sub] stopped: received 0 sample(s); matched=0; INCONSISTENT_TOPIC total=1.
+
+# Step 3 (re-run compatible — cardinal no-false-reject):
+; type-gate[Square/C_Shape]: COMPATIBLE — legacy-TypeObject assignability
+[gated-sub] stopped: received 20 sample(s); matched=1; INCONSISTENT_TOPIC total=0.
+```
+
+The gate parsed Connext's live 232-octet `PID_TYPE_OBJECT_LB` (536 inflated, fingerprint
+`C_Shape`/`color`/`shapesize`, cross-checked live by `make corpus-capture`), ran the real
+`struct-assignable-from`, and decided the match accordingly. A reliable RTPS reader buffers
+wire samples regardless of the DDS match verdict, so after an `:incompatible` verdict
+`run-gated-subscriber` guards the drain (a wrong-type wire sample is logged + skipped, never
+fatal; `SUBSCRIPTION_MATCHED` stays 0). Full analysis: `docs/adr/0011-*.md`.
+
 ## Files
 
 `Corpus.idl`, `corpus_pub.cxx`, `USER_QOS_PROFILES.xml`, `Makefile`, `README.md` are the

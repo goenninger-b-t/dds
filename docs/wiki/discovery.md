@@ -117,7 +117,12 @@ Optional callbacks the [DCPS](dcps.md) layer installs to surface events to the a
 A dds-types-aware layer (DCPS) can interpose a **type-compatibility verdict** before any
 SEDP match is recorded — e.g. XTypes assignability, possibly waiting on a TypeLookup query.
 The DCPS layer installs exactly such a gate on every `DomainParticipant` (FR-TYPE-4 gated
-matching — see [DCPS](dcps.md), "Assignability-gated matching").
+matching — see [DCPS](dcps.md), "Assignability-gated matching"). This gate has been **proven
+firing live against RTI Connext 7.3.1** (2026-06-11, ADR 0011): on a stock Connext peer's
+`PID_TYPE_OBJECT_LB`, a compatible local type returns `:compatible` (the match records and
+samples flow) and an incompatible one returns `:incompatible` (routed to INCONSISTENT_TOPIC,
+no match, no data). Note the gate fires only for a **DCPS** participant — the standalone
+`dds.shapes:run-subscriber` is a bare disc-node and installs no gate.
 
 - `dds.disc:disc-node-type-gate` — optional gate consulted **before a match is recorded**, in both directions (discovered publication vs. local readers, discovered subscription vs. local writers). Contract: called as `(funcall gate node remote local)` where `remote` and `local` are the `dds.rtps.discovery:endpoint-data` pair that just passed topic/type-name + RxO matching; it runs on the receiver thread **outside the node lock** (the gate is user code, like the `on-*` hooks). Verdicts: `:compatible` — record + fire the match as usual; `:incompatible` — routed to the INCONSISTENT_TOPIC record/fire path (same as a type-name mismatch); `:pending` — the decision is **parked** (deduped by remote GUID, so a re-announced remote parks at most once) and no match is recorded until `resume-parked-matches`. A `NIL` gate (the default) — and any other return value — behaves as `:compatible`, byte-identical to plain SEDP matching.
 - `dds.disc:resume-parked-matches` *(node)* — take + clear the parked list under the node lock, then re-run each parked match decision outside it; the gate is consulted again, so a still-`:pending` verdict re-parks the entry (still deduped). Call once the gate's verdict has resolved (e.g. a TypeLookup reply arrived).

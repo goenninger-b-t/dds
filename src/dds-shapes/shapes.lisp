@@ -28,6 +28,13 @@
   (uuid :string)
   (seq :u32))
 
+;; C_Shape with shapesize retyped i32->i64 (same id, different kind => NOT assignable, Table 15): the gate's incompatible-reject fixture.
+(dds.gen:define-dds-type shape-mismatch (:extensibility :final)
+  (color :string :key t)
+  (x :i32)
+  (y :i32)
+  (shapesize :i64))
+
 (defun* %shape-type-information ()
     (function () (or null (simple-array (unsigned-byte 8) (*))))
   "Opaque serialized XTypes TypeInformation for the canonical ShapeType, advertised in
@@ -397,6 +404,69 @@
         (dds.disc:stop-node node)
         (format t "~&[large-sub] stopped; received ~d samples.~%" seen))
       t)))
+
+(defun* run-gated-subscriber (&key (domain 0) (topic "Square") (type-name "C_Shape")
+                                   (local-type "shape-type") (seconds 25)
+                                   (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:topic string) (:type-name string)
+                    (:local-type string) (:seconds (integer 0)) (:advertise-address string)) t)
+  "DCPS-level gated live subscriber (FR-TYPE-4, ADR 0010 live DoD): create a
+   DomainParticipant (whose disc-node carries the installed %PARTICIPANT-TYPE-GATE),
+   bind LOCAL-TYPE's registered type-support under TOPIC / TYPE-NAME, and subscribe.
+   Against a stock Connext writer (PID_TYPE_OBJECT_LB 0x8021, no PID_TYPE_INFORMATION)
+   the gate inflates + parses the legacy TypeObject and assesses it against LOCAL-TYPE:
+   a :compatible verdict matches and delivers samples; an :incompatible verdict joins
+   the INCONSISTENT_TOPIC path (no match, no data). Sets DDS.DCPS:*TYPE-COMPAT-LOG* to
+   stdout so the gate verdict line is visible. LOCAL-TYPE 'shape-type' is the compatible
+   C_Shape; 'shape-mismatch' is the incompatible (shapesize i64) variant. SECONDS 0 =
+   forever (Ctrl-C)."
+  (unless (dds.types:find-type-support local-type)
+    (error "run-gated-subscriber: no registered type-support ~s" local-type))
+  (let* ((ts (dds.types:find-type-support local-type))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address)))
+    (setf dds.dcps:*type-compat-log* *standard-output*)
+    (let* ((tp (dds.dcps:create-topic p topic type-name ts))
+           (sub (dds.dcps:create-subscriber p))
+           (dr (dds.dcps:create-datareader sub tp :qos (dds.qos:make-reader-qos :reliability :reliable))))
+      (format t "~&[gated-sub] ~a/~a local-type=~a domain=~d (multicast 239.255.0.1). Gate verdict + samples below.~%"
+              topic type-name local-type domain)
+      (let ((fa (dds.types:type-support-field-accessors ts))
+            (seen 0) (start (get-internal-real-time)) (matched-reported nil))
+        (flet ((field (s name) (funcall (cdr (assoc name fa :test #'string-equal)) s)))
+          (unwind-protect
+               (loop
+                 (dds.dcps:spin p)
+                 ;; per-sample guard: parse errors skip the offending sample
+                 (dolist (cs (dds.dcps:take-samples dr))
+                   (handler-case
+                       (let ((s (dds.dcps:cached-sample-data cs)))
+                         (incf seen)
+                         (format t "~&[gated-sub] sample #~d: color=~a x=~a y=~a shapesize=~a~%"
+                                 seen (field s "color") (field s "x") (field s "y")
+                                 (field s "shapesize")))
+                     (error (e)
+                       (format t "~&[gated-sub] skipped undeliverable sample (~a) — gate rejected peer?~%"
+                               (type-of e)))))
+                 (let ((ms (dds.dcps:matched-count p)))
+                   (when (and (plusp ms) (not matched-reported))
+                     (setf matched-reported t)
+                     (format t "~&[gated-sub] MATCHED ~d remote endpoint(s) (gate verdict :compatible).~%" ms)))
+                 (let ((it (dds.dcps:get-inconsistent-topic-status tp)))
+                   (when (plusp (dds.dcps:inconsistent-topic-status-total-count it))
+                     (format t "~&[gated-sub] INCONSISTENT_TOPIC total=~d (gate verdict :incompatible -> REJECTED, no data).~%"
+                             (dds.dcps:inconsistent-topic-status-total-count it))))
+                 (when (and (plusp seconds)
+                            (> (/ (- (get-internal-real-time) start) internal-time-units-per-second)
+                               seconds))
+                   (return))
+                 (sleep 0.1))
+            (let ((it (dds.dcps:get-inconsistent-topic-status tp)))
+              (format t "~&[gated-sub] stopped: received ~d sample(s); matched=~d; INCONSISTENT_TOPIC total=~d.~%"
+                      seen (dds.dcps:matched-count p)
+                      (dds.dcps:inconsistent-topic-status-total-count it)))
+            (setf dds.dcps:*type-compat-log* nil)
+            (dds.dcps:delete-participant p)))))
+    t))
 
 (defun* run-corpus-capture-subscriber (&key (domain 0) (topic "Square") (type "ShapeType")
                                             (seconds 20))
