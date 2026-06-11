@@ -201,3 +201,53 @@ dissector limitation only.
 
 Our parser handled every Fast DDS announcement cleanly: no Lisp error, warning, or
 mis-parse in either run (`captures/*-oursub.out` / `*-ourpub.out`).
+
+## S2 data plane (FR-IO-2 DoD — 2026-06-11, same host, lo0)
+
+Formal bidirectional **RELIABLE** ShapeType exchange vs Fast DDS 3.6.1, dedicated
+runs, tshark-validated. Captures + logs under `captures/` (`s2-*`). Each leg was
+driven by one orchestrating shell: tshark first, the subscriber side next, the
+publisher only after the subscriber's ready line, so the receive window always
+covers the whole send.
+
+| Run | Peers | Capture | Result |
+|---|---|---|---|
+| forward | `fastdds-pub COLOR=GREEN COUNT=100` → our `run-subscriber` (`:canonical`, 45 s) | `captures/s2-forward-lo0.pcap` (723 pkts, 528 RTPS) | **95/100** delivered; head-of-stream sns 1–5 declared unavailable pre-match (see below), zero post-match loss; no Lisp warning/error (`s2-forward-oursub.out`) |
+| reverse | our `run-publisher` (BLUE, 250, 30/s) → `fastdds-sub SECONDS=40` | `captures/s2-reverse-lo0.pcap` (2854 pkts) | **250/250** delivered incl. full pre-match recovery from sn 1; our writer consumed 368 ACKNACKs (`s2-reverse-fastsub.out`, `-ourpub.out`) |
+
+GuidPrefixes: Fast DDS `010f9bd79842ef6e…` (fwd pub); ours `474253e7a8d5ed00…`
+(fwd sub) / `47425030a9d5ed00…` (rev pub). User endpoints both legs: writer
+`…00000102`, reader `…00000107`.
+
+### tshark evidence — forward (their writer, our reader)
+
+| Item | Observed | Evidence (frame) |
+|---|---|---|
+| ShapeType payload decodes | `DATA` sn 60: encapsulation **CDR_LE (0x0001)**, serializedData `06000000 "GREEN\0" 6d000000 3f000000 1e000000` = color "GREEN", x=109, y=63, size=30 — printed verbatim by our sub (`x=109 y=63 size=30`, once) | fr 341 |
+| HEARTBEAT from the writer | 98 frames on wr `…00000102` | first fr 50 (t=2.75 s), last fr 507 |
+| ACKNACK from our reader | 96 frames, rd `…00000107` → wr `…00000102` (e.g. sn-state base 8) | first fr 72 (t=2.89 s), last fr 509 |
+| GAP | exactly 2 frames (same submessage out both interfaces): the writer declares **sns 1–5** unavailable pre-match under VOLATILE — GAP of sn 5 only (gapStart=5, numBits=0); sns 1–4 are excluded by the same frame's HEARTBEAT firstAvailableSeqNumber=5 — so 95/100 is the spec-correct count, first delivered `DATA` is sn 6 | frs 50/51; first user `DATA` fr 56 (t=2.78 s) |
+| Retransmit profile | 95 unique sns (6–100), each `DATA` submessage exactly ×2 = one per whitelisted interface (both ride lo0) — **zero true retransmits**, 190 user `DATA` submessages total | — |
+
+### tshark evidence — reverse (our writer, their reader)
+
+| Item | Observed | Evidence (frame) |
+|---|---|---|
+| ShapeType payload decodes | `DATA` sn 200: encapsulation **CDR2_LE (0x0007)**, serializedData `05000000 "BLUE\0" a8000000 1e000000 1e000000` = color "BLUE", x=168, y=30, size=30 | fr 2420 |
+| HEARTBEAT from our writer | 218 frames on wr `…00000102` | first fr 94 (t=3.64 s), last fr 2635 |
+| ACKNACK from their reader | 370 frames (×2 interfaces), rd `…00000107` → wr `…00000102`, first with sn-state base 67 | first fr 1830 (t=5.03 s), last fr 2637 |
+| GAP | **0** | — |
+| Pre-match recovery | their SEDP `DATA(r)` frs 59/60 (t=3.63 s); our first user `DATA` fr 61 (t=3.64 s); their sub still delivered **sample 1 (x=53)** — the RELIABLE machinery recovered every pre-ACKNACK sample | `s2-reverse-fastsub.out` line 1 |
+
+### Anomalies (noted, non-blocking)
+
+- **Our writer's pre-first-ACKNACK repair is aggressive:** between the first user
+  `DATA` (t=3.64 s) and Fast DDS's first ACKNACK (t=5.03 s) our writer re-sent the
+  whole unacked history every send cycle — sn 1 went out 34×, 1867 `DATA` frames
+  total for 250 sns. It is self-limiting (185 sns sent exactly once after the first
+  ACKNACK landed; zero redundant traffic thereafter) and Fast DDS deduplicated
+  cleanly to 250/250, but a HEARTBEAT-paced repair would cut the burst ~7×. Filed
+  as a perf observation, not a correctness issue.
+- **Everything from Fast DDS arrives twice on lo0:** it emits each submessage once
+  per `interfaceWhiteList` entry (`127.0.0.1` + `192.168.2.148`, both looped back
+  on this host). Benign; explains all ×2 counts above.

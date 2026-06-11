@@ -74,9 +74,16 @@ make fastdds-sub SECONDS=15                         # subscribe + print samples 
 make fastdds-pub COLOR=GREEN COUNT=50               # publish ~10 samples/s (0 = forever)
 ```
 
-Same-host Fast DDS↔Fast DDS smoke is green (S0 gate; 48/50 over `lo0`). See
-[`interop/fastdds/README.md`](../../interop/fastdds/README.md) for the toolchain pin, the
-per-machine `profiles.xml` `interfaceWhiteList` note, and the smoke evidence.
+Same-host Fast DDS↔Fast DDS smoke is green (S0 gate; 48/50 over `lo0`), mutual SPDP/SEDP
+discovery is proven from the wire (S1 census), and the **FR-IO-2 data-plane DoD is met**
+(S2): dedicated bidirectional RELIABLE runs — Fast DDS → our subscriber **95/100** (the
+head-of-stream sns 1-5 declared unavailable pre-match under VOLATILE (HB first=5 + GAP of sn 5), zero post-match loss) and our
+publisher → Fast DDS **250/250** (full pre-match recovery from sequence number 1) — with
+HEARTBEAT/ACKNACK verified on the user endpoints in both directions and the ShapeType
+payloads tshark-decoded field-by-field. Captures + run logs are archived under
+`interop/fastdds/captures/`. See [`interop/fastdds/README.md`](../../interop/fastdds/README.md)
+for the toolchain pin, the per-machine `profiles.xml` `interfaceWhiteList` note, and the
+frame-level evidence tables.
 
 ## Live Connext legacy-TypeObject type-gating (ACHIEVED 2026-06-11, ADR 0011)
 
@@ -122,9 +129,10 @@ the diff isolates one of three one-line knobs (encapsulation-header / `struct_fl
 - **Shapes wire format**: validated against the tshark RTPS dissector (`make wire`).
 - **Bidirectional Connext interop**: staged (the harness exists) but **not yet run** — needs
   a Connext install. Same gate applies to full DCPS/content-filter interop.
-- **Open peer (Fast DDS)** interop: harness landed (`interop/fastdds/`, pinned Fast DDS
-  3.6.1; Fast DDS↔Fast DDS same-host smoke green); interop against **this stack** is the
-  next FR-IO-2 step.
+- **Open peer (Fast DDS)** interop: **bidirectional reliable ShapeType exchange achieved**
+  vs Fast DDS 3.6.1 (forward 95/100, reverse 250/250, HEARTBEAT/ACKNACK live both
+  directions, tshark-validated — the FR-IO-2 data-plane DoD, S2); the byte-level TypeLookup
+  CONFIRM-VS-PEER + EquivalenceHash re-pin (S3) is the remaining FR-IO-2 step.
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

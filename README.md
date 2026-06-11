@@ -85,9 +85,13 @@ RTPS dissector). **Live Connext interop has run** against RTI Connext 7.3.1 (the
 oracle apps are in [`interop/connext/`](interop/connext/)): bidirectional reliable ShapeType
 exchange and bidirectional fragmented LargeData exchange (`make large-pub` / `make large-sub`;
 `DROP=3` injects fragment loss to exercise NACK_FRAG recovery), tshark-validated on `lo0`
-captures. The **Fast DDS peer harness** ([`interop/fastdds/`](interop/fastdds/), pinned Fast
-DDS 3.6.1; FR-IO-2) is landed with a green same-host Fast DDS↔Fast DDS smoke (`make
-fastdds-pub` / `make fastdds-sub`); interop against this stack is the next FR-IO-2 step.
+captures. **Live Fast DDS interop has run** against eProsima Fast DDS 3.6.1 (the peer harness
+is in [`interop/fastdds/`](interop/fastdds/); `make fastdds-pub` / `make fastdds-sub`):
+mutual SPDP/SEDP discovery plus bidirectional **reliable** ShapeType exchange (forward 95/100
+with head-of-stream sns 1-5 declared unavailable pre-match (HB first=5 + GAP of sn 5); reverse 250/250 with full pre-match
+recovery), HEARTBEAT/ACKNACK verified on the user endpoints both directions and the payloads
+tshark-validated — the FR-IO-2 data-plane DoD; the byte-level TypeLookup
+CONFIRM-VS-PEER/EquivalenceHash re-pin is the remaining FR-IO-2 step.
 
 ---
 
