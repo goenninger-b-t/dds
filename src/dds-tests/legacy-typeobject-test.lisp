@@ -385,6 +385,65 @@
                   (format nil "~a decodes extensibility ~a" label expected))))))
   t)
 
+;;; Legacy-TypeObject SEQUENCE member decode (Task 3.1). Locked live Connext 7.3.1 captures
+;;; (interop/connext/typeobject-corpus, 2026-06-11): C_Seq (`@key long id; sequence<octet> payload`,
+;;; matching LargeData — unbounded -> RTI default sequence bound), C_SeqL (`sequence<long,10>`), and
+;;; C_SeqL100 (`sequence<long,100>`). The differential (docs/provenance.md 2026-06-11) localized: the
+;;; sequence member node carries kind 0x12 (18) at VALUE-START+8 plus an 8-octet type-hash at +16
+;;; referencing a sequence-definition node (CODE 7) whose CODE-100 child holds the element type-kind
+;;; (u16, RTI's primitive enum: octet 2 / long 5) and whose CODE-200 child holds the bound (u32).
+;;; RTI's default bound for an UNBOUNDED sequence is 100 (the C_Seq payload), mirroring the 255
+;;; string default. The decoded member TI is a SEQUENCE-TYPE-IDENTIFIER over a PRIMITIVE element.
+
+(defun* %lto-seq-fixtures ()
+    (function () list)
+  "Locked Task-3.1 captures: (label element-tk expected-bound . raw-LB-octet-list). Each is a
+   C_Seq sequence differential; ELEMENT-TK is the +tk-*+ kind octet the decoded element TI must
+   carry and EXPECTED-BOUND payload's decoded sequence bound (100 = RTI unbounded default for
+   C_Seq). Test fixture (live Connext 7.3.1, interop/connext/typeobject-corpus, 2026-06-11)."
+  (list
+   (list* "C_Seq" dds.types:+tk-byte+ 100
+          '(1 0 0 0 164 1 0 0 188 0 0 0 120 218 99 172 231 96 0 129 10 70 6 6 38 48 139 133 65 12 72 50 2 197 57 129 244 21 40 27 4 100 64 108 176 44 3 67 179 230 142 9 51 254 60 113 101 3 178 157 227 131 83 11 161 234 24 193 38 64 0 136 159 130 198 79 5 210 53 12 16 187 96 230 138 128 205 133 0 86 32 100 6 210 153 41 152 230 49 213 35 244 168 192 204 4 98 33 40 123 245 225 165 38 189 103 248 120 65 42 10 18 43 115 242 19 83 176 154 1 195 32 81 33 168 59 216 65 122 144 220 164 1 118 163 16 138 185 32 94 113 106 97 105 106 94 114 106 188 161 129 65 188 83 101 73 42 1 127 51 1 97 42 84 6 36 126 2 42 158 130 228 22 152 126 1 32 22 131 154 1 11 95 144 60 0 224 244 47 16))
+   (list* "C_SeqL" dds.types:+tk-int32+ 10
+          '(1 0 0 0 164 1 0 0 190 0 0 0 120 218 99 172 231 96 0 129 10 70 6 6 38 48 139 133 65 12 72 50 2 197 57 129 244 21 40 27 4 100 64 108 176 44 3 195 91 117 175 202 224 204 182 217 236 64 182 115 124 112 106 161 15 68 29 35 216 4 8 0 241 83 208 248 169 64 186 134 1 98 23 204 92 17 176 185 16 192 10 132 204 64 58 51 5 211 60 166 122 132 30 21 152 153 64 44 4 101 235 111 184 227 255 146 235 64 30 72 69 65 98 101 78 126 98 10 86 51 96 24 36 42 4 117 7 200 31 5 72 110 210 0 187 81 8 197 92 16 175 56 181 176 52 53 47 57 53 222 208 32 222 51 175 196 216 136 1 191 191 65 254 73 133 202 128 196 79 64 197 185 144 220 2 211 47 0 196 98 80 51 96 225 11 146 7 0 74 112 45 187 0 0))
+   (list* "C_SeqL100" dds.types:+tk-int32+ 100
+          '(1 0 0 0 168 1 0 0 192 0 0 0 120 218 99 172 231 96 0 129 26 70 6 6 38 48 139 133 65 12 72 50 2 197 57 129 244 13 40 27 4 20 64 108 176 44 3 195 25 142 155 135 143 109 123 124 135 11 200 118 142 15 78 45 244 49 52 48 128 170 101 4 155 2 1 32 126 10 26 63 21 100 31 3 196 62 152 217 34 96 179 33 128 21 8 153 129 116 102 10 166 121 76 245 8 61 42 48 51 129 88 8 202 246 182 232 212 244 171 53 80 4 169 40 72 172 204 201 79 76 193 106 6 12 131 68 133 160 238 96 7 233 65 114 147 6 216 141 66 40 230 10 3 217 197 169 133 165 169 121 201 169 241 64 47 199 123 230 149 24 27 225 247 55 200 63 169 80 25 144 248 9 168 120 10 146 91 96 250 5 128 88 12 106 6 44 140 65 242 0 214 204 47 32))))
+
+(defun* run-lto-parse-sequence-test ()
+    (function () t)
+  "Test: parse-legacy-type-object decodes SEQUENCE-of-primitive member type-identifiers (Task 3.1).
+   For each locked C_Seq/C_SeqL/C_SeqL100 capture, member `payload`'s decoded TI is a plain-sequence
+   TypeIdentifier whose ELEMENT carries the expected primitive +tk-*+ kind (octet/long) and whose
+   BOUND is the decoded sequence bound (100 = RTI's unbounded default for C_Seq, 10 / 100 for the
+   bounded variants); the `@key long id` member stays TK_INT32. Pinned to the live Connext 7.3.1
+   corpus (docs/provenance.md 2026-06-11)."
+  (dolist (fx (%lto-seq-fixtures))
+    (destructuring-bind (label element-tk bound . octlist) fx
+      (let* ((lb (coerce octlist '(simple-array (unsigned-byte 8) (*))))
+             (inflated (dds.types:inflate-type-object-lb lb))
+             (parsed (and inflated (dds.types:parse-legacy-type-object inflated))))
+        (%check (intern (format nil "LTO-SEQ-~A-PARSE" (string-upcase label)) :keyword)
+                (dds.types:minimal-struct-type-p parsed)
+                (format nil "~a parses to a minimal-struct-type" label))
+        (when (dds.types:minimal-struct-type-p parsed)
+          (let* ((payload (%lto-member-named parsed "payload"))
+                 (pti (and payload (dds.types:minimal-struct-member-type-identifier payload)))
+                 (elt (and pti (dds.types:type-identifier-element pti)))
+                 (id (%lto-member-named parsed "id"))
+                 (iti (and id (dds.types:minimal-struct-member-type-identifier id))))
+            (%check (intern (format nil "LTO-SEQ-~A-KIND" (string-upcase label)) :keyword)
+                    (and pti (= (dds.types:type-identifier-kind pti)
+                                dds.types:+ti-plain-sequence-small+)
+                         elt (= (dds.types:type-identifier-kind elt) element-tk))
+                    (format nil "~a payload is a plain-sequence TI over element kind ~x" label element-tk))
+            (%check (intern (format nil "LTO-SEQ-~A-BOUND" (string-upcase label)) :keyword)
+                    (and pti (= (dds.types:type-identifier-bound pti) bound))
+                    (format nil "~a payload sequence bound = ~d" label bound))
+            (%check (intern (format nil "LTO-SEQ-~A-ID" (string-upcase label)) :keyword)
+                    (and iti (= (dds.types:type-identifier-kind iti) dds.types:+tk-int32+))
+                    (format nil "~a id stays TK_INT32" label)))))))
+  t)
+
 ;;; Legacy-TypeObject assignability proof (Task 2.4). Parses the live C_Shape legacy TypeObject and
 ;;; drives it through the REAL struct-assignable-from gate (assignability.lisp) against a locally-
 ;;; built minimal-struct-type for the SAME shape — proving the parsed wire model feeds the type-
@@ -436,4 +495,186 @@
         (%check :lto-asgn-incompatible-members
                 (not (dds.types:struct-assignable-from local-drop parsed opts))
                 "an incompatible local (shapesize dropped) is NOT assignable under :final (incompatible -> NIL)"))))
+  t)
+
+;;; Legacy-TypeObject NESTED-STRUCT member decode + recursion (Task 3.2). Locked live Connext
+;;; 7.3.1 captures (interop/connext/typeobject-corpus, 2026-06-11): C_Nested (`@key long id;
+;;; C_Inner inner`) and C_Nested2 (a 2nd `C_Inner inner2`); C_Inner is `@final struct { long a;
+;;; long b; }`. Publishing C_Nested forces RTI to emit C_Inner's definition as a TypeLibrary
+;;; SIBLING element in the SAME legacy TypeObject. The differential (docs/provenance.md 2026-06-11)
+;;; localized: a nested-struct member node carries kind 0x16 (22) at VALUE-START+8 plus the same
+;;; 8-octet type-hash at +16 (strings 0x13/CODE-8, sequences 0x12/CODE-7, nested struct 0x16/CODE-9)
+;;; referencing C_Inner's CODE-9 struct-def, whose CODE-0 child echoes that hash at VALUE-START+8.
+;;; The decoder resolves the def (the shared %lto-find-def-node, def-code 9), parses it via the
+;;; shared %lto-parse-struct-node (so nesting recurses), and attaches it as an EK_MINIMAL
+;;; hash-type-identifier's `referenced` — exactly the shape struct-assignable-from / the TypeLookup
+;;; gate recurse into. Bounded by *lto-max-type-depth* + a visited-hash cycle guard.
+
+(defun* %lto-connext-c-nested-lb ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The live RTI Connext 7.3.1 C_Nested PID_TYPE_OBJECT_LB parameter value (192 octets), captured
+   2026-06-11 (interop/connext/typeobject-corpus/README.md): `@final struct C_Nested { @key long
+   id; C_Inner inner; }` with `@final struct C_Inner { long a; long b; }` carried as a TypeLibrary
+   sibling. Inflates to a 508-octet legacy TypeObject (ADR 0009)."
+  (coerce
+   '(1 0 0 0 252 1 0 0 178 0 0 0 120 218 99 172 231 96 0 129 11 140 12 12 76 96 22 11 131 24 144
+     100 4 138 115 2 233 27 80 54 8 40 128 216 96 89 6 6 161 98 94 231 228 40 206 88 144 26 231
+     120 191 212 226 146 212 20 6 168 90 70 176 41 16 0 226 167 160 241 83 129 116 13 3 196 62
+     152 217 34 96 179 33 128 21 8 153 129 116 102 10 166 121 76 245 8 61 42 48 51 129 88 12 202
+     190 243 118 106 164 120 110 243 124 54 144 254 188 188 212 34 6 236 102 192 48 186 127 143
+     32 185 73 6 201 191 48 115 57 192 254 245 4 155 76 172 95 115 176 248 149 1 201 175 32 185
+     68 6 252 126 21 65 242 43 76 79 18 1 191 193 228 4 144 194 7 22 111 32 121 0 96 2 43 194 0 0)
+   '(simple-array (unsigned-byte 8) (*))))
+
+(defun* %lto-connext-c-nested2-lb ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The live RTI Connext 7.3.1 C_Nested2 PID_TYPE_OBJECT_LB parameter value (208 octets), captured
+   2026-06-11: `@final struct C_Nested2 { @key long id; C_Inner inner; C_Inner inner2; }`. Both
+   nested members reference the SAME C_Inner def-hash (exercises repeated resolution + the
+   visited-hash guard). Inflates to a 576-octet legacy TypeObject."
+  (coerce
+   '(1 0 0 0 64 2 0 0 193 0 0 0 120 218 99 172 231 96 0 1 17 38 6 6 38 48 139 133 65 12 72 50 2
+     197 57 129 180 12 35 132 13 2 10 32 113 176 44 3 195 153 180 171 187 56 126 55 61 230 2 178
+     157 227 253 82 139 75 82 83 140 160 250 24 193 166 64 0 136 159 130 198 79 5 210 7 128 152
+     153 1 97 182 8 216 108 8 96 5 66 144 92 102 10 166 121 76 245 8 61 42 48 51 129 88 12 202
+     190 243 118 106 164 120 110 243 124 54 144 254 188 188 212 34 6 226 204 96 194 98 6 59 204
+     12 35 236 102 192 48 122 152 29 65 242 151 12 82 152 193 204 229 0 135 153 39 216 117 196
+     134 87 14 212 141 200 225 197 128 20 94 32 185 68 2 126 21 65 10 47 152 158 36 6 252 126 131
+     201 9 32 133 15 44 238 65 242 0 80 224 57 170 0 0 0)
+   '(simple-array (unsigned-byte 8) (*))))
+
+(defun* %lto-local-c-inner (&key (a-kind :i32) (b-kind :i32))
+    (function (&key (:a-kind symbol) (:b-kind symbol)) dds.types:minimal-struct-type)
+  "A locally-built C_Inner-equivalent minimal-struct-type: long a (id 0) + long b (id 1).
+   A-KIND / B-KIND retype member a / b (:i32 = matching, :f64 = nested-incompatible). @appendable
+   so the nested element is DELIMITED under XCDR2 — the precondition for strong-assignability into
+   an outer container (XTypes §7.2.4.2/§7.2.4.3, the stack's :asg-strong-delimited rule): a @final
+   nested element is not self-delimiting, so the recursion would be masked by the delimited gate,
+   not exercised. (A member-SET change is not used as the incompatibility: APPENDABLE allows
+   truncation both ways, so a dropped member stays assignable — only a member TYPE change flips the
+   recursed verdict.) Test fixture."
+  (dds.types:make-minimal-struct-type
+   :name "C_Inner" :extensibility :appendable
+   :members (list (dds.types:make-struct-member
+                   "a" 0 (dds.types:primitive-type-identifier a-kind))
+                  (dds.types:make-struct-member
+                   "b" 1 (dds.types:primitive-type-identifier b-kind)))))
+
+(defun* %lto-local-c-nested (&key (a-kind :i32) (b-kind :i32))
+    (function (&key (:a-kind symbol) (:b-kind symbol)) dds.types:minimal-struct-type)
+  "A locally-built C_Nested-equivalent minimal-struct-type: @key long id (id 0) + a nested
+   C_Inner `inner` member (id 1) whose TI is an EK_MINIMAL hash-type-identifier referencing
+   %LTO-LOCAL-C-INNER. A-KIND / B-KIND push the incompatibility into the NESTED C_Inner model so
+   the assignability gate must RECURSE to detect it. @mutable + @appendable nested element mirror
+   the stack's :asg-nested recursion fixture so the nested member-type drives the verdict (a
+   @final/@final pair is governed by the delimited rule, masking the recursion — see
+   %LTO-LOCAL-C-INNER). Test fixture."
+  (dds.types:make-minimal-struct-type
+   :name "C_Nested" :extensibility :mutable
+   :members (list (dds.types:make-struct-member
+                   "id" 0 (dds.types:primitive-type-identifier :i32) :key-p t)
+                  (dds.types:make-struct-member
+                   "inner" 1
+                   (dds.types:hash-type-identifier
+                    dds.types:+ek-minimal+
+                    :referenced (%lto-local-c-inner :a-kind a-kind :b-kind b-kind))))))
+
+(defun* run-lto-parse-nested-test ()
+    (function () t)
+  "Test: parse-legacy-type-object decodes NESTED-STRUCT members + recurses through the real
+   struct-assignable-from gate (Task 3.2, FR-TYPE-4). The parsed live C_Nested model's `inner`
+   member TI is an EK_MINIMAL hash-type-identifier whose `referenced` is a parsed C_Inner
+   minimal-struct-type {a,b long}; a nested-COMPATIBLE local C_Nested is assignable (T) and a
+   nested-INCOMPATIBLE local (C_Inner.a retyped i32->f64, or b dropped) is NOT (NIL) — proving the
+   recursion runs through the gate. C_Nested2's two members both resolve the SAME C_Inner def
+   (visited-guard exercise). Pinned to the live Connext 7.3.1 corpus (docs/provenance.md 2026-06-11)."
+  (let* ((lb (%lto-connext-c-nested-lb))
+         (inflated (dds.types:inflate-type-object-lb lb))
+         (parsed (and inflated (dds.types:parse-legacy-type-object inflated)))
+         (opts (dds.types:default-assignability-options)))
+    (%check :lto-nested-parse (dds.types:minimal-struct-type-p parsed)
+            "the live C_Nested legacy TypeObject parses to a minimal-struct-type")
+    (when (dds.types:minimal-struct-type-p parsed)
+      (let* ((inner (%lto-member-named parsed "inner"))
+             (iti (and inner (dds.types:minimal-struct-member-type-identifier inner)))
+             (ref (and iti (dds.types:type-identifier-referenced iti))))
+        (%check :lto-nested-ti-aggregate
+                (and iti (= (dds.types:type-identifier-kind iti) dds.types:+ek-minimal+))
+                "the `inner` member decodes to an EK_MINIMAL aggregate TypeIdentifier")
+        (%check :lto-nested-referenced
+                (and (dds.types:minimal-struct-type-p ref)
+                     (string= (dds.types:minimal-struct-type-name ref) "C_Inner"))
+                "the aggregate TI's `referenced` is a parsed C_Inner minimal-struct-type")
+        (%check :lto-nested-inner-members
+                (and (dds.types:minimal-struct-type-p ref)
+                     (let ((a (%lto-member-named ref "a")) (b (%lto-member-named ref "b")))
+                       (and a b
+                            (= (length (dds.types:minimal-struct-type-members ref)) 2)
+                            (let ((ati (dds.types:minimal-struct-member-type-identifier a))
+                                  (bti (dds.types:minimal-struct-member-type-identifier b)))
+                              (and ati bti
+                                   (= (dds.types:type-identifier-kind ati) dds.types:+tk-int32+)
+                                   (= (dds.types:type-identifier-kind bti) dds.types:+tk-int32+))))))
+                "C_Inner has members a/b, both TK_INT32 (long)")
+        ;; the `id` member stays a flat TK_INT32 @key
+        (let* ((idm (%lto-member-named parsed "id"))
+               (idti (and idm (dds.types:minimal-struct-member-type-identifier idm))))
+          (%check :lto-nested-id
+                  (and idm (dds.types:minimal-struct-member-key-p idm)
+                       idti (= (dds.types:type-identifier-kind idti) dds.types:+tk-int32+))
+                  "the @key long id member stays a flat TK_INT32"))
+        ;; build a reference C_Nested whose nested `inner` model mirrors the PARSED C_Inner
+        ;; {a,b long} but carries the delimited (appendable/mutable) extensibility the gate's
+        ;; strong-assignability rule requires, so the nested member-type DRIVES the verdict —
+        ;; then drive nested-compatible / nested-incompatible locals through the REAL gate.
+        (let ((reference (%lto-local-c-nested))
+              (local-ok (%lto-local-c-nested))
+              (local-bad-a (%lto-local-c-nested :a-kind :f64))
+              (local-bad-b (%lto-local-c-nested :b-kind :f64)))
+          (%check :lto-nested-asgn-compatible
+                  (dds.types:struct-assignable-from local-ok reference opts)
+                  "a nested-compatible local C_Nested is assignable through the gate (recurses -> T)")
+          (%check :lto-nested-asgn-compatible-rev
+                  (dds.types:struct-assignable-from reference local-ok opts)
+                  "the recursion holds both directions for the nested-compatible pair")
+          (%check :lto-nested-asgn-incompat-type
+                  (not (dds.types:struct-assignable-from local-bad-a reference opts))
+                  "a NESTED-incompatible local (C_Inner.a long->double) is NOT assignable (recurses -> NIL)")
+          (%check :lto-nested-asgn-incompat-members
+                  (not (dds.types:struct-assignable-from local-bad-b reference opts))
+                  "a NESTED-incompatible local (C_Inner.b long->double) is NOT assignable (recurses into 2nd member -> NIL)"))))
+    ;; resource/cycle guard (NFR-SEC-POSTURE): *lto-max-type-depth* 0 forces EVERY nested-struct
+    ;; member to fail open (TI NIL) — the depth guard that, together with the visited-hash set,
+    ;; makes a hostile self-/mutually-referential TypeObject terminate (never hang) and never OOB.
+    (let ((dds.types:*lto-max-type-depth* 0))
+      (let* ((inflated (dds.types:inflate-type-object-lb (%lto-connext-c-nested-lb)))
+             (parsed (dds.types:parse-legacy-type-object inflated))
+             (inner (and (dds.types:minimal-struct-type-p parsed)
+                         (%lto-member-named parsed "inner"))))
+        (%check :lto-nested-depth-guard
+                (and inner (null (dds.types:minimal-struct-member-type-identifier inner)))
+                "*lto-max-type-depth* 0 fails the nested member open (TI NIL) — depth guard wired")
+        (%check :lto-nested-depth-guard-flat
+                (let ((id (and (dds.types:minimal-struct-type-p parsed)
+                               (%lto-member-named parsed "id"))))
+                  (and id (dds.types:minimal-struct-member-type-identifier id)))
+                "the flat @key long id member still decodes under the depth guard (only nesting fails open)")))
+    ;; C_Nested2: two members both resolve the SAME C_Inner def (visited-hash guard does not block
+    ;; a legitimate repeated reference) — both `inner` and `inner2` carry a C_Inner aggregate TI.
+    (let* ((lb2 (%lto-connext-c-nested2-lb))
+           (inf2 (dds.types:inflate-type-object-lb lb2))
+           (parsed2 (and inf2 (dds.types:parse-legacy-type-object inf2))))
+      (%check :lto-nested2-parse (dds.types:minimal-struct-type-p parsed2)
+              "the live C_Nested2 legacy TypeObject parses to a minimal-struct-type")
+      (when (dds.types:minimal-struct-type-p parsed2)
+        (%check :lto-nested2-both-resolved
+                (every (lambda (nm)
+                         (let* ((m (%lto-member-named parsed2 nm))
+                                (ti (and m (dds.types:minimal-struct-member-type-identifier m)))
+                                (ref (and ti (dds.types:type-identifier-referenced ti))))
+                           (and ti (= (dds.types:type-identifier-kind ti) dds.types:+ek-minimal+)
+                                (dds.types:minimal-struct-type-p ref)
+                                (string= (dds.types:minimal-struct-type-name ref) "C_Inner"))))
+                       '("inner" "inner2"))
+                "both inner/inner2 resolve the shared C_Inner def (repeated reference, not blocked)"))))
   t)

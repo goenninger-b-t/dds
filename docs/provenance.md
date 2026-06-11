@@ -450,3 +450,129 @@ the 536-octet C_Shape inflate):
   values fail open to `:final` (recorded above).
 - **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked; all
   `rtiddsgen` output, the `corpus_pub` binary, and the symlinked RTI dylibs stay git-ignored (NFR-IP).
+
+### Experiment set: C_Seq / C_SeqL / C_SeqL100 — sequence member element + bound (Task 3.1, 2026-06-11)
+
+- **Goal**: decode `sequence<T>` (bounded + unbounded) members from the legacy TypeObject into our
+  `sequence-type-identifier` (element TI + bound). Three live captures, each a struct with a `@key long
+  id` plus one sequence member `payload`:
+  - `C_Seq` — `sequence<octet> payload` (matches the LargeData shape; unbounded → RTI default bound).
+  - `C_SeqL` — `sequence<long, 10> payload` (bounded element=long, bound 10).
+  - `C_SeqL100` — `sequence<long, 100> payload` (bound 100; confirms the bound field width).
+- **Method**: `make corpus-capture TOPIC=Square TYPE=<typename>` ↔ `corpus_pub 0 Square <typename>`,
+  loopback (NDDSHOME=/Applications/rti_connext_dds-7.3.1, CONNEXTDDS_ARCH=arm64Darwin20clang12.0; RTI
+  dylibs symlinked next to `corpus_pub`, git-ignored — macOS SIP strips `DYLD_LIBRARY_PATH`). Raw LB
+  vectors captured: C_Seq 200 octets (inflate 420), C_SeqL 204 (inflate 420), C_SeqL100 204 (inflate
+  424). Tokenized + structurally walked vs the base C_Shape.
+- **Sequence member node** (e.g. C_Seq `payload`, value bytes `00 00 00 00 | 01 00 00 00 | 12 00 00 00
+  | 00 00 00 00 | AB C3 A5 34 8D CC 0E 0D | 08 00 00 00`):
+  - `+0` u32 = the `@key` flag (0 — payload not key), as for every member (Task 2.3).
+  - `+4` u32 = the member id (1 — declaration index), as for every member (Task 2.1).
+  - `+8` **u16 = 0x0012 (18)** = the SEQUENCE member-kind (string is 0x13; sequence is **0x12**). The
+    `+10` u16 is the redundant mirror copy (same convention as the primitive/string member-kind).
+  - `+16` 8 octets = the **type-hash** referencing the sequence-definition node — the SAME
+    hash-reference mechanism strings use (Task 2.3), just a different def-node CODE.
+- **Sequence-definition node**: the LONG node with **CODE 7** (strings use CODE 8) whose CODE-0 child
+  echoes the member's 8-octet hash at its `VALUE-START+8` (identical to the string-def echo). Its
+  named CODE-0 child also carries RTI's internal type name (`sequence_100_Byte` / `sequence_10_Int32`
+  / `sequence_100_Int32` — the embedded number is the bound, a useful cross-check). Under it:
+  - a **CODE 100** child whose `VALUE-START` u16 is the **element type-kind**, in RTI's OWN primitive
+    enum (`*lto-primitive-kind-keyword*`, same as the member primitive kind): C_Seq `02 00 02 00` →
+    octet (2), C_SeqL / C_SeqL100 `05 00 05 00` → long (5). (The value is the kind repeated as two u16.)
+  - a **CODE 200** child whose `VALUE-START` u32 is the **sequence bound**: C_Seq `64 00 00 00` = 100,
+    C_SeqL `0A 00 00 00` = 10, C_SeqL100 `64 00 00 00` = 100. CODE 200 is the SAME bound-child code the
+    string-def uses — the bound is always a u32 (4-octet child value, len=4).
+- **Unbounded default**: `C_Seq`'s `sequence<octet>` is IDL-unbounded, yet RTI emits **bound 100**
+  (the `sequence_100_Byte` token confirms it) — RTI's default unbounded-sequence bound, directly
+  analogous to the **255** default for unbounded strings. The decoder reads the wire bound; it does not
+  synthesize 100 (recorded as `+lto-sequence-default-bound+` for documentation only).
+- **Decode** → `src/dds-types/legacy-type-object.lisp`: `%lto-member-type-identifier` dispatches kind
+  `+lto-member-kind-sequence+` (0x12) to `%lto-sequence-type-identifier`, which resolves the
+  `+lto-code-sequence-def+` (7) node via the shared `%lto-find-def-node` (refactored out of the string
+  path — DRY), reads the element kind from its `+lto-code-sequence-element+` (100) child and the bound
+  from its `+lto-code-string-bound+` (200) child, and builds `(sequence-type-identifier
+  (primitive-type-identifier <kw>) <bound>)`. The string path now also uses `%lto-find-def-node`.
+- **Decoded coverage**: sequence-of-PRIMITIVE only (octet/long proven; the full
+  `*lto-primitive-kind-keyword*` map applies). A sequence whose element is itself a string, a nested
+  aggregate, or another sequence is a **Task 3.2 gap**: the element kind word is non-primitive, so
+  `%lto-sequence-type-identifier` returns NIL and the member TI stays NIL (fail-open, parse continues).
+  These element kinds were NOT captured here. `wstring`-element and char16 sequences are likewise
+  untested gaps.
+- **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked; all
+  `rtiddsgen` output, the `corpus_pub` binary, and the symlinked RTI dylibs stay git-ignored (NFR-IP).
+
+### Experiment set: C_Nested / C_Nested2 — nested-struct member + recursion (Task 3.2, 2026-06-11)
+
+- **Goal**: decode a NESTED-STRUCT (aggregate) member from the legacy TypeObject into an
+  EK_MINIMAL `hash-type-identifier` whose `referenced` slot is the parsed nested
+  `minimal-struct-type`, and make `struct-assignable-from` recurse through it (FR-TYPE-4). Two
+  live captures:
+  - `C_Nested` — `@final struct C_Nested { @key long id; C_Inner inner; }` with
+    `@final struct C_Inner { long a; long b; }`.
+  - `C_Nested2` — adds a second `C_Inner inner2` (proves the resolver + the visited-hash guard
+    handle a REPEATED reference to the same def; the corpus DSL is acyclic).
+- **Method**: `make corpus-capture TOPIC=Square TYPE=<typename>` ↔ `corpus_pub 0 Square <typename>`,
+  loopback (NDDSHOME=/Applications/rti_connext_dds-7.3.1, CONNEXTDDS_ARCH=arm64Darwin20clang12.0;
+  RTI dylibs symlinked next to `corpus_pub`, git-ignored — macOS SIP strips `DYLD_LIBRARY_PATH`).
+  Raw LB vectors: C_Nested 192 octets (inflate 508), C_Nested2 208 (inflate 576). Tokenized +
+  structurally walked.
+- **TypeLibrary structure**: publishing `C_Nested` makes RTI emit a legacy TypeObject containing
+  TWO top-level `+lto-code-struct+` (CODE 9) definition nodes under the outer wrapper — the OUTER
+  `C_Nested` def FIRST (pre-order) and `C_Inner`'s def as a SIBLING after it. So a legacy
+  TypeObject is a TypeLibrary: the nested type's def travels in-band, parseable by the SAME
+  struct-parse path. The top-level entry (`%lto-find-code root +lto-code-struct+`, first match)
+  correctly selects the outer struct; the nested resolver finds the sibling by hash.
+- **Nested-struct member node** (C_Nested `inner`, value bytes `00 00 00 00 | 01 00 00 00 |
+  16 00 00 00 | 00 00 00 00 | DC ED 95 59 17 6D 83 9F | 06 00 00 00 69 6E 6E 65 …`):
+  - `+0` u32 = the `@key` flag (0 — inner not key), as for every member.
+  - `+4` u32 = the member id (1 — declaration index), as for every member.
+  - `+8` **u16 = 0x0016 (22)** = the NESTED-STRUCT member-kind (string 0x13, sequence 0x12, nested
+    struct **0x16**). The `+10` u16 is the redundant mirror (0x0000 here).
+  - `+16` 8 octets = the **type-hash** referencing the nested struct-def — the SAME
+    hash-reference mechanism strings (CODE 8) and sequences (CODE 7) use, here pointing at a
+    `+lto-code-struct+` (CODE 9) def node.
+- **Reference resolution**: the existing `%lto-find-def-node` (find the DEF-CODE node whose CODE-0
+  child echoes the member's 8-octet hash at its `VALUE-START+8`) resolves the nested member with
+  `def-code = +lto-code-struct+` (9) UNCHANGED. Verified: `inner` hash `DC ED 95 59 17 6D 83 9F` ==
+  C_Inner's CODE-0 child "C_Inner" echo at +8; `%lto-find-def-node` returns the C_Inner def
+  (name "C_Inner", code 9). C_Nested2's `inner` and `inner2` BOTH carry that same hash — the def is
+  shared, the two members resolve independently.
+- **Struct-parse refactor (DRY)**: the struct-node→model core of `parse-legacy-type-object`
+  (type-name + member-list container + per-member fold + member-count cross-check) is factored into
+  `%lto-parse-struct-node (octets root sdef depth visited)`, called BOTH by the top-level entry and
+  by the nested resolver — so nesting recurses naturally through the same code. The nested arm is
+  `%lto-nested-type-identifier`: resolve the CODE-9 def via `%lto-find-def-node`, parse it with
+  `%lto-parse-struct-node` at `(1+ depth)` with the member-hash added to `visited`, wrap the result
+  in `(hash-type-identifier +ek-minimal+ :referenced model)`. `%lto-member-type-identifier` gains
+  `depth`/`visited` params and dispatches kind 0x16 to it.
+- **Cycle + depth guard (NFR-SEC-POSTURE, MANDATORY)**: `*lto-max-type-depth*` (16) caps nested
+  resolution depth — guaranteeing termination even for a hostile chain. A `visited` list of member
+  hash@+16 keys (packed u64) short-circuits a self-/mutually-referential reference: when a member's
+  hash is already in `visited`, the resolver returns NIL (fail-open, member TI NIL, parse
+  continues) at depth 1 rather than looping. The two guards are belt-and-suspenders: depth bounds
+  any chain; the visited set breaks an exact cycle immediately. Because the corpus IDL is acyclic
+  (no cyclic TypeObject capturable), the guard is verified by (a) `*lto-max-type-depth*` 0 forcing
+  every nested member open while flat members still decode (`:lto-nested-depth-guard`), and (b)
+  C_Nested2's legitimate repeated reference NOT being over-blocked (`:lto-nested2-both-resolved`).
+  Reasoning for the self-ref case: a `struct S { S inner; }` member's hash == S's def-hash; first
+  resolution adds it to `visited` and recurses into S; the inner `inner` member's hash is now in
+  `visited` → NIL → recursion stops at depth 1. The visited set is passed BY VALUE down the
+  recursion (not mutated), so sibling members at the same level (C_Nested2 inner/inner2) do not
+  pollute each other.
+- **Assignability proof (through the REAL gate)**: the parsed `inner` aggregate TI's `referenced`
+  C_Inner {a,b long} feeds `struct-assignable-from`. Note: a `@final` nested element is NOT
+  self-delimiting under XCDR2 (§7.2.4.2), so the stack's strong-assignability rule
+  (`:asg-strong-delimited`) would mask the recursion for a `@final`/`@final` pair — therefore the
+  recursion proof uses a `@mutable` outer + `@appendable` nested C_Inner (mirroring the stack's
+  established `:asg-nested` fixture), where the nested member-type DRIVES the verdict: a
+  nested-compatible local → T (both directions); a nested-INCOMPATIBLE local (C_Inner.a or .b
+  retyped long→double) → NIL — the gate recurses into the referenced model to decide. (A member-SET
+  change is not used: APPENDABLE allows truncation both ways, so a dropped member stays assignable;
+  only a member-TYPE change flips the recursed verdict.)
+- **Decoded coverage**: nested-struct members (any depth, under the depth/cycle guards) decode +
+  recurse through assignability. STILL `:unsupported` / member-TI NIL (fail-open): sequence-OF-
+  aggregate (sequence element kind non-primitive — Task 3.x), and any Stage-4 aggregate variant
+  (unions, enums, typedefs, arrays, nested mutable members carrying explicit per-member EMHEADER
+  ids) — NOT captured here.
+- **Corpus artifacts**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked; all
+  `rtiddsgen` output, the `corpus_pub` binary, and the symlinked RTI dylibs stay git-ignored (NFR-IP).

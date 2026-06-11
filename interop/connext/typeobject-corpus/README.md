@@ -155,6 +155,41 @@ members do not change layout under `@mutable`). Captured vectors + the full anal
 flat-struct parse (names / ids / primitives / strings / keys / extensibility) that feeds
 `struct-assignable-from`.
 
+### `C_Seq` / `C_SeqL` / `C_SeqL100` — sequence member element + bound (Task 3.1)
+
+Three more siblings, each a struct with `@key long id` plus one sequence member `payload`: `C_Seq`
+(`sequence<octet>`, matching the LargeData shape — unbounded), `C_SeqL` (`sequence<long, 10>`), and
+`C_SeqL100` (`sequence<long, 100>`). The sequence member's node carries kind `0x12` (18) at
+`VALUE-START+8` plus an 8-octet type-hash at `+16` that references a sequence-definition node
+(`CODE 7`, vs `CODE 8` for strings); that node's `CODE 100` child holds the element type-kind (u16,
+RTI's primitive enum: octet 2 / long 5) and its `CODE 200` child the bound as a u32. The unbounded
+`C_Seq` emits bound **100** (RTI's default unbounded-sequence bound, mirroring 255 for strings; the
+internal type name `sequence_100_Byte` confirms it); `C_SeqL`/`C_SeqL100` give 10/100. Captured vectors
++ the full analysis are in `docs/provenance.md` (2026-06-11); they drive `%lto-sequence-type-identifier`.
+Only sequence-of-PRIMITIVE was exercised; sequence-of-{string,struct,sequence} is a Task-3.2 gap
+(the member TI stays NIL, fail-open). NOTE: on macOS symlink the RTI dylibs next to `corpus_pub` (SIP
+strips `DYLD_LIBRARY_PATH`), as for the string-bound experiments.
+
+### `C_Nested` / `C_Nested2` — nested-struct member + recursion (Task 3.2)
+
+Two more siblings: `C_Nested` (`@key long id; C_Inner inner`) and `C_Nested2` (a 2nd `C_Inner
+inner2`); `C_Inner` is `@final struct { long a; long b; }`. Publishing `C_Nested` makes RTI emit
+`C_Inner`'s definition as a **TypeLibrary sibling** in the SAME legacy TypeObject — the outer
+`C_Nested` `CODE 9` struct-def FIRST, `C_Inner`'s `CODE 9` def after it. The nested member's node
+carries kind `0x16` (22) at `VALUE-START+8` (strings `0x13`, sequences `0x12`, nested struct
+`0x16`) plus the same 8-octet type-hash at `+16`, referencing `C_Inner`'s `CODE 9` def (whose
+`CODE 0` child echoes that hash at `VALUE-START+8`) — the SAME hash-reference mechanism, just a
+different def-node CODE. The decoder resolves the def (shared `%lto-find-def-node`, def-code 9),
+parses it via the shared `%lto-parse-struct-node` (so nesting recurses), and attaches it as an
+EK_MINIMAL `hash-type-identifier`'s `referenced` — the shape `struct-assignable-from` / the
+TypeLookup gate recurse into. Bounded by `*lto-max-type-depth*` + a visited-hash cycle guard (a
+hostile self-/mutually-referential TypeObject terminates, never hangs); `C_Nested2`'s two members
+sharing one `C_Inner` def confirm a legitimate repeated reference is not over-blocked. Captured
+vectors + the full analysis are in `docs/provenance.md` (2026-06-11); they drive
+`%lto-nested-type-identifier`. Sequence-of-aggregate + Stage-4 aggregates (union/enum/array/typedef)
+stay a gap (member TI NIL, fail-open). NOTE: on macOS symlink the RTI dylibs next to `corpus_pub`
+(SIP strips `DYLD_LIBRARY_PATH`), as for the earlier experiments.
+
 ## Files
 
 `Corpus.idl`, `corpus_pub.cxx`, `USER_QOS_PROFILES.xml`, `Makefile`, `README.md` are the

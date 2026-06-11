@@ -196,3 +196,54 @@ struct C_ShapeMutable {
     long y;
     long shapesize;
 };
+
+// C_Seq / C_SeqL / C_SeqL100 — Task 3.1 sequence-member differentials. C_Seq matches the
+// LargeData shape (`@key long id; sequence<octet> payload`) so the unbounded-sequence default
+// bound RTI emits is recorded like the 255-string finding. C_SeqL / C_SeqL100 bound a
+// sequence<long> at 10 / 100 to localize the element-type reference and the bound encoding /
+// field width. Diff each inflated TypeObject vs the base C_Shape (lto-diff).
+@final
+struct C_Seq {
+    @key long id;
+    sequence<octet> payload;
+};
+
+@final
+struct C_SeqL {
+    @key long id;
+    sequence<long, 10> payload;
+};
+
+@final
+struct C_SeqL100 {
+    @key long id;
+    sequence<long, 100> payload;
+};
+
+// C_Inner / C_Nested — Task 3.2 nested-struct differentials. C_Inner is a plain @final struct
+// (two longs); C_Nested embeds it as a member `inner`. Publishing C_Nested forces RTI to emit
+// C_Inner's definition as a TypeLibrary sibling element in the SAME legacy TypeObject, so the
+// `inner` member references C_Inner's struct-def by its 8-octet type-hash (the same mechanism
+// strings/sequences use, but pointing at a CODE-9 struct-def node). Diffing the nested member's
+// node + walking C_Inner's sibling def localizes the nested member-kind and the reference.
+@final
+struct C_Inner {
+    long a;
+    long b;
+};
+
+@final
+struct C_Nested {
+    @key long id;
+    C_Inner inner;
+};
+
+// C_Nested2 — Task 3.2 deeper/multi-nest differential: TWO nested members (a second C_Inner) to
+// confirm the resolver + assignability recurse independently per member and the cycle/visited
+// guard handles repeated references to the SAME def. The corpus DSL is acyclic by construction.
+@final
+struct C_Nested2 {
+    @key long id;
+    C_Inner inner;
+    C_Inner inner2;
+};

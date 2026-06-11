@@ -173,10 +173,42 @@ int main(int argc, char **argv)
         return run_corpus<C_ShapeMutable>(domain, topic, type, sample);
     }
 
+    // Task 3.1 sequence-member differentials.
+    if (type == "C_Seq") {
+        C_Seq sample;
+        sample.id(7); sample.payload().resize(3);
+        return run_corpus<C_Seq>(domain, topic, type, sample);
+    }
+    if (type == "C_SeqL") {
+        C_SeqL sample;
+        sample.id(7); sample.payload().resize(3);
+        return run_corpus<C_SeqL>(domain, topic, type, sample);
+    }
+    if (type == "C_SeqL100") {
+        C_SeqL100 sample;
+        sample.id(7); sample.payload().resize(3);
+        return run_corpus<C_SeqL100>(domain, topic, type, sample);
+    }
+
+    // Task 3.2 nested-struct differentials.
+    if (type == "C_Nested") {
+        C_Nested sample;
+        sample.id(7); sample.inner().a(1); sample.inner().b(2);
+        return run_corpus<C_Nested>(domain, topic, type, sample);
+    }
+    if (type == "C_Nested2") {
+        C_Nested2 sample;
+        sample.id(7);
+        sample.inner().a(1); sample.inner().b(2);
+        sample.inner2().a(3); sample.inner2().b(4);
+        return run_corpus<C_Nested2>(domain, topic, type, sample);
+    }
+
     std::cerr << "usage: " << argv[0] << " <domain> <topic> <typename>\n"
               << "  unknown typename '" << type << "'; this build knows: C_Shape, C_Shape2, C_Shape3, C_Shape4,\n"
               << "  C_ShapeP_{short,ushort,ulong,longlong,ulonglong,octet,float,double,boolean,char},\n"
-              << "  C_ShapeS32, C_ShapeS300, C_ShapeNoKey, C_ShapeAppend, C_ShapeMutable\n"
+              << "  C_ShapeS32, C_ShapeS300, C_ShapeNoKey, C_ShapeAppend, C_ShapeMutable,\n"
+              << "  C_Seq, C_SeqL, C_SeqL100, C_Nested, C_Nested2\n"
               << "  (later corpus tasks add types to Corpus.idl + a dispatch arm here)\n";
     return 1;
 }
