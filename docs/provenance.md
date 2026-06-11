@@ -172,3 +172,21 @@ Pinning/vendoring of hot-path dependencies (NFR-BUILD) is a tracked M1 follow-up
   compressed_length u32` followed by the zlib stream. This is an RTI-vendor parameter, NOT
   an OMG-spec construct; treated as a behavioural interop reference (NFR-IP). →
   `src/dds-types/type-object-lb.lisp` (`inflate-type-object-lb`).
+
+## M4 (2026-06-10) — TypeLookup wire framing convention (ADR 0010, FR-TYPE-3)
+
+- **Fast DDS (Apache-2.0, eProsima) read for understanding only — no code copied**:
+  `src/cpp/fastdds/builtin/type_lookup_service/detail/{TypeLookupTypes.idl,rpc_types.idl}`
+  and `TypeLookupManager.cpp` (GitHub master, 2026-06-10) consulted to determine the
+  de-facto wire convention for the XTypes 1.3 §7.6.3.3 service, whose top-level types the
+  spec IDL leaves unannotated: Fast DDS pins `TypeLookup_Request`/`TypeLookup_Reply` and
+  every DDS-RPC header struct `@final` and serializes with XCDRv2. **Fast CDR**
+  (`src/cpp/Cdr.cpp`) consulted for the mutable-member length-code selection: when a
+  member value begins with its own DHEADER/length, the encoder emits `EMHEADER1 LC=5`
+  with NEXTINT doubling as that leading UInt32 (XTypes 1.3 §7.4.3.5.3 rule (22)).
+- **Wireshark `epan/dissectors/packet-rtps.c` (GPL-2.0) read for understanding only — no
+  code copied**: the reference RTPS dissector's TypeLookup dissection (release-4.6)
+  consulted to confirm it implements exactly the Fast DDS layout (CDR2_LE-gated, no
+  top-level DHEADER, union DHEADERs, NEXTINT-as-count members). Used as the independent
+  framing/payload oracle for the self-pinned vectors (`make wire`; no live peer exists,
+  ADR 0010). → `src/dds-types/typelookup.lisp`.

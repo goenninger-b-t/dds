@@ -112,6 +112,17 @@ Optional callbacks the [DCPS](dcps.md) layer installs to surface events to the a
 - `dds.disc:disc-node-on-inconsistent-topic` — fired on a same-name/different-type collision (drives INCONSISTENT_TOPIC).
 - `dds.disc:disc-node-on-sample` — fired when a new user sample is stored (drives DATA_AVAILABLE + the condvar WaitSet wake).
 
+#### Type-compatibility gate + parked matches
+
+A dds-types-aware layer (DCPS) can interpose a **type-compatibility verdict** before any
+SEDP match is recorded — e.g. XTypes assignability, possibly waiting on a TypeLookup query.
+The DCPS layer installs exactly such a gate on every `DomainParticipant` (FR-TYPE-4 gated
+matching — see [DCPS](dcps.md), "Assignability-gated matching").
+
+- `dds.disc:disc-node-type-gate` — optional gate consulted **before a match is recorded**, in both directions (discovered publication vs. local readers, discovered subscription vs. local writers). Contract: called as `(funcall gate node remote local)` where `remote` and `local` are the `dds.rtps.discovery:endpoint-data` pair that just passed topic/type-name + RxO matching; it runs on the receiver thread **outside the node lock** (the gate is user code, like the `on-*` hooks). Verdicts: `:compatible` — record + fire the match as usual; `:incompatible` — routed to the INCONSISTENT_TOPIC record/fire path (same as a type-name mismatch); `:pending` — the decision is **parked** (deduped by remote GUID, so a re-announced remote parks at most once) and no match is recorded until `resume-parked-matches`. A `NIL` gate (the default) — and any other return value — behaves as `:compatible`, byte-identical to plain SEDP matching.
+- `dds.disc:resume-parked-matches` *(node)* — take + clear the parked list under the node lock, then re-run each parked match decision outside it; the gate is consulted again, so a still-`:pending` verdict re-parks the entry (still deduped). Call once the gate's verdict has resolved (e.g. a TypeLookup reply arrived).
+- `dds.disc:disc-node-parked-count` *(node)* — number of parked match decisions awaiting `resume-parked-matches` (diagnostic).
+
 ### The reliable user-data plane (`dds.disc`)
 
 Wires the value-level reliable writer/reader (`dds.rtps.reliable`) to UDP. For v1 the
@@ -133,6 +144,27 @@ recovery).
 - `dds.disc:node-sample` *(node sn)* — the received payload for sequence number `SN`, or `NIL`.
 - `dds.disc:node-sample-sns` *(node)* — sequence numbers of the user samples received so far (unordered; SNs may not start at 1 against Connext).
 - `dds.disc:node-acks-in` *(node)* — count of ACKNACKs received for the node's user writer — i.e. how many times a matched reader (incl. a foreign one like RTI) acknowledged our data (`>0` proves a remote reliable reader is receiving; diagnostic).
+
+### The TypeLookup service endpoints (`dds.disc`)
+
+The four built-in TypeLookup service endpoints (DDS-XTypes 1.3 §7.6.3.3.3 Table 61) ride the
+node's metatraffic socket; requests and replies travel as `DATA` submessages routed by
+writerId, with the same per-remote reliable builtin bookkeeping SEDP uses (a peer's HEARTBEAT
+is answered with a final ACKNACK) plus a bounded resend store for the reply writer (a peer's
+ACKNACK NACKing a reply SN triggers a retransmit; the store is small because the service is
+VOLATILE per §7.6.3.3.3). The server side answers any inbound `TypeLookup_Request` via the
+transport-free core `dds.types:type-lookup-respond` over the global type registry (see
+[Type system](type-system.md)). No oracle exists against Connext (RTI does not implement the
+standard service, ADR 0010), so the byte-level encoding is CONFIRM-VS-PEER; the reference
+tshark dissector names all four EntityIds and parses the request/reply `DATA` + the reply
+HEARTBEAT with no malformed markers.
+
+- `dds.disc:+entityid-tl-req-writer+` / `dds.disc:+entityid-tl-req-reader+` — `ENTITYID_TL_SVC_REQ_WRITER/READER` = `{{00,03,00},c3/c4}` (XTypes 1.3 Table 61).
+- `dds.disc:+entityid-tl-reply-writer+` / `dds.disc:+entityid-tl-reply-reader+` — `ENTITYID_TL_SVC_REPLY_WRITER/READER` = `{{00,03,01},c3/c4}` (XTypes 1.3 Table 61).
+- `dds.disc:type-lookup-query` *(node prefix hashes continuation)* — ask participant `PREFIX`'s TypeLookup service for the TypeObjects of `HASHES` (a list of 14-octet EquivalenceHashes) via a `getTypes` request sent to its metatraffic locator. `CONTINUATION` is called exactly once, outside the node lock, with `(pairs okp)`: `okp` `T` plus the `(hash . typeobject-octets)` alist on a `REMOTE_EX_OK` reply (possibly empty — none of the hashes were known to the peer), or `(NIL NIL)` on a non-OK reply, on expiry, or immediately at the pending cap. Returns `T` if the request was recorded, `NIL` on the cap rejection. The request's `instanceName` is `"dds.builtin.TOS."` + the 24-char lowercase-hex target prefix (§7.6.3.3.4 is self-contradictory on the length; CONFIRM-VS-PEER).
+- `dds.disc:tl-sweep` *(node)* — expire every pending query past its deadline (continuation called with `(NIL NIL)`). Driven automatically on the periodic announce cadence (`announce-endpoints`); call directly to force expiry.
+- `dds.disc:*typelookup-timeout*` — seconds before a pending query expires (default 3; read per query). Local policy — the service QoS itself is RELIABLE/KEEP_ALL/VOLATILE (§7.6.3.3.3).
+- `dds.disc:*max-typelookup-pending*` — cap on in-flight client requests per node (default 64; NFR-SEC-POSTURE). At the cap a query is rejected immediately (continuation `(NIL NIL)`, return `NIL`).
 
 ### Standalone tests (`dds.disc`)
 

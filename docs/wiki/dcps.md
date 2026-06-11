@@ -125,7 +125,31 @@ When a remote endpoint matches a local DataReader/DataWriter, the matcher assess
 | Symbol | Description |
 |---|---|
 | `dds.dcps:entity-type-compat` (`entity`) | The advisory type-object fingerprint verdict for the most recently matched remote, recorded per DataReader/DataWriter (one of the `assess-type-object-lb` verdict keywords); `NIL` on other entities and until a first match. Inspection only — it never affects matching. |
-| `dds.dcps:*type-compat-log*` | When set to a stream (default `NIL` = silent), the matcher writes one advisory verdict line per freshly matched remote to it. Diagnostics opt-in only. The matcher runs on the discovery receiver thread, so set this with a process-global `setf`, not a thread-local `let` in another thread. |
+| `dds.dcps:*type-compat-log*` | When set to a stream (default `NIL` = silent), the matcher writes one advisory verdict line per freshly matched remote to it (and the FR-TYPE-4 gate below writes one line per recorded gate verdict). Diagnostics opt-in only. The matcher runs on the discovery receiver thread, so set this with a process-global `setf`, not a thread-local `let` in another thread. |
+
+### Assignability-gated matching (FR-TYPE-4)
+
+Every participant installs an **assignability gate** on its engine's `type-gate` hook (see
+[discovery](discovery.md)). Unlike the ADR 0009 advisory above, this gate **does decide the
+match** — but only when it can genuinely assess the types; every unassessable case falls
+back to today's name-based matching, never to a rejection. The verdict ladder, evaluated
+on the discovery receiver thread for **both** match directions:
+
+1. The remote endpoint carries no `PID_TYPE_INFORMATION` → **`:compatible`** (name-based, the pre-XTypes behavior).
+2. A verdict already recorded for this remote GUID replays (the post-resume re-run never re-queries).
+3. Malformed TypeInformation, no local Minimal TypeObject (the local type-support is resolved through the participant's Topic of the endpoint's topic name, falling back to the global registry under its type name), or an unserializable local hash → **`:compatible`** (cannot assess; logged).
+4. The remote's EquivalenceHash equals the local one → **`:compatible`** (fast path, zero wire traffic).
+5. Otherwise the remote Minimal TypeObject is fetched from the remote participant's **TypeLookup service** (`getTypes`, XTypes 1.3 §7.6.3.3.3) — the match decision parks as `:pending` meanwhile. If the remote participant has not been SPDP-discovered yet (SEDP can outrun SPDP across the two sockets), the gate stays `:pending` *without* querying; the peer's SEDP re-announce re-runs it once the locator is known. Nested `EK_MINIMAL` member hashes are resolved with bounded follow-up queries (at most `*typelookup-max-depth*` rounds), attaching each fetched model to the referencing TypeIdentifier.
+6. Fully resolved, the verdict is XTypes 1.3 §7.6.3.4.2 Step 1: the **reader-side** type must be `is-assignable-from` the writer-side type under the reader's `TYPE_CONSISTENCY_ENFORCEMENT` QoS (`ALLOW_TYPE_COERCION` → assignability with the four option flags; `DISALLOW_TYPE_COERCION` → Minimal equivalence). The direction is recovered from the remote GUID's entityKind octet (writer = `0x02`/`0x03`, reader = `0x04`/`0x07` in the low six bits, RTPS 2.5 §9.3.1.2 Table 9.1). `:incompatible` routes to the INCONSISTENT_TOPIC path (status + listener on the local Topic).
+7. A TypeLookup timeout/failure, an unknown hash, depth exhaustion, or an unresolvable nesting records the **`:compatible` fallback** (logged via `*type-compat-log*`) and the match completes by name.
+
+Known gap: an unreachable TypeLookup service costs `*typelookup-timeout*` (default 3 s) of parked-match latency per remote endpoint before the name fallback. Known gap: a timeout/unassessable fallback verdict of `:compatible` is replayed for that remote GUID on every re-announce and is never re-assessed until FIFO eviction — a later-reachable TypeLookup service is not re-consulted for an already-decided endpoint. Known gap: `TYPE_CONSISTENCY_ENFORCEMENT` does not ride our SEDP ParameterList yet, so when
+the **remote** endpoint is the reader its policy assumes the §7.6.3.4.1 defaults.
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:*max-typeobject-cache-entries*` | Cap (default 256) on the parsed remote TypeObjects and per-remote verdicts each participant's gate retains; FIFO-evicted at the cap (resource-exhaustion guard). Read at insertion time. |
+| `dds.dcps:*typelookup-max-depth*` | Maximum nested-type TypeLookup follow-up rounds (default 4) before the gate falls back to name-based matching. Bounds wire traffic and recursion. |
 
 ### Content-filtered topics + query conditions
 
