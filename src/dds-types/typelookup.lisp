@@ -8,18 +8,27 @@
 ;;;; builtin TypeLookup service); the framing follows the de-facto interop convention of
 ;;;; the designated FR-IO-2 oracle, Fast DDS (whose rpc_types.idl/TypeLookupTypes.idl pin
 ;;;; every RPC header struct and the top-level Request/Reply @final), which the
-;;;; Wireshark/tshark RTPS dissector implements verbatim. CONFIRM-VS-PEER stays where a
-;;;; byte-level choice still awaits a live peer capture: (1) the spec IDL (§7.6.3.3.3)
+;;;; Wireshark/tshark RTPS dissector implements verbatim. The framing choices are now
+;;;; PEER-CONFIRMED against live Fast DDS 3.6.1 (FR-IO-2 S4, 2026-06-12: leg A
+;;;; s4-ourclient-lo0.pcap frs 85-87, our client vs their server; leg B-patched
+;;;; s4-theirclient-patched-lo0.pcap frs 2494-2498, their client vs our server — see
+;;;; interop/fastdds/README.md "CONFIRM-VS-PEER walk"): (1) the spec IDL (§7.6.3.3.3)
 ;;;; leaves TypeLookup_Request/Reply unannotated — the §7.3.1.2.1.8 default would be
 ;;;; appendable — but the implemented convention is FINAL => PLAIN_CDR2, encapsulation
-;;;; CDR2_LE {0x00,0x07} (Table 60, §7.6.3.1.2), NO top-level DHEADER. (2) The DDS-RPC
-;;;; header structs are FINAL => flat; the TypeLookup_Call/Return/Result unions are
-;;;; unannotated => default appendable => each carries a DHEADER before its discriminator
-;;;; (§7.4.3.4.1 + §7.4.3.5.3 rule (30)). (3) The MUTABLE *_In/*_Out members use EMHEADER1 LC=5: NEXTINT doubles
-;;;; as the member value's leading UInt32 (DHEADER / element count) per serialization
-;;;; rule (22) (§7.4.3.5.3), matching the Fast CDR encoder. (4) type_ids elements are
-;;;; EK_MINIMAL/EK_COMPLETE hash-defined TypeIdentifiers only (the only kinds a request
-;;;; for a TypeObject can name that we serve); other TypeIdentifier kinds reject on parse.
+;;;; CDR2_LE {0x00,0x07} (Table 60, §7.6.3.1.2), NO top-level DHEADER [PEER-CONFIRMED:
+;;;; every live frame both directions]. (2) The DDS-RPC header structs are FINAL => flat;
+;;;; the TypeLookup_Call/Return/Result unions are unannotated => default appendable =>
+;;;; each carries a DHEADER before its discriminator (§7.4.3.4.1 + §7.4.3.5.3 rule (30))
+;;;; [PEER-CONFIRMED: their fr 2496 Call DHEADER; their fr 86 Return+Result DHEADERs;
+;;;; ours consumed both directions]. (3) The MUTABLE *_In/*_Out members use EMHEADER1
+;;;; LC=5: NEXTINT doubles as the member value's leading UInt32 (DHEADER / element count)
+;;;; per serialization rule (22) (§7.4.3.5.3), matching the Fast CDR encoder
+;;;; [PEER-CONFIRMED: their frs 86/2496 emit LC=5; our LC=5 frames consumed]. (4) type_ids
+;;;; elements are EK_MINIMAL/EK_COMPLETE hash-defined TypeIdentifiers only (the only kinds
+;;;; a request for a TypeObject can name that we serve); other TypeIdentifier kinds reject
+;;;; on parse. CONFIRM-VS-PEER stays open only for: a live non-OK reply (Return-arm
+;;;; omission — self-pinned, tshark-validated) and non-CDR2_LE encapsulations (both peers
+;;;; only ever emitted CDR2_LE).
 
 (in-package #:dds.types)
 
@@ -41,12 +50,14 @@
   "Member id of the @hashid continuation_point member of TypeLookup_getTypeDependencies_In
    (XTypes 1.3 §7.6.3.3.3 + §7.3.1.2.1.1).")
 
-;; FINAL top level (Fast DDS @final convention; spec IDL unannotated). CONFIRM-VS-PEER.
+;; FINAL top level (Fast DDS @final convention; spec IDL unannotated). PEER-CONFIRMED.
 (defconstant +tl-encap-cdr2-le+ #x0007
   "RTPS encapsulation identifier CDR2_LE {0x00,0x07}: PLAIN_CDR2, XCDR2, little endian
    (XTypes 1.3 §7.6.3.1.2 Table 60). TypeLookup_Request/Reply's encapsulation — the
    top-level types are FINAL per the implemented convention (Fast DDS pins them @final;
-   the tshark RTPS dissector expects exactly this), so no top-level DHEADER follows.")
+   the tshark RTPS dissector expects exactly this), so no top-level DHEADER follows.
+   PEER-CONFIRMED live vs Fast DDS 3.6.1 (FR-IO-2 S4, 2026-06-12): every TypeLookup frame
+   both directions carries 0x0007 with the flat header directly after the options.")
 
 (defconstant +tl-max-instance-name+ 255
   "InstanceName bound: typedef string<255> InstanceName (XTypes 1.3 §7.6.3.3.2).")
@@ -59,7 +70,9 @@
 (defun* %put-tl-request-header (c writer-guid sn instance-name)
     (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)) integer string) t)
   "dds::rpc::RequestHeader, flat (§7.6.3.3.2): 16 GUID octets + SequenceNumber_t
-   (long high, unsigned long low) + InstanceName string. CONFIRM-VS-PEER (flat nesting)."
+   (long high, unsigned long low) + InstanceName string. PEER-CONFIRMED (flat nesting):
+   Fast DDS 3.6.1 emits the identical layout (s4-theirclient-patched-lo0.pcap frs
+   2494/2496) and its server consumed ours (s4-ourclient-lo0.pcap fr 85 -> REMOTE_EX_OK)."
   (dds.core.buffer:put-octets c writer-guid 0 16)
   (dds.cdr:cdr-put-u32 c (logand (ash sn -32) #xFFFFFFFF) :xcdr2)
   (dds.cdr:cdr-put-u32 c (logand sn #xFFFFFFFF) :xcdr2)
@@ -271,7 +284,8 @@
    bounds-checked against the input extent, NFR-SEC-POSTURE)."
   (let ((len (length octets)))
     (when (< len 8) (return-from parse-type-lookup-request nil))
-    ;; encapsulation: CDR2_LE only (what we emit; other encodings CONFIRM-VS-PEER)
+    ;; encapsulation: CDR2_LE only (what we and live Fast DDS 3.6.1 emit, FR-IO-2 S4;
+    ;; other encodings CONFIRM-VS-PEER -- no peer has ever sent one)
     (unless (and (= (aref octets 0) (ldb (byte 8 8) +tl-encap-cdr2-le+))
                  (= (aref octets 1) (ldb (byte 8 0) +tl-encap-cdr2-le+)))
       (return-from parse-type-lookup-request nil))
@@ -322,9 +336,14 @@
 ;;;; dds::rpc::RequestHeader — an editorial defect: §7.6.3.3.2 copies ReplyHeader
 ;;;; { dds::SampleIdentity relatedRequestId; RemoteExceptionCode_t remoteEx; } from
 ;;;; DDS-RPC precisely for the @RPCReplyType, and only ReplyHeader can carry remoteEx.
-;;;; We serialize the §7.6.3.3.2 ReplyHeader. CONFIRM-VS-PEER. The nested Return/Result
-;;;; unions are default-appendable: each carries a DHEADER before its discriminator
-;;;; (§7.4.3.4.1 + §7.4.3.5.3 rule (30)), like the request's TypeLookup_Call (the Fast DDS / dissector layout).
+;;;; We serialize the §7.6.3.3.2 ReplyHeader. PEER-CONFIRMED: Fast DDS 3.6.1's reply
+;;;; carries remoteEx directly after relatedRequestId (s4-ourclient-lo0.pcap fr 86, the
+;;;; locked fastdds-typelookup-reply-vector), and its client consumed OUR replies with
+;;;; this placement and resolved the type from them (s4-theirclient-patched-lo0.pcap
+;;;; frs 2495/2497 -> 2498). The nested Return/Result unions are default-appendable: each
+;;;; carries a DHEADER before its discriminator (§7.4.3.4.1 + §7.4.3.5.3 rule (30)), like
+;;;; the request's TypeLookup_Call (the Fast DDS / dissector layout; their fr 86 hex shows
+;;;; both DHEADERs).
 
 ;; @hashid("types") §7.3.1.2.1.1: MD5[0:4]={d1 4a 80 22} LE=#x22804AD1 AND #x0FFFFFFF (test re-derives)
 (defconstant +tl-member-types+ #x02804AD1
@@ -371,7 +390,9 @@
     (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)) integer symbol) t)
   "dds::rpc::ReplyHeader, flat (§7.6.3.3.2): relatedRequestId SampleIdentity (16 GUID
    octets + SequenceNumber_t long high / unsigned long low) + remoteEx enum as a 32-bit
-   value (default enum bit-bound). CONFIRM-VS-PEER (flat nesting, like the request)."
+   value (default enum bit-bound). PEER-CONFIRMED (flat nesting, like the request):
+   byte-identical layout in Fast DDS 3.6.1's own reply (fr 86) and ours consumed by
+   their client (patched frs 2495/2497)."
   (dds.core.buffer:put-octets c related-guid 0 16)
   (dds.cdr:cdr-put-u32 c (logand (ash related-sn -32) #xFFFFFFFF) :xcdr2)
   (dds.cdr:cdr-put-u32 c (logand related-sn #xFFFFFFFF) :xcdr2)
@@ -446,8 +467,11 @@
    when NIL or empty, §7.6.3.3.4.1). For any non-:ok REMOTE-EX the TypeLookup_Return is
    omitted entirely: DDS-RPC (referenced by §7.6.3.3.2/.4) signals failure via remoteEx,
    the Return union has no default arm to select (§7.6.3.3.3), and the reply then ends at
-   the input extent (FINAL top level: absence = nothing after the header).
-   CONFIRM-VS-PEER. Returns a fresh vector."
+   the input extent (FINAL top level: absence = nothing after the header). The
+   REMOTE_EX_OK framing is PEER-CONFIRMED (Fast DDS 3.6.1's client consumed our getTypes
+   and getTypeDependencies replies and built the type from them, FR-IO-2 S4 leg
+   B-patched); the non-OK Return-arm omission stays CONFIRM-VS-PEER (never provoked live;
+   self-pinned + tshark-validated only). Returns a fresh vector."
   (when writer-guid
     (unless (= 16 (length writer-guid))
       (error "TypeLookup_Reply: writer-guid must be 16 octets (GUID_t, XTypes §7.6.3.3.2)")))
@@ -659,7 +683,8 @@
    §7.6.3.3.3) and yields an empty RESULT."
   (let ((len (length octets)))
     (when (< len 8) (return-from parse-type-lookup-reply nil))
-    ;; encapsulation: CDR2_LE only (what we emit; other encodings CONFIRM-VS-PEER)
+    ;; encapsulation: CDR2_LE only (what we and live Fast DDS 3.6.1 emit, FR-IO-2 S4;
+    ;; other encodings CONFIRM-VS-PEER -- no peer has ever sent one)
     (unless (and (= (aref octets 0) (ldb (byte 8 8) +tl-encap-cdr2-le+))
                  (= (aref octets 1) (ldb (byte 8 0) +tl-encap-cdr2-le+)))
       (return-from parse-type-lookup-reply nil))

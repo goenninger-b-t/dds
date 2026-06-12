@@ -1,0 +1,21 @@
+./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/type_probe && ./type_probe 30'
+[37;1m2026-06-12 04:23:09.201 [33;1m[[37;1mTRANSPORT_UDPV4[33;1m Warning] [37mSupport for interfaceWhiteList will be removed in a future release. Please use interface allowlist/blocklist instead.[34;1m -> Function [36mUDPv4Transport[m
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] writer discovered: topic=Square type=ShapeType type_information.assigned=0
+[type_probe] discovered type NOT in registry (resolution failed)
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.11.ec.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] FAIL: no type resolved within 30 s
+[37;1m2026-06-12 04:23:39.209 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x104b1c070 (0x104b1c150)[34;1m -> Function [36mReceive[m
+[37;1m2026-06-12 04:23:39.210 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x104b1ce60 (0xb8b04c000)[34;1m -> Function [36mReceive[m
+[37;1m2026-06-12 04:23:39.210 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x104b1ce60 (0xb8b04c0e0)[34;1m -> Function [36mReceive[m
+[37;1m2026-06-12 04:23:39.210 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0xb8b04c1c0 (0xb8b04c2a0)[34;1m -> Function [36mReceive[m
+make: *** [fastdds-type-probe] Error 1

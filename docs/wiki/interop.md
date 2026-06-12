@@ -107,14 +107,28 @@ JSON-printed samples). Against our publisher it can never fire: Fast DDS 3.6.1
 other vendors" branch), so our 0x0075 — delivered and acknowledged on the wire (frames
 389 / 120-123 of `s4-theirclient-lo0.pcap`) — is stripped before their EDP, the probe
 sees `type_information.assigned=0`, and zero TypeLookup requests appear on the wire.
-No configuration disables the gate. Our TypeLookup **server** therefore stays covered
-by the offline suite + the S3 byte-identity result rather than a live foreign client;
-the harness is ready unchanged for any peer that honors foreign TypeInformation. The
+No configuration disables the gate. The
 run also surfaced an environmental trap — this host's macOS firewall/local-network
 layer silently drops LAN-sourced UDP for unapproved freshly-built binaries — answered
 by a loopback-only probe profile plus the new `run-publisher :peers` unicast-SPDP
 option (`make square-pub PEERS=127.0.0.1:7410`). Full evidence in the S4 leg B section
 of [`interop/fastdds/README.md`](../../interop/fastdds/README.md).
+
+**S4 leg B-patched (NON-STOCK diagnostic, 2026-06-12):** the one direction the stock gate
+blocks — our `TypeLookup_Reply` consumed by their client — was verified live by
+neutralizing the vendor gate in a local Fast DDS build (a one-line bypass in both proxy
+parsers; the SEDP gate sits outside the TypeLookup engine, so the TL traffic itself is
+stock): their probe then saw our 0x0075 (`assigned=1`), sent getTypeDependencies and
+getTypes to our server, consumed both replies, **built its DynamicType from our 87-octet
+MINIMAL TypeObject**, and took **600/600** RELIABLE samples (frames 2494-2500 of
+`s4-theirclient-patched-lo0.pcap`); their per-sample JSON-dump failures were root-caused
+to a Fast DDS defect (member names synthesized from raw MINIMAL `NameHash` bytes are not
+UTF-8), not to our framing. The stock build was restored, rebuilt, and re-proven
+(`assigned=0`). With leg A this closes the TypeLookup **CONFIRM-VS-PEER walk** — framing
+peer-confirmed in both directions; only the non-OK-reply Return-arm omission and
+non-CDR2_LE encapsulations remain self-pinned. Walk table + the exact patch + caveats in
+[`interop/fastdds/README.md`](../../interop/fastdds/README.md) (explicitly NOT a
+stock-peer result; the stock verdict stands above).
 
 Same-host Fast DDS↔Fast DDS smoke is green (S0 gate; 48/50 over `lo0`), mutual SPDP/SEDP
 discovery is proven from the wire (S1 census), and the **FR-IO-2 data-plane DoD is met**

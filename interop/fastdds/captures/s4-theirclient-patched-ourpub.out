@@ -1,0 +1,23 @@
+[pub] Square/ShapeType[canonical] color=RED domain=0 uuid=3e404139-3db7-42a3-a644-1fb5a340582d (multicast 239.255.0.1). Ctrl-C to stop.
+[pub] sent 30 samples; peers=0; ACKNACKs received=0
+[pub] peer discovered -> DATA destination 127.0.0.1:7411
+[pub] sent 60 samples; peers=1; ACKNACKs received=0
+[pub] sent 90 samples; peers=1; ACKNACKs received=21
+[pub] sent 120 samples; peers=1; ACKNACKs received=51
+[pub] sent 150 samples; peers=1; ACKNACKs received=81
+[pub] sent 180 samples; peers=1; ACKNACKs received=111
+[pub] sent 210 samples; peers=1; ACKNACKs received=141
+[pub] sent 240 samples; peers=1; ACKNACKs received=171
+[pub] sent 270 samples; peers=1; ACKNACKs received=200
+[pub] sent 300 samples; peers=1; ACKNACKs received=230
+[pub] sent 330 samples; peers=1; ACKNACKs received=260
+[pub] sent 360 samples; peers=1; ACKNACKs received=290
+[pub] sent 390 samples; peers=1; ACKNACKs received=320
+[pub] sent 420 samples; peers=1; ACKNACKs received=350
+[pub] sent 450 samples; peers=1; ACKNACKs received=380
+[pub] sent 480 samples; peers=1; ACKNACKs received=410
+[pub] sent 510 samples; peers=1; ACKNACKs received=440
+[pub] sent 540 samples; peers=1; ACKNACKs received=470
+[pub] sent 570 samples; peers=1; ACKNACKs received=500
+[pub] sent 600 samples; peers=1; ACKNACKs received=530
+[pub] stopped after 600 samples; ACKNACKs received=530 (uuid=3e404139-3db7-42a3-a644-1fb5a340582d).

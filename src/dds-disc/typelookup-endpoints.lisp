@@ -7,8 +7,10 @@
 ;;;; bounded resend store for the reply writer (ACKNACK-driven retransmit; the
 ;;;; §7.6.3.3.3 service QoS is RELIABLE/KEEP_ALL/VOLATILE). Control-plane: per-query
 ;;;; heap allocation is acceptable here (not a measured hot path). NO Connext
-;;;; oracle exists for this protocol (ADR 0010); byte-level choices are
-;;;; CONFIRM-VS-PEER in dds-types/typelookup.lisp.
+;;;; oracle exists for this protocol (ADR 0010); the byte-level choices in
+;;;; dds-types/typelookup.lisp are PEER-CONFIRMED vs live Fast DDS 3.6.1 (FR-IO-2 S4,
+;;;; 2026-06-12, both directions: our client vs their server, their client vs our
+;;;; server — see the interop/fastdds/README.md CONFIRM-VS-PEER walk).
 
 (in-package #:dds.disc)
 
@@ -80,7 +82,12 @@
   "The service instanceName for a request toward participant PREFIX:
    \"dds.builtin.TOS.\" + the lowercase-hex GUID (XTypes 1.3 §7.6.3.3.4). NOTE:
    §7.6.3.3.4 self-contradicts on the hex length (16 chars stated vs a 15-char
-   example); we send the 24-char prefix hex. CONFIRM-VS-PEER (ADR 0010)."
+   example); we send the 24-char prefix hex. PEER-CONFIRMED interoperable (FR-IO-2 S4,
+   2026-06-12): Fast DDS 3.6.1's server accepted our 24-char form (REMOTE_EX_OK,
+   s4-ourclient-lo0.pcap frs 85-87); its own client sends a THIRD length — 32-char
+   full-GUID hex whose entityId varies per call (s4-theirclient-patched-lo0.pcap frs
+   2494/2496) — which our server accepts (parse-type-lookup-request never gates on
+   instanceName). The spec defect stands; no implementation validates the length."
   (format nil "dds.builtin.TOS.~(~{~2,'0x~}~)" (coerce prefix 'list)))
 
 (defun* %tl-now ()

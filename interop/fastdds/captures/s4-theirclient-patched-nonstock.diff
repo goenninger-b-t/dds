@@ -1,0 +1,26 @@
+diff --git a/src/cpp/rtps/builtin/data/ReaderProxyData.cpp b/src/cpp/rtps/builtin/data/ReaderProxyData.cpp
+index abd43b2..b0318b8 100644
+--- a/src/cpp/rtps/builtin/data/ReaderProxyData.cpp
++++ b/src/cpp/rtps/builtin/data/ReaderProxyData.cpp
+@@ -1082,7 +1082,7 @@ bool ReaderProxyData::read_from_cdr_message(
+                         }
+ 
+                         // Ignore this PID when coming from other vendors
+-                        if (c_VendorId_eProsima != local_vendor_id)
++                        if (false && c_VendorId_eProsima != local_vendor_id)
+                         {
+                             EPROSIMA_LOG_INFO(RTPS_PROXY_DATA,
+                                     "Ignoring PID" << pid << " from vendor " << local_vendor_id);
+diff --git a/src/cpp/rtps/builtin/data/WriterProxyData.cpp b/src/cpp/rtps/builtin/data/WriterProxyData.cpp
+index 2fe798d..56f4505 100644
+--- a/src/cpp/rtps/builtin/data/WriterProxyData.cpp
++++ b/src/cpp/rtps/builtin/data/WriterProxyData.cpp
+@@ -1080,7 +1080,7 @@ bool WriterProxyData::read_from_cdr_message(
+                         }
+ 
+                         // Ignore this PID when coming from other vendors
+-                        if (c_VendorId_eProsima != local_vendor_id)
++                        if (false && c_VendorId_eProsima != local_vendor_id)
+                         {
+                             EPROSIMA_LOG_INFO(RTPS_PROXY_DATA,
+                                     "Ignoring PID" << pid << " from vendor " << local_vendor_id);

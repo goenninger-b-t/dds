@@ -380,3 +380,89 @@ is ON with explicit allow entries for the old harness binaries, `socketfilterfw
 If a future harness binary mysteriously hears nothing from a LAN-sourced peer, approve
 it in the firewall (or System Settings → Privacy → Local Network) — or keep the exchange
 on loopback as above.
+
+## S4 leg B-patched (NON-STOCK diagnostic) — our TypeLookup_Reply consumed by THEIR client (2026-06-12, same host, lo0)
+
+**NON-STOCK.** Stock leg B (above) closed with the vendor-gate finding: stock Fast DDS
+3.6.1 drops `PID_TYPE_INFORMATION` from every non-eProsima vendorId before its TypeLookup
+client can ever run, leaving exactly ONE direction of the S4 matrix unverified live: **our
+`TypeLookup_Reply` consumed by their client**. This controller-approved diagnostic patched
+that single gate out of a local Fast DDS build, reran leg B, and then **restored and
+re-proved the stock build** (below). Nothing here is a stock-peer result; the stock-peer
+verdict for leg B remains the section above.
+
+### The patch (committed as `captures/s4-theirclient-patched-nonstock.diff`)
+
+One-line neutralization of the early-return in BOTH proxy parsers — nothing else:
+
+```diff
+ // src/cpp/rtps/builtin/data/{WriterProxyData,ReaderProxyData}.cpp,
+ // case PID_TYPE_INFORMATION ("Ignore this PID when coming from other vendors"):
+-                        if (c_VendorId_eProsima != local_vendor_id)
++                        if (false && c_VendorId_eProsima != local_vendor_id)
+```
+
+### Run + evidence (`captures/s4-theirclient-patched-lo0.pcap`)
+
+Same orchestration as stock leg B: tshark on `lo0`, `make fastdds-type-probe SECONDS=40`
+(binds metatraffic `127.0.0.1:7410`), then our publisher
+(`run-publisher :color "RED" :count 600 :type :canonical :advertise-address "127.0.0.1"
+:peers "127.0.0.1:7410"`). Logs: `s4-theirclient-patched-probe.out` / `-ourpub.out`.
+
+| # | Event | Evidence (frame, t rel) |
+|---|---|---|
+| 1 | Probe callback now sees our 0x0075: `writer discovered: topic=Square type=ShapeType type_information.assigned=1` — their proxy parser **consumed our LC=4 minimal-only TypeInformation** | probe log; (stock: `assigned=0`) |
+| 2 | THEIR `TypeLookup_Request` **getTypeDependencies** DATA at OUR request reader `{00,03,00}c4`: writer sn 1, requestId sn **0**, CDR2_LE 0x0007, `instanceName` `dds.builtin.TOS.47425029ead5ed0000000000000003c2` (**32-char full-GUID hex** — prefix + our SEDP publications writer `…000003c2`), EK_MINIMAL `bfe2…30ee` | **fr 2494** (t=7.0206 s) |
+| 3 | OUR getTypeDependencies reply DATA from `{00,03,01}c3` (+ reply HEARTBEAT): relatedRequestId echoes their GUID + sn 0, `REMOTE_EX_OK`, empty `dependent_typeids` — consumed (they proceed) | **fr 2495** (93 µs later) |
+| 4 | THEIR **getTypes** request: writer sn 2, requestId sn 1, `instanceName` `dds.builtin.TOS.47425029ead5ed0000000000000301c3` (full GUID of our TL **reply writer**); Call-union DHEADER `23 00 00 00` + mutable-In DHEADER `1b 00 00 00` + EMHEADER1 `0x5C536065` (LC=5, id `type_ids`) on the wire | **fr 2496** |
+| 5 | OUR getTypes reply: `REMOTE_EX_OK`, our 87-octet EK_MINIMAL TypeObject (NameHash members), our EMHEADER1 LC=5 framing, our ReplyHeader remoteEx placement | **fr 2497** (35 µs later) |
+| 6 | Their client **builds the DynamicType FROM OUR REPLY**: `type resolved via remote TypeObject: ShapeType`, RELIABLE reader created — their SEDP `DATA(r)` for the new Square reader | **fr 2498** (t=7.0230 s) |
+| 7 | First delivered user DATA: sn 1 (pre-match history repaired), payload byte-exact `00 07 00 00 | 04 00 00 00 "RED\0" | 35…| 34…| 1e…` = RED x=53 y=52 size=30 | **fr 2500** (t=7.0596 s); their first user ACKNACK fr 2640 |
+| 8 | **600/600 samples taken** by their dynamic reader (`take_next_sample` returned OK for every sample; our writer consumed 530 ACKNACKs) | probe log lines `1:`…`600:` |
+
+**The one blemish is theirs, root-caused:** every `json_serialize` call failed with
+`json.exception.type_error.316 invalid UTF-8 byte` — Fast DDS synthesizes member names
+from a MINIMAL TypeObject's 4-octet `NameHash` via
+`DynamicTypeBuilderFactoryImpl::get_string_from_name_hash` (v3.6.1,
+`DynamicTypeBuilderFactoryImpl.cpp:1626`), which streams the raw `uint8_t` bytes through
+`operator<<` (`std::hex` does not apply to the char overload), producing non-UTF-8 member
+names like `"\xdf.\xa5.\xdd.p"` that their own JSON dumper then rejects. Data
+deserialization itself is unaffected (all 600 takes OK against our byte-exact payloads,
+fr 2500). Any minimal-only TypeLookup server triggers this; not a framing defect on our
+side.
+
+**Verdict: our TypeLookup server is now live-verified against a conformant foreign
+client** — request consumed, both replies consumed, DynamicType built from our MINIMAL
+TypeObject, RELIABLE delivery 600/600. Combined with leg A (our client vs their server),
+every direction of the S4 TypeLookup matrix has now flowed live — with this leg under a
+one-line NON-STOCK vendor-gate bypass, never to be cited as a stock-peer result.
+
+### Stock restored (proof)
+
+`git checkout --` of both files, full rebuild+install (both `*ProxyData.cpp` recompiled,
+`git status` clean in the toolchain tree), stock probe rerun vs the same publisher
+command: `writer discovered: topic=Square type=ShapeType type_information.assigned=0` and
+`discovered type NOT in registry` — the stock vendor-gate signature is back
+(`captures/s4-theirclient-restored-probe.out`).
+
+## The CONFIRM-VS-PEER walk (FR-TYPE-3 closeout, 2026-06-12)
+
+Every CONFIRM-VS-PEER marker in the TypeLookup codecs
+(`src/dds-types/typelookup.lisp`, `src/dds-disc/typelookup-endpoints.lisp`) walked
+against the live captures: leg A (`s4-ourclient-lo0.pcap`, their server) + the patched
+leg B (`s4-theirclient-patched-lo0.pcap`, their client; NON-STOCK transport of the same
+stock TypeLookup engine — the vendor gate sits in the SEDP proxy parsers, not in the
+TypeLookup service code, so the TL frames themselves are stock Fast DDS).
+
+| # | Item | Verdict | Evidence |
+|---|---|---|---|
+| 1 | `instanceName` `dds.builtin.TOS.<hex>` (§7.6.3.3.4 self-contradicts: 16 chars stated, 15-char example) | **PEER-CONFIRMED (both forms interop; spec defect stands)** | Ours (24-char prefix hex) accepted by their server: leg A fr 85 → `REMOTE_EX_OK` frs 86/87. Theirs is **32-char full-GUID hex**, target entity varies per call (`…000003c2` SEDP pub writer, fr 2494; `…000301c3` our TL reply writer, fr 2496) — accepted by our server (parse never gates on it) |
+| 2 | ReplyHeader remoteEx placement (§7.6.3.3.3 IDL editorial defect: only ReplyHeader carries remoteEx) | **PEER-CONFIRMED** | Their reply: leg A fr 86 — `remoteEx` directly after `relatedRequestId`, exactly our layout (the locked vector `fastdds-typelookup-reply-vector` parses it). Ours: patched frs 2495/2497 consumed by their client — it proceeded to getTypes and resolved the type |
+| 3 | EMHEADER1 LC=5 NEXTINT-reuse (rule 22) | **PEER-CONFIRMED** | Their emissions: S3 0x0075 (LC=5), leg A reply fr 86 `types` member EMHEADER1 `0x52804AD1` (LC=5), patched fr 2496 `type_ids` EMHEADER1 `0x5C536065` (LC=5). Ours consumed: our LC=5 TL frames by their server (fr 85→86) and client (frs 2495/2497→fr 2498); our **LC=4** SEDP TypeInformation by their proxy parser (patched run `assigned=1`) |
+| 4 | Non-OK reply omits the Return arm | **STILL-SELF-PINNED** | Only `REMOTE_EX_OK` ever flowed live (legs A + B-patched). tshark-validated self-pinned vector only (`typelookup-vectors`); do not cite a peer |
+| 5 | Top-level @final ⇒ CDR2_LE `0x0007`, no top-level DHEADER | **PEER-CONFIRMED** | Their frames 2494/2496 (requests) + leg A fr 86 (reply): encap `0x0007`, header GUID immediately follows (hex shows no DHEADER). Ours consumed both directions (fr 85, frs 2495/2497) |
+| 6 | Call/Return/Result union DHEADERs (default-appendable) | **PEER-CONFIRMED** | Their request fr 2496 hex: Call DHEADER `23 00 00 00` before the GET_TYPES disc; their reply fr 86 hex: Return DHEADER `da 00 00 00` + Result DHEADER `d2 00 00 00`. Ours consumed both directions |
+
+Open after the walk: item 4 (a live non-OK reply was never provoked), big-endian/other
+encapsulations (both peers only ever emitted CDR2_LE), and the S3 leftovers
+(complete-member emission, dependent-typeid insertion order).

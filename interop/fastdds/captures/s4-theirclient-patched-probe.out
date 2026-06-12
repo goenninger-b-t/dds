@@ -1,0 +1,1227 @@
+./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/type_probe && ./type_probe 40'
+[37;1m2026-06-12 04:15:00.940 [33;1m[[37;1mTRANSPORT_UDPV4[33;1m Warning] [37mSupport for interfaceWhiteList will be removed in a future release. Please use interface allowlist/blocklist instead.[34;1m -> Function [36mUDPv4Transport[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] writer discovered: topic=Square type=ShapeType type_information.assigned=1
+[type_probe] type resolved via remote TypeObject: ShapeType
+[type_probe] matched change: 1 total: 1
+[type_probe] RELIABLE reader created on topic Square with the remotely resolved type
+[37;1m2026-06-12 04:15:08.003 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[type_probe] 1: (json_serialize failed)
+[34;1m -> Function [36mjson_serialize[type_probe] 2: (json_serialize failed)
+[m
+[37;1m[type_probe] 3: (json_serialize failed)
+2026-06-12 04:15:08.004 [31;1m[type_probe] 4: (json_serialize failed)
+[[37;1mXTYPES_UTILS[type_probe] 5: (json_serialize failed)
+[31;1m Error[type_probe] 6: (json_serialize failed)
+] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m[type_probe] 7: (json_serialize failed)
+ -> Function [36mjson_serialize[m[type_probe] 8: (json_serialize failed)
+
+[37;1m2026-06-12 04:15:08.004[type_probe] 9: (json_serialize failed)
+ [31;1m[[37;1mXTYPES_UTILS[type_probe] 10: (json_serialize failed)
+[31;1m Error[type_probe] 11: (json_serialize failed)
+] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[type_probe] 12: (json_serialize failed)
+[34;1m -> Function [36m[type_probe] 13: (json_serialize failed)
+json_serialize[m
+[type_probe] 14: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.004[type_probe] 15: (json_serialize failed)
+ [31;1m[[type_probe] 16: (json_serialize failed)
+[37;1mXTYPES_UTILS[31;1m[type_probe] 17: (json_serialize failed)
+ Error] [type_probe] 18: (json_serialize failed)
+[37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m[type_probe] 19: (json_serialize failed)
+ -> Function [36mjson_serialize[type_probe] 20: (json_serialize failed)
+[m
+[37;1m2026-06-12 04:15:08.004 [31;1m[type_probe] 21: (json_serialize failed)
+[[37;1mXTYPES_UTILS[type_probe] 22: (json_serialize failed)
+[31;1m Error[type_probe] 23: (json_serialize failed)
+] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[type_probe] 24: (json_serialize failed)
+[34;1m -> Function [36m[type_probe] 25: (json_serialize failed)
+json_serialize[m
+[type_probe] 26: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.004 [type_probe] 27: (json_serialize failed)
+[31;1m[[37;1m[type_probe] 28: (json_serialize failed)
+XTYPES_UTILS[31;1m [type_probe] 29: (json_serialize failed)
+Error] [37m[type_probe] 30: (json_serialize failed)
+Error encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [type_probe] 31: (json_serialize failed)
+[36mjson_serialize[type_probe] 32: (json_serialize failed)
+[m
+[37;1m2026-06-12 04:15:08.004[type_probe] 33: (json_serialize failed)
+ [31;1m[[type_probe] 34: (json_serialize failed)
+[37;1mXTYPES_UTILS[31;1m[type_probe] 35: (json_serialize failed)
+ Error] [type_probe] 36: (json_serialize failed)
+[37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.005 [31;1m[[37;1mXTYPES_UTILS[31;1m [type_probe] 37: (json_serialize failed)
+Error] [37m[type_probe] 38: (json_serialize failed)
+Error encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[type_probe] 39: (json_serialize failed)
+[m
+[37;1m[type_probe] 40: (json_serialize failed)
+2026-06-12 04:15:08.005 [31;1m[[37;1m[type_probe] 41: (json_serialize failed)
+XTYPES_UTILS[31;1m [type_probe] 42: (json_serialize failed)
+Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[type_probe] 43: (json_serialize failed)
+[34;1m -> Function [36m[type_probe] 44: (json_serialize failed)
+json_serialize[m
+[type_probe] 45: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.005 [type_probe] 46: (json_serialize failed)
+[31;1m[[37;1m[type_probe] 47: (json_serialize failed)
+XTYPES_UTILS[31;1m[type_probe] 48: (json_serialize failed)
+ Error] [type_probe] 49: (json_serialize failed)
+[37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m[type_probe] 50: (json_serialize failed)
+ -> Function [36mjson_serialize[m[type_probe] 51: (json_serialize failed)
+
+[37;1m2026-06-12 04:15:08.005[type_probe] 52: (json_serialize failed)
+ [31;1m[[type_probe] 53: (json_serialize failed)
+[37;1mXTYPES_UTILS[type_probe] 54: (json_serialize failed)
+[31;1m Error[type_probe] 55: (json_serialize failed)
+] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[type_probe] 56: (json_serialize failed)
+[34;1m -> Function [36m[type_probe] 57: (json_serialize failed)
+json_serialize[m
+[type_probe] 58: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.005 [type_probe] [31;1m59: (json_serialize failed)
+[[37;1mXTYPES_UTILS[type_probe] 60: (json_serialize failed)
+[31;1m Error[type_probe] 61: (json_serialize failed)
+] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m[type_probe] 62: (json_serialize failed)
+ -> Function [36mjson_serialize[type_probe] 63: (json_serialize failed)
+[m
+[37;1m[type_probe] 64: (json_serialize failed)
+2026-06-12 04:15:08.005 [31;1m[[37;1m[type_probe] 65: (json_serialize failed)
+XTYPES_UTILS[31;1m [type_probe] 66: (json_serialize failed)
+Error] [37m[type_probe] 67: (json_serialize failed)
+Error encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [type_probe] 68: (json_serialize failed)
+[36mjson_serialize[m[type_probe] 69: (json_serialize failed)
+
+[37;1m2026-06-12 04:15:08.005 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.005 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.005 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.008 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.008 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.008 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.008 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.008 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.008 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.008 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.008 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.009 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.009 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.009 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.009 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.009 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.009 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.009 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.009 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.010 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.010 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.010 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.010 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[37;1m2026-06-12 04:15:08.010 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 70: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.041 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 71: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.079 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 72: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.123 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 73: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.166 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 74: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.207 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 75: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.242 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 76: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.286 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 77: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.325 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 78: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.367 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 79: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.400 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 80: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.440 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 81: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.475 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 82: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.517 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 83: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.557 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 84: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.596 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 85: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.639 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 86: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.683 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 87: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.726 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 88: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.770 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 89: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.805 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 90: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.842 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 91: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.881 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 92: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.925 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 93: (json_serialize failed)
+[37;1m2026-06-12 04:15:08.964 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 94: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.007 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 95: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.041 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 96: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.077 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 97: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.121 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 98: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.164 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 99: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.207 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 100: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.250 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 101: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.284 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 102: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.323 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 103: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.363 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 104: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.402 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 105: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.435 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 106: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.476 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 107: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.519 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 108: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.559 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 109: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.603 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 110: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.646 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 111: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.680 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 112: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.723 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 113: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.764 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 114: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.807 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 115: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.845 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 116: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.889 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 117: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.932 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 118: (json_serialize failed)
+[37;1m2026-06-12 04:15:09.968 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 119: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.004 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 120: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.048 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 121: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.086 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 122: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.131 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 123: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.163 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 124: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.207 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 125: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.250 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 126: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.293 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 127: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.329 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 128: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.372 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 129: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.416 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 130: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.459 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 131: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.503 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 132: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.545 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 133: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.588 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 134: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.631 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 135: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.674 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 136: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.711 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 137: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.747 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 138: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.781 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 139: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.824 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 140: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.868 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 141: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.908 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 142: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.942 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 143: (json_serialize failed)
+[37;1m2026-06-12 04:15:10.975 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 144: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.011 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 145: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.051 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 146: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.094 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 147: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.131 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 148: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.168 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 149: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.202 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 150: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.238 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 151: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.281 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 152: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.325 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 153: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.361 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 154: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.402 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 155: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.435 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 156: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.473 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 157: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.516 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 158: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.560 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 159: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.602 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 160: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.640 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 161: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.675 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 162: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.719 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 163: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.762 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 164: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.805 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 165: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.849 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 166: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.885 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 167: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.928 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 168: (json_serialize failed)
+[37;1m2026-06-12 04:15:11.971 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 169: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.014 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 170: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.050 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 171: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.086 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 172: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.130 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 173: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.173 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 174: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.217 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 175: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.256 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 176: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.289 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 177: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.325 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 178: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.367 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 179: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.411 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 180: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.454 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 181: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.494 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 182: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.532 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 183: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.568 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 184: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.604 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 185: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.638 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 186: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.676 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 187: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.714 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 188: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.758 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 189: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.797 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 190: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.831 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 191: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.868 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 192: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.907 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 193: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.950 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 194: (json_serialize failed)
+[37;1m2026-06-12 04:15:12.987 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 195: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.030 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 196: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.073 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 197: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.117 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 198: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.160 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 199: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.204 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 200: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.247 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 201: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.282 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 202: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.324 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 203: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.367 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 204: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.407 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 205: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.450 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 206: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.488 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 207: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.532 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 208: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.571 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 209: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.605 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 210: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.644 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 211: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.687 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 212: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.731 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 213: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.768 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 214: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.809 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 215: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.852 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 216: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.896 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 217: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.939 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 218: (json_serialize failed)
+[37;1m2026-06-12 04:15:13.981 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 219: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.023 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 220: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.067 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 221: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.110 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 222: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.149 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 223: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.193 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 224: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.236 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 225: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.274 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 226: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.317 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 227: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.361 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 228: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.395 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 229: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.438 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 230: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.480 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 231: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.520 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 232: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.560 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 233: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.603 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 234: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.647 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 235: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.690 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 236: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.724 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 237: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.760 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 238: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.796 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 239: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.839 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 240: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.883 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 241: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.920 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 242: (json_serialize failed)
+[37;1m2026-06-12 04:15:14.960 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 243: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.003 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 244: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.047 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 245: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.089 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 246: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.129 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 247: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.165 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 248: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.208 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 249: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.251 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 250: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.292 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 251: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.332 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 252: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.370 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 253: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.414 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 254: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.448 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 255: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.492 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 256: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.529 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 257: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.566 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 258: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.600 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 259: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.644 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 260: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.687 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 261: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.731 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 262: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.770 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 263: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.806 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 264: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.850 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 265: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.885 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 266: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.928 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 267: (json_serialize failed)
+[37;1m2026-06-12 04:15:15.972 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 268: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.015 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 269: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.087 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 270: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.088 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 271: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.131 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 272: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.174 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 273: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.211 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 274: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.254 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 275: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.295 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 276: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.334 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 277: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.367 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 278: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.411 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 279: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.454 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 280: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.492 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 281: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.536 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 282: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.579 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 283: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.621 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 284: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.657 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 285: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.701 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 286: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.744 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 287: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.781 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 288: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.825 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 289: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.868 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 290: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.911 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 291: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.955 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 292: (json_serialize failed)
+[37;1m2026-06-12 04:15:16.990 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 293: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.027 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 294: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.071 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 295: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.106 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 296: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.149 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 297: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.183 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 298: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.222 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 299: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.265 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 300: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.300 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 301: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.335 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 302: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.374 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 303: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.418 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 304: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.457 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 305: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.499 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 306: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.541 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 307: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.583 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 308: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.623 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 309: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.666 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 310: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.708 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 311: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.750 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 312: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.794 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 313: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.837 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 314: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.875 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 315: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.919 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 316: (json_serialize failed)
+[37;1m2026-06-12 04:15:17.959 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 317: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.003 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 318: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.039 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 319: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.081 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 320: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.124 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 321: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.168 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 322: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.206 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 323: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.249 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 324: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.287 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 325: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.323 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 326: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.367 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 327: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.409 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 328: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.451 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 329: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.489 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 330: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.525 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 331: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.569 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 332: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.607 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 333: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.648 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 334: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.692 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 335: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.735 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 336: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.779 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 337: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.822 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 338: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.857 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 339: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.894 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 340: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.937 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 341: (json_serialize failed)
+[37;1m2026-06-12 04:15:18.975 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 342: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.016 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 343: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.059 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 344: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.103 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 345: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.146 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 346: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.180 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 347: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.224 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 348: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.261 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 349: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.304 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 350: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.339 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 351: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.381 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 352: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.424 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 353: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.467 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 354: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.511 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 355: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.549 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 356: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.592 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 357: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.636 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 358: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.679 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 359: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.723 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 360: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.758 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 361: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.795 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 362: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.837 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 363: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.880 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 364: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.924 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 365: (json_serialize failed)
+[37;1m2026-06-12 04:15:19.967 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 366: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.006 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 367: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.043 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 368: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.079 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 369: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.122 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 370: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.166 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 371: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.209 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 372: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.253 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 373: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.294 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 374: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.329 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 375: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.369 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 376: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.405 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 377: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.445 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 378: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.483 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 379: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.519 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 380: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.562 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 381: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.603 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 382: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.646 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 383: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.685 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 384: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.723 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 385: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.767 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 386: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.806 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 387: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.849 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 388: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.887 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 389: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.930 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 390: (json_serialize failed)
+[37;1m2026-06-12 04:15:20.965 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 391: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.004 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 392: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.048 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 393: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.091 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 394: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.135 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 395: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.178 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 396: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.222 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 397: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.259 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 398: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.302 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 399: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.346 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 400: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.384 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 401: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.423 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 402: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.466 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 403: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.509 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 404: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.546 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 405: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.589 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 406: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.632 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 407: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.669 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 408: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.710 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 409: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.744 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 410: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.788 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 411: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.830 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 412: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.872 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 413: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.916 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 414: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.956 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 415: (json_serialize failed)
+[37;1m2026-06-12 04:15:21.996 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 416: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.034 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 417: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.077 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 418: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.120 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 419: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.164 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 420: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.207 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 421: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.245 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 422: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.289 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 423: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.323 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 424: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.367 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 425: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.406 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 426: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.447 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 427: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.488 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 428: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.524 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 429: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.567 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 430: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.604 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 431: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.646 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 432: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.689 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 433: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.731 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 434: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.774 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 435: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.812 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 436: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.846 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 437: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.890 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 438: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.927 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 439: (json_serialize failed)
+[37;1m2026-06-12 04:15:22.971 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 440: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.014 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 441: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.057 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 442: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.099 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 443: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.143 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 444: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.183 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 445: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.222 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 446: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.265 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 447: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.305 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 448: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.341 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 449: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.381 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 450: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.425 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 451: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.468 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 452: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.512 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 453: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.555 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 454: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.590 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 455: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.627 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 456: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.671 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 457: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.712 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 458: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.756 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 459: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.794 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 460: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.837 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 461: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.873 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 462: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.917 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 463: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.960 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 464: (json_serialize failed)
+[37;1m2026-06-12 04:15:23.995 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 465: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.039 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 466: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.079 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 467: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.123 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 468: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.158 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 469: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.195 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 470: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.237 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 471: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.279 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 472: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.322 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 473: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.359 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 474: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.393 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 475: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.433 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 476: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.477 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 477: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.514 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 478: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.548 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 479: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.583 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 480: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.627 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 481: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.664 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 482: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.707 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 483: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.751 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 484: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.794 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 485: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.828 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 486: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.863 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 487: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.902 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 488: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.936 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 489: (json_serialize failed)
+[37;1m2026-06-12 04:15:24.980 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 490: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.023 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 491: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.067 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 492: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.101 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 493: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.141 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 494: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.182 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 495: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.223 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 496: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.259 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 497: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.302 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 498: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.339 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 499: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.382 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 500: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.418 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 501: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.461 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 502: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.505 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 503: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.542 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 504: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.586 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 505: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.626 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 506: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.670 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 507: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.713 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 508: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.757 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] [37;1m509: (json_serialize failed)2026-06-12 04:15:25.794
+ [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 510: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.830 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 511: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.869 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 512: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.909 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 513: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.944 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 514: (json_serialize failed)
+[37;1m2026-06-12 04:15:25.981 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 515: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.024 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 516: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.068 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 517: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.110 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 518: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.146 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 519: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.183 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 520: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.217 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 521: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.251 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 522: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.294 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 523: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.332 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 524: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.367 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 525: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.410 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 526: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.451 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 527: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.494 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 528: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.538 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 529: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.571 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 530: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.611 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 531: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.655 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 532: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.689 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 533: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.733 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 534: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.770 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 535: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.810 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 536: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.853 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 537: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.897 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 538: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.931 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 539: (json_serialize failed)
+[37;1m2026-06-12 04:15:26.975 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 540: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.012 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 541: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.056 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 542: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.094 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 543: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.137 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 544: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.175 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 545: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.217 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 546: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.253 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 547: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.296 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 548: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.339 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 549: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.377 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 550: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.416 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 551: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.455 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 552: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.497 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 553: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.540 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 554: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.573 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 555: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.617 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 556: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.659 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 557: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.702 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 558: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.742 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 559: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.776 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 560: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.819 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 561: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.859 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 562: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.902 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 563: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.944 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 564: (json_serialize failed)
+[37;1m2026-06-12 04:15:27.987 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 565: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.029 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 566: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.072 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 567: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.111 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 568: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.146 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 569: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.185 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 570: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.219 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 571: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.258 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 572: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.300 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 573: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.338 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 574: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.378 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 575: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.416 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 576: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.458 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 577: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.499 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 578: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.543 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 579: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.580 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 580: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.615 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 581: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.657 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 582: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.693 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 583: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.727 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 584: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.766 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 585: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.810 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 586: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.854 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 587: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.897 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 588: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.934 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 589: (json_serialize failed)
+[37;1m2026-06-12 04:15:28.978 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 590: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.019 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 591: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.059 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 592: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.102 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 593: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.146 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 594: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.181 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] participant discovery event: 47.42.50.29.ea.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] 595: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.224 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] [37;1m596: (json_serialize failed)
+2026-06-12 04:15:29.268 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 597: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.311 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 598: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.347 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 599: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.391 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] 600: (json_serialize failed)
+[37;1m2026-06-12 04:15:29.429 [31;1m[[37;1mXTYPES_UTILS[31;1m Error] [37mError encountered while dumping JSON to output stream: [json.exception.type_error.316] invalid UTF-8 byte at index 4: 0x90[34;1m -> Function [36mjson_serialize[m
+[type_probe] done, received 600
+[37;1m2026-06-12 04:15:41.078 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x1026ff890 (0xca8c64000)[34;1m -> Function [36mReceive[m
+[37;1m2026-06-12 04:15:41.078 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x1026ffab0 (0xca8c640e0)[34;1m -> Function [36mReceive[m
+[37;1m2026-06-12 04:15:41.078 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x1026ffab0 (0xca8c641c0)[34;1m -> Function [36mReceive[m
+[37;1m2026-06-12 04:15:41.078 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x102700760 (0xca8c642a0)[34;1m -> Function [36mReceive[m
