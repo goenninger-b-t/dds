@@ -25,7 +25,7 @@
            #:type-identifier #:type-identifier-p #:type-identifier-kind
            #:type-identifier-bound #:type-identifier-element #:type-identifier-hash
            #:primitive-type-identifier #:string8-type-identifier
-           #:sequence-type-identifier #:hash-type-identifier
+           #:sequence-type-identifier #:array-type-identifier #:hash-type-identifier
            #:type-identifier= #:type-identifier-referenced
            #:member-name-hash
            #:minimal-struct-member #:make-struct-member #:minimal-struct-member-p
@@ -49,6 +49,7 @@
            #:assignability-options-prevent-type-widening
            #:default-assignability-options
            #:ti-assignable-from #:strongly-assignable-from #:struct-assignable-from
+           #:ti-array-p
            #:enum-assignable-from
            #:member-names-agree-p
            #:ti-equivalent-p #:struct-equivalent-p #:enforce-type-consistency
@@ -84,4 +85,5 @@
            #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
            #:+tk-float32+ #:+tk-float64+ #:+tk-char8+
            #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+
-           #:+ti-string8-small+ #:+ti-string8-large+ #:+ti-plain-sequence-small+))
+           #:+ti-string8-small+ #:+ti-string8-large+ #:+ti-plain-sequence-small+
+           #:+ti-plain-array-small+ #:+ti-plain-array-large+))

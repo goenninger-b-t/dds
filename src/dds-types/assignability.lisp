@@ -47,6 +47,12 @@
   (let ((k (type-identifier-kind ti)))
     (or (= k +ti-plain-sequence-small+) (= k +ti-plain-sequence-large+))))
 
+(defun* ti-array-p (ti)
+    (function (type-identifier) t)
+  "True if TI is a plain array (TI_PLAIN_ARRAY_SMALL/LARGE)."
+  (let ((k (type-identifier-kind ti)))
+    (or (= k +ti-plain-array-small+) (= k +ti-plain-array-large+))))
+
 (defun* ti-aggregated-p (ti)
     (function (type-identifier) t)
   "True if TI is a hash-defined type (EK_MINIMAL/EK_COMPLETE) carrying a resolved in-memory
@@ -75,6 +81,8 @@
   (cond ((ti-primitive-p ti) t)
         ((ti-string-p ti) t)
         ((ti-sequence-p ti)
+         (let ((e (type-identifier-element ti))) (and e (ti-delimited-p e) t)))
+        ((ti-array-p ti)
          (let ((e (type-identifier-element ti))) (and e (ti-delimited-p e) t)))
         ((and (ti-aggregated-p ti)
               (minimal-enumerated-type-p (type-identifier-referenced ti)))
@@ -108,6 +116,12 @@
             (strongly-assignable-from e1 e2 opts)
             (or (assignability-options-ignore-sequence-bounds opts)
                 (bound>= (type-identifier-bound t1) (type-identifier-bound t2)))
+            t)))
+    ((and (ti-array-p t1) (ti-array-p t2))
+     (let ((e1 (type-identifier-element t1)) (e2 (type-identifier-element t2)))
+       (and e1 e2
+            (= (type-identifier-bound t1) (type-identifier-bound t2))
+            (strongly-assignable-from e1 e2 opts)
             t)))
     ((and (ti-aggregated-p t1) (ti-aggregated-p t2))
      (let ((r1 (type-identifier-referenced t1))

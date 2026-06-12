@@ -43,6 +43,9 @@
 (defconstant +ti-plain-sequence-small+ #x80
   "XTypes TypeIdentifierKind octet TI_PLAIN_SEQUENCE_SMALL (idl §56-70): plain sequence, SBound.")
 (defconstant +ti-plain-sequence-large+ #x81)
+(defconstant +ti-plain-array-small+ #x90
+  "XTypes TypeIdentifierKind octet TI_PLAIN_ARRAY_SMALL (idl §56-70): fixed array, SBound dims.")
+(defconstant +ti-plain-array-large+ #x91)
 
 ;;; ---- TypeIdentifier (idl §269 union, structural in-memory form) ----
 
@@ -88,6 +91,14 @@
     (function (type-identifier &optional (integer 0)) type-identifier)
   "A plain-sequence TypeIdentifier with ELEMENT element TI and BOUND (0 = unbounded)."
   (%make-type-identifier :kind +ti-plain-sequence-small+ :bound bound :element element))
+
+(defun* array-type-identifier (element size)
+    (function (type-identifier (integer 1)) type-identifier)
+  "A plain ARRAY TypeIdentifier with ELEMENT element TI and a single fixed dimension SIZE
+   (the corpus oracle covers 1-D arrays; multi-dim is a documented decode gap that fails open).
+   SMALL when SIZE <= 255, else LARGE (the 255 threshold of idl §56-70, as for strings)."
+  (%make-type-identifier :kind (if (> size 255) +ti-plain-array-large+ +ti-plain-array-small+)
+                         :bound size :element element))
 
 (defun* hash-type-identifier (ek &key hash referenced)
     (function ((unsigned-byte 8) &key (:hash t) (:referenced t)) type-identifier)

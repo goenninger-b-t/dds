@@ -1103,6 +1103,33 @@
       (assert (dds.types:enum-assignable-from a (enum "RED" 0 "GREEN" 1) opts))
       t)))
 
+;;; Plain-array model (M4, FR-TYPE-4 S1): the plain-array TypeIdentifier carrying the element
+;;; TI and a single fixed dimension.
+
+(defun* run-array-model-test ()
+    (function () t)
+  "array-type-identifier builds a plain-array TI carrying the element TI and the fixed size."
+  (let ((ti (dds.types:array-type-identifier (dds.types:primitive-type-identifier :i32) 4)))
+    (assert (dds.types:ti-array-p ti))
+    (assert (= 4 (dds.types:type-identifier-bound ti)))
+    (assert (= dds.types:+tk-int32+ (dds.types:type-identifier-kind
+                                     (dds.types:type-identifier-element ti))))
+    t))
+
+;;; Plain-array assignability (M4, FR-TYPE-4 S1): arrays are assignable iff the element is
+;;; strongly-assignable AND the fixed dimensions are identical (arrays are not resizable).
+
+(defun* run-array-assignability-test ()
+    (function () t)
+  "Arrays are assignable iff element strongly-assignable AND identical fixed size (arrays are
+   not resizable). A different size or element kind is a provable incompatibility."
+  (let ((opts (dds.types:default-assignability-options))
+        (a (dds.types:array-type-identifier (dds.types:primitive-type-identifier :i32) 4)))
+    (assert (dds.types:ti-assignable-from a (dds.types:array-type-identifier (dds.types:primitive-type-identifier :i32) 4) opts))
+    (assert (not (dds.types:ti-assignable-from a (dds.types:array-type-identifier (dds.types:primitive-type-identifier :i32) 5) opts)))
+    (assert (not (dds.types:ti-assignable-from a (dds.types:array-type-identifier (dds.types:primitive-type-identifier :i64) 4) opts)))
+    t))
+
 ;;; XCDR2 MinimalTypeObject serializer + EquivalenceHash (M4, FR-TYPE-2/5): serialize the
 ;;; Minimal struct TypeObject to canonical XCDR2-LE bytes (XTypes §7.3.4.5) and hash it
 ;;; (§7.3.4.9.1). The hand-derived golden (struct pt{long x;}) proves the framing byte-exact
