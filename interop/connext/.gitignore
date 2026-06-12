@@ -11,6 +11,10 @@ Corpus.hpp
 Corpus.cxx
 CorpusPlugin.hpp
 CorpusPlugin.cxx
+NoKeyData.hpp
+NoKeyData.cxx
+NoKeyDataPlugin.hpp
+NoKeyDataPlugin.cxx
 *.idl.*
 .gen.stamp
 
@@ -27,6 +31,8 @@ cdr-capture/cdr_capture
 large-data/large_pub
 large-data/large_sub
 typeobject-corpus/corpus_pub
+nokey/nokey_pub
+nokey/nokey_sub
 
 # transient capture artifacts (pcaps + tshark decodes produced while probing)
 *.pcap
@@ -35,3 +41,8 @@ decode.txt
 decode.err
 tshark.err
 *.out
+
+# archived no-key interop proof captures are kept (force-added under nokey/captures/)
+!nokey/captures/
+!nokey/captures/*.pcap
+!nokey/captures/*.log

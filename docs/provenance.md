@@ -1020,3 +1020,44 @@ per the clean-room note above; nothing copied into the harness or `src/`:
   failures (`type_error.316`): raw `NameHash` `uint8_t` bytes streamed through the
   `char` `operator<<` overload yield non-UTF-8 member names from any MINIMAL
   TypeObject. A Fast DDS defect (upstream-reportable), not our framing.
+
+## M4 (2026-06-12) — no-key endpoint-kinds live Connext interop (keyed/no-key feature, RTPS 2.5 §9.3.1.2)
+
+Live oracle for the keyed/no-key endpoint-kinds feature against RTI Connext 7.3.1
+(`arm64Darwin20clang12.0`, same host; same-host RTPS on `lo0`). Clean-room: our own
+keyless `NoKeyData` IDL drives `rtiddsgen` at build time; the generated type support is
+git-ignored, never copied into `src/`. No RTI source/headers were consulted.
+
+Wire-confirmed against the OMG DDSI-RTPS 2.5 §9.3.1.2 Table 9.1 entity kinds
+(the resolved loopback captures `captures/nokey-{fwd,rev}-loopback-lo0.pcap` via the
+tshark RTPS dissector):
+
+- our NO_KEY **reader** endpoint GUID ends `0x04` (NO_KEY reader);
+- our NO_KEY **writer** endpoint GUID ends `0x03` (NO_KEY writer);
+- both announce topic `NoKeyTopic` / type `nokey-data` correctly.
+
+**Live interop ACHIEVED both directions (2026-06-12, loopback on `lo0`;
+`captures/nokey-{fwd,rev}-loopback-*`):** forward Connext `nokey_pub` -> our `nokey-sub`
+`MATCHED 1`, received 147/150; reverse our `nokey-pub` -> Connext `nokey_sub` our pub
+`matched=1`, Connext received 159/160 (the head-of-stream sample(s) pre-date the match
+under VOLATILE — expected). Connext's `CONNEXT_VERBOSE=1` log confirms it matches our
+NO_KEY writer EntityId `0x00000103` against its NO_KEY reader (`0x80000004`) "with reliable
+reader service", logging `Remote unkeyed user datawriter … matched with local unkeyed user
+datareader` and `TypeObject not received (topic: 'NoKeyTopic', type: 'nokey-data')` — a
+topic+type-name match, no XTypes assignability required.
+
+Earlier same-host failure — RESOLVED, NOT a NO_KEY defect. The first run's `matched=0`
+("Connext never advances past SPDP for our `4742…` prefix") was an environment artifact:
+(1) a stale keyed `shapes_pub` held discovery port `7410` (and a stale `sbcl` held
+`7400`), forcing Connext's `nokey_pub` to participant index 1 (`7412`) so our unicast SPDP
+to `7410` missed it and the two Connext instances discovered each other
+(`FAILED TO BIND | Invalid port 7410`; `Discovered new remote participant 0x0101DCD1,…`, a
+Connext prefix, never our `4742…`); (2) the macOS LAN-UDP application-firewall would
+independently drop LAN-sourced UDP to the freshly built unapproved `nokey_pub`/`nokey_sub`
+(the same gate the Fast DDS leg B hit). After killing the stale processes and running
+loopback-only (`allow_interfaces=127.0.0.1`) with unicast SPDP (`PEERS=127.0.0.1:7410`),
+both legs matched. Harness/environment fix only: a `:peers` unicast-SPDP passthrough was
+threaded into the DCPS path (`dds.dcps:create-participant :peers`,
+`dds.shapes:run-nokey-{publisher,subscriber} :peers`, Makefile `PEERS=`) and the profile
+pinned to `127.0.0.1`. No change to the NO_KEY mechanism; suite stays 106 green
+(`make test-sbcl`). See `interop/connext/nokey/README.md`.

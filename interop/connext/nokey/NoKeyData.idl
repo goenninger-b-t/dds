@@ -1,0 +1,19 @@
+// Keyless type for the no-key endpoint-kinds interop proof.
+//
+// No @key member => Connext registers NO_KEY DataWriter/DataReader endpoints
+// (RTPS 2.5 §9.3.1.2: writer kind 0x03, reader kind 0x04), the foreign-side
+// counterpart to this stack's nokey-data (define-dds-type with no :key member,
+// type-support-keyed-p NIL). The two interop round-trips prove a no-key type
+// crosses the wire both directions; a no-key endpoint here will NOT match a
+// keyed (WITH_KEY 0x02/0x07) endpoint — that is the silent non-match guard.
+//
+// @final to match this stack's :final extensibility; two 32-bit longs, member
+// ids 0,1 via default @autoid(SEQUENTIAL). The registered type name is set to
+// "nokey-data" at the Topic constructor (3-arg overload) so it is byte-identical
+// to our registered type-name; discovery matches on topic name + type name.
+
+@final
+struct NoKeyData {
+    long a;
+    long b;
+};
