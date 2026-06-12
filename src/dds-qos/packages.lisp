@@ -15,7 +15,7 @@
            #:qos #:make-qos #:make-writer-qos #:make-reader-qos #:copy-qos
            #:qos-reliability #:qos-durability #:qos-deadline #:qos-latency-budget
            #:qos-ownership #:qos-ownership-strength
-           #:qos-liveliness #:qos-liveliness-lease
+           #:qos-liveliness #:qos-liveliness-lease #:liveliness-rank
            #:qos-destination-order #:qos-presentation-scope
            #:qos-presentation-coherent #:qos-presentation-ordered
            #:qos-data-representation #:qos-partition

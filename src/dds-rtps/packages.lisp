@@ -59,7 +59,8 @@
            #:+data-frag-flag-key+ #:+data-frag-flag-inline-qos+
            #:+pid-pad+ #:+pid-sentinel+ #:+pid-participant-lease-duration+
            #:+pid-topic-name+ #:+pid-type-name+ #:+pid-protocol-version+
-           #:+pid-vendorid+ #:+pid-reliability+ #:+pid-durability+ #:+pid-default-unicast-locator+
+           #:+pid-vendorid+ #:+pid-reliability+ #:+pid-durability+ #:+pid-liveliness+
+           #:+pid-default-unicast-locator+
            #:+pid-metatraffic-unicast-locator+ #:+pid-participant-guid+
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
            #:+pid-type-information+ #:+pid-type-object-lb+

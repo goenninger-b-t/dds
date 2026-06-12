@@ -965,3 +965,76 @@
     (%check :nf-short (null (dds.rtps.message:parse-nack-frag-body c 0))
             "a sub-16-octet NACK_FRAG body rejects"))
   t)
+
+;;; PID_LIVELINESS (RTPS 2.5 Table 9.18 §9.6.2.2: PID_LIVELINESS = 0x001b ->
+;;; LivelinessQosPolicy {kind; Duration_t lease_duration}; DDS 1.4 DCPS PSM
+;;; LivelinessQosPolicyKind {AUTOMATIC=0, MANUAL_BY_PARTICIPANT=1, MANUAL_BY_TOPIC=2},
+;;; Duration_t {long sec; unsigned long nanosec}). Vectors pinned from the spec + a
+;;; live Fast DDS oracle, never memory.
+
+(defun* %subseq-present-p (vec sub end)
+    (function ((simple-array (unsigned-byte 8) (*)) list (integer 0)) t)
+  "T if the octet list SUB appears as a contiguous subsequence of VEC[0,END) (test diagnostic)."
+  (let ((s (make-array (length sub) :element-type '(unsigned-byte 8) :initial-contents sub)))
+    (and (search s vec :end2 end) t)))
+
+(defun* run-pid-liveliness-test ()
+    (function () t)
+  "SEDP advertises PID_LIVELINESS (RTPS 2.5 Table 9.18 §9.6.2.2 / DDS 1.4 PSM): a writer
+   qos {:manual-by-participant, lease {5,0}} serializes byte-exact to
+   1b 00 0c 00 / 01 00 00 00 / 05 00 00 00 / 00 00 00 00 (kind LE then Duration_t LE).
+   The Fast DDS oracle AUTOMATIC+1s parameter parses to {:automatic, lease {1,0}}.
+   A PID_LIVELINESS whose length /= 12 is ignored, never read OOB (NFR-SEC-POSTURE)."
+  ;; serialize: writer liveliness MANUAL_BY_PARTICIPANT(1) + lease {5,0} -> 16 octets present.
+  (let* ((ep (dds.rtps.discovery:make-endpoint-data
+              :topic-name "Square" :type-name "ShapeType"
+              :qos (dds.qos:make-qos :reliability :reliable
+                                     :liveliness :manual-by-participant
+                                     :liveliness-lease (dds.qos:make-qos-duration 5 0))))
+         (buf (dds.core.buffer:make-octet-buffer 512))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    (let ((end (dds.rtps.discovery:serialize-endpoint-data c ep)))
+      (%check :liv-emit
+              (%subseq-present-p (dds.core.buffer:octet-buffer-vec buf)
+                                 '(#x1b #x00 #x0c #x00  #x01 #x00 #x00 #x00
+                                   #x05 #x00 #x00 #x00  #x00 #x00 #x00 #x00)
+                                 end)
+              "serialized SEDP contains PID_LIVELINESS {MANUAL_BY_PARTICIPANT, {5,0}}")))
+  ;; parse: a Fast DDS oracle AUTOMATIC(0)+1s parameter inside a minimal valid endpoint-data.
+  (let* ((buf (dds.core.buffer:make-octet-buffer 512))
+         (out (dds.core.buffer:cursor buf :endianness :little))
+         (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (topic (octets #x07 #x00 #x00 #x00 #x53 #x71 #x72 #x00)) ; CDR string "Sqr"
+         (liv (octets #x00 #x00 #x00 #x00  #x01 #x00 #x00 #x00  #x00 #x00 #x00 #x00)))
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-endpoint-guid+ guid 0 16)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-topic-name+ topic 0 8)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-type-name+ topic 0 8)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-liveliness+ liv 0 12)
+    (dds.rtps.message:write-parameter-sentinel out)
+    (let ((back (dds.rtps.discovery:parse-endpoint-data
+                 (dds.core.buffer:cursor buf :endianness :little) :writer)))
+      (%check :liv-parse back "parse-endpoint-data with PID_LIVELINESS returned NIL")
+      (%check :liv-kind (eq :automatic (dds.qos:qos-liveliness (dds.rtps.discovery:endpoint-data-qos back)))
+              "Fast DDS oracle liveliness kind parses AUTOMATIC")
+      (let ((lease (dds.qos:qos-liveliness-lease (dds.rtps.discovery:endpoint-data-qos back))))
+        (%check :liv-lease (and (= 1 (dds.qos:qos-duration-sec lease))
+                                (= 0 (dds.qos:qos-duration-nanosec lease)))
+                "Fast DDS oracle lease parses {1,0}"))))
+  ;; bounds: a PID_LIVELINESS with length /= 12 is ignored, never OOB; defaults survive.
+  (let* ((buf (dds.core.buffer:make-octet-buffer 512))
+         (out (dds.core.buffer:cursor buf :endianness :little))
+         (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (topic (octets #x07 #x00 #x00 #x00 #x53 #x71 #x72 #x00))
+         (short (octets #x02 #x00 #x00 #x00))) ; len 4, not 12
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-endpoint-guid+ guid 0 16)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-topic-name+ topic 0 8)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-type-name+ topic 0 8)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-liveliness+ short 0 4)
+    (dds.rtps.message:write-parameter-sentinel out)
+    (let ((back (dds.rtps.discovery:parse-endpoint-data
+                 (dds.core.buffer:cursor buf :endianness :little) :writer)))
+      (%check :liv-short back "short-length PID_LIVELINESS must not crash the parse")
+      (%check :liv-short-default
+              (eq :automatic (dds.qos:qos-liveliness (dds.rtps.discovery:endpoint-data-qos back)))
+              "short-length PID_LIVELINESS is ignored, liveliness keeps its default")))
+  t)

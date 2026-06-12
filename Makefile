@@ -26,6 +26,10 @@ TYPENAME  ?= C_Shape
 LOCALTYPE ?= shape-type
 COUNT    ?= 0
 PEERS    ?=
+LIVELINESS ?=
+LEASE    ?=
+# Optional writer LIVELINESS QoS for square-pub; empty -> current default behaviour.
+LIVELINESS_ARGS := $(if $(LIVELINESS),:liveliness :$(LIVELINESS),)$(if $(LEASE), :liveliness-lease-seconds $(LEASE),)
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -71,7 +75,7 @@ wire:
 # Ctrl-C to stop. Override DOMAIN=.. COLOR=.. ; LISP=$(SBCL) used (CFFI multicast).
 square-pub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)")' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" $(LIVELINESS_ARGS))' \
 	        --eval '(uiop:quit 0)'
 
 square-sub:

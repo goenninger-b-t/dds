@@ -58,6 +58,12 @@ RTI Connext does **not** emit the standard `ParticipantMessageData` — it uses 
 `NDDSPING` — so a conformant peer is the oracle here; and a peer emits the message only when a
 local writer has a *finite*-lease `LIVELINESS` that actually asserts.
 
+The **reverse direction is also proven**: once we advertise `PID_LIVELINESS` in SEDP (see
+`serialize-endpoint-data`), a live Fast DDS reader RxO-matched our MANUAL_BY_PARTICIPANT writer
+and reported `on_liveliness_changed` ALIVE while we asserted, then NOT_ALIVE when we stopped —
+and since MANUAL liveliness is not kept alive by SPDP, that proves Fast DDS semantically consumes
+our `ParticipantMessageData` (`interop/fastdds/captures/reverse-wlp-manual-lo0.pcap`).
+
 - P2P built-in endpoint EntityIds (§9.6.2.2 / §8.4.13.2): `dds.rtps.discovery:+entityid-p2p-participant-message-writer+` = `{{00,02,00},c2}` (`#x000200c2`), `+entityid-p2p-participant-message-reader+` = `{{00,02,00},c7}` (`#x000200c7`).
 - `kind` values (§9.6.3.2), stored as the integer the wire `octet[4]` encodes big-endian: `+pmd-kind-unknown+` = 0 `{0,0,0,0}`, `+pmd-kind-automatic+` = 1 `{0,0,0,1}`, `+pmd-kind-manual-by-participant+` = 2 `{0,0,0,2}`.
 - `availableBuiltinEndpoints` bits (§9.4.2.10): `+be-participant-message-writer+` = bit 10, `+be-participant-message-reader+` = bit 11. Both are set in `+builtin-endpoint-set-default+` now that the Writer Liveliness Protocol endpoints are wired (see the disc-layer section below).
@@ -89,8 +95,8 @@ type names, the QoS carried for RxO matching, and optional `PID_TYPE_INFORMATION
 - `dds.rtps.discovery:make-endpoint-data` *(&key guid topic-name type-name qos type-information)* — construct an endpoint description (the `qos` is a `dds.qos:qos`; `type-information` is opaque pre-serialized XTypes `TypeInformation`).
 - `dds.rtps.discovery:endpoint-data` / `endpoint-data-p` — the struct type and predicate.
 - Accessors: `endpoint-data-guid`, `endpoint-data-topic-name`, `endpoint-data-type-name`, `endpoint-data-qos`, `endpoint-data-type-information`.
-- `dds.rtps.discovery:serialize-endpoint-data` *(cursor data)* — serialize as a `ParameterList` terminated by `PID_SENTINEL` (§8.5.4 / §9.4.2.11). Emits `PID_TYPE_INFORMATION` only when present (peers skip unknown PIDs).
-- `dds.rtps.discovery:parse-endpoint-data` *(cursor role)* — parse a SEDP `ParameterList` into an `endpoint-data` struct, or `NIL` if truncated. Bounds-checked. The required `ROLE` (`:writer` / `:reader`) seeds the QoS defaults an **absent** parameter must assume (RTPS 2.5 §9.4.2.11.2): a DCPSPublication defaults RELIABILITY to RELIABLE, a DCPSSubscription to BEST_EFFORT (DDS 1.4 §2.2.3). RTI Connext elides default-valued PIDs, so a reliable Connext writer carries **no** `PID_RELIABILITY` — parsing it with reader defaults would fail the RxO check and silently prevent the match.
+- `dds.rtps.discovery:serialize-endpoint-data` *(cursor data)* — serialize as a `ParameterList` terminated by `PID_SENTINEL` (§8.5.4 / §9.4.2.11). Emits `PID_RELIABILITY`, `PID_DURABILITY`, and `PID_LIVELINESS` (`0x001b` → `LivelinessQosPolicy {kind; Duration_t lease_duration}`, RTPS 2.5 Table 9.18 §9.6.2.2; the wire `kind` is `0=AUTOMATIC / 1=MANUAL_BY_PARTICIPANT / 2=MANUAL_BY_TOPIC`), so a remote reader can RxO-match and track the writer's offered liveliness; `PID_TYPE_INFORMATION` is emitted only when present (peers skip unknown PIDs).
+- `dds.rtps.discovery:parse-endpoint-data` *(cursor role)* — parse a SEDP `ParameterList` into an `endpoint-data` struct, or `NIL` if truncated. Bounds-checked. The required `ROLE` (`:writer` / `:reader`) seeds the QoS defaults an **absent** parameter must assume (RTPS 2.5 §9.4.2.11.2): a DCPSPublication defaults RELIABILITY to RELIABLE, a DCPSSubscription to BEST_EFFORT (DDS 1.4 §2.2.3). RTI Connext elides default-valued PIDs, so a reliable Connext writer carries **no** `PID_RELIABILITY` — parsing it with reader defaults would fail the RxO check and silently prevent the match. `PID_LIVELINESS` is parsed into the QoS `liveliness` kind + `liveliness-lease`; an unknown kind keeps the default `:automatic` and a `PID_LIVELINESS` whose length is not 12 is ignored (never read out of bounds, NFR-SEC-POSTURE) — a malformed liveliness PID must never false-REJECT a valid match.
 - `dds.rtps.discovery:endpoint-match-p` *(writer-data reader-data)* — `(values MATCH-P INCOMPATIBLE)`: topic + type names equal AND the offered (writer) QoS is RxO-compatible with the requested (reader) QoS (the full DDS 1.4 §2.2.3 table via `dds.qos:qos-rxo-compatible`). `INCOMPATIBLE` is the failing-policy list; `'(:topic-or-type)` on a name mismatch.
 - `dds.rtps.discovery:run-sedp-test` — standalone round-trip + RxO truth-table check.
 

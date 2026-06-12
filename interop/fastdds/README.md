@@ -494,3 +494,26 @@ WIRESHARK_CONFIG_DIR=/tmp/wscfg tshark -r captures/wlp-participant-message-lo0.p
 
 Confirms `kind` is an endianness-independent `octet[4]` (§9.6.3.2): the wire `00 00 00 01`
 matches our big-endian-stored `{0,0,0,1}` for `AUTOMATIC`.
+
+## Reverse WLP census — Fast DDS accepts our ParticipantMessageData (2026-06-12, FR-RTPS-WLP)
+
+The forward leg proved we PARSE Fast DDS's `ParticipantMessageData` byte-exact; this leg proves
+the conformant peer ACCEPTS ours. Prerequisite: we now advertise `PID_LIVELINESS` (0x001b) in
+SEDP (kind u32 LE + Duration_t{sec,nanosec}), so a Fast DDS reader RxO-matches + tracks our
+writer's liveliness. `shapes_sub` gained an env-gated reader LIVELINESS QoS
+(`SUB_LIVELINESS_LEASE_MS` + `SUB_LIVELINESS_KIND=automatic|manual_by_participant`, off by
+default) and an `on_liveliness_changed` log; our `run-publisher` gained `:liveliness` /
+`:liveliness-lease-seconds` (Makefile `LIVELINESS=` / `LEASE=`).
+
+Recipe (loopback lo0; start the Fast DDS sub first so it owns port 7410):
+```sh
+WIRESHARK_CONFIG_DIR=/tmp/wscfg tshark -i lo0 -f "udp portrange 7400-7460" -w captures/reverse-wlp-manual-lo0.pcap &
+( cd shapes && SUB_LIVELINESS_KIND=manual_by_participant SUB_LIVELINESS_LEASE_MS=10000 ./shapes_sub 45 ) &
+make square-pub TYPE=canonical COUNT=0 ADVERTISE=127.0.0.1 PEERS=127.0.0.1:7410 LIVELINESS=manual-by-participant LEASE=5 &
+# ... observe "LIVELINESS_CHANGED alive=1"; kill the publisher; observe "alive=0 (-1) not_alive=1 (1)" ...
+```
+
+| Kind | Capture | Result |
+|---|---|---|
+| MANUAL_BY_PARTICIPANT (isolated) | `captures/reverse-wlp-manual-lo0.pcap` | Fast DDS matched (RxO via our PID_LIVELINESS), `on_liveliness_changed alive=1`; we emitted 15 PM DATA on `0x000200c2` (prefix `47425030…`, kind `MANUAL_LIVELINESS_UPDATE 0x02`); kill → `alive=0 (-1) not_alive=1 (1)`. MANUAL isn't kept alive by SPDP → **proves semantic consumption of our ParticipantMessageData** |
+| AUTOMATIC (baseline) | `captures/reverse-wlp-automatic-lo0.pcap` | matched + `on_liveliness_changed alive=1`; our PM kind `AUTOMATIC_LIVELINESS_UPDATE 0x01` |

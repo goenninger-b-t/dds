@@ -1126,3 +1126,36 @@ pinned to `127.0.0.1`. No change to the NO_KEY mechanism; suite stays 106 green
 - **Artifacts**: the harness change (env-gated `WLP_LEASE_MS` liveliness in `shapes_pub.cpp`) + the
   committed pcap (`interop/fastdds/captures/wlp-participant-message-lo0.pcap`, the captures/ exception)
   + the regression test + docs are tracked; the RTI/Fast DDS dylibs + build output remain git-ignored.
+
+## M4 (2026-06-12) — reverse WLP: Fast DDS ACCEPTS our ParticipantMessageData + PID_LIVELINESS in SEDP (FR-IO-2 / FR-RTPS-WLP)
+
+- **What was consulted**: live eProsima Fast DDS 3.6.1 (the conformant peer) on the wire + via its
+  public DataReaderListener API (`on_liveliness_changed`). **No Fast DDS source copied** (clean-room).
+- **Conformance addition (prerequisite)**: our SEDP did not advertise writers' LIVELINESS QoS, so no
+  peer could RxO-match or track our liveliness. Added `PID_LIVELINESS` (0x001b) emit+parse
+  (`serialize-/parse-endpoint-data`, `src/dds-rtps/discovery.lisp`): the 12-octet
+  `{ kind:u32 LE (= dds.qos:liveliness-rank, AUTOMATIC=0/MANUAL_BY_PARTICIPANT=1/MANUAL_BY_TOPIC=2),
+  lease_duration Duration_t{sec,nanosec} u32 LE }`. ParameterId 0x001b pinned from
+  `docs/specs/xtypes-1_3-discovery-builtin-topic.idl:218` (`@id(0x001B) LivelinessQosPolicy`) + the
+  DDS PSM LivelinessQosPolicyKind. Byte-exact vs the Fast DDS oracle (frame 67: AUTOMATIC+1s =
+  `1b 00 0c 00 00 00 00 00 01 00 00 00 00 00 00 00`); locked test `pid-liveliness`. Inbound unknown
+  kind / length≠12 fail open (never reject). RxO non-regression verified: default writer offers
+  AUTOMATIC+infinite, default reader requests same → still compatible (no existing match broke).
+- **Live strong proof — MANUAL_BY_PARTICIPANT** (`interop/fastdds/captures/reverse-wlp-manual-lo0.pcap`):
+  our `run-publisher` offers MANUAL_BY_PARTICIPANT + 5 s lease and asserts on the ~1.5 s announce
+  cadence; Fast DDS `shapes_sub` requests MANUAL_BY_PARTICIPANT + 10 s. Fast DDS RxO-matched on our
+  advertised PID_LIVELINESS (`matched total: 1`) and reported `LIVELINESS_CHANGED alive=1 (1)`. We
+  emitted 15 `ParticipantMessageData` DATA on writer 0x000200c2 from our prefix `47425030…`, kind
+  `MANUAL_LIVELINESS_UPDATE (0x00000002)` (Wireshark dissects our bytes cleanly). On killing our
+  publisher Fast DDS fired `LIVELINESS_CHANGED alive=0 (-1) not_alive=1 (1)`. Because MANUAL liveliness
+  is NOT kept alive by SPDP alone, the ALIVE state proves Fast DDS received + semantically acted on our
+  MANUAL `ParticipantMessageData`; the not_alive on cessation confirms it.
+- **Live baseline — AUTOMATIC** (`interop/fastdds/captures/reverse-wlp-automatic-lo0.pcap`): our pub
+  offers AUTOMATIC + 5 s; Fast DDS sub requests AUTOMATIC + 10 s; matched + `LIVELINESS_CHANGED
+  alive=1 (1)`, our emitted PM kind `AUTOMATIC_LIVELINESS_UPDATE (0x00000001)`.
+- **Harness**: env-gated reader liveliness on Fast DDS `shapes_sub` (`SUB_LIVELINESS_LEASE_MS` +
+  `SUB_LIVELINESS_KIND`, off by default) + `on_liveliness_changed` logging; `run-publisher`
+  `:liveliness`/`:liveliness-lease-seconds` (Makefile `LIVELINESS=`/`LEASE=`). Loopback lo0, unicast
+  SPDP `PEERS=127.0.0.1:7410`, `WIRESHARK_CONFIG_DIR=/tmp/wscfg` for reliable dissection.
+- **Artifacts**: both pcaps committed (captures/ exception); the Lisp + C++ harness changes + the
+  locked `pid-liveliness` test + docs tracked. 118 green SBCL+Clasp; gate-types+gate-hotpath green.

@@ -137,8 +137,9 @@
           collect (cons (subseq entry 0 colon) port))))
 
 (defun* run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
-                           (advertise-address "127.0.0.1") (type :tagged) (peers nil))
-    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string))) t)
+                           (advertise-address "127.0.0.1") (type :tagged) (peers nil)
+                           (liveliness :automatic) (liveliness-lease-seconds 0))
+    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0))) t)
   "Publish an animated Square on DOMAIN via multicast discovery. TYPE selects the
    payload: :canonical = the exact RTI ShapeType (color/x/y/shapesize — for interop
    with rtishapesdemo / DDSSpy); :tagged = + per-publisher uuid + per-sample seq
@@ -146,14 +147,22 @@
    optional \"host:port[,host:port]\" list of unicast SPDP announce targets
    (FR-DISC-4) on top of multicast — e.g. \"127.0.0.1:7410\" reaches a same-host
    peer over loopback when the macOS application firewall / local-network privacy
-   layer silently drops LAN-sourced UDP for unapproved peer binaries."
+   layer silently drops LAN-sourced UDP for unapproved peer binaries. LIVELINESS
+   (:automatic | :manual-by-participant | :manual-by-topic) + LIVELINESS-LEASE-SECONDS
+   set the writer's LIVELINESS QoS (advertised via PID_LIVELINESS); a positive lease
+   builds an explicit reliable writer QoS, otherwise the default reliable writer is used."
   (check-type type (member :canonical :tagged))
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
                                        :multicast t :advertise-address advertise-address
                                        :peers (%parse-peers peers))))
-    (dds.disc:add-local-writer node :topic "Square" :type "ShapeType"
-                               :reliability dds.rtps.discovery:+reliability-reliable+
-                               :type-information (%shape-type-information))
+    (if (> liveliness-lease-seconds 0)
+        (dds.disc:add-local-writer
+         node :topic "Square" :type "ShapeType" :type-information (%shape-type-information)
+         :qos (dds.qos:make-qos :reliability :reliable :liveliness liveliness
+                                :liveliness-lease (dds.qos:make-qos-duration liveliness-lease-seconds 0)))
+        (dds.disc:add-local-writer node :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+
+                                   :type-information (%shape-type-information)))
     (dds.disc:enable-publisher node)
     (dds.disc:start-node node)
     (let ((uuid (%make-uuid)))

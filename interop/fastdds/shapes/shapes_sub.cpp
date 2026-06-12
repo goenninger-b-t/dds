@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <thread>
 
 #include <fastdds/dds/domain/DomainParticipant.hpp>
@@ -30,6 +31,14 @@ public:
     {
         std::cout << "[shapes_sub] matched change: " << info.current_count_change
                   << " total: " << info.current_count << std::endl;
+    }
+
+    // Reverse-WLP proof: fires when a matched writer's liveliness changes (our ParticipantMessageData asserts -> alive; assertions stop -> not_alive).
+    void on_liveliness_changed(DataReader*, const LivelinessChangedStatus& status) override
+    {
+        std::cout << "[shapes_sub] LIVELINESS_CHANGED alive=" << status.alive_count
+                  << " (" << status.alive_count_change << ") not_alive=" << status.not_alive_count
+                  << " (" << status.not_alive_count_change << ")" << std::endl;
     }
 
     void on_data_available(DataReader* reader) override
@@ -82,6 +91,15 @@ int main(int argc, char** argv)
 
     DataReaderQos rqos = DATAREADER_QOS_DEFAULT;
     rqos.reliability().kind = RELIABLE_RELIABILITY_QOS;
+    // SUB_LIVELINESS_LEASE_MS (off by default) requests a finite-lease LIVELINESS so this reader RxO-matches + TRACKS a remote writer's liveliness; SUB_LIVELINESS_KIND selects automatic (default) or manual_by_participant.
+    if (const char* lease_ms = std::getenv("SUB_LIVELINESS_LEASE_MS"))
+    {
+        const long ms = std::atol(lease_ms);
+        const char* k = std::getenv("SUB_LIVELINESS_KIND");
+        rqos.liveliness().kind = (k && std::string(k) == "manual_by_participant")
+            ? MANUAL_BY_PARTICIPANT_LIVELINESS_QOS : AUTOMATIC_LIVELINESS_QOS;
+        rqos.liveliness().lease_duration = Duration_t(static_cast<int32_t>(ms / 1000), static_cast<uint32_t>((ms % 1000) * 1000000));
+    }
     ShapeListener listener;
     DataReader* reader = subscriber->create_datareader(topic, rqos, &listener, StatusMask::all());
     if (reader == nullptr)

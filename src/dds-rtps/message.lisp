@@ -587,6 +587,8 @@
   "PID_VENDORID (RTPS 2.5 §9.6.2.2 table).")
 (defconstant +pid-reliability+                #x001a
   "PID_RELIABILITY (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-liveliness+                 #x001b
+  "PID_LIVELINESS -> LivelinessQosPolicy (RTPS 2.5 Table 9.18, §9.6.2.2).")
 (defconstant +pid-durability+                 #x001d
   "PID_DURABILITY (RTPS 2.5 §9.6.3.2).")
 (defconstant +pid-default-unicast-locator+    #x0031

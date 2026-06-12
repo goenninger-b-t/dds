@@ -417,6 +417,10 @@
 (defun* %wire-durability (n)
     (function ((unsigned-byte 32)) symbol)
   "Map a PID_DURABILITY wire code (0..3) to a DURABILITY kind keyword (default :volatile)." (case n (1 :transient-local) (2 :transient) (3 :persistent) (t :volatile)))
+(defun* %wire-liveliness (n)
+    (function ((unsigned-byte 32)) symbol)
+  "Map a PID_LIVELINESS wire kind to a LIVELINESS keyword (DDS 1.4 PSM LivelinessQosPolicyKind
+   0=AUTOMATIC,1=MANUAL_BY_PARTICIPANT,2=MANUAL_BY_TOPIC); an unknown code keeps the default :automatic, never rejecting (FR-QOS-2)." (case n (1 :manual-by-participant) (2 :manual-by-topic) (t :automatic)))
 
 (defstruct* (endpoint-data (:constructor make-endpoint-data))
   "DiscoveredWriterData / DiscoveredReaderData (RTPS 2.5 §8.5.4 / §9.6.2.2): a 16-octet
@@ -465,6 +469,14 @@
   (multiple-value-bind (c vec) (%make-scratch 4)
     (dds.core.buffer:put-u32 c (%durability-wire (dds.qos:qos-durability (endpoint-data-qos data))))
     (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-durability+ vec 0 4))
+  ;; PID_LIVELINESS (0x001b): {long kind; Duration_t lease_duration;} = 12 octets
+  ;; (RTPS 2.5 Table 9.18 §9.6.2.2; DDS 1.4 PSM LivelinessQosPolicy). kind = liveliness-rank.
+  (let* ((q (endpoint-data-qos data)) (lease (dds.qos:qos-liveliness-lease q)))
+    (multiple-value-bind (c vec) (%make-scratch 12)
+      (dds.core.buffer:put-u32 c (dds.qos:liveliness-rank (dds.qos:qos-liveliness q)))
+      (dds.core.buffer:put-u32 c (dds.qos:qos-duration-sec lease))
+      (dds.core.buffer:put-u32 c (dds.qos:qos-duration-nanosec lease))
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-liveliness+ vec 0 12)))
   ;; PID_TYPE_INFORMATION (idl @id 0x0075): opaque pre-serialized XTypes TypeInformation,
   ;; emitted only when present (peers skip unknown PIDs — backward-compatible).
   (let ((ti (endpoint-data-type-information data)))
@@ -495,6 +507,14 @@
      (when (>= len 4)
        (setf (dds.qos:qos-durability (endpoint-data-qos data))
              (%wire-durability (dds.core.buffer:get-u32 cursor)))))
+    ((= pid dds.rtps.message:+pid-liveliness+)
+     (when (= len 12)
+       (let* ((q (endpoint-data-qos data))
+              (kind (%wire-liveliness (dds.core.buffer:get-u32 cursor)))
+              (sec (dds.core.buffer:get-u32 cursor))
+              (nanosec (dds.core.buffer:get-u32 cursor)))
+         (setf (dds.qos:qos-liveliness q) kind
+               (dds.qos:qos-liveliness-lease q) (dds.qos:make-qos-duration sec nanosec)))))
     ((= pid dds.rtps.message:+pid-type-information+)
      (when (> len 0)
        (let ((ti (make-array len :element-type '(unsigned-byte 8))))

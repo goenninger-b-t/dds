@@ -363,6 +363,7 @@
                  ("rtps-frag-lossy"          . run-frag-lossy-test)
                  ("rtps-message-dispatch"    . run-rtps-dispatch-test)
                  ("rtps-parameterlist"       . run-paramlist-test)
+                 ("pid-liveliness"           . run-pid-liveliness-test)
                  ("rtps-port-mapping"        . run-port-mapping-test)
                  ("rtps-participant-message" . run-participant-message-codec-test)
                  ("fastdds-participant-message" . run-fastdds-participant-message-test)
