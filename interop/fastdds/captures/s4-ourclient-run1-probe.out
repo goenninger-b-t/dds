@@ -1,0 +1,7 @@
+./scripts/with-sbcl.sh --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-typelookup-probe :domain 0 :seconds 30 :advertise-address "127.0.0.1")' \
+	        --eval '(uiop:quit 0)'
+[tl-probe] domain=0: waiting for a Square writer announcing PID_TYPE_INFORMATION ...
+[tl-probe] peer 010f9bd7d90e62ec00000000 announces EK_MINIMAL hash bfe2a62ed811ac463c40c97d30ee; sending getTypes ...
+[tl-probe] FAIL OK reply lacks the queried hash (1 pair(s) returned)
+[tl-probe] stopped (FAIL).

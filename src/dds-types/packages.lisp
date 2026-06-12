@@ -50,6 +50,8 @@
            #:minimal-type-object-octets #:equivalence-hash
            ;; MinimalTypeObject deserializer, the serializer's inverse (FR-TYPE-2/3)
            #:parse-minimal-type-object
+           ;; CompleteTypeObject -> MINIMAL reconstruction (XTypes 1.3 §7.6.3.3.4.2, FR-IO-2 S4)
+           #:complete-to-minimal-type-object
            ;; TypeInformation codec for PID_TYPE_INFORMATION (FR-TYPE-3 foundation)
            #:serialize-type-information #:deserialize-type-information-hash
            ;; Built-in TypeLookup service request/reply codecs (XTypes 1.3 §7.6.3.3, FR-TYPE-3)

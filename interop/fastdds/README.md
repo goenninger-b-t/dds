@@ -261,3 +261,48 @@ GuidPrefixes: Fast DDS `010f9bd79842ef6e…` (fwd pub); ours `474253e7a8d5ed00�
 - **Everything from Fast DDS arrives twice on lo0:** it emits each submessage once
   per `interfaceWhiteList` entry (`127.0.0.1` + `192.168.2.148`, both looped back
   on this host). Benign; explains all ×2 counts above.
+
+## S4 leg A: TypeLookup live — our getTypes client (FR-IO-2 — 2026-06-12, same host, lo0)
+
+Our XTypes 1.3 TypeLookup **client** (`dds.disc:type-lookup-query`, complete offline per
+ADR 0010) exchanged its first live frames with a conformant peer: `run-typelookup-probe`
+(`make fastdds-tl-probe`) discovers the Fast DDS participant, takes the EK_MINIMAL hash
+from its SEDP `PID_TYPE_INFORMATION`, sends a **getTypes** `TypeLookup_Request` to its
+metatraffic locator, and verifies the returned TypeObject parses and re-hashes to the
+queried hash.
+
+| Run | Peers | Capture | Result |
+|---|---|---|---|
+| 1 (diagnosis) | `fastdds-pub COLOR=GREEN COUNT=1000` + `make fastdds-tl-probe SECONDS=30` | `captures/s4-ourclient-run1-lo0.pcap` | **FAIL (by design of the run)** — their server answered `REMOTE_EX_OK` with 1 pair, but keyed by the **EK_COMPLETE** TypeIdentifier (`s4-ourclient-run1-probe.out`); reply locked as the regression vector, client extended (below) |
+| 2 (PASS) | same | `captures/s4-ourclient-lo0.pcap` | **PASS** — `[tl-probe] PASS getTypes reply: TypeObject 87 octets parses and re-hashes to bfe2a62ed811ac463c40c97d30ee` (`s4-ourclient-probe.out`) |
+
+### Evidence frames (run 2, `s4-ourclient-lo0.pcap`)
+
+| Item | Observed | Evidence (frame) |
+|---|---|---|
+| Their TL builtin endpoints | HEARTBEATs on their empty TL request/reply writers from discovery on; our builtin ACKNACKs answer | frs 53–62 |
+| Our `TypeLookup_Request` DATA | writer `{00,03,00}c3` → their request reader `{00,03,00}c4`, sn 1, 191 B, unicast to their metatraffic locator `:7410`; carries the §7.6.3.3.4 `instanceName` (24-char prefix hex — **accepted**, see reply) | **fr 85** (t=5.872 s) |
+| Their `TypeLookup_Reply` DATA | writer `{00,03,01}c3` → our reply reader `{00,03,01}c4`, sn 1, 420 B, `REMOTE_EX_OK`, relatedRequestId = our request writer GUID + sn 1 | **frs 86/87** (×2 interfaces) |
+| Probe verdict | reply consumed live: TypeObject parses (87-octet reconstructed MINIMAL) and re-hashes to the queried `bfe2a62ed811ac463c40c97d30ee` | `s4-ourclient-probe.out` |
+
+### The client finding (fixed failing-locked-vector-test-first)
+
+Queried for a **MINIMAL** TypeIdentifier, Fast DDS 3.6.1 answers with the **COMPLETE**
+TypeObject keyed by the EK_COMPLETE TypeIdentifier (`4945808c7622315d6220054f6aad`), plus
+the `complete_to_minimal` member mapping it back to the queried EK_MINIMAL hash — exactly
+the XTypes 1.3 §7.6.3.3.4.2 latitude ("the types may contain either MINIMAL or COMPLETE
+TypeObjects"; the mapping "makes it possible for the receiver to reconstruct the MINIMAL
+TypeObject"). Our minimal-only client dropped the pair as unknown. The 256-octet run-1
+reply payload (`s4-ourclient-run1-lo0.pcap` fr 61) is locked as the regression vector in
+test `fastdds-typelookup-reply-vector`; `parse-type-lookup-reply` now parses
+`complete_to_minimal` (new 7th value) and the new
+`dds.types:complete-to-minimal-type-object` reconstructs the MINIMAL model (member
+NameHashes recomputed per §7.3.4.5; `@optional` details ride as `<is_present>` booleans
+per §7.4.3.5.2; EK_COMPLETE member TypeIdentifiers remapped via the mapping; anything
+unmodeled degrades `:unsupported`, fail-open). The discovery client delivers a
+`(minimal-hash . minimal-octets)` pair only when the reconstruction's own EquivalenceHash
+equals the mapped hash — for ShapeType the reconstructed MinimalTypeObject is
+**byte-identical to our own** (87 octets). Suite: **93 green SBCL**.
+
+Remaining S4 leg B: their client against our TypeLookup server (Fast DDS resolves
+identical types locally, so leg B needs a deliberately differing type or a hash probe).

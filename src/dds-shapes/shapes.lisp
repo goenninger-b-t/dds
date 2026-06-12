@@ -176,10 +176,15 @@
                   n (dds.disc:node-acks-in node) uuid))))
     t))
 
+(defun* %octets-hex (octets)
+    (function (vector) string)
+  "Lowercase hex rendering of an octet vector (GUID prefixes, EquivalenceHashes)."
+  (format nil "~(~{~2,'0x~}~)" (coerce octets 'list)))
+
 (defun* %hex-prefix (prefix)
     (function ((simple-array (unsigned-byte 8) (12))) string)
   "Lowercase hex of a 12-octet GUID prefix."
-  (format nil "~(~{~2,'0x~}~)" (coerce prefix 'list)))
+  (%octets-hex prefix))
 
 (defun* %fmt-locator (loc)
     (function (dds.rtps.discovery:locator) string)
@@ -504,3 +509,93 @@
         (dds.disc:stop-node node)
         (format t "~&[corpus] stopped; no PID_TYPE_OBJECT_LB captured.~%"))
       nil)))
+
+(defun* run-typelookup-probe (&key (domain 0) (seconds 15) (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:seconds (integer 1)) (:advertise-address string)) t)
+  "FR-IO-2 S4 probe: discover one remote participant on DOMAIN, take the
+   EquivalenceHash from its SEDP PID_TYPE_INFORMATION (0x0075), issue a
+   TypeLookup getTypes toward it (XTypes 1.3 §7.6.3.3), and report whether the
+   returned TypeObject parses (parse-minimal-type-object) and re-hashes
+   (equivalence-hash) to the queried hash. Prints PASS/FAIL lines; returns T on
+   PASS. SECONDS bounds discovery + reply wait."
+  (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x54) :domain domain
+                                       :multicast t :advertise-address advertise-address)))
+    ;; a Square reader makes the peer SEDP-announce its Square writer (+ 0x0075) at us
+    (dds.disc:add-local-reader node :topic "Square" :type "ShapeType"
+                               :reliability dds.rtps.discovery:+reliability-reliable+
+                               :type-information (%shape-type-information))
+    (dds.disc:enable-subscriber node)
+    (dds.disc:start-node node)
+    (format t "~&[tl-probe] domain=~d: waiting for a Square writer announcing PID_TYPE_INFORMATION ...~%"
+            domain)
+    (let ((lock (dds.pal:make-lock "tl-probe"))
+          (fired nil) (got-pairs nil) (got-okp nil)
+          (last 0) (start (get-internal-real-time)) (passed nil))
+      (flet ((expired-p ()
+               (> (/ (- (get-internal-real-time) start) internal-time-units-per-second) seconds)))
+        (unwind-protect
+             (block probe
+               (let ((remote nil))
+                 ;; phase 1: spin until a remote Square writer carries 0x0075
+                 (loop
+                   (setf last (%reannounce node last))
+                   (dolist (w (dds.disc:disc-node-discovered-writers-list node))
+                     (when (and (string= (dds.rtps.discovery:endpoint-data-topic-name w) "Square")
+                                (dds.rtps.discovery:endpoint-data-type-information w))
+                       (setf remote w)
+                       (return)))
+                   (when remote (return))
+                   (when (expired-p)
+                     (format t "~&[tl-probe] FAIL no remote Square writer with PID_TYPE_INFORMATION within ~ds~%"
+                             seconds)
+                     (return-from probe nil))
+                   (sleep 0.05))
+                 (let* ((prefix (subseq (dds.rtps.discovery:endpoint-data-guid remote) 0 12))
+                        (hash (handler-case
+                                  (dds.types:deserialize-type-information-hash
+                                   (dds.rtps.discovery:endpoint-data-type-information remote))
+                                (error (e)
+                                  (format t "~&[tl-probe] FAIL TypeInformation parse: ~a~%" e)
+                                  (return-from probe nil)))))
+                   (format t "~&[tl-probe] peer ~a announces EK_MINIMAL hash ~a; sending getTypes ...~%"
+                           (%hex-prefix prefix) (%octets-hex hash))
+                   (dds.disc:type-lookup-query
+                    node prefix (list hash)
+                    (lambda (pairs okp)
+                      ;; fires on the receiver/announce thread: record under OUR lock only
+                      (dds.pal:with-lock (lock)
+                        (setf got-pairs pairs got-okp okp fired t))))
+                   ;; phase 2: keep spinning — the announce cadence drives tl-sweep expiry
+                   (loop
+                     (setf last (%reannounce node last))
+                     (when (dds.pal:with-lock (lock) fired) (return))
+                     (when (expired-p)
+                       (format t "~&[tl-probe] FAIL no TypeLookup reply within ~ds~%" seconds)
+                       (return-from probe nil))
+                     (sleep 0.05))
+                   (multiple-value-bind (pairs okp)
+                       (dds.pal:with-lock (lock) (values got-pairs got-okp))
+                     (unless okp
+                       (format t "~&[tl-probe] FAIL reply not REMOTE_EX_OK (non-OK / expired / guard)~%")
+                       (return-from probe nil))
+                     (let ((pair (assoc hash pairs :test #'equalp)))
+                       (unless pair
+                         (format t "~&[tl-probe] FAIL OK reply lacks the queried hash (~d pair(s) returned)~%"
+                                 (length pairs))
+                         (return-from probe nil))
+                       (let ((parsed (dds.types:parse-minimal-type-object (cdr pair))))
+                         (unless (dds.types:minimal-struct-type-p parsed)
+                           (format t "~&[tl-probe] FAIL returned TypeObject (~d octets) did not parse: ~a~%"
+                                   (length (cdr pair)) parsed)
+                           (return-from probe nil))
+                         (let ((rehash (dds.types:equivalence-hash parsed)))
+                           (cond ((equalp rehash hash)
+                                  (format t "~&[tl-probe] PASS getTypes reply: TypeObject ~d octets parses and re-hashes to ~a~%"
+                                          (length (cdr pair)) (%octets-hex rehash))
+                                  (setf passed t))
+                                 (t
+                                  (format t "~&[tl-probe] FAIL re-hash mismatch: queried ~a, re-hashed ~a~%"
+                                          (%octets-hex hash) (%octets-hex rehash)))))))))))
+          (dds.disc:stop-node node)
+          (format t "~&[tl-probe] stopped (~:[FAIL~;PASS~]).~%" passed)))
+      passed)))

@@ -119,6 +119,25 @@
                        (car hp) (cdr hp)))))
   t)
 
+(defun* %tl-minimalize-pairs (pairs c2m)
+    (function (list list) list)
+  "Normalize a getTypes result to MINIMAL-keyed pairs: a pair keyed by an EK_COMPLETE
+   hash listed in C2M (the reply's complete_to_minimal mapping, XTypes 1.3 §7.6.3.3.4.2
+   — the Fast DDS 3.6.1 answer shape) is reconstructed via
+   complete-to-minimal-type-object and delivered as (minimal-hash . minimal-octets),
+   but only when the reconstruction's own EquivalenceHash equals the mapped hash (both
+   witnesses agree); otherwise the pair is dropped — fail-open, the requester behaves
+   as if the hash were unknown. Pairs not keyed in C2M pass through unchanged."
+  (loop for p in pairs
+        for mh = (cdr (assoc (car p) c2m :test #'equalp))
+        if (null mh)
+          collect p
+        else
+          append (let ((m (dds.types:complete-to-minimal-type-object (cdr p) c2m)))
+                   (when (and (dds.types:minimal-struct-type-p m)
+                              (equalp (dds.types:equivalence-hash m) mh))
+                     (list (cons mh (dds.types:minimal-type-object-octets m)))))))
+
 (defun* %on-tl-reply (node prefix octets)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t)
   "Client inbound: parse a TypeLookup_Reply and correlate it by DDS-RPC GUID + SN
@@ -127,9 +146,12 @@
    target prefix; the relatedRequestId SN selects the entry in tl-pending.
    Unknown/late/mismatched replies drop without consuming the entry. A matched
    entry is removed under the node lock and its continuation is called OUTSIDE the
-   lock with (pairs okp) — okp T iff REMOTE_EX_OK."
+   lock with (pairs okp) — okp T iff REMOTE_EX_OK; COMPLETE-keyed getTypes pairs are
+   first normalized to MINIMAL via %tl-minimalize-pairs (§7.6.3.3.4.2)."
   ;; 6th value (the getDeps continuation token) intentionally dropped: this client issues getTypes only
-  (multiple-value-bind (op result rguid rsn rex) (dds.types:parse-type-lookup-reply octets)
+  (multiple-value-bind (op result rguid rsn rex cont c2m)
+      (dds.types:parse-type-lookup-reply octets)
+    (declare (ignore cont))
     (when (and rsn (equalp rguid (%tl-writer-guid node)))
       (let ((entry (dds.pal:with-lock ((disc-node-lock node))
                      (let ((e (gethash rsn (disc-node-tl-pending node))))
@@ -137,9 +159,12 @@
                          (remhash rsn (disc-node-tl-pending node))
                          e)))))
         (when (and entry (tl-pending-entry-continuation entry))
-          (let ((okp (and (eq rex :ok) (member op '(:get-types :get-deps)) t)))
+          (let ((okp (and (eq rex :ok) (member op '(:get-types :get-deps)) t))
+                (pairs (if (and (eq op :get-types) c2m)
+                           (%tl-minimalize-pairs result c2m)
+                           result)))
             ;; continuation fires OUTSIDE the node lock (file lock discipline)
-            (funcall (tl-pending-entry-continuation entry) (and okp result) okp))))))
+            (funcall (tl-pending-entry-continuation entry) (and okp pairs) okp))))))
   t)
 
 (defun* %on-tl-data (node prefix wtr sn buf poff plen)

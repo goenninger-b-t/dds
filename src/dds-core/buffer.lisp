@@ -63,10 +63,12 @@
     (when (> pos cap) (error 'buffer-overflow :need pos :have cap))
     (setf (cursor-pos cursor) pos)))
 
-(declaim (inline %check-room))
-(defun* %check-room (cursor n)
+(declaim (inline check-room))
+(defun* check-room (cursor n)
     (function (cursor (integer 0)) t)
-  "Signal BUFFER-OVERFLOW unless CURSOR has room for N more octets before its buffer capacity."
+  "Signal BUFFER-OVERFLOW unless CURSOR has room for N more octets before its buffer
+   capacity. Exported so parsers can pre-validate wire-supplied lengths/counts BEFORE
+   allocating a result, so a hostile length can never exhaust the heap (NFR-SEC-POSTURE)."
   (let* ((buf (cursor-buffer cursor))
          (remaining (- (octet-buffer-capacity buf) (cursor-pos cursor))))
     (when (> n remaining)
@@ -82,7 +84,7 @@
          (rem (mod (- pos (cursor-origin cursor)) n)))
     (unless (zerop rem)
       (let ((pad (- n rem)))
-        (%check-room cursor pad)
+        (check-room cursor pad)
         (let ((vec (octet-buffer-vec (cursor-buffer cursor))))
           (dotimes (i pad) (setf (aref vec (+ pos i)) 0)))
         (setf (cursor-pos cursor) (+ pos pad)))))
@@ -93,7 +95,7 @@
   "Write VALUE as an NBYTES-wide unsigned integer at CURSOR in the cursor's endianness, advancing it; returns VALUE."
   (declare (type (integer 0) value) (type (integer 1 8) nbytes))
   (dds.pal:with-hot-optimizations
-    (%check-room cursor nbytes)
+    (check-room cursor nbytes)
     (let* ((vec (octet-buffer-vec (cursor-buffer cursor)))
            (pos (cursor-pos cursor)))
       (ecase (cursor-endianness cursor)
@@ -109,7 +111,7 @@
   "Read an NBYTES-wide unsigned integer at CURSOR in the cursor's endianness, advancing it; returns the value."
   (declare (type (integer 1 8) nbytes))
   (dds.pal:with-hot-optimizations
-    (%check-room cursor nbytes)
+    (check-room cursor nbytes)
     (let* ((vec (octet-buffer-vec (cursor-buffer cursor)))
            (pos (cursor-pos cursor))
            (v 0))
@@ -142,7 +144,7 @@
     (function (cursor (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) (integer 0))
   "Copy LEN octets from SRC[OFF..] into the buffer at the cursor."
   (declare (type (simple-array (unsigned-byte 8) (*)) src))
-  (%check-room cursor len)
+  (check-room cursor len)
   (let* ((vec (octet-buffer-vec (cursor-buffer cursor)))
          (pos (cursor-pos cursor)))
     (replace vec src :start1 pos :start2 off :end2 (+ off len))
@@ -153,7 +155,7 @@
     (function (cursor (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) (integer 0))
   "Copy LEN octets from the buffer at the cursor into DST[OFF..]."
   (declare (type (simple-array (unsigned-byte 8) (*)) dst))
-  (%check-room cursor len)
+  (check-room cursor len)
   (let* ((vec (octet-buffer-vec (cursor-buffer cursor)))
          (pos (cursor-pos cursor)))
     (replace dst vec :start1 off :start2 pos :end2 (+ pos len))

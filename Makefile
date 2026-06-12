@@ -11,7 +11,7 @@ LISP  ?= $(CLASP)
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
-        fastdds-pub fastdds-sub bench mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe bench mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -114,6 +114,13 @@ fastdds-pub:
 
 fastdds-sub:
 	./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/shapes && ./shapes_sub $(SECONDS)'
+
+# TypeLookup live leg A (FR-IO-2 S4): our getTypes client queries a peer's TypeLookup
+# server (e.g. `make fastdds-pub`) for its SEDP-announced EK_MINIMAL hash. PASS/FAIL on stdout.
+fastdds-tl-probe:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-typelookup-probe :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
 
 interop: wire
 	@echo "interop: 'wire' validates our output vs the tshark RTPS dissector."

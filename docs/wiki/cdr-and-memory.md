@@ -72,8 +72,8 @@ Mode-aware primitive encode/decode. Every op takes the trailing `mode` argument
 
 | Symbol | Description |
 |---|---|
-| `dds.cdr:cdr-put-string` / `cdr-get-string` | String as 4-byte length (**including** the NUL) + octets + NUL (FR-CDR-1). Latin-1 for M1; `cdr-put-string` signals `cdr-not-implemented` on non-Latin-1 input. `cdr-get-string` allocates the result string (the pooled zero-alloc deserialize path is a tracked follow-up). |
-| `dds.cdr:cdr-put-sequence` / `cdr-get-sequence` | Sequence as 4-byte element count + elements; each element is written/read via a supplied `elem-writer`/`elem-reader` closure called as `(funcall fn cursor element mode)` / `(funcall fn cursor mode)`. `cdr-get-sequence` allocates the result vector. |
+| `dds.cdr:cdr-put-string` / `cdr-get-string` | String as 4-byte length (**including** the NUL) + octets + NUL (FR-CDR-1). Latin-1 for M1; `cdr-put-string` signals `cdr-not-implemented` on non-Latin-1 input. `cdr-get-string` pre-validates the wire length against the remaining buffer extent **before** allocating the result string, signalling `dds.core.buffer:buffer-overflow` on a hostile length (NFR-SEC-POSTURE); the pooled zero-alloc deserialize path is a tracked follow-up. |
+| `dds.cdr:cdr-put-sequence` / `cdr-get-sequence` | Sequence as 4-byte element count + elements; each element is written/read via a supplied `elem-writer`/`elem-reader` closure called as `(funcall fn cursor element mode)` / `(funcall fn cursor mode)`. `cdr-get-sequence` pre-validates the wire count against the remaining buffer extent (every CDR element is at least 1 octet) **before** allocating the result vector, signalling `buffer-overflow` on a hostile count (NFR-SEC-POSTURE). |
 
 ### XCDR2 framing (`dds.cdr`)
 
@@ -294,8 +294,11 @@ NameHash example: `MD5("color")[0:4]` = `70 dd a5 df`. (From `run-md5-test`.)
 - **Strings are Latin-1 for now.** `cdr-put-string` signals `cdr-not-implemented` on
   any character above code point 255; UTF-8 byte-exactness is pinned by the corpus as a
   follow-up (FR-CDR-8).
-- **`cdr-get-string` / `cdr-get-sequence` allocate.** The deserialize side currently
-  allocates the result string/vector. The pooled, zero-alloc deserialize path is a
+- **`cdr-get-string` / `cdr-get-sequence` allocate — but only after extent validation.**
+  The deserialize side currently allocates the result string/vector, and the
+  wire-supplied length/count is validated against the remaining buffer extent *before*
+  that allocation (a hostile `0xFFFFFFFF` length signals `buffer-overflow` instead of
+  exhausting the heap, NFR-SEC-POSTURE). The pooled, zero-alloc deserialize path is a
   tracked M1-perf follow-up (FR-LANG-5 / NFR-DET); the *serialize* side and pool
   acquire/release are already allocation-free.
 - **DELIMITED / MUTABLE struct serialization is incremental.** `cdr-put-dheader`,

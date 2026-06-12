@@ -22,4 +22,5 @@
            #:run-publisher #:run-subscriber #:run-spy
            #:run-large-publisher #:run-large-subscriber
            #:run-gated-subscriber
-           #:run-corpus-capture-subscriber))
+           #:run-corpus-capture-subscriber
+           #:run-typelookup-probe))

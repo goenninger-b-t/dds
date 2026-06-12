@@ -545,6 +545,36 @@
                           (push (cons h to) pairs))))))
                 (values (nreverse pairs) t)))))))
 
+(defun* %tl-parse-c2m (c limit)
+    (function (dds.core.buffer:cursor (integer 0)) (values list t))
+  "Parse the complete_to_minimal member value ending at most at LIMIT: DHEADER + UInt32
+   count + count TypeIdentifierPairs, each two hash-form TypeIdentifiers —
+   type_identifier1 EK_COMPLETE + 14-octet hash, type_identifier2 EK_MINIMAL + 14-octet
+   hash (the COMPLETE-to-MINIMAL mapping a server sends when it answers a query for a
+   MINIMAL TypeIdentifier with the COMPLETE TypeObject, XTypes 1.3 §7.6.3.3.4.2; observed
+   live from Fast DDS 3.6.1). 30 octets/pair, pre-checked against the extent before any
+   allocation. (values alist ok), each entry (complete-hash . minimal-hash)."
+  (let* ((dsize (dds.cdr:cdr-get-dheader c :xcdr2))
+         (dend (+ (dds.core.buffer:cursor-position c) dsize)))
+    (if (> dend limit)
+        (values nil nil)
+        (let ((count (dds.cdr:cdr-get-u32 c :xcdr2))
+              (acc '()))
+          (if (> (* count 30) (- dend (dds.core.buffer:cursor-position c)))
+              (values nil nil)
+              (progn
+                (dotimes (i count)
+                  (unless (= (dds.core.buffer:get-u8 c) +ek-complete+)
+                    (return-from %tl-parse-c2m (values nil nil)))
+                  (let ((ch (make-array 14 :element-type '(unsigned-byte 8))))
+                    (dds.core.buffer:get-octets c ch 0 14)
+                    (unless (= (dds.core.buffer:get-u8 c) +ek-minimal+)
+                      (return-from %tl-parse-c2m (values nil nil)))
+                    (let ((mh (make-array 14 :element-type '(unsigned-byte 8))))
+                      (dds.core.buffer:get-octets c mh 0 14)
+                      (push (cons ch mh) acc))))
+                (values (nreverse acc) t)))))))
+
 (defun* %tl-parse-deps (c limit)
     (function (dds.core.buffer:cursor (integer 0)) (values list t))
   "Parse the dependent_typeids member value ending at most at LIMIT: DHEADER + UInt32
@@ -578,13 +608,13 @@
 
 (defun* %tl-parse-out-struct (c len op)
     (function (dds.core.buffer:cursor (integer 0) (member :get-types :get-deps))
-              (values list t t))
+              (values list t list t))
   "Parse a MUTABLE TypeLookup_get*_Out struct via %tl-walk-mutable-struct: (values
-   result continuation ok), RESULT the pairs for :get-types or the (hash . size) deps
-   for :get-deps. Members not in OP's Out struct are unknown (skipped, or rejecting on
-   M_FLAG); the complete_to_minimal member is skipped by extent (v1 consumes minimal
-   TypeObjects only). ok NIL on any malformed framing."
-  (let ((result '()) (continuation nil))
+   result continuation c2m ok), RESULT the pairs for :get-types or the (hash . size)
+   deps for :get-deps, C2M the parsed complete_to_minimal mapping for :get-types
+   (XTypes 1.3 §7.6.3.3.4.2). Members not in OP's Out struct are unknown (skipped, or
+   rejecting on M_FLAG). ok NIL on any malformed framing."
+  (let ((result '()) (continuation nil) (c2m '()))
     (if (%tl-walk-mutable-struct
          c len
          (lambda (id vstart vend)
@@ -601,19 +631,24 @@
                   (multiple-value-bind (v ok) (%tl-parse-continuation c vend)
                     (when ok (setf continuation v) :handled)))
                  ((and (eq op :get-types) (= id +tl-member-complete-to-minimal+))
-                  :handled)
+                  (dds.core.buffer:cursor-set-position c vstart)
+                  (multiple-value-bind (v ok) (%tl-parse-c2m c vend)
+                    (when ok (setf c2m v) :handled)))
                  (t :unknown))))
-        (values result continuation t)
-        (values nil nil nil))))
+        (values result continuation c2m t)
+        (values nil nil nil nil))))
 
 (defun* parse-type-lookup-reply (octets)
     (function ((simple-array (unsigned-byte 8) (*)))
               (values (or null (member :get-types :get-deps :unknown)) list
                       (or null (simple-array (unsigned-byte 8) (*))) (or null integer)
-                      (or null keyword) (or null (simple-array (unsigned-byte 8) (*)))))
+                      (or null keyword) (or null (simple-array (unsigned-byte 8) (*)))
+                      list))
   "Parse a serialized TypeLookup_Reply (XTypes 1.3 §7.6.3.3.3, CDR2_LE) and return
-   (values operation result related-guid related-sn remote-ex continuation): OPERATION
-   :get-types with RESULT a list of (14-octet-hash . typeobject-octets) pairs, or
+   (values operation result related-guid related-sn remote-ex continuation c2m):
+   OPERATION :get-types with RESULT a list of (14-octet-hash . typeobject-octets) pairs
+   and C2M the complete_to_minimal alist ((complete-hash . minimal-hash) ...) a server
+   sends when it answers a MINIMAL query with COMPLETE TypeObjects (§7.6.3.3.4.2), or
    :get-deps with RESULT a list of (14-octet-hash . size) and an optional CONTINUATION;
    :unknown for an unrecognized TypeLookup_Return discriminator; OPERATION NIL with
    RELATED-GUID/RELATED-SN/REMOTE-EX still returned when the Return union is absent (a
@@ -648,7 +683,7 @@
                      (cond
                        ;; Return omitted: valid only for a non-OK reply (header-only)
                        ((>= (dds.core.buffer:cursor-position c) len)
-                        (if (eq rex :ok) nil (values nil nil guid sn rex nil)))
+                        (if (eq rex :ok) nil (values nil nil guid sn rex nil nil)))
                        (t
                         ;; TypeLookup_Return: appendable union DHEADER bounds disc + arm
                         (let* ((usize (dds.cdr:cdr-get-dheader c :xcdr2))
@@ -666,13 +701,13 @@
                                  (let ((ret (dds.cdr:cdr-get-i32 c :xcdr2)))
                                    (if (/= ret +tl-retcode-ok+)
                                        ;; no DDS_RETCODE_OK arm: bare Result discriminator
-                                       (values op nil guid sn rex nil)
-                                       (multiple-value-bind (result continuation ok)
+                                       (values op nil guid sn rex nil nil)
+                                       (multiple-value-bind (result continuation c2m ok)
                                            (%tl-parse-out-struct c rend op)
                                          (if ok
-                                             (values op result guid sn rex continuation)
+                                             (values op result guid sn rex continuation c2m)
                                              nil))))))
-                              (t (values :unknown nil guid sn rex nil))))))))))
+                              (t (values :unknown nil guid sn rex nil nil))))))))))
              (dds.core.buffer:buffer-overflow () nil))
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))
 

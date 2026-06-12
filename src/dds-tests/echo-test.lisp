@@ -109,6 +109,24 @@
           (%check :xcdr-alignment-divergence (/= len1 len2)
                   (format nil "expected XCDR1(~d) != XCDR2(~d) for an 8-byte member"
                           len1 len2))
+          ;; hostile wire lengths must signal buffer-overflow BEFORE any allocation (NFR-SEC-POSTURE)
+          (let* ((b (dds.core.arena:pool-acquire pool))
+                 (wc (dds.core.buffer:cursor b :endianness :little)))
+            (dds.cdr:cdr-put-u32 wc #xFFFFFFFF :xcdr2)
+            (flet ((overflows-p (reader)
+                     (handler-case
+                         (progn (funcall reader (dds.core.buffer:cursor b :endianness :little))
+                                nil)
+                       (dds.core.buffer:buffer-overflow () t)
+                       (serious-condition () nil))))
+              (%check :hostile-string-length
+                      (overflows-p (lambda (rc) (dds.cdr:cdr-get-string rc :xcdr2)))
+                      "cdr-get-string must pre-validate a 0xFFFFFFFF length (buffer-overflow)")
+              (%check :hostile-sequence-count
+                      (overflows-p (lambda (rc)
+                                     (dds.cdr:cdr-get-sequence rc #'dds.cdr:cdr-get-u8 :xcdr2)))
+                      "cdr-get-sequence must pre-validate a 0xFFFFFFFF count (buffer-overflow)"))
+            (dds.core.arena:pool-release pool b))
           (dds.core.arena:teardown-arena arena)
           t)))))
 
@@ -234,6 +252,7 @@
                  ("xtypes-typeobject-cdr"    . run-typeobject-cdr-test)
                  ("xtypes-type-information"  . run-type-information-test)
                  ("fastdds-type-information-vector" . run-fastdds-type-information-vector-test)
+                 ("fastdds-typelookup-reply-vector" . run-fastdds-typelookup-reply-vector-test)
                  ("typelookup-request"       . run-typelookup-request-test)
                  ("typelookup-reply"         . run-typelookup-reply-test)
                  ("typelookup-vectors"       . run-typelookup-vector-test)

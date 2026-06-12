@@ -1190,6 +1190,130 @@
               "our serialized MinimalTypeObject size equals their typeobject_serialized_size 87")))
   t)
 
+;;; Live Fast DDS 3.6.1 TypeLookup_Reply vector (FR-IO-2 S4, FR-TYPE-3): the first live
+;;; conformant-peer getTypes exchange (the ADR 0010 CONFIRM-VS-PEER leg). Queried for our
+;;; EK_MINIMAL ShapeType hash, Fast DDS exercises the §7.6.3.3.4.2 latitude: the types
+;;; member carries the COMPLETE TypeObject keyed by its EK_COMPLETE TypeIdentifier, and
+;;; complete_to_minimal maps that back to the queried EK_MINIMAL hash so the receiver can
+;;; reconstruct the MINIMAL TypeObject.
+
+(defun* %fastdds-typelookup-reply-vector ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The live Fast DDS 3.6.1 TypeLookup_Reply SerializedPayload (256 octets, CDR2_LE) from
+   interop/fastdds/captures/s4-ourclient-run1-lo0.pcap frame 61 (DATA on the reply writer
+   {00,03,01}c3, sn 1, payload at frame offset 0x68): the getTypes answer to our query for
+   the EK_MINIMAL ShapeType hash — REMOTE_EX_OK, one TypeIdentifierTypeObjectPair keyed
+   EK_COMPLETE 4945808c7622315d6220054f6aad carrying the 128-octet COMPLETE TypeObject,
+   plus a one-pair complete_to_minimal mapping it to EK_MINIMAL
+   bfe2a62ed811ac463c40c97d30ee (XTypes 1.3 §7.6.3.3.4.2)."
+  (%hex-octets
+   (concatenate 'string
+    "000700024742545cc3d5ed0000000000000300c3000000000100000000000000"
+    "da000000d3528201d200000000000000ca000000d14a80529800000001000000"
+    "f24945808c7622315d6220054f6aad0080000000f25101001200000000000000"
+    "0a00000053686170655479706500000060000000040000001400000000000000"
+    "2100700006000000636f6c6f7200000010000000010000000100040002000000"
+    "7800000010000000020000000100040002000000790000001800000003000000"
+    "010004000a000000736861706573697a6500000077658e5b2200000001000000"
+    "f24945808c7622315d6220054f6aadf1bfe2a62ed811ac463c40c97d30ee0000")))
+
+(defun* %complete-seq-typeobject-octets (ehash)
+    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
+  "Hand-laid XCDR2-LE EK_COMPLETE TypeObject for struct s { sequence<T> v; } whose
+   sequence ELEMENT TypeIdentifier is EK_COMPLETE EHASH (PlainSequenceSElemDefn framing,
+   xtypes-1_3_typeobject.idl §187-189) — the element-remap case the serializer cannot emit."
+  (concatenate
+   '(simple-array (unsigned-byte 8) (*))
+   (octets 66 0 0 0              ; TypeObject DHEADER (content = 66 octets)
+           #xf2 #x51 1 0         ; EK_COMPLETE + TK_STRUCTURE + struct_flags IS_FINAL
+           10 0 0 0              ; header DHEADER (TK_NONE + detail = 10 octets)
+           0 0 0 0               ; TK_NONE base + 2 absent annotations + pad
+           2 0 0 0 #x73 0 0 0    ; type_name "s" (len 2 + chars + pad)
+           42 0 0 0 1 0 0 0      ; member-seq DHEADER(42) + count 1
+           34 0 0 0              ; member DHEADER(34)
+           0 0 0 0 1 0           ; member id 0 + flags TRY_CONSTRUCT=DISCARD
+           #x80 #xf2 1 0 0       ; TI_PLAIN_SEQ_SMALL + equiv EK_COMPLETE + flags + SBound 0
+           #xf2)                 ; element TypeIdentifier discriminator EK_COMPLETE
+   ehash                         ; the 14-octet element EquivalenceHash
+   (octets 0 0 2 0 0 0 #x76 0))) ; pad + member name "v" (len 2 + chars)
+
+(defun* run-fastdds-typelookup-reply-vector-test ()
+    (function () t)
+  "Test: the live Fast DDS 3.6.1 getTypes TypeLookup_Reply parses — including the
+   complete_to_minimal member (XTypes 1.3 §7.6.3.3.4.2) — and the COMPLETE TypeObject
+   reconstructs (complete-to-minimal-type-object) to a MINIMAL model that re-hashes to
+   the queried EquivalenceHash and re-serializes byte-identical to our own ShapeType
+   MinimalTypeObject (FR-IO-2 S4)."
+  (let ((vec (%fastdds-typelookup-reply-vector))
+        (chash (octets #x49 #x45 #x80 #x8c #x76 #x22 #x31 #x5d #x62 #x20 #x05 #x4f #x6a #xad))
+        (mhash (octets #xbf #xe2 #xa6 #x2e #xd8 #x11 #xac #x46 #x3c #x40 #xc9 #x7d #x30 #xee)))
+    (multiple-value-bind (op pairs rguid rsn rex cont c2m)
+        (dds.types:parse-type-lookup-reply vec)
+      (declare (ignore cont))
+      (%check :s4-op (eq op :get-types) "getTypes Return discriminator")
+      (%check :s4-hdr (and (= rsn 1) (eq rex :ok)
+                           (equalp (subseq rguid 12 16) (octets 0 3 0 #xc3)))
+              "relatedRequestId targets our TL request writer {00,03,00}c3, sn 1, REMOTE_EX_OK")
+      (%check :s4-pair (and (= 1 (length pairs)) (equalp (car (first pairs)) chash))
+              "one pair, keyed by the EK_COMPLETE TypeIdentifier (the §7.6.3.3.4.2 latitude)")
+      (%check :s4-c2m (equalp c2m (list (cons chash mhash)))
+              "complete_to_minimal maps the COMPLETE TypeIdentifier to the queried EK_MINIMAL hash")
+      (let ((m (dds.types:complete-to-minimal-type-object (cdr (first pairs)) c2m)))
+        (%check :s4-reconstruct (dds.types:minimal-struct-type-p m)
+                "the COMPLETE TypeObject reconstructs to a MINIMAL struct model")
+        (when (dds.types:minimal-struct-type-p m)
+          (%check :s4-rehash (equalp (dds.types:equivalence-hash m) mhash)
+                  "the reconstruction re-hashes to the queried EK_MINIMAL EquivalenceHash")
+          (let ((ours (dds.types:type-support-typeobject (dds.types:find-type-support "shape-type"))))
+            (%check :s4-bytes (equalp (dds.types:minimal-type-object-octets m)
+                                      (dds.types:minimal-type-object-octets ours))
+                    "the reconstructed MinimalTypeObject is byte-identical to our own ShapeType's")))))
+    ;; truncation sweep over the CDR extent (NFR-SEC-POSTURE): the live payload ends with
+    ;; 2 DATA-submessage pad octets (CDR stream = 254), so only sub-extent prefixes reject
+    (%check :s4-pad-tolerated
+            (eq :get-types (dds.types:parse-type-lookup-reply (subseq vec 0 254)))
+            "the reply minus its submessage padding still parses (trailing-slack tolerance)")
+    (%check :s4-prefixes
+            (loop for end in (%truncation-offsets 254)
+                  always (null (dds.types:parse-type-lookup-reply (subseq vec 0 end))))
+            "every sampled proper prefix of the live reply's CDR extent rejects (NIL)")
+    ;; hostile internal length (NFR-SEC-POSTURE): corrupt the COMPLETE TypeObject's
+    ;; type_name length to 0xFFFFFFFF; reconstruction must drop (NIL), nothing escapes
+    (let ((evil (copy-seq vec)))
+      (%check :s4-hostile-site (equalp (subseq evil 96 100) (octets #x0a 0 0 0))
+              "vec[96..99] is the pristine type_name length field (0a 00 00 00)")
+      (fill evil #xff :start 96 :end 100)
+      (multiple-value-bind (op pairs rguid rsn rex cont c2m)
+          (dds.types:parse-type-lookup-reply evil)
+        (declare (ignore rguid rsn rex cont))
+        (%check :s4-hostile-strlen
+                (and (eq op :get-types) (= 1 (length pairs))
+                     (handler-case
+                         (null (dds.types:complete-to-minimal-type-object
+                                (cdr (first pairs)) c2m))
+                       (serious-condition () nil)))
+                "a 0xFFFFFFFF type_name length must drop to NIL, no condition escape")))
+    ;; sequence-member ELEMENT carrying EK_COMPLETE (hand-laid): remapped via the
+    ;; complete_to_minimal alist like a member-level EK_COMPLETE, :unsupported when
+    ;; unmapped (fail-open) — never passed through for the hash net to catch downstream
+    (let ((seqvec (%complete-seq-typeobject-octets chash)))
+      (let ((m (dds.types:complete-to-minimal-type-object seqvec (list (cons chash mhash)))))
+        (%check :s4-seq-element-remap
+                (and (dds.types:minimal-struct-type-p m)
+                     (let* ((mem (first (dds.types:minimal-struct-type-members m)))
+                            (ti (dds.types:minimal-struct-member-type-identifier mem))
+                            (el (dds.types:type-identifier-element ti)))
+                       (and (= (dds.types:type-identifier-kind ti)
+                               dds.types:+ti-plain-sequence-small+)
+                            el
+                            (= (dds.types:type-identifier-kind el) dds.types:+ek-minimal+)
+                            (equalp (dds.types:type-identifier-hash el) mhash))))
+                "a mapped EK_COMPLETE sequence ELEMENT remaps to its EK_MINIMAL hash"))
+      (%check :s4-seq-element-unmapped
+              (eq :unsupported (dds.types:complete-to-minimal-type-object seqvec '()))
+              "an unmapped EK_COMPLETE sequence ELEMENT degrades the parse to :unsupported")))
+  t)
+
 ;;; Inbound RTI PID_TYPE_OBJECT_LB inflate (ADR 0009, FR-TYPE-3): a ZLIB-compressed
 ;;; COMPLETE TypeObject inflates byte-exact, and a malformed / oversized / wrong-class /
 ;;; truncated LB rejects (bounds + resource guard, NFR-SEC-POSTURE). The LB vector below is

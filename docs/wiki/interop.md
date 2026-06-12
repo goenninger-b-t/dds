@@ -72,7 +72,26 @@ TypeLookup client+server pinned on via `fastdds.type_propagation=enabled`, and �
 ./scripts/with-fastdds.sh make -C interop/fastdds   # build (pinned toolchain)
 make fastdds-sub SECONDS=15                         # subscribe + print samples (0 = forever)
 make fastdds-pub COLOR=GREEN COUNT=50               # publish ~10 samples/s (0 = forever)
+make fastdds-tl-probe SECONDS=30                    # TypeLookup live leg A: our getTypes client
+                                                    # queries the peer's TypeLookup server (S4)
 ```
+
+`make fastdds-tl-probe` runs `dds.shapes:run-typelookup-probe` (FR-IO-2 S4): it discovers one
+remote `Square` writer, takes the EK_MINIMAL EquivalenceHash from its SEDP
+`PID_TYPE_INFORMATION` (0x0075), issues a TypeLookup **getTypes** request toward that
+participant (XTypes 1.3 §7.6.3.3) via `dds.disc:type-lookup-query`, and verifies the returned
+TypeObject both parses (`parse-minimal-type-object`) and re-hashes (`equivalence-hash`) to the
+queried value — printing `[tl-probe] PASS/FAIL` and returning `T` on PASS.
+
+**S4 leg A is ACHIEVED (2026-06-12):** the probe PASSes live against Fast DDS 3.6.1 — our
+request DATA on their TypeLookup request reader and their `REMOTE_EX_OK` reply are frames
+85 / 86-87 of `interop/fastdds/captures/s4-ourclient-lo0.pcap`. The run surfaced (and locked,
+test `fastdds-typelookup-reply-vector`) the conformant reply shape our client had never seen:
+asked for a MINIMAL TypeIdentifier, Fast DDS returns the **COMPLETE** TypeObject plus the
+`complete_to_minimal` mapping (XTypes 1.3 §7.6.3.3.4.2), which the client now reconstructs
+into the MINIMAL TypeObject (`dds.types:complete-to-minimal-type-object` — see
+[Type system](type-system.md)). See the S4 section of
+[`interop/fastdds/README.md`](../../interop/fastdds/README.md) for the run table + evidence.
 
 Same-host Fast DDS↔Fast DDS smoke is green (S0 gate; 48/50 over `lo0`), mutual SPDP/SEDP
 discovery is proven from the wire (S1 census), and the **FR-IO-2 data-plane DoD is met**
@@ -131,8 +150,11 @@ the diff isolates one of three one-line knobs (encapsulation-header / `struct_fl
   a Connext install. Same gate applies to full DCPS/content-filter interop.
 - **Open peer (Fast DDS)** interop: **bidirectional reliable ShapeType exchange achieved**
   vs Fast DDS 3.6.1 (forward 95/100, reverse 250/250, HEARTBEAT/ACKNACK live both
-  directions, tshark-validated — the FR-IO-2 data-plane DoD, S2); the byte-level TypeLookup
-  CONFIRM-VS-PEER + EquivalenceHash re-pin (S3) is the remaining FR-IO-2 step.
+  directions, tshark-validated — the FR-IO-2 data-plane DoD, S2); the **EquivalenceHash is
+  externally confirmed** (S3, locked vector) and the **TypeLookup getTypes client leg is
+  live** (S4 leg A: our client consumes their server's reply, frames 85/86-87 of
+  `s4-ourclient-lo0.pcap`); the remaining FR-IO-2 step is S4 leg B (their client against
+  our TypeLookup server).
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

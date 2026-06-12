@@ -1,0 +1,15 @@
+./scripts/with-sbcl.sh --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-typelookup-probe :domain 0 :seconds 30 :advertise-address "127.0.0.1")' \
+	        --eval '(uiop:quit 0)'
+; compiling file "/Users/frgo/gbt Dropbox/gbt/projects/hofvarpnir/src/dds-shapes/packages.lisp" (written 12 JUN 2026 01:28:09 AM):
+
+; wrote /Users/frgo/.cache/common-lisp/sbcl-2.6.5-85913ede1-macosx-arm64/Users/frgo/gbt Dropbox/gbt/projects/hofvarpnir/src/dds-shapes/packages-tmpGHU3ALSV.fasl
+; compilation finished in 0:00:00.015
+; compiling file "/Users/frgo/gbt Dropbox/gbt/projects/hofvarpnir/src/dds-shapes/shapes.lisp" (written 12 JUN 2026 01:28:03 AM):
+
+; wrote /Users/frgo/.cache/common-lisp/sbcl-2.6.5-85913ede1-macosx-arm64/Users/frgo/gbt Dropbox/gbt/projects/hofvarpnir/src/dds-shapes/shapes-tmpAAURSO1.fasl
+; compilation finished in 0:00:00.111
+[tl-probe] domain=0: waiting for a Square writer announcing PID_TYPE_INFORMATION ...
+[tl-probe] peer 010f9bd78f15414500000000 announces EK_MINIMAL hash bfe2a62ed811ac463c40c97d30ee; sending getTypes ...
+[tl-probe] PASS getTypes reply: TypeObject 87 octets parses and re-hashes to bfe2a62ed811ac463c40c97d30ee
+[tl-probe] stopped (PASS).

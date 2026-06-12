@@ -102,15 +102,21 @@
     s))
 (defun* cdr-get-string (c mode)
     (function (dds.core.buffer:cursor cdr-mode) string)
-  "Note: allocates the result string. The pooled, zero-alloc deserialize path is
-   a tracked M1-perf follow-up (FR-LANG-5/NFR-DET)."
+  "Read a string from cursor C: 4-byte length (including the NUL) + octets + NUL
+   (FR-CDR-1). The wire length is pre-validated against the remaining buffer
+   extent BEFORE the result string is allocated, signalling buffer-overflow on a
+   hostile length (NFR-SEC-POSTURE). Note: allocates the result string. The
+   pooled, zero-alloc deserialize path is a tracked M1-perf follow-up
+   (FR-LANG-5/NFR-DET)."
   (cdr-align c 4 mode)
-  (let* ((len (dds.core.buffer:get-u32 c))
-         (n (max 0 (1- len)))
-         (s (make-string n)))
-    (dotimes (i n) (setf (char s i) (code-char (dds.core.buffer:get-u8 c))))
-    (dds.core.buffer:get-u8 c)
-    s))
+  (let ((len (dds.core.buffer:get-u32 c)))
+    ;; LEN includes the NUL: exactly LEN octets follow (NFR-SEC-POSTURE)
+    (dds.core.buffer:check-room c len)
+    (let* ((n (max 0 (1- len)))
+           (s (make-string n)))
+      (dotimes (i n) (setf (char s i) (code-char (dds.core.buffer:get-u8 c))))
+      (dds.core.buffer:get-u8 c)
+      s)))
 
 ;;; sequence: 4-byte element count + elements (FR-CDR-1)
 (defun* cdr-put-sequence (c vec elem-writer mode)
@@ -124,12 +130,18 @@
     n))
 (defun* cdr-get-sequence (c elem-reader mode)
     (function (dds.core.buffer:cursor function cdr-mode) simple-vector)
-  "Note: allocates the result vector (see cdr-get-string)."
+  "Read a sequence from cursor C: 4-byte element count + elements, each read via
+   (funcall ELEM-READER c mode) (FR-CDR-1). The wire count is pre-validated
+   against the remaining buffer extent BEFORE the result vector is allocated,
+   signalling buffer-overflow on a hostile count (NFR-SEC-POSTURE). Note:
+   allocates the result vector (see cdr-get-string)."
   (cdr-align c 4 mode)
-  (let* ((n (dds.core.buffer:get-u32 c))
-         (vec (make-array n)))
-    (dotimes (i n) (setf (aref vec i) (funcall elem-reader c mode)))
-    vec))
+  (let ((n (dds.core.buffer:get-u32 c)))
+    ;; every CDR element serializes to >= 1 octet (NFR-SEC-POSTURE)
+    (dds.core.buffer:check-room c n)
+    (let ((vec (make-array n)))
+      (dotimes (i n) (setf (aref vec i) (funcall elem-reader c mode)))
+      vec)))
 
 ;;;; XCDR2 framing headers. DHEADER: XTypes 1.3 §7.4.3.4.1 (UInt32 serialized
 ;;;; size of the following object, 4-byte aligned, stream endianness). EMHEADER1

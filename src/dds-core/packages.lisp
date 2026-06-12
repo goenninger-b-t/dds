@@ -17,7 +17,7 @@
            #:cursor-reset #:align
            #:put-u8 #:get-u8 #:put-u16 #:get-u16 #:put-u32 #:get-u32
            #:put-u64 #:get-u64 #:put-octets #:get-octets
-           #:buffer-overflow))
+           #:check-room #:buffer-overflow))
 
 (defpackage #:net.goenninger.dds.core.md5
   (:nicknames #:dds.core.md5)
