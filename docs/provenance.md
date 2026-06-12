@@ -803,6 +803,73 @@ TypeIdentifier (element TI + single fixed dimension), mirroring the enum stage's
 - **Corpus artifacts**: unchanged from the Task-4.2 entry — no new capture taken; this RE re-reads
   the existing C_Array bytes. `rtiddsgen` output + RTI dylibs stay git-ignored (NFR-IP).
 
+### C_Union legacy union def-node — structural union decode (Task 2.3 / FR-TYPE-4 S2, 2026-06-12)
+
+Method: clean-room differential over the SAME locked C_Union capture (232-octet LB, 608-octet
+inflated), meanings ONLY from captured bytes — the tokenized tree was dumped (each node's
+tag/code/[value-start,value-end) + leading value bytes) and read directly; no RTI source / GPL
+dissector. This RE flips union OUT of the Task-4.1/4.2 degrade tier into a real EK_MINIMAL union
+TypeIdentifier (discriminator TI + per-case members), mirroring the enum/array def-node pattern.
+Ground truth: `union SomeUnion switch(long) { case 0: long a; case 1: double b; };` embedded as
+member `u` in `@final struct C_Union { @key long id; SomeUnion u; }`.
+
+- **Union member `u`** (member-list CODE-0 child node `[188..220)`):
+  bytes `00000000 | 01000000 | 1500 0000 | 00000000 | 4F3E0A9E 92CDA651 | 02000000 | 75000000`.
+  `+0` key=0, `+4` id=1, `+8` u16 kind = **0x15 (21)** = union (already pinned in Task 4.2), `+16`
+  8-octet type-hash `4F 3E 0A 9E 92 CD A6 51` — the SAME hash@+16 reference mechanism strings
+  (0x13/CODE-8), sequences (0x12/CODE-7), nested structs (0x16/CODE-9), enums (0x0E/CODE-5) and
+  arrays (0x11/CODE-3) use.
+- **Union-def node = CODE 10** (`+lto-code-union-def+`), node `[268..572)`. Its CODE-0 child `[280..312)`
+  (name="SomeUnion") echoes the member's hash at its `VALUE-START+8`: `4F 3E 0A 9E 92 CD A6 51` —
+  byte-identical to the member's `+16` hash. So `%lto-find-def-node octets root member-node 10`
+  resolves it by the shared hash-reference pattern; CODE 10 is the unique node whose CODE-0 child
+  carries this hash (no other def tier carries it).
+- **Cases container = CODE 100** (`+lto-code-union-cases+`), child `[340..568)`. Its `VALUE-START+0`
+  u32 = **3** — the entry count: the discriminator PLUS the two members. Its CHILDREN, in order, are
+  the entries, each a named CODE-0 LONG node IMMEDIATELY FOLLOWED by a CODE-100 label-list LONG node:
+  - **discriminator** CODE-0 `[356..388)` (name="discriminator"): `+8` u16 kind = `05 00` = **0x05 =
+    RTI `long` → i32 / TK_INT32** (mapped via `*lto-primitive-kind-keyword*`). Its following CODE-100
+    label list `[416..420)` is 4 octets = `00 00 00 00` → label-count **0** (the discriminator has no
+    case labels — the signal that this entry IS the discriminator, not a member).
+  - **member `a`** CODE-0 `[436..456)` (name="a"): `+4` id=1, `+8` u16 kind = `05 00` = **0x05 = i32**.
+    Its following CODE-100 label list `[484..492)` is 8 octets = `01 00 00 00  00 00 00 00` →
+    label-count **1**, label[0]:i32 = **0** → `case 0: long a` ✓.
+  - **member `b`** CODE-0 `[508..528)` (name="b"): `+4` id=2, `+8` u16 kind = `0A 00` = **0x0A = RTI
+    `double` → f64 / TK_FLOAT64**. Its following CODE-100 label list `[556..564)` is 8 octets =
+    `01 00 00 00  01 00 00 00` → label-count **1**, label[0]:i32 = **1** → `case 1: double b` ✓.
+- **Member NAME matching**: the union-def stores the member NAMES ("a", "b") length-prefixed +
+  NUL-padded in each CODE-0 entry (the same string framing `%lto-read-name` decodes), so
+  `make-union-member` hashes both the wire model's and a locally-built model's member names
+  identically (the NameHash IS the union-member identity — no false reject on name).
+- **CODE 100 disambiguation**: CODE value 100 is REUSED — it is both the union cases CONTAINER and
+  each entry's label-list child, AND coincides with the sequence/array element-type child and the
+  enum bit-bound child. All are disambiguated by the PARENT code (union-def 10 vs sequence-def 7 /
+  array-def 3 / enum-def 5); the union decoder reads CODE-100 nodes only via the resolved union-def
+  node, so there is no collision.
+- **Cross-check**: discriminator = i32 (RTI kind 5); case 0 → member "a" type i32 (RTI kind 5),
+  label {0}; case 1 → member "b" type f64 (RTI kind 0x0A), label {1} — exactly the `union SomeUnion
+  switch(long) { case 0: long a; case 1: double b; }` ground truth.
+- **Assignability proof** (`run-lto-union-assignability-test`): the parsed C_Union's `u` member is an
+  EK_MINIMAL union TI (disc i32; {0}→a i32; {1}→b f64). `struct-assignable-from` gates it through
+  `union-assignable-from` (§7.2.4.4.8 Table 19 UNION_TYPE row): a matching local is assignable both
+  ways; a local where case 0's member type changes long→double (shared label {0}, member types not
+  assignable) is NOT; re-running the compatible case proves no false-reject. NOTE: the union member
+  sits in a FINAL struct, so the member-match rule requires STRONG assignability, which requires the
+  member type to be DELIMITED. `ti-delimited-p` was extended (this task) to treat a union as delimited
+  iff its discriminator AND every member type are delimited — a sound, verifiable condition (a FINAL
+  union of delimited members is bounded by discriminator + selected member); this removes the
+  false-reject that the conservative "union = NOT delimited" default produced.
+- **Fail-open residue (still `:unsupported`, gate falls open to name-match)**: a **default member**
+  (`default: …` — no capture, the label encoding is unverified), a **non-primitive discriminator**
+  (only `*lto-primitive-kind-keyword*` kinds 1–0x0C decode), a **non-primitive member type** (string /
+  nested aggregate / sequence / array case member), and a **multi-label case** (`case 0: case 1: …` —
+  label-count ≠ 1, the multi-label encoding is unverified) ALL yield NIL → the union member is
+  unmodelable → the whole parse degrades to `:unsupported`. Union gates ONLY where the wire is safely
+  modelable (primitive discriminator, single-label primitive-typed cases) — better to fail open than
+  to gate on a guessed encoding.
+- **Corpus artifacts**: unchanged from the Task-4.2 entry — no new capture taken; this RE re-reads
+  the existing C_Union bytes. `rtiddsgen` output + RTI dylibs stay git-ignored (NFR-IP).
+
 ### Live legacy-TypeObject type-gating acceptance test (Task 6.1, ADR 0011, 2026-06-11)
 
 - **What was consulted**: live RTI Connext 7.3.1 on the wire only — its SEDP `PID_TYPE_OBJECT_LB`

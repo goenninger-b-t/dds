@@ -713,21 +713,15 @@
     (function () t)
   "Test: the degrading policy (the operating contract, Task 4.1). A struct whose member declares a
    type the model cannot represent degrades the WHOLE parse to :unsupported (fail-open to
-   name-match), never a partial minimal-struct-type with a NIL-TI member. The live C_Union capture is
-   the driver — a union member (kind 0x15, no union TI in assignability.lisp) is UNMODELABLE; plus the
-   *lto-max-type-depth* 0 case (an over-depth nested-struct member is also unmodelable). A purely
-   well-modeled type (C_Shape) is unaffected (still a minimal-struct-type). (Enum used to be the
-   driver here; Task S0.3 flipped enum OUT of the degrade tier — it now decodes structurally, see
-   run-lto-enum-assignability-test.)"
-  (let* ((union-lb (%lto-connext-c-union-lb))
-         (union-inf (dds.types:inflate-type-object-lb union-lb))
-         (union-parsed (and union-inf (dds.types:parse-legacy-type-object union-inf))))
-    (%check :lto-unmodelable-union-inflate
-            (and union-inf (= (length union-inf) 608))
-            "C_Union PID_TYPE_OBJECT_LB inflates to the 608-octet legacy TypeObject")
-    (%check :lto-unmodelable-union-unsupported
-            (eq union-parsed :unsupported)
-            "a struct with an UNMODELABLE union member degrades the whole parse to :unsupported (fail-open)"))
+   name-match), never a partial minimal-struct-type with a NIL-TI member. The live driver is the
+   *lto-max-type-depth* 0 case (an over-depth nested-struct member is unmodelable — the
+   %lto-member-type-identifier NIL + %lto-member-has-kind-p T policy flip fires). A purely
+   well-modeled type (C_Shape) is unaffected (still a minimal-struct-type). (Enum, array and union
+   used to drive this; Tasks S0.3 / 1.3 / 2.3 flipped each OUT of the degrade tier — they now decode
+   structurally, see run-lto-enum/array/union-assignability-test. The residue that still degrades:
+   an over-depth/cyclic nested struct, a sequence/array-of-aggregate, a multi-dim array, a union with
+   a non-primitive discriminator/member or a multi-label/default case, and any not-yet-RE'd kind such
+   as bitmask.)"
   ;; cross-check: a fully-modelable type (C_Shape) is NOT degraded — the policy fires only on an
   ;; unmodelable member, not on every type.
   (let* ((shape-lb (%connext-c-shape-lb))
@@ -828,15 +822,17 @@
 
 (defun* run-lto-parse-aggregates-unsupported-test ()
     (function () t)
-  "Test: the degrading policy holds for the UNION member (Task 4.2), while the ARRAY member now
-   decodes structurally (Task 1.3). The live C_Union capture parses to :unsupported because its union
-   member-kind (0x15) is UNMODELABLE — absent from all mapped arms and from *lto-primitive-kind-keyword*
-   — so %lto-member-type-identifier NIL + %lto-member-has-kind-p T triggers the Task-4.1 policy flip.
-   The live C_Array capture (member-kind 0x11) now parses to a minimal-struct-type (cross-check; the
-   full plain-array TI + assignability proof is in run-lto-array-assignability-test). The fingerprint
-   strings confirm each capture is the right type. Bitmask is recorded as a gap (rtiddsgen 4.3.1
-   rejects `bitmask`). Pinned to the live Connext 7.3.1 corpus (docs/provenance.md 2026-06-11/06-12)."
-  ;; C_Union: member-kind 0x15 (union), unmodelable -> :unsupported
+  "Test: the UNION and ARRAY members now both decode structurally (Tasks 2.3 / 1.3). The live
+   C_Union capture (member-kind 0x15) parses to a minimal-struct-type — its union member resolves a
+   +LTO-CODE-UNION-DEF+ node (discriminator i32; case 0 -> a i32; case 1 -> b f64); the full union TI +
+   assignability proof is in run-lto-union-assignability-test. The live C_Array capture (member-kind
+   0x11) likewise parses to a minimal-struct-type (the plain-array TI proof is in
+   run-lto-array-assignability-test). The fingerprint strings confirm each capture is the right type.
+   The degrade tier now holds only the not-yet-RE'd / unsafe residue (over-depth/cyclic nested struct,
+   sequence/array-of-aggregate, multi-dim array, non-primitive/multi-label/default union, bitmask —
+   rtiddsgen 4.3.1 rejects `bitmask`, recorded as a gap). Pinned to the live Connext 7.3.1 corpus
+   (docs/provenance.md 2026-06-11/06-12)."
+  ;; C_Union: member-kind 0x15 (union), now decodes structurally (Task 2.3) -> minimal-struct-type
   (let* ((lb (%lto-connext-c-union-lb))
          (inflated (dds.types:inflate-type-object-lb lb)))
     (%check :lto-union-inflate
@@ -848,9 +844,9 @@
                 (every (lambda (s) (member s strs :test #'string=))
                        '("C_Union" "SomeUnion"))
                 "the C_Union capture carries C_Union / SomeUnion fingerprint strings"))
-      (%check :lto-union-unsupported
-              (eq (dds.types:parse-legacy-type-object inflated) :unsupported)
-              "C_Union parses to :unsupported — union member-kind 0x15 is unmodelable, fail-open")))
+      (%check :lto-union-structural
+              (dds.types:minimal-struct-type-p (dds.types:parse-legacy-type-object inflated))
+              "C_Union now parses to a minimal-struct-type — union member-kind 0x15 decodes (Task 2.3)")))
   ;; C_Array: member-kind 0x11 (array), now decodes structurally (Task 1.3) -> minimal-struct-type
   (let* ((lb (%lto-connext-c-array-lb))
          (inflated (dds.types:inflate-type-object-lb lb)))
@@ -1042,4 +1038,112 @@
         (%check :lto-array-asgn-no-false-reject
                 (dds.types:struct-assignable-from parsed (%build-c-array-local :i32 4) opts)
                 "no false-reject: the compatible case still holds after the incompatible ones"))))
+  t)
+
+;;; Legacy-TypeObject UNION member structural decode + assignability (Task 2.3, FR-TYPE-4 S2).
+;;; The live C_Union capture (`@final struct C_Union { @key long id; SomeUnion u; }`,
+;;; `union SomeUnion switch(long) { case 0: long a; case 1: double b; }`) now parses to a
+;;; minimal-struct-type whose `u` member is an EK_MINIMAL union TypeIdentifier (discriminator i32;
+;;; case 0 -> a i32; case 1 -> b f64), flipping union OUT of the degrade tier. The differential
+;;; (docs/provenance.md 2026-06-12) localized: the union member node carries kind 0x15 (21) at
+;;; VALUE-START+8 plus the same 8-octet type-hash@+16 referencing a UNION-definition node (CODE 10)
+;;; whose CODE-0 child echoes that hash at VALUE-START+8 and whose CODE-100 child is the cases
+;;; container (count:u32 = discriminator + members). Inside the container, each NAMED CODE-0 entry
+;;; is a discriminator-or-member (id@+4, type-kind u16@+8) immediately followed by a CODE-100
+;;; label-list child (count:u32 then COUNT labels:i32): the discriminator's list is empty (count 0),
+;;; a member's carries its case labels. The wire stores member NAMES, so make-union-member hashes
+;;; both sides identically.
+
+(defun* %build-c-union-local (case0-elem)
+    (function (keyword) dds.types:minimal-struct-type)
+  "A locally-built minimal-struct-type mirroring the live C_Union: @final, @key long id (id 0) +
+   union member u (id 1) over SomeUnion (discriminator i32; member a labels {0} type CASE0-ELEM;
+   member b labels {1} type f64). CASE0-ELEM :i32 = matching the corpus; :f64 = a provably-
+   incompatible union (case 0's member type changed long->double, the shared-label member-type
+   mismatch union-assignable-from rejects). Member ids match the parsed model (declaration order:
+   id 0, u 1); union-member NameHashes are computed by make-union-member — the SAME hashes the
+   wire model carries. Test fixture."
+  (dds.types:make-minimal-struct-type
+   :name "C_Union" :extensibility :final
+   :members (list (dds.types:make-struct-member
+                   "id" 0 (dds.types:primitive-type-identifier :i32) :key-p t)
+                  (dds.types:make-struct-member
+                   "u" 1
+                   (dds.types:union-type-identifier
+                    (dds.types:make-minimal-union-type
+                     :discriminator (dds.types:primitive-type-identifier :i32)
+                     :members (list (dds.types:make-union-member
+                                     "a" '(0) (dds.types:primitive-type-identifier case0-elem) nil)
+                                    (dds.types:make-union-member
+                                     "b" '(1) (dds.types:primitive-type-identifier :f64) nil))))))))
+
+(defun* run-lto-union-assignability-test ()
+    (function () t)
+  "Test: the live C_Union legacy TypeObject parses to a minimal-struct-type whose `u` member is a
+   union TI (discriminator i32; case 0 -> a i32; case 1 -> b f64), and struct-assignable-from gates
+   it (Task 2.3, FR-TYPE-4 S2): a matching local is assignable both ways; a local where case 0's
+   member type changes (long->double) is not; no false-reject on re-run. Pinned to the live Connext
+   7.3.1 corpus (docs/provenance.md 2026-06-12)."
+  (let* ((lb (%lto-connext-c-union-lb))
+         (inflated (dds.types:inflate-type-object-lb lb))
+         (parsed (dds.types:parse-legacy-type-object inflated)))
+    (%check :lto-union-asgn-parse
+            (dds.types:minimal-struct-type-p parsed)
+            "the live C_Union legacy TypeObject parses to a minimal-struct-type (union no longer degrades)")
+    (when (dds.types:minimal-struct-type-p parsed)
+      ;; the `u` member is an EK_MINIMAL union TI with discriminator i32 and members a/b decoded
+      (let* ((u (%lto-member-named parsed "u"))
+             (uti (and u (dds.types:minimal-struct-member-type-identifier u)))
+             (ref (and uti (dds.types:type-identifier-referenced uti))))
+        (%check :lto-union-member-ti
+                (and uti (= (dds.types:type-identifier-kind uti) dds.types:+ek-minimal+)
+                     (dds.types:minimal-union-type-p ref))
+                "the `u` member decodes to an EK_MINIMAL TI referencing a minimal-union-type")
+        (%check :lto-union-disc
+                (and (dds.types:minimal-union-type-p ref)
+                     (= (dds.types:type-identifier-kind
+                         (dds.types:minimal-union-type-discriminator ref))
+                        dds.types:+tk-int32+))
+                "SomeUnion's discriminator decodes to i32 (long)")
+        (%check :lto-union-members
+                (and (dds.types:minimal-union-type-p ref)
+                     (= (length (dds.types:minimal-union-type-members ref)) 2)
+                     (every (lambda (m name labels kind)
+                              (and (equalp (dds.types:union-member-name-hash m)
+                                           (dds.types:member-name-hash name))
+                                   (equal (dds.types:union-member-labels m) labels)
+                                   (= (dds.types:type-identifier-kind
+                                       (dds.types:union-member-type-identifier m))
+                                      kind)))
+                            (dds.types:minimal-union-type-members ref)
+                            '("a" "b") '((0) (1))
+                            (list dds.types:+tk-int32+ dds.types:+tk-float64+)))
+                "SomeUnion decodes to a {0}->a i32, {1}->b f64 (names hashing as on the wire)"))
+      ;; the @key long id member stays a flat TK_INT32 @key
+      (let* ((idm (%lto-member-named parsed "id"))
+             (idti (and idm (dds.types:minimal-struct-member-type-identifier idm))))
+        (%check :lto-union-id
+                (and idm (dds.types:minimal-struct-member-key-p idm)
+                     idti (= (dds.types:type-identifier-kind idti) dds.types:+tk-int32+))
+                "the @key long id member stays a flat TK_INT32"))
+      ;; the parsed wire model drives the REAL struct-assignable-from gate through the union row
+      (let ((opts (dds.types:default-assignability-options))
+            (good (%build-c-union-local :i32))
+            (bad  (%build-c-union-local :f64)))
+        (%check :lto-union-asgn-compatible
+                (dds.types:struct-assignable-from parsed good opts)
+                "the parsed C_Union is assignable from a matching local (compatible -> T)")
+        (%check :lto-union-asgn-compatible-rev
+                (dds.types:struct-assignable-from good parsed opts)
+                "a matching local is assignable from the parsed C_Union (both directions)")
+        (%check :lto-union-asgn-incompatible
+                (not (dds.types:struct-assignable-from parsed bad opts))
+                "a local where case 0's member type changes (long->double) is NOT assignable (-> NIL)")
+        (%check :lto-union-asgn-incompatible-rev
+                (not (dds.types:struct-assignable-from bad parsed opts))
+                "the case-0 member-type mismatch reject holds both directions")
+        ;; no false-reject: re-running the compatible case after the incompatible one still holds
+        (%check :lto-union-asgn-no-false-reject
+                (dds.types:struct-assignable-from parsed (%build-c-union-local :i32) opts)
+                "no false-reject: the compatible case still holds after the incompatible one"))))
   t)

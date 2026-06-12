@@ -367,6 +367,37 @@
    literal-count word; a larger declared count yields NIL (the enum member is unmodelable, the
    whole parse degrades to :unsupported).")
 
+(defconstant +lto-member-kind-union+ #x15
+  "Legacy-TypeObject member type-kind u16 (at a member node's VALUE-START+8) marking a UNION member:
+   its discriminator + cases live in a referenced +LTO-CODE-UNION-DEF+ node (NOT inline), addressed
+   by the same 8-octet type-hash@+16 mechanism strings (0x13), sequences (0x12), nested structs
+   (0x16), enums (0x0E) and arrays (0x11) use (union is 0x15). Reverse-engineered clean-room from
+   the C_Union differential (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-union-def+ 10
+  "Legacy-TypeObject node CODE marking a UNION-definition node: a union member's node carries an
+   8-octet type-hash (at member VALUE-START+16) referencing this node, whose CODE-0 child echoes
+   that hash at its VALUE-START+8 and whose +LTO-CODE-UNION-CASES+ (100) child holds the cases
+   container (count:u32 = discriminator + members, then per entry a named CODE-0 node + its
+   +LTO-CODE-UNION-CASES+ label-list child). Reverse-engineered clean-room from the C_Union
+   differential (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-union-cases+ 100
+  "Legacy-TypeObject node CODE shared, within a +LTO-CODE-UNION-DEF+ node, by (a) the cases CONTAINER
+   child — its value is count:u32 (discriminator + member entries) then the per-entry named CODE-0
+   nodes interleaved with their label lists — and (b) each entry's LABEL-LIST child immediately
+   following the entry's named CODE-0 node: count:u32 then COUNT labels:i32 (the discriminator's
+   label list is empty, count 0; a member's carries its case labels). Shares the CODE value (100)
+   with the sequence/array element-type and the enum bit-bound children, disambiguated by parent
+   CODE (union-def 10 vs sequence-def 7 / array-def 3 / enum-def 5). Reverse-engineered clean-room
+   from the C_Union differential (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defparameter *lto-max-union-members* 4096
+  "Max union members the legacy-TypeObject union decoder will read from a +LTO-CODE-UNION-DEF+ node's
+   cases container before failing open (NFR-SEC-POSTURE): a resource-exhaustion guard bounding a
+   hostile entry count; a larger declared count yields NIL (the union member is unmodelable, the
+   whole parse degrades to :unsupported).")
+
 (defun* %lto-member-id (octets node)
     (function ((simple-array (unsigned-byte 8) (*)) lto-node) (or null (unsigned-byte 32)))
   "The 0-based declaration-order member id encoded as the u32 at the member NODE's VALUE-START+4
@@ -576,6 +607,110 @@
                   (make-minimal-enumerated-type :bit-bound bit-bound
                                                 :literals literals)))))))))
 
+(defun* %lto-primitive-ti (octets node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node) (or null type-identifier))
+  "The PRIMITIVE-TYPE-IDENTIFIER for the type-kind u16 at NODE's VALUE-START+8 mapped via
+   *LTO-PRIMITIVE-KIND-KEYWORD*, or NIL when the kind is OOB or NON-PRIMITIVE (the union decoder
+   models a PRIMITIVE discriminator + PRIMITIVE case members only; anything else fails open).
+   Bounds-checked against VALUE-END FIRST (NFR-SEC-POSTURE)."
+  (let ((kind (%lto-u16 octets (+ (lto-node-value-start node) 8) (lto-node-value-end node))))
+    (when kind
+      (let ((kw (cdr (assoc kind *lto-primitive-kind-keyword*))))
+        (and kw (primitive-type-identifier kw))))))
+
+(defun* %lto-union-case-labels (octets label-node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node) (values list t))
+  "Decode a union entry's +LTO-CODE-UNION-CASES+ LABEL-NODE into its case-label list: count:u32 at
+   VALUE-START then COUNT labels:i32. Returns (values LABELS OK-P): OK-P T with the (possibly empty)
+   LABELS on a clean decode; (values NIL NIL) on a missing/OOB count, an over-budget count, an OOB
+   label, or a label-list extent that does not consume exactly to VALUE-END (trailing-garbage guard).
+   The empty-but-valid result (the discriminator's count-0 list) is (values NIL T), distinct from the
+   error (values NIL NIL). Every wire read is bounds-checked against VALUE-END FIRST
+   (NFR-SEC-POSTURE). Clean-room (docs/provenance.md 2026-06-12)."
+  (let* ((vstart (lto-node-value-start label-node))
+         (vend (lto-node-value-end label-node))
+         (count (%lto-u32 octets vstart vend)))
+    (when (or (null count) (> count *lto-max-union-members*))
+      (return-from %lto-union-case-labels (values nil nil)))
+    (let ((labels '())
+          (pos (+ vstart 4)))
+      (dotimes (i count)
+        (let ((value (%lto-u32 octets pos vend)))
+          (when (null value)
+            (return-from %lto-union-case-labels (values nil nil)))
+          (push (- (logxor value #x80000000) #x80000000) labels)
+          (incf pos 4)))
+      (when (/= pos vend)
+        (return-from %lto-union-case-labels (values nil nil)))
+      (values (nreverse labels) t))))
+
+(defun* %lto-union-type-identifier (octets root member-node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node lto-node) (or null type-identifier))
+  "The TypeIdentifier for a UNION member-node: resolve its referenced +LTO-CODE-UNION-DEF+ node
+   (%LTO-FIND-DEF-NODE), decode its +LTO-CODE-UNION-CASES+ cases container into a MINIMAL-UNION-TYPE
+   (PRIMITIVE discriminator + one union-member per case), and wrap it in an EK_MINIMAL
+   UNION-TYPE-IDENTIFIER so assignability (union-assignable-from) recurses into it. The cases
+   container's NAMED CODE-0 children are the entries in order, each paired with the following
+   +LTO-CODE-UNION-CASES+ label-list sibling: the FIRST entry is the discriminator (its type-kind is
+   the discriminator type; its label list is empty); every later named entry is a member (its
+   type-kind is the member type; its single case label is read from the label list, NameHash from the
+   wire NAME). Fails open to NIL (member TI stays NIL → whole parse degrades to :unsupported) on ANY
+   of: an unresolvable reference; a missing/over-budget entry count (*LTO-MAX-UNION-MEMBERS*); a
+   missing discriminator; a NON-PRIMITIVE discriminator or member type; a member with no NAME, no
+   label list, or a label count /= 1 (a MULTI-LABEL or default case the C_Union capture cannot
+   verify). Every wire read is bounds-checked FIRST (NFR-SEC-POSTURE). Clean-room
+   (docs/provenance.md 2026-06-12)."
+  (let ((udef (%lto-find-def-node octets root member-node +lto-code-union-def+)))
+    (when (null udef)
+      (return-from %lto-union-type-identifier nil))
+    (let ((container (find-if (lambda (c)
+                                (and (= (lto-node-tag c) +lto-tag-long+)
+                                     (= (lto-node-code c) +lto-code-union-cases+)))
+                              (lto-node-children udef))))
+      (when (null container)
+        (return-from %lto-union-type-identifier nil))
+      (let ((count (%lto-u32 octets (lto-node-value-start container)
+                             (lto-node-value-end container))))
+        (when (or (null count) (> count *lto-max-union-members*))
+          (return-from %lto-union-type-identifier nil)))
+      (let ((entries (lto-node-children container))
+            (discriminator nil)
+            (members '())
+            (saw-entry nil))
+        ;; pair each named CODE-0 entry with the next CODE-100 label-list sibling
+        (loop for tail on entries
+              for node = (car tail)
+              when (and (= (lto-node-tag node) +lto-tag-long+) (= (lto-node-code node) 0)
+                        (lto-node-name node))
+              do (let ((label-node (find-if (lambda (c)
+                                              (and (= (lto-node-tag c) +lto-tag-long+)
+                                                   (= (lto-node-code c) +lto-code-union-cases+)))
+                                            (cdr tail))))
+                   (when (null label-node)
+                     (return-from %lto-union-type-identifier nil))
+                   (multiple-value-bind (labels ok)
+                       (%lto-union-case-labels octets label-node)
+                     (let ((ti (%lto-primitive-ti octets node)))
+                       (when (or (null ok) (null ti))
+                         (return-from %lto-union-type-identifier nil))
+                       (cond
+                         ((not saw-entry)
+                          ;; the first named entry is the discriminator (its label list is empty)
+                          (when labels
+                            (return-from %lto-union-type-identifier nil))
+                          (setf discriminator ti saw-entry t))
+                         (t
+                          ;; a member: exactly one case label (multi-label/default fails open)
+                          (when (/= (length labels) 1)
+                            (return-from %lto-union-type-identifier nil))
+                          (push (make-union-member (lto-node-name node) labels ti nil)
+                                members)))))))
+        (when (or (null discriminator) (null members))
+          (return-from %lto-union-type-identifier nil))
+        (union-type-identifier
+         (make-minimal-union-type :discriminator discriminator
+                                  :members (nreverse members)))))))
+
 (defun* %lto-member-hash-key (octets node)
     (function ((simple-array (unsigned-byte 8) (*)) lto-node) (or null (unsigned-byte 64)))
   "The 8-octet type-hash at member NODE's VALUE-START+16 packed little-endian into a u64 — the
@@ -630,10 +765,13 @@
    guards); kind +LTO-MEMBER-KIND-ENUM+ (0x0E) resolves the bit-bound + literals from the referenced
    +LTO-CODE-ENUM-DEF+ node (%LTO-ENUM-TYPE-IDENTIFIER) into an EK_MINIMAL enumerated TI; kind
    +LTO-MEMBER-KIND-ARRAY+ (0x11) resolves the element kind + single dimension from the referenced
-   +LTO-CODE-ARRAY-DEF+ node (%LTO-ARRAY-TYPE-IDENTIFIER) into a plain-array TI — all under
-   ROOT. DEPTH + VISITED bound nested-struct recursion (*LTO-MAX-TYPE-DEPTH*
+   +LTO-CODE-ARRAY-DEF+ node (%LTO-ARRAY-TYPE-IDENTIFIER) into a plain-array TI; kind
+   +LTO-MEMBER-KIND-UNION+ (0x15) resolves the PRIMITIVE discriminator + per-case PRIMITIVE members
+   from the referenced +LTO-CODE-UNION-DEF+ node (%LTO-UNION-TYPE-IDENTIFIER) into an EK_MINIMAL union
+   TI — all under ROOT. DEPTH + VISITED bound nested-struct recursion (*LTO-MAX-TYPE-DEPTH*
    and a visited-hash cycle guard). Returns NIL for a sequence/array-of-non-primitive (Task 3.x), a
-   multi-dim array, an over-depth/cyclic nested struct, or when the kind field is OOB — bounds-checked
+   multi-dim array, an over-depth/cyclic nested struct, a union with a non-primitive discriminator/member
+   or a multi-label/default case, or when the kind field is OOB — bounds-checked
    against VALUE-END FIRST (NFR-SEC-POSTURE)."
   (let ((kind (%lto-u16 octets (+ (lto-node-value-start node) 8) (lto-node-value-end node))))
     (cond
@@ -649,6 +787,8 @@
        (%lto-enum-type-identifier octets root node))
       ((= kind +lto-member-kind-array+)
        (%lto-array-type-identifier octets root node))
+      ((= kind +lto-member-kind-union+)
+       (%lto-union-type-identifier octets root node))
       (t (let ((kw (cdr (assoc kind *lto-primitive-kind-keyword*))))
            (and kw (primitive-type-identifier kw)))))))
 

@@ -78,9 +78,12 @@
   "Whether an object of type TI is self-delimiting under XCDR2 (§7.2.4.2): primitives,
    strings, and enumerated types (fixed bit-bound storage) are; a sequence is iff its
    element is; an aggregated struct is iff its extensibility is APPENDABLE or MUTABLE
-   (FINAL aggregated structs are not delimited). A union (whose extensibility the legacy/
-   minimal model does not carry) is treated as NOT delimited — conservative: a non-delimited
-   element merely can't be a collection element/key, which never causes a false-reject."
+   (FINAL aggregated structs are not delimited). A union is delimited iff its discriminator
+   AND every member type are delimited — a sound, verifiable condition (the minimal model
+   carries no union extensibility): a FINAL union of delimited members is bounded by the
+   discriminator + the selected member, so it self-delimits without a DHEADER. Otherwise
+   conservative NIL — a non-delimited element merely can't be a collection element/key,
+   which never causes a false-reject."
   (cond ((ti-primitive-p ti) t)
         ((ti-string-p ti) t)
         ((ti-sequence-p ti)
@@ -92,7 +95,14 @@
          t)
         ((and (ti-aggregated-p ti)
               (minimal-union-type-p (type-identifier-referenced ti)))
-         nil)
+         (let ((u (type-identifier-referenced ti)))
+           (and (let ((d (minimal-union-type-discriminator u)))
+                  (and d (ti-delimited-p d)))
+                (every (lambda (m)
+                         (let ((mt (union-member-type-identifier m)))
+                           (and mt (ti-delimited-p mt))))
+                       (minimal-union-type-members u))
+                t)))
         ((ti-aggregated-p ti)
          (and (member (minimal-struct-type-extensibility (type-identifier-referenced ti))
                       '(:appendable :mutable))

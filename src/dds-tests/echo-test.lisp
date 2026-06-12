@@ -278,6 +278,7 @@
                  ("lto-parse-aggregates-unsupported" . run-lto-parse-aggregates-unsupported-test)
                  ("lto-enum-assignability"   . run-lto-enum-assignability-test)
                  ("lto-array-assignability"  . run-lto-array-assignability-test)
+                 ("lto-union-assignability"  . run-lto-union-assignability-test)
                  ("sedp-type-object-lb"      . run-sedp-type-object-lb-test)
                  ("xtypes-type-compat-soft"  . run-type-compat-soft-test)
                  ("sedp-type-information"    . run-sedp-type-information-test)
