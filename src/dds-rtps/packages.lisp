@@ -108,6 +108,12 @@
            #:+entityid-sedp-sub-writer+ #:+entityid-sedp-sub-reader+
            #:+be-tl-request-writer+ #:+be-tl-request-reader+
            #:+be-tl-reply-writer+ #:+be-tl-reply-reader+
+           #:+entityid-p2p-participant-message-writer+ #:+entityid-p2p-participant-message-reader+
+           #:+pmd-kind-unknown+ #:+pmd-kind-automatic+ #:+pmd-kind-manual-by-participant+
+           #:+be-participant-message-writer+ #:+be-participant-message-reader+
+           #:participant-message #:make-participant-message #:participant-message-p
+           #:participant-message-guid-prefix #:participant-message-kind #:participant-message-data
+           #:serialize-participant-message #:parse-participant-message
            #:+builtin-endpoint-set-default+
            #:write-locator #:read-locator #:make-ipv4-locator
            #:locator #:make-locator #:locator-p

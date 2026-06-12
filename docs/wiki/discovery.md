@@ -44,6 +44,21 @@ Builtin EntityIds (RTPS 2.5 §9.3.1.3 Table 9.2) and the 24-octet `Locator_t`
 - `dds.rtps.discovery:locator-usable-udpv4-p` *(loc)* — T iff `loc` is a UDPv4 locator with a routable (non-`0.0.0.0`) address.
 - `dds.rtps.discovery:usable-udpv4-locator` *(locators)* — the first routable UDPv4 locator in a list, or `NIL` — the locator-list selection that lets the data plane reach a foreign participant advertising several.
 
+### Writer Liveliness Protocol — `ParticipantMessageData` (`dds.rtps.discovery`)
+
+The wire foundation of the Writer Liveliness Protocol (RTPS 2.5 §8.4.13). The
+`BuiltinParticipantMessageWriter`/`Reader` carry a `ParticipantMessageData` sample
+(§8.4.13.4 / §9.6.3.2) whose DDS key is `participantGuidPrefix + kind`.
+
+- P2P built-in endpoint EntityIds (§9.6.2.2 / §8.4.13.2): `dds.rtps.discovery:+entityid-p2p-participant-message-writer+` = `{{00,02,00},c2}` (`#x000200c2`), `+entityid-p2p-participant-message-reader+` = `{{00,02,00},c7}` (`#x000200c7`).
+- `kind` values (§9.6.3.2), stored as the integer the wire `octet[4]` encodes big-endian: `+pmd-kind-unknown+` = 0 `{0,0,0,0}`, `+pmd-kind-automatic+` = 1 `{0,0,0,1}`, `+pmd-kind-manual-by-participant+` = 2 `{0,0,0,2}`.
+- `availableBuiltinEndpoints` bits (§9.4.2.10): `+be-participant-message-writer+` = bit 10, `+be-participant-message-reader+` = bit 11. Defined here but **not** yet in `+builtin-endpoint-set-default+` — advertising an endpoint that does not exist would claim an unimplemented capability; the bits are added when the endpoint is wired.
+- `dds.rtps.discovery:make-participant-message` *(&key guid-prefix kind data)* — construct the struct (12-octet `GUID-PREFIX`, integer `KIND`, octet-vector `DATA`).
+- `dds.rtps.discovery:participant-message` / `participant-message-p` — the struct type and predicate.
+- Accessors: `participant-message-guid-prefix`, `participant-message-kind`, `participant-message-data`.
+- `dds.rtps.discovery:serialize-participant-message` *(pm)* — the bare CDR struct bytes (no encapsulation): `prefix(12)` + `kind` as `octet[4]` big-endian + `data.length` (u32 LE) + data octets, no trailing pad. The discovery layer wraps these in the `SerializedPayload` encapsulation header.
+- `dds.rtps.discovery:parse-participant-message` *(bytes)* — parse the bare CDR struct; returns a `participant-message`, or `NIL` on truncation or an over-long `data.length`. Every field is bounds-checked before it is read.
+
 ### SPDP — discovered participant data (`dds.rtps.discovery`)
 
 `SPDPdiscoveredParticipantData` (§8.5.3.2 / §9.6.2.2): the subset of

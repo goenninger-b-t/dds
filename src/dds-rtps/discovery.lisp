@@ -22,6 +22,26 @@
 (defconstant +entityid-sedp-sub-reader+ #x000004c7
   "SEDPbuiltinSubscriptionsReader EntityId {{00,00,04},c7} (RTPS 2.5 §9.3.1.3 Table 9.2).")
 
+;; Writer Liveliness Protocol P2P built-in endpoints (RTPS 2.5 §8.4.13.2; values §9.6.2.2).
+(defconstant +entityid-p2p-participant-message-writer+ #x000200c2
+  "ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER {{00,02,00},c2} (RTPS 2.5 §9.6.2.2; §8.4.13.2).")
+(defconstant +entityid-p2p-participant-message-reader+ #x000200c7
+  "ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_READER {{00,02,00},c7} (RTPS 2.5 §9.6.2.2; §8.4.13.2).")
+
+;; ParticipantMessageData kind octet[4] (RTPS 2.5 §9.6.3.2); the integer maps to 4 big-endian octets (1 -> {0,0,0,1}).
+(defconstant +pmd-kind-unknown+ 0
+  "PARTICIPANT_MESSAGE_DATA_KIND_UNKNOWN {0,0,0,0} (RTPS 2.5 §9.6.3.2).")
+(defconstant +pmd-kind-automatic+ 1
+  "PARTICIPANT_MESSAGE_DATA_KIND_AUTOMATIC_LIVELINESS_UPDATE {0,0,0,1} (RTPS 2.5 §9.6.3.2).")
+(defconstant +pmd-kind-manual-by-participant+ 2
+  "PARTICIPANT_MESSAGE_DATA_KIND_MANUAL_LIVELINESS_UPDATE {0,0,0,2} (RTPS 2.5 §9.6.3.2).")
+
+;; WLP builtin-endpoint bits (RTPS 2.5 §9.4.2.10); NOT in +builtin-endpoint-set-default+ until the endpoint is wired.
+(defconstant +be-participant-message-writer+ (ash 1 10)
+  "BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_WRITER availableBuiltinEndpoints bit 10 (RTPS 2.5 §9.4.2.10).")
+(defconstant +be-participant-message-reader+ (ash 1 11)
+  "BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_READER availableBuiltinEndpoints bit 11 (RTPS 2.5 §9.4.2.10).")
+
 ;; TypeLookup builtin-endpoint bits (XTypes 1.3 §7.6.3.3.4 Table 62).
 (defconstant +be-tl-request-writer+ (ash 1 12)
   "TypeLookupServiceRequestDataWriter availableBuiltinEndpoints bit (XTypes 1.3 Table 62).")
@@ -305,6 +325,69 @@
         (assert (= (spdp-data-lease-duration-seconds back) 30) () "lease mismatch")
         (assert (= (spdp-data-builtin-endpoint-set back) +builtin-endpoint-set-default+) () "endpoint-set mismatch")
         (values t back)))))
+
+;;;; ---- ParticipantMessageData: the logical content of the BuiltinParticipant-
+;;;; MessageWriter/Reader used by the Writer Liveliness Protocol (RTPS 2.5 §8.4.13.4
+;;;; / §9.6.3.2). A plain CDR struct (NOT a ParameterList): GuidPrefix_t prefix (12) +
+;;;; octet[4] kind + sequence<octet> data. This codec produces the BARE struct bytes;
+;;;; the discovery layer (Task 1.2) wraps them in the SerializedPayload encapsulation
+;;;; header, exactly as the DATA submessage wraps the SPDP/SEDP ParameterList. ----
+
+(defstruct* (participant-message (:constructor make-participant-message))
+  "ParticipantMessageData (RTPS 2.5 §8.4.13.4 / §9.6.3.2). The DDS key is
+   participantGuidPrefix + kind. KIND is stored as the integer the octet[4] encodes
+   big-endian (value[0] is the MSB-test byte), e.g. +pmd-kind-automatic+ = 1 -> wire
+   {0,0,0,1}. DATA is the variable-length sequence<octet> payload."
+  (guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)
+               :type (simple-array (unsigned-byte 8) (12)))
+  (kind +pmd-kind-automatic+ :type (unsigned-byte 32))
+  (data (make-array 0 :element-type '(unsigned-byte 8))
+        :type (simple-array (unsigned-byte 8) (*))))
+
+(defun* serialize-participant-message (pm)
+    (function (participant-message) (simple-array (unsigned-byte 8) (*)))
+  "Serialize a ParticipantMessageData to the bare CDR struct (no encapsulation):
+   prefix(12) + kind as octet[4] big-endian + data.length (u32) + data octets (RTPS
+   2.5 §9.6.3.2). DATA is the final struct member so no trailing CDR alignment pad is
+   emitted (XCDR §10.2 pads only to align a following member). The sequence-length
+   u32 is written little-endian to mirror the stack's default PLAIN_CDR
+   encapsulation; kind is octet[4] raw so it is endianness-independent."
+  (let* ((dlen (length (participant-message-data pm)))
+         (total (+ 12 4 4 dlen))
+         (ob (dds.core.buffer:make-octet-buffer total))
+         (c (dds.core.buffer:cursor ob :endianness :little)))
+    (dds.core.buffer:put-octets c (participant-message-guid-prefix pm) 0 12)
+    (let ((k (participant-message-kind pm)))
+      (dotimes (i 4) (dds.core.buffer:put-u8 c (ldb (byte 8 (* 8 (- 3 i))) k))))
+    (dds.core.buffer:put-u32 c dlen)
+    (when (plusp dlen)
+      (dds.core.buffer:put-octets c (participant-message-data pm) 0 dlen))
+    (dds.core.buffer:octet-buffer-vec ob)))
+
+(defun* parse-participant-message (bytes)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "Parse the bare CDR ParticipantMessageData struct from BYTES (no encapsulation
+   header). Returns a PARTICIPANT-MESSAGE, or NIL on truncation. Every field is
+   bounds-checked BEFORE it is read and the wire-supplied data.length is validated
+   against the remaining buffer before allocating, so a hostile length can never
+   cause OOB access or exhaust the heap (NFR-SEC-POSTURE; RTPS 2.5 §9.6.3.2)."
+  (let ((cap (length bytes)))
+    (when (< cap 20)
+      (return-from parse-participant-message nil))
+    (let* ((ob (dds.core.buffer:make-octet-buffer cap))
+           (c (dds.core.buffer:cursor ob :endianness :little)))
+      (dds.core.buffer:put-octets c bytes 0 cap)
+      (dds.core.buffer:cursor-reset c)
+    (let ((prefix (make-array 12 :element-type '(unsigned-byte 8))))
+      (dds.core.buffer:get-octets c prefix 0 12)
+      (let ((kind 0))
+        (dotimes (i 4) (setf kind (logior (ash kind 8) (dds.core.buffer:get-u8 c))))
+        (let ((dlen (dds.core.buffer:get-u32 c)))
+          (when (> dlen (- cap (dds.core.buffer:cursor-position c)))
+            (return-from parse-participant-message nil))
+          (let ((data (make-array dlen :element-type '(unsigned-byte 8))))
+            (when (plusp dlen) (dds.core.buffer:get-octets c data 0 dlen))
+            (make-participant-message :guid-prefix prefix :kind kind :data data))))))))
 
 ;;;; ---- SEDP: Simple Endpoint Discovery Protocol (RTPS 2.5 §8.5.4 / §9.6.2.2).
 ;;;; DiscoveredWriterData / DiscoveredReaderData carried as a ParameterList in the

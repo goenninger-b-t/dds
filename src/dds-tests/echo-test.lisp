@@ -364,6 +364,7 @@
                  ("rtps-message-dispatch"    . run-rtps-dispatch-test)
                  ("rtps-parameterlist"       . run-paramlist-test)
                  ("rtps-port-mapping"        . run-port-mapping-test)
+                 ("rtps-participant-message" . run-participant-message-codec-test)
                  ("rtps-history-cache"       . run-history-test)
                  ("rtps-reliable-delivery"   . run-reliability-test)
                  ("rtps-gap-handling"        . run-gap-handling-test)

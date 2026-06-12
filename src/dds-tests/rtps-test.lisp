@@ -350,6 +350,48 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+(defun* run-participant-message-codec-test ()
+    (function () t)
+  "ParticipantMessageData (RTPS 2.5 §8.4.13.4 / §9.6.3.2) round-trips:
+   participantGuidPrefix(12) + kind(octet[4]) + data(sequence<octet>); the bare CDR
+   struct (no encapsulation header) matches a locked vector. kind is octet[4] raw
+   (endianness-independent, AUTOMATIC = {0,0,0,1}); the data-length sequence count is
+   the only endianness-sensitive field and is written PLAIN_CDR little-endian."
+  (let* ((prefix (make-array 12 :element-type '(unsigned-byte 8)
+                             :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12)))
+         (pm (dds.rtps.discovery:make-participant-message
+              :guid-prefix prefix :kind dds.rtps.discovery:+pmd-kind-automatic+
+              :data (make-array 0 :element-type '(unsigned-byte 8))))
+         (bytes (dds.rtps.discovery:serialize-participant-message pm))
+         (back (dds.rtps.discovery:parse-participant-message bytes)))
+    (%check :pm-parse back "parse-participant-message returned NIL")
+    (%check :pm-prefix (equalp prefix (dds.rtps.discovery:participant-message-guid-prefix back)) "prefix")
+    (%check :pm-kind (= dds.rtps.discovery:+pmd-kind-automatic+ (dds.rtps.discovery:participant-message-kind back)) "kind")
+    (%check :pm-data (= 0 (length (dds.rtps.discovery:participant-message-data back))) "empty data")
+    ;; locked vector: prefix(12) + kind {0,0,0,1} + data.length u32 0 = 20 octets, no encapsulation
+    (%check :pm-vector (equalp bytes (octets 1 2 3 4 5 6 7 8 9 10 11 12  0 0 0 1  0 0 0 0)) "byte-exact")
+    ;; non-empty data: 3 octets -> length 3 (LE u32) + 3 octets, no trailing pad (final member, XCDR §10.2)
+    (let* ((d3 (octets #xAA #xBB #xCC))
+           (pm3 (dds.rtps.discovery:make-participant-message
+                 :guid-prefix prefix :kind dds.rtps.discovery:+pmd-kind-manual-by-participant+ :data d3))
+           (b3 (dds.rtps.discovery:serialize-participant-message pm3))
+           (back3 (dds.rtps.discovery:parse-participant-message b3)))
+      (%check :pm3-kind (= dds.rtps.discovery:+pmd-kind-manual-by-participant+
+                           (dds.rtps.discovery:participant-message-kind back3)) "manual kind")
+      (%check :pm3-data (equalp d3 (dds.rtps.discovery:participant-message-data back3)) "3-octet data round-trip")
+      (%check :pm3-vector
+              (equalp b3 (octets 1 2 3 4 5 6 7 8 9 10 11 12  0 0 0 2  3 0 0 0  #xAA #xBB #xCC))
+              "byte-exact 3-octet data"))
+    ;; bounds: truncation before the full header -> NIL, never OOB (NFR-SEC-POSTURE)
+    (%check :pm-trunc (null (dds.rtps.discovery:parse-participant-message (octets 1 2 3 4 5)))
+            "truncated -> NIL")
+    ;; bounds: a data.length larger than the remaining buffer -> NIL
+    (%check :pm-overlen
+            (null (dds.rtps.discovery:parse-participant-message
+                   (octets 1 2 3 4 5 6 7 8 9 10 11 12  0 0 0 1  0 0 0 99)))
+            "over-long data.length -> NIL")
+    t))
+
 (defun* run-port-mapping-test ()
     (function () t)
   "Test: the RTPS well-known port-mapping formulas (RTPS 2.5 §9.6.1.1)."
