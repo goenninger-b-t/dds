@@ -802,3 +802,33 @@ The harness apps (`shapes_pub.cpp`, `shapes_sub.cpp`, `profiles.xml`, Makefiles)
 The `fastddsgen` 4.3.0 output under `interop/fastdds/shapes/gen/` is **committed
 verbatim** (Apache-2.0 generator output, header notice retained) so the harness builds
 without a JDK. No RTI source/headers/generated code was consulted or copied.
+
+## M4 (2026-06-12) — Fast DDS type_probe harness + leg-B diagnosis (`interop/fastdds/type_probe/`, FR-IO-2 S4 leg B)
+
+`type_probe.cpp` was **written fresh** against the installed public headers, following
+the remote-type-discovery workflow shown in eProsima's public example; eProsima sources
+were consulted **read-only** (Apache-2.0, pinned Fast-DDS v3.6.1 tree), per the
+clean-room note above. Files consulted:
+
+- `examples/cpp/xtypes/SubscriberApp.{cpp,hpp}` — the remote type discovery + DynamicType
+  workflow pattern (`on_data_writer_discovery` → `type_object_registry().get_type_object`
+  → `create_type_w_type_object` → `DynamicPubSubType(type, type_information)`).
+- Installed headers `fastdds/dds/domain/DomainParticipantListener.hpp`,
+  `fastdds/dds/xtypes/dynamic_types/DynamicPubSubType.hpp`,
+  `fastdds/dds/xtypes/type_representation/ITypeObjectRegistry.hpp`,
+  `fastdds/dds/xtypes/utils.hpp` (json_serialize), `fastdds/dds/log/Log.hpp`,
+  `fastdds/dds/builtin/topic/PublicationBuiltinTopicData.hpp`,
+  `fastdds/rtps/builtin/data/PublicationBuiltinTopicData.hpp`,
+  `fastdds/dds/core/policy/QosPolicies.hpp` (TypeInformationParameter) — signature
+  reconciliation.
+- `src/cpp/fastdds/builtin/type_lookup_service/TypeLookupManager.{hpp,cpp}` and
+  `TypeLookupReplyListener.cpp` — their client's getTypeDependencies→getTypes flow
+  (read to verify our server answers both operations).
+- `src/cpp/rtps/builtin/data/WriterProxyData.cpp` + `ReaderProxyData.cpp` — the leg-B
+  finding: `PID_TYPE_INFORMATION` is ignored for non-eProsima vendorIds.
+- `src/cpp/rtps/builtin/discovery/participant/{PDP.cpp,PDPSimple.cpp,PDPListener.cpp}`,
+  `src/cpp/fastdds/domain/{DomainParticipantFactory.cpp,DomainParticipantImpl.cpp}` —
+  read during the wire-first diagnosis of the (ultimately environmental, macOS
+  firewall) discovery failure; no code copied.
+
+No eProsima code was copied into the harness or `src/`; no RTI material was consulted.

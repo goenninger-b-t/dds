@@ -1,6 +1,7 @@
 # the built executables (gen/ is COMMITTED verbatim, unlike interop/connext — see README.md)
 shapes/shapes_pub
 shapes/shapes_sub
+type_probe/type_probe
 
 # transient capture artifacts (pcaps + tshark decodes produced while probing).
 # captures/ is the exception: archived evidence cited by the README census tables.

@@ -94,8 +94,12 @@ tshark-validated — the FR-IO-2 data-plane DoD; the **EquivalenceHash byte-leve
 (S3: Fast DDS's `PID_TYPE_INFORMATION` locked as a regression vector, test
 `fastdds-type-information-vector`, matching our hash + serialized size byte-for-byte); and the
 **TypeLookup getTypes client leg ran live** (S4 leg A: `make fastdds-tl-probe` queries their
-TypeLookup server and consumes the reply — see the P3 row above); their client against our
-TypeLookup server (S4 leg B) is the remaining FR-IO-2 step.
+TypeLookup server and consumes the reply — see the P3 row above); S4 leg B (their client
+against our TypeLookup server) closed with a documented **finding**: Fast DDS 3.6.1 discards
+`PID_TYPE_INFORMATION` from non-eProsima vendors, so no foreign announcement can trigger its
+TypeLookup client — the type-blind leg-B harness (`make fastdds-type-probe`) is proven
+end-to-end against an eProsima peer and ready unchanged for any peer without that gate (see
+the S4 leg B section of [`interop/fastdds/README.md`](interop/fastdds/README.md)).
 
 ---
 

@@ -116,16 +116,35 @@
                now)
         last)))
 
+(defun* %parse-peers (peers)
+    (function ((or null string)) list)
+  "Parse a \"host:port[,host:port]...\" PEERS string into the ((host . port) ...)
+   list make-disc-node expects (FR-DISC-4 unicast announce targets). NIL or \"\"
+   parses to NIL (multicast-only discovery). A malformed entry (missing colon,
+   empty host, non-numeric or out-of-range port) signals one uniform error."
+  (when (and peers (plusp (length peers)))
+    (loop for entry in (uiop:split-string peers :separator ",")
+          for colon = (position #\: entry :from-end t)
+          for port = (and colon (ignore-errors (parse-integer entry :start (1+ colon))))
+          unless (and colon (plusp colon) (typep port '(unsigned-byte 16)))
+            do (error "peer ~s is not host:port (port 0..65535)" entry)
+          collect (cons (subseq entry 0 colon) port))))
+
 (defun* run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
-                           (advertise-address "127.0.0.1") (type :tagged))
-    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol)) t)
+                           (advertise-address "127.0.0.1") (type :tagged) (peers nil))
+    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string))) t)
   "Publish an animated Square on DOMAIN via multicast discovery. TYPE selects the
    payload: :canonical = the exact RTI ShapeType (color/x/y/shapesize — for interop
    with rtishapesdemo / DDSSpy); :tagged = + per-publisher uuid + per-sample seq
-   (harness<->harness). RATE updates/sec; COUNT 0 = forever (Ctrl-C)."
+   (harness<->harness). RATE updates/sec; COUNT 0 = forever (Ctrl-C). PEERS is an
+   optional \"host:port[,host:port]\" list of unicast SPDP announce targets
+   (FR-DISC-4) on top of multicast — e.g. \"127.0.0.1:7410\" reaches a same-host
+   peer over loopback when the macOS application firewall / local-network privacy
+   layer silently drops LAN-sourced UDP for unapproved peer binaries."
   (check-type type (member :canonical :tagged))
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
-                                       :multicast t :advertise-address advertise-address)))
+                                       :multicast t :advertise-address advertise-address
+                                       :peers (%parse-peers peers))))
     (dds.disc:add-local-writer node :topic "Square" :type "ShapeType"
                                :reliability dds.rtps.discovery:+reliability-reliable+
                                :type-information (%shape-type-information))

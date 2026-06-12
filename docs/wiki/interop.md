@@ -74,6 +74,9 @@ make fastdds-sub SECONDS=15                         # subscribe + print samples 
 make fastdds-pub COLOR=GREEN COUNT=50               # publish ~10 samples/s (0 = forever)
 make fastdds-tl-probe SECONDS=30                    # TypeLookup live leg A: our getTypes client
                                                     # queries the peer's TypeLookup server (S4)
+make fastdds-type-probe SECONDS=40                  # TypeLookup leg B harness: a type-blind
+                                                    # Fast DDS subscriber resolving the topic's
+                                                    # type via TypeLookup + DynamicType
 ```
 
 `make fastdds-tl-probe` runs `dds.shapes:run-typelookup-probe` (FR-IO-2 S4): it discovers one
@@ -92,6 +95,26 @@ asked for a MINIMAL TypeIdentifier, Fast DDS returns the **COMPLETE** TypeObject
 into the MINIMAL TypeObject (`dds.types:complete-to-minimal-type-object` — see
 [Type system](type-system.md)). See the S4 section of
 [`interop/fastdds/README.md`](../../interop/fastdds/README.md) for the run table + evidence.
+
+**S4 leg B (their client vs our TypeLookup server) is blocked by a Fast DDS vendor gate
+(finding, 2026-06-12):** the leg-B harness (`interop/fastdds/type_probe/`,
+`make fastdds-type-probe`) is a type-blind Fast DDS subscriber that resolves a remote
+type via Fast DDS's own TypeLookup client + `create_type_w_type_object` DynamicType —
+proven end-to-end against an eProsima publisher (type resolved, RELIABLE reader, 233
+JSON-printed samples). Against our publisher it can never fire: Fast DDS 3.6.1
+**ignores `PID_TYPE_INFORMATION` from every non-eProsima vendorId**
+(`WriterProxyData.cpp`/`ReaderProxyData.cpp`, the "Ignore this PID when coming from
+other vendors" branch), so our 0x0075 — delivered and acknowledged on the wire (frames
+389 / 120-123 of `s4-theirclient-lo0.pcap`) — is stripped before their EDP, the probe
+sees `type_information.assigned=0`, and zero TypeLookup requests appear on the wire.
+No configuration disables the gate. Our TypeLookup **server** therefore stays covered
+by the offline suite + the S3 byte-identity result rather than a live foreign client;
+the harness is ready unchanged for any peer that honors foreign TypeInformation. The
+run also surfaced an environmental trap — this host's macOS firewall/local-network
+layer silently drops LAN-sourced UDP for unapproved freshly-built binaries — answered
+by a loopback-only probe profile plus the new `run-publisher :peers` unicast-SPDP
+option (`make square-pub PEERS=127.0.0.1:7410`). Full evidence in the S4 leg B section
+of [`interop/fastdds/README.md`](../../interop/fastdds/README.md).
 
 Same-host Fast DDS↔Fast DDS smoke is green (S0 gate; 48/50 over `lo0`), mutual SPDP/SEDP
 discovery is proven from the wire (S1 census), and the **FR-IO-2 data-plane DoD is met**
@@ -153,8 +176,10 @@ the diff isolates one of three one-line knobs (encapsulation-header / `struct_fl
   directions, tshark-validated — the FR-IO-2 data-plane DoD, S2); the **EquivalenceHash is
   externally confirmed** (S3, locked vector) and the **TypeLookup getTypes client leg is
   live** (S4 leg A: our client consumes their server's reply, frames 85/86-87 of
-  `s4-ourclient-lo0.pcap`); the remaining FR-IO-2 step is S4 leg B (their client against
-  our TypeLookup server).
+  `s4-ourclient-lo0.pcap`); S4 leg B (their client against our TypeLookup server) is
+  **blocked by Fast DDS's vendor gate** — it discards `PID_TYPE_INFORMATION` from
+  non-eProsima vendors, so no foreign announcement can trigger its TypeLookup client
+  (documented finding; the leg-B harness itself is proven against an eProsima peer).
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

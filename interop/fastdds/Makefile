@@ -1,7 +1,7 @@
 # Build every Fast DDS harness app (each lives in its own subdir with its own Makefile).
 # Requires FASTDDS_PREFIX — run via scripts/with-fastdds.sh (see README.md).
 
-APPS := shapes
+APPS := shapes type_probe
 
 .PHONY: all clean $(APPS)
 

@@ -37,6 +37,8 @@ interop/fastdds/
   shapes/shapes_pub.cpp    Fast DDS publishes ShapeType  -> this stack's `make square-sub`
   shapes/shapes_sub.cpp    Fast DDS subscribes ShapeType <- this stack's `make square-pub`
   shapes/profiles.xml      UDPv4-only transport + explicit TypeLookup (see below)
+  type_probe/              S4 leg B: type-blind dynamic-type subscriber (own loopback-only
+                           profiles.xml - see the S4 leg B section for why)
 ```
 
 ## The ShapeType definition
@@ -74,6 +76,7 @@ Both apps load `profiles.xml` from their **cwd**:
 # run via the top-level targets (cd into shapes/ for profiles.xml, then exec):
 make fastdds-sub SECONDS=15            # 0 = forever
 make fastdds-pub COLOR=GREEN COUNT=50  # 0 = forever, ~10 samples/s
+make fastdds-type-probe SECONDS=40     # S4 leg B type-blind dynamic-type probe
 
 # or directly:
 cd interop/fastdds/shapes
@@ -304,5 +307,76 @@ unmodeled degrades `:unsupported`, fail-open). The discovery client delivers a
 equals the mapped hash — for ShapeType the reconstructed MinimalTypeObject is
 **byte-identical to our own** (87 octets). Suite: **93 green SBCL**.
 
-Remaining S4 leg B: their client against our TypeLookup server (Fast DDS resolves
-identical types locally, so leg B needs a deliberately differing type or a hash probe).
+## S4 leg B: their client vs our TypeLookup server (FR-IO-2 — 2026-06-12, same host, lo0)
+
+Leg B's harness is `type_probe/` (`make fastdds-type-probe SECONDS=40`): a **type-blind**
+Fast DDS subscriber that never links the generated `ShapeType` code. It follows the
+Fast DDS "remote type discovery" workflow — `on_data_writer_discovery` takes the remote
+`TypeInformation`, `ITypeObjectRegistry::get_type_object` resolves the TypeObject
+(triggering Fast DDS's own TypeLookup client for an unknown type),
+`DynamicTypeBuilderFactory::create_type_w_type_object` builds the type, and a RELIABLE
+reader prints each sample as JSON (`json_serialize`). Against an eProsima publisher the
+probe is proven end-to-end: vs `shapes_pub GREEN 300` it logs
+`type_information.assigned=1`, `type resolved via remote TypeObject: ShapeType`, creates
+the reader, and delivered **233 samples** as
+`{"color":"GREEN","shapesize":30,"x":..,"y":..}` — their own client+server resolving the
+type for a type-blind process.
+
+**Verdict against OUR publisher: their TypeLookup client is never triggered — by an
+unconditional vendor gate in Fast DDS, not by any defect in our announcements.**
+Fast DDS 3.6.1 **ignores `PID_TYPE_INFORMATION` from every non-eProsima vendor**:
+`src/cpp/rtps/builtin/data/WriterProxyData.cpp` (case `PID_TYPE_INFORMATION`, the
+"Ignore this PID when coming from other vendors" branch, ~lines 1074-1089 of the pinned
+v3.6.1 tree) returns before deserializing whenever the SEDP source's vendorId is not
+`01.0f`; `ReaderProxyData.cpp` has the same gate. Our vendorId is `01.ff`, so their
+writer proxy for us never carries a TypeInformation, `async_get_type` never runs, no
+`getTypeDependencies`/`getTypes` request is ever sent, and the proxy matches by type
+name alone. There is **no configuration that disables the gate** (it is a hard vendor-id
+check, independent of `fastdds.type_propagation`).
+
+| Run | Peers | Capture | Result |
+|---|---|---|---|
+| leg B | our `run-publisher` (RED, 600, 10/s, `:peers "127.0.0.1:7410"`) + `make fastdds-type-probe SECONDS=40` | `captures/s4-theirclient-lo0.pcap` (trimmed to the first 5000 frames — the tail is only the S2-noted pre-ACKNACK repair storm) | **expected-FAIL**: probe logs `writer discovered: topic=Square type=ShapeType type_information.assigned=0` then `discovered type NOT in registry`; no TypeLookup request ever sent (`s4-theirclient-probe.out`, `-ourpub.out`) |
+| control | `fastdds-pub COLOR=GREEN COUNT=300` + the same probe | — | **PASS**: `assigned=1`, type resolved, RELIABLE reader created, 233 JSON samples |
+
+### Evidence frames (`s4-theirclient-lo0.pcap`)
+
+| Item | Observed | Evidence (frame) |
+|---|---|---|
+| Our unicast SPDP `DATA(p)` reaches their metatraffic `127.0.0.1:7410` | new `run-publisher :peers` path (FR-DISC-4) | fr 95 |
+| They process our SPDP | their TL request+reply writers HEARTBEAT at our pub (empty, first=1 last=0) | frs 110/111 |
+| Reliability handshake live at our SEDP writer | their builtin ACKNACKs at our SEDP publications writer `…000003c2` + both our TL writers are PREEMPTIVE (bitmapBase=0, numBits=0; no positive ack of sn 1 appears anywhere — we never send a SEDP HEARTBEAT to solicit one) | frs 120-123 |
+| Our SEDP `DATA(w)` carries `PID_TYPE_INFORMATION` (0x0075) | delivered; receipt+processing proven by their own discovery callback (next row), not by an ACKNACK | fr 389 |
+| Their `TypeLookup_Request` toward our `{00,03,00}c4` | **ZERO TL `DATA` submessages in the whole run, either direction** | — |
+| Probe verdict | `type_information.assigned=0` at the discovery callback — the proxy reached the app with our 0x0075 stripped | `s4-theirclient-probe.out` |
+
+So our TypeLookup **server** remains conformant-but-unexercised by a live foreign client:
+leg A proved our client against their server, S3 proved our 0x0075 bytes byte-identical
+to what Fast DDS computes for the same type, and the server core + endpoints stay covered
+by the offline suite (`typelookup-endpoints`, 93 green). A peer that honors foreign
+TypeInformation (or a future Fast DDS without the vendor gate) can exercise leg B with
+this harness unchanged.
+
+### Environmental finding: macOS gates LAN-sourced UDP per binary
+
+The first leg-B attempt (LAN-interface whitelist, like `shapes/`) failed **before** any
+RTPS-level cause: this host's macOS application-firewall / local-network privacy layer
+**silently drops inbound UDP sourced from the LAN address (even same-host
+`192.168.2.148→192.168.2.148`) for binaries the user has not approved** — loopback
+traffic is exempt. The approval is per code signature: the long-approved `shapes_sub`
+received our packets while a byte-identical copy at a new path also passed, but every
+newly built binary (`type_probe` and instrumented `shapes_sub` variants) received
+**none** of the 192.168.2.148-sourced packets (lldb: `MessageReceiver::processCDRMsg`
+hit 1355× in approved `shapes_sub` vs only its own loopback in the probe; the firewall
+is ON with explicit allow entries for the old harness binaries, `socketfilterfw
+--listapps`). Hence the leg-B design runs **entirely on `lo0`**:
+
+- `type_probe/profiles.xml` (its own, committed) whitelists **127.0.0.1 only**, so the
+  probe announces loopback locators and everything sent to it rides `lo0`;
+- `run-publisher` grew a `:peers "host:port[,host:port]"` option (the existing FR-DISC-4
+  unicast-SPDP path) so our SPDP reaches the probe's `127.0.0.1:7410` from a loopback
+  source: `make square-pub PEERS=127.0.0.1:7410` or the `:peers` key directly.
+
+If a future harness binary mysteriously hears nothing from a LAN-sourced peer, approve
+it in the firewall (or System Settings → Privacy → Local Network) — or keep the exchange
+on loopback as above.

@@ -1,0 +1,34 @@
+[37;1m2026-06-12 03:38:40.090 [33;1m[[37;1mTRANSPORT_UDPV4[33;1m Warning] [37mSupport for interfaceWhiteList will be removed in a future release. Please use interface allowlist/blocklist instead.[34;1m -> Function [36mUDPv4Transport[m
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] writer discovered: topic=Square type=ShapeType type_information.assigned=0
+[type_probe] discovered type NOT in registry (resolution failed)
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] participant discovery event: 47.42.50.9f.e1.d5.ed.00.00.00.00.00|0.0.1.c1
+[type_probe] FAIL: no type resolved within 40 s
+[37;1m2026-06-12 03:39:20.103 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x102394930 (0x102394a10)[34;1m -> Function [36mReceive[m
+[37;1m2026-06-12 03:39:20.103 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x102394bb0 (0x102394c90)[34;1m -> Function [36mReceive[m
+[37;1m2026-06-12 03:39:20.103 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x102394bb0 (0x102394e00)[34;1m -> Function [36mReceive[m
+[37;1m2026-06-12 03:39:20.103 [33;1m[[37;1mRTPS_MSG_OUT[33;1m Warning] [37mError receiving data: receive_from: Bad file descriptor - 0x102394fe0 (0x1023950c0)[34;1m -> Function [36mReceive[m
