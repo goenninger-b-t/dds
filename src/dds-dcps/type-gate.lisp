@@ -120,12 +120,16 @@
     (function (dds.rtps.discovery:endpoint-data dds.rtps.discovery:endpoint-data)
               dds.qos:type-consistency-enforcement)
   "The READER side's TYPE_CONSISTENCY_ENFORCEMENT (the policy applies to DataReaders
-   only, XTypes 1.3 §7.6.3.4): LOCAL's QoS when REMOTE is a writer, else REMOTE's.
-   The policy is not carried in our SEDP ParameterList yet, so a remote reader's
-   parsed QoS holds the §7.6.3.4.1 defaults — the writer side then assesses with
-   default options (documented gap until the policy rides DCPSSubscription)."
-  (dds.qos:qos-type-consistency
-   (dds.rtps.discovery:endpoint-data-qos (if (%remote-writer-p remote) local remote))))
+   only, XTypes 1.3 §7.6.3.4): LOCAL's QoS when REMOTE is a writer (LOCAL is then the
+   reader, with its real policy). When REMOTE is the reader its policy governs, but we
+   do not carry the TCE in our SEDP ParameterList and never parse a remote one, so per
+   §7.6.3.4.1 — when introspecting a remote endpoint that provides no
+   TypeConsistencyEnforcementQosPolicy, the Service SHALL assume DISALLOW_TYPE_COERCION
+   (so conformant + non-conformant peers reach the same matching conclusion) — we
+   assume DISALLOW for the remote reader rather than its (default ALLOW) parsed policy."
+  (if (%remote-writer-p remote)
+      (dds.qos:qos-type-consistency (dds.rtps.discovery:endpoint-data-qos local))
+      (dds.qos:make-type-consistency-enforcement :kind :disallow-type-coercion)))
 
 (defun* %gate-record-verdict (state remote verdict reason)
     (function (type-gate-state dds.rtps.discovery:endpoint-data

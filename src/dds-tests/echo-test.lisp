@@ -286,6 +286,7 @@
                  ("sedp-default-reliability" . run-sedp-default-reliability-test)
                  ("endpoint-kind"            . run-endpoint-kind-test)
                  ("keyed-match"              . run-keyed-match-test)
+                 ("tce-disallow-default"     . run-tce-disallow-default-test)
                  ("zero-alloc-into"          . run-generated-into-test)
                  ("rtps-wire-byte-exact"     . run-rtps-wire-test)
                  ("rtps-seqnum-bitmap"       . run-rtps-seqnum-test)

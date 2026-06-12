@@ -32,13 +32,15 @@
 (defconstant +be-tl-reply-reader+ (ash 1 15)
   "TypeLookupServiceReplyDataReader availableBuiltinEndpoints bit (XTypes 1.3 Table 62).")
 (defconstant +builtin-endpoint-set-default+
-  (logior #x0000043F
+  (logior #x0000003F
           +be-tl-request-writer+ +be-tl-request-reader+
           +be-tl-reply-writer+ +be-tl-reply-reader+)
   "Default availableBuiltinEndpoints mask we announce in SPDP: SPDP/SEDP announcer+
-   detector bits 0-5 and ParticipantMessage writer bit 10 (BuiltinEndpointSet_t,
-   RTPS 2.5 §9.3.2.12) plus the four TypeLookup service bits 12-15 (XTypes 1.3
-   §7.6.3.3.4 Table 62).")
+   detector bits 0-5 (BuiltinEndpointSet_t, RTPS 2.5 §9.3.2.12) plus the four
+   TypeLookup service bits 12-15 (XTypes 1.3 §7.6.3.3.4 Table 62). The
+   ParticipantMessage writer bit 10 is NOT set: the Writer Liveliness Protocol
+   builtin endpoint (RTPS 2.5 §8.4.13) is not implemented yet, so advertising it
+   would claim an unimplemented capability; the bit is re-added with the endpoint.")
 
 (defconstant +locator-bytes+ 24
   "Locator_t size = {long kind; unsigned long port; octet address[16];} = 24 octets (RTPS 2.5 §9.3.2.1).")

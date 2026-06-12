@@ -1862,6 +1862,31 @@
      :guid guid :topic-name "T" :type-name "X"
      :qos (dds.qos:make-qos :reliability :reliable))))
 
+(defun* run-tce-disallow-default-test ()
+    (function () t)
+  "XTypes 1.3 §7.6.3.4.1: introspecting a remote endpoint that carries no
+   TypeConsistencyEnforcementQosPolicy, the Service SHALL assume DISALLOW_TYPE_COERCION.
+   %reader-side-tce returns DISALLOW for an unadvertised remote READER (we never parse a
+   remote TCE), and the LOCAL reader's real policy (default ALLOW) when REMOTE is a writer."
+  (let ((local (dds.rtps.discovery:make-endpoint-data
+                :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 1)))
+                        (setf (aref g 15) #x07) g)         ; local keyed reader
+                :topic-name "T" :type-name "X" :qos (dds.qos:make-qos)))
+        (remote-reader (%remote-writer-ep #x04))            ; reuse the fabricator; force a reader kind below
+        (remote-writer (%remote-writer-ep #x02)))
+    (setf (aref (dds.rtps.discovery:endpoint-data-guid remote-reader) 15) #x04)  ; NO_KEY reader
+    (%check :tce-remote-reader-disallow
+            (eq :disallow-type-coercion
+                (dds.qos:type-consistency-enforcement-kind
+                 (dds.dcps::%reader-side-tce remote-reader local)))
+            "an unadvertised remote reader's TCE must be assumed DISALLOW (§7.6.3.4.1)")
+    (%check :tce-remote-writer-local-policy
+            (eq :allow-type-coercion
+                (dds.qos:type-consistency-enforcement-kind
+                 (dds.dcps::%reader-side-tce remote-writer local)))
+            "a remote writer uses the local reader's real policy (default ALLOW)")
+    t))
+
 (defun* run-keyed-match-test ()
     (function () t)
   "A keyed/no-key endpoint-kind disagreement is a silent non-match; same-kind matches;
