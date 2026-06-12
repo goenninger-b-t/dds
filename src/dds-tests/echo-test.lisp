@@ -253,6 +253,8 @@
                  ("enum-assignability"       . run-enum-assignability-test)
                  ("array-model"              . run-array-model-test)
                  ("array-assignability"      . run-array-assignability-test)
+                 ("union-model"              . run-union-model-test)
+                 ("union-assignability"      . run-union-assignability-test)
                  ("xtypes-typeobject-cdr"    . run-typeobject-cdr-test)
                  ("xtypes-type-information"  . run-type-information-test)
                  ("fastdds-type-information-vector" . run-fastdds-type-information-vector-test)

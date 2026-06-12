@@ -1130,6 +1130,50 @@
     (assert (not (dds.types:ti-assignable-from a (dds.types:array-type-identifier (dds.types:primitive-type-identifier :i64) 4) opts)))
     t))
 
+;;; Union type model (M4, FR-TYPE-4 S2): the in-memory MinimalUnionType and its EK_MINIMAL
+;;; referenced TypeIdentifier, the descriptor assignability recurses into.
+
+(defun* run-union-model-test ()
+    (function () t)
+  "union-type-identifier builds an EK_MINIMAL TI whose referenced descriptor carries the
+   discriminator TI and members (each with labels, member TI, default-p, NameHash)."
+  (let* ((m0 (dds.types:make-union-member "a" '(0) (dds.types:primitive-type-identifier :i32) nil))
+         (m1 (dds.types:make-union-member "b" '(1) (dds.types:primitive-type-identifier :f64) nil))
+         (u (dds.types:make-minimal-union-type
+             :discriminator (dds.types:primitive-type-identifier :i32) :members (list m0 m1)))
+         (ti (dds.types:union-type-identifier u)))
+    (assert (= (dds.types:type-identifier-kind ti) dds.types:+ek-minimal+))
+    (assert (dds.types:minimal-union-type-p (dds.types:type-identifier-referenced ti)))
+    (assert (equal '(0) (dds.types:union-member-labels
+                         (first (dds.types:minimal-union-type-members
+                                 (dds.types:type-identifier-referenced ti))))))
+    t))
+
+;;; Union assignability (M4, FR-TYPE-4 S2): the sound under-approximation of the XTypes
+;;; §7.2.4.4.8 Table 19 UNION_TYPE row — reject only a provable incompatibility.
+
+(defun* run-union-assignability-test ()
+    (function () t)
+  "union-assignable-from rejects only a provable incompatibility: a label present in both whose
+   member types are not assignable (or discriminators not assignable). Identical unions assignable
+   both ways; a changed case-0 member type is not; label-set differences are uncertain (assignable,
+   fail-open)."
+  (flet ((u (disc &rest ms) (dds.types:make-minimal-union-type :discriminator disc :members ms)))
+    (let* ((opts (dds.types:default-assignability-options))
+           (i32 (dds.types:primitive-type-identifier :i32))
+           (f64 (dds.types:primitive-type-identifier :f64))
+           (a (u i32 (dds.types:make-union-member "a" '(0) i32 nil)
+                 (dds.types:make-union-member "b" '(1) f64 nil)))
+           (same (u i32 (dds.types:make-union-member "a" '(0) i32 nil)
+                    (dds.types:make-union-member "b" '(1) f64 nil)))
+           (bad  (u i32 (dds.types:make-union-member "a" '(0) f64 nil)
+                    (dds.types:make-union-member "b" '(1) f64 nil))))
+      (assert (dds.types:union-assignable-from a same opts))
+      (assert (dds.types:union-assignable-from same a opts))
+      (assert (not (dds.types:union-assignable-from a bad opts)))
+      (assert (not (dds.types:union-assignable-from bad a opts)))
+      t)))
+
 ;;; XCDR2 MinimalTypeObject serializer + EquivalenceHash (M4, FR-TYPE-2/5): serialize the
 ;;; Minimal struct TypeObject to canonical XCDR2-LE bytes (XTypes §7.3.4.5) and hash it
 ;;; (§7.3.4.9.1). The hand-derived golden (struct pt{long x;}) proves the framing byte-exact

@@ -186,3 +186,32 @@
    pattern nested structs use. The legacy-wire producer that builds these from a Connext
    0x8021 enum member is added in the S0.3 decode task."
   (hash-type-identifier +ek-minimal+ :referenced enum))
+
+;;; ---- Union type (MinimalUnionType; in-memory descriptor) ----
+
+(defstruct* (union-member (:constructor %make-union-member) (:copier nil))
+  "One union member: NAME-HASH (4-octet NameHash), LABELS (list of i32 case labels),
+   TYPE-IDENTIFIER (the member's type), DEFAULT-P (T iff the `default:` member)."
+  (name-hash (make-array 4 :element-type '(unsigned-byte 8)) :type (array (unsigned-byte 8) (4)))
+  (labels nil :type list)
+  (type-identifier nil :type (or null type-identifier))
+  (default-p nil :type boolean))
+
+(defun* make-union-member (name labels type-identifier default-p)
+    (function (string list (or null type-identifier) t) union-member)
+  "A union-member for NAME (NameHash via member-name-hash), case LABELS, TYPE-IDENTIFIER,
+   and DEFAULT-P."
+  (%make-union-member :name-hash (member-name-hash name) :labels labels
+                      :type-identifier type-identifier :default-p (and default-p t)))
+
+(defstruct* (minimal-union-type (:constructor make-minimal-union-type) (:copier nil))
+  "In-memory MinimalUnionType: DISCRIMINATOR (a TypeIdentifier) and MEMBERS (union-member list).
+   The referenced descriptor of an EK_MINIMAL union TI."
+  (discriminator nil :type (or null type-identifier))
+  (members nil :type list))
+
+(defun* union-type-identifier (union)
+    (function (minimal-union-type) type-identifier)
+  "An EK_MINIMAL TypeIdentifier whose REFERENCED descriptor is UNION (the referenced pattern;
+   the legacy-wire producer that builds it from a Connext 0x8021 union member is the S2.3 task)."
+  (hash-type-identifier +ek-minimal+ :referenced union))

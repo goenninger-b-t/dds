@@ -56,11 +56,12 @@
 (defun* ti-aggregated-p (ti)
     (function (type-identifier) t)
   "True if TI is a hash-defined type (EK_MINIMAL/EK_COMPLETE) carrying a resolved in-memory
-   referenced descriptor (a struct or an enumerated type)."
+   referenced descriptor (a struct, an enumerated type, or a union)."
   (let ((k (type-identifier-kind ti)))
     (and (or (= k +ek-minimal+) (= k +ek-complete+))
          (let ((r (type-identifier-referenced ti)))
-           (or (minimal-struct-type-p r) (minimal-enumerated-type-p r))))))
+           (or (minimal-struct-type-p r) (minimal-enumerated-type-p r)
+               (minimal-union-type-p r))))))
 
 ;;; ---- Bound comparison (0 = unbounded = the maximum) ----
 
@@ -77,7 +78,9 @@
   "Whether an object of type TI is self-delimiting under XCDR2 (§7.2.4.2): primitives,
    strings, and enumerated types (fixed bit-bound storage) are; a sequence is iff its
    element is; an aggregated struct is iff its extensibility is APPENDABLE or MUTABLE
-   (FINAL aggregated structs are not delimited)."
+   (FINAL aggregated structs are not delimited). A union (whose extensibility the legacy/
+   minimal model does not carry) is treated as NOT delimited — conservative: a non-delimited
+   element merely can't be a collection element/key, which never causes a false-reject."
   (cond ((ti-primitive-p ti) t)
         ((ti-string-p ti) t)
         ((ti-sequence-p ti)
@@ -87,6 +90,9 @@
         ((and (ti-aggregated-p ti)
               (minimal-enumerated-type-p (type-identifier-referenced ti)))
          t)
+        ((and (ti-aggregated-p ti)
+              (minimal-union-type-p (type-identifier-referenced ti)))
+         nil)
         ((ti-aggregated-p ti)
          (and (member (minimal-struct-type-extensibility (type-identifier-referenced ti))
                       '(:appendable :mutable))
@@ -131,6 +137,8 @@
           (struct-assignable-from r1 r2 opts))
          ((and (minimal-enumerated-type-p r1) (minimal-enumerated-type-p r2))
           (enum-assignable-from r1 r2 opts))
+         ((and (minimal-union-type-p r1) (minimal-union-type-p r2))
+          (union-assignable-from r1 r2 opts))
          (t nil))))
     (t nil)))
 
@@ -299,6 +307,27 @@
                                :key #'enum-literal-name-hash :test #'equalp)))
                  (or (null l2)
                      (= (enum-literal-value l1) (enum-literal-value l2))))))
+
+;;; ---- Union assignability (XTypes §7.2.4.4.8 Table 19 UNION_TYPE row), sound under-approx ----
+
+(defun* union-assignable-from (t1 t2 opts)
+    (function (minimal-union-type minimal-union-type assignability-options) t)
+  "Sound under-approximation of union is-assignable-from (XTypes 1.3 §7.2.4.4.8, Table 19,
+   UNION_TYPE row): returns NIL only on a PROVABLE incompatibility — discriminators not
+   assignable, OR two members selected by a common case label whose member types are not
+   assignable. Label-set differences and default-member subtleties are uncertain (try_construct
+   is not on the legacy wire) and DO NOT cause a reject (fail-open: never false-reject a
+   possibly-assignable pair). Members matched by shared case LABEL."
+  (let ((d1 (minimal-union-type-discriminator t1))
+        (d2 (minimal-union-type-discriminator t2)))
+    (and d1 d2 (ti-assignable-from d1 d2 opts)
+         (loop for m1 in (minimal-union-type-members t1)
+               always (loop for m2 in (minimal-union-type-members t2)
+                            always (or (null (intersection (union-member-labels m1)
+                                                           (union-member-labels m2)))
+                                       (let ((mt1 (union-member-type-identifier m1))
+                                             (mt2 (union-member-type-identifier m2)))
+                                         (and mt1 mt2 (ti-assignable-from mt1 mt2 opts) t))))))))
 
 ;;; ---- Structural MINIMAL-equivalence (a verifiable stand-in for EquivalenceHash) ----
 

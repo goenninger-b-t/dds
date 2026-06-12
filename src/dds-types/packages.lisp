@@ -41,6 +41,12 @@
            #:minimal-enumerated-type #:minimal-enumerated-type-p #:make-minimal-enumerated-type
            #:minimal-enumerated-type-literals #:minimal-enumerated-type-bit-bound
            #:enumerated-type-identifier
+           ;; Union type model (FR-TYPE-4 S2)
+           #:union-member #:make-union-member #:union-member-labels
+           #:union-member-type-identifier #:union-member-name-hash #:union-member-default-p
+           #:minimal-union-type #:minimal-union-type-p #:make-minimal-union-type
+           #:minimal-union-type-discriminator #:minimal-union-type-members
+           #:union-type-identifier
            ;; XTypes type assignability + TYPE_CONSISTENCY_ENFORCEMENT (FR-TYPE-4)
            #:assignability-options #:make-assignability-options
            #:assignability-options-ignore-sequence-bounds
@@ -51,6 +57,7 @@
            #:ti-assignable-from #:strongly-assignable-from #:struct-assignable-from
            #:ti-array-p
            #:enum-assignable-from
+           #:union-assignable-from
            #:member-names-agree-p
            #:ti-equivalent-p #:struct-equivalent-p #:enforce-type-consistency
            ;; XCDR2 MinimalTypeObject serializer + EquivalenceHash (FR-TYPE-2/5)
