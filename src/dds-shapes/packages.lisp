@@ -19,8 +19,10 @@
            #:serialize-large-data #:deserialize-large-data
            #:shape-mismatch #:make-shape-mismatch
            #:shape-mismatch-color #:shape-mismatch-x #:shape-mismatch-y #:shape-mismatch-shapesize
+           #:nokey-data #:make-nokey-data #:nokey-data-a #:nokey-data-b
            #:run-publisher #:run-subscriber #:run-spy
            #:run-large-publisher #:run-large-subscriber
            #:run-gated-subscriber
            #:run-corpus-capture-subscriber
-           #:run-typelookup-probe))
+           #:run-typelookup-probe
+           #:run-nokey-publisher #:run-nokey-subscriber))

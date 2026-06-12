@@ -174,13 +174,18 @@
     (loop for i from 3 below 12 do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
-(defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1"))
-    (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string)) domain-participant)
+(defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1") (peers nil))
+    (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string) (:peers list)) domain-participant)
   "DomainParticipantFactory::create_participant — open the RTPS engine (a multicast
    disc-node) for DOMAIN, install the match/incompatible-QoS hooks that surface DDS
-   statuses to the application, start the receiver, and return an enabled participant."
+   statuses to the application, start the receiver, and return an enabled participant.
+   PEERS is an optional ((host . port) ...) list of unicast SPDP announce targets
+   (FR-DISC-4) layered on top of multicast — e.g. ((\"127.0.0.1\" . 7410)) reaches a
+   same-host peer over loopback when the macOS application firewall silently drops
+   LAN-sourced UDP for an unapproved peer binary."
   (let* ((node (dds.disc:make-disc-node :domain domain :multicast t
                                         :advertise-address advertise-address
+                                        :peers peers
                                         :guid-prefix (%make-guid-prefix)))
          (p (make-instance 'domain-participant :domain domain :node node :qos qos :enabled t)))
     ;; Install hooks BEFORE the receiver thread starts so no early SEDP match is lost.

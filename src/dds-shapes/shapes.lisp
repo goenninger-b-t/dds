@@ -35,6 +35,11 @@
   (y :i32)
   (shapesize :i64))
 
+;; No @key member => type-support-keyed-p NIL => endpoints come up NO_KEY (writer 0x03 / reader 0x04, RTPS 2.5 §9.3.1.2). Live-proof type for the keyed/no-key endpoint-kinds feature.
+(dds.gen:define-dds-type nokey-data (:extensibility :final)
+  (a :i32)
+  (b :i32))
+
 (defun* %shape-type-information ()
     (function () (or null (simple-array (unsigned-byte 8) (*))))
   "Opaque serialized XTypes TypeInformation for the canonical ShapeType, advertised in
@@ -618,3 +623,84 @@
           (dds.disc:stop-node node)
           (format t "~&[tl-probe] stopped (~:[FAIL~;PASS~]).~%" passed)))
       passed)))
+
+(defun* run-nokey-publisher (&key (domain 0) (rate 5) (count 0)
+                                  (advertise-address "127.0.0.1") (peers nil))
+    (function (&key (:domain (integer 0)) (:rate (integer 1)) (:count (integer 0))
+                    (:advertise-address string) (:peers (or null string))) t)
+  "Publish NoKeyData (a,b) on topic 'NoKeyTopic' / type 'nokey-data' via the DCPS
+   path, so the topic type's keyed-ness (NIL) selects the NO_KEY writer kind 0x03
+   (RTPS 2.5 §9.3.1.2). Proves the live no-key OUT direction against a Connext
+   keyless reader. RATE updates/sec; COUNT 0 = forever (Ctrl-C). PEERS is an optional
+   \"host:port[,host:port]\" list of unicast SPDP announce targets (FR-DISC-4) on top
+   of multicast — e.g. \"127.0.0.1:7410\" reaches a same-host peer over loopback when
+   the macOS application firewall silently drops LAN-sourced UDP for an unapproved
+   peer binary."
+  (let* ((ts (dds.types:find-type-support "nokey-data"))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :peers (%parse-peers peers))))
+    (unless ts (error "run-nokey-publisher: no registered type-support \"nokey-data\""))
+    (let* ((tp (dds.dcps:create-topic p "NoKeyTopic" "nokey-data" ts))
+           (pub (dds.dcps:create-publisher p))
+           (dw (dds.dcps:create-datawriter pub tp
+                                           :qos (dds.qos:make-writer-qos :reliability :reliable))))
+      (format t "~&[nokey-pub] NoKeyTopic/nokey-data domain=~d (NO_KEY writer 0x03, multicast 239.255.0.1). Ctrl-C to stop.~%"
+              domain)
+      (let ((period (/ 1.0 rate)) (n 0))
+        (unwind-protect
+             (loop
+               (dds.dcps:spin p)
+               (incf n)
+               (dds.dcps:write-sample dw (make-nokey-data :a n :b (* n 10)))
+               (when (zerop (mod n 5))
+                 (format t "~&[nokey-pub] sent ~d samples; matched=~d~%" n (dds.dcps:matched-count p)))
+               (when (and (plusp count) (>= n count)) (return))
+               (sleep period))
+          (format t "~&[nokey-pub] stopped after ~d samples; matched=~d.~%" n (dds.dcps:matched-count p))
+          (dds.dcps:delete-participant p))))
+    t))
+
+(defun* run-nokey-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1") (peers nil))
+    (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string) (:peers (or null string))) t)
+  "Subscribe to NoKeyData on topic 'NoKeyTopic' / type 'nokey-data' via the DCPS
+   path, so the topic type's keyed-ness (NIL) selects the NO_KEY reader kind 0x04
+   (RTPS 2.5 §9.3.1.2). Proves the live no-key IN direction from a Connext keyless
+   writer. SECONDS 0 = forever (Ctrl-C). PEERS is an optional \"host:port[,host:port]\"
+   list of unicast SPDP announce targets (FR-DISC-4) on top of multicast — e.g.
+   \"127.0.0.1:7410\" reaches a same-host peer over loopback when the macOS application
+   firewall silently drops LAN-sourced UDP for an unapproved peer binary."
+  (let* ((ts (dds.types:find-type-support "nokey-data"))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :peers (%parse-peers peers))))
+    (unless ts (error "run-nokey-subscriber: no registered type-support \"nokey-data\""))
+    (let* ((tp (dds.dcps:create-topic p "NoKeyTopic" "nokey-data" ts))
+           (sub (dds.dcps:create-subscriber p))
+           (dr (dds.dcps:create-datareader sub tp
+                                           :qos (dds.qos:make-reader-qos :reliability :reliable))))
+      (format t "~&[nokey-sub] NoKeyTopic/nokey-data domain=~d (NO_KEY reader 0x04, multicast 239.255.0.1). Ctrl-C to stop.~%"
+              domain)
+      (let ((seen 0) (start (get-internal-real-time)) (matched-reported nil))
+        (unwind-protect
+             (loop
+               (dds.dcps:spin p)
+               (dolist (cs (dds.dcps:take-samples dr))
+                 (handler-case
+                     (let ((s (dds.dcps:cached-sample-data cs)))
+                       (incf seen)
+                       (format t "~&[nokey-sub] sample #~d: a=~d b=~d~%"
+                               seen (nokey-data-a s) (nokey-data-b s)))
+                   (error (e)
+                     (format t "~&[nokey-sub] skipped undeliverable sample (~a)~%" (type-of e)))))
+               (let ((ms (dds.dcps:matched-count p)))
+                 (when (and (plusp ms) (not matched-reported))
+                   (setf matched-reported t)
+                   (format t "~&[nokey-sub] MATCHED ~d remote endpoint(s) (no-key pair).~%" ms)))
+               (when (and (plusp seconds)
+                          (> (/ (- (get-internal-real-time) start) internal-time-units-per-second)
+                             seconds))
+                 (return))
+               (sleep 0.1))
+          (format t "~&[nokey-sub] stopped; received ~d sample(s); matched=~d.~%"
+                  seen (dds.dcps:matched-count p))
+          (dds.dcps:delete-participant p))))
+    t))

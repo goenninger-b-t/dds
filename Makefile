@@ -11,6 +11,7 @@ LISP  ?= $(CLASP)
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
+        nokey-pub nokey-sub \
         fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench mem sbom hooks clean
 
 DOMAIN   ?= 0
@@ -106,6 +107,18 @@ gated-sub:
 corpus-capture:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-corpus-capture-subscriber :domain $(DOMAIN) :topic "$(TOPIC)" :type "$(TYPE)" :seconds $(SECONDS))' \
+	        --eval '(uiop:quit 0)'
+
+# No-key endpoint-kinds live harness (keyed/no-key feature). The DCPS path threads the
+# topic type's keyed-ness (NIL) so the endpoints come up NO_KEY (writer 0x03 / reader 0x04).
+nokey-pub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-nokey-publisher :domain $(DOMAIN) :count $(COUNT) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)")' \
+	        --eval '(uiop:quit 0)'
+
+nokey-sub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-nokey-subscriber :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)")' \
 	        --eval '(uiop:quit 0)'
 
 # Fast DDS interop peers (interop/fastdds/README.md). FASTDDS_PREFIX via with-fastdds.sh;
