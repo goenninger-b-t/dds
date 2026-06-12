@@ -1797,6 +1797,55 @@
       (dds.disc:stop-node nn)))
   t)
 
+;;; Keyed/no-key endpoint-kind agreement on the SEDP match path (FR-RTPS, RTPS 2.5
+;;; §9.3.1.2 Table 9.1): a WITH_KEY local endpoint must NOT match a NO_KEY remote (and
+;;; vice versa). The disagreement is a SILENT non-match — below type consistency, so it
+;;; does NOT fire INCONSISTENT_TOPIC; only same-kind, name-agreeing endpoints match.
+
+(defun* %remote-writer-ep (kind)
+    (function ((unsigned-byte 8)) dds.rtps.discovery:endpoint-data)
+  "A synthesized remote writer endpoint on (T, X) with a distinct GUID prefix and the
+   given entity KIND (0x02 WITH_KEY / 0x03 NO_KEY), RELIABLE so RxO-matches a reader."
+  (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (setf (aref guid 15) kind)
+    (dds.rtps.discovery:make-endpoint-data
+     :guid guid :topic-name "T" :type-name "X"
+     :qos (dds.qos:make-qos :reliability :reliable))))
+
+(defun* run-keyed-match-test ()
+    (function () t)
+  "A keyed/no-key endpoint-kind disagreement is a silent non-match; same-kind matches;
+   no INCONSISTENT_TOPIC fired (FR-RTPS, RTPS 2.5 §9.3.1.2): a keyed local reader (0x07)
+   rejects a no-key remote writer (0x03); a no-key local reader (0x04) matches a no-key
+   writer but rejects a keyed writer (0x02); the inconsistent table stays empty throughout."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 1)
+               :host "127.0.0.1" :port 0))
+        (nokey-w (%remote-writer-ep #x03))
+        (keyed-w (%remote-writer-ep #x02)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-reader node :topic "T" :type "X")              ; keyed reader 0x07
+           (dds.disc::%match-remote-writer node nokey-w)
+           (%check :keyed-reader-vs-nokey-writer
+                   (zerop (dds.disc:disc-node-matched-count node))
+                   "a keyed local reader must not match a no-key remote writer")
+           (setf (dds.disc::disc-node-local-readers node) '())
+           (dds.disc:add-local-reader node :topic "T" :type "X" :keyed nil)   ; no-key reader 0x04
+           (dds.disc::%match-remote-writer node nokey-w)
+           (%check :nokey-reader-vs-nokey-writer
+                   (= 1 (dds.disc:disc-node-matched-count node))
+                   "a no-key local reader must match a no-key remote writer")
+           (dds.disc::%match-remote-writer node keyed-w)
+           (%check :nokey-reader-vs-keyed-writer
+                   (= 1 (dds.disc:disc-node-matched-count node))
+                   "a no-key local reader must not match a keyed remote writer (no new match)")
+           (%check :keyed-mismatch-no-inconsistent
+                   (zerop (hash-table-count (dds.disc::disc-node-inconsistent node)))
+                   "an endpoint-kind disagreement must not fire INCONSISTENT_TOPIC"))
+      (dds.disc:stop-node node)))
+  t)
+
 ;;; TypeLookup builtin endpoints over UDP (M4 Task 3.2, FR-TYPE-3): the four
 ;;; XTypes 1.3 Table 61 service endpoints wired into the discovery node — a client
 ;;; type-lookup-query fetches a peer's TypeObject by EquivalenceHash; the peer's

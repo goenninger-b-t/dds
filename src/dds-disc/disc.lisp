@@ -240,8 +240,9 @@
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
    TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP. KEYED
    selects the RTPS entity kind (RTPS 2.5 §9.3.1.2 Table 9.1): T (default) -> 0x07 (reader
-   WITH_KEY), NIL -> 0x04 (reader NO_KEY). Sets NODE's user-reader-id so the data plane
-   routes HEARTBEAT/ACKNACK with this id."
+   WITH_KEY), NIL -> 0x04 (reader NO_KEY); a keyed reader will not match a no-key remote
+   writer (and vice versa) — the disagreement is a silent non-match, not INCONSISTENT_TOPIC.
+   Sets NODE's user-reader-id so the data plane routes HEARTBEAT/ACKNACK with this id."
   (let* ((kind (if keyed #x07 #x04))
          (ep (dds.rtps.discovery:make-endpoint-data
               :guid (%make-endpoint-guid (disc-node-guid-prefix node) key kind)
@@ -510,8 +511,11 @@
 (defun* %match-remote-endpoint (node remote direction)
     (function (disc-node dds.rtps.discovery:endpoint-data (member :remote-writer :remote-reader)) (eql t))
   "Test discovered REMOTE against each local endpoint of the opposite kind (DIRECTION
-   :remote-writer -> local readers; :remote-reader -> local writers). On the first
-   RxO-compatible local, consult the TYPE-GATE: :compatible (or no gate) records +
+   :remote-writer -> local readers; :remote-reader -> local writers). A local whose
+   keyed-ness (WITH_KEY vs NO_KEY, RTPS 2.5 §9.3.1.2) disagrees with REMOTE is a silent
+   non-match — a fundamental endpoint-kind incompatibility below type consistency, so it
+   never fires INCONSISTENT_TOPIC. On the first RxO-compatible, same-kind local, consult
+   the TYPE-GATE: :compatible (or no gate) records +
    announces the match; :incompatible joins the INCONSISTENT_TOPIC path; :pending
    parks the decision for resume-parked-matches. Else, against a local on the SAME
    topic name: a different type name is an INCONSISTENT_TOPIC; a matching type whose
@@ -525,6 +529,10 @@
               ;; LOCAL is the writer here (REMOTE is a reader); writer-data still first
               (dds.rtps.discovery:endpoint-match-p local remote))
         (cond
+          ;; topic+type+qos agree but keyed-ness disagrees: a fundamental endpoint-kind
+          ;; incompatibility below type consistency -> silent non-match (RTPS 2.5 §9.3.1.2)
+          ((and ok (not (eq (%endpoint-keyed-p (dds.rtps.discovery:endpoint-data-guid local))
+                            (%endpoint-keyed-p (dds.rtps.discovery:endpoint-data-guid remote))))))
           (ok (case (%consult-type-gate node remote local)
                 (:incompatible
                  (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name local)))

@@ -63,6 +63,12 @@
   "T iff the GUID's entity kind is a user writer (0x02 with-key / 0x03 no-key)."
   (let ((k (aref guid 15))) (or (= k #x02) (= k #x03))))
 
+(defun* %endpoint-keyed-p (guid)
+    (function ((simple-array (unsigned-byte 8) (16))) t)
+  "T iff the endpoint GUID's entity kind is a WITH_KEY user endpoint: writer 0x02 or
+   reader 0x07 (vs NO_KEY writer 0x03 / reader 0x04) — RTPS 2.5 §9.3.1.2 Table 9.1."
+  (let ((k (aref guid 15))) (or (= k #x02) (= k #x07))))
+
 (defun* %user-writer-entityid-p (entity-id)
     (function ((unsigned-byte 32)) t)
   "T iff ENTITY-ID's kind is an application-defined writer (0x02 with-key / 0x03 no-key) —
