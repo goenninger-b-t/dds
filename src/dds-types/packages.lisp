@@ -36,6 +36,11 @@
            #:minimal-struct-type #:make-minimal-struct-type #:minimal-struct-type-p
            #:minimal-struct-type-name #:minimal-struct-type-extensibility
            #:minimal-struct-type-members
+           ;; Enumerated type model (FR-TYPE-4 S0)
+           #:enum-literal #:make-enum-literal #:enum-literal-value #:enum-literal-name-hash
+           #:minimal-enumerated-type #:minimal-enumerated-type-p #:make-minimal-enumerated-type
+           #:minimal-enumerated-type-literals #:minimal-enumerated-type-bit-bound
+           #:enumerated-type-identifier
            ;; XTypes type assignability + TYPE_CONSISTENCY_ENFORCEMENT (FR-TYPE-4)
            #:assignability-options #:make-assignability-options
            #:assignability-options-ignore-sequence-bounds
@@ -44,6 +49,7 @@
            #:assignability-options-prevent-type-widening
            #:default-assignability-options
            #:ti-assignable-from #:strongly-assignable-from #:struct-assignable-from
+           #:enum-assignable-from
            #:member-names-agree-p
            #:ti-equivalent-p #:struct-equivalent-p #:enforce-type-consistency
            ;; XCDR2 MinimalTypeObject serializer + EquivalenceHash (FR-TYPE-2/5)

@@ -148,3 +148,30 @@
   (name "" :type string)
   (extensibility :final :type (member :final :appendable :mutable))
   (members '() :type list))
+
+;;; ---- Enumerated type (MinimalEnumeratedType; in-memory descriptor) ----
+
+(defstruct* (enum-literal (:constructor %make-enum-literal) (:copier nil))
+  "One enumerated literal: NAME-HASH is the 4-octet NameHash (MD5(name)[0:4]) matched
+   across types (the Minimal form carries only the hash); VALUE is the i32 constant."
+  (name-hash (make-array 4 :element-type '(unsigned-byte 8)) :type (array (unsigned-byte 8) (4)))
+  (value 0 :type (signed-byte 32)))
+
+(defun* make-enum-literal (name value)
+    (function (string (signed-byte 32)) enum-literal)
+  "An enum-literal for NAME (its NameHash computed via member-name-hash) and VALUE."
+  (%make-enum-literal :name-hash (member-name-hash name) :value value))
+
+(defstruct* (minimal-enumerated-type (:constructor make-minimal-enumerated-type) (:copier nil))
+  "In-memory MinimalEnumeratedType: BIT-BOUND (storage bit width, default 32) and LITERALS
+   (a list of enum-literal). The referenced descriptor of an EK_MINIMAL enum TI."
+  (bit-bound 32 :type (integer 1 64))
+  (literals nil :type list))
+
+(defun* enumerated-type-identifier (enum)
+    (function (minimal-enumerated-type) type-identifier)
+  "An EK_MINIMAL TypeIdentifier whose REFERENCED descriptor is ENUM, so assignability
+   (FR-TYPE-4) recurses into it ahead of the deferred EquivalenceHash — the same referenced
+   pattern nested structs use. The legacy-wire producer that builds these from a Connext
+   0x8021 enum member is added in the S0.3 decode task."
+  (hash-type-identifier +ek-minimal+ :referenced enum))

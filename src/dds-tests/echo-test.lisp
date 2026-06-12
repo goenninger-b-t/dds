@@ -249,6 +249,8 @@
                  ("dds-keyhash"              . run-keyhash-test)
                  ("xtypes-model"             . run-xtypes-model-test)
                  ("xtypes-assignability"     . run-assignability-test)
+                 ("enum-model"               . run-enum-model-test)
+                 ("enum-assignability"       . run-enum-assignability-test)
                  ("xtypes-typeobject-cdr"    . run-typeobject-cdr-test)
                  ("xtypes-type-information"  . run-type-information-test)
                  ("fastdds-type-information-vector" . run-fastdds-type-information-vector-test)

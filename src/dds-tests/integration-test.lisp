@@ -1059,6 +1059,50 @@
                 "the QoS set carries TYPE_CONSISTENCY_ENFORCEMENT (reader default)"))))
   t)
 
+;;; Enumerated type model (M4, FR-TYPE-4 S0): the in-memory MinimalEnumeratedType and its
+;;; EK_MINIMAL referenced TypeIdentifier, the descriptor assignability recurses into.
+
+(defun* run-enum-model-test ()
+    (function () t)
+  "minimal-enumerated-type + enumerated-type-identifier build an EK_MINIMAL TI whose
+   referenced descriptor carries the literals (NameHash . value) and bit-bound."
+  (let* ((lits (list (dds.types:make-enum-literal "RED" 0)
+                     (dds.types:make-enum-literal "GREEN" 1)
+                     (dds.types:make-enum-literal "BLUE" 2)))
+         (e (dds.types:make-minimal-enumerated-type :bit-bound 32 :literals lits))
+         (ti (dds.types:enumerated-type-identifier e)))
+    (assert (= (dds.types:type-identifier-kind ti) dds.types:+ek-minimal+))
+    (assert (dds.types:minimal-enumerated-type-p (dds.types:type-identifier-referenced ti)))
+    (assert (= 3 (length (dds.types:minimal-enumerated-type-literals
+                          (dds.types:type-identifier-referenced ti)))))
+    (assert (= 1 (dds.types:enum-literal-value
+                  (second (dds.types:minimal-enumerated-type-literals
+                           (dds.types:type-identifier-referenced ti))))))
+    t))
+
+;;; Enumerated assignability (M4, FR-TYPE-4 S0): the sound under-approximation of the
+;;; XTypes §7.2.4.4.7 Table 18 ENUMERATION_TYPE row — reject only a provable incompatibility.
+
+(defun* run-enum-assignability-test ()
+    (function () t)
+  "enum-assignable-from rejects ONLY a provable incompatibility (same literal name, different
+   value); identical enums are assignable both ways; a differing-value enum is not; an
+   extra-literal-on-one-side is uncertain -> assignable (fail-open)."
+  (flet ((enum (&rest pairs)
+           (dds.types:make-minimal-enumerated-type
+            :bit-bound 32
+            :literals (loop for (n v) on pairs by #'cddr collect (dds.types:make-enum-literal n v)))))
+    (let ((a (enum "RED" 0 "GREEN" 1 "BLUE" 2))
+          (same (enum "RED" 0 "GREEN" 1 "BLUE" 2))
+          (badval (enum "RED" 0 "GREEN" 1 "BLUE" 3))
+          (opts (dds.types:default-assignability-options)))
+      (assert (dds.types:enum-assignable-from a same opts))
+      (assert (dds.types:enum-assignable-from same a opts))
+      (assert (not (dds.types:enum-assignable-from a badval opts)))
+      (assert (not (dds.types:enum-assignable-from badval a opts)))
+      (assert (dds.types:enum-assignable-from a (enum "RED" 0 "GREEN" 1) opts))
+      t)))
+
 ;;; XCDR2 MinimalTypeObject serializer + EquivalenceHash (M4, FR-TYPE-2/5): serialize the
 ;;; Minimal struct TypeObject to canonical XCDR2-LE bytes (XTypes §7.3.4.5) and hash it
 ;;; (§7.3.4.9.1). The hand-derived golden (struct pt{long x;}) proves the framing byte-exact

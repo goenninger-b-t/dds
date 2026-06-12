@@ -49,11 +49,12 @@
 
 (defun* ti-aggregated-p (ti)
     (function (type-identifier) t)
-  "True if TI is a hash-defined aggregated type (EK_MINIMAL/EK_COMPLETE) carrying a
-   resolved in-memory referenced struct."
+  "True if TI is a hash-defined type (EK_MINIMAL/EK_COMPLETE) carrying a resolved in-memory
+   referenced descriptor (a struct or an enumerated type)."
   (let ((k (type-identifier-kind ti)))
     (and (or (= k +ek-minimal+) (= k +ek-complete+))
-         (minimal-struct-type-p (type-identifier-referenced ti)))))
+         (let ((r (type-identifier-referenced ti)))
+           (or (minimal-struct-type-p r) (minimal-enumerated-type-p r))))))
 
 ;;; ---- Bound comparison (0 = unbounded = the maximum) ----
 
@@ -67,13 +68,17 @@
 
 (defun* ti-delimited-p (ti)
     (function (type-identifier) t)
-  "Whether an object of type TI is self-delimiting under XCDR2 (§7.2.4.2): primitives and
-   strings are; a sequence is iff its element is; an aggregated type is iff its
-   extensibility is APPENDABLE or MUTABLE (FINAL aggregated types are not delimited)."
+  "Whether an object of type TI is self-delimiting under XCDR2 (§7.2.4.2): primitives,
+   strings, and enumerated types (fixed bit-bound storage) are; a sequence is iff its
+   element is; an aggregated struct is iff its extensibility is APPENDABLE or MUTABLE
+   (FINAL aggregated structs are not delimited)."
   (cond ((ti-primitive-p ti) t)
         ((ti-string-p ti) t)
         ((ti-sequence-p ti)
          (let ((e (type-identifier-element ti))) (and e (ti-delimited-p e) t)))
+        ((and (ti-aggregated-p ti)
+              (minimal-enumerated-type-p (type-identifier-referenced ti)))
+         t)
         ((ti-aggregated-p ti)
          (and (member (minimal-struct-type-extensibility (type-identifier-referenced ti))
                       '(:appendable :mutable))
@@ -88,7 +93,8 @@
    assignable from the same primitive kind (Table 15); narrow strings from narrow strings
    under the bound rule gated by ignore_string_bounds (Table 16); plain sequences when the
    element is strongly-assignable and the bound rule (gated by ignore_sequence_bounds)
-   holds (Table 17); nested structs by recursing on the referenced struct (Table 19).
+   holds (Table 17); nested structs by recursing on the referenced struct (Table 19);
+   enumerated types by the §7.2.4.4.7 Table 18 enumerated row (enum-assignable-from).
    Unmodeled or mismatched kinds are not assignable."
   (cond
     ((and (ti-primitive-p t1) (ti-primitive-p t2))
@@ -104,8 +110,14 @@
                 (bound>= (type-identifier-bound t1) (type-identifier-bound t2)))
             t)))
     ((and (ti-aggregated-p t1) (ti-aggregated-p t2))
-     (struct-assignable-from (type-identifier-referenced t1)
-                             (type-identifier-referenced t2) opts))
+     (let ((r1 (type-identifier-referenced t1))
+           (r2 (type-identifier-referenced t2)))
+       (cond
+         ((and (minimal-struct-type-p r1) (minimal-struct-type-p r2))
+          (struct-assignable-from r1 r2 opts))
+         ((and (minimal-enumerated-type-p r1) (minimal-enumerated-type-p r2))
+          (enum-assignable-from r1 r2 opts))
+         (t nil))))
     (t nil)))
 
 (defun* strongly-assignable-from (t1 t2 opts)
@@ -136,9 +148,9 @@
 
 (defun* key-erase-ti (ti)
     (function (type-identifier) type-identifier)
-  "KeyErased(TI): for an aggregated type, the same kind referencing a key-erased struct;
-   for any other type, TI unchanged (no keys to erase)."
-  (if (ti-aggregated-p ti)
+  "KeyErased(TI): for an aggregated struct, the same kind referencing a key-erased struct;
+   for any other type (enums included — no keys to erase), TI unchanged."
+  (if (and (ti-aggregated-p ti) (minimal-struct-type-p (type-identifier-referenced ti)))
       (hash-type-identifier (type-identifier-kind ti)
                             :referenced (key-erase-struct (type-identifier-referenced ti)))
       ti))
@@ -253,6 +265,26 @@
                           (every (lambda (b) (member-by-id (minimal-struct-member-id b) m1s)) m2s))
                (return-from result nil))))))
       (return-from result t))))
+
+;;; ---- Enumerated assignability (XTypes §7.2.4.4.7 Table 18 enumerated row) ----
+
+(defun* enum-assignable-from (t1 t2 opts)
+    (function (minimal-enumerated-type minimal-enumerated-type assignability-options) t)
+  "Sound under-approximation of enumerated is-assignable-from (XTypes 1.3 §7.2.4.4.7, Table 18,
+   ENUMERATION_TYPE row): returns NIL only on a PROVABLE incompatibility — two literals sharing
+   a NameHash but carrying different values (the spec forbids same-name/different-value).
+   Literals present on only one side are uncertain (try_construct/must_understand are not on the
+   legacy wire) and DO NOT cause a reject (fail-open: never false-reject a possibly-assignable
+   pair). Table 18's value->name direction and the final-extensibility same-literals clause are
+   intentionally not checked — omitting them only ever adds (harmless) false-accepts that fall
+   back to name-match, never a false-reject. OPTS accepted for uniformity."
+  (declare (ignore opts))
+  (loop for l1 in (minimal-enumerated-type-literals t1)
+        always (let ((l2 (find (enum-literal-name-hash l1)
+                               (minimal-enumerated-type-literals t2)
+                               :key #'enum-literal-name-hash :test #'equalp)))
+                 (or (null l2)
+                     (= (enum-literal-value l1) (enum-literal-value l2))))))
 
 ;;; ---- Structural MINIMAL-equivalence (a verifiable stand-in for EquivalenceHash) ----
 
