@@ -187,6 +187,7 @@
            (dds.types:register-type
             (dds.types:make-type-support
              :name ,tname :type-name ,tname :extensibility ,ext
+             :keyed-p ,(and keys t)
              :serialize (function ,ser)
              :deserialize (function ,des)
              :serialized-size (function ,ssz)

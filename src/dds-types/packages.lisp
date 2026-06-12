@@ -12,7 +12,7 @@
     the concrete sample type.")
   (:export #:type-support #:make-type-support #:type-support-p
            #:type-support-name #:type-support-type-name
-           #:type-support-extensibility
+           #:type-support-extensibility #:type-support-keyed-p
            #:type-support-serialize #:type-support-deserialize
            #:type-support-serialized-size #:type-support-key-hash
            #:type-support-typeobject #:type-support-typeidentifier

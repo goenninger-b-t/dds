@@ -17,6 +17,7 @@ The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, 
 - **`dds.types:type-support`** / **`dds.types:make-type-support`** / **`dds.types:type-support-p`** — the per-type manual vtable the engine funcalls per sample: a `defstruct` of function objects plus the type name, extensibility, structural TypeObject/TypeIdentifier, and data-representation mask. The hot path sees only this struct.
 - **`dds.types:type-support-name`** / **`dds.types:type-support-type-name`** — the registry key / qualified type name.
 - **`dds.types:type-support-extensibility`** — `:final` / `:appendable` / `:mutable`.
+- **`dds.types:type-support-keyed-p`** — the RTPS TopicKind (DDSI-RTPS 2.5 §8.2.4.2): `T` = WITH_KEY (the type has at least one `@key` member), `NIL` = NO_KEY. Set by `define-dds-type`; defaults `T` for back-compat. Lets discovery pick the RTPS entity kind.
 - **`dds.types:type-support-serialize`** / **`dds.types:type-support-deserialize`** / **`dds.types:type-support-serialized-size`** — the codec closures (sample × cursor → sample; cursor → sample; sample → byte count).
 - **`dds.types:type-support-key-hash`** — the 16-octet keyhash closure, or `nil` for a keyless type.
 - **`dds.types:type-support-typeobject`** / **`dds.types:type-support-typeidentifier`** — the structural Minimal struct TypeObject and the type's own TypeIdentifier.

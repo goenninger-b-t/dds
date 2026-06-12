@@ -49,6 +49,25 @@
       (dds.core.arena:teardown-arena arena)
       t)))
 
+(dds.gen:define-dds-type kp-keyed-t (:extensibility :final)
+  (id :i32 :key t)
+  (v :i32))
+
+(dds.gen:define-dds-type kp-nokey-t (:extensibility :final)
+  (a :i32)
+  (b :i32))
+
+(defun* run-keyed-p-test ()
+    (function () t)
+  "type-support-keyed-p is T for a type with a @key member, NIL for a keyless type."
+  (let ((kts (dds.types:find-type-support "kp-keyed-t"))
+        (nts (dds.types:find-type-support "kp-nokey-t")))
+    (%check :keyed-p-keyed (dds.types:type-support-keyed-p kts)
+            "type with @key member should have keyed-p T")
+    (%check :keyed-p-nokey (not (dds.types:type-support-keyed-p nts))
+            "keyless type should have keyed-p NIL"))
+  t)
+
 (dds.gen:define-dds-type gseq (:extensibility :final)
   (n :u16)
   (vals (:sequence :i32))

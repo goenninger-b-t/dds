@@ -5,10 +5,14 @@
    plain defstruct of function objects (serialize/deserialize/serialized-size/key-hash,
    sample-pool alloc+free, FlatData hooks, field accessors) plus the type name,
    extensibility, structural TypeObject/TypeIdentifier, and data-representation mask. The
-   hot path sees only this struct, never the concrete sample type."
+   hot path sees only this struct, never the concrete sample type. KEYED-P records the
+   RTPS TopicKind (DDSI-RTPS 2.5 §8.2.4.2): T = WITH_KEY (the type has at least one @key
+   member), NIL = NO_KEY; it defaults T for back-compat and lets discovery pick the RTPS
+   entity kind."
   (name nil :type (or null string))
   (type-name nil :type (or null string))
   (extensibility :appendable :type (member :final :appendable :mutable))
+  (keyed-p t :type boolean)
   (serialize nil :type (or null function))
   (deserialize nil :type (or null function))
   (serialized-size nil :type (or null function))

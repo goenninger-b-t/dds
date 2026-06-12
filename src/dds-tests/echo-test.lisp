@@ -246,6 +246,7 @@
                  ("xcdr-generated-type"      . run-generated-type-test)
                  ("xcdr-generated-sequence"  . run-generated-sequence-test)
                  ("xcdr-generated-nested"    . run-generated-nested-test)
+                 ("type-support-keyed-p"     . run-keyed-p-test)
                  ("dds-keyhash"              . run-keyhash-test)
                  ("xtypes-model"             . run-xtypes-model-test)
                  ("xtypes-assignability"     . run-assignability-test)
