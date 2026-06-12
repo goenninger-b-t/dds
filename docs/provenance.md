@@ -1061,3 +1061,36 @@ threaded into the DCPS path (`dds.dcps:create-participant :peers`,
 `dds.shapes:run-nokey-{publisher,subscriber} :peers`, Makefile `PEERS=`) and the profile
 pinned to `127.0.0.1`. No change to the NO_KEY mechanism; suite stays 106 green
 (`make test-sbcl`). See `interop/connext/nokey/README.md`.
+
+## M4 (2026-06-12) — liveliness / participant-lease-expiry live test (FR-DCPS S0/S1)
+
+- **What was consulted**: live RTI Connext 7.3.1 on the wire only — its SPDP/participant
+  liveliness behaviour and reliable C_Shape DATA, via
+  `interop/connext/typeobject-corpus/corpus_pub 0 Square C_Shape` (the proven 2026-06-11
+  legacy-gate match peer) plus a raw `lo0` packet capture of a lone Connext participant.
+  **No RTI source, header, or `rtiddsgen` output was read or copied** (clean-room, NFR-IP).
+- **Participant-lease prune — live PASS.** Our DCPS gated subscriber (`make gated-sub`)
+  matched the live Connext writer (`MATCHED 0 -> 1`, gate verdict `:compatible`, 26 C_Shape
+  samples received); after `kill`-ing `corpus_pub`, our `%lease-sweep` (RTPS §8.5.3.3.2)
+  found the participant stale past its announced `leaseDuration` (shortened to 12 s for the
+  run), purged it, and the DCPS unmatch hook decremented `SUBSCRIPTION_MATCHED`:
+  `MATCHED 1 -> 0 (remote pruned — participant lease expired)`; final `matched=0`,
+  `INCONSISTENT_TOPIC total=0`. This is the FR-DCPS S0 deliverable confirmed against a real
+  Connext peer (offline tests use synthetic disc-nodes).
+- **Finding — RTI proprietary `NDDSPING`, not standard `ParticipantMessageData`.** A raw
+  capture of a lone Connext participant shows its participant-liveliness frames carry the
+  RTPS magic + the literal `NDDSPING` (`52 54 50 53 02 05 01 01 4e 44 44 53 50 49 4e 47`),
+  RTI's vendor ping — **not** the standard RTPS §8.4.13 `ParticipantMessageData` on
+  `0x000200c2`. Mirrors ADR 0009 (RTI emits `PID_TYPE_OBJECT_LB 0x8021`, not
+  `PID_TYPE_INFORMATION 0x0075`): default RTI↔RTI discovery uses the vendor artifact. Our
+  stack implements the **standard** WLP mechanism (the conformant default a non-RTI peer
+  expects), so the live **byte-validation** of `ParticipantMessageData` is deferred to the
+  Fast DDS leg (FR-IO-2), not this RTI run. RTI still accepts the standard
+  `ParticipantMessageData` (spec-mandated), so emitting it toward Connext is safe.
+- **Tooling note**: the bundled `tshark` did not dissect the `lo0` capture in this shell
+  (`Protocols in frame:` empty, sandboxed and un-sandboxed); the RTPS/`NDDSPING` ID is from
+  the raw `capinfos`/hexdump bytes. Re-dissect in the Wireshark GUI for frame-level detail.
+- **Artifacts**: `corpus_pub`/`rtiddsgen` output, the symlinked RTI dylibs, the `.pcap`, and
+  the run logs remain git-ignored (NFR-IP). Tracked: the harness change
+  (`src/dds-shapes/shapes.lisp` gated-sub MATCHED-transition logging) +
+  `interop/connext/liveliness/{USER_QOS_PROFILES.xml,README.md}` + docs.

@@ -450,7 +450,9 @@
    a :compatible verdict matches and delivers samples; an :incompatible verdict joins
    the INCONSISTENT_TOPIC path (no match, no data). Sets DDS.DCPS:*TYPE-COMPAT-LOG* to
    stdout so the gate verdict line is visible. LOCAL-TYPE 'shape-type' is the compatible
-   C_Shape; 'shape-mismatch' is the incompatible (shapesize i64) variant. SECONDS 0 =
+   C_Shape; 'shape-mismatch' is the incompatible (shapesize i64) variant. Logs every
+   SUBSCRIPTION_MATCHED transition — an increase on a compatible match, a decrease when a
+   vanished peer is pruned by participant-lease expiry (FR-DCPS S0). SECONDS 0 =
    forever (Ctrl-C)."
   (unless (dds.types:find-type-support local-type)
     (error "run-gated-subscriber: no registered type-support ~s" local-type))
@@ -463,7 +465,7 @@
       (format t "~&[gated-sub] ~a/~a local-type=~a domain=~d (multicast 239.255.0.1). Gate verdict + samples below.~%"
               topic type-name local-type domain)
       (let ((fa (dds.types:type-support-field-accessors ts))
-            (seen 0) (start (get-internal-real-time)) (matched-reported nil))
+            (seen 0) (start (get-internal-real-time)) (last-matched 0))
         (flet ((field (s name) (funcall (cdr (assoc name fa :test #'string-equal)) s)))
           (unwind-protect
                (loop
@@ -480,9 +482,12 @@
                        (format t "~&[gated-sub] skipped undeliverable sample (~a) — gate rejected peer?~%"
                                (type-of e)))))
                  (let ((ms (dds.dcps:matched-count p)))
-                   (when (and (plusp ms) (not matched-reported))
-                     (setf matched-reported t)
-                     (format t "~&[gated-sub] MATCHED ~d remote endpoint(s) (gate verdict :compatible).~%" ms)))
+                   (when (/= ms last-matched)
+                     (format t "~&[gated-sub] MATCHED ~d -> ~d remote endpoint(s)~@[ (~a)~].~%"
+                             last-matched ms
+                             (cond ((> ms last-matched) "gate verdict :compatible")
+                                   (t "remote pruned — participant lease expired")))
+                     (setf last-matched ms)))
                  (let ((it (dds.dcps:get-inconsistent-topic-status tp)))
                    (when (plusp (dds.dcps:inconsistent-topic-status-total-count it))
                      (format t "~&[gated-sub] INCONSISTENT_TOPIC total=~d (gate verdict :incompatible -> REJECTED, no data).~%"
