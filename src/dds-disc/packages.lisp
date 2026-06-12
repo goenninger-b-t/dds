@@ -18,6 +18,7 @@
            #:disc-node-discovered-count #:disc-node-discovered-prefixes
            #:disc-node-matched-count #:disc-node-matched-topics
            #:disc-node-on-match #:disc-node-on-unmatch
+           #:disc-node-on-liveliness-changed #:%liveliness-sweep
            #:disc-node-on-incompatible-qos #:disc-node-on-sample
            #:disc-node-on-inconsistent-topic
            #:disc-node-type-gate #:resume-parked-matches #:disc-node-parked-count

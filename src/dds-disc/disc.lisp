@@ -24,7 +24,10 @@
    (PM-WRITER-SN, REMOTE-LIVELINESS) across the receiver thread. REMOTE-LIVELINESS maps
    a (12-octet remote prefix . ParticipantMessageData kind) to the internal-real-time
    stamp of the last inbound liveliness assertion from that participant (RTPS 2.5
-   §8.4.13.5); PM-WRITER-SN is the BuiltinParticipantMessageWriter's monotonic SN. ON-MATCH /
+   §8.4.13.5); PM-WRITER-SN is the BuiltinParticipantMessageWriter's monotonic SN.
+   LIVELINESS-STATE maps a matched remote-writer GUID to its current alive-p flag so
+   %liveliness-sweep fires ON-LIVELINESS-CHANGED only on an alive<->not-alive TRANSITION
+   (RTPS 2.5 §8.4.13). ON-MATCH /
    ON-INCOMPATIBLE-QOS / ON-SAMPLE are optional control-plane hooks the DCPS layer
    installs to surface matched/incompatible events and newly-arrived user data to the
    application (DDS statuses, listeners, and the condvar-driven WaitSet wake); each
@@ -80,6 +83,7 @@
   ;; Writer Liveliness Protocol state (participant-message.lisp, RTPS 2.5 §8.4.13)
   (pm-writer-sn 1 :type integer) ; BuiltinParticipantMessageWriter per-writer SN (1-based)
   (remote-liveliness (make-hash-table :test 'equalp) :type hash-table) ; (12-octet prefix . kind) -> %lease-now stamp
+  (liveliness-state (make-hash-table :test 'equalp) :type hash-table) ; matched remote-writer 16-octet GUID -> alive-p (reader-side LIVELINESS_CHANGED transition flag)
 
   (on-data nil :type (or null function))
   (on-heartbeat nil :type (or null function))
@@ -89,6 +93,7 @@
   (on-nack-frag nil :type (or null function))
   (on-match nil :type (or null function))
   (on-unmatch nil :type (or null function))
+  (on-liveliness-changed nil :type (or null function))
   (type-gate nil :type (or null function))
   (on-incompatible-qos nil :type (or null function))
   (on-inconsistent-topic nil :type (or null function))
@@ -322,7 +327,8 @@
 
 ;; Writer Liveliness Protocol handlers: defined in participant-message.lisp (loaded after this file).
 (declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)) t) %on-participant-message)
-         (ftype (function (disc-node) (eql t)) assert-participant-liveliness))
+         (ftype (function (disc-node) (eql t)) assert-participant-liveliness)
+         (ftype (function (disc-node) (eql t)) %liveliness-sweep))
 
 (defun* %builtin-reader-nl (node prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
@@ -393,8 +399,9 @@
   "Send NODE's local publications (SEDP publications writer) and subscriptions
    (SEDP subscriptions writer) to every discovered participant's metatraffic
    unicast locator (RTPS 2.5 §8.5.4). Also drives tl-sweep (expiring overdue
-   TypeLookup queries) and %lease-sweep (pruning lease-expired participants, RTPS 2.5
-   §8.5.3.3.2) on the periodic announce cadence."
+   TypeLookup queries), %lease-sweep (pruning lease-expired participants, RTPS 2.5
+   §8.5.3.3.2), and %liveliness-sweep (reader-side Writer Liveliness timing -> the
+   ON-LIVELINESS-CHANGED hook, RTPS 2.5 §8.4.13) on the periodic announce cadence."
   (dolist (p (%discovered-participants node))
     (let ((loc (dds.rtps.discovery:usable-udpv4-locator
                 (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))))
@@ -429,6 +436,7 @@
                                nil host port))))))))
   (tl-sweep node)
   (%lease-sweep node)
+  (%liveliness-sweep node)
   t)
 
 (defun* %lease-now ()

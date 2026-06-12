@@ -146,6 +146,89 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (gethash (cons prefix kind) (disc-node-remote-liveliness node))))
 
+(defun* %liveliness-kind-for (qos-kind)
+    (function (symbol) (or null (unsigned-byte 32)))
+  "The ParticipantMessageData kind that carries a matched writer's LIVELINESS QoS kind
+   over this protocol (RTPS 2.5 §8.4.13.5): :automatic -> +pmd-kind-automatic+,
+   :manual-by-participant -> +pmd-kind-manual-by-participant+. :manual-by-topic is NOT
+   carried here (§8.7.2.2.3) and answers NIL (no protocol stamp gates it)."
+  (case qos-kind
+    (:automatic dds.rtps.discovery:+pmd-kind-automatic+)
+    (:manual-by-participant dds.rtps.discovery:+pmd-kind-manual-by-participant+)
+    (t nil)))
+
+(defun* %lease-seconds (duration)
+    (function (dds.qos:qos-duration) integer)
+  "A matched writer's offered LIVELINESS lease_duration as whole seconds (the granularity
+   %lease-stale-p compares against), rounding the sub-second nanosec part up so a fresh
+   assertion within the lease is never prematurely judged stale (RTPS 2.5 §8.4.13)."
+  (+ (dds.qos:qos-duration-sec duration)
+     (if (plusp (dds.qos:qos-duration-nanosec duration)) 1 0)))
+
+(defun* %fire-liveliness-changed (node guid alive-p)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) t) t)
+  "Invoke the ON-LIVELINESS-CHANGED hook (if installed) OUTSIDE the node lock for a
+   matched remote writer GUID whose liveliness crossed alive<->not-alive (RTPS 2.5
+   §8.4.13 / DDS 1.4 §2.2.4.1). ALIVE-P is the NEW state."
+  (when (disc-node-on-liveliness-changed node)
+    (funcall (disc-node-on-liveliness-changed node) guid alive-p))
+  t)
+
+(defun* %matched-writer-alive-p (node remote now)
+    (function (disc-node dds.rtps.discovery:endpoint-data (integer 0)) t)
+  "Whether matched remote writer REMOTE is currently asserting liveliness (RTPS 2.5
+   §8.4.13): T iff a liveliness assertion of REMOTE's offered LIVELINESS kind has been
+   received from its participant within REMOTE's offered lease_duration. A writer with an
+   infinite lease, or a MANUAL_BY_TOPIC writer (not carried by this protocol), is treated
+   as always alive (no protocol stamp can mark it stale). CALLER HOLDS the node lock."
+  (let* ((qos (dds.rtps.discovery:endpoint-data-qos remote))
+         (kind (%liveliness-kind-for (dds.qos:qos-liveliness qos))))
+    (if (null kind)
+        t   ; MANUAL_BY_TOPIC: not gated by the PM protocol -> alive
+        (let ((lease (%lease-seconds (dds.qos:qos-liveliness-lease qos)))
+              (prefix (subseq (dds.rtps.discovery:endpoint-data-guid remote) 0 12))
+              (stamp nil))
+          (setf stamp (gethash (cons prefix kind) (disc-node-remote-liveliness node)))
+          (cond ((>= lease #x7fffffff) t)        ; infinite lease -> always alive
+                ((null stamp) nil)               ; never asserted -> not alive
+                (t (not (%lease-stale-p stamp lease now))))))))
+
+(defun* %liveliness-sweep (node)
+    (function (disc-node) (eql t))
+  "Reader-side Writer Liveliness timing (RTPS 2.5 §8.4.13, DDS 1.4 §2.2.4.1): on the
+   announce cadence, for every MATCHED remote WRITER decide alive vs not-alive from the
+   latest inbound liveliness assertion of the writer's offered LIVELINESS kind against
+   that writer's offered lease_duration (%matched-writer-alive-p). Fire ON-LIVELINESS-
+   CHANGED only on a TRANSITION (LIVELINESS-STATE flips), so the DCPS LIVELINESS_CHANGED
+   status counts each alive<->not-alive crossing once, never every sweep. Transitions are
+   collected under the node lock and the hook fired OUTSIDE it (a listener must never
+   deadlock the receiver). Idempotent between transitions."
+  (let ((transitions '()))
+    (dds.pal:with-lock ((disc-node-lock node))
+      (let ((now (%lease-now)) (seen '()))
+        (maphash
+         (lambda (guid remote)
+           (when (%writer-guid-p guid)
+             (push guid seen)
+             (let* ((alive (%matched-writer-alive-p node remote now))
+                    (prev (multiple-value-bind (v present)
+                              (gethash guid (disc-node-liveliness-state node))
+                            (if present v t))))   ; a freshly matched writer starts ALIVE
+               (unless (eq alive prev)
+                 (push (cons (copy-seq guid) alive) transitions))
+               (setf (gethash (copy-seq guid) (disc-node-liveliness-state node)) alive))))
+         (disc-node-matches node))
+        ;; Drop liveliness-state for writers no longer matched (lease-swept) so a
+        ;; re-match restarts at ALIVE rather than inheriting a stale NOT_ALIVE flag.
+        (let ((stale '()))
+          (maphash (lambda (guid v)
+                     (declare (ignore v))
+                     (unless (member guid seen :test #'equalp) (push guid stale)))
+                   (disc-node-liveliness-state node))
+          (dolist (guid stale) (remhash guid (disc-node-liveliness-state node))))))
+    (dolist (tr transitions) (%fire-liveliness-changed node (car tr) (cdr tr)))
+    t))
+
 (defun* run-participant-liveliness-test ()
     (function () (eql t))
   "Writer Liveliness Protocol over UDP (RTPS 2.5 §8.4.13.5): two participants on

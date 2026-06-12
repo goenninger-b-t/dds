@@ -435,6 +435,9 @@
 (defmethod dds.dcps:on-publication-matched ((l capturing-writer-listener) writer status)
   (declare (ignore writer))
   (dds.pal:with-lock ((cap-lock l)) (push (cons :pub-matched status) (cap-hits l))))
+(defmethod dds.dcps:on-liveliness-changed ((l capturing-reader-listener) reader status)
+  (declare (ignore reader))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :liv-changed status) (cap-hits l))))
 
 (defun* cap-snapshot (l)
     (function (capture-mixin) list)
@@ -2082,6 +2085,95 @@
              (%check :um-pub-total-unchanged
                      (= 1 (dds.dcps:publication-matched-status-total-count pm))
                      "writer PUBLICATION_MATCHED total_count must NOT be decremented (monotonic)")))
+      (dds.dcps:delete-participant p))
+    t))
+
+;;; Reader-side Writer Liveliness timing -> LIVELINESS_CHANGED (RTPS 2.5 §8.4.13,
+;;; DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §123-129): %liveliness-sweep, run on the announce
+;;; cadence, judges each MATCHED remote writer alive/not-alive from the latest inbound
+;;; liveliness assertion of its offered LIVELINESS kind vs its offered lease_duration,
+;;; firing on_liveliness_changed only on an alive<->not-alive TRANSITION. The DCPS hook
+;;; bumps the local DataReader's LIVELINESS_CHANGED status accordingly. Driven
+;;; DETERMINISTICALLY by backdating the inbound stamp (no real-time wait).
+
+(defun* run-liveliness-changed-test ()
+    (function () t)
+  "A matched remote AUTOMATIC writer whose last liveliness assertion is older than its
+   offered lease_duration is swept NOT_ALIVE: %liveliness-sweep fires on_liveliness_changed
+   with alive_count_change -1 / not_alive_count_change +1 and the reader's LIVELINESS_CHANGED
+   reflects alive_count 0 / not_alive_count 1 / last_publication_handle = that writer's GUID.
+   A subsequent FRESH assertion + sweep transitions back to ALIVE (alive_count_change +1 /
+   not_alive_count_change -1). Deterministic: the stamp is backdated, never timed (RTPS 2.5
+   §8.4.13 / DDS 1.4 §2.2.4.1)."
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p (dds.dcps:create-participant :domain 0))
+        (rl (make-instance 'capturing-reader-listener)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "LivTopic" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp))
+                (node (dds.dcps::dp-node p))
+                ;; A matched remote WRITER (0x02 kind) offering AUTOMATIC liveliness with a
+                ;; finite 1s lease, so a backdated stamp can make it stale.
+                (rw (dds.rtps.discovery:make-endpoint-data
+                     :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x71)))
+                             (setf (aref g 15) #x02) g)
+                     :topic-name "LivTopic" :type-name "ShapeType"
+                     :qos (dds.qos:make-qos :reliability :reliable :liveliness :automatic
+                                            :liveliness-lease (dds.qos:make-qos-duration 1 0))))
+                (prefix (subseq (dds.rtps.discovery:endpoint-data-guid rw) 0 12)))
+           (dds.dcps:set-reader-listener dr rl '(:liveliness-changed))
+           (dds.disc::%record-match node rw)
+           ;; Seed a STALE AUTOMATIC stamp (5s old vs a 1s lease) keyed by the writer's prefix.
+           (setf (gethash (cons (copy-seq prefix) dds.rtps.discovery:+pmd-kind-automatic+)
+                          (dds.disc::disc-node-remote-liveliness node))
+                 (- (dds.disc::%lease-now) (* 5 internal-time-units-per-second)))
+           ;; First sweep: a freshly-matched writer starts ALIVE; the stale stamp drives the
+           ;; alive -> not-alive transition.
+           (dds.disc::%liveliness-sweep node)
+           (let ((hit (cdr (assoc :liv-changed (cap-snapshot rl)))))
+             (%check :liv-not-alive-listener
+                     (and hit (= -1 (dds.dcps:liveliness-changed-status-alive-count-change hit))
+                          (= 1 (dds.dcps:liveliness-changed-status-not-alive-count-change hit)))
+                     "on_liveliness_changed must fire with alive_count_change -1 / not_alive_count_change +1")
+             (%check :liv-not-alive-handle
+                     (and hit (equalp (dds.dcps:liveliness-changed-status-last-publication-handle hit)
+                                      (dds.rtps.discovery:endpoint-data-guid rw)))
+                     "last_publication_handle must be the not-alive writer's GUID"))
+           (let ((s (dds.dcps:get-liveliness-changed-status dr)))
+             (%check :liv-not-alive-counts
+                     (and (zerop (dds.dcps:liveliness-changed-status-alive-count s))
+                          (= 1 (dds.dcps:liveliness-changed-status-not-alive-count s)))
+                     "reader LIVELINESS_CHANGED must read alive_count 0 / not_alive_count 1 once stale")
+             (%check :liv-change-reset
+                     (and (zerop (dds.dcps:liveliness-changed-status-alive-count-change s))
+                          (zerop (dds.dcps:liveliness-changed-status-not-alive-count-change s)))
+                     "get_liveliness_changed_status must reset the *_change counters"))
+           ;; A re-sweep with no new stamp must NOT re-fire (no transition).
+           (dds.disc::%liveliness-sweep node)
+           (let ((s (dds.dcps:get-liveliness-changed-status dr)))
+             (%check :liv-no-refire
+                     (and (zerop (dds.dcps:liveliness-changed-status-alive-count-change s))
+                          (zerop (dds.dcps:liveliness-changed-status-not-alive-count-change s)))
+                     "a re-sweep without a transition must not bump the *_change counters"))
+           ;; A FRESH assertion + sweep transitions back to ALIVE. The listener snapshot is
+           ;; the first observer of the +1/-1 change (it resets the counters per DDS), so the
+           ;; change deltas are asserted on the snapshot and the cumulative counts on get_status.
+           (dds.pal:with-lock ((cap-lock rl)) (setf (cap-hits rl) '()))
+           (setf (gethash (cons (copy-seq prefix) dds.rtps.discovery:+pmd-kind-automatic+)
+                          (dds.disc::disc-node-remote-liveliness node))
+                 (dds.disc::%lease-now))
+           (dds.disc::%liveliness-sweep node)
+           (let ((hit (cdr (assoc :liv-changed (cap-snapshot rl)))))
+             (%check :liv-alive-again-listener
+                     (and hit (= 1 (dds.dcps:liveliness-changed-status-alive-count-change hit))
+                          (= -1 (dds.dcps:liveliness-changed-status-not-alive-count-change hit)))
+                     "the alive-again transition must fire with alive_count_change +1 / not_alive_count_change -1"))
+           (let ((s (dds.dcps:get-liveliness-changed-status dr)))
+             (%check :liv-alive-again-counts
+                     (and (= 1 (dds.dcps:liveliness-changed-status-alive-count s))
+                          (zerop (dds.dcps:liveliness-changed-status-not-alive-count s)))
+                     "a fresh assertion + sweep must transition back to ALIVE (alive_count 1 / not_alive_count 0)")))
       (dds.dcps:delete-participant p))
     t))
 

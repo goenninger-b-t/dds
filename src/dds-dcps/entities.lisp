@@ -73,6 +73,7 @@
    (sub-matched :initform (make-subscription-matched-status) :accessor dr-sub-matched)
    (req-incompat :initform (make-requested-incompatible-qos-status) :accessor dr-req-incompat)
    (sample-rejected :initform (make-sample-rejected-status) :accessor dr-sample-rejected)
+   (liv-changed :initform (make-liveliness-changed-status) :accessor dr-liv-changed)
    (listener :initform nil :accessor dr-listener)
    (listener-mask :initform '() :accessor dr-listener-mask)
    (conditions :initform '() :accessor dr-conditions)      ; read/query/status conditions bound here
@@ -194,6 +195,8 @@
           (lambda (kind remote) (%on-disc-match p kind remote)))
     (setf (dds.disc:disc-node-on-unmatch node)
           (lambda (direction remote) (%on-disc-unmatch p direction remote)))
+    (setf (dds.disc:disc-node-on-liveliness-changed node)
+          (lambda (guid alive-p) (%on-disc-liveliness-changed p guid alive-p)))
     (setf (dds.disc:disc-node-on-incompatible-qos node)
           (lambda (kind remote bad) (%on-disc-incompatible p kind remote bad)))
     (setf (dds.disc:disc-node-on-sample node)
@@ -531,6 +534,16 @@
       (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-unmatched dw handle))))))
   t)
 
+(defun* %on-disc-liveliness-changed (p remote-writer-guid alive-p)
+    (function (domain-participant (simple-array (unsigned-byte 8) (16)) t) t)
+  "ON-LIVELINESS-CHANGED hook (disc announce thread, %liveliness-sweep): matched remote
+   writer REMOTE-WRITER-GUID crossed alive<->not-alive (ALIVE-P is the NEW state; RTPS 2.5
+   §8.4.13). Bump the local DataReader's LIVELINESS_CHANGED status (DDS 1.4 §2.2.4.1) and
+   fire on_liveliness_changed. The reader is the v1 single user-reader back-ref."
+  (let ((dr (dp-user-reader p)))
+    (when dr (%reader-liveliness-changed dr (copy-seq remote-writer-guid) alive-p)))
+  t)
+
 (defun* %on-disc-incompatible (p kind remote bad)
     (function (domain-participant keyword dds.rtps.discovery:endpoint-data list) t)
   "ON-INCOMPATIBLE-QOS hook: topic+type agreed but RxO failed. :remote-writer -> our
@@ -617,6 +630,40 @@
                 (subscription-matched-status-current-count-change s) 0))))
     (when snapshot (on-subscription-matched (dr-listener dr) dr snapshot))
     (%notify-reader-conditions dr))   ; wake a StatusCondition(:subscription-matched) waiter
+  t)
+
+(defun* %reader-liveliness-changed (dr handle alive-p)
+    (function (data-reader t t) t)
+  "Apply a matched-writer liveliness transition to DR's LIVELINESS_CHANGED status
+   (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §123-129). ALIVE-P T (not-alive -> alive):
+   alive_count++, not_alive_count-- (floored at 0), alive_count_change +1,
+   not_alive_count_change -1. ALIVE-P NIL (alive -> not-alive): the reverse.
+   last_publication_handle := the transitioned writer's GUID (HANDLE). Fires
+   on-liveliness-changed if masked (snapshot + reset the *_change counters per DDS),
+   then wakes the reader's WaitSets."
+  (let ((snapshot nil))
+    (dds.pal:with-lock ((dr-status-lock dr))
+      (let ((s (dr-liv-changed dr)))
+        (if alive-p
+            (progn
+              (incf (liveliness-changed-status-alive-count s))
+              (when (plusp (liveliness-changed-status-not-alive-count s))
+                (decf (liveliness-changed-status-not-alive-count s)))
+              (incf (liveliness-changed-status-alive-count-change s))
+              (decf (liveliness-changed-status-not-alive-count-change s)))
+            (progn
+              (when (plusp (liveliness-changed-status-alive-count s))
+                (decf (liveliness-changed-status-alive-count s)))
+              (incf (liveliness-changed-status-not-alive-count s))
+              (decf (liveliness-changed-status-alive-count-change s))
+              (incf (liveliness-changed-status-not-alive-count-change s))))
+        (setf (liveliness-changed-status-last-publication-handle s) handle)
+        (when (and (dr-listener dr) (member :liveliness-changed (dr-listener-mask dr)))
+          (setf snapshot (copy-liveliness-changed-status s))
+          (setf (liveliness-changed-status-alive-count-change s) 0
+                (liveliness-changed-status-not-alive-count-change s) 0))))
+    (when snapshot (on-liveliness-changed (dr-listener dr) dr snapshot))
+    (%notify-reader-conditions dr))   ; wake a StatusCondition(:liveliness-changed) waiter
   t)
 
 (defun* %writer-unmatched (dw handle)
@@ -749,6 +796,16 @@
     (let ((s (dr-sample-rejected dr)))
       (prog1 (copy-sample-rejected-status s)
         (setf (sample-rejected-status-total-count-change s) 0)))))
+
+(defun* get-liveliness-changed-status (dr)
+    (function (data-reader) liveliness-changed-status)
+  "DataReader::get_liveliness_changed_status — a snapshot; resets the *_change counters
+   per DDS read-resets-change semantics (DDS 1.4 §2.2.4.1)."
+  (dds.pal:with-lock ((dr-status-lock dr))
+    (let ((s (dr-liv-changed dr)))
+      (prog1 (copy-liveliness-changed-status s)
+        (setf (liveliness-changed-status-alive-count-change s) 0
+              (liveliness-changed-status-not-alive-count-change s) 0)))))
 
 ;;; ---- set_listener (DDS 1.4 Entity::set_listener) ----
 

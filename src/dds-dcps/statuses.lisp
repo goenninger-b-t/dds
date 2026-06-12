@@ -86,6 +86,20 @@
   (current-count-change 0 :type integer)
   (last-subscription-handle nil :type (or null (array (unsigned-byte 8) (*)))))
 
+(defstruct* (liveliness-changed-status (:constructor make-liveliness-changed-status)
+                                      (:copier copy-liveliness-changed-status))
+  "DataReader LIVELINESS_CHANGED status (dds_rtf2_dcps.idl §123-129): how many matched
+   DataWriters are currently asserting their liveliness (ALIVE) vs have let it lapse
+   (NOT_ALIVE) within their offered LIVELINESS lease_duration (RTPS 2.5 §8.4.13). On a
+   matched writer going not-alive alive_count decreases + not_alive_count increases (and
+   the reverse on it becoming alive again); the *_change fields accumulate the delta since
+   the last read; last_publication_handle is the most recently transitioned writer's GUID."
+  (alive-count 0 :type integer)
+  (not-alive-count 0 :type integer)
+  (alive-count-change 0 :type integer)
+  (not-alive-count-change 0 :type integer)
+  (last-publication-handle nil :type (or null (array (unsigned-byte 8) (*)))))
+
 (deftype sample-rejected-reason ()
   "DDS SampleRejectedStatusKind (dds_rtf2_dcps.idl §104)."
   '(member :not-rejected :rejected-by-instances-limit

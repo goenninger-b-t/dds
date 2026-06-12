@@ -68,6 +68,12 @@
            #:sample-rejected-status-total-count #:sample-rejected-status-total-count-change
            #:sample-rejected-status-last-reason #:sample-rejected-status-last-instance-handle
            #:get-sample-rejected-status
+           #:liveliness-changed-status
+           #:liveliness-changed-status-alive-count #:liveliness-changed-status-not-alive-count
+           #:liveliness-changed-status-alive-count-change
+           #:liveliness-changed-status-not-alive-count-change
+           #:liveliness-changed-status-last-publication-handle
+           #:get-liveliness-changed-status
            ;; Listeners (FR-DCPS-2)
            #:listener #:data-reader-listener #:data-writer-listener #:topic-listener
            #:on-data-available #:on-subscription-matched #:on-requested-incompatible-qos
