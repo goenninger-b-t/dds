@@ -388,6 +388,7 @@
                  ("dcps-rxo-blocks-match"    . run-dcps-rxo-test)
                  ("dcps-conditions-waitset"  . run-dcps-waitset-test)
                  ("dcps-matched-status"      . run-dcps-matched-status-test)
+                 ("lease-unmatch"            . run-lease-unmatch-test)
                  ("dcps-incompatible-qos"    . run-dcps-incompatible-qos-test)
                  ("dcps-query-condition"     . run-dcps-query-condition-test)
                  ("dcps-condvar-wake"        . run-dcps-condvar-wake-test)

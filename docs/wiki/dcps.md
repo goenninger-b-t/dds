@@ -448,6 +448,11 @@ the source as deferred or simplified — do not rely on them yet:
   state kinds exist in the type but are never produced; the disposed/no-writers generation
   counts, the ranks, `source-timestamp`, and `publication-handle` all stay at their defaults
   (`0` / `nil`).
+- **MATCHED decrements on lease expiry.** When a discovered participant vanishes and its
+  lease expires (RTPS 2.5 §8.5.3.3.2), each pruned match decrements the affected local
+  endpoint's SUBSCRIPTION_MATCHED / PUBLICATION_MATCHED `current_count` (`current_count_change`
+  negative, `last_*_handle` set to the vanished remote's GUID) and fires the matched listener.
+  `total_count` is **never** decremented — it is monotonic per DDS 1.4 §2.2.4.1.
 - **Some statuses are scaffolding only.** Only MATCHED, INCOMPATIBLE_QOS, INCONSISTENT_TOPIC,
   and SAMPLE_REJECTED are produced and surfaced. DEADLINE (`on_*_deadline_missed`), LIVELINESS
   (`on_liveliness_changed` / `on_liveliness_lost`), and SAMPLE_LOST (`on_sample_lost`) have

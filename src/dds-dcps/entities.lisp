@@ -192,6 +192,8 @@
     ;; Install hooks BEFORE the receiver thread starts so no early SEDP match is lost.
     (setf (dds.disc:disc-node-on-match node)
           (lambda (kind remote) (%on-disc-match p kind remote)))
+    (setf (dds.disc:disc-node-on-unmatch node)
+          (lambda (direction remote) (%on-disc-unmatch p direction remote)))
     (setf (dds.disc:disc-node-on-incompatible-qos node)
           (lambda (kind remote bad) (%on-disc-incompatible p kind remote bad)))
     (setf (dds.disc:disc-node-on-sample node)
@@ -515,6 +517,20 @@
                               (%assess-and-record-type-compat dw remote))))))
   t)
 
+(defun* %on-disc-unmatch (p direction remote)
+    (function (domain-participant keyword dds.rtps.discovery:endpoint-data) t)
+  "ON-UNMATCH hook: a previously matched remote endpoint vanished (participant-lease
+   expiry, disc.lisp %lease-sweep). :remote-writer -> our reader lost a publication
+   (SUBSCRIPTION_MATCHED current_count--); :remote-reader -> our writer lost a
+   subscription (PUBLICATION_MATCHED current_count--). The local entity is located the
+   same way as %on-disc-match (the v1 single user reader/writer back-ref). The remote's
+   16-octet GUID is the unmatched handle (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §165/§174)."
+  (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
+    (ecase direction
+      (:remote-writer (let ((dr (dp-user-reader p))) (when dr (%reader-unmatched dr handle))))
+      (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-unmatched dw handle))))))
+  t)
+
 (defun* %on-disc-incompatible (p kind remote bad)
     (function (domain-participant keyword dds.rtps.discovery:endpoint-data list) t)
   "ON-INCOMPATIBLE-QOS hook: topic+type agreed but RxO failed. :remote-writer -> our
@@ -573,6 +589,48 @@
         (incf (publication-matched-status-total-count-change s))
         (incf (publication-matched-status-current-count s))
         (incf (publication-matched-status-current-count-change s))
+        (setf (publication-matched-status-last-subscription-handle s) handle)
+        (when (and (dw-listener dw) (member :publication-matched (dw-listener-mask dw)))
+          (setf snapshot (copy-publication-matched-status s))
+          (setf (publication-matched-status-total-count-change s) 0
+                (publication-matched-status-current-count-change s) 0))))
+    (when snapshot (on-publication-matched (dw-listener dw) dw snapshot)))
+  t)
+
+(defun* %reader-unmatched (dr handle)
+    (function (data-reader t) t)
+  "Decrement DR's SUBSCRIPTION_MATCHED on a lost match (DDS 1.4 §2.2.4.1): current_count--
+   (floored at 0), current_count_change accumulates -1 (mirroring how %reader-matched
+   accumulates +1), last_publication_handle := the unmatched remote's GUID, total_count
+   UNCHANGED (monotonic, dds_rtf2_dcps.idl §174). Fires on-subscription-matched if masked
+   (snapshot + reset the *_change counters per DDS), then wakes the reader's WaitSets."
+  (let ((snapshot nil))
+    (dds.pal:with-lock ((dr-status-lock dr))
+      (let ((s (dr-sub-matched dr)))
+        (when (plusp (subscription-matched-status-current-count s))
+          (decf (subscription-matched-status-current-count s)))
+        (decf (subscription-matched-status-current-count-change s))
+        (setf (subscription-matched-status-last-publication-handle s) handle)
+        (when (and (dr-listener dr) (member :subscription-matched (dr-listener-mask dr)))
+          (setf snapshot (copy-subscription-matched-status s))
+          (setf (subscription-matched-status-total-count-change s) 0
+                (subscription-matched-status-current-count-change s) 0))))
+    (when snapshot (on-subscription-matched (dr-listener dr) dr snapshot))
+    (%notify-reader-conditions dr))   ; wake a StatusCondition(:subscription-matched) waiter
+  t)
+
+(defun* %writer-unmatched (dw handle)
+    (function (data-writer t) t)
+  "Decrement DW's PUBLICATION_MATCHED on a lost match (DDS 1.4 §2.2.4.1): current_count--
+   (floored at 0), current_count_change accumulates -1, last_subscription_handle := the
+   unmatched remote's GUID, total_count UNCHANGED (monotonic, dds_rtf2_dcps.idl §165).
+   Fires on-publication-matched if masked (snapshot + reset the *_change counters)."
+  (let ((snapshot nil))
+    (dds.pal:with-lock ((dw-status-lock dw))
+      (let ((s (dw-pub-matched dw)))
+        (when (plusp (publication-matched-status-current-count s))
+          (decf (publication-matched-status-current-count s)))
+        (decf (publication-matched-status-current-count-change s))
         (setf (publication-matched-status-last-subscription-handle s) handle)
         (when (and (dw-listener dw) (member :publication-matched (dw-listener-mask dw)))
           (setf snapshot (copy-publication-matched-status s))

@@ -108,6 +108,7 @@ Optional callbacks the [DCPS](dcps.md) layer installs to surface events to the a
 (`on-sample` once per stored user sample). All are settable via `setf`.
 
 - `dds.disc:disc-node-on-match` — fired for a newly-matched remote endpoint (drives SUBSCRIPTION/PUBLICATION_MATCHED).
+- `dds.disc:disc-node-on-unmatch` — fired (with `direction` and the remote `endpoint-data`) once per matched remote endpoint pruned by participant-lease expiry (RTPS 2.5 §8.5.3.3.2); DCPS reacts by **decrementing** the local DataReader's SUBSCRIPTION_MATCHED / DataWriter's PUBLICATION_MATCHED `current_count` (`current_count_change` negative; `total_count` stays monotonic, DDS 1.4 §2.2.4.1).
 - `dds.disc:disc-node-on-incompatible-qos` — fired when a remote agreed on topic+type but failed RxO (drives OFFERED/REQUESTED_INCOMPATIBLE_QOS), passing the failing-policy list.
 - `dds.disc:disc-node-on-inconsistent-topic` — fired on a same-name/different-type collision (drives INCONSISTENT_TOPIC).
 - `dds.disc:disc-node-on-sample` — fired when a new user sample is stored (drives DATA_AVAILABLE + the condvar WaitSet wake).

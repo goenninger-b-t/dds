@@ -1999,6 +1999,92 @@
       (dds.disc:stop-node node))
     t))
 
+;;; DCPS-level reaction to a participant-lease unmatch (DDS 1.4 §2.2.4.1,
+;;; dds_rtf2_dcps.idl §165/§174): when the disc layer fires on-unmatch for a vanished
+;;; remote endpoint, the local DataReader's SUBSCRIPTION_MATCHED / DataWriter's
+;;; PUBLICATION_MATCHED current_count DECREASES (current_count_change negative),
+;;; total_count stays monotonic, and the matched listener fires.
+
+(defun* run-lease-unmatch-test ()
+    (function () t)
+  "A matched remote endpoint removed by participant-lease expiry decrements the local
+   DataReader's SUBSCRIPTION_MATCHED current_count (change -1), leaves total_count, and
+   fires on-subscription-matched; the DataWriter/PUBLICATION_MATCHED mirror holds
+   (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §165/§174)."
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p (dds.dcps:create-participant :domain 0))
+        (rl (make-instance 'capturing-reader-listener))
+        (wl (make-instance 'capturing-writer-listener)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "UnmatchTopic" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (pub (dds.dcps:create-publisher p))
+                (dr (dds.dcps:create-datareader sub tp))
+                (dw (dds.dcps:create-datawriter pub tp))
+                (rw (dds.rtps.discovery:make-endpoint-data
+                     :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7)
+                     :topic-name "UnmatchTopic" :type-name "ShapeType"))
+                (rr (dds.rtps.discovery:make-endpoint-data
+                     :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9)
+                     :topic-name "UnmatchTopic" :type-name "ShapeType")))
+           (dds.dcps:set-reader-listener dr rl '(:subscription-matched))
+           (dds.dcps:set-writer-listener dw wl '(:publication-matched))
+           ;; Match a remote writer (reader's SUBSCRIPTION_MATCHED) and a remote reader
+           ;; (writer's PUBLICATION_MATCHED).
+           (dds.dcps::%on-disc-match p :remote-writer rw)
+           (dds.dcps::%on-disc-match p :remote-reader rr)
+           (let ((sm (dds.dcps:get-subscription-matched-status dr))
+                 (pm (dds.dcps:get-publication-matched-status dw)))
+             (%check :um-sub-matched
+                     (and (= 1 (dds.dcps:subscription-matched-status-total-count sm))
+                          (= 1 (dds.dcps:subscription-matched-status-current-count sm)))
+                     "reader SUBSCRIPTION_MATCHED must be total 1 / current 1 after match")
+             (%check :um-pub-matched
+                     (and (= 1 (dds.dcps:publication-matched-status-total-count pm))
+                          (= 1 (dds.dcps:publication-matched-status-current-count pm)))
+                     "writer PUBLICATION_MATCHED must be total 1 / current 1 after match"))
+           ;; The lease-expiry unmatch.
+           (dds.dcps::%on-disc-unmatch p :remote-writer rw)
+           (dds.dcps::%on-disc-unmatch p :remote-reader rr)
+           ;; The matched listeners fire on unmatch, carrying the -1 change BEFORE any
+           ;; get_*_status read resets it (the listener snapshot is the first observer).
+           (let ((sub-hit (cdr (assoc :sub-matched (cap-snapshot rl))))
+                 (pub-hit (cdr (assoc :pub-matched (cap-snapshot wl)))))
+             (%check :um-sub-listener
+                     (and sub-hit
+                          (= -1 (dds.dcps:subscription-matched-status-current-count-change sub-hit)))
+                     "on-subscription-matched must fire on unmatch with current_count_change -1")
+             (%check :um-sub-listener-current
+                     (and sub-hit
+                          (zerop (dds.dcps:subscription-matched-status-current-count sub-hit)))
+                     "the unmatch snapshot's SUBSCRIPTION_MATCHED current_count must be 0")
+             (%check :um-pub-listener
+                     (and pub-hit
+                          (= -1 (dds.dcps:publication-matched-status-current-count-change pub-hit)))
+                     "on-publication-matched must fire on unmatch with current_count_change -1")
+             (%check :um-pub-listener-current
+                     (and pub-hit
+                          (zerop (dds.dcps:publication-matched-status-current-count pub-hit)))
+                     "the unmatch snapshot's PUBLICATION_MATCHED current_count must be 0"))
+           ;; Post-unmatch state read via get_*_status: current_count 0, total_count
+           ;; UNCHANGED (monotonic, never decremented).
+           (let ((sm (dds.dcps:get-subscription-matched-status dr))
+                 (pm (dds.dcps:get-publication-matched-status dw)))
+             (%check :um-sub-current-zero
+                     (zerop (dds.dcps:subscription-matched-status-current-count sm))
+                     "reader SUBSCRIPTION_MATCHED current_count must drop to 0 on unmatch")
+             (%check :um-sub-total-unchanged
+                     (= 1 (dds.dcps:subscription-matched-status-total-count sm))
+                     "reader SUBSCRIPTION_MATCHED total_count must NOT be decremented (monotonic)")
+             (%check :um-pub-current-zero
+                     (zerop (dds.dcps:publication-matched-status-current-count pm))
+                     "writer PUBLICATION_MATCHED current_count must drop to 0 on unmatch")
+             (%check :um-pub-total-unchanged
+                     (= 1 (dds.dcps:publication-matched-status-total-count pm))
+                     "writer PUBLICATION_MATCHED total_count must NOT be decremented (monotonic)")))
+      (dds.dcps:delete-participant p))
+    t))
+
 ;;; TypeLookup builtin endpoints over UDP (M4 Task 3.2, FR-TYPE-3): the four
 ;;; XTypes 1.3 Table 61 service endpoints wired into the discovery node — a client
 ;;; type-lookup-query fetches a peer's TypeObject by EquivalenceHash; the peer's
