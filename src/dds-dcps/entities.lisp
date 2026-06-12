@@ -70,6 +70,7 @@
    (alive :initform t :accessor dw-alive-p)                            ; LIVELINESS_LOST loss-transition flag
    (listener :initform nil :accessor dw-listener)
    (listener-mask :initform '() :accessor dw-listener-mask)
+   (instances :initform (make-hash-table :test 'equalp) :accessor dw-instances) ; 16-octet handle -> :alive (DDS 1.4 §2.2.2.4.2)
    (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock))
   (:documentation "DDS DataWriter: publishes typed samples on a Topic, carrying its
    PUBLICATION_MATCHED, OFFERED_INCOMPATIBLE_QOS and LIVELINESS_LOST statuses and optional
@@ -390,6 +391,55 @@
    for an unkeyed type."
   (let ((kh (dds.types:type-support-key-hash ts)))
     (if kh (funcall kh sample) +instance-handle-nil+)))
+
+(defun* %handle-p (x)
+    (function (t) t)
+  "T iff X is already a 16-octet instance handle (a (simple-array (unsigned-byte 8) (16)))."
+  (typep x '(simple-array (unsigned-byte 8) (16))))
+
+(defun* %resolve-handle (dw sample-or-handle)
+    (function (data-writer t) (simple-array (unsigned-byte 8) (16)))
+  "The 16-octet instance handle for SAMPLE-OR-HANDLE on DW: SAMPLE-OR-HANDLE used directly when
+   it is already a handle, else computed from a sample via the topic type-support key-hash."
+  (if (%handle-p sample-or-handle)
+      sample-or-handle
+      (%instance-handle (topic-type-support (dw-topic dw)) sample-or-handle)))
+
+(defun* register-instance (dw sample)
+    (function (data-writer t) (simple-array (unsigned-byte 8) (16)))
+  "DataWriter::register_instance (DDS 1.4 §2.2.2.4.2.5) — register the instance of SAMPLE and
+   return its 16-octet handle (the type-support key-hash). Records the handle as :alive in the
+   writer's instance table; HANDLE_NIL for an unkeyed type. No wire message is emitted (registration
+   is a writer-local act; the instance becomes visible to readers on the first write/dispose)."
+  (let ((handle (%instance-handle (topic-type-support (dw-topic dw)) sample)))
+    (dds.pal:with-lock ((dw-status-lock dw))
+      (setf (gethash handle (dw-instances dw)) :alive))
+    handle))
+
+(defun* dispose-instance (dw sample-or-handle)
+    (function (data-writer t) (simple-array (unsigned-byte 8) (16)))
+  "DataWriter::dispose (DDS 1.4 §2.2.2.4.2.10) — dispose the instance named by SAMPLE-OR-HANDLE
+   (a sample or a registered handle): emit a no-payload dispose DATA (StatusInfo Disposed, RTPS 2.5
+   §9.6.4.9) over the reliable engine so matched readers see NOT_ALIVE_DISPOSED. Returns the handle."
+  (let ((handle (%resolve-handle dw sample-or-handle))
+        (node (dp-node (pub-participant (dw-publisher dw)))))
+    (dds.disc:dispose-instance node handle)
+    (assert-liveliness dw)
+    handle))
+
+(defun* unregister-instance (dw sample-or-handle)
+    (function (data-writer t) (simple-array (unsigned-byte 8) (16)))
+  "DataWriter::unregister_instance (DDS 1.4 §2.2.2.4.2.7) — unregister the instance named by
+   SAMPLE-OR-HANDLE: emit a no-payload unregister DATA (StatusInfo Unregistered, RTPS 2.5 §9.6.4.9)
+   over the reliable engine, relinquishing this writer's ownership of the instance. Drops the handle
+   from the writer's instance table. Returns the handle."
+  (let ((handle (%resolve-handle dw sample-or-handle))
+        (node (dp-node (pub-participant (dw-publisher dw)))))
+    (dds.disc:unregister-instance node handle)
+    (dds.pal:with-lock ((dw-status-lock dw))
+      (remhash handle (dw-instances dw)))
+    (assert-liveliness dw)
+    handle))
 
 (defun* %resource-reject-reason (dr handle)
     (function (data-reader t) symbol)

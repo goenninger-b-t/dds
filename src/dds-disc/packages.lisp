@@ -28,6 +28,8 @@
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:publish-sample #:node-sample-count #:node-sample #:node-sample-sns
+           #:dispose-instance #:unregister-instance
+           #:node-lifecycle-change #:node-lifecycle-count
            #:*debug-drop-fragment-numbers*
            #:*debug-drop-sample-numbers*
            #:node-discovered-participants #:resolved-destination #:node-acks-in
@@ -40,4 +42,5 @@
            #:run-spdp-discovery-test #:run-sedp-discovery-test
            #:run-mcast-discovery-test #:run-dataplane-test
            #:run-large-dataplane-test #:run-participant-liveliness-test
-           #:run-locator-filter-test #:run-lost-final-sample-test))
+           #:run-locator-filter-test #:run-lost-final-sample-test
+           #:run-dispose-dataplane-test #:run-dispose-repair-test))

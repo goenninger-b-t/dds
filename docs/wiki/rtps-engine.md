@@ -145,9 +145,9 @@ The change store honouring HISTORY (KEEP_LAST depth / KEEP_ALL) and RESOURCE_LIM
 (max_samples) (FR-RTPS-5). A hot-path package: the `cache-change` struct and the cache
 ops are `defstruct` + monomorphic functions, no CLOS.
 
-- `dds.rtps.history:make-cache-change` *(&key kind writer-guid sn instance-key-hash serialized-payload source-timestamp inline-qos)* — construct a `CacheChange`: the pooled per-sample record (change `KIND` `:data`/`:dispose`/`:unregister`, writer GUID, sequence number, instance key hash, serialized payload, source timestamp, inline QoS).
+- `dds.rtps.history:make-cache-change` *(&key kind writer-guid sn instance-key-hash serialized-payload status-info source-timestamp inline-qos)* — construct a `CacheChange`: the pooled per-sample record (change `KIND` `:data`/`:dispose`/`:unregister`, writer GUID, sequence number, instance key hash, serialized payload, `STATUS-INFO` flags (StatusInfo_t for a dispose/unregister, §9.6.4.9), source timestamp, inline QoS).
 - `dds.rtps.history:cache-change` / `cache-change-p` — the struct type and its predicate.
-- Accessors: `cache-change-kind`, `cache-change-writer-guid`, `cache-change-sn`, `cache-change-instance-key-hash`, `cache-change-serialized-payload`, `cache-change-source-timestamp`, `cache-change-inline-qos`.
+- Accessors: `cache-change-kind`, `cache-change-writer-guid`, `cache-change-sn`, `cache-change-instance-key-hash`, `cache-change-serialized-payload`, `cache-change-status-info`, `cache-change-source-timestamp`, `cache-change-inline-qos`.
 - `dds.rtps.history:make-history-cache` *(kind depth resource-limits type-support)* — create a `HistoryCache` with HISTORY (`KIND` `:keep-last`/`:keep-all`, `DEPTH`) and RESOURCE_LIMITS (an integer, a plist with `:max-samples`, or `NIL` = unlimited).
 - `dds.rtps.history:history-cache` — the struct type.
 - `dds.rtps.history:hc-add-change` *(hc change)* — add a change, enforcing HISTORY + RESOURCE_LIMITS; returns `:OK`, `:DUPLICATE` (SN already present), or `:REJECTED-RESOURCE-LIMITS` (KEEP_ALL at max_samples). KEEP_LAST evicts the lowest SN when at depth.
@@ -167,11 +167,12 @@ in [Discovery](discovery.md)'s data plane.
 
 - `dds.rtps.reliable:make-rtps-writer` *(&key hc last-sn hb-count proxies)* — construct a reliable writer (pass `:hc` a `HistoryCache`).
 - `dds.rtps.reliable:rtps-writer` — the struct type.
-- `dds.rtps.reliable:writer-write` *(writer payload)* — add a new change to the writer's HistoryCache; returns its sequence number.
+- `dds.rtps.reliable:writer-write` *(writer payload)* — add a new `:data` change to the writer's HistoryCache; returns its sequence number.
+- `dds.rtps.reliable:writer-lifecycle-change` *(writer key-hash status-flags)* — add a no-payload **dispose/unregister** change for the instance named by `KEY-HASH` (16 octets); the `KIND` is derived from `STATUS-FLAGS` (`status-info->kind`). It occupies a real SN, so it is reliably ordered and ACKNACK-repairable like any DATA (§8.4.2.2 / §9.6.4.9). Returns the SN.
 - `dds.rtps.reliable:writer-heartbeat` *(writer)* — return `(values firstSN lastSN count)` for a HEARTBEAT (§8.3.7.5).
-- `dds.rtps.reliable:writer-unsent-list` *(writer reader-id)* — the **unsent** changes for `READER-ID` (`next_unsent_change`, §8.4.2.2): the changes with SN ≥ the reader's *unsent* watermark, as `(sn . payload)` in SN order; advances that watermark past the highest SN returned so each change is **pushed exactly once** under `pushMode`. The data plane (`%push-data`) pushes this, so N pre-ACKNACK writes emit N DATA submessages, not N(N+1)/2. Lost/late changes are repaired only via the ACKNACK path (`writer-on-acknack`).
-- `dds.rtps.reliable:writer-data-list` *(writer reader-id)* — changes not yet acked by `READER-ID` (SN ≥ the *acknowledged* watermark), as a list of `(sn . payload)` in SN order. Not used by the push path (that uses `writer-unsent-list`); retained for diagnostics/tests.
-- `dds.rtps.reliable:writer-on-acknack` *(writer reader-id base numbits bitmap)* — process an ACKNACK (§8.3.7.1): confirm SN < `BASE`, then for each NACKed SN return a resend if present, else a GAP. Returns `(values data-resends gap-sns)`, `data-resends` a list of `(sn . payload)`. The `requested_changes` repair path; independent of the unsent watermark.
+- `dds.rtps.reliable:writer-unsent-list` *(writer reader-id)* — the **unsent** changes for `READER-ID` (`next_unsent_change`, §8.4.2.2): the changes with SN ≥ the reader's *unsent* watermark, **as `CacheChange` objects** in SN order; advances that watermark past the highest SN returned so each change is **pushed exactly once** under `pushMode`. Returning the `CacheChange` (not a `(sn . payload)` cell) lets the data plane dispatch on `cache-change-kind` (a `:data` change → DATA/DATA_FRAG; a `:dispose`/`:unregister` change → a no-payload dispose DATA). The data plane (`%push-data`) pushes this, so N pre-ACKNACK writes emit N DATA submessages, not N(N+1)/2. Lost/late changes are repaired only via the ACKNACK path (`writer-on-acknack`).
+- `dds.rtps.reliable:writer-data-list` *(writer reader-id)* — changes not yet acked by `READER-ID` (SN ≥ the *acknowledged* watermark), as a list of `CacheChange` objects in SN order. Not used by the push path (that uses `writer-unsent-list`); retained for diagnostics/tests.
+- `dds.rtps.reliable:writer-on-acknack` *(writer reader-id base numbits bitmap)* — process an ACKNACK (§8.3.7.1): confirm SN < `BASE`, then for each NACKed SN return a resend if present, else a GAP. Returns `(values data-resends gap-sns)`, `data-resends` a list of `CacheChange` objects (so a resend dispatches `:data` vs `:dispose`/`:unregister` exactly as the initial push). The `requested_changes` repair path; independent of the unsent watermark.
 - `dds.rtps.reliable:get-reader-proxy` *(writer reader-id)* — the `ReaderProxy` for `READER-ID`, created on first use.
 - `dds.rtps.reliable:reader-proxy` — the struct type (the writer-side proxy for one matched reader).
 - `dds.rtps.reliable:reader-proxy-acked-base` — the reader's **acknowledged** watermark (it has acknowledged all SN < acked-base; advanced by ACKNACK). Distinct from the **unsent** watermark `reader-proxy-unsent-base` (= 1 + highestSentChangeSN; the send-once push watermark, §8.4.2.2).
@@ -303,9 +304,11 @@ to show the clean handshake).
       (multiple-value-bind (resends gaps)
           (dds.rtps.reliable:writer-on-acknack writer rid base numbits bitmap)
         (declare (ignore gaps))
-        ;; "deliver" each NACKed change to the reader
-        (dolist (cell resends)
-          (dds.rtps.reliable:reader-on-data reader wid (car cell) (cdr cell))))))
+        ;; "deliver" each NACKed CacheChange to the reader
+        (dolist (ch resends)
+          (dds.rtps.reliable:reader-on-data
+           reader wid (dds.rtps.history:cache-change-sn ch)
+           (dds.rtps.history:cache-change-serialized-payload ch))))))
   (dds.rtps.reliable:reader-complete-p reader wid))      ; => T
 ```
 
@@ -325,7 +328,7 @@ resend) for the evicted range and a resend for what is still cached. Adapted fro
   (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
     (multiple-value-bind (resends gaps)
         (dds.rtps.reliable:writer-on-acknack writer rid base numbits bitmap)
-      (list (mapcar #'car resends)    ; => (4 5)   present SNs resent
+      (list (mapcar #'dds.rtps.history:cache-change-sn resends) ; => (4 5)   present SNs resent
             gaps))))                  ; => (1 2 3)  evicted SNs gapped
 ```
 

@@ -7,13 +7,15 @@
 (defstruct* (cache-change (:constructor make-cache-change))
   "An RTPS CacheChange (IMPLEMENTATION-PLAN §7.4): the pooled per-sample record held
    in a HistoryCache — change KIND (:data/:dispose/:unregister), writer GUID,
-   sequence number, instance key hash, serialized payload, source timestamp, and
-   inline QoS."
+   sequence number, instance key hash, serialized payload, STATUS-INFO flags
+   (StatusInfo_t for a dispose/unregister, RTPS 2.5 §9.6.4.9), source timestamp,
+   and inline QoS."
   (kind :data :type (member :data :dispose :unregister))
   (writer-guid nil :type (or null (array (unsigned-byte 8) (*))))
   (sn 0 :type (integer 0))
   (instance-key-hash nil :type (or null (array (unsigned-byte 8) (*))))
   (serialized-payload nil :type (or null (array (unsigned-byte 8) (*))))  ; SerializedPayload octets
+  (status-info 0 :type (unsigned-byte 8))                                 ; StatusInfo_t flags (RTPS 2.5 §9.6.4.9)
   (source-timestamp 0 :type integer)
   (inline-qos nil :type (or null (array (unsigned-byte 8) (*)))))         ; serialized inline-QoS ParameterList
 

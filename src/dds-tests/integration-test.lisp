@@ -212,6 +212,54 @@
       (dds.dcps:delete-participant p2))
     t))
 
+(defun* run-dcps-dispose-test ()
+    (function () t)
+  "DCPS instance lifecycle S1 (writer side, DDS 1.4 §2.2.2.4.2): on the keyed shape-type a
+   DataWriter register_instance returns a 16-octet handle; write the sample; then dispose the
+   instance. Asserts register/dispose/unregister do not error, the handle is the type-support
+   key-hash, and the dispose's no-payload DATA reaches the subscriber's engine classified :dispose
+   carrying that handle (RTPS 2.5 §9.6.4.9). The reader-side instance-state transition is S2."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (sample (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                (node2 (dds.dcps::dp-node p2)))
+           (declare (ignore dr))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :dcps-disp-matched (plusp (dds.dcps:matched-count p1))
+                   "DataWriter/DataReader did not match via DCPS")
+           (let ((handle (dds.dcps:register-instance dw sample)))
+             (%check :dcps-disp-handle
+                     (equalp handle (funcall (dds.types:type-support-key-hash ts) sample))
+                     "register_instance handle must equal the type-support key-hash")
+             (dds.dcps:write-sample dw sample)                  ; SN 1 ALIVE
+             (loop repeat 100 until (plusp (dds.disc:node-sample-count node2))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (let ((rh (dds.dcps:dispose-instance dw handle)))  ; SN 2 dispose
+               (%check :dcps-disp-returns (equalp rh handle) "dispose returns the instance handle"))
+             (loop repeat 150 until (plusp (dds.disc:node-lifecycle-count node2))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (%check :dcps-disp-received (plusp (dds.disc:node-lifecycle-count node2))
+                     "subscriber engine never received the dispose DATA")
+             (let ((lc (dds.disc:node-lifecycle-change node2 2)))
+               (%check :dcps-disp-classified
+                       (and lc (eq (first lc) :dispose) (equalp (second lc) handle))
+                       "dispose DATA classified :dispose with the instance handle"))
+             ;; unregister must not error
+             (dds.dcps:unregister-instance dw handle)))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
 ;;; No-key DCPS round-trip (FR-RTPS S0): a keyless type's DataWriter/DataReader come
 ;;; up NO_KEY (writer 0x03/id 0x103, reader 0x04/id 0x104) — selected by DCPS from the
 ;;; type's keyed-ness — discover, match same-kind, and deliver a sample end to end.

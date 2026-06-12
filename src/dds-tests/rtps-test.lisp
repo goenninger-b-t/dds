@@ -486,8 +486,9 @@
                  (dds.rtps.reliable:reader-on-data reader wid sn payload))))
       ;; initial blast: reversed (reorder) + a duplicate delivery of SN 1
       (deliver 1 (map '(simple-array (unsigned-byte 8) (*)) #'char-code "m1") 0)
-      (dolist (cell (reverse (dds.rtps.reliable:writer-data-list writer rid)))
-        (deliver (car cell) (cdr cell) 0))
+      (dolist (ch (reverse (dds.rtps.reliable:writer-data-list writer rid)))
+        (deliver (dds.rtps.history:cache-change-sn ch)
+                 (dds.rtps.history:cache-change-serialized-payload ch) 0))
       (let ((done nil))
         (dotimes (round 8)
           (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
@@ -498,7 +499,9 @@
             (multiple-value-bind (resends gaps)
                 (dds.rtps.reliable:writer-on-acknack writer rid base numbits bitmap)
               (declare (ignore gaps))
-              (dolist (cell resends) (deliver (car cell) (cdr cell) (1+ round))))))
+              (dolist (ch resends)
+                (deliver (dds.rtps.history:cache-change-sn ch)
+                         (dds.rtps.history:cache-change-serialized-payload ch) (1+ round))))))
         (when (dds.rtps.reliable:reader-complete-p reader wid) (setf done t))
         (%check :reliable-converged done "reliable delivery did not converge")
         (let ((recv (dds.rtps.reliable:writer-proxy-received
@@ -524,9 +527,13 @@
       (%check :gap-acknack (and (= base 1) (= numbits 5)) "reader NACKs all of [1,5]")
       (multiple-value-bind (resends gaps)
           (dds.rtps.reliable:writer-on-acknack writer rid base numbits bitmap)
-        (%check :gap-resends (equal '(4 5) (mapcar #'car resends)) "present SNs resent")
+        (%check :gap-resends (equal '(4 5) (mapcar #'dds.rtps.history:cache-change-sn resends))
+                "present SNs resent")
         (%check :gap-gaps (equal '(1 2 3) gaps) "evicted SNs gapped")
-        (dolist (cell resends) (dds.rtps.reliable:reader-on-data reader wid (car cell) (cdr cell)))
+        (dolist (ch resends)
+          (dds.rtps.reliable:reader-on-data reader wid
+                                            (dds.rtps.history:cache-change-sn ch)
+                                            (dds.rtps.history:cache-change-serialized-payload ch)))
         (dds.rtps.reliable:reader-on-gap
          reader wid 1 4 0 (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0))
         (%check :gap-complete (dds.rtps.reliable:reader-complete-p reader wid)
@@ -563,11 +570,12 @@
           (multiple-value-bind (resends gaps)
               (dds.rtps.reliable:writer-on-acknack w rid base numbits bitmap)
             (declare (ignore gaps))
-            (%check :pushonce-repair-sns (equal '(3 50) (mapcar #'car resends))
+            (%check :pushonce-repair-sns
+                    (equal '(3 50) (mapcar #'dds.rtps.history:cache-change-sn resends))
                     "ACKNACK repair resends exactly the NACKed SNs {3,50}, independent of unsent-base")
             (%check :pushonce-repair-payloads
-                    (and (equalp (cdr (first resends)) (pl 3))
-                         (equalp (cdr (second resends)) (pl 50)))
+                    (and (equalp (dds.rtps.history:cache-change-serialized-payload (first resends)) (pl 3))
+                         (equalp (dds.rtps.history:cache-change-serialized-payload (second resends)) (pl 50)))
                     "ACKNACK repair resends the {3,50} payloads byte-exact"))))
       ;; (b) before-baseline: writer-data-list (whole unacked history) sums to 5050 = N(N+1)/2
       (let ((w (mk-writer)) (sum 0))
@@ -1158,4 +1166,73 @@
                      (eq kind :dispose) (equalp kh gkh)
                      (= sflags dds.rtps.message:+statusinfo-disposed+))
                 "dispose DATA parses: no payload, :dispose, key-hash + Disposed surfaced"))))
+  t)
+
+(defun* run-lifecycle-change-list-test ()
+    (function () t)
+  "Test (instance-lifecycle S1, writer side): writer-lifecycle-change adds a no-payload
+   dispose/unregister CacheChange that flows through the kind-aware send list. Asserts: (1) the
+   change derives KIND from StatusInfo and carries the key-hash + status-info, no payload, on a
+   real SN; (2) writer-unsent-list returns the CacheChange (not a payload cell) and advances the
+   unsent watermark EXACTLY ONCE (send-once, RTPS 2.5 §8.4.2.2); (3) writer-on-acknack repairs the
+   dispose by SN, returning the same CacheChange; (4) re-emitting the dispose DATA from the
+   returned change is byte-exact vs the S0 codec (no payload, :dispose, key-hash + Disposed)."
+  (let* ((w (dds.rtps.reliable:make-rtps-writer
+             :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (rid 2)
+         (kh (%dispose-key-hash))
+         (data-pl (octets 1 2 3 4)))
+    ;; SN 1 = ALIVE data, SN 2 = dispose
+    (dds.rtps.reliable:writer-write w data-pl)
+    (let ((dsn (dds.rtps.reliable:writer-lifecycle-change
+                w kh dds.rtps.message:+statusinfo-disposed+)))
+      (%check :lc-sn (= dsn 2) "lifecycle change occupies the next real SN")
+      ;; (1)+(2): unsent-list returns CacheChanges; the dispose is :dispose with key-hash/status, no payload
+      (let ((unsent (dds.rtps.reliable:writer-unsent-list w rid)))
+        (%check :lc-unsent-count (= (length unsent) 2) "both changes pushed once")
+        (let ((dc (second unsent)))
+          (%check :lc-kind (eq (dds.rtps.history:cache-change-kind dc) :dispose)
+                  "dispose change KIND derived from StatusInfo")
+          (%check :lc-keyhash (equalp (dds.rtps.history:cache-change-instance-key-hash dc) kh)
+                  "dispose change carries the 16-octet key-hash")
+          (%check :lc-status (= (dds.rtps.history:cache-change-status-info dc)
+                                dds.rtps.message:+statusinfo-disposed+)
+                  "dispose change carries StatusInfo Disposed")
+          (%check :lc-nopayload (null (dds.rtps.history:cache-change-serialized-payload dc))
+                  "dispose change carries NO serializedPayload"))
+        ;; send-once: a second unsent-list is empty (watermark advanced past SN 2)
+        (%check :lc-sendonce (null (dds.rtps.reliable:writer-unsent-list w rid))
+                "unsent watermark advanced once: nothing left to push"))
+      ;; (3): ACKNACK NACKing SN 2 repairs the dispose, returning the same CacheChange
+      (let ((bm (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+        (dds.rtps.message:seqnum-set-bit bm 0)             ; base 2, delta 0 = SN 2
+        (multiple-value-bind (resends gaps)
+            (dds.rtps.reliable:writer-on-acknack w rid 2 1 bm)
+          (declare (ignore gaps))
+          (%check :lc-repair-count (= (length resends) 1) "ACKNACK repairs exactly SN 2")
+          (let ((rc (first resends)))
+            (%check :lc-repair-kind (eq (dds.rtps.history:cache-change-kind rc) :dispose)
+                    "repaired change is the :dispose CacheChange")
+            ;; (4): re-emit the dispose DATA from the repaired change -> byte-exact S0 form
+            (let* ((buf (dds.core.buffer:make-octet-buffer 256))
+                   (c (dds.core.buffer:cursor buf :endianness :little)))
+              (dds.rtps.message:write-data-dispose
+               c #x00000107 #x00000102 (dds.rtps.history:cache-change-sn rc)
+               (dds.rtps.history:cache-change-instance-key-hash rc)
+               (dds.rtps.history:cache-change-status-info rc))
+              (dds.core.buffer:cursor-reset c)
+              (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+                (declare (ignore le))
+                (%check :lc-emit-hdr
+                        (and (= id dds.rtps.message:+submsg-data+)
+                             (= flags (logior dds.rtps.message:+flag-endianness+
+                                              dds.rtps.message:+data-flag-inline-qos+)))
+                        "repaired dispose DATA header: E+Q only")
+                (multiple-value-bind (r wq sn has off len keyp kind gkh sflags)
+                    (dds.rtps.message:parse-data-body c flags octets)
+                  (declare (ignore r wq off len))
+                  (%check :lc-emit-body
+                          (and (= sn 2) (not has) (not keyp) (eq kind :dispose)
+                               (equalp kh gkh) (= sflags dds.rtps.message:+statusinfo-disposed+))
+                          "repaired dispose DATA: no payload, :dispose, key-hash + Disposed")))))))))
   t)

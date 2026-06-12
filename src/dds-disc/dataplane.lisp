@@ -115,6 +115,25 @@
    non-fragmented DATA %SEND-SAMPLE silently SKIPS, proving lost-final-sample recovery via the
    periodic HEARTBEAT (RTPS 2.5 §8.4.2.2). Never set in production.")
 
+(defun* %send-change (node buf change host port)
+    (function (disc-node dds.core.buffer:octet-buffer dds.rtps.history:cache-change string (unsigned-byte 16)) t)
+  "Send the CacheChange CHANGE to HOST:PORT, dispatching on its KIND (RTPS 2.5 §9.4.5.4):
+   a :data change carries a serializedPayload and goes through %send-sample (one DATA, or a
+   DATA_FRAG series for a large sample); a :dispose/:unregister change carries NO payload and
+   is emitted as a single dispose/unregister DATA (write-data-dispose, flags E+Q, inlineQos =
+   PID_KEY_HASH + PID_STATUS_INFO, §9.6.4.9) — small, never fragmented. The
+   *DEBUG-DROP-SAMPLE-NUMBERS* loss-injection hook applies to BOTH kinds by SN."
+  (let ((sn (dds.rtps.history:cache-change-sn change)))
+    (if (eq (dds.rtps.history:cache-change-kind change) :data)
+        (%send-sample node buf sn (dds.rtps.history:cache-change-serialized-payload change) host port)
+        (unless (and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*))
+          (%send-msg-buf node buf
+                         (lambda (mc) (dds.rtps.message:write-data-dispose
+                                       mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node)
+                                       sn (dds.rtps.history:cache-change-instance-key-hash change)
+                                       (dds.rtps.history:cache-change-status-info change)))
+                         host port)))))
+
 (defun* %send-sample (node buf sn pl host port)
     (function (disc-node dds.core.buffer:octet-buffer integer (simple-array (unsigned-byte 8) (*)) string (unsigned-byte 16)) t)
   "Send sample (SN, PL) to HOST:PORT: one DATA submessage if PL fits *fragment-size*, else a
@@ -169,8 +188,8 @@
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (let ((datas (dds.rtps.reliable:writer-unsent-list writer (disc-node-user-reader-id node))))
         (dolist (peer (%match-destinations node t))   ; DATA + HEARTBEAT -> matched readers
-          (dolist (d datas)
-            (%send-sample node (disc-node-tx-msg node) (car d) (cdr d) (car peer) (cdr peer)))
+          (dolist (ch datas)
+            (%send-change node (disc-node-tx-msg node) ch (car peer) (cdr peer)))
           (%send-user-heartbeat node (disc-node-tx-msg node) first last count (car peer) (cdr peer)))))))
 
 (defun* %push-heartbeat (node)
@@ -198,6 +217,57 @@
   (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload)
   (%push-data node)
   t)
+
+(defun* %dispose-or-unregister (node key-hash status-flags)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) (unsigned-byte 8)) integer)
+  "Writer side: add a dispose/unregister change for the instance named by KEY-HASH (16 octets)
+   to the user writer's HistoryCache (writer-lifecycle-change, deriving the KIND from
+   STATUS-FLAGS), then push DATA + HEARTBEAT to peers exactly like publish-sample — so the
+   lifecycle DATA is sent AND reliably ACKNACK-repairable (RTPS 2.5 §8.4.2.2 / §9.6.4.9).
+   Returns the change's sequence number."
+  (let ((sn (dds.rtps.reliable:writer-lifecycle-change (disc-node-user-writer node) key-hash status-flags)))
+    (%push-data node)
+    sn))
+
+(defun* dispose-instance (node key-hash)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) integer)
+  "Dispose the instance named by KEY-HASH on NODE's user writer (DDS 1.4 §2.2.2.4.2.10): emit a
+   no-payload dispose DATA (StatusInfo Disposed, RTPS 2.5 §9.6.4.9) over the reliable engine.
+   Returns the change SN. Mirrors publish-sample so the dispose is reliably repairable."
+  (%dispose-or-unregister node key-hash dds.rtps.message:+statusinfo-disposed+))
+
+(defun* unregister-instance (node key-hash)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) integer)
+  "Unregister the instance named by KEY-HASH on NODE's user writer (DDS 1.4 §2.2.2.4.2.7): emit a
+   no-payload unregister DATA (StatusInfo Unregistered, RTPS 2.5 §9.6.4.9) over the reliable engine.
+   Returns the change SN. Mirrors publish-sample so the unregister is reliably repairable."
+  (%dispose-or-unregister node key-hash dds.rtps.message:+statusinfo-unregistered+))
+
+(defun* %on-user-lifecycle (node writer-id sn kind key-hash status-flags)
+    (function (disc-node (unsigned-byte 32) integer (member :dispose :unregister) t (unsigned-byte 8)) t)
+  "Reader side: a no-payload dispose/unregister DATA arrived from WRITER-ID (RTPS 2.5 §9.6.4.9).
+   Feed its SN to the reliable reader (so the ACKNACK/HEARTBEAT bookkeeping treats it as a real
+   change) and record (KIND KEY-HASH STATUS-FLAGS) by SN. B's instance-state transition is S2;
+   here the wire is received + classified. Gated on a matched user writer EntityId."
+  (when (and (disc-node-user-reader node) (%user-writer-entityid-p writer-id))
+    (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn
+                                      (make-array 0 :element-type '(unsigned-byte 8)))
+    (dds.pal:with-lock ((disc-node-lock node))
+      (setf (gethash sn (disc-node-lifecycle-changes node)) (list kind key-hash status-flags))))
+  t)
+
+(defun* node-lifecycle-change (node sn)
+    (function (disc-node integer) t)
+  "The received lifecycle change at sequence number SN as (kind key-hash status-flags), or NIL.
+   Lets a subscriber observe that a dispose/unregister DATA was received and classified (S1)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (gethash sn (disc-node-lifecycle-changes node))))
+
+(defun* node-lifecycle-count (node)
+    (function (disc-node) (integer 0))
+  "Number of distinct dispose/unregister lifecycle DATAs the subscriber has received (S1)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (hash-table-count (disc-node-lifecycle-changes node))))
 
 (defun* %deliver-user-sample (node writer-id sn vec)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))) t)
@@ -251,9 +321,9 @@
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
                                                (disc-node-user-reader-id node) base numbits bitmap)
         (declare (ignore gaps))
-        (dolist (peer (%match-destinations node t))   ; retransmit DATA(_FRAG) -> matched readers
-          (dolist (d resends)
-            (%send-sample node (disc-node-rx-tx-msg node) (car d) (cdr d) (car peer) (cdr peer)))))))
+        (dolist (peer (%match-destinations node t))   ; retransmit DATA(_FRAG) / dispose -> matched readers
+          (dolist (ch resends)
+            (%send-change node (disc-node-rx-tx-msg node) ch (car peer) (cdr peer)))))))
   t)
 
 (defun* %on-user-data-frag (node c flags body-len buf)
@@ -325,6 +395,8 @@
   (setf (disc-node-user-reader node) (dds.rtps.reliable:make-rtps-reader))
   (setf (disc-node-on-data node)
         (lambda (wid sn buf poff plen) (%on-user-data node wid sn buf poff plen)))
+  (setf (disc-node-on-lifecycle node)
+        (lambda (wid sn kind kh sf) (%on-user-lifecycle node wid sn kind kh sf)))
   (setf (disc-node-on-heartbeat node)
         (lambda (c flags) (%on-user-heartbeat node c flags)))
   (setf (disc-node-on-data-frag node)
@@ -418,6 +490,137 @@
            (assert (equalp (node-sample node2 1) payload) ()
                    "subscriber received the wrong payload bytes")
            t)
+      (stop-node node1)
+      (stop-node node2))))
+
+(defun* run-dispose-dataplane-test ()
+    (function () (eql t))
+  "Full stack over UDP, instance lifecycle S1 (writer side): two participants discover (SPDP) +
+   match (SEDP); A publishes a sample, then dispose-instance on a 16-octet key-hash. B receives the
+   ALIVE sample, then a no-payload dispose DATA that parse-data-body classifies :dispose carrying
+   A's exact key-hash + StatusInfo Disposed (RTPS 2.5 §9.6.4.9). B's instance-state handling is S2;
+   here the wire is asserted received + classified. The unregister case is exercised too."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
+         (node1 (make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (node2 (make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (payload (make-array 8 :element-type '(unsigned-byte 8)
+                              :initial-contents '(#xDE #xAD #xBE #xEF #x01 #x02 #x03 #x04)))
+         (kh (make-array 16 :element-type '(unsigned-byte 8)
+                         :initial-contents '(#xca #xc2 #x17 #xc3 #x18 #x36 #x3f #x8e
+                                             #xf1 #x16 #x0e #xee #xde #xf9 #xe8 #x86))))
+    (unwind-protect
+         (progn
+           (add-local-writer node1 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-publisher node1)
+           (add-local-reader node2 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-subscriber node2)
+           (setf (disc-node-peers node1) (list (cons "127.0.0.1" (disc-node-port node2))))
+           (setf (disc-node-peers node2) (list (cons "127.0.0.1" (disc-node-port node1))))
+           (start-node node1)
+           (start-node node2)
+           (announce-participant node1)
+           (announce-participant node2)
+           (loop repeat 100
+                 until (and (plusp (disc-node-discovered-count node1))
+                            (plusp (disc-node-discovered-count node2)))
+                 do (sleep 0.02))
+           (announce-endpoints node1)
+           (announce-endpoints node2)
+           (loop repeat 100
+                 until (and (plusp (disc-node-matched-count node1))
+                            (plusp (disc-node-matched-count node2)))
+                 do (sleep 0.02))
+           (assert (and (plusp (disc-node-matched-count node1))
+                        (plusp (disc-node-matched-count node2)))
+                   () "endpoints did not match before publish")
+           (publish-sample node1 payload)              ; SN 1 = ALIVE sample
+           (loop repeat 150 until (plusp (node-sample-count node2)) do (sleep 0.02))
+           (assert (equalp (node-sample node2 1) payload) () "subscriber missed the ALIVE sample")
+           (dispose-instance node1 kh)                 ; SN 2 = dispose DATA
+           (loop repeat 150 until (node-lifecycle-change node2 2) do (sleep 0.02))
+           (let ((lc (node-lifecycle-change node2 2)))
+             (assert lc () "subscriber never received the dispose DATA over UDP")
+             (assert (eq (first lc) :dispose) () "dispose DATA not classified :dispose")
+             (assert (equalp (second lc) kh) () "dispose DATA carried the wrong key-hash")
+             (assert (= (third lc) dds.rtps.message:+statusinfo-disposed+) ()
+                     "dispose DATA carried the wrong StatusInfo flags"))
+           (unregister-instance node1 kh)              ; SN 3 = unregister DATA
+           (loop repeat 150 until (node-lifecycle-change node2 3) do (sleep 0.02))
+           (let ((lc (node-lifecycle-change node2 3)))
+             (assert lc () "subscriber never received the unregister DATA over UDP")
+             (assert (eq (first lc) :unregister) () "unregister DATA not classified :unregister"))
+           t)
+      (stop-node node1)
+      (stop-node node2))))
+
+(defun* run-dispose-repair-test ()
+    (function () (eql t))
+  "Reliability of a lifecycle change S1: A's dispose DATA is dropped on send
+   (*debug-drop-sample-numbers* on its SN), then the drop is cleared with NO further write; A's
+   periodic HEARTBEAT prompts B to NACK the gap, A resends the dispose via write-data-dispose, B
+   recovers — asserted within a BOUNDED number of iterations. Proves a dispose/unregister occupies a
+   real SN and rides the same ACKNACK/HEARTBEAT repair path as an ALIVE DATA (RTPS 2.5 §8.4.2.2)."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
+         (node1 (make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (node2 (make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (payload (make-array 8 :element-type '(unsigned-byte 8)
+                              :initial-contents '(#xCA #xFE #xBA #xBE #x05 #x06 #x07 #x08)))
+         (kh (make-array 16 :element-type '(unsigned-byte 8)
+                         :initial-contents '(#xca #xc2 #x17 #xc3 #x18 #x36 #x3f #x8e
+                                             #xf1 #x16 #x0e #xee #xde #xf9 #xe8 #x86))))
+    (unwind-protect
+         (progn
+           (add-local-writer node1 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-publisher node1)
+           (add-local-reader node2 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-subscriber node2)
+           (setf (disc-node-peers node1) (list (cons "127.0.0.1" (disc-node-port node2))))
+           (setf (disc-node-peers node2) (list (cons "127.0.0.1" (disc-node-port node1))))
+           (start-node node1)
+           (start-node node2)
+           (announce-participant node1)
+           (announce-participant node2)
+           (loop repeat 100
+                 until (and (plusp (disc-node-discovered-count node1))
+                            (plusp (disc-node-discovered-count node2)))
+                 do (sleep 0.02))
+           (announce-endpoints node1)
+           (announce-endpoints node2)
+           (loop repeat 100
+                 until (and (plusp (disc-node-matched-count node1))
+                            (plusp (disc-node-matched-count node2)))
+                 do (sleep 0.02))
+           (assert (and (plusp (disc-node-matched-count node1))
+                        (plusp (disc-node-matched-count node2)))
+                   () "endpoints did not match before publish")
+           (publish-sample node1 payload)             ; SN 1 ALIVE sample
+           (loop repeat 100 until (plusp (node-sample-count node2)) do (sleep 0.02))
+           (assert (plusp (node-sample-count node2)) () "ALIVE sample never arrived")
+           (setf *debug-drop-sample-numbers* (list 2))  ; drop the dispose DATA (SN 2) on every thread
+           (dispose-instance node1 kh)
+           (sleep 0.1)
+           (assert (null (node-lifecycle-change node2 2)) ()
+                   "drop hook failed: B received the dropped dispose DATA")
+           (setf *debug-drop-sample-numbers* nil)        ; clear; do NOT dispose again
+           (loop repeat 40                               ; BOUNDED: drive A's HB cadence
+                 until (node-lifecycle-change node2 2)
+                 do (announce-endpoints node1) (sleep 0.02))
+           (let ((lc (node-lifecycle-change node2 2)))
+             (assert lc () "lost dispose never recovered via the periodic HEARTBEAT")
+             (assert (and (eq (first lc) :dispose) (equalp (second lc) kh)) ()
+                     "recovered dispose has the wrong kind/key-hash"))
+           t)
+      (setf *debug-drop-sample-numbers* nil)
       (stop-node node1)
       (stop-node node2))))
 

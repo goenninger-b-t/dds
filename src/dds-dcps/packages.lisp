@@ -19,6 +19,7 @@
            #:create-publisher #:create-subscriber #:create-topic
            #:create-datawriter #:create-datareader
            #:write-sample #:read-samples #:take-samples #:samples-available
+           #:register-instance #:dispose-instance #:unregister-instance
            #:sample-info #:make-sample-info
            #:sample-info-sample-state #:sample-info-view-state #:sample-info-instance-state
            #:sample-info-source-timestamp #:sample-info-instance-handle

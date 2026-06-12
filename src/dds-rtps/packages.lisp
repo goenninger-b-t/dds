@@ -12,6 +12,7 @@
   (:export #:cache-change #:make-cache-change #:cache-change-p
            #:cache-change-kind #:cache-change-writer-guid #:cache-change-sn
            #:cache-change-instance-key-hash #:cache-change-serialized-payload
+           #:cache-change-status-info
            #:cache-change-source-timestamp #:cache-change-inline-qos
            #:history-cache #:make-history-cache #:hc-change-count
            #:hc-add-change #:hc-remove-change #:hc-get-change
@@ -85,6 +86,7 @@
     WriterProxy, changes-for-reader, HEARTBEAT/ACKNACK/GAP-driven retransmit and
     reordering. Verified by a lossy/reorder/dup fault-injection suite (NFR-TEST).")
   (:export #:rtps-writer #:make-rtps-writer #:writer-write #:writer-heartbeat
+           #:writer-lifecycle-change
            #:writer-data-list #:writer-unsent-list #:writer-on-acknack #:get-reader-proxy
            #:reader-proxy #:reader-proxy-acked-base
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat

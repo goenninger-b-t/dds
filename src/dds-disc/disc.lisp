@@ -71,6 +71,7 @@
   (user-writer-id #x00000102 :type (unsigned-byte 32)) ; this node's user-data writer EntityId (kind reflects keyed-ness)
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
   (samples (make-hash-table :test 'eql) :type hash-table)
+  (lifecycle-changes (make-hash-table :test 'eql) :type hash-table) ; SN -> (kind key-hash status) received dispose/unregister
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
   (builtin-readers (make-hash-table :test 'equalp) :type hash-table) ; remote 12-octet prefix -> reliable SEDP reader
@@ -86,6 +87,7 @@
   (liveliness-state (make-hash-table :test 'equalp) :type hash-table) ; matched remote-writer 16-octet GUID -> alive-p (reader-side LIVELINESS_CHANGED transition flag)
 
   (on-data nil :type (or null function))
+  (on-lifecycle nil :type (or null function))
   (on-heartbeat nil :type (or null function))
   (on-acknack nil :type (or null function))
   (on-data-frag nil :type (or null function))
@@ -741,9 +743,13 @@
      (lambda (id flags c body-len)
        (cond
          ((= id dds.rtps.message:+submsg-data+)
-          (multiple-value-bind (rdr wtr sn has-payload poff plen keyp)
+          (multiple-value-bind (rdr wtr sn has-payload poff plen keyp kind key-hash status-flags)
               (dds.rtps.message:parse-data-body c flags body-len)
             (declare (ignore rdr keyp))
+            (when (and (not has-payload) (not (eq kind :data)) (disc-node-on-lifecycle node))
+              ;; A no-payload dispose/unregister DATA (RTPS 2.5 §9.6.4.9): route the named
+              ;; instance + StatusInfo transition to the lifecycle hook (B's instance-state is S2).
+              (funcall (disc-node-on-lifecycle node) wtr sn kind key-hash status-flags))
             (when has-payload
               (cond
                 ((= wtr dds.rtps.discovery:+entityid-spdp-writer+)

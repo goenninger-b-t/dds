@@ -43,11 +43,27 @@
 
 (defun* writer-write (writer payload)
     (function (rtps-writer (array (unsigned-byte 8) (*))) integer)
-  "Add a new change to the writer's HistoryCache; return its sequence number."
+  "Add a new :data change to the writer's HistoryCache; return its sequence number."
   (let ((sn (incf (rtps-writer-last-sn writer))))
     (dds.rtps.history:hc-add-change
      (rtps-writer-hc writer)
      (dds.rtps.history:make-cache-change :sn sn :serialized-payload payload))
+    sn))
+
+(defun* writer-lifecycle-change (writer key-hash status-flags)
+    (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)) integer)
+  "Add a dispose/unregister change for the instance named by KEY-HASH (16 octets) to the
+   writer's HistoryCache and return its sequence number (RTPS 2.5 §9.6.4.9). STATUS-FLAGS is
+   the StatusInfo_t flag octet; the change KIND (:dispose/:unregister) is derived from it
+   (status-info->kind). The change carries NO serializedPayload — the instance is identified
+   by its key hash — yet occupies a real SN, so it is reliably ordered and ACKNACK-repairable
+   like any DATA (RTPS 2.5 §8.4.2.2)."
+  (let ((sn (incf (rtps-writer-last-sn writer))))
+    (dds.rtps.history:hc-add-change
+     (rtps-writer-hc writer)
+     (dds.rtps.history:make-cache-change
+      :sn sn :kind (dds.rtps.message:status-info->kind status-flags)
+      :instance-key-hash key-hash :status-info status-flags))
     sn))
 
 (defun* writer-heartbeat (writer)
@@ -59,35 +75,39 @@
 
 (defun* %changes-from (writer base)
     (function (rtps-writer integer) list)
-  "The writer's HistoryCache changes with SN >= BASE, as (sn . payload) in SN order."
+  "The writer's HistoryCache CacheChanges with SN >= BASE, in SN order. The element is the
+   CacheChange itself (carrying KIND, SN, payload, key-hash, status-info) so the send path
+   can dispatch :data vs :dispose/:unregister (RTPS 2.5 §8.4.2.2 / §9.6.4.9)."
   (loop for ch in (dds.rtps.history:hc-changes-for-reader (rtps-writer-hc writer) nil)
         when (>= (dds.rtps.history:cache-change-sn ch) base)
-          collect (cons (dds.rtps.history:cache-change-sn ch)
-                        (dds.rtps.history:cache-change-serialized-payload ch))))
+          collect ch))
 
 (defun* writer-data-list (writer reader-id)
     (function (rtps-writer (unsigned-byte 32)) list)
-  "Changes not yet acked by READER-ID, as a list of (sn . payload) in SN order."
+  "Changes not yet acked by READER-ID, as a list of CacheChanges in SN order."
   (%changes-from writer (reader-proxy-acked-base (get-reader-proxy writer reader-id))))
 
 (defun* writer-unsent-list (writer reader-id)
     (function (rtps-writer (unsigned-byte 32)) list)
   "The UNSENT changes for READER-ID (next_unsent_change, RTPS 2.5 §8.4.2.2): the
-   changes with SN >= the reader's UNSENT-BASE, as (sn . payload) in SN order. On a
-   non-empty result the UNSENT-BASE watermark is advanced past the highest SN collected,
-   so each change is pushed EXACTLY ONCE in pushMode (§8.4.2.2). Lost/late changes are
-   recovered via the ACKNACK repair path (writer-on-acknack), not by re-pushing."
+   CacheChanges with SN >= the reader's UNSENT-BASE, in SN order. On a non-empty result the
+   UNSENT-BASE watermark is advanced past the highest SN collected, so each change is pushed
+   EXACTLY ONCE in pushMode (§8.4.2.2). Lost/late changes are recovered via the ACKNACK repair
+   path (writer-on-acknack), not by re-pushing. Each element is the CacheChange (KIND/SN/
+   payload/key-hash/status-info) so a :dispose/:unregister is pushed as a no-payload DATA."
   (let* ((proxy (get-reader-proxy writer reader-id))
          (changes (%changes-from writer (reader-proxy-unsent-base proxy))))
     (when changes
-      (setf (reader-proxy-unsent-base proxy) (1+ (car (first (last changes))))))
+      (setf (reader-proxy-unsent-base proxy)
+            (1+ (dds.rtps.history:cache-change-sn (first (last changes))))))
     changes))
 
 (defun* writer-on-acknack (writer reader-id base numbits bitmap)
     (function (rtps-writer (unsigned-byte 32) integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) (values list list))
   "Process an ACKNACK from READER-ID (RTPS 2.5 §8.3.7.1). Confirm SN < BASE, then
    for each NACKed SN (bit set in BITMAP) return a resend if present, else a GAP.
-   Returns (values data-resends gap-sns), data-resends a list of (sn . payload)."
+   Returns (values data-resends gap-sns), data-resends a list of CacheChanges (so the
+   resend path dispatches :data vs :dispose/:unregister exactly as the initial push)."
   (let ((proxy (get-reader-proxy writer reader-id))
         (resends '())
         (gaps '()))
@@ -97,7 +117,7 @@
         (let* ((sn (+ base i))
                (ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
           (if ch
-              (push (cons sn (dds.rtps.history:cache-change-serialized-payload ch)) resends)
+              (push ch resends)
               (push sn gaps)))))
     (values (nreverse resends) (nreverse gaps))))
 

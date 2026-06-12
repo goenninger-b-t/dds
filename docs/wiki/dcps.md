@@ -39,6 +39,9 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | Symbol | Description |
 |---|---|
 | `dds.dcps:write-sample` (`dw sample`) | `DataWriter::write` — serialize `sample` via the topic type-support and publish it reliably to matched readers. |
+| `dds.dcps:register-instance` (`dw sample`) | `DataWriter::register_instance` (DDS 1.4 §2.2.2.4.2.5) — register `sample`'s instance and return its 16-octet handle (the type-support key-hash; `HANDLE_NIL` for an unkeyed type). Writer-local; no wire message. |
+| `dds.dcps:dispose-instance` (`dw sample-or-handle`) | `DataWriter::dispose` (DDS 1.4 §2.2.2.4.2.10) — dispose the instance (a sample or a registered handle); emits a no-payload dispose `DATA` (StatusInfo Disposed, RTPS 2.5 §9.6.4.9) over the reliable engine. Returns the handle. |
+| `dds.dcps:unregister-instance` (`dw sample-or-handle`) | `DataWriter::unregister_instance` (DDS 1.4 §2.2.2.4.2.7) — unregister the instance; emits a no-payload unregister `DATA` (StatusInfo Unregistered) over the reliable engine. Returns the handle. |
 | `dds.dcps:read-samples` (`dr &key states where`) | `DataReader::read` — return the cached samples whose sample-state is in `states` (default `(:read :not-read)` = ANY) and whose data satisfies `where`, **without** removing them; mark each `:read` and set its view-state. Returns a list of `cached-sample`. |
 | `dds.dcps:take-samples` (`dr &key states where`) | `DataReader::take` — like `read-samples` but **removes** the returned samples from the cache. |
 | `dds.dcps:samples-available` (`dr`) | Drain newly-received samples into the cache and return the cache size, **without** marking anything `:read` — for polling before a read/take. |
@@ -447,12 +450,14 @@ the source as deferred or simplified — do not rely on them yet:
   per-endpoint RTPS `EntityId`s.
 - **Caller-driven discovery.** You must call `dds.dcps:spin` to drive SPDP/SEDP; there is no
   background announcer (the engine's announce buffers are not yet thread-isolated).
-- **No instance lifecycle beyond `:alive`.** There is no `dispose`/`unregister_instance` API,
-  no `write_w_timestamp`, and the drain always builds `SampleInfo` with
-  `instance-state :alive` / `valid-data t`. The `:not-alive-disposed` / `:not-alive-no-writers`
-  state kinds exist in the type but are never produced; the disposed/no-writers generation
-  counts, the ranks, `source-timestamp`, and `publication-handle` all stay at their defaults
-  (`0` / `nil`).
+- **Instance lifecycle: writer side only (S1).** `register_instance` / `dispose` /
+  `unregister_instance` exist and emit the no-payload dispose/unregister `DATA` over the reliable
+  engine (StatusInfo Disposed/Unregistered, RTPS 2.5 §9.6.4.9; reliably ACKNACK-repairable). What is
+  NOT yet wired is the **reader side**: the drain still builds `SampleInfo` with
+  `instance-state :alive` / `valid-data t`, so a received dispose/unregister does not yet transition
+  the reader's instance to `:not-alive-disposed` / `:not-alive-no-writers` (those kinds exist but are
+  never produced), and the disposed/no-writers generation counts, the ranks, `source-timestamp`, and
+  `publication-handle` stay at their defaults (`0` / `nil`). There is no `write_w_timestamp`.
 - **MATCHED decrements on lease expiry.** When a discovered participant vanishes and its
   lease expires (RTPS 2.5 §8.5.3.3.2), each pruned match decrements the affected local
   endpoint's SUBSCRIPTION_MATCHED / PUBLICATION_MATCHED `current_count` (`current_count_change`
