@@ -83,7 +83,9 @@
    (subscriber :initarg :subscriber :reader dr-subscriber)
    (cache :initform '() :accessor dr-cache)                       ; list of cached-sample
    (instances :initform (make-hash-table :test 'equalp) :accessor dr-instances) ; handle -> accessed-p
+   (instance-recs :initform (make-hash-table :test 'equalp) :accessor dr-instance-recs) ; handle -> instance-rec (DDS 1.4 §2.2.2.5.1.3)
    (drained :initform 0 :accessor dr-drained)                    ; highest engine SN drained
+   (lifecycle-drained :initform '() :accessor dr-lifecycle-drained) ; engine lifecycle SNs already consumed (user thread)
    (sub-matched :initform (make-subscription-matched-status) :accessor dr-sub-matched)
    (req-incompat :initform (make-requested-incompatible-qos-status) :accessor dr-req-incompat)
    (sample-rejected :initform (make-sample-rejected-status) :accessor dr-sample-rejected)
@@ -143,6 +145,18 @@
   "A read/take result element: the deserialized DATA + its SAMPLE-INFO."
   (data nil :type t)
   (info nil :type (or null sample-info)))
+
+(defstruct* (instance-rec (:constructor make-instance-rec))
+  "The reader's per-instance lifecycle record (DDS 1.4 §2.2.2.5.1.3/.5): STATE is the
+   instance_state (ALIVE / NOT_ALIVE_DISPOSED / NOT_ALIVE_NO_WRITERS); DISPOSED-GEN-COUNT
+   and NO-WRITERS-GEN-COUNT are the per-instance generation counters (incremented on the
+   NOT_ALIVE_DISPOSED->ALIVE and NOT_ALIVE_NO_WRITERS->ALIVE transitions respectively);
+   WRITERS is the set of matched remote writer EntityIds (RTPS 2.5 §9.3.1.2) currently
+   keeping the instance alive — emptying it transitions the instance NOT_ALIVE_NO_WRITERS."
+  (state :alive :type (member :alive :not-alive-disposed :not-alive-no-writers))
+  (disposed-gen-count 0 :type integer)
+  (no-writers-gen-count 0 :type integer)
+  (writers '() :type list))
 
 ;;; ---- type-support serialization helpers (PLAIN_CDR2_LE SerializedPayload) ----
 
@@ -211,6 +225,8 @@
           (lambda (direction remote) (%on-disc-unmatch p direction remote)))
     (setf (dds.disc:disc-node-on-liveliness-changed node)
           (lambda (guid alive-p) (%on-disc-liveliness-changed p guid alive-p)))
+    (setf (dds.disc:disc-node-on-lifecycle-event node)
+          (lambda (wid sn kind kh sf) (%on-disc-lifecycle p wid sn kind kh sf)))
     (setf (dds.disc:disc-node-on-incompatible-qos node)
           (lambda (kind remote bad) (%on-disc-incompatible p kind remote bad)))
     (setf (dds.disc:disc-node-on-sample node)
@@ -397,6 +413,13 @@
   "T iff X is already a 16-octet instance handle (a (simple-array (unsigned-byte 8) (16)))."
   (typep x '(simple-array (unsigned-byte 8) (16))))
 
+(defun* %guid-entityid (guid)
+    (function ((simple-array (unsigned-byte 8) (16))) (unsigned-byte 32))
+  "The EntityId (last 4 GUID octets) as an MSB-first u32 (RTPS 2.5 §9.3.1.2) — the same
+   writer EntityId the data path records per sample, so an unmatched writer's GUID maps to
+   the WID held in an instance's writers set."
+  (logior (ash (aref guid 12) 24) (ash (aref guid 13) 16) (ash (aref guid 14) 8) (aref guid 15)))
+
 (defun* %resolve-handle (dw sample-or-handle)
     (function (data-writer t) (simple-array (unsigned-byte 8) (16)))
   "The 16-octet instance handle for SAMPLE-OR-HANDLE on DW: SAMPLE-OR-HANDLE used directly when
@@ -482,36 +505,193 @@
     (when snapshot (on-sample-rejected (dr-listener dr) dr snapshot)))
   t)
 
+(defun* %reader-instance-rec (dr handle)
+    (function (data-reader (simple-array (unsigned-byte 8) (16))) instance-rec)
+  "DR's instance-rec for the 16-octet HANDLE (DDS 1.4 §2.2.2.5.1.3), creating a fresh ALIVE
+   record (generation counts initialized to zero per §2.2.2.5.1.5) the first time the instance
+   is seen. Also seeds the view-state dr-instances entry (nil = not yet accessed) so a synthetic
+   lifecycle notification surfaces with view-state NEW just like a first data sample."
+  (or (gethash handle (dr-instance-recs dr))
+      (progn
+        (unless (nth-value 1 (gethash handle (dr-instances dr)))
+          (setf (gethash handle (dr-instances dr)) nil))
+        (setf (gethash handle (dr-instance-recs dr)) (make-instance-rec)))))
+
+(defun* %enqueue-instance-notification (dr handle rec)
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) instance-rec) t)
+  "Append a synthetic INVALID-DATA cached-sample to DR's cache for instance HANDLE carrying
+   REC's current instance_state + generation counts (DDS 1.4 §2.2.2.5.1.4: a dispose/no-writers
+   change yields a SampleInfo with valid_data=FALSE and no associated Data). NOT_READ so read/take
+   surface it once; sequence-number 0 (no wire SN — it is an instance-state change, not a sample)."
+  (setf (dr-cache dr)
+        (nconc (dr-cache dr)
+               (list (make-cached-sample
+                      :data nil
+                      :info (make-sample-info
+                             :sample-state :not-read :view-state :new
+                             :instance-state (instance-rec-state rec) :valid-data nil
+                             :instance-handle handle
+                             :disposed-generation-count (instance-rec-disposed-gen-count rec)
+                             :no-writers-generation-count (instance-rec-no-writers-gen-count rec)
+                             :sequence-number 0)))))
+  t)
+
+(defun* %wake-reader-data (dr)
+    (function (data-reader) t)
+  "Fire DR's on_data_available (if masked) OUTSIDE the status lock, then wake its WaitSets —
+   the same DATA_AVAILABLE notification path as the on-sample hook (DDS 1.4 §2.2.4.1)."
+  (let ((fire nil))
+    (dds.pal:with-lock ((dr-status-lock dr))
+      (when (and (dr-listener dr) (member :data-available (dr-listener-mask dr)))
+        (setf fire t)))
+    (when fire (on-data-available (dr-listener dr) dr))
+    (%notify-reader-conditions dr))
+  t)
+
+(defun* %on-disc-lifecycle (p wid sn kind key-hash status-flags)
+    (function (domain-participant (unsigned-byte 32) integer (member :dispose :unregister)
+              t (unsigned-byte 8)) t)
+  "ON-LIFECYCLE hook (disc receiver thread): a no-payload dispose/unregister DATA arrived
+   (RTPS 2.5 §9.6.4.9). WAKE ONLY — exactly like the on-sample hook (%on-participant-sample):
+   the engine has already recorded (kind key-hash status-flags writer-id) by SN under the node
+   lock; this hook must NOT touch the reader cache or instance-recs (those are user-thread state,
+   mutated only by %drain — touching them here would race a concurrent read/take/%drain). It just
+   fires DATA_AVAILABLE so a waiting reader drains the pending lifecycle change on the user thread.
+   The instance-state transition itself is applied on the user thread by %drain (S2)."
+  (declare (ignore wid sn kind key-hash status-flags))
+  (let ((dr (dp-user-reader p)))
+    (when dr (%wake-reader-data dr)))
+  t)
+
+(defun* %drain-one-lifecycle (dr node sn)
+    (function (data-reader t integer) t)
+  "Apply ONE pending dispose/unregister lifecycle change at sequence number SN on the USER thread (the
+   on-sample/%drain discipline — never the receiver thread). Marks SN consumed (exactly-once via
+   dr-lifecycle-drained) then applies the DDS 1.4 §2.2.2.5.1.3 reader-side transition to the instance's
+   instance-rec: :dispose -> NOT_ALIVE_DISPOSED (STICKY — dispose dominates no-writers, so it does NOT
+   override an already NOT_ALIVE_DISPOSED instance); :unregister -> drop the originating writer from the
+   instance's writers-set and, only if the instance is still :alive with no writers left, ->
+   NOT_ALIVE_NO_WRITERS. An invalid-data notification (valid_data=FALSE, §2.2.2.5.1.4) is enqueued ONLY
+   when the instance_state actually transitioned (§2.2.2.5.1.4 — these no-data samples surface a CHANGE
+   of state); a no-op unregister (writers remain / re-dispose of a disposed instance) produces nothing.
+   Returns T if the instance transitioned."
+  (push sn (dr-lifecycle-drained dr))
+  (let ((lc (dds.disc:node-lifecycle-change node sn)) (changed nil))
+    (when lc
+      (destructuring-bind (kind key-hash status-flags wid) lc
+        (declare (ignore status-flags))
+        (when (%handle-p key-hash)
+          (let* ((rec (%reader-instance-rec dr key-hash))
+                 (old (instance-rec-state rec)))
+            (ecase kind
+              (:dispose (setf (instance-rec-state rec) :not-alive-disposed))
+              (:unregister
+               (setf (instance-rec-writers rec) (remove wid (instance-rec-writers rec)))
+               (when (and (null (instance-rec-writers rec)) (eq old :alive))
+                 (setf (instance-rec-state rec) :not-alive-no-writers))))
+            (unless (eq old (instance-rec-state rec))
+              (%enqueue-instance-notification dr key-hash rec)
+              (setf changed t))))))
+    changed))
+
+(defun* %on-writer-vanished (dr wid)
+    (function (data-reader (unsigned-byte 32)) t)
+  "A matched remote WRITER (EntityId WID) unmatched/vanished: drop it from every instance's
+   writers set; any instance thereby left with no writers transitions NOT_ALIVE_NO_WRITERS
+   (DDS 1.4 §2.2.2.5.1.3 — the DataReader declares an instance not-alive when it detects no
+   live DataWriter writing it) and gets an invalid-data notification (§2.2.2.5.1.4). v1 has one
+   user writer per remote participant, so this is the last-writer case. Wakes DATA_AVAILABLE
+   once if any instance transitioned."
+  (let ((changed nil))
+    (maphash
+     (lambda (handle rec)
+       (when (member wid (instance-rec-writers rec))
+         (setf (instance-rec-writers rec) (remove wid (instance-rec-writers rec)))
+         (when (and (null (instance-rec-writers rec))
+                    (eq (instance-rec-state rec) :alive))
+           (setf (instance-rec-state rec) :not-alive-no-writers)
+           (%enqueue-instance-notification dr handle rec)
+           (setf changed t))))
+     (dr-instance-recs dr))
+    (when changed (%wake-reader-data dr)))
+  t)
+
+(defun* %reader-revive-instance (dr handle wid)
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) t) instance-rec)
+  "A data sample for instance HANDLE written by WID arrived: register WID in the instance's
+   writers set and revive the instance to ALIVE (DDS 1.4 §2.2.2.5.1.3). A NOT_ALIVE_DISPOSED->
+   ALIVE transition bumps disposed_generation_count, a NOT_ALIVE_NO_WRITERS->ALIVE transition
+   bumps no_writers_generation_count (§2.2.2.5.1.5). WID may be NIL (an offline-injected sample
+   with no recorded writer); then only the state is revived. Returns the (updated) instance-rec."
+  (let ((rec (%reader-instance-rec dr handle)))
+    (when (and wid (not (member wid (instance-rec-writers rec))))
+      (push wid (instance-rec-writers rec)))
+    (ecase (instance-rec-state rec)
+      (:alive)
+      (:not-alive-disposed (incf (instance-rec-disposed-gen-count rec)))
+      (:not-alive-no-writers (incf (instance-rec-no-writers-gen-count rec))))
+    (setf (instance-rec-state rec) :alive)
+    rec))
+
+(defun* %drain-one-sample (dr node ts sn)
+    (function (data-reader t t integer) t)
+  "Apply ONE pending data sample at sequence number SN: mark SN consumed (exactly-once via the
+   dr-drained high-water mark — data SNs are visited in ascending order so the mark is monotone),
+   deserialize, drop it on a ContentFilteredTopic miss, reject it on RESOURCE_LIMITS (SAMPLE_REJECTED),
+   else REVIVE its instance to ALIVE and register its writer (DDS 1.4 §2.2.2.5.1.3: a
+   NOT_ALIVE_DISPOSED->ALIVE or NOT_ALIVE_NO_WRITERS->ALIVE transition bumps the matching generation
+   count, §2.2.2.5.1.5) and append a fresh NOT_READ SampleInfo carrying the instance's current
+   instance_state + generation counts."
+  (setf (dr-drained dr) sn)
+  (let ((bytes (dds.disc:node-sample node sn)))
+    (when bytes
+      (let ((data (%deserialize-sample ts bytes)))
+        ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
+        (when (or (null (dr-filter dr)) (funcall (dr-filter dr) data))
+          (let* ((handle (%instance-handle ts data))
+                 (reason (%resource-reject-reason dr handle)))
+            (if reason
+                ;; RESOURCE_LIMITS would be exceeded -> reject (SAMPLE_REJECTED).
+                (%reader-sample-rejected dr reason handle)
+                (let ((rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node sn))))
+                  (setf (dr-cache dr)
+                        (nconc (dr-cache dr)
+                               (list (make-cached-sample
+                                      :data data
+                                      :info (make-sample-info
+                                             :sample-state :not-read :view-state :new
+                                             :instance-state (instance-rec-state rec) :valid-data t
+                                             :instance-handle handle :sequence-number sn
+                                             :disposed-generation-count (instance-rec-disposed-gen-count rec)
+                                             :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))))))))
+  t)
+
 (defun* %drain (dr)
     (function (data-reader) t)
-  "Pull newly-received raw samples from the engine, deserialize, assign each to its
-   instance, and append to the reader cache with fresh SampleInfo (NOT_READ, ALIVE)."
+  "Pull newly-received changes from the engine on the USER thread and apply them in UNIFIED
+   SEQUENCE-NUMBER ORDER. Data samples and dispose/unregister lifecycle changes share ONE writer SN
+   space (each lifecycle change occupies a real SN), so they form ONE ordered CacheChange stream per
+   writer (DDS 1.4 §2.2.2.5 / RTPS 2.5 §8.7.4) — applying them in SN order is the conformant behaviour
+   and is what makes a dispose-then-revive (revive at the higher SN wins -> ALIVE) and a
+   revive-then-dispose (dispose at the higher SN wins -> NOT_ALIVE_DISPOSED) land correctly within a
+   single drain pass. Pending data SNs (above the dr-drained high-water mark) and pending lifecycle SNs
+   (not yet in dr-lifecycle-drained) are merged and visited in SN order; each data SN runs
+   %drain-one-sample and each lifecycle SN runs %drain-one-lifecycle, each maintaining its own
+   exactly-once discipline. Both streams are drained on the user thread so the reader cache +
+   instance-recs are never mutated off-thread (S2)."
   (let* ((node (dp-node (sub-participant (dr-subscriber dr))))
-         (ts (topic-type-support (dr-topic dr))))
-    (dolist (sn (sort (dds.disc:node-sample-sns node) #'<))
-      (when (> sn (dr-drained dr))
-        (setf (dr-drained dr) sn)
-        (let ((bytes (dds.disc:node-sample node sn)))
-          (when bytes
-            (let ((data (%deserialize-sample ts bytes)))
-              ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
-              (when (or (null (dr-filter dr)) (funcall (dr-filter dr) data))
-                (let* ((handle (%instance-handle ts data))
-                       (reason (%resource-reject-reason dr handle)))
-                  (if reason
-                      ;; RESOURCE_LIMITS would be exceeded -> reject (SAMPLE_REJECTED).
-                      (%reader-sample-rejected dr reason handle)
-                      (progn
-                        (unless (nth-value 1 (gethash handle (dr-instances dr)))
-                          (setf (gethash handle (dr-instances dr)) nil))   ; nil = not yet accessed
-                        (setf (dr-cache dr)
-                              (nconc (dr-cache dr)
-                                     (list (make-cached-sample
-                                            :data data
-                                            :info (make-sample-info
-                                                   :sample-state :not-read :view-state :new
-                                                   :instance-state :alive :valid-data t
-                                                   :instance-handle handle :sequence-number sn))))))))))))))))
+         (ts (topic-type-support (dr-topic dr)))
+         (data-sns (remove-if-not (lambda (sn) (> sn (dr-drained dr)))
+                                  (dds.disc:node-sample-sns node)))
+         (life-sns (set-difference (dds.disc:node-lifecycle-sns node) (dr-lifecycle-drained dr)))
+         (pending (sort (nconc (mapcar (lambda (sn) (cons sn :data)) data-sns)
+                               (mapcar (lambda (sn) (cons sn :lifecycle)) life-sns))
+                        #'< :key #'car)))
+    (dolist (entry pending)
+      (ecase (cdr entry)
+        (:data (%drain-one-sample dr node ts (car entry)))
+        (:lifecycle (%drain-one-lifecycle dr node (car entry)))))
+    t))
 
 (defun* %where-any (sample)
     (function (t) (eql t))
@@ -641,7 +821,9 @@
    16-octet GUID is the unmatched handle (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §165/§174)."
   (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
     (ecase direction
-      (:remote-writer (let ((dr (dp-user-reader p))) (when dr (%reader-unmatched dr handle))))
+      (:remote-writer (let ((dr (dp-user-reader p)))
+                        (when dr (%reader-unmatched dr handle)
+                              (%on-writer-vanished dr (%guid-entityid handle)))))
       (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-unmatched dw handle))))))
   t)
 

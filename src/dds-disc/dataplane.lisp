@@ -247,19 +247,25 @@
     (function (disc-node (unsigned-byte 32) integer (member :dispose :unregister) t (unsigned-byte 8)) t)
   "Reader side: a no-payload dispose/unregister DATA arrived from WRITER-ID (RTPS 2.5 §9.6.4.9).
    Feed its SN to the reliable reader (so the ACKNACK/HEARTBEAT bookkeeping treats it as a real
-   change) and record (KIND KEY-HASH STATUS-FLAGS) by SN. B's instance-state transition is S2;
-   here the wire is received + classified. Gated on a matched user writer EntityId."
+   change), record (KIND KEY-HASH STATUS-FLAGS) by SN, then fire the DCPS-facing lifecycle-event
+   callback OUTSIDE the node lock (S2 reader-side instance-state transition; mirrors how
+   %deliver-user-sample fires on-sample). Gated on a matched user writer EntityId."
   (when (and (disc-node-user-reader node) (%user-writer-entityid-p writer-id))
     (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn
                                       (make-array 0 :element-type '(unsigned-byte 8)))
     (dds.pal:with-lock ((disc-node-lock node))
-      (setf (gethash sn (disc-node-lifecycle-changes node)) (list kind key-hash status-flags))))
+      (setf (gethash sn (disc-node-lifecycle-changes node))
+            (list kind key-hash status-flags writer-id)))
+    (when (disc-node-on-lifecycle-event node)
+      (funcall (disc-node-on-lifecycle-event node) writer-id sn kind key-hash status-flags)))
   t)
 
 (defun* node-lifecycle-change (node sn)
     (function (disc-node integer) t)
-  "The received lifecycle change at sequence number SN as (kind key-hash status-flags), or NIL.
-   Lets a subscriber observe that a dispose/unregister DATA was received and classified (S1)."
+  "The received lifecycle change at sequence number SN as (kind key-hash status-flags writer-id),
+   or NIL. Lets a subscriber observe that a dispose/unregister DATA was received and classified (S1),
+   and lets the user-thread S2 consumer (%drain) recover the originating writer to drop it from the
+   instance's writers-set on an :unregister (DDS 1.4 §2.2.2.5.1.3)."
   (dds.pal:with-lock ((disc-node-lock node))
     (gethash sn (disc-node-lifecycle-changes node))))
 
@@ -269,12 +275,22 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (hash-table-count (disc-node-lifecycle-changes node))))
 
+(defun* node-lifecycle-sns (node)
+    (function (disc-node) list)
+  "Sequence numbers of the dispose/unregister lifecycle DATAs received so far (unordered). Lets the
+   user-thread S2 consumer (%drain) drain newly-classified lifecycle changes the same way
+   node-sample-sns drains data samples — without assuming SNs start at 1 (Connext may not)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (loop for k being the hash-keys of (disc-node-lifecycle-changes node) collect k)))
+
 (defun* %deliver-user-sample (node writer-id sn vec)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))) t)
   "Feed a complete user sample VEC (SN from WRITER-ID) to the reliable reader, record it by SN,
    then fire ON-SAMPLE outside the node lock (DATA_AVAILABLE + WaitSet wake)."
   (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn vec)
-  (dds.pal:with-lock ((disc-node-lock node)) (setf (gethash sn (disc-node-samples node)) vec))
+  (dds.pal:with-lock ((disc-node-lock node))
+    (setf (gethash sn (disc-node-samples node)) vec
+          (gethash sn (disc-node-sample-writers node)) writer-id))
   (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))
   t)
 
@@ -423,6 +439,14 @@
    subscriber drain new samples without assuming SNs start at 1 (Connext may not)."
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for k being the hash-keys of (disc-node-samples node) collect k)))
+
+(defun* node-sample-writer (node sn)
+    (function (disc-node integer) t)
+  "The remote writer EntityId that wrote the user sample at sequence number SN, or NIL.
+   Lets the DCPS reader register which writer keeps an instance alive (the writers-set,
+   DDS 1.4 §2.2.2.5.1.3) so a writer vanishing can transition the instance NOT_ALIVE_NO_WRITERS."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (gethash sn (disc-node-sample-writers node))))
 
 (defun* node-discovered-participants (node)
     (function (disc-node) list)

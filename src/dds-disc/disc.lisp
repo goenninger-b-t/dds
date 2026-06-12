@@ -71,6 +71,7 @@
   (user-writer-id #x00000102 :type (unsigned-byte 32)) ; this node's user-data writer EntityId (kind reflects keyed-ness)
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
   (samples (make-hash-table :test 'eql) :type hash-table)
+  (sample-writers (make-hash-table :test 'eql) :type hash-table) ; SN -> writer EntityId that wrote it (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
   (lifecycle-changes (make-hash-table :test 'eql) :type hash-table) ; SN -> (kind key-hash status) received dispose/unregister
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
@@ -88,6 +89,7 @@
 
   (on-data nil :type (or null function))
   (on-lifecycle nil :type (or null function))
+  (on-lifecycle-event nil :type (or null function)) ; DCPS-facing: fired after a dispose/unregister is classified (S2)
   (on-heartbeat nil :type (or null function))
   (on-acknack nil :type (or null function))
   (on-data-frag nil :type (or null function))

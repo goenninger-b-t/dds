@@ -19,6 +19,7 @@
            #:disc-node-matched-count #:disc-node-matched-topics
            #:disc-node-on-match #:disc-node-on-unmatch
            #:disc-node-on-liveliness-changed #:%liveliness-sweep
+           #:disc-node-on-lifecycle-event
            #:disc-node-on-incompatible-qos #:disc-node-on-sample
            #:disc-node-on-inconsistent-topic
            #:disc-node-type-gate #:resume-parked-matches #:disc-node-parked-count
@@ -28,8 +29,9 @@
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:publish-sample #:node-sample-count #:node-sample #:node-sample-sns
+           #:node-sample-writer
            #:dispose-instance #:unregister-instance
-           #:node-lifecycle-change #:node-lifecycle-count
+           #:node-lifecycle-change #:node-lifecycle-count #:node-lifecycle-sns
            #:*debug-drop-fragment-numbers*
            #:*debug-drop-sample-numbers*
            #:node-discovered-participants #:resolved-destination #:node-acks-in

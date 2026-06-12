@@ -51,13 +51,14 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:sample-info` / `make-sample-info` | The DDS 1.4 `SampleInfo` struct + its constructor. |
 | `dds.dcps:sample-info-sample-state` (`si`) | `:read` or `:not-read`. |
 | `dds.dcps:sample-info-view-state` (`si`) | `:new` or `:not-new` (first access of the instance vs. later). |
-| `dds.dcps:sample-info-instance-state` (`si`) | `:alive` / `:not-alive-disposed` / `:not-alive-no-writers` (v1 only ever produces `:alive`). |
+| `dds.dcps:sample-info-instance-state` (`si`) | `:alive` / `:not-alive-disposed` / `:not-alive-no-writers` (DDS 1.4 §2.2.2.5.1.3) — the reader's per-instance state at the time `read`/`take` was called. A received `dispose` yields `:not-alive-disposed`; the last writer of an instance unregistering or vanishing yields `:not-alive-no-writers`; a later data sample revives it to `:alive`. |
 | `dds.dcps:sample-info-instance-handle` (`si`) | The 16-octet instance handle (key-hash; `HANDLE_NIL` for an unkeyed type). |
-| `dds.dcps:sample-info-valid-data` (`si`) | Whether the data is valid (v1: always `t`). |
+| `dds.dcps:sample-info-valid-data` (`si`) | Whether the sample carries Data (DDS 1.4 §2.2.2.5.1.4). `t` for a normal data sample; `nil` for the **invalid-data** notification a dispose/unregister/no-writers transition produces — that sample carries only the `SampleInfo` (the new `instance-state`), no Data. The application MUST check `valid-data` before accessing `cached-sample-data`. |
 | `dds.dcps:sample-info-source-timestamp` (`si`) | Source timestamp (v1: `nil`). |
 | `dds.dcps:sample-info-publication-handle` (`si`) | Writer handle (v1: `nil`). |
 | `dds.dcps:sample-info-sequence-number` (`si`) | Vendor extension: the RTPS writer sequence number of the sample. |
-| `dds.dcps:sample-info-disposed-generation-count` / `-no-writers-generation-count` / `-sample-rank` / `-generation-rank` / `-absolute-generation-rank` (`si`) | DDS generation counts + ranks (v1: default `0`). |
+| `dds.dcps:sample-info-disposed-generation-count` / `-no-writers-generation-count` (`si`) | DDS 1.4 §2.2.2.5.1.5 per-instance generation counts: `disposed-generation-count` is incremented each time the instance transitions `NOT_ALIVE_DISPOSED -> ALIVE`, `no-writers-generation-count` each time it transitions `NOT_ALIVE_NO_WRITERS -> ALIVE`. Each sample's `SampleInfo` snapshots the counts. |
+| `dds.dcps:sample-info-sample-rank` / `-generation-rank` / `-absolute-generation-rank` (`si`) | DDS ranks (v1: default `0`). |
 
 ### Conditions + WaitSets
 
@@ -450,14 +451,17 @@ the source as deferred or simplified — do not rely on them yet:
   per-endpoint RTPS `EntityId`s.
 - **Caller-driven discovery.** You must call `dds.dcps:spin` to drive SPDP/SEDP; there is no
   background announcer (the engine's announce buffers are not yet thread-isolated).
-- **Instance lifecycle: writer side only (S1).** `register_instance` / `dispose` /
-  `unregister_instance` exist and emit the no-payload dispose/unregister `DATA` over the reliable
-  engine (StatusInfo Disposed/Unregistered, RTPS 2.5 §9.6.4.9; reliably ACKNACK-repairable). What is
-  NOT yet wired is the **reader side**: the drain still builds `SampleInfo` with
-  `instance-state :alive` / `valid-data t`, so a received dispose/unregister does not yet transition
-  the reader's instance to `:not-alive-disposed` / `:not-alive-no-writers` (those kinds exist but are
-  never produced), and the disposed/no-writers generation counts, the ranks, `source-timestamp`, and
-  `publication-handle` stay at their defaults (`0` / `nil`). There is no `write_w_timestamp`.
+- **Instance lifecycle: writer + reader side (S1 + S2).** Writer side (S1): `register_instance` /
+  `dispose` / `unregister_instance` emit the no-payload dispose/unregister `DATA` over the reliable
+  engine (StatusInfo Disposed/Unregistered, RTPS 2.5 §9.6.4.9; reliably ACKNACK-repairable). Reader
+  side (S2, DDS 1.4 §2.2.2.5.1.3/.4/.5): the reader keeps a per-instance state and surfaces it in
+  `SampleInfo`. A received `dispose` -> `:not-alive-disposed`; the last writer of an instance
+  unregistering or vanishing (lease expiry) -> `:not-alive-no-writers`; a later data sample revives
+  the instance to `:alive` and bumps the matching generation count. A dispose/unregister/no-writers
+  transition delivers an **invalid-data** sample (`valid-data nil`, no Data, carrying the new
+  `instance-state` + generation counts) through `read`/`take`, and fires `on_data_available`. The
+  ranks, `source-timestamp`, and `publication-handle` stay at their defaults (`0` / `nil`); there is
+  no `write_w_timestamp`. Live Connext interop of the reader-side transition is a later stage.
 - **MATCHED decrements on lease expiry.** When a discovered participant vanishes and its
   lease expires (RTPS 2.5 §8.5.3.3.2), each pruned match decrements the affected local
   endpoint's SUBSCRIPTION_MATCHED / PUBLICATION_MATCHED `current_count` (`current_count_change`

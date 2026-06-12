@@ -373,6 +373,292 @@
       (dds.dcps:delete-participant p2))
     t))
 
+;;; Reader-side instance_state (instance lifecycle S2, DDS 1.4 §2.2.2.5.1.3/.4/.5): the
+;;; reader maintains a per-instance state (ALIVE / NOT_ALIVE_DISPOSED / NOT_ALIVE_NO_WRITERS)
+;;; from inbound data + dispose/unregister lifecycle DATA + writer-vanish, and surfaces a
+;;; dispose/no-writers change as a valid_data=FALSE SampleInfo carrying the new instance_state.
+
+(defun* %instance-rec-state (dr handle)
+    (function (dds.dcps:data-reader (simple-array (unsigned-byte 8) (16))) t)
+  "The reader DR's instance_state for the 16-octet HANDLE, or NIL if no record (test accessor)."
+  (let ((rec (gethash handle (dds.dcps::dr-instance-recs dr))))
+    (and rec (dds.dcps::instance-rec-state rec))))
+
+(defun* %instance-rec-disp-gen (dr handle)
+    (function (dds.dcps:data-reader (simple-array (unsigned-byte 8) (16))) t)
+  "DR's disposed_generation_count for HANDLE, or NIL if no record (test accessor)."
+  (let ((rec (gethash handle (dds.dcps::dr-instance-recs dr))))
+    (and rec (dds.dcps::instance-rec-disposed-gen-count rec))))
+
+(defun* %drain-until (dr p1 p2 pred n)
+    (function (dds.dcps:data-reader dds.dcps:domain-participant dds.dcps:domain-participant
+              function (integer 0)) t)
+  "Drive discovery/repair cadence: spin both participants and drain DR up to N times (20ms
+   apart), stopping as soon as PRED is true. Bounded — never an unbounded wait."
+  (loop repeat n until (funcall pred)
+        do (dds.dcps:spin p1) (dds.dcps:spin p2) (dds.dcps:samples-available dr) (sleep 0.02))
+  (funcall pred))
+
+(defun* run-dcps-instance-state-test ()
+    (function () t)
+  "DCPS reader-side instance_state (S2, DDS 1.4 §2.2.2.5.1.3/.4/.5): on the keyed shape-type a
+   writer publishes a sample (instance ALIVE), then dispose-instance. The reader, after draining,
+   has the instance NOT_ALIVE_DISPOSED, and take returns an invalid-data SampleInfo (valid_data
+   FALSE) carrying instance_state NOT_ALIVE_DISPOSED + the right handle. A normal sample before the
+   dispose still delivers ALIVE / valid_data TRUE / view-state NEW. A second write REVIVES the
+   instance to ALIVE with disposed_generation_count bumped to 1."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (sample (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                (handle (funcall (dds.types:type-support-key-hash ts) sample)))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :is-matched (plusp (dds.dcps:matched-count p2)) "S2 endpoints did not match")
+           ;; 1) ALIVE sample: a normal valid sample still delivers :alive / valid-data t / view NEW.
+           (dds.dcps:write-sample dw sample)
+           (%drain-until dr p1 p2 (lambda () (eq :alive (%instance-rec-state dr handle))) 150)
+           (%check :is-alive (eq :alive (%instance-rec-state dr handle))
+                   "instance must be ALIVE after a data sample")
+           (let ((r (dds.dcps:read-samples dr)))
+             (%check :is-alive-sample (= 1 (length r)) "expected the one ALIVE sample")
+             (let ((info (dds.dcps:cached-sample-info (first r))))
+               (%check :is-alive-valid (eq t (dds.dcps:sample-info-valid-data info))
+                       "ALIVE sample must have valid_data TRUE")
+               (%check :is-alive-state (eq :alive (dds.dcps:sample-info-instance-state info))
+                       "ALIVE sample instance_state must be ALIVE")
+               (%check :is-alive-view (eq :new (dds.dcps:sample-info-view-state info))
+                       "ALIVE sample view-state must be NEW")
+               (%check :is-alive-disp-gen (= 0 (dds.dcps:sample-info-disposed-generation-count info))
+                       "disposed_generation_count must start at 0")))
+           ;; 2) dispose -> NOT_ALIVE_DISPOSED + an invalid-data notification.
+           (dds.dcps:dispose-instance dw handle)
+           (%drain-until dr p1 p2 (lambda () (eq :not-alive-disposed (%instance-rec-state dr handle))) 150)
+           (%check :is-disposed (eq :not-alive-disposed (%instance-rec-state dr handle))
+                   "instance must be NOT_ALIVE_DISPOSED after dispose")
+           (let ((inv (find-if (lambda (cs) (null (dds.dcps:sample-info-valid-data
+                                                   (dds.dcps:cached-sample-info cs))))
+                               (dds.dcps:take-samples dr))))
+             (%check :is-disposed-sample (and inv t) "dispose must yield an invalid-data sample")
+             (let ((info (dds.dcps:cached-sample-info inv)))
+               (%check :is-disposed-state
+                       (eq :not-alive-disposed (dds.dcps:sample-info-instance-state info))
+                       "invalid-data sample instance_state must be NOT_ALIVE_DISPOSED")
+               (%check :is-disposed-handle (equalp handle (dds.dcps:sample-info-instance-handle info))
+                       "invalid-data sample must carry the instance handle")
+               (%check :is-disposed-nodata (null (dds.dcps:cached-sample-data inv))
+                       "invalid-data sample must carry no Data")))
+           ;; 3) revive: a new write -> ALIVE with disposed_generation_count bumped to 1.
+           (dds.dcps:write-sample dw sample)
+           (%drain-until dr p1 p2 (lambda () (eq :alive (%instance-rec-state dr handle))) 150)
+           (%check :is-revived (eq :alive (%instance-rec-state dr handle))
+                   "a new write must revive the instance to ALIVE")
+           (%check :is-revived-gen (= 1 (%instance-rec-disp-gen dr handle))
+                   "disposed_generation_count must bump to 1 on NOT_ALIVE_DISPOSED->ALIVE")
+           (let ((info (dds.dcps:cached-sample-info
+                        (first (dds.dcps:read-samples dr :states '(:not-read))))))
+             (%check :is-revived-info-gen (= 1 (dds.dcps:sample-info-disposed-generation-count info))
+                     "the revived sample's SampleInfo must carry disposed_generation_count 1")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
+(defun* run-dcps-no-writers-test ()
+    (function () t)
+  "DCPS reader-side NOT_ALIVE_NO_WRITERS (S2, DDS 1.4 §2.2.2.5.1.3): a writer publishes a keyed
+   sample (instance ALIVE, registering the writer), then unregister-instance relinquishes the
+   writer's ownership; with no writers left the reader transitions the instance NOT_ALIVE_NO_WRITERS
+   and surfaces an invalid-data SampleInfo carrying that state. (v1 single user writer per remote
+   participant -> the unregister is the last-writer case.)"
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (sample (make-shape-type :color "GREEN" :x 5 :y 5 :shapesize 22))
+                (handle (funcall (dds.types:type-support-key-hash ts) sample)))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :nw-matched (plusp (dds.dcps:matched-count p2)) "no-writers endpoints did not match")
+           (dds.dcps:write-sample dw sample)
+           (%drain-until dr p1 p2 (lambda () (eq :alive (%instance-rec-state dr handle))) 150)
+           (%check :nw-alive (eq :alive (%instance-rec-state dr handle))
+                   "instance must be ALIVE after the data sample")
+           (dds.dcps:unregister-instance dw handle)
+           (%drain-until dr p1 p2 (lambda () (eq :not-alive-no-writers (%instance-rec-state dr handle))) 150)
+           (%check :nw-no-writers (eq :not-alive-no-writers (%instance-rec-state dr handle))
+                   "instance must be NOT_ALIVE_NO_WRITERS after the last writer unregisters")
+           (let ((inv (find-if (lambda (cs) (null (dds.dcps:sample-info-valid-data
+                                                   (dds.dcps:cached-sample-info cs))))
+                               (dds.dcps:take-samples dr))))
+             (%check :nw-sample (and inv t) "unregister must yield an invalid-data sample")
+             (%check :nw-state (eq :not-alive-no-writers
+                                   (dds.dcps:sample-info-instance-state (dds.dcps:cached-sample-info inv)))
+                     "invalid-data sample instance_state must be NOT_ALIVE_NO_WRITERS")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
+(defun* run-dcps-disposed-sticky-test ()
+    (function () t)
+  "DCPS reader-side DISPOSED-stickiness (S2, DDS 1.4 §2.2.2.5.1.3, service_cleanup_delay): a disposed
+   instance stays NOT_ALIVE_DISPOSED until a sample revives it — an unregister of its last writer must
+   NOT override it to NOT_ALIVE_NO_WRITERS (dispose dominates no-writers). A writer publishes a sample
+   (ALIVE), disposes the instance (NOT_ALIVE_DISPOSED), then unregisters it; the reader stays DISPOSED
+   and the unregister produces NO new invalid-data sample (no state transition, Issues 1+3)."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (sample (make-shape-type :color "RED" :x 3 :y 3 :shapesize 14))
+                (handle (funcall (dds.types:type-support-key-hash ts) sample)))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :ds-matched (plusp (dds.dcps:matched-count p2)) "disposed-sticky endpoints did not match")
+           (dds.dcps:write-sample dw sample)
+           (%drain-until dr p1 p2 (lambda () (eq :alive (%instance-rec-state dr handle))) 150)
+           (%check :ds-alive (eq :alive (%instance-rec-state dr handle)) "instance must be ALIVE first")
+           (dds.dcps:dispose-instance dw handle)
+           (%drain-until dr p1 p2 (lambda () (eq :not-alive-disposed (%instance-rec-state dr handle))) 150)
+           (%check :ds-disposed (eq :not-alive-disposed (%instance-rec-state dr handle))
+                   "instance must be NOT_ALIVE_DISPOSED after dispose")
+           (dds.dcps:take-samples dr)                ; drain the dispose notification out of the cache
+           ;; unregister the last writer -> must NOT flip a disposed instance to no-writers.
+           (dds.dcps:unregister-instance dw handle)
+           (%drain-until dr p1 p2 (lambda () nil) 60) ; bounded settle; PRED never true (no transition expected)
+           (%check :ds-still-disposed (eq :not-alive-disposed (%instance-rec-state dr handle))
+                   "DISPOSED must stay DISPOSED — unregister must not override it to NO_WRITERS")
+           (%check :ds-no-new-sample (null (dds.dcps:take-samples dr))
+                   "a no-op unregister (DISPOSED stays DISPOSED) must produce NO invalid-data sample"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
+(defun* run-dcps-writer-unmatch-test ()
+    (function () t)
+  "DCPS reader-side NOT_ALIVE_NO_WRITERS on writer-unmatch (S2, DDS 1.4 §2.2.2.5.1.3): a reader
+   with an ALIVE instance written by a (synthetic, offline) remote writer transitions the instance
+   NOT_ALIVE_NO_WRITERS when that writer's match is removed (lease expiry -> %on-disc-unmatch), and
+   surfaces a valid_data=FALSE notification. Deterministic offline injection, no UDP wait — the
+   writers-set is seeded via the same %reader-revive-instance path the data plane uses."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp))
+                (handle (make-array 16 :element-type '(unsigned-byte 8) :initial-element 3))
+                ;; A synthetic matched remote WRITER GUID (kind 0x02 with-key); its last 4 octets
+                ;; are the EntityId the writers-set keys on.
+                (wguid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x55)))
+                         (setf (aref g 12) #x00 (aref g 13) #x00 (aref g 14) #x01 (aref g 15) #x02) g))
+                (wid (dds.dcps::%guid-entityid wguid))
+                (rw (dds.rtps.discovery:make-endpoint-data
+                     :guid wguid :topic-name "Square" :type-name "shape-type")))
+           ;; Seed an ALIVE instance with WID in its writers set (mirrors a delivered data sample).
+           (dds.dcps::%reader-revive-instance dr handle wid)
+           (%check :wu-alive (eq :alive (%instance-rec-state dr handle))
+                   "seeded instance must be ALIVE with the writer registered")
+           ;; The writer's match vanishes (lease expiry) -> last writer gone -> NOT_ALIVE_NO_WRITERS.
+           (dds.dcps::%on-disc-unmatch p :remote-writer rw)
+           (%check :wu-no-writers (eq :not-alive-no-writers (%instance-rec-state dr handle))
+                   "instance must be NOT_ALIVE_NO_WRITERS after the writer unmatches")
+           (let ((inv (find-if (lambda (cs) (null (dds.dcps:sample-info-valid-data
+                                                   (dds.dcps:cached-sample-info cs))))
+                               (dds.dcps:take-samples dr))))
+             (%check :wu-sample (and inv t) "writer-unmatch must yield an invalid-data sample")
+             (%check :wu-state (eq :not-alive-no-writers
+                                   (dds.dcps:sample-info-instance-state (dds.dcps:cached-sample-info inv)))
+                     "invalid-data sample instance_state must be NOT_ALIVE_NO_WRITERS")))
+      (dds.dcps:delete-participant p))
+    t))
+
+;;; Unified SN-ordered drain (instance lifecycle S2 corner, DDS 1.4 §2.2.2.5 / RTPS 2.5 §8.7.4):
+;;; data samples and dispose/unregister lifecycle changes share ONE writer SN space, so within ONE
+;;; %drain pass they MUST be applied in sequence-number order — the higher SN wins. Deterministic
+;;; offline injection: stage both changes into the engine's SN maps, then drive %drain once (no UDP).
+
+(defun* %stage-data-sn (node sn handle bytes wid)
+    (function (t integer (simple-array (unsigned-byte 8) (16))
+              (simple-array (unsigned-byte 8) (*)) (unsigned-byte 32)) t)
+  "Stage a data sample (serialized BYTES, written by WID) at sequence number SN in NODE's SN maps —
+   the same (SN -> payload) + (SN -> writer) records %deliver-user-sample writes, minus the wire."
+  (declare (ignore handle))
+  (setf (gethash sn (dds.disc::disc-node-samples node)) bytes
+        (gethash sn (dds.disc::disc-node-sample-writers node)) wid)
+  t)
+
+(defun* %stage-lifecycle-sn (node sn kind handle wid)
+    (function (t integer (member :dispose :unregister)
+              (simple-array (unsigned-byte 8) (16)) (unsigned-byte 32)) t)
+  "Stage a dispose/unregister lifecycle change at sequence number SN in NODE's SN map — the same
+   (SN -> (kind key-hash status-flags writer-id)) record %on-user-lifecycle writes, minus the wire."
+  (setf (gethash sn (dds.disc::disc-node-lifecycle-changes node))
+        (list kind handle 0 wid))
+  t)
+
+(defun* run-dcps-drain-sn-order-test ()
+    (function () t)
+  "DCPS unified SN-ordered drain (S2 corner, DDS 1.4 §2.2.2.5 / RTPS 2.5 §8.7.4): within ONE %drain
+   pass, a dispose at the LOWER SN followed by a revive data sample at the HIGHER SN for the SAME
+   instance must end ALIVE (the revive wins because it has the higher SN) with disposed_generation_count
+   1; the REVERSE (a data sample at the lower SN, then a dispose at the higher SN) must end
+   NOT_ALIVE_DISPOSED. Drives %drain directly after staging both changes in the engine's SN maps —
+   deterministic, no UDP, no unbounded wait."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp))
+                (node (dds.dcps::dp-node p))
+                (sample (make-shape-type :color "BLUE" :x 7 :y 7 :shapesize 18))
+                (handle (funcall (dds.types:type-support-key-hash ts) sample))
+                (bytes (dds.dcps::%serialize-sample ts sample))
+                (wid #x00000102))
+           ;; Direction A: dispose (lower SN 10) then revive (higher SN 11) in ONE drain pass -> ALIVE.
+           (%stage-lifecycle-sn node 10 :dispose handle wid)
+           (%stage-data-sn node 11 handle bytes wid)
+           (dds.dcps::%drain dr)
+           (%check :dso-a-alive (eq :alive (%instance-rec-state dr handle))
+                   "dispose@10 then revive@11 in one pass must end ALIVE (higher SN wins)")
+           (%check :dso-a-gen (= 1 (%instance-rec-disp-gen dr handle))
+                   "the revive must bump disposed_generation_count to 1")
+           ;; Direction B: a fresh instance, data (lower SN 20) then dispose (higher SN 21) -> DISPOSED.
+           (let* ((sample2 (make-shape-type :color "RED" :x 9 :y 9 :shapesize 24))
+                  (handle2 (funcall (dds.types:type-support-key-hash ts) sample2))
+                  (bytes2 (dds.dcps::%serialize-sample ts sample2)))
+             (%stage-data-sn node 20 handle2 bytes2 wid)
+             (%stage-lifecycle-sn node 21 :dispose handle2 wid)
+             (dds.dcps::%drain dr)
+             (%check :dso-b-disposed (eq :not-alive-disposed (%instance-rec-state dr handle2))
+                     "data@20 then dispose@21 in one pass must end NOT_ALIVE_DISPOSED (higher SN wins)")
+             (%check :dso-b-gen (= 0 (%instance-rec-disp-gen dr handle2))
+                     "no revive occurred -> disposed_generation_count stays 0")))
+      (dds.dcps:delete-participant p))
+    t))
+
 ;;; RxO over the wire (M3 #1, FR-QOS-2): SEDP now carries the full QoS (reliability +
 ;;; durability), and endpoint-match-p uses dds.qos:qos-rxo-compatible. Incompatible QoS
 ;;; blocks endpoint matching even when topic+type agree. (Gating DATA delivery on the
