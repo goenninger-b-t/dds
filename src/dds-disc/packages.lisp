@@ -33,8 +33,9 @@
            #:+entityid-tl-reply-writer+ #:+entityid-tl-reply-reader+
            #:*typelookup-timeout* #:*max-typelookup-pending*
            #:type-lookup-query #:tl-sweep
+           #:assert-participant-liveliness #:disc-node-remote-liveliness-stamp
            #:disc-node-discovered-writers-list #:disc-node-discovered-readers-list
            #:run-spdp-discovery-test #:run-sedp-discovery-test
            #:run-mcast-discovery-test #:run-dataplane-test
-           #:run-large-dataplane-test
+           #:run-large-dataplane-test #:run-participant-liveliness-test
            #:run-locator-filter-test))

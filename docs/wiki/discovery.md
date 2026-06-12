@@ -52,7 +52,7 @@ The wire foundation of the Writer Liveliness Protocol (RTPS 2.5 §8.4.13). The
 
 - P2P built-in endpoint EntityIds (§9.6.2.2 / §8.4.13.2): `dds.rtps.discovery:+entityid-p2p-participant-message-writer+` = `{{00,02,00},c2}` (`#x000200c2`), `+entityid-p2p-participant-message-reader+` = `{{00,02,00},c7}` (`#x000200c7`).
 - `kind` values (§9.6.3.2), stored as the integer the wire `octet[4]` encodes big-endian: `+pmd-kind-unknown+` = 0 `{0,0,0,0}`, `+pmd-kind-automatic+` = 1 `{0,0,0,1}`, `+pmd-kind-manual-by-participant+` = 2 `{0,0,0,2}`.
-- `availableBuiltinEndpoints` bits (§9.4.2.10): `+be-participant-message-writer+` = bit 10, `+be-participant-message-reader+` = bit 11. Defined here but **not** yet in `+builtin-endpoint-set-default+` — advertising an endpoint that does not exist would claim an unimplemented capability; the bits are added when the endpoint is wired.
+- `availableBuiltinEndpoints` bits (§9.4.2.10): `+be-participant-message-writer+` = bit 10, `+be-participant-message-reader+` = bit 11. Both are set in `+builtin-endpoint-set-default+` now that the Writer Liveliness Protocol endpoints are wired (see the disc-layer section below).
 - `dds.rtps.discovery:make-participant-message` *(&key guid-prefix kind data)* — construct the struct (12-octet `GUID-PREFIX`, integer `KIND`, octet-vector `DATA`).
 - `dds.rtps.discovery:participant-message` / `participant-message-p` — the struct type and predicate.
 - Accessors: `participant-message-guid-prefix`, `participant-message-kind`, `participant-message-data`.
@@ -100,10 +100,18 @@ A minimal RTPS participant for discovery and the user-data plane.
 
 ### Announce & register endpoints (`dds.disc`)
 
-- `dds.disc:announce-participant` *(node)* — announce the node's `SPDPdiscoveredParticipantData` (SPDP builtin participant writer) to every unicast peer and, if multicast is enabled, to the well-known SPDP multicast group.
+- `dds.disc:announce-participant` *(node)* — announce the node's `SPDPdiscoveredParticipantData` (SPDP builtin participant writer) to every unicast peer and, if multicast is enabled, to the well-known SPDP multicast group. Also asserts the node's Writer Liveliness on the announce cadence (`assert-participant-liveliness`, RTPS 2.5 §8.4.13.5).
 - `dds.disc:add-local-writer` *(node &key topic type reliability key keyed qos type-information)* — register a local publication (writer endpoint). `KEYED` (default `T`) selects the RTPS 2.5 §9.3.1.2 entity kind: `WITH_KEY` `0x02` or `NO_KEY` `0x03`, and sets the node's data-plane writer EntityId accordingly (`0x102`/`0x103`). `TYPE-INFORMATION` is the opaque serialized XTypes `TypeInformation` for `PID_TYPE_INFORMATION`.
 - `dds.disc:add-local-reader` *(node &key topic type reliability key keyed qos type-information)* — register a local subscription (reader endpoint). `KEYED` (default `T`) selects the entity kind: reader `WITH_KEY` `0x07` or `NO_KEY` `0x04` (node id `0x107`/`0x104`). A keyed/no-key endpoint-kind disagreement is a silent non-match at discovery (`%match-remote-endpoint`); DCPS `create-datawriter`/`create-datareader` derive `KEYED` from `type-support-keyed-p` (a type with a `@key` member is keyed). Live-confirmed both directions vs Connext 7.3.1 (`interop/connext/nokey/`).
 - `dds.disc:announce-endpoints` *(node)* — send the node's local publications (SEDP publications writer) and subscriptions (SEDP subscriptions writer) to every discovered participant's metatraffic unicast locator (§8.5.4).
+
+### Writer Liveliness — assertion & inbound stamps (`dds.disc`)
+
+The disc layer wires the `BuiltinParticipantMessageWriter`/`Reader` (RTPS 2.5 §8.4.13) onto the discovery node, mirroring the TypeLookup endpoints.
+
+- `dds.disc:assert-participant-liveliness` *(node)* — assert the participant's Writer Liveliness on the announce cadence (§8.4.13.5). For each liveliness kind the local writers require — one `AUTOMATIC` instance if any local writer's `LIVELINESS` QoS is `:automatic`, one `MANUAL_BY_PARTICIPANT` instance if any is `:manual-by-participant` (the two are distinct DDS-key instances `participantGuidPrefix + kind`) — write one `ParticipantMessageData` to every discovered participant's metatraffic unicast locator via the `BuiltinParticipantMessageWriter`. Driven by `announce-participant`. `MANUAL_BY_TOPIC` is not carried by this protocol (§8.4.13.5). Cadence note: v1 uses the announce cadence as the assertion rate, which must (and does, for default leases) beat the smallest writer lease; a finer per-lease timer is a noted refinement.
+- Reliability (§8.4.13.3): the `BuiltinParticipantMessageWriter` is `RELIABLE` — each assertion is a DATA submessage followed by a non-final `HEARTBEAT` for the PM writer, so a reliable peer can NACK a loss. No per-sample resend store is kept: the assertion is periodic + idempotent, so the next cadence re-sends any lost sample.
+- `dds.disc:disc-node-remote-liveliness-stamp` *(node prefix kind)* — the internal-real-time stamp of the last liveliness assertion of `KIND` received from participant `PREFIX` (anti-spoof: keyed by the datagram's source GUID prefix), or `NIL` if none. The reader-side `LIVELINESS_CHANGED` status timing is a later task.
 
 ### Discovered / matched state (`dds.disc`)
 

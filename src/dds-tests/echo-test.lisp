@@ -378,6 +378,7 @@
                  ("spdp-discovery-over-udp"  . dds.disc:run-spdp-discovery-test)
                  ("sedp-matching-over-udp"   . dds.disc:run-sedp-discovery-test)
                  ("multicast-spdp-discovery" . dds.disc:run-mcast-discovery-test)
+                 ("participant-liveliness"   . dds.disc:run-participant-liveliness-test)
                  ("foreign-locator-robust"   . dds.disc:run-locator-filter-test)
                  ("reliable-data-over-udp"   . dds.disc:run-dataplane-test)
                  ("large-data-over-udp"      . dds.disc:run-large-dataplane-test)

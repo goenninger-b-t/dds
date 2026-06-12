@@ -36,7 +36,7 @@
 (defconstant +pmd-kind-manual-by-participant+ 2
   "PARTICIPANT_MESSAGE_DATA_KIND_MANUAL_LIVELINESS_UPDATE {0,0,0,2} (RTPS 2.5 §9.6.3.2).")
 
-;; WLP builtin-endpoint bits (RTPS 2.5 §9.4.2.10); NOT in +builtin-endpoint-set-default+ until the endpoint is wired.
+;; WLP builtin-endpoint bits (RTPS 2.5 §9.4.2.10); set in +builtin-endpoint-set-default+ (the WLP endpoints are wired).
 (defconstant +be-participant-message-writer+ (ash 1 10)
   "BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_WRITER availableBuiltinEndpoints bit 10 (RTPS 2.5 §9.4.2.10).")
 (defconstant +be-participant-message-reader+ (ash 1 11)
@@ -53,14 +53,16 @@
   "TypeLookupServiceReplyDataReader availableBuiltinEndpoints bit (XTypes 1.3 Table 62).")
 (defconstant +builtin-endpoint-set-default+
   (logior #x0000003F
+          +be-participant-message-writer+ +be-participant-message-reader+
           +be-tl-request-writer+ +be-tl-request-reader+
           +be-tl-reply-writer+ +be-tl-reply-reader+)
   "Default availableBuiltinEndpoints mask we announce in SPDP: SPDP/SEDP announcer+
-   detector bits 0-5 (BuiltinEndpointSet_t, RTPS 2.5 §9.3.2.12) plus the four
-   TypeLookup service bits 12-15 (XTypes 1.3 §7.6.3.3.4 Table 62). The
-   ParticipantMessage writer bit 10 is NOT set: the Writer Liveliness Protocol
-   builtin endpoint (RTPS 2.5 §8.4.13) is not implemented yet, so advertising it
-   would claim an unimplemented capability; the bit is re-added with the endpoint.")
+   detector bits 0-5 (BuiltinEndpointSet_t, RTPS 2.5 §9.3.2.12), the Writer Liveliness
+   Protocol ParticipantMessage writer+reader bits 10-11 (RTPS 2.5 §9.4.2.10; §8.4.13),
+   plus the four TypeLookup service bits 12-15 (XTypes 1.3 §7.6.3.3.4 Table 62). The
+   ParticipantMessage bits are set now that the Writer Liveliness Protocol builtin
+   endpoints are wired (the BuiltinParticipantMessageWriter periodically asserts this
+   participant's liveliness; the reader records inbound assertions).")
 
 (defconstant +locator-bytes+ 24
   "Locator_t size = {long kind; unsigned long port; octet address[16];} = 24 octets (RTPS 2.5 §9.3.2.1).")

@@ -20,7 +20,11 @@
    local endpoint; INCOMPAT maps a remote GUID whose topic+type agreed but whose QoS
    failed RxO (drives OFFERED/REQUESTED_INCOMPATIBLE_QOS). LOCK guards DISCOVERED +
    MATCHES + INCOMPAT + PARKED-MATCHES plus the TypeLookup service state (TL-PENDING,
-   TL-REQ-SN, TL-REPLY-SN, TL-SENT) across the receiver thread. ON-MATCH /
+   TL-REQ-SN, TL-REPLY-SN, TL-SENT) and the Writer Liveliness Protocol state
+   (PM-WRITER-SN, REMOTE-LIVELINESS) across the receiver thread. REMOTE-LIVELINESS maps
+   a (12-octet remote prefix . ParticipantMessageData kind) to the internal-real-time
+   stamp of the last inbound liveliness assertion from that participant (RTPS 2.5
+   §8.4.13.5); PM-WRITER-SN is the BuiltinParticipantMessageWriter's monotonic SN. ON-MATCH /
    ON-INCOMPATIBLE-QOS / ON-SAMPLE are optional control-plane hooks the DCPS layer
    installs to surface matched/incompatible events and newly-arrived user data to the
    application (DDS statuses, listeners, and the condvar-driven WaitSet wake); each
@@ -73,6 +77,9 @@
   (tl-req-sn 1 :type integer)
   (tl-reply-sn 1 :type integer)
   (tl-sent '() :type list) ; reply writer resend store: newest-first (sn . reply-octets)
+  ;; Writer Liveliness Protocol state (participant-message.lisp, RTPS 2.5 §8.4.13)
+  (pm-writer-sn 1 :type integer) ; BuiltinParticipantMessageWriter per-writer SN (1-based)
+  (remote-liveliness (make-hash-table :test 'equalp) :type hash-table) ; (12-octet prefix . kind) -> %lease-now stamp
 
   (on-data nil :type (or null function))
   (on-heartbeat nil :type (or null function))
@@ -193,7 +200,10 @@
   "Announce NODE's SPDPdiscoveredParticipantData (writer = SPDP builtin participant
    writer) to every unicast peer (FR-DISC-1/4) and, if multicast is enabled, to the
    well-known SPDP multicast group (FR-DISC-3). The SPDP data advertises the node's
-   unicast metatraffic locator, so SEDP comes back unicast either way."
+   unicast metatraffic locator, so SEDP comes back unicast either way. Also asserts
+   this participant's Writer Liveliness on the announce cadence (RTPS 2.5 §8.4.13.5,
+   via assert-participant-liveliness)."
+  (assert-participant-liveliness node)
   (incf (disc-node-spdp-sn node))
   (let ((sn (disc-node-spdp-sn node))
         (data (%node-spdp-data node)))
@@ -309,6 +319,10 @@
          (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)) t) %on-tl-data)
          (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) dds.core.buffer:cursor (unsigned-byte 8)) t) %on-tl-acknack)
          (ftype (function (disc-node) (eql t)) tl-sweep))
+
+;; Writer Liveliness Protocol handlers: defined in participant-message.lisp (loaded after this file).
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)) t) %on-participant-message)
+         (ftype (function (disc-node) (eql t)) assert-participant-liveliness))
 
 (defun* %builtin-reader-nl (node prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
@@ -749,6 +763,8 @@
                      (%builtin-on-data node src-prefix wtr sn))))
                 ((%tl-writer-p wtr)
                  (%on-tl-data node src-prefix wtr sn buf poff plen))
+                ((= wtr dds.rtps.discovery:+entityid-p2p-participant-message-writer+)
+                 (%on-participant-message node src-prefix wtr sn buf poff plen))
                 ((disc-node-on-data node)
                  (funcall (disc-node-on-data node) wtr sn buf poff plen))))))
          ((= id dds.rtps.message:+submsg-heartbeat+)
