@@ -773,18 +773,20 @@
               "C_Enum parses to a minimal-struct-type {id, e} — enum decodes structurally, no longer degrades")))
   t)
 
-;;; Legacy-TypeObject union/array degrading tier (Task 4.2). Two live Connext 7.3.1 captures
-;;; confirm the fail-open policy holds for UNION and ARRAY members (docs/provenance.md 2026-06-11):
+;;; Legacy-TypeObject union degrading tier (Task 4.2; array flipped OUT in Task 1.3). Two live
+;;; Connext 7.3.1 captures (docs/provenance.md 2026-06-11/06-12):
 ;;;
-;;;   C_Union  (@key long id; SomeUnion u)  — union member-kind = 0x15 (21).
-;;;   C_Array  (@key long id; long arr[4])  — array member-kind = 0x11 (17).
+;;;   C_Union  (@key long id; SomeUnion u)  — union member-kind = 0x15 (21): still UNMODELABLE.
+;;;   C_Array  (@key long id; long arr[4])  — array member-kind = 0x11 (17): now DECODES (Task 1.3).
 ;;;
-;;; Neither kind is in *lto-primitive-kind-keyword* (1–0x0C) nor in any other mapped arm
-;;; (0x12 sequence / 0x13 string / 0x16 nested struct), so %lto-member-type-identifier returns NIL;
-;;; %lto-member-has-kind-p is T; the Task-4.1 policy flip fires -> :unsupported. No guard needed
-;;; in %lto-member-type-identifier (no collision). Bitmask is NOT capturable (rtiddsgen 4.3.1
-;;; rejects the `bitmask` keyword): the gap is recorded in docs/provenance.md; the policy flip
-;;; will apply to whatever kind value bitmask would carry when a newer rtiddsgen is available.
+;;; The union kind is in neither *lto-primitive-kind-keyword* (1–0x0C) nor any mapped arm (0x12
+;;; sequence / 0x13 string / 0x16 nested struct / 0x0E enum / 0x11 array), so
+;;; %lto-member-type-identifier returns NIL; %lto-member-has-kind-p is T; the Task-4.1 policy flip
+;;; fires -> :unsupported. The array kind 0x11 now resolves to a plain-array TI (the full proof is in
+;;; run-lto-array-assignability-test) — this test cross-checks C_Array parses structurally. Bitmask is
+;;; NOT capturable (rtiddsgen 4.3.1 rejects the `bitmask` keyword): the gap is recorded in
+;;; docs/provenance.md; the policy flip will apply to whatever kind bitmask carries when a newer
+;;; rtiddsgen is available.
 
 (defun* %lto-connext-c-union-lb ()
     (function () (simple-array (unsigned-byte 8) (*)))
@@ -810,9 +812,9 @@
     (function () (simple-array (unsigned-byte 8) (*)))
   "The live RTI Connext 7.3.1 C_Array PID_TYPE_OBJECT_LB parameter value (200 octets), captured
    2026-06-11: `@final struct C_Array { @key long id; long arr[4]; }`. Inflates to a 416-octet
-   legacy TypeObject; the array member `arr` carries member-kind 0x11 (17) at VALUE-START+8 —
-   an UNMODELABLE kind (no array TI in assignability), so the whole parse degrades to :unsupported
-   (docs/provenance.md 2026-06-11)."
+   legacy TypeObject; the array member `arr` carries member-kind 0x11 (17) at VALUE-START+8,
+   referencing an ARRAY-definition node (CODE 3, element long=i32, single dimension 4) — decoded to a
+   plain-array TI (Task 1.3, docs/provenance.md 2026-06-12)."
   (coerce
    '(1 0 0 0 160 1 0 0 185 0 0 0 120 218 99 172 231 96 0 129 18 70 6 6 38 48 139 133 65 12 72 50
      2 197 57 129 244 5 40 27 4 100 64 108 176 44 3 131 80 130 235 165 205 237 21 9 32 25 231 120
@@ -826,14 +828,14 @@
 
 (defun* run-lto-parse-aggregates-unsupported-test ()
     (function () t)
-  "Test: the degrading policy holds for UNION and ARRAY members (Task 4.2). For each of the two live
-   Connext 7.3.1 captures (C_Union / C_Array), parse-legacy-type-object returns :unsupported because
-   the respective member-kind (union=0x15, array=0x11) is UNMODELABLE — absent from all mapped arms
-   and from *lto-primitive-kind-keyword* — so %lto-member-type-identifier NIL + %lto-member-has-kind-p
-   T triggers the Task-4.1 policy flip. The fingerprint strings confirm each capture is the right type.
-   No guard was added to %lto-member-type-identifier (no kind collision). Bitmask is recorded as a
-   gap (rtiddsgen 4.3.1 rejects `bitmask`). Pinned to the live Connext 7.3.1 corpus
-   (docs/provenance.md 2026-06-11)."
+  "Test: the degrading policy holds for the UNION member (Task 4.2), while the ARRAY member now
+   decodes structurally (Task 1.3). The live C_Union capture parses to :unsupported because its union
+   member-kind (0x15) is UNMODELABLE — absent from all mapped arms and from *lto-primitive-kind-keyword*
+   — so %lto-member-type-identifier NIL + %lto-member-has-kind-p T triggers the Task-4.1 policy flip.
+   The live C_Array capture (member-kind 0x11) now parses to a minimal-struct-type (cross-check; the
+   full plain-array TI + assignability proof is in run-lto-array-assignability-test). The fingerprint
+   strings confirm each capture is the right type. Bitmask is recorded as a gap (rtiddsgen 4.3.1
+   rejects `bitmask`). Pinned to the live Connext 7.3.1 corpus (docs/provenance.md 2026-06-11/06-12)."
   ;; C_Union: member-kind 0x15 (union), unmodelable -> :unsupported
   (let* ((lb (%lto-connext-c-union-lb))
          (inflated (dds.types:inflate-type-object-lb lb)))
@@ -849,7 +851,7 @@
       (%check :lto-union-unsupported
               (eq (dds.types:parse-legacy-type-object inflated) :unsupported)
               "C_Union parses to :unsupported — union member-kind 0x15 is unmodelable, fail-open")))
-  ;; C_Array: member-kind 0x11 (array), unmodelable -> :unsupported
+  ;; C_Array: member-kind 0x11 (array), now decodes structurally (Task 1.3) -> minimal-struct-type
   (let* ((lb (%lto-connext-c-array-lb))
          (inflated (dds.types:inflate-type-object-lb lb)))
     (%check :lto-array-inflate
@@ -861,9 +863,9 @@
                 (every (lambda (s) (member s strs :test #'string=))
                        '("C_Array" "arr"))
                 "the C_Array capture carries C_Array / arr fingerprint strings"))
-      (%check :lto-array-unsupported
-              (eq (dds.types:parse-legacy-type-object inflated) :unsupported)
-              "C_Array parses to :unsupported — array member-kind 0x11 is unmodelable, fail-open")))
+      (%check :lto-array-structural
+              (dds.types:minimal-struct-type-p (dds.types:parse-legacy-type-object inflated))
+              "C_Array now parses to a minimal-struct-type — array member-kind 0x11 decodes (Task 1.3)")))
   ;; cross-check: the flat @key long id members (kind 0x05 = TK_INT32) are not the cause;
   ;; C_Shape (only long/string members) still parses to a full minimal-struct-type.
   (let* ((shape-inf (dds.types:inflate-type-object-lb (%connext-c-shape-lb))))
@@ -963,4 +965,81 @@
         (%check :lto-enum-asgn-no-false-reject
                 (dds.types:struct-assignable-from parsed (%build-c-enum-local 2) opts)
                 "no false-reject: the compatible case still holds after the incompatible one"))))
+  t)
+
+;;; Legacy-TypeObject ARRAY member structural decode + assignability (Task 1.3, FR-TYPE-4 S1).
+;;; The live C_Array capture (`@final struct C_Array { @key long id; long arr[4]; }`) now parses to
+;;; a minimal-struct-type whose `arr` member is a plain-array TI (i32 x4), flipping array OUT of the
+;;; degrade tier. The differential (docs/provenance.md 2026-06-12) localized: the array member node
+;;; carries kind 0x11 (17) at VALUE-START+8 plus the same 8-octet type-hash@+16 referencing an
+;;; ARRAY-definition node (CODE 3) whose CODE-0 child echoes that hash at VALUE-START+8, whose CODE-100
+;;; child holds the element type-kind (u16, RTI's primitive enum: long 5) and whose CODE-200 child
+;;; holds the dimension list (count:u32 then COUNT bounds:u32 — multi-dim/count/=1 fails open).
+
+(defun* %build-c-array-local (elem-keyword size)
+    (function (keyword (integer 1)) dds.types:minimal-struct-type)
+  "A locally-built minimal-struct-type mirroring the live C_Array: @final, @key long id (id 0) +
+   array member arr (id 1) over (array-type-identifier (primitive-type-identifier ELEM-KEYWORD) SIZE).
+   ELEM-KEYWORD :i32 + SIZE 4 = matching the corpus; :i16 (element mismatch) or 5 (size mismatch)
+   = provably-incompatible. Member ids match the parsed model (declaration order: id 0, arr 1). Test
+   fixture."
+  (dds.types:make-minimal-struct-type
+   :name "C_Array" :extensibility :final
+   :members (list (dds.types:make-struct-member
+                   "id" 0 (dds.types:primitive-type-identifier :i32) :key-p t)
+                  (dds.types:make-struct-member
+                   "arr" 1
+                   (dds.types:array-type-identifier
+                    (dds.types:primitive-type-identifier elem-keyword) size)))))
+
+(defun* run-lto-array-assignability-test ()
+    (function () t)
+  "Test: the live C_Array legacy TypeObject parses to a minimal-struct-type whose `arr` member is a
+   plain-array TI (i32 x4), and struct-assignable-from gates it (Task 1.3, FR-TYPE-4 S1): a matching
+   local is assignable both ways; a local with arr[5] (size) or short arr[4] (element kind) is not;
+   no false-reject on re-run. Pinned to the live Connext 7.3.1 corpus (docs/provenance.md 2026-06-12)."
+  (let* ((lb (%lto-connext-c-array-lb))
+         (inflated (dds.types:inflate-type-object-lb lb))
+         (parsed (dds.types:parse-legacy-type-object inflated)))
+    (%check :lto-array-asgn-parse
+            (dds.types:minimal-struct-type-p parsed)
+            "the live C_Array legacy TypeObject parses to a minimal-struct-type (array no longer degrades)")
+    (when (dds.types:minimal-struct-type-p parsed)
+      ;; the `arr` member is a plain-array TI over an i32 element with size 4
+      (let* ((arr (%lto-member-named parsed "arr"))
+             (ati (and arr (dds.types:minimal-struct-member-type-identifier arr)))
+             (elt (and ati (dds.types:type-identifier-element ati))))
+        (%check :lto-array-member-ti
+                (and ati (dds.types:ti-array-p ati)
+                     (= (dds.types:type-identifier-bound ati) 4)
+                     elt (= (dds.types:type-identifier-kind elt) dds.types:+tk-int32+))
+                "the `arr` member decodes to a plain-array TI (element i32, size 4)")
+        ;; the @key long id member stays a flat TK_INT32 @key
+        (let* ((idm (%lto-member-named parsed "id"))
+               (idti (and idm (dds.types:minimal-struct-member-type-identifier idm))))
+          (%check :lto-array-id
+                  (and idm (dds.types:minimal-struct-member-key-p idm)
+                       idti (= (dds.types:type-identifier-kind idti) dds.types:+tk-int32+))
+                  "the @key long id member stays a flat TK_INT32")))
+      ;; the parsed wire model drives the REAL struct-assignable-from gate through the array row
+      (let* ((opts (dds.types:default-assignability-options))
+             (good (%build-c-array-local :i32 4))
+             (bad-size (%build-c-array-local :i32 5))
+             (bad-elem (%build-c-array-local :i16 4)))
+        (%check :lto-array-asgn-compatible
+                (dds.types:struct-assignable-from parsed good opts)
+                "the parsed C_Array is assignable from a matching local (compatible -> T)")
+        (%check :lto-array-asgn-compatible-rev
+                (dds.types:struct-assignable-from good parsed opts)
+                "a matching local is assignable from the parsed C_Array (both directions)")
+        (%check :lto-array-asgn-incompat-size
+                (not (dds.types:struct-assignable-from parsed bad-size opts))
+                "a local with arr[5] (size mismatch) is NOT assignable (arrays not resizable -> NIL)")
+        (%check :lto-array-asgn-incompat-elem
+                (not (dds.types:struct-assignable-from parsed bad-elem opts))
+                "a local with short arr[4] (element kind mismatch) is NOT assignable (-> NIL)")
+        ;; no false-reject: re-running the compatible case after the incompatible ones still holds
+        (%check :lto-array-asgn-no-false-reject
+                (dds.types:struct-assignable-from parsed (%build-c-array-local :i32 4) opts)
+                "no false-reject: the compatible case still holds after the incompatible ones"))))
   t)

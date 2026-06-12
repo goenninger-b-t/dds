@@ -754,6 +754,55 @@ the Stage-5 gate falls open to name-match and never sees a partial model with a 
   are tracked; all `rtiddsgen` output, `corpus_pub`, and the symlinked RTI dylibs stay git-ignored
   (NFR-IP).
 
+### C_Array legacy array def-node — structural array decode (Task 1.3 / FR-TYPE-4 S1, 2026-06-12)
+
+Method: clean-room differential over the SAME locked C_Array capture (200-octet LB, 416-octet
+inflated), meanings ONLY from captured bytes — the tokenized tree was dumped (each node's
+tag/code/[value-start,value-end) + leading value bytes) and read directly; no RTI source / GPL
+dissector. This RE flips array OUT of the Task-4.1/4.2 degrade tier into a real plain-array
+TypeIdentifier (element TI + single fixed dimension), mirroring the enum stage's def-node pattern.
+
+- **Array member `arr`** (member-list CODE-0 child node `[188..220)`):
+  bytes `00000000 | 01000000 | 1100 0000 | 00000000 | 5BCD0715 3AEAD633 | 04000000 | 61727200`.
+  `+0` key=0, `+4` id=1, `+8` u16 kind = **0x11 (17)** = array (already pinned in Task 4.2), `+16`
+  8-octet type-hash `5B CD 07 15 3A EA D6 33` — the SAME hash@+16 reference mechanism strings
+  (0x13/CODE-8), sequences (0x12/CODE-7), nested structs (0x16/CODE-9) and enums (0x0E/CODE-5) use.
+- **Array-def node = CODE 3** (`+lto-code-array-def+`), node `[268..380)`. Its CODE-0 child `[280..316)`
+  (name="array_4_Int32", RTI's internal array-type token) echoes the member's hash at its
+  `VALUE-START+8`: `5B CD 07 15 3A EA D6 33` — byte-identical to the member's `+16` hash. So
+  `%lto-find-def-node octets root member-node 3` resolves it by the shared hash-reference pattern.
+  CODE 3 is the unique node whose CODE-0 child carries this hash; no other tier (string-def 8 /
+  sequence-def 7 / enum-def 5 / struct-def 9) carries it.
+- **Element-kind child = CODE 100** (`+lto-code-array-element+`), child `[344..348)` = `05 00 05 00`
+  → u16@+0 = **0x05 = RTI `long` → i32 / TK_INT32** (repeated at +2, same as the sequence element-kind
+  child). Mapped via `*lto-primitive-kind-keyword*` (5 → `:i32`). Element-of-non-primitive (a kind
+  absent from that table) yields NIL → member unmodelable → whole parse degrades (fail-open). CODE
+  value 100 coincides with the sequence element-type child and the enum bit-bound child; all three
+  are disambiguated by the PARENT code (array-def 3 vs sequence-def 7 vs enum-def 5).
+- **Dimension child = CODE 200** (`+lto-code-array-dims+`), child `[368..376)`, 8 bytes:
+  `01 00 00 00  04 00 00 00` → `count:u32 = 1`, then `dim[0]:u32 = 4`. Layout: a dimension COUNT
+  followed by COUNT u32 bounds. For `long arr[4]` (1-D, size 4): count=1, dim[0]=4 — matching the
+  `Corpus.idl` ground truth. **Multi-dim detection/rejection**: the decoder requires count = 1 AND
+  the child extent exactly 8 octets (4 count + 4 single bound); a count ≠ 1 (or a longer extent
+  carrying additional bounds) is a MULTI-DIM array → NIL → member unmodelable → whole parse degrades
+  to `:unsupported` (fail-open — the in-memory model carries a single fixed dimension only; multi-dim
+  is a documented decode gap). CODE value 200 coincides with the string/sequence bound child;
+  disambiguated by parent code (array-def 3 vs string-def 8 / sequence-def 7).
+- **Cross-check**: element = i32 (RTI kind 5), size = 4, dims = [4], ONE dimension — exactly the
+  `@final struct C_Array { @key long id; long arr[4]; }` ground truth.
+- **Assignability proof** (`run-lto-array-assignability-test`): the parsed C_Array's `arr` member is
+  a plain-array TI (i32 × 4). `struct-assignable-from` gates it: a matching local (i32 × 4) is
+  assignable both ways; a local with arr[5] (size mismatch — arrays are not resizable, identical
+  dimensions required per XTypes 1.3 §7.2.4.4.6 Table 17) or short arr[4] (element kind mismatch) is
+  NOT; re-running the compatible case proves no false-reject.
+- **Decoded coverage update**: array (0x11) is now **structurally modeled** (no longer in the degrade
+  tier). The remaining degrade tier is union (0x15) / bitmask (uncaptured) / map / typedef +
+  sequence/array-of-aggregate — still `:unsupported` (fail-open). Multi-dim array + array-of-aggregate
+  + array-of-string are recorded fail-open residue (the in-memory model is single-dimension,
+  primitive-element only).
+- **Corpus artifacts**: unchanged from the Task-4.2 entry — no new capture taken; this RE re-reads
+  the existing C_Array bytes. `rtiddsgen` output + RTI dylibs stay git-ignored (NFR-IP).
+
 ### Live legacy-TypeObject type-gating acceptance test (Task 6.1, ADR 0011, 2026-06-11)
 
 - **What was consulted**: live RTI Connext 7.3.1 on the wire only — its SEDP `PID_TYPE_OBJECT_LB`

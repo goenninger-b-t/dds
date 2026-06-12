@@ -329,6 +329,38 @@
    decoder reads it only via the resolved enum-def node, so there is no collision. Reverse-engineered
    clean-room from the C_Enum differential (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
 
+(defconstant +lto-member-kind-array+ #x11
+  "Legacy-TypeObject member type-kind u16 (at a member node's VALUE-START+8) marking an ARRAY
+   member: its element kind + dimensions live in a referenced +LTO-CODE-ARRAY-DEF+ node (NOT inline),
+   addressed by the same 8-octet type-hash@+16 mechanism strings (0x13), sequences (0x12), nested
+   structs (0x16) and enums (0x0E) use (array is 0x11). Reverse-engineered clean-room from the C_Array
+   differential (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-array-def+ 3
+  "Legacy-TypeObject node CODE marking an ARRAY-definition node: an array member's node carries an
+   8-octet type-hash (at member VALUE-START+16) referencing this node, whose CODE-0 child echoes that
+   hash at its VALUE-START+8, whose +LTO-CODE-ARRAY-ELEMENT+ (100) child holds the element type-kind
+   (u16, RTI's primitive enum) and whose +LTO-CODE-ARRAY-DIMS+ (200) child holds the dimension list
+   (count:u32 then COUNT bounds:u32). Reverse-engineered clean-room from the C_Array differential
+   (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-array-element+ 100
+  "Legacy-TypeObject node CODE marking the element-type child of a +LTO-CODE-ARRAY-DEF+ node: the
+   element type-kind is the u16 at this child's VALUE-START (RTI's OWN primitive enum,
+   *LTO-PRIMITIVE-KIND-KEYWORD*, repeated at +2). Shares the CODE value (100) with the sequence
+   element-type and the enum bit-bound children, disambiguated by parent CODE (array-def 3 vs
+   sequence-def 7 vs enum-def 5). Reverse-engineered clean-room from the C_Array differential
+   (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-array-dims+ 200
+  "Legacy-TypeObject node CODE marking the dimension-list child of a +LTO-CODE-ARRAY-DEF+ node: its
+   value is count:u32 at VALUE-START then COUNT bounds:u32 (for `long arr[4]`: count=1, dim[0]=4). The
+   decoder accepts ONLY a single-dimension array (count=1, child extent exactly 8 octets); count/=1 or
+   a longer extent is a MULTI-DIM array → fail open (the in-memory model is single-dimension). Shares
+   the CODE value (200) with the string/sequence bound child, disambiguated by parent CODE (array-def 3
+   vs string-def 8 / sequence-def 7). Reverse-engineered clean-room from the C_Array differential
+   (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
 (defparameter *lto-max-enum-literals* 4096
   "Max enum literals the legacy-TypeObject enum decoder will read from a +LTO-CODE-ENUM-LITERALS+
    node before failing open (NFR-SEC-POSTURE): a resource-exhaustion guard bounding a hostile
@@ -453,6 +485,44 @@
           (let ((kw (cdr (assoc ek *lto-primitive-kind-keyword*))))
             (and kw (sequence-type-identifier (primitive-type-identifier kw) bound))))))))
 
+(defun* %lto-array-single-dim (octets def-node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node) (or null (integer 1)))
+  "The single fixed dimension of array-definition DEF-NODE: read its +LTO-CODE-ARRAY-DIMS+ child,
+   whose value is count:u32 at VALUE-START then COUNT bounds:u32. Returns the lone bound (dim[0],
+   >= 1) for a 1-D array (count = 1 AND the child value extent is exactly 8 octets: 4 count + 4 one
+   bound), else NIL — a MULTI-DIM array (count /= 1 or a longer extent carrying extra bounds), a zero
+   bound, or a missing/OOB field fails open (the in-memory model is single-dimension). Every span
+   bounds-checked against the child's VALUE-END FIRST (NFR-SEC-POSTURE). Clean-room
+   (docs/provenance.md 2026-06-12)."
+  (dolist (c (lto-node-children def-node))
+    (when (and (= (lto-node-tag c) +lto-tag-long+) (= (lto-node-code c) +lto-code-array-dims+))
+      (let* ((vs (lto-node-value-start c))
+             (ve (lto-node-value-end c))
+             (count (%lto-u32 octets vs ve))
+             (dim (%lto-u32 octets (+ vs 4) ve)))
+        (return-from %lto-array-single-dim
+          (and count dim (= count 1) (= (- ve vs) 8) (>= dim 1) dim)))))
+  nil)
+
+(defun* %lto-array-type-identifier (octets root member-node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node lto-node) (or null type-identifier))
+  "The TypeIdentifier for an ARRAY member-node: resolve its referenced +LTO-CODE-ARRAY-DEF+ node
+   (%LTO-FIND-DEF-NODE), read the element type-kind (u16) from its +LTO-CODE-ARRAY-ELEMENT+ child and
+   the single fixed dimension from its +LTO-CODE-ARRAY-DIMS+ child (%LTO-ARRAY-SINGLE-DIM), and build
+   an ARRAY-TYPE-IDENTIFIER over the decoded PRIMITIVE element + size. The element is decoded via
+   *LTO-PRIMITIVE-KIND-KEYWORD* — array-of-PRIMITIVE only; a non-primitive element kind (string /
+   nested aggregate / sequence) yields NIL (member TI stays NIL, parse degrades). A MULTI-DIM array
+   (dimension count /= 1) also yields NIL (single-dimension model only). NIL if the reference, the
+   element-kind, or the dimension field is missing/OOB — every span bounds-checked FIRST
+   (NFR-SEC-POSTURE). Clean-room (docs/provenance.md 2026-06-12)."
+  (let ((adef (%lto-find-def-node octets root member-node +lto-code-array-def+)))
+    (when adef
+      (let ((ek (%lto-def-child-u16 octets adef +lto-code-array-element+))
+            (size (%lto-array-single-dim octets adef)))
+        (when (and ek size)
+          (let ((kw (cdr (assoc ek *lto-primitive-kind-keyword*))))
+            (and kw (array-type-identifier (primitive-type-identifier kw) size))))))))
+
 (defun* %lto-enum-literals (octets lit-node)
     (function ((simple-array (unsigned-byte 8) (*)) lto-node) (or null list))
   "Decode the literal list of an enum's +LTO-CODE-ENUM-LITERALS+ child LIT-NODE into a list of
@@ -558,11 +628,13 @@
    (%LTO-SEQUENCE-TYPE-IDENTIFIER); kind +LTO-MEMBER-KIND-STRUCT+ (0x16) resolves + parses the
    referenced +LTO-CODE-STRUCT+ node (%LTO-NESTED-TYPE-IDENTIFIER, recursive under DEPTH/VISITED
    guards); kind +LTO-MEMBER-KIND-ENUM+ (0x0E) resolves the bit-bound + literals from the referenced
-   +LTO-CODE-ENUM-DEF+ node (%LTO-ENUM-TYPE-IDENTIFIER) into an EK_MINIMAL enumerated TI — all under
+   +LTO-CODE-ENUM-DEF+ node (%LTO-ENUM-TYPE-IDENTIFIER) into an EK_MINIMAL enumerated TI; kind
+   +LTO-MEMBER-KIND-ARRAY+ (0x11) resolves the element kind + single dimension from the referenced
+   +LTO-CODE-ARRAY-DEF+ node (%LTO-ARRAY-TYPE-IDENTIFIER) into a plain-array TI — all under
    ROOT. DEPTH + VISITED bound nested-struct recursion (*LTO-MAX-TYPE-DEPTH*
-   and a visited-hash cycle guard). Returns NIL for a sequence-of-non-primitive (Task 3.x), an
-   over-depth/cyclic nested struct, or when the kind field is OOB — bounds-checked against
-   VALUE-END FIRST (NFR-SEC-POSTURE)."
+   and a visited-hash cycle guard). Returns NIL for a sequence/array-of-non-primitive (Task 3.x), a
+   multi-dim array, an over-depth/cyclic nested struct, or when the kind field is OOB — bounds-checked
+   against VALUE-END FIRST (NFR-SEC-POSTURE)."
   (let ((kind (%lto-u16 octets (+ (lto-node-value-start node) 8) (lto-node-value-end node))))
     (cond
       ((null kind) nil)
@@ -575,6 +647,8 @@
        (%lto-nested-type-identifier octets root node depth visited))
       ((= kind +lto-member-kind-enum+)
        (%lto-enum-type-identifier octets root node))
+      ((= kind +lto-member-kind-array+)
+       (%lto-array-type-identifier octets root node))
       (t (let ((kw (cdr (assoc kind *lto-primitive-kind-keyword*))))
            (and kw (primitive-type-identifier kw)))))))
 
@@ -632,7 +706,7 @@
    arm). Returns a MINIMAL-STRUCT-TYPE on success, :UNSUPPORTED when SDEF carries no type name /
    no member-list container / no members / a member-count mismatch (mirroring the top-level
    discipline) OR when any member declares a type (kind word present) that cannot be modeled
-   (%LTO-MEMBER-TYPE-IDENTIFIER NIL: an unmapped kind — enum/union/array/bitmask — an unresolvable
+   (%LTO-MEMBER-TYPE-IDENTIFIER NIL: an unmapped kind — union/bitmask/multi-dim-array — an unresolvable
    hash, or an over-depth/cyclic nested struct) — the degrading policy (the operating contract,
    Task 4.1): an unmodelable member fails the WHOLE parse open to :unsupported rather than emit a
    partial model with a NIL-TI member the Stage-5 gate could mis-handle. Every wire read is
@@ -686,9 +760,11 @@
    a NESTED-STRUCT member gets an EK_MINIMAL HASH-TYPE-IDENTIFIER whose REFERENCED slot is the
    parsed nested MINIMAL-STRUCT-TYPE — resolved from the referenced +LTO-CODE-STRUCT+ TypeLibrary-
    sibling node, recursively, under *LTO-MAX-TYPE-DEPTH* + a visited-hash cycle guard (Task 3.2);
+   an ARRAY-of-primitive member gets a plain-array TI (element kind + single fixed dimension) resolved
+   from the referenced +LTO-CODE-ARRAY-DEF+ node (Task 1.3);
    a member that declares a type the model cannot represent — an unmapped member-kind word
-   (enum/union/array/bitmask), an unresolvable hash, a sequence-of-aggregate, or an over-depth/cyclic
-   nested struct — degrades the WHOLE result to :UNSUPPORTED (the operating contract, Task 4.1: fail
+   (union/bitmask), an unresolvable hash, a sequence/array-of-aggregate, a multi-dim array, or an
+   over-depth/cyclic nested struct — degrades the WHOLE result to :UNSUPPORTED (the operating contract, Task 4.1: fail
    the unmodelable member OPEN to name-match at the Stage-5 gate, never gate on a partial model with
    a NIL-TI member). Each member's @key flag is set from the wire (%LTO-MEMBER-KEY-P). EXTENSIBILITY is
    decoded from the wire (%LTO-STRUCT-EXTENSIBILITY: :final/:appendable/:mutable; an unknown flag
