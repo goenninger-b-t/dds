@@ -21,6 +21,7 @@
            #:disc-node-on-inconsistent-topic
            #:disc-node-type-gate #:resume-parked-matches #:disc-node-parked-count
            #:add-local-writer #:add-local-reader
+           #:disc-node-user-writer-id #:disc-node-user-reader-id
            #:start-node #:stop-node
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber

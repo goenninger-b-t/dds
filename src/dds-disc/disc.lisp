@@ -58,6 +58,8 @@
   (rx-tx-msg nil :type (or null dds.core.buffer:octet-buffer))
   (user-writer nil :type (or null dds.rtps.reliable:rtps-writer))
   (user-reader nil :type (or null dds.rtps.reliable:rtps-reader))
+  (user-writer-id #x00000102 :type (unsigned-byte 32)) ; this node's user-data writer EntityId (kind reflects keyed-ness)
+  (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
   (samples (make-hash-table :test 'eql) :type hash-table)
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
@@ -213,31 +215,39 @@
 
 (defun* add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
-                                   (key 1) qos type-information)
-    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t)) dds.rtps.discovery:endpoint-data)
+                                   (key 1) qos type-information (keyed t))
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t) (:keyed t)) dds.rtps.discovery:endpoint-data)
   "Register a local publication (writer endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
-   TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP.
-   Entity kind 0x02 (writer WITH key): the data plane is keyed (matching the keyed reader
-   kind 0x07), and a keyed remote reader (RTI Connext) will not match a no-key writer."
-  (let ((ep (dds.rtps.discovery:make-endpoint-data
-             :guid (%make-endpoint-guid (disc-node-guid-prefix node) key #x02)
-             :topic-name topic :type-name type :type-information type-information
-             :qos (or qos (%qos-from-reliability reliability)))))
+   TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP. KEYED
+   selects the RTPS entity kind (RTPS 2.5 §9.3.1.2 Table 9.1): T (default) -> 0x02 (writer
+   WITH_KEY), NIL -> 0x03 (writer NO_KEY); a keyed remote reader (RTI Connext) will not
+   match a no-key writer. Sets NODE's user-writer-id so the data plane sends with this id."
+  (let* ((kind (if keyed #x02 #x03))
+         (ep (dds.rtps.discovery:make-endpoint-data
+              :guid (%make-endpoint-guid (disc-node-guid-prefix node) key kind)
+              :topic-name topic :type-name type :type-information type-information
+              :qos (or qos (%qos-from-reliability reliability)))))
+    (setf (disc-node-user-writer-id node) (logior (ash key 8) kind))
     (push ep (disc-node-local-writers node))
     ep))
 
 (defun* add-local-reader (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-best-effort+)
-                                   (key 1) qos type-information)
-    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t)) dds.rtps.discovery:endpoint-data)
+                                   (key 1) qos type-information (keyed t))
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t) (:keyed t)) dds.rtps.discovery:endpoint-data)
   "Register a local subscription (reader endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
-   TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP."
-  (let ((ep (dds.rtps.discovery:make-endpoint-data
-             :guid (%make-endpoint-guid (disc-node-guid-prefix node) key #x07)
-             :topic-name topic :type-name type :type-information type-information
-             :qos (or qos (%qos-from-reliability reliability)))))
+   TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP. KEYED
+   selects the RTPS entity kind (RTPS 2.5 §9.3.1.2 Table 9.1): T (default) -> 0x07 (reader
+   WITH_KEY), NIL -> 0x04 (reader NO_KEY). Sets NODE's user-reader-id so the data plane
+   routes HEARTBEAT/ACKNACK with this id."
+  (let* ((kind (if keyed #x07 #x04))
+         (ep (dds.rtps.discovery:make-endpoint-data
+              :guid (%make-endpoint-guid (disc-node-guid-prefix node) key kind)
+              :topic-name topic :type-name type :type-information type-information
+              :qos (or qos (%qos-from-reliability reliability)))))
+    (setf (disc-node-user-reader-id node) (logior (ash key 8) kind))
     (push ep (disc-node-local-readers node))
     ep))
 

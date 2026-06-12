@@ -1752,6 +1752,51 @@
               "an explicit RELIABLE PID_RELIABILITY overrides the reader BEST_EFFORT default")))
   t)
 
+(defun* run-endpoint-kind-test ()
+    (function () t)
+  "add-local-writer/reader pick the RTPS entity kind from :keyed and set the node's
+   data-plane user ids: keyed (default) -> writer 0x02/id 0x102, reader 0x07/id 0x107;
+   no-key -> writer 0x03/id 0x103, reader 0x04/id 0x104."
+  (let ((kn (dds.disc:make-disc-node
+             :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 1)
+             :host "127.0.0.1" :port 0))
+        (nn (dds.disc:make-disc-node
+             :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 2)
+             :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (let ((w (dds.disc:add-local-writer kn :topic "T" :type "X"))
+                 (r (dds.disc:add-local-reader kn :topic "T" :type "X")))
+             (%check :endpoint-keyed-writer-kind
+                     (= #x02 (aref (dds.rtps.discovery:endpoint-data-guid w) 15))
+                     "keyed writer announces entity kind 0x02 (WITH_KEY)")
+             (%check :endpoint-keyed-reader-kind
+                     (= #x07 (aref (dds.rtps.discovery:endpoint-data-guid r) 15))
+                     "keyed reader announces entity kind 0x07 (WITH_KEY)")
+             (%check :endpoint-keyed-writer-id
+                     (= #x00000102 (dds.disc:disc-node-user-writer-id kn))
+                     "keyed node carries data-plane writer id 0x102")
+             (%check :endpoint-keyed-reader-id
+                     (= #x00000107 (dds.disc:disc-node-user-reader-id kn))
+                     "keyed node carries data-plane reader id 0x107"))
+           (let ((w (dds.disc:add-local-writer nn :topic "T" :type "X" :keyed nil))
+                 (r (dds.disc:add-local-reader nn :topic "T" :type "X" :keyed nil)))
+             (%check :endpoint-nokey-writer-kind
+                     (= #x03 (aref (dds.rtps.discovery:endpoint-data-guid w) 15))
+                     "no-key writer announces entity kind 0x03 (NO_KEY)")
+             (%check :endpoint-nokey-reader-kind
+                     (= #x04 (aref (dds.rtps.discovery:endpoint-data-guid r) 15))
+                     "no-key reader announces entity kind 0x04 (NO_KEY)")
+             (%check :endpoint-nokey-writer-id
+                     (= #x00000103 (dds.disc:disc-node-user-writer-id nn))
+                     "no-key node carries data-plane writer id 0x103")
+             (%check :endpoint-nokey-reader-id
+                     (= #x00000104 (dds.disc:disc-node-user-reader-id nn))
+                     "no-key node carries data-plane reader id 0x104")))
+      (dds.disc:stop-node kn)
+      (dds.disc:stop-node nn)))
+  t)
+
 ;;; TypeLookup builtin endpoints over UDP (M4 Task 3.2, FR-TYPE-3): the four
 ;;; XTypes 1.3 Table 61 service endpoints wired into the discovery node — a client
 ;;; type-lookup-query fetches a peer's TypeObject by EquivalenceHash; the peer's

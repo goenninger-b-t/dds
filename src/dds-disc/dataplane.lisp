@@ -114,7 +114,7 @@
     (if (<= size dds.rtps.reliable:*fragment-size*)
         (%send-msg-buf node buf
                        (lambda (mc) (dds.rtps.message:write-data
-                                     mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn pl 0 size))
+                                     mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn pl 0 size))
                        host port)
         (let ((budget (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
           (dolist (desc (dds.rtps.reliable:writer-frag-plan size dds.rtps.reliable:*fragment-size* budget))
@@ -124,7 +124,7 @@
                                    thereis (member f *debug-drop-fragment-numbers*)))
                 (%send-msg-buf node buf
                                (lambda (mc) (dds.rtps.message:write-data-frag
-                                             mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn size
+                                             mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn size
                                              fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
                                host port))))
           (multiple-value-bind (lastfrag cnt)
@@ -132,7 +132,7 @@
             (when lastfrag
               (%send-msg-buf node buf
                              (lambda (mc) (dds.rtps.message:write-heartbeat-frag
-                                           mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn lastfrag cnt))
+                                           mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn lastfrag cnt))
                              host port)))))))
 
 (defun* %push-data (node)
@@ -141,14 +141,14 @@
    for large samples) submessage, followed by a HEARTBEAT, to each peer (caller thread; uses tx-msg)."
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
-      (let ((datas (dds.rtps.reliable:writer-data-list writer +user-reader-id+)))
+      (let ((datas (dds.rtps.reliable:writer-data-list writer (disc-node-user-reader-id node))))
         (dolist (peer (%match-destinations node t))   ; DATA + HEARTBEAT -> matched readers
           (dolist (d datas)
             (%send-sample node (disc-node-tx-msg node) (car d) (cdr d) (car peer) (cdr peer)))
           (%send-msg-buf node (disc-node-tx-msg node)
                          (lambda (mc)
                            (dds.rtps.message:write-heartbeat
-                            mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ first last count :final nil))
+                            mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) first last count :final nil))
                          (car peer) (cdr peer)))))))
 
 (defun* publish-sample (node payload)
@@ -194,7 +194,7 @@
                                ;; writerEntityId = the REMOTE writer's id (WID), so the peer
                                ;; routes the ACKNACK to its writer (not our local convention).
                                (dds.rtps.message:write-acknack
-                                mc +user-reader-id+ wid base numbits bitmap cnt :final t))
+                                mc (disc-node-user-reader-id node) wid base numbits bitmap cnt :final t))
                              (car peer) (cdr peer))))))))
   t)
 
@@ -205,11 +205,11 @@
   (multiple-value-bind (rid wid base numbits bitmap count finalp)
       (dds.rtps.message:parse-acknack-body c flags)
     (declare (ignore rid count finalp))
-    (when (= wid +user-writer-id+)
+    (when (= wid (disc-node-user-writer-id node))
       (incf (disc-node-acks-in node))   ; a matched reader (incl. RTI) acked our writer
       (multiple-value-bind (resends gaps)
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
-                                               +user-reader-id+ base numbits bitmap)
+                                               (disc-node-user-reader-id node) base numbits bitmap)
         (declare (ignore gaps))
         (dolist (peer (%match-destinations node t))   ; retransmit DATA(_FRAG) -> matched readers
           (dolist (d resends)
@@ -243,7 +243,7 @@
             (dolist (peer (%match-destinations node nil))
               (%send-msg-buf node (disc-node-rx-tx-msg node)
                              (lambda (mc) (dds.rtps.message:write-nack-frag
-                                           mc +user-reader-id+ wid sn base numbits bitmap cnt))
+                                           mc (disc-node-user-reader-id node) wid sn base numbits bitmap cnt))
                              (car peer) (cdr peer))))))))
   t)
 
@@ -252,7 +252,7 @@
   "Writer side: on a NACK_FRAG, resend exactly the named fragments as DATA_FRAGs to matched readers."
   (multiple-value-bind (rid wid sn base numbits bitmap count) (dds.rtps.message:parse-nack-frag-body c flags)
     (declare (ignore rid count))
-    (when (= wid +user-writer-id+)
+    (when (= wid (disc-node-user-writer-id node))
       (let ((descs (dds.rtps.reliable:writer-on-nack-frag (disc-node-user-writer node) sn base numbits bitmap))
             (pl (dds.rtps.reliable:writer-sample-payload (disc-node-user-writer node) sn)))
         (when (and descs pl)
@@ -262,7 +262,7 @@
                 (destructuring-bind (fstart fcount off len) desc
                   (%send-msg-buf node (disc-node-rx-tx-msg node)
                                  (lambda (mc) (dds.rtps.message:write-data-frag
-                                               mc dds.rtps.message:+entityid-unknown+ +user-writer-id+ sn size
+                                               mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn size
                                                fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
                                  (car peer) (cdr peer)))))))))
     t))
