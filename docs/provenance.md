@@ -628,6 +628,58 @@ SEDP `PID_TYPE_OBJECT_LB` via `make corpus-capture TOPIC=Square TYPE=C_Enum`.
 - **Corpus artifacts (C_Enum)**: only the `Corpus.idl` + `corpus_pub.cxx` source edits are tracked;
   all `rtiddsgen` output, `corpus_pub`, and the symlinked RTI dylibs stay git-ignored (NFR-IP).
 
+### C_Enum legacy enum def-node — structural enum decode (Task S0.3, 2026-06-12)
+
+Method: clean-room differential over the SAME locked C_Enum capture (444-octet inflated), meanings
+ONLY from captured bytes — the tokenized tree was dumped (each node's tag/code/[value-start,value-end)
++ leading value bytes) and read directly; no RTI source / GPL dissector. This RE flips enum OUT of
+the Task-4.1 degrade tier into a real EK_MINIMAL enumerated TypeIdentifier.
+
+- **Enum member `e`** (member-list CODE-0 child node `[188..220)`):
+  bytes `00000000 | 01000000 | 0E000000 | 00000000 | 96B9AFC0 319DC514 | 02000000 | 65000000`.
+  `+0` key=0, `+4` id=1, `+8` u16 kind = **0x0E (14)** = enum (already pinned in Task 4.1), `+16`
+  8-octet type-hash `96 B9 AF C0 31 9D C5 14` — the SAME hash@+16 reference mechanism strings
+  (0x13/CODE-8), sequences (0x12/CODE-7) and nested structs (0x16/CODE-9) use.
+- **Enum-def node = CODE 5** (`+lto-code-enum-def+`), node `[268..408)`. Its CODE-0 child `[280..312)`
+  (name="SomeEnum") echoes the member's hash at its `VALUE-START+8`: `96 B9 AF C0 31 9D C5 14` —
+  byte-identical to the member's `+16` hash. So `%lto-find-def-node octets root member-node 5`
+  resolves it by the shared hash-reference pattern. The differential that establishes CODE 5 = enum:
+  no other tier (string-def 8 / sequence-def 7 / struct-def 9) carries this hash, and CODE 5 is the
+  unique node whose CODE-0 child name is the enum type name "SomeEnum".
+- **Bit-bound child = CODE 100** (`+lto-code-enum-bitbound+`), child `[340..344)` = `20 00 00 00`
+  = **0x20 = 32** (a u32). (CODE value 100 coincides with the sequence element-type child; the two
+  are disambiguated by the PARENT code — enum-def 5 vs sequence-def 7 — never read on the same node.)
+- **Literal-list child = CODE 101** (`+lto-code-enum-literals+`), child `[356..404)`, 48 bytes:
+  ```
+  03 00 00 00                          count = 3
+  00 00 00 00  04 00 00 00  52 45 44 00              value=0, len=4, "RED\0"           → RED  / 0
+  01 00 00 00  06 00 00 00  47 52 45 45 4E 00 00 00  value=1, len=6, "GREEN\0"+NULpad  → GREEN/ 1
+  02 00 00 00  05 00 00 00  42 4C 55 45 00 00 00 00  value=2, len=5, "BLUE\0"+NULpad   → BLUE / 2
+  ```
+  Layout: `count:u32`, then per literal `value:u32` + a length-prefixed NUL-padded literal NAME (the
+  exact `%lto-read-name` framing: len:u32 + len octets, trailing NUL counted, padded to 4). Decoded
+  RED=0 GREEN=1 BLUE=2 — matching the `Corpus.idl` ground truth `enum SomeEnum { RED, GREEN, BLUE }`
+  (sequential 0,1,2). (CODE value 101 coincides with the struct member-list container; disambiguated
+  by parent code — enum-def 5 vs struct-def 9 — the decoder reads it only via the resolved enum-def.)
+- **Wire stores NAMES, not hashes**: the literal node carries the literal name STRING ("RED"/"GREEN"/
+  "BLUE"), so the decoder builds each literal with `make-enum-literal NAME VALUE` — its NameHash =
+  MD5(NAME)[0:4], the SAME hash a locally-built model computes. That makes the wire-parsed enum and a
+  local enum match by NameHash in `enum-assignable-from` (which compares same-name/different-value).
+- **Assignability proof** (`run-lto-enum-assignability-test`): the parsed C_Enum's `e` member is an
+  EK_MINIMAL TI → `minimal-enumerated-type` {RED 0, GREEN 1, BLUE 2}, bit-bound 32. The struct is
+  `@final`; an enum TI is delimited (fixed bit-bound storage, `ti-delimited-p`), so the @final
+  struct-member match runs `strongly-assignable-from` → `enum-assignable-from`. A matching local
+  (BLUE=2) is assignable both ways; a local with BLUE=3 (same NameHash, different value) is a PROVABLE
+  enum incompatibility → NOT assignable both ways; re-running the compatible case proves no false-reject.
+- **Decoded coverage update**: enum (0x0E) is now **structurally modeled** (no longer in the degrade
+  tier). The remaining degrade tier is union (0x15) / array (0x11) / bitmask (uncaptured) / map /
+  typedef + sequence-of-aggregate — still `:unsupported` (fail-open). The live legacy-gate fail-open
+  case (3) driver was repointed from C_Enum to C_Union (`run-dcps-legacy-gate-test`,
+  `integration-test.lisp`) since enum no longer degrades.
+- **Corpus artifacts**: unchanged from the Task-4.1 entry — only `Corpus.idl` + `corpus_pub.cxx`
+  edits tracked; `rtiddsgen` output + RTI dylibs stay git-ignored (NFR-IP). No new capture was taken;
+  this RE re-reads the existing C_Enum bytes.
+
 ### Experiment set: C_Union + C_Array — union/array member-kinds, degrading tier (Task 4.2, 2026-06-11)
 
 Method: clean-room differential, meanings ONLY from captured bytes (no RTI source / GPL dissector).

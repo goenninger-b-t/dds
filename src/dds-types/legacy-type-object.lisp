@@ -300,6 +300,41 @@
    clean-room (docs/provenance.md 2026-06-11), NOT an OMG-spec constant; recorded for documentation
    — the decoder reads the wire bound directly, it does not synthesize this value.")
 
+(defconstant +lto-member-kind-enum+ #x0E
+  "Legacy-TypeObject member type-kind u16 (at a member node's VALUE-START+8) marking an ENUM
+   member: its bit-bound + literals live in a referenced +LTO-CODE-ENUM-DEF+ node (NOT inline),
+   addressed by the same 8-octet type-hash@+16 mechanism strings (0x13), sequences (0x12) and
+   nested structs (0x16) use (enum is 0x0E). Reverse-engineered clean-room from the C_Enum
+   differential (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-enum-def+ 5
+  "Legacy-TypeObject node CODE marking an ENUM-definition node: an enum member's node carries an
+   8-octet type-hash (at member VALUE-START+16) referencing this node, whose CODE-0 child echoes
+   that hash at its VALUE-START+8, whose +LTO-CODE-ENUM-BITBOUND+ (100) child holds the bit-bound
+   (u32) and whose +LTO-CODE-ENUM-LITERALS+ (101) child holds the literal list. Reverse-engineered
+   clean-room from the C_Enum differential (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-enum-bitbound+ 100
+  "Legacy-TypeObject node CODE marking the bit-bound child of a +LTO-CODE-ENUM-DEF+ node: the
+   storage bit width is the u32 at this child's VALUE-START (0x20 = 32 for a default enum). Shares
+   the CODE value (100) with the sequence element-type child, disambiguated by parent CODE (enum-def
+   5 vs sequence-def 7). Reverse-engineered clean-room from the C_Enum differential
+   (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defconstant +lto-code-enum-literals+ 101
+  "Legacy-TypeObject node CODE marking the literal-list child of a +LTO-CODE-ENUM-DEF+ node: its
+   value is count:u32 then, per literal, value:u32 + a length-prefixed NUL-padded literal name
+   (the same string framing %LTO-READ-NAME decodes). Shares the CODE value (101) with the struct
+   member-list container, disambiguated by parent CODE (enum-def 5 vs struct-def 9) — the enum
+   decoder reads it only via the resolved enum-def node, so there is no collision. Reverse-engineered
+   clean-room from the C_Enum differential (docs/provenance.md 2026-06-12), NOT an OMG-spec constant.")
+
+(defparameter *lto-max-enum-literals* 4096
+  "Max enum literals the legacy-TypeObject enum decoder will read from a +LTO-CODE-ENUM-LITERALS+
+   node before failing open (NFR-SEC-POSTURE): a resource-exhaustion guard bounding a hostile
+   literal-count word; a larger declared count yields NIL (the enum member is unmodelable, the
+   whole parse degrades to :unsupported).")
+
 (defun* %lto-member-id (octets node)
     (function ((simple-array (unsigned-byte 8) (*)) lto-node) (or null (unsigned-byte 32)))
   "The 0-based declaration-order member id encoded as the u32 at the member NODE's VALUE-START+4
@@ -418,6 +453,59 @@
           (let ((kw (cdr (assoc ek *lto-primitive-kind-keyword*))))
             (and kw (sequence-type-identifier (primitive-type-identifier kw) bound))))))))
 
+(defun* %lto-enum-literals (octets lit-node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node) (or null list))
+  "Decode the literal list of an enum's +LTO-CODE-ENUM-LITERALS+ child LIT-NODE into a list of
+   ENUM-LITERAL: count:u32 at VALUE-START, then per literal value:u32 (the i32 enum constant) + a
+   length-prefixed NUL-padded literal NAME (%LTO-READ-NAME framing). Each literal is built with
+   MAKE-ENUM-LITERAL on the decoded NAME so its NameHash matches a locally-built model's (the wire
+   carries names, not hashes). Returns NIL (the enum is unmodelable → degrade) when the count, any
+   value, or any name is missing/OOB, the count exceeds *LTO-MAX-ENUM-LITERALS*, or the walk does
+   not consume exactly to VALUE-END. Every wire read is bounds-checked against VALUE-END FIRST
+   (NFR-SEC-POSTURE). Clean-room (docs/provenance.md 2026-06-12)."
+  (let* ((vstart (lto-node-value-start lit-node))
+         (vend (lto-node-value-end lit-node))
+         (count (%lto-u32 octets vstart vend)))
+    (when (or (null count) (> count *lto-max-enum-literals*))
+      (return-from %lto-enum-literals nil))
+    (let ((literals '())
+          (pos (+ vstart 4)))
+      (dotimes (i count)
+        (let ((value (%lto-u32 octets pos vend)))
+          (when (null value)
+            (return-from %lto-enum-literals nil))
+          (multiple-value-bind (name next) (%lto-read-name octets (+ pos 4) vend)
+            (when (null name)
+              (return-from %lto-enum-literals nil))
+            (push (make-enum-literal name (- (logxor value #x80000000) #x80000000)) literals)
+            (setf pos next))))
+      (when (/= pos vend)
+        (return-from %lto-enum-literals nil))
+      (nreverse literals))))
+
+(defun* %lto-enum-type-identifier (octets root member-node)
+    (function ((simple-array (unsigned-byte 8) (*)) lto-node lto-node) (or null type-identifier))
+  "The TypeIdentifier for an ENUM member-node: resolve its referenced +LTO-CODE-ENUM-DEF+ node
+   (%LTO-FIND-DEF-NODE), read the bit-bound (u32) from its +LTO-CODE-ENUM-BITBOUND+ child and the
+   literals from its +LTO-CODE-ENUM-LITERALS+ child (%LTO-ENUM-LITERALS), build a
+   MINIMAL-ENUMERATED-TYPE and wrap it in an EK_MINIMAL ENUMERATED-TYPE-IDENTIFIER so assignability
+   (enum-assignable-from) recurses into it. NIL (member TI stays NIL → degrade) when the reference,
+   the bit-bound, or the literals are missing/OOB/over-budget — every span bounds-checked FIRST
+   (NFR-SEC-POSTURE). Clean-room (docs/provenance.md 2026-06-12)."
+  (let ((edef (%lto-find-def-node octets root member-node +lto-code-enum-def+)))
+    (when edef
+      (let ((bit-bound (%lto-def-child-u32 octets edef +lto-code-enum-bitbound+))
+            (lit-node (find-if (lambda (c)
+                                 (and (= (lto-node-tag c) +lto-tag-long+)
+                                      (= (lto-node-code c) +lto-code-enum-literals+)))
+                               (lto-node-children edef))))
+        (when (and bit-bound (<= 1 bit-bound 64) lit-node)
+          (let ((literals (%lto-enum-literals octets lit-node)))
+            (and literals
+                 (enumerated-type-identifier
+                  (make-minimal-enumerated-type :bit-bound bit-bound
+                                                :literals literals)))))))))
+
 (defun* %lto-member-hash-key (octets node)
     (function ((simple-array (unsigned-byte 8) (*)) lto-node) (or null (unsigned-byte 64)))
   "The 8-octet type-hash at member NODE's VALUE-START+16 packed little-endian into a u64 — the
@@ -469,7 +557,9 @@
    resolves the element + bound from the referenced +LTO-CODE-SEQUENCE-DEF+ node
    (%LTO-SEQUENCE-TYPE-IDENTIFIER); kind +LTO-MEMBER-KIND-STRUCT+ (0x16) resolves + parses the
    referenced +LTO-CODE-STRUCT+ node (%LTO-NESTED-TYPE-IDENTIFIER, recursive under DEPTH/VISITED
-   guards) — all under ROOT. DEPTH + VISITED bound nested-struct recursion (*LTO-MAX-TYPE-DEPTH*
+   guards); kind +LTO-MEMBER-KIND-ENUM+ (0x0E) resolves the bit-bound + literals from the referenced
+   +LTO-CODE-ENUM-DEF+ node (%LTO-ENUM-TYPE-IDENTIFIER) into an EK_MINIMAL enumerated TI — all under
+   ROOT. DEPTH + VISITED bound nested-struct recursion (*LTO-MAX-TYPE-DEPTH*
    and a visited-hash cycle guard). Returns NIL for a sequence-of-non-primitive (Task 3.x), an
    over-depth/cyclic nested struct, or when the kind field is OOB — bounds-checked against
    VALUE-END FIRST (NFR-SEC-POSTURE)."
@@ -483,6 +573,8 @@
        (%lto-sequence-type-identifier octets root node))
       ((= kind +lto-member-kind-struct+)
        (%lto-nested-type-identifier octets root node depth visited))
+      ((= kind +lto-member-kind-enum+)
+       (%lto-enum-type-identifier octets root node))
       (t (let ((kw (cdr (assoc kind *lto-primitive-kind-keyword*))))
            (and kw (primitive-type-identifier kw)))))))
 

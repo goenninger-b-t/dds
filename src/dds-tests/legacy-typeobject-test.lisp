@@ -713,19 +713,21 @@
     (function () t)
   "Test: the degrading policy (the operating contract, Task 4.1). A struct whose member declares a
    type the model cannot represent degrades the WHOLE parse to :unsupported (fail-open to
-   name-match), never a partial minimal-struct-type with a NIL-TI member. The live C_Enum capture is
-   the driver — an enum member (kind 0x0E, no enum TI in assignability.lisp) is UNMODELABLE; plus the
+   name-match), never a partial minimal-struct-type with a NIL-TI member. The live C_Union capture is
+   the driver — a union member (kind 0x15, no union TI in assignability.lisp) is UNMODELABLE; plus the
    *lto-max-type-depth* 0 case (an over-depth nested-struct member is also unmodelable). A purely
-   well-modeled type (C_Shape) is unaffected (still a minimal-struct-type)."
-  (let* ((enum-lb (%lto-connext-c-enum-lb))
-         (enum-inf (dds.types:inflate-type-object-lb enum-lb))
-         (enum-parsed (and enum-inf (dds.types:parse-legacy-type-object enum-inf))))
-    (%check :lto-unmodelable-enum-inflate
-            (and enum-inf (= (length enum-inf) 444))
-            "C_Enum PID_TYPE_OBJECT_LB inflates to the 444-octet legacy TypeObject")
-    (%check :lto-unmodelable-enum-unsupported
-            (eq enum-parsed :unsupported)
-            "a struct with an UNMODELABLE enum member degrades the whole parse to :unsupported (fail-open)"))
+   well-modeled type (C_Shape) is unaffected (still a minimal-struct-type). (Enum used to be the
+   driver here; Task S0.3 flipped enum OUT of the degrade tier — it now decodes structurally, see
+   run-lto-enum-assignability-test.)"
+  (let* ((union-lb (%lto-connext-c-union-lb))
+         (union-inf (dds.types:inflate-type-object-lb union-lb))
+         (union-parsed (and union-inf (dds.types:parse-legacy-type-object union-inf))))
+    (%check :lto-unmodelable-union-inflate
+            (and union-inf (= (length union-inf) 608))
+            "C_Union PID_TYPE_OBJECT_LB inflates to the 608-octet legacy TypeObject")
+    (%check :lto-unmodelable-union-unsupported
+            (eq union-parsed :unsupported)
+            "a struct with an UNMODELABLE union member degrades the whole parse to :unsupported (fail-open)"))
   ;; cross-check: a fully-modelable type (C_Shape) is NOT degraded — the policy fires only on an
   ;; unmodelable member, not on every type.
   (let* ((shape-lb (%connext-c-shape-lb))
@@ -745,13 +747,12 @@
 
 (defun* run-lto-parse-enum-test ()
     (function () t)
-  "Test: parse-legacy-type-object on the live C_Enum legacy TypeObject (Task 4.1, Part B). Per the
-   decision rule, our assignability model has NO enum TypeIdentifier (assignability.lisp models only
-   primitives/strings/sequences/structs; enum is conservatively non-assignable), so the enum member
-   `e` is UNMODELABLE and the whole parse is :unsupported (fail-open) — we never invent an enum TI
-   the gate would mis-handle. The capture's fingerprint strings (C_Enum / SomeEnum / RED/GREEN/BLUE)
-   confirm it really is the enum type. Pinned to the live Connext 7.3.1 corpus (docs/provenance.md
-   2026-06-11)."
+  "Test: parse-legacy-type-object on the live C_Enum legacy TypeObject (Task S0.3). Enum members
+   now decode STRUCTURALLY (the degrade tier is flipped): the capture's fingerprint strings (C_Enum
+   / SomeEnum / RED/GREEN/BLUE) confirm it is the enum type, and the parse yields a minimal-struct-type
+   named C_Enum with members id (long) + e (enum). The full enum decode + assignability proof lives in
+   run-lto-enum-assignability-test. Pinned to the live Connext 7.3.1 corpus (docs/provenance.md
+   2026-06-12)."
   (let* ((lb (%lto-connext-c-enum-lb))
          (inflated (dds.types:inflate-type-object-lb lb)))
     (%check :lto-enum-inflate
@@ -763,10 +764,13 @@
               (every (lambda (s) (member s strs :test #'string=))
                      '("C_Enum" "SomeEnum" "RED" "GREEN" "BLUE"))
               "the C_Enum capture carries the SomeEnum / RED/GREEN/BLUE fingerprint strings"))
-    ;; the decision rule: enum is unmodelable by assignability -> the whole parse is :unsupported
-    (%check :lto-enum-unsupported
-            (eq (dds.types:parse-legacy-type-object inflated) :unsupported)
-            "C_Enum parses to :unsupported — enum is unmodelable (no enum TI), fail-open per the decision rule"))
+    ;; enum is now structurally modeled -> the whole parse yields a C_Enum minimal-struct-type
+    (let ((parsed (dds.types:parse-legacy-type-object inflated)))
+      (%check :lto-enum-structural
+              (and (dds.types:minimal-struct-type-p parsed)
+                   (string= (dds.types:minimal-struct-type-name parsed) "C_Enum")
+                   (= (length (dds.types:minimal-struct-type-members parsed)) 2))
+              "C_Enum parses to a minimal-struct-type {id, e} — enum decodes structurally, no longer degrades")))
   t)
 
 ;;; Legacy-TypeObject union/array degrading tier (Task 4.2). Two live Connext 7.3.1 captures
@@ -867,4 +871,96 @@
             (dds.types:minimal-struct-type-p
              (and shape-inf (dds.types:parse-legacy-type-object shape-inf)))
             "a type with only modelable members (C_Shape) is unaffected — policy fires only on unmodelable members"))
+  t)
+
+;;; Legacy-TypeObject ENUM member structural decode + assignability (Task S0.3, FR-TYPE-4).
+;;; The live C_Enum capture (`@final struct C_Enum { @key long id; SomeEnum e; }`,
+;;; `enum SomeEnum { RED, GREEN, BLUE }`) now parses to a minimal-struct-type whose `e` member is a
+;;; real EK_MINIMAL enumerated TypeIdentifier (SomeEnum RED=0/GREEN=1/BLUE=2), flipping enum OUT of
+;;; the degrade tier. The differential (docs/provenance.md 2026-06-12) localized: the enum member
+;;; node carries kind 0x0E (14) at VALUE-START+8 plus the same 8-octet type-hash@+16 referencing an
+;;; ENUM-definition node (CODE 5) whose CODE-0 child echoes that hash at VALUE-START+8, whose CODE-100
+;;; child holds the bit-bound (u32, 0x20=32) and whose CODE-101 child holds the literal list:
+;;; count:u32, then per literal value:u32 + a length-prefixed NUL-padded name. The wire stores literal
+;;; NAMES, so make-enum-literal hashes both sides identically.
+
+(defun* %build-c-enum-local (blue-value)
+    (function ((signed-byte 32)) dds.types:minimal-struct-type)
+  "A locally-built minimal-struct-type mirroring the live C_Enum: @final, @key long id (id 0) +
+   enum member e (id 1) over SomeEnum {RED 0, GREEN 1, BLUE BLUE-VALUE}. BLUE-VALUE 2 = matching
+   the corpus, 3 = a provably-incompatible enum (BLUE's NameHash shared but value differs). Member
+   ids match the parsed model (declaration order: id 0, e 1); enum literal NameHashes are computed
+   by make-enum-literal — the SAME hashes the wire model carries. Test fixture."
+  (dds.types:make-minimal-struct-type
+   :name "C_Enum" :extensibility :final
+   :members (list (dds.types:make-struct-member
+                   "id" 0 (dds.types:primitive-type-identifier :i32) :key-p t)
+                  (dds.types:make-struct-member
+                   "e" 1
+                   (dds.types:enumerated-type-identifier
+                    (dds.types:make-minimal-enumerated-type
+                     :literals (list (dds.types:make-enum-literal "RED" 0)
+                                     (dds.types:make-enum-literal "GREEN" 1)
+                                     (dds.types:make-enum-literal "BLUE" blue-value))))))))
+
+(defun* run-lto-enum-assignability-test ()
+    (function () t)
+  "Test: the live C_Enum legacy TypeObject parses to a minimal-struct-type whose `e` member is a
+   real EK_MINIMAL enum TI (SomeEnum RED=0/GREEN=1/BLUE=2), and struct-assignable-from gates it
+   (Task S0.3, FR-TYPE-4): a matching local is assignable both ways; a local whose enum changes
+   BLUE's value is not; no false-reject on re-run. Pinned to the live Connext 7.3.1 corpus
+   (docs/provenance.md 2026-06-12)."
+  (let* ((lb (%lto-connext-c-enum-lb))
+         (inflated (dds.types:inflate-type-object-lb lb))
+         (parsed (dds.types:parse-legacy-type-object inflated)))
+    (%check :lto-enum-asgn-parse
+            (dds.types:minimal-struct-type-p parsed)
+            "the live C_Enum legacy TypeObject parses to a minimal-struct-type (enum no longer degrades)")
+    (when (dds.types:minimal-struct-type-p parsed)
+      ;; the `e` member is a real EK_MINIMAL enum TI with the SomeEnum literals decoded
+      (let* ((e (%lto-member-named parsed "e"))
+             (eti (and e (dds.types:minimal-struct-member-type-identifier e)))
+             (ref (and eti (dds.types:type-identifier-referenced eti))))
+        (%check :lto-enum-member-ti
+                (and eti (= (dds.types:type-identifier-kind eti) dds.types:+ek-minimal+)
+                     (dds.types:minimal-enumerated-type-p ref))
+                "the `e` member decodes to an EK_MINIMAL TI referencing a minimal-enumerated-type")
+        (%check :lto-enum-literals
+                (and (dds.types:minimal-enumerated-type-p ref)
+                     (= (length (dds.types:minimal-enumerated-type-literals ref)) 3)
+                     (= (dds.types:minimal-enumerated-type-bit-bound ref) 32)
+                     (every (lambda (l name value)
+                              (and (equalp (dds.types:enum-literal-name-hash l)
+                                           (dds.types:member-name-hash name))
+                                   (= (dds.types:enum-literal-value l) value)))
+                            (dds.types:minimal-enumerated-type-literals ref)
+                            '("RED" "GREEN" "BLUE") '(0 1 2)))
+                "SomeEnum decodes to RED=0 GREEN=1 BLUE=2 (bit-bound 32), names hashing as on the wire"))
+      ;; the @key long id member stays a flat TK_INT32 @key
+      (let* ((idm (%lto-member-named parsed "id"))
+             (idti (and idm (dds.types:minimal-struct-member-type-identifier idm))))
+        (%check :lto-enum-id
+                (and idm (dds.types:minimal-struct-member-key-p idm)
+                     idti (= (dds.types:type-identifier-kind idti) dds.types:+tk-int32+))
+                "the @key long id member stays a flat TK_INT32"))
+      ;; the parsed wire model drives the REAL struct-assignable-from gate through the enum row
+      (let ((opts (dds.types:default-assignability-options))
+            (good (%build-c-enum-local 2))
+            (bad  (%build-c-enum-local 3)))
+        (%check :lto-enum-asgn-compatible
+                (dds.types:struct-assignable-from parsed good opts)
+                "the parsed C_Enum is assignable from a matching local (compatible -> T)")
+        (%check :lto-enum-asgn-compatible-rev
+                (dds.types:struct-assignable-from good parsed opts)
+                "a matching local is assignable from the parsed C_Enum (both directions)")
+        (%check :lto-enum-asgn-incompatible
+                (not (dds.types:struct-assignable-from parsed bad opts))
+                "a local whose enum changes BLUE's value is NOT assignable (provable enum mismatch -> NIL)")
+        (%check :lto-enum-asgn-incompatible-rev
+                (not (dds.types:struct-assignable-from bad parsed opts))
+                "the BLUE-mismatch reject holds both directions")
+        ;; no false-reject: re-running the compatible case after the incompatible one still holds
+        (%check :lto-enum-asgn-no-false-reject
+                (dds.types:struct-assignable-from parsed (%build-c-enum-local 2) opts)
+                "no false-reject: the compatible case still holds after the incompatible one"))))
   t)

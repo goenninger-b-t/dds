@@ -272,6 +272,7 @@
                  ("lto-unmodelable-unsupported" . run-lto-unmodelable-unsupported-test)
                  ("lto-parse-enum"           . run-lto-parse-enum-test)
                  ("lto-parse-aggregates-unsupported" . run-lto-parse-aggregates-unsupported-test)
+                 ("lto-enum-assignability"   . run-lto-enum-assignability-test)
                  ("sedp-type-object-lb"      . run-sedp-type-object-lb-test)
                  ("xtypes-type-compat-soft"  . run-type-compat-soft-test)
                  ("sedp-type-information"    . run-sedp-type-information-test)

@@ -2098,7 +2098,7 @@
 
 ;; corpus LB fixtures live in legacy-typeobject-test.lisp (loaded later); forward-declare
 (declaim (ftype (function () (simple-array (unsigned-byte 8) (*)))
-                %connext-c-shape-lb %lto-connext-c-enum-lb))
+                %connext-c-shape-lb %lto-connext-c-union-lb))
 
 (defun* %legacy-gate-remote (topic-name lb)
     (function (string (or null (simple-array (unsigned-byte 8) (*))))
@@ -2136,9 +2136,10 @@
    ONLY on a confident minimal-struct-type. (1) the live C_Shape LB vs a structurally
    COMPATIBLE local -> :compatible; (2) the same LB vs a local with a member retyped ->
    :incompatible (surfaces INCONSISTENT_TOPIC via the shared %match-remote-endpoint
-   path); (3) a live C_Enum LB (parses to :unsupported) -> :compatible (the critical
-   fail-open assertion); (4) garbage-but-present LB (won't inflate) -> :compatible. A
-   non-model parse result can NEVER reject."
+   path); (3) a live C_Union LB (parses to :unsupported — union is in the degrade tier) ->
+   :compatible (the critical fail-open assertion); (4) garbage-but-present LB (won't inflate)
+   -> :compatible. A non-model parse result can NEVER reject. (Enum was the case-3 driver
+   until Task S0.3 flipped it to a structural parse; union is now the unmodelable driver.)"
   ;; (1) compatible local struct (C_Shape shape) -> assignable -> :compatible
   (let ((ts (dds.types:find-type-support "legacy-good-type"))
         (p (dds.dcps:create-participant :domain 0)))
@@ -2159,14 +2160,14 @@
                                            (%connext-c-shape-lb)))
                  "a confident C_Shape parse NOT assignable to the local type gates :incompatible")
       (dds.dcps:delete-participant p)))
-  ;; (3) CRITICAL fail-open: C_Enum LB parses to :unsupported -> name-match :compatible
+  ;; (3) CRITICAL fail-open: C_Union LB parses to :unsupported -> name-match :compatible
   (let ((ts (dds.types:find-type-support "legacy-good-type"))
         (p (dds.dcps:create-participant :domain 0)))
     (unwind-protect
          (%check :lg-unsupported-failopen
                  (eq :compatible
-                     (%legacy-gate-verdict p "LegacyEnumTopic" "legacy-good-type" ts
-                                           (%lto-connext-c-enum-lb)))
+                     (%legacy-gate-verdict p "LegacyUnionTopic" "legacy-good-type" ts
+                                           (%lto-connext-c-union-lb)))
                  "an :unsupported legacy-TypeObject parse falls OPEN to :compatible (name-match)")
       (dds.dcps:delete-participant p)))
   ;; (4) garbage-but-present LB (won't inflate) -> fail-open :compatible
