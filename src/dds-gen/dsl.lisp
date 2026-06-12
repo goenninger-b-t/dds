@@ -4,6 +4,8 @@
   ;; dds-type -> (lisp-type default put-fn get-fn align size|:var)
   '((:bool   t                  nil dds.cdr:cdr-put-bool   dds.cdr:cdr-get-bool   1 1)
     (:u8     (unsigned-byte 8)  0   dds.cdr:cdr-put-u8     dds.cdr:cdr-get-u8     1 1)
+    (:byte   (unsigned-byte 8)  0   dds.cdr:cdr-put-u8     dds.cdr:cdr-get-u8     1 1)
+    (:octet  (unsigned-byte 8)  0   dds.cdr:cdr-put-u8     dds.cdr:cdr-get-u8     1 1)
     (:u16    (unsigned-byte 16) 0   dds.cdr:cdr-put-u16    dds.cdr:cdr-get-u16    2 2)
     (:u32    (unsigned-byte 32) 0   dds.cdr:cdr-put-u32    dds.cdr:cdr-get-u32    4 4)
     (:u64    (unsigned-byte 64) 0   dds.cdr:cdr-put-u64    dds.cdr:cdr-get-u64    8 8)
@@ -14,7 +16,10 @@
     (:string string             ""  dds.cdr:cdr-put-string dds.cdr:cdr-get-string 4 :var))
   "Maps an s-expr DSL member type to its Lisp slot type, default, codec ops, CDR
    alignment, and serialized size (:var = data-dependent). Sizes/alignment follow
-   REQUIREMENTS FR-CDR-1/2; string size = 4 (length) + octets + 1 (NUL).")
+   REQUIREMENTS FR-CDR-1/2; string size = 4 (length) + octets + 1 (NUL). :u8/:i8 are the
+   numeric 8-bit integers (TK_UINT8/TK_INT8); :byte (alias :octet) is the opaque octet
+   (TK_BYTE, IDL `octet`) — all three share the one-octet wire codec but carry distinct
+   XTypes kinds (D1).")
 
 (defparameter *sample-pool-capacity* 64
   "Per-type sample-pool size, pre-allocated at registration (NFR-MEM). A later

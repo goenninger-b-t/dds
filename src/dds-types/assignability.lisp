@@ -31,9 +31,11 @@
 
 (defun* ti-primitive-p (ti)
     (function (type-identifier) t)
-  "True if TI is a primitive TypeKind (boolean..float128, char8/char16)."
+  "True if TI is a primitive TypeKind (boolean..float128, byte/int8/uint8, char8/char16).
+   The contiguous 0x01..0x0D range spans TK_BOOLEAN..TK_FLOAT128 plus TK_INT8 (0x0C) and
+   TK_UINT8 (0x0D) — every kind in it is primitive (idl §13-51)."
   (let ((k (type-identifier-kind ti)))
-    (or (<= +tk-boolean+ k +tk-float128+) (= k +tk-char8+) (= k +tk-char16+))))
+    (or (<= +tk-boolean+ k +tk-uint8+) (= k +tk-char8+) (= k +tk-char16+))))
 
 (defun* ti-string-p (ti)
     (function (type-identifier) t)

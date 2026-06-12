@@ -142,6 +142,60 @@
   (let ((vec (dds.core.buffer:octet-buffer-vec buf)))
     (loop for i below n collect (aref vec i))))
 
+(defun* run-encap-options-pad-test ()
+    (function () t)
+  "Test: the encapsulation options low-2-bits encode the trailing pad count to the next
+   4-byte boundary for ALL CDR representations including PLAIN_CDR/XCDR1 (XTypes 1.3
+   §7.6.3.1.2, D3 — the clause is universal, its normative example uses PLAIN_CDR);
+   parse recovers it."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool (dds.core.arena:make-buffer-pool arena 64 8)))
+    (flet ((fresh ()
+             (dds.core.buffer:cursor (dds.core.arena:pool-acquire pool) :endianness :little))
+           (opt-lo (c) (aref (dds.core.buffer:octet-buffer-vec (dds.core.buffer:cursor-buffer c)) 3)))
+      ;; body-len 5 -> pad 3
+      (let ((c (fresh)))
+        (dds.cdr:make-encapsulation-header c :plain-cdr2-le)
+        (loop repeat 5 do (dds.core.buffer:put-u8 c #xaa))
+        (dds.cdr:finalize-encapsulation-options c :plain-cdr2-le)
+        (%check :pad-5 (= 3 (logand (opt-lo c) 3)) "body-len 5 must encode pad 3"))
+      ;; body-len 1 -> pad 3
+      (let ((c (fresh)))
+        (dds.cdr:make-encapsulation-header c :plain-cdr2-le)
+        (dds.core.buffer:put-u8 c #xaa)
+        (dds.cdr:finalize-encapsulation-options c :plain-cdr2-le)
+        (%check :pad-1 (= 3 (logand (opt-lo c) 3)) "body-len 1 must encode pad 3"))
+      ;; body-len 2 -> pad 2
+      (let ((c (fresh)))
+        (dds.cdr:make-encapsulation-header c :plain-cdr2-le)
+        (dds.core.buffer:put-u8 c #xaa) (dds.core.buffer:put-u8 c #xbb)
+        (dds.cdr:finalize-encapsulation-options c :plain-cdr2-le)
+        (%check :pad-2 (= 2 (logand (opt-lo c) 3)) "body-len 2 must encode pad 2"))
+      ;; body-len 4 (4-aligned) -> pad 0
+      (let ((c (fresh)))
+        (dds.cdr:make-encapsulation-header c :plain-cdr2-le)
+        (loop repeat 4 do (dds.core.buffer:put-u8 c #xaa))
+        (dds.cdr:finalize-encapsulation-options c :plain-cdr2-le)
+        (%check :pad-0 (= 0 (logand (opt-lo c) 3)) "4-aligned body must encode pad 0"))
+      ;; XCDR1 (PLAIN_CDR) also encodes the pad — §7.6.3.1.2 is universal (its example is PLAIN_CDR)
+      (let ((c (fresh)))
+        (dds.cdr:make-encapsulation-header c :plain-cdr-be)
+        (dds.core.buffer:put-u8 c #xaa)
+        (dds.cdr:finalize-encapsulation-options c :plain-cdr-be)
+        (%check :pad-xcdr1 (= 3 (logand (opt-lo c) 3)) "PLAIN_CDR body-len 1 must encode pad 3"))
+      ;; round-trip: parse recovers the pad count as a third value
+      (let ((c (fresh)))
+        (dds.cdr:make-encapsulation-header c :plain-cdr2-le)
+        (loop repeat 5 do (dds.core.buffer:put-u8 c #xaa))
+        (dds.cdr:finalize-encapsulation-options c :plain-cdr2-le)
+        (dds.core.buffer:cursor-reset c)
+        (multiple-value-bind (rep opt pad) (dds.cdr:parse-encapsulation-header c)
+          (declare (ignore opt))
+          (%check :pad-roundtrip (and (eq rep :plain-cdr2-le) (= pad 3))
+                  "parse must recover pad count 3"))))
+    (dds.core.arena:teardown-arena arena)
+    t))
+
 (defun* run-byte-exact-test ()
     (function () t)
   "Test: XCDR1 vs XCDR2 byte-exact seed vectors + the 8-byte-alignment divergence (FR-CDR, P0)."
@@ -243,6 +297,7 @@
                  ("echo-over-mock-transport" . run-echo-test)
                  ("xcdr-codec-roundtrip"     . run-codec-roundtrip-test)
                  ("xcdr-byte-exact-seed"     . run-byte-exact-test)
+                 ("xcdr-encap-options-pad"   . run-encap-options-pad-test)
                  ("xcdr-generated-type"      . run-generated-type-test)
                  ("xcdr-generated-sequence"  . run-generated-sequence-test)
                  ("xcdr-generated-nested"    . run-generated-nested-test)
@@ -250,6 +305,7 @@
                  ("dds-keyhash"              . run-keyhash-test)
                  ("xtypes-model"             . run-xtypes-model-test)
                  ("xtypes-assignability"     . run-assignability-test)
+                 ("int8-uint8-byte-kinds"    . run-int8-uint8-byte-kinds-test)
                  ("enum-model"               . run-enum-model-test)
                  ("enum-assignability"       . run-enum-assignability-test)
                  ("array-model"              . run-array-model-test)

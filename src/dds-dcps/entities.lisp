@@ -141,6 +141,7 @@
          (wc (dds.core.buffer:cursor buf :endianness :little)))
     (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
     (funcall (dds.types:type-support-serialize ts) sample wc :xcdr2)
+    (dds.cdr:finalize-encapsulation-options wc :plain-cdr2-le)
     (let* ((len (dds.core.buffer:cursor-position wc))
            (out (make-array len :element-type '(unsigned-byte 8))))
       (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)

@@ -13,7 +13,8 @@
 ;;; ---- TypeKind octets (idl §13-51) ----
 (defconstant +tk-boolean+ #x01 "XTypes TypeKind octet TK_BOOLEAN (idl §13-51).")
 (defconstant +tk-byte+    #x02
-  "XTypes TypeKind octet TK_BYTE (idl §13-51): the 1.3 8-bit kind (no distinct INT8/UINT8).")
+  "XTypes TypeKind octet TK_BYTE (idl §13-51): the opaque 8-bit octet kind (IDL `octet`),
+   distinct from the numeric TK_INT8/TK_UINT8 of XTypes 1.3.")
 (defconstant +tk-int16+   #x03 "XTypes TypeKind octet TK_INT16 (idl §13-51).")
 (defconstant +tk-int32+   #x04 "XTypes TypeKind octet TK_INT32 (idl §13-51).")
 (defconstant +tk-int64+   #x05 "XTypes TypeKind octet TK_INT64 (idl §13-51).")
@@ -23,6 +24,8 @@
 (defconstant +tk-float32+ #x09 "XTypes TypeKind octet TK_FLOAT32 (idl §13-51).")
 (defconstant +tk-float64+ #x0a "XTypes TypeKind octet TK_FLOAT64 (idl §13-51).")
 (defconstant +tk-float128+ #x0b)
+(defconstant +tk-int8+    #x0c "XTypes TypeKind octet TK_INT8 (idl §13-51): signed 8-bit integer.")
+(defconstant +tk-uint8+   #x0d "XTypes TypeKind octet TK_UINT8 (idl §13-51): unsigned 8-bit integer.")
 (defconstant +tk-char8+   #x10 "XTypes TypeKind octet TK_CHAR8 (idl §13-51).")
 (defconstant +tk-char16+  #x11)
 (defconstant +tk-string8+ #x20 "XTypes TypeKind octet TK_STRING8 (idl §13-51): narrow string.")
@@ -74,14 +77,16 @@
 
 (defun* primitive-type-identifier (keyword)
     (function (keyword) type-identifier)
-  "The TypeIdentifier for a primitive / string DSL member KEYWORD. :u8/:i8 map to
-   TK_BYTE (XTypes 1.3 has no distinct 8-bit int kind). :f32/:f64 are FLOAT32/FLOAT64,
-   :char is CHAR8. :string is an unbounded STRING8."
+  "The TypeIdentifier for a primitive / string DSL member KEYWORD. :i8/:u8 map to the
+   distinct numeric TK_INT8/TK_UINT8 of XTypes 1.3; :byte (alias :octet) maps to TK_BYTE
+   (IDL `octet` semantics — same octet on the wire, distinct type kind). :f32/:f64 are
+   FLOAT32/FLOAT64, :char is CHAR8. :string is an unbounded STRING8."
   (if (eq keyword :string)
       (string8-type-identifier 0)
       (%make-type-identifier
        :kind (ecase keyword
-               (:bool +tk-boolean+) (:u8 +tk-byte+) (:i8 +tk-byte+)
+               (:bool +tk-boolean+) ((:byte :octet) +tk-byte+)
+               (:i8 +tk-int8+) (:u8 +tk-uint8+)
                (:i16 +tk-int16+) (:u16 +tk-uint16+)
                (:i32 +tk-int32+) (:u32 +tk-uint32+)
                (:i64 +tk-int64+) (:u64 +tk-uint64+)

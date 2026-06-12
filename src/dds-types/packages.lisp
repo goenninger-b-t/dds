@@ -55,7 +55,7 @@
            #:assignability-options-prevent-type-widening
            #:default-assignability-options
            #:ti-assignable-from #:strongly-assignable-from #:struct-assignable-from
-           #:ti-array-p
+           #:ti-primitive-p #:ti-array-p
            #:enum-assignable-from
            #:union-assignable-from
            #:member-names-agree-p
@@ -88,7 +88,8 @@
            #:lto-node-value-start #:lto-node-value-end #:lto-node-children #:lto-node-name
            #:*lto-max-depth* #:*lto-max-elements* #:*lto-max-string-bytes*
            #:*lto-max-type-depth*
-           #:+tk-boolean+ #:+tk-byte+ #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
+           #:+tk-boolean+ #:+tk-byte+ #:+tk-int8+ #:+tk-uint8+
+           #:+tk-int16+ #:+tk-int32+ #:+tk-int64+
            #:+tk-uint16+ #:+tk-uint32+ #:+tk-uint64+ #:+tk-string8+
            #:+tk-float32+ #:+tk-float64+ #:+tk-char8+
            #:+tk-structure+ #:+tk-sequence+ #:+ek-minimal+ #:+ek-complete+

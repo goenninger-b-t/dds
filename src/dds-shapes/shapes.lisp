@@ -87,6 +87,7 @@
          (wc (dds.core.buffer:cursor buf :endianness :little)))
     (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
     (funcall serialize-fn wc)
+    (dds.cdr:finalize-encapsulation-options wc :plain-cdr2-le)
     (let* ((len (dds.core.buffer:cursor-position wc))
            (out (make-array len :element-type '(unsigned-byte 8))))
       (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
@@ -336,9 +337,10 @@
       t)))
 
 ;;; LargeData type: keyed (id) + unbounded octet sequence payload for DATA_FRAG testing.
+;;; payload is :byte (TK_BYTE) to mirror Connext's `sequence<octet>` (interop/connext/large-data).
 (dds.gen:define-dds-type large-data (:extensibility :final)
   (id :i32 :key t)
-  (payload (:sequence :u8)))
+  (payload (:sequence :byte)))
 
 (defun* run-large-publisher (&key (domain 0) (size 8000) (rate 2) (count 0)
                                   (advertise-address "127.0.0.1") drop-fragments)

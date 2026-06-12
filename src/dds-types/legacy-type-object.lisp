@@ -423,13 +423,14 @@
     (and flag (/= flag 0))))
 
 (defparameter *lto-primitive-kind-keyword*
-  '((#x01 . :bool) (#x02 . :u8) (#x03 . :i16) (#x04 . :u16) (#x05 . :i32)
+  '((#x01 . :bool) (#x02 . :byte) (#x03 . :i16) (#x04 . :u16) (#x05 . :i32)
     (#x06 . :u32) (#x07 . :i64) (#x08 . :u64) (#x09 . :f32) (#x0A . :f64) (#x0C . :char))
   "RTI legacy-TypeObject primitive type-kind octet -> our PRIMITIVE-TYPE-IDENTIFIER keyword.
    This is RTI's OWN internal type-kind enumeration (NOT the XTypes TK_* octets — they differ,
    e.g. RTI long=5 vs XTypes TK_INT32=4, RTI char=0x0C vs TK_CHAR8=0x10). Reverse-engineered
    clean-room from the C_ShapeP_<prim> differentials (each retypes member x; the kind sits at
-   the member node's VALUE-START+8 as a u16, repeated at +10): boolean 1, octet 2, short 3,
+   the member node's VALUE-START+8 as a u16, repeated at +10): boolean 1, octet 2 (IDL `octet`
+   -> :byte/TK_BYTE, NOT the numeric :u8/TK_UINT8), short 3,
    unsigned short 4, long 5, unsigned long 6, long long 7, unsigned long long 8, float 9,
    double 0x0A, char 0x0C (docs/provenance.md 2026-06-11). A kind not in this table (strings,
    sequences, nested aggregates, char16/wstring/enum) is NON-PRIMITIVE here and leaves the

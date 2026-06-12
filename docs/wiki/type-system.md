@@ -10,7 +10,7 @@ See also: [CDR codec, buffers & the arena](cdr-and-memory.md) for the codecs and
 
 - **`dds.gen:define-dds-type`** — macro; defines a DDS topic type `NAME` from an s-expr spec. `OPTIONS` is a plist (only `:extensibility`, default `:final`, in v1). Each member is `(slot-name member-type &key key)`, where `member-type` is a primitive keyword, `(:sequence element)`, or the name of a previously-defined dds type (nested struct). Emits a `defstruct`, `ftype`-declared `serialize-`/`deserialize-`/`serialized-size-` monomorphic functions (plus an internal `%ssize-` position-threading helper and a `deserialize-into-` in-place variant), a 16-octet key-hash for keyed types, and a registered `type-support`.
 
-The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, `:u8`, `:u16`, `:u32`, `:u64`, `:i8`, `:i16`, `:i32`, `:i64`, `:string`. A `(:sequence element)` member takes one of those keywords as its fixed-size primitive element (variable-size sequence elements, e.g. sequences of strings, are not supported in v1). v1 restricts `:extensibility` to `:final` and `@key` to scalar/string members.
+The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, `:byte` (alias `:octet`), `:u8`, `:u16`, `:u32`, `:u64`, `:i8`, `:i16`, `:i32`, `:i64`, `:string`. `:u8`/`:i8` are the numeric 8-bit integers (`TK_UINT8`/`TK_INT8`); `:byte`/`:octet` is the opaque octet (`TK_BYTE`, IDL `octet`) — all three share the one-octet wire codec but carry distinct XTypes kinds (model an IDL `sequence<octet>` with `:byte`). A `(:sequence element)` member takes one of those keywords as its fixed-size primitive element (variable-size sequence elements, e.g. sequences of strings, are not supported in v1). v1 restricts `:extensibility` to `:final` and `@key` to scalar/string members.
 
 ### The type-support vtable + registry — `dds.types`
 
@@ -39,7 +39,7 @@ The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, 
 
 - **`dds.types:type-identifier`** / **`dds.types:type-identifier-p`** — the structural in-memory XTypes TypeIdentifier struct: a discriminant kind octet, a string/collection bound (0 = unbounded), a collection element TI, a 14-octet EquivalenceHash (or `nil` when pending), and the in-memory referenced struct an `EK_*` kind resolves to.
 - **`dds.types:type-identifier-kind`** / **`dds.types:type-identifier-bound`** / **`dds.types:type-identifier-element`** / **`dds.types:type-identifier-hash`** / **`dds.types:type-identifier-referenced`** — accessors for those slots.
-- **`dds.types:primitive-type-identifier`** — the TypeIdentifier for a primitive / string DSL member keyword. `:u8`/`:i8` map to `TK_BYTE` (XTypes 1.3 has no distinct 8-bit int kind); `:string` is an unbounded `STRING8`.
+- **`dds.types:primitive-type-identifier`** — the TypeIdentifier for a primitive / string DSL member keyword. `:i8`/`:u8` map to the distinct numeric `TK_INT8` (0x0C) / `TK_UINT8` (0x0D) of XTypes 1.3; `:byte` (alias `:octet`) maps to `TK_BYTE` (0x02, IDL `octet`); `:string` is an unbounded `STRING8`.
 - **`dds.types:string8-type-identifier`** — a narrow-string (`STRING8`) TypeIdentifier with an optional bound (0 = unbounded). Selects `TI_STRING8_SMALL` for a bound `≤255` (SBound) and `TI_STRING8_LARGE` for `>255` (LBound) per the idl §56-70 threshold, mirroring the `%get-/%put-type-identifier` wire model.
 - **`dds.types:sequence-type-identifier`** — a plain-sequence TypeIdentifier with a given element TI and bound (0 = unbounded).
 - **`dds.types:hash-type-identifier`** — a hash-defined TypeIdentifier (`EK_MINIMAL`/`EK_COMPLETE`); takes `:hash` (the 14-octet EquivalenceHash, or `nil` when pending) and `:referenced` (the in-memory struct it resolves to, letting assignability recurse ahead of the deferred hash).
@@ -103,7 +103,7 @@ The transport-free server half of the service: pure functions over the type regi
 
 ### Exported constants (`dds.types`)
 
-TypeKind octets: **`+tk-boolean+`**, **`+tk-byte+`**, **`+tk-int16+`**, **`+tk-int32+`**, **`+tk-int64+`**, **`+tk-uint16+`**, **`+tk-uint32+`**, **`+tk-uint64+`**, **`+tk-string8+`**, **`+tk-structure+`**, **`+tk-sequence+`**. EquivalenceKind octets: **`+ek-minimal+`**, **`+ek-complete+`**. TypeIdentifierKind octets: **`+ti-string8-small+`**, **`+ti-string8-large+`**, **`+ti-plain-sequence-small+`**.
+TypeKind octets: **`+tk-boolean+`**, **`+tk-byte+`**, **`+tk-int8+`**, **`+tk-uint8+`**, **`+tk-int16+`**, **`+tk-int32+`**, **`+tk-int64+`**, **`+tk-uint16+`**, **`+tk-uint32+`**, **`+tk-uint64+`**, **`+tk-string8+`**, **`+tk-structure+`**, **`+tk-sequence+`**. EquivalenceKind octets: **`+ek-minimal+`**, **`+ek-complete+`**. TypeIdentifierKind octets: **`+ti-string8-small+`**, **`+ti-string8-large+`**, **`+ti-plain-sequence-small+`**.
 
 ## Examples
 

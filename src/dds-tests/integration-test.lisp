@@ -30,6 +30,7 @@
               (let ((pc (dds.core.buffer:cursor pl-buf :endianness :little)))
                 (dds.cdr:make-encapsulation-header pc :plain-cdr2-le)
                 (serialize-gsample sample pc :xcdr2)
+                (dds.cdr:finalize-encapsulation-options pc :plain-cdr2-le)
                 (let ((pl-len (dds.core.buffer:cursor-position pc)))
                   (dds.rtps.reliable:writer-write
                    writer (subseq (dds.core.buffer:octet-buffer-vec pl-buf) 0 pl-len))
@@ -91,6 +92,7 @@
          (wc (dds.core.buffer:cursor buf :endianness :little)))
     (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
     (serialize-shape-type shape wc :xcdr2)
+    (dds.cdr:finalize-encapsulation-options wc :plain-cdr2-le)
     (let* ((len (dds.core.buffer:cursor-position wc))
            (out (make-array len :element-type '(unsigned-byte 8))))
       (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
@@ -1129,6 +1131,40 @@
                   (second (dds.types:minimal-enumerated-type-literals
                            (dds.types:type-identifier-referenced ti))))))
     t))
+
+;;; Distinct 8-bit kinds (M4, FR-TYPE-4, D1): XTypes 1.3 defines THREE 8-bit kinds —
+;;; TK_BYTE (0x02, octet), TK_INT8 (0x0C), TK_UINT8 (0x0D). :i8 -> TK_INT8, :u8 -> TK_UINT8,
+;;; :byte/:octet -> TK_BYTE. All three are primitive (no int8/uint8 false-reject); int8 is
+;;; assignable-from int8 but NOT from uint8 (distinct kinds, Table 15).
+
+(defun* run-int8-uint8-byte-kinds-test ()
+    (function () t)
+  "primitive-type-identifier maps :i8 -> TK_INT8 (0x0C), :u8 -> TK_UINT8 (0x0D), :byte and
+   :octet -> TK_BYTE (0x02); ti-primitive-p is T for all three; int8-vs-int8 assignability
+   is T (the D1 false-reject is gone) while int8-vs-uint8 is NIL (distinct kinds, Table 15)."
+  (let ((i8 (dds.types:primitive-type-identifier :i8))
+        (u8 (dds.types:primitive-type-identifier :u8))
+        (byte (dds.types:primitive-type-identifier :byte))
+        (octet (dds.types:primitive-type-identifier :octet))
+        (opts (dds.types:default-assignability-options)))
+    (%check :d1-i8-kind (= (dds.types:type-identifier-kind i8) dds.types:+tk-int8+)
+            ":i8 maps to TK_INT8 (0x0C)")
+    (%check :d1-u8-kind (= (dds.types:type-identifier-kind u8) dds.types:+tk-uint8+)
+            ":u8 maps to TK_UINT8 (0x0D)")
+    (%check :d1-byte-kind (= (dds.types:type-identifier-kind byte) dds.types:+tk-byte+)
+            ":byte maps to TK_BYTE (0x02)")
+    (%check :d1-octet-kind (= (dds.types:type-identifier-kind octet) dds.types:+tk-byte+)
+            ":octet aliases :byte -> TK_BYTE (0x02)")
+    (%check :d1-i8-primitive (and (dds.types:ti-primitive-p i8) t) "TK_INT8 is a primitive")
+    (%check :d1-u8-primitive (and (dds.types:ti-primitive-p u8) t) "TK_UINT8 is a primitive")
+    (%check :d1-byte-primitive (and (dds.types:ti-primitive-p byte) t) "TK_BYTE is a primitive")
+    (%check :d1-i8-self-assignable
+            (and (dds.types:ti-assignable-from i8 (dds.types:primitive-type-identifier :i8) opts) t)
+            "int8 is-assignable-from int8 (D1 false-reject removed)")
+    (%check :d1-i8-not-from-u8
+            (not (dds.types:ti-assignable-from i8 u8 opts))
+            "int8 is NOT assignable-from uint8 (distinct kinds, Table 15)"))
+  t)
 
 ;;; Enumerated assignability (M4, FR-TYPE-4 S0): the sound under-approximation of the
 ;;; XTypes §7.2.4.4.7 Table 18 ENUMERATION_TYPE row — reject only a provable incompatibility.

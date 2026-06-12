@@ -41,9 +41,11 @@
 (defun* make-encapsulation-header (cursor representation &optional (options 0))
     (function (dds.core.buffer:cursor symbol &optional integer) dds.core.buffer:cursor)
   "Write the 4-octet SerializedPayloadHeader: 2-octet representation_identifier in
-   network order + 2-octet representation_options (RTPS 2.5 §10.2; sender sets
-   options to 0 per §10.2/§10.3), then reset the CDR alignment origin to the byte
-   after it (RTPS 2.5 §10.2). REPRESENTATION is a key of +representation-ids+."
+   network order + 2-octet representation_options, then reset the CDR alignment origin
+   to the byte after it (RTPS 2.5 §10.2). OPTIONS defaults to 0; for an XCDR2 payload
+   the low 2 bits of the second options byte are BACKPATCHED by
+   finalize-encapsulation-options once the body length is known (DDS-XTypes 1.3
+   §7.6.3.1.2). REPRESENTATION is a key of +representation-ids+."
   (let ((id (representation-id-value representation)))
     (dds.core.buffer:put-u8 cursor (ldb (byte 8 8) id))
     (dds.core.buffer:put-u8 cursor (ldb (byte 8 0) id))
@@ -52,20 +54,43 @@
     (dds.core.buffer:cursor-set-origin cursor)
     cursor))
 
+(defun* finalize-encapsulation-options (cursor representation)
+    (function (dds.core.buffer:cursor symbol) dds.core.buffer:cursor)
+  "Backpatch the encapsulation options pad bits after the body is serialized: set the
+   low 2 bits of the second options byte (buffer offset 3) to the number of pad bytes
+   (0..3) the serialized payload needs to reach the next 4-byte boundary, so the receiver
+   can find the exact payload end (DDS-XTypes 1.3 §7.6.3.1.2: 'shall set the least
+   significant two bits in the second byte of the options field to ... the number of
+   padding bytes needed'). The clause is universal — its normative example sets the bits
+   on PLAIN_CDR (XCDR1) — so this applies to ALL CDR representations, not only XCDR2; only
+   the non-CDR XML representation is skipped. Assumes the header occupies buffer offsets
+   0..3 and the body starts at offset 4. Hot path: allocation-free one-octet in-place patch."
+  (unless (eq representation :xml)
+    (let* ((body-len (- (dds.core.buffer:cursor-position cursor) 4))
+           (pad (mod (- 4 (mod body-len 4)) 4))
+           (vec (dds.core.buffer:octet-buffer-vec (dds.core.buffer:cursor-buffer cursor))))
+      (setf (aref vec 3) (logior (logandc2 (aref vec 3) 3) pad))))
+  cursor)
+
 (defun* parse-encapsulation-header (cursor)
-    (function (dds.core.buffer:cursor) (values t integer))
+    (function (dds.core.buffer:cursor) (values t integer (integer 0 3)))
   "Read and validate the 4-octet SerializedPayloadHeader; reset the CDR alignment
-   origin past it (RTPS 2.5 §10.2). Return (values representation-keyword options).
-   Bounds-checked at the boundary (NFR-SEC-POSTURE)."
+   origin past it (RTPS 2.5 §10.2). Return (values representation-keyword options pad),
+   where PAD is the trailing-padding count carried in the low 2 bits of the second
+   options byte (DDS-XTypes 1.3 §7.6.3.1.2 — the receiver SHALL interpret these bits to
+   determine where the serialized data exactly ended). A non-zero options value from a
+   conformant peer is tolerated, never rejected. Bounds-checked at the boundary
+   (NFR-SEC-POSTURE)."
   (let* ((id-hi (dds.core.buffer:get-u8 cursor))
          (id-lo (dds.core.buffer:get-u8 cursor))
          (opt-hi (dds.core.buffer:get-u8 cursor))
          (opt-lo (dds.core.buffer:get-u8 cursor))
          (id (logior (ash id-hi 8) id-lo))
          (options (logior (ash opt-hi 8) opt-lo))
+         (pad (logand opt-lo 3))
          (name (representation-id-name id)))
     (unless name
       (error 'cdr-not-implemented
              :what (format nil "unknown representation id #x~4,'0x" id)))
     (dds.core.buffer:cursor-set-origin cursor)
-    (values name options)))
+    (values name options pad)))

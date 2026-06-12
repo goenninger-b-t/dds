@@ -13,6 +13,7 @@
   (:export #:+representation-ids+ #:extensibility-kind
            #:representation-id #:representation-id-value #:representation-id-name
            #:make-encapsulation-header #:parse-encapsulation-header
+           #:finalize-encapsulation-options
            #:cdr-not-implemented
            ;; XCDR primitive + composite codec (FR-CDR-1/2)
            #:cdr-mode #:cdr-align #:cdr-size-align
