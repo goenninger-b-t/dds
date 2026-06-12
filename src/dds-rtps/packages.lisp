@@ -54,6 +54,9 @@
            #:write-nack-frag #:parse-nack-frag-body
            #:+data-flag-inline-qos+ #:+data-flag-data+ #:+data-flag-key+
            #:+data-flag-non-standard+
+           #:+statusinfo-disposed+ #:+statusinfo-unregistered+ #:+statusinfo-filtered+
+           #:status-info->kind #:write-status-info-inline-qos
+           #:parse-inline-qos-key-status #:write-data-dispose
            #:write-data #:parse-data-body
            #:write-data-frag #:parse-data-frag-body
            #:+data-frag-flag-key+ #:+data-frag-flag-inline-qos+
@@ -63,6 +66,7 @@
            #:+pid-default-unicast-locator+
            #:+pid-metatraffic-unicast-locator+ #:+pid-participant-guid+
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
+           #:+pid-status-info+
            #:+pid-type-information+ #:+pid-type-object-lb+
            #:write-parameter #:write-parameter-sentinel #:parse-parameter-list
            #:spdp-multicast-port #:spdp-unicast-port

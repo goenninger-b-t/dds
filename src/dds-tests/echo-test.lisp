@@ -350,6 +350,7 @@
                  ("rtps-fragnum-set"         . run-fragnum-set-test)
                  ("rtps-submessages"         . run-rtps-submessage-test)
                  ("rtps-data"                . run-rtps-data-test)
+                 ("status-info-codec"        . run-status-info-codec-test)
                  ("rtps-data-frag"           . run-rtps-data-frag-test)
                  ("connext-data-frag-vector" . run-connext-data-frag-vector-test)
                  ("rtps-heartbeat-frag"      . run-heartbeat-frag-test)

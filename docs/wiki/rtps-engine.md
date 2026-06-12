@@ -91,12 +91,29 @@ Filtered (F) extensions are not emitted or parsed in v1.
 ### DATA submessage (`dds.rtps.message`)
 
 `extraFlags + octetsToInlineQos + readerId + writerId + writerSN + [inlineQos if Q] +
-serializedPayload [if D||K]` (§9.4.5.4). v1 emits and parses the **base form (Q=0)**;
+serializedPayload [if D||K]` (§9.4.5.4). `write-data` emits the base form (Q=0);
+`parse-data-body` parses both forms — when the Q flag is set the inlineQos `ParameterList`
+is walked (bounds-checked) and `PID_KEY_HASH` / `PID_STATUS_INFO` are surfaced.
 `serializedPayload` is passed/returned as a byte region, left in place for the caller.
 
 - `dds.rtps.message:write-data` *(cursor reader-id writer-id writer-sn payload payload-off payload-len &key key)* — write a complete DATA submessage with a `serializedPayload`, no inlineQos. `KEY t` emits a key payload (K=1,D=0); else data (D=1,K=0).
-- `dds.rtps.message:parse-data-body` *(cursor flags octets-to-next)* — parse a DATA body (base form, Q=0); returns `(values reader-id writer-id writer-sn has-payload payload-offset payload-len key-p)`, or `NIL` if Q is set (inlineQos deferred) or the buffer is short.
+- `dds.rtps.message:parse-data-body` *(cursor flags octets-to-next)* — parse a DATA body; returns `(values reader-id writer-id writer-sn has-payload payload-offset payload-len key-p change-kind key-hash status-flags)`, or `NIL` if the buffer is short / the inlineQos is malformed. With Q set the inlineQos is walked (bounds-checked); the 16-octet `key-hash` is materialized only for a no-payload lifecycle change (zero per-sample allocation on the hot keyed-DATA path).
 - DATA flags: `+data-flag-inline-qos+` (Q), `+data-flag-data+` (D), `+data-flag-key+` (K), `+data-flag-non-standard+` (N).
+
+### Instance lifecycle: dispose / unregister (`dds.rtps.message`)
+
+A DDS instance dispose/unregister rides a **DATA submessage with flags E+Q only** — D clear,
+K clear, **no serializedPayload**; the instance is named by `PID_KEY_HASH` (`0x0070`, an
+`octet[16]` KeyHash_t, §9.6.4.8) and the lifecycle transition by `PID_STATUS_INFO`
+(`0x0071`, `StatusInfo_t` = `octet[4]`, §9.6.4.9). `StatusInfo_t` flags live in the **last
+octet** (`...F|U|D`): Disposed `0x01`, Unregistered `0x02`, Filtered `0x04`. The wire form is
+pinned from the conformant eProsima Fast DDS oracle and verified byte-exact.
+
+- `dds.rtps.message:status-info->kind` *(status-flags)* — derive the CacheChange kind: `U=1 → :unregister` (dominates), else `D=1 → :dispose`, else `:data` (§9.6.4.9).
+- `dds.rtps.message:write-status-info-inline-qos` *(cursor key-hash status-flags)* — write the dispose/unregister inlineQos `ParameterList`: `PID_KEY_HASH` (16) + `PID_STATUS_INFO` (4) + `PID_SENTINEL` (reuses `write-parameter`/`-sentinel`).
+- `dds.rtps.message:parse-inline-qos-key-status` *(cursor body-end &optional capture-key-hash)* — walk a Q-flag inlineQos `ParameterList` bounded by `BODY-END`, returning `(values key-hash status-flags walk-ok)`; bounds-checked (every read against `BODY-END` first, NFR-SEC-POSTURE), unknown PIDs skipped, a `KEY_HASH`/`STATUS_INFO` of the wrong length ignored. `CAPTURE-KEY-HASH` `NIL` suppresses the key-hash allocation.
+- `dds.rtps.message:write-data-dispose` *(cursor reader-id writer-id writer-sn key-hash status-flags)* — write the full dispose/unregister DATA submessage (flags E+Q, body 52 = 20 fixed prefix + 32 inlineQos).
+- StatusInfo flags: `+statusinfo-disposed+`, `+statusinfo-unregistered+`, `+statusinfo-filtered+`; PID `+pid-status-info+`.
 
 ### ParameterList / PID codec (`dds.rtps.message`)
 
@@ -107,7 +124,7 @@ codec is the substrate the [Discovery](discovery.md) SPDP/SEDP `ParameterList`s 
 - `dds.rtps.message:write-parameter` *(cursor pid value off len)* — write one Parameter: pid + length (padded to a multiple of 4) + value + padding.
 - `dds.rtps.message:write-parameter-sentinel` *(cursor)* — write `PID_SENTINEL`, terminating a ParameterList.
 - `dds.rtps.message:parse-parameter-list` *(cursor handler)* — iterate Parameters until `PID_SENTINEL`, calling `(handler pid cursor len)` with the cursor at the value; returns `T` on clean termination, `NIL` on a truncated list. Bounds-checked.
-- PID constants: `+pid-pad+`, `+pid-sentinel+`, `+pid-participant-lease-duration+`, `+pid-topic-name+`, `+pid-type-name+`, `+pid-protocol-version+`, `+pid-vendorid+`, `+pid-reliability+`, `+pid-durability+`, `+pid-default-unicast-locator+`, `+pid-metatraffic-unicast-locator+`, `+pid-participant-guid+`, `+pid-builtin-endpoint-set+`, `+pid-endpoint-guid+`, `+pid-key-hash+`, `+pid-type-information+`.
+- PID constants: `+pid-pad+`, `+pid-sentinel+`, `+pid-participant-lease-duration+`, `+pid-topic-name+`, `+pid-type-name+`, `+pid-protocol-version+`, `+pid-vendorid+`, `+pid-reliability+`, `+pid-durability+`, `+pid-default-unicast-locator+`, `+pid-metatraffic-unicast-locator+`, `+pid-participant-guid+`, `+pid-builtin-endpoint-set+`, `+pid-endpoint-guid+`, `+pid-key-hash+`, `+pid-status-info+`, `+pid-type-information+`.
 
 ### Port mapping (`dds.rtps.message`)
 

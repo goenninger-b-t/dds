@@ -1038,3 +1038,124 @@
               (eq :automatic (dds.qos:qos-liveliness (dds.rtps.discovery:endpoint-data-qos back)))
               "short-length PID_LIVELINESS is ignored, liveliness keeps its default")))
   t)
+
+;;; Instance-lifecycle wire codec (RTPS 2.5 §9.6.4.9): a dispose/unregister rides a DATA
+;;; submessage with flags E+Q only (no serialized payload); the instance is named by
+;;; PID_KEY_HASH and the lifecycle transition by PID_STATUS_INFO (StatusInfo_t octet[4],
+;;; last octet flags F|U|D). The oracle is eProsima Fast DDS 3.6.1 (the conformant peer),
+;;; interop/fastdds/captures/instance-dispose-lo0.pcap frame 91 (dispose) / 113 (unregister-
+;;; of-already-disposed). Vectors locked from those captures, never memory.
+
+(defun* %dispose-key-hash ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "The 16-octet instance KeyHash from the Fast DDS oracle dispose DATA (frame 91)."
+  (octets #xca #xc2 #x17 #xc3 #x18 #x36 #x3f #x8e #xf1 #x16 #x0e #xee #xde #xf9 #xe8 #x86))
+
+(defun* run-status-info-codec-test ()
+    (function () t)
+  "Test: PID_STATUS_INFO + PID_KEY_HASH inlineQos codec for instance dispose/unregister,
+   byte-exact against the Fast DDS oracle (RTPS 2.5 §9.6.4.9). Builds the ParameterList,
+   asserts the bytes, parses it back, derives the change-kind, byte-validates the exact
+   oracle vectors, and exercises the bounds/over-long path (NFR-SEC-POSTURE)."
+  (let* ((kh (%dispose-key-hash))
+         (buf (dds.core.buffer:make-octet-buffer 256))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    ;; emit the dispose inlineQos: PID_KEY_HASH(16) + PID_STATUS_INFO(4, Disposed) + SENTINEL
+    (let ((plen (dds.rtps.message:write-status-info-inline-qos
+                 c kh dds.rtps.message:+statusinfo-disposed+)))
+      (%check :si-dispose-bytes
+              (equal '(#x70 #x00 #x10 #x00  #xca #xc2 #x17 #xc3 #x18 #x36 #x3f #x8e
+                       #xf1 #x16 #x0e #xee #xde #xf9 #xe8 #x86
+                       #x71 #x00 #x04 #x00  #x00 #x00 #x00 #x01  #x01 #x00 #x00 #x00)
+                     (%first-bytes buf plen))
+              "dispose inlineQos ParameterList bytes (key-hash + StatusInfo Disposed)"))
+    ;; parse it back -> key-hash + StatusInfo flags (Disposed)
+    (let ((pc (dds.core.buffer:cursor buf :endianness :little)))
+      (multiple-value-bind (gkh flags)
+          (dds.rtps.message:parse-inline-qos-key-status
+           pc (dds.core.buffer:octet-buffer-capacity buf))
+        (%check :si-dispose-parse
+                (and (equalp kh gkh) (= flags dds.rtps.message:+statusinfo-disposed+))
+                "parse dispose inlineQos -> key-hash + Disposed")
+        (%check :si-dispose-kind
+                (eq :dispose (dds.rtps.message:status-info->kind flags))
+                "Disposed flag derives change-kind :dispose")))
+    ;; unregister (StatusInfo 00 00 00 02)
+    (let* ((buf2 (dds.core.buffer:make-octet-buffer 256))
+           (c2 (dds.core.buffer:cursor buf2 :endianness :little)))
+      (dds.rtps.message:write-status-info-inline-qos
+       c2 kh dds.rtps.message:+statusinfo-unregistered+)
+      (let ((pc (dds.core.buffer:cursor buf2 :endianness :little)))
+        (multiple-value-bind (gkh flags)
+            (dds.rtps.message:parse-inline-qos-key-status
+             pc (dds.core.buffer:octet-buffer-capacity buf2))
+          (%check :si-unreg-parse
+                  (and (equalp kh gkh) (= flags dds.rtps.message:+statusinfo-unregistered+))
+                  "parse unregister inlineQos -> key-hash + Unregistered")
+          (%check :si-unreg-kind
+                  (eq :unregister (dds.rtps.message:status-info->kind flags))
+                  "Unregistered flag derives change-kind :unregister"))))
+    ;; the byte-exact oracle vector (Fast DDS frame 91): the exact 32-octet inlineQos
+    ;; ParameterList off the wire must parse to :dispose + that key-hash (S0.2 interop).
+    (let* ((oracle (octets #x70 #x00 #x10 #x00  #xca #xc2 #x17 #xc3 #x18 #x36 #x3f #x8e
+                           #xf1 #x16 #x0e #xee #xde #xf9 #xe8 #x86
+                           #x71 #x00 #x04 #x00  #x00 #x00 #x00 #x01  #x01 #x00 #x00 #x00))
+           (ob (dds.core.buffer:make-octet-buffer 64))
+           (oc (dds.core.buffer:cursor ob :endianness :little)))
+      (dds.core.buffer:put-octets oc oracle 0 (length oracle))
+      (let ((pc (dds.core.buffer:cursor ob :endianness :little)))
+        (multiple-value-bind (gkh flags)
+            (dds.rtps.message:parse-inline-qos-key-status pc (length oracle))
+          (%check :si-oracle
+                  (and (equalp (%dispose-key-hash) gkh)
+                       (eq :dispose (dds.rtps.message:status-info->kind flags)))
+                  "Fast DDS oracle dispose inlineQos parses byte-exact -> :dispose + key-hash"))))
+    ;; the unregister-of-already-disposed oracle vector (frame 113): StatusInfo D|U = 0x03;
+    ;; the Unregistered bit dominates the derivation -> :unregister.
+    (let* ((oracle3 (octets #x70 #x00 #x10 #x00  #xca #xc2 #x17 #xc3 #x18 #x36 #x3f #x8e
+                            #xf1 #x16 #x0e #xee #xde #xf9 #xe8 #x86
+                            #x71 #x00 #x04 #x00  #x00 #x00 #x00 #x03  #x01 #x00 #x00 #x00))
+           (ob (dds.core.buffer:make-octet-buffer 64))
+           (oc (dds.core.buffer:cursor ob :endianness :little)))
+      (dds.core.buffer:put-octets oc oracle3 0 (length oracle3))
+      (let ((pc (dds.core.buffer:cursor ob :endianness :little)))
+        (multiple-value-bind (gkh flags)
+            (dds.rtps.message:parse-inline-qos-key-status pc (length oracle3))
+          (declare (ignore gkh))
+          (%check :si-oracle3
+                  (and (= flags 3) (eq :unregister (dds.rtps.message:status-info->kind flags)))
+                  "Fast DDS unregister-of-disposed (StatusInfo 0x03) derives :unregister"))))
+    ;; bounds: an over-long PID_STATUS_INFO length must be rejected, never read OOB.
+    (let* ((bad (octets #x71 #x00 #xff #x00  #x00 #x00 #x00 #x01))
+           (ob (dds.core.buffer:make-octet-buffer 64))
+           (oc (dds.core.buffer:cursor ob :endianness :little)))
+      (dds.core.buffer:put-octets oc bad 0 (length bad))
+      (let ((pc (dds.core.buffer:cursor ob :endianness :little)))
+        (multiple-value-bind (gkh flags)
+            (dds.rtps.message:parse-inline-qos-key-status pc (length bad))
+          (%check :si-overlong
+                  (and (null gkh) (zerop flags))
+                  "over-long PID_STATUS_INFO -> NIL key-hash, no flags, no OOB")))))
+  ;; the full dispose DATA submessage: flags E+Q, no payload, inlineQos = key-hash + status.
+  (let* ((buf (dds.core.buffer:make-octet-buffer 256))
+         (c (dds.core.buffer:cursor buf :endianness :little))
+         (rid #x00000107) (wid #x00000102) (kh (%dispose-key-hash)))
+    (dds.rtps.message:write-data-dispose
+     c rid wid 6 kh dds.rtps.message:+statusinfo-disposed+)
+    (dds.core.buffer:cursor-reset c)
+    (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c)
+      (declare (ignore le))
+      (%check :si-data-hdr
+              (and (= id dds.rtps.message:+submsg-data+)
+                   (= flags (logior dds.rtps.message:+flag-endianness+
+                                    dds.rtps.message:+data-flag-inline-qos+)))
+              "dispose DATA header: E+Q only, D clear, K clear")
+      (multiple-value-bind (r w sn has off len keyp kind gkh sflags)
+          (dds.rtps.message:parse-data-body c flags octets)
+        (declare (ignore off len))
+        (%check :si-data-parse
+                (and (= r rid) (= w wid) (= sn 6) (not has) (not keyp)
+                     (eq kind :dispose) (equalp kh gkh)
+                     (= sflags dds.rtps.message:+statusinfo-disposed+))
+                "dispose DATA parses: no payload, :dispose, key-hash + Disposed surfaced"))))
+  t)

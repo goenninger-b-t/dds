@@ -448,6 +448,86 @@
 (defconstant +data-flag-non-standard+  #x10
   "DATA NonStandardPayloadFlag (N) (RTPS 2.5 §9.4.5.4).")
 
+;; StatusInfo_t (RTPS 2.5 §9.6.4.9): octet[4]; the last octet holds the flags ...F|U|D
+;; (D=bit0, U=bit1, F=bit2). Big-endian octet array, so the flags live in byte index 3.
+(defconstant +statusinfo-disposed+     #x01
+  "StatusInfo_t DisposedFlag (D): the instance was disposed (RTPS 2.5 §9.6.4.9).")
+(defconstant +statusinfo-unregistered+ #x02
+  "StatusInfo_t UnregisteredFlag (U): the instance was unregistered (RTPS 2.5 §9.6.4.9).")
+(defconstant +statusinfo-filtered+     #x04
+  "StatusInfo_t FilteredFlag (F): the sample did not pass the reader filter (RTPS 2.5 §9.6.4.9).")
+
+(defun* status-info->kind (status-flags)
+    (function ((unsigned-byte 8)) (member :data :dispose :unregister))
+  "Derive the CacheChange kind from StatusInfo_t flags (RTPS 2.5 §9.6.4.9): U=1 ->
+   :unregister (dominates), else D=1 -> :dispose, else :data. FilteredFlag does not
+   change the kind (it qualifies an ALIVE write)."
+  (cond ((logtest status-flags +statusinfo-unregistered+) :unregister)
+        ((logtest status-flags +statusinfo-disposed+) :dispose)
+        (t :data)))
+
+(defun* write-status-info-inline-qos (cursor key-hash status-flags)
+    (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)) fixnum)
+  "Write a dispose/unregister inlineQos ParameterList into CURSOR: PID_KEY_HASH (the
+   16-octet KEY-HASH, RTPS 2.5 §9.6.4.8) + PID_STATUS_INFO (StatusInfo_t octet[4], the
+   STATUS-FLAGS in the last octet, §9.6.4.9) + PID_SENTINEL. Reuses write-parameter so the
+   4-byte alignment + sentinel rules stay in one place (§9.4.2.11). Returns the new position."
+  (let ((si (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref si 3) status-flags)                ; StatusInfo_t flags occupy the last octet
+    (write-parameter cursor +pid-key-hash+ key-hash 0 16)
+    (write-parameter cursor +pid-status-info+ si 0 4)
+    (write-parameter-sentinel cursor)))
+
+(defun* parse-inline-qos-key-status (cursor body-end &optional (capture-key-hash t))
+    (function (dds.core.buffer:cursor fixnum &optional t) t)
+  "Walk an inlineQos ParameterList (RTPS 2.5 §9.4.2.11) bounded by BODY-END, extracting
+   PID_KEY_HASH (KeyHash_t octet[16], §9.6.4.8) and PID_STATUS_INFO (StatusInfo_t octet[4],
+   §9.6.4.9). Returns (values key-hash status-flags walk-ok), leaving CURSOR just past the
+   PID_SENTINEL header. KEY-HASH is a fresh 16-octet array or NIL; STATUS-FLAGS is the last
+   StatusInfo octet (0 if absent); WALK-OK is NIL when the list ran off BODY-END without a
+   sentinel. When CAPTURE-KEY-HASH is NIL the key-hash is NOT materialized (zero per-sample
+   allocation on the hot keyed-DATA path) — only its presence advances the cursor. Unknown
+   PIDs are skipped. Every read is bounds-checked against BODY-END FIRST (NFR-SEC-POSTURE);
+   a KEY_HASH not exactly 16 / STATUS_INFO not exactly 4 octets is ignored, never trusted."
+  (let ((key-hash nil) (status-flags 0))
+    (loop
+      (when (> (+ (dds.core.buffer:cursor-position cursor) 4) body-end)
+        (return (values key-hash status-flags nil)))
+      (let ((pid (dds.core.buffer:get-u16 cursor))
+            (plen (dds.core.buffer:get-u16 cursor)))
+        (when (= pid +pid-sentinel+) (return (values key-hash status-flags t)))
+        (let ((value-start (dds.core.buffer:cursor-position cursor)))
+          (when (> (+ value-start plen) body-end)
+            (return (values key-hash status-flags nil)))
+          (cond
+            ((and capture-key-hash (= pid +pid-key-hash+) (= plen 16))
+             (let ((kh (make-array 16 :element-type '(unsigned-byte 8))))
+               (dds.core.buffer:get-octets cursor kh 0 16)
+               (setf key-hash kh)))
+            ((and (= pid +pid-status-info+) (= plen 4))
+             (dds.core.buffer:get-u8 cursor) (dds.core.buffer:get-u8 cursor)
+             (dds.core.buffer:get-u8 cursor)
+             (setf status-flags (dds.core.buffer:get-u8 cursor))))
+          (dds.core.buffer:cursor-set-position cursor (+ value-start plen)))))))
+
+(defun* write-data-dispose (cursor reader-id writer-id writer-sn key-hash status-flags)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)) fixnum)
+  "Write a complete dispose/unregister DATA submessage (RTPS 2.5 §9.4.5.4 + §9.6.4.9):
+   flags E+Q only — D clear, K clear, NO serializedPayload; the instance is named by
+   PID_KEY_HASH and the lifecycle transition by PID_STATUS_INFO (STATUS-FLAGS). Wire form
+   resolved from the conformant Fast DDS oracle. octetsToInlineQos=16; the body is the
+   20-octet fixed prefix + a 32-octet inlineQos (KEY_HASH 4+16, STATUS_INFO 4+4, SENTINEL 4)."
+  (write-submessage-header cursor +submsg-data+
+                           (logior (%e-flag cursor) +data-flag-inline-qos+)
+                           52)
+  (dds.core.buffer:put-u16 cursor 0)               ; extraFlags = 0 (this version)
+  (dds.core.buffer:put-u16 cursor 16)              ; octetsToInlineQos = 16
+  (write-entity-id cursor reader-id)
+  (write-entity-id cursor writer-id)
+  (write-sequence-number cursor writer-sn)
+  (write-status-info-inline-qos cursor key-hash status-flags)
+  (dds.core.buffer:cursor-position cursor))
+
 (defun* write-data (cursor reader-id writer-id writer-sn payload payload-off payload-len &key key)
     (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum)
   "Write a complete DATA submessage with a serializedPayload, no inlineQos. KEY t
@@ -482,10 +562,13 @@
 (defun* parse-data-body (cursor flags octets-to-next)
     (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t)
   "Parse a DATA body. Returns (values reader-id writer-id writer-sn has-payload
-   payload-offset payload-len key-p), or NIL if the buffer is short / malformed. When
-   the InlineQos flag (Q) is set the inlineQos ParameterList is SKIPPED (bounds-checked,
-   %skip-inline-qos) and the serializedPayload that follows it is reported. The payload is
-   left in place (the caller reads it from PAYLOAD-OFFSET). RTPS 2.5 §9.4.5.4."
+   payload-offset payload-len key-p change-kind key-hash status-flags), or NIL if the buffer
+   is short / malformed. When the InlineQos flag (Q) is set the inlineQos ParameterList is
+   walked (bounds-checked, parse-inline-qos-key-status) — PID_STATUS_INFO yields STATUS-FLAGS
+   (StatusInfo_t §9.6.4.9) and the derived CHANGE-KIND (:data/:dispose/:unregister); the
+   16-octet KEY-HASH is materialized only for a no-payload lifecycle change (zero per-sample
+   allocation on the hot keyed-DATA path). The serializedPayload after the inlineQos is
+   reported (left in place at PAYLOAD-OFFSET). RTPS 2.5 §9.4.5.4 + §9.6.4.9."
   (let* ((body-start (dds.core.buffer:cursor-position cursor))
          (cap (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor)))
          (body-end (if (plusp octets-to-next) (min (+ body-start octets-to-next) cap) cap)))
@@ -494,15 +577,20 @@
     (dds.core.buffer:get-u16 cursor)             ; octetsToInlineQos
     (let ((reader (read-entity-id cursor))
           (writer (read-entity-id cursor))
-          (sn (read-sequence-number cursor)))
+          (sn (read-sequence-number cursor))
+          (has-payload (logtest flags (logior +data-flag-data+ +data-flag-key+)))
+          (key-hash nil) (status-flags 0))
       (when (logtest flags +data-flag-inline-qos+)
-        (unless (%skip-inline-qos cursor body-end) (return-from parse-data-body nil)))
-      (let* ((has-payload (logtest flags (logior +data-flag-data+ +data-flag-key+)))
-             (poff (dds.core.buffer:cursor-position cursor))
+        (multiple-value-bind (kh sf ok)
+            (parse-inline-qos-key-status cursor body-end (not has-payload))
+          (unless ok (return-from parse-data-body nil))
+          (setf key-hash kh status-flags sf)))
+      (let* ((poff (dds.core.buffer:cursor-position cursor))
              (len (- body-end poff)))
         (when (< len 0) (return-from parse-data-body nil))
         (values reader writer sn has-payload poff
-                (if has-payload len 0) (logtest flags +data-flag-key+))))))
+                (if has-payload len 0) (logtest flags +data-flag-key+)
+                (status-info->kind status-flags) key-hash status-flags)))))
 
 ;;; ---- DATA_FRAG submessage (§9.4.5.5): extraFlags + octetsToInlineQos + readerId +
 ;;; writerId + writerSN + fragmentStartingNum(u32) + fragmentsInSubmessage(u16) +
@@ -603,6 +691,8 @@
   "PID_ENDPOINT_GUID (RTPS 2.5 §9.6.2.2 table).")
 (defconstant +pid-key-hash+                   #x0070
   "PID_KEY_HASH (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-status-info+                #x0071
+  "PID_STATUS_INFO -> StatusInfo_t (RTPS 2.5 Table 9.23, §9.6.4.9).")
 (defconstant +pid-type-information+           #x0075
   "PID_TYPE_INFORMATION (DDS-XTypes 1.3 BuiltinTopicData @id(0x0075)).")
 (defconstant +pid-type-object-lb+             #x8021
