@@ -107,7 +107,12 @@ engine queried our server (getTypeDependencies + getTypes), **built its DynamicT
 MINIMAL TypeObject**, and took **600/600** RELIABLE samples — closing the TypeLookup
 **CONFIRM-VS-PEER walk** in both directions (the walk table, the exact patch, and the
 explicitly-not-stock caveat live in
-[`interop/fastdds/README.md`](interop/fastdds/README.md)).
+[`interop/fastdds/README.md`](interop/fastdds/README.md)). With that,
+**FR-IO-2 is met and closed** ([ADR 0012](docs/adr/0012-fastdds-peer-fr-io-2.md),
+2026-06-12): every stock-citable element — discovery, the bidirectional reliable data
+plane, the type-identity oracle, and the TypeLookup client leg — ran against an
+**unmodified** Fast DDS 3.6.1 peer; only the leg-B reply direction carries the non-stock
+label, and it travels with that result wherever it is cited.
 
 ---
 

@@ -1,7 +1,7 @@
 # Fast DDS open peer: FR-IO-2 interop + TypeLookup / EquivalenceHash oracle
 
 - **Date:** 2026-06-11
-- **Status:** Design — approved for planning.
+- **Status:** **COMPLETE (2026-06-12)** — all stages S0–S5 implemented; FR-IO-2 met (ADR 0012; the leg-B reply direction is non-stock-only, see the ADR). Was: Design — approved for planning.
 - **Area:** interop harness (new `interop/fastdds/`), external toolchain (Fast DDS source build), L3 type system + L5 discovery only if live testing exposes bugs (fixes per the normal per-task flow)
 - **Requirements:** FR-IO-2 (wire-interoperate with ≥1 of Fast DDS / Cyclone DDS / OpenDDS), FR-TYPE-2/3 (the PROVISIONAL MinimalTypeObject serializer + EquivalenceHash and TypeInformation codec gain their first external oracle), FR-TYPE-3 (TypeLookup live leg deferred by ADR 0010), NFR-IP (clean-room: Fast DDS is Apache-2.0 — read, never copy), the operating contract §4 (the wire is the oracle) and §6 (gates)
 

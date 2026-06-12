@@ -832,3 +832,23 @@ clean-room note above. Files consulted:
   firewall) discovery failure; no code copied.
 
 No eProsima code was copied into the harness or `src/`; no RTI material was consulted.
+
+## M4 (2026-06-12) — Fast DDS vendor-gate NON-STOCK diagnostic + json_serialize root-cause (FR-IO-2 S4 closeout, ADR 0012)
+
+Two further read-only consultations of the pinned Fast-DDS v3.6.1 tree (Apache-2.0),
+per the clean-room note above; nothing copied into the harness or `src/`:
+
+- `src/cpp/rtps/builtin/data/WriterProxyData.cpp` + `ReaderProxyData.cpp` — the
+  controller-approved **NON-STOCK diagnostic**: the `PID_TYPE_INFORMATION` vendor-gate
+  early-return was neutralized by a one-line `if (false && ...)` edit in a **local
+  build only** (the diff is archived as
+  `interop/fastdds/captures/s4-theirclient-patched-nonstock.diff`; the modified files
+  stayed in the out-of-repo toolchain tree, Apache-2.0 permits the modification, and
+  the stock state was restored, rebuilt, and re-proven —
+  `captures/s4-theirclient-restored-probe.out`). The repo contains the diff as
+  evidence, not as shipped code.
+- `src/cpp/fastdds/xtypes/dynamic_types/DynamicTypeBuilderFactoryImpl.cpp` (line 1626,
+  `get_string_from_name_hash`) — read to root-cause THEIR per-sample `json_serialize`
+  failures (`type_error.316`): raw `NameHash` `uint8_t` bytes streamed through the
+  `char` `operator<<` overload yield non-UTF-8 member names from any MINIMAL
+  TypeObject. A Fast DDS defect (upstream-reportable), not our framing.

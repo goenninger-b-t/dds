@@ -36,13 +36,13 @@
 
 **Files:** none (system state; recorded in provenance at Task 0.5)
 
-- [ ] **Step 1: Install**
+- [x] **Step 1: Install**
 
 ```bash
 brew install openjdk
 ```
 
-- [ ] **Step 2: Make it visible and verify**
+- [x] **Step 2: Make it visible and verify**
 
 brew prints a caveat about symlinking; follow it (typically):
 
@@ -57,13 +57,13 @@ Expected: `openjdk version "2x.y"` (any JDK ≥ 11 satisfies fastddsgen). If `su
 
 **Files:** creates `"$HOME/gbt Dropbox/gbt/projects/fastdds/{src,install}"`
 
-- [ ] **Step 1: Brew dependencies** (per the official "Mac OS installation from sources" page — read it at <https://fast-dds.docs.eprosima.com/en/stable/installation/sources/sources_mac.html> before running; adjust if it lists more):
+- [x] **Step 1: Brew dependencies** (per the official "Mac OS installation from sources" page — read it at <https://fast-dds.docs.eprosima.com/en/stable/installation/sources/sources_mac.html> before running; adjust if it lists more):
 
 ```bash
 brew install asio tinyxml2 openssl@3
 ```
 
-- [ ] **Step 2: Clone Fast-DDS at the pin and read its dependency manifest**
+- [x] **Step 2: Clone Fast-DDS at the pin and read its dependency manifest**
 
 ```bash
 mkdir -p "$HOME/gbt Dropbox/gbt/projects/fastdds/src"
@@ -74,7 +74,7 @@ cat fastdds/fastdds.repos
 
 `fastdds.repos` names the exact matching tags for `eProsima/foonathan_memory_vendor` and `eProsima/Fast-CDR`. **Use those tags** in the next step (do not guess). Record all three (repo, tag, commit hash after clone) for Task 0.5's provenance entry.
 
-- [ ] **Step 3: Clone the two dependencies at the manifest tags**
+- [x] **Step 3: Clone the two dependencies at the manifest tags**
 
 ```bash
 git clone --branch <tag-from-fastdds.repos> --depth 1 https://github.com/eProsima/foonathan_memory_vendor.git
@@ -84,13 +84,13 @@ git -C foonathan_memory_vendor rev-parse HEAD; git -C fastcdr rev-parse HEAD; gi
 
 (The `<tag-from-fastdds.repos>` placeholders are resolved by Step 2's output at execution time — this is a deliberate read-the-manifest step, not a plan gap; v3.6.1's manifest is authoritative over anything written here.)
 
-- [ ] **Step 4 (fallback only):** if v3.6.1 later fails to compile on this macOS 26 host (Task 0.3), retry one minor back (v3.5.x latest patch, then v3.4.x), each time re-reading that tag's `fastdds.repos`. Record the pin actually used.
+- [x] **Step 4 (fallback only — never triggered; v3.6.1 built clean, pin recorded):** if v3.6.1 later fails to compile on this macOS 26 host (Task 0.3), retry one minor back (v3.5.x latest patch, then v3.4.x), each time re-reading that tag's `fastdds.repos`. Record the pin actually used.
 
 ### Task 0.3: CMake-build the toolchain into one prefix
 
 **Files:** populates `$FASTDDS_PREFIX`
 
-- [ ] **Step 1: Build in dependency order**
+- [x] **Step 1: Build in dependency order**
 
 ```bash
 export FASTDDS_PREFIX="$HOME/gbt Dropbox/gbt/projects/fastdds/install"
@@ -103,7 +103,7 @@ for d in foonathan_memory_vendor fastcdr fastdds; do
 done
 ```
 
-- [ ] **Step 2: Verify**
+- [x] **Step 2: Verify**
 
 ```bash
 ls "$FASTDDS_PREFIX/lib" | grep -E 'fastdds|fastcdr'
@@ -115,7 +115,7 @@ Expected: `libfastcdr.dylib`, `libfastdds.dylib` (plus versioned symlinks). If t
 
 **Files:** creates `"$HOME/gbt Dropbox/gbt/projects/fastdds/src/fastddsgen"`
 
-- [ ] **Step 1: Clone + gradle-build.** The Fast-DDS-Gen release matching Fast DDS 3.6.x is named in the same docs "versions/dependencies" table (<https://fast-dds.docs.eprosima.com/en/stable/notes/versions.html>) — read it, use that tag:
+- [x] **Step 1: Clone + gradle-build.** The Fast-DDS-Gen release matching Fast DDS 3.6.x is named in the same docs "versions/dependencies" table (<https://fast-dds.docs.eprosima.com/en/stable/notes/versions.html>) — read it, use that tag:
 
 ```bash
 cd "$HOME/gbt Dropbox/gbt/projects/fastdds/src"
@@ -123,7 +123,7 @@ git clone --branch <matching-tag> --depth 1 https://github.com/eProsima/Fast-DDS
 cd fastddsgen && ./gradlew assemble
 ```
 
-- [ ] **Step 2: Verify**
+- [x] **Step 2: Verify**
 
 ```bash
 ./scripts/fastddsgen -version
@@ -137,7 +137,7 @@ Expected: the pinned version string. Record repo/tag/commit for provenance.
 - Create: `$REPO/scripts/with-fastdds.sh`
 - Modify: `$REPO/docs/provenance.md`
 
-- [ ] **Step 1: Write `scripts/with-fastdds.sh`** (modeled on `scripts/with-clasp.sh`):
+- [x] **Step 1: Write `scripts/with-fastdds.sh`** (modeled on `scripts/with-clasp.sh`):
 
 ```bash
 #!/usr/bin/env bash
@@ -167,9 +167,9 @@ chmod +x "$REPO/scripts/with-fastdds.sh"
 
 (macOS SIP strips `DYLD_LIBRARY_PATH` across protected binaries — the Connext harness hit this; if the harness apps fail to find the dylibs at Task 0.7, link them with `-Wl,-rpath,"$FASTDDS_PREFIX/lib"` — the harness Makefile in Task 0.6 already does — and the env var becomes belt-and-suspenders.)
 
-- [ ] **Step 2: Provenance entry** — append to `docs/provenance.md` a dated section: Fast DDS toolchain (test peer, NOT a code dependency, no SBOM entry): the three repos + fastddsgen with URLs, tags, commit hashes, Apache-2.0 license; the brew packages (openjdk, asio, tinyxml2, openssl@3); the clean-room note (read-only consultation of Fast DDS examples/headers for harness API usage; no code copied into `src/`); the docs pages consulted.
+- [x] **Step 2: Provenance entry** — append to `docs/provenance.md` a dated section: Fast DDS toolchain (test peer, NOT a code dependency, no SBOM entry): the three repos + fastddsgen with URLs, tags, commit hashes, Apache-2.0 license; the brew packages (openjdk, asio, tinyxml2, openssl@3); the clean-room note (read-only consultation of Fast DDS examples/headers for harness API usage; no code copied into `src/`); the docs pages consulted.
 
-- [ ] **Step 3: Commit (present message to owner first):**
+- [x] **Step 3: Commit (present message to owner first):**
 
 ```
 chore(interop): pin + build the Fast DDS 3.6.1 toolchain (FR-IO-2 peer)
@@ -194,7 +194,7 @@ docs/superpowers/specs/2026-06-11-fastdds-peer-design.md S0.
 - Create (generated): `$REPO/interop/fastdds/shapes/gen/` (fastddsgen output, committed)
 - Modify: `$REPO/interop/connext/Makefile` — nothing; instead Modify: `$REPO/Makefile` (top level, add `fastdds-*` targets, Step 7)
 
-- [ ] **Step 1: The IDL** — `interop/fastdds/shapes/ShapeType.idl`. Bound-aligned with our model (unbounded string ⇒ bound 0; FINAL):
+- [x] **Step 1: The IDL** — `interop/fastdds/shapes/ShapeType.idl`. Bound-aligned with our model (unbounded string ⇒ bound 0; FINAL):
 
 ```idl
 @final
@@ -207,7 +207,7 @@ struct ShapeType
 };
 ```
 
-- [ ] **Step 2: Generate type support**
+- [x] **Step 2: Generate type support**
 
 ```bash
 cd "$REPO/interop/fastdds/shapes"
@@ -217,7 +217,7 @@ ls gen
 
 Expected: `ShapeType.hpp`, `ShapeTypePubSubTypes.{cxx,hpp}`, `ShapeTypeTypeObjectSupport.{cxx,hpp}`, `ShapeTypeCdrAux.{hpp,ipp}` (names per fastddsgen 4.x; whatever it emits is committed verbatim).
 
-- [ ] **Step 3: `profiles.xml`** — UDPv4-only (no SHMEM — keep every byte capturable on lo0; the Connext same-host lesson), explicit TypeLookup client+server. **The `interfaceWhiteList` IP is per-machine — same convention as `interop/connext/`'s USER_QOS_PROFILES.xml (currently 192.168.2.148; EDIT per machine):**
+- [x] **Step 3: `profiles.xml`** — UDPv4-only (no SHMEM — keep every byte capturable on lo0; the Connext same-host lesson), explicit TypeLookup client+server. **The `interfaceWhiteList` IP is per-machine — same convention as `interop/connext/`'s USER_QOS_PROFILES.xml (currently 192.168.2.148; EDIT per machine):**
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -255,7 +255,7 @@ Expected: `ShapeType.hpp`, `ShapeTypePubSubTypes.{cxx,hpp}`, `ShapeTypeTypeObjec
 
 If the XSD rejects an element name (3.6 schema drift), reconcile against `$FASTDDS_PREFIX/share/fastdds/fastdds_profiles.xsd` and the pinned tree's `examples/` XMLs (reading allowed; note in provenance). The participant QoS knobs in C++ (Step 4) are the fallback if the XML path proves unreliable.
 
-- [ ] **Step 4: `shapes_pub.cpp`** — stock 3.x API (structure verified against the pinned tree's `examples/cpp/hello_world/`; reconcile any drift against the installed headers, never copy):
+- [x] **Step 4: `shapes_pub.cpp`** — stock 3.x API (structure verified against the pinned tree's `examples/cpp/hello_world/`; reconcile any drift against the installed headers, never copy):
 
 ```cpp
 // FR-IO-2 Fast DDS peer publisher: RELIABLE ShapeType on topic "Square".
@@ -339,7 +339,7 @@ int main(int argc, char** argv)
 }
 ```
 
-- [ ] **Step 5: `shapes_sub.cpp`** — same skeleton, reader side:
+- [x] **Step 5: `shapes_sub.cpp`** — same skeleton, reader side:
 
 ```cpp
 // FR-IO-2 Fast DDS peer subscriber: RELIABLE ShapeType on topic "Square".
@@ -430,7 +430,7 @@ int main(int argc, char** argv)
 }
 ```
 
-- [ ] **Step 6: Harness Makefiles.** `interop/fastdds/shapes/Makefile`:
+- [x] **Step 6: Harness Makefiles.** `interop/fastdds/shapes/Makefile`:
 
 ```make
 # Fast DDS shapes harness. Needs FASTDDS_PREFIX (use scripts/with-fastdds.sh).
@@ -472,7 +472,7 @@ clean:
 	@for d in $(APPS); do $(MAKE) -C $$d clean; done
 ```
 
-- [ ] **Step 7: Build + top-level targets.** Build:
+- [x] **Step 7: Build + top-level targets.** Build:
 
 ```bash
 "$REPO/scripts/with-fastdds.sh" make -C "$REPO/interop/fastdds"
@@ -491,11 +491,11 @@ fastdds-sub:
 
 (plus `fastdds-pub fastdds-sub` on the existing `.PHONY` line).
 
-- [ ] **Step 8: README.** `interop/fastdds/README.md`: the pin (versions + commit hashes), build commands, run commands (make targets + direct), the profiles.xml EDIT-per-machine note, the capture command from "Standing rules" — structure mirroring `interop/connext/README.md`.
+- [x] **Step 8: README.** `interop/fastdds/README.md`: the pin (versions + commit hashes), build commands, run commands (make targets + direct), the profiles.xml EDIT-per-machine note, the capture command from "Standing rules" — structure mirroring `interop/connext/README.md`.
 
 ### Task 0.7: Fast DDS ↔ Fast DDS smoke test (S0 exit gate)
 
-- [ ] **Step 1: Two terminals (or backgrounded), same host:**
+- [x] **Step 1: Two terminals (or backgrounded), same host:**
 
 ```bash
 make fastdds-sub SECONDS=15 &
@@ -504,9 +504,9 @@ sleep 2 && make fastdds-pub COLOR=GREEN COUNT=50
 
 Expected: pub logs `matched change: 1`; sub logs `matched change: 1` then `color=GREEN ...` lines; on exit `received` ≥ 40.
 
-- [ ] **Step 2: Record the smoke-run output in `interop/fastdds/README.md`.**
+- [x] **Step 2: Record the smoke-run output in `interop/fastdds/README.md`.**
 
-- [ ] **Step 3: Commit (present message to owner first):**
+- [x] **Step 3: Commit (present message to owner first):**
 
 ```
 feat(interop): Fast DDS shapes harness skeleton (FR-IO-2 S0)
@@ -529,17 +529,17 @@ fastdds-pub/fastdds-sub targets. Refs FR-IO-2.
 - Modify: `$REPO/interop/fastdds/README.md` (census findings)
 - Create: `$REPO/interop/fastdds/captures/s1-census-lo0.pcap` (+ `-en7` if multicast rides there)
 
-- [ ] **Step 1: Capture our stack + their pub.** Terminal A capture (`tshark -i lo0 ... -w interop/fastdds/captures/s1-census-lo0.pcap`); Terminal B `make square-sub TYPE=canonical DOMAIN=0 ADVERTISE=127.0.0.1`; Terminal C `make fastdds-pub COUNT=100`. Run ~30 s. If no SPDP meets, capture en7 too and check whether Fast DDS multicasts only on the whitelisted iface — adjust `profiles.xml` whitelist (127.0.0.1 first) until both sides see each other's SPDP.
+- [x] **Step 1: Capture our stack + their pub.** Terminal A capture (`tshark -i lo0 ... -w interop/fastdds/captures/s1-census-lo0.pcap`); Terminal B `make square-sub TYPE=canonical DOMAIN=0 ADVERTISE=127.0.0.1`; Terminal C `make fastdds-pub COUNT=100`. Run ~30 s. If no SPDP meets, capture en7 too and check whether Fast DDS multicasts only on the whitelisted iface — adjust `profiles.xml` whitelist (127.0.0.1 first) until both sides see each other's SPDP.
 
-- [ ] **Step 2: Census from the pcap** (tshark `-O RTPS` / `-T fields`). Record in the README, each with frame numbers:
+- [x] **Step 2: Census from the pcap** (tshark `-O RTPS` / `-T fields`). Record in the README, each with frame numbers:
   - their VendorId;
   - `PID_TYPE_INFORMATION` (0x0075) present in their SEDP? (expected yes — this is the S3 input);
   - their `PID_BUILTIN_ENDPOINT_SET` TypeLookup bits (Table 62 bits 12–15);
   - TypeLookup endpoints announced/used; any immediate `TypeLookup_Request` toward us, and its `instanceName` string verbatim (the §7.6.3.3.4 self-contradiction — this is a CONFIRM-VS-PEER item, settle it here if traffic appears);
   - whether OUR SEDP/SPDP parse of their announcements is clean: run `make square-sub` with a fresh eye on warnings/errors; any unknown-PID skip is fine, any parse error is a bug.
-- [ ] **Step 3: Reverse: their sub + our pub.** `make fastdds-sub SECONDS=30` + `make square-pub TYPE=canonical COLOR=BLUE`; census what they make of OUR announcements (does their participant complain? does a match attempt appear in their `matched change:` log even if data fails?).
-- [ ] **Step 4: Bug protocol.** Any parse failure in our stack = a real FR-IO-2 bug: extract the offending bytes from the pcap into a locked vector, write the failing test in `dds-tests` FIRST, fix bounds-checked + clause-cited, suite green, separate commit (message presented). Mirror the M2 6-bug-chain discipline.
-- [ ] **Step 5: Commit census (present message to owner first):**
+- [x] **Step 3: Reverse: their sub + our pub.** `make fastdds-sub SECONDS=30` + `make square-pub TYPE=canonical COLOR=BLUE`; census what they make of OUR announcements (does their participant complain? does a match attempt appear in their `matched change:` log even if data fails?).
+- [x] **Step 4: Bug protocol.** Any parse failure in our stack = a real FR-IO-2 bug: extract the offending bytes from the pcap into a locked vector, write the failing test in `dds-tests` FIRST, fix bounds-checked + clause-cited, suite green, separate commit (message presented). Mirror the M2 6-bug-chain discipline.
+- [x] **Step 5: Commit census (present message to owner first):**
 
 ```
 docs(interop): Fast DDS discovery census (FR-IO-2 S1)
@@ -558,20 +558,20 @@ observed on the wire; captures archived under interop/fastdds/captures/.
 
 ### Task 2.1: Forward leg — Fast DDS pub → our sub
 
-- [ ] **Step 1:** Capture running; `make square-sub TYPE=canonical` + `make fastdds-pub COUNT=100`. Expected: our sub prints ≥ 90 `color=GREEN` shapes; their pub logs `matched change: 1`.
-- [ ] **Step 2:** tshark-validate the data path (DATA submessages decode as ShapeType, HEARTBEAT/ACKNACK flowing — reliable, not best-effort fallback).
-- [ ] **Step 3:** On failure, debug from the wire per the M2 lesson: suspect RTPS plumbing (SEDP defaults/QoS-RxO, EntityId kinds, inline QoS, ACKNACK routing) before type matters; every fix = failing-test-first separate commit.
+- [x] **Step 1:** Capture running; `make square-sub TYPE=canonical` + `make fastdds-pub COUNT=100`. Expected: our sub prints ≥ 90 `color=GREEN` shapes; their pub logs `matched change: 1`.
+- [x] **Step 2:** tshark-validate the data path (DATA submessages decode as ShapeType, HEARTBEAT/ACKNACK flowing — reliable, not best-effort fallback).
+- [x] **Step 3:** On failure, debug from the wire per the M2 lesson: suspect RTPS plumbing (SEDP defaults/QoS-RxO, EntityId kinds, inline QoS, ACKNACK routing) before type matters; every fix = failing-test-first separate commit.
 
 ### Task 2.2: Reverse leg — our pub → Fast DDS sub
 
-- [ ] **Step 1:** `make fastdds-sub SECONDS=30` + `make square-pub TYPE=canonical COLOR=BLUE`. Expected: their sub prints `color=BLUE` lines, count ≥ ~25 (30 s at our publisher rate), clean reliable session in the pcap (they ACKNACK our writer).
-- [ ] **Step 2:** Same wire-first debug protocol on failure.
+- [x] **Step 1:** `make fastdds-sub SECONDS=30` + `make square-pub TYPE=canonical COLOR=BLUE`. Expected: their sub prints `color=BLUE` lines, count ≥ ~25 (30 s at our publisher rate), clean reliable session in the pcap (they ACKNACK our writer).
+- [x] **Step 2:** Same wire-first debug protocol on failure.
 
 ### Task 2.3: Archive + commit (S2 exit gate = FR-IO-2 DoD)
 
-- [ ] **Step 1:** Archive both pcaps under `interop/fastdds/captures/` (`s2-forward-lo0.pcap`, `s2-reverse-lo0.pcap`); paste run logs + counts into the README.
-- [ ] **Step 2:** Clasp suite at the stage boundary.
-- [ ] **Step 3: Commit (present message to owner first):**
+- [x] **Step 1:** Archive both pcaps under `interop/fastdds/captures/` (`s2-forward-lo0.pcap`, `s2-reverse-lo0.pcap`); paste run logs + counts into the README.
+- [x] **Step 2:** Clasp suite at the stage boundary.
+- [x] **Step 3: Commit (present message to owner first):**
 
 ```
 feat(interop): bidirectional reliable ShapeType exchange with Fast DDS
@@ -592,8 +592,8 @@ validated; captures + logs in interop/fastdds/. Refs FR-IO-2.
 **Files:**
 - Modify: `$REPO/interop/fastdds/README.md`
 
-- [ ] **Step 1: Their hash.** From the S1/S2 SEDP capture, extract the EK_MINIMAL EquivalenceHash inside their `PID_TYPE_INFORMATION` for ShapeType (tshark RTPS tree, or our own parser: `dds.types:deserialize-type-information-hash` over the raw 0x0075 value pulled from the pcap — the corpus-capture harness `run-corpus-capture-subscriber` already snapshots SEDP parameters and can be reused with `:topic "Square" :type "ShapeType"`).
-- [ ] **Step 2: Our hash.**
+- [x] **Step 1: Their hash.** From the S1/S2 SEDP capture, extract the EK_MINIMAL EquivalenceHash inside their `PID_TYPE_INFORMATION` for ShapeType (tshark RTPS tree, or our own parser: `dds.types:deserialize-type-information-hash` over the raw 0x0075 value pulled from the pcap — the corpus-capture harness `run-corpus-capture-subscriber` already snapshots SEDP parameters and can be reused with `:topic "Square" :type "ShapeType"`).
+- [x] **Step 2: Our hash.**
 
 ```bash
 cd "$REPO" && sbcl --non-interactive \
@@ -602,15 +602,15 @@ cd "$REPO" && sbcl --non-interactive \
 ```
 
 (Adjust the accessor chain to the actual exported API — `equivalence-hash` is `src/dds-types/typeobject-cdr.lisp:207`; the type-support registry lookup is whatever `find-type-support-by-hash`'s index uses, `src/dds-types/typelookup.lisp:706` shows `(equivalence-hash to)` over registry entries. If a one-liner is awkward, add a tiny exported helper `dds.types:registered-equivalence-hash (name)` — defun*, docstring, test — as part of this task.)
-- [ ] **Step 3: Compare.** 14 octets, byte-for-byte.
+- [x] **Step 3: Compare.** 14 octets, byte-for-byte.
   - **Equal:** record both hex strings + the pcap frame in the README and `docs/provenance.md`. This is the external confirmation ADR 0009 declared unobtainable from Connext.
   - **Unequal:** a real bug in our serializer or in the bound alignment. Diff structurally first: dump their TypeObject via a `getTypes` query (S4 machinery, or tshark's decode of their TL reply if traffic exists), compare member-by-member against ours (`serialize-type-object` bytes). Fix clause-first in `src/dds-types/typeobject-cdr.lisp` (§7.3.4.9.1 hash, §7.4.3.5.3 VM), failing-byte-vector test FIRST, then re-run the comparison. If the difference is the *type* (e.g. fastddsgen bounds the string after all), fix the IDL/model alignment instead and re-run — the design constraint is both sides hash the same nominal type.
 
 ### Task 3.2: Verification + commit
 
-- [ ] **Step 1:** `docs/verification.csv`: FR-TYPE-2/3 cells — remove PROVISIONAL for the exercised path (FINAL struct + i32 + unbounded string8), state "EquivalenceHash externally confirmed vs Fast DDS 3.6.1 <date>, frame N"; unexercised edges (unions, MUTABLE, TK_NONE base, nested deps) keep their caveats.
-- [ ] **Step 2:** Wiki lockstep: `docs/wiki/type-system.md` hash section gains the confirmation note; `README.md` status line if it mentions PROVISIONAL.
-- [ ] **Step 3: Commit (present message to owner first):**
+- [x] **Step 1:** `docs/verification.csv`: FR-TYPE-2/3 cells — remove PROVISIONAL for the exercised path (FINAL struct + i32 + unbounded string8), state "EquivalenceHash externally confirmed vs Fast DDS 3.6.1 <date>, frame N"; unexercised edges (unions, MUTABLE, TK_NONE base, nested deps) keep their caveats.
+- [x] **Step 2:** Wiki lockstep: `docs/wiki/type-system.md` hash section gains the confirmation note; `README.md` status line if it mentions PROVISIONAL.
+- [x] **Step 3: Commit (present message to owner first):**
 
 ```
 feat(types): minimal EquivalenceHash externally confirmed vs Fast DDS
@@ -634,7 +634,7 @@ to the unexercised VM edges. Refs FR-TYPE-2/3, ADR 0009/0010.
 - Modify: `$REPO/Makefile` (target `fastdds-tl-probe`)
 - Modify: `$REPO/docs/wiki/` interop/shapes page + `README.md` (docs lockstep)
 
-- [ ] **Step 1: Write `run-typelookup-probe`** (harness entry, same style/no-unit-test precedent as `run-subscriber`; the underlying `type-lookup-query` machinery is already covered offline by `typelookup-endpoints`):
+- [x] **Step 1: Write `run-typelookup-probe`** (harness entry, same style/no-unit-test precedent as `run-subscriber`; the underlying `type-lookup-query` machinery is already covered offline by `typelookup-endpoints`):
 
 ```lisp
 (defun* run-typelookup-probe (&key (domain 0) (seconds 15) (advertise-address "127.0.0.1"))
@@ -649,7 +649,7 @@ to the unexercised VM edges. Refs FR-TYPE-2/3, ADR 0009/0010.
 ```
 
 Body sketch (the executor writes it against the existing APIs — all already exported/used by `run-gated-subscriber` and the `typelookup-endpoints` test): make a disc-node with multicast + `advertise-address` (mirror `run-subscriber`'s node setup), `spin` until a remote endpoint on topic "Square" carries `type-information`, `deserialize-type-information-hash` it, `dds.disc:type-lookup-query` toward the remote prefix with a continuation that `parse-minimal-type-object`s the returned octets and compares `equivalence-hash` of the parse against the queried hash, wait (condvar or sleep-poll) up to SECONDS, print and return the verdict. Full type declarations; bounds already inside the called codecs.
-- [ ] **Step 2:** Makefile target:
+- [x] **Step 2:** Makefile target:
 
 ```make
 fastdds-tl-probe:
@@ -658,13 +658,13 @@ fastdds-tl-probe:
 	        --eval '(uiop:quit 0)'
 ```
 
-- [ ] **Step 3:** Suite green on SBCL (no new offline test, but nothing may break); docstring/wiki/README lockstep for the new exported symbol.
+- [x] **Step 3:** Suite green on SBCL (no new offline test, but nothing may break); docstring/wiki/README lockstep for the new exported symbol.
 
 ### Task 4.2: Live leg A — our getTypes against their server
 
-- [ ] **Step 1:** Capture running; `make fastdds-pub COUNT=1000` + `make fastdds-tl-probe SECONDS=20`. Expected: probe prints PASS (reply parsed; re-hash equal); pcap shows our `TypeLookup_Request` and their reply on the Table-61 endpoints.
-- [ ] **Step 2:** Archive `s4-ourclient-lo0.pcap`; README log.
-- [ ] **Step 3:** On FAIL: tshark-decode both frames; clause-first protocol (Standing rule 6); each fix = failing vector test first, separate commit.
+- [x] **Step 1:** Capture running; `make fastdds-pub COUNT=1000` + `make fastdds-tl-probe SECONDS=20`. Expected: probe prints PASS (reply parsed; re-hash equal); pcap shows our `TypeLookup_Request` and their reply on the Table-61 endpoints.
+- [x] **Step 2:** Archive `s4-ourclient-lo0.pcap`; README log.
+- [x] **Step 3:** On FAIL: tshark-decode both frames; clause-first protocol (Standing rule 6); each fix = failing vector test first, separate commit.
 
 ### Task 4.3: Live leg B — their client consumes our service
 
@@ -673,7 +673,7 @@ fastdds-tl-probe:
 - Create: `$REPO/interop/fastdds/type_probe/type_probe.cpp`
 - Modify: `$REPO/interop/fastdds/Makefile` (add `type_probe` to APPS), `$REPO/Makefile` (target `fastdds-type-probe`)
 
-- [ ] **Step 1: `type_probe.cpp`** — a *type-blind* Fast DDS app (does NOT link the generated ShapeType): DomainParticipant with the same profile, a `DomainParticipantListener` whose `on_data_writer_discovery` pulls the remote `type_information` from the discovered builtin data, asks the `ITypeObjectRegistry` for the TypeObject (this is what makes THEIR TypeLookup client send getTypes to OUR server), builds the type via `DynamicTypeBuilderFactory::create_type_w_type_object(...)`, registers it, creates a RELIABLE DataReader on "Square", and logs received samples generically via `DynamicData`. Exact 3.6 API per the docs use-case "Remote type discovery and endpoint matching" and the pinned tree's XTypes examples (read-only; provenance). Draft skeleton to reconcile:
+- [x] **Step 1: `type_probe.cpp`** — a *type-blind* Fast DDS app (does NOT link the generated ShapeType): DomainParticipant with the same profile, a `DomainParticipantListener` whose `on_data_writer_discovery` pulls the remote `type_information` from the discovered builtin data, asks the `ITypeObjectRegistry` for the TypeObject (this is what makes THEIR TypeLookup client send getTypes to OUR server), builds the type via `DynamicTypeBuilderFactory::create_type_w_type_object(...)`, registers it, creates a RELIABLE DataReader on "Square", and logs received samples generically via `DynamicData`. Exact 3.6 API per the docs use-case "Remote type discovery and endpoint matching" and the pinned tree's XTypes examples (read-only; provenance). Draft skeleton to reconcile:
 
 ```cpp
 // FR-IO-2 S4 leg B: type-blind Fast DDS probe - learns ShapeType from OUR
@@ -703,9 +703,9 @@ using namespace eprosima::fastdds::dds;
 // pinned 3.6 headers + docs use-case before compiling.
 ```
 
-- [ ] **Step 2:** Build via the harness Makefile pattern (same INC/LIBS as `shapes/Makefile`); add the `fastdds-type-probe` top-level target (same `with-fastdds.sh` style, arg `SECONDS`).
-- [ ] **Step 3: Live run:** capture; `make square-pub TYPE=canonical COLOR=RED` + `make fastdds-type-probe SECONDS=30`. Expected: pcap shows THEIR `TypeLookup_Request` (getTypes) hitting OUR request reader and OUR reply; their probe then matches and prints RED samples — proof they consumed our reply end-to-end.
-- [ ] **Step 4:** Archive `s4-theirclient-lo0.pcap`; README log. On failure where their request arrives but our reply never satisfies them: tshark field-diff our reply vs their leg-A reply; clause-first protocol per divergence.
+- [x] **Step 2:** Build via the harness Makefile pattern (same INC/LIBS as `shapes/Makefile`); add the `fastdds-type-probe` top-level target (same `with-fastdds.sh` style, arg `SECONDS`).
+- [x] **Step 3: Live run:** capture; `make square-pub TYPE=canonical COLOR=RED` + `make fastdds-type-probe SECONDS=30`. Expected: pcap shows THEIR `TypeLookup_Request` (getTypes) hitting OUR request reader and OUR reply; their probe then matches and prints RED samples — proof they consumed our reply end-to-end.
+- [x] **Step 4:** Archive `s4-theirclient-lo0.pcap`; README log. On failure where their request arrives but our reply never satisfies them: tshark field-diff our reply vs their leg-A reply; clause-first protocol per divergence.
 
 ### Task 4.4: CONFIRM-VS-PEER walk + vector re-pins + commit (S4 exit gate)
 
@@ -714,16 +714,16 @@ using namespace eprosima::fastdds::dds;
 - Possibly modify: `$REPO/src/dds-types/typelookup.lisp` + the `typelookup-vectors`/`typelookup-request`/`typelookup-reply` tests (re-pins)
 - Modify: `$REPO/docs/provenance.md`
 
-- [ ] **Step 1:** From the leg-A/leg-B pcaps build the walk table — for each CONFIRM-VS-PEER item, our reading vs their bytes vs the clause:
+- [x] **Step 1:** From the leg-A/leg-B pcaps build the walk table — for each CONFIRM-VS-PEER item, our reading vs their bytes vs the clause:
   1. `instanceName` exact string + length (§7.6.3.3.4's self-contradiction);
   2. ReplyHeader `remoteEx` placement (reply-only, our ADR'd reading of the §7.6.3.3.3 IDL defect);
   3. mutable-member EMHEADER1 LC=5 / NEXTINT-doubles-as-length (rule 22);
   4. non-OK reply omits the Return arm entirely;
   5. top-level @final ⇒ CDR2_LE 0x0007 encapsulation (no top-level DHEADER);
   6. union DHEADERs on Call/Return/Result.
-- [ ] **Step 2:** Where their bytes differ AND the clause sides with them: failing vector test first, fix codec, re-pin `typelookup-vectors`, suite green. Where they deviate from the clause: provenance note + receive-tolerance check (our parser must already accept it — if not, that's a fix with its own test).
-- [ ] **Step 3:** Clasp suite at the stage boundary.
-- [ ] **Step 4: Commit (present message to owner first):**
+- [x] **Step 2:** Where their bytes differ AND the clause sides with them: failing vector test first, fix codec, re-pin `typelookup-vectors`, suite green. Where they deviate from the clause: provenance note + receive-tolerance check (our parser must already accept it — if not, that's a fix with its own test).
+- [x] **Step 3:** Clasp suite at the stage boundary.
+- [x] **Step 4: Commit (present message to owner first):**
 
 ```
 feat(disc/types): TypeLookup service live-confirmed vs Fast DDS 3.6.1
@@ -750,9 +750,9 @@ FR-TYPE-3, FR-IO-2.
 - Modify: `$REPO/README.md` (status: FR-IO-2 met, second vendor)
 - Modify: `$REPO/docs/provenance.md` (final pins, consultations)
 
-- [ ] **Step 1:** ADR 0012: status accepted; context (ADR 0010 deferred the live leg; FR-IO-2 open), decision (Fast DDS 3.6.1 native peer), results (S2 counts, S3 hash verdict, S4 walk outcomes incl. any re-pins), consequences (TypeLookup vectors now peer-confirmed; remaining unexercised VM edges listed; Cyclone/OpenDDS still optional).
-- [ ] **Step 2:** verification.csv + wiki + README updated in lockstep; `make build test gate-hotpath gate-types wire` all green on SBCL; Clasp suite once more.
-- [ ] **Step 3: Commit (present message to owner first):**
+- [x] **Step 1:** ADR 0012: status accepted; context (ADR 0010 deferred the live leg; FR-IO-2 open), decision (Fast DDS 3.6.1 native peer), results (S2 counts, S3 hash verdict, S4 walk outcomes incl. any re-pins), consequences (TypeLookup vectors now peer-confirmed; remaining unexercised VM edges listed; Cyclone/OpenDDS still optional).
+- [x] **Step 2:** verification.csv + wiki + README updated in lockstep; `make build test gate-hotpath gate-types wire` all green on SBCL; Clasp suite once more.
+- [ ] **Step 3 (pending owner approval of the message): Commit (present message to owner first):**
 
 ```
 docs: FR-IO-2 closeout - Fast DDS 3.6.1 peer (ADR 0012)
@@ -763,8 +763,8 @@ FR-TYPE-3 TypeLookup live legs done (S4); FR-TYPE-2/3 hash confirmed
 updated; provenance final pins.
 ```
 
-- [ ] **Step 4:** Push after owner approval of the whole feature; verify the Publish Wiki action goes green.
-- [ ] **Step 5:** Update the `dds-stack-position` memory file: feature complete, new HEAD, next candidates (legacy-parser aggregate gaps; Clasp re-baseline; keyed/no-key endpoint kinds; Cyclone/OpenDDS optional third vendor).
+- [ ] **Step 4 (pending):** Push after owner approval of the whole feature; verify the Publish Wiki action goes green.
+- [ ] **Step 5 (pending):** Update the `dds-stack-position` memory file: feature complete, new HEAD, next candidates (legacy-parser aggregate gaps; Clasp re-baseline; keyed/no-key endpoint kinds; Cyclone/OpenDDS optional third vendor).
 
 ---
 

@@ -164,36 +164,48 @@ a genuinely compatible Connext peer is never false-rejected. See
 [`interop/connext/typeobject-corpus/README.md`](../../interop/connext/typeobject-corpus/README.md)
 and [DCPS → Assignability-gated matching](dcps.md) for the full evidence.
 
-## Confirming the XTypes wire bytes (the current open item)
+## The XTypes wire bytes (CONFIRMED — FR-IO-2 S3, 2026-06-12)
 
 The XCDR2 TypeObject serializer + EquivalenceHash and the TypeInformation codec are
-**PROVISIONAL** — spec-faithful but unconfirmed against a conformant peer (see
-[Type system → Notes](type-system.md)). To lock them, compare Connext's `ShapeType` hash
-(from `typeobject-probe` + tshark, or a `rtiddsgen` reference run) against ours:
+**externally confirmed** for the exercised path (FINAL struct + `i32` + unbounded
+`string8`): live Fast DDS 3.6.1 independently computes the identical EK_MINIMAL hash and
+serialized size for the same IDL, and its 92-octet SEDP `PID_TYPE_INFORMATION` is locked
+as a regression vector (test `fastdds-type-information-vector` — see
+[Type system](type-system.md)). Connext could never provide this oracle: stock RTI emits
+no 0x0075 at all (ADR 0009/0010).
 
 ```
 ShapeType  (@final; @key unbounded string color; long x,y,shapesize; ids 0..3)
-ours: EquivalenceHash = BF E2 A6 2E D8 11 AC 46 3C 40 C9 7D 30 EE   (TypeObject = 87 bytes, no encap header)
+both: EquivalenceHash = BF E2 A6 2E D8 11 AC 46 3C 40 C9 7D 30 EE   (TypeObject = 87 bytes, no encap header)
 ```
 
-If they match, the serializers lock and hash-based match enforcement can be enabled; if not,
-the diff isolates one of three one-line knobs (encapsulation-header / `struct_flags` /
-`member_flags`) in `src/dds-types/typeobject-cdr.lisp`.
+Still provisional: the unexercised serialization-VM edges (unions, MUTABLE structs,
+`TK_NONE` base, sequence-member TIs, nested-dependency hashes).
 
 ## Status
 
 - **Shapes wire format**: validated against the tshark RTPS dissector (`make wire`).
-- **Bidirectional Connext interop**: staged (the harness exists) but **not yet run** — needs
-  a Connext install. Same gate applies to full DCPS/content-filter interop.
-- **Open peer (Fast DDS)** interop: **bidirectional reliable ShapeType exchange achieved**
-  vs Fast DDS 3.6.1 (forward 95/100, reverse 250/250, HEARTBEAT/ACKNACK live both
-  directions, tshark-validated — the FR-IO-2 data-plane DoD, S2); the **EquivalenceHash is
-  externally confirmed** (S3, locked vector) and the **TypeLookup getTypes client leg is
-  live** (S4 leg A: our client consumes their server's reply, frames 85/86-87 of
-  `s4-ourclient-lo0.pcap`); S4 leg B (their client against our TypeLookup server) is
-  **blocked by Fast DDS's vendor gate** — it discards `PID_TYPE_INFORMATION` from
-  non-eProsima vendors, so no foreign announcement can trigger its TypeLookup client
-  (documented finding; the leg-B harness itself is proven against an eProsima peer).
+- **Bidirectional Connext interop**: **achieved 2026-06-09** against live RTI Connext 7.3.1
+  over UDP (reliable, both directions: forward Connext → our `square-sub` 251 ShapeType
+  samples; reverse our `square-pub` → Connext `shapes_sub` 228 samples, tshark-validated);
+  **fragmented (DATA_FRAG) interop achieved 2026-06-10** (8000-octet LargeData byte-exact
+  both ways, 15/15 + 25/25, incl. forced-fragment-loss NACK_FRAG recovery 12/12); **live
+  legacy-TypeObject type-gating achieved 2026-06-11** (ADR 0011, section above). Full
+  DCPS/content-filter interop beyond what reliable shapes exercises remains open.
+- **Open peer (Fast DDS) — FR-IO-2 MET, closed (ADR 0012, 2026-06-12)**: bidirectional
+  reliable ShapeType exchange vs **stock** Fast DDS 3.6.1 (forward 95/100, reverse 250/250,
+  HEARTBEAT/ACKNACK live both directions, tshark-validated — the FR-IO-2 data-plane DoD,
+  S2); the **EquivalenceHash is externally confirmed** (S3, locked vector); the
+  **TypeLookup getTypes client leg is live vs stock** (S4 leg A: our client consumes their
+  server's reply, frames 85/86-87 of `s4-ourclient-lo0.pcap`); S4 leg B's **stock verdict**
+  is the documented vendor-gate finding — Fast DDS discards `PID_TYPE_INFORMATION` from
+  non-eProsima vendors, so no foreign announcement can trigger its TypeLookup client — and
+  the one direction that gate blocks (our `TypeLookup_Reply` consumed by their client,
+  600/600 samples via a DynamicType built from our MINIMAL TypeObject) is verified only
+  under the clearly-labeled **NON-STOCK** diagnostic (vendor gate bypassed locally, stock
+  restored + re-proven). The CONFIRM-VS-PEER walk is closed: 5 of 6 items peer-confirmed;
+  the non-OK Return-arm omission stays self-pinned. ADR 0012 records the feature, the three
+  peer findings, and the two own-stack fixes.
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).
