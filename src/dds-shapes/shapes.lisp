@@ -138,8 +138,8 @@
 
 (defun* run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
                            (advertise-address "127.0.0.1") (type :tagged) (peers nil)
-                           (liveliness :automatic) (liveliness-lease-seconds 0))
-    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0))) t)
+                           (liveliness :automatic) (liveliness-lease-seconds 0) (dispose-after 0))
+    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0)) (:dispose-after (integer 0))) t)
   "Publish an animated Square on DOMAIN via multicast discovery. TYPE selects the
    payload: :canonical = the exact RTI ShapeType (color/x/y/shapesize — for interop
    with rtishapesdemo / DDSSpy); :tagged = + per-publisher uuid + per-sample seq
@@ -203,6 +203,14 @@
                (when (zerop (mod n 30))
                  (format t "~&[pub] sent ~d samples; peers=~d; ACKNACKs received=~d~%"
                          n (hash-table-count dests) (dds.disc:node-acks-in node)))
+               ;; DISPOSE-AFTER: dispose the instance (S1 disc dispose path), hold open, stop
+               (when (and (plusp dispose-after) (>= n dispose-after))
+                 (let ((kh (funcall (dds.types:type-support-key-hash (dds.types:find-type-support "shape-type"))
+                                    (make-shape-type :color color :x x :y y :shapesize shapesize))))
+                   (dds.disc:dispose-instance node kh)
+                   (format t "~&[pub] DISPOSED instance color=~a~%" color)
+                   (loop repeat 60 do (setf last (%reannounce node last)) (sleep 0.1))
+                   (return)))
                (when (and (plusp count) (>= n count)) (return))
                (sleep period))
           (dds.disc:stop-node node)
@@ -482,11 +490,17 @@
                  ;; per-sample guard: parse errors skip the offending sample
                  (dolist (cs (dds.dcps:take-samples dr))
                    (handler-case
-                       (let ((s (dds.dcps:cached-sample-data cs)))
-                         (incf seen)
-                         (format t "~&[gated-sub] sample #~d: color=~a x=~a y=~a shapesize=~a~%"
-                                 seen (field s "color") (field s "x") (field s "y")
-                                 (field s "shapesize")))
+                       (let ((info (dds.dcps:cached-sample-info cs)))
+                         (if (dds.dcps:sample-info-valid-data info)
+                             (let ((s (dds.dcps:cached-sample-data cs)))
+                               (incf seen)
+                               (format t "~&[gated-sub] sample #~d: color=~a x=~a y=~a shapesize=~a~%"
+                                       seen (field s "color") (field s "x") (field s "y")
+                                       (field s "shapesize")))
+                             ;; an invalid-data sample is an instance-state change (dispose/unregister)
+                             (format t "~&[gated-sub] INSTANCE_STATE ~a (no data) handle=~a~%"
+                                     (dds.dcps:sample-info-instance-state info)
+                                     (dds.dcps:sample-info-instance-handle info))))
                      (error (e)
                        (format t "~&[gated-sub] skipped undeliverable sample (~a) — gate rejected peer?~%"
                                (type-of e)))))

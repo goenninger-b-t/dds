@@ -94,14 +94,15 @@ int main(int argc, char** argv)
             std::cout << "[shapes_pub] sent " << sent << " x=" << sample.x()
                       << " y=" << sample.y() << std::endl;
         }
-        // DISPOSE_AFTER / UNREGISTER_AFTER (off by default): emit a dispose / unregister of the instance for the instance-lifecycle wire-oracle capture.
-        if (const char* d = std::getenv("DISPOSE_AFTER"))
+        // DISPOSE_AFTER / UNREGISTER_AFTER (off by default): emit a dispose / unregister of the instance, then stop writing it and hold the participant alive so the reliable lifecycle DATA is delivered (instance-lifecycle interop).
+        const char* d = std::getenv("DISPOSE_AFTER");
+        const char* u = std::getenv("UNREGISTER_AFTER");
+        if (d && sent == std::atol(d)) { writer->dispose(&sample, HANDLE_NIL); std::cout << "[shapes_pub] DISPOSED after " << sent << std::endl; }
+        if (u && sent == std::atol(u)) { writer->unregister_instance(&sample, HANDLE_NIL); std::cout << "[shapes_pub] UNREGISTERED after " << sent << std::endl; }
+        if ((d && sent == std::atol(d)) || (u && sent == std::atol(u)))
         {
-            if (sent == std::atol(d)) { writer->dispose(&sample, HANDLE_NIL); std::cout << "[shapes_pub] DISPOSED after " << sent << std::endl; }
-        }
-        if (const char* u = std::getenv("UNREGISTER_AFTER"))
-        {
-            if (sent == std::atol(u)) { writer->unregister_instance(&sample, HANDLE_NIL); std::cout << "[shapes_pub] UNREGISTERED after " << sent << std::endl; }
+            std::this_thread::sleep_for(std::chrono::seconds(8));   // let the reliable dispose/unregister reach matched readers
+            break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

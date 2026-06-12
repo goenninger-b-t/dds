@@ -54,6 +54,11 @@ public:
                           << " x=" << sample.x() << " y=" << sample.y()
                           << " size=" << sample.shapesize() << std::endl;
             }
+            else
+            {
+                // an invalid-data sample is an instance-state change (dispose/unregister) from the writer
+                std::cout << "[shapes_sub] INSTANCE_STATE " << info.instance_state << std::endl;
+            }
         }
     }
 };

@@ -1184,3 +1184,27 @@ pinned to `127.0.0.1`. No change to the NO_KEY mechanism; suite stays 106 green
   SBCL+Clasp. Connext was lenient (matched by name despite the bad value, NDDSPING not standard WLP),
   so this is a straight conformance fix improving correctness toward all peers; the exported helpers
   are reused when PID_DEADLINE/PID_LATENCY_BUDGET/lifespan land (any wire Duration_t needs them).
+
+## M4 (2026-06-13) — instance lifecycle LIVE both directions vs Fast DDS (instance lifecycle S3)
+
+- **What was consulted**: live eProsima Fast DDS 3.6.1 on the wire + via its public DataReader API
+  (SampleInfo.instance_state). No Fast DDS source copied (clean-room). Required the Duration_t
+  fraction regression fix (32f49a4) to restore forward Fast DDS data flow first.
+- **Forward — Fast DDS disposes -> our reader reports NOT_ALIVE_DISPOSED**
+  (interop/fastdds/captures/instance-dispose-forward-lo0.pcap): our DCPS gated-sub received 38 BLUE
+  ShapeType samples from the live Fast DDS keyed writer, then `INSTANCE_STATE NOT-ALIVE-DISPOSED
+  (no data) handle=#(ca c2 17 c3 ...)`. The handle equals the dispose's PID_KEY_HASH AND the instance
+  our reader built from the data samples — proving our key-hash computation (RTPS §9.6.4.8) agrees
+  with Fast DDS's and our reader resolves the inbound dispose to the right instance.
+- **Reverse — our writer disposes -> Fast DDS reader reports NOT_ALIVE_DISPOSED**
+  (interop/fastdds/captures/instance-dispose-reverse-lo0.pcap): our publisher (run-publisher
+  :dispose-after, the S1 disc dispose path) sent 25 BLUE samples then disposed the instance; Fast DDS
+  shapes_sub received 24 samples then logged `INSTANCE_STATE 2` (Fast DDS InstanceStateKind
+  NOT_ALIVE_DISPOSED = 0x1<<1) and reliably ACKNACKed our data + dispose (our pub: 38 ACKNACKs). The
+  conformant peer semantically consumes + acts on our dispose.
+- **Harness**: Fast DDS shapes_pub env DISPOSE_AFTER/UNREGISTER_AFTER (stop+grace); shapes_sub logs
+  on_data_available instance_state for invalid-data samples; our run-publisher :dispose-after; our
+  gated-sub logs instance_state for invalid-data samples. Loopback lo0, unicast SPDP
+  PEERS=127.0.0.1:7410, WIRESHARK_CONFIG_DIR=/tmp/wscfg.
+- Unregister is byte-validated offline (S0 vs frame 113) + S2 tests; dispose is the live-tested
+  headline (shared wire path, only the StatusInfo U flag differs). 129 green SBCL+Clasp.
