@@ -86,8 +86,8 @@ A minimal RTPS participant for discovery and the user-data plane.
 ### Announce & register endpoints (`dds.disc`)
 
 - `dds.disc:announce-participant` *(node)* — announce the node's `SPDPdiscoveredParticipantData` (SPDP builtin participant writer) to every unicast peer and, if multicast is enabled, to the well-known SPDP multicast group.
-- `dds.disc:add-local-writer` *(node &key topic type reliability key qos type-information)* — register a local publication (writer endpoint). `TYPE-INFORMATION` is the opaque serialized XTypes `TypeInformation` for `PID_TYPE_INFORMATION`.
-- `dds.disc:add-local-reader` *(node &key topic type reliability key qos type-information)* — register a local subscription (reader endpoint).
+- `dds.disc:add-local-writer` *(node &key topic type reliability key keyed qos type-information)* — register a local publication (writer endpoint). `KEYED` (default `T`) selects the RTPS 2.5 §9.3.1.2 entity kind: `WITH_KEY` `0x02` or `NO_KEY` `0x03`, and sets the node's data-plane writer EntityId accordingly (`0x102`/`0x103`). `TYPE-INFORMATION` is the opaque serialized XTypes `TypeInformation` for `PID_TYPE_INFORMATION`.
+- `dds.disc:add-local-reader` *(node &key topic type reliability key keyed qos type-information)* — register a local subscription (reader endpoint). `KEYED` (default `T`) selects the entity kind: reader `WITH_KEY` `0x07` or `NO_KEY` `0x04` (node id `0x107`/`0x104`). A keyed/no-key endpoint-kind disagreement is a silent non-match at discovery (`%match-remote-endpoint`); DCPS `create-datawriter`/`create-datareader` derive `KEYED` from `type-support-keyed-p` (a type with a `@key` member is keyed). Live-confirmed both directions vs Connext 7.3.1 (`interop/connext/nokey/`).
 - `dds.disc:announce-endpoints` *(node)* — send the node's local publications (SEDP publications writer) and subscriptions (SEDP subscriptions writer) to every discovered participant's metatraffic unicast locator (§8.5.4).
 
 ### Discovered / matched state (`dds.disc`)
