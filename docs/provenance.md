@@ -1159,3 +1159,28 @@ pinned to `127.0.0.1`. No change to the NO_KEY mechanism; suite stays 106 green
   SPDP `PEERS=127.0.0.1:7410`, `WIRESHARK_CONFIG_DIR=/tmp/wscfg` for reliable dissection.
 - **Artifacts**: both pcaps committed (captures/ exception); the Lisp + C++ harness changes + the
   locked `pid-liveliness` test + docs tracked. 118 green SBCL+Clasp; gate-types+gate-hotpath green.
+
+## M4 (2026-06-13) — REGRESSION FIX: RTPS Duration_t wire fraction in PID_LIVELINESS (FR-RTPS-WLP)
+
+- **Regression**: the reverse-WLP feature (commit 930cabb) began emitting PID_LIVELINESS lease_duration
+  but wrote the DCPS Duration_t **nanosec** field directly into the RTPS-wire Duration_t **fraction**
+  field. The DCPS PSM Duration_t carries nanoseconds (dds_rtf2_dcps.idl DURATION_INFINITE_NSEC =
+  0x7fffffff); the RTPS-wire Duration_t carries a fraction in units of sec/2^32 with DURATION_INFINITE
+  {seconds 0x7fffffff, fraction 0xffffffff} (DDSI-RTPS 2.5 §9.3.2 / §8.3.5.5 struct Duration_t).
+  Emitting raw nanosec made our default reader's INFINITE requested lease read as a FINITE ~0.5 s on a
+  conformant peer → an INFINITE-offered writer failed RxO (offered_infinite <= requested_finite is
+  FALSE) → **Fast DDS refused to match our reader and sent no user DATA** (forward Fast DDS interop
+  silently broke; integer-second leases were unaffected because fraction=nanosec=0, which is why the
+  original byte-validation and the reverse direction missed it).
+- **Wire oracle confirmation**: a live Fast DDS 1.5 s lease emits `seconds 1, fraction 0x80000000`
+  (= 0.5 x 2^32), proving QoS Duration_t on the wire is {seconds, fraction(2^-32)}, NOT nanosec
+  (`/tmp/lifecycle/subsec.pcap` frame 63). Our fixed codec reproduces it byte-exact: nanosec
+  500000000 -> fraction 0x80000000; infinite 0x7fffffff -> 0xffffffff; both round-trip.
+- **Fix**: `dds.qos:duration-nanosec->wire-fraction` / `wire-fraction->duration-nanosec` (qos.lisp,
+  exported) do the boundary conversion incl. the infinite sentinel; serialize-/parse-endpoint-data
+  (PID_LIVELINESS) use them. Test `pid-liveliness` extended for the infinite + sub-second cases.
+- **Verified live**: forward Fast DDS leg now matches (`matched change: 1`) and our subscriber receives
+  BLUE Square samples; the reverse direction (our pub -> Fast DDS sub) still works. 129 green
+  SBCL+Clasp. Connext was lenient (matched by name despite the bad value, NDDSPING not standard WLP),
+  so this is a straight conformance fix improving correctness toward all peers; the exported helpers
+  are reused when PID_DEADLINE/PID_LATENCY_BUDGET/lifespan land (any wire Duration_t needs them).

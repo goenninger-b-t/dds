@@ -471,11 +471,16 @@
     (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-durability+ vec 0 4))
   ;; PID_LIVELINESS (0x001b): {long kind; Duration_t lease_duration;} = 12 octets
   ;; (RTPS 2.5 Table 9.18 §9.6.2.2; DDS 1.4 PSM LivelinessQosPolicy). kind = liveliness-rank.
+  ;; lease_duration is the RTPS-wire Duration_t {seconds; fraction(sec/2^32)} (§9.3.2):
+  ;; the DCPS nanosec is converted to the wire fraction so an INFINITE lease emits
+  ;; fraction 0xffffffff (not the DCPS nanosec sentinel), else a conformant peer reads
+  ;; INFINITE as a finite ~0.5 s lease and the RxO liveliness check rejects the match.
   (let* ((q (endpoint-data-qos data)) (lease (dds.qos:qos-liveliness-lease q)))
     (multiple-value-bind (c vec) (%make-scratch 12)
       (dds.core.buffer:put-u32 c (dds.qos:liveliness-rank (dds.qos:qos-liveliness q)))
       (dds.core.buffer:put-u32 c (dds.qos:qos-duration-sec lease))
-      (dds.core.buffer:put-u32 c (dds.qos:qos-duration-nanosec lease))
+      (dds.core.buffer:put-u32 c (dds.qos:duration-nanosec->wire-fraction
+                                  (dds.qos:qos-duration-nanosec lease)))
       (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-liveliness+ vec 0 12)))
   ;; PID_TYPE_INFORMATION (idl @id 0x0075): opaque pre-serialized XTypes TypeInformation,
   ;; emitted only when present (peers skip unknown PIDs — backward-compatible).
@@ -512,9 +517,11 @@
        (let* ((q (endpoint-data-qos data))
               (kind (%wire-liveliness (dds.core.buffer:get-u32 cursor)))
               (sec (dds.core.buffer:get-u32 cursor))
-              (nanosec (dds.core.buffer:get-u32 cursor)))
+              (fraction (dds.core.buffer:get-u32 cursor)))
          (setf (dds.qos:qos-liveliness q) kind
-               (dds.qos:qos-liveliness-lease q) (dds.qos:make-qos-duration sec nanosec)))))
+               (dds.qos:qos-liveliness-lease q)
+               (dds.qos:make-qos-duration
+                sec (dds.qos:wire-fraction->duration-nanosec fraction))))))
     ((= pid dds.rtps.message:+pid-type-information+)
      (when (> len 0)
        (let ((ti (make-array len :element-type '(unsigned-byte 8))))

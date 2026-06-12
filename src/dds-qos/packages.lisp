@@ -12,6 +12,7 @@
     OFFERED/REQUESTED_INCOMPATIBLE_QOS and blocks endpoint matching.")
   (:export #:qos-duration #:make-qos-duration #:qos-duration-sec #:qos-duration-nanosec
            #:+duration-zero+ #:+duration-infinite+ #:duration<=
+           #:duration-nanosec->wire-fraction #:wire-fraction->duration-nanosec
            #:qos #:make-qos #:make-writer-qos #:make-reader-qos #:copy-qos
            #:qos-reliability #:qos-durability #:qos-deadline #:qos-latency-budget
            #:qos-ownership #:qos-ownership-strength

@@ -27,6 +27,32 @@
   (let ((as (qos-duration-sec a)) (bs (qos-duration-sec b)))
     (or (< as bs) (and (= as bs) (<= (qos-duration-nanosec a) (qos-duration-nanosec b))))))
 
+;;; ---- DCPS Duration_t {sec,nanosec} <-> RTPS-wire Duration_t {seconds,fraction} ----
+;;; The DCPS PSM Duration_t carries nanoseconds (dds_rtf2_dcps.idl: DURATION_INFINITE_NSEC
+;;; = 0x7fffffff), but the RTPS-wire Duration_t carries a fraction in units of sec/2^32
+;;; with DURATION_INFINITE {seconds 0x7fffffff, fraction 0xffffffff} (DDSI-RTPS 2.5 §9.3.2,
+;;; struct Duration_t). Any Duration_t emitted into an RTPS Parameter (e.g. PID_LIVELINESS
+;;; lease_duration) MUST convert nanosec->fraction; emitting the raw nanosec makes an
+;;; INFINITE lease read as a finite ~0.5 s on conformant peers.
+
+(defun* duration-nanosec->wire-fraction (nanosec)
+    (function ((integer 0)) (unsigned-byte 32))
+  "Convert a DCPS Duration_t nanosec field to the RTPS-wire fraction (sec/2^32),
+   mapping the DCPS infinite sentinel 0x7fffffff to the RTPS infinite fraction
+   0xffffffff (DDSI-RTPS 2.5 §9.3.2 struct Duration_t)."
+  (if (= nanosec #x7fffffff)
+      #xffffffff
+      (min #xffffffff (floor (* nanosec #x100000000) 1000000000))))
+
+(defun* wire-fraction->duration-nanosec (fraction)
+    (function ((unsigned-byte 32)) (integer 0))
+  "Convert an RTPS-wire Duration_t fraction (sec/2^32) back to a DCPS Duration_t
+   nanosec field, mapping the RTPS infinite fraction 0xffffffff to the DCPS infinite
+   nanosec 0x7fffffff (DDSI-RTPS 2.5 §9.3.2; dds_rtf2_dcps.idl DURATION_INFINITE_NSEC)."
+  (if (= fraction #xffffffff)
+      #x7fffffff
+      (floor (* fraction 1000000000) #x100000000)))
+
 ;;; ---- Ordinal ranks for the kind-ordered policies (offered >= requested) ----
 
 (defun* reliability-rank (k)

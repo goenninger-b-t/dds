@@ -1045,6 +1045,31 @@
       (%check :liv-short-default
               (eq :automatic (dds.qos:qos-liveliness (dds.rtps.discovery:endpoint-data-qos back)))
               "short-length PID_LIVELINESS is ignored, liveliness keeps its default")))
+  ;; wire-fraction: an INFINITE lease emits the RTPS Duration_t infinite fraction
+  ;; 0xffffffff, NOT the DCPS nanosec sentinel 0x7fffffff (DDSI-RTPS 2.5 §9.3.2). The
+  ;; DCPS sentinel on the wire reads as a finite ~0.5 s lease on a conformant peer and
+  ;; breaks the RxO liveliness match (Fast DDS forward-leg regression, ADR/provenance).
+  (let* ((ep (dds.rtps.discovery:make-endpoint-data
+              :topic-name "Square" :type-name "ShapeType"
+              :qos (dds.qos:make-qos :reliability :reliable :liveliness :automatic
+                                     :liveliness-lease dds.qos:+duration-infinite+)))
+         (buf (dds.core.buffer:make-octet-buffer 512))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    (let ((end (dds.rtps.discovery:serialize-endpoint-data c ep)))
+      (%check :liv-infinite-wire
+              (%subseq-present-p (dds.core.buffer:octet-buffer-vec buf)
+                                 '(#x1b #x00 #x0c #x00  #x00 #x00 #x00 #x00
+                                   #xff #xff #xff #x7f  #xff #xff #xff #xff)
+                                 end)
+              "INFINITE lease emits PID_LIVELINESS {AUTOMATIC, sec 0x7fffffff, fraction 0xffffffff}"))
+    ;; roundtrip: the wire fraction 0xffffffff parses back to the DCPS nanosec 0x7fffffff.
+    (let ((back (dds.rtps.discovery:parse-endpoint-data
+                 (dds.core.buffer:cursor buf :endianness :little) :writer)))
+      (let ((lease (dds.qos:qos-liveliness-lease (dds.rtps.discovery:endpoint-data-qos back))))
+        (%check :liv-infinite-roundtrip
+                (and (= #x7fffffff (dds.qos:qos-duration-sec lease))
+                     (= #x7fffffff (dds.qos:qos-duration-nanosec lease)))
+                "INFINITE lease roundtrips back to DCPS {0x7fffffff, 0x7fffffff}"))))
   t)
 
 ;;; Instance-lifecycle wire codec (RTPS 2.5 §9.6.4.9): a dispose/unregister rides a DATA
