@@ -152,11 +152,17 @@
    and NO-WRITERS-GEN-COUNT are the per-instance generation counters (incremented on the
    NOT_ALIVE_DISPOSED->ALIVE and NOT_ALIVE_NO_WRITERS->ALIVE transitions respectively);
    WRITERS is the set of matched remote writer EntityIds (RTPS 2.5 §9.3.1.2) currently
-   keeping the instance alive — emptying it transitions the instance NOT_ALIVE_NO_WRITERS."
+   keeping the instance alive — emptying it transitions the instance NOT_ALIVE_NO_WRITERS.
+   OWNER-GUID/OWNER-STRENGTH track the EXCLUSIVE-ownership owner of the instance (DDS 1.4
+   §2.2.3.9.2): the 16-octet GUID + strength of the highest-strength alive writer whose
+   samples are currently delivered. OWNER-GUID NIL = no current owner (lazily reclaimed by
+   the next sample). Unused on SHARED readers (arbitration off)."
   (state :alive :type (member :alive :not-alive-disposed :not-alive-no-writers))
   (disposed-gen-count 0 :type integer)
   (no-writers-gen-count 0 :type integer)
-  (writers '() :type list))
+  (writers '() :type list)
+  (owner-guid nil :type (or null (simple-array (unsigned-byte 8) (16))))
+  (owner-strength 0 :type integer))
 
 ;;; ---- type-support serialization helpers (PLAIN_CDR2_LE SerializedPayload) ----
 
@@ -553,7 +559,7 @@
               t (unsigned-byte 8)) t)
   "ON-LIFECYCLE hook (disc receiver thread): a no-payload dispose/unregister DATA arrived
    (RTPS 2.5 §9.6.4.9). WAKE ONLY — exactly like the on-sample hook (%on-participant-sample):
-   the engine has already recorded (kind key-hash status-flags writer-id) by SN under the node
+   the engine has already recorded (kind key-hash status-flags writer-id source-guid) by SN under the node
    lock; this hook must NOT touch the reader cache or instance-recs (those are user-thread state,
    mutated only by %drain — touching them here would race a concurrent read/take/%drain). It just
    fires DATA_AVAILABLE so a waiting reader drains the pending lifecycle change on the user thread.
@@ -578,11 +584,18 @@
   (push sn (dr-lifecycle-drained dr))
   (let ((lc (dds.disc:node-lifecycle-change node sn)) (changed nil))
     (when lc
-      (destructuring-bind (kind key-hash status-flags wid) lc
+      (destructuring-bind (kind key-hash status-flags wid source-guid) lc
         (declare (ignore status-flags))
         (when (%handle-p key-hash)
           (let* ((rec (%reader-instance-rec dr key-hash))
                  (old (instance-rec-state rec)))
+            ;; The current owner disposing/unregistering its instance relinquishes ownership (DDS 1.4
+            ;; §2.2.3.23.1) -> the next sample from the now-highest alive writer reclaims it (lazy).
+            ;; Match the FULL 16-octet source GUID, not the EntityId — writers sharing 0x102 on
+            ;; different participants must not cross-clear each other (DDS 1.4 §2.2.3.9.2).
+            (let ((owner (instance-rec-owner-guid rec)))
+              (when (and owner source-guid (equalp source-guid owner))
+                (setf (instance-rec-owner-guid rec) nil (instance-rec-owner-strength rec) 0)))
             (ecase kind
               (:dispose (setf (instance-rec-state rec) :not-alive-disposed))
               (:unregister
@@ -633,11 +646,70 @@
     (setf (instance-rec-state rec) :alive)
     rec))
 
+(defun* %reader-exclusive-p (dr)
+    (function (data-reader) boolean)
+  "T iff the reader DR requests EXCLUSIVE ownership (DDS 1.4 §2.2.3.9.2) — the only case the data
+   path arbitrates; a SHARED reader (the default) delivers every writer's samples unchanged."
+  (let ((qos (entity-qos dr)))
+    (and (typep qos 'dds.qos:qos) (eq :exclusive (dds.qos:qos-ownership qos)))))
+
+(defun* %guid> (a b)
+    (function ((simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (16))) boolean)
+  "Lexicographic 16-octet GUID comparison A>B. The EXCLUSIVE same-strength tie-break: DDS 1.4
+   §2.2.3.9.2 leaves the choice implementation-defined but REQUIRES it be consistent across all
+   readers — comparing the GUID octets is deterministic + identical on every reader."
+  (dotimes (i 16 nil)
+    (let ((x (aref a i)) (y (aref b i)))
+      (cond ((> x y) (return t)) ((< x y) (return nil))))))
+
+(defun* %arbitrate-owner (dr node sn handle)
+    (function (data-reader t integer (simple-array (unsigned-byte 8) (16))) boolean)
+  "EXCLUSIVE-ownership arbitration for the sample at SN on instance HANDLE (DDS 1.4 §2.2.3.9.2):
+   resolve the sample's FULL source GUID -> the writer's (kind strength) from the matches table, then
+   decide DELIVER (T) vs DROP (NIL). DELIVER and (re)claim ownership when the instance has no current
+   owner, the writer's strength exceeds the owner's, the source IS the current owner, or it ties the
+   owner's strength with a higher GUID (the consistent tie-break). DROP a strictly-lower-strength or
+   losing-tie writer's sample. A sample whose source GUID is unknown (not yet/no longer matched) is
+   delivered (fail-open: never false-REJECT data we cannot arbitrate). Owner state lives on the
+   instance-rec (lazy recompute: a vanished owner is cleared elsewhere, the next sample reclaims)."
+  (let ((guid (dds.disc:node-sample-writer-guid node sn))
+        (rec (%reader-instance-rec dr handle)))
+    (if (null guid)
+        t                                ; unarbitrable source -> fail-open deliver
+        (multiple-value-bind (kind strength) (dds.disc:matched-writer-ownership node guid)
+          (declare (ignore kind))
+          (when (null strength) (setf strength 0))
+          (let ((owner (instance-rec-owner-guid rec)))
+            (cond
+              ((or (null owner) (equalp guid owner)
+                   (> strength (instance-rec-owner-strength rec))
+                   (and (= strength (instance-rec-owner-strength rec)) (%guid> guid owner)))
+               (setf (instance-rec-owner-guid rec) (copy-seq guid)
+                     (instance-rec-owner-strength rec) strength)
+               t)
+              (t nil)))))))
+
+(defun* %clear-owner-on-vanish (dr guid)
+    (function (data-reader (simple-array (unsigned-byte 8) (16))) t)
+  "A matched writer (16-octet GUID) vanished (unmatch / liveliness-lost): clear the EXCLUSIVE owner of
+   every instance it owned (DDS 1.4 §2.2.3.9.2 ownership change (c)) so the next sample from the
+   now-highest alive writer reclaims ownership (lazy recompute). Leaves the writers-set + instance_state
+   to the S2 paths — only the ownership pointer is cleared."
+  (maphash (lambda (handle rec)
+             (declare (ignore handle))
+             (when (and (instance-rec-owner-guid rec) (equalp guid (instance-rec-owner-guid rec)))
+               (setf (instance-rec-owner-guid rec) nil (instance-rec-owner-strength rec) 0)))
+           (dr-instance-recs dr))
+  t)
+
 (defun* %drain-one-sample (dr node ts sn)
     (function (data-reader t t integer) t)
   "Apply ONE pending data sample at sequence number SN: mark SN consumed (exactly-once via the
    dr-drained high-water mark — data SNs are visited in ascending order so the mark is monotone),
    deserialize, drop it on a ContentFilteredTopic miss, reject it on RESOURCE_LIMITS (SAMPLE_REJECTED),
+   DROP it on a lost EXCLUSIVE-ownership arbitration (DDS 1.4 §2.2.3.9.2 — only the highest-strength
+   owner's samples reach the cache; a dropped writer is still registered in the writers-set so
+   liveliness/no-writers tracks it, but its data is neither delivered nor used to revive the instance),
    else REVIVE its instance to ALIVE and register its writer (DDS 1.4 §2.2.2.5.1.3: a
    NOT_ALIVE_DISPOSED->ALIVE or NOT_ALIVE_NO_WRITERS->ALIVE transition bumps the matching generation
    count, §2.2.2.5.1.5) and append a fresh NOT_READ SampleInfo carrying the instance's current
@@ -650,9 +722,16 @@
         (when (or (null (dr-filter dr)) (funcall (dr-filter dr) data))
           (let* ((handle (%instance-handle ts data))
                  (reason (%resource-reject-reason dr handle)))
-            (if reason
-                ;; RESOURCE_LIMITS would be exceeded -> reject (SAMPLE_REJECTED).
-                (%reader-sample-rejected dr reason handle)
+            (cond
+              (reason
+               ;; RESOURCE_LIMITS would be exceeded -> reject (SAMPLE_REJECTED).
+               (%reader-sample-rejected dr reason handle))
+              ((and (%reader-exclusive-p dr) (not (%arbitrate-owner dr node sn handle)))
+               ;; Lost EXCLUSIVE arbitration -> DROP the data, but still register the writer.
+               (let ((wid (dds.disc:node-sample-writer node sn)) (rec (%reader-instance-rec dr handle)))
+                 (when (and wid (not (member wid (instance-rec-writers rec))))
+                   (push wid (instance-rec-writers rec)))))
+              (t
                 (let ((rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node sn))))
                   (setf (dr-cache dr)
                         (nconc (dr-cache dr)
@@ -663,7 +742,7 @@
                                              :instance-state (instance-rec-state rec) :valid-data t
                                              :instance-handle handle :sequence-number sn
                                              :disposed-generation-count (instance-rec-disposed-gen-count rec)
-                                             :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))))))))
+                                             :no-writers-generation-count (instance-rec-no-writers-gen-count rec))))))))))))))
   t)
 
 (defun* %drain (dr)
@@ -823,6 +902,7 @@
     (ecase direction
       (:remote-writer (let ((dr (dp-user-reader p)))
                         (when dr (%reader-unmatched dr handle)
+                              (%clear-owner-on-vanish dr handle)   ; EXCLUSIVE owner loss -> takeover (S1)
                               (%on-writer-vanished dr (%guid-entityid handle)))))
       (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-unmatched dw handle))))))
   t)
@@ -834,7 +914,10 @@
    §8.4.13). Bump the local DataReader's LIVELINESS_CHANGED status (DDS 1.4 §2.2.4.1) and
    fire on_liveliness_changed. The reader is the v1 single user-reader back-ref."
   (let ((dr (dp-user-reader p)))
-    (when dr (%reader-liveliness-changed dr (copy-seq remote-writer-guid) alive-p)))
+    (when dr
+      (%reader-liveliness-changed dr (copy-seq remote-writer-guid) alive-p)
+      ;; A not-alive writer loses ownership (DDS 1.4 §2.2.3.9.2 cause (c)) -> remaining writer takes over.
+      (unless alive-p (%clear-owner-on-vanish dr remote-writer-guid))))
   t)
 
 (defun* %on-disc-incompatible (p kind remote bad)

@@ -402,6 +402,8 @@
                  ("dcps-disposed-sticky"     . run-dcps-disposed-sticky-test)
                  ("dcps-writer-unmatch"      . run-dcps-writer-unmatch-test)
                  ("dcps-drain-sn-order"      . run-dcps-drain-sn-order-test)
+                 ("dcps-exclusive-ownership" . run-dcps-exclusive-ownership-test)
+                 ("dcps-dispose-owner-clear" . run-dcps-dispose-owner-clear-test)
                  ("dcps-rxo-blocks-match"    . run-dcps-rxo-test)
                  ("dcps-conditions-waitset"  . run-dcps-waitset-test)
                  ("dcps-matched-status"      . run-dcps-matched-status-test)

@@ -462,6 +462,22 @@ the source as deferred or simplified — do not rely on them yet:
   `instance-state` + generation counts) through `read`/`take`, and fires `on_data_available`. The
   ranks, `source-timestamp`, and `publication-handle` stay at their defaults (`0` / `nil`); there is
   no `write_w_timestamp`. Live Connext interop of the reader-side transition is a later stage.
+- **EXCLUSIVE OWNERSHIP arbitration: reader side (S1).** An `EXCLUSIVE` `DataReader`
+  (`make-reader-qos :ownership :exclusive`) delivers, **per instance**, only the samples of the
+  **owner** — the highest-`OWNERSHIP_STRENGTH` alive matched writer (DDS 1.4 §2.2.3.9.2 / §2.2.3.10).
+  Lower-strength writers' samples are **dropped** (they never enter the cache); the dropped writer is
+  still registered in the instance's writers-set, so liveliness / no-writers tracking is unaffected.
+  The owner is chosen from the writer's SEDP-carried `OWNERSHIP_STRENGTH`; the first writer to modify
+  an instance owns it until a strictly higher-strength writer modifies it. A same-strength tie is
+  broken by a **consistent lexicographic GUID compare** (the spec leaves the choice
+  implementation-defined but requires every reader make the **same** one). **Takeover:** when the
+  owner unmatches (lease expiry), goes not-alive (LIVELINESS, §2.2.3.9.2 cause c), or
+  disposes/unregisters its instance (§2.2.3.23.1), it relinquishes ownership; the next sample from the
+  now-highest alive writer reclaims it. A `SHARED` reader (the default) does **no** arbitration —
+  every writer's samples are delivered, exactly as before. Arbitration needs the **full 16-octet
+  source GUID** per sample (two writers on different participants share an `EntityId`), recorded by
+  the engine alongside the writer `EntityId`. Reader-side only; cross-reader consistency is per
+  §2.2.3.9.2 (each reader decides independently).
 - **MATCHED decrements on lease expiry.** When a discovered participant vanishes and its
   lease expires (RTPS 2.5 §8.5.3.3.2), each pruned match decrements the affected local
   endpoint's SUBSCRIPTION_MATCHED / PUBLICATION_MATCHED `current_count` (`current_count_change`

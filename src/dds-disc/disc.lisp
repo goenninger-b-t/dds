@@ -72,7 +72,8 @@
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
   (samples (make-hash-table :test 'eql) :type hash-table)
   (sample-writers (make-hash-table :test 'eql) :type hash-table) ; SN -> writer EntityId that wrote it (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
-  (lifecycle-changes (make-hash-table :test 'eql) :type hash-table) ; SN -> (kind key-hash status) received dispose/unregister
+  (sample-writer-guids (make-hash-table :test 'eql) :type hash-table) ; SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
+  (lifecycle-changes (make-hash-table :test 'eql) :type hash-table) ; SN -> (kind key-hash status writer-id source-guid) received dispose/unregister
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
   (builtin-readers (make-hash-table :test 'equalp) :type hash-table) ; remote 12-octet prefix -> reliable SEDP reader
@@ -751,9 +752,10 @@
               (dds.rtps.message:parse-data-body c flags body-len)
             (declare (ignore rdr keyp))
             (when (and (not has-payload) (not (eq kind :data)) (disc-node-on-lifecycle node))
-              ;; A no-payload dispose/unregister DATA (RTPS 2.5 §9.6.4.9): route the named
-              ;; instance + StatusInfo transition to the lifecycle hook (B's instance-state is S2).
-              (funcall (disc-node-on-lifecycle node) wtr sn kind key-hash status-flags))
+              ;; A no-payload dispose/unregister DATA (RTPS 2.5 §9.6.4.9): route the named instance +
+              ;; StatusInfo + datagram SRC-PREFIX (§9.4.4) to the lifecycle hook (S2 owner-clear needs
+              ;; the FULL source GUID, DDS 1.4 §2.2.3.9.2 — mirrors the on-data hook below).
+              (funcall (disc-node-on-lifecycle node) wtr sn kind key-hash status-flags src-prefix))
             (when has-payload
               (cond
                 ((= wtr dds.rtps.discovery:+entityid-spdp-writer+)
@@ -787,7 +789,7 @@
                 ((= wtr dds.rtps.discovery:+entityid-p2p-participant-message-writer+)
                  (%on-participant-message node src-prefix wtr sn buf poff plen))
                 ((disc-node-on-data node)
-                 (funcall (disc-node-on-data node) wtr sn buf poff plen))))))
+                 (funcall (disc-node-on-data node) wtr sn buf poff plen src-prefix))))))
          ((= id dds.rtps.message:+submsg-heartbeat+)
           (let ((pos (dds.core.buffer:cursor-position c)))
             (multiple-value-bind (rid wid first last hcount hfinal hlive)
@@ -806,7 +808,7 @@
                 (dds.core.buffer:cursor-set-position c pos)
                 (funcall (disc-node-on-acknack node) c flags)))))
          ((and (= id dds.rtps.message:+submsg-data-frag+) (disc-node-on-data-frag node))
-          (funcall (disc-node-on-data-frag node) c flags body-len buf))
+          (funcall (disc-node-on-data-frag node) c flags body-len buf src-prefix))
          ((and (= id dds.rtps.message:+submsg-heartbeat-frag+) (disc-node-on-heartbeat-frag node))
           (funcall (disc-node-on-heartbeat-frag node) c flags))
          ((and (= id dds.rtps.message:+submsg-nack-frag+) (disc-node-on-nack-frag node))

@@ -613,9 +613,13 @@
     (function (t integer (member :dispose :unregister)
               (simple-array (unsigned-byte 8) (16)) (unsigned-byte 32)) t)
   "Stage a dispose/unregister lifecycle change at sequence number SN in NODE's SN map — the same
-   (SN -> (kind key-hash status-flags writer-id)) record %on-user-lifecycle writes, minus the wire."
-  (setf (gethash sn (dds.disc::disc-node-lifecycle-changes node))
-        (list kind handle 0 wid))
+   (SN -> (kind key-hash status-flags writer-id source-guid)) record %on-user-lifecycle writes, minus
+   the wire. The source GUID is a zero-prefix + WID EntityId (the owner-clear key, DDS 1.4 §2.2.3.9.2)."
+  (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref guid 12) (ldb (byte 8 24) wid) (aref guid 13) (ldb (byte 8 16) wid)
+          (aref guid 14) (ldb (byte 8 8) wid) (aref guid 15) (ldb (byte 8 0) wid))
+    (setf (gethash sn (dds.disc::disc-node-lifecycle-changes node))
+          (list kind handle 0 wid guid)))
   t)
 
 (defun* run-dcps-drain-sn-order-test ()
@@ -656,6 +660,223 @@
                      "data@20 then dispose@21 in one pass must end NOT_ALIVE_DISPOSED (higher SN wins)")
              (%check :dso-b-gen (= 0 (%instance-rec-disp-gen dr handle2))
                      "no revive occurred -> disposed_generation_count stays 0")))
+      (dds.dcps:delete-participant p))
+    t))
+
+;;; EXCLUSIVE reader-side OWNERSHIP arbitration (S1, DDS 1.4 §2.2.3.9.2 / §2.2.3.10): an EXCLUSIVE
+;;; DataReader delivers, per instance, ONLY the samples of the OWNER = the highest-strength alive
+;;; matched writer; lower-strength writers' samples are dropped. On owner loss a remaining writer
+;;; takes over. SHARED readers (the default) deliver everything (no arbitration). Deterministic
+;;; offline injection: seed two matched remote writers (different participant prefixes, same EntityId
+;;; 0x102) into the node's matches table with EXCLUSIVE + strengths 10/20, stage their samples by
+;;; FULL source GUID in the engine's SN maps, drive %drain, and assert which samples land.
+
+(defun* %two-writer-guid (lastbyte)
+    (function ((unsigned-byte 8)) (simple-array (unsigned-byte 8) (16)))
+  "A synthetic remote WRITER GUID: a per-participant prefix (varied by LASTBYTE so two writers live
+   on different participants) + the user-data writer EntityId 0x00000102 (RTPS 2.5 §9.3.1.2)."
+  (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x40)))
+    (setf (aref g 11) lastbyte
+          (aref g 12) #x00 (aref g 13) #x00 (aref g 14) #x01 (aref g 15) #x02)
+    g))
+
+(defun* %seed-exclusive-match (node guid strength)
+    (function (t (simple-array (unsigned-byte 8) (16)) integer) t)
+  "Register a matched remote WRITER (GUID) in NODE's matches table with EXCLUSIVE ownership and
+   the given STRENGTH — exactly the endpoint-data %match-remote-writer records, minus the wire,
+   so matched-writer-ownership can resolve a sample's source GUID to (kind strength)."
+  (let ((ep (dds.rtps.discovery:make-endpoint-data
+             :guid guid :topic-name "Square" :type-name "shape-type"
+             :qos (dds.qos:make-qos :ownership :exclusive :ownership-strength strength))))
+    (setf (gethash (copy-seq guid) (dds.disc::disc-node-matches node)) ep))
+  t)
+
+(defun* %stage-data-sn-guid (node sn bytes guid)
+    (function (t integer (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (16))) t)
+  "Stage a data sample (serialized BYTES) at sequence number SN keyed by its FULL 16-octet source
+   GUID — the (SN -> payload) + (SN -> EntityId, S2) + (SN -> GUID, S1) records the receive path
+   writes, minus the wire."
+  (setf (gethash sn (dds.disc::disc-node-samples node)) bytes
+        (gethash sn (dds.disc::disc-node-sample-writers node)) (dds.dcps::%guid-entityid guid)
+        (gethash sn (dds.disc::disc-node-sample-writer-guids node)) (copy-seq guid))
+  t)
+
+(defun* %own-handle-count (dr handle)
+    (function (dds.dcps:data-reader (simple-array (unsigned-byte 8) (16))) (integer 0))
+  "How many VALID-DATA samples for instance HANDLE the reader DR has cached (test accessor for the
+   ownership arbitration result — the dropped lower-strength samples never enter the cache)."
+  (count-if (lambda (cs)
+              (let ((info (dds.dcps:cached-sample-info cs)))
+                (and (dds.dcps:sample-info-valid-data info)
+                     (equalp handle (dds.dcps:sample-info-instance-handle info)))))
+            (dds.dcps::dr-cache dr)))
+
+(defun* %ownership-scenario (reader-ownership)
+    (function ((member :shared :exclusive)) (values integer integer))
+  "Drive the two-writer arbitration offline for a reader with the given OWNERSHIP kind. Writer A
+   (strength 10) and writer B (strength 20) both write the SAME instance; B then vanishes (unmatch);
+   writer A writes again. Returns (values SAMPLES-BEFORE-VANISH SAMPLES-AFTER-TAKEOVER) — the count of
+   valid-data samples cached for the instance before B vanished and the extra count A delivered after."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader
+                     sub tp :qos (dds.qos:make-reader-qos :ownership reader-ownership)))
+                (node (dds.dcps::dp-node p))
+                (guid-a (%two-writer-guid #x0a))
+                (guid-b (%two-writer-guid #x0b))
+                (ep-b (dds.rtps.discovery:make-endpoint-data
+                       :guid guid-b :topic-name "Square" :type-name "shape-type"))
+                (sample (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                (handle (funcall (dds.types:type-support-key-hash ts) sample))
+                (bytes (dds.dcps::%serialize-sample ts sample)))
+           (%seed-exclusive-match node guid-a 10)
+           (%seed-exclusive-match node guid-b 20)
+           ;; Higher-strength B owns from SN 1; lower-strength A at SN 2/3 must be dropped (it never
+           ;; out-ranks the owner). (Both writers known a priori — the deterministic arbitration case;
+           ;; §2.2.3.9.2 also lets a first-seen lower writer own until a higher one appears, which is a
+           ;; separate transient handled by the takeover assertion below.)
+           (%stage-data-sn-guid node 1 bytes guid-b)
+           (%stage-data-sn-guid node 2 bytes guid-a)
+           (%stage-data-sn-guid node 3 bytes guid-a)
+           (dds.dcps::%drain dr)
+           (let ((before (%own-handle-count dr handle)))
+             ;; The owner (B) vanishes: A is now the highest-strength alive writer and takes over.
+             (dds.dcps::%on-disc-unmatch p :remote-writer ep-b)
+             (%stage-data-sn-guid node 4 bytes guid-a)
+             (dds.dcps::%drain dr)
+             (values before (- (%own-handle-count dr handle) before))))
+      (dds.dcps:delete-participant p))))
+
+(defun* %first-seen-ownership-scenario ()
+    (function () (values integer integer integer))
+  "Drive the first-seen EXCLUSIVE ownership transient (DDS 1.4 §2.2.3.9.2: the FIRST writer of an
+   instance owns it until a HIGHER-strength writer appears). Lower-strength A (10) writes the instance
+   FIRST and owns it; then higher-strength B (20) writes and takes over; then A writes again and is
+   dropped. Returns (values AFTER-A1 AFTER-B2 AFTER-A3) — the cumulative valid-data sample count for
+   the instance after each successive drain."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader
+                     sub tp :qos (dds.qos:make-reader-qos :ownership :exclusive)))
+                (node (dds.dcps::dp-node p))
+                (guid-a (%two-writer-guid #x0a))
+                (guid-b (%two-writer-guid #x0b))
+                (sample (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                (handle (funcall (dds.types:type-support-key-hash ts) sample))
+                (bytes (dds.dcps::%serialize-sample ts sample)))
+           (%seed-exclusive-match node guid-a 10)
+           (%seed-exclusive-match node guid-b 20)
+           (%stage-data-sn-guid node 1 bytes guid-a)   ; A (10) writes first -> owns
+           (dds.dcps::%drain dr)
+           (let ((after-a1 (%own-handle-count dr handle)))
+             (%stage-data-sn-guid node 2 bytes guid-b) ; B (20) appears -> takes over
+             (dds.dcps::%drain dr)
+             (let ((after-b2 (%own-handle-count dr handle)))
+               (%stage-data-sn-guid node 3 bytes guid-a) ; A again -> now dropped
+               (dds.dcps::%drain dr)
+               (values after-a1 after-b2 (%own-handle-count dr handle)))))
+      (dds.dcps:delete-participant p))))
+
+(defun* run-dcps-exclusive-ownership-test ()
+    (function () t)
+  "DCPS reader-side EXCLUSIVE OWNERSHIP arbitration + takeover (S1, DDS 1.4 §2.2.3.9.2 / §2.2.3.10):
+   two writers (strength 10 and 20) write the same instance to an EXCLUSIVE reader. The reader
+   delivers ONLY the strength-20 owner's samples; the strength-10 writer's samples are DROPPED (not in
+   the cache). When the strength-20 owner vanishes (unmatch), the strength-10 writer takes over and its
+   subsequent sample IS delivered. The first-seen transient (§2.2.3.9.2: the FIRST writer owns until a
+   higher-strength writer appears) is also asserted: a lower-strength writer seen first owns and is
+   delivered, a higher-strength writer then displaces it, and the lower writer's later samples drop. A
+   SHARED reader (the default) delivers BOTH writers' samples (arbitration off). Deterministic offline
+   injection — no UDP, no unbounded wait."
+  ;; EXCLUSIVE: of the three pre-vanish samples (B@1, A@2, A@3) only B@1 (owner) is delivered.
+  (multiple-value-bind (before after) (%ownership-scenario :exclusive)
+    (%check :own-excl-before (= 1 before)
+            "EXCLUSIVE reader must deliver ONLY the strength-20 owner's sample (2 lower-strength dropped)")
+    (%check :own-excl-takeover (= 1 after)
+            "after the owner vanishes the remaining writer takes over and its sample IS delivered"))
+  ;; SHARED: all three pre-vanish samples are delivered (no arbitration), plus one after.
+  (multiple-value-bind (before after) (%ownership-scenario :shared)
+    (%check :own-shared-before (= 3 before)
+            "SHARED reader must deliver BOTH writers' samples (no arbitration)")
+    (%check :own-shared-after (= 1 after)
+            "SHARED reader keeps delivering after the unmatch"))
+  ;; FIRST-SEEN (§2.2.3.9.2): A@1 (10) owns first (1 cached); B@2 (20) displaces (2 cached); A@3 drops.
+  (multiple-value-bind (after-a1 after-b2 after-a3) (%first-seen-ownership-scenario)
+    (%check :own-first-seen-a1 (= 1 after-a1)
+            "the first writer (lower strength) owns the instance and its sample IS delivered")
+    (%check :own-first-seen-b2 (= 2 after-b2)
+            "a higher-strength writer then displaces the first owner and its sample IS delivered")
+    (%check :own-first-seen-a3 (= 2 after-a3)
+            "the displaced lower-strength writer's later sample is DROPPED (count unchanged)"))
+  t)
+
+;;; EXCLUSIVE owner-clear targets the FULL source GUID, not the EntityId (S1, DDS 1.4 §2.2.3.9.2): two
+;;; writers sharing EntityId 0x102 on different participants own different instances; a dispose from
+;;; one must clear ONLY its own ownership, never the other's. An EntityId-only compare would
+;;; cross-clear. Deterministic offline injection: seed both writers, give each its own instance, then
+;;; dispose writer A's instance and assert writer B still owns its own instance.
+
+(defun* %stage-lifecycle-sn-guid (node sn kind handle guid)
+    (function (t integer (member :dispose :unregister)
+              (simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (16))) t)
+  "Stage a dispose/unregister lifecycle change at SN keyed by its FULL 16-octet source GUID — the
+   (SN -> (kind key-hash status-flags writer-id source-guid)) record %on-user-lifecycle writes, minus
+   the wire (the owner-clear key, DDS 1.4 §2.2.3.9.2)."
+  (setf (gethash sn (dds.disc::disc-node-lifecycle-changes node))
+        (list kind handle 0 (dds.dcps::%guid-entityid guid) (copy-seq guid)))
+  t)
+
+(defun* %instance-rec-owner-guid (dr handle)
+    (function (dds.dcps:data-reader (simple-array (unsigned-byte 8) (16))) t)
+  "DR's EXCLUSIVE owner GUID for HANDLE, or NIL if unowned/no record (test accessor)."
+  (let ((rec (gethash handle (dds.dcps::dr-instance-recs dr))))
+    (and rec (dds.dcps::instance-rec-owner-guid rec))))
+
+(defun* run-dcps-dispose-owner-clear-test ()
+    (function () t)
+  "EXCLUSIVE owner-clear uses the FULL source GUID (S1, DDS 1.4 §2.2.3.9.2): writers A and B share
+   EntityId 0x102 on different participants. A owns instance-A; B owns instance-B. A disposes
+   instance-A — its ownership clears, but B's ownership of instance-B MUST survive (an EntityId-only
+   compare would wrongly cross-clear B). Deterministic offline injection — no UDP."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader
+                     sub tp :qos (dds.qos:make-reader-qos :ownership :exclusive)))
+                (node (dds.dcps::dp-node p))
+                (guid-a (%two-writer-guid #x0a))
+                (guid-b (%two-writer-guid #x0b))
+                (sample-a (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                (sample-b (make-shape-type :color "RED" :x 2 :y 2 :shapesize 20))
+                (handle-a (funcall (dds.types:type-support-key-hash ts) sample-a))
+                (handle-b (funcall (dds.types:type-support-key-hash ts) sample-b))
+                (bytes-a (dds.dcps::%serialize-sample ts sample-a))
+                (bytes-b (dds.dcps::%serialize-sample ts sample-b)))
+           (%seed-exclusive-match node guid-a 10)
+           (%seed-exclusive-match node guid-b 10)
+           ;; A writes instance-A (owns it); B writes instance-B (owns it).
+           (%stage-data-sn-guid node 1 bytes-a guid-a)
+           (%stage-data-sn-guid node 2 bytes-b guid-b)
+           (dds.dcps::%drain dr)
+           (%check :doc-a-owns (equalp guid-a (%instance-rec-owner-guid dr handle-a))
+                   "writer A must own instance-A after its first sample")
+           (%check :doc-b-owns (equalp guid-b (%instance-rec-owner-guid dr handle-b))
+                   "writer B must own instance-B after its first sample")
+           ;; A disposes instance-A: only A's ownership clears; B (same EntityId 0x102) must survive.
+           (%stage-lifecycle-sn-guid node 3 :dispose handle-a guid-a)
+           (dds.dcps::%drain dr)
+           (%check :doc-a-cleared (null (%instance-rec-owner-guid dr handle-a))
+                   "A's dispose must clear A's own ownership of instance-A")
+           (%check :doc-b-survives (equalp guid-b (%instance-rec-owner-guid dr handle-b))
+                   "A's dispose must NOT cross-clear B (same EntityId 0x102, different participant)"))
       (dds.dcps:delete-participant p))
     t))
 

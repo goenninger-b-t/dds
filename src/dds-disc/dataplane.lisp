@@ -243,29 +243,44 @@
    Returns the change SN. Mirrors publish-sample so the unregister is reliably repairable."
   (%dispose-or-unregister node key-hash dds.rtps.message:+statusinfo-unregistered+))
 
-(defun* %on-user-lifecycle (node writer-id sn kind key-hash status-flags)
-    (function (disc-node (unsigned-byte 32) integer (member :dispose :unregister) t (unsigned-byte 8)) t)
-  "Reader side: a no-payload dispose/unregister DATA arrived from WRITER-ID (RTPS 2.5 §9.6.4.9).
-   Feed its SN to the reliable reader (so the ACKNACK/HEARTBEAT bookkeeping treats it as a real
-   change), record (KIND KEY-HASH STATUS-FLAGS) by SN, then fire the DCPS-facing lifecycle-event
-   callback OUTSIDE the node lock (S2 reader-side instance-state transition; mirrors how
-   %deliver-user-sample fires on-sample). Gated on a matched user writer EntityId."
+(defun* %source-guid (src-prefix writer-id)
+    (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32)) (simple-array (unsigned-byte 8) (16)))
+  "Assemble the 16-octet source GUID from the datagram's RTPS-header SRC-PREFIX (§9.4.4) and the
+   DATA submessage's WRITER-ID EntityId (§9.3.1.2) — the key for EXCLUSIVE ownership arbitration."
+  (let ((g (make-array 16 :element-type '(unsigned-byte 8))))
+    (replace g src-prefix :end2 12)
+    (setf (aref g 12) (ldb (byte 8 24) writer-id) (aref g 13) (ldb (byte 8 16) writer-id)
+          (aref g 14) (ldb (byte 8 8) writer-id) (aref g 15) (ldb (byte 8 0) writer-id))
+    g))
+
+(defun* %on-user-lifecycle (node writer-id sn kind key-hash status-flags src-prefix)
+    (function (disc-node (unsigned-byte 32) integer (member :dispose :unregister) t (unsigned-byte 8)
+              (simple-array (unsigned-byte 8) (12))) t)
+  "Reader side: a no-payload dispose/unregister DATA arrived from WRITER-ID at SRC-PREFIX (RTPS 2.5
+   §9.6.4.9). Feed its SN to the reliable reader (so the ACKNACK/HEARTBEAT bookkeeping treats it as a
+   real change), record (KIND KEY-HASH STATUS-FLAGS WRITER-ID SOURCE-GUID) by SN — the full 16-octet
+   source GUID (§9.4.4 prefix + EntityId) lets S2 owner-clear target the EXACT disposing writer (DDS
+   1.4 §2.2.3.9.2; an EntityId alone aliases writers sharing 0x102 across participants) — then fire the
+   DCPS-facing lifecycle-event callback OUTSIDE the node lock (mirrors %deliver-user-sample). Gated on
+   a matched user writer EntityId."
   (when (and (disc-node-user-reader node) (%user-writer-entityid-p writer-id))
     (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn
                                       (make-array 0 :element-type '(unsigned-byte 8)))
     (dds.pal:with-lock ((disc-node-lock node))
       (setf (gethash sn (disc-node-lifecycle-changes node))
-            (list kind key-hash status-flags writer-id)))
+            (list kind key-hash status-flags writer-id (%source-guid src-prefix writer-id))))
     (when (disc-node-on-lifecycle-event node)
       (funcall (disc-node-on-lifecycle-event node) writer-id sn kind key-hash status-flags)))
   t)
 
 (defun* node-lifecycle-change (node sn)
     (function (disc-node integer) t)
-  "The received lifecycle change at sequence number SN as (kind key-hash status-flags writer-id),
-   or NIL. Lets a subscriber observe that a dispose/unregister DATA was received and classified (S1),
-   and lets the user-thread S2 consumer (%drain) recover the originating writer to drop it from the
-   instance's writers-set on an :unregister (DDS 1.4 §2.2.2.5.1.3)."
+  "The received lifecycle change at sequence number SN as
+   (kind key-hash status-flags writer-id source-guid), or NIL. Lets a subscriber observe that a
+   dispose/unregister DATA was received and classified (S1), and lets the user-thread S2 consumer
+   (%drain) recover the originating writer (EntityId to drop it from the instance's writers-set on an
+   :unregister, DDS 1.4 §2.2.2.5.1.3; full 16-octet SOURCE-GUID to clear ownership of only the exact
+   disposing writer, §2.2.3.9.2)."
   (dds.pal:with-lock ((disc-node-lock node))
     (gethash sn (disc-node-lifecycle-changes node))))
 
@@ -283,24 +298,28 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for k being the hash-keys of (disc-node-lifecycle-changes node) collect k)))
 
-(defun* %deliver-user-sample (node writer-id sn vec)
-    (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))) t)
-  "Feed a complete user sample VEC (SN from WRITER-ID) to the reliable reader, record it by SN,
-   then fire ON-SAMPLE outside the node lock (DATA_AVAILABLE + WaitSet wake)."
+(defun* %deliver-user-sample (node writer-id sn vec src-prefix)
+    (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
+              (simple-array (unsigned-byte 8) (12))) t)
+  "Feed a complete user sample VEC (SN from WRITER-ID at SRC-PREFIX) to the reliable reader, record
+   it by SN (payload + writer EntityId for the S2 writers-set + full source GUID for S1 EXCLUSIVE
+   ownership arbitration), then fire ON-SAMPLE outside the node lock (DATA_AVAILABLE + WaitSet wake)."
   (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn vec)
   (dds.pal:with-lock ((disc-node-lock node))
     (setf (gethash sn (disc-node-samples node)) vec
-          (gethash sn (disc-node-sample-writers node)) writer-id))
+          (gethash sn (disc-node-sample-writers node)) writer-id
+          (gethash sn (disc-node-sample-writer-guids node)) (%source-guid src-prefix writer-id)))
   (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))
   t)
 
-(defun* %on-user-data (node writer-id sn buf poff plen)
-    (function (disc-node (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)) t)
+(defun* %on-user-data (node writer-id sn buf poff plen src-prefix)
+    (function (disc-node (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)
+              (simple-array (unsigned-byte 8) (12))) t)
   "Reader side: copy the [poff,plen) SerializedPayload out of the receive buffer and deliver it
    (dedup/reorder, store by SN, fire ON-SAMPLE outside the node lock — no lock-order inversion)."
   (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
     (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
-    (%deliver-user-sample node writer-id sn vec)))
+    (%deliver-user-sample node writer-id sn vec src-prefix)))
 
 (defun* %on-user-heartbeat (node c flags)
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8)) t)
@@ -342,8 +361,9 @@
             (%send-change node (disc-node-rx-tx-msg node) ch (car peer) (cdr peer)))))))
   t)
 
-(defun* %on-user-data-frag (node c flags body-len buf)
-    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (integer 0) dds.core.buffer:octet-buffer) t)
+(defun* %on-user-data-frag (node c flags body-len buf src-prefix)
+    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (integer 0) dds.core.buffer:octet-buffer
+              (simple-array (unsigned-byte 8) (12))) t)
   "Reader side: accept a DATA_FRAG, reassemble; on the final fragment deliver the complete sample."
   (multiple-value-bind (rdr wtr sn ssize fstart frags fsize poff plen keyp)
       (dds.rtps.message:parse-data-frag-body c flags body-len)
@@ -353,7 +373,7 @@
         (replace region (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
         (let ((done (dds.rtps.reliable:reader-on-data-frag
                      (disc-node-user-reader node) wtr sn fstart frags fsize ssize region)))
-          (when done (%deliver-user-sample node wtr sn done))))))
+          (when done (%deliver-user-sample node wtr sn done src-prefix))))))
   t)
 
 (defun* %on-user-heartbeat-frag (node c flags)
@@ -410,13 +430,13 @@
    ACKNACK on HEARTBEAT, reassemble DATA_FRAG, NACK_FRAG on HEARTBEAT_FRAG). Call after add-local-reader."
   (setf (disc-node-user-reader node) (dds.rtps.reliable:make-rtps-reader))
   (setf (disc-node-on-data node)
-        (lambda (wid sn buf poff plen) (%on-user-data node wid sn buf poff plen)))
+        (lambda (wid sn buf poff plen src-prefix) (%on-user-data node wid sn buf poff plen src-prefix)))
   (setf (disc-node-on-lifecycle node)
-        (lambda (wid sn kind kh sf) (%on-user-lifecycle node wid sn kind kh sf)))
+        (lambda (wid sn kind kh sf src-prefix) (%on-user-lifecycle node wid sn kind kh sf src-prefix)))
   (setf (disc-node-on-heartbeat node)
         (lambda (c flags) (%on-user-heartbeat node c flags)))
   (setf (disc-node-on-data-frag node)
-        (lambda (c flags body-len buf) (%on-user-data-frag node c flags body-len buf)))
+        (lambda (c flags body-len buf src-prefix) (%on-user-data-frag node c flags body-len buf src-prefix)))
   (setf (disc-node-on-heartbeat-frag node)
         (lambda (c flags) (%on-user-heartbeat-frag node c flags)))
   node)
@@ -447,6 +467,28 @@
    DDS 1.4 §2.2.2.5.1.3) so a writer vanishing can transition the instance NOT_ALIVE_NO_WRITERS."
   (dds.pal:with-lock ((disc-node-lock node))
     (gethash sn (disc-node-sample-writers node))))
+
+(defun* node-sample-writer-guid (node sn)
+    (function (disc-node integer) t)
+  "The FULL 16-octet source GUID (RTPS-header prefix + DATA writer EntityId, §9.3.1.2) that wrote the
+   user sample at sequence number SN, or NIL. The key for EXCLUSIVE ownership arbitration (DDS 1.4
+   §2.2.3.9.2): two writers on different participants share an EntityId, so the GUID — not the
+   EntityId — distinguishes them when selecting the highest-strength owner of an instance."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (gethash sn (disc-node-sample-writer-guids node))))
+
+(defun* matched-writer-ownership (node guid)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) (values t t))
+  "The (values OWNERSHIP-KIND OWNERSHIP-STRENGTH) of the matched remote writer with 16-octet GUID,
+   read from its endpoint-data QoS in NODE's matches table (the SEDP-carried OwnershipQosPolicy +
+   OwnershipStrengthQosPolicy, RTPS 2.5 §8.5.4 / DDS 1.4 §2.2.3.9-.10). (values NIL NIL) when GUID is
+   not (or no longer) matched — the writer vanished; the caller treats that as not-the-owner."
+  (let ((ep (dds.pal:with-lock ((disc-node-lock node))
+              (gethash guid (disc-node-matches node)))))
+    (if ep
+        (let ((q (dds.rtps.discovery:endpoint-data-qos ep)))
+          (values (dds.qos:qos-ownership q) (dds.qos:qos-ownership-strength q)))
+        (values nil nil))))
 
 (defun* node-discovered-participants (node)
     (function (disc-node) list)
