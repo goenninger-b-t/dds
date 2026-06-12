@@ -64,6 +64,7 @@
            #:+pid-pad+ #:+pid-sentinel+ #:+pid-participant-lease-duration+
            #:+pid-topic-name+ #:+pid-type-name+ #:+pid-protocol-version+
            #:+pid-vendorid+ #:+pid-reliability+ #:+pid-durability+ #:+pid-liveliness+
+           #:+pid-ownership+ #:+pid-ownership-strength+
            #:+pid-default-unicast-locator+
            #:+pid-metatraffic-unicast-locator+ #:+pid-participant-guid+
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+

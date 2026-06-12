@@ -366,6 +366,7 @@
                  ("rtps-message-dispatch"    . run-rtps-dispatch-test)
                  ("rtps-parameterlist"       . run-paramlist-test)
                  ("pid-liveliness"           . run-pid-liveliness-test)
+                 ("ownership-codec"          . run-ownership-codec-test)
                  ("rtps-port-mapping"        . run-port-mapping-test)
                  ("rtps-participant-message" . run-participant-message-codec-test)
                  ("fastdds-participant-message" . run-fastdds-participant-message-test)

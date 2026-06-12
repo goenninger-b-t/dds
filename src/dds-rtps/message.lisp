@@ -669,6 +669,9 @@
   "PID_TOPIC_NAME (RTPS 2.5 §9.6.2.2 table).")
 (defconstant +pid-type-name+                  #x0007
   "PID_TYPE_NAME (RTPS 2.5 §9.6.2.2 table).")
+(defconstant +pid-ownership-strength+         #x0006
+  "PID_OWNERSHIP_STRENGTH -> OwnershipStrengthQosPolicy {long value} (RTPS 2.5 Table 9.18
+   §9.6.2.2; DDS 1.4 dds_rtf2_dcps.idl §2.2.3.10). Carried in DataWriterQos only (writer-only).")
 (defconstant +pid-protocol-version+           #x0015
   "PID_PROTOCOL_VERSION (RTPS 2.5 §9.6.2.2 table).")
 (defconstant +pid-vendorid+                   #x0016
@@ -679,6 +682,10 @@
   "PID_LIVELINESS -> LivelinessQosPolicy (RTPS 2.5 Table 9.18, §9.6.2.2).")
 (defconstant +pid-durability+                 #x001d
   "PID_DURABILITY (RTPS 2.5 §9.6.3.2).")
+(defconstant +pid-ownership+                   #x001f
+  "PID_OWNERSHIP -> OwnershipQosPolicy {OwnershipQosPolicyKind kind} (RTPS 2.5 Table 9.18
+   §9.6.2.2; DDS 1.4 dds_rtf2_dcps.idl §2.2.3.9). kind u32: SHARED_OWNERSHIP_QOS=0,
+   EXCLUSIVE_OWNERSHIP_QOS=1.")
 (defconstant +pid-default-unicast-locator+    #x0031
   "PID_DEFAULT_UNICAST_LOCATOR (RTPS 2.5 §9.6.2.2 table).")
 (defconstant +pid-metatraffic-unicast-locator+ #x0032

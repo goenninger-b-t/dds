@@ -249,6 +249,7 @@
    match a no-key writer. Sets NODE's user-writer-id so the data plane sends with this id."
   (let* ((kind (if keyed #x02 #x03))
          (ep (dds.rtps.discovery:make-endpoint-data
+              :role :writer
               :guid (%make-endpoint-guid (disc-node-guid-prefix node) key kind)
               :topic-name topic :type-name type :type-information type-information
               :qos (or qos (%qos-from-reliability reliability)))))
@@ -269,6 +270,7 @@
    Sets NODE's user-reader-id so the data plane routes HEARTBEAT/ACKNACK with this id."
   (let* ((kind (if keyed #x07 #x04))
          (ep (dds.rtps.discovery:make-endpoint-data
+              :role :reader
               :guid (%make-endpoint-guid (disc-node-guid-prefix node) key kind)
               :topic-name topic :type-name type :type-information type-information
               :qos (or qos (%qos-from-reliability reliability)))))

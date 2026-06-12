@@ -1072,6 +1072,99 @@
                 "INFINITE lease roundtrips back to DCPS {0x7fffffff, 0x7fffffff}"))))
   t)
 
+(defun* run-ownership-codec-test ()
+    (function () t)
+  "SEDP advertises OWNERSHIP (RTPS 2.5 Table 9.18 §9.6.2.2): PID_OWNERSHIP (0x001f, len 4,
+   OwnershipQosPolicyKind u32 LE: SHARED=0, EXCLUSIVE=1) and, for a WRITER only,
+   PID_OWNERSHIP_STRENGTH (0x0006, len 4, long value u32 LE) — strength is in DataWriterQos,
+   NOT DataReaderQos (DDS 1.4 dds_rtf2_dcps.idl §2.2.3.9/.10). The oracle is eProsima Fast DDS
+   3.6.1, interop/fastdds/captures/ownership-sedp-lo0.pcap frame 64: a writer {EXCLUSIVE,
+   strength 17} serializes byte-exact to 1f 00 04 00 / 01 00 00 00 / 06 00 04 00 / 11 00 00 00.
+   A :shared writer emits PID_OWNERSHIP kind 0; a READER emits PID_OWNERSHIP but no STRENGTH;
+   a length /= 4 is ignored, never read OOB, and never REJECTs the kind (NFR-SEC-POSTURE / FR-QOS-2)."
+  ;; serialize: an EXCLUSIVE writer with strength 17 -> the 16 exact oracle octets present.
+  (let* ((ep (dds.rtps.discovery:make-endpoint-data
+              :role :writer :topic-name "Square" :type-name "ShapeType"
+              :qos (dds.qos:make-writer-qos :ownership :exclusive :ownership-strength 17)))
+         (buf (dds.core.buffer:make-octet-buffer 512))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    (let ((end (dds.rtps.discovery:serialize-endpoint-data c ep)))
+      (%check :own-emit-kind
+              (%subseq-present-p (dds.core.buffer:octet-buffer-vec buf)
+                                 '(#x1f #x00 #x04 #x00  #x01 #x00 #x00 #x00) end)
+              "writer SEDP contains PID_OWNERSHIP {EXCLUSIVE}")
+      (%check :own-emit-strength
+              (%subseq-present-p (dds.core.buffer:octet-buffer-vec buf)
+                                 '(#x06 #x00 #x04 #x00  #x11 #x00 #x00 #x00) end)
+              "writer SEDP contains PID_OWNERSHIP_STRENGTH {17}")))
+  ;; serialize: a SHARED writer -> PID_OWNERSHIP kind 0.
+  (let* ((ep (dds.rtps.discovery:make-endpoint-data
+              :role :writer :topic-name "Square" :type-name "ShapeType"
+              :qos (dds.qos:make-writer-qos :ownership :shared)))
+         (buf (dds.core.buffer:make-octet-buffer 512))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    (let ((end (dds.rtps.discovery:serialize-endpoint-data c ep)))
+      (%check :own-emit-shared
+              (%subseq-present-p (dds.core.buffer:octet-buffer-vec buf)
+                                 '(#x1f #x00 #x04 #x00  #x00 #x00 #x00 #x00) end)
+              "shared writer SEDP contains PID_OWNERSHIP {SHARED}")))
+  ;; serialize: a READER emits PID_OWNERSHIP but NEVER PID_OWNERSHIP_STRENGTH (writer-only).
+  (let* ((ep (dds.rtps.discovery:make-endpoint-data
+              :role :reader :topic-name "Square" :type-name "ShapeType"
+              :qos (dds.qos:make-reader-qos :ownership :exclusive :ownership-strength 17)))
+         (buf (dds.core.buffer:make-octet-buffer 512))
+         (c (dds.core.buffer:cursor buf :endianness :little)))
+    (let ((end (dds.rtps.discovery:serialize-endpoint-data c ep)))
+      (%check :own-reader-kind
+              (%subseq-present-p (dds.core.buffer:octet-buffer-vec buf)
+                                 '(#x1f #x00 #x04 #x00  #x01 #x00 #x00 #x00) end)
+              "reader SEDP contains PID_OWNERSHIP {EXCLUSIVE}")
+      (%check :own-reader-no-strength
+              (not (%subseq-present-p (dds.core.buffer:octet-buffer-vec buf)
+                                      '(#x06 #x00 #x04 #x00) end))
+              "reader SEDP must NOT contain PID_OWNERSHIP_STRENGTH (writer-only, DataWriterQos)")))
+  ;; parse: the EXACT 16 oracle octets parse to qos :exclusive + strength 17.
+  (let* ((buf (dds.core.buffer:make-octet-buffer 512))
+         (out (dds.core.buffer:cursor buf :endianness :little))
+         (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (topic (octets #x07 #x00 #x00 #x00 #x53 #x71 #x72 #x00)) ; CDR string "Sqr"
+         (own (octets #x01 #x00 #x00 #x00))                       ; EXCLUSIVE
+         (strength (octets #x11 #x00 #x00 #x00)))                 ; 17
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-endpoint-guid+ guid 0 16)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-topic-name+ topic 0 8)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-type-name+ topic 0 8)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-ownership+ own 0 4)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-ownership-strength+ strength 0 4)
+    (dds.rtps.message:write-parameter-sentinel out)
+    (let ((back (dds.rtps.discovery:parse-endpoint-data
+                 (dds.core.buffer:cursor buf :endianness :little) :writer)))
+      (%check :own-parse back "parse-endpoint-data with PID_OWNERSHIP returned NIL")
+      (%check :own-parse-kind
+              (eq :exclusive (dds.qos:qos-ownership (dds.rtps.discovery:endpoint-data-qos back)))
+              "oracle PID_OWNERSHIP parses :exclusive")
+      (%check :own-parse-strength
+              (= 17 (dds.qos:qos-ownership-strength (dds.rtps.discovery:endpoint-data-qos back)))
+              "oracle PID_OWNERSHIP_STRENGTH parses 17")))
+  ;; bounds: a PID_OWNERSHIP whose declared length /= 4 (here 8) is ignored, never OOB; the
+  ;; kind keeps :shared and the parse does not REJECT (NFR-SEC-POSTURE / FR-QOS-2).
+  (let* ((buf (dds.core.buffer:make-octet-buffer 512))
+         (out (dds.core.buffer:cursor buf :endianness :little))
+         (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (topic (octets #x07 #x00 #x00 #x00 #x53 #x71 #x72 #x00))
+         (wrong (octets #x01 #x00 #x00 #x00  #xff #xff #xff #xff)))   ; len 8, not 4
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-endpoint-guid+ guid 0 16)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-topic-name+ topic 0 8)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-type-name+ topic 0 8)
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-ownership+ wrong 0 8)
+    (dds.rtps.message:write-parameter-sentinel out)
+    (let ((back (dds.rtps.discovery:parse-endpoint-data
+                 (dds.core.buffer:cursor buf :endianness :little) :reader)))
+      (%check :own-short back "wrong-length PID_OWNERSHIP must not crash the parse")
+      (%check :own-short-default
+              (eq :shared (dds.qos:qos-ownership (dds.rtps.discovery:endpoint-data-qos back)))
+              "wrong-length PID_OWNERSHIP is ignored, ownership keeps its default :shared")))
+  t)
+
 ;;; Instance-lifecycle wire codec (RTPS 2.5 §9.6.4.9): a dispose/unregister rides a DATA
 ;;; submessage with flags E+Q only (no serialized payload); the instance is named by
 ;;; PID_KEY_HASH and the lifecycle transition by PID_STATUS_INFO (StatusInfo_t octet[4],

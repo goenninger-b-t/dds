@@ -421,12 +421,21 @@
     (function ((unsigned-byte 32)) symbol)
   "Map a PID_LIVELINESS wire kind to a LIVELINESS keyword (DDS 1.4 PSM LivelinessQosPolicyKind
    0=AUTOMATIC,1=MANUAL_BY_PARTICIPANT,2=MANUAL_BY_TOPIC); an unknown code keeps the default :automatic, never rejecting (FR-QOS-2)." (case n (1 :manual-by-participant) (2 :manual-by-topic) (t :automatic)))
+(defun* %ownership-wire (k)
+    (function (symbol) (unsigned-byte 32))
+  "Map an OWNERSHIP kind keyword to its PID_OWNERSHIP wire code (OwnershipQosPolicyKind, dds_rtf2_dcps.idl: SHARED=0, EXCLUSIVE=1)." (ecase k (:shared 0) (:exclusive 1)))
+(defun* %wire-ownership (n)
+    (function ((unsigned-byte 32)) symbol)
+  "Map a PID_OWNERSHIP wire code to an OWNERSHIP kind keyword (1=EXCLUSIVE, else the default :shared); an unknown code never rejects (FR-QOS-2)." (if (= n 1) :exclusive :shared))
 
 (defstruct* (endpoint-data (:constructor make-endpoint-data))
   "DiscoveredWriterData / DiscoveredReaderData (RTPS 2.5 §8.5.4 / §9.6.2.2): a 16-octet
    GUID, topic + type names, and the QoS carried for RxO matching (FR-QOS-2)."
   (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
         :type (simple-array (unsigned-byte 8) (16)))
+  ;; :writer (DCPSPublication) vs :reader (DCPSSubscription) — selects the writer-only PIDs.
+  ;; OwnershipStrengthQosPolicy is in DataWriterQos only, never DataReaderQos (dds_rtf2_dcps.idl).
+  (role :writer :type (member :writer :reader))
   (topic-name "" :type string)
   (type-name "" :type string)
   (qos (dds.qos:make-qos) :type dds.qos:qos)
@@ -482,6 +491,18 @@
       (dds.core.buffer:put-u32 c (dds.qos:duration-nanosec->wire-fraction
                                   (dds.qos:qos-duration-nanosec lease)))
       (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-liveliness+ vec 0 12)))
+  ;; PID_OWNERSHIP (0x001f): {OwnershipQosPolicyKind kind;} = 4 octets (RTPS 2.5 Table 9.18
+  ;; §9.6.2.2; dds_rtf2_dcps.idl §2.2.3.9: SHARED=0, EXCLUSIVE=1). Always emitted (both roles).
+  (let ((q (endpoint-data-qos data)))
+    (multiple-value-bind (c vec) (%make-scratch 4)
+      (dds.core.buffer:put-u32 c (%ownership-wire (dds.qos:qos-ownership q)))
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-ownership+ vec 0 4))
+    ;; PID_OWNERSHIP_STRENGTH (0x0006): {long value;} = 4 octets (RTPS 2.5 Table 9.18 §9.6.2.2;
+    ;; dds_rtf2_dcps.idl §2.2.3.10). DataWriterQos only — a :reader endpoint never emits it.
+    (when (eq (endpoint-data-role data) :writer)
+      (multiple-value-bind (c vec) (%make-scratch 4)
+        (dds.core.buffer:put-u32 c (ldb (byte 32 0) (dds.qos:qos-ownership-strength q)))
+        (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-ownership-strength+ vec 0 4))))
   ;; PID_TYPE_INFORMATION (idl @id 0x0075): opaque pre-serialized XTypes TypeInformation,
   ;; emitted only when present (peers skip unknown PIDs — backward-compatible).
   (let ((ti (endpoint-data-type-information data)))
@@ -522,6 +543,15 @@
                (dds.qos:qos-liveliness-lease q)
                (dds.qos:make-qos-duration
                 sec (dds.qos:wire-fraction->duration-nanosec fraction))))))
+    ((= pid dds.rtps.message:+pid-ownership+)
+     (when (= len 4)
+       (setf (dds.qos:qos-ownership (endpoint-data-qos data))
+             (%wire-ownership (dds.core.buffer:get-u32 cursor)))))
+    ((= pid dds.rtps.message:+pid-ownership-strength+)
+     (when (= len 4)
+       (setf (dds.qos:qos-ownership-strength (endpoint-data-qos data))
+             (let ((u (dds.core.buffer:get-u32 cursor)))
+               (if (>= u #x80000000) (- u #x100000000) u)))))
     ((= pid dds.rtps.message:+pid-type-information+)
      (when (> len 0)
        (let ((ti (make-array len :element-type '(unsigned-byte 8))))
@@ -542,7 +572,8 @@
    a DCPSPublication (:writer) defaults RELIABILITY to RELIABLE, a DCPSSubscription
    (:reader) to BEST_EFFORT (DDS 1.4 §2.2.3 RELIABILITY) — RTI Connext elides
    default-valued PIDs, so a reliable Connext writer carries NO PID_RELIABILITY."
-  (let ((data (make-endpoint-data :qos (if (eq role :writer)
+  (let ((data (make-endpoint-data :role role
+                                  :qos (if (eq role :writer)
                                            (dds.qos:make-writer-qos)
                                            (dds.qos:make-reader-qos)))))
     (if (dds.rtps.message:parse-parameter-list

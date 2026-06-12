@@ -72,6 +72,12 @@ int main(int argc, char** argv)
         wqos.liveliness().lease_duration = Duration_t(static_cast<int32_t>(ms / 1000), static_cast<uint32_t>((ms % 1000) * 1000000));
         wqos.liveliness().announcement_period = Duration_t(static_cast<int32_t>(ap / 1000), static_cast<uint32_t>((ap % 1000) * 1000000));
     }
+    // OWNERSHIP_STRENGTH env (off by default): make the writer EXCLUSIVE with that strength (instance-ownership interop oracle).
+    if (const char* os = std::getenv("OWNERSHIP_STRENGTH"))
+    {
+        wqos.ownership().kind = EXCLUSIVE_OWNERSHIP_QOS;
+        wqos.ownership_strength().value = std::atol(os);
+    }
     MatchListener listener;
     DataWriter* writer = publisher->create_datawriter(topic, wqos, &listener, StatusMask::all());
     if (writer == nullptr)
