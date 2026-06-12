@@ -17,7 +17,8 @@
            #:disc-node-guid-prefix #:disc-node-peers #:disc-node-port
            #:disc-node-discovered-count #:disc-node-discovered-prefixes
            #:disc-node-matched-count #:disc-node-matched-topics
-           #:disc-node-on-match #:disc-node-on-incompatible-qos #:disc-node-on-sample
+           #:disc-node-on-match #:disc-node-on-unmatch
+           #:disc-node-on-incompatible-qos #:disc-node-on-sample
            #:disc-node-on-inconsistent-topic
            #:disc-node-type-gate #:resume-parked-matches #:disc-node-parked-count
            #:add-local-writer #:add-local-reader

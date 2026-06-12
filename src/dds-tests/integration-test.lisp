@@ -1957,6 +1957,48 @@
       (dds.disc:stop-node node)))
   t)
 
+;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a
+;;; discovered participant not refreshed within its leaseDuration. %lease-sweep
+;;; prunes the stale participant's discovered entry + endpoints + matches +
+;;; builtin-reader and fires the on-unmatch hook once per removed matched endpoint.
+
+(defun* run-lease-sweep-test ()
+    (function () t)
+  "%lease-sweep prunes a participant whose last-seen + leaseDuration < now (RTPS 2.5
+   §8.5.3.3.2): removes its discovered entry + endpoints + matches + builtin-reader and
+   fires on-unmatch once per removed matched endpoint (direction . remote)."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x53)
+               :host "127.0.0.1" :port 0))
+        (unmatched '()))
+    (unwind-protect
+        (progn
+          (setf (dds.disc:disc-node-on-unmatch node)
+                (lambda (direction remote) (push (cons direction remote) unmatched)))
+          (let* ((p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x71))
+                 (rw (%remote-writer-ep #x02)))                 ; a remote writer endpoint
+            (replace (dds.rtps.discovery:endpoint-data-guid rw) p2 :end1 12)
+            (dds.disc::%record-match node rw)
+            (setf (gethash (copy-seq (dds.rtps.discovery:endpoint-data-guid rw))
+                           (dds.disc::disc-node-discovered-writers node)) rw)
+            (setf (gethash (copy-seq p2) (dds.disc::disc-node-builtin-readers node))
+                  (dds.rtps.reliable:make-rtps-reader))
+            (dds.disc::%seed-discovered-stale node p2 1 5)       ; lease 1s, seen 5s ago
+            (dds.disc::%lease-sweep node)
+            (%check :pruned (zerop (hash-table-count (dds.disc::disc-node-discovered node)))
+                    "stale participant not pruned from discovered")
+            (%check :builtin-removed (zerop (hash-table-count (dds.disc::disc-node-builtin-readers node)))
+                    "stale participant's builtin-reader not removed")
+            (%check :ep-removed (zerop (hash-table-count (dds.disc::disc-node-discovered-writers node)))
+                    "stale participant's discovered endpoint not removed")
+            (%check :match-removed (zerop (hash-table-count (dds.disc::disc-node-matches node)))
+                    "matched endpoint not removed")
+            (%check :unmatch-fired (= 1 (length unmatched)) "on-unmatch not fired once")
+            (%check :unmatch-direction (eq :remote-writer (car (first unmatched)))
+                    "wrong unmatch direction")))
+      (dds.disc:stop-node node))
+    t))
+
 ;;; TypeLookup builtin endpoints over UDP (M4 Task 3.2, FR-TYPE-3): the four
 ;;; XTypes 1.3 Table 61 service endpoints wired into the discovery node — a client
 ;;; type-lookup-query fetches a peer's TypeObject by EquivalenceHash; the peer's

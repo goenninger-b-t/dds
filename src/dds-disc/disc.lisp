@@ -25,7 +25,10 @@
    installs to surface matched/incompatible events and newly-arrived user data to the
    application (DDS statuses, listeners, and the condvar-driven WaitSet wake); each
    match/incompatible hook fires once per remote endpoint, ON-SAMPLE once per stored
-   user sample. TYPE-GATE is an optional type-compatibility gate consulted OUTSIDE
+   user sample. ON-UNMATCH is the dual of ON-MATCH: %lease-sweep fires it (direction .
+   remote) for every matched endpoint removed when its participant leases out (RTPS 2.5
+   §8.5.3.3.2). PARTICIPANT-LAST-SEEN stamps each discovered prefix's last SPDP refresh
+   so the sweep can detect stale entries (guarded by LOCK). TYPE-GATE is an optional type-compatibility gate consulted OUTSIDE
    the lock (user code, like the ON-* hooks) as (funcall gate node remote local) —
    REMOTE + LOCAL are dds.rtps.discovery:endpoint-data — before a match is recorded
    in EITHER direction; verdicts: :compatible (record + fire as usual), :incompatible
@@ -64,6 +67,7 @@
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
   (builtin-readers (make-hash-table :test 'equalp) :type hash-table) ; remote 12-octet prefix -> reliable SEDP reader
+  (participant-last-seen (make-hash-table :test 'equalp) :type hash-table) ; remote 12-octet prefix -> internal-real-time of last SPDP refresh
   ;; TypeLookup service endpoint state (typelookup-endpoints.lisp, XTypes 1.3 §7.6.3.3)
   (tl-pending (make-hash-table :test 'eql) :type hash-table) ; request SN -> tl-pending-entry
   (tl-req-sn 1 :type integer)
@@ -77,6 +81,7 @@
   (on-heartbeat-frag nil :type (or null function))
   (on-nack-frag nil :type (or null function))
   (on-match nil :type (or null function))
+  (on-unmatch nil :type (or null function))
   (type-gate nil :type (or null function))
   (on-incompatible-qos nil :type (or null function))
   (on-inconsistent-topic nil :type (or null function))
@@ -292,6 +297,12 @@
     (replace p (dds.core.buffer:octet-buffer-vec buf) :start2 8 :end2 20)
     p))
 
+;; Endpoint GUID classifiers: defined in dataplane.lisp (loaded after this file).
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (16))) t) %writer-guid-p %reader-guid-p))
+
+;; %lease-sweep is defined below but called from announce-endpoints above it.
+(declaim (ftype (function (disc-node) (eql t)) %lease-sweep))
+
 ;; TypeLookup endpoint handlers: defined in typelookup-endpoints.lisp (loaded after this file).
 (declaim (ftype (function ((unsigned-byte 32)) t) %tl-writer-p)
          (ftype (function ((unsigned-byte 32)) (or null (unsigned-byte 32))) %tl-reader-id-for)
@@ -367,8 +378,9 @@
     (function (disc-node) (eql t))
   "Send NODE's local publications (SEDP publications writer) and subscriptions
    (SEDP subscriptions writer) to every discovered participant's metatraffic
-   unicast locator (RTPS 2.5 §8.5.4). Also drives tl-sweep, expiring overdue
-   TypeLookup queries on the periodic announce cadence."
+   unicast locator (RTPS 2.5 §8.5.4). Also drives tl-sweep (expiring overdue
+   TypeLookup queries) and %lease-sweep (pruning lease-expired participants, RTPS 2.5
+   §8.5.3.3.2) on the periodic announce cadence."
   (dolist (p (%discovered-participants node))
     (let ((loc (dds.rtps.discovery:usable-udpv4-locator
                 (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))))
@@ -402,16 +414,121 @@
                                (%sedp-reader-id-for wid) wid base numbits bitmap count
                                nil host port))))))))
   (tl-sweep node)
+  (%lease-sweep node)
   t)
+
+(defun* %lease-now ()
+    (function () (integer 0))
+  "Monotonic internal-real-time stamp for lease/liveliness bookkeeping."
+  (get-internal-real-time))
+
+(defun* %lease-stale-p (last-seen lease-seconds now)
+    (function (integer integer (integer 0)) t)
+  "T iff LAST-SEEN is older than LEASE-SECONDS before NOW — the SPDP HistoryCache
+   stale-entry test (RTPS 2.5 §8.5.3.3.2: not refreshed within its leaseDuration)."
+  (> (- now last-seen) (* lease-seconds internal-time-units-per-second)))
 
 (defun* %record-participant (node spdp)
     (function (disc-node dds.rtps.discovery:spdp-data) t)
-  "Record a discovered participant (its SPDP data) keyed by GUID prefix, ignoring
-   this node's own announcements (loopback echo / self in peers)."
+  "Record a discovered participant (its SPDP data) keyed by GUID prefix and stamp its
+   last-seen for lease tracking (RTPS 2.5 §8.5.3.3.2), ignoring this node's own
+   announcements (loopback echo / self in peers)."
   (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix spdp)))
     (unless (equalp prefix (disc-node-guid-prefix node))
       (dds.pal:with-lock ((disc-node-lock node))
-        (setf (gethash (copy-seq prefix) (disc-node-discovered node)) spdp)))))
+        (let ((key (copy-seq prefix)))
+          (setf (gethash key (disc-node-discovered node)) spdp)
+          (setf (gethash key (disc-node-participant-last-seen node)) (%lease-now)))))))
+
+(defun* %seed-discovered-stale (node prefix lease-seconds seconds-ago)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) integer (integer 0)) t)
+  "Test seam: record a discovered participant for PREFIX whose SPDP announces
+   LEASE-SECONDS and whose last-seen is SECONDS-AGO in the past (the stamp may be
+   negative this early after boot — only NOW - last-seen matters), so %lease-sweep sees
+   it as stale (RTPS 2.5 §8.5.3.3.2)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((key (copy-seq prefix)))
+      (setf (gethash key (disc-node-discovered node))
+            (dds.rtps.discovery:make-spdp-data :guid-prefix prefix
+                                               :lease-duration-seconds lease-seconds))
+      (setf (gethash key (disc-node-participant-last-seen node))
+            (- (%lease-now) (* seconds-ago internal-time-units-per-second)))))
+  t)
+
+(defun* %fire-unmatch (node direction remote)
+    (function (disc-node keyword dds.rtps.discovery:endpoint-data) t)
+  "Invoke the ON-UNMATCH hook (if installed) OUTSIDE the node lock for a REMOTE endpoint
+   unmatched by participant-lease expiry (DIRECTION :remote-writer / :remote-reader)."
+  (when (disc-node-on-unmatch node)
+    (funcall (disc-node-on-unmatch node) direction remote)))
+
+(defun* %purge-prefix (node prefix accessor)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) function) t)
+  "Remove every entry in (ACCESSOR NODE)'s table whose remote 16-octet GUID's first 12
+   octets equal PREFIX. CALLER HOLDS the node lock."
+  (let ((table (funcall accessor node)) (dead '()))
+    (maphash (lambda (guid ep)
+               (declare (ignore ep))
+               (when (%guid-prefix-match-p guid prefix) (push guid dead)))
+             table)
+    (dolist (guid dead) (remhash guid table)))
+  t)
+
+(defun* %guid-prefix-match-p (guid prefix)
+    (function ((simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (12))) t)
+  "T iff the 16-octet endpoint GUID's first 12 octets (its participant prefix, RTPS 2.5
+   §9.3.1.2) equal the 12-octet PREFIX."
+  (dotimes (i 12 t)
+    (unless (= (aref guid i) (aref prefix i)) (return nil))))
+
+(defun* %collect-and-remove-matches (node prefix removed-place)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) function) t)
+  "Remove every match whose remote GUID prefix equals PREFIX, classify its direction
+   from the GUID entity kind (a removed remote WRITER -> :remote-writer, READER ->
+   :remote-reader; RTPS 2.5 §9.3.1.2 Table 9.1 via %writer-guid-p/%reader-guid-p), and
+   push (direction . remote) via REMOVED-PLACE. CALLER HOLDS the node lock."
+  (let ((table (disc-node-matches node)) (dead '()))
+    (maphash (lambda (guid remote)
+               (when (%guid-prefix-match-p guid prefix)
+                 (push (cons guid remote) dead)))
+             table)
+    (dolist (entry dead)
+      (let* ((remote (cdr entry))
+             (guid (dds.rtps.discovery:endpoint-data-guid remote))
+             (direction (cond ((%writer-guid-p guid) :remote-writer)
+                              ((%reader-guid-p guid) :remote-reader)
+                              (t :remote-writer))))
+        (remhash (car entry) table)
+        (funcall removed-place (cons direction remote)))))
+  t)
+
+(defun* %lease-sweep (node)
+    (function (disc-node) (eql t))
+  "Prune every discovered participant whose SPDP last-seen is older than its announced
+   leaseDuration (RTPS 2.5 §8.5.3.3.2 — the SPDPbuiltinParticipantReader removes stale
+   entries): under the node lock remove its discovered entry, last-seen, builtin-reader,
+   every discovered-writers/readers endpoint + match keyed by that 12-octet prefix,
+   collecting the removed MATCHED endpoints; then fire on-unmatch per removed match
+   OUTSIDE the lock. Idempotent (a re-announced participant re-adds)."
+  (let ((removed '()))
+    (dds.pal:with-lock ((disc-node-lock node))
+      (let ((now (%lease-now)) (dead '()))
+        (maphash (lambda (prefix spdp)
+                   (let ((ls (gethash prefix (disc-node-participant-last-seen node))))
+                     (when (and ls (%lease-stale-p
+                                    ls (dds.rtps.discovery:spdp-data-lease-duration-seconds spdp) now))
+                       (push prefix dead))))
+                 (disc-node-discovered node))
+        (dolist (prefix dead)
+          (remhash prefix (disc-node-discovered node))
+          (remhash prefix (disc-node-participant-last-seen node))
+          (remhash prefix (disc-node-builtin-readers node))
+          (%purge-prefix node prefix #'disc-node-discovered-writers)
+          (%purge-prefix node prefix #'disc-node-discovered-readers)
+          (%collect-and-remove-matches node prefix
+                                       (lambda (dm) (push dm removed))))))
+    (dolist (dm removed) (%fire-unmatch node (car dm) (cdr dm)))
+    t))
 
 (defun* %record-match (node remote)
     (function (disc-node dds.rtps.discovery:endpoint-data) boolean)
