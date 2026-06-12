@@ -24,7 +24,8 @@
    small-object freelists and crashes later allocations (SIGILL/SIGSEGV inside
    GC_malloc_kind). FREE-STATIC therefore never truly deallocates on Clasp; it
    recycles through this pool. Bounded by the peak number of live static vectors
-   per size. Documented NFR-PORT gap until the upstream deallocator is fixed.")
+   per size. Documented NFR-PORT gap until the upstream deallocator is fixed
+   (reported: clasp-developers/clasp#1793).")
 
 (defvar *static-pool-lock* (bordeaux-threads:make-lock "dds-static-pool")
   "Guards *STATIC-POOL*: FREE-STATIC also runs on receiver threads.")
