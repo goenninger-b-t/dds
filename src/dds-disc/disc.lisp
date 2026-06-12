@@ -70,9 +70,9 @@
   (user-reader nil :type (or null dds.rtps.reliable:rtps-reader))
   (user-writer-id #x00000102 :type (unsigned-byte 32)) ; this node's user-data writer EntityId (kind reflects keyed-ness)
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
-  (samples (make-hash-table :test 'eql) :type hash-table)
-  (sample-writers (make-hash-table :test 'eql) :type hash-table) ; SN -> writer EntityId that wrote it (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
-  (sample-writer-guids (make-hash-table :test 'eql) :type hash-table) ; SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
+  (samples (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> payload (§8.3.5.4: SN is per-writer; no per-sample composite-key alloc)
+  (sample-writers (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> writer EntityId (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
+  (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
   (lifecycle-changes (make-hash-table :test 'eql) :type hash-table) ; SN -> (kind key-hash status writer-id source-guid) received dispose/unregister
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)

@@ -478,6 +478,22 @@ the source as deferred or simplified — do not rely on them yet:
   source GUID** per sample (two writers on different participants share an `EntityId`), recorded by
   the engine alongside the writer `EntityId`. Reader-side only; cross-reader consistency is per
   §2.2.3.9.2 (each reader decides independently).
+  - **Per-writer keying (no SN aliasing).** The engine's reader-side sample store is **2-level** —
+    keyed by the **source GUID** then the RTPS `SequenceNumber` (RTPS 2.5 §8.3.5.4: an SN is unique
+    only *within one writer GUID*), so two writers sharing `EntityId` `0x102` on different
+    participants do **not** alias in the SN space (an SN-only key would silently dedup the second
+    writer's data). The drain's per-writer high-water mark is likewise keyed by the source GUID. The
+    2-level keying also avoids a per-sample composite-key allocation on the receive path (NFR-MEM).
+  - **Pre-match keep-pending.** A sample from a writer that is **identified but not yet SEDP-matched**
+    (its `OWNERSHIP_STRENGTH` is unresolved) is dropped on the current drain but its per-writer
+    watermark is **left pending** — the reliable engine has already ACKed it, so advancing the
+    watermark would lose it permanently. A later drain re-evaluates it once the match completes and
+    the strength is known, so no EXCLUSIVE data is lost across the SEDP race (DDS 1.4 §2.2.3.9.2).
+  - **Known follow-up (SN aliasing, dispose/ACKNACK paths).** The data-delivery store is per-writer,
+    but the dispose/unregister **lifecycle** store and the reliable-engine **writer/reader proxies**
+    still key by raw SN / `EntityId`, so two writers sharing `0x102` can still alias in the DISPOSE
+    and ACKNACK/REPAIR paths (RTPS 2.5 §8.3.5.4). This does **not** affect single-writer or EXCLUSIVE
+    *data delivery*; full-GUID keying of those paths is a tracked TODO.
 - **MATCHED decrements on lease expiry.** When a discovered participant vanishes and its
   lease expires (RTPS 2.5 §8.5.3.3.2), each pruned match decrements the affected local
   endpoint's SUBSCRIPTION_MATCHED / PUBLICATION_MATCHED `current_count` (`current_count_change`

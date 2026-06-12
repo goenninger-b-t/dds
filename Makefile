@@ -28,8 +28,11 @@ COUNT    ?= 0
 PEERS    ?=
 LIVELINESS ?=
 LEASE    ?=
+OWNERSHIP ?=
 # Optional writer LIVELINESS QoS for square-pub; empty -> current default behaviour.
 LIVELINESS_ARGS := $(if $(LIVELINESS),:liveliness :$(LIVELINESS),)$(if $(LEASE), :liveliness-lease-seconds $(LEASE),)
+# Optional reader OWNERSHIP QoS for gated-sub (shared|exclusive); empty -> :shared default.
+OWNERSHIP_ARGS := $(if $(OWNERSHIP),:ownership :$(OWNERSHIP),)
 
 all: build-all test-all gate-hotpath gate-types mem
 
@@ -104,7 +107,7 @@ large-sub:
 # stock Connext peer's PID_TYPE_OBJECT_LB. LOCALTYPE=shape-type (compatible) | shape-mismatch.
 gated-sub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-gated-subscriber :domain $(DOMAIN) :topic "$(TOPIC)" :type-name "$(TYPENAME)" :local-type "$(LOCALTYPE)" :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-gated-subscriber :domain $(DOMAIN) :topic "$(TOPIC)" :type-name "$(TYPENAME)" :local-type "$(LOCALTYPE)" :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" $(OWNERSHIP_ARGS))' \
 	        --eval '(uiop:quit 0)'
 
 # Clean-room legacy-TypeObject capture: dump a peer's PID_TYPE_OBJECT_LB as a Lisp byte vector.

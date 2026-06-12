@@ -88,7 +88,7 @@ int main(int argc, char** argv)
 
     ShapeType sample;
     sample.color(color);
-    sample.shapesize(30);
+    sample.shapesize(std::getenv("SHAPESIZE") ? std::atoi(std::getenv("SHAPESIZE")) : 30);   // distinguish two writers of one instance (ownership interop)
     long sent = 0;
     for (long i = 0; count == 0 || i < count; ++i)
     {

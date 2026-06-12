@@ -316,9 +316,9 @@
       (unwind-protect
            (loop
              (setf last (%reannounce node last))
-             (dolist (sn (sort (dds.disc:node-sample-sns node) #'<))
-               (unless (gethash sn printed)
-                 (setf (gethash sn printed) t)
+             (dolist (sn (sort (dds.disc:node-sample-sns node) #'< :key #'dds.disc:node-sample-key-sn))
+               (unless (gethash (dds.disc:node-sample-key-sn sn) printed)
+                 (setf (gethash (dds.disc:node-sample-key-sn sn) printed) t)
                  ;; a sample we cannot parse (wrong TYPE, foreign encoding, malformed)
                  ;; must never crash the subscriber — skip it with a hint.
                  (handler-case
@@ -430,9 +430,9 @@
       (unwind-protect
            (loop
              (setf last (%reannounce node last))
-             (dolist (sn (sort (dds.disc:node-sample-sns node) #'<))
-               (unless (gethash sn printed)
-                 (setf (gethash sn printed) t)
+             (dolist (sn (sort (dds.disc:node-sample-sns node) #'< :key #'dds.disc:node-sample-key-sn))
+               (unless (gethash (dds.disc:node-sample-key-sn sn) printed)
+                 (setf (gethash (dds.disc:node-sample-key-sn sn) printed) t)
                  (handler-case
                      (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-large-data)))
                        (declare (type large-data s))
@@ -456,9 +456,10 @@
 
 (defun* run-gated-subscriber (&key (domain 0) (topic "Square") (type-name "C_Shape")
                                    (local-type "shape-type") (seconds 25)
-                                   (advertise-address "127.0.0.1"))
+                                   (advertise-address "127.0.0.1") (ownership :shared))
     (function (&key (:domain (integer 0)) (:topic string) (:type-name string)
-                    (:local-type string) (:seconds (integer 0)) (:advertise-address string)) t)
+                    (:local-type string) (:seconds (integer 0)) (:advertise-address string)
+                    (:ownership symbol)) t)
   "DCPS-level gated live subscriber (FR-TYPE-4, ADR 0010 live DoD): create a
    DomainParticipant (whose disc-node carries the installed %PARTICIPANT-TYPE-GATE),
    bind LOCAL-TYPE's registered type-support under TOPIC / TYPE-NAME, and subscribe.
@@ -478,7 +479,7 @@
     (setf dds.dcps:*type-compat-log* *standard-output*)
     (let* ((tp (dds.dcps:create-topic p topic type-name ts))
            (sub (dds.dcps:create-subscriber p))
-           (dr (dds.dcps:create-datareader sub tp :qos (dds.qos:make-reader-qos :reliability :reliable))))
+           (dr (dds.dcps:create-datareader sub tp :qos (dds.qos:make-reader-qos :reliability :reliable :ownership ownership))))
       (format t "~&[gated-sub] ~a/~a local-type=~a domain=~d (multicast 239.255.0.1). Gate verdict + samples below.~%"
               topic type-name local-type domain)
       (let ((fa (dds.types:type-support-field-accessors ts))

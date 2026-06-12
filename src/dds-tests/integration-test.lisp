@@ -156,7 +156,7 @@
            (loop repeat 150 until (plusp (dds.disc:node-sample-count node2)) do (sleep 0.02))
            (%check :typed-received (plusp (dds.disc:node-sample-count node2))
                    "subscriber never received the shape over UDP")
-           (let ((bytes (dds.disc:node-sample node2 1)))
+           (let ((bytes (dds.disc:node-sample-by-sn node2 1)))
              (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
              (let ((q (%deserialize-shape bytes)))
                (%check :typed-fields
@@ -602,11 +602,17 @@
 (defun* %stage-data-sn (node sn handle bytes wid)
     (function (t integer (simple-array (unsigned-byte 8) (16))
               (simple-array (unsigned-byte 8) (*)) (unsigned-byte 32)) t)
-  "Stage a data sample (serialized BYTES, written by WID) at sequence number SN in NODE's SN maps —
-   the same (SN -> payload) + (SN -> writer) records %deliver-user-sample writes, minus the wire."
+  "Stage a data sample (serialized BYTES, written by WID) at sequence number SN in NODE's composite
+   (GUID, SN) maps — the same (payload + writer + source GUID) records %deliver-user-sample writes,
+   minus the wire. The source GUID is a zero-prefix + WID EntityId so the drain's per-writer high-water
+   keys it (a one-writer scenario; §8.3.5.4)."
   (declare (ignore handle))
-  (setf (gethash sn (dds.disc::disc-node-samples node)) bytes
-        (gethash sn (dds.disc::disc-node-sample-writers node)) wid)
+  (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref guid 12) (ldb (byte 8 24) wid) (aref guid 13) (ldb (byte 8 16) wid)
+          (aref guid 14) (ldb (byte 8 8) wid) (aref guid 15) (ldb (byte 8 0) wid))
+    (setf (gethash sn (dds.disc::%inner-table (dds.disc::disc-node-samples node) guid)) bytes
+          (gethash sn (dds.disc::%inner-table (dds.disc::disc-node-sample-writers node) guid)) wid
+          (gethash sn (dds.disc::%inner-table (dds.disc::disc-node-sample-writer-guids node) guid)) guid))
   t)
 
 (defun* %stage-lifecycle-sn (node sn kind handle wid)
@@ -693,12 +699,14 @@
 
 (defun* %stage-data-sn-guid (node sn bytes guid)
     (function (t integer (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (16))) t)
-  "Stage a data sample (serialized BYTES) at sequence number SN keyed by its FULL 16-octet source
-   GUID — the (SN -> payload) + (SN -> EntityId, S2) + (SN -> GUID, S1) records the receive path
-   writes, minus the wire."
-  (setf (gethash sn (dds.disc::disc-node-samples node)) bytes
-        (gethash sn (dds.disc::disc-node-sample-writers node)) (dds.dcps::%guid-entityid guid)
-        (gethash sn (dds.disc::disc-node-sample-writer-guids node)) (copy-seq guid))
+  "Stage a data sample (serialized BYTES) at sequence number SN keyed by the (GUID, SN) composite key
+   built from its FULL 16-octet source GUID — the (payload + EntityId, S2 + GUID, S1) records the
+   receive path writes, minus the wire (§8.3.5.4: keyed by GUID+SN so two writers do not alias)."
+  (setf (gethash sn (dds.disc::%inner-table (dds.disc::disc-node-samples node) guid)) bytes
+        (gethash sn (dds.disc::%inner-table (dds.disc::disc-node-sample-writers node) guid))
+        (dds.dcps::%guid-entityid guid)
+        (gethash sn (dds.disc::%inner-table (dds.disc::disc-node-sample-writer-guids node) guid))
+        (copy-seq guid))
   t)
 
 (defun* %own-handle-count (dr handle)
@@ -814,6 +822,52 @@
             "a higher-strength writer then displaces the first owner and its sample IS delivered")
     (%check :own-first-seen-a3 (= 2 after-a3)
             "the displaced lower-strength writer's later sample is DROPPED (count unchanged)"))
+  t)
+
+(defun* %pre-match-ownership-scenario ()
+    (function () (values integer integer))
+  "Drive the EXCLUSIVE pre-match transient (DDS 1.4 §2.2.3.9.2): a data sample is staged for an
+   EXCLUSIVE reader from a writer whose SEDP match has NOT yet arrived (strength unresolved), then drained;
+   the sample must be DROPPED THIS pass but LEFT PENDING (the reliable engine already ACKed it, so
+   advancing the per-writer watermark would lose it permanently). The match + strength are then seeded
+   and the reader drained again. Returns (values BEFORE-MATCH AFTER-MATCH) — the valid-data sample count
+   for the instance before the match (must be 0) and after (must be 1: the once-pending sample now
+   arbitrates and is delivered)."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader
+                     sub tp :qos (dds.qos:make-reader-qos :ownership :exclusive)))
+                (node (dds.dcps::dp-node p))
+                (guid-a (%two-writer-guid #x0a))
+                (sample (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                (handle (funcall (dds.types:type-support-key-hash ts) sample))
+                (bytes (dds.dcps::%serialize-sample ts sample)))
+           ;; Stage A's sample BEFORE seeding A's SEDP match -> strength unresolved -> :drop-unmatched.
+           (%stage-data-sn-guid node 1 bytes guid-a)
+           (dds.dcps::%drain dr)
+           (let ((before (%own-handle-count dr handle)))
+             ;; The SEDP match now arrives; the once-unmatched sample must STILL be pending and deliver.
+             (%seed-exclusive-match node guid-a 10)
+             (dds.dcps::%drain dr)
+             (values before (%own-handle-count dr handle))))
+      (dds.dcps:delete-participant p))))
+
+(defun* run-dcps-exclusive-pre-match-test ()
+    (function () t)
+  "DCPS EXCLUSIVE pre-match data-loss guard (S1, DDS 1.4 §2.2.3.9.2): a sample from an
+   identified-but-not-yet-SEDP-matched writer arrives at an EXCLUSIVE reader. Its strength is unresolved,
+   so it is dropped THIS drain — but the per-writer drain watermark must NOT advance (the reliable engine
+   already ACKed it and will never retransmit), or the sample is lost permanently once the match arrives.
+   Asserts: before the match the sample is NOT delivered AND not permanently dropped; after the match
+   arrives a re-drain delivers it. Deterministic offline injection — no UDP, no unbounded wait."
+  (multiple-value-bind (before after) (%pre-match-ownership-scenario)
+    (%check :own-pre-match-before (= 0 before)
+            "an unmatched writer's sample must NOT reach an EXCLUSIVE reader's cache before the match")
+    (%check :own-pre-match-after (= 1 after)
+            "the once-unmatched sample must survive (watermark left pending) and deliver after the match"))
   t)
 
 ;;; EXCLUSIVE owner-clear targets the FULL source GUID, not the EntityId (S1, DDS 1.4 §2.2.3.9.2): two

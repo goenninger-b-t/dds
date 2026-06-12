@@ -1208,3 +1208,28 @@ pinned to `127.0.0.1`. No change to the NO_KEY mechanism; suite stays 106 green
   PEERS=127.0.0.1:7410, WIRESHARK_CONFIG_DIR=/tmp/wscfg.
 - Unregister is byte-validated offline (S0 vs frame 113) + S2 tests; dispose is the live-tested
   headline (shared wire path, only the StatusInfo U flag differs). 129 green SBCL+Clasp.
+
+## M4 (2026-06-13) — OWNERSHIP EXCLUSIVE live + a multi-writer SN-aliasing data-plane fix (ownership S1/S2)
+
+- **Live EXCLUSIVE arbitration PROVEN** (two same-instance writers, different OWNERSHIP_STRENGTH,
+  distinguished by shapesize): two EXCLUSIVE publishers strength 10/shapesize 30 + strength
+  20/shapesize 60 (same BLUE instance) -> our `:ownership :exclusive` gated-sub. While both alive:
+  the reader delivered ONLY shapesize 60 (the strength-20 owner), zero shapesize 30 (the
+  lower-strength writer dropped). After killing the strength-20 owner: the participant was pruned,
+  `%clear-owner-on-vanish` cleared the owner, and the strength-10 (shapesize 30) writer reclaimed +
+  resumed delivering — DDS 1.4 §2.2.3.9.2 first-owner + takeover confirmed end-to-end. Harness:
+  env-gated OWNERSHIP_STRENGTH + SHAPESIZE on the Fast DDS shapes_pub AND the Connext shapes_pub
+  (clean-room, public OMG DDS C++ PSM, no RTI source copied); our gated-sub gained `:ownership`;
+  Makefile `gated-sub OWNERSHIP=`.
+- **Data-plane fix surfaced by the live test — multi-writer SN aliasing.** The reader keyed its user-
+  sample store by raw SequenceNumber alone, but an RTPS SN is unique only per writer GUID (RTPS 2.5
+  §8.3.5.4); two writers sharing the user-writer EntityId 0x00000102 across participants both start
+  at SN 1, colliding in the store so one writer's data was dropped before arbitration. Fixed: the
+  reader's sample pipeline is now keyed by the full (source-GUID, SN) — a 2-level GUID->(SN->sample)
+  table (no per-sample bignum / NFR-MEM-clean; one %source-guid per sample) — and the DCPS drain's
+  exactly-once watermark is per-writer. EXCLUSIVE pre-match samples (source identified but SEDP match
+  not yet arrived) are kept PENDING (not watermark-advanced) so they deliver once the match + strength
+  are known, never lost. KNOWN FOLLOW-UP (documented, does NOT affect single-writer or EXCLUSIVE data
+  delivery): the dispose/unregister lifecycle store + the reliable writer/reader proxy still key by
+  SN/EntityId, so two same-EntityId writers still alias in the dispose + ACKNACK/repair paths.
+- 133 green SBCL+Clasp; gate-types+gate-hotpath green.

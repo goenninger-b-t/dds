@@ -5,6 +5,9 @@
 // difference is absorbed by type coercion; see ../common/ShapeType.idl).
 //
 // Usage: ./shapes_pub [domain=0] [color=BLUE] [shapesize=30]
+// Env: SHAPESIZE overrides the shapesize (distinguishes two writers of one instance);
+//      OWNERSHIP_STRENGTH (off by default) makes the writer EXCLUSIVE with that strength
+//      (the EXCLUSIVE-ownership arbitration interop oracle, DDS 1.4 §2.2.3.9.2).
 
 #include <iostream>
 #include <string>
@@ -24,7 +27,9 @@ int main(int argc, char **argv)
 
     const int   domain    = (argc > 1) ? std::atoi(argv[1]) : 0;
     const std::string color = (argc > 2) ? argv[2] : "BLUE";
-    const int   shapesize = (argc > 3) ? std::atoi(argv[3]) : 30;
+    const char* szenv     = std::getenv("SHAPESIZE");
+    const int   shapesize = szenv ? std::atoi(szenv) : ((argc > 3) ? std::atoi(argv[3]) : 30);
+    const char* osenv     = std::getenv("OWNERSHIP_STRENGTH");
 
     dds::domain::DomainParticipant participant(domain);
     dds::topic::Topic<ShapeType> topic(participant, "Square");
@@ -32,10 +37,16 @@ int main(int argc, char **argv)
     dds::pub::Publisher publisher(participant);
     dds::pub::qos::DataWriterQos qos = publisher.default_datawriter_qos();
     qos << dds::core::policy::Reliability::Reliable();
+    if (osenv) {
+        qos << dds::core::policy::Ownership::Exclusive();
+        qos << dds::core::policy::OwnershipStrength(std::atoi(osenv));
+    }
     dds::pub::DataWriter<ShapeType> writer(publisher, topic, qos);
 
     std::cout << "[connext-pub] Square/" << topic.type_name() << " color=" << color
-              << " domain=" << domain << " (reliable). Ctrl-C to stop.\n";
+              << " size=" << shapesize << " domain=" << domain
+              << (osenv ? std::string(" EXCLUSIVE strength=") + osenv : " (shared)")
+              << " (reliable). Ctrl-C to stop.\n";
 
     ShapeType sample;
     sample.color(color);

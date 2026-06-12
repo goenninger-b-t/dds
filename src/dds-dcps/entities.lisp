@@ -84,7 +84,7 @@
    (cache :initform '() :accessor dr-cache)                       ; list of cached-sample
    (instances :initform (make-hash-table :test 'equalp) :accessor dr-instances) ; handle -> accessed-p
    (instance-recs :initform (make-hash-table :test 'equalp) :accessor dr-instance-recs) ; handle -> instance-rec (DDS 1.4 §2.2.2.5.1.3)
-   (drained :initform 0 :accessor dr-drained)                    ; highest engine SN drained
+   (drained :initform (make-hash-table :test 'equalp) :accessor dr-drained) ; 16-octet source GUID -> highest engine SN drained for that writer (§8.3.5.4: SN is per-writer)
    (lifecycle-drained :initform '() :accessor dr-lifecycle-drained) ; engine lifecycle SNs already consumed (user thread)
    (sub-matched :initform (make-subscription-matched-status) :accessor dr-sub-matched)
    (req-incompat :initform (make-requested-incompatible-qos-status) :accessor dr-req-incompat)
@@ -662,23 +662,32 @@
     (let ((x (aref a i)) (y (aref b i)))
       (cond ((> x y) (return t)) ((< x y) (return nil))))))
 
-(defun* %arbitrate-owner (dr node sn handle)
-    (function (data-reader t integer (simple-array (unsigned-byte 8) (16))) boolean)
-  "EXCLUSIVE-ownership arbitration for the sample at SN on instance HANDLE (DDS 1.4 §2.2.3.9.2):
+(defun* %arbitrate-owner (dr node key handle)
+    (function (data-reader t cons (simple-array (unsigned-byte 8) (16)))
+              (member :deliver :drop-loser :drop-unmatched))
+  "EXCLUSIVE-ownership arbitration for the sample at composite KEY on instance HANDLE (DDS 1.4 §2.2.3.9.2):
    resolve the sample's FULL source GUID -> the writer's (kind strength) from the matches table, then
-   decide DELIVER (T) vs DROP (NIL). DELIVER and (re)claim ownership when the instance has no current
-   owner, the writer's strength exceeds the owner's, the source IS the current owner, or it ties the
-   owner's strength with a higher GUID (the consistent tie-break). DROP a strictly-lower-strength or
-   losing-tie writer's sample. A sample whose source GUID is unknown (not yet/no longer matched) is
-   delivered (fail-open: never false-REJECT data we cannot arbitrate). Owner state lives on the
-   instance-rec (lazy recompute: a vanished owner is cleared elsewhere, the next sample reclaims)."
-  (let ((guid (dds.disc:node-sample-writer-guid node sn))
+   return a verdict — :DELIVER, :DROP-LOSER, or :DROP-UNMATCHED. :DELIVER and (re)claim ownership when
+   the instance has no current owner, the writer's strength exceeds the owner's, the source IS the
+   current owner, or it ties the owner's strength with a higher GUID (the consistent tie-break).
+   :DROP-LOSER for a strictly-lower-strength or losing-tie writer whose owner IS resolved — that sample
+   is correctly gone, so the caller advances the drain watermark. :DROP-UNMATCHED when the source GUID
+   is identified but NOT (yet) in the matches table (its SEDP has not arrived): it cannot own the
+   instance YET, so the sample is dropped THIS pass, but the caller must NOT advance the watermark —
+   the strength is unresolved, and once the SEDP match arrives a later drain re-evaluates it (the
+   reliable engine already ACKed it, so leaving it pending is the only non-lossy choice; never let an
+   as-yet-unmatched writer's sample reach the cache and claim ownership ahead of the SEDP). A sample
+   with NO recorded source GUID at all (writer unidentifiable) is :DELIVERed (fail-open: never
+   false-REJECT data we cannot even attribute). Owner state lives on the instance-rec (lazy recompute:
+   a vanished owner is cleared elsewhere, the next sample reclaims)."
+  (let ((guid (dds.disc:node-sample-writer-guid node key))
         (rec (%reader-instance-rec dr handle)))
     (if (null guid)
-        t                                ; unarbitrable source -> fail-open deliver
+        :deliver                          ; unidentifiable source -> fail-open deliver
         (multiple-value-bind (kind strength) (dds.disc:matched-writer-ownership node guid)
           (declare (ignore kind))
-          (when (null strength) (setf strength 0))
+          (if (null strength)
+              :drop-unmatched             ; identified but not (yet) matched -> drop, keep pending
           (let ((owner (instance-rec-owner-guid rec)))
             (cond
               ((or (null owner) (equalp guid owner)
@@ -686,8 +695,8 @@
                    (and (= strength (instance-rec-owner-strength rec)) (%guid> guid owner)))
                (setf (instance-rec-owner-guid rec) (copy-seq guid)
                      (instance-rec-owner-strength rec) strength)
-               t)
-              (t nil)))))))
+               :deliver)
+              (t :drop-loser))))))))
 
 (defun* %clear-owner-on-vanish (dr guid)
     (function (data-reader (simple-array (unsigned-byte 8) (16))) t)
@@ -702,37 +711,50 @@
            (dr-instance-recs dr))
   t)
 
-(defun* %drain-one-sample (dr node ts sn)
-    (function (data-reader t t integer) t)
-  "Apply ONE pending data sample at sequence number SN: mark SN consumed (exactly-once via the
-   dr-drained high-water mark — data SNs are visited in ascending order so the mark is monotone),
-   deserialize, drop it on a ContentFilteredTopic miss, reject it on RESOURCE_LIMITS (SAMPLE_REJECTED),
-   DROP it on a lost EXCLUSIVE-ownership arbitration (DDS 1.4 §2.2.3.9.2 — only the highest-strength
-   owner's samples reach the cache; a dropped writer is still registered in the writers-set so
-   liveliness/no-writers tracks it, but its data is neither delivered nor used to revive the instance),
-   else REVIVE its instance to ALIVE and register its writer (DDS 1.4 §2.2.2.5.1.3: a
-   NOT_ALIVE_DISPOSED->ALIVE or NOT_ALIVE_NO_WRITERS->ALIVE transition bumps the matching generation
-   count, §2.2.2.5.1.5) and append a fresh NOT_READ SampleInfo carrying the instance's current
-   instance_state + generation counts."
-  (setf (dr-drained dr) sn)
-  (let ((bytes (dds.disc:node-sample node sn)))
+(defun* %drain-one-sample (dr node ts key)
+    (function (data-reader t t cons) t)
+  "Apply ONE pending data sample at composite (GUID . SN) KEY: deserialize, drop it on a
+   ContentFilteredTopic miss, reject it on RESOURCE_LIMITS (SAMPLE_REJECTED), DROP it on a lost
+   EXCLUSIVE-ownership arbitration (DDS 1.4 §2.2.3.9.2 — only the highest-strength owner's samples reach
+   the cache; a dropped writer is still registered in the writers-set so liveliness/no-writers tracks
+   it, but its data is neither delivered nor used to revive the instance), else REVIVE its instance to
+   ALIVE and register its writer (DDS 1.4 §2.2.2.5.1.3: a NOT_ALIVE_DISPOSED->ALIVE or
+   NOT_ALIVE_NO_WRITERS->ALIVE transition bumps the matching generation count, §2.2.2.5.1.5) and append
+   a fresh NOT_READ SampleInfo carrying the instance's current instance_state + generation counts. The
+   sample is marked consumed (exactly-once via the PER-WRITER dr-drained high-water — each writer GUID
+   has its own monotone SN mark, §8.3.5.4: an SN is unique only within one writer, so two writers
+   sharing EntityId 0x102 must not share a high-water) for EVERY outcome EXCEPT a :DROP-UNMATCHED
+   EXCLUSIVE verdict: that sample is from an identified-but-not-yet-SEDP-matched writer whose strength
+   is unresolved (DDS 1.4 §2.2.3.9.2), so the watermark is LEFT PENDING — the reliable engine already
+   ACKed it and will never retransmit, so advancing the watermark would lose it permanently; a later
+   drain re-evaluates it once the match completes and the strength is known."
+  (let ((sguid (dds.disc:node-sample-writer-guid node key))
+        (sn (dds.disc:node-sample-key-sn key))
+        (advance t))                       ; advance the per-writer watermark unless arbitration keeps it pending
+  (let ((bytes (dds.disc:node-sample node key)))
     (when bytes
       (let ((data (%deserialize-sample ts bytes)))
         ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
         (when (or (null (dr-filter dr)) (funcall (dr-filter dr) data))
           (let* ((handle (%instance-handle ts data))
-                 (reason (%resource-reject-reason dr handle)))
+                 (reason (%resource-reject-reason dr handle))
+                 (verdict (if (and (null reason) (%reader-exclusive-p dr))
+                              (%arbitrate-owner dr node key handle)
+                              :deliver)))
             (cond
               (reason
                ;; RESOURCE_LIMITS would be exceeded -> reject (SAMPLE_REJECTED).
                (%reader-sample-rejected dr reason handle))
-              ((and (%reader-exclusive-p dr) (not (%arbitrate-owner dr node sn handle)))
-               ;; Lost EXCLUSIVE arbitration -> DROP the data, but still register the writer.
-               (let ((wid (dds.disc:node-sample-writer node sn)) (rec (%reader-instance-rec dr handle)))
+              ((eq verdict :drop-unmatched)
+               ;; Source writer identified but not yet SEDP-matched -> keep pending, do NOT advance.
+               (setf advance nil))
+              ((eq verdict :drop-loser)
+               ;; Lost EXCLUSIVE arbitration (owner resolved) -> DROP the data, but still register the writer.
+               (let ((wid (dds.disc:node-sample-writer node key)) (rec (%reader-instance-rec dr handle)))
                  (when (and wid (not (member wid (instance-rec-writers rec))))
                    (push wid (instance-rec-writers rec)))))
               (t
-                (let ((rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node sn))))
+                (let ((rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node key))))
                   (setf (dr-cache dr)
                         (nconc (dr-cache dr)
                                (list (make-cached-sample
@@ -743,6 +765,8 @@
                                              :instance-handle handle :sequence-number sn
                                              :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                              :no-writers-generation-count (instance-rec-no-writers-gen-count rec))))))))))))))
+    (when (and sguid advance)
+      (setf (gethash sguid (dr-drained dr)) (max sn (gethash sguid (dr-drained dr) 0)))))
   t)
 
 (defun* %drain (dr)
@@ -760,16 +784,22 @@
    instance-recs are never mutated off-thread (S2)."
   (let* ((node (dp-node (sub-participant (dr-subscriber dr))))
          (ts (topic-type-support (dr-topic dr)))
-         (data-sns (remove-if-not (lambda (sn) (> sn (dr-drained dr)))
-                                  (dds.disc:node-sample-sns node)))
+         (data-keys (remove-if-not
+                     (lambda (key)
+                       (let ((g (dds.disc:node-sample-writer-guid node key)))
+                         (or (null g)
+                             (> (dds.disc:node-sample-key-sn key) (gethash g (dr-drained dr) 0)))))
+                     (dds.disc:node-sample-sns node)))
          (life-sns (set-difference (dds.disc:node-lifecycle-sns node) (dr-lifecycle-drained dr)))
-         (pending (sort (nconc (mapcar (lambda (sn) (cons sn :data)) data-sns)
-                               (mapcar (lambda (sn) (cons sn :lifecycle)) life-sns))
+         ;; Order by raw RTPS SN (extracted from the composite data key; lifecycle is already an SN) so a
+         ;; dispose/revive from one writer still lands in §2.2.2.5 SN order (§8.3.5.4: SN is per-writer).
+         (pending (sort (nconc (mapcar (lambda (key) (list (dds.disc:node-sample-key-sn key) :data key)) data-keys)
+                               (mapcar (lambda (sn) (list sn :lifecycle sn)) life-sns))
                         #'< :key #'car)))
     (dolist (entry pending)
-      (ecase (cdr entry)
-        (:data (%drain-one-sample dr node ts (car entry)))
-        (:lifecycle (%drain-one-lifecycle dr node (car entry)))))
+      (ecase (second entry)
+        (:data (%drain-one-sample dr node ts (third entry)))
+        (:lifecycle (%drain-one-lifecycle dr node (third entry)))))
     t))
 
 (defun* %where-any (sample)

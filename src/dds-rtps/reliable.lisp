@@ -147,7 +147,10 @@
 
 (defun* get-writer-proxy (reader writer-id)
     (function (rtps-reader (unsigned-byte 32)) writer-proxy)
-  "The WriterProxy for WRITER-ID, created on first use."
+  "The WriterProxy for WRITER-ID, created on first use. KNOWN FOLLOW-UP: keyed by EntityId only, so two
+   writers sharing 0x102 on different participants alias here in the ACKNACK/REPAIR path (RTPS 2.5
+   §8.3.5.4: SN is unique only within one writer GUID) — the data-delivery aliasing fixed in the data
+   plane; full 16-octet GUID keying is the reliable-engine TODO."
   (or (gethash writer-id (rtps-reader-proxies reader))
       (setf (gethash writer-id (rtps-reader-proxies reader)) (make-writer-proxy))))
 

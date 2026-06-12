@@ -267,6 +267,10 @@
     (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn
                                       (make-array 0 :element-type '(unsigned-byte 8)))
     (dds.pal:with-lock ((disc-node-lock node))
+      ;; KNOWN FOLLOW-UP: this lifecycle store is keyed by raw SN only, so two writers sharing
+      ;; EntityId 0x102 on different participants still alias here (RTPS 2.5 §8.3.5.4: SN is unique
+      ;; only within one writer GUID) — the same aliasing just fixed for data delivery. Does not affect
+      ;; single-writer or EXCLUSIVE data delivery; 2-level (GUID -> SN) keying is the dispose-path TODO.
       (setf (gethash sn (disc-node-lifecycle-changes node))
             (list kind key-hash status-flags writer-id (%source-guid src-prefix writer-id))))
     (when (disc-node-on-lifecycle-event node)
@@ -298,17 +302,29 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for k being the hash-keys of (disc-node-lifecycle-changes node) collect k)))
 
+(defun* %inner-table (outer guid)
+    (function (hash-table (simple-array (unsigned-byte 8) (16))) hash-table)
+  "The per-writer inner SN->value table for 16-octet GUID in OUTER, created on first use (RTPS 2.5
+   §8.3.5.4: a SequenceNumber is unique only within one writer GUID, so each writer GUID owns an
+   independent eql-keyed SN map; no per-sample composite-key allocation)."
+  (or (gethash guid outer)
+      (setf (gethash (copy-seq guid) outer) (make-hash-table :test 'eql))))
+
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
               (simple-array (unsigned-byte 8) (12))) t)
-  "Feed a complete user sample VEC (SN from WRITER-ID at SRC-PREFIX) to the reliable reader, record
-   it by SN (payload + writer EntityId for the S2 writers-set + full source GUID for S1 EXCLUSIVE
-   ownership arbitration), then fire ON-SAMPLE outside the node lock (DATA_AVAILABLE + WaitSet wake)."
+  "Feed a complete user sample VEC (SN from WRITER-ID at SRC-PREFIX) to the reliable reader, record it
+   under the 2-level (source-GUID -> SN) store (payload + writer EntityId for the S2 writers-set + full
+   source GUID for S1 EXCLUSIVE ownership arbitration), then fire ON-SAMPLE outside the node lock
+   (DATA_AVAILABLE + WaitSet wake). Two-level keying by GUID then SN avoids a per-sample composite-key
+   alloc (NFR-MEM) and stops two writers sharing EntityId 0x102 from aliasing in the SN space
+   (§8.3.5.4); ONE %source-guid per sample is reused across the three inner tables."
   (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn vec)
-  (dds.pal:with-lock ((disc-node-lock node))
-    (setf (gethash sn (disc-node-samples node)) vec
-          (gethash sn (disc-node-sample-writers node)) writer-id
-          (gethash sn (disc-node-sample-writer-guids node)) (%source-guid src-prefix writer-id)))
+  (let ((guid (%source-guid src-prefix writer-id)))
+    (dds.pal:with-lock ((disc-node-lock node))
+      (setf (gethash sn (%inner-table (disc-node-samples node) guid)) vec
+            (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
+            (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)))
   (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))
   t)
 
@@ -443,39 +459,66 @@
 
 (defun* node-sample-count (node)
     (function (disc-node) (integer 0))
-  "Number of distinct user samples the subscriber has received."
+  "Number of distinct user samples the subscriber has received (summed over every writer's inner
+   SN map)."
   (dds.pal:with-lock ((disc-node-lock node))
-    (hash-table-count (disc-node-samples node))))
+    (let ((n 0))
+      (maphash (lambda (g inner) (declare (ignore g)) (incf n (hash-table-count inner)))
+               (disc-node-samples node))
+      n)))
 
-(defun* node-sample (node sn)
-    (function (disc-node integer) t)
-  "The received payload for sequence number SN, or NIL."
+(defun* node-sample-key-sn (key)
+    (function (cons) integer)
+  "Recover the raw RTPS SequenceNumber from a (GUID . SN) composite sample KEY (§8.3.5.4)."
+  (cdr key))
+
+(defun* node-sample (node key)
+    (function (disc-node cons) t)
+  "The received payload for composite sample KEY (a (GUID . SN) cons, see node-sample-sns), or NIL."
   (dds.pal:with-lock ((disc-node-lock node))
-    (gethash sn (disc-node-samples node))))
+    (let ((inner (gethash (car key) (disc-node-samples node))))
+      (and inner (gethash (cdr key) inner)))))
+
+(defun* node-sample-by-sn (node sn)
+    (function (disc-node integer) t)
+  "The payload of ANY received user sample whose RTPS SN equals SN, or NIL. A single-writer convenience
+   (the sample store is keyed by GUID then SN, §8.3.5.4) — for tests/diagnostics that know only the SN."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (loop for inner being the hash-values of (disc-node-samples node)
+          thereis (gethash sn inner))))
 
 (defun* node-sample-sns (node)
     (function (disc-node) list)
-  "Sequence numbers of the user samples received so far (unordered). Lets a
-   subscriber drain new samples without assuming SNs start at 1 (Connext may not)."
+  "Composite (GUID . SN) cons keys of the user samples received so far (unordered). Lets a subscriber
+   drain new samples per writer without assuming SNs start at 1 (Connext may not) and without aliasing
+   two writers that share EntityId 0x102 (§8.3.5.4). The cons is built here on the user thread, not on
+   the per-sample receive path (NFR-MEM)."
   (dds.pal:with-lock ((disc-node-lock node))
-    (loop for k being the hash-keys of (disc-node-samples node) collect k)))
+    (let ((keys '()))
+      (maphash (lambda (guid inner)
+                 (loop for sn being the hash-keys of inner do (push (cons guid sn) keys)))
+               (disc-node-samples node))
+      keys)))
 
-(defun* node-sample-writer (node sn)
-    (function (disc-node integer) t)
-  "The remote writer EntityId that wrote the user sample at sequence number SN, or NIL.
+(defun* node-sample-writer (node key)
+    (function (disc-node cons) t)
+  "The remote writer EntityId that wrote the user sample at composite KEY (a (GUID . SN) cons), or NIL.
    Lets the DCPS reader register which writer keeps an instance alive (the writers-set,
    DDS 1.4 §2.2.2.5.1.3) so a writer vanishing can transition the instance NOT_ALIVE_NO_WRITERS."
   (dds.pal:with-lock ((disc-node-lock node))
-    (gethash sn (disc-node-sample-writers node))))
+    (let ((inner (gethash (car key) (disc-node-sample-writers node))))
+      (and inner (gethash (cdr key) inner)))))
 
-(defun* node-sample-writer-guid (node sn)
-    (function (disc-node integer) t)
+(defun* node-sample-writer-guid (node key)
+    (function (disc-node cons) t)
   "The FULL 16-octet source GUID (RTPS-header prefix + DATA writer EntityId, §9.3.1.2) that wrote the
-   user sample at sequence number SN, or NIL. The key for EXCLUSIVE ownership arbitration (DDS 1.4
-   §2.2.3.9.2): two writers on different participants share an EntityId, so the GUID — not the
-   EntityId — distinguishes them when selecting the highest-strength owner of an instance."
+   user sample at composite KEY (a (GUID . SN) cons), or NIL. The key for EXCLUSIVE ownership
+   arbitration (DDS 1.4 §2.2.3.9.2): two writers on different participants share an EntityId, so the
+   GUID — not the EntityId — distinguishes them when selecting the highest-strength owner of an
+   instance."
   (dds.pal:with-lock ((disc-node-lock node))
-    (gethash sn (disc-node-sample-writer-guids node))))
+    (let ((inner (gethash (car key) (disc-node-sample-writer-guids node))))
+      (and inner (gethash (cdr key) inner)))))
 
 (defun* matched-writer-ownership (node guid)
     (function (disc-node (simple-array (unsigned-byte 8) (16))) (values t t))
@@ -553,7 +596,7 @@
            (loop repeat 150 until (plusp (node-sample-count node2)) do (sleep 0.02))
            (assert (plusp (node-sample-count node2)) ()
                    "subscriber never received the sample over UDP")
-           (assert (equalp (node-sample node2 1) payload) ()
+           (assert (equalp (node-sample-by-sn node2 1) payload) ()
                    "subscriber received the wrong payload bytes")
            t)
       (stop-node node1)
@@ -606,7 +649,7 @@
                    () "endpoints did not match before publish")
            (publish-sample node1 payload)              ; SN 1 = ALIVE sample
            (loop repeat 150 until (plusp (node-sample-count node2)) do (sleep 0.02))
-           (assert (equalp (node-sample node2 1) payload) () "subscriber missed the ALIVE sample")
+           (assert (equalp (node-sample-by-sn node2 1) payload) () "subscriber missed the ALIVE sample")
            (dispose-instance node1 kh)                 ; SN 2 = dispose DATA
            (loop repeat 150 until (node-lifecycle-change node2 2) do (sleep 0.02))
            (let ((lc (node-lifecycle-change node2 2)))
@@ -736,7 +779,7 @@
            (loop repeat 150 until (plusp (node-sample-count node2)) do (sleep 0.02))
            (assert (plusp (node-sample-count node2)) ()
                    "subscriber never received the fragmented sample over UDP")
-           (assert (equalp (node-sample node2 1) payload) ()
+           (assert (equalp (node-sample-by-sn node2 1) payload) ()
                    "subscriber received the wrong reassembled payload bytes")
            t)
       (stop-node node1)
@@ -799,7 +842,7 @@
                  do (announce-endpoints node1) (sleep 0.02))
            (assert (plusp (node-sample-count node2)) ()
                    "lost final sample never recovered via the periodic HEARTBEAT")
-           (assert (equalp (node-sample node2 1) payload) ()
+           (assert (equalp (node-sample-by-sn node2 1) payload) ()
                    "recovered sample has the wrong payload bytes")
            t)
       (setf *debug-drop-sample-numbers* nil)

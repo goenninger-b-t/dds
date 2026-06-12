@@ -29,7 +29,7 @@
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:publish-sample #:node-sample-count #:node-sample #:node-sample-sns
-           #:node-sample-writer #:node-sample-writer-guid #:matched-writer-ownership
+           #:node-sample-writer #:node-sample-writer-guid #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
            #:dispose-instance #:unregister-instance
            #:node-lifecycle-change #:node-lifecycle-count #:node-lifecycle-sns
            #:*debug-drop-fragment-numbers*
