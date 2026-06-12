@@ -210,6 +210,56 @@
       (dds.dcps:delete-participant p2))
     t))
 
+;;; No-key DCPS round-trip (FR-RTPS S0): a keyless type's DataWriter/DataReader come
+;;; up NO_KEY (writer 0x03/id 0x103, reader 0x04/id 0x104) — selected by DCPS from the
+;;; type's keyed-ness — discover, match same-kind, and deliver a sample end to end.
+
+(dds.gen:define-dds-type nokey-rt (:extensibility :final)
+  (a :i32)
+  (b :i32))
+
+(defun* run-nokey-roundtrip-test ()
+    (function () t)
+  "A no-key type round-trips through DCPS: create-datawriter/datareader select the
+   NO_KEY endpoint kind from the keyless nokey-rt type (writer id 0x103, reader id
+   0x104), the endpoints discover + match same-kind, and a sample {a=7 b=9} survives
+   write/take. Proves DCPS threads the type's keyed-ness into the endpoint kind."
+  (let* ((ts (dds.types:find-type-support "nokey-rt"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "NoKeyTopic" "nokey-rt" ts))
+                (tr (dds.dcps:create-topic p2 "NoKeyTopic" "nokey-rt" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr)))
+           (%check :nokey-writer-id
+                   (= #x00000103 (dds.disc:disc-node-user-writer-id (dds.dcps::dp-node p1)))
+                   "no-key DataWriter must come up with data-plane writer id 0x103")
+           (%check :nokey-reader-id
+                   (= #x00000104 (dds.disc:disc-node-user-reader-id (dds.dcps::dp-node p2)))
+                   "no-key DataReader must come up with data-plane reader id 0x104")
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1))
+                            (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :nokey-matched (plusp (dds.dcps:matched-count p1))
+                   "no-key DataWriter/DataReader did not match via DCPS")
+           (dds.dcps:write-sample dw (make-nokey-rt :a 7 :b 9))
+           (let ((got nil))
+             (loop repeat 150 until got
+                   do (let ((s (dds.dcps:take-samples dr)))
+                        (when s (setf got (dds.dcps:cached-sample-data (first s)))))
+                      (sleep 0.02))
+             (%check :nokey-take (and got t) "DataReader::take returned no no-key sample")
+             (%check :nokey-fields
+                     (and (= 7 (nokey-rt-a got)) (= 9 (nokey-rt-b got)))
+                     "no-key sample fields did not survive write/take")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
 ;;; Instance lifecycle + read/take + SampleInfo (M3 #2, FR-DCPS-4). Uses the keyed
 ;;; shape-type (key = color): two colors -> two instances; read is non-destructive +
 ;;; marks samples READ + transitions per-instance view-state NEW->NOT_NEW; take removes.

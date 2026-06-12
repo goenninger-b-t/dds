@@ -325,6 +325,7 @@
                  ("typed-shape-over-udp"     . run-typed-dataplane-test)
                  ("qos-rxo-truth-table"      . dds.qos:run-qos-rxo-test)
                  ("dcps-entity-write-take"   . run-dcps-entity-test)
+                 ("nokey-roundtrip"          . run-nokey-roundtrip-test)
                  ("dcps-instance-read-take"  . run-dcps-instance-test)
                  ("dcps-rxo-blocks-match"    . run-dcps-rxo-test)
                  ("dcps-conditions-waitset"  . run-dcps-waitset-test)

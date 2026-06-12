@@ -259,12 +259,22 @@
         (and ts (dds.types:serialize-type-information (dds.types:type-support-typeobject ts))))
     (error () nil)))
 
+(defun* %topic-keyed-p (topic)
+    (function (t) boolean)
+  "Whether TOPIC's type is keyed (selects WITH_KEY vs NO_KEY endpoint kinds);
+   defaults to T (back-compat) when the type-support is absent. TOPIC may be a
+   Topic or a ContentFilteredTopic (both answer topic-type-support)."
+  (let ((ts (topic-type-support topic)))
+    (if ts (dds.types:type-support-keyed-p ts) t)))
+
 (defun* create-datawriter (pub topic &key (qos (dds.qos:make-writer-qos)))
     (function (publisher topic &key (:qos t)) data-writer)
   "Publisher::create_datawriter — register a local writer in the engine on the
-   topic's name/type with the QoS reliability (v1: the single user writer)."
+   topic's name/type with the QoS reliability (v1: the single user writer); the
+   endpoint kind (WITH_KEY/NO_KEY) is selected from the topic type's keyed-ness."
   (let ((node (dp-node (pub-participant pub))))
     (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
+                               :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))
     (dds.disc:enable-publisher node)
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
@@ -277,9 +287,11 @@
   "Subscriber::create_datareader — register a local reader in the engine on the
    topic's name/type with the QoS reliability (v1: the single user reader). TOPIC may
    be a Topic or a ContentFilteredTopic; in the latter case the reader applies the
-   filter predicate reader-side (only matching samples reach read/take)."
+   filter predicate reader-side (only matching samples reach read/take). The
+   endpoint kind (WITH_KEY/NO_KEY) is selected from the topic type's keyed-ness."
   (let ((node (dp-node (sub-participant sub))))
     (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
+                               :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))
     (dds.disc:enable-subscriber node)
     (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos :enabled t)))

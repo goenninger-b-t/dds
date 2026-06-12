@@ -25,8 +25,8 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:create-publisher` (`p`) | Create an enabled `publisher` (DataWriter factory) in `p`. |
 | `dds.dcps:create-subscriber` (`p`) | Create an enabled `subscriber` (DataReader factory) in `p`. |
 | `dds.dcps:create-topic` (`p name type-name type-support`) | Bind a topic `name` + `type-name` to a registered `type-support` (the generated codec bundle). |
-| `dds.dcps:create-datawriter` (`pub topic &key qos`) | Register the local writer in the engine on the topic's name/type with `qos` (v1: the single user writer). |
-| `dds.dcps:create-datareader` (`sub topic &key qos`) | Register the local reader (v1: the single user reader). `topic` may be a `topic` or a `content-filtered-topic`. |
+| `dds.dcps:create-datawriter` (`pub topic &key qos`) | Register the local writer in the engine on the topic's name/type with `qos` (v1: the single user writer). The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. |
+| `dds.dcps:create-datareader` (`sub topic &key qos`) | Register the local reader (v1: the single user reader). `topic` may be a `topic` or a `content-filtered-topic`. The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. |
 | `dds.dcps:spin` (`p`) | Drive **one** discovery announcement cycle (SPDP + SEDP) for `p`. Caller-driven in v1. |
 | `dds.dcps:discovered-count` (`p`) | Number of remote participants `p` has discovered. |
 | `dds.dcps:matched-count` (`p`) | Number of remote endpoints matched against `p`'s local endpoints. |
