@@ -367,6 +367,7 @@
                  ("rtps-participant-message" . run-participant-message-codec-test)
                  ("rtps-history-cache"       . run-history-test)
                  ("rtps-reliable-delivery"   . run-reliability-test)
+                 ("rtps-writer-pushonce"     . run-writer-pushonce-test)
                  ("rtps-gap-handling"        . run-gap-handling-test)
                  ("property-based"           . run-pbt-tests)
                  ("udp-loopback"             . run-udp-loopback-test)

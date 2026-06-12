@@ -80,7 +80,7 @@
     WriterProxy, changes-for-reader, HEARTBEAT/ACKNACK/GAP-driven retransmit and
     reordering. Verified by a lossy/reorder/dup fault-injection suite (NFR-TEST).")
   (:export #:rtps-writer #:make-rtps-writer #:writer-write #:writer-heartbeat
-           #:writer-data-list #:writer-on-acknack #:get-reader-proxy
+           #:writer-data-list #:writer-unsent-list #:writer-on-acknack #:get-reader-proxy
            #:reader-proxy #:reader-proxy-acked-base
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
            #:reader-acknack #:reader-on-gap #:reader-complete-p

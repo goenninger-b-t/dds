@@ -502,6 +502,51 @@
                 "reader complete after GAP(1..3) + DATA(4,5)")))
     t))
 
+;;; Send-once writer push: the writer pushes UNSENT changes once (RTPS 2.5 §8.4.2.2,
+;;; next_unsent_change / unsent_changes) and repairs ONLY requested_changes on ACKNACK.
+;;; Regression for the O(N^2) DATA storm where the whole unacked history was re-pushed
+;;; on every write; the ACKNACK-driven repair path is independent of unsent-base.
+
+(defun* run-writer-pushonce-test ()
+    (function () t)
+  "Test: writer-unsent-list pushes each change exactly once (RTPS 2.5 §8.4.2.2); the
+   total DATA pushed over N pre-ACKNACK writes is N (send-once), not N(N+1)/2; and the
+   ACKNACK repair path (writer-on-acknack) still resends exactly the NACKed SNs."
+  (flet ((mk-writer ()
+           (dds.rtps.reliable:make-rtps-writer
+            :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (pl (k) (map '(simple-array (unsigned-byte 8) (*)) #'char-code (format nil "m~d" k))))
+    (let ((rid 2))
+      ;; (a) send-once: sum of unsent-list lengths over 100 writes = 100 (each change once)
+      (let ((w (mk-writer)) (sum 0))
+        (dotimes (k 100)
+          (dds.rtps.reliable:writer-write w (pl (1+ k)))
+          (incf sum (length (dds.rtps.reliable:writer-unsent-list w rid))))
+        (%check :pushonce-sent-once (= sum 100)
+                "writer-unsent-list must push each of 100 changes exactly once (sum=100)")
+        ;; (c) repair-intact: unsent-base is now 101; an ACKNACK NACKing {3,50} resends exactly those
+        (let ((base 3) (numbits 48)
+              (bitmap (make-array 2 :element-type '(unsigned-byte 32) :initial-element 0)))
+          (dds.rtps.message:seqnum-set-bit bitmap 0)    ; SN 3 (delta 0)
+          (dds.rtps.message:seqnum-set-bit bitmap 47)   ; SN 50 (delta 47)
+          (multiple-value-bind (resends gaps)
+              (dds.rtps.reliable:writer-on-acknack w rid base numbits bitmap)
+            (declare (ignore gaps))
+            (%check :pushonce-repair-sns (equal '(3 50) (mapcar #'car resends))
+                    "ACKNACK repair resends exactly the NACKed SNs {3,50}, independent of unsent-base")
+            (%check :pushonce-repair-payloads
+                    (and (equalp (cdr (first resends)) (pl 3))
+                         (equalp (cdr (second resends)) (pl 50)))
+                    "ACKNACK repair resends the {3,50} payloads byte-exact"))))
+      ;; (b) before-baseline: writer-data-list (whole unacked history) sums to 5050 = N(N+1)/2
+      (let ((w (mk-writer)) (sum 0))
+        (dotimes (k 100)
+          (dds.rtps.reliable:writer-write w (pl (1+ k)))
+          (incf sum (length (dds.rtps.reliable:writer-data-list w rid))))
+        (%check :pushonce-before-baseline (= sum 5050)
+                "writer-data-list (unchanged) re-collects the whole unacked history: sum=5050"))))
+  t)
+
 ;;; HEARTBEAT / ACKNACK / GAP submessage round-trips (RTPS 2.5 §9.4.5.7/.3/.6).
 ;;; Writes a complete submessage, re-reads the SubmessageHeader, then the body.
 

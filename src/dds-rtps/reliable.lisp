@@ -17,9 +17,14 @@
 ;;; ---- Writer side (§8.4.2): one ReaderProxy per matched reader ----
 
 (defstruct* (reader-proxy (:constructor make-reader-proxy))
-  "Writer-side proxy for one matched reader (RTPS 2.5 §8.4.2). ACKED-BASE is the
-   reader's acknowledged watermark: it has acknowledged all SN < acked-base."
-  (acked-base 1 :type integer))            ; reader has acknowledged all SN < acked-base
+  "Writer-side proxy for one matched reader (RTPS 2.5 §8.4.2). Two distinct
+   watermarks (RTPS 2.5 §8.4.2.2): ACKED-BASE is the reader's ACKNOWLEDGED watermark
+   (it has acknowledged all SN < acked-base; advanced only by ACKNACK); UNSENT-BASE
+   is the UNSENT watermark = 1 + highestSentChangeSN (next_unsent_change pushes the
+   change at UNSENT-BASE once, then advances it). Push pacing keys off UNSENT-BASE;
+   ACKNACK-driven repair (requested_changes) is independent of it."
+  (acked-base 1 :type integer)             ; reader has acknowledged all SN < acked-base
+  (unsent-base 1 :type integer))           ; 1 + highestSentChangeSN; changes >= this are unsent
 
 (defstruct* (rtps-writer (:constructor make-rtps-writer))
   "Stateful reliable RTPS writer (RTPS 2.5 §8.4.2): a HistoryCache, the last SN
@@ -52,14 +57,31 @@
           (or (dds.rtps.history:hc-max-seq (rtps-writer-hc writer)) 0)
           (incf (rtps-writer-hb-count writer))))
 
+(defun* %changes-from (writer base)
+    (function (rtps-writer integer) list)
+  "The writer's HistoryCache changes with SN >= BASE, as (sn . payload) in SN order."
+  (loop for ch in (dds.rtps.history:hc-changes-for-reader (rtps-writer-hc writer) nil)
+        when (>= (dds.rtps.history:cache-change-sn ch) base)
+          collect (cons (dds.rtps.history:cache-change-sn ch)
+                        (dds.rtps.history:cache-change-serialized-payload ch))))
+
 (defun* writer-data-list (writer reader-id)
     (function (rtps-writer (unsigned-byte 32)) list)
   "Changes not yet acked by READER-ID, as a list of (sn . payload) in SN order."
-  (let ((base (reader-proxy-acked-base (get-reader-proxy writer reader-id))))
-    (loop for ch in (dds.rtps.history:hc-changes-for-reader (rtps-writer-hc writer) nil)
-          when (>= (dds.rtps.history:cache-change-sn ch) base)
-            collect (cons (dds.rtps.history:cache-change-sn ch)
-                          (dds.rtps.history:cache-change-serialized-payload ch)))))
+  (%changes-from writer (reader-proxy-acked-base (get-reader-proxy writer reader-id))))
+
+(defun* writer-unsent-list (writer reader-id)
+    (function (rtps-writer (unsigned-byte 32)) list)
+  "The UNSENT changes for READER-ID (next_unsent_change, RTPS 2.5 §8.4.2.2): the
+   changes with SN >= the reader's UNSENT-BASE, as (sn . payload) in SN order. On a
+   non-empty result the UNSENT-BASE watermark is advanced past the highest SN collected,
+   so each change is pushed EXACTLY ONCE in pushMode (§8.4.2.2). Lost/late changes are
+   recovered via the ACKNACK repair path (writer-on-acknack), not by re-pushing."
+  (let* ((proxy (get-reader-proxy writer reader-id))
+         (changes (%changes-from writer (reader-proxy-unsent-base proxy))))
+    (when changes
+      (setf (reader-proxy-unsent-base proxy) (1+ (car (first (last changes))))))
+    changes))
 
 (defun* writer-on-acknack (writer reader-id base numbits bitmap)
     (function (rtps-writer (unsigned-byte 32) integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) (values list list))

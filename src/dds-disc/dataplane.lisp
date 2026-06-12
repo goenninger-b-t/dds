@@ -143,11 +143,13 @@
 
 (defun* %push-data (node)
     (function (disc-node) t)
-  "Writer side: send every change not yet acked by the reader as a DATA (or DATA_FRAG series
-   for large samples) submessage, followed by a HEARTBEAT, to each peer (caller thread; uses tx-msg)."
+  "Writer side: send each UNSENT change ONCE as a DATA (or DATA_FRAG series for large samples)
+   submessage, followed by a HEARTBEAT, to each peer (pushMode, RTPS 2.5 §8.4.2.2; caller thread,
+   uses tx-msg). Lost or late changes are repaired only via the reader's ACKNACK (%on-user-acknack),
+   not by re-pushing the whole unacked history."
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
-      (let ((datas (dds.rtps.reliable:writer-data-list writer (disc-node-user-reader-id node))))
+      (let ((datas (dds.rtps.reliable:writer-unsent-list writer (disc-node-user-reader-id node))))
         (dolist (peer (%match-destinations node t))   ; DATA + HEARTBEAT -> matched readers
           (dolist (d datas)
             (%send-sample node (disc-node-tx-msg node) (car d) (cdr d) (car peer) (cdr peer)))

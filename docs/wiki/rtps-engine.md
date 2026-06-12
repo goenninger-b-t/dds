@@ -152,11 +152,12 @@ in [Discovery](discovery.md)'s data plane.
 - `dds.rtps.reliable:rtps-writer` — the struct type.
 - `dds.rtps.reliable:writer-write` *(writer payload)* — add a new change to the writer's HistoryCache; returns its sequence number.
 - `dds.rtps.reliable:writer-heartbeat` *(writer)* — return `(values firstSN lastSN count)` for a HEARTBEAT (§8.3.7.5).
-- `dds.rtps.reliable:writer-data-list` *(writer reader-id)* — changes not yet acked by `READER-ID`, as a list of `(sn . payload)` in SN order.
-- `dds.rtps.reliable:writer-on-acknack` *(writer reader-id base numbits bitmap)* — process an ACKNACK (§8.3.7.1): confirm SN < `BASE`, then for each NACKed SN return a resend if present, else a GAP. Returns `(values data-resends gap-sns)`, `data-resends` a list of `(sn . payload)`.
+- `dds.rtps.reliable:writer-unsent-list` *(writer reader-id)* — the **unsent** changes for `READER-ID` (`next_unsent_change`, §8.4.2.2): the changes with SN ≥ the reader's *unsent* watermark, as `(sn . payload)` in SN order; advances that watermark past the highest SN returned so each change is **pushed exactly once** under `pushMode`. The data plane (`%push-data`) pushes this, so N pre-ACKNACK writes emit N DATA submessages, not N(N+1)/2. Lost/late changes are repaired only via the ACKNACK path (`writer-on-acknack`).
+- `dds.rtps.reliable:writer-data-list` *(writer reader-id)* — changes not yet acked by `READER-ID` (SN ≥ the *acknowledged* watermark), as a list of `(sn . payload)` in SN order. Not used by the push path (that uses `writer-unsent-list`); retained for diagnostics/tests.
+- `dds.rtps.reliable:writer-on-acknack` *(writer reader-id base numbits bitmap)* — process an ACKNACK (§8.3.7.1): confirm SN < `BASE`, then for each NACKed SN return a resend if present, else a GAP. Returns `(values data-resends gap-sns)`, `data-resends` a list of `(sn . payload)`. The `requested_changes` repair path; independent of the unsent watermark.
 - `dds.rtps.reliable:get-reader-proxy` *(writer reader-id)* — the `ReaderProxy` for `READER-ID`, created on first use.
 - `dds.rtps.reliable:reader-proxy` — the struct type (the writer-side proxy for one matched reader).
-- `dds.rtps.reliable:reader-proxy-acked-base` — the reader's acknowledged watermark (it has acknowledged all SN < acked-base).
+- `dds.rtps.reliable:reader-proxy-acked-base` — the reader's **acknowledged** watermark (it has acknowledged all SN < acked-base; advanced by ACKNACK). Distinct from the **unsent** watermark `reader-proxy-unsent-base` (= 1 + highestSentChangeSN; the send-once push watermark, §8.4.2.2).
 
 ### Reliable reader (`dds.rtps.reliable`)
 
