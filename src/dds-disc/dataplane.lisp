@@ -110,18 +110,25 @@
    dropped fragment is the peer's NACK_FRAG — proving fragment-level reliability
    against a live peer (RTPS 2.5 §8.3.8.12 NackFrag). Never set in production.")
 
+(defparameter *debug-drop-sample-numbers* nil
+  "Debug-only whole-sample-loss injection (default NIL = off): a list of sequence numbers whose
+   non-fragmented DATA %SEND-SAMPLE silently SKIPS, proving lost-final-sample recovery via the
+   periodic HEARTBEAT (RTPS 2.5 §8.4.2.2). Never set in production.")
+
 (defun* %send-sample (node buf sn pl host port)
     (function (disc-node dds.core.buffer:octet-buffer integer (simple-array (unsigned-byte 8) (*)) string (unsigned-byte 16)) t)
   "Send sample (SN, PL) to HOST:PORT: one DATA submessage if PL fits *fragment-size*, else a
    series of DATA_FRAG submessages (packing as many fragments as fit the datagram) followed by
    a HEARTBEAT_FRAG. Uses BUF (tx-msg or rx-tx-msg) as the scratch message buffer. A submessage
-   containing a fragment named in *DEBUG-DROP-FRAGMENT-NUMBERS* is skipped (loss injection)."
+   containing a fragment named in *DEBUG-DROP-FRAGMENT-NUMBERS* is skipped, and a non-fragmented
+   DATA whose SN is in *DEBUG-DROP-SAMPLE-NUMBERS* is skipped (loss injection)."
   (let ((size (length pl)))
     (if (<= size dds.rtps.reliable:*fragment-size*)
-        (%send-msg-buf node buf
-                       (lambda (mc) (dds.rtps.message:write-data
-                                     mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn pl 0 size))
-                       host port)
+        (unless (and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*))
+          (%send-msg-buf node buf
+                         (lambda (mc) (dds.rtps.message:write-data
+                                       mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn pl 0 size))
+                         host port))
         (let ((budget (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
           (dolist (desc (dds.rtps.reliable:writer-frag-plan size dds.rtps.reliable:*fragment-size* budget))
             (destructuring-bind (fstart fcount off len) desc
@@ -141,6 +148,17 @@
                                            mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn lastfrag cnt))
                              host port)))))))
 
+(defun* %send-user-heartbeat (node buf first last count host port)
+    (function (disc-node dds.core.buffer:octet-buffer integer integer integer string (unsigned-byte 16)) t)
+  "Send one NON-FINAL user-writer HEARTBEAT (FIRST,LAST,COUNT) to HOST:PORT (RTPS 2.5 §8.3.7.5;
+   readerId = ENTITYID_UNKNOWN, FinalFlag NOT_SET per the Reliable StatefulWriter T7 transition §8.4.9.2.7),
+   prompting the reader to ACKNACK. BUF selects the thread's scratch message buffer."
+  (%send-msg-buf node buf
+                 (lambda (mc)
+                   (dds.rtps.message:write-heartbeat
+                    mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) first last count :final nil))
+                 host port))
+
 (defun* %push-data (node)
     (function (disc-node) t)
   "Writer side: send each UNSENT change ONCE as a DATA (or DATA_FRAG series for large samples)
@@ -153,11 +171,25 @@
         (dolist (peer (%match-destinations node t))   ; DATA + HEARTBEAT -> matched readers
           (dolist (d datas)
             (%send-sample node (disc-node-tx-msg node) (car d) (cdr d) (car peer) (cdr peer)))
-          (%send-msg-buf node (disc-node-tx-msg node)
-                         (lambda (mc)
-                           (dds.rtps.message:write-heartbeat
-                            mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) first last count :final nil))
-                         (car peer) (cdr peer)))))))
+          (%send-user-heartbeat node (disc-node-tx-msg node) first last count (car peer) (cdr peer)))))))
+
+(defun* %push-heartbeat (node)
+    (function (disc-node) (eql t))
+  "Writer side: send a PERIODIC standalone non-final HEARTBEAT (no new DATA) to each matched
+   reader on the announce cadence (RTPS 2.5 §8.4.2.2: a reliable Writer must periodically inform
+   each matching reliable Reader of the availability of a sample; Reliable StatefulWriter T7
+   transition §8.4.9.2.7). This closes the lost-final-sample edge: when a reliable writer's final sample's
+   DATA was lost and no further write follows, nothing else re-prompts the reader to NACK, so the
+   gap is never repaired; the periodic HEARTBEAT keeps reliability live and triggers the ACKNACK
+   repair path. Non-final (FinalFlag NOT_SET) so it solicits an ACKNACK. A no-op on an empty
+   HistoryCache (LAST < FIRST), no user writer, or no matched readers (uses tx-msg, caller thread)."
+  (let ((w (disc-node-user-writer node)))
+    (when w
+      (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)
+        (when (>= last first)
+          (dolist (peer (%match-destinations node t))
+            (%send-user-heartbeat node (disc-node-tx-msg node) first last count (car peer) (cdr peer)))))))
+  t)
 
 (defun* publish-sample (node payload)
     (function (disc-node (simple-array (unsigned-byte 8) (*))) (eql t))
@@ -438,6 +470,70 @@
            (assert (equalp (node-sample node2 1) payload) ()
                    "subscriber received the wrong reassembled payload bytes")
            t)
+      (stop-node node1)
+      (stop-node node2))))
+
+(defun* run-lost-final-sample-test ()
+    (function () (eql t))
+  "Reliability edge: a reliable writer's FINAL sample's DATA is lost and there is no
+   subsequent write, so nothing re-prompts the reader to NACK — only the periodic
+   standalone HEARTBEAT keeps reliability live and triggers recovery (RTPS 2.5
+   §8.4.2.2: a reliable Writer must periodically inform each matching reliable Reader
+   of the availability of a sample). Two participants discover (SPDP) + match (SEDP);
+   *debug-drop-sample-numbers* drops the ONE published sample's DATA on send; the drop
+   is then cleared but NO further sample is published; A's announce cadence then emits
+   the periodic non-final HEARTBEAT, B NACKs the gap, A resends, B recovers — asserted
+   within a BOUNDED number of iterations (no unbounded wait)."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8)
+                         :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
+         (node1 (make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (node2 (make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (payload (make-array 8 :element-type '(unsigned-byte 8)
+                              :initial-contents '(#xCA #xFE #xBA #xBE #x05 #x06 #x07 #x08))))
+    (unwind-protect
+         (progn
+           (add-local-writer node1 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-publisher node1)
+           (add-local-reader node2 :topic "Square" :type "ShapeType"
+                                   :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-subscriber node2)
+           (setf (disc-node-peers node1) (list (cons "127.0.0.1" (disc-node-port node2))))
+           (setf (disc-node-peers node2) (list (cons "127.0.0.1" (disc-node-port node1))))
+           (start-node node1)
+           (start-node node2)
+           (announce-participant node1)
+           (announce-participant node2)
+           (loop repeat 100
+                 until (and (plusp (disc-node-discovered-count node1))
+                            (plusp (disc-node-discovered-count node2)))
+                 do (sleep 0.02))
+           (announce-endpoints node1)
+           (announce-endpoints node2)
+           (loop repeat 100
+                 until (and (plusp (disc-node-matched-count node1))
+                            (plusp (disc-node-matched-count node2)))
+                 do (sleep 0.02))
+           (assert (and (plusp (disc-node-matched-count node1))
+                        (plusp (disc-node-matched-count node2)))
+                   () "endpoints did not match before publish")
+           (setf *debug-drop-sample-numbers* (list 1))     ; drop on EVERY thread (incl. resend)
+           (publish-sample node1 payload)                  ; DATA dropped; HEARTBEAT prompts NACK
+           (sleep 0.1)                                     ; NACK-resend also dropped -> still gone
+           (assert (zerop (node-sample-count node2)) ()
+                   "drop hook failed: B received the dropped sample's DATA")
+           (setf *debug-drop-sample-numbers* nil)          ; clear; do NOT publish again
+           (loop repeat 40                                 ; BOUNDED: drive A's HB cadence
+                 until (plusp (node-sample-count node2))
+                 do (announce-endpoints node1) (sleep 0.02))
+           (assert (plusp (node-sample-count node2)) ()
+                   "lost final sample never recovered via the periodic HEARTBEAT")
+           (assert (equalp (node-sample node2 1) payload) ()
+                   "recovered sample has the wrong payload bytes")
+           t)
+      (setf *debug-drop-sample-numbers* nil)
       (stop-node node1)
       (stop-node node2))))
 

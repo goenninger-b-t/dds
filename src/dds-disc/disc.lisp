@@ -400,8 +400,10 @@
    (SEDP subscriptions writer) to every discovered participant's metatraffic
    unicast locator (RTPS 2.5 §8.5.4). Also drives tl-sweep (expiring overdue
    TypeLookup queries), %lease-sweep (pruning lease-expired participants, RTPS 2.5
-   §8.5.3.3.2), and %liveliness-sweep (reader-side Writer Liveliness timing -> the
-   ON-LIVELINESS-CHANGED hook, RTPS 2.5 §8.4.13) on the periodic announce cadence."
+   §8.5.3.3.2), %liveliness-sweep (reader-side Writer Liveliness timing -> the
+   ON-LIVELINESS-CHANGED hook, RTPS 2.5 §8.4.13), and %push-heartbeat (the periodic
+   standalone user-data HEARTBEAT that keeps reliability live and repairs a lost final
+   sample, RTPS 2.5 §8.4.2.2) on the periodic announce cadence."
   (dolist (p (%discovered-participants node))
     (let ((loc (dds.rtps.discovery:usable-udpv4-locator
                 (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))))
@@ -437,6 +439,7 @@
   (tl-sweep node)
   (%lease-sweep node)
   (%liveliness-sweep node)
+  (%push-heartbeat node)
   t)
 
 (defun* %lease-now ()

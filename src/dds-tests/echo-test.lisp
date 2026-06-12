@@ -385,6 +385,7 @@
                  ("foreign-locator-robust"   . dds.disc:run-locator-filter-test)
                  ("reliable-data-over-udp"   . dds.disc:run-dataplane-test)
                  ("large-data-over-udp"      . dds.disc:run-large-dataplane-test)
+                 ("lost-final-sample-repair" . dds.disc:run-lost-final-sample-test)
                  ("typed-shape-over-udp"     . run-typed-dataplane-test)
                  ("qos-rxo-truth-table"      . dds.qos:run-qos-rxo-test)
                  ("dcps-entity-write-take"   . run-dcps-entity-test)

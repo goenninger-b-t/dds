@@ -29,6 +29,7 @@
            #:enable-publisher #:enable-subscriber
            #:publish-sample #:node-sample-count #:node-sample #:node-sample-sns
            #:*debug-drop-fragment-numbers*
+           #:*debug-drop-sample-numbers*
            #:node-discovered-participants #:resolved-destination #:node-acks-in
            #:+entityid-tl-req-writer+ #:+entityid-tl-req-reader+
            #:+entityid-tl-reply-writer+ #:+entityid-tl-reply-reader+
@@ -39,4 +40,4 @@
            #:run-spdp-discovery-test #:run-sedp-discovery-test
            #:run-mcast-discovery-test #:run-dataplane-test
            #:run-large-dataplane-test #:run-participant-liveliness-test
-           #:run-locator-filter-test))
+           #:run-locator-filter-test #:run-lost-final-sample-test))
