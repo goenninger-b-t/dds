@@ -365,6 +365,7 @@
                  ("rtps-parameterlist"       . run-paramlist-test)
                  ("rtps-port-mapping"        . run-port-mapping-test)
                  ("rtps-participant-message" . run-participant-message-codec-test)
+                 ("fastdds-participant-message" . run-fastdds-participant-message-test)
                  ("rtps-history-cache"       . run-history-test)
                  ("rtps-reliable-delivery"   . run-reliability-test)
                  ("rtps-writer-pushonce"     . run-writer-pushonce-test)

@@ -1094,3 +1094,35 @@ pinned to `127.0.0.1`. No change to the NO_KEY mechanism; suite stays 106 green
   the run logs remain git-ignored (NFR-IP). Tracked: the harness change
   (`src/dds-shapes/shapes.lisp` gated-sub MATCHED-transition logging) +
   `interop/connext/liveliness/{USER_QOS_PROFILES.xml,README.md}` + docs.
+
+## M4 (2026-06-12) — standard ParticipantMessageData byte-validation vs Fast DDS (FR-IO-2 / FR-RTPS-WLP)
+
+- **What was consulted**: live eProsima Fast DDS 3.6.1 (the CONFORMANT peer) on the wire only —
+  its BuiltinParticipantMessageWriter (EntityId 0x000200c2) DATA submessage carrying the standard
+  RTPS §8.4.13.4 / §9.6.3.2 `ParticipantMessageData`. **No Fast DDS source was copied** (clean-room,
+  NFR-IP); the harness builds against the public API.
+- **Why this leg exists**: live RTI Connext emits the proprietary `NDDSPING` for participant
+  liveliness, NOT the standard `ParticipantMessageData` (see the 2026-06-12 liveliness entry), so the
+  standard-message byte-validation was deferred to a conformant peer. Fast DDS implements the standard.
+- **Mechanism finding**: a Fast DDS participant with only DDS-default liveliness (AUTOMATIC, INFINITE
+  lease) sets up the WLP reliable channel (HEARTBEAT/ACKNACK on 0x000200c2) but **writes NO
+  ParticipantMessageData sample** (empty writer history). Emission requires a writer with a FINITE
+  liveliness lease that actually asserts — added env-gated to the harness (`WLP_LEASE_MS`, off by
+  default; `interop/fastdds/shapes/shapes_pub.cpp`). With `WLP_LEASE_MS=1000` the WLP writer emitted
+  68 DATA(ParticipantMessageData) submessages over ~10 s. This mirrors our own design (we assert only
+  when a local writer's LIVELINESS requires it).
+- **Byte-exact result** (`interop/fastdds/captures/wlp-participant-message-lo0.pcap` frame 89,
+  AUTOMATIC assertion): the SerializedPayload is `00 01 00 00` (PLAIN_CDR_LE encapsulation, options 0)
+  + `01 0f 3a f1 63 67 ed 4d 00 00 00 00` (guidPrefix) + `00 00 00 01` (kind octet[4] = AUTOMATIC) +
+  `00 00 00 00` (sequenceSize = 0). Our `serialize-participant-message` reproduces the 20-octet bare
+  struct BYTE-EXACT, and `parse-participant-message` decodes Fast DDS's bytes (kind=AUTOMATIC, empty
+  data, prefix recovered). Locked as the regression test `fastdds-participant-message`
+  (`src/dds-tests/rtps-test.lisp`, mirroring the `rtps-participant-message` self-vector pattern).
+  117 green SBCL+Clasp. The kind being `octet[4]` (§9.6.3.2) is endianness-independent, confirmed by
+  the wire `00 00 00 01` matching our big-endian-stored {0,0,0,1}.
+- **Capture tooling note**: this host's Wireshark profile disables the null/ip/udp dissectors
+  (`disabled_protos`); `--enable-protocol` is unreliable in this shell. The robust fix is a clean
+  profile: `WIRESHARK_CONFIG_DIR=/tmp/wscfg tshark -r f.pcap -Y rtps ...`. Loopback-only on lo0.
+- **Artifacts**: the harness change (env-gated `WLP_LEASE_MS` liveliness in `shapes_pub.cpp`) + the
+  committed pcap (`interop/fastdds/captures/wlp-participant-message-lo0.pcap`, the captures/ exception)
+  + the regression test + docs are tracked; the RTI/Fast DDS dylibs + build output remain git-ignored.

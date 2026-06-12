@@ -63,6 +63,15 @@ int main(int argc, char** argv)
 
     DataWriterQos wqos = DATAWRITER_QOS_DEFAULT;
     wqos.reliability().kind = RELIABLE_RELIABILITY_QOS;
+    // WLP_LEASE_MS (off by default) gives the writer a finite-lease AUTOMATIC LIVELINESS so the participant emits standard ParticipantMessageData (RTPS 8.4.13) for the interop WLP byte-validation leg.
+    if (const char* wlp_ms = std::getenv("WLP_LEASE_MS"))
+    {
+        const long ms = std::atol(wlp_ms);
+        const long ap = ms / 3;
+        wqos.liveliness().kind = AUTOMATIC_LIVELINESS_QOS;
+        wqos.liveliness().lease_duration = Duration_t(static_cast<int32_t>(ms / 1000), static_cast<uint32_t>((ms % 1000) * 1000000));
+        wqos.liveliness().announcement_period = Duration_t(static_cast<int32_t>(ap / 1000), static_cast<uint32_t>((ap % 1000) * 1000000));
+    }
     MatchListener listener;
     DataWriter* writer = publisher->create_datawriter(topic, wqos, &listener, StatusMask::all());
     if (writer == nullptr)

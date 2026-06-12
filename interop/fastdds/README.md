@@ -466,3 +466,31 @@ TypeLookup service code, so the TL frames themselves are stock Fast DDS).
 Open after the walk: item 4 (a live non-OK reply was never provoked), big-endian/other
 encapsulations (both peers only ever emitted CDR2_LE), and the S3 leftovers
 (complete-member emission, dependent-typeid insertion order).
+
+## WLP census — standard `ParticipantMessageData` byte-validation (2026-06-12, FR-RTPS-WLP)
+
+Closes the Writer-Liveliness-Protocol byte-validation deferred from the Connext liveliness
+leg (live RTI emits the proprietary `NDDSPING`, not the standard §8.4.13 message).
+
+Run recipe (the `WLP_LEASE_MS` env, off by default, gives `shapes_pub`'s writer a finite-lease
+AUTOMATIC `LIVELINESS` so the participant actually asserts — a default infinite-lease AUTOMATIC
+writer sets up the WLP channel but writes **no** `ParticipantMessageData` sample):
+
+```sh
+WIRESHARK_CONFIG_DIR=/tmp/wscfg tshark -i lo0 -f "udp portrange 7400-7460" -w captures/wlp-participant-message-lo0.pcap &
+make fastdds-sub SECONDS=20 &                                          # a remote participant
+./scripts/with-fastdds.sh bash -c 'cd interop/fastdds/shapes && WLP_LEASE_MS=1000 ./shapes_pub BLUE 0' &
+# ... ~10 s -> 68 DATA(ParticipantMessageData) submessages on writer 0x000200c2 ...
+WIRESHARK_CONFIG_DIR=/tmp/wscfg tshark -r captures/wlp-participant-message-lo0.pcap -Y "rtps.sm.wrEntityId == 0x000200c2 && rtps.sm.id == 21" -V
+```
+
+> Capture-tooling note: this host's Wireshark profile disables the null/ip/udp dissectors
+> (`disabled_protos`) and `--enable-protocol` is unreliable in a headless shell; a clean
+> `WIRESHARK_CONFIG_DIR` (no profile) dissects reliably.
+
+| Target | Capture | Result |
+|---|---|---|
+| Standard `ParticipantMessageData` bytes | `captures/wlp-participant-message-lo0.pcap` fr 89 (writer `0x000200c2`, SN 1, AUTOMATIC) | SerializedPayload `00 01 00 00` (PLAIN_CDR_LE) + `guidPrefix`(12) + kind `00 00 00 01` + sequenceSize `00 00 00 00`. **`parse-participant-message` decodes it; `serialize-participant-message` reproduces the 20-octet bare struct BYTE-EXACT** — locked test `fastdds-participant-message`. 117 green SBCL+Clasp |
+
+Confirms `kind` is an endianness-independent `octet[4]` (§9.6.3.2): the wire `00 00 00 01`
+matches our big-endian-stored `{0,0,0,1}` for `AUTOMATIC`.

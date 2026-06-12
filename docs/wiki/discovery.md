@@ -50,6 +50,14 @@ The wire foundation of the Writer Liveliness Protocol (RTPS 2.5 §8.4.13). The
 `BuiltinParticipantMessageWriter`/`Reader` carry a `ParticipantMessageData` sample
 (§8.4.13.4 / §9.6.3.2) whose DDS key is `participantGuidPrefix + kind`.
 
+This codec is **byte-validated against the conformant peer eProsima Fast DDS 3.6.1**: a live
+Fast DDS `BuiltinParticipantMessageWriter` (`0x000200c2`) AUTOMATIC-liveliness `DATA` is
+decoded by `parse-participant-message` and reproduced byte-exact by
+`serialize-participant-message` (locked test `fastdds-participant-message`). Note that live
+RTI Connext does **not** emit the standard `ParticipantMessageData` — it uses the proprietary
+`NDDSPING` — so a conformant peer is the oracle here; and a peer emits the message only when a
+local writer has a *finite*-lease `LIVELINESS` that actually asserts.
+
 - P2P built-in endpoint EntityIds (§9.6.2.2 / §8.4.13.2): `dds.rtps.discovery:+entityid-p2p-participant-message-writer+` = `{{00,02,00},c2}` (`#x000200c2`), `+entityid-p2p-participant-message-reader+` = `{{00,02,00},c7}` (`#x000200c7`).
 - `kind` values (§9.6.3.2), stored as the integer the wire `octet[4]` encodes big-endian: `+pmd-kind-unknown+` = 0 `{0,0,0,0}`, `+pmd-kind-automatic+` = 1 `{0,0,0,1}`, `+pmd-kind-manual-by-participant+` = 2 `{0,0,0,2}`.
 - `availableBuiltinEndpoints` bits (§9.4.2.10): `+be-participant-message-writer+` = bit 10, `+be-participant-message-reader+` = bit 11. Both are set in `+builtin-endpoint-set-default+` now that the Writer Liveliness Protocol endpoints are wired (see the disc-layer section below).

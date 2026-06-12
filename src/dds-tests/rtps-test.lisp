@@ -392,6 +392,37 @@
             "over-long data.length -> NIL")
     t))
 
+(defun* run-fastdds-participant-message-test ()
+    (function () t)
+  "Interop byte-validation of ParticipantMessageData against the CONFORMANT peer eProsima
+   Fast DDS 3.6.1 (RTPS 2.5 §8.4.13.4 / §9.6.3.2). The locked vector is the bare CDR struct
+   captured live from a Fast DDS BuiltinParticipantMessageWriter (EntityId 0x000200c2) DATA
+   submessage — interop/fastdds/captures/wlp-participant-message-lo0.pcap frame 89, an
+   AUTOMATIC liveliness assertion (kind {0,0,0,1}, empty data) under a finite-lease writer.
+   Confirms our parser decodes the conformant peer's bytes AND our serializer reproduces them
+   byte-exact. RTI Connext does NOT emit standard ParticipantMessageData (proprietary
+   NDDSPING), so this was the deferred conformant-peer path; see docs/provenance.md."
+  (let* ((prefix (make-array 12 :element-type '(unsigned-byte 8)
+                  :initial-contents '(#x01 #x0f #x3a #xf1 #x63 #x67 #xed #x4d 0 0 0 0)))
+         ;; Fast DDS frame 89 bare struct (after the PLAIN_CDR_LE header): prefix(12) + kind{0,0,0,1} + len 0
+         (wire (octets #x01 #x0f #x3a #xf1 #x63 #x67 #xed #x4d 0 0 0 0  0 0 0 1  0 0 0 0))
+         (back (dds.rtps.discovery:parse-participant-message wire)))
+    (%check :fdds-pm-parse back "parse of Fast DDS ParticipantMessageData returned NIL")
+    (%check :fdds-pm-prefix (equalp prefix (dds.rtps.discovery:participant-message-guid-prefix back)) "guidPrefix")
+    (%check :fdds-pm-kind (= dds.rtps.discovery:+pmd-kind-automatic+
+                             (dds.rtps.discovery:participant-message-kind back)) "AUTOMATIC kind")
+    (%check :fdds-pm-data (zerop (length (dds.rtps.discovery:participant-message-data back)))
+            "empty data (liveliness assertion carries none)")
+    (let* ((pm (dds.rtps.discovery:make-participant-message
+                :guid-prefix prefix :kind dds.rtps.discovery:+pmd-kind-automatic+
+                :data (make-array 0 :element-type '(unsigned-byte 8))))
+           (ours (dds.rtps.discovery:serialize-participant-message pm)))
+      (%check :fdds-pm-serialize-exact (equalp ours wire)
+              "our serializer must reproduce the Fast DDS wire bytes byte-exact"))
+    (%check :fdds-pm-roundtrip (equalp wire (dds.rtps.discovery:serialize-participant-message back))
+            "parse then re-serialize of the Fast DDS bytes must close byte-exact")
+    t))
+
 (defun* run-port-mapping-test ()
     (function () t)
   "Test: the RTPS well-known port-mapping formulas (RTPS 2.5 §9.6.1.1)."
