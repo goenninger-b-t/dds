@@ -100,6 +100,16 @@
   (not-alive-count-change 0 :type integer)
   (last-publication-handle nil :type (or null (array (unsigned-byte 8) (*)))))
 
+(defstruct* (liveliness-lost-status (:constructor make-liveliness-lost-status)
+                                   (:copier copy-liveliness-lost-status))
+  "DataWriter LIVELINESS_LOST status (dds_rtf2_dcps.idl §118-121): the local writer
+   failed to assert its own liveliness within its offered LIVELINESS lease_duration
+   (DDS 1.4 §2.2.3.11). total_count is the cumulative number of times the writer became
+   not-alive (monotonic, never decremented); total_count_change accumulates the delta
+   since the status was last read."
+  (total-count 0 :type integer)
+  (total-count-change 0 :type integer))
+
 (deftype sample-rejected-reason ()
   "DDS SampleRejectedStatusKind (dds_rtf2_dcps.idl §104)."
   '(member :not-rejected :rejected-by-instances-limit

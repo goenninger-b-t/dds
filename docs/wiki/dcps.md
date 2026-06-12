@@ -101,11 +101,14 @@ its `*_change` counters (DDS read-resets-change semantics).
 | `dds.dcps:get-inconsistent-topic-status` (`tp`) | Snapshot the topic's INCONSISTENT_TOPIC status. |
 | `dds.dcps:get-sample-rejected-status` (`dr`) | Snapshot the reader's SAMPLE_REJECTED status. |
 | `dds.dcps:get-liveliness-changed-status` (`dr`) | Snapshot the reader's LIVELINESS_CHANGED status (resets `*_change`). |
+| `dds.dcps:get-liveliness-lost-status` (`dw`) | Snapshot the writer's LIVELINESS_LOST status (resets `total_count_change`). |
+| `dds.dcps:assert-liveliness` (`dw`) | `DataWriter::assert_liveliness` (DDS 1.4 §2.2.3.11) — manually assert the writer's liveliness; kind-aware (MANUAL_BY_TOPIC asserts this writer, MANUAL_BY_PARTICIPANT asserts all such writers of the participant, AUTOMATIC is asserted by the cadence). A `write` also asserts. |
 | `dds.dcps:subscription-matched-status` / `publication-matched-status` | The matched-status structs (`-total-count`, `-total-count-change`, `-current-count`, `-current-count-change`, and `-last-publication-handle` / `-last-subscription-handle`). |
 | `dds.dcps:requested-incompatible-qos-status` / `offered-incompatible-qos-status` | The incompatible-QoS structs (`-total-count`, `-total-count-change`, `-last-policy-id`, `-policies`). |
 | `dds.dcps:inconsistent-topic-status` | INCONSISTENT_TOPIC struct (`-total-count`, `-total-count-change`). |
 | `dds.dcps:sample-rejected-status` | SAMPLE_REJECTED struct (`-total-count`, `-total-count-change`, `-last-reason`, `-last-instance-handle`). |
 | `dds.dcps:liveliness-changed-status` | LIVELINESS_CHANGED struct (`-alive-count`, `-not-alive-count`, `-alive-count-change`, `-not-alive-count-change`, `-last-publication-handle`). |
+| `dds.dcps:liveliness-lost-status` | LIVELINESS_LOST struct (`-total-count` monotonic, `-total-count-change`); a writer that fails to assert its own liveliness within its offered lease. |
 | `dds.dcps:sample-rejected-reason` | The reason type: `:not-rejected` / `:rejected-by-instances-limit` / `:rejected-by-samples-limit` / `:rejected-by-samples-per-instance-limit`. |
 | `dds.dcps:qos-policy-count` / `make-qos-policy-count` / `qos-policy-count-policy-id` / `qos-policy-count-count` | A `{policy-id, count}` entry in an incompatible-QoS `policies` list. |
 | `dds.dcps:rxo-policy-id` (`keyword`) | The DDS `QosPolicyId_t` for an RxO failing-policy keyword. |
@@ -116,9 +119,9 @@ its `*_change` counters (DDS read-resets-change semantics).
 | `dds.dcps:set-topic-listener` (`tp listener mask`) | `Topic::set_listener` (v1 mask: `(:inconsistent-topic)`). |
 | `dds.dcps:on-data-available` (`l reader`) | DataReaderListener callback — fires from the receiver thread on new user data. |
 | `dds.dcps:on-subscription-matched` / `on-requested-incompatible-qos` / `on-sample-rejected` / `on-liveliness-changed` (`l reader status`) | DataReaderListener callbacks that fire in v1. `on-liveliness-changed` fires from the announce cadence when a matched remote writer's liveliness goes stale/fresh (RTPS 2.5 §8.4.13). |
-| `dds.dcps:on-publication-matched` / `on-offered-incompatible-qos` (`l writer status`) | DataWriterListener callbacks that fire in v1. |
+| `dds.dcps:on-publication-matched` / `on-offered-incompatible-qos` / `on-liveliness-lost` (`l writer status`) | DataWriterListener callbacks that fire in v1. `on-liveliness-lost` fires from the announce cadence (`spin`) when a local writer fails to assert its own liveliness within its offered lease (DDS 1.4 §2.2.3.11). |
 | `dds.dcps:on-inconsistent-topic` (`l topic status`) | TopicListener callback that fires in v1. |
-| `dds.dcps:on-requested-deadline-missed` / `on-sample-lost` (`l reader status`); `dds.dcps:on-offered-deadline-missed` / `on-liveliness-lost` (`l writer status`) | Defined for subclassing; **not yet fired** in v1 (the underlying statuses are deferred). |
+| `dds.dcps:on-requested-deadline-missed` / `on-sample-lost` (`l reader status`); `dds.dcps:on-offered-deadline-missed` (`l writer status`) | Defined for subclassing; **not yet fired** in v1 (the underlying statuses are deferred). |
 
 ### Advisory type-compatibility (ADR 0009)
 
@@ -463,11 +466,22 @@ the source as deferred or simplified — do not rely on them yet:
   LIVELINESS_CHANGED status **only on an alive↔not-alive transition** (DDS 1.4 §2.2.4.1):
   alive→not-alive does `alive_count--` / `not_alive_count++` (with the `*_change` deltas), the
   reverse on a fresh assertion; `last_publication_handle` is the transitioned writer's GUID.
+- **Writer-side LIVELINESS_LOST is produced.** On the DCPS announce cadence (`spin`) the
+  `%writer-liveliness-sweep` checks each local DataWriter's OWN liveliness (DDS 1.4 §2.2.3.11):
+  a writer fires `on_liveliness_lost` (and bumps LIVELINESS_LOST `total_count`, monotonic per
+  DDS 1.4 §2.2.4.1) when it has not asserted within its offered `lease_duration`. Assertion is
+  kind-aware: AUTOMATIC writers are asserted by the cadence (so they only go lost if the
+  participant stops announcing — degenerate); MANUAL_BY_PARTICIPANT writers are asserted by a
+  `write` or `assert_liveliness` on **any** of the participant's MANUAL_BY_PARTICIPANT writers;
+  MANUAL_BY_TOPIC writers only by a `write` / `assert_liveliness` on **that** writer. The loss
+  fires **once per going-lost transition**; re-asserting transitions the writer back to alive
+  (it never decrements `total_count`), and a later re-loss increments again. An infinite lease
+  never goes lost.
 - **Some statuses are scaffolding only.** Only MATCHED, INCOMPATIBLE_QOS, INCONSISTENT_TOPIC,
-  SAMPLE_REJECTED, and (reader-side) LIVELINESS_CHANGED are produced and surfaced. DEADLINE
-  (`on_*_deadline_missed`), writer-side LIVELINESS_LOST (`on_liveliness_lost`), and SAMPLE_LOST
-  (`on_sample_lost`) have listener methods defined for subclassing but are **not fired**, and
-  there are no `get-*-status` accessors for them. `on-data-available` does fire (on new user data).
+  SAMPLE_REJECTED, (reader-side) LIVELINESS_CHANGED, and (writer-side) LIVELINESS_LOST are
+  produced and surfaced. DEADLINE (`on_*_deadline_missed`) and SAMPLE_LOST (`on_sample_lost`)
+  have listener methods defined for subclassing but are **not fired**, and there are no
+  `get-*-status` accessors for them. `on-data-available` does fire (on new user data).
 - **Content filtering is reader-side only.** A `ContentFilteredTopic` presents its related
   topic's name/type for SEDP matching and applies the filter in the reader's drain; the writer
   sends every sample. Writer-side filtering is a later increment.

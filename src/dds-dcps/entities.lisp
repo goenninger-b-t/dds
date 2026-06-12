@@ -8,6 +8,13 @@
 
 (in-package #:dds.dcps)
 
+(defun* %lease-now ()
+    (function () (integer 0))
+  "The monotonic DCPS liveliness clock — the same internal-real-time source the engine's
+   lease/liveliness bookkeeping uses (dds.disc::%lease-now), shared so a DataWriter's self-
+   assertion stamp is comparable across the DCPS/disc boundary (DDS 1.4 §2.2.3.11)."
+  (dds.disc::%lease-now))
+
 ;;; ---- Entity hierarchy (CLOS inheritance is the DDS idiom) ----
 
 (defclass entity ()
@@ -58,11 +65,17 @@
    (publisher :initarg :publisher :reader dw-publisher)
    (pub-matched :initform (make-publication-matched-status) :accessor dw-pub-matched)
    (off-incompat :initform (make-offered-incompatible-qos-status) :accessor dw-off-incompat)
+   (liv-lost :initform (make-liveliness-lost-status) :accessor dw-liv-lost)
+   (last-assertion :initform (%lease-now) :accessor dw-last-assertion) ; last self-assertion stamp (DDS 1.4 §2.2.3.11)
+   (alive :initform t :accessor dw-alive-p)                            ; LIVELINESS_LOST loss-transition flag
    (listener :initform nil :accessor dw-listener)
    (listener-mask :initform '() :accessor dw-listener-mask)
    (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock))
   (:documentation "DDS DataWriter: publishes typed samples on a Topic, carrying its
-   PUBLICATION_MATCHED and OFFERED_INCOMPATIBLE_QOS statuses and optional listener."))
+   PUBLICATION_MATCHED, OFFERED_INCOMPATIBLE_QOS and LIVELINESS_LOST statuses and optional
+   listener. LAST-ASSERTION is the internal-real-time stamp of the most recent self-
+   assertion (a write or assert_liveliness, or the announce cadence for an AUTOMATIC
+   writer); ALIVE is the loss-transition flag so LIVELINESS_LOST fires once per going-lost."))
 
 (defclass data-reader (entity)
   ((topic :initarg :topic :reader dr-topic)
@@ -231,6 +244,7 @@
    is a follow-up (the engine's announce buffers are not yet thread-isolated)."
   (dds.disc:announce-participant (dp-node p))
   (dds.disc:announce-endpoints (dp-node p))
+  (%writer-liveliness-sweep p)   ; writer-side LIVELINESS_LOST on the DCPS cadence (DDS 1.4 §2.2.3.11)
   t)
 
 ;;; ---- Publisher / Subscriber / Topic ----
@@ -311,12 +325,59 @@
       (setf (dp-user-reader (sub-participant sub)) dr)   ; v1 back-ref for status hooks
       dr)))
 
+(defun* %participant-writers (p)
+    (function (domain-participant) list)
+  "Every local DataWriter contained in participant P (across all its Publishers)."
+  (let ((ws '()))
+    (dolist (c (dp-children p) ws)
+      (when (typep c 'publisher) (setf ws (append (pub-writers c) ws))))))
+
+(defun* %writer-liveliness-kind (dw)
+    (function (data-writer) symbol)
+  "DW's offered LIVELINESS kind (DDS 1.4 §2.2.3.11), defaulting to :automatic when the
+   QoS is absent or not a dds.qos:qos."
+  (let ((qos (entity-qos dw)))
+    (if (typep qos 'dds.qos:qos) (dds.qos:qos-liveliness qos) :automatic)))
+
+(defun* %assert-writer-liveliness (dw)
+    (function (data-writer) (eql t))
+  "Stamp DW's self-assertion timestamp to now and clear its lost flag (DDS 1.4 §2.2.3.11):
+   a write or DataWriter::assert_liveliness asserts the writer's liveliness, refreshing its
+   lease so the next LIVELINESS_LOST sweep does not judge it not-alive; re-asserting a
+   previously-lost writer transitions it back to alive so a LATER loss fires LIVELINESS_LOST
+   again (total_count is never decremented — re-asserting does not undo a past loss).
+   Lock-guarded."
+  (dds.pal:with-lock ((dw-status-lock dw))
+    (setf (dw-last-assertion dw) (%lease-now)
+          (dw-alive-p dw) t))
+  t)
+
+(defun* assert-liveliness (dw)
+    (function (data-writer) (eql t))
+  "DataWriter::assert_liveliness (DDS 1.4 §2.2.2.4.2.2 / §2.2.3.11) — manually assert this
+   writer's liveliness. Kind-aware (DDS 1.4 §2.2.3.11): MANUAL_BY_TOPIC asserts only THIS
+   writer; MANUAL_BY_PARTICIPANT asserts EVERY MANUAL_BY_PARTICIPANT writer of the same
+   participant (an assertion on any participant entity asserts them all); AUTOMATIC is
+   asserted by the infrastructure (the announce cadence) so calling here merely refreshes
+   this writer harmlessly. Stamps the affected writers' last-assertion to now."
+  (case (%writer-liveliness-kind dw)
+    (:manual-by-participant
+     (let ((p (pub-participant (dw-publisher dw))))
+       (dolist (w (%participant-writers p))
+         (when (eq (%writer-liveliness-kind w) :manual-by-participant)
+           (%assert-writer-liveliness w)))))
+    (t (%assert-writer-liveliness dw)))
+  t)
+
 (defun* write-sample (dw sample)
     (function (data-writer t) (eql t))
   "DataWriter::write — serialize SAMPLE via the topic type-support and publish it
-   reliably over the engine to all matched/discovered readers."
+   reliably over the engine to all matched/discovered readers. A write asserts the
+   writer's liveliness (DDS 1.4 §2.2.3.11), so it stamps the writer (and, for
+   MANUAL_BY_PARTICIPANT, every such writer of the participant) via assert_liveliness."
   (let ((node (dp-node (pub-participant (dw-publisher dw)))))
     (dds.disc:publish-sample node (%serialize-sample (topic-type-support (dw-topic dw)) sample))
+    (assert-liveliness dw)
     t))
 
 (defparameter +instance-handle-nil+
@@ -666,6 +727,71 @@
     (%notify-reader-conditions dr))   ; wake a StatusCondition(:liveliness-changed) waiter
   t)
 
+(defun* %lease-internal-units (duration)
+    (function (dds.qos:qos-duration) (integer 0))
+  "A LIVELINESS lease_duration as internal-time-units (the granularity dw-last-assertion
+   is stamped in), rounding the sub-second nanosec part up so a fresh assertion inside the
+   lease is never prematurely judged stale (DDS 1.4 §2.2.3.11). DURATION_INFINITE
+   (sec 0x7fffffff) is returned as effectively unbounded. The round-up to whole seconds is
+   delegated to dds.disc::%lease-seconds (single source of that arithmetic, DRY)."
+  (* (dds.disc::%lease-seconds duration) internal-time-units-per-second))
+
+(defun* %writer-liveliness-lost (dw)
+    (function (data-writer) t)
+  "Mark DW LIVELINESS_LOST (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §118-121): total_count++
+   (monotonic), total_count_change accumulates +1; clear the alive flag so it fires once
+   per going-lost transition. Fires on_liveliness_lost if masked (snapshot + reset the
+   total_count_change per DDS read-resets-change). CALLER HOLDS the status lock; the
+   listener is fired OUTSIDE it via the returned snapshot."
+  (let ((s (dw-liv-lost dw)) (snapshot nil))
+    (incf (liveliness-lost-status-total-count s))
+    (incf (liveliness-lost-status-total-count-change s))
+    (setf (dw-alive-p dw) nil)
+    (when (and (dw-listener dw) (member :liveliness-lost (dw-listener-mask dw)))
+      (setf snapshot (copy-liveliness-lost-status s))
+      (setf (liveliness-lost-status-total-count-change s) 0))
+    snapshot))
+
+(defun* %writer-liveliness-lost-check (dw now)
+    (function (data-writer (integer 0)) t)
+  "Sweep one DataWriter DW for LIVELINESS_LOST at time NOW (DDS 1.4 §2.2.3.11): if DW is
+   still considered alive but has not asserted its own liveliness within its offered
+   LIVELINESS lease_duration, fire LIVELINESS_LOST. AUTOMATIC writers are kept asserted by
+   the announce cadence (see %writer-liveliness-sweep), so they only go lost if the
+   participant stops announcing. An infinite lease never goes lost. Returns the snapshot to
+   fire the listener with, or NIL. Snapshots under the status lock; the caller fires
+   on_liveliness_lost OUTSIDE the lock."
+  (let ((qos (entity-qos dw)))
+    (when (typep qos 'dds.qos:qos)
+      (let* ((dur (dds.qos:qos-liveliness-lease qos))
+             (lease (%lease-internal-units dur)))
+        (when (and (< (dds.qos:qos-duration-sec dur) #x7fffffff)
+                   (plusp lease))
+          (dds.pal:with-lock ((dw-status-lock dw))
+            (when (and (dw-alive-p dw) (> (- now (dw-last-assertion dw)) lease))
+              (%writer-liveliness-lost dw))))))))
+
+(defun* %writer-liveliness-sweep (p)
+    (function (domain-participant) (eql t))
+  "Writer-side Writer Liveliness timing (DDS 1.4 §2.2.3.11 / §2.2.4.1): on the DCPS
+   announce cadence (SPIN), refresh every AUTOMATIC local writer's self-assertion (the
+   infrastructure asserts AUTOMATIC writers while the participant announces) and then sweep
+   every local writer for LIVELINESS_LOST — a writer that has not asserted within its
+   offered lease_duration fires on_liveliness_lost once per going-lost transition. MANUAL
+   writers (BY_PARTICIPANT / BY_TOPIC) are NOT auto-refreshed here: the application keeps
+   them alive via write / assert_liveliness. Snapshots are collected under each writer's
+   status lock and the listeners fired OUTSIDE the locks."
+  (let ((now (%lease-now)) (fires '()))
+    (dolist (dw (%participant-writers p))
+      (when (eq (%writer-liveliness-kind dw) :automatic)
+        (dds.pal:with-lock ((dw-status-lock dw))
+          (setf (dw-last-assertion dw) now (dw-alive-p dw) t))))
+    (dolist (dw (%participant-writers p))
+      (let ((snap (%writer-liveliness-lost-check dw now)))
+        (when snap (push (cons dw snap) fires))))
+    (dolist (f fires) (on-liveliness-lost (dw-listener (car f)) (car f) (cdr f))))
+  t)
+
 (defun* %writer-unmatched (dw handle)
     (function (data-writer t) t)
   "Decrement DW's PUBLICATION_MATCHED on a lost match (DDS 1.4 §2.2.4.1): current_count--
@@ -806,6 +932,15 @@
       (prog1 (copy-liveliness-changed-status s)
         (setf (liveliness-changed-status-alive-count-change s) 0
               (liveliness-changed-status-not-alive-count-change s) 0)))))
+
+(defun* get-liveliness-lost-status (dw)
+    (function (data-writer) liveliness-lost-status)
+  "DataWriter::get_liveliness_lost_status — a snapshot; resets total_count_change per DDS
+   read-resets-change semantics (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §118-121)."
+  (dds.pal:with-lock ((dw-status-lock dw))
+    (let ((s (dw-liv-lost dw)))
+      (prog1 (copy-liveliness-lost-status s)
+        (setf (liveliness-lost-status-total-count-change s) 0)))))
 
 ;;; ---- set_listener (DDS 1.4 Entity::set_listener) ----
 

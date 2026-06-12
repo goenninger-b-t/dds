@@ -438,6 +438,9 @@
 (defmethod dds.dcps:on-liveliness-changed ((l capturing-reader-listener) reader status)
   (declare (ignore reader))
   (dds.pal:with-lock ((cap-lock l)) (push (cons :liv-changed status) (cap-hits l))))
+(defmethod dds.dcps:on-liveliness-lost ((l capturing-writer-listener) writer status)
+  (declare (ignore writer))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :liv-lost status) (cap-hits l))))
 
 (defun* cap-snapshot (l)
     (function (capture-mixin) list)
@@ -2174,6 +2177,102 @@
                      (and (= 1 (dds.dcps:liveliness-changed-status-alive-count s))
                           (zerop (dds.dcps:liveliness-changed-status-not-alive-count s)))
                      "a fresh assertion + sweep must transition back to ALIVE (alive_count 1 / not_alive_count 0)")))
+      (dds.dcps:delete-participant p))
+    t))
+
+;;; Writer-side Writer Liveliness timing -> LIVELINESS_LOST (DDS 1.4 §2.2.3.11 / §2.2.4.1,
+;;; dds_rtf2_dcps.idl §118-121): %writer-liveliness-sweep, run on the DCPS announce cadence,
+;;; fires on_liveliness_lost when a local DataWriter fails to assert its OWN liveliness
+;;; within its offered lease_duration. AUTOMATIC writers are kept asserted by the cadence;
+;;; MANUAL writers need a write / assert_liveliness. Driven DETERMINISTICALLY by backdating
+;;; the writer's last-assertion (no real-time wait).
+
+(defun* run-liveliness-lost-test ()
+    (function () t)
+  "A local MANUAL_BY_TOPIC DataWriter with a short (1s) LIVELINESS lease whose self-
+   assertion is backdated older than the lease is swept LIVELINESS_LOST: %writer-liveliness-
+   sweep fires on_liveliness_lost with total_count 1 / total_count_change +1 and the writer's
+   status reads the same. A re-sweep without a fresh assertion must NOT re-fire (one fire per
+   going-lost). assert_liveliness refreshes the writer so a subsequent sweep keeps it alive;
+   a later re-loss increments total_count again (monotonic). An AUTOMATIC writer is kept alive
+   by the cadence and never fires while spinning. Deterministic: the stamp is backdated, never
+   timed (DDS 1.4 §2.2.3.11)."
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p (dds.dcps:create-participant :domain 0))
+        (wl (make-instance 'capturing-writer-listener)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "LivLostTopic" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p))
+                (dw (dds.dcps:create-datawriter
+                     pub tp :qos (dds.qos:make-writer-qos
+                                  :liveliness :manual-by-topic
+                                  :liveliness-lease (dds.qos:make-qos-duration 1 0))))
+                (autodw (dds.dcps:create-datawriter
+                         pub tp :qos (dds.qos:make-writer-qos
+                                      :liveliness :automatic
+                                      :liveliness-lease (dds.qos:make-qos-duration 1 0))))
+                ;; A MANUAL_BY_TOPIC writer with an INFINITE lease can never go lost.
+                (infdw (dds.dcps:create-datawriter
+                        pub tp :qos (dds.qos:make-writer-qos
+                                     :liveliness :manual-by-topic
+                                     :liveliness-lease dds.qos:+duration-infinite+))))
+           (dds.dcps:set-writer-listener dw wl '(:liveliness-lost))
+           ;; Backdate all three writers' self-assertion to 5s ago vs a 1s lease.
+           (setf (dds.dcps::dw-last-assertion dw)
+                 (- (dds.disc::%lease-now) (* 5 internal-time-units-per-second)))
+           (setf (dds.dcps::dw-last-assertion autodw)
+                 (- (dds.disc::%lease-now) (* 5 internal-time-units-per-second)))
+           ;; Backdate the infinite-lease writer far past any finite lease.
+           (setf (dds.dcps::dw-last-assertion infdw)
+                 (- (dds.disc::%lease-now) (* 3600 internal-time-units-per-second)))
+           ;; First sweep: the MANUAL_BY_TOPIC writer is stale -> alive->not-alive; the
+           ;; AUTOMATIC writer is refreshed by the cadence first, so it stays alive.
+           (dds.dcps::%writer-liveliness-sweep p)
+           (let ((hit (cdr (assoc :liv-lost (cap-snapshot wl)))))
+             (%check :livlost-listener
+                     (and hit (= 1 (dds.dcps:liveliness-lost-status-total-count hit))
+                          (= 1 (dds.dcps:liveliness-lost-status-total-count-change hit)))
+                     "on_liveliness_lost must fire with total_count 1 / total_count_change +1"))
+           (let ((s (dds.dcps:get-liveliness-lost-status dw)))
+             (%check :livlost-counts (= 1 (dds.dcps:liveliness-lost-status-total-count s))
+                     "writer LIVELINESS_LOST must read total_count 1 once stale")
+             (%check :livlost-change-reset
+                     (zerop (dds.dcps:liveliness-lost-status-total-count-change s))
+                     "get_liveliness_lost_status must reset total_count_change"))
+           (%check :livlost-auto-alive
+                   (and (dds.dcps::dw-alive-p autodw) t)
+                   "an AUTOMATIC writer is asserted by the cadence and must NOT go lost")
+           ;; An INFINITE-lease writer is never judged lost, however stale its assertion.
+           (%check :livlost-infinite-alive
+                   (and (dds.dcps::dw-alive-p infdw)
+                        (zerop (dds.dcps:liveliness-lost-status-total-count
+                                (dds.dcps:get-liveliness-lost-status infdw))))
+                   "an INFINITE-lease writer must stay alive with total_count 0")
+           ;; A re-sweep without a fresh assertion must NOT re-fire (one fire per going-lost).
+           (dds.pal:with-lock ((cap-lock wl)) (setf (cap-hits wl) '()))
+           (dds.dcps::%writer-liveliness-sweep p)
+           (let ((s (dds.dcps:get-liveliness-lost-status dw)))
+             (%check :livlost-no-refire
+                     (and (null (assoc :liv-lost (cap-snapshot wl)))
+                          (= 1 (dds.dcps:liveliness-lost-status-total-count s))
+                          (zerop (dds.dcps:liveliness-lost-status-total-count-change s)))
+                     "a re-sweep without a transition must not re-fire LIVELINESS_LOST"))
+           ;; assert_liveliness refreshes the writer; a subsequent sweep keeps it alive.
+           (dds.dcps:assert-liveliness dw)
+           (dds.dcps::%writer-liveliness-sweep p)
+           (let ((s (dds.dcps:get-liveliness-lost-status dw)))
+             (%check :livlost-reassert-alive
+                     (and (null (assoc :liv-lost (cap-snapshot wl)))
+                          (= 1 (dds.dcps:liveliness-lost-status-total-count s)))
+                     "assert_liveliness must keep the writer alive (no new loss, total_count unchanged)"))
+           ;; A later re-loss after a re-assert increments total_count again (monotonic).
+           (setf (dds.dcps::dw-last-assertion dw)
+                 (- (dds.disc::%lease-now) (* 5 internal-time-units-per-second)))
+           (dds.dcps::%writer-liveliness-sweep p)
+           (let ((s (dds.dcps:get-liveliness-lost-status dw)))
+             (%check :livlost-monotonic
+                     (= 2 (dds.dcps:liveliness-lost-status-total-count s))
+                     "a re-loss after a re-assert must increment total_count to 2 (monotonic)")))
       (dds.dcps:delete-participant p))
     t))
 

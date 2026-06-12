@@ -74,6 +74,9 @@
            #:liveliness-changed-status-not-alive-count-change
            #:liveliness-changed-status-last-publication-handle
            #:get-liveliness-changed-status
+           #:liveliness-lost-status
+           #:liveliness-lost-status-total-count #:liveliness-lost-status-total-count-change
+           #:get-liveliness-lost-status #:assert-liveliness
            ;; Listeners (FR-DCPS-2)
            #:listener #:data-reader-listener #:data-writer-listener #:topic-listener
            #:on-data-available #:on-subscription-matched #:on-requested-incompatible-qos

@@ -392,6 +392,7 @@
                  ("dcps-matched-status"      . run-dcps-matched-status-test)
                  ("lease-unmatch"            . run-lease-unmatch-test)
                  ("liveliness-changed"       . run-liveliness-changed-test)
+                 ("liveliness-lost"          . run-liveliness-lost-test)
                  ("dcps-incompatible-qos"    . run-dcps-incompatible-qos-test)
                  ("dcps-query-condition"     . run-dcps-query-condition-test)
                  ("dcps-condvar-wake"        . run-dcps-condvar-wake-test)
