@@ -354,22 +354,26 @@
                 (push ch merged)))))
         (sort merged #'< :key #'dds.rtps.history:cache-change-sn))))
 
-(defun* %push-data (node)
-    (function (disc-node) t)
+(defun* %push-data-buf (node buf)
+    (function (disc-node dds.core.buffer:octet-buffer) t)
   "Writer side: send each UNSENT change ONCE as a DATA (or DATA_FRAG series for large samples)
    submessage, COALESCED with the trailing HEARTBEAT into as few datagrams as fit the budget
-   (%send-changes-packed, RTPS 2.5 §8.3.4/§8.4.2.2; caller thread, uses tx-msg) — to each matched-reader
-   DESTINATION. The unsent-base watermark is kept PER matched reader (keyed by its full GUID, §8.3.5.4);
-   %merge-unsent advances every reader sharing a destination and sends their union to that destination
-   once (so two DataReaders in one participant both get send-once accounting, not just the first). Lost
-   or late changes are repaired only via the reader's ACKNACK (%on-user-acknack), not by re-pushing the
-   whole unacked history."
+   (%send-changes-packed, RTPS 2.5 §8.3.4/§8.4.2.2), to each matched-reader DESTINATION, using BUF as the
+   scratch message buffer (tx-msg on the caller thread; async-tx-msg on the WP-ASYNC sender thread — each
+   thread owns its buffer). The unsent-base watermark is kept PER matched reader (keyed by its full GUID,
+   §8.3.5.4); %merge-unsent advances every reader sharing a destination and sends their union once. Lost
+   or late changes are repaired only via the reader's ACKNACK (%on-user-acknack)."
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (dolist (group (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched-reader destination
-        (%send-changes-packed node (disc-node-tx-msg node)
+        (%send-changes-packed node buf
                               (%merge-unsent writer (cdr group)) (caar group) (cdar group)
                               (%heartbeat-builder node first last count))))))
+
+(defun* %push-data (node)
+    (function (disc-node) t)
+  "Push unsent changes on the caller thread using tx-msg (the synchronous send path)."
+  (%push-data-buf node (disc-node-tx-msg node)))
 
 (defun* %push-heartbeat (node)
     (function (disc-node) (eql t))
@@ -389,14 +393,57 @@
             (%send-user-heartbeat node (disc-node-tx-msg node) first last count (car peer) (cdr peer)))))))
   t)
 
+(defun* %async-signal (node)
+    (function (disc-node) t)
+  "WP-ASYNC: mark work pending and wake the sender thread (the reliable unsent-list IS the queue; the
+   sender flushes ALL unsent on wake). Guarded by async-lock."
+  (dds.pal:with-lock ((disc-node-async-lock node))
+    (setf (disc-node-async-pending node) t)
+    (dds.pal:condvar-signal (disc-node-async-cv node)))
+  t)
+
+(defun* %async-sender-loop (node)
+    (function (disc-node) t)
+  "WP-ASYNC sender thread (FR-PF-2): wait for a publish/dispose signal (or shutdown), then flush ALL
+   unsent changes on the node's OWN async-tx-msg buffer (%push-data-buf). The async-lock is RELEASED
+   before the send (which takes the reliable writer lock) so there is no nested-lock deadlock; the 0.5 s
+   wait timeout means a missed signal cannot wedge shutdown. On async-stop, drains a final flush + exits."
+  (loop
+    (let ((stop nil))
+      (dds.pal:with-lock ((disc-node-async-lock node))
+        (loop until (or (disc-node-async-stop node) (disc-node-async-pending node))
+              do (dds.pal:condvar-wait (disc-node-async-cv node) (disc-node-async-lock node) 0.5))
+        (setf stop (disc-node-async-stop node)
+              (disc-node-async-pending node) nil))
+      (when (disc-node-user-writer node)
+        (%push-data-buf node (disc-node-async-tx-msg node)))
+      (when stop (return))))
+  t)
+
+(defun* enable-async (node)
+    (function (disc-node) disc-node)
+  "WP-ASYNC (FR-PF-2): give NODE a background SENDER thread so publish-sample returns without blocking on
+   the socket. Idempotent. The sender owns its own async-tx-msg scratch buffer (the app thread keeps
+   tx-msg, the receiver keeps rx-tx-msg). Call after enable-publisher; stop-node joins + drains it. With
+   async on, publish/dispose SIGNAL the sender (the flush-all is adaptive batching); batch-max-samples is
+   superseded."
+  (unless (disc-node-async-thread node)
+    (setf (disc-node-async-tx-msg node) (dds.core.buffer:make-octet-buffer 2048)
+          (disc-node-async-stop node) nil
+          (disc-node-async-pending node) nil
+          (disc-node-async-thread node)
+          (dds.pal:spawn (lambda () (%async-sender-loop node)) :name "dds-async-sender")))
+  node)
+
 (defun* flush-batch (node)
     (function (disc-node) (eql t))
-  "WP-BATCH time/explicit trigger (FR-PF-1): if any batched samples are pending, push them now
-   (%push-data sends all unsent changes, coalesced) and reset the pending counter. A no-op when nothing
-   is pending. Called on the announce cadence (so a partial batch is never stranded) and on stop-node."
+  "WP-BATCH time/explicit trigger (FR-PF-1): if any batched samples are pending, push them now (coalesced)
+   and reset the pending counter. A no-op when nothing is pending. Called on the announce cadence (so a
+   partial batch is never stranded) and on stop-node. In WP-ASYNC mode the sender thread does the push, so
+   this just signals it."
   (when (plusp (disc-node-batch-pending node))
     (setf (disc-node-batch-pending node) 0)
-    (%push-data node))
+    (if (disc-node-async-thread node) (%async-signal node) (%push-data node)))
   t)
 
 (defun* publish-sample (node payload)
@@ -406,12 +453,14 @@
    FR-PF-1/NFR-PERF-4) the push is DEFERRED — the write accumulates and the batch flushes only when
    batch-max-samples have accumulated (size trigger) or flush-batch fires (time/cadence trigger), so N
    small samples go out coalesced in few datagrams with one amortized HEARTBEAT. Default
-   batch-max-samples=1 flushes every write (unchanged behaviour)."
+   batch-max-samples=1 flushes every write (unchanged behaviour). With WP-ASYNC (enable-async, FR-PF-2)
+   the write returns immediately after signalling the sender thread, which does the push off the caller
+   thread (the sender's flush-all is adaptive batching, superseding batch-max-samples)."
   (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload)
-  (if (>= (incf (disc-node-batch-pending node)) (disc-node-batch-max-samples node))
-      (flush-batch node)
-      ;; size trigger not yet reached: defer the push to the next flush (cadence or fill)
-      nil)
+  (cond
+    ((disc-node-async-thread node) (%async-signal node))   ; WP-ASYNC: hand off to the sender thread
+    ((>= (incf (disc-node-batch-pending node)) (disc-node-batch-max-samples node)) (flush-batch node))
+    (t nil))   ; batch size trigger not reached: defer to the next flush (cadence or fill)
   t)
 
 (defun* %dispose-or-unregister (node key-hash status-flags)
@@ -424,8 +473,8 @@
    immediately, which also flushes any pending batched data first (sent in SN order, so a dispose never
    overtakes its instance's batched samples)."
   (let ((sn (dds.rtps.reliable:writer-lifecycle-change (disc-node-user-writer node) key-hash status-flags)))
-    (setf (disc-node-batch-pending node) 0)   ; the immediate push flushes the pending batch too
-    (%push-data node)
+    (setf (disc-node-batch-pending node) 0)   ; the push flushes the pending batch too (data SN < dispose SN)
+    (if (disc-node-async-thread node) (%async-signal node) (%push-data node))
     sn))
 
 (defun* dispose-instance (node key-hash)

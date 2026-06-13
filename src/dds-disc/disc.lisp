@@ -72,6 +72,13 @@
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
   (batch-max-samples 1 :type (integer 1)) ; WP-BATCH size trigger: flush the accumulated batch every N publishes (1 = flush per write, no batching)
   (batch-pending 0 :type (integer 0))     ; samples accumulated since the last flush (a flush pacer; %push-data always sends all unsent)
+  ;; WP-ASYNC: a background sender thread decoupling the push from write() (nil async-thread = synchronous, default)
+  (async-thread nil :type t)
+  (async-lock (dds.pal:make-lock "async") :type t)
+  (async-cv (dds.pal:make-condvar) :type t)
+  (async-pending nil :type t)             ; work to flush (guarded by async-lock)
+  (async-stop nil :type t)                ; shutdown requested (guarded by async-lock)
+  (async-tx-msg nil :type (or null dds.core.buffer:octet-buffer)) ; the sender thread's OWN scratch buffer
   (samples (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> payload (§8.3.5.4: SN is per-writer; no per-sample composite-key alloc)
   (sample-writers (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> writer EntityId (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
@@ -845,7 +852,17 @@
    announce scratch buffers. The join MUST precede the frees: an in-flight
    %HANDLE-DATAGRAM on a receiver thread writes into RX-TX-MSG/TX-MSG, so freeing
    first is a use-after-free (observed via canary instrumentation). Idempotent."
-  (when (disc-node-user-writer node) (flush-batch node))   ; WP-BATCH: drain a pending batch before closing the socket
+  (cond
+    ((disc-node-async-thread node)       ; WP-ASYNC: stop + drain + JOIN the sender BEFORE closing the socket
+     (dds.pal:with-lock ((disc-node-async-lock node))
+       (setf (disc-node-async-stop node) t (disc-node-async-pending node) t)
+       (dds.pal:condvar-signal (disc-node-async-cv node)))
+     (dds.pal:join (disc-node-async-thread node))
+     (setf (disc-node-async-thread node) nil)
+     (when (disc-node-async-tx-msg node)
+       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-async-tx-msg node)))
+       (setf (disc-node-async-tx-msg node) nil)))
+    ((disc-node-user-writer node) (flush-batch node)))   ; WP-BATCH: drain a pending batch before closing the socket
   (dds.pal:udp-close (disc-node-socket node))
   (when (disc-node-mcast-socket node)
     (dds.pal:udp-close (disc-node-mcast-socket node))

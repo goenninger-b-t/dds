@@ -28,7 +28,7 @@
            #:start-node #:stop-node
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
-           #:publish-sample #:flush-batch #:disc-node-batch-max-samples
+           #:publish-sample #:flush-batch #:disc-node-batch-max-samples #:enable-async
            #:node-sample-count #:node-sample #:node-sample-sns
            #:node-sample-writer #:node-sample-writer-guid #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
            #:dispose-instance #:unregister-instance

@@ -349,6 +349,7 @@
                  ("coalesce-split"           . run-coalesce-split-test)
                  ("coalesce-large-pack"      . run-coalesce-large-pack-test)
                  ("batch-defer"              . run-batch-defer-test)
+                 ("async-decoupled"          . run-async-decoupled-test)
                  ("lease-sweep"              . run-lease-sweep-test)
                  ("tce-disallow-default"     . run-tce-disallow-default-test)
                  ("zero-alloc-into"          . run-generated-into-test)

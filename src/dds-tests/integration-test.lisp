@@ -3260,6 +3260,45 @@
       (dds.disc:stop-node node)))
   t)
 
+(defun* run-async-decoupled-test ()
+    (function () t)
+  "WP-ASYNC (FR-PF-2): a writer with enable-async pushes off the caller thread (a background sender);
+   a reliable reader still receives EVERY sample over UDP. Exercises the sender thread end-to-end +
+   stop-node's drain/join. publish-sample returns without blocking on the socket."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 41))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 42))
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "AsyncT" :type "X")
+           (dds.disc:enable-publisher w)
+           (dds.disc:enable-async w)
+           (dds.disc:add-local-reader r :topic "AsyncT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (%check :async-matched (plusp (dds.disc:disc-node-matched-count w))
+                   "async writer must match the reader before publishing")
+           (dotimes (i 20) (dds.disc:publish-sample w (octets 7 7 7 7 7 7 7 7)))
+           (loop repeat 400 until (>= (dds.disc:node-sample-count r) 20) do (sleep 0.01))
+           (%check :async-received (>= (dds.disc:node-sample-count r) 20)
+                   "the async sender thread must deliver all 20 samples to the reliable reader"))
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
 ;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a
 ;;; discovered participant not refreshed within its leaseDuration. %lease-sweep
 ;;; prunes the stale participant's discovered entry + endpoints + matches +
