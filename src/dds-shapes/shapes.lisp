@@ -138,8 +138,9 @@
 
 (defun* run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
                            (advertise-address "127.0.0.1") (type :tagged) (peers nil)
-                           (liveliness :automatic) (liveliness-lease-seconds 0) (dispose-after 0))
-    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0)) (:dispose-after (integer 0))) t)
+                           (liveliness :automatic) (liveliness-lease-seconds 0) (dispose-after 0)
+                           (batch 1) (async nil))
+    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0)) (:dispose-after (integer 0)) (:batch (integer 1)) (:async t)) t)
   "Publish an animated Square on DOMAIN via multicast discovery. TYPE selects the
    payload: :canonical = the exact RTI ShapeType (color/x/y/shapesize — for interop
    with rtishapesdemo / DDSSpy); :tagged = + per-publisher uuid + per-sample seq
@@ -154,7 +155,7 @@
   (check-type type (member :canonical :tagged))
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
                                        :multicast t :advertise-address advertise-address
-                                       :peers (%parse-peers peers))))
+                                       :peers (%parse-peers peers) :batch-max-samples batch)))
     (if (> liveliness-lease-seconds 0)
         (dds.disc:add-local-writer
          node :topic "Square" :type "ShapeType" :type-information (%shape-type-information)
@@ -164,6 +165,7 @@
                                    :reliability dds.rtps.discovery:+reliability-reliable+
                                    :type-information (%shape-type-information)))
     (dds.disc:enable-publisher node)
+    (when async (dds.disc:enable-async node))
     (dds.disc:start-node node)
     (let ((uuid (%make-uuid)))
       (format t "~&[pub] Square/ShapeType[~(~a~)] color=~a domain=~d uuid=~a (multicast 239.255.0.1). Ctrl-C to stop.~%"

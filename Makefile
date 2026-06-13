@@ -33,6 +33,9 @@ LEASE    ?=
 OWNERSHIP ?=
 # Optional writer LIVELINESS QoS for square-pub; empty -> current default behaviour.
 LIVELINESS_ARGS := $(if $(LIVELINESS),:liveliness :$(LIVELINESS),)$(if $(LEASE), :liveliness-lease-seconds $(LEASE),)
+# Optional WP-BATCH / WP-ASYNC for square-pub: BATCH=N (>1 batches), ASYNC=t (decoupled sender thread).
+BATCH    ?= 1
+PERF_ARGS := :batch $(BATCH)$(if $(ASYNC), :async t,)
 # Optional reader OWNERSHIP QoS for gated-sub (shared|exclusive); empty -> :shared default.
 OWNERSHIP_ARGS := $(if $(OWNERSHIP),:ownership :$(OWNERSHIP),)
 
@@ -80,7 +83,7 @@ wire:
 # Ctrl-C to stop. Override DOMAIN=.. COLOR=.. ; LISP=$(SBCL) used (CFFI multicast).
 square-pub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" $(LIVELINESS_ARGS))' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" $(LIVELINESS_ARGS) $(PERF_ARGS))' \
 	        --eval '(uiop:quit 0)'
 
 square-sub:
