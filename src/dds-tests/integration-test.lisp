@@ -2957,6 +2957,78 @@
       (dds.disc:stop-node node)))
   t)
 
+;;; Co-located multi-reader send-once (RTPS 2.5 §8.4.2.2 / §8.3.5.4): two DataReaders in ONE remote
+;;; participant share a unicast destination (a DATA with readerId UNKNOWN reaches both). The writer
+;;; must advance EACH reader's unsent-base watermark while sending the union to the destination once —
+;;; so neither reader re-pushes history on a later write. The old code deduped push targets by
+;;; destination, advancing only ONE reader and leaving the other's accounting stale. Offline: seed two
+;;; reader endpoints sharing a prefix/destination, write, and assert %reader-push-targets groups them
+;;; and %merge-unsent advances both.
+
+(defun* %colocated-reader-guid (prefix-byte entity-key)
+    (function ((unsigned-byte 8) (unsigned-byte 8)) (simple-array (unsigned-byte 8) (16)))
+  "A with-key user-reader GUID (kind 0x07) in participant PREFIX-BYTE (all 12 prefix octets) with
+   entityKey ENTITY-KEY — two such GUIDs sharing PREFIX-BYTE are two readers in ONE participant."
+  (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element prefix-byte)))
+    (setf (aref g 12) #x00 (aref g 13) #x00 (aref g 14) entity-key (aref g 15) #x07)
+    g))
+
+(defun* run-colocated-push-test ()
+    (function () t)
+  "Two matched DataReaders in ONE remote participant get send-once accounting EACH (RTPS 2.5
+   §8.4.2.2/§8.3.5.4): %reader-push-targets groups them under one destination carrying both GUIDs;
+   after the writer pushes a change, BOTH readers' unsent-base advanced (neither re-pushes history on a
+   later write). Asserts the per-reader watermark via writer-unsent-list and %merge-unsent's union."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 8)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (let* ((loc (dds.rtps.discovery:make-locator
+                      :kind dds.rtps.discovery:+locator-kind-udpv4+ :port 7601
+                      :address (dds.rtps.discovery:make-ipv4-locator
+                                (coerce #(127 0 0 1) '(simple-array (unsigned-byte 8) (4))))))
+                (prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x33))
+                (guid-a (%colocated-reader-guid #x33 #x01))
+                (guid-b (%colocated-reader-guid #x33 #x02)))
+           (declare (ignore prefix))
+           (dds.disc:enable-publisher node)
+           (dds.disc::%record-participant
+            node (dds.rtps.discovery:make-spdp-data
+                  :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x33)
+                  :version-major 2 :version-minor 5
+                  :metatraffic-unicast-locators (list loc) :default-unicast-locators (list loc)))
+           (dolist (g (list guid-a guid-b))
+             (setf (gethash (copy-seq g) (dds.disc::disc-node-matches node))
+                   (dds.rtps.discovery:make-endpoint-data
+                    :guid g :topic-name "Square" :type-name "shape-type" :qos (dds.qos:make-reader-qos))))
+           (let* ((writer (dds.disc::disc-node-user-writer node))
+                  (groups (dds.disc::%reader-push-targets node)))
+             (%check :colo-one-group (= 1 (length groups))
+                     "two co-located readers must form ONE destination group")
+             (%check :colo-dest (equal (cons "127.0.0.1" 7601) (car (first groups)))
+                     "the group's destination must be the shared unicast (host . port)")
+             (%check :colo-two-keys (= 2 (length (cdr (first groups))))
+                     "the group must carry BOTH co-located reader GUIDs")
+             (dds.rtps.reliable:writer-write writer (octets 9 9 9 9))
+             (let ((m1 (dds.disc::%merge-unsent writer (cdr (first groups)))))
+               (%check :colo-union-1
+                       (and (= 1 (length m1))
+                            (= 1 (dds.rtps.history:cache-change-sn (first m1))))
+                       "the first push must send exactly SN 1 once to the shared destination"))
+             ;; %merge-unsent advanced BOTH readers: each is now empty (proves the second was not left behind).
+             (%check :colo-a-advanced (null (dds.rtps.reliable:writer-unsent-list writer guid-a))
+                     "reader A's unsent-base must have advanced past SN 1")
+             (%check :colo-b-advanced (null (dds.rtps.reliable:writer-unsent-list writer guid-b))
+                     "reader B's unsent-base must have advanced past SN 1 (the co-located fix)")
+             (dds.rtps.reliable:writer-write writer (octets 8 8 8 8))
+             (let ((m2 (dds.disc::%merge-unsent writer (cdr (first groups)))))
+               (%check :colo-no-repush
+                       (and (= 1 (length m2))
+                            (= 2 (dds.rtps.history:cache-change-sn (first m2))))
+                       "the second push must send ONLY SN 2 — no re-push of SN 1 history"))))
+      (dds.disc:stop-node node)))
+  t)
+
 ;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a
 ;;; discovered participant not refreshed within its leaseDuration. %lease-sweep
 ;;; prunes the stale participant's discovered entry + endpoints + matches +

@@ -194,13 +194,16 @@
 
 (defun* %reader-push-targets (node)
     (function (disc-node) list)
-  "Per matched remote READER, a (READER-KEY host . port) triple for the writer push path: the key is
-   the reader's FULL 16-octet GUID so its unsent-base watermark is independent of any other reader's
-   (RTPS 2.5 §8.3.5.4 — a SN is unique only within one writer GUID, and the corresponding ACKNACK keys
-   by the same remote reader GUID, %on-user-acknack). Falls back to the union of static PEERS keyed by
-   this node's local reader-id when no matched reader endpoint resolves to a destination (the
-   discovery-less test path), so the single stable send-once key is preserved there."
-  (let ((targets '())
+  "Per matched-reader DESTINATION, a ((host . port) READER-KEY…) group for the writer push path: the
+   keys are the FULL 16-octet GUIDs of EVERY matched reader resolving to that (host . port) (RTPS 2.5
+   §8.3.5.4 — a SN is unique only within one writer GUID, and the corresponding ACKNACK keys by the
+   same remote reader GUID, %on-user-acknack). Two DataReaders in one remote participant share a
+   unicast destination — a DATA with readerId UNKNOWN reaches both — so they are grouped, not deduped
+   away: the push sends the union to the destination ONCE while advancing EACH reader's unsent-base
+   (%merge-unsent, %push-data), keeping every co-located reader's send-once accounting honest. Falls
+   back to the union of static PEERS, each carrying this node's local reader-id, when no matched reader
+   endpoint resolves to a destination (the discovery-less test path)."
+  (let ((groups '())   ; alist: (host . port) -> list of matched reader GUID keys at that destination
         (parts (%discovered-participants node)))
     (dolist (remote (%matched-endpoints node))
       (let ((guid (dds.rtps.discovery:endpoint-data-guid remote)))
@@ -209,28 +212,49 @@
                             :key #'dds.rtps.discovery:spdp-data-guid-prefix :test #'equalp)))
             (when spdp
               (let ((hp (%usable-destination spdp)))
-                ;; dedup by destination: two readers on one (host:port) share a push target, so the second's send-once degrades to ACKNACK repair (multi-reader-per-participant sub-follow-up, not data loss).
                 (when (and hp (plusp (cdr hp)))
-                  (pushnew (list* (copy-seq guid) hp) targets
-                           :test #'equalp :key #'cdr))))))))
+                  (let ((cell (assoc hp groups :test #'equal)))
+                    (if cell
+                        (pushnew (copy-seq guid) (cdr cell) :test #'equalp)
+                        (push (list hp (copy-seq guid)) groups))))))))))
     (dolist (peer (disc-node-peers node))
-      (unless (member peer targets :test #'equal :key #'cdr)
-        (push (list* (disc-node-user-reader-id node) peer) targets)))
-    targets))
+      (unless (assoc peer groups :test #'equal)
+        (push (list peer (disc-node-user-reader-id node)) groups)))
+    groups))
+
+(defun* %merge-unsent (writer keys)
+    (function (dds.rtps.reliable:rtps-writer list) list)
+  "The UNSENT CacheChanges to push ONCE to a destination shared by the readers KEYS, in ascending SN
+   order. For the common single-reader destination this is exactly writer-unsent-list (no merge, no
+   extra alloc — byte-identical to the prior path). For co-located readers it calls writer-unsent-list
+   for EACH key — advancing EACH reader's unsent-base watermark so none re-pushes history on a later
+   write (RTPS 2.5 §8.4.2.2) — and returns the SN-deduplicated union (the lower-base set when joins are
+   staggered); one datagram per change reaches every reader at the destination via readerId UNKNOWN
+   (§8.3.5.4)."
+  (if (null (cdr keys))
+      (dds.rtps.reliable:writer-unsent-list writer (car keys))
+      (let ((merged '()))
+        (dolist (k keys)
+          (dolist (ch (dds.rtps.reliable:writer-unsent-list writer k))
+            (let ((sn (dds.rtps.history:cache-change-sn ch)))
+              (unless (find sn merged :key #'dds.rtps.history:cache-change-sn :test #'=)
+                (push ch merged)))))
+        (sort merged #'< :key #'dds.rtps.history:cache-change-sn))))
 
 (defun* %push-data (node)
     (function (disc-node) t)
   "Writer side: send each UNSENT change ONCE as a DATA (or DATA_FRAG series for large samples)
-   submessage, followed by a HEARTBEAT, to each matched reader (pushMode, RTPS 2.5 §8.4.2.2; caller
-   thread, uses tx-msg). The unsent-base watermark is kept PER matched reader (keyed by its full GUID,
-   §8.3.5.4) so each reader is pushed each change exactly once and the matching ACKNACK (keyed by the
-   same remote reader GUID) advances the SAME proxy. Lost or late changes are repaired only via the
-   reader's ACKNACK (%on-user-acknack), not by re-pushing the whole unacked history."
+   submessage, followed by a HEARTBEAT, to each matched-reader DESTINATION (pushMode, RTPS 2.5
+   §8.4.2.2; caller thread, uses tx-msg). The unsent-base watermark is kept PER matched reader (keyed
+   by its full GUID, §8.3.5.4); %merge-unsent advances every reader sharing a destination and sends
+   their union to that destination once (so two DataReaders in one participant both get send-once
+   accounting, not just the first). Lost or late changes are repaired only via the reader's ACKNACK
+   (%on-user-acknack), not by re-pushing the whole unacked history."
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
-      (dolist (target (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched reader
-        (let ((key (car target)) (host (cadr target)) (port (cddr target)))
-          (dolist (ch (dds.rtps.reliable:writer-unsent-list writer key))
+      (dolist (group (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched-reader destination
+        (let ((host (caar group)) (port (cdar group)))
+          (dolist (ch (%merge-unsent writer (cdr group)))
             (%send-change node (disc-node-tx-msg node) ch host port))
           (%send-user-heartbeat node (disc-node-tx-msg node) first last count host port))))))
 
