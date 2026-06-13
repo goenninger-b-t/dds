@@ -128,6 +128,10 @@
   ;; WRITER_DATA_LIFECYCLE (DDS 1.4 §2.2.3.21): writer-local, NOT advertised in SEDP, NOT RxO-checked.
   ;; autodispose_unregistered_instances default TRUE -> an unregister also disposes the instance.
   (autodispose-unregistered-instances t :type boolean)
+  ;; READER_DATA_LIFECYCLE (DDS 1.4 §2.2.3.22): reader-local, NOT advertised in SEDP, NOT RxO-checked.
+  ;; Both default INFINITE -> a NOT_ALIVE instance is never autopurged (the no-op default).
+  (autopurge-nowriter-samples-delay +duration-infinite+ :type qos-duration)
+  (autopurge-disposed-samples-delay +duration-infinite+ :type qos-duration)
   ;; RESOURCE_LIMITS (not an RxO policy). LENGTH_UNLIMITED = -1 is the DDS default.
   (resource-max-samples -1 :type integer)
   (resource-max-instances -1 :type integer)

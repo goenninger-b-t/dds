@@ -472,6 +472,19 @@ the source as deferred or simplified — do not rely on them yet:
   to suppress the auto-dispose: the unregister then carries `Unregistered` (0x02) only and a reader
   reports `NOT_ALIVE_NO_WRITERS` once the last writer is gone. The policy is **writer-local** — it is
   not advertised in SEDP and not part of RxO compatibility.
+- **`READER_DATA_LIFECYCLE` autopurge (DDS 1.4 §2.2.3.22, both delays default INFINITE).** A
+  `DataReader` purges **all** internal information + untaken samples for a `NOT_ALIVE` instance after a
+  configurable delay: `autopurge_disposed_samples_delay` once the instance is `NOT_ALIVE_DISPOSED`,
+  `autopurge_nowriter_samples_delay` once it is `NOT_ALIVE_NO_WRITERS`
+  (`make-reader-qos :autopurge-disposed-samples-delay {5 0}` etc.). Each instance records the
+  internal-time stamp of its `ALIVE -> NOT_ALIVE` transition; the purge sweep runs on the DCPS announce
+  cadence (`spin`, beside the writer-liveliness sweep) and, when the applicable delay is **finite** and
+  has elapsed, removes that instance's cached samples, its instance record, and its view-state entry —
+  so a later sample for the same key starts a **fresh `ALIVE` instance** (view-state `NEW`, generation
+  counts reset to `0`). **Both delays default `+duration-infinite+`, so by default nothing is ever
+  purged** (the common case is a no-op). The policy is **reader-local** — not advertised in SEDP and
+  not part of RxO compatibility. The purge runs on the user/`spin` thread (the cache owner), never the
+  receiver thread.
 - **EXCLUSIVE OWNERSHIP arbitration: reader side (S1).** An `EXCLUSIVE` `DataReader`
   (`make-reader-qos :ownership :exclusive`) delivers, **per instance**, only the samples of the
   **owner** — the highest-`OWNERSHIP_STRENGTH` alive matched writer (DDS 1.4 §2.2.3.9.2 / §2.2.3.10).

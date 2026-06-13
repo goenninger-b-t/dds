@@ -403,6 +403,7 @@
                  ("dcps-writer-unmatch"      . run-dcps-writer-unmatch-test)
                  ("dcps-drain-sn-order"      . run-dcps-drain-sn-order-test)
                  ("dcps-autodispose-reader"  . run-dcps-autodispose-reader-test)
+                 ("dcps-autopurge"           . run-dcps-autopurge-test)
                  ("dcps-autodispose-writer"  . run-dcps-autodispose-writer-test)
                  ("dcps-exclusive-ownership" . run-dcps-exclusive-ownership-test)
                  ("dcps-exclusive-pre-match" . run-dcps-exclusive-pre-match-test)

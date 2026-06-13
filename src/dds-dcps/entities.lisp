@@ -156,13 +156,16 @@
    OWNER-GUID/OWNER-STRENGTH track the EXCLUSIVE-ownership owner of the instance (DDS 1.4
    §2.2.3.9.2): the 16-octet GUID + strength of the highest-strength alive writer whose
    samples are currently delivered. OWNER-GUID NIL = no current owner (lazily reclaimed by
-   the next sample). Unused on SHARED readers (arbitration off)."
+   the next sample). Unused on SHARED readers (arbitration off).
+   NOT-ALIVE-SINCE is the internal-time stamp (%lease-now) of the most recent ALIVE->NOT_ALIVE
+   transition, or NIL while ALIVE — the READER_DATA_LIFECYCLE autopurge clock (DDS 1.4 §2.2.3.22)."
   (state :alive :type (member :alive :not-alive-disposed :not-alive-no-writers))
   (disposed-gen-count 0 :type integer)
   (no-writers-gen-count 0 :type integer)
   (writers '() :type list)
   (owner-guid nil :type (or null (simple-array (unsigned-byte 8) (16))))
-  (owner-strength 0 :type integer))
+  (owner-strength 0 :type integer)
+  (not-alive-since nil :type (or null (integer 0))))
 
 ;;; ---- type-support serialization helpers (PLAIN_CDR2_LE SerializedPayload) ----
 
@@ -268,6 +271,7 @@
   (dds.disc:announce-participant (dp-node p))
   (dds.disc:announce-endpoints (dp-node p))
   (%writer-liveliness-sweep p)   ; writer-side LIVELINESS_LOST on the DCPS cadence (DDS 1.4 §2.2.3.11)
+  (dolist (dr (%participant-readers p)) (%autopurge-sweep dr))   ; READER_DATA_LIFECYCLE autopurge (DDS 1.4 §2.2.3.22)
   t)
 
 ;;; ---- Publisher / Subscriber / Topic ----
@@ -552,6 +556,14 @@
                              :sequence-number 0)))))
   t)
 
+(defun* %note-not-alive-since (rec)
+    (function (instance-rec) t)
+  "Stamp REC's NOT-ALIVE-SINCE to now (%lease-now) — the READER_DATA_LIFECYCLE autopurge clock
+   (DDS 1.4 §2.2.3.22), read by %autopurge-sweep. Single stamping point for every ALIVE->NOT_ALIVE
+   transition (DRY) so the sweep's elapsed-since measurement uses the SAME clock the sweep reads."
+  (setf (instance-rec-not-alive-since rec) (%lease-now))
+  t)
+
 (defun* %wake-reader-data (dr)
     (function (data-reader) t)
   "Fire DR's on_data_available (if masked) OUTSIDE the status lock, then wake its WaitSets —
@@ -621,6 +633,7 @@
                     (null (instance-rec-writers rec)) (eq old :alive))
                (setf (instance-rec-state rec) :not-alive-no-writers)))
             (unless (eq old (instance-rec-state rec))
+              (%note-not-alive-since rec)   ; stamp the autopurge clock on ALIVE->NOT_ALIVE (DDS 1.4 §2.2.3.22)
               (%enqueue-instance-notification dr key-hash rec)
               (setf changed t))))))
     changed))
@@ -641,6 +654,7 @@
          (when (and (null (instance-rec-writers rec))
                     (eq (instance-rec-state rec) :alive))
            (setf (instance-rec-state rec) :not-alive-no-writers)
+           (%note-not-alive-since rec)   ; stamp the autopurge clock (DDS 1.4 §2.2.3.22)
            (%enqueue-instance-notification dr handle rec)
            (setf changed t))))
      (dr-instance-recs dr))
@@ -661,7 +675,8 @@
       (:alive)
       (:not-alive-disposed (incf (instance-rec-disposed-gen-count rec)))
       (:not-alive-no-writers (incf (instance-rec-no-writers-gen-count rec))))
-    (setf (instance-rec-state rec) :alive)
+    (setf (instance-rec-state rec) :alive
+          (instance-rec-not-alive-since rec) nil)   ; clear the autopurge clock on revival (DDS 1.4 §2.2.3.22)
     rec))
 
 (defun* %reader-exclusive-p (dr)
@@ -728,6 +743,71 @@
                (setf (instance-rec-owner-guid rec) nil (instance-rec-owner-strength rec) 0)))
            (dr-instance-recs dr))
   t)
+
+(defun* %autopurge-instance-delay (dr rec)
+    (function (data-reader instance-rec) (or null dds.qos:qos-duration))
+  "The applicable READER_DATA_LIFECYCLE autopurge delay for instance REC on reader DR (DDS 1.4
+   §2.2.3.22): autopurge_disposed_samples_delay for a NOT_ALIVE_DISPOSED instance,
+   autopurge_nowriter_samples_delay for a NOT_ALIVE_NO_WRITERS instance; NIL for an ALIVE instance
+   or when the reader's QoS is absent (never purge)."
+  (let ((qos (entity-qos dr)))
+    (when (typep qos 'dds.qos:qos)
+      (ecase (instance-rec-state rec)
+        (:alive nil)
+        (:not-alive-disposed (dds.qos:qos-autopurge-disposed-samples-delay qos))
+        (:not-alive-no-writers (dds.qos:qos-autopurge-nowriter-samples-delay qos))))))
+
+(defun* %autopurge-due-p (rec delay now)
+    (function (instance-rec (or null dds.qos:qos-duration) (integer 0)) boolean)
+  "T iff NOT_ALIVE instance REC is due for autopurge at time NOW under DELAY (DDS 1.4 §2.2.3.22):
+   DELAY is finite (not DURATION_INFINITE, the default — INFINITE never purges) and at least DELAY of
+   internal-time has elapsed since the instance went not-alive. The Duration_t->internal-units
+   conversion reuses %lease-internal-units (DRY), the same lease arithmetic the liveliness sweep uses."
+  (and delay
+       (instance-rec-not-alive-since rec)
+       (< (dds.qos:qos-duration-sec delay) #x7fffffff)
+       (>= (- now (instance-rec-not-alive-since rec)) (%lease-internal-units delay))))
+
+(defun* %autopurge-purge-instance (dr handle)
+    (function (data-reader (simple-array (unsigned-byte 8) (16))) t)
+  "Purge ALL reader-internal state for instance HANDLE (DDS 1.4 §2.2.3.22): drop its untaken cached
+   samples from dr-cache, its instance-rec (state + generation counts + writers-set + owner pointer),
+   and its dr-instances view-state entry — so the instance is fully forgotten and a later sample for the
+   same key starts a brand-new ALIVE instance (view-state NEW, generation counts reset). The per-writer
+   dr-drained high-water is left intact (it is keyed by writer GUID, not instance — §8.3.5.4 — so a
+   replayed lower SN is still suppressed while a fresh higher-SN sample still drains)."
+  (setf (dr-cache dr)
+        (remove handle (dr-cache dr)
+                :test #'equalp
+                :key (lambda (cs) (sample-info-instance-handle (cached-sample-info cs)))))
+  (remhash handle (dr-instance-recs dr))
+  (remhash handle (dr-instances dr))
+  t)
+
+(defun* %autopurge-sweep (dr)
+    (function (data-reader) t)
+  "READER_DATA_LIFECYCLE autopurge sweep on the USER/spin thread (DDS 1.4 §2.2.3.22): for each
+   NOT_ALIVE instance whose applicable autopurge delay is finite AND has elapsed since the instance went
+   not-alive, PURGE it (%autopurge-purge-instance). Both delays default DURATION_INFINITE, so the common
+   case is a no-op — no instance is ever purged by default. Run on the DCPS announce cadence (SPIN),
+   beside the writer-liveliness/lease sweeps; mutates dr-cache + instance-recs on the user/spin thread
+   only (the dr-cache owner thread), never the receiver thread (S2 lock discipline). Snapshots the
+   due handles before mutating so the maphash is not modified under iteration."
+  (let ((now (%lease-now)) (due '()))
+    (maphash
+     (lambda (handle rec)
+       (when (%autopurge-due-p rec (%autopurge-instance-delay dr rec) now)
+         (push handle due)))
+     (dr-instance-recs dr))
+    (dolist (handle due) (%autopurge-purge-instance dr handle)))
+  t)
+
+(defun* %participant-readers (p)
+    (function (domain-participant) list)
+  "Every local DataReader contained in participant P (across all its Subscribers)."
+  (let ((rs '()))
+    (dolist (c (dp-children p) rs)
+      (when (typep c 'subscriber) (setf rs (append (sub-readers c) rs))))))
 
 (defun* %drain-one-sample (dr node ts key)
     (function (data-reader t t cons) t)

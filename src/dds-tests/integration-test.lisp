@@ -736,6 +736,165 @@
   (let ((lc (dds.disc:node-lifecycle-change node sn)))
     (and lc (third lc))))
 
+(defun* %instance-rec-not-alive-since (dr handle)
+    (function (dds.dcps:data-reader (simple-array (unsigned-byte 8) (16))) t)
+  "DR's NOT-ALIVE-SINCE internal-time stamp for HANDLE (nil when ALIVE / no record); test accessor."
+  (let ((rec (gethash handle (dds.dcps::dr-instance-recs dr))))
+    (and rec (dds.dcps::instance-rec-not-alive-since rec))))
+
+(defun* %handle-cache-count (dr handle)
+    (function (dds.dcps:data-reader (simple-array (unsigned-byte 8) (16))) (integer 0))
+  "How many cached-samples (valid OR invalid) DR holds for instance HANDLE (test accessor)."
+  (count-if (lambda (cs) (equalp handle (%cs-ih cs))) (dds.dcps::dr-cache dr)))
+
+(defun* %backdate-not-alive (dr handle seconds-ago)
+    (function (dds.dcps:data-reader (simple-array (unsigned-byte 8) (16)) (integer 0)) t)
+  "Backdate instance HANDLE's not-alive-since by SECONDS-AGO of internal-time (clamped at 0 so a
+   low-uptime test process never underflows the (integer 0) slot) — the deterministic offline stand-in
+   for waiting out the autopurge delay (DDS 1.4 §2.2.3.22), no real sleep."
+  (setf (dds.dcps::instance-rec-not-alive-since (gethash handle (dds.dcps::dr-instance-recs dr)))
+        (max 0 (- (dds.dcps::%lease-now) (* seconds-ago internal-time-units-per-second))))
+  t)
+
+(defun* run-dcps-autopurge-test ()
+    (function () t)
+  "DCPS READER_DATA_LIFECYCLE autopurge of NOT_ALIVE instances (DDS 1.4 §2.2.3.22): after a configurable
+   delay a DataReader purges all internal information + untaken samples for a NOT_ALIVE_NO_WRITERS or
+   NOT_ALIVE_DISPOSED instance. Deterministic offline injection — stage data + a dispose/unregister in
+   the engine SN maps, %drain, BACKDATE the instance's not-alive-since, run %autopurge-sweep; no UDP, no
+   real wait. (a) DEFAULT (both autopurge delays INFINITE) NEVER purges (the no-op common case). (b) A
+   FINITE autopurge_disposed_samples_delay purges a disposed instance once now-not-alive-since >= delay:
+   its cached samples + instance-rec are gone, and a later sample for the SAME key starts a FRESH ALIVE
+   instance (view-state NEW, disposed_generation_count reset 0). (c) The same via the no-writers path
+   under autopurge_nowriter_samples_delay. (d) A still-ALIVE instance is never purged; a NOT_ALIVE
+   instance WITHIN its delay is not purged."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (delay (dds.qos:make-qos-duration 1 0))         ; {1,0}s finite autopurge delay
+         (wid #x00000102))
+    ;; (a) DEFAULT (both delays INFINITE): a disposed instance is NEVER purged — the no-op default.
+    (let ((p (dds.dcps:create-participant :domain 0)))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                  (sub (dds.dcps:create-subscriber p))
+                  (dr (dds.dcps:create-datareader sub tp))   ; default reader QoS = INFINITE delays
+                  (node (dds.dcps::dp-node p))
+                  (s (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                  (h (funcall (dds.types:type-support-key-hash ts) s))
+                  (bytes (dds.dcps::%serialize-sample ts s)))
+             (%stage-data-sn node 1 h bytes wid)
+             (%stage-lifecycle-sn node 2 :dispose h wid dds.rtps.message:+statusinfo-disposed+)
+             (dds.dcps::%drain dr)
+             (%check :ap-def-disposed (eq :not-alive-disposed (%instance-rec-state dr h))
+                     "instance must be NOT_ALIVE_DISPOSED before the sweep")
+             ;; backdate far past any finite delay; INFINITE default must still never purge
+             (%backdate-not-alive dr h 3600)
+             (dds.dcps::%autopurge-sweep dr)
+             (%check :ap-def-kept-rec (eq :not-alive-disposed (%instance-rec-state dr h))
+                     "DEFAULT (INFINITE delay) must NEVER purge the instance-rec")
+             (%check :ap-def-kept-cache (plusp (%handle-cache-count dr h))
+                     "DEFAULT (INFINITE delay) must NEVER purge cached samples"))
+        (dds.dcps:delete-participant p)))
+    ;; (b) FINITE autopurge_disposed_samples_delay: disposed instance purged past the delay.
+    (let ((p (dds.dcps:create-participant :domain 0)))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                  (sub (dds.dcps:create-subscriber p))
+                  (dr (dds.dcps:create-datareader
+                       sub tp :qos (dds.qos:make-reader-qos :autopurge-disposed-samples-delay delay)))
+                  (node (dds.dcps::dp-node p))
+                  (s (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                  (h (funcall (dds.types:type-support-key-hash ts) s))
+                  (bytes (dds.dcps::%serialize-sample ts s)))
+             (%stage-data-sn node 1 h bytes wid)
+             (%stage-lifecycle-sn node 2 :dispose h wid dds.rtps.message:+statusinfo-disposed+)
+             (dds.dcps::%drain dr)
+             (%check :ap-dis-state (eq :not-alive-disposed (%instance-rec-state dr h))
+                     "instance must be NOT_ALIVE_DISPOSED before the sweep")
+             (%check :ap-dis-stamped (integerp (%instance-rec-not-alive-since dr h))
+                     "not-alive-since must be stamped on the ALIVE->NOT_ALIVE transition")
+             ;; WITHIN the delay (not yet elapsed): not purged.
+             (dds.dcps::%autopurge-sweep dr)
+             (%check :ap-dis-within (eq :not-alive-disposed (%instance-rec-state dr h))
+                     "a disposed instance WITHIN its delay must not be purged")
+             ;; BACKDATE past the 1s delay -> purge.
+             (%backdate-not-alive dr h 2)
+             (dds.dcps::%autopurge-sweep dr)
+             (%check :ap-dis-rec-gone (null (gethash h (dds.dcps::dr-instance-recs dr)))
+                     "the disposed instance-rec must be PURGED past the delay")
+             (%check :ap-dis-cache-gone (zerop (%handle-cache-count dr h))
+                     "the disposed instance's cached samples must be PURGED past the delay")
+             (%check :ap-dis-view-gone (not (nth-value 1 (gethash h (dds.dcps::dr-instances dr))))
+                     "the purged instance's view-state entry must be removed")
+             ;; A NEW sample for the SAME key starts a FRESH ALIVE instance (view NEW, gen reset 0).
+             (%stage-data-sn node 3 h bytes wid)
+             (dds.dcps::%drain dr)
+             (%check :ap-dis-fresh-alive (eq :alive (%instance-rec-state dr h))
+                     "a sample after purge must start a FRESH ALIVE instance")
+             (%check :ap-dis-fresh-gen (= 0 (%instance-rec-disp-gen dr h))
+                     "the fresh instance's disposed_generation_count must reset to 0")
+             (let ((info (dds.dcps:cached-sample-info
+                          (first (dds.dcps:read-samples dr :states '(:not-read))))))
+               (%check :ap-dis-fresh-view (eq :new (dds.dcps:sample-info-view-state info))
+                       "the fresh instance's first sample view-state must be NEW")))
+        (dds.dcps:delete-participant p)))
+    ;; (c) FINITE autopurge_nowriter_samples_delay: no-writers instance purged past the delay.
+    (let ((p (dds.dcps:create-participant :domain 0)))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                  (sub (dds.dcps:create-subscriber p))
+                  (dr (dds.dcps:create-datareader
+                       sub tp :qos (dds.qos:make-reader-qos :autopurge-nowriter-samples-delay delay)))
+                  (node (dds.dcps::dp-node p))
+                  (s (make-shape-type :color "GREEN" :x 5 :y 5 :shapesize 22))
+                  (h (funcall (dds.types:type-support-key-hash ts) s))
+                  (bytes (dds.dcps::%serialize-sample ts s)))
+             (%stage-data-sn node 1 h bytes wid)
+             ;; pure Unregistered (0x02) of the last writer -> NOT_ALIVE_NO_WRITERS.
+             (%stage-lifecycle-sn node 2 :unregister h wid dds.rtps.message:+statusinfo-unregistered+)
+             (dds.dcps::%drain dr)
+             (%check :ap-nw-state (eq :not-alive-no-writers (%instance-rec-state dr h))
+                     "instance must be NOT_ALIVE_NO_WRITERS before the sweep")
+             (%check :ap-nw-stamped (integerp (%instance-rec-not-alive-since dr h))
+                     "not-alive-since must be stamped on the no-writers transition")
+             (%backdate-not-alive dr h 2)
+             (dds.dcps::%autopurge-sweep dr)
+             (%check :ap-nw-rec-gone (null (gethash h (dds.dcps::dr-instance-recs dr)))
+                     "the no-writers instance-rec must be PURGED past the delay")
+             (%check :ap-nw-cache-gone (zerop (%handle-cache-count dr h))
+                     "the no-writers instance's cached samples must be PURGED past the delay"))
+        (dds.dcps:delete-participant p)))
+    ;; (d) cross-policy: a disposed-delay reader must NOT purge a NOT_ALIVE_NO_WRITERS instance, and an
+    ;; ALIVE instance is never purged regardless.
+    (let ((p (dds.dcps:create-participant :domain 0)))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                  (sub (dds.dcps:create-subscriber p))
+                  (dr (dds.dcps:create-datareader
+                       sub tp :qos (dds.qos:make-reader-qos :autopurge-disposed-samples-delay delay)))
+                  (node (dds.dcps::dp-node p))
+                  (s-nw (make-shape-type :color "GREEN" :x 5 :y 5 :shapesize 22))
+                  (h-nw (funcall (dds.types:type-support-key-hash ts) s-nw))
+                  (b-nw (dds.dcps::%serialize-sample ts s-nw))
+                  (s-al (make-shape-type :color "RED" :x 3 :y 3 :shapesize 14))
+                  (h-al (funcall (dds.types:type-support-key-hash ts) s-al))
+                  (b-al (dds.dcps::%serialize-sample ts s-al)))
+             (%stage-data-sn node 1 h-nw b-nw wid)
+             (%stage-lifecycle-sn node 2 :unregister h-nw wid dds.rtps.message:+statusinfo-unregistered+)
+             (%stage-data-sn node 3 h-al b-al wid)         ; stays ALIVE
+             (dds.dcps::%drain dr)
+             (%check :ap-x-nw (eq :not-alive-no-writers (%instance-rec-state dr h-nw))
+                     "the no-writers instance must be NOT_ALIVE_NO_WRITERS")
+             (%check :ap-x-al (eq :alive (%instance-rec-state dr h-al))
+                     "the other instance must be ALIVE")
+             (%backdate-not-alive dr h-nw 2)
+             (dds.dcps::%autopurge-sweep dr)
+             (%check :ap-x-nw-kept (eq :not-alive-no-writers (%instance-rec-state dr h-nw))
+                     "a disposed-delay reader must NOT purge a NOT_ALIVE_NO_WRITERS instance")
+             (%check :ap-x-al-kept (eq :alive (%instance-rec-state dr h-al))
+                     "a still-ALIVE instance must NEVER be purged"))
+        (dds.dcps:delete-participant p)))
+    t))
+
 (defun* run-dcps-autodispose-writer-test ()
     (function () t)
   "DCPS writer-side WRITER_DATA_LIFECYCLE.autodispose_unregistered_instances over UDP (S1, DDS 1.4

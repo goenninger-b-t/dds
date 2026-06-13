@@ -21,6 +21,7 @@
            #:qos-presentation-coherent #:qos-presentation-ordered
            #:qos-data-representation #:qos-partition
            #:qos-autodispose-unregistered-instances
+           #:qos-autopurge-nowriter-samples-delay #:qos-autopurge-disposed-samples-delay
            #:qos-history-kind #:qos-history-depth #:qos-lifespan
            #:qos-resource-max-samples #:qos-resource-max-instances
            #:qos-resource-max-samples-per-instance

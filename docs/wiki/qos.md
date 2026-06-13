@@ -50,6 +50,8 @@ a package-qualified accessor.
 | `dds.qos:qos-data-representation` | DATA_REPRESENTATION list. Writer: the *offered* representation is `(first …)`. Reader: the *set* of accepted representations. | `(:xcdr1)` |
 | `dds.qos:qos-partition` | PARTITION — a list of partition-name strings | `()` |
 | `dds.qos:qos-autodispose-unregistered-instances` | WRITER_DATA_LIFECYCLE `autodispose_unregistered_instances` (writer-local, non-RxO, §2.2.3.21) — `t` makes a writer's `unregister_instance` also dispose the instance | `t` |
+| `dds.qos:qos-autopurge-nowriter-samples-delay` | READER_DATA_LIFECYCLE `autopurge_nowriter_samples_delay` (reader-local, non-RxO, §2.2.3.22) — delay after which a `NOT_ALIVE_NO_WRITERS` instance's samples + resources are purged. `+duration-infinite+` = never purge | `+duration-infinite+` |
+| `dds.qos:qos-autopurge-disposed-samples-delay` | READER_DATA_LIFECYCLE `autopurge_disposed_samples_delay` (reader-local, non-RxO, §2.2.3.22) — delay after which a `NOT_ALIVE_DISPOSED` instance's samples + resources are purged. `+duration-infinite+` = never purge | `+duration-infinite+` |
 | `dds.qos:qos-history-kind` | HISTORY kind (held, non-RxO) — `:keep-last` or `:keep-all` | `:keep-last` |
 | `dds.qos:qos-history-depth` | HISTORY depth (held, non-RxO) | `1` |
 | `dds.qos:qos-lifespan` | LIFESPAN duration (held, non-RxO) | `+duration-infinite+` |
@@ -202,6 +204,13 @@ and `run-dcps-incompatible-qos-test` / `run-assignability-test` (in
   `autodispose_unregistered_instances` TRUE a `DataWriter::unregister_instance` also disposes the
   instance (the reader reports `NOT_ALIVE_DISPOSED`); FALSE leaves it at `NOT_ALIVE_NO_WRITERS`. It is
   not advertised in SEDP and excluded from `qos-rxo-compatible`.
+- **READER_DATA_LIFECYCLE is reader-local (DDS 1.4 §2.2.3.22, both delays default INFINITE).** The two
+  `autopurge_*_samples_delay` durations control when a DataReader purges all internal information +
+  untaken samples for a `NOT_ALIVE` instance: `autopurge_disposed_samples_delay` after it became
+  `NOT_ALIVE_DISPOSED`, `autopurge_nowriter_samples_delay` after it became `NOT_ALIVE_NO_WRITERS`. Both
+  default `+duration-infinite+`, so **by default nothing is ever purged** (the common case is a no-op).
+  Reader-local: not advertised in SEDP and excluded from `qos-rxo-compatible`. See the
+  [DCPS page](dcps.md) for the purge mechanics.
 - **PARTITION gates matching but raises no status.** It is excluded from
   `qos-rxo-compatible` and handled by `partition-match-p`; a mismatch silently prevents the
   match. Per the source docstring, **wildcard / `fnmatch` partition names are a later
