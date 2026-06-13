@@ -2957,6 +2957,43 @@
       (dds.disc:stop-node node)))
   t)
 
+;;; Static-:peers user-data isolation (FR-DISC-4 / RTPS 2.5 §9.6.1.4): a :peers entry is an SPDP
+;;; metatraffic BOOTSTRAP locator, NOT a user-data destination. Once a reader is matched, user data must
+;;; go to its DEFAULT_UNICAST locator alone — the static SPDP peer (a different port) must not also
+;;; receive user DATA (a foreign peer like Fast DDS binds metatraffic 7410 and user 7411 on separate
+;;; ports, so user DATA to 7410 is dropped; our own stack shares one socket so it was merely wasteful).
+;;; The fallback to static peers as a user-data destination fires ONLY in the discovery-less case
+;;; (no matched reader resolved).
+
+(defun* run-push-spdp-peer-isolation-test ()
+    (function () t)
+  "A matched reader's resolved DEFAULT_UNICAST destination is the sole user-data push target; a static
+   :peers SPDP/metatraffic locator on a DIFFERENT port is NOT added as a second user-data destination
+   once a reader is matched. The static-peer fallback fires ONLY when no matched reader resolved (the
+   discovery-less path)."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (%seed-reader-participant node #x60 7411)              ; matched reader, user locator 127.0.0.1:7411
+           (setf (dds.disc::disc-node-peers node) (list (cons "127.0.0.1" 7410)))  ; SPDP bootstrap peer, port 7410
+           (let ((groups (dds.disc::%reader-push-targets node)))
+             (%check :psi-one-group (= 1 (length groups))
+                     "a matched reader must not add the static SPDP peer as a 2nd user-data destination")
+             (%check :psi-user-dest (equal (cons "127.0.0.1" 7411) (car (first groups)))
+                     "the push destination must be the reader's DEFAULT_UNICAST locator (7411)")
+             (%check :psi-no-spdp-port
+                     (notany (lambda (g) (equal (cons "127.0.0.1" 7410) (car g))) groups)
+                     "user data must never target the static SPDP/metatraffic peer port (7410)"))
+           (clrhash (dds.disc::disc-node-matches node))           ; discovery-less: no matched reader
+           (let ((groups (dds.disc::%reader-push-targets node)))
+             (%check :psi-fallback
+                     (and (= 1 (length groups)) (equal (cons "127.0.0.1" 7410) (car (first groups))))
+                     "with no matched reader the static peer is the discovery-less fallback destination")))
+      (dds.disc:stop-node node)))
+  t)
+
 ;;; Co-located multi-reader send-once (RTPS 2.5 §8.4.2.2 / §8.3.5.4): two DataReaders in ONE remote
 ;;; participant share a unicast destination (a DATA with readerId UNKNOWN reaches both). The writer
 ;;; must advance EACH reader's unsent-base watermark while sending the union to the destination once —

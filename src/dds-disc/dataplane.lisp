@@ -294,8 +294,11 @@
    unicast destination — a DATA with readerId UNKNOWN reaches both — so they are grouped, not deduped
    away: the push sends the union to the destination ONCE while advancing EACH reader's unsent-base
    (%merge-unsent, %push-data), keeping every co-located reader's send-once accounting honest. Falls
-   back to the union of static PEERS, each carrying this node's local reader-id, when no matched reader
-   endpoint resolves to a destination (the discovery-less test path)."
+   back to the static PEERS (each carrying this node's local reader-id) ONLY when NO matched reader
+   resolved to a destination (the discovery-less test path) — a :peers entry is an SPDP metatraffic
+   BOOTSTRAP locator (FR-DISC-4), not a user-data destination, so once a real reader is matched its
+   DEFAULT_UNICAST locator (§9.6.1.4) is the destination and the SPDP peer is NOT also blasted with user
+   DATA (which a foreign peer binds on a different port from its user-data locator)."
   (let ((groups '())   ; alist: (host . port) -> list of matched reader GUID keys at that destination
         (parts (%discovered-participants node)))
     (dolist (remote (%matched-endpoints node))
@@ -310,9 +313,10 @@
                     (if cell
                         (pushnew (copy-seq guid) (cdr cell) :test #'equalp)
                         (push (list hp (copy-seq guid)) groups))))))))))
-    (dolist (peer (disc-node-peers node))
-      (unless (assoc peer groups :test #'equal)
-        (push (list peer (disc-node-user-reader-id node)) groups)))
+    (when (null groups)   ; discovery-less ONLY: a :peers entry is an SPDP bootstrap locator, not a user-data dest
+      (dolist (peer (disc-node-peers node))
+        (unless (assoc peer groups :test #'equal)   ; dedup duplicate :peers entries
+          (push (list peer (disc-node-user-reader-id node)) groups))))
     groups))
 
 (defun* %merge-unsent (writer keys)

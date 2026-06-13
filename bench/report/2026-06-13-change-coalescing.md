@@ -53,11 +53,15 @@ frames 9-15                    0x15,0x07     SN 2..8, each DATA+HEARTBEAT in one
 ```
 
 The standard dissector parses both submessages cleanly, confirming the coalesced datagram is well-formed
-RTPS (§8.3.4) — the same framing Connext/Fast DDS emit and parse. End-to-end reception over a real UDP
-socket is covered by the passing UDP-loopback regression suite (which drives our reader through the
-coalescing send path). (Foreign-peer end-to-end *delivery* on this run used the loopback static-`:peers`
-fallback destination, a same-host discovery-resolution detail orthogonal to the coalescing framing
-proven here.)
+RTPS (§8.3.4) — the same framing Connext/Fast DDS emit and parse.
+
+**Foreign-peer end-to-end delivery CONFIRMED.** With discovery given time to complete (a longer run),
+our square-pub → Fast DDS shapes_sub on loopback delivers **299/300 coalesced samples** (ACKNACKs
+climbing 22→210); the publisher resolves Fast DDS's `PID_DEFAULT_UNICAST_LOCATOR` 127.0.0.1:7411 and
+sends the coalesced DATA+HEARTBEAT there. The initial "received 0" was a harness-timing artifact
+(`count=8 ÷ rate=30` exited the publisher in ~0.27 s, before discovery) plus a static-`:peers`
+user-data wart — both addressed (see `docs/superpowers/specs/2026-06-13-push-spdp-peer-isolation-design.md`:
+the SPDP bootstrap peer is no longer used as a user-data destination once a reader is matched).
 
 ## Gates
 143 tests pass on SBCL and Clasp (was 140; +`coalesce-pack` +`coalesce-split` +`coalesce-large-pack`).

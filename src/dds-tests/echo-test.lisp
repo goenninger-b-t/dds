@@ -343,6 +343,7 @@
                  ("endpoint-kind"            . run-endpoint-kind-test)
                  ("keyed-match"              . run-keyed-match-test)
                  ("acknack-addressing"       . run-acknack-addressing-test)
+                 ("push-spdp-peer-isolation" . run-push-spdp-peer-isolation-test)
                  ("colocated-push"           . run-colocated-push-test)
                  ("coalesce-pack"            . run-coalesce-pack-test)
                  ("coalesce-split"           . run-coalesce-split-test)
