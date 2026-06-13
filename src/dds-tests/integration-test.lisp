@@ -2898,6 +2898,65 @@
       (dds.disc:stop-node node)))
   t)
 
+;;; ACKNACK retransmit addressing (RTPS 2.5 §8.4.2.2 / §9.4.4): a NACK comes from exactly one
+;;; reader, so the writer must retransmit the NACKed changes to THAT participant's destination
+;;; alone, not fan them out to every matched reader (over-send, harmless under KEEP_ALL but
+;;; wasteful). %prefix-user-destination resolves the single (host . port) from the ACKNACK's
+;;; src-prefix; the test seeds two matched reader participants and asserts the fan-out set is 2
+;;; while the targeted resolution picks exactly the originating one.
+
+(defun* %seed-reader-participant (node prefix-byte port)
+    (function (dds.disc:disc-node (unsigned-byte 8) (unsigned-byte 16))
+              (values (simple-array (unsigned-byte 8) (12)) cons))
+  "Seed NODE with a discovered remote participant (SPDP, default-unicast 127.0.0.1:PORT) holding one
+   matched user READER endpoint (with-key kind 0x07), its 12-octet prefix all PREFIX-BYTE. Returns
+   the prefix and its expected (host . port) — the offline twin of SPDP+SEDP for a remote reader."
+  (let* ((prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element prefix-byte))
+         (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element prefix-byte))
+         (loc (dds.rtps.discovery:make-locator
+               :kind dds.rtps.discovery:+locator-kind-udpv4+ :port port
+               :address (dds.rtps.discovery:make-ipv4-locator
+                         (coerce #(127 0 0 1) '(simple-array (unsigned-byte 8) (4)))))))
+    (setf (aref guid 12) #x00 (aref guid 13) #x00 (aref guid 14) #x01 (aref guid 15) #x07)
+    (dds.disc::%record-participant
+     node (dds.rtps.discovery:make-spdp-data
+           :guid-prefix prefix :version-major 2 :version-minor 5
+           :metatraffic-unicast-locators (list loc) :default-unicast-locators (list loc)))
+    (setf (gethash (copy-seq guid) (dds.disc::disc-node-matches node))
+          (dds.rtps.discovery:make-endpoint-data
+           :guid guid :topic-name "Square" :type-name "shape-type" :qos (dds.qos:make-reader-qos)))
+    (values prefix (cons "127.0.0.1" port))))
+
+(defun* run-acknack-addressing-test ()
+    (function () t)
+  "A writer with TWO matched reader participants resolves an ACKNACK's retransmit destination to the
+   ONE originating reader (RTPS 2.5 §8.4.2.2): %prefix-user-destination returns each reader's
+   (host . port) and NIL for an undiscovered prefix, while %match-destinations still lists BOTH — so
+   the fix narrows a 2-way fan-out resend to the single NACKing reader."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (multiple-value-bind (p1 d1) (%seed-reader-participant node #x21 7501)
+           (multiple-value-bind (p2 d2) (%seed-reader-participant node #x22 7502)
+             (%check :ana-resolve-1 (equal d1 (dds.disc::%prefix-user-destination node p1))
+                     "%prefix-user-destination must resolve reader 1's (host . port)")
+             (%check :ana-resolve-2 (equal d2 (dds.disc::%prefix-user-destination node p2))
+                     "%prefix-user-destination must resolve reader 2's (host . port)")
+             (%check :ana-resolve-nil
+                     (null (dds.disc::%prefix-user-destination
+                            node (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xee)))
+                     "an undiscovered prefix must resolve to NIL (falls back to fan-out)")
+             (%check :ana-fanout-two (= 2 (length (dds.disc::%match-destinations node t)))
+                     "both matched readers must be in the fan-out set (the pre-fix breadth)")
+             (%check :ana-targeted-one
+                     (and (equal d1 (dds.disc::%prefix-user-destination node p1))
+                          (not (equal (dds.disc::%prefix-user-destination node p1)
+                                      (dds.disc::%prefix-user-destination node p2))))
+                     "the targeted resend destination must be reader 1 alone, distinct from reader 2")))
+      (dds.disc:stop-node node)))
+  t)
+
 ;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a
 ;;; discovered participant not refreshed within its leaseDuration. %lease-sweep
 ;;; prunes the stale participant's discovered entry + endpoints + matches +

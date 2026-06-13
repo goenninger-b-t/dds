@@ -53,6 +53,20 @@
              (%locator-port (dds.rtps.discovery:locator-port (first dlocs)))))
       (t nil))))
 
+(defun* %prefix-user-destination (node prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) (or null cons))
+  "User-plane (host . port) for participant PREFIX, or NIL — the user-traffic twin of
+   %REMOTE-METATRAFFIC (disc.lisp): look up the discovered SPDP record for the 12-octet GUID-prefix
+   (RTPS 2.5 §9.4.4) and resolve its sendable default-unicast destination via %USABLE-DESTINATION.
+   NIL when PREFIX is undiscovered or resolves to no usable (port>0) destination. Lets an inbound
+   submessage (e.g. an ACKNACK) be answered at the originating participant ALONE instead of every
+   matched peer."
+  (let ((spdp (dds.pal:with-lock ((disc-node-lock node))
+                (gethash prefix (disc-node-discovered node)))))
+    (when spdp
+      (let ((hp (%usable-destination spdp)))
+        (when (and hp (plusp (cdr hp))) hp)))))
+
 (defun* %reader-guid-p (guid)
     (function ((simple-array (unsigned-byte 8) (16))) t)
   "T iff the GUID's entity kind is a user reader (0x04 no-key / 0x07 with-key)."
@@ -420,11 +434,15 @@
 
 (defun* %on-user-acknack (node c flags src-prefix)
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
-  "Writer side: on an ACKNACK, retransmit each NACKed change as a DATA submessage
-   to each peer (uses rx-tx-msg). GAPs are not needed (KEEP_ALL never drops). The reader-proxy is keyed
+  "Writer side: on an ACKNACK, retransmit each NACKed change as a DATA submessage to the ONE reader
+   that NACKed (uses rx-tx-msg). GAPs are not needed (KEEP_ALL never drops). The reader-proxy is keyed
    by the REMOTE reader's FULL 16-octet GUID (SRC-PREFIX + the ACKNACK's reader EntityId RID, §9.4.4 /
    §9.3.1.2) — the SAME key %push-data uses for that reader — so two readers sharing EntityId 0x107
-   across participants advance independent acked-base watermarks (§8.3.5.4)."
+   across participants advance independent acked-base watermarks (§8.3.5.4). The resend goes ONLY to the
+   ACKNACKing participant's destination, resolved from SRC-PREFIX (a NACK is from exactly one reader, so
+   fanning the resend out to every matched reader is pure over-send — harmless under KEEP_ALL but
+   wasteful); falls back to every matched reader only when the prefix is undiscovered (the
+   discovery-less test path)."
   (multiple-value-bind (rid wid base numbits bitmap count finalp)
       (dds.rtps.message:parse-acknack-body c flags)
     (declare (ignore count finalp))
@@ -434,9 +452,11 @@
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
                                                (%source-guid src-prefix rid) base numbits bitmap)
         (declare (ignore gaps))
-        (dolist (peer (%match-destinations node t))   ; retransmit DATA(_FRAG) / dispose -> matched readers
-          (dolist (ch resends)
-            (%send-change node (disc-node-rx-tx-msg node) ch (car peer) (cdr peer)))))))
+        (let* ((dest (%prefix-user-destination node src-prefix))
+               (peers (if dest (list dest) (%match-destinations node t))))
+          (dolist (peer peers)   ; retransmit DATA(_FRAG) / dispose -> the NACKing reader
+            (dolist (ch resends)
+              (%send-change node (disc-node-rx-tx-msg node) ch (car peer) (cdr peer))))))))
   t)
 
 (defun* %on-user-data-frag (node c flags body-len buf src-prefix)
