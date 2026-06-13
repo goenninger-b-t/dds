@@ -540,6 +540,57 @@
                 "reader complete after GAP(1..3) + DATA(4,5)")))
     t))
 
+;;; Multi-writer SN-aliasing independence (RTPS 2.5 §8.3.5.4: a SequenceNumber is unique
+;;; only within one writer GUID). ONE reader, TWO writer proxy keys (full 16-octet GUIDs
+;;; that SHARE the user-writer EntityId tail 0x102 but differ in prefix); each delivers
+;;; SN 1..5 with a DIFFERENT gap. The two writer-proxies' received sets / HEARTBEAT ranges
+;;; / ACKNACKs MUST be independent — writer A's gap must not appear in writer B's ACKNACK.
+
+(defun* %aliasing-writer-guid (lastbyte)
+    (function ((unsigned-byte 8)) (simple-array (unsigned-byte 8) (16)))
+  "A 16-octet remote writer GUID: a per-participant prefix varied by LASTBYTE, then the
+   user-data writer EntityId 0x00000102 tail (RTPS 2.5 §9.3.1.2) — two such GUIDs ALIAS on
+   the EntityId but differ on the GUID, the case §8.3.5.4 distinguishes."
+  (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x55)))
+    (setf (aref g 11) lastbyte
+          (aref g 12) #x00 (aref g 13) #x00 (aref g 14) #x01 (aref g 15) #x02)
+    g))
+
+(defun* run-reliable-multiwriter-test ()
+    (function () t)
+  "Test: two writers sharing EntityId 0x102 keep INDEPENDENT reliable reader-proxy state
+   when keyed by their full GUID (RTPS 2.5 §8.3.5.4). Writer A is missing SN 3; writer B is
+   missing SN 4. Each writer's ACKNACK NACKs only its own gap, and writer A's HEARTBEAT range
+   does not perturb writer B's."
+  (let* ((reader (dds.rtps.reliable:make-rtps-reader))
+         (key-a (%aliasing-writer-guid #x0a))
+         (key-b (%aliasing-writer-guid #x0b))
+         (pl (lambda (sn) (map '(simple-array (unsigned-byte 8) (*)) #'char-code (format nil "m~d" sn)))))
+    ;; A receives 1,2,4,5 (gap at 3); B receives 1,2,3,5 (gap at 4).
+    (dolist (sn '(1 2 4 5)) (dds.rtps.reliable:reader-on-data reader key-a sn (funcall pl sn)))
+    (dolist (sn '(1 2 3 5)) (dds.rtps.reliable:reader-on-data reader key-b sn (funcall pl sn)))
+    (dds.rtps.reliable:reader-on-heartbeat reader key-a 1 5)
+    (dds.rtps.reliable:reader-on-heartbeat reader key-b 1 5)
+    (multiple-value-bind (base-a numbits-a bitmap-a) (dds.rtps.reliable:reader-acknack reader key-a)
+      (%check :mw-a-nacks-3 (and (= base-a 3) (= numbits-a 3)
+                                 (dds.rtps.message:seqnum-set-bit-p bitmap-a 0)
+                                 (not (dds.rtps.message:seqnum-set-bit-p bitmap-a 1)))
+              "writer A's ACKNACK must NACK only SN 3 (base 3, SN 4/5 received)"))
+    (multiple-value-bind (base-b numbits-b bitmap-b) (dds.rtps.reliable:reader-acknack reader key-b)
+      (%check :mw-b-nacks-4 (and (= base-b 4) (= numbits-b 2)
+                                 (dds.rtps.message:seqnum-set-bit-p bitmap-b 0)
+                                 (not (dds.rtps.message:seqnum-set-bit-p bitmap-b 1)))
+              "writer B's ACKNACK must NACK only SN 4 (base 4, SN 5 received) — A's gap@3 absent"))
+    ;; Independent ranges: B sees a higher last SN; A's range must be untouched.
+    (dds.rtps.reliable:reader-on-heartbeat reader key-b 1 9)
+    (%check :mw-a-range-unperturbed
+            (= 5 (dds.rtps.reliable:writer-proxy-last-sn (dds.rtps.reliable:get-writer-proxy reader key-a)))
+            "writer A's HEARTBEAT range must be unaffected by writer B's HEARTBEAT")
+    (%check :mw-b-range-advanced
+            (= 9 (dds.rtps.reliable:writer-proxy-last-sn (dds.rtps.reliable:get-writer-proxy reader key-b)))
+            "writer B's HEARTBEAT range must advance independently"))
+  t)
+
 ;;; Send-once writer push: the writer pushes UNSENT changes once (RTPS 2.5 §8.4.2.2,
 ;;; next_unsent_change / unsent_changes) and repairs ONLY requested_changes on ACKNACK.
 ;;; Regression for the O(N^2) DATA storm where the whole unacked history was re-pushed

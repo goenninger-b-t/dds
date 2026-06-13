@@ -32,12 +32,15 @@
   (hc nil :type (or null dds.rtps.history:history-cache))  ; a HistoryCache
   (last-sn 0 :type integer)
   (hb-count 0 :type integer)
-  (proxies (make-hash-table :test 'eql) :type hash-table)   ; reader-id -> reader-proxy
+  (proxies (make-hash-table :test 'equalp) :type hash-table)   ; reader key (opaque, equalp) -> reader-proxy
   (frag-hb-count 0 :type integer))   ; HEARTBEAT_FRAG Count, separate from hb-count
 
 (defun* get-reader-proxy (writer reader-id)
-    (function (rtps-writer (unsigned-byte 32)) reader-proxy)
-  "The ReaderProxy for READER-ID, created on first use."
+    (function (rtps-writer t) reader-proxy)
+  "The ReaderProxy for the matched reader named by the opaque per-endpoint key READER-ID, created on
+   first use. The key is treated only as an equalp hash key (the disc layer passes the remote reader's
+   full 16-octet GUID; the value-level tests pass an integer): a SequenceNumber is unique only within
+   one writer GUID (RTPS 2.5 §8.3.5.4), so each remote reader's watermarks are kept independent."
   (or (gethash reader-id (rtps-writer-proxies writer))
       (setf (gethash reader-id (rtps-writer-proxies writer)) (make-reader-proxy))))
 
@@ -83,13 +86,13 @@
           collect ch))
 
 (defun* writer-data-list (writer reader-id)
-    (function (rtps-writer (unsigned-byte 32)) list)
-  "Changes not yet acked by READER-ID, as a list of CacheChanges in SN order."
+    (function (rtps-writer t) list)
+  "Changes not yet acked by READER-ID (the opaque per-reader key), as a list of CacheChanges in SN order."
   (%changes-from writer (reader-proxy-acked-base (get-reader-proxy writer reader-id))))
 
 (defun* writer-unsent-list (writer reader-id)
-    (function (rtps-writer (unsigned-byte 32)) list)
-  "The UNSENT changes for READER-ID (next_unsent_change, RTPS 2.5 §8.4.2.2): the
+    (function (rtps-writer t) list)
+  "The UNSENT changes for READER-ID (the opaque per-reader key; next_unsent_change, RTPS 2.5 §8.4.2.2): the
    CacheChanges with SN >= the reader's UNSENT-BASE, in SN order. On a non-empty result the
    UNSENT-BASE watermark is advanced past the highest SN collected, so each change is pushed
    EXACTLY ONCE in pushMode (§8.4.2.2). Lost/late changes are recovered via the ACKNACK repair
@@ -103,8 +106,8 @@
     changes))
 
 (defun* writer-on-acknack (writer reader-id base numbits bitmap)
-    (function (rtps-writer (unsigned-byte 32) integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) (values list list))
-  "Process an ACKNACK from READER-ID (RTPS 2.5 §8.3.7.1). Confirm SN < BASE, then
+    (function (rtps-writer t integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) (values list list))
+  "Process an ACKNACK from READER-ID (the opaque per-reader key; RTPS 2.5 §8.3.7.1). Confirm SN < BASE, then
    for each NACKed SN (bit set in BITMAP) return a resend if present, else a GAP.
    Returns (values data-resends gap-sns), data-resends a list of CacheChanges (so the
    resend path dispatches :data vs :dispose/:unregister exactly as the initial push)."
@@ -142,20 +145,21 @@
   (reassembly (make-hash-table :test 'eql) :type hash-table)) ; SN -> frag-reassembly
 
 (defstruct* (rtps-reader (:constructor make-rtps-reader))
-  "Stateful reliable RTPS reader (RTPS 2.5 §8.4.10): a writer-id -> WriterProxy table."
-  (proxies (make-hash-table :test 'eql) :type hash-table))   ; writer-id -> writer-proxy
+  "Stateful reliable RTPS reader (RTPS 2.5 §8.4.10): an opaque-writer-key -> WriterProxy table."
+  (proxies (make-hash-table :test 'equalp) :type hash-table))   ; writer key (opaque, equalp) -> writer-proxy
 
 (defun* get-writer-proxy (reader writer-id)
-    (function (rtps-reader (unsigned-byte 32)) writer-proxy)
-  "The WriterProxy for WRITER-ID, created on first use. KNOWN FOLLOW-UP: keyed by EntityId only, so two
-   writers sharing 0x102 on different participants alias here in the ACKNACK/REPAIR path (RTPS 2.5
-   §8.3.5.4: SN is unique only within one writer GUID) — the data-delivery aliasing fixed in the data
-   plane; full 16-octet GUID keying is the reliable-engine TODO."
+    (function (rtps-reader t) writer-proxy)
+  "The WriterProxy for the matched writer named by the opaque per-endpoint key WRITER-ID, created on
+   first use. The key is treated only as an equalp hash key (the disc layer passes the remote writer's
+   full 16-octet GUID; the value-level tests pass an integer): a SequenceNumber is unique only within
+   one writer GUID (RTPS 2.5 §8.3.5.4), so two writers sharing EntityId 0x102 on different participants
+   get independent received-SN sets / HEARTBEAT ranges / ACKNACK / GAP / reassembly state."
   (or (gethash writer-id (rtps-reader-proxies reader))
       (setf (gethash writer-id (rtps-reader-proxies reader)) (make-writer-proxy))))
 
 (defun* reader-on-data (reader writer-id sn payload)
-    (function (rtps-reader (unsigned-byte 32) integer (array (unsigned-byte 8) (*))) t)
+    (function (rtps-reader t integer (array (unsigned-byte 8) (*))) t)
   "Accept a DATA. Idempotent (duplicate SN overwrites — dedup); tracks the highest
    SN seen so reordered delivery is harmless (stored by SN)."
   (let ((proxy (get-writer-proxy reader writer-id)))
@@ -164,7 +168,7 @@
     t))
 
 (defun* reader-on-heartbeat (reader writer-id first-sn last-sn)
-    (function (rtps-reader (unsigned-byte 32) integer integer) t)
+    (function (rtps-reader t integer integer) t)
   "Update the available range [firstSN, lastSN] (RTPS 2.5 §8.3.7.5)."
   (let ((proxy (get-writer-proxy reader writer-id)))
     (setf (writer-proxy-first-sn proxy) first-sn
@@ -172,7 +176,7 @@
     t))
 
 (defun* reader-acknack (reader writer-id)
-    (function (rtps-reader (unsigned-byte 32)) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))))
+    (function (rtps-reader t) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))))
   "Compute an ACKNACK (RTPS 2.5 §8.3.7.1): (values base numBits bitmap). BASE is
    the lowest unreceived SN in [first, last] (or last+1 if none); the bitmap NACKs
    the unreceived SNs in [base, last] (capped at 256)."
@@ -192,7 +196,7 @@
     (values base numbits bitmap)))
 
 (defun* reader-on-gap (reader writer-id gap-start base numbits bitmap)
-    (function (rtps-reader (unsigned-byte 32) integer integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) t)
+    (function (rtps-reader t integer integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) t)
   "Mark GAPped SNs as irrelevant so they do not block the ack (RTPS 2.5 §8.3.7.4):
    the range [gapStart, base-1] plus the SNs listed in the bitmap."
   (let ((received (writer-proxy-received (get-writer-proxy reader writer-id))))
@@ -203,7 +207,7 @@
     t))
 
 (defun* reader-complete-p (reader writer-id)
-    (function (rtps-reader (unsigned-byte 32)) t)
+    (function (rtps-reader t) t)
   "T iff every SN in the available range [first, last] has been received or GAPped."
   (let* ((proxy (get-writer-proxy reader writer-id))
          (received (writer-proxy-received proxy)))
@@ -212,7 +216,7 @@
 
 (defun* reader-on-data-frag (reader writer-id sn fragment-starting-num fragments-in-submsg
                                     fragment-size sample-size payload)
-    (function (rtps-reader (unsigned-byte 32) integer (unsigned-byte 32) (unsigned-byte 32)
+    (function (rtps-reader t integer (unsigned-byte 32) (unsigned-byte 32)
                (unsigned-byte 32) (unsigned-byte 32) (array (unsigned-byte 8) (*)))
               (or null (simple-array (unsigned-byte 8) (*))))
   "Accept one DATA_FRAG submessage's fragment range for (WRITER-ID, SN). Reassembles into the
@@ -259,7 +263,7 @@
           buf)))))
 
 (defun* reader-frag-acknack (reader writer-id sn)
-    (function (rtps-reader (unsigned-byte 32) integer) t)
+    (function (rtps-reader t integer) t)
   "Compute a NACK_FRAG fragment set for the in-progress reassembly of (WRITER-ID, SN):
    (values base numBits bitmap) naming the 1-based fragment numbers NOT yet received, or
    NIL if there is no such reassembly (unknown or already complete). The window

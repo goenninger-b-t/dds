@@ -161,9 +161,12 @@ ops are `defstruct` + monomorphic functions, no CLOS.
 ### Reliable writer (`dds.rtps.reliable`)
 
 The stateful reliable writer (§8.4.2): a `HistoryCache`, the last SN written, the HEARTBEAT
-count, and a reader-id → `ReaderProxy` table. Operates on submessage field **values** (not
-bytes) so the state machine is directly testable; the byte/transport wiring lives a layer up
-in [Discovery](discovery.md)'s data plane.
+count, and a **per-reader-key** → `ReaderProxy` table. The proxy key is **opaque** (an `equalp`
+hash key): the data plane passes the matched reader's full 16-octet GUID, so two readers sharing
+EntityId `0x107` on different participants advance independent watermarks (a SequenceNumber is
+unique only within one writer/reader GUID, §8.3.5.4); the value-level tests pass integers. Operates
+on submessage field **values** (not bytes) so the state machine is directly testable; the
+byte/transport wiring lives a layer up in [Discovery](discovery.md)'s data plane.
 
 - `dds.rtps.reliable:make-rtps-writer` *(&key hc last-sn hb-count proxies)* — construct a reliable writer (pass `:hc` a `HistoryCache`).
 - `dds.rtps.reliable:rtps-writer` — the struct type.
@@ -173,14 +176,17 @@ in [Discovery](discovery.md)'s data plane.
 - `dds.rtps.reliable:writer-unsent-list` *(writer reader-id)* — the **unsent** changes for `READER-ID` (`next_unsent_change`, §8.4.2.2): the changes with SN ≥ the reader's *unsent* watermark, **as `CacheChange` objects** in SN order; advances that watermark past the highest SN returned so each change is **pushed exactly once** under `pushMode`. Returning the `CacheChange` (not a `(sn . payload)` cell) lets the data plane dispatch on `cache-change-kind` (a `:data` change → DATA/DATA_FRAG; a `:dispose`/`:unregister` change → a no-payload dispose DATA). The data plane (`%push-data`) pushes this, so N pre-ACKNACK writes emit N DATA submessages, not N(N+1)/2. Lost/late changes are repaired only via the ACKNACK path (`writer-on-acknack`).
 - `dds.rtps.reliable:writer-data-list` *(writer reader-id)* — changes not yet acked by `READER-ID` (SN ≥ the *acknowledged* watermark), as a list of `CacheChange` objects in SN order. Not used by the push path (that uses `writer-unsent-list`); retained for diagnostics/tests.
 - `dds.rtps.reliable:writer-on-acknack` *(writer reader-id base numbits bitmap)* — process an ACKNACK (§8.3.7.1): confirm SN < `BASE`, then for each NACKed SN return a resend if present, else a GAP. Returns `(values data-resends gap-sns)`, `data-resends` a list of `CacheChange` objects (so a resend dispatches `:data` vs `:dispose`/`:unregister` exactly as the initial push). The `requested_changes` repair path; independent of the unsent watermark.
-- `dds.rtps.reliable:get-reader-proxy` *(writer reader-id)* — the `ReaderProxy` for `READER-ID`, created on first use.
+- `dds.rtps.reliable:get-reader-proxy` *(writer reader-id)* — the `ReaderProxy` for the opaque per-reader key `READER-ID` (the data plane passes the remote reader's full GUID), created on first use. Keyed only as an `equalp` hash key so each remote reader's watermarks stay independent (§8.3.5.4).
 - `dds.rtps.reliable:reader-proxy` — the struct type (the writer-side proxy for one matched reader).
 - `dds.rtps.reliable:reader-proxy-acked-base` — the reader's **acknowledged** watermark (it has acknowledged all SN < acked-base; advanced by ACKNACK). Distinct from the **unsent** watermark `reader-proxy-unsent-base` (= 1 + highestSentChangeSN; the send-once push watermark, §8.4.2.2).
 
 ### Reliable reader (`dds.rtps.reliable`)
 
-The stateful reliable reader (§8.4.10): a writer-id → `WriterProxy` table. Handles dedup
-(duplicate SN overwrites), reorder (stored by SN), and GAP.
+The stateful reliable reader (§8.4.10): a **per-writer-key** → `WriterProxy` table. The proxy key
+is **opaque** (an `equalp` hash key): the data plane passes the matched writer's full 16-octet GUID,
+so two writers sharing EntityId `0x102` on different participants keep independent received-SN sets /
+HEARTBEAT ranges / ACKNACK / GAP / reassembly state (§8.3.5.4); the value-level tests pass integers.
+Handles dedup (duplicate SN overwrites), reorder (stored by SN), and GAP.
 
 - `dds.rtps.reliable:make-rtps-reader` *(&key proxies)* — construct a reliable reader.
 - `dds.rtps.reliable:rtps-reader` — the struct type.
@@ -189,7 +195,7 @@ The stateful reliable reader (§8.4.10): a writer-id → `WriterProxy` table. Ha
 - `dds.rtps.reliable:reader-acknack` *(reader writer-id)* — compute an ACKNACK (§8.3.7.1): `(values base numBits bitmap)`. `BASE` is the lowest unreceived SN in `[first, last]` (or `last+1` if none); the bitmap NACKs the unreceived SNs in `[base, last]` (capped at 256).
 - `dds.rtps.reliable:reader-on-gap` *(reader writer-id gap-start base numbits bitmap)* — mark GAPped SNs as irrelevant so they do not block the ack (§8.3.7.4): the range `[gapStart, base-1]` plus the SNs listed in the bitmap.
 - `dds.rtps.reliable:reader-complete-p` *(reader writer-id)* — T iff every SN in the available range `[first, last]` has been received or GAPped.
-- `dds.rtps.reliable:get-writer-proxy` *(reader writer-id)* — the `WriterProxy` for `WRITER-ID`, created on first use.
+- `dds.rtps.reliable:get-writer-proxy` *(reader writer-id)* — the `WriterProxy` for the opaque per-writer key `WRITER-ID` (the data plane passes the remote writer's full GUID), created on first use. Keyed only as an `equalp` hash key so two writers sharing EntityId `0x102` across participants get independent reliable state (§8.3.5.4).
 - `dds.rtps.reliable:writer-proxy` — the struct type (the reader-side proxy for one matched writer).
 - `dds.rtps.reliable:writer-proxy-received` — the SN → `payload | :gap` table of what the reader has seen.
 

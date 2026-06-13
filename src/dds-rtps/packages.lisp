@@ -92,7 +92,7 @@
            #:reader-proxy #:reader-proxy-acked-base
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
            #:reader-acknack #:reader-on-gap #:reader-complete-p
-           #:get-writer-proxy #:writer-proxy #:writer-proxy-received
+           #:get-writer-proxy #:writer-proxy #:writer-proxy-received #:writer-proxy-last-sn
            #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments*
            #:reader-on-data-frag #:reader-frag-acknack
            #:writer-frag-plan #:writer-frag-plan-for

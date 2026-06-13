@@ -178,19 +178,47 @@
                     mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) first last count :final nil))
                  host port))
 
+(defun* %reader-push-targets (node)
+    (function (disc-node) list)
+  "Per matched remote READER, a (READER-KEY host . port) triple for the writer push path: the key is
+   the reader's FULL 16-octet GUID so its unsent-base watermark is independent of any other reader's
+   (RTPS 2.5 §8.3.5.4 — a SN is unique only within one writer GUID, and the corresponding ACKNACK keys
+   by the same remote reader GUID, %on-user-acknack). Falls back to the union of static PEERS keyed by
+   this node's local reader-id when no matched reader endpoint resolves to a destination (the
+   discovery-less test path), so the single stable send-once key is preserved there."
+  (let ((targets '())
+        (parts (%discovered-participants node)))
+    (dolist (remote (%matched-endpoints node))
+      (let ((guid (dds.rtps.discovery:endpoint-data-guid remote)))
+        (when (%reader-guid-p guid)
+          (let ((spdp (find (subseq guid 0 12) parts
+                            :key #'dds.rtps.discovery:spdp-data-guid-prefix :test #'equalp)))
+            (when spdp
+              (let ((hp (%usable-destination spdp)))
+                ;; dedup by destination: two readers on one (host:port) share a push target, so the second's send-once degrades to ACKNACK repair (multi-reader-per-participant sub-follow-up, not data loss).
+                (when (and hp (plusp (cdr hp)))
+                  (pushnew (list* (copy-seq guid) hp) targets
+                           :test #'equalp :key #'cdr))))))))
+    (dolist (peer (disc-node-peers node))
+      (unless (member peer targets :test #'equal :key #'cdr)
+        (push (list* (disc-node-user-reader-id node) peer) targets)))
+    targets))
+
 (defun* %push-data (node)
     (function (disc-node) t)
   "Writer side: send each UNSENT change ONCE as a DATA (or DATA_FRAG series for large samples)
-   submessage, followed by a HEARTBEAT, to each peer (pushMode, RTPS 2.5 §8.4.2.2; caller thread,
-   uses tx-msg). Lost or late changes are repaired only via the reader's ACKNACK (%on-user-acknack),
-   not by re-pushing the whole unacked history."
+   submessage, followed by a HEARTBEAT, to each matched reader (pushMode, RTPS 2.5 §8.4.2.2; caller
+   thread, uses tx-msg). The unsent-base watermark is kept PER matched reader (keyed by its full GUID,
+   §8.3.5.4) so each reader is pushed each change exactly once and the matching ACKNACK (keyed by the
+   same remote reader GUID) advances the SAME proxy. Lost or late changes are repaired only via the
+   reader's ACKNACK (%on-user-acknack), not by re-pushing the whole unacked history."
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
-      (let ((datas (dds.rtps.reliable:writer-unsent-list writer (disc-node-user-reader-id node))))
-        (dolist (peer (%match-destinations node t))   ; DATA + HEARTBEAT -> matched readers
-          (dolist (ch datas)
-            (%send-change node (disc-node-tx-msg node) ch (car peer) (cdr peer)))
-          (%send-user-heartbeat node (disc-node-tx-msg node) first last count (car peer) (cdr peer)))))))
+      (dolist (target (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched reader
+        (let ((key (car target)) (host (cadr target)) (port (cddr target)))
+          (dolist (ch (dds.rtps.reliable:writer-unsent-list writer key))
+            (%send-change node (disc-node-tx-msg node) ch host port))
+          (%send-user-heartbeat node (disc-node-tx-msg node) first last count host port))))))
 
 (defun* %push-heartbeat (node)
     (function (disc-node) (eql t))
@@ -271,43 +299,64 @@
    DCPS-facing lifecycle-event callback OUTSIDE the node lock (mirrors %deliver-user-sample). Gated on
    a matched user writer EntityId."
   (when (and (disc-node-user-reader node) (%user-writer-entityid-p writer-id))
-    (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn
-                                      (make-array 0 :element-type '(unsigned-byte 8)))
-    (dds.pal:with-lock ((disc-node-lock node))
-      ;; KNOWN FOLLOW-UP: this lifecycle store is keyed by raw SN only, so two writers sharing
-      ;; EntityId 0x102 on different participants still alias here (RTPS 2.5 §8.3.5.4: SN is unique
-      ;; only within one writer GUID) — the same aliasing just fixed for data delivery. Does not affect
-      ;; single-writer or EXCLUSIVE data delivery; 2-level (GUID -> SN) keying is the dispose-path TODO.
-      (setf (gethash sn (disc-node-lifecycle-changes node))
-            (list kind key-hash status-flags writer-id (%source-guid src-prefix writer-id))))
+    (let ((guid (%source-guid src-prefix writer-id)))
+      (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn
+                                        (make-array 0 :element-type '(unsigned-byte 8)))
+      (dds.pal:with-lock ((disc-node-lock node))
+        ;; 2-level (source-GUID -> SN) keying mirrors the data store: a SequenceNumber is unique only
+        ;; within one writer GUID (RTPS 2.5 §8.3.5.4), so two writers sharing EntityId 0x102 on different
+        ;; participants disposing different instances at the SAME SN do not clobber each other.
+        (setf (gethash sn (%inner-table (disc-node-lifecycle-changes node) guid))
+              (list kind key-hash status-flags writer-id guid))))
     (when (disc-node-on-lifecycle-event node)
       (funcall (disc-node-on-lifecycle-event node) writer-id sn kind key-hash status-flags)))
   t)
 
-(defun* node-lifecycle-change (node sn)
-    (function (disc-node integer) t)
-  "The received lifecycle change at sequence number SN as
+(defun* node-lifecycle-change (node key)
+    (function (disc-node cons) t)
+  "The received lifecycle change for composite KEY (a (GUID . SN) cons, see node-lifecycle-sns) as
    (kind key-hash status-flags writer-id source-guid), or NIL. Lets a subscriber observe that a
    dispose/unregister DATA was received and classified (S1), and lets the user-thread S2 consumer
    (%drain) recover the originating writer (EntityId to drop it from the instance's writers-set on an
    :unregister, DDS 1.4 §2.2.2.5.1.3; full 16-octet SOURCE-GUID to clear ownership of only the exact
-   disposing writer, §2.2.3.9.2)."
+   disposing writer, §2.2.3.9.2). Keyed by GUID then SN (§8.3.5.4) so two writers sharing EntityId 0x102
+   never alias in the SN space."
   (dds.pal:with-lock ((disc-node-lock node))
-    (gethash sn (disc-node-lifecycle-changes node))))
+    (let ((inner (gethash (car key) (disc-node-lifecycle-changes node))))
+      (and inner (gethash (cdr key) inner)))))
+
+(defun* node-lifecycle-change-by-sn (node sn)
+    (function (disc-node integer) t)
+  "The lifecycle change of ANY received dispose/unregister whose RTPS SN equals SN, or NIL. A
+   single-writer convenience (the store is keyed by GUID then SN, §8.3.5.4) — for tests/diagnostics
+   that know only the SN, mirroring node-sample-by-sn."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (loop for inner being the hash-values of (disc-node-lifecycle-changes node)
+          thereis (gethash sn inner))))
 
 (defun* node-lifecycle-count (node)
     (function (disc-node) (integer 0))
-  "Number of distinct dispose/unregister lifecycle DATAs the subscriber has received (S1)."
+  "Number of distinct dispose/unregister lifecycle DATAs the subscriber has received (S1), summed over
+   every writer's inner SN map."
   (dds.pal:with-lock ((disc-node-lock node))
-    (hash-table-count (disc-node-lifecycle-changes node))))
+    (let ((n 0))
+      (maphash (lambda (g inner) (declare (ignore g)) (incf n (hash-table-count inner)))
+               (disc-node-lifecycle-changes node))
+      n)))
 
 (defun* node-lifecycle-sns (node)
     (function (disc-node) list)
-  "Sequence numbers of the dispose/unregister lifecycle DATAs received so far (unordered). Lets the
-   user-thread S2 consumer (%drain) drain newly-classified lifecycle changes the same way
-   node-sample-sns drains data samples — without assuming SNs start at 1 (Connext may not)."
+  "Composite (GUID . SN) cons keys of the dispose/unregister lifecycle DATAs received so far (unordered).
+   Lets the user-thread S2 consumer (%drain) drain newly-classified lifecycle changes the same way
+   node-sample-sns drains data samples — per writer GUID, without assuming SNs start at 1 (Connext may
+   not) and without aliasing two writers sharing EntityId 0x102 (§8.3.5.4). The cons is built here on
+   the user thread, not on the per-change receive path (NFR-MEM)."
   (dds.pal:with-lock ((disc-node-lock node))
-    (loop for k being the hash-keys of (disc-node-lifecycle-changes node) collect k)))
+    (let ((keys '()))
+      (maphash (lambda (guid inner)
+                 (loop for sn being the hash-keys of inner do (push (cons guid sn) keys)))
+               (disc-node-lifecycle-changes node))
+      keys)))
 
 (defun* %inner-table (outer guid)
     (function (hash-table (simple-array (unsigned-byte 8) (16))) hash-table)
@@ -325,9 +374,9 @@
    source GUID for S1 EXCLUSIVE ownership arbitration), then fire ON-SAMPLE outside the node lock
    (DATA_AVAILABLE + WaitSet wake). Two-level keying by GUID then SN avoids a per-sample composite-key
    alloc (NFR-MEM) and stops two writers sharing EntityId 0x102 from aliasing in the SN space
-   (§8.3.5.4); ONE %source-guid per sample is reused across the three inner tables."
-  (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) writer-id sn vec)
+   (§8.3.5.4); ONE %source-guid per sample is reused for the reliable-reader proxy key AND the three inner tables."
   (let ((guid (%source-guid src-prefix writer-id)))
+    (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn vec)
     (dds.pal:with-lock ((disc-node-lock node))
       (setf (gethash sn (%inner-table (disc-node-samples node) guid)) vec
             (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
@@ -344,17 +393,20 @@
     (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
     (%deliver-user-sample node writer-id sn vec src-prefix)))
 
-(defun* %on-user-heartbeat (node c flags)
-    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8)) t)
+(defun* %on-user-heartbeat (node c flags src-prefix)
+    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
   "Reader side: apply the HEARTBEAT's available range, then answer with an ACKNACK
-   (acking received SNs, NACKing the rest) to each peer (uses rx-tx-msg)."
+   (acking received SNs, NACKing the rest) to each peer (uses rx-tx-msg). The reliable reader-proxy is
+   keyed by the remote writer's FULL 16-octet GUID (SRC-PREFIX + WID, §9.4.4 / §9.3.1.2) so two writers
+   sharing EntityId 0x102 across participants keep independent received-SN / ACKNACK state (§8.3.5.4)."
   (multiple-value-bind (rid wid first last count finalp livep)
       (dds.rtps.message:parse-heartbeat-body c flags)
     (declare (ignore rid count finalp livep))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid))
-      (let ((reader (disc-node-user-reader node)))
-        (dds.rtps.reliable:reader-on-heartbeat reader wid first last)
-        (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wid)
+      (let ((reader (disc-node-user-reader node))
+            (wguid (%source-guid src-prefix wid)))
+        (dds.rtps.reliable:reader-on-heartbeat reader wguid first last)
+        (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
           (let ((cnt (incf (disc-node-ack-count node))))
             (dolist (peer (%match-destinations node nil))   ; ACKNACK -> matched writers
               (%send-msg-buf node (disc-node-rx-tx-msg node)
@@ -366,18 +418,21 @@
                              (car peer) (cdr peer))))))))
   t)
 
-(defun* %on-user-acknack (node c flags)
-    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8)) t)
+(defun* %on-user-acknack (node c flags src-prefix)
+    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
   "Writer side: on an ACKNACK, retransmit each NACKed change as a DATA submessage
-   to each peer (uses rx-tx-msg). GAPs are not needed (KEEP_ALL never drops)."
+   to each peer (uses rx-tx-msg). GAPs are not needed (KEEP_ALL never drops). The reader-proxy is keyed
+   by the REMOTE reader's FULL 16-octet GUID (SRC-PREFIX + the ACKNACK's reader EntityId RID, §9.4.4 /
+   §9.3.1.2) — the SAME key %push-data uses for that reader — so two readers sharing EntityId 0x107
+   across participants advance independent acked-base watermarks (§8.3.5.4)."
   (multiple-value-bind (rid wid base numbits bitmap count finalp)
       (dds.rtps.message:parse-acknack-body c flags)
-    (declare (ignore rid count finalp))
+    (declare (ignore count finalp))
     (when (= wid (disc-node-user-writer-id node))
       (incf (disc-node-acks-in node))   ; a matched reader (incl. RTI) acked our writer
       (multiple-value-bind (resends gaps)
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
-                                               (disc-node-user-reader-id node) base numbits bitmap)
+                                               (%source-guid src-prefix rid) base numbits bitmap)
         (declare (ignore gaps))
         (dolist (peer (%match-destinations node t))   ; retransmit DATA(_FRAG) / dispose -> matched readers
           (dolist (ch resends)
@@ -392,21 +447,24 @@
       (dds.rtps.message:parse-data-frag-body c flags body-len)
     (declare (ignore rdr keyp))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wtr))
-      (let ((region (make-array plen :element-type '(unsigned-byte 8))))
+      (let ((region (make-array plen :element-type '(unsigned-byte 8)))
+            (wguid (%source-guid src-prefix wtr)))
         (replace region (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
         (let ((done (dds.rtps.reliable:reader-on-data-frag
-                     (disc-node-user-reader node) wtr sn fstart frags fsize ssize region)))
+                     (disc-node-user-reader node) wguid sn fstart frags fsize ssize region)))
           (when done (%deliver-user-sample node wtr sn done src-prefix))))))
   t)
 
-(defun* %on-user-heartbeat-frag (node c flags)
-    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8)) t)
-  "Reader side: on a HEARTBEAT_FRAG, NACK_FRAG the still-missing fragments to matched writers."
+(defun* %on-user-heartbeat-frag (node c flags src-prefix)
+    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
+  "Reader side: on a HEARTBEAT_FRAG, NACK_FRAG the still-missing fragments to matched writers. The
+   reassembly proxy is keyed by the remote writer's FULL 16-octet GUID (SRC-PREFIX + WID, §9.4.4 /
+   §9.3.1.2) so two writers sharing EntityId 0x102 keep independent reassembly state (§8.3.5.4)."
   (multiple-value-bind (rid wid sn lastfrag count) (dds.rtps.message:parse-heartbeat-frag-body c flags)
     (declare (ignore rid lastfrag count))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid))
       (multiple-value-bind (base numbits bitmap)
-          (dds.rtps.reliable:reader-frag-acknack (disc-node-user-reader node) wid sn)
+          (dds.rtps.reliable:reader-frag-acknack (disc-node-user-reader node) (%source-guid src-prefix wid) sn)
         (when base
           (let ((cnt (incf (disc-node-ack-count node))))
             (dolist (peer (%match-destinations node nil))
@@ -443,7 +501,7 @@
   (setf (disc-node-user-writer node)
         (dds.rtps.reliable:make-rtps-writer
          :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
-  (setf (disc-node-on-acknack node) (lambda (c flags) (%on-user-acknack node c flags)))
+  (setf (disc-node-on-acknack node) (lambda (c flags src-prefix) (%on-user-acknack node c flags src-prefix)))
   (setf (disc-node-on-nack-frag node) (lambda (c flags) (%on-user-nack-frag node c flags)))
   node)
 
@@ -457,11 +515,11 @@
   (setf (disc-node-on-lifecycle node)
         (lambda (wid sn kind kh sf src-prefix) (%on-user-lifecycle node wid sn kind kh sf src-prefix)))
   (setf (disc-node-on-heartbeat node)
-        (lambda (c flags) (%on-user-heartbeat node c flags)))
+        (lambda (c flags src-prefix) (%on-user-heartbeat node c flags src-prefix)))
   (setf (disc-node-on-data-frag node)
         (lambda (c flags body-len buf src-prefix) (%on-user-data-frag node c flags body-len buf src-prefix)))
   (setf (disc-node-on-heartbeat-frag node)
-        (lambda (c flags) (%on-user-heartbeat-frag node c flags)))
+        (lambda (c flags src-prefix) (%on-user-heartbeat-frag node c flags src-prefix)))
   node)
 
 (defun* node-sample-count (node)
@@ -658,16 +716,16 @@
            (loop repeat 150 until (plusp (node-sample-count node2)) do (sleep 0.02))
            (assert (equalp (node-sample-by-sn node2 1) payload) () "subscriber missed the ALIVE sample")
            (dispose-instance node1 kh)                 ; SN 2 = dispose DATA
-           (loop repeat 150 until (node-lifecycle-change node2 2) do (sleep 0.02))
-           (let ((lc (node-lifecycle-change node2 2)))
+           (loop repeat 150 until (node-lifecycle-change-by-sn node2 2) do (sleep 0.02))
+           (let ((lc (node-lifecycle-change-by-sn node2 2)))
              (assert lc () "subscriber never received the dispose DATA over UDP")
              (assert (eq (first lc) :dispose) () "dispose DATA not classified :dispose")
              (assert (equalp (second lc) kh) () "dispose DATA carried the wrong key-hash")
              (assert (= (third lc) dds.rtps.message:+statusinfo-disposed+) ()
                      "dispose DATA carried the wrong StatusInfo flags"))
            (unregister-instance node1 kh)              ; SN 3 = unregister DATA
-           (loop repeat 150 until (node-lifecycle-change node2 3) do (sleep 0.02))
-           (let ((lc (node-lifecycle-change node2 3)))
+           (loop repeat 150 until (node-lifecycle-change-by-sn node2 3) do (sleep 0.02))
+           (let ((lc (node-lifecycle-change-by-sn node2 3)))
              (assert lc () "subscriber never received the unregister DATA over UDP")
              (assert (eq (first lc) :unregister) () "unregister DATA not classified :unregister"))
            t)
@@ -725,13 +783,13 @@
            (setf *debug-drop-sample-numbers* (list 2))  ; drop the dispose DATA (SN 2) on every thread
            (dispose-instance node1 kh)
            (sleep 0.1)
-           (assert (null (node-lifecycle-change node2 2)) ()
+           (assert (null (node-lifecycle-change-by-sn node2 2)) ()
                    "drop hook failed: B received the dropped dispose DATA")
            (setf *debug-drop-sample-numbers* nil)        ; clear; do NOT dispose again
            (loop repeat 40                               ; BOUNDED: drive A's HB cadence
-                 until (node-lifecycle-change node2 2)
+                 until (node-lifecycle-change-by-sn node2 2)
                  do (announce-endpoints node1) (sleep 0.02))
-           (let ((lc (node-lifecycle-change node2 2)))
+           (let ((lc (node-lifecycle-change-by-sn node2 2)))
              (assert lc () "lost dispose never recovered via the periodic HEARTBEAT")
              (assert (and (eq (first lc) :dispose) (equalp (second lc) kh)) ()
                      "recovered dispose has the wrong kind/key-hash"))

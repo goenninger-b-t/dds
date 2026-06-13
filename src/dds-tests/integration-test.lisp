@@ -250,7 +250,7 @@
                    do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
              (%check :dcps-disp-received (plusp (dds.disc:node-lifecycle-count node2))
                      "subscriber engine never received the dispose DATA")
-             (let ((lc (dds.disc:node-lifecycle-change node2 2)))
+             (let ((lc (dds.disc:node-lifecycle-change-by-sn node2 2)))
                (%check :dcps-disp-classified
                        (and lc (eq (first lc) :dispose) (equalp (second lc) handle))
                        "dispose DATA classified :dispose with the instance handle"))
@@ -634,7 +634,7 @@
                                (:unregister dds.rtps.message:+statusinfo-unregistered+)))))
     (setf (aref guid 12) (ldb (byte 8 24) wid) (aref guid 13) (ldb (byte 8 16) wid)
           (aref guid 14) (ldb (byte 8 8) wid) (aref guid 15) (ldb (byte 8 0) wid))
-    (setf (gethash sn (dds.disc::disc-node-lifecycle-changes node))
+    (setf (gethash sn (dds.disc::%inner-table (dds.disc::disc-node-lifecycle-changes node) guid))
           (list kind handle sf wid guid)))
   t)
 
@@ -733,7 +733,7 @@
     (function (t integer) t)
   "The StatusInfo_t flag octet (RTPS 2.5 §9.6.4.9) the subscriber engine recorded for the lifecycle
    DATA at sequence number SN (the 3rd element of the node's lifecycle 5-tuple), or NIL (test accessor)."
-  (let ((lc (dds.disc:node-lifecycle-change node sn)))
+  (let ((lc (dds.disc:node-lifecycle-change-by-sn node sn)))
     (and lc (third lc))))
 
 (defun* %instance-rec-not-alive-since (dr handle)
@@ -928,9 +928,9 @@
                         (loop repeat 100 until (plusp (dds.disc:node-sample-count node2))
                               do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
                         (dds.dcps:unregister-instance dw handle)       ; SN 2 unregister
-                        (loop repeat 150 until (dds.disc:node-lifecycle-change node2 2)
+                        (loop repeat 150 until (dds.disc:node-lifecycle-change-by-sn node2 2)
                               do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
-                        (%check :adw-received (dds.disc:node-lifecycle-change node2 2)
+                        (%check :adw-received (dds.disc:node-lifecycle-change-by-sn node2 2)
                                 "subscriber engine never received the unregister DATA")
                         (%lifecycle-status-flags node2 2)))
                  (dds.dcps:delete-participant p1)
@@ -1155,9 +1155,13 @@
               (simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (16))) t)
   "Stage a dispose/unregister lifecycle change at SN keyed by its FULL 16-octet source GUID — the
    (SN -> (kind key-hash status-flags writer-id source-guid)) record %on-user-lifecycle writes, minus
-   the wire (the owner-clear key, DDS 1.4 §2.2.3.9.2)."
-  (setf (gethash sn (dds.disc::disc-node-lifecycle-changes node))
-        (list kind handle 0 (dds.dcps::%guid-entityid guid) (copy-seq guid)))
+   the wire (the owner-clear key, DDS 1.4 §2.2.3.9.2). Keyed by source GUID then SN (§8.3.5.4). The
+   StatusInfo_t octet is derived from KIND (RTPS 2.5 §9.6.4.9) so the reader's flag-based state applies."
+  (let ((sf (ecase kind
+              (:dispose dds.rtps.message:+statusinfo-disposed+)
+              (:unregister dds.rtps.message:+statusinfo-unregistered+))))
+    (setf (gethash sn (dds.disc::%inner-table (dds.disc::disc-node-lifecycle-changes node) guid))
+          (list kind handle sf (dds.dcps::%guid-entityid guid) (copy-seq guid))))
   t)
 
 (defun* %instance-rec-owner-guid (dr handle)
@@ -1205,6 +1209,54 @@
                    "A's dispose must clear A's own ownership of instance-A")
            (%check :doc-b-survives (equalp guid-b (%instance-rec-owner-guid dr handle-b))
                    "A's dispose must NOT cross-clear B (same EntityId 0x102, different participant)"))
+      (dds.dcps:delete-participant p))
+    t))
+
+;;; Multi-writer dispose non-collision at the SAME SN (S1/S2, RTPS 2.5 §8.3.5.4: a
+;;; SequenceNumber is unique only within one writer GUID). Writers A and B share EntityId
+;;; 0x102 on different participants and each disposes its OWN instance at the SAME raw SN.
+;;; An SN-only lifecycle store would have B's dispose CLOBBER A's; the 2-level (GUID -> SN)
+;;; store keeps them independent, so BOTH instances transition NOT_ALIVE_DISPOSED.
+
+(defun* run-dcps-multiwriter-dispose-test ()
+    (function () t)
+  "Two writers sharing EntityId 0x102 on different participants dispose their OWN instances at
+   the SAME raw SN (3). The lifecycle store keyed by source GUID then SN (RTPS 2.5 §8.3.5.4)
+   must keep both disposes — A's dispose of instance-A and B's dispose of instance-B must each
+   land NOT_ALIVE_DISPOSED, not clobber each other. Deterministic offline injection — no UDP."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp))
+                (node (dds.dcps::dp-node p))
+                (guid-a (%two-writer-guid #x0a))
+                (guid-b (%two-writer-guid #x0b))
+                (sample-a (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                (sample-b (make-shape-type :color "RED" :x 2 :y 2 :shapesize 20))
+                (handle-a (funcall (dds.types:type-support-key-hash ts) sample-a))
+                (handle-b (funcall (dds.types:type-support-key-hash ts) sample-b))
+                (bytes-a (dds.dcps::%serialize-sample ts sample-a))
+                (bytes-b (dds.dcps::%serialize-sample ts sample-b)))
+           (%seed-exclusive-match node guid-a 10)
+           (%seed-exclusive-match node guid-b 10)
+           ;; A writes instance-A (SN 1), B writes instance-B (SN 1) — each its own SN space.
+           (%stage-data-sn-guid node 1 bytes-a guid-a)
+           (%stage-data-sn-guid node 1 bytes-b guid-b)
+           (dds.dcps::%drain dr)
+           (%check :mwd-a-alive (eq :alive (%instance-rec-state dr handle-a))
+                   "instance-A must be ALIVE after writer A's first sample")
+           (%check :mwd-b-alive (eq :alive (%instance-rec-state dr handle-b))
+                   "instance-B must be ALIVE after writer B's first sample")
+           ;; A disposes instance-A at SN 3; B disposes instance-B at the SAME SN 3.
+           (%stage-lifecycle-sn-guid node 3 :dispose handle-a guid-a)
+           (%stage-lifecycle-sn-guid node 3 :dispose handle-b guid-b)
+           (dds.dcps::%drain dr)
+           (%check :mwd-a-disposed (eq :not-alive-disposed (%instance-rec-state dr handle-a))
+                   "A's dispose@SN3 must transition instance-A NOT_ALIVE_DISPOSED")
+           (%check :mwd-b-disposed (eq :not-alive-disposed (%instance-rec-state dr handle-b))
+                   "B's dispose@SN3 must NOT be clobbered by A's same-SN dispose (§8.3.5.4)"))
       (dds.dcps:delete-participant p))
     t))
 

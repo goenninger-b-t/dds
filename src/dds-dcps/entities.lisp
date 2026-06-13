@@ -85,7 +85,7 @@
    (instances :initform (make-hash-table :test 'equalp) :accessor dr-instances) ; handle -> accessed-p
    (instance-recs :initform (make-hash-table :test 'equalp) :accessor dr-instance-recs) ; handle -> instance-rec (DDS 1.4 §2.2.2.5.1.3)
    (drained :initform (make-hash-table :test 'equalp) :accessor dr-drained) ; 16-octet source GUID -> highest engine SN drained for that writer (§8.3.5.4: SN is per-writer)
-   (lifecycle-drained :initform '() :accessor dr-lifecycle-drained) ; engine lifecycle SNs already consumed (user thread)
+   (lifecycle-drained :initform '() :accessor dr-lifecycle-drained) ; engine lifecycle (GUID . SN) composite keys already consumed (user thread)
    (sub-matched :initform (make-subscription-matched-status) :accessor dr-sub-matched)
    (req-incompat :initform (make-requested-incompatible-qos-status) :accessor dr-req-incompat)
    (sample-rejected :initform (make-sample-rejected-status) :accessor dr-sample-rejected)
@@ -591,9 +591,10 @@
     (when dr (%wake-reader-data dr)))
   t)
 
-(defun* %drain-one-lifecycle (dr node sn)
-    (function (data-reader t integer) t)
-  "Apply ONE pending dispose/unregister lifecycle change at sequence number SN on the USER thread (the
+(defun* %drain-one-lifecycle (dr node key)
+    (function (data-reader t cons) t)
+  "Apply ONE pending dispose/unregister lifecycle change at composite KEY (a (GUID . SN) cons, keyed by
+   source GUID then SN per RTPS 2.5 §8.3.5.4) on the USER thread (the
    on-sample/%drain discipline — never the receiver thread). Marks SN consumed (exactly-once via
    dr-lifecycle-drained) then applies the DDS 1.4 §2.2.2.5.1.3 reader-side transition to the instance's
    instance-rec from the StatusInfo_t FLAG bits (RTPS 2.5 §9.6.4.9), not only the derived kind: the
@@ -607,8 +608,8 @@
    when the instance_state actually transitioned (§2.2.2.5.1.4 — these no-data samples surface a CHANGE
    of state); a no-op unregister (writers remain / re-dispose of a disposed instance) produces nothing.
    Returns T if the instance transitioned."
-  (push sn (dr-lifecycle-drained dr))
-  (let ((lc (dds.disc:node-lifecycle-change node sn)) (changed nil))
+  (push key (dr-lifecycle-drained dr))
+  (let ((lc (dds.disc:node-lifecycle-change node key)) (changed nil))
     (when lc
       (destructuring-bind (kind key-hash status-flags wid source-guid) lc
         (declare (ignore kind))
@@ -888,11 +889,12 @@
                          (or (null g)
                              (> (dds.disc:node-sample-key-sn key) (gethash g (dr-drained dr) 0)))))
                      (dds.disc:node-sample-sns node)))
-         (life-sns (set-difference (dds.disc:node-lifecycle-sns node) (dr-lifecycle-drained dr)))
-         ;; Order by raw RTPS SN (extracted from the composite data key; lifecycle is already an SN) so a
-         ;; dispose/revive from one writer still lands in §2.2.2.5 SN order (§8.3.5.4: SN is per-writer).
+         (life-keys (set-difference (dds.disc:node-lifecycle-sns node) (dr-lifecycle-drained dr)
+                                    :test #'equalp))
+         ;; Order by raw RTPS SN (extracted from each composite (GUID . SN) key) so a dispose/revive from
+         ;; one writer still lands in §2.2.2.5 SN order (§8.3.5.4: SN is per-writer).
          (pending (sort (nconc (mapcar (lambda (key) (list (dds.disc:node-sample-key-sn key) :data key)) data-keys)
-                               (mapcar (lambda (sn) (list sn :lifecycle sn)) life-sns))
+                               (mapcar (lambda (key) (list (dds.disc:node-sample-key-sn key) :lifecycle key)) life-keys))
                         #'< :key #'car)))
     (dolist (entry pending)
       (ecase (second entry)

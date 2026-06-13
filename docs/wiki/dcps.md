@@ -512,11 +512,15 @@ the source as deferred or simplified — do not rely on them yet:
     watermark is **left pending** — the reliable engine has already ACKed it, so advancing the
     watermark would lose it permanently. A later drain re-evaluates it once the match completes and
     the strength is known, so no EXCLUSIVE data is lost across the SEDP race (DDS 1.4 §2.2.3.9.2).
-  - **Known follow-up (SN aliasing, dispose/ACKNACK paths).** The data-delivery store is per-writer,
-    but the dispose/unregister **lifecycle** store and the reliable-engine **writer/reader proxies**
-    still key by raw SN / `EntityId`, so two writers sharing `0x102` can still alias in the DISPOSE
-    and ACKNACK/REPAIR paths (RTPS 2.5 §8.3.5.4). This does **not** affect single-writer or EXCLUSIVE
-    *data delivery*; full-GUID keying of those paths is a tracked TODO.
+  - **Per-writer keying of the dispose + ACKNACK/repair paths (done).** The dispose/unregister
+    **lifecycle** store is now **2-level** (source GUID → SN, mirroring the data store), and the
+    reliable-engine **writer/reader proxies** are keyed by an **opaque per-endpoint key** (the data
+    plane passes the remote endpoint's full 16-octet GUID) — so two writers sharing `EntityId` `0x102`
+    on different participants no longer alias in the DISPOSE or ACKNACK/REPAIR paths either (RTPS 2.5
+    §8.3.5.4: an SN is unique only within one writer GUID). The inbound ACKNACK is keyed by the
+    **remote reader** GUID (fixing an earlier bug where every reader's ACKNACK mapped to one proxy via
+    the local reader-id), and the proactive push keys by the same per-reader GUID so the send-once and
+    acknowledged watermarks stay on one proxy for the single-reader common case.
 - **MATCHED decrements on lease expiry.** When a discovered participant vanishes and its
   lease expires (RTPS 2.5 §8.5.3.3.2), each pruned match decrements the affected local
   endpoint's SUBSCRIPTION_MATCHED / PUBLICATION_MATCHED `current_count` (`current_count_change`
