@@ -477,7 +477,10 @@
    sample (instance ALIVE, registering the writer), then unregister-instance relinquishes the
    writer's ownership; with no writers left the reader transitions the instance NOT_ALIVE_NO_WRITERS
    and surfaces an invalid-data SampleInfo carrying that state. (v1 single user writer per remote
-   participant -> the unregister is the last-writer case.)"
+   participant -> the unregister is the last-writer case.) The writer is created with
+   autodispose_unregistered_instances FALSE (DDS 1.4 §2.2.3.21) so a plain unregister exercises the
+   NO_WRITERS path; under the policy DEFAULT (TRUE) the same unregister would instead DISPOSE the
+   instance (covered by run-dcps-autodispose-writer-test / run-dcps-autodispose-reader-test)."
   (let* ((ts (dds.types:find-type-support "shape-type"))
          (p1 (dds.dcps:create-participant :domain 0))
          (p2 (dds.dcps:create-participant :domain 0)))
@@ -486,7 +489,8 @@
                 (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
                 (pub (dds.dcps:create-publisher p1))
                 (sub (dds.dcps:create-subscriber p2))
-                (dw (dds.dcps:create-datawriter pub tw))
+                (dw (dds.dcps:create-datawriter
+                     pub tw :qos (dds.qos:make-writer-qos :autodispose-unregistered-instances nil)))
                 (dr (dds.dcps:create-datareader sub tr))
                 (sample (make-shape-type :color "GREEN" :x 5 :y 5 :shapesize 22))
                 (handle (funcall (dds.types:type-support-key-hash ts) sample)))
@@ -615,17 +619,23 @@
           (gethash sn (dds.disc::%inner-table (dds.disc::disc-node-sample-writer-guids node) guid)) guid))
   t)
 
-(defun* %stage-lifecycle-sn (node sn kind handle wid)
+(defun* %stage-lifecycle-sn (node sn kind handle wid &optional status-flags)
     (function (t integer (member :dispose :unregister)
-              (simple-array (unsigned-byte 8) (16)) (unsigned-byte 32)) t)
+              (simple-array (unsigned-byte 8) (16)) (unsigned-byte 32) &optional t) t)
   "Stage a dispose/unregister lifecycle change at sequence number SN in NODE's SN map — the same
    (SN -> (kind key-hash status-flags writer-id source-guid)) record %on-user-lifecycle writes, minus
-   the wire. The source GUID is a zero-prefix + WID EntityId (the owner-clear key, DDS 1.4 §2.2.3.9.2)."
-  (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+   the wire. The source GUID is a zero-prefix + WID EntityId (the owner-clear key, DDS 1.4 §2.2.3.9.2).
+   STATUS-FLAGS is the StatusInfo_t flag octet (RTPS 2.5 §9.6.4.9); when NIL it is derived from KIND
+   (the legacy pure-dispose 0x01 / pure-unregister 0x02 forms), so the reader's flag-based state can be
+   exercised with a Disposed|Unregistered (0x03) octet by passing it explicitly."
+  (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+        (sf (or status-flags (ecase kind
+                               (:dispose dds.rtps.message:+statusinfo-disposed+)
+                               (:unregister dds.rtps.message:+statusinfo-unregistered+)))))
     (setf (aref guid 12) (ldb (byte 8 24) wid) (aref guid 13) (ldb (byte 8 16) wid)
           (aref guid 14) (ldb (byte 8 8) wid) (aref guid 15) (ldb (byte 8 0) wid))
     (setf (gethash sn (dds.disc::disc-node-lifecycle-changes node))
-          (list kind handle 0 wid guid)))
+          (list kind handle sf wid guid)))
   t)
 
 (defun* run-dcps-drain-sn-order-test ()
@@ -667,6 +677,111 @@
              (%check :dso-b-gen (= 0 (%instance-rec-disp-gen dr handle2))
                      "no revive occurred -> disposed_generation_count stays 0")))
       (dds.dcps:delete-participant p))
+    t))
+
+(defun* run-dcps-autodispose-reader-test ()
+    (function () t)
+  "DCPS reader-side flag-based instance_state for WRITER_DATA_LIFECYCLE.autodispose (S2, DDS 1.4
+   §2.2.3.21 + §2.2.2.5.1.3): %drain-one-lifecycle must apply instance_state from the StatusInfo_t
+   FLAG bits (RTPS 2.5 §9.6.4.9), not only the derived kind. (a) A Disposed|Unregistered (0x03)
+   lifecycle for an instance with one writer -> NOT_ALIVE_DISPOSED (disposed dominates, §2.2.2.5.1.3),
+   NOT NOT_ALIVE_NO_WRITERS, even though the writers-set is also emptied. (b) A pure Unregistered
+   (0x02, the autodispose-FALSE form) of the last writer -> NOT_ALIVE_NO_WRITERS. (c) A pure Disposed
+   (0x01) -> NOT_ALIVE_DISPOSED (unchanged). Deterministic offline injection — stage the change with
+   an explicit StatusInfo octet, drive %drain once, no UDP."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp))
+                (node (dds.dcps::dp-node p))
+                (wid #x00000102)
+                (du (logior dds.rtps.message:+statusinfo-disposed+
+                            dds.rtps.message:+statusinfo-unregistered+))
+                (s-a (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                (h-a (funcall (dds.types:type-support-key-hash ts) s-a))
+                (s-b (make-shape-type :color "GREEN" :x 2 :y 2 :shapesize 11))
+                (h-b (funcall (dds.types:type-support-key-hash ts) s-b))
+                (s-c (make-shape-type :color "RED" :x 3 :y 3 :shapesize 12))
+                (h-c (funcall (dds.types:type-support-key-hash ts) s-c)))
+           ;; (a) D|U (0x03): writer registered ALIVE, then a default-autodispose unregister.
+           (dds.dcps::%reader-revive-instance dr h-a wid)
+           (%check :adr-a-alive (eq :alive (%instance-rec-state dr h-a)) "instance A must start ALIVE")
+           (%stage-lifecycle-sn node 10 :unregister h-a wid du)
+           (dds.dcps::%drain dr)
+           (%check :adr-a-disposed (eq :not-alive-disposed (%instance-rec-state dr h-a))
+                   "a Disposed|Unregistered (0x03) lifecycle must end NOT_ALIVE_DISPOSED (disposed dominates)")
+           ;; (b) pure Unregistered (0x02): autodispose-FALSE form -> NO_WRITERS.
+           (dds.dcps::%reader-revive-instance dr h-b wid)
+           (%check :adr-b-alive (eq :alive (%instance-rec-state dr h-b)) "instance B must start ALIVE")
+           (%stage-lifecycle-sn node 11 :unregister h-b wid dds.rtps.message:+statusinfo-unregistered+)
+           (dds.dcps::%drain dr)
+           (%check :adr-b-no-writers (eq :not-alive-no-writers (%instance-rec-state dr h-b))
+                   "a pure Unregistered (0x02) of the last writer must end NOT_ALIVE_NO_WRITERS")
+           ;; (c) pure Disposed (0x01): unchanged -> DISPOSED.
+           (dds.dcps::%reader-revive-instance dr h-c wid)
+           (%check :adr-c-alive (eq :alive (%instance-rec-state dr h-c)) "instance C must start ALIVE")
+           (%stage-lifecycle-sn node 12 :dispose h-c wid dds.rtps.message:+statusinfo-disposed+)
+           (dds.dcps::%drain dr)
+           (%check :adr-c-disposed (eq :not-alive-disposed (%instance-rec-state dr h-c))
+                   "a pure Disposed (0x01) lifecycle must end NOT_ALIVE_DISPOSED"))
+      (dds.dcps:delete-participant p))
+    t))
+
+(defun* %lifecycle-status-flags (node sn)
+    (function (t integer) t)
+  "The StatusInfo_t flag octet (RTPS 2.5 §9.6.4.9) the subscriber engine recorded for the lifecycle
+   DATA at sequence number SN (the 3rd element of the node's lifecycle 5-tuple), or NIL (test accessor)."
+  (let ((lc (dds.disc:node-lifecycle-change node sn)))
+    (and lc (third lc))))
+
+(defun* run-dcps-autodispose-writer-test ()
+    (function () t)
+  "DCPS writer-side WRITER_DATA_LIFECYCLE.autodispose_unregistered_instances over UDP (S1, DDS 1.4
+   §2.2.3.21): a DEFAULT DataWriter (autodispose TRUE) that unregisters an instance must emit the
+   unregister DATA with StatusInfo Disposed|Unregistered (0x03) — behaviour identical to a dispose
+   before the unregister (§2.2.3.21) — while a writer created with autodispose FALSE emits only
+   Unregistered (0x02). Asserts the exact StatusInfo_t octet the subscriber's engine recorded for the
+   unregister DATA (RTPS 2.5 §9.6.4.9), the conformant default the live Fast DDS oracle confirmed."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (du (logior dds.rtps.message:+statusinfo-disposed+
+                     dds.rtps.message:+statusinfo-unregistered+)))
+    (flet ((scenario (writer-qos)
+             (let ((p1 (dds.dcps:create-participant :domain 0))
+                   (p2 (dds.dcps:create-participant :domain 0)))
+               (unwind-protect
+                    (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                           (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                           (pub (dds.dcps:create-publisher p1))
+                           (sub (dds.dcps:create-subscriber p2))
+                           (dw (dds.dcps:create-datawriter pub tw :qos writer-qos))
+                           (dr (dds.dcps:create-datareader sub tr))
+                           (sample (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                           (node2 (dds.dcps::dp-node p2)))
+                      (declare (ignore dr))
+                      (loop repeat 150
+                            until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                            do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                      (%check :adw-matched (plusp (dds.dcps:matched-count p1)) "endpoints did not match")
+                      (let ((handle (dds.dcps:register-instance dw sample)))
+                        (dds.dcps:write-sample dw sample)             ; SN 1 ALIVE
+                        (loop repeat 100 until (plusp (dds.disc:node-sample-count node2))
+                              do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                        (dds.dcps:unregister-instance dw handle)       ; SN 2 unregister
+                        (loop repeat 150 until (dds.disc:node-lifecycle-change node2 2)
+                              do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                        (%check :adw-received (dds.disc:node-lifecycle-change node2 2)
+                                "subscriber engine never received the unregister DATA")
+                        (%lifecycle-status-flags node2 2)))
+                 (dds.dcps:delete-participant p1)
+                 (dds.dcps:delete-participant p2)))))
+      (%check :adw-default-0x03 (= du (scenario (dds.qos:make-writer-qos)))
+              "a default DataWriter's unregister must emit StatusInfo Disposed|Unregistered (0x03)")
+      (%check :adw-off-0x02
+              (= dds.rtps.message:+statusinfo-unregistered+
+                 (scenario (dds.qos:make-writer-qos :autodispose-unregistered-instances nil)))
+              "autodispose FALSE must emit only StatusInfo Unregistered (0x02)"))
     t))
 
 ;;; EXCLUSIVE reader-side OWNERSHIP arbitration (S1, DDS 1.4 §2.2.3.9.2 / §2.2.3.10): an EXCLUSIVE

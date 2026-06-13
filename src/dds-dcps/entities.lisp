@@ -456,15 +456,25 @@
     (assert-liveliness dw)
     handle))
 
+(defun* %writer-autodispose-p (dw)
+    (function (data-writer) boolean)
+  "DW's WRITER_DATA_LIFECYCLE autodispose_unregistered_instances flag (DDS 1.4 §2.2.3.21), defaulting
+   to T (the policy default) when the QoS is absent or not a dds.qos:qos."
+  (let ((qos (entity-qos dw)))
+    (if (typep qos 'dds.qos:qos) (dds.qos:qos-autodispose-unregistered-instances qos) t)))
+
 (defun* unregister-instance (dw sample-or-handle)
     (function (data-writer t) (simple-array (unsigned-byte 8) (16)))
   "DataWriter::unregister_instance (DDS 1.4 §2.2.2.4.2.7) — unregister the instance named by
-   SAMPLE-OR-HANDLE: emit a no-payload unregister DATA (StatusInfo Unregistered, RTPS 2.5 §9.6.4.9)
-   over the reliable engine, relinquishing this writer's ownership of the instance. Drops the handle
-   from the writer's instance table. Returns the handle."
+   SAMPLE-OR-HANDLE: emit a no-payload unregister DATA over the reliable engine, relinquishing this
+   writer's ownership of the instance. Per WRITER_DATA_LIFECYCLE (DDS 1.4 §2.2.3.21,
+   autodispose_unregistered_instances, default TRUE) the unregister also DISPOSES the instance — the
+   DATA carries StatusInfo Disposed|Unregistered (0x03) so readers report NOT_ALIVE_DISPOSED — unless
+   the writer's QoS sets autodispose FALSE, in which case it carries only Unregistered (0x02, RTPS 2.5
+   §9.6.4.9). Drops the handle from the writer's instance table. Returns the handle."
   (let ((handle (%resolve-handle dw sample-or-handle))
         (node (dp-node (pub-participant (dw-publisher dw)))))
-    (dds.disc:unregister-instance node handle)
+    (dds.disc:unregister-instance node handle (%writer-autodispose-p dw))
     (dds.pal:with-lock ((dw-status-lock dw))
       (remhash handle (dw-instances dw)))
     (assert-liveliness dw)
@@ -574,10 +584,14 @@
   "Apply ONE pending dispose/unregister lifecycle change at sequence number SN on the USER thread (the
    on-sample/%drain discipline — never the receiver thread). Marks SN consumed (exactly-once via
    dr-lifecycle-drained) then applies the DDS 1.4 §2.2.2.5.1.3 reader-side transition to the instance's
-   instance-rec: :dispose -> NOT_ALIVE_DISPOSED (STICKY — dispose dominates no-writers, so it does NOT
-   override an already NOT_ALIVE_DISPOSED instance); :unregister -> drop the originating writer from the
-   instance's writers-set and, only if the instance is still :alive with no writers left, ->
-   NOT_ALIVE_NO_WRITERS. An invalid-data notification (valid_data=FALSE, §2.2.2.5.1.4) is enqueued ONLY
+   instance-rec from the StatusInfo_t FLAG bits (RTPS 2.5 §9.6.4.9), not only the derived kind: the
+   Unregistered bit drops the originating writer from the instance's writers-set, and the instance
+   state is the Disposed bit set -> NOT_ALIVE_DISPOSED (STICKY; disposed dominates no-writers,
+   §2.2.2.5.1.3, even when Unregistered is also set — the WRITER_DATA_LIFECYCLE autodispose default,
+   DDS 1.4 §2.2.3.21), else if the writers-set emptied while still :alive -> NOT_ALIVE_NO_WRITERS. So a
+   Disposed|Unregistered (0x03) DROPS the writer AND ends NOT_ALIVE_DISPOSED; a pure Unregistered
+   (0x02) of the last writer ends NOT_ALIVE_NO_WRITERS; a pure Dispose (0x01) ends NOT_ALIVE_DISPOSED.
+   An invalid-data notification (valid_data=FALSE, §2.2.2.5.1.4) is enqueued ONLY
    when the instance_state actually transitioned (§2.2.2.5.1.4 — these no-data samples surface a CHANGE
    of state); a no-op unregister (writers remain / re-dispose of a disposed instance) produces nothing.
    Returns T if the instance transitioned."
@@ -585,7 +599,7 @@
   (let ((lc (dds.disc:node-lifecycle-change node sn)) (changed nil))
     (when lc
       (destructuring-bind (kind key-hash status-flags wid source-guid) lc
-        (declare (ignore status-flags))
+        (declare (ignore kind))
         (when (%handle-p key-hash)
           (let* ((rec (%reader-instance-rec dr key-hash))
                  (old (instance-rec-state rec)))
@@ -596,12 +610,16 @@
             (let ((owner (instance-rec-owner-guid rec)))
               (when (and owner source-guid (equalp source-guid owner))
                 (setf (instance-rec-owner-guid rec) nil (instance-rec-owner-strength rec) 0)))
-            (ecase kind
-              (:dispose (setf (instance-rec-state rec) :not-alive-disposed))
-              (:unregister
-               (setf (instance-rec-writers rec) (remove wid (instance-rec-writers rec)))
-               (when (and (null (instance-rec-writers rec)) (eq old :alive))
-                 (setf (instance-rec-state rec) :not-alive-no-writers))))
+            ;; Apply the instance state from the StatusInfo_t flag bits (RTPS 2.5 §9.6.4.9): Unregistered
+            ;; drops the writer; Disposed dominates the resulting state (§2.2.2.5.1.3 / §2.2.3.21).
+            (when (logtest status-flags dds.rtps.message:+statusinfo-unregistered+)
+              (setf (instance-rec-writers rec) (remove wid (instance-rec-writers rec))))
+            (cond
+              ((logtest status-flags dds.rtps.message:+statusinfo-disposed+)
+               (setf (instance-rec-state rec) :not-alive-disposed))
+              ((and (logtest status-flags dds.rtps.message:+statusinfo-unregistered+)
+                    (null (instance-rec-writers rec)) (eq old :alive))
+               (setf (instance-rec-state rec) :not-alive-no-writers)))
             (unless (eq old (instance-rec-state rec))
               (%enqueue-instance-notification dr key-hash rec)
               (setf changed t))))))

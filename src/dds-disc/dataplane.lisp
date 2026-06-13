@@ -236,12 +236,19 @@
    Returns the change SN. Mirrors publish-sample so the dispose is reliably repairable."
   (%dispose-or-unregister node key-hash dds.rtps.message:+statusinfo-disposed+))
 
-(defun* unregister-instance (node key-hash)
-    (function (disc-node (simple-array (unsigned-byte 8) (16))) integer)
+(defun* unregister-instance (node key-hash &optional (autodispose t))
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) &optional t) integer)
   "Unregister the instance named by KEY-HASH on NODE's user writer (DDS 1.4 §2.2.2.4.2.7): emit a
-   no-payload unregister DATA (StatusInfo Unregistered, RTPS 2.5 §9.6.4.9) over the reliable engine.
-   Returns the change SN. Mirrors publish-sample so the unregister is reliably repairable."
-  (%dispose-or-unregister node key-hash dds.rtps.message:+statusinfo-unregistered+))
+   no-payload unregister DATA over the reliable engine. When AUTODISPOSE is true (the
+   WRITER_DATA_LIFECYCLE default, DDS 1.4 §2.2.3.21) the StatusInfo is Disposed|Unregistered (the
+   unregister also disposes the instance, behaviour identical to a dispose before the unregister);
+   when false it is Unregistered only (RTPS 2.5 §9.6.4.9). Returns the change SN. Mirrors
+   publish-sample so the unregister is reliably repairable."
+  (%dispose-or-unregister
+   node key-hash
+   (if autodispose
+       (logior dds.rtps.message:+statusinfo-unregistered+ dds.rtps.message:+statusinfo-disposed+)
+       dds.rtps.message:+statusinfo-unregistered+)))
 
 (defun* %source-guid (src-prefix writer-id)
     (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32)) (simple-array (unsigned-byte 8) (16)))

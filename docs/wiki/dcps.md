@@ -41,7 +41,7 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:write-sample` (`dw sample`) | `DataWriter::write` — serialize `sample` via the topic type-support and publish it reliably to matched readers. |
 | `dds.dcps:register-instance` (`dw sample`) | `DataWriter::register_instance` (DDS 1.4 §2.2.2.4.2.5) — register `sample`'s instance and return its 16-octet handle (the type-support key-hash; `HANDLE_NIL` for an unkeyed type). Writer-local; no wire message. |
 | `dds.dcps:dispose-instance` (`dw sample-or-handle`) | `DataWriter::dispose` (DDS 1.4 §2.2.2.4.2.10) — dispose the instance (a sample or a registered handle); emits a no-payload dispose `DATA` (StatusInfo Disposed, RTPS 2.5 §9.6.4.9) over the reliable engine. Returns the handle. |
-| `dds.dcps:unregister-instance` (`dw sample-or-handle`) | `DataWriter::unregister_instance` (DDS 1.4 §2.2.2.4.2.7) — unregister the instance; emits a no-payload unregister `DATA` (StatusInfo Unregistered) over the reliable engine. Returns the handle. |
+| `dds.dcps:unregister-instance` (`dw sample-or-handle`) | `DataWriter::unregister_instance` (DDS 1.4 §2.2.2.4.2.7) — unregister the instance over the reliable engine. Per `WRITER_DATA_LIFECYCLE.autodispose_unregistered_instances` (§2.2.3.21, default **TRUE**) the unregister also **disposes** the instance: the no-payload `DATA` carries StatusInfo `Disposed\|Unregistered` (0x03) so readers report `NOT_ALIVE_DISPOSED`; with autodispose `FALSE` it carries `Unregistered` (0x02) only. Returns the handle. |
 | `dds.dcps:read-samples` (`dr &key states where`) | `DataReader::read` — return the cached samples whose sample-state is in `states` (default `(:read :not-read)` = ANY) and whose data satisfies `where`, **without** removing them; mark each `:read` and set its view-state. Returns a list of `cached-sample`. |
 | `dds.dcps:take-samples` (`dr &key states where`) | `DataReader::take` — like `read-samples` but **removes** the returned samples from the cache. |
 | `dds.dcps:samples-available` (`dr`) | Drain newly-received samples into the cache and return the cache size, **without** marking anything `:read` — for polling before a read/take. |
@@ -455,13 +455,23 @@ the source as deferred or simplified — do not rely on them yet:
   `dispose` / `unregister_instance` emit the no-payload dispose/unregister `DATA` over the reliable
   engine (StatusInfo Disposed/Unregistered, RTPS 2.5 §9.6.4.9; reliably ACKNACK-repairable). Reader
   side (S2, DDS 1.4 §2.2.2.5.1.3/.4/.5): the reader keeps a per-instance state and surfaces it in
-  `SampleInfo`. A received `dispose` -> `:not-alive-disposed`; the last writer of an instance
-  unregistering or vanishing (lease expiry) -> `:not-alive-no-writers`; a later data sample revives
+  `SampleInfo`. The reader applies the state from the StatusInfo_t **flag bits**: the `Unregistered`
+  bit drops the source writer from the instance's writers-set, then the `Disposed` bit set ->
+  `:not-alive-disposed` (disposed dominates, §2.2.2.5.1.3, even when `Unregistered` is also set), else
+  the writers-set emptied while alive -> `:not-alive-no-writers`. A later data sample revives
   the instance to `:alive` and bumps the matching generation count. A dispose/unregister/no-writers
   transition delivers an **invalid-data** sample (`valid-data nil`, no Data, carrying the new
   `instance-state` + generation counts) through `read`/`take`, and fires `on_data_available`. The
   ranks, `source-timestamp`, and `publication-handle` stay at their defaults (`0` / `nil`); there is
   no `write_w_timestamp`. Live Connext interop of the reader-side transition is a later stage.
+- **`WRITER_DATA_LIFECYCLE.autodispose_unregistered_instances` (DDS 1.4 §2.2.3.21, default TRUE).** By
+  default a `DataWriter::unregister_instance` **also disposes** the instance — behaviour identical to
+  calling `dispose` before the unregister (§2.2.3.21) — so the unregister `DATA` carries StatusInfo
+  `Disposed\|Unregistered` (0x03) and a reader reports `NOT_ALIVE_DISPOSED`, matching the conformant
+  Fast DDS default. Create the writer with `(make-writer-qos :autodispose-unregistered-instances nil)`
+  to suppress the auto-dispose: the unregister then carries `Unregistered` (0x02) only and a reader
+  reports `NOT_ALIVE_NO_WRITERS` once the last writer is gone. The policy is **writer-local** — it is
+  not advertised in SEDP and not part of RxO compatibility.
 - **EXCLUSIVE OWNERSHIP arbitration: reader side (S1).** An `EXCLUSIVE` `DataReader`
   (`make-reader-qos :ownership :exclusive`) delivers, **per instance**, only the samples of the
   **owner** — the highest-`OWNERSHIP_STRENGTH` alive matched writer (DDS 1.4 §2.2.3.9.2 / §2.2.3.10).

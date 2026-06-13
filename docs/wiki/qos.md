@@ -49,6 +49,7 @@ a package-qualified accessor.
 | `dds.qos:qos-presentation-ordered` | PRESENTATION `ordered_access` flag | `nil` |
 | `dds.qos:qos-data-representation` | DATA_REPRESENTATION list. Writer: the *offered* representation is `(first …)`. Reader: the *set* of accepted representations. | `(:xcdr1)` |
 | `dds.qos:qos-partition` | PARTITION — a list of partition-name strings | `()` |
+| `dds.qos:qos-autodispose-unregistered-instances` | WRITER_DATA_LIFECYCLE `autodispose_unregistered_instances` (writer-local, non-RxO, §2.2.3.21) — `t` makes a writer's `unregister_instance` also dispose the instance | `t` |
 | `dds.qos:qos-history-kind` | HISTORY kind (held, non-RxO) — `:keep-last` or `:keep-all` | `:keep-last` |
 | `dds.qos:qos-history-depth` | HISTORY depth (held, non-RxO) | `1` |
 | `dds.qos:qos-lifespan` | LIFESPAN duration (held, non-RxO) | `+duration-infinite+` |
@@ -194,8 +195,13 @@ and `run-dcps-incompatible-qos-test` / `run-assignability-test` (in
   PRESENTATION (scope + the coherent/ordered flags), and DATA_REPRESENTATION.
 - **Held (non-RxO) policies** carried for completeness but not part of compatibility:
   HISTORY (kind + depth), LIFESPAN, RESOURCE_LIMITS (`max_samples` /
-  `max_instances` / `max_samples_per_instance`), OWNERSHIP_STRENGTH, and
+  `max_instances` / `max_samples_per_instance`), OWNERSHIP_STRENGTH,
+  WRITER_DATA_LIFECYCLE (`autodispose_unregistered_instances`), and
   TYPE_CONSISTENCY_ENFORCEMENT.
+- **WRITER_DATA_LIFECYCLE is writer-local (DDS 1.4 §2.2.3.21, default TRUE).** With
+  `autodispose_unregistered_instances` TRUE a `DataWriter::unregister_instance` also disposes the
+  instance (the reader reports `NOT_ALIVE_DISPOSED`); FALSE leaves it at `NOT_ALIVE_NO_WRITERS`. It is
+  not advertised in SEDP and excluded from `qos-rxo-compatible`.
 - **PARTITION gates matching but raises no status.** It is excluded from
   `qos-rxo-compatible` and handled by `partition-match-p`; a mismatch silently prevents the
   match. Per the source docstring, **wildcard / `fnmatch` partition names are a later

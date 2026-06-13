@@ -125,6 +125,9 @@
   (history-kind :keep-last :type (member :keep-last :keep-all))
   (history-depth 1 :type (integer 1))
   (lifespan +duration-infinite+ :type qos-duration)
+  ;; WRITER_DATA_LIFECYCLE (DDS 1.4 §2.2.3.21): writer-local, NOT advertised in SEDP, NOT RxO-checked.
+  ;; autodispose_unregistered_instances default TRUE -> an unregister also disposes the instance.
+  (autodispose-unregistered-instances t :type boolean)
   ;; RESOURCE_LIMITS (not an RxO policy). LENGTH_UNLIMITED = -1 is the DDS default.
   (resource-max-samples -1 :type integer)
   (resource-max-instances -1 :type integer)
