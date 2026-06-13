@@ -389,12 +389,29 @@
             (%send-user-heartbeat node (disc-node-tx-msg node) first last count (car peer) (cdr peer)))))))
   t)
 
+(defun* flush-batch (node)
+    (function (disc-node) (eql t))
+  "WP-BATCH time/explicit trigger (FR-PF-1): if any batched samples are pending, push them now
+   (%push-data sends all unsent changes, coalesced) and reset the pending counter. A no-op when nothing
+   is pending. Called on the announce cadence (so a partial batch is never stranded) and on stop-node."
+  (when (plusp (disc-node-batch-pending node))
+    (setf (disc-node-batch-pending node) 0)
+    (%push-data node))
+  t)
+
 (defun* publish-sample (node payload)
     (function (disc-node (simple-array (unsigned-byte 8) (*))) (eql t))
-  "Publish PAYLOAD (an opaque SerializedPayload) on the node's user writer: add it
-   to the writer HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8)."
+  "Publish PAYLOAD (an opaque SerializedPayload) on the node's user writer: add it to the writer
+   HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8). With WP-BATCH (batch-max-samples > 1,
+   FR-PF-1/NFR-PERF-4) the push is DEFERRED — the write accumulates and the batch flushes only when
+   batch-max-samples have accumulated (size trigger) or flush-batch fires (time/cadence trigger), so N
+   small samples go out coalesced in few datagrams with one amortized HEARTBEAT. Default
+   batch-max-samples=1 flushes every write (unchanged behaviour)."
   (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload)
-  (%push-data node)
+  (if (>= (incf (disc-node-batch-pending node)) (disc-node-batch-max-samples node))
+      (flush-batch node)
+      ;; size trigger not yet reached: defer the push to the next flush (cadence or fill)
+      nil)
   t)
 
 (defun* %dispose-or-unregister (node key-hash status-flags)
@@ -403,8 +420,11 @@
    to the user writer's HistoryCache (writer-lifecycle-change, deriving the KIND from
    STATUS-FLAGS), then push DATA + HEARTBEAT to peers exactly like publish-sample — so the
    lifecycle DATA is sent AND reliably ACKNACK-repairable (RTPS 2.5 §8.4.2.2 / §9.6.4.9).
-   Returns the change's sequence number."
+   Returns the change's sequence number. A lifecycle change is NEVER batch-delayed: it pushes
+   immediately, which also flushes any pending batched data first (sent in SN order, so a dispose never
+   overtakes its instance's batched samples)."
   (let ((sn (dds.rtps.reliable:writer-lifecycle-change (disc-node-user-writer node) key-hash status-flags)))
+    (setf (disc-node-batch-pending node) 0)   ; the immediate push flushes the pending batch too
     (%push-data node)
     sn))
 

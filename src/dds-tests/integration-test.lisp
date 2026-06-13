@@ -3222,6 +3222,44 @@
       (dds.disc:stop-node node)))
   t)
 
+;;; WP-BATCH write-side batching (FR-PF-1 / NFR-PERF-4): with batch-max-samples=N, publish-sample DEFERS
+;;; the push until N samples accumulate (size trigger) or flush-batch fires (time/cadence/stop); the batch
+;;; then flushes coalesced into few datagrams with one amortized HEARTBEAT. Each sample stays a standard
+;;; DATA (wire-standard, reader unchanged). Default N=1 flushes per write (no batching). Offline: a matched
+;;; reader destination is seeded so %push-data has somewhere to send, and *datagram-sink* counts the DATA.
+
+(defun* run-batch-defer-test ()
+    (function () t)
+  "WP-BATCH: with batch-max-samples=5, four publishes DEFER (no datagram); the 5th hits the size trigger
+   and flushes all 5 batched DATA at once; a subsequent partial batch flushes only on flush-batch."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7)
+               :host "127.0.0.1" :port 0 :batch-max-samples 5)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-publisher node)
+           (%seed-reader-participant node #x63 7705)
+           (let ((captured '()))
+             (let ((dds.disc::*datagram-sink* (lambda (dg) (push dg captured))))
+               (dotimes (i 4) (dds.disc:publish-sample node (octets 1 2 3 4)))
+               (%check :batch-deferred (null captured)
+                       "a partial batch (4 < max 5) must NOT push any datagram")
+               (dds.disc:publish-sample node (octets 1 2 3 4))   ; 5th -> size trigger
+               (%check :batch-flush-5
+                       (= 5 (reduce #'+ (mapcar #'%count-submessages captured) :key #'second))
+                       "the 5th publish flushes all 5 batched DATA at once")
+               (setf captured '())
+               (dds.disc:publish-sample node (octets 1 2 3 4))
+               (dds.disc:publish-sample node (octets 1 2 3 4))
+               (%check :batch-deferred-2 (null captured)
+                       "two more publishes defer (2 < max 5)")
+               (dds.disc:flush-batch node)
+               (%check :batch-flush-partial
+                       (= 2 (reduce #'+ (mapcar #'%count-submessages captured) :key #'second))
+                       "flush-batch pushes the 2-sample partial batch"))))
+      (dds.disc:stop-node node)))
+  t)
+
 ;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a
 ;;; discovered participant not refreshed within its leaseDuration. %lease-sweep
 ;;; prunes the stale participant's discovered entry + endpoints + matches +

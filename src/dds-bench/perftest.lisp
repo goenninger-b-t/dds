@@ -129,12 +129,14 @@
                        :bytes-per-sample (round (/ consed samples)))))))
       (dds.disc:stop-node p) (dds.disc:stop-node e))))
 
-(defun* run-throughput (&key (samples 20000) (payload-bytes 64))
-    (function (&key (:samples (integer 1)) (:payload-bytes (integer 1))) list)
+(defun* run-throughput (&key (samples 20000) (payload-bytes 64) (batch 1))
+    (function (&key (:samples (integer 1)) (:payload-bytes (integer 1)) (:batch (integer 1))) list)
   "Measure one-way throughput over UDP loopback: a writer node blasts SAMPLES of a PAYLOAD-BYTES sample
-   on topic PerfThru as fast as write() returns; a reader node counts delivery. Returns a plist:
-   :samples :payload-bytes :received :send-samples-per-s :delivered-samples-per-s :send-mbps."
-  (let* ((p (dds.disc:make-disc-node :guid-prefix (%prefix #x72) :host "127.0.0.1" :port 0))
+   on topic PerfThru as fast as write() returns; a reader node counts delivery. BATCH > 1 enables WP-BATCH
+   write-side batching (flush every BATCH samples). Returns a plist:
+   :samples :payload-bytes :batch :received :send-samples-per-s :delivered-samples-per-s :send-mbps."
+  (let* ((p (dds.disc:make-disc-node :guid-prefix (%prefix #x72) :host "127.0.0.1" :port 0
+                                     :batch-max-samples batch))
          (e (dds.disc:make-disc-node :guid-prefix (%prefix #x73) :host "127.0.0.1" :port 0))
          (payload (%payload payload-bytes)))
     (unwind-protect
@@ -147,11 +149,12 @@
            (%connect p e 1)
            (let ((t0 (dds.pal:monotonic-ns)))
              (dotimes (i samples) (dds.disc:publish-sample p payload))
+             (dds.disc:flush-batch p)             ; drain the final partial batch
              (let ((send-ns (max 1 (- (dds.pal:monotonic-ns) t0))))
                (loop repeat 2000 until (>= (dds.disc:node-sample-count e) samples) do (sleep 0.005))
                (let* ((recv-ns (max 1 (- (dds.pal:monotonic-ns) t0)))
                       (received (dds.disc:node-sample-count e)))
-                 (list :samples samples :payload-bytes payload-bytes :received received
+                 (list :samples samples :payload-bytes payload-bytes :batch batch :received received
                        :send-samples-per-s (round (/ samples (/ send-ns 1.0d9)))
                        :delivered-samples-per-s (round (/ received (/ recv-ns 1.0d9)))
                        :send-mbps (/ (round (/ (* samples payload-bytes 8) (/ send-ns 1.0d9))) 1.0d6))))))
@@ -177,14 +180,14 @@
   (format t "|---------|---------|----------|----------|----------|----------|----------|------------|~%")
   (dolist (sz '(16 64 256))
     (%print-latency (run-latency :samples latency-samples :payload-bytes sz :warmup 500)))
-  (format t "~%## Throughput (one-way)~%~%")
-  (format t "| payload | samples | received | send samples/s | delivered samples/s | send Mbps |~%")
-  (format t "|---------|---------|----------|----------------|---------------------|-----------|~%")
-  (dolist (sz '(64 1024))
-    (let ((r (run-throughput :samples throughput-samples :payload-bytes sz)))
-      (format t "| ~5d B | ~7d | ~8d | ~14d | ~19d | ~9,1f |~%"
-              (getf r :payload-bytes) (getf r :samples) (getf r :received)
-              (getf r :send-samples-per-s) (getf r :delivered-samples-per-s) (getf r :send-mbps))))
+  (format t "~%## Throughput (one-way; batch N = WP-BATCH write-side batching)~%~%")
+  (format t "| payload | batch | samples | received | send samples/s | send Mbps |~%")
+  (format t "|---------|-------|---------|----------|----------------|-----------|~%")
+  (dolist (spec '((64 . 1) (64 . 100) (1024 . 1)))
+    (let ((r (run-throughput :samples throughput-samples :payload-bytes (car spec) :batch (cdr spec))))
+      (format t "| ~5d B | ~5d | ~7d | ~8d | ~14d | ~9,1f |~%"
+              (getf r :payload-bytes) (getf r :batch) (getf r :samples) (getf r :received)
+              (getf r :send-samples-per-s) (getf r :send-mbps))))
   (format t "~%Note: bytes/sample > 0 reflects the v1 data plane (per-sample heap copies, documented); the P4 features drive it toward the NFR-PERF-8 0-alloc target measured here.~%")
   t)
 

@@ -70,6 +70,8 @@
   (user-reader nil :type (or null dds.rtps.reliable:rtps-reader))
   (user-writer-id #x00000102 :type (unsigned-byte 32)) ; this node's user-data writer EntityId (kind reflects keyed-ness)
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
+  (batch-max-samples 1 :type (integer 1)) ; WP-BATCH size trigger: flush the accumulated batch every N publishes (1 = flush per write, no batching)
+  (batch-pending 0 :type (integer 0))     ; samples accumulated since the last flush (a flush pacer; %push-data always sends all unsent)
   (samples (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> payload (§8.3.5.4: SN is per-writer; no per-sample composite-key alloc)
   (sample-writers (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> writer EntityId (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
@@ -114,12 +116,15 @@
 (defun* make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
                                                      :initial-element 0))
                             (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast
-                            (advertise-address "127.0.0.1"))
-    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string)) disc-node)
+                            (advertise-address "127.0.0.1") (batch-max-samples 1))
+    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1))) disc-node)
   "Open a metatraffic UDPv4 socket bound to HOST:PORT and build a discovery node.
    PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4).
    MULTICAST opens a second socket bound to the SPDP multicast port and joins the
-   well-known group, so the node also discovers peers via multicast (FR-DISC-3)."
+   well-known group, so the node also discovers peers via multicast (FR-DISC-3).
+   BATCH-MAX-SAMPLES > 1 enables WP-BATCH write-side batching (FR-PF-1): publish-sample defers the push
+   until N samples accumulate or flush-batch fires (the announce cadence / stop-node), amortizing
+   per-sample overhead for small samples (NFR-PERF-4). Default 1 = flush every write (no batching)."
   ;; In multicast mode bind the unicast socket to 0.0.0.0: a loopback-bound socket
   ;; cannot egress to a multicast group (EADDRNOTAVAIL), and 0.0.0.0 still receives
   ;; unicast SEDP addressed to 127.0.0.1:port.
@@ -128,6 +133,7 @@
     (let ((node (%make-disc-node :guid-prefix guid-prefix :domain domain
                                  :advertise-address advertise-address
                                  :socket sock :transport tr :peers peers
+                                 :batch-max-samples batch-max-samples
                                  :tx-payload (dds.core.buffer:make-octet-buffer 512)
                                  :tx-msg (dds.core.buffer:make-octet-buffer 2048)
                                  :rx-tx-msg (dds.core.buffer:make-octet-buffer 2048))))
@@ -446,6 +452,7 @@
   (tl-sweep node)
   (%lease-sweep node)
   (%liveliness-sweep node)
+  (flush-batch node)        ; WP-BATCH time trigger: flush a partial batch on the announce cadence
   (%push-heartbeat node)
   t)
 
@@ -838,6 +845,7 @@
    announce scratch buffers. The join MUST precede the frees: an in-flight
    %HANDLE-DATAGRAM on a receiver thread writes into RX-TX-MSG/TX-MSG, so freeing
    first is a use-after-free (observed via canary instrumentation). Idempotent."
+  (when (disc-node-user-writer node) (flush-batch node))   ; WP-BATCH: drain a pending batch before closing the socket
   (dds.pal:udp-close (disc-node-socket node))
   (when (disc-node-mcast-socket node)
     (dds.pal:udp-close (disc-node-mcast-socket node))
