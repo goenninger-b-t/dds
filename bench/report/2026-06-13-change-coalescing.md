@@ -41,6 +41,24 @@ constant changed. The shared RTPS Header (§9.4.4) is reused verbatim per datagr
 regression tests green (reliable-data-over-udp, large-data-over-udp, lost-final-sample-repair,
 dispose-over-udp, dispose-reliable-repair).
 
+## Live wire confirmation (lo0, our square-pub vs Fast DDS shapes_sub)
+Capture `interop/fastdds/captures/coalescing-data-heartbeat-lo0.pcap`, dissected with the standard
+Wireshark/tshark RTPS dissector. Our publisher (vendorId 0x01FF) emitted 8 user-data samples; each is ONE
+UDP datagram carrying TWO submessages — `DATA (0x15)` then `HEARTBEAT (0x07)`, both writerEntityId
+0x00000102 — i.e. DATA+HEARTBEAT coalesced (8 datagrams for 8 samples, vs 16 one-per-submessage before):
+
+```
+frame 8  udp→7410  rtps.sm.id = 0x15,0x07   DATA(writer 0x102, SN 1) + HEARTBEAT(0x102, 1..1)
+frames 9-15                    0x15,0x07     SN 2..8, each DATA+HEARTBEAT in one datagram
+```
+
+The standard dissector parses both submessages cleanly, confirming the coalesced datagram is well-formed
+RTPS (§8.3.4) — the same framing Connext/Fast DDS emit and parse. End-to-end reception over a real UDP
+socket is covered by the passing UDP-loopback regression suite (which drives our reader through the
+coalescing send path). (Foreign-peer end-to-end *delivery* on this run used the loopback static-`:peers`
+fallback destination, a same-host discovery-resolution detail orthogonal to the coalescing framing
+proven here.)
+
 ## Gates
 143 tests pass on SBCL and Clasp (was 140; +`coalesce-pack` +`coalesce-split` +`coalesce-large-pack`).
 gate-types PASS (925 ftype'd defuns). gate-hotpath PASS (5 hot-path files clean — this L5/L6 bridge file
