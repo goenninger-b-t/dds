@@ -637,6 +637,76 @@
                 "writer-data-list (unchanged) re-collects the whole unacked history: sum=5050"))))
   t)
 
+(defun* run-history-purge-test ()
+    (function () t)
+  "Test: writer-purge-acked bounds a KEEP_ALL HistoryCache by the SLOWEST reader's ack (RTPS 2.5 §8.4.1).
+   Two matched readers; a change is dropped only once EVERY reader has acked past it (min acked-base); a
+   matched-but-unacked reader holds the watermark at 1 (nothing purged); a NACKed (unacked) change is
+   never purged."
+  (flet ((mk () (dds.rtps.reliable:make-rtps-writer
+                 :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (pl (k) (map '(simple-array (unsigned-byte 8) (*)) #'char-code (format nil "m~d" k)))
+         (ack (w rid base) (dds.rtps.reliable:writer-on-acknack
+                            w rid base 0 (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0))))
+    (let ((w (mk)) (a 10) (b 20))
+      (dotimes (k 10) (dds.rtps.reliable:writer-write w (pl (1+ k))))   ; SN 1..10
+      (%check :hp-full (= 10 (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w)))
+              "the KEEP_ALL writer must hold all 10 written changes before any ack")
+      (ack w a 7)   ; reader A acked < 7 (acked-base 7)
+      (%check :hp-unacked-holds
+              (and (zerop (dds.rtps.reliable:writer-purge-acked w (list a b)))
+                   (= 10 (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w))))
+              "an unacked second reader (acked-base 1) holds the watermark — nothing is purged")
+      (ack w b 5)   ; reader B acked < 5 (acked-base 5); min(7,5)=5 -> purge SN 1..4
+      (%check :hp-purged (= 4 (dds.rtps.reliable:writer-purge-acked w (list a b)))
+              "min acked-base 5 purges exactly SN 1..4 (acked by BOTH readers)")
+      (let ((hc (dds.rtps.reliable:rtps-writer-hc w)))
+        (%check :hp-count (= 6 (dds.rtps.history:hc-change-count hc))
+                "6 changes remain (SN 5..10)")
+        (%check :hp-firstsn (= 5 (dds.rtps.history:hc-min-seq hc))
+                "the HEARTBEAT firstSN (hc-min-seq) advances to 5 after the purge")
+        (%check :hp-boundary-kept (dds.rtps.history:hc-get-change hc 5)
+                "SN 5 (= acked-base, NACK-able, not fully-acked) is NOT purged — repair stays intact")
+        (%check :hp-below-gone (null (dds.rtps.history:hc-get-change hc 4))
+                "SN 4 (< min acked-base) is purged"))
+      (%check :hp-empty (zerop (dds.rtps.reliable:writer-purge-acked w '()))
+              "no matched readers -> purge is a no-op (keep everything)")))
+  t)
+
+(defun* run-reader-compaction-test ()
+    (function () t)
+  "Test: the reader WriterProxy received-table stays bounded to the live window, not O(history) (RTPS 2.5
+   §8.4.10). reader-on-data records a presence marker (no payload retained); reader-on-heartbeat compacts
+   markers below the advancing firstSN (the writer purged them); firstSN is monotonic (a stale lower
+   HEARTBEAT does not un-compact); ACKNACK/complete-p remain correct."
+  (let* ((reader (dds.rtps.reliable:make-rtps-reader))
+         (w 7)
+         (pl (map '(simple-array (unsigned-byte 8) (*)) #'char-code "x")))
+    (dotimes (k 100)                                   ; SN 1..100, a 10-wide moving window
+      (let ((sn (1+ k)))
+        (dds.rtps.reliable:reader-on-data reader w sn pl)
+        (dds.rtps.reliable:reader-on-heartbeat reader w (max 1 (- sn 9)) sn)))
+    (let* ((proxy (dds.rtps.reliable:get-writer-proxy reader w))
+           (received (dds.rtps.reliable:writer-proxy-received proxy)))
+      (%check :rc-bounded (<= (hash-table-count received) 10)
+              "received markers must be bounded to the ~10-wide window, not the 100 samples")
+      (%check :rc-window-present
+              (and (gethash 100 received) (gethash 91 received) (null (gethash 90 received)))
+              "the live window [91,100] is retained; compacted SNs below firstSN are dropped")
+      (%check :rc-complete (dds.rtps.reliable:reader-complete-p reader w)
+              "reader-complete-p stays correct over the live window after compaction")
+      (multiple-value-bind (base numbits) (dds.rtps.reliable:reader-acknack reader w)
+        (declare (ignore numbits))
+        (%check :rc-acknack-base (= 101 base)
+                "with the whole window received, the ACKNACK base is last+1 (101) — no spurious NACK"))
+      ;; monotonic firstSN: a stale lower HEARTBEAT must not lower firstSN or un-compact
+      (dds.rtps.reliable:reader-on-heartbeat reader w 50 100)
+      (%check :rc-monotonic
+              (and (= 91 (dds.rtps.reliable:writer-proxy-first-sn proxy))
+                   (<= (hash-table-count received) 10))
+              "a stale lower-firstSN HEARTBEAT must not lower firstSN nor re-grow the received table")))
+  t)
+
 ;;; HEARTBEAT / ACKNACK / GAP submessage round-trips (RTPS 2.5 §9.4.5.7/.3/.6).
 ;;; Writes a complete submessage, re-reads the SubmessageHeader, then the body.
 

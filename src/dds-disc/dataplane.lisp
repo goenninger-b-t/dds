@@ -145,6 +145,22 @@
    convention (a peer such as RTI Connext picks its own writer EntityIds)."
   (let ((k (logand entity-id #xff))) (or (= k #x02) (= k #x03))))
 
+(defun* %matched-reader-keys (node)
+    (function (disc-node) list)
+  "The full 16-octet GUIDs of every matched RELIABLE remote user READER — the writer-proxy keys for
+   purge-on-full-ACK (writer-purge-acked). Identical keys to the ones %on-user-acknack advances
+   (%source-guid src-prefix rid = the reader's GUID, RTPS 2.5 §9.4.4 / §8.3.5.4), so the purge watermark
+   is the min acked-base across every matched RELIABLE reader (a not-yet-ACKed reliable reader's proxy
+   reads acked-base 1 and holds the watermark — nothing purged until it acks). A BEST_EFFORT reader is
+   EXCLUDED: it never ACKNACKs (its proxy would pin the watermark at 1 forever, disabling the purge) and
+   the writer owes it no retransmit (best-effort = no delivery guarantee, §2.2.3.13), so purging samples
+   it never acked is correct."
+  (loop for remote in (%matched-endpoints node)
+        for guid = (dds.rtps.discovery:endpoint-data-guid remote)
+        for q = (dds.rtps.discovery:endpoint-data-qos remote)
+        when (and (%reader-guid-p guid) q (eq (dds.qos:qos-reliability q) :reliable))
+          collect (copy-seq guid)))
+
 (defun* %matched-endpoints (node)
     (function (disc-node) list)
   "Snapshot of the remote endpoints matched to one of NODE's local endpoints."
@@ -556,7 +572,9 @@
 (defun* %on-user-acknack (node c flags src-prefix)
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
   "Writer side: on an ACKNACK, retransmit each NACKed change as a DATA submessage to the ONE reader
-   that NACKed (uses rx-tx-msg). GAPs are not needed (KEEP_ALL never drops). The reader-proxy is keyed
+   that NACKed (uses rx-tx-msg), then purge the HistoryCache of changes ALL matched readers have acked
+   (writer-purge-acked, §8.4.1). GAPs are not needed (only FULLY-acked changes are purged; a NACKed change
+   is never purged so it stays repairable). The reader-proxy is keyed
    by the REMOTE reader's FULL 16-octet GUID (SRC-PREFIX + the ACKNACK's reader EntityId RID, §9.4.4 /
    §9.3.1.2) — the SAME key %push-data uses for that reader — so two readers sharing EntityId 0x107
    across participants advance independent acked-base watermarks (§8.3.5.4). The resend goes ONLY to the
@@ -576,7 +594,11 @@
         (let* ((dest (%prefix-user-destination node src-prefix))
                (peers (if dest (list dest) (%match-destinations node t))))
           (dolist (peer peers)   ; retransmit DATA(_FRAG) / dispose -> the NACKing reader (coalesced, no HB)
-            (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil))))))
+            (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil)))
+        ;; the ACKNACK advanced this reader's acked-base -> purge HistoryCache changes ALL matched readers
+        ;; have now acknowledged (RTPS 2.5 §8.4.1), bounding the KEEP_ALL writer history. NACKed (resent)
+        ;; changes are not fully acked, so they are never purged.
+        (dds.rtps.reliable:writer-purge-acked (disc-node-user-writer node) (%matched-reader-keys node)))))
   t)
 
 (defun* %on-user-data-frag (node c flags body-len buf src-prefix)

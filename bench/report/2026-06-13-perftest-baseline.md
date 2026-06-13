@@ -8,50 +8,41 @@ retry cap); the app-facing poll cache is drained each iteration (emulating `take
 `dds.pal:bytes-consed` delta over the measured loop (whole path, all threads, SBCL-exact); clock =
 `dds.pal:monotonic-ns` (~µs resolution).
 
-## One-way latency (ns; RTT/2, 5 000 samples, 500 warmup)
+## One-way latency (ns; RTT/2, 5 000 samples, 500 warmup) — AFTER the history-retention WP
 
-| payload | p50     | p99     | p99.99    | max       | mean    | bytes/sample |
-| ------- | ------- | ------- | --------- | --------- | ------- | ------------ |
-| 16 B    | 116 000 | 205 500 | 4 454 000 | 4 454 000 | 115 332 | 104 850      |
-| 64 B    | 112 000 | 210 500 |   690 500 |   690 500 | 113 878 | 104 976      |
-| 256 B   | 115 000 | 209 500 | 3 847 000 | 3 847 000 | 116 770 | 105 403      |
+| payload | p50    | p99    | p99.99    | max       | mean   | bytes/sample |
+| ------- | ------ | ------ | --------- | --------- | ------ | ------------ |
+| 16 B    | 14 500 | 28 500 |   814 000 |   814 000 | 15 564 | 9 158        |
+| 64 B    | 15 000 | 29 500 | 4 051 000 | 4 051 000 | 16 361 | 9 234        |
+| 256 B   | 17 000 | 64 000 | 4 212 000 | 4 212 000 | 22 615 | 9 616        |
 
-## Throughput (one-way, 20 000 samples)
+## Throughput (one-way, 20 000 samples) — AFTER
 
 | payload | received | send samples/s | delivered samples/s | send Mbps |
 | ------- | -------- | -------------- | ------------------- | --------- |
-| 64 B    | 20 000   | 2 930          | 2 927               | 1.5       |
-| 1024 B  | 20 000   | 2 880          | 2 878               | 23.6      |
+| 64 B    | 20 000   | 5 796          | ~5 790              | 3.0       |
 
-## ⚠ First finding: per-sample cost grows O(N) — the v1 reliable engine retains unbounded history
+## ✅ First finding — RESOLVED by the history-retention WP
 
-The harness's first surfaced defect. Latency and bytes/sample are NOT steady-state — they grow with the
-sample count N (64 B payload, poll cache drained each iteration):
+The harness's first surfaced defect: latency + bytes/sample grew O(N) because the reliable engine
+retained O(history) — writer `HistoryCache` KEEP_ALL never purged on ack, and the reader
+`writer-proxy.received` stored every payload by SN forever. **Fixed** (`writer-purge-acked` on full-ACK +
+reader presence-markers + first-SN compaction; see `docs/superpowers/specs/2026-06-13-history-retention-design.md`).
+The growth is gone — steady-state O(1) (64 B, poll cache drained):
 
-| N      | p50 latency | bytes/sample |
-| ------ | ----------- | ------------ |
-| 2 000  | 48 500 ns   | 44 434       |
-| 5 000  | 113 000 ns  | 104 976      |
-| 10 000 | 186 500 ns  | 171 804      |
+| N      | p50 latency BEFORE → AFTER | bytes/sample BEFORE → AFTER |
+| ------ | -------------------------- | --------------------------- |
+| 2 000  | 48 500 ns  → ~17 000 ns    | 44 434  → ~9 200            |
+| 5 000  | 113 000 ns → ~16 500 ns    | 104 976 → ~9 260            |
+| 10 000 | 186 500 ns → ~17 000 ns    | 171 804 → ~9 250            |
 
-**Root cause (confirmed in source):** the reliable engine retains O(history), never purging on ack:
-- **Writer `HistoryCache` is KEEP_ALL** and never drops acked samples (`src/dds-rtps/history.lisp`:25
-  notes per-instance KEEP_LAST + LIFESPAN expiry as "tracked follow-ups"); every published sample stays
-  in `history-cache-changes`.
-- **Reader `writer-proxy.received`** (`src/dds-rtps/reliable.lisp`:142/166) stores every received
-  sample's **payload** keyed by SN, forever — never purged.
-
-So both sides grow to N entries; the per-sample figure is rehash + retention churn over a growing table,
-and latency degrades as the structures grow. **This is a v1 data-plane characteristic, not a harness
-artifact** — and exactly the kind of scalability issue a perftest harness exists to surface.
-
-**Recommended follow-up WP (data plane, not WP-PERFTEST):** purge writer history on full-ACK and bound
-the reader received-table (KEEP_LAST / RESOURCE_LIMITS), so steady-state cost is O(1) per sample. Until
-then the absolute baseline numbers must be read AT A STATED N (above: N = 5 000), not as steady-state.
+At N = 10 000: **18.6× less alloc, 11× lower latency, and now FLAT across N** (≈ 2× throughput, 2 900 →
+5 800 samples/s). The remaining ~9.2 KB/sample is the still-unoptimized v1 per-sample consing (list
+churn in the push/merge/target paths, the condvar handoff) — the lever for the arena / batching WPs.
 
 ## Reading the rest of the baseline
-- **p50 ~113 µs at N=5 000** is dominated by per-round-trip thread handoffs (two receiver-thread wakeups +
-  a condvar signal) + the synchronous RELIABLE handshake + the O(N) retention above — not serialization.
+- **p50 ~16 µs at N=5 000** is now dominated by per-round-trip thread handoffs (two receiver-thread
+  wakeups + a condvar signal) + the synchronous RELIABLE handshake — not retention or serialization.
 - **p99.99/max in the ms range** are GC pauses (NFR-PERF-3 tail risk, as forecast); the static-arena /
   0-alloc path shrinks them.
 - **~2 900 samples/s** is the synchronous one-at-a-time reliable send rate; **batching** (WP-BATCH) +

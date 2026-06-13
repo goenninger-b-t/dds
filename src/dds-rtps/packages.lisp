@@ -15,7 +15,7 @@
            #:cache-change-status-info
            #:cache-change-source-timestamp #:cache-change-inline-qos
            #:history-cache #:make-history-cache #:hc-change-count
-           #:hc-add-change #:hc-remove-change #:hc-get-change
+           #:hc-add-change #:hc-remove-change #:hc-purge-below #:hc-get-change
            #:hc-min-seq #:hc-max-seq #:hc-changes-for-reader
            #:history-not-implemented))
 
@@ -86,13 +86,13 @@
    "Stateful reliable RTPS writer + reader (RTPS 2.5 §8.4.2/§8.4.10): ReaderProxy/
     WriterProxy, changes-for-reader, HEARTBEAT/ACKNACK/GAP-driven retransmit and
     reordering. Verified by a lossy/reorder/dup fault-injection suite (NFR-TEST).")
-  (:export #:rtps-writer #:make-rtps-writer #:writer-write #:writer-heartbeat
+  (:export #:rtps-writer #:make-rtps-writer #:rtps-writer-hc #:writer-write #:writer-heartbeat
            #:writer-lifecycle-change
-           #:writer-data-list #:writer-unsent-list #:writer-on-acknack #:get-reader-proxy
+           #:writer-data-list #:writer-unsent-list #:writer-on-acknack #:writer-purge-acked #:get-reader-proxy
            #:reader-proxy #:reader-proxy-acked-base
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
            #:reader-acknack #:reader-on-gap #:reader-complete-p
-           #:get-writer-proxy #:writer-proxy #:writer-proxy-received #:writer-proxy-last-sn
+           #:get-writer-proxy #:writer-proxy #:writer-proxy-received #:writer-proxy-last-sn #:writer-proxy-first-sn
            #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments*
            #:reader-on-data-frag #:reader-frag-acknack
            #:writer-frag-plan #:writer-frag-plan-for

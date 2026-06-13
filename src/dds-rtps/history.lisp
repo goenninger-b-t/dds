@@ -67,6 +67,17 @@
     (decf (history-cache-count hc))
     t))
 
+(defun* hc-purge-below (hc base)
+    (function (history-cache integer) (integer 0))
+  "Remove every change with SN < BASE (fully acknowledged + done); return the number removed. O(stored),
+   no sort — bounds a KEEP_ALL writer history once all matched readers have ACKed past BASE (RTPS 2.5
+   §8.4.1). The HEARTBEAT firstSN (hc-min-seq) then advances past the purged range."
+  (let ((removed '()))
+    (maphash (lambda (sn ch) (declare (ignore ch)) (when (< sn base) (push sn removed)))
+             (history-cache-changes hc))
+    (dolist (sn removed (length removed))
+      (hc-remove-change hc sn))))
+
 (defun* hc-min-seq (hc)
     (function (history-cache) t)
   "Lowest sequence number present, or NIL if empty."

@@ -2994,6 +2994,33 @@
       (dds.disc:stop-node node)))
   t)
 
+(defun* run-purge-reliable-only-test ()
+    (function () t)
+  "writer-purge-acked is driven ONLY by matched RELIABLE readers: a BEST_EFFORT reader never ACKNACKs, so
+   if it were in %matched-reader-keys its proxy (acked-base 1) would pin the purge watermark forever and
+   the writer history would grow unbounded. Seed one reliable + one best-effort matched reader and assert
+   only the reliable reader's GUID is keyed for the purge (DDS 1.4 §2.2.3.13: best-effort owes no ack)."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (let ((rel (%colocated-reader-guid #x61 #x01))
+               (be (%colocated-reader-guid #x62 #x01)))
+           (dolist (spec (list (cons rel :reliable) (cons be :best-effort)))
+             (setf (gethash (copy-seq (car spec)) (dds.disc::disc-node-matches node))
+                   (dds.rtps.discovery:make-endpoint-data
+                    :guid (car spec) :topic-name "Square" :type-name "shape-type"
+                    :qos (dds.qos:make-qos :reliability (cdr spec)))))
+           (let ((keys (dds.disc::%matched-reader-keys node)))
+             (%check :pro-one (= 1 (length keys))
+                     "only the RELIABLE matched reader must be a purge watermark key")
+             (%check :pro-reliable (find rel keys :test #'equalp)
+                     "the reliable reader's GUID must be a purge key")
+             (%check :pro-not-be (not (find be keys :test #'equalp))
+                     "a best-effort reader must NOT pin the purge watermark (it never ACKNACKs)")))
+      (dds.disc:stop-node node)))
+  t)
+
 ;;; Co-located multi-reader send-once (RTPS 2.5 §8.4.2.2 / §8.3.5.4): two DataReaders in ONE remote
 ;;; participant share a unicast destination (a DATA with readerId UNKNOWN reaches both). The writer
 ;;; must advance EACH reader's unsent-base watermark while sending the union to the destination once —

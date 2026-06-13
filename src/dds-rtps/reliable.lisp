@@ -28,12 +28,21 @@
 
 (defstruct* (rtps-writer (:constructor make-rtps-writer))
   "Stateful reliable RTPS writer (RTPS 2.5 §8.4.2): a HistoryCache, the last SN
-   written, the HEARTBEAT count, and a reader-id -> ReaderProxy table."
+   written, the HEARTBEAT count, a reader-id -> ReaderProxy table, and a LOCK serializing all access to
+   the HistoryCache + proxies — the disc layer drives the writer from TWO threads (publish on the caller
+   thread; ACKNACK/purge on the receiver thread), so every public writer op below takes the lock."
   (hc nil :type (or null dds.rtps.history:history-cache))  ; a HistoryCache
   (last-sn 0 :type integer)
   (hb-count 0 :type integer)
   (proxies (make-hash-table :test 'equalp) :type hash-table)   ; reader key (opaque, equalp) -> reader-proxy
-  (frag-hb-count 0 :type integer))   ; HEARTBEAT_FRAG Count, separate from hb-count
+  (frag-hb-count 0 :type integer)   ; HEARTBEAT_FRAG Count, separate from hb-count
+  (lock (dds.pal:make-lock) :type t))
+
+(defmacro %with-writer-lock ((writer) &body body)
+  "Serialize BODY's access to WRITER's HistoryCache + proxies (publish thread vs receiver thread). The
+   guarded public ops never call one another, so the non-recursive lock cannot self-deadlock; the internal
+   helpers (get-reader-proxy, %changes-from) run only inside a held lock."
+  `(dds.pal:with-lock ((rtps-writer-lock ,writer)) ,@body))
 
 (defun* get-reader-proxy (writer reader-id)
     (function (rtps-writer t) reader-proxy)
@@ -47,11 +56,12 @@
 (defun* writer-write (writer payload)
     (function (rtps-writer (array (unsigned-byte 8) (*))) integer)
   "Add a new :data change to the writer's HistoryCache; return its sequence number."
-  (let ((sn (incf (rtps-writer-last-sn writer))))
-    (dds.rtps.history:hc-add-change
-     (rtps-writer-hc writer)
-     (dds.rtps.history:make-cache-change :sn sn :serialized-payload payload))
-    sn))
+  (%with-writer-lock (writer)
+    (let ((sn (incf (rtps-writer-last-sn writer))))
+      (dds.rtps.history:hc-add-change
+       (rtps-writer-hc writer)
+       (dds.rtps.history:make-cache-change :sn sn :serialized-payload payload))
+      sn)))
 
 (defun* writer-lifecycle-change (writer key-hash status-flags)
     (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)) integer)
@@ -61,20 +71,22 @@
    (status-info->kind). The change carries NO serializedPayload — the instance is identified
    by its key hash — yet occupies a real SN, so it is reliably ordered and ACKNACK-repairable
    like any DATA (RTPS 2.5 §8.4.2.2)."
-  (let ((sn (incf (rtps-writer-last-sn writer))))
-    (dds.rtps.history:hc-add-change
-     (rtps-writer-hc writer)
-     (dds.rtps.history:make-cache-change
-      :sn sn :kind (dds.rtps.message:status-info->kind status-flags)
-      :instance-key-hash key-hash :status-info status-flags))
-    sn))
+  (%with-writer-lock (writer)
+    (let ((sn (incf (rtps-writer-last-sn writer))))
+      (dds.rtps.history:hc-add-change
+       (rtps-writer-hc writer)
+       (dds.rtps.history:make-cache-change
+        :sn sn :kind (dds.rtps.message:status-info->kind status-flags)
+        :instance-key-hash key-hash :status-info status-flags))
+      sn)))
 
 (defun* writer-heartbeat (writer)
     (function (rtps-writer) (values integer integer integer))
   "Return (values firstSN lastSN count) for a HEARTBEAT (RTPS 2.5 §8.3.7.5)."
-  (values (or (dds.rtps.history:hc-min-seq (rtps-writer-hc writer)) 1)
-          (or (dds.rtps.history:hc-max-seq (rtps-writer-hc writer)) 0)
-          (incf (rtps-writer-hb-count writer))))
+  (%with-writer-lock (writer)
+    (values (or (dds.rtps.history:hc-min-seq (rtps-writer-hc writer)) 1)
+            (or (dds.rtps.history:hc-max-seq (rtps-writer-hc writer)) 0)
+            (incf (rtps-writer-hb-count writer)))))
 
 (defun* %changes-from (writer base)
     (function (rtps-writer integer) list)
@@ -88,7 +100,8 @@
 (defun* writer-data-list (writer reader-id)
     (function (rtps-writer t) list)
   "Changes not yet acked by READER-ID (the opaque per-reader key), as a list of CacheChanges in SN order."
-  (%changes-from writer (reader-proxy-acked-base (get-reader-proxy writer reader-id))))
+  (%with-writer-lock (writer)
+    (%changes-from writer (reader-proxy-acked-base (get-reader-proxy writer reader-id)))))
 
 (defun* writer-unsent-list (writer reader-id)
     (function (rtps-writer t) list)
@@ -98,12 +111,13 @@
    EXACTLY ONCE in pushMode (§8.4.2.2). Lost/late changes are recovered via the ACKNACK repair
    path (writer-on-acknack), not by re-pushing. Each element is the CacheChange (KIND/SN/
    payload/key-hash/status-info) so a :dispose/:unregister is pushed as a no-payload DATA."
-  (let* ((proxy (get-reader-proxy writer reader-id))
-         (changes (%changes-from writer (reader-proxy-unsent-base proxy))))
-    (when changes
-      (setf (reader-proxy-unsent-base proxy)
-            (1+ (dds.rtps.history:cache-change-sn (first (last changes))))))
-    changes))
+  (%with-writer-lock (writer)
+    (let* ((proxy (get-reader-proxy writer reader-id))
+           (changes (%changes-from writer (reader-proxy-unsent-base proxy))))
+      (when changes
+        (setf (reader-proxy-unsent-base proxy)
+              (1+ (dds.rtps.history:cache-change-sn (first (last changes))))))
+      changes)))
 
 (defun* writer-on-acknack (writer reader-id base numbits bitmap)
     (function (rtps-writer t integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) (values list list))
@@ -111,18 +125,36 @@
    for each NACKed SN (bit set in BITMAP) return a resend if present, else a GAP.
    Returns (values data-resends gap-sns), data-resends a list of CacheChanges (so the
    resend path dispatches :data vs :dispose/:unregister exactly as the initial push)."
-  (let ((proxy (get-reader-proxy writer reader-id))
-        (resends '())
-        (gaps '()))
-    (setf (reader-proxy-acked-base proxy) (max (reader-proxy-acked-base proxy) base))
-    (dotimes (i numbits)
-      (when (dds.rtps.message:seqnum-set-bit-p bitmap i)
-        (let* ((sn (+ base i))
-               (ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
-          (if ch
-              (push ch resends)
-              (push sn gaps)))))
-    (values (nreverse resends) (nreverse gaps))))
+  (%with-writer-lock (writer)
+    (let ((proxy (get-reader-proxy writer reader-id))
+          (resends '())
+          (gaps '()))
+      (setf (reader-proxy-acked-base proxy) (max (reader-proxy-acked-base proxy) base))
+      (dotimes (i numbits)
+        (when (dds.rtps.message:seqnum-set-bit-p bitmap i)
+          (let* ((sn (+ base i))
+                 (ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
+            (if ch
+                (push ch resends)
+                (push sn gaps)))))
+      (values (nreverse resends) (nreverse gaps)))))
+
+(defun* writer-purge-acked (writer reader-keys)
+    (function (rtps-writer list) (integer 0))
+  "Drop from the writer's HistoryCache every change that EVERY matched reader has acknowledged — SN below
+   the minimum acked-base over READER-KEYS' proxies (RTPS 2.5 §8.4.1: VOLATILE writer history is bounded
+   by the slowest reader's ack). Each key's proxy is created with acked-base 1 if absent, so a matched
+   reader that has not yet ACKed holds the watermark at 1 and NOTHING is purged until it acks. A NACKed
+   sample is not fully-acked (acked-base has not passed it), so it is never purged — reliable repair is
+   unaffected and no GAP is needed. Returns the number of changes purged; a no-op (0) when READER-KEYS is
+   empty (no matched reader -> keep everything, bounded only by RESOURCE_LIMITS)."
+  (if (null reader-keys)
+      0
+      (%with-writer-lock (writer)
+        (dds.rtps.history:hc-purge-below
+         (rtps-writer-hc writer)
+         (loop for k in reader-keys
+               minimize (reader-proxy-acked-base (get-reader-proxy writer k)))))))
 
 ;;; ---- Reader side (§8.4.10): one WriterProxy per matched writer ----
 
@@ -137,9 +169,12 @@
 
 (defstruct* (writer-proxy (:constructor make-writer-proxy))
   "Reader-side proxy for one matched writer (RTPS 2.5 §8.4.10). RECEIVED maps SN ->
-   payload | :gap; FIRST-SN/LAST-SN bound the available range from HEARTBEAT;
-   REASSEMBLY maps SN -> frag-reassembly for in-progress DATA_FRAG samples."
-  (received (make-hash-table :test 'eql) :type hash-table)   ; SN -> payload | :gap
+   T (received) | :gap — a PRESENCE marker only (the engine checks presence for ACKNACK/complete/gap;
+   the application is delivered from the wire, not from here), so no payload is retained. FIRST-SN/LAST-SN
+   bound the available range from HEARTBEAT; entries below FIRST-SN are compacted away as the writer
+   purges its acked history (reader-on-heartbeat). REASSEMBLY maps SN -> frag-reassembly for in-progress
+   DATA_FRAG samples."
+  (received (make-hash-table :test 'eql) :type hash-table)   ; SN -> T (received) | :gap (presence only)
   (first-sn 1 :type integer)
   (last-sn 0 :type integer)                ; available range from HEARTBEAT
   (reassembly (make-hash-table :test 'eql) :type hash-table)) ; SN -> frag-reassembly
@@ -160,19 +195,31 @@
 
 (defun* reader-on-data (reader writer-id sn payload)
     (function (rtps-reader t integer (array (unsigned-byte 8) (*))) t)
-  "Accept a DATA. Idempotent (duplicate SN overwrites — dedup); tracks the highest
-   SN seen so reordered delivery is harmless (stored by SN)."
+  "Accept a DATA. Idempotent (duplicate SN re-marks — dedup); tracks the highest SN seen. Records only a
+   PRESENCE marker (T), not PAYLOAD — the application is delivered the sample from the wire, and the engine
+   only needs SN presence for ACKNACK/complete/gap, so no per-sample payload is retained (the PAYLOAD
+   argument is kept for the call contract but not stored)."
+  (declare (ignore payload))
   (let ((proxy (get-writer-proxy reader writer-id)))
-    (setf (gethash sn (writer-proxy-received proxy)) payload)
+    (setf (gethash sn (writer-proxy-received proxy)) t)
     (when (> sn (writer-proxy-last-sn proxy)) (setf (writer-proxy-last-sn proxy) sn))
     t))
 
 (defun* reader-on-heartbeat (reader writer-id first-sn last-sn)
     (function (rtps-reader t integer integer) t)
-  "Update the available range [firstSN, lastSN] (RTPS 2.5 §8.3.7.5)."
-  (let ((proxy (get-writer-proxy reader writer-id)))
-    (setf (writer-proxy-first-sn proxy) first-sn
-          (writer-proxy-last-sn proxy) (max (writer-proxy-last-sn proxy) last-sn))
+  "Update the available range [firstSN, lastSN] (RTPS 2.5 §8.3.7.5). firstSN is tracked MONOTONICALLY
+   non-decreasing (a writer's firstSN only advances as it purges acked history, never decreases — a
+   reordered stale HEARTBEAT must not lower it). When firstSN advances, COMPACT the received table: drop
+   markers below it (the writer purged those fully-acked samples, and reader-acknack/complete-p iterate
+   [firstSN, lastSN] so they are unreachable) — bounding received to the live window, not O(history)."
+  (let* ((proxy (get-writer-proxy reader writer-id))
+         (new-first (max (writer-proxy-first-sn proxy) first-sn)))
+    (setf (writer-proxy-last-sn proxy) (max (writer-proxy-last-sn proxy) last-sn))
+    (when (> new-first (writer-proxy-first-sn proxy))
+      (setf (writer-proxy-first-sn proxy) new-first)
+      (let ((received (writer-proxy-received proxy)) (drop '()))
+        (maphash (lambda (sn v) (declare (ignore v)) (when (< sn new-first) (push sn drop))) received)
+        (dolist (sn drop) (remhash sn received))))
     t))
 
 (defun* reader-acknack (reader writer-id)
@@ -295,29 +342,32 @@
    last-fragment-num is the sample's total fragment count at *fragment-size* and count is the
    writer's monotonically increasing HEARTBEAT_FRAG counter; NIL if SN is absent/empty.
    RTPS 2.5 §8.3.7.5 (fragment variant)."
-  (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
-    (when (null ch) (return-from writer-frag-heartbeat nil))
-    (let ((payload (dds.rtps.history:cache-change-serialized-payload ch)))
-      (when (null payload) (return-from writer-frag-heartbeat nil))
-      (values (ceiling (length payload) *fragment-size*)
-              (incf (rtps-writer-frag-hb-count writer))))))
+  (%with-writer-lock (writer)
+    (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
+      (when (null ch) (return-from writer-frag-heartbeat nil))
+      (let ((payload (dds.rtps.history:cache-change-serialized-payload ch)))
+        (when (null payload) (return-from writer-frag-heartbeat nil))
+        (values (ceiling (length payload) *fragment-size*)
+                (incf (rtps-writer-frag-hb-count writer)))))))
 
 (defun* writer-on-nack-frag (writer sn base numbits bitmap)
     (function (rtps-writer integer (unsigned-byte 32) (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) list)
   "Plan the DATA_FRAG resends for a NACK_FRAG naming missing fragments of the sample at SN:
    the writer-frag-plan-for descriptors over SN's payload, or NIL if SN is absent/empty.
    RTPS 2.5 §8.3.8.x."
-  (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
-    (when (null ch) (return-from writer-on-nack-frag nil))
-    (let ((payload (dds.rtps.history:cache-change-serialized-payload ch)))
-      (when (null payload) (return-from writer-on-nack-frag nil))
-      (writer-frag-plan-for (length payload) *fragment-size* base numbits bitmap))))
+  (%with-writer-lock (writer)
+    (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
+      (when (null ch) (return-from writer-on-nack-frag nil))
+      (let ((payload (dds.rtps.history:cache-change-serialized-payload ch)))
+        (when (null payload) (return-from writer-on-nack-frag nil))
+        (writer-frag-plan-for (length payload) *fragment-size* base numbits bitmap)))))
 
 (defun* writer-sample-payload (writer sn)
     (function (rtps-writer integer) (or null (array (unsigned-byte 8) (*))))
   "The stored SerializedPayload octets for the writer's sample SN, or NIL if absent."
-  (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
-    (and ch (dds.rtps.history:cache-change-serialized-payload ch))))
+  (%with-writer-lock (writer)
+    (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
+      (and ch (dds.rtps.history:cache-change-serialized-payload ch)))))
 
 (defun* writer-frag-plan (sample-size fragment-size budget)
     (function ((unsigned-byte 32) (unsigned-byte 32) (integer 1)) list)
