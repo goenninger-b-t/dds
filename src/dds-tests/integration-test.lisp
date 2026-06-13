@@ -3029,6 +3029,135 @@
       (dds.disc:stop-node node)))
   t)
 
+;;; Send-side submessage coalescing (RTPS 2.5 §8.3.4): a writer packs multiple small DATA submessages
+;;; plus the trailing HEARTBEAT into ONE datagram instead of one datagram per submessage, cutting the
+;;; sendto count. The receiver already accepts multi-submessage datagrams (dispatch-message). Offline:
+;;; capture every outgoing datagram via *datagram-sink*, re-parse with dispatch-message, and assert the
+;;; submessage total is preserved while the datagram COUNT drops (and each datagram is within budget).
+
+(defun* %count-submessages (bytes)
+    (function ((simple-array (unsigned-byte 8) (*))) list)
+  "Parse a captured RTPS datagram BYTES with dispatch-message and return (TOTAL DATA HEARTBEAT)
+   submessage counts — the test oracle for coalescing (a datagram is a Header + a sequence of
+   Submessages, RTPS 2.5 §8.3.4)."
+  (let* ((n (length bytes))
+         (buf (dds.core.buffer:make-octet-buffer n))
+         (total 0) (data 0) (hb 0))
+    (replace (dds.core.buffer:octet-buffer-vec buf) bytes)
+    (dds.rtps.message:dispatch-message
+     (dds.core.buffer:cursor buf :endianness :little)
+     (lambda (id flags c body-len)
+       (declare (ignore flags c body-len))
+       (incf total)
+       (cond ((= id dds.rtps.message:+submsg-data+) (incf data))
+             ((= id dds.rtps.message:+submsg-heartbeat+) (incf hb))))
+     n)
+    (list total data hb)))
+
+(defun* %coalesce-capture (node)
+    (function (dds.disc:disc-node) list)
+  "Push the writer's unsent changes (%push-data) while capturing every outgoing datagram via
+   *datagram-sink*; return the captured datagrams (each a fresh octet vector), in send order."
+  (let ((captured '()))
+    (let ((dds.disc::*datagram-sink* (lambda (dg) (push dg captured))))
+      (dds.disc::%push-data node))
+    (nreverse captured)))
+
+(defun* run-coalesce-pack-test ()
+    (function () t)
+  "Ten small DATA + the trailing HEARTBEAT coalesce into ONE datagram (RTPS 2.5 §8.3.4): write 10 small
+   samples to a writer with one matched reader, push under *datagram-sink*, and assert a single captured
+   datagram re-parses to 10 DATA + 1 HEARTBEAT (11 submessages) within budget — vs 11 datagrams
+   one-per-submessage before coalescing."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 6)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-publisher node)
+           (%seed-reader-participant node #x55 7701)
+           (let ((writer (dds.disc::disc-node-user-writer node)))
+             (dotimes (i 10)
+               (dds.rtps.reliable:writer-write writer (octets 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0)))
+             (let ((captured (%coalesce-capture node)))
+               (%check :coalesce-one-datagram (= 1 (length captured))
+                       "10 small DATA + HEARTBEAT must coalesce into ONE datagram")
+               (destructuring-bind (total data hb) (%count-submessages (first captured))
+                 (%check :coalesce-submsg-count (and (= 11 total) (= 10 data) (= 1 hb))
+                         "the coalesced datagram must carry 10 DATA + 1 HEARTBEAT (11 submessages)")
+                 (%check :coalesce-within-budget
+                         (<= (length (first captured)) dds.disc::*coalesce-datagram-budget*)
+                         "the coalesced datagram must be within *coalesce-datagram-budget*")))))
+      (dds.disc:stop-node node)))
+  t)
+
+(defun* run-coalesce-split-test ()
+    (function () t)
+  "A small datagram budget forces the same 10-sample burst across ≥2 datagrams WITHOUT losing or
+   duplicating submessages (the %send-packed flush/move path): with *coalesce-datagram-budget* lowered,
+   assert >1 but <11 datagrams, each within budget, and the DATA+HEARTBEAT submessage total still 11."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 6)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-publisher node)
+           (%seed-reader-participant node #x56 7702)
+           (let ((writer (dds.disc::disc-node-user-writer node)))
+             (dotimes (i 10)
+               (dds.rtps.reliable:writer-write writer (octets 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0)))
+             (let* ((dds.disc::*coalesce-datagram-budget* 200)
+                    (captured (%coalesce-capture node))
+                    (totals (mapcar #'%count-submessages captured)))
+               (%check :split-multiple (< 1 (length captured))
+                       "a small budget must split the burst across more than one datagram")
+               (%check :split-fewer (< (length captured) 11)
+                       "coalescing must still pack — fewer datagrams than the 11 submessages")
+               (%check :split-each-within-budget
+                       (every (lambda (dg) (<= (length dg) 200)) captured)
+                       "every split datagram must be within the lowered budget")
+               (%check :split-total-preserved
+                       (and (= 11 (reduce #'+ totals :key #'first))
+                            (= 10 (reduce #'+ totals :key #'second))
+                            (= 1 (reduce #'+ totals :key #'third)))
+                       "the 10 DATA + 1 HEARTBEAT submessages must be preserved across the split"))))
+      (dds.disc:stop-node node)))
+  t)
+
+(defun* run-coalesce-large-pack-test ()
+    (function () t)
+  "Near-*fragment-size* small samples coalesce WITHOUT overflowing the 2048-octet send buffer
+   (regression for a write-before-budget-check overflow): push 10 samples of 1000-octet payload — two of
+   which (2×1024) would exceed both the 1400 budget and, unchecked, approach the buffer — and assert no
+   error, every datagram within BOTH the budget and the 2048 buffer capacity, and all 11 submessages
+   (10 DATA + 1 HEARTBEAT) sent. %send-packed must flush BEFORE writing a submessage that would not fit."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 6)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-publisher node)
+           (%seed-reader-participant node #x57 7703)
+           (let ((writer (dds.disc::disc-node-user-writer node))
+                 (big (make-array 1000 :element-type '(unsigned-byte 8) :initial-element 7)))
+             (dotimes (i 10) (dds.rtps.reliable:writer-write writer big))
+             (let* ((captured (%coalesce-capture node))
+                    (totals (mapcar #'%count-submessages captured)))
+               (%check :clp-sent (plusp (length captured))
+                       "the near-fragment-size burst must push datagrams (no BUFFER-OVERFLOW)")
+               (%check :clp-within-capacity (every (lambda (dg) (<= (length dg) 2048)) captured)
+                       "no coalesced datagram may exceed the 2048-octet send buffer")
+               (%check :clp-within-budget
+                       (every (lambda (dg) (<= (length dg) dds.disc::*coalesce-datagram-budget*)) captured)
+                       "each datagram must be within *coalesce-datagram-budget*")
+               (%check :clp-total-preserved
+                       (and (= 11 (reduce #'+ totals :key #'first))
+                            (= 10 (reduce #'+ totals :key #'second))
+                            (= 1 (reduce #'+ totals :key #'third)))
+                       "all 10 DATA + 1 HEARTBEAT submessages must be sent"))))
+      (dds.disc:stop-node node)))
+  t)
+
 ;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a
 ;;; discovered participant not refreshed within its leaseDuration. %lease-sweep
 ;;; prunes the stale participant's discovered entry + endpoints + matches +

@@ -22,6 +22,24 @@
 ;; SEDP (key 1, kinds 0x02/0x07): a peer matches the announced endpoint and routes its
 ;; HEARTBEAT/ACKNACK by that EntityId, so the data-plane endpoint must carry the same id.
 
+(defparameter *datagram-sink* nil
+  "Test/bench affordance (default NIL = off): when bound to a function, %SEND-RAW-BUF calls it with a
+   fresh octet-vector copy of each outgoing datagram (buf[0..LEN]) BEFORE sending — so a test can
+   capture and re-parse coalesced datagrams (count submessages, assert ≤ budget). The real send still
+   happens. The copy is allocated only while the sink is bound, so there is no production cost. Never
+   set in production.")
+
+(defun* %send-raw-buf (node buf len host port)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0) string (unsigned-byte 16)) t)
+  "Send the first LEN octets of BUF (a complete RTPS message) to HOST:PORT over the node's transport —
+   the raw one-datagram send shared by %SEND-MSG-BUF and the %SEND-PACKED coalescer (one dds.xport:send
+   = one sendto). Hands a copy to *DATAGRAM-SINK* first when that test hook is bound."
+  (when *datagram-sink*
+    (funcall *datagram-sink* (subseq (dds.core.buffer:octet-buffer-vec buf) 0 len)))
+  (dds.xport:send (disc-node-transport node)
+                  (dds.xport.udp:make-udp-locator :host host :port port)
+                  buf 0 len))
+
 (defun* %send-msg-buf (node buf build-fn host port)
     (function (disc-node dds.core.buffer:octet-buffer function string (unsigned-byte 16)) t)
   "Build an RTPS message (Header + whatever BUILD-FN writes on the cursor) into BUF
@@ -29,9 +47,45 @@
   (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
     (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
     (funcall build-fn mc)
-    (dds.xport:send (disc-node-transport node)
-                    (dds.xport.udp:make-udp-locator :host host :port port)
-                    buf 0 (dds.core.buffer:cursor-position mc))))
+    (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port)))
+
+(defparameter *coalesce-datagram-budget* 1400
+  "Soft upper bound (octets) on a coalesced RTPS datagram built by %SEND-PACKED. Default 1400 keeps the
+   UDP datagram under the common Ethernet path MTU (1500 − 20 IPv4 − 8 UDP = 1472) so a coalesced
+   message is not IP-fragmented (the real hazard of over-large datagrams). The effective budget is
+   min(this, buffer-capacity − 64). A single submessage larger than the budget is still sent (alone in
+   its datagram), never truncated. Tunable; pinned to no spec constant (a local batching policy, not a
+   wire field).")
+
+(defun* %send-packed (node buf host port items)
+    (function (disc-node dds.core.buffer:octet-buffer string (unsigned-byte 16) list) t)
+  "Coalesce ITEMS — each a (SIZE . BUILD-FN) where BUILD-FN writes exactly ONE submessage of at most
+   SIZE octets — into as few RTPS datagrams as fit the budget, one shared Header per datagram (RTPS 2.5
+   §8.3.4 / §9.4.4), and send each to HOST:PORT. Before writing a submessage that would push a non-empty
+   datagram past min(*COALESCE-DATAGRAM-BUDGET*, capacity−64), the current datagram is FLUSHED first
+   (then the header — never overwritten — is reused), so the cursor never exceeds the budget (≪ buffer
+   capacity): no buffer overflow on legitimate input. A submessage whose body does not end on a 4-octet
+   boundary (RTPS 2.5 §8.3.4 requires submessages to start 32-bit-aligned) cannot be followed by another
+   in the same datagram, so it is flushed as its datagram's last — a no-op for this stack (every DATA
+   payload is XCDR-padded to 4, dispose=52, HEARTBEAT=28, all aligned), a graceful degrade otherwise.
+   Cuts the sendto count from one-per-submessage to ceil(total/budget). NIL ITEMS sends nothing."
+  (when items
+    (let* ((budget (min *coalesce-datagram-budget*
+                        (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
+           (mc (dds.core.buffer:cursor buf :endianness :little)))
+      (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
+      (let ((hdr-end (dds.core.buffer:cursor-position mc)))
+        (flet ((flush () (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port)
+                 (dds.core.buffer:cursor-set-position mc hdr-end)))
+          (dolist (item items)
+            (when (and (> (dds.core.buffer:cursor-position mc) hdr-end)
+                       (> (+ (dds.core.buffer:cursor-position mc) (car item)) budget))
+              (flush))                                   ; would overflow the datagram: send what we have first
+            (funcall (cdr item) mc)                      ; write the submessage into the (possibly fresh) datagram
+            (when (plusp (mod (dds.core.buffer:cursor-position mc) 4))
+              (flush)))                                  ; non-4-aligned end: must be this datagram's last submessage
+          (when (> (dds.core.buffer:cursor-position mc) hdr-end)
+            (flush)))))))
 
 (defun* %usable-destination (p)
     (function (dds.rtps.discovery:spdp-data) t)
@@ -129,24 +183,63 @@
    non-fragmented DATA %SEND-SAMPLE silently SKIPS, proving lost-final-sample recovery via the
    periodic HEARTBEAT (RTPS 2.5 §8.4.2.2). Never set in production.")
 
-(defun* %send-change (node buf change host port)
-    (function (disc-node dds.core.buffer:octet-buffer dds.rtps.history:cache-change string (unsigned-byte 16)) t)
-  "Send the CacheChange CHANGE to HOST:PORT, dispatching on its KIND (RTPS 2.5 §9.4.5.4):
-   a :data change carries a serializedPayload and goes through %send-sample (one DATA, or a
-   DATA_FRAG series for a large sample); a :dispose/:unregister change carries NO payload and
-   is emitted as a single dispose/unregister DATA (write-data-dispose, flags E+Q, inlineQos =
-   PID_KEY_HASH + PID_STATUS_INFO, §9.6.4.9) — small, never fragmented. The
-   *DEBUG-DROP-SAMPLE-NUMBERS* loss-injection hook applies to BOTH kinds by SN."
-  (let ((sn (dds.rtps.history:cache-change-sn change)))
+(defun* %small-change-p (change)
+    (function (dds.rtps.history:cache-change) t)
+  "T iff CHANGE is a single-submessage (packable) change: a no-payload dispose/unregister (always
+   small) or a :data sample whose serializedPayload fits one DATA submessage (≤ *fragment-size*, so it
+   is NOT fragmented into a DATA_FRAG series). Large samples are sent individually by %send-sample."
+  (or (not (eq (dds.rtps.history:cache-change-kind change) :data))
+      (<= (length (dds.rtps.history:cache-change-serialized-payload change))
+          dds.rtps.reliable:*fragment-size*)))
+
+(defun* %data-builder (node change)
+    (function (disc-node dds.rtps.history:cache-change) cons)
+  "A (SIZE . BUILD-FN) packable item for the SMALL CHANGE (for %send-packed), dispatching on KIND (RTPS
+   2.5 §9.4.5.4): a :data change writes one DATA (write-data, D-flag, no inlineQos — byte-identical to
+   %send-sample's small branch), SIZE = 4 submsg-header + 20 body-prefix + payload; a :dispose/:unregister
+   writes one no-payload DATA (write-data-dispose, flags E+Q, inlineQos PID_KEY_HASH + PID_STATUS_INFO,
+   §9.6.4.9), SIZE = 4 + 52. SIZE is the exact submessage length — the fit bound %send-packed checks
+   before writing so the datagram never overflows the buffer."
+  (let ((sn (dds.rtps.history:cache-change-sn change))
+        (wid (disc-node-user-writer-id node)))
     (if (eq (dds.rtps.history:cache-change-kind change) :data)
-        (%send-sample node buf sn (dds.rtps.history:cache-change-serialized-payload change) host port)
-        (unless (and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*))
-          (%send-msg-buf node buf
-                         (lambda (mc) (dds.rtps.message:write-data-dispose
-                                       mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node)
-                                       sn (dds.rtps.history:cache-change-instance-key-hash change)
-                                       (dds.rtps.history:cache-change-status-info change)))
-                         host port)))))
+        (let ((pl (dds.rtps.history:cache-change-serialized-payload change)))
+          (cons (+ 24 (length pl))
+                (lambda (mc) (dds.rtps.message:write-data
+                              mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 (length pl)))))
+        (let ((kh (dds.rtps.history:cache-change-instance-key-hash change))
+              (si (dds.rtps.history:cache-change-status-info change)))
+          (cons 56
+                (lambda (mc) (dds.rtps.message:write-data-dispose
+                              mc dds.rtps.message:+entityid-unknown+ wid sn kh si)))))))
+
+(defun* %heartbeat-builder (node first last count)
+    (function (disc-node integer integer integer) cons)
+  "A (SIZE . BUILD-FN) packable item for one NON-FINAL user-writer HEARTBEAT (FIRST,LAST,COUNT) —
+   readerId UNKNOWN, FinalFlag NOT_SET so it solicits an ACKNACK (RTPS 2.5 §8.3.7.5 / §8.4.9.2.7);
+   mirrors %send-user-heartbeat. SIZE = 4 submsg-header + 28 body."
+  (let ((wid (disc-node-user-writer-id node)))
+    (cons 32
+          (lambda (mc) (dds.rtps.message:write-heartbeat
+                        mc dds.rtps.message:+entityid-unknown+ wid first last count :final nil)))))
+
+(defun* %send-changes-packed (node buf changes host port hb)
+    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons)) t)
+  "Send CHANGES (+ optional trailing HEARTBEAT item HB, a (SIZE . BUILD-FN)) to HOST:PORT, coalescing the
+   small ones into as few datagrams as fit the budget (%send-packed): collect a %data-builder item per
+   SMALL change (a SN in *DEBUG-DROP-SAMPLE-NUMBERS* is skipped — loss injection preserved), send each
+   LARGE change individually via %send-sample (already one datagram per fragment group), append HB, then
+   pack. This is the shared writer push/retransmit emit path (RTPS 2.5 §8.3.4 §8.4.2.2)."
+  (let ((items '()))
+    (dolist (change changes)
+      (let ((sn (dds.rtps.history:cache-change-sn change)))
+        (cond
+          ((and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*)))
+          ((%small-change-p change) (push (%data-builder node change) items))
+          (t (%send-sample node buf sn
+                           (dds.rtps.history:cache-change-serialized-payload change) host port)))))
+    (when hb (push hb items))
+    (%send-packed node buf host port (nreverse items))))
 
 (defun* %send-sample (node buf sn pl host port)
     (function (disc-node dds.core.buffer:octet-buffer integer (simple-array (unsigned-byte 8) (*)) string (unsigned-byte 16)) t)
@@ -244,19 +337,19 @@
 (defun* %push-data (node)
     (function (disc-node) t)
   "Writer side: send each UNSENT change ONCE as a DATA (or DATA_FRAG series for large samples)
-   submessage, followed by a HEARTBEAT, to each matched-reader DESTINATION (pushMode, RTPS 2.5
-   §8.4.2.2; caller thread, uses tx-msg). The unsent-base watermark is kept PER matched reader (keyed
-   by its full GUID, §8.3.5.4); %merge-unsent advances every reader sharing a destination and sends
-   their union to that destination once (so two DataReaders in one participant both get send-once
-   accounting, not just the first). Lost or late changes are repaired only via the reader's ACKNACK
-   (%on-user-acknack), not by re-pushing the whole unacked history."
+   submessage, COALESCED with the trailing HEARTBEAT into as few datagrams as fit the budget
+   (%send-changes-packed, RTPS 2.5 §8.3.4/§8.4.2.2; caller thread, uses tx-msg) — to each matched-reader
+   DESTINATION. The unsent-base watermark is kept PER matched reader (keyed by its full GUID, §8.3.5.4);
+   %merge-unsent advances every reader sharing a destination and sends their union to that destination
+   once (so two DataReaders in one participant both get send-once accounting, not just the first). Lost
+   or late changes are repaired only via the reader's ACKNACK (%on-user-acknack), not by re-pushing the
+   whole unacked history."
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (dolist (group (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched-reader destination
-        (let ((host (caar group)) (port (cdar group)))
-          (dolist (ch (%merge-unsent writer (cdr group)))
-            (%send-change node (disc-node-tx-msg node) ch host port))
-          (%send-user-heartbeat node (disc-node-tx-msg node) first last count host port))))))
+        (%send-changes-packed node (disc-node-tx-msg node)
+                              (%merge-unsent writer (cdr group)) (caar group) (cdar group)
+                              (%heartbeat-builder node first last count))))))
 
 (defun* %push-heartbeat (node)
     (function (disc-node) (eql t))
@@ -478,9 +571,8 @@
         (declare (ignore gaps))
         (let* ((dest (%prefix-user-destination node src-prefix))
                (peers (if dest (list dest) (%match-destinations node t))))
-          (dolist (peer peers)   ; retransmit DATA(_FRAG) / dispose -> the NACKing reader
-            (dolist (ch resends)
-              (%send-change node (disc-node-rx-tx-msg node) ch (car peer) (cdr peer))))))))
+          (dolist (peer peers)   ; retransmit DATA(_FRAG) / dispose -> the NACKing reader (coalesced, no HB)
+            (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil))))))
   t)
 
 (defun* %on-user-data-frag (node c flags body-len buf src-prefix)
