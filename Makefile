@@ -25,6 +25,8 @@ SECONDS  ?= 20
 TYPENAME  ?= C_Shape
 LOCALTYPE ?= shape-type
 COUNT    ?= 0
+LATSAMPLES  ?= 10000
+THRUSAMPLES ?= 20000
 PEERS    ?=
 LIVELINESS ?=
 LEASE    ?=
@@ -153,7 +155,9 @@ interop: wire
 	@echo "interop: bidirectional Connext interop pending a Connext install (M2, FR-IO)."
 
 bench:
-	@echo "bench: perftest-equivalent harness — not yet implemented (M5, NFR-PERF)"
+	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
+	        --eval '(uiop:symbol-call :dds.bench :run-bench :latency-samples $(LATSAMPLES) :throughput-samples $(THRUSAMPLES))' \
+	        --eval '(uiop:quit 0)'
 
 mem:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
