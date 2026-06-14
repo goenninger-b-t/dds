@@ -25,4 +25,5 @@
            #:run-gated-subscriber
            #:run-corpus-capture-subscriber
            #:run-typelookup-probe
-           #:run-nokey-publisher #:run-nokey-subscriber))
+           #:run-nokey-publisher #:run-nokey-subscriber
+           #:run-shmem-xproc-pub #:run-shmem-xproc-sub))

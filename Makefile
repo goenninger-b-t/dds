@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem shmem-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -161,6 +161,18 @@ bench:
 	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
 	        --eval '(uiop:symbol-call :dds.bench :run-bench :latency-samples $(LATSAMPLES) :throughput-samples $(THRUSAMPLES))' \
 	        --eval '(uiop:quit 0)'
+
+bench-shmem:
+	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
+	        --eval '(uiop:symbol-call :dds.bench :run-bench-shmem :latency-samples $(LATSAMPLES) :throughput-samples $(THRUSAMPLES))' \
+	        --eval '(uiop:quit 0)'
+
+# WP-SHMEM Task F1 (FR-XPORT-2): REAL two-OS-process cross-process SHMEM round-trip.
+# Two SEPARATE SBCL processes discover over loopback UDP (:peers, no multicast) and the
+# pub routes user DATA over SHARED MEMORY; PASS iff the sub received the samples AND the
+# pub's shmem-sends > 0. SBCL only — SHMEM is on for SBCL; Clasp/macOS would use UDP.
+shmem-xproc:
+	./scripts/shmem-roundtrip.sh
 
 mem:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \

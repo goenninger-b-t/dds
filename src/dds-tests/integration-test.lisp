@@ -3299,6 +3299,60 @@
       (dds.disc:stop-node w) (dds.disc:stop-node r)))
   t)
 
+;;; SHMEM intra-host data plane (FR-XPORT-2): two participants in ONE process (so one host, one
+;;; host-uuid) discover (SPDP) + match (SEDP) over UDP, then the writer routes user DATA over SHARED
+;;; MEMORY to the same-host reader (discovery/HB/ACKNACK stay UDP). The reader receives every sample via
+;;; the SAME %handle-datagram entry point as UDP (engine untouched); a shmem-sends counter proves SHMEM —
+;;; not UDP — carried the bulk data. Pass-skips on the Clasp/macOS by-name-attach gap (ADR 0013), where
+;;; *shmem-enabled* is NIL and everything falls back to UDP.
+
+(defun* run-shmem-end-to-end-test ()
+    (function () t)
+  "FR-XPORT-2: same-host user DATA travels over SHMEM (UDP fallback). Two nodes, same host-uuid,
+   *shmem-enabled* T; after match, publish 20 samples and assert the reliable reader receives all 20 AND
+   the writer's shmem-sends advanced (so SHMEM, not UDP, carried the user data). Skips cleanly where SHMEM
+   is off (Clasp/macOS by-name-attach gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-shmem-end-to-end-test t))
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 51))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 52))
+         (dds.disc:*shmem-enabled* t)   ; force SHMEM on for this test regardless of the global default
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (%check :shmem-e2e-enabled (and (dds.disc::disc-node-shmem w) (dds.disc::disc-node-shmem r))
+                   "both nodes must have a SHMEM transport when *shmem-enabled*")
+           (%check :shmem-e2e-same-host (= (dds.disc::disc-node-host-uuid w) (dds.disc::disc-node-host-uuid r))
+                   "two participants in one process must share a host-uuid")
+           (dds.disc:add-local-writer w :topic "ShmemT" :type "X")
+           (dds.disc:enable-publisher w)
+           (dds.disc:add-local-reader r :topic "ShmemT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (%check :shmem-e2e-matched (plusp (dds.disc:disc-node-matched-count w))
+                   "writer must match the reader before publishing over SHMEM")
+           (dotimes (i 20) (dds.disc:publish-sample w (octets 9 9 9 9 9 9 9 9)))
+           (loop repeat 400 until (>= (dds.disc:node-sample-count r) 20) do (sleep 0.01))
+           (%check :shmem-e2e-received (>= (dds.disc:node-sample-count r) 20)
+                   "the reader must receive all 20 samples delivered over SHMEM")
+           (%check :shmem-e2e-via-shmem (plusp (dds.disc::disc-node-shmem-sends w))
+                   "the writer must have routed user data over SHMEM (shmem-sends advanced), not UDP"))
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
 ;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a
 ;;; discovered participant not refreshed within its leaseDuration. %lease-sweep
 ;;; prunes the stale participant's discovered entry + endpoints + matches +

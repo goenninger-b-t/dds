@@ -12,6 +12,34 @@
 
 (in-package #:dds.disc)
 
+(defparameter *shmem-enabled*
+  (and (find-package :net.goenninger.dds.xport.shmem)
+       (not (and (eq (dds.pal:pal-impl-name) :clasp) (uiop:os-macosx-p))))
+  "Master switch (read once per node at make-disc-node into the SHMEM slot) for routing same-host user
+   DATA over the shared-memory transport (FR-XPORT-2) instead of UDP. Default: T on SBCL everywhere and
+   Clasp/Linux (where the SHMEM package is present and by-name attach works); NIL on Clasp/macOS — that
+   platform's shm_open variadic-mode ABI gap (ADR 0013, dds.xport.shmem:shm-attach-by-name-reliable-p)
+   makes a created segment unre-openable by name, so SHMEM is unusable there and UDP carries everything.
+   Rebind to NIL before make-disc-node to force the all-UDP path (e.g. cross-host deployments where no
+   same-host peer can exist). Not a wire constant — a local transport-selection policy.")
+
+(defconstant +shmem-default-lane-count+ 8
+  "Default per-receiver SHMEM lane count (max concurrent same-host senders); must match the advertised wire locator (FR-XPORT-2).")
+
+(defconstant +shmem-default-capacity+ 65536
+  "Default per-lane SHMEM ring capacity in bytes (multiple of 8); must match the advertised wire locator (FR-XPORT-2).")
+
+(defun* %host-uuid ()
+    (function () (unsigned-byte 64))
+  "A u64 identifying THIS host so same-host SHMEM peers match: the low 8 octets of the MD5 (reusing the
+   vendored dds.core.md5, no new dependency) of (uiop:hostname). Deterministic — same hostname yields the
+   same uuid — so two participants on one host agree without exchanging it out of band. A boot-id would
+   harden against same-hostname-different-host, but hostname suffices for v1: a collision only makes a
+   cross-host SHMEM attempt fail and fall back to UDP (no data loss). Not a wire constant."
+  (let ((d (dds.core.md5:md5 (map '(simple-array (unsigned-byte 8) (*)) #'char-code (uiop:hostname))))
+        (v 0))
+    (dotimes (i 8 v) (setf v (logior (ash v 8) (aref d i))))))
+
 (defstruct* (disc-node (:constructor %make-disc-node))
   "A minimal RTPS participant for discovery. SOCKET/TRANSPORT carry metatraffic;
    PEERS are unicast SPDP targets; DISCOVERED maps a remote 12-octet GUID prefix
@@ -42,7 +70,13 @@
    (routed to the INCONSISTENT_TOPIC path, like a type-name mismatch), :pending (the
    (direction . remote) decision is parked on PARKED-MATCHES, deduped by remote GUID,
    until resume-parked-matches re-runs it); a NIL gate (default) behaves exactly as
-   :compatible. TX-PAYLOAD/TX-MSG are the reused announce scratch buffers."
+   :compatible. TX-PAYLOAD/TX-MSG are the reused announce scratch buffers. SHMEM (when
+   *shmem-enabled*) is this node's shared-memory receive transport; HOST-UUID identifies the host so a
+   same-host peer that advertised a SHMEM locator receives user DATA over SHMEM instead of UDP
+   (FR-XPORT-2); SHMEM-SENDS counts those routed datagrams. SHMEM-DEST-CACHE memoizes each remote
+   prefix's resolved shmem-locator (or :none) so the steady-state send does no per-datagram resolve +
+   make-shmem-locator allocation (a peer is resolved at most once; the entry is invalidated on that
+   peer's SPDP re-discovery and on its lease-out). Discovery/HEARTBEAT/ACKNACK always stay UDP."
   (guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)
                :type (simple-array (unsigned-byte 8) (12)))
   (domain 0 :type (integer 0))
@@ -70,6 +104,11 @@
   (user-reader nil :type (or null dds.rtps.reliable:rtps-reader))
   (user-writer-id #x00000102 :type (unsigned-byte 32)) ; this node's user-data writer EntityId (kind reflects keyed-ness)
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
+  ;; FR-XPORT-2 SHMEM intra-host data plane (same-host user DATA only; discovery/HB/ACKNACK stay UDP)
+  (shmem nil :type t)                     ; this node's shmem-transport (NIL = SHMEM off: *shmem-enabled* nil or pkg absent)
+  (host-uuid 0 :type (unsigned-byte 64))  ; u64 host id (MD5 of hostname); a remote with the SAME uuid is same-host
+  (shmem-sends 0 :type (integer 0))       ; count of user DATA datagrams this node routed over SHMEM (proof/diagnostic)
+  (shmem-dest-cache (make-hash-table :test 'equalp) :type hash-table) ; remote 12-octet prefix -> shmem-locator | :none; one-time resolve per peer (hot-path send reads, no lock/alloc); invalidated on SPDP re-discovery + lease-out
   (batch-max-samples 1 :type (integer 1)) ; WP-BATCH size trigger: flush the accumulated batch every N publishes (1 = flush per write, no batching)
   (batch-pending 0 :type (integer 0))     ; samples accumulated since the last flush (a flush pacer; %push-data always sends all unsent)
   ;; WP-ASYNC: a background sender thread decoupling the push from write() (nil async-thread = synchronous, default)
@@ -137,13 +176,19 @@
   ;; unicast SEDP addressed to 127.0.0.1:port.
   (multiple-value-bind (tr sock)
       (dds.xport.udp:make-udp-transport :host (if multicast "0.0.0.0" host) :port port)
-    (let ((node (%make-disc-node :guid-prefix guid-prefix :domain domain
-                                 :advertise-address advertise-address
-                                 :socket sock :transport tr :peers peers
-                                 :batch-max-samples batch-max-samples
-                                 :tx-payload (dds.core.buffer:make-octet-buffer 512)
-                                 :tx-msg (dds.core.buffer:make-octet-buffer 2048)
-                                 :rx-tx-msg (dds.core.buffer:make-octet-buffer 2048))))
+    (let* ((host-uuid (%host-uuid))
+           (node (%make-disc-node :guid-prefix guid-prefix :domain domain
+                                  :advertise-address advertise-address
+                                  :socket sock :transport tr :peers peers
+                                  :batch-max-samples batch-max-samples
+                                  :host-uuid host-uuid
+                                  :shmem (when *shmem-enabled*   ; SHMEM receive segment for same-host user DATA (FR-XPORT-2)
+                                           (dds.xport.shmem:make-shmem-transport
+                                            :participant-guid guid-prefix :host-uuid host-uuid
+                                            :lane-count +shmem-default-lane-count+ :capacity +shmem-default-capacity+))
+                                  :tx-payload (dds.core.buffer:make-octet-buffer 512)
+                                  :tx-msg (dds.core.buffer:make-octet-buffer 2048)
+                                  :rx-tx-msg (dds.core.buffer:make-octet-buffer 2048))))
       (when multicast
         (let ((ms (dds.pal:udp-open :host "0.0.0.0"
                                     :port (dds.rtps.message:spdp-multicast-port domain)
@@ -183,18 +228,24 @@
 (defun* %node-spdp-data (node)
     (function (disc-node) dds.rtps.discovery:spdp-data)
   "Build NODE's SPDPdiscoveredParticipantData: its GUID prefix + a unicast locator
-   at <advertise-address>:<bound port> (default 127.0.0.1), protocol version 2.5."
+   at <advertise-address>:<bound port> (default 127.0.0.1), protocol version 2.5. When SHMEM is on, ALSO
+   advertise a SHMEM Locator_t (lanes+capacity) in default-unicast and the host-uuid (FR-XPORT-2) so a
+   same-host peer can route user DATA over shared memory; metatraffic stays UDP-only (discovery on UDP)."
   (let* ((addr (dds.rtps.discovery:make-ipv4-locator
                 (%ipv4-octets (disc-node-advertise-address node))))
          (port (disc-node-port node))
          (loc (dds.rtps.discovery:make-locator
-               :kind dds.rtps.discovery:+locator-kind-udpv4+ :port port :address addr)))
+               :kind dds.rtps.discovery:+locator-kind-udpv4+ :port port :address addr))
+         (sm (disc-node-shmem node)))
     (dds.rtps.discovery:make-spdp-data
      :guid-prefix (disc-node-guid-prefix node)
      :version-major 2 :version-minor 5
      :vendor-id dds.rtps.message:*vendor-id*
-     :default-unicast-locators (list loc)
+     :default-unicast-locators (if sm
+                                   (list loc (dds.rtps.discovery:make-shmem-locator-wire +shmem-default-lane-count+ +shmem-default-capacity+))
+                                   (list loc))
      :metatraffic-unicast-locators (list loc)
+     :host-uuid (if sm (disc-node-host-uuid node) 0)
      :lease-duration-seconds 100
      :builtin-endpoint-set dds.rtps.discovery:+builtin-endpoint-set-default+)))
 
@@ -474,17 +525,28 @@
    stale-entry test (RTPS 2.5 §8.5.3.3.2: not refreshed within its leaseDuration)."
   (> (- now last-seen) (* lease-seconds internal-time-units-per-second)))
 
+(defun* %invalidate-shmem-dest (node prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
+  "Drop the cached SHMEM destination for the remote 12-octet PREFIX (FR-XPORT-2). CALLER HOLDS the
+   node lock. Called whenever PREFIX's SPDP is re-recorded (its advertised locators / host-uuid may
+   have changed) or it leases out, so the next send re-resolves rather than reusing a stale locator."
+  (remhash prefix (disc-node-shmem-dest-cache node))
+  t)
+
 (defun* %record-participant (node spdp)
     (function (disc-node dds.rtps.discovery:spdp-data) t)
   "Record a discovered participant (its SPDP data) keyed by GUID prefix and stamp its
    last-seen for lease tracking (RTPS 2.5 §8.5.3.3.2), ignoring this node's own
-   announcements (loopback echo / self in peers)."
+   announcements (loopback echo / self in peers). Invalidates the participant's cached SHMEM
+   destination (FR-XPORT-2): a fresh SPDP may change its advertised SHMEM locator / host-uuid, so the
+   memoized dest is dropped and re-resolved on the next send."
   (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix spdp)))
     (unless (equalp prefix (disc-node-guid-prefix node))
       (dds.pal:with-lock ((disc-node-lock node))
         (let ((key (copy-seq prefix)))
           (setf (gethash key (disc-node-discovered node)) spdp)
-          (setf (gethash key (disc-node-participant-last-seen node)) (%lease-now)))))))
+          (setf (gethash key (disc-node-participant-last-seen node)) (%lease-now))
+          (%invalidate-shmem-dest node prefix))))))
 
 (defun* %seed-discovered-stale (node prefix lease-seconds seconds-ago)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) integer (integer 0)) t)
@@ -569,6 +631,7 @@
           (remhash prefix (disc-node-discovered node))
           (remhash prefix (disc-node-participant-last-seen node))
           (remhash prefix (disc-node-builtin-readers node))
+          (%invalidate-shmem-dest node prefix)   ; a leased-out peer's cached SHMEM dest must not be reused
           (%purge-prefix node prefix #'disc-node-discovered-writers)
           (%purge-prefix node prefix #'disc-node-discovered-readers)
           (%collect-and-remove-matches node prefix
@@ -833,8 +896,9 @@
 (defun* start-node (node)
     (function (disc-node) disc-node)
   "Spawn the background receiver thread(s) that process inbound datagrams for NODE:
-   the unicast metatraffic socket always, plus the multicast socket if enabled.
-   Both feed the same %handle-datagram. Returns NODE."
+   the unicast metatraffic socket always, plus the multicast socket if enabled, plus the SHMEM receive
+   segment when SHMEM is on (FR-XPORT-2). All feed the SAME %handle-datagram, so the engine is identical
+   regardless of which transport carried a datagram. Returns NODE."
   (setf (disc-node-rx-thread node)
         (dds.xport.udp:start-udp-receiver
          (disc-node-socket node)
@@ -844,14 +908,19 @@
           (dds.xport.udp:start-udp-receiver
            (disc-node-mcast-socket node)
            (lambda (buf size) (%handle-datagram node buf size)))))
+  (when (disc-node-shmem node)
+    (dds.xport.shmem:start-shmem-receiver
+     (disc-node-shmem node)
+     (lambda (buf size) (%handle-datagram node buf size))))
   node)
 
 (defun* stop-node (node)
     (function (disc-node) (eql t))
-  "Close NODE's socket(s), join its receiver thread(s), then free the reusable
-   announce scratch buffers. The join MUST precede the frees: an in-flight
-   %HANDLE-DATAGRAM on a receiver thread writes into RX-TX-MSG/TX-MSG, so freeing
-   first is a use-after-free (observed via canary instrumentation). Idempotent."
+  "Close NODE's socket(s), join its receiver thread(s) — UDP, multicast, AND the SHMEM receiver when on
+   (FR-XPORT-2) — then free the reusable announce scratch buffers. The joins MUST precede the frees: an
+   in-flight %HANDLE-DATAGRAM on ANY receiver thread (a SHMEM record feeds the same entry point) writes
+   into RX-TX-MSG/TX-MSG, so freeing first is a use-after-free (observed via canary instrumentation). The
+   WP-ASYNC sender (which may itself SHMEM-send) is stopped+joined first. Idempotent."
   (cond
     ((disc-node-async-thread node)       ; WP-ASYNC: stop + drain + JOIN the sender BEFORE closing the socket
      (dds.pal:with-lock ((disc-node-async-lock node))
@@ -873,6 +942,9 @@
   (when (disc-node-mcast-rx-thread node)
     (dds.pal:join (disc-node-mcast-rx-thread node))
     (setf (disc-node-mcast-rx-thread node) nil))
+  (when (disc-node-shmem node)         ; FR-XPORT-2: JOIN the SHMEM receiver (it feeds %handle-datagram -> rx-tx-msg) BEFORE the frees
+    (dds.xport.shmem:shmem-transport-close (disc-node-shmem node))
+    (setf (disc-node-shmem node) nil))
   (when (disc-node-tx-payload node)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-payload node)))
     (setf (disc-node-tx-payload node) nil))

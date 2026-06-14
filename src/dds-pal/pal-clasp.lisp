@@ -113,8 +113,38 @@
   (error 'pal-unimplemented :op 'atomic-incf))
 (defun* fence (&optional (kind :full))
     (function (&optional t) (values))
-  "Memory fence of the given KIND. M0 no-op; a native fence fast path lands in M1."
-  (declare (ignore kind)) (values))
+  "Real memory barrier (M1) via mp:fence. KIND maps to the C++11 memory order it expects."
+  (mp:fence (ecase kind
+              (:acquire :acquire)
+              (:release :release)
+              (:full    :sequentially-consistent)))
+  (values))
+
+(defun* load-sap-u64 (sap offset)
+    (function (t (integer 0)) (unsigned-byte 64))
+  "Aligned 64-bit read of the foreign location at SAP+OFFSET (bytes). Masked to unsigned
+   because Clasp's CFFI :uint64 mem-ref sign-extends a high-bit-set word (probed A4)."
+  (logand (cffi:mem-ref sap :uint64 offset) #xFFFFFFFFFFFFFFFF))
+(defun* store-sap-u64 (sap offset value)
+    (function (t (integer 0) (unsigned-byte 64)) (unsigned-byte 64))
+  "Aligned 64-bit write of VALUE at SAP+OFFSET (bytes)."
+  (setf (cffi:mem-ref sap :uint64 offset) value))
+(defun* cas-sap-u64 (sap offset old new)
+    (function (t (integer 0) (unsigned-byte 64) (unsigned-byte 64)) (unsigned-byte 64))
+  "Atomic compare-and-swap of the u64 at SAP+OFFSET; returns the PREVIOUS value (= OLD on
+   success). NFR-PORT gap: Clasp has no hardware atomic over a raw foreign cell — mp:cas
+   rejects a cffi:mem-ref place (NOT-ATOMIC), and the only foreign-backed primitive
+   (core:acas on a (unsigned-byte 64) static-vector) silently drops the store when the
+   compare operand exceeds most-positive-fixnum (probed A4); signals PAL-UNIMPLEMENTED so the
+   SHMEM ring stays SBCL-only and Clasp falls back to UDP (ADR 0013, FR-XPORT-2)."
+  (declare (ignore sap offset old new))
+  (error 'pal-unimplemented :op 'cas-sap-u64))
+(defun* atomic-incf-sap-u64 (sap offset delta)
+    (function (t (integer 0) (unsigned-byte 64)) (unsigned-byte 64))
+  "Atomically add DELTA to the u64 at SAP+OFFSET; returns the NEW value. Same NFR-PORT gap as
+   CAS-SAP-U64 (no Clasp foreign atomic); signals PAL-UNIMPLEMENTED (ADR 0013, FR-XPORT-2)."
+  (declare (ignore sap offset delta))
+  (error 'pal-unimplemented :op 'atomic-incf-sap-u64))
 
 (defun* spawn (fn &key name)
     (function (function &key (:name (or null string))) t)

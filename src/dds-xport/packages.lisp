@@ -27,3 +27,25 @@
            #:udp-transport-local-port #:udp-transport-recv
            #:start-udp-receiver
            #:run-udp-transport-test #:run-udp-receiver-test))
+
+(defpackage #:net.goenninger.dds.xport.shmem
+  (:nicknames #:dds.xport.shmem)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
+  (:documentation
+   "POSIX shared-memory intra-host transport ring (FR-XPORT-2). Per-receiver
+    segment: header + a pshared notify block (mutex+cond) + K per-sender SPSC
+    lanes. Lane claim is mutex-guarded (no foreign CAS -> full Clasp parity); the
+    SPSC enqueue/drain hot path is raw SAP read/write with release/acquire fences.
+    Public API: make-shmem-transport returns a participant's receive segment + the
+    frozen transport record; the receiver thread cond-waits on the notify block.
+    %-internals are reached via :: by the test package.")
+  (:export #:make-shmem-transport #:shmem-transport #:shmem-transport-transport
+           #:shmem-transport-locator
+           #:shmem-locator #:make-shmem-locator
+           #:shmem-locator-name #:shmem-locator-host-uuid
+           #:shmem-locator-lane-count #:shmem-locator-capacity
+           #:seg-name-for-guid
+           #:shmem-receive-drain #:shmem-transport-close
+           #:start-shmem-receiver #:stop-shmem-receiver
+           #:shm-attach-by-name-reliable-p
+           #:run-shmem-transport-test #:run-shmem-receiver-test #:run-shmem-stress-test))

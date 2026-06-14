@@ -8,6 +8,10 @@
 (defconstant +locator-kind-udpv4+ 1
   "LOCATOR_KIND_UDPv4 = 1 (RTPS 2.5 §9.3.2.1 IDL / §9.3.2.4).")
 
+(defconstant +locator-kind-shmem+ #x47420001
+  "Vendor SHMEM Locator_t kind (GB|1); ours-to-ours intra-host only. No standard RTPS SHMEM kind exists;
+   cross-vendor peers ignore an unknown kind (fail-open). Pinned in ADR 0013, not from any spec clause.")
+
 ;; Builtin EntityIds (RTPS 2.5 §9.3.1.3 Table 9.2): entityKey[3]+entityKind, MSB-first u32.
 (defconstant +entityid-spdp-writer+     #x000100c2
   "SPDPbuiltinParticipantWriter EntityId {{00,01,00},c2} (RTPS 2.5 §9.3.1.3 Table 9.2).")
@@ -120,6 +124,20 @@
   (let ((a (locator-address loc)))
     (format nil "~d.~d.~d.~d" (aref a 12) (aref a 13) (aref a 14) (aref a 15))))
 
+(defun* make-shmem-locator-wire (lane-count capacity)
+    (function ((integer 1) (integer 8)) locator)
+  "Build a SHMEM Locator_t: kind=+locator-kind-shmem+, port=CAPACITY, address[0..3]=LANE-COUNT (u32 LE)."
+  (let ((a (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref a 0) (ldb (byte 8 0) lane-count) (aref a 1) (ldb (byte 8 8) lane-count)
+          (aref a 2) (ldb (byte 8 16) lane-count) (aref a 3) (ldb (byte 8 24) lane-count))
+    (make-locator :kind +locator-kind-shmem+ :port capacity :address a)))
+
+(defun* shmem-locator-wire-lane-count (loc)
+    (function (locator) (unsigned-byte 32))
+  "Extract the lane-count from a SHMEM Locator_t's address (u32 LE in octets 0..3)."
+  (let ((a (locator-address loc)))
+    (logior (aref a 0) (ash (aref a 1) 8) (ash (aref a 2) 16) (ash (aref a 3) 24))))
+
 (defun* locator-usable-udpv4-p (loc)
     (function (locator) t)
   "T iff LOC is a UDPv4 locator with a routable (non-0.0.0.0) address."
@@ -148,7 +166,9 @@
   (default-unicast-locators '() :type list)       ; list of LOCATOR (user traffic)
   (metatraffic-unicast-locators '() :type list)   ; list of LOCATOR (discovery)
   (lease-duration-seconds 100 :type (signed-byte 32))
-  (builtin-endpoint-set 0 :type (unsigned-byte 32)))
+  (builtin-endpoint-set 0 :type (unsigned-byte 32))
+  ;; PID_SHMEM_HOST_UUID (vendor 0x8040, ADR 0013): 8-octet same-host UUID; 0 = none/absent.
+  (host-uuid 0 :type (unsigned-byte 64)))
 
 (defun* %make-scratch (n)
     (function ((integer 0)) (values dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*))))
@@ -200,6 +220,12 @@
   (multiple-value-bind (c vec) (%make-scratch 4)
     (dds.core.buffer:put-u32 c (spdp-data-builtin-endpoint-set data))
     (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-builtin-endpoint-set+ vec 0 4))
+  ;; PID_SHMEM_HOST_UUID (vendor 0x8040, ADR 0013): 8-octet same-host UUID (u64 LE); only when set.
+  (when (plusp (spdp-data-host-uuid data))
+    (multiple-value-bind (c vec) (%make-scratch 8)
+      (dds.core.buffer:put-u32 c (ldb (byte 32 0) (spdp-data-host-uuid data)))
+      (dds.core.buffer:put-u32 c (ldb (byte 32 32) (spdp-data-host-uuid data)))
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-shmem-host-uuid+ vec 0 8)))
   (dds.rtps.message:write-parameter-sentinel cursor))
 
 (defun* %fill-spdp-param (data pid cursor len)
@@ -237,7 +263,11 @@
                (if (>= su #x80000000) (- su #x100000000) su)))))
     ((= pid dds.rtps.message:+pid-builtin-endpoint-set+)
      (when (>= len 4)
-       (setf (spdp-data-builtin-endpoint-set data) (dds.core.buffer:get-u32 cursor)))))
+       (setf (spdp-data-builtin-endpoint-set data) (dds.core.buffer:get-u32 cursor))))
+    ((= pid dds.rtps.message:+pid-shmem-host-uuid+)
+     (when (>= len 8)                                ; fail-open: a short value is ignored, never an error
+       (let ((lo (dds.core.buffer:get-u32 cursor)) (hi (dds.core.buffer:get-u32 cursor)))
+         (setf (spdp-data-host-uuid data) (logior lo (ash hi 32)))))))
   data)
 
 (defun* parse-spdp-data (cursor)

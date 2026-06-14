@@ -6,5 +6,6 @@
   :serial t
   :components ((:file "packages")
                (:file "transport")
-               (:file "udp"))
+               (:file "udp")
+               (:file "shmem"))
   :in-order-to ((test-op (test-op "dds-tests"))))

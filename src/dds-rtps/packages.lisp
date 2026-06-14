@@ -69,7 +69,7 @@
            #:+pid-metatraffic-unicast-locator+ #:+pid-participant-guid+
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
            #:+pid-status-info+
-           #:+pid-type-information+ #:+pid-type-object-lb+
+           #:+pid-type-information+ #:+pid-type-object-lb+ #:+pid-shmem-host-uuid+
            #:write-parameter #:write-parameter-sentinel #:parse-parameter-list
            #:spdp-multicast-port #:spdp-unicast-port
            #:user-multicast-port #:user-unicast-port
@@ -110,7 +110,8 @@
    "Simple Participant Discovery Protocol (SPDP): the Locator_t codec (RTPS 2.5
     §9.3.2.4) and SPDPdiscoveredParticipantData ParameterList build/parse (§8.5.3/
     §9.6.2). PID values from §9.6.2.2; Duration/Locator layouts from §9.3.2.")
-  (:export #:+locator-kind-udpv4+ #:+locator-bytes+
+  (:export #:+locator-kind-udpv4+ #:+locator-kind-shmem+ #:+locator-bytes+
+           #:make-shmem-locator-wire #:shmem-locator-wire-lane-count
            #:+entityid-spdp-writer+ #:+entityid-spdp-reader+
            #:+entityid-sedp-pub-writer+ #:+entityid-sedp-pub-reader+
            #:+entityid-sedp-sub-writer+ #:+entityid-sedp-sub-reader+
@@ -132,6 +133,7 @@
            #:spdp-data-vendor-id
            #:spdp-data-default-unicast-locators #:spdp-data-metatraffic-unicast-locators
            #:spdp-data-lease-duration-seconds #:spdp-data-builtin-endpoint-set
+           #:spdp-data-host-uuid
            #:serialize-spdp-data #:parse-spdp-data
            #:run-discovery-test
            #:+reliability-best-effort+ #:+reliability-reliable+

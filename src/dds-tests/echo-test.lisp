@@ -290,11 +290,246 @@
             "XTypes NameHash example color -> 70 dd a5 df"))
   t)
 
+(defun* run-pal-fence-test ()
+    (function () (eql t))
+  "fence must accept :acquire/:release/:full and return without error (real barrier, not the M0 no-op)."
+  (dolist (k '(:acquire :release :full) t)
+    (dds.pal:fence k)))
+
+(defun* run-pal-sap-atomics-test ()
+    (function () (eql t))
+  "cas-sap-u64 / atomic-incf-sap-u64 / load/store on a foreign 8-byte region behave atomically (single-thread correctness)."
+  (unless (eq (dds.pal:pal-impl-name) :sbcl) (return-from run-pal-sap-atomics-test t))
+  (let ((m (dds.pal:alloc-static 16)))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m)))
+           (dds.pal:store-sap-u64 sap 0 0)
+           (%check :cas-ok    (= 0 (dds.pal:cas-sap-u64 sap 0 0 42)) "cas returns prev")
+           (%check :cas-set   (= 42 (dds.pal:load-sap-u64 sap 0)) "cas stored new")
+           (%check :cas-fail  (= 42 (dds.pal:cas-sap-u64 sap 0 0 99)) "cas mismatch returns prev")
+           (%check :cas-nochg (= 42 (dds.pal:load-sap-u64 sap 0)) "cas mismatch no write")
+           (%check :incf      (= 47 (dds.pal:atomic-incf-sap-u64 sap 0 5)) "incf returns new")
+           t)
+      (dds.pal:free-static m))))
+
+(defun* %shm-attach-by-name-reliable-p ()
+    (function () t)
+  "True except on Clasp/macOS-arm64, whose plain cffi:foreign-funcall mispasses shm_open's variadic
+   mode_t -> the created object is unre-openable (documented NFR-PORT gap, ADR 0013). Delegates to the
+   single transport-layer definition to keep the platform fact in one place (DRY)."
+  (dds.xport.shmem:shm-attach-by-name-reliable-p))
+
+(defun* run-pal-shm-test ()
+    (function () (eql t))
+  "Create a segment, prove MAP_SHARED sharing via a second mapping (deterministic on every target),
+   and assert shm-attach by name sees the same memory (mandatory on SBCL all platforms + Clasp/non-macOS;
+   the Clasp/macOS-arm64 variadic-mode_t ABI gap is tolerated at runtime, NFR-PORT)."
+  (let* ((name (format nil "/dds-test-shm-b1-~a" (random 1000000))) (size 4096))
+    (ignore-errors (dds.pal:shm-destroy name))
+    (let ((seg (dds.pal:shm-create name size)))
+      (unwind-protect
+           (progn
+             (setf (cffi:mem-ref (dds.pal:shm-sap seg) :uint32 0) #xCAFEF00D)
+             ;; second mmap of the same fd proves MAP_SHARED (deterministic everywhere)
+             (let ((sap2 (dds.pal::%mmap-shared (dds.pal::shm-segment-fd seg) size)))
+               (unwind-protect
+                    (%check :shm-shared-second-mapping
+                            (= #xCAFEF00D (cffi:mem-ref sap2 :uint32 0))
+                            "second mapping sees the first's write")
+                 (cffi:foreign-funcall "munmap" :pointer sap2 :unsigned-long size :int)))
+             ;; by-name attach: cross-process path. Deterministic with the SBCL varargs create
+             ;; (verified macOS arm64); Clasp/macOS-arm64 mispasses the variadic mode -> tolerated.
+             (handler-case
+                 (let ((seg2 (dds.pal:shm-attach name size)))
+                   (unwind-protect
+                        (%check :shm-attach-by-name
+                                (= #xCAFEF00D (cffi:mem-ref (dds.pal:shm-sap seg2) :uint32 0))
+                                "named attach sees the first's write")
+                     (dds.pal:shm-detach seg2)))
+               (error (e)
+                 (when (%shm-attach-by-name-reliable-p) (error e))))
+             t)
+        (dds.pal:shm-detach seg)
+        (dds.pal:shm-destroy name)))))
+
+(defun* run-pal-pshared-test ()
+    (function () (eql t))
+  "A PROCESS_SHARED mutex+cond in a foreign buffer: a waiter thread blocks on the cond and is woken by a signal."
+  (let ((m (dds.pal:alloc-static 256)))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m)) (mx 0) (cv 64) (flag 128) (woke nil))
+           (dds.pal:store-sap-u64 sap flag 0)
+           (dds.pal:pshared-mutex-init sap mx)
+           (dds.pal:pshared-cond-init sap cv)
+           (let ((th (dds.pal:spawn
+                       (lambda ()
+                         (dds.pal:pshared-lock sap mx)
+                         (loop until (= 1 (dds.pal:load-sap-u64 sap flag))
+                               do (dds.pal:pshared-cond-wait sap cv mx))
+                         (dds.pal:pshared-unlock sap mx)
+                         (setf woke t)))))
+             (sleep 0.05)
+             (dds.pal:pshared-lock sap mx)
+             (dds.pal:store-sap-u64 sap flag 1)
+             (dds.pal:pshared-cond-signal sap cv)
+             (dds.pal:pshared-unlock sap mx)
+             (dds.pal:join th)
+             (%check :woke woke "waiter thread woke after the signal")
+             (dds.pal:pshared-destroy sap mx cv)
+             t))
+      (dds.pal:free-static m))))
+
+(defun* run-shmem-ring-init-test ()
+    (function () (eql t))
+  "SHMEM ring header+notify init/validate: magic, version, lane-count, capacity round-trip on a real segment."
+  (let ((m (dds.pal:alloc-static (dds.xport.shmem::%segment-bytes 4 4096))))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m)))
+           (dds.xport.shmem::%ring-init sap 4 4096)
+           (%check :shmem-validate (dds.xport.shmem::%ring-validate sap) "ring validate after init")
+           (%check :shmem-lane-count (= 4 (dds.xport.shmem::%ring-lane-count sap)) "lane-count round-trip")
+           (%check :shmem-capacity (= 4096 (dds.xport.shmem::%ring-capacity sap)) "capacity round-trip")
+           (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-shmem-lane-claim-test ()
+    (function () (eql t))
+  "SHMEM mutex-guarded lane claim: two tokens take two distinct lanes; re-claim is idempotent; full -> NIL."
+  (let ((m (dds.pal:alloc-static (dds.xport.shmem::%segment-bytes 2 4096))))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m)))
+           (dds.xport.shmem::%ring-init sap 2 4096)
+           (let ((a (dds.xport.shmem::%claim-lane sap 111))
+                 (b (dds.xport.shmem::%claim-lane sap 222)))
+             (%check :shmem-claim-a a "first token must get a lane")
+             (%check :shmem-claim-b b "second token must get a lane")
+             (%check :shmem-claim-distinct (/= a b) "two tokens must get distinct lanes")
+             (%check :shmem-claim-reuse (= a (dds.xport.shmem::%claim-lane sap 111)) "re-claim returns same lane")
+             (%check :shmem-claim-full (null (dds.xport.shmem::%claim-lane sap 333)) "third token must get NIL (full)"))
+           (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-shmem-enqueue-test ()
+    (function () (eql t))
+  "SHMEM SPSC enqueue: a 5-byte record advances the write-cursor to round8(4+5)=16; an oversize record rejects."
+  (let ((m (dds.pal:alloc-static (dds.xport.shmem::%segment-bytes 1 64))))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m))
+               (p (octets 1 2 3 4 5))
+               (big (make-array 60 :element-type '(unsigned-byte 8) :initial-element 0)))
+           (dds.xport.shmem::%ring-init sap 1 64)
+           (%check :shmem-enq-ok (dds.xport.shmem::%lane-enqueue sap 0 64 p 0 5) "enqueue of 5 bytes must succeed")
+           (%check :shmem-enq-cursor
+                   (= 16 (dds.pal:load-sap-u64 sap (+ (dds.xport.shmem::%lane-desc-off 0)
+                                                      dds.xport.shmem::+lane-off-write+)))
+                   "write-cursor must be round8(4+5)=16")
+           (%check :shmem-enq-reject (null (dds.xport.shmem::%lane-enqueue sap 0 64 big 0 60))
+                   "a record of len cap-4 must be rejected (does not fit)")
+           (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-shmem-drain-test ()
+    (function () (eql t))
+  "SHMEM SPSC drain: two enqueued records (3x9, 2x7) are delivered in order with the right sizes/first-bytes."
+  (let ((m (dds.pal:alloc-static (dds.xport.shmem::%segment-bytes 1 64))))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m))
+               (a (octets 9 9 9))
+               (b (octets 7 7))
+               (sink (dds.core.buffer:make-octet-buffer 64))
+               (got '()))
+           (dds.xport.shmem::%ring-init sap 1 64)
+           (dds.xport.shmem::%lane-enqueue sap 0 64 a 0 3)
+           (dds.xport.shmem::%lane-enqueue sap 0 64 b 0 2)
+           (dds.xport.shmem::%lane-drain
+            sap 0 64 sink
+            (lambda (s size)
+              (push (cons size (aref (dds.core.buffer:octet-buffer-vec s) 0)) got)))
+           (setf got (nreverse got))
+           (%check :shmem-drain-count (= 2 (length got)) "drain must deliver both records")
+           (%check :shmem-drain-first (equal '(3 . 9) (first got)) "first record: size 3, byte 9")
+           (%check :shmem-drain-second (equal '(2 . 7) (second got)) "second record: size 2, byte 7")
+           (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-shmem-drain-resource-guard-test ()
+    (function () (eql t))
+  "A garbage write-cursor (w - r >> capacity) must NOT flood on-datagram: the drain rejects w-r > capacity (NFR-SEC-POSTURE)."
+  (let* ((lanes 1) (cap 64) (m (dds.pal:alloc-static (dds.xport.shmem::%segment-bytes lanes cap))) (n 0))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m)))
+           (dds.xport.shmem::%ring-init sap lanes cap)
+           ;; forge a write-cursor 10*capacity ahead with no real records written
+           (dds.pal:store-sap-u64 sap (+ (dds.xport.shmem::%lane-desc-off 0) dds.xport.shmem::+lane-off-write+) (* 10 cap))
+           (let ((sink (dds.core.buffer:make-octet-buffer cap)))
+             (dds.xport.shmem::%lane-drain sap 0 cap sink (lambda (buf size) (declare (ignore buf size)) (incf n))))
+           (%check :no-flood (zerop n) "drain must deliver 0 records for a w-r > capacity garbage cursor")
+           (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-shmem-locator-wire-test ()
+    (function () (eql t))
+  "SHMEM Locator_t + PID_SHMEM_HOST_UUID ride additively in SPDP (FR-XPORT-2, ADR 0013):
+   a SHMEM locator round-trips beside a UDP locator (no regression), the host-uuid round-trips,
+   and a truncated PID_SHMEM_HOST_UUID is ignored fail-open (host-uuid stays 0, never errors)."
+  (let* ((prefix (make-array 12 :element-type '(unsigned-byte 8)
+                             :initial-contents '(9 9 9 9 8 8 8 8 7 7 7 7)))
+         (udp (dds.rtps.discovery:make-locator
+               :kind dds.rtps.discovery:+locator-kind-udpv4+ :port 7411
+               :address (dds.rtps.discovery:make-ipv4-locator
+                         (octets 192 168 1 77))))
+         (shm (dds.rtps.discovery:make-shmem-locator-wire 8 65536))
+         (data (dds.rtps.discovery:make-spdp-data
+                :guid-prefix prefix :host-uuid #xCAFEBABEF00D1234
+                :default-unicast-locators (list udp shm)))
+         (ob (dds.core.buffer:make-octet-buffer 512))
+         (wc (dds.core.buffer:cursor ob :endianness :little)))
+    (dds.rtps.discovery:serialize-spdp-data wc data)
+    (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
+           (back (dds.rtps.discovery:parse-spdp-data rc)))
+      (%check :parsed back "parse-spdp-data returned NIL")
+      (%check :host-uuid (= (dds.rtps.discovery:spdp-data-host-uuid back) #xCAFEBABEF00D1234)
+              "host-uuid did not round-trip")
+      (let* ((locs (dds.rtps.discovery:spdp-data-default-unicast-locators back))
+             (sloc (find dds.rtps.discovery:+locator-kind-shmem+ locs
+                         :key #'dds.rtps.discovery:locator-kind))
+             (uloc (find dds.rtps.discovery:+locator-kind-udpv4+ locs
+                         :key #'dds.rtps.discovery:locator-kind)))
+        (%check :shmem-present sloc "no SHMEM-kind locator in parsed default-unicast-locators")
+        (%check :shmem-lanes (= (dds.rtps.discovery:shmem-locator-wire-lane-count sloc) 8)
+                "SHMEM locator lane-count != 8")
+        (%check :shmem-capacity (= (dds.rtps.discovery:locator-port sloc) 65536)
+                "SHMEM locator capacity (port) != 65536")
+        (%check :udp-present uloc "UDP locator regressed (not in parsed list)")
+        (%check :udp-addr (string= (dds.rtps.discovery:locator-ipv4-string uloc) "192.168.1.77")
+                "UDP locator address did not round-trip"))))
+  ;; fail-open: a truncated PID_SHMEM_HOST_UUID (len 4) is ignored, never an error; host-uuid stays 0.
+  (let* ((ob (dds.core.buffer:make-octet-buffer 64))
+         (wc (dds.core.buffer:cursor ob :endianness :little))
+         (bad (octets 1 2 3 4)))
+    (dds.rtps.message:write-parameter wc dds.rtps.message:+pid-shmem-host-uuid+ bad 0 4)
+    (dds.rtps.message:write-parameter-sentinel wc)
+    (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
+           (back (dds.rtps.discovery:parse-spdp-data rc)))
+      (%check :failopen-parsed back "truncated PID_SHMEM_HOST_UUID must parse, not error")
+      (%check :failopen-zero (zerop (dds.rtps.discovery:spdp-data-host-uuid back))
+              "truncated PID_SHMEM_HOST_UUID must leave host-uuid 0 (fail-open)")))
+  t)
+
 (defun* run-all-tests ()
     (function () t)
   "Run every landed test; signal on first failure, else report and return T."
   (let ((tests '(("md5-rfc1321"               . run-md5-test)
                  ("echo-over-mock-transport" . run-echo-test)
+                 ("pal-fence"                . run-pal-fence-test)
+                 ("pal-sap-atomics"          . run-pal-sap-atomics-test)
+                 ("pal-shm"                  . run-pal-shm-test)
+                 ("pal-pshared"              . run-pal-pshared-test)
                  ("xcdr-codec-roundtrip"     . run-codec-roundtrip-test)
                  ("xcdr-byte-exact-seed"     . run-byte-exact-test)
                  ("xcdr-encap-options-pad"   . run-encap-options-pad-test)
@@ -350,6 +585,7 @@
                  ("coalesce-large-pack"      . run-coalesce-large-pack-test)
                  ("batch-defer"              . run-batch-defer-test)
                  ("async-decoupled"          . run-async-decoupled-test)
+                 ("shmem-end-to-end"         . run-shmem-end-to-end-test)
                  ("lease-sweep"              . run-lease-sweep-test)
                  ("tce-disallow-default"     . run-tce-disallow-default-test)
                  ("zero-alloc-into"          . run-generated-into-test)
@@ -390,6 +626,7 @@
                  ("udp-loopback"             . run-udp-loopback-test)
                  ("rtps-discovery-spdp"      . dds.rtps.discovery:run-discovery-test)
                  ("rtps-discovery-sedp"      . dds.rtps.discovery:run-sedp-test)
+                 ("shmem-locator-wire"       . run-shmem-locator-wire-test)
                  ("udp-transport"           . dds.xport.udp:run-udp-transport-test)
                  ("udp-receiver-thread"      . dds.xport.udp:run-udp-receiver-test)
                  ("end-to-end-udp"           . run-end-to-end-test)
@@ -442,7 +679,16 @@
                  ("sedp-type-gate"           . run-type-gate-test)
                  ("dcps-type-gate"           . run-dcps-type-gate-test)
                  ("dcps-legacy-gate"         . run-dcps-legacy-gate-test)
-                 ("perftest-smoke"           . dds.bench:run-bench-smoke))))
+                 ("perftest-smoke"           . dds.bench:run-bench-smoke)
+                 ("perftest-shmem-smoke"     . dds.bench:run-bench-shmem-smoke)
+                 ("shmem-ring-init"          . run-shmem-ring-init-test)
+                 ("shmem-lane-claim"         . run-shmem-lane-claim-test)
+                 ("shmem-enqueue"            . run-shmem-enqueue-test)
+                 ("shmem-drain"              . run-shmem-drain-test)
+                 ("shmem-drain-resource-guard" . run-shmem-drain-resource-guard-test)
+                 ("shmem-transport"          . dds.xport.shmem:run-shmem-transport-test)
+                 ("shmem-receiver-thread"    . dds.xport.shmem:run-shmem-receiver-test)
+                 ("shmem-stress"             . dds.xport.shmem:run-shmem-stress-test))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))
       (funcall (cdr test))

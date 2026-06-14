@@ -73,14 +73,38 @@
   "The FRAC quantile (0..1) of the ascending SORTED vector by nearest-rank."
   (aref sorted (min (1- (length sorted)) (floor (* frac (length sorted))))))
 
-(defun* run-latency (&key (samples 10000) (payload-bytes 64) (warmup 500))
-    (function (&key (:samples (integer 1)) (:payload-bytes (integer 1)) (:warmup (integer 0))) list)
-  "Measure one-way PING/PONG latency over UDP loopback: a pinger node writes a PAYLOAD-BYTES sample on
-   topic PerfPing; an echoer node echoes a pong on PerfPong; one-way = RTT/2. After WARMUP throwaway
-   round-trips, time SAMPLES of them and the bytes consed across the whole path. Returns a plist:
-   :samples :payload-bytes :p50 :p99 :p9999 :max :min :mean :bytes-per-sample (latency values are
-   ONE-WAY nanoseconds)."
-  (let* ((p (dds.disc:make-disc-node :guid-prefix (%prefix #x70) :host "127.0.0.1" :port 0))
+(defun* %shmem-transport-p (transport)
+    (function (keyword) t)
+  "T iff TRANSPORT selects the SHMEM data plane (:shmem), NIL for :udp — the bench's transport switch.
+   Both bench nodes run in ONE process (same host-uuid), so with *shmem-enabled* T (its default on SBCL
+   and Clasp/Linux) the user-DATA push auto-routes over shared memory (%shmem-dest); rebinding it NIL
+   forces the all-UDP baseline. NOT a wire constant — a local transport-selection switch (WP-SHMEM)."
+  (ecase transport (:udp nil) (:shmem t)))
+
+(defun* %assert-shmem-sends (transport node label)
+    (function (keyword dds.disc:disc-node string) t)
+  "On the :shmem transport, assert NODE actually routed user DATA over shared memory (disc-node-shmem-sends
+   advanced past 0) — so the bench PROVES it measured SHMEM, not a silent UDP fallback (FR-LANG-7). A no-op
+   on :udp. Signals an error naming LABEL otherwise (e.g. *shmem-enabled* NIL, or the platform SHMEM gate)."
+  (when (%shmem-transport-p transport)
+    (assert (plusp (dds.disc::disc-node-shmem-sends node)) ()
+            "WP-SHMEM bench: ~a routed 0 datagrams over SHMEM (shmem-sends=0) — SHMEM did not engage"
+            label))
+  t)
+
+(defun* run-latency (&key (samples 10000) (payload-bytes 64) (warmup 500) (transport :udp))
+    (function (&key (:samples (integer 1)) (:payload-bytes (integer 1)) (:warmup (integer 0))
+               (:transport (member :udp :shmem))) list)
+  "Measure one-way PING/PONG latency over the TRANSPORT data plane (:udp loopback baseline, default; or
+   :shmem same-host shared memory, WP-SHMEM): a pinger node writes a PAYLOAD-BYTES sample on topic
+   PerfPing; an echoer node echoes a pong on PerfPong; one-way = RTT/2. Both nodes are in-process (same
+   host-uuid), so on :shmem the user DATA auto-routes over shared memory; :udp rebinds dds.disc:*shmem-enabled*
+   NIL to force UDP. After WARMUP throwaway round-trips, time SAMPLES of them and the bytes consed across the
+   whole path; on :shmem assert each node's shmem-sends advanced (proof it measured SHMEM, FR-LANG-7).
+   Returns a plist: :samples :payload-bytes :transport :p50 :p99 :p9999 :max :min :mean :bytes-per-sample
+   :shmem-sends (latency values are ONE-WAY nanoseconds)."
+  (let* ((dds.disc:*shmem-enabled* (%shmem-transport-p transport))
+         (p (dds.disc:make-disc-node :guid-prefix (%prefix #x70) :host "127.0.0.1" :port 0))
          (e (dds.disc:make-disc-node :guid-prefix (%prefix #x71) :host "127.0.0.1" :port 0))
          (rv (%make-rendezvous))
          (ping (%payload payload-bytes))
@@ -115,27 +139,35 @@
                                    (error "perftest: pong not received within 5 s (reliable stall?)"))))
                       (- (rendezvous-recv-ns rv) t0))))
              (dotimes (i warmup) (one) (%drain-cache p) (%drain-cache e))
-             (let ((before (dds.pal:bytes-consed)))
+             (let ((before (dds.pal:bytes-consed)) (shmem0 (dds.disc::disc-node-shmem-sends p)))
                (dotimes (i samples) (vector-push (one) rtts) (%drain-cache p) (%drain-cache e))
+               (%assert-shmem-sends transport p "pinger") (%assert-shmem-sends transport e "echoer")
                (let* ((consed (- (dds.pal:bytes-consed) before))
                       (oneway (make-array samples :element-type 'fixnum)))
                  (dotimes (i samples) (setf (aref oneway i) (ash (aref rtts i) -1)))
                  (sort oneway #'<)
-                 (list :samples samples :payload-bytes payload-bytes
+                 (list :samples samples :payload-bytes payload-bytes :transport transport
                        :p50 (%pct oneway 0.50) :p99 (%pct oneway 0.99)
                        :p9999 (%pct oneway 0.9999) :max (aref oneway (1- samples))
                        :min (aref oneway 0)
                        :mean (round (/ (loop for x across oneway sum x) samples))
-                       :bytes-per-sample (round (/ consed samples)))))))
+                       :bytes-per-sample (round (/ consed samples))
+                       :shmem-sends (- (dds.disc::disc-node-shmem-sends p) shmem0))))))
       (dds.disc:stop-node p) (dds.disc:stop-node e))))
 
-(defun* run-throughput (&key (samples 20000) (payload-bytes 64) (batch 1))
-    (function (&key (:samples (integer 1)) (:payload-bytes (integer 1)) (:batch (integer 1))) list)
-  "Measure one-way throughput over UDP loopback: a writer node blasts SAMPLES of a PAYLOAD-BYTES sample
-   on topic PerfThru as fast as write() returns; a reader node counts delivery. BATCH > 1 enables WP-BATCH
-   write-side batching (flush every BATCH samples). Returns a plist:
-   :samples :payload-bytes :batch :received :send-samples-per-s :delivered-samples-per-s :send-mbps."
-  (let* ((p (dds.disc:make-disc-node :guid-prefix (%prefix #x72) :host "127.0.0.1" :port 0
+(defun* run-throughput (&key (samples 20000) (payload-bytes 64) (batch 1) (transport :udp))
+    (function (&key (:samples (integer 1)) (:payload-bytes (integer 1)) (:batch (integer 1))
+               (:transport (member :udp :shmem))) list)
+  "Measure one-way throughput over the TRANSPORT data plane (:udp loopback baseline, default; or :shmem
+   same-host shared memory, WP-SHMEM): a writer node blasts SAMPLES of a PAYLOAD-BYTES sample on topic
+   PerfThru as fast as write() returns; a reader node counts delivery. Both nodes are in-process (same
+   host-uuid), so on :shmem the user DATA auto-routes over shared memory; :udp rebinds dds.disc:*shmem-enabled*
+   NIL to force UDP. BATCH > 1 enables WP-BATCH write-side batching (flush every BATCH samples). On :shmem
+   assert the writer's shmem-sends advanced (proof it measured SHMEM, FR-LANG-7). Returns a plist:
+   :samples :payload-bytes :batch :transport :received :send-samples-per-s :delivered-samples-per-s
+   :send-mbps :shmem-sends."
+  (let* ((dds.disc:*shmem-enabled* (%shmem-transport-p transport))
+         (p (dds.disc:make-disc-node :guid-prefix (%prefix #x72) :host "127.0.0.1" :port 0
                                      :batch-max-samples batch))
          (e (dds.disc:make-disc-node :guid-prefix (%prefix #x73) :host "127.0.0.1" :port 0))
          (payload (%payload payload-bytes)))
@@ -152,12 +184,15 @@
              (dds.disc:flush-batch p)             ; drain the final partial batch
              (let ((send-ns (max 1 (- (dds.pal:monotonic-ns) t0))))
                (loop repeat 2000 until (>= (dds.disc:node-sample-count e) samples) do (sleep 0.005))
+               (%assert-shmem-sends transport p "writer")
                (let* ((recv-ns (max 1 (- (dds.pal:monotonic-ns) t0)))
                       (received (dds.disc:node-sample-count e)))
-                 (list :samples samples :payload-bytes payload-bytes :batch batch :received received
+                 (list :samples samples :payload-bytes payload-bytes :batch batch :transport transport
+                       :received received
                        :send-samples-per-s (round (/ samples (/ send-ns 1.0d9)))
                        :delivered-samples-per-s (round (/ received (/ recv-ns 1.0d9)))
-                       :send-mbps (/ (round (/ (* samples payload-bytes 8) (/ send-ns 1.0d9))) 1.0d6))))))
+                       :send-mbps (/ (round (/ (* samples payload-bytes 8) (/ send-ns 1.0d9))) 1.0d6)
+                       :shmem-sends (dds.disc::disc-node-shmem-sends p))))))
       (dds.disc:stop-node p) (dds.disc:stop-node e))))
 
 (defun* %print-latency (r)
@@ -191,6 +226,78 @@
   (format t "~%Note: bytes/sample > 0 reflects the v1 data plane (per-sample heap copies, documented); the P4 features drive it toward the NFR-PERF-8 0-alloc target measured here.~%")
   t)
 
+(defun* %speedup (baseline candidate)
+    (function (real real) double-float)
+  "BASELINE/CANDIDATE as a double — a latency SPEEDUP factor (>1 = CANDIDATE is faster), or 0.0 when
+   CANDIDATE is non-positive (the SHMEM-vs-UDP delta column; honest 0.0 rather than a divide-by-zero)."
+  (if (plusp candidate) (/ (float baseline 1.0d0) (float candidate 1.0d0)) 0.0d0))
+
+(defun* %ratio (candidate baseline)
+    (function (real real) double-float)
+  "CANDIDATE/BASELINE as a double — a throughput RATIO (>1 = CANDIDATE delivers more), or 0.0 when
+   BASELINE is non-positive (the SHMEM-vs-UDP throughput delta column)."
+  (if (plusp baseline) (/ (float candidate 1.0d0) (float baseline 1.0d0)) 0.0d0))
+
+(defun* %print-latency-cmp (u s)
+    (function (list list) t)
+  "Print one SHMEM-vs-UDP latency comparison row from the UDP plist U and the SHMEM plist S (same payload
+   size): UDP p50/p99/max, SHMEM p50/p99/max (one-way ns), the p50 speedup factor, and SHMEM bytes/sample
+   (the 0-alloc evidence, NFR-PERF-8)."
+  (format t "~&| ~5d B | ~8d | ~8d | ~8d | ~8d | ~8d | ~8d | ~7,2fx | ~10d |~%"
+          (getf u :payload-bytes)
+          (getf u :p50) (getf u :p99) (getf u :max)
+          (getf s :p50) (getf s :p99) (getf s :max)
+          (%speedup (getf u :p50) (getf s :p50))
+          (getf s :bytes-per-sample))
+  t)
+
+(defun* %print-throughput-cmp (u s)
+    (function (list list) t)
+  "Print one SHMEM-vs-UDP throughput comparison row from the UDP plist U and the SHMEM plist S (same payload
+   + batch): UDP/SHMEM send samples-per-s and Mbps, plus the samples-per-s ratio (>1 = SHMEM faster)."
+  (format t "~&| ~5d B | ~5d | ~14d | ~9,1f | ~14d | ~9,1f | ~7,2fx |~%"
+          (getf u :payload-bytes) (getf u :batch)
+          (getf u :send-samples-per-s) (getf u :send-mbps)
+          (getf s :send-samples-per-s) (getf s :send-mbps)
+          (%ratio (getf s :send-samples-per-s) (getf u :send-samples-per-s)))
+  t)
+
+(defparameter +bench-shmem-latency-sizes+ '(16 64 256 1024)
+  "Payload sizes (octets) the WP-SHMEM latency comparison sweeps — small (where the SHMEM mutex/condvar
+   per-message overhead is most visible) up to 1 KB (where the per-byte copy cost grows).")
+
+(defparameter +bench-shmem-throughput-specs+ '((64 . 1) (64 . 100) (256 . 1) (1024 . 1))
+  "(PAYLOAD-BYTES . BATCH) cases the WP-SHMEM throughput comparison sweeps (BATCH = WP-BATCH write-side
+   batching; batch 100 amortizes per-datagram overhead over the same transport).")
+
+(defun* run-bench-shmem (&key (latency-samples 10000) (throughput-samples 20000))
+    (function (&key (:latency-samples (integer 1)) (:throughput-samples (integer 1))) t)
+  "Run the perftest latency + throughput scenarios over BOTH transports — UDP loopback (the baseline) and
+   same-host SHMEM (WP-SHMEM) — for the same payload sizes, and print a markdown comparison report to
+   *standard-output* quantifying the SHMEM-vs-UDP delta (NFR-PERF-6, FR-LANG-7). Captured into bench/report/
+   by the make bench-shmem target. Each :shmem run asserts disc-node-shmem-sends advanced, so the SHMEM
+   columns are PROVEN to have traversed shared memory, not a silent UDP fallback. bytes/sample is the
+   NFR-PERF-8 0-alloc oracle (SBCL-exact; Clasp reports 0 — a documented NFR-PORT gap, so on Clasp the
+   bytes/sample column is uninformative)."
+  (format t "~&# dds-bench — SHMEM vs UDP-loopback (WP-SHMEM)~%~%")
+  (format t "Both bench nodes run in ONE process (same host-uuid), so with dds.disc:*shmem-enabled* T the user-DATA push auto-routes over shared memory; the UDP rows rebind it NIL to force the loopback baseline. Clock: dds.pal:monotonic-ns (~~us resolution). bytes/sample: dds.pal:bytes-consed delta over the measured loop (whole path, all threads; SBCL-exact, Clasp=0). Each SHMEM run is asserted to have advanced disc-node-shmem-sends (proof it measured SHMEM, not UDP).~%~%")
+  (format t "## One-way latency — SHMEM vs UDP (ns; RTT/2, single in-flight)~%~%")
+  (format t "| payload |  UDP p50 |  UDP p99 |  UDP max | SHM p50 | SHM p99 | SHM max | p50 spdup | SHM b/samp |~%")
+  (format t "|---------|----------|----------|----------|---------|---------|---------|-----------|------------|~%")
+  (dolist (sz +bench-shmem-latency-sizes+)
+    (let ((u (run-latency :samples latency-samples :payload-bytes sz :warmup 500 :transport :udp))
+          (s (run-latency :samples latency-samples :payload-bytes sz :warmup 500 :transport :shmem)))
+      (%print-latency-cmp u s)))
+  (format t "~%## Throughput — SHMEM vs UDP (one-way; batch N = WP-BATCH write-side batching)~%~%")
+  (format t "| payload | batch | UDP samples/s | UDP Mbps | SHM samples/s | SHM Mbps | spr ratio |~%")
+  (format t "|---------|-------|---------------|----------|---------------|----------|-----------|~%")
+  (dolist (spec +bench-shmem-throughput-specs+)
+    (let ((u (run-throughput :samples throughput-samples :payload-bytes (car spec) :batch (cdr spec) :transport :udp))
+          (s (run-throughput :samples throughput-samples :payload-bytes (car spec) :batch (cdr spec) :transport :shmem)))
+      (%print-throughput-cmp u s)))
+  (format t "~%Legend: p50 spdup = UDP-p50 / SHMEM-p50 (>1 = SHMEM faster). spr ratio = SHMEM-send-samples/s / UDP (>1 = SHMEM faster). SHM b/samp is the SHMEM bytes-consed/sample (NFR-PERF-8; ~~0 = the steady path allocates nothing; Clasp reports 0 by gap).~%")
+  t)
+
 (defun* run-bench-smoke ()
     (function () t)
   "Suite-friendly self-check: a tiny latency + throughput run; asserts every sample round-trips,
@@ -204,3 +311,21 @@
     (assert (>= (getf thr :received) 50) () "throughput smoke: not all samples delivered (~d/50)"
             (getf thr :received))
     t))
+
+(defun* run-bench-shmem-smoke ()
+    (function () t)
+  "Suite-friendly self-check of the WP-SHMEM bench path: a tiny :shmem latency + throughput run, asserting
+   every sample round-trips AND that disc-node-shmem-sends advanced (so CI catches a SHMEM-routing
+   regression — the bench measuring UDP while claiming SHMEM — without a long run). Pass-SKIPS where SHMEM
+   is off (dds.disc:*shmem-enabled* NIL, e.g. Clasp/macOS per ADR 0013) so it never false-fails on a platform
+   with no usable SHMEM. Signals an error on failure (the dds.tests runner treats that as a test failure)."
+  (if (not dds.disc:*shmem-enabled*)
+      (format t "(SHMEM off on this platform — skipped) ")
+      (let ((lat (run-latency :samples 30 :payload-bytes 32 :warmup 5 :transport :shmem))
+            (thr (run-throughput :samples 50 :payload-bytes 32 :transport :shmem)))
+        (assert (plusp (getf lat :p50)) () "shmem latency smoke: non-positive p50 latency")
+        (assert (plusp (getf lat :shmem-sends)) () "shmem latency smoke: shmem-sends did not advance (UDP, not SHMEM)")
+        (assert (>= (getf thr :received) 50) () "shmem throughput smoke: not all samples delivered (~d/50)"
+                (getf thr :received))
+        (assert (plusp (getf thr :shmem-sends)) () "shmem throughput smoke: shmem-sends did not advance (UDP, not SHMEM)")))
+  t)

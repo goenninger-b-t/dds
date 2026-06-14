@@ -11,14 +11,14 @@ SHMEM segment layouts are vendor-proprietary (RTI and Fast DDS use different seg
 vendor locator kinds; there is no standard RTPS SHMEM locator), so cross-vendor SHMEM interop is **out
 of scope** — "interop where wire-compatible" (M5 exit gate) excludes SHMEM by construction, and same-host
 cross-vendor already falls back to UDP loopback in the field. **Out of v1:** Zero-Copy reference passing
-(WP-ZEROCOPY), a Linux `futex` notification fast-path (a measured follow-up; named POSIX semaphores are
+(WP-ZEROCOPY), a Linux `futex` notification fast-path (a measured follow-up; a pthread PROCESS_SHARED condvar is
 the portable v1), Windows.
 
 ## Contract impact
 - The `transport` record (`dds.xport`, IMPLEMENTATION-PLAN §7.5 / FR-XPORT-5) is **unchanged** — a SHMEM
   transport is "construct one record", so the RTPS engine and `%handle-datagram` are untouched.
 - **ADR required:** WP-SHMEM **extends the M0-frozen `dds.pal` contract** three ways: (a) SHMEM segment
-  primitives, (b) cross-process named-semaphore primitives, and (c) the **M1 atomics fast path** — the
+  primitives, (b) cross-process `PTHREAD_PROCESS_SHARED` mutex+condvar primitives, and (c) the **M1 atomics fast path** — the
   current `cas`/`atomic-incf`/`fence` are M0 stubs (`cas`/`atomic-incf` signal `pal-unimplemented`; `fence`
   is a no-op ignoring `:kind`), verified at `pal-sbcl.lisp:81-96` / `pal-clasp.lisp:102-117`. This WP
   implements them for real. Because an atomic CAS cannot go through the stub's runtime `place-fn`
@@ -34,15 +34,23 @@ system is not warranted for one file). `make-shmem-transport` returns `(values t
 like `make-udp-transport`.
 
 ## New PAL surface (ADR-gated; CFFI `foreign-funcall`, mirroring `pal-net.lisp`)
-- Segment: `shm-create(name size)` = `shm_open(O_CREAT|O_EXCL|O_RDWR,0600)` + `ftruncate` + `mmap(MAP_SHARED)`;
-  `shm-attach(name size)` = `shm_open(O_RDWR)` + `mmap`; `shm-detach(h)` = `munmap`+`close`;
+- Segment: `shm-create(name size)` = `shm_open(O_CREAT|O_EXCL|O_RDWR,0600)` + `ftruncate` + `mmap(MAP_SHARED)`
+  — the create's `mode` is a **variadic arg, so it MUST be passed via `cffi:foreign-funcall-varargs`** on
+  arm64 (a plain `foreign-funcall` passes a garbage mode → EACCES on later attach; verified 2026-06-14);
+  `shm-attach(name size)` = `shm_open(O_RDWR)` (2-arg, non-variadic) + `mmap`; `shm-detach(h)` = `munmap`+`close`;
   `shm-destroy(name)` = `shm_unlink`; `shm-sap(h)` → the `mmap` base SAP (typed R/W on the foreign region
   via the PAL SAP accessors — the same `sap-ref-*` / `cffi:mem-ref` family the buffer layer uses; the shm
   region is a raw `mmap` pointer, not a `static-vectors` octet-buffer).
-- Notification: `sem-create/sem-open/sem-post/sem-wait/sem-close/sem-unlink` over **named POSIX
-  semaphores** (`sem_open`/`sem_post`/`sem_wait`). `sem-wait` blocks; **clean shutdown uses a stop-flag +
-  `sem-post`-to-wake** (the proven WP-ASYNC teardown pattern), so no `sem_timedwait` is needed (macOS
-  lacks it) and there is no notification-latency polling.
+- Notification: a **`PTHREAD_PROCESS_SHARED` mutex + condition variable living IN the segment** — NOT named
+  semaphores (`sem_open` cannot be driven from the Lisp runtime on macOS arm64: its `mode`/`value` are
+  variadic and CFFI/sb-alien mispass them → EINVAL, verified 2026-06-14 via CFFI plain+varargs+sb-alien vs
+  working C). PAL primitives (all NON-variadic `pthread_*`, so they work from Lisp on macOS + Linux;
+  libpthread already linked → no new dependency): `pshared-mutex-init`/`pshared-cond-init` (creator only,
+  set the `PTHREAD_PROCESS_SHARED` attrs), `pshared-lock`/`pshared-unlock`, `pshared-cond-wait`,
+  `pshared-cond-signal`/`pshared-cond-broadcast`, `pshared-destroy`. The receiver waits on the cond with the
+  predicate **"any lane has data"** (re-checked under the mutex; the SPSC release-store + the mutex acq/rel
+  give correct ordering, no lost wakeup). The sender enqueues, then locks + signals. **Clean shutdown:** set
+  the in-segment `stop` flag, lock + broadcast, join the receive thread before teardown. No polling.
 - Naming: macOS caps shm/sem names at ~31 chars, so names are `"/dds" + 10 hex of a host+GUID hash`, not
   the full GUID. The exact length cap + the leading-slash requirement are pinned from the platform at
   design/impl time, not from memory.
@@ -54,9 +62,12 @@ like `make-udp-transport`.
 
 ## Segment & ring layout
 One **receive segment per participant** (the receiver creates it; senders attach). Layout:
-`[ Header (cache-line aligned) | K SPSC lanes ]`. Header: `magic:u32`, `version:u32`, `capacity:u32`,
-`max_record:u32`, `lane_count:u32`, per-lane `{owner_token:u64, write_cursor:u64, read_cursor:u64}`,
-all fixed-offset, fixed-width, little-endian. `magic`+`version` are an ABI guard checked on attach.
+`[ Header (64B) | Notify block (mutex + cond + stop, cache-aligned) | K SPSC lanes ]`. Header: `magic:u32`,
+`version:u32`, `lane_count:u32`, `capacity:u32`, `max_record:u32`. Notify block: a `pthread_mutex_t` + a
+`pthread_cond_t` + a `stop:u64`, each at a fixed cache-aligned offset, the block sized to the per-platform
+max pthread struct sizes (macOS arm64 mutex 64B/cond 48B; Linux mutex 40B/cond 48B) so one layout serves
+both. Per-lane descriptor `{owner_token:u64, write_cursor:u64, read_cursor:u64}` cache-aligned (no false
+sharing). All fixed-offset, fixed-width, little-endian; `magic`+`version` are an ABI guard checked on attach.
 
 Each lane is a byte-ring of length-prefixed records `[len:u32][payload:len]`. A record that would straddle
 the wrap boundary is preceded by a skip-to-start sentinel (`len = 0xFFFFFFFF`) rather than split. Lane
@@ -69,38 +80,45 @@ foreign/static memory — the GC neither scans nor moves it (NFR-MEM).
 The path is multi-producer (several same-host participants may target one receiver) / single-consumer
 (one receive-loop drains). v1 avoids MPSC by giving **each sending participant its own SPSC lane**:
 
-- **Lane claim (once, at attach):** a sender CASes its `owner_token` into a free lane slot
-  (`dds.pal:cas-sap-u64` on the lane's `owner_token` offset). One CAS per (sender,receiver) pair for the
-  life of the connection — not per message.
+- **Lane claim (once, at attach):** under the segment's pshared mutex, the sender scans lanes for its
+  `owner_token` (already-claimed → reuse) else a free slot (`owner_token`==0), claims it via `store-sap-u64`,
+  and unlocks. One mutex-guarded claim per (sender,receiver) pair for the life of the connection — off the
+  hot path, so **no foreign-SAP CAS is needed** (this gives Clasp full parity; SBCL could use `cas-sap-u64`
+  but the uniform mutex path is simpler).
 - **Enqueue (SPSC, no CAS):** copy `[len][payload]` at `write_cursor mod capacity`, then a
   **store-release** publishes the advanced `write_cursor` (`dds.pal:fence :release` — now a real CPU
   barrier — before the aligned 64-bit cursor store). Single producer per lane ⇒ no contended index, no
   compare-and-swap on the hot path.
 - **Drain (SPSC, no CAS):** the receiver does a **load-acquire** on each lane's `write_cursor` (aligned
   64-bit load then `dds.pal:fence :acquire`) before reading records up to it, then advances `read_cursor`.
-- The receive-loop round-robins the K lanes on each semaphore wake.
+- The receive-loop round-robins the K lanes on each condvar wake.
 
-This design needs **only** the real `fence` + a one-time foreign-SAP `cas` (lane claim) this WP implements
-as the M1 atomics fast path; steady-state enqueue/drain are lock-free with aligned 64-bit cursors and no
-per-message CAS. No PROCESS_SHARED mutex (it would be more surface *and* carries an owner-death deadlock
-macOS cannot make robust), and the lane model has **no owner-death deadlock**. Cost: a fixed cap of **K**
-concurrent same-host senders per receiver (K configurable, default 32); the K+1-th sender falls back to
-UDP. Alternatives (single lock-free CAS-MPSC byte-ring; PROCESS_SHARED-mutex ring; or — if Clasp foreign
-atomics fall short — a semaphore-locked MPSC ring as the Clasp path) are deferred unless the bench shows
-the lane model is the bottleneck (FR-LANG-7 — no perf change on intuition).
+Steady-state enqueue/drain are lock-free — aligned 64-bit `store`/`load` + the real `fence`, no per-message
+CAS; the only lock is the pshared mutex for the one-time lane claim. So the ring needs **no foreign-SAP CAS
+at all**, and **SBCL and Clasp are at full parity** (the A4 Clasp foreign-CAS gap is irrelevant here).
+`cas-sap-u64`/`atomic-incf-sap-u64` (A3) remain valid PAL primitives kept for a future lock-free-MPSC
+optimization, unused by this ring. Cost: a fixed cap of **K** concurrent same-host senders per receiver (K
+configurable, default 32); the K+1-th sender falls back to UDP. The single lock-free CAS-MPSC byte-ring
+alternative is deferred unless the bench shows the lane model is the bottleneck (FR-LANG-7 — no perf change
+on intuition). bordeaux-threads v2 atomics are **not** used (heap `atomic-integer` objects cannot live in
+shared memory or be CAS'd cross-process).
 
 ## Send / receive (engine untouched)
 - `make-shmem-transport(&key participant-guid host-uuid capacity lane-count)`: `shm-create` this
-  participant's receive segment + `sem-create` its semaphore; build a `transport` with `:kind :shmem`,
-  `:locator-kind :shmem`, `:max-message-size` = `max_record`, and the closures below.
+  participant's receive segment, then `pshared-mutex-init`/`pshared-cond-init` its in-segment notify block;
+  build a `transport` with `:kind :shmem`, `:locator-kind :shmem`, `:max-message-size` = `max_record`, and
+  the closures below.
 - `send(locator buffer off len)`: resolve `locator` → segment name; `shm-attach` (cached per-transport by
   name in a hash table populated off the hot path); **bounds-check `len ≤ max_record`** before any write;
-  enqueue into this sender's lane; `sem-post`. Lane full ⇒ return a reject sentinel.
-- `receive-loop`: `sem-wait` (bounded timeout for clean shutdown) → drain all committed records across all
-  lanes → hand each record to the **existing `%handle-datagram`** callback → every current
-  RTPS/reliability/discovery/lifecycle behaviour runs over SHMEM with zero engine changes.
-- `open-receive-resource` → this segment's SHMEM locator (for SPDP/SEDP advertisement). `close` → stop the
-  loop, detach all attached segments, `shm-destroy`+`sem-unlink` the own segment.
+  enqueue into this sender's lane; then `pshared-lock` + `pshared-cond-signal` + `pshared-unlock` the
+  destination's notify block. Lane full ⇒ return a reject sentinel.
+- `receive-loop`: under `pshared-lock`, `pshared-cond-wait` until a lane has data or `stop` is set, then
+  drain all committed records across all lanes → hand each record to the **existing `%handle-datagram`**
+  callback → every current RTPS/reliability/discovery/lifecycle behaviour runs over SHMEM with zero engine
+  changes.
+- `open-receive-resource` → this segment's SHMEM locator (for SPDP/SEDP advertisement). `close` → set
+  `stop`, broadcast, join the receive thread, `pshared-destroy`, detach all attached segments, `shm-destroy`
+  the own segment.
 - `stop-node` **joins the receive-loop thread before** detach/destroy (the same ordering rule the existing
   receiver-thread teardown uses — avoids the use-after-free a prior session hit by freeing buffers before
   joining).
@@ -122,7 +140,7 @@ locator still matches and talks over UDP.
 - Lane/ring full ⇒ reject ⇒ **RESOURCE_LIMITS / UDP fallback for that datagram**; reliable samples remain
   in the HistoryCache and repair via HEARTBEAT/ACKNACK (RTPS 2.5 §8.4.2.2). **Never a GC-heap fallback**
   (NFR-MEM).
-- Stale segments/semaphores left by a crashed peer are reclaimed on the next `shm-create`: `O_EXCL` fails
+- Stale segments (carrying their in-segment pthread mutex/cond) left by a crashed peer are reclaimed on the next `shm-create`: `O_EXCL` fails
   ⇒ `shm_unlink` + recreate.
 
 ## Hot-path purity & memory (gate-hotpath, mem)
@@ -136,7 +154,7 @@ per-sample CLOS, 0 bytes/sample steady-state** (the ring is preallocated foreign
   round-trip, multi-sample, large-sample via DATA_FRAG-over-SHMEM) — same `%handle-datagram`, so a pass
   proves engine-transparency.
 - **Cross-process:** two separate Lisp processes attach to one segment and exchange samples (the real
-  proof; loopback within one image does not exercise cross-process mmap/semaphore).
+  proof; loopback within one image does not exercise cross-process mmap/condvar).
 - **Concurrency stress:** N sender processes → 1 receiver; assert no loss, no corruption, no deadlock (the
   SPSC-lane correctness gate).
 - **Security:** fuzz the ring record parser (malformed `len`, wrap-sentinel edge, oversized record) under
@@ -148,6 +166,6 @@ per-sample CLOS, 0 bytes/sample steady-state** (the ring is preallocated foreign
   NFR-PORT gap (the licensed build is absent in this environment), mirroring the existing Clasp latitude.
 
 ## Open / deferred (explicit, not silent)
-- Linux `futex` notification fast-path — deferred, measured follow-up; named semaphores are v1.
+- Linux `futex` notification fast-path — deferred, measured follow-up; a pthread PROCESS_SHARED condvar is v1.
 - K-sender cap overflow → UDP fallback is logged, not silent (no hidden capacity ceiling).
 - AllegroCL perf-gate parity — blocked on the licensed build; gap documented per NFR-PORT.

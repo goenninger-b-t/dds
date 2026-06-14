@@ -54,6 +54,40 @@ and the `send`/`close` closures capture it.
 | `dds.xport.udp:run-udp-transport-test` | function | Transport-level UDP loopback self-test (sender `send` -> receiver recv on 127.0.0.1); returns `T`. |
 | `dds.xport.udp:run-udp-receiver-test` | function | Receiver-thread loopback self-test; a background thread receives a datagram and records it; returns `T`. |
 
+### Shared-memory transport — `dds.xport.shmem`
+
+The same-host intra-host transport (FR-XPORT-2). It delivers the **identical** serialized RTPS datagrams
+through a POSIX shared-memory ring instead of a UDP socket, and like every transport it constructs one
+frozen `dds.xport:transport` record — the RTPS engine and `%handle-datagram` are untouched. It is the
+patent-clean foundation a future Zero-Copy path (FR-PF-3) builds on, reusing this segment + notification
+machinery. See [When SHMEM engages](#when-shmem-engages-and-what-stays-on-udp) and
+[SHMEM architecture](#shmem-architecture) below for the selection rule and the segment layout.
+
+| Symbol | Kind | Description |
+|---|---|---|
+| `dds.xport.shmem:make-shmem-transport` | function | `&key participant-guid host-uuid lane-count capacity` — create this participant's SHMEM **receive** segment (header + pshared notify block + `lane-count` per-sender SPSC lanes) and wrap it in a `transport` record whose `send` attaches to the destination segment and enqueues. `capacity` is the per-lane ring size in bytes (multiple of 8; default 65536); `lane-count` defaults 8. Returns a `shmem-transport`. |
+| `dds.xport.shmem:shmem-transport` | struct type | Owns a participant's receive segment + the frozen `transport` record + a per-sender attach cache + this sender's lane token + the drain sink + the receiver thread (the bits that have no slot in the frozen record). |
+| `dds.xport.shmem:shmem-transport-transport` | accessor | The frozen `dds.xport:transport` record to plug into the engine. |
+| `dds.xport.shmem:shmem-transport-locator` | function | `(st)` — the `shmem-locator` a peer uses to send to `st` (segment name + host-uuid + ring geometry). |
+| `dds.xport.shmem:shmem-locator` | struct type | A SHMEM send destination: receiver segment `name` + same-host `host-uuid` + ring `lane-count`/`capacity`. |
+| `dds.xport.shmem:make-shmem-locator` | function | `&key name host-uuid lane-count capacity` — construct a `shmem-locator`. |
+| `dds.xport.shmem:shmem-locator-name` / `-host-uuid` / `-lane-count` / `-capacity` | accessors | The locator's fields. |
+| `dds.xport.shmem:seg-name-for-guid` | function | `(guid)` — the deterministic receive-segment name a peer's 12-octet GUID prefix maps to. A sender derives the destination segment name from the remote participant's prefix, so the discovery layer addresses a same-host peer with `make-shmem-locator :name (seg-name-for-guid remote-prefix)`. |
+| `dds.xport.shmem:start-shmem-receiver` | function | `(st on-datagram)` — spawn the receive thread: it blocks on the segment's pshared cond until a lane has data (or stop), then drains **all** lanes and calls `(on-datagram sink size)` per record. Uses the conditional-wakeup parked flag so a busy sender skips the futex wake while the thread is draining. |
+| `dds.xport.shmem:stop-shmem-receiver` | function | `(st)` — signal the receive thread to exit (set stop + broadcast) and **join it before** any segment teardown (no use-after-free). |
+| `dds.xport.shmem:shmem-receive-drain` | function | `(st on-datagram)` — drain all lanes of `st`'s own receive segment once, calling `on-datagram` per record (the single-shot drain the threaded receiver wraps). |
+| `dds.xport.shmem:shmem-transport-close` | function | `(st)` — stop the receiver, destroy the pshared objects, detach all attached + own segments, and unlink the own segment. |
+| `dds.xport.shmem:shm-attach-by-name-reliable-p` | function | `()` — `T` except on Clasp/macOS-arm64, whose plain `cffi:foreign-funcall` mispasses `shm_open`'s variadic `mode_t` so a created segment is unre-openable by name (NFR-PORT gap, ADR 0013). The transport requires by-name attach, so its loopback tests pass-skip where this is `NIL`. A runtime check, not a reader conditional. |
+| `dds.xport.shmem:run-shmem-transport-test` | function | Transport-level SHMEM loopback in one image (tx `send` -> rx own-segment drain); returns `T`. Pass-skips on the Clasp/macOS by-name-attach gap. |
+| `dds.xport.shmem:run-shmem-receiver-test` | function | Receiver-thread loopback self-test; returns `T`. Pass-skips on the same gap. |
+| `dds.xport.shmem:run-shmem-stress-test` | function | Contention self-test: N sender lanes -> one receiver, asserting no loss/corruption/deadlock; returns `T`. |
+
+The transport selection is a discovery-layer policy, controlled by one special variable:
+
+| Symbol | Kind | Description |
+|---|---|---|
+| `dds.disc:*shmem-enabled*` | special var | Master switch (read once per node at `make-disc-node`) for routing same-host user DATA over SHMEM instead of UDP (FR-XPORT-2). Default `T` on SBCL everywhere and Clasp/Linux (where the SHMEM package is present and by-name attach works); `NIL` on Clasp/macOS (the `shm_open` variadic-mode ABI gap, ADR 0013). Rebind to `NIL` before `make-disc-node` to force the all-UDP path. Not a wire constant — a local transport-selection policy. |
+
 ### The PAL contract — `dds.pal`
 
 The single frozen L0 surface (IMPLEMENTATION-PLAN §7.6). Everything above L0 depends only on these symbols;
@@ -84,9 +118,36 @@ per-impl bodies live in `pal-<impl>.lisp`.
 
 | Symbol | Kind | Description |
 |---|---|---|
-| `dds.pal:cas` | function | `(place-fn old new)` — atomic compare-and-swap. **M0 stub: signals `pal-unimplemented`** (native fast path lands in M1). |
-| `dds.pal:atomic-incf` | function | `(place-fn &optional delta)` — atomic increment. **M0 stub: signals `pal-unimplemented`** (native fast path lands in M1). |
-| `dds.pal:fence` | function | `(&optional kind)` — memory fence of the given `kind`. M0 no-op; a native barrier fast path lands in M1. |
+| `dds.pal:cas` | function | `(place-fn old new)` — generic place-based atomic compare-and-swap. Still a stub (signals `pal-unimplemented`); it has no callers — the SHMEM ring uses the SAP-targeted forms below. The generic stub is kept (removing it would break the frozen contract, ADR 0002). |
+| `dds.pal:atomic-incf` | function | `(place-fn &optional delta)` — generic place-based atomic increment. Still a stub (signals `pal-unimplemented`), no callers; superseded by the SAP-targeted form below. |
+| `dds.pal:fence` | function | `(&optional kind)` — **real memory barrier (M1):** `:acquire` = load barrier, `:release` = store barrier, `:full` = full barrier. SBCL maps to `sb-thread:barrier`; the SHMEM ring uses it for the release/acquire publish/consume of lane cursors and the full StoreLoad fence of the conditional-wakeup handshake. |
+
+**SAP-targeted 64-bit atomics (M1 fast path, ADR 0013)** — the SHMEM ring needs true hardware atomics on a
+raw foreign 64-bit cell addressed by `(sap, byte-offset)`, which the generic `place-fn` stubs cannot lower.
+
+| Symbol | Kind | Description |
+|---|---|---|
+| `dds.pal:load-sap-u64` | function | `(sap offset)` — aligned 64-bit read of the foreign location at `sap+offset` (bytes). |
+| `dds.pal:store-sap-u64` | function | `(sap offset value)` — aligned 64-bit write of `value` at `sap+offset`. |
+| `dds.pal:cas-sap-u64` | function | `(sap offset old new)` — atomic compare-and-swap of the u64 at `sap+offset`; returns the PREVIOUS value (= `old` on success). **SBCL only** (`sb-ext:cas` over `sb-sys:sap-ref-64`); **Clasp signals `pal-unimplemented`** — Clasp has no usable hardware atomic over a raw foreign cell (NFR-PORT gap, ADR 0013). Unused by the v1 ring (the lane claim is mutex-guarded), kept for a future lock-free-MPSC optimization. |
+| `dds.pal:atomic-incf-sap-u64` | function | `(sap offset delta)` — atomically add `delta` to the u64 at `sap+offset`; returns the NEW value. SBCL only (CAS-retry fetch-add); Clasp signals `pal-unimplemented` (same gap). Unused by the v1 ring. |
+
+**POSIX shared memory + cross-process notification (ADR 0013)** — the SHMEM transport's segment and its
+in-segment `PTHREAD_PROCESS_SHARED` mutex/condvar. All thin CFFI wrappers; no external library dependency.
+
+| Symbol | Kind | Description |
+|---|---|---|
+| `dds.pal:shm-create` | function | `(name size)` — `shm_open(O_CREAT\|O_EXCL\|O_RDWR,0600)` + `ftruncate` + `mmap(MAP_SHARED)`; returns a segment handle. The creator. A stale segment from a crashed peer is reclaimed (`O_EXCL` fails -> `shm_unlink` + recreate). |
+| `dds.pal:shm-attach` | function | `(name size)` — `shm_open(O_RDWR)` + `mmap`; a sender attaches to a receiver's existing segment by name. |
+| `dds.pal:shm-detach` | function | `(handle)` — `munmap` + `close`. |
+| `dds.pal:shm-destroy` | function | `(name)` — `shm_unlink`. |
+| `dds.pal:shm-sap` | function | `(handle)` — the `mmap` base SAP, for the typed `sap-ref-*`/`cffi:mem-ref` reads/writes the ring uses. |
+| `dds.pal:shm-segment-size` | function | `(handle)` — the segment's byte length. |
+| `dds.pal:pshared-mutex-init` / `pshared-cond-init` | functions | `(sap offset)` — creator-only init of a `PTHREAD_PROCESS_SHARED` mutex / condvar living **in** the segment. |
+| `dds.pal:pshared-lock` / `pshared-unlock` | functions | `(sap offset)` — lock / unlock the in-segment mutex. |
+| `dds.pal:pshared-cond-wait` | function | `(sap cond-offset mutex-offset)` — wait on the in-segment cond, releasing the mutex. |
+| `dds.pal:pshared-cond-signal` / `pshared-cond-broadcast` | functions | `(sap offset)` — wake one / all waiters on the in-segment cond. |
+| `dds.pal:pshared-destroy` | function | `(sap mutex-offset cond-offset)` — destroy the in-segment mutex + cond. |
 
 **Threads, locks, condition variables**
 
@@ -253,22 +314,162 @@ The transport record wraps these, but the PAL UDP layer is usable directly — t
     (dds.pal:udp-close rx)))
 ```
 
+### SHMEM transport — same-host send through the ring
+
+Two participants on one host: the receiver creates its segment, a background receive thread cond-waits and
+drains, and the sender attaches by the receiver's locator and enqueues. The engine never sees the difference —
+the sender calls the same `dds.xport:send`. Adapted from `dds.xport.shmem:run-shmem-receiver-test`
+(`src/dds-tests/echo-test.lisp`); it pass-skips on the Clasp/macOS by-name-attach gap (ADR 0013).
+
+```lisp
+(when (dds.xport.shmem:shm-attach-by-name-reliable-p)        ; skip on the Clasp/macOS NFR-PORT gap
+  (let ((rx (dds.xport.shmem:make-shmem-transport
+             :participant-guid (make-array 12 :element-type '(unsigned-byte 8) :initial-element 1)
+             :host-uuid 7))
+        (tx (dds.xport.shmem:make-shmem-transport
+             :participant-guid (make-array 12 :element-type '(unsigned-byte 8) :initial-element 2)
+             :host-uuid 7))
+        (received nil))
+    (unwind-protect
+         (progn
+           ;; the receiver's background thread blocks on the pshared cond, then drains all lanes
+           (dds.xport.shmem:start-shmem-receiver
+            rx (lambda (sink size)
+                 (setf received (cons size (aref (dds.core.buffer:octet-buffer-vec sink) 0)))))
+           (let ((buf (dds.core.buffer:make-octet-buffer 64)))
+             (let ((c (dds.core.buffer:cursor buf)))
+               (dds.core.buffer:put-u8 c #xDE) (dds.core.buffer:put-u8 c #xAD))
+             ;; dispatch-free send to the receiver's SHMEM locator — same call as UDP
+             (dds.xport:send (dds.xport.shmem:shmem-transport-transport tx)
+                             (dds.xport.shmem:shmem-transport-locator rx)
+                             buf 0 2))
+           (loop repeat 100 until received do (sleep 0.02))
+           received)   ; => (2 . #xDE)
+      (dds.xport.shmem:shmem-transport-close tx)
+      (dds.xport.shmem:shmem-transport-close rx))))
+```
+
+In a live deployment you never construct the locator by hand: discovery does it. With `dds.disc:*shmem-enabled*`
+`T`, two participants that share a host-uuid and have each advertised a SHMEM locator in SPDP/SEDP auto-route
+their bulk user DATA through the ring; everything else stays on UDP. The real **two-process** round-trip
+(separate Lisp images attaching to one segment — the proof loopback within one image cannot give) is the
+`make shmem-xproc` harness (`scripts/shmem-roundtrip.sh`); the latency/throughput numbers are `make bench-shmem`.
+
+## SHMEM architecture
+
+`make-shmem-transport` creates **one receive segment per participant** (the receiver creates it, senders
+attach). The segment is laid out as a fixed-offset, little-endian region:
+
+```
+[ Header (magic/version/lane_count/capacity/max_record) | Notify block | K SPSC lanes ]
+```
+
+- **Notify block** — a `PTHREAD_PROCESS_SHARED` mutex + condition variable + a `stop` flag + a `parked` flag,
+  each at a fixed cache-aligned offset, the block sized to the per-platform max pthread struct sizes so one
+  layout serves macOS and Linux. (Named POSIX semaphores were rejected: `sem_open` cannot be driven from the
+  Lisp runtime on macOS arm64 — its variadic args are mispassed. The non-variadic `pthread_*` calls work from
+  both SBCL and Clasp on macOS + Linux; libpthread is already linked.)
+- **K per-sender SPSC lanes** — the path is multi-producer (several same-host participants may target one
+  receiver) / single-consumer (one receive loop drains). v1 sidesteps a lock-free MPSC ring by giving **each
+  sending participant its own SPSC lane**. A lane is a byte-ring of length-prefixed records `[len][payload]`; a
+  record that would straddle the wrap boundary is preceded by a skip-to-start sentinel rather than split. Lane
+  capacity derives from the writer's `RESOURCE_LIMITS` QoS, so the memory-level and DDS-level limits agree. The
+  whole segment is `mmap`-backed foreign/static memory — the GC neither scans nor moves it (NFR-MEM).
+
+**Lane claim is mutex-guarded** — at attach, a sender takes the segment's pshared mutex once, finds its
+existing lane (reuse) or the first free one, and claims it. One claim per (sender, receiver) pair for the life
+of the connection, off the hot path — so **no foreign-SAP compare-and-swap is needed**, which gives SBCL and
+Clasp full parity at that layer.
+
+**Steady-state enqueue/drain are lock-free** — the producer copies the record then publishes the advanced
+write-cursor with a *release* fence; the consumer does an *acquire* load of the write-cursor before reading up
+to it. Aligned 64-bit `load`/`store` + the real `dds.pal:fence`, no per-message CAS.
+
+**Conditional (parked-flag) wakeup** — naively the sender would lock + signal the condvar (a futex syscall) on
+every send, even into a busy receiver. Instead the receiver publishes `parked = 1` strictly under the mutex
+before it actually `cond-wait`s, full-fences, and **re-checks** the data predicate; the sender enqueues,
+full-fences, reads `parked`, and signals **only** when `parked = 1`. This Dekker StoreLoad handshake makes a
+skipped signal provably never a lost wakeup (at least one side observes the other), so a tight blast into a
+draining receiver does **no** per-message futex wake — the WP-SHMEM raw-send throughput fix.
+
+**The ring is an untrusted parser surface** — a segment written by another process is treated exactly like the
+wire: every `len`/offset is bounds-checked against the lane extents before it is read, even at `(safety 0)`
+(NFR-SEC-POSTURE). A lane/ring-full enqueue returns a reject sentinel, which the discovery layer maps to a UDP
+fallback for that datagram (the reliable sample stays in the HistoryCache and repairs via HEARTBEAT/ACKNACK) —
+**never** a GC-heap fallback.
+
+### When SHMEM engages, and what stays on UDP
+
+SHMEM is the same-host data path; **UDP is the fallback and carries everything else**. A peer is sent bulk user
+DATA over SHMEM iff both of the following hold (`dds.disc` resolves this per remote, then caches the verdict):
+
+1. it shares this node's **host-uuid** — a u64 from the MD5 of the hostname (`dds.disc::%host-uuid`),
+   advertised in SPDP, so two participants on one host agree without an out-of-band exchange; and
+2. it advertised a **SHMEM locator** (a vendor `Locator_t`) beside its UDP locator in discovery.
+
+Discovery, the metatraffic (SPDP/SEDP) channel, and the reliable HEARTBEAT/ACKNACK handshake **always** ride
+UDP in v1 — only bulk user DATA takes SHMEM. The SHMEM locator is purely additive: a cross-vendor peer (or any
+peer that does not share the host-uuid) sees an unknown locator kind, ignores it, and matches + talks over UDP.
+Cross-vendor SHMEM is out of scope by construction (RTI and Fast DDS use different, proprietary segments and
+locator kinds; there is no standard RTPS SHMEM wire format).
+
+The selection vendor constants are **ours**, pinned in ADR 0013 (not OMG spec clauses): the SHMEM `Locator_t`
+kind `0x47420001` (`dds.rtps.discovery:+locator-kind-shmem+`) and `PID_SHMEM_HOST_UUID` `0x8040`
+(`dds.rtps.message:+pid-shmem-host-uuid+`, in the `0x8000` vendor PID range).
+
+### Performance characteristics
+
+Measured SBCL/macOS (Apple M5), `bench/report/2026-06-14-wp-shmem.md`:
+
+- **Latency: a clear win.** SHMEM cuts the one-way median (p50) latency to **1.35x–1.94x** lower than UDP
+  loopback (largest for the smallest payloads), with a p99 comparable-to-better and a *lower* worst-case max
+  tail. For one outstanding message the pshared mutex is uncontended and a userspace condvar wake beats two
+  trips through the kernel networking stack.
+- **Throughput: end-to-end reliable samples/s is UDP-handshake-bound, not SHMEM-bound.** The
+  `delivered-samples/s` over the reliable data plane is dominated by the HEARTBEAT/ACKNACK round-trip and the
+  receiver poll granularity — both transports gate on the same handshake, so the coarse harness metric does not
+  surface the transport difference (the UDP baseline itself swung ~10x run-to-run with no code change). A direct
+  send-path micro-bench (no reliable handshake) isolates the conditional-wakeup optimization at **~1.4x–1.8x**
+  raw SHMEM send throughput with no record loss. The remaining transport follow-up is a lock-free-MPSC ring; the
+  reliable-handshake/poll-granularity cost is a separate engine/DCPS follow-up.
+- **Allocation: 0 bytes/sample on the SHMEM send path.** The ring is preallocated foreign/static, the enqueue is
+  raw SAP writes, and the destination is resolved once and cached per remote — steady-state SHMEM `send` does no
+  per-datagram heap allocation (it now allocates at the UDP baseline per sample). The residual ~9–11 KB/sample
+  seen end-to-end is the v1 disc-layer data-plane copy, identical on both transports and explicitly *not* the
+  gated hot path; the gated XCDR codec is already 0-alloc (`make mem`).
+
+### NFR-PORT gap — Clasp/macOS-arm64
+
+**SBCL has full SHMEM on every platform.** On **Clasp/macOS-arm64** the transport is unavailable: Clasp's CFFI
+cannot reliably pass `shm_open`'s variadic `mode_t` argument on arm64 (verified ~40% flaky), so a created
+segment is unre-openable by name — the cross-process attach the transport depends on. There, `*shmem-enabled*`
+defaults `NIL` and **UDP carries everything** (`shm-attach-by-name-reliable-p` returns `NIL`; the SHMEM tests
+pass-skip cleanly). **Clasp/Linux** is expected to work via the register varargs ABI but is **pending
+verification on a Linux host**. (A separate, deeper Clasp gap — no usable hardware atomic over a raw foreign
+cell — keeps the SAP-CAS primitives SBCL-only, but the v1 ring's mutex-guarded claim means that gap does not
+affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and foreign-atomics latitude (NFR-PORT).
+
 ## Notes / status
 
 - **Landed:** UDPv4 unicast and multicast over each implementation's native `sb-bsd-sockets` (SBCL contrib;
-  Clasp bundled), the pluggable `transport` record, and the synchronous mock transport. Multicast (`SO_REUSEPORT`
-  + `IP_ADD_MEMBERSHIP` + loopback) is wired in the PAL for SPDP discovery; the OS-specific socket-option
-  constants are gated by **OS** reader conditionals (`#+darwin`/`#-darwin`) in `pal-net.lisp`, not impl ones.
-- **Planned:** SHMEM/zero-copy and TCP transports, and a raw `recvmmsg`/`sendmmsg`/iovec batched send/recv fast
-  path. None are present yet — today's UDP send is one datagram per `socket-send`.
+  Clasp bundled), the pluggable `transport` record, the synchronous mock transport, and the **shared-memory
+  intra-host transport** (FR-XPORT-2; auto-selected for same-host user DATA, UDP fallback; SBCL full, Clasp/macOS
+  NFR-PORT gap — see [SHMEM architecture](#shmem-architecture) above). Multicast (`SO_REUSEPORT` +
+  `IP_ADD_MEMBERSHIP` + loopback) is wired in the PAL for SPDP discovery; the OS-specific socket-option constants
+  are gated by **OS** reader conditionals (`#+darwin`/`#-darwin`) in `pal-net.lisp`, not impl ones.
+- **Planned:** Zero-Copy-over-SHMEM (reuses this segment + notification machinery), a TCP transport, a Linux
+  `futex` notification fast-path for SHMEM, a lock-free-MPSC ring, and a raw `recvmmsg`/`sendmmsg`/iovec batched
+  send/recv fast path. The UDP send is one datagram per `socket-send` (small samples are coalesced first).
 - **Per-impl rule:** `#+sbcl`/`#+clasp` reader conditionals live **only** under `dds-pal/` (`pal-sbcl.lisp` and
   the per-impl PALs). The shared `pal-net.lisp` and everything in `dds-xport` carry none. CI lint enforces this
   (NFR-PORT, the operating contract §10).
 - **PAL maturity:** the **SBCL** PAL is the reference; Clasp shares the native socket layer. The **AllegroCL**
-  PAL is a planned target and **not yet present**. Several capabilities are explicit M0 stubs pending M1 native
-  fast paths: `cas` and `atomic-incf` signal `pal-unimplemented`; `fence`, `gc-suggest`, and `with-gc-inhibited`
-  are no-ops; `monotonic-ns` uses the portable real-time clock scaled to ns (a `clock_gettime(CLOCK_MONOTONIC)`
-  fast path is the M1 replacement).
+  PAL is a planned target and **not yet present**. The **M1 atomics fast path landed** with WP-SHMEM (ADR 0013):
+  `fence` is now a real `:acquire`/`:release`/`:full` barrier, and the SAP-targeted 64-bit atomics + POSIX
+  shm/pshared primitives are implemented (SBCL full; Clasp has the SAP-CAS + `shm-create`/macOS gaps noted above).
+  The generic `cas`/`atomic-incf` place stubs remain (no callers; the SAP forms supersede them). `gc-suggest` and
+  `with-gc-inhibited` are still no-ops; `monotonic-ns` uses the portable real-time clock scaled to ns (a
+  `clock_gettime(CLOCK_MONOTONIC)` fast path is a later replacement).
 - **UDP is best-effort by design:** the UDPv4 transport's `send` swallows a `sendto` failure to one destination
   (an unreachable/stale/placeholder locator, e.g. a peer advertising `0.0.0.0`) and returns 0 rather than
   signalling — the reliable RTPS layer recovers via HEARTBEAT/ACKNACK. See the [RTPS engine](rtps-engine.md).

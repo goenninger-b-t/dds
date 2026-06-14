@@ -12,6 +12,7 @@ HOTPATH_FILES=(
   "src/dds-cdr/primitives.lisp"
   "src/dds-rtps/history.lisp"
   "src/dds-rtps/message.lisp"
+  "src/dds-xport/shmem.lisp"
 )
 # Generated-codec output dir is scanned too, once it exists.
 if [[ -d src/dds-gen/generated ]]; then

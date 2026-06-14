@@ -355,6 +355,129 @@
         (format t "~&[sub] stopped; received ~d shapes.~%" seen))
       t)))
 
+;;; ---- FR-XPORT-2: real two-OS-process cross-process SHMEM round-trip (WP-SHMEM Task F1) ----
+;;; Two SBCL processes on THIS host get the same host-uuid (MD5 of hostname) automatically, each
+;;; brings up a SHMEM receive segment (*shmem-enabled* default-on for SBCL), and after they discover
+;;; each other over loopback UDP (deterministic domain-derived ports + :peers — no multicast, so the
+;;; macOS app-firewall LAN-UDP drop is irrelevant) the publisher routes user DATA over shared memory.
+;;; The pub's disc-node-shmem-sends > 0 proves SHMEM (not UDP) carried the data across the OS boundary.
+
+(defun* %shmem-xproc-port (domain participant-id)
+    (function ((integer 0) (integer 0)) (unsigned-byte 16))
+  "The loopback metatraffic port this harness binds for PARTICIPANT-ID on DOMAIN: the RTPS 2.5 §9.6.1.1
+   SPDP unicast port (PB + DG*domain + d1 + PG*participantId). Deterministic so the two processes
+   coordinate via :peers without exchanging ports out of band (sub = id 0, pub = id 1)."
+  (dds.rtps.message:spdp-unicast-port domain participant-id))
+
+(defun* run-shmem-xproc-sub (&key (domain 0) (threshold 20) (seconds 20)
+                                  (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:threshold (integer 1)) (:seconds (integer 1))
+                    (:advertise-address string)) t)
+  "FR-XPORT-2 cross-process SHMEM subscriber half (WP-SHMEM Task F1): a SHMEM-enabled disc-node with a
+   reliable Square/ShapeType reader, bound to the deterministic loopback port for participant 0 and
+   pointing :peers at the publisher (participant 1). Loopback-only (no multicast) sidesteps the macOS
+   app-firewall LAN-UDP drop. Spins to the SECONDS deadline collecting samples, then prints
+   SHMEM-SUB-RECEIVED: <n> and uiop:quit 0 iff n >= THRESHOLD else 1. Same host as the pub => same
+   host-uuid => the pub's user DATA arrives over shared memory, which this node's SHMEM receiver feeds
+   into the identical engine path. Intended to be launched by scripts/shmem-roundtrip.sh."
+  (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x53) :domain domain
+                                       :host "127.0.0.1" :port (%shmem-xproc-port domain 0)
+                                       :advertise-address advertise-address
+                                       :peers (list (cons "127.0.0.1" (%shmem-xproc-port domain 1))))))
+    (dds.disc:add-local-reader node :topic "Square" :type "ShapeType"
+                               :reliability dds.rtps.discovery:+reliability-reliable+
+                               :type-information (%shape-type-information))
+    (dds.disc:enable-subscriber node)
+    (dds.disc:start-node node)
+    (format t "~&[shmem-sub] Square/ShapeType domain=~d port=~d shmem=~:[OFF~;ON~] threshold=~d (loopback :peers, no multicast).~%"
+            domain (%shmem-xproc-port domain 0) (and (dds.disc:disc-node-shmem node) t) threshold)
+    (force-output)
+    (let ((printed (make-hash-table :test 'eql)) (seen 0)
+          (last 0) (start (get-internal-real-time)))
+      (unwind-protect
+           (loop
+             (setf last (%reannounce node last))
+             (dolist (sn (sort (dds.disc:node-sample-sns node) #'< :key #'dds.disc:node-sample-key-sn))
+               (unless (gethash (dds.disc:node-sample-key-sn sn) printed)
+                 (setf (gethash (dds.disc:node-sample-key-sn sn) printed) t)
+                 ;; an unparseable sample must never crash the proof loop — skip it
+                 (handler-case
+                     (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-shape-type)))
+                       (declare (type shape-type s))
+                       (when (shape-type-color s) (incf seen)))   ; parse validates the sample; touch a field so it is used
+                   (error (e)
+                     (format t "~&[shmem-sub] sn=~d: skipped unparseable sample (~a)~%"
+                             (dds.disc:node-sample-key-sn sn) (type-of e))))))
+             (when (>= seen threshold) (return))
+             (when (> (/ (- (get-internal-real-time) start) internal-time-units-per-second) seconds)
+               (return))
+             (sleep 0.02))
+        (dds.disc:stop-node node))
+      (format t "~&SHMEM-SUB-RECEIVED: ~d~%" seen)
+      (force-output)
+      (uiop:quit (if (>= seen threshold) 0 1)))))
+
+(defun* run-shmem-xproc-pub (&key (domain 0) (color "BLUE") (count 60) (rate 30)
+                                  (match-timeout 15) (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:color string) (:count (integer 1)) (:rate (integer 1))
+                    (:match-timeout (integer 1)) (:advertise-address string)) t)
+  "FR-XPORT-2 cross-process SHMEM publisher half (WP-SHMEM Task F1): a SHMEM-enabled disc-node with a
+   reliable Square/ShapeType writer, bound to the deterministic loopback port for participant 1 and
+   pointing :peers at the subscriber (participant 0). Loopback-only (no multicast). Waits up to
+   MATCH-TIMEOUT s for the subscriber's reader to match, then publish-sample COUNT times at RATE/s (the
+   pacing lets the reliable handshake keep up), then prints SHMEM-PUB-SENDS: <shmem-sends> / <COUNT> and
+   uiop:quit (0 iff shmem-sends > 0, i.e. SHMEM actually carried user DATA, else 2). Same host as the sub
+   => same host-uuid => the writer routes user DATA over shared memory and disc-node-shmem-sends counts
+   each such datagram. Intended to be launched by scripts/shmem-roundtrip.sh after the sub binds."
+  (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
+                                       :host "127.0.0.1" :port (%shmem-xproc-port domain 1)
+                                       :advertise-address advertise-address
+                                       :peers (list (cons "127.0.0.1" (%shmem-xproc-port domain 0))))))
+    (dds.disc:add-local-writer node :topic "Square" :type "ShapeType"
+                               :reliability dds.rtps.discovery:+reliability-reliable+
+                               :type-information (%shape-type-information))
+    (dds.disc:enable-publisher node)
+    (dds.disc:start-node node)
+    (format t "~&[shmem-pub] Square/ShapeType domain=~d port=~d shmem=~:[OFF~;ON~] count=~d (loopback :peers, no multicast).~%"
+            domain (%shmem-xproc-port domain 1) (and (dds.disc:disc-node-shmem node) t) count)
+    (force-output)
+    (let ((x 50) (y 50) (dx 3) (dy 2) (period (/ 1.0 rate)) (n 0) (last 0)
+          (start (get-internal-real-time)) (matched nil))
+      (unwind-protect
+           (progn
+             ;; phase 1: announce on the cadence until the sub's reader matches our writer (bounded)
+             (loop
+               (setf last (%reannounce node last))
+               (when (plusp (dds.disc:disc-node-matched-count node)) (setf matched t) (return))
+               (when (> (/ (- (get-internal-real-time) start) internal-time-units-per-second) match-timeout)
+                 (return))
+               (sleep 0.02))
+             (format t "~&[shmem-pub] match=~:[NO~;YES~] after ~,1fs; publishing ~d samples ...~%"
+                     matched (/ (- (get-internal-real-time) start) internal-time-units-per-second) count)
+             (force-output)
+             ;; phase 2: publish COUNT paced samples; keep announcing so SEDP/HEARTBEAT cadence holds
+             (when matched
+               (loop
+                 (setf last (%reannounce node last))
+                 (setf x (+ x dx) y (+ y dy))
+                 (when (or (<= x 0) (>= x 240)) (setf dx (- dx) x (min 240 (max 0 x))))
+                 (when (or (<= y 0) (>= y 240)) (setf dy (- dy) y (min 240 (max 0 y))))
+                 (dds.disc:publish-sample
+                  node (%serialize-payload
+                        (lambda (wc) (serialize-shape-type
+                                      (make-shape-type :color color :x x :y y :shapesize 30)
+                                      wc :xcdr2))))
+                 (incf n)
+                 (when (>= n count) (return))
+                 (sleep period))
+               ;; let the reliable engine drain final ACKNACKs before teardown
+               (loop repeat 25 do (setf last (%reannounce node last)) (sleep 0.02))))
+        (let ((sends (dds.disc:disc-node-shmem-sends node)))
+          (dds.disc:stop-node node)
+          (format t "~&SHMEM-PUB-SENDS: ~d / ~d~%" sends count)
+          (force-output)
+          (uiop:quit (if (plusp sends) 0 2)))))))
+
 ;;; LargeData type: keyed (id) + unbounded octet sequence payload for DATA_FRAG testing.
 ;;; payload is :byte (TK_BYTE) to mirror Connext's `sequence<octet>` (interop/connext/large-data).
 (dds.gen:define-dds-type large-data (:extensibility :final)

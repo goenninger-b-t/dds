@@ -1233,3 +1233,33 @@ pinned to `127.0.0.1`. No change to the NO_KEY mechanism; suite stays 106 green
   delivery): the dispose/unregister lifecycle store + the reliable writer/reader proxy still key by
   SN/EntityId, so two same-EntityId writers still alias in the dispose + ACKNACK/repair paths.
 - 133 green SBCL+Clasp; gate-types+gate-hotpath green.
+
+## M5 (2026-06-14) — WP-SHMEM shared-memory intra-host transport (FR-XPORT-2, ADR 0013)
+
+The shared-memory transport is **clean-room from public, non-proprietary sources only** — no DDS
+vendor's SHMEM/data-sharing implementation was read or copied.
+
+- **POSIX.1-2017 — the sole external source for the segment + notification primitives.** `shm_open`,
+  `ftruncate`, `mmap`/`munmap`, `shm_unlink` (POSIX.1-2017 §3.254, §3.288) for the segment; the
+  `pthread_mutexattr_setpshared` / `pthread_condattr_setpshared` `PTHREAD_PROCESS_SHARED` mutex+condvar
+  family for the in-segment cross-process notification. All are thin CFFI wrappers in `pal-net.lisp`;
+  **no external library dependency** and **no third-party SHMEM code** was consulted. (The named-POSIX-
+  semaphore path provisioned in ADR 0013's Decision was dropped — `sem_open` is undrivable from the Lisp
+  runtime on macOS arm64 — and the pthread pshared path was used instead.)
+- **Each implementation's OWN atomics API** for the M1 fast path: SBCL `sb-ext:cas` / `sb-ext:atomic-incf`
+  over `sb-sys:sap-ref-64` and `sb-thread:barrier` for the real `fence`; Clasp `mp:fence` (the Clasp
+  foreign-place CAS gap is recorded in ADR 0013). These are documented impl internals, not copied code.
+- **The SHMEM segment + ring layout is OURS.** There is **no standard RTPS SHMEM wire format**: RTI and
+  Fast DDS each use a different, proprietary segment and a different vendor locator kind, and the OMG
+  RTPS spec defines none. The segment layout (header + pshared notify block + K per-sender SPSC
+  length-prefixed-record lanes), the conditional-wakeup (parked-flag Dekker StoreLoad) handshake, the
+  ABI magic/version guard, and the selection metadata — the SHMEM `Locator_t` kind `0x47420001` and
+  `PID_SHMEM_HOST_UUID 0x8040` (host-uuid = low 8 octets of the vendored MD5 of the hostname) — are all
+  this project's own design, **pinned in ADR 0013, not taken from any spec clause or vendor artifact**.
+  Cross-vendor SHMEM interop is out of scope by construction (a foreign peer sees an unknown locator
+  kind and falls back to UDP).
+- **No RTI Connext / Fast DDS / Cyclone / OpenDDS source, headers, or generated code** was read or
+  copied for this work package. The transport is validated functionally (in-process + a real two-process
+  cross-image round-trip), under fuzz (the ring record parser), and by an SBCL-vs-UDP-loopback benchmark
+  (`bench/report/2026-06-14-wp-shmem.md`) — none of which involves a vendor artifact.
+- 165 tests green SBCL; gate-types + gate-hotpath + fuzz + mem green.

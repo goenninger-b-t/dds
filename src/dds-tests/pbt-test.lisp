@@ -67,6 +67,107 @@
                :detail (format nil "case ~d falsified for input ~s" i input)))))
   t)
 
+;;; ---- SHMEM ring-drain fuzz ----
+
+(defconstant +fuzz-ring-cap+ 256 "Per-lane ring capacity (bytes) used by the drain fuzz (multiple of 8).")
+(defconstant +fuzz-ring-lanes+ 1 "Lane count for the drain fuzz segment.")
+
+(defun* %fuzz-ring-data-off ()
+    (function () (integer 0))
+  "Byte offset of lane 0's data region in the drain-fuzz segment (1 lane, cap=+fuzz-ring-cap+)."
+  (dds.xport.shmem::%lane-data-off +fuzz-ring-lanes+ 0 +fuzz-ring-cap+))
+
+(defun* %fuzz-ring-write-cursor-off ()
+    (function () (integer 0))
+  "Byte offset of lane 0's write-cursor in the drain-fuzz segment."
+  (+ (dds.xport.shmem::%lane-desc-off 0) dds.xport.shmem::+lane-off-write+))
+
+(defun* %fuzz-ring-read-cursor-off ()
+    (function () (integer 0))
+  "Byte offset of lane 0's read-cursor in the drain-fuzz segment."
+  (+ (dds.xport.shmem::%lane-desc-off 0) dds.xport.shmem::+lane-off-read+))
+
+(defun* %adversarial-cursor (prng)
+    (function (prng) (unsigned-byte 64))
+  "A pseudo-random adversarial cursor value from the PRNG: uniform u64 or a boundary case (0, cap, huge)."
+  (let ((pick (prng-int prng 0 7)))
+    (case pick
+      (0 0)
+      (1 +fuzz-ring-cap+)
+      (2 (* 10 +fuzz-ring-cap+))
+      (3 (1- +fuzz-ring-cap+))
+      (4 (ash 1 63))
+      (5 (1- (ash 1 64)))
+      (t (prng-u64 prng)))))
+
+(defun* gen-ring-drain-fuzz (prng)
+    (function (prng) list)
+  "A (w r seed) triple for one drain-fuzz iteration: adversarial write/read cursors + a data-fill seed."
+  (list (%adversarial-cursor prng) (%adversarial-cursor prng) (prng-next prng)))
+
+(defun* %fill-ring-data-random (sap seed)
+    (function (t (unsigned-byte 32)) t)
+  "Overwrite the lane-0 data region with deterministic pseudo-random bytes derived from SEED."
+  (let ((data-off (%fuzz-ring-data-off)) (x (logand #xFFFFFFFF (max 1 seed))))
+    (dotimes (i +fuzz-ring-cap+)
+      (setf x (logand #xFFFFFFFF (logxor x (ash x 13))))
+      (setf x (logand #xFFFFFFFF (logxor x (ash x -17))))
+      (setf x (logand #xFFFFFFFF (logxor x (ash x 5))))
+      (setf (cffi:mem-ref sap :uint8 (+ data-off i)) (logand x #xFF)))))
+
+(defun* %fill-ring-data-skip-markers (sap)
+    (function (t) t)
+  "Write +SKIP-MARKER+ len fields at multiple ring positions to exercise the skip path."
+  (let ((data-off (%fuzz-ring-data-off)) (skip dds.xport.shmem::+skip-marker+))
+    (setf (cffi:mem-ref sap :uint32 (+ data-off 0)) skip)
+    (setf (cffi:mem-ref sap :uint32 (+ data-off 8)) skip)
+    (setf (cffi:mem-ref sap :uint32 (+ data-off 128)) skip)))
+
+(defun* fuzz-shmem-ring-drain ()
+    (function () t)
+  "Property-based fuzz of %LANE-DRAIN: adversarial bytes + cursors, 2000 iterations.
+   Verifies: no OOB/error escapes, terminates, callback count bounded by capacity/8."
+  (let* ((seg-bytes (dds.xport.shmem::%segment-bytes +fuzz-ring-lanes+ +fuzz-ring-cap+))
+         (mem (dds.pal:alloc-static seg-bytes))
+         (sap (dds.pal:static-pointer mem))
+         (sink (dds.core.buffer:make-octet-buffer +fuzz-ring-cap+))
+         (prng (make-prng #xDEADBEEF))
+         (max-cbs (+ (truncate +fuzz-ring-cap+ 8) 4))  ; bound: capacity/8 + slack
+         (iters 2000))
+    (dds.xport.shmem::%ring-init sap +fuzz-ring-lanes+ +fuzz-ring-cap+)
+    (unwind-protect
+         (dotimes (i iters t)
+           (let* ((triple (gen-ring-drain-fuzz prng))
+                  (w (first triple)) (r (second triple)) (seed (third triple))
+                  ;; every 5th iteration: skip-marker path; every 10th: max-record boundary
+                  (use-skip (zerop (mod i 5)))
+                  (use-maxr (zerop (mod i 10)))
+                  (cbs 0))
+             (if use-skip
+                 (%fill-ring-data-skip-markers sap)
+                 (%fill-ring-data-random sap seed))
+             (when use-maxr
+               ;; write a max-record len at position 0 to exercise the boundary check
+               (setf (cffi:mem-ref sap :uint32 (%fuzz-ring-data-off))
+                     (dds.xport.shmem::%ring-max-record sap)))
+             (dds.pal:store-sap-u64 sap (%fuzz-ring-write-cursor-off) w)
+             (dds.pal:store-sap-u64 sap (%fuzz-ring-read-cursor-off) r)
+             ;; the drain is synchronous and non-blocking; no timeout guard needed
+             (handler-case
+                 (dds.xport.shmem::%lane-drain
+                  sap 0 +fuzz-ring-cap+ sink
+                  (lambda (buf size) (declare (ignore buf size)) (incf cbs)))
+               (error (e)
+                 (error 'test-failure :name "shmem-ring-drain-fuzz"
+                        :detail (format nil "iter ~d w=~d r=~d signalled: ~a" i w r e))))
+             (unless (<= cbs max-cbs)
+               (error 'test-failure :name "shmem-ring-drain-fuzz"
+                      :detail (format nil "iter ~d w=~d r=~d: ~d callbacks > bound ~d (w-r guard failed)"
+                                      i w r cbs max-cbs)))))
+      (dds.pal:pshared-destroy sap dds.xport.shmem::+mutex-off+ dds.xport.shmem::+cond-off+)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sink))
+      (dds.pal:free-static mem))))
+
 ;;; ---- generators + properties ----
 
 (defun* gsample= (a b)
@@ -241,7 +342,9 @@
                       (lambda (v)
                         (let ((result (dds.types:tokenize-legacy-type-object v)))
                           (or (null result) (dds.types:lto-node-p result))))))
-    (format t "~&  pbt: 6 properties x ~d cases each, deterministic seed.~%" runs)
+    ;; ring-drain fuzz runs independently (its own memory + prng, 2000 iterations)
+    (fuzz-shmem-ring-drain)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters, deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

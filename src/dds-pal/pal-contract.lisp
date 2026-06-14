@@ -18,8 +18,13 @@
    ;; memory (off-heap, non-GC'd, raw-pointer-addressable)
    #:alloc-static #:free-static #:static-pointer #:static-length
    #:mem-ref-u8 #:mem-set-u8
-   ;; atomics
+   ;; atomics (generic M0 stubs); foreign-SAP fast paths for hot-path use (M1, ADR 0013)
    #:cas #:atomic-incf #:fence
+   #:cas-sap-u64 #:atomic-incf-sap-u64 #:load-sap-u64 #:store-sap-u64
+   ;; shared memory segments + in-segment PTHREAD_PROCESS_SHARED mutex/condvar (FR-XPORT-2, ADR 0013)
+   #:shm-create #:shm-attach #:shm-detach #:shm-destroy #:shm-sap #:shm-segment-size
+   #:pshared-mutex-init #:pshared-cond-init #:pshared-lock #:pshared-unlock
+   #:pshared-cond-wait #:pshared-cond-signal #:pshared-cond-broadcast #:pshared-destroy
    ;; threads (condvar-wait: (cv lock &optional timeout-seconds) -> woke-p; nil timeout
    ;; = wait forever, else bounded; re-check the predicate on wake — ADR 0007)
    #:spawn #:join #:make-lock #:with-lock #:make-condvar #:condvar-wait #:condvar-signal

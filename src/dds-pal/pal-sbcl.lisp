@@ -92,8 +92,34 @@
   (error 'pal-unimplemented :op 'atomic-incf))
 (defun* fence (&optional (kind :full))
     (function (&optional t) (values))
-  "Memory fence of the given KIND. M0 no-op; an sb-thread:barrier fast path lands in M1."
-  (declare (ignore kind)) (values))
+  "Real memory barrier (M1). :acquire = load barrier, :release = store barrier, :full = full."
+  (ecase kind
+    (:acquire (sb-thread:barrier (:read)))
+    (:release (sb-thread:barrier (:write)))
+    (:full    (sb-thread:barrier (:memory))))
+  (values))
+
+(defun* load-sap-u64 (sap offset)
+    (function (t (integer 0)) (unsigned-byte 64))
+  "Aligned 64-bit read of the foreign location at SAP+OFFSET (bytes)."
+  (sb-sys:sap-ref-64 sap offset))
+(defun* store-sap-u64 (sap offset value)
+    (function (t (integer 0) (unsigned-byte 64)) (unsigned-byte 64))
+  "Aligned 64-bit write of VALUE at SAP+OFFSET (bytes)."
+  (setf (sb-sys:sap-ref-64 sap offset) value))
+(defun* cas-sap-u64 (sap offset old new)
+    (function (t (integer 0) (unsigned-byte 64) (unsigned-byte 64)) (unsigned-byte 64))
+  "Atomic compare-and-swap of the u64 at SAP+OFFSET; returns the PREVIOUS value (= OLD on success)."
+  (sb-ext:cas (sb-sys:sap-ref-64 sap offset) old new))
+(defun* atomic-incf-sap-u64 (sap offset delta)
+    (function (t (integer 0) (unsigned-byte 64)) (unsigned-byte 64))
+  "Atomically add DELTA to the u64 at SAP+OFFSET; returns the NEW value."
+  ;; sb-ext:atomic-incf rejects SAP-REF places; build fetch-add from the supported CAS-SAP-U64.
+  (loop
+    (let* ((old (sb-sys:sap-ref-64 sap offset))
+           (new (logand (+ old delta) #xFFFFFFFFFFFFFFFF)))
+      (when (= old (cas-sap-u64 sap offset old new))
+        (return new)))))
 
 (defun* spawn (fn &key name)
     (function (function &key (:name (or null string))) t)

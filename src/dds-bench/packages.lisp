@@ -7,6 +7,8 @@
   (:documentation
    "Performance harness for the participant data plane (NFR-PERF / FR-LANG-7): one-way
     PING/PONG latency percentiles, throughput (samples/s + Mbps), and bytes-consed per
-    sample (NFR-PERF-8 oracle). run-bench prints a markdown report; run-bench-smoke is a
-    tiny suite-friendly self-check.")
-  (:export #:run-latency #:run-throughput #:run-bench #:run-bench-smoke))
+    sample (NFR-PERF-8 oracle). run-bench prints a markdown report; run-bench-shmem prints the
+    SHMEM-vs-UDP comparison (WP-SHMEM); run-bench-smoke / run-bench-shmem-smoke are tiny suite-friendly
+    self-checks.")
+  (:export #:run-latency #:run-throughput #:run-bench #:run-bench-shmem
+           #:run-bench-smoke #:run-bench-shmem-smoke))

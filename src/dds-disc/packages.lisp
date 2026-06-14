@@ -29,6 +29,7 @@
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:publish-sample #:flush-batch #:disc-node-batch-max-samples #:enable-async
+           #:*shmem-enabled* #:disc-node-shmem #:disc-node-shmem-sends #:disc-node-host-uuid
            #:node-sample-count #:node-sample #:node-sample-sns
            #:node-sample-writer #:node-sample-writer-guid #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
            #:dispose-instance #:unregister-instance

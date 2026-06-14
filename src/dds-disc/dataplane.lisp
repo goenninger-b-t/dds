@@ -29,13 +29,22 @@
    happens. The copy is allocated only while the sink is bound, so there is no production cost. Never
    set in production.")
 
-(defun* %send-raw-buf (node buf len host port)
-    (function (disc-node dds.core.buffer:octet-buffer (integer 0) string (unsigned-byte 16)) t)
-  "Send the first LEN octets of BUF (a complete RTPS message) to HOST:PORT over the node's transport —
-   the raw one-datagram send shared by %SEND-MSG-BUF and the %SEND-PACKED coalescer (one dds.xport:send
-   = one sendto). Hands a copy to *DATAGRAM-SINK* first when that test hook is bound."
+(defun* %send-raw-buf (node buf len host port &optional shmem-dest)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0) string (unsigned-byte 16) &optional t) t)
+  "Send the first LEN octets of BUF (a complete RTPS message) as ONE datagram — the raw one-datagram send
+   shared by %SEND-MSG-BUF and the %SEND-PACKED coalescer (one dds.xport:send = one sendto). When
+   SHMEM-DEST (a dds.xport.shmem:shmem-locator) is supplied, the datagram goes over SHARED MEMORY to that
+   same-host peer (FR-XPORT-2); if the SHMEM send returns 0 (lane full / claim fail) it FALLS BACK to the
+   UDP send to HOST:PORT (no loss, no double-delivery — exactly one of the two carries it). With SHMEM-DEST
+   NIL (every discovery/HB/ACKNACK caller, and every cross-host data send) the path is the original UDP send,
+   byte-for-byte unchanged. Hands a copy to *DATAGRAM-SINK* first when that test hook is bound."
   (when *datagram-sink*
     (funcall *datagram-sink* (subseq (dds.core.buffer:octet-buffer-vec buf) 0 len)))
+  (when (and shmem-dest (disc-node-shmem node))
+    (when (plusp (dds.xport:send (dds.xport.shmem:shmem-transport-transport (disc-node-shmem node))
+                                 shmem-dest buf 0 len))
+      (incf (disc-node-shmem-sends node))
+      (return-from %send-raw-buf t)))   ; delivered over SHMEM: do NOT also UDP-send (no double-delivery)
   (dds.xport:send (disc-node-transport node)
                   (dds.xport.udp:make-udp-locator :host host :port port)
                   buf 0 len))
@@ -57,8 +66,8 @@
    its datagram), never truncated. Tunable; pinned to no spec constant (a local batching policy, not a
    wire field).")
 
-(defun* %send-packed (node buf host port items)
-    (function (disc-node dds.core.buffer:octet-buffer string (unsigned-byte 16) list) t)
+(defun* %send-packed (node buf host port items &optional shmem-dest)
+    (function (disc-node dds.core.buffer:octet-buffer string (unsigned-byte 16) list &optional t) t)
   "Coalesce ITEMS — each a (SIZE . BUILD-FN) where BUILD-FN writes exactly ONE submessage of at most
    SIZE octets — into as few RTPS datagrams as fit the budget, one shared Header per datagram (RTPS 2.5
    §8.3.4 / §9.4.4), and send each to HOST:PORT. Before writing a submessage that would push a non-empty
@@ -68,14 +77,16 @@
    boundary (RTPS 2.5 §8.3.4 requires submessages to start 32-bit-aligned) cannot be followed by another
    in the same datagram, so it is flushed as its datagram's last — a no-op for this stack (every DATA
    payload is XCDR-padded to 4, dispose=52, HEARTBEAT=28, all aligned), a graceful degrade otherwise.
-   Cuts the sendto count from one-per-submessage to ceil(total/budget). NIL ITEMS sends nothing."
+   Cuts the sendto count from one-per-submessage to ceil(total/budget). NIL ITEMS sends nothing. SHMEM-DEST
+   (a shmem-locator, default NIL) routes every flushed datagram over shared memory with UDP fallback
+   (%send-raw-buf, FR-XPORT-2); NIL keeps the original all-UDP path."
   (when items
     (let* ((budget (min *coalesce-datagram-budget*
                         (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
            (mc (dds.core.buffer:cursor buf :endianness :little)))
       (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
       (let ((hdr-end (dds.core.buffer:cursor-position mc)))
-        (flet ((flush () (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port)
+        (flet ((flush () (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port shmem-dest)
                  (dds.core.buffer:cursor-set-position mc hdr-end)))
           (dolist (item items)
             (when (and (> (dds.core.buffer:cursor-position mc) hdr-end)
@@ -120,6 +131,60 @@
     (when spdp
       (let ((hp (%usable-destination spdp)))
         (when (and hp (plusp (cdr hp))) hp)))))
+
+(defun* %shmem-wire-locator (spdp)
+    (function (dds.rtps.discovery:spdp-data) t)
+  "The first SHMEM Locator_t (kind +locator-kind-shmem+) a peer advertised in its default-unicast
+   locators (FR-XPORT-2 / E1 make-shmem-locator-wire), or NIL — proves the peer offers a SHMEM receive
+   segment. The ring geometry (lane-count, capacity) rides in the locator: address[0..3]=lane-count,
+   port=capacity."
+  (find dds.rtps.discovery:+locator-kind-shmem+
+        (dds.rtps.discovery:spdp-data-default-unicast-locators spdp)
+        :key #'dds.rtps.discovery:locator-kind :test #'=))
+
+(defun* %resolve-shmem-dest (node prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
+  "Resolve participant PREFIX's SHMEM destination from the discovered SPDP record, or NIL. CALLER HOLDS
+   the node lock. A peer qualifies iff the discovered remote advertised the SAME host-uuid as this node
+   (same physical host, RTPS-level so a hostname collision degrades to a failed attach + UDP fallback,
+   never data loss), AND it advertised a SHMEM locator (so a receive segment exists). The destination NAME
+   is derived deterministically from PREFIX (seg-name-for-guid, RTPS 2.5 §9.4.4) and the ring geometry
+   from the wire locator (lane-count from its address, capacity from its port). Off the hot path — called
+   only on a %shmem-dest cache miss (once per peer)."
+  (let ((spdp (gethash prefix (disc-node-discovered node))))
+    (when (and spdp
+               (plusp (dds.rtps.discovery:spdp-data-host-uuid spdp))
+               (= (dds.rtps.discovery:spdp-data-host-uuid spdp) (disc-node-host-uuid node)))
+      (let ((wl (%shmem-wire-locator spdp)))
+        (when wl
+          (dds.xport.shmem:make-shmem-locator
+           :name (dds.xport.shmem:seg-name-for-guid prefix)
+           :host-uuid (disc-node-host-uuid node)
+           :lane-count (dds.rtps.discovery:shmem-locator-wire-lane-count wl)
+           :capacity (dds.rtps.discovery:locator-port wl)))))))
+
+(defun* %shmem-dest (node prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
+  "A dds.xport.shmem:shmem-locator addressing participant PREFIX's receive segment iff PREFIX is a
+   SAME-HOST SHMEM peer reachable over shared memory, else NIL (caller then uses UDP). A peer qualifies
+   iff: SHMEM is on for this node (the shmem slot is set — which already encodes *shmem-enabled* + the
+   platform gate), AND the discovered remote advertised the SAME host-uuid as this node, AND it advertised
+   a SHMEM locator. MEMOIZED per remote prefix (FR-XPORT-2 / FR-LANG-7): the resolved locator (or the
+   sentinel :none for 'not a SHMEM peer') is cached in shmem-dest-cache, so the steady-state send does ONE
+   cheap gethash and NO per-datagram make-shmem-locator allocation or full re-resolve (the prior cost the
+   WP-SHMEM bench charged at ~800-2000 bytes/sample). The cache is read + filled under the node lock and is
+   invalidated when PREFIX's SPDP is re-recorded (%record-participant) or it leases out (%lease-sweep), so a
+   changed or removed peer never sends to a stale locator."
+  (when (disc-node-shmem node)
+    (dds.pal:with-lock ((disc-node-lock node))
+      (let ((cached (gethash prefix (disc-node-shmem-dest-cache node))))
+        (cond
+          ((eq cached :none) nil)               ; memoized non-SHMEM peer: skip the resolve, UDP
+          (cached cached)                        ; memoized live shmem-locator: reuse, no alloc
+          (t (let ((resolved (%resolve-shmem-dest node prefix)))
+               (setf (gethash (copy-seq prefix) (disc-node-shmem-dest-cache node))
+                     (or resolved :none))        ; cache the verdict (:none for not-a-peer) keyed by an owned copy
+               resolved)))))))
 
 (defun* %reader-guid-p (guid)
     (function ((simple-array (unsigned-byte 8) (16))) t)
@@ -239,13 +304,16 @@
           (lambda (mc) (dds.rtps.message:write-heartbeat
                         mc dds.rtps.message:+entityid-unknown+ wid first last count :final nil)))))
 
-(defun* %send-changes-packed (node buf changes host port hb)
-    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons)) t)
+(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest)
+    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons) &optional t) t)
   "Send CHANGES (+ optional trailing HEARTBEAT item HB, a (SIZE . BUILD-FN)) to HOST:PORT, coalescing the
    small ones into as few datagrams as fit the budget (%send-packed): collect a %data-builder item per
    SMALL change (a SN in *DEBUG-DROP-SAMPLE-NUMBERS* is skipped — loss injection preserved), send each
    LARGE change individually via %send-sample (already one datagram per fragment group), append HB, then
-   pack. This is the shared writer push/retransmit emit path (RTPS 2.5 §8.3.4 §8.4.2.2)."
+   pack. This is the shared writer push/retransmit emit path (RTPS 2.5 §8.3.4 §8.4.2.2). When SHMEM-DEST is
+   supplied the COALESCED small-sample datagrams go over shared memory with UDP fallback (FR-XPORT-2);
+   large fragmented samples stay on UDP in v1 (the bulk small-sample path is the SHMEM throughput target).
+   NIL SHMEM-DEST is the original all-UDP behaviour, byte-for-byte."
   (let ((items '()))
     (dolist (change changes)
       (let ((sn (dds.rtps.history:cache-change-sn change)))
@@ -255,7 +323,7 @@
           (t (%send-sample node buf sn
                            (dds.rtps.history:cache-change-serialized-payload change) host port)))))
     (when hb (push hb items))
-    (%send-packed node buf host port (nreverse items))))
+    (%send-packed node buf host port (nreverse items) shmem-dest)))
 
 (defun* %send-sample (node buf sn pl host port)
     (function (disc-node dds.core.buffer:octet-buffer integer (simple-array (unsigned-byte 8) (*)) string (unsigned-byte 16)) t)
@@ -354,6 +422,18 @@
                 (push ch merged)))))
         (sort merged #'< :key #'dds.rtps.history:cache-change-sn))))
 
+(defun* %group-shmem-dest (node group)
+    (function (disc-node cons) t)
+  "The SHMEM destination for a %reader-push-targets GROUP, or NIL — resolves the remote participant prefix
+   from the group's reader keys (the first 12 octets of any matched-reader GUID at that destination, RTPS
+   2.5 §9.3.1.2 / §8.3.5.4; every reader in one group shares a unicast (host . port), hence one participant
+   prefix) and asks %shmem-dest whether that participant is a same-host SHMEM peer (FR-XPORT-2). NIL for the
+   discovery-less PEERS fallback group (its key is this node's own reader-id, not a remote GUID) — those
+   stay UDP."
+  (let ((k (first (cdr group))))   ; a 16-octet GUID for a real matched reader; a u32 reader-id for the PEERS fallback
+    (when (typep k '(simple-array (unsigned-byte 8) (16)))
+      (%shmem-dest node (subseq k 0 12)))))
+
 (defun* %push-data-buf (node buf)
     (function (disc-node dds.core.buffer:octet-buffer) t)
   "Writer side: send each UNSENT change ONCE as a DATA (or DATA_FRAG series for large samples)
@@ -362,13 +442,16 @@
    scratch message buffer (tx-msg on the caller thread; async-tx-msg on the WP-ASYNC sender thread — each
    thread owns its buffer). The unsent-base watermark is kept PER matched reader (keyed by its full GUID,
    §8.3.5.4); %merge-unsent advances every reader sharing a destination and sends their union once. Lost
-   or late changes are repaired only via the reader's ACKNACK (%on-user-acknack)."
+   or late changes are repaired only via the reader's ACKNACK (%on-user-acknack). When a destination is a
+   same-host SHMEM peer (%group-shmem-dest) the coalesced small-sample datagrams take shared memory with
+   UDP fallback (FR-XPORT-2); the reader's ACKNACK return path is UDP (%on-user-heartbeat, untouched)."
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (dolist (group (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched-reader destination
         (%send-changes-packed node buf
                               (%merge-unsent writer (cdr group)) (caar group) (cdar group)
-                              (%heartbeat-builder node first last count))))))
+                              (%heartbeat-builder node first last count)
+                              (%group-shmem-dest node group))))))
 
 (defun* %push-data (node)
     (function (disc-node) t)

@@ -706,6 +706,11 @@
   "PID_TYPE_OBJECT_LB — RTI Connext VENDOR parameter (high-bit 0x8000 vendor range) carrying
    a ZLIB-compressed complete TypeObject. NOT an OMG-spec PID; value observed on the live
    Connext 7.3.1 wire (ADR 0009). Parsed inbound only; never emitted (clean-room).")
+(defconstant +pid-shmem-host-uuid+            #x8040
+  "PID_SHMEM_HOST_UUID — OUR vendor parameter (high-bit 0x8000 vendor range) carrying an
+   8-octet same-host UUID (u64 LE) for SHMEM peer selection. NOT an OMG-spec PID; value
+   pinned in ADR 0013, not from any spec clause. Cross-vendor peers ignore an unknown PID
+   (fail-open), so it is purely additive to SPDP.")
 
 (defun* write-parameter (cursor pid value off len)
     (function (dds.core.buffer:cursor (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) fixnum)
