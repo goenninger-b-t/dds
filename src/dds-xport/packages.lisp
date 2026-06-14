@@ -49,3 +49,22 @@
            #:start-shmem-receiver #:stop-shmem-receiver
            #:shm-attach-by-name-reliable-p
            #:run-shmem-transport-test #:run-shmem-receiver-test #:run-shmem-stress-test))
+
+(defpackage #:net.goenninger.dds.xport.zerocopy
+  (:nicknames #:dds.xport.zerocopy)
+  (:use #:common-lisp #:net.goenninger.dds.lang)
+  (:documentation
+   "WP-ZEROCOPY SHMEM sample-pool (FR-PF-3; ADR 0014). A per-writer pool of
+    fixed-size slots over an mmap segment: the writer loans a slot, copies one
+    serialized SerializedPayload in, and publishes a 16-byte reference instead of
+    the payload; a same-host reader resolves the reference (bounds + generation
+    guarded) and copies the slot out. All slot state (freelist head, per-slot
+    refcount/generation) is mutated UNDER the pool's PTHREAD_PROCESS_SHARED mutex
+    (no foreign-SAP CAS -> full Clasp parity). Generation is the single guard for
+    stale refs, force-reclaim mid-read, and untrusted cross-process references.
+    NOT cleared for ship — pending counsel (R6); the path is off by default
+    behind dds.disc:*zerocopy-enabled*. %-internals are reached via :: by tests.")
+  (:export #:%zc-bytes #:%zc-init #:%zc-validate #:%zc-destroy
+           #:%zc-slot-count #:%zc-slot-bytes #:%zc-free-count
+           #:%zc-loan #:%zc-release #:%zc-resolve
+           #:*zc-pubseq*))

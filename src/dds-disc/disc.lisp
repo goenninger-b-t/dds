@@ -23,6 +23,30 @@
    Rebind to NIL before make-disc-node to force the all-UDP path (e.g. cross-host deployments where no
    same-host peer can exist). Not a wire constant — a local transport-selection policy.")
 
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
+(defvar *zerocopy-enabled* nil
+  "WP-ZEROCOPY master switch (FR-PF-3). DEFAULT NIL — Zero-Copy is patent-gated (R6) and NOT cleared for
+   ship pending counsel; it never engages unless explicitly enabled. When T (and SHMEM is available + a
+   matched reader is same-host + ZC-capable) the writer sends a 16-byte reference instead of the payload.")
+
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
+(defconstant +zerocopy-pool-slots+ 32
+  "WP-ZEROCOPY per-writer pool slot count K (FR-PF-3, ADR 0014). Defined ONCE; used by BOTH the node's
+   pool creation and the advertised slot geometry (the WP-SHMEM DRY lesson). NOT a wire constant.")
+
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
+(defconstant +zerocopy-pool-slot-bytes+ 65536
+  "WP-ZEROCOPY per-slot payload capacity in octets (FR-PF-3, ADR 0014). A serialized SerializedPayload
+   larger than this falls back to normal DATA (%zc-loan returns NIL). Defined ONCE; used by BOTH pool
+   creation and the advertised geometry. NOT a wire constant.")
+
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
+(defparameter *zerocopy-min-payload-bytes* 1024
+  "WP-ZEROCOPY size threshold (FR-PF-3): a serialized SerializedPayload at or below this many octets is
+   NOT worth a pool slot + a 16-byte reference (the small-sample path is the WP-SHMEM/batching target),
+   so the writer sends it as normal DATA. Only payloads STRICTLY LARGER are stored in the pool and sent
+   as a reference. A local policy, NOT a wire constant; tunable.")
+
 (defconstant +shmem-default-lane-count+ 8
   "Default per-receiver SHMEM lane count (max concurrent same-host senders); must match the advertised wire locator (FR-XPORT-2).")
 
@@ -109,6 +133,20 @@
   (host-uuid 0 :type (unsigned-byte 64))  ; u64 host id (MD5 of hostname); a remote with the SAME uuid is same-host
   (shmem-sends 0 :type (integer 0))       ; count of user DATA datagrams this node routed over SHMEM (proof/diagnostic)
   (shmem-dest-cache (make-hash-table :test 'equalp) :type hash-table) ; remote 12-octet prefix -> shmem-locator | :none; one-time resolve per peer (hot-path send reads, no lock/alloc); invalidated on SPDP re-discovery + lease-out
+  ;; WP-ZEROCOPY (FR-PF-3, ADR 0014; NOT cleared for ship — pending counsel R6). All NIL/0 unless
+  ;; *zerocopy-enabled* AND this node has SHMEM. ZC-POOL is this writer's per-participant SHMEM
+  ;; sample-pool segment (named seg-name-for-guid + "z"); ZC-POOL-SAP caches its mapped base SAP so the
+  ;; publish hook needs no per-sample shm-sap call. ZC-SENDS counts samples sent as a 16-byte reference
+  ;; (proof/diagnostic). ZC-ATTACH-CACHE memoizes, on the READER side, each source participant's attached
+  ;; pool segment keyed by its 12-octet prefix (attach once per remote writer; the resolved payload is
+  ;; copied into a FRESH per-datagram vector so concurrent receiver threads — UDP + SHMEM — never share a
+  ;; sink; freed in stop-node). ZC-ATTACH-LOCK serializes the first attach for one remote writer across
+  ;; receiver threads.
+  (zc-pool nil :type t)                    ; this writer's pool shm-segment (NIL = ZC off)
+  (zc-pool-sap nil :type t)                ; cached mapped base SAP of zc-pool
+  (zc-sends 0 :type (integer 0))           ; user samples this node published as a zero-copy reference
+  (zc-attach-cache (make-hash-table :test 'equalp) :type hash-table) ; reader side: remote 12-octet prefix -> attached pool shm-segment | :none
+  (zc-attach-lock (dds.pal:make-lock "zc-attach") :type t)
   (batch-max-samples 1 :type (integer 1)) ; WP-BATCH size trigger: flush the accumulated batch every N publishes (1 = flush per write, no batching)
   (batch-pending 0 :type (integer 0))     ; samples accumulated since the last flush (a flush pacer; %push-data always sends all unsent)
   ;; WP-ASYNC: a background sender thread decoupling the push from write() (nil async-thread = synchronous, default)
@@ -159,6 +197,36 @@
   "Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
    participants announce + listen on UDPv4 239.255.0.1 : spdp-multicast-port.")
 
+(defun* %zc-pool-name (guid)
+    (function ((simple-array (unsigned-byte 8) (12))) string)
+  "WP-ZEROCOPY pool segment name for a participant's 12-octet GUID prefix: the SHMEM receive-segment name
+   (dds.xport.shmem:seg-name-for-guid, '/dds' + 10 hex = 14 chars) suffixed 'z' -> 15 chars, under the
+   macOS ~31-char shm-name cap. The reader derives the SAME name from the DATA source prefix (no extra
+   advertisement). ADR 0014; NOT a wire constant."
+  (concatenate 'string (dds.xport.shmem:seg-name-for-guid guid) "z"))
+
+(defun* %zc-make-pool (node)
+    (function (disc-node) t)
+  "Create + init this node's WP-ZEROCOPY writer pool (FR-PF-3, ADR 0014): an shm segment of
+   +zerocopy-pool-slots+ x +zerocopy-pool-slot-bytes+ named %zc-pool-name. A stale leftover is unlinked +
+   recreated by shm-create. Caller has gated on *zerocopy-enabled* AND the node having SHMEM. NOT cleared
+   for ship — pending counsel (R6)."
+  (let ((seg (dds.pal:shm-create (%zc-pool-name (disc-node-guid-prefix node))
+                                 (dds.xport.zerocopy::%zc-bytes +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+))))
+    (dds.xport.zerocopy::%zc-init (dds.pal:shm-sap seg) +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+)
+    (setf (disc-node-zc-pool node) seg
+          (disc-node-zc-pool-sap node) (dds.pal:shm-sap seg)))
+  t)
+
+(defun* %zc-node-capable-p (node)
+    (function (disc-node) t)
+  "T iff NODE is WP-ZEROCOPY-capable (FR-PF-3, ADR 0014): it has a writer pool (created at make-disc-node
+   iff *zerocopy-enabled* was set then — the pool slot is the single source of truth, mirroring
+   disc-node-shmem; not the special, which may be invisible to a later announce thread). Its local
+   endpoints advertise PID_ZEROCOPY_CAPABLE iff this holds, so a peer only sends this node zero-copy
+   references when it can actually resolve them (fail-open). NOT cleared for ship — pending counsel (R6)."
+  (and (disc-node-zc-pool node) t))
+
 (defun* make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
                                                      :initial-element 0))
                             (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast
@@ -195,6 +263,8 @@
                                     :reuse-port t)))
           (dds.pal:udp-join-multicast ms +spdp-multicast-group+)
           (setf (disc-node-mcast-socket node) ms)))
+      (when (and *zerocopy-enabled* (disc-node-shmem node))   ; WP-ZEROCOPY writer pool (FR-PF-3, ADR 0014)
+        (%zc-make-pool node))
       node)))
 
 (defun* disc-node-port (node)
@@ -475,6 +545,12 @@
    ON-LIVELINESS-CHANGED hook, RTPS 2.5 §8.4.13), and %push-heartbeat (the periodic
    standalone user-data HEARTBEAT that keeps reliability live and repairs a lost final
    sample, RTPS 2.5 §8.4.2.2) on the periodic announce cadence."
+  ;; WP-ZEROCOPY (FR-PF-3): stamp each local endpoint's advertised ZC-capable flag from this node's
+  ;; current capability so SEDP carries PID_ZEROCOPY_CAPABLE iff the node can resolve a reference. NIL
+  ;; (ZC off / no pool) leaves the flag NIL -> the PID is elided -> byte-identical SEDP to today.
+  (let ((zc (%zc-node-capable-p node)))
+    (dolist (w (disc-node-local-writers node)) (setf (dds.rtps.discovery:endpoint-data-zerocopy-capable w) zc))
+    (dolist (r (disc-node-local-readers node)) (setf (dds.rtps.discovery:endpoint-data-zerocopy-capable r) zc)))
   (dolist (p (%discovered-participants node))
     (let ((loc (dds.rtps.discovery:usable-udpv4-locator
                 (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))))
@@ -945,6 +1021,19 @@
   (when (disc-node-shmem node)         ; FR-XPORT-2: JOIN the SHMEM receiver (it feeds %handle-datagram -> rx-tx-msg) BEFORE the frees
     (dds.xport.shmem:shmem-transport-close (disc-node-shmem node))
     (setf (disc-node-shmem node) nil))
+  ;; WP-ZEROCOPY teardown (FR-PF-3, ADR 0014) AFTER the receiver join (UAF rule: %handle-datagram may
+  ;; %zc-resolve against an attached pool on a receiver thread): detach every reader-side attached pool,
+  ;; then destroy the writer pool's mutex + detach + unlink its segment.
+  (when (plusp (hash-table-count (disc-node-zc-attach-cache node)))
+    (maphash (lambda (k seg) (declare (ignore k))
+               (unless (eq seg :none) (ignore-errors (dds.pal:shm-detach seg))))
+             (disc-node-zc-attach-cache node))
+    (clrhash (disc-node-zc-attach-cache node)))
+  (when (disc-node-zc-pool node)
+    (dds.xport.zerocopy::%zc-destroy (disc-node-zc-pool-sap node))
+    (dds.pal:shm-detach (disc-node-zc-pool node))
+    (dds.pal:shm-destroy (%zc-pool-name (disc-node-guid-prefix node)))
+    (setf (disc-node-zc-pool node) nil (disc-node-zc-pool-sap node) nil))
   (when (disc-node-tx-payload node)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-tx-payload node)))
     (setf (disc-node-tx-payload node) nil))

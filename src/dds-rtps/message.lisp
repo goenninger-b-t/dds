@@ -711,6 +711,9 @@
    8-octet same-host UUID (u64 LE) for SHMEM peer selection. NOT an OMG-spec PID; value
    pinned in ADR 0013, not from any spec clause. Cross-vendor peers ignore an unknown PID
    (fail-open), so it is purely additive to SPDP.")
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
+(defconstant +pid-zerocopy-capable+           #x8041
+  "Vendor PID (1 octet, 1 = endpoint understands WP-ZEROCOPY references). ADR 0014; ours, NOT a spec clause.")
 
 (defun* write-parameter (cursor pid value off len)
     (function (dds.core.buffer:cursor (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) fixnum)

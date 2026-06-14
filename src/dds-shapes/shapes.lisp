@@ -579,6 +579,141 @@
         (format t "~&[large-sub] stopped; received ~d samples.~%" seen))
       t)))
 
+;;; ---- FR-PF-3: real two-OS-process cross-process WP-ZEROCOPY round-trip (ADR 0014, Phase E2) ----
+;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
+;;; Two SBCL processes on THIS host get the same host-uuid (MD5 of hostname) and, with *zerocopy-enabled*
+;;; T, each brings up a per-writer SHMEM sample-pool. After they discover over loopback UDP (deterministic
+;;; domain-derived ports + :peers, no multicast) the publisher places each LARGE LargeData sample (> the ZC
+;;; threshold) into its pool and sends a 16-byte REFERENCE; the subscriber resolves it from the writer's pool
+;;; cross-process and verifies the payload byte-exact. Proof = the sub received the samples AND the pub's
+;;; disc-node-zc-sends > 0 (a reference, not the fragmented payload, crossed the OS-process boundary). SBCL
+;;; only: the by-name SHMEM attach the pool relies on is reliable on SBCL but not Clasp/macOS (ADR 0013).
+
+(defun* %zc-xproc-payload (size id)
+    (function ((integer 1) (integer 0)) (simple-array (unsigned-byte 8) (*)))
+  "A reproducible SIZE-octet LargeData payload for the ZC xproc proof: octet i = (i*7 + id) mod 256, so the
+   subscriber can verify the cross-process-resolved bytes are exact (and distinguishes successive samples)."
+  (let ((v (make-array size :element-type '(unsigned-byte 8))))
+    (dotimes (i size v) (setf (aref v i) (logand (+ (* i 7) id) #xff)))))
+
+(defun* run-zc-xproc-sub (&key (domain 0) (threshold 8) (seconds 25) (size 4000)
+                               (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:threshold (integer 1)) (:seconds (integer 1))
+                    (:size (integer 1)) (:advertise-address string)) t)
+  "FR-PF-3 cross-process WP-ZEROCOPY subscriber half (ADR 0014, Phase E2; NOT cleared for ship — counsel R6):
+   a *zerocopy-enabled* + SHMEM disc-node with a reliable LargeData reader, bound to the deterministic
+   loopback port for participant 0 and pointing :peers at the publisher (participant 1). Loopback-only (no
+   multicast) sidesteps the macOS app-firewall LAN-UDP drop. Spins to the SECONDS deadline collecting
+   samples, verifying each SIZE-octet payload is byte-exact (proving the cross-process pool resolve), then
+   prints ZC-SUB-RECEIVED: <n> and uiop:quit 0 iff n >= THRESHOLD else 1. Same host as the pub => same
+   host-uuid => the pub's reference resolves against the writer's SHMEM pool, which this node maps + reads
+   directly. Intended to be launched by scripts/zerocopy-roundtrip.sh."
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x5a) :domain domain
+                                        :host "127.0.0.1" :port (%shmem-xproc-port domain 0)
+                                        :advertise-address advertise-address
+                                        :peers (list (cons "127.0.0.1" (%shmem-xproc-port domain 1))))))
+    (dds.disc:add-local-reader node :topic "ZcLargeData" :type "LargeData"
+                               :reliability dds.rtps.discovery:+reliability-reliable+)
+    (dds.disc:enable-subscriber node)
+    (dds.disc:start-node node)
+    (format t "~&[zc-sub] ZcLargeData domain=~d port=~d zc=~:[OFF~;ON~] threshold=~d size=~d (loopback :peers, no multicast).~%"
+            domain (%shmem-xproc-port domain 0) (and (dds.disc::disc-node-zc-pool node) t) threshold size)
+    (force-output)
+    (let ((printed (make-hash-table :test 'eql)) (seen 0) (bad 0)
+          (last 0) (start (get-internal-real-time)))
+      (unwind-protect
+           (loop
+             (setf last (%reannounce node last))
+             (dolist (sn (sort (dds.disc:node-sample-sns node) #'< :key #'dds.disc:node-sample-key-sn))
+               (unless (gethash (dds.disc:node-sample-key-sn sn) printed)
+                 (setf (gethash (dds.disc:node-sample-key-sn sn) printed) t)
+                 ;; an unparseable sample must never crash the proof loop — skip it
+                 (handler-case
+                     (let ((s (%deserialize-with (dds.disc:node-sample node sn) #'deserialize-large-data)))
+                       (declare (type large-data s))
+                       (let* ((pv (large-data-payload s))
+                              (off (loop for i from 0 below (length pv)
+                                         unless (= (aref pv i) (logand (+ (* i 7) (large-data-id s)) #xff))
+                                           return i)))
+                         (if off (incf bad) (incf seen))))
+                   (error (e)
+                     (format t "~&[zc-sub] sn=~d: skipped unparseable sample (~a)~%"
+                             (dds.disc:node-sample-key-sn sn) (type-of e))))))
+             (when (>= seen threshold) (return))
+             (when (> (/ (- (get-internal-real-time) start) internal-time-units-per-second) seconds)
+               (return))
+             (sleep 0.02))
+        (dds.disc:stop-node node))
+      (format t "~&ZC-SUB-RECEIVED: ~d~%" seen)
+      (when (plusp bad) (format t "~&[zc-sub] WARNING: ~d sample(s) had a payload mismatch (resolve corruption)~%" bad))
+      (force-output)
+      (uiop:quit (if (and (>= seen threshold) (zerop bad)) 0 1)))))
+
+(defun* run-zc-xproc-pub (&key (domain 0) (count 24) (rate 20) (size 4000)
+                               (match-timeout 15) (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:count (integer 1)) (:rate (integer 1)) (:size (integer 1))
+                    (:match-timeout (integer 1)) (:advertise-address string)) t)
+  "FR-PF-3 cross-process WP-ZEROCOPY publisher half (ADR 0014, Phase E2; NOT cleared for ship — counsel R6):
+   a *zerocopy-enabled* + SHMEM disc-node with a reliable LargeData writer, bound to the deterministic
+   loopback port for participant 1 and pointing :peers at the subscriber (participant 0). Loopback-only (no
+   multicast). Waits up to MATCH-TIMEOUT s for the subscriber's reader to match AND advertise
+   PID_ZEROCOPY_CAPABLE, then publish-sample COUNT SIZE-octet LargeData samples (SIZE > the ZC threshold) at
+   RATE/s, then prints ZC-PUB-SENDS: <zc-sends> / <COUNT> and uiop:quit (0 iff zc-sends > 0, i.e. at least
+   one large sample crossed as a reference, else 2). Same host as the sub => same host-uuid => the writer
+   stores the payload in its SHMEM pool and sends only a 16-byte reference; disc-node-zc-sends counts each.
+   Intended to be launched by scripts/zerocopy-roundtrip.sh after the sub binds."
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x57) :domain domain
+                                        :host "127.0.0.1" :port (%shmem-xproc-port domain 1)
+                                        :advertise-address advertise-address
+                                        :peers (list (cons "127.0.0.1" (%shmem-xproc-port domain 0))))))
+    (dds.disc:add-local-writer node :topic "ZcLargeData" :type "LargeData"
+                               :reliability dds.rtps.discovery:+reliability-reliable+)
+    (dds.disc:enable-publisher node)
+    (dds.disc:start-node node)
+    (format t "~&[zc-pub] ZcLargeData domain=~d port=~d zc=~:[OFF~;ON~] count=~d size=~d (loopback :peers, no multicast).~%"
+            domain (%shmem-xproc-port domain 1) (and (dds.disc::disc-node-zc-pool node) t) count size)
+    (force-output)
+    (let ((period (/ 1.0 rate)) (n 0) (last 0)
+          (start (get-internal-real-time)) (matched nil))
+      (unwind-protect
+           (progn
+             ;; phase 1: announce until the sub's reader matches AND we see it is ZC-capable (bounded)
+             (loop
+               (setf last (%reannounce node last))
+               (when (and (plusp (dds.disc:disc-node-matched-count node))
+                          (plusp (dds.disc::%zc-readers node (mapcar #'dds.rtps.discovery:endpoint-data-guid
+                                                                     (dds.disc::%matched-endpoints node)))))
+                 (setf matched t) (return))
+               (when (> (/ (- (get-internal-real-time) start) internal-time-units-per-second) match-timeout)
+                 (return))
+               (sleep 0.02))
+             (format t "~&[zc-pub] zc-capable-match=~:[NO~;YES~] after ~,1fs; publishing ~d large samples ...~%"
+                     matched (/ (- (get-internal-real-time) start) internal-time-units-per-second) count)
+             (force-output)
+             ;; phase 2: publish COUNT paced large samples; keep announcing so SEDP/HEARTBEAT cadence holds
+             (when matched
+               (loop
+                 (setf last (%reannounce node last))
+                 (incf n)
+                 (let ((sample (make-large-data :id n :payload (%zc-xproc-payload size n))))
+                   (dds.disc:publish-sample
+                    node (%serialize-payload
+                          (lambda (wc) (serialize-large-data sample wc :xcdr2))
+                          (+ size 64))))
+                 (when (>= n count) (return))
+                 (sleep period))
+               ;; let the reliable engine drain final ACKNACKs before teardown
+               (loop repeat 25 do (setf last (%reannounce node last)) (sleep 0.02))))
+        (let ((sends (dds.disc:disc-node-zc-sends node)))
+          (dds.disc:stop-node node)
+          (format t "~&ZC-PUB-SENDS: ~d / ~d~%" sends count)
+          (force-output)
+          (uiop:quit (if (plusp sends) 0 2)))))))
+
 (defun* run-gated-subscriber (&key (domain 0) (topic "Square") (type-name "C_Shape")
                                    (local-type "shape-type") (seconds 25)
                                    (advertise-address "127.0.0.1") (ownership :shared))

@@ -3353,6 +3353,74 @@
       (dds.disc:stop-node w) (dds.disc:stop-node r)))
   t)
 
+(defun* run-zerocopy-end-to-end-test ()
+    (function () t)
+  "WP-ZEROCOPY Phase D end-to-end (FR-PF-3, ADR 0014; NOT cleared for ship — pending counsel R6): two
+   same-host nodes, both *zerocopy-enabled* T (+ SHMEM), exchange LARGE samples (> the ZC threshold). After
+   match the writer publishes N; assert (a) the reader receives all N byte-exact, (b) the writer's zc-sends
+   advanced (so a 16-byte reference, not the fragmented payload, crossed), and (c) the writer pool's free
+   slots fully recover once the reader has resolved+released every reference (no slot leak). Skips cleanly
+   where SHMEM is off (Clasp/macOS by-name-attach gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-zerocopy-end-to-end-test t))
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 61))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 62))
+         (dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)   ; arm ZC for BOTH nodes (default OFF; R6)
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (n 8)
+         (payload (make-array 3000 :element-type '(unsigned-byte 8))))   ; > *zerocopy-min-payload-bytes* (1024)
+    (dotimes (i 3000) (setf (aref payload i) (logand (* i 5) #xff)))
+    (unwind-protect
+         (progn
+           (%check :zc-e2e-pool (and (dds.disc::disc-node-zc-pool w) (dds.disc::disc-node-zc-pool r))
+                   "both nodes must have a ZC writer pool when *zerocopy-enabled* + SHMEM")
+           (dds.disc:add-local-writer w :topic "ZcT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-publisher w)
+           (dds.disc:add-local-reader r :topic "ZcT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (%check :zc-e2e-matched (plusp (dds.disc:disc-node-matched-count w))
+                   "writer must match the reader before publishing zero-copy")
+           ;; the reader must have parsed the writer's PID_ZEROCOPY_CAPABLE for the writer to send refs
+           (loop repeat 200
+                 until (plusp (dds.disc::%zc-readers w (list (dds.rtps.discovery:endpoint-data-guid
+                                                              (first (dds.disc::%matched-endpoints w))))))
+                 do (dds.disc:announce-endpoints w) (sleep 0.01))
+           (dotimes (i n) (dds.disc:publish-sample w payload))
+           (loop repeat 500 until (>= (dds.disc:node-sample-count r) n) do (sleep 0.01))
+           (%check :zc-e2e-received (>= (dds.disc:node-sample-count r) n)
+                   "the reader must receive all N large samples delivered via zero-copy reference")
+           (%check :zc-e2e-bytes (equalp (dds.disc:node-sample-by-sn r 1) payload)
+                   "the reader's resolved payload must be byte-exact")
+           (%check :zc-e2e-sends (>= (dds.disc::disc-node-zc-sends w) n)
+                   "the writer must have published references (zc-sends advanced), not fragmented payloads")
+           ;; the reader resolved+released every ref -> the writer pool's freelist must fully recover
+           (loop repeat 200
+                 until (= dds.disc:+zerocopy-pool-slots+
+                          (dds.xport.zerocopy::%zc-free-count (dds.disc::disc-node-zc-pool-sap w)))
+                 do (sleep 0.01))
+           (%check :zc-e2e-pool-recovers
+                   (= dds.disc:+zerocopy-pool-slots+
+                      (dds.xport.zerocopy::%zc-free-count (dds.disc::disc-node-zc-pool-sap w)))
+                   "every loaned slot must return to the freelist after the reader releases (no leak)"))
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
 ;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a
 ;;; discovered participant not refreshed within its leaseDuration. %lease-sweep
 ;;; prunes the stale participant's discovered entry + endpoints + matches +

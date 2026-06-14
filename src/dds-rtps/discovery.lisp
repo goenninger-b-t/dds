@@ -475,7 +475,12 @@
   ;; Opaque inbound RTI PID_TYPE_OBJECT_LB (0x8021): the ZLIB-compressed complete TypeObject
   ;; a Connext peer advertises. Stored verbatim here (L4); dds-disc inflates + fingerprints it
   ;; (dds.types, ADR 0009). Never EMITTED — RTI-vendor + clean-room; inbound only.
-  (type-object-lb nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+  (type-object-lb nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  ;; WP-ZEROCOPY (FR-PF-3, ADR 0014): T iff this endpoint advertised PID_ZEROCOPY_CAPABLE — it
+  ;; understands a 16-byte zero-copy reference in place of the SerializedPayload. Fail-open: an
+  ;; absent/garbage PID parses NIL, so a non-ZC / cross-vendor peer simply gets normal DATA. NOT
+  ;; cleared for ship — pending counsel (R6).
+  (zerocopy-capable nil :type boolean))
 
 (defun* serialize-endpoint-data (cursor data)
     (function (dds.core.buffer:cursor endpoint-data) fixnum)
@@ -539,6 +544,12 @@
     (when ti
       (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-type-information+
                                         ti 0 (length ti))))
+  ;; PID_ZEROCOPY_CAPABLE (0x8041, vendor): a single octet 1 when this endpoint understands a
+  ;; WP-ZEROCOPY reference (ADR 0014); elided otherwise (fail-open — peers skip an unknown PID).
+  (when (endpoint-data-zerocopy-capable data)
+    (multiple-value-bind (c vec) (%make-scratch 1)
+      (dds.core.buffer:put-u8 c 1)
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-zerocopy-capable+ vec 0 1)))
   (dds.rtps.message:write-parameter-sentinel cursor))
 
 (defun* %fill-endpoint-param (data pid cursor len)
@@ -591,7 +602,10 @@
      (when (> len 0)
        (let ((lb (make-array len :element-type '(unsigned-byte 8))))
          (dds.core.buffer:get-octets cursor lb 0 len)
-         (setf (endpoint-data-type-object-lb data) lb)))))
+         (setf (endpoint-data-type-object-lb data) lb))))
+    ((= pid dds.rtps.message:+pid-zerocopy-capable+)
+     (when (>= len 1)   ; fail-open: a nonzero leading octet means ZC-capable (WP-ZEROCOPY, ADR 0014)
+       (setf (endpoint-data-zerocopy-capable data) (plusp (dds.core.buffer:get-u8 cursor))))))
   data)
 
 (defun* parse-endpoint-data (cursor role)

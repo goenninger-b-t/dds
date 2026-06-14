@@ -438,6 +438,69 @@ Measured SBCL/macOS (Apple M5), `bench/report/2026-06-14-wp-shmem.md`:
   seen end-to-end is the v1 disc-layer data-plane copy, identical on both transports and explicitly *not* the
   gated hot path; the gated XCDR codec is already 0-alloc (`make mem`).
 
+## Zero-Copy over SHMEM (WP-ZEROCOPY) — default-OFF, R6 patent-gated
+
+> **NOT cleared for ship — pending counsel (R6).** Zero-Copy mirrors RTI's patented mechanism (the operating
+> contract §NFR-IP; ADR 0014). It is implemented clean-room from FR-PF-3 + the OMG spec, ships **off by
+> default**, and must clear legal review before any `*zerocopy-enabled*`-on deployment. Every Zero-Copy file
+> carries this marker.
+
+On top of SHMEM, a writer can place a large serialized sample in a per-writer SHMEM **sample-pool** it owns and
+transmit a **16-byte reference** (a vendor SerializedPayload encapsulation, `dds.cdr:+zc-encapsulation-id+` =
+`0x4B43`) instead of the payload; a same-host, ZC-capable reader maps the pool, resolves the reference, and
+delivers the real bytes. v1 is **best-effort**; the win is **large samples** crossing as a tiny reference (no
+payload copy into the transport). The reference rides the **existing DATA path** (UDP or the SHMEM ring) through
+the full RTPS machinery unchanged.
+
+**Selection (all must hold, else normal serialized DATA — exactly one of {reference, payload} per reader, no
+double-delivery):** `*zerocopy-enabled*` was `T` at `make-disc-node` (so the node built a pool — the pool slot,
+not the special, is the runtime gate, mirroring `disc-node-shmem`; this matters because the receiver/async
+threads cannot see a later dynamic binding); the matched reader is **same-host** (`host-uuid` match) and
+advertised **`PID_ZEROCOPY_CAPABLE`** (`0x8041`) in SEDP; and the serialized payload is **larger than
+`*zerocopy-min-payload-bytes*`** (default 1024 — small samples are not worth a slot + a reference). A pool
+saturated with in-read slots, or a payload larger than a slot, falls back to normal serialized DATA. The
+reference is **untrusted cross-process input**: the resolver bounds-checks the slot index and validates the slot
+**generation** (the single guard against stale, force-reclaimed, and forged references) before any slot access,
+even at `(safety 0)` (NFR-SEC-POSTURE); an invalid reference is dropped (best-effort). With `*zerocopy-enabled*`
+`nil` (the default) the data path is **byte-identical** to the non-ZC path.
+
+| Symbol | Kind | Meaning |
+|---|---|---|
+| `dds.disc:*zerocopy-enabled*` | special var | **Default `NIL`.** Read once per node at `make-disc-node`; when `T` (and SHMEM is available) the node builds a Zero-Copy writer pool and advertises `PID_ZEROCOPY_CAPABLE`. NOT cleared for ship — pending counsel (R6). |
+| `dds.disc:*zerocopy-min-payload-bytes*` | special var | Size threshold (default 1024): only a serialized payload **strictly larger** is sent as a reference. A local policy, not a wire constant. |
+| `dds.disc:+zerocopy-pool-slots+` / `+zerocopy-pool-slot-bytes+` | constants | Shared pool geometry (32 slots x 65536 octets), used by **both** pool creation and the reader's attach sizing (one definition). |
+| `dds.disc:disc-node-zc-sends` | accessor | Count of samples this node published as a 16-byte reference (proof/diagnostic). |
+| `dds.rtps.discovery:endpoint-data-zerocopy-capable` | accessor | T iff the endpoint advertised `PID_ZEROCOPY_CAPABLE` (fail-open: absent → NIL). |
+| `dds.cdr:+zc-encapsulation-id+` / `encode-zc-reference` / `parse-zc-reference` | constant / functions | The 20-octet reference codec (4-octet encapsulation header + `{slot-index, generation, slot-bytes, reserved}` LE). |
+| `dds.xport.zerocopy` | package | The SHMEM sample-pool (`%zc-loan`/`%zc-resolve`/`%zc-release`, pshared-mutex-guarded — full Clasp parity, no foreign-SAP CAS). |
+
+The pool segment name derives deterministically from the writer GUID (`seg-name-for-guid` + `"z"`), so the
+reader maps it with no extra advertisement. The cross-vendor case is out of scope (the segment + encapsulation
+are ours — there is no standard RTPS zero-copy wire format). On the Clasp/macOS NFR-PORT gap (no by-name attach)
+Zero-Copy is unavailable for the same reason as SHMEM; its end-to-end test pass-skips.
+
+### Measured (Phase E) — bench + a real 2-process round-trip
+
+`make bench-zerocopy` (`dds.bench:run-bench-zerocopy`) compares Zero-Copy vs serialized-SHMEM vs UDP at
+4/16/64 KiB and writes `bench/report/2026-06-14-wp-zerocopy.md`. For LARGE same-host samples Zero-Copy is a
+clear **latency** win (≈2.5x–3.9x lower one-way median vs UDP loopback; up to **15.8x** vs the fragmented SHMEM
+path — only a 16-byte reference crosses, so there is no fragmentation/reassembly round-trip) and a **throughput**
+win that grows with payload size (up to **9.9x** vs SHMEM at 64 KiB). The 512 B control row (below the threshold)
+shows `zc-sends = 0` — the writer correctly falls back to normal DATA — and every above-threshold row asserts
+`disc-node-zc-sends` advanced, so the Zero-Copy figures are proven to have crossed as a reference. **Honest
+caveat (FR-LANG-7):** the v1 reader resolve over-allocates a slot-sized scratch sink per sample, so the
+per-sample *allocation* win only materializes once the sample approaches the slot size (64 KiB); at 4/16 KiB
+Zero-Copy conses more than SHMEM. Sizing the sink to the parsed length (cheap) and ultimately read-in-place
+(FlatData) turn the allocation win on at all sizes.
+
+`make zc-xproc` (`scripts/zerocopy-roundtrip.sh`, `dds.shapes:run-zc-xproc-pub`/`run-zc-xproc-sub`) launches two
+**separate SBCL OS processes** that discover over loopback UDP and exchange large `LargeData` samples; the
+publisher stores each in its pool and sends only a reference, and the subscriber resolves it from the writer's
+pool **cross-process** and verifies the payload byte-exact (PASS = sub received ≥ threshold byte-exact AND the
+pub's `zc-sends > 0`). This is the proof a within-image test cannot give: the reference resolves across the OS
+boundary. SBCL only (Clasp/macOS inherits the SHMEM by-name-attach gap). **Reliable Zero-Copy and literal
+read-in-place / FlatData are follow-ups (out of scope v1).**
+
 ### NFR-PORT gap — Clasp/macOS-arm64
 
 **SBCL has full SHMEM on every platform.** On **Clasp/macOS-arm64** the transport is unavailable: Clasp's CFFI
@@ -457,7 +520,11 @@ affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and fore
   NFR-PORT gap — see [SHMEM architecture](#shmem-architecture) above). Multicast (`SO_REUSEPORT` +
   `IP_ADD_MEMBERSHIP` + loopback) is wired in the PAL for SPDP discovery; the OS-specific socket-option constants
   are gated by **OS** reader conditionals (`#+darwin`/`#-darwin`) in `pal-net.lisp`, not impl ones.
-- **Planned:** Zero-Copy-over-SHMEM (reuses this segment + notification machinery), a TCP transport, a Linux
+- **Landed (gated, default-OFF):** Zero-Copy-over-SHMEM (WP-ZEROCOPY, FR-PF-3) — a per-writer SHMEM
+  sample-pool + 16-byte-reference passing for large same-host samples, behind `dds.disc:*zerocopy-enabled*`
+  (default `NIL`) and **NOT cleared for ship pending counsel (R6, ADR 0014)**. See
+  [Zero-Copy over SHMEM](#zero-copy-over-shmem-wp-zerocopy--default-off-r6-patent-gated) above.
+- **Planned:** literal 0-copy read-in-place (WP-FLATDATA), reliable Zero-Copy, a TCP transport, a Linux
   `futex` notification fast-path for SHMEM, a lock-free-MPSC ring, and a raw `recvmmsg`/`sendmmsg`/iovec batched
   send/recv fast path. The UDP send is one datagram per `socket-send` (small samples are coalesced first).
 - **Per-impl rule:** `#+sbcl`/`#+clasp` reader conditionals live **only** under `dds-pal/` (`pal-sbcl.lisp` and

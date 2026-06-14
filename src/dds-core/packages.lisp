@@ -10,7 +10,7 @@
     bounds-checked at the boundary (NFR-SEC-POSTURE). Alignment is relative to a
     settable origin (default 0); the codec sets it past the encapsulation header
     per RTPS 2.5 §10.2.")
-  (:export #:octet-buffer #:make-octet-buffer #:octet-buffer-vec
+  (:export #:octet-buffer #:make-octet-buffer #:octet-buffer-over #:octet-buffer-vec
            #:octet-buffer-capacity #:buffer-sap
            #:cursor #:cursor-buffer #:cursor-position #:cursor-endianness
            #:cursor-origin #:cursor-set-origin #:cursor-set-endianness #:cursor-set-position

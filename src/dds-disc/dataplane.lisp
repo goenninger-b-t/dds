@@ -304,8 +304,23 @@
           (lambda (mc) (dds.rtps.message:write-heartbeat
                         mc dds.rtps.message:+entityid-unknown+ wid first last count :final nil)))))
 
-(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest)
-    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons) &optional t) t)
+(defun* %zc-change-item (node change zc-readers)
+    (function (disc-node dds.rtps.history:cache-change (integer 0)) (or null cons))
+  "WP-ZEROCOPY (FR-PF-3, ADR 0014): if CHANGE is a :data sample whose serialized payload is LARGER than
+   *zerocopy-min-payload-bytes* AND ZC-READERS (same-host ZC-capable readers at this destination) > 0,
+   loan the payload into the writer pool and return a (SIZE . BUILD-FN) DATA item carrying the 16-byte
+   reference (%zc-ref-builder). NIL when not ZC-eligible OR the pool is saturated — the caller then emits
+   the FULL serialized payload (no loss, exactly one of {ref, payload} per reader). ZC-READERS is used
+   only as a >0 GATE; the slot refcount is 1 (this ref reaches ONE destination, resolved ONCE there —
+   see %zc-ref-builder). NOT cleared for ship — pending counsel (R6)."
+  (when (and (plusp zc-readers)
+             (eq (dds.rtps.history:cache-change-kind change) :data))
+    (let ((pl (dds.rtps.history:cache-change-serialized-payload change)))
+      (when (> (length pl) *zerocopy-min-payload-bytes*)
+        (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 (length pl) 1)))))
+
+(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest (zc-readers 0))
+    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons) &optional t (integer 0)) t)
   "Send CHANGES (+ optional trailing HEARTBEAT item HB, a (SIZE . BUILD-FN)) to HOST:PORT, coalescing the
    small ones into as few datagrams as fit the budget (%send-packed): collect a %data-builder item per
    SMALL change (a SN in *DEBUG-DROP-SAMPLE-NUMBERS* is skipped — loss injection preserved), send each
@@ -313,12 +328,17 @@
    pack. This is the shared writer push/retransmit emit path (RTPS 2.5 §8.3.4 §8.4.2.2). When SHMEM-DEST is
    supplied the COALESCED small-sample datagrams go over shared memory with UDP fallback (FR-XPORT-2);
    large fragmented samples stay on UDP in v1 (the bulk small-sample path is the SHMEM throughput target).
-   NIL SHMEM-DEST is the original all-UDP behaviour, byte-for-byte."
+   NIL SHMEM-DEST is the original all-UDP behaviour, byte-for-byte. ZC-READERS > 0 (WP-ZEROCOPY, FR-PF-3)
+   substitutes a 16-byte reference for a large :data sample's payload at THIS destination (%zc-change-item)
+   instead of fragmenting it — exactly one of {ref, full payload} reaches each reader (no double-delivery);
+   ZC-READERS 0 (the default, and always when *zerocopy-enabled* is nil) is the existing path verbatim."
   (let ((items '()))
     (dolist (change changes)
-      (let ((sn (dds.rtps.history:cache-change-sn change)))
+      (let ((sn (dds.rtps.history:cache-change-sn change))
+            (zc nil))
         (cond
           ((and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*)))
+          ((setf zc (%zc-change-item node change zc-readers)) (push zc items))   ; WP-ZEROCOPY: ref, not payload
           ((%small-change-p change) (push (%data-builder node change) items))
           (t (%send-sample node buf sn
                            (dds.rtps.history:cache-change-serialized-payload change) host port)))))
@@ -434,6 +454,67 @@
     (when (typep k '(simple-array (unsigned-byte 8) (16)))
       (%shmem-dest node (subseq k 0 12)))))
 
+(defun* %reader-zc-capable-p (node reader-guid)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) t)
+  "T iff the matched remote reader with 16-octet READER-GUID is BOTH same-host SHMEM-reachable (its
+   participant is a %shmem-dest peer — host-uuid match + a SHMEM receive segment) AND advertised
+   PID_ZEROCOPY_CAPABLE in SEDP (WP-ZEROCOPY, FR-PF-3, ADR 0014). The endpoint-data is read from the
+   matches table; off the hot path (called once per push group, not per sample). NIL on any miss."
+  (let ((ep (dds.pal:with-lock ((disc-node-lock node))
+              (gethash reader-guid (disc-node-matches node)))))
+    (and ep
+         (dds.rtps.discovery:endpoint-data-zerocopy-capable ep)
+         (%shmem-dest node (subseq reader-guid 0 12))
+         t)))
+
+(defun* %zc-readers (node targets)
+    (function (disc-node list) (integer 0))
+  "WP-ZEROCOPY (FR-PF-3, ADR 0014): the count of reader keys in TARGETS (a %reader-push-targets group's
+   cdr — 16-octet matched-reader GUIDs) that are same-host AND ZC-capable, when this node has a writer
+   pool (the pool exists iff *zerocopy-enabled* was set at make-disc-node — gate on the SLOT, not the
+   special, since the WP-ASYNC sender thread that also pushes cannot see a dynamic binding). 0 disables
+   zero-copy for the group (the writer sends normal DATA — the no-double-delivery fallback), so the
+   flag-off (no-pool) path is untouched."
+  (if (disc-node-zc-pool node)
+      (count-if (lambda (k)
+                  (and (typep k '(simple-array (unsigned-byte 8) (16)))
+                       (%reader-zc-capable-p node k)))
+                targets)
+      0))
+
+(defun* %encode-zc-ref-vec (slot generation slot-bytes)
+    (function ((unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)) (simple-array (unsigned-byte 8) (20)))
+  "Encode a 20-octet WP-ZEROCOPY SerializedPayload reference (encode-zc-reference) into a fresh vector.
+   The 20-byte alloc is negligible against the large-sample payload copy it REPLACES; this file is not a
+   measured hot path (the gated hot-path files are untouched). ADR 0014, FR-PF-3."
+  (let* ((v (make-array 20 :element-type '(unsigned-byte 8)))
+         (c (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over v) :endianness :little)))
+    (dds.cdr:encode-zc-reference c slot generation slot-bytes)
+    v))
+
+(defun* %zc-ref-builder (node sn payload off len resolves)
+    (function (disc-node integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) (integer 1))
+              (or null cons))
+  "WP-ZEROCOPY (FR-PF-3, ADR 0014): loan PAYLOAD[off,off+len) into this node's writer pool with refcount
+   RESOLVES (the number of times the slot will be resolved+released), and return a (SIZE . BUILD-FN)
+   packable DATA item (SN) whose SerializedPayload is the resulting 20-octet zero-copy reference — drop-in
+   for %data-builder so the ref rides the existing coalesced DATA path. Returns NIL if the pool is
+   saturated / the payload exceeds a slot (%zc-loan NIL) so the caller falls back to the full serialized
+   payload (no loss, no double-delivery). RESOLVES is ONE here: this ref is emitted to a SINGLE
+   destination and a DATA with readerId UNKNOWN is processed ONCE by that participant's receiver
+   (%on-user-data -> one %zc-release), regardless of how many reader endpoints are co-located there — so
+   refcount 1 frees the slot after that single resolve (refcount = the matched-reader COUNT would leak the
+   slot when a destination has >1 ZC reader endpoint). Bumps zc-sends. NOT cleared for ship — counsel (R6)."
+  (multiple-value-bind (slot gen)
+      (dds.xport.zerocopy::%zc-loan (disc-node-zc-pool-sap node) payload off len resolves)
+    (when slot
+      (incf (disc-node-zc-sends node))
+      (let ((ref (%encode-zc-ref-vec slot gen +zerocopy-pool-slot-bytes+))
+            (wid (disc-node-user-writer-id node)))
+        (cons (+ 24 (length ref))   ; mirrors %data-builder's small-:data SIZE (4 hdr + 20 body-prefix + payload)
+              (lambda (mc) (dds.rtps.message:write-data
+                            mc dds.rtps.message:+entityid-unknown+ wid sn ref 0 (length ref))))))))
+
 (defun* %push-data-buf (node buf)
     (function (disc-node dds.core.buffer:octet-buffer) t)
   "Writer side: send each UNSENT change ONCE as a DATA (or DATA_FRAG series for large samples)
@@ -444,14 +525,17 @@
    §8.3.5.4); %merge-unsent advances every reader sharing a destination and sends their union once. Lost
    or late changes are repaired only via the reader's ACKNACK (%on-user-acknack). When a destination is a
    same-host SHMEM peer (%group-shmem-dest) the coalesced small-sample datagrams take shared memory with
-   UDP fallback (FR-XPORT-2); the reader's ACKNACK return path is UDP (%on-user-heartbeat, untouched)."
+   UDP fallback (FR-XPORT-2); the reader's ACKNACK return path is UDP (%on-user-heartbeat, untouched).
+   When the destination's readers are same-host ZC-capable (%zc-readers > 0, WP-ZEROCOPY FR-PF-3) a large
+   :data sample crosses as a 16-byte reference instead of a fragmented payload; ZC off -> 0 -> untouched."
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (dolist (group (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched-reader destination
         (%send-changes-packed node buf
                               (%merge-unsent writer (cdr group)) (caar group) (cdar group)
                               (%heartbeat-builder node first last count)
-                              (%group-shmem-dest node group))))))
+                              (%group-shmem-dest node group)
+                              (%zc-readers node (cdr group)))))))
 
 (defun* %push-data (node)
     (function (disc-node) t)
@@ -669,6 +753,54 @@
   (or (gethash guid outer)
       (setf (gethash (copy-seq guid) outer) (make-hash-table :test 'eql))))
 
+(defun* %zc-attach-pool (node src-prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
+  "WP-ZEROCOPY reader side (FR-PF-3, ADR 0014): the mapped base SAP of the writer pool published by the
+   participant at SRC-PREFIX, or NIL if the pool cannot be opened (a forged/stale source prefix derives a
+   deterministic %zc-pool-name that simply does not exist -> shm-attach errors -> cached as :none, dropped
+   — never a crash). MEMOIZED per source prefix under zc-attach-lock (attach once per remote writer; two
+   receiver threads racing the first attach for one writer are serialized). The attach SIZE uses the
+   SHARED geometry constants (+zerocopy-pool-slots+ / +zerocopy-pool-slot-bytes+), NOT a wire-supplied
+   value, so an untrusted ref can never size the mapping (NFR-SEC-POSTURE)."
+  (dds.pal:with-lock ((disc-node-zc-attach-lock node))
+    (let ((cached (gethash src-prefix (disc-node-zc-attach-cache node))))
+      (cond
+        ((eq cached :none) nil)
+        (cached (dds.pal:shm-sap cached))
+        (t (let ((seg (ignore-errors
+                       (dds.pal:shm-attach (%zc-pool-name src-prefix)
+                                           (dds.xport.zerocopy::%zc-bytes
+                                            +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+)))))
+             (setf (gethash (copy-seq src-prefix) (disc-node-zc-attach-cache node)) (or seg :none))
+             (and seg
+                  (dds.xport.zerocopy::%zc-validate (dds.pal:shm-sap seg))   ; ABI magic/version guard
+                  (dds.pal:shm-sap seg))))))))
+
+(defun* %zc-try-resolve (node buf poff plen src-prefix)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0) (integer 0)
+              (simple-array (unsigned-byte 8) (12))) t)
+  "WP-ZEROCOPY reader side (FR-PF-3, ADR 0014): test the DATA SerializedPayload at BUF[poff,poff+plen)
+   for a 16-byte zero-copy reference. Returns :NOT-A-REF for a normal payload (the caller delivers it
+   unchanged); a fresh (simple-array (unsigned-byte 8)) holding the RESOLVED serialized payload on a valid
+   ref (attach the writer pool, %zc-resolve under its mutex, %zc-release); or NIL when it IS a ref but
+   resolution fails (stale/forced-reclaimed/OOB/attach-fail) — best-effort DROP, no delivery, no crash.
+   The ref is UNTRUSTED cross-process input: parse-zc-reference bounds-checks the payload region and
+   %zc-resolve bounds-checks slot-index + validates generation against the slot header (NFR-SEC-POSTURE)."
+  (multiple-value-bind (slot gen slot-bytes)
+      (dds.cdr:parse-zc-reference (dds.core.buffer:octet-buffer-vec buf) poff plen)
+    (declare (ignore slot-bytes))
+    (if (null slot)
+        :not-a-ref
+        (let ((sap (%zc-attach-pool node src-prefix)))
+          (when sap
+            (let* ((sink (make-array +zerocopy-pool-slot-bytes+ :element-type '(unsigned-byte 8)))
+                   (len (dds.xport.zerocopy::%zc-resolve sap slot gen sink)))
+              (dds.xport.zerocopy::%zc-release sap slot gen)   ; decrement refcount (frees the slot at 0); no-op if already stale
+              (when len
+                (let ((vec (make-array len :element-type '(unsigned-byte 8))))
+                  (replace vec sink :end2 len)
+                  vec))))))))
+
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
               (simple-array (unsigned-byte 8) (12))) t)
@@ -690,11 +822,26 @@
 (defun* %on-user-data (node writer-id sn buf poff plen src-prefix)
     (function (disc-node (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)
               (simple-array (unsigned-byte 8) (12))) t)
-  "Reader side: copy the [poff,plen) SerializedPayload out of the receive buffer and deliver it
-   (dedup/reorder, store by SN, fire ON-SAMPLE outside the node lock — no lock-order inversion)."
-  (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
-    (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
-    (%deliver-user-sample node writer-id sn vec src-prefix)))
+  "Reader side: deliver the DATA SerializedPayload at BUF[poff,poff+plen). WP-ZEROCOPY (FR-PF-3, ADR
+   0014): when this node has a ZC pool (which exists iff *zerocopy-enabled* was set at make-disc-node —
+   the gate is the SLOT, not the special, because this runs on the receiver thread where a dynamic
+   binding is invisible), FIRST test the payload for a 16-byte zero-copy reference (%zc-try-resolve) — a
+   valid ref is resolved from the writer pool to the real serialized payload (then delivered exactly as a
+   normal sample); an INVALID ref (stale/forced/OOB/attach-fail) is DROPPED best-effort (no delivery, no
+   crash); a normal payload (:not-a-ref) takes the existing copy-and-deliver path verbatim. With ZC off
+   (no pool) the ref test is skipped entirely — byte-identical to today (dedup/reorder, store by SN, fire
+   ON-SAMPLE outside the node lock — no lock-order inversion)."
+  (let ((zc (if (disc-node-zc-pool node)   ; the pool's existence == ZC armed at make-disc-node (slot, not the special: this runs on the receiver thread, where a dynamic binding of *zerocopy-enabled* is invisible — mirrors disc-node-shmem)
+                (%zc-try-resolve node buf poff plen src-prefix)
+                :not-a-ref)))                                       ; ZC off: never inspected -> normal path
+    (cond
+      ((null zc))                                                   ; armed + ref present but resolution FAILED -> drop (best-effort)
+      ((eq zc :not-a-ref)                                           ; normal payload (or ZC off): existing path, byte-identical
+       (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
+         (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
+         (%deliver-user-sample node writer-id sn vec src-prefix)))
+      (t (%deliver-user-sample node writer-id sn zc src-prefix)))   ; resolved ZC payload
+    t))
 
 (defun* %on-user-heartbeat (node c flags src-prefix)
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)

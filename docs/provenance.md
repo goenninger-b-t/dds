@@ -1263,3 +1263,27 @@ vendor's SHMEM/data-sharing implementation was read or copied.
   cross-image round-trip), under fuzz (the ring record parser), and by an SBCL-vs-UDP-loopback benchmark
   (`bench/report/2026-06-14-wp-shmem.md`) — none of which involves a vendor artifact.
 - 165 tests green SBCL; gate-types + gate-hotpath + fuzz + mem green.
+
+## M5 (2026-06-14) — WP-ZEROCOPY per-writer SHMEM sample-pool (FR-PF-3, ADR 0014)
+
+The per-writer SHMEM sample-pool (`src/dds-xport/zerocopy-pool.lisp`) is **clean-room
+from FR-PF-3 + the OMG DDSI-RTPS 2.5 spec only** — no RTI Connext source, headers, or
+`rtiddsgen` output was consulted.
+
+- **Sources consulted**: POSIX.1-2017 (the `pshared` mutex primitives, already covered
+  under WP-SHMEM, ADR 0013); the operating contract §4 (FR-PF-3 feature requirement);
+  the in-repo OMG DDSI-RTPS 2.5 spec (the 16-byte reference payload encoding). No RTI
+  Zero-Copy patent / whitepaper / header / source was read.
+- **The pool layout, slot lifecycle, and the 16-byte reference format are this project's
+  own design.** The SHMEM segment layout (`{header: magic + version + slot-count +
+  slot-bytes + free-head + pshared-mutex} + K slots`), each slot's sub-layout
+  (`{refcount:u32, generation:u32, len:u32, _pad:u32, pubseq:u64, payload:slot-bytes}`),
+  the freelist-over-`len` encoding while free, the generation-bump + force-reclaim
+  lifecycle, the `*zc-pubseq*` monotonic ordering for oldest-slot reclaim, and the
+  segment-naming convention (from the writer GUID) are not taken from any spec clause or
+  vendor artifact. Pinned in ADR 0014; constants are vendor-chosen (not OMG-assigned).
+- **NOT cleared for ship — pending counsel (R6).** The operating contract and ADR 0014
+  require counsel to perform the authoritative claim clearance before any
+  `*zerocopy-enabled*`-on ship. This entry records provenance for that review.
+- **No RTI Connext / Fast DDS / Cyclone / OpenDDS source, headers, or generated code**
+  was read or copied for this work package.

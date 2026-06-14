@@ -38,6 +38,12 @@
   "Inverse of representation-id-value, or NIL if VALUE is unrecognised."
   (car (rassoc value +representation-ids+)))
 
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
+(defconstant +zc-encapsulation-id+ #x4B43
+  "Vendor SerializedPayload encapsulation id for a WP-ZEROCOPY 16-byte reference (ADR 0014; ours, NOT a
+   spec clause). A reader without ZC sees an unknown representation id and ignores the sample (fail-open).
+   NOT cleared for ship — pending counsel (R6).")
+
 (defun* make-encapsulation-header (cursor representation &optional (options 0))
     (function (dds.core.buffer:cursor symbol &optional integer) dds.core.buffer:cursor)
   "Write the 4-octet SerializedPayloadHeader: 2-octet representation_identifier in
@@ -71,6 +77,44 @@
            (vec (dds.core.buffer:octet-buffer-vec (dds.core.buffer:cursor-buffer cursor))))
       (setf (aref vec 3) (logior (logandc2 (aref vec 3) 3) pad))))
   cursor)
+
+(defun* encode-zc-reference (cursor slot-index generation slot-bytes)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)) t)
+  "Write a 20-octet WP-ZEROCOPY SerializedPayload: +zc-encapsulation-id+ in NBO (hi, lo),
+   options=0 (hi, lo), then slot-index, generation, slot-bytes, reserved=0 as LE u32s (ADR 0014)."
+  ;; encap id in NBO byte-by-byte, matching make-encapsulation-header convention
+  (dds.core.buffer:put-u8 cursor (ldb (byte 8 8) +zc-encapsulation-id+))
+  (dds.core.buffer:put-u8 cursor (ldb (byte 8 0) +zc-encapsulation-id+))
+  (dds.core.buffer:put-u8 cursor 0)
+  (dds.core.buffer:put-u8 cursor 0)
+  ;; 16-byte body: four u32 fields in LE (ours-to-ours, ADR 0014)
+  (dds.core.buffer:put-u32 cursor slot-index)
+  (dds.core.buffer:put-u32 cursor generation)
+  (dds.core.buffer:put-u32 cursor slot-bytes)
+  (dds.core.buffer:put-u32 cursor 0)
+  cursor)
+
+(defun* parse-zc-reference (buf off len)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0))
+              (values (or null (unsigned-byte 32)) (unsigned-byte 32) (unsigned-byte 32)))
+  "If BUF[off, off+len) is a WP-ZEROCOPY 16-byte reference (len>=20, leading u16==+zc-encapsulation-id+),
+   return (values slot-index generation slot-bytes); else (values NIL 0 0). Bounds-checked (NFR-SEC-POSTURE)."
+  (unless (and (>= len 20)
+               (>= (length buf) (+ off 20)))
+    (return-from parse-zc-reference (values nil 0 0)))
+  ;; encap id in NBO: hi byte at off+0, lo at off+1 (matches encode-zc-reference write convention)
+  (let ((id (logior (ash (aref buf off) 8) (aref buf (+ off 1)))))
+    (unless (= id +zc-encapsulation-id+)
+      (return-from parse-zc-reference (values nil 0 0)))
+    ;; body at off+4: four LE u32s (slot-index, generation, slot-bytes, reserved)
+    (flet ((le-u32 (base)
+             (logior (aref buf base)
+                     (ash (aref buf (+ base 1)) 8)
+                     (ash (aref buf (+ base 2)) 16)
+                     (ash (aref buf (+ base 3)) 24))))
+      (values (le-u32 (+ off 4))
+              (le-u32 (+ off 8))
+              (le-u32 (+ off 12))))))
 
 (defun* parse-encapsulation-header (cursor)
     (function (dds.core.buffer:cursor) (values t integer (integer 0 3)))

@@ -472,6 +472,144 @@
            t)
       (dds.pal:free-static m))))
 
+(defun* run-zc-pool-init-test ()
+    (function () (eql t))
+  "WP-ZEROCOPY pool layout + init/validate (FR-PF-3, ADR 0014; R6 off-by-default feature): a 4-slot pool of
+   256-byte slots, in a static foreign region (no SHMEM segment needed for the unit), validates, reports its
+   slot-count, and threads all 4 slots onto the freelist."
+  (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 4 256))))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m)))
+           (dds.xport.zerocopy::%zc-init sap 4 256)
+           (%check :zc-validate (dds.xport.zerocopy::%zc-validate sap) "pool validate after init")
+           (%check :zc-slot-count (= 4 (dds.xport.zerocopy::%zc-slot-count sap)) "slot-count round-trip")
+           (%check :zc-slot-bytes (= 256 (dds.xport.zerocopy::%zc-slot-bytes sap)) "slot-bytes round-trip")
+           (%check :zc-free-count (= 4 (dds.xport.zerocopy::%zc-free-count sap)) "all 4 slots on the freelist")
+           (dds.xport.zerocopy::%zc-destroy sap)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-zc-pool-loan-test ()
+    (function () (eql t))
+  "WP-ZEROCOPY loan/release (FR-PF-3, ADR 0014): in a 2-slot pool, two loans take distinct slots; a third
+   loan force-reclaims the oldest (slot 0) with a bumped generation; releasing a valid (slot,generation)
+   succeeds; releasing with a stale generation is a no-op (NIL)."
+  (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
+        (payload (octets 1 2 3 4)))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m)))
+           (dds.xport.zerocopy::%zc-init sap 2 32)
+           (multiple-value-bind (i0 g0) (dds.xport.zerocopy::%zc-loan sap payload 0 4 1)
+             (multiple-value-bind (i1 g1) (dds.xport.zerocopy::%zc-loan sap payload 0 4 1)
+               (%check :zc-loan-i0 (eql i0 0) "first loan must take slot 0")
+               (%check :zc-loan-i1 (eql i1 1) "second loan must take slot 1")
+               (%check :zc-loan-distinct (/= i0 i1) "two loans must take distinct slots")
+               (%check :zc-loan-g0 (= g0 1) "first loan bumps slot 0 generation to 1")
+               (%check :zc-loan-g1 (= g1 1) "second loan bumps slot 1 generation to 1")
+               ;; pool now full -> third loan force-reclaims the oldest (slot 0, lowest pubseq)
+               (multiple-value-bind (i2 g2) (dds.xport.zerocopy::%zc-loan sap payload 0 4 1)
+                 (%check :zc-reclaim-oldest (eql i2 0) "third loan must force-reclaim the oldest slot (0)")
+                 (%check :zc-reclaim-gen (= g2 2) "force-reclaim must bump slot 0 generation to 2")
+                 ;; a release with the STALE generation g0 (now superseded by g2) is a no-op
+                 (%check :zc-release-stale (null (dds.xport.zerocopy::%zc-release sap i0 g0))
+                         "release with a stale generation must be a no-op (NIL)")
+                 ;; a release of the live (slot,generation) succeeds and frees the slot
+                 (%check :zc-release-valid (dds.xport.zerocopy::%zc-release sap i2 g2)
+                         "release of a live (slot,generation) must succeed (T)")
+                 ;; slot 0 is back on the freelist; slot 1 is still loaned -> exactly one free
+                 (%check :zc-release-frees (= 1 (dds.xport.zerocopy::%zc-free-count sap))
+                         "the released slot must return to the freelist (free-count 1)")
+                 ;; a double-release of a freed slot must NOT push it onto the freelist again
+                 ;; (the refcount-0 guard prevents a freelist cycle; the free-count stays 1)
+                 (dds.xport.zerocopy::%zc-release sap i2 g2)
+                 (%check :zc-release-no-double-free (= 1 (dds.xport.zerocopy::%zc-free-count sap))
+                         "a double-release must not re-push the slot (free-count stays 1)")
+                 ;; an out-of-range slot index is a no-op (untrusted bounds)
+                 (%check :zc-release-oob (null (dds.xport.zerocopy::%zc-release sap 99 0))
+                         "release of an out-of-range slot must be a no-op (NIL)"))))
+           (dds.xport.zerocopy::%zc-destroy sap)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-zc-pool-resolve-test ()
+    (function () (eql t))
+  "WP-ZEROCOPY reader resolve (FR-PF-3, ADR 0014; NFR-SEC-POSTURE): loan a payload, resolve (slot,gen) into
+   a sink -> returns LEN and the bytes match; a wrong generation or an out-of-range slot returns NIL and
+   copies nothing (the sink is left untouched)."
+  (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
+        (payload (octets 11 22 33 44 55)))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m))
+               (sink (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xEE)))
+           (dds.xport.zerocopy::%zc-init sap 2 32)
+           (multiple-value-bind (i g) (dds.xport.zerocopy::%zc-loan sap payload 0 5 1)
+             (let ((len (dds.xport.zerocopy::%zc-resolve sap i g sink)))
+               (%check :zc-resolve-len (eql len 5) "resolve must return the loaned LEN (5)")
+               (%check :zc-resolve-bytes
+                       (loop for k below 5 always (= (aref sink k) (aref payload k)))
+                       "resolve must copy the slot payload bytes into the sink"))
+             ;; wrong generation -> NIL, no copy (the sink past the first resolve stays the sentinel)
+             (let ((sink2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xEE)))
+               (%check :zc-resolve-wrong-gen
+                       (null (dds.xport.zerocopy::%zc-resolve sap i (logand (1+ g) #xFFFFFFFF) sink2))
+                       "resolve with a wrong generation must return NIL")
+               (%check :zc-resolve-wrong-gen-nocopy
+                       (loop for k below 32 always (= (aref sink2 k) #xEE))
+                       "a wrong-generation resolve must copy nothing")
+               ;; out-of-range slot index -> NIL, no copy (untrusted bounds)
+               (%check :zc-resolve-oob
+                       (null (dds.xport.zerocopy::%zc-resolve sap 99 g sink2))
+                       "resolve of an out-of-range slot must return NIL")
+               (%check :zc-resolve-oob-nocopy
+                       (loop for k below 32 always (= (aref sink2 k) #xEE))
+                       "an out-of-range resolve must copy nothing")))
+           (dds.xport.zerocopy::%zc-destroy sap)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-zc-pool-align-test ()
+    (function () (eql t))
+  "WP-ZEROCOPY slot-stride 8-alignment regression (FR-PF-3, ADR 0014): a pool with slot-bytes=13
+   (non-8-aligned) and 3 slots loans distinct payloads into slots 0,1,2 (the slots that would be
+   misaligned without the fix), resolves each back into a sink, asserts byte-exact match, then
+   releases each. Without %zc-slot-stride rounding, slot 1+ would be misaligned and the u64 pubseq
+   store/load (dds.pal:store/load-sap-u64, documented aligned) would be UB on strict-align targets."
+  (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 3 13))))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m))
+               (p0 (octets 1 2 3 4 5 6 7 8 9 10 11 12 13))
+               (p1 (octets 20 21 22 23 24 25 26 27 28 29 30 31 32))
+               (p2 (octets 40 41 42 43 44 45 46 47 48 49 50 51 52))
+               (sink (make-array 13 :element-type '(unsigned-byte 8) :initial-element 0)))
+           (dds.xport.zerocopy::%zc-init sap 3 13)
+           (multiple-value-bind (i0 g0) (dds.xport.zerocopy::%zc-loan sap p0 0 13 1)
+             (multiple-value-bind (i1 g1) (dds.xport.zerocopy::%zc-loan sap p1 0 13 1)
+               (multiple-value-bind (i2 g2) (dds.xport.zerocopy::%zc-loan sap p2 0 13 1)
+                 (%check :zc-align-slots-distinct (and (/= i0 i1) (/= i1 i2) (/= i0 i2))
+                         "three loans must use three distinct slots")
+                 ;; resolve each and assert byte-exact payload recovery
+                 (let ((len0 (dds.xport.zerocopy::%zc-resolve sap i0 g0 sink)))
+                   (%check :zc-align-resolve0-len (eql len0 13) "slot 0 resolve must return 13")
+                   (%check :zc-align-resolve0-bytes
+                           (loop for k below 13 always (= (aref sink k) (aref p0 k)))
+                           "slot 0 payload mismatch (misaligned pubseq would corrupt or fault here)"))
+                 (let ((len1 (dds.xport.zerocopy::%zc-resolve sap i1 g1 sink)))
+                   (%check :zc-align-resolve1-len (eql len1 13) "slot 1 resolve must return 13")
+                   (%check :zc-align-resolve1-bytes
+                           (loop for k below 13 always (= (aref sink k) (aref p1 k)))
+                           "slot 1 payload mismatch (misaligned without fix)"))
+                 (let ((len2 (dds.xport.zerocopy::%zc-resolve sap i2 g2 sink)))
+                   (%check :zc-align-resolve2-len (eql len2 13) "slot 2 resolve must return 13")
+                   (%check :zc-align-resolve2-bytes
+                           (loop for k below 13 always (= (aref sink k) (aref p2 k)))
+                           "slot 2 payload mismatch (misaligned without fix)"))
+                 (dds.xport.zerocopy::%zc-release sap i0 g0)
+                 (dds.xport.zerocopy::%zc-release sap i1 g1)
+                 (dds.xport.zerocopy::%zc-release sap i2 g2))))
+           (dds.xport.zerocopy::%zc-destroy sap)
+           t)
+      (dds.pal:free-static m))))
+
 (defun* run-shmem-locator-wire-test ()
     (function () (eql t))
   "SHMEM Locator_t + PID_SHMEM_HOST_UUID ride additively in SPDP (FR-XPORT-2, ADR 0013):
@@ -520,6 +658,115 @@
       (%check :failopen-zero (zerop (dds.rtps.discovery:spdp-data-host-uuid back))
               "truncated PID_SHMEM_HOST_UUID must leave host-uuid 0 (fail-open)")))
   t)
+
+(defun* run-zc-ref-codec-test ()
+    (function () t)
+  "WP-ZEROCOPY Phase C1: encode-zc-reference round-trips via parse-zc-reference;
+   a normal-representation-id payload returns NIL; a too-short buffer returns NIL (NFR-SEC-POSTURE)."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+         (pool  (dds.core.arena:make-buffer-pool arena 64 4)))
+    (let* ((b  (dds.core.arena:pool-acquire pool))
+           (wc (dds.core.buffer:cursor b :endianness :little)))
+      ;; encode (slot=5, gen=42, slot-bytes=65536)
+      (dds.cdr:encode-zc-reference wc 5 42 65536)
+      (let ((pos (dds.core.buffer:cursor-position wc)))
+        (%check :zc-ref-len (= 20 pos) (format nil "expected 20 octets, got ~d" pos)))
+      ;; round-trip: parse must recover the same values
+      (let ((vec (dds.core.buffer:octet-buffer-vec b)))
+        (multiple-value-bind (idx gen sb) (dds.cdr:parse-zc-reference vec 0 20)
+          (%check :zc-ref-slot-index (eql idx 5)     (format nil "slot-index ~s != 5" idx))
+          (%check :zc-ref-generation (eql gen 42)    (format nil "generation ~s != 42" gen))
+          (%check :zc-ref-slot-bytes (eql sb 65536)  (format nil "slot-bytes ~s != 65536" sb)))
+        ;; a buffer whose leading u16 is CDR_LE (#x0001) must return NIL
+        (let ((normal-buf (make-array 20 :element-type '(unsigned-byte 8) :initial-element 0)))
+          ;; CDR_LE = #x0001: hi=0x00, lo=0x01
+          (setf (aref normal-buf 0) #x00 (aref normal-buf 1) #x01)
+          (multiple-value-bind (idx2 g2 sb2)
+              (dds.cdr:parse-zc-reference normal-buf 0 20)
+            (declare (ignore g2 sb2))
+            (%check :zc-ref-rejects-normal (null idx2) "normal rep-id must return NIL")))
+        ;; a too-short buffer (len 8) must return NIL
+        (multiple-value-bind (idx3 g3 sb3)
+            (dds.cdr:parse-zc-reference vec 0 8)
+          (declare (ignore g3 sb3))
+          (%check :zc-ref-rejects-short (null idx3) "len < 20 must return NIL"))))
+    (dds.core.arena:teardown-arena arena)
+    t))
+
+(defun* run-zc-sedp-flag-test ()
+    (function () t)
+  "WP-ZEROCOPY Phase D1: the SEDP PID_ZEROCOPY_CAPABLE flag round-trips fail-open. An endpoint-data
+   with zerocopy-capable T serializes the vendor PID and parses back T; one without it elides the PID
+   and parses back NIL (an absent PID is the fail-open default, ADR 0014, FR-PF-3)."
+  (let ((arena (dds.core.arena:init-arena :bytes (* 64 1024))))
+    (flet ((roundtrip (zc-p)
+             (let* ((pool (dds.core.arena:make-buffer-pool arena 512 2))
+                    (b (dds.core.arena:pool-acquire pool))
+                    (c (dds.core.buffer:cursor b :endianness :little))
+                    (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+                    (ep (dds.rtps.discovery:make-endpoint-data
+                         :role :writer :guid guid :topic-name "ZcT" :type-name "X"
+                         :zerocopy-capable zc-p)))
+               (dds.cdr:make-encapsulation-header c :pl-cdr-le)
+               (dds.rtps.discovery:serialize-endpoint-data c ep)
+               (let ((rc (dds.core.buffer:cursor b :endianness :little)))
+                 (dds.cdr:parse-encapsulation-header rc)
+                 (dds.rtps.discovery:endpoint-data-zerocopy-capable
+                  (dds.rtps.discovery:parse-endpoint-data rc :writer))))))
+      (%check :zc-sedp-flag-on  (eq t   (roundtrip t))   "zerocopy-capable T must parse back T")
+      (%check :zc-sedp-flag-off (eq nil (roundtrip nil)) "absent PID_ZEROCOPY_CAPABLE must parse back NIL"))
+    (dds.core.arena:teardown-arena arena)
+    t))
+
+(defun* run-zc-resolve-drop-test ()
+    (function () t)
+  "WP-ZEROCOPY Phase D3 (NFR-SEC-POSTURE, FR-PF-3, ADR 0014): a forged 16-byte reference — to a
+   non-existent writer pool AND, against this node's own pool, to a bad slot/generation — is DROPPED
+   safely (best-effort) with no crash and no sample stored. The reference is untrusted cross-process
+   input: %zc-attach-pool tolerates a garbage source prefix (attach fails -> :none -> drop) and %zc-resolve
+   bounds-checks slot-index + validates generation. Skips where SHMEM (hence a ZC pool) is unavailable."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-zc-resolve-drop-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (node (dds.disc:make-disc-node
+                :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 70)
+                :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-reader node :topic "ZcDrop" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber node)
+           (%check :zc-drop-armed (dds.disc::disc-node-zc-pool node) "node must have a ZC pool to exercise the resolve path")
+           ;; forge a zc-ref payload in an octet-buffer at offset 0
+           (let* ((b (dds.core.buffer:make-octet-buffer 64))
+                  (c (dds.core.buffer:cursor b :endianness :little))
+                  (bad-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 99)))   ; no such writer pool
+             (dds.cdr:encode-zc-reference c 3 7 dds.disc:+zerocopy-pool-slot-bytes+)   ; slot 3, gen 7
+             (let ((plen (dds.core.buffer:cursor-position c)))
+               ;; (a) ref to a NON-EXISTENT pool (garbage source prefix) -> drop (NIL), no crash
+               (%check :zc-drop-no-pool
+                       (null (dds.disc::%zc-try-resolve node b 0 plen bad-prefix))
+                       "a ref to a non-existent writer pool must resolve to NIL (drop), not crash")
+               ;; (b) ref to THIS node's own pool but a stale slot/generation -> drop (NIL)
+               (%check :zc-drop-stale-gen
+                       (null (dds.disc::%zc-try-resolve node b 0 plen (dds.disc::disc-node-guid-prefix node)))
+                       "a ref with a non-matching generation must resolve to NIL (drop)")
+               ;; (c) end-to-end via the on-data hook: a forged ref must store NO sample
+               (dds.disc::%on-user-data node #x00000102 1 b 0 plen bad-prefix)
+               (%check :zc-drop-no-sample (zerop (dds.disc:node-sample-count node))
+                       "a forged ZC reference must deliver NO sample (best-effort drop)")
+               ;; (d) a NORMAL (non-ref) payload still delivers on the same path (sanity: drop logic is ref-gated)
+               (let* ((nb (dds.core.buffer:make-octet-buffer 16))
+                      (nc (dds.core.buffer:cursor nb :endianness :little)))
+                 (dds.core.buffer:put-octets nc (octets 1 2 3 4 5 6 7 8) 0 8)
+                 (dds.disc::%on-user-data node #x00000102 2 nb 0 8
+                                          (dds.disc::disc-node-guid-prefix node))
+                 (%check :zc-drop-normal-delivers (= 1 (dds.disc:node-sample-count node))
+                         "a normal (non-ref) payload must still be delivered when ZC is armed")
+                 (dds.pal:free-static (dds.core.buffer:octet-buffer-vec nb)))
+               (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
+      (dds.disc:stop-node node))
+    t))
 
 (defun* run-all-tests ()
     (function () t)
@@ -586,6 +833,7 @@
                  ("batch-defer"              . run-batch-defer-test)
                  ("async-decoupled"          . run-async-decoupled-test)
                  ("shmem-end-to-end"         . run-shmem-end-to-end-test)
+                 ("zerocopy-end-to-end"      . run-zerocopy-end-to-end-test)
                  ("lease-sweep"              . run-lease-sweep-test)
                  ("tce-disallow-default"     . run-tce-disallow-default-test)
                  ("zero-alloc-into"          . run-generated-into-test)
@@ -681,14 +929,22 @@
                  ("dcps-legacy-gate"         . run-dcps-legacy-gate-test)
                  ("perftest-smoke"           . dds.bench:run-bench-smoke)
                  ("perftest-shmem-smoke"     . dds.bench:run-bench-shmem-smoke)
+                 ("perftest-zerocopy-smoke"  . dds.bench:run-bench-zerocopy-smoke)
                  ("shmem-ring-init"          . run-shmem-ring-init-test)
                  ("shmem-lane-claim"         . run-shmem-lane-claim-test)
                  ("shmem-enqueue"            . run-shmem-enqueue-test)
                  ("shmem-drain"              . run-shmem-drain-test)
                  ("shmem-drain-resource-guard" . run-shmem-drain-resource-guard-test)
+                 ("zc-pool-init"             . run-zc-pool-init-test)
+                 ("zc-pool-loan"             . run-zc-pool-loan-test)
+                 ("zc-pool-resolve"          . run-zc-pool-resolve-test)
+                 ("zc-pool-align"            . run-zc-pool-align-test)
                  ("shmem-transport"          . dds.xport.shmem:run-shmem-transport-test)
                  ("shmem-receiver-thread"    . dds.xport.shmem:run-shmem-receiver-test)
-                 ("shmem-stress"             . dds.xport.shmem:run-shmem-stress-test))))
+                 ("shmem-stress"             . dds.xport.shmem:run-shmem-stress-test)
+                 ("zc-ref-codec"             . run-zc-ref-codec-test)
+                 ("zc-sedp-flag"             . run-zc-sedp-flag-test)
+                 ("zc-resolve-drop"          . run-zc-resolve-drop-test))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))
       (funcall (cdr test))

@@ -75,11 +75,21 @@
 
 (defun* %shmem-transport-p (transport)
     (function (keyword) t)
-  "T iff TRANSPORT selects the SHMEM data plane (:shmem), NIL for :udp — the bench's transport switch.
-   Both bench nodes run in ONE process (same host-uuid), so with *shmem-enabled* T (its default on SBCL
-   and Clasp/Linux) the user-DATA push auto-routes over shared memory (%shmem-dest); rebinding it NIL
-   forces the all-UDP baseline. NOT a wire constant — a local transport-selection switch (WP-SHMEM)."
-  (ecase transport (:udp nil) (:shmem t)))
+  "T iff TRANSPORT routes user DATA over the SHMEM data plane (:shmem OR :zerocopy), NIL for :udp — the
+   bench's transport switch. Both bench nodes run in ONE process (same host-uuid), so with *shmem-enabled*
+   T (its default on SBCL and Clasp/Linux) the user-DATA push auto-routes over shared memory (%shmem-dest);
+   rebinding it NIL forces the all-UDP baseline. :zerocopy also rides SHMEM (the ZC pool is a SHMEM segment,
+   the ref still crosses over the SHMEM transport). NOT a wire constant — a local transport switch (WP-SHMEM)."
+  (ecase transport (:udp nil) (:shmem t) (:zerocopy t)))
+
+(defun* %zerocopy-transport-p (transport)
+    (function (keyword) t)
+  "T iff TRANSPORT selects WP-ZEROCOPY (:zerocopy), NIL for :udp/:shmem — the bench's zero-copy switch.
+   When T the bench binds dds.disc:*zerocopy-enabled* T around make-disc-node so each node builds its
+   per-writer SHMEM sample-pool; a large same-host sample (> *zerocopy-min-payload-bytes*) then crosses as
+   a 16-byte reference instead of the serialized payload (FR-PF-3, ADR 0014). NOT a wire constant.
+   NOT cleared for ship — pending counsel (R6)."
+  (ecase transport (:udp nil) (:shmem nil) (:zerocopy t)))
 
 (defun* %assert-shmem-sends (transport node label)
     (function (keyword dds.disc:disc-node string) t)
@@ -92,18 +102,34 @@
             label))
   t)
 
+(defun* %assert-zc-sends (transport node label payload-bytes)
+    (function (keyword dds.disc:disc-node string (integer 1)) t)
+  "On the :zerocopy transport AND a PAYLOAD-BYTES strictly above dds.disc:*zerocopy-min-payload-bytes*,
+   assert NODE actually published references (disc-node-zc-sends advanced past 0) — so the bench PROVES the
+   large-sample path used a ZC reference, not a fragmented payload (FR-LANG-7, R6). A no-op on :udp/:shmem
+   AND on a sub-threshold payload (where ZC correctly does NOT engage — the control case). Signals an error
+   naming LABEL otherwise (e.g. *zerocopy-enabled* NIL or the SHMEM gate suppressed ZC for a large sample)."
+  (when (and (%zerocopy-transport-p transport)
+             (> payload-bytes dds.disc:*zerocopy-min-payload-bytes*))
+    (assert (plusp (dds.disc::disc-node-zc-sends node)) ()
+            "WP-ZEROCOPY bench: ~a published 0 zero-copy references (zc-sends=0) — ZC did not engage" label))
+  t)
+
 (defun* run-latency (&key (samples 10000) (payload-bytes 64) (warmup 500) (transport :udp))
     (function (&key (:samples (integer 1)) (:payload-bytes (integer 1)) (:warmup (integer 0))
-               (:transport (member :udp :shmem))) list)
-  "Measure one-way PING/PONG latency over the TRANSPORT data plane (:udp loopback baseline, default; or
-   :shmem same-host shared memory, WP-SHMEM): a pinger node writes a PAYLOAD-BYTES sample on topic
-   PerfPing; an echoer node echoes a pong on PerfPong; one-way = RTT/2. Both nodes are in-process (same
-   host-uuid), so on :shmem the user DATA auto-routes over shared memory; :udp rebinds dds.disc:*shmem-enabled*
-   NIL to force UDP. After WARMUP throwaway round-trips, time SAMPLES of them and the bytes consed across the
-   whole path; on :shmem assert each node's shmem-sends advanced (proof it measured SHMEM, FR-LANG-7).
-   Returns a plist: :samples :payload-bytes :transport :p50 :p99 :p9999 :max :min :mean :bytes-per-sample
-   :shmem-sends (latency values are ONE-WAY nanoseconds)."
+               (:transport (member :udp :shmem :zerocopy))) list)
+  "Measure one-way PING/PONG latency over the TRANSPORT data plane (:udp loopback baseline, default; :shmem
+   same-host shared memory, WP-SHMEM; or :zerocopy same-host ZC reference passing, WP-ZEROCOPY/FR-PF-3): a
+   pinger node writes a PAYLOAD-BYTES sample on topic PerfPing; an echoer node echoes a pong on PerfPong;
+   one-way = RTT/2. Both nodes are in-process (same host-uuid), so on :shmem/:zerocopy the user DATA routes
+   over shared memory; :udp rebinds dds.disc:*shmem-enabled* NIL to force UDP; :zerocopy additionally binds
+   dds.disc:*zerocopy-enabled* T so a large sample (> *zerocopy-min-payload-bytes*) crosses as a 16-byte
+   reference. After WARMUP throwaway round-trips, time SAMPLES of them and the bytes consed across the whole
+   path; on :shmem assert each node's shmem-sends advanced, on :zerocopy assert zc-sends advanced (proof the
+   measured path engaged, FR-LANG-7). Returns a plist: :samples :payload-bytes :transport :p50 :p99 :p9999
+   :max :min :mean :bytes-per-sample :shmem-sends :zc-sends (latency values are ONE-WAY nanoseconds)."
   (let* ((dds.disc:*shmem-enabled* (%shmem-transport-p transport))
+         (dds.disc:*zerocopy-enabled* (%zerocopy-transport-p transport))
          (p (dds.disc:make-disc-node :guid-prefix (%prefix #x70) :host "127.0.0.1" :port 0))
          (e (dds.disc:make-disc-node :guid-prefix (%prefix #x71) :host "127.0.0.1" :port 0))
          (rv (%make-rendezvous))
@@ -139,9 +165,11 @@
                                    (error "perftest: pong not received within 5 s (reliable stall?)"))))
                       (- (rendezvous-recv-ns rv) t0))))
              (dotimes (i warmup) (one) (%drain-cache p) (%drain-cache e))
-             (let ((before (dds.pal:bytes-consed)) (shmem0 (dds.disc::disc-node-shmem-sends p)))
+             (let ((before (dds.pal:bytes-consed)) (shmem0 (dds.disc::disc-node-shmem-sends p))
+                   (zc0 (dds.disc::disc-node-zc-sends p)))
                (dotimes (i samples) (vector-push (one) rtts) (%drain-cache p) (%drain-cache e))
                (%assert-shmem-sends transport p "pinger") (%assert-shmem-sends transport e "echoer")
+               (%assert-zc-sends transport p "pinger" payload-bytes)
                (let* ((consed (- (dds.pal:bytes-consed) before))
                       (oneway (make-array samples :element-type 'fixnum)))
                  (dotimes (i samples) (setf (aref oneway i) (ash (aref rtts i) -1)))
@@ -152,21 +180,25 @@
                        :min (aref oneway 0)
                        :mean (round (/ (loop for x across oneway sum x) samples))
                        :bytes-per-sample (round (/ consed samples))
-                       :shmem-sends (- (dds.disc::disc-node-shmem-sends p) shmem0))))))
+                       :shmem-sends (- (dds.disc::disc-node-shmem-sends p) shmem0)
+                       :zc-sends (- (dds.disc::disc-node-zc-sends p) zc0))))))
       (dds.disc:stop-node p) (dds.disc:stop-node e))))
 
 (defun* run-throughput (&key (samples 20000) (payload-bytes 64) (batch 1) (transport :udp))
     (function (&key (:samples (integer 1)) (:payload-bytes (integer 1)) (:batch (integer 1))
-               (:transport (member :udp :shmem))) list)
-  "Measure one-way throughput over the TRANSPORT data plane (:udp loopback baseline, default; or :shmem
-   same-host shared memory, WP-SHMEM): a writer node blasts SAMPLES of a PAYLOAD-BYTES sample on topic
-   PerfThru as fast as write() returns; a reader node counts delivery. Both nodes are in-process (same
-   host-uuid), so on :shmem the user DATA auto-routes over shared memory; :udp rebinds dds.disc:*shmem-enabled*
-   NIL to force UDP. BATCH > 1 enables WP-BATCH write-side batching (flush every BATCH samples). On :shmem
-   assert the writer's shmem-sends advanced (proof it measured SHMEM, FR-LANG-7). Returns a plist:
-   :samples :payload-bytes :batch :transport :received :send-samples-per-s :delivered-samples-per-s
-   :send-mbps :shmem-sends."
+               (:transport (member :udp :shmem :zerocopy))) list)
+  "Measure one-way throughput over the TRANSPORT data plane (:udp loopback baseline, default; :shmem
+   same-host shared memory, WP-SHMEM; or :zerocopy same-host ZC reference passing, WP-ZEROCOPY/FR-PF-3): a
+   writer node blasts SAMPLES of a PAYLOAD-BYTES sample on topic PerfThru as fast as write() returns; a
+   reader node counts delivery. Both nodes are in-process (same host-uuid), so on :shmem/:zerocopy the user
+   DATA routes over shared memory; :udp rebinds dds.disc:*shmem-enabled* NIL to force UDP; :zerocopy binds
+   dds.disc:*zerocopy-enabled* T so a large sample (> *zerocopy-min-payload-bytes*) crosses as a 16-byte
+   reference rather than a fragmented payload. BATCH > 1 enables WP-BATCH write-side batching (flush every
+   BATCH samples). On :shmem assert the writer's shmem-sends advanced, on :zerocopy assert zc-sends advanced
+   (proof the measured path engaged, FR-LANG-7). Returns a plist: :samples :payload-bytes :batch :transport
+   :received :send-samples-per-s :delivered-samples-per-s :send-mbps :bytes-per-sample :shmem-sends :zc-sends."
   (let* ((dds.disc:*shmem-enabled* (%shmem-transport-p transport))
+         (dds.disc:*zerocopy-enabled* (%zerocopy-transport-p transport))
          (p (dds.disc:make-disc-node :guid-prefix (%prefix #x72) :host "127.0.0.1" :port 0
                                      :batch-max-samples batch))
          (e (dds.disc:make-disc-node :guid-prefix (%prefix #x73) :host "127.0.0.1" :port 0))
@@ -179,16 +211,19 @@
            (dds.disc:enable-subscriber e)
            (dds.disc:start-node p) (dds.disc:start-node e)
            (%connect p e 1)
-           (let ((t0 (dds.pal:monotonic-ns)))
+           (let ((t0 (dds.pal:monotonic-ns)) (consed0 (dds.pal:bytes-consed)))
              (dotimes (i samples) (dds.disc:publish-sample p payload))
              (dds.disc:flush-batch p)             ; drain the final partial batch
-             (let ((send-ns (max 1 (- (dds.pal:monotonic-ns) t0))))
+             (let ((send-ns (max 1 (- (dds.pal:monotonic-ns) t0)))
+                   (consed (- (dds.pal:bytes-consed) consed0)))
                (loop repeat 2000 until (>= (dds.disc:node-sample-count e) samples) do (sleep 0.005))
-               (%assert-shmem-sends transport p "writer")
+               (%assert-shmem-sends transport p "writer") (%assert-zc-sends transport p "writer" payload-bytes)
                (let* ((recv-ns (max 1 (- (dds.pal:monotonic-ns) t0)))
                       (received (dds.disc:node-sample-count e)))
                  (list :samples samples :payload-bytes payload-bytes :batch batch :transport transport
                        :received received
+                       :bytes-per-sample (round (/ consed samples))
+                       :zc-sends (dds.disc::disc-node-zc-sends p)
                        :send-samples-per-s (round (/ samples (/ send-ns 1.0d9)))
                        :delivered-samples-per-s (round (/ received (/ recv-ns 1.0d9)))
                        :send-mbps (/ (round (/ (* samples payload-bytes 8) (/ send-ns 1.0d9))) 1.0d6)
@@ -298,6 +333,98 @@
   (format t "~%Legend: p50 spdup = UDP-p50 / SHMEM-p50 (>1 = SHMEM faster). spr ratio = SHMEM-send-samples/s / UDP (>1 = SHMEM faster). SHM b/samp is the SHMEM bytes-consed/sample (NFR-PERF-8; ~~0 = the steady path allocates nothing; Clasp reports 0 by gap).~%")
   t)
 
+;;;; ---- WP-ZEROCOPY large-sample bench (FR-PF-3, FR-LANG-7; NOT cleared for ship — pending counsel R6) ----
+
+(defparameter +bench-zerocopy-latency-sizes+ '(512 4096 16384 65536)
+  "Payload sizes (octets) the WP-ZEROCOPY latency comparison sweeps. 512 B is a control BELOW
+   *zerocopy-min-payload-bytes* (1024) — ZC must NOT engage there (zc-sends=0, fallback to normal DATA), so
+   that row shows the threshold is honoured; 4/16/64 KiB are above it, where eliminating the payload copy
+   (only a 16-byte reference crosses the transport) is expected to pay off. NOT a wire constant.")
+
+(defparameter +bench-zerocopy-throughput-sizes+ '(4096 16384 65536)
+  "Payload sizes (octets) the WP-ZEROCOPY throughput comparison sweeps — all above
+   *zerocopy-min-payload-bytes*. NOT a wire constant.")
+
+(defparameter +bench-zerocopy-throughput-byte-budget+ (* 24 1024 1024)
+  "Per-run byte budget for the WP-ZEROCOPY throughput sweep. run-throughput does NOT drain the disc-layer
+   receive cache (nor the reliable writer history), so each run retains ~SAMPLES * PAYLOAD-BYTES on the
+   heap; the sample count per size is BUDGET / PAYLOAD-BYTES (floored, min 200) to keep that bounded (the
+   1 GB SBCL heap must hold the writer history + the reader cache + retransmit scratch simultaneously).
+   Honest-measurement note: a smaller-but-stable per-sample throughput figure, NOT a sustained-rate
+   benchmark. NOT a wire constant.")
+
+(defun* %zc-throughput-samples (payload-bytes)
+    (function ((integer 1)) (integer 1))
+  "Sample count for one WP-ZEROCOPY throughput row at PAYLOAD-BYTES: the byte budget divided by the payload
+   size (min 200), so the un-drained receive cache + writer history stay bounded across the payload sweep."
+  (max 200 (floor +bench-zerocopy-throughput-byte-budget+ payload-bytes)))
+
+(defun* %print-latency-cmp3 (u s z)
+    (function (list list list) t)
+  "Print one 3-way WP-ZEROCOPY latency row from the UDP plist U, SHMEM plist S and ZEROCOPY plist Z (same
+   payload size): each transport's p50/p99 (one-way ns) + bytes/sample, the ZC-vs-SHMEM p50 speedup, and the
+   ZC zc-sends count (>0 proves the row crossed as a reference; 0 = below threshold, fell back to DATA)."
+  (format t "~&| ~6d B | ~8d | ~8d | ~10d | ~8d | ~8d | ~10d | ~8d | ~8d | ~10d | ~8,2fx | ~8d |~%"
+          (getf u :payload-bytes)
+          (getf u :p50) (getf u :p99) (getf u :bytes-per-sample)
+          (getf s :p50) (getf s :p99) (getf s :bytes-per-sample)
+          (getf z :p50) (getf z :p99) (getf z :bytes-per-sample)
+          (%speedup (getf s :p50) (getf z :p50))
+          (getf z :zc-sends))
+  t)
+
+(defun* %print-throughput-cmp3 (u s z)
+    (function (list list list) t)
+  "Print one 3-way WP-ZEROCOPY throughput row from the UDP plist U, SHMEM plist S and ZEROCOPY plist Z (same
+   payload size): each transport's send samples/s + bytes/sample, the ZC-vs-SHMEM samples/s ratio, and the
+   ZC zc-sends count (the proof the large samples crossed as references)."
+  (format t "~&| ~6d B | ~7d | ~12d | ~10d | ~12d | ~10d | ~12d | ~10d | ~8,2fx | ~8d |~%"
+          (getf u :payload-bytes) (getf u :samples)
+          (getf u :send-samples-per-s) (getf u :bytes-per-sample)
+          (getf s :send-samples-per-s) (getf s :bytes-per-sample)
+          (getf z :send-samples-per-s) (getf z :bytes-per-sample)
+          (%ratio (getf z :send-samples-per-s) (getf s :send-samples-per-s))
+          (getf z :zc-sends))
+  t)
+
+(defun* run-bench-zerocopy (&key (latency-samples 2000) (throughput-samples nil))
+    (function (&key (:latency-samples (integer 1)) (:throughput-samples (or null (integer 1)))) t)
+  "Run the perftest latency + throughput scenarios over THREE transports — UDP loopback, same-host SHMEM
+   (serialized payload), and same-host WP-ZEROCOPY (16-byte reference) — at LARGE payloads (4/16/64 KiB,
+   above *zerocopy-min-payload-bytes*), and print a markdown comparison report to *standard-output*
+   quantifying the ZC-vs-SHMEM-vs-UDP delta (FR-PF-3, FR-LANG-7). Captured into bench/report/ by the make
+   bench-zerocopy target. Each :zerocopy run ASSERTS disc-node-zc-sends advanced, so the ZC columns are
+   PROVEN to have crossed as a reference, not a fragmented payload (else the run errors). The expectation is
+   the no-payload-copy win shows at LARGE sizes; the 512 B control row (below the threshold) demonstrates ZC
+   correctly does NOT engage (zc-sends=0). LATENCY-SAMPLES defaults small (large samples are slow per
+   round-trip); THROUGHPUT-SAMPLES NIL (the default) scales the per-size count to a fixed byte budget
+   (%zc-throughput-samples — the receive cache is not drained), else forces that fixed count for every size.
+   NOT cleared for ship — pending counsel (R6)."
+  (flet ((thr-n (size) (or throughput-samples (%zc-throughput-samples size))))
+    (format t "~&# dds-bench — WP-ZEROCOPY vs SHMEM vs UDP-loopback (FR-PF-3, large samples)~%~%")
+    (format t "NOT cleared for ship — pending counsel (R6); see ADR 0014. dds.disc:*zerocopy-enabled* is default OFF.~%~%")
+    (format t "All three transports run as 2 in-process participants (same host-uuid). UDP rebinds dds.disc:*shmem-enabled* NIL; SHMEM routes the serialized payload over shared memory; ZEROCOPY additionally binds dds.disc:*zerocopy-enabled* T so a sample LARGER than *zerocopy-min-payload-bytes* (1024) crosses as a 16-byte SHMEM-pool reference, not the payload. Clock: dds.pal:monotonic-ns (~~us). bytes/sample: dds.pal:bytes-consed delta over the measured loop (whole path; SBCL-exact, Clasp=0 by NFR-PORT gap). Each ZEROCOPY run is asserted to have advanced disc-node-zc-sends (a reference crossed, not a payload).~%~%")
+    (format t "## One-way latency — ZC vs SHMEM vs UDP (ns; RTT/2, single in-flight, N=~d)~%~%" latency-samples)
+    (format t "| payload |  UDP p50 |  UDP p99 |  UDP b/samp | SHM p50 | SHM p99 | SHM b/samp |  ZC p50 |  ZC p99 |  ZC b/samp | ZC/SHM p50 | zc-sends |~%")
+    (format t "|---------|----------|----------|-------------|---------|---------|------------|---------|---------|------------|------------|----------|~%")
+    (dolist (sz +bench-zerocopy-latency-sizes+)
+      (let ((u (run-latency :samples latency-samples :payload-bytes sz :warmup 50 :transport :udp))
+            (s (run-latency :samples latency-samples :payload-bytes sz :warmup 50 :transport :shmem))
+            (z (run-latency :samples latency-samples :payload-bytes sz :warmup 50 :transport :zerocopy)))
+        (%print-latency-cmp3 u s z)))
+    (format t "~%## Throughput — ZC vs SHMEM vs UDP (one-way, batch 1; N scaled to a ~d MiB/run byte budget)~%~%"
+            (floor +bench-zerocopy-throughput-byte-budget+ (* 1024 1024)))
+    (format t "| payload |       N | UDP samples/s | UDP b/samp | SHM samples/s | SHM b/samp |  ZC samples/s |  ZC b/samp | ZC/SHM spr | zc-sends |~%")
+    (format t "|---------|---------|---------------|------------|---------------|------------|---------------|------------|------------|----------|~%")
+    (dolist (sz +bench-zerocopy-throughput-sizes+)
+      (let* ((n (thr-n sz))
+             (u (run-throughput :samples n :payload-bytes sz :transport :udp))
+             (s (run-throughput :samples n :payload-bytes sz :transport :shmem))
+             (z (run-throughput :samples n :payload-bytes sz :transport :zerocopy)))
+        (%print-throughput-cmp3 u s z)))
+    (format t "~%Legend: ZC/SHM p50 = SHMEM-p50 / ZC-p50 (>1 = ZC lower latency than serialized SHMEM). ZC/SHM spr = ZC-send-samples/s / SHMEM (>1 = ZC higher throughput). b/samp = bytes-consed/sample on that transport's path (the transport-copy elimination shows as a LOWER ZC b/samp at large sizes — only the 20-byte reference crosses, not the payload). zc-sends>0 proves the row used a reference; the 512 B control sits below the threshold so zc-sends=0 there (fell back to normal DATA — by design).~%")
+    t))
+
 (defun* run-bench-smoke ()
     (function () t)
   "Suite-friendly self-check: a tiny latency + throughput run; asserts every sample round-trips,
@@ -328,4 +455,23 @@
         (assert (>= (getf thr :received) 50) () "shmem throughput smoke: not all samples delivered (~d/50)"
                 (getf thr :received))
         (assert (plusp (getf thr :shmem-sends)) () "shmem throughput smoke: shmem-sends did not advance (UDP, not SHMEM)")))
+  t)
+
+(defun* run-bench-zerocopy-smoke ()
+    (function () t)
+  "Suite-friendly self-check of the WP-ZEROCOPY bench path (FR-PF-3; NOT cleared for ship — pending counsel
+   R6): a tiny :zerocopy latency + throughput run at a payload ABOVE *zerocopy-min-payload-bytes*, asserting
+   every sample round-trips byte-exact AND that disc-node-zc-sends advanced (so CI catches a ZC-routing
+   regression — the bench fragmenting the payload while claiming a reference crossed — without a long run).
+   Pass-SKIPS where SHMEM is not reliably by-name-attachable (Clasp/macOS per ADR 0013) so it never
+   false-fails on a platform with no usable SHMEM pool. Signals an error on failure."
+  (if (not (dds.xport.shmem:shm-attach-by-name-reliable-p))
+      (format t "(SHMEM by-name attach unreliable on this platform — ZC bench skipped) ")
+      (let ((lat (run-latency :samples 20 :payload-bytes 2048 :warmup 5 :transport :zerocopy))
+            (thr (run-throughput :samples 30 :payload-bytes 2048 :transport :zerocopy)))
+        (assert (plusp (getf lat :p50)) () "zc latency smoke: non-positive p50 latency")
+        (assert (plusp (getf lat :zc-sends)) () "zc latency smoke: zc-sends did not advance (payload crossed, not a reference)")
+        (assert (>= (getf thr :received) 30) () "zc throughput smoke: not all samples delivered (~d/30)"
+                (getf thr :received))
+        (assert (plusp (getf thr :zc-sends)) () "zc throughput smoke: zc-sends did not advance (payload crossed, not a reference)")))
   t)

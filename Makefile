@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem shmem-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -167,12 +167,28 @@ bench-shmem:
 	        --eval '(uiop:symbol-call :dds.bench :run-bench-shmem :latency-samples $(LATSAMPLES) :throughput-samples $(THRUSAMPLES))' \
 	        --eval '(uiop:quit 0)'
 
+# WP-ZEROCOPY (FR-PF-3): large-sample ZC vs SHMEM vs UDP comparison (default sizes 4/16/64 KiB,
+# above *zerocopy-min-payload-bytes*). Each ZEROCOPY run asserts disc-node-zc-sends advanced (a
+# 16-byte reference crossed, not the payload). NOT cleared for ship — pending counsel (R6).
+bench-zerocopy:
+	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
+	        --eval '(uiop:symbol-call :dds.bench :run-bench-zerocopy)' \
+	        --eval '(uiop:quit 0)'
+
 # WP-SHMEM Task F1 (FR-XPORT-2): REAL two-OS-process cross-process SHMEM round-trip.
 # Two SEPARATE SBCL processes discover over loopback UDP (:peers, no multicast) and the
 # pub routes user DATA over SHARED MEMORY; PASS iff the sub received the samples AND the
 # pub's shmem-sends > 0. SBCL only — SHMEM is on for SBCL; Clasp/macOS would use UDP.
 shmem-xproc:
 	./scripts/shmem-roundtrip.sh
+
+# WP-ZEROCOPY Phase E2 (FR-PF-3): REAL two-OS-process cross-process Zero-Copy round-trip.
+# Two SEPARATE SBCL processes discover over loopback UDP (:peers, no multicast) and the pub
+# stores each LARGE LargeData sample in its SHMEM pool, sending only a 16-byte reference; the
+# sub resolves it CROSS-PROCESS + verifies byte-exact. PASS iff the sub received >= threshold
+# AND the pub's zc-sends > 0. SBCL only. NOT cleared for ship — pending counsel (R6); ADR 0014.
+zc-xproc:
+	./scripts/zerocopy-roundtrip.sh
 
 mem:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \

@@ -70,6 +70,7 @@
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
            #:+pid-status-info+
            #:+pid-type-information+ #:+pid-type-object-lb+ #:+pid-shmem-host-uuid+
+           #:+pid-zerocopy-capable+
            #:write-parameter #:write-parameter-sentinel #:parse-parameter-list
            #:spdp-multicast-port #:spdp-unicast-port
            #:user-multicast-port #:user-unicast-port
@@ -141,5 +142,6 @@
            #:endpoint-data-guid #:endpoint-data-topic-name
            #:endpoint-data-type-name #:endpoint-data-qos
            #:endpoint-data-type-information #:endpoint-data-type-object-lb
+           #:endpoint-data-zerocopy-capable
            #:serialize-endpoint-data #:parse-endpoint-data #:endpoint-match-p
            #:run-sedp-test))

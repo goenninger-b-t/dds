@@ -118,6 +118,7 @@ carries endianness and the alignment origin. **Hot path.**
 |---|---|
 | `dds.core.buffer:octet-buffer` | Off-heap octet buffer (PAL-backed, stable foreign address) of fixed capacity — the unit of hot-path serialization memory. |
 | `dds.core.buffer:make-octet-buffer` | Allocate an N-octet off-heap buffer with a stable address. |
+| `dds.core.buffer:octet-buffer-over` | Wrap an **existing** octet vector as an `octet-buffer` (no static allocation, no copy) — for building/parsing a small message in a caller-owned (e.g. GC-heap) buffer when no stable foreign address is needed. Not for syscall/SHMEM buffers (use `make-octet-buffer`). |
 | `dds.core.buffer:octet-buffer-vec` | The backing `(simple-array (unsigned-byte 8))`. |
 | `dds.core.buffer:octet-buffer-capacity` | Fixed capacity in octets. |
 | `dds.core.buffer:buffer-sap` | Raw foreign pointer to the buffer, for syscalls / SHMEM. |

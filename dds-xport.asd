@@ -7,5 +7,6 @@
   :components ((:file "packages")
                (:file "transport")
                (:file "udp")
-               (:file "shmem"))
+               (:file "shmem")
+               (:file "zerocopy-pool"))
   :in-order-to ((test-op (test-op "dds-tests"))))

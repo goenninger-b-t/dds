@@ -168,6 +168,55 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sink))
       (dds.pal:free-static mem))))
 
+;;; ---- WP-ZEROCOPY resolve fuzz (FR-PF-3, NFR-SEC-POSTURE) ----
+
+(defconstant +fuzz-zc-max-slots+ 8 "Upper bound on slot count for the zero-copy resolve fuzz.")
+(defconstant +fuzz-zc-max-slot-bytes+ 128 "Upper bound on per-slot payload bytes for the zero-copy resolve fuzz.")
+
+(defun* %adversarial-u32 (prng)
+    (function (prng) (unsigned-byte 32))
+  "A pseudo-random adversarial u32: uniform, or a boundary case (0, small, huge) — drives the resolve fuzz."
+  (case (prng-int prng 0 5)
+    (0 0)
+    (1 1)
+    (2 (1- (ash 1 32)))
+    (3 (prng-int prng 0 (1- +fuzz-zc-max-slots+)))
+    (t (prng-next prng))))
+
+(defun* fuzz-zc-resolve ()
+    (function () t)
+  "Property-based fuzz of %ZC-RESOLVE (the untrusted cross-process reference resolver): a re-initialised
+   pool of random geometry, an optional valid loan, then resolve with adversarial slot-index/generation.
+   Verifies: no OOB/error escapes, and the result is always NIL or a bounded LEN in [0, slot-bytes]."
+  (let* ((seg-bytes (dds.xport.zerocopy::%zc-bytes +fuzz-zc-max-slots+ +fuzz-zc-max-slot-bytes+))
+         (mem (dds.pal:alloc-static seg-bytes))
+         (sap (dds.pal:static-pointer mem))
+         (sink (make-array +fuzz-zc-max-slot-bytes+ :element-type '(unsigned-byte 8)))
+         (payload (make-array +fuzz-zc-max-slot-bytes+ :element-type '(unsigned-byte 8) :initial-element #xC3))
+         (prng (make-prng #x2C0DEC0))
+         (iters 2500))
+    (unwind-protect
+         (dotimes (i iters t)
+           (let ((slots (prng-int prng 1 +fuzz-zc-max-slots+))
+                 (slot-bytes (prng-int prng 1 +fuzz-zc-max-slot-bytes+)))
+             (dds.xport.zerocopy::%zc-init sap slots slot-bytes)
+             ;; half the iterations seed one valid loan so resolve sometimes hits a live slot
+             (when (oddp i)
+               (dds.xport.zerocopy::%zc-loan sap payload 0 (prng-int prng 0 slot-bytes) 1))
+             (let* ((idx (%adversarial-u32 prng))
+                    (gen (%adversarial-u32 prng))
+                    (r (handler-case (dds.xport.zerocopy::%zc-resolve sap idx gen sink)
+                         (error (e)
+                           (error 'test-failure :name "zc-resolve-fuzz"
+                                  :detail (format nil "iter ~d slots=~d sb=~d idx=~d gen=~d signalled: ~a"
+                                                  i slots slot-bytes idx gen e))))))
+               (unless (or (null r) (and (integerp r) (<= 0 r slot-bytes)))
+                 (error 'test-failure :name "zc-resolve-fuzz"
+                        :detail (format nil "iter ~d slots=~d sb=~d idx=~d gen=~d: result ~s not NIL/bounded"
+                                        i slots slot-bytes idx gen r))))))
+      (dds.xport.zerocopy::%zc-destroy sap)
+      (dds.pal:free-static mem))))
+
 ;;; ---- generators + properties ----
 
 (defun* gsample= (a b)
@@ -344,7 +393,9 @@
                           (or (null result) (dds.types:lto-node-p result))))))
     ;; ring-drain fuzz runs independently (its own memory + prng, 2000 iterations)
     (fuzz-shmem-ring-drain)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters, deterministic seed.~%" runs)
+    ;; WP-ZEROCOPY resolve fuzz: adversarial cross-process references, never an OOB (own memory + prng)
+    (fuzz-zc-resolve)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters, deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

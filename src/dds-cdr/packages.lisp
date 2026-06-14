@@ -10,10 +10,11 @@
     deserialize-T / serialized-size-T / key-hash-T) call concrete buffer ops.
     Encapsulation representation IDs are filled from [XTYPES]/[RTPS] tables and
     verified byte-exact (FR-CDR-3) — never hardcoded from memory.")
-  (:export #:+representation-ids+ #:extensibility-kind
+  (:export #:+representation-ids+ #:extensibility-kind #:+zc-encapsulation-id+
            #:representation-id #:representation-id-value #:representation-id-name
            #:make-encapsulation-header #:parse-encapsulation-header
            #:finalize-encapsulation-options
+           #:encode-zc-reference #:parse-zc-reference
            #:cdr-not-implemented
            ;; XCDR primitive + composite codec (FR-CDR-1/2)
            #:cdr-mode #:cdr-align #:cdr-size-align

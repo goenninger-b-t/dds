@@ -26,4 +26,5 @@
            #:run-corpus-capture-subscriber
            #:run-typelookup-probe
            #:run-nokey-publisher #:run-nokey-subscriber
-           #:run-shmem-xproc-pub #:run-shmem-xproc-sub))
+           #:run-shmem-xproc-pub #:run-shmem-xproc-sub
+           #:run-zc-xproc-pub #:run-zc-xproc-sub))

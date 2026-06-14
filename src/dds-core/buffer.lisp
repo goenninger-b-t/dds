@@ -21,6 +21,14 @@
   (declare (type (integer 0) n))
   (%make-octet-buffer :vec (dds.pal:alloc-static n) :capacity n))
 
+(defun* octet-buffer-over (vec)
+    (function ((simple-array (unsigned-byte 8) (*))) octet-buffer)
+  "Wrap an EXISTING octet vector VEC as an octet-buffer (capacity = its length), WITHOUT a static
+   allocation. For building/parsing a small message in a caller-owned (e.g. GC-heap) buffer when no
+   stable foreign address is needed — NOT for a syscall/SHMEM buffer (use make-octet-buffer for those,
+   whose vec has a stable PAL-backed address). Shares VEC; no copy."
+  (%make-octet-buffer :vec vec :capacity (length vec)))
+
 (defun* buffer-sap (buffer)
     (function (octet-buffer) t)
   "Raw foreign pointer to BUFFER for syscalls / SHMEM."
