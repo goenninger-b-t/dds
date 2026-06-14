@@ -17,9 +17,15 @@ the portable v1), Windows.
 ## Contract impact
 - The `transport` record (`dds.xport`, IMPLEMENTATION-PLAN §7.5 / FR-XPORT-5) is **unchanged** — a SHMEM
   transport is "construct one record", so the RTPS engine and `%handle-datagram` are untouched.
-- **ADR required:** the SHMEM segment + cross-process notification primitives **extend the M0-frozen
-  `dds.pal` contract**. PAL edits are the A0 role; the ADR lists the added symbols + the (sole) consumer
-  `dds.xport.shmem`. No reader-conditional (`#+sbcl`/`#+clasp`) leaves `dds-pal/`.
+- **ADR required:** WP-SHMEM **extends the M0-frozen `dds.pal` contract** three ways: (a) SHMEM segment
+  primitives, (b) cross-process named-semaphore primitives, and (c) the **M1 atomics fast path** — the
+  current `cas`/`atomic-incf`/`fence` are M0 stubs (`cas`/`atomic-incf` signal `pal-unimplemented`; `fence`
+  is a no-op ignoring `:kind`), verified at `pal-sbcl.lisp:81-96` / `pal-clasp.lisp:102-117`. This WP
+  implements them for real. Because an atomic CAS cannot go through the stub's runtime `place-fn`
+  indirection, the real atomics are **foreign-SAP-specific primitives** (`cas-sap-u64`,
+  `atomic-incf-sap-u64`, plus a real `fence`), which is exactly what the cross-process ring needs. PAL
+  edits are the A0 role; the ADR lists the added symbols + the (sole) consumer `dds.xport.shmem`. No
+  reader-conditional (`#+sbcl`/`#+clasp`) leaves `dds-pal/`.
 
 ## Module layout
 New `src/dds-xport/shmem.lisp`, package `dds.xport.shmem`, in the **existing `dds-xport` system** (mirrors
@@ -34,12 +40,17 @@ like `make-udp-transport`.
   via the PAL SAP accessors — the same `sap-ref-*` / `cffi:mem-ref` family the buffer layer uses; the shm
   region is a raw `mmap` pointer, not a `static-vectors` octet-buffer).
 - Notification: `sem-create/sem-open/sem-post/sem-wait/sem-close/sem-unlink` over **named POSIX
-  semaphores** (`sem_open`/`sem_post`/`sem_wait`). Timed wait: `sem_timedwait` on Linux; macOS lacks it,
-  so a short bounded `sem_trywait` poll inside the PAL (the dev host is macOS — must function; Linux is
-  the optimized target).
+  semaphores** (`sem_open`/`sem_post`/`sem_wait`). `sem-wait` blocks; **clean shutdown uses a stop-flag +
+  `sem-post`-to-wake** (the proven WP-ASYNC teardown pattern), so no `sem_timedwait` is needed (macOS
+  lacks it) and there is no notification-latency polling.
 - Naming: macOS caps shm/sem names at ~31 chars, so names are `"/dds" + 10 hex of a host+GUID hash`, not
   the full GUID. The exact length cap + the leading-slash requirement are pinned from the platform at
   design/impl time, not from memory.
+- Atomics (real M1 fast path, replacing the M0 stubs): `fence(kind)` with `:acquire`/`:release`/`:full`
+  (SBCL `sb-thread:barrier (:read)/(:write)/(:memory)` — verified; Clasp `mp:fence`), and foreign-SAP
+  64-bit atomics `cas-sap-u64(sap off old new)` + `atomic-incf-sap-u64(sap off delta)` (SBCL `sb-ext:cas`
+  / `sb-ext:atomic-incf` on `sb-sys:sap-ref-64` — **verified to compile + run**; Clasp `mp:cas` /
+  `mp:atomic-incf` — foreign-place support confirmed by a probe-first task, else NFR-PORT Clasp gap).
 
 ## Segment & ring layout
 One **receive segment per participant** (the receiver creates it; senders attach). Layout:
@@ -59,20 +70,24 @@ The path is multi-producer (several same-host participants may target one receiv
 (one receive-loop drains). v1 avoids MPSC by giving **each sending participant its own SPSC lane**:
 
 - **Lane claim (once, at attach):** a sender CASes its `owner_token` into a free lane slot
-  (`dds.pal:cas`). One CAS per (sender,receiver) pair for the life of the connection — not per message.
+  (`dds.pal:cas-sap-u64` on the lane's `owner_token` offset). One CAS per (sender,receiver) pair for the
+  life of the connection — not per message.
 - **Enqueue (SPSC, no CAS):** copy `[len][payload]` at `write_cursor mod capacity`, then a
-  **store-release** publishes the advanced `write_cursor` (`dds.pal:fence :release` before the cursor
-  store). Single producer per lane ⇒ no contended index, no compare-and-swap on the hot path.
-- **Drain (SPSC, no CAS):** the receiver does a **load-acquire** on each lane's `write_cursor`
-  (`dds.pal:fence :acquire` after the load) before reading records up to it, then advances `read_cursor`.
+  **store-release** publishes the advanced `write_cursor` (`dds.pal:fence :release` — now a real CPU
+  barrier — before the aligned 64-bit cursor store). Single producer per lane ⇒ no contended index, no
+  compare-and-swap on the hot path.
+- **Drain (SPSC, no CAS):** the receiver does a **load-acquire** on each lane's `write_cursor` (aligned
+  64-bit load then `dds.pal:fence :acquire`) before reading records up to it, then advances `read_cursor`.
 - The receive-loop round-robins the K lanes on each semaphore wake.
 
-This is the simplest provably-correct design, **reuses the existing `cas`/`fence`** (no new cross-process
-mutex primitive — a PROCESS_SHARED mutex would be more new surface *and* carries an owner-death deadlock
-macOS cannot make robust), and has **no owner-death deadlock**. Cost: a fixed cap of **K** concurrent
-same-host senders per receiver (K configurable, default 32); the K+1-th sender falls back to UDP.
-Alternatives (single lock-free CAS-MPSC byte-ring; PROCESS_SHARED-mutex ring) are deferred unless the
-bench shows the lane model is the bottleneck (FR-LANG-7 — no perf change on intuition).
+This design needs **only** the real `fence` + a one-time foreign-SAP `cas` (lane claim) this WP implements
+as the M1 atomics fast path; steady-state enqueue/drain are lock-free with aligned 64-bit cursors and no
+per-message CAS. No PROCESS_SHARED mutex (it would be more surface *and* carries an owner-death deadlock
+macOS cannot make robust), and the lane model has **no owner-death deadlock**. Cost: a fixed cap of **K**
+concurrent same-host senders per receiver (K configurable, default 32); the K+1-th sender falls back to
+UDP. Alternatives (single lock-free CAS-MPSC byte-ring; PROCESS_SHARED-mutex ring; or — if Clasp foreign
+atomics fall short — a semaphore-locked MPSC ring as the Clasp path) are deferred unless the bench shows
+the lane model is the bottleneck (FR-LANG-7 — no perf change on intuition).
 
 ## Send / receive (engine untouched)
 - `make-shmem-transport(&key participant-guid host-uuid capacity lane-count)`: `shm-create` this
