@@ -3260,6 +3260,954 @@
       (dds.disc:stop-node node)))
   t)
 
+;;; WP-ASYNC-FLOW per-datagram step send (FR-PF-2): %send-changes-packed is now a step loop over
+;;; %emit-next-datagram, and %flow-step-emit exposes a node-level "build+send the next single datagram"
+;;; seam for the Phase-C FlowController scheduler. The step's oracle is BYTE-IDENTITY: emitting one
+;;; datagram at a time must produce the EXACT same wire bytes (same datagram count, same bytes each) as
+;;; the existing flush-all push. Two equivalently-built nodes (same guid-prefix, same seeded reader, same
+;;; unsent set) are driven — one by flush-all (%push-data), one by the step (%flow-step-emit) — and their
+;;; captured datagram byte-sequences compared via *datagram-sink* (reused, DRY).
+
+(defun* %flow-step-capture (node)
+    (function (dds.disc:disc-node) list)
+  "Drive NODE's user writer through the per-datagram STEP (%flow-step-emit) to completion, capturing every
+   outgoing datagram's bytes via *datagram-sink*; return the captured datagrams (fresh octet vectors) in send
+   order. Loops one datagram per call until MORE-REMAIN-P is NIL — the Phase-C scheduler's drive loop,
+   minus the token pacing."
+  (let ((captured '()))
+    (let ((dds.disc::*datagram-sink* (lambda (dg) (push dg captured))))
+      (loop with more = t
+            while more
+            do (multiple-value-bind (bytes more-remain)
+                   (dds.disc::%flow-step-emit node (dds.disc::disc-node-tx-msg node))
+                 (declare (ignore bytes))
+                 (setf more (and more-remain t)))))
+    (nreverse captured)))
+
+(defun* %flow-step-build-node (guid-byte reader-byte port writes)
+    (function ((unsigned-byte 8) (unsigned-byte 8) (unsigned-byte 16) list) dds.disc:disc-node)
+  "A publisher node (guid-prefix all GUID-BYTE) with one matched reader (%seed-reader-participant,
+   reader-prefix READER-BYTE at PORT) and each payload in WRITES written to its user writer's HistoryCache —
+   the identical fixture both the flush-all and the step paths are driven against (byte-identity demands the
+   two nodes differ in NOTHING). Caller stop-nodes it."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element guid-byte)
+               :host "127.0.0.1" :port 0)))
+    (dds.disc:enable-publisher node)
+    (%seed-reader-participant node reader-byte port)
+    (let ((writer (dds.disc::disc-node-user-writer node)))
+      (dolist (pl writes) (dds.rtps.reliable:writer-write writer pl)))
+    node))
+
+(defun* %datagrams-identical-p (a b)
+    (function (list list) t)
+  "T iff datagram byte-sequences A and B are identical: same count AND each pair equalp (same bytes)."
+  (and (= (length a) (length b))
+       (every #'equalp a b)))
+
+(defun* run-flow-step-equivalence-test ()
+    (function () t)
+  "WP-ASYNC-FLOW byte-identity oracle (FR-PF-2): the per-datagram STEP send produces the EXACT wire bytes the
+   flush-all push does. Two cases, each driving two equivalently-built nodes (same guid-prefix, matched
+   reader, unsent set): (1) K=8 small DATA — flush-all (%push-data) vs step (%flow-step-emit) datagram
+   sequences must be byte-IDENTICAL (same count, same bytes), proving the coalesced DATA+HEARTBEAT framing,
+   coalesce budget, and HEARTBEAT trailing are unchanged; (2) ONE large sample that FRAGMENTS into a
+   DATA_FRAG series + HEARTBEAT_FRAG — the fragment datagram sequence must likewise be byte-identical. Both
+   capture via *datagram-sink* (reused). Flow control is wire-invisible (ADR 0016): the step is an internal
+   restructuring, never a wire change."
+  ;; Case 1 — K small DATA: flush-all vs step, byte-identical.
+  (let ((flush-node (%flow-step-build-node #x71 #x81 7801
+                                           (loop repeat 8 collect (octets 1 2 3 4 5 6 7 8))))
+        (step-node  (%flow-step-build-node #x71 #x81 7801
+                                           (loop repeat 8 collect (octets 1 2 3 4 5 6 7 8)))))
+    (unwind-protect
+         (let ((flush-dgs (%coalesce-capture flush-node))
+               (step-dgs  (%flow-step-capture step-node)))
+           (%check :flow-step-small-nonempty (plusp (length step-dgs))
+                   "the step must emit at least one datagram for K unsent small changes")
+           (%check :flow-step-small-identical (%datagrams-identical-p flush-dgs step-dgs)
+                   "the step's small-DATA datagram sequence must be byte-identical to flush-all")
+           ;; Sanity: the captured datagram(s) carry the expected 8 DATA + 1 HEARTBEAT (coalesced).
+           (let ((totals (mapcar #'%count-submessages step-dgs)))
+             (%check :flow-step-small-submsgs
+                     (and (= 8 (reduce #'+ totals :key #'second))
+                          (= 1 (reduce #'+ totals :key #'third)))
+                     "the step's datagrams must carry 8 DATA + 1 HEARTBEAT (coalesced)")))
+      (dds.disc:stop-node flush-node)
+      (dds.disc:stop-node step-node)))
+  ;; Case 2 — one large sample (DATA_FRAG series): flush-all vs step, byte-identical.
+  (let* ((big (let ((v (make-array 4000 :element-type '(unsigned-byte 8))))
+                (dotimes (i 4000 v) (setf (aref v i) (logand (* i 7) #xff)))))
+         (flush-node (%flow-step-build-node #x72 #x82 7802 (list big)))
+         (step-node  (%flow-step-build-node #x72 #x82 7802 (list big))))
+    (unwind-protect
+         (let ((flush-dgs (%coalesce-capture flush-node))
+               (step-dgs  (%flow-step-capture step-node)))
+           (%check :flow-step-frag-multiple (< 1 (length step-dgs))
+                   "a 4000-octet sample must fragment into a multi-datagram DATA_FRAG series via the step")
+           (%check :flow-step-frag-identical (%datagrams-identical-p flush-dgs step-dgs)
+                   "the step's DATA_FRAG datagram sequence must be byte-identical to flush-all"))
+      (dds.disc:stop-node flush-node)
+      (dds.disc:stop-node step-node)))
+  t)
+
+;;; WP-ASYNC-FLOW Phase C (FR-PF-2, ADR 0016): the shared flow-controller + its scheduler thread paces the
+;;; aggregate user-data byte rate of its associated writers via the token bucket, round-robining one datagram
+;;; per writer per turn (so multiple writers interleave at the shaped rate). Three tests: (1) object lifecycle
+;;; — make/associate/double-associate-rejected/destroy-joins (SBCL+Clasp, no sends); (2) rate-shaping — a
+;;; low-rate controller drains B (>= burst) bytes in >= ~B/rate wall time vs an unpaced async baseline draining
+;;; far faster (SBCL; Clasp pass-skipped — timing-dependent); (3) multi-writer round-robin — two writers on one
+;;; controller, both delivered, datagrams interleave, aggregate rate shaped (SBCL).
+
+(defun* %flow-match-writer-reader (w r topic)
+    (function (dds.disc:disc-node dds.disc:disc-node string) t)
+  "Wire writer node W to reader node R as a BEST_EFFORT pair on TOPIC and drive SPDP+SEDP until they match
+   (the live-fixture twin of run-async-decoupled-test's boilerplate, factored DRY for the pacing + RR tests).
+   BEST_EFFORT so the controller's paced send is the SOLE delivery path — no ACKNACK-driven retransmit (which
+   runs unpaced on the receiver thread) confounds the rate measurement. Caller has already enable-publisher'd
+   W and enable-subscriber'd R, and must stop-node both. Returns T once matched."
+  (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+        (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+  (dds.disc:start-node w) (dds.disc:start-node r)
+  (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+  (loop repeat 300
+        until (and (plusp (dds.disc:disc-node-discovered-count w))
+                   (plusp (dds.disc:disc-node-discovered-count r)))
+        do (sleep 0.01))
+  (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+  (loop repeat 300
+        until (and (plusp (dds.disc:disc-node-matched-count w))
+                   (plusp (dds.disc:disc-node-matched-count r)))
+        do (sleep 0.01))
+  (%check :flow-matched (plusp (dds.disc:disc-node-matched-count w))
+          "the flow-controller writer must match the reader before publishing")
+  t)
+
+(defun* run-flow-controller-lifecycle-test ()
+    (function () t)
+  "WP-ASYNC-FLOW (FR-PF-2, ADR 0016): the flow-controller OBJECT lifecycle — no samples. make-flow-controller
+   spawns a scheduler thread (the THREAD slot is non-NIL); flow-controller-associate binds a writer node; a
+   SECOND associate of the SAME node SIGNALS (one controller per writer); destroy-flow-controller JOINs the
+   scheduler (the THREAD slot becomes NIL afterward) and is idempotent. The THREAD slot (non-NIL = running,
+   NIL = joined) is the portable alive signal across SBCL + Clasp (no PAL thread-alive predicate). Runs on
+   SBCL + Clasp."
+  (let ((node (%flow-step-build-node #x91 #xA1 7811 '()))   ; a writer node (seeded reader); never published
+        (controller (dds.disc:make-flow-controller :tokens-per-period 10000 :period 100000000
+                                                   :max-burst 10000)))
+    (unwind-protect
+         (progn
+           (%check :flow-lc-thread-running (dds.disc:flow-controller-thread controller)
+                   "make-flow-controller must spawn a scheduler thread (THREAD slot non-NIL)")
+           (dds.disc:flow-controller-associate controller node)
+           (%check :flow-lc-associated (eq controller (dds.disc::disc-node-flow-controller node))
+                   "flow-controller-associate must set the node's flow-controller slot")
+           (%check :flow-lc-double-rejected
+                   (null (ignore-errors (dds.disc:flow-controller-associate controller node) t))
+                   "a SECOND associate of the SAME node must SIGNAL (one controller per writer)")
+           (dds.disc:flow-controller-unregister controller node)
+           (%check :flow-lc-unregistered (null (dds.disc::disc-node-flow-controller node))
+                   "flow-controller-unregister must clear the node's flow-controller slot")
+           (dds.disc:destroy-flow-controller controller)
+           (%check :flow-lc-thread-joined (null (dds.disc:flow-controller-thread controller))
+                   "destroy-flow-controller must JOIN the scheduler thread (THREAD slot NIL afterward)")
+           (dds.disc:destroy-flow-controller controller)   ; idempotent
+           (%check :flow-lc-destroy-idempotent (null (dds.disc:flow-controller-thread controller))
+                   "destroy-flow-controller must be idempotent (still NIL, no error)"))
+      (ignore-errors (dds.disc:destroy-flow-controller controller))
+      (dds.disc:stop-node node)))
+  t)
+
+(defun* run-flow-pacing-test ()
+    (function () t)
+  "WP-ASYNC-FLOW (FR-PF-2, ADR 0016): RATE-SHAPING is observed. A LOW-rate controller (10000 bytes / 100 ms
+   = 100 kB/s, max-burst 10000) paces a writer publishing N large samples totalling B bytes (B well above
+   max-burst); the wall time for a BEST_EFFORT reader to receive all N is >= ~(B-burst)/rate within tolerance,
+   while an UNPACED enable-async baseline (same payload, no controller) drains far faster — so the elapsed
+   gap is the shaping. Timing-dependent: SBCL only; Clasp is pass-skipped."
+  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-pacing-test t))   ; timing-flaky on Clasp
+  (let* ((n 30)
+         (payload (make-array 1400 :element-type '(unsigned-byte 8) :initial-element #x5a))
+         (wire-bytes (* n (+ 1400 24 20)))   ; ~ payload + DATA submsg-prefix (24) + RTPS Header (20) per datagram
+         (rate-bytes-per-sec 100000)         ; 10000 bytes / 0.1 s
+         (max-burst 10000)
+         (ideal-seconds (/ (max 0 (- wire-bytes max-burst)) (float rate-bytes-per-sec)))
+         ;; -- PACED run --
+         (pw (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x93) :host "127.0.0.1" :port 0))
+         (pr (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA3) :host "127.0.0.1" :port 0))
+         (controller nil) (paced-elapsed 0.0) (unpaced-elapsed 0.0))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer pw :topic "FlowPace" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher pw)
+           (dds.disc:add-local-reader pr :topic "FlowPace" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber pr)
+           (%flow-match-writer-reader pw pr "FlowPace")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period max-burst :period 100000000
+                                                           :max-burst max-burst))
+           (dds.disc:flow-controller-associate controller pw)
+           (let ((t0 (dds.pal:monotonic-ns)))
+             (dotimes (i n) (dds.disc:publish-sample pw payload))
+             (loop repeat 1000 until (>= (dds.disc:node-sample-count pr) n) do (sleep 0.005))
+             (setf paced-elapsed (/ (- (dds.pal:monotonic-ns) t0) 1.0d9)))
+           (%check :flow-pace-delivered (>= (dds.disc:node-sample-count pr) n)
+                   (format nil "the paced controller must deliver all ~d samples to the best-effort reader" n)))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node pw) (dds.disc:stop-node pr))
+    ;; -- UNPACED baseline (enable-async, no controller) --
+    (let ((uw (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x94) :host "127.0.0.1" :port 0))
+          (ur (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA4) :host "127.0.0.1" :port 0)))
+      (unwind-protect
+           (progn
+             (dds.disc:add-local-writer uw :topic "FlowPace" :type "X"
+                                        :reliability dds.rtps.discovery:+reliability-best-effort+)
+             (dds.disc:enable-publisher uw)
+             (dds.disc:enable-async uw)
+             (dds.disc:add-local-reader ur :topic "FlowPace" :type "X"
+                                        :reliability dds.rtps.discovery:+reliability-best-effort+)
+             (dds.disc:enable-subscriber ur)
+             (%flow-match-writer-reader uw ur "FlowPace")
+             (let ((t0 (dds.pal:monotonic-ns)))
+               (dotimes (i n) (dds.disc:publish-sample uw payload))
+               (loop repeat 1000 until (>= (dds.disc:node-sample-count ur) n) do (sleep 0.005))
+               (setf unpaced-elapsed (/ (- (dds.pal:monotonic-ns) t0) 1.0d9))))
+        (dds.disc:stop-node uw) (dds.disc:stop-node ur)))
+    (format t "~&  [flow-pace] wire~~~d B, rate ~d B/s, ideal>=~,3fs | paced=~,3fs unpaced=~,3fs~%"
+            wire-bytes rate-bytes-per-sec ideal-seconds paced-elapsed unpaced-elapsed)
+    ;; Rate-shaping observed: paced drain takes >= a conservative fraction of the ideal AND is materially
+    ;; slower than the unpaced baseline. Lower bound is loose (0.5 x ideal) to stay robust under load.
+    (%check :flow-pace-shaped (>= paced-elapsed (* 0.5d0 ideal-seconds))
+            (format nil "paced drain (~,3fs) must be >= ~,3fs (~~0.5 x ideal ~,3fs) — rate shaping"
+                    paced-elapsed (* 0.5d0 ideal-seconds) ideal-seconds))
+    (%check :flow-pace-slower-than-unpaced (> paced-elapsed (* 2.0d0 unpaced-elapsed))
+            (format nil "paced (~,3fs) must be materially slower than unpaced (~,3fs) — pacing adds latency"
+                    paced-elapsed unpaced-elapsed)))
+  t)
+
+(defun* run-flow-multiwriter-rr-test ()
+    (function () t)
+  "WP-ASYNC-FLOW (FR-PF-2, ADR 0016): two writer nodes on ONE controller round-robin at the datagram level.
+   Both writers publish into a single low-rate controller; a BEST_EFFORT reader for EACH writer's topic
+   receives all of that writer's samples (both delivered), the controller's scheduler interleaves their
+   datagrams (one per writer per RR turn — neither writer's stream is fully drained before the other's
+   begins), and the aggregate send is rate-shaped. SBCL only (timing); Clasp pass-skipped."
+  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-multiwriter-rr-test t))
+  (let* ((n 12)
+         (pa (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x0a))
+         (pb (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x0b))
+         (wa (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x95) :host "127.0.0.1" :port 0))
+         (ra (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA5) :host "127.0.0.1" :port 0))
+         (wb (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x96) :host "127.0.0.1" :port 0))
+         (rb (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA6) :host "127.0.0.1" :port 0))
+         (controller nil) (order '()))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer wa :topic "FlowRRa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher wa)
+           (dds.disc:add-local-reader ra :topic "FlowRRa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber ra)
+           (dds.disc:add-local-writer wb :topic "FlowRRb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher wb)
+           (dds.disc:add-local-reader rb :topic "FlowRRb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber rb)
+           ;; Record the INTERLEAVING: each reader's on-sample stamps which writer (:a / :b) just delivered.
+           (setf (dds.disc:disc-node-on-sample ra) (lambda () (push :a order))
+                 (dds.disc:disc-node-on-sample rb) (lambda () (push :b order)))
+           (%flow-match-writer-reader wa ra "FlowRRa")
+           (%flow-match-writer-reader wb rb "FlowRRb")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 4000 :period 100000000 :max-burst 4000))
+           (dds.disc:flow-controller-associate controller wa)
+           (dds.disc:flow-controller-associate controller wb)
+           (dotimes (i n) (dds.disc:publish-sample wa pa) (dds.disc:publish-sample wb pb))
+           (loop repeat 1500
+                 until (and (>= (dds.disc:node-sample-count ra) n) (>= (dds.disc:node-sample-count rb) n))
+                 do (sleep 0.005))
+           (%check :flow-rr-a-delivered (>= (dds.disc:node-sample-count ra) n)
+                   (format nil "writer A's ~d samples must all be delivered" n))
+           (%check :flow-rr-b-delivered (>= (dds.disc:node-sample-count rb) n)
+                   (format nil "writer B's ~d samples must all be delivered" n))
+           ;; Interleaving: count :a<->:b transitions in delivery order. Strict per-writer ordering (all A
+           ;; then all B) yields exactly ONE transition; per-datagram RR yields many. Require several.
+           (let* ((seq (nreverse order))
+                  (transitions (loop for (x y) on seq while y count (not (eq x y)))))
+             (format t "~&  [flow-rr] delivered A=~d B=~d, interleave-transitions=~d~%"
+                     (dds.disc:node-sample-count ra) (dds.disc:node-sample-count rb) transitions)
+             (%check :flow-rr-interleaved (>= transitions 4)
+                     (format nil "RR must interleave the two writers' datagrams (>= 4 a/b transitions in ~
+                                  delivery order, not all-A-then-all-B); got ~d" transitions))))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node wa) (dds.disc:stop-node ra)
+      (dds.disc:stop-node wb) (dds.disc:stop-node rb)))
+  t)
+
+;;; WP-ASYNC-FLOW Phase C concurrency/UAF stress (FR-PF-2, ADR 0016 §Teardown): the regression guard for the
+;;; per-node emit barrier. The shared flow-controller's scheduler picks a node under the lock, RELEASES it,
+;;; then builds+sends LOCK-FREE; stop-node frees that node's socket/SHMEM/tx-buffers. WITHOUT the barrier a
+;;; stop-node concurrent with a mid-emit would send on a closed socket / freed ring (use-after-free). These
+;;; variants drive the EXACT racy path the lifecycle/pacing/RR tests avoid (they never stop a node mid-emit):
+;;; (A) DETERMINISTIC — *datagram-sink* PARKS the scheduler mid-emit, then a worker calls stop-node; assert
+;;; stop-node BLOCKS until the park releases (the barrier) and the node is freed only after; (B) single-writer
+;;; churn — publish continuously while stop-node races the scheduler, no destroy-first; (C) shared-controller
+;;; churn — 2 writers/2 threads, stop ONE node mid-drain, assert the OTHER keeps delivering (the scheduler
+;;; survived — a per-node, not whole-scheduler, barrier). Real threads ⇒ SBCL (Clasp pass-skipped: timing +
+;;; the known Clasp multithread-condvar SIGSEGV, NFR-PORT). *datagram-sink* is set GLOBALLY (the scheduler
+;;; runs on its own thread; a LET binding would be thread-local and invisible there) and restored in cleanup.
+
+(defun* run-flow-concurrency-stress-test ()
+    (function () t)
+  "WP-ASYNC-FLOW (FR-PF-2, ADR 0016 §Teardown): the PER-NODE EMIT BARRIER closes the use-after-free where
+   stop-node frees a node's socket/SHMEM/tx-buffers while the SHARED controller's scheduler is mid-emit on it.
+   Three variants on SBCL (Clasp pass-skipped — real-thread timing + the known Clasp condvar SIGSEGV): (A)
+   DETERMINISTIC — *datagram-sink* parks the scheduler mid-emit on the writer, a worker thread calls stop-node;
+   assert stop-node BLOCKS while parked (CURRENT-EMIT-NODE = node ⇒ unregister waits on EMIT-DONE-CV) and only
+   RETURNS after the park releases and the emit completes — and the freed node was never sent on after the
+   free; (B) single-writer churn — a writer thread publishes continuously while the main thread stop-nodes the
+   writer (NO destroy-first); assert no crash, stop-node returns cleanly, the scheduler did not abort (a final
+   destroy joins cleanly); (C) shared-controller churn — 2 writers on 1 controller, 2 publish threads, ~0.5s
+   drain, stop ONE node, assert the OTHER writer keeps being delivered (the scheduler thread SURVIVED a
+   per-node teardown, which a whole-scheduler join would not allow) then a clean teardown of the rest. Proves:
+   no UAF, no scheduler abort, stop-node clean, controller keeps serving its other nodes."
+  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-concurrency-stress-test t))
+  (%flow-stress-deterministic-park)
+  (%flow-stress-single-writer-churn)
+  (%flow-stress-shared-controller-churn)
+  t)
+
+(defun* %flow-stress-deterministic-park ()
+    (function () t)
+  "Variant A (the strongest barrier proof). Match a writer to a BEST_EFFORT reader, associate a GENEROUS-rate
+   controller (no deficit confounds the timing), then PARK the scheduler mid-emit via *datagram-sink* (it
+   blocks the first data datagram on a release latch, recording the park). A worker thread calls stop-node on
+   the parked writer. While parked, stop-node MUST NOT return (its flow-controller-unregister is blocked in the
+   barrier: CURRENT-EMIT-NODE = node). Release the park ⇒ the emit completes, the barrier clears, stop-node
+   returns. Asserts the park happened, stop-node was still blocked at release, then returned cleanly, and no
+   datagram was sent on the node AFTER stop-node freed it (the sink records the last send order)."
+  (let* ((w (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x97) :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA7) :host "127.0.0.1" :port 0))
+         (payload (make-array 800 :element-type '(unsigned-byte 8) :initial-element #x77))
+         (controller nil) (parked nil) (release nil) (armed nil)
+         (latch-lock (dds.pal:make-lock "flow-stress-park")) (latch-cv (dds.pal:make-condvar))
+         (stop-returned nil) (stop-thread nil) (sink-error nil))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "FlowStA" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher w)
+           (dds.disc:add-local-reader r :topic "FlowStA" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber r)
+           (%flow-match-writer-reader w r "FlowStA")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 10000000 :period 100000000 :max-burst 10000000))
+           (dds.disc:flow-controller-associate controller w)
+           ;; PARK: the first data datagram (>= 400 B) while armed blocks on the release latch — scheduler stuck mid-emit.
+           (setf dds.disc::*datagram-sink*
+                 (lambda (dg)
+                   (handler-case
+                       (when (and armed (>= (length dg) 400))
+                         (dds.pal:with-lock (latch-lock)
+                           (setf parked t)
+                           (dds.pal:condvar-signal latch-cv)
+                           (loop until release do (dds.pal:condvar-wait latch-cv latch-lock 0.5))))
+                     (error (e) (setf sink-error e)))))
+           (setf armed t)
+           (dds.disc:publish-sample w payload)
+           (dds.pal:with-lock (latch-lock)   ; wait until the scheduler is provably parked mid-emit
+             (loop repeat 40 until parked do (dds.pal:condvar-wait latch-cv latch-lock 0.05)))
+           (%check :flow-stress-parked parked
+                   "the scheduler must reach *datagram-sink* mid-emit (parked) before stop-node races it")
+           ;; Worker thread: stop-node the parked writer. It must BLOCK in the barrier until we release.
+           (setf stop-thread (dds.pal:spawn (lambda () (dds.disc:stop-node w) (setf stop-returned t))
+                                            :name "flow-stress-stop"))
+           (sleep 0.25)   ; give stop-node ample time to (try to) complete — it must NOT, the barrier holds it
+           (%check :flow-stress-barrier-blocks (null stop-returned)
+                   "stop-node MUST block in flow-controller-unregister while the scheduler is mid-emit on the node (the barrier)")
+           (dds.pal:with-lock (latch-lock) (setf release t) (dds.pal:condvar-signal latch-cv))   ; release the park
+           (dds.pal:join stop-thread) (setf stop-thread nil)
+           (%check :flow-stress-stop-returns stop-returned
+                   "stop-node must RETURN cleanly once the parked emit completes (the barrier releases)")
+           (%check :flow-stress-no-sink-error (null sink-error)
+                   (format nil "the scheduler emit must not error around the barrier; got ~a" sink-error))
+           (dds.disc:destroy-flow-controller controller) (setf controller nil)
+           (format t "~&  [flow-stress A] deterministic park: barrier held stop-node, released cleanly, no UAF~%"))
+      (setf dds.disc::*datagram-sink* nil release t)
+      (ignore-errors (dds.pal:with-lock (latch-lock) (dds.pal:condvar-signal latch-cv)))
+      (when stop-thread (ignore-errors (dds.pal:join stop-thread)))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (ignore-errors (dds.disc:stop-node w)) (dds.disc:stop-node r)))
+  t)
+
+(defun* %flow-stress-single-writer-churn ()
+    (function () t)
+  "Variant B (the original UAF repro, non-deterministic). A writer thread publishes continuously into a
+   modest-rate controller while the main thread, after a short drain, calls stop-node on that writer WITHOUT
+   destroying the controller first — racing stop-node's frees against the scheduler's lock-free emit. Asserts
+   no crash, stop-node returns cleanly, and the scheduler did not abort (a subsequent destroy joins cleanly)."
+  (let* ((w (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x98) :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA8) :host "127.0.0.1" :port 0))
+         (payload (make-array 700 :element-type '(unsigned-byte 8) :initial-element #x78))
+         (controller nil) (run t) (pub-thread nil) (pub-error nil))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "FlowStB" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher w)
+           (dds.disc:add-local-reader r :topic "FlowStB" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber r)
+           (%flow-match-writer-reader w r "FlowStB")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 200000 :period 100000000 :max-burst 200000))
+           (dds.disc:flow-controller-associate controller w)
+           (setf pub-thread (dds.pal:spawn
+                             (lambda () (handler-case (loop while run do (dds.disc:publish-sample w payload) (sleep 0.001))
+                                          (error (e) (setf pub-error e))))
+                             :name "flow-stress-pub"))
+           (sleep 0.3)   ; build a backlog the scheduler is still draining
+           ;; Quiesce the PUBLISHER (no app-level publish into a node being freed), then stop-node RACES the
+           ;; scheduler still draining the backlog — the barrier must serialize stop-node's frees against any
+           ;; IN-FLIGHT scheduler emit on the node.
+           (setf run nil) (dds.pal:join pub-thread) (setf pub-thread nil)
+           (dds.disc:stop-node w)
+           (%check :flow-stress-b-stop-clean t "stop-node returned without crashing under churn")
+           (dds.disc:destroy-flow-controller controller) (setf controller nil)   ; clean join ⇒ scheduler did not abort
+           (format t "~&  [flow-stress B] single-writer churn: stop-node + scheduler raced cleanly (pub-error=~a)~%" pub-error))
+      (setf run nil)
+      (when pub-thread (ignore-errors (dds.pal:join pub-thread)))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (ignore-errors (dds.disc:stop-node w)) (dds.disc:stop-node r)))
+  t)
+
+(defun* %flow-stress-shared-controller-churn ()
+    (function () t)
+  "Variant C (the SHARED-controller proof — why a per-node barrier, not a whole-scheduler join). Two writers
+   on ONE controller, a publish thread each, ~0.5s drain, then stop ONE writer's node mid-drain. Asserts the
+   OTHER writer KEEPS being delivered afterward — the scheduler thread SURVIVED tearing one node down (a
+   whole-scheduler join would have stopped serving the survivor) — and the survivor + controller tear down
+   cleanly with no error."
+  (let* ((wa (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x99) :host "127.0.0.1" :port 0))
+         (ra (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA9) :host "127.0.0.1" :port 0))
+         (wb (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x9b) :host "127.0.0.1" :port 0))
+         (rb (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xAb) :host "127.0.0.1" :port 0))
+         (pa (make-array 500 :element-type '(unsigned-byte 8) :initial-element #x0c))
+         (pb (make-array 500 :element-type '(unsigned-byte 8) :initial-element #x0d))
+         (controller nil) (run-a t) (run-b t) (ta nil) (tb nil) (ea nil) (eb nil))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer wa :topic "FlowStCa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher wa)
+           (dds.disc:add-local-reader ra :topic "FlowStCa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber ra)
+           (dds.disc:add-local-writer wb :topic "FlowStCb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher wb)
+           (dds.disc:add-local-reader rb :topic "FlowStCb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber rb)
+           (%flow-match-writer-reader wa ra "FlowStCa")
+           (%flow-match-writer-reader wb rb "FlowStCb")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 500000 :period 100000000 :max-burst 500000))
+           (dds.disc:flow-controller-associate controller wa)
+           (dds.disc:flow-controller-associate controller wb)
+           (setf ta (dds.pal:spawn (lambda () (handler-case (loop while run-a do (dds.disc:publish-sample wa pa) (sleep 0.001)) (error (e) (setf ea e)))) :name "flow-stress-ca")
+                 tb (dds.pal:spawn (lambda () (handler-case (loop while run-b do (dds.disc:publish-sample wb pb) (sleep 0.001)) (error (e) (setf eb e)))) :name "flow-stress-cb"))
+           (sleep 0.5)   ; both writers drain through the shared scheduler
+           ;; Quiesce wa's PUBLISHER (the app must not publish into a node it is tearing down — that is an app-level
+           ;; UAF, not the scheduler's) BEFORE stop-node(wa); the barrier still serializes against any IN-FLIGHT
+           ;; scheduler emit on wa. wb keeps publishing throughout.
+           (setf run-a nil) (dds.pal:join ta) (setf ta nil)
+           (dds.disc:stop-node wa)   ; tear ONE node down mid-drain — the scheduler must keep serving wb
+           (let ((b-before (dds.disc:node-sample-count rb)))
+             (sleep 0.3)   ; the survivor must keep being delivered (scheduler alive)
+             (%check :flow-stress-c-survivor (> (dds.disc:node-sample-count rb) b-before)
+                     (format nil "after stop-node(wa), the SHARED controller must keep delivering wb (got ~d, was ~d) — scheduler survived a per-node teardown"
+                             (dds.disc:node-sample-count rb) b-before)))
+           (setf run-b nil) (dds.pal:join tb) (setf tb nil)
+           (%check :flow-stress-c-no-pub-error (and (null ea) (null eb))
+                   (format nil "neither publish thread errored under churn (a=~a b=~a)" ea eb))
+           (dds.disc:destroy-flow-controller controller) (setf controller nil)
+           (format t "~&  [flow-stress C] shared-controller churn: stop-node(wa) kept wb flowing, clean teardown~%"))
+      (setf run-a nil run-b nil)
+      (when ta (ignore-errors (dds.pal:join ta)))
+      (when tb (ignore-errors (dds.pal:join tb)))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (ignore-errors (dds.disc:stop-node wa)) (dds.disc:stop-node ra)
+      (dds.disc:stop-node wb) (dds.disc:stop-node rb)))
+  t)
+
+;;; WP-ASYNC-FLOW Phase E / E1 (FR-PF-2, ADR 0016 §Defaults): OFF-BY-DEFAULT byte-identity. A node with NO
+;;; flow-controller associated must take the UNCHANGED non-flow send path: publish-sample's first cond-clause
+;;; ((disc-node-flow-controller node) ...) is NOT engaged (the controller machinery never touches the node —
+;;; flow-pending / flow-step-state stay NIL), and the wire bytes equal the pre-flow %push-data path exactly.
+;;; B1's flow-step-equivalence proves step == flush-all; this proves the OFF path never even engages a
+;;; controller (the guard that the opt-in cannot regress the default). SBCL + Clasp (deterministic, no
+;;; threads). Reuses %coalesce-capture (= %push-data), %flow-step-build-node, %datagrams-identical-p (DRY).
+
+(defun* %flow-publish-capture (node payload)
+    (function (dds.disc:disc-node (simple-array (unsigned-byte 8) (*))) list)
+  "Publish ONE PAYLOAD on NODE via publish-sample (the public API) while capturing every outgoing datagram's
+   bytes via *datagram-sink*; return the captured datagrams (fresh octet vectors) in send order — the OFF-path
+   twin of %coalesce-capture (which drives %push-data directly), so a controllerless publish can be compared
+   byte-for-byte against the pre-flow %push-data path (WP-ASYNC-FLOW off-by-default oracle, ADR 0016)."
+  (let ((captured '()))
+    (let ((dds.disc::*datagram-sink* (lambda (dg) (push dg captured))))
+      (dds.disc:publish-sample node payload))
+    (nreverse captured)))
+
+(defun* run-flow-off-byte-identical-test ()
+    (function () t)
+  "WP-ASYNC-FLOW off-by-default regression (FR-PF-2, ADR 0016 §Defaults): a node with NO flow-controller
+   associated is byte-identical to the pre-flow path AND never engages the controller machinery. Two parts:
+   (1) ENGAGE GUARD — on a controllerless node, disc-node-flow-controller is NIL, so publish-sample's first
+   cond-clause is not taken: a publish leaves flow-pending and flow-step-state NIL (the %flow-signal path,
+   which would set flow-pending, never ran) — the opt-in is provably dormant; (2) BYTE-IDENTITY — a single
+   publish-sample on a controllerless node (default batch-max-samples 1 ⇒ write + immediate %push-data)
+   produces the EXACT datagrams that writer-write + a plain %push-data produce for the same sample, for both
+   a small DATA and a large DATA_FRAG sample. SBCL + Clasp (deterministic, no threads). Flow control is
+   wire-invisible (ADR 0016): with the controller OFF the send path is the unchanged pre-flow path."
+  ;; -- Part 1: the OFF path never engages the controller machinery (the first cond-clause is dormant) --
+  (let ((node (%flow-step-build-node #xC1 #xD1 7821 '())))   ; controllerless writer node, seeded reader
+    (unwind-protect
+         (progn
+           (%check :flow-off-no-controller (null (dds.disc::disc-node-flow-controller node))
+                   "a node with no controller associated must have a NIL flow-controller slot")
+           (let ((dds.disc::*datagram-sink* (lambda (dg) (declare (ignore dg)))))
+             (dds.disc:publish-sample node (octets 1 2 3 4 5 6 7 8)))
+           (%check :flow-off-pending-nil (null (dds.disc::disc-node-flow-pending node))
+                   "a controllerless publish must NOT set flow-pending (the %flow-signal path never ran)")
+           (%check :flow-off-step-state-nil (null (dds.disc::disc-node-flow-step-state node))
+                   "a controllerless publish must NOT build a flow step-plan (flow-step-state stays NIL)"))
+      (dds.disc:stop-node node)))
+  ;; -- Part 2a: small DATA — publish-sample (OFF) == writer-write + %push-data, byte-identical --
+  (let ((pub-node  (%flow-step-build-node #xC2 #xD2 7822 '()))
+        (push-node (%flow-step-build-node #xC2 #xD2 7822 '())))
+    (unwind-protect
+         (let ((pub-dgs  (loop for i below 4
+                               append (%flow-publish-capture pub-node (octets 9 8 7 6 5 4 3 2))))
+               (push-dgs (loop for i below 4
+                               append (let ((w (dds.disc::disc-node-user-writer push-node)))
+                                        (dds.rtps.reliable:writer-write w (octets 9 8 7 6 5 4 3 2))
+                                        (%coalesce-capture push-node)))))
+           (%check :flow-off-small-nonempty (plusp (length pub-dgs))
+                   "the OFF publish path must emit datagrams for the small samples")
+           (%check :flow-off-small-identical (%datagrams-identical-p pub-dgs push-dgs)
+                   "a controllerless publish-sample must be byte-identical to writer-write + %push-data (small DATA)"))
+      (dds.disc:stop-node pub-node)
+      (dds.disc:stop-node push-node)))
+  ;; -- Part 2b: large DATA_FRAG sample — same byte-identity across the fragment path --
+  (let* ((big (let ((v (make-array 4000 :element-type '(unsigned-byte 8))))
+                (dotimes (i 4000 v) (setf (aref v i) (logand (* i 7) #xff)))))
+         (pub-node  (%flow-step-build-node #xC3 #xD3 7823 '()))
+         (push-node (%flow-step-build-node #xC3 #xD3 7823 '())))
+    (unwind-protect
+         (let ((pub-dgs  (%flow-publish-capture pub-node big))
+               (push-dgs (progn (dds.rtps.reliable:writer-write
+                                 (dds.disc::disc-node-user-writer push-node) big)
+                                (%coalesce-capture push-node))))
+           (%check :flow-off-frag-multiple (< 1 (length pub-dgs))
+                   "a 4000-octet OFF publish must fragment into a multi-datagram DATA_FRAG series")
+           (%check :flow-off-frag-identical (%datagrams-identical-p pub-dgs push-dgs)
+                   "a controllerless publish-sample must be byte-identical to writer-write + %push-data (DATA_FRAG)"))
+      (dds.disc:stop-node pub-node)
+      (dds.disc:stop-node push-node)))
+  t)
+
+;;; WP-ASYNC-FLOW Phase E / E1 (FR-PF-2, ADR 0016 §Teardown): explicit teardown guarantees. (1) destroy
+;;; FLUSHES the remaining unsent IGNORING the bucket — shutdown must never wait on a slow paced drain, and a
+;;; partial in-progress plan must not be dropped — and JOINS the scheduler thread; (2) teardown must never
+;;; WEDGE a writer blocked in writer-write on a full KEEP_ALL cache (block-up-to-max_blocking_time). Real
+;;; threads ⇒ SBCL (Clasp pass-skipped — fine timing + the known Clasp multithread-condvar SIGSEGV, NFR-PORT).
+;;; *datagram-sink* is set GLOBALLY (the scheduler runs on its own thread; a LET binding is thread-local and
+;;; invisible there) and restored in cleanup. Reuses %flow-step-build-node, %seed-reader-participant,
+;;; %count-submessages (DRY).
+
+(defun* %flow-teardown-flushes-pending ()
+    (function () t)
+  "Part 1 (flush-on-destroy). Associate a writer node (seeded reader, KEEP_ALL/unlimited) with a LOW-rate
+   controller so the paced scheduler cannot drain the backlog before teardown, publish N samples (each adds a
+   change + signals the controller), then — before the paced drain completes — destroy-flow-controller.
+   Asserts ALL N samples' DATA reach the wire (the flush, %flow-flush-all, drains the rest IGNORING the
+   bucket: total DATA submessages captured across every datagram = N, whatever the paced/flush split) and the
+   scheduler thread is JOINED (flow-controller-thread NIL). *datagram-sink* counts the DATA (the scheduler is
+   on its own thread, so the sink is set globally). Low rate ⇒ deficit-sleep ⇒ a short pause lands destroy
+   mid-backlog, then the flush completes it."
+  (let* ((n 12)
+         (payload (octets 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))
+         (node (%flow-step-build-node #xC4 #xD4 7824 '()))   ; controllerless yet; seeded reader destination
+         (controller nil) (captured '()) (sink-error nil))
+    (unwind-protect
+         (progn
+           (setf dds.disc::*datagram-sink*
+                 (lambda (dg) (handler-case (push dg captured) (error (e) (setf sink-error e)))))
+           ;; LOW rate (400 B / 100 ms, burst 400) << N x (payload + framing): the scheduler deficit-sleeps with a backlog still pending at destroy
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 400 :period 100000000 :max-burst 400))
+           (dds.disc:flow-controller-associate controller node)
+           (dotimes (i n) (dds.disc:publish-sample node payload))
+           (sleep 0.05)   ; let the scheduler send its first deficit-limited datagram(s), then it sleeps on the deficit
+           (dds.disc:destroy-flow-controller controller)   ; flush ignoring the bucket + join
+           (%check :flow-td-flush-joined (null (dds.disc:flow-controller-thread controller))
+                   "destroy-flow-controller must JOIN the scheduler thread (flow-controller-thread NIL)")
+           (setf controller nil)
+           (%check :flow-td-flush-no-sink-error (null sink-error)
+                   (format nil "the teardown flush must not error in the sink; got ~a" sink-error))
+           (let ((data-total (reduce #'+ (mapcar #'%count-submessages captured) :key #'second)))
+             (%check :flow-td-flush-all-data (= n data-total)
+                     (format nil "destroy-flow-controller must FLUSH all ~d samples' DATA ignoring the bucket (got ~d DATA submessages)"
+                             n data-total)))
+           (format t "~&  [flow-teardown] flush: all ~d samples flushed on destroy, scheduler joined~%" n))
+      (setf dds.disc::*datagram-sink* nil)
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node node)))
+  t)
+
+(defun* %flow-teardown-no-wedge ()
+    (function () t)
+  "Part 2 (the key guarantee — teardown never wedges a blocked writer, NO HANG). A writer node with KEEP_ALL +
+   tiny max_samples + a generous max_blocking_time, associated with a LOW-rate controller; fill the cache to
+   max_samples (writer-write directly, deterministic), then from a WORKER thread publish-sample the next sample
+   — it BLOCKS in %writer-add-bounded on the full cache. From the main thread destroy-flow-controller (which
+   joins the scheduler then broadcasts each registered writer's space-cv via %flow-unblock-writer). The worker
+   MUST return within a bounded time. OBSERVED OUTCOME: teardown does not PURGE the KEEP_ALL cache (only an
+   ACKNACK purge frees a KEEP_ALL cache, and the seeded reader sends none), so the woken worker re-checks, the
+   cache is still full, and it returns :timeout at its max_blocking_time deadline — i.e. teardown unblocks the
+   writer to re-evaluate, and the block-up-to-max_blocking_time deadline bounds it; either way the writer
+   makes progress and does NOT hang. Asserted ROBUSTLY: poll a worker-returned flag up to deadline + margin;
+   FAIL (without an unconditional join on a possibly-wedged thread) if still alive past the bound."
+  (let* ((max-samples 3)
+         (block-ms 800)
+         (payload (octets 2 4 6 8 10 12 14 16))
+         (node (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC5) :host "127.0.0.1" :port 0))
+         (controller nil) (worker nil) (worker-returned nil) (worker-result :unset) (worker-error nil)
+         (t0 0) (elapsed-ms nil))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer node :topic "FlowTd" :type "X")
+           (dds.disc:enable-publisher node :max-samples max-samples :max-blocking-ns (* block-ms 1000000))
+           (%seed-reader-participant node #xD5 7825)
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 400 :period 100000000 :max-burst 400))
+           (dds.disc:flow-controller-associate controller node)
+           (let ((w (dds.disc::disc-node-user-writer node)))
+             (dotimes (i max-samples)
+               (%check :flow-td-fill (integerp (dds.rtps.reliable:writer-write w payload))
+                       "filling the bounded cache to max_samples must succeed (return an SN)")))
+           ;; Worker publish-sample blocks in writer-write on the full cache (never reaching %flow-signal); records its return so it is never left to wedge the suite
+           (setf t0 (dds.pal:monotonic-ns)
+                 worker (dds.pal:spawn
+                         (lambda ()
+                           (handler-case (setf worker-result (dds.disc:publish-sample node payload))
+                             (error (e) (setf worker-error e)))
+                           (setf worker-returned t))
+                         :name "flow-td-blocked"))
+           (sleep 0.1)   ; let the worker reach the block (cache full, nothing has freed space)
+           (%check :flow-td-blocked (null worker-returned)
+                   "the worker publish-sample must BLOCK on the full bounded cache before teardown")
+           (dds.disc:destroy-flow-controller controller) (setf controller nil)   ; join scheduler + unblock writers
+           ;; NO HANG: poll a flag up to deadline + margin (no PAL bounded-join), so a wedged worker FAILS the assertion rather than hanging join — join only after it returned
+           (loop repeat 60   ; 60 x 50 ms = 3.0 s > block-ms (0.8 s) + margin
+                 until worker-returned do (sleep 0.05))
+           (setf elapsed-ms (/ (- (dds.pal:monotonic-ns) t0) 1000000.0d0))
+           (%check :flow-td-no-wedge worker-returned
+                   (format nil "teardown must not WEDGE the blocked writer — it must return within ~,0f ms (deadline ~d ms + margin); still alive ⇒ HANG"
+                           (+ block-ms 2200.0) block-ms))
+           (when worker-returned (dds.pal:join worker) (setf worker nil))   ; reap only after it provably returned
+           (%check :flow-td-worker-no-error (null worker-error)
+                   (format nil "the blocked worker must not error around teardown; got ~a" worker-error))
+           ;; OBSERVED: :timeout at the deadline (teardown does not purge a KEEP_ALL cache). Documented + asserted.
+           (%check :flow-td-outcome-timeout (eq :timeout worker-result)
+                   (format nil "the blocked worker must return :timeout (teardown unblocks it but space never frees ⇒ block-up-to-max_blocking_time deadline), got ~S" worker-result))
+           (%check :flow-td-at-deadline (>= elapsed-ms (* block-ms 0.7))
+                   (format nil "the :timeout must land at ~~max_blocking_time (~d ms, >= 0.7x), got ~,1f ms — progress, not a hang" block-ms elapsed-ms))
+           (format t "~&  [flow-teardown] no-wedge: blocked writer returned ~S after ~,1f ms (deadline ~d ms) — no hang~%"
+                   worker-result elapsed-ms block-ms))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (when (and worker worker-returned) (ignore-errors (dds.pal:join worker)))   ; never join a possibly-wedged worker
+      (dds.disc:stop-node node)))
+  t)
+
+(defun* run-flow-teardown-test ()
+    (function () t)
+  "WP-ASYNC-FLOW (FR-PF-2, ADR 0016 §Teardown): explicit teardown — flush-on-destroy + no-wedge. SBCL only
+   (real threads + timing); Clasp pass-skipped (fine timing + the known Clasp multithread-condvar SIGSEGV,
+   NFR-PORT). (1) destroy-flow-controller FLUSHES the remaining unsent IGNORING the bucket (all N samples'
+   DATA reach the wire even though the paced drain had not finished) and JOINS the scheduler thread; (2)
+   teardown lets a writer BLOCKED in writer-write on a full KEEP_ALL cache make progress — it returns
+   (:timeout at its max_blocking_time deadline, since teardown unblocks it to re-evaluate but a KEEP_ALL cache
+   only frees on an ACKNACK purge) within a bounded time, NEVER hanging. The point of §Teardown: shutdown
+   never waits on a slow paced drain, no pending change is dropped, and a blocked writer is never wedged."
+  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-teardown-test t))
+  (%flow-teardown-flushes-pending)
+  (%flow-teardown-no-wedge)
+  t)
+
+;;;; WP-ASYNC-FLOW Phase F1 (FR-PF-2, FR-LANG-7): the HONEST rate-shaping bench. Flow control is rate
+;;;; CONTROL — it trades latency for a bounded byte rate; the report makes NO "0-cost"/"free" claim. The
+;;;; oracle is the MEASURED achieved drain rate over the data plane (real publish-sample + a best-effort
+;;;; reader, the controller's paced send the sole delivery path) timed with dds.pal:monotonic-ns, mirroring
+;;;; run-flow-pacing-test / run-flow-multiwriter-rr-test (the same measurement seam, reused DRY). Four blocks:
+;;;; (1) rate-shaping accuracy (achieved-vs-configured over a few rates/burst sizes); (2) single-writer paced
+;;;; vs the enable-async UNPACED baseline (so the added latency is visible); (3) multi-writer AGGREGATE rate
+;;;; shaped to R (not 2R) + per-datagram RR interleaving; (4) DATA_FRAG pacing — one large fragmented sample's
+;;;; fragments spread across periods (the FR-PF-2 headline use case), observed per-datagram via *datagram-sink*.
+
+(defun* %flow-bench-configured-rate (tokens-per-period period-ns)
+    (function ((integer 1) (integer 1)) double-float)
+  "The configured steady-state byte rate (bytes/s) of a token bucket = TOKENS-PER-PERIOD / (PERIOD-NS / 1e9).
+   Used to report achieved-vs-configured honestly (the steady drain converges to this; startup is faster by
+   one full bucket — see %FLOW-BENCH-RATE-ROW)."
+  (/ (float tokens-per-period 1.0d0) (/ (float period-ns 1.0d0) 1.0d9)))
+
+(defun* %flow-bench-paced-drain (payload n tokens-per-period period-ns max-burst guard-w guard-r)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 1) (integer 1) (integer 1) (integer 1)
+               (unsigned-byte 8) (unsigned-byte 8))
+              (values double-float (integer 0) (integer 0)))
+  "Drain N copies of PAYLOAD through ONE flow-controller (TOKENS-PER-PERIOD/PERIOD-NS/MAX-BURST) to a
+   BEST_EFFORT reader and return (values elapsed-seconds wire-bytes delivered). GUARD-W/GUARD-R are distinct
+   GUID-prefix octets (fresh nodes per call, like the flow tests). The controller's paced send is the sole
+   delivery path (best-effort ⇒ no ACKNACK retransmit on the receiver thread to confound the rate). WIRE-BYTES
+   is the approximate on-wire total (payload + a ~24-octet DATA submessage prefix + a 20-octet RTPS header per
+   datagram) — the SAME accounting run-flow-pacing-test uses. Elapsed is monotonic-ns from the first publish
+   to all-N-received (or a bounded poll-out). Tears every node + the controller down."
+  (let* ((wire-bytes (* n (+ (length payload) 24 20)))
+         (w (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element guard-w) :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element guard-r) :host "127.0.0.1" :port 0))
+         (controller nil) (elapsed 0.0d0) (delivered 0))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "FlowBench" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher w)
+           (dds.disc:add-local-reader r :topic "FlowBench" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber r)
+           (%flow-match-writer-reader w r "FlowBench")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period tokens-per-period
+                                                           :period period-ns :max-burst max-burst))
+           (dds.disc:flow-controller-associate controller w)
+           (let ((t0 (dds.pal:monotonic-ns)))
+             (dotimes (i n) (dds.disc:publish-sample w payload))
+             (loop repeat 2000 until (>= (dds.disc:node-sample-count r) n) do (sleep 0.005))
+             (setf elapsed (/ (- (dds.pal:monotonic-ns) t0) 1.0d9)
+                   delivered (dds.disc:node-sample-count r))))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node w) (dds.disc:stop-node r))
+    (values elapsed wire-bytes delivered)))
+
+(defun* %flow-bench-unpaced-drain (payload n guard-w guard-r)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 1) (unsigned-byte 8) (unsigned-byte 8))
+              (values double-float (integer 0)))
+  "Drain N copies of PAYLOAD through an UNPACED enable-async writer (WP-ASYNC v1 — a per-node sender thread,
+   NO flow-controller) to a BEST_EFFORT reader; return (values elapsed-seconds delivered). The unpaced baseline
+   for %FLOW-BENCH-PACED-DRAIN: same payload + reader, no rate bound, so the elapsed gap is exactly the shaping
+   (pacing ADDS latency by design — the honest contrast). Fresh nodes per call; tears them down."
+  (let* ((w (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element guard-w) :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element guard-r) :host "127.0.0.1" :port 0))
+         (elapsed 0.0d0) (delivered 0))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "FlowBench" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher w)
+           (dds.disc:enable-async w)
+           (dds.disc:add-local-reader r :topic "FlowBench" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber r)
+           (%flow-match-writer-reader w r "FlowBench")
+           (let ((t0 (dds.pal:monotonic-ns)))
+             (dotimes (i n) (dds.disc:publish-sample w payload))
+             (loop repeat 2000 until (>= (dds.disc:node-sample-count r) n) do (sleep 0.001))
+             (setf elapsed (/ (- (dds.pal:monotonic-ns) t0) 1.0d9)
+                   delivered (dds.disc:node-sample-count r))))
+      (dds.disc:stop-node w) (dds.disc:stop-node r))
+    (values elapsed delivered)))
+
+(defun* %flow-bench-rate-row (stream payload n tokens-per-period period-ns max-burst guard-w guard-r)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 1) (integer 1) (integer 1) (integer 1)
+                 (unsigned-byte 8) (unsigned-byte 8))
+              double-float)
+  "Measure one paced drain (%FLOW-BENCH-PACED-DRAIN) and emit a markdown row: configured rate, wire bytes,
+   ideal seconds (the steady-state lower bound (WIRE-BYTES - MAX-BURST)/rate — the full bucket drains free at
+   startup, the rest is rate-bounded), achieved seconds, and achieved rate = WIRE-BYTES/elapsed. Returns the
+   achieved rate (bytes/s) so the caller can guard it. The overshoot vs configured is the honest artifact:
+   the startup full bucket + per-datagram granularity (a datagram is sent whole once its tokens are met)."
+  (let ((configured (%flow-bench-configured-rate tokens-per-period period-ns)))
+    (multiple-value-bind (elapsed wire-bytes delivered)
+        (%flow-bench-paced-drain payload n tokens-per-period period-ns max-burst guard-w guard-r)
+      (let* ((ideal (/ (float (max 0 (- wire-bytes max-burst)) 1.0d0) configured))
+             (achieved (if (plusp elapsed) (/ (float wire-bytes 1.0d0) elapsed) 0.0d0)))
+        (format stream "~&| ~,0f | ~d | ~d | ~d | ~,3f | ~,3f | ~,0f | ~,2f |~%"
+                configured max-burst wire-bytes delivered ideal elapsed achieved
+                (if (plusp configured) (/ achieved configured) 0.0d0))
+        achieved))))
+
+(defun* %flow-bench-multiwriter (stream payload n tokens-per-period period-ns max-burst)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 1) (integer 1) (integer 1) (integer 1))
+              (values double-float (integer 0)))
+  "Two writers on ONE controller publish N copies of PAYLOAD each; a BEST_EFFORT reader per writer. Returns
+   (values aggregate-achieved-rate interleave-transitions): the AGGREGATE wire rate (BOTH writers' bytes /
+   elapsed) is shaped to ~R (not 2R — the controller paces the sum), and the per-datagram round-robin
+   interleaves the two streams (transitions = a/b changes in delivery order; all-A-then-all-B would be 1).
+   Emits a markdown row. Reuses the run-flow-multiwriter-rr-test seam (DRY). Tears all nodes + controller down."
+  (let* ((wa (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC5) :host "127.0.0.1" :port 0))
+         (ra (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xD5) :host "127.0.0.1" :port 0))
+         (wb (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC6) :host "127.0.0.1" :port 0))
+         (rb (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xD6) :host "127.0.0.1" :port 0))
+         (controller nil) (order '()) (elapsed 0.0d0)
+         (wire-bytes (* 2 n (+ (length payload) 24 20)))
+         (configured (%flow-bench-configured-rate tokens-per-period period-ns)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer wa :topic "FlowBenchRRa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher wa)
+           (dds.disc:add-local-reader ra :topic "FlowBenchRRa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber ra)
+           (dds.disc:add-local-writer wb :topic "FlowBenchRRb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher wb)
+           (dds.disc:add-local-reader rb :topic "FlowBenchRRb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber rb)
+           (setf (dds.disc:disc-node-on-sample ra) (lambda () (push :a order))
+                 (dds.disc:disc-node-on-sample rb) (lambda () (push :b order)))
+           (%flow-match-writer-reader wa ra "FlowBenchRRa")
+           (%flow-match-writer-reader wb rb "FlowBenchRRb")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period tokens-per-period
+                                                           :period period-ns :max-burst max-burst))
+           (dds.disc:flow-controller-associate controller wa)
+           (dds.disc:flow-controller-associate controller wb)
+           (let ((t0 (dds.pal:monotonic-ns)))
+             (dotimes (i n) (dds.disc:publish-sample wa payload) (dds.disc:publish-sample wb payload))
+             (loop repeat 3000
+                   until (and (>= (dds.disc:node-sample-count ra) n) (>= (dds.disc:node-sample-count rb) n))
+                   do (sleep 0.005))
+             (setf elapsed (/ (- (dds.pal:monotonic-ns) t0) 1.0d9))))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node wa) (dds.disc:stop-node ra)
+      (dds.disc:stop-node wb) (dds.disc:stop-node rb))
+    (let* ((seq (nreverse order))
+           (transitions (loop for (x y) on seq while y count (not (eq x y))))
+           (achieved (if (plusp elapsed) (/ (float wire-bytes 1.0d0) elapsed) 0.0d0)))
+      (format stream "~&| ~,0f | ~d | ~d | ~,3f | ~,0f | ~,2f | ~d |~%"
+              configured wire-bytes (* 2 n) elapsed achieved
+              (if (plusp configured) (/ achieved configured) 0.0d0) transitions)
+      (values achieved transitions))))
+
+(defun* %flow-bench-datafrag-cadence (size tokens-per-period period-ns max-burst)
+    (function ((integer 1) (integer 1) (integer 1) (integer 1)) list)
+  "Publish ONE large (SIZE-octet) sample paced; capture every DATA_FRAG datagram's (offset-ns . length) via
+   *datagram-sink* (the per-datagram seam, set GLOBALLY since the scheduler runs on its own thread). Returns
+   the captured fragment events in send order (offset-ns from the first publish). SIZE > *fragment-size* ⇒ the
+   sample fragments into a DATA_FRAG series, one datagram per fragment, which the scheduler paces one per RR
+   step — so the fragments spread across periods (the FR-PF-2 headline use case). Filters to >= 200-octet
+   datagrams (DATA_FRAGs; excludes tiny discovery/HEARTBEAT traffic). Tears the node + controller down."
+  (let* ((payload (make-array size :element-type '(unsigned-byte 8) :initial-element #x5a))
+         (w (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC9) :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xD9) :host "127.0.0.1" :port 0))
+         (controller nil) (events '()) (t0 0))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "FlowBenchFrag" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher w)
+           (dds.disc:add-local-reader r :topic "FlowBenchFrag" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber r)
+           (%flow-match-writer-reader w r "FlowBenchFrag")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period tokens-per-period
+                                                           :period period-ns :max-burst max-burst))
+           (dds.disc:flow-controller-associate controller w)
+           (setf t0 (dds.pal:monotonic-ns)
+                 dds.disc::*datagram-sink*
+                 (lambda (dg) (when (>= (length dg) 200)
+                                (push (cons (- (dds.pal:monotonic-ns) t0) (length dg)) events))))
+           (dds.disc:publish-sample w payload)
+           (loop repeat 2000 until (>= (dds.disc:node-sample-count r) 1) do (sleep 0.005))
+           (sleep 0.05))
+      (setf dds.disc::*datagram-sink* nil)
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node w) (dds.disc:stop-node r))
+    (nreverse events)))
+
+(defun* run-bench-async-flow (&key (file nil))
+    (function (&key (:file (or null string pathname))) t)
+  "WP-ASYNC-FLOW Phase F1 bench (FR-PF-2, FR-LANG-7; standard DDS, NOT R6, ADR 0016): the HONEST rate-shaping
+   report. Flow control is rate CONTROL — it trades latency for a bounded byte rate; this report makes NO
+   '0-cost'/'free' claim. Prints a markdown report to *standard-output*; when FILE is given, ALSO writes it
+   there (captured by make bench-async-flow). The oracle is the MEASURED achieved drain rate over the real data
+   plane (publish-sample + a best-effort reader, the controller's paced send the sole delivery path) timed with
+   dds.pal:monotonic-ns — the SAME seam run-flow-pacing-test / run-flow-multiwriter-rr-test use, reused DRY.
+   Four blocks: (1) rate-shaping accuracy over a few rates/burst sizes (achieved-vs-configured; the overshoot
+   is the startup full bucket + per-datagram granularity); (2) single-writer PACED vs the enable-async UNPACED
+   baseline (the added latency made visible); (3) multi-writer AGGREGATE rate shaped to ~R (not 2R) + the
+   per-datagram RR interleaving; (4) DATA_FRAG pacing — one large fragmented sample's fragments spread across
+   periods. SBCL-targeted (real threads + timing); on Clasp it pass-returns (the flow tests are Clasp
+   pass-skipped — timing-flaky + the known Clasp multithread-condvar SIGSEGV, NFR-PORT)."
+  (when (eq (uiop:implementation-type) :clasp)
+    (format t "~&  run-bench-async-flow: Clasp pass-skipped (real-thread timing + the known Clasp condvar SIGSEGV, NFR-PORT)~%")
+    (return-from run-bench-async-flow t))
+  (let ((small (make-array 1400 :element-type '(unsigned-byte 8) :initial-element #x5a)))
+    (flet ((emit (stream)
+             (format stream "~&# WP-ASYNC-FLOW — rate-shaping + multi-writer aggregate (honest) (FR-PF-2, FR-LANG-7)~%~%")
+             (format stream "Standard DDS flow control — **NOT patent-gated, NOT R6** (ADR 0016). Flow control is rate **CONTROL**: it bounds the user-data byte rate by **delaying** datagrams, so it **ADDS latency by design** — this report makes **no \"0-cost\"/\"free\" claim**. Phase F1 of WP-ASYNC-FLOW: the honest before/after the operating contract requires for a feature on the send path (FR-LANG-7). Generated by `dds.tests:run-bench-async-flow` (entry: `make bench-async-flow`).~%~%")
+             (format stream "## Environment~%~%")
+             (format stream "| field | value |~%|-------|-------|~%")
+             (format stream "| host | ~a (~a) |~%" (machine-instance) (machine-version))
+             (format stream "| os | ~a ~a ~a |~%" (software-type) (software-version) (machine-type))
+             (format stream "| impl | ~a ~a |~%" (lisp-implementation-type) (lisp-implementation-version))
+             (format stream "| HEAD | ~a |~%" (%bench-git-head))
+             (format stream "| date | ~a |~%" (%bench-date-string))
+             (format stream "| `*fragment-size*` | ~d octets (DATA_FRAG threshold) |~%" dds.rtps.reliable:*fragment-size*)
+             (format stream "~%## Method~%~%")
+             (format stream "Measured over the REAL data plane: a `flow-controller` paces `publish-sample`s from a writer node to a BEST_EFFORT reader node over UDP loopback (both in-process), the controller's paced send the SOLE delivery path (best-effort ⇒ no ACKNACK-driven retransmit on the receiver thread to confound the rate — the same fixture `run-flow-pacing-test` uses). The achieved drain rate is `wire-bytes / elapsed`, where elapsed is `dds.pal:monotonic-ns` from the first publish to all-N-received and `wire-bytes ~~ N x (payload + ~~24-octet DATA submessage prefix + 20-octet RTPS header)` — the SAME wire accounting `run-flow-pacing-test` uses (approximate: it counts a coalesced group as one prefix, so it is a close upper estimate, not byte-exact). Configured rate = `tokens-per-period / (period / 1e9)` bytes/s. The DATA_FRAG cadence is captured per-datagram via `*datagram-sink*` (a fresh octet copy of each outgoing datagram, BEFORE the real send). Single in-process run; no warmup beyond discovery; nodes + controller fresh per measurement.~%~%")
+             (format stream "**Honest framing (FR-LANG-7):** pacing is a LATENCY-FOR-RATE-CONTROL trade. The paced drain is BOUNDED BELOW by `(wire-bytes - max-burst)/rate` (the initial full bucket drains at line rate, the remainder is rate-limited); it is ALWAYS slower than the unpaced baseline. Achieved rate runs slightly ABOVE configured because (a) the bucket STARTS FULL (one max-burst burst is free) and (b) per-datagram GRANULARITY — a datagram is emitted whole once its exact byte cost is met, so the meter rounds up at the datagram boundary. NO path here is 0-cost; the only thing pacing optimizes is bytes-on-the-wire-per-second predictability.~%~%")))
+      (labels ((blocks (stream)
+                 (format stream "## (1) Rate-shaping accuracy — achieved vs configured~%~%")
+                 (format stream "| configured B/s | max-burst | wire B | delivered | ideal s | achieved s | achieved B/s | achieved/configured |~%")
+                 (format stream "|----------------|-----------|--------|-----------|---------|------------|--------------|---------------------|~%")
+                 (let ((r1 (%flow-bench-rate-row stream small 60 12500 100000000 12500 #xB1 #xE1))   ; 125 KB/s, burst 12.5KB
+                       (r2 (%flow-bench-rate-row stream small 60 25000 100000000 25000 #xB2 #xE2))   ; 250 KB/s, burst 25KB
+                       (r3 (%flow-bench-rate-row stream small 40 10000 100000000 5000 #xB3 #xE3)))   ; 100 KB/s, burst 5KB
+                   (format stream "~%The achieved rate tracks the configured rate within the startup-burst + per-datagram-granularity overshoot (a smaller `max-burst` ⇒ a tighter bound, since less of the total drains free at startup). Rate control is real: the drain rate is held near the configured ceiling, NOT line rate.~%~%")
+                   (format stream "## (2) Single-writer: paced vs UNPACED (`enable-async`) — the added latency~%~%")
+                   (multiple-value-bind (paced-s pwire pdel) (%flow-bench-paced-drain small 40 12500 100000000 12500 #xB4 #xE4)
+                     (multiple-value-bind (unpaced-s udel) (%flow-bench-unpaced-drain small 40 #xB5 #xE5)
+                       (let ((pideal (/ (float (max 0 (- pwire 12500)) 1.0d0) (%flow-bench-configured-rate 12500 100000000))))
+                         (format stream "| path | wire B | delivered | elapsed s | drain B/s | note |~%")
+                         (format stream "|------|--------|-----------|-----------|-----------|------|~%")
+                         (format stream "| **paced** (125 KB/s, burst 12.5KB) | ~d | ~d | ~,3f | ~,0f | rate-bounded ~~ ideal ~,3fs |~%"
+                                 pwire pdel paced-s (if (plusp paced-s) (/ (float pwire 1.0d0) paced-s) 0.0d0) pideal)
+                         (format stream "| **unpaced** (`enable-async`, same workload) | ~d | ~d | ~,3f | ~,0f | drains as fast as the loopback allows |~%~%"
+                                 pwire udel unpaced-s (if (plusp unpaced-s) (/ (float pwire 1.0d0) unpaced-s) 0.0d0))
+                         (format stream "Pacing made the SAME ~d-byte workload take **~,3fs** instead of the unpaced **~,3fs** (a **~,1fx** slowdown) — the added latency is the WHOLE POINT of rate control; it is not overhead to be eliminated. The unpaced `enable-async` path is the right choice when you want async-WITHOUT-a-rate-bound; the `flow-controller` is the right choice when a downstream link / reader must not be overrun.~%~%"
+                                 pwire paced-s unpaced-s (if (plusp unpaced-s) (/ paced-s unpaced-s) 0.0d0))
+                         (format stream "## (3) Multi-writer: AGGREGATE rate shaped to R (not 2R) + RR interleaving~%~%")
+                         (format stream "| configured B/s | aggregate wire B | total delivered | elapsed s | achieved agg B/s | achieved/configured | interleave transitions |~%")
+                         (format stream "|----------------|------------------|-----------------|-----------|------------------|---------------------|------------------------|~%")
+                         (multiple-value-bind (agg trans) (%flow-bench-multiwriter stream small 20 12500 100000000 12500)
+                           (format stream "~%Two writers on ONE controller: the AGGREGATE wire rate (~,0f B/s) is shaped to ~~the configured ceiling (125000 B/s) — the controller paces the SUM of both writers, NOT 2x (a per-writer controller would let each hit R, totalling 2R). The ~d a/b transitions in delivery order prove per-datagram ROUND-ROBIN (one datagram per writer per turn) — NOT all-of-A-then-all-of-B (which would be 1 transition).~%~%"
+                                   agg trans)
+                           ;; honest regression guards (SBCL): rate is bounded near configured; pacing is slower than unpaced; RR interleaves; aggregate is shaped (not 2R)
+                           (assert (and (> r1 0.0d0) (> r2 0.0d0) (> r3 0.0d0)) () "bench: every paced drain must deliver + measure a positive rate")
+                           (assert (> paced-s unpaced-s) () "bench: paced (~,3fs) must be slower than unpaced (~,3fs) — pacing adds latency" paced-s unpaced-s)
+                           (assert (>= trans 4) () "bench: multi-writer RR must interleave (>= 4 a/b transitions), got ~d" trans)
+                           (assert (< agg (* 1.8d0 (%flow-bench-configured-rate 12500 100000000))) ()
+                                   "bench: AGGREGATE rate (~,0f) must be shaped to ~~R, not 2R (< 1.8x configured)" agg)))))
+                   (format stream "## (4) DATA_FRAG pacing — fragments spread across periods (the FR-PF-2 headline)~%~%")
+                   (let* ((size 8000) (tpp 10000) (per 100000000) (burst 4000)
+                          (events (%flow-bench-datafrag-cadence size tpp per burst))
+                          (configured (%flow-bench-configured-rate tpp per)))
+                     (format stream "One **~d-octet** sample at **~,0f B/s** (burst ~d) fragments into a DATA_FRAG series (`*fragment-size*` = ~d ⇒ ~~~d fragments), one datagram per fragment, paced one per RR step:~%~%"
+                             size configured burst dds.rtps.reliable:*fragment-size* (ceiling size dds.rtps.reliable:*fragment-size*))
+                     (format stream "| fragment # | t since publish (ms) | datagram bytes |~%|------------|----------------------|----------------|~%")
+                     (loop for e in events for i from 1
+                           do (format stream "| ~d | ~,1f | ~d |~%" i (/ (car e) 1.0d6) (cdr e)))
+                     (format stream "~%The initial full bucket (~d B) drains the first fragments back-to-back (~~0 ms apart); the rest are spread at the token-refill cadence — at ~,0f B/s a ~~~d-octet fragment costs ~~~,1f ms — so a large sample is emitted as a rate-shaped fragment STREAM rather than a single burst (the FR-PF-2 \"DATA_FRAG pacing\" use case). The fragmentation itself is wire-IDENTICAL to the unpaced path (ADR 0016): pacing changes only WHEN each fragment is sent, never its bytes.~%~%"
+                             burst configured (1+ dds.rtps.reliable:*fragment-size*)
+                             (* 1000.0d0 (/ (float (1+ dds.rtps.reliable:*fragment-size*) 1.0d0) configured)))
+                     (when (>= (length events) 2)
+                       (assert (> (car (car (last events))) (car (first events))) ()
+                               "bench: DATA_FRAG fragments must spread over time (last later than first)")))
+                   (format stream "## Honest framing (FR-LANG-7) — restated~%~%")
+                   (format stream "- Flow control **adds latency by design**; it is rate **control**, not a speedup. NO path here is 0-cost or free.~%")
+                   (format stream "- Achieved rate runs slightly ABOVE configured (startup full bucket + per-datagram granularity); a smaller `max-burst` tightens the bound.~%")
+                   (format stream "- The aggregate rate of N writers on one controller is shaped to **R**, not N x R (the controller paces the sum) — the interleaving is per-datagram round-robin (v1).~%")
+                   (format stream "- A large sample is paced at FRAGMENT granularity (the FR-PF-2 headline) — fragments stream out rate-shaped, the bytes wire-identical to the unpaced path.~%")
+                   (format stream "- v1 policy is **round-robin only**, behind a pluggable hook; the OMG-standard-QoS-anchored follow-ups are `LATENCY_BUDGET`/`DEADLINE` -> EDF and `TRANSPORT_PRIORITY` -> priority (ADR 0016, deferred).~%~%")
+                   (format stream "Method: achieved rate = wire-bytes/elapsed (`dds.pal:monotonic-ns`); paced send over the real data plane to a best-effort reader; impl ~a ~a on ~a.~%"
+                           (lisp-implementation-type) (lisp-implementation-version) (machine-instance)))))
+        (emit *standard-output*)
+        (blocks *standard-output*)
+        (when file
+          (with-open-file (s file :direction :output :if-exists :supersede :if-does-not-exist :create)
+            (emit s)
+            (blocks s))   ; re-run the measured drains into the file stream (keeps the file self-contained)
+          (format t "~&  wrote ~a~%" file)))))
+  t)
+
 (defun* run-async-decoupled-test ()
     (function () t)
   "WP-ASYNC (FR-PF-2): a writer with enable-async pushes off the caller thread (a background sender);

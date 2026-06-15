@@ -28,6 +28,7 @@
    ;; threads (condvar-wait: (cv lock &optional timeout-seconds) -> woke-p; nil timeout
    ;; = wait forever, else bounded; re-check the predicate on wake — ADR 0007)
    #:spawn #:join #:make-lock #:with-lock #:make-condvar #:condvar-wait #:condvar-signal
+   #:condvar-broadcast
    ;; clock
    #:monotonic-ns
    ;; UDPv4 sockets (native, FR-XPORT-1)

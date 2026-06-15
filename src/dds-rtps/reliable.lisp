@@ -30,19 +30,85 @@
   "Stateful reliable RTPS writer (RTPS 2.5 §8.4.2): a HistoryCache, the last SN
    written, the HEARTBEAT count, a reader-id -> ReaderProxy table, and a LOCK serializing all access to
    the HistoryCache + proxies — the disc layer drives the writer from TWO threads (publish on the caller
-   thread; ACKNACK/purge on the receiver thread), so every public writer op below takes the lock."
+   thread; ACKNACK/purge on the receiver thread), so every public writer op below takes the lock.
+   SPACE-CV + MAX-BLOCKING-NS implement DDS-standard block-up-to-max_blocking_time backpressure
+   (WP-ASYNC-FLOW, FR-PF-2/FR-QOS, ADR 0016): on a FULL KEEP_ALL cache (RESOURCE_LIMITS max_samples)
+   writer-write/writer-lifecycle-change block on SPACE-CV — paired with LOCK — for up to MAX-BLOCKING-NS
+   ns (RELIABILITY.max_blocking_time), then return :timeout (RETCODE_TIMEOUT) with the cache intact;
+   SPACE-CV is broadcast whenever the cache shrinks — a KEEP_ALL cache shrinks only on the ACKNACK purge
+   (writer-purge-acked, the slowest reader having ACKed), so that is the in-steady-state space signal;
+   controller teardown also signals so a blocked publish reaches its TIMEOUT (%writer-signal-space). MAX-BLOCKING-NS NIL ⇒ no
+   blocking (the cache bound is then never reached for an unlimited cache; the degenerate 0 ⇒ immediate
+   :timeout when full). The bound applies to ALL changes (data + dispose/unregister) — RTPS 2.5 §8.4.2.2
+   gives every change a SN, so the cache occupancy is consistent across kinds (ADR 0016 §Backpressure)."
   (hc nil :type (or null dds.rtps.history:history-cache))  ; a HistoryCache
   (last-sn 0 :type integer)
   (hb-count 0 :type integer)
   (proxies (make-hash-table :test 'equalp) :type hash-table)   ; reader key (opaque, equalp) -> reader-proxy
   (frag-hb-count 0 :type integer)   ; HEARTBEAT_FRAG Count, separate from hb-count
-  (lock (dds.pal:make-lock) :type t))
+  (lock (dds.pal:make-lock) :type t)
+  (space-cv (dds.pal:make-condvar) :type t)   ; signalled (under LOCK) when the cache shrinks; writer-write waits on it when full (ADR 0016 §Backpressure)
+  (max-blocking-ns nil :type (or null (integer 0))))   ; RELIABILITY.max_blocking_time in ns; NIL = never block (unlimited cache)
 
 (defmacro %with-writer-lock ((writer) &body body)
   "Serialize BODY's access to WRITER's HistoryCache + proxies (publish thread vs receiver thread). The
    guarded public ops never call one another, so the non-recursive lock cannot self-deadlock; the internal
    helpers (get-reader-proxy, %changes-from) run only inside a held lock."
   `(dds.pal:with-lock ((rtps-writer-lock ,writer)) ,@body))
+
+(defun* %writer-signal-space (writer)
+    (function (rtps-writer) t)
+  "Broadcast WRITER's SPACE-CV under the writer LOCK — wake every writer-write/writer-lifecycle-change
+   blocked waiting for the bounded KEEP_ALL cache to drop below max_samples (WP-ASYNC-FLOW backpressure,
+   ADR 0016 §Backpressure). Call AFTER any operation that frees cache space: the ACKNACK purge
+   (writer-purge-acked — a KEEP_ALL cache shrinks only when the slowest reader ACKs, RTPS 2.5 §8.4.1) and
+   controller teardown. condvar-BROADCAST (not signal): several publishers may be blocked, and one freed slot
+   may admit exactly one — each re-checks the count on wake (a no-progress waker re-blocks until its
+   deadline). A no-op (signals nobody) when no writer is blocked. Safe to call when MAX-BLOCKING-NS is NIL
+   (no waiter ever exists)."
+  (%with-writer-lock (writer)
+    (dds.pal:condvar-broadcast (rtps-writer-space-cv writer)))
+  t)
+
+(defun* %writer-add-bounded (writer make-change)
+    (function (rtps-writer function) (or integer (eql :timeout)))
+  "Add the change produced by the thunk MAKE-CHANGE (given the freshly-bumped SN) to WRITER's HistoryCache
+   under the writer LOCK, applying DDS-standard block-up-to-max_blocking_time backpressure (WP-ASYNC-FLOW,
+   FR-PF-2/FR-QOS, ADR 0016 §Backpressure). Shared core of writer-write + writer-lifecycle-change (DRY).
+
+   For a BOUNDED cache (KEEP_ALL with a finite max_samples): when full (count >= max_samples) and
+   MAX-BLOCKING-NS is set, BLOCK on SPACE-CV — which RELEASES the writer LOCK while waiting, so the purge
+   path can take the LOCK to free space + %writer-signal-space — until either the count drops below
+   max_samples (space freed) or the deadline (now + MAX-BLOCKING-NS) passes. After the wait (or with
+   MAX-BLOCKING-NS NIL ⇒ no wait, or MAX-BLOCKING-NS 0 ⇒ no wait), a single re-check: if the cache is STILL
+   full, return :timeout (RETCODE_TIMEOUT) WITHOUT bumping the SN or adding the change (the cache is left
+   intact). So a bounded full cache ALWAYS yields :timeout (never a silent hc-add-change rejection that would
+   consume an SN without storing — the SN is bumped only after room is confirmed, so the reliable SN stream
+   has no holes). For an UNLIMITED (max_samples NIL) or KEEP_LAST cache there is no bound: bump the SN, add,
+   return it — the prior behaviour, byte-identical (the default path is unchanged).
+
+   LOCK ordering: the only lock held across the wait is the writer LOCK, released by condvar-wait; the
+   freeing thread (the ACKNACK purge, writer-purge-acked, on the receiver thread — NOT the paced scheduler,
+   which is send-only and never purges a KEEP_ALL cache) takes the same LOCK to purge + signal, so there is
+   no lock-ordering cycle (ADR 0016 §Backpressure)."
+  (%with-writer-lock (writer)
+    (let* ((hc (rtps-writer-hc writer))
+           (max-samples (dds.rtps.history:hc-max-samples hc))
+           (bounded (and (eq (dds.rtps.history:hc-kind hc) :keep-all) max-samples))
+           (block-ns (rtps-writer-max-blocking-ns writer)))
+      (when bounded
+        (when block-ns                                   ; block up to max_blocking_time for a free slot
+          (let ((deadline (+ (dds.pal:monotonic-ns) block-ns)))
+            (loop while (>= (dds.rtps.history:hc-change-count hc) max-samples)
+                  for remaining = (- deadline (dds.pal:monotonic-ns))
+                  while (plusp remaining)
+                  do (dds.pal:condvar-wait (rtps-writer-space-cv writer) (rtps-writer-lock writer)
+                                           (/ remaining 1000000000.0d0)))))
+        (when (>= (dds.rtps.history:hc-change-count hc) max-samples)   ; still full (deadline passed / no blocking): reject, NO SN consumed
+          (return-from %writer-add-bounded :timeout)))
+      (let ((sn (incf (rtps-writer-last-sn writer))))                  ; room confirmed (or unlimited / KEEP_LAST)
+        (dds.rtps.history:hc-add-change hc (funcall make-change sn))
+        sn))))
 
 (defun* get-reader-proxy (writer reader-id)
     (function (rtps-writer t) reader-proxy)
@@ -54,31 +120,32 @@
       (setf (gethash reader-id (rtps-writer-proxies writer)) (make-reader-proxy))))
 
 (defun* writer-write (writer payload)
-    (function (rtps-writer (array (unsigned-byte 8) (*))) integer)
-  "Add a new :data change to the writer's HistoryCache; return its sequence number."
-  (%with-writer-lock (writer)
-    (let ((sn (incf (rtps-writer-last-sn writer))))
-      (dds.rtps.history:hc-add-change
-       (rtps-writer-hc writer)
-       (dds.rtps.history:make-cache-change :sn sn :serialized-payload payload))
-      sn)))
+    (function (rtps-writer (array (unsigned-byte 8) (*))) (or integer (eql :timeout)))
+  "Add a new :data change to the writer's HistoryCache; return its sequence number, OR the :timeout sentinel
+   (RETCODE_TIMEOUT) if a FULL KEEP_ALL cache (RESOURCE_LIMITS max_samples) did not free a slot within the
+   writer's max_blocking_time (RELIABILITY.max_blocking_time) — DDS-standard block-up-to-max_blocking_time
+   backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS, ADR 0016 §Backpressure; see %writer-add-bounded). For a
+   writer with no finite max_samples (the default, KEEP_ALL/unlimited or KEEP_LAST) this NEVER blocks and
+   NEVER returns :timeout — byte-identical to the prior behaviour. On :timeout the cache is left intact and
+   NO sequence number is consumed (the reliable SN stream stays hole-free)."
+  (%writer-add-bounded
+   writer (lambda (sn) (dds.rtps.history:make-cache-change :sn sn :serialized-payload payload))))
 
 (defun* writer-lifecycle-change (writer key-hash status-flags)
-    (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)) integer)
+    (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)) (or integer (eql :timeout)))
   "Add a dispose/unregister change for the instance named by KEY-HASH (16 octets) to the
-   writer's HistoryCache and return its sequence number (RTPS 2.5 §9.6.4.9). STATUS-FLAGS is
-   the StatusInfo_t flag octet; the change KIND (:dispose/:unregister) is derived from it
-   (status-info->kind). The change carries NO serializedPayload — the instance is identified
-   by its key hash — yet occupies a real SN, so it is reliably ordered and ACKNACK-repairable
-   like any DATA (RTPS 2.5 §8.4.2.2)."
-  (%with-writer-lock (writer)
-    (let ((sn (incf (rtps-writer-last-sn writer))))
-      (dds.rtps.history:hc-add-change
-       (rtps-writer-hc writer)
-       (dds.rtps.history:make-cache-change
-        :sn sn :kind (dds.rtps.message:status-info->kind status-flags)
-        :instance-key-hash key-hash :status-info status-flags))
-      sn)))
+   writer's HistoryCache and return its sequence number (RTPS 2.5 §9.6.4.9), OR the :timeout sentinel
+   (RETCODE_TIMEOUT) under the SAME block-up-to-max_blocking_time backpressure as writer-write — a
+   lifecycle change occupies a real SN (RTPS 2.5 §8.4.2.2) so it counts toward the cache bound and is
+   treated CONSISTENTLY with a DATA write (ADR 0016 §Backpressure; the bound applies to all changes).
+   STATUS-FLAGS is the StatusInfo_t flag octet; the change KIND (:dispose/:unregister) is derived from it
+   (status-info->kind). The change carries NO serializedPayload — the instance is identified by its key
+   hash — yet is reliably ordered and ACKNACK-repairable like any DATA. For a writer with no finite
+   max_samples this never blocks and never returns :timeout (byte-identical to before)."
+  (%writer-add-bounded
+   writer (lambda (sn) (dds.rtps.history:make-cache-change
+                        :sn sn :kind (dds.rtps.message:status-info->kind status-flags)
+                        :instance-key-hash key-hash :status-info status-flags))))
 
 (defun* writer-heartbeat (writer)
     (function (rtps-writer) (values integer integer integer))
@@ -147,14 +214,19 @@
    reader that has not yet ACKed holds the watermark at 1 and NOTHING is purged until it acks. A NACKed
    sample is not fully-acked (acked-base has not passed it), so it is never purged — reliable repair is
    unaffected and no GAP is needed. Returns the number of changes purged; a no-op (0) when READER-KEYS is
-   empty (no matched reader -> keep everything, bounded only by RESOURCE_LIMITS)."
+   empty (no matched reader -> keep everything, bounded only by RESOURCE_LIMITS). When changes ARE purged
+   (the cache shrank), broadcast SPACE-CV so a writer-write/writer-lifecycle-change blocked on a full
+   KEEP_ALL cache wakes — this is the ACKNACK purge half of the WP-ASYNC-FLOW space-available signal (ADR
+   0016 §Backpressure); the signal is sent AFTER the writer LOCK is released (the non-recursive LOCK)."
   (if (null reader-keys)
       0
-      (%with-writer-lock (writer)
-        (dds.rtps.history:hc-purge-below
-         (rtps-writer-hc writer)
-         (loop for k in reader-keys
-               minimize (reader-proxy-acked-base (get-reader-proxy writer k)))))))
+      (let ((purged (%with-writer-lock (writer)
+                      (dds.rtps.history:hc-purge-below
+                       (rtps-writer-hc writer)
+                       (loop for k in reader-keys
+                             minimize (reader-proxy-acked-base (get-reader-proxy writer k)))))))
+        (when (plusp purged) (%writer-signal-space writer))   ; the cache shrank: wake any blocked writer-write
+        purged)))
 
 ;;; ---- Reader side (§8.4.10): one WriterProxy per matched writer ----
 

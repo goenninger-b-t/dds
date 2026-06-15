@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata bench-async-flow shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -182,6 +182,15 @@ bench-zerocopy:
 bench-flatdata:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata :file "bench/report/2026-06-14-wp-flatdata.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+
+# WP-ASYNC-FLOW Phase F1 (FR-PF-2, FR-LANG-7): HONEST rate-shaping report — achieved-vs-configured rate,
+# single-writer paced vs the enable-async UNPACED baseline (pacing ADDS latency by design — no 0-cost claim),
+# multi-writer AGGREGATE rate shaped to R (not 2R) + per-datagram RR, and DATA_FRAG fragment cadence (the
+# FR-PF-2 headline). Standard DDS, NOT R6 (ADR 0016). Writes bench/report/2026-06-15-wp-async-flow.md. SBCL
+# only (real threads + timing; Clasp pass-skips — the flow tests' known Clasp condvar SIGSEGV, NFR-PORT).
+bench-async-flow:
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-async-flow :file "bench/report/2026-06-15-wp-async-flow.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-SHMEM Task F1 (FR-XPORT-2): REAL two-OS-process cross-process SHMEM round-trip.
 # Two SEPARATE SBCL processes discover over loopback UDP (:peers, no multicast) and the

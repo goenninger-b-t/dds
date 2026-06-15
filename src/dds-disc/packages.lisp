@@ -29,6 +29,10 @@
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:publish-sample #:flush-batch #:disc-node-batch-max-samples #:enable-async
+           #:flow-token-bucket #:flow-token-bucket-p #:make-flow-token-bucket
+           #:flow-token-bucket-tokens #:flow-token-bucket-max-burst
+           #:flow-controller #:flow-controller-p #:make-flow-controller #:destroy-flow-controller
+           #:flow-controller-associate #:flow-controller-unregister #:flow-controller-thread
            #:*shmem-enabled* #:*zerocopy-enabled* #:disc-node-shmem #:disc-node-shmem-sends #:disc-node-host-uuid
            #:disc-node-zc-sends #:+zerocopy-pool-slots+ #:+zerocopy-pool-slot-bytes+ #:*zerocopy-min-payload-bytes*
            #:node-sample-count #:node-sample #:node-sample-sns

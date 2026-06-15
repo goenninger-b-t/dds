@@ -36,6 +36,7 @@ a package-qualified accessor.
 | Accessor | Policy / slot | Default |
 |---|---|---|
 | `dds.qos:qos-reliability` | RELIABILITY kind — `:best-effort` or `:reliable` | `:best-effort` |
+| `reliability-max-blocking` (slot) | RELIABILITY `max_blocking_time` (`qos-duration`) — the **block-up-to** bound a reliable write waits on a full bounded HistoryCache before `RETCODE_TIMEOUT` (see Backpressure below) | `{0, 100 ms}` |
 | `dds.qos:qos-durability` | DURABILITY kind — `:volatile`, `:transient-local`, `:transient`, `:persistent` | `:volatile` |
 | `dds.qos:qos-deadline` | DEADLINE period (`qos-duration`) | `+duration-infinite+` |
 | `dds.qos:qos-latency-budget` | LATENCY_BUDGET duration (`qos-duration`) | `+duration-zero+` |
@@ -66,6 +67,28 @@ a package-qualified accessor.
 |---|---|
 | `dds.qos:make-writer-qos` | `(make-writer-qos &rest args)` — a `qos` with DataWriter defaults (RELIABILITY defaults to `:reliable`); `args` override slots. |
 | `dds.qos:make-reader-qos` | `(make-reader-qos &rest args)` — a `qos` with DataReader defaults (RELIABILITY defaults to `:best-effort`); `args` override slots. |
+
+### Backpressure: block up to `max_blocking_time` (RELIABILITY × RESOURCE_LIMITS)
+
+DDS-standard **block-up-to-`max_blocking_time`** flow control (WP-ASYNC-FLOW, FR-PF-2/FR-QOS,
+[ADR 0016](../adr/0016-async-flow-control.md) §Backpressure). When a **reliable** writer's HistoryCache is
+**HISTORY KEEP_ALL** with a finite **RESOURCE_LIMITS `max_samples`** and **full**, a write
+(`publish-sample` / `write-sample` / dispose / unregister) **blocks** on a space-available condvar for up to
+**RELIABILITY `max_blocking_time`**, then returns **`RETCODE_TIMEOUT`** (the `:timeout` sentinel;
+`dds.dcps:+retcode-timeout+`) with the cache **intact** and **no sequence number consumed**. Space becomes
+available — and the blocked write wakes — when the cache shrinks: a KEEP_ALL cache shrinks only on the
+**ACKNACK purge** (`writer-purge-acked`, the slowest reader having acknowledged, §8.4.1), plus
+**controller teardown** (so a blocked publish reaches its `:timeout` once the paced drain stops).
+`max_blocking_time = 0` ⇒ **immediate** `:timeout` when full (the non-blocking
+degenerate). The bound applies to **all** changes (data + dispose/unregister), each occupying a SN.
+
+This is the standard RELIABILITY behaviour, **wire-invisible** and **additive on conforming RTPS** — it
+changes only *when* (or whether) a write proceeds, never the submessage bytes. The bound is **per-writer**
+(each writer's cache); paired with a `flow-controller` (which paces the aggregate drain rate) it keeps the
+backlog bounded (NFR-MEM) regardless of how slow the drain or the readers are. **Wiring:** the engine reads
+`max_samples` + `max_blocking_time` via `dds.disc:enable-publisher`'s `:max-samples` / `:max-blocking-ns`
+keywords (both `nil` by default ⇒ **unlimited cache, no blocking** — byte-identical to a writer with no
+bound). The DCPS `write-sample` / `dispose-instance` / `unregister-instance` surface `+retcode-timeout+`.
 
 ### RxO compatibility
 

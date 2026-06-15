@@ -355,6 +355,93 @@ their bulk user DATA through the ring; everything else stays on UDP. The real **
 (separate Lisp images attaching to one segment — the proof loopback within one image cannot give) is the
 `make shmem-xproc` harness (`scripts/shmem-roundtrip.sh`); the latency/throughput numbers are `make bench-shmem`.
 
+## Publication send modes: sync, async-unpaced, async-paced (flow control)
+
+Independently of *which* transport carries a datagram, a writer is in exactly one of **three send modes** —
+they govern *which thread sends* and *when* (WP-ASYNC / WP-ASYNC-FLOW, FR-PF-2,
+[ADR 0016](../adr/0016-async-flow-control.md)). All three are **wire-invisible**: they change only *when* a
+datagram leaves, never its bytes (the operating-contract "extend, never replace conforming RTPS" pattern), so
+none is patent-gated and none is R6.
+
+| Mode | How to opt in | Who sends | When |
+|---|---|---|---|
+| **sync** (default) | nothing | the **calling** (`publish-sample`) thread | inline, immediately on write |
+| **async-unpaced** | `dds.disc:enable-async` | a **per-node** background sender thread | on signal it flushes **all** unsent (the reliable unsent-list *is* the queue), **unpaced** — drains as fast as the link allows |
+| **async-paced** (flow control) | associate with a `dds.disc:flow-controller` | the **controller's** scheduler thread | rate-shaped: one datagram per associated writer per round-robin turn, gated by a bytes/period token bucket |
+
+A writer is associated with **at most one** controller; association **supersedes** the per-node unpaced sender
+for that writer (`enable-async` remains for the async-*without*-rate-control case). Flow control is **off by
+default** — a writer with no controller is **byte-identical** to a sync (or `enable-async`) writer.
+
+### Worked example — a shared flow-controller pacing a writer
+
+`make-flow-controller` builds a token bucket (`tokens-per-period` bytes every `period` ns, capacity
+`max-burst`) plus its own scheduler thread; `flow-controller-associate` registers a writer node, making its
+publication async-and-paced; the writer is configured **HISTORY KEEP_ALL** with a finite `max_samples` and a
+`max_blocking_time` so a too-fast producer **blocks up to `max_blocking_time`** then gets `RETCODE_TIMEOUT`
+rather than growing the cache without bound (the backpressure half — see the [QoS wiki](qos.md#backpressure-block-up-to-max_blocking_time-reliability--resource_limits)).
+Adapted from `dds.tests::run-flow-pacing-test` (`src/dds-tests/integration-test.lisp`); SBCL (real threads +
+timing — the flow tests pass-skip on Clasp, NFR-PORT).
+
+```lisp
+(let* ((payload (make-array 1400 :element-type '(unsigned-byte 8) :initial-element #x5a))
+       (w (dds.disc:make-disc-node
+           :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x93)
+           :host "127.0.0.1" :port 0))
+       (controller nil))
+  (unwind-protect
+       (progn
+         ;; bound the writer's cache so a too-fast producer is back-pressured, not unbounded:
+         ;; KEEP_ALL + max_samples=64 + max_blocking_time=200 ms (RETCODE_TIMEOUT when full past the deadline)
+         (dds.disc:add-local-writer w :topic "Paced" :type "X"
+                                    :reliability dds.rtps.discovery:+reliability-reliable+)
+         (dds.disc:enable-publisher w :max-samples 64 :max-blocking-ns 200000000)
+         ;; 100 KB/s = 10000 bytes every 100 ms, bucket capacity 10000 bytes
+         (setf controller (dds.disc:make-flow-controller
+                           :tokens-per-period 10000 :period 100000000 :max-burst 10000))
+         (dds.disc:flow-controller-associate controller w)   ; now publication is async + rate-shaped
+         ;; publish-sample returns immediately (the controller's thread sends, paced); RETCODE_TIMEOUT
+         ;; (:timeout) if the bounded cache is full past max_blocking_time
+         (dotimes (i 100)
+           (let ((rc (dds.disc:publish-sample w payload)))
+             (when (eq rc :timeout) (format t "~&back-pressured at sample ~d~%" i)))))
+    (when controller (dds.disc:destroy-flow-controller controller))   ; join the scheduler; flush remaining ignoring the bucket
+    (dds.disc:stop-node w)))   ; unregisters w from the controller via the per-node emit barrier BEFORE freeing
+```
+
+For **two or more** writers, call `flow-controller-associate` once per writer node on the **same** controller:
+the scheduler round-robins one datagram per writer per turn, so their datagrams interleave and the
+**aggregate** byte rate is shaped to the configured rate (not N × it). `stop-node` tears one writer down via a
+**per-node emit barrier** (`flow-controller-unregister`) — it removes the node from the scheduler's writer set
+then blocks until the shared scheduler is provably not, and never again will be, mid-emit on it, so freeing the
+node's socket/buffers cannot race a live send; the controller keeps serving its other writers. A large sample
+is paced at **DATA_FRAG fragment** granularity — its fragments spread across periods (the FR-PF-2 headline use
+case).
+
+### Honest cost (FR-LANG-7) — rate control trades latency
+
+Flow control is rate **control**: it bounds the byte rate by **delaying** datagrams, so it **adds latency by
+design** — there is **no "0-cost"/"free" claim**. The honest bench (`bench/report/2026-06-15-wp-async-flow.md`,
+`make bench-async-flow`): the achieved drain rate tracks the configured ceiling within a small startup-burst +
+per-datagram-granularity overshoot (e.g. configured 125 KB/s → achieved ~132 KB/s; a smaller `max-burst`
+tracks ~1.0×); the **same** workload runs **tens of times slower paced than unpaced** — which is the *point*,
+not overhead to remove. Use `enable-async` (unpaced) when you want async without a rate bound; use a
+`flow-controller` when a downstream link or reader must not be overrun.
+
+### Deferred (v1 → follow-ups)
+
+v1 ships **round-robin only**, behind a **pluggable policy hook** (the scheduler calls it to pick the next
+writer-with-pending-work), so the OMG-standard-QoS-anchored policies drop in without rework:
+`TRANSPORT_PRIORITY` → a highest-priority-first policy; `LATENCY_BUDGET`/`DEADLINE` → an EDF-like policy
+(per-sample deadline ≈ write-time + latency-budget; earliest first — `LATENCY_BUDGET` is a max-delay *hint*, so
+it informs *ordering*, not a hard cap). Also deferred: per-sample priority/deadline, **runtime rate
+re-configuration** (rate is set at `make-flow-controller`), pacing of discovery/HEARTBEAT/ACKNACK (only user
+DATA is paced), and cross-process flow control (a controller is an in-process, sender-side object). The
+`FlowController`, asynchronous `PublishMode`, and the policy *names* are RTI Connext vendor-extension names —
+**none is normative** in OMG DDS 1.4 or DDSI-RTPS 2.5 (the standard QoS set has no `PUBLISH_MODE` or
+`FLOW_CONTROLLER`; asynchronous publication is an implementation freedom), and the implementation is clean-room
+from FR-PF-2 + first principles.
+
 ## SHMEM architecture
 
 `make-shmem-transport` creates **one receive segment per participant** (the receiver creates it, senders

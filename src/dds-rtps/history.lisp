@@ -55,6 +55,18 @@
   "The number of changes currently stored in the HistoryCache HC."
   (history-cache-count hc))
 
+(defun* hc-kind (hc)
+    (function (history-cache) (member :keep-last :keep-all))
+  "The HISTORY kind of the HistoryCache HC (:keep-last or :keep-all). Read by the reliable writer's
+   backpressure path to decide whether the cache is bound by max_samples (KEEP_ALL, ADR 0016 §Backpressure)."
+  (history-cache-kind hc))
+
+(defun* hc-max-samples (hc)
+    (function (history-cache) (or null (integer 0)))
+  "The RESOURCE_LIMITS max_samples bound of the HistoryCache HC (NIL = unlimited). Read by the reliable
+   writer's block-up-to-max_blocking_time backpressure path (ADR 0016 §Backpressure)."
+  (history-cache-max-samples hc))
+
 (defun* hc-get-change (hc seqnum)
     (function (history-cache integer) t)
   "Return the CacheChange with SEQNUM, or NIL."

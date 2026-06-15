@@ -1313,3 +1313,37 @@ source, headers, or `rtiddsgen` output** was consulted.
 - Validated functionally + byte-exact against the engine's own serializer (the in-memory == wire
   oracle), under fuzz (the untrusted-payload wrap, incl. a `(safety 0)` arm), and by an SBCL bench
   (`bench/report/2026-06-14-wp-flatdata.md`) — none of which involves a vendor artifact.
+
+## M5 (2026-06-15) — WP-ASYNC-FLOW asynchronous flow control (FR-PF-2, ADR 0016, Phases A–F)
+
+The whole WP-ASYNC-FLOW — the `flow-token-bucket` metering primitive (`src/dds-disc/flow-control.lisp`
+— the bytes/period lazy-refill bucket, `make-flow-token-bucket`, `%fb-refill`, `%fb-acquire`), the
+shared `flow-controller` object + its round-robin scheduler thread + pluggable policy hook + per-node
+emit barrier, the block-up-to-`max_blocking_time` backpressure (`src/dds-rtps/reliable.lisp`
+`space-cv`), and the honest rate-shaping bench (`run-bench-async-flow`,
+`bench/report/2026-06-15-wp-async-flow.md`) — is **clean-room from FR-PF-2 + the WP-ASYNC-FLOW design
+spec only** — **no RTI Connext source, headers, or `rtiddsgen` output** was consulted.
+
+- **Sources consulted**: the operating contract §4 (FR-PF-2); the in-repo design spec
+  `docs/superpowers/specs/2026-06-15-wp-async-flow-design.md`; the DDSI-RTPS 2.5 reading that the
+  wire constrains submessage format + reliable-eventual-delivery but is **silent on sender-side
+  scheduling** (so flow control is a wire-invisible additive extension, not a wire change).
+- The token bucket is the **standard textbook rate-limiter** algorithm (lazy on-acquire refill,
+  multiply-before-divide integer rate, max-burst cap, deficit-wait) — not an RTI mechanism. The
+  `flow-controller` object shape (Alt B — a shared object + its own scheduler thread + a pluggable
+  policy hook), the per-node emit barrier (the use-after-free fix for a shared scheduler), and the
+  round-robin one-datagram-per-writer-per-turn scheduling are all this project's **own design from
+  first principles** — the FlowController/PublishMode *concept* is RTI's, but the **implementation
+  is clean-room** (derived from FR-PF-2 + the DDSI-RTPS reading, not from any RTI artifact).
+- **Flow control is NOT patent-gated** — it is standard DDS; no R6 marker, no "NOT cleared for
+  ship" header (the explicit contrast with WP-ZEROCOPY/WP-FLATDATA). The `FlowController` /
+  asynchronous-PublishMode / round-robin / EDF / highest-priority-first names are RTI
+  vendor-extension *names*, not normative OMG symbols; none were taken from RTI artifacts. The
+  block-up-to-`max_blocking_time` backpressure is the standard DDS RELIABILITY behaviour over a
+  bounded HISTORY/RESOURCE_LIMITS cache (OMG DDS 1.4 §2.2.3), not a new mechanism.
+- **No Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) / OpenDDS source was read** for this work package.
+- Validated by a deterministic unit test with an injected (settable-counter) clock — no wall-clock
+  dependence (`run-flow-token-bucket-test`, SBCL + Clasp) — plus the integration/stress tests
+  (`flow-pacing`, `flow-multiwriter-rr`, `flow-backpressure`, `flow-concurrency-stress`,
+  `flow-teardown`, `flow-off-byte-identical`) and the honest rate-shaping bench (`run-bench-async-flow`),
+  none of which consult any vendor artifact.

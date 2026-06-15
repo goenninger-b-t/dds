@@ -396,16 +396,32 @@
     (t (%assert-writer-liveliness dw)))
   t)
 
+(defparameter +retcode-ok+ :ok
+  "DDS 1.4 ReturnCode_t RETCODE_OK (§2.2.4.4): the operation succeeded. Represented as the keyword :ok.")
+
+(defparameter +retcode-timeout+ :timeout
+  "DDS 1.4 ReturnCode_t RETCODE_TIMEOUT (§2.2.4.4): the operation did not complete within the configured
+   time. Returned by write/dispose/unregister when RELIABILITY.max_blocking_time elapsed on a full bounded
+   (KEEP_ALL + RESOURCE_LIMITS max_samples) HistoryCache — DDS-standard block-up-to-max_blocking_time
+   backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS, ADR 0016 §Backpressure). Represented as the keyword
+   :timeout, the same sentinel the engine (dds.disc:publish-sample) surfaces.")
+
 (defun* write-sample (dw sample)
-    (function (data-writer t) (eql t))
-  "DataWriter::write — serialize SAMPLE via the topic type-support and publish it
-   reliably over the engine to all matched/discovered readers. A write asserts the
-   writer's liveliness (DDS 1.4 §2.2.3.11), so it stamps the writer (and, for
-   MANUAL_BY_PARTICIPANT, every such writer of the participant) via assert_liveliness."
+    (function (data-writer t) (member :ok :timeout))
+  "DataWriter::write — serialize SAMPLE via the topic type-support and publish it reliably over the engine
+   to all matched/discovered readers. Returns the DDS ReturnCode_t +RETCODE-OK+ (:ok) normally, or
+   +RETCODE-TIMEOUT+ (:timeout) if the writer's HistoryCache was full and RELIABILITY.max_blocking_time
+   elapsed without freeing a slot (WP-ASYNC-FLOW backpressure, ADR 0016 §Backpressure; only a writer whose
+   engine cache is bounded — finite max_samples + max_blocking_time — can return :timeout, so the default
+   path is byte-identical). On :timeout the sample was NOT published and liveliness is NOT asserted (the
+   write did not occur). A write otherwise asserts the writer's liveliness (DDS 1.4 §2.2.3.11), stamping the
+   writer (and, for MANUAL_BY_PARTICIPANT, every such writer of the participant) via assert_liveliness."
   (let ((node (dp-node (pub-participant (dw-publisher dw)))))
-    (dds.disc:publish-sample node (%serialize-sample (topic-type-support (dw-topic dw)) sample))
+    (when (eq :timeout (dds.disc:publish-sample
+                        node (%serialize-sample (topic-type-support (dw-topic dw)) sample)))
+      (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
-    t))
+    +retcode-ok+))
 
 (defparameter +instance-handle-nil+
   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
@@ -450,13 +466,16 @@
     handle))
 
 (defun* dispose-instance (dw sample-or-handle)
-    (function (data-writer t) (simple-array (unsigned-byte 8) (16)))
+    (function (data-writer t) (or (simple-array (unsigned-byte 8) (16)) (eql :timeout)))
   "DataWriter::dispose (DDS 1.4 §2.2.2.4.2.10) — dispose the instance named by SAMPLE-OR-HANDLE
    (a sample or a registered handle): emit a no-payload dispose DATA (StatusInfo Disposed, RTPS 2.5
-   §9.6.4.9) over the reliable engine so matched readers see NOT_ALIVE_DISPOSED. Returns the handle."
+   §9.6.4.9) over the reliable engine so matched readers see NOT_ALIVE_DISPOSED. Returns the handle, or
+   +RETCODE-TIMEOUT+ (:timeout) if the bounded cache was full and max_blocking_time elapsed (WP-ASYNC-FLOW
+   backpressure, ADR 0016 §Backpressure; on :timeout nothing was emitted and liveliness is not asserted)."
   (let ((handle (%resolve-handle dw sample-or-handle))
         (node (dp-node (pub-participant (dw-publisher dw)))))
-    (dds.disc:dispose-instance node handle)
+    (when (eq :timeout (dds.disc:dispose-instance node handle))
+      (return-from dispose-instance +retcode-timeout+))
     (assert-liveliness dw)
     handle))
 
@@ -468,17 +487,20 @@
     (if (typep qos 'dds.qos:qos) (dds.qos:qos-autodispose-unregistered-instances qos) t)))
 
 (defun* unregister-instance (dw sample-or-handle)
-    (function (data-writer t) (simple-array (unsigned-byte 8) (16)))
+    (function (data-writer t) (or (simple-array (unsigned-byte 8) (16)) (eql :timeout)))
   "DataWriter::unregister_instance (DDS 1.4 §2.2.2.4.2.7) — unregister the instance named by
    SAMPLE-OR-HANDLE: emit a no-payload unregister DATA over the reliable engine, relinquishing this
    writer's ownership of the instance. Per WRITER_DATA_LIFECYCLE (DDS 1.4 §2.2.3.21,
    autodispose_unregistered_instances, default TRUE) the unregister also DISPOSES the instance — the
    DATA carries StatusInfo Disposed|Unregistered (0x03) so readers report NOT_ALIVE_DISPOSED — unless
    the writer's QoS sets autodispose FALSE, in which case it carries only Unregistered (0x02, RTPS 2.5
-   §9.6.4.9). Drops the handle from the writer's instance table. Returns the handle."
+   §9.6.4.9). Drops the handle from the writer's instance table. Returns the handle, or +RETCODE-TIMEOUT+
+   (:timeout) if the bounded cache was full and max_blocking_time elapsed (WP-ASYNC-FLOW backpressure, ADR
+   0016 §Backpressure; on :timeout nothing was emitted, the handle is NOT dropped, liveliness not asserted)."
   (let ((handle (%resolve-handle dw sample-or-handle))
         (node (dp-node (pub-participant (dw-publisher dw)))))
-    (dds.disc:unregister-instance node handle (%writer-autodispose-p dw))
+    (when (eq :timeout (dds.disc:unregister-instance node handle (%writer-autodispose-p dw)))
+      (return-from unregister-instance +retcode-timeout+))
     (dds.pal:with-lock ((dw-status-lock dw))
       (remhash handle (dw-instances dw)))
     (assert-liveliness dw)

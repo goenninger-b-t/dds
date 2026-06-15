@@ -151,6 +151,13 @@
     (function (t) t)
   "Wake one thread waiting on condition variable CV."
   (bordeaux-threads:condition-notify cv))
+(defun* condvar-broadcast (cv)
+    (function (t) t)
+  "Wake ALL threads waiting on condition variable CV (each re-checks its predicate on wake). bordeaux-threads
+   0.9.4 has no portable broadcast, so this uses the native SB-THREAD:CONDITION-BROADCAST (the bt condvar is
+   an SB-THREAD:WAITQUEUE) — the only correct way to release several waiters on one event (e.g. several
+   publishers blocked on a full HistoryCache, ADR 0016 §Backpressure)."
+  (sb-thread:condition-broadcast cv))
 
 (defun* gc-suggest ()
     (function () (values))

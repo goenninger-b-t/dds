@@ -1339,6 +1339,214 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec cb))))
   t)
 
+(defun* run-flow-token-bucket-test ()
+    (function () t)
+  "WP-ASYNC-FLOW (FR-PF-2, flow-control half), ADR 0016: the bytes/period token bucket with a deterministic
+   INJECTED clock (a closure over a settable ns counter — no wall-clock dependence). Asserts: starts full;
+   acquire-success consumes and returns 0; a third acquire over the remaining tokens returns a POSITIVE
+   deficit-wait with NO consume; a half-period elapse refills ~rate*delta capped at MAX-BURST; tokens never
+   exceed MAX-BURST after a long idle; an over-MAX-BURST acquire SUCCEEDS via retry-then-refill within a small
+   bound and drains the bucket to 0 (the no-livelock guarantee — FAILS against the pre-fix wait=1-forever code);
+   a low-rate refill stepped in sub-quantum increments delivers the IDEAL token count with no remainder loss
+   (FAILS against the pre-fix advance-to-NOW refill); and zero/negative :tokens-per-period or :period are
+   rejected at construction."
+  (let* ((clk 0)
+         (clock-fn (lambda () clk))
+         (b (dds.disc:make-flow-token-bucket :tokens-per-period 1000 :period 1000000000
+                                             :max-burst 1000 :clock-fn clock-fn)))
+    (%check :fb-starts-full (= 1000 (dds.disc:flow-token-bucket-tokens b))
+            "token bucket must start full at MAX-BURST (1000)")
+    (%check :fb-acquire-1 (= 0 (dds.disc::%fb-acquire b 400))
+            "first acquire of 400 with a full bucket must succeed (return 0)")
+    (%check :fb-after-1 (= 600 (dds.disc:flow-token-bucket-tokens b))
+            "after acquiring 400 of 1000, 600 tokens must remain")
+    (%check :fb-acquire-2 (= 0 (dds.disc::%fb-acquire b 400))
+            "second acquire of 400 (200 left after) must succeed (return 0)")
+    (%check :fb-after-2 (= 200 (dds.disc:flow-token-bucket-tokens b))
+            "after consuming 800 of 1000, 200 tokens must remain")
+    (let ((wait (dds.disc::%fb-acquire b 400)))
+      (%check :fb-deficit-positive (and (integerp wait) (plusp wait))
+              "a third acquire of 400 with only 200 tokens must return a POSITIVE deficit-wait")
+      (%check :fb-deficit-no-consume (= 200 (dds.disc:flow-token-bucket-tokens b))
+              "the deficit-wait acquire must NOT consume any tokens (still 200)")
+      (%check :fb-deficit-value (= 200000000 wait)
+              (format nil "deficit-wait for 200 missing bytes at 1000 B/1e9 ns must be 2e8 ns, got ~d" wait)))
+    (setf clk 500000000)
+    (let ((tokens (dds.disc::%fb-refill b)))
+      (%check :fb-half-period-refill (= 700 tokens)
+              (format nil "half a period (5e8 ns) must add ~~500 tokens to 200 => 700 (capped at 1000), got ~d"
+                      tokens)))
+    (setf clk 1000000000000)
+    (let ((tokens (dds.disc::%fb-refill b)))
+      (%check :fb-cap-at-max-burst (= 1000 tokens)
+              (format nil "tokens must never exceed MAX-BURST (1000) after a long idle, got ~d" tokens)))
+    (dds.disc::%fb-acquire b 1000)
+    (let ((sent nil) (iters 0) (cap 3) (drained-from (dds.disc:flow-token-bucket-tokens b)))
+      (loop for i from 1 to cap
+            for wait = (dds.disc::%fb-acquire b 1500)
+            do (setf iters i)
+            when (= 0 wait) do (setf sent t) (loop-finish)
+            else do (incf clk wait) (dds.disc::%fb-refill b))
+      (%check :fb-over-burst-drained (= 0 drained-from)
+              (format nil "over-burst probe must start from a drained (non-full) bucket, got ~d" drained-from))
+      (%check :fb-over-burst-no-livelock sent
+              (format nil "an over-MAX-BURST (1500 > 1000) acquire from EMPTY must SUCCEED via deficit-wait + ~
+                           refill-to-full + retry within ~d iterations (pre-fix livelocks: wait=1 forever), ~
+                           got sent=~S after ~d iters"
+                      cap sent iters))
+      (%check :fb-over-burst-iters (>= iters 2)
+              (format nil "the non-full over-burst path must take a deficit-then-retry (>= 2 iters), got ~d"
+                      iters))
+      (%check :fb-over-burst-consumes (= 0 (dds.disc:flow-token-bucket-tokens b))
+              (format nil "an over-MAX-BURST success must drain the bucket to 0 (clamped, no debt), got ~d"
+                      (dds.disc:flow-token-bucket-tokens b))))
+    (let* ((fclk 0)
+           (fb (dds.disc:make-flow-token-bucket :tokens-per-period 1 :period 1000000000
+                                                :max-burst 1000 :clock-fn (lambda () fclk))))
+      (dds.disc::%fb-acquire fb 1000)
+      (dotimes (i 5) (incf fclk 400000000) (dds.disc::%fb-refill fb))
+      (%check :fb-refill-fidelity (= 2 (dds.disc:flow-token-bucket-tokens fb))
+              (format nil "5 x 0.4e9 ns (=2.0e9 ns) at 1 tok/1e9 ns must deliver exactly 2 tokens (no ~
+                           sub-quantum loss); pre-fix advances last-refill to NOW and delivers 1, got ~d"
+                      (dds.disc:flow-token-bucket-tokens fb))))
+    (%check :fb-reject-zero-tpp
+            (null (ignore-errors (dds.disc:make-flow-token-bucket :tokens-per-period 0 :period 1000000000
+                                                                  :max-burst 1000 :clock-fn clock-fn)))
+            "make-flow-token-bucket must reject :tokens-per-period 0")
+    (%check :fb-reject-neg-tpp
+            (null (ignore-errors (dds.disc:make-flow-token-bucket :tokens-per-period -5 :period 1000000000
+                                                                  :max-burst 1000 :clock-fn clock-fn)))
+            "make-flow-token-bucket must reject a negative :tokens-per-period")
+    (%check :fb-reject-zero-period
+            (null (ignore-errors (dds.disc:make-flow-token-bucket :tokens-per-period 1000 :period 0
+                                                                  :max-burst 1000 :clock-fn clock-fn)))
+            "make-flow-token-bucket must reject :period 0")
+    (%check :fb-reject-neg-period
+            (null (ignore-errors (dds.disc:make-flow-token-bucket :tokens-per-period 1000 :period -1
+                                                                  :max-burst 1000 :clock-fn clock-fn)))
+            "make-flow-token-bucket must reject a negative :period"))
+  t)
+
+(defun* %bp-writer (max-samples max-blocking-ns &optional (kind :keep-all))
+    (function ((or null (integer 1)) (or null (integer 0)) &optional (member :keep-last :keep-all))
+              dds.rtps.reliable:rtps-writer)
+  "Build a reliable rtps-writer with a HISTORY KIND (KEEP_ALL by default) / RESOURCE_LIMITS MAX-SAMPLES
+   cache and RELIABILITY MAX-BLOCKING-NS — the backpressure test fixture (WP-ASYNC-FLOW, ADR 0016)."
+  (dds.rtps.reliable:make-rtps-writer
+   :hc (dds.rtps.history:make-history-cache kind 1 max-samples nil)
+   :max-blocking-ns max-blocking-ns))
+
+(defun* %bp-payload ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "A 4-octet payload for the backpressure test."
+  (octets 9 9 9 9))
+
+(defun* run-flow-backpressure-test ()
+    (function () t)
+  "WP-ASYNC-FLOW (FR-PF-2/FR-QOS), ADR 0016 §Backpressure: DDS-standard block-up-to-max_blocking_time
+   backpressure in the reliable writer. SBCL-only (real blocking + threads); Clasp pass-skipped (the known
+   Clasp multithread-condvar SIGSEGV, NFR-PORT). Four cases:
+   (1) BLOCK→TIMEOUT — a KEEP_ALL writer at MAX-SAMPLES with a stalled drain (no purge): a worker-thread
+       writer-write of the next sample BLOCKS, then returns the :timeout sentinel after ~max_blocking_time
+       (200 ms ± tolerance) with the cache intact and NO SN consumed (the SN stream stays hole-free);
+   (2) UNBLOCK-ON-SPACE-SIGNAL — a worker blocks on a full cache with a GENEROUS deadline; the main thread
+       frees space via the REAL ACKNACK purge path (writer-purge-acked, which broadcasts space-cv) BEFORE
+       the deadline; the worker WAKES and SUCCEEDS (returns an SN), proving the CV wakeup (elapsed << the
+       deadline), not a timeout;
+   (3) MAX_BLOCKING = 0 — a full cache returns :timeout IMMEDIATELY (~0 elapsed), the non-blocking degenerate;
+   (4) DEFAULT NO-BLOCK regression — an unlimited (max_samples NIL) and a KEEP_LAST writer NEVER block and
+       NEVER return :timeout (every writer-write returns an integer SN) — the default path is unchanged."
+  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-backpressure-test t))
+  ;; -- Case 1: block then TIMEOUT at ~max_blocking_time (stalled drain, no purge) --
+  (let* ((block-ms 200)
+         (w (%bp-writer 3 (* block-ms 1000000)))
+         (rkey 11) (result :unset) (elapsed-ms nil))
+    (dotimes (i 3)
+      (%check :bp1-fill (integerp (dds.rtps.reliable:writer-write w (%bp-payload)))
+              "filling the bounded cache to max_samples must succeed (return an SN)"))   ; SN 1,2,3
+    (let* ((t0 (dds.pal:monotonic-ns))
+           (th (dds.pal:spawn (lambda () (setf result (dds.rtps.reliable:writer-write w (%bp-payload))))
+                              :name "bp-block")))
+      (dds.pal:join th)
+      (setf elapsed-ms (/ (- (dds.pal:monotonic-ns) t0) 1000000.0d0)))
+    (%check :bp1-timeout (eq :timeout result)
+            (format nil "a write into a full KEEP_ALL cache must return :timeout after max_blocking_time, got ~S" result))
+    (%check :bp1-blocked-approx (and (>= elapsed-ms (* block-ms 0.7)) (<= elapsed-ms (* block-ms 3.0)))
+            (format nil "the blocked write must take ~~~d ms (>= 0.7x, <= 3x), got ~,1f ms" block-ms elapsed-ms))
+    (%check :bp1-cache-intact (= 3 (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w)))
+            "a timed-out write must leave the cache intact (still 3 changes)")
+    ;; the timed-out write consumed NO SN (hole-free): free space, then the next write takes SN 4 (not 5)
+    (setf (dds.rtps.reliable:reader-proxy-acked-base (dds.rtps.reliable:get-reader-proxy w rkey)) 4)
+    (dds.rtps.reliable:writer-purge-acked w (list rkey))
+    (%check :bp1-no-sn-consumed (eql 4 (dds.rtps.reliable:writer-write w (%bp-payload)))
+            "a timed-out write must NOT consume a sequence number: the next successful write takes SN 4 (hole-free)"))
+  ;; -- Case 2: unblock BEFORE the deadline via the real ACKNACK purge path (proves the CV wakeup) --
+  (let* ((deadline-ms 3000)
+         (w (%bp-writer 3 (* deadline-ms 1000000)))
+         (rkey 77) (result :unset) (elapsed-ms nil))
+    (dotimes (i 3) (dds.rtps.reliable:writer-write w (%bp-payload)))   ; SN 1,2,3 fill the cache
+    (setf (dds.rtps.reliable:reader-proxy-acked-base
+           (dds.rtps.reliable:get-reader-proxy w rkey))
+          3)   ; the reader has ACKed SN 1,2 (acked-base 3) -> writer-purge-acked drops them
+    (let* ((t0 (dds.pal:monotonic-ns))
+           (th (dds.pal:spawn (lambda () (setf result (dds.rtps.reliable:writer-write w (%bp-payload))))
+                              :name "bp-unblock")))
+      (sleep 0.1)   ; let the worker reach the wait (still blocked: nothing has freed space yet)
+      (%check :bp2-still-blocked (eq result :unset)
+              "the worker write must still be BLOCKED before any space is freed")
+      (let ((purged (dds.rtps.reliable:writer-purge-acked w (list rkey))))   ; REAL purge path: frees space + broadcasts space-cv
+        (%check :bp2-purged (= 2 purged)
+                (format nil "writer-purge-acked must drop the 2 acked changes (SN 1,2), got ~d" purged)))
+      (dds.pal:join th)
+      (setf elapsed-ms (/ (- (dds.pal:monotonic-ns) t0) 1000000.0d0)))
+    (%check :bp2-success (integerp result)
+            (format nil "the blocked write must SUCCEED (return an SN) once the purge frees space + signals, got ~S" result))
+    (%check :bp2-sn-4 (eql result 4)
+            (format nil "the unblocked write must take the next SN (4), got ~S" result))
+    (%check :bp2-woke-early (< elapsed-ms (* deadline-ms 0.5))
+            (format nil "the write must be WOKEN by the space-signal WELL before its ~d ms deadline (proves the CV wakeup, not a timeout), got ~,1f ms"
+                    deadline-ms elapsed-ms)))
+  ;; -- Case 3: max_blocking_time = 0 -> immediate :timeout when full (no blocking) --
+  (let* ((w (%bp-writer 2 0)) (result :unset) (elapsed-ms nil))
+    (dotimes (i 2) (dds.rtps.reliable:writer-write w (%bp-payload)))   ; fill to max_samples=2
+    (let ((t0 (dds.pal:monotonic-ns)))
+      (setf result (dds.rtps.reliable:writer-write w (%bp-payload))
+            elapsed-ms (/ (- (dds.pal:monotonic-ns) t0) 1000000.0d0)))
+    (%check :bp3-immediate-timeout (eq :timeout result)
+            (format nil "max_blocking_time 0 on a full cache must return :timeout immediately, got ~S" result))
+    (%check :bp3-no-block (< elapsed-ms 50)
+            (format nil "max_blocking_time 0 must NOT block (~~0 ms), got ~,1f ms" elapsed-ms)))
+  ;; -- Case 4: default (unlimited / KEEP_LAST) never blocks, never times out (regression) --
+  (let ((w (%bp-writer nil (* 200 1000000))))   ; KEEP_ALL, max_samples NIL = unlimited, with a max_blocking set
+    (dotimes (i 50)
+      (%check :bp4-unlimited-ok (integerp (dds.rtps.reliable:writer-write w (%bp-payload)))
+              "an UNLIMITED KEEP_ALL writer must never block / time out (always returns an SN)")))
+  (let ((w (%bp-writer 2 (* 200 1000000) :keep-last)))   ; KEEP_LAST depth-1 with a finite max_samples + max_blocking
+    (dotimes (i 50)
+      (%check :bp4-keeplast-ok (integerp (dds.rtps.reliable:writer-write w (%bp-payload)))
+              "a KEEP_LAST writer must never block / time out (it evicts, never rejects)")))
+  ;; lifecycle change respects the bound consistently with a data write (full cache + 0 blocking -> :timeout)
+  (let ((w (%bp-writer 1 0)))
+    (dds.rtps.reliable:writer-write w (%bp-payload))   ; fill the single slot
+    (%check :bp4-lifecycle-bounded
+            (eq :timeout (dds.rtps.reliable:writer-lifecycle-change
+                          w (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0) 1))
+            "writer-lifecycle-change must also return :timeout on a full bounded cache (the bound applies to all changes)"))
+  ;; bounded cache + max-blocking-ns NIL: a full cache must REJECT with :timeout and consume NO SN
+  ;; (never an unrepairable SN hole from a silently-rejected hc-add-change)
+  (let ((w (%bp-writer 2 nil)) (rkey 22))
+    (dotimes (i 2) (dds.rtps.reliable:writer-write w (%bp-payload)))   ; SN 1,2 fill the cache (no blocking config)
+    (%check :bp4-bounded-noblock-timeout
+            (eq :timeout (dds.rtps.reliable:writer-write w (%bp-payload)))
+            "a full bounded cache with max-blocking-ns NIL must return :timeout immediately (no blocking)")
+    (%check :bp4-bounded-noblock-intact (= 2 (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w)))
+            "the rejected write must not grow the cache (still 2)")
+    (setf (dds.rtps.reliable:reader-proxy-acked-base (dds.rtps.reliable:get-reader-proxy w rkey)) 3)
+    (dds.rtps.reliable:writer-purge-acked w (list rkey))   ; free SN 1,2 -> room
+    (%check :bp4-bounded-noblock-no-hole (eql 3 (dds.rtps.reliable:writer-write w (%bp-payload)))
+            "the next successful write after a :timeout must take SN 3 (no SN consumed by the rejected write — hole-free)"))
+  t)
+
 (defun* run-all-tests ()
     (function () t)
   "Run every landed test; signal on first failure, else report and return T."
@@ -1403,6 +1611,15 @@
                  ("coalesce-large-pack"      . run-coalesce-large-pack-test)
                  ("batch-defer"              . run-batch-defer-test)
                  ("async-decoupled"          . run-async-decoupled-test)
+                 ("flow-step-equivalence"    . run-flow-step-equivalence-test)
+                 ("flow-token-bucket"        . run-flow-token-bucket-test)
+                 ("flow-backpressure"        . run-flow-backpressure-test)
+                 ("flow-controller-lifecycle" . run-flow-controller-lifecycle-test)
+                 ("flow-pacing"              . run-flow-pacing-test)
+                 ("flow-multiwriter-rr"      . run-flow-multiwriter-rr-test)
+                 ("flow-concurrency-stress"  . run-flow-concurrency-stress-test)
+                 ("flow-teardown"            . run-flow-teardown-test)
+                 ("flow-off-byte-identical"  . run-flow-off-byte-identical-test)
                  ("shmem-end-to-end"         . run-shmem-end-to-end-test)
                  ("zerocopy-end-to-end"      . run-zerocopy-end-to-end-test)
                  ("flatdata-zerocopy"        . run-flatdata-zerocopy-test)

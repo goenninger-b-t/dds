@@ -156,6 +156,9 @@
   (async-pending nil :type t)             ; work to flush (guarded by async-lock)
   (async-stop nil :type t)                ; shutdown requested (guarded by async-lock)
   (async-tx-msg nil :type (or null dds.core.buffer:octet-buffer)) ; the sender thread's OWN scratch buffer
+  (flow-step-state nil :type t) ; WP-ASYNC-FLOW: the node's in-progress per-datagram send plan ((host . port) . PLAN), threaded across %flow-step-emit calls; NIL = rebuild on next call
+  (flow-controller nil :type t) ; WP-ASYNC-FLOW: the flow-controller this writer is associated with (NIL = none); set/cleared under the CONTROLLER lock; non-NIL makes publish async-and-paced (the controller thread sends)
+  (flow-pending nil :type t)    ; WP-ASYNC-FLOW: new unsent work awaiting a fresh plan snapshot; set by %flow-signal, cleared by the scheduler — guarded by the CONTROLLER lock (NOT the node lock)
   (samples (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> payload (§8.3.5.4: SN is per-writer; no per-sample composite-key alloc)
   (sample-writers (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> writer EntityId (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
@@ -997,6 +1000,8 @@
    in-flight %HANDLE-DATAGRAM on ANY receiver thread (a SHMEM record feeds the same entry point) writes
    into RX-TX-MSG/TX-MSG, so freeing first is a use-after-free (observed via canary instrumentation). The
    WP-ASYNC sender (which may itself SHMEM-send) is stopped+joined first. Idempotent."
+  (when (disc-node-flow-controller node)   ; WP-ASYNC-FLOW: unregister from any flow-controller BEFORE the frees below — unregister is a PER-NODE EMIT BARRIER (it removes NODE from the writers list, then BLOCKS until the SHARED scheduler is not mid-emit on NODE), so the subsequent udp-close/shmem-close/free-static never race a live scheduler send on NODE (no use-after-free). A bare unregister-without-join would NOT be safe; the barrier is what makes it safe (ADR 0016 §Teardown)
+    (flow-controller-unregister (disc-node-flow-controller node) node))
   (cond
     ((disc-node-async-thread node)       ; WP-ASYNC: stop + drain + JOIN the sender BEFORE closing the socket
      (dds.pal:with-lock ((disc-node-async-lock node))

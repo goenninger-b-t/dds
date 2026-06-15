@@ -66,37 +66,60 @@
    its datagram), never truncated. Tunable; pinned to no spec constant (a local batching policy, not a
    wire field).")
 
+(defun* %pack-budget (buf)
+    (function (dds.core.buffer:octet-buffer) (integer 0))
+  "The effective coalescing budget for BUF: min(*COALESCE-DATAGRAM-BUDGET*, capacity−64) — the per-datagram
+   octet ceiling %PACK-PLAN partitions to (RTPS 2.5 §8.3.4). Factored so the plan and the build agree on it."
+  (min *coalesce-datagram-budget* (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
+
+(defun* %pack-plan (items budget)
+    (function (list (integer 0)) list)
+  "Partition ITEMS — each a (SIZE . BUILD-FN) packable submessage of at most SIZE octets — into the ORDERED
+   list of per-datagram item groups %SEND-PACKED would flush at BUDGET (RTPS 2.5 §8.3.4): a fresh group is
+   started before a submessage that would push the current (non-empty) group past BUDGET, and a submessage
+   whose SIZE is not a multiple of 4 forces a group boundary after it (RTPS 2.5 §8.3.4 requires the next
+   submessage to start 32-bit-aligned). Pure (no I/O, no cursor) — the boundary decision depends only on the
+   SIZE sequence and BUDGET, so the partition is identical whether the caller sends eagerly (%SEND-PACKED) or
+   one group at a time (the per-datagram step), making the two byte-identical by construction. NIL ITEMS ->
+   NIL (no datagram)."
+  (let ((groups '()) (cur '()) (used 0))
+    (dolist (item items)
+      (when (and cur (> (+ used (car item)) budget))
+        (push (nreverse cur) groups) (setf cur '() used 0))   ; would overflow: close the current group
+      (push item cur) (incf used (car item))
+      (when (plusp (mod (car item) 4))
+        (push (nreverse cur) groups) (setf cur '() used 0)))   ; non-4-aligned: must be this datagram's last
+    (when cur (push (nreverse cur) groups))
+    (nreverse groups)))
+
+(defun* %build-packed-datagram (node buf group)
+    (function (disc-node dds.core.buffer:octet-buffer list) (integer 0))
+  "Build ONE coalesced RTPS datagram for the item GROUP (a %PACK-PLAN sublist) into BUF — one shared Header
+   (RTPS 2.5 §8.3.4 / §9.4.4) then each item's submessage in order — and return its octet length. No I/O: the
+   send is the caller's (so the per-datagram step can build-then-send, accounting tokens on the returned
+   length before sending). The byte-exact body shared by %SEND-PACKED and %EMIT-NEXT-DATAGRAM."
+  (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
+    (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
+    (dolist (item group)
+      (funcall (cdr item) mc))
+    (dds.core.buffer:cursor-position mc)))
+
 (defun* %send-packed (node buf host port items &optional shmem-dest)
     (function (disc-node dds.core.buffer:octet-buffer string (unsigned-byte 16) list &optional t) t)
   "Coalesce ITEMS — each a (SIZE . BUILD-FN) where BUILD-FN writes exactly ONE submessage of at most
    SIZE octets — into as few RTPS datagrams as fit the budget, one shared Header per datagram (RTPS 2.5
-   §8.3.4 / §9.4.4), and send each to HOST:PORT. Before writing a submessage that would push a non-empty
-   datagram past min(*COALESCE-DATAGRAM-BUDGET*, capacity−64), the current datagram is FLUSHED first
-   (then the header — never overwritten — is reused), so the cursor never exceeds the budget (≪ buffer
-   capacity): no buffer overflow on legitimate input. A submessage whose body does not end on a 4-octet
-   boundary (RTPS 2.5 §8.3.4 requires submessages to start 32-bit-aligned) cannot be followed by another
-   in the same datagram, so it is flushed as its datagram's last — a no-op for this stack (every DATA
-   payload is XCDR-padded to 4, dispose=52, HEARTBEAT=28, all aligned), a graceful degrade otherwise.
-   Cuts the sendto count from one-per-submessage to ceil(total/budget). NIL ITEMS sends nothing. SHMEM-DEST
-   (a shmem-locator, default NIL) routes every flushed datagram over shared memory with UDP fallback
-   (%send-raw-buf, FR-XPORT-2); NIL keeps the original all-UDP path."
-  (when items
-    (let* ((budget (min *coalesce-datagram-budget*
-                        (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
-           (mc (dds.core.buffer:cursor buf :endianness :little)))
-      (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
-      (let ((hdr-end (dds.core.buffer:cursor-position mc)))
-        (flet ((flush () (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port shmem-dest)
-                 (dds.core.buffer:cursor-set-position mc hdr-end)))
-          (dolist (item items)
-            (when (and (> (dds.core.buffer:cursor-position mc) hdr-end)
-                       (> (+ (dds.core.buffer:cursor-position mc) (car item)) budget))
-              (flush))                                   ; would overflow the datagram: send what we have first
-            (funcall (cdr item) mc)                      ; write the submessage into the (possibly fresh) datagram
-            (when (plusp (mod (dds.core.buffer:cursor-position mc) 4))
-              (flush)))                                  ; non-4-aligned end: must be this datagram's last submessage
-          (when (> (dds.core.buffer:cursor-position mc) hdr-end)
-            (flush)))))))
+   §8.3.4 / §9.4.4), and send each to HOST:PORT. The datagram partition is %PACK-PLAN (a fresh datagram is
+   started before a submessage that would push a non-empty datagram past min(*COALESCE-DATAGRAM-BUDGET*,
+   capacity−64), so the cursor never exceeds the budget ≪ buffer capacity: no buffer overflow on legitimate
+   input; a submessage whose body does not end on a 4-octet boundary, RTPS 2.5 §8.3.4 requires the next to
+   start 32-bit-aligned, is the last in its datagram — a no-op for this stack: every DATA payload is
+   XCDR-padded to 4, dispose=52, HEARTBEAT=28, all aligned, a graceful degrade otherwise); each group is then
+   built (%BUILD-PACKED-DATAGRAM) and sent. Cuts the sendto count from one-per-submessage to
+   ceil(total/budget). NIL ITEMS sends nothing. SHMEM-DEST (a shmem-locator, default NIL) routes every
+   datagram over shared memory with UDP fallback (%send-raw-buf, FR-XPORT-2); NIL keeps the original all-UDP
+   path."
+  (dolist (group (%pack-plan items (%pack-budget buf)))
+    (%send-raw-buf node buf (%build-packed-datagram node buf group) host port shmem-dest)))
 
 (defun* %usable-destination (p)
     (function (dds.rtps.discovery:spdp-data) t)
@@ -319,20 +342,69 @@
       (when (> (length pl) *zerocopy-min-payload-bytes*)
         (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 (length pl) 1)))))
 
-(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest (zc-readers 0))
-    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons) &optional t (integer 0)) t)
-  "Send CHANGES (+ optional trailing HEARTBEAT item HB, a (SIZE . BUILD-FN)) to HOST:PORT, coalescing the
-   small ones into as few datagrams as fit the budget (%send-packed): collect a %data-builder item per
-   SMALL change (a SN in *DEBUG-DROP-SAMPLE-NUMBERS* is skipped — loss injection preserved), send each
-   LARGE change individually via %send-sample (already one datagram per fragment group), append HB, then
-   pack. This is the shared writer push/retransmit emit path (RTPS 2.5 §8.3.4 §8.4.2.2). When SHMEM-DEST is
-   supplied the COALESCED small-sample datagrams go over shared memory with UDP fallback (FR-XPORT-2);
-   large fragmented samples stay on UDP in v1 (the bulk small-sample path is the SHMEM throughput target).
-   NIL SHMEM-DEST is the original all-UDP behaviour, byte-for-byte. ZC-READERS > 0 (WP-ZEROCOPY, FR-PF-3)
-   substitutes a 16-byte reference for a large :data sample's payload at THIS destination (%zc-change-item)
-   instead of fragmenting it — exactly one of {ref, full payload} reaches each reader (no double-delivery);
-   ZC-READERS 0 (the default, and always when *zerocopy-enabled* is nil) is the existing path verbatim."
-  (let ((items '()))
+(defun* %msg-datagram (node build-fn)
+    (function (disc-node function) function)
+  "Wrap a submessage BUILD-FN (writing onto a cursor after the Header) as a ONE-DATAGRAM build-thunk
+   (lambda (buf) -> octet-length): write the RTPS Header (RTPS 2.5 §8.3.4) then BUILD-FN, return the
+   cursor length. No I/O — the byte-exact twin of %SEND-MSG-BUF's build half, so the per-datagram step
+   builds the identical bytes %SEND-MSG-BUF would, then sends them itself."
+  (lambda (buf)
+    (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
+      (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
+      (funcall build-fn mc)
+      (dds.core.buffer:cursor-position mc))))
+
+(defun* %sample-plan (node sn pl budget)
+    (function (disc-node integer (simple-array (unsigned-byte 8) (*)) (integer 1)) list)
+  "The ORDERED list of one-datagram build-thunks (each lambda (buf) -> octet-length) for sample (SN, PL):
+   one DATA datagram if PL fits *fragment-size*, else a DATA_FRAG series (packing as many fragments as fit
+   BUDGET per datagram, RTPS 2.5 §9.4.5.5) followed by a HEARTBEAT_FRAG. Loss injection is applied HERE,
+   identically to the prior inline %send-sample: a small DATA whose SN is in *DEBUG-DROP-SAMPLE-NUMBERS* and
+   a DATA_FRAG submessage covering a fragment in *DEBUG-DROP-FRAGMENT-NUMBERS* are omitted (no thunk). The
+   HEARTBEAT_FRAG count side-effect (writer-frag-heartbeat increments a counter) runs ONCE here — exactly as
+   the prior flush-all ran it once — and the captured (lastfrag count) close over the thunk, so stepping is
+   byte-identical and does not double-count. No I/O: the step builds+sends each thunk."
+  (let ((size (length pl))
+        (wid (disc-node-user-writer-id node)))
+    (if (<= size dds.rtps.reliable:*fragment-size*)
+        (if (and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*))
+            '()
+            (list (%msg-datagram node
+                                 (lambda (mc) (dds.rtps.message:write-data
+                                               mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 size)))))
+        (let ((thunks '()))
+          (dolist (desc (dds.rtps.reliable:writer-frag-plan size dds.rtps.reliable:*fragment-size* budget))
+            (destructuring-bind (fstart fcount off len) desc
+              (unless (and *debug-drop-fragment-numbers*
+                           (loop for f from fstart below (+ fstart fcount)
+                                   thereis (member f *debug-drop-fragment-numbers*)))
+                (push (%msg-datagram node
+                                     (lambda (mc) (dds.rtps.message:write-data-frag
+                                                   mc dds.rtps.message:+entityid-unknown+ wid sn size
+                                                   fstart fcount dds.rtps.reliable:*fragment-size* pl off len)))
+                      thunks))))
+          (multiple-value-bind (lastfrag cnt)
+              (dds.rtps.reliable:writer-frag-heartbeat (disc-node-user-writer node) sn)
+            (when lastfrag
+              (push (%msg-datagram node
+                                   (lambda (mc) (dds.rtps.message:write-heartbeat-frag
+                                                 mc dds.rtps.message:+entityid-unknown+ wid sn lastfrag cnt)))
+                    thunks)))
+          (nreverse thunks)))))
+
+(defun* %changes-datagram-plan (node buf changes hb shmem-dest zc-readers)
+    (function (disc-node dds.core.buffer:octet-buffer list (or null cons) t (integer 0)) list)
+  "The ORDERED per-datagram send-plan for pushing CHANGES (+ optional trailing HEARTBEAT item HB) to ONE
+   destination: a list of (BUILD-THUNK . SHMEM-DEST), each BUILD-THUNK a lambda (buf) -> octet-length that
+   builds exactly ONE datagram. The order, and each datagram's bytes, are IDENTICAL to the prior flush-all
+   %send-changes-packed: every LARGE change's DATA_FRAG datagrams (%sample-plan, in CHANGES order, UDP only
+   in v1 -> SHMEM-DEST NIL) come FIRST, then the coalesced small-:data / ZC-ref items + HB packed into ≤budget
+   datagrams (%pack-plan + %build-packed-datagram, carrying SHMEM-DEST). Loss injection, ZC substitution
+   (ZC-READERS > 0, WP-ZEROCOPY FR-PF-3 — exactly one of {ref, payload} per reader), and the HEARTBEAT_FRAG
+   count side-effect all happen here, once, exactly as before — so consuming this plan one datagram at a time
+   (the step) is byte-identical to flush-all by construction. Pure of I/O; BUF supplies only the packing
+   budget (%pack-budget)."
+  (let ((frag-plans '()) (items '()) (budget (%pack-budget buf)))
     (dolist (change changes)
       (let ((sn (dds.rtps.history:cache-change-sn change))
             (zc nil))
@@ -340,43 +412,65 @@
           ((and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*)))
           ((setf zc (%zc-change-item node change zc-readers)) (push zc items))   ; WP-ZEROCOPY: ref, not payload
           ((%small-change-p change) (push (%data-builder node change) items))
-          (t (%send-sample node buf sn
-                           (dds.rtps.history:cache-change-serialized-payload change) host port)))))
+          (t (dolist (thunk (%sample-plan node sn (dds.rtps.history:cache-change-serialized-payload change)
+                                          (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
+               (push (cons thunk nil) frag-plans))))))   ; large samples: UDP only (v1), one datagram per thunk
     (when hb (push hb items))
-    (%send-packed node buf host port (nreverse items) shmem-dest)))
+    (let ((packed (loop for group in (%pack-plan (nreverse items) budget)
+                        collect (cons (let ((g group)) (lambda (buf) (%build-packed-datagram node buf g)))
+                                      shmem-dest))))
+      (nconc (nreverse frag-plans) packed))))
+
+(defun* %emit-next-datagram (node buf state)
+    (function (disc-node dds.core.buffer:octet-buffer list) (values (integer 0) t list))
+  "The per-datagram STEP (WP-ASYNC-FLOW core, FR-PF-2): build the NEXT single datagram of STATE into BUF and
+   send it, returning (values BYTES-SENT MORE-REMAIN-P NEW-STATE). STATE is a list of (BUILD-THUNK . SHMEM-DEST)
+   plan entries with the destination (HOST . PORT) consed on its head — i.e. ((HOST . PORT) . PLAN); NEW-STATE
+   carries the SAME head with PLAN's tail, so threading it across calls walks the plan one datagram at a time.
+   MORE-REMAIN-P is NIL once the plan is exhausted. Build-then-send by construction: the thunk builds the
+   datagram into BUF and reports its length (the exact token cost the Phase-C scheduler acquires) BEFORE the
+   %send-raw-buf — so a scheduler can build, acquire(length), then send the already-built buffer. An empty/
+   exhausted STATE sends nothing and returns (values 0 NIL STATE). Flow control is wire-invisible: this only
+   changes WHEN a datagram is sent, never its bytes (ADR 0016)."
+  (let ((dest (car state)) (plan (cdr state)))
+    (if (null plan)
+        (values 0 nil state)
+        (let* ((entry (car plan))
+               (len (funcall (car entry) buf)))
+          (%send-raw-buf node buf len (car dest) (cdr dest) (cdr entry))
+          (values len (and (cdr plan) t) (cons dest (cdr plan)))))))
+
+(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest (zc-readers 0))
+    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons) &optional t (integer 0)) t)
+  "Send CHANGES (+ optional trailing HEARTBEAT item HB, a (SIZE . BUILD-FN)) to HOST:PORT, coalescing the
+   small ones into as few datagrams as fit the budget: this is now the per-datagram STEP run to completion —
+   build the %changes-datagram-plan once, then %emit-next-datagram in a loop until no datagram remains. The
+   plan emits every LARGE change's DATA_FRAG series first (one datagram per fragment group, UDP only in v1),
+   then the coalesced small-:data / ZC-ref items + HB; so the wire bytes are byte-IDENTICAL to the prior
+   flush-all (the loop is the same datagram sequence, now stepped). The shared writer push/retransmit emit
+   path (RTPS 2.5 §8.3.4 §8.4.2.2). When SHMEM-DEST is supplied the COALESCED small-sample datagrams go over
+   shared memory with UDP fallback (FR-XPORT-2); large fragmented samples stay on UDP in v1 (the bulk
+   small-sample path is the SHMEM throughput target). NIL SHMEM-DEST is the original all-UDP behaviour,
+   byte-for-byte. ZC-READERS > 0 (WP-ZEROCOPY, FR-PF-3) substitutes a 16-byte reference for a large :data
+   sample's payload at THIS destination (%zc-change-item) instead of fragmenting it — exactly one of
+   {ref, full payload} reaches each reader (no double-delivery); ZC-READERS 0 (the default, and always when
+   *zerocopy-enabled* is nil) is the existing path verbatim."
+  (let ((state (cons (cons host port)
+                     (%changes-datagram-plan node buf changes hb shmem-dest zc-readers))))
+    (loop while (cdr state)   ; (cdr state) = the remaining datagram plan; NIL when exhausted
+          do (setf state (nth-value 2 (%emit-next-datagram node buf state))))
+    t))
 
 (defun* %send-sample (node buf sn pl host port)
     (function (disc-node dds.core.buffer:octet-buffer integer (simple-array (unsigned-byte 8) (*)) string (unsigned-byte 16)) t)
   "Send sample (SN, PL) to HOST:PORT: one DATA submessage if PL fits *fragment-size*, else a
    series of DATA_FRAG submessages (packing as many fragments as fit the datagram) followed by
-   a HEARTBEAT_FRAG. Uses BUF (tx-msg or rx-tx-msg) as the scratch message buffer. A submessage
-   containing a fragment named in *DEBUG-DROP-FRAGMENT-NUMBERS* is skipped, and a non-fragmented
-   DATA whose SN is in *DEBUG-DROP-SAMPLE-NUMBERS* is skipped (loss injection)."
-  (let ((size (length pl)))
-    (if (<= size dds.rtps.reliable:*fragment-size*)
-        (unless (and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*))
-          (%send-msg-buf node buf
-                         (lambda (mc) (dds.rtps.message:write-data
-                                       mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn pl 0 size))
-                         host port))
-        (let ((budget (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
-          (dolist (desc (dds.rtps.reliable:writer-frag-plan size dds.rtps.reliable:*fragment-size* budget))
-            (destructuring-bind (fstart fcount off len) desc
-              (unless (and *debug-drop-fragment-numbers*
-                           (loop for f from fstart below (+ fstart fcount)
-                                   thereis (member f *debug-drop-fragment-numbers*)))
-                (%send-msg-buf node buf
-                               (lambda (mc) (dds.rtps.message:write-data-frag
-                                             mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn size
-                                             fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
-                               host port))))
-          (multiple-value-bind (lastfrag cnt)
-              (dds.rtps.reliable:writer-frag-heartbeat (disc-node-user-writer node) sn)
-            (when lastfrag
-              (%send-msg-buf node buf
-                             (lambda (mc) (dds.rtps.message:write-heartbeat-frag
-                                           mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn lastfrag cnt))
-                             host port)))))))
+   a HEARTBEAT_FRAG. Now the %sample-plan datagram thunks built+sent in order (byte-identical to the prior
+   inline emit). Uses BUF (tx-msg or rx-tx-msg) as the scratch message buffer. A submessage containing a
+   fragment named in *DEBUG-DROP-FRAGMENT-NUMBERS* is skipped, and a non-fragmented DATA whose SN is in
+   *DEBUG-DROP-SAMPLE-NUMBERS* is skipped (loss injection)."
+  (dolist (thunk (%sample-plan node sn pl (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
+    (%send-raw-buf node buf (funcall thunk buf) host port)))
 
 (defun* %send-user-heartbeat (node buf first last count host port)
     (function (disc-node dds.core.buffer:octet-buffer integer integer integer string (unsigned-byte 16)) t)
@@ -548,6 +642,65 @@
   "Push unsent changes on the caller thread using tx-msg (the synchronous send path)."
   (%push-data-buf node (disc-node-tx-msg node)))
 
+(defun* %node-datagram-plan (node buf)
+    (function (disc-node dds.core.buffer:octet-buffer) list)
+  "The FULL per-datagram send-plan for the node's user writer across ALL its matched-reader destinations —
+   a flat list of ((HOST . PORT) BUILD-THUNK . SHMEM-DEST) entries, in the SAME order, with the SAME datagram
+   bytes, that %push-data-buf's flush-all would send (it walks %reader-push-targets in the same order and
+   each group's plan is %changes-datagram-plan). The unsent watermark is captured ONCE here (%merge-unsent
+   advances each reader's unsent-base exactly as flush-all does) — so the scheduler must build this plan once
+   and then step it, never rebuild mid-drain (that would re-read an already-advanced watermark and send
+   nothing). The seam the Phase-C FlowController scheduler drives: build the plan (capturing the unsent set),
+   then for each entry build into a scratch buffer (the thunk reports the token cost = datagram length),
+   acquire that many tokens, and send — one datagram per RR step. BUF supplies only the packing budget."
+  (let ((writer (disc-node-user-writer node))
+        (plan '()))
+    (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
+      (dolist (group (%reader-push-targets node))
+        (let ((dest (car group)))
+          (dolist (entry (%changes-datagram-plan node buf (%merge-unsent writer (cdr group))
+                                                  (%heartbeat-builder node first last count)
+                                                  (%group-shmem-dest node group)
+                                                  (%zc-readers node (cdr group))))
+            (push (cons dest entry) plan)))))   ; ((host . port) . (thunk . shmem-dest))
+    (nreverse plan)))
+
+(defun* %emit-plan-entry (node buf entry &optional before-send)
+    (function (disc-node dds.core.buffer:octet-buffer cons &optional (or null function)) (integer 0))
+  "Build ONE node-plan ENTRY — a ((HOST . PORT) BUILD-THUNK . SHMEM-DEST) from %node-datagram-plan — into BUF
+   (the thunk writes the datagram and returns its octet length) and send it, returning the length. The
+   build-then-send SEAM for the Phase-C FlowController scheduler: BEFORE-SEND, when supplied, is called with
+   the just-built datagram's LENGTH AFTER the build but BEFORE the %send-raw-buf — so the scheduler interposes
+   its token acquire(length) there (build → acquire → send), the built datagram simply held in BUF across any
+   deficit wait, never rebuilt. This is the single place that knows the entry cons-shape (DRY): %flow-step-emit
+   passes no BEFORE-SEND (build+send); the scheduler passes its acquire hook."
+  (let* ((dest (car entry)) (thunk (cadr entry)) (shmem-dest (cddr entry))
+         (len (funcall thunk buf)))
+    (when before-send (funcall before-send len))
+    (%send-raw-buf node buf len (car dest) (cdr dest) shmem-dest)
+    len))
+
+(defun* %flow-step-emit (node buf)
+    (function (disc-node dds.core.buffer:octet-buffer) (values (integer 0) t))
+  "WP-ASYNC-FLOW node-level STEP entry (FR-PF-2): build + send the NEXT single datagram for NODE's user writer
+   across its matched-reader push-targets, returning (values BYTES-SENT MORE-REMAIN-P). The first call (when
+   flow-step-state is NIL) snapshots the whole-node datagram plan (%node-datagram-plan, capturing the unsent
+   set ONCE — the watermark is advanced here, not per step); each call thereafter emits exactly ONE datagram
+   (%emit-plan-entry) from the cached plan and advances it; when the plan drains, flow-step-state is cleared so
+   the next call re-snapshots any newly-unsent changes. MORE-REMAIN-P is T while the current plan still holds
+   datagrams. The Phase-C FlowController scheduler drives the same plan but interposes a token acquire between
+   build and send via %emit-plan-entry's BEFORE-SEND seam. Returns (values 0 NIL) when there is nothing to
+   send. Wire-invisible: pacing changes only WHEN a datagram is sent (ADR 0016). BUF is the caller thread's
+   scratch buffer."
+  (when (null (disc-node-flow-step-state node))
+    (setf (disc-node-flow-step-state node) (%node-datagram-plan node buf)))
+  (let ((plan (disc-node-flow-step-state node)))
+    (if (null plan)
+        (progn (setf (disc-node-flow-step-state node) nil) (values 0 nil))
+        (let ((len (%emit-plan-entry node buf (car plan))))
+          (setf (disc-node-flow-step-state node) (cdr plan))
+          (values len (and (cdr plan) t))))))
+
 (defun* %push-heartbeat (node)
     (function (disc-node) (eql t))
   "Writer side: send a PERIODIC standalone non-final HEARTBEAT (no new DATA) to each matched
@@ -620,50 +773,73 @@
   t)
 
 (defun* publish-sample (node payload)
-    (function (disc-node (simple-array (unsigned-byte 8) (*))) (eql t))
+    (function (disc-node (simple-array (unsigned-byte 8) (*))) (or (eql t) (eql :timeout)))
   "Publish PAYLOAD (an opaque SerializedPayload) on the node's user writer: add it to the writer
-   HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8). With WP-BATCH (batch-max-samples > 1,
+   HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8). Returns T normally, or the :timeout
+   sentinel (RETCODE_TIMEOUT) if the writer's cache was full and block-up-to-max_blocking_time elapsed
+   without freeing a slot — WP-ASYNC-FLOW backpressure (FR-PF-2/FR-QOS, ADR 0016 §Backpressure; only a
+   writer enable-publisher'd with a finite :max-samples + :max-blocking-ns can return :timeout, so the
+   default path is byte-identical). On :timeout the change was NOT added, so nothing is pushed/signalled
+   and no flow/batch state advances (the cache is intact). With WP-BATCH (batch-max-samples > 1,
    FR-PF-1/NFR-PERF-4) the push is DEFERRED — the write accumulates and the batch flushes only when
    batch-max-samples have accumulated (size trigger) or flush-batch fires (time/cadence trigger), so N
    small samples go out coalesced in few datagrams with one amortized HEARTBEAT. Default
    batch-max-samples=1 flushes every write (unchanged behaviour). With WP-ASYNC (enable-async, FR-PF-2)
    the write returns immediately after signalling the sender thread, which does the push off the caller
-   thread (the sender's flush-all is adaptive batching, superseding batch-max-samples)."
-  (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload)
+   thread (the sender's flush-all is adaptive batching, superseding batch-max-samples). With WP-ASYNC-FLOW
+   (a flow-controller associated, FR-PF-2, ADR 0016) the write returns immediately after marking the writer
+   pending + signalling the controller, whose scheduler thread does the RATE-PACED push off the caller
+   thread (an associated controller supersedes both batch and the per-node async sender for that writer)."
+  (when (eq :timeout (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload))
+    (return-from publish-sample :timeout))   ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
   (cond
+    ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))   ; WP-ASYNC-FLOW: paced async send
     ((disc-node-async-thread node) (%async-signal node))   ; WP-ASYNC: hand off to the sender thread
     ((>= (incf (disc-node-batch-pending node)) (disc-node-batch-max-samples node)) (flush-batch node))
     (t nil))   ; batch size trigger not reached: defer to the next flush (cadence or fill)
   t)
 
 (defun* %dispose-or-unregister (node key-hash status-flags)
-    (function (disc-node (simple-array (unsigned-byte 8) (16)) (unsigned-byte 8)) integer)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) (unsigned-byte 8)) (or integer (eql :timeout)))
   "Writer side: add a dispose/unregister change for the instance named by KEY-HASH (16 octets)
    to the user writer's HistoryCache (writer-lifecycle-change, deriving the KIND from
    STATUS-FLAGS), then push DATA + HEARTBEAT to peers exactly like publish-sample — so the
    lifecycle DATA is sent AND reliably ACKNACK-repairable (RTPS 2.5 §8.4.2.2 / §9.6.4.9).
-   Returns the change's sequence number. A lifecycle change is NEVER batch-delayed: it pushes
-   immediately, which also flushes any pending batched data first (sent in SN order, so a dispose never
-   overtakes its instance's batched samples)."
+   Returns the change's sequence number, OR the :timeout sentinel (RETCODE_TIMEOUT) if the bounded cache
+   was full and block-up-to-max_blocking_time elapsed (WP-ASYNC-FLOW backpressure, ADR 0016 §Backpressure;
+   a lifecycle change occupies a SN so it is bounded CONSISTENTLY with a DATA write). On :timeout nothing
+   was added, so nothing is flushed/pushed/signalled (the batch pacer is left untouched). A lifecycle change
+   is NEVER batch-delayed: it pushes immediately, which also flushes any pending batched data first (sent in
+   SN order, so a dispose never overtakes its instance's batched samples). With a flow-controller associated
+   (WP-ASYNC-FLOW, ADR 0016) it goes through the same paced async path as publish-sample — the lifecycle
+   DATA is rate-shaped with the writer's data, in SN order, by the controller thread."
   (let ((sn (dds.rtps.reliable:writer-lifecycle-change (disc-node-user-writer node) key-hash status-flags)))
+    (when (eq sn :timeout) (return-from %dispose-or-unregister :timeout))   ; full bounded cache: nothing added, nothing to push
     (setf (disc-node-batch-pending node) 0)   ; the push flushes the pending batch too (data SN < dispose SN)
-    (if (disc-node-async-thread node) (%async-signal node) (%push-data node))
+    (cond
+      ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))   ; WP-ASYNC-FLOW: paced async send
+      ((disc-node-async-thread node) (%async-signal node))
+      (t (%push-data node)))
     sn))
 
 (defun* dispose-instance (node key-hash)
-    (function (disc-node (simple-array (unsigned-byte 8) (16))) integer)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) (or integer (eql :timeout)))
   "Dispose the instance named by KEY-HASH on NODE's user writer (DDS 1.4 §2.2.2.4.2.10): emit a
    no-payload dispose DATA (StatusInfo Disposed, RTPS 2.5 §9.6.4.9) over the reliable engine.
-   Returns the change SN. Mirrors publish-sample so the dispose is reliably repairable."
+   Returns the change SN, or :timeout (RETCODE_TIMEOUT) under the same block-up-to-max_blocking_time
+   backpressure as publish-sample (ADR 0016 §Backpressure; only with a finite bounded cache). Mirrors
+   publish-sample so the dispose is reliably repairable."
   (%dispose-or-unregister node key-hash dds.rtps.message:+statusinfo-disposed+))
 
 (defun* unregister-instance (node key-hash &optional (autodispose t))
-    (function (disc-node (simple-array (unsigned-byte 8) (16)) &optional t) integer)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) &optional t) (or integer (eql :timeout)))
   "Unregister the instance named by KEY-HASH on NODE's user writer (DDS 1.4 §2.2.2.4.2.7): emit a
    no-payload unregister DATA over the reliable engine. When AUTODISPOSE is true (the
    WRITER_DATA_LIFECYCLE default, DDS 1.4 §2.2.3.21) the StatusInfo is Disposed|Unregistered (the
    unregister also disposes the instance, behaviour identical to a dispose before the unregister);
-   when false it is Unregistered only (RTPS 2.5 §9.6.4.9). Returns the change SN. Mirrors
+   when false it is Unregistered only (RTPS 2.5 §9.6.4.9). Returns the change SN, or :timeout
+   (RETCODE_TIMEOUT) under the same block-up-to-max_blocking_time backpressure as publish-sample
+   (ADR 0016 §Backpressure; only with a finite bounded cache). Mirrors
    publish-sample so the unregister is reliably repairable."
   (%dispose-or-unregister
    node key-hash
@@ -973,13 +1149,21 @@
                                  (car peer) (cdr peer)))))))))
     t))
 
-(defun* enable-publisher (node)
-    (function (disc-node) disc-node)
-  "Give NODE a reliable user writer (KEEP_ALL) and install the writer-side data-
-   plane hooks (retransmit on ACKNACK; resend named fragments on NACK_FRAG). Call after add-local-writer."
+(defun* enable-publisher (node &key max-samples (max-blocking-ns nil))
+    (function (disc-node &key (:max-samples (or null (integer 1))) (:max-blocking-ns (or null (integer 0)))) disc-node)
+  "Give NODE a reliable user writer (KEEP_ALL) and install the writer-side data-plane hooks (retransmit on
+   ACKNACK; resend named fragments on NACK_FRAG). Call after add-local-writer. MAX-SAMPLES (RESOURCE_LIMITS
+   max_samples; NIL = unlimited, the default — byte-identical to before) bounds the KEEP_ALL HistoryCache;
+   MAX-BLOCKING-NS (RELIABILITY.max_blocking_time in ns; NIL = never block) makes publish-sample / dispose /
+   unregister BLOCK up to that long on a FULL bounded cache, then return RETCODE_TIMEOUT — DDS-standard
+   block-up-to-max_blocking_time backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS, ADR 0016 §Backpressure;
+   pairs with a flow-controller, which paces the drain so a bounded cache + bounded block keeps the backlog
+   bounded). With MAX-SAMPLES NIL the cache never fills, so MAX-BLOCKING-NS has no effect (the bound is the
+   trigger)."
   (setf (disc-node-user-writer node)
         (dds.rtps.reliable:make-rtps-writer
-         :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         :hc (dds.rtps.history:make-history-cache :keep-all 1 max-samples nil)
+         :max-blocking-ns max-blocking-ns))
   (setf (disc-node-on-acknack node) (lambda (c flags src-prefix) (%on-user-acknack node c flags src-prefix)))
   (setf (disc-node-on-nack-frag node) (lambda (c flags) (%on-user-nack-frag node c flags)))
   node)
