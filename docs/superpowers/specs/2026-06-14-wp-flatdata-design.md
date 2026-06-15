@@ -6,11 +6,24 @@
 > until the owner reviews + approves this spec** (and the plan). The plan
 > (`docs/superpowers/plans/2026-06-14-wp-flatdata.md`) is provisional, for review alongside this spec.
 
+> **SUPERSEDED IN PART — see ADR 0015 "Phase D outcome".** This spec was written pre-implementation. Phase D
+> found that the **literal-0-copy RX** goal below is **NOT safely achievable in this architecture's best-effort
+> v1** (a Lisp octet-buffer cannot wrap a raw foreign SAP; the async off-thread read has no slot-aware release
+> hook; writer force-reclaim would overwrite a held view — a literal-0-copy SHMEM-slot view would be a
+> cross-process use-after-free). The **delivered, as-built** RX is a **SAFE SINGLE COPY out of SHMEM (~830×**
+> less RX allocation than the WP-ZEROCOPY-v1 sink+re-copy, measured), **NOT** literal-0-copy; literal-0-copy RX
+> is **deferred** (needs an engine-contract change: SAP-backed accessors + a refcount-spanning ZC-aware read
+> path). Every "literal 0-copy" / "0 copies" / "≈0 deser" claim below is the original design intent and is
+> superseded by the as-built single-copy result — read it as the deferred goal, not a shipped property. The TX
+> serialize-is-identity (0 GC-heap, 0 per-field encode) result DID ship as described. v1 is **NO_KEY** only.
+
 **Goal (FR-PF-4, NFR-PERF-7).** For an annotated **FINAL fixed-size** type, the in-memory representation
-**equals** the XCDR2 wire bytes, so serialize/deserialize cost is **zero**: the type compiler emits **Offset
-accessors** that read/modify each field in place in a foreign buffer, and the buffer *is* the
-SerializedPayload. Composed with WP-ZEROCOPY this yields literal **0 intra-host copies** (the reader reads
-fields directly from the writer's SHMEM slot — removing the WP-ZEROCOPY v1 deserialize-into-sink copy).
+**equals** the XCDR2 wire bytes, so serialize cost is **zero** (identity TX, as-built): the type compiler emits
+**Offset accessors** that read/modify each field in place in a foreign buffer, and the buffer *is* the
+SerializedPayload. Composed with WP-ZEROCOPY the original goal was literal **0 intra-host copies** (the reader
+reading fields directly from the writer's SHMEM slot) — **SUPERSEDED**: the as-built RX is a safe **single** copy
+out of SHMEM (~830× less than the WP-ZEROCOPY-v1 sink+re-copy), removing the WP-ZEROCOPY-v1 slot-sized sink +
+re-copy but **not** the one copy; literal-0-copy RX is deferred (see the banner above / ADR 0015 Phase-D outcome).
 
 ## R6 — PATENT GATE (same as WP-ZEROCOPY)
 FlatData mirrors RTI's patented mechanism (REQUIREMENTS §NFR-IP; R6). **Build-now / gate-the-ship,
@@ -36,9 +49,12 @@ the existing `%ssize`/`cdr-size-align` already implement, evaluated at macro-exp
 are constant). The type compiler emits, per field, **Offset accessors** that read/write the field at
 `4 + <field-xcdr2-offset>` in the buffer's SAP, plus a constructor that allocates the buffer (from a
 foreign pool/arena) and writes the encapsulation header once. `serialize` is **identity** (the buffer already
-IS the SerializedPayload); `deserialize` is **read-in-place** (the received buffer IS the FlatData sample —
-no copy). The engine hot path is unchanged (it still sees the `type-support` vtable; FlatData just makes
-`serialize`/`deserialize` trivial and adds the `flatdata-offset` accessors).
+IS the SerializedPayload — as-built: 0 GC-heap, 0 per-field encode); `deserialize` validates then reads-in-place
+into a FlatData sample. *(SUPERSEDED — see ADR 0015 "Phase D outcome": the as-built `deserialize` COPIES the body
+into a fresh/loaned buffer, since the engine frees the received RX buffer right after delivery, so a literal
+no-copy view of the received buffer would be use-after-free; it is 0-per-field-decode, not 0-copy.)* The engine
+hot path is unchanged (it still sees the `type-support` vtable; FlatData just makes `serialize` trivial,
+`deserialize` a validate+block-copy, and adds the `flatdata-offset` accessors).
 
 ## Components
 1. **DSL extension** (`src/dds-gen/dsl.lisp`): `define-dds-type` accepts `:flatdata t` in OPTIONS. For a
@@ -56,19 +72,27 @@ no copy). The engine hot path is unchanged (it still sees the `type-support` vta
    `serialized-size` = `+<name>-flatdata-size+`); `deserialize` = wrap the received payload as the sample
    (read-in-place). `keyed-p`/key-hash unchanged (keys read via the same fixed offsets).
 3. **WP-ZEROCOPY read-in-place integration** (`dds-disc/dataplane.lisp`): when the matched type is FlatData,
-   the ZC writer stores the FlatData buffer (already the payload) in the pool slot with **no serialize copy**;
-   the ZC reader hands the **slot SAP directly** to the app via the Offset accessors with **no
-   deserialize-into-sink copy** = literal 0-copy (NFR-PERF-7) — this removes the WP-ZEROCOPY v1
-   sink-over-allocation the bench flagged.
+   the ZC writer stores the FlatData buffer (already the payload) in the pool slot with **no per-field
+   re-serialize** (the identity serializer ran once; the loan is the one app-buffer→slot copy — the documented
+   v1 TX cost). *(SUPERSEDED — see ADR 0015 "Phase D outcome": the original goal here — "the ZC reader hands the
+   slot SAP directly to the app via the Offset accessors with no copy = literal 0-copy" — is NOT safely
+   achievable in v1.)* **As-built:** the ZC reader removes the WP-ZEROCOPY-v1 slot-sized **sink + re-copy** and
+   instead reads the slot in place into **one** exact-length owned vector (`%zc-resolve-fresh`, a single
+   under-mutex copy), releasing the slot immediately — a **safe single copy out of SHMEM (~830×** less RX
+   allocation than the v1 sink+re-copy, measured), **NOT literal-0-copy**. Literal-0-copy RX is deferred (needs
+   SAP-backed accessors + a DCPS-level refcount-spanning ZC-aware read path — an engine-contract change).
 
 ## Memory / hot-path
 FlatData buffers are foreign/static (a pool/arena, NFR-MEM); the Offset accessors are raw SAP read/write +
-the fixed-offset cdr primitives — no per-sample CLOS, no consing, no serialize/deserialize work (NFR-PERF-7).
+the fixed-offset cdr primitives — no per-sample CLOS, no consing, **0 per-field serialize/deserialize work**
+(NFR-PERF-7). *(As-built note: TX serialize is 0-alloc identity; the engine-visible non-ZC `deserialize` and
+the ZC RX each do ONE buffer copy — 0 per-field decode, not 0-alloc — see ADR 0015 Phase-D outcome.)*
 gate-hotpath covers the accessor + the ZC read-in-place path.
 
 ## Safety
-A received FlatData payload is untrusted: before wrapping/reading, validate `len == +<name>-flatdata-size+`
-(a fixed-size type has exactly one valid length) and the encapsulation id; a mismatch → reject (RxO /
+A received FlatData payload is untrusted: before wrapping/reading, validate `len >= +<name>-flatdata-size+`
+(>=, not ==: a conforming trailing-padded peer payload may be longer; reject only if too short to contain all
+fields — never false-REJECT a valid sample) and the encapsulation id; a mismatch → reject (RxO /
 SAMPLE_REJECTED), never an OOB accessor read (NFR-SEC-POSTURE). Offset accessors are bounds-bound by the
 fixed size. Fuzz the wrap/accessor path.
 
@@ -77,10 +101,13 @@ fixed size. Fuzz the wrap/accessor path.
   wire offsets (byte-exact vs the existing `serialize` of the same type — the FlatData buffer must equal the
   serialized struct, proving in-memory==wire). A `:flatdata t` type with a string/sequence → compile error.
 - Round-trip: build via Offset setters → the buffer bytes == the classic `serialize` of an equal struct;
-  read via Offset getters == the classic deserialize. **NFR-PERF-7: serialize/deserialize alloc + time ≈ 0**
-  (alloc-counter + bench).
-- ZC + FlatData end-to-end: a FlatData type over WP-ZEROCOPY → the reader reads fields from the slot with
-  **0 copies** (bench shows the bytes/sample drop to ~0 vs the WP-ZEROCOPY-only deserialize-into-sink).
+  read via Offset getters == the classic deserialize. **NFR-PERF-7: serialize alloc ≈ 0 (as-built: 0-alloc
+  identity TX) + the loaned-target inner RX path 0-alloc; the engine-visible non-ZC `deserialize` allocates one
+  buffer/sample (0 per-field decode, NOT 0-alloc)** (alloc-counter + `make bench-flatdata`). *(SUPERSEDED — the
+  original blanket "deserialize alloc ≈ 0" is corrected to the per-path as-built; see ADR 0015 Phase-D outcome.)*
+- ZC + FlatData end-to-end: a FlatData type over WP-ZEROCOPY → the reader reads the slot in place into one
+  owned vector. *(SUPERSEDED — the original "0 copies / bytes drop to ~0" is a **safe single copy**, ~830× less
+  RX allocation than the WP-ZEROCOPY-v1 sink+re-copy, **not** literal-0-copy; see ADR 0015 Phase-D outcome.)*
 - Fuzz the untrusted-payload wrap (wrong length / bad encap → reject, no OOB). Engine-untouched: non-FlatData
   types are byte-identical (the DSL change is additive, gated on `:flatdata t`).
 - Gates green SBCL+Clasp; behind the per-type opt-in; R6 marker throughout.

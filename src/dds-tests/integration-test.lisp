@@ -3421,6 +3421,147 @@
       (dds.disc:stop-node w) (dds.disc:stop-node r)))
   t)
 
+(defun* %fd-zc-rx-bytes-new (sap slot gen iters)
+    (function (t (integer 0) (unsigned-byte 32) (integer 1)) (integer 0))
+  "Mean GC bytes/sample of the WP-FLATDATA-over-ZC single-copy RX resolve (%zc-resolve-fresh) over ITERS
+   calls: one exact-payload-length owned vector, read in place from the slot, no slot-sized scratch sink (the
+   resolve does NOT touch the slot refcount, so one loaned slot serves every iteration). The number the
+   reader actually pays per FlatData-over-ZC sample (NFR-PERF-7 honest measurement)."
+  (let ((before (dds.pal:bytes-consed)))
+    (dotimes (i iters) (dds.xport.zerocopy::%zc-resolve-fresh sap slot gen))
+    (floor (max 0 (- (dds.pal:bytes-consed) before)) iters)))
+
+(defun* %fd-zc-rx-bytes-v1 (sap slot gen iters)
+    (function (t (integer 0) (unsigned-byte 32) (integer 1)) (integer 0))
+  "Mean GC bytes/sample of the WP-ZEROCOPY v1 resolve-into-sink-then-re-copy RX path over ITERS calls,
+   reconstructed inline for an apples-to-apples comparison: a slot-bytes (65536) scratch sink + %zc-resolve
+   (copy 1) + a fresh len vector + replace (copy 2). The cost Phase D removes on RX (NFR-PERF-7)."
+  (let ((before (dds.pal:bytes-consed)))
+    (dotimes (i iters)
+      (let* ((sink (make-array dds.disc:+zerocopy-pool-slot-bytes+ :element-type '(unsigned-byte 8)))
+             (len (dds.xport.zerocopy::%zc-resolve sap slot gen sink)))
+        (when len
+          (let ((vec (make-array len :element-type '(unsigned-byte 8))))
+            (replace vec sink :end2 len)))))
+    (floor (max 0 (- (dds.pal:bytes-consed) before)) iters)))
+
+(defun* run-flatdata-zerocopy-test ()
+    (function () t)
+  "WP-FLATDATA over Zero-Copy, Phase D (FR-PF-3/4, NFR-PERF-7, R6; ADR 0015. NOT cleared for ship — pending
+   counsel R6). Two same-host nodes, both *zerocopy-enabled* T (+ SHMEM), exchange a FINAL fixed-size
+   FlatData sample (fd-abc) over the Zero-Copy reference path (the ZC threshold is lowered so fd-abc's
+   20-octet payload qualifies). The headline checks:
+     (1) ROUND-TRIP via the Offset accessors: the writer publishes a FlatData SerializedPayload built with the
+         <name>-<field>-fd SETTERS; the reader resolves the ZC reference, and reading the DELIVERED payload
+         with the <name>-<field>-fd GETTERS yields the EXACT field values — proving the FlatData bytes crossed
+         the writer's SHMEM slot intact and are read in place.
+     (2) WRITER no-double-serialize: zc-sends advanced, and the slot carried the published payload with NO
+         per-field re-serialization (FlatData serialize=IDENTITY ran once in %serialize-sample; the loan is a
+         single app-buffer->slot copy — the documented v1 TX cost).
+     (3) RX HONEST MEASUREMENT (the win): the reader-side per-sample GC bytes of the NEW single-copy resolve
+         (%zc-resolve-fresh — one exact-length owned vector, read in place) vs the WP-ZEROCOPY-v1
+         resolve-into-65536-byte-sink-then-re-copy. The new path allocates ONLY the delivery vector (no sink,
+         no second copy) — RX 0-EXTRA-alloc beyond the one owned payload vector. NO OVERCLAIM: this is a SAFE
+         SINGLE COPY out of SHMEM (a Lisp octet-buffer cannot wrap a raw foreign SAP, and delivery is into an
+         async store read on another thread with no slot-aware release hook — a literal-0-copy SHMEM VIEW would
+         be a cross-process use-after-free; see ADR 0015). TX still has the one app->slot copy (loan-write API
+         is the follow-up).
+   Skips cleanly where SHMEM is off (Clasp/macOS by-name-attach gap, ADR 0013); on SBCL bytes-consed is exact,
+   on Clasp it reads 0 (NFR-PORT gap) so the RX assertion is smoked, not enforced."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-flatdata-zerocopy-test t))
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 63))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 64))
+         (dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)                 ; arm ZC for BOTH nodes (default OFF; R6)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)       ; lower the threshold so fd-abc (20 octets) takes the ZC ref path
+         (sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
+         (va 200) (vb 3000000000) (vc 12345678901234567890)
+         (fd (make-fd-abc-flatdata))                     ; the FlatData sample (the buffer IS the SerializedPayload)
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0)))
+    (setf (fd-abc-a-fd fd) va (fd-abc-b-fd fd) vb (fd-abc-c-fd fd) vc)   ; write fields via the Offset SETTERS
+    (let ((payload (let ((src (dds.core.buffer:octet-buffer-vec fd)))   ; the serialized FlatData payload to publish
+                     (subseq src 0 +fd-abc-flatdata-size+))))
+      (unwind-protect
+           (progn
+             (%check :fd-zc-pool (and (dds.disc::disc-node-zc-pool w) (dds.disc::disc-node-zc-pool r))
+                     "both nodes must have a ZC writer pool when *zerocopy-enabled* + SHMEM")
+             (%check :fd-zc-payload-size (> (length payload) dds.disc:*zerocopy-min-payload-bytes*)
+                     "the FlatData payload must exceed the (lowered) ZC threshold to take the reference path")
+             (dds.disc:add-local-writer w :topic "FdZc" :type "fd-abc"
+                                        :reliability dds.rtps.discovery:+reliability-reliable+)
+             (dds.disc:enable-publisher w)
+             (dds.disc:add-local-reader r :topic "FdZc" :type "fd-abc"
+                                        :reliability dds.rtps.discovery:+reliability-reliable+)
+             (dds.disc:enable-subscriber r)
+             (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                   (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+             (dds.disc:start-node w) (dds.disc:start-node r)
+             (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+             (loop repeat 300
+                   until (and (plusp (dds.disc:disc-node-discovered-count w))
+                              (plusp (dds.disc:disc-node-discovered-count r)))
+                   do (sleep 0.01))
+             (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+             (loop repeat 300
+                   until (and (plusp (dds.disc:disc-node-matched-count w))
+                              (plusp (dds.disc:disc-node-matched-count r)))
+                   do (sleep 0.01))
+             (%check :fd-zc-matched (plusp (dds.disc:disc-node-matched-count w))
+                     "writer must match the reader before publishing FlatData over zero-copy")
+             ;; the reader must have parsed the writer's PID_ZEROCOPY_CAPABLE before the writer will send a ref
+             (loop repeat 200
+                   until (plusp (dds.disc::%zc-readers w (list (dds.rtps.discovery:endpoint-data-guid
+                                                                (first (dds.disc::%matched-endpoints w))))))
+                   do (dds.disc:announce-endpoints w) (sleep 0.01))
+             (dds.disc:publish-sample w payload)
+             (loop repeat 500 until (plusp (dds.disc:node-sample-count r)) do (sleep 0.01))
+             (%check :fd-zc-received (plusp (dds.disc:node-sample-count r))
+                     "the reader must receive the FlatData sample delivered via the zero-copy reference")
+             (%check :fd-zc-sends (plusp (dds.disc::disc-node-zc-sends w))
+                     "the writer must have published a reference (zc-sends advanced), not the inline payload")
+             ;; (1) ROUND-TRIP: read the DELIVERED payload's fields via the Offset GETTERS (read-in-place)
+             (let ((got (dds.disc:node-sample-by-sn r 1)))
+               (%check :fd-zc-rx-not-nil (and got t) "the reader stored no FlatData payload")
+               (when got
+                 (let ((view (dds.core.buffer:octet-buffer-over got)))   ; non-owning wrapper for the Offset accessors
+                   (%check :fd-zc-field-a (= (fd-abc-a-fd view) va)
+                           (format nil "FlatData-over-ZC field a mismatch: ~d != ~d" (fd-abc-a-fd view) va))
+                   (%check :fd-zc-field-b (= (fd-abc-b-fd view) vb)
+                           (format nil "FlatData-over-ZC field b mismatch: ~d != ~d" (fd-abc-b-fd view) vb))
+                   (%check :fd-zc-field-c (= (fd-abc-c-fd view) vc)
+                           (format nil "FlatData-over-ZC field c mismatch: ~d != ~d" (fd-abc-c-fd view) vc))
+                   ;; (2) no-double-serialize: the delivered payload EQUALS the published serialized FlatData bytes
+                   (%check :fd-zc-no-reserialize (equalp got payload)
+                           "the slot must carry the published FlatData payload byte-for-byte (no re-serialize)"))))
+             ;; (3) RX HONEST MEASUREMENT: loan one slot, resolve it ITERS times each way (the resolve does not
+             ;; touch the refcount), compare the mean per-sample GC bytes of NEW single-copy vs v1 sink+re-copy.
+             (let ((sap (dds.disc::disc-node-zc-pool-sap w))
+                   (iters 20000))
+               (multiple-value-bind (slot gen)
+                   (dds.xport.zerocopy::%zc-loan sap payload 0 (length payload) 1)
+                 (%check :fd-zc-meas-loan (and slot t) "could not loan a slot for the RX measurement")
+                 (when slot
+                   (let ((new-bytes (%fd-zc-rx-bytes-new sap slot gen iters))
+                         (v1-bytes (%fd-zc-rx-bytes-v1 sap slot gen iters)))
+                     (dds.xport.zerocopy::%zc-release sap slot gen)   ; balance the refcount-1 loan
+                     (format t "~&  fd-zc-rx: new single-copy = ~d bytes/sample; WP-ZEROCOPY-v1 sink+re-copy = ~d bytes/sample (~a)~%"
+                             new-bytes v1-bytes (if sbcl-p "SBCL exact" "Clasp bytes-consed=0 gap"))
+                     (format t "  fd-zc-rx: RX win = one exact-length (~d-octet) owned vector, read in place; no 65536-byte sink, no 2nd copy. TX still has the app->slot copy (loan-write follow-up).~%"
+                             (length payload))
+                     (when sbcl-p
+                       (%check :fd-zc-rx-bounded
+                               (< new-bytes v1-bytes)
+                               (format nil "the new single-copy RX (~d) must allocate strictly less than the v1 sink+re-copy (~d)"
+                                       new-bytes v1-bytes))
+                       (%check :fd-zc-rx-no-sink
+                               (< new-bytes dds.disc:+zerocopy-pool-slot-bytes+)
+                               (format nil "the new RX (~d) must not allocate a slot-sized (~d) sink"
+                                       new-bytes dds.disc:+zerocopy-pool-slot-bytes+))))))))
+        (dds.disc:stop-node w) (dds.disc:stop-node r)
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))))
+  t)
+
 ;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a
 ;;; discovered participant not refreshed within its leaseDuration. %lease-sweep
 ;;; prunes the stale participant's discovered entry + endpoints + matches +

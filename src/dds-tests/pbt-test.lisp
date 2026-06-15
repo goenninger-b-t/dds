@@ -217,6 +217,176 @@
       (dds.xport.zerocopy::%zc-destroy sap)
       (dds.pal:free-static mem))))
 
+;;; ---- WP-FLATDATA untrusted-wrap fuzz (FR-PF-4, NFR-SEC-POSTURE; R6, ADR 0015) ----
+;;;; A received / cross-process FlatData buffer is HOSTILE: a malformed payload must REJECT (a signalled
+;;;; condition the engine maps to SAMPLE_REJECTED) or accept-and-read-in-bounds, NEVER an OOB read/write or an
+;;;; uncaught error. The load-bearing length/encap guard in deserialize-into-<name>-fd is an EXPLICIT manual
+;;;; (when (< avail +size+) (error ...)) check (dsl.lisp) — NOT a compiler-inserted array bound — so it is
+;;;; SAFETY-INDEPENDENT BY CONSTRUCTION: it executes under any optimization policy, including (safety 0).
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
+
+(defconstant +fuzz-fd-slop+ 16 "Max trailing octets past +fd-abc-flatdata-size+ a wrap-fuzz payload may carry.")
+
+(defun* %fd-wrap-read-safety0 (vec)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "This WRAPPER is compiled at (SAFETY 0): parse the encap header of VEC and run the FlatData wrap
+   (deserialize-into a loaned target), then read every field via the Offset getters. NOTE (FR-LANG-7, honest
+   scope): deserialize-into-<name>-fd + the Offset getters are out-of-line callees compiled once under
+   with-hot-optimizations, so this wrapper's (safety 0) does NOT recompile them — it confirms the WRAPPER code
+   (the encap parse + the accessor reads here) is safety-independent, NOT that it forces the kernel to run
+   safety-0. The kernel's guard is safety-independent for a stronger reason: it is an EXPLICIT manual
+   (when (< avail +size+) (error ...)) (dsl.lisp), not a compiler bound, so it holds under any policy. Returns
+   T on a clean read, NIL on a cleanly-signalled reject; an OOB would corrupt/crash rather than signal."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (handler-case
+      (let* ((ob (dds.core.buffer:octet-buffer-over vec))
+             (rc (dds.core.buffer:cursor ob :endianness :little))
+             (target (make-fd-abc-flatdata)))
+        (dds.cdr:parse-encapsulation-header rc)
+        (deserialize-into-fd-abc-fd target rc :xcdr2)
+        (let ((sum (+ (fd-abc-a-fd target) (fd-abc-b-fd target) (fd-abc-c-fd target))))
+          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec target))
+          (and (integerp sum) t)))
+    (error () nil)))
+
+(defun* %gen-fd-wrap-payload (prng)
+    (function (prng) (simple-array (unsigned-byte 8) (*)))
+  "An adversarial FlatData wrap-fuzz payload from PRNG, drawn from families that exercise every wrap edge:
+   too-SHORT (< +fd-abc-flatdata-size+ -> must reject, no OOB), EXACT length, LONGER (trailing pad -> must
+   ACCEPT, no false-REJECT), wrong encap id, all-zero, and pure-random. A valid-length payload is seeded with
+   the correct PLAIN_CDR2_LE (0x0007 NBO) encap id half the time so the reader sometimes reaches the body."
+  (let* ((size +fd-abc-flatdata-size+)
+         (family (prng-int prng 0 6))
+         (n (ecase family
+              (0 (prng-int prng 0 (max 0 (1- size))))            ; too short
+              (1 size)                                            ; exact
+              (2 (+ size (prng-int prng 1 +fuzz-fd-slop+)))       ; longer (trailing pad)
+              (3 size)                                            ; wrong encap id (filled below)
+              (4 (+ size (prng-int prng 0 +fuzz-fd-slop+)))       ; all-zero
+              (5 (prng-int prng 0 (+ size +fuzz-fd-slop+)))       ; pure random length
+              (6 (prng-int prng 0 3))))                           ; sub-encap-header (< 4 octets)
+         (v (make-array n :element-type '(unsigned-byte 8) :initial-element 0)))
+    (case family
+      (4 v)                                                       ; all-zero: leave as zeros
+      (t (dotimes (i n) (setf (aref v i) (prng-int prng 0 255)))
+         (when (and (>= n 2) (member family '(1 2 5)) (oddp (prng-next prng)))
+           (setf (aref v 0) #x00 (aref v 1) #x07))                ; valid PLAIN_CDR2_LE id so the body is reached
+         (when (and (>= n 2) (= family 3))
+           (setf (aref v 0) (prng-int prng 0 255) (aref v 1) (prng-int prng 0 255)))))
+    v))
+
+(defun* %fd-wrap-read-checked (vec)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "Run the FlatData wrap over VEC the way the engine does (parse encap header, then the vtable
+   deserialize-<name>-fd, then read every field via the Offset getters) under the PRODUCTION optimization
+   policy. Returns T on a clean accept+in-bounds read, NIL on a cleanly-signalled reject. Any escaping non-error
+   or OOB is a fuzz failure (caught by the caller). DRY: deserialize-fd-abc-fd itself delegates the validate +
+   clamp to deserialize-into-fd-abc-fd, so this exercises BOTH the full vtable and the inner copy."
+  (handler-case
+      (let* ((ob (dds.core.buffer:octet-buffer-over vec))
+             (rc (dds.core.buffer:cursor ob :endianness :little)))
+        (dds.cdr:parse-encapsulation-header rc)
+        (let* ((s (deserialize-fd-abc-fd rc :xcdr2))
+               (ok (and (integerp (fd-abc-a-fd s)) (integerp (fd-abc-b-fd s)) (integerp (fd-abc-c-fd s)))))
+          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec s))
+          ok))
+    (error () nil)))
+
+(defun* fuzz-flatdata-wrap ()
+    (function () t)
+  "Property-based fuzz of the UNTRUSTED WP-FLATDATA wrap/read paths (FR-PF-4, NFR-SEC-POSTURE; R6, ADR 0015. NOT
+   cleared for ship — pending counsel R6). Two hostile surfaces:
+
+   (A) NON-ZC deserialize wrap: feed deserialize-<name>-fd / deserialize-into-<name>-fd (via a cursor over a
+       received buffer, mirroring %deserialize-sample) a large random corpus of malformed payloads — too-short
+       (< +size+ -> MUST reject via the >= check, no OOB), exact, longer (trailing pad -> MUST accept, no
+       false-REJECT), wrong encap id, all-zero, random, and sub-4-octet. Each case must EITHER reject cleanly (a
+       signalled condition the engine maps to SAMPLE_REJECTED) OR accept-and-read-in-bounds (the Offset getters
+       read every field without an OOB); never an uncaught error or an OOB. A LONGER (trailing-padded) conformant
+       payload must ACCEPT (the no-false-REJECT rule). The load-bearing length/encap guard is an EXPLICIT manual
+       (when (< avail +size+) (error ...)) (dsl.lisp), NOT a compiler bound, so it is safety-INDEPENDENT by
+       construction; this production-policy arm exercises it directly. A (safety 0)-compiled WRAPPER arm
+       (%fd-wrap-read-safety0) additionally confirms the wrapper + the Offset-accessor reads are safety-independent
+       and reaches the SAME verdict (it does NOT recompile the out-of-line kernel, so it does not by itself prove
+       the kernel's bound holds at safety 0 — the manual-check argument does).
+
+   (B) ZC slot resolve clamp: the cross-process untrusted path. Loan a valid slot, then FORGE its recorded
+       payload-LEN field (0..0xFFFFFFFF) and resolve with %zc-resolve-fresh / %zc-resolve under adversarial
+       slot-index + generation; the result MUST be NIL or a length CLAMPED to slot-bytes — the resolver must
+       NEVER read past the fixed slot allocation on a forged LEN/generation/index (the min-clamp in
+       %zc-slot-payload-len is the defence; this proves it holds against forged input). Skips the ZC half where
+       SHMEM by-name attach is unreliable (Clasp/macOS, ADR 0013); the non-ZC wrap half runs on every impl.
+
+   Deterministic + seeded (reproducible on SBCL + Clasp); N iterations. Signals test-failure on any OOB /
+   uncaught error / false-REJECT of a conformant payload."
+  (let ((prng (make-prng #xF1A7DA7A))
+        (iters 4000))
+    ;; (A) NON-ZC wrap fuzz — production policy AND a (safety 0) variant; both must agree (reject == reject)
+    (dotimes (i iters)
+      (let* ((vec (%gen-fd-wrap-payload prng))
+             (n (length vec))
+             (prod (handler-case (%fd-wrap-read-checked vec)
+                     (error (e) (error 'test-failure :name "flatdata-wrap-fuzz"
+                                       :detail (format nil "iter ~d len ~d: production wrap signalled past its own handler: ~a" i n e)))))
+             (s0 (handler-case (%fd-wrap-read-safety0 vec)
+                   (error (e) (error 'test-failure :name "flatdata-wrap-fuzz"
+                                     :detail (format nil "iter ~d len ~d: (safety 0) wrap leaked OOB/error: ~a" i n e))))))
+        ;; a too-short payload MUST have rejected (NIL); a payload >= +size+ with the valid encap id MUST accept
+        (when (and (< n +fd-abc-flatdata-size+) (or prod s0))
+          (error 'test-failure :name "flatdata-wrap-fuzz"
+                 :detail (format nil "iter ~d: too-short payload (len ~d < ~d) ACCEPTED — bounds check failed"
+                                 i n +fd-abc-flatdata-size+)))
+        (when (and (>= n +fd-abc-flatdata-size+) (= (aref vec 0) #x00) (= (aref vec 1) #x07) (not prod))
+          (error 'test-failure :name "flatdata-wrap-fuzz"
+                 :detail (format nil "iter ~d: conformant payload (len ~d >= ~d, PLAIN_CDR2_LE id) FALSE-REJECTED"
+                                 i n +fd-abc-flatdata-size+)))
+        ;; the production-policy and (safety 0)-wrapper arms must reach the same verdict (the wrapper path is safety-independent)
+        (unless (eq (and prod t) (and s0 t))
+          (error 'test-failure :name "flatdata-wrap-fuzz"
+                 :detail (format nil "iter ~d len ~d: production verdict ~a != (safety 0)-wrapper verdict ~a (a wrapper guard depends on SAFETY)"
+                                 i n prod s0)))))
+    ;; (B) ZC slot resolve clamp fuzz — FORGED recorded-len + adversarial idx/gen; skip where SHMEM is unusable
+    (when (dds.xport.shmem:shm-attach-by-name-reliable-p)
+      (let* ((slots 4)
+             (slot-bytes 64)
+             (seg-bytes (dds.xport.zerocopy::%zc-bytes slots slot-bytes))
+             (mem (dds.pal:alloc-static seg-bytes))
+             (sap (dds.pal:static-pointer mem))
+             (sink (make-array slot-bytes :element-type '(unsigned-byte 8)))
+             (payload (make-array slot-bytes :element-type '(unsigned-byte 8) :initial-element #xA5)))
+        (dds.xport.zerocopy::%zc-init sap slots slot-bytes)
+        (unwind-protect
+             (dotimes (i iters)
+               (multiple-value-bind (slot gen)
+                   (dds.xport.zerocopy::%zc-loan sap payload 0 (prng-int prng 0 slot-bytes) 1)
+                 (when slot
+                   ;; FORGE the cross-process recorded payload-LEN field to an adversarial u32 (incl. > slot-bytes)
+                   (let ((b (dds.xport.zerocopy::%zc-slot-off sap slot)))
+                     (setf (cffi:mem-ref sap :uint32 (+ b dds.xport.zerocopy::+zc-slot-off-len+))
+                           (%adversarial-u32 prng)))
+                   (let* ((idx (if (oddp i) slot (%adversarial-u32 prng)))
+                          (g (if (zerop (mod i 3)) gen (%adversarial-u32 prng)))
+                          (fresh (handler-case (dds.xport.zerocopy::%zc-resolve-fresh sap idx g)
+                                   (error (e) (error 'test-failure :name "flatdata-zc-clamp-fuzz"
+                                                     :detail (format nil "iter ~d idx=~d gen=~d: resolve-fresh signalled: ~a" i idx g e)))))
+                          (rlen (handler-case (dds.xport.zerocopy::%zc-resolve sap idx g sink)
+                                  (error (e) (error 'test-failure :name "flatdata-zc-clamp-fuzz"
+                                                    :detail (format nil "iter ~d idx=~d gen=~d: resolve signalled: ~a" i idx g e))))))
+                     ;; the single-copy vector MUST be NIL or clamped to <= slot-bytes (never past the slot)
+                     (unless (or (null fresh) (<= (length fresh) slot-bytes))
+                       (error 'test-failure :name "flatdata-zc-clamp-fuzz"
+                              :detail (format nil "iter ~d idx=~d gen=~d: forged LEN -> resolve-fresh vec ~d > slot-bytes ~d (clamp failed)"
+                                              i idx g (length fresh) slot-bytes)))
+                     (unless (or (null rlen) (<= 0 rlen slot-bytes))
+                       (error 'test-failure :name "flatdata-zc-clamp-fuzz"
+                              :detail (format nil "iter ~d idx=~d gen=~d: forged LEN -> resolve returned ~d, not NIL/[0,~d] (clamp failed)"
+                                              i idx g rlen slot-bytes))))
+                   ;; release at the loaned generation to recycle the slot (best-effort; forged gens are no-ops)
+                   (dds.xport.zerocopy::%zc-release sap slot gen))))
+          (dds.xport.zerocopy::%zc-destroy sap)
+          (dds.pal:free-static mem))))
+    t))
+
 ;;; ---- generators + properties ----
 
 (defun* gsample= (a b)
@@ -395,7 +565,9 @@
     (fuzz-shmem-ring-drain)
     ;; WP-ZEROCOPY resolve fuzz: adversarial cross-process references, never an OOB (own memory + prng)
     (fuzz-zc-resolve)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters, deterministic seed.~%" runs)
+    ;; WP-FLATDATA untrusted-wrap fuzz: malformed wrap (reject/accept-in-bounds + safety-0) + forged ZC clamp (NFR-SEC-POSTURE, R6)
+    (fuzz-flatdata-wrap)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp), deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

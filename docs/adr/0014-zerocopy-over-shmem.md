@@ -128,8 +128,9 @@ Pool slots are `mmap` foreign/static memory (NFR-MEM). Publish/resolve hooks: sl
 
 ## Out of scope (v1)
 
-Reliable Zero-Copy; literal 0-copy read-in-place (WP-FLATDATA); app-facing explicit `get-loan`/
-`return-loan` write API; cross-vendor ZC interop.
+Reliable Zero-Copy; literal 0-copy read-in-place (WP-FLATDATA, ADR 0015 — **update:** WP-FLATDATA shipped a
+**safe SINGLE copy** ~830× RX win; **literal-0-copy is still deferred**, needs an engine-contract change, see
+ADR 0015 *Phase D outcome*); app-facing explicit `get-loan`/`return-loan` write API; cross-vendor ZC interop.
 
 ## Consequences
 
@@ -235,8 +236,9 @@ ones pass-skip on Clasp/macOS); `gate-types` + `gate-hotpath` PASS; the referenc
 
 ### Follow-ups (out of scope v1)
 
-Reliable Zero-Copy (slot lifetime vs the ACK path); literal 0-copy **read-in-place** / FlatData (also removes
-the resolve-side sink over-allocation the E1 bench surfaced); an app-facing explicit `get-loan` / `return-loan`
-write API; cross-vendor ZC interop.
+Reliable Zero-Copy (slot lifetime vs the ACK path); literal 0-copy **read-in-place** / FlatData (**update,
+ADR 0015 Phase-D outcome:** WP-FLATDATA shipped a **safe SINGLE copy** — it removed the resolve-side sink
+over-allocation the E1 bench surfaced, a ~830× RX win — but **literal-0-copy remains deferred**, needing an
+engine-contract change); an app-facing explicit `get-loan` / `return-loan` write API; cross-vendor ZC interop.
 
 **NOT cleared for ship — pending counsel (R6); see the R6 — PATENT GATE section above.**

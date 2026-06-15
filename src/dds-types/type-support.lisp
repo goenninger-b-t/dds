@@ -1,9 +1,17 @@
 (in-package #:dds.types)
 
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
+(defstruct* (flatdata-layout (:constructor make-flatdata-layout))
+  "WP-FLATDATA fixed-size layout (FR-PF-4): total SerializedPayload SIZE (encap header + XCDR2 body),
+   ENCAP-OFFSET (4), and per-field (name body-offset getter setter) for in-place access.
+   NOT cleared for ship — pending counsel (R6); see ADR 0015."
+  (size 0 :type (integer 0)) (encap-offset 4 :type (integer 0)) (fields '() :type list))
+
 (defstruct* (type-support (:constructor make-type-support))
   "Per-type manual vtable the engine funcalls per sample (IMPLEMENTATION-PLAN §7.3): a
    plain defstruct of function objects (serialize/deserialize/serialized-size/key-hash,
-   sample-pool alloc+free, FlatData hooks, field accessors) plus the type name,
+   sample-pool alloc+free, FlatData hooks — FLATDATA-OFFSET holds the FlatData-layout for a
+   :flatdata type, NIL otherwise — field accessors) plus the type name,
    extensibility, structural TypeObject/TypeIdentifier, and data-representation mask. The
    hot path sees only this struct, never the concrete sample type. KEYED-P records the
    RTPS TopicKind (DDSI-RTPS 2.5 §8.2.4.2): T = WITH_KEY (the type has at least one @key
@@ -21,7 +29,7 @@
   (typeidentifier nil :type t)
   (sample-pool-alloc nil :type (or null function))
   (sample-pool-free nil :type (or null function))
-  (flatdata-offset nil :type (or null function))
+  (flatdata-offset nil :type (or null function flatdata-layout))
   (flatdata-builder nil :type (or null function))
   (data-representation-mask 0 :type integer)
   ;; (FIELD-NAME-STRING . unary accessor) per scalar/string member, for content

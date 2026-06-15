@@ -137,18 +137,65 @@
                     t))))
     (dds.pal:pshared-unlock sap +zc-mutex-off+)))
 
+(defun* %zc-slot-payload-len (sap slot-index generation)
+    (function (t (integer 0) (unsigned-byte 32)) (or null (unsigned-byte 32)))
+  "CALLER HOLDS THE MUTEX. The slot's recorded payload length CLAMPED to slot-bytes (so a forged on-wire
+   LEN can never make a caller read past the fixed slot allocation — NFR-SEC-POSTURE), or NIL if SLOT-INDEX
+   is out of range or its generation != GENERATION (stale / force-reclaimed). The clamp is the OOB-safe
+   bound: a slot is a fixed slot-bytes region, so min(recorded-len, slot-bytes) is always in-bounds."
+  (when (>= slot-index (%zc-slot-count sap)) (return-from %zc-slot-payload-len nil))
+  (let ((b (%zc-slot-off sap slot-index)))
+    (when (= generation (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+)))
+      (min (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+)) (%zc-slot-bytes sap)))))
+
+(defun* %zc-resolve-into (sap slot-index generation dst dst-off)
+    (function (t (integer 0) (unsigned-byte 32) (simple-array (unsigned-byte 8) (*)) (integer 0))
+              (or null (integer 0)))
+  "Reader, the 0-EXTRA-ALLOC resolve (WP-FLATDATA-over-ZC, FR-PF-3/4): under the mutex, if SLOT-INDEX is in
+   range AND its generation == GENERATION, copy the slot's payload octets into DST starting at DST-OFF and
+   return the number copied; else NIL (stale/reclaimed/OOB ref — untrusted cross-process input). The copy
+   length is min(slot recorded-LEN, slot-bytes, room in DST after DST-OFF), so it NEVER reads past the fixed
+   slot allocation NOR writes past DST even on a forged LEN or an undersized DST (bounds-checked even at
+   (safety 0), NFR-SEC-POSTURE). DST is a CALLER-OWNED Lisp array (e.g. the per-datagram delivery vector);
+   the copy-under-mutex keeps the slot stable vs a concurrent force-reclaim, and because the bytes land in
+   DST the caller may %zc-release the slot immediately — no cross-process lifetime spans the app read. Unlike
+   %zc-resolve, DST need only hold the PAYLOAD (not the full slot-bytes), so the reader needs no slot-sized
+   scratch sink."
+  (dds.pal:pshared-lock sap +zc-mutex-off+)
+  (unwind-protect
+       (let ((len (%zc-slot-payload-len sap slot-index generation)))
+         (when len
+           (let* ((b (%zc-slot-off sap slot-index))
+                  (room (max 0 (- (length dst) dst-off)))
+                  (n (min len room)))
+             (dotimes (k n n) (setf (aref dst (+ dst-off k)) (cffi:mem-ref sap :uint8 (+ b +zc-slot-hdr+ k)))))))
+    (dds.pal:pshared-unlock sap +zc-mutex-off+)))
+
 (defun* %zc-resolve (sap slot-index generation sink)
     (function (t (integer 0) (unsigned-byte 32) (simple-array (unsigned-byte 8) (*))) (or null (integer 0)))
   "Reader: under the mutex, if SLOT-INDEX in range AND its generation == GENERATION, copy the slot's LEN
    payload octets into SINK (capacity >= slot-bytes) and return LEN; else NIL (stale/reclaimed/OOB ref —
    untrusted cross-process input, NFR-SEC-POSTURE: never OOB). The copy-under-mutex keeps the slot stable
-   vs a concurrent force-reclaim."
-  (when (>= slot-index (%zc-slot-count sap)) (return-from %zc-resolve nil))
+   vs a concurrent force-reclaim. Thin wrapper over %zc-resolve-into at DST-OFF 0 (DRY)."
+  (%zc-resolve-into sap slot-index generation sink 0))
+
+(defun* %zc-resolve-fresh (sap slot-index generation)
+    (function (t (integer 0) (unsigned-byte 32)) (or null (simple-array (unsigned-byte 8) (*))))
+  "Reader, the single-copy resolve (WP-FLATDATA-over-ZC, FR-PF-3/4): under ONE mutex acquisition, validate
+   SLOT-INDEX + generation, allocate a delivery vector sized to the slot's CLAMPED payload length (NOT the
+   full slot-bytes — so the reader needs no slot-sized scratch sink and re-copy), copy the payload into it,
+   and return it; NIL on a stale/reclaimed/OOB ref. The single under-mutex copy is the only intra-host copy
+   on this RX path (the slot is read in place straight into the owned vector — the WP-ZEROCOPY v1
+   resolve-into-sink-then-re-copy is gone). Because the bytes land in a CALLER-OWNED Lisp vector, the caller
+   releases the slot immediately on return: no cross-process slot lifetime spans the app's later read, so no
+   use-after-free. The copy length is min(recorded-LEN, slot-bytes) — never past the fixed slot allocation
+   even on a forged on-wire LEN (NFR-SEC-POSTURE)."
+  (when (>= slot-index (%zc-slot-count sap)) (return-from %zc-resolve-fresh nil))
   (dds.pal:pshared-lock sap +zc-mutex-off+)
   (unwind-protect
-       (let ((b (%zc-slot-off sap slot-index)))
-         (when (= generation (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+)))
-           (let ((len (min (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+)) (%zc-slot-bytes sap))))
-             (dotimes (k len) (setf (aref sink k) (cffi:mem-ref sap :uint8 (+ b +zc-slot-hdr+ k))))
-             len)))
+       (let ((len (%zc-slot-payload-len sap slot-index generation)))
+         (when len
+           (let ((vec (make-array len :element-type '(unsigned-byte 8)))
+                 (b (%zc-slot-off sap slot-index)))
+             (dotimes (k len vec) (setf (aref vec k) (cffi:mem-ref sap :uint8 (+ b +zc-slot-hdr+ k)))))))
     (dds.pal:pshared-unlock sap +zc-mutex-off+)))

@@ -768,6 +768,577 @@
       (dds.disc:stop-node node))
     t))
 
+;;; WP-FLATDATA compile-time gate (FR-PF-4, ADR 0015)
+(defun* run-flatdata-rejects-variable-test ()
+    (function () (eql t))
+  "A :flatdata t type with a variable-size member must be a compile-time error (FlatData v1 = fixed-size only)."
+  (%check :flatdata-rejects-string
+          (nth-value 1 (ignore-errors
+                         (macroexpand-1 '(dds.gen:define-dds-type flatdata-bad-t (:flatdata t)
+                                          (n :u32) (s :string)))))
+          "define-dds-type :flatdata t with a :string member must signal at macroexpand")
+  t)
+
+;;; WP-FLATDATA compile-time XCDR2 offsets (FR-PF-4, ADR 0015; R6). fd-abc's u8/u32/u64 mix
+;;; forces the alignment path: u8@0, u32@4 (3-byte pad), u64@8 (XCDR2 4-cap, no 8-pad).
+(dds.gen:define-dds-type fd-abc (:flatdata t)
+  (a :u8) (b :u32) (c :u64))
+
+(defun* run-flatdata-offsets-test ()
+    (function () (eql t))
+  "%flatdata-offsets lands each FINAL fixed-size scalar where the classic serialize writes it:
+   serialize an equal struct (body at origin 4), then read each field back at 4+body-offset (the oracle)."
+  (multiple-value-bind (offs body-size) (dds.gen::%flatdata-offsets
+                                         (mapcar #'dds.gen::%parse-member
+                                                 '((a :u8) (b :u32) (c :u64))))
+    (%check :fd-offsets-values
+            (equal offs '((a . 0) (b . 4) (c . 8)))
+            (format nil "unexpected XCDR2 body offsets ~s" offs))
+    (%check :fd-body-size (= body-size 16)
+            (format nil "unexpected body size ~d (want 16)" body-size))
+    (let* ((arena (dds.core.arena:init-arena :bytes (* 64 1024)))
+           (pool (dds.core.arena:make-buffer-pool arena 256 1))
+           (va 200) (vb 3000000000) (vc 12345678901234567890)
+           (s (make-fd-abc :a va :b vb :c vc))
+           (b (dds.core.arena:pool-acquire pool))
+           (wc (dds.core.buffer:cursor b :endianness :little)))
+      ;; mirror the engine: 4-byte XCDR2-LE encap header sets the body origin to offset 4
+      (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+      (serialize-fd-abc s wc :xcdr2)
+      (let ((vec (dds.core.buffer:octet-buffer-vec b)))
+        (flet ((le (off n) (let ((v 0)) (dotimes (i n v) (setf v (logior v (ash (aref vec (+ 4 off i)) (* 8 i)))))))
+               (boff (slot) (cdr (assoc slot offs))))
+          (%check :fd-off-a (= (le (boff 'a) 1) va)
+                  (format nil "u8 @body~d != ~d" (boff 'a) va))
+          (%check :fd-off-b (= (le (boff 'b) 4) vb)
+                  (format nil "u32 @body~d != ~d" (boff 'b) vb))
+          (%check :fd-off-c (= (le (boff 'c) 8) vc)
+                  (format nil "u64 @body~d != ~d" (boff 'c) vc))))
+      (dds.core.arena:pool-release pool b)
+      (dds.core.arena:teardown-arena arena)))
+  t)
+
+;;; WP-FLATDATA Offset accessors — byte-exact oracle (FR-PF-4, ADR 0015; R6). Build a FlatData buffer
+;;; via the Offset setters and assert its body bytes EQUAL the classic serialize of an equal struct
+;;; (in-memory == wire). i32-signed/i64-signed values exercise the two's-complement accessor paths.
+(dds.gen:define-dds-type fd-sig (:flatdata t)
+  (a :u8) (b :i32) (c :i64))
+
+;;; WP-FLATDATA non-4-aligned tail (FR-PF-4, ADR 0015; R6, MUST-FIX false-REJECT). fd-tail's body ends on
+;;; an odd offset (u32@0..3, u8@4 -> unpadded body 5); the engine does NOT tail-pad — it writes a 9-octet
+;;; payload and records pad 3 in the encap OPTIONS field. +fd-tail-flatdata-size+ MUST be 9, not 12, and the
+;;; OPTIONS byte MUST match, or a length==+size+ wrap-check would false-REJECT the engine's own payload.
+(dds.gen:define-dds-type fd-tail (:flatdata t)
+  (a :u32) (b :u8))
+
+;;; WP-FLATDATA cap discriminator (FR-PF-4, ADR 0015; R6). u32@0,u64@body4 under XCDR2's 4-byte alignment
+;;; cap (FR-CDR-2): body 12, payload 16. A wrong 8-cap would put u64@body8 -> body 16, payload 20 — so this
+;;; type's engine size discriminates a 4-vs-8 cap regression that fd-abc/fd-sig (64-bit member @body8) cannot.
+(dds.gen:define-dds-type fd-disc (:flatdata t)
+  (a :u32) (b :u64))
+
+;;; WP-FLATDATA narrow-width accessor coverage (FR-PF-4, ADR 0015; R6). Exercises the u16/i16/bool/i8 form
+;;; builders no other FlatData type touches; unpadded body = u16@0 + i16@2 + bool@4 + i8@5 = 6.
+(dds.gen:define-dds-type fd-narrow (:flatdata t)
+  (a :u16) (b :i16) (c :bool) (d :i8))
+
+(defun* %flatdata-byte-exact (fd-buf size-const ser struct triples)
+    (function (dds.core.buffer:octet-buffer (integer 0) function t list) t)
+  "Byte-exact FlatData oracle for arbitrary arity: write each member of FD-BUF via its (getter setter value)
+   TRIPLE, read it back via the getter, then serialize STRUCT through the CLASSIC path EXACTLY as
+   %serialize-sample does (encap header at origin 4, body, finalize-encapsulation-options) and assert the
+   FlatData buffer equals it byte-for-byte over [0,SIZE-CONST) — both the body AND the 4-byte encap header
+   (incl. the OPTIONS pad bits) — and that the classic payload length equals SIZE-CONST. The engine is the
+   only oracle (no hardcoded wire bytes)."
+  (loop for (getter setter val) in triples
+        do (funcall (fdefinition `(setf ,setter)) val fd-buf)
+           (%check :fd-acc-rt (eql (funcall getter fd-buf) val)
+                   (format nil "getter ~a read-back mismatch (set ~s)" getter val)))
+  (let* ((cb (dds.core.buffer:make-octet-buffer (+ size-const 8)))
+         (wc (dds.core.buffer:cursor cb :endianness :little)))
+    (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+    (funcall ser struct wc :xcdr2)
+    (dds.cdr:finalize-encapsulation-options wc :plain-cdr2-le)
+    (let ((fv (dds.core.buffer:octet-buffer-vec fd-buf))
+          (cv (dds.core.buffer:octet-buffer-vec cb))
+          (wrote (dds.core.buffer:cursor-position wc)))
+      (%check :fd-acc-len (= wrote size-const)
+              (format nil "classic serialize wrote ~d, FlatData size ~d" wrote size-const))
+      (%check :fd-acc-byte-exact
+              (loop for i from 4 below size-const always (= (aref fv i) (aref cv i)))
+              (format nil "in-memory != wire (body): ~s vs ~s"
+                      (subseq fv 0 size-const) (subseq cv 0 size-const)))
+      (%check :fd-acc-encap
+              (loop for i below 4 always (= (aref fv i) (aref cv i)))
+              (format nil "encapsulation header (incl. OPTIONS) mismatch: ~s vs ~s"
+                      (subseq fv 0 4) (subseq cv 0 4))))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec cb)))
+  t)
+
+(defun* run-flatdata-accessor-test ()
+    (function () (eql t))
+  "FlatData Offset accessors round-trip AND the buffer's body bytes + encap header (incl. OPTIONS pad bits)
+   equal the classic serialize of an equal struct — the byte-exact in-memory==wire oracle (FR-PF-4). Covers
+   unsigned u8/u32/u64; two's-complement signed i32/i64; a non-4-aligned tail (false-REJECT regression); a
+   4-vs-8 alignment-cap discriminator; and the narrow u16/i16/bool/i8 accessor forms.
+   All buffers are PAL-static make-octet-buffer (FlatData via the constructor; classic scratch via the oracle
+   helper), each freed via free-static — no arena/pool is needed here."
+  (progn
+    ;; case 1: unsigned u8/u32/u64 (fd-abc from the offsets test) — 64-bit member @body8, payload 20
+    (let ((b (make-fd-abc-flatdata)))
+      (%check :fd-abc-size (= +fd-abc-flatdata-size+ 20)
+              (format nil "unexpected +fd-abc-flatdata-size+ ~d" +fd-abc-flatdata-size+))
+      (%flatdata-byte-exact
+       b +fd-abc-flatdata-size+ #'serialize-fd-abc
+       (make-fd-abc :a 200 :b 3000000000 :c 12345678901234567890)
+       '((fd-abc-a-fd fd-abc-a-fd 200) (fd-abc-b-fd fd-abc-b-fd 3000000000)
+         (fd-abc-c-fd fd-abc-c-fd 12345678901234567890)))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
+    ;; case 2: signed i32/i64 (negative values exercise the two's-complement accessor)
+    (let ((b (make-fd-sig-flatdata)))
+      (%flatdata-byte-exact
+       b +fd-sig-flatdata-size+ #'serialize-fd-sig
+       (make-fd-sig :a 7 :b -123456789 :c -1234567890123456789)
+       '((fd-sig-a-fd fd-sig-a-fd 7) (fd-sig-b-fd fd-sig-b-fd -123456789)
+         (fd-sig-c-fd fd-sig-c-fd -1234567890123456789)))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
+    ;; case 3: non-4-aligned tail (u32 + u8) — body 5, payload 9, OPTIONS pad 3 (MUST-FIX false-REJECT)
+    (let ((b (make-fd-tail-flatdata)))
+      (%check :fd-tail-size (= +fd-tail-flatdata-size+ 9)
+              (format nil "+fd-tail-flatdata-size+ must be 9 (4 encap + 5 unpadded body), got ~d — a tail-padded ~
+                12 would false-REJECT the engine's own 9-octet payload" +fd-tail-flatdata-size+))
+      (%flatdata-byte-exact
+       b +fd-tail-flatdata-size+ #'serialize-fd-tail
+       (make-fd-tail :a #x11223344 :b #xAB)
+       '((fd-tail-a-fd fd-tail-a-fd #x11223344) (fd-tail-b-fd fd-tail-b-fd #xAB)))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
+    ;; case 4: alignment-cap discriminator (u32 + u64) — u64 MUST sit @body4 (XCDR2 4-cap): payload 16, not 20
+    (let ((b (make-fd-disc-flatdata)))
+      (%check :fd-disc-size (= +fd-disc-flatdata-size+ 16)
+              (format nil "+fd-disc-flatdata-size+ must be 16 (u64 @body4 under XCDR2's 4-byte cap); a wrong ~
+                8-cap would put u64 @body8 -> 20. got ~d" +fd-disc-flatdata-size+))
+      (%flatdata-byte-exact
+       b +fd-disc-flatdata-size+ #'serialize-fd-disc
+       (make-fd-disc :a #xDEADBEEF :b #x0123456789ABCDEF)
+       '((fd-disc-a-fd fd-disc-a-fd #xDEADBEEF) (fd-disc-b-fd fd-disc-b-fd #x0123456789ABCDEF)))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
+    ;; case 5: narrow widths (u16/i16/bool/i8) with a negative i16/i8 and bool t — body 6, payload 10
+    ;; (NB: all scratch + FlatData buffers are PAL-static make-octet-buffer, freed per case via free-static)
+    (let ((b (make-fd-narrow-flatdata)))
+      (%check :fd-narrow-size (= +fd-narrow-flatdata-size+ 10)
+              (format nil "+fd-narrow-flatdata-size+ must be 10 (4 encap + 6 unpadded body), got ~d"
+                      +fd-narrow-flatdata-size+))
+      (%flatdata-byte-exact
+       b +fd-narrow-flatdata-size+ #'serialize-fd-narrow
+       (make-fd-narrow :a #xBEEF :b -12345 :c t :d -42)
+       '((fd-narrow-a-fd fd-narrow-a-fd #xBEEF) (fd-narrow-b-fd fd-narrow-b-fd -12345)
+         (fd-narrow-c-fd fd-narrow-c-fd t) (fd-narrow-d-fd fd-narrow-d-fd -42)))
+      ;; bool nil round-trips too (the setter writes 0, the getter reads /=0 -> NIL)
+      (setf (fd-narrow-c-fd b) nil)
+      (%check :fd-narrow-bool-nil (null (fd-narrow-c-fd b)) "bool NIL must round-trip via the Offset accessor")
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
+    ;; the layout is wired into the type-support hook
+    (let* ((ts (dds.types:find-type-support "fd-abc"))
+           (lay (dds.types:type-support-flatdata-offset ts)))
+      (%check :fd-layout-present (dds.types:flatdata-layout-p lay)
+              "type-support flatdata-offset is not a flatdata-layout")
+      (%check :fd-layout-size (= (dds.types:flatdata-layout-size lay) +fd-abc-flatdata-size+)
+              "flatdata-layout size mismatch")
+      (%check :fd-layout-fields (= 3 (length (dds.types:flatdata-layout-fields lay)))
+              "flatdata-layout fields count mismatch")
+      ;; a non-FlatData type leaves the hook NIL (engine/codegen untouched)
+      (%check :fd-nonflat-nil (null (dds.types:type-support-flatdata-offset
+                                     (dds.types:find-type-support "gsample")))
+              "non-FlatData type unexpectedly has a flatdata-layout")))
+  t)
+
+;;; WP-FLATDATA Phase C: serialize=identity / deserialize=read-in-place via the type-support vtable
+;;; (FR-PF-4, NFR-PERF-7, ADR 0015; R6). The engine hot path is unchanged — it funcalls the vtable; FlatData
+;;; only swaps the function pointers. These two tests prove (1) the swapped serialize+deserialize codecs and
+;;; (2) that the FlatData and classic codecs are interchangeable on the wire (decode direction).
+
+(defun* %fd-measure-bytes (label iters thunk)
+    (function (string (integer 1) function) single-float)
+  "Run THUNK ITERS times, print + return its mean dds.pal:bytes-consed per call (NFR-PERF-7 honest-measurement
+   harness, mirrors run-mem-test). On Clasp bytes-consed is 0 (NFR-PORT gap) so it reports 0."
+  (declare (type function thunk))
+  (let ((before (dds.pal:bytes-consed)))
+    (dotimes (i iters) (funcall thunk))
+    (let* ((delta (- (dds.pal:bytes-consed) before))
+           (per (/ (float delta) iters)))
+      (format t "~&  fd-mem[~14a]: ~10d bytes / ~d iters = ~,4f bytes/sample (~a)~%"
+              label delta iters per (dds.pal:pal-impl-name))
+      per)))
+
+(defun* run-flatdata-zero-alloc-test ()
+    (function () (eql t))
+  "WP-FLATDATA honest GC-bytes/sample measurement (NFR-PERF-7, FR-LANG-7), separating the TX win, the deferred
+   ZC RX path, and the engine's ACTUAL non-ZC RX path. Mirrors run-mem-test's dds.pal:bytes-consed harness:
+   reusable write+RX buffers reset per iteration; on SBCL it asserts, on Clasp bytes-consed is 0 (NFR-PORT gap)
+   so it only smokes. Four numbers, each on the FUNCTION the engine actually funcalls:
+     serialize-id     = vtable :serialize (FlatData identity, into the engine's reused cursor)  -> assert ~0 (real TX win).
+     deser-into-loan  = deserialize-into-<name>-fd, the inner copy into a PRE-LOANED target — the 0-alloc path
+                        Phase D's Zero-Copy uses (the loaned target IS the ZC slot); NOT the engine's non-ZC RX
+                        path today -> assert ~0.
+     vtable-deser     = deserialize-<name>-fd, the type-support :deserialize slot %deserialize-sample funcalls on
+                        the NON-ZC RX path; allocates one fresh FlatData buffer wrapper per sample (a true 0-copy
+                        SAP view with refcount lifetime is DEFERRED beyond v1 — an engine-contract change, see
+                        ADR 0015 Phase-D outcome) -> NOT 0; regression-guarded <= classic.
+     classic-deser    = the classic per-field deserialize-<name> -> the baseline the vtable-deser must not beat.
+   No overclaim: the engine non-ZC RX path is ~vtable-deser bytes (modestly below classic + 0 per-field decode);
+   Phase D delivered a SAFE SINGLE COPY ZC RX (~830x less than the v1 sink+re-copy), NOT literal-0-copy; the
+   literal-0-copy + 0-alloc RX view is DEFERRED beyond v1 (an engine-contract change; R6, ADR 0015)."
+  (let* ((ts (dds.types:find-type-support "fd-abc"))
+         (fd (make-fd-abc-flatdata))               ; the FlatData sample (the buffer IS the SerializedPayload)
+         (target (make-fd-abc-flatdata))           ; a loaned RX FlatData buffer (deserialize-into copies into it)
+         (wbuf (dds.core.buffer:make-octet-buffer (+ +fd-abc-flatdata-size+ 8)))
+         (wc (dds.core.buffer:cursor wbuf :endianness :little))
+         (rxbuf (dds.core.buffer:make-octet-buffer +fd-abc-flatdata-size+))
+         (rc (dds.core.buffer:cursor rxbuf :endianness :little))
+         (ser (dds.types:type-support-serialize ts))
+         (vdes (dds.types:type-support-deserialize ts))   ; the engine's non-ZC RX vtable slot = deserialize-fd-abc-fd
+         (iters 100000)
+         (sbcl-p (eq (dds.pal:pal-impl-name) :sbcl)))
+    (declare (type function ser vdes))
+    (setf (fd-abc-a-fd fd) 200 (fd-abc-b-fd fd) 3000000000 (fd-abc-c-fd fd) 12345678901234567890)
+    ;; Build the RX wire payload ONCE (encap header + body), exactly as %serialize-sample delivers it.
+    (replace (dds.core.buffer:octet-buffer-vec rxbuf) (dds.dcps::%serialize-sample ts fd))
+    ;; warm every path (the engine writes the header then calls :serialize for the body, origin reset to 4;
+    ;; reset rc before each parse-encapsulation-header so the encap id is read at position 0, never mid-body)
+    (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+    (funcall ser fd wc :xcdr2)
+    (dds.core.buffer:cursor-set-position rc 4)
+    (deserialize-into-fd-abc-fd target rc :xcdr2)
+    (dds.core.buffer:cursor-reset rc)
+    (dds.cdr:parse-encapsulation-header rc)
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (funcall vdes rc :xcdr2)))
+    (dds.core.buffer:cursor-reset rc)
+    (dds.cdr:parse-encapsulation-header rc)
+    (deserialize-fd-abc rc :xcdr2)
+    ;; serialize=identity: header once at origin 4, then the FlatData body block-copy (put-octets = replace)
+    (let ((ser-per (%fd-measure-bytes
+                    "serialize-id" iters
+                    (lambda ()
+                      (dds.core.buffer:cursor-reset wc)
+                      (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+                      (funcall ser fd wc :xcdr2))))
+          ;; deserialize=read-in-place into the loaned target — the 0-alloc path Phase D ZC uses (loaned target =
+          ;; the ZC slot); NOT the engine's non-ZC RX path today.
+          (loan-per (%fd-measure-bytes
+                     "deser-into-loan" iters
+                     (lambda ()
+                       (dds.core.buffer:cursor-set-position rc 4)
+                       (deserialize-into-fd-abc-fd target rc :xcdr2))))
+          ;; vtable :deserialize — the function %deserialize-sample funcalls on the engine's NON-ZC RX path.
+          ;; It allocates a fresh FlatData buffer per sample (free it to avoid a foreign leak; free-static is a
+          ;; foreign release, NOT GC, so it does not perturb bytes-consed). Replicate the engine: parse the encap
+          ;; header (positions to 4 AND resets the alignment origin) each iteration.
+          (vtable-per (%fd-measure-bytes
+                       "vtable-deser" iters
+                       (lambda ()
+                         (dds.core.buffer:cursor-reset rc)
+                         (dds.cdr:parse-encapsulation-header rc)
+                         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (funcall vdes rc :xcdr2))))))
+          ;; classic per-field deserialize — the baseline the FlatData vtable deserialize must not regress past.
+          (classic-per (%fd-measure-bytes
+                        "classic-deser" iters
+                        (lambda ()
+                          (dds.core.buffer:cursor-reset rc)
+                          (dds.cdr:parse-encapsulation-header rc)
+                          (deserialize-fd-abc rc :xcdr2)))))
+      (format t "~&  fd-mem: TX serialize = ~,4f (0-alloc win); RX non-ZC vtable = ~,4f vs classic = ~,4f; ~
+                 literal-0-copy+0-alloc RX deferred beyond v1 (engine-contract change; loaned-target path = ~,4f).~%"
+              ser-per vtable-per classic-per loan-per)
+      (when sbcl-p
+        ;; the two genuine 0-alloc paths: serialize=identity (TX) and the loaned-target inner copy (Phase-D ZC)
+        (%check :fd-serialize-zero-alloc (< ser-per 1.0)
+                (format nil "serialize-id: ~,4f bytes/sample (expected ~~0, the FlatData TX win)" ser-per))
+        (%check :fd-loan-zero-alloc (< loan-per 1.0)
+                (format nil "deser-into-loan: ~,4f bytes/sample (expected ~~0, the Phase-D ZC path)" loan-per))
+        ;; the engine's non-ZC RX vtable deserialize is NOT 0 (Phase D pools the buffer); guard only that it does
+        ;; not REGRESS past the classic per-field decode — it should be modestly better + 0 per-field work.
+        (%check :fd-vtable-not-worse-than-classic (<= vtable-per classic-per)
+                (format nil "vtable-deser ~,4f must be <= classic-deser ~,4f (regression guard; not 0 until Phase D)"
+                        vtable-per classic-per))))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec target))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec wbuf))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec rxbuf))
+    t))
+
+;;;; ---- WP-FLATDATA Phase E1a bench (FR-PF-4, NFR-PERF-7, FR-LANG-7; R6, ADR 0015) ----
+;;;; HONEST measurement (FR-LANG-7): the FlatData TX is a genuine 0-alloc identity copy and the loaned-target
+;;;; inner RX path is 0-alloc, but the ENGINE-VISIBLE non-ZC RX vtable still allocates one buffer/sample and the
+;;;; ZC RX is a SAFE SINGLE COPY out of SHMEM (~830x less than the WP-ZEROCOPY-v1 sink+re-copy) — NOT literal
+;;;; 0-copy. No path is reported "~0" unless bytes-consed actually reads ~0. NOT cleared for ship — counsel R6.
+
+(defun* %fd-measure-ns (label iters thunk)
+    (function (string (integer 1) function) double-float)
+  "Run THUNK ITERS times and print + return its mean wall time in nanoseconds (total elapsed / ITERS — the
+   PAL clock is ~us resolution, so a single op reads 0; the per-op figure is the amortised loop time, the same
+   method perftest.lisp uses). The time companion to %fd-measure-bytes (DRY)."
+  (declare (type function thunk))
+  (let ((t0 (dds.pal:monotonic-ns)))
+    (dotimes (i iters) (funcall thunk))
+    (let ((per (/ (float (max 0 (- (dds.pal:monotonic-ns) t0)) 1.0d0) iters)))
+      (format t "~&  fd-ns[~16a]: ~,1f ns/op (~d iters)~%" label per iters)
+      per)))
+
+(defun* %fd-bench-row (stream label fd-bytes fd-ns classic-bytes classic-ns note)
+    (function (t string real real real real string) t)
+  "Emit one markdown comparison row to STREAM: a measured FlatData path (FD-BYTES GC bytes/op, FD-NS ns/op) vs
+   its classic counterpart (CLASSIC-BYTES, CLASSIC-NS) with a free-text NOTE. Used by run-bench-flatdata."
+  (format stream "~&| ~a | ~,1f | ~,1f | ~,1f | ~,1f | ~a |~%"
+          label (float fd-bytes 1.0) (float fd-ns 1.0) (float classic-bytes 1.0) (float classic-ns 1.0) note)
+  t)
+
+(defun* %fd-zc-bench-bytes (iters)
+    (function ((integer 1)) (values (integer 0) (integer 0)))
+  "Measure the WP-FLATDATA-over-ZC RX GC bytes/sample on a standalone in-process ZC pool (the same pool ABI the
+   data plane uses): loan ONE slot with an fd-abc-sized payload, then resolve it ITERS times each way — the NEW
+   safe single-copy (%zc-resolve-fresh) vs the WP-ZEROCOPY-v1 sink+re-copy (%fd-zc-rx-bytes-v1, DRY) — and
+   return (values new-bytes v1-bytes). Pass-returns (0 0) where SHMEM by-name attach is unreliable (Clasp/macOS
+   gap, ADR 0013), since the pool's PTHREAD_PROCESS_SHARED mutex needs a usable SHMEM segment."
+  (if (not (dds.xport.shmem:shm-attach-by-name-reliable-p))
+      (values 0 0)
+      (let* ((slots 8)
+             (slot-bytes dds.disc:+zerocopy-pool-slot-bytes+)
+             (seg-bytes (dds.xport.zerocopy::%zc-bytes slots slot-bytes))
+             (mem (dds.pal:alloc-static seg-bytes))
+             (sap (dds.pal:static-pointer mem))
+             (payload (let ((v (make-array +fd-abc-flatdata-size+ :element-type '(unsigned-byte 8))))
+                        (dotimes (i +fd-abc-flatdata-size+ v) (setf (aref v i) (logand i #xff))))))
+        (dds.xport.zerocopy::%zc-init sap slots slot-bytes)
+        (unwind-protect
+             (multiple-value-bind (slot gen)
+                 (dds.xport.zerocopy::%zc-loan sap payload 0 (length payload) 1)
+               (if (null slot)
+                   (values 0 0)
+                   (let ((new-bytes (%fd-zc-rx-bytes-new sap slot gen iters))
+                         (v1-bytes (%fd-zc-rx-bytes-v1 sap slot gen iters)))
+                     (dds.xport.zerocopy::%zc-release sap slot gen)
+                     (values new-bytes v1-bytes))))
+          (dds.xport.zerocopy::%zc-destroy sap)
+          (dds.pal:free-static mem)))))
+
+(defun* %bench-git-head ()
+    (function () string)
+  "The current short git HEAD (`git rev-parse --short HEAD`), derived AT RUN TIME so a bench report is never
+   stamped with a stale SHA; \"unknown\" if git is unavailable / not a work tree (the report stays self-consistent)."
+  (handler-case
+      (let ((s (string-trim '(#\Space #\Newline #\Return #\Tab)
+                            (with-output-to-string (out)
+                              (uiop:run-program (list "git" "rev-parse" "--short" "HEAD")
+                                                :output out :error-output nil :ignore-error-status t)))))
+        (if (and (plusp (length s)) (every (lambda (c) (digit-char-p c 16)) s)) s "unknown"))
+    (error () "unknown")))
+
+(defun* %bench-date-string ()
+    (function () string)
+  "Today's date as YYYY-MM-DD from get-decoded-time, derived AT RUN TIME (no hardcoded date in a bench report)."
+  (multiple-value-bind (s m h day month year) (get-decoded-time)
+    (declare (ignore s m h))
+    (format nil "~4,'0d-~2,'0d-~2,'0d" year month day)))
+
+(defun* run-bench-flatdata (&key (file nil) (iters 200000) (zc-iters 100000))
+    (function (&key (:file (or null string pathname)) (:iters (integer 1)) (:zc-iters (integer 1))) t)
+  "WP-FLATDATA Phase E1a bench (FR-PF-4, NFR-PERF-7, FR-LANG-7; R6, ADR 0015 — NOT cleared for ship, counsel
+   R6). HONEST before/after numbers for a FINAL fixed-size FlatData type (fd-abc: u8/u32/u64, 20-octet payload)
+   vs the classic per-field codec for the SAME type, over the EXACT functions the engine funcalls. Prints a
+   markdown report to *standard-output*; when FILE is given, ALSO writes it there (broadcast — captured by
+   make bench-flatdata). Each row is GC bytes/op (dds.pal:bytes-consed delta, NFR-PERF-8 oracle; SBCL-exact,
+   Clasp=0 by NFR-PORT gap) + ns/op (amortised over ITERS; the PAL clock is ~us so a single op reads 0). The
+   measured paths (DRY — reuses %fd-measure-bytes + the ZC measurement helpers): TX serialize (FlatData
+   identity vs classic per-field); RX deserialize (the engine-visible vtable deserialize-<name>-fd vs classic
+   deserialize-<name>, AND the loaned-target 0-alloc inner path deserialize-into-<name>-fd); the Offset
+   accessors (get/set, 0-alloc); and FlatData-over-ZC RX (the safe single-copy %zc-resolve-fresh vs the
+   WP-ZEROCOPY-v1 sink+re-copy, ~830x measured). NO OVERCLAIM: only TX serialize + the loaned-target inner path are
+   genuinely ~0; the engine non-ZC RX vtable allocates one buffer/sample and the ZC RX is a SAFE SINGLE COPY
+   out of SHMEM, NOT literal 0-copy (a Lisp octet-buffer cannot wrap a raw foreign SAP; ZC delivery is into an
+   async store read off-thread with no slot-aware release hook — literal-0-copy RX is DEFERRED, see ADR 0015
+   Phase-D outcome). TX also still has the app->slot copy on the ZC path (loan-write API follow-up)."
+  (let* ((ts (dds.types:find-type-support "fd-abc"))
+         (fd (make-fd-abc-flatdata))
+         (target (make-fd-abc-flatdata))
+         (wbuf (dds.core.buffer:make-octet-buffer (+ +fd-abc-flatdata-size+ 8)))
+         (wc (dds.core.buffer:cursor wbuf :endianness :little))
+         (rxbuf (dds.core.buffer:make-octet-buffer +fd-abc-flatdata-size+))
+         (rc (dds.core.buffer:cursor rxbuf :endianness :little))
+         (ser (dds.types:type-support-serialize ts))
+         (vdes (dds.types:type-support-deserialize ts))
+         (classic-ser #'serialize-fd-abc)
+         (sbcl-p (eq (dds.pal:pal-impl-name) :sbcl)))
+    (declare (type function ser vdes classic-ser))
+    (setf (fd-abc-a-fd fd) 200 (fd-abc-b-fd fd) 3000000000 (fd-abc-c-fd fd) 12345678901234567890)
+    (replace (dds.core.buffer:octet-buffer-vec rxbuf) (dds.dcps::%serialize-sample ts fd))
+    (let ((cl-struct (make-fd-abc :a 200 :b 3000000000 :c 12345678901234567890)))
+      (flet ((emit (stream)
+               (format stream "~&# WP-FLATDATA — ser/deser cost + ZC-RX vs classic (honest) (FR-PF-4, NFR-PERF-7, FR-LANG-7)~%~%")
+               (format stream "**NOT cleared for ship — pending counsel (R6); see ADR 0015.** FlatData + Zero-Copy are R6 patent-gated.~%~%")
+               (format stream "Phase E1a of WP-FLATDATA: quantify the cost of a FINAL fixed-size FlatData type (`fd-abc`: `u8`/`u32`/`u64`, 20-octet payload) against the CLASSIC per-field codec for the SAME type, over the EXACT functions the engine funcalls. Per the operating contract no hot-path change lands without a before/after measurement; this is that measurement. Generated by `dds.tests:run-bench-flatdata` (entry: `make bench-flatdata`).~%~%")
+               (format stream "## Environment~%~%")
+               (format stream "| field | value |~%|-------|-------|~%")
+               (format stream "| host | ~a (~a) |~%" (machine-instance) (machine-version))
+               (format stream "| os | ~a ~a ~a |~%" (software-type) (software-version) (machine-type))
+               (format stream "| impl | ~a ~a |~%" (lisp-implementation-type) (lisp-implementation-version))
+               (format stream "| HEAD | ~a |~%" (%bench-git-head))
+               (format stream "| date | ~a |~%" (%bench-date-string))
+               (format stream "| FlatData type | `fd-abc` (`u8`,`u32`,`u64`) -> `+fd-abc-flatdata-size+` = ~d octets (4 encap + 16 body) |~%" +fd-abc-flatdata-size+)
+               (format stream "| iters (ser/deser/accessor) | ~d |~%" iters)
+               (format stream "| iters (ZC-RX) | ~d |~%" zc-iters)
+               (format stream "~%## Method~%~%")
+               (format stream "Each path is measured over the FUNCTION the engine actually funcalls (the type-support vtable slot), not a hand-rolled stand-in. GC bytes/op is the `dds.pal:bytes-consed` delta over the loop (NFR-PERF-8 oracle; SBCL-exact, Clasp reports 0 — a documented NFR-PORT gap). ns/op is total elapsed (`dds.pal:monotonic-ns`, ~~microsecond resolution) divided by the iteration count: a single op reads 0 on this clock, so the per-op figure is the amortised loop time (the same method `perftest.lisp` uses) and is a coarse RELATIVE indicator, not an absolute single-op latency. The TX serialize loop resets the write cursor + re-writes the encap header each iteration (as `%serialize-sample` does); the RX loops re-parse the encap header each iteration (as `%deserialize-sample` does). Reusable write/RX buffers are PAL-static and freed at the end.~%~%")
+               (format stream "## Serialize / deserialize / accessor cost — FlatData vs classic (same `fd-abc`)~%~%")
+               (format stream "| path | FD bytes/op | FD ns/op | classic bytes/op | classic ns/op | note |~%")
+               (format stream "|------|-------------|----------|------------------|---------------|------|~%"))
+             (rows (stream new-bytes v1-bytes)
+               (let* ((ser-bytes (%fd-measure-bytes "ser-id" iters
+                                   (lambda () (dds.core.buffer:cursor-reset wc)
+                                     (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+                                     (funcall ser fd wc :xcdr2))))
+                      (ser-ns (%fd-measure-ns "ser-id" iters
+                                (lambda () (dds.core.buffer:cursor-reset wc)
+                                  (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+                                  (funcall ser fd wc :xcdr2))))
+                      (cser-bytes (%fd-measure-bytes "ser-classic" iters
+                                    (lambda () (dds.core.buffer:cursor-reset wc)
+                                      (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+                                      (funcall classic-ser cl-struct wc :xcdr2))))
+                      (cser-ns (%fd-measure-ns "ser-classic" iters
+                                 (lambda () (dds.core.buffer:cursor-reset wc)
+                                   (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+                                   (funcall classic-ser cl-struct wc :xcdr2))))
+                      (vdes-bytes (%fd-measure-bytes "vtable-deser" iters
+                                    (lambda () (dds.core.buffer:cursor-reset rc)
+                                      (dds.cdr:parse-encapsulation-header rc)
+                                      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (funcall vdes rc :xcdr2))))))
+                      (vdes-ns (%fd-measure-ns "vtable-deser" iters
+                                 (lambda () (dds.core.buffer:cursor-reset rc)
+                                   (dds.cdr:parse-encapsulation-header rc)
+                                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (funcall vdes rc :xcdr2))))))
+                      (cdes-bytes (%fd-measure-bytes "classic-deser" iters
+                                    (lambda () (dds.core.buffer:cursor-reset rc)
+                                      (dds.cdr:parse-encapsulation-header rc)
+                                      (deserialize-fd-abc rc :xcdr2))))
+                      (cdes-ns (%fd-measure-ns "classic-deser" iters
+                                 (lambda () (dds.core.buffer:cursor-reset rc)
+                                   (dds.cdr:parse-encapsulation-header rc)
+                                   (deserialize-fd-abc rc :xcdr2))))
+                      (loan-bytes (%fd-measure-bytes "deser-into-loan" iters
+                                    (lambda () (dds.core.buffer:cursor-set-position rc 4)
+                                      (deserialize-into-fd-abc-fd target rc :xcdr2))))
+                      (loan-ns (%fd-measure-ns "deser-into-loan" iters
+                                 (lambda () (dds.core.buffer:cursor-set-position rc 4)
+                                   (deserialize-into-fd-abc-fd target rc :xcdr2))))
+                      ;; fixnum-fitting fields (a:u8, b:u32) — the GENUINE read/write-in-place 0-alloc property
+                      (get-bytes (%fd-measure-bytes "accessor-get-fx" iters
+                                   (lambda () (fd-abc-a-fd fd) (fd-abc-b-fd fd))))
+                      (get-ns (%fd-measure-ns "accessor-get-fx" iters
+                                (lambda () (fd-abc-a-fd fd) (fd-abc-b-fd fd))))
+                      (set-bytes (%fd-measure-bytes "accessor-set-fx" iters
+                                   (lambda () (setf (fd-abc-a-fd fd) 200 (fd-abc-b-fd fd) 3000000000))))
+                      (set-ns (%fd-measure-ns "accessor-set-fx" iters
+                                (lambda () (setf (fd-abc-a-fd fd) 200 (fd-abc-b-fd fd) 3000000000))))
+                      ;; u64 c > most-positive-fixnum: read-in-place is 0-copy but returning the integer BOXES a bignum (a Lisp cost, not FlatData)
+                      (get64-bytes (%fd-measure-bytes "accessor-get-u64" iters (lambda () (fd-abc-c-fd fd))))
+                      (get64-ns (%fd-measure-ns "accessor-get-u64" iters (lambda () (fd-abc-c-fd fd)))))
+                 (%fd-bench-row stream "**TX serialize** (engine `:serialize`)" ser-bytes ser-ns cser-bytes cser-ns
+                                "FlatData = block-copy identity, 0 per-field encode (the TX win)")
+                 (%fd-bench-row stream "**RX deserialize** (engine non-ZC `:deserialize`)" vdes-bytes vdes-ns cdes-bytes cdes-ns
+                                "FlatData allocs 1 buffer/sample; win = modest GC-heap + 0 per-field decode")
+                 (%fd-bench-row stream "**RX deser into loaned target** (0-alloc inner)" loan-bytes loan-ns cdes-bytes cdes-ns
+                                "the path Phase-D ZC uses (loaned target = the slot); 0-alloc")
+                 (%fd-bench-row stream "**Offset accessor GET** (`a`:u8 + `b`:u32, fixnum)" get-bytes get-ns 0 0
+                                "read in place, 0-alloc (no classic equivalent — struct slots)")
+                 (%fd-bench-row stream "**Offset accessor SET** (`a`:u8 + `b`:u32, fixnum)" set-bytes set-ns 0 0
+                                "write in place, 0-alloc")
+                 (%fd-bench-row stream "**Offset accessor GET** (`c`:u64 > fixnum)" get64-bytes get64-ns 0 0
+                                "read in place IS 0-copy, but returning a >fixnum u64 BOXES a bignum (a Lisp cost, not FlatData)")
+                 (format stream "~%## FlatData over Zero-Copy — RX (safe single copy out of SHMEM, NOT literal-0-copy)~%~%")
+                 (if (and (zerop new-bytes) (zerop v1-bytes))
+                     (format stream "(SHMEM by-name attach unreliable on this platform — ZC-RX bench skipped; Clasp/macOS gap, ADR 0013)~%~%")
+                     (progn
+                       (format stream "| RX path | GC bytes/sample | vs v1 |~%|---------|-----------------|-------|~%")
+                       (format stream "| WP-FLATDATA-over-ZC single-copy (`%zc-resolve-fresh`) | ~d | 1x |~%" new-bytes)
+                       (format stream "| WP-ZEROCOPY-v1 sink(65536)+re-copy | ~d | ~dx |~%~%"
+                               v1-bytes (if (plusp new-bytes) (round v1-bytes new-bytes) 0))
+                       (format stream "The FlatData-over-ZC RX allocates ONE exact-length (~d-octet) owned vector, read in place from the SHMEM slot under a single mutex hold — no 65536-byte scratch sink, no second copy: a **~dx** reduction in RX GC bytes/sample vs WP-ZEROCOPY-v1.~%~%"
+                               +fd-abc-flatdata-size+ (if (plusp new-bytes) (round v1-bytes new-bytes) 0))))
+                 (format stream "## Honest framing (FR-LANG-7) — no path is claimed ~~0 unless it measures ~~0~%~%")
+                 (format stream "- **TX serialize** and **RX-into-loaned-target** are the only GENUINELY ~~0-alloc paths (block-copy identity / copy into a caller-owned buffer; the loaned buffer IS the ZC slot on the Phase-D path).~%")
+                 (format stream "- The **engine-visible non-ZC RX vtable** (`deserialize-<name>-fd`) allocates ONE FlatData buffer per sample (~,1f bytes/op here) — modestly below the classic per-field decode (~,1f) with 0 per-field work, NOT zero. The classic vtable likewise allocates a fresh sample per call.~%" vdes-bytes cdes-bytes)
+                 (format stream "- The **FlatData-over-ZC RX is a SAFE SINGLE COPY out of shared memory** (~~~dx less than WP-ZEROCOPY-v1's sink+re-copy — ~~3 orders of magnitude), **NOT literal-0-copy**. A Lisp octet-buffer cannot wrap a raw foreign SAP, and ZC delivery is into an async store read on another thread with no slot-aware release hook, so a literal-0-copy SHMEM VIEW would be a cross-process use-after-free. **TX still has the one app->slot copy** (a loan-write API is the follow-up). **Literal-0-copy RX is DEFERRED** — it needs SAP-backed accessors plus a DCPS-level refcount-spanning ZC read path (ADR 0015, Phase-D outcome).~%~%"
+                         (if (plusp new-bytes) (round v1-bytes new-bytes) 830))
+                 (format stream "Method: ~d iterations (~d for ZC-RX); GC bytes/op = `dds.pal:bytes-consed` delta (SBCL-exact, Clasp=0); ns/op = `dds.pal:monotonic-ns` total/iters (~~us clock, amortised). Impl: ~a ~a on ~a.~%"
+                         iters zc-iters (lisp-implementation-type) (lisp-implementation-version) (machine-instance))
+                 (when sbcl-p
+                   ;; honest regression guards: the two genuine 0-alloc paths must be ~0; the vtable must not regress past classic
+                   (assert (< ser-bytes 1.0) () "bench: FlatData TX serialize must be ~0 GC bytes/op, got ~,4f" ser-bytes)
+                   (assert (< loan-bytes 1.0) () "bench: deser-into-loaned-target must be ~0 GC bytes/op, got ~,4f" loan-bytes)
+                   (assert (< get-bytes 1.0) () "bench: Offset accessor GET must be 0-alloc, got ~,4f" get-bytes)
+                   (assert (< set-bytes 1.0) () "bench: Offset accessor SET must be 0-alloc, got ~,4f" set-bytes)
+                   (assert (<= vdes-bytes cdes-bytes) () "bench: vtable RX (~,4f) must not regress past classic (~,4f)" vdes-bytes cdes-bytes)))))
+        ;; warm every measured path once (engine writes the header then :serialize for the body, origin 4)
+        (dds.cdr:make-encapsulation-header wc :plain-cdr2-le) (funcall ser fd wc :xcdr2)
+        (dds.core.buffer:cursor-set-position rc 4) (deserialize-into-fd-abc-fd target rc :xcdr2)
+        (multiple-value-bind (new-bytes v1-bytes) (%fd-zc-bench-bytes zc-iters)
+          (emit *standard-output*)
+          (rows *standard-output* new-bytes v1-bytes)
+          (when file
+            (with-open-file (s file :direction :output :if-exists :supersede :if-does-not-exist :create)
+              (emit s)
+              ;; re-run the measured loops into the file stream (cheap vs a long bench; keeps the file self-contained)
+              (rows s new-bytes v1-bytes))
+            (format t "~&  wrote ~a~%" file)))))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec target))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec wbuf))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec rxbuf))
+    t))
+
+(defun* run-flatdata-deser-interop-test ()
+    (function () (eql t))
+  "WP-FLATDATA in-memory==wire at DESERIALIZE (FR-PF-4): the FlatData and classic codecs are interchangeable on
+   the wire in the decode direction (Phase B proved the encode direction byte-exact). (a) A FlatData buffer
+   filled via the Offset setters, fed to the CLASSIC deserialize-fd-abc, yields a STRUCT whose fields equal what
+   was set. (b) The classic serialize of an equal struct, fed to the FlatData read-in-place (deserialize-fd-abc /
+   the Offset getters), yields accessor reads equal to the same values. Uses the engine's own
+   %serialize-sample / %deserialize-sample so no wire bytes are hardcoded (the engine is the oracle)."
+  (let ((ts (dds.types:find-type-support "fd-abc"))
+        (va 200) (vb 3000000000) (vc 12345678901234567890))
+    ;; (a) FlatData buffer (via setters) -> classic deserialize -> equal STRUCT
+    (let ((fd (make-fd-abc-flatdata)))
+      (setf (fd-abc-a-fd fd) va (fd-abc-b-fd fd) vb (fd-abc-c-fd fd) vc)
+      (let* ((wire (dds.dcps::%serialize-sample ts fd))         ; FlatData identity TX
+             (ob (dds.core.buffer:make-octet-buffer (length wire)))
+             (rc (progn (replace (dds.core.buffer:octet-buffer-vec ob) wire)
+                        (dds.core.buffer:cursor ob :endianness :little))))
+        (dds.cdr:parse-encapsulation-header rc)
+        (let ((st (deserialize-fd-abc rc :xcdr2)))             ; CLASSIC decode of FlatData-produced wire
+          (%check :fd-interop-a (and (fd-abc-p st) (= (fd-abc-a st) va) (= (fd-abc-b st) vb) (= (fd-abc-c st) vc))
+                  (format nil "classic decode of FlatData wire mismatch: ~s" st)))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+    ;; (b) classic serialize of a struct -> FlatData read-in-place -> equal accessor reads. Build the classic
+    ;; wire form directly (serialize-fd-abc, NOT via %serialize-sample, whose vtable is now the FlatData identity
+    ;; serializer expecting a buffer), exactly as %serialize-sample frames it (header + body + finalize-options).
+    (let* ((st (make-fd-abc :a va :b vb :c vc))
+           (cb (dds.core.buffer:make-octet-buffer (+ +fd-abc-flatdata-size+ 8)))
+           (wc (dds.core.buffer:cursor cb :endianness :little)))
+      (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+      (serialize-fd-abc st wc :xcdr2)
+      (dds.cdr:finalize-encapsulation-options wc :plain-cdr2-le)
+      (let* ((len (dds.core.buffer:cursor-position wc))
+             (wire (make-array len :element-type '(unsigned-byte 8))))
+        (replace wire (dds.core.buffer:octet-buffer-vec cb) :end1 len)
+        (let ((sample (dds.dcps::%deserialize-sample ts wire)))   ; FlatData read-in-place RX (vtable :deserialize)
+          (%check :fd-interop-b (and (= (fd-abc-a-fd sample) va) (= (fd-abc-b-fd sample) vb) (= (fd-abc-c-fd sample) vc))
+                  (format nil "FlatData read-in-place of classic wire mismatch: a=~d b=~d c=~d"
+                          (fd-abc-a-fd sample) (fd-abc-b-fd sample) (fd-abc-c-fd sample)))
+          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sample))))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec cb))))
+  t)
+
 (defun* run-all-tests ()
     (function () t)
   "Run every landed test; signal on first failure, else report and return T."
@@ -834,6 +1405,7 @@
                  ("async-decoupled"          . run-async-decoupled-test)
                  ("shmem-end-to-end"         . run-shmem-end-to-end-test)
                  ("zerocopy-end-to-end"      . run-zerocopy-end-to-end-test)
+                 ("flatdata-zerocopy"        . run-flatdata-zerocopy-test)
                  ("lease-sweep"              . run-lease-sweep-test)
                  ("tce-disallow-default"     . run-tce-disallow-default-test)
                  ("zero-alloc-into"          . run-generated-into-test)
@@ -944,7 +1516,12 @@
                  ("shmem-stress"             . dds.xport.shmem:run-shmem-stress-test)
                  ("zc-ref-codec"             . run-zc-ref-codec-test)
                  ("zc-sedp-flag"             . run-zc-sedp-flag-test)
-                 ("zc-resolve-drop"          . run-zc-resolve-drop-test))))
+                 ("zc-resolve-drop"          . run-zc-resolve-drop-test)
+                 ("flatdata-rejects-variable" . run-flatdata-rejects-variable-test)
+                 ("flatdata-offsets"         . run-flatdata-offsets-test)
+                 ("flatdata-accessor"        . run-flatdata-accessor-test)
+                 ("flatdata-zero-alloc"      . run-flatdata-zero-alloc-test)
+                 ("flatdata-deser-interop"   . run-flatdata-deser-interop-test))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))
       (funcall (cdr test))

@@ -1287,3 +1287,29 @@ from FR-PF-3 + the OMG DDSI-RTPS 2.5 spec only** — no RTI Connext source, head
   `*zerocopy-enabled*`-on ship. This entry records provenance for that review.
 - **No RTI Connext / Fast DDS / Cyclone / OpenDDS source, headers, or generated code**
   was read or copied for this work package.
+
+## M5 (2026-06-15) — WP-FLATDATA FlatData-equivalent fixed-size binding (FR-PF-4, ADR 0015)
+
+The `:flatdata t` codegen (`src/dds-gen/dsl.lisp` — compile-time XCDR2 Offset accessors, the
+`make-<name>-flatdata` constructor, identity `serialize` / read-in-place `deserialize`,
+`+<name>-flatdata-size+`, the `flatdata-layout`) and the FlatData-over-Zero-Copy single-copy RX
+(`src/dds-xport/zerocopy-pool.lisp` `%zc-resolve-fresh`; `src/dds-disc/dataplane.lisp`) are
+**clean-room from FR-PF-4 + the OMG XCDR (DDS-XTypes 1.3 / CDR) spec only** — **no RTI Connext
+source, headers, or `rtiddsgen` output** was consulted.
+
+- **Sources consulted**: the in-repo OMG DDS-XTypes 1.3 / XCDR spec (the PLAIN_CDR2 fixed-size
+  member layout + alignment rules already pinned for the existing serializer; the encap header +
+  OPTIONS trailing-pad rule, §7.6.3.1.2); the operating contract §4 (FR-PF-4 + NFR-PERF-7 feature
+  requirements). The buffer-equals-SerializedPayload identity, the compile-time constant-offset
+  fold, and the Offset-accessor get/`setf` pattern are this project's own design derived from first
+  principles and reuse the project's existing `cdr-size-align` / fixed-offset CDR primitives.
+- **No Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) / OpenDDS source was read** for this work
+  package — FlatData mirrors RTI's *patented* mechanism (R6), so the design was kept strictly to
+  the OMG XCDR layout + the project's own code; no other vendor's FlatData/zero-copy implementation
+  was consulted, and no RTI FlatData patent / whitepaper / header / source was read.
+- **NOT cleared for ship — pending counsel (R6).** FlatData is opt-in per type (`:flatdata t`); the
+  default codegen path is byte-identical to before. Counsel performs the authoritative claim
+  clearance before any FlatData type ships; this entry + ADR 0015 record provenance for that review.
+- Validated functionally + byte-exact against the engine's own serializer (the in-memory == wire
+  oracle), under fuzz (the untrusted-payload wrap, incl. a `(safety 0)` arm), and by an SBCL bench
+  (`bench/report/2026-06-14-wp-flatdata.md`) — none of which involves a vendor artifact.

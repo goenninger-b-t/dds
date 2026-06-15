@@ -490,16 +490,22 @@ shows `zc-sends = 0` — the writer correctly falls back to normal DATA — and 
 `disc-node-zc-sends` advanced, so the Zero-Copy figures are proven to have crossed as a reference. **Honest
 caveat (FR-LANG-7):** the v1 reader resolve over-allocates a slot-sized scratch sink per sample, so the
 per-sample *allocation* win only materializes once the sample approaches the slot size (64 KiB); at 4/16 KiB
-Zero-Copy conses more than SHMEM. Sizing the sink to the parsed length (cheap) and ultimately read-in-place
-(FlatData) turn the allocation win on at all sizes.
+Zero-Copy conses more than SHMEM. The follow-up landed: for a FlatData type the RX resolves the slot into a
+single exact-length owned vector (`%zc-resolve-fresh`, no slot-sized sink, no re-copy) — **~830x less RX GC
+than the v1 sink+re-copy** (`bench/report/2026-06-14-wp-flatdata.md`, `make bench-flatdata`). It is a SAFE
+SINGLE COPY out of SHMEM, **not** literal-0-copy (a Lisp octet-buffer cannot wrap a raw foreign SAP and the
+async off-thread read has no slot-aware release hook, so a literal-0-copy view would be a cross-process
+use-after-free; deferred — ADR 0015). The untrusted resolve clamp is fuzzed with forged recorded-len /
+generation / slot-index (`make fuzz`): the result is always NIL or clamped to slot-bytes, never an OOB.
 
 `make zc-xproc` (`scripts/zerocopy-roundtrip.sh`, `dds.shapes:run-zc-xproc-pub`/`run-zc-xproc-sub`) launches two
 **separate SBCL OS processes** that discover over loopback UDP and exchange large `LargeData` samples; the
 publisher stores each in its pool and sends only a reference, and the subscriber resolves it from the writer's
 pool **cross-process** and verifies the payload byte-exact (PASS = sub received ≥ threshold byte-exact AND the
 pub's `zc-sends > 0`). This is the proof a within-image test cannot give: the reference resolves across the OS
-boundary. SBCL only (Clasp/macOS inherits the SHMEM by-name-attach gap). **Reliable Zero-Copy and literal
-read-in-place / FlatData are follow-ups (out of scope v1).**
+boundary. SBCL only (Clasp/macOS inherits the SHMEM by-name-attach gap). **FlatData-over-Zero-Copy RX landed
+2026-06-14 as a SAFE SINGLE COPY (FR-PF-4, ADR 0015) — see the type system wiki; literal-0-copy RX and reliable
+Zero-Copy remain follow-ups.**
 
 ### NFR-PORT gap — Clasp/macOS-arm64
 
@@ -524,7 +530,13 @@ affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and fore
   sample-pool + 16-byte-reference passing for large same-host samples, behind `dds.disc:*zerocopy-enabled*`
   (default `NIL`) and **NOT cleared for ship pending counsel (R6, ADR 0014)**. See
   [Zero-Copy over SHMEM](#zero-copy-over-shmem-wp-zerocopy--default-off-r6-patent-gated) above.
-- **Planned:** literal 0-copy read-in-place (WP-FLATDATA), reliable Zero-Copy, a TCP transport, a Linux
+- **Landed (gated, default-OFF):** FlatData-equivalent for FINAL fixed-size **NO_KEY** types (WP-FLATDATA,
+  FR-PF-4, ADR 0015; a `@key` member is a compile-time error in v1) — in-memory == XCDR2 wire, Offset accessors,
+  identity serialize (0-alloc TX), and a SAFE SINGLE-COPY RX over Zero-Copy (~830x less RX GC than the v1
+  sink+re-copy; **literal-0-copy deferred** — it needs an engine-contract change). **NOT cleared for ship
+  pending counsel (R6).** See the [type system wiki](type-system.md#8-flatdata--flatdata-t-offset-accessors-final-fixed-size-no_key-v1-r6-not-cleared-for-ship). The untrusted wrap/read + ZC resolve clamp
+  are fuzzed (`make fuzz`).
+- **Planned:** literal 0-copy read-in-place (the SAP-backed FlatData RX view), reliable Zero-Copy, a TCP transport, a Linux
   `futex` notification fast-path for SHMEM, a lock-free-MPSC ring, and a raw `recvmmsg`/`sendmmsg`/iovec batched
   send/recv fast path. The UDP send is one datagram per `socket-send` (small samples are coalesced first).
 - **Per-impl rule:** `#+sbcl`/`#+clasp` reader conditionals live **only** under `dds-pal/` (`pal-sbcl.lisp` and

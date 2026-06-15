@@ -504,7 +504,13 @@
    destination and a DATA with readerId UNKNOWN is processed ONCE by that participant's receiver
    (%on-user-data -> one %zc-release), regardless of how many reader endpoints are co-located there — so
    refcount 1 frees the slot after that single resolve (refcount = the matched-reader COUNT would leak the
-   slot when a destination has >1 ZC reader endpoint). Bumps zc-sends. NOT cleared for ship — counsel (R6)."
+   slot when a destination has >1 ZC reader endpoint). Bumps zc-sends. WP-FLATDATA-over-ZC (FR-PF-4, ADR
+   0015): for a FlatData type the published PAYLOAD already IS the FlatData SerializedPayload (the type's
+   serialize=IDENTITY block-copy ran once in %serialize-sample), so loaning it here is %zc-loan's single
+   app-buffer->slot copy with NO per-field re-serialize — there is no second serialization on the FlatData
+   TX path. (That remaining app->slot copy is the documented v1 limitation; a loan-write API that writes
+   the sample straight into the slot is the explicit follow-up — out of scope here. The Phase-D 0-copy win
+   is on RX.) NOT cleared for ship — counsel (R6)."
   (multiple-value-bind (slot gen)
       (dds.xport.zerocopy::%zc-loan (disc-node-zc-pool-sap node) payload off len resolves)
     (when slot
@@ -779,13 +785,22 @@
 (defun* %zc-try-resolve (node buf poff plen src-prefix)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) (integer 0)
               (simple-array (unsigned-byte 8) (12))) t)
-  "WP-ZEROCOPY reader side (FR-PF-3, ADR 0014): test the DATA SerializedPayload at BUF[poff,poff+plen)
-   for a 16-byte zero-copy reference. Returns :NOT-A-REF for a normal payload (the caller delivers it
-   unchanged); a fresh (simple-array (unsigned-byte 8)) holding the RESOLVED serialized payload on a valid
-   ref (attach the writer pool, %zc-resolve under its mutex, %zc-release); or NIL when it IS a ref but
-   resolution fails (stale/forced-reclaimed/OOB/attach-fail) — best-effort DROP, no delivery, no crash.
-   The ref is UNTRUSTED cross-process input: parse-zc-reference bounds-checks the payload region and
-   %zc-resolve bounds-checks slot-index + validates generation against the slot header (NFR-SEC-POSTURE)."
+  "WP-ZEROCOPY / WP-FLATDATA reader side (FR-PF-3/4, ADR 0014/0015; NOT cleared for ship — pending counsel
+   R6): test the DATA SerializedPayload at BUF[poff,poff+plen) for a 16-byte zero-copy reference. Returns
+   :NOT-A-REF for a normal payload (the caller delivers it unchanged); a fresh (simple-array (unsigned-byte 8))
+   holding the RESOLVED serialized payload on a valid ref; or NIL when it IS a ref but resolution fails
+   (stale/forced-reclaimed/OOB/attach-fail) — best-effort DROP, no delivery, no crash. READ-THEN-RELEASE
+   lifetime (the Phase-D crux): the resolved payload is read IN PLACE from the writer's SHMEM pool slot
+   straight into a fresh exact-length node-OWNED vector under the slot mutex (%zc-resolve-fresh — a SINGLE
+   intra-host copy; the WP-ZEROCOPY v1 resolve-into-slot-sized-sink-then-re-copy is gone), then the slot is
+   %zc-released IMMEDIATELY. The slot's cross-process lifetime therefore ends here and never spans the app's
+   later (other-thread, %drain/read) access — so a writer force-reclaim cannot corrupt a delivered sample
+   (no cross-process use-after-free). A literal-0-copy SHMEM VIEW handed to the reader is NOT done in v1 and
+   would be unsafe here: this stack delivers samples into an async store read on another thread with no
+   slot-aware release hook, and an octet-buffer cannot wrap a raw foreign SAP (the FlatData accessors need a
+   Lisp simple-array) — see ADR 0015. The ref is UNTRUSTED cross-process input: parse-zc-reference
+   bounds-checks the payload region and %zc-resolve-fresh clamps the copy to the fixed slot-bytes + validates
+   generation against the slot header (NFR-SEC-POSTURE: never OOB into SHMEM)."
   (multiple-value-bind (slot gen slot-bytes)
       (dds.cdr:parse-zc-reference (dds.core.buffer:octet-buffer-vec buf) poff plen)
     (declare (ignore slot-bytes))
@@ -793,13 +808,16 @@
         :not-a-ref
         (let ((sap (%zc-attach-pool node src-prefix)))
           (when sap
-            (let* ((sink (make-array +zerocopy-pool-slot-bytes+ :element-type '(unsigned-byte 8)))
-                   (len (dds.xport.zerocopy::%zc-resolve sap slot gen sink)))
-              (dds.xport.zerocopy::%zc-release sap slot gen)   ; decrement refcount (frees the slot at 0); no-op if already stale
-              (when len
-                (let ((vec (make-array len :element-type '(unsigned-byte 8))))
-                  (replace vec sink :end2 len)
-                  vec))))))))
+            ;; READ-THEN-RELEASE (the WP-FLATDATA-over-ZC single-copy RX path): %zc-resolve-fresh reads the
+            ;; slot IN PLACE straight into a freshly-allocated, exact-payload-length owned vector under one
+            ;; mutex acquisition (no slot-sized scratch sink + re-copy, as WP-ZEROCOPY v1 did), then we
+            ;; %zc-release the slot IMMEDIATELY. The payload now lives in a node-owned Lisp vector, so the
+            ;; slot's cross-process lifetime ends here and does NOT span the app's later (other-thread,
+            ;; %drain) read — no cross-process use-after-free. The copy is clamped to the fixed slot-bytes,
+            ;; never OOB into SHMEM (NFR-SEC-POSTURE).
+            (let ((vec (dds.xport.zerocopy::%zc-resolve-fresh sap slot gen)))
+              (dds.xport.zerocopy::%zc-release sap slot gen)   ; release now: bytes already copied into the owned VEC
+              vec))))))
 
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))

@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -174,6 +174,14 @@ bench-zerocopy:
 	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
 	        --eval '(uiop:symbol-call :dds.bench :run-bench-zerocopy)' \
 	        --eval '(uiop:quit 0)'
+
+# WP-FLATDATA Phase E1a (FR-PF-4, NFR-PERF-7, FR-LANG-7): HONEST ser/deser/accessor cost of a FINAL
+# fixed-size FlatData type vs the classic per-field codec, plus the FlatData-over-ZC RX (safe single
+# copy out of SHMEM, ~830x less than WP-ZEROCOPY-v1 — NOT literal-0-copy). Lives in dds-tests (needs
+# the dds-gen FlatData type); writes bench/report/2026-06-14-wp-flatdata.md. NOT cleared for ship (R6).
+bench-flatdata:
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata :file "bench/report/2026-06-14-wp-flatdata.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-SHMEM Task F1 (FR-XPORT-2): REAL two-OS-process cross-process SHMEM round-trip.
 # Two SEPARATE SBCL processes discover over loopback UDP (:peers, no multicast) and the

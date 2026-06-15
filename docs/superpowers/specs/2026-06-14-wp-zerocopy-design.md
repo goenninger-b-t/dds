@@ -2,9 +2,11 @@
 
 **Goal (FR-PF-3).** A writer places samples in a SHMEM sample-pool it owns and transmits a small (~16-byte)
 **reference** instead of the payload; a same-host reader maps the pool and reads the sample from the slot;
-**loan/return** sample-pool ownership. v1 delivers the **mechanism** (pool + ref-passing + loan/return);
-literal 0-copy *read-in-place* (no deserialize) arrives with WP-FLATDATA (FR-PF-4), which flips the slot to
-a foreign layout the reader accesses via Offset accessors.
+**loan/return** sample-pool ownership. v1 delivers the **mechanism** (pool + ref-passing + loan/return).
+*(SUPERSEDED — see ADR 0015 "Phase D outcome": the original expectation that "literal 0-copy read-in-place
+arrives with WP-FLATDATA" did NOT hold; WP-FLATDATA shipped a **safe SINGLE copy** out of SHMEM (~830× RX win),
+and literal-0-copy read-in-place remains **deferred**, needing an engine-contract change — SAP-backed accessors
++ a refcount-spanning ZC-aware read path.)*
 
 ## R6 — PATENT GATE (the defining constraint)
 FR-PF-3 mirrors RTI's patented Zero-Copy mechanism (REQUIREMENTS §NFR-IP; IMPLEMENTATION-PLAN R6). Owner

@@ -19,6 +19,9 @@
            #:type-support-sample-pool-alloc #:type-support-sample-pool-free
            #:type-support-flatdata-offset #:type-support-flatdata-builder
            #:type-support-data-representation-mask #:type-support-field-accessors
+           ;; WP-FLATDATA fixed-size layout (FR-PF-4, ADR 0015; R6)
+           #:flatdata-layout #:make-flatdata-layout #:flatdata-layout-p
+           #:flatdata-layout-size #:flatdata-layout-encap-offset #:flatdata-layout-fields
            #:register-type #:find-type-support #:registered-type-names
            #:sample-pool #:make-sample-pool #:sample-pool-acquire #:sample-pool-release
            ;; XTypes structural TypeIdentifier / TypeObject model (FR-TYPE-2)

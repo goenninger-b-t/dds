@@ -83,6 +83,56 @@
         (setf pos (* (ceiling pos a) a))
         (incf pos (getf m :size))))))
 
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
+(defun* %flatdata-offsets (parsed)
+    (function (list) (values list (integer 0)))
+  "(values ((slot . body-offset) ...) total-body-size) for FINAL fixed-size scalar members, using the same
+   XCDR2 alignment rule as %ssize (cdr-size-align, max-align 4 per FR-CDR-2) constant-folded. The body is NOT
+   tail-padded: the engine's serialize-<name> writes an unpadded FINAL struct and records the trailing pad to
+   the next 4-byte boundary in the encapsulation OPTIONS field (finalize-encapsulation-options), so the true
+   SerializedPayload body length is the last member's end, not the next 4-multiple. The byte-exact test
+   (in-memory == classic serialize) is the oracle. NOT cleared for ship — pending counsel (R6)."
+  (let ((pos 0) (out '()))
+    (dolist (m parsed)
+      (let ((a (min (getf m :align) 4)))
+        (setf pos (* (ceiling pos a) a))
+        (push (cons (getf m :slot) pos) out)
+        (incf pos (getf m :size))))
+    (values (nreverse out) pos)))
+
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
+(defun* %flatdata-field-kind (m)
+    (function (list) (values (integer 1 8) t t))
+  "(values nbytes signed-p bool-p) for a fixed-size scalar member plist M, so the FlatData accessor mirrors
+   the exact cdr-put-/cdr-get- XCDR2-LE encoding (two's-complement for signed, 1/0 for bool). NBYTES is read
+   from (getf M :size) — the one width table in *dds-type-map* via %parse-member (DRY) — so only the bool-p /
+   signed-p distinction is decided here. The byte-exact test is the oracle. NOT cleared for ship (R6)."
+  (let ((nbytes (getf m :size)))
+    (ecase (getf m :dds-type)
+      (:bool (values nbytes nil t))
+      ((:u8 :byte :octet :u16 :u32 :u64) (values nbytes nil nil))
+      ((:i8 :i16 :i32 :i64) (values nbytes t nil)))))
+
+(defun* %flatdata-getter-form (vec base nbytes signed-p bool-p)
+    (function (symbol (integer 0) (integer 1 8) t t) t)
+  "Macro-time: a 0-alloc form reading an NBYTES XCDR2-LE field at VEC[BASE..], two's-complement if SIGNED-P,
+   /=0 boolean if BOOL-P. Direct (aref VEC ...) — no cursor, no consing. NOT cleared for ship (R6)."
+  (let ((raw `(logior ,@(loop for i below nbytes
+                              collect `(ash (aref ,vec ,(+ base i)) ,(* 8 i))))))
+    (cond (bool-p `(/= 0 ,raw))
+          (signed-p `(let ((u ,raw)) (if (>= u ,(ash 1 (1- (* 8 nbytes)))) (- u ,(ash 1 (* 8 nbytes))) u)))
+          (t raw))))
+
+(defun* %flatdata-setter-form (vec base nbytes bool-p val)
+    (function (symbol (integer 0) (integer 1 8) t symbol) t)
+  "Macro-time: a 0-alloc form writing VAL as an NBYTES XCDR2-LE field at VEC[BASE..] (two's-complement reduced
+   via LDB; bool 1/0). Direct (setf (aref VEC ...)) — no cursor, no consing. NOT cleared for ship (R6)."
+  (let ((u (if bool-p `(if ,val 1 0) val)))
+    `(let ((u ,u))
+       ,@(loop for i below nbytes
+               collect `(setf (aref ,vec ,(+ base i)) (ldb (byte 8 ,(* 8 i)) u)))
+       ,val)))
+
 (defmacro define-dds-type (name options &body members)
   "Define a DDS topic type NAME from an s-expr spec. OPTIONS is a plist (only
    :extensibility, default :final, in v1). Each MEMBER is (slot-name member-type
@@ -103,12 +153,34 @@
          (keys (remove-if-not (lambda (m) (getf m :key)) parsed))
          (keymax (%key-max-size keys))
          (key-direct-p (and (integerp keymax) (<= keymax 16)))
+         (flatp (and (getf options :flatdata) t))
+         (fd-size-sym (%sym pkg "+" (string name) "-FLATDATA-SIZE+"))
+         (fd-ctor (%sym pkg "MAKE-" (string name) "-FLATDATA"))
+         (fd-ser (%sym pkg "SERIALIZE-" (string name) "-FD"))
+         (fd-des (%sym pkg "DESERIALIZE-" (string name) "-FD"))
+         (fd-dnto (%sym pkg "DESERIALIZE-INTO-" (string name) "-FD"))
+         (fd-ssz (%sym pkg "SERIALIZED-SIZE-" (string name) "-FD"))
          (tname (string-downcase (string name))))
     (unless (eq ext :final)
       (error "define-dds-type: only :final extensibility is supported in v1 (got ~s)" ext))
+    ;; FlatData v1 gate: :flatdata t requires every member to be a fixed-size scalar (FR-PF-4, ADR 0015)
+    (when (getf options :flatdata)
+      (when (some (lambda (m) (or (getf m :var) (not (eq (getf m :kind) :scalar)))) parsed)
+        (error "define-dds-type: :flatdata v1 requires FINAL + fixed-size scalar members (no string/sequence/nested/variable); got ~s"
+               (find-if (lambda (m) (or (getf m :var) (not (eq (getf m :kind) :scalar)))) parsed)))
+      ;; FlatData v1 is NO_KEY only: the FlatData sample is the octet-buffer, but the keyhash/instance path
+      ;; (%instance-handle -> key-hash-<name>) reads keys from a <name> STRUCT. A keyed-FlatData keyhash that
+      ;; reads keys from the buffer at the key offsets is a follow-up (Phase C report flag), so reject @key here.
+      (when keys
+        (error "define-dds-type: :flatdata v1 is NO_KEY only (the FlatData sample is the octet-buffer, not a struct, so the @key/keyhash path cannot read it); got @key member(s) ~s"
+               (mapcar (lambda (m) (getf m :slot)) keys))))
     (when (some (lambda (m) (not (eq (getf m :kind) :scalar))) keys)
       (error "define-dds-type: only scalar/string @key members are supported in v1"))
-    (flet ((acc (m) (%sym pkg (string name) "-" (string (getf m :slot)))))
+    (multiple-value-bind (fd-offs fd-body) (when flatp (%flatdata-offsets parsed))
+      (declare (ignorable fd-offs fd-body))
+    (flet ((acc (m) (%sym pkg (string name) "-" (string (getf m :slot))))
+           (fd-acc (m) (%sym pkg (string name) "-" (string (getf m :slot)) "-FD")))
+      (declare (ignorable #'fd-acc))
       `(progn
          (defstruct (,name (:constructor ,ctor))
            ,@(loop for m in parsed
@@ -188,17 +260,158 @@
                             `(replace out (dds.core.md5:md5 (subseq vec 0 len))))))
                    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
                    out))))
+         ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
+         ,@(when flatp
+             (let ((fd-total (+ 4 fd-body)))
+               `((defconstant ,fd-size-sym ,fd-total
+                   ,(format nil "WP-FLATDATA total SerializedPayload size for ~a = 4 (XCDR2 encap header) ~
+                     + ~d (unpadded fixed XCDR2-LE body); equals the engine's SerializedPayload length for ~
+                     this type (%serialize-sample / serialize-~a). The FINAL body is NOT tail-padded — any ~
+                     trailing pad to the next 4-byte boundary is carried in the encapsulation OPTIONS field, ~
+                     not as body octets (FR-PF-4, ADR 0015; R6)."
+                            tname fd-body tname))
+                 ,@(loop for m in parsed
+                         for off = (cdr (assoc (getf m :slot) fd-offs))
+                         for base = (+ 4 off)
+                         append
+                         (multiple-value-bind (nbytes signed-p bool-p)
+                             (%flatdata-field-kind m)
+                           `((declaim (ftype (function (dds.core.buffer:octet-buffer) ,(getf m :ltype))
+                                             ,(fd-acc m)))
+                             (defun ,(fd-acc m) (buf)
+                               ,(format nil "WP-FLATDATA Offset getter: read member ~a in place at body offset ~
+                                 ~d (buffer offset ~d), XCDR2-LE, 0-alloc raw SAP/vec access (no cursor, no ~
+                                 consing). NOT cleared for ship — pending counsel (R6)." (getf m :slot) off base)
+                               (dds.pal:with-hot-optimizations
+                                 (let ((vec (dds.core.buffer:octet-buffer-vec buf)))
+                                   (declare (type (simple-array (unsigned-byte 8) (*)) vec))
+                                   ,(%flatdata-getter-form 'vec base nbytes signed-p bool-p))))
+                             (declaim (ftype (function (,(getf m :ltype) dds.core.buffer:octet-buffer)
+                                                       ,(getf m :ltype)) (setf ,(fd-acc m))))
+                             (defun (setf ,(fd-acc m)) (v buf)
+                               ,(format nil "WP-FLATDATA Offset setter: write member ~a in place at body offset ~
+                                 ~d (buffer offset ~d), XCDR2-LE, 0-alloc raw SAP/vec access (no cursor, no ~
+                                 consing). NOT cleared for ship — pending counsel (R6)." (getf m :slot) off base)
+                               (dds.pal:with-hot-optimizations
+                                 (let ((vec (dds.core.buffer:octet-buffer-vec buf)))
+                                   (declare (type (simple-array (unsigned-byte 8) (*)) vec))
+                                   ,(%flatdata-setter-form 'vec base nbytes bool-p 'v)))))))
+                 (declaim (ftype (function () dds.core.buffer:octet-buffer) ,fd-ctor))
+                 (defun ,fd-ctor ()
+                   ,(format nil "WP-FLATDATA constructor: allocate a ~a-octet foreign octet-buffer (the sample IS ~
+                     the SerializedPayload) and write the 4-octet XCDR2-LE (PLAIN_CDR2_LE) encapsulation header ~
+                     the engine uses, with the OPTIONS trailing-pad bits set IDENTICALLY to %serialize-sample ~
+                     (via finalize-encapsulation-options at the body end) so a non-4-aligned body matches the ~
+                     engine byte-for-byte; return the buffer. NOT cleared for ship — pending counsel (R6)."
+                            (symbol-name fd-size-sym))
+                   (let* ((buf (dds.core.buffer:make-octet-buffer ,fd-size-sym))
+                          (wc (dds.core.buffer:cursor buf :endianness :little)))
+                     (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+                     (dds.core.buffer:cursor-set-position wc ,fd-size-sym)
+                     (dds.cdr:finalize-encapsulation-options wc :plain-cdr2-le)
+                     buf))
+                 (declaim (ftype (function (dds.core.buffer:octet-buffer dds.core.buffer:cursor &optional symbol)
+                                           dds.core.buffer:octet-buffer)
+                                 ,fd-ser))
+                 (defun ,fd-ser (sample cursor &optional (mode :xcdr2))
+                   ,(format nil "WP-FLATDATA serialize=IDENTITY (TX, type-support :serialize, same signature as ~
+                     serialize-~a but SAMPLE is the FlatData octet-buffer): block-copy the body bytes [4,~a) of ~
+                     the FlatData buffer into the engine's write CURSOR — NO per-field encoding, 0-alloc (put-octets ~
+                     = replace). The engine (%serialize-sample) has already written the 4-octet XCDR2-LE encap ~
+                     header into CURSOR and reset its origin to 4, then calls this for the body only; the copied ~
+                     body is byte-identical to serialize-~a (proven byte-exact, Phase B). MODE is accepted+ignored ~
+                     (a FlatData buffer is already XCDR2-LE). NOT cleared for ship — pending counsel (R6); see ADR 0015."
+                            tname (symbol-name fd-size-sym) tname)
+                   (declare (ignore mode))
+                   (dds.pal:with-hot-optimizations
+                     (dds.core.buffer:put-octets cursor (dds.core.buffer:octet-buffer-vec sample)
+                                                 4 ,fd-body))
+                   sample)
+                 (declaim (ftype (function (dds.core.buffer:octet-buffer &optional symbol) (integer 0)) ,fd-ssz))
+                 (defun ,fd-ssz (sample &optional (mode :xcdr2))
+                   ,(format nil "WP-FLATDATA serialized BODY size (type-support :serialized-size): the constant ~
+                     unpadded XCDR2-LE body length ~d (= ~a - 4), which the engine adds the 4-octet header to. ~
+                     SAMPLE (the FlatData octet-buffer) + MODE are accepted+ignored — the size is a per-TYPE ~
+                     constant. NOT cleared for ship — pending counsel (R6); see ADR 0015." fd-body (symbol-name fd-size-sym))
+                   (declare (ignore sample mode))
+                   ,fd-body)
+                 (declaim (ftype (function (dds.core.buffer:octet-buffer dds.core.buffer:cursor &optional symbol)
+                                           dds.core.buffer:octet-buffer)
+                                 ,fd-dnto))
+                 (defun ,fd-dnto (target cursor &optional (mode :xcdr2))
+                   ,(format nil "WP-FLATDATA deserialize=READ-IN-PLACE into a PRE-LOANED FlatData buffer TARGET ~
+                     (the 0-ALLOC RX path, parallel to deserialize-into-~a): validate then block-copy the received ~
+                     payload body into TARGET — NO per-field decode, 0-alloc (TARGET is loaned, e.g. from a pool). ~
+                     CURSOR is positioned by the engine at body offset 4 over the received payload. ~
+                     FALSE-REJECT-SAFE VALIDATION FIRST (NFR-SEC-POSTURE + the no-false-REJECT rule): the available ~
+                     payload length (cursor-buffer capacity) MUST be >= ~a — NOT == — so a conforming/trailing- ~
+                     padded peer payload that is LONGER is accepted; reject (signal) only if too SHORT to contain ~
+                     every field (which would risk an OOB accessor read), and re-confirm the encap id is XCDR2-LE ~
+                     (PLAIN_CDR2_LE 0x0007, NBO) at vec[0..1]; bounds-checked even at (safety 0). Copies only ~
+                     [4,~a) (the header+OPTIONS in TARGET were written by make-~a-flatdata). Returns TARGET. ~
+                     NOT cleared for ship — pending counsel (R6); see ADR 0015." tname (symbol-name fd-size-sym)
+                            (symbol-name fd-size-sym) tname)
+                   (declare (ignore mode))
+                   (dds.pal:with-hot-optimizations
+                     (let* ((src-buf (dds.core.buffer:cursor-buffer cursor))
+                            (src (dds.core.buffer:octet-buffer-vec src-buf))
+                            (avail (dds.core.buffer:octet-buffer-capacity src-buf))
+                            (dst (dds.core.buffer:octet-buffer-vec target)))
+                       (declare (type (simple-array (unsigned-byte 8) (*)) src dst))
+                       ;; false-REJECT-safe: too SHORT to hold all fields -> reject (never OOB); LONGER is fine (>=).
+                       (when (< avail ,fd-size-sym)
+                         (error 'dds.core.buffer:buffer-overflow :need ,fd-size-sym :have avail))
+                       ;; re-confirm XCDR2-LE (PLAIN_CDR2_LE 0x0007, NBO) — never read-in-place a foreign representation.
+                       (unless (and (= (aref src 0) #x00) (= (aref src 1) #x07))
+                         (error 'dds.cdr:cdr-not-implemented
+                                :what (format nil "FlatData ~a: expected PLAIN_CDR2_LE encap id 0x0007, got #x~2,'0x~2,'0x"
+                                              ,tname (aref src 0) (aref src 1))))
+                       ;; 0-per-field-work body copy into the loaned FlatData buffer (header+OPTIONS already there).
+                       (replace dst src :start1 4 :end1 ,fd-size-sym :start2 4 :end2 ,fd-size-sym)
+                       target)))
+                 (declaim (ftype (function (dds.core.buffer:cursor &optional symbol) dds.core.buffer:octet-buffer)
+                                 ,fd-des))
+                 (defun ,fd-des (cursor &optional (mode :xcdr2))
+                   ,(format nil "WP-FLATDATA deserialize=READ-IN-PLACE (RX, type-support :deserialize, same ~
+                     signature as deserialize-~a): wrap the received payload as a fresh FlatData ~a-octet sample the ~
+                     Offset accessors read at 4+offset, with NO per-field decode. The engine (%deserialize-sample) ~
+                     has parsed the encap header and positioned CURSOR at body offset 4. Allocates a fresh FlatData ~
+                     buffer (make-~a-flatdata) — matching the classic :deserialize vtable contract, which also ~
+                     returns a freshly-allocated sample — then delegates the false-REJECT-safe validation + 0-per- ~
+                     field-work body copy to deserialize-into-~a-fd (DRY). PHASE-C/D COPY (engine-contract gap): ~
+                     %deserialize-sample frees the RX buffer immediately after this returns, so a true 0-copy view ~
+                     would be use-after-free; Phase D confirmed a literal-0-copy SHMEM-slot view is NOT safe in v1 ~
+                     either (async store read off-thread with no slot-aware release hook + an octet-buffer cannot ~
+                     wrap a raw foreign SAP), so ZC RX is a SINGLE copy into an owned vector (ADR 0015 Phase D ~
+                     outcome). The 0-ALLOC steady-state RX path is deserialize-into-~a-fd (copy into a loaned buffer). MODE ignored. ~
+                     NOT cleared for ship — pending counsel (R6); see ADR 0015." tname (symbol-name fd-size-sym)
+                            tname tname tname)
+                   (,fd-dnto (,fd-ctor) cursor mode)))))
          (let ((%pool (dds.types:make-sample-pool (function ,ctor) ,*sample-pool-capacity*)))
            (dds.types:register-type
             (dds.types:make-type-support
              :name ,tname :type-name ,tname :extensibility ,ext
              :keyed-p ,(and keys t)
-             :serialize (function ,ser)
-             :deserialize (function ,des)
-             :serialized-size (function ,ssz)
+             ;; WP-FLATDATA: for a :flatdata type the engine's vtable funcalls the FlatData serialize=identity /
+             ;; deserialize=read-in-place / constant serialized-size instead of the classic per-field codecs
+             ;; (the engine hot path is unchanged — only these pointers swap); the classic ser/des/ssz stay
+             ;; emitted for interop/non-FlatData use. NO_KEY only in v1 (gated above), so no key-hash. (R6, ADR 0015.)
+             :serialize (function ,(if flatp fd-ser ser))
+             :deserialize (function ,(if flatp fd-des des))
+             :serialized-size (function ,(if flatp fd-ssz ssz))
              :key-hash ,(when keys `(function ,khf))
              :sample-pool-alloc (lambda () (dds.types:sample-pool-acquire %pool))
              :sample-pool-free (lambda (s) (dds.types:sample-pool-release %pool s))
+             ;; WP-FLATDATA fixed-size layout (FR-PF-4, ADR 0015; R6); NIL for non-FlatData types.
+             :flatdata-offset
+             ,(when flatp
+                `(dds.types:make-flatdata-layout
+                  :size ,fd-size-sym
+                  :fields (list ,@(loop for m in parsed
+                                        for off = (cdr (assoc (getf m :slot) fd-offs))
+                                        collect `(list ,(string-downcase (string (getf m :slot)))
+                                                       ,off (function ,(fd-acc m))
+                                                       (function (setf ,(fd-acc m))))))))
              ;; (field-name . accessor) per scalar/string member for content filters
              ;; (FR-DCPS-5, ADR 0008); sequence/nested members are not filterable in v1.
              :field-accessors
@@ -230,4 +443,4 @@
                                                      (dds.types:find-type-support
                                                       ,(getf m :type-name))))))
                                       ,@(when (getf m :key) '(:key-p t)))))))))
-         ',name))))
+         ',name)))))

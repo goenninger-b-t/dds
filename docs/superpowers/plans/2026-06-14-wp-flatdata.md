@@ -4,7 +4,16 @@
 
 > **AFK / R6 GATE:** Written autonomously (owner AFK, 2026-06-14) as the design package for review. **Do NOT execute (write feature code) until the owner has reviewed + approved the spec `docs/superpowers/specs/2026-06-14-wp-flatdata-design.md` + this plan** (brainstorming HARD-GATE; FlatData is R6 patent-gated). Every new FlatData symbol/file carries `;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.` Clean-room from FR-PF-4 + the OMG XCDR spec; no RTI source. No AI attribution.
 
-**Goal:** For a `:flatdata t`-annotated FINAL all-fixed-size type, the in-memory buffer == the XCDR2 SerializedPayload; the compiler emits Offset accessors (read/modify in place); serialize/deserialize cost is zero (NFR-PERF-7); composed with WP-ZEROCOPY the reader reads fields from the writer's SHMEM slot with literal 0 copies.
+> **SUPERSEDED IN PART (as-built) — see ADR 0015 "Phase D outcome".** This is the pre-implementation plan.
+> Phase D found the **literal-0-copy RX** target (in the Goal, the Architecture, and Phase D below) is **NOT
+> safely achievable in v1** (octet-buffer can't wrap a raw SAP; async off-thread read has no slot-aware release
+> hook; force-reclaim would overwrite a held view → cross-process UAF). **As-built:** TX serialize is 0-alloc
+> identity (shipped as planned); RX is a **safe single copy out of SHMEM (~830×** less RX allocation than the
+> WP-ZEROCOPY-v1 sink+re-copy), **NOT** literal-0-copy; the engine-visible non-ZC `deserialize` copies one
+> buffer/sample (0 per-field decode, not 0-alloc). v1 is **NO_KEY** only. Read every "literal 0 copies" / "0-copy"
+> / "cost is zero" claim below as the deferred design intent, superseded by the single-copy as-built result.
+
+**Goal:** For a `:flatdata t`-annotated FINAL all-fixed-size type, the in-memory buffer == the XCDR2 SerializedPayload; the compiler emits Offset accessors (read/modify in place); serialize/deserialize cost is zero (NFR-PERF-7); composed with WP-ZEROCOPY the reader reads fields from the writer's SHMEM slot with literal 0 copies. *(SUPERSEDED — see the banner above: TX 0-alloc identity shipped; RX is a safe single copy ~830×, not literal-0-copy.)*
 
 **Architecture:** Extend `define-dds-type` (dds-gen/dsl.lisp): for `:flatdata t` + all-fixed-size-scalar members, compute compile-time XCDR2 field offsets (fold the existing `cdr-size-align` rules at macro time), emit `<name>-<field>-fd` get/`setf` accessors over a foreign buffer at `4 + offset` (4 = encapsulation header), a `make-<name>-flatdata` constructor, and a `flatdata-layout` in the type-support `flatdata-offset` hook. serialize=identity, deserialize=read-in-place. The ZC writer pools the FlatData buffer directly (no serialize); the ZC reader hands the slot SAP to the app via accessors (no deserialize copy).
 
@@ -91,13 +100,13 @@
 
 ---
 
-# Phase D — WP-ZEROCOPY read-in-place integration (literal 0-copy)
+# Phase D — WP-ZEROCOPY read-in-place integration (as-built: safe SINGLE copy, ~830×; literal-0-copy SUPERSEDED → deferred, see ADR 0015 Phase-D outcome)
 
 ### Task D1: ZC writer pools the FlatData buffer directly; ZC reader reads the slot in place
 **Files:** Modify `src/dds-disc/dataplane.lisp` (the `%zc-change-item` writer hook + the `%on-user-data` reader resolve).
 - [ ] **Writer:** when the matched type is FlatData (`type-support-flatdata-offset` non-nil) AND ZC is engaged, the published `payload` IS already the FlatData SerializedPayload → store it in the pool slot with **no extra serialize/copy** (it already is the bytes). (Mostly already true since publish-sample gets the serialized payload; assert no double-serialize for FlatData.)
-- [ ] **Reader:** when resolving a zc-ref for a FlatData type, instead of copying the slot payload into a fresh sink vector (the WP-ZEROCOPY v1 behavior), hand the **slot SAP region directly** to the on-data delivery as a read-in-place FlatData sample (the app reads fields via the Offset accessors on the slot SAP) — **0 copy**. Bounds: validate `slot len == +<type>-flatdata-size+` before exposing (untrusted; fixed size). Release the slot AFTER the app is done reading (the loan lifetime extends across the read — for best-effort v1, the refcount holds the slot until release; document the read-then-release ordering so the slot isn't force-reclaimed mid-read — the generation guard already catches it).
-- [ ] **Test** `run-flatdata-zerocopy-test` (register, SBCL; pass-skip Clasp/macOS): a FlatData type over ZC end-to-end → the reader reads fields correctly from the slot AND the per-sample bytes-consed drops to ~0 (vs the WP-ZEROCOPY-only deserialize-into-sink). This is the headline NFR-PERF-7 + 0-intra-host-copy result. Commit `feat(disc): WP-FLATDATA over Zero-Copy — reader reads slot in place, 0 copies (FR-PF-3/4, NFR-PERF-7, R6)`
+- [ ] **Reader:** when resolving a zc-ref for a FlatData type, instead of copying the slot payload into a slot-sized sink + re-copy (the WP-ZEROCOPY v1 behavior), read the slot in place into **one exact-length owned vector** (`%zc-resolve-fresh`) and release the slot immediately. *(SUPERSEDED — the original "hand the slot SAP region directly to the app … 0 copy" is NOT safely achievable in v1: an octet-buffer can't wrap a raw foreign SAP, the async off-thread read has no slot-aware release hook, and force-reclaim would overwrite a held view → cross-process UAF. As-built = a safe SINGLE copy, ~830× less RX allocation, NOT literal-0-copy; see ADR 0015 Phase-D outcome.)* Bounds (untrusted): validate `slot/payload len >= +<type>-flatdata-size+` — **`>=`, not `==`** (false-REJECT-safe; a trailing-padded conformant peer payload may be longer; reject only if too short) — and the copy is clamped to the fixed slot-bytes (never an OOB read). Read-then-release ordering means the bytes live in a node-owned vector before the app's later read, so the slot is never force-reclaimed mid-read.
+- [ ] **Test** `run-flatdata-zerocopy-test` (register, SBCL; pass-skip Clasp/macOS): a FlatData type over ZC end-to-end → the reader reads fields correctly from the slot AND the per-sample bytes-consed drops ~830× (to one exact-length owned vector, ~79 bytes/sample, vs the WP-ZEROCOPY-v1 sink+re-copy ~65551). *(SUPERSEDED — the original "drops to ~0 / 0-intra-host-copy result" is a safe SINGLE copy, ~830×, NOT literal-0-copy; see ADR 0015 Phase-D outcome.)* Commit (as landed, `52cf033`) `feat(disc): WP-FLATDATA over Zero-Copy — reader reads slot in place, 0 copies (FR-PF-3/4, NFR-PERF-7, R6)` — the commit-message "0 copies" is the historical title; the as-built is the safe single copy above.
 
 ---
 

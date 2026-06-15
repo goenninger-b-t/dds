@@ -22,7 +22,7 @@ The DSL recognizes these member-type keywords (from `*dds-type-map*`): `:bool`, 
 - **`dds.types:type-support-key-hash`** — the 16-octet keyhash closure, or `nil` for a keyless type.
 - **`dds.types:type-support-typeobject`** / **`dds.types:type-support-typeidentifier`** — the structural Minimal struct TypeObject and the type's own TypeIdentifier.
 - **`dds.types:type-support-sample-pool-alloc`** / **`dds.types:type-support-sample-pool-free`** — loan / return a pre-allocated sample for zero-per-sample-allocation deserialize.
-- **`dds.types:type-support-flatdata-offset`** / **`dds.types:type-support-flatdata-builder`** — FlatData hooks (P4).
+- **`dds.types:type-support-flatdata-offset`** / **`dds.types:type-support-flatdata-builder`** — FlatData hooks (FR-PF-4, ADR 0015; **NOT cleared for ship — R6, patent-gated**). For a FINAL fixed-size `:flatdata t` type, `-flatdata-offset` holds a `dds.types:flatdata-layout` (size + per-field compile-time XCDR2 byte offsets + Offset accessor functions); the in-memory layout *equals* the wire, so `serialize-<name>-fd` is an identity block-copy (0-alloc TX, byte-exact vs the classic serializer), `deserialize-into-<name>-fd` copies into a loaned buffer (0-alloc RX inner path), and the `<name>-<field>-fd` Offset accessors read/modify in place (0-alloc for fixnum-range fields). The honest costs (TX 0, engine non-ZC RX vtable ~80 vs ~128 classic — 0 per-field decode but one buffer/sample, **not** 0-alloc; FlatData-over-ZC RX a safe single copy ~830x below the WP-ZEROCOPY-v1 sink+re-copy — **not** literal-0-copy) are in `bench/report/2026-06-14-wp-flatdata.md` (`make bench-flatdata`); the untrusted wrap/read paths are fuzzed (`make fuzz`, incl. a `(safety 0)` arm — the length/encap guard is an explicit manual check, hence safety-independent). **FlatData v1 is FINAL fixed-size + NO_KEY only** (a `@key` member is a compile-time error). **Deferred follow-ups:** literal-0-copy RX (an engine-contract change — SAP-backed accessors + a refcount-spanning ZC-aware read path, ADR 0015 *Phase D outcome*); `-flatdata-builder` (variable-size/mutable/string/sequence/nested FlatData); keyed FlatData; the app-facing ZC loan-write API. See [Examples §8](#8-flatdata--flatdata-t-offset-accessors-final-fixed-size-no_key-v1-r6-not-cleared-for-ship).
 - **`dds.types:type-support-data-representation-mask`** — the accepted data-representation mask.
 - **`dds.types:type-support-field-accessors`** — `(field-name-string . unary-accessor)` per scalar/string member, for content filters / query conditions (off the hot path).
 - **`dds.types:register-type`** — register a `type-support` under its `name`; returns it.
@@ -287,6 +287,31 @@ The matching getTypes reply carries `TypeIdentifierTypeObjectPair`s — each the
     (assert (and (equalp (car (first pairs)) hash) (equalp (cdr (first pairs)) to)))
     (assert (and (equalp rguid rg) (= rsn 5) (eq remote-ex :ok)))))
 ```
+
+### 8. FlatData — `:flatdata t` Offset accessors (FINAL fixed-size NO_KEY v1; R6, NOT cleared for ship)
+
+> **NOT cleared for ship — pending counsel (R6, patent-gated); see ADR 0015.** Per-type opt-in via `:flatdata t`; the default codegen path is untouched.
+
+For a **FINAL fixed-size scalar NO_KEY** type annotated `:flatdata t`, the in-memory sample **is** the XCDR2-LE SerializedPayload (`[4-octet encap header][PLAIN_CDR2-LE body]`). The compiler emits compile-time-constant **Offset accessors** `<name>-<field>-fd` (get/`setf`, raw read/write at `4 + offset`), a `make-<name>-flatdata` constructor, and `+<name>-flatdata-size+`. `serialize` is an **identity block-copy** (0-alloc TX), so the buffer the accessors mutate is byte-identical to the engine's classic serialize of an equal struct (adapted from `run-flatdata-accessor-test` in `src/dds-tests/echo-test.lisp`):
+
+```lisp
+(dds.gen:define-dds-type fd-abc (:flatdata t)   ; FINAL, fixed-size scalars, NO_KEY (a @key member is a compile error)
+  (a :u8) (b :u32) (c :u64))                     ; u8@0, u32@4 (3-byte pad), u64@8 -> +fd-abc-flatdata-size+ = 20
+
+(let ((fd (make-fd-abc-flatdata)))               ; a foreign buffer == the full SerializedPayload (header written once)
+  (setf (fd-abc-a-fd fd) 200                      ; Offset SET: write each field in place, 0-alloc
+        (fd-abc-b-fd fd) 3000000000
+        (fd-abc-c-fd fd) 12345678901234567890)
+  (assert (= (fd-abc-a-fd fd) 200))               ; Offset GET: read in place, 0-alloc for fixnum-range fields
+  ;; the buffer IS the wire: byte-identical to the engine's classic serialize of an equal struct
+  (let* ((ts   (dds.types:find-type-support "fd-abc"))
+         (wire (dds.dcps::%serialize-sample ts fd))                  ; FlatData identity TX (block-copy)
+         (classic (dds.dcps::%serialize-sample ts (make-fd-abc :a 200 :b 3000000000 :c 12345678901234567890))))
+    (assert (equalp wire classic)))                                  ; in-memory == wire, proven against the oracle
+  (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+```
+
+**Composed with Zero-Copy (RX):** a FlatData type over WP-ZEROCOPY resolves the writer's SHMEM slot **in place into one exact-length owned vector** (`%zc-resolve-fresh`) — a **safe single copy** out of SHMEM, **~830× less RX allocation** than the WP-ZEROCOPY-v1 sink+re-copy (`make bench-flatdata`). This is **NOT literal-0-copy**: a Lisp octet-buffer cannot wrap a raw foreign SAP and the async off-thread read has no slot-aware release hook, so a literal-0-copy slot view would be a cross-process use-after-free. **Honest costs** (no path is ≈0 unless it measures ≈0): TX serialize 0 GC-bytes/sample; the engine-visible non-ZC `deserialize-<name>-fd` allocates **one** buffer/sample (~80 vs classic ~128 — 0 per-field decode, not 0-alloc), while the loaned-target inner path `deserialize-into-<name>-fd` is 0-alloc; the untrusted wrap is fuzzed including a `(safety 0)` arm (the length/encap guard is an explicit manual check, hence safety-independent by construction). **Deferred follow-ups:** literal-0-copy RX (needs SAP-backed accessors + a DCPS-level refcount-spanning ZC-aware read path — an engine-contract change, ADR 0015 *Phase D outcome*); the Builder + variable-size/string/sequence/nested FlatData; keyed FlatData (v1 is NO_KEY); the app-facing ZC loan-write API.
 
 ## Notes / status
 
