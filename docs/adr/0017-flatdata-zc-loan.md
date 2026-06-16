@@ -189,9 +189,60 @@ derived from first principles + the OMG loan model. Provenance logged in `docs/p
   FlatData-over-ZC exchange (`make zc-xproc`) both pass; the row records the as-built.
 - No migration burden: purely additive.
 
+## Reliable-ZC-loan — delivered (scope A), verified + hardened (WP-RELIABLE-ZC, 2026-06-16)
+
+The "Reliable-ZC-loan" follow-up below has been **delivered as scope A** (verify + harden + test); it is no
+longer a follow-up. The as-built model (grounded in code, then proven by five SBCL reliability tests +
+one latent-bug fix — `make test`, 211 green both impls):
+
+- **Reliable ZC delivery rides the existing reliable path; there is no separate reliability gate** — a ZC
+  sample on a RELIABLE writer has a SequenceNumber, is NACKable and retransmittable like any DATA. The writer
+  **HistoryCache stores the FULL payload** for every change (ZC or not); the 16-byte ZC reference is
+  **regenerated per-send** (`%zc-change-item` → `%zc-loan`) for the initial push.
+- **A NACK retransmits the SN.** As-built, the ACKNACK retransmit path **copy-falls-back**: it re-emits the
+  full retained HistoryCache payload (byte-exact, no loss), it does **not** re-loan a ZC reference
+  (`%on-user-acknack` omits the `zc-readers` argument that the initial-push path passes, so the resend takes
+  the normal full-payload DATA branch). A loan-capable reader delivers that retransmit **as an owned copy**
+  (a non-`flatdata-view` sample, `NIL` loan), not a view. Reliability (ultimate byte-exact delivery) holds;
+  the ZC win is simply not re-applied on the repair leg. (Verified by `run-reliable-zc-retransmit-test`.)
+- **The reader ACK/NACKs a ZC ref as a normal DATA** — `reader-on-data` marks the SN received, `reader-acknack`
+  ACKs/NACKs identically. A loan-capable reader stores the unresolved `zc-loan-marker` but its ACK bookkeeping
+  is unchanged. The reader ACKs on **receive** (reliable completion); the app holds the loan until
+  `return-loan` (read lifetime).
+- **The loan composes with reliability via the refcount.** The writer purges the HistoryCache change on
+  full-ACK (RTPS 2.5 §8.4.1), freeing the HC copy — but the loaned **slot** stays held by the reader's
+  refcount (force-reclaim skips `refcount > 0`), so a loaned slot **outlives the HC purge** until
+  `return-loan`. No use-after-free. (Verified by `run-reliable-zc-slot-outlives-purge-test`.)
+- **The ZC win is reader-RX (0-copy / 0-alloc) + wire (16-byte ref).** The **writer keeps the HistoryCache
+  full-payload copy** (needed for retransmit and for any non-ZC / remote reader) — this **writer-side
+  double-storage** (the slot copy plus the HC copy) is the **v1 cost**, recorded honestly (FR-LANG-7). The
+  writer-side is **not** zero-copy under reliability.
+- A saturated pool ⇒ `%zc-loan` NIL ⇒ the writer sends the full payload ⇒ the loan-capable reader delivers it
+  as a copy, never a silent drop (`run-reliable-zc-poolfull-fallback-test`); a single `take-loaned` returns a
+  ZC view and a fallback copy interleaved, both byte-exact (`run-reliable-zc-mixed-test`); a RELIABLE and a
+  BEST_EFFORT ZC writer each deliver a loan view identically (`run-reliable-zc-qos-test`).
+- **Latent bug found + fixed (beyond reliable-ZC, a real correctness fix):** `make-reader-qos` /
+  `make-writer-qos` prepended their reliability **default** ahead of the caller's `&rest` args, so a duplicate
+  `:reliability` resolved to the default (HyperSpec 3.4.1.4 — the leftmost keyword wins). A
+  RELIABLE-requesting reader silently advertised BEST_EFFORT, was excluded from the writer's
+  `%matched-reader-keys` purge set, and the writer never purged its HistoryCache on full-ACK for it →
+  **unbounded HC growth** (NFR-MEM). Fixed (the caller's keyword now wins — append the default *after* args);
+  commit `0a03bf5`. Surfaced by the slot-outlives-purge scenario.
+
+The **scope-B follow-ups** (deferred) are listed below.
+
 ## Out of scope / follow-ups
 
-- **Reliable-ZC-loan** (the slot held until ACKed AND not loaned) — best-effort first.
+- **Re-loan-on-retransmit (scope B).** Make the ACKNACK repair leg re-send a ZC reference instead of the full
+  HistoryCache copy. This needs per-peer `%zc-readers` resolution on the retransmit path so the slot refcount
+  stays exactly 1 per resolving destination — otherwise a resend that fans to multiple peers would
+  double-count (and later double-free) the loan. (The initial-push path already resolves `zc-readers`;
+  `%on-user-acknack` does not.)
+- **True writer-side reliable ZC (scope B).** When all matched readers are same-host ZC-capable, the
+  HistoryCache change **references the slot** (no full-payload copy), the slot retained until ACK
+  (writer-hold released on purge) and not reclaimed while loaned, and the retransmit re-sends the ref to the
+  retained slot. Eliminates the v1 writer-side double-storage; conditional (any non-ZC / remote reader forces
+  the copy) + a bigger HC↔pool change. Deferred.
 - **The app-facing ZC loan-WRITE API** (app writes directly into a pool slot, removing the remaining TX
   app→slot copy) — the write-side dual of this WP; separate follow-up.
 - **Loan-leak detection / max-loan-age / a hard loan cap** — v1 degrades gracefully to non-ZC; active leak

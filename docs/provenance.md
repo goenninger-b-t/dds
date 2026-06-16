@@ -1399,6 +1399,38 @@ decrement; `src/dds-pal/{pal-contract,pal-sbcl,pal-clasp}.lisp` the `cas-sap-u32
   writer's O(slots)-scan tradeoff (the dropped O(1) freelist-pop) + the loan/return calls + the app's return
   obligation — no `0-cost`/`free` claim.
 
+## M5 (2026-06-16) — WP-RELIABLE-ZC reliable Zero-Copy loan delivery, scope A (FR-PF-3/4, FR-RTPS reliability, ADR 0017)
+
+The reliable Zero-Copy loan delivery verify+harden+test work (`src/dds-qos/qos.lisp` the
+`make-reader-qos`/`make-writer-qos` default-ordering fix; `src/dds-tests/{integration-test,echo-test}.lisp`
+the five `run-reliable-zc-*` scenarios + the test-only `%saturate-zc-pool`/`%zc-pool-full-p`/
+`%release-zc-loans`/`%deliver-one-zc-loan` helpers) is **clean-room** and introduced **no new external source**:
+
+- The reliability model is **OMG DDSI-RTPS 2.5 §8.4** (the StatefulWriter/StatefulReader HEARTBEAT/ACKNACK/GAP
+  protocol, the full-ACK HistoryCache purge §8.4.1) + the OMG DDS 1.4 `read()`/`take()` + `return_loan()`
+  loan-by-reference model (§2.2.2.5) — the same authorities ADR 0017 / ADR 0018 already record. The finding
+  that reliable ZC delivery rides the existing reliable path (HC full payload + retransmit; the retransmit
+  copy-fallback as-built; the loan composing with reliability via the refcount; the loaned slot outliving the
+  full-ACK purge), and the two scope-B follow-ups (re-loan-on-retransmit needing per-peer `%zc-readers`; true
+  writer-side reliable ZC) are this project's **own analysis of its own engine** from first principles.
+- The `make-reader-qos`/`make-writer-qos` fix is a **plain Common Lisp keyword-precedence correction**
+  (HyperSpec 3.4.1.4 — the leftmost of duplicate keyword arguments wins): the implementation was made to match
+  its own documented "ARGS override" docstring contract. No external artifact informed it.
+- **No RTI source, headers, or `rtiddsgen` output consulted; no other vendor's reliable / Zero-Copy / loan
+  implementation read; no RTI patent / whitepaper read.** No Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) /
+  OpenDDS code was consulted. The scenarios reuse this project's own `fd-abc` FlatData fixture, the loan-capable
+  DCPS reader setup, and the `dds.disc:*debug-drop-sample-numbers*` loss-injection seam.
+- **NOT cleared for ship — pending counsel (R6).** WP-RELIABLE-ZC exercises the FlatData + Zero-Copy
+  literal-0-copy loan path (ADR 0017 / ADR 0018) under RELIABLE reliability; the patent posture is unchanged;
+  gated default-OFF twice (`dds.disc:*zerocopy-enabled*` nil **and** the per-type `:flatdata t`). This entry +
+  ADR 0017 record provenance for that review.
+- Validated by `run-reliable-zc-retransmit-test` / `run-reliable-zc-poolfull-fallback-test` /
+  `run-reliable-zc-mixed-test` / `run-reliable-zc-slot-outlives-purge-test` / `run-reliable-zc-qos-test`
+  (211 green SBCL + Clasp; the ZC-gated scenarios pass-skip on the Clasp/macOS by-name-attach gap, ADR 0013) —
+  none of which involves a vendor artifact. HONEST (FR-LANG-7): the docs state the reader-RX + 16-byte-wire ZC
+  win AND that the retransmit is copy-fallback (not re-loan) and the writer keeps the HistoryCache full-payload
+  copy (writer-side double-storage, not zero-copy under reliability) — no writer-side-zero-copy overclaim.
+
 ## M5 (2026-06-15) — WP-ASYNC-FLOW asynchronous flow control (FR-PF-2, ADR 0016, Phases A–F)
 
 The whole WP-ASYNC-FLOW — the `flow-token-bucket` metering primitive (`src/dds-disc/flow-control.lisp`

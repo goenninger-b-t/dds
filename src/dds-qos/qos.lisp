@@ -141,13 +141,15 @@
 
 (defun* make-writer-qos (&rest args)
     (function (&rest t) qos)
-  "QoS with DataWriter defaults (RELIABILITY defaults to RELIABLE). ARGS override."
-  (apply #'make-qos :reliability :reliable args))
+  "QoS with DataWriter defaults (RELIABILITY defaults to RELIABLE). ARGS override: ARGS precede the default
+   so a caller's :reliability is the LEFTMOST (and thus winning, HyperSpec 3.4.1.4) keyword."
+  (apply #'make-qos (append args (list :reliability :reliable))))
 
 (defun* make-reader-qos (&rest args)
     (function (&rest t) qos)
-  "QoS with DataReader defaults (RELIABILITY defaults to BEST_EFFORT). ARGS override."
-  (apply #'make-qos :reliability :best-effort args))
+  "QoS with DataReader defaults (RELIABILITY defaults to BEST_EFFORT). ARGS override: ARGS precede the default
+   so a caller's :reliability is the LEFTMOST (and thus winning, HyperSpec 3.4.1.4) keyword."
+  (apply #'make-qos (append args (list :reliability :best-effort))))
 
 ;;; ---- RxO compatibility (FR-QOS-2) ----
 

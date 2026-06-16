@@ -599,7 +599,25 @@ system wiki. The loaned RX is now also literal 0-alloc (WP-ZC-LOAN-LOCKFREE, ADR
 + `%zc-release` are lock-free (a generation acquire-load + `fence :acquire`, and a `cas-sap-u32` refcount
 decrement) so the per-sample loaned RX consumes literal 0 GC-heap bytes (the progression `65552 → 79 → 31 → 0`,
 `make bench-zc-loan-lockfree`) — honest tradeoff: the writer's loan is now O(slots) (the freelist was dropped),
-benched at Phase C. RELIABLE Zero-Copy and the loan-WRITE API remain follow-ups.**
+benched at Phase C. **Reliable ZC loan delivery verified + hardened (WP-RELIABLE-ZC scope A, FR-PF-3/4, ADR
+0017): a ZC loan sample on a RELIABLE writer rides the existing reliable path with NO separate reliability
+gate (it has a SequenceNumber, is NACKable and retransmittable); the reader-RX 0-copy/0-alloc + the 16-byte
+wire reference are the ZC win, and the loan composes with reliability via the refcount — the reader ACKs on
+receive, and the writer's full-ACK HistoryCache purge (RTPS 2.5 §8.4.1) frees the HC copy while the loaned
+SLOT outlives the purge (force-reclaim skips `refcount>0`) until `return-loan` (no UAF). Honest (FR-LANG-7):
+the retransmit is reliable via COPY-FALLBACK, not re-loan — the ACKNACK repair leg re-emits the FULL retained
+HistoryCache payload (byte-exact; `%on-user-acknack` omits `zc-readers`), delivered as an owned copy not a ZC
+view; and the WRITER KEEPS the HistoryCache full-payload copy (needed for retransmit + non-ZC/remote readers),
+so the writer-side is DOUBLE-STORAGE, NOT zero-copy, under reliability (the v1 cost — no writer-side-zero-copy
+claim for reliable). A saturated pool falls back to the full payload (copy-delivered, never a silent drop).
+Five SBCL scenarios green (`run-reliable-zc-{retransmit,poolfull-fallback,mixed,slot-outlives-purge,qos}-test`;
+Clasp pass-skip), 211 green both impls; the run also found + fixed a latent reliability/memory bug
+(`make-reader-qos`/`make-writer-qos` silently dropped a caller's `:reliability` override → a RELIABLE reader
+advertised BEST_EFFORT → was excluded from the writer's purge set → unbounded HC growth; fixed, commit
+`0a03bf5`). Scope-B follow-ups (not done): re-loan-on-retransmit (re-send a ZC ref on the ACKNACK path —
+needs per-peer `%zc-readers` so the slot refcount stays 1 per resolving destination, avoiding a double-free
+when a resend fans to multiple peers) and true writer-side reliable ZC (the HistoryCache change references
+the slot, no full-payload copy, when all readers are same-host ZC). The loan-WRITE API remains a follow-up.**
 
 ### NFR-PORT gap — Clasp/macOS-arm64
 
@@ -637,8 +655,20 @@ affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and fore
   O(slots) `refcount==0` scan, ~106 ns/loan at 2 slots → ~1801 ns at 128, benched at Phase C — the reader RX is
   the win, the writer pays a small bounded scan; a lock-free freelist to restore O(1) is a noted follow-up).
   **NOT cleared for ship pending counsel (R6).** See the [type system wiki](type-system.md#8-flatdata--flatdata-t-offset-accessors-final-fixed-size-no_key-v1-r6-not-cleared-for-ship). The untrusted wrap/read + ZC resolve clamp
-  are fuzzed (`make fuzz`).
-- **Planned:** the app-facing ZC loan-**write** API (the remaining TX app→slot copy), reliable Zero-Copy, a TCP transport, a Linux
+  are fuzzed (`make fuzz`). **Reliable ZC loan delivery is verified + hardened (WP-RELIABLE-ZC scope A, ADR
+  0017):** a ZC loan sample on a RELIABLE writer rides the existing reliable path with no separate reliability
+  gate; the **reader-RX 0-copy/0-alloc + the 16-byte wire reference are the ZC win**, and the **loan composes
+  with reliability via the refcount** (the reader ACKs on receive; the writer's full-ACK HistoryCache purge
+  frees the HC copy, but the loaned slot outlives the purge — force-reclaim skips `refcount>0` — until
+  `return-loan`). Honest (FR-LANG-7): the **retransmit is reliable via copy-fallback, not re-loan** (the
+  ACKNACK leg re-sends the full retained payload, delivered as a copy, not a ZC view) and the **writer keeps
+  the HistoryCache full-payload copy** (double-storage, **not** zero-copy on the writer side under reliability
+  — the v1 cost). Five SBCL scenarios green, 211 both impls; the run also fixed a latent QoS bug
+  (`make-reader-qos`/`make-writer-qos` dropped a caller's `:reliability` override → unbounded HC growth;
+  commit `0a03bf5`). **Scope-B follow-ups (not done):** re-loan-on-retransmit and true writer-side reliable ZC.
+- **Planned:** the app-facing ZC loan-**write** API (the remaining TX app→slot copy), the WP-RELIABLE-ZC
+  scope-B follow-ups (re-loan-on-retransmit; true writer-side reliable ZC — no HistoryCache full-payload copy
+  when all readers are same-host ZC), a TCP transport, a Linux
   `futex` notification fast-path for SHMEM, a lock-free-MPSC ring, and a raw `recvmmsg`/`sendmmsg`/iovec batched
   send/recv fast path. The UDP send is one datagram per `socket-send` (small samples are coalesced first).
 - **Per-impl rule:** `#+sbcl`/`#+clasp` reader conditionals live **only** under `dds-pal/` (`pal-sbcl.lisp` and
