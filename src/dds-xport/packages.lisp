@@ -58,9 +58,11 @@
     fixed-size slots over an mmap segment: the writer loans a slot, copies one
     serialized SerializedPayload in, and publishes a 16-byte reference instead of
     the payload; a same-host reader resolves the reference (bounds + generation
-    guarded) and copies the slot out. All slot state (freelist head, per-slot
-    refcount/generation) is mutated UNDER the pool's PTHREAD_PROCESS_SHARED mutex
-    (no foreign-SAP CAS -> full Clasp parity). Generation is the single guard for
+    guarded) and copies the slot out. All slot state (per-slot
+    refcount/generation/len/pubseq) is mutated UNDER the pool's PTHREAD_PROCESS_SHARED
+    mutex (no foreign-SAP CAS -> full Clasp parity); the freelist was dropped, so a
+    slot is reclaimable iff refcount==0 and the writer scans for the oldest such slot
+    (WP-ZC-LOAN-LOCKFREE, ADR 0018). Generation is the single guard for
     stale refs, force-reclaim mid-read, and untrusted cross-process references.
     NOT cleared for ship — pending counsel (R6); the path is off by default
     behind dds.disc:*zerocopy-enabled*. %-internals are reached via :: by tests.")

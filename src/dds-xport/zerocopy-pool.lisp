@@ -9,15 +9,15 @@
 (defconstant +zc-off-version+ 4 "Header byte offset of the u32 ABI version.")
 (defconstant +zc-off-slot-count+ 8 "Header byte offset of the u32 slot count K.")
 (defconstant +zc-off-slot-bytes+ 12 "Header byte offset of the u32 per-slot payload capacity.")
-(defconstant +zc-off-free-head+ 16 "Header byte offset of the u32 freelist head (slot index, or +zc-free-end+).")
+(defconstant +zc-off-free-head+ 16 "Unused since the freelist was dropped (WP-ZC-LOAN-LOCKFREE, ADR 0018); was the u32 freelist-head offset.")
 (defconstant +zc-mutex-off+ 64 "Byte offset of the pool's PTHREAD_PROCESS_SHARED mutex (guards all slot state).")
 (defconstant +zc-slots-off+ 128 "Byte offset where the K slots begin (after header + mutex region).")
 (defconstant +zc-slot-hdr+ 32 "Per-slot header bytes preceding the slot payload.")
 (defconstant +zc-slot-off-refcount+ 0 "Within-slot offset of the u32 refcount.")
 (defconstant +zc-slot-off-generation+ 4 "Within-slot offset of the u32 generation (the single race guard).")
-(defconstant +zc-slot-off-len+ 8 "Within-slot offset of the u32 payload length; overlays the freelist 'next' while free.")
+(defconstant +zc-slot-off-len+ 8 "Within-slot offset of the u32 payload length (no longer overlays a freelist 'next' — freelist dropped, WP-ZC-LOAN-LOCKFREE, ADR 0018).")
 (defconstant +zc-slot-off-pubseq+ 16 "Within-slot offset of the u64 publish sequence (force-reclaim 'oldest' ordering).")
-(defconstant +zc-free-end+ #xFFFFFFFF "Freelist terminator (no next free slot).")
+(defconstant +zc-free-end+ #xFFFFFFFF "Unused since the freelist was dropped (WP-ZC-LOAN-LOCKFREE, ADR 0018); was the freelist terminator.")
 
 (defun* %zc-slot-stride (slot-bytes)
     (function ((integer 1)) (integer 1))
@@ -44,19 +44,20 @@
 
 (defun* %zc-init (sap slot-count slot-bytes)
     (function (t (integer 1) (integer 1)) t)
-  "Initialise header + pshared mutex; thread all slots onto the freelist (the LEN field overlays the
-   freelist 'next' pointer while a slot is free); zero refcount/generation/pubseq. Creator-only."
+  "Initialise header + pshared mutex; zero every slot's refcount/generation/len/pubseq. Creator-only.
+   WP-ZC-LOAN-LOCKFREE (R6, ADR 0018; NOT cleared for ship — pending counsel): the freelist is DROPPED — a
+   slot is reclaimable iff its refcount==0, so init builds no freelist head and the LEN field no longer
+   overlays a freelist 'next' (it is just the payload length, initialised 0)."
   (setf (cffi:mem-ref sap :uint32 +zc-off-magic+) +zc-magic+
         (cffi:mem-ref sap :uint32 +zc-off-version+) +zc-version+
         (cffi:mem-ref sap :uint32 +zc-off-slot-count+) slot-count
-        (cffi:mem-ref sap :uint32 +zc-off-slot-bytes+) slot-bytes
-        (cffi:mem-ref sap :uint32 +zc-off-free-head+) 0)
+        (cffi:mem-ref sap :uint32 +zc-off-slot-bytes+) slot-bytes)
   (dds.pal:pshared-mutex-init sap +zc-mutex-off+)
   (dotimes (i slot-count t)
     (let ((b (%zc-slot-off sap i)))
       (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-refcount+)) 0
             (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+)) 0
-            (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+)) (if (= i (1- slot-count)) +zc-free-end+ (1+ i)))
+            (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+)) 0)
       (dds.pal:store-sap-u64 sap (+ b +zc-slot-off-pubseq+) 0))))
 
 (defun* %zc-validate (sap)
@@ -74,43 +75,49 @@
 
 (defun* %zc-free-count (sap)
     (function (t) (integer 0))
-  "Walk the freelist counting free slots (test/debug; not hot path)."
-  (let ((n 0) (cur (cffi:mem-ref sap :uint32 +zc-off-free-head+)))
-    (loop until (= cur +zc-free-end+) do (incf n)
-          (setf cur (cffi:mem-ref sap :uint32 (+ (%zc-slot-off sap cur) +zc-slot-off-len+))))
-    n))
+  "Count the reclaimable (refcount==0) slots (test/debug; not hot path). WP-ZC-LOAN-LOCKFREE (ADR 0018): the
+   freelist was dropped, so 'free' now means 'reclaimable' = refcount==0 (a released slot is reclaimable, a
+   held slot is not, a double-release does not change the count) — behaviorally identical to the old
+   freelist-walk for every WP-ZEROCOPY assertion."
+  (let ((n 0))
+    (dotimes (i (%zc-slot-count sap) n)
+      (when (zerop (cffi:mem-ref sap :uint32 (+ (%zc-slot-off sap i) +zc-slot-off-refcount+))) (incf n)))))
 
 (defvar *zc-pubseq* 0 "Process-local monotonic publish sequence for force-reclaim 'oldest' ordering.")
 
 (defun* %zc-take-free-or-reclaim (sap)
     (function (t) (or null (integer 0)))
-  "CALLER HOLDS THE MUTEX. Pop the freelist head; if empty, force-reclaim the lowest-pubseq (oldest)
-   slot AMONG THOSE WITH refcount==0 — the caller's generation bump then invalidates any in-flight ref
-   to it. WP-FLATDATA-ZC-LOAN safety contract (R6, ADR 0017; NOT cleared for ship — pending counsel):
-   a loaned slot has refcount>0 (the writer's %zc-loan set refcount=readers and a reader-loan holds it
-   until %zc-release), so it is NEVER a reclaim candidate — it can never be overwritten under the app's
-   read. Returns the slot index, or NIL when the freelist is empty AND every slot is loaned (refcount>0)
-   ⇒ %zc-loan returns NIL ⇒ the writer falls back to non-ZC for that sample (lost-tolerant, never blocks)."
-  (let ((head (cffi:mem-ref sap :uint32 +zc-off-free-head+)))
-    (if (/= head +zc-free-end+)
-        (progn (setf (cffi:mem-ref sap :uint32 +zc-off-free-head+)
-                     (cffi:mem-ref sap :uint32 (+ (%zc-slot-off sap head) +zc-slot-off-len+)))
-               head)
-        (let ((oldest nil) (oldest-seq 0))
-          (dotimes (i (%zc-slot-count sap) oldest)
-            (let ((b (%zc-slot-off sap i)))
-              (when (zerop (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-refcount+)))
-                (let ((s (dds.pal:load-sap-u64 sap (+ b +zc-slot-off-pubseq+))))
-                  (when (or (null oldest) (< s oldest-seq)) (setf oldest i oldest-seq s))))))))))
+  "CALLER HOLDS THE MUTEX. Scan for the lowest-pubseq (oldest) slot AMONG THOSE WITH refcount==0 and return
+   it — the caller's generation bump then invalidates any in-flight ref to that now-reused slot.
+   WP-ZC-LOAN-LOCKFREE (R6, ADR 0018; NOT cleared for ship — pending counsel): the freelist is DROPPED, so
+   this ALWAYS scans (the writer's loan is O(slots), amortized — the freelist's O(1) pop is gone), and a slot
+   is reclaimable iff refcount==0. WP-FLATDATA-ZC-LOAN safety contract (ADR 0017): a loaned slot has
+   refcount>0 (the writer's %zc-loan set refcount=readers and a reader-loan holds it until %zc-release), so
+   it is NEVER a reclaim candidate — it can never be overwritten under the app's read. Returns the slot
+   index, or NIL when every slot is loaned (refcount>0, none reclaimable) ⇒ %zc-loan returns NIL ⇒ the
+   writer falls back to non-ZC for that sample (lost-tolerant, never blocks)."
+  (let ((oldest nil) (oldest-seq 0))
+    (dotimes (i (%zc-slot-count sap) oldest)
+      (let ((b (%zc-slot-off sap i)))
+        (when (zerop (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-refcount+)))
+          (let ((s (dds.pal:load-sap-u64 sap (+ b +zc-slot-off-pubseq+))))
+            (when (or (null oldest) (< s oldest-seq)) (setf oldest i oldest-seq s))))))))
 
 (defun* %zc-loan (sap payload off len readers)
     (function (t (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) (integer 0))
               (values (or null (integer 0)) (unsigned-byte 32)))
-  "Single-producer (the owning writer): loan a slot for PAYLOAD[off,off+len) to READERS consumers. Take a
-   free slot, else force-reclaim the oldest UNLOANED (refcount==0) slot. Bump the slot generation, copy the
-   payload in, set refcount=READERS, stamp pubseq. Returns (values slot-index generation), or (values NIL 0)
-   if LEN > slot-bytes OR the pool is full with every slot loaned (refcount>0, none reclaimable —
-   WP-FLATDATA-ZC-LOAN R6, ADR 0017) ⇒ the writer falls back to non-ZC for that sample."
+  "Single-producer (the owning writer): loan a slot for PAYLOAD[off,off+len) to READERS consumers. Scan the
+   oldest UNLOANED (refcount==0) slot (the freelist was dropped, WP-ZC-LOAN-LOCKFREE). Set len/refcount/pubseq,
+   COPY THE PAYLOAD IN, then a release-fence, then store the bumped generation LAST. Returns (values slot-index
+   generation), or (values NIL 0) if LEN > slot-bytes OR every slot is loaned (refcount>0, none reclaimable —
+   WP-FLATDATA-ZC-LOAN R6, ADR 0017) ⇒ the writer falls back to non-ZC for that sample.
+   ORDERING (WP-ZC-LOAN-LOCKFREE, R6, ADR 0018; NOT cleared for ship — pending counsel): the payload is
+   written FIRST; then dds.pal:fence :release publishes it (+ len/refcount/pubseq); then the generation store
+   is the LAST write — the single RELEASE point that publishes the whole slot to a future lock-free reader
+   (the generation is the release/acquire sync variable, mirroring the WP-SHMEM ring cursor). A reader that
+   acquire-loads the new generation is then guaranteed to see the payload-before stores (no torn read). The
+   writer keeps its pshared-mutex for mutual exclusion vs other writers / force-reclaim; the fence +
+   generation-last is what synchronizes-with the lock-free reader, which does NOT share the mutex."
   (when (> len (%zc-slot-bytes sap)) (return-from %zc-loan (values nil 0)))
   (dds.pal:pshared-lock sap +zc-mutex-off+)
   (unwind-protect
@@ -118,40 +125,54 @@
          (unless i (return-from %zc-loan (values nil 0)))
          (let* ((b (%zc-slot-off sap i))
                 (g (logand (1+ (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+))) #xFFFFFFFF)))
-           (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+)) g
-                 (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+)) len
+           (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+)) len
                  (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-refcount+)) readers)
            (dds.pal:store-sap-u64 sap (+ b +zc-slot-off-pubseq+) (incf *zc-pubseq*))
            (dotimes (k len) (setf (cffi:mem-ref sap :uint8 (+ b +zc-slot-hdr+ k)) (aref payload (+ off k))))
+           (dds.pal:fence :release)
+           (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+)) g)
            (values i g)))
     (dds.pal:pshared-unlock sap +zc-mutex-off+)))
 
 (defun* %zc-release (sap slot-index generation)
     (function (t (integer 0) (unsigned-byte 32)) t)
   "A reader returning a loan on slot SLOT-INDEX it read at GENERATION (the loan-return half of
-   %zc-acquire-for-read): under the mutex, validate bounds + generation, decrement refcount; on the 1->0
-   transition push the slot onto the freelist (LEN overlays 'next'). T if applied, NIL if stale/OOB.
-   IDEMPOTENT / DOUBLE-RETURN-SAFE (WP-FLATDATA-ZC-LOAN safety contract, R6, ADR 0017; NOT cleared for
-   ship — pending counsel): the refcount decrement is guarded by (plusp rc) and the freelist push by the
-   (= 1 rc) edge, so a SECOND release of an already-refcount==0 slot (matching generation, already on the
-   freelist) is a validated no-op — no decrement below 0, no double freelist push (no freelist cycle). A
-   generation mismatch (the slot was reclaimed + generation-rebumped) is likewise a no-op. Hence a double
-   return-loan of the same view, and a reader-close returning an already-returned loan, are both safe;
-   best-effort tolerates a lost / force-reclaimed ref."
+   %zc-acquire-for-read). LOCK-FREE cas-sap-u32 ATOMIC DECREMENT OF THE REFCOUNT SUB-FIELD (WP-ZC-LOAN-LOCKFREE
+   Phase B, R6, ADR 0018; NOT cleared for ship — pending counsel): NO mutex ⇒ 0 GC-heap bytes per release. T if
+   the decrement applied, NIL if stale/OOB. A slot becomes reclaimable simply by reaching refcount==0 (the
+   writer's next scan finds the lowest-pubseq refcount==0 slot; the freelist is DROPPED).
+   DIRECT u32-REFCOUNT CAS (0-alloc AT ANY GENERATION): the refcount (u32 @+0) is CASed DIRECTLY — the combined
+   (generation<<32)|refcount u64 is NEVER materialised, so nothing boxes a bignum once a slot's generation grows
+   past most-positive-fixnum/2^32 (~2^30). All refcount arithmetic stays (unsigned-byte 32) ⇒ fixnum ⇒ literal
+   0-alloc regardless of generation. The generation (u32 @+4) is read ONCE up front for the stale-ref check and
+   then NEVER touched (the CAS contends only on the refcount cell @+0); it is preserved by construction.
+   GENERATION GUARD (separate u32 read, not a sync point): a held slot's generation is STABLE while refcount>0
+   (force-reclaim/loan only reclaim refcount==0 slots, so a slot we hold a count on CANNOT be reclaimed +
+   generation-rebumped mid-release), so a separate u32 read of the generation can't race the writer — it is the
+   stale/forged-ref check, and a mismatch (the slot was already reclaimed) returns NIL with NO decrement (never
+   touch a slot we no longer own). The CAS loop then only contends on the refcount (multiple readers of the same
+   slot each decrement; the loop re-reads + re-CASes; bounded):
+     gen0 := load-u32 generation@+4
+     gen0 /= GENERATION -> NIL   (stale / reclaimed, no decrement)
+     loop: rc := load-u32 refcount@+0
+           rc = 0  -> T          (already 0 -> double-return no-op, NO underflow / wrap)
+           CAS(refcount: rc -> rc-1) succeeds -> T ; else retry
+   MEMORY-ORDERING HANDSHAKE (the binary gate, UNCHANGED): dds.pal:cas-sap-u32 is sb-ext:cas (arm64 CASAL — a
+   32-bit FULL barrier, the same acquire+release ordering the u64 CAS had), so the reader's prior payload reads
+   HAPPEN-BEFORE the refcount reaches 0; the writer's force-reclaim/loan only reclaims refcount==0 slots ⇒ it can
+   NEVER overwrite a slot a reader is still reading (no UAF / torn read).
+   IDEMPOTENT / DOUBLE-RETURN-SAFE (WP-FLATDATA-ZC-LOAN safety contract, ADR 0017): the (plusp rc) guard means a
+   SECOND release of an already-refcount==0 slot (matching generation) is a validated no-op — the refcount stays
+   0, never decrements below 0 / wraps to ~4e9. A generation mismatch (the slot was reclaimed + generation-
+   rebumped) is likewise a no-op. Hence a double return-loan of the same view, and a reader-close returning an
+   already-returned loan, are both safe; best-effort tolerates a lost / force-reclaimed ref."
   (when (>= slot-index (%zc-slot-count sap)) (return-from %zc-release nil))
-  (dds.pal:pshared-lock sap +zc-mutex-off+)
-  (unwind-protect
-       (let ((b (%zc-slot-off sap slot-index)))
-         (cond ((/= generation (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+))) nil)
-               (t (let ((rc (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-refcount+))))
-                    (when (plusp rc)
-                      (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-refcount+)) (1- rc))
-                      (when (= 1 rc)
-                        (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+))
-                              (cffi:mem-ref sap :uint32 +zc-off-free-head+)
-                              (cffi:mem-ref sap :uint32 +zc-off-free-head+) slot-index)))
-                    t))))
-    (dds.pal:pshared-unlock sap +zc-mutex-off+)))
+  (let ((b (%zc-slot-off sap slot-index)))
+    (unless (= generation (dds.pal:load-sap-u32 sap (+ b +zc-slot-off-generation+))) (return-from %zc-release nil))
+    (loop
+      (let ((rc (dds.pal:load-sap-u32 sap (+ b +zc-slot-off-refcount+))))
+        (when (zerop rc) (return t))
+        (when (= rc (dds.pal:cas-sap-u32 sap (+ b +zc-slot-off-refcount+) rc (1- rc))) (return t))))))
 
 (defun* %zc-slot-payload-len (sap slot-index generation)
     (function (t (integer 0) (unsigned-byte 32)) (or null (unsigned-byte 32)))
@@ -168,27 +189,38 @@
     (function (t (integer 0) (unsigned-byte 32))
               (values (or null t) &optional (integer 0) (unsigned-byte 32) (unsigned-byte 32) (integer 0)))
   "Reader, the literal-0-copy loan acquire (WP-FLATDATA-ZC-LOAN Task C1, FR-PF-3/4, R6, ADR 0017; NOT cleared
-   for ship — pending counsel). Under the mutex, validate SLOT-INDEX in range AND its generation == GENERATION
-   (the single race guard — a stale ref whose slot was force-reclaimed + generation-rebumped ⇒ the loan FAILS),
-   then return a slot-view handle (values POOL-SAP SLOT-INDEX GENERATION PAYLOAD-LEN PAYLOAD-BASE) WITHOUT
+   for ship — pending counsel). LOCK-FREE FENCED READ (WP-ZC-LOAN-LOCKFREE Phase B, R6, ADR 0018; NOT cleared
+   for ship — pending counsel): NO mutex, NO copy ⇒ 0 GC-heap bytes per acquire. Validate SLOT-INDEX in range,
+   then ACQUIRE-LOAD the generation, then dds.pal:fence :acquire, then validate generation == GENERATION (the
+   single race guard — a stale ref whose slot was force-reclaimed + generation-rebumped ⇒ the loan FAILS), then
+   read LEN + return a slot-view handle (values POOL-SAP SLOT-INDEX GENERATION PAYLOAD-LEN PAYLOAD-BASE) WITHOUT
    COPYING — the app reads fields straight off the slot via the SAP-mode FlatData accessors (literal 0 intra-host
-   copies). PAYLOAD-LEN is %zc-slot-payload-len (recorded LEN CLAMPED to slot-bytes), so a forged on-wire LEN can
-   never expose a read past the fixed slot allocation (NFR-SEC-POSTURE, OOB-safe even at (safety 0)); PAYLOAD-BASE
-   is the slot's payload byte offset within the segment (slot-off + +zc-slot-hdr+) for dds.pal:load-sap-u* reads at
+   copies). PAYLOAD-LEN is the recorded LEN CLAMPED to slot-bytes (min), so a forged on-wire LEN can never expose
+   a read past the fixed slot allocation (NFR-SEC-POSTURE, OOB-safe even at (safety 0)); PAYLOAD-BASE is the
+   slot's payload byte offset within the segment (slot-off + +zc-slot-hdr+) for dds.pal:load-sap-u* reads at
    SAP+PAYLOAD-BASE+field-offset. Returns NIL (single value) on any validation failure (stale / force-reclaimed /
    OOB) — best-effort: the caller drops the sample.
+   MEMORY-ORDERING HANDSHAKE (the binary gate): the ORDER is load-coherent — read the generation FIRST, THEN the
+   acquire-fence, THEN the dependent LEN/payload reads. The generation acquire-load + dds.pal:fence :acquire
+   (SBCL sb-thread:barrier(:read)) PAIRS-WITH the writer's dds.pal:fence :release + generation-store-LAST in
+   %zc-loan (the generation is the release/acquire sync variable, mirroring the WP-SHMEM ring cursor handshake):
+   when this reader observes the new generation, the payload (+ len) the writer wrote-before the release is
+   guaranteed visible — no torn read. A stale/forged ref ⇒ generation mismatch ⇒ NIL before any payload read.
    REFCOUNT MODEL (precise): the writer's %zc-loan SET refcount = matched-readers and stamps the slot; THIS
    reader's count is already pre-allocated within that initial refcount, so the loan is held by that existing
    count from %zc-loan through the disc-receiver store, this acquire, and the app's reads — until the reader's
    %zc-release decrements it. %zc-acquire-for-read therefore does NOT increment the refcount (incrementing would
    double-count this reader and leak the slot). The slot cannot be force-reclaimed while held because
-   %zc-take-free-or-reclaim only reclaims refcount==0 slots; %zc-release at the 1->0 edge frees it back."
-  (dds.pal:pshared-lock sap +zc-mutex-off+)
-  (unwind-protect
-       (let ((len (%zc-slot-payload-len sap slot-index generation)))
-         (when len
-           (values sap slot-index generation len (+ (%zc-slot-off sap slot-index) +zc-slot-hdr+))))
-    (dds.pal:pshared-unlock sap +zc-mutex-off+)))
+   %zc-take-free-or-reclaim only reclaims refcount==0 slots; %zc-release at the 1->0 edge frees it back. (No
+   mutual exclusion is needed: a held slot's generation/len/payload are STABLE while refcount>0, so the acquire
+   needs only cross-process VISIBILITY, which the generation sync variable + the fence pair provide.)"
+  (when (>= slot-index (%zc-slot-count sap)) (return-from %zc-acquire-for-read nil))
+  (let* ((b (%zc-slot-off sap slot-index))
+         (g (dds.pal:load-sap-u32 sap (+ b +zc-slot-off-generation+))))
+    (dds.pal:fence :acquire)
+    (when (= g generation)
+      (let ((len (min (dds.pal:load-sap-u32 sap (+ b +zc-slot-off-len+)) (%zc-slot-bytes sap))))
+        (values sap slot-index generation len (+ b +zc-slot-hdr+))))))
 
 (defun* %zc-resolve-into (sap slot-index generation dst dst-off)
     (function (t (integer 0) (unsigned-byte 32) (simple-array (unsigned-byte 8) (*)) (integer 0))

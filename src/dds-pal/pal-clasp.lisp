@@ -164,6 +164,14 @@
    SHMEM ring stays SBCL-only and Clasp falls back to UDP (ADR 0013, FR-XPORT-2)."
   (declare (ignore sap offset old new))
   (error 'pal-unimplemented :op 'cas-sap-u64))
+(defun* cas-sap-u32 (sap offset old new)
+    (function (t (integer 0) (unsigned-byte 32) (unsigned-byte 32)) (unsigned-byte 32))
+  "Atomic compare-and-swap of the u32 at SAP+OFFSET; returns the PREVIOUS value (= OLD on success). The
+   full-barrier atomic backing the lock-free loan release (WP-ZC-LOAN-LOCKFREE, R6 — NOT cleared for ship,
+   see ADR 0018). Same NFR-PORT gap as CAS-SAP-U64: no Clasp hardware atomic over a raw foreign cell, and ZC
+   is SBCL-only (ADR 0013), so the loan-release path never runs on Clasp; signals PAL-UNIMPLEMENTED."
+  (declare (ignore sap offset old new))
+  (error 'pal-unimplemented :op 'cas-sap-u32))
 (defun* atomic-incf-sap-u64 (sap offset delta)
     (function (t (integer 0) (unsigned-byte 64)) (unsigned-byte 64))
   "Atomically add DELTA to the u64 at SAP+OFFSET; returns the NEW value. Same NFR-PORT gap as

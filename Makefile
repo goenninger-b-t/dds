@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-async-flow shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-zc-loan-lockfree bench-async-flow shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -192,6 +192,17 @@ bench-flatdata:
 bench-flatdata-zc-loan:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-zc-loan :file "bench/report/2026-06-16-wp-flatdata-zc-loan.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+
+# WP-ZC-LOAN-LOCKFREE Phase C (FR-PF-3/4, NFR-PERF-7, FR-LANG-7): the lock-free 0-alloc loaned RX headline —
+# the loaned RX GC bytes/sample now LITERAL 0 (the lock-free %zc-acquire-for-read + cas-sap-u32 %zc-release),
+# the full progression 65552 -> 79 -> 31 -> 0, plus the HONEST writer tradeoff (the O(1) freelist-pop became an
+# O(slots) refcount==0 scan — benched at several pool sizes; no "0-cost" claim — the reader RX is the win, the
+# writer pays a small bounded scan). Lives in dds-tests (needs the dds-gen FlatData type); writes
+# bench/report/2026-06-16-wp-zc-loan-lockfree.md. SBCL only (ZC + foreign-SAP atomics, ADR 0013).
+# NOT cleared for ship — pending counsel (R6); see ADR 0018.
+bench-zc-loan-lockfree:
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-zc-loan-lockfree :file "bench/report/2026-06-16-wp-zc-loan-lockfree.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-ASYNC-FLOW Phase F1 (FR-PF-2, FR-LANG-7): HONEST rate-shaping report — achieved-vs-configured rate,
 # single-writer paced vs the enable-async UNPACED baseline (pacing ADDS latency by design — no 0-cost claim),

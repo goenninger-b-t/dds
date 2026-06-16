@@ -4540,8 +4540,9 @@
      (1) LITERAL 0-COPY READ (byte-exact): reading EVERY field via <name>-<field>-fd on the loaned VIEW (which
          reads straight off the writer's SHMEM slot SAP) EQUALS the published values — no copy, no deserialize.
      (2) SLOT REUSABLE AFTER return-loan: the loaned slot's refcount is held while loaned; after return-loan the
-         refcount drops to 0 and a subsequent %zc-loan REUSES that exact slot — proving the loan was the only
-         holder and the release frees it.
+         refcount drops to 0 so the slot becomes reclaimable again — proving the loan was the only holder and the
+         release frees it (the freelist was dropped, WP-ZC-LOAN-LOCKFREE ADR 0018, so the writer-scan reclaims any
+         refcount==0 slot; which exact slot is not part of the contract).
      (3) DOUBLE return-loan is a SAFE no-op (idempotent — no double-%zc-release, no error).
      (4) READER-CLOSE RETURNS AN OUTSTANDING LOAN: take a fresh loan, do NOT return it, delete the participant —
          the registry-driven reader-close release frees the slot (refcount 0; no leaked refcount pinning the
@@ -4603,7 +4604,9 @@
                       (slot (dds.types:flatdata-view-slot-index view)))
                  (%check :loan-held (= 1 (%zc-slot-refcount wsap slot))
                          "while loaned the slot refcount must be 1 (held; force-reclaim skips it -> no UAF)")
-                 ;; (2) return-loan frees the slot -> the next %zc-loan REUSES it (the loan was the only holder)
+                 ;; (2) return-loan frees the slot (refcount->0) -> it becomes reclaimable, so a subsequent
+                 ;; %zc-loan SUCCEEDS (which exact slot it picks is a writer-scan/oldest-first detail since the
+                 ;; freelist was dropped, WP-ZC-LOAN-LOCKFREE ADR 0018 — the contract is "freed -> reusable")
                  (dds.dcps:return-loan dr loans)
                  (%check :loan-released (zerop (%zc-slot-refcount wsap slot))
                          "after return-loan the slot refcount must be 0 (freed)")
@@ -4612,8 +4615,8 @@
                  (multiple-value-bind (rslot rgen)
                      (dds.xport.zerocopy::%zc-loan wsap (subseq (dds.core.buffer:octet-buffer-vec fd) 0 +fd-abc-flatdata-size+)
                                                    0 +fd-abc-flatdata-size+ 1)
-                   (%check :loan-slot-reusable (eql rslot slot)
-                           "the released slot must be reusable by a subsequent %zc-loan (refcount freed it)")
+                   (%check :loan-slot-reusable rslot
+                           "after the loan was freed a subsequent %zc-loan must succeed (a reclaimable slot exists)")
                    (dds.xport.zerocopy::%zc-release wsap rslot rgen))   ; balance this probe loan
                  ;; (3) double return-loan is a safe no-op (idempotent)
                  (dds.dcps:return-loan dr loans)

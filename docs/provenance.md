@@ -1357,6 +1357,48 @@ freelist + the loan-capable wiring) is **clean-room**:
   reference resolves across two OS processes; literal-0-copy is a LOCAL read optimization — the wire is
   byte-identical, so no separate loan-variant cross-process harness was added).
 
+## M5 (2026-06-16) — WP-ZC-LOAN-LOCKFREE lock-free 0-alloc loaned RX (FR-PF-3/4, NFR-PERF-7, ADR 0018, Phases A–C)
+
+The lock-free loaned-RX path (`src/dds-xport/zerocopy-pool.lisp` `%zc-loan` payload→`fence :release`→
+generation-store-LAST + the freelist drop + `%zc-take-free-or-reclaim` always-scan, `%zc-acquire-for-read`
+generation-acquire-load→`fence :acquire`→validate→clamped read, `%zc-release` direct `cas-sap-u32` refcount
+decrement; `src/dds-pal/{pal-contract,pal-sbcl,pal-clasp}.lisp` the `cas-sap-u32` primitive;
+`src/dds-tests/{echo-test,pbt-test}.lisp`, `Makefile` the unit tests + the bench) is **clean-room**:
+
+- Implemented from **FR-PF-3 / FR-PF-4 + the OMG XCDR fixed-size layout + the OMG DDS `read()`/`take()` +
+  `return_loan()` read-by-reference model + the standard lock-free single-producer release/acquire publication
+  protocol** (a release store of a generation/version word after the payload, paired with an acquire load
+  before the consumer reads — the textbook handshake this project already uses for the WP-SHMEM ring cursor,
+  ADR 0013). The payload→release-fence→generation-last reorder, the always-scan reclaim, the no-freelist
+  `cas`-decrement release, and the direct-u32-refcount CAS are this project's **own design from first
+  principles** + the OMG loan model + the WP-SHMEM ring pattern. No RTI mechanism.
+- **The arm64 barrier analysis is from SBCL's own VOP disassembly, no external source.** That
+  `dds.pal:fence :release`/`:acquire` lower to a real `DMB SY` store/load barrier and that `sb-ext:cas` over
+  `sb-sys:sap-ref-32` lowers to a full-barrier `CASAL` was confirmed by **disassembling SBCL's own generated
+  code** (`disassemble` over the PAL primitives), not by reading any external/vendor source — the same
+  clean-room rule as code: verify against the toolchain, never invent.
+- **No RTI source, headers, or `rtiddsgen` output consulted; no other vendor's FlatData/Zero-Copy/lock-free
+  loan implementation read; no RTI patent / whitepaper read.** No Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) /
+  OpenDDS source was read for this work package.
+- **NOT cleared for ship — pending counsel (R6).** This only makes the release/acquire of the already-R6-gated
+  FlatData+Zero-Copy literal-0-copy loan path (ADR 0017) lock-free — the patent posture is unchanged; gated
+  default-OFF twice (`dds.disc:*zerocopy-enabled*` nil **and** the per-type `:flatdata t`). With either off the
+  data path is byte-identical (only the writer's local slot-store order + slot-acquisition strategy changed;
+  the wire bytes are unchanged). Counsel performs the authoritative claim clearance before any
+  `*zerocopy-enabled*`-on FlatData-loan ship; this entry + ADR 0018 record provenance.
+- Validated by `zc-loan-nofreelist` (the always-scan reclaim sans the freelist), `zc-lockfree-acquire` /
+  `zc-lockfree-release` (the lock-free fenced-read acquire + the `cas`-decrement release, 0-alloc),
+  `zc-lockfree-release-biggen` (the Phase-B amendment regression guard — asserts the release is 0-alloc at
+  generation `2^31`; FAILS at ~32 B against the dropped combined-word `cas-sap-u64` overlay that boxed a
+  bignum), `zc-lockfree-stress` (the lock-free release-race under real threads — no torn read, no refcount
+  underflow/leak, no slot overwritten under a reader), the existing `zc-xproc` (the genuine cross-process
+  release/acquire — byte-exact), and `run-bench-zc-loan-lockfree`
+  (`make bench-zc-loan-lockfree` → `bench/report/2026-06-16-wp-zc-loan-lockfree.md`) — none of which involves a
+  vendor artifact; measured with this project's own `dds.pal:bytes-consed` / `dds.pal:monotonic-ns` seams over
+  its own pool primitives. HONEST (FR-LANG-7): the report states the loaned RX *literal 0-alloc* win AND the
+  writer's O(slots)-scan tradeoff (the dropped O(1) freelist-pop) + the loan/return calls + the app's return
+  obligation — no `0-cost`/`free` claim.
+
 ## M5 (2026-06-15) — WP-ASYNC-FLOW asynchronous flow control (FR-PF-2, ADR 0016, Phases A–F)
 
 The whole WP-ASYNC-FLOW — the `flow-token-bucket` metering primitive (`src/dds-disc/flow-control.lisp`

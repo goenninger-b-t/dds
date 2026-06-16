@@ -129,7 +129,8 @@ raw foreign 64-bit cell addressed by `(sap, byte-offset)`, which the generic `pl
 |---|---|---|
 | `dds.pal:load-sap-u64` | function | `(sap offset)` — aligned 64-bit read of the foreign location at `sap+offset` (bytes). |
 | `dds.pal:store-sap-u64` | function | `(sap offset value)` — aligned 64-bit write of `value` at `sap+offset`. |
-| `dds.pal:cas-sap-u64` | function | `(sap offset old new)` — atomic compare-and-swap of the u64 at `sap+offset`; returns the PREVIOUS value (= `old` on success). **SBCL only** (`sb-ext:cas` over `sb-sys:sap-ref-64`); **Clasp signals `pal-unimplemented`** — Clasp has no usable hardware atomic over a raw foreign cell (NFR-PORT gap, ADR 0013). Unused by the v1 ring (the lane claim is mutex-guarded), kept for a future lock-free-MPSC optimization. |
+| `dds.pal:cas-sap-u64` | function | `(sap offset old new)` — atomic compare-and-swap of the u64 at `sap+offset`; returns the PREVIOUS value (= `old` on success). **SBCL only** (`sb-ext:cas` over `sb-sys:sap-ref-64`, a full barrier); **Clasp signals `pal-unimplemented`** — Clasp has no usable hardware atomic over a raw foreign cell (NFR-PORT gap, ADR 0013). Unused by the v1 SHMEM ring (the lane claim is mutex-guarded) and no longer by the Zero-Copy loan release (which now uses `cas-sap-u32` directly on the refcount sub-field — see below). |
+| `dds.pal:cas-sap-u32` | function | `(sap offset old new)` — atomic compare-and-swap of the u32 at `sap+offset`; returns the PREVIOUS value (= `old` on success). **SBCL only** (`sb-ext:cas` over `sb-sys:sap-ref-32`, disassembled to arm64 `CASAL` — a 32-bit full barrier, the same acquire+release ordering as the u64 CAS); **Clasp signals `pal-unimplemented`** (same NFR-PORT gap, ADR 0013). Backs the lock-free `%zc-release`: it CASes ONLY the u32 refcount cell directly, so the combined `(generation<<32)|refcount` word is never materialised — **0-alloc at any generation** (a `cas-sap-u64` overlay of that word boxed a bignum once the generation reached ~2^30; NFR-MEM); the full barrier orders the reader's payload reads before `refcount→0` (WP-ZC-LOAN-LOCKFREE, R6, ADR 0018; NOT cleared for ship — pending counsel). |
 | `dds.pal:atomic-incf-sap-u64` | function | `(sap offset delta)` — atomically add `delta` to the u64 at `sap+offset`; returns the NEW value. SBCL only (CAS-retry fetch-add); Clasp signals `pal-unimplemented` (same gap). Unused by the v1 ring. |
 
 **POSIX shared memory + cross-process notification (ADR 0013)** — the SHMEM transport's segment and its
@@ -559,7 +560,7 @@ even at `(safety 0)` (NFR-SEC-POSTURE); an invalid reference is dropped (best-ef
 | `dds.disc:disc-node-zc-sends` | accessor | Count of samples this node published as a 16-byte reference (proof/diagnostic). |
 | `dds.rtps.discovery:endpoint-data-zerocopy-capable` | accessor | T iff the endpoint advertised `PID_ZEROCOPY_CAPABLE` (fail-open: absent → NIL). |
 | `dds.cdr:+zc-encapsulation-id+` / `encode-zc-reference` / `parse-zc-reference` | constant / functions | The 20-octet reference codec (4-octet encapsulation header + `{slot-index, generation, slot-bytes, reserved}` LE). |
-| `dds.xport.zerocopy` | package | The SHMEM sample-pool (`%zc-loan`/`%zc-resolve`/`%zc-release`, pshared-mutex-guarded — full Clasp parity, no foreign-SAP CAS). |
+| `dds.xport.zerocopy` | package | The SHMEM sample-pool. The mutex'd copy-resolve (`%zc-resolve`/`%zc-resolve-fresh`) keeps full Clasp parity; the **loaned-RX path is lock-free** (WP-ZC-LOAN-LOCKFREE, ADR 0018, R6): `%zc-loan` writes payload → `fence :release` → generation-store-LAST (the generation is the release/acquire sync variable), `%zc-acquire-for-read` is a generation acquire-load + `fence :acquire` + clamped read (0-copy/0-alloc), and `%zc-release` is a direct `cas-sap-u32` refcount decrement (0-alloc at any generation; the freelist was dropped, so the writer's loan scans the lowest-pubseq `refcount==0` slot, O(slots)). The lock-free path is SBCL-only (foreign-SAP atomics, ADR 0013); Clasp pass-skips. |
 
 The pool segment name derives deterministically from the writer GUID (`seg-name-for-guid` + `"z"`), so the
 reader maps it with no extra advertisement. The cross-vendor case is out of scope (the segment + encapsulation
@@ -594,7 +595,11 @@ boundary. SBCL only (Clasp/macOS inherits the SHMEM by-name-attach gap). **FlatD
 RX landed (WP-FLATDATA-ZC-LOAN, FR-PF-3/4, ADR 0017): a loan-capable `:flatdata` reader's disc receiver thread
 stores the unresolved reference (no copy; slot held via the writer's refcount) and the DCPS `take-loaned` /
 `return-loan` loan API hands the app a `flatdata-view` it reads in place off the writer's slot — see the type
-system wiki. RELIABLE Zero-Copy and the loan-WRITE API remain follow-ups.**
+system wiki. The loaned RX is now also literal 0-alloc (WP-ZC-LOAN-LOCKFREE, ADR 0018): `%zc-acquire-for-read`
++ `%zc-release` are lock-free (a generation acquire-load + `fence :acquire`, and a `cas-sap-u32` refcount
+decrement) so the per-sample loaned RX consumes literal 0 GC-heap bytes (the progression `65552 → 79 → 31 → 0`,
+`make bench-zc-loan-lockfree`) — honest tradeoff: the writer's loan is now O(slots) (the freelist was dropped),
+benched at Phase C. RELIABLE Zero-Copy and the loan-WRITE API remain follow-ups.**
 
 ### NFR-PORT gap — Clasp/macOS-arm64
 
@@ -624,7 +629,13 @@ affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and fore
   identity serialize (0-alloc TX), a SAFE SINGLE-COPY RX over Zero-Copy for non-loan readers (~830x less RX GC
   than the v1 sink+re-copy), and — for a loan-capable `:flatdata` reader — **literal-0-copy RX via the DCPS
   loan/return_loan API** (WP-FLATDATA-ZC-LOAN, ADR 0017: `take-loaned`/`read-loaned` hand a `flatdata-view` read
-  in place off the writer's SHMEM slot, `return-loan` releases it; force-reclaim skips held slots, so no UAF).
+  in place off the writer's SHMEM slot, `return-loan` releases it; force-reclaim skips held slots, so no UAF),
+  now also **lock-free 0-alloc** (WP-ZC-LOAN-LOCKFREE, ADR 0018: the loaned RX `%zc-acquire-for-read` +
+  `%zc-release` dropped the pool mutex for a generation acquire-load + `fence :acquire` and a `cas-sap-u32`
+  refcount decrement, so the per-sample loaned RX is **literal 0 GC bytes** — the progression `65552 → 79 → 31
+  → 0`, `make bench-zc-loan-lockfree`; honest tradeoff: the writer's loan lost its O(1) freelist-pop for an
+  O(slots) `refcount==0` scan, ~106 ns/loan at 2 slots → ~1801 ns at 128, benched at Phase C — the reader RX is
+  the win, the writer pays a small bounded scan; a lock-free freelist to restore O(1) is a noted follow-up).
   **NOT cleared for ship pending counsel (R6).** See the [type system wiki](type-system.md#8-flatdata--flatdata-t-offset-accessors-final-fixed-size-no_key-v1-r6-not-cleared-for-ship). The untrusted wrap/read + ZC resolve clamp
   are fuzzed (`make fuzz`).
 - **Planned:** the app-facing ZC loan-**write** API (the remaining TX app→slot copy), reliable Zero-Copy, a TCP transport, a Linux

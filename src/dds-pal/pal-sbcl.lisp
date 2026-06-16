@@ -132,6 +132,14 @@
     (function (t (integer 0) (unsigned-byte 64) (unsigned-byte 64)) (unsigned-byte 64))
   "Atomic compare-and-swap of the u64 at SAP+OFFSET; returns the PREVIOUS value (= OLD on success)."
   (sb-ext:cas (sb-sys:sap-ref-64 sap offset) old new))
+(defun* cas-sap-u32 (sap offset old new)
+    (function (t (integer 0) (unsigned-byte 32) (unsigned-byte 32)) (unsigned-byte 32))
+  "Atomic compare-and-swap of the u32 at SAP+OFFSET; returns the PREVIOUS value (= OLD on success). The
+   full-barrier (arm64 CASAL) atomic backing the lock-free loan release: it CASes ONLY the 4-byte refcount
+   sub-field directly, so the combined (generation<<32)|refcount value never materialises — no bignum boxing
+   at any generation (NFR-MEM, the 0-alloc-at-any-generation fix). Same acquire+release ordering as
+   CAS-SAP-U64 (WP-ZC-LOAN-LOCKFREE, R6 — NOT cleared for ship, see ADR 0018)."
+  (sb-ext:cas (sb-sys:sap-ref-32 sap offset) old new))
 (defun* atomic-incf-sap-u64 (sap offset delta)
     (function (t (integer 0) (unsigned-byte 64)) (unsigned-byte 64))
   "Atomically add DELTA to the u64 at SAP+OFFSET; returns the NEW value."
