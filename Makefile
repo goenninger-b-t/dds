@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-zc-loan-lockfree bench-async-flow shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-zc-loan-lockfree bench-async-flow bench-keeplast shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -27,6 +27,9 @@ LOCALTYPE ?= shape-type
 COUNT    ?= 0
 LATSAMPLES  ?= 10000
 THRUSAMPLES ?= 20000
+KLSAMPLES   ?= 1000000
+KLINSTANCES ?= 100
+KLDEPTH     ?= 2
 PEERS    ?=
 LIVELINESS ?=
 LEASE    ?=
@@ -212,6 +215,16 @@ bench-zc-loan-lockfree:
 bench-async-flow:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-async-flow :file "bench/report/2026-06-15-wp-async-flow.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+
+# WP-KEEPLAST Task E1 (DDS 1.4 §2.2.3.18, FR-LANG-7): HONEST writer-side cost of per-instance
+# KEEP_LAST. Drives dds.rtps.history:hc-add-change directly so the KEEP_LAST-vs-KEEP_ALL delta
+# isolates the per-instance index + evict (not the transport path). Writer throughput + GC
+# bytes/sample for KEEP_ALL/KEEP_LAST x keyed/unkeyed + the keyhash-derivation line; SBCL is the
+# record (Clasp bytes-consed=0, NFR-PORT gap). Writes bench/report/2026-06-16-wp-keeplast.md.
+bench-keeplast:
+	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
+	        --eval '(with-open-file (s "bench/report/2026-06-16-wp-keeplast.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.bench :run-keeplast-bench :samples $(KLSAMPLES) :instances $(KLINSTANCES) :depth $(KLDEPTH) :stream s))' \
+	        --eval '(uiop:quit 0)'
 
 # WP-SHMEM Task F1 (FR-XPORT-2): REAL two-OS-process cross-process SHMEM round-trip.
 # Two SEPARATE SBCL processes discover over loopback UDP (:peers, no multicast) and the

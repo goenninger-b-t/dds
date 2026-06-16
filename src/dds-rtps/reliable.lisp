@@ -14,6 +14,13 @@
 (defparameter *max-reassembly-fragments* 8192
   "Cap on the fragment count per reassembled sample (NFR-SEC-POSTURE).")
 
+(defparameter *max-gap-range* 65536
+  "Cap on the contiguous [gapStart, base) span a single inbound GAP may mark irrelevant, BEFORE
+   iterating it — gapStart/base are wire-controlled 64-bit values and last-sn is itself set from
+   inbound HEARTBEATs, so neither bounds the loop; an unclamped span is a CPU+memory DoS
+   (resource-exhaustion guard, NFR-SEC-POSTURE; RTPS 2.5 §8.3.7.4). A legitimately larger evicted
+   run is recovered across subsequent GAP/HEARTBEAT rounds (firstSN compaction), so capping is loss-free.")
+
 ;;; ---- Writer side (§8.4.2): one ReaderProxy per matched reader ----
 
 (defstruct* (reader-proxy (:constructor make-reader-proxy))
@@ -119,17 +126,21 @@
   (or (gethash reader-id (rtps-writer-proxies writer))
       (setf (gethash reader-id (rtps-writer-proxies writer)) (make-reader-proxy))))
 
-(defun* writer-write (writer payload)
-    (function (rtps-writer (array (unsigned-byte 8) (*))) (or integer (eql :timeout)))
+(defun* writer-write (writer payload &optional (key-hash nil))
+    (function (rtps-writer (array (unsigned-byte 8) (*)) &optional (or null (array (unsigned-byte 8) (*))))
+              (or integer (eql :timeout)))
   "Add a new :data change to the writer's HistoryCache; return its sequence number, OR the :timeout sentinel
    (RETCODE_TIMEOUT) if a FULL KEEP_ALL cache (RESOURCE_LIMITS max_samples) did not free a slot within the
    writer's max_blocking_time (RELIABILITY.max_blocking_time) — DDS-standard block-up-to-max_blocking_time
    backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS, ADR 0016 §Backpressure; see %writer-add-bounded). For a
    writer with no finite max_samples (the default, KEEP_ALL/unlimited or KEEP_LAST) this NEVER blocks and
    NEVER returns :timeout — byte-identical to the prior behaviour. On :timeout the cache is left intact and
-   NO sequence number is consumed (the reliable SN stream stays hole-free)."
+   NO sequence number is consumed (the reliable SN stream stays hole-free). KEY-HASH (WP-KEEPLAST, ADR 0019,
+   DDS 1.4 §2.2.3.18) is the sample's 16-octet instance handle recorded on the change for per-instance
+   KEEP_LAST eviction; NIL (the default) keeps the change's instance-key-hash unset — byte-identical to before."
   (%writer-add-bounded
-   writer (lambda (sn) (dds.rtps.history:make-cache-change :sn sn :serialized-payload payload))))
+   writer (lambda (sn) (dds.rtps.history:make-cache-change
+                        :sn sn :serialized-payload payload :instance-key-hash key-hash))))
 
 (defun* writer-lifecycle-change (writer key-hash status-flags)
     (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)) (or integer (eql :timeout)))
@@ -210,11 +221,13 @@
     (function (rtps-writer list) (integer 0))
   "Drop from the writer's HistoryCache every change that EVERY matched reader has acknowledged — SN below
    the minimum acked-base over READER-KEYS' proxies (RTPS 2.5 §8.4.1: VOLATILE writer history is bounded
-   by the slowest reader's ack). Each key's proxy is created with acked-base 1 if absent, so a matched
-   reader that has not yet ACKed holds the watermark at 1 and NOTHING is purged until it acks. A NACKed
-   sample is not fully-acked (acked-base has not passed it), so it is never purged — reliable repair is
-   unaffected and no GAP is needed. Returns the number of changes purged; a no-op (0) when READER-KEYS is
-   empty (no matched reader -> keep everything, bounded only by RESOURCE_LIMITS). When changes ARE purged
+   by the slowest reader's ack), via hc-purge-below which routes each removal through the index-consistent
+   single removal path (so a purge keeps the per-instance KEEP_LAST index in step, ADR 0019). Each key's
+   proxy is created with acked-base 1 if absent, so a matched reader that has not yet ACKed holds the
+   watermark at 1 and NOTHING is purged until it acks. A NACKed sample is not fully-acked (acked-base has
+   not passed it), so it is never purged — reliable repair is unaffected and no GAP is needed. Returns the
+   number of changes purged; a no-op (0) when READER-KEYS is empty (no matched reader -> keep everything,
+   bounded only by RESOURCE_LIMITS). When changes ARE purged
    (the cache shrank), broadcast SPACE-CV so a writer-write/writer-lifecycle-change blocked on a full
    KEEP_ALL cache wakes — this is the ACKNACK purge half of the WP-ASYNC-FLOW space-available signal (ADR
    0016 §Backpressure); the signal is sent AFTER the writer LOCK is released (the non-recursive LOCK)."
@@ -317,10 +330,19 @@
 (defun* reader-on-gap (reader writer-id gap-start base numbits bitmap)
     (function (rtps-reader t integer integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) t)
   "Mark GAPped SNs as irrelevant so they do not block the ack (RTPS 2.5 §8.3.7.4):
-   the range [gapStart, base-1] plus the SNs listed in the bitmap."
-  (let ((received (writer-proxy-received (get-writer-proxy reader writer-id))))
-    (loop for sn from gap-start below base do (setf (gethash sn received) :gap))
-    (dotimes (i numbits)
+   the range [gapStart, base-1] plus the SNs listed in the bitmap. The contiguous range is LOWER-clamped
+   to the proxy's first-sn (marking below the live window is pointless) and its iteration is HARD-capped at
+   *max-gap-range* SNs — gapStart/base are wire-controlled 64-bit values and last-sn is itself set from
+   inbound HEARTBEATs, so NEITHER bounds the loop; the cap (independent of any wire value) is the
+   resource-exhaustion guard against a 2^60-span CPU+memory DoS (NFR-SEC-POSTURE; RTPS 2.5 §8.3.7.4). A
+   legitimately larger evicted run is recovered over subsequent GAP/HEARTBEAT rounds (firstSN compaction),
+   so the cap is loss-free. The bitmap loop is already bounded (numBits<=256, <=256 inserts)."
+  (let* ((proxy (get-writer-proxy reader writer-id))
+         (received (writer-proxy-received proxy))
+         (lo (max gap-start (writer-proxy-first-sn proxy)))         ; don't mark below the proxy window
+         (hi (min base (+ lo *max-gap-range*))))                    ; HARD cap — independent of wire last-sn
+    (loop for sn from lo below hi do (setf (gethash sn received) :gap))
+    (dotimes (i numbits)                                            ; bitmap is already bounded (numBits<=256)
       (when (dds.rtps.message:seqnum-set-bit-p bitmap i)
         (setf (gethash (+ base i) received) :gap)))
     t))

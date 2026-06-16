@@ -1464,3 +1464,32 @@ spec only** — **no RTI Connext source, headers, or `rtiddsgen` output** was co
   (`flow-pacing`, `flow-multiwriter-rr`, `flow-backpressure`, `flow-concurrency-stress`,
   `flow-teardown`, `flow-off-byte-identical`) and the honest rate-shaping bench (`run-bench-async-flow`),
   none of which consult any vendor artifact.
+
+## M5 (2026-06-16) — WP-KEEPLAST per-instance KEEP_LAST history + GAP both directions (DDS 1.4 §2.2.3.18, RTPS 2.5 §8.3.7.4/§8.4.1)
+
+- WP-KEEPLAST — making HISTORY `KEEP_LAST` apply **per instance** on both sides (the HistoryCache
+  keyhash→SN index + the single `%hc-remove-change` removal path in `src/dds-rtps/history.lisp`, the
+  additive `key-hash` threading through `writer-write`/`publish-sample`/`write-sample`, the writer HC +
+  reader DCPS-cache QoS honoring via `enable-publisher` + `%drain-one-sample`, the default flip to spec
+  KEEP_LAST-1, the GAP send `%on-user-acknack` + the reader `+submsg-gap+` dispatch with the
+  `*max-gap-range*` cap, and the honest write-path bench `run-keeplast-bench` /
+  `bench/report/2026-06-16-wp-keeplast.md`) — is **clean-room from OMG DDS 1.4 §2.2.3.18 + DDSI-RTPS 2.5
+  §8.3.7.4/§8.4.1 + the in-repo WP-KEEPLAST design spec only** — **no RTI Connext source, headers, or
+  `rtiddsgen` output** was consulted.
+- **Sources consulted**: the operating contract §4 (FR-QOS); the in-repo design spec
+  `docs/superpowers/specs/2026-06-16-wp-keeplast-perinstance-design.md`; DDS 1.4 §2.2.3.18 ("KEEP_LAST …
+  keep the last `depth` values **for each instance**") + §2.2.3 (the generic QoS default table, HISTORY =
+  KEEP_LAST depth 1); DDSI-RTPS 2.5 §8.3.7.4 (GAP — irrelevant/no-longer-available SNs) + §8.4.1
+  (HistoryCache + the writer's first/last SN in HEARTBEAT). The per-instance index (a keyhash→ordered-SN
+  bucket, evict-from-head) and the reactive-GAP-on-NACK wiring are this project's **own implementation
+  from the OMG clauses**, not from any RTI artifact.
+- **This is standard DDS QoS conformance — NOT patent-gated** (no R6 marker, no "NOT cleared for ship"
+  header): per-instance KEEP_LAST and the GAP are normative OMG behaviour.
+- **No Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) / OpenDDS source was read** for this work package.
+- Validated by the HistoryCache-unit tests (`hc-perinstance-keeplast`, `hc-keeplast-unkeyed`,
+  `hc-remove-change-consistency`, `rtps-history-purge`, `purge-reliable-only`), the end-to-end scenarios
+  (`keeplast-writer-perinstance-e2e`, `keeplast-interior-hole-gap-e2e`, `keeplast-firstsn-advance`,
+  `keeplast-reader-perinstance-e2e`, `keeplast-unkeyed-collapse`, `keeplast-keepall-regression`,
+  `keeplast-reliability-composition`), the keyhash-threading test (`keeplast-keyhash-threaded`), and the
+  honest write-path bench (`run-keeplast-bench`) — 226 green SBCL + Clasp — none of which consult any
+  vendor artifact.

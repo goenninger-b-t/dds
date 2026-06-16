@@ -203,6 +203,21 @@
   "T iff the bit for offset DELTA is set: word DELTA/32, bit (31-DELTA%32) (§9.4.2.6)."
   (logbitp (- 31 (mod delta 32)) (aref bitmap (floor delta 32))))
 
+(defun* seqnum-set-from-sns (sns)
+    (function (cons) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))))
+  "Build a SequenceNumberSet (RTPS 2.5 §9.4.2.6) covering the non-empty SN list SNS: (values base numBits
+   bitmap), base = min SN, numBits = (max−min+1), one bit set per SN via the shared seqnum-set-bit (so the
+   MSB-first word layout is never re-derived). SNS must fit one 256-SN window (max−min < 256), as it does for
+   the SNs of a single inbound ACKNACK's SequenceNumberSet; ASSERTed."
+  (let* ((lo (reduce #'min sns))
+         (hi (reduce #'max sns))
+         (numbits (1+ (- hi lo))))
+    (assert (<= numbits +seqnum-set-max-bits+))
+    (let ((bitmap (make-array (max 1 (%seqnum-set-words numbits))
+                              :element-type '(unsigned-byte 32) :initial-element 0)))
+      (dolist (sn sns) (seqnum-set-bit bitmap (- sn lo)))
+      (values lo numbits bitmap))))
+
 (defun* write-sequence-number-set (cursor base numbits bitmap)
     (function (dds.core.buffer:cursor integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) fixnum)
   "Write a SequenceNumberSet: bitmapBase + numBits + M longs (RTPS 2.5 §9.4.2.6)."

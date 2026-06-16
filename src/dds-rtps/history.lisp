@@ -21,18 +21,25 @@
 
 ;;;; HistoryCache (FR-RTPS-5): a change store honouring HISTORY (KEEP_LAST depth /
 ;;;; KEEP_ALL) and RESOURCE_LIMITS (max_samples). v1 keys changes by sequence
-;;;; number in a hash-table; a pooled, zero-alloc store + non-consing iteration,
-;;;; per-instance KEEP_LAST, and LIFESPAN expiry are tracked follow-ups.
+;;;; number in a hash-table; a secondary keyhash->SN index applies KEEP_LAST depth
+;;;; PER INSTANCE (DDS 1.4 §2.2.3.18). A pooled, zero-alloc store + non-consing
+;;;; iteration and LIFESPAN expiry are tracked follow-ups.
 
 (defstruct* (history-cache (:constructor %make-history-cache))
   "A HistoryCache (FR-RTPS-5): a change store honouring HISTORY (KIND :keep-last with
-   DEPTH / :keep-all) and RESOURCE_LIMITS (MAX-SAMPLES; nil = unlimited). v1 keys
-   changes by sequence number in a hash-table. Build via MAKE-HISTORY-CACHE."
+   DEPTH / :keep-all) and RESOURCE_LIMITS (MAX-SAMPLES; nil = unlimited). CHANGES keys
+   changes by sequence number; INSTANCES is the per-instance KEEP_LAST index — instance
+   keyhash (EQUALP) -> that instance's stored SNs oldest-first (DDS 1.4 §2.2.3.18: KEEP_LAST
+   keeps the last DEPTH values per instance). A NIL / HANDLE_NIL keyhash collapses to one
+   shared bucket (global KEEP_LAST). The index is maintained for KEEP_LAST ONLY (its sole
+   consumer is per-instance eviction); a KEEP_ALL cache keeps it empty (an O(1) change-table
+   insert, never evicted per-instance). Build via MAKE-HISTORY-CACHE."
   (kind :keep-last :type (member :keep-last :keep-all))
   (depth 1 :type (integer 1))
   (max-samples nil :type (or null (integer 0)))                                  ; resource limit; nil = unlimited
   (type-support nil :type (or null dds.types:type-support))
   (changes (make-hash-table :test 'eql) :type hash-table)
+  (instances (make-hash-table :test 'equalp) :type hash-table)                   ; keyhash -> SNs oldest-first (per-instance KEEP_LAST, §2.2.3.18)
   (count 0 :type (integer 0)))
 
 (defun* %resolve-max-samples (resource-limits)
@@ -72,23 +79,70 @@
   "Return the CacheChange with SEQNUM, or NIL."
   (values (gethash seqnum (history-cache-changes hc))))
 
+(defun* %hc-bucket-key (key-hash)
+    (function (t) t)
+  "The per-instance index bucket key for a change's INSTANCE-KEY-HASH. A NIL or all-zero
+   HANDLE_NIL collapses to one canonical :UNKEYED bucket (the single-instance/global KEEP_LAST
+   case, DDS 1.4 §2.2.3.18); any other 16-octet handle is its own bucket (EQUALP-compared)."
+  (if (or (null key-hash) (every #'zerop key-hash)) :unkeyed key-hash))
+
+(defun* %hc-index-append (hc sn change)
+    (function (history-cache integer cache-change) t)
+  "Append SN to its instance bucket tail (SNs arrive monotonically per writer, so the bucket
+   stays oldest-first) in the per-instance KEEP_LAST index (DDS 1.4 §2.2.3.18). KEEP_LAST-ONLY:
+   the index serves per-instance eviction, which only KEEP_LAST performs; a KEEP_ALL cache never
+   evicts per-instance, so it keeps NO index — an O(1) change-table insert, unchanged from pre-WP
+   (a KEEP_ALL bucket would otherwise grow unbounded and the tail-append would be O(N) = O(N²) total).
+   The append walks the bucket tail, which under KEEP_LAST is bounded by DEPTH (O(depth))."
+  (when (eq (history-cache-kind hc) :keep-last)
+    (let ((key (%hc-bucket-key (cache-change-instance-key-hash change))))
+      (setf (gethash key (history-cache-instances hc))
+            (nconc (gethash key (history-cache-instances hc)) (list sn)))))
+  t)
+
+(defun* %hc-index-drop (hc sn change)
+    (function (history-cache integer cache-change) t)
+  "Drop SN from its instance bucket in the per-instance index; remove the bucket when it empties
+   so a re-created instance starts fresh (no orphaned SN inflating a later depth check). KEEP_LAST-ONLY
+   (mirrors %hc-index-append): a KEEP_ALL cache keeps no index, so its purge/dispose removals never
+   touch it (an O(1) change-table-only removal, unchanged from pre-WP)."
+  (when (eq (history-cache-kind hc) :keep-last)
+    (let* ((key (%hc-bucket-key (cache-change-instance-key-hash change)))
+           (rest (delete sn (gethash key (history-cache-instances hc)))))
+      (if rest
+          (setf (gethash key (history-cache-instances hc)) rest)
+          (remhash key (history-cache-instances hc)))))
+  t)
+
+(defun* %hc-remove-change (hc seqnum)
+    (function (history-cache integer) t)
+  "The single change-removal path: drop SEQNUM from BOTH the change table and its per-instance
+   index bucket, decrementing the count, so the two never drift (ADR 0019). Return T if one was
+   present. Used by KEEP_LAST eviction, the full-ACK purge (writer-purge-acked), and dispose."
+  (let ((change (gethash seqnum (history-cache-changes hc))))
+    (when change
+      (remhash seqnum (history-cache-changes hc))
+      (%hc-index-drop hc seqnum change)
+      (decf (history-cache-count hc))
+      t)))
+
 (defun* hc-remove-change (hc seqnum)
     (function (history-cache integer) t)
-  "Remove the change with SEQNUM; return T if one was present."
-  (when (remhash seqnum (history-cache-changes hc))
-    (decf (history-cache-count hc))
-    t))
+  "Remove the change with SEQNUM; return T if one was present. Routes through %HC-REMOVE-CHANGE so
+   the per-instance index stays consistent with the change table (ADR 0019)."
+  (%hc-remove-change hc seqnum))
 
 (defun* hc-purge-below (hc base)
     (function (history-cache integer) (integer 0))
   "Remove every change with SN < BASE (fully acknowledged + done); return the number removed. O(stored),
    no sort — bounds a KEEP_ALL writer history once all matched readers have ACKed past BASE (RTPS 2.5
-   §8.4.1). The HEARTBEAT firstSN (hc-min-seq) then advances past the purged range."
+   §8.4.1). Routes each removal through %HC-REMOVE-CHANGE so the per-instance index stays consistent (ADR
+   0019). The HEARTBEAT firstSN (hc-min-seq) then advances past the purged range."
   (let ((removed '()))
     (maphash (lambda (sn ch) (declare (ignore ch)) (when (< sn base) (push sn removed)))
              (history-cache-changes hc))
     (dolist (sn removed (length removed))
-      (hc-remove-change hc sn))))
+      (%hc-remove-change hc sn))))
 
 (defun* hc-min-seq (hc)
     (function (history-cache) t)
@@ -110,28 +164,29 @@
 
 (defun* %hc-store (hc sn change)
     (function (history-cache integer cache-change) (integer 0))
-  "Insert CHANGE under sequence number SN into the history cache's change table, bumping its count; returns the new count."
+  "Insert CHANGE under sequence number SN into the change table, bumping the count, and append SN to
+   its per-instance index bucket (KEEP_LAST only — %hc-index-append no-ops for KEEP_ALL); returns
+   the new count."
   (setf (gethash sn (history-cache-changes hc)) change)
+  (%hc-index-append hc sn change)
   (incf (history-cache-count hc)))
-
-(defun* %hc-evict-oldest (hc)
-    (function (history-cache) t)
-  "Remove the lowest-sequence-number change from the history cache (KEEP_LAST eviction); no-op if empty."
-  (let ((min (hc-min-seq hc)))
-    (when min (hc-remove-change hc min))))
 
 (defun* hc-add-change (hc change)
     (function (history-cache cache-change) symbol)
   "Add CHANGE, enforcing HISTORY + RESOURCE_LIMITS (FR-RTPS-5). Returns :OK,
    :DUPLICATE (SN already present), or :REJECTED-RESOURCE-LIMITS (KEEP_ALL at
-   max_samples). KEEP_LAST evicts the lowest SN when at depth."
+   max_samples). KEEP_LAST keeps the last DEPTH values PER INSTANCE (DDS 1.4 §2.2.3.18):
+   when CHANGE's instance is at depth, its OWN oldest SN is evicted (a NIL/HANDLE_NIL
+   keyhash collapses to one bucket = global KEEP_LAST)."
   (let ((sn (cache-change-sn change)))
     (cond
       ((nth-value 1 (gethash sn (history-cache-changes hc))) :duplicate)
       ((eq (history-cache-kind hc) :keep-last)
-       (when (>= (history-cache-count hc) (history-cache-depth hc))
-         (%hc-evict-oldest hc))
        (%hc-store hc sn change)
+       (let ((bucket (gethash (%hc-bucket-key (cache-change-instance-key-hash change))
+                              (history-cache-instances hc))))
+         (when (> (length bucket) (history-cache-depth hc))
+           (%hc-remove-change hc (first bucket))))               ; evict this instance's oldest, not the global oldest
        :ok)
       (t
        (if (and (history-cache-max-samples hc)

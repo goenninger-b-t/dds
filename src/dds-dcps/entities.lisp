@@ -341,7 +341,8 @@
     (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
                                :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))
-    (dds.disc:enable-publisher node)
+    (dds.disc:enable-publisher node :history-kind (dds.qos:qos-history-kind qos)
+                                    :history-depth (dds.qos:qos-history-depth qos))
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
       (push dw (pub-writers pub))
       (setf (dp-user-writer (pub-participant pub)) dw)   ; v1 back-ref for status hooks
@@ -424,6 +425,23 @@
    backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS, ADR 0016 §Backpressure). Represented as the keyword
    :timeout, the same sentinel the engine (dds.disc:publish-sample) surfaces.")
 
+(defun* %writer-keeplast-p (dw)
+    (function (data-writer) boolean)
+  "T iff DW's effective HISTORY QoS kind is KEEP_LAST (DDS 1.4 §2.2.3.18); defaults to T (the
+   policy default :keep-last, DDS 1.4 §2.2.3 default QoS table) when the QoS is absent/not a qos."
+  (let ((qos (entity-qos dw)))
+    (if (typep qos 'dds.qos:qos) (eq :keep-last (dds.qos:qos-history-kind qos)) t)))
+
+(defun* %write-key-hash (dw sample)
+    (function (data-writer t) (or null (simple-array (unsigned-byte 8) (16))))
+  "The instance handle to thread onto SAMPLE's data CacheChange (WP-KEEPLAST, ADR 0019,
+   DDS 1.4 §2.2.3.18): computed via the topic type-support ONLY when DW is KEEP_LAST (a
+   KEEP_ALL writer never evicts per-instance, so it needs no handle), else NIL. For an unkeyed
+   type %instance-handle returns the SHARED +instance-handle-nil+ (eq, no allocation); a keyed
+   type allocates a fresh keyhash. NIL on a KEEP_ALL writer keeps the default path 0-alloc."
+  (when (%writer-keeplast-p dw)
+    (%instance-handle (topic-type-support (dw-topic dw)) sample)))
+
 (defun* write-sample (dw sample)
     (function (data-writer t) (member :ok :timeout))
   "DataWriter::write — serialize SAMPLE via the topic type-support and publish it reliably over the engine
@@ -433,10 +451,14 @@
    engine cache is bounded — finite max_samples + max_blocking_time — can return :timeout, so the default
    path is byte-identical). On :timeout the sample was NOT published and liveliness is NOT asserted (the
    write did not occur). A write otherwise asserts the writer's liveliness (DDS 1.4 §2.2.3.11), stamping the
-   writer (and, for MANUAL_BY_PARTICIPANT, every such writer of the participant) via assert_liveliness."
+   writer (and, for MANUAL_BY_PARTICIPANT, every such writer of the participant) via assert_liveliness.
+   WP-KEEPLAST (ADR 0019, DDS 1.4 §2.2.3.18): for a KEEP_LAST writer the sample's instance handle is
+   threaded onto the data CacheChange (publish-sample -> writer-write) for per-instance eviction; a KEEP_ALL
+   writer threads NIL, keeping the default path 0-alloc (the handle is computed only when KEEP_LAST needs it)."
   (let ((node (dp-node (pub-participant (dw-publisher dw)))))
     (when (eq :timeout (dds.disc:publish-sample
-                        node (%serialize-sample (topic-type-support (dw-topic dw)) sample)))
+                        node (%serialize-sample (topic-type-support (dw-topic dw)) sample)
+                        (%write-key-hash dw sample)))
       (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
     +retcode-ok+))
@@ -727,6 +749,41 @@
   (let ((qos (entity-qos dr)))
     (and (typep qos 'dds.qos:qos) (eq :exclusive (dds.qos:qos-ownership qos)))))
 
+(defun* %reader-keeplast-depth (dr)
+    (function (data-reader) (or null (integer 1)))
+  "DR's HISTORY depth iff the reader is KEEP_LAST (DDS 1.4 §2.2.3.18), else NIL — NIL = KEEP_ALL,
+   no per-instance depth cap (the reader keeps every delivered sample, bounded only by RESOURCE_LIMITS)."
+  (let ((qos (entity-qos dr)))
+    (and (typep qos 'dds.qos:qos)
+         (eq :keep-last (dds.qos:qos-history-kind qos))
+         (dds.qos:qos-history-depth qos))))
+
+(defun* %reader-keeplast-drop-oldest (dr handle depth)
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) (integer 1)) t)
+  "KEEP_LAST per-instance drop (DDS 1.4 §2.2.3.18): if instance HANDLE already holds DEPTH valid-data
+   samples in dr-cache, delete that instance's OLDEST (lowest sequence-number) cached sample so the
+   imminent append keeps the per-instance count at DEPTH. A LOSSY drop by design — the oldest goes
+   regardless of its read/sample-state (distinct from the RESOURCE_LIMITS reject, which stays). Touches
+   ONLY dr-cache (the instance-rec / view-state survive — the instance stays alive across the drop, like
+   take removing a cache entry without forgetting the instance). O(N) cache scan, matching the existing
+   %resource-reject-reason count. Invalid-data instance notifications (sequence-number 0) are not counted.
+   LIMITATION (v1): oldest = min SN is the true age order only for ONE writer per instance; with multiple
+   writers on one instance SNs alias (RTPS 2.5 §8.3.5.4) and the reader has no merged cross-writer order
+   (source-timestamp / DESTINATION_ORDER not implemented), so the dropped sample may not be the globally
+   oldest — lifted when DESTINATION_ORDER lands."
+  (let ((count 0) (oldest nil) (oldest-sn nil))
+    (dolist (cs (dr-cache dr))
+      (let ((info (cached-sample-info cs)))
+        (when (and (sample-info-valid-data info)
+                   (equalp handle (sample-info-instance-handle info)))
+          (incf count)
+          (let ((sn (sample-info-sequence-number info)))
+            (when (or (null oldest-sn) (< sn oldest-sn))
+              (setf oldest-sn sn oldest cs))))))
+    (when (and (>= count depth) oldest)
+      (setf (dr-cache dr) (delete oldest (dr-cache dr) :test #'eq))))
+  t)
+
 (defun* %guid> (a b)
     (function ((simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (16))) boolean)
   "Lexicographic 16-octet GUID comparison A>B. The EXCLUSIVE same-strength tie-break: DDS 1.4
@@ -920,6 +977,7 @@
                (rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer
                                                         (dp-node (sub-participant (dr-subscriber dr))) key))))
           (push view (dr-loans dr))                                ; register BEFORE delivery (reader-close safety)
+          ;; no KEEP_LAST per-instance drop here: ZC loan handles are per-(GUID,SN)-unique (NO_KEY FlatData v1) so the cap never fires; revisit for keyed FlatData (WP-3b)
           (setf (dr-cache dr)
                 (nconc (dr-cache dr)
                        (list (make-cached-sample
@@ -1064,7 +1122,9 @@
                  (when (and wid (not (member wid (instance-rec-writers rec))))
                    (push wid (instance-rec-writers rec)))))
               (t
-                (let ((rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node key))))
+                (let ((rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node key)))
+                      (depth (%reader-keeplast-depth dr)))
+                  (when depth (%reader-keeplast-drop-oldest dr handle depth))   ; KEEP_LAST per-instance drop (DDS 1.4 §2.2.3.18) before append
                   (setf (dr-cache dr)
                         (nconc (dr-cache dr)
                                (list (make-cached-sample

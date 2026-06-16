@@ -483,6 +483,21 @@
                     mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) first last count :final nil))
                  host port))
 
+(defun* %send-user-gap (node buf reader-id gap-sns host port)
+    (function (disc-node dds.core.buffer:octet-buffer (unsigned-byte 32) cons string (unsigned-byte 16)) t)
+  "Send ONE GAP to HOST:PORT declaring every SN in the non-empty GAP-SNS list irrelevant (RTPS 2.5 §8.3.7.4 /
+   §9.4.5.6): readerId = the NACKing reader's EntityId READER-ID, writerId = this user writer's EntityId. The
+   SequenceNumberSet is built by seqnum-set-from-sns (shared MSB-first layout) and gapStart = its base, so the
+   [gapStart, base) contiguous-prefix range is empty and the set is EXACTLY the bitmapped SNs. The gap SNs all
+   came from ONE inbound ACKNACK's SequenceNumberSet, so they fit one 256-SN window. BUF selects the thread's
+   scratch message buffer; mirrors %send-user-heartbeat (single-submessage send via %send-msg-buf)."
+  (multiple-value-bind (base numbits bitmap) (dds.rtps.message:seqnum-set-from-sns gap-sns)
+    (%send-msg-buf node buf
+                   (lambda (mc)
+                     (dds.rtps.message:write-gap
+                      mc reader-id (disc-node-user-writer-id node) base base numbits bitmap))
+                   host port)))
+
 (defun* %reader-push-targets (node)
     (function (disc-node) list)
   "Per matched-reader DESTINATION, a ((host . port) READER-KEY…) group for the writer push path: the
@@ -772,8 +787,9 @@
     (if (disc-node-async-thread node) (%async-signal node) (%push-data node)))
   t)
 
-(defun* publish-sample (node payload)
-    (function (disc-node (simple-array (unsigned-byte 8) (*))) (or (eql t) (eql :timeout)))
+(defun* publish-sample (node payload &optional (key-hash nil))
+    (function (disc-node (simple-array (unsigned-byte 8) (*)) &optional (or null (array (unsigned-byte 8) (*))))
+              (or (eql t) (eql :timeout)))
   "Publish PAYLOAD (an opaque SerializedPayload) on the node's user writer: add it to the writer
    HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8). Returns T normally, or the :timeout
    sentinel (RETCODE_TIMEOUT) if the writer's cache was full and block-up-to-max_blocking_time elapsed
@@ -789,8 +805,10 @@
    thread (the sender's flush-all is adaptive batching, superseding batch-max-samples). With WP-ASYNC-FLOW
    (a flow-controller associated, FR-PF-2, ADR 0016) the write returns immediately after marking the writer
    pending + signalling the controller, whose scheduler thread does the RATE-PACED push off the caller
-   thread (an associated controller supersedes both batch and the per-node async sender for that writer)."
-  (when (eq :timeout (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload))
+   thread (an associated controller supersedes both batch and the per-node async sender for that writer).
+   KEY-HASH (WP-KEEPLAST, ADR 0019, DDS 1.4 §2.2.3.18) is the sample's 16-octet instance handle threaded
+   onto the data CacheChange (writer-write) for per-instance KEEP_LAST eviction; NIL (default) is unchanged."
+  (when (eq :timeout (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload key-hash))
     (return-from publish-sample :timeout))   ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
   (cond
     ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))   ; WP-ASYNC-FLOW: paced async send
@@ -1134,19 +1152,39 @@
                              (car peer) (cdr peer))))))))
   t)
 
+(defun* %on-user-gap (node c flags src-prefix)
+    (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
+  "Reader side: a GAP from a matched remote writer marks the SNs it declares irrelevant — the half-open range
+   [gapStart, base) plus the bitmap'd SNs — as :gap in the reliable reader's writer-proxy (reader-on-gap), so a
+   reliable reader stops NACKing an evicted/unrepairable SN forever and its ack watermark advances (RTPS 2.5
+   §8.3.7.4 / §9.4.5.6). parse-gap-body bounds-checks the SequenceNumberSet against the body extent (numBits<=256,
+   the M bitmap words fit) BEFORE this trusts it (NFR-SEC-POSTURE) — returns NIL on a short/malformed GAP, which
+   this drops. The reader-proxy is keyed by the remote writer's FULL 16-octet GUID (SRC-PREFIX + the GAP's WID,
+   §9.4.4 / §9.3.1.2) — the SAME key %on-user-heartbeat / %deliver-user-sample use — so two writers sharing
+   EntityId 0x102 across participants keep independent received-SN state (§8.3.5.4). Gated on a matched user
+   writer EntityId; mirrors %on-user-heartbeat."
+  (multiple-value-bind (rid wid gap-start base numbits bitmap) (dds.rtps.message:parse-gap-body c flags)
+    (declare (ignore rid))
+    (when (and base (disc-node-user-reader node) (%user-writer-entityid-p wid))
+      (dds.rtps.reliable:reader-on-gap (disc-node-user-reader node) (%source-guid src-prefix wid)
+                                       gap-start base numbits bitmap)))
+  t)
+
 (defun* %on-user-acknack (node c flags src-prefix)
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
-  "Writer side: on an ACKNACK, retransmit each NACKed change as a DATA submessage to the ONE reader
-   that NACKed (uses rx-tx-msg), then purge the HistoryCache of changes ALL matched readers have acked
-   (writer-purge-acked, §8.4.1). GAPs are not needed (only FULLY-acked changes are purged; a NACKed change
-   is never purged so it stays repairable). The reader-proxy is keyed
-   by the REMOTE reader's FULL 16-octet GUID (SRC-PREFIX + the ACKNACK's reader EntityId RID, §9.4.4 /
-   §9.3.1.2) — the SAME key %push-data uses for that reader — so two readers sharing EntityId 0x107
-   across participants advance independent acked-base watermarks (§8.3.5.4). The resend goes ONLY to the
-   ACKNACKing participant's destination, resolved from SRC-PREFIX (a NACK is from exactly one reader, so
-   fanning the resend out to every matched reader is pure over-send — harmless under KEEP_ALL but
-   wasteful); falls back to every matched reader only when the prefix is undiscovered (the
-   discovery-less test path)."
+  "Writer side: on an ACKNACK, retransmit each NACKed change PRESENT in the HistoryCache as a DATA submessage
+   to the ONE reader that NACKed (uses rx-tx-msg); for each NACKed SN the HC NO LONGER HOLDS (a per-instance
+   KEEP_LAST eviction or a RESOURCE_LIMITS drop left the hole, ADR 0019) send ONE GAP marking those SNs
+   irrelevant (RTPS 2.5 §8.3.7.4 / §9.4.5.6) so the reliable reader advances past the unrepairable SN instead
+   of NACKing it forever; then purge the HistoryCache of changes ALL matched readers have acked
+   (writer-purge-acked, §8.4.1). The default unlimited KEEP_ALL writer never evicts, so writer-on-acknack
+   returns an EMPTY gaps list and NO GAP is sent (a fully-acked change is purged, never GAPped). The
+   reader-proxy is keyed by the REMOTE reader's FULL 16-octet GUID (SRC-PREFIX + the ACKNACK's reader EntityId
+   RID, §9.4.4 / §9.3.1.2) — the SAME key %push-data uses for that reader — so two readers sharing EntityId
+   0x107 across participants advance independent acked-base watermarks (§8.3.5.4). The resend AND the GAP go
+   ONLY to the ACKNACKing participant's destination, resolved from SRC-PREFIX (a NACK is from exactly one
+   reader, so fanning out to every matched reader is pure over-send); falls back to every matched reader only
+   when the prefix is undiscovered (the discovery-less test path)."
   (multiple-value-bind (rid wid base numbits bitmap count finalp)
       (dds.rtps.message:parse-acknack-body c flags)
     (declare (ignore count finalp))
@@ -1155,11 +1193,11 @@
       (multiple-value-bind (resends gaps)
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
                                                (%source-guid src-prefix rid) base numbits bitmap)
-        (declare (ignore gaps))
         (let* ((dest (%prefix-user-destination node src-prefix))
                (peers (if dest (list dest) (%match-destinations node t))))
-          (dolist (peer peers)   ; retransmit DATA(_FRAG) / dispose -> the NACKing reader (coalesced, no HB)
-            (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil)))
+          (dolist (peer peers)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
+            (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil)
+            (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer)))))
         ;; the ACKNACK advanced this reader's acked-base -> purge HistoryCache changes ALL matched readers
         ;; have now acknowledged (RTPS 2.5 §8.4.1), bounding the KEEP_ALL writer history. NACKed (resent)
         ;; changes are not fully acked, so they are never purged.
@@ -1221,20 +1259,28 @@
                                  (car peer) (cdr peer)))))))))
     t))
 
-(defun* enable-publisher (node &key max-samples (max-blocking-ns nil))
-    (function (disc-node &key (:max-samples (or null (integer 1))) (:max-blocking-ns (or null (integer 0)))) disc-node)
-  "Give NODE a reliable user writer (KEEP_ALL) and install the writer-side data-plane hooks (retransmit on
-   ACKNACK; resend named fragments on NACK_FRAG). Call after add-local-writer. MAX-SAMPLES (RESOURCE_LIMITS
-   max_samples; NIL = unlimited, the default — byte-identical to before) bounds the KEEP_ALL HistoryCache;
-   MAX-BLOCKING-NS (RELIABILITY.max_blocking_time in ns; NIL = never block) makes publish-sample / dispose /
-   unregister BLOCK up to that long on a FULL bounded cache, then return RETCODE_TIMEOUT — DDS-standard
-   block-up-to-max_blocking_time backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS, ADR 0016 §Backpressure;
-   pairs with a flow-controller, which paces the drain so a bounded cache + bounded block keeps the backlog
-   bounded). With MAX-SAMPLES NIL the cache never fills, so MAX-BLOCKING-NS has no effect (the bound is the
-   trigger)."
+(defun* enable-publisher (node &key max-samples (max-blocking-ns nil)
+                                    (history-kind :keep-last) (history-depth 1))
+    (function (disc-node &key (:max-samples (or null (integer 1))) (:max-blocking-ns (or null (integer 0)))
+                              (:history-kind (member :keep-last :keep-all)) (:history-depth (integer 1)))
+              disc-node)
+  "Give NODE a reliable user writer honoring its HISTORY QoS and install the writer-side data-plane hooks
+   (retransmit on ACKNACK; resend named fragments on NACK_FRAG). Call after add-local-writer. HISTORY-KIND /
+   HISTORY-DEPTH (DDS 1.4 §2.2.3.18; defaulting to the spec generic default KEEP_LAST depth 1) size the writer
+   HistoryCache: KEEP_LAST retains the last HISTORY-DEPTH changes PER INSTANCE for late-joiner/retransmit;
+   KEEP_ALL ignores depth and retains-until-acked, bounded only by RESOURCE_LIMITS (the prior behavior — pass
+   :keep-all to preserve it byte-identically). MAX-SAMPLES (RESOURCE_LIMITS max_samples; NIL = unlimited)
+   bounds the HistoryCache; MAX-BLOCKING-NS (RELIABILITY.max_blocking_time in ns; NIL = never block) makes
+   publish-sample / dispose / unregister BLOCK up to that long on a FULL bounded cache, then return
+   RETCODE_TIMEOUT — DDS-standard block-up-to-max_blocking_time backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS,
+   ADR 0016 §Backpressure; pairs with a flow-controller, which paces the drain so a bounded cache + bounded
+   block keeps the backlog bounded). With MAX-SAMPLES NIL the cache never fills, so MAX-BLOCKING-NS has no
+   effect (the bound is the trigger). NOTE (ADR 0019): one engine writer per disc-node is shared by all of a
+   publisher's DataWriters, so the HC honors the HISTORY QoS of the DataWriter that (re)enabled the publisher —
+   a pre-existing one-writer-per-node limitation, not introduced here."
   (setf (disc-node-user-writer node)
         (dds.rtps.reliable:make-rtps-writer
-         :hc (dds.rtps.history:make-history-cache :keep-all 1 max-samples nil)
+         :hc (dds.rtps.history:make-history-cache history-kind history-depth max-samples nil)
          :max-blocking-ns max-blocking-ns))
   (setf (disc-node-on-acknack node) (lambda (c flags src-prefix) (%on-user-acknack node c flags src-prefix)))
   (setf (disc-node-on-nack-frag node) (lambda (c flags) (%on-user-nack-frag node c flags)))
@@ -1242,8 +1288,9 @@
 
 (defun* enable-subscriber (node)
     (function (disc-node) disc-node)
-  "Give NODE a reliable user reader and install the reader-side data-plane hooks (store DATA,
-   ACKNACK on HEARTBEAT, reassemble DATA_FRAG, NACK_FRAG on HEARTBEAT_FRAG). Call after add-local-reader."
+  "Give NODE a reliable user reader and install the reader-side data-plane hooks (store DATA, ACKNACK on
+   HEARTBEAT, mark GAP'd SNs irrelevant on GAP, reassemble DATA_FRAG, NACK_FRAG on HEARTBEAT_FRAG). Call after
+   add-local-reader."
   (setf (disc-node-user-reader node) (dds.rtps.reliable:make-rtps-reader))
   (setf (disc-node-on-data node)
         (lambda (wid sn buf poff plen src-prefix) (%on-user-data node wid sn buf poff plen src-prefix)))
@@ -1251,6 +1298,8 @@
         (lambda (wid sn kind kh sf src-prefix) (%on-user-lifecycle node wid sn kind kh sf src-prefix)))
   (setf (disc-node-on-heartbeat node)
         (lambda (c flags src-prefix) (%on-user-heartbeat node c flags src-prefix)))
+  (setf (disc-node-on-gap node)
+        (lambda (c flags src-prefix) (%on-user-gap node c flags src-prefix)))
   (setf (disc-node-on-data-frag node)
         (lambda (c flags body-len buf src-prefix) (%on-user-data-frag node c flags body-len buf src-prefix)))
   (setf (disc-node-on-heartbeat-frag node)

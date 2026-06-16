@@ -310,6 +310,71 @@
       (dds.dcps:delete-participant p2))
     t))
 
+;;; WP-KEEPLAST Task B1 (ADR 0019, DDS 1.4 §2.2.3.18): the DCPS write path threads the
+;;; sample's instance keyhash DCPS write-sample -> publish-sample -> writer-write onto the
+;;; data CacheChange, GATED on the writer's effective HISTORY being KEEP_LAST (a KEEP_ALL
+;;; writer never evicts per-instance, so it skips the handle computation -> default 0-alloc).
+
+(defun* %last-writer-change (dw)
+    (function (dds.dcps:data-writer) dds.rtps.history:cache-change)
+  "The CacheChange most recently added to DW's engine user-writer HistoryCache (test reach-in):
+   the change at the writer's current max SN. Asserts the threaded instance-key-hash landed."
+  (let* ((node (dds.dcps::dp-node (dds.dcps::pub-participant (dds.dcps::dw-publisher dw))))
+         (writer (dds.disc::disc-node-user-writer node))
+         (hc (dds.rtps.reliable:rtps-writer-hc writer)))
+    (dds.rtps.history:hc-get-change hc (dds.rtps.history:hc-max-seq hc))))
+
+(defun* run-keeplast-keyhash-threaded-test ()
+    (function () t)
+  "WP-KEEPLAST B1 (ADR 0019, DDS 1.4 §2.2.3.18): a KEEP_LAST DataWriter threads the sample's
+   instance keyhash onto its data CacheChange. (a) A KEEP_LAST writer of the KEYED shape-type:
+   the just-written change carries instance-key-hash = the type-support keyhash of the sample.
+   (b) A KEEP_LAST writer of the UNKEYED nokey-rt: the change's instance-key-hash is EQ to the
+   shared +instance-handle-nil+ (proving the shared constant, no per-sample allocation). (c) A
+   KEEP_ALL writer of the keyed shape-type: the gate skips the handle -> instance-key-hash NIL.
+   The engine HistoryCache is still hard-coded KEEP_ALL (the QoS flip is Task D1), so this only
+   verifies the THREADING; nothing is evicted-on yet."
+  (let* ((kts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((ktw (dds.dcps:create-topic p "KlSquare" "shape-type" kts))
+                (kl-pub (dds.dcps:create-publisher p))
+                (sample (make-shape-type :color "BLUE" :x 1 :y 2 :shapesize 10))
+                (kl-keyed (dds.dcps:create-datawriter
+                           kl-pub ktw :qos (dds.qos:make-writer-qos :history-kind :keep-last :history-depth 4))))
+           (dds.dcps:write-sample kl-keyed sample)
+           (%check :kl-keyed-handle
+                   (equalp (dds.rtps.history:cache-change-instance-key-hash (%last-writer-change kl-keyed))
+                           (funcall (dds.types:type-support-key-hash kts) sample))
+                   "KEEP_LAST keyed writer must thread the type-support keyhash onto the data change"))
+      (dds.dcps:delete-participant p)))
+  (let* ((uts (dds.types:find-type-support "nokey-rt"))
+           (p2 (dds.dcps:create-participant :domain 0)))
+      (unwind-protect
+           (let* ((utw (dds.dcps:create-topic p2 "KlNoKey" "nokey-rt" uts))
+                  (kl-pub2 (dds.dcps:create-publisher p2))
+                  (kl-unkeyed (dds.dcps:create-datawriter
+                               kl-pub2 utw :qos (dds.qos:make-writer-qos :history-kind :keep-last))))
+             (dds.dcps:write-sample kl-unkeyed (make-nokey-rt :a 7 :b 9))
+             (%check :kl-unkeyed-shared-nil
+                     (eq (dds.rtps.history:cache-change-instance-key-hash (%last-writer-change kl-unkeyed))
+                         dds.dcps::+instance-handle-nil+)
+                     "KEEP_LAST unkeyed writer must thread the shared +instance-handle-nil+ (no per-sample alloc)"))
+        (dds.dcps:delete-participant p2)))
+    (let* ((kts (dds.types:find-type-support "shape-type"))
+           (p3 (dds.dcps:create-participant :domain 0)))
+      (unwind-protect
+           (let* ((ktw3 (dds.dcps:create-topic p3 "KaSquare" "shape-type" kts))
+                  (ka-pub (dds.dcps:create-publisher p3))
+                  (ka-keyed (dds.dcps:create-datawriter
+                             ka-pub ktw3 :qos (dds.qos:make-writer-qos :history-kind :keep-all))))
+             (dds.dcps:write-sample ka-keyed (make-shape-type :color "RED" :x 3 :y 4 :shapesize 5))
+             (%check :ka-keyed-nil
+                     (null (dds.rtps.history:cache-change-instance-key-hash (%last-writer-change ka-keyed)))
+                     "KEEP_ALL keyed writer must SKIP the handle computation -> instance-key-hash NIL"))
+        (dds.dcps:delete-participant p3)))
+    t)
+
 ;;; Instance lifecycle + read/take + SampleInfo (M3 #2, FR-DCPS-4). Uses the keyed
 ;;; shape-type (key = color): two colors -> two instances; read is non-destructive +
 ;;; marks samples READ + transitions per-instance view-state NEW->NOT_NEW; take removes.
@@ -338,8 +403,9 @@
                 (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
                 (pub (dds.dcps:create-publisher p1))
                 (sub (dds.dcps:create-subscriber p2))
-                (dw (dds.dcps:create-datawriter pub tw))
-                (dr (dds.dcps:create-datareader sub tr)))
+                ;; KEEP_ALL both sides: this test retains 3 samples across 2 instances (BLUE x2) — ADR 0019 migration.
+                (dw (dds.dcps:create-datawriter pub tw :qos (dds.qos:make-writer-qos :history-kind :keep-all)))
+                (dr (dds.dcps:create-datareader sub tr :qos (dds.qos:make-reader-qos :history-kind :keep-all))))
            (loop repeat 100
                  until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
                  do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
@@ -1005,7 +1071,7 @@
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
                 (dr (dds.dcps:create-datareader
-                     sub tp :qos (dds.qos:make-reader-qos :ownership reader-ownership)))
+                     sub tp :qos (dds.qos:make-reader-qos :ownership reader-ownership :history-kind :keep-all)))   ; KEEP_ALL: counts >1 same-instance delivered sample (ADR 0019 migration)
                 (node (dds.dcps::dp-node p))
                 (guid-a (%two-writer-guid #x0a))
                 (guid-b (%two-writer-guid #x0b))
@@ -1045,7 +1111,7 @@
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
                 (dr (dds.dcps:create-datareader
-                     sub tp :qos (dds.qos:make-reader-qos :ownership :exclusive)))
+                     sub tp :qos (dds.qos:make-reader-qos :ownership :exclusive :history-kind :keep-all)))   ; KEEP_ALL: counts 2 same-instance delivered samples (A@1+B@2) (ADR 0019 migration)
                 (node (dds.dcps::dp-node p))
                 (guid-a (%two-writer-guid #x0a))
                 (guid-b (%two-writer-guid #x0b))
@@ -1504,8 +1570,9 @@
          (let* ((tw (dds.dcps:create-topic p1 "QueryTopic" "dcps-msg" ts))
                 (tr (dds.dcps:create-topic p2 "QueryTopic" "dcps-msg" ts))
                 (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
-                (dw (dds.dcps:create-datawriter pub tw))
-                (dr (dds.dcps:create-datareader sub tr))
+                ;; KEEP_ALL both sides: unkeyed dcps-msg; read_w_condition is non-destructive (both samples stay cached) — ADR 0019 migration.
+                (dw (dds.dcps:create-datawriter pub tw :qos (dds.qos:make-writer-qos :history-kind :keep-all)))
+                (dr (dds.dcps:create-datareader sub tr :qos (dds.qos:make-reader-qos :history-kind :keep-all)))
                 (qc (dds.dcps:create-querycondition
                      dr :states '(:not-read) :query (lambda (m) (> (dcps-msg-id m) 50))))
                 (ws (dds.dcps:make-wait-set)))
@@ -1669,8 +1736,9 @@
                 (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
                 (cft (dds.dcps:create-contentfilteredtopic p2 "FastSquare" tr "x > %0" '("50")))
                 (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
-                (dw (dds.dcps:create-datawriter pub tw))
-                (dr (dds.dcps:create-datareader sub cft)))
+                ;; KEEP_ALL both sides: 3 same-instance (BLUE) samples; the CFT surfaces the 2 matching (x=100,200) — ADR 0019 migration.
+                (dw (dds.dcps:create-datawriter pub tw :qos (dds.qos:make-writer-qos :history-kind :keep-all)))
+                (dr (dds.dcps:create-datareader sub cft :qos (dds.qos:make-reader-qos :history-kind :keep-all))))
            (loop repeat 150
                  until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
                  do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
@@ -1784,9 +1852,11 @@
          (let* ((tw (dds.dcps:create-topic p1 "RejTopic" "dcps-msg" ts))
                 (tr (dds.dcps:create-topic p2 "RejTopic" "dcps-msg" ts))
                 (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
-                (dw (dds.dcps:create-datawriter pub tw))
+                ;; KEEP_ALL both sides: tests RESOURCE_LIMITS *reject* (max_samples=2) — the writer must deliver all 3
+                ;; unkeyed samples and the reader must NOT lossy-drop, so the 3rd hits the reject path — ADR 0019 migration.
+                (dw (dds.dcps:create-datawriter pub tw :qos (dds.qos:make-writer-qos :history-kind :keep-all)))
                 (dr (dds.dcps:create-datareader sub tr
-                      :qos (dds.qos:make-reader-qos :reliability :reliable
+                      :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all
                                                     :resource-max-samples 2))))
            (dds.dcps:set-reader-listener dr rl '(:sample-rejected))
            (loop repeat 150
@@ -3138,7 +3208,7 @@
                :host "127.0.0.1" :port 0)))
     (unwind-protect
          (progn
-           (dds.disc:enable-publisher node)
+           (dds.disc:enable-publisher node :history-kind :keep-all)   ; KEEP_ALL: the test retains all 10 DATA to coalesce (ADR 0019 migration)
            (%seed-reader-participant node #x55 7701)
            (let ((writer (dds.disc::disc-node-user-writer node)))
              (dotimes (i 10)
@@ -3165,7 +3235,7 @@
                :host "127.0.0.1" :port 0)))
     (unwind-protect
          (progn
-           (dds.disc:enable-publisher node)
+           (dds.disc:enable-publisher node :history-kind :keep-all)   ; KEEP_ALL: the split test retains all 10 DATA (ADR 0019 migration)
            (%seed-reader-participant node #x56 7702)
            (let ((writer (dds.disc::disc-node-user-writer node)))
              (dotimes (i 10)
@@ -3200,7 +3270,7 @@
                :host "127.0.0.1" :port 0)))
     (unwind-protect
          (progn
-           (dds.disc:enable-publisher node)
+           (dds.disc:enable-publisher node :history-kind :keep-all)   ; KEEP_ALL: the large-pack test retains all 10 DATA (ADR 0019 migration)
            (%seed-reader-participant node #x57 7703)
            (let ((writer (dds.disc::disc-node-user-writer node))
                  (big (make-array 1000 :element-type '(unsigned-byte 8) :initial-element 7)))
@@ -3222,6 +3292,612 @@
       (dds.disc:stop-node node)))
   t)
 
+;;; WP-KEEPLAST GAP on an evicted/missing SN (RTPS 2.5 §8.3.7.4 / §9.4.5.6): when a reliable reader NACKs a
+;;; SN the writer's HistoryCache no longer holds (per-instance KEEP_LAST eviction, ADR 0019; or any
+;;; KEEP_LAST/RESOURCE_LIMITS reliable writer that evicted), the writer must answer with a GAP marking that
+;;; SN irrelevant — not silence. %on-user-acknack computes those gap SNs (writer-on-acknack) and now SENDS
+;;; the GAP to the NACKing reader, alongside resending any present NACKed SN as DATA. Offline: force a hole
+;;; by hc-remove-change'ing a low SN, deliver an ACKNACK NACKing {hole, present} via the disc on-acknack hook,
+;;; capture the outgoing datagrams (*datagram-sink*), and assert exactly one GAP for the hole (parse-gap-body)
+;;; plus a DATA resend for the present SN.
+
+(defun* %acknack-body-cursor (reader-id writer-id base nacked-sns)
+    (function ((unsigned-byte 32) (unsigned-byte 32) integer list) dds.core.buffer:cursor)
+  "Build an ACKNACK BODY (the bytes parse-acknack-body consumes: readerId+writerId+SequenceNumberSet+count,
+   RTPS 2.5 §9.4.5.3, NO submessage header) for READER-ID NACKing each SN in NACKED-SNS relative to BASE, and
+   return a fresh cursor positioned at its start — the offline twin of an inbound ACKNACK delivered to the
+   disc on-acknack hook. The bitmap is built with the SAME seqnum-set-bit helper reader-acknack uses (DRY)."
+  (let* ((hi (reduce #'max nacked-sns))
+         (numbits (1+ (- hi base)))
+         (bitmap (make-array (max 1 (ceiling numbits 32)) :element-type '(unsigned-byte 32) :initial-element 0))
+         (buf (dds.core.buffer:make-octet-buffer 64))
+         (wc (dds.core.buffer:cursor buf :endianness :little)))
+    (dolist (sn nacked-sns) (dds.rtps.message:seqnum-set-bit bitmap (- sn base)))
+    (dds.rtps.message:write-entity-id wc reader-id)
+    (dds.rtps.message:write-entity-id wc writer-id)
+    (dds.rtps.message:write-sequence-number-set wc base numbits bitmap)
+    (dds.core.buffer:put-u32 wc 1)                  ; ACKNACK count (§9.4.5.3)
+    (dds.core.buffer:cursor buf :endianness :little)))
+
+(defun* %scan-datagrams-for-submsg (captured target-id parse-fn)
+    (function (list (unsigned-byte 8) function) list)
+  "Re-parse each captured RTPS datagram (dispatch-message) and, for every submessage whose id is TARGET-ID,
+   collect (multiple-value-list (funcall PARSE-FN body-cursor flags body-len)); return the list in wire order.
+   The test oracle for an emitted submessage of one kind — parses the bytes the receiver would (§8.3.4)."
+  (let ((results '()))
+    (dolist (bytes captured)
+      (let* ((n (length bytes))
+             (buf (dds.core.buffer:make-octet-buffer n)))
+        (replace (dds.core.buffer:octet-buffer-vec buf) bytes)
+        (dds.rtps.message:dispatch-message
+         (dds.core.buffer:cursor buf :endianness :little)
+         (lambda (id flags c body-len)
+           (when (= id target-id) (push (multiple-value-list (funcall parse-fn c flags body-len)) results)))
+         n)))
+    (nreverse results)))
+
+(defun* run-gap-send-on-missing-sn-test ()
+    (function () t)
+  "WP-KEEPLAST: a reliable writer answers a NACK for an EVICTED/missing SN with a GAP (RTPS 2.5 §8.3.7.4),
+   not silence. Write SN 1,2,3 to a reliable user writer with one matched reader; hc-remove-change SN 1 (the
+   hole an eviction leaves); deliver an ACKNACK NACKing {1 (missing), 3 (present)} through the disc
+   on-acknack hook while capturing outgoing datagrams. Assert: exactly ONE GAP whose SequenceNumberSet
+   declares EXACTLY SN 1 irrelevant (gap-start=base=1, only bit 0 set, parsed by parse-gap-body), and SN 3
+   resent as a DATA (the present NACKed change), SN 1 NOT resent as DATA. The writer is explicit KEEP_ALL
+   (it never evicts -> writer-on-acknack returns no gaps -> no GAP), so this test forces the hole explicitly
+   via hc-remove-change (ADR 0019: the generic default is now KEEP_LAST-1, which would evict on its own)."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 8)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-publisher node :history-kind :keep-all)   ; KEEP_ALL: the fixture writes SN 1,2,3 then removes SN 1 to model the eviction hole (ADR 0019 migration)
+           (multiple-value-bind (prefix dest) (%seed-reader-participant node #x71 7706)
+             (declare (ignore dest))
+             (let ((writer (dds.disc::disc-node-user-writer node)))
+               (dotimes (i 3) (dds.rtps.reliable:writer-write writer (octets 1 2 3 4 5 6 7 8)))
+               (dds.rtps.history:hc-remove-change (dds.rtps.reliable:rtps-writer-hc writer) 1)   ; the eviction hole
+               (%check :gap-hole-gone (null (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1))
+                       "test setup: SN 1 must be absent from the writer HC (the evicted hole)")
+               (%check :gap-present-kept (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 3)
+                       "test setup: SN 3 must still be present (resent as DATA, not GAP'd)")
+               (let ((captured '()))
+                 (let ((dds.disc::*datagram-sink* (lambda (dg) (push dg captured))))
+                   (dds.disc::%on-user-acknack
+                    node
+                    (%acknack-body-cursor dds.disc::+user-reader-id+ (dds.disc:disc-node-user-writer-id node) 1 '(1 3))
+                    dds.rtps.message:+acknack-flag-final+
+                    prefix))
+                 (setf captured (nreverse captured))
+                 (let ((gaps (%scan-datagrams-for-submsg
+                              captured dds.rtps.message:+submsg-gap+
+                              (lambda (c flags body-len) (declare (ignore body-len))
+                                (dds.rtps.message:parse-gap-body c flags))))
+                       (datas (%scan-datagrams-for-submsg
+                               captured dds.rtps.message:+submsg-data+
+                               #'dds.rtps.message:parse-data-body)))
+                   (%check :gap-one (= 1 (length gaps))
+                           (format nil "exactly one GAP must be emitted for the missing SN (got ~d)" (length gaps)))
+                   (destructuring-bind (rid wid gap-start base numbits bitmap) (first gaps)
+                     (declare (ignore rid wid))
+                     (%check :gap-start-base (and (= gap-start 1) (= base 1))
+                             (format nil "the GAP's gapStart and SequenceNumberSet base must be 1 (got ~d/~d)" gap-start base))
+                     (%check :gap-declares-missing (dds.rtps.message:seqnum-set-member-p base numbits bitmap 1)
+                             "the GAP's SequenceNumberSet must declare the missing SN 1 irrelevant")
+                     (%check :gap-only-missing (not (dds.rtps.message:seqnum-set-member-p base numbits bitmap 3))
+                             "the GAP must NOT mark the present SN 3 irrelevant — only the missing SN 1"))
+                   (%check :gap-present-resent
+                           (member 3 datas :key (lambda (vals) (third vals)))   ; parse-data-body -> (... sn ...)
+                           "the present NACKed SN 3 must be resent as a DATA submessage")
+                   (%check :gap-missing-not-resent
+                           (not (member 1 datas :key (lambda (vals) (third vals))))
+                           "the missing SN 1 must NOT be resent as DATA (it is GAP'd, not repaired)"))))))
+      (dds.disc:stop-node node)))
+  t)
+
+;;; WP-KEEPLAST GAP RECEPTION (RTPS 2.5 §8.3.7.4 / §9.4.5.6, Task C2): the receiver-thread dispatch wires an
+;;; inbound GAP submessage to reader-on-gap, so a reliable reader that NACKed an evicted SN stops NACKing it
+;;; once the writer answers with a GAP. Offline twin of the wire: drive reader-on-heartbeat[1,5] so the reader's
+;;; writer-proxy records SN 1 missing (it would NACK it), then deliver a real GAP datagram (Header + GAP marking
+;;; SN 1 irrelevant) through %handle-datagram — the SAME entry point every transport feeds. Assert SN 1 is :gap
+;;; in the proxy received table AND drops out of the next reader-acknack NACK set (the ack watermark advances).
+
+(defun* %gap-datagram (src-prefix reader-id writer-id gap-start base numbits bitmap)
+    (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) (unsigned-byte 32) integer integer
+              (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)))
+              (values dds.core.buffer:octet-buffer fixnum))
+  "Build a complete RTPS datagram (Header with SRC-PREFIX + one GAP submessage, RTPS 2.5 §8.3.4 / §9.4.5.6)
+   into a fresh octet-buffer. Returns (values buffer byte-length) — the offline twin of a GAP arriving on the
+   wire from the remote writer at SRC-PREFIX, fed to %handle-datagram. Uses the same write-header / write-gap
+   the engine emits (DRY)."
+  (let* ((buf (dds.core.buffer:make-octet-buffer 128))
+         (wc (dds.core.buffer:cursor buf :endianness :little)))
+    (dds.rtps.message:write-header wc src-prefix)
+    (dds.rtps.message:write-gap wc reader-id writer-id gap-start base numbits bitmap)
+    (values buf (dds.core.buffer:cursor-position wc))))
+
+(defun* run-reader-gap-reception-test ()
+    (function () t)
+  "WP-KEEPLAST (Task C2): the reader RECEIVES a GAP. A reliable reader with a writer-proxy that recorded SN 1
+   as missing (reader-on-heartbeat[1,5]) gets a GAP datagram marking SN 1 irrelevant, delivered through the
+   receiver-thread dispatch (%handle-datagram -> +submsg-gap+ -> %on-user-gap -> reader-on-gap, RTPS 2.5
+   §8.3.7.4). Assert: SN 1 becomes :gap in the writer-proxy received table, and the next reader-acknack no
+   longer NACKs SN 1 (its base advances past it) — so the reader stops NACKing the unrepairable SN forever."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 9)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-reader node :topic "Square" :type "ShapeType")   ; sets disc-node-user-reader-id 0x107
+           (dds.disc:enable-subscriber node)                                    ; reader + reader-side hooks (incl. on-gap)
+           (let* ((src (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x99))
+                  (wid dds.disc::+user-writer-id+)                              ; remote writer EntityId 0x102 (with-key)
+                  (rid (dds.disc:disc-node-user-reader-id node))
+                  (reader (dds.disc::disc-node-user-reader node))
+                  (wguid (dds.disc::%source-guid src wid)))
+             (dds.rtps.reliable:reader-on-heartbeat reader wguid 1 5)            ; reader believes [1,5] available -> SN 1 missing
+             (multiple-value-bind (base0 numbits0 bitmap0) (dds.rtps.reliable:reader-acknack reader wguid)
+               (%check :grx-setup-nacks-1 (dds.rtps.message:seqnum-set-member-p base0 numbits0 bitmap0 1)
+                       "test setup: before the GAP the reader must NACK SN 1 (base=1, bit 0 set)"))
+             ;; deliver a GAP for SN 1 (gapStart=1, base=2, empty bitmap -> the range [1,2) = {1}) via the real dispatch
+             (let ((gbitmap (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+               (multiple-value-bind (dg len) (%gap-datagram src rid wid 1 2 0 gbitmap)
+                 (dds.disc::%handle-datagram node dg len)))
+             (let ((received (dds.rtps.reliable:writer-proxy-received
+                              (dds.rtps.reliable:get-writer-proxy reader wguid))))
+               (%check :grx-sn1-gap (eq :gap (gethash 1 received))
+                       "after the GAP, SN 1 must be marked :gap (irrelevant) in the writer-proxy received table"))
+             (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
+               (%check :grx-no-nack-1 (not (dds.rtps.message:seqnum-set-member-p base numbits bitmap 1))
+                       "after the GAP, the next reader-acknack must NOT NACK SN 1 (it is irrelevant, not missing)")
+               (%check :grx-base-advanced (> base 1)
+                       (format nil "the ACKNACK base must advance past the GAP'd SN 1 (got ~d)" base)))))
+      (dds.disc:stop-node node)))
+  t)
+
+;;; WP-KEEPLAST GAP RANGE HARD-CAP (NFR-SEC-POSTURE, RTPS 2.5 §8.3.7.4, Task C2 security fix): wiring
+;;; reader-on-gap to the wire (%on-user-gap) made its contiguous [gapStart, base) loop reachable by an
+;;; attacker-controlled GAP. gapStart/base are wire-supplied 64-bit values and last-sn is itself set from
+;;; inbound HEARTBEATs, so an unclamped span (gapStart=1, base=2^60) would loop ~2^60 times inserting ~2^60
+;;; hash entries -> CPU+memory DoS. The fix hard-caps the iterated span at *max-gap-range* SNs, independent
+;;; of any wire value. Adversarial twin: feed such a GAP through %handle-datagram (the real receiver-thread
+;;; dispatch) and assert the call returns PROMPTLY and the received table stays bounded — proving the cap held
+;;; (under the pre-fix unbounded loop this call never returns / exhausts memory).
+
+(defun* run-reader-gap-range-cap-test ()
+    (function () t)
+  "WP-KEEPLAST (Task C2 security fix, NFR-SEC-POSTURE): an adversarial GAP cannot DoS the receiver. Deliver a
+   GAP with a 2^60-wide irrelevant range (gapStart=1, base=2^60), then a second with base=most-positive-fixnum,
+   through the real dispatch (%handle-datagram -> +submsg-gap+ -> %on-user-gap -> reader-on-gap, RTPS 2.5
+   §8.3.7.4). Assert each call returns PROMPTLY and the writer-proxy received table stays bounded by
+   *max-gap-range*+slack — proving the hard cap (independent of the wire-supplied base/last-sn) held instead of
+   iterating ~2^60 SNs. The cap is loss-free: a real evicted run is recovered over later GAP/HEARTBEAT rounds."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-reader node :topic "Square" :type "ShapeType")
+           (dds.disc:enable-subscriber node)
+           (let* ((src (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x99))
+                  (wid dds.disc::+user-writer-id+)
+                  (rid (dds.disc:disc-node-user-reader-id node))
+                  (reader (dds.disc::disc-node-user-reader node))
+                  (wguid (dds.disc::%source-guid src wid))
+                  (gbitmap (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0))
+                  (bound (+ dds.rtps.reliable:*max-gap-range* 300)))
+             (dolist (evil-base (list (expt 2 60) most-positive-fixnum))   ; both wire-controlled DoS spans
+               (multiple-value-bind (dg len) (%gap-datagram src rid wid 1 evil-base 0 gbitmap)
+                 (dds.disc::%handle-datagram node dg len))               ; must return promptly, not iterate 2^60
+               (let ((received (dds.rtps.reliable:writer-proxy-received
+                                (dds.rtps.reliable:get-writer-proxy reader wguid))))
+                 (%check :grxcap-bounded (<= (hash-table-count received) bound)
+                         (format nil "an attacker GAP (gapStart=1, base=~d) must mark <=~d SNs (the *max-gap-range* cap), got ~d — the contiguous loop was NOT hard-capped (CPU+memory DoS, NFR-SEC-POSTURE)"
+                                 evil-base bound (hash-table-count received)))))))
+      (dds.disc:stop-node node)))
+  t)
+
+;;; WP-KEEPLAST Task D2 (ADR 0019, DDS 1.4 §2.2.3.18, RTPS 2.5 §8.3.7.4): the 7 end-to-end acceptance
+;;; scenarios on the now-ACTIVATED per-instance KEEP_LAST path (the engine writer HistoryCache + the reader
+;;; DCPS cache honor the QoS HISTORY; the generic default is KEEP_LAST-1). These exercise the real DCPS->engine
+;;; and disc->engine paths the unit tests (run-hc-perinstance-keeplast-test et al.) prove only at the cache
+;;; layer: writer-side per-instance retention through write-sample, the interior-hole->GAP chain end to end,
+;;; the firstSN advance on a low eviction, reader-side per-instance lossy drop through %drain, the unkeyed
+;;; global-collapse, the KEEP_ALL regression, and purge-acked composing with per-instance eviction.
+
+(defun* %hc-instance-sns (hc)
+    (function (dds.rtps.history:history-cache) hash-table)
+  "Group the HistoryCache HC's stored changes by per-instance bucket key -> ascending SN list (test oracle for
+   per-instance retention). An UNKEYED / HANDLE_NIL change collapses to the :UNKEYED bucket, matching the HC's
+   own %hc-bucket-key (DDS 1.4 §2.2.3.18). Built from the public hc-changes-for-reader change list (DRY)."
+  (let ((by-instance (make-hash-table :test 'equalp)))
+    (dolist (ch (dds.rtps.history:hc-changes-for-reader hc nil))
+      (let* ((kh (dds.rtps.history:cache-change-instance-key-hash ch))
+             (key (if (or (null kh) (every #'zerop kh)) :unkeyed kh)))
+        (push (dds.rtps.history:cache-change-sn ch) (gethash key by-instance))))
+    (maphash (lambda (k sns) (setf (gethash k by-instance) (sort sns #'<))) by-instance)
+    by-instance))
+
+(defun* %dw-engine-hc (dw)
+    (function (dds.dcps:data-writer) dds.rtps.history:history-cache)
+  "The engine user-writer HistoryCache backing the DCPS DataWriter DW (test reach-in via the participant's
+   disc-node) — the cache the activated writer-side per-instance KEEP_LAST evicts in (ADR 0019)."
+  (let* ((node (dds.dcps::dp-node (dds.dcps::pub-participant (dds.dcps::dw-publisher dw)))))
+    (dds.rtps.reliable:rtps-writer-hc (dds.disc::disc-node-user-writer node))))
+
+(defun* run-keeplast-writer-perinstance-e2e-test ()
+    (function () t)
+  "WP-KEEPLAST D2 scenario 1 (spec §1, DDS 1.4 §2.2.3.18): a DCPS KEEP_LAST depth-2 KEYED DataWriter retains
+   the last 2 changes PER INSTANCE on the real write-sample -> publish-sample -> writer-write -> engine HC path
+   (write-sample auto-threads each sample's keyhash). Write 3 samples for instance A (color BLUE) and 3 for
+   instance B (color RED); reach into the engine writer HC and assert it holds EXACTLY 4 changes — the last 2
+   SNs of A AND the last 2 SNs of B — NOT a global last-2 (which would keep only the 4th/5th write and starve
+   one key). Proves the activation: the QoS HISTORY now sizes the engine cache and the keyhash drives eviction."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "KlW2Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p))
+                (dw (dds.dcps:create-datawriter
+                     pub tp :qos (dds.qos:make-writer-qos :history-kind :keep-last :history-depth 2)))
+                (a (make-shape-type :color "BLUE" :x 0 :y 0 :shapesize 1))
+                (b (make-shape-type :color "RED"  :x 0 :y 0 :shapesize 1))
+                (ha (funcall (dds.types:type-support-key-hash ts) a))
+                (hb (funcall (dds.types:type-support-key-hash ts) b)))
+           ;; interleave the writes so a global last-2 would diverge from a per-instance last-2:
+           ;; A@1 B@2 A@3 B@4 A@5 B@6  (A = SN 1,3,5 ; B = SN 2,4,6)
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 1))
+           (dds.dcps:write-sample dw (make-shape-type :color "RED"  :x 2 :y 2 :shapesize 2))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 3 :y 3 :shapesize 3))
+           (dds.dcps:write-sample dw (make-shape-type :color "RED"  :x 4 :y 4 :shapesize 4))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 5 :y 5 :shapesize 5))
+           (dds.dcps:write-sample dw (make-shape-type :color "RED"  :x 6 :y 6 :shapesize 6))
+           (let* ((hc (%dw-engine-hc dw))
+                  (by-instance (%hc-instance-sns hc)))
+             (%check :klw2-count (= 4 (dds.rtps.history:hc-change-count hc))
+                     (format nil "KEEP_LAST-2 over 2 instances must hold 4 changes (2 per instance), got ~d"
+                             (dds.rtps.history:hc-change-count hc)))
+             (%check :klw2-a-last2 (equal '(3 5) (gethash ha by-instance))
+                     (format nil "instance A (BLUE) must retain its last 2 SNs (3,5), got ~s" (gethash ha by-instance)))
+             (%check :klw2-b-last2 (equal '(4 6) (gethash hb by-instance))
+                     (format nil "instance B (RED) must retain its last 2 SNs (4,6), got ~s" (gethash hb by-instance)))
+             (%check :klw2-not-global
+                     (and (dds.rtps.history:hc-get-change hc 3) (null (dds.rtps.history:hc-get-change hc 2)))
+                     "NOT a global last-2: A's SN3 survives though B's SN2/SN4 bracket it (per-instance retention)")))
+      (dds.dcps:delete-participant p)))
+  t)
+
+(defun* run-keeplast-interior-hole-gap-e2e-test ()
+    (function () t)
+  "WP-KEEPLAST D2 scenario 2 (spec §2, DDS 1.4 §2.2.3.18 + RTPS 2.5 §8.3.7.4): the full interior-hole -> GAP
+   chain on the activated engine path. A KEEP_LAST depth-1 reliable user writer (enable-publisher) gets explicit
+   per-instance keyhashes via writer-write: A@SN1 (handle-A), B@SN2 (handle-B), B@SN3 (handle-B). Per-instance
+   KEEP_LAST-1 evicts B's oldest (SN2) -> the HC holds {SN1, SN3}, an interior hole at SN2 inside [firstSN,
+   lastSN]. Deliver an ACKNACK NACKing the evicted interior SN2 through the disc on-acknack hook and capture
+   outbound datagrams; assert EXACTLY one GAP declaring SN2 irrelevant is sent (parse-gap-body), SN2 is NOT
+   resent as DATA. Then drive the reader side: a reliable reader that recorded SN2 missing receives that GAP via
+   the real dispatch (%handle-datagram), marks SN2 :gap, and stops NACKing it (the ack watermark advances)."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 8)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-publisher node :history-kind :keep-last :history-depth 1)   ; the activated per-instance KEEP_LAST-1 engine writer
+           (multiple-value-bind (prefix dest) (%seed-reader-participant node #x72 7806)
+             (declare (ignore dest))
+             (let ((writer (dds.disc::disc-node-user-writer node))
+                   (ha (%keeplast-handle 1))                       ; instance A
+                   (hb (%keeplast-handle 2)))                      ; instance B
+               (dds.rtps.reliable:writer-write writer (octets 1 2 3 4) ha)   ; A@SN1
+               (dds.rtps.reliable:writer-write writer (octets 5 6 7 8) hb)   ; B@SN2
+               (dds.rtps.reliable:writer-write writer (octets 9 9 9 9) hb)   ; B@SN3 -> evicts B's SN2 (interior hole)
+               (let ((hc (dds.rtps.reliable:rtps-writer-hc writer)))
+                 (%check :klg-hole (null (dds.rtps.history:hc-get-change hc 2))
+                         "per-instance KEEP_LAST-1 must have evicted B's oldest SN2 (the interior hole)")
+                 (%check :klg-kept (and (dds.rtps.history:hc-get-change hc 1) (dds.rtps.history:hc-get-change hc 3))
+                         "the HC must still hold SN1 (A) and SN3 (B) around the SN2 hole"))
+               ;; writer side: an ACKNACK for the evicted SN2 must yield a GAP for SN2, not a DATA resend.
+               (let ((captured '()))
+                 (let ((dds.disc::*datagram-sink* (lambda (dg) (push dg captured))))
+                   (dds.disc::%on-user-acknack
+                    node
+                    (%acknack-body-cursor dds.disc::+user-reader-id+ (dds.disc:disc-node-user-writer-id node) 2 '(2))
+                    dds.rtps.message:+acknack-flag-final+
+                    prefix))
+                 (setf captured (nreverse captured))
+                 (let ((gaps (%scan-datagrams-for-submsg
+                              captured dds.rtps.message:+submsg-gap+
+                              (lambda (c flags body-len) (declare (ignore body-len))
+                                (dds.rtps.message:parse-gap-body c flags))))
+                       (datas (%scan-datagrams-for-submsg
+                               captured dds.rtps.message:+submsg-data+
+                               #'dds.rtps.message:parse-data-body)))
+                   (%check :klg-one-gap (= 1 (length gaps))
+                           (format nil "exactly one GAP must be sent for the evicted interior SN2 (got ~d)" (length gaps)))
+                   (destructuring-bind (rid wid gap-start base numbits bitmap) (first gaps)
+                     (declare (ignore rid wid gap-start))
+                     (%check :klg-gap-declares-sn2 (dds.rtps.message:seqnum-set-member-p base numbits bitmap 2)
+                             "the GAP's SequenceNumberSet must declare the evicted SN2 irrelevant"))
+                   (%check :klg-sn2-not-resent (not (member 2 datas :key (lambda (vals) (third vals))))
+                           "the evicted SN2 must NOT be resent as DATA (it is GAP'd, gone forever)")))))
+           ;; reader side: a reliable reader that NACKed SN2 receives the GAP and stops NACKing it.
+           (dds.disc:add-local-reader node :topic "Square" :type "ShapeType")
+           (dds.disc:enable-subscriber node)
+           (let* ((src (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x9a))
+                  (wid dds.disc::+user-writer-id+)
+                  (rid (dds.disc:disc-node-user-reader-id node))
+                  (reader (dds.disc::disc-node-user-reader node))
+                  (wguid (dds.disc::%source-guid src wid)))
+             (dds.rtps.reliable:reader-on-heartbeat reader wguid 1 3)            ; [1,3] -> SN2 missing (the evicted interior)
+             (multiple-value-bind (b0 n0 m0) (dds.rtps.reliable:reader-acknack reader wguid)
+               (%check :klg-rx-nacks-2 (dds.rtps.message:seqnum-set-member-p b0 n0 m0 2)
+                       "test setup: before the GAP the reader must NACK the missing SN2"))
+             (let ((gbitmap (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+               (multiple-value-bind (dg len) (%gap-datagram src rid wid 2 3 0 gbitmap)   ; GAP SN2 ([2,3) = {2})
+                 (dds.disc::%handle-datagram node dg len)))
+             (let ((received (dds.rtps.reliable:writer-proxy-received
+                              (dds.rtps.reliable:get-writer-proxy reader wguid))))
+               (%check :klg-rx-sn2-gap (eq :gap (gethash 2 received))
+                       "after the GAP the reader must mark SN2 :gap (irrelevant) in the writer-proxy table"))
+             (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
+               (%check :klg-rx-no-nack-2 (not (dds.rtps.message:seqnum-set-member-p base numbits bitmap 2))
+                       "after the GAP the reader must NOT NACK SN2 (irrelevant, not missing) — no hang"))))
+      (dds.disc:stop-node node)))
+  t)
+
+(defun* run-keeplast-firstsn-advance-test ()
+    (function () t)
+  "WP-KEEPLAST D2 scenario 3 (spec §3, RTPS 2.5 §8.4.1 + §8.3.7.5): a low-end eviction advances the writer's
+   advertised HEARTBEAT firstSN. A KEEP_LAST depth-1 reliable engine writer writes A@SN1 then A@SN2 (same
+   instance A -> SN1 evicted, the lowest held SN). hc-min-seq (the live first SN) is now 2, and writer-heartbeat
+   advertises firstSN=2. A reader told the available range is [2,2] (the advertised window) does not NACK the
+   evicted SN1 — it compacts below first and never repairs it (covers low evictions without a GAP)."
+  (let ((node (dds.disc:make-disc-node
+               :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 6)
+               :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-publisher node :history-kind :keep-last :history-depth 1)
+           (let ((writer (dds.disc::disc-node-user-writer node))
+                 (ha (%keeplast-handle 1)))
+             (dds.rtps.reliable:writer-write writer (octets 1 1 1 1) ha)        ; A@SN1
+             (dds.rtps.reliable:writer-write writer (octets 2 2 2 2) ha)        ; A@SN2 -> SN1 evicted
+             (let ((hc (dds.rtps.reliable:rtps-writer-hc writer)))
+               (%check :klf-sn1-gone (null (dds.rtps.history:hc-get-change hc 1))
+                       "KEEP_LAST-1 must evict A's SN1 when A@SN2 arrives")
+               (%check :klf-min-seq-2 (= 2 (dds.rtps.history:hc-min-seq hc))
+                       (format nil "the live first SN (hc-min-seq) must advance to 2, got ~s" (dds.rtps.history:hc-min-seq hc))))
+             (multiple-value-bind (first-sn last-sn count) (dds.rtps.reliable:writer-heartbeat writer)
+               (declare (ignore count))
+               (%check :klf-hb-first-2 (= 2 first-sn)
+                       (format nil "the HEARTBEAT firstSN must advance to 2 after the low eviction, got ~d" first-sn))
+               (%check :klf-hb-last-2 (= 2 last-sn)
+                       (format nil "the HEARTBEAT lastSN must be 2 (the only held SN), got ~d" last-sn))))
+           ;; a reader on the advertised window [2,2] must not NACK the evicted SN1.
+           (dds.disc:add-local-reader node :topic "Square" :type "ShapeType")
+           (dds.disc:enable-subscriber node)
+           (let* ((src (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x9b))
+                  (wid dds.disc::+user-writer-id+)
+                  (reader (dds.disc::disc-node-user-reader node))
+                  (wguid (dds.disc::%source-guid src wid)))
+             (dds.rtps.reliable:reader-on-heartbeat reader wguid 2 2)            ; advertised firstSN=2
+             (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
+               (%check :klf-no-nack-1 (not (dds.rtps.message:seqnum-set-member-p base numbits bitmap 1))
+                       "a reader on [first=2,last=2] must NOT NACK the evicted SN1 (it is below firstSN)")
+               (%check :klf-base-ge-2 (>= base 2)
+                       (format nil "the ACKNACK base must be >= the advertised firstSN 2 (got ~d)" base)))))
+      (dds.disc:stop-node node)))
+  t)
+
+(defun* run-keeplast-reader-perinstance-e2e-test ()
+    (function () t)
+  "WP-KEEPLAST D2 scenario 4 (spec §4, DDS 1.4 §2.2.3.18 — also the dedicated reader-side %reader-keeplast-drop
+   coverage): a DCPS KEEP_LAST depth-2 KEYED DataReader keeps the last 2 samples PER INSTANCE in dr-cache (a
+   lossy drop of the oldest per instance, NOT a global last-2). Deliver 3 samples for instance A and 3 for
+   instance B deterministically through the engine SN maps + %drain (the same records %deliver-user-sample
+   writes, minus UDP), then assert dr-cache holds EXACTLY A's last 2 and B's last 2. A second single-instance
+   variant: deliver 3 of A to a fresh KEEP_LAST-2 reader and assert exactly the last 2 survive."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "KlR2Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader
+                     sub tp :qos (dds.qos:make-reader-qos :history-kind :keep-last :history-depth 2)))
+                (node (dds.dcps::dp-node p))
+                (wid #x00000102)
+                (a (make-shape-type :color "BLUE" :x 0 :y 0 :shapesize 0))
+                (b (make-shape-type :color "RED"  :x 0 :y 0 :shapesize 0))
+                (ha (funcall (dds.types:type-support-key-hash ts) a))
+                (hb (funcall (dds.types:type-support-key-hash ts) b)))
+           ;; deliver A@1 B@2 A@3 B@4 A@5 B@6 then drain (per-instance last-2 must survive, not a global last-2)
+           (flet ((deliver (sn shape)
+                    (%stage-data-sn node sn (funcall (dds.types:type-support-key-hash ts) shape)
+                                    (dds.dcps::%serialize-sample ts shape) wid)))
+             (deliver 1 (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 1))
+             (deliver 2 (make-shape-type :color "RED"  :x 2 :y 2 :shapesize 2))
+             (deliver 3 (make-shape-type :color "BLUE" :x 3 :y 3 :shapesize 3))
+             (deliver 4 (make-shape-type :color "RED"  :x 4 :y 4 :shapesize 4))
+             (deliver 5 (make-shape-type :color "BLUE" :x 5 :y 5 :shapesize 5))
+             (deliver 6 (make-shape-type :color "RED"  :x 6 :y 6 :shapesize 6)))
+           (dds.dcps::%drain dr)
+           (%check :klr2-total (= 4 (length (dds.dcps::dr-cache dr)))
+                   (format nil "KEEP_LAST-2 reader over 2 instances must hold 4 cached samples, got ~d"
+                           (length (dds.dcps::dr-cache dr))))
+           (%check :klr2-a-2 (= 2 (%handle-cache-count dr ha))
+                   (format nil "instance A must keep exactly its last 2 samples, got ~d" (%handle-cache-count dr ha)))
+           (%check :klr2-b-2 (= 2 (%handle-cache-count dr hb))
+                   (format nil "instance B must keep exactly its last 2 samples, got ~d" (%handle-cache-count dr hb)))
+           (let ((a-sns (sort (mapcar (lambda (cs) (dds.dcps:sample-info-sequence-number (dds.dcps:cached-sample-info cs)))
+                                      (remove-if-not (lambda (cs) (equalp ha (%cs-ih cs))) (dds.dcps::dr-cache dr)))
+                              #'<)))
+             (%check :klr2-a-last2 (equal '(3 5) a-sns)
+                     (format nil "instance A must keep its LAST 2 SNs (3,5), oldest dropped; got ~s" a-sns))))
+      (dds.dcps:delete-participant p)))
+  ;; single-instance variant: 3 of A to a fresh KEEP_LAST-2 reader -> exactly the last 2 survive.
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p2 "KlR2bSquare" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p2))
+                (dr (dds.dcps:create-datareader
+                     sub tp :qos (dds.qos:make-reader-qos :history-kind :keep-last :history-depth 2)))
+                (node (dds.dcps::dp-node p2))
+                (wid #x00000102)
+                (a (make-shape-type :color "GREEN" :x 0 :y 0 :shapesize 0))
+                (ha (funcall (dds.types:type-support-key-hash ts) a)))
+           (dotimes (i 3)
+             (let ((shape (make-shape-type :color "GREEN" :x (1+ i) :y (1+ i) :shapesize (1+ i))))
+               (%stage-data-sn node (1+ i) ha (dds.dcps::%serialize-sample ts shape) wid)))
+           (dds.dcps::%drain dr)
+           (%check :klr2b-total (= 2 (length (dds.dcps::dr-cache dr)))
+                   (format nil "a single-instance KEEP_LAST-2 reader fed 3 samples must keep exactly 2, got ~d"
+                           (length (dds.dcps::dr-cache dr))))
+           (let ((sns (sort (mapcar (lambda (cs) (dds.dcps:sample-info-sequence-number (dds.dcps:cached-sample-info cs)))
+                                    (dds.dcps::dr-cache dr)) #'<)))
+             (%check :klr2b-last2 (equal '(2 3) sns)
+                     (format nil "the reader must keep the LAST 2 SNs (2,3), SN1 dropped; got ~s" sns))))
+      (dds.dcps:delete-participant p2)))
+  t)
+
+(defun* run-keeplast-unkeyed-collapse-test ()
+    (function () t)
+  "WP-KEEPLAST D2 scenario 5 (spec §5, DDS 1.4 §2.2.3.18 degenerate single-instance case): an UNKEYED KEEP_LAST
+   depth-2 writer + reader collapse to global last-2 (one shared instance bucket). Writer side: a DCPS unkeyed
+   (nokey-rt) KEEP_LAST-2 writer's engine HC holds the global last 2 after 3 writes (all in the :UNKEYED bucket).
+   Reader side: an unkeyed KEEP_LAST-2 reader fed 3 samples through %drain keeps the global last 2 — identical to
+   a correct global KEEP_LAST (no per-key partitioning when there is no key)."
+  (let* ((uts (dds.types:find-type-support "nokey-rt"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "KlUkNoKey" "nokey-rt" uts))
+                (pub (dds.dcps:create-publisher p))
+                (dw (dds.dcps:create-datawriter
+                     pub tp :qos (dds.qos:make-writer-qos :history-kind :keep-last :history-depth 2))))
+           (dds.dcps:write-sample dw (make-nokey-rt :a 1 :b 1))
+           (dds.dcps:write-sample dw (make-nokey-rt :a 2 :b 2))
+           (dds.dcps:write-sample dw (make-nokey-rt :a 3 :b 3))
+           (let* ((hc (%dw-engine-hc dw))
+                  (by-instance (%hc-instance-sns hc)))
+             (%check :klu-w-count (= 2 (dds.rtps.history:hc-change-count hc))
+                     (format nil "an unkeyed KEEP_LAST-2 writer must hold the global last 2, got ~d"
+                             (dds.rtps.history:hc-change-count hc)))
+             (%check :klu-w-one-bucket (= 1 (hash-table-count by-instance))
+                     "unkeyed samples must collapse to ONE instance bucket (global KEEP_LAST)")
+             (%check :klu-w-last2 (equal '(2 3) (gethash :unkeyed by-instance))
+                     (format nil "the global last 2 SNs (2,3) must be retained, got ~s" (gethash :unkeyed by-instance)))))
+      (dds.dcps:delete-participant p)))
+  (let* ((uts (dds.types:find-type-support "nokey-rt"))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p2 "KlUkRNoKey" "nokey-rt" uts))
+                (sub (dds.dcps:create-subscriber p2))
+                (dr (dds.dcps:create-datareader
+                     sub tp :qos (dds.qos:make-reader-qos :history-kind :keep-last :history-depth 2)))
+                (node (dds.dcps::dp-node p2))
+                (wid #x00000103))                       ; no-key endpoint EntityId 0x103
+           (dotimes (i 3)
+             (let ((shape (make-nokey-rt :a (1+ i) :b (1+ i))))
+               (%stage-data-sn node (1+ i)
+                               (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)   ; HANDLE_NIL (unkeyed)
+                               (dds.dcps::%serialize-sample uts shape) wid)))
+           (dds.dcps::%drain dr)
+           (%check :klu-r-count (= 2 (length (dds.dcps::dr-cache dr)))
+                   (format nil "an unkeyed KEEP_LAST-2 reader fed 3 samples must keep the global last 2, got ~d"
+                           (length (dds.dcps::dr-cache dr))))
+           (let ((sns (sort (mapcar (lambda (cs) (dds.dcps:sample-info-sequence-number (dds.dcps:cached-sample-info cs)))
+                                    (dds.dcps::dr-cache dr)) #'<)))
+             (%check :klu-r-last2 (equal '(2 3) sns)
+                     (format nil "the unkeyed reader must keep the global last 2 SNs (2,3), got ~s" sns))))
+      (dds.dcps:delete-participant p2)))
+  t)
+
+(defun* run-keeplast-keepall-regression-test ()
+    (function () t)
+  "WP-KEEPLAST D2 scenario 6 (spec §6, regression): KEEP_ALL is unchanged from pre-activation — no per-instance
+   eviction. A DCPS KEEP_ALL keyed writer's engine HC retains ALL writes across instances (bounded only by
+   RESOURCE_LIMITS, as before). A KEEP_ALL keyed reader fed several samples for two instances keeps ALL of them
+   in dr-cache (no lossy KEEP_LAST drop fires — %reader-keeplast-depth is NIL for KEEP_ALL)."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "KaW2Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p))
+                (dw (dds.dcps:create-datawriter pub tp :qos (dds.qos:make-writer-qos :history-kind :keep-all))))
+           (dotimes (i 3) (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x i :y i :shapesize 1)))
+           (dotimes (i 3) (dds.dcps:write-sample dw (make-shape-type :color "RED"  :x i :y i :shapesize 1)))
+           (%check :kaw-keeps-all (= 6 (dds.rtps.history:hc-change-count (%dw-engine-hc dw)))
+                   (format nil "a KEEP_ALL writer must retain ALL 6 changes (no per-instance eviction), got ~d"
+                           (dds.rtps.history:hc-change-count (%dw-engine-hc dw)))))
+      (dds.dcps:delete-participant p)))
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p2 "KaR2Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p2))
+                (dr (dds.dcps:create-datareader sub tp :qos (dds.qos:make-reader-qos :history-kind :keep-all)))
+                (node (dds.dcps::dp-node p2))
+                (wid #x00000102))
+           (%check :kar-no-depth (null (dds.dcps::%reader-keeplast-depth dr))
+                   "a KEEP_ALL reader must report NO KEEP_LAST depth (no per-instance drop path)")
+           (flet ((deliver (sn shape)
+                    (%stage-data-sn node sn (funcall (dds.types:type-support-key-hash ts) shape)
+                                    (dds.dcps::%serialize-sample ts shape) wid)))
+             (deliver 1 (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 1))
+             (deliver 2 (make-shape-type :color "BLUE" :x 2 :y 2 :shapesize 2))
+             (deliver 3 (make-shape-type :color "BLUE" :x 3 :y 3 :shapesize 3))
+             (deliver 4 (make-shape-type :color "RED"  :x 4 :y 4 :shapesize 4)))
+           (dds.dcps::%drain dr)
+           (%check :kar-keeps-all (= 4 (length (dds.dcps::dr-cache dr)))
+                   (format nil "a KEEP_ALL reader must keep ALL 4 delivered samples (no drop), got ~d"
+                           (length (dds.dcps::dr-cache dr)))))
+      (dds.dcps:delete-participant p2)))
+  t)
+
+(defun* run-keeplast-reliability-composition-test ()
+    (function () t)
+  "WP-KEEPLAST D2 scenario 7 (spec §7, DDS 1.4 §2.2.3.18 + RTPS 2.5 §8.4.1): purge-acked and per-instance
+   KEEP_LAST eviction co-exist through the single %hc-remove-change path without drifting. A KEEP_LAST depth-2
+   keyed engine writer is fed A@1 A@3 A@5 (instance A; SN1 EVICTED at depth) and B@2 (instance B). A reliable
+   reader then fully-acks through SN3, so writer-purge-acked PURGES the fully-acked low changes (SN2, SN3 < 4).
+   Assert: SN1 went by eviction, SN2/SN3 by purge, A keeps its last 2 (SN3 was purged though — so A's live set
+   becomes {5} after purge), the change table and the per-instance index agree (count = sum of bucket lengths),
+   no bucket holds an orphaned (purged/evicted) SN, and re-adding into A still evicts correctly (no drift)."
+  (let* ((hc (dds.rtps.history:make-history-cache :keep-last 2 nil nil))
+         (a (%keeplast-handle 1))
+         (b (%keeplast-handle 2)))
+    (flet ((add (sn h) (dds.rtps.history:hc-add-change
+                        hc (dds.rtps.history:make-cache-change :sn sn :instance-key-hash h)))
+           (have (sn) (dds.rtps.history:hc-get-change hc sn)))
+      (add 1 a) (add 2 b) (add 3 a) (add 5 a)            ; A: 1,3,5 -> KEEP_LAST-2 evicts A's SN1
+      (%check :klc-evicted-1 (null (have 1)) "per-instance KEEP_LAST-2 must evict A's oldest SN1")
+      (%check :klc-pre-count (= 3 (dds.rtps.history:hc-change-count hc))
+              (format nil "after eviction the HC holds 3 changes (A:3,5 + B:2), got ~d" (dds.rtps.history:hc-change-count hc)))
+      ;; purge the fully-acked low range (< 4): removes SN2 (B) and SN3 (A) through the SAME %hc-remove-change.
+      (let ((purged (dds.rtps.history:hc-purge-below hc 4)))
+        (%check :klc-purged-2 (= 2 purged)
+                (format nil "hc-purge-below 4 must remove SN2 and SN3 (the fully-acked low changes), got ~d" purged)))
+      (%check :klc-2-gone (null (have 2)) "SN2 (B) must be purged")
+      (%check :klc-3-gone (null (have 3)) "SN3 (A) must be purged")
+      (%check :klc-5-kept (have 5) "SN5 (A) survives both eviction and purge")
+      (%check :klc-count-1 (= 1 (dds.rtps.history:hc-change-count hc))
+              (format nil "only SN5 must remain (count 1), got ~d" (dds.rtps.history:hc-change-count hc)))
+      ;; the index never drifted: bucket-summed SNs equal the change count, and no bucket holds a removed SN.
+      (let ((by-instance (%hc-instance-sns hc)))
+        (%check :klc-index-agrees
+                (= (dds.rtps.history:hc-change-count hc)
+                   (let ((n 0)) (maphash (lambda (k sns) (declare (ignore k)) (incf n (length sns))) by-instance) n))
+                "the per-instance index SN total must equal the change count (no orphaned/double-counted SN)")
+        (%check :klc-a-live (equal '(5) (gethash a by-instance))
+                (format nil "instance A's live bucket must be exactly (5) after eviction+purge, got ~s" (gethash a by-instance)))
+        (%check :klc-b-empty (null (gethash b by-instance))
+                "instance B's bucket must be gone (its only SN2 was purged) — not an orphaned empty bucket"))
+      ;; re-add into A: depth-2 must still evict correctly off the TRUE post-purge bucket (no stale index entry).
+      (add 6 a) (add 7 a)
+      (%check :klc-readd-evicts (and (= 2 (dds.rtps.history:hc-change-count hc)) (have 6) (have 7) (null (have 5)))
+              "re-adding A@6,A@7 must keep the last 2 (6,7) and evict SN5 — the post-purge bucket drove eviction (no drift)")))
+  t)
+
 ;;; WP-BATCH write-side batching (FR-PF-1 / NFR-PERF-4): with batch-max-samples=N, publish-sample DEFERS
 ;;; the push until N samples accumulate (size trigger) or flush-batch fires (time/cadence/stop); the batch
 ;;; then flushes coalesced into few datagrams with one amortized HEARTBEAT. Each sample stays a standard
@@ -3237,7 +3913,7 @@
                :host "127.0.0.1" :port 0 :batch-max-samples 5)))
     (unwind-protect
          (progn
-           (dds.disc:enable-publisher node)
+           (dds.disc:enable-publisher node :history-kind :keep-all)   ; KEEP_ALL: batching retains all 5 DATA to flush at once (ADR 0019 migration)
            (%seed-reader-participant node #x63 7705)
            (let ((captured '()))
              (let ((dds.disc::*datagram-sink* (lambda (dg) (push dg captured))))
@@ -3293,7 +3969,7 @@
   (let ((node (dds.disc:make-disc-node
                :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element guid-byte)
                :host "127.0.0.1" :port 0)))
-    (dds.disc:enable-publisher node)
+    (dds.disc:enable-publisher node :history-kind :keep-all)   ; KEEP_ALL: the step/teardown fixtures retain every written change (ADR 0019 migration)
     (%seed-reader-participant node reader-byte port)
     (let ((writer (dds.disc::disc-node-user-writer node)))
       (dolist (pl writes) (dds.rtps.reliable:writer-write writer pl)))
@@ -3439,7 +4115,7 @@
          (progn
            (dds.disc:add-local-writer pw :topic "FlowPace" :type "X"
                                       :reliability dds.rtps.discovery:+reliability-best-effort+)
-           (dds.disc:enable-publisher pw)
+           (dds.disc:enable-publisher pw :history-kind :keep-all)   ; KEEP_ALL: pacing must deliver all N samples (ADR 0019 migration)
            (dds.disc:add-local-reader pr :topic "FlowPace" :type "X"
                                       :reliability dds.rtps.discovery:+reliability-best-effort+)
            (dds.disc:enable-subscriber pr)
@@ -3462,7 +4138,7 @@
            (progn
              (dds.disc:add-local-writer uw :topic "FlowPace" :type "X"
                                         :reliability dds.rtps.discovery:+reliability-best-effort+)
-             (dds.disc:enable-publisher uw)
+             (dds.disc:enable-publisher uw :history-kind :keep-all)   ; KEEP_ALL: the unpaced baseline must deliver all N (ADR 0019 migration)
              (dds.disc:enable-async uw)
              (dds.disc:add-local-reader ur :topic "FlowPace" :type "X"
                                         :reliability dds.rtps.discovery:+reliability-best-effort+)
@@ -3504,11 +4180,11 @@
     (unwind-protect
          (progn
            (dds.disc:add-local-writer wa :topic "FlowRRa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
-           (dds.disc:enable-publisher wa)
+           (dds.disc:enable-publisher wa :history-kind :keep-all)   ; KEEP_ALL: writer A must deliver all its samples (ADR 0019 migration)
            (dds.disc:add-local-reader ra :topic "FlowRRa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
            (dds.disc:enable-subscriber ra)
            (dds.disc:add-local-writer wb :topic "FlowRRb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
-           (dds.disc:enable-publisher wb)
+           (dds.disc:enable-publisher wb :history-kind :keep-all)   ; KEEP_ALL: writer B must deliver all its samples (ADR 0019 migration)
            (dds.disc:add-local-reader rb :topic "FlowRRb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
            (dds.disc:enable-subscriber rb)
            ;; Record the INTERLEAVING: each reader's on-sample stamps which writer (:a / :b) just delivered.
@@ -3875,7 +4551,8 @@
     (unwind-protect
          (progn
            (dds.disc:add-local-writer node :topic "FlowTd" :type "X")
-           (dds.disc:enable-publisher node :max-samples max-samples :max-blocking-ns (* block-ms 1000000))
+           (dds.disc:enable-publisher node :history-kind :keep-all   ; KEEP_ALL bounded cache: fills + blocks (the no-wedge fixture, ADR 0019 migration)
+                                           :max-samples max-samples :max-blocking-ns (* block-ms 1000000))
            (%seed-reader-participant node #xD5 7825)
            (setf controller (dds.disc:make-flow-controller :tokens-per-period 400 :period 100000000 :max-burst 400))
            (dds.disc:flow-controller-associate controller node)
@@ -3967,7 +4644,7 @@
     (unwind-protect
          (progn
            (dds.disc:add-local-writer w :topic "FlowBench" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
-           (dds.disc:enable-publisher w)
+           (dds.disc:enable-publisher w :history-kind :keep-all)   ; KEEP_ALL: the bench drains all N samples (ADR 0019 migration)
            (dds.disc:add-local-reader r :topic "FlowBench" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
            (dds.disc:enable-subscriber r)
            (%flow-match-writer-reader w r "FlowBench")
@@ -3996,7 +4673,7 @@
     (unwind-protect
          (progn
            (dds.disc:add-local-writer w :topic "FlowBench" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
-           (dds.disc:enable-publisher w)
+           (dds.disc:enable-publisher w :history-kind :keep-all)   ; KEEP_ALL: the unpaced bench baseline drains all N (ADR 0019 migration)
            (dds.disc:enable-async w)
            (dds.disc:add-local-reader r :topic "FlowBench" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
            (dds.disc:enable-subscriber r)
@@ -4046,11 +4723,11 @@
     (unwind-protect
          (progn
            (dds.disc:add-local-writer wa :topic "FlowBenchRRa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
-           (dds.disc:enable-publisher wa)
+           (dds.disc:enable-publisher wa :history-kind :keep-all)   ; KEEP_ALL: bench writer A drains all N (ADR 0019 migration)
            (dds.disc:add-local-reader ra :topic "FlowBenchRRa" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
            (dds.disc:enable-subscriber ra)
            (dds.disc:add-local-writer wb :topic "FlowBenchRRb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
-           (dds.disc:enable-publisher wb)
+           (dds.disc:enable-publisher wb :history-kind :keep-all)   ; KEEP_ALL: bench writer B drains all N (ADR 0019 migration)
            (dds.disc:add-local-reader rb :topic "FlowBenchRRb" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
            (dds.disc:enable-subscriber rb)
            (setf (dds.disc:disc-node-on-sample ra) (lambda () (push :a order))
@@ -4093,7 +4770,7 @@
     (unwind-protect
          (progn
            (dds.disc:add-local-writer w :topic "FlowBenchFrag" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
-           (dds.disc:enable-publisher w)
+           (dds.disc:enable-publisher w :history-kind :keep-all)   ; KEEP_ALL: one large fragmented sample; KEEP_ALL keeps the fixture honest (ADR 0019 migration)
            (dds.disc:add-local-reader r :topic "FlowBenchFrag" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
            (dds.disc:enable-subscriber r)
            (%flow-match-writer-reader w r "FlowBenchFrag")
@@ -4220,7 +4897,7 @@
     (unwind-protect
          (progn
            (dds.disc:add-local-writer w :topic "AsyncT" :type "X")
-           (dds.disc:enable-publisher w)
+           (dds.disc:enable-publisher w :history-kind :keep-all)   ; KEEP_ALL: the async sender must deliver all 20 (ADR 0019 migration)
            (dds.disc:enable-async w)
            (dds.disc:add-local-reader r :topic "AsyncT" :type "X"
                                       :reliability dds.rtps.discovery:+reliability-reliable+)
@@ -4273,7 +4950,7 @@
            (%check :shmem-e2e-same-host (= (dds.disc::disc-node-host-uuid w) (dds.disc::disc-node-host-uuid r))
                    "two participants in one process must share a host-uuid")
            (dds.disc:add-local-writer w :topic "ShmemT" :type "X")
-           (dds.disc:enable-publisher w)
+           (dds.disc:enable-publisher w :history-kind :keep-all)   ; KEEP_ALL: SHMEM e2e must deliver all 20 (ADR 0019 migration)
            (dds.disc:add-local-reader r :topic "ShmemT" :type "X"
                                       :reliability dds.rtps.discovery:+reliability-reliable+)
            (dds.disc:enable-subscriber r)
@@ -4325,7 +5002,7 @@
                    "both nodes must have a ZC writer pool when *zerocopy-enabled* + SHMEM")
            (dds.disc:add-local-writer w :topic "ZcT" :type "X"
                                       :reliability dds.rtps.discovery:+reliability-reliable+)
-           (dds.disc:enable-publisher w)
+           (dds.disc:enable-publisher w :history-kind :keep-all)   ; KEEP_ALL: Zero-Copy e2e must deliver all N (ADR 0019 migration)
            (dds.disc:add-local-reader r :topic "ZcT" :type "X"
                                       :reliability dds.rtps.discovery:+reliability-reliable+)
            (dds.disc:enable-subscriber r)

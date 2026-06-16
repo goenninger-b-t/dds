@@ -468,6 +468,109 @@
               "remove decrements count"))
     t))
 
+;;; Per-instance KEEP_LAST eviction (DDS 1.4 §2.2.3.18: "keep the last depth values FOR EACH
+;;; instance"). A keyed KEEP_LAST-N cache must retain the last N of EACH key, not a global last-N
+;;; (which would starve a slow-writing key). The HistoryCache is constructed KEEP_LAST directly
+;;; here; the engine writer still builds KEEP_ALL (a later WP-KEEPLAST task activates QoS), so this
+;;; exercises the eviction machinery at the engine level (ADR 0019, Phase A).
+
+(defun* %keeplast-handle (lastbyte)
+    (function ((unsigned-byte 8)) (simple-array (unsigned-byte 8) (16)))
+  "A 16-octet instance key hash distinguished by LASTBYTE — a per-instance handle for the
+   per-instance KEEP_LAST tests (the shape DCPS computes per keyed sample; 0 = HANDLE_NIL)."
+  (let ((h (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref h 15) lastbyte)
+    h))
+
+(defun* run-hc-perinstance-keeplast-test ()
+    (function () t)
+  "Test: KEEP_LAST depth applies PER INSTANCE (DDS 1.4 §2.2.3.18). A keyed KEEP_LAST-2 cache fed 3
+   changes for instance A and 3 for instance B retains exactly the last 2 of A AND the last 2 of B
+   (4 total) — NOT a global last-2 (which would hold only B's last 2 and starve A)."
+  (let ((hc (dds.rtps.history:make-history-cache :keep-last 2 nil nil))
+        (a (%keeplast-handle 1))
+        (b (%keeplast-handle 2)))
+    (flet ((add (sn h)
+             (dds.rtps.history:hc-add-change
+              hc (dds.rtps.history:make-cache-change :sn sn :instance-key-hash h)))
+           (have (sn) (dds.rtps.history:hc-get-change hc sn)))
+      ;; interleaved writes: A@1 B@2 A@3 B@4 A@5 B@6 (A = odd SNs, B = even SNs)
+      (add 1 a) (add 2 b) (add 3 a) (add 4 b) (add 5 a) (add 6 b)
+      (%check :kl-pi-count (= 4 (dds.rtps.history:hc-change-count hc))
+              "per-instance KEEP_LAST-2 over 2 instances holds 4 changes (2 per instance)")
+      (%check :kl-pi-a-kept (and (have 3) (have 5)) "instance A keeps its last 2 (SN 3,5)")
+      (%check :kl-pi-a-evicted (null (have 1)) "instance A's oldest (SN 1) is evicted")
+      (%check :kl-pi-b-kept (and (have 4) (have 6)) "instance B keeps its last 2 (SN 4,6)")
+      (%check :kl-pi-b-evicted (null (have 2)) "instance B's oldest (SN 2) is evicted")
+      (%check :kl-pi-not-global
+              (and (have 3) (null (have 1)))
+              "NOT a global last-2: A's SN3 survives though it is below B's retained SN4/6")))
+  t)
+
+(defun* run-hc-keeplast-unkeyed-test ()
+    (function () t)
+  "Test: unkeyed changes (instance-key-hash NIL or HANDLE_NIL) collapse to ONE instance bucket, so
+   KEEP_LAST is the global last-depth (DDS 1.4 §2.2.3.18 degenerate single-instance case). A NIL
+   keyhash and the all-zero HANDLE_NIL must share the SAME bucket."
+  (let ((handle-nil (%keeplast-handle 0)))           ; all-zero 16-octet HANDLE_NIL
+    ;; (a) NIL keyhash: 4 adds to a KEEP_LAST-2 cache -> global last-2
+    (let ((hc (dds.rtps.history:make-history-cache :keep-last 2 nil nil)))
+      (dolist (sn '(1 2 3 4))
+        (dds.rtps.history:hc-add-change hc (dds.rtps.history:make-cache-change :sn sn)))
+      (%check :kl-unkeyed-count (= 2 (dds.rtps.history:hc-change-count hc))
+              "NIL-keyhash KEEP_LAST-2 collapses to one instance -> global last-2")
+      (%check :kl-unkeyed-kept (and (dds.rtps.history:hc-get-change hc 3)
+                                    (dds.rtps.history:hc-get-change hc 4))
+              "global last-2 (SN 3,4) retained")
+      (%check :kl-unkeyed-evicted (and (null (dds.rtps.history:hc-get-change hc 1))
+                                       (null (dds.rtps.history:hc-get-change hc 2)))
+              "globally-oldest (SN 1,2) evicted"))
+    ;; (b) NIL and HANDLE_NIL share ONE bucket: 2 NIL + 2 HANDLE_NIL, depth 2 -> 2 retained total
+    (let ((hc (dds.rtps.history:make-history-cache :keep-last 2 nil nil)))
+      (dds.rtps.history:hc-add-change hc (dds.rtps.history:make-cache-change :sn 1))
+      (dds.rtps.history:hc-add-change hc (dds.rtps.history:make-cache-change :sn 2 :instance-key-hash handle-nil))
+      (dds.rtps.history:hc-add-change hc (dds.rtps.history:make-cache-change :sn 3))
+      (dds.rtps.history:hc-add-change hc (dds.rtps.history:make-cache-change :sn 4 :instance-key-hash handle-nil))
+      (%check :kl-nil-handlenil-one-bucket (= 2 (dds.rtps.history:hc-change-count hc))
+              "NIL and all-zero HANDLE_NIL share one bucket -> depth-2 keeps only 2 total")
+      (%check :kl-nil-handlenil-kept (and (dds.rtps.history:hc-get-change hc 3)
+                                          (dds.rtps.history:hc-get-change hc 4))
+              "the last 2 across the shared bucket (SN 3,4) retained")))
+  t)
+
+(defun* run-hc-remove-change-consistency-test ()
+    (function () t)
+  "Test: a removal updates BOTH the change table AND the per-instance index — no orphaned SN is left
+   in an instance bucket, the count decrements, and re-adding the same instance works (ADR 0019: a
+   single removal path so changes + instances never drift)."
+  (let ((hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil))
+        (a (%keeplast-handle 1)))
+    (flet ((add (sn h)
+             (dds.rtps.history:hc-add-change
+              hc (dds.rtps.history:make-cache-change :sn sn :instance-key-hash h))))
+      (add 10 a) (add 11 a) (add 12 a)
+      (%check :rmc-before (= 3 (dds.rtps.history:hc-change-count hc)) "3 changes for instance A added")
+      ;; remove an arbitrary (interior) SN
+      (%check :rmc-removed (dds.rtps.history:hc-remove-change hc 11) "hc-remove-change reports SN 11 present")
+      (%check :rmc-count (= 2 (dds.rtps.history:hc-change-count hc)) "count decremented to 2")
+      (%check :rmc-gone (null (dds.rtps.history:hc-get-change hc 11)) "SN 11 gone from the change table")
+      (%check :rmc-others (and (dds.rtps.history:hc-get-change hc 10)
+                               (dds.rtps.history:hc-get-change hc 12))
+              "SN 10 and 12 untouched")
+      ;; the index has no orphaned SN 11: switch this cache to KEEP_LAST-1 semantics by re-adding
+      ;; into A and confirming eviction sees the true bucket (the removed SN must not count toward depth)
+      (let ((kl (dds.rtps.history:make-history-cache :keep-last 1 nil nil)))
+        (dds.rtps.history:hc-add-change kl (dds.rtps.history:make-cache-change :sn 20 :instance-key-hash a))
+        (dds.rtps.history:hc-remove-change kl 20)             ; index for A must now be empty, not orphaned
+        (%check :rmc-empty-after (zerop (dds.rtps.history:hc-change-count kl)) "KEEP_LAST cache empty after removing its only change")
+        (dds.rtps.history:hc-add-change kl (dds.rtps.history:make-cache-change :sn 21 :instance-key-hash a))
+        (dds.rtps.history:hc-add-change kl (dds.rtps.history:make-cache-change :sn 22 :instance-key-hash a))
+        (%check :rmc-readd-evicts (and (= 1 (dds.rtps.history:hc-change-count kl))
+                                       (dds.rtps.history:hc-get-change kl 22)
+                                       (null (dds.rtps.history:hc-get-change kl 21)))
+                "re-adding into A after a clean remove evicts correctly (no orphaned SN inflated the bucket)"))))
+  t)
+
 ;;; Reliable writer/reader: eventual delivery through a lossy/reorder/dup channel
 ;;; (RTPS 2.5 §8.4; NFR-TEST reliability suite). Deterministic loss pattern that
 ;;; clears by round 3, so convergence is guaranteed and the loop is bounded.

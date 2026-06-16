@@ -183,6 +183,7 @@
   (on-lifecycle-event nil :type (or null function)) ; DCPS-facing: fired after a dispose/unregister is classified (S2)
   (on-heartbeat nil :type (or null function))
   (on-acknack nil :type (or null function))
+  (on-gap nil :type (or null function))
   (on-data-frag nil :type (or null function))
   (on-heartbeat-frag nil :type (or null function))
   (on-nack-frag nil :type (or null function))
@@ -964,6 +965,9 @@
               (when (disc-node-on-acknack node)
                 (dds.core.buffer:cursor-set-position c pos)
                 (funcall (disc-node-on-acknack node) c flags src-prefix)))))
+         ((and (= id dds.rtps.message:+submsg-gap+) (disc-node-on-gap node))
+          ;; RTPS 2.5 §8.3.7.4: a GAP marks evicted/irrelevant SNs so the reliable reader stops NACKing them.
+          (funcall (disc-node-on-gap node) c flags src-prefix))
          ((and (= id dds.rtps.message:+submsg-data-frag+) (disc-node-on-data-frag node))
           (funcall (disc-node-on-data-frag node) c flags body-len buf src-prefix))
          ((and (= id dds.rtps.message:+submsg-heartbeat-frag+) (disc-node-on-heartbeat-frag node))

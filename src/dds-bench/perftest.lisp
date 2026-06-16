@@ -140,10 +140,10 @@
          (progn
            (dds.disc:add-local-writer p :topic "PerfPing" :type "perf")
            (dds.disc:add-local-reader p :topic "PerfPong" :type "perf" :reliability +reliable+)
-           (dds.disc:enable-publisher p) (dds.disc:enable-subscriber p)
+           (dds.disc:enable-publisher p :history-kind :keep-all) (dds.disc:enable-subscriber p)   ; KEEP_ALL: a latency bench measures delivery, not history (ADR 0019)
            (dds.disc:add-local-reader e :topic "PerfPing" :type "perf" :reliability +reliable+)
            (dds.disc:add-local-writer e :topic "PerfPong" :type "perf")
-           (dds.disc:enable-subscriber e) (dds.disc:enable-publisher e)
+           (dds.disc:enable-subscriber e) (dds.disc:enable-publisher e :history-kind :keep-all)   ; KEEP_ALL: the pong writer likewise (ADR 0019)
            (setf (dds.disc:disc-node-on-sample e)
                  (lambda () (dds.disc:publish-sample e pong)))
            (setf (dds.disc:disc-node-on-sample p)
@@ -206,7 +206,7 @@
     (unwind-protect
          (progn
            (dds.disc:add-local-writer p :topic "PerfThru" :type "perf")
-           (dds.disc:enable-publisher p)
+           (dds.disc:enable-publisher p :history-kind :keep-all)   ; KEEP_ALL: throughput delivers all `samples` (ADR 0019)
            (dds.disc:add-local-reader e :topic "PerfThru" :type "perf" :reliability +reliable+)
            (dds.disc:enable-subscriber e)
            (dds.disc:start-node p) (dds.disc:start-node e)

@@ -13,4 +13,5 @@
     run-bench-smoke / run-bench-shmem-smoke / run-bench-zerocopy-smoke are tiny suite-friendly
     self-checks.")
   (:export #:run-latency #:run-throughput #:run-bench #:run-bench-shmem #:run-bench-zerocopy
-           #:run-bench-smoke #:run-bench-shmem-smoke #:run-bench-zerocopy-smoke))
+           #:run-bench-smoke #:run-bench-shmem-smoke #:run-bench-zerocopy-smoke
+           #:run-keeplast-bench #:run-keeplast-bench-smoke))

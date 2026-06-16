@@ -43,7 +43,7 @@
            #:+sequence-number-unknown+ #:+seqnum-set-max-bits+
            #:write-sequence-number #:read-sequence-number
            #:write-sequence-number-set #:read-sequence-number-set
-           #:seqnum-set-bit #:seqnum-set-bit-p #:seqnum-set-member-p
+           #:seqnum-set-bit #:seqnum-set-bit-p #:seqnum-set-member-p #:seqnum-set-from-sns
            #:write-fragment-number-set #:read-fragment-number-set
            #:fragnum-set-bit #:fragnum-set-member-p
            #:+heartbeat-flag-final+ #:+heartbeat-flag-liveliness+ #:+heartbeat-flag-group-info+
@@ -94,7 +94,7 @@
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
            #:reader-acknack #:reader-on-gap #:reader-complete-p
            #:get-writer-proxy #:writer-proxy #:writer-proxy-received #:writer-proxy-last-sn #:writer-proxy-first-sn
-           #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments*
+           #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments* #:*max-gap-range*
            #:reader-on-data-frag #:reader-frag-acknack
            #:writer-frag-plan #:writer-frag-plan-for
            #:writer-frag-heartbeat #:writer-on-nack-frag #:writer-sample-payload))

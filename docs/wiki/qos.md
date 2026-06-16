@@ -68,6 +68,44 @@ a package-qualified accessor.
 | `dds.qos:make-writer-qos` | `(make-writer-qos &rest args)` — a `qos` with DataWriter defaults (RELIABILITY defaults to `:reliable`); `args` override slots. |
 | `dds.qos:make-reader-qos` | `(make-reader-qos &rest args)` — a `qos` with DataReader defaults (RELIABILITY defaults to `:best-effort`); `args` override slots. |
 
+### HISTORY: per-instance KEEP_LAST (DDS 1.4 §2.2.3.18)
+
+HISTORY governs how many samples an endpoint retains. **`KEEP_LAST` keeps the last `depth` values of
+*each instance*** (each topic key), not a global last-`depth` — so one fast-writing key can never starve
+another. This holds on **both sides**: the writer's `HistoryCache` keeps the last `depth` changes of each
+key (for reliable retransmit / late-joiners), and the DataReader's cache keeps the last `depth` samples of
+each key (a lossy *drop* of an instance's oldest, distinct from the RESOURCE_LIMITS *reject*). `KEEP_ALL`
+retains every sample, bounded only by RESOURCE_LIMITS (`max_samples`). An **unkeyed** (NO_KEY) type has a
+single instance, so KEEP_LAST collapses to a global last-`depth`.
+
+**Default + opt-out.** The generic default is the spec value **`KEEP_LAST` depth 1** (the QoS table above) —
+an unconfigured writer/reader keeps the latest sample per key. Where you need full retention (a burst-then-
+drain pattern, a late joiner that must catch up on more than the latest per key, or a test that writes more
+than `depth` and expects all retained), set **`KEEP_ALL`** explicitly (e.g. `make-writer-qos :history-kind
+:keep-all`, or `dds.disc:enable-publisher … :history-kind :keep-all` at the engine layer).
+
+```lisp
+;; A keyed KEEP_LAST depth-2 writer keeps the LAST 2 samples of EACH key.
+;; Writing 3 samples for key "A" then 1 for key "B" retains {A2,A3} AND {B1} —
+;; a global last-2 would have wrongly dropped A's history when B wrote.
+(let ((w (dds.dcps:create-datawriter
+          pub topic :qos (dds.qos:make-writer-qos :history-kind :keep-last :history-depth 2))))
+  (dds.dcps:write-sample w (make-keyed-sample :key "A" :v 1))
+  (dds.dcps:write-sample w (make-keyed-sample :key "A" :v 2))
+  (dds.dcps:write-sample w (make-keyed-sample :key "A" :v 3))   ; A@1 evicted; A keeps {2,3}
+  (dds.dcps:write-sample w (make-keyed-sample :key "B" :v 1)))  ; B keeps {1}, A untouched
+```
+
+**GAP interaction (RTPS 2.5 §8.3.7.4).** Per-instance eviction can remove an **interior** sequence number
+(depth 1: write A@1, B@2, B@3 → evicting B's oldest SN2 leaves a hole at SN2 inside `[firstSN, lastSN]`). A
+reliable reader that NACKs the evicted SN receives a **GAP** marking it irrelevant (sent by the writer data
+plane, wired in both directions) — so the reader advances its ACK past the hole instead of NACKing forever;
+low-end evictions are additionally covered by the HEARTBEAT `firstSN` advance. See
+[rtps-engine](rtps-engine.md) (HistoryCache + GAP) and [ADR 0019](../adr/0019-perinstance-keeplast.md). The
+writer-side per-instance machinery cost is benched honestly in `bench/report/2026-06-16-wp-keeplast.md`
+(`make bench-keeplast`): a keyed KEEP_LAST writer adds ~16-octet keyhash/sample + the index cons (freed on
+evict); KEEP_ALL and unkeyed stay as before (NO 0-cost claim).
+
 ### Backpressure: block up to `max_blocking_time` (RELIABILITY × RESOURCE_LIMITS)
 
 DDS-standard **block-up-to-`max_blocking_time`** flow control (WP-ASYNC-FLOW, FR-PF-2/FR-QOS,

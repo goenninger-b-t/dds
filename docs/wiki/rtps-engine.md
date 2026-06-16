@@ -71,6 +71,7 @@ source.
 - `dds.rtps.message:seqnum-set-bit` *(bitmap delta)* — set the bit for offset `DELTA` (word `DELTA/32`, bit `31 - DELTA%32`).
 - `dds.rtps.message:seqnum-set-bit-p` *(bitmap delta)* — T iff the bit for offset `DELTA` is set.
 - `dds.rtps.message:seqnum-set-member-p` *(base numbits bitmap seqnum)* — T iff `SEQNUM` is in the set, per the §9.4.2.6 membership rule.
+- `dds.rtps.message:seqnum-set-from-sns` *(sns)* — build a SequenceNumberSet covering the non-empty SN list `SNS`: `(values base numBits bitmap)`, `base = min SN`, one bit set per SN via `seqnum-set-bit`. `SNS` must fit one 256-SN window (it does for the SNs of one inbound ACKNACK). Used to GAP the NACKed-but-evicted SNs (`%on-user-acknack`).
 
 ### Reliability submessages: HEARTBEAT / ACKNACK / GAP (`dds.rtps.message`)
 
@@ -143,14 +144,19 @@ The RTPS well-known port formula (§9.6.1.1): `PB=7400 DG=250 PG=2 d0=0 d1=10 d2
 
 The change store honouring HISTORY (KEEP_LAST depth / KEEP_ALL) and RESOURCE_LIMITS
 (max_samples) (FR-RTPS-5). A hot-path package: the `cache-change` struct and the cache
-ops are `defstruct` + monomorphic functions, no CLOS.
+ops are `defstruct` + monomorphic functions, no CLOS. KEEP_LAST is **per-instance** (DDS 1.4
+§2.2.3.18): a secondary keyhash→SN index (`instances`) keeps the last `depth` changes of *each*
+instance key, evicting an instance's *own* oldest SN at depth, not the global oldest. The index is
+the KEEP_LAST eviction mechanism and is maintained for KEEP_LAST only — a **KEEP_ALL** cache keeps
+no index (an O(1) change-table insert, bounded only by RESOURCE_LIMITS). A NIL / HANDLE_NIL keyhash
+(an unkeyed type) collapses to one shared bucket = a global KEEP_LAST.
 
 - `dds.rtps.history:make-cache-change` *(&key kind writer-guid sn instance-key-hash serialized-payload status-info source-timestamp inline-qos)* — construct a `CacheChange`: the pooled per-sample record (change `KIND` `:data`/`:dispose`/`:unregister`, writer GUID, sequence number, instance key hash, serialized payload, `STATUS-INFO` flags (StatusInfo_t for a dispose/unregister, §9.6.4.9), source timestamp, inline QoS).
 - `dds.rtps.history:cache-change` / `cache-change-p` — the struct type and its predicate.
 - Accessors: `cache-change-kind`, `cache-change-writer-guid`, `cache-change-sn`, `cache-change-instance-key-hash`, `cache-change-serialized-payload`, `cache-change-status-info`, `cache-change-source-timestamp`, `cache-change-inline-qos`.
 - `dds.rtps.history:make-history-cache` *(kind depth resource-limits type-support)* — create a `HistoryCache` with HISTORY (`KIND` `:keep-last`/`:keep-all`, `DEPTH`) and RESOURCE_LIMITS (an integer, a plist with `:max-samples`, or `NIL` = unlimited).
 - `dds.rtps.history:history-cache` — the struct type.
-- `dds.rtps.history:hc-add-change` *(hc change)* — add a change, enforcing HISTORY + RESOURCE_LIMITS; returns `:OK`, `:DUPLICATE` (SN already present), or `:REJECTED-RESOURCE-LIMITS` (KEEP_ALL at max_samples). KEEP_LAST evicts the lowest SN when at depth.
+- `dds.rtps.history:hc-add-change` *(hc change)* — add a change, enforcing HISTORY + RESOURCE_LIMITS; returns `:OK`, `:DUPLICATE` (SN already present), or `:REJECTED-RESOURCE-LIMITS` (KEEP_ALL at max_samples). KEEP_LAST keeps the last `depth` values **per instance** (DDS 1.4 §2.2.3.18): when the change's instance is at depth, that instance's *own* oldest SN is evicted (not the global oldest); a NIL / HANDLE_NIL keyhash collapses to one bucket = global KEEP_LAST.
 - `dds.rtps.history:hc-get-change` *(hc seqnum)* — the `CacheChange` with `SEQNUM`, or `NIL`.
 - `dds.rtps.history:hc-remove-change` *(hc seqnum)* — remove the change with `SEQNUM`; returns `T` if one was present (and decrements the count).
 - `dds.rtps.history:hc-change-count` *(hc)* — the number of changes currently stored.
@@ -194,7 +200,7 @@ Handles dedup (duplicate SN overwrites), reorder (stored by SN), and GAP.
 - `dds.rtps.reliable:reader-on-data` *(reader writer-id sn payload)* — accept a DATA; idempotent (duplicate SN overwrites — dedup); tracks the highest SN seen so reordered delivery is harmless.
 - `dds.rtps.reliable:reader-on-heartbeat` *(reader writer-id first-sn last-sn)* — update the available range `[firstSN, lastSN]` (§8.3.7.5).
 - `dds.rtps.reliable:reader-acknack` *(reader writer-id)* — compute an ACKNACK (§8.3.7.1): `(values base numBits bitmap)`. `BASE` is the lowest unreceived SN in `[first, last]` (or `last+1` if none); the bitmap NACKs the unreceived SNs in `[base, last]` (capped at 256).
-- `dds.rtps.reliable:reader-on-gap` *(reader writer-id gap-start base numbits bitmap)* — mark GAPped SNs as irrelevant so they do not block the ack (§8.3.7.4): the range `[gapStart, base-1]` plus the SNs listed in the bitmap.
+- `dds.rtps.reliable:reader-on-gap` *(reader writer-id gap-start base numbits bitmap)* — mark GAPped SNs as irrelevant so they do not block the ack (§8.3.7.4): the range `[gapStart, base-1]` (lower-clamped to the proxy `first-sn`, upper-bounded by a hard cap of `*max-gap-range*` SNs) plus the SNs listed in the bitmap. `gapStart`/`base` are wire-controlled 64-bit values and `last-sn` is itself set from inbound HEARTBEATs, so the cap — independent of any wire value — is the resource-exhaustion guard against a `2^60`-span CPU+memory DoS (NFR-SEC-POSTURE); a larger evicted run is recovered loss-free over later GAP/HEARTBEAT rounds.
 - `dds.rtps.reliable:reader-complete-p` *(reader writer-id)* — T iff every SN in the available range `[first, last]` has been received or GAPped.
 - `dds.rtps.reliable:get-writer-proxy` *(reader writer-id)* — the `WriterProxy` for the opaque per-writer key `WRITER-ID` (the data plane passes the remote writer's full GUID), created on first use. Keyed only as an `equalp` hash key so two writers sharing EntityId `0x102` across participants get independent reliable state (§8.3.5.4).
 - `dds.rtps.reliable:writer-proxy` — the struct type (the reader-side proxy for one matched writer).
@@ -264,19 +270,36 @@ The §9.4.2.6 spec example `1234/12:00110` (offsets 2 and 3 set). Adapted from
                 (dds.rtps.message:read-sequence-number-set c)))))  ; => (1234 12 #(#x30000000))
 ```
 
-### 3. HistoryCache: KEEP_LAST eviction and KEEP_ALL RESOURCE_LIMITS
+### 3. HistoryCache: per-instance KEEP_LAST eviction and KEEP_ALL RESOURCE_LIMITS
 
-Adapted from `run-history-test`. KEEP_LAST evicts the lowest SN at depth; KEEP_ALL rejects
-beyond `max_samples` and detects duplicates.
+Adapted from `run-history-test` / `run-hc-perinstance-keeplast-test`. KEEP_LAST keeps the last
+`depth` values **per instance key** (DDS 1.4 §2.2.3.18) — at depth it evicts that instance's *own*
+oldest SN, not the global oldest; an unkeyed change (no/HANDLE_NIL keyhash) collapses to one shared
+bucket = a global KEEP_LAST. KEEP_ALL keeps everything (no per-instance index), rejecting beyond
+`max_samples` and detecting duplicates.
 
 ```lisp
-;; KEEP_LAST depth 3: adding SN 1..4 evicts SN 1
+;; PER-INSTANCE KEEP_LAST depth 2, keyed: keep the last 2 changes of EACH key.
+;; Write A@1, A@2, A@3 for key A and B@4 for key B; A's oldest (SN1) is evicted
+;; (A now {2,3}), B keeps {4} — a GLOBAL last-2 would have wrongly dropped SN1+SN2.
+(let ((hc (dds.rtps.history:make-history-cache :keep-last 2 nil nil))
+      (ka (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xaa))
+      (kb (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xbb)))
+  (dolist (s '((1 . a) (2 . a) (3 . a) (4 . b)))
+    (dds.rtps.history:hc-add-change
+     hc (dds.rtps.history:make-cache-change
+         :sn (car s) :instance-key-hash (if (eq (cdr s) 'a) ka kb))))
+  (list (dds.rtps.history:hc-get-change hc 1)            ; => NIL (A's oldest, evicted)
+        (and (dds.rtps.history:hc-get-change hc 2)
+             (dds.rtps.history:hc-get-change hc 3)       ; A keeps its last 2 (SN 2,3)
+             (dds.rtps.history:hc-get-change hc 4) t)))  ; B keeps SN 4 (NOT starved by A)
+
+;; UNKEYED KEEP_LAST depth 3 (one bucket = global): adding SN 1..4 evicts SN 1
 (let ((hc (dds.rtps.history:make-history-cache :keep-last 3 nil nil)))
   (dolist (sn '(1 2 3 4))
     (dds.rtps.history:hc-add-change hc (dds.rtps.history:make-cache-change :sn sn)))
   (list (dds.rtps.history:hc-change-count hc)            ; => 3
         (dds.rtps.history:hc-get-change hc 1)            ; => NIL (evicted)
-        (dds.rtps.history:hc-min-seq hc)                 ; => 2
         (mapcar #'dds.rtps.history:cache-change-sn
                 (dds.rtps.history:hc-changes-for-reader hc nil)))) ; => (2 3 4)
 
@@ -323,7 +346,10 @@ to show the clean handshake).
 
 When a KEEP_LAST writer has already evicted low SNs, an ACKNACK for them yields a GAP (not a
 resend) for the evicted range and a resend for what is still cached. Adapted from
-`run-gap-handling-test`.
+`run-gap-handling-test`. On the wire the disc data plane (`%on-user-acknack`) sends that GAP to the
+NACKing reader (`seqnum-set-from-sns` → `write-gap`, §8.3.7.4) alongside the DATA resends — so a
+reliable reader advances past an evicted SN instead of NACKing it forever; the default unlimited
+KEEP_ALL writer never evicts, so `gap-sns` is empty and no GAP is sent.
 
 ```lisp
 (let* ((writer (dds.rtps.reliable:make-rtps-writer
@@ -384,8 +410,10 @@ resend) for the evicted range and a resend for what is still cached. Adapted fro
   byte/transport/thread wiring lives in the [Discovery](discovery.md) data plane
   (`dataplane.lisp`). The docstrings note the per-reader-proxy / resend-list consing there as
   a documented v1 concern; it is not on a measured hot path.
-- **HistoryCache v1 keys changes by SN in a hash-table.** A pooled, zero-alloc store +
-  non-consing iteration, per-instance KEEP_LAST, and LIFESPAN expiry are tracked follow-ups
+- **HistoryCache v1 keys changes by SN in a hash-table**, with a secondary keyhash→SN index for
+  **per-instance KEEP_LAST** (DDS 1.4 §2.2.3.18 — *done*, WP-KEEPLAST 2026-06-16; the index is
+  maintained for KEEP_LAST only, so KEEP_ALL stays an O(1) change-table insert). A pooled,
+  zero-alloc change store + non-consing iteration and LIFESPAN expiry remain tracked follow-ups
   (see the docstring in `history.lisp`). `hc-changes-for-reader` ignores its `reader-proxy`
   argument for now.
 
