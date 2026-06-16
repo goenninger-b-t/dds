@@ -4393,6 +4393,26 @@
             (replace vec sink :end2 len)))))
     (floor (max 0 (- (dds.pal:bytes-consed) before)) iters)))
 
+(defun* %fd-zc-loan-rx-bytes (sap slot gen iters)
+    (function (t (integer 0) (unsigned-byte 32) (integer 1)) (integer 0))
+  "WP-FLATDATA-ZC-LOAN literal-0-copy RX headline (FR-PF-3/4, NFR-PERF-7, R6, ADR 0017; NOT cleared for ship —
+   pending counsel). Mean GC bytes/sample of the LITERAL-0-COPY loan acquire+read+recycle over ITERS calls:
+   %zc-acquire-for-read (NO copy, NO refcount inc — one loaned slot serves every iteration) reuses the SAME view
+   struct (the per-reader view recycling DCPS does — no per-sample GC-heap view alloc), the app reads a field
+   straight off the slot SAP via the SAP-mode Offset accessor (read-in-place), then re-uses the view. NO owned
+   delivery vector at all — the residue is only the pool-mutex acquire/release (a fixed ~32 B CFFI
+   pthread-mutex-lock cost, PAYLOAD-INDEPENDENT, the SAME cost the v1 single-copy resolve %zc-resolve-fresh ALSO
+   pays on top of its ~46 B owned vector). The eliminated per-sample owned vector is the literal-0-copy win.
+   SBCL-exact; Clasp reads 0 (NFR-PORT gap)."
+  (let ((view (dds.types:make-flatdata-view))
+        (before (dds.pal:bytes-consed)))
+    (dotimes (i iters)
+      (multiple-value-bind (psap idx g len base) (dds.xport.zerocopy::%zc-acquire-for-read sap slot gen)
+        (when psap
+          (%set-view-from-acquire view psap idx g len base)    ; recycle the SAME view struct (no per-sample alloc)
+          (fd-abc-a-fd view))))                                ; read a field straight off the slot SAP (0-copy)
+    (floor (max 0 (- (dds.pal:bytes-consed) before)) iters)))
+
 (defun* run-flatdata-zerocopy-test ()
     (function () t)
   "WP-FLATDATA over Zero-Copy, Phase D (FR-PF-3/4, NFR-PERF-7, R6; ADR 0015. NOT cleared for ship — pending
@@ -4508,6 +4528,453 @@
                                        new-bytes dds.disc:+zerocopy-pool-slot-bytes+))))))))
         (dds.disc:stop-node w) (dds.disc:stop-node r)
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))))
+  t)
+
+(defun* run-dcps-loan-roundtrip-test ()
+    (function () t)
+  "WP-FLATDATA-ZC-LOAN Phase D+E literal-0-copy loan round-trip (FR-PF-3/4, NFR-PERF-7, R6, ADR 0017; NOT
+   cleared for ship — pending counsel). The full DCPS stack: two same-host participants, *shmem-enabled* +
+   *zerocopy-enabled* T, a FlatData topic (fd-abc). create_datareader on a :flatdata topic with ZC armed makes
+   the reader AUTO loan-capable (the wiring); a DataWriter publishes a FlatData sample over the Zero-Copy
+   reference path; take-loaned hands back a flatdata-view loan. Asserts, the headline:
+     (1) LITERAL 0-COPY READ (byte-exact): reading EVERY field via <name>-<field>-fd on the loaned VIEW (which
+         reads straight off the writer's SHMEM slot SAP) EQUALS the published values — no copy, no deserialize.
+     (2) SLOT REUSABLE AFTER return-loan: the loaned slot's refcount is held while loaned; after return-loan the
+         refcount drops to 0 and a subsequent %zc-loan REUSES that exact slot — proving the loan was the only
+         holder and the release frees it.
+     (3) DOUBLE return-loan is a SAFE no-op (idempotent — no double-%zc-release, no error).
+     (4) READER-CLOSE RETURNS AN OUTSTANDING LOAN: take a fresh loan, do NOT return it, delete the participant —
+         the registry-driven reader-close release frees the slot (refcount 0; no leaked refcount pinning the
+         pool). The slot lifetime never lets the receiver thread free a slot under the app's read (no UAF) and
+         never leaks a refcount (no wedge). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-dcps-loan-roundtrip-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
+         (ts (dds.types:find-type-support "fd-abc"))
+         (va 200) (vb 3000000000) (vc 12345678901234567890)
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "FdLoan" "fd-abc" ts))
+                (tr (dds.dcps:create-topic p2 "FdLoan" "fd-abc" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (node1 (dds.dcps::dp-node p1))
+                (node2 (dds.dcps::dp-node p2))
+                (fd (make-fd-abc-flatdata)))
+           (setf (fd-abc-a-fd fd) va (fd-abc-b-fd fd) vb (fd-abc-c-fd fd) vc)
+           (%check :loan-pools (and (dds.disc::disc-node-zc-pool node1) (dds.disc::disc-node-zc-pool node2))
+                   "both participants must have a ZC writer pool (*shmem-enabled* + *zerocopy-enabled*)")
+           (%check :loan-capable-wired (dds.disc::disc-node-zc-loan-capable node2)
+                   "the FlatData-topic reader must be auto loan-capable (the Phase-E wiring)")
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :loan-matched (plusp (dds.dcps:matched-count p1)) "writer/reader did not match")
+           ;; the reader must have parsed PID_ZEROCOPY_CAPABLE before the writer will send a ref
+           (loop repeat 200
+                 until (plusp (dds.disc::%zc-readers node1
+                                                     (list (dds.rtps.discovery:endpoint-data-guid
+                                                            (first (dds.disc::%matched-endpoints node1))))))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (dds.dcps:write-sample dw fd)                  ; SN 1: a FlatData sample over Zero-Copy
+           (loop repeat 300 until (plusp (dds.disc:node-sample-count node2))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :loan-zc-sends (plusp (dds.disc::disc-node-zc-sends node1))
+                   "the writer must have published a reference (zc-sends advanced), not the inline payload")
+           ;; (1) LITERAL 0-COPY READ via take-loaned -> a flatdata-view loan, byte-exact field reads
+           (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+             (%check :loan-got-one (= 1 (length data)) "take-loaned must return exactly one sample")
+             (%check :loan-is-view (dds.types:flatdata-view-p (first data))
+                     "the delivered sample must be a flatdata-view (literal-0-copy loan), not a copy")
+             (%check :loan-registered (= 1 (length loans)) "take-loaned must return one loan to hand back")
+             (let ((view (first data)))
+               (%check :loan-field-a (= (fd-abc-a-fd view) va)
+                       (format nil "loaned 0-copy field a: ~d != ~d" (fd-abc-a-fd view) va))
+               (%check :loan-field-b (= (fd-abc-b-fd view) vb)
+                       (format nil "loaned 0-copy field b: ~d != ~d" (fd-abc-b-fd view) vb))
+               (%check :loan-field-c (= (fd-abc-c-fd view) vc)
+                       (format nil "loaned 0-copy field c: ~d != ~d" (fd-abc-c-fd view) vc))
+               ;; the view reads the WRITER's pool slot directly (cross-process SAP), literal 0 intra-host copies
+               (let* ((wsap (dds.disc::disc-node-zc-pool-sap node1))
+                      (slot (dds.types:flatdata-view-slot-index view)))
+                 (%check :loan-held (= 1 (%zc-slot-refcount wsap slot))
+                         "while loaned the slot refcount must be 1 (held; force-reclaim skips it -> no UAF)")
+                 ;; (2) return-loan frees the slot -> the next %zc-loan REUSES it (the loan was the only holder)
+                 (dds.dcps:return-loan dr loans)
+                 (%check :loan-released (zerop (%zc-slot-refcount wsap slot))
+                         "after return-loan the slot refcount must be 0 (freed)")
+                 (%check :loan-registry-cleared (null (dds.dcps::dr-loans dr))
+                         "return-loan must clear the loan registry")
+                 (multiple-value-bind (rslot rgen)
+                     (dds.xport.zerocopy::%zc-loan wsap (subseq (dds.core.buffer:octet-buffer-vec fd) 0 +fd-abc-flatdata-size+)
+                                                   0 +fd-abc-flatdata-size+ 1)
+                   (%check :loan-slot-reusable (eql rslot slot)
+                           "the released slot must be reusable by a subsequent %zc-loan (refcount freed it)")
+                   (dds.xport.zerocopy::%zc-release wsap rslot rgen))   ; balance this probe loan
+                 ;; (3) double return-loan is a safe no-op (idempotent)
+                 (dds.dcps:return-loan dr loans)
+                 (%check :loan-double-return-safe (zerop (%zc-slot-refcount wsap slot))
+                         "a double return-loan must be a safe no-op (no double-release, refcount unchanged at 0)")))
+           ;; (4) READER-CLOSE RETURNS AN OUTSTANDING LOAN: take a 2nd sample, leak it, delete -> released
+           (dds.dcps:write-sample dw fd)                  ; SN 2
+           (loop repeat 300 until (> (dds.disc:node-sample-count node2) 1)
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (multiple-value-bind (data2 loans2) (dds.dcps:take-loaned dr)
+             (declare (ignore loans2))
+             (%check :loan-second (and data2 (dds.types:flatdata-view-p (first data2)))
+                     "the second take-loaned must also return a loaned view")
+             (let* ((view2 (first data2))
+                    (wsap (dds.disc::disc-node-zc-pool-sap node1))
+                    (slot2 (dds.types:flatdata-view-slot-index view2)))
+               (%check :loan-second-held (= 1 (%zc-slot-refcount wsap slot2))
+                       "the second loan must hold its slot (refcount 1) before reader-close")
+               (%check :loan-registry-has (= 1 (length (dds.dcps::dr-loans dr)))
+                       "the un-returned loan must be in the registry (so reader-close can release it)")
+               (dds.dcps:delete-participant p2)            ; reader-close returns ALL outstanding loans (before pool detach)
+               (setf p2 nil)
+               (%check :loan-close-released (zerop (%zc-slot-refcount wsap slot2))
+                       "reader-close (delete-participant) must return the outstanding loan (refcount 0, no leak)")))
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+    t))
+
+(defun* run-loan-read-return-take-test ()
+    (function () t)
+  "WP-FLATDATA-ZC-LOAN return-loan cache-invalidation (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending
+   counsel). The stale-read regression guard: read-loaned LEAVES samples in dr-cache, so the cached-sample keeps
+   referencing the returned view; before the fix, return-loan recycled the view to the freelist WITHOUT dropping
+   its cache entry, so a subsequent drain popped+re-inited that same struct for a NEW slot and the surviving stale
+   cache entry then aliased the NEW sample's bytes (a WRONG-BYTES stale read / double-return-of-the-view). The
+   flow: publish sample 1 over ZC; read-loaned (leaves it) -> view V1 reading sample 1; return-loan V1 (must drop
+   its cache entry AND recycle V1); publish sample 2; take-loaned (drains sample 2, recycling V1's struct).
+   Asserts: (1) V1 read sample 1's values; (2) after return, V1's cache entry is gone (no dr-cache element still
+   references V1 — reading a returned loan is invalidated, not a stale read); (3) take-loaned returns EXACTLY ONE
+   sample (no stale duplicate of the recycled struct) that reads SAMPLE 2's values (not sample 1, not an alias).
+   Pre-fix this FAILS (take-loaned returns two samples, both the recycled V1, both reading sample 2). Skips
+   cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-loan-read-return-take-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
+         (ts (dds.types:find-type-support "fd-abc"))
+         (va1 200) (vb1 3000000000) (vc1 12345678901234567890)   ; sample 1
+         (va2 99) (vb2 1234567890) (vc2 9876543210987654321)     ; sample 2 (distinct, to catch a stale alias)
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "FdLoanRR" "fd-abc" ts))
+                (tr (dds.dcps:create-topic p2 "FdLoanRR" "fd-abc" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (node1 (dds.dcps::dp-node p1))
+                (node2 (dds.dcps::dp-node p2))
+                (fd (make-fd-abc-flatdata)))
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :loan-rr-matched (plusp (dds.dcps:matched-count p1)) "writer/reader did not match")
+           (loop repeat 200
+                 until (plusp (dds.disc::%zc-readers node1
+                                                     (list (dds.rtps.discovery:endpoint-data-guid
+                                                            (first (dds.disc::%matched-endpoints node1))))))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (setf (fd-abc-a-fd fd) va1 (fd-abc-b-fd fd) vb1 (fd-abc-c-fd fd) vc1)
+           (dds.dcps:write-sample dw fd)                  ; SN 1
+           (loop repeat 300 until (plusp (dds.disc:node-sample-count node2))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           ;; (1) read-loaned LEAVES the sample; V1 reads sample 1's values
+           (multiple-value-bind (data loans) (dds.dcps:read-loaned dr)
+             (%check :loan-rr-read-one (= 1 (length data)) "read-loaned must return exactly one sample")
+             (%check :loan-rr-read-view (dds.types:flatdata-view-p (first data)) "the read sample must be a flatdata-view loan")
+             (let ((v1 (first data)))
+               (%check :loan-rr-v1-a (= (fd-abc-a-fd v1) va1) (format nil "V1 field a: ~d != ~d" (fd-abc-a-fd v1) va1))
+               (%check :loan-rr-v1-b (= (fd-abc-b-fd v1) vb1) (format nil "V1 field b: ~d != ~d" (fd-abc-b-fd v1) vb1))
+               (%check :loan-rr-v1-c (= (fd-abc-c-fd v1) vc1) (format nil "V1 field c: ~d != ~d" (fd-abc-c-fd v1) vc1))
+               ;; return V1 -> must drop its cache entry (the fix) AND recycle the struct
+               (dds.dcps:return-loan dr loans)
+               ;; (2) after return, NO dr-cache element still references V1 (the stale-read kill)
+               (%check :loan-rr-cache-invalidated
+                       (notany (lambda (cs) (eq (dds.dcps::cached-sample-data cs) v1)) (dds.dcps::dr-cache dr))
+                       "return-loan must drop the returned view's cache entry (else a later read aliases the next sample's bytes)")
+               ;; publish sample 2 with DISTINCT values; take-loaned drains it (recycling V1's struct)
+               (setf (fd-abc-a-fd fd) va2 (fd-abc-b-fd fd) vb2 (fd-abc-c-fd fd) vc2)
+               (dds.dcps:write-sample dw fd)              ; SN 2
+               (loop repeat 300 until (> (dds.disc:node-sample-count node2) 1)
+                     do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+               (multiple-value-bind (data2 loans2) (dds.dcps:take-loaned dr)
+                 ;; (3) EXACTLY ONE sample (no stale duplicate of the recycled struct), reading SAMPLE 2
+                 (%check :loan-rr-take-one (= 1 (length data2))
+                         (format nil "take-loaned must return exactly one sample (sample 2), got ~d (a stale duplicate of the recycled view = the regression)"
+                                 (length data2)))
+                 (let ((v2 (first data2)))
+                   (%check :loan-rr-v2-view (dds.types:flatdata-view-p v2) "the taken sample must be a flatdata-view loan")
+                   (%check :loan-rr-v2-a (= (fd-abc-a-fd v2) va2)
+                           (format nil "taken view must read SAMPLE 2's a (~d), got ~d (a stale alias of sample 1 = ~d)" va2 (fd-abc-a-fd v2) va1))
+                   (%check :loan-rr-v2-b (= (fd-abc-b-fd v2) vb2)
+                           (format nil "taken view must read SAMPLE 2's b (~d), got ~d" vb2 (fd-abc-b-fd v2)))
+                   (%check :loan-rr-v2-c (= (fd-abc-c-fd v2) vc2)
+                           (format nil "taken view must read SAMPLE 2's c (~d), got ~d" vc2 (fd-abc-c-fd v2))))
+                 (dds.dcps:return-loan dr loans2))))
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+    t)
+
+(defun* run-loan-handle-dealias-test ()
+    (function () t)
+  "WP-FLATDATA-ZC-LOAN loaned instance-handle de-alias (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending
+   counsel). %loan-instance-handle must fold the source writer GUID into the 16-octet handle so two co-located
+   writers — each SN-stream restarts at 1 — do NOT collide (the earlier SN-only v1 aliased them, flipping a
+   cosmetic NEW/NOT_NEW view-state; §8.3.5.4: SN is per-writer). Asserts at the same SN=1: (1) distinct source
+   GUIDs -> DISTINCT handles (no SN-collision alias); (2) the SAME GUID + SN is deterministic (equal handle);
+   (3) the low 8 octets still carry the SN (the published handle layout is preserved); (4) the handle is 16
+   octets. Pure (no SHMEM), so it runs on every host/impl."
+  (let* ((ts (dds.types:find-type-support "fd-abc"))
+         (v (dds.types:make-flatdata-view))
+         (g1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 17))
+         (g2 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 17)))
+    (setf (aref g2 0) 99)                                 ; g2 differs from g1 in one octet (different participant)
+    (let ((h1 (dds.dcps::%loan-instance-handle ts v 1 g1))
+          (h1b (dds.dcps::%loan-instance-handle ts v 1 g1))
+          (h2 (dds.dcps::%loan-instance-handle ts v 1 g2)))
+      (%check :loan-handle-len (= 16 (length h1)) "the loaned instance handle must be 16 octets")
+      (%check :loan-handle-dealias (not (equalp h1 h2))
+              "two co-located writers (distinct GUID, same SN=1) must get DISTINCT handles (no SN-collision alias)")
+      (%check :loan-handle-deterministic (equalp h1 h1b) "the same GUID + SN must yield an equal handle")
+      (%check :loan-handle-sn-low (= 1 (loop for i below 8 sum (ash (aref h1 i) (* 8 i))))
+              "the low 8 octets must still carry the RTPS SN (layout preserved)")
+      (%check :loan-handle-guid-high (not (equalp (subseq h1 8 16) (subseq h2 8 16)))
+              "the high 8 octets must encode the (de-aliasing) GUID fold, differing per source"))
+    t))
+
+(defun* run-flatdata-zc-loan-e2e-test ()
+    (function () t)
+  "WP-FLATDATA-ZC-LOAN Phase F1 — THE LITERAL-0-COPY HEADLINE (FR-PF-3/4, NFR-PERF-7, R6, ADR 0017; NOT cleared
+   for ship — pending counsel). The full DCPS stack: two same-host participants, *shmem-enabled* +
+   *zerocopy-enabled* T, a FlatData topic; a DataWriter publishes over Zero-Copy; the reader take-loaned's a
+   flatdata-view, reads EVERY field off the slot, and return-loan's it — IN A LOOP. Asserts:
+     (1) BYTE-EXACT across the loop: each take-loaned hands back exactly one flatdata-view whose field reads via
+         <name>-<field>-fd EQUAL the published values (literal 0 intra-host copies, read straight off the slot).
+     (2) NO REFCOUNT LEAK across the loop: after each return-loan the loan registry is empty and the freelist
+         recycled the view (the per-reader freelist never grows past one — no per-sample GC-heap view alloc).
+     (3) THE LITERAL-0-COPY RX NUMBER (the headline): the loan acquire+read+recycle RX (%fd-zc-loan-rx-bytes)
+         allocates NO OWNED DELIVERY VECTOR — only the pool mutex acquire/release's fixed ~32 B (a CFFI
+         pthread-mutex-lock cost, PAYLOAD-INDEPENDENT, the SAME cost the v1 single-copy ALSO pays) — vs the
+         WP-ZEROCOPY+FlatData v1 single-copy resolve (%fd-zc-rx-bytes-new = ~78 = that same ~32 B lock + the
+         ~46 B exact-length OWNED VECTOR) vs the WP-ZEROCOPY-v1 sink+re-copy (%fd-zc-rx-bytes-v1 = ~65549 = lock
+         + a 64 KiB sink + a re-copy). The literal-0-copy win is the ELIMINATED per-sample owned vector
+         (~78 -> ~32, the 46-byte vector gone). HONEST (FR-LANG-7): the RX ALLOCATION drops to the bare mutex
+         overhead (no owned vector); the loan API's cost is the explicit %zc-acquire-for-read + %zc-release calls
+         + the app's return-loan OBLIGATION, NOT a free lunch. Cross-process is covered by make zc-xproc (the ZC
+         reference resolves across two OS processes; the literal-0-copy loan is a LOCAL read optimization — the
+         wire is byte-identical). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013); on SBCL
+         bytes-consed is exact, on Clasp it reads 0 (NFR-PORT gap) so the headline assertion is smoked."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-flatdata-zc-loan-e2e-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
+         (ts (dds.types:find-type-support "fd-abc"))
+         (va 200) (vb 3000000000) (vc 12345678901234567890)
+         (sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "FdZcE2E" "fd-abc" ts))
+                (tr (dds.dcps:create-topic p2 "FdZcE2E" "fd-abc" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (node1 (dds.dcps::dp-node p1))
+                (node2 (dds.dcps::dp-node p2))
+                (fd (make-fd-abc-flatdata)))
+           (setf (fd-abc-a-fd fd) va (fd-abc-b-fd fd) vb (fd-abc-c-fd fd) vc)
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :fdzc-e2e-matched (plusp (dds.dcps:matched-count p1)) "writer/reader did not match")
+           (loop repeat 200
+                 until (plusp (dds.disc::%zc-readers node1
+                                                     (list (dds.rtps.discovery:endpoint-data-guid
+                                                            (first (dds.disc::%matched-endpoints node1))))))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           ;; (1)+(2) the take-loaned/read/return-loan LOOP — byte-exact + no registry/freelist growth per round
+           (dotimes (round 5)
+             (dds.dcps:write-sample dw fd)
+             (loop repeat 300 until (> (dds.disc:node-sample-count node2) round)
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+               (%check :fdzc-e2e-one (= 1 (length data))
+                       (format nil "round ~d: take-loaned must return exactly one sample" round))
+               (%check :fdzc-e2e-view (dds.types:flatdata-view-p (first data))
+                       (format nil "round ~d: the sample must be a flatdata-view (literal-0-copy loan)" round))
+               (let ((view (first data)))
+                 (%check :fdzc-e2e-a (= (fd-abc-a-fd view) va)
+                         (format nil "round ~d: loaned 0-copy field a ~d != ~d" round (fd-abc-a-fd view) va))
+                 (%check :fdzc-e2e-b (= (fd-abc-b-fd view) vb)
+                         (format nil "round ~d: loaned 0-copy field b ~d != ~d" round (fd-abc-b-fd view) vb))
+                 (%check :fdzc-e2e-c (= (fd-abc-c-fd view) vc)
+                         (format nil "round ~d: loaned 0-copy field c ~d != ~d" round (fd-abc-c-fd view) vc)))
+               (dds.dcps:return-loan dr loans)
+               (%check :fdzc-e2e-registry-clear (null (dds.dcps::dr-loans dr))
+                       (format nil "round ~d: return-loan must leave the loan registry empty (no refcount leak)" round))
+               (%check :fdzc-e2e-freelist-bounded (<= (length (dds.dcps::dr-view-freelist dr)) 1)
+                       (format nil "round ~d: the per-reader view freelist must recycle (<=1), not grow per sample" round))))
+           ;; (3) THE LITERAL-0-COPY HEADLINE: loan acquire+read (~0) vs v1 single-copy (~80) vs v1 sink (~65552)
+           (let ((sap (dds.disc::disc-node-zc-pool-sap node1))
+                 (iters 20000))
+             (multiple-value-bind (slot gen)
+                 (dds.xport.zerocopy::%zc-loan sap (subseq (dds.core.buffer:octet-buffer-vec fd) 0 +fd-abc-flatdata-size+)
+                                               0 +fd-abc-flatdata-size+ 1)
+               (%check :fdzc-e2e-meas-loan (and slot t) "could not loan a slot for the literal-0-copy measurement")
+               (when slot
+                 (let ((loan-bytes (%fd-zc-loan-rx-bytes sap slot gen iters))
+                       (new-bytes (%fd-zc-rx-bytes-new sap slot gen iters))
+                       (v1-bytes (%fd-zc-rx-bytes-v1 sap slot gen iters)))
+                   (dds.xport.zerocopy::%zc-release sap slot gen)   ; balance the refcount-1 measurement loan
+                   (format t "~&  fd-zc-loan-rx: LITERAL-0-COPY loan = ~d bytes/sample (the pool mutex acquire alone, NO owned vector); FlatData+ZC v1 single-copy = ~d (lock + the owned vector); WP-ZEROCOPY-v1 sink = ~d (~a)~%"
+                           loan-bytes new-bytes v1-bytes (if sbcl-p "SBCL exact" "Clasp bytes-consed=0 gap"))
+                   (format t "  fd-zc-loan-rx: the eliminated per-sample OWNED VECTOR is the win (~d -> ~d, payload-independent residue = the CFFI mutex lock the v1 path ALSO pays); the loan API's cost is the explicit acquire/release calls + the app's return-loan obligation (FR-LANG-7, no overclaim).~%"
+                           new-bytes loan-bytes)
+                   (when sbcl-p
+                     ;; the literal-0-copy win: the per-sample OWNED VECTOR is gone (loan RX strictly below the v1 single-copy)
+                     (%check :fdzc-e2e-loan-below-v1-single
+                             (< loan-bytes new-bytes)
+                             (format nil "the literal-0-copy loan RX (~d) must allocate strictly less than the v1 single-copy (~d) — the owned vector eliminated"
+                                     loan-bytes new-bytes))
+                     ;; the residue is a small FIXED mutex cost (payload-independent), NOT a per-sample delivery vector
+                     (%check :fdzc-e2e-loan-no-owned-vector
+                             (<= loan-bytes 64)
+                             (format nil "the literal-0-copy loan RX (~d) must be a small fixed overhead (<=64 B, the mutex acquire), not a per-sample owned vector" loan-bytes))
+                     (%check :fdzc-e2e-loan-below-v1-sink
+                             (< loan-bytes v1-bytes)
+                             (format nil "the literal-0-copy loan RX (~d) must allocate far less than the WP-ZEROCOPY-v1 sink (~d)"
+                                     loan-bytes v1-bytes)))))))
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+    t)
+
+(defun* run-flatdata-zc-loan-stress-test ()
+    (function () t)
+  "WP-FLATDATA-ZC-LOAN Phase F1 — THE CONCURRENCY LIFETIME STRESS (FR-PF-3/4, NFR-SEC, R6, ADR 0017; NOT cleared
+   for ship — pending counsel). The binary-gate safety property under REAL threads: a loan's slot lifetime spans
+   the holder thread WHILE a concurrent writer thread churns the pool (loaning + force-reclaiming to fill it).
+   Asserts, against a small pool: (1) NO UAF / NO TORN READ — a held loan's fields stay byte-correct while the
+   writer churns (force-reclaim skips refcount>0, so the held slot is never overwritten under the read); (2)
+   POOL-FULL ⇒ the writer's %zc-loan returns NIL (the non-ZC fallback — never blocks, never crashes), with the
+   held slot still intact; (3) NO REFCOUNT LEAK — after the holder releases, the pool is FULLY reclaimable (the
+   freelist recovers to K); (4) A LEAKED LOAN (never returned) degrades to fallback (a pinned slot ⇒ pool-full ⇒
+   NIL, no wedge), and an explicit final release (the reader-close analogue) STILL returns it (the slot frees).
+   Bounded + robust: the writer thread runs a fixed iteration count behind a deadline so a regression FAILS
+   rather than wedges (the holder never blocks; the writer's loan just returns NIL when saturated). SBCL only
+   (the ZC pool + foreign SAP reads are SBCL-only, ADR 0013); Clasp pass-skips."
+  (if (not (eq (dds.pal:pal-impl-name) :sbcl))
+      (format t "~&  [skip] flatdata-zc-loan-stress: ZC pool + load-sap-u8 are SBCL-only (ADR 0013) — NFR-PORT gap~%")
+      (let* ((k 4)
+             (slot-bytes 64)
+             (mem (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes k slot-bytes)))
+             (sap (dds.pal:static-pointer mem))
+             (held (octets 11 22 33 44 55 66 77 88))   ; the byte pattern the held loan must keep intact
+             (churn (octets 200 201 202 203 204))      ; the writer's churn payload (distinct from HELD)
+             (stop nil) (writer-iters 0) (writer-error nil) (loan-nils 0)
+             (writer-thread nil))
+        (unwind-protect
+             (progn
+               (dds.xport.zerocopy::%zc-init sap k slot-bytes)
+               ;; HOLD a loan: loan HELD into a slot (refcount=1), acquire it for read, DO NOT release
+               (multiple-value-bind (hslot hgen) (dds.xport.zerocopy::%zc-loan sap held 0 (length held) 1)
+                 (%check :fdzc-stress-held-loaned (and hslot t) "the held loan must take a slot")
+                 (multiple-value-bind (psap idx hg hlen hbase) (dds.xport.zerocopy::%zc-acquire-for-read sap hslot hgen)
+                   (declare (ignore idx hg))
+                   (%check :fdzc-stress-held-acquired (and psap t) "acquire-for-read of the held loan must return a handle")
+                   ;; CONCURRENT WRITER: churn the pool (loan + force-reclaim) for a bounded number of iterations
+                   (setf writer-thread
+                         (dds.pal:spawn
+                          (lambda ()
+                            (handler-case
+                                (dotimes (i 20000)
+                                  (when stop (return))
+                                  (multiple-value-bind (s g) (dds.xport.zerocopy::%zc-loan sap churn 0 (length churn) 1)
+                                    (incf writer-iters)
+                                    (if s
+                                        (dds.xport.zerocopy::%zc-release sap s g)   ; immediately return so churn keeps cycling
+                                        (incf loan-nils)))                          ; pool-full while the held slot pins one ⇒ fallback
+                                  (when (zerop (mod i 64)) (sleep 0.0001)))         ; let the holder interleave
+                              (error (e) (setf writer-error e))))
+                          :name "fdzc-stress-writer"))
+                   ;; wait (bounded) for the writer to actually start churning (no race: the holder read must overlap real churn)
+                   (let ((start-deadline (+ (dds.pal:monotonic-ns) 2000000000)))
+                     (loop until (or (plusp writer-iters) (> (dds.pal:monotonic-ns) start-deadline))
+                           do (sleep 0.0005)))
+                   ;; while the writer churns, REPEATEDLY read the held view — its bytes must NEVER tear/change
+                   (let ((torn nil) (deadline (+ (dds.pal:monotonic-ns) 2000000000)))   ; 2s bound (fail, never wedge)
+                     (loop repeat 50000
+                           while (< (dds.pal:monotonic-ns) deadline)
+                           do (unless (loop for j below (min (length held) hlen)
+                                            always (= (dds.pal:load-sap-u8 psap (+ hbase j)) (aref held j)))
+                                (setf torn t) (return)))
+                     (%check :fdzc-stress-no-torn-read (null torn)
+                             "the held loan's bytes must stay byte-correct while the writer churns (no torn read / UAF — force-reclaim skips refcount>0)"))
+                   (setf stop t)
+                   (dds.pal:join writer-thread) (setf writer-thread nil)
+                   (%check :fdzc-stress-writer-no-error (null writer-error)
+                           (format nil "the concurrent writer must not error (no crash under churn); got ~a" writer-error))
+                   (%check :fdzc-stress-writer-progressed (plusp writer-iters)
+                           "the concurrent writer must have made progress (the holder never blocks it)")
+                   ;; the held loan is STILL byte-intact after all that churn (the final UAF check)
+                   (%check :fdzc-stress-held-still-intact
+                           (loop for j below (min (length held) hlen)
+                                 always (= (dds.pal:load-sap-u8 psap (+ hbase j)) (aref held j)))
+                           "the held loan's payload must remain byte-intact after the writer churn completes (no overwrite)")
+                   ;; (2) POOL-FULL fallback while the held slot pins one: fill the other K-1 slots, then a further loan ⇒ NIL
+                   (let ((probes '()))
+                     (dotimes (i (1- k))
+                       (multiple-value-bind (s g) (dds.xport.zerocopy::%zc-loan sap churn 0 (length churn) 1)
+                         (when s (push (cons s g) probes))))
+                     (multiple-value-bind (sfull gfull) (dds.xport.zerocopy::%zc-loan sap churn 0 (length churn) 1)
+                       (declare (ignore gfull))
+                       (%check :fdzc-stress-pool-full-fallback (null sfull)
+                               "with every slot loaned (the held one + the K-1 probes) %zc-loan must return NIL (non-ZC fallback), never reclaim the held slot"))
+                     (%check :fdzc-stress-held-survives-full
+                             (loop for j below (min (length held) hlen)
+                                   always (= (dds.pal:load-sap-u8 psap (+ hbase j)) (aref held j)))
+                             "the held loan must survive pool-full pressure byte-intact (it is never a reclaim candidate)")
+                     (dolist (p probes) (dds.xport.zerocopy::%zc-release sap (car p) (cdr p))))   ; release the probes
+                   ;; (3) NO REFCOUNT LEAK: release the held loan ⇒ the freelist fully recovers to K
+                   (%check :fdzc-stress-release-held (dds.xport.zerocopy::%zc-release psap hslot hgen)
+                           "releasing the held loan must apply")
+                   (%check :fdzc-stress-full-reclaim (= k (dds.xport.zerocopy::%zc-free-count sap))
+                           (format nil "after all returns the pool must be FULLY reclaimable (freelist = K = ~d), no refcount leak" k))))
+               ;; (4) LEAKED LOAN: loan + acquire, NEVER return ⇒ a pinned slot; fill the rest ⇒ pool-full fallback (no wedge);
+               ;;     then the explicit final release (the reader-close analogue) STILL returns it.
+               (multiple-value-bind (lslot lgen) (dds.xport.zerocopy::%zc-loan sap held 0 (length held) 1)
+                 (dds.xport.zerocopy::%zc-acquire-for-read sap lslot lgen)   ; acquire, then LEAK (no release)
+                 (let ((probes '()))
+                   (dotimes (i (1- k))
+                     (multiple-value-bind (s g) (dds.xport.zerocopy::%zc-loan sap churn 0 (length churn) 1)
+                       (when s (push (cons s g) probes))))
+                   (multiple-value-bind (sfull gfull) (dds.xport.zerocopy::%zc-loan sap churn 0 (length churn) 1)
+                     (declare (ignore gfull))
+                     (%check :fdzc-stress-leak-fallback (null sfull)
+                             "a LEAKED (never-returned) loan pins a slot ⇒ pool-full ⇒ the writer falls back to non-ZC (NIL), no wedge"))
+                   (dolist (p probes) (dds.xport.zerocopy::%zc-release sap (car p) (cdr p)))
+                   ;; the reader-close analogue: the explicit final release of the leaked loan still frees its slot
+                   (%check :fdzc-stress-leak-close-returns (dds.xport.zerocopy::%zc-release sap lslot lgen)
+                           "the reader-close analogue (a final release of the leaked loan) must STILL return it")
+                   (%check :fdzc-stress-leak-recovered (= k (dds.xport.zerocopy::%zc-free-count sap))
+                           "after the leaked loan's final release the pool fully recovers (no permanent leak)"))))
+          (setf stop t)
+          (when writer-thread (ignore-errors (dds.pal:join writer-thread)))
+          (dds.xport.zerocopy::%zc-destroy sap)
+          (dds.pal:free-static mem))))
   t)
 
 ;;; Participant-lease expiry (RTPS 2.5 §8.5.3.3.2): the SPDP reader removes a

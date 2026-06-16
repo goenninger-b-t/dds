@@ -45,6 +45,9 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:read-samples` (`dr &key states where`) | `DataReader::read` — return the cached samples whose sample-state is in `states` (default `(:read :not-read)` = ANY) and whose data satisfies `where`, **without** removing them; mark each `:read` and set its view-state. Returns a list of `cached-sample`. |
 | `dds.dcps:take-samples` (`dr &key states where`) | `DataReader::take` — like `read-samples` but **removes** the returned samples from the cache. |
 | `dds.dcps:samples-available` (`dr`) | Drain newly-received samples into the cache and return the cache size, **without** marking anything `:read` — for polling before a read/take. |
+| `dds.dcps:take-loaned` (`dr`) | **WP-FLATDATA-ZC-LOAN literal-0-copy RX (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending counsel).** `DataReader::take` **by loan**: returns `(values DATA-LIST LOANS)`; for a `:flatdata` reader created with `dds.disc:*zerocopy-enabled*` on, each loaned sample is a `dds.types:flatdata-view` read **directly off the writer's SHMEM slot — literal 0 intra-host copies** (`<name>-<field>-fd` accessors), and `LOANS` is the list to hand back to `return-loan`. **Removes** the returned samples (mirrors `take-samples`). A copy-backed sample mixed in is delivered as today with a `NIL` loan slot. |
+| `dds.dcps:read-loaned` (`dr`) | Like `take-loaned` but **leaves** the samples in the cache (mirrors `read-samples` vs `take-samples`). |
+| `dds.dcps:return-loan` (`dr loans`) | `DataReader::return_loan` — release each loaned `flatdata-view` (`%zc-release` the slot, recycle the view). **Invalidates the view's cache entry**: since `read-loaned` leaves samples in the cache, returning a view also drops its cached sample, so a returned loan is **never re-read** (reading after return is a no-op, never a stale read of the next sample's recycled-slot bytes). **Idempotent / double-return-safe.** A leaked loan pins a slot → the writer's pool gracefully falls back to non-ZC. Reader-close (`delete-participant`) returns every outstanding loan (no leaked refcount). |
 | `dds.dcps:cached-sample` | A read/take result element: the deserialized data + its `sample-info`. |
 | `dds.dcps:cached-sample-data` (`cs`) | The deserialized sample struct out of a `cached-sample`. |
 | `dds.dcps:cached-sample-info` (`cs`) | The `sample-info` out of a `cached-sample`. |
@@ -59,6 +62,23 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:sample-info-sequence-number` (`si`) | Vendor extension: the RTPS writer sequence number of the sample. |
 | `dds.dcps:sample-info-disposed-generation-count` / `-no-writers-generation-count` (`si`) | DDS 1.4 §2.2.2.5.1.5 per-instance generation counts: `disposed-generation-count` is incremented each time the instance transitions `NOT_ALIVE_DISPOSED -> ALIVE`, `no-writers-generation-count` each time it transitions `NOT_ALIVE_NO_WRITERS -> ALIVE`. Each sample's `SampleInfo` snapshots the counts. |
 | `dds.dcps:sample-info-sample-rank` / `-generation-rank` / `-absolute-generation-rank` (`si`) | DDS ranks (v1: default `0`). |
+
+#### Worked example — the literal-0-copy loan read (WP-FLATDATA-ZC-LOAN, ADR 0017; R6, NOT cleared for ship)
+
+A `:flatdata t` reader on the same host as the writer, created while `dds.disc:*zerocopy-enabled*` is on, reads fields **straight off the writer's SHMEM slot** (literal 0 intra-host copies) via the explicit `take-loaned` / `return-loan` loan API (mirroring OMG DDS `take()` + `return_loan()`):
+
+```lisp
+(let ((dds.disc:*shmem-enabled* t) (dds.disc:*zerocopy-enabled* t))   ; arm ZC (default OFF, R6); same-host
+  ;; ... a FlatData topic "fd-abc"; dr is a DataReader on it; the writer publishes fd over Zero-Copy ...
+  (multiple-value-bind (samples loans) (dds.dcps:take-loaned dr)       ; borrow the samples BY REFERENCE
+    (dolist (view samples)                                             ; each is a dds.types:flatdata-view (NOT a copy)
+      (when (dds.types:flatdata-view-p view)                           ; (a copy-backed sample mixed in is a struct)
+        (format t "a=~d b=~d c=~d~%"
+                (fd-abc-a-fd view) (fd-abc-b-fd view) (fd-abc-c-fd view))))  ; 0-copy reads off the writer's slot SAP
+    (dds.dcps:return-loan dr loans)))                                  ; RELEASE the slots (idempotent; reader-close also returns)
+```
+
+The slot is held by the writer's `refcount` from `%zc-loan` → the disc receiver-thread store (no release) → `take-loaned`'s `%zc-acquire-for-read` (no refcount inc) → the app's reads → `return-loan`'s `%zc-release`; **force-reclaim skips `refcount>0` slots**, so a held loan is never overwritten under the read (no UAF). The app **must** `return-loan` (a leaked loan pins a slot until the writer's pool gracefully falls back to non-ZC; reader-close returns any outstanding loan). The RX allocation is the **bare pool-mutex acquire (~32 GC bytes/sample, no owned delivery vector)** vs the v1 single-copy ~79 and the WP-ZEROCOPY-v1 sink ~65551 — `make bench-flatdata-zc-loan`, `bench/report/2026-06-16-wp-flatdata-zc-loan.md` (honest: the loan API ADDS the explicit acquire/release calls + the return obligation — no `0-cost` claim). See the [type-system wiki](type-system.md) for the FlatData accessor surface. **SBCL only** (ZC, ADR 0013); with `*zerocopy-enabled*` off or a non-FlatData reader the read path is byte-identical to the copied delivery. **Follow-ups (not done):** RELIABLE-ZC-loan, the app-facing ZC loan-write API, keyed / variable-size FlatData over ZC; a **lock-free / 0-alloc loan acquire** — the residual ~31 GC-bytes/sample is the CFFI pool-mutex (`pthread_mutex_lock`) cost the v1 single-copy also pays, and because a held slot stays at `refcount>0` (force-reclaim skips it) its header is stable, so `%zc-acquire-for-read` could validate the generation by a fenced read instead of taking the mutex → a genuinely 0-alloc loaned RX (needs a careful fenced-read design + bench); and a documented **one-loan-capable-reader-per-`disc-node` invariant** — the slot refcount is 1 per destination participant and the `zc-loan-marker` is stored once per source-GUID→SN on a `disc-node` that holds a single `user-reader`, so two loan-capable readers sharing one node would let the first `return-loan` (`refcount` 1→0) free a slot the second still views (a cross-reader use-after-free); unreachable as-built (one reader per node), but it MUST be a precondition the reliable / multi-reader follow-up lifts via refcount-per-reader or per-reader loan markers.
 
 ### Conditions + WaitSets
 

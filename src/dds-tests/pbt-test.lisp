@@ -387,6 +387,74 @@
           (dds.pal:free-static mem))))
     t))
 
+;;; ---- WP-FLATDATA-ZC-LOAN untrusted loan-acquire fuzz (FR-PF-3/4, NFR-SEC-POSTURE; R6, ADR 0017) ----
+;;;; The cross-process LOAN-ACQUIRE path is HOSTILE input: %zc-acquire-for-read takes a forged (slot,generation)
+;;;; reference and a forged recorded LEN and must fail-or-clamp — return NIL (drop, best-effort) or a view whose
+;;;; PAYLOAD-LEN is CLAMPED to slot-bytes and whose PAYLOAD-BASE+LEN never reaches past the fixed slot allocation
+;;;; — NEVER an OOB SAP read, even at (safety 0). This complements fuzz-flatdata-wrap (B), which fuzzes the
+;;;; resolve-COPY path (%zc-resolve / %zc-resolve-fresh); this fuzzes the literal-0-copy ACQUIRE path the loan API
+;;;; uses (where the app then reads in place off the returned SAP). NOT cleared for ship — pending counsel (R6).
+
+(defun* fuzz-flatdata-zc-loan-wrap ()
+    (function () t)
+  "Property-based fuzz of the UNTRUSTED WP-FLATDATA-ZC-LOAN loan-acquire path (FR-PF-3/4, NFR-SEC-POSTURE; R6,
+   ADR 0017. NOT cleared for ship — pending counsel R6). Loan a valid slot, then FORGE its recorded payload-LEN
+   field (0..0xFFFFFFFF, incl. < +size+ and > slot-bytes) and call %zc-acquire-for-read with an adversarial
+   slot-index + generation; the result MUST be EITHER NIL (single value — a stale/forged/OOB ref the loan path
+   DROPs best-effort) OR a view handle whose PAYLOAD-LEN is CLAMPED to [0, slot-bytes] AND whose
+   PAYLOAD-BASE + PAYLOAD-LEN stays within the pool segment — so a forged on-wire LEN/generation/index can NEVER
+   expose a read past the fixed slot allocation (the min-clamp in %zc-slot-payload-len + the generation/bounds
+   guard are the defence; this proves they hold against forged input for the ACQUIRE path the loan API uses).
+   Additionally, when a handle IS returned, the SAP-read of every clamped payload octet (load-sap-u8 at
+   PAYLOAD-BASE+j) must not signal — the read stays in-bounds by construction. Skips where SHMEM by-name attach
+   is unreliable (Clasp/macOS, ADR 0013; ZC + load-sap-u8 are SBCL-only). Deterministic + seeded; N iterations;
+   signals test-failure on any OOB / uncaught error / over-clamp."
+  (when (and (dds.xport.shmem:shm-attach-by-name-reliable-p) (eq (dds.pal:pal-impl-name) :sbcl))
+    (let* ((slots 4)
+           (slot-bytes 64)
+           (seg-bytes (dds.xport.zerocopy::%zc-bytes slots slot-bytes))
+           (mem (dds.pal:alloc-static seg-bytes))
+           (sap (dds.pal:static-pointer mem))
+           (payload (make-array slot-bytes :element-type '(unsigned-byte 8) :initial-element #x5A))
+           (prng (make-prng #xACC0F02D))
+           (iters 4000))
+      (dds.xport.zerocopy::%zc-init sap slots slot-bytes)
+      (unwind-protect
+           (dotimes (i iters t)
+             (multiple-value-bind (slot gen)
+                 (dds.xport.zerocopy::%zc-loan sap payload 0 (prng-int prng 0 slot-bytes) 1)
+               (when slot
+                 ;; FORGE the cross-process recorded payload-LEN field to an adversarial u32 (incl. > slot-bytes, < +size+)
+                 (let ((b (dds.xport.zerocopy::%zc-slot-off sap slot)))
+                   (setf (cffi:mem-ref sap :uint32 (+ b dds.xport.zerocopy::+zc-slot-off-len+))
+                         (%adversarial-u32 prng)))
+                 (let* ((idx (if (oddp i) slot (%adversarial-u32 prng)))     ; sometimes the real slot, sometimes forged
+                        (g (if (zerop (mod i 3)) gen (%adversarial-u32 prng))))  ; sometimes the real gen, sometimes forged
+                   (multiple-value-bind (psap ridx rgen plen pbase)
+                       (handler-case (dds.xport.zerocopy::%zc-acquire-for-read sap idx g)
+                         (error (e) (error 'test-failure :name "flatdata-zc-loan-acquire-fuzz"
+                                           :detail (format nil "iter ~d idx=~d gen=~d: acquire-for-read signalled: ~a" i idx g e))))
+                     (declare (ignore ridx rgen))
+                     (when psap
+                       ;; a returned handle MUST be clamped in-bounds: plen<=slot-bytes AND pbase+plen within the segment
+                       (unless (<= 0 plen slot-bytes)
+                         (error 'test-failure :name "flatdata-zc-loan-acquire-fuzz"
+                                :detail (format nil "iter ~d idx=~d gen=~d: forged LEN -> acquire payload-len ~d not in [0,~d] (clamp failed)"
+                                                i idx g plen slot-bytes)))
+                       (unless (<= (+ pbase plen) seg-bytes)
+                         (error 'test-failure :name "flatdata-zc-loan-acquire-fuzz"
+                                :detail (format nil "iter ~d idx=~d gen=~d: payload-base+len (~d+~d) past segment ~d (OOB exposure)"
+                                                i idx g pbase plen seg-bytes)))
+                       ;; reading every clamped octet off the SAP must stay in-bounds (no OOB SAP read), even at (safety 0)
+                       (handler-case (loop for j below plen sum (dds.pal:load-sap-u8 psap (+ pbase j)))
+                         (error (e) (error 'test-failure :name "flatdata-zc-loan-acquire-fuzz"
+                                           :detail (format nil "iter ~d idx=~d gen=~d plen=~d: SAP read OOB/signalled: ~a" i idx g plen e)))))))
+                 ;; release at the loaned generation to recycle the slot (best-effort; forged gens are no-ops)
+                 (dds.xport.zerocopy::%zc-release sap slot gen))))
+        (dds.xport.zerocopy::%zc-destroy sap)
+        (dds.pal:free-static mem))))
+  t)
+
 ;;; ---- generators + properties ----
 
 (defun* gsample= (a b)
@@ -567,7 +635,9 @@
     (fuzz-zc-resolve)
     ;; WP-FLATDATA untrusted-wrap fuzz: malformed wrap (reject/accept-in-bounds + safety-0) + forged ZC clamp (NFR-SEC-POSTURE, R6)
     (fuzz-flatdata-wrap)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp), deterministic seed.~%" runs)
+    ;; WP-FLATDATA-ZC-LOAN untrusted loan-ACQUIRE fuzz: forged slot/generation/len -> NIL or clamped view, never OOB (NFR-SEC-POSTURE, R6)
+    (fuzz-flatdata-zc-loan-wrap)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL), deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

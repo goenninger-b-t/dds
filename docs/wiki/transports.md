@@ -590,9 +590,11 @@ generation / slot-index (`make fuzz`): the result is always NIL or clamped to sl
 publisher stores each in its pool and sends only a reference, and the subscriber resolves it from the writer's
 pool **cross-process** and verifies the payload byte-exact (PASS = sub received ≥ threshold byte-exact AND the
 pub's `zc-sends > 0`). This is the proof a within-image test cannot give: the reference resolves across the OS
-boundary. SBCL only (Clasp/macOS inherits the SHMEM by-name-attach gap). **FlatData-over-Zero-Copy RX landed
-2026-06-14 as a SAFE SINGLE COPY (FR-PF-4, ADR 0015) — see the type system wiki; literal-0-copy RX and reliable
-Zero-Copy remain follow-ups.**
+boundary. SBCL only (Clasp/macOS inherits the SHMEM by-name-attach gap). **FlatData-over-Zero-Copy literal-0-copy
+RX landed (WP-FLATDATA-ZC-LOAN, FR-PF-3/4, ADR 0017): a loan-capable `:flatdata` reader's disc receiver thread
+stores the unresolved reference (no copy; slot held via the writer's refcount) and the DCPS `take-loaned` /
+`return-loan` loan API hands the app a `flatdata-view` it reads in place off the writer's slot — see the type
+system wiki. RELIABLE Zero-Copy and the loan-WRITE API remain follow-ups.**
 
 ### NFR-PORT gap — Clasp/macOS-arm64
 
@@ -619,11 +621,13 @@ affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and fore
   [Zero-Copy over SHMEM](#zero-copy-over-shmem-wp-zerocopy--default-off-r6-patent-gated) above.
 - **Landed (gated, default-OFF):** FlatData-equivalent for FINAL fixed-size **NO_KEY** types (WP-FLATDATA,
   FR-PF-4, ADR 0015; a `@key` member is a compile-time error in v1) — in-memory == XCDR2 wire, Offset accessors,
-  identity serialize (0-alloc TX), and a SAFE SINGLE-COPY RX over Zero-Copy (~830x less RX GC than the v1
-  sink+re-copy; **literal-0-copy deferred** — it needs an engine-contract change). **NOT cleared for ship
-  pending counsel (R6).** See the [type system wiki](type-system.md#8-flatdata--flatdata-t-offset-accessors-final-fixed-size-no_key-v1-r6-not-cleared-for-ship). The untrusted wrap/read + ZC resolve clamp
+  identity serialize (0-alloc TX), a SAFE SINGLE-COPY RX over Zero-Copy for non-loan readers (~830x less RX GC
+  than the v1 sink+re-copy), and — for a loan-capable `:flatdata` reader — **literal-0-copy RX via the DCPS
+  loan/return_loan API** (WP-FLATDATA-ZC-LOAN, ADR 0017: `take-loaned`/`read-loaned` hand a `flatdata-view` read
+  in place off the writer's SHMEM slot, `return-loan` releases it; force-reclaim skips held slots, so no UAF).
+  **NOT cleared for ship pending counsel (R6).** See the [type system wiki](type-system.md#8-flatdata--flatdata-t-offset-accessors-final-fixed-size-no_key-v1-r6-not-cleared-for-ship). The untrusted wrap/read + ZC resolve clamp
   are fuzzed (`make fuzz`).
-- **Planned:** literal 0-copy read-in-place (the SAP-backed FlatData RX view), reliable Zero-Copy, a TCP transport, a Linux
+- **Planned:** the app-facing ZC loan-**write** API (the remaining TX app→slot copy), reliable Zero-Copy, a TCP transport, a Linux
   `futex` notification fast-path for SHMEM, a lock-free-MPSC ring, and a raw `recvmmsg`/`sendmmsg`/iovec batched
   send/recv fast path. The UDP send is one datagram per `socket-send` (small samples are coalesced first).
 - **Per-impl rule:** `#+sbcl`/`#+clasp` reader conditionals live **only** under `dds-pal/` (`pal-sbcl.lisp` and

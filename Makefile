@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata bench-async-flow shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-async-flow shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -182,6 +182,16 @@ bench-zerocopy:
 bench-flatdata:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata :file "bench/report/2026-06-14-wp-flatdata.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+
+# WP-FLATDATA-ZC-LOAN Phase F2 (FR-PF-3/4, NFR-PERF-7, FR-LANG-7): the literal-0-copy RX headline — the RX GC
+# bytes/sample PROGRESSION (literal-0-copy loan via take-loaned/return-loan -> FlatData+ZC v1 single-copy ->
+# WP-ZEROCOPY-v1 sink), plus the HONEST loan/return per-sample overhead (the loan API adds the explicit
+# acquire/release calls + the app's return obligation — no "0-cost" claim). Lives in dds-tests (needs the
+# dds-gen FlatData type); writes bench/report/2026-06-16-wp-flatdata-zc-loan.md. SBCL only (ZC, ADR 0013).
+# NOT cleared for ship — pending counsel (R6); see ADR 0017.
+bench-flatdata-zc-loan:
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-zc-loan :file "bench/report/2026-06-16-wp-flatdata-zc-loan.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-ASYNC-FLOW Phase F1 (FR-PF-2, FR-LANG-7): HONEST rate-shaping report — achieved-vs-configured rate,
 # single-writer paced vs the enable-async UNPACED baseline (pacing ADDS latency by design — no 0-cost claim),

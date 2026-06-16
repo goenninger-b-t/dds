@@ -312,6 +312,47 @@
            t)
       (dds.pal:free-static m))))
 
+(defun* run-sap-ref-test ()
+    (function () (eql t))
+  "WP-FLATDATA-ZC-LOAN Task A1 (FR-PF-3/4, R6 — NOT cleared for ship, see ADR 0017): the PAL
+   fixed-width SAP reads that back the FlatData-over-Zero-Copy read-in-place accessors are
+   byte-exact little-endian. Write known octets into an octet-buffer, take its buffer-sap, and
+   assert load-sap-u8/u16/u32 at offsets 0/2/4 EQUAL the little-endian composition of the same
+   underlying aref bytes (the byte-exact oracle). SBCL only — ZC is SBCL-only (ADR 0013); on
+   Clasp the primitives are a documented NFR-PORT gap, so assert each signals PAL-UNIMPLEMENTED."
+  (let* ((buf (dds.core.buffer:make-octet-buffer 16))
+         (vec (dds.core.buffer:octet-buffer-vec buf))
+         (bytes (octets #x11 #x22 #xAA #xBB #x01 #x02 #x03 #x04)))
+    (unwind-protect
+         (let ((wc (dds.core.buffer:cursor buf :endianness :little))
+               (sap (dds.core.buffer:buffer-sap buf)))
+           (dds.core.buffer:put-octets wc bytes 0 (length bytes))
+           (if (eq (dds.pal:pal-impl-name) :sbcl)
+               (progn
+                 (%check :sap-u8
+                         (= (dds.pal:load-sap-u8 sap 0) (aref vec 0))
+                         "load-sap-u8 @0 must equal the underlying octet")
+                 (%check :sap-u16
+                         (= (dds.pal:load-sap-u16 sap 2)
+                            (logior (aref vec 2) (ash (aref vec 3) 8)))
+                         "load-sap-u16 @2 must equal the little-endian 2-octet composition")
+                 (%check :sap-u32
+                         (= (dds.pal:load-sap-u32 sap 4)
+                            (logior (aref vec 4) (ash (aref vec 5) 8)
+                                    (ash (aref vec 6) 16) (ash (aref vec 7) 24)))
+                         "load-sap-u32 @4 must equal the little-endian 4-octet composition"))
+               (flet ((unimplemented-p (thunk)
+                        (handler-case (progn (funcall thunk) nil)
+                          (dds.pal:pal-unimplemented () t))))
+                 (%check :sap-u8-gap  (unimplemented-p (lambda () (dds.pal:load-sap-u8 sap 0)))
+                         "load-sap-u8 must signal PAL-UNIMPLEMENTED off SBCL (NFR-PORT)")
+                 (%check :sap-u16-gap (unimplemented-p (lambda () (dds.pal:load-sap-u16 sap 2)))
+                         "load-sap-u16 must signal PAL-UNIMPLEMENTED off SBCL (NFR-PORT)")
+                 (%check :sap-u32-gap (unimplemented-p (lambda () (dds.pal:load-sap-u32 sap 4)))
+                         "load-sap-u32 must signal PAL-UNIMPLEMENTED off SBCL (NFR-PORT)")))
+           t)
+      (dds.pal:free-static vec))))
+
 (defun* %shm-attach-by-name-reliable-p ()
     (function () t)
   "True except on Clasp/macOS-arm64, whose plain cffi:foreign-funcall mispasses shm_open's variadic
@@ -491,9 +532,11 @@
 
 (defun* run-zc-pool-loan-test ()
     (function () (eql t))
-  "WP-ZEROCOPY loan/release (FR-PF-3, ADR 0014): in a 2-slot pool, two loans take distinct slots; a third
-   loan force-reclaims the oldest (slot 0) with a bumped generation; releasing a valid (slot,generation)
-   succeeds; releasing with a stale generation is a no-op (NIL)."
+  "WP-ZEROCOPY loan/release (FR-PF-3, ADR 0014) under the WP-FLATDATA-ZC-LOAN safety contract (R6, ADR 0017):
+   in a 2-slot pool, two loans take distinct slots; with BOTH slots loaned (refcount>0) a third loan returns
+   NIL — force-reclaim NEVER overwrites a held slot (the binary safety gate); after releasing the oldest
+   (slot 0), a fresh loan force-reclaims that now-UNLOANED slot (lowest pubseq) with a bumped generation;
+   releasing a valid (slot,generation) succeeds; a stale generation or a double-release is a no-op."
   (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
         (payload (octets 1 2 3 4)))
     (unwind-protect
@@ -501,15 +544,24 @@
            (dds.xport.zerocopy::%zc-init sap 2 32)
            (multiple-value-bind (i0 g0) (dds.xport.zerocopy::%zc-loan sap payload 0 4 1)
              (multiple-value-bind (i1 g1) (dds.xport.zerocopy::%zc-loan sap payload 0 4 1)
+               (declare (ignore g1))
                (%check :zc-loan-i0 (eql i0 0) "first loan must take slot 0")
                (%check :zc-loan-i1 (eql i1 1) "second loan must take slot 1")
                (%check :zc-loan-distinct (/= i0 i1) "two loans must take distinct slots")
                (%check :zc-loan-g0 (= g0 1) "first loan bumps slot 0 generation to 1")
-               (%check :zc-loan-g1 (= g1 1) "second loan bumps slot 1 generation to 1")
-               ;; pool now full -> third loan force-reclaims the oldest (slot 0, lowest pubseq)
+               ;; pool now full AND both slots loaned (refcount>0) -> the third loan finds no reclaimable
+               ;; slot and returns NIL (the writer's non-ZC fallback); NEITHER held slot is overwritten
+               (multiple-value-bind (ifull gfull) (dds.xport.zerocopy::%zc-loan sap payload 0 4 1)
+                 (declare (ignore gfull))
+                 (%check :zc-loan-full-nil (null ifull)
+                         "with both slots loaned the third loan must return NIL (never reclaim a held slot)"))
+               ;; release slot 0 (the oldest) -> it becomes reclaimable; slot 1 stays held
+               (%check :zc-release-oldest (dds.xport.zerocopy::%zc-release sap i0 g0)
+                       "releasing the oldest held slot must succeed (T)")
+               ;; now a fresh loan force-reclaims the freed slot 0 (back on the freelist) with a bumped gen
                (multiple-value-bind (i2 g2) (dds.xport.zerocopy::%zc-loan sap payload 0 4 1)
-                 (%check :zc-reclaim-oldest (eql i2 0) "third loan must force-reclaim the oldest slot (0)")
-                 (%check :zc-reclaim-gen (= g2 2) "force-reclaim must bump slot 0 generation to 2")
+                 (%check :zc-reclaim-unloaned (eql i2 0) "the next loan must reuse the now-unloaned slot (0)")
+                 (%check :zc-reclaim-gen (= g2 2) "reusing slot 0 must bump its generation to 2")
                  ;; a release with the STALE generation g0 (now superseded by g2) is a no-op
                  (%check :zc-release-stale (null (dds.xport.zerocopy::%zc-release sap i0 g0))
                          "release with a stale generation must be a no-op (NIL)")
@@ -606,6 +658,150 @@
                  (dds.xport.zerocopy::%zc-release sap i0 g0)
                  (dds.xport.zerocopy::%zc-release sap i1 g1)
                  (dds.xport.zerocopy::%zc-release sap i2 g2))))
+           (dds.xport.zerocopy::%zc-destroy sap)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-zc-loan-acquire-test ()
+    (function () (eql t))
+  "WP-FLATDATA-ZC-LOAN Task C1 (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending counsel): the
+   literal-0-copy %zc-acquire-for-read. Loan a payload (refcount=1); acquire returns a handle whose payload
+   octets — read via dds.pal:load-sap-u8 over the returned POOL-SAP at PAYLOAD-BASE — EQUAL the loaned
+   payload, WITHOUT a copy and WITHOUT bumping the refcount (the slot is held by the loan's existing count);
+   a forged/stale generation ⇒ NIL; a forged over-long recorded LEN is CLAMPED to slot-bytes (no OOB read).
+   SBCL only (load-sap-u8 is SBCL-only, ZC ADR 0013); Clasp pass-skips."
+  (if (eq (dds.pal:pal-impl-name) :sbcl)
+      (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
+            (payload (octets 11 22 33 44 55)))
+        (unwind-protect
+             (let ((sap (dds.pal:static-pointer m)))
+               (dds.xport.zerocopy::%zc-init sap 2 32)
+               (multiple-value-bind (i g) (dds.xport.zerocopy::%zc-loan sap payload 0 5 1)
+                 ;; acquire returns the live handle WITHOUT copying and WITHOUT touching the refcount
+                 (multiple-value-bind (psap idx gen len base)
+                     (dds.xport.zerocopy::%zc-acquire-for-read sap i g)
+                   (%check :zc-acq-handle psap "acquire of a live (slot,generation) must return a handle")
+                   (%check :zc-acq-slot (eql idx i) "acquire must echo the slot index")
+                   (%check :zc-acq-gen (eql gen g) "acquire must echo the generation")
+                   (%check :zc-acq-len (eql len 5) "acquire must return the clamped payload length (5)")
+                   (%check :zc-acq-bytes
+                           (loop for k below 5 always (= (dds.pal:load-sap-u8 psap (+ base k)) (aref payload k)))
+                           "the SAP-read payload bytes must equal the loaned payload (literal 0-copy)")
+                   ;; acquire did NOT increment the refcount: a single release returns the slot fully
+                   (%check :zc-acq-no-refcount-bump (dds.xport.zerocopy::%zc-release psap idx gen)
+                           "one release must apply (acquire must not have bumped the refcount)")
+                   (%check :zc-acq-released-frees (= 2 (dds.xport.zerocopy::%zc-free-count sap))
+                           "after the single release the slot must be back on the freelist (acquire held no extra count)"))
+                 ;; a forged/stale generation ⇒ NIL (single value), no handle
+                 (%check :zc-acq-stale-gen
+                         (null (dds.xport.zerocopy::%zc-acquire-for-read sap i (logand (+ g 7) #xFFFFFFFF)))
+                         "acquire with a stale/forged generation must return NIL")
+                 ;; an out-of-range slot ⇒ NIL (untrusted bounds)
+                 (%check :zc-acq-oob
+                         (null (dds.xport.zerocopy::%zc-acquire-for-read sap 99 g))
+                         "acquire of an out-of-range slot must return NIL"))
+               ;; forged over-long recorded LEN ⇒ acquire CLAMPS to slot-bytes (no OOB exposure)
+               (multiple-value-bind (i2 g2) (dds.xport.zerocopy::%zc-loan sap payload 0 4 1)
+                 (let ((b (dds.xport.zerocopy::%zc-slot-off sap i2)))
+                   (setf (cffi:mem-ref sap :uint32 (+ b dds.xport.zerocopy::+zc-slot-off-len+)) #xFFFFFFFF))
+                 (multiple-value-bind (psap2 idx2 gen2 len2 base2)
+                     (dds.xport.zerocopy::%zc-acquire-for-read sap i2 g2)
+                   (declare (ignore idx2 gen2 base2))
+                   (%check :zc-acq-forged-len-handle psap2 "acquire of a forged-LEN slot must still return a handle")
+                   (%check :zc-acq-forged-len-clamped (eql len2 32)
+                           "a forged over-long recorded LEN must be CLAMPED to slot-bytes (32), never exposed OOB"))
+                 (dds.xport.zerocopy::%zc-release sap i2 g2))
+               (dds.xport.zerocopy::%zc-destroy sap)
+               t)
+          (dds.pal:free-static m)))
+      (progn
+        (format t "~&  [skip] zc-loan-acquire: load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%")
+        t)))
+
+(defun* run-zc-reclaim-skips-loaned-test ()
+    (function () (eql t))
+  "WP-FLATDATA-ZC-LOAN Task C1 — THE BINARY SAFETY GATE (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship —
+   pending counsel): force-reclaim MUST skip refcount>0 slots, so a HELD loan is never overwritten under the
+   reader. In a 2-slot pool, loan A (refcount=1, NOT released) + fill the other slot, then force a further
+   loan: the pool is full and every slot is loaned (refcount>0) ⇒ %zc-loan returns NIL (the writer's non-ZC
+   fallback) and A is NOT reclaimed (its generation + payload stay intact while held). Then %zc-release A ⇒
+   exactly one slot frees and the next loan reuses it (A is reclaimable only once unloaned)."
+  (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
+        (pa (octets 91 92 93 94 95))
+        (pb (octets 60 61 62 63)))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m))
+               (sink (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+           (dds.xport.zerocopy::%zc-init sap 2 32)
+           ;; loan A into slot 0 (refcount=1) and HOLD it (never release while the pool is pressured)
+           (multiple-value-bind (ia ga) (dds.xport.zerocopy::%zc-loan sap pa 0 5 1)
+             (%check :zc-skip-loan-a (eql ia 0) "A must take slot 0")
+             ;; loan B into the only other slot (refcount=1) — now both slots are loaned (refcount>0)
+             (multiple-value-bind (ib gb) (dds.xport.zerocopy::%zc-loan sap pb 0 4 1)
+               (declare (ignore gb))
+               (%check :zc-skip-loan-b (eql ib 1) "B must take slot 1 (pool now full, both loaned)")
+               ;; the pool is full AND every slot is loaned ⇒ a further loan finds NO reclaimable slot ⇒ NIL
+               (multiple-value-bind (ifull gfull) (dds.xport.zerocopy::%zc-loan sap pb 0 4 1)
+                 (declare (ignore gfull))
+                 (%check :zc-skip-loan-full-nil (null ifull)
+                         "with every slot loaned (refcount>0) %zc-loan must return NIL (non-ZC fallback), never reclaim a held slot"))
+               ;; A was NOT reclaimed: its generation is unchanged and its payload is intact under the read
+               (%check :zc-skip-a-gen-intact (= ga (cffi:mem-ref sap :uint32
+                                                                  (+ (dds.xport.zerocopy::%zc-slot-off sap ia)
+                                                                     dds.xport.zerocopy::+zc-slot-off-generation+)))
+                       "the held loan A's generation must be UNCHANGED (it was never reclaimed)")
+               (let ((len (dds.xport.zerocopy::%zc-resolve sap ia ga sink)))
+                 (%check :zc-skip-a-len (eql len 5) "the held loan A must still resolve (LEN 5) — not overwritten")
+                 (%check :zc-skip-a-bytes (loop for k below 5 always (= (aref sink k) (aref pa k)))
+                         "the held loan A's payload must be byte-intact (force-reclaim skipped it)")))
+             ;; release A ⇒ exactly one slot returns to the freelist (B still held)
+             (%check :zc-skip-release-a (dds.xport.zerocopy::%zc-release sap ia ga) "releasing A must apply")
+             (%check :zc-skip-one-free (= 1 (dds.xport.zerocopy::%zc-free-count sap))
+                     "after releasing A exactly one slot frees (B still loaned)")
+             ;; now A's slot is reclaimable/reusable: the next loan succeeds and reuses slot 0
+             (multiple-value-bind (ic gc) (dds.xport.zerocopy::%zc-loan sap pb 0 4 1)
+               (declare (ignore gc))
+               (%check :zc-skip-reuse (eql ic 0) "once unloaned, A's slot must be reusable by a fresh loan")))
+           (dds.xport.zerocopy::%zc-destroy sap)
+           t)
+      (dds.pal:free-static m))))
+
+(defun* run-zc-release-idempotent-test ()
+    (function () (eql t))
+  "WP-FLATDATA-ZC-LOAN Task C1 (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending counsel): %zc-release
+   is idempotent / double-return-safe. Release a slot to refcount 0 (onto the freelist); a SECOND release of
+   the same (slot,generation) is a validated NO-OP — the refcount stays 0 (never negative) and the slot is NOT
+   double-pushed (the free-count is unchanged, no freelist cycle); a release with a stale generation is also a
+   no-op. Guards a double return_loan of one view and a reader-close returning an already-returned loan."
+  (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 32)))
+        (payload (octets 7 8 9)))
+    (unwind-protect
+         (let ((sap (dds.pal:static-pointer m)))
+           (dds.xport.zerocopy::%zc-init sap 2 32)
+           (multiple-value-bind (i g) (dds.xport.zerocopy::%zc-loan sap payload 0 3 1)
+             ;; first release: refcount 1 -> 0, slot onto the freelist
+             (%check :zc-idem-first (dds.xport.zerocopy::%zc-release sap i g) "the first release must apply (T)")
+             (%check :zc-idem-one-free (= 2 (dds.xport.zerocopy::%zc-free-count sap))
+                     "after the first release both slots are free (the slot returned)")
+             ;; the slot's refcount is 0
+             (%check :zc-idem-refcount-zero
+                     (zerop (cffi:mem-ref sap :uint32 (+ (dds.xport.zerocopy::%zc-slot-off sap i)
+                                                         dds.xport.zerocopy::+zc-slot-off-refcount+)))
+                     "the released slot's refcount must be 0")
+             ;; SECOND release of the SAME (slot,generation): a no-op — refcount stays 0, not double-pushed
+             (dds.xport.zerocopy::%zc-release sap i g)
+             (%check :zc-idem-still-zero
+                     (zerop (cffi:mem-ref sap :uint32 (+ (dds.xport.zerocopy::%zc-slot-off sap i)
+                                                         dds.xport.zerocopy::+zc-slot-off-refcount+)))
+                     "a double release must leave the refcount at 0 (never negative / wrapped)")
+             (%check :zc-idem-no-double-push (= 2 (dds.xport.zerocopy::%zc-free-count sap))
+                     "a double release must NOT re-push the slot (free-count unchanged, no freelist cycle)")
+             ;; a release with a stale generation is a no-op (NIL)
+             (%check :zc-idem-stale-gen
+                     (null (dds.xport.zerocopy::%zc-release sap i (logand (+ g 9) #xFFFFFFFF)))
+                     "a release with a stale generation must be a no-op (NIL)")
+             (%check :zc-idem-stale-no-push (= 2 (dds.xport.zerocopy::%zc-free-count sap))
+                     "a stale-generation release must not touch the freelist"))
            (dds.xport.zerocopy::%zc-destroy sap)
            t)
       (dds.pal:free-static m))))
@@ -767,6 +963,78 @@
                (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
       (dds.disc:stop-node node))
     t))
+
+(defun* %zc-slot-refcount (sap slot)
+    (function (t (integer 0)) (unsigned-byte 32))
+  "Test helper (WP-FLATDATA-ZC-LOAN, R6, ADR 0017): the live u32 refcount of pool SLOT off SAP, read directly
+   (like the other zc-pool tests reach %-internals). Lets the defer test prove a loaned slot is NOT released."
+  (cffi:mem-ref sap :uint32 (+ (dds.xport.zerocopy::%zc-slot-off sap slot)
+                               dds.xport.zerocopy::+zc-slot-off-refcount+)))
+
+(defun* run-zc-defer-test ()
+    (function () t)
+  "WP-FLATDATA-ZC-LOAN Task D (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending counsel): the disc
+   receiver thread DEFERS ZC resolution for a LOAN-CAPABLE reader and RESOLVES-COPIES-RELEASES for a
+   non-loan-capable one. Single-process + deterministic (no networking, the run-zc-resolve-drop-test technique):
+   loan a FlatData payload into the node's OWN pool, encode the 16-byte ref, then drive %on-user-data with the
+   node's own guid-prefix as the source (so %zc-attach-pool attaches the node's own pool).
+     (1) LOAN-CAPABLE: the stored sample is an UNRESOLVED zc-loan-marker (NOT a copied octet-vector) AND the slot
+         is NOT released (refcount still 1, the slot still loaned) — the slot lifetime is handed to DCPS.
+     (2) NON-LOAN-CAPABLE: the stored sample is a normal resolved octet-vector EQUAL to the published payload AND
+         the slot WAS released (refcount 0, freed) — the shipped resolve-copy-release path, byte-unchanged.
+   Skips where SHMEM (hence a ZC pool) is unavailable (Clasp/macOS by-name-attach gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-zc-defer-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (va 200) (vb 3000000000) (vc 12345678901234567890)
+         (fd (make-fd-abc-flatdata)))
+    (setf (fd-abc-a-fd fd) va (fd-abc-b-fd fd) vb (fd-abc-c-fd fd) vc)
+    (let ((payload (subseq (dds.core.buffer:octet-buffer-vec fd) 0 +fd-abc-flatdata-size+)))
+      (unwind-protect
+           (dolist (loan-capable '(t nil))
+             (let ((node (dds.disc:make-disc-node
+                          :guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
+                                                   :initial-element (if loan-capable 71 72))
+                          :host "127.0.0.1" :port 0)))
+               (unwind-protect
+                    (progn
+                      (dds.disc:add-local-reader node :topic "ZcDefer" :type "fd-abc"
+                                                 :reliability dds.rtps.discovery:+reliability-reliable+)
+                      (dds.disc:enable-subscriber node)
+                      (when loan-capable (dds.disc:set-zc-loan-capable node t))
+                      (let* ((sap (dds.disc::disc-node-zc-pool-sap node))
+                             (b (dds.core.buffer:make-octet-buffer 64))
+                             (c (dds.core.buffer:cursor b :endianness :little)))
+                        (multiple-value-bind (slot gen)
+                            (dds.xport.zerocopy::%zc-loan sap payload 0 (length payload) 1)
+                          (%check :zc-defer-loaned (and slot t) "could not loan the FlatData payload into the pool")
+                          (dds.cdr:encode-zc-reference c slot gen dds.disc:+zerocopy-pool-slot-bytes+)
+                          (let ((plen (dds.core.buffer:cursor-position c)))
+                            (dds.disc::%on-user-data node #x00000102 1 b 0 plen
+                                                     (dds.disc::disc-node-guid-prefix node))
+                            (let ((got (dds.disc:node-sample-by-sn node 1)))
+                              (%check :zc-defer-stored (and got t) "%on-user-data stored no sample")
+                              (if loan-capable
+                                  (progn
+                                    (%check :zc-defer-marker (dds.disc:zc-loan-marker-p got)
+                                            "a loan-capable reader must store an UNRESOLVED zc-loan-marker, not a copy")
+                                    (%check :zc-defer-marker-slot
+                                            (and (= (dds.disc:zc-loan-marker-slot-index got) slot)
+                                                 (= (dds.disc:zc-loan-marker-generation got) gen))
+                                            "the marker must carry the loan handle (slot + generation)")
+                                    (%check :zc-defer-not-released (= 1 (%zc-slot-refcount sap slot))
+                                            "a loan-capable reader must NOT release the slot (refcount stays 1, still loaned)"))
+                                  (progn
+                                    (%check :zc-defer-resolved
+                                            (and (typep got '(simple-array (unsigned-byte 8) (*)))
+                                                 (equalp got payload))
+                                            "a non-loan-capable reader must resolve+copy the payload (shipped path)")
+                                    (%check :zc-defer-released (zerop (%zc-slot-refcount sap slot))
+                                            "a non-loan-capable reader must release the slot (refcount 0, freed)"))))
+                            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b))))))
+                 (dds.disc:stop-node node))))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))))
+  t)
 
 ;;; WP-FLATDATA compile-time gate (FR-PF-4, ADR 0015)
 (defun* run-flatdata-rejects-variable-test ()
@@ -1140,6 +1408,26 @@
     (declare (ignore s m h))
     (format nil "~4,'0d-~2,'0d-~2,'0d" year month day)))
 
+(defun* %bench-ratio (a b)
+    (function (real real) double-float)
+  "A/B as a double-float for a bench report, or 0.0d0 when B is 0 (div-by-zero-safe; Clasp bytes-consed=0 gap)."
+  (if (zerop b) 0.0d0 (/ (coerce a 'double-float) b)))
+
+(defun* %set-view-from-acquire (view psap idx gen len base)
+    (function (dds.types:flatdata-view t (integer 0) (unsigned-byte 32) (integer 0) (integer 0)) dds.types:flatdata-view)
+  "WP-FLATDATA-ZC-LOAN (R6, ADR 0017; NOT cleared for ship — pending counsel): in-place-init VIEW from a
+   %zc-acquire-for-read result (POOL-SAP/SLOT/GENERATION/PAYLOAD-LEN/PAYLOAD-BASE) — the BASE-OFFSET is
+   PAYLOAD-BASE+4 (past the 4-octet encap header, to the XCDR2 body) and LEN is the body length. The DRY core
+   the bench RX/CYCLE measurement helpers reuse to recycle one view struct (no per-sample GC alloc; mirrors the
+   DCPS %loan-view, sans the per-reader freelist). Returns VIEW."
+  (setf (dds.types:flatdata-view-slot-sap view) psap
+        (dds.types:flatdata-view-base-offset view) (+ base 4)
+        (dds.types:flatdata-view-len view) (max 0 (- len 4))
+        (dds.types:flatdata-view-pool-sap view) psap
+        (dds.types:flatdata-view-slot-index view) idx
+        (dds.types:flatdata-view-generation view) gen)
+  view)
+
 (defun* run-bench-flatdata (&key (file nil) (iters 200000) (zc-iters 100000))
     (function (&key (:file (or null string pathname)) (:iters (integer 1)) (:zc-iters (integer 1))) t)
   "WP-FLATDATA Phase E1a bench (FR-PF-4, NFR-PERF-7, FR-LANG-7; R6, ADR 0015 — NOT cleared for ship, counsel
@@ -1296,6 +1584,108 @@
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec rxbuf))
     t))
 
+(defun* %fd-zc-loan-cycle-bytes (sap payload iters)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 1)) (integer 0))
+  "WP-FLATDATA-ZC-LOAN (R6, ADR 0017; NOT cleared for ship — pending counsel): mean GC bytes/sample of the FULL
+   explicit loan/return CYCLE over ITERS calls — %zc-acquire-for-read (the loan) + a field read off the SAP +
+   %zc-release (the return) — on a slot freshly %zc-loan'd each iteration. The honest cost the loan API ADDS over
+   a bare read: the explicit acquire + release (each takes the pool mutex) + the app's return obligation. SBCL
+   bytes-consed exact; Clasp reads 0 (NFR-PORT gap)."
+  (let ((view (dds.types:make-flatdata-view))
+        (before (dds.pal:bytes-consed)))
+    (dotimes (i iters)
+      (multiple-value-bind (slot gen) (dds.xport.zerocopy::%zc-loan sap payload 0 (length payload) 1)
+        (when slot
+          (multiple-value-bind (psap idx g len base) (dds.xport.zerocopy::%zc-acquire-for-read sap slot gen)
+            (when psap
+              (%set-view-from-acquire view psap idx g len base)
+              (fd-abc-a-fd view)                          ; read a field off the slot SAP (0-copy)
+              (dds.xport.zerocopy::%zc-release psap idx g)))))) ; return-loan
+    (floor (max 0 (- (dds.pal:bytes-consed) before)) iters)))
+
+(defun* run-bench-flatdata-zc-loan (&key (file nil) (iters 100000))
+    (function (&key (:file (or null string pathname)) (:iters (integer 1))) t)
+  "WP-FLATDATA-ZC-LOAN Phase F2 bench (FR-PF-3/4, NFR-PERF-7, FR-LANG-7; R6, ADR 0017 — NOT cleared for ship,
+   counsel R6). The literal-0-copy RX headline measurement: the RX GC bytes/sample PROGRESSION across the three
+   FlatData-over-Zero-Copy RX strategies for a FINAL fixed-size FlatData type (fd-abc, 20-octet payload), over
+   the EXACT pool primitives the loan path funcalls (DRY — reuses %fd-zc-loan-rx-bytes + %fd-zc-rx-bytes-new +
+   %fd-zc-rx-bytes-v1 + %fd-zc-loan-cycle-bytes + the bench env helpers). Prints a markdown report to
+   *standard-output*; when FILE is given, ALSO writes it there (broadcast — captured by make
+   bench-flatdata-zc-loan). HONEST (FR-LANG-7), NO OVERCLAIM: the literal-0-copy loan RX eliminates the
+   per-sample OWNED DELIVERY VECTOR (the alloc win); its residue is the bare pool-mutex acquire (a fixed,
+   payload-independent CFFI cost the v1 single-copy ALSO pays), and the loan API ADDS an explicit
+   %zc-acquire-for-read + %zc-release + the app's return-loan OBLIGATION over a copy-and-forget read — a real
+   cost, stated plainly. SBCL only (ZC + foreign SAP reads, ADR 0013); on Clasp the SHMEM by-name attach is
+   unreliable so the bench pass-skips. NOT cleared for ship — pending counsel (R6)."
+  (let* ((fd (make-fd-abc-flatdata))
+         (sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
+         (have-shmem (dds.xport.shmem:shm-attach-by-name-reliable-p)))
+    (setf (fd-abc-a-fd fd) 200 (fd-abc-b-fd fd) 3000000000 (fd-abc-c-fd fd) 12345678901234567890)
+    (let ((payload (subseq (dds.core.buffer:octet-buffer-vec fd) 0 +fd-abc-flatdata-size+)))
+      (multiple-value-bind (loan-bytes new-bytes v1-bytes cycle-bytes)
+          (if (not have-shmem)
+              (values 0 0 0 0)
+              (let* ((mem (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 +fd-abc-flatdata-size+)))
+                     (sap (dds.pal:static-pointer mem)))
+                (dds.xport.zerocopy::%zc-init sap 2 +fd-abc-flatdata-size+)
+                (unwind-protect
+                     (multiple-value-bind (slot gen) (dds.xport.zerocopy::%zc-loan sap payload 0 +fd-abc-flatdata-size+ 1)
+                       (let ((lb (%fd-zc-loan-rx-bytes sap slot gen iters))    ; force a fixed eval order, all four kept
+                             (nb (%fd-zc-rx-bytes-new sap slot gen iters))
+                             (vb (%fd-zc-rx-bytes-v1 sap slot gen iters))
+                             (cb (%fd-zc-loan-cycle-bytes sap payload iters)))
+                         (dds.xport.zerocopy::%zc-release sap slot gen)         ; balance the measurement loan
+                         (values lb nb vb cb)))
+                  (dds.xport.zerocopy::%zc-destroy sap)
+                  (dds.pal:free-static mem))))
+        (flet ((emit (stream)
+                 (format stream "~&# WP-FLATDATA-ZC-LOAN — literal-0-copy RX (FlatData over Zero-Copy via loan/return_loan) (FR-PF-3/4, NFR-PERF-7, FR-LANG-7)~%~%")
+                 (format stream "**NOT cleared for ship — pending counsel (R6); see ADR 0017.** `dds.disc:*zerocopy-enabled*` is default OFF and the per-type `:flatdata t` opt-in is off by default; this report exercises the loan path with both armed inside the bench only.~%~%")
+                 (format stream "Phase F2 of WP-FLATDATA-ZC-LOAN: the headline literal-0-copy RX measurement. A FlatData reader on the same host reads fields **directly from the writer's SHMEM pool slot** via an explicit `take-loaned`/`return-loan` read API, eliminating the per-sample OWNED DELIVERY VECTOR the WP-ZEROCOPY+FlatData v1 single-copy resolve still allocates. Measured over the EXACT pool primitives the loan path funcalls (`%zc-acquire-for-read` / the SAP-mode Offset accessor / `%zc-release`). Per the operating contract no hot-path change lands without a before/after measurement; this is that measurement. Generated by `dds.tests:run-bench-flatdata-zc-loan` (entry: `make bench-flatdata-zc-loan`).~%~%")
+                 (format stream "## Environment~%~%| field | value |~%|-------|-------|~%")
+                 (format stream "| host | ~a (~a) |~%" (machine-instance) (machine-version))
+                 (format stream "| os | ~a ~a ~a |~%" (software-type) (software-version) (machine-type))
+                 (format stream "| impl | ~a ~a |~%" (lisp-implementation-type) (lisp-implementation-version))
+                 (format stream "| HEAD | ~a |~%" (%bench-git-head))
+                 (format stream "| date | ~a |~%" (%bench-date-string))
+                 (format stream "| FlatData type | `fd-abc` (`u8`,`u32`,`u64`) -> `+fd-abc-flatdata-size+` = ~d octets (4 encap + 16 body) |~%" +fd-abc-flatdata-size+)
+                 (format stream "| pool slot bytes | `+zerocopy-pool-slot-bytes+` = ~d (the WP-ZEROCOPY-v1 sink size) |~%" dds.disc:+zerocopy-pool-slot-bytes+)
+                 (format stream "| iters | ~d |~%" iters)
+                 (format stream "~%## Method~%~%")
+                 (format stream "Each RX strategy resolves ONE loaned slot `iters` times; the resolve does NOT touch the slot refcount, so a single loaned slot serves every iteration. GC bytes/sample is the `dds.pal:bytes-consed` delta over the loop divided by `iters` (NFR-PERF-8 oracle; SBCL-exact, Clasp reports 0 — a documented NFR-PORT gap). The literal-0-copy loan RX reuses one `flatdata-view` struct (the per-reader view recycling the DCPS loan registry does) and reads a field straight off the slot SAP. The loan/return CYCLE row additionally `%zc-loan`s + `%zc-release`s each iteration to price the explicit loan + return obligation. NOTE: this is the per-sample RX allocation, not end-to-end latency.~%~%")
+                 (if (not have-shmem)
+                     (format stream "(SHMEM by-name attach unreliable on this platform — the ZC loan bench pass-skipped; Clasp/macOS gap, ADR 0013)~%~%")
+                     (progn
+                       (format stream "## RX GC bytes/sample — the literal-0-copy progression~%~%")
+                       (format stream "| RX strategy | GC bytes/sample | vs literal-0-copy loan | what it allocates |~%")
+                       (format stream "|-------------|-----------------|------------------------|-------------------|~%")
+                       (format stream "| **literal-0-copy loan** (`%zc-acquire-for-read` + SAP read; `take-loaned`) | **~d** | 1x | NO owned vector — only the pool mutex acquire (fixed, payload-independent) |~%" loan-bytes)
+                       (format stream "| FlatData+ZC v1 single-copy (`%zc-resolve-fresh`) | ~d | ~,1fx | the mutex + one exact-length (~d-octet) OWNED vector |~%"
+                               new-bytes (%bench-ratio new-bytes loan-bytes) +fd-abc-flatdata-size+)
+                       (format stream "| WP-ZEROCOPY-v1 sink+re-copy | ~d | ~,1fx | the mutex + a ~d-octet sink + a re-copy |~%~%"
+                               v1-bytes (%bench-ratio v1-bytes loan-bytes) dds.disc:+zerocopy-pool-slot-bytes+)
+                       (format stream "The literal-0-copy loan RX allocates **~d** GC bytes/sample vs the FlatData+ZC v1 single-copy's **~d** and the WP-ZEROCOPY-v1 sink's **~d** — the progression `~d -> ~d -> ~d`. The win is the **eliminated per-sample owned delivery vector** (the ~~~d-octet vector at the single-copy step is gone): the reader reads fields straight off the writer's slot SAP. The residual ~d B is the pool-mutex acquire/release — a FIXED, payload-independent CFFI cost the v1 single-copy ALSO pays on top of its owned vector.~%~%"
+                               loan-bytes new-bytes v1-bytes v1-bytes new-bytes loan-bytes (max 0 (- new-bytes loan-bytes)) loan-bytes)
+                       (format stream "## The loan / return per-sample overhead (FR-LANG-7 — the honest cost)~%~%")
+                       (format stream "| operation | GC bytes/sample |~%|-----------|-----------------|~%")
+                       (format stream "| loan acquire + read (RX only) | ~d |~%" loan-bytes)
+                       (format stream "| full loan + return CYCLE (`%zc-loan` + acquire + read + `%zc-release`) | ~d |~%~%" cycle-bytes)
+                       (format stream "Literal-0-copy RX is the allocation win, but it is **not free**: the loan API adds an explicit `%zc-acquire-for-read` (the loan) and `%zc-release` (the return) — each taking the pool mutex — plus the app's **explicit `return-loan` obligation** (a leaked loan pins a slot until the writer's pool gracefully falls back to non-ZC). The full loan+return cycle costs **~d** GC bytes/sample here (the per-sample mutex traffic of loan + acquire + release), vs the **~d** B the read-only literal-0-copy RX pays. No `0-cost`/`free` claim: the RX *allocation* is eliminated; the loan/return *calls* and the return *obligation* are real.~%~%"
+                               cycle-bytes loan-bytes)))
+                 (format stream "Method: ~d iterations; GC bytes/sample = `dds.pal:bytes-consed` delta / iters (SBCL-exact, Clasp=0). Cross-process FlatData-over-ZC is proven byte-exact by `make zc-xproc` (the 16-byte reference resolves across two OS processes; literal-0-copy is a LOCAL read optimization — the wire is byte-identical). Impl: ~a ~a on ~a.~%"
+                         iters (lisp-implementation-type) (lisp-implementation-version) (machine-instance))
+                 (when (and sbcl-p have-shmem)
+                   (assert (< loan-bytes new-bytes) () "bench: the literal-0-copy loan RX (~d) must allocate strictly less than the v1 single-copy (~d) — the owned vector eliminated" loan-bytes new-bytes)
+                   (assert (<= loan-bytes 64) () "bench: the literal-0-copy loan RX (~d) must be a small fixed mutex overhead, not a per-sample owned vector" loan-bytes)
+                   (assert (< loan-bytes v1-bytes) () "bench: the literal-0-copy loan RX (~d) must allocate far less than the WP-ZEROCOPY-v1 sink (~d)" loan-bytes v1-bytes))))
+          (emit *standard-output*)
+          (when file
+            (with-open-file (s file :direction :output :if-exists :supersede :if-does-not-exist :create)
+              (emit s))
+            (format t "~&  wrote ~a~%" file)))))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+  t)
+
 (defun* run-flatdata-deser-interop-test ()
     (function () (eql t))
   "WP-FLATDATA in-memory==wire at DESERIALIZE (FR-PF-4): the FlatData and classic codecs are interchangeable on
@@ -1337,6 +1727,138 @@
                           (fd-abc-a-fd sample) (fd-abc-b-fd sample) (fd-abc-c-fd sample)))
           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sample))))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec cb))))
+  t)
+
+;;; WP-FLATDATA-ZC-LOAN Task B1 (FR-PF-3/4, R6 — NOT cleared for ship, see ADR 0017): the SAP-mode Offset
+;;; getter form is byte-exact to the shipped aref getter. Build a :flatdata value in an owned octet-buffer via
+;;; the owned setters, then for each field COMPILE %flatdata-sap-getter-form over the buffer's SAP at body
+;;; offset 4+off and assert the SAP read EQUALS the owned aref accessor — for all widths + signed-negative +
+;;; bool. SBCL only (load-sap-u8 is SBCL-only, ZC is SBCL-only, ADR 0013); Clasp pass-skips cleanly.
+(defun* %fd-sap-getter-byte-exact (spec build-fn getter-fn-alist)
+    (function (list function list) t)
+  "B1 helper (DRY): SPEC is the define-dds-type member list; BUILD-FN fills + returns an owned FlatData buffer;
+   GETTER-FN-ALIST maps each member slot to its owned -fd accessor. For each member compute (off nbytes signed
+   bool) from the SAME dds.gen helpers the codegen uses, COMPILE the SAP getter form over the buffer's SAP, and
+   assert the SAP read = the owned aref read (the byte-exact oracle). Frees the buffer. NOT cleared for ship (R6)."
+  (let* ((parsed (mapcar #'dds.gen::%parse-member spec))
+         (offs (dds.gen::%flatdata-offsets parsed))
+         (buf (funcall build-fn))
+         (sap (dds.core.buffer:buffer-sap buf)))
+    (unwind-protect
+         (dolist (m parsed)
+           (let* ((slot (getf m :slot))
+                  (off (cdr (assoc slot offs)))
+                  (base (+ 4 off))
+                  (owned-fn (cdr (assoc slot getter-fn-alist))))
+             (multiple-value-bind (nbytes signed-p bool-p) (dds.gen::%flatdata-field-kind m)
+               (let* ((form (dds.gen::%flatdata-sap-getter-form 's base nbytes signed-p bool-p))
+                      (sap-read (funcall (compile nil `(lambda (s) ,form)) sap))
+                      (owned-read (funcall owned-fn buf)))
+                 (%check (intern (format nil "FD-SAP-~a" slot) :keyword)
+                         (eql sap-read owned-read)
+                         (format nil "SAP getter for ~a (~d bytes @body~d) read ~s, aref accessor read ~s"
+                                 slot nbytes off sap-read owned-read))))))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))
+    t))
+
+(defun* run-flatdata-sap-getter-test ()
+    (function () (eql t))
+  "WP-FLATDATA-ZC-LOAN Task B1 (FR-PF-3/4, R6, ADR 0017): %flatdata-sap-getter-form is byte-exact to the shipped
+   aref getter for every width + signed-negative + bool. Builds each value in an owned octet-buffer via the owned
+   setters, COMPILEs the SAP getter form over the buffer's SAP at 4+body-offset, and asserts it EQUALS the owned
+   accessor (the byte-exact oracle is the FlatData buffer). SBCL only (load-sap-u8 is SBCL-only); Clasp pass-skips."
+  (if (eq (dds.pal:pal-impl-name) :sbcl)
+      (progn
+        ;; unsigned u8/u32/u64
+        (%fd-sap-getter-byte-exact
+         '((a :u8) (b :u32) (c :u64))
+         (lambda () (let ((b (make-fd-abc-flatdata)))
+                      (setf (fd-abc-a-fd b) 200 (fd-abc-b-fd b) 3000000000 (fd-abc-c-fd b) 12345678901234567890)
+                      b))
+         (list (cons 'a #'fd-abc-a-fd) (cons 'b #'fd-abc-b-fd) (cons 'c #'fd-abc-c-fd)))
+        ;; signed i32/i64 negative (two's-complement) + u8
+        (%fd-sap-getter-byte-exact
+         '((a :u8) (b :i32) (c :i64))
+         (lambda () (let ((b (make-fd-sig-flatdata)))
+                      (setf (fd-sig-a-fd b) 7 (fd-sig-b-fd b) -123456789 (fd-sig-c-fd b) -1234567890123456789)
+                      b))
+         (list (cons 'a #'fd-sig-a-fd) (cons 'b #'fd-sig-b-fd) (cons 'c #'fd-sig-c-fd)))
+        ;; narrow u16/i16/bool/i8 with a negative i16/i8 and bool t
+        (%fd-sap-getter-byte-exact
+         '((a :u16) (b :i16) (c :bool) (d :i8))
+         (lambda () (let ((b (make-fd-narrow-flatdata)))
+                      (setf (fd-narrow-a-fd b) #xBEEF (fd-narrow-b-fd b) -12345
+                            (fd-narrow-c-fd b) t (fd-narrow-d-fd b) -42)
+                      b))
+         (list (cons 'a #'fd-narrow-a-fd) (cons 'b #'fd-narrow-b-fd)
+               (cons 'c #'fd-narrow-c-fd) (cons 'd #'fd-narrow-d-fd)))
+        ;; bool nil too (raw 0 -> /=0 is NIL)
+        (%fd-sap-getter-byte-exact
+         '((a :u16) (b :i16) (c :bool) (d :i8))
+         (lambda () (let ((b (make-fd-narrow-flatdata)))
+                      (setf (fd-narrow-a-fd b) 0 (fd-narrow-b-fd b) 0 (fd-narrow-c-fd b) nil (fd-narrow-d-fd b) 0)
+                      b))
+         (list (cons 'a #'fd-narrow-a-fd) (cons 'b #'fd-narrow-b-fd)
+               (cons 'c #'fd-narrow-c-fd) (cons 'd #'fd-narrow-d-fd))))
+      (format t "~&  [skip] flatdata-sap-getter: load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%"))
+  t)
+
+;;; WP-FLATDATA-ZC-LOAN Task B2 (FR-PF-3/4, R6, ADR 0017): the re-emitted <name>-<field>-fd dispatches owned
+;;; octet-buffer vs flatdata-view on one struct-type branch. Build a :flatdata value in an OWNED buffer (the
+;;; owned path reads unchanged), wrap a flatdata-view over that buffer's SAP (base-offset 4), and read every
+;;; field via the SAME -fd accessor on the view -> equals the owned read, all widths/signed/bool. SBCL only.
+(defun* %fd-view-accessor-byte-exact (build-fn getter-fn-alist)
+    (function (function list) t)
+  "B2 helper (DRY): BUILD-FN fills + returns an owned FlatData buffer; GETTER-FN-ALIST maps each member slot to
+   its (now dispatching) -fd accessor. Wrap a flatdata-view over the buffer's SAP (base-offset 4) and assert each
+   -fd accessor on the VIEW = the same accessor on the OWNED buffer (byte-exact). Frees the buffer. NOT cleared (R6)."
+  (let* ((buf (funcall build-fn))
+         (view (dds.types:make-flatdata-view :slot-sap (dds.core.buffer:buffer-sap buf)
+                                             :base-offset 4
+                                             :len (dds.core.buffer:octet-buffer-capacity buf))))
+    (unwind-protect
+         (dolist (entry getter-fn-alist)
+           (let* ((slot (car entry)) (fn (cdr entry))
+                  (owned-read (funcall fn buf))
+                  (view-read (funcall fn view)))
+             (%check (intern (format nil "FD-VIEW-~a" slot) :keyword)
+                     (eql view-read owned-read)
+                     (format nil "view accessor for ~a read ~s, owned accessor read ~s" slot view-read owned-read))))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))
+    t))
+
+(defun* run-flatdata-view-accessor-test ()
+    (function () (eql t))
+  "WP-FLATDATA-ZC-LOAN Task B2 (FR-PF-3/4, R6, ADR 0017): the single -fd accessor surface reads a flatdata-view
+   (SAP path) byte-exactly to an owned octet-buffer (aref path), via the predicted struct-type dispatch branch —
+   for every width + signed-negative + bool (the owned read is the oracle). SBCL only (the view holds a live SAP
+   the SAP accessors read; load-sap-u8 is SBCL-only); Clasp pass-skips."
+  (if (eq (dds.pal:pal-impl-name) :sbcl)
+      (progn
+        (%fd-view-accessor-byte-exact
+         (lambda () (let ((b (make-fd-abc-flatdata)))
+                      (setf (fd-abc-a-fd b) 200 (fd-abc-b-fd b) 3000000000 (fd-abc-c-fd b) 12345678901234567890)
+                      b))
+         (list (cons 'a #'fd-abc-a-fd) (cons 'b #'fd-abc-b-fd) (cons 'c #'fd-abc-c-fd)))
+        (%fd-view-accessor-byte-exact
+         (lambda () (let ((b (make-fd-sig-flatdata)))
+                      (setf (fd-sig-a-fd b) 7 (fd-sig-b-fd b) -123456789 (fd-sig-c-fd b) -1234567890123456789)
+                      b))
+         (list (cons 'a #'fd-sig-a-fd) (cons 'b #'fd-sig-b-fd) (cons 'c #'fd-sig-c-fd)))
+        (%fd-view-accessor-byte-exact
+         (lambda () (let ((b (make-fd-narrow-flatdata)))
+                      (setf (fd-narrow-a-fd b) #xBEEF (fd-narrow-b-fd b) -12345
+                            (fd-narrow-c-fd b) t (fd-narrow-d-fd b) -42)
+                      b))
+         (list (cons 'a #'fd-narrow-a-fd) (cons 'b #'fd-narrow-b-fd)
+               (cons 'c #'fd-narrow-c-fd) (cons 'd #'fd-narrow-d-fd)))
+        ;; bool nil through the view too
+        (%fd-view-accessor-byte-exact
+         (lambda () (let ((b (make-fd-narrow-flatdata)))
+                      (setf (fd-narrow-a-fd b) 0 (fd-narrow-b-fd b) 0 (fd-narrow-c-fd b) nil (fd-narrow-d-fd b) 0)
+                      b))
+         (list (cons 'c #'fd-narrow-c-fd))))
+      (format t "~&  [skip] flatdata-view-accessor: load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%"))
   t)
 
 (defun* run-flow-token-bucket-test ()
@@ -1554,6 +2076,7 @@
                  ("echo-over-mock-transport" . run-echo-test)
                  ("pal-fence"                . run-pal-fence-test)
                  ("pal-sap-atomics"          . run-pal-sap-atomics-test)
+                 ("pal-sap-ref"              . run-sap-ref-test)
                  ("pal-shm"                  . run-pal-shm-test)
                  ("pal-pshared"              . run-pal-pshared-test)
                  ("xcdr-codec-roundtrip"     . run-codec-roundtrip-test)
@@ -1623,6 +2146,12 @@
                  ("shmem-end-to-end"         . run-shmem-end-to-end-test)
                  ("zerocopy-end-to-end"      . run-zerocopy-end-to-end-test)
                  ("flatdata-zerocopy"        . run-flatdata-zerocopy-test)
+                 ("zc-defer"                 . run-zc-defer-test)
+                 ("dcps-loan-roundtrip"      . run-dcps-loan-roundtrip-test)
+                 ("loan-read-return-take"    . run-loan-read-return-take-test)
+                 ("loan-handle-dealias"      . run-loan-handle-dealias-test)
+                 ("flatdata-zc-loan-e2e"     . run-flatdata-zc-loan-e2e-test)
+                 ("flatdata-zc-loan-stress"  . run-flatdata-zc-loan-stress-test)
                  ("lease-sweep"              . run-lease-sweep-test)
                  ("tce-disallow-default"     . run-tce-disallow-default-test)
                  ("zero-alloc-into"          . run-generated-into-test)
@@ -1728,6 +2257,9 @@
                  ("zc-pool-loan"             . run-zc-pool-loan-test)
                  ("zc-pool-resolve"          . run-zc-pool-resolve-test)
                  ("zc-pool-align"            . run-zc-pool-align-test)
+                 ("zc-loan-acquire"          . run-zc-loan-acquire-test)
+                 ("zc-reclaim-skips-loaned"  . run-zc-reclaim-skips-loaned-test)
+                 ("zc-release-idempotent"    . run-zc-release-idempotent-test)
                  ("shmem-transport"          . dds.xport.shmem:run-shmem-transport-test)
                  ("shmem-receiver-thread"    . dds.xport.shmem:run-shmem-receiver-test)
                  ("shmem-stress"             . dds.xport.shmem:run-shmem-stress-test)
@@ -1738,7 +2270,9 @@
                  ("flatdata-offsets"         . run-flatdata-offsets-test)
                  ("flatdata-accessor"        . run-flatdata-accessor-test)
                  ("flatdata-zero-alloc"      . run-flatdata-zero-alloc-test)
-                 ("flatdata-deser-interop"   . run-flatdata-deser-interop-test))))
+                 ("flatdata-deser-interop"   . run-flatdata-deser-interop-test)
+                 ("flatdata-sap-getter"      . run-flatdata-sap-getter-test)
+                 ("flatdata-view-accessor"   . run-flatdata-view-accessor-test))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))
       (funcall (cdr test))

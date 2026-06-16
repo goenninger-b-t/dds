@@ -7,6 +7,15 @@
    NOT cleared for ship — pending counsel (R6); see ADR 0015."
   (size 0 :type (integer 0)) (encap-offset 4 :type (integer 0)) (fields '() :type list))
 
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0017.
+(defstruct* (flatdata-view (:constructor make-flatdata-view))
+  "WP-FLATDATA-ZC-LOAN read-in-place view over a live ZC SHMEM slot (FR-PF-3/4): SLOT-SAP + BASE-OFFSET (=4,
+   past the 4-octet encap header) for the SAP-mode Offset accessors, LEN (validated >= +size+ by the loan
+   path), and the pool handle (POOL-SAP + SLOT-INDEX + GENERATION) for return-loan. Read-only (RX).
+   NOT cleared for ship — pending counsel (R6); see ADR 0017."
+  (slot-sap nil :type t) (base-offset 4 :type (integer 0)) (len 0 :type (integer 0))
+  (pool-sap nil :type t) (slot-index 0 :type (integer 0)) (generation 0 :type (unsigned-byte 32)))
+
 (defstruct* (type-support (:constructor make-type-support))
   "Per-type manual vtable the engine funcalls per sample (IMPLEMENTATION-PLAN §7.3): a
    plain defstruct of function objects (serialize/deserialize/serialized-size/key-hash,

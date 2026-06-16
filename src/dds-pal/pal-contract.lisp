@@ -21,6 +21,9 @@
    ;; atomics (generic M0 stubs); foreign-SAP fast paths for hot-path use (M1, ADR 0013)
    #:cas #:atomic-incf #:fence
    #:cas-sap-u64 #:atomic-incf-sap-u64 #:load-sap-u64 #:store-sap-u64
+   ;; foreign-SAP fixed-width unsigned reads — back the FlatData-ZC read-in-place
+   ;; accessors (WP-FLATDATA-ZC-LOAN; SBCL-only; R6, NOT cleared for ship — see ADR 0017)
+   #:load-sap-u8 #:load-sap-u16 #:load-sap-u32
    ;; shared memory segments + in-segment PTHREAD_PROCESS_SHARED mutex/condvar (FR-XPORT-2, ADR 0013)
    #:shm-create #:shm-attach #:shm-detach #:shm-destroy #:shm-sap #:shm-segment-size
    #:pshared-mutex-init #:pshared-cond-init #:pshared-lock #:pshared-unlock

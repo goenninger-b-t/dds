@@ -22,6 +22,10 @@
            ;; WP-FLATDATA fixed-size layout (FR-PF-4, ADR 0015; R6)
            #:flatdata-layout #:make-flatdata-layout #:flatdata-layout-p
            #:flatdata-layout-size #:flatdata-layout-encap-offset #:flatdata-layout-fields
+           ;; WP-FLATDATA-ZC-LOAN read-in-place SHMEM-slot view (FR-PF-3/4, ADR 0017; R6)
+           #:flatdata-view #:make-flatdata-view #:flatdata-view-p
+           #:flatdata-view-slot-sap #:flatdata-view-base-offset #:flatdata-view-len
+           #:flatdata-view-pool-sap #:flatdata-view-slot-index #:flatdata-view-generation
            #:register-type #:find-type-support #:registered-type-names
            #:sample-pool #:make-sample-pool #:sample-pool-acquire #:sample-pool-release
            ;; XTypes structural TypeIdentifier / TypeObject model (FR-TYPE-2)

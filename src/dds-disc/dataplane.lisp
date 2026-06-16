@@ -935,6 +935,27 @@
   (or (gethash guid outer)
       (setf (gethash (copy-seq guid) outer) (make-hash-table :test 'eql))))
 
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0017.
+(defstruct* (zc-loan-marker (:constructor %make-zc-loan-marker))
+  "WP-FLATDATA-ZC-LOAN unresolved ZC-ref marker (FR-PF-3/4, R6, ADR 0017): the receiver thread stores THIS
+   (not a resolved/copied octet-vector) in disc-node-samples for a zc-loan-capable reader, so the slot stays
+   loaned (no copy, no %zc-release on the receiver thread) until DCPS take-loaned acquires + return-loan
+   releases it. POOL-SAP is the reader-side attached pool base SAP, SLOT-INDEX + GENERATION the loan handle,
+   LEN the wire-declared payload length (re-validated against the slot at acquire). Distinguishable from a
+   normal resolved-bytes sample (a simple-array) by ZC-LOAN-MARKER-P, so %drain knows to acquire-for-read vs
+   deserialize-normally. NOT cleared for ship — pending counsel (R6)."
+  (pool-sap nil :type t) (slot-index 0 :type (integer 0))
+  (generation 0 :type (unsigned-byte 32)) (len 0 :type (integer 0)))
+
+(defun* set-zc-loan-capable (node capable)
+    (function (disc-node t) t)
+  "WP-FLATDATA-ZC-LOAN wiring (FR-PF-3/4, R6, ADR 0017): mark NODE's local user reader loan-capable (CAPABLE
+   non-NIL) or not. DCPS calls this on a :flatdata-topic reader created while *zerocopy-enabled* is on, so the
+   receiver thread defers ZC resolution (stores the unresolved marker, holds the slot) and DCPS take-loaned /
+   return-loan owns the slot lifetime. Default NIL leaves the shipped resolve-copy-release path byte-unchanged.
+   NOT cleared for ship — pending counsel (R6)."
+  (setf (disc-node-zc-loan-capable node) capable))
+
 (defun* %zc-attach-pool (node src-prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
   "WP-ZEROCOPY reader side (FR-PF-3, ADR 0014): the mapped base SAP of the writer pool published by the
@@ -995,6 +1016,48 @@
               (dds.xport.zerocopy::%zc-release sap slot gen)   ; release now: bytes already copied into the owned VEC
               vec))))))
 
+(defun* %zc-defer (node buf poff plen src-prefix)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0) (integer 0)
+              (simple-array (unsigned-byte 8) (12))) t)
+  "WP-FLATDATA-ZC-LOAN reader side, the LOAN-CAPABLE branch (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship —
+   pending counsel): test the DATA SerializedPayload at BUF[poff,poff+plen) for a 16-byte zero-copy reference.
+   Returns :NOT-A-REF for a normal payload (the caller copies+delivers it unchanged); a ZC-LOAN-MARKER (pool-sap
+   + slot + generation + len) on a valid ref WITHOUT resolving/copying/releasing — the slot stays loaned via the
+   writer's refcount so the app reads it in place through DCPS take-loaned (literal 0 intra-host copies); or NIL
+   when it IS a ref but the writer pool cannot be attached (forged/stale src-prefix) — best-effort DROP. This is
+   the Phase-D defer: unlike %zc-try-resolve (which read-then-RELEASEs on the receiver thread), the slot's
+   cross-process lifetime is HANDED to DCPS — the receiver thread does NOT release it (releasing here would free
+   the slot before the app's later read = use-after-free). The ref is UNTRUSTED: parse-zc-reference bounds-checks
+   the payload region; the attach SIZE uses the fixed pool geometry, never a wire value; %zc-acquire-for-read
+   re-validates the slot + generation + len at acquire (NFR-SEC-POSTURE)."
+  (multiple-value-bind (slot gen slot-bytes)
+      (dds.cdr:parse-zc-reference (dds.core.buffer:octet-buffer-vec buf) poff plen)
+    (if (null slot)
+        :not-a-ref
+        (let ((sap (%zc-attach-pool node src-prefix)))
+          (when sap
+            ;; LEN here is the ref's advisory slot-capacity; %zc-acquire-for-read re-derives the AUTHORITATIVE
+            ;; clamped payload length from the slot header at acquire, so a forged wire LEN cannot widen a read.
+            (%make-zc-loan-marker :pool-sap sap :slot-index slot :generation gen :len slot-bytes))))))
+
+(defun* %deliver-user-marker (node writer-id sn marker src-prefix)
+    (function (disc-node (unsigned-byte 32) integer zc-loan-marker
+              (simple-array (unsigned-byte 8) (12))) t)
+  "WP-FLATDATA-ZC-LOAN (R6, ADR 0017): store the UNRESOLVED ZC-LOAN-MARKER as the sample value (mirrors
+   %deliver-user-sample, but the value is the marker, not an octet-vector). The reliable-reader proxy is still
+   fed the marker as the change so ACKNACK/HEARTBEAT bookkeeping advances; the 2-level (source-GUID -> SN) store
+   keeps the marker so DCPS %drain can acquire-for-read it. ON-SAMPLE fires outside the node lock. NOT cleared
+   for ship — pending counsel (R6)."
+  (let ((guid (%source-guid src-prefix writer-id)))
+    (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn
+                                      (make-array 0 :element-type '(unsigned-byte 8)))
+    (dds.pal:with-lock ((disc-node-lock node))
+      (setf (gethash sn (%inner-table (disc-node-samples node) guid)) marker
+            (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
+            (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)))
+  (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))
+  t)
+
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
               (simple-array (unsigned-byte 8) (12))) t)
@@ -1024,17 +1087,26 @@
    normal sample); an INVALID ref (stale/forced/OOB/attach-fail) is DROPPED best-effort (no delivery, no
    crash); a normal payload (:not-a-ref) takes the existing copy-and-deliver path verbatim. With ZC off
    (no pool) the ref test is skipped entirely — byte-identical to today (dedup/reorder, store by SN, fire
-   ON-SAMPLE outside the node lock — no lock-order inversion)."
-  (let ((zc (if (disc-node-zc-pool node)   ; the pool's existence == ZC armed at make-disc-node (slot, not the special: this runs on the receiver thread, where a dynamic binding of *zerocopy-enabled* is invisible — mirrors disc-node-shmem)
-                (%zc-try-resolve node buf poff plen src-prefix)
-                :not-a-ref)))                                       ; ZC off: never inspected -> normal path
+   ON-SAMPLE outside the node lock — no lock-order inversion).
+   WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending counsel): when this node's
+   local reader is ZC-LOAN-CAPABLE (DCPS marked it — a :flatdata topic + ZC armed), a valid ref is stored as an
+   UNRESOLVED ZC-LOAN-MARKER (%zc-defer) and NOT released — the slot stays loaned via the writer's refcount so
+   DCPS take-loaned reads it in place (literal 0 intra-host copies) and return-loan releases it; releasing here
+   would free the slot before the app's later read (use-after-free). A non-loan-capable reader keeps the shipped
+   resolve-copy-release path (%zc-try-resolve), byte-unchanged."
+  (let ((zc (cond
+              ((null (disc-node-zc-pool node)) :not-a-ref)         ; the pool's existence == ZC armed at make-disc-node (slot, not the special: this runs on the receiver thread, where a dynamic binding of *zerocopy-enabled* is invisible — mirrors disc-node-shmem); ZC off -> never inspected -> normal path
+              ((disc-node-zc-loan-capable node)                    ; loan-capable: DEFER (store unresolved marker, hold the slot)
+               (%zc-defer node buf poff plen src-prefix))
+              (t (%zc-try-resolve node buf poff plen src-prefix))))) ; shipped path: resolve-copy-release
     (cond
-      ((null zc))                                                   ; armed + ref present but resolution FAILED -> drop (best-effort)
+      ((null zc))                                                   ; armed + ref present but defer/resolve FAILED -> drop (best-effort)
       ((eq zc :not-a-ref)                                           ; normal payload (or ZC off): existing path, byte-identical
        (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
          (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
          (%deliver-user-sample node writer-id sn vec src-prefix)))
-      (t (%deliver-user-sample node writer-id sn zc src-prefix)))   ; resolved ZC payload
+      ((zc-loan-marker-p zc) (%deliver-user-marker node writer-id sn zc src-prefix)) ; loan-capable: the unresolved marker
+      (t (%deliver-user-sample node writer-id sn zc src-prefix)))   ; resolved ZC payload (non-loan-capable)
     t))
 
 (defun* %on-user-heartbeat (node c flags src-prefix)

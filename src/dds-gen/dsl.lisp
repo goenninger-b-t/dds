@@ -123,6 +123,21 @@
           (signed-p `(let ((u ,raw)) (if (>= u ,(ash 1 (1- (* 8 nbytes)))) (- u ,(ash 1 (* 8 nbytes))) u)))
           (t raw))))
 
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0017.
+(defun* %flatdata-sap-getter-form (sap base nbytes signed-p bool-p)
+    (function (symbol t (integer 1 8) t t) t)
+  "Macro-time: the SAP twin of %flatdata-getter-form for WP-FLATDATA-ZC-LOAN — a 0-alloc form reading an NBYTES
+   XCDR2-LE field straight off a live SHMEM-slot SAP at SAP+BASE.., byte-exact to the aref form. Composes from
+   per-byte (dds.pal:load-sap-u8 SAP (+ BASE i)) reads with the SAME logior/ash + two's-complement (SIGNED-P) +
+   /=0 boolean (BOOL-P) logic (BASE may be a runtime form). Per-byte u8 compose guarantees LE byte-exactness
+   matching the aref accessor exactly — NOT load-sap-u16/u32, to avoid any native-order divergence. NOT cleared
+   for ship — pending counsel (R6); see ADR 0017."
+  (let ((raw `(logior ,@(loop for i below nbytes
+                              collect `(ash (dds.pal:load-sap-u8 ,sap (+ ,base ,i)) ,(* 8 i))))))
+    (cond (bool-p `(/= 0 ,raw))
+          (signed-p `(let ((u ,raw)) (if (>= u ,(ash 1 (1- (* 8 nbytes)))) (- u ,(ash 1 (* 8 nbytes))) u)))
+          (t raw))))
+
 (defun* %flatdata-setter-form (vec base nbytes bool-p val)
     (function (symbol (integer 0) (integer 1 8) t symbol) t)
   "Macro-time: a 0-alloc form writing VAL as an NBYTES XCDR2-LE field at VEC[BASE..] (two's-complement reduced
@@ -276,22 +291,33 @@
                          append
                          (multiple-value-bind (nbytes signed-p bool-p)
                              (%flatdata-field-kind m)
-                           `((declaim (ftype (function (dds.core.buffer:octet-buffer) ,(getf m :ltype))
+                           `((declaim (ftype (function ((or dds.core.buffer:octet-buffer dds.types:flatdata-view))
+                                                       ,(getf m :ltype))
                                              ,(fd-acc m)))
-                             (defun ,(fd-acc m) (buf)
+                             (defun ,(fd-acc m) (x)
                                ,(format nil "WP-FLATDATA Offset getter: read member ~a in place at body offset ~
-                                 ~d (buffer offset ~d), XCDR2-LE, 0-alloc raw SAP/vec access (no cursor, no ~
-                                 consing). NOT cleared for ship — pending counsel (R6)." (getf m :slot) off base)
+                                 ~d, XCDR2-LE, 0-alloc raw SAP/vec access (no cursor, no consing). X is EITHER an ~
+                                 owned octet-buffer (the shipped aref read at buffer offset ~d) OR a ~
+                                 WP-FLATDATA-ZC-LOAN flatdata-view over a live SHMEM slot (the SAP read at ~
+                                 base-offset+~d, byte-exact to the aref form), dispatched by a single predicted ~
+                                 struct-type branch (no generic dispatch). NOT cleared for ship — pending counsel ~
+                                 (R6); see ADR 0017 (view) / ADR 0015 (owned)." (getf m :slot) off base off)
                                (dds.pal:with-hot-optimizations
-                                 (let ((vec (dds.core.buffer:octet-buffer-vec buf)))
-                                   (declare (type (simple-array (unsigned-byte 8) (*)) vec))
-                                   ,(%flatdata-getter-form 'vec base nbytes signed-p bool-p))))
+                                 (if (dds.types:flatdata-view-p x)
+                                     (let ((sap (dds.types:flatdata-view-slot-sap x))
+                                           (base (+ (dds.types:flatdata-view-base-offset x) ,off)))
+                                       ,(%flatdata-sap-getter-form 'sap 'base nbytes signed-p bool-p))
+                                     (let ((vec (dds.core.buffer:octet-buffer-vec x)))
+                                       (declare (type (simple-array (unsigned-byte 8) (*)) vec))
+                                       ,(%flatdata-getter-form 'vec base nbytes signed-p bool-p)))))
                              (declaim (ftype (function (,(getf m :ltype) dds.core.buffer:octet-buffer)
                                                        ,(getf m :ltype)) (setf ,(fd-acc m))))
                              (defun (setf ,(fd-acc m)) (v buf)
                                ,(format nil "WP-FLATDATA Offset setter: write member ~a in place at body offset ~
-                                 ~d (buffer offset ~d), XCDR2-LE, 0-alloc raw SAP/vec access (no cursor, no ~
-                                 consing). NOT cleared for ship — pending counsel (R6)." (getf m :slot) off base)
+                                 ~d (buffer offset ~d), XCDR2-LE, 0-alloc raw vec access (no cursor, no consing). ~
+                                 OWNED octet-buffer ONLY: a WP-FLATDATA-ZC-LOAN flatdata-view is read-only (RX) ~
+                                 — writing a loaned SHMEM slot is out of scope (the writer owns it; see ADR 0017). ~
+                                 NOT cleared for ship — pending counsel (R6)." (getf m :slot) off base)
                                (dds.pal:with-hot-optimizations
                                  (let ((vec (dds.core.buffer:octet-buffer-vec buf)))
                                    (declare (type (simple-array (unsigned-byte 8) (*)) vec))

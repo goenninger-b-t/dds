@@ -1314,6 +1314,49 @@ source, headers, or `rtiddsgen` output** was consulted.
   oracle), under fuzz (the untrusted-payload wrap, incl. a `(safety 0)` arm), and by an SBCL bench
   (`bench/report/2026-06-14-wp-flatdata.md`) — none of which involves a vendor artifact.
 
+## M5 (2026-06-16) — WP-FLATDATA-ZC-LOAN literal-0-copy RX loan API (FR-PF-3/4, ADR 0017, Phases D–F)
+
+The literal-0-copy FlatData-over-Zero-Copy RX (`src/dds-pal/*` `load-sap-u8/u16/u32`;
+`src/dds-gen/dsl.lisp` SAP-mode `<name>-<field>-fd`; `src/dds-types/type-support.lisp` `flatdata-view`;
+`src/dds-xport/zerocopy-pool.lisp` `%zc-acquire-for-read` + the force-reclaim `refcount>0` skip;
+`src/dds-disc/{disc,dataplane}.lisp` the `zc-loan-capable` flag + `%zc-defer` + the `zc-loan-marker`;
+`src/dds-dcps/entities.lisp` `take-loaned`/`read-loaned`/`return-loan` + the per-reader loan registry +
+freelist + the loan-capable wiring) is **clean-room**:
+
+- Implemented from **FR-PF-3 / FR-PF-4 + the OMG XCDR 1.3 fixed-size layout + the OMG DDS 1.4
+  `read()`/`take()` + `return_loan()` read-by-reference model (§2.2.2.5)** only. The loan/return-by-reference
+  flow, the per-reader `zc-loan-capable` targeting, the refcount-spanning slot lifetime (held by the writer's
+  `%zc-loan` refcount through the receiver-thread store, the DCPS acquire-without-inc, the app reads, until
+  `return-loan`), and the force-reclaim `refcount>0` skip are this project's **own design from first
+  principles** + the OMG loan model. The PAL foreign-SAP fixed-width reads are this project's own thin
+  wrappers over SBCL's documented `sb-sys:sap-ref-{8,16,32}`.
+- **No RTI source, headers, or `rtiddsgen` output consulted; no other vendor's FlatData/Zero-Copy/loan
+  implementation read; no RTI patent / whitepaper read.** No Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) /
+  OpenDDS source was read for this work package.
+- **NOT cleared for ship — pending counsel (R6).** This IS the FlatData+Zero-Copy literal-0-copy mechanism
+  RTI's patents touch; gated default-OFF twice (`dds.disc:*zerocopy-enabled*` nil **and** the per-type
+  `:flatdata t`). With either off the data path is byte-identical. Counsel performs the authoritative claim
+  clearance before any `*zerocopy-enabled*`-on FlatData-loan ship; this entry + ADR 0017 record provenance.
+- Validated by `zc-defer` (the receiver-thread defer/no-release vs the shipped resolve-copy-release) +
+  `dcps-loan-roundtrip` (the full DCPS stack: byte-exact 0-copy loaned read, slot-reusable-after-return,
+  double-return-safe, reader-close-returns-loans), the existing `zerocopy-end-to-end` / `flatdata-zerocopy` /
+  `zc-xproc` (the copy path + the real 2-process exchange, byte-unchanged), and fuzz (the forged-len ZC clamp,
+  `(safety 0)` arm) — none of which involves a vendor artifact.
+- **Phase F (`src/dds-tests/{integration-test,echo-test,pbt-test}.lisp`, `Makefile`):** the literal-0-copy
+  headline + lifetime stress + loan-acquire fuzz + the bench are likewise clean-room — measured with this
+  project's own `dds.pal:bytes-consed` seam over its own pool primitives; no vendor artifact, benchmark, or
+  number consulted. `run-flatdata-zc-loan-e2e-test` (the `take-loaned`/read/`return-loan` loop + the RX
+  `bytes-consed` progression `~32 → ~79 → ~65551`), `run-flatdata-zc-loan-stress-test` (the concurrency
+  lifetime safety property under real threads — held-loan-byte-integrity-under-churn, pool-full fallback, no
+  refcount leak, leaked-loan-degrades-to-fallback), `fuzz-flatdata-zc-loan-wrap` (the untrusted loan-acquire
+  bounds — forged slot/generation/recorded-len ⇒ NIL or a slot-clamped view, never an OOB even at `(safety 0)`),
+  `run-bench-flatdata-zc-loan` (`make bench-flatdata-zc-loan` → `bench/report/2026-06-16-wp-flatdata-zc-loan.md`).
+  HONEST (FR-LANG-7): the report states the literal-0-copy RX *allocation* win (the eliminated owned vector)
+  AND the loan/return per-sample overhead (the explicit acquire/release calls + the app's return obligation) —
+  no `0-cost`/`free` claim. The cross-process FlatData-over-ZC exchange stays covered by `make zc-xproc` (the
+  reference resolves across two OS processes; literal-0-copy is a LOCAL read optimization — the wire is
+  byte-identical, so no separate loan-variant cross-process harness was added).
+
 ## M5 (2026-06-15) — WP-ASYNC-FLOW asynchronous flow control (FR-PF-2, ADR 0016, Phases A–F)
 
 The whole WP-ASYNC-FLOW — the `flow-token-bucket` metering primitive (`src/dds-disc/flow-control.lisp`

@@ -99,6 +99,27 @@
     (:full    (sb-thread:barrier (:memory))))
   (values))
 
+(defun* load-sap-u8 (sap offset)
+    (function (t (integer 0)) (unsigned-byte 8))
+  "8-bit unsigned read of the foreign location at SAP+OFFSET (bytes). Backs the
+   FlatData-over-Zero-Copy read-in-place accessors (WP-FLATDATA-ZC-LOAN, R6 — NOT
+   cleared for ship, see ADR 0017): a literal-0-copy field read straight off a
+   SHMEM pool slot SAP, byte-exact to the aref accessor (XCDR2-LE)."
+  (sb-sys:sap-ref-8 sap offset))
+(defun* load-sap-u16 (sap offset)
+    (function (t (integer 0)) (unsigned-byte 16))
+  "Aligned 16-bit little-endian unsigned read of the foreign location at SAP+OFFSET
+   (bytes). Backs the FlatData-over-Zero-Copy read-in-place accessors
+   (WP-FLATDATA-ZC-LOAN, R6 — NOT cleared for ship, see ADR 0017): a literal-0-copy
+   field read straight off a SHMEM pool slot SAP, byte-exact to the aref accessor."
+  (sb-sys:sap-ref-16 sap offset))
+(defun* load-sap-u32 (sap offset)
+    (function (t (integer 0)) (unsigned-byte 32))
+  "Aligned 32-bit little-endian unsigned read of the foreign location at SAP+OFFSET
+   (bytes). Backs the FlatData-over-Zero-Copy read-in-place accessors
+   (WP-FLATDATA-ZC-LOAN, R6 — NOT cleared for ship, see ADR 0017): a literal-0-copy
+   field read straight off a SHMEM pool slot SAP, byte-exact to the aref accessor."
+  (sb-sys:sap-ref-32 sap offset))
 (defun* load-sap-u64 (sap offset)
     (function (t (integer 0)) (unsigned-byte 64))
   "Aligned 64-bit read of the foreign location at SAP+OFFSET (bytes)."

@@ -94,6 +94,8 @@
    (listener-mask :initform '() :accessor dr-listener-mask)
    (conditions :initform '() :accessor dr-conditions)      ; read/query/status conditions bound here
    (filter :initform nil :accessor dr-filter)              ; ContentFilteredTopic predicate, or nil
+   (loans :initform '() :accessor dr-loans)                ; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): outstanding loaned flatdata-views (the loan registry) — return-loan / reader-close release them
+   (view-freelist :initform '() :accessor dr-view-freelist) ; WP-FLATDATA-ZC-LOAN: recycled flatdata-view structs (no per-sample GC-heap alloc; NFR-MEM)
    (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock))
   (:documentation "DDS DataReader: receives typed samples on a Topic into a read/take
    cache with per-instance SampleInfo, carrying its SUBSCRIPTION_MATCHED,
@@ -106,6 +108,12 @@
 ;; Defined in type-gate.lisp (loaded after this file); forward-declared so
 ;; create-participant can install the FR-TYPE-4 assignability gate.
 (declaim (ftype (function (domain-participant) domain-participant) %install-type-gate))
+
+;; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): forward-declared so create-datareader / delete-participant (defined
+;; above their bodies in this file) reach the loan helpers without a compile-time undefined-function warning.
+(declaim (ftype (function (t) (or null (integer 0))) %flatdata-size))
+(declaim (ftype (function (domain-participant) list) %participant-readers))
+(declaim (ftype (function (data-reader) t) return-all-loans))
 
 (defun* %field-resolver (ts)
     (function (t) function)
@@ -248,7 +256,12 @@
 
 (defun* delete-participant (p)
     (function (domain-participant) (eql t))
-  "Delete the participant and its contained entities; stop the engine."
+  "Delete the participant and its contained entities; stop the engine. WP-FLATDATA-ZC-LOAN (R6, ADR 0017):
+   return EVERY outstanding loan on each contained DataReader FIRST — BEFORE stop-node detaches the reader-side
+   ZC pool mapping — so no held refcount pins the writer's pool (no leak) and the final %zc-release runs while
+   the views' SAP is still mapped (no use-after-free at teardown). A no-op for readers with no loans (the common
+   case: ZC off / non-FlatData)."
+  (dolist (dr (%participant-readers p)) (return-all-loans dr))
   (dds.disc:stop-node (dp-node p))
   (setf (entity-enabled-p p) nil)
   t)
@@ -346,6 +359,11 @@
                                :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))
     (dds.disc:enable-subscriber node)
+    ;; WP-FLATDATA-ZC-LOAN wiring (FR-PF-3/4, R6, ADR 0017): a :flatdata-topic reader, with ZC armed, is
+    ;; loan-capable — the receiver thread defers ZC resolution (holds the slot) and the loan API owns the slot
+    ;; lifetime. Gated on the TYPE being FlatData AND *zerocopy-enabled*; off either way -> NIL -> byte-unchanged.
+    (when (and dds.disc:*zerocopy-enabled* (%flatdata-size (topic-type-support topic)))
+      (dds.disc:set-zc-loan-capable node t))
     (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos :enabled t)))
       (setf (dr-filter dr) (td-filter-predicate topic))   ; nil for a plain Topic
       (push dr (sub-readers sub))
@@ -832,6 +850,174 @@
     (dolist (c (dp-children p) rs)
       (when (typep c 'subscriber) (setf rs (append (sub-readers c) rs))))))
 
+;;;; ---- WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017) ----
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0017.
+
+(defun* %flatdata-size (ts)
+    (function (t) (or null (integer 0)))
+  "WP-FLATDATA-ZC-LOAN (R6, ADR 0017): the FINAL fixed-size FlatData SerializedPayload size (+<type>-flatdata-size+,
+   the loan-acquire lower bound for PAYLOAD-LEN) for type-support TS, or NIL when TS is not a :flatdata type. Reads
+   the flatdata-layout size the codegen recorded; the layout IS the +size+ oracle."
+  (let ((fo (dds.types:type-support-flatdata-offset ts)))
+    (and (dds.types:flatdata-layout-p fo) (dds.types:flatdata-layout-size fo))))
+
+(defun* %loan-view (dr pool-sap base-offset len slot gen)
+    (function (data-reader t (integer 0) (integer 0) (integer 0) (unsigned-byte 32)) dds.types:flatdata-view)
+  "WP-FLATDATA-ZC-LOAN (R6, ADR 0017): a flatdata-view over the live slot, drawn from DR's per-reader freelist
+   (no per-sample GC-heap alloc; NFR-MEM) and initialised in place — SLOT-SAP=POOL-SAP, BASE-OFFSET (the XCDR2
+   body start within the segment), LEN (the body length), + the loan handle (POOL-SAP/SLOT/GEN) for return-loan.
+   Recycled by return-loan. NOT cleared for ship — pending counsel (R6)."
+  (let ((v (or (pop (dr-view-freelist dr)) (dds.types:make-flatdata-view))))
+    (setf (dds.types:flatdata-view-slot-sap v) pool-sap
+          (dds.types:flatdata-view-base-offset v) base-offset
+          (dds.types:flatdata-view-len v) len
+          (dds.types:flatdata-view-pool-sap v) pool-sap
+          (dds.types:flatdata-view-slot-index v) slot
+          (dds.types:flatdata-view-generation v) gen)
+    v))
+
+(defun* %loan-instance-handle (ts view sn sguid)
+    (function (t dds.types:flatdata-view integer t) (simple-array (unsigned-byte 8) (16)))
+  "WP-FLATDATA-ZC-LOAN (R6, ADR 0017): a 16-octet NON-ALIASING instance handle for a loaned FlatData VIEW.
+   v1 derives a per-source-per-sample handle: low 8 octets = the RTPS SN; high 8 octets = an FNV-1a fold of the
+   source writer's 16-octet GUID (SGUID). Folding the GUID de-aliases two co-located writers — each SN-stream
+   restarts at 1, so SN alone (the earlier v1) would collide their handles and flip a NEW/NOT_NEW view-state
+   (cosmetic for NO_KEY, but the handle must still be unique per source, §8.3.5.4: SN is per-writer). When SGUID
+   is NIL (an un-attributed sample) the fold is the FNV-1a basis, so the handle still differs from any GUID-bearing
+   writer's. The literal-0-copy loan path keeps the sample's keyhash out of the hot loop; per-key instance
+   coalescing over the view's SAP keyhash is a follow-up (NO_KEY v1 scope). TS/VIEW reserved for that follow-up.
+   NOT cleared for ship — pending counsel (R6)."
+  (declare (ignore ts view))
+  (let ((h (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+        (fold 14695981039346656037))                                   ; FNV-1a 64-bit offset basis
+    (when (typep sguid '(array (unsigned-byte 8) (*)))
+      (dotimes (i (length sguid))                                      ; fold the 16-octet source GUID -> 64 bits
+        (setf fold (ldb (byte 64 0) (* (logxor fold (aref sguid i)) 1099511628211)))))
+    (dotimes (i 8) (setf (aref h i) (ldb (byte 8 (* 8 i)) sn)))        ; low 8 = SN
+    (dotimes (i 8 h) (setf (aref h (+ 8 i)) (ldb (byte 8 (* 8 i)) fold)))))  ; high 8 = GUID fold (de-alias)
+
+(defun* %drain-one-loan (dr ts key marker sn sguid)
+    (function (data-reader t cons dds.disc:zc-loan-marker integer t) t)
+  "WP-FLATDATA-ZC-LOAN (R6, ADR 0017; NOT cleared for ship — pending counsel): turn an UNRESOLVED ZC-LOAN-MARKER
+   (Task D, stored by the receiver thread WITHOUT copying/releasing) into a literal-0-copy delivery. Acquire the
+   slot for read (%zc-acquire-for-read — generation/bounds validated, NO refcount inc: the loan is already held by
+   the writer's refcount from %zc-loan through the receiver store to here); validate PAYLOAD-LEN >= the type's
+   +flatdata-size+ (a short slot ⇒ a stale/forged ref ⇒ DROP, best-effort, slot left for force-reclaim); build a
+   flatdata-view (base = PAYLOAD-BASE + 4, past the encap header, to the XCDR2 body; len = body length) from the
+   freelist; RECORD it in the loan registry (dr-loans) so return-loan / reader-close release it; and append a
+   cached-sample carrying the VIEW (read in place via <name>-<field>-fd). Registering at DRAIN time (not at
+   take-loaned) means a drained-but-never-taken loan is still released at reader-close (no refcount leak). The
+   per-writer watermark advances for every outcome (the reliable engine already ACKed; never retransmit). NOT
+   cleared for ship — pending counsel (R6)."
+  (multiple-value-bind (pool-sap slot gen payload-len payload-base)
+      (dds.xport.zerocopy::%zc-acquire-for-read (dds.disc:zc-loan-marker-pool-sap marker)
+                                                (dds.disc:zc-loan-marker-slot-index marker)
+                                                (dds.disc:zc-loan-marker-generation marker))
+    (let ((min (%flatdata-size ts)))
+      (when (and pool-sap (or (null min) (>= payload-len min)))   ; stale/forged/short -> drop (best-effort)
+        (let* ((view (%loan-view dr pool-sap (+ payload-base 4) (max 0 (- payload-len 4)) slot gen))
+               (handle (%loan-instance-handle ts view sn sguid))       ; fold the source GUID -> non-aliasing handle
+               (rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer
+                                                        (dp-node (sub-participant (dr-subscriber dr))) key))))
+          (push view (dr-loans dr))                                ; register BEFORE delivery (reader-close safety)
+          (setf (dr-cache dr)
+                (nconc (dr-cache dr)
+                       (list (make-cached-sample
+                              :data view
+                              :info (make-sample-info
+                                     :sample-state :not-read :view-state :new
+                                     :instance-state (instance-rec-state rec) :valid-data t
+                                     :instance-handle handle :sequence-number sn
+                                     :disposed-generation-count (instance-rec-disposed-gen-count rec)
+                                     :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))))
+    (when sguid                                                    ; advance the per-writer watermark (best-effort: ACKed, never retransmit)
+      (setf (gethash sguid (dr-drained dr)) (max sn (gethash sguid (dr-drained dr) 0)))))
+  t)
+
+(defun* take-loaned (dr)
+    (function (data-reader) (values list list))
+  "DataReader::take by LOAN — WP-FLATDATA-ZC-LOAN literal-0-copy RX (FR-PF-3/4, NFR-PERF-7, R6, ADR 0017; NOT
+   cleared for ship — pending counsel). Drain pending changes; for each sample that is an UNRESOLVED ZC-ref on a
+   loan-capable FlatData reader (Task D), the drain has already acquired the slot for read (%zc-acquire-for-read,
+   no copy) and built a flatdata-view recorded in the loan registry. take-loaned REMOVES the returned samples
+   from the cache (mirrors take-samples) and returns (values DATA-LIST LOANS) where DATA-LIST is the per-sample
+   data (a flatdata-view for a loaned sample — read fields via <name>-<field>-fd directly off the writer's SHMEM
+   slot, LITERAL 0 intra-host copies — or the deserialized struct for any copy-backed sample mixed in) and LOANS
+   is the list of flatdata-views to hand back to return-loan (NIL for a copy-backed sample). SLOT LIFETIME: the
+   slot is held by the writer's refcount from %zc-loan, never released by the receiver thread, until return-loan
+   (or reader-close) %zc-releases it — so the app's in-place read can never race a writer force-reclaim
+   (force-reclaim skips refcount>0). The app MUST return-loan the views when done (a leaked loan pins a slot ⇒
+   the writer's pool eventually falls back to non-ZC — graceful, never a wedge). NOT cleared for ship — pending
+   counsel (R6)."
+  (%drain dr)
+  (let ((data '()) (loans '()) (touched '()))
+    (dolist (cs (dr-cache dr))
+      (let* ((info (cached-sample-info cs)) (d (cached-sample-data cs))
+             (handle (sample-info-instance-handle info)))
+        (setf (sample-info-view-state info) (if (gethash handle (dr-instances dr)) :not-new :new))
+        (pushnew handle touched :test #'equalp)
+        (setf (sample-info-sample-state info) :read)
+        (push d data)
+        (when (dds.types:flatdata-view-p d) (push d loans))))   ; a loaned view (registry slot); NIL otherwise
+    (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
+    (setf (dr-cache dr) '())                                    ; take removes ALL drained samples
+    (values (nreverse data) (nreverse loans))))
+
+(defun* read-loaned (dr)
+    (function (data-reader) (values list list))
+  "DataReader::read by LOAN — WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending
+   counsel). Like take-loaned but LEAVES the samples in the cache (mirrors read-samples vs take-samples): returns
+   (values DATA-LIST LOANS) for the cached samples, marking each READ. The SAME loan-registry views are returned
+   each call until return-loan releases them; the app still returns each view once (return-loan is idempotent, so
+   a view returned after a read-then-take is a safe no-op). NOT cleared for ship — pending counsel (R6)."
+  (%drain dr)
+  (let ((data '()) (loans '()) (touched '()))
+    (dolist (cs (dr-cache dr))
+      (let* ((info (cached-sample-info cs)) (d (cached-sample-data cs))
+             (handle (sample-info-instance-handle info)))
+        (setf (sample-info-view-state info) (if (gethash handle (dr-instances dr)) :not-new :new))
+        (pushnew handle touched :test #'equalp)
+        (setf (sample-info-sample-state info) :read)
+        (push d data)
+        (when (dds.types:flatdata-view-p d) (push d loans))))
+    (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
+    (values (nreverse data) (nreverse loans))))
+
+(defun* return-loan (dr loans)
+    (function (data-reader list) t)
+  "DataReader::return_loan — WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017; NOT cleared for ship — pending
+   counsel). Release each loaned flatdata-view in LOANS: INVALIDATE its cache entry (drop the cached-sample(s)
+   in dr-cache that still reference the view — read-loaned LEAVES them, so the entry would otherwise outlive the
+   loan), %zc-release the slot (refcount→ on the 1→0 edge frees it back to the writer's pool), clear it from the
+   loan registry (dr-loans), and recycle the view struct to the per-reader freelist (no GC churn). After return,
+   BOTH the view AND its cache entry are invalidated: a returned loan is never re-read — once a view is recycled
+   to the freelist, %loan-view may pop+re-init it for a NEW slot, so a surviving stale cache entry would alias
+   the new sample's bytes (a WRONG-BYTES stale read); dropping the entry here makes reading a returned loan a
+   no-op (the sample is gone from the cache), never a stale read. IDEMPOTENT / double-return-safe: a view NOT in
+   the registry (already returned, or never loaned — e.g. a copy-backed sample's NIL) is skipped without a
+   second %zc-release and without a second cache scan, and %zc-release itself is generation-validated (a second
+   release of an already-freed/regenerated slot is a validated no-op). So return-loan(loans) twice, or returning
+   a view after a read-then-take, is safe. NOT cleared for ship — pending counsel (R6)."
+  (dolist (v loans)
+    (when (and (dds.types:flatdata-view-p v) (member v (dr-loans dr)))   ; in the registry -> release exactly once
+      (setf (dr-cache dr) (delete v (dr-cache dr) :key #'cached-sample-data)) ; invalidate the cache entry BEFORE recycle (no stale read)
+      (dds.xport.zerocopy::%zc-release (dds.types:flatdata-view-pool-sap v)
+                                       (dds.types:flatdata-view-slot-index v)
+                                       (dds.types:flatdata-view-generation v))
+      (setf (dr-loans dr) (delete v (dr-loans dr)))
+      (push v (dr-view-freelist dr))))                                   ; recycle (NFR-MEM)
+  t)
+
+(defun* return-all-loans (dr)
+    (function (data-reader) t)
+  "WP-FLATDATA-ZC-LOAN reader-close safety (FR-PF-3/4, R6, ADR 0017): return EVERY outstanding loan in DR's
+   registry (return-loan over a snapshot of dr-loans) so reader-close / delete-participant leaves NO held
+   refcount that would pin the writer's pool. Called BEFORE the engine stop-node detaches the reader-side pool
+   mapping (the views' SAP must still be valid for the final %zc-release). NOT cleared for ship — pending counsel
+   (R6)."
+  (return-loan dr (copy-list (dr-loans dr)))
+  t)
+
 (defun* %drain-one-sample (dr node ts key)
     (function (data-reader t t cons) t)
   "Apply ONE pending data sample at composite (GUID . SN) KEY: deserialize, drop it on a
@@ -853,6 +1039,9 @@
         (sn (dds.disc:node-sample-key-sn key))
         (advance t))                       ; advance the per-writer watermark unless arbitration keeps it pending
   (let ((bytes (dds.disc:node-sample node key)))
+    (when (dds.disc:zc-loan-marker-p bytes)            ; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): an UNRESOLVED ZC ref -> acquire a literal-0-copy view, never deserialize
+      (%drain-one-loan dr ts key bytes sn sguid)
+      (return-from %drain-one-sample t))
     (when bytes
       (let ((data (%deserialize-sample ts bytes)))
         ;; ContentFilteredTopic: drop reader-side a sample failing the filter.

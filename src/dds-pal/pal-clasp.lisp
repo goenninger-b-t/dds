@@ -120,6 +120,31 @@
               (:full    :sequentially-consistent)))
   (values))
 
+(defun* load-sap-u8 (sap offset)
+    (function (t (integer 0)) (unsigned-byte 8))
+  "8-bit unsigned read of the foreign location at SAP+OFFSET. NFR-PORT gap: backs the
+   FlatData-over-Zero-Copy read-in-place accessors (WP-FLATDATA-ZC-LOAN, R6 — NOT cleared
+   for ship, see ADR 0017), and ZC is SBCL-only (ADR 0013), so the loan path never runs on
+   Clasp; signals PAL-UNIMPLEMENTED rather than offering a half-path (consistent with the
+   cas-sap-u64 stub)."
+  (declare (ignore sap offset))
+  (error 'pal-unimplemented :op 'load-sap-u8))
+(defun* load-sap-u16 (sap offset)
+    (function (t (integer 0)) (unsigned-byte 16))
+  "16-bit little-endian unsigned read of the foreign location at SAP+OFFSET. Same NFR-PORT
+   gap as LOAD-SAP-U8: ZC is SBCL-only (ADR 0013), so the FlatData-ZC loan path
+   (WP-FLATDATA-ZC-LOAN, R6 — NOT cleared for ship, see ADR 0017) never runs on Clasp;
+   signals PAL-UNIMPLEMENTED."
+  (declare (ignore sap offset))
+  (error 'pal-unimplemented :op 'load-sap-u16))
+(defun* load-sap-u32 (sap offset)
+    (function (t (integer 0)) (unsigned-byte 32))
+  "32-bit little-endian unsigned read of the foreign location at SAP+OFFSET. Same NFR-PORT
+   gap as LOAD-SAP-U8: ZC is SBCL-only (ADR 0013), so the FlatData-ZC loan path
+   (WP-FLATDATA-ZC-LOAN, R6 — NOT cleared for ship, see ADR 0017) never runs on Clasp;
+   signals PAL-UNIMPLEMENTED."
+  (declare (ignore sap offset))
+  (error 'pal-unimplemented :op 'load-sap-u32))
 (defun* load-sap-u64 (sap offset)
     (function (t (integer 0)) (unsigned-byte 64))
   "Aligned 64-bit read of the foreign location at SAP+OFFSET (bytes). Masked to unsigned

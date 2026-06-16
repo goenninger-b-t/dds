@@ -35,6 +35,10 @@
            #:flow-controller-associate #:flow-controller-unregister #:flow-controller-thread
            #:*shmem-enabled* #:*zerocopy-enabled* #:disc-node-shmem #:disc-node-shmem-sends #:disc-node-host-uuid
            #:disc-node-zc-sends #:+zerocopy-pool-slots+ #:+zerocopy-pool-slot-bytes+ #:*zerocopy-min-payload-bytes*
+           ;; WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017): loan-capable flag + the unresolved ZC-ref marker
+           #:set-zc-loan-capable #:disc-node-zc-loan-capable
+           #:zc-loan-marker #:zc-loan-marker-p #:zc-loan-marker-pool-sap
+           #:zc-loan-marker-slot-index #:zc-loan-marker-generation #:zc-loan-marker-len
            #:node-sample-count #:node-sample #:node-sample-sns
            #:node-sample-writer #:node-sample-writer-guid #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
            #:dispose-instance #:unregister-instance

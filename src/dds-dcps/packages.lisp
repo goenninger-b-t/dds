@@ -19,6 +19,8 @@
            #:create-publisher #:create-subscriber #:create-topic
            #:create-datawriter #:create-datareader
            #:write-sample #:read-samples #:take-samples #:samples-available
+           ;; WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017)
+           #:take-loaned #:read-loaned #:return-loan #:return-all-loans
            #:register-instance #:dispose-instance #:unregister-instance
            #:+retcode-ok+ #:+retcode-timeout+
            #:sample-info #:make-sample-info

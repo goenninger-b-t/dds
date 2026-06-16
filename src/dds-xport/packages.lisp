@@ -66,5 +66,5 @@
     behind dds.disc:*zerocopy-enabled*. %-internals are reached via :: by tests.")
   (:export #:%zc-bytes #:%zc-init #:%zc-validate #:%zc-destroy
            #:%zc-slot-count #:%zc-slot-bytes #:%zc-free-count
-           #:%zc-loan #:%zc-release #:%zc-resolve
+           #:%zc-loan #:%zc-release #:%zc-resolve #:%zc-acquire-for-read
            #:*zc-pubseq*))
