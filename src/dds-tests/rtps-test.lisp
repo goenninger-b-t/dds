@@ -1731,3 +1731,128 @@
                    "key-hash-<name>-fd equals the struct key-hash-<name> for the same id (FlatData/non-FlatData agree)"))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     t))
+
+;;; WP-FLATDATA-XCDR-TRANSCODE (FR-PF-4, DDS-XTypes 1.3 §7.6.3.1.2, R6 — NOT cleared for ship, see ADR 0015):
+;;; a :flatdata t reader transcodes a FOREIGN representation (XCDR1 BE/LE, XCDR2 BE) into its canonical
+;;; XCDR2-LE buffer via the sibling struct codec, instead of rejecting it (the WP-KEYED-FLATDATA forward-leg
+;;; false-REJECT a stock Connext peer — defaulting to XCDR1-BE — surfaced). The native PLAIN_CDR2_LE (0x0007)
+;;; path stays read-in-place (0-copy). The transcode-test type carries an :i8 then an :i64 @key so the
+;;; XCDR1<->XCDR2 8-vs-4 alignment divergence is exercised: in XCDR1 the i64 sits at body offset 8 (8-align
+;;; after the i8), in XCDR2 at offset 4 (4-align cap) — so the transcode is a re-align, not a pure byte-swap.
+(dds.gen:define-dds-type xcv (:flatdata t)
+  (a :i8) (k :i64 :key t) (v :i32))
+
+(defun* %be-i64 (v)
+    (function ((signed-byte 64)) (simple-array (unsigned-byte 8) (8)))
+  "The 8-octet big-endian two's-complement encoding of an i64 V — an INDEPENDENT derivation of the XCDR2
+   big-endian @key serialization (RTPS 2.5 §9.6.4.8), not via the project's own serializer, so the keyhash
+   oracle does not circularly reuse the code under test."
+  (let ((u (ldb (byte 64 0) v))
+        (b (make-array 8 :element-type '(unsigned-byte 8))))
+    (dotimes (i 8) (setf (aref b i) (ldb (byte 8 (* 8 (- 7 i))) u)))
+    b))
+
+(defun* %expected-i64-keyhash (k)
+    (function ((signed-byte 64)) (simple-array (unsigned-byte 8) (16)))
+  "The 16-octet DDS keyhash a STANDARDS-CONFORMANT peer computes for a keyed type whose only @key is an i64 = K
+   (RTPS 2.5 §9.6.4.8): key holder max serialized size 8 (<=16), so the key bytes (XCDR2 big-endian) directly,
+   right-zero-padded to 16. Derived from first principles (%be-i64), independent of our keyhash, as the oracle."
+  (let ((out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace out (%be-i64 k))
+    out))
+
+(defun* %xcv-transcode-check (wire tag)
+    (function ((simple-array (unsigned-byte 8) (*)) symbol) t)
+  "DRY: feed a HAND-BUILT SerializedPayload WIRE through the engine RX (dds.dcps::%deserialize-sample, which
+   parses the encap header then funcalls the FlatData :deserialize = deserialize-xcv-fd) and assert the
+   canonical -fd accessors read the pinned values (a=#x11, k=#x0102030405060708, v=#x21222324) AND
+   key-hash-xcv-fd equals the independently-derived i64 keyhash. WIRE is built by hand (not our serializer) so
+   the test is a genuine oracle of the foreign-rep transcode + the XCDR1<->XCDR2 re-alignment."
+  (let* ((ts (dds.types:find-type-support "xcv"))
+         (sample (dds.dcps::%deserialize-sample ts wire)))
+    (unwind-protect
+         (progn
+           (%check (intern (format nil "XCV-TRANSCODE-A-~a" tag) :keyword)
+                   (= (xcv-a-fd sample) #x11)
+                   (format nil "~a: a-fd should read #x11, got #x~x" tag (xcv-a-fd sample)))
+           (%check (intern (format nil "XCV-TRANSCODE-K-~a" tag) :keyword)
+                   (= (xcv-k-fd sample) #x0102030405060708)
+                   (format nil "~a: k-fd should read #x0102030405060708, got #x~x" tag (xcv-k-fd sample)))
+           (%check (intern (format nil "XCV-TRANSCODE-V-~a" tag) :keyword)
+                   (= (xcv-v-fd sample) #x21222324)
+                   (format nil "~a: v-fd should read #x21222324, got #x~x" tag (xcv-v-fd sample)))
+           (%check (intern (format nil "XCV-TRANSCODE-KH-~a" tag) :keyword)
+                   (equalp (key-hash-xcv-fd sample) (%expected-i64-keyhash #x0102030405060708))
+                   (format nil "~a: key-hash-xcv-fd must equal the native i64 keyhash (RTPS 2.5 §9.6.4.8)" tag)))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sample)))
+    t))
+
+(defun* run-flatdata-transcode-xcdr1be-test ()
+    (function () t)
+  "WP-FLATDATA-XCDR-TRANSCODE: a FlatData reader transcodes a PLAIN_CDR_BE (0x0000, XCDR1 big-endian) foreign
+   SerializedPayload into its canonical XCDR2-LE buffer (FR-PF-4, DDS-XTypes 1.3 §7.6.3.1.2). The body is HAND
+   built per §7.6.3.1.2 + the XCDR1 8-byte alignment: a@0 (1 octet), pad to 8, k@8 (i64 BE), v@16 (i32 BE) —
+   so the i64 sits at offset 8 (NOT the XCDR2 offset 4); the transcode must re-align, not just byte-swap. The
+   -fd accessors and key-hash-xcv-fd then read the pinned values (the oracle). A stock RTI Connext defaults to
+   this representation — this is the forward-leg false-REJECT closed."
+  (let ((wire (octets #x00 #x00 #x00 #x00                          ; encap: PLAIN_CDR_BE (0x0000), options 0
+                      #x11 #x00 #x00 #x00 #x00 #x00 #x00 #x00      ; a@0=11, pad to 8-align k (XCDR1)
+                      #x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08      ; k@8 = i64 BE 0x0102030405060708
+                      #x21 #x22 #x23 #x24)))                       ; v@16 = i32 BE 0x21222324
+    (%xcv-transcode-check wire :xcdr1be)))
+
+(defun* run-flatdata-transcode-xcdr1le-test ()
+    (function () t)
+  "WP-FLATDATA-XCDR-TRANSCODE: a FlatData reader transcodes a PLAIN_CDR_LE (0x0001, XCDR1 little-endian)
+   foreign payload into XCDR2-LE (FR-PF-4, §7.6.3.1.2). Same XCDR1 layout as the BE case (i64 still @8 — the
+   8-byte alignment is endianness-independent) but little-endian field bytes; the -fd accessors read the pinned
+   values. HAND-BUILT (not our serializer)."
+  (let ((wire (octets #x00 #x01 #x00 #x00                          ; encap: PLAIN_CDR_LE (0x0001), options 0
+                      #x11 #x00 #x00 #x00 #x00 #x00 #x00 #x00      ; a@0=11, pad to 8-align k (XCDR1)
+                      #x08 #x07 #x06 #x05 #x04 #x03 #x02 #x01      ; k@8 = i64 LE 0x0102030405060708
+                      #x24 #x23 #x22 #x21)))                       ; v@16 = i32 LE 0x21222324
+    (%xcv-transcode-check wire :xcdr1le)))
+
+(defun* run-flatdata-transcode-xcdr2be-test ()
+    (function () t)
+  "WP-FLATDATA-XCDR-TRANSCODE: a FlatData reader transcodes a PLAIN_CDR2_BE (0x0006, XCDR2 big-endian) foreign
+   payload into XCDR2-LE (FR-PF-4, §7.6.3.1.2). XCDR2 4-byte alignment cap: a@0, pad to 4, k@4 (i64 BE), v@12
+   (i32 BE) — so the i64 is at offset 4 (NOT the XCDR1 offset 8); only the endianness differs from the native
+   layout, so this exercises the byte-swap-only transcode. HAND-BUILT."
+  (let ((wire (octets #x00 #x06 #x00 #x00                          ; encap: PLAIN_CDR2_BE (0x0006), options 0
+                      #x11 #x00 #x00 #x00                          ; a@0=11, pad to 4-align k (XCDR2)
+                      #x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08      ; k@4 = i64 BE 0x0102030405060708
+                      #x21 #x22 #x23 #x24)))                       ; v@12 = i32 BE 0x21222324
+    (%xcv-transcode-check wire :xcdr2be)))
+
+(defun* run-flatdata-transcode-native-test ()
+    (function () t)
+  "WP-FLATDATA-XCDR-TRANSCODE regression: the native PLAIN_CDR2_LE (0x0007) path still reads IN PLACE (0-copy,
+   UNCHANGED) — a hand-built canonical XCDR2-LE payload (a@0, pad to 4, k@4 i64 LE, v@12 i32 LE) reads the
+   pinned values via the -fd accessors with NO transcode (the native branch). This proves the rep-id branch
+   does not perturb the shipped 0-copy path."
+  (let ((wire (octets #x00 #x07 #x00 #x00                          ; encap: PLAIN_CDR2_LE (0x0007), options 0
+                      #x11 #x00 #x00 #x00                          ; a@0=11, pad to 4-align k (XCDR2)
+                      #x08 #x07 #x06 #x05 #x04 #x03 #x02 #x01      ; k@4 = i64 LE 0x0102030405060708
+                      #x24 #x23 #x22 #x21)))                       ; v@12 = i32 LE 0x21222324
+    (%xcv-transcode-check wire :native)))
+
+(defun* run-flatdata-transcode-rejects-pl-test ()
+    (function () t)
+  "WP-FLATDATA-XCDR-TRANSCODE: non-transcodable representations on a FINAL fixed-size FlatData type — PL_CDR2
+   (0x000b), DELIMITED_CDR_LE (0x0009), XML (0x0004) — keep the CLEAN reject (a FINAL fixed-size FlatData type
+   is PLAIN-encapsulated, so these are unexpected; rejecting is correct, not a regression). The reject must be
+   a controlled signal, never an OOB / crash (false-REJECT-safe + NFR-SEC-POSTURE). The bodies are arbitrary
+   (the rep-id alone decides the reject); each must raise."
+  (let ((ts (dds.types:find-type-support "xcv")))
+    (dolist (rep '((#x00 #x0b . :pl-cdr2-le)
+                   (#x00 #x09 . :delimited-cdr-le)
+                   (#x00 #x04 . :xml)))
+      (let ((wire (octets (first rep) (second rep) #x00 #x00
+                          #x11 #x00 #x00 #x00
+                          #x08 #x07 #x06 #x05 #x04 #x03 #x02 #x01
+                          #x24 #x23 #x22 #x21)))
+        (%check (intern (format nil "XCV-TRANSCODE-REJECT-~a" (cddr rep)) :keyword)
+                (nth-value 1 (ignore-errors (dds.dcps::%deserialize-sample ts wire)))
+                (format nil "FlatData RX of ~a must cleanly reject (signal), not read-in-place or crash" (cddr rep)))))
+    t))

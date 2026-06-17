@@ -222,12 +222,19 @@ Still provisional: the unexercised serialization-VM edges (unions, MUTABLE struc
   Connext; tshark confirms our user DATA is `CDR2_LE (0x0007)` with the i32 `@key` in the
   payload (no `PID_KEY_HASH` on alive DATA) and the dispose DATA carries
   `PID_KEY_HASH (0x0070)` + `PID_STATUS_INFO (0x0071) Disposed`
-  (`interop/keyed-flatdata/captures/`). **Fast DDS: owner-pending** — built peer apps +
-  the `fastddsgen` step + `make fastdds-keyed-flat-pub/sub` + the expected per-key keyhash
-  result are handed over (the toolchain lives in the owner's environment). A documented
-  forward-leg limitation (our XCDR2-LE-only FlatData read-in-place reader **rejects**, never
-  mis-reads, a foreign XCDR1/BE payload; the follow-up advertises `PID_DATA_REPRESENTATION =
-  XCDR2` and/or transcodes) is a conformance follow-up, **not** a keyhash defect.
+  (`interop/keyed-flatdata/captures/`). **Fast DDS 3.6.1: PASS, live in-session** (2026-06-17,
+  loopback; `fastddsgen` v4.3.0 output committed) — the reverse leg matched the Connext result
+  (30/30 into exactly 3 per-key instances, the keyhash `00000000…`/`00000001…`/`00000002…`
+  byte-identical to ours and to Connext's, dispose-by-key resolved; `kflat-reverse-fastdds.pcap`).
+  **Forward leg (peer pub → our FlatData sub) now PASS via the transcode** (WP-FLATDATA-XCDR-TRANSCODE,
+  2026-06-17, FR-PF-4, DDS-XTypes 1.3 §7.6.3.1.2): both Connext and Fast DDS emit `PLAIN_CDR_LE`
+  (0x0001, XCDR1-LE) on the wire, and our `:flatdata t` reader **transcodes** it into its canonical
+  XCDR2-LE buffer (decode via the sibling struct codec + re-serialize XCDR2-LE) — 29/30 into exactly
+  3 instances, keyhashes byte-identical, dispose-by-key resolved (`kflat-forward-connext.pcap` +
+  `kflat-forward-fastdds.pcap`). This **closes the earlier forward-leg false-REJECT** (the reader used
+  to read only `PLAIN_CDR2_LE` 0x0007 and rejected a foreign rep — false-REJECT-safe, never mis-read).
+  The remaining `PID_DATA_REPRESENTATION = XCDR2`-on-our-SEDP item (so a peer can also pick XCDR2 and
+  skip the transcode) is a production-side XTypes follow-up, **not** a transcode or keyhash defect.
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

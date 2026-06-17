@@ -38,6 +38,25 @@
   "Inverse of representation-id-value, or NIL if VALUE is unrecognised."
   (car (rassoc value +representation-ids+)))
 
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
+(defun* flatdata-rx-rep-plan (id)
+    (function ((unsigned-byte 16)) (values (member :native :transcode :reject)
+                                           (or null cdr-mode) (or null (member :little :big))))
+  "Classify a 16-bit SerializedPayload representation ID (NBO, as read from vec[0..1]) for a FINAL fixed-size
+   FlatData reader's RX (WP-FLATDATA-XCDR-TRANSCODE, FR-PF-4). Returns (values KIND MODE ENDIANNESS) where the
+   IDs are PINNED from +representation-ids+ (DDS-XTypes 1.3 §7.6.3.1.2 Table 60), NOT hardcoded from memory:
+   PLAIN_CDR2_LE -> (:native nil nil) = read-in-place (0-copy, the canonical buffer); PLAIN_CDR2_BE ->
+   (:transcode :xcdr2 :big), PLAIN_CDR_BE -> (:transcode :xcdr1 :big), PLAIN_CDR_LE -> (:transcode :xcdr1
+   :little) = decode-via-struct-codec then re-write canonical XCDR2-LE; anything else (PL_CDR(2)/DELIMITED/XML)
+   -> (:reject nil nil) — a FINAL fixed-size FlatData type is PLAIN-encapsulated, so these are unexpected.
+   NOT cleared for ship — pending counsel (R6)."
+  (cond
+    ((= id (representation-id-value :plain-cdr2-le)) (values :native    nil    nil))
+    ((= id (representation-id-value :plain-cdr2-be)) (values :transcode :xcdr2 :big))
+    ((= id (representation-id-value :plain-cdr-be))  (values :transcode :xcdr1 :big))
+    ((= id (representation-id-value :plain-cdr-le))  (values :transcode :xcdr1 :little))
+    (t (values :reject nil nil))))
+
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
 (defconstant +zc-encapsulation-id+ #x4B43
   "Vendor SerializedPayload encapsulation id for a WP-ZEROCOPY 16-byte reference (ADR 0014; ours, NOT a

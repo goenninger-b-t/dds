@@ -390,18 +390,24 @@
                                            dds.core.buffer:octet-buffer)
                                  ,fd-dnto))
                  (defun ,fd-dnto (target cursor &optional (mode :xcdr2))
-                   ,(format nil "WP-FLATDATA deserialize=READ-IN-PLACE into a PRE-LOANED FlatData buffer TARGET ~
-                     (the 0-ALLOC RX path, parallel to deserialize-into-~a): validate then block-copy the received ~
-                     payload body into TARGET — NO per-field decode, 0-alloc (TARGET is loaned, e.g. from a pool). ~
-                     CURSOR is positioned by the engine at body offset 4 over the received payload. ~
-                     FALSE-REJECT-SAFE VALIDATION FIRST (NFR-SEC-POSTURE + the no-false-REJECT rule): the available ~
-                     payload length (cursor-buffer capacity) MUST be >= ~a — NOT == — so a conforming/trailing- ~
-                     padded peer payload that is LONGER is accepted; reject (signal) only if too SHORT to contain ~
-                     every field (which would risk an OOB accessor read), and re-confirm the encap id is XCDR2-LE ~
-                     (PLAIN_CDR2_LE 0x0007, NBO) at vec[0..1]; bounds-checked even at (safety 0). Copies only ~
-                     [4,~a) (the header+OPTIONS in TARGET were written by make-~a-flatdata). Returns TARGET. ~
-                     NOT cleared for ship — pending counsel (R6); see ADR 0015." tname (symbol-name fd-size-sym)
-                            (symbol-name fd-size-sym) tname)
+                   ,(format nil "WP-FLATDATA deserialize into a PRE-LOANED FlatData buffer TARGET, branching on the ~
+                     received SerializedPayload representation id (NBO at vec[0..1]) via dds.cdr:flatdata-rx-rep-plan ~
+                     (PINNED to +representation-ids+, DDS-XTypes 1.3 §7.6.3.1.2): (1) PLAIN_CDR2_LE (0x0007) = the ~
+                     0-ALLOC READ-IN-PLACE path (UNCHANGED, parallel to deserialize-into-~a) — block-copy the body ~
+                     into TARGET, NO per-field decode; (2) a FOREIGN transcodable rep (PLAIN_CDR_BE 0x0000, ~
+                     PLAIN_CDR_LE 0x0001, PLAIN_CDR2_BE 0x0006) = TRANSCODE (WP-FLATDATA-XCDR-TRANSCODE, FR-PF-4): ~
+                     decode the body via the sibling struct codec deserialize-~a (mode + cursor endianness from the ~
+                     rep-id — it already handles XCDR1/XCDR2 x BE/LE incl. the 8-vs-4 alignment divergence) then ~
+                     write each field into TARGET's canonical XCDR2-LE layout via the ~a-<field>-fd setters; the ~
+                     allocating fallback for a conformant non-XCDR2-LE peer (e.g. stock RTI Connext, XCDR1-BE), OFF ~
+                     the measured CDR hot path; (3) anything else (PL_CDR(2)/DELIMITED/XML) = a CLEAN reject (a FINAL ~
+                     fixed-size FlatData type is PLAIN-encapsulated, so these are unexpected). FALSE-REJECT-SAFE ~
+                     BOUNDS (NFR-SEC-POSTURE, even at (safety 0)): the available payload length (cursor-buffer ~
+                     capacity) MUST be >= 4 to read the rep-id, then >= ~a for the native copy (NOT == — a LONGER ~
+                     trailing-padded peer payload is accepted); the transcode's struct codec bounds-checks every ~
+                     field against the payload extent (check-room), so a SHORT/forged foreign body -> a controlled ~
+                     signal, never OOB. Returns TARGET. NOT cleared for ship — pending counsel (R6); see ADR 0015."
+                            tname tname tname (symbol-name fd-size-sym))
                    (declare (ignore mode))
                    (dds.pal:with-hot-optimizations
                      (let* ((src-buf (dds.core.buffer:cursor-buffer cursor))
@@ -409,16 +415,30 @@
                             (avail (dds.core.buffer:octet-buffer-capacity src-buf))
                             (dst (dds.core.buffer:octet-buffer-vec target)))
                        (declare (type (simple-array (unsigned-byte 8) (*)) src dst))
-                       ;; false-REJECT-safe: too SHORT to hold all fields -> reject (never OOB); LONGER is fine (>=).
-                       (when (< avail ,fd-size-sym)
-                         (error 'dds.core.buffer:buffer-overflow :need ,fd-size-sym :have avail))
-                       ;; re-confirm XCDR2-LE (PLAIN_CDR2_LE 0x0007, NBO) — never read-in-place a foreign representation.
-                       (unless (and (= (aref src 0) #x00) (= (aref src 1) #x07))
-                         (error 'dds.cdr:cdr-not-implemented
-                                :what (format nil "FlatData ~a: expected PLAIN_CDR2_LE encap id 0x0007, got #x~2,'0x~2,'0x"
-                                              ,tname (aref src 0) (aref src 1))))
-                       ;; 0-per-field-work body copy into the loaned FlatData buffer (header+OPTIONS already there).
-                       (replace dst src :start1 4 :end1 ,fd-size-sym :start2 4 :end2 ,fd-size-sym)
+                       ;; false-REJECT-safe: need >= 4 octets even to read the representation id (never OOB).
+                       (when (< avail 4)
+                         (error 'dds.core.buffer:buffer-overflow :need 4 :have avail))
+                       ;; rep-id NBO at vec[0..1]; classify against +representation-ids+ (§7.6.3.1.2; not from memory).
+                       (let ((id (logior (ash (aref src 0) 8) (aref src 1))))
+                         (multiple-value-bind (kind tmode tendian) (dds.cdr:flatdata-rx-rep-plan id)
+                           (ecase kind
+                             (:native
+                              ;; PLAIN_CDR2_LE (0x0007): read-in-place (0-copy, UNCHANGED) — header+OPTIONS already in TARGET.
+                              (when (< avail ,fd-size-sym)
+                                (error 'dds.core.buffer:buffer-overflow :need ,fd-size-sym :have avail))
+                              (replace dst src :start1 4 :end1 ,fd-size-sym :start2 4 :end2 ,fd-size-sym))
+                             (:transcode
+                              ;; foreign rep: decode the body (struct codec, foreign mode+endianness) then write canonical.
+                              (let ((rc (dds.core.buffer:cursor src-buf :endianness tendian)))
+                                (dds.core.buffer:cursor-set-position rc 4)
+                                (dds.core.buffer:cursor-set-origin rc)
+                                (let ((%st (,des rc tmode)))
+                                  ,@(loop for m in parsed
+                                          collect `(setf (,(fd-acc m) target) (,(acc m) %st))))))
+                             (:reject
+                              (error 'dds.cdr:cdr-not-implemented
+                                     :what (format nil "FlatData ~a: non-transcodable representation id #x~2,'0x~2,'0x (a FINAL fixed-size FlatData type is PLAIN-encapsulated; expected PLAIN_CDR(2)_BE/LE)"
+                                                   ,tname (aref src 0) (aref src 1)))))))
                        target)))
                  (declaim (ftype (function (dds.core.buffer:cursor &optional symbol) dds.core.buffer:octet-buffer)
                                  ,fd-des))

@@ -70,7 +70,8 @@ int main(int argc, char** argv)
     wqos.reliability().kind = RELIABLE_RELIABILITY_QOS;
     wqos.history().kind = KEEP_ALL_HISTORY_QOS;
     wqos.representation().m_value.clear();
-    wqos.representation().m_value.push_back(XCDR2_DATA_REPRESENTATION);   // XCDR2 (PLAIN_CDR2), DDS-XTypes 1.3 §7.6.3.1.1
+    wqos.representation().m_value.push_back(XCDR_DATA_REPRESENTATION);    // XCDR1 (PLAIN_CDR) first = the negotiated rep vs an XCDR1-default reader
+    wqos.representation().m_value.push_back(XCDR2_DATA_REPRESENTATION);   // XCDR2 (PLAIN_CDR2) also offered, DDS-XTypes 1.3 §7.6.3.1.1
     MatchListener listener;
     DataWriter* writer = publisher->create_datawriter(topic, wqos, &listener, StatusMask::all());
     if (writer == nullptr) { std::cerr << "[keyed_flat_pub] writer creation failed\n"; return 1; }

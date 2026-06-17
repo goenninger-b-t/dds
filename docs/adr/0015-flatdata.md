@@ -309,3 +309,52 @@ verification is tracked as the **F1 final gate and is PENDING** — internal byt
 vs our own struct keyhash is proven; live-peer confirmation is the remaining step before this row is fully closed.
 
 **NOT cleared for ship — pending counsel (R6); see the R6 — PATENT GATE section above.**
+
+## FlatData reader transcodes a foreign representation — closing the forward-leg false-REJECT (2026-06-17, WP-FLATDATA-XCDR-TRANSCODE, FR-PF-4 + DDS-XTypes 1.3 §7.6.3.1.2)
+
+The original v1 (and WP-KEYED-FLATDATA) FlatData reader read **only** `PLAIN_CDR2_LE` (0x0007), its
+canonical buffer representation, and **rejected** any other RTPS encapsulation id (false-REJECT-safe —
+it dropped, never mis-read). WP-KEYED-FLATDATA's cross-DDS interop surfaced that this was a real
+forward-leg gap: a conformant RTI Connext / Fast DDS peer defaults to **XCDR1** (the wire showed
+`PLAIN_CDR_LE` 0x0001), so a foreign publisher → our `:flatdata t` subscriber matched but every sample
+was rejected. WP-FLATDATA-XCDR-TRANSCODE **closes that false-REJECT** — the forward-leg limitation
+this ADR's *Keyed FlatData* / *Out of scope* lines flagged is now resolved.
+
+**As-built — decode-then-reserialize via the sibling struct codec (no new codec; DRY).** In
+`deserialize-into-<name>-fd` the SerializedPayload rep-id (`+representation-ids+`, DDS-XTypes 1.3
+§7.6.3.1.2 — read from the table, never hardcoded) selects the path:
+- `0x0007` PLAIN_CDR2_LE → **native read-in-place** (0-copy/0-alloc) — UNCHANGED, the canonical path.
+- `0x0000` PLAIN_CDR_BE / `0x0001` PLAIN_CDR_LE / `0x0006` PLAIN_CDR2_BE → **transcode**: decode the body
+  via the type's sibling `deserialize-<name>` struct codec (mode `:xcdr1`/`:xcdr2` + the cursor endianness
+  from the rep-id — both already implemented), then **re-serialize that struct XCDR2-LE** into the
+  reader's canonical FlatData buffer via the existing serializer. The result is the canonical XCDR2-LE
+  buffer the `<name>-<field>-fd` accessors + `key-hash-<name>-fd` read — so keyhash / per-key instance /
+  view-state / KEEP_LAST compose identically to a native sample (the transcode runs BEFORE the keyhash
+  derivation).
+- PL_CDR(2) / DELIMITED_CDR / XML → the existing clean **reject** (false-REJECT-safe; a FINAL fixed-size
+  FlatData type is PLAIN-encapsulated, so these are not expected for it — rejecting is correct).
+
+**Why decode-then-reserialize, not a byte-swap.** XCDR1 caps alignment at 8 and XCDR2 at 4 (DDS-XTypes
+1.3 §7.4), so an 8-byte scalar sits at a different offset under the two — the transcode is a **re-align +
+byte-swap**, handled naturally by routing through the struct decode + the XCDR2-LE re-serialize. The
+foreign payload is **untrusted**: the struct decode bounds-checks every field against the body extent
+(even at `(safety 0)` — NFR-SEC-POSTURE), and the re-serialize writes exactly the `+size+` FlatData
+layout into the fixed buffer (no overflow); a malformed/short foreign payload → a clean reject, never an
+OOB (fuzzed — `make fuzz`, the transcode foreign-rep decode arm).
+
+**Cost / hot-path.** The transcode is the **foreign-representation FALLBACK** (it allocs the decode +
+the re-serialize) — **off the measured CDR hot path**; the native 0x0007 path is unchanged, so
+`make mem` stays **0.0000** serialize/deserialize/round-trip and **no hot-path number changed → no bench
+warranted** (FR-LANG-7). It benefits ALL FlatData types (keyed and unkeyed) — it is a reader
+*representation* fix, not keyed-specific.
+
+**Interop result.** The keyed-FlatData cross-DDS interop is now LIVE in **both directions** vs RTI
+Connext 7.3.1 + Fast DDS 3.6.1 (the forward leg via the transcode) — see `interop/keyed-flatdata/README.md`
+and `docs/verification.csv` (FR-PF-4 row). **Separate follow-up (NOT this WP):** advertising the reader's
+accepted reps via `PID_DATA_REPRESENTATION` (0x0073) in SEDP + RxO matching — a general
+DATA_REPRESENTATION QoS feature for ALL types that would let a peer PREFER XCDR2 and skip the transcode;
+with the transcode the reader reads any standard rep regardless of what is advertised, so the
+false-REJECT is closed without it (the advertisement is a perf/signaling optimization).
+
+Clean-room from FR-PF-4 + DDS-XTypes 1.3 §7.6.3.1.2/§7.4 + first principles; no new external source
+consulted (provenance: `docs/provenance.md`). **NOT cleared for ship — pending counsel (R6).**

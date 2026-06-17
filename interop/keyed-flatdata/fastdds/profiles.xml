@@ -11,7 +11,6 @@
         <type>UDPv4</type>
         <interfaceWhiteList>
           <address>127.0.0.1</address>
-          <address>192.168.2.148</address>
         </interfaceWhiteList>
       </transport_descriptor>
     </transport_descriptors>

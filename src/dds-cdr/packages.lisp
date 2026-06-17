@@ -12,6 +12,7 @@
     verified byte-exact (FR-CDR-3) — never hardcoded from memory.")
   (:export #:+representation-ids+ #:extensibility-kind #:+zc-encapsulation-id+
            #:representation-id #:representation-id-value #:representation-id-name
+           #:flatdata-rx-rep-plan
            #:make-encapsulation-header #:parse-encapsulation-header
            #:finalize-encapsulation-options
            #:encode-zc-reference #:parse-zc-reference

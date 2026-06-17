@@ -455,6 +455,137 @@
         (dds.pal:free-static mem))))
   t)
 
+;;; ---- WP-FLATDATA-XCDR-TRANSCODE untrusted foreign-rep transcode fuzz (FR-PF-4, NFR-SEC-POSTURE; R6) ----
+;;;; A1 added the FOREIGN-REP transcode in deserialize-into-<name>-fd (dsl.lisp): when a received FlatData
+;;;; SerializedPayload carries a transcodable non-canonical rep-id (PLAIN_CDR_BE 0x0000 / PLAIN_CDR_LE 0x0001 /
+;;;; PLAIN_CDR2_BE 0x0006) the UNTRUSTED foreign body is decoded via the sibling struct codec (deserialize-<name>,
+;;;; mode + endianness from flatdata-rx-rep-plan) then re-written canonical XCDR2-LE. That struct decode walks the
+;;;; foreign body field-by-field; each cdr-get-* bounds-checks against the payload extent via check-room (the
+;;;; cursor-buffer capacity = the EXACT payload length, entities.lisp %deserialize-sample), so a SHORT / TRUNCATED /
+;;;; forged foreign body MUST yield a controlled signal (buffer-overflow / cdr-not-implemented) or a bounded value,
+;;;; NEVER an OOB read — even at (safety 0). This arm makes A1's manual bounds-safety a systematic, repeatable fuzz.
+;;;; The reuse-xcv type (a :i8) (k :i64 :key t) (v :i32) exercises the XCDR1<->XCDR2 8-vs-4 re-alignment in the
+;;;; transcode (i64 @8 in XCDR1, @4 in XCDR2). NOT cleared for ship — pending counsel (R6); see ADR 0015.
+
+(defconstant +fuzz-transcode-slop+ 16 "Max trailing/short octets a transcode-fuzz body may swing past/under +xcv-flatdata-size+.")
+
+(defun* %transcode-fuzz-rep-id (prng i)
+    (function (prng (integer 0)) (unsigned-byte 16))
+  "A 16-bit NBO SerializedPayload rep-id for transcode-fuzz iteration I: cycle the 3 TRANSCODABLE reps
+   (0x0000/0x0001/0x0006) + the native 0x0007 deterministically (so each is hit every iteration-block), then
+   also draw a pure-random 2-octet id (covers non-transcodable -> the clean reject) — fuzzing the rep-id itself."
+  (case (mod i 5)
+    (0 (dds.cdr:representation-id-value :plain-cdr-be))    ; 0x0000 transcode XCDR1 BE
+    (1 (dds.cdr:representation-id-value :plain-cdr-le))    ; 0x0001 transcode XCDR1 LE
+    (2 (dds.cdr:representation-id-value :plain-cdr2-be))   ; 0x0006 transcode XCDR2 BE
+    (3 (dds.cdr:representation-id-value :plain-cdr2-le))   ; 0x0007 native (read-in-place)
+    (t (prng-int prng 0 #xFFFF))))                         ; random id (incl. non-transcodable -> reject)
+
+(defun* %gen-transcode-fuzz-wire (prng i)
+    (function (prng (integer 0)) (simple-array (unsigned-byte 8) (*)))
+  "An adversarial FlatData SerializedPayload (4-octet encap header + body) for the foreign-rep transcode fuzz:
+   a rep-id from %transcode-fuzz-rep-id (the 3 transcodable reps + native + random) NBO at [0..1], options at
+   [2..3], then a body of random octets whose TOTAL length sweeps every edge — sub-4 (cannot read the rep-id),
+   SHORT (< +xcv-flatdata-size+ -> a transcode/native decode MUST hit check-room and reject), EXACT, and LONGER
+   (trailing pad -> a conformant peer payload MUST be accepted, no false-REJECT). The body bytes are random so a
+   transcodable rep decodes to a (bounded, possibly-garbage) value."
+  (let* ((size +xcv-flatdata-size+)
+         (family (prng-int prng 0 4))
+         (n (ecase family
+              (0 (prng-int prng 0 3))                              ; sub-encap-header (< 4 octets)
+              (1 (prng-int prng 4 (max 4 (1- size))))              ; short body (>=4, < +size+)
+              (2 size)                                             ; exact
+              (3 (+ size (prng-int prng 1 +fuzz-transcode-slop+))) ; longer (trailing pad)
+              (4 (prng-int prng 0 (+ size +fuzz-transcode-slop+))))) ; pure-random length
+         (v (make-array n :element-type '(unsigned-byte 8))))
+    (dotimes (j n) (setf (aref v j) (prng-int prng 0 255)))
+    (when (>= n 2)
+      (let ((id (%transcode-fuzz-rep-id prng i)))
+        (setf (aref v 0) (ldb (byte 8 8) id) (aref v 1) (ldb (byte 8 0) id))))
+    v))
+
+(defun* %transcode-fuzz-read-checked (vec)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "Drive the PRODUCTION engine RX (dds.dcps::%deserialize-sample = parse encap header, then the FlatData
+   :deserialize = deserialize-xcv-fd -> deserialize-into-xcv-fd, where A1's foreign-rep transcode lives) over the
+   untrusted payload VEC, then read every -fd accessor on a returned sample and free its buffer. Returns T on a
+   clean accept+in-bounds read, NIL on a CLEANLY-signalled reject (buffer-overflow from the length guard / the
+   struct codec check-room, or cdr-not-implemented from a non-transcodable rep). Any OTHER signalled condition is
+   an uncontrolled low-level error (re-signalled by the caller's handler as a fuzz failure); an OOB would corrupt
+   or crash rather than signal."
+  (let* ((ts (dds.types:find-type-support "xcv"))
+         (sample (handler-case (dds.dcps::%deserialize-sample ts vec)
+                   ((or dds.core.buffer:buffer-overflow dds.cdr:cdr-not-implemented) () nil))))
+    (when sample
+      (unwind-protect
+           (let ((sum (+ (xcv-a-fd sample) (xcv-k-fd sample) (xcv-v-fd sample))))
+             (return-from %transcode-fuzz-read-checked (and (integerp sum) t)))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sample))))
+    nil))
+
+(defun* %transcode-fuzz-read-safety0 (vec)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "The (SAFETY 0) twin of %transcode-fuzz-read-checked. NOTE (FR-LANG-7, honest scope): %deserialize-sample,
+   deserialize-into-xcv-fd and the Offset getters are out-of-line callees compiled once under
+   with-hot-optimizations, so this wrapper's (safety 0) does NOT recompile them — it confirms the WRAPPER code
+   (the encap parse + the accessor reads here) is safety-independent. The kernel's foreign-body decode is
+   safety-independent for a stronger reason: every cdr-get-* bounds-checks via an EXPLICIT check-room
+   (when (< room need) (error 'buffer-overflow ...)) and the length guard is an EXPLICIT manual
+   (when (< avail ...) (error ...)) (dsl.lisp), NOT compiler-inserted array bounds, so they hold under any policy.
+   Returns T on a clean read, NIL on a cleanly-signalled reject; an OOB would corrupt/crash rather than signal."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (let* ((ts (dds.types:find-type-support "xcv"))
+         (sample (handler-case (dds.dcps::%deserialize-sample ts vec)
+                   ((or dds.core.buffer:buffer-overflow dds.cdr:cdr-not-implemented) () nil))))
+    (when sample
+      (unwind-protect
+           (let ((sum (+ (xcv-a-fd sample) (xcv-k-fd sample) (xcv-v-fd sample))))
+             (return-from %transcode-fuzz-read-safety0 (and (integerp sum) t)))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sample))))
+    nil))
+
+(defun* run-flatdata-transcode-fuzz ()
+    (function () t)
+  "Property-based fuzz of A1's UNTRUSTED foreign-rep transcode decode in deserialize-into-<name>-fd
+   (WP-FLATDATA-XCDR-TRANSCODE, FR-PF-4, NFR-SEC-POSTURE; R6, ADR 0015. NOT cleared for ship — pending counsel R6).
+   For the FlatData type xcv (a:i8, k:i64 @key, v:i32 — exercising the XCDR1<->XCDR2 8-vs-4 re-alignment), feed the
+   engine RX a large corpus of SerializedPayloads whose rep-id is one of the 3 TRANSCODABLE reps (PLAIN_CDR_BE
+   0x0000 / PLAIN_CDR_LE 0x0001 / PLAIN_CDR2_BE 0x0006), the native 0x0007, or a pure-random 2-octet id (covering
+   non-transcodable -> clean reject), and whose body is random octets of length sweeping [0, +xcv-flatdata-size+ +
+   slop] (sub-4 / SHORT / EXACT / LONGER). Each case must EITHER decode to a (bounded, possibly-garbage) value (the
+   transcode struct codec + the canonical re-write stay in bounds; the -fd accessors read every field without an
+   OOB) OR signal a CLEAN condition (buffer-overflow from the length guard / the struct codec check-room, or
+   cdr-not-implemented from a non-transcodable rep) — NEVER an OOB / an uncontrolled low-level error. A LONGER
+   (trailing-padded) conformant payload MUST be accepted (the no-false-REJECT rule). A SHORT body under a
+   transcodable/native rep MUST reject (the bounds guard fired). The PRODUCTION-policy arm exercises the manual
+   check-room/length guards directly; a (safety 0) WRAPPER arm additionally confirms the wrapper + accessor reads
+   are safety-independent and reaches the SAME verdict (it does NOT recompile the out-of-line kernel, so it does not
+   by itself prove the kernel's bound at safety 0 — the explicit-manual-check argument does). Deterministic + seeded
+   (reproducible on SBCL + Clasp); N iterations; signals test-failure on any OOB / uncontrolled error / false-REJECT."
+  (let ((prng (make-prng #x7A5C0DE5))
+        (iters 4000)
+        (size +xcv-flatdata-size+))
+    (dotimes (i iters t)
+      (let* ((vec (%gen-transcode-fuzz-wire prng i))
+             (n (length vec))
+             (id (if (>= n 2) (logior (ash (aref vec 0) 8) (aref vec 1)) nil))
+             (prod (handler-case (%transcode-fuzz-read-checked vec)
+                     (error (e) (error 'test-failure :name "flatdata-transcode-fuzz"
+                                       :detail (format nil "iter ~d len ~d id ~a: production transcode signalled an uncontrolled error: ~a" i n id e)))))
+             (s0 (handler-case (%transcode-fuzz-read-safety0 vec)
+                   (error (e) (error 'test-failure :name "flatdata-transcode-fuzz"
+                                     :detail (format nil "iter ~d len ~d id ~a: (safety 0) transcode leaked OOB/error: ~a" i n id e))))))
+        ;; the production-policy and (safety 0)-wrapper arms must reach the same verdict (the wrapper path is safety-independent)
+        (unless (eq (and prod t) (and s0 t))
+          (error 'test-failure :name "flatdata-transcode-fuzz"
+                 :detail (format nil "iter ~d len ~d id ~a: production verdict ~a != (safety 0)-wrapper verdict ~a (a wrapper guard depends on SAFETY)" i n id prod s0)))
+        ;; a transcodable/native rep with a SHORT body (< +size+) MUST reject (the length guard / check-room fired)
+        (multiple-value-bind (kind tmode tendian) (if id (dds.cdr:flatdata-rx-rep-plan id) (values :reject nil nil))
+          (declare (ignore tmode tendian))
+          (when (and id (member kind '(:native :transcode)) (< n size) prod)
+            (error 'test-failure :name "flatdata-transcode-fuzz"
+                   :detail (format nil "iter ~d: SHORT payload (len ~d < ~d) under rep #x~4,'0x (~a) ACCEPTED — bounds guard failed" i n size id kind))))))))
+
 ;;; ---- generators + properties ----
 
 (defun* gsample= (a b)
@@ -637,7 +768,9 @@
     (fuzz-flatdata-wrap)
     ;; WP-FLATDATA-ZC-LOAN untrusted loan-ACQUIRE fuzz: forged slot/generation/len -> NIL or clamped view, never OOB (NFR-SEC-POSTURE, R6)
     (fuzz-flatdata-zc-loan-wrap)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL), deterministic seed.~%" runs)
+    ;; WP-FLATDATA-XCDR-TRANSCODE foreign-rep transcode fuzz: malformed/short/truncated foreign body + random rep-id -> reject/bounded, never OOB at (safety 0) (NFR-SEC-POSTURE, R6)
+    (run-flatdata-transcode-fuzz)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0), deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)
