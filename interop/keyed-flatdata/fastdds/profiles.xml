@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WP-KEYED-FLATDATA Fast DDS harness profile (FR-PF-4): UDPv4 only (observable on lo0/en*, and the
+     COPY/UDP path is what is wire-interoperable — NOT data-sharing/SHMEM, which is the out-of-scope ZC
+     loan path). interfaceWhiteList: EDIT per machine (keep 127.0.0.1 first for same-host loopback runs,
+     which the macOS LAN-UDP firewall does not gate). Mirrors interop/fastdds/shapes/profiles.xml. -->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastDDS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>udp_only</transport_id>
+        <type>UDPv4</type>
+        <interfaceWhiteList>
+          <address>127.0.0.1</address>
+          <address>192.168.2.148</address>
+        </interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="keyed_flat_interop" is_default_profile="true">
+      <rtps>
+        <useBuiltinTransports>false</useBuiltinTransports>
+        <userTransports>
+          <transport_id>udp_only</transport_id>
+        </userTransports>
+        <propertiesPolicy>
+          <properties>
+            <property>
+              <name>fastdds.type_propagation</name>
+              <value>enabled</value>
+            </property>
+          </properties>
+        </propertiesPolicy>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

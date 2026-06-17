@@ -758,30 +758,65 @@
          (eq :keep-last (dds.qos:qos-history-kind qos))
          (dds.qos:qos-history-depth qos))))
 
-(defun* %reader-keeplast-drop-oldest (dr handle depth)
-    (function (data-reader (simple-array (unsigned-byte 8) (16)) (integer 1)) t)
-  "KEEP_LAST per-instance drop (DDS 1.4 §2.2.3.18): if instance HANDLE already holds DEPTH valid-data
-   samples in dr-cache, delete that instance's OLDEST (lowest sequence-number) cached sample so the
-   imminent append keeps the per-instance count at DEPTH. A LOSSY drop by design — the oldest goes
-   regardless of its read/sample-state (distinct from the RESOURCE_LIMITS reject, which stays). Touches
-   ONLY dr-cache (the instance-rec / view-state survive — the instance stays alive across the drop, like
-   take removing a cache entry without forgetting the instance). O(N) cache scan, matching the existing
-   %resource-reject-reason count. Invalid-data instance notifications (sequence-number 0) are not counted.
-   LIMITATION (v1): oldest = min SN is the true age order only for ONE writer per instance; with multiple
-   writers on one instance SNs alias (RTPS 2.5 §8.3.5.4) and the reader has no merged cross-writer order
-   (source-timestamp / DESTINATION_ORDER not implemented), so the dropped sample may not be the globally
-   oldest — lifted when DESTINATION_ORDER lands."
+(defun* %reader-instance-oldest (dr handle releasable-only)
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) t) (values (integer 0) t))
+  "Shared KEEP_LAST scan (DRY for both the copy path %reader-keeplast-drop-oldest and the loan path
+   %reader-keeplast-drop-oldest-loan): one O(N) dr-cache pass returning (values VALID-DATA-COUNT OLDEST) for
+   instance HANDLE, where VALID-DATA-COUNT is ALL valid-data cached samples of the instance (the depth-cap
+   decision, identical on both paths) and OLDEST is the lowest-SN cached sample to drop. When RELEASABLE-ONLY,
+   OLDEST is constrained to a :NOT-READ sample (never one already handed to the app via read-loaned) — the
+   loan-path UAF guard (the SHMEM slot under an app-held loan must NOT be released); else OLDEST is the lowest-SN
+   valid-data sample regardless of read/sample-state (the lossy copy-path drop). Invalid-data notifications
+   (sequence-number 0) are not counted. LIMITATION (v1): oldest = min SN is the true age order only for ONE writer
+   per instance; with multiple writers SNs alias (RTPS 2.5 §8.3.5.4) and the reader has no merged cross-writer
+   order (no source-timestamp / DESTINATION_ORDER) — lifted when DESTINATION_ORDER lands."
   (let ((count 0) (oldest nil) (oldest-sn nil))
-    (dolist (cs (dr-cache dr))
+    (dolist (cs (dr-cache dr) (values count oldest))
       (let ((info (cached-sample-info cs)))
         (when (and (sample-info-valid-data info)
                    (equalp handle (sample-info-instance-handle info)))
-          (incf count)
-          (let ((sn (sample-info-sequence-number info)))
-            (when (or (null oldest-sn) (< sn oldest-sn))
-              (setf oldest-sn sn oldest cs))))))
+          (incf count)                                                  ; cap counts ALL valid-data (both paths)
+          (when (or (not releasable-only) (eq :not-read (sample-info-sample-state info)))
+            (let ((sn (sample-info-sequence-number info)))
+              (when (or (null oldest-sn) (< sn oldest-sn))
+                (setf oldest-sn sn oldest cs)))))))))
+
+(defun* %reader-keeplast-drop-oldest (dr handle depth)
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) (integer 1)) t)
+  "KEEP_LAST per-instance drop, COPY path (DDS 1.4 §2.2.3.18): if instance HANDLE already holds DEPTH valid-data
+   samples in dr-cache, delete that instance's OLDEST (lowest sequence-number) cached sample so the imminent
+   append keeps the per-instance count at DEPTH. A LOSSY drop by design — the oldest goes regardless of its
+   read/sample-state (distinct from the RESOURCE_LIMITS reject, which stays); safe because a copy-path sample's
+   data is a heap struct, NOT a SHMEM-slot loan (so dropping a read-but-held copy frees nothing the app aliases —
+   the loan path is %reader-keeplast-drop-oldest-loan). Touches ONLY dr-cache (the instance-rec / view-state
+   survive — the instance stays alive across the drop, like take removing a cache entry without forgetting the
+   instance). O(N) cache scan via %reader-instance-oldest (DRY), matching the existing %resource-reject count."
+  (multiple-value-bind (count oldest) (%reader-instance-oldest dr handle nil)
     (when (and (>= count depth) oldest)
       (setf (dr-cache dr) (delete oldest (dr-cache dr) :test #'eq))))
+  t)
+
+(defun* %reader-keeplast-drop-oldest-loan (dr handle depth)
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) (integer 1)) t)
+  "KEEP_LAST per-instance drop, ZC LOAN path (DDS 1.4 §2.2.3.18; WP-KEYED-FLATDATA, ADR 0017, R6; NOT cleared for
+   ship — pending counsel). The loan-aware sibling of %reader-keeplast-drop-oldest: a dropped loaned sample's data
+   is a flatdata-view that (a) is registered in the loan registry dr-loans and (b) holds a ZC pool slot at
+   refcount>0; a bare dr-cache delete (the copy-path mutation) would orphan the view — gone from dr-cache (so the
+   app can never return-loan it) yet still in dr-loans pinning the slot → a slot LEAK until reader-close → ZC pool
+   exhaustion (NFR-MEM / NFR-SEC-POSTURE). So the evicted view gets the FULL return-loan teardown: invalidate the
+   dr-cache entry + %zc-release the slot + drop it from dr-loans + recycle the view (return-loan does all four
+   idempotently — so we do NOT also delete). UAF GUARD: KEEP_LAST drops the instance's OLDEST, but read-loaned is
+   non-destructive (it LEAVES :READ samples in dr-cache and hands their views to the app), so the oldest could be a
+   view the app still holds — releasing its slot would be a use-after-free for the app's in-place read. We therefore
+   constrain the candidate to a :NOT-READ view (RELEASABLE-ONLY t): never release a sample already delivered to the
+   app (a take-loaned sample is gone from dr-cache entirely, so this only ever differs from the copy path for a
+   read-loaned-but-not-returned view). If every over-depth sample is app-held (no :NOT-READ candidate), nothing is
+   released and the new sample appends — a transient over-depth the app resolves by return-loan, the only
+   memory-safe choice under the ZC loan contract (the slot is pinned until the app returns it). The depth cap counts
+   ALL valid-data (matching the copy path); only the drop is guarded. O(N) scan via %reader-instance-oldest (DRY)."
+  (multiple-value-bind (count oldest) (%reader-instance-oldest dr handle t)
+    (when (and (>= count depth) oldest)
+      (return-loan dr (list (cached-sample-data oldest)))))            ; full teardown (release slot + drop dr-loans + recycle); UAF-safe: oldest is :not-read
   t)
 
 (defun* %guid> (a b)
@@ -935,16 +970,20 @@
 
 (defun* %loan-instance-handle (ts view sn sguid)
     (function (t dds.types:flatdata-view integer t) (simple-array (unsigned-byte 8) (16)))
-  "WP-FLATDATA-ZC-LOAN (R6, ADR 0017): a 16-octet NON-ALIASING instance handle for a loaned FlatData VIEW.
-   v1 derives a per-source-per-sample handle: low 8 octets = the RTPS SN; high 8 octets = an FNV-1a fold of the
-   source writer's 16-octet GUID (SGUID). Folding the GUID de-aliases two co-located writers — each SN-stream
-   restarts at 1, so SN alone (the earlier v1) would collide their handles and flip a NEW/NOT_NEW view-state
-   (cosmetic for NO_KEY, but the handle must still be unique per source, §8.3.5.4: SN is per-writer). When SGUID
-   is NIL (an un-attributed sample) the fold is the FNV-1a basis, so the handle still differs from any GUID-bearing
-   writer's. The literal-0-copy loan path keeps the sample's keyhash out of the hot loop; per-key instance
-   coalescing over the view's SAP keyhash is a follow-up (NO_KEY v1 scope). TS/VIEW reserved for that follow-up.
-   NOT cleared for ship — pending counsel (R6)."
-  (declare (ignore ts view))
+  "WP-FLATDATA-ZC-LOAN (R6, ADR 0017): a 16-octet instance handle for a loaned FlatData VIEW. WP-KEYED-FLATDATA:
+   for a KEYED FlatData type (TS's key-hash non-NIL) this is the REAL per-key keyhash — key-hash-<name>-fd reads
+   the @key members straight off the loaned VIEW (the -fd accessors dual-dispatch view/buffer) and serializes them
+   big-endian (RTPS 2.5 §9.6.4.8), byte-identical to what a non-FlatData peer computes — so two same-key samples
+   share one handle (no SN-fold aliasing), enabling correct NEW/NOT_NEW view-state + per-instance KEEP_LAST. For a
+   NO_KEY type (key-hash NIL) it keeps the synthetic NON-ALIASING handle: low 8 octets = the RTPS SN; high 8 octets
+   = an FNV-1a fold of the source writer's 16-octet GUID (SGUID). Folding the GUID de-aliases two co-located writers
+   — each SN-stream restarts at 1, so SN alone (the earlier v1) would collide their handles and flip a NEW/NOT_NEW
+   view-state (cosmetic for NO_KEY, but the handle must still be unique per source, §8.3.5.4: SN is per-writer).
+   When SGUID is NIL (an un-attributed sample) the fold is the FNV-1a basis, so the handle still differs from any
+   GUID-bearing writer's. Same 16-octet alloc on either branch — no 0-alloc regression (make mem measures the CDR
+   path, not this DCPS loan-handle). NOT cleared for ship — pending counsel (R6)."
+  (let ((kh (dds.types:type-support-key-hash ts)))
+    (when kh (return-from %loan-instance-handle (funcall kh view))))   ; keyed: the real per-key keyhash off the view (RTPS 2.5 §9.6.4.8)
   (let ((h (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
         (fold 14695981039346656037))                                   ; FNV-1a 64-bit offset basis
     (when (typep sguid '(array (unsigned-byte 8) (*)))
@@ -973,11 +1012,12 @@
     (let ((min (%flatdata-size ts)))
       (when (and pool-sap (or (null min) (>= payload-len min)))   ; stale/forged/short -> drop (best-effort)
         (let* ((view (%loan-view dr pool-sap (+ payload-base 4) (max 0 (- payload-len 4)) slot gen))
-               (handle (%loan-instance-handle ts view sn sguid))       ; fold the source GUID -> non-aliasing handle
+               (handle (%loan-instance-handle ts view sn sguid))       ; keyed: real per-key keyhash off the view; NO_KEY: SN+GUID fold
                (rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer
                                                         (dp-node (sub-participant (dr-subscriber dr))) key))))
           (push view (dr-loans dr))                                ; register BEFORE delivery (reader-close safety)
-          ;; no KEEP_LAST per-instance drop here: ZC loan handles are per-(GUID,SN)-unique (NO_KEY FlatData v1) so the cap never fires; revisit for keyed FlatData (WP-3b)
+          (let ((depth (%reader-keeplast-depth dr)))
+            (when depth (%reader-keeplast-drop-oldest-loan dr handle depth)))   ; KEEP_LAST per-instance drop, LOAN-aware: releases the evicted view's loan, not a bare delete (DDS 1.4 §2.2.3.18); UAF-guarded (never an app-held :read view); for NO_KEY FlatData the per-(GUID,SN)-unique handle means the cap never fires
           (setf (dr-cache dr)
                 (nconc (dr-cache dr)
                        (list (make-cached-sample

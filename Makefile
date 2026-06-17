@@ -11,8 +11,8 @@ LISP  ?= $(CLASP)
 .PHONY: all build test build-clasp build-sbcl test-clasp test-sbcl \
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
-        nokey-pub nokey-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-zc-loan-lockfree bench-async-flow bench-keeplast shmem-xproc zc-xproc mem sbom hooks clean
+        nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-zc-loan-lockfree bench-async-flow bench-keeplast shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -25,6 +25,8 @@ SECONDS  ?= 20
 TYPENAME  ?= C_Shape
 LOCALTYPE ?= shape-type
 COUNT    ?= 0
+KEYS     ?= 3
+DISPOSE_AFTER ?= 0
 LATSAMPLES  ?= 10000
 THRUSAMPLES ?= 20000
 KLSAMPLES   ?= 1000000
@@ -136,6 +138,19 @@ nokey-sub:
 	        --eval '(uiop:symbol-call :dds.shapes :run-nokey-subscriber :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)")' \
 	        --eval '(uiop:quit 0)'
 
+# WP-KEYED-FLATDATA cross-DDS interop live harness (FR-PF-4, RTPS 2.5 §9.6.4.8; interop/keyed-flatdata).
+# DCPS COPY/UDP path (NO ZeroCopy) of the keyed FlatData type keyed-flat (i32 @key id; i32 x; i32 y); the
+# foreign peers are interop/keyed-flatdata/{connext,fastdds}. KEYS=N keys, DISPOSE_AFTER=N dispose-by-key.
+keyed-flat-pub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-keyed-flat-publisher :domain $(DOMAIN) :count $(COUNT) :keys $(KEYS) :dispose-after $(DISPOSE_AFTER) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)")' \
+	        --eval '(uiop:quit 0)'
+
+keyed-flat-sub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-keyed-flat-subscriber :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)")' \
+	        --eval '(uiop:quit 0)'
+
 # Fast DDS interop peers (interop/fastdds/README.md). FASTDDS_PREFIX via with-fastdds.sh;
 # the apps read profiles.xml from their cwd. COUNT=0 / SECONDS=0 = run forever.
 fastdds-pub:
@@ -155,6 +170,15 @@ fastdds-tl-probe:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-typelookup-probe :domain $(DOMAIN) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
 	        --eval '(uiop:quit 0)'
+
+# WP-KEYED-FLATDATA Fast DDS interop peers (interop/keyed-flatdata/fastdds; FR-PF-4). FASTDDS_PREFIX via
+# with-fastdds.sh; the apps read profiles.xml from their cwd. Owner-run leg. KEYS=N keys, COUNT=0/SECONDS=0
+# = forever; DISPOSE_AFTER=N (env) on the pub disposes each key by key (dispose DATA carries PID_KEY_HASH).
+fastdds-keyed-flat-pub:
+	./scripts/with-fastdds.sh bash -c 'cd interop/keyed-flatdata/fastdds && ./keyed_flat_pub $(COUNT) $(KEYS)'
+
+fastdds-keyed-flat-sub:
+	./scripts/with-fastdds.sh bash -c 'cd interop/keyed-flatdata/fastdds && ./keyed_flat_sub $(SECONDS)'
 
 interop: wire
 	@echo "interop: 'wire' validates our output vs the tshark RTPS dissector."

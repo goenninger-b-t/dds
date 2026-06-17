@@ -1,0 +1,31 @@
+# WP-KEYED-FLATDATA interop harness ignores. Connext rtiddsgen output is produced at build time and
+# git-ignored (clean-room); Fast DDS fastddsgen output under fastdds/gen/ is COMMITTED verbatim
+# (Apache-2.0; see README.md + docs/provenance.md), only its executables are ignored.
+
+# Connext rtiddsgen-generated type support (clean-room: build-time, never committed)
+connext/KeyedFlat.hpp
+connext/KeyedFlat.cxx
+connext/KeyedFlatPlugin.hpp
+connext/KeyedFlatPlugin.cxx
+connext/*.idl.*
+connext/.gen.stamp
+
+# build artifacts
+*.o
+*.so
+*.dylib
+
+# the built executables
+connext/keyed_flat_pub
+connext/keyed_flat_sub
+fastdds/keyed_flat_pub
+fastdds/keyed_flat_sub
+
+# transient capture/decode artifacts (the archived proof pcaps under captures/ are kept)
+decode.txt
+decode.err
+tshark.err
+*.out
+!captures/
+!captures/*.pcap
+!captures/*.log

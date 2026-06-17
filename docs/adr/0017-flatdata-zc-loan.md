@@ -248,7 +248,7 @@ The **scope-B follow-ups** (deferred) are listed below.
 - **Loan-leak detection / max-loan-age / a hard loan cap** — v1 degrades gracefully to non-ZC; active leak
   management is later.
 - **Variable-size / Builder FlatData over ZC** (FlatData v1 is FINAL fixed-size; that restriction stands);
-  keyed FlatData (v1 is NO_KEY only).
+  keyed FlatData with a variable-size/string `@key` (fixed-size scalar `@key` is now supported — WP-KEYED-FLATDATA).
 - **Clasp ZC** (NFR-PORT gap — UDP, no ZC, no loan).
 - **Lock-free / 0-alloc loan acquire.** The loaned RX path's residual ~31 GC-bytes/sample is the CFFI
   pool-mutex (`pthread_mutex_lock`) cost — payload-independent, and the v1 single-copy pays it too. Because a

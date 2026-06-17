@@ -642,8 +642,8 @@ affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and fore
   sample-pool + 16-byte-reference passing for large same-host samples, behind `dds.disc:*zerocopy-enabled*`
   (default `NIL`) and **NOT cleared for ship pending counsel (R6, ADR 0014)**. See
   [Zero-Copy over SHMEM](#zero-copy-over-shmem-wp-zerocopy--default-off-r6-patent-gated) above.
-- **Landed (gated, default-OFF):** FlatData-equivalent for FINAL fixed-size **NO_KEY** types (WP-FLATDATA,
-  FR-PF-4, ADR 0015; a `@key` member is a compile-time error in v1) — in-memory == XCDR2 wire, Offset accessors,
+- **Landed (gated, default-OFF):** FlatData-equivalent for FINAL fixed-size scalar types (WP-FLATDATA,
+  FR-PF-4, ADR 0015; keyed FlatData for fixed-size scalar `@key` is supported — WP-KEYED-FLATDATA; a variable-size/string `@key` is still a compile-time error in v1) — in-memory == XCDR2 wire, Offset accessors,
   identity serialize (0-alloc TX), a SAFE SINGLE-COPY RX over Zero-Copy for non-loan readers (~830x less RX GC
   than the v1 sink+re-copy), and — for a loan-capable `:flatdata` reader — **literal-0-copy RX via the DCPS
   loan/return_loan API** (WP-FLATDATA-ZC-LOAN, ADR 0017: `take-loaned`/`read-loaned` hand a `flatdata-view` read
@@ -654,7 +654,7 @@ affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and fore
   → 0`, `make bench-zc-loan-lockfree`; honest tradeoff: the writer's loan lost its O(1) freelist-pop for an
   O(slots) `refcount==0` scan, ~106 ns/loan at 2 slots → ~1801 ns at 128, benched at Phase C — the reader RX is
   the win, the writer pays a small bounded scan; a lock-free freelist to restore O(1) is a noted follow-up).
-  **NOT cleared for ship pending counsel (R6).** See the [type system wiki](type-system.md#8-flatdata--flatdata-t-offset-accessors-final-fixed-size-no_key-v1-r6-not-cleared-for-ship). The untrusted wrap/read + ZC resolve clamp
+  **NOT cleared for ship pending counsel (R6).** See the [type system wiki](type-system.md#8-flatdata--flatdata-t-offset-accessors-final-fixed-size-r6-not-cleared-for-ship). The untrusted wrap/read + ZC resolve clamp
   are fuzzed (`make fuzz`). **Reliable ZC loan delivery is verified + hardened (WP-RELIABLE-ZC scope A, ADR
   0017):** a ZC loan sample on a RELIABLE writer rides the existing reliable path with no separate reliability
   gate; the **reader-RX 0-copy/0-alloc + the 16-byte wire reference are the ZC win**, and the **loan composes

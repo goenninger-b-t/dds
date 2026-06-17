@@ -165,6 +165,7 @@
          (sszi (%sym pkg "%SSIZE-" (string name)))
          (dnto (%sym pkg "DESERIALIZE-INTO-" (string name)))
          (khf  (%sym pkg "KEY-HASH-" (string name)))
+         (khf-fd (%sym pkg "KEY-HASH-" (string name) "-FD"))
          (keys (remove-if-not (lambda (m) (getf m :key)) parsed))
          (keymax (%key-max-size keys))
          (key-direct-p (and (integerp keymax) (<= keymax 16)))
@@ -178,17 +179,13 @@
          (tname (string-downcase (string name))))
     (unless (eq ext :final)
       (error "define-dds-type: only :final extensibility is supported in v1 (got ~s)" ext))
-    ;; FlatData v1 gate: :flatdata t requires every member to be a fixed-size scalar (FR-PF-4, ADR 0015)
+    ;; FlatData v1 gate: :flatdata t requires every member to be a fixed-size scalar (FR-PF-4, ADR 0015).
+    ;; This already constrains @key members to fixed-size scalars (WP-KEYED-FLATDATA): a string/sequence/
+    ;; variable-size @key still errors here; the keyhash is read from the buffer via key-hash-<name>-fd below.
     (when (getf options :flatdata)
       (when (some (lambda (m) (or (getf m :var) (not (eq (getf m :kind) :scalar)))) parsed)
         (error "define-dds-type: :flatdata v1 requires FINAL + fixed-size scalar members (no string/sequence/nested/variable); got ~s"
-               (find-if (lambda (m) (or (getf m :var) (not (eq (getf m :kind) :scalar)))) parsed)))
-      ;; FlatData v1 is NO_KEY only: the FlatData sample is the octet-buffer, but the keyhash/instance path
-      ;; (%instance-handle -> key-hash-<name>) reads keys from a <name> STRUCT. A keyed-FlatData keyhash that
-      ;; reads keys from the buffer at the key offsets is a follow-up (Phase C report flag), so reject @key here.
-      (when keys
-        (error "define-dds-type: :flatdata v1 is NO_KEY only (the FlatData sample is the octet-buffer, not a struct, so the @key/keyhash path cannot read it); got @key member(s) ~s"
-               (mapcar (lambda (m) (getf m :slot)) keys))))
+               (find-if (lambda (m) (or (getf m :var) (not (eq (getf m :kind) :scalar)))) parsed))))
     (when (some (lambda (m) (not (eq (getf m :kind) :scalar))) keys)
       (error "define-dds-type: only scalar/string @key members are supported in v1"))
     (multiple-value-bind (fd-offs fd-body) (when flatp (%flatdata-offsets parsed))
@@ -322,6 +319,34 @@
                                  (let ((vec (dds.core.buffer:octet-buffer-vec buf)))
                                    (declare (type (simple-array (unsigned-byte 8) (*)) vec))
                                    ,(%flatdata-setter-form 'vec base nbytes bool-p 'v)))))))
+                 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015/0017.
+                 ,@(when keys
+                     `((declaim (ftype (function ((or dds.core.buffer:octet-buffer dds.types:flatdata-view))
+                                                 (simple-array (unsigned-byte 8) (16)))
+                                       ,khf-fd))
+                       (defun ,khf-fd (x)
+                         ,(format nil "WP-KEYED-FLATDATA 16-octet DDS keyhash / instance handle (RTPS 2.5 §9.6.4.8, ~
+                           FR-TYPE-5) for a KEYED FlatData type — read directly from the FlatData SAMPLE X (an owned ~
+                           octet-buffer OR a flatdata-view, via the dual-dispatching <name>-<field>-fd accessors), not ~
+                           a struct. The @key members in member order, PLAIN_CDR2 (XCDR2) big-endian, no ~
+                           encapsulation/type/member headers, origin-0 (4-aligned); key holder max serialized size = ~
+                           ~a -> ~a path. Byte-identical to the struct key-hash-<name> for the same key values (the ~
+                           conformance crux: a keyed FlatData instance's identity equals what a non-FlatData peer ~
+                           computes). NOT cleared for ship — pending counsel (R6); see ADR 0015/0017."
+                                  (if (integerp keymax) keymax :unbounded)
+                                  (if key-direct-p "<=16 direct/zero-padded" "MD5"))
+                         (let ((buf (dds.core.buffer:make-octet-buffer 256))
+                               (out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+                           (let ((wc (dds.core.buffer:cursor buf :endianness :big)))
+                             ,@(loop for m in keys
+                                     collect `(,(getf m :put) wc (,(fd-acc m) x) :xcdr2))
+                             (let ((len (dds.core.buffer:cursor-position wc))
+                                   (vec (dds.core.buffer:octet-buffer-vec buf)))
+                               ,(if key-direct-p
+                                    `(replace out vec :end2 len)
+                                    `(replace out (dds.core.md5:md5 (subseq vec 0 len))))))
+                           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
+                           out))))
                  (declaim (ftype (function () dds.core.buffer:octet-buffer) ,fd-ctor))
                  (defun ,fd-ctor ()
                    ,(format nil "WP-FLATDATA constructor: allocate a ~a-octet foreign octet-buffer (the sample IS ~
@@ -421,11 +446,13 @@
              ;; WP-FLATDATA: for a :flatdata type the engine's vtable funcalls the FlatData serialize=identity /
              ;; deserialize=read-in-place / constant serialized-size instead of the classic per-field codecs
              ;; (the engine hot path is unchanged — only these pointers swap); the classic ser/des/ssz stay
-             ;; emitted for interop/non-FlatData use. NO_KEY only in v1 (gated above), so no key-hash. (R6, ADR 0015.)
+             ;; emitted for interop/non-FlatData use. WP-KEYED-FLATDATA: a keyed FlatData type binds :key-hash to
+             ;; the buffer-reading key-hash-<name>-fd (the FlatData sample is the octet-buffer/view, not a struct);
+             ;; a keyed non-FlatData type keeps the struct key-hash-<name>. (R6, ADR 0015/0017.)
              :serialize (function ,(if flatp fd-ser ser))
              :deserialize (function ,(if flatp fd-des des))
              :serialized-size (function ,(if flatp fd-ssz ssz))
-             :key-hash ,(when keys `(function ,khf))
+             :key-hash ,(when keys `(function ,(if flatp khf-fd khf)))
              :sample-pool-alloc (lambda () (dds.types:sample-pool-acquire %pool))
              :sample-pool-free (lambda (s) (dds.types:sample-pool-release %pool s))
              ;; WP-FLATDATA fixed-size layout (FR-PF-4, ADR 0015; R6); NIL for non-FlatData types.

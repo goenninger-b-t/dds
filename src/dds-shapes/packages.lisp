@@ -20,11 +20,14 @@
            #:shape-mismatch #:make-shape-mismatch
            #:shape-mismatch-color #:shape-mismatch-x #:shape-mismatch-y #:shape-mismatch-shapesize
            #:nokey-data #:make-nokey-data #:nokey-data-a #:nokey-data-b
+           #:keyed-flat #:make-keyed-flat-flatdata
+           #:keyed-flat-id-fd #:keyed-flat-x-fd #:keyed-flat-y-fd #:key-hash-keyed-flat-fd
            #:run-publisher #:run-subscriber #:run-spy
            #:run-large-publisher #:run-large-subscriber
            #:run-gated-subscriber
            #:run-corpus-capture-subscriber
            #:run-typelookup-probe
            #:run-nokey-publisher #:run-nokey-subscriber
+           #:run-keyed-flat-publisher #:run-keyed-flat-subscriber
            #:run-shmem-xproc-pub #:run-shmem-xproc-sub
            #:run-zc-xproc-pub #:run-zc-xproc-sub))

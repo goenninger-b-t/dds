@@ -206,6 +206,28 @@ Still provisional: the unexercised serialization-VM edges (unions, MUTABLE struc
   restored + re-proven). The CONFIRM-VS-PEER walk is closed: 5 of 6 items peer-confirmed;
   the non-OK Return-arm omission stays self-pinned. ADR 0012 records the feature, the three
   peer findings, and the two own-stack fixes.
+- **Keyed FlatData cross-DDS interop (WP-KEYED-FLATDATA F1, FR-PF-4, RTPS 2.5 §9.6.4.8;
+  [`interop/keyed-flatdata/`](../../interop/keyed-flatdata/))** — the per-feature DoD gate
+  (owner directive 2026-06-17: every feature verifies interop with both RTI Connext **and**
+  Fast DDS). The conformance crux is the **keyhash / per-key instance identity** on the
+  **UDP/copy path** (the same-host Zero-Copy loan path is not wire-interoperable, out of scope).
+  The shared type is `KeyedFlat { @key long id; long x; long y; }` (== this stack's
+  `keyed-flat`); our side is `make keyed-flat-pub` / `keyed-flat-sub`. An offline cross-impl
+  test (`keyed-flat-interop-keyhash`) asserts our `key-hash-keyed-flat-fd` equals an
+  **independently-derived** standards-conformant peer keyhash (RTPS 2.5 §9.6.4.8) — green both
+  impls. **Connext 7.3.1: PASS, live in-session (2026-06-17, loopback)** — our keyed FlatData
+  publisher → a Connext subscriber that grouped 30/30 samples into exactly **3 per-key
+  instances** with the keyhash `00000000…`/`00000001…`/`00000002…` **byte-identical to ours**
+  (the crux proven on the wire), and our **dispose-by-key** resolved to the correct instance on
+  Connext; tshark confirms our user DATA is `CDR2_LE (0x0007)` with the i32 `@key` in the
+  payload (no `PID_KEY_HASH` on alive DATA) and the dispose DATA carries
+  `PID_KEY_HASH (0x0070)` + `PID_STATUS_INFO (0x0071) Disposed`
+  (`interop/keyed-flatdata/captures/`). **Fast DDS: owner-pending** — built peer apps +
+  the `fastddsgen` step + `make fastdds-keyed-flat-pub/sub` + the expected per-key keyhash
+  result are handed over (the toolchain lives in the owner's environment). A documented
+  forward-leg limitation (our XCDR2-LE-only FlatData read-in-place reader **rejects**, never
+  mis-reads, a foreign XCDR1/BE payload; the follow-up advertises `PID_DATA_REPRESENTATION =
+  XCDR2` and/or transcodes) is a conformance follow-up, **not** a keyhash defect.
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

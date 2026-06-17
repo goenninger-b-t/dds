@@ -1493,3 +1493,64 @@ spec only** — **no RTI Connext source, headers, or `rtiddsgen` output** was co
   `keeplast-reliability-composition`), the keyhash-threading test (`keeplast-keyhash-threaded`), and the
   honest write-path bench (`run-keeplast-bench`) — 226 green SBCL + Clasp — none of which consult any
   vendor artifact.
+
+## M5 (2026-06-17) — WP-KEYED-FLATDATA keyed FlatData / the buffer-reading keyhash (FR-PF-4 + FR-TYPE-5, RTPS 2.5 §9.6.4.8, ADR 0015)
+
+- WP-KEYED-FLATDATA — lifting FlatData v1's NO_KEY restriction for **fixed-size scalar `@key` members**
+  (the buffer-reading keyhash `key-hash-<name>-fd` emitted by `define-dds-type` in `src/dds-gen/dsl.lisp`,
+  its `type-support` wiring `:keyed-p t` + `:key-hash`, the real per-key `%loan-instance-handle` + the
+  loan-path per-instance KEEP_LAST drop in `%drain-one-loan` in `src/dds-dcps/entities.lisp`, and the
+  internal tests in `src/dds-tests/{rtps-test,integration-test}.lisp`) — is **clean-room from OMG DDSI-RTPS
+  2.5 §9.6.4.8 (KeyHash) + OMG DDS 1.4 §2.2.2.5 (instance lifecycle) / §2.2.3.18 (KEEP_LAST) + DDS-XTypes
+  1.3 §7.6.3 (XCDR2 FINAL fixed-size layout) + the in-repo WP-KEYED-FLATDATA design spec only** — **no RTI
+  Connext source, headers, or `rtiddsgen` output** was consulted.
+- **Sources consulted**: the operating contract §4 (FR-PF-4, FR-TYPE-5); the in-repo design spec
+  `docs/superpowers/specs/2026-06-17-wp-keyed-flatdata-design.md` + plan
+  `docs/superpowers/plans/2026-06-17-wp-keyed-flatdata.md`; DDSI-RTPS 2.5 §9.6.4.8 (the 16-octet instance
+  KeyHash — the key members in member order to a big-endian XCDR2 cursor, ≤16 → zero-padded direct / >16 →
+  MD5 of the bytes); ADR 0015 (the FlatData v1 NO_KEY deviation, now closed). The keyhash REUSES this
+  project's own existing `key-hash-<name>` struct-keyhash serialization (itself derived clean-room from
+  §9.6.4.8) — only the value source changed (the `<name>-<field>-fd` Offset accessor reading the LE buffer
+  in place, vs the struct slot accessor); no new wire rule was derived, and no constant was taken from memory.
+  Byte-exactness is established against a hand-computed §9.6.4.8 vector AND against our own struct keyhash for
+  the same key values (`run-keyed-flatdata-keyhash-test`), not from any RTI artifact.
+- **R6 — patent-gated** (rides the FlatData / Zero-Copy line): built behind `:flatdata t` + (for the loan
+  path) `dds.disc:*zerocopy-enabled*` (default OFF) + the `NOT cleared for ship — pending counsel (R6); see
+  ADR 0015/0017` marker on the new codegen. The copy/wire path is both-impl; the loan path is SBCL-only
+  (ZC is an NFR-PORT gap on Clasp, ADR 0013).
+- **No Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) / OpenDDS source was read** for this work package.
+- Validated by the keyhash byte-exact test (`keyed-flatdata-keyhash` — the ≤16 direct + >16 MD5 paths, both
+  cross-checked vs the struct keyhash; the variable-size `@key` compile-error preserved) and the keyed
+  behavior tests (`keyed-flatdata-loan-handle`, `keyed-flatdata-loan-keeplast`, `keyed-flatdata-copy-behavior`,
+  `keyed-flatdata-dispose`) — 231 green SBCL + Clasp (the SBCL-only ZC loan tests pass-skip on Clasp) — none
+  of which consult any vendor artifact. The cross-DDS interop verification vs RTI Connext + Fast DDS (the
+  keyhash/instance-identity on the wire) is the **pending F1 final gate** per the 2026-06-17 per-feature DoD.
+
+## M5 (2026-06-17) — WP-KEYED-FLATDATA F1 cross-DDS interop harness (`interop/keyed-flatdata/`, FR-PF-4, RTPS 2.5 §9.6.4.8)
+
+- The F1 cross-DDS interop gate for keyed FlatData: a shared `KeyedFlat.idl` (`struct KeyedFlat { @key long
+  id; long x; long y; }`, defined to match this stack's `keyed-flat` type), Connext + Fast DDS peer apps, an
+  our-side DCPS COPY/UDP harness (`dds.shapes:run-keyed-flat-{publisher,subscriber}`), `make` run targets, and
+  an extended offline keyhash conformance test (`keyed-flat-interop-keyhash`, `src/dds-tests/rtps-test.lisp`)
+  whose expected peer keyhash is **derived from first principles** (`%expected-i32-keyhash`, RTPS 2.5 §9.6.4.8),
+  not from this project's serializer.
+- **RTI Connext 7.3.1 — behavioural reference via interop only** (REQUIREMENTS §8, FR-IO-1, NFR-IP). The
+  Connext apps (`interop/keyed-flatdata/connext/keyed_flat_{pub,sub}.cxx`) are built **against the RTI Connext
+  public Modern C++ API + our own `KeyedFlat.idl`**; the `rtiddsgen` output (`KeyedFlat.{hpp,cxx}`,
+  `KeyedFlatPlugin.{hpp,cxx}`) is produced at build time and **git-ignored** (`.gitignore`) — **never
+  committed; no Connext source, headers, or generated code is copied** into any hand-written file. Built + run
+  live in-session: the REVERSE leg (our pub → Connext sub) confirmed Connext computes the SAME per-key 16-octet
+  instance keyhash for our keyed FlatData samples as our offline test pins (`00000000…`/`00000001…`/`00000002…`
+  for id 0/1/2), and dispose-by-key resolved to the correct instance. Archived loopback pcap
+  `captures/kflat-reverse-loopback.pcap`. (Forward-leg representation limitation documented in the README — a
+  conformance follow-up, not an IP matter.)
+- **eProsima Fast DDS — `fastddsgen` output committed verbatim by the owner once generated (Apache-2.0).** The Fast DDS peer apps
+  (`interop/keyed-flatdata/fastdds/keyed_flat_{pub,sub}.cpp`) are built against the Fast DDS **public API** +
+  our `KeyedFlat.idl`; the `fastddsgen`-generated type support under `fastdds/gen/` is to be **committed verbatim by the owner once generated** (only `fastdds/gen/GENERATE.md`, the generation step, is committed here — the toolchain is owner-side)
+  (Apache-2.0 output of the pinned generator — Fast-DDS-Gen v4.3.0, the pin in `interop/fastdds/README.md`),
+  the same convention as `interop/fastdds/shapes/gen/`. **No Fast DDS source is copied** into the hand-written
+  harness files. This leg is **owner-run** (the Fast DDS toolchain lives only in the owner's environment via
+  `scripts/with-fastdds.sh`); the harness ships with the generation step (`fastdds/gen/GENERATE.md`), `make`
+  targets, run commands, and the expected result in `interop/keyed-flatdata/README.md`.
+- The keyhash + the dispose `PID_KEY_HASH`/`PID_STATUS_INFO` wire forms are pinned from OMG DDSI-RTPS 2.5
+  §9.6.4.8 / §9.6.4.9; no constant was taken from memory or from any vendor artifact.

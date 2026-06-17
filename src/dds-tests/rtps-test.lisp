@@ -1578,3 +1578,156 @@
                                (equalp kh gkh) (= sflags dds.rtps.message:+statusinfo-disposed+))
                           "repaired dispose DATA: no payload, :dispose, key-hash + Disposed")))))))))
   t)
+
+;;; WP-KEYED-FLATDATA: keyed FlatData keyhash byte-exactness (FR-PF-4, RTPS 2.5 §9.6.4.8). Lifting the
+;;; FlatData NO_KEY restriction (fixed-size scalar @key only) emits key-hash-<name>-fd, a buffer-reading
+;;; BE keyhash byte-identical to the spec keyhash. A <=16 direct/zero-padded key (one i32) and a >16 MD5
+;;; key (three i64) are both pinned; the -fd value source is the in-place -fd accessor, so it equals the
+;;; struct key-hash-<name> for the same values. NOT cleared for ship — pending counsel (R6); see ADR 0015/0017.
+(dds.gen:define-dds-type keyed-fd-i32 (:flatdata t)
+  (k :i32 :key t) (v :i32))
+
+(dds.gen:define-dds-type keyed-fd-md5 (:flatdata t)
+  (k1 :i64 :key t) (k2 :i64 :key t) (k3 :i64 :key t) (v :i32))
+
+;; WP-KEYED-FLATDATA cross-DDS interop type, byte-identical to dds.shapes:keyed-flat and to the foreign
+;; peers' interop/keyed-flatdata/KeyedFlat.idl (struct KeyedFlat { @key long id; long x; long y; }). Defined
+;; test-local (dds-tests does not depend on dds-shapes) so the cross-impl keyhash conformance proof runs in
+;; the core suite on BOTH impls. The keyhash depends ONLY on the @key member (i32 id); the trailing x/y do
+;; not enter the key holder, so this is keyhash-identical to a single-i32-@key type for any given id.
+(dds.gen:define-dds-type keyed-flat-iop (:flatdata t)
+  (id :i32 :key t) (x :i32) (y :i32))
+
+(defun* run-keyed-flatdata-keyhash-test ()
+    (function () t)
+  "WP-KEYED-FLATDATA keyhash byte-exactness (FR-PF-4, RTPS 2.5 §9.6.4.8). (a) a keyed FlatData type
+   compiles (NO_KEY lifted); (b) key-hash-keyed-fd-i32-fd over an owned buffer with a known i32 @key
+   equals the PINNED <=16 direct vector (the key BIG-ENDIAN, zero-padded to 16); (c) the three-i64 type's
+   -fd keyhash equals MD5 of its BE-serialized 24-octet key holder (the >16 path); (d) -fd == the struct
+   key-hash-<name> for the same values (the struct keyhash is also emitted); (e) a :flatdata t type with a
+   variable-size (:string) @key still raises the compile error."
+  ;; (b) <=16 direct path: i32 @key #x01020304 -> BE {01 02 03 04} zero-padded to 16
+  (let ((b (make-keyed-fd-i32-flatdata)))
+    (setf (keyed-fd-i32-k-fd b) #x01020304)
+    (setf (keyed-fd-i32-v-fd b) #x7f7f7f7f)
+    (%check :kfd-direct
+            (equalp (key-hash-keyed-fd-i32-fd b)
+                    (octets #x01 #x02 #x03 #x04 0 0 0 0 0 0 0 0 0 0 0 0))
+            "keyed FlatData i32 keyhash = big-endian XCDR2 key bytes zero-padded to 16")
+    ;; (d) the buffer-reading -fd keyhash equals the struct keyhash for the same key value
+    (%check :kfd-direct-vs-struct
+            (equalp (key-hash-keyed-fd-i32-fd b)
+                    (key-hash-keyed-fd-i32 (make-keyed-fd-i32 :k #x01020304 :v 0)))
+            "key-hash-<name>-fd equals the struct key-hash-<name> for the same i32 key")
+    ;; the key drives the hash distinctly; a different key value gives a different hash
+    (let ((b2 (make-keyed-fd-i32-flatdata)))
+      (setf (keyed-fd-i32-k-fd b2) #x01020305)
+      (%check :kfd-distinct
+              (not (equalp (key-hash-keyed-fd-i32-fd b) (key-hash-keyed-fd-i32-fd b2)))
+              "distinct key values yield distinct keyhashes")
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b2)))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
+  ;; (c) >16 MD5 path: three i64 keys (24 octets > 16) -> MD5 of the BE XCDR2 key holder
+  (let ((b (make-keyed-fd-md5-flatdata))
+        (k1 #x0102030405060708) (k2 #x1112131415161718) (k3 #x2122232425262728))
+    (setf (keyed-fd-md5-k1-fd b) k1)
+    (setf (keyed-fd-md5-k2-fd b) k2)
+    (setf (keyed-fd-md5-k3-fd b) k3)
+    (setf (keyed-fd-md5-v-fd b) 1)
+    ;; expected = MD5 of the three i64 keys serialized big-endian, contiguous (XCDR2, all 4-aligned at 0/8/16)
+    (let ((be (octets #x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08
+                      #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x18
+                      #x21 #x22 #x23 #x24 #x25 #x26 #x27 #x28)))
+      (%check :kfd-md5
+              (equalp (key-hash-keyed-fd-md5-fd b) (dds.core.md5:md5 be))
+              "three-i64 keyed FlatData keyhash = MD5 of the big-endian XCDR2 key holder")
+      ;; it MUST be the 16-octet MD5, not the direct >16-octet copy (the first 16 BE bytes)
+      (%check :kfd-md5-not-direct
+              (not (equalp (key-hash-keyed-fd-md5-fd b) (subseq be 0 16)))
+              ">16 key takes the MD5 path, not a direct copy of the first 16 octets"))
+    ;; (d) -fd == struct keyhash on the MD5 path too
+    (%check :kfd-md5-vs-struct
+            (equalp (key-hash-keyed-fd-md5-fd b)
+                    (key-hash-keyed-fd-md5 (make-keyed-fd-md5 :k1 k1 :k2 k2 :k3 k3 :v 1)))
+            "key-hash-<name>-fd equals the struct key-hash-<name> on the MD5 path")
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
+  ;; (e) a variable-size (:string) @key on a :flatdata t type must still be a compile-time error
+  (%check :kfd-string-key-rejected
+          (nth-value 1 (ignore-errors
+                         (macroexpand-1 '(dds.gen:define-dds-type keyed-fd-bad (:flatdata t)
+                                          (k :string :key t) (v :i32)))))
+          ":flatdata t with a variable-size (:string) @key must signal at macroexpand (fixed-size scalar only)")
+  t)
+
+(defun* %be-i32 (v)
+    (function ((signed-byte 32)) (simple-array (unsigned-byte 8) (4)))
+  "The 4-octet big-endian two's-complement encoding of an i32 V — an INDEPENDENT derivation of the XCDR2
+   big-endian key-member serialization (RTPS 2.5 §9.6.4.8), not via the project's own serializer, so the
+   cross-impl keyhash oracle does not circularly reuse the code under test."
+  (let ((u (ldb (byte 32 0) v))
+        (b (make-array 4 :element-type '(unsigned-byte 8))))
+    (setf (aref b 0) (ldb (byte 8 24) u) (aref b 1) (ldb (byte 8 16) u)
+          (aref b 2) (ldb (byte 8 8) u) (aref b 3) (ldb (byte 8 0) u))
+    b))
+
+(defun* %expected-i32-keyhash (id)
+    (function ((signed-byte 32)) (simple-array (unsigned-byte 8) (16)))
+  "The 16-octet DDS keyhash a STANDARDS-CONFORMANT peer (RTI Connext / Fast DDS) computes for a keyed type
+   whose only @key is an i32 = ID (RTPS 2.5 §9.6.4.8): the key holder is the @key members in member order,
+   PLAIN_CDR2 (XCDR2) big-endian, no encapsulation/type/member headers, origin-0; its maximum serialized
+   size is 4 (<=16), so the keyhash is the key bytes directly, right-zero-padded to 16. Derived here from
+   first principles (%be-i32), independent of the project's keyhash, to serve as the cross-impl oracle."
+  (let ((out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace out (%be-i32 id))
+    out))
+
+(defun* run-keyed-flat-interop-keyhash-test ()
+    (function () t)
+  "WP-KEYED-FLATDATA F1 (per-feature DoD 2026-06-17) — the CROSS-DDS interop conformance crux for the
+   keyed FlatData KeyedFlat type (FR-PF-4, RTPS 2.5 §9.6.4.8, R6). KeyedFlat is the interop type shared with
+   the foreign peers: struct KeyedFlat { @key long id; long x; long y; } (interop/keyed-flatdata/KeyedFlat.idl;
+   dds.shapes:keyed-flat). This proves OUR keyed-FlatData instance identity equals what a standards-conformant
+   peer (RTI Connext / Fast DDS) computes for the SAME key value, so keyed matching + dispose-by-key
+   interoperate on the WIRE (copy path; same-host ZC loan is out of scope). The peer keyhash is derived from
+   first principles (%expected-i32-keyhash, INDEPENDENT of our serializer), not copied from our own struct
+   keyhash. Asserts: (a) key-hash-keyed-flat-iop-fd off the FlatData buffer EQUALP the independently-derived
+   peer keyhash for several id values, INCLUDING the spec Example-1-style pinned vector for id=1
+   (#(00 00 00 01 0..0)) and a negative id (two's-complement BE); (b) the trailing non-key x/y do NOT enter
+   the key holder (changing x/y leaves the keyhash unchanged — only id drives instance identity); (c) the
+   -fd keyhash equals the struct key-hash-keyed-flat-iop for the same id (the FlatData and non-FlatData
+   keyhash of OUR own stack coincide, so the copy-path reader and a non-FlatData peer agree). Both impls."
+  (let ((b (make-keyed-flat-iop-flatdata)))
+    (unwind-protect
+         (progn
+           ;; (a) the cross-impl crux: our -fd keyhash == the independently-derived conformant-peer keyhash
+           (dolist (id '(1 7 305419896 -1 -2 #x7fffffff))
+             (setf (keyed-flat-iop-id-fd b) id
+                   (keyed-flat-iop-x-fd b) 50 (keyed-flat-iop-y-fd b) 60)
+             (%check (intern (format nil "KFLAT-PEER-~d" id) :keyword)
+                     (equalp (key-hash-keyed-flat-iop-fd b) (%expected-i32-keyhash id))
+                     (format nil "keyed FlatData keyhash for id=~d must equal the standards-conformant peer keyhash (RTPS 2.5 §9.6.4.8)" id)))
+           ;; pinned spec Example-1-style vector: id=1 -> BE {00 00 00 01} zero-padded to 16
+           (setf (keyed-flat-iop-id-fd b) 1 (keyed-flat-iop-x-fd b) 99 (keyed-flat-iop-y-fd b) 99)
+           (%check :kflat-pinned-id1
+                   (equalp (key-hash-keyed-flat-iop-fd b)
+                           (octets #x00 #x00 #x00 #x01 0 0 0 0 0 0 0 0 0 0 0 0))
+                   "id=1 keyhash is the pinned big-endian XCDR2 key zero-padded to 16 (#(00 00 00 01 0..0))")
+           ;; (b) the non-key x/y must NOT enter the key holder — only id drives instance identity
+           (let ((kh-x50 (let () (setf (keyed-flat-iop-id-fd b) 42 (keyed-flat-iop-x-fd b) 50 (keyed-flat-iop-y-fd b) 50)
+                              (copy-seq (key-hash-keyed-flat-iop-fd b))))
+                 (kh-x77 (let () (setf (keyed-flat-iop-id-fd b) 42 (keyed-flat-iop-x-fd b) 77 (keyed-flat-iop-y-fd b) 88)
+                              (copy-seq (key-hash-keyed-flat-iop-fd b)))))
+             (%check :kflat-key-is-id-only
+                     (equalp kh-x50 kh-x77)
+                     "changing the non-key x/y must NOT change the keyhash (only the @key id enters the key holder)")
+             (%check :kflat-id42-vector
+                     (equalp kh-x50 (%expected-i32-keyhash 42))
+                     "id=42 keyhash matches the conformant-peer derivation regardless of x/y"))
+           ;; (c) the -fd keyhash equals OUR struct keyhash for the same id (FlatData == non-FlatData, our side)
+           (setf (keyed-flat-iop-id-fd b) 305419896 (keyed-flat-iop-x-fd b) 7 (keyed-flat-iop-y-fd b) 8)
+           (%check :kflat-fd-vs-struct
+                   (equalp (key-hash-keyed-flat-iop-fd b)
+                           (key-hash-keyed-flat-iop (make-keyed-flat-iop :id 305419896 :x 0 :y 0)))
+                   "key-hash-<name>-fd equals the struct key-hash-<name> for the same id (FlatData/non-FlatData agree)"))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
+    t))

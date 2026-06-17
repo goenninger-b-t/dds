@@ -1,0 +1,29 @@
+// KeyedFlat — the cross-DDS interop type for the keyed FlatData feature (WP-KEYED-FLATDATA,
+// FR-PF-4, RTPS 2.5 §9.6.4.8). Defined to MATCH this stack's keyed FlatData type EXACTLY:
+//
+//   (define-dds-type keyed-flat (:flatdata t) (id :i32 :key t) (x :i32) (y :i32))
+//   (dds.shapes:keyed-flat; the type-local conformance twin is keyed-flat-iop in the suite)
+//
+//   - @final extensibility (our define-dds-type uses :final; :flatdata t is FINAL-only)
+//   - @key on the FIRST member, id (a fixed-size scalar 32-bit long — the only @key kind a
+//     :flatdata t type admits, FR-PF-4 / ADR 0015)
+//   - three 32-bit longs; default @autoid(SEQUENTIAL) -> member ids 0,1,2 (matches our decl-index ids)
+//
+// Interop crux (RTPS 2.5 §9.6.4.8): the instance keyhash is the @key members in member order,
+// PLAIN_CDR2 (XCDR2) big-endian, no headers, origin-0; for a single 4-octet i32 the max serialized
+// size is <=16, so the keyhash is the key bytes directly, right-zero-padded to 16. A standards-
+// conformant peer (Connext / Fast DDS) computes the SAME 16 octets our key-hash-keyed-flat-fd reads
+// off the FlatData buffer, so keyed matching + dispose-by-key interoperate on the WIRE. The same-host
+// Zero-Copy LOAN path is NOT wire-interoperable and is out of scope here — this is the UDP/copy path.
+//
+// Our FlatData type is fixed-size all-32-bit, so its XCDR2 body bytes coincide with XCDR1; a peer that
+// negotiates either representation reads the id/x/y fields and the keyhash identically. The registered
+// type name is pinned to "keyed-flat" at each peer's Topic constructor so it is byte-identical to this
+// stack's registered type-name (discovery matches on topic name + type name).
+
+@final
+struct KeyedFlat {
+    @key long id;
+    long x;
+    long y;
+};

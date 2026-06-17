@@ -5542,6 +5542,501 @@
       (when p2 (dds.dcps:delete-participant p2))))
     t)
 
+(defun* run-keyed-flatdata-loan-handle-test ()
+    (function () t)
+  "WP-KEYED-FLATDATA real per-key loan handle (FR-PF-4, ADR 0017, RTPS 2.5 §9.6.4.8, R6; NOT cleared for ship —
+   pending counsel). The full DCPS stack over Zero-Copy with a KEYED FlatData type (keyed-fd-i32: i32 @key k +
+   i32 v): %loan-instance-handle must now return the REAL per-key keyhash off the loaned view (key-hash-<name>-fd),
+   NOT the synthetic SN+GUID fold (which gave per-sample-unique handles → same-key samples would get DIFFERENT
+   handles). Loans samples one at a time (write → spin → %drain → capture the cached SampleInfo instance-handle →
+   take-loaned → return-loan) and asserts: (1) key-A round 1 handle EQUALP the keyhash of an owned key-A buffer
+   (the conformance link: the view keyhash == the buffer keyhash for the same key bytes); (2) a SECOND key-A sample
+   gets the SAME handle (no SN-fold aliasing — the v1 fold would differ on SN); (3) a key-B sample gets a DISTINCT
+   handle EQUALP the keyhash of a key-B buffer; (4) the loaned sample is a flatdata-view whose field reads via
+   -fd are byte-correct off the slot. Skips cleanly where SHMEM is off (the ZC loan path is SBCL-only — NFR-PORT
+   gap, ADR 0013; Clasp/macOS pass-skip). NOT cleared for ship — pending counsel (R6)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-keyed-flatdata-loan-handle-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 4)        ; keyed-fd-i32 (8 octets) takes the ZC ref path
+         (ts (dds.types:find-type-support "keyed-fd-i32"))
+         (ka #x01020304) (kb #x0a0b0c0d) (va #x11223344) (vb #x55667788)
+         ;; oracle: the per-key keyhash read from an OWNED buffer — the view keyhash must equal this for the same key
+         (kh-a (let ((b (make-keyed-fd-i32-flatdata)))
+                 (setf (keyed-fd-i32-k-fd b) ka (keyed-fd-i32-v-fd b) 0)
+                 (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
+         (kh-b (let ((b (make-keyed-fd-i32-flatdata)))
+                 (setf (keyed-fd-i32-k-fd b) kb (keyed-fd-i32-v-fd b) 0)
+                 (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (%check :kfdl-kh-distinct (not (equalp kh-a kh-b)) "the two key values must have distinct keyhashes (oracle sanity)")
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "KFdLoan" "keyed-fd-i32" ts))
+                (tr (dds.dcps:create-topic p2 "KFdLoan" "keyed-fd-i32" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (node1 (dds.dcps::dp-node p1))
+                (node2 (dds.dcps::dp-node p2))
+                (fd (make-keyed-fd-i32-flatdata)))
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :kfdl-matched (plusp (dds.dcps:matched-count p1)) "writer/reader did not match")
+           (loop repeat 200
+                 until (plusp (dds.disc::%zc-readers node1
+                                                     (list (dds.rtps.discovery:endpoint-data-guid
+                                                            (first (dds.disc::%matched-endpoints node1))))))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           ;; loan ONE sample of key K (value V) and return the (handle . view-field-V) it delivered
+           (flet ((%loan-one (round k v)
+                    (setf (keyed-fd-i32-k-fd fd) k (keyed-fd-i32-v-fd fd) v)
+                    (dds.dcps:write-sample dw fd)
+                    (loop repeat 300 until (> (dds.disc:node-sample-count node2) round)
+                          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                    (dds.dcps::%drain dr)                              ; build the loan + cached SampleInfo
+                    (let* ((cs (first (dds.dcps::dr-cache dr)))        ; the just-drained loaned sample
+                           (handle (and cs (copy-seq (dds.dcps::sample-info-instance-handle
+                                                      (dds.dcps::cached-sample-info cs))))))
+                      (%check :kfdl-cs (and cs t) (format nil "round ~d: no drained sample" round))
+                      (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+                        (%check :kfdl-view (and data (dds.types:flatdata-view-p (first data)))
+                                (format nil "round ~d: the loaned sample must be a flatdata-view" round))
+                        (let ((vfield (and data (keyed-fd-i32-v-fd (first data)))))   ; -fd read off the slot
+                          (dds.dcps:return-loan dr loans)
+                          (values handle vfield))))))
+             (multiple-value-bind (ha1 va1) (%loan-one 0 ka va)
+               (multiple-value-bind (ha2 va2) (%loan-one 1 ka #x0c0d0e0f)   ; same key, DIFFERENT i32 value
+                 (multiple-value-bind (hb vb-read) (%loan-one 2 kb vb)
+                   ;; (1) key-A handle == the per-key keyhash (the real keyhash off the view, not the SN-fold)
+                   (%check :kfdl-a-keyhash (equalp ha1 kh-a)
+                           "the loaned key-A handle must equal the per-key keyhash of a key-A buffer")
+                   ;; (2) a SECOND key-A sample gets the SAME handle (no SN-fold aliasing across samples)
+                   (%check :kfdl-same-key-same-handle (equalp ha1 ha2)
+                           "two samples of the SAME key must get the SAME instance handle (no SN-fold aliasing)")
+                   ;; (3) key-B gets a DISTINCT handle == the key-B keyhash
+                   (%check :kfdl-b-distinct (not (equalp ha1 hb))
+                           "two DIFFERENT key values must get DISTINCT instance handles")
+                   (%check :kfdl-b-keyhash (equalp hb kh-b)
+                           "the loaned key-B handle must equal the per-key keyhash of a key-B buffer")
+                   ;; (4) the -fd field read off the slot is byte-correct
+                   (%check :kfdl-field-a (eql va1 va) (format nil "loaned key-A v ~a != ~a" va1 va))
+                   (%check :kfdl-field-a2 (eql va2 #x0c0d0e0f) "second key-A v read wrong off the slot")
+                   (%check :kfdl-field-b (eql vb-read vb) (format nil "loaned key-B v ~a != ~a" vb-read vb))))))
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+    t)
+
+(defun* run-keyed-flatdata-loan-keeplast-test ()
+    (function () t)
+  "WP-KEYED-FLATDATA Task C1 — close the WP-KEEPLAST follow-up gap on the ZC LOAN path (DDS 1.4 §2.2.3.18,
+   FR-PF-4, ADR 0017, RTPS 2.5 §9.6.4.8, R6; NOT cleared for ship — pending counsel). With B1's REAL per-key loan
+   handle in place, %drain-one-loan now applies the per-instance KEEP_LAST drop (mirroring the copy path
+   %drain-one-sample), so a KEEP_LAST depth-2 loan-capable reader of a KEYED FlatData type (keyed-fd-i32: i32
+   @key k + i32 v) keeps the last 2 of EACH instance, not a global last-2. Loans 3 samples of instance A (key kA,
+   varying v) + 3 of instance B (key kB) — draining after each write (delivery is where the drop fires) and NOT
+   taking between writes (take would empty the cache, masking retention) — then inspects dr-cache: EXACTLY 4 cached
+   (A's last 2 + B's last 2), 2 per instance, A's surviving SNs the LAST 2 of A's three and likewise for B. RED
+   before C1 (the loan path skipped the drop → all 6 of A+B retained). REGRESSION: a NO_KEY FlatData (fd-abc)
+   KEEP_LAST-2 loan reader is UNAFFECTED — its per-(GUID,SN)-unique synthetic handles mean each sample is its own
+   instance, so the depth-2 cap never fires and all 3 loaned samples are retained. Skips cleanly where SHMEM is off
+   (the ZC loan path is SBCL-only — NFR-PORT gap, ADR 0013; Clasp/macOS pass-skip). NOT cleared for ship (R6)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-keyed-flatdata-loan-keeplast-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 4)        ; keyed-fd-i32 (8 octets) takes the ZC ref path
+         (ts (dds.types:find-type-support "keyed-fd-i32"))
+         (ka #x01020304) (kb #x0a0b0c0d)
+         (kh-a (let ((b (make-keyed-fd-i32-flatdata)))    ; oracle: instance A's per-key handle
+                 (setf (keyed-fd-i32-k-fd b) ka (keyed-fd-i32-v-fd b) 0)
+                 (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
+         (kh-b (let ((b (make-keyed-fd-i32-flatdata)))    ; oracle: instance B's per-key handle
+                 (setf (keyed-fd-i32-k-fd b) kb (keyed-fd-i32-v-fd b) 0)
+                 (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "KFdKlLoan" "keyed-fd-i32" ts))
+                (tr (dds.dcps:create-topic p2 "KFdKlLoan" "keyed-fd-i32" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader
+                     sub tr :qos (dds.qos:make-reader-qos :history-kind :keep-last :history-depth 2)))
+                (node1 (dds.dcps::dp-node p1))
+                (node2 (dds.dcps::dp-node p2))
+                (fd (make-keyed-fd-i32-flatdata)))
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :kfdkl-matched (plusp (dds.dcps:matched-count p1)) "writer/reader did not match")
+           (loop repeat 200
+                 until (plusp (dds.disc::%zc-readers node1
+                                                     (list (dds.rtps.discovery:endpoint-data-guid
+                                                            (first (dds.disc::%matched-endpoints node1))))))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           ;; loan the (round+1)-th sample of key K (value V), draining (NOT taking) so the KEEP_LAST drop fires on delivery
+           (flet ((%loan (round k v)
+                    (setf (keyed-fd-i32-k-fd fd) k (keyed-fd-i32-v-fd fd) v)
+                    (dds.dcps:write-sample dw fd)
+                    (loop repeat 300 until (> (dds.disc:node-sample-count node2) round)
+                          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                    (dds.dcps::%drain dr)))                ; delivery + the per-instance KEEP_LAST drop
+             ;; interleave A and B so per-instance retention (not a global last-2) is the only thing that passes
+             (%loan 0 ka #x000000a1) (%loan 1 kb #x000000b1)
+             (%loan 2 ka #x000000a2) (%loan 3 kb #x000000b2)
+             (%loan 4 ka #x000000a3) (%loan 5 kb #x000000b3))
+           ;; the keyed reader retains the last 2 of EACH instance: 4 cached, 2 per handle, NOT 6 and NOT a global 2
+           (%check :kfdkl-total (= 4 (length (dds.dcps::dr-cache dr)))
+                   (format nil "keyed KEEP_LAST-2 loan reader over 2 instances must hold 4 cached, got ~d"
+                           (length (dds.dcps::dr-cache dr))))
+           (%check :kfdkl-a-2 (= 2 (%handle-cache-count dr kh-a))
+                   (format nil "instance A must keep exactly its last 2 loaned samples, got ~d"
+                           (%handle-cache-count dr kh-a)))
+           (%check :kfdkl-b-2 (= 2 (%handle-cache-count dr kh-b))
+                   (format nil "instance B must keep exactly its last 2 loaned samples, got ~d"
+                           (%handle-cache-count dr kh-b)))
+           ;; the surviving samples are each instance's LAST 2 (oldest dropped): A keeps a2,a3 — B keeps b2,b3
+           (flet ((%vals (h) (sort (mapcar (lambda (cs) (keyed-fd-i32-v-fd (dds.dcps:cached-sample-data cs)))
+                                           (remove-if-not (lambda (cs) (equalp h (%cs-ih cs)))
+                                                          (dds.dcps::dr-cache dr)))
+                                   #'<)))
+             (%check :kfdkl-a-last2 (equal (list #x000000a2 #x000000a3) (%vals kh-a))
+                     (format nil "instance A must keep its LAST 2 values (a2,a3), oldest dropped; got ~x" (%vals kh-a)))
+             (%check :kfdkl-b-last2 (equal (list #x000000b2 #x000000b3) (%vals kh-b))
+                     (format nil "instance B must keep its LAST 2 values (b2,b3), oldest dropped; got ~x" (%vals kh-b))))
+           ;; THE LEAK CHECK (C-2): the 2 evicted views' loans were RELEASED, not orphaned in dr-loans pinning a slot.
+           ;; dr-cache shape (above) CANNOT see the leak — the unfixed bug is precisely a slot surviving in dr-loans /
+           ;; the pool while gone from dr-cache. Unfixed: dr-loans=6, writer pool free=26 (2 dropped slots LEAK held).
+           (%check :kfdkl-loans-4 (= 4 (length (dds.dcps::dr-loans dr)))
+                   (format nil "the 2 KEEP_LAST-evicted loaned views must be released (dr-loans=4), got ~d (=6 ⇒ slot LEAK)"
+                           (length (dds.dcps::dr-loans dr))))
+           ;; the 2 dropped slots returned to the writer's ZC pool (28 of 32 reclaimable: 4 still held by live loans)
+           (let ((wsap (dds.disc::disc-node-zc-pool-sap node1)))
+             (%check :kfdkl-pool-2-reclaimed
+                     (= (- dds.disc:+zerocopy-pool-slots+ 4)
+                        (dds.xport.zerocopy::%zc-free-count wsap))
+                     (format nil "the 2 evicted slots must be reclaimable in the writer pool (free=~d of ~d), got ~d"
+                             (- dds.disc:+zerocopy-pool-slots+ 4) dds.disc:+zerocopy-pool-slots+
+                             (dds.xport.zerocopy::%zc-free-count wsap)))
+             ;; full pool recovery after the app returns the 4 held loans + reader close — no residual held slot
+             (dds.dcps:return-all-loans dr)
+             (loop repeat 200
+                   until (= dds.disc:+zerocopy-pool-slots+ (dds.xport.zerocopy::%zc-free-count wsap))
+                   do (dds.dcps:spin p1) (sleep 0.01))
+             (%check :kfdkl-pool-full-recovery
+                     (= dds.disc:+zerocopy-pool-slots+ (dds.xport.zerocopy::%zc-free-count wsap))
+                     (format nil "every loaned slot must return to the writer pool after return-all-loans (free=~d of ~d)"
+                             (dds.xport.zerocopy::%zc-free-count wsap) dds.disc:+zerocopy-pool-slots+)))
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+  ;; NO-UAF (C-2): read-loaned is NON-DESTRUCTIVE — it LEAVES :READ samples in dr-cache and hands the app their views.
+  ;; So the KEEP_LAST drop's oldest CAN be an app-held view; releasing its slot would be a use-after-free. The loan
+  ;; drop's RELEASABLE-ONLY guard skips :READ views: a held view is NEVER released by an over-depth append. Here a
+  ;; single instance's 2 loaned samples are read-loaned (app-held, :READ); a 3rd arrives (over depth 2). The 2 held
+  ;; views must STILL be loaned (dr-loans keeps the 2 held; only an UN-held over-depth sample could have been dropped,
+  ;; and there is none), so no app-held slot was released out from under the reader.
+  (when (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (let* ((dds.disc:*shmem-enabled* t)
+           (dds.disc:*zerocopy-enabled* t)
+           (dds.disc:*zerocopy-min-payload-bytes* 4)
+           (ts (dds.types:find-type-support "keyed-fd-i32"))
+           (kc #x07070707)
+           (p1 (dds.dcps:create-participant :domain 0))
+           (p2 (dds.dcps:create-participant :domain 0)))
+      (unwind-protect
+           (let* ((tw (dds.dcps:create-topic p1 "KFdKlUaf" "keyed-fd-i32" ts))
+                  (tr (dds.dcps:create-topic p2 "KFdKlUaf" "keyed-fd-i32" ts))
+                  (pub (dds.dcps:create-publisher p1))
+                  (sub (dds.dcps:create-subscriber p2))
+                  (dw (dds.dcps:create-datawriter pub tw))
+                  (dr (dds.dcps:create-datareader
+                       sub tr :qos (dds.qos:make-reader-qos :history-kind :keep-last :history-depth 2)))
+                  (node1 (dds.dcps::dp-node p1))
+                  (node2 (dds.dcps::dp-node p2))
+                  (fd (make-keyed-fd-i32-flatdata)))
+             (loop repeat 200
+                   until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (%check :kfdkl-uaf-matched (plusp (dds.dcps:matched-count p1)) "no-UAF writer/reader did not match")
+             (loop repeat 200
+                   until (plusp (dds.disc::%zc-readers node1
+                                                       (list (dds.rtps.discovery:endpoint-data-guid
+                                                              (first (dds.disc::%matched-endpoints node1))))))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (flet ((%loan (round v)
+                      (setf (keyed-fd-i32-k-fd fd) kc (keyed-fd-i32-v-fd fd) v)
+                      (dds.dcps:write-sample dw fd)
+                      (loop repeat 300 until (> (dds.disc:node-sample-count node2) round)
+                            do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))))
+               (%loan 0 #x000000c1) (%loan 1 #x000000c2)
+               ;; READ (non-destructive): both views handed to the app, left in dr-cache, marked :READ
+               (multiple-value-bind (data loans) (dds.dcps:read-loaned dr)
+                 (declare (ignore data))
+                 (%check :kfdkl-uaf-read-2 (= 2 (length loans)) "read-loaned must hand the app 2 loaned views")
+                 (%check :kfdkl-uaf-all-read
+                         (every (lambda (cs) (eq :read (%cs-ss cs))) (dds.dcps::dr-cache dr))
+                         "both held views must be marked :read after read-loaned")
+                 ;; a 3rd sample arrives (over depth 2) — the drop must NOT release either app-held :read view
+                 (%loan 2 #x000000c3)
+                 (dds.dcps::%drain dr)
+                 (%check :kfdkl-uaf-held-not-released
+                         (and (member (first loans) (dds.dcps::dr-loans dr))
+                              (member (second loans) (dds.dcps::dr-loans dr)))
+                         "no-UAF: a read-loaned (app-held :read) view must NEVER be released by the KEEP_LAST drop")
+                 ;; the app can still safely return its held loans (slots were never freed under it) -> full recovery
+                 (dds.dcps:return-loan dr loans)
+                 (dds.dcps:return-all-loans dr)
+                 (let ((wsap (dds.disc::disc-node-zc-pool-sap node1)))
+                   (loop repeat 200
+                         until (= dds.disc:+zerocopy-pool-slots+ (dds.xport.zerocopy::%zc-free-count wsap))
+                         do (dds.dcps:spin p1) (sleep 0.01))
+                   (%check :kfdkl-uaf-recovery
+                           (= dds.disc:+zerocopy-pool-slots+ (dds.xport.zerocopy::%zc-free-count wsap))
+                           "no-UAF: every slot recovers after the app returns its held loans (no slot freed under it)"))))
+             (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+        (dds.dcps:delete-participant p1)
+        (when p2 (dds.dcps:delete-participant p2)))))
+  ;; REGRESSION: a NO_KEY FlatData KEEP_LAST-2 loan reader is UNAFFECTED — per-(GUID,SN)-unique handles ⇒ the cap never fires.
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
+         (ts (dds.types:find-type-support "fd-abc"))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "NkFdKlLoan" "fd-abc" ts))
+                (tr (dds.dcps:create-topic p2 "NkFdKlLoan" "fd-abc" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader
+                     sub tr :qos (dds.qos:make-reader-qos :history-kind :keep-last :history-depth 2)))
+                (node1 (dds.dcps::dp-node p1))
+                (node2 (dds.dcps::dp-node p2))
+                (fd (make-fd-abc-flatdata)))
+           (setf (fd-abc-a-fd fd) 1 (fd-abc-b-fd fd) 2 (fd-abc-c-fd fd) 3)
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :nkfdkl-matched (plusp (dds.dcps:matched-count p1)) "NO_KEY writer/reader did not match")
+           (loop repeat 200
+                 until (plusp (dds.disc::%zc-readers node1
+                                                     (list (dds.rtps.discovery:endpoint-data-guid
+                                                            (first (dds.disc::%matched-endpoints node1))))))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (dotimes (round 3)                              ; 3 samples > depth 2; drain (NOT take) after each
+             (dds.dcps:write-sample dw fd)
+             (loop repeat 300 until (> (dds.disc:node-sample-count node2) round)
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (dds.dcps::%drain dr))
+           ;; NO_KEY: 3 distinct synthetic instances ⇒ the depth-2 cap never fires ⇒ all 3 retained (unchanged from B1)
+           (%check :nkfdkl-all-retained (= 3 (length (dds.dcps::dr-cache dr)))
+                   (format nil "NO_KEY KEEP_LAST-2 loan reader must retain all 3 (per-(GUID,SN) handles, cap never fires), got ~d"
+                           (length (dds.dcps::dr-cache dr))))
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+  t)
+
+(defun* run-keyed-flatdata-copy-behavior-test ()
+    (function () t)
+  "WP-KEYED-FLATDATA Task D1 — keyed FlatData FULL keyed behaviour on the COPY (non-ZeroCopy) path (FR-PF-4,
+   DDS 1.4 §2.2.2.5, RTPS 2.5 §9.6.4.8, R6). NO *zerocopy-enabled* — plain UDP/loopback: write-sample
+   serializes the keyed-fd-i32 FlatData buffer, the reader deserializes it to an owned octet-buffer the -fd
+   accessors read in place, and %drain-one-sample computes the instance handle via %instance-handle ts data =
+   key-hash-keyed-fd-i32-fd off that buffer. Asserts the keyhash wiring (A1) lit the EXISTING reader machinery
+   with NO new copy-path code: (1) each delivered sample's SampleInfo instance-handle EQUALP the per-key
+   keyhash of its key (a REAL per-key handle, NOT HANDLE_NIL); (2) the FIRST sample of key A reads view-state
+   :new, a REPEAT of key A reads :not-new (per-instance view-state, DDS 1.4 §2.2.2.5.1.7); (3) a second
+   distinct key B is an INDEPENDENT instance with its own :new; (4) a KEEP_LAST depth-2 keyed reader fed 3
+   samples of ONE key retains the last 2 (per-instance KEEP_LAST on the copy path, DDS 1.4 §2.2.3.18 —
+   %drain-one-sample's %reader-keeplast-drop-oldest keyed on the FlatData handle). Both impls (the copy path is
+   NOT ZC-gated). NOT cleared for ship — pending counsel (R6)."
+  (let* ((ts (dds.types:find-type-support "keyed-fd-i32"))
+         (ka #x01020304) (kb #x0a0b0c0d)
+         (nil-handle (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         ;; oracle: the per-key handle the reader must produce == the keyhash read from an owned buffer
+         (kh-a (let ((b (make-keyed-fd-i32-flatdata)))
+                 (setf (keyed-fd-i32-k-fd b) ka (keyed-fd-i32-v-fd b) 0)
+                 (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
+         (kh-b (let ((b (make-keyed-fd-i32-flatdata)))
+                 (setf (keyed-fd-i32-k-fd b) kb (keyed-fd-i32-v-fd b) 0)
+                 (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (%check :kfdc-kh-distinct (not (equalp kh-a kh-b)) "the two key values must have distinct keyhashes (oracle sanity)")
+    (%check :kfdc-kh-not-nil (not (equalp kh-a nil-handle)) "a keyed FlatData keyhash must not be HANDLE_NIL")
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "KFdCopy" "keyed-fd-i32" ts))
+                (tr (dds.dcps:create-topic p2 "KFdCopy" "keyed-fd-i32" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                ;; RELIABLE + KEEP_ALL both sides: deterministic delivery + retain every sample for the grouping/view-state asserts
+                (dw (dds.dcps:create-datawriter
+                     pub tw :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                (dr (dds.dcps:create-datareader
+                     sub tr :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all)))
+                (fd (make-keyed-fd-i32-flatdata)))
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :kfdc-matched (plusp (dds.dcps:matched-count p2)) "keyed FlatData copy writer/reader did not match")
+           ;; write ONE keyed FlatData sample of key K (value V) and wait for the reader to receive it
+           (flet ((%write (round k v)
+                    (setf (keyed-fd-i32-k-fd fd) k (keyed-fd-i32-v-fd fd) v)
+                    (dds.dcps:write-sample dw fd)
+                    (loop repeat 300 until (> (dds.dcps:samples-available dr) round)
+                          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))))
+             ;; (1)+(2) first key-A sample -> a REAL per-key handle (== kh-a), view-state NEW (first access of A)
+             (%write 0 ka #x11111111)
+             (let ((r (dds.dcps:read-samples dr :states '(:not-read))))
+               (%check :kfdc-a1-one (= 1 (length r)) "expected the one key-A sample unread")
+               (%check :kfdc-a1-handle (equalp kh-a (%cs-ih (first r)))
+                       "the delivered key-A sample's SampleInfo handle must equal the per-key keyhash (a REAL handle, not HANDLE_NIL)")
+               (%check :kfdc-a1-not-nil (not (equalp nil-handle (%cs-ih (first r))))
+                       "the keyed FlatData copy-path handle must not be HANDLE_NIL")
+               (%check :kfdc-a1-new (eq :new (%cs-vs (first r))) "the FIRST sample of key A must read view-state NEW")
+               (%check :kfdc-a1-value (eql #x11111111 (keyed-fd-i32-v-fd (dds.dcps:cached-sample-data (first r))))
+                       "the key-A sample value must read byte-correct off the deserialized FlatData buffer"))
+             ;; (2) a REPEAT of key A -> SAME handle, view-state NOT_NEW (instance A already accessed)
+             (%write 1 ka #x22222222)
+             (let ((r (dds.dcps:read-samples dr :states '(:not-read))))
+               (%check :kfdc-a2-one (= 1 (length r)) "expected the second key-A sample unread")
+               (%check :kfdc-a2-same-handle (equalp kh-a (%cs-ih (first r)))
+                       "a REPEAT of key A must carry the SAME per-key handle")
+               (%check :kfdc-a2-notnew (eq :not-new (%cs-vs (first r)))
+                       "a REPEAT of an already-accessed key must read view-state NOT_NEW"))
+             ;; (3) a second DISTINCT key B -> an independent instance with its OWN view-state NEW
+             (%write 2 kb #x33333333)
+             (let ((r (dds.dcps:read-samples dr :states '(:not-read))))
+               (%check :kfdc-b-one (= 1 (length r)) "expected the one key-B sample unread")
+               (%check :kfdc-b-handle (equalp kh-b (%cs-ih (first r)))
+                       "key B must be an independent instance carrying its own per-key keyhash")
+               (%check :kfdc-b-distinct (not (equalp kh-a (%cs-ih (first r))))
+                       "key B's handle must differ from key A's (two instances, not one)")
+               (%check :kfdc-b-new (eq :new (%cs-vs (first r))) "the first sample of a distinct key B must read view-state NEW"))
+             ;; total instances seen across the read history: exactly 2 (A and B)
+             (%check :kfdc-two-instances
+                     (= 2 (length (remove-duplicates (mapcar #'%cs-ih (dds.dcps:read-samples dr)) :test #'equalp)))
+                     "the keyed FlatData reader must group the samples into exactly 2 instances")
+             (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+           ;; (4) per-instance KEEP_LAST depth-2 on the copy path: a fresh keyed reader fed 3 of ONE key keeps the last 2
+           (let* ((trk (dds.dcps:create-topic p2 "KFdCopyKl" "keyed-fd-i32" ts))
+                  (twk (dds.dcps:create-topic p1 "KFdCopyKl" "keyed-fd-i32" ts))
+                  (pubk (dds.dcps:create-publisher p1))
+                  (subk (dds.dcps:create-subscriber p2))
+                  (dwk (dds.dcps:create-datawriter
+                        pubk twk :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                  (drk (dds.dcps:create-datareader
+                        subk trk :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                               :history-kind :keep-last :history-depth 2)))
+                  (node2k (dds.dcps::dp-node p2))
+                  (base (dds.disc:node-sample-count node2k))
+                  (fdk (make-keyed-fd-i32-flatdata)))
+             (loop repeat 200
+                   until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (dotimes (round 3)                          ; 3 samples of key A > depth 2; deliver all, the drop fires within %drain
+               (setf (keyed-fd-i32-k-fd fdk) ka (keyed-fd-i32-v-fd fdk) (+ #x000000a1 round))
+               (dds.dcps:write-sample dwk fdk)
+               (loop repeat 300 until (> (- (dds.disc:node-sample-count node2k) base) round)
+                     do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02)))
+             (dds.dcps::%drain drk)                       ; per-instance KEEP_LAST drop runs over the 3 received in one pass
+             ;; the per-instance KEEP_LAST cap holds on the copy path: exactly the last 2 of key A survive
+             (%check :kfdc-kl-total (= 2 (length (dds.dcps::dr-cache drk)))
+                     (format nil "a keyed KEEP_LAST-2 copy reader fed 3 of one key must keep exactly 2, got ~d"
+                             (length (dds.dcps::dr-cache drk))))
+             (%check :kfdc-kl-a-2 (= 2 (%handle-cache-count drk kh-a))
+                     (format nil "all retained samples must belong to key A's instance, got ~d" (%handle-cache-count drk kh-a)))
+             (let ((vals (sort (mapcar (lambda (cs) (keyed-fd-i32-v-fd (dds.dcps:cached-sample-data cs)))
+                                       (dds.dcps::dr-cache drk)) #'<)))
+               (%check :kfdc-kl-last2 (equal (list #x000000a2 #x000000a3) vals)
+                       (format nil "the copy reader must keep key A's LAST 2 values (a2,a3), oldest dropped; got ~x" vals)))
+             (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fdk))))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+  t)
+
+(defun* run-keyed-flatdata-dispose-test ()
+    (function () t)
+  "WP-KEYED-FLATDATA Task D1 — dispose/unregister of a keyed FlatData instance BY SAMPLE (FR-PF-4,
+   DDS 1.4 §2.2.2.5 / §2.2.3.21, RTPS 2.5 §9.6.4.9, R6). Both impls (no ZeroCopy). A keyed-fd-i32 writer
+   disposes an instance by passing the FlatData octet-buffer (NOT a pre-computed handle): %resolve-handle's
+   %handle-p must REJECT the octet-buffer (it is a struct, not a (simple-array (unsigned-byte 8) (16))) and
+   fall through to %instance-handle -> key-hash-keyed-fd-i32-fd, which reads @key off the buffer the app passed.
+   Asserts: (1) a matched reader sees the instance ALIVE after a normal write; (2) after dispose-instance dw fd
+   the reader sees NOT_ALIVE_DISPOSED for that instance's keyhash, with an invalid-data SampleInfo carrying the
+   right handle; (3) a SECOND distinct instance: write -> ALIVE, then unregister-instance dw fd (default
+   autodispose TRUE) -> NOT_ALIVE_DISPOSED. NOT cleared for ship — pending counsel (R6)."
+  (let* ((ts (dds.types:find-type-support "keyed-fd-i32"))
+         (ka #x02030405) (kb #x0b0c0d0e)
+         (kh-a (let ((b (make-keyed-fd-i32-flatdata)))
+                 (setf (keyed-fd-i32-k-fd b) ka (keyed-fd-i32-v-fd b) 0)
+                 (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
+         (kh-b (let ((b (make-keyed-fd-i32-flatdata)))
+                 (setf (keyed-fd-i32-k-fd b) kb (keyed-fd-i32-v-fd b) 0)
+                 (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
+         (p1 (dds.dcps:create-participant :domain 0))
+         (p2 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "KFdDisp" "keyed-fd-i32" ts))
+                (tr (dds.dcps:create-topic p2 "KFdDisp" "keyed-fd-i32" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw :qos (dds.qos:make-writer-qos :reliability :reliable)))
+                (dr (dds.dcps:create-datareader sub tr :qos (dds.qos:make-reader-qos :reliability :reliable)))
+                (fd (make-keyed-fd-i32-flatdata)))
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :kfdd-matched (plusp (dds.dcps:matched-count p2)) "keyed FlatData dispose writer/reader did not match")
+           ;; instance A: write -> ALIVE
+           (setf (keyed-fd-i32-k-fd fd) ka (keyed-fd-i32-v-fd fd) #x11111111)
+           (dds.dcps:write-sample dw fd)
+           (%drain-until dr p1 p2 (lambda () (eq :alive (%instance-rec-state dr kh-a))) 200)
+           (%check :kfdd-a-alive (eq :alive (%instance-rec-state dr kh-a))
+                   "instance A must be ALIVE after a keyed FlatData data sample")
+           ;; dispose BY SAMPLE (the FlatData octet-buffer, k still = ka) -> the reader sees NOT_ALIVE_DISPOSED
+           (dds.dcps:dispose-instance dw fd)
+           (%drain-until dr p1 p2 (lambda () (eq :not-alive-disposed (%instance-rec-state dr kh-a))) 200)
+           (%check :kfdd-a-disposed (eq :not-alive-disposed (%instance-rec-state dr kh-a))
+                   "dispose-instance BY SAMPLE must transition instance A to NOT_ALIVE_DISPOSED (keyhash read off the buffer)")
+           (let ((inv (find-if (lambda (cs) (and (null (dds.dcps:sample-info-valid-data (dds.dcps:cached-sample-info cs)))
+                                                 (equalp kh-a (%cs-ih cs))))
+                               (dds.dcps:take-samples dr))))
+             (%check :kfdd-a-inv (and inv t) "dispose must yield an invalid-data SampleInfo for instance A")
+             (when inv
+               (%check :kfdd-a-inv-state
+                       (eq :not-alive-disposed (dds.dcps:sample-info-instance-state (dds.dcps:cached-sample-info inv)))
+                       "the invalid-data SampleInfo must carry instance_state NOT_ALIVE_DISPOSED")))
+           ;; instance B: write -> ALIVE, then unregister BY SAMPLE with default autodispose (TRUE) -> NOT_ALIVE_DISPOSED
+           (setf (keyed-fd-i32-k-fd fd) kb (keyed-fd-i32-v-fd fd) #x22222222)
+           (dds.dcps:write-sample dw fd)
+           (%drain-until dr p1 p2 (lambda () (eq :alive (%instance-rec-state dr kh-b))) 200)
+           (%check :kfdd-b-alive (eq :alive (%instance-rec-state dr kh-b))
+                   "instance B must be ALIVE after a keyed FlatData data sample")
+           (dds.dcps:unregister-instance dw fd)             ; default autodispose TRUE -> disposes too (DDS 1.4 §2.2.3.21)
+           (%drain-until dr p1 p2 (lambda () (eq :not-alive-disposed (%instance-rec-state dr kh-b))) 200)
+           (%check :kfdd-b-disposed (eq :not-alive-disposed (%instance-rec-state dr kh-b))
+                   "unregister-instance BY SAMPLE (autodispose default TRUE) must transition instance B to NOT_ALIVE_DISPOSED")
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+  t)
+
 (defun* run-reliable-zc-retransmit-test ()
     (function () t)
   "WP-RELIABLE-ZC scenario 1 — RELIABLE retransmit of a Zero-Copy loan sample (FR-PF-3/4, FR-RTPS reliability,

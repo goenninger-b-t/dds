@@ -1,9 +1,9 @@
 # ADR 0015 — WP-FLATDATA: FlatData-equivalent binding (FINAL fixed-size v1)
 
-- **Status:** Accepted (2026-06-15)
+- **Status:** Accepted (2026-06-15); NO_KEY deviation **closed for fixed-size scalar keys** (2026-06-17, WP-KEYED-FLATDATA — see *Keyed FlatData* below)
 - **Deciders:** A0 (integrator)
 - **Amends:** nothing frozen — purely additive; no existing interface symbol changed
-- **Feature:** FR-PF-4 (FlatData publication), NFR-PERF-7 (fixed-size sample serialize/deserialize ≈ 0)
+- **Feature:** FR-PF-4 (FlatData publication), FR-TYPE-5 (keyhash), NFR-PERF-7 (fixed-size sample serialize/deserialize ≈ 0)
 
 ## R6 — PATENT GATE (defining constraint)
 
@@ -141,9 +141,14 @@ is the follow-up). The literal-0-copy view remains a **follow-up requiring an en
 change**: a ZC-aware, type-aware, refcount-spanning read path (slot delivered as a refcounted loan
 held until the app's read completes) **and** a SAP→Lisp-array (or SAP-backed accessor) primitive.
 
-## Final design (as implemented) — the honest as-built (v1, NO_KEY, R6 NOT-cleared-for-ship)
+## Final design (as implemented) — the honest as-built (v1, R6 NOT-cleared-for-ship)
 
-WP-FLATDATA v1 ships exactly the following for a `:flatdata t` **FINAL all-fixed-size-scalar NO_KEY** type
+> **As-built update (2026-06-17, WP-KEYED-FLATDATA):** the v1 NO_KEY restriction below is **lifted for
+> fixed-size scalar `@key` members** — see *Keyed FlatData* near the end of this ADR. The text in this
+> section is the original NO_KEY v1 as-built; read it together with that closing section. Variable-size /
+> string `@key` members remain a compile-time error (FlatData v1 fixed-size).
+
+WP-FLATDATA v1 ships exactly the following for a `:flatdata t` **FINAL all-fixed-size-scalar** type
 (opt-in per type; default codegen untouched). Stated against measurement (FR-LANG-7) — no path is claimed
 ≈0 unless `dds.pal:bytes-consed` reads ≈0 (`make bench-flatdata`, SBCL, type `fd-abc` = `u8`/`u32`/`u64`,
 20-octet payload):
@@ -166,16 +171,19 @@ WP-FLATDATA v1 ships exactly the following for a `:flatdata t` **FINAL all-fixed
   releasing the slot before the app's later off-thread read — **~830× less RX allocation** (measured 79
   bytes/sample vs WP-ZEROCOPY-v1's 65551). **This is NOT literal-0-copy.** TX on the ZC path still has the one
   app→slot copy (the loan-write API is the follow-up).
-- **NO_KEY only.** A `@key` member is a **compile-time error** in v1 (the FlatData sample is the octet-buffer,
-  not a struct, so the keyhash path cannot read it); keyed FlatData is a follow-up.
+- **NO_KEY in the original v1; keyed (fixed-size scalar `@key`) lifted 2026-06-17** — see *Keyed FlatData*
+  below. A variable-size / string `@key` member remains a **compile-time error** (FlatData v1 fixed-size scalar).
 
 **Deferred (follow-ups — stated as not-done):**
 1. **Literal-0-copy RX** — requires an **engine-contract change**: a SAP-backed (or SAP→Lisp-array) accessor
    primitive **and** a DCPS-level refcount-spanning, ZC-aware, type-aware read path (slot delivered as a
    refcounted loan held until the app's read completes). See *Phase D outcome* for the four individually-fatal
    blockers that make a literal-0-copy SHMEM-slot view a cross-process use-after-free in the current architecture.
-2. **The Builder + variable-size FlatData** — strings, sequences, nested/variable members, `@mutable`.
-3. **Keyed FlatData** (v1 is NO_KEY).
+   *(Literal-0-copy RX subsequently delivered — WP-FLATDATA-ZC-LOAN, ADR 0017.)*
+2. **The Builder + variable-size FlatData** — strings, sequences, nested/variable members, `@mutable`
+   (variable-size / string `@key` members ride this — still deferred).
+3. ~~Keyed FlatData (v1 is NO_KEY).~~ **Done for fixed-size scalar keys** (WP-KEYED-FLATDATA, 2026-06-17) —
+   see *Keyed FlatData* below.
 4. **The app-facing ZC loan-write API** — write directly into a pool slot, removing the TX app→slot copy.
 
 ## Memory / hot-path
@@ -218,7 +226,8 @@ process-local constants) is part of the security pass that must precede any ZC-o
 - `src/dds-gen/dsl.lisp` — type-support vtable swap: serialize=identity (block-copy the FlatData body, no
   per-field encode) / deserialize=read-in-place (validate + body copy into a fresh-or-loaned FlatData buffer,
   no per-field decode) / constant serialized-size; the engine hot path is unchanged (it funcalls the vtable —
-  FlatData only swaps the pointers); v1 is NO_KEY only (the keyhash path reads a struct, not the buffer);
+  FlatData only swaps the pointers); keyed via `key-hash-<name>-fd` (the buffer-reading keyhash, *Keyed
+  FlatData* below; original v1 was NO_KEY because the struct keyhash cannot read the buffer);
   0 GC-alloc/sample proven via `dds.pal:bytes-consed` (Task C1, NFR-PERF-7)
 - `src/dds-xport/zerocopy-pool.lisp` — `%zc-resolve-fresh` / `%zc-resolve-into` / `%zc-slot-payload-len`:
   the single-copy ZC RX resolve (reads the slot in place into one exact-length owned vector; no slot-sized
@@ -252,5 +261,51 @@ app-facing WP-ZEROCOPY loan-write API (write directly into a pool slot — the n
 - No existing behaviour changed; non-FlatData types are byte-identical.
 - `docs/verification.csv` FR-PF-4 row: open until Task A2 byte-exact + Task A3 ZC integration pass.
 - No migration burden: purely additive.
+
+## Keyed FlatData — closing the NO_KEY deviation (2026-06-17, WP-KEYED-FLATDATA, FR-PF-4 + FR-TYPE-5)
+
+The v1 NO_KEY restriction (above) was a **documented deviation**: a `:flatdata t` type could not carry
+`@key` members because the spec keyhash `key-hash-<name>` reads a *struct* sample via slot accessors, and a
+FlatData sample has **no struct** — it is the octet buffer. WP-KEYED-FLATDATA removes that deviation for
+**fixed-size scalar `@key` members** (the second half of queue #3; the same R6 gate as the rest of the
+FlatData/Zero-Copy line — `:flatdata t` opt-in + `dds.disc:*zerocopy-enabled*` for the loan path;
+**NOT cleared for ship — pending counsel (R6)**).
+
+**The linchpin — `key-hash-<name>-fd`, a buffer-reading keyhash.** For a keyed FlatData type the type
+compiler now emits `key-hash-<name>-fd (sample)` where `sample` is the FlatData octet-buffer **or** a
+`flatdata-view`. It reuses the struct keyhash's exact serialization (the per-member `:put` codecs to a
+**big-endian** XCDR2 cursor, the ≤16-direct-zero-padded / >16-MD5 rule per **RTPS 2.5 §9.6.4.8**), sourcing
+each `@key` value from the existing `<name>-<field>-fd` accessor (LE, in place, dual-dispatching
+owned-buffer vs view) instead of the struct slot accessor. Result: **byte-identical** to the struct keyhash
+for the same key values — so a keyed FlatData instance's identity equals what a non-FlatData peer computes
+(the conformance crux; oracle = a pinned BE vector + the struct cross-check, both the ≤16 and >16-MD5 paths;
+test `keyed-flatdata-keyhash`). One function serves the write/wire path (owned buffer) **and** the loan path
+(view); there is no struct case.
+
+**What follows once the keyhash is wired into `type-support`** (`:keyed-p t` + `:key-hash #'key-hash-<name>-fd`):
+- **Real per-key loan handle.** `%loan-instance-handle` returns the keyhash of the loaned view for a keyed
+  type (replacing the synthetic SN+GUID fold used for NO_KEY) — two samples of different keys get distinct
+  handles, two of the same key get the same handle (test `keyed-flatdata-loan-handle`).
+- **Loan-path per-instance KEEP_LAST drop.** `%drain-one-loan` now applies `%reader-keeplast-drop-oldest`
+  per instance, closing the WP-KEEPLAST loan-path follow-up gap (DDS 1.4 §2.2.3.18; test
+  `keyed-flatdata-loan-keeplast`). For NO_KEY FlatData the per-(GUID,SN)-unique handle means the cap never
+  fires — behaviour unchanged.
+- **Copy-path keyed behavior (≈free).** A keyed FlatData reader without ZC gets a real per-key
+  `instance-handle`, NEW/NOT_NEW view-state, instance-recs, and per-instance KEEP_LAST — the existing keyed
+  machinery lit by the keyhash wiring, no new code (test `keyed-flatdata-copy-behavior`).
+- **Dispose/unregister by sample.** A keyed FlatData app passes the FlatData buffer to dispose/unregister;
+  `%resolve-handle` → `%instance-handle` → `key-hash-<name>-fd` reads the buffer; a matched reader sees
+  NOT_ALIVE_DISPOSED for that instance (DDS 1.4 §2.2.2.5; test `keyed-flatdata-dispose`).
+
+**Residual limitation (still deferred — FlatData fixed-size).** A variable-size / string `@key` member is
+**still a compile-time error** (the FlatData v1 FINAL fixed-size-scalar restriction is intact; variable-size
+keys ride the Builder follow-up). The keyhash, the loan path, the copy path, and dispose/unregister are
+validated by internal tests (231 green SBCL+Clasp; the SBCL-only ZC loan tests pass-skip on Clasp).
+
+**Pending final gate — cross-DDS interop (F1, owner directive 2026-06-17).** Per the new per-feature DoD,
+the keyhash byte-exactness and keyed instance identity must be **confirmed on the wire against RTI Connext +
+Fast DDS** (a keyed FlatData instance matching/disposing against a foreign keyed peer). That cross-DDS interop
+verification is tracked as the **F1 final gate and is PENDING** — internal byte-exactness vs the spec rule and
+vs our own struct keyhash is proven; live-peer confirmation is the remaining step before this row is fully closed.
 
 **NOT cleared for ship — pending counsel (R6); see the R6 — PATENT GATE section above.**

@@ -40,6 +40,17 @@
   (a :i32)
   (b :i32))
 
+;; WP-KEYED-FLATDATA cross-DDS interop type (FR-PF-4, RTPS 2.5 §9.6.4.8, R6): a FlatData type carrying a
+;; fixed-size scalar @key (i32 id) — the foreign-side counterpart is interop/keyed-flatdata/KeyedFlat.idl
+;; (struct KeyedFlat { @key long id; long x; long y; }). The i32 @key takes the <=16 direct/zero-padded
+;; keyhash path; key-hash-keyed-flat-fd reads it off the FlatData buffer byte-identically to the struct
+;; key-hash-keyed-flat, so a non-FlatData peer (Connext/Fast DDS) computes the SAME instance identity. The
+;; WIRE/copy path (plain UDP, no *zerocopy-enabled*) is the interoperable path; same-host ZC loan is not.
+(dds.gen:define-dds-type keyed-flat (:flatdata t)
+  (id :i32 :key t)
+  (x :i32)
+  (y :i32))
+
 (defun* %shape-type-information ()
     (function () (or null (simple-array (unsigned-byte 8) (*))))
   "Opaque serialized XTypes TypeInformation for the canonical ShapeType, advertised in
@@ -993,5 +1004,125 @@
                (sleep 0.1))
           (format t "~&[nokey-sub] stopped; received ~d sample(s); matched=~d.~%"
                   seen (dds.dcps:matched-count p))
+          (dds.dcps:delete-participant p))))
+    t))
+
+;;; ---- WP-KEYED-FLATDATA cross-DDS interop harness (FR-PF-4, RTPS 2.5 §9.6.4.8, R6) ----
+;;; The our-side peer for interop/keyed-flatdata/ (Connext + Fast DDS). Plain UDP (NO ZeroCopy): the keyed
+;;; FlatData sample is serialized to the wire and the peer derives the per-key instance from the i32 @key in
+;;; the XCDR2 payload (alive DATA carries no PID_KEY_HASH — RTPS 2.5 §8.4.5.4 / dds-disc/dataplane.lisp), so
+;;; the conformance crux is that our keyhash byte-matches the peer's for the same key value. Mirrors the
+;;; run-nokey-{publisher,subscriber} DCPS pattern; the :peers loopback passthrough sidesteps the macOS
+;;; LAN-UDP firewall for a freshly built foreign peer binary (same recipe as interop/connext/nokey).
+
+(defun* %keyhash-hex (handle)
+    (function ((array (unsigned-byte 8) (*))) string)
+  "A 16-octet instance handle / keyhash (RTPS 2.5 §9.6.4.8) as a lowercase hex string, so the per-key
+   instance identity is visible+comparable on the wire across implementations (ours vs Connext/Fast DDS)."
+  (with-output-to-string (s)
+    (loop for b across handle do (format s "~(~2,'0x~)" b))))
+
+(defun* run-keyed-flat-publisher (&key (domain 0) (rate 5) (count 0) (keys 3)
+                                       (dispose-after 0) (advertise-address "127.0.0.1") (peers nil))
+    (function (&key (:domain (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:keys (integer 1))
+                    (:dispose-after (integer 0)) (:advertise-address string) (:peers (or null string))) t)
+  "Publish keyed FlatData KeyedFlat (i32 @key id; i32 x; i32 y) on topic 'KeyedFlat' / type 'keyed-flat'
+   via the DCPS COPY path (plain UDP — NO ZeroCopy/loan; the same-host ZC loan path is not wire-interop).
+   Cycles id over 0..KEYS-1 so a subscriber demonstrates per-key instance grouping; for each sample prints
+   the per-key keyhash (RTPS 2.5 §9.6.4.8) so the cross-impl instance identity is visible. RELIABLE +
+   KEEP_ALL. RATE updates/sec; COUNT 0 = forever (Ctrl-C). DISPOSE-AFTER>0 disposes EACH key once that many
+   samples have been sent, then keeps publishing the survivors — proving dispose-BY-KEY crosses the wire
+   (the dispose DATA carries PID_KEY_HASH inline-QoS, RTPS 2.5 §9.6.4.8/§9.6.4.9). PEERS is an optional
+   \"host:port[,host:port]\" unicast SPDP target list (FR-DISC-4) reaching a same-host foreign peer over
+   loopback when the macOS firewall drops LAN-sourced UDP for an unapproved binary (cf. interop/connext/nokey)."
+  (let* ((ts (dds.types:find-type-support "keyed-flat"))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :peers (%parse-peers peers))))
+    (unless ts (error "run-keyed-flat-publisher: no registered type-support \"keyed-flat\""))
+    (let* ((tp (dds.dcps:create-topic p "KeyedFlat" "keyed-flat" ts))
+           (pub (dds.dcps:create-publisher p))
+           (dw (dds.dcps:create-datawriter
+                pub tp :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+           (fd (make-keyed-flat-flatdata))
+           (disposed (make-hash-table :test 'eql)))
+      (format t "~&[kflat-pub] KeyedFlat/keyed-flat domain=~d (WITH_KEY 0x02 writer, COPY/UDP, reliable, ~d key(s)). Ctrl-C to stop.~%"
+              domain keys)
+      (let ((period (/ 1.0 rate)) (n 0))
+        (unwind-protect
+             (loop
+               (dds.dcps:spin p)
+               (incf n)
+               (let ((id (mod n keys)))
+                 (setf (keyed-flat-id-fd fd) id
+                       (keyed-flat-x-fd fd) (+ 50 (mod n 100))
+                       (keyed-flat-y-fd fd) (+ 50 (mod (* n 7) 100)))
+                 (dds.dcps:write-sample dw fd)
+                 (when (zerop (mod n keys))
+                   (format t "~&[kflat-pub] sent #~d id=~d x=~d y=~d keyhash=~a; matched=~d~%"
+                           n id (keyed-flat-x-fd fd) (keyed-flat-y-fd fd)
+                           (%keyhash-hex (key-hash-keyed-flat-fd fd)) (dds.dcps:matched-count p)))
+                 ;; dispose-by-key: once each key has reached DISPOSE-AFTER, dispose it ONCE (by sample -> keyhash)
+                 (when (and (plusp dispose-after) (>= n (* dispose-after keys)) (not (gethash id disposed)))
+                   (dds.dcps:dispose-instance dw fd)
+                   (setf (gethash id disposed) t)
+                   (format t "~&[kflat-pub] DISPOSED key id=~d (keyhash=~a) — dispose DATA carries PID_KEY_HASH inline-QoS~%"
+                           id (%keyhash-hex (key-hash-keyed-flat-fd fd)))))
+               (when (and (plusp count) (>= n count)) (return))
+               (sleep period))
+          (format t "~&[kflat-pub] stopped after ~d samples; matched=~d.~%" n (dds.dcps:matched-count p))
+          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd))
+          (dds.dcps:delete-participant p))))
+    t))
+
+(defun* run-keyed-flat-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1") (peers nil))
+    (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string) (:peers (or null string))) t)
+  "Subscribe to keyed FlatData KeyedFlat on topic 'KeyedFlat' / type 'keyed-flat' via the DCPS COPY path
+   (plain UDP — NO ZeroCopy). For each delivered sample prints the SampleInfo per-key instance handle
+   (RTPS 2.5 §9.6.4.8 keyhash, computed by %instance-handle -> key-hash-keyed-flat-fd off the deserialized
+   FlatData buffer) and the x/y read in place, and tracks the set of distinct instances seen — so a foreign
+   (Connext/Fast DDS) publisher's samples GROUP into the correct per-key instances iff our keyhash matches the
+   peer's. An invalid-data sample is an instance-state change (a dispose-BY-KEY from the peer, carrying
+   PID_KEY_HASH inline-QoS). SECONDS 0 = forever (Ctrl-C). PEERS as in run-keyed-flat-publisher."
+  (let* ((ts (dds.types:find-type-support "keyed-flat"))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :peers (%parse-peers peers))))
+    (unless ts (error "run-keyed-flat-subscriber: no registered type-support \"keyed-flat\""))
+    (let* ((tp (dds.dcps:create-topic p "KeyedFlat" "keyed-flat" ts))
+           (sub (dds.dcps:create-subscriber p))
+           (dr (dds.dcps:create-datareader
+                sub tp :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all))))
+      (format t "~&[kflat-sub] KeyedFlat/keyed-flat domain=~d (WITH_KEY 0x07 reader, COPY/UDP, reliable). Ctrl-C to stop.~%"
+              domain)
+      (let ((seen 0) (instances (make-hash-table :test 'equal))
+            (start (get-internal-real-time)) (matched-reported nil))
+        (unwind-protect
+             (loop
+               (dds.dcps:spin p)
+               (dolist (cs (dds.dcps:take-samples dr))
+                 (handler-case
+                     (let* ((info (dds.dcps:cached-sample-info cs))
+                            (h (dds.dcps:sample-info-instance-handle info))
+                            (hx (%keyhash-hex h)))
+                       (setf (gethash hx instances) t)
+                       (if (dds.dcps:sample-info-valid-data info)
+                           (let ((s (dds.dcps:cached-sample-data cs)))
+                             (incf seen)
+                             (format t "~&[kflat-sub] #~d id=~d x=~d y=~d instance(keyhash)=~a~%"
+                                     seen (keyed-flat-id-fd s) (keyed-flat-x-fd s) (keyed-flat-y-fd s) hx))
+                           (format t "~&[kflat-sub] INSTANCE_STATE ~a (no data) instance(keyhash)=~a — dispose-by-key from peer~%"
+                                   (dds.dcps:sample-info-instance-state info) hx)))
+                   (error (e)
+                     (format t "~&[kflat-sub] skipped undeliverable sample (~a)~%" (type-of e)))))
+               (let ((ms (dds.dcps:matched-count p)))
+                 (when (and (plusp ms) (not matched-reported))
+                   (setf matched-reported t)
+                   (format t "~&[kflat-sub] MATCHED ~d remote endpoint(s) (keyed pair).~%" ms)))
+               (when (and (plusp seconds)
+                          (> (/ (- (get-internal-real-time) start) internal-time-units-per-second)
+                             seconds))
+                 (return))
+               (sleep 0.1))
+          (format t "~&[kflat-sub] stopped; received ~d sample(s) in ~d distinct instance(s); matched=~d.~%"
+                  seen (hash-table-count instances) (dds.dcps:matched-count p))
           (dds.dcps:delete-participant p))))
     t))
