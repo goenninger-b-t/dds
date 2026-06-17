@@ -150,8 +150,9 @@
 (defun* run-publisher (&key (domain 0) (color "BLUE") (shapesize 30) (rate 30) (count 0)
                            (advertise-address "127.0.0.1") (type :tagged) (peers nil)
                            (liveliness :automatic) (liveliness-lease-seconds 0) (dispose-after 0)
-                           (batch 1) (async nil))
-    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0)) (:dispose-after (integer 0)) (:batch (integer 1)) (:async t)) t)
+                           (batch 1) (async nil) (fault-after 0) (fault-count 0) (port 0)
+                           (history-kind :keep-last))
+    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0)) (:dispose-after (integer 0)) (:batch (integer 1)) (:async t) (:fault-after (integer 0)) (:fault-count (integer 0)) (:port (unsigned-byte 16)) (:history-kind (member :keep-last :keep-all))) t)
   "Publish an animated Square on DOMAIN via multicast discovery. TYPE selects the
    payload: :canonical = the exact RTI ShapeType (color/x/y/shapesize — for interop
    with rtishapesdemo / DDSSpy); :tagged = + per-publisher uuid + per-sample seq
@@ -162,10 +163,23 @@
    layer silently drops LAN-sourced UDP for unapproved peer binaries. LIVELINESS
    (:automatic | :manual-by-participant | :manual-by-topic) + LIVELINESS-LEASE-SECONDS
    set the writer's LIVELINESS QoS (advertised via PID_LIVELINESS); a positive lease
-   builds an explicit reliable writer QoS, otherwise the default reliable writer is used."
+   builds an explicit reliable writer QoS, otherwise the default reliable writer is used.
+   HISTORY-KIND (:keep-last default / :keep-all) sets the writer HISTORY QoS; :keep-all retains
+   un-acked samples so a dropped reliable DATA is repairable (the spec default KEEP_LAST depth 1
+   keeps only the latest per instance). PORT>0 binds + advertises a fixed loopback metatraffic
+   port so a foreign peer can reply to our unicast SPDP (0 = ephemeral). FAULT-AFTER>0 +
+   FAULT-COUNT>0 (FAULT=k@j; WP-SENDER-ERROR-RESILIENCE interop DoD, FR-PF-2, async only): after
+   the FAULT-AFTER-th publish, drive EXACTLY FAULT-COUNT synthetic emit faults onto the ASYNC
+   sender thread (arm dds.disc:*debug-emit-fault* :persistent, publish that many one-at-a-time
+   waiting for the async emit-error counter to advance, then clear) so the guard catches each on
+   the guarded async send and the thread survives (RTPS 2.5 §8.4 reliability repairs the dropped
+   DATA); the final report prints the caught-emit-error count + the sender-thread-alive verdict
+   (our-side survival evidence). Inert when either is 0 (production default) — byte-identical wire."
   (check-type type (member :canonical :tagged))
+  ;; PORT>0 binds a fixed metatraffic port (advertised verbatim) so a foreign peer can reply to our
+  ;; unicast SPDP over loopback; 0 = ephemeral (default, multicast discovery).
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
-                                       :multicast t :advertise-address advertise-address
+                                       :multicast t :advertise-address advertise-address :port port
                                        :peers (%parse-peers peers) :batch-max-samples batch)))
     (if (> liveliness-lease-seconds 0)
         (dds.disc:add-local-writer
@@ -175,7 +189,7 @@
         (dds.disc:add-local-writer node :topic "Square" :type "ShapeType"
                                    :reliability dds.rtps.discovery:+reliability-reliable+
                                    :type-information (%shape-type-information)))
-    (dds.disc:enable-publisher node)
+    (dds.disc:enable-publisher node :history-kind history-kind)
     (when async (dds.disc:enable-async node))
     (dds.disc:start-node node)
     (let ((uuid (%make-uuid)))
@@ -183,6 +197,16 @@
               type color domain uuid)
       (let ((x 50) (y 50) (dx 3) (dy 2) (period (/ 1.0 rate)) (n 0) (last 0) (seq 0)
             (dests (make-hash-table :test 'equalp)))
+        ;; ASYNC: drain the SPDP/SEDP handshake to a match BEFORE the first publish — async flushes user
+        ;; DATA the instant publish-sample signals it, and a reliable foreign peer (Connext/Fast DDS) that
+        ;; receives unsolicited DATA from a not-yet-matched writer over loopback can stall its discovery
+        ;; (bounded ~6s; falls through if no peer appears, so a no-peer demo run is unaffected).
+        (when async
+          (loop repeat 300
+                until (plusp (dds.disc:disc-node-matched-count node))
+                do (setf last (%reannounce node last)) (sleep 0.02))
+          (format t "~&[pub] async pre-publish match=~:[NO (publishing anyway)~;YES~]~%"
+                  (plusp (dds.disc:disc-node-matched-count node))))
         (unwind-protect
              (loop
                (setf last (%reannounce node last))
@@ -213,6 +237,26 @@
                                                           :uuid uuid :seq seq)
                                        wc :xcdr2))))))
                (incf n)
+               ;; FAULT=k@j: after the j-th publish, drive EXACTLY k faults onto the ASYNC sender thread (FR-PF-2).
+               ;; Arm :persistent then publish k samples one at a time, each waiting for the async emit-error
+               ;; counter to advance, so every fault is consumed by the guarded async send (never the unguarded
+               ;; caller-thread announce path), mirroring run-async-emit-fault-survives-test. The thread survives
+               ;; all k; the dropped reliable DATAs are repaired via HEARTBEAT/ACKNACK (RTPS 2.5 §8.4).
+               (when (and async (plusp fault-after) (plusp fault-count) (= n fault-after))
+                 (format t "~&[pub] FAULT: driving ~d emit fault(s) onto the async sender thread (it must survive each)~%" fault-count)
+                 (let ((base (dds.disc::disc-node-async-emit-errors node)))
+                   (setf dds.disc:*debug-emit-fault* :persistent)
+                   (dotimes (k fault-count)
+                     (incf seq) (incf n)
+                     (dds.disc:publish-sample
+                      node (%serialize-payload
+                            (lambda (wc) (serialize-shape-type
+                                          (make-shape-type :color color :x x :y y :shapesize shapesize) wc :xcdr2))))
+                     (loop repeat 400 until (>= (dds.disc::disc-node-async-emit-errors node) (+ base k 1)) do (sleep 0.01)))
+                   (setf dds.disc:*debug-emit-fault* nil)
+                   (format t "~&[pub] FAULT window done: async caught ~d fault(s); sender thread alive=~:[NO~;YES~]~%"
+                           (- (dds.disc::disc-node-async-emit-errors node) base)
+                           (and (dds.disc::disc-node-async-thread node) t))))
                (when (zerop (mod n 30))
                  (format t "~&[pub] sent ~d samples; peers=~d; ACKNACKs received=~d~%"
                          n (hash-table-count dests) (dds.disc:node-acks-in node)))
@@ -226,9 +270,21 @@
                    (return)))
                (when (and (plusp count) (>= n count)) (return))
                (sleep period))
-          (dds.disc:stop-node node)
-          (format t "~&[pub] stopped after ~d samples; ACKNACKs received=~d (uuid=~a).~%"
-                  n (dds.disc:node-acks-in node) uuid))))
+          ;; Bounded reliable drain (count>0 only): push a HEARTBEAT every iteration (not the 1.5s-gated reannounce)
+          ;; so a reliable peer NACKs any tail gap and we retransmit BEFORE teardown (RTPS 2.5 §8.4.2.2) — otherwise
+          ;; the last few samples are lost when stop-node closes the socket mid-repair. Harmless for a forever run.
+          (when (plusp count)
+            (loop repeat 60 do (setf last (%reannounce node last)) (dds.disc::%push-heartbeat node) (sleep 0.05)))
+          ;; WP-SENDER-ERROR-RESILIENCE survival evidence: read the sender-thread state BEFORE stop-node clears it
+          (let ((emit-errors (dds.disc::disc-node-async-emit-errors node))
+                (alive (and (dds.disc::disc-node-async-thread node) t)))
+            (setf dds.disc:*debug-emit-fault* nil)
+            (when (or (plusp fault-after) (plusp emit-errors))
+              (format t "~&[pub] SENDER-RESILIENCE: caught emit faults=~d; async sender thread alive=~:[NO~;YES~] (still publishing through teardown).~%"
+                      emit-errors alive))
+            (dds.disc:stop-node node)
+            (format t "~&[pub] stopped after ~d samples; ACKNACKs received=~d (uuid=~a).~%"
+                    n (dds.disc:node-acks-in node) uuid)))))
     t))
 
 (defun* %octets-hex (octets)

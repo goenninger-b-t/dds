@@ -45,6 +45,8 @@
            #:node-lifecycle-change #:node-lifecycle-change-by-sn #:node-lifecycle-count #:node-lifecycle-sns
            #:*debug-drop-fragment-numbers*
            #:*debug-drop-sample-numbers*
+           ;; WP-SENDER-ERROR-RESILIENCE (FR-PF-2): the sender-thread emit guard + its observability + test affordance
+           #:*sender-emit-error-hook* #:with-sender-emit-guard #:*debug-emit-fault* #:sender-emit-test-fault
            #:node-discovered-participants #:resolved-destination #:node-acks-in
            #:+entityid-tl-req-writer+ #:+entityid-tl-req-reader+
            #:+entityid-tl-reply-writer+ #:+entityid-tl-reply-reader+

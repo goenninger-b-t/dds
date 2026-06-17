@@ -41,6 +41,17 @@ LIVELINESS_ARGS := $(if $(LIVELINESS),:liveliness :$(LIVELINESS),)$(if $(LEASE),
 # Optional WP-BATCH / WP-ASYNC for square-pub: BATCH=N (>1 batches), ASYNC=t (decoupled sender thread).
 BATCH    ?= 1
 PERF_ARGS := :batch $(BATCH)$(if $(ASYNC), :async t,)
+# WP-SENDER-ERROR-RESILIENCE square-pub fault injection: FAULT=k@j arms a k-shot synthetic emit
+# fault after the j-th publish (k = fault-count before the @, j = fault-after after it); empty = inert.
+FAULT    ?=
+FAULT_ARGS := $(if $(FAULT), :fault-count $(word 1,$(subst @, ,$(FAULT))) :fault-after $(word 2,$(subst @, ,$(FAULT))),)
+# Optional fixed metatraffic port for square-pub (PORT>0): bind+advertise a reachable loopback locator
+# so a foreign peer can reply to our unicast SPDP; 0 (default) = ephemeral (multicast discovery).
+PORT     ?= 0
+# Optional writer HISTORY for square-pub: HISTORY=keep-all retains-until-acked (needed for full reliable
+# repair of a dropped/un-acked sample); empty -> keep-last (the spec generic default, depth 1).
+HISTORY  ?=
+HISTORY_ARGS := $(if $(HISTORY),:history-kind :$(HISTORY),)
 # Optional reader OWNERSHIP QoS for gated-sub (shared|exclusive); empty -> :shared default.
 OWNERSHIP_ARGS := $(if $(OWNERSHIP),:ownership :$(OWNERSHIP),)
 
@@ -88,7 +99,7 @@ wire:
 # Ctrl-C to stop. Override DOMAIN=.. COLOR=.. ; LISP=$(SBCL) used (CFFI multicast).
 square-pub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" $(LIVELINESS_ARGS) $(PERF_ARGS))' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" :port $(PORT) $(LIVELINESS_ARGS) $(PERF_ARGS) $(FAULT_ARGS) $(HISTORY_ARGS))' \
 	        --eval '(uiop:quit 0)'
 
 square-sub:

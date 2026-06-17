@@ -157,6 +157,7 @@
   (async-pending nil :type t)             ; work to flush (guarded by async-lock)
   (async-stop nil :type t)                ; shutdown requested (guarded by async-lock)
   (async-tx-msg nil :type (or null dds.core.buffer:octet-buffer)) ; the sender thread's OWN scratch buffer
+  (async-emit-errors 0 :type fixnum) ; WP-SENDER-ERROR-RESILIENCE: count of emit errors the async sender thread caught + survived (FR-PF-2)
   (flow-step-state nil :type t) ; WP-ASYNC-FLOW: the node's in-progress per-datagram send plan ((host . port) . PLAN), threaded across %flow-step-emit calls; NIL = rebuild on next call
   (flow-controller nil :type t) ; WP-ASYNC-FLOW: the flow-controller this writer is associated with (NIL = none); set/cleared under the CONTROLLER lock; non-NIL makes publish async-and-paced (the controller thread sends)
   (flow-pending nil :type t)    ; WP-ASYNC-FLOW: new unsent work awaiting a fresh plan snapshot; set by %flow-signal, cleared by the scheduler — guarded by the CONTROLLER lock (NOT the node lock)

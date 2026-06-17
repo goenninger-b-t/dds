@@ -108,7 +108,8 @@
   (stop nil :type t)                 ; shutdown requested (guarded by LOCK)
   (current-emit-node nil :type t)    ; per-node emit barrier: the node the scheduler is mid-emit on, else NIL (guarded by LOCK)
   (emit-done-cv (dds.pal:make-condvar) :type t)   ; signalled (under LOCK) when an emit on CURRENT-EMIT-NODE completes — unregister waits on it
-  (scratch nil :type (or null dds.core.buffer:octet-buffer)))   ; scheduler thread's OWN scratch send-buffer
+  (scratch nil :type (or null dds.core.buffer:octet-buffer))   ; scheduler thread's OWN scratch send-buffer
+  (emit-errors 0 :type fixnum))   ; WP-SENDER-ERROR-RESILIENCE: count of emit errors the scheduler thread caught + survived (FR-PF-2)
 
 (defun* %flow-node-pending-p (controller node)
     (function (flow-controller dds.disc::disc-node) t)
@@ -193,7 +194,14 @@
    on the first datagram of a plan — the B1 contract: build the plan once, step to completion, re-snapshot
    only after it drains), acquire tokens for that datagram's exact length (sleeping the deficit), then send
    the already-built datagram and advance the plan cursor (%EMIT-PLAN-ENTRY with the token-acquire BEFORE-SEND
-   hook). On STOP, flush every registered writer's remaining datagrams IGNORING the bucket and return.
+   hook). The emit is wrapped in WITH-SENDER-EMIT-GUARD (:FLOW-SCHEDULER) and the plan cursor is advanced
+   UNCONDITIONALLY (Option 1: drop + advance — WP-SENDER-ERROR-RESILIENCE, FR-PF-2): a signalled emit error is
+   caught INSIDE the unwind-protect (so the per-node barrier cleanup still disarms and the error never escapes
+   the loop), the scheduler counts it (EMIT-ERRORS) + fires *SENDER-EMIT-ERROR-HOOK* and moves on, so the
+   scheduler thread never dies from one bad emit and the cursor always progresses (no hot-spin — the unsent
+   watermark already advanced at SNAPSHOT time, so a drained faulted plan is never re-snapshotted). A dropped
+   reliable DATA stays in the HistoryCache and is recovered via the HEARTBEAT/ACKNACK repair (RTPS 2.5 §8.4).
+   On STOP, flush every registered writer's remaining datagrams IGNORING the bucket and return.
 
    LOCK ORDERING (correctness-critical, BINARY gate). The controller LOCK guards ONLY {condvar-wait,
    RR-pick/cursor, FLOW-PENDING flags, %FB-ACQUIRE token math, the writers list, STOP}. It is NEVER held
@@ -249,9 +257,10 @@
                       (dds.disc::%node-datagram-plan node (flow-controller-scratch controller))))
               (let ((plan (dds.disc::disc-node-flow-step-state node)))
                 (when plan   ; NIL plan = nothing actually unsent (raced); node drops out of pending until re-signalled
-                  (dds.disc::%emit-plan-entry node (flow-controller-scratch controller) (car plan)
-                                              (%flow-acquire-hook controller))
-                  (setf (dds.disc::disc-node-flow-step-state node) (cdr plan)))))
+                  (with-sender-emit-guard (:flow-scheduler (flow-controller-emit-errors controller))   ; catch INSIDE the unwind-protect: barrier cleanup still disarms, the error never escapes the loop
+                    (dds.disc::%emit-plan-entry node (flow-controller-scratch controller) (car plan)
+                                                (%flow-acquire-hook controller)))
+                  (setf (dds.disc::disc-node-flow-step-state node) (cdr plan)))))   ; advance the cursor whether sent or dropped (Option 1: drop + advance; reliability repairs via NACK/HEARTBEAT)
           (dds.pal:with-lock ((flow-controller-lock controller))   ; disarm the barrier: emit on NODE is done
             (setf (flow-controller-current-emit-node controller) nil)
             (dds.pal:condvar-signal (flow-controller-emit-done-cv controller)))))))

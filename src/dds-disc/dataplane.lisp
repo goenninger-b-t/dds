@@ -29,6 +29,55 @@
    happens. The copy is allocated only while the sink is bound, so there is no production cost. Never
    set in production.")
 
+(define-condition sender-emit-test-fault (error) ()
+  (:report (lambda (c s) (declare (ignore c)) (format s "synthetic sender-thread emit fault (test only)")))
+  (:documentation "Test-only synthetic ERROR injected by *DEBUG-EMIT-FAULT* to exercise the sender-thread emit
+   guards (WITH-SENDER-EMIT-GUARD). Never signalled in production (*DEBUG-EMIT-FAULT* defaults NIL)."))
+
+(defparameter *debug-emit-fault* nil
+  "Test affordance (inert when NIL): a positive integer N signals SENDER-EMIT-TEST-FAULT on the next N
+   %SEND-RAW-BUF calls (decrementing toward NIL, single-driver only — the decrement is non-atomic, fine for a
+   single sender thread under test); :PERSISTENT signals on EVERY call (the no-spin test). Production default
+   NIL = byte-identical wire, zero effect. Mirrors *DEBUG-DROP-SAMPLE-NUMBERS*. Never set in production.")
+
+(defun* %power-of-ten-p (n)
+    (function ((integer 1)) t)
+  "T iff N is a positive power of ten (1, 10, 100, …): divide out 10s, accept iff the residue is 1."
+  (loop for x of-type (integer 1) = n then (truncate x 10)
+        when (= x 1) return t
+        when (plusp (mod x 10)) return nil))
+
+(defun* %default-sender-emit-error-hook (condition context count)
+    (function (condition t (integer 1)) t)
+  "Default *SENDER-EMIT-ERROR-HOOK*: a clockless rate-limited WARN to *ERROR-OUTPUT* — log only when COUNT is
+   a power of ten (1, 10, 100, …) so a persistent emit failure logs O(log n) lines, never a per-iteration
+   flood (no logging framework exists; this is the minimal observable default). Runs ON the sender thread."
+  (when (%power-of-ten-p count)
+    (warn "dds sender thread (~a) emit error #~d: ~a" context count condition))
+  t)
+
+(defparameter *sender-emit-error-hook* #'%default-sender-emit-error-hook
+  "Funcallable (CONDITION CONTEXT COUNT) invoked when a sender thread's emit signals an ERROR that
+   WITH-SENDER-EMIT-GUARD caught. CONTEXT is a keyword tagging the thread (:ASYNC-SENDER / :FLOW-SCHEDULER);
+   COUNT is that thread's running error count (>= 1). Runs ON the sender thread, so it MUST NOT block; a
+   signalling hook is itself swallowed (IGNORE-ERRORS in the guard) so the thread is never re-killed by the
+   hook. Bind it to observe sender-thread emit errors. Default = %DEFAULT-SENDER-EMIT-ERROR-HOOK.")
+
+(defmacro with-sender-emit-guard ((context count-place) &body body)
+  "Run BODY (one sender-thread emit). On a caught ERROR — NOT a SERIOUS-CONDITION (a fatal VM state such as
+   storage-condition/control-stack-exhausted SHOULD still terminate the thread; masking it would hide an
+   unrecoverable condition) — INCF COUNT-PLACE, fire *SENDER-EMIT-ERROR-HOOK* (itself IGNORE-ERRORS-guarded so
+   a signalling hook cannot re-kill the thread), and return NIL; on success return BODY's value. CONTEXT is a
+   keyword tagging the thread. The thread never dies from one bad emit (RTPS 2.5 §8.4: a dropped reliable DATA
+   is recovered via the HEARTBEAT/ACKNACK repair path; a best-effort drop is conformant). A macro (no per-emit
+   closure) → 0-alloc; the sender threads are off the measured CDR hot path regardless."
+  (let ((c (gensym "C")))
+    `(handler-case (progn ,@body)
+       (error (,c)
+         (let ((n (incf ,count-place)))
+           (ignore-errors (funcall *sender-emit-error-hook* ,c ,context n)))
+         nil))))
+
 (defun* %send-raw-buf (node buf len host port &optional shmem-dest)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) string (unsigned-byte 16) &optional t) t)
   "Send the first LEN octets of BUF (a complete RTPS message) as ONE datagram — the raw one-datagram send
@@ -40,6 +89,10 @@
    byte-for-byte unchanged. Hands a copy to *DATAGRAM-SINK* first when that test hook is bound."
   (when *datagram-sink*
     (funcall *datagram-sink* (subseq (dds.core.buffer:octet-buffer-vec buf) 0 len)))
+  (when *debug-emit-fault*
+    (when (integerp *debug-emit-fault*)
+      (setf *debug-emit-fault* (when (> *debug-emit-fault* 1) (1- *debug-emit-fault*))))   ; N -> N-1, last -> NIL
+    (error 'sender-emit-test-fault))   ; :persistent or a positive integer: inject; inert when NIL
   (when (and shmem-dest (disc-node-shmem node))
     (when (plusp (dds.xport:send (dds.xport.shmem:shmem-transport-transport (disc-node-shmem node))
                                  shmem-dest buf 0 len))
@@ -757,7 +810,8 @@
         (setf stop (disc-node-async-stop node)
               (disc-node-async-pending node) nil))
       (when (disc-node-user-writer node)
-        (%push-data-buf node (disc-node-async-tx-msg node)))
+        (with-sender-emit-guard (:async-sender (disc-node-async-emit-errors node))
+          (%push-data-buf node (disc-node-async-tx-msg node))))
       (when stop (return))))
   t)
 

@@ -4924,6 +4924,418 @@
       (dds.disc:stop-node w) (dds.disc:stop-node r)))
   t)
 
+(defun* run-async-emit-fault-survives-test ()
+    (function () t)
+  "WP-SENDER-ERROR-RESILIENCE scenario 1 (FR-PF-2, RTPS 2.5 §8.4): the async sender thread SURVIVES injected
+   transient emit faults and keeps sending. Phase 1: with the fault armed, publish 3 samples ONE AT A TIME,
+   each time waiting for the async emit-error counter to advance — so exactly 3 faults are caught on the async
+   sender thread (a faulted flush drops both the DATA and its coalesced HEARTBEAT, so the reader never NACKs
+   during this phase ⇒ no receiver-thread retransmit steals the fault budget; deterministic). Phase 2: clear
+   the fault, publish 3 more (these deliver), then drive the periodic HEARTBEAT so the reader NACKs the 3
+   gaps and the writer retransmits the held samples. Assert: the thread is still alive (slot non-NIL + still
+   working — a dead thread could neither bump the counter nor deliver), the hook fired 3x with :ASYNC-SENDER,
+   the counter = 3, and ALL 6 samples are delivered (the 3 dropped DATAs repaired via HEARTBEAT/ACKNACK)."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 43))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 44))
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (lock (dds.pal:make-lock "async-fault-fired"))
+         (fired '())
+         (saved-hook dds.disc:*sender-emit-error-hook*))
+    ;; The hook runs ON the async sender thread, which does NOT inherit this thread's dynamic bindings, so set
+    ;; the GLOBAL value (restored in cleanup); the lock guards the cross-thread FIRED list.
+    (setf dds.disc:*sender-emit-error-hook*
+          (lambda (c ctx n) (declare (ignore n))
+            (dds.pal:with-lock (lock) (push (cons ctx (type-of c)) fired))))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "AsyncFaultT" :type "X")
+           (dds.disc:enable-publisher w :history-kind :keep-all)   ; KEEP_ALL: all samples must survive the drops + repair
+           (dds.disc:enable-async w)
+           (dds.disc:add-local-reader r :topic "AsyncFaultT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (%check :async-fault-matched (plusp (dds.disc:disc-node-matched-count w))
+                   "async writer must match the reader before publishing")
+           ;; Phase 1: arm a persistent fault, publish 3 samples one at a time, waiting for each to fault.
+           (setf dds.disc:*debug-emit-fault* :persistent)   ; every async flush faults until cleared
+           (dotimes (i 3)
+             (dds.disc:publish-sample w (octets 7 7 7 7 7 7 7 i))
+             (loop repeat 400 until (>= (dds.disc::disc-node-async-emit-errors w) (1+ i)) do (sleep 0.01))
+             (%check :async-fault-step (>= (dds.disc::disc-node-async-emit-errors w) (1+ i))
+                     "each armed publish must fault the async sender thread (counter advances)"))
+           ;; Phase 2: clear the fault, publish 3 deliverable samples, then drive repair of the 3 dropped.
+           (setf dds.disc:*debug-emit-fault* nil)
+           (dotimes (i 3) (dds.disc:publish-sample w (octets 7 7 7 7 7 7 8 i)))
+           (loop repeat 600
+                 until (>= (dds.disc:node-sample-count r) 6)
+                 do (dds.disc::%push-heartbeat w) (sleep 0.01))   ; periodic HB ⇒ reader NACKs the gaps ⇒ retransmit
+           (%check :async-fault-thread-slot-retained (dds.disc::disc-node-async-thread w)
+                   "the async sender thread slot must still be retained (non-NIL — only stop-node clears it) after the injected faults; the real liveness proof is the counter advancing + delivery")
+           (%check :async-fault-counter (= 3 (dds.disc::disc-node-async-emit-errors w))
+                   "exactly 3 emit faults must have been counted on the async sender thread")
+           (let ((snapshot (dds.pal:with-lock (lock) (copy-list fired))))
+             (%check :async-fault-hook-fired (= 3 (length snapshot))
+                     "the *sender-emit-error-hook* must have fired exactly 3 times")
+             (%check :async-fault-hook-context (every (lambda (e) (eq :async-sender (car e))) snapshot)
+                     "every hook fire must carry the :ASYNC-SENDER context"))
+           (%check :async-fault-delivered (>= (dds.disc:node-sample-count r) 6)
+                   "all 6 samples must still be delivered (the 3 dropped DATAs repaired via HEARTBEAT/ACKNACK)"))
+      (setf dds.disc:*debug-emit-fault* nil
+            dds.disc:*sender-emit-error-hook* saved-hook)
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
+(defun* run-emit-fault-inert-test ()
+    (function () t)
+  "WP-SENDER-ERROR-RESILIENCE scenario 4 (FR-PF-2): with *DEBUG-EMIT-FAULT* NIL the guard + injector are INERT.
+   Part 1 (byte-identity): a controllerless publish-sample (the guard is wired into the async loop, but the
+   injector is dormant) produces datagrams byte-identical to writer-write + %push-data — the wire is unchanged.
+   Part 2 (runtime inertness): an async writer delivers all samples to a loopback reader with the error counter
+   never advancing (= 0) and the hook never firing."
+  ;; -- Part 1: byte-identity — *debug-emit-fault* NIL ⇒ the send path is unchanged --
+  (let ((pub-node  (%flow-step-build-node #xE2 #xF2 7831 '()))
+        (push-node (%flow-step-build-node #xE2 #xF2 7831 '())))
+    (%check :inert-default-nil (null dds.disc:*debug-emit-fault*)
+            "*debug-emit-fault* must default to NIL (inert in production)")
+    (unwind-protect
+         (let ((pub-dgs  (loop for i below 4
+                               append (%flow-publish-capture pub-node (octets 5 5 5 5 5 5 5 5))))
+               (push-dgs (loop for i below 4
+                               append (let ((w (dds.disc::disc-node-user-writer push-node)))
+                                        (dds.rtps.reliable:writer-write w (octets 5 5 5 5 5 5 5 5))
+                                        (%coalesce-capture push-node)))))
+           (%check :inert-nonempty (plusp (length pub-dgs))
+                   "the inert publish path must still emit datagrams")
+           (%check :inert-byte-identical (%datagrams-identical-p pub-dgs push-dgs)
+                   "with *debug-emit-fault* NIL a publish must be byte-identical to writer-write + %push-data"))
+      (dds.disc:stop-node pub-node)
+      (dds.disc:stop-node push-node)))
+  ;; -- Part 2: runtime inertness — async delivery, the counter never advances, the hook never fires --
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 45))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 46))
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (lock (dds.pal:make-lock "inert-fired"))
+         (fired 0)
+         (saved-hook dds.disc:*sender-emit-error-hook*))
+    ;; The hook runs on the async sender thread (no inherited dynamic bindings), so set the GLOBAL value.
+    (setf dds.disc:*sender-emit-error-hook*
+          (lambda (c ctx n) (declare (ignore c ctx n)) (dds.pal:with-lock (lock) (incf fired))))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "InertT" :type "X")
+           (dds.disc:enable-publisher w :history-kind :keep-all)
+           (dds.disc:enable-async w)
+           (dds.disc:add-local-reader r :topic "InertT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (dotimes (i 10) (dds.disc:publish-sample w (octets 5 5 5 5 5 5 5 i)))
+           (loop repeat 400 until (>= (dds.disc:node-sample-count r) 10) do (sleep 0.01))
+           (%check :inert-delivered (>= (dds.disc:node-sample-count r) 10)
+                   "an inert async publish must deliver all 10 samples")
+           (%check :inert-counter-zero (zerop (dds.disc::disc-node-async-emit-errors w))
+                   "with no injected fault the async emit-error counter must stay 0")
+           (%check :inert-hook-silent (zerop (dds.pal:with-lock (lock) fired))
+                   "with no injected fault the *sender-emit-error-hook* must never fire"))
+      (setf dds.disc:*sender-emit-error-hook* saved-hook)
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
+(defun* run-flow-emit-fault-no-spin-test ()
+    (function () t)
+  "WP-SENDER-ERROR-RESILIENCE scenario 2 (FR-PF-2, RTPS 2.5 §8.4): under a PERSISTENT emit fault the flow
+   scheduler advances its plan cursor (drops + moves on), does NOT hot-spin, survives, and resumes when the
+   fault clears. A flow-controller paces a BEST_EFFORT writer (the paced scheduler is the sole delivery path).
+   Phase 1: arm *DEBUG-EMIT-FAULT* :persistent, publish K small samples (which COALESCE into a single DATA+
+   HEARTBEAT datagram per snapshot — so the plan here is ONE entry; the multi-entry cursor-advance-under-fault
+   path is exercised by run-flow-emit-fault-no-spin-multi-test); every scheduler emit faults so the cursor
+   drains each snapshotted plan and the node stops being pending (the unsent watermark advanced at SNAPSHOT
+   time, so a drained faulted plan is never re-snapshotted). The no-spin PROOF: the hook-fire count STABILISES
+   (two readings 0.3 s apart are equal — a spin would keep growing it) and is BOUNDED (<= K + slack, not
+   unbounded). Phase 2: clear the fault, publish K more; assert the writer RESUMES (the best-effort reader now
+   receives the new samples) — a dead scheduler thread could neither stabilise nor resume."
+  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-emit-fault-no-spin-test t))   ; timing-flaky on Clasp (mirrors the other flow tests)
+  (let* ((k 6)
+         (slack 4)
+         (payload (octets 9 9 9 9 9 9 9 9))
+         (w (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x97) :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA7) :host "127.0.0.1" :port 0))
+         (lock (dds.pal:make-lock "no-spin-fired"))
+         (fired 0)
+         (controller nil)
+         (saved-hook dds.disc:*sender-emit-error-hook*))
+    ;; The hook runs ON the scheduler thread (no inherited dynamic bindings), so set the GLOBAL value; the lock
+    ;; guards the cross-thread FIRED counter.
+    (setf dds.disc:*sender-emit-error-hook*
+          (lambda (c ctx n) (declare (ignore c ctx n)) (dds.pal:with-lock (lock) (incf fired))))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "NoSpinT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher w :history-kind :keep-all)
+           (dds.disc:add-local-reader r :topic "NoSpinT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber r)
+           (%flow-match-writer-reader w r "NoSpinT")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 1000000 :period 100000000
+                                                           :max-burst 1000000))   ; high rate: pacing never confounds the spin reading
+           (dds.disc:flow-controller-associate controller w)
+           ;; Phase 1: arm a persistent fault, publish K, let every scheduler emit fault + drain its plan.
+           (setf dds.disc:*debug-emit-fault* :persistent)
+           (dotimes (i k) (dds.disc:publish-sample w payload))
+           (loop repeat 100 until (plusp (dds.pal:with-lock (lock) fired)) do (sleep 0.005))   ; wait until the scheduler has faulted at least once
+           (sleep 0.3)
+           (let ((reading1 (dds.pal:with-lock (lock) fired)))
+             (sleep 0.3)
+             (let ((reading2 (dds.pal:with-lock (lock) fired)))
+               (format t "~&  [no-spin] persistent-fault fires: reading1=~d reading2=~d (K=~d)~%" reading1 reading2 k)
+               (%check :no-spin-fired-some (plusp reading2)
+                       "the scheduler must have caught at least one emit fault (it ran + advanced)")
+               (%check :no-spin-stable (= reading1 reading2)
+                       (format nil "the hook-fire count must STABILISE under a persistent fault (no hot-spin); ~
+                                    grew ~d -> ~d" reading1 reading2))
+               (%check :no-spin-bounded (<= reading2 (+ k slack))
+                       (format nil "the hook-fire count must be BOUNDED (<= K datagrams — here the K small ~
+                                    samples coalesce to 1 — not unbounded); ~d > ~d" reading2 (+ k slack)))))
+           (%check :no-spin-controller-alive (dds.disc::flow-controller-thread controller)
+                   "the flow-scheduler thread slot must still be retained after the persistent faults")
+           ;; Phase 2: clear the fault, publish K more; the writer must RESUME (best-effort reader gets them).
+           (setf dds.disc:*debug-emit-fault* nil)
+           (let ((before (dds.disc:node-sample-count r)))
+             (dotimes (i k) (dds.disc:publish-sample w payload))
+             (loop repeat 600 until (> (dds.disc:node-sample-count r) before) do (sleep 0.005))
+             (%check :no-spin-resumes (> (dds.disc:node-sample-count r) before)
+                     "the scheduler must RESUME delivering once the fault clears (new samples reach the reader)")))
+      (setf dds.disc:*debug-emit-fault* nil
+            dds.disc:*sender-emit-error-hook* saved-hook)
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
+(defun* run-flow-emit-fault-no-spin-multi-test ()
+    (function () t)
+  "WP-SENDER-ERROR-RESILIENCE scenario 2, MULTI-ENTRY strengthening (FR-PF-2, RTPS 2.5 §8.4): the sibling
+   run-flow-emit-fault-no-spin-test drains a SINGLE coalesced datagram (its K small samples coalesce to one
+   plan entry); this test forces a >=3-ENTRY plan in one snapshot so the scheduler walks the MULTI-element plan
+   cursor (setf flow-step-state (cdr plan)) while EVERY emit faults. A single 4000-octet sample fragments into
+   a DATA_FRAG series + HEARTBEAT_FRAG = multiple datagram entries (one per fragment group), exactly as
+   run-flow-step-equivalence Case 2 establishes. PRECONDITION proof: an equivalently-built twin node's
+   %node-datagram-plan is snapshotted DETERMINISTICALLY (no scheduler race) and asserted >= 3 entries — so the
+   live faulting run genuinely exercises the multi-entry path. Phase 1: arm *DEBUG-EMIT-FAULT* :persistent,
+   publish the large sample; every scheduler emit faults so the cursor drains the whole multi-entry plan and
+   the node stops being pending (the unsent watermark advanced at SNAPSHOT time, so a drained faulted plan is
+   never re-snapshotted). The plan-size-AGNOSTIC no-spin PROOF: the hook-fire count STABILISES (two readings
+   0.3 s apart are equal — a spin would keep growing it regardless of plan size) and is BOUNDED. Phase 2: clear
+   the fault, publish a small sample; assert the writer RESUMES (the best-effort reader receives it) — a dead
+   scheduler thread could neither stabilise nor resume."
+  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-emit-fault-no-spin-multi-test t))   ; timing-flaky on Clasp (mirrors the other flow tests)
+  (let* ((slack 8)
+         (big (let ((v (make-array 4000 :element-type '(unsigned-byte 8))))
+                (dotimes (i 4000 v) (setf (aref v i) (logand (* i 7) #xff)))))   ; 4000 octets > *fragment-size* (1024) ⇒ DATA_FRAG series
+         (w (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x98) :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA8) :host "127.0.0.1" :port 0))
+         (lock (dds.pal:make-lock "no-spin-multi-fired"))
+         (fired 0)
+         (controller nil)
+         (saved-hook dds.disc:*sender-emit-error-hook*))
+    ;; PRECONDITION: a deterministic twin node (same guid/reader/unsent set, no scheduler) snapshots the plan —
+    ;; assert the 4000-octet sample yields a >=3-ENTRY plan, so the live run below walks a multi-element cursor.
+    (let ((twin (%flow-step-build-node #x98 #xA8 7831 (list big))))
+      (unwind-protect
+           (let ((plan (dds.disc::%node-datagram-plan twin (dds.disc::disc-node-tx-msg twin))))
+             (%check :no-spin-multi-plan-ge3 (>= (length plan) 3)
+                     (format nil "the 4000-octet sample must snapshot a >=3-entry datagram plan to exercise the ~
+                                  multi-entry cursor-advance-under-fault path; got ~d" (length plan))))
+        (dds.disc:stop-node twin)))
+    ;; The hook runs ON the scheduler thread (no inherited dynamic bindings), so set the GLOBAL value; the lock
+    ;; guards the cross-thread FIRED counter.
+    (setf dds.disc:*sender-emit-error-hook*
+          (lambda (c ctx n) (declare (ignore c ctx n)) (dds.pal:with-lock (lock) (incf fired))))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "NoSpinMultiT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher w :history-kind :keep-all)
+           (dds.disc:add-local-reader r :topic "NoSpinMultiT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber r)
+           (%flow-match-writer-reader w r "NoSpinMultiT")
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 1000000 :period 100000000
+                                                           :max-burst 1000000))   ; high rate: pacing never confounds the spin reading
+           (dds.disc:flow-controller-associate controller w)
+           ;; Phase 1: arm a persistent fault, publish the large sample, let every scheduler emit fault + drain
+           ;; the whole multi-entry plan.
+           (setf dds.disc:*debug-emit-fault* :persistent)
+           (dds.disc:publish-sample w big)
+           (loop repeat 100 until (plusp (dds.pal:with-lock (lock) fired)) do (sleep 0.005))   ; wait until the scheduler has faulted at least once
+           (sleep 0.3)
+           (let ((reading1 (dds.pal:with-lock (lock) fired)))
+             (sleep 0.3)
+             (let ((reading2 (dds.pal:with-lock (lock) fired)))
+               (format t "~&  [no-spin-multi] persistent-fault fires: reading1=~d reading2=~d~%" reading1 reading2)
+               (%check :no-spin-multi-fired-some (plusp reading2)
+                       "the scheduler must have caught at least one emit fault while draining the multi-entry plan")
+               (%check :no-spin-multi-stable (= reading1 reading2)
+                       (format nil "the hook-fire count must STABILISE under a persistent fault while walking a ~
+                                    >=3-entry plan (no hot-spin); grew ~d -> ~d" reading1 reading2))
+               (%check :no-spin-multi-bounded (<= reading2 slack)
+                       (format nil "the hook-fire count must be BOUNDED (the multi-entry plan drains once, ~
+                                    not unbounded); ~d > ~d" reading2 slack))))
+           (%check :no-spin-multi-controller-alive (dds.disc::flow-controller-thread controller)
+                   "the flow-scheduler thread slot must still be retained after draining the faulted multi-entry plan")
+           ;; Phase 2: clear the fault, publish a small sample; the writer must RESUME (best-effort reader gets it).
+           (setf dds.disc:*debug-emit-fault* nil)
+           (let ((before (dds.disc:node-sample-count r)))
+             (dds.disc:publish-sample w (octets 9 9 9 9 9 9 9 9))
+             (loop repeat 600 until (> (dds.disc:node-sample-count r) before) do (sleep 0.005))
+             (%check :no-spin-multi-resumes (> (dds.disc:node-sample-count r) before)
+                     "the scheduler must RESUME delivering once the fault clears (a new sample reaches the reader)")))
+      (setf dds.disc:*debug-emit-fault* nil
+            dds.disc:*sender-emit-error-hook* saved-hook)
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
+(defun* run-reliable-repair-after-drop-test ()
+    (function () t)
+  "WP-SENDER-ERROR-RESILIENCE scenario 3 (Option-1 conformance, RTPS 2.5 §8.4): a RELIABLE writer + reader;
+   drop exactly ONE DATA via *DEBUG-EMIT-FAULT* = 1 around the sole publish; assert the reader STILL receives
+   that sample via the HEARTBEAT/ACKNACK repair path (the sample stayed in the HistoryCache; the guard caught
+   the drop and the writer survived). Proves the dropped reliable sample is recovered, not lost. Uses the
+   synchronous publish path (publish-sample on the caller thread reaches the SAME guarded %send-raw-buf) so the
+   single injected fault is consumed deterministically by exactly one send; the periodic HEARTBEAT is driven
+   explicitly so the reader NACKs the gap and the writer retransmits (no reliance on a background timer)."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 47))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 48))
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "RepairT" :type "X")
+           (dds.disc:enable-publisher w :history-kind :keep-all)   ; KEEP_ALL: the dropped sample must survive in the HC for repair
+           (dds.disc:add-local-reader r :topic "RepairT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (%check :repair-matched (plusp (dds.disc:disc-node-matched-count w))
+                   "the reliable writer must match the reader before publishing")
+           ;; Drop exactly the ONE DATA datagram for the sole sample (coalesced DATA+HEARTBEAT in one datagram).
+           ;; This publish uses the SYNC path (no async/flow), which has no guard — the fault signals out HERE,
+           ;; AFTER writer-write has put the sample in the HC; IGNORE-ERRORS lets the test continue to the repair.
+           (setf dds.disc:*debug-emit-fault* 1)
+           (ignore-errors (dds.disc:publish-sample w (octets 1 2 3 4 5 6 7 0)))
+           (setf dds.disc:*debug-emit-fault* nil)   ; only the first send is dropped
+           ;; Drive the periodic HEARTBEAT so the reader NACKs the gap and the writer retransmits the held sample.
+           (loop repeat 600
+                 until (>= (dds.disc:node-sample-count r) 1)
+                 do (dds.disc::%push-heartbeat w) (sleep 0.01))
+           (%check :repair-delivered (>= (dds.disc:node-sample-count r) 1)
+                   "the dropped reliable DATA must still be delivered via the HEARTBEAT/ACKNACK repair (Option 1)"))
+      (setf dds.disc:*debug-emit-fault* nil)
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
+(defun* run-hook-self-error-test ()
+    (function () t)
+  "WP-SENDER-ERROR-RESILIENCE scenario 5 (FR-PF-2): a *SENDER-EMIT-ERROR-HOOK* that itself SIGNALS must NOT
+   re-kill the sender thread (the IGNORE-ERRORS around the hook call in WITH-SENDER-EMIT-GUARD). Arm a hook
+   that always errors + *DEBUG-EMIT-FAULT* :persistent on an async writer, publish, wait for the emit-error
+   counter to advance past the first hook-boom, then clear the fault and assert the async sender thread is
+   STILL working (its counter keeps advancing on a fresh fault, and a post-fault publish is delivered to a
+   loopback reader) — a thread killed by the signalling hook could do neither."
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 49))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 50))
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (saved-hook dds.disc:*sender-emit-error-hook*))
+    ;; The hook runs ON the async sender thread (no inherited dynamic bindings), so set the GLOBAL value; the
+    ;; hook itself signals on EVERY fire — the guard's IGNORE-ERRORS must swallow it.
+    (setf dds.disc:*sender-emit-error-hook*
+          (lambda (c ctx n) (declare (ignore c ctx n)) (error "hook boom")))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer w :topic "HookBoomT" :type "X")
+           (dds.disc:enable-publisher w :history-kind :keep-all)
+           (dds.disc:enable-async w)
+           (dds.disc:add-local-reader r :topic "HookBoomT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (%check :hook-boom-matched (plusp (dds.disc:disc-node-matched-count w))
+                   "the async writer must match the reader before publishing")
+           ;; Phase 1: persistent fault + a signalling hook; wait until the counter advances (the hook boomed
+           ;; AND was swallowed — the thread survived its own hook signalling).
+           (setf dds.disc:*debug-emit-fault* :persistent)
+           (dds.disc:publish-sample w (octets 4 4 4 4 4 4 4 0))
+           (loop repeat 600 until (>= (dds.disc::disc-node-async-emit-errors w) 1) do (sleep 0.01))
+           (%check :hook-boom-counter-advanced (>= (dds.disc::disc-node-async-emit-errors w) 1)
+                   "the async sender thread must survive a SIGNALLING hook (the counter advanced past the first boom)")
+           ;; Phase 2: clear the fault; the thread must STILL work — publish + drive repair to delivery.
+           (setf dds.disc:*debug-emit-fault* nil)
+           (dotimes (i 3) (dds.disc:publish-sample w (octets 4 4 4 4 4 4 8 i)))
+           (loop repeat 600
+                 until (>= (dds.disc:node-sample-count r) 1)
+                 do (dds.disc::%push-heartbeat w) (sleep 0.01))
+           (%check :hook-boom-thread-working (dds.disc::disc-node-async-thread w)
+                   "the async sender thread slot must still be retained after the signalling hook")
+           (%check :hook-boom-delivered (>= (dds.disc:node-sample-count r) 1)
+                   "the async sender thread must still deliver after surviving a signalling hook (it is alive + working)"))
+      (setf dds.disc:*debug-emit-fault* nil
+            dds.disc:*sender-emit-error-hook* saved-hook)
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
 ;;; SHMEM intra-host data plane (FR-XPORT-2): two participants in ONE process (so one host, one
 ;;; host-uuid) discover (SPDP) + match (SEDP) over UDP, then the writer routes user DATA over SHARED
 ;;; MEMORY to the same-host reader (discovery/HB/ACKNACK stay UDP). The reader receives every sample via

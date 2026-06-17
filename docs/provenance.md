@@ -1591,3 +1591,28 @@ spec only** — **no RTI Connext source, headers, or `rtiddsgen` output** was co
   principles. It reuses the existing sibling struct codec (`deserialize-<name>` / `serialize-<name>`) — no new
   codec. No RTI/Fast DDS/Cyclone/OpenDDS source, headers, or generated code was read or copied for it; ADR 0015
   records the design.
+
+## M5 (2026-06-17) — WP-SENDER-ERROR-RESILIENCE sender-thread emit guard (FR-PF-2, RTPS 2.5 §8.4, ADR 0016)
+
+The sender-thread emit guard — the DRY `with-sender-emit-guard` macro + `*sender-emit-error-hook*` +
+per-thread counters + the Option-1 drop-and-advance flow path + the `*debug-emit-fault*` test injector
+(`src/dds-disc/dataplane.lisp` + `src/dds-disc/flow-control.lisp`) — is **clean-room; no new external source
+was consulted.**
+
+- **Sources consulted**: the operating contract §4 (FR-PF-2); the in-repo design spec
+  `docs/superpowers/specs/2026-06-17-wp-sender-error-resilience-design.md`; **RTPS 2.5 §8.4.1–§8.4.2** (the
+  reliable-writer HistoryCache retention + the HEARTBEAT/ACKNACK repair) and **§8.4.2.2** (pushMode=true
+  proactive push) — the spec basis for "drop + advance, reliability recovers". DDS 1.4 / DDSI-RTPS 2.5 does
+  **not** specify local send-error handling (it is implementation-defined, not wire-observable), so the
+  Option-1 rationale is *derived from* the reliability model, not taken from a mandate, and the wire is
+  unchanged.
+- The guard **mirrors this repo's own existing pattern** — the RX receiver thread's per-iteration
+  `(handler-case … (error () nil))` (`src/dds-xport/udp.lisp:105`); it is the symmetric sender-side
+  application of an in-house idiom, not a copy of any vendor's mechanism. The "catch `error` not
+  `serious-condition`", the rate-limited default hook, and the snapshot-watermark no-spin argument are all
+  first-principles design.
+- **This is standard DDS hardening — NOT patent-gated** (no R6 marker, no "NOT cleared for ship" header).
+- **No RTI Connext source/headers/`rtiddsgen` output, and no Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) /
+  OpenDDS source, was read or copied** for this work package. The live cross-DDS interop
+  (`interop/sender-resilience/`) reuses the already-committed Connext `shapes-sub` and Fast DDS `shapes`
+  subscribers (provenance recorded above); no new vendor source/output is added by this leg.

@@ -429,6 +429,55 @@ tracks ~1.0×); the **same** workload runs **tens of times slower paced than unp
 not overhead to remove. Use `enable-async` (unpaced) when you want async without a rate bound; use a
 `flow-controller` when a downstream link or reader must not be overrun.
 
+### Sender-thread fault resilience — `*sender-emit-error-hook*`
+
+Both background sender threads — the **async sender** (`%async-sender-loop`, one per `enable-async` node) and
+the **flow scheduler** (`%flow-scheduler-loop`, one per `flow-controller`) — are **fault-resilient**
+(WP-SENDER-ERROR-RESILIENCE, FR-PF-2; standard DDS, NOT R6). They mirror the RX receiver thread's existing
+per-iteration guard: a transient `error` signalled out of one emit (a hard SHMEM-send segment/bounds error,
+datagram-build / destination-resolution, static-arena exhaustion, a future transport) is **caught, counted,
+observed via a hook, and the loop continues** — instead of the thread dying and silently stalling every writer
+it serves. The guard catches `error` **only, not `serious-condition`**: a fatal VM state (`storage-condition`
+/ control-stack-exhausted) still terminates the thread, because masking it would hide an unrecoverable
+condition. It is inert in production — the bytes on the wire are **byte-identical** to before — and **off the
+measured CDR hot path** (`make mem` stays 0.0000).
+
+**Drop-and-recover (Option 1, RTPS 2.5 §8.4).** When the flow scheduler's emit faults, it **drops the
+datagram and advances its plan cursor unconditionally**, so the scheduler always makes progress and **never
+hot-spins** — the writer's unsent watermark is advanced at *snapshot* time, so a drained faulted plan is never
+re-snapshotted (bounded work). A dropped **reliable** DATA stays in the writer's HistoryCache and is recovered
+by the writer's **proactive re-push of unacked samples** (pushMode=true, §8.4.2.2) on the next flush — the
+periodic HEARTBEAT keeps advertising `[firstSN,lastSN]` and an ACKNACK-driven repair is the fallback (§8.4.1);
+a best-effort drop is conformant (loss tolerated). Local send-error handling is implementation-defined (the
+standard is silent — this resilience does not change the wire), and the alternatives were rejected:
+retry-the-same risks **wedging** a writer (no SN advances), clear-pending defers proactive push.
+
+**Observability.** `dds.disc:*sender-emit-error-hook*` is a bindable funcallable `(condition context count)`
+invoked on each caught emit error (the default is a clockless rate-limited `WARN` — it logs only when `count`
+is 1 or a power of ten, so a persistent failure logs O(log n) lines, never a flood). `context` is
+`:async-sender` or `:flow-scheduler`; `count` is that thread's running error count (also readable as the
+`disc-node` `async-emit-errors` / `flow-controller` `emit-errors` slots). **The hook runs on the sender
+thread** — so it must not block, it does **not** inherit the binding thread's dynamic environment (bind the
+**global** value, not a thread-local `let`), and a hook that itself signals is swallowed (it can never re-kill
+the thread).
+
+| Symbol | Kind | Contract |
+|---|---|---|
+| `dds.disc:*sender-emit-error-hook*` | special variable | funcallable `(condition context count) → t`; called on the sender thread for each caught emit `error`. `context` ∈ {`:async-sender`, `:flow-scheduler`}; `count` is that thread's running error count. Must not block; a signalling hook is itself guarded. Default rate-limited WARN. |
+| `dds.disc:*debug-emit-fault*` | special variable | **test affordance, default `NIL` = inert** (byte-identical wire). A positive integer N faults the next N `%send-raw-buf` calls (decrementing); `:persistent` faults every call. Mirrors `*debug-drop-sample-numbers*`. |
+
+```lisp
+;; Observe sender-thread emit faults: set the GLOBAL hook (it fires on the sender thread).
+(let ((errors '()))
+  (setf dds.disc:*sender-emit-error-hook*
+        (lambda (condition context count)
+          (push (list context count (type-of condition)) errors)))   ; record; do not block
+  ;; ... an async / flow-paced writer runs; on each caught emit error the hook fires ...
+  ;; errors now holds e.g. ((:async-sender 1 sender-emit-test-fault) ...), newest first;
+  ;; the thread stayed alive and kept sending — a dropped reliable DATA repairs via re-push.
+  errors)
+```
+
 ### Deferred (v1 → follow-ups)
 
 v1 ships **round-robin only**, behind a **pluggable policy hook** (the scheduler calls it to pick the next

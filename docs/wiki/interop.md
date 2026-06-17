@@ -236,5 +236,26 @@ Still provisional: the unexercised serialization-VM edges (unions, MUTABLE struc
   The remaining `PID_DATA_REPRESENTATION = XCDR2`-on-our-SEDP item (so a peer can also pick XCDR2 and
   skip the transcode) is a production-side XTypes follow-up, **not** a transcode or keyhash defect.
 
+- **Sender-thread emit-fault resilience cross-DDS interop (WP-SENDER-ERROR-RESILIENCE, FR-PF-2, RTPS
+  2.5 §8.4; [`interop/sender-resilience/`](../../interop/sender-resilience/))** — the per-feature DoD
+  gate for the sender-thread emit guard. The Shapes publisher (`make square-pub` / `run-publisher`)
+  gains `FAULT=k@j` (drive exactly k synthetic emit faults onto the async sender thread after the
+  j-th publish), `HISTORY=keep-all`, and `PORT=` knobs (all inert when unset; byte-identical wire).
+  **Connext 7.3.1 + Fast DDS 3.6.1: PASS, live in-session (2026-06-17, loopback)** — the async sender
+  thread caught **3/3** injected faults and stayed alive + publishing, the peer stayed matched and
+  receiving (Connext 24/30, Fast DDS 29/30), user DATA `CDR2_LE (0x0007)` SN 1→30 across the fault
+  window — the faulted SNs reappear as the writer's **proactive re-push of unacked samples**
+  (pushMode=true, RTPS 2.5 §8.4.2.2; the HEARTBEAT keeps advertising and ACKNACK-repair is the
+  fallback), not via a peer NACK (the ACKNACKs in the captures — Connext 45, Fast DDS 25 — are the
+  peers' **builtin discovery**; **zero** target our user writer `0x00000102`)
+  (`captures/sender-resilience-{connext,fastdds}.pcap`). **Honest framing:** a reliable writer
+  delivers regardless of the guard (the proactive re-push + HEARTBEAT advertisement run on threads
+  that do not die with the guarded sender thread), so the interop proves *sender-thread survival +
+  wire validity + delivery preservation* (the Fast DDS fault run delivered exactly as many as its
+  no-fault baseline, 29/30); the **guard-vs-no-guard** discrimination is the UNIT mutation tests
+  (`run-async-emit-fault-survives-test`, `run-flow-emit-fault-no-spin-test`), not this interop. The
+  few-sample tail gap is a harness teardown-drain artifact (present in the no-fault baseline too),
+  not a guard or wire defect.
+
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

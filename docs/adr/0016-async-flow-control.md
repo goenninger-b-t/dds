@@ -169,6 +169,67 @@ condvar; it returns **without the caller sending** (async). The contract change,
   ~`max_blocking_time`; unblock via the real `writer-purge-acked` BEFORE the deadline (proves the CV wakeup);
   `max_blocking_time = 0` immediate `:timeout`; default unlimited / KEEP_LAST never blocks.
 
+### Sender-thread emit resilience (WP-SENDER-ERROR-RESILIENCE — the deferred Should-fix, DELIVERED 2026-06-17)
+
+WP-ASYNC-FLOW flagged a Should-fix: the RX receiver thread already guards each iteration's dispatch
+(`src/dds-xport/udp.lisp:105`, `(handler-case … (error () nil))`), but the **two sender threads** —
+`%async-sender-loop` (`dataplane.lisp`) and `%flow-scheduler-loop` (`flow-control.lisp`) — did not, so a
+signalled emit `error` (a hard `%shmem-send` segment/bounds error, datagram-build / destination resolution,
+static-arena exhaustion, or a future transport) unwound out of the loop, **killed the thread**, and silently
+stalled every writer it served. This WP closes that asymmetric gap. Non-R6; standard DDS (local send-error
+handling is implementation-defined — the standard is silent — so this adds resilience, it does not change the
+wire). Delivered:
+
+- **One DRY guard macro** `with-sender-emit-guard ((context count-place) &body body)` in `dds.disc`
+  (`dataplane.lisp`), used by **both** loops. It wraps the one per-iteration emit in `handler-case`: a caught
+  `error` bumps `count-place`, fires `*sender-emit-error-hook*` (itself `ignore-errors`-guarded so a signalling
+  hook cannot re-kill the thread), and returns `NIL`; on success it returns the body value. It catches **`error`
+  only, NOT `serious-condition`** — a fatal VM state (`storage-condition` / control-stack-exhausted) SHOULD still
+  terminate the thread; masking it would hide an unrecoverable condition. A macro (no per-emit closure) keeps it
+  0-alloc, though the sender threads are off the measured CDR hot path regardless (`make mem` 0.0000 unchanged).
+- **Observability** — exported `*sender-emit-error-hook*` (a funcallable `(condition context count)`, default
+  `%default-sender-emit-error-hook` = a clockless rate-limited WARN: log only when `count` is 1 or a power of
+  ten, so a persistent failure logs O(log n) lines, never a flood) + per-thread fixnum counters
+  (`disc-node` slot `async-emit-errors`, `flow-controller` slot `emit-errors`); `context` is `:async-sender` /
+  `:flow-scheduler`. The hook runs **on the sender thread** (it must not block; it does not inherit the binding
+  thread's dynamic environment — a test/app sets the GLOBAL value).
+- **The flow path drops + advances unconditionally (Option 1).** The catch is **inside** the scheduler's
+  `unwind-protect` (the per-node emit barrier cleanup at `flow-control.lisp:264` still disarms; the error never
+  escapes the loop), and the plan cursor advances on both success and a caught error
+  (`(setf (disc-node-flow-step-state node) (cdr plan))`). **Why this cannot hot-spin (correctness-critical):**
+  the writer's unsent **watermark is advanced at SNAPSHOT time** (`%node-datagram-plan` /
+  `%flow-step-emit`'s contract, `dataplane.lisp`), NOT per send — so once a plan is snapshotted those samples
+  are already past the watermark and the node is no longer pending *for them*; draining the faulted plan's cursor
+  exits the plan, and the next RR-pick does not re-snapshot the dropped samples → bounded work, no spin. We
+  deliberately do NOT touch the watermark (it already moved); the dropped samples stay in the HistoryCache and
+  are recovered by the writer's proactive re-push on the next flush / the HEARTBEAT-ACKNACK fallback (RTPS 2.5
+  §8.4.2.2, §8.4.1). The async path already could not spin (`async-pending` is cleared before the send, so a
+  caught error returns to the bounded condvar-wait). Option 2 (retry-the-same) was rejected — it risks
+  **wedging** a writer (no SN advances → no-progress); Option 3 (clear-pending) defers proactive push.
+- **Fault injection (test-only, inert in production):** condition `sender-emit-test-fault` + the special
+  `*debug-emit-fault*` (default `NIL` = inert, byte-identical; a positive integer N faults the next N
+  `%send-raw-buf` calls decrementing; `:persistent` faults every call) — injected at the top of the single
+  shared send primitive `%send-raw-buf` so both threads exercise the guard. Mirrors `*debug-drop-sample-numbers*`.
+- **Tests (6, oracle = thread survival + delivery + the hook record; all green SBCL+Clasp except where noted):**
+  `run-async-emit-fault-survives-test` (3 faults caught, thread survives, all 6 samples delivered),
+  `run-emit-fault-inert-test` (NIL ⇒ byte-identical wire + counter stays 0),
+  `run-flow-emit-fault-no-spin-test` (persistent fault, the K small samples coalesce to 1 plan entry, the
+  hook-fire count STABILISES + is BOUNDED, the scheduler resumes — SBCL; Clasp pass-skip, the flow-test timing
+  gap), `run-flow-emit-fault-no-spin-multi-test` (the multi-entry strengthening: a 4000-octet sample forces a
+  ≥3-entry DATA_FRAG plan — asserted via a deterministic twin-node `%node-datagram-plan` snapshot — so the
+  scheduler walks the multi-element cursor under a persistent fault; the plan-size-agnostic stability proof —
+  observed a 6-entry plan, 6 fires, stable — SBCL; Clasp pass-skip),
+  `run-reliable-repair-after-drop-test` (Option-1: a reliable DATA dropped by the guard is still delivered),
+  `run-hook-self-error-test` (a signalling hook does not re-kill the thread).
+- **Live cross-DDS interop (the per-feature DoD):** the Shapes publisher gained `FAULT=k@j` / `HISTORY=keep-all`
+  / `PORT=` env gates (inert when unset, byte-identical wire); the async sender survived **3/3** injected faults
+  while interoperating with a **live RTI Connext 7.3.1** and **live Fast DDS 3.6.1** reliable subscriber, the
+  peer kept matching + receiving, and delivery was preserved (the Fast DDS fault run = its no-fault baseline,
+  29/30) — `interop/sender-resilience/`, tshark-validated, captures committed. **Honest framing:** a reliable
+  writer delivers regardless of the guard (the re-push + HEARTBEAT run on threads that do not die with the
+  guarded sender thread), so the interop proves *sender-thread survival + wire validity + delivery preservation*;
+  the *guard-vs-no-guard* discrimination is the unit mutation tests, not the interop.
+
 ## OMG DDS / RTPS spec-compliance (wire-invisible / additive on conforming RTPS / NOT R6)
 
 Flow control is **wire-invisible**: it changes only **when** a datagram is sent, never the submessage bytes.
