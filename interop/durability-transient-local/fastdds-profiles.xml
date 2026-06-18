@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LOOPBACK-ONLY Fast DDS profile for the WP-DURABILITY-TRANSIENT-LOCAL late-joiner interop DoD
+     (DDS 1.4 §2.2.3.4). interfaceWhiteList is pinned to 127.0.0.1 ONLY (NOT the LAN address) so Fast
+     DDS routes BOTH discovery and the user dataflow over lo0 — with a LAN address also whitelisted Fast
+     DDS routes the user data off loopback and the samples miss our loopback reader (discovery still
+     matches but no data flows; see interop/keyed-flatdata/README.md). UDPv4 only keeps the wire
+     observable. The TRANSIENT_LOCAL + KEEP_ALL durability is set in the harness C++ via the DURABILITY
+     env gate (the entity QoS is code-built, not profile-applied), NOT here. Copy this to ./profiles.xml
+     in the run cwd (the shapes binaries load_XML_profiles_file("profiles.xml") from cwd). Capture-only
+     aid; NOT built or run by CI. -->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastDDS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>udp_loopback</transport_id>
+        <type>UDPv4</type>
+        <interfaceWhiteList>
+          <address>127.0.0.1</address>
+        </interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="fastdds_interop" is_default_profile="true">
+      <rtps>
+        <useBuiltinTransports>false</useBuiltinTransports>
+        <userTransports>
+          <transport_id>udp_loopback</transport_id>
+        </userTransports>
+        <propertiesPolicy>
+          <properties>
+            <property>
+              <name>fastdds.type_propagation</name>
+              <value>enabled</value>
+            </property>
+          </properties>
+        </propertiesPolicy>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

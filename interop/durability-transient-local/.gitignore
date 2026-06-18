@@ -1,0 +1,17 @@
+# WP-DURABILITY-TRANSIENT-LOCAL interop harness ignores. The foreign peers are the committed
+# interop/connext/shapes-* and interop/fastdds/shapes binaries (built elsewhere); this dir holds only
+# the loopback-TL QoS config + the archived proof captures. Transient capture/decode artifacts are
+# ignored; the archived proof pcaps under captures/ are kept.
+
+# a local copy of the Fast DDS profile placed in this cwd for a run (the canonical one is fastdds-profiles.xml)
+profiles.xml
+
+# transient capture/decode artifacts
+decode.txt
+decode.err
+tshark.err
+*.out
+!captures/
+!captures/*.pcap
+!captures/*.log
+!captures/*.txt

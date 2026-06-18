@@ -28,6 +28,7 @@
            #:start-node #:stop-node
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
+           #:%writer-durability-init #:%reader-durability-init #:finalize-writer-durability
            #:publish-sample #:flush-batch #:disc-node-batch-max-samples #:enable-async
            #:flow-token-bucket #:flow-token-bucket-p #:make-flow-token-bucket
            #:flow-token-bucket-tokens #:flow-token-bucket-max-burst

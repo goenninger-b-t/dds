@@ -47,7 +47,11 @@
    controller teardown also signals so a blocked publish reaches its TIMEOUT (%writer-signal-space). MAX-BLOCKING-NS NIL ⇒ no
    blocking (the cache bound is then never reached for an unlimited cache; the degenerate 0 ⇒ immediate
    :timeout when full). The bound applies to ALL changes (data + dispose/unregister) — RTPS 2.5 §8.4.2.2
-   gives every change a SN, so the cache occupancy is consistent across kinds (ADR 0016 §Backpressure)."
+   gives every change a SN, so the cache occupancy is consistent across kinds (ADR 0016 §Backpressure).
+   FINALIZED (durability-finalize, DDS 1.4 §2.2.3.4; the OPT-IN extension ON TOP of the conformant default,
+   NIL = standard TRANSIENT_LOCAL) when T makes writer-purge-acked treat a TRANSIENT_LOCAL writer as
+   VOLATILE — re-enabling the full-ACK purge so the retained late-joiner history is RELEASED once all current
+   readers ACK; monotonic (set once by writer-finalize-durability, never cleared in v1)."
   (hc nil :type (or null dds.rtps.history:history-cache))  ; a HistoryCache
   (last-sn 0 :type integer)
   (hb-count 0 :type integer)
@@ -55,7 +59,8 @@
   (frag-hb-count 0 :type integer)   ; HEARTBEAT_FRAG Count, separate from hb-count
   (lock (dds.pal:make-lock) :type t)
   (space-cv (dds.pal:make-condvar) :type t)   ; signalled (under LOCK) when the cache shrinks; writer-write waits on it when full (ADR 0016 §Backpressure)
-  (max-blocking-ns nil :type (or null (integer 0))))   ; RELIABILITY.max_blocking_time in ns; NIL = never block (unlimited cache)
+  (max-blocking-ns nil :type (or null (integer 0)))   ; RELIABILITY.max_blocking_time in ns; NIL = never block (unlimited cache)
+  (finalized nil :type boolean))   ; durability-finalize (DDS 1.4 §2.2.3.4 extension): a TL writer reverts to the VOLATILE full-ACK purge
 
 (defmacro %with-writer-lock ((writer) &body body)
   "Serialize BODY's access to WRITER's HistoryCache + proxies (publish thread vs receiver thread). The
@@ -217,8 +222,9 @@
                 (push sn gaps)))))
       (values (nreverse resends) (nreverse gaps)))))
 
-(defun* writer-purge-acked (writer reader-keys)
-    (function (rtps-writer list) (integer 0))
+(defun* writer-purge-acked (writer reader-keys &optional (durability :volatile))
+    (function (rtps-writer list &optional (member :volatile :transient-local :transient :persistent))
+              (integer 0))
   "Drop from the writer's HistoryCache every change that EVERY matched reader has acknowledged — SN below
    the minimum acked-base over READER-KEYS' proxies (RTPS 2.5 §8.4.1: VOLATILE writer history is bounded
    by the slowest reader's ack), via hc-purge-below which routes each removal through the index-consistent
@@ -230,8 +236,23 @@
    bounded only by RESOURCE_LIMITS). When changes ARE purged
    (the cache shrank), broadcast SPACE-CV so a writer-write/writer-lifecycle-change blocked on a full
    KEEP_ALL cache wakes — this is the ACKNACK purge half of the WP-ASYNC-FLOW space-available signal (ADR
-   0016 §Backpressure); the signal is sent AFTER the writer LOCK is released (the non-recursive LOCK)."
-  (if (null reader-keys)
+   0016 §Backpressure); the signal is sent AFTER the writer LOCK is released (the non-recursive LOCK).
+
+   DURABILITY (DDS 1.4 §2.2.3.4; default :VOLATILE = the prior behavior, byte-identical) gates the
+   full-ACK purge: a :VOLATILE writer purges as above (history bounded by the slowest reader's ack); a
+   :TRANSIENT-LOCAL writer does NOT full-ACK-purge — it RETAINS its acked history for late-joiners (a
+   no-op 0), bounded instead by HISTORY (the per-instance KEEP_LAST eviction in hc-add-change still
+   evicts, and a KEEP_ALL cache by RESOURCE_LIMITS), so it is HISTORY-bounded, not ACK-bounded, and
+   retained for the writer's lifetime. :TRANSIENT/:PERSISTENT need a durability service (out of scope) —
+   treated here like :TRANSIENT-LOCAL (retain), never silently purging more than the conformant default.
+
+   The FINALIZED flag (durability-finalize, the OPT-IN extension ON TOP of the conformant default; set via
+   writer-finalize-durability) OVERRIDES the retain for a non-VOLATILE writer: a FINALIZED writer purges
+   exactly as :VOLATILE — the retained late-joiner history is RELEASED once all current readers ACK (the
+   owner has declared no more late-joiners expected). So the purge runs iff there is a matched reader AND
+   the writer is :VOLATILE OR FINALIZED; an un-finalized TRANSIENT_LOCAL writer is byte-identical to before."
+  (if (or (null reader-keys)
+          (and (not (eq durability :volatile)) (not (rtps-writer-finalized writer))))
       0
       (let ((purged (%with-writer-lock (writer)
                       (dds.rtps.history:hc-purge-below
@@ -240,6 +261,36 @@
                              minimize (reader-proxy-acked-base (get-reader-proxy writer k)))))))
         (when (plusp purged) (%writer-signal-space writer))   ; the cache shrank: wake any blocked writer-write
         purged)))
+
+(defun* writer-finalize-durability (writer)
+    (function (rtps-writer) (eql t))
+  "Mark WRITER FINALIZED (DDS 1.4 §2.2.3.4; the OPT-IN extension ON TOP of the conformant default — the
+   owner declares 'no more late-joiners expected'). A FINALIZED TRANSIENT_LOCAL writer reverts to the
+   VOLATILE-style full-ACK purge: writer-purge-acked then RELEASES the retained late-joiner history once all
+   current readers ACK (see writer-purge-acked's FINALIZED gate), and any sample published afterwards behaves
+   VOLATILE (purged on full-ACK). MONOTONIC — set once, never cleared in v1 (a repeat call is idempotent).
+   Default off ⇒ standard TRANSIENT_LOCAL (retain for the writer's lifetime). Lock-guarded (the receiver
+   thread purges; this runs on the caller thread). The standard places per-writer TRANSIENT/PERSISTENT
+   lifetime control in the durability SERVICE — out of scope for this WP (the follow-on service milestone)."
+  (%with-writer-lock (writer)
+    (setf (rtps-writer-finalized writer) t))
+  t)
+
+(defun* init-reader-proxy-base (writer reader-id base)
+    (function (rtps-writer t integer) reader-proxy)
+  "Initialize the UNSENT-BASE watermark of the ReaderProxy for the matched reader keyed by the opaque
+   READER-ID (creating the proxy on first use), and return it — the durability-aware late-joiner proxy
+   init (DDS 1.4 §2.2.3.4, RTPS 2.5 §8.4.2.2). The disc layer calls this once at match time: for a
+   TRANSIENT_LOCAL writer matched by a TRANSIENT_LOCAL reader BASE = firstSN (hc-min-seq) so the existing
+   push (writer-unsent-list) replays the ENTIRE retained history; otherwise BASE = lastSN+1 (future-only,
+   the effective pre-WP behavior). Sets ONLY unsent-base (the push watermark); acked-base stays at its
+   default 1 so the ACKNACK-driven repair watermark is untouched (RTPS 2.5 §8.4.2.2 keeps the two
+   independent). The proxy is keyed by the reader's GUID (each remote reader's watermarks are independent,
+   §8.3.5.4)."
+  (%with-writer-lock (writer)
+    (let ((proxy (get-reader-proxy writer reader-id)))
+      (setf (reader-proxy-unsent-base proxy) base)
+      proxy)))
 
 ;;; ---- Reader side (§8.4.10): one WriterProxy per matched writer ----
 
@@ -258,10 +309,17 @@
    the application is delivered from the wire, not from here), so no payload is retained. FIRST-SN/LAST-SN
    bound the available range from HEARTBEAT; entries below FIRST-SN are compacted away as the writer
    purges its acked history (reader-on-heartbeat). REASSEMBLY maps SN -> frag-reassembly for in-progress
-   DATA_FRAG samples."
+   DATA_FRAG samples. SKIP-HISTORY (the durability gate, DDS 1.4 §2.2.3.4): when T, the FIRST HEARTBEAT
+   advances FIRST-SN to lastSN+1 so the reader SKIPS the writer's advertised pre-match history (NACKing only
+   future gaps); NIL (the default, byte-identical to before) requests the full advertised range. The disc
+   layer sets the flag from durability (%reader-durability-init: T for a VOLATILE reader matched a retaining
+   writer); the reliable engine here is policy-agnostic and just applies it. DURABILITY-APPLIED-P latches the
+   one-shot application so a later HEARTBEAT never re-skips live samples."
   (received (make-hash-table :test 'eql) :type hash-table)   ; SN -> T (received) | :gap (presence only)
   (first-sn 1 :type integer)
   (last-sn 0 :type integer)                ; available range from HEARTBEAT
+  (skip-history nil :type boolean)         ; durability gate: VOLATILE skips pre-match history (DDS §2.2.3.4)
+  (durability-applied-p nil :type boolean) ; latch: the skip is applied once, on the first HEARTBEAT
   (reassembly (make-hash-table :test 'eql) :type hash-table)) ; SN -> frag-reassembly
 
 (defstruct* (rtps-reader (:constructor make-rtps-reader))
@@ -296,9 +354,22 @@
    non-decreasing (a writer's firstSN only advances as it purges acked history, never decreases — a
    reordered stale HEARTBEAT must not lower it). When firstSN advances, COMPACT the received table: drop
    markers below it (the writer purged those fully-acked samples, and reader-acknack/complete-p iterate
-   [firstSN, lastSN] so they are unreachable) — bounding received to the live window, not O(history)."
+   [firstSN, lastSN] so they are unreachable) — bounding received to the live window, not O(history).
+
+   The durability gate (DDS 1.4 §2.2.3.4): on the FIRST HEARTBEAT from this writer, if the proxy is marked
+   SKIP-HISTORY (set at match time by init-writer-proxy-durability — the disc layer marks it for a VOLATILE
+   reader matched a retaining writer), advance firstSN to lastSN+1 so the reader SKIPS the writer's
+   advertised pre-match history (it then NACKs only future gaps). The skip is LATCHED (durability-applied-p)
+   so it applies exactly once — a later HEARTBEAT (the writer published new samples) never re-skips them.
+   With SKIP-HISTORY NIL (the default) this is byte-identical to before: the reader keeps firstSN and
+   requests the full advertised range."
   (let* ((proxy (get-writer-proxy reader writer-id))
-         (new-first (max (writer-proxy-first-sn proxy) first-sn)))
+         (skip-floor (if (and (writer-proxy-skip-history proxy)
+                              (not (writer-proxy-durability-applied-p proxy)))
+                         (1+ last-sn)                      ; VOLATILE: skip the pre-match history
+                         (writer-proxy-first-sn proxy)))
+         (new-first (max (writer-proxy-first-sn proxy) first-sn skip-floor)))
+    (setf (writer-proxy-durability-applied-p proxy) t)    ; one-shot: never re-skip a later HEARTBEAT
     (setf (writer-proxy-last-sn proxy) (max (writer-proxy-last-sn proxy) last-sn))
     (when (> new-first (writer-proxy-first-sn proxy))
       (setf (writer-proxy-first-sn proxy) new-first)
@@ -306,6 +377,22 @@
         (maphash (lambda (sn v) (declare (ignore v)) (when (< sn new-first) (push sn drop))) received)
         (dolist (sn drop) (remhash sn received))))
     t))
+
+(defun* init-writer-proxy-durability (reader writer-id skip-history)
+    (function (rtps-reader t boolean) writer-proxy)
+  "Record the reader-side durability decision for the matched writer keyed by the opaque WRITER-ID
+   (creating the WriterProxy on first use), and return it — the reader-side history-request gate (DDS 1.4
+   §2.2.3.4, RTPS 2.5 §8.4.2.2). The disc layer (%reader-durability-init) calls this once at match time,
+   BEFORE the first HEARTBEAT: SKIP-HISTORY T (the disc gate marks it for a VOLATILE reader matched a
+   retaining writer) makes the first HEARTBEAT skip the writer's advertised pre-match history
+   (reader-on-heartbeat advances firstSN to lastSN+1, NACKing only future gaps); SKIP-HISTORY NIL leaves the
+   default full-range request (byte-identical to before this WP). Resets the one-shot latch so a re-match
+   re-arms the decision. The proxy is keyed by the writer's GUID (each matched writer's gate is independent,
+   §8.3.5.4)."
+  (let ((proxy (get-writer-proxy reader writer-id)))
+    (setf (writer-proxy-skip-history proxy) skip-history)
+    (setf (writer-proxy-durability-applied-p proxy) nil)   ; re-arm on (re)match
+    proxy))
 
 (defun* reader-acknack (reader writer-id)
     (function (rtps-reader t) (values integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))))

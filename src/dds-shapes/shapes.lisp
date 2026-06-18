@@ -160,8 +160,8 @@
                            (advertise-address "127.0.0.1") (type :tagged) (peers nil)
                            (liveliness :automatic) (liveliness-lease-seconds 0) (dispose-after 0)
                            (batch 1) (async nil) (fault-after 0) (fault-count 0) (port 0)
-                           (history-kind :keep-last) (data-representation :xcdr2))
-    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0)) (:dispose-after (integer 0)) (:batch (integer 1)) (:async t) (:fault-after (integer 0)) (:fault-count (integer 0)) (:port (unsigned-byte 16)) (:history-kind (member :keep-last :keep-all)) (:data-representation (member :xcdr2 :xcdr1))) t)
+                           (history-kind :keep-last) (data-representation :xcdr2) (durability :volatile))
+    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0)) (:dispose-after (integer 0)) (:batch (integer 1)) (:async t) (:fault-after (integer 0)) (:fault-count (integer 0)) (:port (unsigned-byte 16)) (:history-kind (member :keep-last :keep-all)) (:data-representation (member :xcdr2 :xcdr1)) (:durability (member :volatile :transient-local))) t)
   "Publish an animated Square on DOMAIN via multicast discovery. TYPE selects the
    payload: :canonical = the exact RTI ShapeType (color/x/y/shapesize — for interop
    with rtishapesdemo / DDSSpy); :tagged = + per-publisher uuid + per-sample seq
@@ -189,9 +189,18 @@
    PID_DATA_REPRESENTATION sequence in SEDP AND the representation the user DATA is serialized + sent
    in (:xcdr2 -> PLAIN_CDR2_LE 0x0007, the default/byte-identical existing wire; :xcdr1 ->
    PLAIN_CDR_LE 0x0001 — for a peer whose reader advertises [XCDR1]-only). The shape bodies are
-   :final 32-bit/string so XCDR1 and XCDR2 bodies coincide; only the 4-octet encap header differs."
+   :final 32-bit/string so XCDR1 and XCDR2 bodies coincide; only the 4-octet encap header differs.
+   DURABILITY (:volatile default | :transient-local; WP-DURABILITY-TRANSIENT-LOCAL, DDS 1.4 §2.2.3.4)
+   sets the writer's DURABILITY QoS: :transient-local makes the (always-reliable) writer RETAIN its
+   published history and REPLAY it to a late-joining matched reader (advertised via PID_DURABILITY in
+   SEDP; the writer answers the late reader's NACK with a retransmit of the [firstSN,lastSN] range) and
+   forces HISTORY KEEP_ALL so ALL pre-join samples are retained (depth-1 KEEP_LAST would replay only the
+   latest per instance). :volatile (the default) is byte-identical to the prior wire — no retention."
   (check-type type (member :canonical :tagged))
   (check-type data-representation (member :xcdr2 :xcdr1))
+  (check-type durability (member :volatile :transient-local))
+  ;; TRANSIENT_LOCAL must retain ALL pre-join samples for late-joiner replay -> force KEEP_ALL (DDS 1.4 §2.2.3.4).
+  (when (eq durability :transient-local) (setf history-kind :keep-all))
   ;; PORT>0 binds a fixed metatraffic port (advertised verbatim) so a foreign peer can reply to our
   ;; unicast SPDP over loopback; 0 = ephemeral (default, multicast discovery).
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
@@ -202,11 +211,12 @@
     (if (> liveliness-lease-seconds 0)
         (dds.disc:add-local-writer
          node :topic "Square" :type "ShapeType" :type-information (%shape-type-information)
-         :qos (dds.qos:make-qos :reliability :reliable :liveliness liveliness
+         :qos (dds.qos:make-qos :reliability :reliable :liveliness liveliness :durability durability
                                 :data-representation (list data-representation)
                                 :liveliness-lease (dds.qos:make-qos-duration liveliness-lease-seconds 0)))
         (dds.disc:add-local-writer node :topic "Square" :type "ShapeType"
                                    :qos (dds.qos:make-writer-qos
+                                         :durability durability
                                          :data-representation (list data-representation))
                                    :type-information (%shape-type-information)))
     (dds.disc:enable-publisher node :history-kind history-kind)
@@ -389,8 +399,8 @@
       t)))
 
 (defun* run-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1") (type :tagged)
-                            (peers nil) (port 0))
-    (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:port (unsigned-byte 16))) t)
+                            (peers nil) (port 0) (durability :volatile))
+    (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:port (unsigned-byte 16)) (:durability (member :volatile :transient-local))) t)
   "Subscribe to Square on DOMAIN via multicast discovery and print every shape.
    TYPE selects the payload codec (:canonical | :tagged) and must match the
    publisher. SECONDS 0 = forever (Ctrl-C). Receives from rtishapesdemo / DDSSpy
@@ -399,16 +409,25 @@
    \"127.0.0.1:7410\" lets our reader reach a same-host foreign PUBLISHER over loopback when the
    loopback multicast SEDP handshake does not complete (mirrors run-publisher; WP-DATA-REPRESENTATION
    step 1 reverse leg). PORT>0 binds+advertises a fixed metatraffic port (0 = ephemeral). Default
-   (no PEERS) is the prior multicast-only behaviour — byte-identical wire."
+   (no PEERS) is the prior multicast-only behaviour — byte-identical wire. DURABILITY (:volatile default |
+   :transient-local; WP-DURABILITY-TRANSIENT-LOCAL, DDS 1.4 §2.2.3.4) sets the reader's DURABILITY QoS: a
+   :transient-local reader matched to a RETAINING writer REQUESTS that writer's pre-join history (NACKs the
+   advertised [firstSN,lastSN]) — so a late-joining TL reader receives the N samples published BEFORE it
+   joined, plus all future ones; advertised via PID_DURABILITY in SEDP. :volatile (the default) SKIPS a
+   retaining writer's history (advances the WriterProxy past the pre-join range, NACKing only future gaps),
+   receiving ONLY post-join samples — byte-identical to the prior wire."
   (check-type type (member :canonical :tagged))
+  (check-type durability (member :volatile :transient-local))
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x53) :domain domain
                                        :multicast t :advertise-address advertise-address
                                        :port port :peers (%parse-peers peers))))
     ;; Reader ACCEPTS (:xcdr2 :xcdr1) (make-reader-qos default, DDS-XTypes 1.3 §7.6.3.1.1): reads either rep
     ;; (XCDR2 native + XCDR1 via the struct codec / FlatData transcode), so an XCDR1- OR XCDR2-offering peer
     ;; writer passes RxO (first-of-offered in the accepted set) — WP-DATA-REPRESENTATION step 1/2.
+    ;; DURABILITY (default :volatile) flows into the reader QoS -> SEDP PID_DURABILITY + the late-joiner
+    ;; history-request/skip gate (%reader-durability-init), WP-DURABILITY-TRANSIENT-LOCAL, DDS 1.4 §2.2.3.4.
     (dds.disc:add-local-reader node :topic "Square" :type "ShapeType"
-                               :qos (dds.qos:make-reader-qos :reliability :reliable)
+                               :qos (dds.qos:make-reader-qos :reliability :reliable :durability durability)
                                :type-information (%shape-type-information))
     (dds.disc:enable-subscriber node)
     (dds.disc:start-node node)

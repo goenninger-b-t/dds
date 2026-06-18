@@ -96,6 +96,15 @@ int main(int argc, char** argv)
 
     DataReaderQos rqos = DATAREADER_QOS_DEFAULT;
     rqos.reliability().kind = RELIABLE_RELIABILITY_QOS;
+    // DURABILITY=transient_local (off by default = VOLATILE) makes a late-joining reader REQUEST a matched writer's pre-join history; KEEP_ALL retains it (WP-DURABILITY-TRANSIENT-LOCAL interop, DDS 1.4 §2.2.3.4).
+    if (const char* dur = std::getenv("DURABILITY"))
+    {
+        if (std::string(dur) == "transient_local" || std::string(dur) == "transient-local")
+        {
+            rqos.durability().kind = TRANSIENT_LOCAL_DURABILITY_QOS;
+            rqos.history().kind = KEEP_ALL_HISTORY_QOS;
+        }
+    }
     // SUB_LIVELINESS_LEASE_MS (off by default) requests a finite-lease LIVELINESS so this reader RxO-matches + TRACKS a remote writer's liveliness; SUB_LIVELINESS_KIND selects automatic (default) or manual_by_participant.
     if (const char* lease_ms = std::getenv("SUB_LIVELINESS_LEASE_MS"))
     {

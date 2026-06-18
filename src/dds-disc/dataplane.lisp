@@ -323,6 +323,44 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for v being the hash-values of (disc-node-matches node) collect v)))
 
+(defun* %local-writer-durability (node)
+    (function (disc-node) (member :volatile :transient-local :transient :persistent))
+  "NODE's local user writer's DURABILITY kind (DDS 1.4 §2.2.3.4), read from its advertised endpoint-data
+   QoS (disc-node-local-writers — the same QoS the SEDP advertises + RxO-matches). v1 is one engine writer
+   per node (one-writer-per-node, the enable-publisher note + the single dp-user-writer), so the node's lone
+   local-writer's durability IS the engine writer's; :VOLATILE when there is no local writer yet (the
+   discovery-less value-level path). Gates the full-ACK purge in %on-user-acknack + the late-joiner replay
+   in %writer-durability-init: a TRANSIENT_LOCAL writer retains for late-joiners (writer-purge-acked
+   DURABILITY). NOTE: if v1's one-writer-per-node invariant is ever lifted (multiple DataWriters of mixed
+   durability sharing the engine writer), this single-writer attribution must be revisited — the engine
+   writer would need its own settled durability rather than a list head."
+  (let ((w (first (disc-node-local-writers node))))
+    (if w (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos w)) :volatile)))
+
+(defun* finalize-writer-durability (node)
+    (function (disc-node) (eql t))
+  "Mark NODE's local user writer FINALIZED (DDS 1.4 §2.2.3.4; the OPT-IN durability-finalize extension ON
+   TOP of the conformant default). The disc-level bridge for DCPS durability-finalize: forwards to the engine
+   writer (writer-finalize-durability on disc-node-user-writer), after which the full-ACK purge in
+   %on-user-acknack RELEASES the TRANSIENT_LOCAL writer's retained late-joiner history once all current
+   readers ACK (writer-purge-acked treats a finalized writer as VOLATILE). v1 one-writer-per-node, so this
+   finalizes the node's lone engine writer; a no-op (still T) when there is no user writer. Monotonic."
+  (let ((w (disc-node-user-writer node)))
+    (when w (dds.rtps.reliable:writer-finalize-durability w)))
+  t)
+
+(defun* %local-reader-durability (node)
+    (function (disc-node) (member :volatile :transient-local :transient :persistent))
+  "NODE's local user reader's DURABILITY kind (DDS 1.4 §2.2.3.4), read from its advertised endpoint-data
+   QoS (disc-node-local-readers — the same QoS the SEDP advertises + RxO-matches). v1 is one engine reader
+   per node (the single dp-user-reader), so the node's lone local-reader's durability IS the engine
+   reader's; :VOLATILE when there is no local reader yet (the discovery-less value-level path). Gates the
+   reader-side history request in %reader-durability-init: a VOLATILE reader skips a matched writer's
+   advertised pre-match history; a TRANSIENT_LOCAL reader matched a TRANSIENT_LOCAL writer requests it.
+   Mirrors %local-writer-durability; the same one-reader-per-node caveat applies if that invariant is lifted."
+  (let ((r (first (disc-node-local-readers node))))
+    (if r (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos r)) :volatile)))
+
 (defun* %match-destinations (node want-readers)
     (function (disc-node t) list)
   "User-traffic (host . port) destinations gated on MATCHING: the union of static
@@ -802,6 +840,65 @@
             (%send-user-heartbeat node (disc-node-tx-msg node) first last count (car peer) (cdr peer)))))))
   t)
 
+(defun* %writer-durability-init (node reader-guid reader-durability)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))
+               (member :volatile :transient-local :transient :persistent)) (eql t))
+  "Writer-side late-joiner proxy init for a newly matched remote reader (DDS 1.4 §2.2.3.4, RTPS 2.5
+   §8.4.2.2). Called once at match time from the DCPS on-match hook — on the RECEIVER thread, so every send
+   here uses the node's rx-tx-msg buffer, never tx-msg (the announce/caller thread's, dataplane.lisp §top).
+   READER-GUID = the matched handle; READER-DURABILITY = the remote reader's advertised DURABILITY. When
+   BOTH this writer (its advertised DURABILITY) AND the reader are TRANSIENT_LOCAL, initialize the reader's
+   ReaderProxy UNSENT-BASE to firstSN (hc-min-seq) so the existing push (writer-unsent-list) REPLAYS the
+   entire retained history, then send a prompt HEARTBEAT [firstSN,lastSN] so it ACKNACKs and the existing
+   retransmit path delivers the history — to that reader's participant alone when its unicast destination is
+   resolved (by the 12-octet GUID prefix), else fanned out to every matched-reader destination (each reader
+   NACKs only its own gaps). firstSN/lastSN/count are taken from a SINGLE writer-heartbeat call (one lock,
+   one consistent snapshot — no torn read vs a concurrent write/purge). Otherwise (a VOLATILE writer or a
+   VOLATILE reader) init UNSENT-BASE to lastSN+1 — future-only, the effective pre-WP behavior (a new reader
+   never gets the pre-existing history). A no-op (still returns T) when there is no user writer. Sets only
+   the push watermark; the ACKNACK repair watermark (acked-base) is left at its default (independent,
+   §8.4.2.2)."
+  (let ((w (disc-node-user-writer node)))
+    (when w
+      (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)   ; one locked snapshot
+        (let* ((tl-tl (and (eq reader-durability :transient-local)
+                           (eq (%local-writer-durability node) :transient-local)))
+               (base (if tl-tl first (1+ last))))
+          (dds.rtps.reliable:init-reader-proxy-base w reader-guid base)
+          (when (and tl-tl (>= last first))              ; retained history exists -> prompt a NACK
+            (let* ((prefix (subseq reader-guid 0 12))
+                   (dest (%prefix-user-destination node prefix))
+                   (peers (if dest (list dest) (%match-destinations node t))))   ; rx-thread-safe fan-out fallback
+              (dolist (peer peers)
+                (%send-user-heartbeat node (disc-node-rx-tx-msg node) first last count
+                                      (car peer) (cdr peer)))))))))
+  t)
+
+(defun* %reader-durability-init (node writer-guid writer-durability)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))
+               (member :volatile :transient-local :transient :persistent)) (eql t))
+  "Reader-side late-joiner gate for a newly matched remote writer (DDS 1.4 §2.2.3.4, RTPS 2.5 §8.4.2.2).
+   Called once at match time from the DCPS on-match hook. WRITER-GUID = the matched handle;
+   WRITER-DURABILITY = the remote writer's advertised DURABILITY. SKIP iff this reader is VOLATILE AND the
+   writer is a RETAINING durability (TRANSIENT_LOCAL / TRANSIENT / PERSISTENT — RxO admits a non-volatile
+   writer matching a VOLATILE reader, offered-rank >= requested-rank): then the reader SKIPS the writer's
+   advertised pre-match history (init-writer-proxy-durability SKIP-HISTORY T → the first HEARTBEAT advances
+   the WriterProxy firstSN to lastSN+1, NACKing only future gaps) — the behavior-defining branch: a VOLATILE
+   reader must NOT pull a TRANSIENT_LOCAL writer's retained history even though it is advertised. In EVERY
+   other admitted combination — a TRANSIENT_LOCAL reader (matched a retaining writer → REQUEST the history)
+   AND, crucially, VOLATILE-reader<->VOLATILE-writer — SKIP-HISTORY is NIL: byte-identical to before this WP,
+   so a VOLATILE reader against a VOLATILE writer still NACKs a dropped LIVE sample (a VOLATILE writer
+   retains no history to wrongly pull; gating the skip on a RETAINING writer is what keeps reliable
+   drop-recovery intact). A no-op (still T) when there is no user reader. Mirrors %writer-durability-init;
+   sets ONLY the reader-side gate (no send here — the answering ACKNACK rides the existing
+   %on-user-heartbeat path)."
+  (let ((r (disc-node-user-reader node)))
+    (when r
+      (let ((skip (and (eq (%local-reader-durability node) :volatile)
+                       (not (eq writer-durability :volatile)))))   ; VOLATILE reader skips a RETAINING writer
+        (dds.rtps.reliable:init-writer-proxy-durability r writer-guid skip))))
+  t)
+
 (defun* %async-signal (node)
     (function (disc-node) t)
   "WP-ASYNC: mark work pending and wake the sender thread (the reliable unsent-list IS the queue; the
@@ -1269,8 +1366,11 @@
             (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer)))))
         ;; the ACKNACK advanced this reader's acked-base -> purge HistoryCache changes ALL matched readers
         ;; have now acknowledged (RTPS 2.5 §8.4.1), bounding the KEEP_ALL writer history. NACKed (resent)
-        ;; changes are not fully acked, so they are never purged.
-        (dds.rtps.reliable:writer-purge-acked (disc-node-user-writer node) (%matched-reader-keys node)))))
+        ;; changes are not fully acked, so they are never purged. A TRANSIENT_LOCAL writer (DDS 1.4
+        ;; §2.2.3.4) RETAINS its acked history for late-joiners — the durability arg makes the purge a
+        ;; no-op for it (HISTORY-bounded, not ACK-bounded); a VOLATILE writer purges as before.
+        (dds.rtps.reliable:writer-purge-acked (disc-node-user-writer node) (%matched-reader-keys node)
+                                              (%local-writer-durability node)))))
   t)
 
 (defun* %on-user-data-frag (node c flags body-len buf src-prefix)

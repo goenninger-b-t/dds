@@ -776,6 +776,188 @@
               "no matched readers -> purge is a no-op (keep everything)")))
   t)
 
+(defun* run-durability-retention-test ()
+    (function () t)
+  "Test: a TRANSIENT_LOCAL writer RETAINS its fully-acked history for late-joiners (DDS 1.4 §2.2.3.4); a
+   VOLATILE writer purges on full-ACK as before (RTPS 2.5 §8.4.1). Both writers hold 10 changes; both
+   readers ACK past the end (acked-base 11). writer-purge-acked with DURABILITY :transient-local purges
+   NOTHING (the cache is HISTORY-bounded, not ACK-bounded — retained for the writer's lifetime); with
+   :volatile (the default) it purges the full-acked range to empty, byte-identical to before this WP."
+  (flet ((mk () (dds.rtps.reliable:make-rtps-writer
+                 :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (pl (k) (map '(simple-array (unsigned-byte 8) (*)) #'char-code (format nil "m~d" k)))
+         (ack (w rid base) (dds.rtps.reliable:writer-on-acknack
+                            w rid base 0 (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0))))
+    ;; (a) TRANSIENT_LOCAL writer: full-ACK does NOT purge — the history is kept for a late-joiner.
+    (let ((w (mk)) (a 10) (b 20))
+      (dotimes (k 10) (dds.rtps.reliable:writer-write w (pl (1+ k))))   ; SN 1..10
+      (ack w a 11) (ack w b 11)                                         ; BOTH readers acked all 10
+      (%check :dret-tl-noop
+              (and (zerop (dds.rtps.reliable:writer-purge-acked w (list a b) :transient-local))
+                   (= 10 (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w))))
+              "a TRANSIENT_LOCAL writer must NOT full-ACK-purge — all 10 retained for late-joiners")
+      (%check :dret-tl-firstsn (= 1 (dds.rtps.history:hc-min-seq (dds.rtps.reliable:rtps-writer-hc w)))
+              "the TL writer's HEARTBEAT firstSN stays at 1 (full history available to a late-joiner)"))
+    ;; (b) VOLATILE writer (the default DURABILITY arg): full-ACK purges to empty — UNCHANGED behavior.
+    (let ((w (mk)) (a 10) (b 20))
+      (dotimes (k 10) (dds.rtps.reliable:writer-write w (pl (1+ k))))   ; SN 1..10
+      (ack w a 11) (ack w b 11)
+      (%check :dret-vol-purges
+              (and (= 10 (dds.rtps.reliable:writer-purge-acked w (list a b)))   ; default :volatile
+                   (zerop (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w))))
+              "a VOLATILE writer (default) purges the full-acked history to empty — byte-identical to before")
+      (%check :dret-vol-explicit
+              (let ((w2 (mk)))
+                (dotimes (k 10) (dds.rtps.reliable:writer-write w2 (pl (1+ k))))
+                (ack w2 a 11) (ack w2 b 11)
+                (= 10 (dds.rtps.reliable:writer-purge-acked w2 (list a b) :volatile)))
+              "an EXPLICIT :volatile purges identically to the default arg")))
+  t)
+
+(defun* run-durability-replays-test ()
+    (function () t)
+  "Test: a TRANSIENT_LOCAL writer REPLAYS its retained history to a late-joining TL reader (DDS 1.4
+   §2.2.3.4) — init-reader-proxy-base sets the new reader's UNSENT-BASE to firstSN (= hc-min-seq) so the
+   writer pushes ALL retained changes, vs the future-only default (lastSN+1). A TL writer publishes 5; a
+   NEW reader joins; its proxy initialized to firstSN replays all 5 (writer-unsent-list); a future-only
+   reader (lastSN+1) replays 0 of the pre-existing 5 and only sees a subsequently-published 6th."
+  (let* ((w (dds.rtps.reliable:make-rtps-writer
+             :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (late 30) (future 40)
+         (pl (lambda (k) (map '(simple-array (unsigned-byte 8) (*)) #'char-code (format nil "m~d" k)))))
+    (dotimes (k 5) (dds.rtps.reliable:writer-write w (funcall pl (1+ k))))   ; SN 1..5
+    (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)
+      (declare (ignore count))
+      (%check :drep-hb-range (and (= first 1) (= last 5)) "the writer advertises [firstSN=1, lastSN=5]")
+      ;; TRANSIENT_LOCAL late-joiner: proxy unsent-base := firstSN -> the writer replays all 5.
+      (dds.rtps.reliable:init-reader-proxy-base w late first)
+      (%check :drep-tl-base
+              (= 1 (dds.rtps.reliable:reader-proxy-unsent-base (dds.rtps.reliable:get-reader-proxy w late)))
+              "a TL late-joiner's proxy unsent-base is initialized to firstSN=1 (replay all)")
+      (let ((replayed (dds.rtps.reliable:writer-unsent-list w late)))
+        (%check :drep-tl-all
+                (equal '(1 2 3 4 5) (mapcar #'dds.rtps.history:cache-change-sn replayed))
+                "the TL late-joiner is pushed ALL 5 retained changes (the firstSN proxy init)"))
+      ;; VOLATILE (future-only) late-joiner: proxy unsent-base := lastSN+1 -> 0 of the pre-existing 5.
+      (dds.rtps.reliable:init-reader-proxy-base w future (1+ last))
+      (%check :drep-vol-empty (null (dds.rtps.reliable:writer-unsent-list w future))
+              "a future-only (lastSN+1) reader replays NOTHING of the pre-existing history")
+      (dds.rtps.reliable:writer-write w (funcall pl 6))                 ; SN 6, published AFTER both joined
+      (%check :drep-vol-future
+              (equal '(6) (mapcar #'dds.rtps.history:cache-change-sn
+                                  (dds.rtps.reliable:writer-unsent-list w future)))
+              "the future-only reader sees only SN 6 (published after it joined), not the retained 1..5")))
+  t)
+
+(defun* run-durability-reader-gate-test ()
+    (function () t)
+  "Test: the READER-SIDE durability gate (DDS 1.4 §2.2.3.4) — on the FIRST HEARTBEAT advertising
+   [firstSN, lastSN] a reader that REQUESTS history (a TRANSIENT_LOCAL reader matched a retaining writer,
+   skip-history NIL) NACKs the full range from firstSN, while a reader that SKIPS history (a VOLATILE reader
+   matched a retaining/TRANSIENT_LOCAL writer, skip-history T) sets its expected base to lastSN+1, NACKing
+   only future gaps. init-writer-proxy-durability records the per-writer skip decision at match time;
+   reader-on-heartbeat applies it once, on the first HEARTBEAT. The behavior-defining branch: without it a
+   VOLATILE reader would NACK the TL writer's advertised history and the TL writer (which retains) would
+   retransmit it — wrongly delivering history to a VOLATILE reader. (The disc gate sets skip-history only for
+   a VOLATILE reader against a RETAINING writer, so VOLATILE<->VOLATILE stays NIL = byte-identical; this test
+   drives the reliable mechanism directly with both flag values.)"
+  (let* ((reader (dds.rtps.reliable:make-rtps-reader))
+         (tl-w (%aliasing-writer-guid #x1a))      ; skip-history NIL (a TL reader matched a TL writer) -> REQUEST
+         (vol-w (%aliasing-writer-guid #x1b)))     ; skip-history T (a VOLATILE reader matched a TL writer) -> SKIP
+    ;; (a) skip-history NIL (a TL reader matched a TL writer): request the full history.
+    (dds.rtps.reliable:init-writer-proxy-durability reader tl-w nil)   ; skip-history NIL -> request
+    (dds.rtps.reliable:reader-on-heartbeat reader tl-w 1 10)            ; late-joiner: [firstSN=1, lastSN=10]
+    (%check :drg-tl-firstsn
+            (= 1 (dds.rtps.reliable:writer-proxy-first-sn (dds.rtps.reliable:get-writer-proxy reader tl-w)))
+            "a TL reader keeps firstSN=1 -> requests the retained history")
+    (multiple-value-bind (base numbits) (dds.rtps.reliable:reader-acknack reader tl-w)
+      (%check :drg-tl-nacks-all (and (= base 1) (= numbits 10))
+              "a TL reader's ACKNACK base is firstSN=1 and NACKs the full advertised [1,10]"))
+    ;; (b) VOLATILE reader: skip the advertised history (base := lastSN+1), NACK only future gaps.
+    (dds.rtps.reliable:init-writer-proxy-durability reader vol-w t)    ; skip-history T -> skip
+    (dds.rtps.reliable:reader-on-heartbeat reader vol-w 1 10)           ; late-joiner: [firstSN=1, lastSN=10]
+    (%check :drg-vol-skip
+            (= 11 (dds.rtps.reliable:writer-proxy-first-sn (dds.rtps.reliable:get-writer-proxy reader vol-w)))
+            "a VOLATILE reader advances firstSN to lastSN+1=11 -> skips the retained history")
+    (multiple-value-bind (base numbits) (dds.rtps.reliable:reader-acknack reader vol-w)
+      (%check :drg-vol-no-history (and (= base 11) (zerop numbits))
+              "a VOLATILE reader's ACKNACK NACKs NOTHING of the advertised history (base lastSN+1, 0 bits)"))
+    ;; (c) the skip is applied ONCE (first HEARTBEAT only): a later HEARTBEAT does NOT re-skip new samples.
+    (dds.rtps.reliable:reader-on-heartbeat reader vol-w 1 15)           ; the writer published SN 11..15
+    (multiple-value-bind (base numbits) (dds.rtps.reliable:reader-acknack reader vol-w)
+      (%check :drg-vol-future (and (= base 11) (= numbits 5))
+              "a VOLATILE reader NACKs the FUTURE gap [11,15] (published after it joined), base still 11"))
+    ;; (d) byte-identical default: a fresh reader with NO durability decision behaves EXACTLY as before
+    ;; (full-range NACK of [firstSN, lastSN]) — the gate is OFF unless init-writer-proxy-durability set it.
+    (let ((dflt (dds.rtps.reliable:make-rtps-reader)) (w (%aliasing-writer-guid #x1c)))
+      (dds.rtps.reliable:reader-on-heartbeat dflt w 1 10)
+      (multiple-value-bind (base numbits) (dds.rtps.reliable:reader-acknack dflt w)
+        (%check :drg-default-unchanged (and (= base 1) (= numbits 10))
+                "with NO durability decision the reader NACKs the full range — byte-identical to before"))))
+  t)
+
+(defun* run-durability-finalize-test ()
+    (function () t)
+  "Test: durability-finalize (DDS 1.4 §2.2.3.4; the OPT-IN extension ON TOP of the conformant default) —
+   a finalized TRANSIENT_LOCAL writer reverts to the VOLATILE-style full-ACK purge, RELEASING its retained
+   history once all current readers ACK; a subsequent late-joiner gets NOTHING of the pre-finalize history;
+   samples published AFTER finalize behave VOLATILE (purged on full-ACK). The default (un-finalized) TL
+   writer still RETAINS (byte-identical to Task 1), and a VOLATILE writer is unaffected (regression gate).
+   The finalize is MONOTONIC (no un-finalize in v1)."
+  (flet ((mk () (dds.rtps.reliable:make-rtps-writer
+                 :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (pl (k) (map '(simple-array (unsigned-byte 8) (*)) #'char-code (format nil "m~d" k)))
+         (ack (w rid base) (dds.rtps.reliable:writer-on-acknack
+                            w rid base 0 (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0))))
+    ;; (a) finalize releases the retained history: a TL writer holds 10, finalize, both readers ACK -> purged.
+    (let ((w (mk)) (a 10) (b 20))
+      (dotimes (k 10) (dds.rtps.reliable:writer-write w (pl (1+ k))))   ; SN 1..10
+      (ack w a 11) (ack w b 11)                                         ; both readers acked all 10
+      (%check :dfin-default-retains
+              (zerop (dds.rtps.reliable:writer-purge-acked w (list a b) :transient-local))
+              "before finalize a TL writer still RETAINS on full-ACK (byte-identical to Task 1)")
+      (dds.rtps.reliable:writer-finalize-durability w)                  ; no more late-joiners expected
+      (%check :dfin-flag (dds.rtps.reliable:rtps-writer-finalized w)
+              "writer-finalize-durability sets the per-writer FINALIZED flag")
+      (%check :dfin-releases
+              (and (= 10 (dds.rtps.reliable:writer-purge-acked w (list a b) :transient-local))
+                   (zerop (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w))))
+              "a FINALIZED TL writer purges the full-acked history to empty (reverts to VOLATILE)"))
+    ;; (b) a subsequent late-joiner gets NOTHING of the released pre-finalize history (firstSN moved past it).
+    (let ((w (mk)) (a 10) (b 20) (late 30))
+      (dotimes (k 5) (dds.rtps.reliable:writer-write w (pl (1+ k))))    ; SN 1..5
+      (ack w a 6) (ack w b 6)
+      (dds.rtps.reliable:writer-finalize-durability w)
+      (dds.rtps.reliable:writer-purge-acked w (list a b) :transient-local)   ; release 1..5
+      (multiple-value-bind (first last) (dds.rtps.reliable:writer-heartbeat w)
+        (dds.rtps.reliable:init-reader-proxy-base w late first)          ; TL late-joiner: replay from firstSN
+        (%check :dfin-latejoiner-nothing
+                (null (dds.rtps.reliable:writer-unsent-list w late))
+                "a late-joiner after finalize gets NOTHING of the released pre-finalize history")
+        (%check :dfin-empty-after-release (zerop last)
+                "the released cache advertises an empty range (lastSN 0) to the late-joiner")))
+    ;; (c) samples published AFTER finalize behave VOLATILE: purged on full-ACK (not retained).
+    (let ((w (mk)) (a 10) (b 20))
+      (dds.rtps.reliable:writer-finalize-durability w)                 ; finalize an empty writer
+      (dotimes (k 4) (dds.rtps.reliable:writer-write w (pl (1+ k))))   ; SN 1..4 published after finalize
+      (ack w a 5) (ack w b 5)
+      (%check :dfin-post-volatile
+              (and (= 4 (dds.rtps.reliable:writer-purge-acked w (list a b) :transient-local))
+                   (zerop (dds.rtps.history:hc-change-count (dds.rtps.reliable:rtps-writer-hc w))))
+              "samples published AFTER finalize are purged on full-ACK (VOLATILE behavior)"))
+    ;; (d) regression: a VOLATILE writer is UNAFFECTED by finalize (already purges); finalize is MONOTONIC.
+    (let ((w (mk)) (a 10) (b 20))
+      (dotimes (k 3) (dds.rtps.reliable:writer-write w (pl (1+ k))))   ; SN 1..3
+      (ack w a 4) (ack w b 4)
+      (%check :dfin-volatile-unaffected
+              (= 3 (dds.rtps.reliable:writer-purge-acked w (list a b) :volatile))
+              "a VOLATILE writer purges on full-ACK regardless of finalize (byte-identical)")
+      (dds.rtps.reliable:writer-finalize-durability w)
+      (dds.rtps.reliable:writer-finalize-durability w)                 ; idempotent / monotonic
+      (%check :dfin-monotonic (dds.rtps.reliable:rtps-writer-finalized w)
+              "finalize is monotonic: a second call keeps the writer FINALIZED")))
+  t)
+
 (defun* run-reader-compaction-test ()
     (function () t)
   "Test: the reader WriterProxy received-table stays bounded to the live window, not O(history) (RTPS 2.5

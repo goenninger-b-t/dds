@@ -81,6 +81,7 @@
            #:liveliness-lost-status
            #:liveliness-lost-status-total-count #:liveliness-lost-status-total-count-change
            #:get-liveliness-lost-status #:assert-liveliness
+           #:durability-finalize
            ;; Listeners (FR-DCPS-2)
            #:listener #:data-reader-listener #:data-writer-listener #:topic-listener
            #:on-data-available #:on-subscription-matched #:on-requested-incompatible-qos

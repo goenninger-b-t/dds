@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <thread>
 
 #include <fastdds/dds/domain/DomainParticipant.hpp>
@@ -63,6 +64,15 @@ int main(int argc, char** argv)
 
     DataWriterQos wqos = DATAWRITER_QOS_DEFAULT;
     wqos.reliability().kind = RELIABLE_RELIABILITY_QOS;
+    // DURABILITY=transient_local (off by default = VOLATILE) makes the writer RETAIN+REPLAY its history to a late-joining reader; KEEP_ALL so ALL pre-join samples are retained (WP-DURABILITY-TRANSIENT-LOCAL interop, DDS 1.4 §2.2.3.4).
+    if (const char* dur = std::getenv("DURABILITY"))
+    {
+        if (std::string(dur) == "transient_local" || std::string(dur) == "transient-local")
+        {
+            wqos.durability().kind = TRANSIENT_LOCAL_DURABILITY_QOS;
+            wqos.history().kind = KEEP_ALL_HISTORY_QOS;
+        }
+    }
     // WLP_LEASE_MS (off by default) gives the writer a finite-lease AUTOMATIC LIVELINESS so the participant emits standard ParticipantMessageData (RTPS 8.4.13) for the interop WLP byte-validation leg.
     if (const char* wlp_ms = std::getenv("WLP_LEASE_MS"))
     {

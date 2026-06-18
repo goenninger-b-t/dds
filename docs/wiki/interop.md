@@ -19,7 +19,15 @@ make square-sub                # subscribe + print received shapes
 make square-spy                # discovery diagnostic: discovered participants + locators
 make gated-sub                 # DCPS-level type-GATED subscriber (FR-TYPE-4): the assignability
                                # gate fires on a stock Connext peer's PID_TYPE_OBJECT_LB (0x8021)
+make square-pub DURABILITY=transient-local   # TRANSIENT_LOCAL writer: retain + replay to a late-joiner
+make square-sub DURABILITY=transient-local PEERS=127.0.0.1:7410   # TL late-joiner: pull the retained history
 ```
+
+The `DURABILITY=transient-local` gate (DDS 1.4 §2.2.3.4; default `volatile` = byte-identical wire) makes
+the writer RETAIN its history + replay it to a late-joining reader (forcing HISTORY KEEP_ALL), and the
+reader REQUEST a matched retaining writer's pre-join history. See
+[`interop/durability-transient-local/`](../../interop/durability-transient-local/) for the live
+late-joiner interop (both directions, both peers).
 
 `make gated-sub` builds a **DCPS** participant (whose `create-participant` installs the
 FR-TYPE-4 assignability gate — the standalone `square-sub` is a bare `dds.disc` node with no
@@ -275,6 +283,27 @@ Still provisional: the unexercised serialization-VM edges (unions, MUTABLE struc
   loopback-capture quirk, not a delivery gap — proven by the decoded sample counts); the forward-leg
   `0x0001`/`0x0007` TX encapsulation is dissected directly (`captures/our-xcdr{1,2}-to-{connext,fastdds}.pcap`,
   `captures/{connext,fastdds}-pub-to-our-sub.pcap`).
+
+- **TRANSIENT_LOCAL durability + late-joiner cross-DDS interop (WP-DURABILITY-TRANSIENT-LOCAL, M6/P5,
+  DDS 1.4 §2.2.3.4; [`interop/durability-transient-local/`](../../interop/durability-transient-local/))**
+  — the per-feature DoD gate for TRANSIENT_LOCAL + the late-joiner, both directions, both peers. Both
+  halves of the Shapes harness gain a **`DURABILITY=transient-local`** gate (`run-publisher` /
+  `run-subscriber`; default `volatile` = byte-identical wire): the TL writer retains its history (forcing
+  HISTORY KEEP_ALL) + replays it to a late-joining reader, and the TL reader requests a retaining writer's
+  pre-join history. The foreign peers are made TL via QoS XML (Connext) and an inert C++ `DURABILITY` env
+  gate (Fast DDS). **Connext 7.3.1 + Fast DDS 3.6.1: PASS, live in-session (2026-06-18, loopback)** — all
+  four directional legs delivered the late-joiner the RETAINED pre-join history (the animation's first
+  low-coordinate sample, published before the late side joined): forward (our TL writer → a late foreign
+  TL reader) Connext received 63 from `x=53 y=52`, Fast DDS 60 from `x=53 y=52`; reverse (a foreign TL
+  writer → our late TL reader) we received Connext's 902 incl. `x=53 y=52` and Fast DDS's 200 incl.
+  `x=50 y=50`. The **VOLATILE-reader contrast** against each foreign TL writer correctly received ONLY
+  post-join samples (Connext 425 from `x=68 y=106`, Fast DDS 93 from `x=57 y=99`; the pre-join first
+  sample NOT received) — the behaviour-defining branch. Forward legs are fully wire-captured (our
+  HEARTBEAT `firstAvailableSeqNumber=1` retained, 95 / 89 **retransmits** of the retained range answering
+  the late reader's NACK, `CDR_LE 0x0001`); the reverse legs rest on the decoded application receipt + our
+  outbound ACKNACKs on the wire, because the macOS lo0 BPF under-captures the foreign→us user-DATA
+  direction (the same documented quirk, stated plainly). Our-to-our the feature is also covered by the
+  unit test `run-dcps-durability-latejoiner-test` (green SBCL + Clasp).
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

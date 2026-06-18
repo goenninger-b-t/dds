@@ -27,7 +27,7 @@ Core DDS/DCPS + RTPS + discovery + XTypes/XCDR + the high-value performance diff
 
 ### 1.2 Explicitly out of scope (this program) — see §13
 
-Routing Service, Recording/Replay Service, Persistence Service (as a *separate* service process), Cloud Discovery Service, Admin Console / Monitor GUIs, Database/Web Integration, Limited-Bandwidth plugins, Queuing Service, TSS, spreadsheet add-ins. **Rationale:** these are the bulk of what makes Connext *Professional* "Professional," and each is a project. They are deferred, not designed-out; the architecture MUST NOT preclude them.
+Routing Service, Recording/Replay Service, Cloud Discovery Service, Admin Console / Monitor GUIs, Database/Web Integration, Limited-Bandwidth plugins, Queuing Service, TSS, spreadsheet add-ins. **(The durability/persistence service is now IN scope — owner directive 2026-06-18, ADR 0021 — because DDS TRANSIENT/PERSISTENT durability requires it; the remaining services listed here stay out.)** **Rationale:** these are the bulk of what makes Connext *Professional* "Professional," and each is a project. They are deferred, not designed-out; the architecture MUST NOT preclude them.
 
 ### 1.3 The non-negotiable constraints (from the brief)
 
@@ -295,7 +295,7 @@ A release is **accepted as "Connext-class (core)"** iff, on **SBCL and AllegroCL
 ## 11. Open issues / decisions needed from owner
 
 1. ~~**FR-LANG-4 carve-out:** condition system allowed, or literally zero CLOS?~~ **RESOLVED:** CLOS is permitted and preferred wherever it shows no performance degradation; the hot path stays CLOS-free and per-sample-allocation-free (FR-LANG-0, NFR-CLOS). Remaining sub-decision: confirm the exact set of packages designated "hot path" for the purity gate (current proposal in NFR-CLOS). `(confirm package list)`
-2. **Scope of "Professional":** core+differentiators (this doc) or the full service suite (re-scope as a program of programs)? `(decision)`
+2. **Scope of "Professional":** core+differentiators **+ the durability/persistence service** — RESOLVED 2026-06-18 (ADR 0021): the durability service is in scope (TRANSIENT/PERSISTENT need it); the remaining Professional services stay out. `(resolved)`
 3. **Hard-RT requirement?** If yes, NFR-PERF-3 must be renegotiated or the RT nodes delegated to Connext Micro/Cert. `(decision)`
 4. **VendorId** acquisition path with OMG. `(action)`
 5. **FlatData/Zero-Copy patent clearance** — legal review owner + deadline. `(action, gating P4 ship)`

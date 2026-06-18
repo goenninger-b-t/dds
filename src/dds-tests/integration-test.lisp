@@ -260,6 +260,122 @@
       (dds.dcps:delete-participant p2))
     t))
 
+;;; TRANSIENT_LOCAL durability + late-joiner, our-to-our END-TO-END (DDS 1.4 §2.2.3.4, M6/P5):
+;;; the MVP slice. A reliable TL writer publishes N samples BEFORE any reader exists; THEN a late
+;;; reader joins. A reliable TL reader receives all N retained samples (the writer retained them —
+;;; Task 1 — and replays them: firstSN proxy-init + a prompt HEARTBEAT, and Task 2's reader-side
+;;; gate requests the advertised history). A VOLATILE late reader receives 0 of the pre-existing N
+;;; (its reader-side gate skips the history) and only future-published samples. Both sides land here.
+
+(defun* %run-dcps-late-joiner (reader-durability)
+    (function ((member :volatile :transient-local)) (values (integer 0) (integer 0)))
+  "Drive the our-to-our late-joiner slice for READER-DURABILITY and return (values pre-existing-count
+   future-count): how many of the 3 PRE-EXISTING (published-before-join) samples the late reader got,
+   and whether a 4th sample published AFTER the join arrived. The WRITER is always reliable
+   TRANSIENT_LOCAL KEEP_ALL (it retains for late-joiners, DDS 1.4 §2.2.3.4); the late reader is reliable
+   with READER-DURABILITY. Three distinct instances (RED/GREEN/BLUE) are published first, then the late
+   reader joins, drains, then a 4th (YELLOW) sample is published."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (dw (dds.dcps:create-datawriter
+                     pub tw :qos (dds.qos:make-writer-qos :durability :transient-local
+                                                          :history-kind :keep-all))))
+           ;; publish 3 samples BEFORE any reader exists (the writer retains them — TRANSIENT_LOCAL).
+           (dds.dcps:write-sample dw (make-shape-type :color "RED"   :x 1 :y 1 :shapesize 10))
+           (dds.dcps:write-sample dw (make-shape-type :color "GREEN" :x 2 :y 2 :shapesize 20))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE"  :x 3 :y 3 :shapesize 30))
+           (loop repeat 10 do (dds.dcps:spin p1) (sleep 0.01))   ; let the 3 settle in the HC
+           ;; NOW the late reader joins.
+           (let ((p2 (dds.dcps:create-participant :domain 0)))
+             (unwind-protect
+                  (let* ((tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                         (sub (dds.dcps:create-subscriber p2))
+                         (dr (dds.dcps:create-datareader
+                              sub tr :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                   :durability reader-durability
+                                                                   :history-kind :keep-all))))
+                    (loop repeat 150
+                          until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                    (%check :lj-matched (plusp (dds.dcps:matched-count p2))
+                            "the late reader did not match the writer")
+                    ;; a TL reader must pull all 3; a VOLATILE reader must pull 0 — drain the cadence either way.
+                    (%drain-until dr p1 p2
+                                  (lambda () (>= (dds.dcps:samples-available dr)
+                                                 (if (eq reader-durability :transient-local) 3 99)))
+                                  200)
+                    (let ((pre (length (dds.dcps:take-samples dr))))
+                      ;; a 4th sample, published AFTER the join — both durabilities must receive it.
+                      (dds.dcps:write-sample dw (make-shape-type :color "YELLOW" :x 4 :y 4 :shapesize 40))
+                      (%drain-until dr p1 p2 (lambda () (plusp (dds.dcps:samples-available dr))) 200)
+                      (let ((fut (length (dds.dcps:take-samples dr))))
+                        (values pre fut))))
+               (dds.dcps:delete-participant p2))))
+      (dds.dcps:delete-participant p1))))
+
+(defun* run-dcps-durability-latejoiner-test ()
+    (function () t)
+  "DCPS our-to-our late-joiner (DDS 1.4 §2.2.3.4, M6/P5, the MVP slice). A reliable TRANSIENT_LOCAL writer
+   publishes 3 samples BEFORE any reader; a late-joining reliable TRANSIENT_LOCAL reader receives ALL 3
+   retained samples (writer retention + firstSN replay + the reader-side history request), then a 4th
+   published after the join. A VOLATILE late reader receives 0 of the 3 pre-existing samples (its reader-side
+   gate skips the advertised history) but DOES receive the 4th, published after it joined."
+  (multiple-value-bind (tl-pre tl-fut) (%run-dcps-late-joiner :transient-local)
+    (%check :lj-tl-pre (= 3 tl-pre)
+            "a TRANSIENT_LOCAL late reader must receive ALL 3 retained pre-existing samples")
+    (%check :lj-tl-fut (= 1 tl-fut) "the TL late reader must also receive the 4th (post-join) sample"))
+  (multiple-value-bind (vol-pre vol-fut) (%run-dcps-late-joiner :volatile)
+    (%check :lj-vol-pre (zerop vol-pre)
+            "a VOLATILE late reader must receive 0 of the 3 pre-existing samples (skip the history)")
+    (%check :lj-vol-fut (= 1 vol-fut)
+            "the VOLATILE late reader must still receive the 4th sample (published after it joined)"))
+  t)
+
+(defun* run-dcps-durability-keeplast-test ()
+    (function () t)
+  "DCPS per-instance KEEP_LAST retention for a late-joiner (DDS 1.4 §2.2.3.4, spec test 3). A reliable
+   TRANSIENT_LOCAL KEEP_LAST(depth=1) writer publishes 3 samples on ONE instance (color BLUE) BEFORE any
+   reader; a late-joining TL reader receives only the LAST sample on that instance (depth 1 per instance),
+   not the full 3-sample history (per-instance %hc-index-drop eviction still bounds a TL writer's HC)."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain 0)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (dw (dds.dcps:create-datawriter
+                     pub tw :qos (dds.qos:make-writer-qos :durability :transient-local
+                                                          :history-kind :keep-last :history-depth 1))))
+           ;; 3 samples on the SAME instance: KEEP_LAST(1) keeps only the newest (shapesize 30).
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 2 :y 2 :shapesize 20))
+           (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 3 :y 3 :shapesize 30))
+           (loop repeat 10 do (dds.dcps:spin p1) (sleep 0.01))
+           (let ((p2 (dds.dcps:create-participant :domain 0)))
+             (unwind-protect
+                  (let* ((tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                         (sub (dds.dcps:create-subscriber p2))
+                         (dr (dds.dcps:create-datareader
+                              sub tr :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                   :durability :transient-local
+                                                                   :history-kind :keep-last :history-depth 1))))
+                    (loop repeat 150
+                          until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                    (%check :ljkl-matched (plusp (dds.dcps:matched-count p2)) "KEEP_LAST late reader did not match")
+                    (%drain-until dr p1 p2 (lambda () (plusp (dds.dcps:samples-available dr))) 200)
+                    (let ((got (dds.dcps:take-samples dr)))
+                      (%check :ljkl-one (= 1 (length got))
+                              "a KEEP_LAST(1) TL late reader must get only the LAST sample on the instance, not all 3")
+                      (%check :ljkl-newest
+                              (and got (= 30 (shape-type-shapesize (dds.dcps:cached-sample-data (first got)))))
+                              "the retained KEEP_LAST sample must be the NEWEST (shapesize 30)")))
+               (dds.dcps:delete-participant p2))))
+      (dds.dcps:delete-participant p1))
+    t))
+
 ;;; No-key DCPS round-trip (FR-RTPS S0): a keyless type's DataWriter/DataReader come
 ;;; up NO_KEY (writer 0x03/id 0x103, reader 0x04/id 0x104) — selected by DCPS from the
 ;;; type's keyed-ness — discover, match same-kind, and deliver a sample end to end.

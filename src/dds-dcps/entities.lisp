@@ -472,6 +472,23 @@
     (t (%assert-writer-liveliness dw)))
   t)
 
+(defun* durability-finalize (dw)
+    (function (data-writer) (eql t))
+  "Declare that NO MORE LATE-JOINERS are expected for this DataWriter, releasing its retained
+   TRANSIENT_LOCAL history — a NON-STANDARD, OPT-IN extension ADDED ON TOP of the conformant default
+   (DDS 1.4 §2.2.3.4), never replacing it. By default a TRANSIENT_LOCAL writer RETAINS its acked samples
+   for the writer's lifetime (the conformant default; DDS leaves per-writer TRANSIENT/PERSISTENT lifetime
+   to the durability SERVICE — out of scope for this WP, that is the follow-on service milestone). Calling
+   durability-finalize sets a per-writer flag so the writer reverts to the VOLATILE-style full-ACK purge:
+   the retained late-joiner history is RELEASED once all current matched readers ACK it, and any sample
+   published afterwards behaves VOLATILE (purged on full-ACK, not retained). A subsequent TRANSIENT_LOCAL
+   late-joiner therefore receives NOTHING of the pre-finalize history. The control is MONOTONIC — once
+   finalized the writer stays finalized (no un-finalize in v1); a repeat call is idempotent. A no-op (still
+   returns T) for a VOLATILE writer (it already purges on full-ACK) and when there is no engine writer yet —
+   the disc bridge (dds.disc:finalize-writer-durability) guards on (when w ...), so the no-op arises from the
+   absence of an engine writer, NOT from an explicit enabled check. Forwards to the engine via that bridge."
+  (dds.disc:finalize-writer-durability (dp-node (pub-participant (dw-publisher dw)))))
+
 (defparameter +retcode-ok+ :ok
   "DDS 1.4 ReturnCode_t RETCODE_OK (§2.2.4.4): the operation succeeded. Represented as the keyword :ok.")
 
@@ -1387,9 +1404,22 @@
     (ecase kind
       (:remote-writer (let ((dr (dp-user-reader p)))
                         (when dr (%reader-matched dr handle)
+                              ;; durability-aware late-joiner gate (DDS 1.4 §2.2.3.4): a TL reader matched
+                              ;; a retaining writer REQUESTS its history; a VOLATILE reader matched a
+                              ;; RETAINING writer SKIPS it; a VOLATILE writer retains nothing so its match
+                              ;; never skips. Writer durability is its advertised QoS.
+                              (dds.disc:%reader-durability-init
+                               (dp-node p) handle
+                               (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote)))
                               (%assess-and-record-type-compat dr remote))))
       (:remote-reader (let ((dw (dp-user-writer p)))
                         (when dw (%writer-matched dw handle)
+                              ;; durability-aware late-joiner proxy init (DDS 1.4 §2.2.3.4): a TL writer
+                              ;; matched by a TL reader replays its retained history (firstSN + a prompt
+                              ;; HEARTBEAT); else future-only. Reader durability is its advertised QoS.
+                              (dds.disc:%writer-durability-init
+                               (dp-node p) handle
+                               (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote)))
                               (%assess-and-record-type-compat dw remote))))))
   t)
 

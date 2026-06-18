@@ -90,10 +90,12 @@
   (:export #:rtps-writer #:make-rtps-writer #:rtps-writer-hc #:writer-write #:writer-heartbeat
            #:writer-lifecycle-change #:rtps-writer-max-blocking-ns #:%writer-signal-space
            #:writer-data-list #:writer-unsent-list #:writer-on-acknack #:writer-purge-acked #:get-reader-proxy
-           #:reader-proxy #:reader-proxy-acked-base
+           #:init-reader-proxy-base #:writer-finalize-durability #:rtps-writer-finalized
+           #:reader-proxy #:reader-proxy-acked-base #:reader-proxy-unsent-base
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
-           #:reader-acknack #:reader-on-gap #:reader-complete-p
+           #:reader-acknack #:reader-on-gap #:reader-complete-p #:init-writer-proxy-durability
            #:get-writer-proxy #:writer-proxy #:writer-proxy-received #:writer-proxy-last-sn #:writer-proxy-first-sn
+           #:writer-proxy-skip-history
            #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments* #:*max-gap-range*
            #:reader-on-data-frag #:reader-frag-acknack
            #:writer-frag-plan #:writer-frag-plan-for

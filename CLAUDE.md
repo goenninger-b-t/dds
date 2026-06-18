@@ -8,7 +8,7 @@ This file is the operating contract for every Claude Code session on this reposi
 
 Build, in Common Lisp, a **data-centric publish/subscribe middleware** implementing **OMG DDS 1.4** on the **OMG DDSI-RTPS 2.5** wire protocol with **OMG XCDR (1 + 2)** as the foundational serialization, that **interoperates on the wire with RTI Connext 7.x** and approaches **Connext-class median performance**. CLOS is preferred wherever it costs nothing; the **measured hot path** is `defstruct` + monomorphized code generation + manual vtables, with all hot-path memory drawn from a **static, startup-allocated, non-GC'd arena** sized by `*static-arena-bytes*`. Targets: **SBCL, AllegroCL, Clasp** (Linux-first).
 
-**Scope is the core libraries + high-value differentiators** (FlatData-equivalent, Zero-Copy/SHMEM, batching, async+flow-control, content-filtered topics, durability, security). The Connext *Professional* **service suite** (Routing/Recording/Persistence/Cloud-Discovery/Admin-Console/Monitor) is **out of scope** here — do not start building services; do not let the architecture preclude them.
+**Scope is the core libraries + high-value differentiators** (FlatData-equivalent, Zero-Copy/SHMEM, batching, async+flow-control, content-filtered topics, durability, security) **plus the durability/persistence service** (IN scope per ADR 0021, owner directive 2026-06-18 — DDS TRANSIENT/PERSISTENT durability cannot function without it). The REST of the Connext *Professional* **service suite** (Routing/Recording/Cloud-Discovery/Admin-Console/Monitor) is **out of scope** here — do not start building those services; do not let the architecture preclude them. (The durability service is built per ADR 0021's owner-specified capabilities: embedded library entity, multi-service runner, thread-or-process execution, OTP-style supervisor, `durability-service-main` CLI/env entrypoint, pluggable persistence [file/db/microservice], always-on CNSA-2.0 Data-At-Rest Encryption.)
 
 ---
 
@@ -131,7 +131,7 @@ Rules: **no agent edits another agent's package** (file an issue or open a contr
 - Never hardcode an RTPS/XCDR wire constant from memory — read the clause, verify against vectors.
 - Never trust wire data without bounds-checking, even in `(safety 0)`.
 - Never copy RTI Connext source/headers/generated code.
-- Never start a Connext *Professional* service (Routing/Recording/Persistence/etc.).
+- Never start a Connext *Professional* service (Routing/Recording/Cloud-Discovery/Admin-Console/Monitor/etc.) — **EXCEPT the durability/persistence service, which is IN scope** per ADR 0021 (owner directive 2026-06-18; TRANSIENT/PERSISTENT require it).
 - Never land a performance change without a before/after measurement.
 - Never change an API symbol (special variable, API-visible constant, API-relevant function) without updating its docstring + the affected `docs/wiki/` page and `README.md` (§5.1).
 - Never mark work done with a red gate or a skipped interop/byte-exact check.

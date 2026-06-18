@@ -56,6 +56,11 @@ HISTORY_ARGS := $(if $(HISTORY),:history-kind :$(HISTORY),)
 # (PLAIN_CDR_LE 0x0001) for a peer whose reader accepts [XCDR1]; empty/xcdr2 -> the default (0x0007, identical wire).
 REP      ?=
 REP_ARGS := $(if $(REP),:data-representation :$(REP),)
+# WP-DURABILITY-TRANSIENT-LOCAL square-pub/square-sub DURABILITY QoS: DURABILITY=transient-local makes the
+# (always-reliable) writer RETAIN+REPLAY its history to a late-joining reader / the reader REQUEST that
+# pre-join history (DDS 1.4 §2.2.3.4); empty/volatile -> the default (no retention, byte-identical wire).
+DURABILITY ?=
+DURABILITY_ARGS := $(if $(DURABILITY),:durability :$(DURABILITY),)
 # Optional reader OWNERSHIP QoS for gated-sub (shared|exclusive); empty -> :shared default.
 OWNERSHIP_ARGS := $(if $(OWNERSHIP),:ownership :$(OWNERSHIP),)
 
@@ -103,12 +108,12 @@ wire:
 # Ctrl-C to stop. Override DOMAIN=.. COLOR=.. ; LISP=$(SBCL) used (CFFI multicast).
 square-pub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" :port $(PORT) $(LIVELINESS_ARGS) $(PERF_ARGS) $(FAULT_ARGS) $(HISTORY_ARGS) $(REP_ARGS))' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" :port $(PORT) $(LIVELINESS_ARGS) $(PERF_ARGS) $(FAULT_ARGS) $(HISTORY_ARGS) $(REP_ARGS) $(DURABILITY_ARGS))' \
 	        --eval '(uiop:quit 0)'
 
 square-sub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)" :type :$(TYPE))' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-subscriber :domain $(DOMAIN) :advertise-address "$(ADVERTISE)" :type :$(TYPE) :peers "$(PEERS)" :port $(PORT) $(DURABILITY_ARGS))' \
 	        --eval '(uiop:quit 0)'
 
 # Discovery diagnostic: print each discovered participant's locators + resolved dest.
