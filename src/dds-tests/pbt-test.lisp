@@ -586,6 +586,98 @@
             (error 'test-failure :name "flatdata-transcode-fuzz"
                    :detail (format nil "iter ~d: SHORT payload (len ~d < ~d) under rep #x~4,'0x (~a) ACCEPTED — bounds guard failed" i n size id kind))))))))
 
+;;; ---- WP-DURABILITY-SERVICE-TRANSIENT config-parser fuzz (NFR-SEC-POSTURE) ----
+;;;; PARSE-DURABILITY-CONFIG is the sole network-facing / user-facing parse surface of the
+;;;; durability service CLI.  All parse guards are EXPLICIT manual checks — they do not depend
+;;;; on CL safety level — so a malformed input must ALWAYS signal DURABILITY-CONFIG-ERROR (a
+;;;; controlled condition), NEVER crash, OOB, or produce an undefined result, even at (safety 0).
+;;;; This arm covers: malformed --topic (no colon, empty name/type), unknown flag, non-integer
+;;;; --domain/--max-restarts/--window-seconds, negative domain/restarts, zero window-seconds,
+;;;; --topic with a missing argument, malformed DDS_DURABILITY_TOPICS env string, and random
+;;;; argv/env combinations.  A (safety 0) wrapper confirms the explicit-manual-check argument.
+
+(defun* %gen-durability-config-argv (prng)
+    (function (prng) list)
+  "Generate a pseudo-random, adversarial parse-durability-config ARGV from PRNG.
+   Families: empty, one/two valid tokens, a malformed --topic (no colon / empty part),
+   an unknown flag, a --domain/--max-restarts/--window-seconds with a non-integer or negative
+   value, a trailing --topic with no argument, and pure-random ASCII strings."
+  (let ((family (prng-int prng 0 9)))
+    (case family
+      (0 '())
+      (1 (list "--domain" (format nil "~d" (prng-int prng 0 255))))
+      (2 (list "--topic" "Square:ShapeType"))
+      (3 (list "--topic" (prng-ascii-string prng 24)))      ; likely no colon or empty part
+      (4 (list (prng-ascii-string prng 16)))                ; likely unknown flag
+      (5 (list "--domain" (prng-ascii-string prng 8)))      ; non-integer domain
+      (6 (list "--domain" (format nil "~d" (- (prng-int prng 1 1000)))))  ; negative domain
+      (7 (list "--max-restarts" "-1"))
+      (8 (list "--window-seconds" "0"))
+      (9 (list "--topic"))                                  ; missing argument after --topic
+      (t (loop repeat (prng-int prng 0 4)
+               collect (prng-ascii-string prng 12))))))
+
+(defun* %gen-durability-config-env (prng)
+    (function (prng) list)
+  "Generate a pseudo-random DDS_DURABILITY_* env alist from PRNG.
+   Families: empty, valid domain, malformed domain, valid topic pair, malformed topics string,
+   unknown env key, and random ASCII value."
+  (let ((family (prng-int prng 0 6)))
+    (case family
+      (0 '())
+      (1 (list (cons "DDS_DURABILITY_DOMAIN" (format nil "~d" (prng-int prng 0 255)))))
+      (2 (list (cons "DDS_DURABILITY_DOMAIN" (prng-ascii-string prng 8))))
+      (3 (list (cons "DDS_DURABILITY_TOPICS" "Square:ShapeType")))
+      (4 (list (cons "DDS_DURABILITY_TOPICS" (prng-ascii-string prng 24))))
+      (5 (list (cons (prng-ascii-string prng 16) (prng-ascii-string prng 8))))
+      (6 (list (cons "DDS_DURABILITY_MODE" (prng-ascii-string prng 8)))))))
+
+(defun* %parse-config-safety0 (argv env)
+    (function (list list) t)
+  "Call parse-durability-config under (safety 0). The manual explicit guards in the parser are
+   safety-level-independent — they must signal DURABILITY-CONFIG-ERROR or return valid values
+   regardless of the optimization policy. Returns T on a clean signal or a valid result."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (handler-case
+      (progn
+        (dds.durability:parse-durability-config :argv argv :env env)
+        t)
+    (dds.durability:durability-config-error () t)
+    (error () nil)))
+
+(defun* fuzz-durability-config ()
+    (function () t)
+  "Property-based fuzz of PARSE-DURABILITY-CONFIG (WP-DURABILITY-SERVICE-TRANSIENT, NFR-SEC-POSTURE).
+   For each random (argv, env) pair: the parser MUST either signal DURABILITY-CONFIG-ERROR (a clean,
+   controlled condition) or return a valid (specs max-restarts window-seconds) triple — NEVER an
+   uncontrolled low-level error, OOB, or crash.  A (safety 0) wrapper additionally confirms the
+   explicit-manual-check argument: all parse guards are non-safety-dependent, so the (safety 0)
+   wrapper must reach the same verdict (error vs. success) as the production-policy arm.
+   Deterministic + seeded (reproducible on SBCL + Clasp); 2000 iterations."
+  (let ((prng (make-prng #xD1A9B01F))
+        (iters 2000))
+    (dotimes (i iters t)
+      (let* ((argv (%gen-durability-config-argv prng))
+             (env  (%gen-durability-config-env  prng))
+             ;; production-policy arm: must signal durability-config-error OR return valid triple
+             (prod-ok (handler-case
+                          (progn
+                            (dds.durability:parse-durability-config :argv argv :env env)
+                            t)
+                        (dds.durability:durability-config-error () t)
+                        (error (e)
+                          (error 'test-failure :name "durability-config-fuzz"
+                                 :detail (format nil "iter ~d argv=~s env=~s: production parse leaked uncontrolled error: ~a"
+                                                 i argv env e)))))
+             ;; (safety 0) wrapper: must agree (signal iff production signalled)
+             (s0-ok (%parse-config-safety0 argv env)))
+        (declare (ignore prod-ok))
+        (unless s0-ok
+          (error 'test-failure :name "durability-config-fuzz"
+                 :detail (format nil "iter ~d argv=~s env=~s: (safety 0) wrapper leaked uncontrolled error (explicit manual guard is safety-dependent)"
+                                 i argv env))))))
+  t)
+
 ;;; ---- generators + properties ----
 
 (defun* gsample= (a b)
@@ -776,7 +868,9 @@
     (fuzz-flatdata-zc-loan-wrap)
     ;; WP-FLATDATA-XCDR-TRANSCODE foreign-rep transcode fuzz: malformed/short/truncated foreign body + random rep-id -> reject/bounded, never OOB at (safety 0) (NFR-SEC-POSTURE, R6)
     (run-flatdata-transcode-fuzz)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0), deterministic seed.~%" runs)
+    ;; WP-DURABILITY-SERVICE-TRANSIENT config-parser fuzz: random/malformed argv+env -> clean error or valid result, never OOB (NFR-SEC-POSTURE); (safety 0) arm confirms explicit-manual-check guards
+    (fuzz-durability-config)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0), deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

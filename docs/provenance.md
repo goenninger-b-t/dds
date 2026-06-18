@@ -1680,3 +1680,20 @@ A signalled `%shmem-send` hard fault is caught in `%send-raw-buf` (`dds.disc`), 
   cross-DDS surface is **no-regression** (a foreign peer always gets UDP — the guard is inert for it); the
   no-regression interop (`interop/shmem-send-self-guard/`) reuses the already-committed Connext + Fast DDS
   Shapes peers (provenance recorded above). No new vendor source/binaries are added by this leg.
+
+## M6/P5 — WP-DURABILITY-SERVICE-TRANSIENT Task 1 Spike (2026-06-18)
+
+- **RTI Connext source/headers:** NOT read. The `PID_ORIGINAL_WRITER_INFO (0x0061)` byte layout and
+  dedup mechanism were identified purely by live wire capture: `rtipersistenceservice` v7.3.1 TRANSIENT
+  relay on `lo0`, dissected with tshark RTPS dissector.
+  Capture: `interop/durability-transient/captures/spike-rtips-transient-virtual-guid.pcap`. CLEAN.
+- **eProsima Fast DDS source** (Apache-2.0,
+  `$HOME/gbt Dropbox/gbt/projects/fastdds/src/fastdds/`): read for cross-vendor confirmation of the
+  identified PID. Specific files and lines are recorded in
+  `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md` §6. No code was copied.
+  Purpose: confirm that `PID_ORIGINAL_WRITER_INFO = 0x0061` is shared by both RTI and eProsima, and
+  that the receiver-side dedup map is the standard mechanism. Influence: the findings doc §5
+  Phase 2 design recommendation (emit `PID_ORIGINAL_WRITER_INFO`; receiver dedup map).
+- **OMG RTPS 2.5 spec citations:** `PID_ORIGINAL_WRITER_INFO` is defined in §8.3.5.4
+  (`OriginalWriterInfo`) and Table 9.12; `SequenceNumber` layout in §8.3.3.4. These are the
+  normative references for the Phase 2 implementation.
