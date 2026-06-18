@@ -1616,3 +1616,39 @@ was consulted.**
   OpenDDS source, was read or copied** for this work package. The live cross-DDS interop
   (`interop/sender-resilience/`) reuses the already-committed Connext `shapes-sub` and Fast DDS `shapes`
   subscribers (provenance recorded above); no new vendor source/output is added by this leg.
+
+## M5 (2026-06-17) — WP-DATA-REPRESENTATION PID_DATA_REPRESENTATION + TX in the offered representation (FR-QOS / FR-IO, DDS-XTypes 1.3 §7.6.3.1.1, ADR 0020)
+
+The `PID_DATA_REPRESENTATION` (0x0073) SEDP emit/parse, the role-aware QoS advertising, the spec-strict RxO
+on truthful values, the TX-in-offered-representation (XCDR1-LE / XCDR2-LE) path, and the RX generalization
+(`src/dds-rtps/{message,discovery,packages}.lisp`, `src/dds-qos/qos.lisp`, `src/dds-dcps/entities.lisp`,
+`src/dds-gen/dsl.lisp`) are **clean-room; no new external source code was consulted.**
+
+- **Sources consulted**: the operating contract §4; the in-repo design spec
+  `docs/superpowers/specs/2026-06-17-wp-data-representation-design.md`; **DDS-XTypes 1.3 §7.6.3.1.1**
+  (the `DataRepresentationQosPolicy`, `DataRepresentationId_t` — XCDR1=0, XML=1, XCDR2=2 — and the RxO rule)
+  + **§7.6.3.1.2 / Table 60** (the *distinct* encapsulation ids — `PLAIN_CDR_LE` 0x0001, `PLAIN_CDR2_LE`
+  0x0007); **RTPS 2.5 §8.5** (SEDP), **§9.6** (the PL_CDR parameter encoding), **§9.6.4.8** (the keyhash,
+  unchanged — always XCDR2-BE, rep-independent), **§10.2** (the SerializedPayload header); DDS 1.4 §2.2.3
+  (the QoS RxO / INCOMPATIBLE_QOS). The wire constants were **NOT taken from memory or from this doc**: the
+  `DataRepresentationId_t` values and the `sequence<short>` encoding were pinned from the §7.6.3.1.1 clause
+  text AND verified **byte-exact** against a live RTI Connext 7.3.1 + eProsima Fast DDS 3.6.1 SEDP capture
+  (the wire-is-oracle, the operating contract §4) — recorded in
+  `interop/data-representation/captures/NOTES.md` and re-dissected from our own emitted frames in
+  `interop/data-representation/README.md`. The live SEDP capture (the only new "external artifact") is a
+  **behavioural reference via interop only** — a tshark dissection of bytes on `lo0`, never source/headers.
+- The work **reuses this repo's own existing machinery** — the SEDP PID emit/parse idiom (the
+  PID_RELIABILITY / PID_LIVELINESS precedents), the `qos-rxo-compatible` rule, the `+representation-ids+`
+  encapsulation-id table + `make-encapsulation-header`, the generated struct codec's dual-mode
+  serialize/serialized-size, and the FlatData transcode builder (ADR 0015). It is the in-house application of
+  in-house idioms, not a copy of any vendor's mechanism.
+- **This is standard DDS conformance — NOT patent-gated, with ONE R6 exception**: the FlatData TX-transcode
+  (the `:xcdr1`-offered FlatData write path) is gated like the existing FlatData RX-transcode (ADR 0015) and
+  carries the `NOT cleared for ship — pending counsel (R6)` marker; everything else is unrestricted standard
+  DDS, green on SBCL + Clasp.
+- **No RTI Connext source/headers/`rtiddsgen` output, and no Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) /
+  OpenDDS source, was read or copied** for this work package. The live cross-DDS interop
+  (`interop/data-representation/`) reuses the already-committed Connext `shapes-sub`/`shapes-pub` and Fast
+  DDS `shapes` peers (provenance recorded above); the loopback `USER_QOS_PROFILES.xml` is a copy of the
+  in-repo `interop/connext/liveliness/USER_QOS_PROFILES.xml` (a capture-only aid, not run by CI). No new
+  vendor source/binaries are added by this leg.

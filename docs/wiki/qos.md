@@ -48,7 +48,7 @@ a package-qualified accessor.
 | `dds.qos:qos-presentation-scope` | PRESENTATION access scope — `:instance`, `:topic`, `:group` | `:instance` |
 | `dds.qos:qos-presentation-coherent` | PRESENTATION `coherent_access` flag | `nil` |
 | `dds.qos:qos-presentation-ordered` | PRESENTATION `ordered_access` flag | `nil` |
-| `dds.qos:qos-data-representation` | DATA_REPRESENTATION list. Writer: the *offered* representation is `(first …)`. Reader: the *set* of accepted representations. | `(:xcdr1)` |
+| `dds.qos:qos-data-representation` | DATA_REPRESENTATION list (XTypes 1.3 §7.6.3.1.1). Writer: the *offered* representation is `(first …)`. Reader: the *set* of accepted representations. The base `make-qos` default is `(:xcdr1)` (it models a peer that elides `PID_DATA_REPRESENTATION`); the role-aware constructors advertise the truth — see below. | `(:xcdr1)` |
 | `dds.qos:qos-partition` | PARTITION — a list of partition-name strings | `()` |
 | `dds.qos:qos-autodispose-unregistered-instances` | WRITER_DATA_LIFECYCLE `autodispose_unregistered_instances` (writer-local, non-RxO, §2.2.3.21) — `t` makes a writer's `unregister_instance` also dispose the instance | `t` |
 | `dds.qos:qos-autopurge-nowriter-samples-delay` | READER_DATA_LIFECYCLE `autopurge_nowriter_samples_delay` (reader-local, non-RxO, §2.2.3.22) — delay after which a `NOT_ALIVE_NO_WRITERS` instance's samples + resources are purged. `+duration-infinite+` = never purge | `+duration-infinite+` |
@@ -65,8 +65,8 @@ a package-qualified accessor.
 
 | Symbol | Description |
 |---|---|
-| `dds.qos:make-writer-qos` | `(make-writer-qos &rest args)` — a `qos` with DataWriter defaults (RELIABILITY defaults to `:reliable`); `args` override slots. |
-| `dds.qos:make-reader-qos` | `(make-reader-qos &rest args)` — a `qos` with DataReader defaults (RELIABILITY defaults to `:best-effort`); `args` override slots. |
+| `dds.qos:make-writer-qos` | `(make-writer-qos &rest args)` — a `qos` with DataWriter defaults (RELIABILITY defaults to `:reliable`; DATA_REPRESENTATION defaults to `(:xcdr2)` — the offered representation TX serializes/sends, XTypes 1.3 §7.6.3.1.1); `args` override slots. |
+| `dds.qos:make-reader-qos` | `(make-reader-qos &rest args)` — a `qos` with DataReader defaults (RELIABILITY defaults to `:best-effort`; DATA_REPRESENTATION defaults to `(:xcdr2 :xcdr1)` — the accepted set, XCDR2 preferred, XCDR1 read via the struct codec/FlatData transcode, XTypes 1.3 §7.6.3.1.1); `args` override slots. |
 
 ### HISTORY: per-instance KEEP_LAST (DDS 1.4 §2.2.3.18)
 
@@ -196,6 +196,42 @@ and `run-dcps-incompatible-qos-test` / `run-assignability-test` (in
           (dds.qos:qos-reliability r)            ; => :best-effort
           (dds.qos:qos-durability  r)))          ; => :transient-local
 ```
+
+### DATA_REPRESENTATION — bind a writer to XCDR1, and what it does on the wire
+
+```lisp
+;; A writer OFFERS a single representation (it serializes/sends in it); a reader ACCEPTS a set.
+;; The role-aware defaults advertise the truth in SEDP (PID_DATA_REPRESENTATION 0x0073,
+;; XTypes 1.3 §7.6.3.1.1): writer -> (:xcdr2), reader -> (:xcdr2 :xcdr1).
+(dds.qos:qos-data-representation (dds.qos:make-writer-qos))   ; => (:XCDR2)   offered
+(dds.qos:qos-data-representation (dds.qos:make-reader-qos))   ; => (:XCDR2 :XCDR1) accepted set
+
+;; Bind a writer to XCDR1 (e.g. to serve a fixed-size @final peer whose reader accepts XCDR1 only,
+;; as RTI Connext and Fast DDS Shapes readers do). The writer then SERIALIZES + SENDS XCDR1-LE:
+;; the SerializedPayload encapsulation id is PLAIN_CDR_LE (0x0001), vs the default PLAIN_CDR2_LE (0x0007).
+(let ((w (dds.qos:make-writer-qos :data-representation '(:xcdr1))))
+  (dds.qos:qos-data-representation w))                        ; => (:XCDR1)
+
+;; RxO (DDS 1.4 §2.2.3 / XTypes 1.3 §7.6.3.1.1): the writer's OFFERED rep (first of its list) must be
+;; a member of the reader's accepted set. Our reader accepts both, so either writer matches it:
+(dds.qos:qos-rxo-compatible (dds.qos:make-writer-qos :data-representation '(:xcdr1))
+                            (dds.qos:make-reader-qos))        ; => T,   NIL  (XCDR1 ∈ {XCDR2,XCDR1})
+(dds.qos:qos-rxo-compatible (dds.qos:make-writer-qos)         ; offers (:xcdr2)
+                            (dds.qos:make-reader-qos))        ; => T,   NIL  (XCDR2 ∈ {XCDR2,XCDR1})
+
+;; A reader that accepts XCDR1 ONLY correctly REJECTS a default (:xcdr2) writer — a TRUE incompatibility
+;; (OFFERED/REQUESTED_INCOMPATIBLE_QOS, policy id 23), NOT a false-reject. Bind the writer to (:xcdr1)
+;; to serve such a peer (this is exactly the live Connext/Fast DDS Shapes-reader case).
+(dds.qos:qos-rxo-compatible (dds.qos:make-writer-qos)                          ; offers (:xcdr2)
+                            (dds.qos:make-reader-qos :data-representation '(:xcdr1)))
+;; => NIL, (:DATA-REPRESENTATION)
+```
+
+The RX side decodes whichever standard representation the encapsulation header declares
+(`PLAIN_CDR_LE`/`_BE` → XCDR1, `PLAIN_CDR2_LE`/`_BE` → XCDR2), so a reader accepting `(:xcdr2 :xcdr1)`
+reads either representation a peer wrote. The representation applies ONLY to the user-data payload —
+never to the keyhash (always XCDR2-BE, RTPS 2.5 §9.6.4.8) or discovery. See ADR 0020 and
+`interop/data-representation/README.md` for the live wire proof.
 
 ### Check RxO — a compatible and an incompatible pair
 

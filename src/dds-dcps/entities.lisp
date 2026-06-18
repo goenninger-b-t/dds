@@ -175,34 +175,91 @@
   (owner-strength 0 :type integer)
   (not-alive-since nil :type (or null (integer 0))))
 
-;;; ---- type-support serialization helpers (PLAIN_CDR2_LE SerializedPayload) ----
+;;; ---- type-support serialization helpers (PLAIN_CDR(2)_LE SerializedPayload) ----
 
-(defun* %serialize-sample (ts sample)
-    (function (t t) (simple-array (unsigned-byte 8) (*)))
-  "Serialize SAMPLE via type-support TS as a PLAIN_CDR2_LE SerializedPayload."
-  (let* ((ssz-fn (dds.types:type-support-serialized-size ts))
-         (body-size (if ssz-fn (funcall ssz-fn sample :xcdr2) 2044))
-         (cap (+ 4 body-size 8))   ; 4 encap + body + 8 slack for alignment
-         (buf (dds.core.buffer:make-octet-buffer cap))
-         (wc (dds.core.buffer:cursor buf :endianness :little)))
-    (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
-    (funcall (dds.types:type-support-serialize ts) sample wc :xcdr2)
-    (dds.cdr:finalize-encapsulation-options wc :plain-cdr2-le)
-    (let* ((len (dds.core.buffer:cursor-position wc))
-           (out (make-array len :element-type '(unsigned-byte 8))))
-      (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
-      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
-      out)))
+(defun* %rep->codec (rep)
+    (function (symbol) (values dds.cdr:cdr-mode (member :plain-cdr2-le :plain-cdr-le)))
+  "Map a writer's OFFERED data-representation keyword (DDS-XTypes 1.3 §7.6.3.1.1) to the
+   (values CODEC-MODE ENCAP-REP) the TX SerializedPayload uses: :xcdr2 -> (:xcdr2 :plain-cdr2-le),
+   :xcdr1 -> (:xcdr1 :plain-cdr-le). CODEC-MODE drives the generated serializer's alignment cap
+   (FR-CDR-2); ENCAP-REP names the +representation-ids+ encapsulation id (§7.6.3.1.2 Table 60) the
+   4-octet header carries (XCDR2-LE 0x0007 / XCDR1-LE 0x0001). The XML / BE representations are out
+   of scope on TX (we send LE); a NIL (absent) rep maps to the :xcdr2 default (back-compat), and any
+   other unmapped rep (e.g. :xml) SIGNALS via the ecase — a FINAL PLAIN-encapsulated writer sends only
+   XCDR1/XCDR2-LE."
+  (ecase rep
+    ((:xcdr2 nil) (values :xcdr2 :plain-cdr2-le))
+    (:xcdr1       (values :xcdr1 :plain-cdr-le))))
+
+(defun* %writer-tx-rep (dw)
+    (function (data-writer) symbol)
+  "DW's OFFERED data-representation = (first (qos-data-representation writer-qos)) — the single rep TX
+   serializes/sends in (DDS-XTypes 1.3 §7.6.3.1.1; WP-DATA-REPRESENTATION step 2). Defaults to :xcdr2
+   (the make-writer-qos default, byte-identical existing wire) when the QoS is absent / not a dds.qos:qos
+   / has an empty data-representation list."
+  (let ((qos (entity-qos dw)))
+    (or (and (typep qos 'dds.qos:qos) (first (dds.qos:qos-data-representation qos))) :xcdr2)))
+
+(defun* %serialize-sample (ts sample &optional (rep :xcdr2))
+    (function (t t &optional symbol) (simple-array (unsigned-byte 8) (*)))
+  "Serialize SAMPLE via type-support TS as a SerializedPayload in the writer's OFFERED representation
+   REP (DDS-XTypes 1.3 §7.6.3.1.1; WP-DATA-REPRESENTATION step 2): :xcdr2 -> PLAIN_CDR2_LE (0x0007,
+   the default — byte-identical existing wire), :xcdr1 -> PLAIN_CDR_LE (0x0001). The encapsulation id
+   and the codec alignment mode are both rep-derived (%rep->codec); REP applies ONLY to the user-data
+   payload, NEVER to the keyhash (always XCDR2-BE, RTPS 2.5 §9.6.4.8) or discovery. For a FlatData type
+   the :xcdr2 path stays the 0-copy identity serialize; an :xcdr1 FlatData write TX-transcodes via the
+   flatdata-builder (decode XCDR2 -> struct -> re-encode XCDR1) — R6, off the measured hot path."
+  (multiple-value-bind (mode encap) (%rep->codec rep)
+    (let ((fd-tx (dds.types:type-support-flatdata-builder ts)))
+      ;; FlatData + non-XCDR2 offered rep: the identity serializer copies XCDR2 bytes, so transcode (R6).
+      (when (and fd-tx (not (eq mode :xcdr2)))
+        (return-from %serialize-sample (funcall fd-tx ts sample mode encap))))
+    (let* ((ssz-fn (dds.types:type-support-serialized-size ts))
+           (body-size (if ssz-fn (funcall ssz-fn sample mode) 2044))
+           (cap (+ 4 body-size 8))   ; 4 encap + body + 8 slack for alignment
+           (buf (dds.core.buffer:make-octet-buffer cap))
+           (wc (dds.core.buffer:cursor buf :endianness :little)))
+      (dds.cdr:make-encapsulation-header wc encap)
+      (funcall (dds.types:type-support-serialize ts) sample wc mode)
+      (dds.cdr:finalize-encapsulation-options wc encap)
+      (let* ((len (dds.core.buffer:cursor-position wc))
+             (out (make-array len :element-type '(unsigned-byte 8))))
+        (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
+        out))))
+
+(defun* %encap->codec (encap)
+    (function (symbol) (values dds.cdr:cdr-mode (member :little :big)))
+  "Map a parsed SerializedPayload encapsulation id (a +representation-ids+ key, DDS-XTypes 1.3
+   §7.6.3.1.2 Table 60) to the (values CODEC-MODE ENDIANNESS) the struct codec decodes the body in:
+   PLAIN_CDR_LE -> (:xcdr1 :little), PLAIN_CDR_BE -> (:xcdr1 :big), PLAIN_CDR2_LE -> (:xcdr2 :little),
+   PLAIN_CDR2_BE -> (:xcdr2 :big). The inverse of %rep->codec for RX: a reader accepting (:xcdr2 :xcdr1)
+   reads whichever representation a peer wrote (WP-DATA-REPRESENTATION; the 8-vs-4 alignment + endianness
+   come from the wire, not a hardcoded :xcdr2). A NIL (absent) encap maps to the XCDR2-LE default
+   (back-compat); a known-but-unmapped encap (PL_CDR / DELIMITED / XML) is unexpected for a
+   PLAIN-encapsulated FINAL type and SIGNALS via the ecase — the correct conservative reject (such a body
+   is not decodable here; truly-unknown ids are already rejected upstream by parse-encapsulation-header)."
+  (ecase encap
+    (:plain-cdr-le   (values :xcdr1 :little))
+    (:plain-cdr-be   (values :xcdr1 :big))
+    ((:plain-cdr2-le nil) (values :xcdr2 :little))
+    (:plain-cdr2-be  (values :xcdr2 :big))))
 
 (defun* %deserialize-sample (ts bytes)
     (function (t (simple-array (unsigned-byte 8) (*))) t)
-  "Deserialize a SerializedPayload (encap header + body) into a sample via TS."
+  "Deserialize a SerializedPayload (encap header + body) into a sample via TS, decoding the body in the
+   representation the encapsulation header declares (DDS-XTypes 1.3 §7.6.3.1.2; WP-DATA-REPRESENTATION):
+   the parsed encap keyword/name selects the codec mode (XCDR1/XCDR2, the 8-vs-4 alignment) AND the cursor endianness
+   (LE/BE) via %encap->codec, so a reader accepting (:xcdr2 :xcdr1) reads either rep a peer sent. A FlatData
+   type's :deserialize self-dispatches on the rep id and ignores the passed mode (its own RX-transcode)."
   (let* ((ob (dds.core.buffer:make-octet-buffer (length bytes)))
          (rc (dds.core.buffer:cursor ob :endianness :little)))
     (replace (dds.core.buffer:octet-buffer-vec ob) bytes)
-    (dds.cdr:parse-encapsulation-header rc)
-    (prog1 (funcall (dds.types:type-support-deserialize ts) rc :xcdr2)
-      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))
+    (let ((encap (dds.cdr:parse-encapsulation-header rc)))
+      (multiple-value-bind (mode endian) (%encap->codec encap)
+        (dds.core.buffer:cursor-set-endianness rc endian)
+        (prog1 (funcall (dds.types:type-support-deserialize ts) rc mode)
+          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))))
 
 ;;; ---- DomainParticipantFactory + participant lifecycle ----
 
@@ -454,10 +511,15 @@
    writer (and, for MANUAL_BY_PARTICIPANT, every such writer of the participant) via assert_liveliness.
    WP-KEEPLAST (ADR 0019, DDS 1.4 §2.2.3.18): for a KEEP_LAST writer the sample's instance handle is
    threaded onto the data CacheChange (publish-sample -> writer-write) for per-instance eviction; a KEEP_ALL
-   writer threads NIL, keeping the default path 0-alloc (the handle is computed only when KEEP_LAST needs it)."
+   writer threads NIL, keeping the default path 0-alloc (the handle is computed only when KEEP_LAST needs it).
+   WP-DATA-REPRESENTATION step 2 (DDS-XTypes 1.3 §7.6.3.1.1): the sample is serialized in DW's OFFERED
+   representation (%writer-tx-rep = the first of its data-representation QoS) — :xcdr2 (default, PLAIN_CDR2_LE,
+   byte-identical existing wire) or :xcdr1 (PLAIN_CDR_LE), so an XCDR1-offering writer can serve an XCDR1-only
+   reader; the rep applies to the payload only, never to the keyhash (always XCDR2-BE, RTPS 2.5 §9.6.4.8)."
   (let ((node (dp-node (pub-participant (dw-publisher dw)))))
     (when (eq :timeout (dds.disc:publish-sample
-                        node (%serialize-sample (topic-type-support (dw-topic dw)) sample)
+                        node (%serialize-sample (topic-type-support (dw-topic dw)) sample
+                                                (%writer-tx-rep dw))
                         (%write-key-hash dw sample)))
       (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)

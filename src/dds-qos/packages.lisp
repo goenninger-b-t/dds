@@ -36,4 +36,4 @@
            #:type-consistency-enforcement-prevent-type-widening
            #:type-consistency-enforcement-force-type-validation
            #:qos-rxo-compatible #:partition-match-p
-           #:run-qos-rxo-test))
+           #:run-qos-rxo-test #:run-data-representation-rxo-test))

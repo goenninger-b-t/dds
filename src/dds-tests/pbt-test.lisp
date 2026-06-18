@@ -737,7 +737,13 @@
                                (safe (lambda () (dds.rtps.message:parse-heartbeat-frag-body
                                                  (dds.core.buffer:cursor b) flags)))
                                (safe (lambda () (dds.rtps.message:parse-nack-frag-body
-                                                 (dds.core.buffer:cursor b) flags))))))))
+                                                 (dds.core.buffer:cursor b) flags)))
+                               ;; SEDP ParameterList parse over random octets: a malformed PID
+                               ;; (incl. a forged PID_DATA_REPRESENTATION count) must never OOB (NFR-SEC-POSTURE).
+                               (safe (lambda () (dds.rtps.discovery:parse-endpoint-data
+                                                 (dds.core.buffer:cursor b) :reader)))
+                               (safe (lambda () (dds.rtps.discovery:parse-endpoint-data
+                                                 (dds.core.buffer:cursor b) :writer))))))))
     ;; TypeLookup + TypeObject parsers contract NEVER-signal: no safe-wrap, a signal fails
     ;; RUNS (not 4x): each case feeds all three parsers and rejects signal internally (Clasp cost)
     (check-property "typelookup-parser-fuzz-no-signal" prng runs

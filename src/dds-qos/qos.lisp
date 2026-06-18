@@ -141,15 +141,18 @@
 
 (defun* make-writer-qos (&rest args)
     (function (&rest t) qos)
-  "QoS with DataWriter defaults (RELIABILITY defaults to RELIABLE). ARGS override: ARGS precede the default
-   so a caller's :reliability is the LEFTMOST (and thus winning, HyperSpec 3.4.1.4) keyword."
-  (apply #'make-qos (append args (list :reliability :reliable))))
+  "QoS with DataWriter defaults: RELIABILITY -> RELIABLE; DATA_REPRESENTATION -> (:xcdr2) — the
+   OFFERED representation the writer's TX serializes/sends (XTypes 1.3 §7.6.3.1.1). ARGS override:
+   ARGS precede the defaults so a caller's keyword is the LEFTMOST (and thus winning, HyperSpec 3.4.1.4)."
+  (apply #'make-qos (append args (list :reliability :reliable :data-representation (list :xcdr2)))))
 
 (defun* make-reader-qos (&rest args)
     (function (&rest t) qos)
-  "QoS with DataReader defaults (RELIABILITY defaults to BEST_EFFORT). ARGS override: ARGS precede the default
-   so a caller's :reliability is the LEFTMOST (and thus winning, HyperSpec 3.4.1.4) keyword."
-  (apply #'make-qos (append args (list :reliability :best-effort))))
+  "QoS with DataReader defaults: RELIABILITY -> BEST_EFFORT; DATA_REPRESENTATION -> (:xcdr2 :xcdr1) — the
+   ACCEPTED set; the reader reads both (XCDR2 native + XCDR1 via the struct codec/FlatData transcode) and
+   prefers XCDR2 (XTypes 1.3 §7.6.3.1.1). ARGS override: ARGS precede the defaults so a caller's keyword is
+   the LEFTMOST (and thus winning, HyperSpec 3.4.1.4)."
+  (apply #'make-qos (append args (list :reliability :best-effort :data-representation (list :xcdr2 :xcdr1)))))
 
 ;;; ---- RxO compatibility (FR-QOS-2) ----
 
@@ -265,4 +268,38 @@
             () "overlapping partitions must match")
     (assert (not (partition-match-p (make-qos :partition '("A")) (make-qos :partition '("B"))))
             () "disjoint partitions must not match"))
+  t)
+
+;;; ---- DATA_REPRESENTATION RxO matrix + role-aware-default advertising (XTypes 1.3 §7.6.3.1.1) ----
+
+(defun* run-data-representation-rxo-test ()
+    (function () (eql t))
+  "Lock the DATA_REPRESENTATION RxO matrix (XTypes 1.3 §7.6.3.1.1; the rule is
+   offered-first ∈ reader-set) AND assert the truthful role-aware advertising defaults:
+   make-reader-qos accepts (:xcdr2 :xcdr1) (XCDR2 native + XCDR1 via the struct codec/
+   FlatData transcode, XCDR2 preferred), make-writer-qos offers (:xcdr2) (what TX sends).
+   A failing data-representation policy is the policy-id-23 OFFERED/REQUESTED_INCOMPATIBLE_QOS."
+  (flet ((bad (offered requested) (nth-value 1 (qos-rxo-compatible offered requested))))
+    ;; (a) explicit-value matrix: a reader accepting both reps matches either single-rep writer.
+    (%assert-rxo :rep-reader-both-vs-xcdr1 '()
+                 (bad (make-qos :data-representation '(:xcdr1))
+                      (make-qos :data-representation '(:xcdr2 :xcdr1))))
+    (%assert-rxo :rep-reader-both-vs-xcdr2 '()
+                 (bad (make-qos :data-representation '(:xcdr2))
+                      (make-qos :data-representation '(:xcdr2 :xcdr1))))
+    ;; an XCDR1-only reader does NOT accept an XCDR2-only writer -> incompatible (policy-id 23).
+    (%assert-rxo :rep-xcdr1-reader-vs-xcdr2-writer '(:data-representation)
+                 (bad (make-qos :data-representation '(:xcdr2))
+                      (make-qos :data-representation '(:xcdr1))))
+    ;; (b) role-aware DEFAULTS advertise the truth: reader accepts (:xcdr2 :xcdr1), writer offers (:xcdr2).
+    (assert (equal (qos-data-representation (make-reader-qos)) '(:xcdr2 :xcdr1)) ()
+            "make-reader-qos must default data-representation to (:xcdr2 :xcdr1)")
+    (assert (equal (qos-data-representation (make-writer-qos)) '(:xcdr2)) ()
+            "make-writer-qos must default data-representation to (:xcdr2)")
+    ;; the default writer (offers :xcdr2) matches the default reader (accepts :xcdr2) -> our own pub/sub match.
+    (%assert-rxo :rep-default-writer-vs-default-reader '()
+                 (bad (make-writer-qos) (make-reader-qos)))
+    ;; the default :xcdr2 writer vs an explicit XCDR1-only reader -> a TRUE incompatibility (step 2 resolves it).
+    (%assert-rxo :rep-default-writer-vs-xcdr1-reader '(:data-representation)
+                 (bad (make-writer-qos) (make-reader-qos :data-representation '(:xcdr1)))))
   t)

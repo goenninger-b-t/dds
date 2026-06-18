@@ -88,17 +88,26 @@
           do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
-(defun* %serialize-payload (serialize-fn &optional (capacity 256))
-    (function (function &optional (integer 1)) (simple-array (unsigned-byte 8) (*)))
-  "Build a PLAIN_CDR2_LE SerializedPayload: an encapsulation header + whatever
-   SERIALIZE-FN writes (called with the XCDR2 cursor) into a CAPACITY-octet scratch
-   buffer (default 256; pass a larger CAPACITY for large samples). Returns a fresh
-   octet vector — the data-plane publish payload. Works for either shape type."
+(defun* %rep->encap (rep)
+    (function (symbol) symbol)
+  "Map a writer's offered data-representation keyword to its +representation-ids+ LE encapsulation key (DDS-XTypes 1.3 §7.6.3.1.2 Table 60): :xcdr2 -> :plain-cdr2-le (0x0007, default), :xcdr1 -> :plain-cdr-le (0x0001)."
+  (ecase rep
+    ((:xcdr2 nil) :plain-cdr2-le)
+    (:xcdr1       :plain-cdr-le)))
+
+(defun* %serialize-payload (serialize-fn &optional (capacity 256) (rep :xcdr2))
+    (function (function &optional (integer 1) symbol) (simple-array (unsigned-byte 8) (*)))
+  "Build a SerializedPayload in REP (:xcdr2 -> PLAIN_CDR2_LE 0x0007, default/byte-identical wire;
+   :xcdr1 -> PLAIN_CDR_LE 0x0001): a rep-derived encapsulation header + whatever SERIALIZE-FN
+   writes (called with the LE cursor) into a CAPACITY-octet scratch buffer (default 256; pass a
+   larger CAPACITY for large samples). Returns a fresh octet vector — the data-plane publish payload.
+   Works for either shape type (both :final 32-bit/string => XCDR1 and XCDR2 bodies coincide)."
   (let* ((buf (dds.core.buffer:make-octet-buffer capacity))
-         (wc (dds.core.buffer:cursor buf :endianness :little)))
-    (dds.cdr:make-encapsulation-header wc :plain-cdr2-le)
+         (wc (dds.core.buffer:cursor buf :endianness :little))
+         (encap (%rep->encap rep)))
+    (dds.cdr:make-encapsulation-header wc encap)
     (funcall serialize-fn wc)
-    (dds.cdr:finalize-encapsulation-options wc :plain-cdr2-le)
+    (dds.cdr:finalize-encapsulation-options wc encap)
     (let* ((len (dds.core.buffer:cursor-position wc))
            (out (make-array len :element-type '(unsigned-byte 8))))
       (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
@@ -151,8 +160,8 @@
                            (advertise-address "127.0.0.1") (type :tagged) (peers nil)
                            (liveliness :automatic) (liveliness-lease-seconds 0) (dispose-after 0)
                            (batch 1) (async nil) (fault-after 0) (fault-count 0) (port 0)
-                           (history-kind :keep-last))
-    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0)) (:dispose-after (integer 0)) (:batch (integer 1)) (:async t) (:fault-after (integer 0)) (:fault-count (integer 0)) (:port (unsigned-byte 16)) (:history-kind (member :keep-last :keep-all))) t)
+                           (history-kind :keep-last) (data-representation :xcdr2))
+    (function (&key (:domain (integer 0)) (:color string) (:shapesize (integer 0)) (:rate (integer 1)) (:count (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:liveliness symbol) (:liveliness-lease-seconds (integer 0)) (:dispose-after (integer 0)) (:batch (integer 1)) (:async t) (:fault-after (integer 0)) (:fault-count (integer 0)) (:port (unsigned-byte 16)) (:history-kind (member :keep-last :keep-all)) (:data-representation (member :xcdr2 :xcdr1))) t)
   "Publish an animated Square on DOMAIN via multicast discovery. TYPE selects the
    payload: :canonical = the exact RTI ShapeType (color/x/y/shapesize — for interop
    with rtishapesdemo / DDSSpy); :tagged = + per-publisher uuid + per-sample seq
@@ -174,20 +183,31 @@
    waiting for the async emit-error counter to advance, then clear) so the guard catches each on
    the guarded async send and the thread survives (RTPS 2.5 §8.4 reliability repairs the dropped
    DATA); the final report prints the caught-emit-error count + the sender-thread-alive verdict
-   (our-side survival evidence). Inert when either is 0 (production default) — byte-identical wire."
+   (our-side survival evidence). Inert when either is 0 (production default) — byte-identical wire.
+   DATA-REPRESENTATION (:xcdr2 default | :xcdr1; WP-DATA-REPRESENTATION step 2, DDS-XTypes 1.3
+   §7.6.3.1.1) sets the writer's OFFERED representation: advertised verbatim as the writer's
+   PID_DATA_REPRESENTATION sequence in SEDP AND the representation the user DATA is serialized + sent
+   in (:xcdr2 -> PLAIN_CDR2_LE 0x0007, the default/byte-identical existing wire; :xcdr1 ->
+   PLAIN_CDR_LE 0x0001 — for a peer whose reader advertises [XCDR1]-only). The shape bodies are
+   :final 32-bit/string so XCDR1 and XCDR2 bodies coincide; only the 4-octet encap header differs."
   (check-type type (member :canonical :tagged))
+  (check-type data-representation (member :xcdr2 :xcdr1))
   ;; PORT>0 binds a fixed metatraffic port (advertised verbatim) so a foreign peer can reply to our
   ;; unicast SPDP over loopback; 0 = ephemeral (default, multicast discovery).
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x50) :domain domain
                                        :multicast t :advertise-address advertise-address :port port
                                        :peers (%parse-peers peers) :batch-max-samples batch)))
+    ;; The writer's OFFERED data-representation (DATA-REPRESENTATION, default :xcdr2) flows into its QoS so
+    ;; SEDP advertises it and TX serializes/sends in it (WP-DATA-REPRESENTATION step 2, DDS-XTypes 1.3 §7.6.3.1.1).
     (if (> liveliness-lease-seconds 0)
         (dds.disc:add-local-writer
          node :topic "Square" :type "ShapeType" :type-information (%shape-type-information)
          :qos (dds.qos:make-qos :reliability :reliable :liveliness liveliness
+                                :data-representation (list data-representation)
                                 :liveliness-lease (dds.qos:make-qos-duration liveliness-lease-seconds 0)))
         (dds.disc:add-local-writer node :topic "Square" :type "ShapeType"
-                                   :reliability dds.rtps.discovery:+reliability-reliable+
+                                   :qos (dds.qos:make-writer-qos
+                                         :data-representation (list data-representation))
                                    :type-information (%shape-type-information)))
     (dds.disc:enable-publisher node :history-kind history-kind)
     (when async (dds.disc:enable-async node))
@@ -229,13 +249,15 @@
                         (%serialize-payload
                          (lambda (wc) (serialize-shape-type
                                        (make-shape-type :color color :x x :y y :shapesize shapesize)
-                                       wc :xcdr2))))
+                                       wc data-representation))
+                         256 data-representation))
                        (:tagged
                         (%serialize-payload
                          (lambda (wc) (serialize-tagged-shape
                                        (make-tagged-shape :color color :x x :y y :shapesize shapesize
                                                           :uuid uuid :seq seq)
-                                       wc :xcdr2))))))
+                                       wc data-representation))
+                         256 data-representation))))
                (incf n)
                ;; FAULT=k@j: after the j-th publish, drive EXACTLY k faults onto the ASYNC sender thread (FR-PF-2).
                ;; Arm :persistent then publish k samples one at a time, each waiting for the async emit-error
@@ -251,7 +273,9 @@
                      (dds.disc:publish-sample
                       node (%serialize-payload
                             (lambda (wc) (serialize-shape-type
-                                          (make-shape-type :color color :x x :y y :shapesize shapesize) wc :xcdr2))))
+                                          (make-shape-type :color color :x x :y y :shapesize shapesize)
+                                          wc data-representation))
+                            256 data-representation))
                      (loop repeat 400 until (>= (dds.disc::disc-node-async-emit-errors node) (+ base k 1)) do (sleep 0.01)))
                    (setf dds.disc:*debug-emit-fault* nil)
                    (format t "~&[pub] FAULT window done: async caught ~d fault(s); sender thread alive=~:[NO~;YES~]~%"
@@ -364,17 +388,27 @@
         (format t "~&[spy] stopped; ~d participant(s) discovered.~%" (hash-table-count seen)))
       t)))
 
-(defun* run-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1") (type :tagged))
-    (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string) (:type symbol)) t)
+(defun* run-subscriber (&key (domain 0) (seconds 0) (advertise-address "127.0.0.1") (type :tagged)
+                            (peers nil) (port 0))
+    (function (&key (:domain (integer 0)) (:seconds (integer 0)) (:advertise-address string) (:type symbol) (:peers (or null string)) (:port (unsigned-byte 16))) t)
   "Subscribe to Square on DOMAIN via multicast discovery and print every shape.
    TYPE selects the payload codec (:canonical | :tagged) and must match the
    publisher. SECONDS 0 = forever (Ctrl-C). Receives from rtishapesdemo / DDSSpy
-   (use :canonical) or this harness's publisher."
+   (use :canonical) or this harness's publisher. PEERS is an optional
+   \"host:port[,host:port]\" unicast SPDP announce list (FR-DISC-4) on top of multicast — e.g.
+   \"127.0.0.1:7410\" lets our reader reach a same-host foreign PUBLISHER over loopback when the
+   loopback multicast SEDP handshake does not complete (mirrors run-publisher; WP-DATA-REPRESENTATION
+   step 1 reverse leg). PORT>0 binds+advertises a fixed metatraffic port (0 = ephemeral). Default
+   (no PEERS) is the prior multicast-only behaviour — byte-identical wire."
   (check-type type (member :canonical :tagged))
   (let ((node (dds.disc:make-disc-node :guid-prefix (%make-prefix #x53) :domain domain
-                                       :multicast t :advertise-address advertise-address)))
+                                       :multicast t :advertise-address advertise-address
+                                       :port port :peers (%parse-peers peers))))
+    ;; Reader ACCEPTS (:xcdr2 :xcdr1) (make-reader-qos default, DDS-XTypes 1.3 §7.6.3.1.1): reads either rep
+    ;; (XCDR2 native + XCDR1 via the struct codec / FlatData transcode), so an XCDR1- OR XCDR2-offering peer
+    ;; writer passes RxO (first-of-offered in the accepted set) — WP-DATA-REPRESENTATION step 1/2.
     (dds.disc:add-local-reader node :topic "Square" :type "ShapeType"
-                               :reliability dds.rtps.discovery:+reliability-reliable+
+                               :qos (dds.qos:make-reader-qos :reliability :reliable)
                                :type-information (%shape-type-information))
     (dds.disc:enable-subscriber node)
     (dds.disc:start-node node)

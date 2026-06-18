@@ -715,6 +715,11 @@
   "PID_KEY_HASH (RTPS 2.5 §9.6.2.2 table).")
 (defconstant +pid-status-info+                #x0071
   "PID_STATUS_INFO -> StatusInfo_t (RTPS 2.5 Table 9.23, §9.6.4.9).")
+(defconstant +pid-data-representation+        #x0073
+  "PID_DATA_REPRESENTATION -> DataRepresentationQosPolicy {sequence<DataRepresentationId_t> value}
+   (DDS-XTypes 1.3 §7.6.3.1.1; @id(0x0073) in the discovery-builtin-topic IDL). The value is a
+   CDR sequence<short>: u32 count + count*short (XCDR_DATA_REPRESENTATION=0/XML=1/XCDR2=2), padded to 4.
+   The policy struct is APPENDABLE, so a peer (e.g. RTI) may append trailing members the reader ignores.")
 (defconstant +pid-type-information+           #x0075
   "PID_TYPE_INFORMATION (DDS-XTypes 1.3 BuiltinTopicData @id(0x0075)).")
 (defconstant +pid-type-object-lb+             #x8021

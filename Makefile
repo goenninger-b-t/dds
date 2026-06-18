@@ -52,6 +52,10 @@ PORT     ?= 0
 # repair of a dropped/un-acked sample); empty -> keep-last (the spec generic default, depth 1).
 HISTORY  ?=
 HISTORY_ARGS := $(if $(HISTORY),:history-kind :$(HISTORY),)
+# WP-DATA-REPRESENTATION square-pub OFFERED representation: REP=xcdr1 makes the writer advertise+send XCDR1
+# (PLAIN_CDR_LE 0x0001) for a peer whose reader accepts [XCDR1]; empty/xcdr2 -> the default (0x0007, identical wire).
+REP      ?=
+REP_ARGS := $(if $(REP),:data-representation :$(REP),)
 # Optional reader OWNERSHIP QoS for gated-sub (shared|exclusive); empty -> :shared default.
 OWNERSHIP_ARGS := $(if $(OWNERSHIP),:ownership :$(OWNERSHIP),)
 
@@ -99,7 +103,7 @@ wire:
 # Ctrl-C to stop. Override DOMAIN=.. COLOR=.. ; LISP=$(SBCL) used (CFFI multicast).
 square-pub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
-	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" :port $(PORT) $(LIVELINESS_ARGS) $(PERF_ARGS) $(FAULT_ARGS) $(HISTORY_ARGS))' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-publisher :domain $(DOMAIN) :color "$(COLOR)" :advertise-address "$(ADVERTISE)" :type :$(TYPE) :count $(COUNT) :peers "$(PEERS)" :port $(PORT) $(LIVELINESS_ARGS) $(PERF_ARGS) $(FAULT_ARGS) $(HISTORY_ARGS) $(REP_ARGS))' \
 	        --eval '(uiop:quit 0)'
 
 square-sub:

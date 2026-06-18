@@ -176,6 +176,7 @@
          (fd-des (%sym pkg "DESERIALIZE-" (string name) "-FD"))
          (fd-dnto (%sym pkg "DESERIALIZE-INTO-" (string name) "-FD"))
          (fd-ssz (%sym pkg "SERIALIZED-SIZE-" (string name) "-FD"))
+         (fd-tx (%sym pkg "TX-TRANSCODE-" (string name) "-FD"))
          (tname (string-downcase (string name))))
     (unless (eq ext :final)
       (error "define-dds-type: only :final extensibility is supported in v1 (got ~s)" ext))
@@ -457,7 +458,40 @@
                      outcome). The 0-ALLOC steady-state RX path is deserialize-into-~a-fd (copy into a loaned buffer). MODE ignored. ~
                      NOT cleared for ship — pending counsel (R6); see ADR 0015." tname (symbol-name fd-size-sym)
                             tname tname tname)
-                   (,fd-dnto (,fd-ctor) cursor mode)))))
+                   (,fd-dnto (,fd-ctor) cursor mode))
+                 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0015.
+                 (declaim (ftype (function (t dds.core.buffer:octet-buffer dds.cdr:cdr-mode symbol)
+                                           (simple-array (unsigned-byte 8) (*)))
+                                 ,fd-tx))
+                 (defun ,fd-tx (ts sample mode encap)
+                   ,(format nil "WP-DATA-REPRESENTATION TX-transcode for a FlatData writer offering a non-XCDR2-LE ~
+                     representation (DDS-XTypes 1.3 §7.6.3.1.1, FR-PF-4; bound to type-support flatdata-builder, ~
+                     invoked by %serialize-sample): the FlatData buffer SAMPLE is canonical XCDR2-LE, so for an ~
+                     :xcdr1 offered rep transcode it (symmetric to the RX deserialize-into-~a-fd :transcode arm) — ~
+                     decode the XCDR2-LE body via the sibling struct codec deserialize-~a (it already handles the ~
+                     8-vs-4 alignment divergence) into a fresh struct, then RE-SERIALIZE that struct via serialize-~a ~
+                     in MODE under an ENCAP-derived (representation-id-value, +representation-ids+ §7.6.3.1.2) ~
+                     encapsulation header — byte-exact to a non-FlatData XCDR1 writer of the same values. The :xcdr2 ~
+                     identity path NEVER reaches here (%serialize-sample short-circuits it to the 0-copy serialize-~a-fd). ~
+                     ALLOCATES (the opt-in foreign-rep TX fallback, OFF the measured CDR hot path); the XCDR2 default ~
+                     stays 0-alloc. TS is unused (the codec is monomorphic to this type). NOT cleared for ship — ~
+                     pending counsel (R6); see ADR 0015." tname tname tname tname)
+                   (declare (ignore ts))
+                   (let* ((rc (dds.core.buffer:cursor sample :endianness :little)))
+                     (dds.core.buffer:cursor-set-position rc 4)   ; past the FlatData buffer's XCDR2-LE encap header
+                     (dds.core.buffer:cursor-set-origin rc)
+                     (let* ((%st (,des rc :xcdr2))
+                            (body-size (,ssz %st mode))
+                            (buf (dds.core.buffer:make-octet-buffer (+ 4 body-size 8)))
+                            (wc (dds.core.buffer:cursor buf :endianness :little)))
+                       (dds.cdr:make-encapsulation-header wc encap)
+                       (,ser %st wc mode)
+                       (dds.cdr:finalize-encapsulation-options wc encap)
+                       (let* ((len (dds.core.buffer:cursor-position wc))
+                              (out (make-array len :element-type '(unsigned-byte 8))))
+                         (replace out (dds.core.buffer:octet-buffer-vec buf) :end1 len)
+                         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))
+                         out)))))))
          (let ((%pool (dds.types:make-sample-pool (function ,ctor) ,*sample-pool-capacity*)))
            (dds.types:register-type
             (dds.types:make-type-support
@@ -473,6 +507,10 @@
              :deserialize (function ,(if flatp fd-des des))
              :serialized-size (function ,(if flatp fd-ssz ssz))
              :key-hash ,(when keys `(function ,(if flatp khf-fd khf)))
+             ;; WP-DATA-REPRESENTATION (R6): the FlatData TX-transcode for a non-XCDR2 offered rep
+             ;; (decode XCDR2 buffer -> struct -> re-encode XCDR1), invoked by %serialize-sample; NIL
+             ;; for a non-FlatData type (its struct serializer already honours the mode). (§7.6.3.1.1.)
+             :flatdata-builder ,(when flatp `(function ,fd-tx))
              :sample-pool-alloc (lambda () (dds.types:sample-pool-acquire %pool))
              :sample-pool-free (lambda (s) (dds.types:sample-pool-release %pool s))
              ;; WP-FLATDATA fixed-size layout (FR-PF-4, ADR 0015; R6); NIL for non-FlatData types.

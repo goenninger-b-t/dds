@@ -20,7 +20,9 @@
   "Per-type manual vtable the engine funcalls per sample (IMPLEMENTATION-PLAN §7.3): a
    plain defstruct of function objects (serialize/deserialize/serialized-size/key-hash,
    sample-pool alloc+free, FlatData hooks — FLATDATA-OFFSET holds the FlatData-layout for a
-   :flatdata type, NIL otherwise — field accessors) plus the type name,
+   :flatdata type, NIL otherwise; FLATDATA-BUILDER holds that type's WP-DATA-REPRESENTATION
+   TX-transcode (buf,mode,encap)->octets for a non-XCDR2 offered rep, NIL otherwise — field
+   accessors) plus the type name,
    extensibility, structural TypeObject/TypeIdentifier, and data-representation mask. The
    hot path sees only this struct, never the concrete sample type. KEYED-P records the
    RTPS TopicKind (DDSI-RTPS 2.5 §8.2.4.2): T = WITH_KEY (the type has at least one @key
@@ -39,6 +41,7 @@
   (sample-pool-alloc nil :type (or null function))
   (sample-pool-free nil :type (or null function))
   (flatdata-offset nil :type (or null function flatdata-layout))
+  ;; WP-DATA-REPRESENTATION FlatData TX-transcode (buf,mode,encap)->octets; NIL for non-FlatData (R6, §7.6.3.1.1).
   (flatdata-builder nil :type (or null function))
   (data-representation-mask 0 :type integer)
   ;; (FIELD-NAME-STRING . unary accessor) per scalar/string member, for content

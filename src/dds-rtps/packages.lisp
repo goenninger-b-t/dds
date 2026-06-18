@@ -68,7 +68,7 @@
            #:+pid-default-unicast-locator+
            #:+pid-metatraffic-unicast-locator+ #:+pid-participant-guid+
            #:+pid-builtin-endpoint-set+ #:+pid-endpoint-guid+ #:+pid-key-hash+
-           #:+pid-status-info+
+           #:+pid-status-info+ #:+pid-data-representation+
            #:+pid-type-information+ #:+pid-type-object-lb+ #:+pid-shmem-host-uuid+
            #:+pid-zerocopy-capable+
            #:write-parameter #:write-parameter-sentinel #:parse-parameter-list
@@ -144,4 +144,5 @@
            #:endpoint-data-type-information #:endpoint-data-type-object-lb
            #:endpoint-data-zerocopy-capable
            #:serialize-endpoint-data #:parse-endpoint-data #:endpoint-match-p
-           #:run-sedp-test))
+           #:run-sedp-test #:run-data-representation-wire-test
+           #:run-data-representation-malformed-test))

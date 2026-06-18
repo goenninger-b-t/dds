@@ -169,6 +169,107 @@
     (dds.core.arena:teardown-arena arena)
     t))
 
+;;; WP-DATA-REPRESENTATION step 2 (TX in the offered representation, DDS-XTypes 1.3 §7.6.3.1.1).
+;;; txr8 has an i8 followed by an i64 so the XCDR1 8-byte alignment (i64 @ body offset 8, body 16)
+;;; differs from the XCDR2 4-byte-capped alignment (i64 @ body offset 4, body 12) — the 8-vs-4 cap.
+;;; txr8 is the non-FlatData (struct codec) arm; txr8fd the FlatData (TX-transcode) arm.
+(dds.gen:define-dds-type txr8 (:extensibility :final)
+  (a :i8 :key t)
+  (b :i64))
+
+(dds.gen:define-dds-type txr8fd (:flatdata t)
+  (a :i8 :key t)
+  (b :i64))
+
+(defun* %txr8-oracle (mode va vb)
+    (function (symbol integer integer) (simple-array (unsigned-byte 8) (*)))
+  "Independent hand-built SerializedPayload oracle for the txr8 (i8 a, i64 b) type in MODE
+   (:xcdr1 / :xcdr2): the 4-octet encap header (rep id NBO + 2-octet options whose low 2 bits =
+   the body trailing pad), then the i8 at body offset 0 (two's-complement u8) + alignment pad to
+   the mode-capped i64 boundary (XCDR1 -> 8, XCDR2 -> 4) + the LE i64. NO codec call — pinned to
+   DDS-XTypes 1.3 §7.6.3.1.1/.2 by hand so it is a true oracle, not the code under test."
+  (let* ((encap (ecase mode (:xcdr2 #x0007) (:xcdr1 #x0001)))   ; +representation-ids+ values (§7.6.3.1.2 Table 60)
+         (i64-off (ecase mode (:xcdr2 4) (:xcdr1 8)))            ; i8@0, then align to min(8, mode-cap)
+         (body-len (+ i64-off 8))
+         (pad (mod (- 4 (mod body-len 4)) 4))                    ; trailing pad in the encap OPTIONS (§7.6.3.1.2)
+         (total (+ 4 body-len))
+         (out (make-array total :element-type '(unsigned-byte 8) :initial-element 0))
+         (ua (logand va #xff))
+         (ub (logand vb #xffffffffffffffff)))
+    (setf (aref out 0) (ldb (byte 8 8) encap) (aref out 1) (ldb (byte 8 0) encap))   ; rep id, NBO
+    (setf (aref out 3) (logand pad 3))                                               ; options pad bits
+    (setf (aref out 4) ua)                                                           ; i8 @ body offset 0
+    (dotimes (i 8) (setf (aref out (+ 4 i64-off i)) (ldb (byte 8 (* 8 i)) ub)))      ; LE i64
+    out))
+
+(defun* run-tx-representation-test ()
+    (function () t)
+  "WP-DATA-REPRESENTATION step 2 (DDS-XTypes 1.3 §7.6.3.1.1): a writer's OFFERED representation
+   selects the TX SerializedPayload encoding. An (:xcdr1) writer emits a PLAIN_CDR_LE (0x0001)
+   header + an XCDR1 (8-byte-aligned) body; the default (:xcdr2) writer emits PLAIN_CDR2_LE (0x0007)
+   + an XCDR2 (4-byte-capped) body — BYTE-IDENTICAL to before. Asserted byte-exact vs %txr8-oracle
+   (an independent hand-built oracle) for BOTH the non-FlatData struct codec AND the FlatData
+   TX-transcode, and the XCDR1 body is 4 octets LONGER than XCDR2 (the i64's 8-vs-4 alignment)."
+  (let ((ts (dds.types:find-type-support "txr8"))
+        (fts (dds.types:find-type-support "txr8fd"))
+        (va -2) (vb #x0102030405060708))
+    (%check :txr8-ts (and ts fts) "txr8 / txr8fd type-support not registered")
+    ;; non-FlatData: default XCDR2 (unchanged wire) + opt-in XCDR1, each byte-exact vs the oracle
+    (let* ((s (make-txr8 :a va :b vb))
+           (x2 (dds.dcps::%serialize-sample ts s :xcdr2))
+           (x1 (dds.dcps::%serialize-sample ts s :xcdr1)))
+      (%check :txr8-xcdr2-default-byte-exact (equalp x2 (%txr8-oracle :xcdr2 va vb))
+              (format nil "non-FlatData XCDR2 default ~s != oracle ~s" x2 (%txr8-oracle :xcdr2 va vb)))
+      (%check :txr8-xcdr2-encap (and (= (aref x2 0) 0) (= (aref x2 1) #x07))
+              (format nil "default writer must emit PLAIN_CDR2_LE 0x0007, got ~2,'0x~2,'0x" (aref x2 0) (aref x2 1)))
+      (%check :txr8-xcdr1-byte-exact (equalp x1 (%txr8-oracle :xcdr1 va vb))
+              (format nil "non-FlatData XCDR1 ~s != oracle ~s" x1 (%txr8-oracle :xcdr1 va vb)))
+      (%check :txr8-xcdr1-encap (and (= (aref x1 0) 0) (= (aref x1 1) #x01))
+              (format nil "an (:xcdr1) writer must emit PLAIN_CDR_LE 0x0001, got ~2,'0x~2,'0x" (aref x1 0) (aref x1 1)))
+      (%check :txr8-xcdr1-longer (= (length x1) (+ (length x2) 4))
+              (format nil "XCDR1 payload ~d must be 4 longer than XCDR2 ~d (i64 8-vs-4 align)" (length x1) (length x2))))
+    ;; FlatData (R6): identity XCDR2 unchanged + TX-transcode XCDR1, both byte-exact vs the same oracle
+    (let ((fd (make-txr8fd-flatdata)))
+      (setf (txr8fd-a-fd fd) va (txr8fd-b-fd fd) vb)
+      (let ((fx2 (dds.dcps::%serialize-sample fts fd :xcdr2))
+            (fx1 (dds.dcps::%serialize-sample fts fd :xcdr1)))
+        (%check :txr8fd-xcdr2-identity-byte-exact (equalp fx2 (%txr8-oracle :xcdr2 va vb))
+                (format nil "FlatData XCDR2 identity ~s != oracle ~s" fx2 (%txr8-oracle :xcdr2 va vb)))
+        (%check :txr8fd-xcdr1-transcode-byte-exact (equalp fx1 (%txr8-oracle :xcdr1 va vb))
+                (format nil "FlatData XCDR1 TX-transcode ~s != oracle ~s" fx1 (%txr8-oracle :xcdr1 va vb))))))
+  t)
+
+(defun* run-tx-rx-representation-roundtrip-test ()
+    (function () t)
+  "WP-DATA-REPRESENTATION step 2 (DDS-XTypes 1.3 §7.6.3.1.1): an (:xcdr1) writer's SerializedPayload is read
+   back correctly by the reader (%serialize-sample :xcdr1 -> %deserialize-sample, which decodes in the
+   encap-declared representation) — field values AND the XCDR2-BE keyhash (RTPS 2.5 §9.6.4.8, rep-independent)
+   are correct, for BOTH the non-FlatData struct codec (XCDR1 8-vs-4 re-alignment) and the FlatData RX-transcode."
+  (let ((ts (dds.types:find-type-support "txr8"))
+        (fts (dds.types:find-type-support "txr8fd"))
+        (va -2) (vb #x0102030405060708))
+    ;; non-FlatData: TX XCDR1 -> RX decodes (mode/endianness from the header), values + keyhash match XCDR2
+    (let* ((s (make-txr8 :a va :b vb))
+           (q1 (dds.dcps::%deserialize-sample ts (dds.dcps::%serialize-sample ts s :xcdr1)))
+           (q2 (dds.dcps::%deserialize-sample ts (dds.dcps::%serialize-sample ts s :xcdr2))))
+      (%check :txr8-rx-xcdr1-values (and (= (txr8-a q1) va) (= (txr8-b q1) vb))
+              (format nil "XCDR1 TX->RX field mismatch: a=~d b=~d" (txr8-a q1) (txr8-b q1)))
+      (%check :txr8-rx-xcdr2-values (and (= (txr8-a q2) va) (= (txr8-b q2) vb))
+              (format nil "XCDR2 TX->RX field mismatch: a=~d b=~d" (txr8-a q2) (txr8-b q2)))
+      (%check :txr8-rx-keyhash-rep-independent
+              (equalp (key-hash-txr8 s) (key-hash-txr8 q1))
+              "keyhash must be identical regardless of the user-data representation (XCDR2-BE, §9.6.4.8)"))
+    ;; FlatData: TX XCDR1 (transcode) -> RX (FlatData read/transcode), values via the -fd accessors + keyhash
+    (let ((fd (make-txr8fd-flatdata)))
+      (setf (txr8fd-a-fd fd) va (txr8fd-b-fd fd) vb)
+      (let ((q1 (dds.dcps::%deserialize-sample fts (dds.dcps::%serialize-sample fts fd :xcdr1))))
+        (%check :txr8fd-rx-xcdr1-values (and (= (txr8fd-a-fd q1) va) (= (txr8fd-b-fd q1) vb))
+                (format nil "FlatData XCDR1 TX->RX field mismatch: a=~d b=~d" (txr8fd-a-fd q1) (txr8fd-b-fd q1)))
+        (%check :txr8fd-rx-keyhash-rep-independent
+                (equalp (key-hash-txr8fd-fd fd) (key-hash-txr8fd-fd q1))
+                "FlatData keyhash must be identical regardless of the user-data representation (XCDR2-BE)"))))
+  t)
+
 (defun* run-mem-test ()
     (function () t)
   "Measured zero-alloc serialize + deserialize (NFR-PERF-8). Asserted on SBCL

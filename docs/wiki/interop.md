@@ -233,8 +233,8 @@ Still provisional: the unexercised serialization-VM edges (unions, MUTABLE struc
   3 instances, keyhashes byte-identical, dispose-by-key resolved (`kflat-forward-connext.pcap` +
   `kflat-forward-fastdds.pcap`). This **closes the earlier forward-leg false-REJECT** (the reader used
   to read only `PLAIN_CDR2_LE` 0x0007 and rejected a foreign rep — false-REJECT-safe, never mis-read).
-  The remaining `PID_DATA_REPRESENTATION = XCDR2`-on-our-SEDP item (so a peer can also pick XCDR2 and
-  skip the transcode) is a production-side XTypes follow-up, **not** a transcode or keyhash defect.
+  The `PID_DATA_REPRESENTATION`-on-our-SEDP item (advertise our offered/accepted representations, and
+  TX in the offered one) is delivered by **WP-DATA-REPRESENTATION** (below).
 
 - **Sender-thread emit-fault resilience cross-DDS interop (WP-SENDER-ERROR-RESILIENCE, FR-PF-2, RTPS
   2.5 §8.4; [`interop/sender-resilience/`](../../interop/sender-resilience/))** — the per-feature DoD
@@ -256,6 +256,25 @@ Still provisional: the unexercised serialization-VM edges (unions, MUTABLE struc
   (`run-async-emit-fault-survives-test`, `run-flow-emit-fault-no-spin-test`), not this interop. The
   few-sample tail gap is a harness teardown-drain artifact (present in the no-fault baseline too),
   not a guard or wire defect.
+
+- **DATA_REPRESENTATION cross-DDS interop (WP-DATA-REPRESENTATION, DDS-XTypes 1.3 §7.6.3.1.1;
+  [`interop/data-representation/`](../../interop/data-representation/))** — emit/parse
+  `PID_DATA_REPRESENTATION (0x0073)` in SEDP (byte-exact vs the live oracle), role-aware advertising
+  (our reader accepts `[XCDR2, XCDR1]` = shorts `[2, 0]`, our writer offers `[XCDR2]`), spec-strict
+  RxO, and TX in the writer's offered representation. The Shapes publisher (`make square-pub` /
+  `run-publisher`) gains a **`REP=xcdr1|xcdr2`** knob (writer's offered representation; unset/`xcdr2`
+  = the default `PLAIN_CDR2_LE 0x0007`, byte-identical user-data wire; `xcdr1` = `PLAIN_CDR_LE
+  0x0001`), and `run-subscriber` gains `:peers`/`:port` for the reverse leg. **Connext 7.3.1 + Fast
+  DDS 3.6.1: PASS, live in-session (2026-06-17, loopback).** Forward: with `REP=xcdr1` our user DATA
+  is `CDR_LE (0x0001)` on the wire and both peers received + decoded it (Connext 37, Fast DDS 49);
+  with the default `REP=xcdr2` (`CDR2_LE 0x0007`) both peers' `[XCDR1]`-only `ShapeType` reader
+  correctly does **not** match (0 received, 0 user-writer ACKNACKs) — the spec-mandated RxO reject of
+  an unsatisfiable representation, **not** a false-reject. Reverse: our reader (`[XCDR2, XCDR1]`)
+  matched each peer's `[XCDR1]` writer and decoded its samples (Connext 688, Fast DDS 126). Honest
+  caveat: the foreign→us *user-data* path is not visible to tshark on this host's lo0 (a macOS
+  loopback-capture quirk, not a delivery gap — proven by the decoded sample counts); the forward-leg
+  `0x0001`/`0x0007` TX encapsulation is dissected directly (`captures/our-xcdr{1,2}-to-{connext,fastdds}.pcap`,
+  `captures/{connext,fastdds}-pub-to-our-sub.pcap`).
 
 Cross-links: [Type system](type-system.md) · [Discovery](discovery.md) · [DCPS](dcps.md) ·
 [CDR & memory](cdr-and-memory.md).

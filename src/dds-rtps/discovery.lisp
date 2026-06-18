@@ -457,6 +457,15 @@
 (defun* %wire-ownership (n)
     (function ((unsigned-byte 32)) symbol)
   "Map a PID_OWNERSHIP wire code to an OWNERSHIP kind keyword (1=EXCLUSIVE, else the default :shared); an unknown code never rejects (FR-QOS-2)." (if (= n 1) :exclusive :shared))
+(defun* %data-rep-wire (k)
+    (function (symbol) (unsigned-byte 16))
+  "Map a DATA_REPRESENTATION keyword to its DataRepresentationId_t short (DDS-XTypes 1.3 §7.6.3.1.1:
+   XCDR_DATA_REPRESENTATION=0, XML_DATA_REPRESENTATION=1, XCDR2_DATA_REPRESENTATION=2). NOT the 16-bit
+   RTPS encapsulation id (cdr.lisp +representation-ids+) — a distinct namespace." (ecase k (:xcdr1 0) (:xml 1) (:xcdr2 2)))
+(defun* %wire-data-rep (n)
+    (function ((unsigned-byte 16)) symbol)
+  "Map a DataRepresentationId_t short to a DATA_REPRESENTATION keyword (DDS-XTypes 1.3 §7.6.3.1.1:
+   0->:xcdr1, 1->:xml, 2->:xcdr2); an unknown id -> NIL so the SEDP parse drops it fail-open (FR-QOS-2)." (case n (0 :xcdr1) (1 :xml) (2 :xcdr2) (t nil)))
 
 (defstruct* (endpoint-data (:constructor make-endpoint-data))
   "DiscoveredWriterData / DiscoveredReaderData (RTPS 2.5 §8.5.4 / §9.6.2.2): a 16-octet
@@ -526,6 +535,16 @@
       (dds.core.buffer:put-u32 c (dds.qos:duration-nanosec->wire-fraction
                                   (dds.qos:qos-duration-nanosec lease)))
       (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-liveliness+ vec 0 12)))
+  ;; PID_DATA_REPRESENTATION (0x0073): DataRepresentationQosPolicy{sequence<short> value} = u32 count +
+  ;; count*short, padded to 4 (DDS-XTypes 1.3 §7.6.3.1.1). Emitted for BOTH roles (each advertises its
+  ;; own accepted/offered list); the value is 4-byte aligned so WRITE-PARAMETER adds no further padding.
+  (let* ((reps (dds.qos:qos-data-representation (endpoint-data-qos data)))
+         (n (length reps))
+         (val-len (* 4 (ceiling (+ 4 (* 2 n)) 4))))
+    (multiple-value-bind (c vec) (%make-scratch val-len)
+      (dds.core.buffer:put-u32 c n)
+      (dolist (r reps) (dds.core.buffer:put-u16 c (%data-rep-wire r)))
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-data-representation+ vec 0 val-len)))
   ;; PID_OWNERSHIP (0x001f): {OwnershipQosPolicyKind kind;} = 4 octets (RTPS 2.5 Table 9.18
   ;; §9.6.2.2; dds_rtf2_dcps.idl §2.2.3.9: SHARED=0, EXCLUSIVE=1). Always emitted (both roles).
   (let ((q (endpoint-data-qos data)))
@@ -584,6 +603,19 @@
                (dds.qos:qos-liveliness-lease q)
                (dds.qos:make-qos-duration
                 sec (dds.qos:wire-fraction->duration-nanosec fraction))))))
+    ((= pid dds.rtps.message:+pid-data-representation+)
+     ;; DataRepresentationQosPolicy{sequence<short>} (XTypes 1.3 §7.6.3.1.1). Bounds-check the count
+     ;; against LEN before any short read (NFR-SEC-POSTURE: a forged count must not over-read — skip
+     ;; the PID, never error the SEDP). Unknown ids drop (fail-open). Absent PID leaves the role default.
+     (when (>= len 4)
+       (let ((count (dds.core.buffer:get-u32 cursor)))
+         (when (<= (+ 4 (* 2 count)) len)
+           (let ((reps '()))
+             (dotimes (i count)
+               (let ((kw (%wire-data-rep (dds.core.buffer:get-u16 cursor))))
+                 (when kw (push kw reps))))
+             (when reps
+               (setf (dds.qos:qos-data-representation (endpoint-data-qos data)) (nreverse reps))))))))
     ((= pid dds.rtps.message:+pid-ownership+)
      (when (= len 4)
        (setf (dds.qos:qos-ownership (endpoint-data-qos data))
@@ -654,7 +686,8 @@
          (data (make-endpoint-data :guid guid :topic-name "Square" :type-name "ShapeType"
                                    :type-information tinfo
                                    :qos (dds.qos:make-qos :reliability :reliable
-                                                          :durability :transient-local)))
+                                                          :durability :transient-local
+                                                          :data-representation '(:xcdr2 :xcdr1))))
          (ob (dds.core.buffer:make-octet-buffer 256))
          (wc (dds.core.buffer:cursor ob :endianness :little)))
     (serialize-endpoint-data wc data)
@@ -666,6 +699,9 @@
       (assert (string= (endpoint-data-type-name back) "ShapeType") () "type-name mismatch")
       (assert (eq (dds.qos:qos-reliability (endpoint-data-qos back)) :reliable) () "reliability mismatch")
       (assert (eq (dds.qos:qos-durability (endpoint-data-qos back)) :transient-local) () "durability mismatch")
+      ;; PID_DATA_REPRESENTATION round-trip: the ordered sequence<short> survives (XTypes 1.3 §7.6.3.1.1).
+      (assert (equal (dds.qos:qos-data-representation (endpoint-data-qos back)) '(:xcdr2 :xcdr1)) ()
+              "data-representation sequence round-trip mismatch")
       (assert (equalp (endpoint-data-type-information back) tinfo) ()
               "PID_TYPE_INFORMATION opaque round-trip mismatch")))
   ;; RxO matching truth table over the wire QoS (FR-QOS-2): reliability + durability.
@@ -683,4 +719,91 @@
       (assert (not (endpoint-match-p w-rel r-topic)) () "(d) different topic-name must not match")
       (assert (not (endpoint-match-p w-vol r-tl)) () "(e) VOLATILE writer + TRANSIENT_LOCAL reader must not match (durability RxO)")
       (assert (endpoint-match-p r-tl w-vol) () "(f) TRANSIENT_LOCAL writer + VOLATILE reader should match")))
+  t)
+
+(defun* run-data-representation-wire-test ()
+    (function () t)
+  "Byte-exact PID_DATA_REPRESENTATION (0x0073) emission vs the pinned DDS-XTypes 1.3 §7.6.3.1.1
+   layout + the live RTI Connext capture (interop/data-representation/captures/NOTES.md): for
+   data-representation (:xcdr2 :xcdr1) the parameter is 73 00 (pid) 08 00 (len) 02 00 00 00 (count 2)
+   02 00 (XCDR2=2) 00 00 (XCDR1=0, = XCDR_DATA_REPRESENTATION, the live-Connext-confirmed value) — the
+   bare conformant sequence<short>, 4-aligned, no padding, no RTI vendor trailing mask. Returns T on
+   success (ASSERT signals otherwise)."
+  (let* ((data (make-endpoint-data :topic-name "Square" :type-name "ShapeType"
+                                   :qos (dds.qos:make-qos :data-representation '(:xcdr2 :xcdr1))))
+         (ob (dds.core.buffer:make-octet-buffer 256))
+         (wc (dds.core.buffer:cursor ob :endianness :little))
+         (vec (dds.core.buffer:octet-buffer-vec ob))
+         (expected #(#x73 #x00 #x08 #x00 #x02 #x00 #x00 #x00 #x02 #x00 #x00 #x00))
+         (n (length expected)))
+    (serialize-endpoint-data wc data)
+    ;; Locate the 12-octet PID_DATA_REPRESENTATION parameter in the ParameterList by its pid+len marker.
+    (let ((at (loop for i from 0 to (- (dds.core.buffer:cursor-position wc) n)
+                    when (and (= (aref vec i) #x73) (= (aref vec (1+ i)) #x00)
+                              (= (aref vec (+ i 2)) #x08) (= (aref vec (+ i 3)) #x00))
+                      return i)))
+      (assert at () "PID_DATA_REPRESENTATION (73 00 08 00) not found in the emitted ParameterList")
+      (dotimes (k n)
+        (assert (= (aref vec (+ at k)) (aref expected k)) ()
+                "PID_DATA_REPRESENTATION byte ~d: got #x~2,'0x expected #x~2,'0x"
+                k (aref vec (+ at k)) (aref expected k)))))
+  t)
+
+(defun* %forge-malformed-data-rep-paramlist (count value-bytes)
+    (function ((unsigned-byte 32) list) dds.core.buffer:octet-buffer)
+  "Hand-build a SEDP ParameterList whose PID_DATA_REPRESENTATION (0x0073) value carries
+   a FORGED u32 COUNT followed by only VALUE-BYTES octets — a malformed sequence<short>
+   (the count over-states the value extent). A trailing legit PID_TOPIC_NAME 'OK' + the
+   sentinel follow, to prove the parser skips the bad PID and keeps parsing (NFR-SEC-POSTURE)."
+  (let* ((dst (dds.core.buffer:make-octet-buffer 256))
+         (out (dds.core.buffer:cursor dst :endianness :little))
+         (val (make-array (+ 4 (length value-bytes)) :element-type '(unsigned-byte 8))))
+    ;; value = u32 forged-count (LE) ++ the (too-few) short octets.
+    (setf (aref val 0) (ldb (byte 8 0) count) (aref val 1) (ldb (byte 8 8) count)
+          (aref val 2) (ldb (byte 8 16) count) (aref val 3) (ldb (byte 8 24) count))
+    (loop for b in value-bytes for i from 4 do (setf (aref val i) b))
+    (dds.rtps.message:write-parameter out dds.rtps.message:+pid-data-representation+
+                                      val 0 (length val))
+    (multiple-value-bind (c tv) (%make-scratch 8)
+      (dds.cdr:cdr-put-string c "OK" :xcdr1)
+      (dds.rtps.message:write-parameter out dds.rtps.message:+pid-topic-name+
+                                        tv 0 (dds.core.buffer:cursor-position c)))
+    (dds.rtps.message:write-parameter-sentinel out)
+    dst))
+
+(defun* %parse-endpoint-safety0 (buf)
+    (function (dds.core.buffer:octet-buffer) t)
+  "Parse an endpoint ParameterList from BUF in a wrapper compiled at (SAFETY 0): a malformed
+   PID_DATA_REPRESENTATION must never cause an OOB array access even with this frame's bounds-
+   checks elided (NFR-SEC-POSTURE — the parser's own explicit length gates must suffice)."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (parse-endpoint-data (dds.core.buffer:cursor buf :endianness :little) :reader))
+
+(defun* run-data-representation-malformed-test ()
+    (function () t)
+  "Malformed PID_DATA_REPRESENTATION bounds/fuzz (NFR-SEC-POSTURE; XTypes 1.3 §7.6.3.1.1):
+   a forged in-value COUNT larger than the value extent, and a truncated value, MUST be
+   skipped cleanly — the data-representation stays at the role default and a trailing legit
+   PID (topic-name 'OK') still parses — with NO OOB even at (safety 0). Both the production
+   parse and the (safety 0) twin must agree (reject == reject)."
+  (let ((reader-default (dds.qos:qos-data-representation (dds.qos:make-reader-qos))))
+   (flet ((default-rep-p (ep)
+            ;; a skipped/malformed PID must leave the seeded reader-role default untouched (not corrupt it).
+            (equal (dds.qos:qos-data-representation (endpoint-data-qos ep)) reader-default))
+          (parsed-ok (ep)
+            (and ep (string= (endpoint-data-topic-name ep) "OK"))))
+    (dolist (case (list
+                   ;; (label forged-count value-bytes): count >> the value extent (first case len==4, no shorts).
+                   '(:over-count-no-shorts 9 ())
+                   '(:over-count-one-short 5 (#x02 #x00))            ; says 5, only 1 short present
+                   '(:over-count-truncated #xffffffff (#x00 #x00 #x00)))) ; huge count, odd truncated value
+      (destructuring-bind (label count value-bytes) case
+        (let* ((buf (%forge-malformed-data-rep-paramlist count value-bytes))
+               (prod (parse-endpoint-data (dds.core.buffer:cursor buf :endianness :little) :reader))
+               (s0 (%parse-endpoint-safety0 buf)))
+          (assert (parsed-ok prod) () "[~a] production parse must skip the bad PID and still read PID_TOPIC_NAME" label)
+          (assert (default-rep-p prod) () "[~a] a malformed PID_DATA_REPRESENTATION must leave the role default, not corrupt it" label)
+          (assert (parsed-ok s0) () "[~a] (safety 0) parse must skip the bad PID and still read PID_TOPIC_NAME (no OOB)" label)
+          (assert (default-rep-p s0) () "[~a] (safety 0) parse must leave the role default" label)
+          (assert (equal (parsed-ok prod) (parsed-ok s0)) () "[~a] production and (safety 0) parse must agree" label))))))
   t)
