@@ -13,6 +13,18 @@
 (defconstant +lane-off-owner+ 0) (defconstant +lane-off-write+ 8) (defconstant +lane-off-read+ 16)
 (defconstant +skip-marker+ #xFFFFFFFF "Ring record len meaning 'pad to the capacity boundary'.")
 
+(define-condition shmem-send-test-fault (error) ()
+  (:report (lambda (c s) (declare (ignore c)) (format s "synthetic %shmem-send hard fault (test only)")))
+  (:documentation "Test-only synthetic %SHMEM-SEND hard fault, injected by *DEBUG-SHMEM-SEND-FAULT* to exercise
+   the %SEND-RAW-BUF self-guard -> UDP fallback (WP-SHMEM-SEND-SELF-GUARD, FR-XPORT-2). Never signalled in
+   production (*DEBUG-SHMEM-SEND-FAULT* defaults NIL)."))
+
+(defparameter *debug-shmem-send-fault* nil
+  "Test affordance (inert when NIL): when non-NIL, %SHMEM-SEND signals SHMEM-SEND-TEST-FAULT before doing any
+   work — exercises the %SEND-RAW-BUF self-guard (which catches the signal, bumps DISC-NODE-SHMEM-SEND-FAULTS,
+   fires *SENDER-EMIT-ERROR-HOOK* with context :SHMEM-SEND-FAULT, and falls back to UDP). Production default NIL
+   = byte-identical wire, zero effect. Never set in production. (WP-SHMEM-SEND-SELF-GUARD, FR-XPORT-2.)")
+
 (defun* %segment-bytes (lane-count capacity)
     (function ((integer 1) (integer 8)) (integer 1))
   "Total segment size: header+notify block, lane descriptors, per-lane ring data."
@@ -220,6 +232,7 @@
    the busy receiver WILL see this datagram on its next predicate check, never a lost wakeup). The
    lock+signal (a futex syscall) is taken ONLY for a parked receiver, so a tight blast into a draining
    receiver does no per-message futex wake — the WP-SHMEM throughput fix (FR-XPORT-2)."
+  (when *debug-shmem-send-fault* (error 'shmem-send-test-fault))   ; test affordance: inert when NIL (byte-identical production)
   (let* ((dest (%attach-for st locator)) (sap (dds.pal:shm-sap dest))
          (lane (%claim-lane sap (shmem-transport-token st))))
     (if (and lane (%lane-enqueue sap lane (shmem-locator-capacity locator)

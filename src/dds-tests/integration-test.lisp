@@ -5390,6 +5390,179 @@
       (dds.disc:stop-node w) (dds.disc:stop-node r)))
   t)
 
+;;; WP-SHMEM-SEND-SELF-GUARD (FR-XPORT-2): a SIGNALED %shmem-send hard fault (segment detached / pshared /
+;;; bounds), unlike a benign return-0 lane-full, must NOT propagate out of the user-data send — %send-raw-buf
+;;; (dds.disc) catches it, bumps disc-node-shmem-send-faults, fires *sender-emit-error-hook* with the context
+;;; :shmem-send-fault, and FALLS BACK to UDP so the datagram still delivers. The catch lives in dds.disc (not
+;;; the dds.xport SHMEM :send lambda) so the counter + hook stay in scope without an upward dds.xport->dds.disc
+;;; dependency. The fault is injected by the test affordance dds.xport.shmem:*debug-shmem-send-fault* (inert
+;;; NIL = byte-identical production). Pass-skips on the Clasp/macOS by-name-attach gap (ADR 0013).
+
+(defun* run-shmem-send-self-guard-test ()
+    (function () t)
+  "FR-XPORT-2: a hard %shmem-send fault degrades to the UDP fallback. Two same-host nodes, *shmem-enabled* T;
+   after match, ARM *debug-shmem-send-fault* and publish a sample. Assert the reader STILL receives it (via the
+   UDP fallback), disc-node-shmem-send-faults advanced (>=1), the hook fired with context :shmem-send-fault, and
+   disc-node-shmem-sends did NOT advance (it went UDP, not SHMEM). Skips where SHMEM is off (ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-shmem-send-self-guard-test t))
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 53))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 54))
+         (dds.disc:*shmem-enabled* t)
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+         (lock (dds.pal:make-lock "shmem-fault-fired"))
+         (fired '())
+         (saved-hook dds.disc:*sender-emit-error-hook*))
+    ;; The send is synchronous (on the caller thread), but set the GLOBAL hook (restored in cleanup) so the
+    ;; recorder is visible regardless of thread; the lock guards the FIRED list.
+    (setf dds.disc:*sender-emit-error-hook*
+          (lambda (c ctx n) (declare (ignore n))
+            (dds.pal:with-lock (lock) (push (cons ctx (type-of c)) fired))))
+    (unwind-protect
+         (progn
+           (%check :shmem-guard-enabled (and (dds.disc::disc-node-shmem w) (dds.disc::disc-node-shmem r))
+                   "both nodes must have a SHMEM transport when *shmem-enabled*")
+           (dds.disc:add-local-writer w :topic "ShmemGuardT" :type "X")
+           (dds.disc:enable-publisher w :history-kind :keep-all)
+           (dds.disc:add-local-reader r :topic "ShmemGuardT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (%check :shmem-guard-matched (plusp (dds.disc:disc-node-matched-count w))
+                   "writer must match the reader before publishing")
+           (let ((sends-before (dds.disc::disc-node-shmem-sends w)))
+             ;; Arm the synthetic hard fault: the next SHMEM send signals -> %send-raw-buf catches -> UDP.
+             (setf dds.xport.shmem:*debug-shmem-send-fault* t)
+             (dds.disc:publish-sample w (octets 1 2 3 4 5 6 7 8))
+             (loop repeat 400 until (>= (dds.disc:node-sample-count r) 1)
+                   do (dds.disc::%push-heartbeat w) (sleep 0.01))   ; HB ⇒ NACK ⇒ retransmit if needed (still UDP)
+             (setf dds.xport.shmem:*debug-shmem-send-fault* nil)
+             (%check :shmem-guard-fallback-delivered (>= (dds.disc:node-sample-count r) 1)
+                     "the sample must still reach the reader via the UDP fallback after the SHMEM fault")
+             (%check :shmem-guard-fault-counted (plusp (dds.disc::disc-node-shmem-send-faults w))
+                     "disc-node-shmem-send-faults must advance (the hard %shmem-send fault was caught)")
+             (%check :shmem-guard-no-shmem-send (= sends-before (dds.disc::disc-node-shmem-sends w))
+                     "disc-node-shmem-sends must NOT advance — the datagram went UDP, not SHMEM"))
+           (let ((snapshot (dds.pal:with-lock (lock) (copy-list fired))))
+             (%check :shmem-guard-hook-fired (plusp (length snapshot))
+                     "the *sender-emit-error-hook* must have fired for the SHMEM send fault")
+             (%check :shmem-guard-hook-context (every (lambda (e) (eq :shmem-send-fault (car e))) snapshot)
+                     "every hook fire must carry the :SHMEM-SEND-FAULT context")))
+      (setf dds.xport.shmem:*debug-shmem-send-fault* nil
+            dds.disc:*sender-emit-error-hook* saved-hook)
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
+(defun* run-shmem-send-self-guard-no-regression-test ()
+    (function () t)
+  "WP-SHMEM-SEND-SELF-GUARD no-regression (BOTH impls): with *debug-shmem-send-fault* NIL the guard is INERT.
+   (1) A same-host pair (SHMEM active) still delivers over SHMEM — disc-node-shmem-sends advances, shmem-send-
+   faults stays 0, the hook never fires (the handler-case fires ONLY on a SIGNAL; a benign return-0 lane-full
+   would fall back to UDP without touching the counter, but the no-fault path takes SHMEM). The SHMEM leg
+   pass-skips where SHMEM is off (ADR 0013). (2) A non-SHMEM (shmem-dest NIL) UDP send still delivers and is
+   byte-unaffected — this leg runs on BOTH impls (it never touches the SHMEM transport)."
+  ;; Leg 1 (SHMEM active only): no-fault SHMEM send -> SHMEM, counter 0, hook silent.
+  (when (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 55))
+           (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 56))
+           (dds.disc:*shmem-enabled* t)
+           (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+           (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0))
+           (lock (dds.pal:make-lock "shmem-noreg-fired"))
+           (fired '())
+           (saved-hook dds.disc:*sender-emit-error-hook*))
+      (setf dds.disc:*sender-emit-error-hook*
+            (lambda (c ctx n) (declare (ignore c n))
+              (dds.pal:with-lock (lock) (push ctx fired))))
+      (unwind-protect
+           (progn
+             (%check :shmem-noreg-inert-flag (null dds.xport.shmem:*debug-shmem-send-fault*)
+                     "the fault injector must default NIL (inert production)")
+             (dds.disc:add-local-writer w :topic "ShmemNoRegT" :type "X")
+             (dds.disc:enable-publisher w :history-kind :keep-all)
+             (dds.disc:add-local-reader r :topic "ShmemNoRegT" :type "X"
+                                        :reliability dds.rtps.discovery:+reliability-reliable+)
+             (dds.disc:enable-subscriber r)
+             (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                   (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+             (dds.disc:start-node w) (dds.disc:start-node r)
+             (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+             (loop repeat 300
+                   until (and (plusp (dds.disc:disc-node-discovered-count w))
+                              (plusp (dds.disc:disc-node-discovered-count r)))
+                   do (sleep 0.01))
+             (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+             (loop repeat 300
+                   until (and (plusp (dds.disc:disc-node-matched-count w))
+                              (plusp (dds.disc:disc-node-matched-count r)))
+                   do (sleep 0.01))
+             (%check :shmem-noreg-matched (plusp (dds.disc:disc-node-matched-count w))
+                     "writer must match the reader before publishing")
+             (dotimes (i 5) (dds.disc:publish-sample w (octets 9 9 9 9 9 9 9 i)))
+             (loop repeat 400 until (>= (dds.disc:node-sample-count r) 5) do (sleep 0.01))
+             (%check :shmem-noreg-delivered (>= (dds.disc:node-sample-count r) 5)
+                     "the reader must receive all 5 samples")
+             (%check :shmem-noreg-via-shmem (plusp (dds.disc::disc-node-shmem-sends w))
+                     "with the injector NIL the user data must still travel over SHMEM")
+             (%check :shmem-noreg-no-faults (zerop (dds.disc::disc-node-shmem-send-faults w))
+                     "no SHMEM fault must be counted when the injector is NIL")
+             (%check :shmem-noreg-hook-silent (null (dds.pal:with-lock (lock) (copy-list fired)))
+                     "the *sender-emit-error-hook* must never fire on the no-fault SHMEM path"))
+        (setf dds.disc:*sender-emit-error-hook* saved-hook)
+        (dds.disc:stop-node w) (dds.disc:stop-node r))))
+  ;; Leg 2 (both impls): a non-SHMEM UDP send (shmem-dest NIL) is unaffected by the guard.
+  (let* ((p1 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 57))
+         (p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element 58))
+         (dds.disc:*shmem-enabled* nil)   ; force the all-UDP path: the SHMEM block in %send-raw-buf is skipped
+         (w (dds.disc:make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (r (dds.disc:make-disc-node :guid-prefix p2 :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (%check :shmem-noreg-udp-no-transport (null (dds.disc::disc-node-shmem w))
+                   "with *shmem-enabled* NIL a node must have no SHMEM transport (all-UDP path)")
+           (dds.disc:add-local-writer w :topic "UdpNoRegT" :type "X")
+           (dds.disc:enable-publisher w :history-kind :keep-all)
+           (dds.disc:add-local-reader r :topic "UdpNoRegT" :type "X"
+                                      :reliability dds.rtps.discovery:+reliability-reliable+)
+           (dds.disc:enable-subscriber r)
+           (setf (dds.disc::disc-node-peers w) (list (cons "127.0.0.1" (dds.disc:disc-node-port r)))
+                 (dds.disc::disc-node-peers r) (list (cons "127.0.0.1" (dds.disc:disc-node-port w))))
+           (dds.disc:start-node w) (dds.disc:start-node r)
+           (dds.disc:announce-participant w) (dds.disc:announce-participant r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-discovered-count w))
+                            (plusp (dds.disc:disc-node-discovered-count r)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints w) (dds.disc:announce-endpoints r)
+           (loop repeat 300
+                 until (and (plusp (dds.disc:disc-node-matched-count w))
+                            (plusp (dds.disc:disc-node-matched-count r)))
+                 do (sleep 0.01))
+           (%check :shmem-noreg-udp-matched (plusp (dds.disc:disc-node-matched-count w))
+                   "writer must match the reader before publishing (UDP leg)")
+           (dotimes (i 3) (dds.disc:publish-sample w (octets 4 4 4 4 4 4 4 i)))
+           (loop repeat 400 until (>= (dds.disc:node-sample-count r) 3) do (sleep 0.01))
+           (%check :shmem-noreg-udp-delivered (>= (dds.disc:node-sample-count r) 3)
+                   "the all-UDP send (shmem-dest NIL) must deliver unaffected by the guard")
+           (%check :shmem-noreg-udp-zero-shmem (zerop (dds.disc::disc-node-shmem-sends w))
+                   "no SHMEM send on the all-UDP path")
+           (%check :shmem-noreg-udp-zero-faults (zerop (dds.disc::disc-node-shmem-send-faults w))
+                   "no SHMEM fault on the all-UDP path"))
+      (dds.disc:stop-node w) (dds.disc:stop-node r)))
+  t)
+
 (defun* run-zerocopy-end-to-end-test ()
     (function () t)
   "WP-ZEROCOPY Phase D end-to-end (FR-PF-3, ADR 0014; NOT cleared for ship — pending counsel R6): two

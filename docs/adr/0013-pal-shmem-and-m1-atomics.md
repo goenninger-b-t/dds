@@ -250,3 +250,54 @@ superseded by the pshared mutex/cond above; everything else in the Decision ship
 (the SAP atomics + real fence + the six `shm-*` primitives, with the documented Clasp gaps).
 `docs/verification.csv` FR-XPORT-2: the PAL/atomics row is `partial` (Clasp gaps), and the
 transport row is `implemented`.
+
+## SHMEM-send self-guard (as-built, 2026-06-18) — WP-SHMEM-SEND-SELF-GUARD
+
+A follow-up hardening of the SHMEM **send** path, flagged as a deferred item in
+WP-SENDER-ERROR-RESILIENCE / ADR 0016. The Final-design "Selection + fallback" note above
+already mapped a SHMEM **lane/ring-full reject** (the enqueue *returns* 0) to a UDP fallback.
+A **signalled** `%shmem-send` hard fault (segment detached, pshared error, bounds) is a
+different outcome and, before this WP, propagated out of the user-data send (the
+WP-SENDER-ERROR-RESILIENCE sender-thread guard caught it but *dropped* the datagram and relied
+on reliability repair).
+
+**As-built.** A signalled `%shmem-send` fault is now caught in **`%send-raw-buf` (`dds.disc`)**
+— the production one-datagram send path — bumps the `disc-node` `shmem-send-faults` counter,
+fires `*sender-emit-error-hook*` with context **`:shmem-send-fault`** (via
+`%note-shmem-send-fault`, the hook call `ignore-errors`-guarded so a signalling hook cannot
+break the send), and **falls back to UDP exactly like a return-0** — so the datagram still
+delivers. The spec design is `docs/superpowers/specs/2026-06-18-wp-shmem-send-self-guard-design.md`.
+
+**Layering rationale.** The hook (`*sender-emit-error-hook*`) lives in `dds.disc`; the SHMEM
+`:send` lambda lives in `dds.xport` (a lower layer `dds.disc` depends on). Catching in the
+`dds.xport` `:send` lambda would defeat the counter + hook (you cannot have both layers catch),
+and reaching the hook from there would require an upward `dds.xport → dds.disc` dependency. So
+the guard goes in `%send-raw-buf`, which already holds the SHMEM transport, the node, the
+UDP-fallback dest, and the hook in scope — no layering inversion. The `dds.xport` SHMEM `:send`
+lambda stays **unguarded** so it can signal up to `%send-raw-buf`.
+
+**Fault-vs-lane-full distinction.** The `handler-case` fires **only on a signal**. A benign
+lane-full (the SHMEM send *returns* 0) does **not** enter the handler → it takes the **silent**
+UDP fallback with **no** counter bump and **no** hook fire. Only the hard-fault (signal) path is
+counted/observed. Either way exactly one of {SHMEM, UDP} carries the datagram (no loss, no
+double-delivery); a genuinely lost reliable sample is backstopped by HEARTBEAT/ACKNACK repair
+(RTPS 2.5 §8.4.1).
+
+**Test affordance.** `dds.xport.shmem:*debug-shmem-send-fault*` (special, default `NIL`,
+exported) injects a synthetic `shmem-send-test-fault` at the top of `%shmem-send`; `NIL` =
+byte-identical production, never wire-triggered (NFR-SEC-POSTURE). Proven by
+`run-shmem-send-self-guard-test` (fault → UDP-fallback delivery + counter advanced + hook fired
+`:shmem-send-fault` + `shmem-sends` did **not** advance) and `run-shmem-send-self-guard-no-regression-test`
+(injector NIL → SHMEM still delivers, counter 0, hook silent; and an all-UDP `shmem-dest`-NIL
+send unaffected — the latter leg on both impls).
+
+**Conformance / scope.** FR-XPORT-2; SHMEM is standard, so this is **non-R6**. Local send-error
+handling is implementation-defined (no RTPS clause governs it — same posture as
+WP-SENDER-ERROR-RESILIENCE); a UDP-fallback delivery is **more** conformant than a drop (the
+datagram is delivered, not lost). Off the measured CDR hot path — `make mem` stays `0.0000`, no
+hot-path number moved, no bench warranted (FR-LANG-7). **Cross-DDS interop DoD** (owner directive
+2026-06-17): minimal wire-observable surface — SHMEM is same-host **ours-to-ours**, a foreign
+peer always gets UDP (`shmem-dest` is `NIL` for it → the guard is inert), so the cross-DDS surface
+is **no-regression** vs RTI Connext 7.3.1 + Fast DDS 3.6.1 (`interop/shmem-send-self-guard/`); the
+our-to-our fault→UDP-fallback unit test is the feature proof. `docs/verification.csv` FR-XPORT-2:
+the transport row stays `implemented`; the self-guard rows are added.

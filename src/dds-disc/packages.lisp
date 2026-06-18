@@ -33,7 +33,7 @@
            #:flow-token-bucket-tokens #:flow-token-bucket-max-burst
            #:flow-controller #:flow-controller-p #:make-flow-controller #:destroy-flow-controller
            #:flow-controller-associate #:flow-controller-unregister #:flow-controller-thread
-           #:*shmem-enabled* #:*zerocopy-enabled* #:disc-node-shmem #:disc-node-shmem-sends #:disc-node-host-uuid
+           #:*shmem-enabled* #:*zerocopy-enabled* #:disc-node-shmem #:disc-node-shmem-sends #:disc-node-shmem-send-faults #:disc-node-host-uuid
            #:disc-node-zc-sends #:+zerocopy-pool-slots+ #:+zerocopy-pool-slot-bytes+ #:*zerocopy-min-payload-bytes*
            ;; WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017): loan-capable flag + the unresolved ZC-ref marker
            #:set-zc-loan-capable #:disc-node-zc-loan-capable

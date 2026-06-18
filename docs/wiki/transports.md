@@ -455,16 +455,31 @@ retry-the-same risks **wedging** a writer (no SN advances), clear-pending defers
 **Observability.** `dds.disc:*sender-emit-error-hook*` is a bindable funcallable `(condition context count)`
 invoked on each caught emit error (the default is a clockless rate-limited `WARN` — it logs only when `count`
 is 1 or a power of ten, so a persistent failure logs O(log n) lines, never a flood). `context` is
-`:async-sender` or `:flow-scheduler`; `count` is that thread's running error count (also readable as the
-`disc-node` `async-emit-errors` / `flow-controller` `emit-errors` slots). **The hook runs on the sender
-thread** — so it must not block, it does **not** inherit the binding thread's dynamic environment (bind the
-**global** value, not a thread-local `let`), and a hook that itself signals is swallowed (it can never re-kill
-the thread).
+`:async-sender`, `:flow-scheduler`, or `:shmem-send-fault`; `count` is that thread's running error count (also
+readable as the `disc-node` `async-emit-errors` / `flow-controller` `emit-errors` slots, and for the SHMEM
+fault the `disc-node-shmem-send-faults` counter). **The hook runs on the sender thread** — so it must not
+block, it does **not** inherit the binding thread's dynamic environment (bind the **global** value, not a
+thread-local `let`), and a hook that itself signals is swallowed (it can never re-kill the thread).
+
+**SHMEM-send self-guard (WP-SHMEM-SEND-SELF-GUARD, FR-XPORT-2).** The same hook also fires — with context
+`:shmem-send-fault` — when a **signalled** `%shmem-send` hard fault (segment detached / pshared error /
+bounds) is caught in `%send-raw-buf` and the datagram is degraded to the UDP fallback. This widens the hook's
+use beyond the two sender-thread emit sites to this transport-fault site (the catch lives in `dds.disc`'s
+production send path, not the lower `dds.xport` SHMEM `:send` lambda, so the counter + hook stay in scope
+without an upward `dds.xport → dds.disc` dependency). It is distinct from a **benign lane-full**, where the
+SHMEM send *returns* 0 (not a signal): that takes the **silent** UDP fallback with **no** counter bump and
+**no** hook fire (the fault-vs-lane-full distinction). Either way the datagram still delivers over UDP, and a
+genuinely lost reliable sample is backstopped by HEARTBEAT/ACKNACK repair (§8.4.1). The fault never propagates
+out of the user-data send. The `disc-node-shmem-send-faults` counter is the proof/diagnostic; the
+`dds.xport.shmem:*debug-shmem-send-fault*` test affordance injects the synthetic fault (inert NIL =
+byte-identical production).
 
 | Symbol | Kind | Contract |
 |---|---|---|
-| `dds.disc:*sender-emit-error-hook*` | special variable | funcallable `(condition context count) → t`; called on the sender thread for each caught emit `error`. `context` ∈ {`:async-sender`, `:flow-scheduler`}; `count` is that thread's running error count. Must not block; a signalling hook is itself guarded. Default rate-limited WARN. |
+| `dds.disc:*sender-emit-error-hook*` | special variable | funcallable `(condition context count) → t`; called for each caught emit `error`. On a sender thread for `context` ∈ {`:async-sender`, `:flow-scheduler`}; on the calling (or sender) thread for `:shmem-send-fault` (a `%shmem-send` hard fault caught in `%send-raw-buf` → UDP fallback). `count` is the matching running error count. Must not block; a signalling hook is itself guarded. Default rate-limited WARN. |
+| `dds.disc:disc-node-shmem-send-faults` | accessor | Count of **signalled** `%shmem-send` faults caught in `%send-raw-buf` and degraded to the UDP fallback (proof/diagnostic; FR-XPORT-2). A benign lane-full return-0 does **not** advance it. |
 | `dds.disc:*debug-emit-fault*` | special variable | **test affordance, default `NIL` = inert** (byte-identical wire). A positive integer N faults the next N `%send-raw-buf` calls (decrementing); `:persistent` faults every call. Mirrors `*debug-drop-sample-numbers*`. |
+| `dds.xport.shmem:*debug-shmem-send-fault*` | special variable | **test affordance, default `NIL` = inert** (byte-identical production). When non-`NIL`, `%shmem-send` signals `shmem-send-test-fault` before doing any work — exercises the `%send-raw-buf` self-guard (catch → `disc-node-shmem-send-faults` + hook `:shmem-send-fault` → UDP fallback). Never set in production. |
 
 ```lisp
 ;; Observe sender-thread emit faults: set the GLOBAL hook (it fires on the sender thread).
@@ -534,6 +549,19 @@ wire: every `len`/offset is bounds-checked against the lane extents before it is
 (NFR-SEC-POSTURE). A lane/ring-full enqueue returns a reject sentinel, which the discovery layer maps to a UDP
 fallback for that datagram (the reliable sample stays in the HistoryCache and repairs via HEARTBEAT/ACKNACK) —
 **never** a GC-heap fallback.
+
+**A signalled SHMEM-send hard fault also degrades to UDP** (WP-SHMEM-SEND-SELF-GUARD, FR-XPORT-2). The lane-full
+reject above is a benign *return-0*; a **signalled** `%shmem-send` error (segment detached / pshared error /
+bounds) is a different outcome, and it too must not propagate out of the user-data send. `%send-raw-buf`
+(`dds.disc`) wraps the SHMEM send in a `handler-case`: a signal is caught, bumps `disc-node-shmem-send-faults`,
+fires `*sender-emit-error-hook*` with context `:shmem-send-fault` (see
+[Sender-thread fault resilience](#sender-thread-fault-resilience--sender-emit-error-hook)), and falls back to
+UDP exactly like a return-0 — so the datagram still delivers. The catch lives here in the production send path
+(which already holds the transport + node + UDP-fallback dest + the hook), **not** the lower `dds.xport` SHMEM
+`:send` lambda, so the counter + hook stay in scope without an upward `dds.xport → dds.disc` dependency. The
+fault-vs-lane-full distinction matters: only the **signal** path bumps the counter and fires the hook; the
+benign lane-full takes the silent UDP fallback. The `dds.xport.shmem:*debug-shmem-send-fault*` test affordance
+injects the synthetic fault (inert NIL = byte-identical production).
 
 ### When SHMEM engages, and what stays on UDP
 
@@ -684,7 +712,11 @@ affect SHMEM on Clasp/Linux.) This mirrors the existing Clasp threading and fore
 - **Landed:** UDPv4 unicast and multicast over each implementation's native `sb-bsd-sockets` (SBCL contrib;
   Clasp bundled), the pluggable `transport` record, the synchronous mock transport, and the **shared-memory
   intra-host transport** (FR-XPORT-2; auto-selected for same-host user DATA, UDP fallback; SBCL full, Clasp/macOS
-  NFR-PORT gap — see [SHMEM architecture](#shmem-architecture) above). Multicast (`SO_REUSEPORT` +
+  NFR-PORT gap — see [SHMEM architecture](#shmem-architecture) above). The SHMEM send now **degrades a signalled
+  hard fault to the UDP fallback** (WP-SHMEM-SEND-SELF-GUARD, FR-XPORT-2): caught in `%send-raw-buf`, counted in
+  `disc-node-shmem-send-faults`, observed via `*sender-emit-error-hook*` (context `:shmem-send-fault`), distinct
+  from a benign lane-full return-0 — see
+  [When SHMEM engages](#when-shmem-engages-and-what-stays-on-udp) above. Multicast (`SO_REUSEPORT` +
   `IP_ADD_MEMBERSHIP` + loopback) is wired in the PAL for SPDP discovery; the OS-specific socket-option constants
   are gated by **OS** reader conditionals (`#+darwin`/`#-darwin`) in `pal-net.lisp`, not impl ones.
 - **Landed (gated, default-OFF):** Zero-Copy-over-SHMEM (WP-ZEROCOPY, FR-PF-3) — a per-writer SHMEM

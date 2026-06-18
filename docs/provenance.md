@@ -1652,3 +1652,31 @@ on truthful values, the TX-in-offered-representation (XCDR1-LE / XCDR2-LE) path,
   DDS `shapes` peers (provenance recorded above); the loopback `USER_QOS_PROFILES.xml` is a copy of the
   in-repo `interop/connext/liveliness/USER_QOS_PROFILES.xml` (a capture-only aid, not run by CI). No new
   vendor source/binaries are added by this leg.
+
+## M5 (2026-06-18) — WP-SHMEM-SEND-SELF-GUARD: a signalled %shmem-send fault degrades to the UDP fallback (FR-XPORT-2, ADR 0013)
+
+A signalled `%shmem-send` hard fault is caught in `%send-raw-buf` (`dds.disc`), counted
+(`disc-node-shmem-send-faults`), observed via `*sender-emit-error-hook*` (context
+`:shmem-send-fault`), and degraded to the existing UDP fallback
+(`src/dds-disc/{dataplane,disc,packages}.lisp`, `src/dds-xport/{shmem,packages}.lisp`). This is
+**clean-room; no new external source code was consulted.**
+
+- **Sources consulted**: the operating contract §4; the in-repo design spec
+  `docs/superpowers/specs/2026-06-18-wp-shmem-send-self-guard-design.md`; **FR-XPORT-2** (the SHMEM
+  transport). Local send-error handling is **implementation-defined** — no RTPS clause governs it (the same
+  posture as WP-SENDER-ERROR-RESILIENCE) — so **no wire constant or wire behaviour is involved**; the
+  UDP-fallback delivery is backstopped for genuinely lost reliable samples by **RTPS 2.5 §8.4 / §8.4.1**
+  (the HEARTBEAT/ACKNACK repair, unchanged). The fault injector is a test affordance (NFR-SEC-POSTURE), inert
+  in production, never wire-triggered.
+- The work **reuses this repo's own existing machinery** — the `*sender-emit-error-hook*` `(condition context
+  count)` contract + the `%note`/`ignore-errors` fire idiom (WP-SENDER-ERROR-RESILIENCE, ADR 0016), the
+  `disc-node` diagnostic counter pattern (`shmem-sends`), the `%send-raw-buf` SHMEM-then-UDP fallback (ADR
+  0013), and the `*debug-*-fault*` test-injector pattern (`*debug-emit-fault*`). It is the in-house
+  application of in-house idioms, no copy of any vendor's mechanism.
+- **This is standard DDS — NOT patent-gated, NOT R6**: SHMEM is a standard transport (FR-XPORT-2) and the
+  graceful-degrade is implementation-defined local error handling; green on SBCL + Clasp.
+- **No RTI Connext source/headers/`rtiddsgen` output, and no Apache-2.0 (Fast DDS) / EPL-EDL (Cyclone) /
+  OpenDDS source, was read or copied** for this work package. SHMEM is same-host ours-to-ours, so the
+  cross-DDS surface is **no-regression** (a foreign peer always gets UDP — the guard is inert for it); the
+  no-regression interop (`interop/shmem-send-self-guard/`) reuses the already-committed Connext + Fast DDS
+  Shapes peers (provenance recorded above). No new vendor source/binaries are added by this leg.

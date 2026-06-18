@@ -78,13 +78,26 @@
            (ignore-errors (funcall *sender-emit-error-hook* ,c ,context n)))
          nil))))
 
+(defun* %note-shmem-send-fault (node condition)
+    (function (disc-node condition) fixnum)
+  "WP-SHMEM-SEND-SELF-GUARD: a hard %shmem-send fault was caught in %send-raw-buf and the datagram is falling
+   back to UDP — bump the node's SHMEM-SEND-FAULTS counter and fire *SENDER-EMIT-ERROR-HOOK* (context
+   :shmem-send-fault), the hook call IGNORE-ERRORS-guarded so a signalling hook can't break the send."
+  (let ((n (incf (disc-node-shmem-send-faults node))))
+    (ignore-errors (funcall *sender-emit-error-hook* condition :shmem-send-fault n))
+    n))
+
 (defun* %send-raw-buf (node buf len host port &optional shmem-dest)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) string (unsigned-byte 16) &optional t) t)
   "Send the first LEN octets of BUF (a complete RTPS message) as ONE datagram — the raw one-datagram send
    shared by %SEND-MSG-BUF and the %SEND-PACKED coalescer (one dds.xport:send = one sendto). When
    SHMEM-DEST (a dds.xport.shmem:shmem-locator) is supplied, the datagram goes over SHARED MEMORY to that
    same-host peer (FR-XPORT-2); if the SHMEM send returns 0 (lane full / claim fail) it FALLS BACK to the
-   UDP send to HOST:PORT (no loss, no double-delivery — exactly one of the two carries it). With SHMEM-DEST
+   UDP send to HOST:PORT (no loss, no double-delivery — exactly one of the two carries it). A SIGNALED hard
+   SHMEM fault (segment detached / pshared / bounds) is caught here (WP-SHMEM-SEND-SELF-GUARD): it bumps
+   SHMEM-SEND-FAULTS + fires *SENDER-EMIT-ERROR-HOOK* (context :shmem-send-fault) via %NOTE-SHMEM-SEND-FAULT,
+   then falls back to UDP exactly like a return-0 — so the datagram still delivers (the HANDLER-CASE fires only
+   on a SIGNAL; a benign return-0 lane-full takes the silent UDP fallback with no counter/hook). With SHMEM-DEST
    NIL (every discovery/HB/ACKNACK caller, and every cross-host data send) the path is the original UDP send,
    byte-for-byte unchanged. Hands a copy to *DATAGRAM-SINK* first when that test hook is bound."
   (when *datagram-sink*
@@ -94,8 +107,10 @@
       (setf *debug-emit-fault* (when (> *debug-emit-fault* 1) (1- *debug-emit-fault*))))   ; N -> N-1, last -> NIL
     (error 'sender-emit-test-fault))   ; :persistent or a positive integer: inject; inert when NIL
   (when (and shmem-dest (disc-node-shmem node))
-    (when (plusp (dds.xport:send (dds.xport.shmem:shmem-transport-transport (disc-node-shmem node))
-                                 shmem-dest buf 0 len))
+    (when (plusp (handler-case
+                     (dds.xport:send (dds.xport.shmem:shmem-transport-transport (disc-node-shmem node))
+                                     shmem-dest buf 0 len)
+                   (error (c) (%note-shmem-send-fault node c) 0)))   ; hard SHMEM fault -> counter+hook, fall to UDP
       (incf (disc-node-shmem-sends node))
       (return-from %send-raw-buf t)))   ; delivered over SHMEM: do NOT also UDP-send (no double-delivery)
   (dds.xport:send (disc-node-transport node)
