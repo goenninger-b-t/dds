@@ -466,6 +466,10 @@
 ;; %lease-sweep is defined below but called from announce-endpoints above it.
 (declaim (ftype (function (disc-node) (eql t)) %lease-sweep))
 
+;; %source-guid is defined in dataplane.lisp (loaded after this file).
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32))
+                          (simple-array (unsigned-byte 8) (16))) %source-guid))
+
 ;; TypeLookup endpoint handlers: defined in typelookup-endpoints.lisp (loaded after this file).
 (declaim (ftype (function ((unsigned-byte 32)) t) %tl-writer-p)
          (ftype (function ((unsigned-byte 32)) (or null (unsigned-byte 32))) %tl-reader-id-for)
@@ -908,7 +912,8 @@
      (lambda (id flags c body-len)
        (cond
          ((= id dds.rtps.message:+submsg-data+)
-          (multiple-value-bind (rdr wtr sn has-payload poff plen keyp kind key-hash status-flags)
+          (multiple-value-bind (rdr wtr sn has-payload poff plen keyp kind key-hash status-flags
+                                orig-guid orig-sn)
               (dds.rtps.message:parse-data-body c flags body-len)
             (declare (ignore rdr keyp))
             (when (and (not has-payload) (not (eq kind :data)) (disc-node-on-lifecycle node))
@@ -949,7 +954,11 @@
                 ((= wtr dds.rtps.discovery:+entityid-p2p-participant-message-writer+)
                  (%on-participant-message node src-prefix wtr sn buf poff plen))
                 ((disc-node-on-data node)
-                 (funcall (disc-node-on-data node) wtr sn buf poff plen src-prefix))))))
+                 ;; Pass orig-guid/orig-sn (from PID_ORIGINAL_WRITER_INFO, §8.3.5.4) into the
+                 ;; data-plane hook. %on-user-data MUST call reader-on-data unconditionally (for
+                 ;; RTPS reliable NACK/HEARTBEAT correctness) and gates only the APP delivery.
+                 (funcall (disc-node-on-data node) wtr sn buf poff plen src-prefix
+                          orig-guid orig-sn))))))
          ((= id dds.rtps.message:+submsg-heartbeat+)
           (let ((pos (dds.core.buffer:cursor-position c)))
             (multiple-value-bind (rid wid first last hcount hfinal hlive)

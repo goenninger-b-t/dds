@@ -496,24 +496,27 @@
 (defun* parse-inline-qos-key-status (cursor body-end &optional (capture-key-hash t))
     (function (dds.core.buffer:cursor fixnum &optional t) t)
   "Walk an inlineQos ParameterList (RTPS 2.5 §9.4.2.11) bounded by BODY-END, extracting
-   PID_KEY_HASH (KeyHash_t octet[16], §9.6.4.8) and PID_STATUS_INFO (StatusInfo_t octet[4],
-   §9.6.4.9). Returns (values key-hash status-flags walk-ok), leaving CURSOR just past the
-   PID_SENTINEL header. KEY-HASH is a fresh 16-octet array or NIL; STATUS-FLAGS is the last
-   StatusInfo octet (0 if absent); WALK-OK is NIL when the list ran off BODY-END without a
-   sentinel. When CAPTURE-KEY-HASH is NIL the key-hash is NOT materialized (zero per-sample
-   allocation on the hot keyed-DATA path) — only its presence advances the cursor. Unknown
-   PIDs are skipped. Every read is bounds-checked against BODY-END FIRST (NFR-SEC-POSTURE);
-   a KEY_HASH not exactly 16 / STATUS_INFO not exactly 4 octets is ignored, never trusted."
-  (let ((key-hash nil) (status-flags 0))
+   PID_KEY_HASH (KeyHash_t octet[16], §9.6.4.8), PID_STATUS_INFO (StatusInfo_t octet[4],
+   §9.6.4.9), and PID_ORIGINAL_WRITER_INFO (GuidPrefix_t[12]+EntityId_t[4]+SequenceNumber_t[8],
+   §8.3.5.4). Returns (values key-hash status-flags walk-ok original-guid original-sn).
+   KEY-HASH is a fresh 16-octet array or NIL; STATUS-FLAGS is the last StatusInfo octet (0 if
+   absent); WALK-OK is NIL when the list ran off BODY-END without a sentinel; ORIGINAL-GUID is
+   a fresh 16-octet array (GuidPrefix+EntityId) or NIL; ORIGINAL-SN is an integer or NIL.
+   When CAPTURE-KEY-HASH is NIL the key-hash is NOT materialized (zero per-sample allocation
+   on the hot keyed-DATA path). Unknown PIDs are skipped. Every read is bounds-checked against
+   BODY-END FIRST (NFR-SEC-POSTURE); a KEY_HASH not exactly 16 / STATUS_INFO not exactly 4 /
+   ORIGINAL_WRITER_INFO not exactly 24 octets is ignored, never trusted."
+  (let ((key-hash nil) (status-flags 0) (original-guid nil) (original-sn nil))
     (loop
       (when (> (+ (dds.core.buffer:cursor-position cursor) 4) body-end)
-        (return (values key-hash status-flags nil)))
+        (return (values key-hash status-flags nil original-guid original-sn)))
       (let ((pid (dds.core.buffer:get-u16 cursor))
             (plen (dds.core.buffer:get-u16 cursor)))
-        (when (= pid +pid-sentinel+) (return (values key-hash status-flags t)))
+        (when (= pid +pid-sentinel+)
+          (return (values key-hash status-flags t original-guid original-sn)))
         (let ((value-start (dds.core.buffer:cursor-position cursor)))
           (when (> (+ value-start plen) body-end)
-            (return (values key-hash status-flags nil)))
+            (return (values key-hash status-flags nil original-guid original-sn)))
           (cond
             ((and capture-key-hash (= pid +pid-key-hash+) (= plen 16))
              (let ((kh (make-array 16 :element-type '(unsigned-byte 8))))
@@ -522,7 +525,15 @@
             ((and (= pid +pid-status-info+) (= plen 4))
              (dds.core.buffer:get-u8 cursor) (dds.core.buffer:get-u8 cursor)
              (dds.core.buffer:get-u8 cursor)
-             (setf status-flags (dds.core.buffer:get-u8 cursor))))
+             (setf status-flags (dds.core.buffer:get-u8 cursor)))
+            ((= pid +pid-original-writer-info+)
+             ;; PID_ORIGINAL_WRITER_INFO body: 24 octets (RTPS 2.5 §8.3.5.4):
+             ;;   GuidPrefix_t[12] + EntityId_t[4] + SequenceNumber_t high(i32)[4] + low(u32)[4]
+             (multiple-value-bind (g s) (parse-original-writer-info
+                                         (dds.core.buffer:octet-buffer-vec
+                                          (dds.core.buffer:cursor-buffer cursor))
+                                         value-start plen)
+               (when g (setf original-guid g original-sn s)))))
           (dds.core.buffer:cursor-set-position cursor (+ value-start plen)))))))
 
 (defun* write-data-dispose (cursor reader-id writer-id writer-sn key-hash status-flags)
@@ -543,21 +554,34 @@
   (write-status-info-inline-qos cursor key-hash status-flags)
   (dds.core.buffer:cursor-position cursor))
 
-(defun* write-data (cursor reader-id writer-id writer-sn payload payload-off payload-len &key key)
-    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) &key (:key t)) fixnum)
-  "Write a complete DATA submessage with a serializedPayload, no inlineQos. KEY t
-   emits a key payload (K=1,D=0); else data (D=1,K=0). RTPS 2.5 §9.4.5.4."
-  (write-submessage-header cursor +submsg-data+
-                           (logior (%e-flag cursor)
-                                   (if key +data-flag-key+ +data-flag-data+))
-                           (+ 20 payload-len))
-  (dds.core.buffer:put-u16 cursor 0)             ; extraFlags = 0 (this version)
-  (dds.core.buffer:put-u16 cursor 16)            ; octetsToInlineQos = 16
-  (write-entity-id cursor reader-id)
-  (write-entity-id cursor writer-id)
-  (write-sequence-number cursor writer-sn)
-  (dds.core.buffer:put-octets cursor payload payload-off payload-len)
-  (dds.core.buffer:cursor-position cursor))
+(defun* write-data (cursor reader-id writer-id writer-sn payload payload-off payload-len
+                   &key key inline-qos)
+    (function (dds.core.buffer:cursor (unsigned-byte 32) (unsigned-byte 32) integer
+               (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)
+               &key (:key t) (:inline-qos (or null (simple-array (unsigned-byte 8) (*))))) fixnum)
+  "Write a complete DATA submessage (RTPS 2.5 §9.4.5.4). KEY t → K=1,D=0; else D=1,K=0.
+   INLINE-QOS (or nil): when non-nil the caller supplies a COMPLETE, PID_SENTINEL-terminated
+   ParameterList octet vector; write-data ORs +data-flag-inline-qos+ into the flags, adds the
+   (length inline-qos) to octetsToNextHeader, and writes the bytes verbatim between the 20-octet
+   fixed body prefix and the serializedPayload (caller is responsible for 4-octet alignment,
+   which holds as long as inline-qos bytes are a multiple of 4 — true for all standard parameters).
+   When nil: byte-identical to the prior no-inline-qos form (Q-bit clear, octetsToNextHeader
+   unchanged). Design choice: the caller passes the FULL pre-framed block (simplest — write-data
+   just length-accounts and copies). §9.4.5.4 / §9.4.2.11."
+  (let ((iq-len (if inline-qos (length inline-qos) 0)))
+    (write-submessage-header cursor +submsg-data+
+                             (logior (%e-flag cursor)
+                                     (if key +data-flag-key+ +data-flag-data+)
+                                     (if inline-qos +data-flag-inline-qos+ 0))
+                             (+ 20 iq-len payload-len))
+    (dds.core.buffer:put-u16 cursor 0)           ; extraFlags = 0 (this version)
+    (dds.core.buffer:put-u16 cursor 16)          ; octetsToInlineQos = 16
+    (write-entity-id cursor reader-id)
+    (write-entity-id cursor writer-id)
+    (write-sequence-number cursor writer-sn)
+    (when inline-qos (dds.core.buffer:put-octets cursor inline-qos 0 iq-len))
+    (dds.core.buffer:put-octets cursor payload payload-off payload-len)
+    (dds.core.buffer:cursor-position cursor)))
 
 (defun* %skip-inline-qos (cursor body-end)
     (function (dds.core.buffer:cursor fixnum) t)
@@ -577,13 +601,13 @@
 (defun* parse-data-body (cursor flags octets-to-next)
     (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t)
   "Parse a DATA body. Returns (values reader-id writer-id writer-sn has-payload
-   payload-offset payload-len key-p change-kind key-hash status-flags), or NIL if the buffer
-   is short / malformed. When the InlineQos flag (Q) is set the inlineQos ParameterList is
-   walked (bounds-checked, parse-inline-qos-key-status) — PID_STATUS_INFO yields STATUS-FLAGS
-   (StatusInfo_t §9.6.4.9) and the derived CHANGE-KIND (:data/:dispose/:unregister); the
-   16-octet KEY-HASH is materialized only for a no-payload lifecycle change (zero per-sample
-   allocation on the hot keyed-DATA path). The serializedPayload after the inlineQos is
-   reported (left in place at PAYLOAD-OFFSET). RTPS 2.5 §9.4.5.4 + §9.6.4.9."
+   payload-offset payload-len key-p change-kind key-hash status-flags original-guid original-sn),
+   or NIL if the buffer is short / malformed. When the InlineQos flag (Q) is set the inlineQos
+   ParameterList is walked (bounds-checked, parse-inline-qos-key-status) — PID_STATUS_INFO
+   yields STATUS-FLAGS (§9.6.4.9) and the derived CHANGE-KIND (:data/:dispose/:unregister);
+   the 16-octet KEY-HASH is materialized only for a no-payload lifecycle change (zero per-sample
+   allocation on the hot keyed-DATA path); PID_ORIGINAL_WRITER_INFO yields ORIGINAL-GUID (16
+   octets) and ORIGINAL-SN or nil/nil when absent (§8.3.5.4). RTPS 2.5 §9.4.5.4 + §9.6.4.9."
   (let* ((body-start (dds.core.buffer:cursor-position cursor))
          (cap (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor)))
          (body-end (if (plusp octets-to-next) (min (+ body-start octets-to-next) cap) cap)))
@@ -594,18 +618,19 @@
           (writer (read-entity-id cursor))
           (sn (read-sequence-number cursor))
           (has-payload (logtest flags (logior +data-flag-data+ +data-flag-key+)))
-          (key-hash nil) (status-flags 0))
+          (key-hash nil) (status-flags 0) (original-guid nil) (original-sn nil))
       (when (logtest flags +data-flag-inline-qos+)
-        (multiple-value-bind (kh sf ok)
+        (multiple-value-bind (kh sf ok og os)
             (parse-inline-qos-key-status cursor body-end (not has-payload))
           (unless ok (return-from parse-data-body nil))
-          (setf key-hash kh status-flags sf)))
+          (setf key-hash kh status-flags sf original-guid og original-sn os)))
       (let* ((poff (dds.core.buffer:cursor-position cursor))
              (len (- body-end poff)))
         (when (< len 0) (return-from parse-data-body nil))
         (values reader writer sn has-payload poff
                 (if has-payload len 0) (logtest flags +data-flag-key+)
-                (status-info->kind status-flags) key-hash status-flags)))))
+                (status-info->kind status-flags) key-hash status-flags
+                original-guid original-sn)))))
 
 ;;; ---- DATA_FRAG submessage (§9.4.5.5): extraFlags + octetsToInlineQos + readerId +
 ;;; writerId + writerSN + fragmentStartingNum(u32) + fragmentsInSubmessage(u16) +
@@ -722,6 +747,21 @@
    The policy struct is APPENDABLE, so a peer (e.g. RTI) may append trailing members the reader ignores.")
 (defconstant +pid-type-information+           #x0075
   "PID_TYPE_INFORMATION (DDS-XTypes 1.3 BuiltinTopicData @id(0x0075)).")
+(defconstant +pid-entity-virtual-guid+        #x8002
+  "PID_ENTITY_VIRTUAL_GUID — RTI vendor SEDP PID (0x8002; eProsima names it PID_PERSISTENCE_GUID).
+   16-byte GUID of the original writer this relay endpoint represents. Emitted by a Persistence Service
+   relay writer in its SEDP announcement; triggers Connext receiver-side PID_ORIGINAL_WRITER_INFO dedup.
+   Observed in live Connext 7.3.1 PS capture (spike 2026-06-18). Vendor range, fail-open for receivers
+   that ignore it (RTPS 2.5 §8.3.5.10).")
+(defconstant +pid-service-kind+               #x8003
+  "PID_SERVICE_KIND — RTI vendor SEDP PID (0x8003), u32 LE. Value 1 = PERSISTENCE_SERVICE_QOS.
+   Emitted by a Persistence Service relay writer in its SEDP announcement; gates Connext receiver-side
+   PID_ORIGINAL_WRITER_INFO dedup (Connext only applies inline-QoS dedup when the relay announces
+   SERVICE_KIND=PERSISTENCE_SERVICE). Observed in live Connext 7.3.1 PS capture (spike 2026-06-18).
+   Vendor range, fail-open for receivers that ignore it (RTPS 2.5 §8.3.5.10).")
+(defconstant +service-kind-persistence+       #x00000001
+  "PERSISTENCE_SERVICE_QOS wire value for PID_SERVICE_KIND (0x8003, RTI vendor). u32 LE = 1.
+   Connext activation gate for receiver-side PID_ORIGINAL_WRITER_INFO dedup (spike 2026-06-18).")
 (defconstant +pid-type-object-lb+             #x8021
   "PID_TYPE_OBJECT_LB — RTI Connext VENDOR parameter (high-bit 0x8000 vendor range) carrying
    a ZLIB-compressed complete TypeObject. NOT an OMG-spec PID; value observed on the live
@@ -734,6 +774,56 @@
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
 (defconstant +pid-zerocopy-capable+           #x8041
   "Vendor PID (1 octet, 1 = endpoint understands WP-ZEROCOPY references). ADR 0014; ours, NOT a spec clause.")
+(defconstant +pid-original-writer-info+       #x0061
+  "PID_ORIGINAL_WRITER_INFO — GUID + SequenceNumber of the original writer (RTPS 2.5 §8.3.5.4, Table 9.12).
+   Carried in inline-QoS of DATA/DATA_FRAG sent by a Persistence Service replaying retained samples to late
+   joiners; lets receivers deduplicate against samples already received from the live writer.")
+
+(defun* encode-original-writer-info (guid sn)
+    (function ((simple-array (unsigned-byte 8) (16)) (integer 0)) (simple-array (unsigned-byte 8) (24)))
+  "Encode a 24-octet OriginalWriterInfo body LE: bytes 0-15 = GUID verbatim; bytes 16-19 = SN.high (i32 LE);
+   bytes 20-23 = SN.low (u32 LE). RTPS 2.5 §8.3.5.4 / Table 9.12."
+  (let ((body (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0))
+        (high (logand (ash sn -32) #xFFFFFFFF))
+        (low  (logand sn #xFFFFFFFF)))
+    (replace body guid :start1 0 :end1 16)
+    (setf (aref body 16) (ldb (byte 8  0) high)
+          (aref body 17) (ldb (byte 8  8) high)
+          (aref body 18) (ldb (byte 8 16) high)
+          (aref body 19) (ldb (byte 8 24) high)
+          (aref body 20) (ldb (byte 8  0) low)
+          (aref body 21) (ldb (byte 8  8) low)
+          (aref body 22) (ldb (byte 8 16) low)
+          (aref body 23) (ldb (byte 8 24) low))
+    body))
+
+(defun* parse-original-writer-info (octets off len)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) t)
+  "Parse a 24-octet OriginalWriterInfo body from OCTETS at offset OFF with wire length LEN.
+   Returns (values guid sn) or (values nil nil) if LEN /= 24 or body overruns OCTETS.
+   Bounds-checked; never reads OOB (NFR-SEC-POSTURE). RTPS 2.5 §8.3.5.4 / Table 9.12."
+  (when (or (/= len 24) (> (+ off 24) (length octets)))
+    (return-from parse-original-writer-info (values nil nil)))
+  (let ((guid (make-array 16 :element-type '(unsigned-byte 8)))
+        (high 0)
+        (low  0))
+    (replace guid octets :start1 0 :end1 16 :start2 off :end2 (+ off 16))
+    (setf high (logior (aref octets (+ off 16))
+                       (ash (aref octets (+ off 17)) 8)
+                       (ash (aref octets (+ off 18)) 16)
+                       (ash (aref octets (+ off 19)) 24)))
+    (setf low  (logior (aref octets (+ off 20))
+                       (ash (aref octets (+ off 21)) 8)
+                       (ash (aref octets (+ off 22)) 16)
+                       (ash (aref octets (+ off 23)) 24)))
+    (when (>= high #x80000000) (setf high (- high #x100000000)))
+    (values guid (+ low (* high #x100000000)))))
+
+(defun* write-original-writer-info-parameter (cursor guid sn)
+    (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (16)) (integer 0)) fixnum)
+  "Write a complete PID_ORIGINAL_WRITER_INFO parameter (pid + len=24 + body) via WRITE-PARAMETER.
+   RTPS 2.5 §8.3.5.4 / Table 9.12; 24-octet body is always a multiple of 4, no padding needed."
+  (write-parameter cursor +pid-original-writer-info+ (encode-original-writer-info guid sn) 0 24))
 
 (defun* write-parameter (cursor pid value off len)
     (function (dds.core.buffer:cursor (unsigned-byte 16) (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) fixnum)

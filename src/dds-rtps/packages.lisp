@@ -71,6 +71,10 @@
            #:+pid-status-info+ #:+pid-data-representation+
            #:+pid-type-information+ #:+pid-type-object-lb+ #:+pid-shmem-host-uuid+
            #:+pid-zerocopy-capable+
+           #:+pid-entity-virtual-guid+ #:+pid-service-kind+ #:+service-kind-persistence+
+           #:+pid-original-writer-info+
+           #:encode-original-writer-info #:parse-original-writer-info
+           #:write-original-writer-info-parameter
            #:write-parameter #:write-parameter-sentinel #:parse-parameter-list
            #:spdp-multicast-port #:spdp-unicast-port
            #:user-multicast-port #:user-unicast-port
@@ -94,6 +98,7 @@
            #:reader-proxy #:reader-proxy-acked-base #:reader-proxy-unsent-base
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
            #:reader-acknack #:reader-on-gap #:reader-complete-p #:init-writer-proxy-durability
+           #:reader-dedup-accept-p #:rtps-reader-dedup-map
            #:get-writer-proxy #:writer-proxy #:writer-proxy-received #:writer-proxy-last-sn #:writer-proxy-first-sn
            #:writer-proxy-skip-history
            #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments* #:*max-gap-range*
@@ -145,6 +150,8 @@
            #:endpoint-data-type-name #:endpoint-data-qos
            #:endpoint-data-type-information #:endpoint-data-type-object-lb
            #:endpoint-data-zerocopy-capable
+           #:endpoint-data-entity-virtual-guid #:endpoint-data-service-kind
            #:serialize-endpoint-data #:parse-endpoint-data #:endpoint-match-p
+           #:+pid-entity-virtual-guid+ #:+pid-service-kind+ #:+service-kind-persistence+
            #:run-sedp-test #:run-data-representation-wire-test
            #:run-data-representation-malformed-test))

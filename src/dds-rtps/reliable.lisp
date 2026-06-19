@@ -131,8 +131,10 @@
   (or (gethash reader-id (rtps-writer-proxies writer))
       (setf (gethash reader-id (rtps-writer-proxies writer)) (make-reader-proxy))))
 
-(defun* writer-write (writer payload &optional (key-hash nil))
-    (function (rtps-writer (array (unsigned-byte 8) (*)) &optional (or null (array (unsigned-byte 8) (*))))
+(defun* writer-write (writer payload &optional (key-hash nil) (inline-qos nil))
+    (function (rtps-writer (array (unsigned-byte 8) (*))
+               &optional (or null (array (unsigned-byte 8) (*)))
+                         (or null (simple-array (unsigned-byte 8) (*))))
               (or integer (eql :timeout)))
   "Add a new :data change to the writer's HistoryCache; return its sequence number, OR the :timeout sentinel
    (RETCODE_TIMEOUT) if a FULL KEEP_ALL cache (RESOURCE_LIMITS max_samples) did not free a slot within the
@@ -142,26 +144,38 @@
    NEVER returns :timeout — byte-identical to the prior behaviour. On :timeout the cache is left intact and
    NO sequence number is consumed (the reliable SN stream stays hole-free). KEY-HASH (WP-KEEPLAST, ADR 0019,
    DDS 1.4 §2.2.3.18) is the sample's 16-octet instance handle recorded on the change for per-instance
-   KEEP_LAST eviction; NIL (the default) keeps the change's instance-key-hash unset — byte-identical to before."
+   KEEP_LAST eviction; NIL (the default) keeps the change's instance-key-hash unset — byte-identical to before.
+   INLINE-QOS (WP-DURABILITY-DEDUP, RTPS 2.5 §9.4.5.4 / §9.4.2.11): a complete PID_SENTINEL-terminated
+   ParameterList octet vector stored on the change's inline-qos slot; the small-DATA emit path (dataplane.lisp
+   %data-builder) passes it to write-data :inline-qos; the DATA_FRAG path (%sample-plan) does NOT carry
+   inline-QoS (RTPS 2.5 §9.4.5.5 makes it optional; relay samples are always small, never fragment).
+   NIL (the default) → no Q-bit, no extra bytes — byte-identical to the prior behaviour."
   (%writer-add-bounded
    writer (lambda (sn) (dds.rtps.history:make-cache-change
-                        :sn sn :serialized-payload payload :instance-key-hash key-hash))))
+                        :sn sn :serialized-payload payload :instance-key-hash key-hash
+                        :inline-qos inline-qos))))
 
-(defun* writer-lifecycle-change (writer key-hash status-flags)
-    (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)) (or integer (eql :timeout)))
+(defun* writer-lifecycle-change (writer key-hash status-flags &optional (inline-qos nil))
+    (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)
+               &optional (or null (simple-array (unsigned-byte 8) (*))))
+              (or integer (eql :timeout)))
   "Add a dispose/unregister change for the instance named by KEY-HASH (16 octets) to the
    writer's HistoryCache and return its sequence number (RTPS 2.5 §9.6.4.9), OR the :timeout sentinel
    (RETCODE_TIMEOUT) under the SAME block-up-to-max_blocking_time backpressure as writer-write — a
    lifecycle change occupies a real SN (RTPS 2.5 §8.4.2.2) so it counts toward the cache bound and is
    treated CONSISTENTLY with a DATA write (ADR 0016 §Backpressure; the bound applies to all changes).
    STATUS-FLAGS is the StatusInfo_t flag octet; the change KIND (:dispose/:unregister) is derived from it
-   (status-info->kind). The change carries NO serializedPayload — the instance is identified by its key
-   hash — yet is reliably ordered and ACKNACK-repairable like any DATA. For a writer with no finite
-   max_samples this never blocks and never returns :timeout (byte-identical to before)."
+   (status-info->kind). INLINE-QOS (optional, default NIL): a PID_SENTINEL-terminated ParameterList
+   vector attached to the change (e.g. PID_ORIGINAL_WRITER_INFO for relay, RTPS 2.5 §9.4.5.4);
+   NIL = no Q-bit, byte-identical to prior behaviour. The change carries NO serializedPayload —
+   the instance is identified by its key hash — yet is reliably ordered and ACKNACK-repairable
+   like any DATA. For a writer with no finite max_samples this never blocks and never returns
+   :timeout (byte-identical to before)."
   (%writer-add-bounded
    writer (lambda (sn) (dds.rtps.history:make-cache-change
                         :sn sn :kind (dds.rtps.message:status-info->kind status-flags)
-                        :instance-key-hash key-hash :status-info status-flags))))
+                        :instance-key-hash key-hash :status-info status-flags
+                        :inline-qos inline-qos))))
 
 (defun* writer-heartbeat (writer)
     (function (rtps-writer) (values integer integer integer))
@@ -322,9 +336,17 @@
   (durability-applied-p nil :type boolean) ; latch: the skip is applied once, on the first HEARTBEAT
   (reassembly (make-hash-table :test 'eql) :type hash-table)) ; SN -> frag-reassembly
 
+(defstruct* (dedup-origin (:constructor %make-dedup-origin))
+  "Per-original-GUID dedup state: contiguous low-watermark LO + bounded out-of-order set ABOVE.
+   In-order traffic keeps ABOVE EMPTY (LO just advances), O(1)/GUID. NFR-MEM. RTPS 2.5 §8.3.5.4."
+  (lo 0 :type integer)
+  (above (make-hash-table :test 'eql) :type hash-table))
+
 (defstruct* (rtps-reader (:constructor make-rtps-reader))
-  "Stateful reliable RTPS reader (RTPS 2.5 §8.4.10): an opaque-writer-key -> WriterProxy table."
-  (proxies (make-hash-table :test 'equalp) :type hash-table))   ; writer key (opaque, equalp) -> writer-proxy
+  "Stateful reliable RTPS reader (RTPS 2.5 §8.4.10): an opaque-writer-key -> WriterProxy table
+   plus an original-GUID dedup map for relay-forwarded samples (§8.3.5.4)."
+  (proxies  (make-hash-table :test 'equalp) :type hash-table)   ; writer key (opaque, equalp) -> writer-proxy
+  (dedup-map (make-hash-table :test 'equalp) :type hash-table)) ; original-GUID[16] -> dedup-origin
 
 (defun* get-writer-proxy (reader writer-id)
     (function (rtps-reader t) writer-proxy)
@@ -335,6 +357,43 @@
    get independent received-SN sets / HEARTBEAT ranges / ACKNACK / GAP / reassembly state."
   (or (gethash writer-id (rtps-reader-proxies reader))
       (setf (gethash writer-id (rtps-reader-proxies reader)) (make-writer-proxy))))
+
+(defun* reader-dedup-accept-p (reader original-guid original-sn)
+    (function (rtps-reader (or null (simple-array (unsigned-byte 8) (16))) (or null integer)) boolean)
+  "Original-GUID per-SN dedup gate for relay-forwarded samples (RTPS 2.5 §8.3.5.4).
+   Returns T (accept + record) when ORIGINAL-GUID is nil (PID absent — normal non-relayed path,
+   never consults the map) or (ORIGINAL-GUID, ORIGINAL-SN) not yet seen; returns NIL (duplicate,
+   discard) when this exact (GUID, SN) pair was already delivered. Per-GUID contiguous-watermark
+   design: LO is the highest SN advanced through contiguously (every SN <= LO is known-delivered);
+   ABOVE is the bounded out-of-order set for SNs > LO not yet compacted into LO. In-order traffic
+   keeps ABOVE EMPTY — LO just advances, O(1)/GUID (NFR-MEM). At the *max-gap-range* cap, the
+   HIGHEST entry in ABOVE is shed (never LO is advanced past an un-arrived SN) — the only residual
+   is a benign duplicate if that high out-of-order SN re-arrives; silent loss cannot occur.
+   INERT when ORIGINAL-GUID is nil."
+  (if (null original-guid)
+      t                                                   ; no PID -> normal path, always accept
+      (let* ((outer (rtps-reader-dedup-map reader))
+             (origin (or (gethash original-guid outer)
+                         (let ((o (%make-dedup-origin)))
+                           (setf (gethash original-guid outer) o)
+                           o)))
+             (lo (dedup-origin-lo origin))
+             (above (dedup-origin-above origin)))
+        (cond
+          ((<= original-sn lo) nil)                      ; below watermark: already delivered
+          ((gethash original-sn above) nil)              ; in out-of-order set: already delivered
+          (t                                             ; ACCEPT
+           (setf (gethash original-sn above) t)
+           ;; NFR-MEM cap: shed the HIGHEST entry so lo never skips an un-arrived gap SN;
+           ;; if the shed SN re-arrives it becomes a benign duplicate (never silent loss)
+           (when (> (hash-table-count above) *max-gap-range*)
+             (let ((max-sn (loop for k being each hash-key of above maximize k)))
+               (remhash max-sn above)))
+           ;; advance watermark through the contiguous prefix in ABOVE
+           (loop while (gethash (1+ (dedup-origin-lo origin)) above)
+                 do (remhash (1+ (dedup-origin-lo origin)) above)
+                    (incf (dedup-origin-lo origin)))
+           t)))))
 
 (defun* reader-on-data (reader writer-id sn payload)
     (function (rtps-reader t integer (array (unsigned-byte 8) (*))) t)

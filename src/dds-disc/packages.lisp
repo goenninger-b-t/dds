@@ -29,7 +29,7 @@
            #:announce-participant #:announce-endpoints
            #:enable-publisher #:enable-subscriber
            #:%writer-durability-init #:%reader-durability-init #:finalize-writer-durability
-           #:publish-sample #:flush-batch #:disc-node-batch-max-samples #:enable-async
+           #:publish-sample #:publish-relay-sample #:publish-relay-lifecycle #:flush-batch #:disc-node-batch-max-samples #:enable-async
            #:flow-token-bucket #:flow-token-bucket-p #:make-flow-token-bucket
            #:flow-token-bucket-tokens #:flow-token-bucket-max-burst
            #:flow-controller #:flow-controller-p #:make-flow-controller #:destroy-flow-controller
@@ -44,6 +44,7 @@
            #:node-sample-writer #:node-sample-writer-guid #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
            #:dispose-instance #:unregister-instance
            #:node-lifecycle-change #:node-lifecycle-change-by-sn #:node-lifecycle-count #:node-lifecycle-sns
+           #:*datagram-sink*
            #:*debug-drop-fragment-numbers*
            #:*debug-drop-sample-numbers*
            ;; WP-SENDER-ERROR-RESILIENCE (FR-PF-2): the sender-thread emit guard + its observability + test affordance

@@ -405,18 +405,21 @@
 (defun* %data-builder (node change)
     (function (disc-node dds.rtps.history:cache-change) cons)
   "A (SIZE . BUILD-FN) packable item for the SMALL CHANGE (for %send-packed), dispatching on KIND (RTPS
-   2.5 §9.4.5.4): a :data change writes one DATA (write-data, D-flag, no inlineQos — byte-identical to
-   %send-sample's small branch), SIZE = 4 submsg-header + 20 body-prefix + payload; a :dispose/:unregister
+   2.5 §9.4.5.4): a :data change writes one DATA (write-data, D-flag, inline-qos from the change's slot
+   when non-nil — byte-identical to before when nil), SIZE = 4 + 20 + iq-len + payload; a :dispose/:unregister
    writes one no-payload DATA (write-data-dispose, flags E+Q, inlineQos PID_KEY_HASH + PID_STATUS_INFO,
    §9.6.4.9), SIZE = 4 + 52. SIZE is the exact submessage length — the fit bound %send-packed checks
    before writing so the datagram never overflows the buffer."
   (let ((sn (dds.rtps.history:cache-change-sn change))
         (wid (disc-node-user-writer-id node)))
     (if (eq (dds.rtps.history:cache-change-kind change) :data)
-        (let ((pl (dds.rtps.history:cache-change-serialized-payload change)))
-          (cons (+ 24 (length pl))
+        (let* ((pl (dds.rtps.history:cache-change-serialized-payload change))
+               (iq (dds.rtps.history:cache-change-inline-qos change))
+               (iq-len (if iq (length iq) 0)))
+          (cons (+ 24 iq-len (length pl))
                 (lambda (mc) (dds.rtps.message:write-data
-                              mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 (length pl)))))
+                              mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 (length pl)
+                              :inline-qos iq))))
         (let ((kh (dds.rtps.history:cache-change-instance-key-hash change))
               (si (dds.rtps.history:cache-change-status-info change)))
           (cons 56
@@ -469,15 +472,20 @@
    a DATA_FRAG submessage covering a fragment in *DEBUG-DROP-FRAGMENT-NUMBERS* are omitted (no thunk). The
    HEARTBEAT_FRAG count side-effect (writer-frag-heartbeat increments a counter) runs ONCE here — exactly as
    the prior flush-all ran it once — and the captured (lastfrag count) close over the thunk, so stepping is
-   byte-identical and does not double-count. No I/O: the step builds+sends each thunk."
+   byte-identical and does not double-count. No I/O: the step builds+sends each thunk.
+   NOTE: inline-QoS (cache-change-inline-qos) is carried ONLY on the small-DATA path (%data-builder above);
+   this DATA_FRAG path does NOT thread inline-QoS — RTPS 2.5 §9.4.5.5 makes it optional, and relay samples
+   are ShapeType-sized, always below *fragment-size*, so they never reach this branch."
   (let ((size (length pl))
         (wid (disc-node-user-writer-id node)))
     (if (<= size dds.rtps.reliable:*fragment-size*)
         (if (and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*))
             '()
             (list (%msg-datagram node
-                                 (lambda (mc) (dds.rtps.message:write-data
-                                               mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 size)))))
+                                 (lambda (mc)
+                                   ; inline-QoS intentionally not threaded here — only %data-builder carries it (DATA_FRAG/large-sample path; durability relay uses small DATA only)
+                                   (dds.rtps.message:write-data
+                                     mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 size)))))
         (let ((thunks '()))
           (dolist (desc (dds.rtps.reliable:writer-frag-plan size dds.rtps.reliable:*fragment-size* budget))
             (destructuring-bind (fstart fcount off len) desc
@@ -983,6 +991,65 @@
     (t nil))   ; batch size trigger not reached: defer to the next flush (cadence or fill)
   t)
 
+(defun* %build-original-writer-info-iq (guid sn)
+    (function ((simple-array (unsigned-byte 8) (16)) (integer 0))
+              (simple-array (unsigned-byte 8) (*)))
+  "Build a 32-octet PID_SENTINEL-terminated inline-QoS block carrying PID_ORIGINAL_WRITER_INFO for the
+   given (GUID, SN). Returns a fresh octet vector: 28 bytes PID_ORIGINAL_WRITER_INFO parameter (pid 2 +
+   len 2 + body 24) + 4 bytes PID_SENTINEL = 32. RTPS 2.5 §8.3.5.4 / §9.4.2.11 / Table 9.12.
+   Called only from publish-relay-sample — off the hot path (relay/control-plane publish)."
+  (let* ((scratch (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (buf (dds.core.buffer:octet-buffer-over scratch))
+         (mc (dds.core.buffer:cursor buf :endianness :little)))
+    (dds.rtps.message:write-original-writer-info-parameter mc guid sn)
+    (dds.rtps.message:write-parameter-sentinel mc)
+    scratch))
+
+(defun* publish-relay-sample (node payload original-guid original-sn &optional (key-hash nil))
+    (function (disc-node (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (16)) (integer 0)
+               &optional (or null (array (unsigned-byte 8) (*))))
+              (or (eql t) (eql :timeout)))
+  "Publish PAYLOAD as a RELAY write: identical to PUBLISH-SAMPLE but attaches PID_ORIGINAL_WRITER_INFO
+   (ORIGINAL-GUID, ORIGINAL-SN) as inline-QoS on the emitted DATA (RTPS 2.5 §8.3.5.4 / §9.4.5.4).
+   PUBLISH-SAMPLE remains byte-identical (no PID, Q-bit clear). KEY-HASH mirrors publish-sample's arg
+   (WP-KEEPLAST instance handle, default NIL). Returns T normally, :timeout under the same
+   block-up-to-max_blocking_time backpressure as publish-sample (ADR 0016). The inline-QoS block is
+   built off-heap by %build-original-writer-info-iq (32 octets; off the hot path — relay is control-plane).
+   Inline-QoS is scoped to small (non-fragmented) DATA samples (%data-builder); the DATA_FRAG path
+   (%sample-plan) does NOT carry it — RTPS 2.5 §9.4.5.5 makes it optional, and relay samples
+   (ShapeType-sized) are always below *fragment-size* and never fragment."
+  (let ((iq (%build-original-writer-info-iq original-guid original-sn)))
+    (when (eq :timeout (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload key-hash iq))
+      (return-from publish-relay-sample :timeout))
+    (cond
+      ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))
+      ((disc-node-async-thread node) (%async-signal node))
+      ((>= (incf (disc-node-batch-pending node)) (disc-node-batch-max-samples node)) (flush-batch node))
+      (t nil))
+    t))
+
+(defun* publish-relay-lifecycle (node key-hash status-flags original-guid original-sn)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) (unsigned-byte 8)
+               (simple-array (unsigned-byte 8) (16)) (integer 0))
+              (or (eql t) (eql :timeout)))
+  "Replay a dispose/unregister as a RELAY lifecycle change: identical to %dispose-or-unregister
+   but attaches PID_ORIGINAL_WRITER_INFO (ORIGINAL-GUID, ORIGINAL-SN) as inline-QoS on the
+   emitted DATA (RTPS 2.5 §9.4.5.4) so the late-joiner can dedup it against a direct dispose
+   from the original writer. KEY-HASH is the instance key hash, STATUS-FLAGS the StatusInfo_t
+   octet (Disposed / Unregistered / both). Returns T normally, :timeout under the same
+   backpressure as %dispose-or-unregister."
+  (let* ((iq (%build-original-writer-info-iq original-guid original-sn))
+         (sn (dds.rtps.reliable:writer-lifecycle-change
+              (disc-node-user-writer node) key-hash status-flags iq)))
+    (when (eq sn :timeout) (return-from publish-relay-lifecycle :timeout))
+    (setf (disc-node-batch-pending node) 0)
+    (cond
+      ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))
+      ((disc-node-async-thread node) (%async-signal node))
+      (t (%push-data node)))
+    t))
+
 (defun* %dispose-or-unregister (node key-hash status-flags)
     (function (disc-node (simple-array (unsigned-byte 8) (16)) (unsigned-byte 8)) (or integer (eql :timeout)))
   "Writer side: add a dispose/unregister change for the instance named by KEY-HASH (16 octets)
@@ -1224,45 +1291,62 @@
             ;; clamped payload length from the slot header at acquire, so a forged wire LEN cannot widen a read.
             (%make-zc-loan-marker :pool-sap sap :slot-index slot :generation gen :len slot-bytes))))))
 
-(defun* %deliver-user-marker (node writer-id sn marker src-prefix)
+(defun* %deliver-user-marker (node writer-id sn marker src-prefix effective-guid effective-sn)
     (function (disc-node (unsigned-byte 32) integer zc-loan-marker
-              (simple-array (unsigned-byte 8) (12))) t)
+              (simple-array (unsigned-byte 8) (12))
+              (simple-array (unsigned-byte 8) (16)) integer) t)
   "WP-FLATDATA-ZC-LOAN (R6, ADR 0017): store the UNRESOLVED ZC-LOAN-MARKER as the sample value (mirrors
    %deliver-user-sample, but the value is the marker, not an octet-vector). The reliable-reader proxy is still
    fed the marker as the change so ACKNACK/HEARTBEAT bookkeeping advances; the 2-level (source-GUID -> SN) store
    keeps the marker so DCPS %drain can acquire-for-read it. ON-SAMPLE fires outside the node lock. NOT cleared
-   for ship — pending counsel (R6)."
+   for ship — pending counsel (R6). EFFECTIVE-GUID/EFFECTIVE-SN are the logical-origin GUID+SN for dedup
+   (orig-guid/orig-sn on the relay path; wire GUID+SN on the direct path) per RTPS 2.5 §8.3.5.4."
   (let ((guid (%source-guid src-prefix writer-id)))
+    ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too)
     (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn
                                       (make-array 0 :element-type '(unsigned-byte 8)))
-    (dds.pal:with-lock ((disc-node-lock node))
-      (setf (gethash sn (%inner-table (disc-node-samples node) guid)) marker
-            (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
-            (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)))
-  (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))
+    ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
+    (when (dds.rtps.reliable:reader-dedup-accept-p (disc-node-user-reader node)
+                                                   effective-guid effective-sn)
+      (dds.pal:with-lock ((disc-node-lock node))
+        (setf (gethash sn (%inner-table (disc-node-samples node) guid)) marker
+              (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
+              (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid))
+      (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))))
   t)
 
-(defun* %deliver-user-sample (node writer-id sn vec src-prefix)
+(defun* %deliver-user-sample (node writer-id sn vec src-prefix effective-guid effective-sn)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
-              (simple-array (unsigned-byte 8) (12))) t)
+              (simple-array (unsigned-byte 8) (12))
+              (simple-array (unsigned-byte 8) (16)) integer) t)
   "Feed a complete user sample VEC (SN from WRITER-ID at SRC-PREFIX) to the reliable reader, record it
    under the 2-level (source-GUID -> SN) store (payload + writer EntityId for the S2 writers-set + full
    source GUID for S1 EXCLUSIVE ownership arbitration), then fire ON-SAMPLE outside the node lock
    (DATA_AVAILABLE + WaitSet wake). Two-level keying by GUID then SN avoids a per-sample composite-key
    alloc (NFR-MEM) and stops two writers sharing EntityId 0x102 from aliasing in the SN space
-   (§8.3.5.4); ONE %source-guid per sample is reused for the reliable-reader proxy key AND the three inner tables."
+   (§8.3.5.4); ONE %source-guid per sample is reused for the reliable-reader proxy key AND the three inner tables.
+   EFFECTIVE-GUID/EFFECTIVE-SN are the logical-origin GUID+SN for dedup (orig-guid/orig-sn on the relay
+   path; wire GUID+SN on the direct path) per RTPS 2.5 §8.3.5.4."
   (let ((guid (%source-guid src-prefix writer-id)))
+    ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too)
     (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn vec)
-    (dds.pal:with-lock ((disc-node-lock node))
-      (setf (gethash sn (%inner-table (disc-node-samples node) guid)) vec
-            (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
-            (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)))
-  (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))
+    ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
+    (when (dds.rtps.reliable:reader-dedup-accept-p (disc-node-user-reader node)
+                                                   effective-guid effective-sn)
+      (dds.pal:with-lock ((disc-node-lock node))
+        (setf (gethash sn (%inner-table (disc-node-samples node) guid)) vec
+              (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
+              (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid))
+      (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))))
   t)
 
-(defun* %on-user-data (node writer-id sn buf poff plen src-prefix)
+(defun* %on-user-data (node writer-id sn buf poff plen src-prefix
+                       &optional orig-guid orig-sn)
     (function (disc-node (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)
-              (simple-array (unsigned-byte 8) (12))) t)
+              (simple-array (unsigned-byte 8) (12))
+              &optional
+              (or null (simple-array (unsigned-byte 8) (16)))
+              (or null integer)) t)
   "Reader side: deliver the DATA SerializedPayload at BUF[poff,poff+plen). WP-ZEROCOPY (FR-PF-3, ADR
    0014): when this node has a ZC pool (which exists iff *zerocopy-enabled* was set at make-disc-node —
    the gate is the SLOT, not the special, because this runs on the receiver thread where a dynamic
@@ -1277,20 +1361,27 @@
    UNRESOLVED ZC-LOAN-MARKER (%zc-defer) and NOT released — the slot stays loaned via the writer's refcount so
    DCPS take-loaned reads it in place (literal 0 intra-host copies) and return-loan releases it; releasing here
    would free the slot before the app's later read (use-after-free). A non-loan-capable reader keeps the shipped
-   resolve-copy-release path (%zc-try-resolve), byte-unchanged."
-  (let ((zc (cond
-              ((null (disc-node-zc-pool node)) :not-a-ref)         ; the pool's existence == ZC armed at make-disc-node (slot, not the special: this runs on the receiver thread, where a dynamic binding of *zerocopy-enabled* is invisible — mirrors disc-node-shmem); ZC off -> never inspected -> normal path
-              ((disc-node-zc-loan-capable node)                    ; loan-capable: DEFER (store unresolved marker, hold the slot)
-               (%zc-defer node buf poff plen src-prefix))
-              (t (%zc-try-resolve node buf poff plen src-prefix))))) ; shipped path: resolve-copy-release
+   resolve-copy-release path (%zc-try-resolve), byte-unchanged.
+   ORIG-GUID/ORIG-SN: from PID_ORIGINAL_WRITER_INFO (§8.3.5.4) on relay-forwarded samples; NIL on direct
+   path. The effective logical-origin (orig-guid or wire-guid, orig-sn or wire-sn) is computed here and
+   threaded into %deliver-user-sample/%deliver-user-marker for the dedup gate."
+  ;; effective-guid/sn: relay path uses PID values; direct path uses the wire writer GUID + SN
+  (let* ((eff-guid (or orig-guid (%source-guid src-prefix writer-id)))
+         (eff-sn   (or orig-sn sn))
+         (zc (cond
+               ((null (disc-node-zc-pool node)) :not-a-ref)         ; ZC off -> normal path
+               ((disc-node-zc-loan-capable node)
+                (%zc-defer node buf poff plen src-prefix))
+               (t (%zc-try-resolve node buf poff plen src-prefix)))))
     (cond
       ((null zc))                                                   ; armed + ref present but defer/resolve FAILED -> drop (best-effort)
-      ((eq zc :not-a-ref)                                           ; normal payload (or ZC off): existing path, byte-identical
+      ((eq zc :not-a-ref)                                           ; normal payload (or ZC off)
        (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
          (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
-         (%deliver-user-sample node writer-id sn vec src-prefix)))
-      ((zc-loan-marker-p zc) (%deliver-user-marker node writer-id sn zc src-prefix)) ; loan-capable: the unresolved marker
-      (t (%deliver-user-sample node writer-id sn zc src-prefix)))   ; resolved ZC payload (non-loan-capable)
+         (%deliver-user-sample node writer-id sn vec src-prefix eff-guid eff-sn)))
+      ((zc-loan-marker-p zc)
+       (%deliver-user-marker node writer-id sn zc src-prefix eff-guid eff-sn)) ; loan-capable: the unresolved marker
+      (t (%deliver-user-sample node writer-id sn zc src-prefix eff-guid eff-sn))) ; resolved ZC payload (non-loan-capable)
     t))
 
 (defun* %on-user-heartbeat (node c flags src-prefix)
@@ -1386,7 +1477,8 @@
         (replace region (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
         (let ((done (dds.rtps.reliable:reader-on-data-frag
                      (disc-node-user-reader node) wguid sn fstart frags fsize ssize region)))
-          (when done (%deliver-user-sample node wtr sn done src-prefix))))))
+          ;; DATA_FRAG: no relay forwarding -> wire GUID/SN are the logical origin (no PID_ORIGINAL_WRITER_INFO on frags)
+          (when done (%deliver-user-sample node wtr sn done src-prefix wguid sn))))))
   t)
 
 (defun* %on-user-heartbeat-frag (node c flags src-prefix)
@@ -1462,7 +1554,8 @@
    add-local-reader."
   (setf (disc-node-user-reader node) (dds.rtps.reliable:make-rtps-reader))
   (setf (disc-node-on-data node)
-        (lambda (wid sn buf poff plen src-prefix) (%on-user-data node wid sn buf poff plen src-prefix)))
+        (lambda (wid sn buf poff plen src-prefix &optional og os)
+          (%on-user-data node wid sn buf poff plen src-prefix og os)))
   (setf (disc-node-on-lifecycle node)
         (lambda (wid sn kind kh sf src-prefix) (%on-user-lifecycle node wid sn kind kh sf src-prefix)))
   (setf (disc-node-on-heartbeat node)

@@ -678,6 +678,174 @@
                                  i argv env))))))
   t)
 
+;;; ---- WP-DURABILITY-DEDUP PID_ORIGINAL_WRITER_INFO parse fuzz (NFR-SEC-POSTURE) ----
+;;;; PARSE-ORIGINAL-WRITER-INFO and PARSE-INLINE-QOS-KEY-STATUS are network-facing: a
+;;;; malformed PID body (wrong len, short buffer, oversized len, zero len) MUST return
+;;;; (values nil nil) or a valid parse, NEVER an OOB read or uncaught signal — at any
+;;;; safety level. PARSE-INLINE-QOS-KEY-STATUS walks a random ParameterList with a
+;;;; random body-end bound: MUST return 5 values, NEVER signal.  Both checks include a
+;;;; (safety 0) wrapper that confirms all guards are safety-independent.
+
+(defun* %gen-owi-fuzz-octets (prng)
+    (function (prng) (values (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)))
+  "Generate adversarial (octets off len) for PARSE-ORIGINAL-WRITER-INFO.
+   Length families: zero, short (<24), exact (24), long (>24), huge (wire-controlled),
+   random; offset sweeps: 0, 1, past-end, and mid-buffer.
+   Returns (values octets off len)."
+  (let* ((len-family (prng-int prng 0 6))
+         (len (ecase len-family
+                (0 0)
+                (1 (prng-int prng 1 23))
+                (2 24)
+                (3 (prng-int prng 25 64))
+                (4 (prng-int prng 0 #xFFFF))
+                (5 (prng-int prng 0 4))
+                (6 (prng-int prng 0 255))))
+         (buf-n (prng-int prng 0 (+ 24 (prng-int prng 0 16))))
+         (octets (make-array buf-n :element-type '(unsigned-byte 8)))
+         (off-family (prng-int prng 0 3))
+         (off (case off-family
+                (0 0)
+                (1 (if (> buf-n 0) (prng-int prng 0 (1- buf-n)) 0))
+                (2 buf-n)
+                (t (+ buf-n (prng-int prng 1 8))))))
+    (dotimes (i buf-n) (setf (aref octets i) (prng-int prng 0 255)))
+    (values octets off len)))
+
+(defun* %owi-parse-safety0 (octets off len)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0)) t)
+  "Call PARSE-ORIGINAL-WRITER-INFO at (SAFETY 0). The explicit manual bounds check
+   (when (or (/= len 24) (> (+ off 24) (length octets))) ...) is safety-independent.
+   Returns T if it returned NIL-NIL or a valid GUID+SN; NIL if it signalled."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (handler-case
+      (multiple-value-bind (g s) (dds.rtps.message:parse-original-writer-info octets off len)
+        (or (and (null g) (null s))
+            (and (typep g '(simple-array (unsigned-byte 8) (16)))
+                 (integerp s))))
+    (error () nil)))
+
+(defun* %inline-qos-parse-safety0 (ob be)
+    (function (dds.core.buffer:octet-buffer fixnum) t)
+  "Call PARSE-INLINE-QOS-KEY-STATUS at (SAFETY 0). The walker guards every read
+   against body-end before advancing, so it is safety-independent. Returns T if
+   it returned 5 values without signalling; NIL if it signalled."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (handler-case
+      (multiple-value-bind (kh sf ok g sn)
+          (dds.rtps.message:parse-inline-qos-key-status (dds.core.buffer:cursor ob) be)
+        (declare (ignore kh sf ok g sn))
+        t)
+    (error () nil)))
+
+(defun* %gen-inline-qos-blob (prng)
+    (function (prng) (values (simple-array (unsigned-byte 8) (*)) fixnum))
+  "Generate an adversarial inline-QoS byte blob + a random body-end for
+   PARSE-INLINE-QOS-KEY-STATUS.  Body families: empty, short (<4), a
+   valid-looking PID_ORIGINAL_WRITER_INFO block, a PID_SENTINEL, a
+   PID_KEY_HASH, a junk PID, and pure random bytes."
+  ;; 7 families: indices 0..6 inclusive
+  (let* ((family (prng-int prng 0 6))
+         (v (ecase family
+              (0 (make-array 0 :element-type '(unsigned-byte 8)))
+              (1 (let ((n (prng-int prng 1 3)))
+                   (let ((a (make-array n :element-type '(unsigned-byte 8))))
+                     (dotimes (i n) (setf (aref a i) (prng-int prng 0 255)))
+                     a)))
+              (2 ;; well-formed OWI PID (pid=0x0061 LE, len=24 LE, 24 random body bytes) + sentinel
+               (let ((a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                 (setf (aref a 0) #x61 (aref a 1) #x00 (aref a 2) 24 (aref a 3) 0)
+                 (dotimes (i 24) (setf (aref a (+ 4 i)) (prng-int prng 0 255)))
+                 (setf (aref a 28) #x01 (aref a 29) #x00 (aref a 30) 0 (aref a 31) 0)
+                 a))
+              (3 ;; PID_SENTINEL only
+               (make-array 4 :element-type '(unsigned-byte 8)
+                            :initial-contents '(#x01 #x00 #x00 #x00)))
+              (4 ;; PID_KEY_HASH (pid=0x0070 LE, len=16) + 16 random bytes + sentinel
+               (let ((a (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0)))
+                 (setf (aref a 0) #x70 (aref a 1) #x00 (aref a 2) 16 (aref a 3) 0)
+                 (dotimes (i 16) (setf (aref a (+ 4 i)) (prng-int prng 0 255)))
+                 (setf (aref a 20) #x01 (aref a 21) #x00 (aref a 22) 0 (aref a 23) 0)
+                 a))
+              (5 ;; junk PID with adversarial plen (may overrun)
+               (let* ((n (prng-int prng 4 64))
+                      (a (make-array n :element-type '(unsigned-byte 8))))
+                 (dotimes (i n) (setf (aref a i) (prng-int prng 0 255)))
+                 a))
+              (6 (let* ((n (prng-int prng 0 128))
+                        (a (make-array n :element-type '(unsigned-byte 8))))
+                   (dotimes (i n) (setf (aref a i) (prng-int prng 0 255)))
+                   a))))
+         (n (length v))
+         (body-end-family (prng-int prng 0 4))
+         (body-end (case body-end-family
+                     (0 0)
+                     (1 n)
+                     (2 (if (> n 0) (prng-int prng 0 n) 0))
+                     (3 (+ n (prng-int prng 1 16)))
+                     (t (prng-int prng 0 (+ n 32))))))
+    (values v (max 0 body-end))))
+
+(defun* fuzz-original-writer-info-parse ()
+    (function () t)
+  "Property-based fuzz of PARSE-ORIGINAL-WRITER-INFO + PARSE-INLINE-QOS-KEY-STATUS
+   (WP-DURABILITY-DEDUP, NFR-SEC-POSTURE; RTPS 2.5 §8.3.5.4).
+
+   Arm A — PARSE-ORIGINAL-WRITER-INFO: feed random (octets off len) from adversarial
+   families (zero/short/<24/exact-24/oversized/huge len; off=0/mid/past-end/beyond-buf).
+   The explicit manual guard (when (or (/= len 24) (> (+ off 24) (length octets))) ...)
+   is safety-independent, so the result MUST be (values nil nil) or a valid (GUID SN)
+   — NEVER an OOB read or uncaught signal.  A (safety 0) wrapper confirms the guard is
+   safety-independent and reaches the same verdict.
+
+   Arm B — PARSE-INLINE-QOS-KEY-STATUS: feed a cursor over a random byte blob + a
+   random body-end (may be < 0, > buf-len, or past the blob).  The walker is
+   bounds-checked against body-end before every read; it MUST return 5 values and NEVER
+   signal, regardless of blob content.  Deterministic + seeded; 2000 iterations."
+  (let ((prng (make-prng #x0C19B01D))
+        (iters 2000))
+    ;; Arm A: parse-original-writer-info
+    (dotimes (i iters)
+      (multiple-value-bind (octets off len) (%gen-owi-fuzz-octets prng)
+        (let ((prod-ok (handler-case
+                           (multiple-value-bind (g s) (dds.rtps.message:parse-original-writer-info octets off len)
+                             (or (and (null g) (null s))
+                                 (and (typep g '(simple-array (unsigned-byte 8) (16)))
+                                      (integerp s))))
+                         (error (e)
+                           (error 'test-failure :name "owi-parse-fuzz"
+                                  :detail (format nil "iter ~d off=~d len=~d buf=~d: production parse signalled: ~a"
+                                                  i off len (length octets) e)))))
+              (s0-ok (%owi-parse-safety0 octets off len)))
+          (unless prod-ok
+            (error 'test-failure :name "owi-parse-fuzz"
+                   :detail (format nil "iter ~d off=~d len=~d buf=~d: production parse returned unexpected value" i off len (length octets))))
+          (unless s0-ok
+            (error 'test-failure :name "owi-parse-fuzz"
+                   :detail (format nil "iter ~d off=~d len=~d buf=~d: (safety 0) parse leaked OOB/error (guard is safety-dependent)" i off len (length octets)))))))
+    ;; Arm B: parse-inline-qos-key-status over random ParameterList blobs (prod + safety-0)
+    (dotimes (i iters)
+      (multiple-value-bind (blob body-end) (%gen-inline-qos-blob prng)
+        (let* ((ob (dds.core.buffer:octet-buffer-over blob))
+               (be (min body-end (length blob)))  ; body-end capped to buf extent for cursor validity
+               (prod-ok (handler-case
+                            (multiple-value-bind (kh sf ok g sn)
+                                (dds.rtps.message:parse-inline-qos-key-status
+                                 (dds.core.buffer:cursor ob) be)
+                              (declare (ignore kh sf ok g sn))
+                              t)
+                          (error (e)
+                            (error 'test-failure :name "inline-qos-parse-fuzz"
+                                   :detail (format nil "iter ~d blob=~d body-end=~d: parse-inline-qos-key-status signalled: ~a"
+                                                   i (length blob) body-end e)))))
+               (s0-ok (%inline-qos-parse-safety0 ob be)))
+          (declare (ignore prod-ok))
+          (unless s0-ok
+            (error 'test-failure :name "inline-qos-parse-fuzz"
+                   :detail (format nil "iter ~d blob=~d body-end=~d: (safety 0) parse-inline-qos-key-status signalled (guard safety-dependent)"
+                                   i (length blob) body-end))))))
+    t))
+
 ;;; ---- generators + properties ----
 
 (defun* gsample= (a b)
@@ -870,7 +1038,9 @@
     (run-flatdata-transcode-fuzz)
     ;; WP-DURABILITY-SERVICE-TRANSIENT config-parser fuzz: random/malformed argv+env -> clean error or valid result, never OOB (NFR-SEC-POSTURE); (safety 0) arm confirms explicit-manual-check guards
     (fuzz-durability-config)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0), deterministic seed.~%" runs)
+    ;; WP-DURABILITY-DEDUP PID_ORIGINAL_WRITER_INFO parse fuzz: random/short/oversized/off-end octets + inline-QoS blob walk; prod + safety-0 (NFR-SEC-POSTURE; RTPS 2.5 §8.3.5.4)
+    (fuzz-original-writer-info-parse)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0) + owi-parse fuzz 2000 iters (PID_ORIGINAL_WRITER_INFO parse: random/short/oversized/off-end octets + inline-QoS blob walk; BOTH arms prod + safety-0, NFR-SEC-POSTURE), deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

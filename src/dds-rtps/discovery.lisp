@@ -489,7 +489,15 @@
   ;; understands a 16-byte zero-copy reference in place of the SerializedPayload. Fail-open: an
   ;; absent/garbage PID parses NIL, so a non-ZC / cross-vendor peer simply gets normal DATA. NOT
   ;; cleared for ship — pending counsel (R6).
-  (zerocopy-capable nil :type boolean))
+  (zerocopy-capable nil :type boolean)
+  ;; PID_ENTITY_VIRTUAL_GUID (0x8002, RTI vendor): 16-byte GUID of the original writer this relay
+  ;; endpoint represents. Emitted in SEDP by a Persistence Service relay writer; triggers Connext
+  ;; receiver-side PID_ORIGINAL_WRITER_INFO dedup. NIL when absent (non-relay endpoints). When set,
+  ;; PID_SERVICE_KIND (0x8003) = PERSISTENCE_SERVICE is also emitted (ADR 0024 Task 8 / spike 2026-06-18).
+  (entity-virtual-guid nil :type (or null (simple-array (unsigned-byte 8) (16))))
+  ;; PID_SERVICE_KIND (0x8003, RTI vendor): u32 service role code; 0 = absent/not-a-service (default),
+  ;; +service-kind-persistence+ (1) = Persistence Service. Emitted only when non-zero.
+  (service-kind 0 :type (unsigned-byte 32)))
 
 (defun* serialize-endpoint-data (cursor data)
     (function (dds.core.buffer:cursor endpoint-data) fixnum)
@@ -569,6 +577,18 @@
     (multiple-value-bind (c vec) (%make-scratch 1)
       (dds.core.buffer:put-u8 c 1)
       (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-zerocopy-capable+ vec 0 1)))
+  ;; PID_ENTITY_VIRTUAL_GUID (0x8002, RTI vendor): 16-byte GUID of original writer; triggers
+  ;; Connext receiver-side PID_ORIGINAL_WRITER_INFO dedup (ADR 0024 Task 8, spike 2026-06-18).
+  (let ((vg (endpoint-data-entity-virtual-guid data)))
+    (when vg
+      (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-entity-virtual-guid+ vg 0 16)))
+  ;; PID_SERVICE_KIND (0x8003, RTI vendor): u32 LE role code; 1 = PERSISTENCE_SERVICE.
+  ;; Emitted alongside PID_ENTITY_VIRTUAL_GUID; absent on non-relay endpoints (spike 2026-06-18).
+  (let ((sk (endpoint-data-service-kind data)))
+    (when (plusp sk)
+      (multiple-value-bind (c vec) (%make-scratch 4)
+        (dds.core.buffer:put-u32 c sk)
+        (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-service-kind+ vec 0 4))))
   (dds.rtps.message:write-parameter-sentinel cursor))
 
 (defun* %fill-endpoint-param (data pid cursor len)
@@ -637,7 +657,17 @@
          (setf (endpoint-data-type-object-lb data) lb))))
     ((= pid dds.rtps.message:+pid-zerocopy-capable+)
      (when (>= len 1)   ; fail-open: a nonzero leading octet means ZC-capable (WP-ZEROCOPY, ADR 0014)
-       (setf (endpoint-data-zerocopy-capable data) (plusp (dds.core.buffer:get-u8 cursor))))))
+       (setf (endpoint-data-zerocopy-capable data) (plusp (dds.core.buffer:get-u8 cursor)))))
+    ((= pid dds.rtps.message:+pid-entity-virtual-guid+)
+     ;; PID_ENTITY_VIRTUAL_GUID (0x8002, RTI vendor): 16-byte GUID; fail-open on wrong length.
+     (when (>= len 16)
+       (let ((vg (make-array 16 :element-type '(unsigned-byte 8))))
+         (dds.core.buffer:get-octets cursor vg 0 16)
+         (setf (endpoint-data-entity-virtual-guid data) vg))))
+    ((= pid dds.rtps.message:+pid-service-kind+)
+     ;; PID_SERVICE_KIND (0x8003, RTI vendor): u32 LE role code; fail-open on wrong length.
+     (when (>= len 4)
+       (setf (endpoint-data-service-kind data) (dds.core.buffer:get-u32 cursor)))))
   data)
 
 (defun* parse-endpoint-data (cursor role)

@@ -830,3 +830,566 @@
                            (length (dds.durability:service-runner-services runner)))))
       (ignore-errors (dds.durability:runner-stop runner))))
   t)
+
+;;; --- relay emit test (Task 3) ---
+;;; Goal: the durability service's replay writer attaches PID_ORIGINAL_WRITER_INFO to every
+;;; relayed DATA, carrying the ORIGINAL publisher's GUID and SN (not the relay writer's).
+;;; Domain 67 avoids collisions with all prior tests.
+;;;
+;;; Approach:
+;;;   1. Start service + publisher (domain 67), let service collect N=3 samples.
+;;;   2. Stop the publisher (writer gone).
+;;;   3. Bring up a TL late-joiner; capture the service node's outbound datagrams via
+;;;      *datagram-sink* (bound around the late-joiner drain phase).
+;;;   4. Parse the captured datagrams: find DATA submessages with Q-bit set, walk the
+;;;      inline-QoS ParameterList to locate PID_ORIGINAL_WRITER_INFO (0x0061), extract
+;;;      (guid, sn), assert GUID == original publisher's GUID and SN is one of {1..N}.
+
+(defun* %parse-owi-from-datagram (datagram)
+    (function ((simple-array (unsigned-byte 8) (*))) list)
+  "Parse DATAGRAM (raw RTPS message bytes) and return a list of (guid . sn) pairs extracted
+   from any PID_ORIGINAL_WRITER_INFO parameters found in inline-QoS of DATA submessages.
+   Returns NIL if no such parameters are found. Bounds-checked throughout."
+  (let ((buf (dds.core.buffer:octet-buffer-over datagram))
+        (results '()))
+    (dds.rtps.message:dispatch-message
+     (dds.core.buffer:cursor buf :endianness :little)
+     (lambda (id flags cursor body-len)
+       (when (= id dds.rtps.message:+submsg-data+)
+         (let ((body-end (+ (dds.core.buffer:cursor-position cursor) body-len)))
+           (when (logtest flags dds.rtps.message:+data-flag-inline-qos+)
+             (let ((pos (dds.core.buffer:cursor-position cursor)))
+               (when (>= (- body-end pos) 20)
+                 (dds.core.buffer:cursor-set-position cursor (+ pos 20))
+                 (dds.rtps.message:parse-parameter-list
+                  cursor
+                  (lambda (pid c plen)
+                    (when (= pid dds.rtps.message:+pid-original-writer-info+)
+                      (let ((off (dds.core.buffer:cursor-position c)))
+                        (multiple-value-bind (g s)
+                            (dds.rtps.message:parse-original-writer-info
+                             (dds.core.buffer:octet-buffer-vec (dds.core.buffer:cursor-buffer c))
+                             off plen)
+                          (when g
+                            (push (cons g s) results)))))))))))))
+     (length datagram))
+    results))
+
+(defun* run-relay-emit-test ()
+    (function () t)
+  "Relay emit: service replay writer attaches PID_ORIGINAL_WRITER_INFO with the ORIGINAL
+   publisher's GUID + SN on every relayed DATA. Domain 67, loopback unicast, N=3 samples.
+   Captures the service node's outbound datagrams via *datagram-sink* during the late-joiner
+   drain phase and asserts: (1) every relayed DATA carries PID_ORIGINAL_WRITER_INFO; (2) its
+   GUID matches the original publisher's GUID; (3) its SN is one of the originals {1..N}."
+  (let* ((n 3)
+         (svc-store (dds.durability:make-memory-store))
+         (spec (dds.durability:make-service-spec
+                :domain 67
+                :topics '(("RSquare" . "ShapeType"))
+                :store (lambda () svc-store)
+                :name "relay-emit-test"))
+         (svc (dds.durability:make-durability-service spec :store svc-store))
+         (pub-prefix (%make-test-prefix #xD7))
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 67
+                                            :host "127.0.0.1" :port 0 :multicast nil))
+         ;; original publisher GUID: prefix + user-writer EntityId (0x00000102 = key 1, kind 02)
+         (orig-guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (replace g pub-prefix :end1 12)
+                      (setf (aref g 12) #x00 (aref g 13) #x00
+                            (aref g 14) #x01 (aref g 15) #x02)
+                      g)))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start svc)
+           (let ((svc-node (dds.durability:durability-service-node svc)))
+             ;; wire pub <-> service
+             (setf (dds.disc:disc-node-peers pub-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-node))))
+             (setf (dds.disc:disc-node-peers svc-node)
+                   (list (cons "127.0.0.1" 0)))
+             ;; configure publisher writer
+             (dds.disc:add-local-writer pub-node :topic "RSquare" :type "ShapeType"
+                                        :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                       :durability :transient-local))
+             (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+             (dds.disc:start-node pub-node)
+             (setf (dds.disc:disc-node-peers svc-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-node))))
+             ;; discovery
+             (%await-match pub-node svc-node :retries 300 :sleep-s 0.02)
+             ;; publish N samples
+             (dotimes (i n)
+               (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+             ;; drain until service has collected all N
+             (loop repeat 80
+                   do (%announce-both pub-node svc-node) (sleep 0.05))
+             (%await-store-count svc-store "RSquare" n)
+             (%check :relay-collect
+                     (= n (dds.durability:store-count svc-store "RSquare"))
+                     (format nil "service should collect ~d before pub stops, got ~d"
+                             n (dds.durability:store-count svc-store "RSquare")))
+             ;; STOP publisher — original writer gone
+             (ignore-errors (dds.disc:stop-node pub-node))
+             (sleep 0.1)
+             ;; bring up TL late-joiner
+             (let* ((lj-prefix (%make-test-prefix #xE7))
+                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 67
+                                                      :host "127.0.0.1" :port 0 :multicast nil))
+                    (captured (make-array 0 :element-type t :adjustable t :fill-pointer 0)))
+               (unwind-protect
+                    (progn
+                      (dds.disc:add-local-reader lj-node :topic "RSquare" :type "ShapeType"
+                                                 :qos (dds.qos:make-reader-qos
+                                                       :reliability :reliable
+                                                       :durability :transient-local))
+                      (dds.disc:enable-subscriber lj-node)
+                      (setf (dds.disc:disc-node-on-match lj-node)
+                            (lambda (kind remote)
+                              (when (eq kind :remote-writer)
+                                (dds.disc:%reader-durability-init
+                                 lj-node
+                                 (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                 (dds.qos:qos-durability
+                                  (dds.rtps.discovery:endpoint-data-qos remote))))))
+                      (dds.disc:start-node lj-node)
+                      ;; wire lj <-> service
+                      (setf (dds.disc:disc-node-peers lj-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-node))))
+                      (setf (dds.disc:disc-node-peers svc-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-node))))
+                      ;; capture ALL outbound datagrams during drain (global setf — the service
+                      ;; sends from its receiver thread, not the test thread, so a LET binding
+                      ;; would be invisible there; restore in unwind-protect)
+                      (unwind-protect
+                           (progn
+                             (setf dds.disc:*datagram-sink*
+                                   (lambda (dg) (vector-push-extend (copy-seq dg) captured)))
+                             (%await-match lj-node svc-node :retries 300 :sleep-s 0.02)
+                             (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005))
+                        (setf dds.disc:*datagram-sink* nil))
+                      ;; assert late-joiner got the samples
+                      (%check :relay-lj-count
+                              (= n (dds.disc:node-sample-count lj-node))
+                              (format nil "TL late-joiner expected ~d relayed samples, got ~d"
+                                      n (dds.disc:node-sample-count lj-node)))
+                      ;; parse captured datagrams for PID_ORIGINAL_WRITER_INFO
+                      (let ((owi-hits '()))
+                        (loop for dg across captured
+                              do (dolist (pair (%parse-owi-from-datagram dg))
+                                   (push pair owi-hits)))
+                        ;; must have exactly N OWI entries (one per relayed DATA)
+                        (%check :relay-owi-count
+                                (= n (length owi-hits))
+                                (format nil "expected ~d OWI PIDs in captured datagrams, got ~d"
+                                        n (length owi-hits)))
+                        ;; every OWI GUID must match the original publisher
+                        (%check :relay-owi-guid
+                                (every (lambda (pair) (equalp orig-guid (car pair))) owi-hits)
+                                (format nil "OWI GUID mismatch — expected ~s, got ~s"
+                                        (coerce orig-guid 'list)
+                                        (mapcar (lambda (p) (coerce (car p) 'list)) owi-hits)))
+                        ;; every OWI SN must be in {1..N}
+                        (%check :relay-owi-sn
+                                (every (lambda (pair) (<= 1 (cdr pair) n)) owi-hits)
+                                (format nil "OWI SN out of range {1..~d}: ~s"
+                                        n (mapcar #'cdr owi-hits)))))
+                 (ignore-errors (dds.disc:stop-node lj-node))))))
+      (ignore-errors (dds.durability:service-stop svc)))))
+
+;;; --- no-double-delivery test (Task 4: WP-DURABILITY-DEDUP) ---
+;;; Headline end-to-end: an ALIVE original writer + a durability service relay BOTH
+;;; send the same N samples to the same reader. The original-GUID max-SN dedup gate
+;;; must collapse both copies so the reader receives exactly N samples, not 2N.
+;;; Domain 77 (avoids collision with existing tests). Loopback unicast, triangular wiring:
+;;;   pub <-> svc  (service collects via HEARTBEAT/ACKNACK repair)
+;;;   svc <-> sub  (relay sends retained history to the subscriber)
+;;;   pub <-> sub  (original writer also sends live DATA directly to subscriber)
+;;; The service relay attaches PID_ORIGINAL_WRITER_INFO (Task 3); the original writer's
+;;; direct DATA carries no PID (treated as "carries the original GUID natively" via
+;;; the effective-GUID fallback in the disc dispatcher). Either copy arrives first; the
+;;; dedup map collapses the second. Expected: sub sample count == N (not 2N).
+
+(defun* run-durability-no-double-delivery-test ()
+    (function () t)
+  "No-double-delivery: alive original writer + service relay both send N samples to
+   a reader; original-GUID dedup collapses them to exactly N deliveries. Domain 77."
+  (let* ((n 3)
+         (svc-store (dds.durability:make-memory-store))
+         (spec (dds.durability:make-service-spec
+                :domain 77
+                :topics '(("DSquare" . "ShapeType"))
+                :store (lambda () svc-store)
+                :name "no-double-delivery-test"))
+         (svc (dds.durability:make-durability-service spec :store svc-store))
+         (pub-prefix (%make-test-prefix #xD9))
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 77
+                                            :host "127.0.0.1" :port 0 :multicast nil))
+         (sub-prefix (%make-test-prefix #xE9))
+         (sub-node (dds.disc:make-disc-node :guid-prefix sub-prefix :domain 77
+                                            :host "127.0.0.1" :port 0 :multicast nil)))
+    (unwind-protect
+         (progn
+           ;; start durability service
+           (dds.durability:service-start svc)
+           (let ((svc-node (dds.durability:durability-service-node svc)))
+             ;; configure publisher
+             (dds.disc:add-local-writer pub-node :topic "DSquare" :type "ShapeType"
+                                        :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                       :durability :transient-local))
+             (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+             (dds.disc:start-node pub-node)
+             ;; configure subscriber (TL reader, matched to both pub + relay)
+             (dds.disc:add-local-reader sub-node :topic "DSquare" :type "ShapeType"
+                                        :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                       :durability :transient-local))
+             (dds.disc:enable-subscriber sub-node)
+             ;; install on-match to init durability so TL reader requests history from relay
+             (setf (dds.disc:disc-node-on-match sub-node)
+                   (lambda (kind remote)
+                     (when (eq kind :remote-writer)
+                       (dds.disc:%reader-durability-init
+                        sub-node
+                        (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                        (dds.qos:qos-durability
+                         (dds.rtps.discovery:endpoint-data-qos remote))))))
+             (dds.disc:start-node sub-node)
+             ;; triangular wiring: pub <-> svc, pub <-> sub, svc <-> sub
+             (let ((pub-port (dds.disc:disc-node-port pub-node))
+                   (svc-port (dds.disc:disc-node-port svc-node))
+                   (sub-port (dds.disc:disc-node-port sub-node)))
+               (setf (dds.disc:disc-node-peers pub-node)
+                     (list (cons "127.0.0.1" svc-port) (cons "127.0.0.1" sub-port)))
+               (setf (dds.disc:disc-node-peers svc-node)
+                     (list (cons "127.0.0.1" pub-port) (cons "127.0.0.1" sub-port)))
+               (setf (dds.disc:disc-node-peers sub-node)
+                     (list (cons "127.0.0.1" pub-port) (cons "127.0.0.1" svc-port))))
+             ;; discovery: announce until everyone has matched
+             (loop repeat 400
+                   until (and (>= (dds.disc:disc-node-matched-count pub-node) 2)
+                              (plusp (dds.disc:disc-node-matched-count
+                                      (dds.durability:durability-service-node svc)))
+                              (>= (dds.disc:disc-node-matched-count sub-node) 2))
+                   do (dds.disc:announce-participant pub-node)
+                      (dds.disc:announce-endpoints pub-node)
+                      (dds.disc:announce-participant (dds.durability:durability-service-node svc))
+                      (dds.disc:announce-endpoints (dds.durability:durability-service-node svc))
+                      (dds.disc:announce-participant sub-node)
+                      (dds.disc:announce-endpoints sub-node)
+                      (sleep 0.02))
+             ;; publish N samples from the original writer (alive; sends to sub AND svc)
+             (dotimes (i n)
+               (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+             ;; drain heartbeats: push HBs so svc and sub process the data
+             (loop repeat 120
+                   do (dds.disc:announce-participant pub-node)
+                      (dds.disc:announce-endpoints pub-node)
+                      (dds.disc:announce-participant (dds.durability:durability-service-node svc))
+                      (dds.disc:announce-endpoints (dds.durability:durability-service-node svc))
+                      (dds.disc:announce-participant sub-node)
+                      (dds.disc:announce-endpoints sub-node)
+                      (sleep 0.05))
+             ;; wait for service store to fill (it collects from the pub)
+             (%await-store-count svc-store "DSquare" n :retries 1200 :sleep-s 0.005)
+             ;; wait for subscriber to have settled (relay + direct both delivered)
+             (%await-sample-count sub-node n :retries 1200 :sleep-s 0.005)
+             ;; key assertion: exactly N samples, NOT 2N (the dedup collapsed both copies)
+             (%check :no-double-delivery
+                     (= n (dds.disc:node-sample-count sub-node))
+                     (format nil "expected exactly ~d samples (no double delivery), got ~d"
+                             n (dds.disc:node-sample-count sub-node)))
+             t))
+      (ignore-errors (dds.disc:stop-node sub-node))
+      (ignore-errors (dds.disc:stop-node pub-node))
+      (ignore-errors (dds.durability:service-stop svc)))))
+
+;;; --- multi-topic service test (Task 5: WP-DURABILITY-DEDUP Phase 2) ---
+;;; A single durability-service with topics '(("Square" . "ShapeType") ("Circle" . "ShapeType"))
+;;; holds two disc-nodes (one per topic). Two separate publisher nodes write TL samples to each
+;;; topic respectively (one-writer-per-node invariant), then exit. A late-joiner on each topic
+;;; receives that topic's retained history from the service. Topic isolation is asserted:
+;;; the service's per-topic store entries are counted per topic. Domain 87.
+
+(defun* run-durability-multitopic-test ()
+    (function () t)
+  "Multi-topic service (K=2): one service, two disc-nodes, two pub nodes, two late-joiners.
+   Asserts per-topic store isolation, late-joiner delivery on both topics, and pristine stop.
+   Domain 87, loopback unicast, no multicast."
+  (let* ((n-sq 3)
+         (n-ci 2)
+         (svc-store (dds.durability:make-memory-store))
+         (spec (dds.durability:make-service-spec
+                :domain 87
+                :topics '(("Square" . "ShapeType") ("Circle" . "ShapeType"))
+                :store (lambda () svc-store)
+                :name "multitopic-test"))
+         (svc (dds.durability:make-durability-service spec :store svc-store))
+         ;; two publisher nodes: one per topic (one-writer-per-node invariant)
+         (pub-sq-node (dds.disc:make-disc-node
+                       :guid-prefix (%make-test-prefix #xA1) :domain 87
+                       :host "127.0.0.1" :port 0 :multicast nil))
+         (pub-ci-node (dds.disc:make-disc-node
+                       :guid-prefix (%make-test-prefix #xA2) :domain 87
+                       :host "127.0.0.1" :port 0 :multicast nil)))
+    (unwind-protect
+         (progn
+           ;; start service: builds two disc-nodes (one per topic), spawns two collect loops
+           (dds.durability:service-start svc)
+           (let* ((svc-nodes (dds.durability:durability-service-nodes svc))
+                  (svc-sq-node (car (first  svc-nodes)))
+                  (svc-ci-node (car (second svc-nodes))))
+             ;; set up Square publisher
+             (dds.disc:add-local-writer pub-sq-node :topic "Square" :type "ShapeType"
+                                        :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                       :durability :transient-local))
+             (dds.disc:enable-publisher pub-sq-node :history-kind :keep-all)
+             (dds.disc:start-node pub-sq-node)
+             ;; set up Circle publisher
+             (dds.disc:add-local-writer pub-ci-node :topic "Circle" :type "ShapeType"
+                                        :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                       :durability :transient-local))
+             (dds.disc:enable-publisher pub-ci-node :history-kind :keep-all)
+             (dds.disc:start-node pub-ci-node)
+             ;; wire unicast: svc-sq-node <-> pub-sq-node, svc-ci-node <-> pub-ci-node
+             (setf (dds.disc:disc-node-peers pub-sq-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-sq-node))))
+             (setf (dds.disc:disc-node-peers pub-ci-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-ci-node))))
+             (setf (dds.disc:disc-node-peers svc-sq-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-sq-node))))
+             (setf (dds.disc:disc-node-peers svc-ci-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-ci-node))))
+             ;; discovery: announce until both service nodes matched their respective publishers
+             (loop repeat 300
+                   until (and (plusp (dds.disc:disc-node-matched-count svc-sq-node))
+                              (plusp (dds.disc:disc-node-matched-count svc-ci-node)))
+                   do (dds.disc:announce-participant pub-sq-node)
+                      (dds.disc:announce-endpoints   pub-sq-node)
+                      (dds.disc:announce-participant pub-ci-node)
+                      (dds.disc:announce-endpoints   pub-ci-node)
+                      (dds.disc:announce-participant svc-sq-node)
+                      (dds.disc:announce-endpoints   svc-sq-node)
+                      (dds.disc:announce-participant svc-ci-node)
+                      (dds.disc:announce-endpoints   svc-ci-node)
+                      (sleep 0.02))
+             ;; publish N-SQ Square samples and N-CI Circle samples
+             (dotimes (i n-sq) (dds.disc:publish-sample pub-sq-node (%make-small-payload (1+ i))))
+             (dotimes (i n-ci) (dds.disc:publish-sample pub-ci-node (%make-small-payload (+ 10 i))))
+             ;; drain heartbeats so service readers collect the data
+             (loop repeat 80
+                   do (dds.disc:announce-participant pub-sq-node)
+                      (dds.disc:announce-endpoints   pub-sq-node)
+                      (dds.disc:announce-participant pub-ci-node)
+                      (dds.disc:announce-endpoints   pub-ci-node)
+                      (sleep 0.05))
+             ;; wait for both topics to be collected
+             (%await-store-count svc-store "Square" n-sq :retries 1200 :sleep-s 0.005)
+             (%await-store-count svc-store "Circle" n-ci :retries 1200 :sleep-s 0.005)
+             ;; assert per-topic store isolation before stopping publishers
+             (%check :mt-sq-count
+                     (= n-sq (dds.durability:store-count svc-store "Square"))
+                     (format nil "service Square store expected ~d, got ~d"
+                             n-sq (dds.durability:store-count svc-store "Square")))
+             (%check :mt-ci-count
+                     (= n-ci (dds.durability:store-count svc-store "Circle"))
+                     (format nil "service Circle store expected ~d, got ~d"
+                             n-ci (dds.durability:store-count svc-store "Circle")))
+             (%check :mt-store-isolation
+                     (and (= n-sq (dds.durability:store-count svc-store "Square"))
+                          (= n-ci (dds.durability:store-count svc-store "Circle"))
+                          (null (set-difference (dds.durability:store-topics svc-store)
+                                                '("Square" "Circle") :test #'string=)))
+                     "per-topic isolation: store has exactly {Square:~d, Circle:~d} and no other topic")
+             ;; stop publishers — original writers gone
+             (ignore-errors (dds.disc:stop-node pub-sq-node))
+             (ignore-errors (dds.disc:stop-node pub-ci-node))
+             (sleep 0.1)
+             ;; late-joiner 1: TL reader on Square expects N-SQ from the service
+             (let* ((lj-sq (dds.disc:make-disc-node
+                             :guid-prefix (%make-test-prefix #xB1) :domain 87
+                             :host "127.0.0.1" :port 0 :multicast nil)))
+               (unwind-protect
+                    (progn
+                      (dds.disc:add-local-reader lj-sq :topic "Square" :type "ShapeType"
+                                                 :qos (dds.qos:make-reader-qos
+                                                       :reliability :reliable
+                                                       :durability :transient-local))
+                      (dds.disc:enable-subscriber lj-sq)
+                      (setf (dds.disc:disc-node-on-match lj-sq)
+                            (lambda (kind remote)
+                              (when (eq kind :remote-writer)
+                                (dds.disc:%reader-durability-init
+                                 lj-sq
+                                 (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                 (dds.qos:qos-durability
+                                  (dds.rtps.discovery:endpoint-data-qos remote))))))
+                      (dds.disc:start-node lj-sq)
+                      (setf (dds.disc:disc-node-peers lj-sq)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-sq-node))))
+                      (setf (dds.disc:disc-node-peers svc-sq-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-sq))))
+                      (%await-match lj-sq svc-sq-node :retries 300 :sleep-s 0.02)
+                      (%await-sample-count lj-sq n-sq :retries 1200 :sleep-s 0.005)
+                      (%check :mt-lj-sq-count
+                              (= n-sq (dds.disc:node-sample-count lj-sq))
+                              (format nil "TL Square late-joiner expected ~d, got ~d"
+                                      n-sq (dds.disc:node-sample-count lj-sq))))
+                 (ignore-errors (dds.disc:stop-node lj-sq))))
+             ;; late-joiner 2: TL reader on Circle expects N-CI from the service
+             (let* ((lj-ci (dds.disc:make-disc-node
+                             :guid-prefix (%make-test-prefix #xB2) :domain 87
+                             :host "127.0.0.1" :port 0 :multicast nil)))
+               (unwind-protect
+                    (progn
+                      (dds.disc:add-local-reader lj-ci :topic "Circle" :type "ShapeType"
+                                                 :qos (dds.qos:make-reader-qos
+                                                       :reliability :reliable
+                                                       :durability :transient-local))
+                      (dds.disc:enable-subscriber lj-ci)
+                      (setf (dds.disc:disc-node-on-match lj-ci)
+                            (lambda (kind remote)
+                              (when (eq kind :remote-writer)
+                                (dds.disc:%reader-durability-init
+                                 lj-ci
+                                 (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                 (dds.qos:qos-durability
+                                  (dds.rtps.discovery:endpoint-data-qos remote))))))
+                      (dds.disc:start-node lj-ci)
+                      (setf (dds.disc:disc-node-peers lj-ci)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-ci-node))))
+                      (setf (dds.disc:disc-node-peers svc-ci-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-ci))))
+                      (%await-match lj-ci svc-ci-node :retries 300 :sleep-s 0.02)
+                      (%await-sample-count lj-ci n-ci :retries 1200 :sleep-s 0.005)
+                      (%check :mt-lj-ci-count
+                              (= n-ci (dds.disc:node-sample-count lj-ci))
+                              (format nil "TL Circle late-joiner expected ~d, got ~d"
+                                      n-ci (dds.disc:node-sample-count lj-ci))))
+                 (ignore-errors (dds.disc:stop-node lj-ci))))
+             t))
+      (ignore-errors (dds.disc:stop-node pub-sq-node))
+      (ignore-errors (dds.disc:stop-node pub-ci-node))
+      (ignore-errors (dds.durability:service-stop svc)))))
+
+;;; --- dispose-replay test (Task 6: WP-DURABILITY-DEDUP Phase 2) ---
+;;; A TL publisher writes N=3 samples to a topic, then DISPOSES an instance
+;;; (via dds.disc:dispose-instance).  The durability service collects the data
+;;; AND the dispose into the store (kind=:dispose record).  Then the original
+;;; writer STOPS.  A TL late-joiner receives the full pre-join history: N data
+;;; samples + the dispose lifecycle change.  Assert that the late-joiner's
+;;; node-lifecycle-count >= 1 and the lifecycle change has kind :dispose.
+;;; Domain 97 avoids collision with all prior tests.
+
+(defun* run-durability-dispose-replay-test ()
+    (function () t)
+  "Dispose/unregister capture + replay: publisher writes N TL samples then disposes
+   an instance; service collects data + dispose; TL late-joiner receives data history
+   AND the dispose (lifecycle kind :dispose observed).  Domain 97, loopback unicast."
+  (let* ((n 3)
+         (svc-store (dds.durability:make-memory-store))
+         (spec (dds.durability:make-service-spec
+                :domain 97
+                :topics '(("DRSquare" . "ShapeType"))
+                :store (lambda () svc-store)
+                :name "dispose-replay-test"))
+         (svc (dds.durability:make-durability-service spec :store svc-store))
+         (pub-prefix (%make-test-prefix #xC9))
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 97
+                                            :host "127.0.0.1" :port 0 :multicast nil))
+         ;; key-hash used for dispose: 16 bytes, first byte 0xAB
+         (kh (let ((k (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 0) #xAB) k)))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start svc)
+           (let ((svc-node (dds.durability:durability-service-node svc)))
+             (setf (dds.disc:disc-node-peers pub-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-node))))
+             (setf (dds.disc:disc-node-peers svc-node)
+                   (list (cons "127.0.0.1" 0)))
+             (dds.disc:add-local-writer pub-node :topic "DRSquare" :type "ShapeType"
+                                        :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                       :durability :transient-local))
+             (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+             (dds.disc:start-node pub-node)
+             (setf (dds.disc:disc-node-peers svc-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-node))))
+             (%await-match pub-node svc-node :retries 300 :sleep-s 0.02)
+             ;; publish N data samples
+             (dotimes (i n)
+               (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+             ;; dispose the instance
+             (dds.disc:dispose-instance pub-node kh)
+             ;; drain heartbeats so service reader collects data + lifecycle
+             (loop repeat 80
+                   do (%announce-both pub-node svc-node) (sleep 0.05))
+             ;; wait for store to have N data records + 1 lifecycle record (N+1 total)
+             (%await-store-count svc-store "DRSquare" (1+ n) :retries 1200 :sleep-s 0.005)
+             ;; verify store has the dispose record
+             (%check :dr-store-total
+                     (= (1+ n) (dds.durability:store-count svc-store "DRSquare"))
+                     (format nil "store must have ~d records (data+dispose), got ~d"
+                             (1+ n) (dds.durability:store-count svc-store "DRSquare")))
+             (let* ((recs (dds.durability:store-get-range svc-store "DRSquare"))
+                    (dispose-recs (remove-if-not
+                                   (lambda (r) (eq :dispose (dds.durability:durable-record-kind r)))
+                                   recs)))
+               (%check :dr-store-dispose-kind
+                       (= 1 (length dispose-recs))
+                       (format nil "store must have 1 dispose record, got ~d" (length dispose-recs))))
+             ;; stop the publisher — original writer gone
+             (ignore-errors (dds.disc:stop-node pub-node))
+             (sleep 0.1)
+             ;; TL late-joiner: receives data history + dispose from the service
+             (let* ((lj-prefix (%make-test-prefix #xD9))
+                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 97
+                                                      :host "127.0.0.1" :port 0 :multicast nil)))
+               (unwind-protect
+                    (progn
+                      (dds.disc:add-local-reader lj-node :topic "DRSquare" :type "ShapeType"
+                                                 :qos (dds.qos:make-reader-qos
+                                                       :reliability :reliable
+                                                       :durability :transient-local))
+                      (dds.disc:enable-subscriber lj-node)
+                      (setf (dds.disc:disc-node-on-match lj-node)
+                            (lambda (kind remote)
+                              (when (eq kind :remote-writer)
+                                (dds.disc:%reader-durability-init
+                                 lj-node
+                                 (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                 (dds.qos:qos-durability
+                                  (dds.rtps.discovery:endpoint-data-qos remote))))))
+                      (dds.disc:start-node lj-node)
+                      (setf (dds.disc:disc-node-peers lj-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-node))))
+                      (setf (dds.disc:disc-node-peers svc-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-node))))
+                      (%await-match lj-node svc-node :retries 300 :sleep-s 0.02)
+                      ;; wait for data samples
+                      (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
+                      ;; wait for lifecycle change (dispose) to arrive
+                      (loop repeat 1200
+                            until (plusp (dds.disc:node-lifecycle-count lj-node))
+                            do (sleep 0.005))
+                      ;; data assertion
+                      (%check :dr-lj-data-count
+                              (= n (dds.disc:node-sample-count lj-node))
+                              (format nil "TL late-joiner expected ~d data samples, got ~d"
+                                      n (dds.disc:node-sample-count lj-node)))
+                      ;; lifecycle assertion: at least one dispose received
+                      (%check :dr-lj-lifecycle-count
+                              (plusp (dds.disc:node-lifecycle-count lj-node))
+                              (format nil "TL late-joiner must receive at least 1 lifecycle change, got ~d"
+                                      (dds.disc:node-lifecycle-count lj-node)))
+                      ;; verify the lifecycle kind is :dispose
+                      (let* ((lc-sns (dds.disc:node-lifecycle-sns lj-node))
+                             (lc-rec (and lc-sns (dds.disc:node-lifecycle-change lj-node (first lc-sns)))))
+                        (%check :dr-lj-dispose-kind
+                                (and lc-rec (eq :dispose (first lc-rec)))
+                                (format nil "lifecycle change must be :dispose, got ~s"
+                                        (and lc-rec (first lc-rec))))))
+                 (ignore-errors (dds.disc:stop-node lj-node)))))
+           t)
+      (ignore-errors (dds.disc:stop-node pub-node))
+      (ignore-errors (dds.durability:service-stop svc)))))
+

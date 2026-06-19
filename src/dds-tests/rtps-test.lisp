@@ -2038,3 +2038,306 @@
                 (nth-value 1 (ignore-errors (dds.dcps::%deserialize-sample ts wire)))
                 (format nil "FlatData RX of ~a must cleanly reject (signal), not read-in-place or crash" (cddr rep)))))
     t))
+
+(defun* run-original-writer-info-vector-test ()
+    (function () t)
+  "PID_ORIGINAL_WRITER_INFO (0x0061) byte-exact encode/decode vs the spike capture (RTPS 2.5 §8.3.5.4)."
+  (let* ((guid (make-array 16 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x01 #x01 #x66 #xf2 #x8f #x4f #x79 #x5f
+                                               #xa0 #x8e #xcd #xa9 #x80 #x00 #x00 #x02)))
+         (sn 1)
+         (expect (make-array 24 :element-type '(unsigned-byte 8)
+                             :initial-contents '(#x01 #x01 #x66 #xf2 #x8f #x4f #x79 #x5f
+                                                 #xa0 #x8e #xcd #xa9 #x80 #x00 #x00 #x02
+                                                 #x00 #x00 #x00 #x00 #x01 #x00 #x00 #x00)))
+         (body (dds.rtps.message:encode-original-writer-info guid sn)))
+    (%check :owi-encode (equalp body expect)
+            (format nil "OriginalWriterInfo body mismatch: ~s vs ~s" body expect))
+    (multiple-value-bind (g s) (dds.rtps.message:parse-original-writer-info body 0 24)
+      (%check :owi-decode-guid (equalp g guid) "round-trip GUID mismatch")
+      (%check :owi-decode-sn (eql s 1) "round-trip SN mismatch"))
+    ;; large SN exercises the high word
+    (let* ((big (+ (ash 1 33) 7))
+           (b2 (dds.rtps.message:encode-original-writer-info guid big)))
+      (multiple-value-bind (g s) (dds.rtps.message:parse-original-writer-info b2 0 24)
+        (declare (ignore g))
+        (%check :owi-bigsn (eql s big) "high-word SN round-trip mismatch")))
+    ;; bounds: wrong length -> (nil nil), never an error/OOB
+    (multiple-value-bind (g s) (dds.rtps.message:parse-original-writer-info body 0 20)
+      (%check :owi-badlen (and (null g) (null s)) "len/=24 must yield (nil nil)"))
+    t))
+
+;;; DATA inline-QoS emit: Q-bit + ParameterList before payload (RTPS 2.5 §9.4.5.4).
+;;; The nil path MUST be byte-identical to today; the non-nil path sets Q-bit and
+;;; inserts the complete caller-supplied ParameterList (sentinel-terminated) between
+;;; the 20-octet fixed prefix and the serializedPayload.
+
+(defun* run-data-inline-qos-emit-test ()
+    (function () t)
+  "Test: write-data :inline-qos nil → byte-identical to no-arg form (Q-bit clear, no extra
+   bytes); write-data :inline-qos <block> → Q-bit set, inline-QoS bytes precede payload,
+   parse-data-body round-trips the payload and reports inline-QoS present.
+   RTPS 2.5 §9.4.5.4."
+  (let* ((arena (dds.core.arena:init-arena :bytes (* 256 1024)))
+         (pool  (dds.core.arena:make-buffer-pool arena 512 4))
+         (rid   dds.rtps.message:+entityid-participant+)
+         (wid   dds.rtps.message:+entityid-unknown+)
+         (sn    7)
+         (payload (make-array 8 :element-type '(unsigned-byte 8)
+                                :initial-contents '(0 #x11 0 0 #x2a 0 0 0)))
+         ;; (a) nil-arg baseline — call without :inline-qos
+         (buf-base (dds.core.arena:pool-acquire pool))
+         (c-base   (dds.core.buffer:cursor buf-base :endianness :little))
+         ;; (b) explicit nil — must equal (a) byte-for-byte
+         (buf-nil  (dds.core.arena:pool-acquire pool))
+         (c-nil    (dds.core.buffer:cursor buf-nil :endianness :little))
+         ;; (c) with inline-QoS built via write-original-writer-info-parameter + sentinel
+         (buf-iq   (dds.core.arena:pool-acquire pool))
+         (c-iq     (dds.core.buffer:cursor buf-iq :endianness :little))
+         ;; scratch buffer to capture the inline-QoS ParameterList bytes
+         (scratch  (dds.core.arena:pool-acquire pool))
+         (c-sc     (dds.core.buffer:cursor scratch :endianness :little))
+         (guid     (make-array 16 :element-type '(unsigned-byte 8)
+                               :initial-contents '(#x01 #x01 #x66 #xf2 #x8f #x4f #x79 #x5f
+                                                   #xa0 #x8e #xcd #xa9 #x80 #x00 #x00 #x02))))
+    ;; build inline-QoS block: PID_ORIGINAL_WRITER_INFO(28 bytes) + PID_SENTINEL(4 bytes) = 32
+    (dds.rtps.message:write-original-writer-info-parameter c-sc guid 42)
+    (dds.rtps.message:write-parameter-sentinel c-sc)
+    (let* ((iq-len  (dds.core.buffer:cursor-position c-sc))  ; 32
+           (iq-vec  (dds.core.buffer:octet-buffer-vec scratch))
+           (iq-blob (make-array iq-len :element-type '(unsigned-byte 8))))
+      (replace iq-blob iq-vec :end2 iq-len)
+      ;; write the three variants
+      (dds.rtps.message:write-data c-base rid wid sn payload 0 8)
+      (dds.rtps.message:write-data c-nil  rid wid sn payload 0 8 :inline-qos nil)
+      (dds.rtps.message:write-data c-iq   rid wid sn payload 0 8 :inline-qos iq-blob)
+      (let ((len-base (dds.core.buffer:cursor-position c-base))
+            (len-nil  (dds.core.buffer:cursor-position c-nil))
+            (len-iq   (dds.core.buffer:cursor-position c-iq))
+            (v-base   (dds.core.buffer:octet-buffer-vec buf-base))
+            (v-nil    (dds.core.buffer:octet-buffer-vec buf-nil))
+            (v-iq     (dds.core.buffer:octet-buffer-vec buf-iq)))
+        ;; nil branch: byte-identical to no-arg baseline
+        (%check :diq-nil-len  (= len-base len-nil)        "nil inline-qos must not change submsg length")
+        (%check :diq-nil-bytes (loop for i below len-base always (= (aref v-base i) (aref v-nil i)))
+                "nil inline-qos must be byte-identical to baseline")
+        ;; Q-bit: flags byte is index 1 (flags field of submsg header)
+        (%check :diq-qbit-clear (zerop (logand (aref v-base 1) dds.rtps.message:+data-flag-inline-qos+))
+                "baseline must have Q-bit clear")
+        (%check :diq-qbit-set   (not (zerop (logand (aref v-iq 1) dds.rtps.message:+data-flag-inline-qos+)))
+                "inline-qos branch must set Q-bit")
+        ;; inline-QoS branch: total length = 4(header) + 20(body-prefix) + 32(iq) + 8(payload)
+        (%check :diq-iq-len (= len-iq (+ 4 20 iq-len 8)) "inline-QoS submsg length accounting")
+        ;; inline-QoS bytes precede payload: bytes [24, 24+iq-len) must equal iq-blob
+        (%check :diq-iq-bytes
+                (loop for i below iq-len always (= (aref v-iq (+ 24 i)) (aref iq-blob i)))
+                "inline-QoS bytes must appear between body-prefix and payload")
+        ;; payload round-trip via parse-data-body
+        (dds.core.buffer:cursor-reset c-iq)
+        (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header c-iq)
+          (declare (ignore id le))
+          (multiple-value-bind (r w psn has poff plen key ck pkh psf)
+              (dds.rtps.message:parse-data-body c-iq flags octets)
+            (declare (ignore r w ck pkh psf))
+            (%check :diq-parse-sn    (= psn sn)   "parse-data-body SN round-trip")
+            (%check :diq-parse-has   has           "parse-data-body has-payload")
+            (%check :diq-parse-key   (not key)     "parse-data-body key-flag clear")
+            (%check :diq-parse-len   (= plen 8)    "parse-data-body payload length")
+            (%check :diq-parse-payload
+                    (loop for i below 8
+                          always (= (aref v-iq (+ poff i)) (aref payload i)))
+                    "payload bytes round-trip after inline-QoS")
+            ;; parse-data-body must report inline-QoS was present (key-hash and status-flags
+            ;; from parse-inline-qos-key-status are the indicators — the iq block contains
+            ;; PID_ORIGINAL_WRITER_INFO which is not PID_KEY_HASH/PID_STATUS_INFO, so
+            ;; key-hash=nil status-flags=0, but parse-data-body must NOT return nil (it must
+            ;; successfully walk the unknown pid and reach the sentinel)
+            (%check :diq-flags-qset
+                    (logtest flags dds.rtps.message:+data-flag-inline-qos+)
+                    "parsed flags must have Q-bit set")))))
+    (dds.core.arena:teardown-arena arena)
+    t))
+
+;;; Original-GUID per-SN dedup gate (WP-DURABILITY-DEDUP, RTPS 2.5 §8.3.5.4).
+
+(defun* run-original-writer-dedup-test ()
+    (function () t)
+  "Unit test for reader-dedup-accept-p: watermark semantics + independence + boundedness.
+   SN sequence 1,2,2,1,3 -> T,T,NIL,NIL,T (SN 2 repeated is dup; SN 1 is below watermark
+   after 1+2 compact LO to 2; SN 3 continues). A different originalGUID tracked independently.
+   Nil guid always returns T without touching the map. Boundedness: 1000 in-order SNs yield
+   an empty ABOVE set (LO advances through every prefix, O(1)/GUID, NFR-MEM)."
+  (let* ((reader  (dds.rtps.reliable:make-rtps-reader))
+         (guid-a  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xAA))
+         (guid-b  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xBB)))
+    ;; PID-absent path: nil guid ALWAYS returns T, map never touched
+    (%check :dedup-nil-1 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader nil nil))
+            "nil guid must return T (no PID, normal path)")
+    (%check :dedup-nil-2 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader nil 99))
+            "nil guid with non-nil sn must still return T")
+    (%check :dedup-nil-map-empty
+            (zerop (hash-table-count (dds.rtps.reliable:rtps-reader-dedup-map reader)))
+            "nil guid must never touch the dedup map")
+    ;; guid-a: SN 1 -> accept; SN 2 -> accept; both compact LO to 2, ABOVE stays empty
+    (%check :dedup-a-sn1 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid-a 1))
+            "guid-a SN 1: first time -> T (accept)")
+    (%check :dedup-a-sn2 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid-a 2))
+            "guid-a SN 2: not yet seen -> T (accept)")
+    ;; guid-a: SN 2 again -> exact duplicate -> NIL (in the compacted LO range)
+    (%check :dedup-a-sn2-dup (null (dds.rtps.reliable:reader-dedup-accept-p reader guid-a 2))
+            "guid-a SN 2 repeat: below watermark -> NIL (discard)")
+    ;; guid-a: SN 1 again -> below watermark -> NIL (LO = 2 after compaction)
+    (%check :dedup-a-sn1-dup (null (dds.rtps.reliable:reader-dedup-accept-p reader guid-a 1))
+            "guid-a SN 1 repeat: below watermark -> NIL")
+    ;; guid-a: SN 3 -> not yet seen -> accept
+    (%check :dedup-a-sn3 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid-a 3))
+            "guid-a SN 3: not yet seen -> T (accept)")
+    ;; guid-b tracked INDEPENDENTLY: SN 1 still accepted (guid-b is a separate tracking entry)
+    (%check :dedup-b-sn1 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid-b 1))
+            "guid-b SN 1: independent tracking -> T (accept)")
+    ;; guid-b: SN 1 again -> duplicate for guid-b
+    (%check :dedup-b-sn1-dup (null (dds.rtps.reliable:reader-dedup-accept-p reader guid-b 1))
+            "guid-b SN 1 repeat: duplicate -> NIL")
+    ;; outer map has exactly 2 entries (guid-a + guid-b), nil path left map untouched
+    (%check :dedup-map-size
+            (= 2 (hash-table-count (dds.rtps.reliable:rtps-reader-dedup-map reader)))
+            "dedup outer map must have exactly 2 entries after guid-a + guid-b (nil left none)")
+    ;; Boundedness: 1000 in-order SNs -> ABOVE stays EMPTY (watermark advances, O(1)/GUID, NFR-MEM)
+    (let* ((reader2 (dds.rtps.reliable:make-rtps-reader))
+           (guid-c  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xCC)))
+      (loop for sn from 1 to 1000
+            do (dds.rtps.reliable:reader-dedup-accept-p reader2 guid-c sn))
+      (let* ((origin (gethash guid-c (dds.rtps.reliable:rtps-reader-dedup-map reader2)))
+             (above-count (hash-table-count (dds.rtps.reliable::dedup-origin-above origin))))
+        (%check :dedup-inorder-above-empty (zerop above-count)
+                (format nil "in-order delivery must keep ABOVE empty (got ~d entries)" above-count))))
+    t))
+
+;;; Cap/shedding path: proves lo never jumps a hole and no fresh SN is ever discarded.
+
+(defun* run-dedup-cap-test ()
+    (function () t)
+  "Unit test for reader-dedup-accept-p at-cap shedding.  Uses *max-gap-range* = 4.
+   Setup: deliver SNs 1..4 in order (lo advances to 4, above empty).  Then deliver SNs
+   9,8,7,6 out-of-order, filling above to the cap.  SN 5 is deliberately withheld (the gap).
+   SN 5+ causes the cap to trigger on the next out-of-order SN.
+   Assertions: (1) every fresh SN is accepted (T); (2) lo stays at 4 after the cap path
+   (never jumps the withheld SN 5); (3) when SN 5 later arrives it is ACCEPTED (T) — no
+   silent loss; (4) lo then advances through the compacted run; (5) the shed high SN is
+   re-admitted on re-arrival (benign duplicate, not silent loss)."
+  (let* ((reader (dds.rtps.reliable:make-rtps-reader))
+         (guid   (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xDD)))
+    (let ((dds.rtps.reliable:*max-gap-range* 4))
+      ;; SNs 1..4 in order: lo advances to 4, above stays empty
+      (loop for sn from 1 to 4
+            do (%check (intern (format nil "DEDUP-CAP-INORDER-~d" sn) :keyword)
+                       (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid sn))
+                       (format nil "SN ~d (in-order) -> T" sn)))
+      ;; Deliver SNs 9,8,7,6 — all above the withheld gap SN 5; fills above to {6,7,8,9}
+      (%check :dedup-cap-sn9 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid 9))
+              "SN 9 out-of-order fresh -> T")
+      (%check :dedup-cap-sn8 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid 8))
+              "SN 8 out-of-order fresh -> T")
+      (%check :dedup-cap-sn7 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid 7))
+              "SN 7 out-of-order fresh -> T")
+      (%check :dedup-cap-sn6 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid 6))
+              "SN 6 out-of-order fresh -> T; above = {6,7,8,9} = cap (4)")
+      ;; above = {6,7,8,9} = cap (4); lo = 4. SN 10 overflows: shed highest (9), admit 10.
+      (%check :dedup-cap-sn10 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid 10))
+              "SN 10 -> T; triggers cap: shed highest (10) -> above={6,7,8,9}")
+      ;; KEY: lo must still be 4 (SN 5 never arrived; cap MUST NOT have jumped the hole)
+      (let* ((origin (gethash guid (dds.rtps.reliable:rtps-reader-dedup-map reader)))
+             (lo-val (dds.rtps.reliable::dedup-origin-lo origin)))
+        (%check :dedup-cap-lo-stable (= lo-val 4)
+                (format nil "lo must be 4 (SN 5 never arrived, cap must not jump hole); got ~d" lo-val)))
+      ;; SN 5 (the withheld gap SN) now arrives — must be ACCEPTED (T), never silently lost
+      (%check :dedup-cap-gap-sn5 (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid 5))
+              "SN 5 (withheld gap SN) -> T (no silent loss)")
+      ;; After SN 5, the contiguous prefix 5,6,7,8 compacts into lo (9 was shed, so lo stops at 8;
+      ;; above = {10}).  lo = 8.
+      (let* ((origin (gethash guid (dds.rtps.reliable:rtps-reader-dedup-map reader)))
+             (lo-val (dds.rtps.reliable::dedup-origin-lo origin)))
+        (%check :dedup-cap-lo-after-gap (= lo-val 8)
+                (format nil "lo must be 8 after SN 5 arrives (prefix 5..8 compact; 9 shed); got ~d" lo-val)))
+      ;; SN 9 was shed; re-arrival must be accepted (benign duplicate of a high out-of-order SN)
+      (%check :dedup-cap-shed-readmit (eq t (dds.rtps.reliable:reader-dedup-accept-p reader guid 9))
+              "SN 9 (shed entry) re-arrives -> T (benign duplicate, not silent loss)"))
+    t))
+
+(defun* run-vendor-sedp-pid-test ()
+    (function () t)
+  "PID_ENTITY_VIRTUAL_GUID (0x8002) + PID_SERVICE_KIND (0x8003) byte-exact emit + round-trip
+   in a SEDP ParameterList. Verifies that a relay endpoint-data with service-kind = PERSISTENCE_SERVICE
+   emits both PIDs correctly (ADR 0024 Task 8; RTI vendor PIDs, spike 2026-06-18)."
+  ;; Build a relay endpoint-data with entity-virtual-guid + service-kind set.
+  (let* ((vguid (make-array 16 :element-type '(unsigned-byte 8)
+                            :initial-contents '(#x01 #x01 #x93 #xbb #x4d #x4e #x9f #xa4
+                                                #xac #x3c #x26 #x96 #x80 #x00 #x00 #x02)))
+         (ep (dds.rtps.discovery:make-endpoint-data
+              :role :writer
+              :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 1)
+              :topic-name "Square" :type-name "ShapeType"
+              :entity-virtual-guid vguid
+              :service-kind dds.rtps.message:+service-kind-persistence+))
+         (ob (dds.core.buffer:make-octet-buffer 512))
+         (wc (dds.core.buffer:cursor ob :endianness :little))
+         (vec (dds.core.buffer:octet-buffer-vec ob)))
+    (dds.rtps.discovery:serialize-endpoint-data wc ep)
+    (let ((end (dds.core.buffer:cursor-position wc)))
+      ;; Locate PID_ENTITY_VIRTUAL_GUID (0x8002 LE = #x02 #x80) in the ParameterList.
+      (let ((at-vg (loop for i from 0 to (- end 20)
+                         when (and (= (aref vec i) #x02) (= (aref vec (1+ i)) #x80)
+                                   (= (aref vec (+ i 2)) #x10) (= (aref vec (+ i 3)) #x00))
+                           return i)))
+        (%check :vguid-present at-vg "PID_ENTITY_VIRTUAL_GUID (02 80 10 00) not found in SEDP ParameterList")
+        (when at-vg
+          ;; Value bytes [4..19] must equal vguid verbatim.
+          (dotimes (k 16)
+            (%check (intern (format nil "VGUID-BYTE-~d" k) :keyword)
+                    (= (aref vec (+ at-vg 4 k)) (aref vguid k))
+                    (format nil "PID_ENTITY_VIRTUAL_GUID byte ~d mismatch: got #x~2,'0x expected #x~2,'0x"
+                            k (aref vec (+ at-vg 4 k)) (aref vguid k))))))
+      ;; Locate PID_SERVICE_KIND (0x8003 LE = #x03 #x80) in the ParameterList.
+      (let ((at-sk (loop for i from 0 to (- end 8)
+                         when (and (= (aref vec i) #x03) (= (aref vec (1+ i)) #x80)
+                                   (= (aref vec (+ i 2)) #x04) (= (aref vec (+ i 3)) #x00))
+                           return i)))
+        (%check :service-kind-present at-sk
+                "PID_SERVICE_KIND (03 80 04 00) not found in SEDP ParameterList")
+        (when at-sk
+          ;; Value = 1 (PERSISTENCE_SERVICE_QOS) as u32 LE = #x01 #x00 #x00 #x00.
+          (%check :service-kind-value-byte0 (= (aref vec (+ at-sk 4)) #x01)
+                  (format nil "PID_SERVICE_KIND[0] got #x~2,'0x want #x01" (aref vec (+ at-sk 4))))
+          (%check :service-kind-value-bytes1-3
+                  (and (= (aref vec (+ at-sk 5)) 0)
+                       (= (aref vec (+ at-sk 6)) 0)
+                       (= (aref vec (+ at-sk 7)) 0))
+                  "PID_SERVICE_KIND bytes [1..3] must be zero (u32 LE)"))))
+    ;; Round-trip: parse back and verify the fields survive.
+    (let* ((rc (dds.core.buffer:cursor ob :endianness :little))
+           (back (dds.rtps.discovery:parse-endpoint-data rc :writer)))
+      (%check :vendor-sedp-roundtrip-vguid
+              (and back (equalp (dds.rtps.discovery:endpoint-data-entity-virtual-guid back) vguid))
+              "entity-virtual-guid must round-trip through SEDP parse")
+      (%check :vendor-sedp-roundtrip-sk
+              (and back (= (dds.rtps.discovery:endpoint-data-service-kind back)
+                           dds.rtps.message:+service-kind-persistence+))
+              "service-kind must round-trip as +service-kind-persistence+"))
+    ;; Absent case: a non-relay endpoint must NOT emit either PID.
+    (let* ((plain (dds.rtps.discovery:make-endpoint-data
+                   :role :writer :topic-name "Square" :type-name "ShapeType"
+                   :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 2)))
+           (ob2 (dds.core.buffer:make-octet-buffer 512))
+           (wc2 (dds.core.buffer:cursor ob2 :endianness :little))
+           (vec2 (dds.core.buffer:octet-buffer-vec ob2)))
+      (dds.rtps.discovery:serialize-endpoint-data wc2 plain)
+      (let ((end2 (dds.core.buffer:cursor-position wc2)))
+        (%check :no-vguid-on-plain
+                (not (loop for i from 0 to (- end2 4)
+                           when (and (= (aref vec2 i) #x02) (= (aref vec2 (1+ i)) #x80)) return t))
+                "PID_ENTITY_VIRTUAL_GUID must NOT appear in a non-relay endpoint")
+        (%check :no-sk-on-plain
+                (not (loop for i from 0 to (- end2 4)
+                           when (and (= (aref vec2 i) #x03) (= (aref vec2 (1+ i)) #x80)) return t))
+                "PID_SERVICE_KIND must NOT appear in a non-relay endpoint")))
+    t))

@@ -287,17 +287,131 @@ sbcl --eval '(require :asdf)' \
 
 ---
 
-## 6. Phase-1 limitations
+## 6. Phase-2 — dedup / no-double-delivery, multi-topic, dispose/unregister (WP-DURABILITY-DEDUP)
 
-- **Writer-is-gone scenario only.** No-double-delivery (original writer alive + service both
-  matched) is Phase 2 (`PID_ORIGINAL_WRITER_INFO 0x0061` inline QoS carrier; spike confirmed in
-  `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md`).
-- **One topic per service node.** Multi-topic-per-service is Phase 2.
-- **DATA-kind capture only.** Dispose/unregister replay is Phase 2.
-- **In-memory store.** State is lost on process restart. Disk-backed + CNSA-2.0 DARE is Phase 3.
+Phase 2 (WP-DURABILITY-DEDUP) resolves the principal Phase-1 limitations:
+
+### 6.1 No-double-delivery via PID_ORIGINAL_WRITER_INFO (RTPS 2.5 §8.3.5.4)
+
+The relay writer attaches `PID_ORIGINAL_WRITER_INFO (PID 0x0061)` as inline-QoS on every
+relayed DATA submessage, carrying the **original writer's GUID and sequence number** (not the
+relay writer's). This lets a receiver deduplicate across multiple relay sources without
+inter-relay coordination — the receiver tracks the highest delivered `(originalGUID, SN)` pair
+per originating writer.
+
+The receiver-side dedup state is a per-origGUID **contiguous watermark + bounded reorder set**
+(ADR 0024): `LO` = highest contiguously delivered SN; `ABOVE` = out-of-order set bounded by
+`*max-gap-range*` (65536 entries). In-order traffic keeps `ABOVE` empty (O(1)/GUID). Late-joiner
+replay of low historical SNs is handled correctly: the watermark starts at 0 for a fresh GUID,
+so low SNs (1–10) are accepted even if high live SNs (50+) were already delivered.
+
+```lisp
+;; Check whether a relayed sample should be accepted (returns T) or dropped (returns NIL).
+;; Called once per relayed DATA submessage on the receiving reader.
+(dds.rtps.reliable:reader-dedup-accept-p reader original-guid original-sn)
+```
+
+Wire: every relayed user-data DATA submessage carries `PID_ORIGINAL_WRITER_INFO`; the inline-QoS
+block is 32 octets (PID_ORIGINAL_WRITER_INFO 28 + PID_SENTINEL 4). Non-relay DATA (direct
+writers, discovery) is byte-identical to before — the PID is not emitted. The `write-data` and
+`writer-write` inline-QoS path is opt-in (nil by default).
+
+### 6.2 Multi-topic service (N disc-nodes)
+
+`make-service-spec` accepts a list of `(topic . type)` conses or a predicate. At `service-start`
+time the service spawns **one disc-node per topic**, each with its own collect+replay entity pair
+and its own store partition. Topics are isolated at the store level.
+
+```lisp
+(dds.durability:make-service-spec
+ :domain 0
+ :topics '(("Square" . "ShapeType") ("Circle" . "ShapeType"))
+ :name "multi-topic-service")
+```
+
+**Limitation:** topics are fixed at construction time. Dynamic topic-add to a running service is
+a follow-up.
+
+### 6.3 Dispose/unregister capture + replay
+
+The collecting reader captures lifecycle changes — dispose (`STATUS_INFO = 0x01`) and
+unregister (`STATUS_INFO = 0x02`) — as `durable-record` entries with `kind = :disposed` or
+`kind = :unregistered`. The replay writer re-emits these lifecycle records carrying
+`PID_ORIGINAL_WRITER_INFO`, so a late-joining reader receives the instance lifecycle events in
+the correct relative order (DATA → dispose/unregister, ordered by original SN per writer GUID).
+
+### 6.4 Foreign-service coexistence
+
+When both our durability service and RTI Persistence Service relay the same TRANSIENT topic,
+a late-joiner matched to both receives each sample exactly once — because both relays emit
+`PID_ORIGINAL_WRITER_INFO` with the same original-writer GUID + SN, and the receiver's
+dedup map identifies them as the same sample. No inter-relay coordination is required.
+
+Cross-DDS interop legs:
+- **Leg A** — Connext 7.3.1 pub → our service → Connext late-joiner: 190 samples received,
+  every relayed DATA carries `PID_ORIGINAL_WRITER_INFO` byte-exact.
+- **Leg B** — Fast DDS 3.6.1 pub → our service → Fast DDS late-joiner: 465 samples received
+  (service held 265 Connext + 100 Fast DDS history), two distinct original-GUID streams both
+  carrying `PID_ORIGINAL_WRITER_INFO`.
+- **Leg C** — RTI PS + our service both alive (CLOSED_WITH_FINDINGS, 2026-06-19). RTI Persistence
+  Service v7.3.1 does NOT relay TRANSIENT_LOCAL data — it only handles TRANSIENT (and PERSISTENT)
+  durability. For a TRANSIENT_LOCAL topic RTI PS is inert as a relay; our service collected and
+  replayed correctly. The prior ~3558 additive count was entirely from our service's accumulated
+  history across multiple test runs (different publisher GUIDs), not from RTI PS. Task-8 correctly
+  adds `PID_SERVICE_KIND (0x8003) = PERSISTENCE_SERVICE_QOS` to our relay writer's SEDP endpoint
+  announcement (spike-confirmed SEDP placement, not SPDP). A true dual-relay coexistence live proof
+  with RTI PS requires a TRANSIENT topic (Phase 3). See `interop/durability-dedup/coexistence/README.md`.
+
+See `interop/durability-dedup/README.md` for wire evidence and `ADR 0024` for the dedup architecture.
+
+### 6.5 Remaining Phase-2 limitations
+
+- **Seen-set prune deferred:** dedup-map entries per GUID are control-plane and bounded (ADR 0024);
+  a GC of stale-GUID entries is a follow-up.
+- **In-memory store only.** State is lost on process restart. Disk-backed + CNSA-2.0 DARE is Phase 3.
 - **`:process` mode is SBCL-only** (runtime fallback to in-thread on other impls).
+- **Dynamic topic-add to a running service** is deferred.
 
-See ADR 0023 §Phase-1 limitations for the full record.
+See ADR 0023 + ADR 0024 for the full boundary.
+
+## 6.6 Worked example — no-double-delivery with PID_ORIGINAL_WRITER_INFO
+
+The following shows how to confirm no-double-delivery is active in a mixed relay scenario.
+The key observable: the relay writer's DATA submessages carry `PID_ORIGINAL_WRITER_INFO`
+with the original writer's GUID + SN (not the relay's).
+
+```lisp
+;;; Start a durability service on domain 0, topic Square/ShapeType
+(defparameter *spec*
+  (dds.durability:make-service-spec
+   :domain 0
+   :topics '(("Square" . "ShapeType"))
+   :name "relay-service"))
+
+(defparameter *runner* (dds.durability:make-service-runner (list *spec*)))
+(dds.durability:runner-start *runner*)
+
+;;; The service collects live samples. When the original writer exits, the
+;;; service replays its retained history to any late-joining TL reader.
+;;; Each replayed DATA carries PID_ORIGINAL_WRITER_INFO (0x0061) inline-QoS:
+;;;   guidPrefix[12] = original writer's GUID prefix
+;;;   entityId[4]    = original writer's EntityId
+;;;   SN.high[4]     = 0 (for SN <= 2^32)
+;;;   SN.low[4]      = original SN (LE)
+;;;
+;;; A Connext or Fast DDS late-joiner with dedup enabled will receive each
+;;; sample exactly once even if RTI Persistence Service is also relaying.
+
+(dds.durability:runner-stop *runner*)
+```
+
+tshark one-liner to verify the PID is on the wire:
+```sh
+tshark -i lo0 -T json -x -f "udp" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin);
+[print(f['_source']['layers'].get('rtps.param.id','')) for f in d]" \
+  | grep -c "0x0061"
+```
 
 ---
 
@@ -309,4 +423,7 @@ See ADR 0023 §Phase-1 limitations for the full record.
 - `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md` — PID_ORIGINAL_WRITER_INFO spike
 - `interop/durability-transient/` — cross-DDS interop captures and README
 - `src/dds-durability/` — service implementation (store / spec / service / runner / supervisor / main)
-- `src/dds-tests/durability-test.lisp` — unit + integration tests
+- `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`)
+- `src/dds-tests/pbt-test.lisp` — PID-parse fuzz arm (`fuzz-original-writer-info-parse`, NFR-SEC-POSTURE)
+- `interop/durability-dedup/` — PID_ORIGINAL_WRITER_INFO cross-DDS legs + coexistence captures
+- ADR 0024 — Dedup map architecture (watermark + bounded reorder set)

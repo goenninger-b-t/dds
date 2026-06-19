@@ -11,4 +11,13 @@
            #:run-durability-transient-test #:run-durability-runner-test
            #:run-durability-supervisor-test #:run-durability-runner-lifecycle-test
            #:run-durability-config-test #:run-durability-process-smoke-test
-           #:run-durability-writer-rep-test))
+           #:run-durability-writer-rep-test
+           #:run-original-writer-info-vector-test
+           #:run-data-inline-qos-emit-test
+           #:run-relay-emit-test
+           #:run-original-writer-dedup-test
+           #:run-dedup-cap-test
+           #:run-vendor-sedp-pid-test
+           #:run-durability-no-double-delivery-test
+           #:run-durability-multitopic-test
+           #:run-durability-dispose-replay-test))
