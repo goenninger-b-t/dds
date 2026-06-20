@@ -1393,3 +1393,98 @@
       (ignore-errors (dds.disc:stop-node pub-node))
       (ignore-errors (dds.durability:service-stop svc)))))
 
+;;; --- DARE-wrapped service transparency (Task 6 cap.7) ---
+;;; Publisher writes N=5 TL samples; service collects via an encrypted store (DARE-sealed);
+;;; TL late-joiner receives all N byte-exact — DARE is transparent to the relay path.
+;;; Domain 107 avoids collision with all other harness domains (7,17,27,37,47,57,67,77,87,97).
+
+(defun* run-dare-service-transparency-test ()
+    (function () t)
+  "DARE-wrapped durability service: publisher writes N TL samples; service seals into encrypted store;
+   TL late-joiner receives all N byte-exact (DARE transparent to relay path). Domain 107, loopback unicast."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [dare-service-transparency] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-dare-service-transparency-test t)))
+  (let* ((n 5)
+         (tmp-dir (uiop:merge-pathnames*
+                   (make-pathname :directory (list :relative
+                                                   (format nil "dds-dare-svc-test-~a"
+                                                           (get-universal-time))))
+                   (uiop:temporary-directory)))
+         (kp (dds.dare:make-file-key-provider :dir tmp-dir))
+         (svc-store (dds.durability:make-encrypted-store
+                     (dds.durability:make-memory-store) kp))
+         (spec (dds.durability:make-service-spec
+                :domain 107
+                :topics '(("Square" . "ShapeType"))
+                :store (lambda () svc-store)
+                :name "dare-transparency-test"))
+         (svc (dds.durability:make-durability-service spec :store svc-store))
+         (pub-prefix (%make-test-prefix #xD3))
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 107
+                                            :host "127.0.0.1" :port 0 :multicast nil)))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start svc)
+           (let ((svc-node (dds.durability:durability-service-node svc)))
+             (setf (dds.disc:disc-node-peers pub-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-node))))
+             (setf (dds.disc:disc-node-peers svc-node)
+                   (list (cons "127.0.0.1" 0)))
+             (dds.disc:add-local-writer pub-node :topic "Square" :type "ShapeType"
+                                        :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                       :durability :transient-local))
+             (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+             (dds.disc:start-node pub-node)
+             (setf (dds.disc:disc-node-peers svc-node)
+                   (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-node))))
+             (%await-match pub-node svc-node :retries 300 :sleep-s 0.02)
+             (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+             (loop repeat 80
+                   do (%announce-both pub-node svc-node) (sleep 0.05))
+             (%await-store-count svc-store "Square" n)
+             (%check :dare-svc-collected
+                     (= n (dds.durability:store-count svc-store "Square"))
+                     (format nil "service should have collected ~d before publisher stopped, got ~d"
+                             n (dds.durability:store-count svc-store "Square")))
+             (ignore-errors (dds.disc:stop-node pub-node))
+             (sleep 0.1)
+             (let* ((lj-prefix (%make-test-prefix #xE3))
+                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 107
+                                                      :host "127.0.0.1" :port 0 :multicast nil)))
+               (unwind-protect
+                    (progn
+                      (dds.disc:add-local-reader lj-node :topic "Square" :type "ShapeType"
+                                                 :qos (dds.qos:make-reader-qos
+                                                       :reliability :reliable
+                                                       :durability :transient-local))
+                      (dds.disc:enable-subscriber lj-node)
+                      (setf (dds.disc:disc-node-on-match lj-node)
+                            (lambda (kind remote)
+                              (when (eq kind :remote-writer)
+                                (dds.disc:%reader-durability-init
+                                 lj-node
+                                 (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                 (dds.qos:qos-durability
+                                  (dds.rtps.discovery:endpoint-data-qos remote))))))
+                      (dds.disc:start-node lj-node)
+                      (setf (dds.disc:disc-node-peers lj-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-node))))
+                      (setf (dds.disc:disc-node-peers svc-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-node))))
+                      (%await-match lj-node svc-node :retries 300 :sleep-s 0.02)
+                      (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
+                      (%check :dare-transparency-lj-count
+                              (= n (dds.disc:node-sample-count lj-node))
+                              (format nil "DARE-wrapped service: TL late-joiner expected ~d, got ~d"
+                                      n (dds.disc:node-sample-count lj-node))))
+                 (ignore-errors (dds.disc:stop-node lj-node))))
+             t))
+      (ignore-errors (dds.durability:service-stop svc))
+      (ignore-errors (dds.disc:stop-node pub-node))
+      ;; close the encrypted store so its DEK (foreign static-vector) is zeroized + freed
+      (ignore-errors (dds.durability:store-close svc-store))
+      (when (uiop:directory-exists-p tmp-dir)
+        (uiop:delete-directory-tree tmp-dir :validate t)))))

@@ -20,4 +20,5 @@
            #:durability-service-main
            #:parse-durability-config
            #:durability-config-error
-           #:%spec->argv))
+           #:%spec->argv
+           #:make-encrypted-store #:*dare-error-hook*))

@@ -20,4 +20,12 @@
            #:run-vendor-sedp-pid-test
            #:run-durability-no-double-delivery-test
            #:run-durability-multitopic-test
-           #:run-durability-dispose-replay-test))
+           #:run-durability-dispose-replay-test
+           #:run-dare-sha384-hkdf-kat-test
+           #:run-dare-aes-gcm-kat-test
+           #:run-dare-ml-kem-kat-test
+           #:run-dare-envelope-test
+           #:run-dare-key-provider-test
+           #:run-dare-encrypted-store-test
+           #:run-dare-encrypted-store-lifecycle-test
+           #:run-dare-service-transparency-test))

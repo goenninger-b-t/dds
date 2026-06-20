@@ -846,6 +846,171 @@
                                    i (length blob) body-end))))))
     t))
 
+;;; ---- WP-DURABILITY-DARE open-path fuzz (NFR-SEC-POSTURE; the operating contract §4) ----
+;;;; OPEN-PAYLOAD (dds.dare) is the sole UNTRUSTED parse surface of the DARE envelope: it takes a
+;;;; sealed blob that, on a disk-backed store (slice 3b) or any tampered medium, is HOSTILE input.
+;;;; Its contract (envelope.lisp) is fail-closed + bounds-checked even at (safety 0): for ANY input
+;;;; it MUST return either NIL (reject — short/oversized/tampered/wrong-AAD/garbage) or the CORRECT
+;;;; plaintext (a genuinely-sealed blob opened under its true AAD) — NEVER an error, OOB, or crash.
+;;;; The bounds guards in open-payload ((< sealed-len +envelope-min-sealed-len+), version-byte check,
+;;;; the ct-len split) are EXPLICIT manual checks, NOT compiler bounds, so they are safety-independent
+;;;; by construction; a (safety 0) wrapper arm confirms it and must reach the SAME verdict.
+;;;; The cryptographic correctness (seal/open round-trip + tamper) is proved separately by the NIST
+;;;; KATs (run-dare-*-kat-test) + run-dare-envelope-test; this arm fuzzes the open path's robustness.
+
+(defconstant +fuzz-dare-max-pt+ 48 "Max plaintext octets a DARE open-path fuzz case seals (covers empty..multi-block).")
+(defconstant +fuzz-dare-min-sealed+ 29
+  "Minimum valid DARE sealed-blob length (version 1 + nonce 12 + tag 16); mirrors dds.dare::+envelope-min-sealed-len+. A shorter blob MUST reject.")
+
+(defun* %gen-dare-aad (prng)
+    (function (prng) (simple-array (unsigned-byte 8) (*)))
+  "A pseudo-random AAD octet vector for the DARE open-path fuzz (length 0..40, random bytes)."
+  (let* ((n (prng-int prng 0 40))
+         (v (make-array n :element-type '(unsigned-byte 8))))
+    (dotimes (i n v) (setf (aref v i) (prng-int prng 0 255)))))
+
+(defun* %dare-tamper (blob prng)
+    (function ((simple-array (unsigned-byte 8) (*)) prng) (simple-array (unsigned-byte 8) (*)))
+  "Return a copy of sealed BLOB with one octet flipped at a random position (tamper any of
+   version / nonce / ciphertext / tag). A zero-length blob is returned unchanged."
+  (let ((v (copy-seq blob)))
+    (when (> (length v) 0)
+      (let ((p (prng-int prng 0 (1- (length v)))))
+        (setf (aref v p) (logxor (aref v p) (1+ (prng-int prng 0 254))))))
+    v))
+
+(defun* %gen-dare-open-case (dek prng)
+    (function ((simple-array (unsigned-byte 8) (*)) prng)
+              (values (simple-array (unsigned-byte 8) (*))
+                      (simple-array (unsigned-byte 8) (*))
+                      t))
+  "Generate one adversarial (sealed-blob aad expected) DARE open-path fuzz case from PRNG.
+   EXPECTED is the correct plaintext octet vector that OPEN-PAYLOAD must return for this
+   (blob, aad) pair, or NIL when the case must reject. Families: too-short, oversized-random,
+   pure-random, all-zero, a VALID seal opened under its true AAD (expect the plaintext),
+   a valid seal opened under a DIFFERENT AAD (expect NIL), and a valid-then-tampered blob
+   (expect NIL). The DEK is held constant across the run (one fresh per-store key)."
+  (let ((family (prng-int prng 0 7)))
+    (case family
+      (0 ;; too-short: 0..28 random octets -> MUST reject
+       (let* ((n (prng-int prng 0 (1- +fuzz-dare-min-sealed+)))
+              (v (make-array n :element-type '(unsigned-byte 8))))
+         (dotimes (i n) (setf (aref v i) (prng-int prng 0 255)))
+         (values v (%gen-dare-aad prng) nil)))
+      (1 ;; oversized random (>= min) -> MUST reject (random bytes won't authenticate)
+       (let* ((n (prng-int prng +fuzz-dare-min-sealed+ (+ +fuzz-dare-min-sealed+ +fuzz-dare-max-pt+)))
+              (v (make-array n :element-type '(unsigned-byte 8))))
+         (dotimes (i n) (setf (aref v i) (prng-int prng 0 255)))
+         (values v (%gen-dare-aad prng) nil)))
+      (2 ;; pure-random length 0..min+slop -> reject (or NIL)
+       (let* ((n (prng-int prng 0 (+ +fuzz-dare-min-sealed+ 8)))
+              (v (make-array n :element-type '(unsigned-byte 8))))
+         (dotimes (i n) (setf (aref v i) (prng-int prng 0 255)))
+         (values v (%gen-dare-aad prng) nil)))
+      (3 ;; all-zero (valid version byte 0 != 1 -> reject on version check)
+       (values (make-array (prng-int prng +fuzz-dare-min-sealed+ (+ +fuzz-dare-min-sealed+ 8))
+                           :element-type '(unsigned-byte 8) :initial-element 0)
+               (%gen-dare-aad prng) nil))
+      (t ;; families 4-7: a GENUINELY-sealed blob (the only accept path + its tamper/wrong-AAD rejects)
+       (let* ((pt-len (prng-int prng 0 +fuzz-dare-max-pt+))
+              (pt     (make-array pt-len :element-type '(unsigned-byte 8)))
+              (nonce  (make-array 12 :element-type '(unsigned-byte 8)))
+              (aad    (%gen-dare-aad prng)))
+         (dotimes (i pt-len) (setf (aref pt i) (prng-int prng 0 255)))
+         (dotimes (i 12) (setf (aref nonce i) (prng-int prng 0 255)))
+         (let ((sealed (dds.dare:seal-payload dek nonce aad pt)))
+           (case family
+             (4 (values sealed aad pt))                                  ; true AAD -> expect plaintext
+             (5 (values (%dare-tamper sealed prng) aad nil))             ; tampered -> reject
+             (6 (values sealed                                           ; different AAD -> reject
+                        (let ((a2 (copy-seq aad)))
+                          (if (> (length a2) 0)
+                              (progn (setf (aref a2 0) (logxor (aref a2 0) 1)) a2)
+                              (make-array 1 :element-type '(unsigned-byte 8) :initial-element 7)))
+                        nil))
+             (t (values (subseq sealed 0 (prng-int prng 0 (max 0 (1- (length sealed))))) ; strictly-truncated valid -> reject
+                        aad nil)))))))))
+
+(defun* %dare-octets= (a b)
+    (function (t t) t)
+  "T iff A and B are octet vectors of equal length + contents (NIL/NIL is also T)."
+  (cond ((and (null a) (null b)) t)
+        ((or (null a) (null b)) nil)
+        ((/= (length a) (length b)) nil)
+        (t (loop for i below (length a) always (= (aref a i) (aref b i))))))
+
+(defun* %dare-open-safety0 (dek sealed aad)
+    (function ((simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              t)
+  "Call OPEN-PAYLOAD under (SAFETY 0). The envelope bounds guards are EXPLICIT manual checks
+   (length / version-byte / ct-len split, envelope.lisp), so they are safety-independent: this
+   must reach the same verdict (NIL vs plaintext) as the production-policy call. Returns the
+   open-payload result; an OOB would corrupt/crash rather than return."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (dds.dare:open-payload dek sealed aad))
+
+(defun* fuzz-dare-open-payload ()
+    (function () t)
+  "Property-based fuzz of the UNTRUSTED dds.dare:OPEN-PAYLOAD parse path (WP-DURABILITY-DARE,
+   NFR-SEC-POSTURE; the operating contract §4). One fresh per-store DEK (ML-KEM-1024 encapsulate
+   -> HKDF-SHA384) is derived once, then a large corpus of adversarial sealed blobs is opened:
+   too-short (< 29 -> MUST reject via the length guard, no OOB), oversized/pure-random/all-zero
+   (reject), a GENUINELY-sealed blob under its true AAD (MUST return the exact plaintext — the
+   only accept path), and a tampered / wrong-AAD / truncated valid blob (MUST reject, fail-closed).
+   Each case MUST return NIL or the CORRECT plaintext — NEVER an error, OOB, or crash. A (safety 0)
+   wrapper arm (%dare-open-safety0) confirms the explicit manual bounds guards are safety-independent
+   and reaches the SAME verdict. Skips cleanly (returns T) when OpenSSL >= 3.5 is unavailable
+   (dare-unavailable) — the crypto correctness itself is proved by the NIST KATs. Deterministic +
+   seeded (reproducible on SBCL + Clasp); N iterations; signals test-failure on any OOB / uncaught
+   error / wrong plaintext / verdict disagreement. The DEK foreign secret is freed in unwind-protect."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [dare-open-payload-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from fuzz-dare-open-payload t)))
+  (let* ((prng   (make-prng #xDA7EC0DE))
+         (iters  3000)
+         (pub    nil) (ss nil) (dek nil))
+    (multiple-value-setq (pub ss) (dds.dare:ml-kem-1024-keygen))
+    (multiple-value-bind (kem-ct shared) (dds.dare:ml-kem-1024-encapsulate pub)
+      (declare (ignore kem-ct))
+      (setf dek (dds.dare:derive-dek shared))
+      (setf shared (dds.dare:free-secret-octets shared)))
+    (setf ss (dds.dare:free-secret-octets ss))
+    (unwind-protect
+         (dotimes (i iters t)
+           (multiple-value-bind (sealed aad expected) (%gen-dare-open-case dek prng)
+             (let ((prod (handler-case (dds.dare:open-payload dek sealed aad)
+                           (error (e)
+                             (error 'test-failure :name "dare-open-payload-fuzz"
+                                    :detail (format nil "iter ~d sealed-len ~d aad-len ~d: open-payload signalled (must fail-closed to NIL): ~a"
+                                                    i (length sealed) (length aad) e)))))
+                   (s0   (handler-case (%dare-open-safety0 dek sealed aad)
+                           (error (e)
+                             (error 'test-failure :name "dare-open-payload-fuzz"
+                                    :detail (format nil "iter ~d sealed-len ~d aad-len ~d: (safety 0) open-payload leaked OOB/error: ~a"
+                                                    i (length sealed) (length aad) e))))))
+               ;; verdict must equal the oracle: NIL for a reject case, the exact plaintext for the accept case
+               (unless (%dare-octets= prod expected)
+                 (error 'test-failure :name "dare-open-payload-fuzz"
+                        :detail (format nil "iter ~d sealed-len ~d aad-len ~d: open-payload returned ~a, expected ~a (fail-closed/round-trip violated)"
+                                        i (length sealed) (length aad)
+                                        (if prod (format nil "~d-octet plaintext" (length prod)) "NIL")
+                                        (if expected (format nil "~d-octet plaintext" (length expected)) "NIL"))))
+               ;; a too-short blob must have rejected (NIL) — the explicit length guard
+               (when (and (< (length sealed) +fuzz-dare-min-sealed+) prod)
+                 (error 'test-failure :name "dare-open-payload-fuzz"
+                        :detail (format nil "iter ~d: too-short sealed (len ~d < ~d) ACCEPTED — bounds guard failed"
+                                        i (length sealed) +fuzz-dare-min-sealed+)))
+               ;; the production and (safety 0) arms must agree (the guards are safety-independent)
+               (unless (%dare-octets= prod s0)
+                 (error 'test-failure :name "dare-open-payload-fuzz"
+                        :detail (format nil "iter ~d sealed-len ~d: production verdict != (safety 0) verdict (a bounds guard depends on SAFETY)"
+                                        i (length sealed)))))))
+      (setf dek (dds.dare:free-secret-octets dek)))))
+
 ;;; ---- generators + properties ----
 
 (defun* gsample= (a b)
@@ -1040,7 +1205,9 @@
     (fuzz-durability-config)
     ;; WP-DURABILITY-DEDUP PID_ORIGINAL_WRITER_INFO parse fuzz: random/short/oversized/off-end octets + inline-QoS blob walk; prod + safety-0 (NFR-SEC-POSTURE; RTPS 2.5 §8.3.5.4)
     (fuzz-original-writer-info-parse)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0) + owi-parse fuzz 2000 iters (PID_ORIGINAL_WRITER_INFO parse: random/short/oversized/off-end octets + inline-QoS blob walk; BOTH arms prod + safety-0, NFR-SEC-POSTURE), deterministic seed.~%" runs)
+    ;; WP-DURABILITY-DARE open-path fuzz: adversarial sealed blobs (short/oversized/tampered/wrong-AAD) + a valid seal -> NIL or the correct plaintext, never OOB; prod + safety-0; SKIPs if OpenSSL<3.5 (NFR-SEC-POSTURE)
+    (fuzz-dare-open-payload)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0) + owi-parse fuzz 2000 iters (PID_ORIGINAL_WRITER_INFO parse: random/short/oversized/off-end octets + inline-QoS blob walk; BOTH arms prod + safety-0, NFR-SEC-POSTURE) + dare-open-payload fuzz 3000 iters (adversarial sealed blobs -> NIL or correct plaintext, fail-closed + bounds-checked, prod + safety-0; SKIP if OpenSSL<3.5, NFR-SEC-POSTURE), deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

@@ -156,6 +156,7 @@ behavioural-reference-via-interop use, not a clean-room breach:
 | `cffi` | FFI (sockets/SHMEM/crypto later) | MIT |
 | `bordeaux-threads` | portable threads/locks | MIT |
 | `chipz` | pure-Lisp ZLIB inflate of inbound RTI `PID_TYPE_OBJECT_LB` (ADR 0009; control plane, off the hot path) | BSD-3-Clause |
+| OpenSSL (`libcrypto`) ≥ 3.5 | vetted native CNSA-2.0 crypto for `dds-dare` Data-At-Rest Encryption (AES-256-GCM + ML-KEM-1024 + SHA-384/HKDF) via CFFI; FR-SEC-2 (no hand-rolling); control plane, off the hot path (ADR 0025) | Apache-2.0 |
 | Quicklisp | dependency loading (dev) | — |
 | Clasp `boehmprecise` | the M0 target implementation | LGPL-2.1 (runtime) |
 
@@ -1697,3 +1698,38 @@ A signalled `%shmem-send` hard fault is caught in `%send-raw-buf` (`dds.disc`), 
 - **OMG RTPS 2.5 spec citations:** `PID_ORIGINAL_WRITER_INFO` is defined in §8.3.5.4
   (`OriginalWriterInfo`) and Table 9.12; `SequenceNumber` layout in §8.3.3.4. These are the
   normative references for the Phase 2 implementation.
+
+## M6/P5 — WP-DURABILITY-DARE: OpenSSL ≥ 3.5 native crypto (2026-06-19, ADR 0025)
+
+- **OpenSSL (`libcrypto`) ≥ 3.5 (Apache-2.0, The OpenSSL Project)** added as a **native runtime
+  dependency** of the new `dds-dare` system — the vetted CNSA-2.0 crypto backend for the durability
+  service's always-on Data-At-Rest Encryption (ADR 0021 capability 7): AES-256-GCM (FIPS-197 / NIST
+  SP 800-38D), ML-KEM-1024 (FIPS-203), and SHA-384 + HKDF (FIPS-180-4 / RFC 5869 / NIST SP 800-56C).
+  This satisfies **FR-SEC-2 (vetted native crypto, NO hand-rolling)**: we bind + compose
+  (KEM-DEM envelope, the HKDF domain-separator label, counter-nonce discipline, AAD) per NIST
+  guidance and implement no primitive ourselves. The version verified on this host is **OpenSSL
+  3.6.2 (7 Apr 2026)**; **≥ 3.5 is a hard requirement** (ML-KEM landed in the 3.5 LTS),
+  runtime-checked at startup (`dare-available-p` → hard error, never a plaintext fallback).
+- **No OpenSSL source/headers were copied.** The CFFI bindings (`src/dds-dare/openssl-ffi.lisp`)
+  are clean-room: each EVP signature is **pinned against the installed OpenSSL 3.6.2 public headers**
+  (`evp.h`/`kdf.h`/`core.h`/`crypto.h`, file + line cited in-source) and verified by **published
+  NIST/IETF/Wycheproof Known-Answer Tests** (FIPS-180-4 SHA-384, Google Wycheproof HKDF-SHA-384,
+  NIST SP 800-38D GCM Test Case 16, C2SP/CCTV ML-KEM-1024 — never self-generated). The OSSL_PARAM
+  struct layout was confirmed by C `offsetof` on this host (arm64-macOS), recorded in-source, not
+  taken from any vendor artifact.
+- **Google Wycheproof (Apache-2.0, Google) — published crypto test-vector source, read as data only,
+  no code copied.** The HKDF-SHA384 KAT (`src/dds-tests/dare-test.lisp`) pins two vectors verbatim
+  from **`testvectors_v1/hkdf_sha384_test.json`** (`algorithm "HKDF-SHA-384"`, schema
+  `hkdf_test_schema_v1.json`): tcId 1 (empty salt + empty info — matches `derive-dek`'s empty-salt
+  usage) and tcId 4 (empty salt + non-empty info). Wycheproof computes its expected OKM with a different
+  implementation, so our OpenSSL EVP_KDF reproducing them byte-exactly on both SBCL and Clasp is
+  genuine independent conformance — replacing the prior self-generated (OpenSSL-CLI-derived) HKDF
+  regression vector, which only self-tested OpenSSL against itself (RFC 5869 standardises no SHA-384
+  vector). The SHA-384("abc") KAT stays anchored to FIPS PUB 180-4 §B.2.
+- **libsodium NOT used** (owner directive "use libsodium if appropriate" → not-appropriate): it
+  lacks ML-KEM and SHA-384; OpenSSL ≥ 3.5 covers all three, so libsodium would be redundant FFI/SBOM
+  surface. Recorded in ADR 0025.
+- **SBOM:** OpenSSL is pinned in `scripts/generate-sbom.py`'s component table and emitted as a native
+  runtime `software_Package` (Apache-2.0, `dependsOn` the product), mirroring the SBCL runtime entry
+  — CRA Annex I top-level coverage. (Loaded via CFFI, it is not an ASDF `:depends-on`, so it is
+  emitted explicitly rather than via the ASDF scan.)

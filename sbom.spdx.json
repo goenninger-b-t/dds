@@ -3,7 +3,7 @@
   "@graph": [
     {
       "@id": "_:creationinfo",
-      "created": "2026-06-19T14:12:53Z",
+      "created": "2026-06-20T10:09:51Z",
       "createdBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
       ],
@@ -75,6 +75,12 @@
       "type": "simplelicensing_LicenseExpression"
     },
     {
+      "creationInfo": "_:creationinfo",
+      "simplelicensing_licenseExpression": "Apache-2.0",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#license/Apache-2.0",
+      "type": "simplelicensing_LicenseExpression"
+    },
+    {
       "comment": "OMG DDS 1.4 / DDSI-RTPS 2.5 / XCDR middleware in Common Lisp. Project code + documentation licensed CC-BY-ND-4.0 (see LICENSE.md / COPYRIGHT.md). Third-party dependencies retain their own licences.",
       "creationInfo": "_:creationinfo",
       "name": "common-lisp-dds",
@@ -84,8 +90,8 @@
       "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
       "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
       "software_homePage": "https://github.com/goenninger-b-t/dds",
-      "software_packageUrl": "pkg:github/goenninger-b-t/dds@c212408",
-      "software_packageVersion": "0.0.0-dev+git.c212408",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@2697b51",
+      "software_packageVersion": "0.0.0-dev+git.2697b51",
       "software_primaryPurpose": "library",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
@@ -202,17 +208,50 @@
     },
     {
       "creationInfo": "_:creationinfo",
+      "name": "The OpenSSL Project",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/The-OpenSSL-Project",
+      "type": "Organization"
+    },
+    {
+      "comment": "Native crypto backend for dds-dare (CNSA-2.0 DARE: AES-256-GCM, ML-KEM-1024, SHA-384/HKDF via libcrypto). >= 3.5 is a HARD runtime requirement (ML-KEM landed in 3.5 LTS); runtime-checked at startup (dare-available-p), hard-error if absent (no plaintext fallback). Version 3.6.2 verified on this host (docs/provenance.md, FR-SEC-2).",
+      "creationInfo": "_:creationinfo",
+      "name": "openssl",
+      "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/Apache-2.0",
+      "software_downloadLocation": "https://www.openssl.org/source/",
+      "software_homePage": "https://www.openssl.org/",
+      "software_packageUrl": "pkg:generic/openssl@3.6.2",
+      "software_packageVersion": "3.6.2",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/openssl",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/The-OpenSSL-Project",
+      "type": "software_Package"
+    },
+    {
+      "comment": "native runtime dependency (dds-dare CNSA-2.0 DARE; OpenSSL >= 3.5)",
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-openssl",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/openssl"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "creationInfo": "_:creationinfo",
       "element": [
         "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
         "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
+        "https://github.com/goenninger-b-t/dds/sbom#package/openssl",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-cffi",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-chipz",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-static-vectors",
-        "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl"
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-openssl"
       ],
       "rootElement": [
         "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds"
@@ -237,12 +276,15 @@
         "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
         "https://github.com/goenninger-b-t/dds/sbom#license/CC0-1.0",
         "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
+        "https://github.com/goenninger-b-t/dds/sbom#license/Apache-2.0",
         "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
         "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
         "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/The-OpenSSL-Project",
+        "https://github.com/goenninger-b-t/dds/sbom#package/openssl",
         "https://github.com/goenninger-b-t/dds/sbom#sbom",
         "https://github.com/goenninger-b-t/dds/sbom#sbom"
       ],

@@ -42,6 +42,14 @@ COMPONENTS = {
     "chipz":            {"version": "0.8", "license": "BSD-3-Clause",
                          "download": "https://github.com/froydnj/chipz",
                          "supplier": "Nathan Froyd"},
+    # OpenSSL is a NATIVE runtime dependency of dds-dare (CNSA-2.0 DARE: AES-256-GCM +
+    # ML-KEM-1024 + SHA-384/HKDF via libcrypto, loaded through CFFI — not an ASDF :depends-on),
+    # so it is emitted as a native runtime package below (mirroring the SBCL runtime entry),
+    # not via the ASDF scan. >= 3.5 is a HARD deployment requirement (ML-KEM landed in 3.5 LTS);
+    # 3.6.2 is the version verified on this host (docs/provenance.md, FR-SEC-2 vetted crypto).
+    "openssl":          {"version": "3.6.2", "license": "Apache-2.0",
+                         "download": "https://www.openssl.org/source/",
+                         "supplier": "The OpenSSL Project"},
 }
 
 
@@ -93,11 +101,13 @@ def main():
     lic_mit = NS + "license/MIT"
     lic_cc0 = NS + "license/CC0-1.0"
     lic_proj = NS + "license/CC-BY-ND-4.0"
+    lic_apache = NS + "license/Apache-2.0"
     author = NS + "agent/frank-goenninger"
     sbom_id = NS + "sbom"
     doc_id = NS + "document"
     root_pkg = NS + "package/common-lisp-dds"
     rt_pkg = NS + "package/sbcl"
+    openssl_pkg = NS + "package/openssl"
 
     graph = []
     elements = []   # every spdxId-bearing element (for SpdxDocument.element)
@@ -131,7 +141,9 @@ def main():
                   "creationInfo": ci, "simplelicensing_licenseExpression": "CC0-1.0"})
     graph.append({"spdxId": lic_proj, "type": "simplelicensing_LicenseExpression",
                   "creationInfo": ci, "simplelicensing_licenseExpression": "CC-BY-ND-4.0"})
-    elements += [lic_mit, lic_cc0, lic_proj]
+    graph.append({"spdxId": lic_apache, "type": "simplelicensing_LicenseExpression",
+                  "creationInfo": ci, "simplelicensing_licenseExpression": "Apache-2.0"})
+    elements += [lic_mit, lic_cc0, lic_proj, lic_apache]
 
     # Root product package.
     root = {"spdxId": root_pkg, "type": "software_Package", "creationInfo": ci,
@@ -185,10 +197,40 @@ def main():
                   "from": root_pkg, "to": [rt_pkg], "relationshipType": "dependsOn",
                   "comment": "runtime dependency"})
 
+    # Native runtime: OpenSSL >= 3.5 (the CNSA-2.0 DARE crypto backend for dds-dare; loaded via
+    # CFFI, not an ASDF :depends-on, so emitted explicitly here — CRA Annex I top-level coverage).
+    ossl = COMPONENTS["openssl"]
+    ossl_sup = ossl["supplier"]
+    if ossl_sup not in suppliers:
+        ossl_sup_id = NS + "agent/" + slug(ossl_sup)
+        suppliers[ossl_sup] = ossl_sup_id
+        graph.append({"spdxId": ossl_sup_id, "type": "Organization", "creationInfo": ci,
+                      "name": ossl_sup})
+        elements.append(ossl_sup_id)
+    graph.append({"spdxId": openssl_pkg, "type": "software_Package", "creationInfo": ci,
+                  "name": "openssl", "software_packageVersion": ossl["version"],
+                  "software_downloadLocation": ossl["download"],
+                  "software_homePage": "https://www.openssl.org/",
+                  "software_packageUrl": "pkg:generic/openssl@" + ossl["version"],
+                  "software_primaryPurpose": "library",
+                  "software_declaredLicense": lic_apache,
+                  "suppliedBy": suppliers[ossl_sup],
+                  "comment": "Native crypto backend for dds-dare (CNSA-2.0 DARE: AES-256-GCM, "
+                             "ML-KEM-1024, SHA-384/HKDF via libcrypto). >= 3.5 is a HARD runtime "
+                             "requirement (ML-KEM landed in 3.5 LTS); runtime-checked at startup "
+                             "(dare-available-p), hard-error if absent (no plaintext fallback). "
+                             "Version 3.6.2 verified on this host (docs/provenance.md, FR-SEC-2)."})
+    elements.append(openssl_pkg)
+    ossl_rel = NS + "relationship/runtime-openssl"
+    relationships.append(ossl_rel)
+    graph.append({"spdxId": ossl_rel, "type": "Relationship", "creationInfo": ci,
+                  "from": root_pkg, "to": [openssl_pkg], "relationshipType": "dependsOn",
+                  "comment": "native runtime dependency (dds-dare CNSA-2.0 DARE; OpenSSL >= 3.5)"})
+
     # The SBOM element (its rootElement is the product; contents are deps + relationships).
     graph.append({"spdxId": sbom_id, "type": "software_Sbom", "creationInfo": ci,
                   "software_sbomType": ["source"], "rootElement": [root_pkg],
-                  "element": dep_ids + [rt_pkg] + relationships})
+                  "element": dep_ids + [rt_pkg, openssl_pkg] + relationships})
     elements.append(sbom_id)
 
     # The containing document.

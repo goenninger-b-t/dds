@@ -415,15 +415,108 @@ tshark -i lo0 -T json -x -f "udp" \
 
 ---
 
-## 7. Cross-references
+## 7. DARE — always-on CNSA-2.0 Data-At-Rest Encryption (Phase 3a, WP-DURABILITY-DARE)
 
-- ADR 0021 — Durability service scope decision (owner directive 2026-06-18)
+Phase 3a (ADR 0021 **capability 7**, ADR 0025) adds an **always-on CNSA-2.0 Data-At-Rest
+Encryption** layer over the durable store, so persisted samples are never held in plaintext. It is
+a **`durable-store` decorator** (`make-encrypted-store`) — it wraps any inner store and is built and
+proven over the in-memory store in 3a; the disk-backed store (slice 3b) plugs underneath the same
+decorator so disk holds only sealed bytes.
+
+### 7.1 The envelope (KEM-DEM)
+
+The decorator implements the NIST envelope-encryption pattern with the CNSA-2.0 suite (the new
+`dds-dare` system):
+
+- **Key establishment:** ML-KEM-1024 (FIPS-203, post-quantum) — on store open, the decorator
+  encapsulates to the key-provider's recipient public key → `(kem-ciphertext, shared-secret)`, then
+  derives **`DEK = HKDF-SHA384(shared-secret, info="dds-dare/dek/v1")`** (a 256-bit AES key). On open
+  the provider decapsulates with the private key to re-derive the same DEK.
+- **Per-record sealing:** AES-256-GCM (FIPS-197 / NIST SP 800-38D) under the DEK, with a **per-store
+  96-bit counter nonce** and **AAD = `topic ∥ writer-guid ∥ sn ∥ kind`** (authenticated, not
+  encrypted — the inner store indexes/replays by these). The on-store bytes are
+  `version(1) ∥ nonce(12) ∥ ciphertext ∥ tag(16)`.
+- **Fail-closed:** opening a tampered, wrong-key, short, or wrong-AAD blob returns NIL — never
+  plaintext. `store-get-range` **drops** a record that fails to open (counts it, fires
+  `dds.durability:*dare-error-hook*`).
+
+Only the CDR payload is encrypted; record metadata stays cleartext-authenticated (metadata
+confidentiality is a MUST follow-on, ADR 0025 §10). **DARE is at-rest only — it adds nothing to the
+wire** (data-in-transit is the separate P6 DDS-Security work).
+
+### 7.2 Secure-store factory — worked example
+
+`make-service-spec` takes a `:store` slot (a 0-arg factory). To get an always-on encrypted store,
+wrap the inner store in the decorator backed by a file key-provider:
+
+```lisp
+(require :dds-durability)   ; pulls in dds-dare
+
+(defparameter *keydir* (uiop:ensure-directory-pathname "/var/lib/dds-dare/keys"))
+
+(defparameter *spec*
+  (dds.durability:make-service-spec
+   :domain 0
+   :topics '(("Square" . "ShapeType"))
+   ;; the ONLY delta vs a plain service: the store factory wraps the inner store in DARE
+   :store (lambda ()
+            (dds.durability:make-encrypted-store
+             (dds.durability:make-memory-store)
+             (dds.dare:make-file-key-provider :dir *keydir*)))
+   :name "secure-durability-service"))
+
+(defparameter *runner* (dds.durability:make-service-runner (list *spec*)))
+(dds.durability:runner-start *runner*)
+;; samples collected by the service are now SEALED in the store and OPENED on replay;
+;; a late-joiner receives byte-correct plaintext — DARE is transparent to the relay path.
+(dds.durability:runner-stop *runner*)
+```
+
+- `dds.durability:make-encrypted-store inner-store key-provider` — seals on `store-put`, opens on
+  `store-get-range`, delegates `topics`/`purge`/`count`/`open`/`close` to the inner store. On
+  construction it opens the provider, ML-KEM-1024-encapsulates, derives the DEK, and frees the
+  transient shared secret. The DEK is a foreign-backed secret (a `static-vector`, zeroized+freed on
+  `store-close`).
+- `dds.dare:make-file-key-provider :dir DIR` — an ML-KEM-1024 keypair in `DIR/ml-kem-1024.{pub,key}`,
+  generated on first open (perms enforced **0600 file / 0700 dir** and checked at open — a
+  group/other-readable or unverifiable key **refuses to load**, fail-closed) and loaded thereafter.
+  Decapsulation is internal, so the raw private key never leaves the provider — the **KMS hook
+  point** (an HSM/cloud-KMS backend supplies different vtable closures).
+
+### 7.3 Deployment requirement — OpenSSL ≥ 3.5
+
+DARE uses **OpenSSL ≥ 3.5** (`libcrypto`) for all three CNSA-2.0 algorithms — **ML-KEM landed in the
+3.5 LTS**, so this is a **hard runtime requirement**. It is checked at startup
+(`dds.dare:dare-available-p`); if OpenSSL is absent, below 3.5, or ML-KEM-1024 is not fetchable, DARE
+signals `dds.dare:dare-unavailable` — a **hard error, never a silent plaintext fallback**. On macOS
+the bindings resolve the real homebrew `libcrypto` explicitly (a `$DDS_DARE_LIBCRYPTO` env override is
+honoured first) to avoid binding the system LibreSSL, which lacks ML-KEM; on Linux they fall back to
+`libcrypto.so.3`. No hand-rolled crypto (FR-SEC-2); OpenSSL is SBOM-pinned and recorded in
+`docs/provenance.md`.
+
+### 7.4 Scope & follow-ons
+
+DARE 3a protects **stored payloads** (confidentiality + integrity + authenticity; tampering is
+detected and fails closed). The MUST follow-ons (ADR 0025 §10): **3b** disk-backed PERSISTENT store +
+the cross-restart key-epoch the `version` byte reserves; **3c** metadata confidentiality; in-RAM
+plaintext minimization (with an honest pure-Lisp feasibility caveat); and **P6** DDS-Security for
+in-transit confidentiality.
+
+---
+
+## 8. Cross-references
+
+- ADR 0021 — Durability service scope decision (owner directive 2026-06-18; cap. 7 = always-on DARE)
 - ADR 0022 — TRANSIENT_LOCAL as-built behavior (writer-side retention + late-joiner replay)
 - ADR 0023 — TRANSIENT durability service Phase-1 architecture
+- ADR 0024 — Dedup map architecture (watermark + bounded reorder set)
+- ADR 0025 — DARE: CNSA-2.0 Data-At-Rest Encryption (the KEM-DEM envelope, key-provider, fail-closed, secret handling)
+- `docs/superpowers/specs/2026-06-19-durability-dare-design.md` — the DARE design spec
 - `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md` — PID_ORIGINAL_WRITER_INFO spike
 - `interop/durability-transient/` — cross-DDS interop captures and README
-- `src/dds-durability/` — service implementation (store / spec / service / runner / supervisor / main)
-- `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`)
-- `src/dds-tests/pbt-test.lisp` — PID-parse fuzz arm (`fuzz-original-writer-info-parse`, NFR-SEC-POSTURE)
 - `interop/durability-dedup/` — PID_ORIGINAL_WRITER_INFO cross-DDS legs + coexistence captures
-- ADR 0024 — Dedup map architecture (watermark + bounded reorder set)
+- `interop/durability-dare/` — DARE cross-DDS transparency captures (Connext 352 / Fast DDS 152)
+- `src/dds-durability/` — service implementation (store / spec / service / runner / supervisor / main / store-encrypted)
+- `src/dds-dare/` — DARE crypto (openssl-ffi / primitives / envelope / key-provider)
+- `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-dare-*`)
+- `src/dds-tests/pbt-test.lisp` — PID-parse fuzz arm (`fuzz-original-writer-info-parse`) + DARE open-path fuzz arm (`fuzz-dare-open-payload`), NFR-SEC-POSTURE
