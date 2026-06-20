@@ -9,9 +9,9 @@
            #:service-spec #:make-service-spec #:service-spec-matches-p
            #:service-spec-domain #:service-spec-topics #:service-spec-store
            #:service-spec-mode #:service-spec-qos-overrides #:service-spec-name
-           #:durability-service #:make-durability-service #:service-start #:service-stop #:service-alive-p
+           #:durability-service #:make-durability-service #:service-start #:service-stop #:service-alive-p #:service-add-topic
            #:durability-service-store #:durability-service-node #:durability-service-nodes
-           #:durability-service-spec
+           #:durability-service-topic-names #:durability-service-spec
            #:*durability-error-hook* #:*durability-debug-start-fault*
            #:service-runner #:make-service-runner #:runner-start #:runner-stop #:runner-status
            #:service-runner-services
@@ -21,4 +21,7 @@
            #:parse-durability-config
            #:durability-config-error
            #:%spec->argv
-           #:make-encrypted-store #:*dare-error-hook*))
+           #:make-encrypted-store #:*dare-error-hook*
+           #:make-file-store #:file-store-sync
+           #:durable-store-sync #:store-sync
+           #:make-persistent-store-factory))

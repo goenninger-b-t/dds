@@ -40,7 +40,9 @@
    ;; gc control / measurement
    #:gc-suggest #:with-gc-inhibited #:bytes-consed
    ;; optimization hints
-   #:with-hot-optimizations))
+   #:with-hot-optimizations
+   ;; file sync (group-commit; fdatasync on SBCL, finish-output on Clasp — NFR-PORT)
+   #:fsync-stream))
 
 (in-package #:dds.pal)
 

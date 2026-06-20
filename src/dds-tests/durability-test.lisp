@@ -1488,3 +1488,813 @@
       (ignore-errors (dds.durability:store-close svc-store))
       (when (uiop:directory-exists-p tmp-dir)
         (uiop:delete-directory-tree tmp-dir :validate t)))))
+
+;;; --- file-store backend (Task 1 of WP-DURABILITY-PERSISTENT) ---
+;;; Round-trip + reopen-from-disk + idempotent re-put test for make-file-store.
+;;; Domain-independent (no network — purely local file I/O).
+
+(defun* run-durability-file-store-test ()
+    (function () t)
+  "make-file-store: put 5 records across 2 topics, get-range byte-exact + sorted, idempotent
+   re-put, topics=2, count=5, store-close; then reopen from same dir and verify all 5 survive."
+  (let* ((tmp-dir (uiop:merge-pathnames*
+                   (make-pathname :directory (list :relative
+                                                   (format nil "dds-file-store-test-~a"
+                                                           (get-universal-time))))
+                   (uiop:temporary-directory)))
+         (g0 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (g1 (let ((v (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref v 0) 1) v))
+         (p (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (s (dds.durability:make-file-store :dir tmp-dir)))
+    (unwind-protect
+         (progn
+           (dds.durability:store-open s)
+           ;; put 3 records on topic "A" (two guids, varied sn/kind)
+           (%check :fs-put-a1 (eq t (dds.durability:store-put s "A" g0 1 nil :data (funcall p '(10 20)))) "put A/g0/1")
+           (%check :fs-put-a2 (eq t (dds.durability:store-put s "A" g0 2 nil :data (funcall p '(30 40)))) "put A/g0/2")
+           (%check :fs-put-a3 (eq t (dds.durability:store-put s "A" g1 1 nil :dispose (funcall p '(50)))) "put A/g1/1 dispose")
+           ;; put 2 records on topic "B"
+           (%check :fs-put-b1 (eq t (dds.durability:store-put s "B" g0 1 nil :data (funcall p '(1 2 3)))) "put B/g0/1 data")
+           (%check :fs-put-b2 (eq t (dds.durability:store-put s "B" g1 5 nil :unregister (funcall p '(99)))) "put B/g1/5 unregister")
+           ;; counts
+           (%check :fs-count-total (= 5 (dds.durability:store-count s)) "total count 5")
+           (%check :fs-count-a     (= 3 (dds.durability:store-count s "A")) "topic A count 3")
+           (%check :fs-count-b     (= 2 (dds.durability:store-count s "B")) "topic B count 2")
+           ;; topics
+           (%check :fs-topics (equal '("A" "B") (sort (copy-list (dds.durability:store-topics s)) #'string<)) "topics A+B")
+           ;; get-range: A sorted by (guid bytes asc, sn asc) — g0 < g1; within g0: sn 1 then 2
+           (let ((recs-a (dds.durability:store-get-range s "A")))
+             (%check :fs-a-len  (= 3 (length recs-a)) "A get-range 3 records")
+             (%check :fs-a-ord0 (and (equalp g0 (dds.durability:durable-record-writer-guid (first recs-a)))
+                                     (= 1 (dds.durability:durable-record-sn (first recs-a))))
+                     "A[0] is g0/sn1")
+             (%check :fs-a-ord1 (and (equalp g0 (dds.durability:durable-record-writer-guid (second recs-a)))
+                                     (= 2 (dds.durability:durable-record-sn (second recs-a))))
+                     "A[1] is g0/sn2")
+             (%check :fs-a-ord2 (and (equalp g1 (dds.durability:durable-record-writer-guid (third recs-a)))
+                                     (= 1 (dds.durability:durable-record-sn (third recs-a))))
+                     "A[2] is g1/sn1")
+             ;; payload byte-exact
+             (%check :fs-a-payload0 (equalp (funcall p '(10 20))
+                                             (dds.durability:durable-record-payload (first recs-a)))
+                     "A[0] payload byte-exact")
+             (%check :fs-a-payload2 (equalp (funcall p '(50))
+                                             (dds.durability:durable-record-payload (third recs-a)))
+                     "A[2] payload byte-exact"))
+           ;; idempotent re-put: same (topic,guid,sn) -> T, count unchanged
+           (%check :fs-reput (eq t (dds.durability:store-put s "A" g0 1 nil :data (funcall p '(99)))) "re-put A/g0/1 -> T")
+           (%check :fs-reput-count (= 5 (dds.durability:store-count s)) "count still 5 after re-put")
+           (dds.durability:store-close s)
+           ;; reopen from same dir — all 5 records must survive disk round-trip
+           (let ((s2 (dds.durability:make-file-store :dir tmp-dir)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:store-open s2)
+                    (%check :fs-reopen-count  (= 5 (dds.durability:store-count s2)) "reopen: count=5")
+                    (%check :fs-reopen-topics (equal '("A" "B")
+                                                     (sort (copy-list (dds.durability:store-topics s2)) #'string<))
+                            "reopen: topics A+B")
+                    (let ((recs2 (dds.durability:store-get-range s2 "A")))
+                      (%check :fs-reopen-a-len (= 3 (length recs2)) "reopen A: 3 records")
+                      (%check :fs-reopen-a-payload0
+                              (equalp (funcall p '(10 20))
+                                      (dds.durability:durable-record-payload (first recs2)))
+                              "reopen A[0] payload byte-exact"))
+                    (dds.durability:store-close s2))
+               (ignore-errors (dds.durability:store-close s2)))))
+      (ignore-errors (dds.durability:store-close s))
+      (when (uiop:directory-exists-p tmp-dir)
+        (uiop:delete-directory-tree tmp-dir :validate t))))
+  t)
+
+;;; --- PERSISTENT service tier: restart → replay (Task 4 of WP-DURABILITY-PERSISTENT) ---
+;;; Write N TL samples → service-stop (store persists to disk, sealed + epoch-keyed).
+;;; Construct a FRESH service on the same dirs (simulating a restart) → service-start
+;;; (store-open re-derives prior epochs' DEKs, replays sealed logs).
+;;; A TL late-joiner that appears AFTER the restart receives all N retained samples
+;;; byte-exact (decrypted-on-replay via the replay writer — no original writer present).
+;;; Domain 117 avoids collision with all prior tests.
+
+(defun* run-durability-persistent-service-test ()
+    (function () t)
+  "PERSISTENT service tier: write N TL samples; service-stop (store persists); fresh service
+   on same dirs simulates restart; TL late-joiner receives all N byte-exact. Domain 117."
+  (unless (dds.dare:dare-available-p)
+    (format t "~&  [persistent-service] SKIP — OpenSSL >= 3.5 not available~%")
+    (return-from run-durability-persistent-service-test t))
+  (let* ((n 4)
+         (tmp-dir (uiop:merge-pathnames*
+                   (make-pathname :directory
+                                  (list :relative (format nil "dds-persistent-svc-~a"
+                                                          (get-universal-time))))
+                   (uiop:temporary-directory)))
+         (key-dir (uiop:merge-pathnames*
+                   (make-pathname :directory '(:relative "keys"))
+                   tmp-dir)))
+    (unwind-protect
+         (progn
+           ;; --- run 1: publisher writes N samples, service collects + persists ---
+           (let* ((spec1 (dds.durability:make-service-spec
+                          :domain 117
+                          :topics '(("PSquare" . "ShapeType"))
+                          :store (dds.durability:make-persistent-store-factory
+                                  :dir tmp-dir :key-dir key-dir)
+                          :name "persistent-run1"))
+                  (svc1  (dds.durability:make-durability-service spec1))
+                  (pub-prefix (%make-test-prefix #xC5))
+                  (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 117
+                                                     :host "127.0.0.1" :port 0
+                                                     :multicast nil)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:service-start svc1)
+                    (let ((svc1-node (dds.durability:durability-service-node svc1)))
+                      (setf (dds.disc:disc-node-peers pub-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port svc1-node))))
+                      (setf (dds.disc:disc-node-peers svc1-node)
+                            (list (cons "127.0.0.1" 0)))
+                      (dds.disc:add-local-writer pub-node :topic "PSquare" :type "ShapeType"
+                                                 :qos (dds.qos:make-writer-qos
+                                                       :reliability :reliable
+                                                       :durability :transient-local))
+                      (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+                      (dds.disc:start-node pub-node)
+                      (setf (dds.disc:disc-node-peers svc1-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-node))))
+                      (%await-match pub-node svc1-node :retries 300 :sleep-s 0.02)
+                      (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+                      (loop repeat 80
+                            do (%announce-both pub-node svc1-node) (sleep 0.05))
+                      (%await-store-count (dds.durability:durability-service-store svc1)
+                                          "PSquare" n)
+                      (%check :persistent-svc-collect
+                              (= n (dds.durability:store-count
+                                    (dds.durability:durability-service-store svc1) "PSquare"))
+                              (format nil "run1: service should collect ~d before stop, got ~d"
+                                      n (dds.durability:store-count
+                                         (dds.durability:durability-service-store svc1) "PSquare")))
+                      (ignore-errors (dds.disc:stop-node pub-node))))
+               ;; service-stop: store-close flushes + seals to disk
+               (ignore-errors (dds.durability:service-stop svc1))))
+           ;; DARE-at-rest through the SERVICE composition: no plaintext sample appears on disk.
+           ;; (the standalone dare-persistent test scans the bare store; this proves the
+           ;;  make-persistent-store-factory wiring actually seals via the service path too.)
+           (let ((raw (%pst-read-all-log-bytes tmp-dir)))
+             (dotimes (i n)
+               (%check :persistent-svc-no-plaintext
+                       (not (%pst-subseq-present-p raw (%make-small-payload (1+ i))))
+                       (format nil "service-tier DARE: plaintext sample ~d must not appear on disk" (1+ i)))))
+           ;; --- run 2: fresh service on same dirs simulates restart ---
+           (let* ((spec2 (dds.durability:make-service-spec
+                          :domain 117
+                          :topics '(("PSquare" . "ShapeType"))
+                          :store (dds.durability:make-persistent-store-factory
+                                  :dir tmp-dir :key-dir key-dir)
+                          :name "persistent-run2"))
+                  (svc2  (dds.durability:make-durability-service spec2)))
+             (unwind-protect
+                  (progn
+                    ;; service-start: store-open re-derives prior epoch DEKs, replays logs
+                    (dds.durability:service-start svc2)
+                    ;; assert the reloaded store has the N records from run 1
+                    (%check :persistent-svc-reload
+                            (= n (dds.durability:store-count
+                                  (dds.durability:durability-service-store svc2) "PSquare"))
+                            (format nil "run2: reloaded store expected ~d records, got ~d"
+                                    n (dds.durability:store-count
+                                       (dds.durability:durability-service-store svc2) "PSquare")))
+                    (let* ((lj-prefix (%make-test-prefix #xE5))
+                           (lj-node (dds.disc:make-disc-node
+                                     :guid-prefix lj-prefix :domain 117
+                                     :host "127.0.0.1" :port 0 :multicast nil))
+                           (svc2-node (dds.durability:durability-service-node svc2)))
+                      (unwind-protect
+                           (progn
+                             (dds.disc:add-local-reader lj-node :topic "PSquare" :type "ShapeType"
+                                                        :qos (dds.qos:make-reader-qos
+                                                              :reliability :reliable
+                                                              :durability :transient-local))
+                             (dds.disc:enable-subscriber lj-node)
+                             (setf (dds.disc:disc-node-on-match lj-node)
+                                   (lambda (kind remote)
+                                     (when (eq kind :remote-writer)
+                                       (dds.disc:%reader-durability-init
+                                        lj-node
+                                        (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                        (dds.qos:qos-durability
+                                         (dds.rtps.discovery:endpoint-data-qos remote))))))
+                             (dds.disc:start-node lj-node)
+                             (setf (dds.disc:disc-node-peers lj-node)
+                                   (list (cons "127.0.0.1" (dds.disc:disc-node-port svc2-node))))
+                             (setf (dds.disc:disc-node-peers svc2-node)
+                                   (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-node))))
+                             (%await-match lj-node svc2-node :retries 300 :sleep-s 0.02)
+                             (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
+                             (%check :persistent-svc-latejoiner
+                                     (= n (dds.disc:node-sample-count lj-node))
+                                     (format nil "restart late-joiner expected ~d, got ~d"
+                                             n (dds.disc:node-sample-count lj-node)))
+                             ;; byte-exact: every received payload must equalp its original
+                             ;; (%make-small-payload (1+i)); N zero-bufs or duplicates must fail
+                             (let* ((keys (dds.disc:node-sample-sns lj-node))
+                                    (payloads (sort
+                                               (mapcar (lambda (k) (dds.disc:node-sample lj-node k))
+                                                       keys)
+                                               #'< :key (lambda (p) (aref p 4))))
+                                    (expected (loop for i from 1 to n
+                                                    collect (%make-small-payload i))))
+                               (%check :persistent-svc-payload-exact
+                                       (and (= n (length payloads))
+                                            (every #'equalp payloads expected))
+                                       (format nil "restart payloads not byte-exact: got ~s expected ~s"
+                                               (mapcar (lambda (p) (coerce p 'list)) payloads)
+                                               (mapcar (lambda (p) (coerce p 'list)) expected)))))
+                        (ignore-errors (dds.disc:stop-node lj-node)))))
+               (ignore-errors (dds.durability:service-stop svc2)))))
+      (when (uiop:directory-exists-p tmp-dir)
+        (uiop:delete-directory-tree tmp-dir :validate t))))
+  t)
+
+;;; --- file-store recovery test (T1 review findings 1+2) ---
+;;; (a) torn tail: truncate last few bytes of 2nd frame → exactly 1 record recovered, no error.
+;;; (b) mid-file corruption: flip a byte inside the 1st frame body → store-open must signal an error.
+
+(defun* run-durability-file-recovery-test ()
+    (function () t)
+  "file-store replay distinguishes torn tail (recover) from mid-file corruption (error)."
+  (let* ((g0 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (p  (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b))))
+    ;; --- (a) torn tail: 2nd frame truncated mid-write → 1 record recovered, no error ---
+    (let* ((tmp-a (uiop:merge-pathnames*
+                   (make-pathname :directory (list :relative
+                                                   (format nil "dds-recovery-torn-~a"
+                                                           (get-universal-time))))
+                   (uiop:temporary-directory)))
+           (s-a (dds.durability:make-file-store :dir tmp-a)))
+      (unwind-protect
+           (progn
+             (dds.durability:store-open s-a)
+             (dds.durability:store-put s-a "R" g0 1 nil :data (funcall p '(11)))
+             (dds.durability:store-put s-a "R" g0 2 nil :data (funcall p '(22)))
+             (dds.durability:store-close s-a)
+             ;; truncate the log to drop the last 4 bytes of the 2nd frame (tears the CRC)
+             (let* ((tid (dds.durability::%topic->id "R"))
+                    (log-path (merge-pathnames
+                               (make-pathname :directory '(:relative "topics")
+                                             :name tid :type "log")
+                               tmp-a))
+                    (sz (with-open-file (fin log-path :element-type '(unsigned-byte 8))
+                          (file-length fin))))
+               (dds.durability::%truncate-file log-path (- sz 4)))
+             ;; fresh store on same dir → open → exactly 1 record, no error
+             (let ((s-a2 (dds.durability:make-file-store :dir tmp-a)))
+               (unwind-protect
+                    (progn
+                      (dds.durability:store-open s-a2)
+                      (%check :recovery-torn-count
+                              (= 1 (dds.durability:store-count s-a2 "R"))
+                              (format nil "torn tail: expected 1 record, got ~d"
+                                      (dds.durability:store-count s-a2 "R")))
+                      ;; put + get-range still works after recovery
+                      (dds.durability:store-put s-a2 "R" g0 3 nil :data (funcall p '(33)))
+                      (%check :recovery-torn-post-put
+                              (= 2 (dds.durability:store-count s-a2 "R"))
+                              "torn tail: put after recovery must succeed (count=2)")
+                      (let ((recs (dds.durability:store-get-range s-a2 "R")))
+                        (%check :recovery-torn-sn1
+                                (= 1 (dds.durability:durable-record-sn (first recs)))
+                                "torn tail: first record must have sn=1"))
+                      (dds.durability:store-close s-a2))
+                 (ignore-errors (dds.durability:store-close s-a2)))))
+        (ignore-errors (dds.durability:store-close s-a))
+        (when (uiop:directory-exists-p tmp-a)
+          (uiop:delete-directory-tree tmp-a :validate t))))
+    ;; --- (b) mid-file corruption: flip byte inside 1st frame body → store-open signals error ---
+    (let* ((tmp-b (uiop:merge-pathnames*
+                   (make-pathname :directory (list :relative
+                                                   (format nil "dds-recovery-corrupt-~a"
+                                                           (get-universal-time))))
+                   (uiop:temporary-directory)))
+           (s-b (dds.durability:make-file-store :dir tmp-b)))
+      (unwind-protect
+           (progn
+             (dds.durability:store-open s-b)
+             (dds.durability:store-put s-b "R" g0 1 nil :data (funcall p '(11)))
+             (dds.durability:store-put s-b "R" g0 2 nil :data (funcall p '(22)))
+             (dds.durability:store-close s-b)
+             ;; flip a byte inside the 1st frame's payload body (byte 29 = payload area)
+             (let* ((tid (dds.durability::%topic->id "R"))
+                    (log-path (merge-pathnames
+                               (make-pathname :directory '(:relative "topics")
+                                             :name tid :type "log")
+                               tmp-b))
+                    (raw (with-open-file (fin log-path :element-type '(unsigned-byte 8))
+                           (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
+                             (read-sequence v fin)
+                             v))))
+               ;; offset 31 is the first payload byte of frame 1 (magic(2)+flags(1)+guid(16)+sn(8)+plen(4)=31)
+               (setf (aref raw 31) (logxor (aref raw 31) #xFF))
+               (with-open-file (fout log-path :direction :output :element-type '(unsigned-byte 8)
+                                              :if-exists :supersede)
+                 (write-sequence raw fout)))
+             ;; fresh store → open MUST signal an error (mid-file CRC mismatch on 1st frame)
+             (let ((s-b2 (dds.durability:make-file-store :dir tmp-b))
+                   (errored nil))
+               (handler-case
+                   (dds.durability:store-open s-b2)
+                 (error () (setf errored t)))
+               (%check :recovery-corrupt-error
+                       errored
+                       "mid-file corruption must cause store-open to signal an error")))
+        (ignore-errors (dds.durability:store-close s-b))
+        (when (uiop:directory-exists-p tmp-b)
+          (uiop:delete-directory-tree tmp-b :validate t))))
+    ;; --- (c) interior plen-field corruption: an inflated payload-len that overshoots the sanity
+    ;;     cap MUST be :corrupt (fail loud), NOT silently truncated as a torn tail. Without the
+    ;;     +frame-max-payload+ cap, an over-cap plen → :short → silent truncation of all live data. ---
+    (let* ((tmp-c (uiop:merge-pathnames*
+                   (make-pathname :directory (list :relative
+                                                   (format nil "dds-recovery-plen-~a"
+                                                           (get-universal-time))))
+                   (uiop:temporary-directory)))
+           (s-c (dds.durability:make-file-store :dir tmp-c)))
+      (unwind-protect
+           (progn
+             (dds.durability:store-open s-c)
+             (dds.durability:store-put s-c "R" g0 1 nil :data (funcall p '(11)))
+             (dds.durability:store-put s-c "R" g0 2 nil :data (funcall p '(22)))
+             (dds.durability:store-close s-c)
+             ;; frame-1 plen field (no key-hash): magic(2)+flags(1)+guid(16)+sn(8)=27 → plen at 27..30.
+             ;; inflate it to 0xFFFFFFFF (> +frame-max-payload+) — frame 1 is interior (frame 2 follows).
+             (let* ((tid (dds.durability::%topic->id "R"))
+                    (log-path (merge-pathnames
+                               (make-pathname :directory '(:relative "topics")
+                                             :name tid :type "log")
+                               tmp-c))
+                    (raw (with-open-file (fin log-path :element-type '(unsigned-byte 8))
+                           (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
+                             (read-sequence v fin) v))))
+               (dotimes (i 4) (setf (aref raw (+ 27 i)) #xFF))
+               (with-open-file (fout log-path :direction :output :element-type '(unsigned-byte 8)
+                                              :if-exists :supersede)
+                 (write-sequence raw fout)))
+             ;; fresh store → open MUST signal (over-cap plen is :corrupt, never a silent truncate)
+             (let ((s-c2 (dds.durability:make-file-store :dir tmp-c))
+                   (errored nil))
+               (handler-case (dds.durability:store-open s-c2)
+                 (error () (setf errored t)))
+               (%check :recovery-plen-overcap-error
+                       errored
+                       "an interior frame plen above the sanity cap must fail loud (:corrupt), not silently truncate")))
+        (ignore-errors (dds.durability:store-close s-c))
+        (when (uiop:directory-exists-p tmp-c)
+          (uiop:delete-directory-tree tmp-c :validate t))))
+    t))
+
+;;; --- compaction-on-open (Task 6, WP-DURABILITY-PERSISTENT) ---
+;;; A file-store with settle records (both :dispose AND :unregister for the same
+;;; key-hash) must compact them away on the next open, resulting in zero records
+;;; for that instance.  A SECOND key-hash (kh2) that has only a :data record
+;;; (no tombstones) must SURVIVE compaction with its 1 record intact.
+;;; A new put after compaction must succeed.
+
+(defun* run-durability-compaction-test ()
+    (function () t)
+  "Compaction-on-open: settled instances dropped; live-only instance survives; new put works."
+  (let* ((tmp (uiop:merge-pathnames*
+               (make-pathname :directory (list :relative
+                                               (format nil "dds-compact-~a"
+                                                       (get-universal-time))))
+               (uiop:temporary-directory)))
+         (g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xCC))
+         (kh   (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xDD))
+         (kh2  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xEE))
+         (p    (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8)
+                                                   :initial-contents b)))
+         (topic "CompactTopic"))
+    (unwind-protect
+         (progn
+           ;; write 3 data + dispose + unregister for kh (settled); 1 data-only for kh2 (live)
+           (let ((store (dds.durability:make-file-store :dir tmp)))
+             (dds.durability:store-open store)
+             (dotimes (i 3)
+               (dds.durability:store-put store topic g0 (1+ i) kh :data (funcall p (list (1+ i)))))
+             (dds.durability:store-put store topic g0 4 kh :dispose     (funcall p '()))
+             (dds.durability:store-put store topic g0 5 kh :unregister  (funcall p '()))
+             ;; kh2: one live :data record only (no tombstones -> must survive compaction)
+             (dds.durability:store-put store topic g0 6 kh2 :data (funcall p '(42)))
+             (%check :compact-pre (= 6 (dds.durability:store-count store topic))
+                     "before close: must have 6 records (5 for kh + 1 for kh2)")
+             (dds.durability:store-close store))
+           ;; reopen -> compaction: kh settled -> 0; kh2 live -> 1 survives
+           (let ((store2 (dds.durability:make-file-store :dir tmp)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:store-open store2)
+                    ;; settled kh is gone; kh2 live record survives -> total = 1
+                    (%check :compact-post-total (= 1 (dds.durability:store-count store2 topic))
+                            "after reopen: settled kh dropped + kh2 live -> total 1 record")
+                    ;; live-record sub-case: kh2 data record must survive (count-by-keyhash proxy)
+                    (let ((recs2 (dds.durability:store-get-range store2 topic)))
+                      (%check :compact-live-survives
+                              (and (= 1 (length recs2))
+                                   (equalp kh2 (dds.durability:durable-record-key-hash (first recs2))))
+                              (format nil "kh2 live record must survive compaction; got ~d records" (length recs2))))
+                    ;; a new put for the settled key-hash must work after compaction
+                    (%check :compact-new-put
+                            (eq t (dds.durability:store-put store2 topic g0 7 kh :data (funcall p '(7))))
+                            "put after compaction must succeed")
+                    (%check :compact-new-count (= 2 (dds.durability:store-count store2 topic))
+                            "count after new put must be 2 (kh2 live + new kh data)"))
+               (ignore-errors (dds.durability:store-close store2)))))
+      (ignore-errors
+       (when (uiop:directory-exists-p tmp)
+         (uiop:delete-directory-tree tmp :validate t))))
+    t))
+
+;;; --- compaction is order-aware: resurrected instance survives (WP-DURABILITY-PERSISTENT review) ---
+
+(defun* run-durability-resurrection-compaction-test ()
+    (function () t)
+  "Compaction must be order-aware: a legally RESURRECTED instance (data → dispose → unregister →
+   data again) keeps the live :data written AFTER the teardown. The order-insensitive
+   set-membership form (both tombstones present ⇒ drop all) silently lost the resurrected data."
+  (let* ((tmp (uiop:merge-pathnames*
+               (make-pathname :directory (list :relative
+                                               (format nil "dds-resurrect-~a" (get-universal-time))))
+               (uiop:temporary-directory)))
+         (g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xCC))
+         (kh  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xFA))
+         (p   (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (topic "ResurrectTopic"))
+    (unwind-protect
+         (progn
+           ;; data(1) → dispose(2) → unregister(3) → data(4, resurrection): LIVE at the end
+           (let ((store (dds.durability:make-file-store :dir tmp)))
+             (dds.durability:store-open store)
+             (dds.durability:store-put store topic g0 1 kh :data       (funcall p '(1)))
+             (dds.durability:store-put store topic g0 2 kh :dispose    (funcall p '()))
+             (dds.durability:store-put store topic g0 3 kh :unregister (funcall p '()))
+             (dds.durability:store-put store topic g0 4 kh :data       (funcall p '(44)))
+             (dds.durability:store-close store))
+           ;; reopen → compaction must KEEP the resurrected instance (final change is :data)
+           (let ((store2 (dds.durability:make-file-store :dir tmp)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:store-open store2)
+                    (let* ((recs (dds.durability:store-get-range store2 topic))
+                           (live (find-if (lambda (r)
+                                            (and (eq :data (dds.durability:durable-record-kind r))
+                                                 (= 4 (dds.durability:durable-record-sn r))))
+                                          recs)))
+                      (%check :resurrect-live-survives
+                              live
+                              (format nil "resurrected live data (sn=4) must survive compaction; got ~d records, kinds ~s"
+                                      (length recs)
+                                      (mapcar #'dds.durability:durable-record-kind recs)))))
+               (ignore-errors (dds.durability:store-close store2)))))
+      (ignore-errors
+       (when (uiop:directory-exists-p tmp)
+         (uiop:delete-directory-tree tmp :validate t))))
+    t))
+
+;;; --- :sync delegation through the DARE decorator (WP-DURABILITY-PERSISTENT review) ---
+;;; Regression guard for the T6 data-loss bug: a missing :sync delegation = the production
+;;; PERSISTENT store's per-tick fsync silently no-ops = crash data loss. A stub inner store
+;;; counts :sync calls; both the v1 and v2 encrypted-store decorators MUST forward store-sync.
+
+(defun* %sync-stub-store (counter-box)
+    (function (cons) dds.durability:durable-store)
+  "A minimal durable-store whose :sync increments (CAR COUNTER-BOX); other ops are inert stubs."
+  (dds.durability::%make-durable-store
+   :name :sync-stub
+   :put       (lambda (a b c d e f) (declare (ignore a b c d e f)) t)
+   :get-range (lambda (tp) (declare (ignore tp)) '())
+   :topics    (lambda () '())
+   :purge     (lambda (tp) (declare (ignore tp)) t)
+   :open      (lambda () t)
+   :close     (lambda () t)
+   :count-fn  (lambda (tp) (declare (ignore tp)) 0)
+   :sync      (lambda () (incf (car counter-box)) t)))
+
+(defun* run-durability-sync-delegation-test ()
+    (function () t)
+  "store-sync on the encrypted-store decorator MUST reach the inner store's :sync (the T6
+   regression: a dropped :sync delegation = the DARE PERSISTENT config never fsyncs = data loss)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [sync-delegation] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-sync-delegation-test t)))
+  (let* ((k1 (uiop:merge-pathnames*
+              (make-pathname :directory (list :relative (format nil "dds-syncdel-k1-~a" (get-universal-time))))
+              (uiop:temporary-directory)))
+         (k2 (uiop:merge-pathnames*
+              (make-pathname :directory (list :relative (format nil "dds-syncdel-k2-~a" (get-universal-time))))
+              (uiop:temporary-directory)))
+         (e2 (uiop:merge-pathnames*
+              (make-pathname :directory (list :relative (format nil "dds-syncdel-e2-~a" (get-universal-time))))
+              (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           ;; v1 (no epoch-dir): construction opens the key-provider + derives a DEK
+           (let* ((box (list 0))
+                  (kp  (dds.dare:make-file-key-provider :dir k1))
+                  (enc (dds.durability:make-encrypted-store (%sync-stub-store box) kp)))
+             (dds.durability:store-sync enc)
+             (dds.durability:store-sync enc)
+             (%check :sync-deleg-v1 (= 2 (car box))
+                     (format nil "v1 encrypted-store must forward both store-sync calls; got ~d" (car box)))
+             (ignore-errors (dds.durability:store-close enc)))
+           ;; v2 (epoch-dir): constructed closed; store-sync must still forward to the inner store
+           (let* ((box (list 0))
+                  (kp  (dds.dare:make-file-key-provider :dir k2))
+                  (enc (dds.durability:make-encrypted-store (%sync-stub-store box) kp :epoch-dir e2)))
+             (dds.durability:store-sync enc)
+             (%check :sync-deleg-v2 (= 1 (car box))
+                     (format nil "v2 encrypted-store must forward store-sync; got ~d" (car box)))))
+      (dolist (d (list k1 k2 e2))
+        (when (uiop:directory-exists-p d)
+          (ignore-errors (uiop:delete-directory-tree d :validate t))))))
+  t)
+
+;;; --- seed-backpressure robustness (Task 6, WP-DURABILITY-PERSISTENT) ---
+;;; Pre-populate a store with 20 records before service-start; assert all 20
+;;; are seeded into the replay writer's cache (:timeout is structurally impossible
+;;; for TL/KEEP_ALL seeding with no reader, per the %seed-relay-from-store docstring).
+
+(defun* run-durability-seed-backpressure-test ()
+    (function () t)
+  "Seed-relay backpressure robustness: 20 pre-existing records all reach a TL late-joiner.
+   Validates %seed-relay-from-store handles volumes well above a typical window without
+   :timeout (TL+KEEP_ALL writer with no reader has unbounded cache; :timeout is impossible).
+   Domain 97 avoids collision with other test domains."
+  (let* ((n     20)
+         (svc-store (dds.durability:make-memory-store))
+         (topic "BPSquare")
+         (g0    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xBB)))
+    ;; pre-populate 20 records BEFORE service-start
+    (dds.durability:store-open svc-store)
+    (dotimes (i n)
+      (dds.durability:store-put svc-store topic g0 (1+ i) nil :data
+                                 (make-array 4 :element-type '(unsigned-byte 8)
+                                               :initial-element (1+ i))))
+    (%check :seed-bp-pre (= n (dds.durability:store-count svc-store topic))
+            (format nil "pre-seed: store must have ~d records before service-start, got ~d"
+                    n (dds.durability:store-count svc-store topic)))
+    (let* ((spec (dds.durability:make-service-spec
+                  :domain 97
+                  :topics (list (cons topic "ShapeType"))
+                  :store  (lambda () svc-store)
+                  :name   "seed-bp-test"))
+           (svc (dds.durability:make-durability-service spec :store svc-store))
+           (lj-prefix (%make-test-prefix #xBB))
+           (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 97
+                                             :host "127.0.0.1" :port 0 :multicast nil)))
+      (unwind-protect
+           (progn
+             ;; service-start calls %seed-relay-from-store with 20 records (no :timeout expected)
+             (dds.durability:service-start svc)
+             (let ((svc-node (dds.durability:durability-service-node svc)))
+               ;; late-joiner TL reader
+               (dds.disc:add-local-reader lj-node :topic topic :type "ShapeType"
+                                          :qos (dds.qos:make-reader-qos
+                                                :reliability :reliable
+                                                :durability :transient-local))
+               (dds.disc:enable-subscriber lj-node)
+               (setf (dds.disc:disc-node-on-match lj-node)
+                     (lambda (kind remote)
+                       (when (eq kind :remote-writer)
+                         (dds.disc:%reader-durability-init
+                          lj-node
+                          (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                          (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote))))))
+               (dds.disc:start-node lj-node)
+               ;; wire lj <-> service
+               (setf (dds.disc:disc-node-peers lj-node)
+                     (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-node))))
+               (setf (dds.disc:disc-node-peers svc-node)
+                     (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-node))))
+               ;; discovery + drain
+               (%await-match lj-node svc-node :retries 300 :sleep-s 0.02)
+               ;; poll for all n samples
+               (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
+               (%check :seed-bp-received
+                       (= n (dds.disc:node-sample-count lj-node))
+                       (format nil "seed-backpressure: TL late-joiner expected ~d samples, got ~d"
+                               n (dds.disc:node-sample-count lj-node)))))
+        (ignore-errors (dds.disc:stop-node lj-node))
+        (ignore-errors (dds.durability:service-stop svc)))))
+  t)
+
+;;; --- collect-loop seen-set prune test (Task 7, WP-DURABILITY-PERSISTENT carry-forward) ---
+;;; NFR-MEM: the collect-loop per-origin seen-set must stay BOUNDED by a function of the
+;;; reorder window (*max-gap-range*), not by the total sample count.
+;;; PURE (no threads, no network): drives %collect-seen-p / %collect-mark-seen! directly.
+;;; Step 1 (failing before implementation): assert ABOVE size stays <= 1 after N in-order
+;;;   samples from one origin (the watermark compacts each entry immediately on in-order traffic;
+;;;   ABOVE stays empty after every mark).
+;;; Step 2: assert no-double-delivery — %collect-seen-p returns T for already-delivered SNs.
+
+(defun* run-durability-seen-prune-test ()
+    (function () t)
+  "PURE: collect-loop seen-set stays bounded (NFR-MEM carry-forward from Phase-2 review).
+   Drives %collect-mark-seen! with N=1000 in-order samples from one origin GUID;
+   after each mark, asserts the per-origin ABOVE-HT size <= 1 (compacts to 0 for in-order
+   traffic — the watermark advances through every just-accepted entry).
+   Also asserts no-double-delivery: re-feeding any already-delivered SN is seen-p=T."
+  (let* ((origins (dds.durability::%make-collect-origins))
+         (guid    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xAA))
+         (n       1000))
+    ;; deliver n samples in order: watermark must advance, above stays empty
+    (dotimes (i n)
+      (let ((sn (1+ i)))
+        ;; before delivery: must not be seen yet
+        (%check :prune-pre-seen
+                (not (dds.durability::%collect-seen-p origins guid sn))
+                (format nil "sn ~d must not be seen before delivery" sn))
+        (dds.durability::%collect-mark-seen! origins guid sn)
+        ;; after delivery: watermark advance — above-set size must be <= 1
+        (let ((above-size (dds.durability::%collect-origins-above-size origins)))
+          (%check :prune-bounded
+                  (<= above-size 1)
+                  (format nil "after sn ~d: above-size ~d must be <= 1 (bounded by reorder window)"
+                          sn above-size)))))
+    ;; no-double-delivery: re-feed every SN in {1..n}; all must be seen
+    (dotimes (i n)
+      (let ((sn (1+ i)))
+        (%check :prune-no-double
+                (dds.durability::%collect-seen-p origins guid sn)
+                (format nil "re-fed sn ~d must still be seen (no-double-delivery)" sn))))
+    ;; lifecycle dedup: origins-lc uses the same %collect-seen-p/%collect-mark-seen! machinery;
+    ;; the key-change refactor (car key)=writer-guid (cdr key)=sn must still dedup correctly
+    (let* ((origins-lc (dds.durability::%make-collect-origins))
+           (lc-guid    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xCC)))
+      (dds.durability::%collect-mark-seen! origins-lc lc-guid 42)
+      (%check :prune-lc-no-double
+              (dds.durability::%collect-seen-p origins-lc lc-guid 42)
+              "re-fed lifecycle (lc-guid, sn=42) must still be seen (dedup preserved after key-change)"))
+    ;; out-of-order: above-set bounded at *max-gap-range* even under gaps
+    (let* ((origins2 (dds.durability::%make-collect-origins))
+           (g2       (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xBB))
+           (cap      dds.rtps.reliable:*max-gap-range*))
+      ;; deliver samples at large out-of-order offsets (gaps between them)
+      ;; expected: above-set can grow up to cap entries but not beyond
+      (dotimes (i (+ cap 100))
+        ;; skip every other SN to create gaps
+        (let ((sn (* 2 (1+ i))))
+          (unless (dds.durability::%collect-seen-p origins2 g2 sn)
+            (dds.durability::%collect-mark-seen! origins2 g2 sn))))
+      (let* ((above2 (dds.durability::%collect-origins-above-size origins2))
+             ;; the shed entry is the highest SN that was pushed out (it exceeds *max-gap-range*);
+             ;; re-feeding that SN must NOT be seen (shed entry is re-admissible — ADR 0024 benign dup)
+             (shed-sn (* 2 (+ cap 100))))
+        (%check :prune-gap-bounded
+                (<= above2 (+ cap 1))
+                (format nil "out-of-order scenario: above-size ~d must be <= cap+1 (~d)"
+                        above2 (+ cap 1)))
+        ;; shed re-admission: the highest-sn entry that was evicted must be re-admissible (not seen)
+        (%check :prune-shed-readmission
+                (not (dds.durability::%collect-seen-p origins2 g2 shed-sn))
+                (format nil "shed sn ~d must NOT be seen — re-admissible (ADR 0024 benign dup, not silent loss)"
+                        shed-sn))))
+    t))
+
+;;; --- dynamic-topic-add test (Task 8, WP-DURABILITY-PERSISTENT carry-forward, ADR 0024) ---
+;;; A service starts with topic "DynA"/"ShapeType".  service-add-topic adds "DynB"/"ShapeType"
+;;; to the RUNNING service (no restart).  A publisher on "DynB" writes N=3 TL samples; a TL
+;;; late-joiner on "DynB" receives all 3 (proving the new disc-node is live).
+;;; Assert "DynA"'s node is still present (node-count=2 after add).
+;;; Idempotency: a second service-add-topic "DynB" returns T and does NOT double-add
+;;; (node count stays at 2).
+;;; NFR-PORT: the live-thread sub-tests (late-joiner delivery) are skipped on Clasp due to the
+;;; Clasp threading gap (intermittent SIGSEGV in CLOS error-signaling on multithreaded condvar
+;;; teardown — memory: clasp-threading-gap).  The idempotency + node-count structural assertions
+;;; run on BOTH impls.  Domain 127 avoids collision with all prior tests.
+
+(defun* run-durability-dynamic-topic-test ()
+    (function () t)
+  "Dynamic topic add: service starts with DynA; service-add-topic adds DynB live; a publisher
+   on DynB writes N TL samples; TL late-joiner on DynB receives all N; DynA's node unaffected;
+   idempotent second add-topic does not double the node count.  Domain 127, loopback unicast."
+  (let* ((n 3)
+         (svc-store (dds.durability:make-memory-store))
+         (spec (dds.durability:make-service-spec
+                :domain 127
+                :topics '(("DynA" . "ShapeType"))
+                :store (lambda () svc-store)
+                :name "dynamic-topic-test"))
+         (svc (dds.durability:make-durability-service spec :store svc-store)))
+    (unwind-protect
+         (progn
+           ;; start service with topic DynA (one disc-node)
+           (dds.durability:service-start svc)
+
+           ;; --- structural assertion: add DynB live; capture the returned node ---
+           (multiple-value-bind (ok svc-b-node)
+               (dds.durability:service-add-topic svc "DynB" "ShapeType")
+             (%check :dyn-add-returns-t
+                     (eq t ok)
+                     "service-add-topic DynB must return T as first value")
+             (%check :dyn-add-returns-node
+                     (not (null svc-b-node))
+                     "service-add-topic DynB must return a non-NIL node as second value")
+             (%check :dyn-node-count-after-add
+                     (= 2 (length (dds.durability:durability-service-nodes svc)))
+                     (format nil "after service-add-topic DynB: expected 2 nodes, got ~d"
+                             (length (dds.durability:durability-service-nodes svc))))
+
+             ;; --- DynA's node still present: service's topic-name registry must contain "DynA" ---
+             (%check :dyn-a-present
+                     (gethash "DynA" (dds.durability:durability-service-topic-names svc))
+                     "DynA's topic-name must still be in the service registry after DynB was added")
+
+             ;; --- idempotency: second service-add-topic DynB must be a no-op ---
+             (multiple-value-bind (ok2 node2)
+                 (dds.durability:service-add-topic svc "DynB" "ShapeType")
+               (%check :dyn-idempotent-return
+                       (eq t ok2)
+                       "second service-add-topic DynB must return T as first value")
+               (%check :dyn-idempotent-nil-node
+                       (null node2)
+                       "second service-add-topic DynB must return NIL as second value (no-op)")
+               (%check :dyn-node-count-idempotent
+                       (= 2 (length (dds.durability:durability-service-nodes svc)))
+                       (format nil "after idempotent re-add: must still have 2 nodes, got ~d"
+                               (length (dds.durability:durability-service-nodes svc)))))
+
+             ;; --- live-thread sub-test: publisher on DynB → TL late-joiner on DynB ---
+             ;; NFR-PORT: skipped on Clasp (clasp-threading-gap: intermittent SIGSEGV in CLOS
+             ;; error-signaling on multithreaded condvar teardown; pure structural tests above ran both impls)
+             (cond
+               ((eq (dds.pal:pal-impl-name) :clasp)
+                (format t "~&    [dynamic-topic] Clasp: skipping live-thread sub-test (NFR-PORT gap)~%"))
+               (t
+                ;; svc-b-node is the node returned directly by service-add-topic (no prefix re-derivation)
+                (let* ((pub-prefix (%make-test-prefix #xC7))
+                       (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 127
+                                                          :host "127.0.0.1" :port 0 :multicast nil)))
+                  (when svc-b-node
+                    (unwind-protect
+                         (progn
+                           ;; set up publisher on DynB
+                           (dds.disc:add-local-writer pub-node :topic "DynB" :type "ShapeType"
+                                                      :qos (dds.qos:make-writer-qos
+                                                            :reliability :reliable
+                                                            :durability :transient-local))
+                           (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+                           (dds.disc:start-node pub-node)
+                           ;; wire pub <-> svc-b-node
+                           (setf (dds.disc:disc-node-peers pub-node)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-b-node))))
+                           (setf (dds.disc:disc-node-peers svc-b-node)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-node))))
+                           ;; discovery + publish N samples
+                           (%await-match pub-node svc-b-node :retries 300 :sleep-s 0.02)
+                           (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+                           (loop repeat 80
+                                 do (%announce-both pub-node svc-b-node) (sleep 0.05))
+                           (%await-store-count svc-store "DynB" n)
+                           (%check :dyn-b-store-count
+                                   (= n (dds.durability:store-count svc-store "DynB"))
+                                   (format nil "DynB store expected ~d, got ~d"
+                                           n (dds.durability:store-count svc-store "DynB")))
+                           ;; stop publisher — writer gone
+                           (ignore-errors (dds.disc:stop-node pub-node))
+                           (sleep 0.1)
+                           ;; TL late-joiner on DynB: must receive N from the service
+                           (let* ((lj-prefix (%make-test-prefix #xE8))
+                                  (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 127
+                                                                     :host "127.0.0.1" :port 0
+                                                                     :multicast nil)))
+                             (unwind-protect
+                                  (progn
+                                    (dds.disc:add-local-reader lj-node :topic "DynB" :type "ShapeType"
+                                                               :qos (dds.qos:make-reader-qos
+                                                                     :reliability :reliable
+                                                                     :durability :transient-local))
+                                    (dds.disc:enable-subscriber lj-node)
+                                    (setf (dds.disc:disc-node-on-match lj-node)
+                                          (lambda (kind remote)
+                                            (when (eq kind :remote-writer)
+                                              (dds.disc:%reader-durability-init
+                                               lj-node
+                                               (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                               (dds.qos:qos-durability
+                                                (dds.rtps.discovery:endpoint-data-qos remote))))))
+                                    (dds.disc:start-node lj-node)
+                                    (setf (dds.disc:disc-node-peers lj-node)
+                                          (list (cons "127.0.0.1" (dds.disc:disc-node-port svc-b-node))))
+                                    (setf (dds.disc:disc-node-peers svc-b-node)
+                                          (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-node))))
+                                    (%await-match lj-node svc-b-node :retries 300 :sleep-s 0.02)
+                                    (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
+                                    (%check :dyn-b-latejoiner-count
+                                            (= n (dds.disc:node-sample-count lj-node))
+                                            (format nil "DynB TL late-joiner expected ~d samples, got ~d"
+                                                    n (dds.disc:node-sample-count lj-node))))
+                               (ignore-errors (dds.disc:stop-node lj-node)))))
+                      (ignore-errors (dds.disc:stop-node pub-node)))))))))
+      (ignore-errors (dds.durability:service-stop svc))))
+  t)

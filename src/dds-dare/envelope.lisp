@@ -9,6 +9,15 @@
 (defconstant +envelope-version+ #x01
   "DARE envelope version byte (CNSA-2.0, v1). Fixed prefix of every sealed blob.")
 
+(defconstant +envelope-version-v2+ #x02
+  "DARE envelope version byte (v2, epoch-aware cross-restart key-epoch). ADR 0025 §5.")
+
+(defconstant +envelope-epoch-len+ 4
+  "Byte width of the epoch-id field in a v2 envelope (32-bit LE unsigned integer).")
+
+(defconstant +envelope-v2-header-len+ 17
+  "Version(1) + epoch-id(4) + nonce(12) bytes that precede ciphertext in a v2 sealed blob.")
+
 (defconstant +envelope-header-len+ 13
   "Version(1) + nonce(12) bytes that precede the ciphertext in a sealed blob.")
 
@@ -98,6 +107,96 @@
         (setf (aref tag i) (aref sealed (+ +envelope-header-len+ ct-len i))))
       ;; aes-256-gcm-open returns plaintext or NIL (fail-closed)
       (aes-256-gcm-open dek nonce aad ct tag))))
+
+(defun* %epoch-id->4-bytes-le (epoch-id)
+    (function ((unsigned-byte 32)) (simple-array (unsigned-byte 8) (*)))
+  "Encode EPOCH-ID as 4 bytes little-endian (32-bit unsigned)."
+  (let ((v (make-array +envelope-epoch-len+ :element-type '(unsigned-byte 8))))
+    (dotimes (i +envelope-epoch-len+ v)
+      (setf (aref v i) (ldb (byte 8 (* 8 i)) epoch-id)))))
+
+(defun* %append-epoch-aad-bytes (aad epoch-bytes)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "Return AAD ∥ EPOCH-BYTES (4 LE) — inner form that reuses already-computed epoch bytes."
+  (let* ((aad-len (length aad))
+         (out     (make-array (+ aad-len +envelope-epoch-len+) :element-type '(unsigned-byte 8))))
+    (dotimes (i aad-len)
+      (setf (aref out i) (aref aad i)))
+    (dotimes (i +envelope-epoch-len+)
+      (setf (aref out (+ aad-len i)) (aref epoch-bytes i)))
+    out))
+
+(defun* %append-epoch-aad (aad epoch-id)
+    (function ((simple-array (unsigned-byte 8) (*)) (unsigned-byte 32))
+              (simple-array (unsigned-byte 8) (*)))
+  "Return AAD ∥ epoch-id(4 LE) — the full GCM additional data for v2 (binds epoch into AEAD)."
+  (%append-epoch-aad-bytes aad (%epoch-id->4-bytes-le epoch-id)))
+
+(defun* seal-payload-v2 (dek epoch-id nonce aad plaintext)
+    (function ((simple-array (unsigned-byte 8) (*))
+               (unsigned-byte 32)
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "Seal PLAINTEXT under DEK/NONCE with epoch EPOCH-ID bound into the AEAD via AAD ∥ epoch-id(4 LE).
+   Wire format: version(1)=#x02 ∥ epoch-id(4 LE) ∥ nonce(12) ∥ ciphertext ∥ tag(16). ADR 0025 §5."
+  (let* ((eb      (%epoch-id->4-bytes-le epoch-id))  ; computed once; reused for header + AAD
+         (gcm-aad (%append-epoch-aad-bytes aad eb)))
+    (multiple-value-bind (ct tag)
+        (aes-256-gcm-seal dek nonce gcm-aad plaintext)
+      (let* ((pt-len  (length plaintext))
+             (out-len (+ 1 +envelope-epoch-len+ +aes-gcm-nonce-len+ pt-len +aes-gcm-tag-len+))
+             (out     (make-array out-len :element-type '(unsigned-byte 8))))
+        (setf (aref out 0) +envelope-version-v2+)
+        (dotimes (i +envelope-epoch-len+)
+          (setf (aref out (+ 1 i)) (aref eb i)))
+        (dotimes (i +aes-gcm-nonce-len+)
+          (setf (aref out (+ 1 +envelope-epoch-len+ i)) (aref nonce i)))
+        (dotimes (i pt-len)
+          (setf (aref out (+ +envelope-v2-header-len+ i)) (aref ct i)))
+        (dotimes (i +aes-gcm-tag-len+)
+          (setf (aref out (+ +envelope-v2-header-len+ pt-len i)) (aref tag i)))
+        out))))
+
+(defun* open-payload-v2 (dek-lookup sealed aad)
+    (function ((function ((unsigned-byte 32))
+                         (or null (simple-array (unsigned-byte 8) (*))))
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              (or (simple-array (unsigned-byte 8) (*)) null))
+  "Unseal a v2 DARE blob produced by SEAL-PAYLOAD-V2. DEK-LOOKUP is called with the epoch-id
+   and must return the DEK (32-byte octet vector) or NIL (unknown epoch -> fail-closed).
+   Bounds-checked (the operating contract §4 — mandatory even at (safety 0)):
+     returns NIL if (length SEALED) < 33 or version byte /= #x02.
+   Reads epoch-id(4 LE), calls DEK-LOOKUP; NIL DEK -> NIL. Slices nonce/ct/tag,
+   rebuilds AAD ∥ epoch-id, calls AES-256-GCM-OPEN. Returns plaintext or NIL (fail-closed)."
+  (let ((sealed-len (length sealed)))
+    ;; bounds check: minimum = 1 + 4 + 12 + 16 = 33
+    (when (< sealed-len (+ +envelope-v2-header-len+ +aes-gcm-tag-len+))
+      (return-from open-payload-v2 nil))
+    (unless (= (aref sealed 0) +envelope-version-v2+)
+      (return-from open-payload-v2 nil))
+    (let* ((epoch-id (logior (aref sealed 1)
+                             (ash (aref sealed 2) 8)
+                             (ash (aref sealed 3) 16)
+                             (ash (aref sealed 4) 24)))
+           (dek      (funcall dek-lookup epoch-id)))
+      (unless dek
+        (return-from open-payload-v2 nil))
+      (let* ((ct-len  (- sealed-len +envelope-v2-header-len+ +aes-gcm-tag-len+))
+             (nonce   (make-array +aes-gcm-nonce-len+ :element-type '(unsigned-byte 8)))
+             (ct      (make-array ct-len :element-type '(unsigned-byte 8)))
+             (tag     (make-array +aes-gcm-tag-len+ :element-type '(unsigned-byte 8)))
+             (gcm-aad (%append-epoch-aad aad epoch-id)))
+        (dotimes (i +aes-gcm-nonce-len+)
+          (setf (aref nonce i) (aref sealed (+ 1 +envelope-epoch-len+ i))))
+        (dotimes (i ct-len)
+          (setf (aref ct i) (aref sealed (+ +envelope-v2-header-len+ i))))
+        (dotimes (i +aes-gcm-tag-len+)
+          (setf (aref tag i) (aref sealed (+ +envelope-v2-header-len+ ct-len i))))
+        (aes-256-gcm-open dek nonce gcm-aad ct tag)))))
 
 (defun* %sn->8-bytes-le (sn)
     (function ((integer 0)) (simple-array (unsigned-byte 8) (*)))

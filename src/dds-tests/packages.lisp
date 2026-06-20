@@ -28,4 +28,13 @@
            #:run-dare-key-provider-test
            #:run-dare-encrypted-store-test
            #:run-dare-encrypted-store-lifecycle-test
-           #:run-dare-service-transparency-test))
+           #:run-dare-service-transparency-test
+           #:run-dare-envelope-v2-test
+           #:run-durability-file-store-test
+           #:run-durability-file-recovery-test
+           #:run-dare-persistent-store-test
+           #:run-durability-persistent-service-test
+           #:run-durability-compaction-test
+           #:run-durability-seed-backpressure-test
+           #:run-durability-seen-prune-test
+           #:run-durability-dynamic-topic-test))

@@ -196,3 +196,18 @@
   "M0: no-op wrapper. SBCL's sb-sys:without-gcing lands behind an explicit unsafe
    flag in a later ADR (REQUIREMENTS NFR-DET)."
   `(progn ,@body))
+
+(defun* fsync-stream (stream)
+    (function (stream) (eql t))
+  "Flush CL stream buffers then fdatasync the underlying fd on SBCL fd-streams.
+   Falls back to finish-output when the stream is not an SBCL fd-stream (NFR-PORT).
+   SIGNALS an error if fdatasync(2) returns -1 (EIO/ENOSPC): a durability flush that the OS
+   reports as failed must NOT be reported as success — the caller surfaces it (fail-closed,
+   NFR-SEC-POSTURE: never silently treat un-synced data as durable)."
+  (finish-output stream)
+  #+sbcl
+  (let ((fd (when (typep stream 'sb-sys:fd-stream) (sb-sys:fd-stream-fd stream))))
+    (when (and fd (minusp (the (signed-byte 32)
+                               (cffi:foreign-funcall "fdatasync" :int fd :int))))
+      (error "dds.pal:fsync-stream: fdatasync(fd=~d) failed" fd)))
+  t)

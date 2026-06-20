@@ -134,6 +134,13 @@
          (setf action :shed))))
     (ecase action
       (:restart
+       ;; Reclaim the DEAD instance's resources before building the replacement. This WP made
+       ;; service-start open the store (OS file handles + foreign per-epoch DEKs) and service-stop
+       ;; close it (fsync + zeroize/free the DEKs). The OTP restart abandons the old instance, so
+       ;; without this every supervised restart of a PERSISTENT service leaks open file handles AND
+       ;; un-zeroized CNSA-2.0 secret material (contradicting ADR 0025/0026). Safe: svc is already
+       ;; dead and about to be replaced in the runner, so it is never re-examined by the watcher.
+       (ignore-errors (service-stop svc))
        (let ((new-svc (make-durability-service spec)))
          (handler-case
              (progn

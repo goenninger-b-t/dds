@@ -6,6 +6,7 @@
   :serial t
   :components ((:file "packages")
                (:file "store")
+               (:file "store-file")
                (:file "spec")
                (:file "service")
                (:file "store-encrypted")

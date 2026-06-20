@@ -55,14 +55,17 @@
    TRANSIENT_LOCAL KEEP_ALL collecting reader + a replay writer + a dedicated collect thread.
    NODES is a list of (node . thread) pairs (K=1 is byte-identical to Phase 1).
    NODE and THREAD are kept for backward compat (process-mode proxy in runner.lisp) and
-   single-arity accessor callers; they mirror the first element of NODES after service-start."
-  (spec   nil :type (or null service-spec))
-  (store  nil :type (or null durable-store))
-  (node   nil :type t)
-  (thread nil :type t)
-  (nodes  nil :type list)
-  (lock   (dds.pal:make-lock "dds-durability-service") :type t)
-  (running nil :type t))
+   single-arity accessor callers; they mirror the first element of NODES after service-start.
+   TOPIC-NAMES is an :equal hash-table of registered topic-name strings; guards idempotency in
+   service-add-topic by name (time-stable) rather than by the time-varying GUID prefix."
+  (spec        nil :type (or null service-spec))
+  (store       nil :type (or null durable-store))
+  (node        nil :type t)
+  (thread      nil :type t)
+  (nodes       nil :type list)
+  (topic-names (make-hash-table :test #'equal) :type hash-table)
+  (lock        (dds.pal:make-lock "dds-durability-service") :type t)
+  (running     nil :type t))
 
 
 ;;; --- construction ---
@@ -102,6 +105,7 @@
     (function (service-spec &optional (or null string)) (simple-array (unsigned-byte 8) (12)))
   "Build a 12-byte GUID prefix for one collect node: 'DS' + spec-name hash XOR topic hash + wall clock.
    TOPIC-NAME is mixed in so two nodes in the same multi-topic service get distinct prefixes.
+   The wall-clock component makes the prefix TIME-VARYING: do NOT use for idempotency checks.
    Demo-grade (not vetted UUID)."
   (let ((p (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0))
         (clk (get-universal-time))
@@ -114,6 +118,75 @@
           do (setf (aref p i) (logand (ash clk (* -8 (- i 6))) #xff)))
     p))
 
+;;; --- per-origin collect dedup (bounded watermark, mirrors ADR 0024) ---
+;;;
+;;; Each seen-origins table maps GUID (equalp) -> (cons LO ABOVE-HT) where LO is the
+;;; contiguous high-water SN (every SN <= LO is known-delivered) and ABOVE-HT maps
+;;; integer SN -> T for out-of-order entries above LO.  Bounded: ABOVE-HT grows at most
+;;; *max-gap-range* entries per GUID; pruning after watermark advance keeps memory O(live
+;;; origins * *max-gap-range*), not O(total samples delivered).
+
+(defun* %make-collect-origins ()
+    (function () hash-table)
+  "Return a fresh per-origin dedup table (GUID equalp -> (lo . above-ht))."
+  (make-hash-table :test #'equalp))
+
+(defun* %collect-seen-p (origins guid sn)
+    (function (hash-table (simple-array (unsigned-byte 8) (*)) integer) t)
+  "T iff (GUID SN) is already delivered per ORIGINS (below or equal to watermark, or in above-set)."
+  (let ((entry (gethash guid origins)))
+    (and entry
+         (or (<= sn (car entry))
+             (if (gethash sn (cdr entry)) t nil)))))
+
+(defun* %collect-mark-seen! (origins guid sn)
+    (function (hash-table (simple-array (unsigned-byte 8) (*)) integer) integer)
+  "Record (GUID SN) as delivered in ORIGINS; advance watermark LO through the contiguous
+   prefix; prune all ABOVE-HT entries <= new LO so the set stays bounded.
+   At-cap (above-ht count > *max-gap-range*) drops the highest above-ht entry to enforce
+   the bound — benign for the high out-of-order entry (if it re-arrives it is re-admitted);
+   lo never advances past an un-arrived SN so silent loss cannot occur (ADR 0024 §Decision).
+   Returns the updated LO for GUID after compaction."
+  (let* ((entry (or (gethash guid origins)
+                    (let ((e (cons 0 (make-hash-table :test #'eql))))
+                      (setf (gethash guid origins) e)
+                      e)))
+         (lo   (car entry))
+         (above (cdr entry)))
+    ;; add to above-set if above watermark (never insert <= lo)
+    (when (> sn lo)
+      (setf (gethash sn above) t))
+    ;; at-cap: shed the highest above-set entry (NFR-MEM hard bound)
+    (when (> (hash-table-count above) dds.rtps.reliable:*max-gap-range*)
+      (let ((hi-key (let ((m lo))
+                      (maphash (lambda (k _) (declare (ignore _)) (when (> k m) (setf m k))) above)
+                      m)))
+        (remhash hi-key above)))
+    ;; advance watermark through the contiguous run
+    (loop while (gethash (1+ lo) above)
+          do (incf lo)
+             (remhash lo above))
+    (setf (car entry) lo)
+    ;; prune any residual below-lo entries from above-set
+    (when (plusp lo)
+      (maphash (lambda (k _)
+                 (declare (ignore _))
+                 (when (<= k lo)
+                   (remhash k above)))
+               above))
+    lo))
+
+(defun* %collect-origins-above-size (origins)
+    (function (hash-table) integer)
+  "Return the total number of entries in all ABOVE-HT tables across all origins in ORIGINS.
+   Used by the test harness to assert boundedness (must stay <= *max-gap-range* + small constant)."
+  (let ((total 0))
+    (maphash (lambda (_ entry)
+               (declare (ignore _))
+               (incf total (hash-table-count (cdr entry))))
+             origins)
+    total))
+
 ;;; --- collect loop ---
 
 (defun* %collect-loop (svc node topic-name)
@@ -122,11 +195,12 @@
    Polls NODE for new (GUID . SN) data + lifecycle keys, drains each into the store, and
    IMMEDIATELY re-publishes through the service writer (publish-on-collect model). Lifecycle
    changes (:dispose/:unregister) are stored with their kind and re-emitted via
-   publish-relay-lifecycle with PID_ORIGINAL_WRITER_INFO. Tracks seen keys locally.
+   publish-relay-lifecycle with PID_ORIGINAL_WRITER_INFO. Tracks seen keys per-origin-GUID
+   with a bounded watermark (ADR 0024 carry-forward, NFR-MEM).
    Sleeps ~5 ms between polls. Re-announces SPDP + SEDP every ~1.5 s (RTPS 2.5 §8.5.3.3).
    Wraps each iteration in handler-case so a transient error fires *DURABILITY-ERROR-HOOK*."
-  (let ((seen-data (make-hash-table :test #'equal))
-        (seen-lc   (make-hash-table :test #'equal))
+  (let ((origins-data (%make-collect-origins))
+        (origins-lc   (%make-collect-origins))
         (error-count 0)
         (store (durability-service-store svc))
         (last-announce 0))
@@ -143,39 +217,101 @@
               (setf last-announce now))
             ;; drain data samples
             (dolist (key (dds.disc:node-sample-sns node))
-              (unless (gethash key seen-data)
-                (setf (gethash key seen-data) t)
-                (let ((payload (dds.disc:node-sample node key))
-                      (writer-guid (dds.disc:node-sample-writer-guid node key))
-                      (sn (dds.disc:node-sample-key-sn key)))
-                  (when (and payload writer-guid)
-                    (store-put store topic-name writer-guid sn nil :data payload)
-                    (dds.disc:publish-relay-sample node payload writer-guid sn)))))
+              (let ((writer-guid (dds.disc:node-sample-writer-guid node key))
+                    (sn (dds.disc:node-sample-key-sn key)))
+                (when (and writer-guid
+                           (not (%collect-seen-p origins-data writer-guid sn)))
+                  (%collect-mark-seen! origins-data writer-guid sn)
+                  (let ((payload (dds.disc:node-sample node key)))
+                    (when payload
+                      (store-put store topic-name writer-guid sn nil :data payload)
+                      (dds.disc:publish-relay-sample node payload writer-guid sn))))))
             ;; drain lifecycle changes (dispose / unregister)
+            ;; key = (writer-guid . sn); dedup on (writer-guid, sn) via origins-lc watermark
             (dolist (key (dds.disc:node-lifecycle-sns node))
-              (unless (gethash key seen-lc)
-                (setf (gethash key seen-lc) t)
-                (let ((lc (dds.disc:node-lifecycle-change node key)))
-                  (when lc
-                    (let* ((kind       (first  lc))
-                           (key-hash   (second lc))
-                           (status-flags (third lc))
-                           (orig-guid  (fifth  lc))
-                           (orig-sn    (cdr key))
-                           (kh16 (if (and key-hash
-                                          (= 16 (length key-hash)))
-                                     (coerce key-hash '(simple-array (unsigned-byte 8) (16)))
-                                     (make-array 16 :element-type '(unsigned-byte 8)
-                                                    :initial-element 0))))
-                      (store-put store topic-name orig-guid orig-sn kh16 kind
-                                 (make-array 0 :element-type '(unsigned-byte 8)))
-                      (dds.disc:publish-relay-lifecycle
-                       node kh16 status-flags orig-guid orig-sn)))))))
+              (let* ((key-guid (car key))
+                     (key-sn  (cdr key)))
+                (when (not (%collect-seen-p origins-lc key-guid key-sn))
+                  (%collect-mark-seen! origins-lc key-guid key-sn)
+                  (let ((lc (dds.disc:node-lifecycle-change node key)))
+                    (when lc
+                      (let* ((kind         (first  lc))
+                             (key-hash     (second lc))
+                             (status-flags (third  lc))
+                             (orig-guid    (fifth  lc))
+                             (orig-sn      key-sn)
+                             (kh16 (if (and key-hash
+                                            (= 16 (length key-hash)))
+                                       (coerce key-hash '(simple-array (unsigned-byte 8) (16)))
+                                       (make-array 16 :element-type '(unsigned-byte 8)
+                                                      :initial-element 0))))
+                        (store-put store topic-name orig-guid orig-sn kh16 kind
+                                   (make-array 0 :element-type '(unsigned-byte 8)))
+                        (dds.disc:publish-relay-lifecycle
+                         node kh16 status-flags orig-guid orig-sn))))))))
         (error (c)
           (let ((n (incf error-count)))
             (ignore-errors
              (funcall *durability-error-hook* c :collect-loop n)))))
+      ;; group-commit: fsync all open log streams once per drain tick. A sync failure is SURFACED
+      ;; via the error hook (not silently swallowed) so a failing disk is observable; the thread
+      ;; survives (a transient fsync error must not kill the collect loop) — fail-closed + alive.
+      (handler-case (store-sync store)
+        (error (c)
+          (let ((n (incf error-count)))
+            (ignore-errors (funcall *durability-error-hook* c :group-commit n)))))
       (sleep 0.005)))
+  t)
+
+;;; --- pre-seed the replay writer from the store on restart ---
+
+(defun* %seed-relay-from-store (node store topic-name)
+    (function (dds.disc:disc-node durable-store string) t)
+  "Pre-publish all existing records for TOPIC-NAME from STORE through NODE's replay writer.
+   Called during service-start after store-open so retained history (e.g. from a prior
+   run on disk) populates the TL+KEEP_ALL writer's cache before any late-joiner connects.
+   No-op when the store has no records for the topic. The in-memory store is always empty
+   at this point, so this is a true no-op for the TRANSIENT tier (byte-identical).
+   :timeout from publish-relay-sample/publish-relay-lifecycle: structurally impossible at
+   realistic seed volumes. The replay writer is TL+KEEP_ALL with no resource limit on its
+   HistoryCache, and during seed-relay there is no matched reader yet so no RTPS sends
+   occur — data goes directly into the local history cache without any socket interaction.
+   A socket-send timeout cannot trigger without a connected reader, and cache capacity is
+   unbounded (KEEP_ALL). The :timeout handler here is a backstop for unforeseen conditions;
+   it has never been observed in testing and is not expected to occur. Any other ERROR is
+   also routed to *durability-error-hook*."
+  (let ((error-count 0))
+    (dolist (r (store-get-range store topic-name))
+      (let ((result
+             (handler-case
+                 (if (eq (durable-record-kind r) :data)
+                     (dds.disc:publish-relay-sample node
+                                                    (durable-record-payload r)
+                                                    (durable-record-writer-guid r)
+                                                    (durable-record-sn r))
+                     (let* ((kh   (or (durable-record-key-hash r)
+                                      (make-array 16 :element-type '(unsigned-byte 8)
+                                                     :initial-element 0)))
+                            (kh16 (coerce kh '(simple-array (unsigned-byte 8) (16))))
+                            (sf   (ecase (durable-record-kind r)
+                                    (:dispose     1)
+                                    (:unregister  2))))
+                       (dds.disc:publish-relay-lifecycle node kh16 sf
+                                                         (durable-record-writer-guid r)
+                                                         (durable-record-sn r))))
+               (error (c)
+                 c))))
+        ;; :timeout = not cached (writer-write rejected); error = unexpected fault — both reported
+        (when (or (eq result :timeout) (typep result 'error))
+          (let ((n (incf error-count)))
+            (ignore-errors
+             (funcall *durability-error-hook*
+                      (if (typep result 'error)
+                          result
+                          (make-condition 'simple-error
+                                          :format-control "seed-relay :timeout (sn=~d topic=~a)"
+                                          :format-arguments (list (durable-record-sn r) topic-name)))
+                      :seed-relay n)))))))
   t)
 
 ;;; --- service-start ---
@@ -239,16 +375,25 @@
      :peers <list-of-(host . port)> — initial unicast SPDP peers; default none.
      :multicast <boolean>         — when T enables multicast SPDP socket; default NIL.
    *DURABILITY-DEBUG-START-FAULT* when non-NIL: after building the first node, signals an
-   error simulating startup failure (test-only fault injector; inert by default)."
+   error simulating startup failure (test-only fault injector; inert by default).
+   Note: concurrent-start re-entrancy is guarded at the runner level (runner-start in runner.lisp);
+   calling service-start concurrently on the same service instance is a caller error."
   (let* ((spec   (durability-service-spec service))
          (topics (%service-topics spec))
          (nodes  '()))
+    ;; open the store: for file-backed tiers this replays logs + re-derives epoch DEKs
+    (store-open (durability-service-store service))
     (dds.pal:with-lock ((durability-service-lock service))
-      (setf (durability-service-running service) t))
+      (setf (durability-service-running service) t)
+      ;; register all initial topic names so service-add-topic idempotency check covers them
+      (dolist (pair topics)
+        (setf (gethash (car pair) (durability-service-topic-names service)) t)))
     (dolist (pair topics)
       (let* ((topic-name (car pair))
              (type-name  (cdr pair))
              (node       (%build-disc-node spec topic-name type-name)))
+        ;; pre-seed the replay writer with any records already in the store
+        (%seed-relay-from-store node (durability-service-store service) topic-name)
         ;; fault injector fires after the first node is built (test-only)
         (when *durability-debug-start-fault*
           (dds.pal:with-lock ((durability-service-lock service))
@@ -296,7 +441,9 @@
         (when legacy-th
           (ignore-errors (dds.pal:join legacy-th))))
     (dds.pal:with-lock ((durability-service-lock service))
-      (setf (durability-service-thread service) nil)))
+      (setf (durability-service-thread service) nil))
+    ;; close the store: for file-backed tiers this fsyncs logs + frees epoch DEKs
+    (ignore-errors (store-close (durability-service-store service))))
   t)
 
 ;;; --- service-alive-p ---
@@ -313,3 +460,41 @@
                (every (lambda (p) (if (cdr p) t nil)) pairs)
                ;; process-mode proxy: use legacy thread slot
                (if (durability-service-thread service) t nil))))))
+
+;;; --- service-add-topic ---
+
+(defun* service-add-topic (service topic-name type-name)
+    (function (durability-service string string) (values (eql t) (or null t)))
+  "Add TOPIC-NAME/TYPE-NAME to a RUNNING SERVICE without a restart.
+   Idempotent by TOPIC-NAME (string=, time-stable) — a duplicate call returns (values T NIL).
+   On a fresh add: builds a new disc-node via %BUILD-DISC-NODE, pre-seeds from the store,
+   spawns a collect-loop thread, and registers the (node . thread) pair under the lock.
+   Returns (values T <new-node>) so callers can use the node without re-deriving the prefix.
+   TOCTOU-safe: checks under the first lock, builds outside it (I/O), then re-checks under
+   the final lock before push — if the topic appeared concurrently the just-built node is
+   stopped and NIL is returned as the node value.
+   The collect thread reads RUNNING under the lock on every iteration, so service-stop
+   correctly drains and joins the new thread along with all pre-existing ones.
+   Caller error: calling on a stopped service (RUNNING=NIL) is undefined — do not."
+  (let* ((spec (durability-service-spec service)))
+    ;; first check: fast path under lock — O(1) hash lookup
+    (dds.pal:with-lock ((durability-service-lock service))
+      (when (gethash topic-name (durability-service-topic-names service))
+        (return-from service-add-topic (values t nil))))
+    ;; build + start the new disc-node (outside the lock: I/O + socket bind)
+    (let ((node (%build-disc-node spec topic-name type-name)))
+      ;; pre-seed from existing store records (idempotent for empty store)
+      (%seed-relay-from-store node (durability-service-store service) topic-name)
+      (let ((th (dds.pal:spawn
+                 (let ((n node) (tn topic-name))
+                   (lambda () (%collect-loop service n tn)))
+                 :name (format nil "dds-durability-collect(~a)" topic-name))))
+        ;; TOCTOU re-check: register only if topic still absent (concurrent add wins)
+        (dds.pal:with-lock ((durability-service-lock service))
+          (when (gethash topic-name (durability-service-topic-names service))
+            ;; concurrent add won; stop the just-built node and discard it
+            (ignore-errors (dds.disc:stop-node node))
+            (return-from service-add-topic (values t nil)))
+          (setf (gethash topic-name (durability-service-topic-names service)) t)
+          (push (cons node th) (durability-service-nodes service)))
+        (values t node)))))

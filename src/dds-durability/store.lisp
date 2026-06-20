@@ -25,7 +25,9 @@
   (purge      nil     :type (or null function))
   (open       nil     :type (or null function))
   (close      nil     :type (or null function))
-  (count-fn   nil     :type (or null function)))
+  (count-fn   nil     :type (or null function))
+  ;; group-commit sync: called after each drain tick; NIL = no-op (memory store)
+  (sync       nil     :type (or null function)))
 
 ;;; Public dispatch functions — one slot read + funcall (no CLOS dispatch on the hot path).
 
@@ -68,6 +70,13 @@
     (function (durable-store &optional (or null string)) (integer 0))
   "Return the total record count across all topics, or the per-TOPIC count if TOPIC is supplied."
   (funcall (durable-store-count-fn store) topic))
+
+(defun* store-sync (store)
+    (function (durable-store) (eql t))
+  "Flush+fsync any buffered writes; no-op when the backing store has no :sync slot."
+  (let ((f (durable-store-sync store)))
+    (when f (funcall f)))
+  t)
 
 ;;; In-memory backing implementation.
 ;;; Outer table: topic (string) -> inner table.
@@ -115,6 +124,16 @@
         when (/= ba bb) do (return (< ba bb))
         finally (return nil)))
 
+(defun* %record-guid-sn< (a b)
+    (function (durable-record durable-record) boolean)
+  "Canonical get-range order on records: (writer-guid bytes ascending, then sn ascending).
+   Shared by every backend (memory + file) so the ordering is defined once (DRY)."
+  (let ((ga (coerce (durable-record-writer-guid a) 'list))
+        (gb (coerce (durable-record-writer-guid b) 'list)))
+    (if (equal ga gb)
+        (< (durable-record-sn a) (durable-record-sn b))
+        (%guid-list< ga gb))))
+
 (defun* %mem-get-range (outer lock topic)
     (function (hash-table t string) list)
   "Collect and sort all records for TOPIC by (writer-guid bytes ascending, sn ascending)."
@@ -124,12 +143,7 @@
           '()
           (let ((recs '()))
             (maphash (lambda (k v) (declare (ignore k)) (push v recs)) inn)
-            (sort recs (lambda (a b)
-                         (let ((ga (coerce (durable-record-writer-guid a) 'list))
-                               (gb (coerce (durable-record-writer-guid b) 'list)))
-                           (if (equal ga gb)
-                               (< (durable-record-sn a) (durable-record-sn b))
-                               (%guid-list< ga gb))))))))))
+            (sort recs #'%record-guid-sn<))))))
 
 (defun* %mem-topics (outer lock)
     (function (hash-table t) list)

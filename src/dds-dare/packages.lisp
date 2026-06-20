@@ -18,11 +18,17 @@
    #:ml-kem-1024-keygen
    #:ml-kem-1024-encapsulate
    #:ml-kem-1024-decapsulate
-   ;; Task 4: KEM-DEM envelope
+   ;; Task 4: KEM-DEM envelope (v1)
    #:derive-dek
    #:seal-payload
    #:open-payload
    #:make-record-aad
+   ;; Task 2 (WP-DURABILITY-PERSISTENT): envelope v2 — epoch-aware, ADR 0025 §5
+   #:seal-payload-v2
+   #:open-payload-v2
+   #:+envelope-version-v2+
+   #:+envelope-epoch-len+
+   #:+envelope-v2-header-len+
    ;; Task 5: pluggable key-provider vtable + file-based provider
    #:key-provider
    #:key-provider-recipient-public-key

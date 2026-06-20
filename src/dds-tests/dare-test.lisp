@@ -769,3 +769,470 @@
       (when (uiop:directory-exists-p tmp-dir)
         (uiop:delete-directory-tree tmp-dir :validate t))))
   t)
+
+(defun* run-dare-envelope-v2-test ()
+    (function () t)
+  "Envelope v2: epoch-aware seal-payload-v2/open-payload-v2, AAD-bound epoch-id, fail-closed, bounds-checked.
+   Builds a DEK via derive-dek of a fixed shared secret, verifies v2 blob structure, round-trips,
+   unknown-epoch -> NIL, 1-bit flips -> NIL, changed AAD -> NIL, short blobs -> NIL.
+   AAD-binding discriminator: patches header epoch to epoch+1 with a lookup that always returns
+   the same DEK — GCM must fail, proving epoch-id is bound inside the AEAD (not just the header).
+   Regression: v1 seal-payload/open-payload are deterministic (unchanged) + round-trip correctly."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [dare-envelope-v2] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-dare-envelope-v2-test t)))
+
+  (let* ((shared-secret (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x42))
+         (dek  (dds.dare:derive-dek shared-secret))
+         (nonce (make-array 12 :element-type '(unsigned-byte 8)
+                               :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12)))
+         (aad   (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(#xde #xad #xbe #xef)))
+         (pt    (make-array 5 :element-type '(unsigned-byte 8) :initial-contents '(10 20 30 40 50)))
+         (epoch-id 7))
+    (unwind-protect
+         (let ((blob (dds.dare:seal-payload-v2 dek epoch-id nonce aad pt)))
+           ;; version byte must be #x02
+           (%check :v2-version-byte (= #x02 (aref blob 0)) "v2 blob must start with #x02")
+           ;; bytes 1-4: epoch-id 7 as 4-byte LE
+           (%check :v2-epoch-b0 (= 7 (aref blob 1)) "epoch-id byte 0 must be 7")
+           (%check :v2-epoch-b1 (= 0 (aref blob 2)) "epoch-id byte 1 must be 0")
+           (%check :v2-epoch-b2 (= 0 (aref blob 3)) "epoch-id byte 2 must be 0")
+           (%check :v2-epoch-b3 (= 0 (aref blob 4)) "epoch-id byte 3 must be 0")
+           ;; total length = 1 + 4 + 12 + len(pt) + 16
+           (%check :v2-blob-len (= (length blob) (+ 1 4 12 (length pt) 16))
+                   (format nil "v2 blob length mismatch; got ~d" (length blob)))
+           ;; round-trip: correct epoch lookup -> plaintext
+           (let ((rt (dds.dare:open-payload-v2 (lambda (e) (if (= e epoch-id) dek nil)) blob aad)))
+             (%check :v2-roundtrip-non-nil rt "open-payload-v2 must return non-NIL for valid blob")
+             (%check :v2-roundtrip (equalp rt pt)
+                     (format nil "open-payload-v2 roundtrip mismatch; got ~{~2,'0x~^ ~}" (coerce rt 'list))))
+           ;; unknown epoch -> NIL
+           (%check :v2-unknown-epoch
+                   (null (dds.dare:open-payload-v2 (lambda (e) (declare (ignore e)) nil) blob aad))
+                   "unknown epoch must return NIL")
+           ;; 1-bit flip in epoch-id byte -> NIL (dek-lookup returns NIL for unknown epoch)
+           (let ((bad (copy-seq blob)))
+             (setf (aref bad 1) (logxor (aref bad 1) 1))
+             (%check :v2-flip-epoch
+                     (null (dds.dare:open-payload-v2 (lambda (e) (if (= e epoch-id) dek nil)) bad aad))
+                     "1-bit flip in epoch-id must return NIL"))
+           ;; AAD-binding proof: seal under epoch-id, patch header to claim epoch-id+1, open
+           ;; with a lookup that returns the SAME dek for any epoch — GCM MUST fail because
+           ;; seal bound aad||epoch-id-LE and open recomputes aad||(epoch-id+1)-LE.
+           (let* ((patched (copy-seq blob))
+                  (ep2     (1+ epoch-id)))
+             (dotimes (i 4) (setf (aref patched (1+ i)) (ldb (byte 8 (* 8 i)) ep2)))
+             (%check :v2-epoch-aad-binding
+                     (null (dds.dare:open-payload-v2 (lambda (e) (declare (ignore e)) dek) patched aad))
+                     "header epoch tampered (epoch+1, same DEK) MUST fail GCM -> proves epoch-id is inside AEAD AAD"))
+           ;; 1-bit flip in nonce -> NIL
+           (let ((bad (copy-seq blob)))
+             (setf (aref bad 5) (logxor (aref bad 5) 1))
+             (%check :v2-flip-nonce
+                     (null (dds.dare:open-payload-v2 (lambda (e) (if (= e epoch-id) dek nil)) bad aad))
+                     "1-bit flip in nonce must return NIL"))
+           ;; 1-bit flip in ct -> NIL
+           (let ((bad (copy-seq blob)))
+             (setf (aref bad 17) (logxor (aref bad 17) 1))
+             (%check :v2-flip-ct
+                     (null (dds.dare:open-payload-v2 (lambda (e) (if (= e epoch-id) dek nil)) bad aad))
+                     "1-bit flip in ct must return NIL"))
+           ;; 1-bit flip in tag -> NIL
+           (let ((bad (copy-seq blob)))
+             (setf (aref bad (1- (length blob))) (logxor (aref bad (1- (length blob))) 1))
+             (%check :v2-flip-tag
+                     (null (dds.dare:open-payload-v2 (lambda (e) (if (= e epoch-id) dek nil)) bad aad))
+                     "1-bit flip in tag must return NIL"))
+           ;; changed AAD -> NIL
+           (let ((bad-aad (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(#xff #xff #xff #xff))))
+             (%check :v2-changed-aad
+                     (null (dds.dare:open-payload-v2 (lambda (e) (if (= e epoch-id) dek nil)) blob bad-aad))
+                     "changed AAD must return NIL"))
+           ;; short blobs -> NIL, no error
+           (dolist (short-len '(0 1 16 32))
+             (let ((short (make-array short-len :element-type '(unsigned-byte 8) :initial-element #x02)))
+               (%check :v2-short-blob
+                       (null (dds.dare:open-payload-v2 (lambda (e) (declare (ignore e)) dek) short aad))
+                       (format nil "short blob (len=~d) must return NIL" short-len))))
+           ;; v1 regression: seal-payload/open-payload deterministic + correct round-trip
+           ;; (:v1-deterministic checks GCM determinism with same inputs; v1 code is unmodified in this diff)
+           (let* ((v1-nonce (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xab))
+                  (v1-aad   (make-array 2  :element-type '(unsigned-byte 8) :initial-contents '(#xca #xfe)))
+                  (v1-pt    (make-array 3  :element-type '(unsigned-byte 8) :initial-contents '(1 2 3)))
+                  (sealed1  (dds.dare:seal-payload dek v1-nonce v1-aad v1-pt))
+                  (sealed2  (dds.dare:seal-payload dek v1-nonce v1-aad v1-pt)))
+             (%check :v1-deterministic (equalp sealed1 sealed2)
+                     "v1 seal-payload must produce identical bytes for identical inputs (GCM determinism)")
+             (%check :v1-regression-version (= #x01 (aref sealed1 0))
+                     "v1 sealed blob must still start with #x01")
+             (let ((rt1 (dds.dare:open-payload dek sealed1 v1-aad)))
+               (%check :v1-regression-roundtrip (equalp rt1 v1-pt)
+                       "v1 open-payload must still round-trip"))))
+      (dds.dare:free-secret-octets dek)))
+  t)
+
+;;; --- Task 3 (WP-DURABILITY-PERSISTENT): epoch-aware encrypted-store cross-restart test ---
+;;; Composes make-file-store (inner, disk) + make-encrypted-store :epoch-dir (v2 seal/open
+;;; by epoch-id, persisted epochs.dat). Proves: cross-restart re-open re-derives prior epochs'
+;;; DEKs, a fresh epoch is minted per run with puts, records round-trip byte-exact across runs,
+;;; on-disk frames are sealed (start #x02, never plaintext), tamper -> fail-closed drop.
+
+(defun* %pst-octets (b)
+    (function (list) (simple-array (unsigned-byte 8) (*)))
+  "Build a (simple-array (unsigned-byte 8) (*)) from list B (persistent-store-test fixture)."
+  (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b))
+
+(defun* %pst-read-all-log-bytes (dir)
+    (function (pathname) (simple-array (unsigned-byte 8) (*)))
+  "Concatenate every D/topics/*.log file's raw bytes (for the no-plaintext-on-disk assertion)."
+  (let* ((topics-dir (merge-pathnames (make-pathname :directory '(:relative "topics")) dir))
+         (out '()))
+    (when (uiop:directory-exists-p topics-dir)
+      (dolist (path (uiop:directory-files topics-dir "*.log"))
+        (with-open-file (s path :element-type '(unsigned-byte 8))
+          (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+            (read-sequence v s)
+            (push v out)))))
+    (let* ((total (reduce #'+ out :key #'length :initial-value 0))
+           (cat   (make-array total :element-type '(unsigned-byte 8)))
+           (pos   0))
+      (dolist (v (nreverse out) cat)
+        (replace cat v :start1 pos)
+        (incf pos (length v))))))
+
+(defun* %pst-subseq-present-p (haystack needle)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) boolean)
+  "Return T iff octet vector NEEDLE occurs as a contiguous subsequence of HAYSTACK."
+  (let ((hn (length haystack)) (nn (length needle)))
+    (when (zerop nn) (return-from %pst-subseq-present-p t))
+    (loop for start from 0 to (- hn nn)
+          when (loop for i below nn always (= (aref haystack (+ start i)) (aref needle i)))
+            do (return-from %pst-subseq-present-p t))
+    nil))
+
+(defun* %pst-epoch-count (dir)
+    (function (pathname) (integer 0))
+  "Count epochs in D/epochs.dat via the production loader (replay + tail-recover)."
+  (hash-table-count (dds.durability::%load-epoch-table dir)))
+
+(defun* %pst-read-epochs-dat (dir)
+    (function (pathname) (simple-array (unsigned-byte 8) (*)))
+  "Read D/epochs.dat into a fresh octet vector (empty vector if absent)."
+  (let ((path (dds.durability::%epochs-dat-path dir)))
+    (if (probe-file path)
+        (with-open-file (s path :element-type '(unsigned-byte 8))
+          (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+            (read-sequence v s)
+            v))
+        (make-array 0 :element-type '(unsigned-byte 8)))))
+
+(defun* %pst-epochs-kem-cts (dir)
+    (function (pathname) list)
+  "Return an alist of (epoch-id . kem-ct-vector) parsed from D/epochs.dat, sorted by epoch-id."
+  (let ((tbl (dds.durability::%load-epoch-table dir))
+        (acc '()))
+    (maphash (lambda (id ct) (push (cons id ct) acc)) tbl)
+    (sort acc #'< :key #'car)))
+
+(defun* %pst-sealed-epoch-id (blob)
+    (function ((simple-array (unsigned-byte 8) (*))) (unsigned-byte 32))
+  "Extract epoch-id from a v2 sealed blob: bytes 1-4 LE (after the version byte at 0)."
+  (dds.durability::%get-u32-le blob 1))
+
+(defun* %pst-sealed-nonce (blob)
+    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
+  "Extract the 12-byte nonce from a v2 sealed blob: bytes 5-16 (after ver(1)+epoch-id(4))."
+  (let ((v (make-array 12 :element-type '(unsigned-byte 8))))
+    (replace v blob :start2 5 :end2 17)
+    v))
+
+(defun* run-dare-persistent-store-test ()
+    (function () t)
+  "Epoch-aware encrypted-store cross-restart: persisted epochs.dat, per-epoch DEK, lazy mint
+   on first put, v2 seal/open by epoch-id. Three runs over the SAME store dir D + key dir K:
+   run1 puts N -> get-range byte-exact, inner frames sealed (start #x02, no plaintext on disk),
+   epochs.dat has exactly 1 epoch; run2 re-opens (epoch-1 DEK re-derived) -> N still byte-exact,
+   put M more -> 2 epochs; run3 -> all N+M open byte-exact; a tampered on-disk frame is DROPPED."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [dare-persistent-store] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-dare-persistent-store-test t)))
+
+  (let* ((d-dir (uiop:merge-pathnames*
+                 (make-pathname :directory (list :relative
+                                                 (format nil "dds-pst-d-~a" (get-universal-time))))
+                 (uiop:temporary-directory)))
+         (k-dir (uiop:merge-pathnames*
+                 (make-pathname :directory (list :relative
+                                                 (format nil "dds-pst-k-~a" (get-universal-time))))
+                 (uiop:temporary-directory)))
+         (g1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 1))
+         (g2 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 2))
+         ;; distinctive plaintexts so a no-plaintext-on-disk substring scan is meaningful
+         (pa (%pst-octets '(#xA0 #xA1 #xA2 #xA3 #xA4 #xA5 #xA6 #xA7)))
+         (pb (%pst-octets '(#xB0 #xB1 #xB2 #xB3 #xB4 #xB5 #xB6 #xB7)))
+         (pc (%pst-octets '(#xC0 #xC1 #xC2 #xC3 #xC4 #xC5 #xC6 #xC7))))
+    (unwind-protect
+         (progn
+           ;; --- RUN 1: put N=2, byte-exact round-trip, sealed-on-disk, 1 epoch ---
+           (let* ((kp1  (dds.dare:make-file-key-provider :dir k-dir))
+                  (fs1  (dds.durability:make-file-store :dir d-dir))
+                  (enc1 (dds.durability:make-encrypted-store fs1 kp1 :epoch-dir d-dir)))
+             (dds.durability:store-open enc1)
+             (dds.durability:store-put enc1 "Square" g1 1 nil :data pa)
+             (dds.durability:store-put enc1 "Square" g1 2 nil :data pb)
+             ;; (a) get-range round-trips byte-exact
+             (let ((recs (dds.durability:store-get-range enc1 "Square")))
+               (%check :pst1-count (= 2 (length recs)) "run1 Square count must be 2")
+               (%check :pst1-rt1 (equalp pa (dds.durability:durable-record-payload (first recs)))
+                       "run1 sn1 payload must round-trip byte-exact")
+               (%check :pst1-rt2 (equalp pb (dds.durability:durable-record-payload (second recs)))
+                       "run1 sn2 payload must round-trip byte-exact"))
+             ;; (b) the INNER file-store's on-disk frame payloads are SEALED (start #x02, != plaintext)
+             (let ((inner-recs (dds.durability:store-get-range fs1 "Square")))
+               (%check :pst1-inner-sealed-v2
+                       (= #x02 (aref (dds.durability:durable-record-payload (first inner-recs)) 0))
+                       "inner sealed payload must start with v2 version byte #x02")
+               (%check :pst1-inner-not-plaintext
+                       (not (equalp (dds.durability:durable-record-payload (first inner-recs)) pa))
+                       "inner sealed payload must not equal plaintext"))
+             ;; (b') no plaintext on disk: neither pa nor pb appears verbatim in any *.log
+             (let ((raw (%pst-read-all-log-bytes d-dir)))
+               (%check :pst1-disk-no-pa (not (%pst-subseq-present-p raw pa))
+                       "plaintext pa must not appear on disk")
+               (%check :pst1-disk-no-pb (not (%pst-subseq-present-p raw pb))
+                       "plaintext pb must not appear on disk"))
+             ;; (c) epochs.dat has exactly 1 epoch after a run with puts
+             (%check :pst1-epochs-1 (= 1 (%pst-epoch-count d-dir)) "run1 must mint exactly 1 epoch")
+             (dds.durability:store-close enc1))
+
+           ;; --- RUN 2: re-open SAME D+K, N still byte-exact (epoch-1 DEK re-derived), put M=1 -> 2 epochs ---
+           (let* ((kp2  (dds.dare:make-file-key-provider :dir k-dir))
+                  (fs2  (dds.durability:make-file-store :dir d-dir))
+                  (enc2 (dds.durability:make-encrypted-store fs2 kp2 :epoch-dir d-dir)))
+             (dds.durability:store-open enc2)
+             ;; (a) run-1's records open byte-exact under the re-derived epoch-1 DEK
+             (let ((recs (dds.durability:store-get-range enc2 "Square")))
+               (%check :pst2-count (= 2 (length recs)) "run2 must see run1's 2 records")
+               (%check :pst2-rt1 (equalp pa (dds.durability:durable-record-payload (first recs)))
+                       "run2 re-derives epoch-1 DEK: sn1 byte-exact")
+               (%check :pst2-rt2 (equalp pb (dds.durability:durable-record-payload (second recs)))
+                       "run2 re-derives epoch-1 DEK: sn2 byte-exact"))
+             ;; still 1 epoch before any put in run2 (open does not mint)
+             (%check :pst2-epochs-pre-1 (= 1 (%pst-epoch-count d-dir))
+                     "run2 open must NOT mint an epoch before the first put")
+             ;; put M=1 more -> mints epoch 2
+             (dds.durability:store-put enc2 "Square" g2 7 nil :data pc)
+             (%check :pst2-epochs-2 (= 2 (%pst-epoch-count d-dir)) "run2 first put must mint epoch 2")
+             ;; (a) all 3 now open byte-exact within run2 (epoch-1 + epoch-2 DEKs both live)
+             (let ((recs (dds.durability:store-get-range enc2 "Square")))
+               (%check :pst2-count-3 (= 3 (length recs)) "run2 must now see 3 records")
+               (%check :pst2-rt-pc
+                       (find pc recs :key #'dds.durability:durable-record-payload :test #'equalp)
+                       "run2 new epoch-2 record must round-trip byte-exact"))
+             (dds.durability:store-close enc2))
+
+           ;; --- SECURITY ASSERTIONS (after 2-run sequence; d-dir has 2 epochs + all sealed records) ---
+
+           ;; (sec-a) cross-epoch DEK distinctness: epoch-1 and epoch-2 kem-ct bytes must differ
+           (let ((entries (%pst-epochs-kem-cts d-dir)))
+             (%check :pst-sec-epoch-count (= 2 (length entries))
+                     (format nil "expected exactly 2 epoch entries; got ~d" (length entries)))
+             (let ((ct1 (cdr (first entries)))
+                   (ct2 (cdr (second entries))))
+               (%check :pst-sec-kem-ct-distinct
+                       (not (equalp ct1 ct2))
+                       "epoch-1 and epoch-2 kem-ct must be DIFFERENT (distinct encapsulations)")))
+
+           ;; (sec-b+c) cross-run epoch-id and intra-epoch nonce distinctness via a single ro open.
+           (let* ((fs-ro (dds.durability:make-file-store :dir d-dir)))
+             (dds.durability:store-open fs-ro)
+             (let ((blobs (mapcar #'dds.durability:durable-record-payload
+                                  (dds.durability:store-get-range fs-ro "Square"))))
+               (%check :pst-sec-blobs-count (= 3 (length blobs))
+                       (format nil "expected 3 sealed blobs; got ~d" (length blobs)))
+               ;; sec-b: run-1 records (first two, sn=1,2) have epoch-id=1; run-2 record (sn=7) has epoch-id=2
+               (let ((eid-run1 (%pst-sealed-epoch-id (first blobs)))
+                     (eid-run2 (%pst-sealed-epoch-id (third blobs))))
+                 (%check :pst-sec-cross-run-epoch-distinct
+                         (not (= eid-run1 eid-run2))
+                         (format nil "run-1 epoch-id ~d must differ from run-2 epoch-id ~d"
+                                 eid-run1 eid-run2)))
+               ;; sec-c: run-1's two records share epoch-1 but must have distinct nonces (counter++)
+               (let ((n1 (%pst-sealed-nonce (first blobs)))
+                     (n2 (%pst-sealed-nonce (second blobs))))
+                 (%check :pst-sec-intra-epoch-nonce-distinct
+                         (not (equalp n1 n2))
+                         "intra-epoch nonces for sn=1 and sn=2 must be DIFFERENT (counter increments)")))
+             (dds.durability:store-close fs-ro))
+
+           ;; --- RUN 3: re-open SAME D+K, BOTH runs' records open byte-exact (epoch 1 + 2 re-derived) ---
+           (let* ((kp3  (dds.dare:make-file-key-provider :dir k-dir))
+                  (fs3  (dds.durability:make-file-store :dir d-dir))
+                  (enc3 (dds.durability:make-encrypted-store fs3 kp3 :epoch-dir d-dir)))
+             (dds.durability:store-open enc3)
+             (let ((recs (dds.durability:store-get-range enc3 "Square")))
+               (%check :pst3-count (= 3 (length recs)) "run3 must see all 3 records")
+               (%check :pst3-rt-pa (find pa recs :key #'dds.durability:durable-record-payload :test #'equalp)
+                       "run3 epoch-1 record pa byte-exact")
+               (%check :pst3-rt-pb (find pb recs :key #'dds.durability:durable-record-payload :test #'equalp)
+                       "run3 epoch-1 record pb byte-exact")
+               (%check :pst3-rt-pc (find pc recs :key #'dds.durability:durable-record-payload :test #'equalp)
+                       "run3 epoch-2 record pc byte-exact"))
+             ;; tamper: flip a byte inside a sealed on-disk frame -> get-range DROPS it (no error)
+             (let* ((inner (dds.durability:store-get-range fs3 "Square"))
+                    (target (first inner))
+                    (blob   (dds.durability:durable-record-payload target))
+                    (tampered (copy-seq blob))
+                    (hook-count 0))
+               ;; flip a ciphertext byte (past the v2 header: 1 ver + 4 epoch + 12 nonce = 17)
+               (setf (aref tampered 18) (logxor (aref tampered 18) #xff))
+               ;; re-inject the tampered blob under a NEW sn directly into the inner file store
+               (dds.durability:store-put fs3 "Square"
+                                         (dds.durability:durable-record-writer-guid target)
+                                         999 nil :data tampered)
+               (let ((dds.durability:*dare-error-hook*
+                       (lambda (c ctx n) (declare (ignore c ctx)) (setf hook-count n) t)))
+                 (let ((recs (dds.durability:store-get-range enc3 "Square")))
+                   (%check :pst3-tamper-drop (= 3 (length recs))
+                           (format nil "tampered frame must be DROPPED; expected 3, got ~d" (length recs)))
+                   (%check :pst3-tamper-hook (= 1 hook-count)
+                           "tamper must fire the dare-error-hook exactly once"))))
+             (dds.durability:store-close enc3)))
+      (when (uiop:directory-exists-p d-dir)
+        (uiop:delete-directory-tree d-dir :validate t))
+      (when (uiop:directory-exists-p k-dir)
+        (uiop:delete-directory-tree k-dir :validate t))))
+  t)
+
+;;; --- v2 key-hash AAD binding (WP-DURABILITY-PERSISTENT review) ---
+;;; The file store writes key-hash to the frame in CLEARTEXT (CRC-only). A disk-write adversary
+;;; could flip a record's key-hash and fix the trivial CRC to mis-route an instance's lifecycle.
+;;; %record-aad-v2 binds key-hash into the AEAD, so a flipped key-hash now fails the GCM tag.
+
+(defun* run-dare-keyhash-aad-test ()
+    (function () t)
+  "v2 AEAD binds key-hash: a disk-tampered (key-hash flipped, CRC fixed) frame must be DROPPED
+   (fail-closed), not returned with the wrong key-hash. Control: the keyed record round-trips untampered."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [dare-keyhash-aad] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-dare-keyhash-aad-test t)))
+  (let* ((d-dir (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-khaad-d-~a" (get-universal-time)))) (uiop:temporary-directory)))
+         (k-dir (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-khaad-k-~a" (get-universal-time)))) (uiop:temporary-directory)))
+         (g1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 1))
+         (kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xAA))
+         (pa (%pst-octets '(#xA0 #xA1 #xA2 #xA3 #xA4 #xA5 #xA6 #xA7)))
+         (topic "K"))
+    (unwind-protect
+         (progn
+           ;; RUN 1: put a KEYED record, prove benign round-trip (S1 no-regression), seal to disk
+           (let* ((kp  (dds.dare:make-file-key-provider :dir k-dir))
+                  (fs  (dds.durability:make-file-store :dir d-dir))
+                  (enc (dds.durability:make-encrypted-store fs kp :epoch-dir d-dir)))
+             (dds.durability:store-open enc)
+             (dds.durability:store-put enc topic g1 1 kh :data pa)
+             (let ((recs (dds.durability:store-get-range enc topic)))
+               (%check :khaad-control-rt
+                       (and (= 1 (length recs))
+                            (equalp pa (dds.durability:durable-record-payload (first recs)))
+                            (equalp kh (dds.durability:durable-record-key-hash (first recs))))
+                       "control: keyed record must round-trip byte-exact (key-hash in AAD, no regression)"))
+             (dds.durability:store-close enc))
+           ;; TAMPER: flip a key-hash byte in the on-disk frame + recompute the frame CRC so it parses.
+           ;; frame: magic(2)+flags(1)+guid(16)+sn(8)=27, key-hash at 27..42, plen at 43..46.
+           (let* ((tid (dds.durability::%topic->id topic))
+                  (log-path (merge-pathnames (make-pathname :directory '(:relative "topics") :name tid :type "log") d-dir))
+                  (raw (with-open-file (fin log-path :element-type '(unsigned-byte 8))
+                         (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
+                           (read-sequence v fin) v))))
+             (setf (aref raw 27) (logxor (aref raw 27) #xFF))
+             (let* ((plen    (dds.durability::%get-u32-le raw 43))
+                    (crc-off (+ 47 plen)))
+               (dds.durability::%put-u32-le raw crc-off (dds.durability::%crc32 raw 0 crc-off))
+               (with-open-file (fout log-path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+                 (write-sequence raw fout))))
+           ;; RUN 2: reopen → frame parses (CRC valid) but key-hash is in the AAD → GCM fail → DROP
+           (let* ((kp2  (dds.dare:make-file-key-provider :dir k-dir))
+                  (fs2  (dds.durability:make-file-store :dir d-dir))
+                  (enc2 (dds.durability:make-encrypted-store fs2 kp2 :epoch-dir d-dir))
+                  (hook-count 0))
+             (dds.durability:store-open enc2)
+             (%check :khaad-frame-parses
+                     (= 1 (dds.durability:store-count fs2 topic))
+                     "tampered frame must still parse at the file layer (CRC was recomputed)")
+             (let ((dds.durability:*dare-error-hook*
+                     (lambda (c ctx n) (declare (ignore c ctx)) (setf hook-count n) t)))
+               (let ((recs (dds.durability:store-get-range enc2 topic)))
+                 (%check :khaad-tamper-drop (zerop (length recs))
+                         (format nil "tampered key-hash must be DROPPED by the AEAD; got ~d records" (length recs)))
+                 (%check :khaad-tamper-hook (= 1 hook-count)
+                         "key-hash tamper must fire the dare-error-hook exactly once")))
+             (dds.durability:store-close enc2)))
+      (when (uiop:directory-exists-p d-dir) (ignore-errors (uiop:delete-directory-tree d-dir :validate t)))
+      (when (uiop:directory-exists-p k-dir) (ignore-errors (uiop:delete-directory-tree k-dir :validate t)))))
+  t)
+
+;;; --- epochs.dat replay recovery (WP-DURABILITY-PERSISTENT review) ---
+;;; Mirrors the topic-log torn-vs-corrupt discipline + exercises the +epochs-max-ctlen+ cap.
+
+(defun* run-dare-epochs-recovery-test ()
+    (function () t)
+  "epochs.dat replay recovery: torn trailing entry truncate-recovers; mid-file CRC corruption errors;
+   an over-cap kem-ct-len errors (the +epochs-max-ctlen+ sanity cap, never a silent truncation).
+   No crypto: %append-epoch / %load-epoch-table are CRC framing over opaque kem-ct bytes."
+  (let ((ct1 (%pst-octets (loop for i below 40 collect (logand (+ i 1) 255))))
+        (ct2 (%pst-octets (loop for i below 40 collect (logand (+ i 200) 255)))))
+    (flet ((fresh-dir (tag)
+             (let ((d (uiop:merge-pathnames*
+                       (make-pathname :directory (list :relative (format nil "dds-eprec-~a-~a" tag (get-universal-time))))
+                       (uiop:temporary-directory))))
+               (dds.durability::%append-epoch d 1 ct1)
+               (dds.durability::%append-epoch d 2 ct2)
+               d)))
+      ;; control: a clean 2-entry table loads both
+      (let ((d (fresh-dir "ok")))
+        (unwind-protect
+             (%check :eprec-control (= 2 (hash-table-count (dds.durability::%load-epoch-table d)))
+                     "clean epochs.dat must load both entries")
+          (ignore-errors (uiop:delete-directory-tree d :validate t))))
+      ;; (a) torn trailing entry → truncate-recover to 1 entry, no error
+      (let ((d (fresh-dir "torn")))
+        (unwind-protect
+             (let* ((path (dds.durability::%epochs-dat-path d))
+                    (sz   (length (%pst-read-epochs-dat d))))
+               (dds.durability::%truncate-file path (- sz 3))
+               (%check :eprec-torn (= 1 (hash-table-count (dds.durability::%load-epoch-table d)))
+                       "torn trailing epochs.dat entry must truncate-recover to 1 entry, no error"))
+          (ignore-errors (uiop:delete-directory-tree d :validate t))))
+      ;; (b) mid-file CRC corruption (flip a byte inside entry 1's kem-ct) → error
+      (let ((d (fresh-dir "corrupt")))
+        (unwind-protect
+             (let* ((path (dds.durability::%epochs-dat-path d))
+                    (raw  (%pst-read-epochs-dat d))
+                    (errored nil))
+               (setf (aref raw 8) (logxor (aref raw 8) #xFF))
+               (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+                 (write-sequence raw out))
+               (handler-case (dds.durability::%load-epoch-table d) (error () (setf errored t)))
+               (%check :eprec-corrupt errored
+                       "mid-file epochs.dat corruption must signal an error (fail loud)"))
+          (ignore-errors (uiop:delete-directory-tree d :validate t))))
+      ;; (c) over-cap kem-ct-len (entry-1 ctlen field at offset 4) → :corrupt → error
+      (let ((d (fresh-dir "overcap")))
+        (unwind-protect
+             (let* ((path (dds.durability::%epochs-dat-path d))
+                    (raw  (%pst-read-epochs-dat d))
+                    (errored nil))
+               (dotimes (i 4) (setf (aref raw (+ 4 i)) #xFF))
+               (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+                 (write-sequence raw out))
+               (handler-case (dds.durability::%load-epoch-table d) (error () (setf errored t)))
+               (%check :eprec-overcap errored
+                       "an over-cap epochs.dat kem-ct-len must fail loud (:corrupt), not silently truncate"))
+          (ignore-errors (uiop:delete-directory-tree d :validate t))))))
+  t)

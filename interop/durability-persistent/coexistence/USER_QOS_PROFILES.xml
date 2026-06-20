@@ -1,0 +1,77 @@
+<?xml version="1.0"?>
+<!-- TRANSIENT-tier coexistence QoS for the WP-DURABILITY-PERSISTENT carry-forward (ADR 0024).
+     Loopback-only (127.0.0.1), domain 0. Run Connext apps from THIS dir so they load it from cwd.
+
+     The two relays under test:
+       Relay 1 = RTI Persistence Service (relays the TRANSIENT durability tier).
+       Relay 2 = our durability service (TRANSIENT_LOCAL collecting reader + TRANSIENT_LOCAL replay
+                 writer that emits PID_ORIGINAL_WRITER_INFO + PID_SERVICE_KIND=PERSISTENCE_SERVICE).
+
+     Asymmetric durability is deliberate and load-bearing for the coexistence:
+       * datawriter_qos = TRANSIENT  — the original publisher. RTI PS only relays TRANSIENT/PERSISTENT,
+         NOT TRANSIENT_LOCAL (the documented Phase-2 blocker). Our service's TRANSIENT_LOCAL reader is
+         still RxO-compatible with a TRANSIENT writer (offered rank 2 >= requested rank 1; see
+         dds.qos:durability-rank), so BOTH relays collect the same origin samples.
+       * datareader_qos = TRANSIENT_LOCAL — the late-joining subscriber. It must match BOTH relay
+         writers: RTI PS's relay writer (TRANSIENT, rank 2 >= 1 OK) AND our relay writer
+         (TRANSIENT_LOCAL, rank 1 >= 1 OK). A TRANSIENT reader (rank 2) would NOT match our
+         TRANSIENT_LOCAL writer (offered 1 < requested 2) and would see only RTI PS — defeating the
+         dual-relay test. TRANSIENT_LOCAL is the only request rank that matches both relays.
+
+     A participant_id of -1 lets Connext auto-pick a free index so pub, sub, RTI PS and our service
+     coexist on domain 0 without index-negotiation timeouts. -->
+<dds xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:noNamespaceSchemaLocation="https://community.rti.com/schema/7.3.1/rti_dds_qos_profiles.xsd">
+  <qos_library name="CoexistenceTransientLib">
+    <qos_profile name="LoopbackTransient" is_default_qos="true">
+      <participant_qos>
+        <transport_builtin>
+          <mask>UDPv4</mask>
+        </transport_builtin>
+        <property>
+          <value>
+            <element>
+              <name>dds.transport.UDPv4.builtin.parent.allow_interfaces</name>
+              <value>127.0.0.1</value>
+            </element>
+          </value>
+        </property>
+        <wire_protocol>
+          <participant_id>-1</participant_id>
+        </wire_protocol>
+      </participant_qos>
+      <datawriter_qos>
+        <reliability>
+          <kind>RELIABLE_RELIABILITY_QOS</kind>
+        </reliability>
+        <durability>
+          <kind>TRANSIENT_DURABILITY_QOS</kind>
+        </durability>
+        <history>
+          <kind>KEEP_ALL_HISTORY_QOS</kind>
+        </history>
+        <resource_limits>
+          <max_samples>LENGTH_UNLIMITED</max_samples>
+          <max_instances>LENGTH_UNLIMITED</max_instances>
+          <max_samples_per_instance>LENGTH_UNLIMITED</max_samples_per_instance>
+        </resource_limits>
+      </datawriter_qos>
+      <datareader_qos>
+        <reliability>
+          <kind>RELIABLE_RELIABILITY_QOS</kind>
+        </reliability>
+        <durability>
+          <kind>TRANSIENT_LOCAL_DURABILITY_QOS</kind>
+        </durability>
+        <history>
+          <kind>KEEP_ALL_HISTORY_QOS</kind>
+        </history>
+        <resource_limits>
+          <max_samples>LENGTH_UNLIMITED</max_samples>
+          <max_instances>LENGTH_UNLIMITED</max_instances>
+          <max_samples_per_instance>LENGTH_UNLIMITED</max_samples_per_instance>
+        </resource_limits>
+      </datareader_qos>
+    </qos_profile>
+  </qos_library>
+</dds>

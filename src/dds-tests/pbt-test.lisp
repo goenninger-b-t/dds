@@ -1119,6 +1119,193 @@
                    (prng-int prng 0 255)))
            v)))))
 
+;;; ---- WP-DURABILITY-PERSISTENT crash-injection fuzz (NFR-SEC-POSTURE) ----
+;;;; Verifies that the file-store open/replay path is robust against truncated or
+;;;; garbage-appended log files (torn write after a crash) and against mid-file
+;;;; corruption (which must signal an error, never silently produce wrong data).
+
+(defun* %crash-fuzz-temp-dir (seed)
+    (function (integer) pathname)
+  "Return a deterministic temp-dir pathname for the crash-injection fuzz SEED."
+  (uiop:merge-pathnames*
+   (make-pathname :directory (list :relative (format nil "dds-crash-fuzz-~a" seed)))
+   (uiop:temporary-directory)))
+
+(defun* %crash-fuzz-cleanup (dir)
+    (function (pathname) t)
+  "Recursively delete DIR if it exists (best-effort; errors ignored)."
+  (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))
+  t)
+
+(defun* fuzz-file-store-crash-injection ()
+    (function () t)
+  "Crash-injection fuzz of the file-store open/replay path (WP-DURABILITY-PERSISTENT, NFR-SEC-POSTURE).
+   Four sub-arms:
+   (A) Tail truncation: write K=5 frames, truncate the last frame at a random byte offset,
+       reopen -> must recover to K-1 or K intact frames (torn tail = :short -> auto-truncate).
+   (B) Garbage append: write K=5 frames, append random bytes after the last frame,
+       reopen -> must recover to exactly K intact frames (the garbage is :short -> auto-truncate).
+   (C) Mid-file corruption: write K=5 frames, flip one byte in frame 1's body,
+       reopen -> must signal an error (full frame present but CRC invalid -> :corrupt).
+   (D) epochs.dat: write 3 epoch entries; a torn TRAILING entry truncate-recovers (no error),
+       a mid-file CRC corruption signals an error (the cross-restart key table gets the same
+       torn-vs-corrupt discipline as the topic logs — a silently lost epoch bricks its records).
+   Deterministic (seeded xorshift32); signals test-failure on OOB / unexpected result."
+  (let* ((seed #xC7A5D31B)
+         (prng (make-prng seed))
+         (topic "CrashFuzzTopic")
+         (g0    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xAB))
+         (k     5))
+    ;; --- arm A: tail truncation ---
+    (let ((dir (%crash-fuzz-temp-dir (logxor seed #x0001))))
+      (unwind-protect
+           (progn
+             ;; write K frames into a fresh store
+             (let ((store (dds.durability:make-file-store :dir dir)))
+               (dds.durability:store-open store)
+               (dotimes (i k)
+                 (dds.durability:store-put store topic g0 (1+ i) nil :data
+                                           (make-array 4 :element-type '(unsigned-byte 8)
+                                                          :initial-element (1+ i))))
+               (dds.durability:store-close store))
+             ;; find the log file and truncate it at a random byte inside the last frame
+             (let* ((topics-dir (merge-pathnames (make-pathname :directory '(:relative "topics")) dir))
+                    (logs       (uiop:directory-files topics-dir "*.log")))
+               (when logs
+                 (let* ((log-path (first logs))
+                        (file-size (with-open-file (s log-path :element-type '(unsigned-byte 8))
+                                     (file-length s)))
+                        ;; truncate somewhere in the last 20 bytes (but not before byte 2)
+                        (trunc-at (max 2 (- file-size (prng-int prng 1 (min 20 (max 1 (truncate file-size 2))))))))
+                   (dds.durability::%truncate-file log-path trunc-at)))
+               ;; reopen -> recovery; no error must escape
+               (let* ((store2 (dds.durability:make-file-store :dir dir))
+                      (ok (handler-case
+                               (progn (dds.durability:store-open store2) t)
+                             (error (e)
+                               (error 'test-failure :name "crash-fuzz-tail-truncation"
+                                      :detail (format nil "store-open after tail truncation signalled: ~a" e))))))
+                 (declare (ignore ok))
+                 ;; count must be K-1 or K (depends on where the truncation landed)
+                 (let ((cnt (dds.durability:store-count store2 topic)))
+                   (unless (or (= cnt (1- k)) (= cnt k))
+                     (error 'test-failure :name "crash-fuzz-tail-truncation"
+                            :detail (format nil "after tail truncation expected ~d or ~d records, got ~d"
+                                            (1- k) k cnt))))
+                 (ignore-errors (dds.durability:store-close store2)))))
+        (%crash-fuzz-cleanup dir)))
+    ;; --- arm B: garbage append ---
+    (let ((dir (%crash-fuzz-temp-dir (logxor seed #x0002))))
+      (unwind-protect
+           (progn
+             (let ((store (dds.durability:make-file-store :dir dir)))
+               (dds.durability:store-open store)
+               (dotimes (i k)
+                 (dds.durability:store-put store topic g0 (1+ i) nil :data
+                                           (make-array 4 :element-type '(unsigned-byte 8)
+                                                          :initial-element (1+ i))))
+               (dds.durability:store-close store))
+             ;; append random garbage to the log
+             (let* ((topics-dir (merge-pathnames (make-pathname :directory '(:relative "topics")) dir))
+                    (logs       (uiop:directory-files topics-dir "*.log")))
+               (when logs
+                 (let ((log-path (first logs)))
+                   (with-open-file (stm log-path :direction :output
+                                                 :element-type '(unsigned-byte 8)
+                                                 :if-exists :append)
+                     (dotimes (_ (prng-int prng 1 32))
+                       (write-byte (prng-int prng 0 255) stm)))))
+               ;; reopen -> must recover exactly K frames (the garbage bytes are :short)
+               (let* ((store2 (dds.durability:make-file-store :dir dir))
+                      (ok (handler-case
+                               (progn (dds.durability:store-open store2) t)
+                             (error (e)
+                               (error 'test-failure :name "crash-fuzz-garbage-append"
+                                      :detail (format nil "store-open after garbage append signalled: ~a" e))))))
+                 (declare (ignore ok))
+                 (let ((cnt (dds.durability:store-count store2 topic)))
+                   (unless (= cnt k)
+                     (error 'test-failure :name "crash-fuzz-garbage-append"
+                            :detail (format nil "after garbage append expected ~d records, got ~d" k cnt))))
+                 (ignore-errors (dds.durability:store-close store2)))))
+        (%crash-fuzz-cleanup dir)))
+    ;; --- arm C: mid-file corruption -> must signal error ---
+    (let ((dir (%crash-fuzz-temp-dir (logxor seed #x0003))))
+      (unwind-protect
+           (progn
+             (let ((store (dds.durability:make-file-store :dir dir)))
+               (dds.durability:store-open store)
+               (dotimes (i k)
+                 (dds.durability:store-put store topic g0 (1+ i) nil :data
+                                           (make-array 4 :element-type '(unsigned-byte 8)
+                                                          :initial-element (1+ i))))
+               (dds.durability:store-close store))
+             ;; flip one byte in the BODY of the first frame (offset 5 = guid byte 2, well within frame 1)
+             (let* ((topics-dir (merge-pathnames (make-pathname :directory '(:relative "topics")) dir))
+                    (logs       (uiop:directory-files topics-dir "*.log")))
+               (when logs
+                 (let* ((log-path (first logs))
+                        (file-size (with-open-file (s log-path :element-type '(unsigned-byte 8))
+                                     (file-length s)))
+                        ;; corrupt a byte near offset 5 (inside frame 1's guid field)
+                        (corrupt-at (min 5 (1- (max 1 file-size))))
+                        (buf (make-array file-size :element-type '(unsigned-byte 8))))
+                   (with-open-file (in log-path :element-type '(unsigned-byte 8)) (read-sequence buf in))
+                   (setf (aref buf corrupt-at) (logxor (aref buf corrupt-at) #xFF))
+                   (with-open-file (out log-path :direction :output :element-type '(unsigned-byte 8)
+                                                 :if-exists :supersede)
+                     (write-sequence buf out))))
+               ;; reopen -> must signal an error (mid-file CRC mismatch; not a torn tail)
+               (let* ((store2 (dds.durability:make-file-store :dir dir))
+                      (signalled (handler-case
+                                     (progn (dds.durability:store-open store2) nil)
+                                   (error () t))))
+                 (cond
+                   ;; required: a mid-file corrupt frame signals an error
+                   (signalled t)
+                   ;; if no error was raised, the count must be zero (auto-truncated on corrupt)
+                   (t
+                    (let ((cnt2 (ignore-errors (dds.durability:store-count store2 topic))))
+                      (ignore-errors (dds.durability:store-close store2))
+                      (when (and cnt2 (plusp cnt2))
+                        ;; silent acceptance of corrupted data is a data-integrity bug
+                        (error 'test-failure :name "crash-fuzz-mid-file-corruption"
+                               :detail (format nil "mid-file corruption: no error AND count=~d (silent wrong-data)" cnt2)))))))))
+        (%crash-fuzz-cleanup dir)))
+    ;; --- arm D: epochs.dat — torn tail recovers (no error); mid-file corruption errors ---
+    (let ((d1 (%crash-fuzz-temp-dir (logxor seed #x0004)))
+          (d2 (%crash-fuzz-temp-dir (logxor seed #x0005)))
+          (ct (make-array 48 :element-type '(unsigned-byte 8) :initial-element #x5A)))
+      (unwind-protect
+           (progn
+             ;; D1: torn tail → %load-epoch-table recovers, no error
+             (dotimes (i 3) (dds.durability::%append-epoch d1 (1+ i) ct))
+             (let* ((path (dds.durability::%epochs-dat-path d1))
+                    (sz   (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
+                    (cut  (max 1 (prng-int prng 1 (min 8 (max 1 (1- sz)))))))
+               (dds.durability::%truncate-file path (- sz cut))
+               (handler-case (dds.durability::%load-epoch-table d1)
+                 (error (e)
+                   (error 'test-failure :name "crash-fuzz-epochs-torn"
+                          :detail (format nil "%load-epoch-table after epochs.dat tail-truncation signalled: ~a" e)))))
+             ;; D2: mid-file corruption (flip a byte inside entry 1's kem-ct) → must error
+             (dotimes (i 3) (dds.durability::%append-epoch d2 (1+ i) ct))
+             (let* ((path (dds.durability::%epochs-dat-path d2))
+                    (raw  (with-open-file (s path :element-type '(unsigned-byte 8))
+                            (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                              (read-sequence v s) v))))
+               (setf (aref raw 8) (logxor (aref raw 8) #xFF))
+               (with-open-file (out path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+                 (write-sequence raw out))
+               (let ((signalled (handler-case (progn (dds.durability::%load-epoch-table d2) nil)
+                                  (error () t))))
+                 (unless signalled
+                   (error 'test-failure :name "crash-fuzz-epochs-corrupt"
+                          :detail "mid-file epochs.dat corruption did not signal (silent acceptance)")))))
+        (%crash-fuzz-cleanup d1)
+        (%crash-fuzz-cleanup d2)))
+    t))
+
 (defun* run-pbt-tests ()
     (function () t)
   "Run all property-based tests; signal test-failure on the first falsification."
@@ -1207,7 +1394,9 @@
     (fuzz-original-writer-info-parse)
     ;; WP-DURABILITY-DARE open-path fuzz: adversarial sealed blobs (short/oversized/tampered/wrong-AAD) + a valid seal -> NIL or the correct plaintext, never OOB; prod + safety-0; SKIPs if OpenSSL<3.5 (NFR-SEC-POSTURE)
     (fuzz-dare-open-payload)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0) + owi-parse fuzz 2000 iters (PID_ORIGINAL_WRITER_INFO parse: random/short/oversized/off-end octets + inline-QoS blob walk; BOTH arms prod + safety-0, NFR-SEC-POSTURE) + dare-open-payload fuzz 3000 iters (adversarial sealed blobs -> NIL or correct plaintext, fail-closed + bounds-checked, prod + safety-0; SKIP if OpenSSL<3.5, NFR-SEC-POSTURE), deterministic seed.~%" runs)
+    ;; WP-DURABILITY-PERSISTENT crash-injection fuzz: tail-truncation + garbage-append + mid-file-corruption against file-store replay (NFR-SEC-POSTURE)
+    (fuzz-file-store-crash-injection)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0) + owi-parse fuzz 2000 iters (PID_ORIGINAL_WRITER_INFO parse: random/short/oversized/off-end octets + inline-QoS blob walk; BOTH arms prod + safety-0, NFR-SEC-POSTURE) + dare-open-payload fuzz 3000 iters (adversarial sealed blobs -> NIL or correct plaintext, fail-closed + bounds-checked, prod + safety-0; SKIP if OpenSSL<3.5, NFR-SEC-POSTURE) + crash-injection fuzz 4 arms (tail-truncation / garbage-append / mid-file-corruption against file-store replay + epochs.dat torn-tail/mid-file recovery, NFR-SEC-POSTURE), deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

@@ -226,3 +226,11 @@
   "M0: no-op wrapper. A bounded, audited GC-inhibition window lands behind an
    explicit unsafe flag in a later ADR (REQUIREMENTS NFR-DET)."
   `(progn ,@body))
+
+(defun* fsync-stream (stream)
+    (function (stream) (eql t))
+  "Flush CL stream buffers. Clasp has no direct fdatasync path (NFR-PORT gap);
+   finish-output + force-output is the documented fallback."
+  (finish-output stream)
+  (force-output stream)
+  t)

@@ -1,8 +1,11 @@
-# Durability — TRANSIENT_LOCAL and the TRANSIENT Durability Service
+# Durability — TRANSIENT_LOCAL, the TRANSIENT/PERSISTENT Durability Service, and DARE
 
-This page covers the DDS DURABILITY QoS implementation in this stack: TRANSIENT_LOCAL
-writer-side retention + late-joiner replay (fully conformant, P5/M6), and the embedded TRANSIENT
-durability service (Phase 1, in-memory, writer-is-gone scenario). See also ADR 0022 and ADR 0023.
+This page covers the DDS DURABILITY QoS implementation in this stack: TRANSIENT_LOCAL writer-side
+retention + late-joiner replay (fully conformant, P5/M6, §2); the embedded durability service with
+its in-memory TRANSIENT tier (§3–§6) and dedup/no-double-delivery (§6); always-on CNSA-2.0
+Data-At-Rest Encryption (DARE, §7); and the **disk-backed PERSISTENT tier** that survives a
+process/system restart, always DARE-wrapped with a cross-restart key-epoch (§8). See also ADR 0022,
+0023, 0024, 0025 and 0026.
 
 ---
 
@@ -13,7 +16,7 @@ durability service (Phase 1, in-memory, writer-is-gone scenario). See also ADR 0
 | VOLATILE | None — samples are not retained | — |
 | TRANSIENT_LOCAL | Writer keeps its HistoryCache for its own lifetime | Writer itself |
 | TRANSIENT | Samples outlive the writer (in-memory service) | Durability service |
-| PERSISTENT | Samples survive process + system restart (disk) | Durability service (Phase 3) |
+| PERSISTENT | Samples survive process + system restart (disk) | Durability service (Phase 3b — landed, §8) |
 
 The DURABILITY default is VOLATILE. Every behavior below is inert unless a non-VOLATILE durability
 is explicitly requested.
@@ -329,8 +332,8 @@ and its own store partition. Topics are isolated at the store level.
  :name "multi-topic-service")
 ```
 
-**Limitation:** topics are fixed at construction time. Dynamic topic-add to a running service is
-a follow-up.
+Topics may be fixed at construction time, or added to a running service: dynamic topic-add landed
+in Phase 3b (`service-add-topic`, §8.1).
 
 ### 6.3 Dispose/unregister capture + replay
 
@@ -359,18 +362,23 @@ Cross-DDS interop legs:
   replayed correctly. The prior ~3558 additive count was entirely from our service's accumulated
   history across multiple test runs (different publisher GUIDs), not from RTI PS. Task-8 correctly
   adds `PID_SERVICE_KIND (0x8003) = PERSISTENCE_SERVICE_QOS` to our relay writer's SEDP endpoint
-  announcement (spike-confirmed SEDP placement, not SPDP). A true dual-relay coexistence live proof
-  with RTI PS requires a TRANSIENT topic (Phase 3). See `interop/durability-dedup/coexistence/README.md`.
+  announcement (spike-confirmed SEDP placement, not SPDP). Phase 3b got RTI PS running + relaying at
+  the TRANSIENT tier (resolving this blocker); the live dual-relay exactly-once proof is nonetheless
+  blocked by a wire-dialect mismatch (RTI PS conveys origin via its vendor `PID_ENTITY_VIRTUAL_GUID`,
+  not the standard `PID_ORIGINAL_WRITER_INFO`) — see §8.6. See `interop/durability-dedup/coexistence/README.md`.
 
 See `interop/durability-dedup/README.md` for wire evidence and `ADR 0024` for the dedup architecture.
 
 ### 6.5 Remaining Phase-2 limitations
 
-- **Seen-set prune deferred:** dedup-map entries per GUID are control-plane and bounded (ADR 0024);
-  a GC of stale-GUID entries is a follow-up.
-- **In-memory store only.** State is lost on process restart. Disk-backed + CNSA-2.0 DARE is Phase 3.
-- **`:process` mode is SBCL-only** (runtime fallback to in-thread on other impls).
-- **Dynamic topic-add to a running service** is deferred.
+- **Seen-set prune:** LANDED in Phase 3b — the collect-loop seen-set is bounded to
+  O(live-origins × `*max-gap-range*`) (§8, ADR 0026).
+- **In-memory store** was the Phase-2 default; the disk-backed PERSISTENT tier (always DARE-wrapped,
+  survives restart) LANDED in Phase 3b — see §8.
+- **`:process` mode is SBCL-only** (runtime fallback to in-thread on other impls); note `:process`
+  mode does NOT carry the PERSISTENT store factory across the process boundary — use `:thread`
+  mode for the PERSISTENT tier (§8.7).
+- **Dynamic topic-add to a running service** LANDED in Phase 3b (`service-add-topic`, §8.1).
 
 See ADR 0023 + ADR 0024 for the full boundary.
 
@@ -504,19 +512,188 @@ in-transit confidentiality.
 
 ---
 
-## 8. Cross-references
+## 8. PERSISTENT — disk-backed durability + cross-restart key-epoch (Phase 3b, WP-DURABILITY-PERSISTENT)
+
+Phase 3b (ADR 0021 **capability 7** / ADR 0025 §10, ADR 0026) adds a **disk-backed PERSISTENT
+tier**: the durability service's retained history **survives a process AND system restart** (DDS 1.4
+§2.2.3.4) while remaining **encrypted at rest — no plaintext on disk, ever**. A late-joiner appearing
+*after* the service (and the original writer) has restarted still receives the retained,
+authenticated samples.
+
+It is built on the **existing `durable-store` vtable**: a new file-store backend
+(`make-file-store`) plugs underneath the **same** DARE decorator from §7, so disk holds only sealed
+bytes from its first byte. A persisted **key-epoch** lets each prior run's DEK be re-derived on
+reopen **without ever reusing an AES-GCM nonce across runs**.
+
+### 8.1 The PERSISTENT-tier store factory — worked example
+
+`make-persistent-store-factory` returns the 0-arg `:store` factory the service spec expects; it
+composes the file store + the file key-provider + the epoch-aware encrypted-store for you:
+
+```lisp
+(require :dds-durability)   ; pulls in dds-dare
+
+(defparameter *store-dir* (uiop:ensure-directory-pathname "/var/lib/dds-dare/store"))
+(defparameter *key-dir*   (uiop:ensure-directory-pathname "/var/lib/dds-dare/keys"))
+
+(defparameter *spec*
+  (dds.durability:make-service-spec
+   :domain 0
+   :topics '(("Square" . "ShapeType"))
+   ;; the PERSISTENT tier: a disk-backed, always-DARE-wrapped store with a cross-restart key-epoch
+   :store (dds.durability:make-persistent-store-factory
+           :dir     *store-dir*    ; D — sealed topic logs + epochs.dat live here
+           :key-dir *key-dir*)     ; K — the ML-KEM-1024 keypair lives here
+   :name "persistent-durability-service"))
+
+(defparameter *runner* (dds.durability:make-service-runner (list *spec*)))
+(dds.durability:runner-start *runner*)   ; store-opens: reload logs + re-derive prior-epoch DEKs,
+                                         ; then seed the replay writer's history from disk
+;; ... samples collected by the service are SEALED to disk; the process may exit/crash ...
+;; ... on a later start the service reloads + decrypts them; a late-joiner gets the retained history ...
+(dds.durability:runner-stop *runner*)    ; store-closes: group-commit fsync + free every epoch DEK
+```
+
+`make-persistent-store-factory` is equivalent to the explicit composition
+`(make-encrypted-store (make-file-store :dir D) (make-file-key-provider :dir K) :epoch-dir D)` — the
+encrypted-store seals → the file store writes only sealed bytes under `D`; the encrypted-store owns
+`D/epochs.dat`; the key-provider owns `K/ml-kem-1024.{key,pub}`.
+
+To add a topic to an **already-running** service without a restart:
+
+```lisp
+(dds.durability:service-add-topic service "Circle" "ShapeType")
+;; => (values T node)   ; idempotent by topic name — a duplicate add returns (values NIL NIL)
+```
+
+### 8.2 On-disk format (append-log-per-topic)
+
+- `D/topics/<topic-id>.log` — one append-only log per topic (`<topic-id>` = lowercase hex of the
+  topic UTF-8 bytes; a `D/topics.map` records the readable name).
+- Each record is a framed entry: `magic(2)=DA 01 ∥ flags(1) ∥ writer-guid(16) ∥ sn(8 LE) ∥
+  [key-hash(16) if keyed] ∥ payload-len(4 LE) ∥ payload ∥ crc32(4)`. `flags` encodes the record
+  kind (`:data`/`:dispose`/`:unregister`) + key-hash-present; the CRC32 uses the reflected
+  polynomial `0xEDB88320` (a torn-write integrity check, **not** the security primitive — tamper
+  detection is the GCM tag). The **`payload` is the encrypted-store's opaque sealed blob** (which
+  itself carries the epoch-id); the file store never parses or decrypts it.
+- `D/epochs.dat` — an append-only epoch table; each entry is
+  `epoch-id(4 LE) ∥ kem-ct-len(4 LE) ∥ ML-KEM-ciphertext ∥ crc32(4)`.
+- An **in-memory index** (`topic → ((guid . sn) → frame)`) is rebuilt on open; `put` is idempotent
+  on `(topic, writer-guid, sn)`; `get-range` is sorted by `(writer-guid, sn)`.
+
+### 8.3 Cross-restart key-epoch (new-epoch-per-open)
+
+The 3a encrypted-store derives a *fresh* DEK per open and discards the ML-KEM ciphertext, so disk
+records from a prior run could not be reopened. 3b adds a persisted **key-epoch**:
+
+- **On open**, the store loads `epochs.dat` and, for each epoch, asks the key-provider to
+  decapsulate its stored ML-KEM ciphertext → re-derive that epoch's DEK (held foreign), building an
+  `epoch-id → DEK` map. Open does **not** mint an epoch (a read-only restart adds none).
+- **On the first `put` of a run**, a **new epoch** is minted lazily: a fresh ML-KEM encapsulation →
+  a fresh DEK (derived *before* the epoch is appended), the epoch entry is appended to `epochs.dat`
+  and **fsync'd before the first record references it**. Its nonce counter starts at 0.
+- Each record's **envelope v2** blob is `#x02 ∥ epoch-id(4 LE) ∥ nonce(12) ∥ ciphertext ∥ tag(16)`
+  — the epoch-id **and** the cleartext frame metadata (topic ∥ writer-guid ∥ sn ∥ kind ∥ key-hash)
+  are **AAD-bound**, so a disk-write adversary that flips any of them (e.g. a record's key-hash, to
+  mis-route an instance's lifecycle) fails the GCM tag ⇒ fail-closed drop. On read, the decorator
+  resolves the DEK by the record's epoch-id (an unknown epoch-id ⇒ fail-closed drop) and AES-256-GCM-opens.
+- **Why nonce reuse is structurally impossible:** every run mints a **distinct epoch ⇒ a distinct
+  DEK with its own counter-from-0 nonce space**, so no two runs ever share a `(DEK, nonce)` pair —
+  regardless of crash timing, and with **no counter-resume to get wrong**. (The epoch table grows
+  by one ~1.6 KB entry per open; retirement of very-old empty epochs is a follow-on.)
+
+### 8.4 Crash-consistency
+
+- **Group-commit fsync** per collect-drain tick (`dds.pal:fsync-stream`): a crash loses at most the
+  current sub-tick's not-yet-synced records. The encrypted-store delegates the fsync to the inner
+  file store, so the production DARE-wrapped config is genuinely synced. A fsync the OS reports as
+  failed (`fdatasync` → −1) is **surfaced via `*durability-error-hook*`, never silently treated as
+  durable** (fail-closed, NFR-SEC-POSTURE).
+- Append-only files + CRC/length framing ⇒ a **torn trailing frame** (a crash mid-append) is
+  detected and **truncated on open** (recover); a **mid-file corruption** **fails the open loudly**
+  (it could mask tampering — recovery only truncates a torn *tail*). A declared frame/epoch length
+  above a sanity cap (`+frame-max-payload+` / `+epochs-max-ctlen+`) is treated as `:corrupt` (fail
+  loud), so a gross length-field corruption can never masquerade as a torn tail and silently truncate.
+- **Ordering invariant:** `epochs.dat` is fsync'd before any topic-log record references the new
+  epoch, so every record's epoch-id resolves after a crash.
+- **Compaction-on-open** is conservative and **order-aware**: it drops a key-hash only when both a
+  `:dispose` and an `:unregister` tombstone are present AND the instance's **final** record is itself
+  a tombstone — a legally **resurrected** instance (a `:data` written after the teardown) is never
+  dropped. The rewrite is via an atomic rename; a live record is **never** dropped.
+- The crash path is fuzzed (random truncation/garbage/mid-file corruption of logs + `epochs.dat`,
+  including a `(safety 0)` arm): open recovers with no crash/OOB/mis-decode and no nonce reuse.
+- **Caveat (follow-on):** file *contents* are `fdatasync`'d, but the *containing directory* is not —
+  a newly-created log / `epochs.dat` / the compaction rename relies on the parent-directory entry,
+  whose durability across a power loss needs a directory fsync (a §8.7 follow-on).
+
+### 8.5 Deployment requirement — OpenSSL ≥ 3.5
+
+The PERSISTENT tier is **always DARE-wrapped**, so the §7.3 deployment requirement applies in full:
+**OpenSSL ≥ 3.5 (`libcrypto`) is a hard runtime requirement** (ML-KEM landed in the 3.5 LTS),
+checked at startup (`dds.dare:dare-available-p`); if it is absent/below 3.5/ML-KEM-less, the service
+signals `dds.dare:dare-unavailable` — a **hard error, never a silent plaintext-on-disk path**. The
+file store itself adds no new dependency (plain-file IO). `dds.pal:fsync-stream` is an **NFR-PORT
+split**: SBCL issues a true `fdatasync(2)`; **Clasp falls back to `finish-output`** (no stream-fd
+`fdatasync` exposed here), so the SBCL path carries the production OS-level durability guarantee.
+
+### 8.6 Cross-DDS transparency-after-restart + the RTI-PS coexistence finding
+
+**Transparency-after-restart is LIVE vs both peers** (`interop/durability-persistent/`, 2026-06-20,
+a GENUINE 2-process restart sharing the same disk `D` + key `K`): process 1 sealed N samples to disk
+then exited; a fresh process 2 reloaded + decrypted the same N on reopen; a late-joining foreign TL
+subscriber received exactly N byte-correct — **Connext 7.3.1: 458 sealed → 458 reloaded → 458
+received**; **Fast DDS 3.6.1: 186 → 186 → 186**. Both captures match the plain-store transient wire
+**byte-for-byte** (replay EntityId `0x00000102`, `firstAvailableSeqNumber=1` held on every HEARTBEAT,
+`CDR_LE`, NACK→retransmit). Direct disk inspection confirmed only sealed ciphertext on disk
+throughout — DARE-at-rest is real, yet wire-transparent after restart.
+
+**RTI Persistence Service coexistence is a documented finding** (`interop/durability-persistent/coexistence/`).
+Stronger than Phase-2, we got RTI PS v7.3.1 to **run + relay at the TRANSIENT tier** (resolving the
+Phase-2 blocker — it was inert for TRANSIENT_LOCAL), both relays live simultaneously. **But**
+standard-OWI dual-relay exactly-once is **not cross-vendor-exercisable** against RTI PS: RTI PS
+stamps `PID_KEY_HASH (0x0070)` + **zero** `PID_ORIGINAL_WRITER_INFO (0x0061)`, conveying origin via
+its **vendor `PID_ENTITY_VIRTUAL_GUID`**, not the OMG-standard OWI our dedup keys on. Our relay emits
+OWI byte-correct (534/534); RTI PS does not — a **wire-dialect mismatch, NOT a code defect**
+(standard-OWI is the conformant choice). The **authoritative no-double-delivery proof is the
+in-process `run-durability-no-double-delivery-test`**. Recognizing RTI's `PID_ENTITY_VIRTUAL_GUID`
+in coexistence dedup is a follow-on.
+
+### 8.7 Scope & follow-ons
+
+PERSISTENT 3b protects **stored payloads on disk**: **confidentiality** (sealed) + **per-record
+authenticity** of the payload AND its AAD-bound metadata (topic/guid/sn/kind/key-hash) — any flipped
+byte fails the GCM tag, fail-closed — and it survives restart. It does **not** provide **log-level
+integrity** (a disk-write adversary can delete/reorder/truncate whole records undetectably — there is
+no MAC'd log chain) nor metadata **confidentiality** (metadata is cleartext on disk). The follow-ons
+(ADR 0026 §10 / ADR 0025 §10): cross-vendor coexistence dedup recognizing RTI's
+`PID_ENTITY_VIRTUAL_GUID`; KEEP_LAST-superseded + online/threshold compaction; **parent-directory
+fsync** (durable directory entries for new files + the compaction rename across a power loss);
+**`:process`-mode PERSISTENT** (the store factory is not serialized across the process boundary —
+use `:thread` mode for the PERSISTENT tier); **log-level at-rest integrity** (a MAC'd log chain);
+graceful FFI teardown on signal (a benign SIGBUS in a non-Lisp thread on `kill -15` shutdown was
+observed); epoch-table retirement; **3c** metadata confidentiality; in-RAM plaintext minimization
+(honest pure-Lisp feasibility caveat); **P6** DDS-Security in-transit; and db/microservice
+persistence backends (the file backend is on the same vtable, so they drop in).
+
+---
+
+## 9. Cross-references
 
 - ADR 0021 — Durability service scope decision (owner directive 2026-06-18; cap. 7 = always-on DARE)
 - ADR 0022 — TRANSIENT_LOCAL as-built behavior (writer-side retention + late-joiner replay)
 - ADR 0023 — TRANSIENT durability service Phase-1 architecture
 - ADR 0024 — Dedup map architecture (watermark + bounded reorder set)
 - ADR 0025 — DARE: CNSA-2.0 Data-At-Rest Encryption (the KEM-DEM envelope, key-provider, fail-closed, secret handling)
+- ADR 0026 — Disk-backed PERSISTENT store + cross-restart key-epoch (file-store framing/recovery, envelope v2, group-commit, compaction, the coexistence finding)
 - `docs/superpowers/specs/2026-06-19-durability-dare-design.md` — the DARE design spec
+- `docs/superpowers/specs/2026-06-20-durability-persistent-design.md` — the PERSISTENT design spec
 - `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md` — PID_ORIGINAL_WRITER_INFO spike
 - `interop/durability-transient/` — cross-DDS interop captures and README
 - `interop/durability-dedup/` — PID_ORIGINAL_WRITER_INFO cross-DDS legs + coexistence captures
 - `interop/durability-dare/` — DARE cross-DDS transparency captures (Connext 352 / Fast DDS 152)
-- `src/dds-durability/` — service implementation (store / spec / service / runner / supervisor / main / store-encrypted)
+- `interop/durability-persistent/` — PERSISTENT transparency-after-restart (Connext 458 / Fast DDS 186) + the RTI-PS coexistence finding
+- `src/dds-durability/` — service implementation (store / store-file / spec / service / runner / supervisor / main / store-encrypted)
 - `src/dds-dare/` — DARE crypto (openssl-ffi / primitives / envelope / key-provider)
-- `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-dare-*`)
-- `src/dds-tests/pbt-test.lisp` — PID-parse fuzz arm (`fuzz-original-writer-info-parse`) + DARE open-path fuzz arm (`fuzz-dare-open-payload`), NFR-SEC-POSTURE
+- `src/dds-pal/pal-{sbcl,clasp}.lisp` — `fsync-stream` (group-commit; NFR-PORT split: SBCL `fdatasync(2)` / Clasp `finish-output`)
+- `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-durability-file-recovery-test`, `run-dare-*`)
+- `src/dds-tests/pbt-test.lisp` — PID-parse fuzz arm (`fuzz-original-writer-info-parse`) + DARE open-path fuzz arm (`fuzz-dare-open-payload`) + the PERSISTENT crash-injection arm, NFR-SEC-POSTURE

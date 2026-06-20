@@ -31,6 +31,25 @@
   (%make-service-spec :domain domain :topics topics :store store
                       :mode mode :qos-overrides qos-overrides :name name))
 
+(defun* make-persistent-store-factory (&key dir key-dir)
+    (function (&key (:dir (or pathname string)) (:key-dir (or pathname string))) function)
+  "Return a 0-arg store factory that produces the PERSISTENT-tier secure file-store composition.
+   The composed store is: make-encrypted-store(make-file-store(:dir DIR),
+   make-file-key-provider(:dir KEY-DIR), :epoch-dir DIR).  Pass this as the :STORE argument
+   to MAKE-SERVICE-SPEC to wire the PERSISTENT encrypted-on-disk tier into the service.
+   KEY-DIR holds the ML-KEM-1024 keypair (perms enforced 0700 dir / 0600 key, checked at open,
+   fail-closed by the key-provider); DIR holds the DARE-sealed topic logs + epochs.dat (DIR's own
+   0700 enforcement is a follow-on, ADR 0026 §10). NOTE: :PROCESS service mode does NOT carry this
+   factory across the subprocess boundary — use :THREAD mode for the PERSISTENT tier (ADR 0026 §10).
+   The returned store requires STORE-OPEN before reads or writes, and STORE-CLOSE to flush
+   and fsync the sealed log to disk; calling STORE-CLOSE is mandatory to avoid data loss."
+  (let ((d (uiop:ensure-directory-pathname dir))
+        (k (uiop:ensure-directory-pathname key-dir)))
+    (lambda ()
+      (make-encrypted-store (make-file-store :dir d)
+                            (dds.dare:make-file-key-provider :dir k)
+                            :epoch-dir d))))
+
 (defun* service-spec-matches-p (spec topic type)
     (function (service-spec string string) boolean)
   "Return T if TOPIC/TYPE is covered by SPEC's topic-filter.
