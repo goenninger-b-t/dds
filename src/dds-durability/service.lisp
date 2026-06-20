@@ -320,12 +320,19 @@
     (function (service-spec string string) t)
   "Build, configure, and start one disc-node for TOPIC-NAME/TYPE-NAME within SPEC.
    Installs the on-match hook for TL late-joiner replay initialization.
-   Returns the started node."
+   Honors :relay-durability and :collect-durability from (service-spec-qos-overrides spec): each
+   :transient-local (default, byte-identical to prior behavior) or :transient (opt-in for cross-vendor
+   coexistence). :collect-durability :transient makes the collect reader pull a foreign persistence
+   service's OWI-stamped TRANSIENT replay so its OWI logical origin is recorded and its copies collapse
+   against directly-collected samples, instead of double-recording under the foreign relay's wire GUID
+   (cross-vendor coexistence, ADR 0026 §10). Returns the started node."
   (let* ((domain (service-spec-domain spec))
          (overrides (service-spec-qos-overrides spec))
-         (dr-override    (getf overrides :data-representation))
-         (peers-override (getf overrides :peers))
-         (mcast-override (getf overrides :multicast))
+         (dr-override       (getf overrides :data-representation))
+         (relay-dur         (or (getf overrides :relay-durability) :transient-local))
+         (collect-dur       (or (getf overrides :collect-durability) :transient-local))
+         (peers-override    (getf overrides :peers))
+         (mcast-override    (getf overrides :multicast))
          (node (dds.disc:make-disc-node
                 :guid-prefix (%collect-node-prefix spec topic-name)
                 :domain domain
@@ -341,7 +348,7 @@
                                                   (append (when dr-override
                                                             (list :data-representation dr-override))
                                                           (list :reliability :reliable
-                                                                :durability :transient-local))))))
+                                                                :durability relay-dur))))))
       ;; PID_SERVICE_KIND (0x8003) = PERSISTENCE_SERVICE: gates Connext receiver-side
       ;; PID_ORIGINAL_WRITER_INFO dedup (ADR 0024 Task 8; spike 2026-06-18).
       (setf (dds.rtps.discovery:endpoint-data-service-kind relay-ep)
@@ -352,7 +359,7 @@
                                :type type-name
                                :qos (dds.qos:make-reader-qos
                                      :reliability :reliable
-                                     :durability :transient-local
+                                     :durability collect-dur
                                      :history-kind :keep-all))
     (dds.disc:enable-subscriber node)
     (setf (dds.disc:disc-node-on-match node)
@@ -372,6 +379,11 @@
    thread.  K=1 is byte-identical to Phase 1.  All K nodes share the same STORE.
    QoS overrides from (service-spec-qos-overrides spec):
      :data-representation <list>  — governs SEDP RxO advertisement; payload forwarded opaque.
+     :relay-durability <keyword>  — DURABILITY for the relay writer; :transient-local (default,
+                                    byte-identical) or :transient (opt-in for cross-vendor).
+     :collect-durability <keyword> — DURABILITY for the collect reader; :transient-local (default,
+                                    byte-identical) or :transient (opt-in: pull a foreign persistence
+                                    service's OWI-stamped TRANSIENT replay so its origin converges).
      :peers <list-of-(host . port)> — initial unicast SPDP peers; default none.
      :multicast <boolean>         — when T enables multicast SPDP socket; default NIL.
    *DURABILITY-DEBUG-START-FAULT* when non-NIL: after building the first node, signals an

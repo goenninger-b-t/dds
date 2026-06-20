@@ -27,7 +27,21 @@
                     (:name string))
               service-spec)
   "Construct a SERVICE-SPEC for DOMAIN. TOPICS is a list of (topic . type) conses or a predicate function.
-   STORE is a 0-arg factory returning a DURABLE-STORE (default: in-memory). MODE is :THREAD or :PROCESS."
+   STORE is a 0-arg factory returning a DURABLE-STORE (default: in-memory). MODE is :THREAD or :PROCESS.
+   QOS-OVERRIDES is a plist of optional per-service writer/transport overrides:
+     :data-representation <list>  — SEDP RxO advertisement (e.g. '(:xcdr1) for foreign interop).
+     :relay-durability <keyword>  — DURABILITY for the relay writer; :TRANSIENT-LOCAL (default, byte-identical
+                                    to all prior behavior) or :TRANSIENT (opt-in for cross-vendor coexistence,
+                                    e.g. to receive from RTI Persistence Service which only replays to TRANSIENT
+                                    readers; DURABILITY RxO: offered >= requested, TRANSIENT rank 2 > TL rank 1).
+     :collect-durability <keyword> — DURABILITY for the collect reader; :TRANSIENT-LOCAL (default, byte-identical)
+                                    or :TRANSIENT (opt-in for cross-vendor coexistence: a foreign persistence
+                                    service stamps PID_ORIGINAL_WRITER_INFO only when replaying to a TRANSIENT
+                                    reader, so a TRANSIENT collect reader records the OWI logical origin and
+                                    collapses the foreign relay's copies against directly-collected samples,
+                                    rather than double-recording them under the foreign relay's own wire GUID).
+     :peers <list-of-(host . port)> — initial unicast SPDP peers.
+     :multicast <boolean>           — when T enables multicast SPDP socket."
   (%make-service-spec :domain domain :topics topics :store store
                       :mode mode :qos-overrides qos-overrides :name name))
 

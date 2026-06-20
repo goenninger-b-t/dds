@@ -19,6 +19,7 @@
            #:run-dedup-cap-test
            #:run-vendor-sedp-pid-test
            #:run-durability-no-double-delivery-test
+           #:run-durability-multi-relay-dedup-test
            #:run-durability-multitopic-test
            #:run-durability-dispose-replay-test
            #:run-dare-sha384-hkdf-kat-test
@@ -37,4 +38,6 @@
            #:run-durability-compaction-test
            #:run-durability-seed-backpressure-test
            #:run-durability-seen-prune-test
-           #:run-durability-dynamic-topic-test))
+           #:run-durability-dynamic-topic-test
+           #:run-durability-relay-tier-test
+           #:run-durability-collect-tier-test))

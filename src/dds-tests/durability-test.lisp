@@ -49,6 +49,112 @@
     (%check :pred-miss (not (dds.durability:service-spec-matches-p s2 "Square" "X")) "predicate miss")
     t))
 
+;;; --- relay tier QoS override (WP-DURABILITY-COEXIST-DEDUP Task 2) ---
+;;; Asserts that service-start honors :relay-durability in service-spec qos-overrides:
+;;;   (a) explicit :transient override -> writer advertises :transient     [cross-vendor path]
+;;;   (b) no override                  -> writer advertises :transient-local [no-regression default]
+;;; Mirrors run-durability-writer-rep-test's structure via disc-node-local-writers ->
+;;; endpoint-data-qos -> qos-durability.  Domain 137 avoids collision with all prior tests.
+
+(defun* run-durability-relay-tier-test ()
+    (function () t)
+  "QoS override plumbing: relay writer advertises :relay-durability per qos-overrides;
+   absent override keeps the default :transient-local byte-identical to the prior behavior."
+  ;; --- (a) explicit :transient override ---
+  (let* ((spec-transient (dds.durability:make-service-spec
+                          :domain 137
+                          :topics '(("RTSquare" . "ShapeType"))
+                          :qos-overrides '(:relay-durability :transient)
+                          :name "relay-tier-transient"))
+         (svc-transient (dds.durability:make-durability-service spec-transient)))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start svc-transient)
+           (let* ((node (dds.durability:durability-service-node svc-transient))
+                  (writers (dds.disc::disc-node-local-writers node))
+                  (dur (when writers
+                         (dds.qos:qos-durability
+                          (dds.rtps.discovery:endpoint-data-qos (first writers))))))
+             (%check :relay-tier-transient
+                     (eq :transient dur)
+                     (format nil "expected :transient relay durability, got ~s" dur))))
+      (ignore-errors (dds.durability:service-stop svc-transient))))
+  ;; --- (b) no override -> default :transient-local ---
+  (let* ((spec-default (dds.durability:make-service-spec
+                        :domain 137
+                        :topics '(("RTCircle" . "ShapeType"))
+                        :name "relay-tier-default"))
+         (svc-default (dds.durability:make-durability-service spec-default)))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start svc-default)
+           (let* ((node (dds.durability:durability-service-node svc-default))
+                  (writers (dds.disc::disc-node-local-writers node))
+                  (dur (when writers
+                         (dds.qos:qos-durability
+                          (dds.rtps.discovery:endpoint-data-qos (first writers))))))
+             (%check :relay-tier-default
+                     (eq :transient-local dur)
+                     (format nil "expected default :transient-local relay durability, got ~s" dur))))
+      (ignore-errors (dds.durability:service-stop svc-default))))
+  t)
+
+;;; --- collect-reader tier QoS override (WP-DURABILITY-COEXIST-DEDUP Task 3) ---
+;;; Asserts service-start honors :collect-durability in service-spec qos-overrides:
+;;;   (a) explicit :transient override -> the COLLECT READER requests :transient   [coexistence path]
+;;;   (b) no override                  -> the collect reader requests :transient-local [default]
+;;; Why this matters (B2 origin-convergence, README): when a foreign persistence service (RTI PS) is
+;;; co-relaying, RTI PS stamps PID_ORIGINAL_WRITER_INFO (the original publisher's GUID) ONLY when it
+;;; replays to a TRANSIENT reader.  A TRANSIENT_LOCAL collect reader therefore receives RTI PS's copies
+;;; WITHOUT OWI and records them under RTI PS's own (virtual) GUID — a divergent origin.  A TRANSIENT
+;;; collect reader receives RTI PS's OWI-stamped copies, whose origin (the publisher's GUID) collapses
+;;; against the publisher samples collected directly, so the relay re-stamps the single publisher origin.
+;;; Reaches the advertised QoS via disc-node-local-readers -> endpoint-data-qos -> qos-durability.
+;;; Domain 138 avoids collision with all prior tests.
+
+(defun* run-durability-collect-tier-test ()
+    (function () t)
+  "QoS override plumbing: the collect READER requests :collect-durability per qos-overrides;
+   absent override keeps the default :transient-local byte-identical to the prior behavior."
+  ;; --- (a) explicit :transient override ---
+  (let* ((spec-transient (dds.durability:make-service-spec
+                          :domain 138
+                          :topics '(("CTSquare" . "ShapeType"))
+                          :qos-overrides '(:collect-durability :transient)
+                          :name "collect-tier-transient"))
+         (svc-transient (dds.durability:make-durability-service spec-transient)))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start svc-transient)
+           (let* ((node (dds.durability:durability-service-node svc-transient))
+                  (readers (dds.disc::disc-node-local-readers node))
+                  (dur (when readers
+                         (dds.qos:qos-durability
+                          (dds.rtps.discovery:endpoint-data-qos (first readers))))))
+             (%check :collect-tier-transient
+                     (eq :transient dur)
+                     (format nil "expected :transient collect durability, got ~s" dur))))
+      (ignore-errors (dds.durability:service-stop svc-transient))))
+  ;; --- (b) no override -> default :transient-local ---
+  (let* ((spec-default (dds.durability:make-service-spec
+                        :domain 138
+                        :topics '(("CTCircle" . "ShapeType"))
+                        :name "collect-tier-default"))
+         (svc-default (dds.durability:make-durability-service spec-default)))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start svc-default)
+           (let* ((node (dds.durability:durability-service-node svc-default))
+                  (readers (dds.disc::disc-node-local-readers node))
+                  (dur (when readers
+                         (dds.qos:qos-durability
+                          (dds.rtps.discovery:endpoint-data-qos (first readers))))))
+             (%check :collect-tier-default
+                     (eq :transient-local dur)
+                     (format nil "expected default :transient-local collect durability, got ~s" dur))))
+      (ignore-errors (dds.durability:service-stop svc-default))))
+  t)
+
 ;;; --- durability-service collect path (Task 4) ---
 ;;; An our-stack publisher writes 3 TRANSIENT_LOCAL "Square"/"ShapeType" samples; the
 ;;; durability-service on the same domain collects them into the store. Domain 7 avoids
@@ -996,6 +1102,48 @@
                                         n (mapcar #'cdr owi-hits)))))
                  (ignore-errors (dds.disc:stop-node lj-node))))))
       (ignore-errors (dds.durability:service-stop svc)))))
+
+;;; --- cross-vendor N-relay dedup confirmation (WP-DURABILITY-COEXIST-DEDUP) ---
+;;; The receiver dedup keys on the standard PID_ORIGINAL_WRITER_INFO (origin GUID, SN) tuple,
+;;; independent of which / how-many relays delivered it. RTI Persistence Service stamps that SAME
+;;; standard tuple on its retained-history replay (Task-1 spike), so to the dedup it is just another
+;;; standard-OWI relay — any number of relays of one publisher collapse to exactly N. Deterministic.
+
+(defun* run-durability-multi-relay-dedup-test ()
+    (function () t)
+  "Receiver dedup is relay-count-agnostic (the cross-vendor essence, ADR 0026 §10): K relays each
+   delivering the SAME origin (GUID, SN) set 1..N collapse to EXACTLY N deliveries; a distinct origin
+   is independent (no false cross-origin reject); interleaved/reordered relays still deliver each SN
+   exactly once (RTPS 2.5 §8.3.5.4, ADR 0024). No networking — exercises reader-dedup-accept-p directly."
+  (let* ((reader (dds.rtps.reliable:make-rtps-reader))
+         (g  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x5A))
+         (n  50)
+         (k  3)
+         (accepts 0))
+    ;; K relays (our relay + RTI PS + a third), each delivering origin (g, 1..n): exactly N accepts total
+    (dotimes (_ k)
+      (loop for sn from 1 to n
+            when (dds.rtps.reliable:reader-dedup-accept-p reader g sn) do (incf accepts)))
+    (%check :multi-relay-exactly-once
+            (= n accepts)
+            (format nil "K=~d relays of one origin must collapse to exactly N=~d, got ~d" k n accepts))
+    ;; a DIFFERENT origin is independent (per-origin dedup, never a false cross-origin reject)
+    (let ((g2 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x6B)))
+      (%check :multi-relay-distinct-origin
+              (dds.rtps.reliable:reader-dedup-accept-p reader g2 1)
+              "a different origin GUID must be accepted (dedup is strictly per-origin)"))
+    ;; interleaved/reordered relays: relay A sends odd SNs, relay B then sends ALL — still exactly N
+    (let* ((reader2 (dds.rtps.reliable:make-rtps-reader))
+           (g3 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x7C))
+           (acc2 0))
+      (loop for sn from 1 to n by 2
+            when (dds.rtps.reliable:reader-dedup-accept-p reader2 g3 sn) do (incf acc2))
+      (loop for sn from 1 to n
+            when (dds.rtps.reliable:reader-dedup-accept-p reader2 g3 sn) do (incf acc2))
+      (%check :multi-relay-reordered-exactly-once
+              (= n acc2)
+              (format nil "interleaved relays (odds then all) must deliver exactly N=~d, got ~d" n acc2))))
+  t)
 
 ;;; --- no-double-delivery test (Task 4: WP-DURABILITY-DEDUP) ---
 ;;; Headline end-to-end: an ALIVE original writer + a durability service relay BOTH

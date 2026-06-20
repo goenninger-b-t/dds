@@ -14,3 +14,7 @@
 
 # OS noise
 .DS_Store
+
+# Local agent / SDD scratch workspaces (handoff briefs, reports — not deliverables)
+/.superpowers/
+/.claude/

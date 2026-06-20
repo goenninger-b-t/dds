@@ -363,9 +363,10 @@ Cross-DDS interop legs:
   history across multiple test runs (different publisher GUIDs), not from RTI PS. Task-8 correctly
   adds `PID_SERVICE_KIND (0x8003) = PERSISTENCE_SERVICE_QOS` to our relay writer's SEDP endpoint
   announcement (spike-confirmed SEDP placement, not SPDP). Phase 3b got RTI PS running + relaying at
-  the TRANSIENT tier (resolving this blocker); the live dual-relay exactly-once proof is nonetheless
-  blocked by a wire-dialect mismatch (RTI PS conveys origin via its vendor `PID_ENTITY_VIRTUAL_GUID`,
-  not the standard `PID_ORIGINAL_WRITER_INFO`) — see §8.6. See `interop/durability-dedup/coexistence/README.md`.
+  the TRANSIENT tier (resolving this blocker). WP-DURABILITY-COEXIST-DEDUP (ADR 0027) later showed RTI PS
+  DOES emit the standard `PID_ORIGINAL_WRITER_INFO` on its retained-history **replay** to a late-joiner
+  (the earlier wire-dialect reading was its live-forward path only), so cross-vendor dedup works on the
+  standard path with no vendor PID — see §8.6. See `interop/durability-dedup/coexistence/README.md`.
 
 See `interop/durability-dedup/README.md` for wire evidence and `ADR 0024` for the dedup architecture.
 
@@ -649,14 +650,18 @@ throughout — DARE-at-rest is real, yet wire-transparent after restart.
 
 **RTI Persistence Service coexistence is a documented finding** (`interop/durability-persistent/coexistence/`).
 Stronger than Phase-2, we got RTI PS v7.3.1 to **run + relay at the TRANSIENT tier** (resolving the
-Phase-2 blocker — it was inert for TRANSIENT_LOCAL), both relays live simultaneously. **But**
-standard-OWI dual-relay exactly-once is **not cross-vendor-exercisable** against RTI PS: RTI PS
-stamps `PID_KEY_HASH (0x0070)` + **zero** `PID_ORIGINAL_WRITER_INFO (0x0061)`, conveying origin via
-its **vendor `PID_ENTITY_VIRTUAL_GUID`**, not the OMG-standard OWI our dedup keys on. Our relay emits
-OWI byte-correct (534/534); RTI PS does not — a **wire-dialect mismatch, NOT a code defect**
-(standard-OWI is the conformant choice). The **authoritative no-double-delivery proof is the
-in-process `run-durability-no-double-delivery-test`**. Recognizing RTI's `PID_ENTITY_VIRTUAL_GUID`
-in coexistence dedup is a follow-on.
+Phase-2 blocker — it was inert for TRANSIENT_LOCAL), both relays live simultaneously.
+**WP-DURABILITY-COEXIST-DEDUP (ADR 0027) corrected the earlier finding:** RTI PS **does** emit the
+standard `PID_ORIGINAL_WRITER_INFO (0x0061)` — the publisher's real `(GUID, SN)` — on its
+**retained-history replay to a late-joiner** (the earlier "zero OWI / vendor `PID_ENTITY_VIRTUAL_GUID`"
+reading was RTI PS's **live-forward** path only; the Phase-2/3b capture missed the replay episode). So
+**cross-vendor dual-relay exactly-once works on the standard path — no vendor PID is needed** — and our
+dedup already keys on it; the vendor `PID_ENTITY_VIRTUAL_GUID` (0x8002) is SEDP relay-identity only. New
+configurable `:relay-durability` / `:collect-durability` qos-overrides (default `:transient-local`,
+byte-identical; opt-in `:transient`) let our service coexist at the TRANSIENT tier RTI PS replays to. The
+**authoritative proof** is the in-process `run-durability-no-double-delivery-test` +
+`run-durability-multi-relay-dedup-test` (N standard-OWI relays of one origin → exactly N); a live
+exactly-once capture is a documented follow-on (ADR 0027).
 
 ### 8.7 Scope & follow-ons
 
@@ -665,8 +670,10 @@ authenticity** of the payload AND its AAD-bound metadata (topic/guid/sn/kind/key
 byte fails the GCM tag, fail-closed — and it survives restart. It does **not** provide **log-level
 integrity** (a disk-write adversary can delete/reorder/truncate whole records undetectably — there is
 no MAC'd log chain) nor metadata **confidentiality** (metadata is cleartext on disk). The follow-ons
-(ADR 0026 §10 / ADR 0025 §10): cross-vendor coexistence dedup recognizing RTI's
-`PID_ENTITY_VIRTUAL_GUID`; KEEP_LAST-superseded + online/threshold compaction; **parent-directory
+(ADR 0026 §10 / ADR 0025 §10): cross-vendor coexistence dedup **(RESOLVED — ADR 0027: RTI PS uses
+standard OWI on its retained-history replay, so no vendor PID is needed; the live exactly-once capture
+is the residual follow-on; the configurable `:relay-durability`/`:collect-durability` tiers landed)**;
+KEEP_LAST-superseded + online/threshold compaction; **parent-directory
 fsync** (durable directory entries for new files + the compaction rename across a power loss);
 **`:process`-mode PERSISTENT** (the store factory is not serialized across the process boundary —
 use `:thread` mode for the PERSISTENT tier); **log-level at-rest integrity** (a MAC'd log chain);

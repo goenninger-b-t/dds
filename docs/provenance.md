@@ -1733,3 +1733,38 @@ A signalled `%shmem-send` hard fault is caught in `%send-raw-buf` (`dds.disc`), 
   runtime `software_Package` (Apache-2.0, `dependsOn` the product), mirroring the SBCL runtime entry
   — CRA Annex I top-level coverage. (Loaded via CFFI, it is not an ASDF `:depends-on`, so it is
   emitted explicitly rather than via the ASDF scan.)
+
+## M6/P5 — WP-DURABILITY-COEXIST-DEDUP: RTI PS per-sample origin encoding (2026-06-20, ADR 0026 §10)
+
+- **RTI Connext Persistence Service v7.3.1 — reverse-engineered from the wire ONLY.** Spike Task 1
+  decoded how RTI PS conveys per-sample origin identity when relaying durable history. No RTI source,
+  headers, or generated code were read. Behavior observed via live `rtipersistenceservice` v7.3.1 on
+  `lo0` (domain 0, loopback) and decoded with our own raw RTPS submessage byte-walk
+  (`interop/durability-persistent/coexistence/analyze-capture.py`, extended with an `--owi-dump` mode).
+  Finding: RTI PS stamps the **OMG-standard `PID_ORIGINAL_WRITER_INFO (0x0061)`** (NOT a vendor PID)
+  on its retained-history replay to a late joiner, carrying the original writer's REAL `(GUID, SN)`
+  — Branch A. Captures: `interop/durability-transient/captures/spike-rtips-transient-virtual-guid.pcap`
+  (2026-06-18, 1085 OWI vectors) and `interop/durability-coexist-dedup/spike/captures/rti-ps-replay-owi.pcap`
+  (2026-06-20, this session). CLEAN-ROOM.
+- **Wireshark/tshark RTPS dissector (GPL-2.0, The Wireshark Foundation)** — used ONLY as an independent
+  cross-check of our byte offsets against C1 frame 1102 (the dissector's `virtualGUIDSuffix` /
+  `virtualSeqNumber` labels under `PID_ORIGINAL_WRITER_INFO` confirm RTI's "virtual" origin IS the
+  standard `OriginalWriterInfo`). Output read for verification, no code copied. The dissector is a
+  separate tool we run, not a dependency we link.
+- **OMG DDSI-RTPS 2.5 spec citations:** `PID_ORIGINAL_WRITER_INFO (0x0061)` / `OriginalWriterInfo` —
+  §8.3.5.4 + Table 9.12; `SequenceNumber` (int32 high + uint32 low) — §8.3.3.4; DATA submessage /
+  `octetsToInlineQoS` — §8.3.7.2. Normative pins for the 24-byte LE layout recorded in the findings doc
+  (`docs/superpowers/spikes/2026-06-20-rti-vendor-origin-findings.md` §2.1).
+- **Builds on** the 2026-06-18 Task-7 SEDP spike (`docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md`):
+  that one established the SEDP-level RTI vendor `PID_ENTITY_VIRTUAL_GUID (0x8002)` /
+  `PID_SERVICE_KIND (0x8003)`; this one establishes the **per-sample** carrier (the standard `0x0061`)
+  and corrects the Phase-3b over-generalization that RTI PS emits "ZERO" OWI (true only of the
+  live-forward path, not the replay path).
+- **Task 2 (live dual-relay exactly-once, both directions) — RTI PS observed on the wire ONLY.** The
+  coexistence harness `interop/durability-coexist-dedup/` runs live `rtipersistenceservice` v7.3.1 +
+  `shapes_pub`/`shapes_sub` on `lo0`; all RTI behavior (OWI on replay, KEEP_ALL retention, the relay
+  virtual-GUID origin entity `0x80000002`, the TRANSIENT-vs-TRANSIENT_LOCAL replay-tier semantics) was
+  established by the raw RTPS byte-walk over loopback captures, never from RTI source/headers/generated
+  code. `RTI_PS_TRANSIENT.xml` is configuration (KEEP_ALL relay QoS) authored against the published RTI
+  persistence-service XSD (`.../resource/schema/rti_persistence_service.xsd`, read for the element set
+  only). The `analyze-capture.py` `--dedup-union` mode is our own. CLEAN-ROOM.

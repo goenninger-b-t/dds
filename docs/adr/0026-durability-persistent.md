@@ -288,6 +288,11 @@ plaintext or data in transit. All recorded §10 follow-ons.
   proof is the in-process `dds.tests:run-durability-no-double-delivery-test`** (re-greened on SBCL).
   Recognizing RTI's `PID_ENTITY_VIRTUAL_GUID` in coexistence dedup is a §10 follow-on
   (Connext-interop-on-top-of-standard).
+  **CORRECTED by ADR 0027 (2026-06-21):** this "ZERO OWI" was RTI PS's **live-forward** path only. On its
+  **retained-history REPLAY to a late-joiner**, RTI PS v7.3.1 DOES emit the standard
+  `PID_ORIGINAL_WRITER_INFO (0x0061)` carrying the original publisher's **real** `(GUID, SN)` (wire-proven;
+  the Phase-3b capture missed the replay episode — a flaky late-joiner). So cross-vendor dedup works on the
+  **standard** path with no vendor PID, and §10 item 1 below is resolved-as-unnecessary — see ADR 0027.
 - **Gates:** SBCL + Clasp (both deterministic — file IO + secrets via the PAL); `gate-hotpath`,
   `gate-types`, `mem` (0.0000 — the store is control-plane), `fuzz`, `wire` — all green.
 
@@ -342,10 +347,12 @@ plaintext or data in transit. All recorded §10 follow-ons.
 Per the ADR 0025 §10 MUST-roadmap (owner directive 2026-06-19) and the design spec §14, each its
 own vertical slice:
 
-1. **Cross-vendor coexistence dedup recognizing RTI's `PID_ENTITY_VIRTUAL_GUID`** — so a live
-   dual-relay-exactly-once proof with RTI Persistence Service becomes exercisable (a
-   Connext-interop behaviour ON TOP of the conformant standard-OWI dedup; the documented coexistence
-   finding above).
+1. **Cross-vendor coexistence dedup recognizing RTI's `PID_ENTITY_VIRTUAL_GUID`** — **RESOLVED by
+   ADR 0027 (2026-06-21) as UNNECESSARY.** The spike disproved the premise: RTI PS emits the standard
+   `PID_ORIGINAL_WRITER_INFO` (the publisher's real `(GUID, SN)`) on its retained-history replay, which our
+   dedup already keys on — the vendor `PID_ENTITY_VIRTUAL_GUID` (0x8002) is SEDP relay-identity only, not the
+   per-sample dedup key. The remaining open item is the live convergence capture (ADR 0027 §follow-ons), plus
+   the configurable `:relay-durability` / `:collect-durability` tiers ADR 0027 added.
 2. **KEEP_LAST-superseded compaction + online/threshold compaction** — the current compaction is
    conservatively dispose+unregister-then-settled-only; superseded-SN reclamation and long-run
    online compaction are deferred.

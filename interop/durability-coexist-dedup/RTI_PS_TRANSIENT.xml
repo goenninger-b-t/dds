@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!-- RTI Persistence Service config for WP-DURABILITY-COEXIST-DEDUP (M6/P5, ADR 0026 §10).
+     Loopback-pinned (allow_interfaces=127.0.0.1), domain 0, TRANSIENT in-memory, all topics (*).
+     RTI PS relays the TRANSIENT durability tier; on its retained-history REPLAY to a late-joiner it
+     stamps PID_ORIGINAL_WRITER_INFO 0x0061 (RTPS 2.5 §8.3.5.4; Branch A, spike 2026-06-20).
+     KEY DIFFERENCE vs the spike config: the persistence_group's relay datawriter/datareader QoS pin
+     KEEP_ALL + TRANSIENT + unlimited resource limits, so RTI PS RETAINS *all* N samples of the single
+     animated ShapeType instance (the default relay history would coalesce a single instance to its
+     latest sample, so only ~1 would be retained/replayed — the cause of the historic "1 sample"
+     late-joiner result). With KEEP_ALL the relay holds and replays the full retained history. -->
+<dds xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:noNamespaceSchemaLocation="https://community.rti.com/schema/7.3.1/rti_persistence_service.xsd">
+
+  <qos_library name="CoexistenceQosLib">
+    <qos_profile name="LoopbackQos">
+      <participant_qos>
+        <transport_builtin>
+          <mask>UDPv4</mask>
+        </transport_builtin>
+        <property>
+          <value>
+            <element>
+              <name>dds.transport.UDPv4.builtin.parent.allow_interfaces</name>
+              <value>127.0.0.1</value>
+            </element>
+          </value>
+        </property>
+      </participant_qos>
+    </qos_profile>
+  </qos_library>
+
+  <persistence_service name="transient">
+    <participant name="transientParticipant">
+      <domain_id>0</domain_id>
+      <participant_qos base_name="CoexistenceQosLib::LoopbackQos"/>
+      <persistence_group name="transientAll">
+        <filter>*</filter>
+        <single_publisher>true</single_publisher>
+        <single_subscriber>true</single_subscriber>
+        <datawriter_qos>
+          <reliability><kind>RELIABLE_RELIABILITY_QOS</kind></reliability>
+          <durability><kind>TRANSIENT_DURABILITY_QOS</kind></durability>
+          <history><kind>KEEP_ALL_HISTORY_QOS</kind></history>
+          <resource_limits>
+            <max_samples>LENGTH_UNLIMITED</max_samples>
+            <max_instances>LENGTH_UNLIMITED</max_instances>
+            <max_samples_per_instance>LENGTH_UNLIMITED</max_samples_per_instance>
+          </resource_limits>
+        </datawriter_qos>
+        <datareader_qos>
+          <reliability><kind>RELIABLE_RELIABILITY_QOS</kind></reliability>
+          <durability><kind>TRANSIENT_DURABILITY_QOS</kind></durability>
+          <history><kind>KEEP_ALL_HISTORY_QOS</kind></history>
+          <resource_limits>
+            <max_samples>LENGTH_UNLIMITED</max_samples>
+            <max_instances>LENGTH_UNLIMITED</max_instances>
+            <max_samples_per_instance>LENGTH_UNLIMITED</max_samples_per_instance>
+          </resource_limits>
+        </datareader_qos>
+      </persistence_group>
+    </participant>
+  </persistence_service>
+
+</dds>
