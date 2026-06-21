@@ -8,13 +8,14 @@
 ;;;; The reader's receiver-side dedup (reader-dedup-accept-p, RTPS 2.5 §8.3.5.4) keys on the
 ;;;; effective origin (GUID, SN); duplicates of the same origin collapse to one delivery.
 ;;;;
-;;;; FINDING (authoritative: README §direction-a + ADR 0027): RTI PS emits the standard
-;;;; PID_ORIGINAL_WRITER_INFO with the publisher's real (GUID,SN) on replay; with our relay advertising
-;;;; :relay-durability :transient a TRANSIENT receiver matches BOTH relays (the tier wall is gone). A live
-;;;; dual-relay exactly-once was NOT captured — the two relays' recorded origins diverged on our
-;;;; collect/orchestration side (NOT an RTI virtual-GUID wall) — a documented follow-on. The authoritative
-;;;; two-OWI-relay exactly-once proof is the in-process dds.tests:run-durability-no-double-delivery-test +
-;;;; run-durability-multi-relay-dedup-test.
+;;;; RESULT (authoritative: README §direction-a + ADR 0028): dir-a LIVE-CAPTURED N=545. RTI PS emits the
+;;;; standard PID_ORIGINAL_WRITER_INFO with the publisher's real (GUID,SN) on replay; with our relay
+;;;; advertising :relay-durability :transient a TRANSIENT receiver matches BOTH relays (the tier wall is
+;;;; gone). The collect-path logical-origin fix (node-sample-origin-guid/sn + %collect-loop re-stamp) makes
+;;;; both relays converge on the same origin GUID (0101642e5f4294116dd106b480000002); UNION=545; sum=1090.
+;;;; analyze-capture.py --assert-converged exits 0 on captures/coexist-dir-a.pcap. ADR 0027 §follow-on 1
+;;;; RESOLVED by ADR 0028. In-process two-OWI-relay proof: run-durability-no-double-delivery-test +
+;;;; run-durability-multi-relay-dedup-test + run-durability-collect-origin-convergence-test.
 ;;;;
 ;;;; Reliability (the real work vs Phase-3b): the reader binds a FIXED port (relay2 lists it as an SPDP
 ;;;; peer so the relay can SPDP-reach + match it), drives SPDP+SEDP every ~50 ms, requests each matched

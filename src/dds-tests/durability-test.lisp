@@ -2446,3 +2446,165 @@
                       (ignore-errors (dds.disc:stop-node pub-node)))))))))
       (ignore-errors (dds.durability:service-stop svc))))
   t)
+
+;;; --- logical-origin accessor test (Task 1: WP-DURABILITY-COEXIST-LIVE) ---
+;;; node-sample-origin-guid/-sn surface the PID_ORIGINAL_WRITER_INFO logical origin
+;;; (RTPS 2.5 §8.3.5.4) for relayed samples.  A direct sample (no OWI) falls back to
+;;; the wire GUID/SN.  Two-node loopback, domain 78.
+
+(defun* run-durability-origin-accessor-test ()
+    (function () t)
+  "node-sample-origin-guid/-sn surface the logical origin (RTPS 2.5 §8.3.5.4): a sample relayed with
+   PID_ORIGINAL_WRITER_INFO reports the ORIGINAL writer's (GUID,SN), not the relaying wire sender; a
+   direct sample (no OWI) reports the wire GUID/SN. Two-node loopback, domain 78."
+  (let* ((relay-prefix (%make-test-prefix #xA1))
+         (relay-node (dds.disc:make-disc-node :guid-prefix relay-prefix :domain 78
+                                              :host "127.0.0.1" :port 0 :multicast nil))
+         (rdr-prefix (%make-test-prefix #xB2))
+         (rdr-node (dds.disc:make-disc-node :guid-prefix rdr-prefix :domain 78
+                                            :host "127.0.0.1" :port 0 :multicast nil))
+         (orig-guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xC3))
+         (orig-sn 41))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer relay-node :topic "OSquare" :type "ShapeType"
+                                      :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                     :durability :transient-local))
+           (dds.disc:enable-publisher relay-node :history-kind :keep-all)
+           (dds.disc:start-node relay-node)
+           (dds.disc:add-local-reader rdr-node :topic "OSquare" :type "ShapeType"
+                                      :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                     :durability :transient-local))
+           (dds.disc:enable-subscriber rdr-node)
+           (dds.disc:start-node rdr-node)
+           (let ((rp (dds.disc:disc-node-port relay-node))
+                 (sp (dds.disc:disc-node-port rdr-node)))
+             (setf (dds.disc:disc-node-peers relay-node) (list (cons "127.0.0.1" sp)))
+             (setf (dds.disc:disc-node-peers rdr-node)   (list (cons "127.0.0.1" rp))))
+           (loop repeat 400
+                 until (and (plusp (dds.disc:disc-node-matched-count relay-node))
+                            (plusp (dds.disc:disc-node-matched-count rdr-node)))
+                 do (dds.disc:announce-participant relay-node) (dds.disc:announce-endpoints relay-node)
+                    (dds.disc:announce-participant rdr-node)   (dds.disc:announce-endpoints rdr-node)
+                    (sleep 0.02))
+           ;; (1) a RELAYED sample: publish with PID_ORIGINAL_WRITER_INFO = (orig-guid, orig-sn)
+           (dds.disc:publish-relay-sample relay-node (%make-small-payload 7) orig-guid orig-sn)
+           (loop repeat 200
+                 until (plusp (dds.disc:node-sample-count rdr-node))
+                 do (dds.disc:announce-participant relay-node) (dds.disc:announce-endpoints relay-node)
+                    (sleep 0.02))
+           (let ((key (first (dds.disc:node-sample-sns rdr-node))))
+             (%check :origin-accessor-relayed-guid
+                     (equalp (dds.disc:node-sample-origin-guid rdr-node key) orig-guid)
+                     "a relayed sample must report the ORIGINAL writer GUID, not the wire sender")
+             (%check :origin-accessor-relayed-sn
+                     (= (dds.disc:node-sample-origin-sn rdr-node key) orig-sn)
+                     "a relayed sample must report the ORIGINAL writer SN")
+             (%check :origin-accessor-not-wire
+                     (not (equalp (dds.disc:node-sample-origin-guid rdr-node key) (car key)))
+                     "the relayed origin GUID must differ from the wire sender GUID in this test")
+             ;; (2) a DIRECT sample: no OWI; accessor must fall back to the wire GUID/SN and store NOTHING extra
+             (dds.disc:publish-sample relay-node (%make-small-payload 8))
+             (loop repeat 200
+                   until (= 2 (dds.disc:node-sample-count rdr-node))
+                   do (dds.disc:announce-participant relay-node) (dds.disc:announce-endpoints relay-node)
+                      (sleep 0.02))
+             (let ((dkey (first (set-difference (dds.disc:node-sample-sns rdr-node)
+                                                (list key) :test #'equal))))
+               (%check :origin-accessor-direct-guid
+                       (equalp (dds.disc:node-sample-origin-guid rdr-node dkey) (car dkey))
+                       "a direct sample must report the WIRE sender GUID as its origin")
+               (%check :origin-accessor-direct-sn
+                       (= (dds.disc:node-sample-origin-sn rdr-node dkey) (cdr dkey))
+                       "a direct sample must report the WIRE SN as its origin")
+               (%check :origin-accessor-direct-no-store
+                       (let ((inner (gethash (car dkey)
+                                             (dds.disc::disc-node-sample-origins rdr-node))))
+                         (or (null inner) (null (gethash (cdr dkey) inner))))
+                       "a direct sample must NOT insert an entry into sample-origins (zero-extra-alloc invariant)"))))
+      (ignore-errors (dds.disc:stop-node relay-node))
+      (ignore-errors (dds.disc:stop-node rdr-node))))
+  t)
+
+;;; --- collect-loop origin-convergence test (Task 2: WP-DURABILITY-COEXIST-LIVE) ---
+;;; Publisher P (direct, no OWI) + foreign relay R (OWI = P's GUID) both feed the durability
+;;; collect node. After the fix, the service store holds exactly ONE origin GUID == P's GUID
+;;; regardless of which wire sender delivers first (RTPS 2.5 §8.3.5.4, ADR 0028).
+
+(defun* %collect-origin-convergence-case (relay-first)
+    (function (t) t)
+  "One convergence case: publisher P (direct, no OWI) + foreign relay R (OWI = P's GUID) both feed the
+   durability collect node N samples; RELAY-FIRST selects which writes first. The service store must end
+   with exactly ONE distinct origin GUID == P's GUID (the logical origin), never R's wire GUID. Domain 79."
+  (let* ((n 3)
+         (svc-store (dds.durability:make-memory-store))
+         (spec (dds.durability:make-service-spec
+                :domain 79 :topics '(("CSquare" . "ShapeType")) :store (lambda () svc-store)
+                :qos-overrides '(:collect-durability :transient) :name "collect-origin-convergence"))
+         (svc (dds.durability:make-durability-service spec :store svc-store))
+         (pub-node (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #x1A) :domain 79
+                                            :host "127.0.0.1" :port 0 :multicast nil))
+         (relay-node (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #x2B) :domain 79
+                                              :host "127.0.0.1" :port 0 :multicast nil)))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start svc)
+           (let* ((svc-node (dds.durability:durability-service-node svc))
+                  ;; pub-guid: extract the 16-octet writer GUID from the returned endpoint-data
+                  ;; (add-local-writer returns endpoint-data, not the raw GUID array)
+                  (pub-ep   (dds.disc:add-local-writer pub-node :topic "CSquare" :type "ShapeType"
+                                                       :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                                      :durability :transient)))
+                  (pub-guid (copy-seq (dds.rtps.discovery:endpoint-data-guid pub-ep))))
+             (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+             (dds.disc:start-node pub-node)
+             (dds.disc:add-local-writer relay-node :topic "CSquare" :type "ShapeType"
+                                        :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                       :durability :transient))
+             (dds.disc:enable-publisher relay-node :history-kind :keep-all)
+             (dds.disc:start-node relay-node)
+             (let ((pp (dds.disc:disc-node-port pub-node))
+                   (rp (dds.disc:disc-node-port relay-node))
+                   (sp (dds.disc:disc-node-port svc-node)))
+               (setf (dds.disc:disc-node-peers pub-node)   (list (cons "127.0.0.1" sp)))
+               (setf (dds.disc:disc-node-peers relay-node) (list (cons "127.0.0.1" sp)))
+               (setf (dds.disc:disc-node-peers svc-node)
+                     (list (cons "127.0.0.1" pp) (cons "127.0.0.1" rp))))
+             (loop repeat 400
+                   until (>= (dds.disc:disc-node-matched-count svc-node) 2)
+                   do (dds.disc:announce-participant pub-node) (dds.disc:announce-endpoints pub-node)
+                      (dds.disc:announce-participant relay-node) (dds.disc:announce-endpoints relay-node)
+                      (dds.disc:announce-participant svc-node) (dds.disc:announce-endpoints svc-node)
+                      (sleep 0.02))
+             (flet ((send-direct () (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i)))))
+                    (send-relay  () (dotimes (i n)
+                                     (dds.disc:publish-relay-sample relay-node (%make-small-payload (1+ i))
+                                                                    pub-guid (1+ i)))))
+               (if relay-first (progn (send-relay) (sleep 0.2) (send-direct))
+                   (progn (send-direct) (sleep 0.2) (send-relay))))
+             (loop repeat 200
+                   do (dds.disc:announce-participant pub-node) (dds.disc:announce-endpoints pub-node)
+                      (dds.disc:announce-participant relay-node) (dds.disc:announce-endpoints relay-node)
+                      (dds.disc:announce-participant svc-node) (dds.disc:announce-endpoints svc-node)
+                      (sleep 0.03))
+             (let ((origins (remove-duplicates
+                             (mapcar #'dds.durability:durable-record-writer-guid
+                                     (dds.durability:store-get-range svc-store "CSquare"))
+                             :test #'equalp)))
+               (%check (if relay-first :converge-relay-first :converge-direct-first)
+                       (and (= 1 (length origins)) (equalp (first origins) pub-guid))
+                       (format nil "store must hold exactly ONE origin == pub-guid ~a (relay-first=~a); got ~d: ~a"
+                               pub-guid relay-first (length origins) origins)))))
+      (ignore-errors (dds.disc:stop-node pub-node))
+      (ignore-errors (dds.disc:stop-node relay-node))
+      (ignore-errors (dds.durability:service-stop svc))))
+  t)
+
+(defun* run-durability-collect-origin-convergence-test ()
+    (function () t)
+  "The fix's deterministic proof: a durability relay collecting the SAME logical sample from a direct
+   publisher AND a foreign OWI-stamping relay converges on the publisher's logical origin regardless of
+   arrival order (RTPS 2.5 §8.3.5.4, ADR 0028) — the data-path symmetry of the lifecycle drain's orig-guid."
+  (%collect-origin-convergence-case t)     ; relay copy arrives first (the case that diverged before the fix)
+  (%collect-origin-convergence-case nil)   ; direct copy arrives first
+  t)

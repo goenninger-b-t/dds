@@ -84,11 +84,14 @@ follow-on. No false exactly-once claim is made; the authoritative proof remains 
 - **Gates:** `make test` (SBCL + Clasp, 299 each, deterministic), `gate-hotpath`, `gate-types`, `mem`
   (0.0000), `fuzz`, `wire` — all green.
 
-## §Follow-ons (recorded, NOT built here)
+## §Follow-ons
 
-1. **Live cross-vendor exactly-once capture** — reliable one-publisher-into-both-relays orchestration +
-   collect-origin convergence (our relay recording the original publisher's GUID for a foreign relay's
-   OWI-stamped replay); root-cause the residual origin divergence observed in `interop/durability-coexist-dedup/`.
+1. **Live cross-vendor exactly-once capture — RESOLVED by ADR 0028 (WP-DURABILITY-COEXIST-LIVE,
+   2026-06-21).** The root cause was the collect path recording the wire sender GUID instead of the
+   OWI logical origin; fixed by per-sample logical-origin capture (`node-sample-origin-guid` /
+   `node-sample-origin-sn` + `%collect-loop` re-stamp). Live captures: dir-a N=545 (our reader),
+   dir-b N=550 (Connext `shapes_sub`); both relays' wire OWI = the publisher's real GUID;
+   `analyze-capture.py --assert-converged` exits 0. See ADR 0028.
 2. **Coexistence with a persistence service that does NOT emit standard OWI on replay** (should one exist) —
    only then would a vendor origin-id recognition (à la the original §10 item 1) be warranted.
 
@@ -97,6 +100,6 @@ follow-on. No false exactly-once claim is made; the authoritative proof remains 
 - ADR 0024 — Phase-2 dedup (standard `PID_ORIGINAL_WRITER_INFO` + bounded per-origin watermark)
 - ADR 0026 — disk-backed PERSISTENT durability + §10 follow-on roadmap (item 1 resolved here)
 - `docs/superpowers/spikes/2026-06-20-rti-vendor-origin-findings.md` — the spike (RTI PS uses standard OWI on replay)
-- `interop/durability-coexist-dedup/` — the live coexistence exercise + the honest live status
+- `interop/durability-coexist-dedup/` — the live coexistence harness + the captured dir-a (N=545) / dir-b (N=550) pcaps (the live exactly-once that ADR 0027 §follow-on 1 deferred; resolved by ADR 0028)
 - `src/dds-durability/{service,spec}.lisp` — `:relay-durability` / `:collect-durability` qos-overrides
 - `src/dds-tests/durability-test.lisp` — `run-durability-multi-relay-dedup-test`, `run-durability-no-double-delivery-test`

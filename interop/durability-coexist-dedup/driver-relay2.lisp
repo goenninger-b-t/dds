@@ -16,6 +16,13 @@
 ;;;; the SAME single Connext TRANSIENT publisher, both origins == that publisher's (GUID, SN), so the
 ;;;; receiver's dedup collapses the two identical-origin streams to exactly N.
 ;;;;
+;;;; LIVE RESULT (WP-DURABILITY-COEXIST-LIVE, ADR 0028, 2026-06-21): dir-a N=545, dir-b N=550; both
+;;;; relays stamped the same publisher origin GUID in each direction; UNION=N; sum=2N; captures in
+;;;; captures/coexist-dir-{a,b}.pcap; analyze-capture.py --assert-converged exits 0. The :collect-durability
+;;;; :transient + logical-origin fix (node-sample-origin-guid/sn in disc-node) was the key: our relay now
+;;;; records the OWI origin GUID (the publisher's) not the wire sender GUID (RTI PS's relay) when RTI PS
+;;;; replay wins the arrival race.
+;;;;
 ;;;; In-memory store (make-memory-store): persistence/at-rest is a separate concern
 ;;;; (interop/durability-persistent/).  Two QoS overrides as the other durability drivers:
 ;;;; :data-representation (:xcdr1) for the XCDR1-only ShapeType peers and :peers — 7410 (domain-0

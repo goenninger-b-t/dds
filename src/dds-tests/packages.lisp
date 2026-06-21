@@ -40,4 +40,6 @@
            #:run-durability-seen-prune-test
            #:run-durability-dynamic-topic-test
            #:run-durability-relay-tier-test
-           #:run-durability-collect-tier-test))
+           #:run-durability-collect-tier-test
+           #:run-durability-origin-accessor-test
+           #:run-durability-collect-origin-convergence-test))

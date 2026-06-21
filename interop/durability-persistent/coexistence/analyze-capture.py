@@ -160,6 +160,49 @@ def owi_dump(path):
                        'either Branch B synthetic, OR Branch A but the original writer is not in-window)')
             print(f"  origin {og}: also-a-direct-writer-GUID={is_direct} => {verdict}")
 
+def assert_converged(path):
+    "Live-gated check: >=2 relays stamped OWI AND their origin-GUID sets are identical (converged to the"
+    " one publisher) AND the UNION of (GUID,SN) equals each relay's count (exactly-once). Exit 0 iff so."
+    per_writer = collections.defaultdict(set)
+    for E, src_prefix, wId, own_sn, qflag, iq, sub in data_submessages(path):
+        if not (qflag and iq < len(sub)):
+            continue
+        q = iq
+        while q + 4 <= len(sub):
+            pid = struct.unpack_from(E + 'H', sub, q)[0]
+            plen = struct.unpack_from(E + 'H', sub, q + 2)[0]
+            val = sub[q + 4:q + 4 + plen]
+            if pid == 0x0001:
+                break
+            if pid == 0x0061 and len(val) >= 24:
+                oshi, oslo = struct.unpack_from(E + 'iI', val, 16)
+                per_writer[wId].add((val[0:16].hex(), (oshi << 32) | oslo))
+            q += 4 + plen
+    relays = sorted(per_writer)
+    if len(relays) < 2:
+        print(f"NOT-CONVERGED: only {len(relays)} relay stamped OWI on this capture (need >=2).")
+        return 1
+    guid_sets = [frozenset(g for g, _ in per_writer[w]) for w in relays]
+    union = set().union(*per_writer.values())
+    converged = all(s == guid_sets[0] for s in guid_sets) and len(guid_sets[0]) == 1
+    # even when converged (identical singleton GUID sets), exactly_once can be False if relays stamp
+    # different SNs so the UNION of (GUID,SN) pairs exceeds each relay's individual count.
+    exactly_once = all(len(per_writer[w]) == len(union) for w in relays)
+    pub = next(iter(guid_sets[0])) if guid_sets[0] else None
+    print(f"relays={len(relays)} origin-GUID-sets={[sorted(s) for s in guid_sets]} "
+          f"union(GUID,SN)={len(union)} converged={converged} exactly_once={exactly_once}")
+    if converged and exactly_once:
+        print(f"CONVERGED: both relays stamp OWI origin GUID {pub}; a dedup receiver delivers exactly "
+              f"N={len(union)} (cross-vendor dual-relay exactly-once).")
+        return 0
+    if not converged:
+        print("NOT-CONVERGED: relay origin GUID sets differ or are non-singleton "
+              f"({[sorted(s) for s in guid_sets]}); see --owi-dump.")
+    else:  # converged True but exactly_once False
+        print(f"NOT-CONVERGED: relays share origin GUID but per-relay (GUID,SN) counts "
+              f"({[len(per_writer[w]) for w in relays]}) != union ({len(union)}); partial overlap, see --dedup-union.")
+    return 1
+
 def main(path):
     own_sn = collections.defaultdict(set)
     data_by_writer = collections.Counter()
@@ -213,5 +256,7 @@ if __name__ == '__main__':
         owi_dump(args[1] if len(args) > 1 else 'captures/coexistence-transient.pcap')
     elif args and args[0] == '--dedup-union':
         dedup_union(args[1] if len(args) > 1 else 'captures/coexistence-transient.pcap')
+    elif args and args[0] == '--assert-converged':
+        sys.exit(assert_converged(args[1] if len(args) > 1 else 'captures/coexistence-transient.pcap'))
     else:
         main(args[0] if args else 'captures/coexistence-transient.pcap')

@@ -1186,6 +1186,18 @@
   (or (gethash guid outer)
       (setf (gethash (copy-seq guid) outer) (make-hash-table :test 'eql))))
 
+(defun* %record-sample-origin (node wire-guid sn eff-guid eff-sn)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer
+              (simple-array (unsigned-byte 8) (16)) integer) t)
+  "Record the logical origin (EFF-GUID . EFF-SN) for the sample stored under wire (WIRE-GUID, SN) — but
+   ONLY when it differs from the wire identity, i.e. the sample arrived relayed with PID_ORIGINAL_WRITER_INFO
+   (RTPS 2.5 §8.3.5.4). A direct sample stores nothing here (the wire GUID/SN IS the origin), so the common
+   path stays byte-identical and allocation-free. Caller holds the node lock. Control-plane (relay store)."
+  (when (or (not (equalp eff-guid wire-guid)) (/= eff-sn sn))
+    (setf (gethash sn (%inner-table (disc-node-sample-origins node) wire-guid))
+          (cons (copy-seq eff-guid) eff-sn)))
+  t)
+
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0017.
 (defstruct* (zc-loan-marker (:constructor %make-zc-loan-marker))
   "WP-FLATDATA-ZC-LOAN unresolved ZC-ref marker (FR-PF-3/4, R6, ADR 0017): the receiver thread stores THIS
@@ -1311,7 +1323,8 @@
       (dds.pal:with-lock ((disc-node-lock node))
         (setf (gethash sn (%inner-table (disc-node-samples node) guid)) marker
               (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
-              (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid))
+              (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
+        (%record-sample-origin node guid sn effective-guid effective-sn))
       (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))))
   t)
 
@@ -1336,7 +1349,8 @@
       (dds.pal:with-lock ((disc-node-lock node))
         (setf (gethash sn (%inner-table (disc-node-samples node) guid)) vec
               (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
-              (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid))
+              (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
+        (%record-sample-origin node guid sn effective-guid effective-sn))
       (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))))
   t)
 
@@ -1630,6 +1644,27 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (let ((inner (gethash (car key) (disc-node-sample-writer-guids node))))
       (and inner (gethash (cdr key) inner)))))
+
+(defun* node-sample-origin-guid (node key)
+    (function (disc-node cons) (simple-array (unsigned-byte 8) (16)))
+  "The LOGICAL ORIGIN GUID of the user sample at composite KEY (a (GUID . SN) cons): the original
+   writer's GUID when the sample was relayed with PID_ORIGINAL_WRITER_INFO (RTPS 2.5 §8.3.5.4), else the
+   wire sender GUID (= (car KEY)). Always defined. A durability relay re-stamps THIS as the OWI origin so
+   a foreign persistence service's relayed copies converge with directly-collected copies (ADR 0028)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let* ((inner (gethash (car key) (disc-node-sample-origins node)))
+           (entry (and inner (gethash (cdr key) inner))))
+      (if entry (car entry) (car key)))))
+
+(defun* node-sample-origin-sn (node key)
+    (function (disc-node cons) integer)
+  "The LOGICAL ORIGIN SN of the user sample at composite KEY: the original writer's SN when relayed with
+   PID_ORIGINAL_WRITER_INFO (RTPS 2.5 §8.3.5.4), else the wire SN (= (cdr KEY)). Pairs with
+   node-sample-origin-guid."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let* ((inner (gethash (car key) (disc-node-sample-origins node)))
+           (entry (and inner (gethash (cdr key) inner))))
+      (if entry (cdr entry) (cdr key)))))
 
 (defun* matched-writer-ownership (node guid)
     (function (disc-node (simple-array (unsigned-byte 8) (16))) (values t t))

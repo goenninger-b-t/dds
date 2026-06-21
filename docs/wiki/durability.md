@@ -350,6 +350,12 @@ a late-joiner matched to both receives each sample exactly once — because both
 `PID_ORIGINAL_WRITER_INFO` with the same original-writer GUID + SN, and the receiver's
 dedup map identifies them as the same sample. No inter-relay coordination is required.
 
+**This is LIVE-captured as of WP-DURABILITY-COEXIST-LIVE (ADR 0028, 2026-06-21).** The
+`:collect-durability :transient` qos-override ensures our collect path records the OWI logical
+origin (the publisher's GUID) when RTI PS's OWI-stamped replay arrives, so both relays converge
+on the same `(origin-GUID, SN)` regardless of arrival order. See `dds.disc:node-sample-origin-guid`
+/ `node-sample-origin-sn` and §8.6.
+
 Cross-DDS interop legs:
 - **Leg A** — Connext 7.3.1 pub → our service → Connext late-joiner: 190 samples received,
   every relayed DATA carries `PID_ORIGINAL_WRITER_INFO` byte-exact.
@@ -637,7 +643,7 @@ file store itself adds no new dependency (plain-file IO). `dds.pal:fsync-stream`
 split**: SBCL issues a true `fdatasync(2)`; **Clasp falls back to `finish-output`** (no stream-fd
 `fdatasync` exposed here), so the SBCL path carries the production OS-level durability guarantee.
 
-### 8.6 Cross-DDS transparency-after-restart + the RTI-PS coexistence finding
+### 8.6 Cross-DDS transparency-after-restart + cross-vendor dual-relay exactly-once
 
 **Transparency-after-restart is LIVE vs both peers** (`interop/durability-persistent/`, 2026-06-20,
 a GENUINE 2-process restart sharing the same disk `D` + key `K`): process 1 sealed N samples to disk
@@ -648,20 +654,42 @@ received**; **Fast DDS 3.6.1: 186 → 186 → 186**. Both captures match the pla
 `CDR_LE`, NACK→retransmit). Direct disk inspection confirmed only sealed ciphertext on disk
 throughout — DARE-at-rest is real, yet wire-transparent after restart.
 
-**RTI Persistence Service coexistence is a documented finding** (`interop/durability-persistent/coexistence/`).
-Stronger than Phase-2, we got RTI PS v7.3.1 to **run + relay at the TRANSIENT tier** (resolving the
-Phase-2 blocker — it was inert for TRANSIENT_LOCAL), both relays live simultaneously.
-**WP-DURABILITY-COEXIST-DEDUP (ADR 0027) corrected the earlier finding:** RTI PS **does** emit the
-standard `PID_ORIGINAL_WRITER_INFO (0x0061)` — the publisher's real `(GUID, SN)` — on its
-**retained-history replay to a late-joiner** (the earlier "zero OWI / vendor `PID_ENTITY_VIRTUAL_GUID`"
-reading was RTI PS's **live-forward** path only; the Phase-2/3b capture missed the replay episode). So
-**cross-vendor dual-relay exactly-once works on the standard path — no vendor PID is needed** — and our
-dedup already keys on it; the vendor `PID_ENTITY_VIRTUAL_GUID` (0x8002) is SEDP relay-identity only. New
-configurable `:relay-durability` / `:collect-durability` qos-overrides (default `:transient-local`,
-byte-identical; opt-in `:transient`) let our service coexist at the TRANSIENT tier RTI PS replays to. The
-**authoritative proof** is the in-process `run-durability-no-double-delivery-test` +
-`run-durability-multi-relay-dedup-test` (N standard-OWI relays of one origin → exactly N); a live
-exactly-once capture is a documented follow-on (ADR 0027).
+**RTI Persistence Service coexistence — LIVE exactly-once CAPTURED (WP-DURABILITY-COEXIST-LIVE,
+ADR 0028, 2026-06-21).** Background: WP-DURABILITY-COEXIST-DEDUP (ADR 0027) showed RTI PS v7.3.1
+emits the standard `PID_ORIGINAL_WRITER_INFO (0x0061)` — the publisher's real `(GUID, SN)` — on its
+**retained-history replay**, so cross-vendor dedup works on the standard path. The residual ADR 0027
+follow-on was the origin **divergence** observed on our collect side: our relay was storing the **wire
+sender** GUID, not the OWI logical origin, so when RTI PS's relay won an arrival race the stored GUID
+was RTI PS's relay GUID (`0x80000002`), not the publisher — and dedup keyed on a different origin.
+
+**Fix (WP-DURABILITY-COEXIST-LIVE Tasks 1–2):** per-sample logical-origin capture in `disc-node`:
+
+```lisp
+;; After an on-data callback, look up the OWI logical origin (or the wire guid/sn if no OWI).
+(dds.disc:node-sample-origin-guid node key)  ; → (simple-array (unsigned-byte 8) (16))
+(dds.disc:node-sample-origin-sn   node key)  ; → integer
+;; key = (writer-guid . sn) as stored in the disc-node sample maps
+```
+
+`%collect-loop` now keys `store-put` + dedup on these logical-origin values. The default/direct path
+(no OWI → effective = wire) is byte-identical. Mirrors the lifecycle drain precedent (`orig-guid`).
+
+**Live capture results (both directions converged on FIRST attempt):**
+
+| Direction | Receiver | N | RTI PS OWI origin GUID | Our relay OWI origin GUID | UNION | Naïve 2-relay sum |
+|---|---|---|---|---|---|---|
+| dir-a | our-stack reader | **545** | `0101642e5f4294116dd106b480000002` | same | 545 | 1090 |
+| dir-b | Connext `shapes_sub` | **550** | `01017344014e53c9630ac19e80000002` | same | 550 | 1100 |
+
+Both relays stamp `PID_ORIGINAL_WRITER_INFO` with the **same** publisher GUID (EntityId kind `0x02`,
+USER_DEFINED) in both directions. `analyze-capture.py --assert-converged` exits 0 on both committed
+captures (`interop/durability-coexist-dedup/captures/coexist-dir-{a,b}.pcap`).
+
+**In-process convergence proof:** `run-durability-collect-origin-convergence-test` shows convergence
+for both arrival orders (direct-first, relay-first) without a live run.
+
+**ADR 0027 §follow-on 1 is RESOLVED** by ADR 0028. The still-open follow-on is ADR 0027 §follow-on 2:
+coexistence with a persistence service that does NOT emit standard OWI on its replay.
 
 ### 8.7 Scope & follow-ons
 
@@ -671,8 +699,9 @@ byte fails the GCM tag, fail-closed — and it survives restart. It does **not**
 integrity** (a disk-write adversary can delete/reorder/truncate whole records undetectably — there is
 no MAC'd log chain) nor metadata **confidentiality** (metadata is cleartext on disk). The follow-ons
 (ADR 0026 §10 / ADR 0025 §10): cross-vendor coexistence dedup **(RESOLVED — ADR 0027: RTI PS uses
-standard OWI on its retained-history replay, so no vendor PID is needed; the live exactly-once capture
-is the residual follow-on; the configurable `:relay-durability`/`:collect-durability` tiers landed)**;
+standard OWI on its retained-history replay, so no vendor PID is needed; the configurable
+`:relay-durability`/`:collect-durability` tiers landed; ADR 0027 §follow-on 1 RESOLVED — ADR 0028:
+live exactly-once captured dir-a N=545, dir-b N=550)**;
 KEEP_LAST-superseded + online/threshold compaction; **parent-directory
 fsync** (durable directory entries for new files + the compaction rename across a power loss);
 **`:process`-mode PERSISTENT** (the store factory is not serialized across the process boundary —
@@ -692,15 +721,20 @@ persistence backends (the file backend is on the same vtable, so they drop in).
 - ADR 0024 — Dedup map architecture (watermark + bounded reorder set)
 - ADR 0025 — DARE: CNSA-2.0 Data-At-Rest Encryption (the KEM-DEM envelope, key-provider, fail-closed, secret handling)
 - ADR 0026 — Disk-backed PERSISTENT store + cross-restart key-epoch (file-store framing/recovery, envelope v2, group-commit, compaction, the coexistence finding)
+- ADR 0027 — Cross-vendor coexistence dedup: RTI PS uses standard OWI on replay; `:relay-durability`/`:collect-durability` tiers; honest live status; §follow-on 1 resolved by ADR 0028
+- ADR 0028 — Cross-vendor dual-relay exactly-once: live-captured convergence via logical-origin capture (dir-a N=545, dir-b N=550; resolves ADR 0027 §follow-on 1)
 - `docs/superpowers/specs/2026-06-19-durability-dare-design.md` — the DARE design spec
 - `docs/superpowers/specs/2026-06-20-durability-persistent-design.md` — the PERSISTENT design spec
 - `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md` — PID_ORIGINAL_WRITER_INFO spike
+- `docs/superpowers/spikes/2026-06-20-rti-vendor-origin-findings.md` — RTI PS uses standard OWI on replay (ADR 0027 spike)
 - `interop/durability-transient/` — cross-DDS interop captures and README
 - `interop/durability-dedup/` — PID_ORIGINAL_WRITER_INFO cross-DDS legs + coexistence captures
 - `interop/durability-dare/` — DARE cross-DDS transparency captures (Connext 352 / Fast DDS 152)
 - `interop/durability-persistent/` — PERSISTENT transparency-after-restart (Connext 458 / Fast DDS 186) + the RTI-PS coexistence finding
+- `interop/durability-coexist-dedup/` — live dual-relay coexistence harness; captures dir-a (N=545) + dir-b (N=550); `analyze-capture.py --assert-converged`
+- `src/dds-disc/disc.lisp` — `sample-origins` struct slot; `src/dds-disc/dataplane.lisp` — `node-sample-origin-guid` / `node-sample-origin-sn` (logical-origin accessors) + `%record-sample-origin` setter
 - `src/dds-durability/` — service implementation (store / store-file / spec / service / runner / supervisor / main / store-encrypted)
 - `src/dds-dare/` — DARE crypto (openssl-ffi / primitives / envelope / key-provider)
 - `src/dds-pal/pal-{sbcl,clasp}.lisp` — `fsync-stream` (group-commit; NFR-PORT split: SBCL `fdatasync(2)` / Clasp `finish-output`)
-- `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-durability-file-recovery-test`, `run-dare-*`)
+- `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-durability-file-recovery-test`, `run-dare-*`, `run-durability-collect-origin-convergence-test`)
 - `src/dds-tests/pbt-test.lisp` — PID-parse fuzz arm (`fuzz-original-writer-info-parse`) + DARE open-path fuzz arm (`fuzz-dare-open-payload`) + the PERSISTENT crash-injection arm, NFR-SEC-POSTURE

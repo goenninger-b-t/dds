@@ -35,22 +35,29 @@ So that our service can actually participate in such a topology:
 Both default to `:transient-local` ⇒ the normal service is byte-identical to before
 (`run-durability-relay-tier-test`, `run-durability-collect-tier-test`, both green Clasp + SBCL).
 
-## Live status — honest
+## Live status — CAPTURED (WP-DURABILITY-COEXIST-LIVE, ADR 0028, 2026-06-21)
 
-A live cross-vendor dual-relay **exactly-once was not captured** in this WP. With both tiers on, a single
-TRANSIENT receiver does match **both** relays (direction (a) reaches `relays=2` — the tier wall is gone),
-but the two relays' `0x0061` origins **diverged** in the runs: RTI PS stamped the publisher's real GUID
-(`0101fa83…`), while our relay recorded a **different** GUID (`0101f0a9…`) → disjoint origins → a deduping
-receiver saw 2N (direction (a): 868 = 2×434), and a Connext receiver pulled from RTI PS alone
-(direction (b): N from `0x80000002` only).
+**Cross-vendor dual-relay exactly-once is now LIVE-CAPTURED in both directions.** The root cause of the
+ADR 0027 divergence was identified and fixed: `%collect-loop` was storing the **wire sender GUID** instead
+of the OWI **logical origin** GUID. When RTI PS's TRANSIENT replay won the arrival race our relay stored
+RTI PS's relay GUID (`0x80000002`), not the publisher's — so the two relays' `0x0061` origins diverged.
 
-**The divergence is on our collect / orchestration side — NOT an RTI virtual-GUID wall** (RTI demonstrably
-uses the publisher's real GUID, above) and not a dedup-mechanism defect. Achieving live convergence needs
-(a) one publisher genuinely feeding both relays' replays and (b) our collect path recording the *original*
-publisher's GUID for a foreign relay's OWI-stamped samples (what `:collect-durability :transient` targets).
-A reliable live capture proved finicky to orchestrate (discovery timing of one Connext pub into two foreign
-relays + a late-joiner); the exact residual cause was not fully pinned here. **The live convergence capture
-is a documented follow-on** (ADR 0027 §follow-ons).
+**Fix:** per-sample logical-origin capture in `disc-node` (`node-sample-origin-guid`/`node-sample-origin-sn`
+accessors; `%record-sample-origin` on `on-data`); `%collect-loop` now re-stamps `store-put` + dedup from
+the logical origin. Default/direct path byte-identical (no OWI → effective = wire).
+
+**Capture results (`captures/coexist-dir-{a,b}.pcap`):**
+
+| Direction | Receiver | N | Both relays' OWI origin GUID |
+|---|---|---|---|
+| dir-a | our-stack reader | **545** | `0101642e5f4294116dd106b480000002` (publisher's real GUID) |
+| dir-b | Connext `shapes_sub` | **550** | `01017344014e53c9630ac19e80000002` (publisher's real GUID) |
+
+UNION = N in both directions. Naïve 2-relay sum = 1090 / 1100 respectively. Both relays stamp the
+**same** publisher GUID (EntityId kind `0x02`, USER_DEFINED) — no divergence. Both runs converged on the
+FIRST attempt. `analyze-capture.py --assert-converged` exits 0 on both captures.
+
+**ADR 0027 §follow-on 1 is RESOLVED** by ADR 0028.
 
 ## Authoritative proof (conformant, deterministic)
 

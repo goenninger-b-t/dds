@@ -9,13 +9,15 @@
 #   (a) our-stack reader receiver   -> driver-our-reader.lisp  (our reader-dedup-accept-p)
 #   (b) Connext shapes_sub receiver -> RTI receiver-side dedup
 #
-# FINDING (authoritative: README + ADR 0027): RTI PS emits the standard PID_ORIGINAL_WRITER_INFO with the
-# publisher's real (GUID,SN) on replay, so cross-vendor dedup works on the standard path. driver-relay2
-# advertises :relay-durability :transient, so a TRANSIENT receiver matches BOTH relays (the tier wall is
-# gone). A live dual-relay exactly-once was NOT captured — the relays' recorded origins diverged on our
-# collect/orchestration side (NOT an RTI virtual-GUID wall) — a documented follow-on. The authoritative
-# exactly-once proof is the in-process dds.tests:run-durability-no-double-delivery-test +
-# run-durability-multi-relay-dedup-test.
+# FINDING (authoritative: captures/coexist-dir-{a,b}.pcap + ADR 0028): LIVE cross-vendor dual-relay
+# exactly-once CAPTURED both directions (ADR 0028, %collect-loop origin-convergence fix).  Both RTI PS
+# (relay 1, EntityId 0x80000002) and our service (relay 2, EntityId 0x00000102) stamp
+# PID_ORIGINAL_WRITER_INFO 0x0061 with the SAME origin GUID — the original Connext publisher's GUID.
+# UNION(GUID,SN) == N per relay == exactly N delivered (SUM==2N, dedup collapses the duplicate).
+# dir-a: N=545, publisher GUID 0101642e5f4294116dd106b480000002; our-stack reader delivered 545.
+# dir-b: N=550, publisher GUID 01017344014e53c9630ac19e80000002; Connext shapes_sub received 550.
+# --assert-converged exits 0 on both captures (the live-gated merge gate passes).
+# The in-process authoritative proof: dds.tests:run-durability-collect-origin-convergence-test.
 #
 # RELIABILITY FIXES vs Phase-3b: (1) RTI PS KEEP_ALL relay QoS so it retains/replays all N of the single
 # animated instance; (2) the our-stack reader binds a FIXED port that relay 2 lists as an SPDP peer, so
@@ -153,6 +155,9 @@ run_episode() {
   python3 "$REPO/interop/durability-persistent/coexistence/analyze-capture.py" --owi-dump "$cap" || true
   echo "--- dual-relay dedup arithmetic ($label): UNION vs SUM ---"
   python3 "$REPO/interop/durability-persistent/coexistence/analyze-capture.py" --dedup-union "$cap" || true
+  echo "--- converged-exactly-once assertion ($label) ---"
+  python3 "$REPO/interop/durability-persistent/coexistence/analyze-capture.py" --assert-converged "$cap" \
+    && echo "   CONVERGED ($label)" || echo "   NOT-CONVERGED ($label) — see --owi-dump"
   echo "   capture: $cap ($(ls -la "$cap" | awk '{print $5}') bytes)"
 }
 

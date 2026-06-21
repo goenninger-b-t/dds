@@ -215,17 +215,18 @@
               (dds.disc:announce-participant node)
               (dds.disc:announce-endpoints node)
               (setf last-announce now))
-            ;; drain data samples
+            ;; drain data samples — dedup/store/relay on the LOGICAL origin (OWI else wire)
             (dolist (key (dds.disc:node-sample-sns node))
-              (let ((writer-guid (dds.disc:node-sample-writer-guid node key))
-                    (sn (dds.disc:node-sample-key-sn key)))
+              (let* ((writer-guid (dds.disc:node-sample-writer-guid node key))
+                     (origin-guid (dds.disc:node-sample-origin-guid node key))  ; logical origin (OWI else wire)
+                     (origin-sn   (dds.disc:node-sample-origin-sn   node key)))
                 (when (and writer-guid
-                           (not (%collect-seen-p origins-data writer-guid sn)))
-                  (%collect-mark-seen! origins-data writer-guid sn)
+                           (not (%collect-seen-p origins-data origin-guid origin-sn)))
+                  (%collect-mark-seen! origins-data origin-guid origin-sn)
                   (let ((payload (dds.disc:node-sample node key)))
                     (when payload
-                      (store-put store topic-name writer-guid sn nil :data payload)
-                      (dds.disc:publish-relay-sample node payload writer-guid sn))))))
+                      (store-put store topic-name origin-guid origin-sn nil :data payload)
+                      (dds.disc:publish-relay-sample node payload origin-guid origin-sn))))))
             ;; drain lifecycle changes (dispose / unregister)
             ;; key = (writer-guid . sn); dedup on (writer-guid, sn) via origins-lc watermark
             (dolist (key (dds.disc:node-lifecycle-sns node))
