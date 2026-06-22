@@ -298,7 +298,9 @@
      :purge
      (lambda (topic) (store-purge inner-store topic))
      :open
-     (lambda ()
+     (lambda (history-kind history-depth)
+       ;; v1 has no inner file-store to forward policy to; accept+ignore (decorator contract)
+       (declare (ignore history-kind history-depth))
        (unless dek
          (dds.dare:key-provider-open key-provider)
          ;; defensive: never double-hold a DEK; free any stale one before re-deriving (§6)
@@ -397,10 +399,10 @@
        :purge
        (lambda (topic) (store-purge inner-store topic))
        :open
-       (lambda ()
+       (lambda (history-kind history-depth)
          (dds.pal:with-lock (lock)
-           ;; open the inner store first: it creates topics/ + replays the sealed logs (spec §5)
-           (store-open inner-store)
+           ;; delegate policy to the inner file-store so compaction-on-open uses the effective args
+           (store-open inner-store history-kind history-depth)
            ;; defensive: a re-open must not leak prior-run DEKs (idempotent on empty); §6
            (%free-epoch-dek-map dek-map)
            (setf current-epoch nil)

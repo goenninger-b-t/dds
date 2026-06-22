@@ -42,4 +42,10 @@
            #:run-durability-relay-tier-test
            #:run-durability-collect-tier-test
            #:run-durability-origin-accessor-test
-           #:run-durability-collect-origin-convergence-test))
+           #:run-durability-collect-origin-convergence-test
+           #:run-durability-data-keyhash-capture-test
+           #:run-durability-collect-keyhash-store-test
+           #:run-durability-keeplast-memory-test
+           #:run-durability-keeplast-compaction-test
+           #:run-durability-keeplast-cross-restart-test
+           #:run-durability-keeplast-service-spec-policy-test))

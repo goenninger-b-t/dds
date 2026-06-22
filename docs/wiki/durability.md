@@ -91,13 +91,20 @@ Load it by depending on `:dds-durability` in your system.
 (dds.durability:store-topics store)            ; → list of topic strings
 (dds.durability:store-purge  store topic)      ; → T
 (dds.durability:store-count  store &optional topic)  ; → (integer 0)
-(dds.durability:store-open   store)            ; → T
+(dds.durability:store-open   store &optional history-kind history-depth)  ; → T
 (dds.durability:store-close  store)            ; → T
 ```
 
 `store-put` is idempotent on `(topic, writer-guid, sn)`. Records sorted by `(writer-guid, sn)` in
 `store-get-range`. The store vtable is extensible — a file-backed or database-backed implementation
 slots in by replacing the function slots (Phase 2/3 follow-up).
+
+`store-open` accepts optional `history-kind` (`:keep-all` | `:keep-last`) and `history-depth`
+(positive integer) arguments. When supplied they override the store's factory-time defaults
+and drive compaction-on-open (file-store) or online eviction (in-memory store) for the lifetime
+of that open. `service-start` calls `store-open` with the service-spec's `history-kind` and
+`history-depth`, making the service-spec the single functional policy source in service mode
+(ADR 0029, DDS 1.4 §2.2.3.5).
 
 ### 3.2 Service specification
 
@@ -109,6 +116,8 @@ slots in by replacing the function slots (Phase 2/3 follow-up).
        (store (lambda () (make-memory-store)))
        (mode :thread)  ; :thread | :process
        (qos-overrides nil)  ; plist: :data-representation, :peers, :multicast
+       (history-kind  :keep-all) ; DURABILITY_SERVICE history_kind: :keep-all | :keep-last (DDS 1.4 §2.2.3.5)
+       (history-depth 1)         ; KEEP_LAST depth bound per non-NIL-key-hash instance (integer >= 1)
        (name ""))      ; → service-spec
 
 ;; Test if a (topic, type) pair matches the spec's filter
@@ -549,8 +558,10 @@ composes the file store + the file key-provider + the epoch-aware encrypted-stor
    :topics '(("Square" . "ShapeType"))
    ;; the PERSISTENT tier: a disk-backed, always-DARE-wrapped store with a cross-restart key-epoch
    :store (dds.durability:make-persistent-store-factory
-           :dir     *store-dir*    ; D — sealed topic logs + epochs.dat live here
-           :key-dir *key-dir*)     ; K — the ML-KEM-1024 keypair lives here
+           :dir          *store-dir*    ; D — sealed topic logs + epochs.dat live here
+           :key-dir      *key-dir*      ; K — the ML-KEM-1024 keypair lives here
+           :history-kind :keep-last     ; optional: bound per-instance :data on each open
+           :history-depth 10)           ; keep the newest 10 :data per instance (default: :keep-all)
    :name "persistent-durability-service"))
 
 (defparameter *runner* (dds.durability:make-service-runner (list *spec*)))
@@ -562,7 +573,7 @@ composes the file store + the file key-provider + the epoch-aware encrypted-stor
 ```
 
 `make-persistent-store-factory` is equivalent to the explicit composition
-`(make-encrypted-store (make-file-store :dir D) (make-file-key-provider :dir K) :epoch-dir D)` — the
+`(make-encrypted-store (make-file-store :dir D :history-kind … :history-depth …) (make-file-key-provider :dir K) :epoch-dir D)` — the
 encrypted-store seals → the file store writes only sealed bytes under `D`; the encrypted-store owns
 `D/epochs.dat`; the key-provider owns `K/ml-kem-1024.{key,pub}`.
 
@@ -623,10 +634,15 @@ records from a prior run could not be reopened. 3b adds a persisted **key-epoch*
   loud), so a gross length-field corruption can never masquerade as a torn tail and silently truncate.
 - **Ordering invariant:** `epochs.dat` is fsync'd before any topic-log record references the new
   epoch, so every record's epoch-id resolves after a crash.
-- **Compaction-on-open** is conservative and **order-aware**: it drops a key-hash only when both a
-  `:dispose` and an `:unregister` tombstone are present AND the instance's **final** record is itself
-  a tombstone — a legally **resurrected** instance (a `:data` written after the teardown) is never
-  dropped. The rewrite is via an atomic rename; a live record is **never** dropped.
+- **Compaction-on-open** runs two passes. Pass 1 (unconditional, order-aware): drops a key-hash
+  only when both a `:dispose` and an `:unregister` tombstone are present AND the instance's
+  **final** record is itself a tombstone — a legally **resurrected** instance (a `:data` written
+  after the teardown) is never dropped. Records with NIL key-hash (NO_KEY topics) are never
+  dropped. Pass 2 (KEEP_LAST only, ADR 0029 §File-store compaction): for each non-NIL-key-hash
+  instance, keeps only the newest `HISTORY-DEPTH` `:data` records (sorted by `(writer-guid, sn)`,
+  ascending); lifecycle records pass through untouched. This bounds per-instance growth across
+  restarts without breaking resurrection-safety. `:keep-all` (default) skips pass 2
+  (byte-identical to prior behavior). The rewrite is via an atomic rename.
 - The crash path is fuzzed (random truncation/garbage/mid-file corruption of logs + `epochs.dat`,
   including a `(safety 0)` arm): open recovers with no crash/OOB/mis-decode and no nonce reuse.
 - **Caveat (follow-on):** file *contents* are `fdatasync`'d, but the *containing directory* is not —
@@ -702,7 +718,12 @@ no MAC'd log chain) nor metadata **confidentiality** (metadata is cleartext on d
 standard OWI on its retained-history replay, so no vendor PID is needed; the configurable
 `:relay-durability`/`:collect-durability` tiers landed; ADR 0027 §follow-on 1 RESOLVED — ADR 0028:
 live exactly-once captured dir-a N=545, dir-b N=550)**;
-KEEP_LAST-superseded + online/threshold compaction; **parent-directory
+**KEEP_LAST-superseded compaction** **(RESOLVED — ADR 0029: `%compact-topic-records` pass 2 keeps newest
+`HISTORY-DEPTH` `:data` records per non-NIL-key-hash instance on every `store-open`; `make-file-store`
+and `make-persistent-store-factory` accept `:history-kind`/`:history-depth` as factory defaults;
+`make-service-spec` carries `history-kind`/`history-depth` fields; `service-start` passes them to
+`store-open` — making the service-spec the single functional policy source in service mode;
+in-memory store applies online eviction on `store-put`; DARE intact; fuzz green; ADR 0029)**; online/threshold compaction; **parent-directory
 fsync** (durable directory entries for new files + the compaction rename across a power loss);
 **`:process`-mode PERSISTENT** (the store factory is not serialized across the process boundary —
 use `:thread` mode for the PERSISTENT tier); **log-level at-rest integrity** (a MAC'd log chain);
@@ -723,6 +744,7 @@ persistence backends (the file backend is on the same vtable, so they drop in).
 - ADR 0026 — Disk-backed PERSISTENT store + cross-restart key-epoch (file-store framing/recovery, envelope v2, group-commit, compaction, the coexistence finding)
 - ADR 0027 — Cross-vendor coexistence dedup: RTI PS uses standard OWI on replay; `:relay-durability`/`:collect-durability` tiers; honest live status; §follow-on 1 resolved by ADR 0028
 - ADR 0028 — Cross-vendor dual-relay exactly-once: live-captured convergence via logical-origin capture (dir-a N=545, dir-b N=550; resolves ADR 0027 §follow-on 1)
+- ADR 0029 — Per-instance KEEP_LAST compaction in the durability service (DDS 1.4 §2.2.3.5; file-store compaction-on-open + in-memory online eviction; service-spec via store-open; Connext M=302→2, Fast DDS M=134→2)
 - `docs/superpowers/specs/2026-06-19-durability-dare-design.md` — the DARE design spec
 - `docs/superpowers/specs/2026-06-20-durability-persistent-design.md` — the PERSISTENT design spec
 - `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md` — PID_ORIGINAL_WRITER_INFO spike
@@ -732,9 +754,10 @@ persistence backends (the file backend is on the same vtable, so they drop in).
 - `interop/durability-dare/` — DARE cross-DDS transparency captures (Connext 352 / Fast DDS 152)
 - `interop/durability-persistent/` — PERSISTENT transparency-after-restart (Connext 458 / Fast DDS 186) + the RTI-PS coexistence finding
 - `interop/durability-coexist-dedup/` — live dual-relay coexistence harness; captures dir-a (N=545) + dir-b (N=550); `analyze-capture.py --assert-converged`
-- `src/dds-disc/disc.lisp` — `sample-origins` struct slot; `src/dds-disc/dataplane.lisp` — `node-sample-origin-guid` / `node-sample-origin-sn` (logical-origin accessors) + `%record-sample-origin` setter
+- `interop/durability-keeplast/` — KEEP_LAST restart-seed cross-DDS harness (Leg 1 Connext M=302→D=2, Leg 2 Fast DDS M=134→D=2); `spike/` — `PID_KEY_HASH` presence confirmations (767 Connext + 362 Fast DDS)
+- `src/dds-disc/disc.lisp` — `sample-origins` struct slot; `capture-data-key-hash` slot (KEEP_LAST, ADR 0029); `sample-key-hashes` table; `src/dds-disc/dataplane.lisp` — `node-sample-origin-guid` / `node-sample-origin-sn` (logical-origin accessors) + `%record-sample-origin` setter; `node-sample-key-hash (node key)` → captured `PID_KEY_HASH (0x0070)` per `(writer-guid . sn)` (ADR 0029)
 - `src/dds-durability/` — service implementation (store / store-file / spec / service / runner / supervisor / main / store-encrypted)
 - `src/dds-dare/` — DARE crypto (openssl-ffi / primitives / envelope / key-provider)
 - `src/dds-pal/pal-{sbcl,clasp}.lisp` — `fsync-stream` (group-commit; NFR-PORT split: SBCL `fdatasync(2)` / Clasp `finish-output`)
-- `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-durability-file-recovery-test`, `run-dare-*`, `run-durability-collect-origin-convergence-test`)
+- `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-durability-file-recovery-test`, `run-dare-*`, `run-durability-collect-origin-convergence-test`, `run-durability-keeplast-compaction-test`, `run-durability-keeplast-cross-restart-test`, `run-durability-keeplast-service-spec-policy-test`, `run-durability-keeplast-memory-test`)
 - `src/dds-tests/pbt-test.lisp` — PID-parse fuzz arm (`fuzz-original-writer-info-parse`) + DARE open-path fuzz arm (`fuzz-dare-open-payload`) + the PERSISTENT crash-injection arm, NFR-SEC-POSTURE

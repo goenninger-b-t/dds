@@ -6,28 +6,38 @@
 (defstruct* (service-spec (:constructor %make-service-spec))
   "Discrimination unit for a durability service: domain id + topic-filter + store factory + mode.
    TOPICS is either a list of (topic-string . type-string) conses, a (lambda (topic type) …) predicate, or NIL.
-   When TOPICS is NIL (empty list), the service matches no topics — non-erroring no-match, distinct from a predicate."
-  (domain         0   :type (integer 0))
-  (topics         nil :type (or null list function))
-  (store          nil :type (or null function))
-  (mode           :thread :type (member :thread :process))
-  (qos-overrides  nil :type list)
-  (name           ""  :type string))
+   When TOPICS is NIL (empty list), the service matches no topics — non-erroring no-match, distinct from a predicate.
+   HISTORY-KIND + HISTORY-DEPTH are the DURABILITY_SERVICE history QoS (DDS 1.4 §2.2.3.5): :keep-all (default,
+   byte-identical — no compaction) or :keep-last with DEPTH >= 1 (compaction on file-store + eviction on in-memory)."
+  (domain         0         :type (integer 0))
+  (topics         nil       :type (or null list function))
+  (store          nil       :type (or null function))
+  (mode           :thread   :type (member :thread :process))
+  (qos-overrides  nil       :type list)
+  (name           ""        :type string)
+  (history-kind   :keep-all :type (member :keep-all :keep-last)) ; DURABILITY_SERVICE history_kind (DDS 1.4 §2.2.3.5)
+  (history-depth  1         :type (integer 1)))                  ; DURABILITY_SERVICE history_depth; KEEP_LAST compaction (file-store) + eviction (in-memory)
 
 (defun* make-service-spec (&key (domain 0) topics
                                 (store (lambda () (make-memory-store)))
                                 (mode :thread)
                                 (qos-overrides nil)
-                                (name ""))
+                                (name "")
+                                (history-kind  :keep-all)
+                                (history-depth 1))
     (function (&key (:domain (integer 0))
                     (:topics (or null list function))
                     (:store (or null function))
                     (:mode (member :thread :process))
                     (:qos-overrides list)
-                    (:name string))
+                    (:name string)
+                    (:history-kind  (member :keep-all :keep-last))
+                    (:history-depth (integer 1)))
               service-spec)
   "Construct a SERVICE-SPEC for DOMAIN. TOPICS is a list of (topic . type) conses or a predicate function.
    STORE is a 0-arg factory returning a DURABLE-STORE (default: in-memory). MODE is :THREAD or :PROCESS.
+   HISTORY-KIND / HISTORY-DEPTH are the DURABILITY_SERVICE history QoS (DDS 1.4 §2.2.3.5): :keep-all
+   (default, byte-identical — no compaction) or :keep-last with DEPTH >= 1 (KEEP_LAST per-instance compaction).
    QOS-OVERRIDES is a plist of optional per-service writer/transport overrides:
      :data-representation <list>  — SEDP RxO advertisement (e.g. '(:xcdr1) for foreign interop).
      :relay-durability <keyword>  — DURABILITY for the relay writer; :TRANSIENT-LOCAL (default, byte-identical
@@ -43,24 +53,32 @@
      :peers <list-of-(host . port)> — initial unicast SPDP peers.
      :multicast <boolean>           — when T enables multicast SPDP socket."
   (%make-service-spec :domain domain :topics topics :store store
-                      :mode mode :qos-overrides qos-overrides :name name))
+                      :mode mode :qos-overrides qos-overrides :name name
+                      :history-kind history-kind :history-depth history-depth))
 
-(defun* make-persistent-store-factory (&key dir key-dir)
-    (function (&key (:dir (or pathname string)) (:key-dir (or pathname string))) function)
+(defun* make-persistent-store-factory (&key dir key-dir
+                                            (history-kind :keep-all) (history-depth 1))
+    (function (&key (:dir (or pathname string)) (:key-dir (or pathname string))
+                    (:history-kind (member :keep-all :keep-last)) (:history-depth (integer 1)))
+              function)
   "Return a 0-arg store factory that produces the PERSISTENT-tier secure file-store composition.
-   The composed store is: make-encrypted-store(make-file-store(:dir DIR),
-   make-file-key-provider(:dir KEY-DIR), :epoch-dir DIR).  Pass this as the :STORE argument
+   The composed store is: make-encrypted-store(make-file-store(:dir DIR :history-kind …),
+   make-file-key-provider(:dir KEY-DIR), :epoch-dir DIR). Pass this as the :STORE argument
    to MAKE-SERVICE-SPEC to wire the PERSISTENT encrypted-on-disk tier into the service.
+   HISTORY-KIND / HISTORY-DEPTH are forwarded to the file-store for compaction-on-open
+   (DDS 1.4 §2.2.3.5): :keep-all (default, byte-identical) or :keep-last with DEPTH >= 1.
    KEY-DIR holds the ML-KEM-1024 keypair (perms enforced 0700 dir / 0600 key, checked at open,
    fail-closed by the key-provider); DIR holds the DARE-sealed topic logs + epochs.dat (DIR's own
    0700 enforcement is a follow-on, ADR 0026 §10). NOTE: :PROCESS service mode does NOT carry this
    factory across the subprocess boundary — use :THREAD mode for the PERSISTENT tier (ADR 0026 §10).
    The returned store requires STORE-OPEN before reads or writes, and STORE-CLOSE to flush
    and fsync the sealed log to disk; calling STORE-CLOSE is mandatory to avoid data loss."
-  (let ((d (uiop:ensure-directory-pathname dir))
-        (k (uiop:ensure-directory-pathname key-dir)))
+  (let ((d  (uiop:ensure-directory-pathname dir))
+        (k  (uiop:ensure-directory-pathname key-dir))
+        (hk history-kind)
+        (hd history-depth))
     (lambda ()
-      (make-encrypted-store (make-file-store :dir d)
+      (make-encrypted-store (make-file-store :dir d :history-kind hk :history-depth hd)
                             (dds.dare:make-file-key-provider :dir k)
                             :epoch-dir d))))
 

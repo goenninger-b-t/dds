@@ -225,8 +225,9 @@
                   (%collect-mark-seen! origins-data origin-guid origin-sn)
                   (let ((payload (dds.disc:node-sample node key)))
                     (when payload
-                      (store-put store topic-name origin-guid origin-sn nil :data payload)
-                      (dds.disc:publish-relay-sample node payload origin-guid origin-sn))))))
+                      (let ((kh (dds.disc:node-sample-key-hash node key))) ; wire PID_KEY_HASH (RTPS 2.5 §9.6.4.8)
+                        (store-put store topic-name origin-guid origin-sn kh :data payload)
+                        (dds.disc:publish-relay-sample node payload origin-guid origin-sn)))))))
             ;; drain lifecycle changes (dispose / unregister)
             ;; key = (writer-guid . sn); dedup on (writer-guid, sn) via origins-lc watermark
             (dolist (key (dds.disc:node-lifecycle-sns node))
@@ -340,7 +341,8 @@
                 :host "127.0.0.1"
                 :port 0
                 :peers (or peers-override '())
-                :multicast mcast-override)))
+                :multicast mcast-override
+                :capture-data-key-hash t)))
     (let ((relay-ep
            (dds.disc:add-local-writer node
                                       :topic topic-name
@@ -394,8 +396,12 @@
   (let* ((spec   (durability-service-spec service))
          (topics (%service-topics spec))
          (nodes  '()))
-    ;; open the store: for file-backed tiers this replays logs + re-derives epoch DEKs
-    (store-open (durability-service-store service))
+    ;; open the store: for file-backed tiers this replays logs + re-derives epoch DEKs;
+    ;; pass the DURABILITY_SERVICE history QoS from the spec so service-spec is the single
+    ;; functional source of compaction policy (DDS 1.4 §2.2.3.5, ADR 0029).
+    (store-open (durability-service-store service)
+                (service-spec-history-kind spec)
+                (service-spec-history-depth spec))
     (dds.pal:with-lock ((durability-service-lock service))
       (setf (durability-service-running service) t)
       ;; register all initial topic names so service-add-topic idempotency check covers them

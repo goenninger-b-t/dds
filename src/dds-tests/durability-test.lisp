@@ -2608,3 +2608,517 @@
   (%collect-origin-convergence-case t)     ; relay copy arrives first (the case that diverged before the fix)
   (%collect-origin-convergence-case nil)   ; direct copy arrives first
   t)
+
+;;; --- collect-loop stores :data under its wire key-hash (Task 2: WP-DURABILITY-KEEPLAST-COMPACTION, ADR 0029) ---
+;;; A durability service (in-memory) collects a keyed sample whose writer embeds PID_KEY_HASH in its
+;;; inline-QoS (RTPS 2.5 §9.6.4.8).  The service's collect-loop, having opted into capture-data-key-hash,
+;;; passes node-sample-key-hash to store-put so the resulting durable-record carries the wire hash — NOT NIL.
+;;; Also asserts that the two new DURABILITY_SERVICE history QoS fields (DDS 1.4 §2.2.3.5) are plumbed
+;;; correctly: :keep-all (default) + depth 1 accessible via service-spec-history-kind / -depth.
+;;; Domain 81, in-memory store, loopback unicast.
+
+(defun* run-durability-collect-keyhash-store-test ()
+    (function () t)
+  "Durability collect-loop stores :data records under the wire PID_KEY_HASH (ADR 0029, DDS 1.4 §2.2.3.5,
+   RTPS 2.5 §9.6.4.8): durable-record-key-hash equals the 16-octet hash published by the writer.
+   Also asserts service-spec-history-kind / -depth plumbing (DURABILITY_SERVICE QoS fields).
+   Domain 81, in-memory store, loopback unicast."
+  (let* ((kh16 (make-array 16 :element-type '(unsigned-byte 8) :initial-contents
+                            '(#xA1 #xA2 #xA3 #xA4 #xA5 #xA6 #xA7 #xA8
+                              #xA9 #xAA #xAB #xAC #xAD #xAE #xAF #xB0)))
+         (svc-store (dds.durability:make-memory-store))
+         (spec (dds.durability:make-service-spec
+                :domain 81
+                :topics '(("KHCollect" . "ShapeType"))
+                :store (lambda () svc-store)
+                :name "collect-keyhash-store-test"))
+         (svc (dds.durability:make-durability-service spec :store svc-store))
+         (pub-prefix (%make-test-prefix #xB1))
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 81
+                                            :host "127.0.0.1" :port 0 :multicast nil)))
+    ;; assert DURABILITY_SERVICE history QoS fields plumbed (DDS 1.4 §2.2.3.5)
+    (%check :history-kind-default
+            (eq :keep-all (dds.durability:service-spec-history-kind spec))
+            "default history-kind must be :keep-all (DDS 1.4 §2.2.3.5)")
+    (%check :history-depth-default
+            (= 1 (dds.durability:service-spec-history-depth spec))
+            "default history-depth must be 1")
+    (let* ((spec2 (dds.durability:make-service-spec
+                   :domain 81
+                   :topics '(("KHCollect2" . "ShapeType"))
+                   :history-kind :keep-last
+                   :history-depth 5
+                   :name "kl5"))
+           (kind2 (dds.durability:service-spec-history-kind spec2))
+           (dep2  (dds.durability:service-spec-history-depth spec2)))
+      (%check :history-kind-kl (eq :keep-last kind2) "explicit :keep-last must round-trip")
+      (%check :history-depth-5 (= 5 dep2) "explicit depth 5 must round-trip"))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start svc)
+           (let ((svc-node (dds.durability:durability-service-node svc)))
+             (dds.disc:add-local-writer pub-node :topic "KHCollect" :type "ShapeType"
+                                        :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                       :durability :transient-local))
+             (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+             (dds.disc:start-node pub-node)
+             (let ((pub-port (dds.disc:disc-node-port pub-node))
+                   (svc-port (dds.disc:disc-node-port svc-node)))
+               (setf (dds.disc:disc-node-peers pub-node)
+                     (list (cons "127.0.0.1" svc-port)))
+               (setf (dds.disc:disc-node-peers svc-node)
+                     (list (cons "127.0.0.1" pub-port))))
+             (loop repeat 400
+                   until (and (plusp (dds.disc:disc-node-matched-count pub-node))
+                              (plusp (dds.disc:disc-node-matched-count svc-node)))
+                   do (dds.disc:announce-participant pub-node) (dds.disc:announce-endpoints pub-node)
+                      (dds.disc:announce-participant svc-node) (dds.disc:announce-endpoints svc-node)
+                      (sleep 0.02))
+             ;; publish one keyed sample carrying PID_KEY_HASH in inline-QoS (RTPS 2.5 §9.6.4.8)
+             (dds.disc:publish-sample pub-node (%make-small-payload 7) kh16)
+             (loop repeat 120
+                   do (dds.disc:announce-participant pub-node) (dds.disc:announce-endpoints pub-node)
+                      (dds.disc:announce-participant svc-node) (dds.disc:announce-endpoints svc-node)
+                      (sleep 0.05))
+             (%await-store-count svc-store "KHCollect" 1 :retries 1200 :sleep-s 0.005)
+             (let* ((recs (dds.durability:store-get-range svc-store "KHCollect"))
+                    (rec  (first recs)))
+               (%check :collect-keyhash-stored
+                       (and rec
+                            (eq :data (dds.durability:durable-record-kind rec))
+                            (equalp (dds.durability:durable-record-key-hash rec) kh16))
+                       (format nil "record must be :data kind with key-hash=kh16 (kind=~s kh=~s)"
+                               (and rec (dds.durability:durable-record-kind rec))
+                               (and rec (dds.durability:durable-record-key-hash rec)))))))
+      (ignore-errors (dds.disc:stop-node pub-node))
+      (ignore-errors (dds.durability:service-stop svc))))
+  t)
+
+;;; --- data key-hash capture test (Task 1: WP-DURABILITY-KEEPLAST-COMPACTION, ADR 0029) ---
+;;; A writer publishes a keyed sample carrying PID_KEY_HASH in its inline-QoS (RTPS 2.5 §9.6.4.8).
+;;; A reader with capture-data-key-hash enabled receives and stores the 16-octet hash.
+;;; A second reader with the flag OFF (default) must see NIL — no hot-path allocation, byte-identical.
+
+(defun* run-durability-data-keyhash-capture-test ()
+    (function () t)
+  "node-sample-key-hash surfaces the 16-octet PID_KEY_HASH (RTPS 2.5 §9.6.4.8) from a :data sample's
+   inline-QoS when the receiving node has capture-data-key-hash enabled (ADR 0029). With the flag OFF
+   (default) no hash is stored — the hot path stays byte-identical, mem remains 0.0000. Two loopback
+   nodes on domain 80; writer publishes with a KH16 key-hash; one subscriber with capture ON, one with
+   capture OFF."
+  (let* ((pub-prefix (%make-test-prefix #xD1))
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 80
+                                            :host "127.0.0.1" :port 0 :multicast nil))
+         (rdr-on-prefix (%make-test-prefix #xE2))
+         (rdr-on (dds.disc:make-disc-node :guid-prefix rdr-on-prefix :domain 80
+                                          :host "127.0.0.1" :port 0 :multicast nil
+                                          :capture-data-key-hash t))
+         (rdr-off-prefix (%make-test-prefix #xF3))
+         (rdr-off (dds.disc:make-disc-node :guid-prefix rdr-off-prefix :domain 80
+                                           :host "127.0.0.1" :port 0 :multicast nil))
+         (kh16 (make-array 16 :element-type '(unsigned-byte 8) :initial-contents
+                           '(#x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08
+                             #x09 #x0A #x0B #x0C #x0D #x0E #x0F #x10))))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer pub-node :topic "KHSquare" :type "ShapeType"
+                                      :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                     :durability :transient-local))
+           (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+           (dds.disc:start-node pub-node)
+           (dds.disc:add-local-reader rdr-on :topic "KHSquare" :type "ShapeType"
+                                      :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                     :durability :transient-local))
+           (dds.disc:enable-subscriber rdr-on)
+           (dds.disc:start-node rdr-on)
+           (dds.disc:add-local-reader rdr-off :topic "KHSquare" :type "ShapeType"
+                                      :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                     :durability :transient-local))
+           (dds.disc:enable-subscriber rdr-off)
+           (dds.disc:start-node rdr-off)
+           (let ((pp (dds.disc:disc-node-port pub-node))
+                 (on-p (dds.disc:disc-node-port rdr-on))
+                 (off-p (dds.disc:disc-node-port rdr-off)))
+             (setf (dds.disc:disc-node-peers pub-node)  (list (cons "127.0.0.1" on-p)
+                                                               (cons "127.0.0.1" off-p)))
+             (setf (dds.disc:disc-node-peers rdr-on)    (list (cons "127.0.0.1" pp)))
+             (setf (dds.disc:disc-node-peers rdr-off)   (list (cons "127.0.0.1" pp))))
+           (loop repeat 400
+                 until (and (>= (dds.disc:disc-node-matched-count pub-node) 2)
+                            (plusp (dds.disc:disc-node-matched-count rdr-on))
+                            (plusp (dds.disc:disc-node-matched-count rdr-off)))
+                 do (dds.disc:announce-participant pub-node) (dds.disc:announce-endpoints pub-node)
+                    (dds.disc:announce-participant rdr-on)   (dds.disc:announce-endpoints rdr-on)
+                    (dds.disc:announce-participant rdr-off)  (dds.disc:announce-endpoints rdr-off)
+                    (sleep 0.02))
+           (dds.disc:publish-sample pub-node (%make-small-payload 42) kh16)
+           (loop repeat 200
+                 until (and (plusp (dds.disc:node-sample-count rdr-on))
+                            (plusp (dds.disc:node-sample-count rdr-off)))
+                 do (dds.disc:announce-participant pub-node) (dds.disc:announce-endpoints pub-node)
+                    (dds.disc:announce-participant rdr-on)   (dds.disc:announce-endpoints rdr-on)
+                    (dds.disc:announce-participant rdr-off)  (dds.disc:announce-endpoints rdr-off)
+                    (sleep 0.02))
+           ;; capture-ON reader: key hash must equal the published KH16
+           (let ((key-on (first (dds.disc:node-sample-sns rdr-on))))
+             (%check :keyhash-capture-on
+                     (equalp (dds.disc:node-sample-key-hash rdr-on key-on) kh16)
+                     "capture-enabled reader must record the 16-octet PID_KEY_HASH from the :data sample"))
+           ;; capture-OFF reader (default): node-sample-key-hash must return NIL (byte-identical, no alloc)
+           (let ((key-off (first (dds.disc:node-sample-sns rdr-off))))
+             (%check :keyhash-capture-off
+                     (null (dds.disc:node-sample-key-hash rdr-off key-off))
+                     "capture-disabled reader must return NIL for node-sample-key-hash")))
+      (ignore-errors (dds.disc:stop-node pub-node))
+      (ignore-errors (dds.disc:stop-node rdr-on))
+      (ignore-errors (dds.disc:stop-node rdr-off))))
+  t)
+
+;;; --- in-memory store online per-instance KEEP_LAST eviction (WP-DURABILITY-KEEPLAST-COMPACTION) ---
+;;; store-open policy stash drives %mem-put eviction at put time.
+;;; Contract: after inserting a :data record for a non-NIL key-hash under :keep-last D,
+;;; if the instance now has >D :data records, remove the lowest-SN :data record(s) until D remain.
+;;; NIL-key-hash records and lifecycle (:dispose/:unregister) records are NEVER evicted.
+;;; :keep-all (default) → no eviction → byte-identical to today.
+
+(defun* run-durability-keeplast-memory-test ()
+    (function () t)
+  "Online per-instance KEEP_LAST eviction in the in-memory store (ADR 0029, DDS 1.4 §2.2.3.5):
+   policy driven by store-open stash; :data records for non-NIL key-hash evicted to depth;
+   NIL-key-hash records never evicted; distinct instances independent; :keep-all byte-identical."
+  (let* ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xAA))
+         (kh1  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xBB))
+         (kh2  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xCC))
+         (p    (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (topic "KLMem"))
+    ;; --- :keep-last 2 via store-open (the service-spec channel, WP-DURABILITY-KEEPLAST-COMPACTION) ---
+    (let ((s (dds.durability:make-memory-store)))
+      (dds.durability:store-open s :keep-last 2)
+      ;; put 5 :data records for keyed instance kh1
+      (dotimes (i 5)
+        (dds.durability:store-put s topic guid (1+ i) kh1 :data (funcall p (list (1+ i)))))
+      ;; assert exactly 2 remain for kh1 (the 2 highest SNs: 4 and 5)
+      (let* ((recs  (dds.durability:store-get-range s topic))
+             (kh1-data (remove-if-not (lambda (r)
+                                        (and (equalp kh1 (dds.durability:durable-record-key-hash r))
+                                             (eq :data (dds.durability:durable-record-kind r))))
+                                      recs))
+             (sns   (sort (mapcar #'dds.durability:durable-record-sn kh1-data) #'<)))
+        (%check :klm-count2
+                (= 2 (length kh1-data))
+                (format nil "KEEP_LAST 2: expected 2 data records for kh1, got ~d" (length kh1-data)))
+        (%check :klm-sns
+                (equal '(4 5) sns)
+                (format nil "KEEP_LAST 2: expected SNs (4 5), got ~s" sns))))
+    ;; --- NIL-key-hash instance: all 3 records must survive (never evicted) ---
+    (let ((s2 (dds.durability:make-memory-store)))
+      (dds.durability:store-open s2 :keep-last 2)
+      (dotimes (i 3)
+        (dds.durability:store-put s2 topic guid (1+ i) nil :data (funcall p (list (1+ i)))))
+      (%check :klm-nil-kh-kept
+              (= 3 (dds.durability:store-count s2 topic))
+              (format nil "NIL-key-hash records must never be evicted; expected 3, got ~d"
+                      (dds.durability:store-count s2 topic))))
+    ;; --- two distinct key-hash instances are independent ---
+    (let ((s3 (dds.durability:make-memory-store)))
+      (dds.durability:store-open s3 :keep-last 2)
+      ;; put 3 :data records for kh1 (should evict to 2)
+      (dotimes (i 3)
+        (dds.durability:store-put s3 topic guid (1+ i) kh1 :data (funcall p (list (1+ i)))))
+      ;; put 3 :data records for kh2 (independently evicted to 2)
+      (dotimes (i 3)
+        (dds.durability:store-put s3 topic guid (+ 10 i) kh2 :data (funcall p (list (+ 10 i)))))
+      (let* ((recs (dds.durability:store-get-range s3 topic))
+             (kh1d (remove-if-not (lambda (r) (and (equalp kh1 (dds.durability:durable-record-key-hash r))
+                                                   (eq :data (dds.durability:durable-record-kind r))))
+                                  recs))
+             (kh2d (remove-if-not (lambda (r) (and (equalp kh2 (dds.durability:durable-record-key-hash r))
+                                                   (eq :data (dds.durability:durable-record-kind r))))
+                                  recs)))
+        (%check :klm-indep-kh1
+                (= 2 (length kh1d))
+                (format nil "independent kh1: expected 2, got ~d" (length kh1d)))
+        (%check :klm-indep-kh2
+                (= 2 (length kh2d))
+                (format nil "independent kh2: expected 2, got ~d" (length kh2d)))))
+    ;; --- :keep-all (default, no store-open call) keeps all 5 ---
+    (let ((s4 (dds.durability:make-memory-store)))
+      (dotimes (i 5)
+        (dds.durability:store-put s4 topic guid (1+ i) kh1 :data (funcall p (list (1+ i)))))
+      (%check :klm-keepall
+              (= 5 (dds.durability:store-count s4 topic))
+              (format nil "KEEP_ALL: expected all 5 records, got ~d"
+                      (dds.durability:store-count s4 topic))))
+    t))
+
+;;; --- per-instance KEEP_LAST compaction unit test (WP-DURABILITY-KEEPLAST-COMPACTION) ---
+;;; One keyed instance K with 5 :data records (SN 1-5, same key-hash), a NIL-key-hash
+;;; record, and a settled instance (dispose+unregister). Under :keep-last 2: K keeps
+;;; only its 2 highest SNs (4,5); NIL-key-hash record kept; settled instance dropped.
+;;; Under :keep-all (and no-arg default): byte-identical to settled-only result.
+
+(defun* run-durability-keeplast-compaction-test ()
+    (function () t)
+  "Unit test for %compact-topic-records KEEP_LAST per-instance compaction.
+   Verifies: newest-depth :data records kept per non-NIL key-hash; NIL-key-hash
+   records untouched; settled instances dropped; :keep-all byte-identical to no-arg call."
+  (let* ((guid  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xAA))
+         (kh    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xBB))  ; instance K
+         (kh2   (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xCC))  ; settled instance
+         (p     (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         ;; 5 :data records for instance K (SN 1..5, same key-hash)
+         (k1    (dds.durability::make-durable-record :topic "T" :writer-guid guid :sn 1 :key-hash kh
+                                                     :kind :data    :payload (funcall p '(1))))
+         (k2    (dds.durability::make-durable-record :topic "T" :writer-guid guid :sn 2 :key-hash kh
+                                                     :kind :data    :payload (funcall p '(2))))
+         (k3    (dds.durability::make-durable-record :topic "T" :writer-guid guid :sn 3 :key-hash kh
+                                                     :kind :data    :payload (funcall p '(3))))
+         (k4    (dds.durability::make-durable-record :topic "T" :writer-guid guid :sn 4 :key-hash kh
+                                                     :kind :data    :payload (funcall p '(4))))
+         (k5    (dds.durability::make-durable-record :topic "T" :writer-guid guid :sn 5 :key-hash kh
+                                                     :kind :data    :payload (funcall p '(5))))
+         ;; NIL-key-hash record (NO_KEY topic — must never be compacted)
+         (nil-r (dds.durability::make-durable-record :topic "T" :writer-guid guid :sn 6 :key-hash nil
+                                                     :kind :data    :payload (funcall p '(99))))
+         ;; settled instance kh2: dispose + unregister (must be dropped by the settled-drop pass)
+         (d2    (dds.durability::make-durable-record :topic "T" :writer-guid guid :sn 7 :key-hash kh2
+                                                     :kind :dispose    :payload (funcall p '())))
+         (u2    (dds.durability::make-durable-record :topic "T" :writer-guid guid :sn 8 :key-hash kh2
+                                                     :kind :unregister :payload (funcall p '())))
+         (recs  (list k1 k2 k3 k4 k5 nil-r d2 u2)))
+    ;; --- :keep-last 2 ---
+    (let* ((kept2 (dds.durability::%compact-topic-records recs :keep-last 2))
+           (kh-data (remove-if-not (lambda (r)
+                                     (and (equalp kh (dds.durability:durable-record-key-hash r))
+                                          (eq :data (dds.durability:durable-record-kind r))))
+                                   kept2))
+           (sns  (sort (mapcar #'dds.durability:durable-record-sn kh-data) #'<)))
+      (%check :keeplast-depth2-count
+              (= 2 (length kh-data))
+              (format nil "KEEP_LAST 2: instance K must have exactly 2 data records; got ~d" (length kh-data)))
+      (%check :keeplast-depth2-sns
+              (equal '(4 5) sns)
+              (format nil "KEEP_LAST 2: instance K must keep SNs (4 5); got ~s" sns))
+      ;; NIL-key-hash record must survive
+      (%check :keeplast-nil-kh-kept
+              (member nil-r kept2 :test #'eq)
+              "KEEP_LAST: NIL-key-hash record must be kept untouched")
+      ;; settled instance kh2 must be gone
+      (%check :keeplast-settled-dropped
+              (and (not (member d2 kept2 :test #'eq))
+                   (not (member u2 kept2 :test #'eq)))
+              "KEEP_LAST: settled instance must be dropped"))
+    ;; --- :keep-all byte-identical to no-arg call ---
+    (let* ((ka  (dds.durability::%compact-topic-records recs :keep-all))
+           (df  (dds.durability::%compact-topic-records recs)))
+      (%check :keeplast-keepall-identical
+              (and (= (length ka) (length df))
+                   (every #'eq ka df))
+              (format nil "KEEP_ALL must be byte-identical to no-arg call; got ~d vs ~d records"
+                      (length ka) (length df))))
+    t))
+
+;;; --- KEEP_LAST cross-restart test: compaction-on-open + DARE intact ---
+;;; Write M :data records for one keyed instance to a file-backed (DARE) store.
+;;; Close. Reopen via a service-spec with :keep-last D. Assert the reopened store
+;;; holds exactly D records for the instance (compaction-on-open ran) AND a record
+;;; can be retrieved (DARE decrypt succeeded). Domain 118.
+
+(defun* run-durability-keeplast-cross-restart-test ()
+    (function () t)
+  "KEEP_LAST cross-restart: write M :data records; reopen with :keep-last D; assert
+   exactly D records remain per instance; DARE envelope decrypts (ADR 0029)."
+  (unless (dds.dare:dare-available-p)
+    (format t "~&  [keeplast-cross-restart] SKIP — OpenSSL >= 3.5 not available~%")
+    (return-from run-durability-keeplast-cross-restart-test t))
+  (let* ((m       6)
+         (d       2)
+         (topic   "KLSquare")
+         (guid    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xD5))
+         (kh      (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xE6))
+         (p       (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (tmp-dir (uiop:merge-pathnames*
+                   (make-pathname :directory
+                                  (list :relative (format nil "dds-kl-restart-~a" (get-universal-time))))
+                   (uiop:temporary-directory)))
+         (key-dir (uiop:merge-pathnames*
+                   (make-pathname :directory '(:relative "keys"))
+                   tmp-dir)))
+    (unwind-protect
+         (progn
+           ;; --- write M samples to the encrypted file store ---
+           (let* ((store1  (dds.durability:make-file-store
+                            :dir tmp-dir
+                            :history-kind :keep-last
+                            :history-depth d))
+                  (kp      (dds.dare:make-file-key-provider :dir key-dir))
+                  (enc-st  (dds.durability:make-encrypted-store store1 kp :epoch-dir tmp-dir)))
+             (dds.durability:store-open enc-st)
+             (dotimes (i m)
+               (dds.durability:store-put enc-st topic guid (1+ i) kh :data (funcall p (list (1+ i)))))
+             (%check :kl-restart-write
+                     (= m (dds.durability:store-count enc-st topic))
+                     (format nil "before close: expected ~d records, got ~d"
+                             m (dds.durability:store-count enc-st topic)))
+             (dds.durability:store-close enc-st))
+           ;; --- reopen with :keep-last D → compaction-on-open keeps only D newest ---
+           (let* ((store2 (dds.durability:make-file-store
+                           :dir tmp-dir
+                           :history-kind :keep-last
+                           :history-depth d))
+                  (kp2    (dds.dare:make-file-key-provider :dir key-dir))
+                  (enc-st2 (dds.durability:make-encrypted-store store2 kp2 :epoch-dir tmp-dir)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:store-open enc-st2)
+                    (%check :kl-restart-count
+                            (= d (dds.durability:store-count enc-st2 topic))
+                            (format nil "after :keep-last ~d reopen: expected ~d records, got ~d"
+                                    d d (dds.durability:store-count enc-st2 topic)))
+                    ;; DARE decrypt check: records must be accessible (non-empty payload)
+                    (let ((recs (dds.durability:store-get-range enc-st2 topic)))
+                      (%check :kl-restart-dare-intact
+                              (and (= d (length recs))
+                                   (every (lambda (r)
+                                            (plusp (length (dds.durability:durable-record-payload r))))
+                                          recs))
+                              (format nil "DARE decrypt: expected ~d records with non-empty payload; got ~s"
+                                      d (mapcar (lambda (r)
+                                                  (length (dds.durability:durable-record-payload r)))
+                                                recs)))))
+               (ignore-errors (dds.durability:store-close enc-st2)))))
+      (ignore-errors
+       (when (uiop:directory-exists-p tmp-dir)
+         (uiop:delete-directory-tree tmp-dir :validate t))))
+    t))
+
+;;; --- service-spec drives store-open compaction policy (WP-DURABILITY-KEEPLAST-COMPACTION) ---
+;;; store-open now accepts optional HISTORY-KIND and HISTORY-DEPTH that override the factory default.
+;;; service-start passes these from the service-spec. This test verifies the end-to-end plumbing:
+;;; write M samples with factory default (no policy); reopen via store-open with :keep-last D override;
+;;; assert exactly D records remain (override took effect, not the factory default :keep-all).
+
+(defun* run-durability-keeplast-service-spec-policy-test ()
+    (function () t)
+  "store-open history-kind/depth args drive compaction-on-open; service-start wires service-spec
+   policy end-to-end (ADR 0029, DDS 1.4 §2.2.3.5):
+   Part A (direct store-open): write M records with :keep-all factory; reopen with :keep-last D
+   override; assert exactly D records survive (override wins over factory default).
+   Part B (service-start end-to-end): write M records to a pre-seeded file store; build a
+   durability-service whose spec carries :keep-last D; call service-start; assert the service
+   store holds exactly D records (service-start called store-open with the spec policy,
+   compaction ran, and the service-spec is the single functional source of the KEEP_LAST policy)."
+  (let* ((m       5)
+         (d       2)
+         (topic   "KLSpecPolicy")
+         (guid    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xF1))
+         (kh      (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xF2))
+         (p       (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (tmp-dir (uiop:merge-pathnames*
+                   (make-pathname :directory
+                                  (list :relative (format nil "dds-kl-policy-~a" (get-universal-time))))
+                   (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           ;; Part A: write M samples to a file-store built with default :keep-all (no compaction on close)
+           (let ((store1 (dds.durability:make-file-store :dir tmp-dir :history-kind :keep-all)))
+             (dds.durability:store-open store1)
+             (dotimes (i m)
+               (dds.durability:store-put store1 topic guid (1+ i) kh :data (funcall p (list (1+ i)))))
+             (%check :policy-write-all
+                     (= m (dds.durability:store-count store1 topic))
+                     (format nil "before close: expected ~d records, got ~d"
+                             m (dds.durability:store-count store1 topic)))
+             (dds.durability:store-close store1))
+           ;; reopen with store-open :keep-last D override — factory is :keep-all but override wins
+           (let ((store2 (dds.durability:make-file-store :dir tmp-dir :history-kind :keep-all)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:store-open store2 :keep-last d)
+                    (%check :policy-override-count
+                            (= d (dds.durability:store-count store2 topic))
+                            (format nil "after :keep-last ~d override: expected ~d records, got ~d"
+                                    d d (dds.durability:store-count store2 topic)))
+                    (let* ((recs (dds.durability:store-get-range store2 topic))
+                           (sns  (sort (mapcar #'dds.durability:durable-record-sn recs) #'<)))
+                      (%check :policy-override-sns
+                              (equal '(4 5) sns)
+                              (format nil "override :keep-last ~d must retain SNs (4 5); got ~s"
+                                      d sns))))
+               (ignore-errors (dds.durability:store-close store2))))
+           ;; verify no-arg store-open uses factory default (:keep-all = no additional compaction)
+           (let ((store3 (dds.durability:make-file-store :dir tmp-dir :history-kind :keep-all)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:store-open store3)
+                    ;; store3 opens the already-compacted log (2 records from previous reopen)
+                    (%check :policy-factory-default
+                            (= d (dds.durability:store-count store3 topic))
+                            (format nil "no-arg reopen must keep ~d (already-compacted) records; got ~d"
+                                    d (dds.durability:store-count store3 topic))))
+               (ignore-errors (dds.durability:store-close store3)))))
+      (ignore-errors
+       (when (uiop:directory-exists-p tmp-dir)
+         (uiop:delete-directory-tree tmp-dir :validate t))))
+    ;; Part B: end-to-end service-start wiring — service-spec is the single source of compaction policy.
+    ;; Pre-seed a fresh dir with M records (all :keep-all, no compaction on close); build a
+    ;; durability-service with spec :keep-last D; call service-start; service-start calls store-open
+    ;; with (service-spec-history-kind spec) = :keep-last and (service-spec-history-depth spec) = D;
+    ;; compaction-on-open reduces the store to D records. Assert store-count = D (not M).
+    (let* ((svc-topic "KLSvcPolicy")
+           (svc-guid  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xF3))
+           (svc-kh    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xF4))
+           (p2        (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+           (svc-dir   (uiop:merge-pathnames*
+                       (make-pathname :directory
+                                      (list :relative (format nil "dds-kl-svc-policy-~a" (get-universal-time))))
+                       (uiop:temporary-directory))))
+      (unwind-protect
+           (progn
+             ;; pre-seed: write M records with :keep-all factory (all M records on disk)
+             (let ((seed-store (dds.durability:make-file-store :dir svc-dir :history-kind :keep-all)))
+               (dds.durability:store-open seed-store)
+               (dotimes (i m)
+                 (dds.durability:store-put seed-store svc-topic svc-guid (1+ i) svc-kh
+                                           :data (funcall p2 (list (1+ i)))))
+               (%check :svc-policy-seed
+                       (= m (dds.durability:store-count seed-store svc-topic))
+                       (format nil "pre-seed: expected ~d records, got ~d"
+                               m (dds.durability:store-count seed-store svc-topic)))
+               (dds.durability:store-close seed-store))
+             ;; build spec with :keep-last D — this is the policy that service-start must pass to store-open
+             (let* ((spec (dds.durability:make-service-spec
+                           :domain 119
+                           :topics (list (cons svc-topic "ShapeType"))
+                           :history-kind :keep-last
+                           :history-depth d
+                           :store (lambda ()
+                                    (dds.durability:make-file-store :dir svc-dir
+                                                                     :history-kind :keep-all))
+                           :name "kl-svc-policy-test"))
+                    (svc (dds.durability:make-durability-service spec)))
+               (unwind-protect
+                    (progn
+                      ;; service-start calls (store-open store :keep-last D) — driven by spec
+                      (dds.durability:service-start svc)
+                      ;; compaction-on-open must have run: M records → D records
+                      (%check :svc-policy-after-start
+                              (= d (dds.durability:store-count
+                                    (dds.durability:durability-service-store svc) svc-topic))
+                              (format nil "service-start :keep-last ~d must compact M=~d to D=~d; got ~d"
+                                      d m d
+                                      (dds.durability:store-count
+                                       (dds.durability:durability-service-store svc) svc-topic)))
+                      ;; SNs retained must be the D newest (4 and 5 for M=5, D=2)
+                      (let* ((recs (dds.durability:store-get-range
+                                    (dds.durability:durability-service-store svc) svc-topic))
+                             (sns  (sort (mapcar #'dds.durability:durable-record-sn recs) #'<)))
+                        (%check :svc-policy-sns
+                                (equal '(4 5) sns)
+                                (format nil "service-start :keep-last ~d must retain SNs (4 5); got ~s"
+                                        d sns))))
+                 (ignore-errors (dds.durability:service-stop svc)))))
+        (ignore-errors
+         (when (uiop:directory-exists-p svc-dir)
+           (uiop:delete-directory-tree svc-dir :validate t)))))
+    t))

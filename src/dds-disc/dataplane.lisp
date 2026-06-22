@@ -981,15 +981,33 @@
    pending + signalling the controller, whose scheduler thread does the RATE-PACED push off the caller
    thread (an associated controller supersedes both batch and the per-node async sender for that writer).
    KEY-HASH (WP-KEEPLAST, ADR 0019, DDS 1.4 §2.2.3.18) is the sample's 16-octet instance handle threaded
-   onto the data CacheChange (writer-write) for per-instance KEEP_LAST eviction; NIL (default) is unchanged."
-  (when (eq :timeout (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload key-hash))
-    (return-from publish-sample :timeout))   ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
+   onto the data CacheChange (writer-write) for per-instance KEEP_LAST eviction; NIL (default) is unchanged.
+   When KEY-HASH is non-nil and exactly 16 octets, a PID_KEY_HASH inline-QoS block is also built
+   (%build-key-hash-iq) and carried on the DATA submessage (RTPS 2.5 §9.6.4.8), mirroring the wire
+   behaviour of Connext 7.3.1 and Fast DDS 3.6.1 on keyed writes (ADR 0029). NIL KEY-HASH = byte-identical."
+  (let ((iq (when (and key-hash (= 16 (length key-hash)))
+              (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16)))))))
+    (when (eq :timeout (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload key-hash iq))
+      (return-from publish-sample :timeout)))  ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
   (cond
     ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))   ; WP-ASYNC-FLOW: paced async send
     ((disc-node-async-thread node) (%async-signal node))   ; WP-ASYNC: hand off to the sender thread
     ((>= (incf (disc-node-batch-pending node)) (disc-node-batch-max-samples node)) (flush-batch node))
     (t nil))   ; batch size trigger not reached: defer to the next flush (cadence or fill)
   t)
+
+(defun* %build-key-hash-iq (key-hash)
+    (function ((simple-array (unsigned-byte 8) (16))) (simple-array (unsigned-byte 8) (*)))
+  "Build a 24-octet PID_SENTINEL-terminated inline-QoS block carrying PID_KEY_HASH for DATA-with-payload
+   (RTPS 2.5 §9.6.4.8): 4 bytes PID header + 16 bytes hash + 4 bytes PID_SENTINEL = 24. Mirrors what
+   Connext 7.3.1 and Fast DDS 3.6.1 emit on every keyed write() call (spike 2026-06-21). Off the hot path —
+   only publish-sample callers that opt in via a non-nil key-hash call this. Control-plane (ADR 0029)."
+  (let* ((scratch (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0))
+         (buf (dds.core.buffer:octet-buffer-over scratch))
+         (mc (dds.core.buffer:cursor buf :endianness :little)))
+    (dds.rtps.message:write-parameter mc dds.rtps.message:+pid-key-hash+ key-hash 0 16)
+    (dds.rtps.message:write-parameter-sentinel mc)
+    scratch))
 
 (defun* %build-original-writer-info-iq (guid sn)
     (function ((simple-array (unsigned-byte 8) (16)) (integer 0))
@@ -1198,6 +1216,28 @@
           (cons (copy-seq eff-guid) eff-sn)))
   t)
 
+(defun* %record-sample-key-hash (node wire-guid sn key-hash)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer
+              (or null (simple-array (unsigned-byte 8) (*)))) t)
+  "Record the wire PID_KEY_HASH (RTPS 2.5 §9.6.4.8) of the :data sample stored under (WIRE-GUID, SN) when
+   one was captured (a keyed sample whose peer sent it inline; the durability collect node opts in via
+   capture-data-key-hash). NIL or non-16-octet -> store nothing (the store treats absent key-hash as
+   'unknown instance', never compacted). Caller holds the node lock. Control-plane (relay store, ADR 0029)."
+  (when (and key-hash (= 16 (length key-hash)))
+    (setf (gethash sn (%inner-table (disc-node-sample-key-hashes node) wire-guid))
+          (coerce key-hash '(simple-array (unsigned-byte 8) (16)))))
+  t)
+
+(defun* node-sample-key-hash (node key)
+    (function (disc-node cons) (or null (simple-array (unsigned-byte 8) (16))))
+  "The captured 16-octet wire PID_KEY_HASH (RTPS 2.5 §9.6.4.8) of the :data sample at composite KEY
+   (a (GUID . SN) cons), or NIL when none was captured (capture not enabled, or the sample carried no
+   inline PID_KEY_HASH). A durability relay uses THIS as the per-instance handle for KEEP_LAST compaction
+   (ADR 0029)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((inner (gethash (car key) (disc-node-sample-key-hashes node))))
+      (and inner (gethash (cdr key) inner)))))
+
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0017.
 (defstruct* (zc-loan-marker (:constructor %make-zc-loan-marker))
   "WP-FLATDATA-ZC-LOAN unresolved ZC-ref marker (FR-PF-3/4, R6, ADR 0017): the receiver thread stores THIS
@@ -1328,10 +1368,12 @@
       (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))))
   t)
 
-(defun* %deliver-user-sample (node writer-id sn vec src-prefix effective-guid effective-sn)
+(defun* %deliver-user-sample (node writer-id sn vec src-prefix effective-guid effective-sn
+                             &optional key-hash)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
               (simple-array (unsigned-byte 8) (12))
-              (simple-array (unsigned-byte 8) (16)) integer) t)
+              (simple-array (unsigned-byte 8) (16)) integer
+              &optional (or null (simple-array (unsigned-byte 8) (*)))) t)
   "Feed a complete user sample VEC (SN from WRITER-ID at SRC-PREFIX) to the reliable reader, record it
    under the 2-level (source-GUID -> SN) store (payload + writer EntityId for the S2 writers-set + full
    source GUID for S1 EXCLUSIVE ownership arbitration), then fire ON-SAMPLE outside the node lock
@@ -1339,7 +1381,9 @@
    alloc (NFR-MEM) and stops two writers sharing EntityId 0x102 from aliasing in the SN space
    (§8.3.5.4); ONE %source-guid per sample is reused for the reliable-reader proxy key AND the three inner tables.
    EFFECTIVE-GUID/EFFECTIVE-SN are the logical-origin GUID+SN for dedup (orig-guid/orig-sn on the relay
-   path; wire GUID+SN on the direct path) per RTPS 2.5 §8.3.5.4."
+   path; wire GUID+SN on the direct path) per RTPS 2.5 §8.3.5.4.
+   KEY-HASH (ADR 0029, RTPS 2.5 §9.6.4.8): the captured wire PID_KEY_HASH; NIL unless the node has
+   capture-data-key-hash set. Stored via %record-sample-key-hash inside the lock."
   (let ((guid (%source-guid src-prefix writer-id)))
     ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too)
     (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn vec)
@@ -1350,17 +1394,19 @@
         (setf (gethash sn (%inner-table (disc-node-samples node) guid)) vec
               (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
               (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
-        (%record-sample-origin node guid sn effective-guid effective-sn))
+        (%record-sample-origin node guid sn effective-guid effective-sn)
+        (%record-sample-key-hash node guid sn key-hash))
       (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))))
   t)
 
 (defun* %on-user-data (node writer-id sn buf poff plen src-prefix
-                       &optional orig-guid orig-sn)
+                       &optional orig-guid orig-sn key-hash)
     (function (disc-node (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)
               (simple-array (unsigned-byte 8) (12))
               &optional
               (or null (simple-array (unsigned-byte 8) (16)))
-              (or null integer)) t)
+              (or null integer)
+              (or null (simple-array (unsigned-byte 8) (*)))) t)
   "Reader side: deliver the DATA SerializedPayload at BUF[poff,poff+plen). WP-ZEROCOPY (FR-PF-3, ADR
    0014): when this node has a ZC pool (which exists iff *zerocopy-enabled* was set at make-disc-node —
    the gate is the SLOT, not the special, because this runs on the receiver thread where a dynamic
@@ -1377,7 +1423,8 @@
    would free the slot before the app's later read (use-after-free). A non-loan-capable reader keeps the shipped
    resolve-copy-release path (%zc-try-resolve), byte-unchanged.
    ORIG-GUID/ORIG-SN: from PID_ORIGINAL_WRITER_INFO (§8.3.5.4) on relay-forwarded samples; NIL on direct
-   path. The effective logical-origin (orig-guid or wire-guid, orig-sn or wire-sn) is computed here and
+   path. KEY-HASH: the wire PID_KEY_HASH (RTPS 2.5 §9.6.4.8) when the node has capture-data-key-hash set;
+   NIL otherwise. The effective logical-origin (orig-guid or wire-guid, orig-sn or wire-sn) is computed here and
    threaded into %deliver-user-sample/%deliver-user-marker for the dedup gate."
   ;; effective-guid/sn: relay path uses PID values; direct path uses the wire writer GUID + SN
   (let* ((eff-guid (or orig-guid (%source-guid src-prefix writer-id)))
@@ -1392,10 +1439,10 @@
       ((eq zc :not-a-ref)                                           ; normal payload (or ZC off)
        (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
          (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
-         (%deliver-user-sample node writer-id sn vec src-prefix eff-guid eff-sn)))
+         (%deliver-user-sample node writer-id sn vec src-prefix eff-guid eff-sn key-hash)))
       ((zc-loan-marker-p zc)
        (%deliver-user-marker node writer-id sn zc src-prefix eff-guid eff-sn)) ; loan-capable: the unresolved marker
-      (t (%deliver-user-sample node writer-id sn zc src-prefix eff-guid eff-sn))) ; resolved ZC payload (non-loan-capable)
+      (t (%deliver-user-sample node writer-id sn zc src-prefix eff-guid eff-sn key-hash))) ; resolved ZC payload (non-loan-capable)
     t))
 
 (defun* %on-user-heartbeat (node c flags src-prefix)
@@ -1568,8 +1615,8 @@
    add-local-reader."
   (setf (disc-node-user-reader node) (dds.rtps.reliable:make-rtps-reader))
   (setf (disc-node-on-data node)
-        (lambda (wid sn buf poff plen src-prefix &optional og os)
-          (%on-user-data node wid sn buf poff plen src-prefix og os)))
+        (lambda (wid sn buf poff plen src-prefix &optional og os kh)
+          (%on-user-data node wid sn buf poff plen src-prefix og os kh)))
   (setf (disc-node-on-lifecycle node)
         (lambda (wid sn kind kh sf src-prefix) (%on-user-lifecycle node wid sn kind kh sf src-prefix)))
   (setf (disc-node-on-heartbeat node)

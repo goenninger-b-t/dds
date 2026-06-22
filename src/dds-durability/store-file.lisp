@@ -342,20 +342,20 @@
 
 ;;; Compaction: drop settled (dispose+unregister both present) instances.
 
-(defun* %compact-topic-records (records)
-    (function (list) list)
-  "Filter RECORDS keeping only live entries; a settled instance is dropped entirely.
-   An instance (non-NIL key-hash) is SETTLED iff it has BOTH a :dispose AND an :unregister
-   tombstone AND its FINAL record (highest append position) is a tombstone — i.e. no live :data
-   was written after the teardown. RECORDS is in append order, so the last assignment to
-   LAST-KIND per key-hash is that key's most-recent change. This is order-aware so a legally
-   RESURRECTED instance (dispose+unregister then a later :data) is NEVER dropped — the
-   order-insensitive set-membership form would have lost the resurrected live data.
-   Records with NIL key-hash are NEVER dropped. Conservative: any doubt keeps the data."
+(defun* %compact-topic-records (records &optional (history-kind :keep-all) (history-depth 1))
+    (function (list &optional (member :keep-all :keep-last) (integer 1)) list)
+  "Filter RECORDS keeping only live entries.
+   Pass 1 (unconditional): drop settled instances (dispose+unregister both present AND the
+   FINAL record is a tombstone; order-aware so a RESURRECTED instance is never dropped).
+   Records with NIL key-hash are NEVER dropped. Conservative: any doubt keeps the data.
+   Pass 2 (HISTORY-KIND :keep-last only): for each non-NIL-key-hash instance, keep only the
+   HISTORY-DEPTH :data records sorting HIGHEST by %record-guid-sn< (drop older superseded ones).
+   Lifecycle records (:dispose/:unregister) and NIL-key-hash records pass through untouched.
+   Append order is preserved in the output. :keep-all skips pass 2 (byte-identical to no-arg call)."
   (let ((dispose-set  (make-hash-table :test #'equalp))
         (unreg-set    (make-hash-table :test #'equalp))
         (last-kind    (make-hash-table :test #'equalp)))
-    ;; first pass (append order): tombstone presence + the FINAL kind per key-hash
+    ;; pass 1a (append order): tombstone presence + the FINAL kind per key-hash
     (dolist (r records)
       (let ((kh (durable-record-key-hash r)))
         (when kh
@@ -364,16 +364,40 @@
             (:dispose    (setf (gethash kh dispose-set)  t))
             (:unregister (setf (gethash kh unreg-set)    t))
             (otherwise   nil)))))
-    ;; second pass: drop a record only if its key-hash is settled (both tombstones AND
-    ;; the instance's final change is itself a tombstone — never drop a resurrected instance)
-    (loop for r in records
-          for kh = (durable-record-key-hash r)
-          unless (and kh
-                      (gethash kh dispose-set)
-                      (gethash kh unreg-set)
-                      (let ((lk (gethash kh last-kind)))
-                        (or (eq lk :dispose) (eq lk :unregister))))
-            collect r)))
+    ;; pass 1b: drop a record only if its key-hash is settled
+    (let ((kept (loop for r in records
+                      for kh = (durable-record-key-hash r)
+                      unless (and kh
+                                  (gethash kh dispose-set)
+                                  (gethash kh unreg-set)
+                                  (let ((lk (gethash kh last-kind)))
+                                    (or (eq lk :dispose) (eq lk :unregister))))
+                        collect r)))
+      (if (eq history-kind :keep-last)
+          ;; pass 2: per-instance KEEP_LAST — keep only the newest HISTORY-DEPTH :data records
+          ;; per non-NIL key-hash; lifecycle records + NIL-key-hash records pass through
+          (let ((drop-set (make-hash-table :test #'eq))) ; record identity -> drop?
+            ;; bucket :data records per non-NIL key-hash
+            (let ((buckets (make-hash-table :test #'equalp)))
+              (dolist (r kept)
+                (let ((kh (durable-record-key-hash r)))
+                  (when (and kh (eq :data (durable-record-kind r)))
+                    (push r (gethash kh buckets '())))))
+              ;; for each bucket, mark the OLDER (below newest depth) records for dropping
+              (maphash (lambda (kh bucket)
+                         (declare (ignore kh))
+                         (when (> (length bucket) history-depth)
+                           ;; sort ascending by (guid sn); oldest first; drop all but last depth
+                           (let* ((sorted  (sort (copy-list bucket) #'%record-guid-sn<))
+                                  (n-drop  (- (length sorted) history-depth))
+                                  (to-drop (subseq sorted 0 n-drop)))
+                             (dolist (r to-drop)
+                               (setf (gethash r drop-set) t)))))
+                       buckets))
+            ;; filter kept, preserving append order
+            (loop for r in kept unless (gethash r drop-set) collect r))
+          ;; :keep-all — pass 2 skipped; return settled-only result
+          kept))))
 
 (defun* %rewrite-topic-log (dir tid records)
     (function (pathname string list) (eql t))
@@ -397,11 +421,17 @@
 
 ;;; File-store make-file-store.
 
-(defun* make-file-store (&key dir (max-samples 0))
-    (function (&key (:dir (or null pathname)) (:max-samples (integer 0))) durable-store)
+(defun* make-file-store (&key dir (max-samples 0)
+                              (history-kind :keep-all) (history-depth 1))
+    (function (&key (:dir (or null pathname)) (:max-samples (integer 0))
+                    (:history-kind (member :keep-all :keep-last)) (:history-depth (integer 1)))
+              durable-store)
   "Construct an append-log-per-topic durable-store.
    DIR is the root directory for topic logs (required on open).
-   MAX-SAMPLES 0 = unbounded; positive caps total records across all topics (:rejected when full)."
+   MAX-SAMPLES 0 = unbounded; positive caps total records across all topics (:rejected when full).
+   HISTORY-KIND / HISTORY-DEPTH govern per-instance compaction-on-open (DDS 1.4 §2.2.3.5):
+   :keep-all (default, byte-identical) or :keep-last with DEPTH >= 1 keeps only the newest DEPTH
+   :data records per non-NIL-key-hash instance on each store-open."
   (let* ((outer     (make-hash-table :test #'equal)) ; topic-id -> inner hash-table
          (streams   (make-hash-table :test #'equal)) ; topic-id -> open output stream
          (id-map    (make-hash-table :test #'equal)) ; topic -> topic-id
@@ -492,42 +522,45 @@
            t))
 
        :open
-       (lambda ()
-         ;; reset in-memory index so a re-open does not accumulate stale state
-         (clrhash outer)
-         (clrhash id-map)
-         (clrhash streams)
-         (ensure-directories-exist (%topic-log-path store-dir "x"))
-         ;; read topics.map to resolve topic-ids back to names
-         (let ((tmap (%read-topics-map store-dir)))
-           ;; build reverse: id -> topic
-           (let ((id->topic (make-hash-table :test #'equal)))
-             (maphash (lambda (id name) (setf (gethash id id->topic) name)) tmap)
-             ;; replay each *.log in the topics/ subdir
-             (let ((topics-dir (merge-pathnames
-                                (make-pathname :directory '(:relative "topics")) store-dir)))
-               (when (uiop:directory-exists-p topics-dir)
-                 (dolist (log-path (uiop:directory-files topics-dir "*.log"))
-                   (let* ((tid   (pathname-name log-path))
-                          (topic (or (gethash tid id->topic) tid)))
-                     (let* ((recs      (%replay-log log-path topic))
-                            (compacted (%compact-topic-records recs)))
-                       ;; rewrite the log when compaction dropped at least one record
-                       (when (and recs (< (length compacted) (length recs)))
-                         (%rewrite-topic-log store-dir tid compacted))
-                       (when compacted
-                         (setf (gethash topic id-map) tid)
-                         (let ((inn (%inner tid)))
-                           (dolist (r compacted)
-                             (let ((k (%record-key (durable-record-writer-guid r)
-                                                   (durable-record-sn r))))
-                               (setf (gethash k inn) r)))))))))
-               ;; rebuild topics.map with any recovered topics
-               (when (plusp (hash-table-count id-map))
-                 (let ((new-map (make-hash-table :test #'equal)))
-                   (maphash (lambda (topic tid) (setf (gethash tid new-map) topic)) id-map)
-                   (%write-topics-map store-dir new-map))))))
-         t)
+       (lambda (open-hk open-hd)
+         ;; effective policy: caller override wins when non-NIL; fall back to factory default
+         (let ((eff-hk (or open-hk history-kind))
+               (eff-hd (or open-hd history-depth)))
+           ;; reset in-memory index so a re-open does not accumulate stale state
+           (clrhash outer)
+           (clrhash id-map)
+           (clrhash streams)
+           (ensure-directories-exist (%topic-log-path store-dir "x"))
+           ;; read topics.map to resolve topic-ids back to names
+           (let ((tmap (%read-topics-map store-dir)))
+             ;; build reverse: id -> topic
+             (let ((id->topic (make-hash-table :test #'equal)))
+               (maphash (lambda (id name) (setf (gethash id id->topic) name)) tmap)
+               ;; replay each *.log in the topics/ subdir
+               (let ((topics-dir (merge-pathnames
+                                  (make-pathname :directory '(:relative "topics")) store-dir)))
+                 (when (uiop:directory-exists-p topics-dir)
+                   (dolist (log-path (uiop:directory-files topics-dir "*.log"))
+                     (let* ((tid   (pathname-name log-path))
+                            (topic (or (gethash tid id->topic) tid)))
+                       (let* ((recs      (%replay-log log-path topic))
+                              (compacted (%compact-topic-records recs eff-hk eff-hd)))
+                         ;; rewrite the log when compaction dropped at least one record
+                         (when (and recs (< (length compacted) (length recs)))
+                           (%rewrite-topic-log store-dir tid compacted))
+                         (when compacted
+                           (setf (gethash topic id-map) tid)
+                           (let ((inn (%inner tid)))
+                             (dolist (r compacted)
+                               (let ((k (%record-key (durable-record-writer-guid r)
+                                                     (durable-record-sn r))))
+                                 (setf (gethash k inn) r)))))))))
+                 ;; rebuild topics.map with any recovered topics
+                 (when (plusp (hash-table-count id-map))
+                   (let ((new-map (make-hash-table :test #'equal)))
+                     (maphash (lambda (topic tid) (setf (gethash tid new-map) topic)) id-map)
+                     (%write-topics-map store-dir new-map))))))
+           t))
 
        :close
        (lambda ()

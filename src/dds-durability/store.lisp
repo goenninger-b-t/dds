@@ -56,10 +56,24 @@
   "Remove all retained records for TOPIC. Returns T."
   (funcall (durable-store-purge store) topic))
 
-(defun* store-open (store)
-    (function (durable-store) (eql t))
-  "Open (initialise) the backing store. No-op for the in-memory implementation. Returns T."
-  (funcall (durable-store-open store)))
+(declaim (ftype (function (durable-store &optional
+                                          (or null (member :keep-all :keep-last))
+                                          (or null (integer 1)))
+                          t)
+                store-open))
+(defun* store-open (store &optional history-kind history-depth)
+    (function (durable-store &optional
+               (or null (member :keep-all :keep-last)) (or null (integer 1)))
+              t)
+  "Open STORE; HISTORY-KIND and HISTORY-DEPTH override the factory default when non-NIL.
+   A non-NIL HISTORY-DEPTH must be a positive integer (>= 1); NIL defers to the store factory default.
+   The in-memory backend stashes the overrides for future per-instance eviction.
+   The file backend applies the effective policy at compaction-on-open (DDS 1.4 §2.2.3.5).
+   The encrypted backend delegates to the inner store. Returns T."
+  (declare (type durable-store store)
+           (type (or null (member :keep-all :keep-last)) history-kind)
+           (type (or null (integer 1)) history-depth))
+  (funcall (durable-store-open store) history-kind history-depth))
 
 (defun* store-close (store)
     (function (durable-store) (eql t))
@@ -96,14 +110,34 @@
   (or (gethash topic outer)
       (setf (gethash topic outer) (make-hash-table :test #'equal))))
 
-(defun* %mem-put (outer lock max-samples topic writer-guid sn key-hash kind payload)
-    (function (hash-table t (integer 0) string
+(defun* %mem-evict-instance (inn key-hash depth)
+    (function (hash-table (simple-array (unsigned-byte 8) (16)) (integer 1)) (eql t))
+  "Remove lowest-SN :data records for KEY-HASH in INN until at most DEPTH remain.
+   Lifecycle (:dispose/:unregister) records are never evicted (DDS 1.4 §2.2.3.5)."
+  (loop
+    (let ((data-keys '()))
+      (maphash (lambda (k v)
+                 (when (and (eq :data (durable-record-kind v))
+                            (equalp key-hash (durable-record-key-hash v)))
+                   (push k data-keys)))
+               inn)
+      (when (<= (length data-keys) depth)
+        (return t))
+      ;; remove the entry with the minimum sn (cdr of the key cons is the sn)
+      (let ((min-k (reduce (lambda (a b) (if (< (cdr a) (cdr b)) a b)) data-keys)))
+        (remhash min-k inn))))
+  t)
+
+(defun* %mem-put (outer lock max-samples hk-cell depth-cell topic writer-guid sn key-hash kind payload)
+    (function (hash-table t (integer 0) cons cons string
                (simple-array (unsigned-byte 8) (16)) (integer 0)
                (or null (simple-array (unsigned-byte 8) (16)))
                (member :data :dispose :unregister)
                (simple-array (unsigned-byte 8) (*)))
               (or (eql t) (eql :rejected)))
-  "Insert or idempotently no-op a record; return :REJECTED when bounded store is full."
+  "Insert or idempotently no-op a record; return :REJECTED when bounded store is full.
+   When the stashed policy (HK-CELL car) is :keep-last, evicts the lowest-SN :data
+   records for the inserted instance until DEPTH-CELL car records remain (DDS 1.4 §2.2.3.5)."
   (dds.pal:with-lock (lock)
     (let* ((inn (%mem-inner outer topic))
            (k   (cons (coerce writer-guid 'list) sn)))
@@ -113,6 +147,10 @@
         (t (setf (gethash k inn)
                  (make-durable-record :topic topic :writer-guid writer-guid :sn sn
                                       :key-hash key-hash :kind kind :payload payload))
+           (when (and (eq :keep-last (car hk-cell))
+                      (eq :data kind)
+                      key-hash)
+             (%mem-evict-instance inn key-hash (car depth-cell)))
            t)))))
 
 (defun* %guid-list< (ga gb)
@@ -175,16 +213,26 @@
 (defun* make-memory-store (&key (max-samples 0))
     (function (&key (:max-samples (integer 0))) durable-store)
   "Construct an in-memory durable-store. MAX-SAMPLES 0 means unbounded; a positive value
-   caps the TOTAL record count across all topics — store-put returns :REJECTED when full."
-  (let ((outer (make-hash-table :test #'equal))
-        (lock  (dds.pal:make-lock "dds-durability-store")))
+   caps the TOTAL record count across all topics — store-put returns :REJECTED when full.
+   The effective KEEP_LAST policy is driven by store-open (the service-start channel,
+   ADR 0029, DDS 1.4 §2.2.3.5); the factory default is :keep-all (no eviction)."
+  (let ((outer     (make-hash-table :test #'equal))
+        (lock      (dds.pal:make-lock "dds-durability-store"))
+        ;; mutable stash cells: car is the live value; store-open overwrites car in-place
+        (hk-cell   (cons :keep-all nil))
+        (depth-cell (cons 1 nil)))
     (%make-durable-store
      :name :memory
      :put        (lambda (topic writer-guid sn key-hash kind payload)
-                   (%mem-put outer lock max-samples topic writer-guid sn key-hash kind payload))
+                   (%mem-put outer lock max-samples hk-cell depth-cell
+                              topic writer-guid sn key-hash kind payload))
      :get-range  (lambda (topic) (%mem-get-range outer lock topic))
      :topics     (lambda () (%mem-topics outer lock))
      :purge      (lambda (topic) (%mem-purge outer lock topic))
-     :open       (lambda () t)
+     :open       (lambda (history-kind history-depth)
+                   ;; stash the effective policy; non-NIL args override the factory default
+                   (when history-kind  (setf (car hk-cell)    history-kind))
+                   (when history-depth (setf (car depth-cell) history-depth))
+                   t)
      :close      (lambda () t)
      :count-fn   (lambda (topic) (%mem-count outer lock topic)))))

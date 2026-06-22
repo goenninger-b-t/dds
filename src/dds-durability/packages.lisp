@@ -9,6 +9,7 @@
            #:service-spec #:make-service-spec #:service-spec-matches-p
            #:service-spec-domain #:service-spec-topics #:service-spec-store
            #:service-spec-mode #:service-spec-qos-overrides #:service-spec-name
+           #:service-spec-history-kind #:service-spec-history-depth
            #:durability-service #:make-durability-service #:service-start #:service-stop #:service-alive-p #:service-add-topic
            #:durability-service-store #:durability-service-node #:durability-service-nodes
            #:durability-service-topic-names #:durability-service-spec

@@ -598,14 +598,15 @@
         (when (> next body-end) (return nil))
         (dds.core.buffer:cursor-set-position cursor next)))))
 
-(defun* parse-data-body (cursor flags octets-to-next)
-    (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16)) t)
+(defun* parse-data-body (cursor flags octets-to-next &optional capture-data-key-hash)
+    (function (dds.core.buffer:cursor (unsigned-byte 8) (unsigned-byte 16) &optional t) t)
   "Parse a DATA body. Returns (values reader-id writer-id writer-sn has-payload
    payload-offset payload-len key-p change-kind key-hash status-flags original-guid original-sn),
    or NIL if the buffer is short / malformed. When the InlineQos flag (Q) is set the inlineQos
    ParameterList is walked (bounds-checked, parse-inline-qos-key-status) — PID_STATUS_INFO
    yields STATUS-FLAGS (§9.6.4.9) and the derived CHANGE-KIND (:data/:dispose/:unregister);
-   the 16-octet KEY-HASH is materialized only for a no-payload lifecycle change (zero per-sample
+   the 16-octet KEY-HASH is materialized for a no-payload lifecycle change OR when
+   CAPTURE-DATA-KEY-HASH is non-NIL (durability collect node opts in; default NIL = zero per-sample
    allocation on the hot keyed-DATA path); PID_ORIGINAL_WRITER_INFO yields ORIGINAL-GUID (16
    octets) and ORIGINAL-SN or nil/nil when absent (§8.3.5.4). RTPS 2.5 §9.4.5.4 + §9.6.4.9."
   (let* ((body-start (dds.core.buffer:cursor-position cursor))
@@ -621,7 +622,7 @@
           (key-hash nil) (status-flags 0) (original-guid nil) (original-sn nil))
       (when (logtest flags +data-flag-inline-qos+)
         (multiple-value-bind (kh sf ok og os)
-            (parse-inline-qos-key-status cursor body-end (not has-payload))
+            (parse-inline-qos-key-status cursor body-end (or (not has-payload) capture-data-key-hash))
           (unless ok (return-from parse-data-body nil))
           (setf key-hash kh status-flags sf original-guid og original-sn os)))
       (let* ((poff (dds.core.buffer:cursor-position cursor))

@@ -166,6 +166,8 @@
   (sample-writers (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> writer EntityId (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
   (sample-origins (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> (effective-origin-GUID . effective-origin-SN): the PID_ORIGINAL_WRITER_INFO logical origin when the received sample was relayed (RTPS 2.5 §8.3.5.4), absent for a direct sample (then the wire GUID/SN IS the origin)
+  (capture-data-key-hash nil :type boolean) ; durability collect node opts in to materialize the wire PID_KEY_HASH on :data (control-plane); default NIL = byte-identical, no hot-path alloc (ADR 0029, RTPS 2.5 §9.6.4.8)
+  (sample-key-hashes (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet wire key-hash of the :data sample (RTPS 2.5 §9.6.4.8), absent when not captured
   (lifecycle-changes (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> (kind key-hash status writer-id source-guid) (§8.3.5.4: SN is per-writer; no per-change composite-key alloc)
   (ack-count 0 :type integer)
   (acks-in 0 :type integer)
@@ -238,15 +240,19 @@
 (defun* make-disc-node (&key (guid-prefix (make-array 12 :element-type '(unsigned-byte 8)
                                                      :initial-element 0))
                             (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast
-                            (advertise-address "127.0.0.1") (batch-max-samples 1))
-    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1))) disc-node)
+                            (advertise-address "127.0.0.1") (batch-max-samples 1)
+                            (capture-data-key-hash nil))
+    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1)) (:capture-data-key-hash t)) disc-node)
   "Open a metatraffic UDPv4 socket bound to HOST:PORT and build a discovery node.
    PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4).
    MULTICAST opens a second socket bound to the SPDP multicast port and joins the
    well-known group, so the node also discovers peers via multicast (FR-DISC-3).
    BATCH-MAX-SAMPLES > 1 enables WP-BATCH write-side batching (FR-PF-1): publish-sample defers the push
    until N samples accumulate or flush-batch fires (the announce cadence / stop-node), amortizing
-   per-sample overhead for small samples (NFR-PERF-4). Default 1 = flush every write (no batching)."
+   per-sample overhead for small samples (NFR-PERF-4). Default 1 = flush every write (no batching).
+   CAPTURE-DATA-KEY-HASH (ADR 0029, RTPS 2.5 §9.6.4.8): when non-NIL, the receiver thread
+   materializes the wire PID_KEY_HASH even on :data samples with payload (the durability collect node
+   uses this; default NIL = byte-identical, no hot-path alloc)."
   ;; In multicast mode bind the unicast socket to 0.0.0.0: a loopback-bound socket
   ;; cannot egress to a multicast group (EADDRNOTAVAIL), and 0.0.0.0 still receives
   ;; unicast SEDP addressed to 127.0.0.1:port.
@@ -257,6 +263,7 @@
                                   :advertise-address advertise-address
                                   :socket sock :transport tr :peers peers
                                   :batch-max-samples batch-max-samples
+                                  :capture-data-key-hash (and capture-data-key-hash t)
                                   :host-uuid host-uuid
                                   :shmem (when *shmem-enabled*   ; SHMEM receive segment for same-host user DATA (FR-XPORT-2)
                                            (dds.xport.shmem:make-shmem-transport
@@ -915,7 +922,7 @@
          ((= id dds.rtps.message:+submsg-data+)
           (multiple-value-bind (rdr wtr sn has-payload poff plen keyp kind key-hash status-flags
                                 orig-guid orig-sn)
-              (dds.rtps.message:parse-data-body c flags body-len)
+              (dds.rtps.message:parse-data-body c flags body-len (disc-node-capture-data-key-hash node))
             (declare (ignore rdr keyp))
             (when (and (not has-payload) (not (eq kind :data)) (disc-node-on-lifecycle node))
               ;; A no-payload dispose/unregister DATA (RTPS 2.5 §9.6.4.9): route the named instance +
@@ -955,11 +962,12 @@
                 ((= wtr dds.rtps.discovery:+entityid-p2p-participant-message-writer+)
                  (%on-participant-message node src-prefix wtr sn buf poff plen))
                 ((disc-node-on-data node)
-                 ;; Pass orig-guid/orig-sn (from PID_ORIGINAL_WRITER_INFO, §8.3.5.4) into the
-                 ;; data-plane hook. %on-user-data MUST call reader-on-data unconditionally (for
-                 ;; RTPS reliable NACK/HEARTBEAT correctness) and gates only the APP delivery.
+                 ;; Pass orig-guid/orig-sn (PID_ORIGINAL_WRITER_INFO, §8.3.5.4) and key-hash
+                 ;; (PID_KEY_HASH, §9.6.4.8 — only non-NIL when capture-data-key-hash is set on
+                 ;; the node) into the data-plane hook. %on-user-data gates APP delivery; it MUST
+                 ;; call reader-on-data unconditionally for RTPS reliable NACK/HEARTBEAT correctness.
                  (funcall (disc-node-on-data node) wtr sn buf poff plen src-prefix
-                          orig-guid orig-sn))))))
+                          orig-guid orig-sn key-hash))))))
          ((= id dds.rtps.message:+submsg-heartbeat+)
           (let ((pos (dds.core.buffer:cursor-position c)))
             (multiple-value-bind (rid wid first last hcount hfinal hlive)
