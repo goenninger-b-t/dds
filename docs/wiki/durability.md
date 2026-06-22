@@ -297,6 +297,37 @@ sbcl --eval '(require :asdf)' \
      --eval '(dds.durability:durability-service-main)'
 ```
 
+### 5.1 Signal-driven graceful shutdown (WP-GRACEFUL-FFI-TEARDOWN, ADR 0030)
+
+When `:block t` (the default), `durability-service-main` installs a **SIGTERM/SIGINT handler**
+via `dds.pal:install-signal-handler` and blocks until the handler fires.  On receipt:
+
+```
+supervisor-stop   ; no more restarts
+runner-stop       ; service-stop each service = join collect threads THEN store-close
+                  ; store-close:  fsync + free DARE DEKs + free static arena
+uiop:quit 0       ; no live foreign pointer at this point
+```
+
+The handler sets a flag (`*durability-shutdown-requested*`); all teardown runs in the blocking
+Lisp thread, never in the signal context.
+
+**PAL primitive:** `dds.pal:install-signal-handler signals callback → t`
+
+- `signals` — list of `(member :term :int)`
+- `callback` — 0-arg fn; must be minimal (set a flag / wake a thread; never do teardown inline)
+
+Implementations:
+- **SBCL** — `sb-sys:enable-interrupt` for `sb-unix:sigterm` / `sb-unix:sigint`.
+- **Clasp** — `mp:service-interrupt :around` methods on `core:sigterm` / `core:sigint`;
+  dispatched via an alist guarded by `*signal-handler-lock*`.
+
+No reader conditional escapes `dds-pal/`.
+
+**Live proof:** `interop/graceful-shutdown/run-kill15.sh` — launches a PERSISTENT (DARE/file)
+service on both Clasp and SBCL, sends `kill -15`, and asserts: status 0, no SIGBUS.
+Result (2026-06-22): **both impls clean exit, no SIGBUS** (ADR 0026 §10 item 3 RESOLVED).
+
 ---
 
 ## 6. Phase-2 — dedup / no-double-delivery, multi-topic, dispose/unregister (WP-DURABILITY-DEDUP)
@@ -727,8 +758,9 @@ in-memory store applies online eviction on `store-put`; DARE intact; fuzz green;
 fsync** (durable directory entries for new files + the compaction rename across a power loss);
 **`:process`-mode PERSISTENT** (the store factory is not serialized across the process boundary —
 use `:thread` mode for the PERSISTENT tier); **log-level at-rest integrity** (a MAC'd log chain);
-graceful FFI teardown on signal (a benign SIGBUS in a non-Lisp thread on `kill -15` shutdown was
-observed); epoch-table retirement; **3c** metadata confidentiality; in-RAM plaintext minimization
+**graceful FFI teardown on signal (RESOLVED — ADR 0030, 2026-06-22; `kill -15` exits cleanly
+status 0, no SIGBUS, both impls; see §5.1)**;
+epoch-table retirement; **3c** metadata confidentiality; in-RAM plaintext minimization
 (honest pure-Lisp feasibility caveat); **P6** DDS-Security in-transit; and db/microservice
 persistence backends (the file backend is on the same vtable, so they drop in).
 
@@ -745,6 +777,7 @@ persistence backends (the file backend is on the same vtable, so they drop in).
 - ADR 0027 — Cross-vendor coexistence dedup: RTI PS uses standard OWI on replay; `:relay-durability`/`:collect-durability` tiers; honest live status; §follow-on 1 resolved by ADR 0028
 - ADR 0028 — Cross-vendor dual-relay exactly-once: live-captured convergence via logical-origin capture (dir-a N=545, dir-b N=550; resolves ADR 0027 §follow-on 1)
 - ADR 0029 — Per-instance KEEP_LAST compaction in the durability service (DDS 1.4 §2.2.3.5; file-store compaction-on-open + in-memory online eviction; service-spec via store-open; Connext M=302→2, Fast DDS M=134→2)
+- ADR 0030 — Graceful FFI teardown on SIGTERM/SIGINT (`dds.pal:install-signal-handler`; orderly drain supervisor-stop → runner-stop → store-close → uiop:quit 0; `kill -15` clean exit both impls; resolves ADR 0026 §10 item 3)
 - `docs/superpowers/specs/2026-06-19-durability-dare-design.md` — the DARE design spec
 - `docs/superpowers/specs/2026-06-20-durability-persistent-design.md` — the PERSISTENT design spec
 - `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md` — PID_ORIGINAL_WRITER_INFO spike
@@ -755,6 +788,7 @@ persistence backends (the file backend is on the same vtable, so they drop in).
 - `interop/durability-persistent/` — PERSISTENT transparency-after-restart (Connext 458 / Fast DDS 186) + the RTI-PS coexistence finding
 - `interop/durability-coexist-dedup/` — live dual-relay coexistence harness; captures dir-a (N=545) + dir-b (N=550); `analyze-capture.py --assert-converged`
 - `interop/durability-keeplast/` — KEEP_LAST restart-seed cross-DDS harness (Leg 1 Connext M=302→D=2, Leg 2 Fast DDS M=134→D=2); `spike/` — `PID_KEY_HASH` presence confirmations (767 Connext + 362 Fast DDS)
+- `interop/graceful-shutdown/` — `kill -15` clean-exit harness (`driver.lisp` + `run-kill15.sh`); both Clasp and SBCL: status 0, no SIGBUS (ADR 0030)
 - `src/dds-disc/disc.lisp` — `sample-origins` struct slot; `capture-data-key-hash` slot (KEEP_LAST, ADR 0029); `sample-key-hashes` table; `src/dds-disc/dataplane.lisp` — `node-sample-origin-guid` / `node-sample-origin-sn` (logical-origin accessors) + `%record-sample-origin` setter; `node-sample-key-hash (node key)` → captured `PID_KEY_HASH (0x0070)` per `(writer-guid . sn)` (ADR 0029)
 - `src/dds-durability/` — service implementation (store / store-file / spec / service / runner / supervisor / main / store-encrypted)
 - `src/dds-dare/` — DARE crypto (openssl-ffi / primitives / envelope / key-provider)

@@ -3122,3 +3122,21 @@
          (when (uiop:directory-exists-p svc-dir)
            (uiop:delete-directory-tree svc-dir :validate t)))))
     t))
+
+(defun* run-durability-graceful-teardown-order-test ()
+    (function () t)
+  "The graceful teardown stops the service threads and closes the store: after the orderly stop
+   (supervisor-stop -> runner-stop -> service-stop), no collect thread is alive and the store is
+   closed. service-stop's join-before-close order (service.lisp) is the no-thread-mid-foreign-call
+   prerequisite. Domain 82, in-memory store."
+  (let* ((store (dds.durability:make-memory-store))
+         (spec (dds.durability:make-service-spec
+                :domain 82 :topics '(("GtSquare" . "ShapeType")) :store (lambda () store)
+                :name "graceful-teardown"))
+         (svc (dds.durability:make-durability-service spec :store store)))
+    (dds.durability:service-start svc)
+    (%check :gt-alive-before (dds.durability:service-alive-p svc) "service must be alive after start")
+    (dds.durability:service-stop svc)
+    (%check :gt-not-alive-after (not (dds.durability:service-alive-p svc))
+            "after service-stop every collect thread must be joined (not alive)"))
+  t)

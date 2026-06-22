@@ -32,6 +32,8 @@
    ;; = wait forever, else bounded; re-check the predicate on wake — ADR 0007)
    #:spawn #:join #:make-lock #:with-lock #:make-condvar #:condvar-wait #:condvar-signal
    #:condvar-broadcast
+   ;; process signal handling (SIGTERM/SIGINT -> 0-arg callback; ADR 0026 §10 graceful teardown)
+   #:install-signal-handler
    ;; clock
    #:monotonic-ns
    ;; UDPv4 sockets (native, FR-XPORT-1)

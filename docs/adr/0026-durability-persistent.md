@@ -356,9 +356,11 @@ own vertical slice:
 2. **KEEP_LAST-superseded compaction + online/threshold compaction** — the current compaction is
    conservatively dispose+unregister-then-settled-only; superseded-SN reclamation and long-run
    online compaction are deferred.
-3. **Graceful FFI teardown on signal** — a **benign** SIGBUS in a non-Lisp thread was observed on
-   `kill -15` during shutdown (cosmetic, post-run, in the FFI teardown of a process being killed);
-   a clean signal-handled teardown is a follow-on.
+3. **Graceful FFI teardown on signal** — **RESOLVED by ADR 0030 (2026-06-22).** `dds.pal:install-signal-handler`
+   (T1) + `durability-service-main` teardown wiring (T2): `kill -15` now exits cleanly with status 0, no
+   SIGBUS, on both Clasp and SBCL.  Orderly drain: supervisor-stop → runner-stop (join collect threads) →
+   store-close (fsync + free DARE/arena) → `uiop:quit 0`.  No OPENSSL_cleanup or signal masking was needed;
+   the graceful Lisp shutdown alone sufficed.  See `interop/graceful-shutdown/run-kill15.sh`.
 4. **Epoch-table retirement** — compaction/retire of very-old epochs with no live records (the
    table grows by one ~1.6 KB entry per open).
 5. **(3c) Metadata confidentiality** — seal the record metadata (topic/GUID/SN/kind), not just the

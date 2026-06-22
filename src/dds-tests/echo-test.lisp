@@ -296,6 +296,22 @@
   (dolist (k '(:acquire :release :full) t)
     (dds.pal:fence k)))
 
+(defun* run-pal-signal-handler-test ()
+    (function () (eql t))
+  "install-signal-handler registers a non-terminating handler: raising SIGTERM to our own
+   process invokes the callback (sets the flag) and we keep running (the default terminate
+   is overridden). Impl-agnostic raise via CFFI kill(2)/getpid(2).
+   Leaves a process-wide :term handler installed (benign: the suite raises no further SIGTERM)."
+  (let ((fired nil))
+    (dds.pal:install-signal-handler '(:term) (lambda () (setf fired t)))
+    (cffi:foreign-funcall "kill"
+                          :int (cffi:foreign-funcall "getpid" :int)
+                          :int 15 :int)
+    (loop repeat 200 until fired do (sleep 0.01))
+    (%check :pal-signal-handler-fired fired
+            "install-signal-handler's callback must run on SIGTERM (and we must NOT terminate)"))
+  t)
+
 (defun* run-pal-sap-atomics-test ()
     (function () (eql t))
   "cas-sap-u64 / atomic-incf-sap-u64 / load/store on a foreign 8-byte region behave atomically (single-thread correctness)."
@@ -2615,6 +2631,7 @@
   (let ((tests '(("md5-rfc1321"               . run-md5-test)
                  ("echo-over-mock-transport" . run-echo-test)
                  ("pal-fence"                . run-pal-fence-test)
+                 ("pal-signal-handler"       . run-pal-signal-handler-test)
                  ("pal-sap-atomics"          . run-pal-sap-atomics-test)
                  ("pal-sap-ref"              . run-sap-ref-test)
                  ("pal-shm"                  . run-pal-shm-test)
@@ -2918,7 +2935,8 @@
                  ("durability-keeplast-memory"       . run-durability-keeplast-memory-test)
                  ("durability-keeplast-compaction"  . run-durability-keeplast-compaction-test)
                  ("durability-keeplast-cross-restart" . run-durability-keeplast-cross-restart-test)
-                 ("durability-keeplast-service-spec-policy" . run-durability-keeplast-service-spec-policy-test))))
+                 ("durability-keeplast-service-spec-policy" . run-durability-keeplast-service-spec-policy-test)
+                 ("durability-graceful-teardown-order" . run-durability-graceful-teardown-order-test))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))
       (funcall (cdr test))

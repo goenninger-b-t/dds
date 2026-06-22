@@ -218,6 +218,47 @@
    §Backpressure)."
   (mp:condition-variable-broadcast cv))
 
+;;; Per-signal callback table; guarded by *signal-handler-lock*.
+;;; Clasp dispatches POSIX signals as Lisp conditions via mp:service-interrupt;
+;;; the :around methods below intercept core:sigterm / core:sigint and call the
+;;; registered callback instead of the default (ext:quit 1 for SIGTERM; the default
+;;; SIGINT action for SIGINT). Unregistered signals fall through to call-next-method.
+(defvar *signal-handlers* '()
+  "Alist of (signal-keyword . callback) for install-signal-handler on Clasp.")
+
+(defvar *signal-handler-lock* (bordeaux-threads:make-lock "dds-signal-handlers")
+  "Guards *SIGNAL-HANDLERS* for concurrent install-signal-handler calls.")
+
+(defmethod mp:service-interrupt :around ((i core:sigterm))
+  "Intercept SIGTERM: call the registered :term callback (if any) instead of terminating."
+  (let ((h (bordeaux-threads:with-lock-held (*signal-handler-lock*)
+              (cdr (assoc :term *signal-handlers*)))))
+    (if h (funcall h) (call-next-method))))
+
+(defmethod mp:service-interrupt :around ((i core:sigint))
+  "Intercept SIGINT: call the registered :int callback (if any) instead of the default SIGINT action (the terminal interrupt)."
+  (let ((h (bordeaux-threads:with-lock-held (*signal-handler-lock*)
+              (cdr (assoc :int *signal-handlers*)))))
+    (if h (funcall h) (call-next-method))))
+
+(defun* install-signal-handler (signals callback)
+    (function (list function) (eql t))
+  "Register CALLBACK (a 0-arg fn) for each signal in SIGNALS (list of (member :term :int)) —
+   Clasp via mp:service-interrupt :around methods on core:sigterm/core:sigint. The handler
+   suppresses the default termination/terminal-interrupt action when a callback is registered. CALLBACK
+   must be minimal (set a flag / wake a thread), never do teardown inline.
+   No reader conditional escapes dds-pal/."
+  (bordeaux-threads:with-lock-held (*signal-handler-lock*)
+    (dolist (s signals)
+      (ecase s
+        (:term (setf *signal-handlers*
+                     (cons (cons :term callback)
+                           (remove :term *signal-handlers* :key #'car))))
+        (:int  (setf *signal-handlers*
+                     (cons (cons :int callback)
+                           (remove :int *signal-handlers* :key #'car)))))))
+  t)
+
 (defun* gc-suggest ()
     (function () (values))
   "Suggest a GC to the implementation. M0 no-op."

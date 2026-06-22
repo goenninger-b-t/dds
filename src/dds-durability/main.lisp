@@ -180,6 +180,20 @@
                                      (format nil "~a:~a" (car pair) (cdr pair))))))))
     acc))
 
+;;; --- signal-driven graceful teardown ---
+
+(defvar *durability-shutdown-requested* nil
+  "Set by the SIGTERM/SIGINT handler installed in DURABILITY-SERVICE-MAIN; the block loop polls it.")
+
+(defun* %graceful-shutdown (runner sup)
+    (function (service-runner supervisor) t)
+  "Orderly teardown: stop supervising (no restarts), then stop the runner (service-stop each service =
+   join collect threads THEN close the store + free DARE/arena). Threads are joined before the FFI is
+   freed, so nothing is mid-foreign-call at teardown (resolves the kill -15 SIGBUS, ADR 0026 §10)."
+  (ignore-errors (supervisor-stop sup))
+  (ignore-errors (runner-stop runner))
+  t)
+
 ;;; --- main entrypoint ---
 
 (defun* durability-service-main (&key (argv nil) (env '()) (block t))
@@ -187,7 +201,9 @@
   "CLI/env entrypoint for the durability service.
    ARGV defaults to UIOP:COMMAND-LINE-ARGUMENTS when NIL. ENV is an alist or 1-arg fn.
    Parses config (including supervisor opts max-restarts/window-seconds), builds runner+supervisor.
-   When BLOCK is T (subprocess body), loops until killed. When NIL, returns (CONS runner sup)."
+   When BLOCK is T (subprocess body), installs a SIGTERM/SIGINT handler, polls a shutdown flag,
+   then tears down in order (supervisor-stop -> runner-stop) and calls UIOP:QUIT 0.
+   When NIL, returns (CONS runner sup)."
   (let ((effective-argv (or argv (uiop:command-line-arguments))))
     (multiple-value-bind (specs max-restarts window-seconds)
         (parse-durability-config :argv (or effective-argv '()) :env env)
@@ -198,5 +214,12 @@
         (runner-start runner)
         (supervisor-start sup)
         (if block
-            (loop (sleep 1))
+            (progn
+              (setf *durability-shutdown-requested* nil)
+              (dds.pal:install-signal-handler
+               '(:term :int)
+               (lambda () (setf *durability-shutdown-requested* t)))
+              (loop until *durability-shutdown-requested* do (sleep 0.2))
+              (%graceful-shutdown runner sup)
+              (uiop:quit 0))
             (cons runner sup))))))

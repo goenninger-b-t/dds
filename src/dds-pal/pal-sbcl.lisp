@@ -188,6 +188,22 @@
    publishers blocked on a full HistoryCache, ADR 0016 §Backpressure)."
   (sb-thread:condition-broadcast cv))
 
+(defun* install-signal-handler (signals callback)
+    (function (list function) (eql t))
+  "Register CALLBACK (a 0-arg fn) for each signal in SIGNALS (list of (member :term :int)) — SBCL via
+   sb-sys:enable-interrupt. The handler runs CALLBACK in the signal context; CALLBACK must be minimal
+   (set a flag / wake a thread), never do teardown inline. No reader conditional escapes dds-pal/."
+  (dolist (s signals)
+    (let ((signum (ecase s
+                    (:term sb-unix:sigterm)
+                    (:int  sb-unix:sigint))))
+      (sb-sys:enable-interrupt
+       signum
+       (lambda (signo info context)
+         (declare (ignore signo info context))
+         (funcall callback)))))
+  t)
+
 (defun* gc-suggest ()
     (function () (values))
   "Suggest a GC to the implementation. M0 no-op."
