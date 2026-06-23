@@ -167,6 +167,7 @@
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
   (sample-origins (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> (effective-origin-GUID . effective-origin-SN): the PID_ORIGINAL_WRITER_INFO logical origin when the received sample was relayed (RTPS 2.5 §8.3.5.4), absent for a direct sample (then the wire GUID/SN IS the origin)
   (capture-data-key-hash nil :type boolean) ; durability collect node opts in to materialize the wire PID_KEY_HASH on :data (control-plane); default NIL = byte-identical, no hot-path alloc (ADR 0029, RTPS 2.5 §9.6.4.8)
+  (crypto-transform nil :type t) ; DDS-Security 1.1 §9.5.3.3 Slice-1: key-material for AES256-GCM serialized-payload protection; NIL = security OFF, byte-identical hot path (ADR 0031)
   (sample-key-hashes (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet wire key-hash of the :data sample (RTPS 2.5 §9.6.4.8), absent when not captured
   (lifecycle-changes (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> (kind key-hash status writer-id source-guid) (§8.3.5.4: SN is per-writer; no per-change composite-key alloc)
   (ack-count 0 :type integer)
@@ -241,8 +242,8 @@
                                                      :initial-element 0))
                             (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast
                             (advertise-address "127.0.0.1") (batch-max-samples 1)
-                            (capture-data-key-hash nil))
-    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1)) (:capture-data-key-hash t)) disc-node)
+                            (capture-data-key-hash nil) (crypto-transform nil))
+    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1)) (:capture-data-key-hash t) (:crypto-transform t)) disc-node)
   "Open a metatraffic UDPv4 socket bound to HOST:PORT and build a discovery node.
    PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4).
    MULTICAST opens a second socket bound to the SPDP multicast port and joins the
@@ -252,7 +253,10 @@
    per-sample overhead for small samples (NFR-PERF-4). Default 1 = flush every write (no batching).
    CAPTURE-DATA-KEY-HASH (ADR 0029, RTPS 2.5 §9.6.4.8): when non-NIL, the receiver thread
    materializes the wire PID_KEY_HASH even on :data samples with payload (the durability collect node
-   uses this; default NIL = byte-identical, no hot-path alloc)."
+   uses this; default NIL = byte-identical, no hot-path alloc).
+   CRYPTO-TRANSFORM (ADR 0031, DDS-Security 1.1 §9.5.3.3): a dds.security:key-material; when non-NIL,
+   publish-sample AES256-GCM-encodes the SerializedPayload before wire emission, and the receiver
+   decodes before delivery (fail-closed on auth failure). NIL (default) = security OFF, byte-identical."
   ;; In multicast mode bind the unicast socket to 0.0.0.0: a loopback-bound socket
   ;; cannot egress to a multicast group (EADDRNOTAVAIL), and 0.0.0.0 still receives
   ;; unicast SEDP addressed to 127.0.0.1:port.
@@ -264,6 +268,7 @@
                                   :socket sock :transport tr :peers peers
                                   :batch-max-samples batch-max-samples
                                   :capture-data-key-hash (and capture-data-key-hash t)
+                                  :crypto-transform crypto-transform
                                   :host-uuid host-uuid
                                   :shmem (when *shmem-enabled*   ; SHMEM receive segment for same-host user DATA (FR-XPORT-2)
                                            (dds.xport.shmem:make-shmem-transport
@@ -280,6 +285,9 @@
           (setf (disc-node-mcast-socket node) ms)))
       (when (and *zerocopy-enabled* (disc-node-shmem node))   ; WP-ZEROCOPY writer pool (FR-PF-3, ADR 0014)
         (%zc-make-pool node))
+      ;; DDS-Security §9.5.3.3 Slice-1 (ADR 0031): crypto + ZC unsupported — SecuredPayload cannot be applied in-place to a ZC loan.
+      (when (and crypto-transform (disc-node-zc-pool node))
+        (error "crypto-transform and zero-copy are mutually exclusive in Slice 1 (ADR 0031 known-limitation 4): use one or the other"))
       node)))
 
 (defun* disc-node-port (node)

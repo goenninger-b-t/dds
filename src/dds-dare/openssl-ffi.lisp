@@ -12,6 +12,14 @@
 ;;;                unsigned char *md, size_t *mdlen)  -> int (1=ok, <=0 error)
 ;;;     Source: evp.h line 744 (OpenSSL 3.6.2)
 ;;;
+;;;   EVP_Q_mac(OSSL_LIB_CTX *libctx, const char *name, const char *propq,
+;;;             const char *subalg, const OSSL_PARAM *params,
+;;;             const void *key, size_t keylen,
+;;;             const unsigned char *data, size_t datalen,
+;;;             unsigned char *out, size_t outsize, size_t *outlen) -> uchar* (NULL=error)
+;;;     One-shot MAC (analogue of EVP_Q_digest); HMAC-SHA256 = name "HMAC", subalg "SHA256".
+;;;     Source: evp.h line 1271 (OpenSSL 3.6.2)
+;;;
 ;;;   EVP_KDF_fetch(OSSL_LIB_CTX *libctx, const char *algorithm,
 ;;;                 const char *properties) -> EVP_KDF* (NULL on error)
 ;;;   EVP_KDF_free(EVP_KDF *kdf)  -> void

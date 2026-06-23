@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Governance: payload-only protection on domain 0, topic Square.
+     metadata_protection_kind=NONE so no SEC_PREFIX/POSTFIX submessage wrapping;
+     data_protection_kind=ENCRYPT so the serialized payload is a SecuredPayload.
+     DDS-Security 1.1 §9.5.3.3 wire oracle capture: thinnest observable form. -->
+<dds xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:noNamespaceSchemaLocation="http://community.rti.com/schema/7.3.1/dds_security_governance.xsd">
+    <domain_access_rules>
+        <domain_rule>
+            <domains>
+                <id>0</id>
+            </domains>
+            <allow_unauthenticated_participants>false</allow_unauthenticated_participants>
+            <enable_join_access_control>true</enable_join_access_control>
+            <discovery_protection_kind>NONE</discovery_protection_kind>
+            <liveliness_protection_kind>NONE</liveliness_protection_kind>
+            <rtps_protection_kind>NONE</rtps_protection_kind>
+            <topic_access_rules>
+                <topic_rule>
+                    <topic_expression>Square</topic_expression>
+                    <enable_discovery_protection>false</enable_discovery_protection>
+                    <enable_liveliness_protection>false</enable_liveliness_protection>
+                    <enable_read_access_control>true</enable_read_access_control>
+                    <enable_write_access_control>true</enable_write_access_control>
+                    <metadata_protection_kind>NONE</metadata_protection_kind>
+                    <data_protection_kind>ENCRYPT</data_protection_kind>
+                </topic_rule>
+            </topic_access_rules>
+        </domain_rule>
+    </domain_access_rules>
+</dds>

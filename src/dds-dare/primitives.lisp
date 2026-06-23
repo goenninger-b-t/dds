@@ -4,6 +4,7 @@
 ;;; Foreign buffers zeroized before free (establishes the DARE secret-material pattern).
 
 (defconstant +sha384-digest-len+ 48 "SHA-384 output length in octets (FIPS 180-4 §6.5).")
+(defconstant +hmac-sha256-mac-len+ 32 "HMAC-SHA-256 output length in octets (FIPS 198-1, hash=SHA-256 FIPS 180-4 §6.2).")
 
 ;;; OSSL_KDF_PARAM_* string constants (core_names.h, OpenSSL 3.6.2):
 ;;;   OSSL_KDF_PARAM_DIGEST = "digest"  (core_names.h line 281 -> OSSL_ALG_PARAM_DIGEST line 128)
@@ -41,6 +42,50 @@
               (setf (aref out i) (cffi:mem-aref md-ptr :uint8 i)))
             (dotimes (i +sha384-digest-len+)
               (setf (cffi:mem-aref md-ptr :uint8 i) 0))))))
+    out))
+
+;;; HMAC-SHA256 one-shot — EVP_Q_mac(name="HMAC", subalg="SHA256"), the DDS-Security session-key MAC.
+
+(defun* hmac-sha256 (key data)
+    (function ((simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (32)))
+  "Return HMAC-SHA-256(KEY, DATA) as a fresh 32-byte vector (FIPS 198-1, hash SHA-256).
+   Uses one-shot EVP_Q_mac(NULL,'HMAC',NULL,'SHA256',NULL,...) (OpenSSL evp.h, verified vs 3.6.2).
+   The foreign key buffer is zeroized before deallocation. Signals on any EVP error.
+   This is the session-key MAC primitive for DDS-Security 1.1 §9.5.3.3.4.2 (NOT HKDF-SHA384)."
+  (let* ((key-n  (length key))
+         (data-n (length data))
+         (out    (make-array +hmac-sha256-mac-len+ :element-type '(unsigned-byte 8))))
+    (cffi:with-foreign-pointer (key-ptr (max 1 key-n))
+      (cffi:with-foreign-pointer (data-ptr (max 1 data-n))
+        (cffi:with-foreign-pointer (out-ptr +hmac-sha256-mac-len+)
+          (cffi:with-foreign-pointer (outlen-ptr (cffi:foreign-type-size :size))
+            (dotimes (i key-n)
+              (setf (cffi:mem-aref key-ptr :uint8 i) (aref key i)))
+            (dotimes (i data-n)
+              (setf (cffi:mem-aref data-ptr :uint8 i) (aref data i)))
+            (setf (cffi:mem-ref outlen-ptr :size) +hmac-sha256-mac-len+)
+            (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_Q_mac") nil
+                                            :pointer (cffi:null-pointer)
+                                            :string "HMAC"
+                                            :pointer (cffi:null-pointer)
+                                            :string "SHA256"
+                                            :pointer (cffi:null-pointer)
+                                            :pointer key-ptr
+                                            :size key-n
+                                            :pointer data-ptr
+                                            :size data-n
+                                            :pointer out-ptr
+                                            :size +hmac-sha256-mac-len+
+                                            :pointer outlen-ptr
+                                            :pointer)))
+              (dotimes (i key-n)
+                (setf (cffi:mem-aref key-ptr :uint8 i) 0))
+              (when (cffi:null-pointer-p rc)
+                (error "EVP_Q_mac(HMAC-SHA256) returned NULL"))
+              (dotimes (i +hmac-sha256-mac-len+)
+                (setf (aref out i) (cffi:mem-aref out-ptr :uint8 i))))))))
     out))
 
 ;;; HKDF-SHA384 internal workhorse — holds all foreign state live while EVP_KDF_derive runs.

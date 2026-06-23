@@ -60,4 +60,6 @@
            #:run-mcast-discovery-test #:run-dataplane-test
            #:run-large-dataplane-test #:run-participant-liveliness-test
            #:run-locator-filter-test #:run-lost-final-sample-test
-           #:run-dispose-dataplane-test #:run-dispose-repair-test))
+           #:run-dispose-dataplane-test #:run-dispose-repair-test
+           ;; ADR 0031: DDS-Security 1.1 §9.5.3.3 Slice-1 serialized-payload protection slot
+           #:disc-node-crypto-transform))

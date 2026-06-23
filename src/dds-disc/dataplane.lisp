@@ -987,6 +987,9 @@
    behaviour of Connext 7.3.1 and Fast DDS 3.6.1 on keyed writes (ADR 0029). NIL KEY-HASH = byte-identical."
   (let ((iq (when (and key-hash (= 16 (length key-hash)))
               (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16)))))))
+    ;; DDS-Security §9.5.3.3.4.4 Slice-1 encode (ADR 0031): AES256-GCM-seal the payload pre-wire; key-hash is plaintext-derived (RTPS 2.5 §9.6.4.8), travels unchanged.
+    (when (disc-node-crypto-transform node)
+      (setf payload (dds.security:encode-serialized-payload (disc-node-crypto-transform node) payload)))
     (when (eq :timeout (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload key-hash iq))
       (return-from publish-sample :timeout)))  ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
   (cond
@@ -1384,6 +1387,11 @@
    path; wire GUID+SN on the direct path) per RTPS 2.5 §8.3.5.4.
    KEY-HASH (ADR 0029, RTPS 2.5 §9.6.4.8): the captured wire PID_KEY_HASH; NIL unless the node has
    capture-data-key-hash set. Stored via %record-sample-key-hash inside the lock."
+  ;; DDS-Security §9.5.3.3.4.5 Slice-1 decode (ADR 0031): covers both DATA and DATA_FRAG paths; fail-closed drop on NIL.
+  (when (disc-node-crypto-transform node)
+    (let ((plain (dds.security:decode-serialized-payload (disc-node-crypto-transform node) vec)))
+      (unless plain (return-from %deliver-user-sample t))
+      (setf vec plain)))
   (let ((guid (%source-guid src-prefix writer-id)))
     ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too)
     (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn vec)

@@ -12,6 +12,7 @@
    #:dare-unavailable
    #:dare-unavailable-reason
    #:sha-384
+   #:hmac-sha256
    #:hkdf-sha384
    #:aes-256-gcm-seal
    #:aes-256-gcm-open

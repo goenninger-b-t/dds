@@ -50,4 +50,9 @@
            #:run-durability-keeplast-compaction-test
            #:run-durability-keeplast-cross-restart-test
            #:run-durability-keeplast-service-spec-policy-test
-           #:run-durability-graceful-teardown-order-test))
+           #:run-durability-graceful-teardown-order-test
+           #:run-security-secured-payload-corpus-test
+           #:run-security-payload-roundtrip-test
+           #:run-security-payload-fuzz-test
+           #:run-security-encrypted-pubsub-test
+           #:run-security-encrypted-fragmented-test))
