@@ -2487,22 +2487,13 @@
               (format nil "5 x 0.4e9 ns (=2.0e9 ns) at 1 tok/1e9 ns must deliver exactly 2 tokens (no ~
                            sub-quantum loss); pre-fix advances last-refill to NOW and delivers 1, got ~d"
                       (dds.disc:flow-token-bucket-tokens fb))))
-    (%check :fb-reject-zero-tpp
-            (null (ignore-errors (dds.disc:make-flow-token-bucket :tokens-per-period 0 :period 1000000000
-                                                                  :max-burst 1000 :clock-fn clock-fn)))
-            "make-flow-token-bucket must reject :tokens-per-period 0")
-    (%check :fb-reject-neg-tpp
-            (null (ignore-errors (dds.disc:make-flow-token-bucket :tokens-per-period -5 :period 1000000000
-                                                                  :max-burst 1000 :clock-fn clock-fn)))
-            "make-flow-token-bucket must reject a negative :tokens-per-period")
-    (%check :fb-reject-zero-period
-            (null (ignore-errors (dds.disc:make-flow-token-bucket :tokens-per-period 1000 :period 0
-                                                                  :max-burst 1000 :clock-fn clock-fn)))
-            "make-flow-token-bucket must reject :period 0")
-    (%check :fb-reject-neg-period
-            (null (ignore-errors (dds.disc:make-flow-token-bucket :tokens-per-period 1000 :period -1
-                                                                  :max-burst 1000 :clock-fn clock-fn)))
-            "make-flow-token-bucket must reject a negative :period"))
+    (flet ((%try-make-bucket (tpp period)  ; non-inline so SBCL cannot propagate integer constants into ftype-checked callee
+             (ignore-errors (dds.disc:make-flow-token-bucket :tokens-per-period tpp :period period
+                                                             :max-burst 1000 :clock-fn clock-fn))))
+      (%check :fb-reject-zero-tpp  (null (%try-make-bucket 0  1000000000)) "reject :tokens-per-period 0")
+      (%check :fb-reject-neg-tpp   (null (%try-make-bucket -5 1000000000)) "reject negative :tokens-per-period")
+      (%check :fb-reject-zero-period (null (%try-make-bucket 1000 0))  "reject :period 0")
+      (%check :fb-reject-neg-period  (null (%try-make-bucket 1000 -1)) "reject negative :period")))
   t)
 
 (defun* %bp-writer (max-samples max-blocking-ns &optional (kind :keep-all))
@@ -2941,7 +2932,18 @@
                  ("security-payload-roundtrip"   . run-security-payload-roundtrip-test)
                  ("security-payload-fuzz"        . run-security-payload-fuzz-test)
                  ("security-encrypted-pubsub"    . run-security-encrypted-pubsub-test)
-                 ("security-encrypted-fragmented" . run-security-encrypted-fragmented-test))))
+                 ("security-encrypted-fragmented" . run-security-encrypted-fragmented-test)
+                 ("auth-identity"                . run-auth-identity-test)
+                 ("auth-sha256-kat"             . run-auth-sha256-kat)
+                 ("auth-ecdsa-kat"              . run-auth-ecdsa-kat)
+                 ("auth-handshake-ecdh"         . run-auth-handshake-ecdh-test)
+                 ("auth-rsa-pss-kat"            . run-auth-rsa-pss-kat)
+                 ("auth-ffdh-kat"               . run-auth-ffdh-kat)
+                 ("auth-suite-selection"        . run-auth-suite-selection-test)
+                 ("auth-handshake-rsa"          . run-auth-handshake-rsa-test)
+                 ("auth-negatives"             . run-auth-negatives-test)
+                 ("auth-token-corpus"          . run-auth-token-corpus-test)
+                 ("auth-token-fuzz"            . run-auth-token-fuzz-test))))
     (dolist (test tests)
       (format t "~&  [test] ~a ... " (car test))
       (funcall (cdr test))

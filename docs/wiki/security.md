@@ -216,17 +216,219 @@ is **deferred** (Slice 5, the P6 exit gate).
 
 ---
 
-## 6. Roadmap (Slice 1 of 5 — M7/P6)
+## 6. Authentication plugin — Slice 2a (DDS-Security 1.1 §8.7, §9.3)
+
+Slice 2a (landed 2026-06-24, WP-DDS-SECURITY-AUTH-2A, ADR 0032) delivers the
+DDS-Security 1.1 **`DDS:Auth:PKI-DH`** builtin Authentication plugin — the foundation that
+ultimately replaces the Slice-1 pre-shared test key with keys derived from a proper
+mutual-authentication handshake.
+
+**Scope of Slice 2a:** PKI identity load + the complete §8.7.2.4 three-message PKI-DH
+handshake (Request → Reply → Final) → a `SharedSecret`, our-to-our, both §9.3 suites.  No
+live discovery, no key derivation into `key-material` — those are Slices 2b and 2c.
+
+### 6.1 The §8.7.2.4 three-message handshake
+
+Two participants mutually authenticate via X.509 certificates and a Diffie-Hellman ephemeral
+key exchange:
+
+1. **Request** (requester → replier):  requester's cert (`c.id`), its ephemeral DH public key
+   (`dh1`, SubjectPublicKeyInfo DER), a 32-byte nonce (`challenge1`), and a SHA-256 hash of
+   the requester's `c.*` properties (`hash_c1`).
+2. **Reply** (replier → requester):  replier's cert and ephemeral key (`dh2`), `challenge2`,
+   `hash_c2`, echoes of `hash_c1` / `dh1` / `challenge1`, and a **digital signature**
+   (`Sign2`) over a CDR big-endian `BinaryPropertySeq` of
+   `hash_c2 ∥ challenge2 ∥ dh2 ∥ challenge1 ∥ dh1 ∥ hash_c1` (§9.3.2.2).
+   The requester verifies the replier's cert chain + `Sign2`.
+3. **Final** (requester → replier):  echoes of all fields + a **digital signature** (`Sign1`)
+   over `hash_c1 ∥ challenge1 ∥ dh1 ∥ challenge2 ∥ dh2 ∥ hash_c2` (§9.3.2.3).
+   The replier verifies `Sign1`.
+4. Both sides independently compute **`SharedSecret = SHA-256(ECDH-or-FFDH-agreed-value)`**
+   (§9.3.3).
+
+Both participants reach `:authenticated` with byte-equal `SharedSecret`.
+
+### 6.2 The two §9.3 suites
+
+| Suite | `kagree_algo` | `dsign_algo` | Cert kind |
+|---|---|---|---|
+| `+suite-ecdh+` | `"ECDH+prime256v1-CEUM"` | `"ECDSA-SHA256"` | EC P-256 |
+| `+suite-ffdh+` | `"DH+MODP-2048-256"` | `"RSASSA-PSS-SHA256"` | RSA-2048 |
+
+Suite selection is via `select-auth-suite (local-cert-kind remote-cert-kind)` (§9.3.2):
+both EC → `+suite-ecdh+`; both RSA → `+suite-ffdh+`; mismatched → NIL → reject.
+`select-auth-suite` is implemented and tested; wiring it into the discovery entry points is a
+Slice 2b item.
+
+### 6.3 The API (`dds.security`, Slice 2a)
+
+```lisp
+;;; PKI identity
+
+(validate-local-identity ca-pem cert-pem key-pem guid)
+  ;; -> (values identity-handle nil) | (values nil reason-string)
+  ;; Load + chain-verify the local participant identity from PEM octet vectors.
+  ;; GUID: 16-octet array used for the §8.7.2.4 role ordering.
+
+(validate-remote-identity local remote-identity-token)
+  ;; -> (values :ok :requester nil) | (values :ok :replier nil) | (values :rejected role reason)
+  ;; Parse the remote IdentityToken; decide local role (§8.7.2.4 GUID lexicographic ordering).
+
+(identity-token handle)      ; -> IdentityToken CDR LE octet vector (§8.7.2.2 / §9.3.1)
+(free-identity-handle handle)
+
+;;; Suites and selection
+
++suite-ecdh+        ; ECDH+prime256v1-CEUM / ECDSA-SHA256 / SHA-256 (DDS-Security 1.1 §9.3)
++suite-ffdh+        ; DH+MODP-2048-256 / RSASSA-PSS-SHA256 / SHA-256 (§9.3 / RFC 3526 §3)
+(select-auth-suite local-cert-kind remote-cert-kind)
+  ;; -> auth-suite | nil
+  ;; :ec  + :ec  -> +suite-ecdh+
+  ;; :rsa + :rsa -> +suite-ffdh+
+  ;; mixed       -> NIL (§9.3.2; handshake must reject)
+
+;;; Handshake state machine
+
+(begin-handshake-request local remote suite)
+  ;; -> (values request-token-octets handshake-handle)
+  ;; Initiate the handshake as the requester (local GUID < remote GUID per §8.7.2.4).
+
+(begin-handshake-reply local remote request-token-octets suite)
+  ;; -> (values reply-token-octets handshake-handle) | (values nil nil)
+  ;; Process the Request token as the replier; verify peer cert chain + hash_c1.
+
+(process-handshake handle incoming-token-octets)
+  ;; -> (values next-token-or-nil status)
+  ;; status: :continue | :authenticated | :rejected
+  ;; Requester (:awaiting-reply): processes Reply -> produces Final; state -> :authenticated.
+  ;; Replier (:awaiting-final): processes Final; state -> :authenticated. No further token.
+
+;;; SharedSecret access
+
+(handshake-shared-secret handle)            ; -> shared-secret-handle | nil
+(shared-secret-bytes shared-secret-handle)  ; -> (simple-array (unsigned-byte 8) (32))
+(free-shared-secret-handle handle)          ; -> t  (zeroizes + frees the foreign buffer)
+(free-handshake-handle handle)              ; -> t
+```
+
+### 6.4 A worked our-to-our example (EC suite)
+
+```lisp
+(let* ((ca-pem   (uiop:read-file-string "interop/security-auth/pki/ca/ca-cert.pem"))
+       (cert-a   (uiop:read-file-string "interop/security-auth/pki/participant_ec/identity_cert.pem"))
+       (key-a    (uiop:read-file-string "interop/security-auth/pki/participant_ec/identity_key.pem"))
+       (cert-b   (uiop:read-file-string "interop/security-auth/pki/participant_ec_b/identity_cert.pem"))
+       (key-b    (uiop:read-file-string "interop/security-auth/pki/participant_ec_b/identity_key.pem"))
+       (to-pem   (lambda (s)
+                   (map '(simple-array (unsigned-byte 8) (*)) #'char-code s)))
+       (guid-a   (make-array 16 :element-type '(unsigned-byte 8)
+                                :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))
+       (guid-b   (make-array 16 :element-type '(unsigned-byte 8)
+                                :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))))
+
+  ;; 1. Load and validate local identities
+  (multiple-value-bind (id-a err-a)
+      (dds.security:validate-local-identity (funcall to-pem ca-pem)
+                                             (funcall to-pem cert-a)
+                                             (funcall to-pem key-a) guid-a)
+    (assert (not (null id-a)) () (format nil "id-a failed: ~a" err-a))
+    (multiple-value-bind (id-b err-b)
+        (dds.security:validate-local-identity (funcall to-pem ca-pem)
+                                               (funcall to-pem cert-b)
+                                               (funcall to-pem key-b) guid-b)
+      (assert (not (null id-b)) () (format nil "id-b failed: ~a" err-b))
+
+      ;; 2. Validate remote identity — determine roles (GUID ordering)
+      ;; guid-a (1,2,...) < guid-b (200,2,...), so A is :requester, B is :replier.
+
+      ;; 3. Requester sends HandshakeRequestMessageToken
+      (multiple-value-bind (req-tok req-hdl)
+          (dds.security:begin-handshake-request id-a id-b dds.security:+suite-ecdh+)
+
+        ;; 4. Replier processes Request, sends HandshakeReplyMessageToken
+        (multiple-value-bind (rep-tok rep-hdl)
+            (dds.security:begin-handshake-reply id-b id-a req-tok dds.security:+suite-ecdh+)
+          (assert (not (null rep-tok)) () "reply nil")
+
+          ;; 5. Requester processes Reply, sends HandshakeFinalMessageToken
+          (multiple-value-bind (final-tok req-status)
+              (dds.security:process-handshake req-hdl rep-tok)
+            (assert (eq req-status :continue) () (format nil "req status ~a" req-status))
+
+            ;; 6. Replier processes Final, both sides now :authenticated
+            (multiple-value-bind (nil-tok rep-status)
+                (dds.security:process-handshake rep-hdl final-tok)
+              (assert (eq rep-status :authenticated) () "rep not :authenticated")
+              (assert (null nil-tok) () "rep returned unexpected token")
+              (assert (eq (dds.security:handshake-handle-state req-hdl) :authenticated))
+
+              ;; 7. Both SharedSecrets are byte-equal
+              (let ((ss-req (dds.security:handshake-shared-secret req-hdl))
+                    (ss-rep (dds.security:handshake-shared-secret rep-hdl)))
+                (assert (equalp (dds.security:shared-secret-bytes ss-req)
+                                (dds.security:shared-secret-bytes ss-rep))
+                        () "SharedSecrets not byte-equal")
+                (format t "~&SharedSecret (32 bytes): ~{~2,'0x~}~%"
+                        (coerce (dds.security:shared-secret-bytes ss-req) 'list)))
+
+              ;; 8. Clean up all foreign resources
+              (dds.security:free-handshake-handle req-hdl)
+              (dds.security:free-handshake-handle rep-hdl)))
+          (dds.security:free-identity-handle id-a)
+          (dds.security:free-identity-handle id-b))))))
+```
+
+Replace `+suite-ecdh+` with `+suite-ffdh+` and the RSA participant fixtures for the FFDH
+suite.  The API is identical; only the suite parameter changes.
+
+### 6.5 Published KATs
+
+| KAT | Source | Test |
+|---|---|---|
+| SHA-256(`""`) | NIST FIPS 180-4 | `run-auth-sha256-kat` |
+| ECDH P-256 shared secret | RFC 5903 §8.1 (Group 19 / P-256) | `run-auth-ecdsa-kat` |
+| ECDSA-P256/SHA-256 deterministic (`"sample"`) | RFC 6979 §A.2.5 | `run-auth-ecdsa-kat` |
+| RSA-PSS-SHA256-saltlen32 (empty msg, valid sig) | Wycheproof rsa_pss_2048_sha256_mgf1_32 tcId 1 | `run-auth-rsa-pss-kat` |
+| RSA-PSS-SHA256 invalid-sig rejection | Wycheproof rsa_pss_2048_sha256_mgf1_32 tcId 62 | `run-auth-rsa-pss-kat` |
+| FFDH MODP-2048 commutativity | self-consistency round-trip (no published oracle available) | `run-auth-ffdh-kat` |
+
+The FFDH KAT is a self-consistency commutativity proof — no published MODP-2048 shared-secret
+test vector was located (NIST CAVP KAS-FFC does not cover OpenSSL `EVP_PKEY`-level MODP-2048).
+This is documented honestly; cross-vendor FFDH byte-equality is a Slice 5 verification item.
+
+### 6.6 The honest interop posture
+
+Three levels, as in Slice 1:
+
+1. **Our-to-our mutual authentication + byte-equal SharedSecret** (achieved): both ECDH and
+   FFDH suites complete the full three-message handshake; both sides reach `:authenticated`
+   with identical SharedSecret values.  Tested by `run-auth-handshake-ecdh-test` and
+   `run-auth-handshake-rsa-test`.
+
+2. **Cryptographic primitive conformance** (achieved, by published KAT): ECDH P-256, ECDSA-SHA256,
+   RSA-PSS-SHA256 (saltlen=32), and SHA-256 each produce byte-identical output to any conformant
+   implementation, proven by RFC 5903, RFC 6979, Wycheproof, and NIST FIPS 180-4 vectors.
+
+3. **Live cross-vendor PKI-DH authentication interop** (DEFERRED to Slice 5 — NOT achieved):
+   the RTI Connext Security Plugins are not installed.  Several internal details are
+   self-consistent (our-to-our) but unverified against a live Connext peer:
+   - The internal-token-vs-CDR-DataHolder wire mapping (Slice 2b item).
+   - CDR-BE BinaryPropertySeq alignment for hash_c1/hash_c2/signature inputs.
+   - FFDH dh1/dh2 SPKI-DER encoding vs Connext.
+   - RSA-PSS saltlen=32 vs Connext's convention.
+
+   **Do NOT interpret this section as "cross-vendor authentication interop verified."**
+
+---
+
+## 7. Roadmap (M7/P6)
 
 | Slice | Description | Status |
 |---|---|---|
-| **1 (this page)** | Crypto plugin: AES256-GCM `SecuredPayload` + session-key KDF + `disc-node` integration | **LANDED** |
-| 2 | Authentication plugin (§8.7): PKIX-DH handshake, certificate exchange, per-writer derived session keys | pending |
+| **1** | Crypto plugin: AES256-GCM `SecuredPayload` + session-key KDF + `disc-node` integration (ADR 0031) | **LANDED** |
+| **2a** | Authentication plugin: PKI identity + §8.7.2.4 PKI-DH handshake → SharedSecret, both §9.3 suites, our-to-our (ADR 0032) | **LANDED** |
+| 2b | Authentication plugin: live discovery — IdentityToken in SPDP, ParticipantStatelessMessage token exchange, auth gate matching | pending |
+| 2c | Crypto key-exchange: derive `key-material` from SharedSecret → replace `make-test-key-material` | pending |
 | 3 | AccessControl plugin (§8.8): governance/permissions XML, topic-level policy enforcement | pending |
 | 4 | Secure discovery (§7.4.4): SPDP/SEDP participant/endpoint authentication | pending |
-| 5 | Connext-Security live interop: live cross-vendor byte-compare (the P6 exit gate) | pending |
-
-Slice 2 (Auth) replaces `make-test-key-material` with Auth-handshake-derived per-writer
-keys, resolves the single-instance nonce constraint, and eliminates the
-decode-failure-on-reliable-reader caveat (matched readers share keys by construction).
-See ADR 0031 §9.
+| 5 | Connext-Security live interop: live cross-vendor PKI-DH auth interop (the P6 exit gate) | pending |

@@ -39,5 +39,33 @@
    #:make-file-key-provider
    ;; Task 6b: foreign-backed secret-material lifetime (design spec §6)
    #:free-secret-octets
+   ;; X.509 / EVP_PKEY primitives (WP-DDS-SECURITY-AUTH-2A T1)
+   #:x509-load-cert
+   #:x509-free
+   #:x509-load-ca
+   #:x509-ca-free
+   #:x509-verify-chain
+   #:x509-public-key
+   #:x509-subject-name
+   #:pkey-load-private
+   #:pkey-free
+   #:pkey-kind
    ;; internal helper exported for tests
-   #:%ascii))
+   #:%ascii
+   ;; WP-DDS-SECURITY-AUTH-2A T2: ECDH/ECDSA/SHA-256/DER-export
+   #:sha-256
+   #:ecdh-gen-keypair
+   #:ecdh-compute
+   #:ecdsa-sign
+   #:ecdsa-verify
+   #:x509-to-der
+   #:x509-load-cert-der
+   #:random-bytes
+   ;; T2-fix: raw P-256 key import for KATs (EVP_PKEY_fromdata, OpenSSL 3.6.2)
+   #:ec-p256-import-private
+   #:ec-p256-import-public
+   ;; T3: FFDH MODP-2048 + RSA-PSS-SHA256 (DDS-Security 1.1 §9.3 DH+MODP-2048-256 suite)
+   #:ffdh-gen-keypair
+   #:ffdh-compute
+   #:rsa-pss-sign
+   #:rsa-pss-verify))

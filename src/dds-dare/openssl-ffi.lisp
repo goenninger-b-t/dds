@@ -163,8 +163,10 @@
 ;;; Layout per slot: key(8) data_type(4) pad(4) data(8) data_size(8) return_size(8).
 
 (defconstant +ossl-param-size+ 40)
-(defconstant +ossl-param-data-type-utf8-string+ 4)   ; core.h line 117
-(defconstant +ossl-param-data-type-octet-string+ 5)  ; core.h line 123
+(defconstant +ossl-param-data-type-integer+ 1)           ; OSSL_PARAM_INTEGER (core.h line 103) — signed int BN
+(defconstant +ossl-param-data-type-unsigned-integer+ 2)  ; OSSL_PARAM_UNSIGNED_INTEGER (core.h line 107) — BN "priv"
+(defconstant +ossl-param-data-type-utf8-string+ 4)       ; OSSL_PARAM_UTF8_STRING (core.h line 117)
+(defconstant +ossl-param-data-type-octet-string+ 5)      ; OSSL_PARAM_OCTET_STRING (core.h line 123)
 
 (defun* %set-ossl-param-slot (base idx key-ptr data-type data-ptr data-size)
     (function (cffi:foreign-pointer fixnum cffi:foreign-pointer fixnum cffi:foreign-pointer fixnum) t)
@@ -271,3 +273,223 @@
 (defconstant +ml-kem-1024-priv-len+  3168 "ML-KEM-1024 private key (dk) size in octets (FIPS-203 Table 2).")
 (defconstant +ml-kem-1024-ct-len+    1568 "ML-KEM-1024 ciphertext (c) size in octets (FIPS-203 Table 2).")
 (defconstant +ml-kem-1024-ss-len+      32 "ML-KEM-1024 shared secret (K) size in octets (FIPS-203 Table 2).")
+
+;;; X.509 / EVP_PKEY primitives for DDS-Security 1.1 §8.7 Authentication plugin (Auth T1).
+;;;
+;;; All function pointers resolved via (%ossl-sym ...) on *LIBCRYPTO* — the same handle-based
+;;; pattern as Task 1-3 (clasp#1793-safe, LibreSSL-collision-safe).
+;;;
+;;; Signatures verified against installed OpenSSL 3.6.2 headers:
+;;;   /opt/homebrew/opt/openssl@3/include/openssl/{pem.h,x509.h,x509_vfy.h,evp.h}
+;;;   C compilation of verification oracle confirmed no warnings (arm64-macOS 2026-06-23).
+;;;
+;;;   BIO_new_mem_buf(const void *buf, int len) -> BIO*   (bio.h line 783)
+;;;   BIO_free(BIO *a) -> int                             (bio.h line 733)
+;;;
+;;;   PEM_read_bio_X509(BIO *bp, X509 **x, pem_password_cb *cb, void *u) -> X509*
+;;;     (pem.h DECLARE_PEM_rw(X509, X509) -> PEM_read_cb_fnsig -> pem.h lines 75-77)
+;;;   X509_free(X509 *a) -> void                          (x509.h — OPENSSL_sk_free family)
+;;;
+;;;   X509_STORE_new(void) -> X509_STORE*                 (x509_vfy.h line 516)
+;;;   X509_STORE_free(X509_STORE *xs) -> void             (x509_vfy.h line 517)
+;;;   X509_STORE_add_cert(X509_STORE *xs, X509 *x) -> int (x509_vfy.h line 712)
+;;;
+;;;   X509_STORE_CTX_new(void) -> X509_STORE_CTX*         (x509_vfy.h line 585)
+;;;   X509_STORE_CTX_free(X509_STORE_CTX *ctx) -> void    (x509_vfy.h line 589)
+;;;   X509_STORE_CTX_init(X509_STORE_CTX*, X509_STORE*, X509*, NULL) -> int (x509_vfy.h line 590)
+;;;   X509_verify_cert(X509_STORE_CTX *ctx) -> int (>0=ok) (x509_vfy.h line 246)
+;;;
+;;;   X509_get_subject_name(const X509 *a) -> X509_NAME*  (x509.h line 857)
+;;;   X509_NAME_oneline(const X509_NAME*, char *buf, int size) -> char* (x509.h line 816)
+;;;     When buf=NULL + size=0, OpenSSL allocates the string; caller must OPENSSL_free it.
+;;;   CRYPTO_free(void *ptr, const char *file, int line) -> void
+;;;     OPENSSL_free(ptr) expands to CRYPTO_free(ptr,__FILE__,__LINE__); call directly with
+;;;     NULL file / 0 line to avoid needing compile-time macros.
+;;;
+;;;   X509_get_pubkey(X509 *x) -> EVP_PKEY*               (x509.h line 886)
+;;;   EVP_PKEY_free(EVP_PKEY *pkey) -> void               (evp.h line 1440)
+;;;   EVP_PKEY_get_id(const EVP_PKEY *pkey) -> int        (evp.h line 1364)
+;;;     EVP_PKEY_RSA = NID_rsaEncryption = 6  (obj_mac.h line 543)
+;;;     EVP_PKEY_EC  = NID_X9_62_id_ecPublicKey = 408 (obj_mac.h line 178)
+;;;
+;;;   PEM_read_bio_PrivateKey(BIO *bp, EVP_PKEY **x, pem_password_cb *cb, void *u) -> EVP_PKEY*
+;;;     (pem.h DECLARE_PEM_rw_cb macro, same cb pattern)
+
+(defconstant +evp-pkey-nid-rsa+  6
+  "NID_rsaEncryption = EVP_PKEY_RSA (obj_mac.h line 543 / evp.h line 63, OpenSSL 3.6.2).")
+(defconstant +evp-pkey-nid-ec+   408
+  "NID_X9_62_id_ecPublicKey = EVP_PKEY_EC (obj_mac.h line 178 / evp.h line 73, OpenSSL 3.6.2).")
+
+;;; --- X.509 / PEM load primitives ---
+
+;;; d2i_X509(X509 **a, const unsigned char **pp, long length) -> X509* (x509.h, OpenSSL 3.6.2).
+;;; DER-decode an X509 certificate from a raw DER buffer (as produced by i2d_X509 / x509-to-der).
+
+(defun* x509-load-cert-der (der-octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (or cffi:foreign-pointer null))
+  "Load an X.509 certificate from DER-OCTETS via d2i_X509 (x509.h, OpenSSL 3.6.2).
+   Returns a foreign X509* pointer (caller MUST release via X509-FREE) or NIL on failure.
+   Use this instead of X509-LOAD-CERT when the cert bytes are DER (from X509-TO-DER)."
+  (let* ((n (length der-octets)))
+    (cffi:with-foreign-pointer (buf n)
+      (dotimes (i n)
+        (setf (cffi:mem-aref buf :uint8 i) (aref der-octets i)))
+      (cffi:with-foreign-pointer (pp (cffi:foreign-type-size :pointer))
+        (setf (cffi:mem-ref pp :pointer) buf)
+        (let ((cert (cffi:foreign-funcall-pointer (%ossl-sym "d2i_X509") nil
+                                                   :pointer (cffi:null-pointer)
+                                                   :pointer pp
+                                                   :long n
+                                                   :pointer)))
+          (if (cffi:null-pointer-p cert) nil cert))))))
+
+(defun* x509-load-cert (pem-octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (or cffi:foreign-pointer null))
+  "Load an X.509 certificate from PEM-OCTETS via PEM_read_bio_X509 over a mem BIO.
+   Returns a foreign X509* pointer (caller MUST release via X509-FREE) or NIL on failure.
+   No GC heap allocation; the BIO and cert are OpenSSL-internal foreign objects."
+  (let* ((n (length pem-octets)))
+    (cffi:with-foreign-pointer (buf n)
+      (dotimes (i n)
+        (setf (cffi:mem-aref buf :uint8 i) (aref pem-octets i)))
+      (let ((bio (cffi:foreign-funcall-pointer (%ossl-sym "BIO_new_mem_buf") nil
+                                               :pointer buf :int n :pointer)))
+        (when (cffi:null-pointer-p bio)
+          (return-from x509-load-cert nil))
+        (unwind-protect
+             (let ((cert (cffi:foreign-funcall-pointer (%ossl-sym "PEM_read_bio_X509") nil
+                                                       :pointer bio
+                                                       :pointer (cffi:null-pointer)
+                                                       :pointer (cffi:null-pointer)
+                                                       :pointer (cffi:null-pointer)
+                                                       :pointer)))
+               (if (cffi:null-pointer-p cert) nil cert))
+          (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil :pointer bio :int))))))
+
+(defun* x509-free (cert)
+    (function ((or cffi:foreign-pointer null)) t)
+  "Release an X509* handle returned by X509-LOAD-CERT (X509_free, x509.h)."
+  (when (and cert (not (cffi:null-pointer-p cert)))
+    (cffi:foreign-funcall-pointer (%ossl-sym "X509_free") nil :pointer cert :void))
+  t)
+
+(defun* x509-load-ca (ca-pem-octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (or cffi:foreign-pointer null))
+  "Load a CA certificate into an X509_STORE trust store from CA-PEM-OCTETS.
+   Returns a foreign X509_STORE* pointer (caller MUST release via X509-CA-FREE) or NIL.
+   Uses X509_STORE_new + X509_STORE_add_cert (x509_vfy.h); stores keep the cert ref."
+  (let ((ca-cert (x509-load-cert ca-pem-octets)))
+    (unless ca-cert (return-from x509-load-ca nil))
+    (unwind-protect
+         (let ((store (cffi:foreign-funcall-pointer (%ossl-sym "X509_STORE_new") nil :pointer)))
+           (when (cffi:null-pointer-p store)
+             (return-from x509-load-ca nil))
+           (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "X509_STORE_add_cert") nil
+                                                   :pointer store :pointer ca-cert :int)))
+             (if (= rc 1)
+                 store
+                 (progn (cffi:foreign-funcall-pointer (%ossl-sym "X509_STORE_free") nil
+                                                      :pointer store :void)
+                        nil))))
+      (x509-free ca-cert))))
+
+(defun* x509-ca-free (store)
+    (function ((or cffi:foreign-pointer null)) t)
+  "Release an X509_STORE* returned by X509-LOAD-CA (X509_STORE_free, x509_vfy.h line 517)."
+  (when (and store (not (cffi:null-pointer-p store)))
+    (cffi:foreign-funcall-pointer (%ossl-sym "X509_STORE_free") nil :pointer store :void))
+  t)
+
+(defun* x509-verify-chain (ca-store cert)
+    (function (cffi:foreign-pointer cffi:foreign-pointer) boolean)
+  "Verify CERT (X509*) against CA-STORE (X509_STORE*) via X509_STORE_CTX.
+   Returns T if chain verifies; NIL on any error or verification failure (fail-closed).
+   Uses X509_STORE_CTX_new/init/X509_verify_cert/free (x509_vfy.h lines 585/590/246/589)."
+  (let ((ctx (cffi:foreign-funcall-pointer (%ossl-sym "X509_STORE_CTX_new") nil :pointer)))
+    (when (cffi:null-pointer-p ctx)
+      (return-from x509-verify-chain nil))
+    (unwind-protect
+         (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "X509_STORE_CTX_init") nil
+                                                 :pointer ctx
+                                                 :pointer ca-store
+                                                 :pointer cert
+                                                 :pointer (cffi:null-pointer)
+                                                 :int)))
+           (if (= rc 1)
+               (= 1 (cffi:foreign-funcall-pointer (%ossl-sym "X509_verify_cert") nil
+                                                   :pointer ctx :int))
+               nil))
+      (cffi:foreign-funcall-pointer (%ossl-sym "X509_STORE_CTX_free") nil :pointer ctx :void))))
+
+(defun* x509-subject-name (cert)
+    (function (cffi:foreign-pointer) (or string null))
+  "Extract the subject-name string from CERT (X509*) via X509_get_subject_name + X509_NAME_oneline.
+   Returns the /CN=.../O=... string (OpenSSL one-line format) or NIL on error.
+   The OpenSSL-allocated C string is copied into a Lisp string then freed via CRYPTO_free."
+  (let ((name (cffi:foreign-funcall-pointer (%ossl-sym "X509_get_subject_name") nil
+                                             :pointer cert :pointer)))
+    (when (cffi:null-pointer-p name) (return-from x509-subject-name nil))
+    (let ((str-ptr (cffi:foreign-funcall-pointer (%ossl-sym "X509_NAME_oneline") nil
+                                                 :pointer name
+                                                 :pointer (cffi:null-pointer)
+                                                 :int 0
+                                                 :pointer)))
+      (when (cffi:null-pointer-p str-ptr) (return-from x509-subject-name nil))
+      (unwind-protect
+           (cffi:foreign-string-to-lisp str-ptr)
+        (cffi:foreign-funcall-pointer (%ossl-sym "CRYPTO_free") nil
+                                      :pointer str-ptr
+                                      :pointer (cffi:null-pointer)
+                                      :int 0
+                                      :void)))))
+
+(defun* x509-public-key (cert)
+    (function (cffi:foreign-pointer) (or cffi:foreign-pointer null))
+  "Extract the public key EVP_PKEY* from CERT (X509*) via X509_get_pubkey (x509.h line 886).
+   Returns a foreign EVP_PKEY* (caller MUST release via PKEY-FREE) or NIL on error."
+  (let ((pk (cffi:foreign-funcall-pointer (%ossl-sym "X509_get_pubkey") nil
+                                           :pointer cert :pointer)))
+    (if (cffi:null-pointer-p pk) nil pk)))
+
+(defun* pkey-free (pkey)
+    (function ((or cffi:foreign-pointer null)) t)
+  "Release an EVP_PKEY* returned by X509-PUBLIC-KEY or PKEY-LOAD-PRIVATE (evp.h line 1440)."
+  (when (and pkey (not (cffi:null-pointer-p pkey)))
+    (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_free") nil :pointer pkey :void))
+  t)
+
+(defun* pkey-load-private (pem-octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (or cffi:foreign-pointer null))
+  "Load an EVP_PKEY* private key from PEM-OCTETS via PEM_read_bio_PrivateKey over a mem BIO.
+   Returns a foreign EVP_PKEY* (caller MUST release via PKEY-FREE) or NIL on failure.
+   The raw PEM bytes are in a foreign with-foreign-pointer buffer (never on GC heap as a secret)."
+  (let* ((n (length pem-octets)))
+    (cffi:with-foreign-pointer (buf n)
+      (dotimes (i n)
+        (setf (cffi:mem-aref buf :uint8 i) (aref pem-octets i)))
+      (let ((bio (cffi:foreign-funcall-pointer (%ossl-sym "BIO_new_mem_buf") nil
+                                               :pointer buf :int n :pointer)))
+        (when (cffi:null-pointer-p bio)
+          (return-from pkey-load-private nil))
+        (unwind-protect
+             (let ((pk (cffi:foreign-funcall-pointer (%ossl-sym "PEM_read_bio_PrivateKey") nil
+                                                     :pointer bio
+                                                     :pointer (cffi:null-pointer)
+                                                     :pointer (cffi:null-pointer)
+                                                     :pointer (cffi:null-pointer)
+                                                     :pointer)))
+               (if (cffi:null-pointer-p pk) nil pk))
+          (progn
+            (dotimes (i n) (setf (cffi:mem-aref buf :uint8 i) 0))
+            (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil :pointer bio :int)))))))
+
+(defun* pkey-kind (pkey)
+    (function (cffi:foreign-pointer) (member :ec :rsa))
+  "Return :EC or :RSA for the EVP_PKEY* handle via EVP_PKEY_get_id (evp.h line 1364).
+   NID_rsaEncryption=6, NID_X9_62_id_ecPublicKey=408 (obj_mac.h; OpenSSL 3.6.2).
+   Signals on an unrecognized key type."
+  (let ((id (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_get_id") nil
+                                           :pointer pkey :int)))
+    (cond ((= id +evp-pkey-nid-rsa+) :rsa)
+          ((= id +evp-pkey-nid-ec+)  :ec)
+          (t (error "pkey-kind: unrecognized EVP_PKEY NID ~d" id)))))

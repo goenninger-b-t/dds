@@ -514,6 +514,20 @@
     (dds.pal:free-static v))
   nil)
 
+;;; RAND_bytes wrapper — exported for DDS-Security nonce generation (not a secret; plain heap vector).
+;;; RAND_bytes(unsigned char *buf, int num) -> int (1=ok); rand.h (OpenSSL 3.6.2).
+
+(defun* random-bytes (n)
+    (function ((unsigned-byte 32)) (simple-array (unsigned-byte 8) (*)))
+  "Generate N cryptographically random bytes via RAND_bytes (rand.h, OpenSSL 3.6.2).
+   Returns a plain heap octet vector. Nonces are not secret. Signals on RAND_bytes failure."
+  (cffi:with-foreign-pointer (buf n)
+    (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "RAND_bytes") nil
+                                             :pointer buf :int n :int)))
+      (unless (= rc 1)
+        (error "RAND_bytes(~a) failed (rc=~a)" n rc))
+      (%foreign->octets buf n))))
+
 (defun* ml-kem-1024-keygen ()
     (function () (values (simple-array (unsigned-byte 8) (*))
                          (simple-array (unsigned-byte 8) (*))))
@@ -637,6 +651,756 @@
                               (values ct ss)))))))
                (%evp-pkey-ctx-free ctx)))
         (%evp-pkey-free pkey)))))
+
+;;; SHA-256 one-shot digest — EVP_Q_digest(NULL,"SHA-256",NULL,...) (evp.h line 744, OpenSSL 3.6.2).
+;;; DDS-Security 1.1 §9.3.2 uses SHA-256 for hash_c1, hash_c2, and SharedSecret derivation.
+
+(defconstant +sha256-digest-len+ 32 "SHA-256 output length in octets (FIPS 180-4 §6.2).")
+
+(defun* sha-256 (octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (32)))
+  "Return SHA-256(OCTETS) as a fresh 32-byte heap vector via EVP_Q_digest (evp.h line 744).
+   Source: FIPS 180-4 §6.2. KAT: SHA-256('') = e3b0c44...b855 (NIST FIPS 180-4 §6.2 test vector)."
+  (let* ((n (length octets))
+         (out (make-array +sha256-digest-len+ :element-type '(unsigned-byte 8))))
+    (cffi:with-foreign-pointer (in-ptr (max 1 n))
+      (dotimes (i n)
+        (setf (cffi:mem-aref in-ptr :uint8 i) (aref octets i)))
+      (cffi:with-foreign-pointer (md-ptr +sha256-digest-len+)
+        (cffi:with-foreign-pointer (mdlen-ptr (cffi:foreign-type-size :size))
+          (setf (cffi:mem-ref mdlen-ptr :size) +sha256-digest-len+)
+          (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_Q_digest") nil
+                                          :pointer (cffi:null-pointer)
+                                          :string "SHA-256"
+                                          :pointer (cffi:null-pointer)
+                                          :pointer in-ptr
+                                          :size n
+                                          :pointer md-ptr
+                                          :pointer mdlen-ptr
+                                          :int)))
+            (unless (= rc 1)
+              (dotimes (i +sha256-digest-len+)
+                (setf (cffi:mem-aref md-ptr :uint8 i) 0))
+              (error "EVP_Q_digest(SHA-256) failed (rc=~a)" rc))
+            (dotimes (i +sha256-digest-len+)
+              (setf (aref out i) (cffi:mem-aref md-ptr :uint8 i)))
+            (dotimes (i +sha256-digest-len+)
+              (setf (cffi:mem-aref md-ptr :uint8 i) 0))))))
+    out))
+
+;;; x509-to-der: DER-encode an X509* handle via i2d_X509 (x509.h line 743, OpenSSL 3.6.2).
+;;; i2d_X509(X509 *a, unsigned char **pp) -> int (bytes written, <0=error).
+;;; With pp pointing to a NULL pointer, OpenSSL allocates the DER buffer; caller must CRYPTO_free it.
+;;; SubjectPublicKeyInfo DER (via i2d_PUBKEY) used for dh1/dh2 in DDS-Security §9.3.2.1.
+
+(defun* x509-to-der (cert)
+    (function (cffi:foreign-pointer) (or (simple-array (unsigned-byte 8) (*)) null))
+  "DER-encode X509* CERT via i2d_X509 (x509.h, OpenSSL 3.6.2). Returns fresh heap vector or NIL."
+  (cffi:with-foreign-pointer (pp (cffi:foreign-type-size :pointer))
+    (setf (cffi:mem-ref pp :pointer) (cffi:null-pointer))
+    (let ((derlen (cffi:foreign-funcall-pointer (%ossl-sym "i2d_X509") nil
+                                                 :pointer cert :pointer pp :int)))
+      (when (< derlen 0) (return-from x509-to-der nil))
+      (let ((der-ptr (cffi:mem-ref pp :pointer)))
+        (unwind-protect
+             (let ((v (make-array derlen :element-type '(unsigned-byte 8))))
+               (dotimes (i derlen v)
+                 (setf (aref v i) (cffi:mem-aref der-ptr :uint8 i))))
+          (cffi:foreign-funcall-pointer (%ossl-sym "CRYPTO_free") nil
+                                        :pointer der-ptr
+                                        :pointer (cffi:null-pointer)
+                                        :int 0
+                                        :void))))))
+
+;;; EC P-256 key import from raw scalar + uncompressed point (for KATs and externally-supplied keys).
+;;;
+;;; EVP_PKEY_fromdata_init(ctx) -> int (evp.h line 2078, OpenSSL 3.6.2).
+;;; EVP_PKEY_fromdata(ctx, **ppkey, selection, params) -> int (evp.h line 2079, OpenSSL 3.6.2).
+;;; selection constants (evp.h line 106–113, core_dispatch.h line 640–651):
+;;;   EVP_PKEY_PUBLIC_KEY = 0x86 (ALL_PARAMS|PUBLIC_KEY), EVP_PKEY_KEYPAIR = 0x87 (+PRIVATE_KEY).
+;;; OSSL_PARAM for EC key import (core_names.h):
+;;;   "group" (UTF8_STRING, "prime256v1"), "priv" (UNSIGNED_INTEGER, BN in LE byte order),
+;;;   "pub"   (OCTET_STRING, uncompressed point 0x04||X||Y, 65 bytes).
+;;; CRITICAL: OpenSSL OSSL_PARAM BN (type UNSIGNED_INTEGER=2) is stored in little-endian byte order
+;;;   on LE hosts (BN_bn2nativepad; OpenSSL crypto/params.c). Standard EC scalars are big-endian, so
+;;;   the caller must reverse the scalar bytes before providing them as the UNSIGNED_INTEGER buffer.
+;;; The public point (OCTET_STRING "pub") is passed as-is (no endian conversion needed).
+
+(defconstant +evp-pkey-public-key+  #x86 "EVP_PKEY selection: public key + domain parameters (evp.h line 110).")
+(defconstant +evp-pkey-keypair+     #x87 "EVP_PKEY selection: keypair (public + private + params) (evp.h line 112).")
+
+(defun* ec-p256-import-private (scalar-octets point-octets)
+    (function ((simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              cffi:foreign-pointer)
+  "Import a P-256 private key (KEYPAIR) from SCALAR-OCTETS (32 BE bytes, the scalar d) and
+   POINT-OCTETS (65 bytes, uncompressed 0x04||X||Y). Returns EVP_PKEY* (caller MUST release
+   via PKEY-FREE). The scalar is reversed to little-endian before passing to the UNSIGNED_INTEGER
+   OSSL_PARAM (OpenSSL BN native byte order on LE hosts; core_dispatch.h + crypto/params.c).
+   Uses EVP_PKEY_fromdata(KEYPAIR=0x87) (evp.h line 2079, OpenSSL 3.6.2). Signals on failure."
+  (assert (= (length scalar-octets) 32))
+  (assert (and (= (length point-octets) 65) (= (aref point-octets 0) #x04)))
+  (cffi:with-foreign-pointer (scalar-le 32)
+    (cffi:with-foreign-pointer (pub-ptr 65)
+      (dotimes (i 32)
+        (setf (cffi:mem-aref scalar-le :uint8 i) (aref scalar-octets (- 31 i))))
+      (dotimes (i 65)
+        (setf (cffi:mem-aref pub-ptr :uint8 i) (aref point-octets i)))
+      (cffi:with-foreign-pointer (params (* 4 +ossl-param-size+))
+        (cffi:with-foreign-string (p-group "group")
+          (cffi:with-foreign-string (v-p256  "prime256v1")
+            (cffi:with-foreign-string (p-priv  "priv")
+              (cffi:with-foreign-string (p-pub   "pub")
+                (%set-ossl-param-slot params 0 p-group +ossl-param-data-type-utf8-string+ v-p256 10)
+                (%set-ossl-param-slot params 1 p-priv  +ossl-param-data-type-unsigned-integer+ scalar-le 32)
+                (%set-ossl-param-slot params 2 p-pub   +ossl-param-data-type-octet-string+ pub-ptr 65)
+                (%set-ossl-param-end  params 3)
+                (let ((kctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_CTX_new_from_name") nil
+                                                           :pointer (cffi:null-pointer)
+                                                           :string "EC"
+                                                           :pointer (cffi:null-pointer)
+                                                           :pointer)))
+                  (when (cffi:null-pointer-p kctx)
+                    (error "EVP_PKEY_CTX_new_from_name(EC) returned NULL"))
+                  (unwind-protect
+                       (progn
+                         (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_fromdata_init") nil
+                                                                  :pointer kctx :int)))
+                           (unless (= rc 1)
+                             (error "EVP_PKEY_fromdata_init failed (rc=~a)" rc)))
+                         (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
+                           (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
+                           (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_fromdata") nil
+                                                                    :pointer kctx
+                                                                    :pointer ppkey
+                                                                    :int +evp-pkey-keypair+
+                                                                    :pointer params
+                                                                    :int)))
+                             (unless (= rc 1)
+                               (%zeroize-foreign scalar-le 32)
+                               (error "EVP_PKEY_fromdata(EC KEYPAIR) failed (rc=~a)" rc))
+                             (%zeroize-foreign scalar-le 32)
+                             (cffi:mem-ref ppkey :pointer))))
+                    (%evp-pkey-ctx-free kctx)))))))))))
+
+(defun* ec-p256-import-public (point-octets)
+    (function ((simple-array (unsigned-byte 8) (*))) cffi:foreign-pointer)
+  "Import a P-256 public key from POINT-OCTETS (65 bytes, uncompressed 0x04||X||Y).
+   Returns EVP_PKEY* (caller MUST release via PKEY-FREE).
+   Uses EVP_PKEY_fromdata(PUBLIC_KEY=0x86) with OSSL_PARAM 'pub' (OCTET_STRING).
+   (evp.h line 2079, core_names.h, OpenSSL 3.6.2). Signals on failure."
+  (assert (and (= (length point-octets) 65) (= (aref point-octets 0) #x04)))
+  (cffi:with-foreign-pointer (pub-ptr 65)
+    (dotimes (i 65)
+      (setf (cffi:mem-aref pub-ptr :uint8 i) (aref point-octets i)))
+    (cffi:with-foreign-pointer (params (* 3 +ossl-param-size+))
+      (cffi:with-foreign-string (p-group "group")
+        (cffi:with-foreign-string (v-p256  "prime256v1")
+          (cffi:with-foreign-string (p-pub   "pub")
+            (%set-ossl-param-slot params 0 p-group +ossl-param-data-type-utf8-string+ v-p256 10)
+            (%set-ossl-param-slot params 1 p-pub   +ossl-param-data-type-octet-string+ pub-ptr 65)
+            (%set-ossl-param-end  params 2)
+            (let ((kctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_CTX_new_from_name") nil
+                                                       :pointer (cffi:null-pointer)
+                                                       :string "EC"
+                                                       :pointer (cffi:null-pointer)
+                                                       :pointer)))
+              (when (cffi:null-pointer-p kctx)
+                (error "EVP_PKEY_CTX_new_from_name(EC) returned NULL"))
+              (unwind-protect
+                   (progn
+                     (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_fromdata_init") nil
+                                                              :pointer kctx :int)))
+                       (unless (= rc 1)
+                         (error "EVP_PKEY_fromdata_init failed (rc=~a)" rc)))
+                     (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
+                       (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
+                       (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_fromdata") nil
+                                                                :pointer kctx
+                                                                :pointer ppkey
+                                                                :int +evp-pkey-public-key+
+                                                                :pointer params
+                                                                :int)))
+                         (unless (= rc 1)
+                           (error "EVP_PKEY_fromdata(EC PUBLIC_KEY) failed (rc=~a)" rc))
+                         (cffi:mem-ref ppkey :pointer))))
+                (%evp-pkey-ctx-free kctx)))))))))
+
+;;; EC P-256 ephemeral key generation for ECDH (DDS-Security 1.1 §9.3 ECDH+prime256v1-CEUM).
+;;;
+;;; OpenSSL 3.x OSSL_PARAM approach (EVP_PKEY_CTX_new_from_name + keygen_init +
+;;;   EVP_PKEY_CTX_set_params(group="prime256v1") + EVP_PKEY_generate); evp.h, OpenSSL 3.6.2.
+;;; i2d_PUBKEY(pkey, &pp) -> derlen: SubjectPublicKeyInfo DER; x509.h line 735.
+;;; dh1/dh2 wire format = SubjectPublicKeyInfo DER (per Fast DDS PKIDH.cpp i2d_PUBKEY usage).
+;;; OSSL_PARAM "group" = OSSL_PKEY_PARAM_GROUP_NAME (core_names.h); data_size = strlen (no NUL).
+
+(defun* ecdh-gen-keypair ()
+    (function () (values (simple-array (unsigned-byte 8) (*)) cffi:foreign-pointer))
+  "Generate ephemeral EC P-256 key pair (DDS-Security 1.1 §9.3 ECDH+prime256v1-CEUM).
+   Returns (values PUB-DER PRIV-PKEY): PUB-DER = SubjectPublicKeyInfo DER (dh1/dh2 wire format,
+   per Fast DDS PKIDH.cpp i2d_PUBKEY); PRIV-PKEY = EVP_PKEY* (caller MUST release via PKEY-FREE)."
+  (let ((kctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_CTX_new_from_name") nil
+                                             :pointer (cffi:null-pointer)
+                                             :string "EC"
+                                             :pointer (cffi:null-pointer)
+                                             :pointer)))
+    (when (cffi:null-pointer-p kctx)
+      (error "EVP_PKEY_CTX_new_from_name(EC) returned NULL"))
+    (unwind-protect
+         (progn
+           (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_keygen_init") nil
+                                                    :pointer kctx :int)))
+             (unless (= rc 1)
+               (error "EVP_PKEY_keygen_init(EC) failed (rc=~a)" rc)))
+           (cffi:with-foreign-pointer (params (* 2 +ossl-param-size+))
+             (cffi:with-foreign-string (p-group "group")
+               (cffi:with-foreign-string (v-p256 "prime256v1")
+                 (%set-ossl-param-slot params 0 p-group
+                                       +ossl-param-data-type-utf8-string+
+                                       v-p256 (length "prime256v1"))
+                 (%set-ossl-param-end params 1)
+                 (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_CTX_set_params") nil
+                                                          :pointer kctx :pointer params :int)))
+                   (unless (= rc 1)
+                     (error "EVP_PKEY_CTX_set_params(group=prime256v1) failed (rc=~a)" rc)))))
+             (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
+               (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
+               (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_generate") nil
+                                                        :pointer kctx :pointer ppkey :int)))
+                 (unless (= rc 1)
+                   (error "EVP_PKEY_generate(EC P-256) failed (rc=~a)" rc)))
+               (let ((pkey (cffi:mem-ref ppkey :pointer)))
+                 (cffi:with-foreign-pointer (pp (cffi:foreign-type-size :pointer))
+                   (setf (cffi:mem-ref pp :pointer) (cffi:null-pointer))
+                   (let ((derlen (cffi:foreign-funcall-pointer (%ossl-sym "i2d_PUBKEY") nil
+                                                                :pointer pkey :pointer pp :int)))
+                     (when (< derlen 0)
+                       (%evp-pkey-free pkey)
+                       (error "i2d_PUBKEY failed (rc=~a)" derlen))
+                     (let ((der-ptr (cffi:mem-ref pp :pointer)))
+                       (unwind-protect
+                            (let ((pub (%foreign->octets der-ptr derlen)))
+                              (values pub pkey))
+                         (cffi:foreign-funcall-pointer (%ossl-sym "CRYPTO_free") nil
+                                                       :pointer der-ptr
+                                                       :pointer (cffi:null-pointer)
+                                                       :int 0
+                                                       :void)))))))))
+      (%evp-pkey-ctx-free kctx))))
+
+;;; ECDH key agreement — EVP_PKEY_derive_init + EVP_PKEY_derive_set_peer + EVP_PKEY_derive.
+;;; d2i_PUBKEY(EVP_PKEY **a, const unsigned char **pp, long length) -> EVP_PKEY* (x509.h).
+;;; EVP_PKEY_derive_init(ctx) -> int (evp.h line 2127); _set_peer(ctx,peer) (evp.h line 2128).
+;;; EVP_PKEY_derive(ctx, key, *keylen) -> int (evp.h line 2131); NULL key queries size.
+
+(defun* ecdh-compute (priv-handle peer-pub-octets)
+    (function (cffi:foreign-pointer (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "ECDH key agreement: raw x-coordinate from PRIV-HANDLE (EVP_PKEY*) + PEER-PUB-OCTETS (SPKI DER).
+   PEER-PUB-OCTETS is SubjectPublicKeyInfo DER (dh2 from wire); imported via d2i_PUBKEY (x509.h).
+   Returns 32-byte raw ECDH agreed value. Caller must SHA-256(result) for DDS-Security §9.3.3."
+  (let ((peer-n (length peer-pub-octets)))
+    (cffi:with-foreign-pointer (peer-ptr peer-n)
+      (dotimes (i peer-n)
+        (setf (cffi:mem-aref peer-ptr :uint8 i) (aref peer-pub-octets i)))
+      (cffi:with-foreign-pointer (pp (cffi:foreign-type-size :pointer))
+        (setf (cffi:mem-ref pp :pointer) peer-ptr)
+        (let ((peer-pkey (cffi:foreign-funcall-pointer (%ossl-sym "d2i_PUBKEY") nil
+                                                        :pointer (cffi:null-pointer)
+                                                        :pointer pp
+                                                        :long peer-n
+                                                        :pointer)))
+          (when (cffi:null-pointer-p peer-pkey)
+            (error "d2i_PUBKEY failed (malformed peer SubjectPublicKeyInfo DER)"))
+          (unwind-protect
+               (let ((ctx (%evp-pkey-ctx-from-pkey priv-handle)))
+                 (unwind-protect
+                      (progn
+                        (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive_init") nil
+                                                                 :pointer ctx :int)))
+                          (unless (= rc 1)
+                            (error "EVP_PKEY_derive_init failed (rc=~a)" rc)))
+                        (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive_set_peer") nil
+                                                                 :pointer ctx :pointer peer-pkey :int)))
+                          (unless (= rc 1)
+                            (error "EVP_PKEY_derive_set_peer failed (rc=~a)" rc)))
+                        (cffi:with-foreign-pointer (keylen-ptr (cffi:foreign-type-size :size))
+                          (setf (cffi:mem-ref keylen-ptr :size) 0)
+                          (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive") nil
+                                                                   :pointer ctx
+                                                                   :pointer (cffi:null-pointer)
+                                                                   :pointer keylen-ptr
+                                                                   :int)))
+                            (unless (= rc 1)
+                              (error "EVP_PKEY_derive(size-query) failed (rc=~a)" rc)))
+                          (let ((klen (cffi:mem-ref keylen-ptr :size)))
+                            (cffi:with-foreign-pointer (key-ptr klen)
+                              (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive") nil
+                                                                       :pointer ctx
+                                                                       :pointer key-ptr
+                                                                       :pointer keylen-ptr
+                                                                       :int)))
+                                (unless (= rc 1)
+                                  (%zeroize-foreign key-ptr klen)
+                                  (error "EVP_PKEY_derive failed (rc=~a)" rc)))
+                              (let ((result (%foreign->octets key-ptr klen)))
+                                (%zeroize-foreign key-ptr klen)
+                                result)))))
+                   (%evp-pkey-ctx-free ctx)))
+            (%evp-pkey-free peer-pkey)))))))
+
+;;; ECDSA-SHA256 sign/verify via EVP_DigestSign/Verify API (evp.h, OpenSSL 3.6.2).
+;;; EVP_MD_CTX_new / EVP_MD_CTX_free (evp.h); EVP_sha256() -> const EVP_MD* (evp.h).
+;;; EVP_DigestSignInit(ctx, NULL, md, NULL, pkey) -> int (evp.h).
+;;; EVP_DigestSignUpdate(ctx, data, len) -> int (evp.h).
+;;; EVP_DigestSignFinal(ctx, sig, &siglen) -> int (1=ok) (evp.h); NULL sig queries size.
+;;; EVP_DigestVerifyFinal(ctx, sig, siglen) -> int (1=ok, 0=fail, <0=error) (evp.h).
+
+(defun* ecdsa-sign (priv-handle data)
+    (function (cffi:foreign-pointer (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "ECDSA-SHA256 sign: DER-encoded signature over DATA using PRIV-HANDLE (EVP_PKEY*).
+   Uses EVP_DigestSignInit(SHA256)+Update+Final (evp.h, OpenSSL 3.6.2). Returns heap octet vector."
+  (let* ((data-n (length data))
+         (md-ctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_new") nil :pointer)))
+    (when (cffi:null-pointer-p md-ctx)
+      (error "EVP_MD_CTX_new returned NULL"))
+    (unwind-protect
+         (progn
+           (let ((sha256 (cffi:foreign-funcall-pointer (%ossl-sym "EVP_sha256") nil :pointer)))
+             (when (cffi:null-pointer-p sha256)
+               (error "EVP_sha256 returned NULL"))
+             (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestSignInit") nil
+                                                      :pointer md-ctx
+                                                      :pointer (cffi:null-pointer)
+                                                      :pointer sha256
+                                                      :pointer (cffi:null-pointer)
+                                                      :pointer priv-handle
+                                                      :int)))
+               (unless (= rc 1)
+                 (error "EVP_DigestSignInit failed (rc=~a)" rc))))
+           (cffi:with-foreign-pointer (data-ptr (max 1 data-n))
+             (dotimes (i data-n)
+               (setf (cffi:mem-aref data-ptr :uint8 i) (aref data i)))
+             (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestSignUpdate") nil
+                                                      :pointer md-ctx
+                                                      :pointer data-ptr
+                                                      :size data-n
+                                                      :int)))
+               (unless (= rc 1)
+                 (error "EVP_DigestSignUpdate failed (rc=~a)" rc))))
+           (cffi:with-foreign-pointer (siglen-ptr (cffi:foreign-type-size :size))
+             (setf (cffi:mem-ref siglen-ptr :size) 0)
+             (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestSignFinal") nil
+                                                      :pointer md-ctx
+                                                      :pointer (cffi:null-pointer)
+                                                      :pointer siglen-ptr
+                                                      :int)))
+               (unless (= rc 1)
+                 (error "EVP_DigestSignFinal(size-query) failed (rc=~a)" rc)))
+             (let ((max-siglen (cffi:mem-ref siglen-ptr :size)))
+               (cffi:with-foreign-pointer (sig-ptr max-siglen)
+                 (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestSignFinal") nil
+                                                          :pointer md-ctx
+                                                          :pointer sig-ptr
+                                                          :pointer siglen-ptr
+                                                          :int)))
+                   (unless (= rc 1)
+                     (error "EVP_DigestSignFinal failed (rc=~a)" rc)))
+                 ;; Re-read siglen-ptr: actual written length may be less than max-siglen
+                 (let ((actual-siglen (cffi:mem-ref siglen-ptr :size)))
+                   (%foreign->octets sig-ptr actual-siglen))))))
+      (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_free") nil :pointer md-ctx :void))))
+
+(defun* ecdsa-verify (pub-handle data sig)
+    (function (cffi:foreign-pointer
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              boolean)
+  "ECDSA-SHA256 verify: T if SIG is valid over DATA under PUB-HANDLE (EVP_PKEY*).
+   Uses EVP_DigestVerifyInit(SHA256)+Update+Final (evp.h, OpenSSL 3.6.2). Fail-closed: NIL on error."
+  (let* ((data-n (length data))
+         (sig-n  (length sig))
+         (md-ctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_new") nil :pointer)))
+    (when (cffi:null-pointer-p md-ctx)
+      (return-from ecdsa-verify nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (let ((sha256 (cffi:foreign-funcall-pointer (%ossl-sym "EVP_sha256") nil :pointer)))
+                 (when (cffi:null-pointer-p sha256) (return-from ecdsa-verify nil))
+                 (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestVerifyInit") nil
+                                                          :pointer md-ctx
+                                                          :pointer (cffi:null-pointer)
+                                                          :pointer sha256
+                                                          :pointer (cffi:null-pointer)
+                                                          :pointer pub-handle
+                                                          :int)))
+                   (unless (= rc 1) (return-from ecdsa-verify nil))))
+               (cffi:with-foreign-pointer (data-ptr (max 1 data-n))
+                 (dotimes (i data-n)
+                   (setf (cffi:mem-aref data-ptr :uint8 i) (aref data i)))
+                 (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestVerifyUpdate") nil
+                                                          :pointer md-ctx
+                                                          :pointer data-ptr
+                                                          :size data-n
+                                                          :int)))
+                   (unless (= rc 1) (return-from ecdsa-verify nil))))
+               (cffi:with-foreign-pointer (sig-ptr (max 1 sig-n))
+                 (dotimes (i sig-n)
+                   (setf (cffi:mem-aref sig-ptr :uint8 i) (aref sig i)))
+                 (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestVerifyFinal") nil
+                                                          :pointer md-ctx
+                                                          :pointer sig-ptr
+                                                          :size sig-n
+                                                          :int)))
+                   (= rc 1))))
+           (error () nil))
+      (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_free") nil :pointer md-ctx :void))))
+
+;;; FFDH MODP-2048 (DH+MODP-2048-256) key generation and key agreement.
+;;;
+;;; OpenSSL approach: EVP_PKEY_CTX_new_from_name(NULL,"DH",NULL) + fromdata(KEY_PARAMETERS) to
+;;; import p/g, then EVP_PKEY_CTX_new(tmpl,NULL) + keygen to produce a private key + public value.
+;;; Agreement: EVP_PKEY_derive (raw DH output, 256 bytes for 2048-bit group). Caller SHA-256s it.
+;;;
+;;; Wire encoding of dh1/dh2: SubjectPublicKeyInfo DER via i2d_PUBKEY (same as ECDH — see Fast DDS
+;;; PKIDH.cpp which uses i2d_PUBKEY for both ECDH and FFDH). On import, d2i_PUBKEY recovers the key.
+;;;
+;;; OSSL_PARAM names for DH (verified against /opt/homebrew/opt/openssl@3/include/openssl/core_names.h
+;;; OpenSSL 3.6.2 7 Apr 2026):
+;;;   OSSL_PKEY_PARAM_FFC_P = "p"  (core_names.h)
+;;;   OSSL_PKEY_PARAM_FFC_G = "g"  (core_names.h)
+;;; EVP_PKEY_KEY_PARAMETERS selection = 0x01 (evp.h line 104).
+;;; BN parameters use OSSL_PARAM_UNSIGNED_INTEGER = 2 (core.h line 107, OpenSSL 3.6.2).
+
+(defconstant +evp-pkey-key-parameters+ 1
+  "EVP_PKEY selection flag: domain parameters only (evp.h line 104, OpenSSL 3.6.2).")
+;;; OSSL_PARAM_UNSIGNED_INTEGER = 2 (core.h line 103, OpenSSL 3.6.2) — same as existing
+;;; +ossl-param-data-type-unsigned-integer+ = 2 defined in openssl-ffi.lisp.
+;;; Alias used here for clarity in the DH/RSA fromdata context.
+
+(defun* %dh-build-params-pkey (p-octets g-octets)
+    (function ((simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              (or cffi:foreign-pointer null))
+  "Import MODP-2048 (p,g) parameters via EVP_PKEY_fromdata(KEY_PARAMETERS,'DH') from big-endian BN.
+   Returns an EVP_PKEY* parameter template or NIL on failure (caller must release via %EVP-PKEY-FREE)."
+  (let* ((p-n (length p-octets))
+         (g-n (length g-octets)))
+    (cffi:with-foreign-pointer (p-ptr p-n)
+      (cffi:with-foreign-pointer (g-ptr g-n)
+        (dotimes (i p-n)
+          (setf (cffi:mem-aref p-ptr :uint8 i) (aref p-octets i)))
+        (dotimes (i g-n)
+          (setf (cffi:mem-aref g-ptr :uint8 i) (aref g-octets i)))
+        (cffi:with-foreign-pointer (params (* 3 +ossl-param-size+))
+          (cffi:with-foreign-string (pname "p")
+            (cffi:with-foreign-string (gname "g")
+              (%set-ossl-param-slot params 0 pname +ossl-param-data-type-unsigned-integer+ p-ptr p-n)
+              (%set-ossl-param-slot params 1 gname +ossl-param-data-type-unsigned-integer+ g-ptr g-n)
+              (%set-ossl-param-end  params 2)
+              (let ((kctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_CTX_new_from_name") nil
+                                                         :pointer (cffi:null-pointer)
+                                                         :string "DH"
+                                                         :pointer (cffi:null-pointer)
+                                                         :pointer)))
+                (when (cffi:null-pointer-p kctx)
+                  (return-from %dh-build-params-pkey nil))
+                (unwind-protect
+                     (progn
+                       (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_fromdata_init") nil
+                                                                :pointer kctx :int)))
+                         (unless (= rc 1)
+                           (return-from %dh-build-params-pkey nil)))
+                       (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
+                         (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
+                         (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_fromdata") nil
+                                                                  :pointer kctx
+                                                                  :pointer ppkey
+                                                                  :int +evp-pkey-key-parameters+
+                                                                  :pointer params
+                                                                  :int)))
+                           (if (= rc 1)
+                               (cffi:mem-ref ppkey :pointer)
+                               nil))))
+                  (%evp-pkey-ctx-free kctx))))))))))
+
+(defun* ffdh-gen-keypair (p-octets g-octets)
+    (function ((simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              (values (simple-array (unsigned-byte 8) (*)) cffi:foreign-pointer))
+  "Generate ephemeral FFDH key pair over the group defined by P-OCTETS and G-OCTETS (big-endian BN).
+   Returns (values PUB-DER PRIV-PKEY): PUB-DER = SubjectPublicKeyInfo DER (dh1/dh2 wire encoding,
+   per Fast DDS PKIDH.cpp i2d_PUBKEY); PRIV-PKEY = EVP_PKEY* (caller MUST release via PKEY-FREE).
+   Designed for DH+MODP-2048-256 (DDS-Security 1.1 §9.3, RFC 3526 §3 Group 14)."
+  (let ((tmpl (%dh-build-params-pkey p-octets g-octets)))
+    (unless tmpl (error "ffdh-gen-keypair: failed to build DH parameter template"))
+    (unwind-protect
+         (let ((gctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_CTX_new") nil
+                                                    :pointer tmpl
+                                                    :pointer (cffi:null-pointer)
+                                                    :pointer)))
+           (when (cffi:null-pointer-p gctx)
+             (error "ffdh-gen-keypair: EVP_PKEY_CTX_new returned NULL"))
+           (unwind-protect
+                (progn
+                  (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_keygen_init") nil
+                                                           :pointer gctx :int)))
+                    (unless (= rc 1)
+                      (error "ffdh-gen-keypair: EVP_PKEY_keygen_init failed (rc=~a)" rc)))
+                  (cffi:with-foreign-pointer (ppkey (cffi:foreign-type-size :pointer))
+                    (setf (cffi:mem-ref ppkey :pointer) (cffi:null-pointer))
+                    (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_keygen") nil
+                                                             :pointer gctx :pointer ppkey :int)))
+                      (unless (= rc 1)
+                        (error "ffdh-gen-keypair: EVP_PKEY_keygen failed (rc=~a)" rc)))
+                    (let ((pkey (cffi:mem-ref ppkey :pointer)))
+                      (cffi:with-foreign-pointer (pp (cffi:foreign-type-size :pointer))
+                        (setf (cffi:mem-ref pp :pointer) (cffi:null-pointer))
+                        (let ((derlen (cffi:foreign-funcall-pointer (%ossl-sym "i2d_PUBKEY") nil
+                                                                     :pointer pkey :pointer pp :int)))
+                          (when (< derlen 0)
+                            (%evp-pkey-free pkey)
+                            (error "ffdh-gen-keypair: i2d_PUBKEY failed (rc=~a)" derlen))
+                          (let ((der-ptr (cffi:mem-ref pp :pointer)))
+                            (unwind-protect
+                                 (let ((pub (%foreign->octets der-ptr derlen)))
+                                   (values pub pkey))
+                              (cffi:foreign-funcall-pointer (%ossl-sym "CRYPTO_free") nil
+                                                            :pointer der-ptr
+                                                            :pointer (cffi:null-pointer)
+                                                            :int 0
+                                                            :void))))))))
+             (%evp-pkey-ctx-free gctx)))
+      (%evp-pkey-free tmpl))))
+
+(defun* ffdh-compute (priv-handle peer-pub-octets)
+    (function (cffi:foreign-pointer (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "FFDH key agreement: raw DH agreed value from PRIV-HANDLE (EVP_PKEY*) + PEER-PUB-OCTETS (SPKI DER).
+   PEER-PUB-OCTETS is SubjectPublicKeyInfo DER (dh2 from wire); imported via d2i_PUBKEY (x509.h).
+   Returns the raw DH output (256 bytes for MODP-2048). Caller MUST SHA-256 it per DDS-Security §9.3.3.
+   Wire encoding: SubjectPublicKeyInfo DER (i2d_PUBKEY), consistent with ECDH dh1/dh2 encoding."
+  (let ((peer-n (length peer-pub-octets)))
+    (cffi:with-foreign-pointer (peer-ptr peer-n)
+      (dotimes (i peer-n)
+        (setf (cffi:mem-aref peer-ptr :uint8 i) (aref peer-pub-octets i)))
+      (cffi:with-foreign-pointer (pp (cffi:foreign-type-size :pointer))
+        (setf (cffi:mem-ref pp :pointer) peer-ptr)
+        (let ((peer-pkey (cffi:foreign-funcall-pointer (%ossl-sym "d2i_PUBKEY") nil
+                                                        :pointer (cffi:null-pointer)
+                                                        :pointer pp
+                                                        :long peer-n
+                                                        :pointer)))
+          (when (cffi:null-pointer-p peer-pkey)
+            (error "ffdh-compute: d2i_PUBKEY failed (malformed DH SubjectPublicKeyInfo DER)"))
+          (unwind-protect
+               (let ((ctx (%evp-pkey-ctx-from-pkey priv-handle)))
+                 (unwind-protect
+                      (progn
+                        (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive_init") nil
+                                                                 :pointer ctx :int)))
+                          (unless (= rc 1)
+                            (error "ffdh-compute: EVP_PKEY_derive_init failed (rc=~a)" rc)))
+                        (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive_set_peer") nil
+                                                                 :pointer ctx :pointer peer-pkey :int)))
+                          (unless (= rc 1)
+                            (error "ffdh-compute: EVP_PKEY_derive_set_peer failed (rc=~a)" rc)))
+                        (cffi:with-foreign-pointer (keylen-ptr (cffi:foreign-type-size :size))
+                          (setf (cffi:mem-ref keylen-ptr :size) 0)
+                          (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive") nil
+                                                                   :pointer ctx
+                                                                   :pointer (cffi:null-pointer)
+                                                                   :pointer keylen-ptr
+                                                                   :int)))
+                            (unless (= rc 1)
+                              (error "ffdh-compute: EVP_PKEY_derive(size-query) failed (rc=~a)" rc)))
+                          (let ((klen (cffi:mem-ref keylen-ptr :size)))
+                            (cffi:with-foreign-pointer (key-ptr klen)
+                              (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_PKEY_derive") nil
+                                                                       :pointer ctx
+                                                                       :pointer key-ptr
+                                                                       :pointer keylen-ptr
+                                                                       :int)))
+                                (unless (= rc 1)
+                                  (%zeroize-foreign key-ptr klen)
+                                  (error "ffdh-compute: EVP_PKEY_derive failed (rc=~a)" rc)))
+                              (let ((result (%foreign->octets key-ptr klen)))
+                                (%zeroize-foreign key-ptr klen)
+                                result)))))
+                   (%evp-pkey-ctx-free ctx)))
+            (%evp-pkey-free peer-pkey)))))))
+
+;;; RSA-PSS-SHA256 sign/verify via EVP_DigestSignInit_ex / EVP_DigestVerifyInit_ex (OpenSSL 3.x).
+;;;
+;;; Signatures verified against /opt/homebrew/opt/openssl@3/include/openssl/evp.h (OpenSSL 3.6.2):
+;;;   EVP_DigestSignInit_ex(ctx, **pctx, mdname, libctx, props, pkey,
+;;;                         const OSSL_PARAM params[]) -> int (evp.h)
+;;;   EVP_DigestVerifyInit_ex(ctx, **pctx, mdname, libctx, props, pkey,
+;;;                           const OSSL_PARAM params[]) -> int (evp.h)
+;;;   EVP_DigestSignUpdate / EVP_DigestVerifyUpdate: same as ECDSA (reused).
+;;;   EVP_DigestSignFinal / EVP_DigestVerifyFinal: same as ECDSA (reused).
+;;;
+;;; PSS params passed via OSSL_PARAM array (verified against core_names.h, OpenSSL 3.6.2):
+;;;   OSSL_PKEY_PARAM_PAD_MODE    = "pad-mode"      value = "pss" (OSSL_PKEY_RSA_PAD_MODE_PSS)
+;;;   OSSL_PKEY_PARAM_MGF1_DIGEST = "mgf1-digest"   value = "SHA256"
+;;;   OSSL_PKEY_PARAM_RSA_PSS_SALTLEN = "saltlen"   value = 32 (integer; hash length; §9.3 / Fast DDS)
+;;;
+;;; The saltlen=32 (digest length) matches Fast DDS usage of RSA_PSS_SALTLEN_DIGEST; the OMG spec
+;;; cites MGF1-SHA256 but does not mandate a specific salt length (Fast DDS spike §10 item 6).
+;;; Using saltlen=32 (= SHA-256 output length) for interoperability with Fast DDS.
+;;;
+;;; Wycheproof KAT source: https://raw.githubusercontent.com/google/wycheproof/master/testvectors_v1/
+;;;   rsa_pss_2048_sha256_mgf1_32_test.json (fetched 2026-06-24)
+;;;   tcId=1: msg="" (empty), sig=4f01e0c1..., result=valid
+;;;   tcId=62: msg=313233343030, sig=67d1d1c0..., result=invalid
+
+(defconstant +rsa-pss-salt-len+ 32
+  "RSASSA-PSS salt length = SHA-256 digest length (32 bytes) per Fast DDS and DDS-Security 1.1 §9.3.")
+
+(defun* rsa-pss-sign (priv-handle data)
+    (function (cffi:foreign-pointer (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "RSASSA-PSS-SHA256 sign: signature over DATA using PRIV-HANDLE (EVP_PKEY*).
+   Uses EVP_DigestSignInit_ex(SHA256, pad-mode=pss, mgf1-digest=SHA256, saltlen=32)
+   + Update + Final (evp.h, OpenSSL 3.6.2; core_names.h param names verified).
+   Returns raw RSA signature octet vector (256 bytes for RSA-2048). Signals on error.
+   Source: DDS-Security 1.1 §9.3 RSASSA-PSS-SHA256; Fast DDS PKIDH.cpp RSA_PSS_SALTLEN_DIGEST."
+  (let* ((data-n (length data))
+         (md-ctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_new") nil :pointer)))
+    (when (cffi:null-pointer-p md-ctx)
+      (error "rsa-pss-sign: EVP_MD_CTX_new returned NULL"))
+    (unwind-protect
+         (progn
+           (cffi:with-foreign-pointer (saltlen-ptr (cffi:foreign-type-size :int))
+             (setf (cffi:mem-ref saltlen-ptr :int) +rsa-pss-salt-len+)
+             (cffi:with-foreign-pointer (params-buf (* 4 +ossl-param-size+))
+               (cffi:with-foreign-string (v-pss "pss")
+                 (cffi:with-foreign-string (v-sha256 "SHA256")
+                   (cffi:with-foreign-string (k-padmode "pad-mode")
+                     (cffi:with-foreign-string (k-mgf1 "mgf1-digest")
+                       (cffi:with-foreign-string (k-saltlen "saltlen")
+                         (%set-ossl-param-slot params-buf 0 k-padmode
+                                               +ossl-param-data-type-utf8-string+
+                                               v-pss (length "pss"))
+                         (%set-ossl-param-slot params-buf 1 k-mgf1
+                                               +ossl-param-data-type-utf8-string+
+                                               v-sha256 (length "SHA256"))
+                         (%set-ossl-param-slot params-buf 2 k-saltlen
+                                               +ossl-param-data-type-integer+
+                                               saltlen-ptr (cffi:foreign-type-size :int))
+                         (%set-ossl-param-end params-buf 3)
+                         (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestSignInit_ex") nil
+                                                                  :pointer md-ctx
+                                                                  :pointer (cffi:null-pointer)
+                                                                  :string "SHA256"
+                                                                  :pointer (cffi:null-pointer)
+                                                                  :pointer (cffi:null-pointer)
+                                                                  :pointer priv-handle
+                                                                  :pointer params-buf
+                                                                  :int)))
+                           (unless (= rc 1)
+                             (error "rsa-pss-sign: EVP_DigestSignInit_ex failed (rc=~a)" rc))))))))))
+           (cffi:with-foreign-pointer (data-ptr (max 1 data-n))
+             (dotimes (i data-n)
+               (setf (cffi:mem-aref data-ptr :uint8 i) (aref data i)))
+             (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestSignUpdate") nil
+                                                      :pointer md-ctx
+                                                      :pointer data-ptr
+                                                      :size data-n
+                                                      :int)))
+               (unless (= rc 1)
+                 (error "rsa-pss-sign: EVP_DigestSignUpdate failed (rc=~a)" rc))))
+           (cffi:with-foreign-pointer (siglen-ptr (cffi:foreign-type-size :size))
+             (setf (cffi:mem-ref siglen-ptr :size) 0)
+             (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestSignFinal") nil
+                                                      :pointer md-ctx
+                                                      :pointer (cffi:null-pointer)
+                                                      :pointer siglen-ptr
+                                                      :int)))
+               (unless (= rc 1)
+                 (error "rsa-pss-sign: EVP_DigestSignFinal(size-query) failed (rc=~a)" rc)))
+             (let ((max-siglen (cffi:mem-ref siglen-ptr :size)))
+               (cffi:with-foreign-pointer (sig-ptr max-siglen)
+                 (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestSignFinal") nil
+                                                          :pointer md-ctx
+                                                          :pointer sig-ptr
+                                                          :pointer siglen-ptr
+                                                          :int)))
+                   (unless (= rc 1)
+                     (error "rsa-pss-sign: EVP_DigestSignFinal failed (rc=~a)" rc)))
+                 (let ((actual-siglen (cffi:mem-ref siglen-ptr :size)))
+                   (%foreign->octets sig-ptr actual-siglen))))))
+      (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_free") nil :pointer md-ctx :void))))
+
+(defun* rsa-pss-verify (pub-handle data sig)
+    (function (cffi:foreign-pointer
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              boolean)
+  "RSASSA-PSS-SHA256 verify: T if SIG is valid over DATA under PUB-HANDLE (EVP_PKEY*).
+   Uses EVP_DigestVerifyInit_ex(SHA256, pad-mode=pss, mgf1-digest=SHA256, saltlen=32)
+   + Update + Final (evp.h, OpenSSL 3.6.2; core_names.h param names verified).
+   Fail-closed: returns NIL on any error or verification failure (never signals).
+   Source: DDS-Security 1.1 §9.3 RSASSA-PSS-SHA256; Fast DDS PKIDH.cpp RSA_PSS_SALTLEN_DIGEST.
+   KAT: Wycheproof rsa_pss_2048_sha256_mgf1_32_test.json tcId=1 (valid) + tcId=62 (invalid);
+        fetched from raw.githubusercontent.com/google/wycheproof/master/testvectors_v1/ 2026-06-24."
+  (let* ((data-n (length data))
+         (sig-n  (length sig))
+         (md-ctx (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_new") nil :pointer)))
+    (when (cffi:null-pointer-p md-ctx)
+      (return-from rsa-pss-verify nil))
+    (unwind-protect
+         (handler-case
+             (progn
+               (cffi:with-foreign-pointer (saltlen-ptr (cffi:foreign-type-size :int))
+                 (setf (cffi:mem-ref saltlen-ptr :int) +rsa-pss-salt-len+)
+                 (cffi:with-foreign-pointer (params-buf (* 4 +ossl-param-size+))
+                   (cffi:with-foreign-string (v-pss "pss")
+                     (cffi:with-foreign-string (v-sha256 "SHA256")
+                       (cffi:with-foreign-string (k-padmode "pad-mode")
+                         (cffi:with-foreign-string (k-mgf1 "mgf1-digest")
+                           (cffi:with-foreign-string (k-saltlen "saltlen")
+                             (%set-ossl-param-slot params-buf 0 k-padmode
+                                                   +ossl-param-data-type-utf8-string+
+                                                   v-pss (length "pss"))
+                             (%set-ossl-param-slot params-buf 1 k-mgf1
+                                                   +ossl-param-data-type-utf8-string+
+                                                   v-sha256 (length "SHA256"))
+                             (%set-ossl-param-slot params-buf 2 k-saltlen
+                                                   +ossl-param-data-type-integer+
+                                                   saltlen-ptr (cffi:foreign-type-size :int))
+                             (%set-ossl-param-end params-buf 3)
+                             (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestVerifyInit_ex") nil
+                                                                      :pointer md-ctx
+                                                                      :pointer (cffi:null-pointer)
+                                                                      :string "SHA256"
+                                                                      :pointer (cffi:null-pointer)
+                                                                      :pointer (cffi:null-pointer)
+                                                                      :pointer pub-handle
+                                                                      :pointer params-buf
+                                                                      :int)))
+                               (unless (= rc 1) (return-from rsa-pss-verify nil))))))))))
+               (cffi:with-foreign-pointer (data-ptr (max 1 data-n))
+                 (dotimes (i data-n)
+                   (setf (cffi:mem-aref data-ptr :uint8 i) (aref data i)))
+                 (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestVerifyUpdate") nil
+                                                          :pointer md-ctx
+                                                          :pointer data-ptr
+                                                          :size data-n
+                                                          :int)))
+                   (unless (= rc 1) (return-from rsa-pss-verify nil))))
+               (cffi:with-foreign-pointer (sig-ptr (max 1 sig-n))
+                 (dotimes (i sig-n)
+                   (setf (cffi:mem-aref sig-ptr :uint8 i) (aref sig i)))
+                 (= 1 (cffi:foreign-funcall-pointer (%ossl-sym "EVP_DigestVerifyFinal") nil
+                                                     :pointer md-ctx
+                                                     :pointer sig-ptr
+                                                     :size sig-n
+                                                     :int))))
+           (error () nil))
+      (cffi:foreign-funcall-pointer (%ossl-sym "EVP_MD_CTX_free") nil :pointer md-ctx :void))))
 
 (defun* ml-kem-1024-decapsulate (private-key kem-ciphertext)
     (function ((simple-array (unsigned-byte 8) (*))

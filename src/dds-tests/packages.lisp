@@ -55,4 +55,15 @@
            #:run-security-payload-roundtrip-test
            #:run-security-payload-fuzz-test
            #:run-security-encrypted-pubsub-test
-           #:run-security-encrypted-fragmented-test))
+           #:run-security-encrypted-fragmented-test
+           #:run-auth-identity-test
+           #:run-auth-sha256-kat
+           #:run-auth-ecdsa-kat
+           #:run-auth-handshake-ecdh-test
+           #:run-auth-rsa-pss-kat
+           #:run-auth-ffdh-kat
+           #:run-auth-suite-selection-test
+           #:run-auth-handshake-rsa-test
+           #:run-auth-negatives-test
+           #:run-auth-token-corpus-test
+           #:run-auth-token-fuzz-test))
