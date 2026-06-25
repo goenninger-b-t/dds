@@ -132,6 +132,9 @@
            #:participant-message-guid-prefix #:participant-message-kind #:participant-message-data
            #:serialize-participant-message #:parse-participant-message
            #:+builtin-endpoint-set-default+
+           #:+be-participant-stateless-writer+ #:+be-participant-stateless-reader+
+           #:+entityid-participant-stateless-writer+ #:+entityid-participant-stateless-reader+
+           #:+pid-identity-token+
            #:write-locator #:read-locator #:make-ipv4-locator
            #:locator #:make-locator #:locator-p
            #:locator-kind #:locator-port #:locator-address
@@ -141,7 +144,7 @@
            #:spdp-data-vendor-id
            #:spdp-data-default-unicast-locators #:spdp-data-metatraffic-unicast-locators
            #:spdp-data-lease-duration-seconds #:spdp-data-builtin-endpoint-set
-           #:spdp-data-host-uuid
+           #:spdp-data-host-uuid #:spdp-data-identity-token-octets
            #:serialize-spdp-data #:parse-spdp-data
            #:run-discovery-test
            #:+reliability-best-effort+ #:+reliability-reliable+

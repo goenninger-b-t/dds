@@ -184,6 +184,8 @@
   (remote-liveliness (make-hash-table :test 'equalp) :type hash-table) ; (12-octet prefix . kind) -> %lease-now stamp
   (liveliness-state (make-hash-table :test 'equalp) :type hash-table) ; matched remote-writer 16-octet GUID -> alive-p (reader-side LIVELINESS_CHANGED transition flag)
 
+  ;; DDS-Security 1.1 §7.4.3.2 IdentityToken octets for SPDP; NIL = security OFF, byte-identical.
+  (identity-token-octets nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (on-data nil :type (or null function))
   (on-lifecycle nil :type (or null function))
   (on-lifecycle-event nil :type (or null function)) ; DCPS-facing: fired after a dispose/unregister is classified (S2)
@@ -200,6 +202,8 @@
   (on-incompatible-qos nil :type (or null function))
   (on-inconsistent-topic nil :type (or null function))
   (on-sample nil :type (or null function))
+  ;; Slice 2b-i: PSM receiver callback (DDS-Security 1.1 §7.4.3 / §8.7); NIL = PSM messages ignored.
+  (on-stateless-message nil :type (or null function))
   (mcast-socket nil :type t)
   (mcast-rx-thread nil :type t)
   (rx-thread nil :type t))
@@ -242,8 +246,9 @@
                                                      :initial-element 0))
                             (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast
                             (advertise-address "127.0.0.1") (batch-max-samples 1)
-                            (capture-data-key-hash nil) (crypto-transform nil))
-    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1)) (:capture-data-key-hash t) (:crypto-transform t)) disc-node)
+                            (capture-data-key-hash nil) (crypto-transform nil)
+                            (identity-token-octets nil) (on-stateless-message nil))
+    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1)) (:capture-data-key-hash t) (:crypto-transform t) (:identity-token-octets t) (:on-stateless-message t)) disc-node)
   "Open a metatraffic UDPv4 socket bound to HOST:PORT and build a discovery node.
    PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4).
    MULTICAST opens a second socket bound to the SPDP multicast port and joins the
@@ -256,7 +261,13 @@
    uses this; default NIL = byte-identical, no hot-path alloc).
    CRYPTO-TRANSFORM (ADR 0031, DDS-Security 1.1 §9.5.3.3): a dds.security:key-material; when non-NIL,
    publish-sample AES256-GCM-encodes the SerializedPayload before wire emission, and the receiver
-   decodes before delivery (fail-closed on auth failure). NIL (default) = security OFF, byte-identical."
+   decodes before delivery (fail-closed on auth failure). NIL (default) = security OFF, byte-identical.
+   IDENTITY-TOKEN-OCTETS (§7.4.3.2): CDR-LE IdentityToken DataHolder octets from validate-local-identity
+   + identity-token; when non-NIL the node advertises PID_IDENTITY_TOKEN + PSM endpoint-set bits in SPDP.
+   NIL (default) = security OFF, byte-identical SPDP (no PID_IDENTITY_TOKEN, no PSM bits).
+   ON-STATELESS-MESSAGE (Slice 2b-i, §7.4.3 / §8.7): function (node src-prefix token) -> t invoked by
+   the receiver thread when a PSM DATA arrives and is successfully parsed (fail-closed: not called on
+   malformed input). NIL (default) = PSM messages silently ignored."
   ;; In multicast mode bind the unicast socket to 0.0.0.0: a loopback-bound socket
   ;; cannot egress to a multicast group (EADDRNOTAVAIL), and 0.0.0.0 still receives
   ;; unicast SEDP addressed to 127.0.0.1:port.
@@ -269,6 +280,8 @@
                                   :batch-max-samples batch-max-samples
                                   :capture-data-key-hash (and capture-data-key-hash t)
                                   :crypto-transform crypto-transform
+                                  :identity-token-octets identity-token-octets
+                                  :on-stateless-message on-stateless-message
                                   :host-uuid host-uuid
                                   :shmem (when *shmem-enabled*   ; SHMEM receive segment for same-host user DATA (FR-XPORT-2)
                                            (dds.xport.shmem:make-shmem-transport
@@ -323,13 +336,22 @@
   "Build NODE's SPDPdiscoveredParticipantData: its GUID prefix + a unicast locator
    at <advertise-address>:<bound port> (default 127.0.0.1), protocol version 2.5. When SHMEM is on, ALSO
    advertise a SHMEM Locator_t (lanes+capacity) in default-unicast and the host-uuid (FR-XPORT-2) so a
-   same-host peer can route user DATA over shared memory; metatraffic stays UDP-only (discovery on UDP)."
+   same-host peer can route user DATA over shared memory; metatraffic stays UDP-only (discovery on UDP).
+   When the node carries an IdentityToken, ORs in the PSM endpoint-set bits 22/23 (§7.4.6.1) so a
+   security-aware peer learns this participant has ParticipantStatelessMessage endpoints (Slice 2b-i)."
   (let* ((addr (dds.rtps.discovery:make-ipv4-locator
                 (%ipv4-octets (disc-node-advertise-address node))))
          (port (disc-node-port node))
          (loc (dds.rtps.discovery:make-locator
                :kind dds.rtps.discovery:+locator-kind-udpv4+ :port port :address addr))
-         (sm (disc-node-shmem node)))
+         (sm (disc-node-shmem node))
+         (tok (disc-node-identity-token-octets node))
+         ;; OR PSM bits 22/23 only when we have a token; no secure-discovery bits 16-21/26-27 (Slice 2c/4).
+         (ep-set (if tok
+                     (logior dds.rtps.discovery:+builtin-endpoint-set-default+
+                             dds.rtps.discovery:+be-participant-stateless-writer+
+                             dds.rtps.discovery:+be-participant-stateless-reader+)
+                     dds.rtps.discovery:+builtin-endpoint-set-default+)))
     (dds.rtps.discovery:make-spdp-data
      :guid-prefix (disc-node-guid-prefix node)
      :version-major 2 :version-minor 5
@@ -340,7 +362,8 @@
      :metatraffic-unicast-locators (list loc)
      :host-uuid (if sm (disc-node-host-uuid node) 0)
      :lease-duration-seconds 100
-     :builtin-endpoint-set dds.rtps.discovery:+builtin-endpoint-set-default+)))
+     :builtin-endpoint-set ep-set
+     :identity-token-octets tok)))
 
 (defun* %send-paramlist (node reader-id writer-id sn serialize-fn host port)
     (function (disc-node (unsigned-byte 32) (unsigned-byte 32) integer function string (unsigned-byte 16)) t)
@@ -497,6 +520,10 @@
 (declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)) t) %on-participant-message)
          (ftype (function (disc-node) (eql t)) assert-participant-liveliness)
          (ftype (function (disc-node) (eql t)) %liveliness-sweep))
+
+;; Slice 2b-i PSM handler: defined in stateless-message.lisp (loaded after this file).
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer dds.core.buffer:octet-buffer (integer 0) (integer 0)) t) %on-stateless-message)
+         (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t) %send-stateless-message))
 
 (defun* %builtin-reader-nl (node prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
@@ -969,6 +996,9 @@
                  (%on-tl-data node src-prefix wtr sn buf poff plen))
                 ((= wtr dds.rtps.discovery:+entityid-p2p-participant-message-writer+)
                  (%on-participant-message node src-prefix wtr sn buf poff plen))
+                ;; Slice 2b-i: PSM DATA — ParticipantStatelessMessage (DDS-Security 1.1 §7.4.3)
+                ((= wtr dds.rtps.discovery:+entityid-participant-stateless-writer+)
+                 (%on-stateless-message node src-prefix wtr sn buf poff plen))
                 ((disc-node-on-data node)
                  ;; Pass orig-guid/orig-sn (PID_ORIGINAL_WRITER_INFO, §8.3.5.4) and key-hash
                  ;; (PID_KEY_HASH, §9.6.4.8 — only non-NIL when capture-data-key-hash is set on

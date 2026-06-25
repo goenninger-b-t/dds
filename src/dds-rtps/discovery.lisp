@@ -55,6 +55,59 @@
   "TypeLookupServiceReplyDataWriter availableBuiltinEndpoints bit (XTypes 1.3 Table 62).")
 (defconstant +be-tl-reply-reader+ (ash 1 15)
   "TypeLookupServiceReplyDataReader availableBuiltinEndpoints bit (XTypes 1.3 Table 62).")
+
+;; DDS-Security 1.1 §7.4.3 secure builtin EntityIds: PSM = ParticipantStatelessMessage (auth handshake).
+;; entityKind 0xC3 = WRITER_NO_KEY (best-effort); 0xC4 = READER_NO_KEY (best-effort).
+;; PSM is best-effort — no HEARTBEAT/ACKNACK (DDS-Security 1.1 §7.4.3).
+(defconstant +entityid-participant-stateless-writer+ #x000201c3
+  "ENTITYID_P2P_BUILTIN_PARTICIPANT_STATELESS_WRITER {{00,02,01},c3} (DDS-Security 1.1 §7.4.3).")
+(defconstant +entityid-participant-stateless-reader+ #x000201c4
+  "ENTITYID_P2P_BUILTIN_PARTICIPANT_STATELESS_READER {{00,02,01},c4} (DDS-Security 1.1 §7.4.3).")
+
+;; DDS-Security 1.1 §7.4.5 secure volatile message EntityIds (ParticipantVolatileMessageSecure).
+;; 0xff entity-key prefix = vendor/security-scoped; 0xC3/C4 = best-effort NO_KEY writer/reader.
+(defconstant +entityid-participant-volatile-secure-writer+ #xff0202c3
+  "ENTITYID_P2P_BUILTIN_PARTICIPANT_VOLATILE_MESSAGE_SECURE_WRITER (DDS-Security 1.1 §7.4.5).")
+(defconstant +entityid-participant-volatile-secure-reader+ #xff0202c4
+  "ENTITYID_P2P_BUILTIN_PARTICIPANT_VOLATILE_MESSAGE_SECURE_READER (DDS-Security 1.1 §7.4.5).")
+
+;; DDS-Security 1.1 §7.4.6.1 BuiltinEndpointSet security bits (secure SEDP, secure PMD, PSM, PVMS).
+;; Bits 16-19: secure SEDP pub/sub announcer/detector; 20-21: secure PMD writer/reader.
+(defconstant +be-sedp-pub-secure-writer+ (ash 1 16)
+  "DISC_BUILTIN_ENDPOINT_PUBLICATION_SECURE_ANNOUNCER bit 16 (DDS-Security 1.1 §7.4.6.1).")
+(defconstant +be-sedp-pub-secure-reader+ (ash 1 17)
+  "DISC_BUILTIN_ENDPOINT_PUBLICATION_SECURE_DETECTOR bit 17 (DDS-Security 1.1 §7.4.6.1).")
+(defconstant +be-sedp-sub-secure-writer+ (ash 1 18)
+  "DISC_BUILTIN_ENDPOINT_SUBSCRIPTION_SECURE_ANNOUNCER bit 18 (DDS-Security 1.1 §7.4.6.1).")
+(defconstant +be-sedp-sub-secure-reader+ (ash 1 19)
+  "DISC_BUILTIN_ENDPOINT_SUBSCRIPTION_SECURE_DETECTOR bit 19 (DDS-Security 1.1 §7.4.6.1).")
+(defconstant +be-participant-message-secure-writer+ (ash 1 20)
+  "BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_SECURE_DATA_WRITER bit 20 (DDS-Security 1.1 §7.4.6.1).")
+(defconstant +be-participant-message-secure-reader+ (ash 1 21)
+  "BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_SECURE_DATA_READER bit 21 (DDS-Security 1.1 §7.4.6.1).")
+;; Bits 22-23: PSM writer/reader (authentication handshake, this slice).
+(defconstant +be-participant-stateless-writer+ (ash 1 22)
+  "BUILTIN_ENDPOINT_PARTICIPANT_STATELESS_MESSAGE_WRITER bit 22 (DDS-Security 1.1 §7.4.6.1).")
+(defconstant +be-participant-stateless-reader+ (ash 1 23)
+  "BUILTIN_ENDPOINT_PARTICIPANT_STATELESS_MESSAGE_READER bit 23 (DDS-Security 1.1 §7.4.6.1).")
+;; Bits 24-25: PVMS (crypto key exchange, future slice).
+(defconstant +be-participant-volatile-secure-writer+ (ash 1 24)
+  "BUILTIN_ENDPOINT_PARTICIPANT_VOLATILE_MESSAGE_SECURE_WRITER bit 24 (DDS-Security 1.1 §7.4.6.1).")
+(defconstant +be-participant-volatile-secure-reader+ (ash 1 25)
+  "BUILTIN_ENDPOINT_PARTICIPANT_VOLATILE_MESSAGE_SECURE_READER bit 25 (DDS-Security 1.1 §7.4.6.1).")
+;; Bits 26-27: secure SPDP announcer/detector (required when security is enabled).
+(defconstant +be-participant-secure-announcer+ (ash 1 26)
+  "DISC_BUILTIN_ENDPOINT_PARTICIPANT_SECURE_ANNOUNCER bit 26 (DDS-Security 1.1 §7.4.6.1).")
+(defconstant +be-participant-secure-detector+ (ash 1 27)
+  "DISC_BUILTIN_ENDPOINT_PARTICIPANT_SECURE_DETECTOR bit 27 (DDS-Security 1.1 §7.4.6.1).")
+
+;; PID_IDENTITY_TOKEN: carries the IdentityToken DataHolder in the SPDP ParameterList.
+;; Serialized as CDR-LE DataHolder: class_id + PropertySeq + BinaryPropertySeq (DDS-Security 1.1 §7.4.3.2).
+(defconstant +pid-identity-token+ #x1001
+  "PID_IDENTITY_TOKEN = 0x1001; SPDP ParameterList entry for IdentityToken (DDS-Security 1.1 §7.4.3.2).")
+;; PID_PERMISSIONS_TOKEN: carries PermissionsToken; AccessControl / Slice-3 only.
+(defconstant +pid-permissions-token+ #x1002
+  "PID_PERMISSIONS_TOKEN = 0x1002; SPDP ParameterList entry for PermissionsToken (DDS-Security 1.1 §7.4.3.2).")
 (defconstant +builtin-endpoint-set-default+
   (logior #x0000003F
           +be-participant-message-writer+ +be-participant-message-reader+
@@ -168,7 +221,9 @@
   (lease-duration-seconds 100 :type (signed-byte 32))
   (builtin-endpoint-set 0 :type (unsigned-byte 32))
   ;; PID_SHMEM_HOST_UUID (vendor 0x8040, ADR 0013): 8-octet same-host UUID; 0 = none/absent.
-  (host-uuid 0 :type (unsigned-byte 64)))
+  (host-uuid 0 :type (unsigned-byte 64))
+  ;; PID_IDENTITY_TOKEN (0x1001, DDS-Security 1.1 §7.4.3.2): CDR-LE DataHolder octets; NIL = security OFF.
+  (identity-token-octets nil :type (or null (simple-array (unsigned-byte 8) (*)))))
 
 (defun* %make-scratch (n)
     (function ((integer 0)) (values dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*))))
@@ -226,6 +281,10 @@
       (dds.core.buffer:put-u32 c (ldb (byte 32 0) (spdp-data-host-uuid data)))
       (dds.core.buffer:put-u32 c (ldb (byte 32 32) (spdp-data-host-uuid data)))
       (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-shmem-host-uuid+ vec 0 8)))
+  ;; PID_IDENTITY_TOKEN (0x1001, §7.4.3.2): CDR-LE DataHolder; omitted when NIL (security OFF).
+  (let ((tok (spdp-data-identity-token-octets data)))
+    (when tok
+      (dds.rtps.message:write-parameter cursor +pid-identity-token+ tok 0 (length tok))))
   (dds.rtps.message:write-parameter-sentinel cursor))
 
 (defun* %fill-spdp-param (data pid cursor len)
@@ -267,7 +326,15 @@
     ((= pid dds.rtps.message:+pid-shmem-host-uuid+)
      (when (>= len 8)                                ; fail-open: a short value is ignored, never an error
        (let ((lo (dds.core.buffer:get-u32 cursor)) (hi (dds.core.buffer:get-u32 cursor)))
-         (setf (spdp-data-host-uuid data) (logior lo (ash hi 32)))))))
+         (setf (spdp-data-host-uuid data) (logior lo (ash hi 32))))))
+    ((= pid +pid-identity-token+)
+     ;; Bounds-checked before allocation: len MUST fit remaining buffer (§9.4.2.11, NFR-SEC-POSTURE).
+     (let ((remaining (- (dds.core.buffer:octet-buffer-capacity (dds.core.buffer:cursor-buffer cursor))
+                         (dds.core.buffer:cursor-position cursor))))
+       (when (and (> len 0) (<= len remaining))
+         (let ((oct (make-array len :element-type '(unsigned-byte 8))))
+           (dds.core.buffer:get-octets cursor oct 0 len)
+           (setf (spdp-data-identity-token-octets data) oct))))))
   data)
 
 (defun* parse-spdp-data (cursor)

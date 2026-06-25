@@ -421,13 +421,142 @@ Three levels, as in Slice 1:
 
 ---
 
+## 6bis. Authentication plugin — Slice 2b-i: wire transport (DDS-Security 1.1 §7.4.4, §9.3.4)
+
+Slice 2b-i (landed 2026-06-25, WP-DDS-SECURITY-AUTH-2BI, ADR 0033) puts the Slice 2a
+in-process handshake tokens on the real wire, completing the PSM transport layer.
+
+### 6bis.1 SPDP IdentityToken (§8.7.2.2 / §9.3.1 / RTPS 2.5 §9.4.1.3)
+
+`spdp-data` gains an `identity-token-octets` slot (type `(or (simple-array (unsigned-byte 8) (*)) null)`,
+default NIL).  When set:
+
+- `serialize-spdp-data` emits `PID_IDENTITY_TOKEN` (PID 0x1001, DDS-Security 1.1
+  §9.4.1.3) carrying the CDR-LE `DataHolder` bytes of the participant's `IdentityToken`.
+- The `builtin-endpoint-set` is ORed with bits 22 (`+be-participant-stateless-writer+`)
+  and 23 (`+be-participant-stateless-reader+`) per DDS-Security 1.1 §7.4.6.1 Table 29.
+- `parse-spdp-data` reads and stores the `identity-token-octets` when PID 0x1001 is
+  present; silently skips it when absent (conformant receivers must skip unknown optional
+  PIDs per RTPS 2.5 §9.6.2.2.2).
+
+**Default-OFF:** when `identity-token-octets` is NIL the serialized SPDP is byte-identical
+to the pre-security wire — no extra PID, no extra bits.
+
+**Don't-break-plain:** plain Connext or Fast DDS receivers skip PID 0x1001 silently
+(optional bit set per §9.4.1.3) and ignore PSM bits 22/23 (RTPS 2.5 §8.5.3.1).
+See `interop/security-auth-discovery/README.md` for the full environment-limited outcome.
+
+### 6bis.2 The §9.3.4 DataHolder + §7.4.4 ParticipantGenericMessage codec (`dds.security`)
+
+Handshake tokens travel as CDR-LE `DataHolder` blobs inside a
+`ParticipantGenericMessage` (`ParticipantStatelessMessage`) envelope.
+
+| Symbol | Contract |
+|---|---|
+| `handshake-token->dataholder (token)` | Serialize a `handshake-token` struct (Slice 2a) to CDR-LE `DataHolder` octets (§9.3.4): class_id string + `PropertySeq(count=0)` + `BinaryPropertySeq` |
+| `dataholder->handshake-token (octets)` | Parse CDR-LE `DataHolder` octets back to a `handshake-token`; bounds-checked, fail-closed (NIL on any malformed/truncated/over-declared input) |
+| `make-generic-message (&key ...)` | Serialize a `ParticipantGenericMessage` envelope as CDR-LE: 2×`MessageIdentity`(24) + 3×`GUID_t`(16) + `message_class_id`(CDR-LE string) + `DataHolderSeq`(u32-LE count + `DataHolder*`) |
+| `parse-generic-message (octets)` | Parse a CDR-LE envelope; returns 9 values (source-guid sn related-guid related-sn dest-participant-guid dest-endpoint-guid source-endpoint-guid message-class-id dataholder-list) or all NIL on malformed |
+| `+auth-message-class-id+` | `"dds.sec.auth"` (the `message_class_id` for all handshake tokens; DDS-Security 1.1 §7.4.4 / §9.3) |
+
+**Endianness split:** the PSM wire (`DataHolder` + `ParticipantGenericMessage`) is
+CDR-LE.  The Slice 2a hash/signature inputs (`BinaryPropertySeq` for `hash_c1`,
+`hash_c2`, `Sign1`, `Sign2`) remain CDR-BE per §9.3.2 — the BE bytes are carried
+verbatim as raw octets inside the LE DataHolder value field.  The two serializations
+are distinct and never mixed.
+
+### 6bis.3 PSM endpoints (`dds.disc` / `dds.rtps.discovery`)
+
+| Symbol | Value | Source |
+|---|---|---|
+| `+entityid-participant-stateless-writer+` | `0x000201C3` | DDS-Security 1.1 §9.5.1.3 Table 40 |
+| `+entityid-participant-stateless-reader+` | `0x000201C4` | DDS-Security 1.1 §9.5.1.3 Table 40 |
+| `+be-participant-stateless-writer+` | bit 22 | DDS-Security 1.1 §7.4.6.1 Table 29 |
+| `+be-participant-stateless-reader+` | bit 23 | DDS-Security 1.1 §7.4.6.1 Table 29 |
+
+`disc-node` gains:
+- `%send-stateless-message (node dest-prefix envelope-octets)` — wraps the CDR-LE
+  envelope in a DATA submessage and sends unicast to the PSM reader EntityId port.
+- `on-stateless-message` slot — a closure called by the receiver thread with
+  `(node src-prefix token)` when a PSM DATA arrives.
+
+### 6bis.4 A worked end-to-end example (our-to-our, EC suite)
+
+```lisp
+;; Node-A and Node-B both carry an IdentityToken in their SPDP.
+(let* ((node-a (dds.disc:make-disc-node
+                :guid-prefix prefix-a :host "127.0.0.1" :port 0
+                :identity-token-octets (dds.security:identity-token id-a)
+                :on-stateless-message
+                (lambda (node src-prefix token)
+                  (declare (ignore src-prefix))
+                  ;; A's callback: receives Reply -> process-handshake -> send Final
+                  (%on-a-reply node token state))))
+       (node-b (dds.disc:make-disc-node
+                :guid-prefix prefix-b :host "127.0.0.1" :port 0
+                :identity-token-octets (dds.security:identity-token id-b)
+                :on-stateless-message
+                (lambda (node src-prefix token)
+                  (declare (ignore src-prefix))
+                  ;; B's callback: receives Request -> begin-handshake-reply -> send Reply;
+                  ;;                receives Final  -> process-handshake -> :authenticated
+                  (%on-b-request-or-final node token state)))))
+  ;; 1. SPDP discovery (real UDP loopback).
+  (dds.disc:start-node node-a)
+  (dds.disc:start-node node-b)
+  ;; 2. Initiate handshake from A (requester, GUID-A < GUID-B per §8.7.2.4).
+  (multiple-value-bind (req-octets req-hdl)
+      (dds.security:begin-handshake-request id-a id-b dds.security:+suite-ecdh+)
+    (let ((req-tok (dds.security::%parse-token req-octets)))
+      ;; 3. Serialize to DataHolder, wrap in PSM envelope, send.
+      (dds.disc:%send-stateless-message
+        node-a prefix-b
+        (dds.security:make-generic-message
+          :source-guid src-ep-a :sequence-number 1
+          :related-guid zero-guid :related-sn 0
+          :dest-participant-guid dest-part-b
+          :dest-endpoint-guid dst-ep-b :source-endpoint-guid src-ep-a
+          :message-class-id dds.security:+auth-message-class-id+
+          :dataholders (list (dds.security:handshake-token->dataholder req-tok)))))
+    ;; 4-6 happen via callbacks; poll for completion.
+    (loop until (both-authenticated-p state) do (sleep 0.02))
+    ;; 7. Both SharedSecrets are byte-equal.
+    (assert (equalp (wire-hs-state-a-ss state) (wire-hs-state-b-ss state)))))
+```
+
+See `run-auth-handshake-over-wire-test` in
+`src/dds-tests/security-auth-test.lisp` for the full working test.
+
+### 6bis.5 The honest interop posture for Slice 2b-i
+
+**Level 1 — Our-to-our handshake over the real UDP wire (ACHIEVED)**
+Both nodes reach `:authenticated` with byte-equal `SharedSecret`.  Proven by
+`run-auth-handshake-over-wire-test` (Clasp 329 + SBCL 329, Clasp first).
+
+**Level 2 — Don't-break-plain (ENVIRONMENT-LIMITED)**
+The in-process portable guard (`run-auth-spdp-identity-token-test` arm b) proves the
+DEFAULT-OFF path is byte-identical.  RTPS 2.5 §9.6.2.2.2 requires conformant peers to
+silently skip unknown optional PIDs; RTPS 2.5 §8.5.3.1 requires ignoring unknown
+endpoint bits.  A live plain-peer session is environment-limited (see
+`interop/security-auth-discovery/README.md`).
+
+**Level 3 — Live Connext-Security authentication interop (DEFERRED to Slice 5)**
+The RTI Security Plugins are not installed.  The DataHolder byte-match vs Connext,
+CDR-BE alignment of hash inputs, FFDH SPKI-DER encoding, and RSA-PSS saltlen are
+self-consistent (our-to-our) but unverified against a live Connext peer.
+
+**Do NOT interpret this section as "cross-vendor authentication interop verified."**
+
+---
+
 ## 7. Roadmap (M7/P6)
 
 | Slice | Description | Status |
 |---|---|---|
 | **1** | Crypto plugin: AES256-GCM `SecuredPayload` + session-key KDF + `disc-node` integration (ADR 0031) | **LANDED** |
 | **2a** | Authentication plugin: PKI identity + §8.7.2.4 PKI-DH handshake → SharedSecret, both §9.3 suites, our-to-our (ADR 0032) | **LANDED** |
-| 2b | Authentication plugin: live discovery — IdentityToken in SPDP, ParticipantStatelessMessage token exchange, auth gate matching | pending |
+| **2b-i** | Wire transport: SPDP IdentityToken + PSM endpoints + DataHolder/envelope codec + our-to-our handshake over UDP (ADR 0033) | **LANDED** |
+| 2b-ii | Discovery integration: on-participant-discovered hook + auth manager + per-participant auth-state + endpoint-match auth-gate + `select-auth-suite` wiring | pending |
 | 2c | Crypto key-exchange: derive `key-material` from SharedSecret → replace `make-test-key-material` | pending |
 | 3 | AccessControl plugin (§8.8): governance/permissions XML, topic-level policy enforcement | pending |
 | 4 | Secure discovery (§7.4.4): SPDP/SEDP participant/endpoint authentication | pending |

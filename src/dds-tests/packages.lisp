@@ -66,4 +66,8 @@
            #:run-auth-handshake-rsa-test
            #:run-auth-negatives-test
            #:run-auth-token-corpus-test
-           #:run-auth-token-fuzz-test))
+           #:run-auth-token-fuzz-test
+           #:run-auth-spdp-identity-token-test
+           #:run-auth-wire-codec-test
+           #:run-auth-wire-fuzz-test
+           #:run-auth-handshake-over-wire-test))

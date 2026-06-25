@@ -62,4 +62,10 @@
            #:run-locator-filter-test #:run-lost-final-sample-test
            #:run-dispose-dataplane-test #:run-dispose-repair-test
            ;; ADR 0031: DDS-Security 1.1 §9.5.3.3 Slice-1 serialized-payload protection slot
-           #:disc-node-crypto-transform))
+           #:disc-node-crypto-transform
+           ;; Slice 2b-i: IdentityToken octets for SPDP PID_IDENTITY_TOKEN + PSM endpoint-set bits
+           #:disc-node-identity-token-octets
+           ;; Slice 2b-i: ParticipantStatelessMessage builtin endpoints (DDS-Security 1.1 §7.4.3)
+           #:disc-node-on-stateless-message
+           #:%send-stateless-message
+           #:%on-stateless-message))

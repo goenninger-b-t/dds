@@ -62,4 +62,10 @@
    #:handshake-shared-secret
    #:shared-secret-bytes
    #:free-shared-secret-handle
-   #:free-handshake-handle))
+   #:free-handshake-handle
+   ;; T2: §9.3.4 DataHolder + §7.4.4 ParticipantGenericMessage wire codec (WP-DDS-SECURITY-AUTH-2BI T2)
+   #:+auth-message-class-id+
+   #:handshake-token->dataholder
+   #:dataholder->handshake-token
+   #:make-generic-message
+   #:parse-generic-message))

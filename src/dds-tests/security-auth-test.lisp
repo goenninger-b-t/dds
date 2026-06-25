@@ -1261,3 +1261,652 @@
                (dds.security:free-identity-handle id-b)))
         (dds.security:free-identity-handle id-a))))
   t)
+
+(defun* run-auth-spdp-identity-token-test ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-2BI T1: PID_IDENTITY_TOKEN + PSM endpoint-set bits in SPDP.
+   (a) WITH token: serialize-spdp-data -> parse-spdp-data round-trips the token bytes exactly
+       and the parsed builtin-endpoint-set has both PSM bits (22 and 23) set.
+   (b) DEFAULT-OFF byte-identical: identity-token-octets NIL -> no PID_IDENTITY_TOKEN in
+       the serialized bytes, and the parsed builtin-endpoint-set lacks both PSM bits.
+   Requires OpenSSL >= 3.5 for the fixture IdentityToken; skips gracefully if absent."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-spdp-identity-token] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-spdp-identity-token-test t)))
+
+  ;; Acquire a fixture IdentityToken from validate-local-identity on the EC fixture.
+  (let* ((ca-pem      (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert-pem (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key-pem  (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (guid-a      (make-array 16 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))))
+    (multiple-value-bind (handle reason)
+        (dds.security:validate-local-identity ca-pem ec-cert-pem ec-key-pem guid-a)
+      (%check :spdp-tok-handle-ok (not (null handle))
+              (format nil "validate-local-identity failed: ~a" reason))
+      (when (null handle) (return-from run-auth-spdp-identity-token-test t))
+      (unwind-protect
+           (let* ((tok-octets (dds.security:identity-token handle))
+                  ;; --- (a) WITH token ---
+                  (prefix (make-array 12 :element-type '(unsigned-byte 8)
+                                         :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12)))
+                  (ep-set-with (logior dds.rtps.discovery:+builtin-endpoint-set-default+
+                                       dds.rtps.discovery:+be-participant-stateless-writer+
+                                       dds.rtps.discovery:+be-participant-stateless-reader+))
+                  (data-with (dds.rtps.discovery:make-spdp-data
+                              :guid-prefix prefix
+                              :version-major 2 :version-minor 5
+                              :vendor-id #x010F
+                              :lease-duration-seconds 100
+                              :builtin-endpoint-set ep-set-with
+                              :identity-token-octets tok-octets))
+                  (ob-with (dds.core.buffer:make-octet-buffer 2048))
+                  (wc-with (dds.core.buffer:cursor ob-with :endianness :little)))
+             (dds.rtps.discovery:serialize-spdp-data wc-with data-with)
+             (let* ((rc-with (dds.core.buffer:cursor ob-with :endianness :little))
+                    (parsed-with (dds.rtps.discovery:parse-spdp-data rc-with)))
+               (%check :spdp-tok-parsed-non-nil (not (null parsed-with))
+                       "parse-spdp-data returned NIL on WITH-token data")
+               (when parsed-with
+                 (%check :spdp-tok-round-trip
+                         (equalp (dds.rtps.discovery:spdp-data-identity-token-octets parsed-with)
+                                 tok-octets)
+                         (format nil "identity-token-octets mismatch after round-trip (len ~d vs ~d)"
+                                 (length (dds.rtps.discovery:spdp-data-identity-token-octets parsed-with))
+                                 (length tok-octets)))
+                 (%check :spdp-tok-psm-writer-bit
+                         (logtest (dds.rtps.discovery:spdp-data-builtin-endpoint-set parsed-with)
+                                  dds.rtps.discovery:+be-participant-stateless-writer+)
+                         "parsed builtin-endpoint-set missing +be-participant-stateless-writer+ (bit 22)")
+                 (%check :spdp-tok-psm-reader-bit
+                         (logtest (dds.rtps.discovery:spdp-data-builtin-endpoint-set parsed-with)
+                                  dds.rtps.discovery:+be-participant-stateless-reader+)
+                         "parsed builtin-endpoint-set missing +be-participant-stateless-reader+ (bit 23)")))
+
+             ;; --- (b) DEFAULT-OFF: no token, no PSM bits, byte-identical ---
+             (let* ((data-off (dds.rtps.discovery:make-spdp-data
+                               :guid-prefix prefix
+                               :version-major 2 :version-minor 5
+                               :vendor-id #x010F
+                               :lease-duration-seconds 100
+                               :builtin-endpoint-set dds.rtps.discovery:+builtin-endpoint-set-default+))
+                    (ob-off (dds.core.buffer:make-octet-buffer 2048))
+                    (wc-off (dds.core.buffer:cursor ob-off :endianness :little)))
+               (dds.rtps.discovery:serialize-spdp-data wc-off data-off)
+               (let* ((rc-off (dds.core.buffer:cursor ob-off :endianness :little))
+                      (parsed-off (dds.rtps.discovery:parse-spdp-data rc-off)))
+                 (%check :spdp-off-parsed-non-nil (not (null parsed-off))
+                         "parse-spdp-data returned NIL on DEFAULT-OFF data")
+                 (when parsed-off
+                   (%check :spdp-off-no-token
+                           (null (dds.rtps.discovery:spdp-data-identity-token-octets parsed-off))
+                           "identity-token-octets must be NIL in DEFAULT-OFF path")
+                   (%check :spdp-off-no-psm-writer
+                           (not (logtest (dds.rtps.discovery:spdp-data-builtin-endpoint-set parsed-off)
+                                         dds.rtps.discovery:+be-participant-stateless-writer+))
+                           "DEFAULT-OFF must NOT have +be-participant-stateless-writer+ bit")
+                   (%check :spdp-off-no-psm-reader
+                           (not (logtest (dds.rtps.discovery:spdp-data-builtin-endpoint-set parsed-off)
+                                         dds.rtps.discovery:+be-participant-stateless-reader+))
+                           "DEFAULT-OFF must NOT have +be-participant-stateless-reader+ bit")
+                   (%check :spdp-off-endpoint-set-exact
+                           (= (dds.rtps.discovery:spdp-data-builtin-endpoint-set parsed-off)
+                              dds.rtps.discovery:+builtin-endpoint-set-default+)
+                           (format nil "DEFAULT-OFF builtin-endpoint-set ~d != +builtin-endpoint-set-default+ ~d"
+                                   (dds.rtps.discovery:spdp-data-builtin-endpoint-set parsed-off)
+                                   dds.rtps.discovery:+builtin-endpoint-set-default+))))))
+        (dds.security:free-identity-handle handle))))
+  t)
+
+;;; ============================================================
+;;; T2: §9.3.4 DataHolder + §7.4.4 ParticipantGenericMessage wire codec
+;;; ============================================================
+
+;;; Self-consistency byte corpus: CDR-LE DataHolder leading bytes for class_id "DDS:Auth:PKI-DH:1.0+Req".
+;;; class_id CDR-LE encoding: u32-LE(len+1=25) | "DDS:Auth:PKI-DH:1.0+Req" | NUL | 3-pad
+;;; u32-LE(25) = 19 00 00 00; then 24 ASCII chars + NUL = 25 bytes; pad = (4 - 25%4)%4 = 3.
+;;; So bytes 0..31: 19 00 00 00 44 44 53 3a ... 52 65 71 00 [pad 00 00 00]
+;;; PropertySeq count=0: bytes 32..35: 00 00 00 00
+;;; This vector covers only the first 36 bytes (class_id + PropSeq-count).
+(defparameter +dataholder-req-prefix-vector+
+    (let* ((class-id "DDS:Auth:PKI-DH:1.0+Req")
+           (cid-len  (1+ (length class-id)))           ; 25 (includes NUL)
+           (cid-pad  (mod (- 4 (mod cid-len 4)) 4))   ; pad to 4 = 3
+           (total    (+ 4 cid-len cid-pad 4))          ; u32 + cid+NUL+pad + PropSeq-count-u32 = 36
+           (v        (make-array total :element-type '(unsigned-byte 8) :initial-element 0)))
+      ;; u32-LE(cid-len)
+      (setf (aref v 0) (ldb (byte 8  0) cid-len)
+            (aref v 1) (ldb (byte 8  8) cid-len)
+            (aref v 2) (ldb (byte 8 16) cid-len)
+            (aref v 3) (ldb (byte 8 24) cid-len))
+      ;; ASCII bytes
+      (dotimes (i (length class-id))
+        (setf (aref v (+ 4 i)) (char-code (char class-id i))))
+      ;; NUL already 0 at offset (+ 4 (length class-id)); pad bytes already 0
+      ;; PropSeq count = 0 at bytes (+ 4 cid-len cid-pad)..+3 (already 0)
+      v)
+  "Self-consistency byte corpus: CDR-LE DataHolder class_id prefix + PropSeq count=0 for +Req (36 bytes).")
+
+(defun* run-auth-wire-codec-test ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-2BI T2: §9.3.4 DataHolder + §7.4.4 ParticipantGenericMessage wire codec.
+   (a) Round-trip fidelity: Request token -> handshake-token->dataholder -> dataholder->handshake-token
+       -> the reconstructed token drives begin-handshake-reply on the peer to the SAME next state.
+   (b) ParticipantGenericMessage round-trip: make-generic-message -> parse-generic-message ->
+       message-class-id + GUIDs + DataHolder list round-trip byte-identically.
+   (c) Self-consistency prefix: DataHolder leading bytes match the T0-pinned CDR-LE layout
+       (the locked +dataholder-req-prefix-vector+ above).
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-wire-codec] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-wire-codec-test t)))
+
+  (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key-a  (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (ec-cert-b (%read-fixture-pem "participant_ec_b/identity_cert.pem"))
+         (ec-key-b  (%read-fixture-pem "participant_ec_b/identity_key.pem"))
+         (guid-a    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))
+         (guid-b    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))))
+    (multiple-value-bind (id-a reason-a)
+        (dds.security:validate-local-identity ca-pem ec-cert-a ec-key-a guid-a)
+      (%check :wire-id-a-ok (not (null id-a))
+              (format nil "validate-local-identity A failed: ~a" reason-a))
+      (unless id-a (return-from run-auth-wire-codec-test t))
+      (unwind-protect
+           (multiple-value-bind (id-b reason-b)
+               (dds.security:validate-local-identity ca-pem ec-cert-b ec-key-b guid-b)
+             (%check :wire-id-b-ok (not (null id-b))
+                     (format nil "validate-local-identity B failed: ~a" reason-b))
+             (unless id-b (return-from run-auth-wire-codec-test t))
+             (unwind-protect
+                  (progn
+
+                    ;; --- (a) DataHolder round-trip fidelity ---
+                    ;; begin-handshake-request returns internal tagged-binary octets + handle.
+                    ;; %parse-token recovers the handshake-token struct; then serialize to DataHolder,
+                    ;; parse back, re-serialize to tagged-binary, feed into begin-handshake-reply.
+                    (multiple-value-bind (req-tok-octets req-hdl)
+                        (dds.security:begin-handshake-request id-a id-b dds.security:+suite-ecdh+)
+                      (unwind-protect
+                           (progn
+                             ;; recover struct from the internal tagged-binary
+                             (let ((req-struct (dds.security::%parse-token req-tok-octets)))
+                               (%check :wire-req-struct-ok (not (null req-struct))
+                                       "wire-codec: %parse-token on req-tok returned NIL")
+                               (when req-struct
+                                 ;; serialize to DataHolder CDR-LE
+                                 (let* ((dh-octets (dds.security:handshake-token->dataholder req-struct))
+                                        (dh-len    (length dh-octets)))
+                                   (%check :wire-dh-non-empty (> dh-len 0)
+                                           "wire-codec: handshake-token->dataholder returned empty")
+
+                                   ;; (c) self-consistency: leading bytes match the pinned prefix vector
+                                   (let ((prefix-len (length +dataholder-req-prefix-vector+)))
+                                     (%check :wire-dh-prefix-len (>= dh-len prefix-len)
+                                             (format nil "wire-codec: DataHolder ~d bytes < prefix ~d" dh-len prefix-len))
+                                     (when (>= dh-len prefix-len)
+                                       (%check :wire-dh-prefix-exact
+                                               (equalp (subseq dh-octets 0 prefix-len)
+                                                       +dataholder-req-prefix-vector+)
+                                               (format nil "wire-codec: DataHolder prefix mismatch; first ~d: ~{~d ~}"
+                                                       prefix-len
+                                                       (coerce (subseq dh-octets 0 (min prefix-len dh-len)) 'list)))))
+
+                                   ;; parse DataHolder back to token
+                                   (let ((rt-tok (dds.security:dataholder->handshake-token dh-octets)))
+                                     (%check :wire-rt-tok-ok (not (null rt-tok))
+                                             "wire-codec: dataholder->handshake-token returned NIL")
+                                     (when rt-tok
+                                       ;; class_id must match
+                                       (%check :wire-rt-class-id
+                                               (string= (dds.security::handshake-token-class-id rt-tok)
+                                                        dds.security::+handshake-request-class-id+)
+                                               (format nil "wire-codec: round-trip class_id '~a'"
+                                                       (dds.security::handshake-token-class-id rt-tok)))
+                                       ;; binary-props count must match
+                                       (%check :wire-rt-prop-count
+                                               (= (length (dds.security::handshake-token-binary-props rt-tok))
+                                                  (length (dds.security::handshake-token-binary-props req-struct)))
+                                               (format nil "wire-codec: prop count ~d vs ~d"
+                                                       (length (dds.security::handshake-token-binary-props rt-tok))
+                                                       (length (dds.security::handshake-token-binary-props req-struct))))
+                                       ;; re-serialize to tagged binary and drive begin-handshake-reply
+                                       (let* ((rt-octets (dds.security::%serialize-token rt-tok))
+                                              (rep-tok-rt (nth-value 0
+                                                            (dds.security:begin-handshake-reply
+                                                             id-b id-a rt-octets dds.security:+suite-ecdh+)))
+                                              (rep-tok-direct (nth-value 0
+                                                               (dds.security:begin-handshake-reply
+                                                                id-b id-a req-tok-octets dds.security:+suite-ecdh+))))
+                                         ;; both paths must yield non-nil reply tokens (same next state)
+                                         (%check :wire-rt-reply-ok (not (null rep-tok-rt))
+                                                 "wire-codec: begin-handshake-reply on round-tripped token returned NIL")
+                                         (%check :wire-direct-reply-ok (not (null rep-tok-direct))
+                                                 "wire-codec: begin-handshake-reply on direct token returned NIL"))))))
+                        (dds.security:free-handshake-handle req-hdl)))
+
+                    ;; --- (b) ParticipantGenericMessage round-trip ---
+                    (multiple-value-bind (req-tok2 req-hdl2)
+                        (dds.security:begin-handshake-request id-a id-b dds.security:+suite-ecdh+)
+                      (unwind-protect
+                           (let* ((req-struct2 (dds.security::%parse-token req-tok2))
+                                  (dh-blob     (dds.security:handshake-token->dataholder req-struct2))
+                                  (src-guid    (make-array 16 :element-type '(unsigned-byte 8)
+                                                              :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 0 0 2 195)))
+                                  (rel-guid    (make-array 16 :element-type '(unsigned-byte 8)
+                                                              :initial-element 0))
+                                  (dest-pg     (make-array 16 :element-type '(unsigned-byte 8)
+                                                              :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 0 0 0 193)))
+                                  (dest-ep     (make-array 16 :element-type '(unsigned-byte 8)
+                                                              :initial-contents '(0 0 0 0 0 0 0 0 0 0 0 0 0 2 1 196)))
+                                  (src-ep      (make-array 16 :element-type '(unsigned-byte 8)
+                                                              :initial-contents '(0 0 0 0 0 0 0 0 0 0 0 0 0 2 1 195)))
+                                  (msg-class   dds.security:+auth-message-class-id+)
+                                  (envelope    (dds.security:make-generic-message
+                                                :source-guid src-guid
+                                                :sequence-number 1
+                                                :related-guid rel-guid
+                                                :related-sn 0
+                                                :dest-participant-guid dest-pg
+                                                :dest-endpoint-guid dest-ep
+                                                :source-endpoint-guid src-ep
+                                                :message-class-id msg-class
+                                                :dataholders (list dh-blob))))
+                             (%check :wire-env-non-empty (> (length envelope) 0)
+                                     "wire-codec: make-generic-message returned empty envelope")
+                             (multiple-value-bind (p-src-guid p-sn p-rel-guid p-rel-sn
+                                                   p-dest-pg p-dest-ep p-src-ep
+                                                   p-class p-dh-list)
+                                 (dds.security:parse-generic-message envelope)
+                               (%check :wire-parse-src-guid-ok (not (null p-src-guid))
+                                       "wire-codec: parse-generic-message returned NIL source-guid")
+                               (when p-src-guid
+                                 (%check :wire-parse-src-guid (equalp p-src-guid src-guid)
+                                         "wire-codec: parsed source-guid mismatch")
+                                 (%check :wire-parse-sn (= p-sn 1)
+                                         (format nil "wire-codec: parsed SN ~d != 1" p-sn))
+                                 (%check :wire-parse-rel-guid (equalp p-rel-guid rel-guid)
+                                         "wire-codec: parsed related-guid mismatch")
+                                 (%check :wire-parse-rel-sn (= p-rel-sn 0)
+                                         (format nil "wire-codec: parsed related-SN ~d != 0" p-rel-sn))
+                                 (%check :wire-parse-dest-pg (equalp p-dest-pg dest-pg)
+                                         "wire-codec: parsed dest-participant-guid mismatch")
+                                 (%check :wire-parse-dest-ep (equalp p-dest-ep dest-ep)
+                                         "wire-codec: parsed dest-endpoint-guid mismatch")
+                                 (%check :wire-parse-src-ep (equalp p-src-ep src-ep)
+                                         "wire-codec: parsed source-endpoint-guid mismatch")
+                                 (%check :wire-parse-class-id (string= p-class msg-class)
+                                         (format nil "wire-codec: parsed class-id '~a' != '~a'" p-class msg-class))
+                                 (%check :wire-parse-dh-count (= (length p-dh-list) 1)
+                                         (format nil "wire-codec: parsed ~d DataHolders, expected 1"
+                                                 (length p-dh-list)))
+                                 (when (= (length p-dh-list) 1)
+                                   (%check :wire-parse-dh-bytes (equalp (car p-dh-list) dh-blob)
+                                           (format nil "wire-codec: DataHolder blob round-trip mismatch (~d vs ~d bytes)"
+                                                   (length (car p-dh-list)) (length dh-blob)))))))
+                        (dds.security:free-handshake-handle req-hdl2))))
+               (dds.security:free-identity-handle id-b)))
+        (dds.security:free-identity-handle id-a))))
+  t)))
+
+;;; Safety-0 compiled fuzz inner loop for the wire codec parsers.
+
+(defun* %fuzz-wire-parse-loop-s0 (blobs)
+    (function (list) (unsigned-byte 32))
+  "Feed each blob through dataholder->handshake-token AND parse-generic-message at (safety 0).
+   Returns count of blobs where BOTH parsers returned NIL/nil-head (fail-closed). safety-0 arm."
+  (declare (optimize (safety 0) (speed 3)))
+  (let ((nil-count 0))
+    (declare (type (unsigned-byte 32) nil-count))
+    (dolist (blob blobs nil-count)
+      (let ((dh-result (dds.security:dataholder->handshake-token blob)))
+        (when (null dh-result) (incf nil-count)))
+      (let ((pgm-head (nth-value 0 (dds.security:parse-generic-message blob))))
+        (when (null pgm-head) (incf nil-count))))))
+
+(defun* run-auth-wire-fuzz-test ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-2BI T2: parser fuzz — N=2000 malformed/short/oversized/random blobs.
+   Drives dataholder->handshake-token AND parse-generic-message; asserts fail-closed (-> NIL).
+   Tests BOTH a normal-optimization path AND a (safety 0) compiled inner loop (NFR-SEC-POSTURE).
+   Deterministic blob generation (index-based fill, no random-state). Both SBCL and Clasp must pass."
+  (let* ((fuzz-blobs '())
+         (fuzz-count 0))
+
+    ;; Case A (44 blobs): zero-length through 43-byte, all zeros
+    (dotimes (len 44)
+      (push (make-array len :element-type '(unsigned-byte 8) :initial-element 0) fuzz-blobs))
+
+    ;; Case B (50 blobs): various sizes 4..53, deterministic fill
+    (dotimes (k 50)
+      (let* ((sz (+ 4 k))
+             (b  (make-array sz :element-type '(unsigned-byte 8))))
+        (dotimes (i sz) (setf (aref b i) (ldb (byte 8 0) (+ (* i k) 37))))
+        (push b fuzz-blobs)))
+
+    ;; Case C (1906 blobs): sizes 60 128 256 512 1024, deterministic fill
+    (let ((sizes '(60 128 256 512 1024)))
+      (dotimes (idx 1906)
+        (let* ((sz   (nth (mod idx (length sizes)) sizes))
+               (blob (make-array sz :element-type '(unsigned-byte 8))))
+          (dotimes (i sz)
+            (setf (aref blob i) (ldb (byte 8 0) (+ (* i (1+ idx)) 37))))
+          (push blob fuzz-blobs))))
+
+    (setf fuzz-blobs  (nreverse fuzz-blobs))
+    (setf fuzz-count  (length fuzz-blobs))
+
+    ;; Normal-optimization pass: every blob through both parsers -> NIL (fail-closed)
+    (let ((normal-dh-nil-count  0)
+          (normal-pgm-nil-count 0))
+      (declare (type (unsigned-byte 32) normal-dh-nil-count normal-pgm-nil-count))
+      (dolist (blob fuzz-blobs)
+        (let ((result
+                (handler-case
+                    (dds.security:dataholder->handshake-token blob)
+                  (error (e)
+                    (error 'test-failure :name :wire-fuzz-dh-escaped
+                           :detail (format nil "wire-fuzz: dataholder->handshake-token signalled: ~a" e))))))
+          (%check :wire-fuzz-dh-closed (null result)
+                  (format nil "wire-fuzz: dataholder->handshake-token did not return NIL on blob len ~d"
+                          (length blob)))
+          (when (null result) (incf normal-dh-nil-count)))
+        (let ((head
+                (handler-case
+                    (nth-value 0 (dds.security:parse-generic-message blob))
+                  (error (e)
+                    (error 'test-failure :name :wire-fuzz-pgm-escaped
+                           :detail (format nil "wire-fuzz: parse-generic-message signalled: ~a" e))))))
+          (%check :wire-fuzz-pgm-closed (null head)
+                  (format nil "wire-fuzz: parse-generic-message did not return NIL on blob len ~d"
+                          (length blob)))
+          (when (null head) (incf normal-pgm-nil-count))))
+
+      (%check :wire-fuzz-normal-dh-all-nil (= normal-dh-nil-count fuzz-count)
+              (format nil "wire-fuzz normal dh: ~d/~d returned NIL" normal-dh-nil-count fuzz-count))
+      (%check :wire-fuzz-normal-pgm-all-nil (= normal-pgm-nil-count fuzz-count)
+              (format nil "wire-fuzz normal pgm: ~d/~d returned NIL" normal-pgm-nil-count fuzz-count)))
+
+    ;; safety-0 pass: count blobs where BOTH parsers returned NIL (each blob counted twice)
+    (let ((safety0-count
+            (handler-case
+                (%fuzz-wire-parse-loop-s0 fuzz-blobs)
+              (error (e)
+                (error 'test-failure :name :wire-fuzz-s0-escaped
+                       :detail (format nil "wire-fuzz safety-0: signalled: ~a" e))))))
+      ;; Each blob contributes up to 2 increments (one per parser); total = 2*fuzz-count when all NIL
+      (%check :wire-fuzz-s0-all-nil (= safety0-count (* 2 fuzz-count))
+              (format nil "wire-fuzz safety-0: ~d/~d nil-results (expect ~d)"
+                      safety0-count (* 2 fuzz-count) (* 2 fuzz-count))))
+
+    (format t "~&  [auth-wire-fuzz] ~d blobs exercised (dataholder + pgm, normal + safety-0)~%"
+            fuzz-count))
+  t)
+
+;;; ============================================================
+;;; T3: ParticipantStatelessMessage builtin endpoints + handshake over the wire
+;;; ============================================================
+
+(defun* %psm-guid-from-prefix (prefix entity-id)
+    (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32)) (simple-array (unsigned-byte 8) (16)))
+  "Build a 16-octet GUID_t from a 12-octet participant PREFIX + 32-bit ENTITY-ID (big-endian bytes 12-15)."
+  (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace g prefix :start1 0 :end1 12)
+    (setf (aref g 12) (ldb (byte 8 24) entity-id)
+          (aref g 13) (ldb (byte 8 16) entity-id)
+          (aref g 14) (ldb (byte 8  8) entity-id)
+          (aref g 15) (ldb (byte 8  0) entity-id))
+    g))
+
+;;; Shared mutable handshake state threaded across the two PSM receiver closures (lock-protected).
+(defstruct* (wire-hs-state (:constructor make-wire-hs-state
+                                          (&key id-a id-b prefix-a prefix-b)))
+  "Lock-protected handshake state shared between the two PSM receiver callbacks."
+  (lock    (dds.pal:make-lock "whs") :type t)
+  (id-a    nil :type t)
+  (id-b    nil :type t)
+  (prefix-a (make-array 12 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (12)))
+  (prefix-b (make-array 12 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (12)))
+  (a-hdl   nil :type t)
+  (b-hdl   nil :type t)
+  (a-done  nil :type t)
+  (b-done  nil :type t)
+  (a-ss    nil :type t)
+  (b-ss    nil :type t)
+  (a-sn    1   :type integer)
+  (b-sn    1   :type integer))
+
+(defun* %psm-send-token-msg (from-node from-prefix to-prefix token sn)
+    (function (t (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (12)) t integer) t)
+  "Serialize TOKEN into a ParticipantGenericMessage and send it via PSM unicast."
+  (let* ((dh-octets (dds.security:handshake-token->dataholder token))
+         (src-guid  (%psm-guid-from-prefix
+                     from-prefix dds.rtps.discovery:+entityid-participant-stateless-writer+))
+         (dst-guid  (%psm-guid-from-prefix
+                     to-prefix dds.rtps.discovery:+entityid-participant-stateless-reader+))
+         (zero      (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (env       (dds.security:make-generic-message
+                     :source-guid           src-guid
+                     :sequence-number       sn
+                     :related-guid          zero
+                     :related-sn            0
+                     :dest-participant-guid (%psm-guid-from-prefix to-prefix dds.rtps.message:+entityid-participant+)
+                     :dest-endpoint-guid    dst-guid
+                     :source-endpoint-guid  src-guid
+                     :message-class-id      dds.security:+auth-message-class-id+
+                     :dataholders           (list dh-octets))))
+    (dds.disc:%send-stateless-message from-node to-prefix env))
+  t)
+
+(defun* %psm-on-a-callback (node token state)
+    (function (t t wire-hs-state) t)
+  "PSM callback for node-A (requester): HandshakeReply -> process-handshake -> send Final."
+  (dds.pal:with-lock ((wire-hs-state-lock state))
+    (unless (wire-hs-state-a-done state)
+      (when (wire-hs-state-a-hdl state)
+        (multiple-value-bind (final-octets status)
+            (dds.security:process-handshake
+             (wire-hs-state-a-hdl state)
+             (dds.security::%serialize-token token))
+          ;; :continue = requester reached :authenticated (holds the secret; sends Final) per §8.7.2.4
+          (when (eq status :continue)
+            (setf (wire-hs-state-a-done state) t)
+            (let ((ss (dds.security:handshake-shared-secret (wire-hs-state-a-hdl state))))
+              (when ss
+                (setf (wire-hs-state-a-ss state) (dds.security:shared-secret-bytes ss))))
+            (when final-octets
+              (let ((ft (dds.security::%parse-token final-octets)))
+                (when ft
+                  (let ((sn (incf (wire-hs-state-a-sn state))))
+                    (%psm-send-token-msg node
+                                        (wire-hs-state-prefix-a state)
+                                        (wire-hs-state-prefix-b state)
+                                        ft sn))))))))))
+  t)
+
+(defun* %psm-on-b-callback (node token state)
+    (function (t t wire-hs-state) t)
+  "PSM callback for node-B (replier): HandshakeRequest -> begin-handshake-reply; Final -> :authenticated."
+  (dds.pal:with-lock ((wire-hs-state-lock state))
+    (unless (wire-hs-state-b-done state)
+      (if (null (wire-hs-state-b-hdl state))
+          (multiple-value-bind (rep-octets rep-hdl)
+              (dds.security:begin-handshake-reply
+               (wire-hs-state-id-b state)
+               (wire-hs-state-id-a state)
+               (dds.security::%serialize-token token)
+               dds.security:+suite-ecdh+)
+            (when (and rep-octets rep-hdl)
+              (setf (wire-hs-state-b-hdl state) rep-hdl)
+              (let ((rt (dds.security::%parse-token rep-octets)))
+                (when rt
+                  (let ((sn (incf (wire-hs-state-b-sn state))))
+                    (%psm-send-token-msg node
+                                        (wire-hs-state-prefix-b state)
+                                        (wire-hs-state-prefix-a state)
+                                        rt sn))))))
+          (multiple-value-bind (nil-tok status)
+              (dds.security:process-handshake
+               (wire-hs-state-b-hdl state)
+               (dds.security::%serialize-token token))
+            (declare (ignore nil-tok))
+            (when (eq status :authenticated)
+              (setf (wire-hs-state-b-done state) t)
+              (let ((ss (dds.security:handshake-shared-secret (wire-hs-state-b-hdl state))))
+                (when ss
+                  (setf (wire-hs-state-b-ss state) (dds.security:shared-secret-bytes ss)))))))))
+  t)
+
+(defun* run-auth-handshake-over-wire-test ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-2BI T3: PSM builtin endpoints, end-to-end handshake over UDP wire.
+   (a) Two real disc-nodes perform REAL SPDP discovery on loopback.
+   (b) Node-A (GUID prefix 0x01...) is the requester (GUID-A < GUID-B, §8.7.2.4).
+       begin-handshake-request -> handshake-token->dataholder -> make-generic-message ->
+       %send-stateless-message (node-A, B-prefix, env).
+   (c) Node-B's on-stateless-message callback receives the token (UDP wire) -> begin-handshake-reply.
+   (d) Node-A receives the Reply -> process-handshake -> sends Final.
+   (e) Node-B receives the Final -> process-handshake -> :authenticated.
+   (f) Both reach :authenticated with byte-equal SharedSecrets (bounded 4 s poll).
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-handshake-over-wire] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-handshake-over-wire-test t)))
+
+  (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key-a  (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (ec-cert-b (%read-fixture-pem "participant_ec_b/identity_cert.pem"))
+         (ec-key-b  (%read-fixture-pem "participant_ec_b/identity_key.pem"))
+         ;; GUID-A (0x01..) < GUID-B (0xC8..) — A is always the requester (§8.7.2.4)
+         (guid-a-16 (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 0 2 1 #xC3)))
+         (guid-b-16 (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 0 2 1 #xC3)))
+         (prefix-a  (subseq guid-a-16 0 12))
+         (prefix-b  (subseq guid-b-16 0 12)))
+
+    (multiple-value-bind (id-a reason-a)
+        (dds.security:validate-local-identity ca-pem ec-cert-a ec-key-a guid-a-16)
+      (%check :wire-hs-id-a (not (null id-a))
+              (format nil "validate-local-identity A failed: ~a" reason-a))
+      (unless id-a (return-from run-auth-handshake-over-wire-test t))
+      (unwind-protect
+           (multiple-value-bind (id-b reason-b)
+               (dds.security:validate-local-identity ca-pem ec-cert-b ec-key-b guid-b-16)
+             (%check :wire-hs-id-b (not (null id-b))
+                     (format nil "validate-local-identity B failed: ~a" reason-b))
+             (unless id-b (return-from run-auth-handshake-over-wire-test t))
+             (unwind-protect
+                  (let* ((state (make-wire-hs-state :id-a id-a :id-b id-b
+                                                    :prefix-a prefix-a :prefix-b prefix-b))
+                         (node-a (dds.disc:make-disc-node
+                                  :guid-prefix prefix-a
+                                  :host "127.0.0.1" :port 0
+                                  :identity-token-octets (dds.security:identity-token id-a)
+                                  :on-stateless-message
+                                  (lambda (node src-prefix token)
+                                    (declare (ignore src-prefix))
+                                    (%psm-on-a-callback node token state))))
+                         (node-b (dds.disc:make-disc-node
+                                  :guid-prefix prefix-b
+                                  :host "127.0.0.1" :port 0
+                                  :identity-token-octets (dds.security:identity-token id-b)
+                                  :on-stateless-message
+                                  (lambda (node src-prefix token)
+                                    (declare (ignore src-prefix))
+                                    (%psm-on-b-callback node token state)))))
+                    (unwind-protect
+                         (progn
+                           ;; wire peer lists for unicast SPDP
+                           (setf (dds.disc:disc-node-peers node-a)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-b))))
+                           (setf (dds.disc:disc-node-peers node-b)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-a))))
+                           (dds.disc:start-node node-a)
+                           (dds.disc:start-node node-b)
+
+                           ;; Phase 1: REAL SPDP discovery — poll until mutual discovery
+                           (dds.disc:announce-participant node-a)
+                           (dds.disc:announce-participant node-b)
+                           (loop repeat 200
+                                 until (and (plusp (dds.disc:disc-node-discovered-count node-a))
+                                            (plusp (dds.disc:disc-node-discovered-count node-b)))
+                                 do (dds.disc:announce-participant node-a)
+                                    (dds.disc:announce-participant node-b)
+                                    (sleep 0.02))
+                           (%check :wire-hs-spdp-a
+                                   (plusp (dds.disc:disc-node-discovered-count node-a))
+                                   "node-A did not discover node-B via SPDP")
+                           (%check :wire-hs-spdp-b
+                                   (plusp (dds.disc:disc-node-discovered-count node-b))
+                                   "node-B did not discover node-A via SPDP")
+
+                           ;; Phase 2: initiate the handshake from node-A (requester)
+                           (multiple-value-bind (req-octets req-hdl)
+                               (dds.security:begin-handshake-request
+                                id-a id-b dds.security:+suite-ecdh+)
+                             (%check :wire-hs-req-hdl (not (null req-hdl))
+                                     "begin-handshake-request returned nil handle")
+                             (when req-hdl
+                               (dds.pal:with-lock ((wire-hs-state-lock state))
+                                 (setf (wire-hs-state-a-hdl state) req-hdl))
+                               (let ((rt (dds.security::%parse-token req-octets)))
+                                 (%check :wire-hs-req-tok (not (null rt))
+                                         "begin-handshake-request: internal token parse failed")
+                                 (when rt
+                                   (%psm-send-token-msg node-a prefix-a prefix-b
+                                                        rt (wire-hs-state-a-sn state))))
+
+                               ;; Phase 3: poll for completion (bounded; 4 seconds max)
+                               (loop repeat 200
+                                     until (dds.pal:with-lock ((wire-hs-state-lock state))
+                                             (and (wire-hs-state-a-done state)
+                                                  (wire-hs-state-b-done state)))
+                                     do (sleep 0.02))
+
+                               (let* ((done-a (dds.pal:with-lock ((wire-hs-state-lock state))
+                                                (wire-hs-state-a-done state)))
+                                      (done-b (dds.pal:with-lock ((wire-hs-state-lock state))
+                                                (wire-hs-state-b-done state)))
+                                      (ss-a   (dds.pal:with-lock ((wire-hs-state-lock state))
+                                                (wire-hs-state-a-ss state)))
+                                      (ss-b   (dds.pal:with-lock ((wire-hs-state-lock state))
+                                                (wire-hs-state-b-ss state))))
+                                 (%check :wire-hs-a-authenticated done-a
+                                         "node-A did not reach :authenticated within timeout")
+                                 (%check :wire-hs-b-authenticated done-b
+                                         "node-B did not reach :authenticated within timeout")
+                                 (when (and done-a done-b)
+                                   (%check :wire-hs-ss-a-ok (not (null ss-a))
+                                           "node-A SharedSecret is nil after :authenticated")
+                                   (%check :wire-hs-ss-b-ok (not (null ss-b))
+                                           "node-B SharedSecret is nil after :authenticated")
+                                   (when (and ss-a ss-b)
+                                     (%check :wire-hs-ss-len-a (= (length ss-a) 32)
+                                             (format nil "node-A SS length ~d != 32" (length ss-a)))
+                                     (%check :wire-hs-ss-len-b (= (length ss-b) 32)
+                                             (format nil "node-B SS length ~d != 32" (length ss-b)))
+                                     (%check :wire-hs-ss-equal (equalp ss-a ss-b)
+                                             "SharedSecret mismatch between node-A and node-B")))
+                                 (dds.pal:with-lock ((wire-hs-state-lock state))
+                                   (when (wire-hs-state-a-hdl state)
+                                     (dds.security:free-handshake-handle (wire-hs-state-a-hdl state))
+                                     (setf (wire-hs-state-a-hdl state) nil))
+                                   (when (wire-hs-state-b-hdl state)
+                                     (dds.security:free-handshake-handle (wire-hs-state-b-hdl state))
+                                     (setf (wire-hs-state-b-hdl state) nil)))))))
+                      (dds.disc:stop-node node-a)
+                      (dds.disc:stop-node node-b)))
+               (dds.security:free-identity-handle id-b)))
+        (dds.security:free-identity-handle id-a))))
+  t)

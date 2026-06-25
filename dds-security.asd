@@ -15,5 +15,6 @@
                 :components ((:file "constants")
                              (:file "identity")
                              (:file "suites")
-                             (:file "handshake"))))
+                             (:file "handshake")
+                             (:file "wire"))))
   :in-order-to ((test-op (test-op "dds-tests"))))

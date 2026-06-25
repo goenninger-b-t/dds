@@ -12,5 +12,6 @@
                (:file "dataplane")
                (:file "flow-control")
                (:file "typelookup-endpoints")
-               (:file "participant-message"))
+               (:file "participant-message")
+               (:file "stateless-message"))
   :in-order-to ((test-op (test-op "dds-tests"))))
