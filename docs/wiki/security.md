@@ -478,9 +478,22 @@ are distinct and never mixed.
 - `%send-stateless-message (node dest-prefix envelope-octets)` — wraps the CDR-LE
   envelope in a DATA submessage and sends unicast to the PSM reader EntityId port.
 - `on-stateless-message` slot — a closure called by the receiver thread with
-  `(node src-prefix token)` when a PSM DATA arrives.
+  `(node src-prefix envelope-octets)` when a PSM DATA arrives.  **As of Slice 2b-ii
+  (Decision 1) the hook receives the RAW `ParticipantGenericMessage` envelope octets**
+  (only the payload buffer-extent is bounds-checked in `dds-disc`); `dds-disc` stays
+  crypto/format-agnostic and the consumer (the auth manager) does `parse-generic-message`
+  and dispatches by `message_class_id` — because both the handshake (`dds.sec.auth`) and the
+  crypto-token (`dds.sec.participant_crypto_tokens`) messages share this one endpoint with
+  different `DataHolder`s, so a pre-parse to a `handshake-token` in `dds-disc` would silently
+  drop crypto-token messages.
 
 ### 6bis.4 A worked end-to-end example (our-to-our, EC suite)
+
+As of Slice 2b-ii the hook delivers the **raw envelope octets** (Decision 1); the `%on-*`
+helpers below first `parse-generic-message` the envelope, take the first `DataHolder`, and
+`dataholder->handshake-token` it before driving the handshake (`%psm-envelope->token-octets`
+in the test does exactly this).  Most callers should instead just configure an identity on
+the participant (§6ter) and let the auth manager drive all of this.
 
 ```lisp
 ;; Node-A and Node-B both carry an IdentityToken in their SPDP.
@@ -488,19 +501,19 @@ are distinct and never mixed.
                 :guid-prefix prefix-a :host "127.0.0.1" :port 0
                 :identity-token-octets (dds.security:identity-token id-a)
                 :on-stateless-message
-                (lambda (node src-prefix token)
+                (lambda (node src-prefix envelope)
                   (declare (ignore src-prefix))
                   ;; A's callback: receives Reply -> process-handshake -> send Final
-                  (%on-a-reply node token state))))
+                  (%on-a-reply node envelope state))))
        (node-b (dds.disc:make-disc-node
                 :guid-prefix prefix-b :host "127.0.0.1" :port 0
                 :identity-token-octets (dds.security:identity-token id-b)
                 :on-stateless-message
-                (lambda (node src-prefix token)
+                (lambda (node src-prefix envelope)
                   (declare (ignore src-prefix))
                   ;; B's callback: receives Request -> begin-handshake-reply -> send Reply;
                   ;;                receives Final  -> process-handshake -> :authenticated
-                  (%on-b-request-or-final node token state)))))
+                  (%on-b-request-or-final node envelope state)))))
   ;; 1. SPDP discovery (real UDP loopback).
   (dds.disc:start-node node-a)
   (dds.disc:start-node node-b)
@@ -549,6 +562,298 @@ self-consistent (our-to-our) but unverified against a live Connext peer.
 
 ---
 
+## 6ter. Authentication MANAGER — Slice 2b-ii + 2c (discovery integration + key exchange)
+
+Slice 2b-ii + 2c (landed 2026-06-26, WP-DDS-SECURITY-AUTH-KEYX, ADR 0034 at the capstone)
+adds the orchestrator that finally *uses* the handshake automatically: a security-enabled
+participant authenticates every discovered security-enabled peer over the PSM wire, exchanges
+per-writer key material, and **gates endpoint matching strictly on authentication**.
+
+### 6ter.1 Where it lives
+
+The **auth manager** is `src/dds-dcps/auth-manager.lisp`, mirroring the FR-TYPE-4 type-gate
+(`type-gate.lisp`).  It sits in the DCPS layer because it needs BOTH `dds-security` (handshake +
+key exchange) AND `dds-disc` (hooks, send, matching); `dds-disc` stays crypto-free.  Per-participant
+state hangs off the `domain-participant` (`dp-auth-state`, analogous to `dp-type-gate-state`);
+per-remote state (`auth-remote`, keyed by 12-octet GUID prefix) lives in the disc-node's
+manager-owned `disc-node-auth-state` table.
+
+### 6ter.2 Turning it on
+
+```lisp
+(let ((id (dds.security:validate-local-identity ca-pem cert-pem key-pem guid)))
+  ;; a security-enabled participant: advertises its IdentityToken in SPDP + installs the manager
+  (dds.dcps:create-participant :domain 0 :identity id))
+```
+
+`create-participant :identity <identity-handle>` sets the node's `identity-token-octets` (so SPDP
+advertises `PID_IDENTITY_TOKEN` + the PSM bits) and calls `%install-auth-manager`, which installs
+three disc-node hooks: `on-participant-discovered` (the requester trigger / replier pre-stash),
+`on-stateless-message` (the raw-envelope handshake + key-material dispatcher), and `auth-gate`
+(the strict §7.3 endpoint-match verdict).  With **no** `:identity`, `dp-auth-state` stays NIL and
+the participant is the byte-identical plain path.
+
+### 6ter.3 The `auth-remote` state machine (§8.7 / §9.5)
+
+| State | Meaning |
+|---|---|
+| `:none` | discovered + validated; role/suite recorded; no handshake yet |
+| `:handshaking` | an in-flight §8.7.2.4 handshake (handle non-NIL) |
+| `:authenticated` | handshake complete (SharedSecret); KxKey derived + our CryptoTokens sent; remote KeyMaterial NOT yet installed |
+| `:keyed` | authenticated AND the remote writer KeyMaterial installed → endpoint matching resumed |
+| `:rejected` | terminal refusal (malformed/untrusted remote, unsupported/mismatched algo, bad handshake) |
+
+The **role** (`:requester` / `:replier`) is decided from the **real RTPS participant GUID prefixes**
+(§8.7.2.4 lexicographic order) — deterministic and complementary on both peers — not from
+`validate-remote-identity`'s T1 cert-sn-hash stand-in (which is used only for the `:ok`/`:rejected`
+verdict).
+
+### 6ter.4 The three design decisions
+
+1. **One stateless endpoint, two message kinds (Decision 1).** The handshake and the crypto-token
+   messages arrive on the SAME PSM endpoint with DIFFERENT `DataHolder`s.  `%on-stateless-message`
+   now delivers the RAW envelope octets; the manager does `parse-generic-message`, reads
+   `message_class_id`, and dispatches: `dds.sec.auth` → handshake; `dds.sec.participant_crypto_tokens`
+   → install the remote KeyMaterial.  (Before, `dds-disc` pre-parsed a `handshake-token`, which
+   silently dropped crypto-token messages.)
+2. **Suite selection encapsulates the unsupported-algo NIL (Decision 2).**
+   `select-suite-for-identities (local-identity remote-id-token-octets)` derives both cert kinds via
+   the internal `%cert-algo->kind` and returns NIL — meaning *reject this remote* — when EITHER algo
+   is unsupported or the suites mismatch, else the selected `auth-suite`.  This keeps the NIL handling
+   where `%cert-algo->kind` lives, so the manager never passes NIL to `select-auth-suite` (whose ftype
+   is `(member :ec :rsa)`).
+3. **Local identity wiring (Decision 3).** The manager holds the local `identity-handle` (with the
+   private key) — the disc-node holds only the IdentityToken octets.  `create-participant :identity`
+   plumbs it; `%install-auth-manager (p identity-handle)` stores it in `dp-auth-state`.
+
+### 6ter.5 The strict auth-gate (§7.3)
+
+Consulted as the SECOND sequential gate after the type-gate returns `:compatible` (in
+`%match-remote-endpoint`), outside the node lock.  Strict authenticated-only matching
+(`allow_unauthenticated = FALSE`, the conformant default):
+
+- local **not** security-enabled (`dp-auth-state` NIL) → `:compatible` (security off, unchanged);
+- remote `:keyed` → `:compatible`;
+- remote `:handshaking` / `:authenticated` (in flight) → `:pending` (park; resumed on `:keyed`);
+- remote has NO `auth-remote` (a plain peer, no IdentityToken) OR `:rejected` / `:none` →
+  `:incompatible` (strict refuse).
+
+### 6ter.6 Key exchange (§9.5.2 / §9.5.3)
+
+On reaching `:authenticated`, each side derives the §9.5.3 **KxKey** from the SharedSecret +
+challenges (`derive-kx-key`, T2 — KxKey held in a `dds.pal` foreign buffer), generates its §9.5.2
+per-writer **KeyMaterial** (`generate-writer-key-material`, T3), and sends it **KxKey-encrypted**
+over PSM (`make-crypto-token-message`, T3).  The peer decrypts + installs it
+(`parse-crypto-token-message`, fail-closed: a bad KxKey or any tamper → no install).  When both
+authenticated AND the remote KeyMaterial is installed → `:keyed` → `resume-parked-matches`.  PSM is
+best-effort with no resend this slice (the reliable `ParticipantVolatileMessageSecure` endpoint is a
+Slice-5 carry); a crypto-token that arrives before the local KxKey exists is buffered and drained on
+authentication.
+
+### 6ter.7 The honest interop posture for Slice 2b-ii + 2c
+
+**Level 1 — Our-to-our discovery → authenticate → key exchange → strict-gated match → encrypted DATA (ACHIEVED)**
+Two security-enabled participants authenticate on SPDP discovery, exchange conformant
+KxKey-encrypted §9.5.2 key material, and both reach `auth-remote` `:keyed` with the other's writer
+KeyMaterial installed.  A security-enabled participant strictly refuses an unauthenticated peer
+(`run-auth-secured-refuses-plain-test`, non-vacuous via plain↔plain control).  Encrypted pub/sub
+round-trip with the exchanged keys proven by `run-auth-encrypted-pubsub-keyx-test` (ciphertext on
+wire: plaintext absent + header `#(0 0 0 4)` per §9.5.3.3.1; plaintext delivered to subscriber).
+337 tests Clasp + SBCL (Clasp first; non-vacuous — NOT `:keyed` before the exchange completes).
+
+**Level 2 — Don't-break-plain (ACHIEVED)** A participant with no `:identity` is byte-identical to
+the pre-security plain path; `run-auth-plain-byte-identical-test` confirms 8-byte `"PLAINDAT"` is
+delivered exactly.  A security-enabled participant strictly refuses an unauthenticated peer.
+
+**Level 3 — Live Connext-Security interop (DEFERRED to Slice 5)** The RTI Security Plugins are not
+installed.  The §9.5.2 KeyMaterial framing, the KxKey-AEAD wrap, and the reliable Volatile endpoint
+are self-consistent (our-to-our) but unverified against a live Connext peer (see ADR 0034).
+
+---
+
+## 6quarter. Key-exchange API reference and worked example
+
+### 6quarter.1 The §9.5.3 KxKey/KxSalt API (`dds.security`)
+
+| Symbol | Contract |
+|---|---|
+| `derive-kx-key (shared-secret challenge1 challenge2)` | Derive the §9.5.3 KxKey; returns a `kx-key-handle` (foreign buffer). challenge1 = initiator nonce, challenge2 = responder nonce. |
+| `derive-kx-salt (shared-secret challenge1 challenge2)` | Derive the §9.5.3 KxSalt; same signature. Challenge inputs are SWAPPED between KxKey and KxSalt by spec design. |
+| `kx-key-bytes (handle)` | Return the 32-byte foreign-backed buffer; do not retain past `free-kx-key`. |
+| `free-kx-key (handle)` | Zeroize and free the foreign buffer. Idempotent; NIL is a no-op. Every handle from `derive-kx-key`/`derive-kx-salt` must be freed here. |
+| `+kxkey-label+` | ASCII `"key exchange key"` (16 bytes, §9.5.3, hex `6b65792065786368616e6765206b6579`). |
+| `+kxsalt-label+` | ASCII `"keyexchange salt"` (16 bytes, §9.5.3, hex `6b657965786368616e67652073616c74`). |
+
+KDF construction (§9.5.3; two-step HMAC-SHA256, no HKDF; pinned from the T0 spike §2.4 /
+Fast DDS corroboration):
+
+```
+KxKey = HMAC-SHA256(key = SHA-256(challenge_2 || "+kxkey-label+" || challenge_1),
+                    data = shared_secret)
+KxSalt = HMAC-SHA256(key = SHA-256(challenge_1 || "+kxsalt-label+" || challenge_2),
+                     data = shared_secret)
+```
+
+All inputs are 32-byte vectors.  Both functions signal `secured-payload-malformed` on
+wrong-length inputs (fail-closed, NFR-SEC-POSTURE).
+
+### 6quarter.2 The §9.5.2 KeyMaterial + CryptoToken API (`dds.security`)
+
+| Symbol | Contract |
+|---|---|
+| `generate-writer-key-material (writer-guid)` | Generate a fresh §9.5.2 AES256-GCM `key-material` for the 16-octet `writer-guid` (random master-salt + master-sender-key via `dds.dare:random-bytes`; sender-key-id derived from GUID bytes 0–3). |
+| `serialize-crypto-token (km kx-key)` | Serialize `km` as a KxKey-AEAD-wrapped CDR-LE `DataHolder` blob: nonce(12) ∥ AES256-GCM-seal(88-byte KeyMaterial CDR, key=kx-key) ∥ tag(16) = 116 bytes. Fail-closed on AEAD error. |
+| `parse-crypto-token (octets kx-key)` | Parse + authenticate a KxKey-wrapped `DataHolder` blob → `key-material` or `NIL` (fail-closed on wrong key, tamper, malformed input). |
+| `make-crypto-token-message (km kx-key src-guid dest-guid)` | Build a §7.4.4 `ParticipantGenericMessage` carrying one `CryptoToken` DataHolder (class_id `"dds.sec.participant_crypto_tokens"`). |
+| `parse-crypto-token-message (octets kx-key)` | Parse a `ParticipantGenericMessage` + unwrap the single CryptoToken → `key-material` or `NIL`. Enforces exactly-1-DataHolder cap (spike §6.3). |
+| `+participant-crypto-tokens-class-id+` | `"dds.sec.participant_crypto_tokens"` (§7.4.4; spike §7). |
+| `+crypto-token-class-id+` | `"DDS:Crypto:AES_GCM_GMAC"` (§9.5; spike §7). |
+| `+crypto-keymat-prop-name+` | `"dds.cryp.keymat"` (§9.5; spike §7). |
+
+### 6quarter.3 The `crypto-keys` per-writer resolver (`dds.security`)
+
+`crypto-keys` is a `defstruct*` (§9.5.3.3.4 encode/decode direction, T6):
+
+| Symbol | Contract |
+|---|---|
+| `make-crypto-keys :encode-key-fn F :decode-key-fn G` | Construct a per-writer key resolver. Both functions are required (error default). |
+| `crypto-keys-encode-key-fn (ck)` | The encode closure: `(local-writer-guid) -> (or key-material null)` — resolves the local writer's KeyMaterial for outgoing samples. |
+| `crypto-keys-decode-key-fn (ck)` | The decode closure: `(remote-writer-guid) -> (or key-material null)` — resolves the remote writer's KeyMaterial for incoming samples. |
+
+Both closures return `NIL` when no key is installed; callers are fail-closed (sample
+dropped, no plaintext on the secured path).  The resolver is installed on
+`disc-node-crypto-transform` BEFORE `resume-parked-matches` fires.
+
+### 6quarter.4 The `select-suite-for-identities` encapsulation (`dds.security`)
+
+```lisp
+(select-suite-for-identities local-identity remote-id-token-octets)
+  ;; -> auth-suite | nil
+  ;; Derive both cert kinds from the dds.cert.algo property of the local identity and
+  ;; the remote IdentityToken octets via %cert-algo->kind, then call select-auth-suite.
+  ;; Returns NIL — meaning REJECT the remote — when either algo is unsupported or the
+  ;; cert kinds yield no common suite.
+```
+
+This keeps the `nil`-handling co-located with `%cert-algo->kind`, so the manager never
+passes `nil` to `select-auth-suite` (whose ftype constrains both arguments to
+`(member :ec :rsa)` per §9.3.2).
+
+### 6quarter.5 New `disc-node` security extension slots (`dds.disc`)
+
+| Exported accessor | Slot type | Contract |
+|---|---|---|
+| `disc-node-on-participant-discovered` | `(or null function)` | Called `(node prefix spdp)` outside the node lock on the first SPDP arrival from a security-capable (IdentityToken-carrying) remote (DDS-Security 1.1 §7.3.4). NIL = ignored. |
+| `disc-node-auth-gate` | `(or null function)` | Called `(node remote local)` as the second sequential gate after the type-gate in `%match-remote-endpoint`; returns `:compatible` / `:incompatible` / `:pending` (§7.3). NIL = security off → `:compatible`. |
+| `disc-node-auth-state` | `hash-table` (EQUALP) | Manager-owned per-participant auth state table; keyed by 12-octet GUID prefix → opaque `auth-remote` record (DDS-Security 1.1 §7.3). |
+
+### 6quarter.6 `%install-auth-manager` (`dds.dcps`)
+
+```lisp
+(%install-auth-manager p identity-handle)
+  ;; -> domain-participant
+  ;; Create P's DDS-Security §8.7 auth-manager state (holding IDENTITY-HANDLE — the local
+  ;; identity with the private key) and install its three hooks on P's disc-node:
+  ;; ON-PARTICIPANT-DISCOVERED, ON-STATELESS-MESSAGE, and AUTH-GATE.
+  ;; Called by create-participant :identity; not normally called directly.
+```
+
+### 6quarter.7 A worked end-to-end example — authenticated encrypted pub/sub
+
+```lisp
+(let* ((ca-oct   (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                      (uiop:read-file-string
+                       "interop/security-auth/pki/ca/ca-cert.pem")))
+       (cert-a-oct (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                        (uiop:read-file-string
+                         "interop/security-auth/pki/participant_ec/identity_cert.pem")))
+       (key-a-oct  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                        (uiop:read-file-string
+                         "interop/security-auth/pki/participant_ec/identity_key.pem")))
+       (cert-b-oct (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                        (uiop:read-file-string
+                         "interop/security-auth/pki/participant_ec_b/identity_cert.pem")))
+       (key-b-oct  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                        (uiop:read-file-string
+                         "interop/security-auth/pki/participant_ec_b/identity_key.pem"))))
+
+  ;; 1. Load and validate local identities
+  (multiple-value-bind (id-a err-a)
+      (dds.security:validate-local-identity ca-oct cert-a-oct key-a-oct
+        (make-array 16 :element-type '(unsigned-byte 8)
+                       :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))
+    (assert id-a () (format nil "id-a: ~a" err-a))
+    (multiple-value-bind (id-b err-b)
+        (dds.security:validate-local-identity ca-oct cert-b-oct key-b-oct
+          (make-array 16 :element-type '(unsigned-byte 8)
+                         :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))
+      (assert id-b () (format nil "id-b: ~a" err-b))
+
+      ;; 2. Create security-enabled participants.
+      ;;    create-participant :identity sets the SPDP IdentityToken + installs the auth manager.
+      (let ((p-a (dds.dcps:create-participant :domain 99 :identity id-a))
+            (p-b (dds.dcps:create-participant :domain 99 :identity id-b)))
+
+        ;; 3. Wire peers, announce topics + types.
+        ;;    The auth manager fires automatically on SPDP discovery:
+        ;;      on-participant-discovered -> handshake -> SharedSecret -> KxKey ->
+        ;;      generate-writer-key-material -> serialize-crypto-token -> PSM send ->
+        ;;      parse-crypto-token-message on the peer -> install remote-km -> :keyed ->
+        ;;      resume-parked-matches -> endpoint match.
+        (dds.disc:add-peer (dp-node p-a) "127.0.0.1")
+        (dds.disc:add-peer (dp-node p-b) "127.0.0.1")
+
+        ;; 4. Wait for both to reach :keyed.
+        ;;    The auth gate parks any endpoint match until :keyed; resume fires automatically.
+        (let ((keyed nil))
+          (dotimes (i 300)
+            (let ((ms-a (dp-auth-state p-a)))
+              (when (and ms-a
+                         (some (lambda (ar)
+                                 (eq (dds.dcps::auth-remote-state ar) :keyed))
+                               (alexandria:hash-table-values
+                                (dds.disc:disc-node-auth-state (dp-node p-a)))))
+                (setf keyed t)
+                (return)))
+            (sleep 0.02))
+          (assert keyed () "participants did not reach :keyed within 6s"))
+
+        ;; 5. Publish known plaintext from A; B receives it decrypted.
+        ;;    The crypto-transform slot is now a crypto-keys resolver (not make-test-key-material).
+        ;;    A's publish-sample: encode-key-fn(A-writer-guid) -> km -> encode-serialized-payload.
+        ;;    B's %deliver-user-sample: decode-key-fn(A-writer-guid) -> km -> decode-serialized-payload.
+        (let ((plaintext #(#x4b #x45 #x59 #x58 #x44 #x41 #x54 #x41))) ; "KEYXDATA"
+          (dds.disc:publish-sample (dp-node p-a) plaintext)
+          ;; ... poll for receipt on p-b, then assert received = plaintext ...
+          )
+
+        ;; 6. Cleanup.
+        (dds.dcps:delete-participant p-a)
+        (dds.dcps:delete-participant p-b)))))
+```
+
+See `run-auth-encrypted-pubsub-keyx-test` in `src/dds-tests/security-auth-test.lisp` for
+the full working test, including the ciphertext-on-wire assertions (plaintext absent,
+header bytes `#(0 0 0 4)` = AES256-GCM `transformation_kind` per §9.5.3.3.1 Table 69).
+
+### 6quarter.8 The honest interop posture (complete picture, ADR 0034)
+
+| Item | Status |
+|---|---|
+| Our-to-our: auth → key exchange → strict gate → encrypted DATA | **ACHIEVED** (337 tests Clasp + SBCL) |
+| Don't-break-plain (byte-identical plain path) | **ACHIEVED** (`run-auth-plain-byte-identical-test`) |
+| Strict refusal of unauthenticated peers | **ACHIEVED** (`run-auth-secured-refuses-plain-test`) |
+| KxKey-AEAD wrap nonce/AAD vs Connext | **NEEDS-VERIFICATION** (Slice 5) |
+| §9.5.2 KeyMaterial CDR framing vs Connext | **NEEDS-VERIFICATION** (Slice 5) |
+| KeyMaterial master-key/salt in foreign buffers | **HARDENING-GAP** (control-plane; follow-on) |
+| Reliable `ParticipantVolatileMessageSecure` endpoint | **DEFERRED** (Slice 5) |
+| RTPS/submessage protection | **DEFERRED** (later slice) |
+| Live Connext-Security interop | **DEFERRED** (Slice 5 = the P6 exit gate) |
+
+See ADR 0034 (`docs/adr/0034-dds-security-auth-keyx.md`) for the full analysis.
+
+---
+
 ## 7. Roadmap (M7/P6)
 
 | Slice | Description | Status |
@@ -556,8 +861,8 @@ self-consistent (our-to-our) but unverified against a live Connext peer.
 | **1** | Crypto plugin: AES256-GCM `SecuredPayload` + session-key KDF + `disc-node` integration (ADR 0031) | **LANDED** |
 | **2a** | Authentication plugin: PKI identity + §8.7.2.4 PKI-DH handshake → SharedSecret, both §9.3 suites, our-to-our (ADR 0032) | **LANDED** |
 | **2b-i** | Wire transport: SPDP IdentityToken + PSM endpoints + DataHolder/envelope codec + our-to-our handshake over UDP (ADR 0033) | **LANDED** |
-| 2b-ii | Discovery integration: on-participant-discovered hook + auth manager + per-participant auth-state + endpoint-match auth-gate + `select-auth-suite` wiring | pending |
-| 2c | Crypto key-exchange: derive `key-material` from SharedSecret → replace `make-test-key-material` | pending |
+| **2b-ii** | Discovery integration: on-participant-discovered hook + auth manager (`%install-auth-manager`) + per-participant `dp-auth-state` + strict endpoint-match auth-gate + `select-suite-for-identities` (ADR 0034 at capstone) | **LANDED** |
+| **2c** | Crypto key-exchange: §9.5.3 KxKey + §9.5.2 per-writer KeyMaterial exchanged over PSM, installed per remote (ADR 0034 at capstone) | **LANDED** |
 | 3 | AccessControl plugin (§8.8): governance/permissions XML, topic-level policy enforcement | pending |
 | 4 | Secure discovery (§7.4.4): SPDP/SEDP participant/endpoint authentication | pending |
 | 5 | Connext-Security live interop: live cross-vendor PKI-DH auth interop (the P6 exit gate) | pending |

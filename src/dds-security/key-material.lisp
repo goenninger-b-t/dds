@@ -14,6 +14,11 @@
   "CryptoTransformKeyMaterial.sender_key_id width: octet[4] (§9.5.2 Table 65).")
 (defconstant +km-master-sender-key-len+ 32
   "CryptoTransformKeyMaterial.master_sender_key width: 32 octets for AES-256 (§9.5.2 Table 65).")
+(defconstant +km-receiver-specific-key-id-len+ 4
+  "CryptoTransformKeyMaterial.receiver_specific_key_id width: octet[4] (§9.5.2 Table 65).")
+(defconstant +km-master-receiver-specific-key-len+ 32
+  "CryptoTransformKeyMaterial.master_receiver_specific_key width: 32 octets (§9.5.2 Table 65).
+   All-zeros when receiver_specific_key_id is zero (participant-level protection, no per-receiver key).")
 
 (defstruct* key-material
   "DDS-Security 1.1 §9.5.2 CryptoTransformKeyMaterial_DH — the key bundle used by
@@ -35,6 +40,13 @@
   (sender-key-id (make-array +km-sender-key-id-len+ :element-type '(unsigned-byte 8) :initial-element 0)
    :type (simple-array (unsigned-byte 8) (*)))
   (master-sender-key (make-array +km-master-sender-key-len+ :element-type '(unsigned-byte 8) :initial-element 0)
+   :type (simple-array (unsigned-byte 8) (*)))
+  ;; §9.5.2 Table 65: receiver-specific key fields. All-zeros = no per-receiver key (participant-level).
+  (receiver-specific-key-id
+   (make-array +km-receiver-specific-key-id-len+ :element-type '(unsigned-byte 8) :initial-element 0)
+   :type (simple-array (unsigned-byte 8) (*)))
+  (master-receiver-specific-key
+   (make-array +km-master-receiver-specific-key-len+ :element-type '(unsigned-byte 8) :initial-element 0)
    :type (simple-array (unsigned-byte 8) (*)))
   ;; Nonce-uniqueness state: iv-counter is the only mutable field; must be incremented atomically.
   (iv-counter 0 :type (unsigned-byte 64))
@@ -76,6 +88,14 @@
         (make-array 4 :element-type '(unsigned-byte 8)
                       :initial-contents '(#xde #xad #xbe #xef)))
   "Fixed sender_key_id for make-test-key-material (test scaffold only). Value: 0xDEADBEEF.")
+
+(defstruct* (crypto-keys (:constructor make-crypto-keys))
+  "Per-writer key resolver for the DDS-Security §9.5.3.3 secured data path (T6).
+   ENCODE-KEY-FN resolves the local writer's KeyMaterial by its 16-octet GUID for outgoing samples
+   (§9.5.3.3.4.4). DECODE-KEY-FN resolves the remote writer's KeyMaterial by its 16-octet wire GUID
+   for incoming samples (§9.5.3.3.4.5). Both return NIL when no key exists — caller MUST fail-closed."
+  (encode-key-fn (error "crypto-keys: :encode-key-fn required") :type function)
+  (decode-key-fn (error "crypto-keys: :decode-key-fn required") :type function))
 
 (defun* make-test-key-material ()
     (function () key-material)

@@ -33,10 +33,13 @@
    (children :initform '() :accessor dp-children)
    (user-reader :initform nil :accessor dp-user-reader)   ; v1: one DataReader per participant
    (user-writer :initform nil :accessor dp-user-writer)   ; v1: one DataWriter per participant
-   (type-gate-state :initform nil :accessor dp-type-gate-state))  ; FR-TYPE-4 gate (type-gate.lisp)
+   (type-gate-state :initform nil :accessor dp-type-gate-state)   ; FR-TYPE-4 gate (type-gate.lisp)
+   (auth-state :initform nil :accessor dp-auth-state))   ; DDS-Security 1.1 §8.7 auth manager (auth-manager.lisp)
   (:documentation "DDS DomainParticipant: owns a multicast disc-node for its domain and
    its contained entities. v1 holds one DataReader + one DataWriter per participant.
-   TYPE-GATE-STATE carries the FR-TYPE-4 assignability gate's TypeObject/verdict caches."))
+   TYPE-GATE-STATE carries the FR-TYPE-4 assignability gate's TypeObject/verdict caches.
+   AUTH-STATE carries the DDS-Security §8.7 authentication manager's local identity +
+   per-remote handshake/key state (NIL = security OFF; see auth-manager.lisp)."))
 
 (defclass publisher (entity)
   ((participant :initarg :participant :reader pub-participant)
@@ -108,6 +111,11 @@
 ;; Defined in type-gate.lisp (loaded after this file); forward-declared so
 ;; create-participant can install the FR-TYPE-4 assignability gate.
 (declaim (ftype (function (domain-participant) domain-participant) %install-type-gate))
+
+;; Defined in auth-manager.lisp (loaded after this file); forward-declared so
+;; create-participant can install the DDS-Security §8.7 auth manager when an identity is configured.
+(declaim (ftype (function (domain-participant dds.security:identity-handle) domain-participant)
+                %install-auth-manager))
 
 ;; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): forward-declared so create-datareader / delete-participant (defined
 ;; above their bodies in this file) reach the loan helpers without a compile-time undefined-function warning.
@@ -278,19 +286,30 @@
     (loop for i from 3 below 12 do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
-(defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1") (peers nil))
-    (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string) (:peers list)) domain-participant)
+(defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1") (peers nil)
+                                 (identity nil))
+    (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string) (:peers list)
+                    (:identity t))
+              domain-participant)
   "DomainParticipantFactory::create_participant — open the RTPS engine (a multicast
    disc-node) for DOMAIN, install the match/incompatible-QoS hooks that surface DDS
    statuses to the application, start the receiver, and return an enabled participant.
    PEERS is an optional ((host . port) ...) list of unicast SPDP announce targets
    (FR-DISC-4) layered on top of multicast — e.g. ((\"127.0.0.1\" . 7410)) reaches a
    same-host peer over loopback when the macOS application firewall silently drops
-   LAN-sourced UDP for an unapproved peer binary."
+   LAN-sourced UDP for an unapproved peer binary.
+   IDENTITY (DDS-Security 1.1 §8.7): an optional dds.security:identity-handle from
+   validate-local-identity. When supplied the participant is SECURITY-ENABLED — the node
+   advertises its IdentityToken + PSM bits in SPDP and the auth manager is installed, so the
+   participant authenticates every discovered security-enabled peer over the §7.4.3 PSM wire,
+   exchanges §9.5.2 key material, and STRICTLY refuses unauthenticated peers (the conformant
+   default). NIL (default) = security OFF, byte-identical plain participant."
   (let* ((node (dds.disc:make-disc-node :domain domain :multicast t
                                         :advertise-address advertise-address
                                         :peers peers
-                                        :guid-prefix (%make-guid-prefix)))
+                                        :guid-prefix (%make-guid-prefix)
+                                        :identity-token-octets
+                                        (when identity (dds.security:identity-token identity))))
          (p (make-instance 'domain-participant :domain domain :node node :qos qos :enabled t)))
     ;; Install hooks BEFORE the receiver thread starts so no early SEDP match is lost.
     (setf (dds.disc:disc-node-on-match node)
@@ -308,6 +327,8 @@
     (setf (dds.disc:disc-node-on-inconsistent-topic node)
           (lambda (topic-name) (%on-disc-inconsistent-topic p topic-name)))
     (%install-type-gate p)   ; FR-TYPE-4 assignability gate (type-gate.lisp)
+    (when identity           ; DDS-Security §8.7 auth manager — only for a security-enabled participant
+      (%install-auth-manager p identity))
     (dds.disc:start-node node)
     p))
 

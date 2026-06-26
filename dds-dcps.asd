@@ -4,7 +4,7 @@
 ;;;; + Requested/Offered (RxO) matching (FR-QOS-1/2).
 (defsystem "dds-dcps"
   :description "DDS.DCPS — DDS 1.4 entities + QoS (P2)."
-  :depends-on ("dds-pal" "dds-core" "dds-cdr" "dds-qos" "dds-types" "dds-rtps" "dds-disc")
+  :depends-on ("dds-pal" "dds-core" "dds-cdr" "dds-qos" "dds-types" "dds-rtps" "dds-disc" "dds-security")
   :pathname "src/dds-dcps"
   :serial t
   :components ((:file "packages")
@@ -12,6 +12,7 @@
                (:file "listeners")
                (:file "entities")
                (:file "type-gate")
+               (:file "auth-manager")
                (:file "conditions")
                (:file "filter")
                (:file "builtin"))

@@ -387,10 +387,14 @@
              (progn
                (unless (dds.dare:x509-verify-chain (identity-handle-ca-store local) peer-cert)
                  (return-from begin-handshake-reply (values nil nil)))
-               (let* ((peer-dsign-str  (map 'string #'code-char peer-dsign-octs))
-                      (peer-kagree-str (map 'string #'code-char peer-kagree-octs))
+               (let* ((peer-dsign-str     (map 'string #'code-char peer-dsign-octs))
+                      (peer-kagree-str    (map 'string #'code-char peer-kagree-octs))
                       (hash-c1-recomputed (%compute-hash-c suite peer-cert-der peer-perm peer-pdata
                                                             peer-dsign-str peer-kagree-str)))
+                 ;; §9.3.2 algo-vs-suite cross-check: peer advertised algos must match selected suite
+                 (unless (and (string= peer-dsign-str  (auth-suite-dsign-algo-str suite))
+                              (string= peer-kagree-str (auth-suite-kagree-algo-str suite)))
+                   (return-from begin-handshake-reply (values nil nil)))
                  (unless (equalp hash-c1-claimed hash-c1-recomputed)
                    (return-from begin-handshake-reply (values nil nil)))
                  (multiple-value-bind (my-dh-pub my-dh-priv)
@@ -513,10 +517,14 @@
                  (unless (dds.dare:x509-verify-chain
                           (identity-handle-ca-store (handshake-handle-local-id handle)) peer-cert)
                    (reject))
-                 (let* ((peer-dsign-str  (map 'string #'code-char peer-dsign-o))
-                        (peer-kagree-str (map 'string #'code-char peer-kagree-o))
+                 (let* ((peer-dsign-str     (map 'string #'code-char peer-dsign-o))
+                        (peer-kagree-str    (map 'string #'code-char peer-kagree-o))
                         (hash-c2-recomputed (%compute-hash-c suite peer-cert-der peer-perm peer-pdata
                                                               peer-dsign-str peer-kagree-str)))
+                   ;; §9.3.2 algo-vs-suite cross-check: peer advertised algos must match selected suite
+                   (unless (and (string= peer-dsign-str  (auth-suite-dsign-algo-str suite))
+                                (string= peer-kagree-str (auth-suite-kagree-algo-str suite)))
+                     (reject))
                    (unless (equalp hash-c2 hash-c2-recomputed) (reject))
                    (let ((peer-pub     nil)
                          (peer-stored  nil))

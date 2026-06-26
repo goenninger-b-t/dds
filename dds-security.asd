@@ -16,5 +16,6 @@
                              (:file "identity")
                              (:file "suites")
                              (:file "handshake")
-                             (:file "wire"))))
+                             (:file "wire")
+                             (:file "keyexchange"))))
   :in-order-to ((test-op (test-op "dds-tests"))))

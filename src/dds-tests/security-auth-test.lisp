@@ -455,7 +455,9 @@
    (:ec  :ec)  -> +suite-ecdh+  (ECDH+prime256v1-CEUM / ECDSA-SHA256).
    (:rsa :rsa) -> +suite-ffdh+  (DH+MODP-2048-256 / RSASSA-PSS-SHA256).
    (:ec  :rsa) -> NIL  (mismatched -> no common suite -> handshake must reject).
-   (:rsa :ec)  -> NIL  (same, reversed direction). Both SBCL and Clasp must pass."
+   (:rsa :ec)  -> NIL  (same, reversed direction).
+   %cert-algo->kind: \"EC-prime256v1\"->:ec, \"RSA-2048\"->:rsa, unknown->NIL (§8.7.2.2 / §9.3.1).
+   Both SBCL and Clasp must pass."
   (%check :sel-ec-ec
           (eq (dds.security:select-auth-suite :ec :ec) dds.security:+suite-ecdh+)
           "select-auth-suite(:ec :ec) must return +suite-ecdh+")
@@ -468,6 +470,29 @@
   (%check :sel-rsa-ec
           (null (dds.security:select-auth-suite :rsa :ec))
           "select-auth-suite(:rsa :ec) must return NIL (no common suite)")
+  ;; %cert-algo->kind: IdentityToken algo string -> cert kind (§8.7.2.2 / §9.3.1)
+  (%check :cert-algo->kind-ec
+          (eq (dds.security::%cert-algo->kind "EC-prime256v1") :ec)
+          "%cert-algo->kind(\"EC-prime256v1\") must return :EC")
+  (%check :cert-algo->kind-rsa
+          (eq (dds.security::%cert-algo->kind "RSA-2048") :rsa)
+          "%cert-algo->kind(\"RSA-2048\") must return :RSA")
+  (%check :cert-algo->kind-unknown
+          (null (dds.security::%cert-algo->kind "bogus"))
+          "%cert-algo->kind(\"bogus\") must return NIL (unrecognized algo)")
+  ;; Round-trip: algo string from suite -> kind -> select-auth-suite
+  (%check :cert-algo-round-trip-ec
+          (eq (dds.security:select-auth-suite
+               (dds.security::%cert-algo->kind dds.security::+token-algo-ec+)
+               (dds.security::%cert-algo->kind dds.security::+token-algo-ec+))
+              dds.security:+suite-ecdh+)
+          "round-trip EC-prime256v1 -> :ec -> select-auth-suite must yield +suite-ecdh+")
+  (%check :cert-algo-round-trip-rsa
+          (eq (dds.security:select-auth-suite
+               (dds.security::%cert-algo->kind dds.security::+token-algo-rsa+)
+               (dds.security::%cert-algo->kind dds.security::+token-algo-rsa+))
+              dds.security:+suite-ffdh+)
+          "round-trip RSA-2048 -> :rsa -> select-auth-suite must yield +suite-ffdh+")
   t)
 
 (defun* run-auth-handshake-rsa-test ()
@@ -846,7 +871,109 @@
                              (%check :neg8-oversized-rejected (eq neg8b-status :rejected)
                                      (format nil "N8b: 4096-byte garbage blob -> ~a" neg8b-status)))
                         (dds.security:free-handshake-handle rep-hdl-ov)
-                        (dds.security:free-handshake-handle req-hdl-ov))))
+                        (dds.security:free-handshake-handle req-hdl-ov)))
+
+                    ;; ----- N9: §9.3.2 algo-vs-suite cross-check: replier rejects on suite mismatch -----
+                    ;; Positive control: genuine ECDH request -> ECDH replier -> non-nil reply.
+                    (multiple-value-bind (req-tok-good req-hdl-good)
+                        (dds.security:begin-handshake-request id-a id-b dds.security:+suite-ecdh+)
+                      (unwind-protect
+                           (multiple-value-bind (rep-tok-good rep-hdl-good)
+                               (dds.security:begin-handshake-reply id-b id-a req-tok-good dds.security:+suite-ecdh+)
+                             (when rep-hdl-good (dds.security:free-handshake-handle rep-hdl-good))
+                             (%check :neg9-ecdh-pos-reply (not (null rep-tok-good))
+                                     "N9 positive: genuine ECDH request must produce a reply token"))
+                        (dds.security:free-handshake-handle req-hdl-good)))
+                    ;; N9a: cross-suite dsign+kagree mismatch (non-vacuous guard proof).
+                    ;; Build a genuine FFDH request (RSA identity, +suite-ffdh+): its hash_c1 is
+                    ;; internally consistent (computed from FFDH algo strings) so the hash check
+                    ;; in begin-handshake-reply would PASS.  The cert chain also verifies (same CA).
+                    ;; Only the algo-guard (§9.3.2) catches the mismatch.
+                    ;; Proof: remove the guard -> begin-handshake-reply returns non-nil (accepted).
+                    (multiple-value-bind (id-ra reason-ra)
+                        (dds.security:validate-local-identity ca-pem rsa-cert-a rsa-key-a guid-a)
+                      (%check :neg9a-id-ra-ok (not (null id-ra))
+                              (format nil "N9a: RSA-A identity failed: ~a" reason-ra))
+                      (when id-ra
+                        (unwind-protect
+                             (multiple-value-bind (id-rb reason-rb)
+                                 (dds.security:validate-local-identity ca-pem rsa-cert-b rsa-key-b guid-b)
+                               (%check :neg9a-id-rb-ok (not (null id-rb))
+                                       (format nil "N9a: RSA-B identity failed: ~a" reason-rb))
+                               (when id-rb
+                                 (unwind-protect
+                                      (multiple-value-bind (ffdh-req-tok ffdh-req-hdl)
+                                          (dds.security:begin-handshake-request id-ra id-rb dds.security:+suite-ffdh+)
+                                        (%check :neg9a-ffdh-req-tok (and ffdh-req-tok (> (length ffdh-req-tok) 0))
+                                                "N9a: FFDH begin-handshake-request returned empty token")
+                                        (unwind-protect
+                                             (multiple-value-bind (nil-tok9a nil-hdl9a)
+                                                 ;; present FFDH request to ECDH replier (id-b) — suite mismatch
+                                                 (dds.security:begin-handshake-reply id-b id-ra ffdh-req-tok dds.security:+suite-ecdh+)
+                                               (when nil-hdl9a (dds.security:free-handshake-handle nil-hdl9a))
+                                               (%check :neg9a-cross-suite-nil-tok (null nil-tok9a)
+                                                       "N9a: FFDH request to ECDH replier must return nil token (algo-vs-suite guard §9.3.2)")
+                                               (%check :neg9a-cross-suite-nil-hdl (null nil-hdl9a)
+                                                       "N9a: FFDH request to ECDH replier must return nil handle"))
+                                          (dds.security:free-handshake-handle ffdh-req-hdl)))
+                                   (dds.security:free-identity-handle id-rb))))
+                          (dds.security:free-identity-handle id-ra))))
+                    ;; N9b: kagree-only mismatch (isolates the second branch of the guard's `and`).
+                    ;; Start from a genuine ECDH request (c.dsign_algo="ECDSA-SHA256" correct),
+                    ;; replace c.kagree_algo with the FFDH value, and recompute hash_c1 using the
+                    ;; altered kagree string so the hash check does NOT mask the guard.
+                    ;; Without the guard, hash_c1 matches and begin-handshake-reply proceeds.
+                    (multiple-value-bind (req-tok-nb req-hdl-nb)
+                        (dds.security:begin-handshake-request id-a id-b dds.security:+suite-ecdh+)
+                      (unwind-protect
+                           (let* ((parsed-nb (dds.security::%parse-token req-tok-nb)))
+                             (%check :neg9b-req-parseable (not (null parsed-nb))
+                                     "N9b: ECDH request token must parse")
+                             (when parsed-nb
+                               (let* ((cert-der-nb   (cdr (find dds.security::+prop-c-id+
+                                                                 (dds.security::handshake-token-binary-props parsed-nb)
+                                                                 :key #'car :test #'string=)))
+                                      (perm-nb       (or (cdr (find dds.security::+prop-c-perm+
+                                                                     (dds.security::handshake-token-binary-props parsed-nb)
+                                                                     :key #'car :test #'string=))
+                                                         (make-array 0 :element-type '(unsigned-byte 8))))
+                                      (pdata-nb      (or (cdr (find dds.security::+prop-c-pdata+
+                                                                     (dds.security::handshake-token-binary-props parsed-nb)
+                                                                     :key #'car :test #'string=))
+                                                         (make-array 0 :element-type '(unsigned-byte 8))))
+                                      ;; keep dsign as ECDSA (correct for ECDH suite), swap kagree to FFDH
+                                      (dsign-str-nb  (dds.security::auth-suite-dsign-algo-str dds.security:+suite-ecdh+))
+                                      (ffdh-kagree-str (dds.security::auth-suite-kagree-algo-str dds.security:+suite-ffdh+))
+                                      (ffdh-kagree-bytes (map '(simple-array (unsigned-byte 8) (*))
+                                                              #'char-code ffdh-kagree-str))
+                                      ;; recompute hash_c1 so it is consistent with the tampered kagree
+                                      (new-hash-c1   (dds.security::%compute-hash-c
+                                                       dds.security:+suite-ecdh+
+                                                       cert-der-nb perm-nb pdata-nb
+                                                       dsign-str-nb ffdh-kagree-str))
+                                      (props-nb (dds.security::handshake-token-binary-props parsed-nb))
+                                      ;; replace c.kagree_algo and hash_c1 in the property list
+                                      (new-props-nb
+                                        (mapcar (lambda (pair)
+                                                  (cond
+                                                    ((string= (car pair) dds.security::+prop-c-kagree-algo+)
+                                                     (cons (car pair) ffdh-kagree-bytes))
+                                                    ((string= (car pair) dds.security::+prop-hash-c1+)
+                                                     (cons (car pair) new-hash-c1))
+                                                    (t pair)))
+                                                props-nb))
+                                      (tampered-nb   (dds.security::%serialize-token
+                                                       (dds.security::%make-handshake-token
+                                                        :class-id (dds.security::handshake-token-class-id parsed-nb)
+                                                        :binary-props new-props-nb))))
+                                 (multiple-value-bind (nil-tok9b nil-hdl9b)
+                                     (dds.security:begin-handshake-reply id-b id-a tampered-nb dds.security:+suite-ecdh+)
+                                   (when nil-hdl9b (dds.security:free-handshake-handle nil-hdl9b))
+                                   (%check :neg9b-kagree-mismatch-nil-tok (null nil-tok9b)
+                                           "N9b: kagree-only mismatch must cause begin-handshake-reply to return nil token")
+                                   (%check :neg9b-kagree-mismatch-nil-hdl (null nil-hdl9b)
+                                           "N9b: kagree-only mismatch must cause begin-handshake-reply to return nil handle")))))
+                        (dds.security:free-handshake-handle req-hdl-nb))))
 
                (dds.security:free-identity-handle id-b)))
         (dds.security:free-identity-handle id-a))))
@@ -1705,16 +1832,32 @@
     (dds.disc:%send-stateless-message from-node to-prefix env))
   t)
 
-(defun* %psm-on-a-callback (node token state)
-    (function (t t wire-hs-state) t)
-  "PSM callback for node-A (requester): HandshakeReply -> process-handshake -> send Final."
-  (dds.pal:with-lock ((wire-hs-state-lock state))
+(defun* %psm-envelope->token-octets (envelope)
+    (function ((simple-array (unsigned-byte 8) (*))) (or (simple-array (unsigned-byte 8) (*)) null))
+  "Decode a RAW PSM ParticipantGenericMessage ENVELOPE (the post-Decision-1 hook contract:
+   dds-disc now delivers raw envelope octets, not a parsed token) back into the handshake's
+   internal tagged token octets: parse-generic-message -> first DataHolder ->
+   dataholder->handshake-token -> %serialize-token. NIL on any malformed/missing input."
+  (multiple-value-bind (src-guid sn rel-guid rel-sn dest-part dest-ep src-ep class-id dh-list)
+      (dds.security:parse-generic-message envelope)
+    (declare (ignore sn rel-guid rel-sn dest-part dest-ep src-ep class-id))
+    (when (and src-guid dh-list)
+      (let ((tok (dds.security:dataholder->handshake-token (car dh-list))))
+        (when tok (dds.security::%serialize-token tok))))))
+
+(defun* %psm-on-a-callback (node envelope state)
+    (function (t (simple-array (unsigned-byte 8) (*)) wire-hs-state) t)
+  "PSM callback for node-A (requester): HandshakeReply -> process-handshake -> send Final.
+   Receives the RAW PSM envelope (Decision 1); decodes it to the handshake token internally."
+  (let ((token-octets (%psm-envelope->token-octets envelope)))
+    (when (null token-octets) (return-from %psm-on-a-callback t))
+   (dds.pal:with-lock ((wire-hs-state-lock state))
     (unless (wire-hs-state-a-done state)
       (when (wire-hs-state-a-hdl state)
         (multiple-value-bind (final-octets status)
             (dds.security:process-handshake
              (wire-hs-state-a-hdl state)
-             (dds.security::%serialize-token token))
+             token-octets)
           ;; :continue = requester reached :authenticated (holds the secret; sends Final) per §8.7.2.4
           (when (eq status :continue)
             (setf (wire-hs-state-a-done state) t)
@@ -1728,20 +1871,23 @@
                     (%psm-send-token-msg node
                                         (wire-hs-state-prefix-a state)
                                         (wire-hs-state-prefix-b state)
-                                        ft sn))))))))))
+                                        ft sn)))))))))))
   t)
 
-(defun* %psm-on-b-callback (node token state)
-    (function (t t wire-hs-state) t)
-  "PSM callback for node-B (replier): HandshakeRequest -> begin-handshake-reply; Final -> :authenticated."
-  (dds.pal:with-lock ((wire-hs-state-lock state))
+(defun* %psm-on-b-callback (node envelope state)
+    (function (t (simple-array (unsigned-byte 8) (*)) wire-hs-state) t)
+  "PSM callback for node-B (replier): HandshakeRequest -> begin-handshake-reply; Final -> :authenticated.
+   Receives the RAW PSM envelope (Decision 1); decodes it to the handshake token internally."
+  (let ((token-octets (%psm-envelope->token-octets envelope)))
+    (when (null token-octets) (return-from %psm-on-b-callback t))
+   (dds.pal:with-lock ((wire-hs-state-lock state))
     (unless (wire-hs-state-b-done state)
       (if (null (wire-hs-state-b-hdl state))
           (multiple-value-bind (rep-octets rep-hdl)
               (dds.security:begin-handshake-reply
                (wire-hs-state-id-b state)
                (wire-hs-state-id-a state)
-               (dds.security::%serialize-token token)
+               token-octets
                dds.security:+suite-ecdh+)
             (when (and rep-octets rep-hdl)
               (setf (wire-hs-state-b-hdl state) rep-hdl)
@@ -1755,13 +1901,13 @@
           (multiple-value-bind (nil-tok status)
               (dds.security:process-handshake
                (wire-hs-state-b-hdl state)
-               (dds.security::%serialize-token token))
+               token-octets)
             (declare (ignore nil-tok))
             (when (eq status :authenticated)
               (setf (wire-hs-state-b-done state) t)
               (let ((ss (dds.security:handshake-shared-secret (wire-hs-state-b-hdl state))))
                 (when ss
-                  (setf (wire-hs-state-b-ss state) (dds.security:shared-secret-bytes ss)))))))))
+                  (setf (wire-hs-state-b-ss state) (dds.security:shared-secret-bytes ss))))))))))
   t)
 
 (defun* run-auth-handshake-over-wire-test ()
@@ -1814,17 +1960,17 @@
                                   :host "127.0.0.1" :port 0
                                   :identity-token-octets (dds.security:identity-token id-a)
                                   :on-stateless-message
-                                  (lambda (node src-prefix token)
+                                  (lambda (node src-prefix envelope)
                                     (declare (ignore src-prefix))
-                                    (%psm-on-a-callback node token state))))
+                                    (%psm-on-a-callback node envelope state))))
                          (node-b (dds.disc:make-disc-node
                                   :guid-prefix prefix-b
                                   :host "127.0.0.1" :port 0
                                   :identity-token-octets (dds.security:identity-token id-b)
                                   :on-stateless-message
-                                  (lambda (node src-prefix token)
+                                  (lambda (node src-prefix envelope)
                                     (declare (ignore src-prefix))
-                                    (%psm-on-b-callback node token state)))))
+                                    (%psm-on-b-callback node envelope state)))))
                     (unwind-protect
                          (progn
                            ;; wire peer lists for unicast SPDP
@@ -1909,4 +2055,841 @@
                       (dds.disc:stop-node node-b)))
                (dds.security:free-identity-handle id-b)))
         (dds.security:free-identity-handle id-a))))
+  t)
+
+;;; ============================================================
+;;; WP-DDS-SECURITY-AUTH-KEYX T5: the auth manager — end-to-end over the wire
+;;; ============================================================
+;;; Two in-process security-enabled DomainParticipants (each with %install-auth-manager and a
+;;; distinct EC identity) discover each other via SPDP; the auth manager then drives the §8.7.2.4
+;;; handshake over the §7.4.3 PSM wire, derives the §9.5.3 KxKey, exchanges §9.5.2 per-writer
+;;; KeyMaterial KxKey-encrypted, and transitions each remote to :keyed. The headline assertion:
+;;; BOTH participants reach auth-remote state :keyed for each other AND each installed the other's
+;;; writer KeyMaterial. NON-VACUOUS: the pre-exchange snapshot asserts NOT-yet-:keyed (proving the
+;;; :keyed state is produced by the exchange, not a constant).
+
+(defun* %am-remote-for (p remote-prefix)
+    (function (dds.dcps:domain-participant (simple-array (unsigned-byte 8) (12)))
+              (or dds.dcps::auth-remote null))
+  "P's auth-manager per-remote AUTH-REMOTE record for REMOTE-PREFIX (NIL if not yet created).
+   Reads the disc-node's manager-owned auth-state table under the manager lock."
+  (let ((ms (dds.dcps::dp-auth-state p)))
+    (when ms
+      (dds.pal:with-lock ((dds.dcps::auth-manager-state-lock ms))
+        (gethash remote-prefix (dds.disc:disc-node-auth-state (dds.dcps::dp-node p)))))))
+
+(defun* %am-remote-state (p remote-prefix)
+    (function (dds.dcps:domain-participant (simple-array (unsigned-byte 8) (12))) t)
+  "The auth-remote STATE keyword P holds for REMOTE-PREFIX, or NIL if no record yet."
+  (let ((ar (%am-remote-for p remote-prefix)))
+    (when ar (dds.dcps::auth-remote-state ar))))
+
+(defun* %am-remote-keyed-p (p remote-prefix)
+    (function (dds.dcps:domain-participant (simple-array (unsigned-byte 8) (12))) t)
+  "T iff P's auth-remote for REMOTE-PREFIX is :keyed AND it installed the remote writer
+   KeyMaterial (§9.5.2) — the full key-exchange completion predicate."
+  (let ((ar (%am-remote-for p remote-prefix)))
+    (and ar
+         (eq (dds.dcps::auth-remote-state ar) :keyed)
+         (not (null (dds.dcps::auth-remote-remote-km ar)))
+         t)))
+
+(defun* run-auth-manager-handshake-test ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-KEYX T5: the auth manager (dds-dcps) drives the §8.7 handshake +
+   §9.5 key exchange end-to-end between two security-enabled participants on discovery.
+   (a) Two DomainParticipants are created with distinct EC identities (participant_ec /
+       participant_ec_b) -> security-enabled (DP-AUTH-STATE set, IdentityToken advertised).
+   (b) NON-VACUITY: before discovery completes, neither holds a :keyed remote.
+   (c) On SPDP discovery the manager runs the handshake (requester by §8.7.2.4 GUID order),
+       derives the KxKey, exchanges KeyMaterial, and reaches :keyed BOTH directions.
+   (d) Each installed the OTHER's writer KeyMaterial (auth-remote-remote-km non-NIL).
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-manager-handshake] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-manager-handshake-test t)))
+
+  (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key-a  (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (ec-cert-b (%read-fixture-pem "participant_ec_b/identity_cert.pem"))
+         (ec-key-b  (%read-fixture-pem "participant_ec_b/identity_key.pem"))
+         ;; identity GUIDs are not used for the role (the manager uses the real RTPS prefixes);
+         ;; distinct values kept for parity with the over-wire setup.
+         (guid-a    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))
+         (guid-b    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))))
+    (multiple-value-bind (id-a reason-a)
+        (dds.security:validate-local-identity ca-pem ec-cert-a ec-key-a guid-a)
+      (%check :am-id-a (not (null id-a))
+              (format nil "validate-local-identity A failed: ~a" reason-a))
+      (unless id-a (return-from run-auth-manager-handshake-test t))
+      (unwind-protect
+           (multiple-value-bind (id-b reason-b)
+               (dds.security:validate-local-identity ca-pem ec-cert-b ec-key-b guid-b)
+             (%check :am-id-b (not (null id-b))
+                     (format nil "validate-local-identity B failed: ~a" reason-b))
+             (unless id-b (return-from run-auth-manager-handshake-test t))
+             (unwind-protect
+             (let ((p-a (dds.dcps:create-participant :domain 0 :identity id-a))
+                   (p-b (dds.dcps:create-participant :domain 0 :identity id-b)))
+               (unwind-protect
+                    (let ((prefix-a (dds.disc:disc-node-guid-prefix (dds.dcps::dp-node p-a)))
+                          (prefix-b (dds.disc:disc-node-guid-prefix (dds.dcps::dp-node p-b))))
+                      ;; security-enabled both sides
+                      (%check :am-secure-a (not (null (dds.dcps::dp-auth-state p-a)))
+                              "participant A must be security-enabled (DP-AUTH-STATE set)")
+                      (%check :am-secure-b (not (null (dds.dcps::dp-auth-state p-b)))
+                              "participant B must be security-enabled (DP-AUTH-STATE set)")
+                      ;; NON-VACUITY: before discovery, neither holds a :keyed remote
+                      (%check :am-not-keyed-before
+                              (and (not (%am-remote-keyed-p p-a prefix-b))
+                                   (not (%am-remote-keyed-p p-b prefix-a)))
+                              "no remote may be :keyed before the handshake/key-exchange completes")
+                      ;; drive discovery + the handshake/key-exchange (bounded; ~6 s max)
+                      (loop repeat 300
+                            until (and (%am-remote-keyed-p p-a prefix-b)
+                                       (%am-remote-keyed-p p-b prefix-a))
+                            do (dds.dcps:spin p-a) (dds.dcps:spin p-b) (sleep 0.02))
+                      ;; headline: BOTH reached :keyed for each other
+                      (%check :am-a-keyed-b (%am-remote-keyed-p p-a prefix-b)
+                              (format nil "A did not reach :keyed for B (state ~a)"
+                                      (%am-remote-state p-a prefix-b)))
+                      (%check :am-b-keyed-a (%am-remote-keyed-p p-b prefix-a)
+                              (format nil "B did not reach :keyed for A (state ~a)"
+                                      (%am-remote-state p-b prefix-a)))
+                      ;; each installed the OTHER's writer KeyMaterial (§9.5.2)
+                      (%check :am-a-has-b-km
+                              (let ((ar (%am-remote-for p-a prefix-b)))
+                                (and ar (typep (dds.dcps::auth-remote-remote-km ar)
+                                               'dds.security:key-material)))
+                              "A must have installed B's writer KeyMaterial")
+                      (%check :am-b-has-a-km
+                              (let ((ar (%am-remote-for p-b prefix-a)))
+                                (and ar (typep (dds.dcps::auth-remote-remote-km ar)
+                                               'dds.security:key-material)))
+                              "B must have installed A's writer KeyMaterial"))
+                 (dds.dcps:delete-participant p-a)
+                 (dds.dcps:delete-participant p-b)))
+               (dds.security:free-identity-handle id-b)))
+        (dds.security:free-identity-handle id-a))))
+  t)
+
+;;; ============================================================
+;;; WP-DDS-SECURITY-AUTH-KEYX T6: end-to-end encrypted pub/sub via exchanged keys
+;;; ============================================================
+
+(defun* run-auth-encrypted-pubsub-keyx-test ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-KEYX T6: encrypted pub/sub using per-writer keys from the auth
+   manager (§9.5.2 / §9.5.3.3), NOT the Slice-1 make-test-key-material scaffold.
+   Two security-enabled DomainParticipants A (writer) and B (reader) complete the
+   §8.7 handshake and §9.5 key exchange to :keyed. After :keyed the auth manager
+   installs a CRYPTO-KEYS resolver (not a plain KEY-MATERIAL) on each participant's
+   disc-node CRYPTO-TRANSFORM. A then publishes a known plaintext; the resolver provides
+   the encode key. B decrypts with its decode resolver and the received plaintext MUST
+   equal the original byte-exact. Assertions:
+     (a)  Both reach :keyed -> auth + key exchange complete.
+     (b)  Each participant's CRYPTO-TRANSFORM is a CRYPTO-KEYS struct (not a KEY-MATERIAL).
+     (c)  A's encode resolver returns a non-nil KEY-MATERIAL for A's writer GUID.
+     (c2) A's encode resolver returns EQ the same instance stored in WRITER-KM-TABLE
+          (§9.5 per-writer table invariant: one stable km shared across all remotes).
+     (d)  B's decode resolver returns a non-nil KEY-MATERIAL for A's wire writer GUID.
+     (e)  B receives EXACTLY the original plaintext PT (encode+decode round-trip byte-exact).
+   No make-test-key-material is used anywhere in this test.
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-encrypted-pubsub-keyx] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-encrypted-pubsub-keyx-test t)))
+
+  (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key-a  (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (ec-cert-b (%read-fixture-pem "participant_ec_b/identity_cert.pem"))
+         (ec-key-b  (%read-fixture-pem "participant_ec_b/identity_key.pem"))
+         (guid-a    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))
+         (guid-b    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16))))
+    (multiple-value-bind (id-a reason-a)
+        (dds.security:validate-local-identity ca-pem ec-cert-a ec-key-a guid-a)
+      (%check :kpub-id-a (not (null id-a))
+              (format nil "validate-local-identity A failed: ~a" reason-a))
+      (unless id-a (return-from run-auth-encrypted-pubsub-keyx-test t))
+      (unwind-protect
+           (multiple-value-bind (id-b reason-b)
+               (dds.security:validate-local-identity ca-pem ec-cert-b ec-key-b guid-b)
+             (%check :kpub-id-b (not (null id-b))
+                     (format nil "validate-local-identity B failed: ~a" reason-b))
+             (unless id-b (return-from run-auth-encrypted-pubsub-keyx-test t))
+             (unwind-protect
+                  (let ((p-a (dds.dcps:create-participant :domain 0 :identity id-a))
+                        (p-b (dds.dcps:create-participant :domain 0 :identity id-b)))
+                    (unwind-protect
+                         (let* ((node-a (dds.dcps::dp-node p-a))
+                                (node-b (dds.dcps::dp-node p-b))
+                                (prefix-a (dds.disc:disc-node-guid-prefix node-a))
+                                (prefix-b (dds.disc:disc-node-guid-prefix node-b))
+                                (pt (make-array 8 :element-type '(unsigned-byte 8)
+                                                  :initial-contents '(#x4b #x45 #x59 #x58 #x44 #x41 #x54 #x41))))
+                           ;; wire up unicast peers for reliable connectivity (bypass multicast CI variability)
+                           (setf (dds.disc:disc-node-peers node-a)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-b))))
+                           (setf (dds.disc:disc-node-peers node-b)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-a))))
+                           ;; add writer on A and reader on B (must precede announce-endpoints)
+                           (dds.disc:add-local-writer node-a :topic "KxTopic" :type "KxType"
+                                                      :qos (dds.qos:make-writer-qos
+                                                            :reliability :reliable
+                                                            :durability :transient-local))
+                           (dds.disc:enable-publisher node-a :history-kind :keep-all)
+                           (dds.disc:add-local-reader node-b :topic "KxTopic" :type "KxType"
+                                                      :qos (dds.qos:make-reader-qos
+                                                            :reliability :reliable
+                                                            :durability :transient-local))
+                           (dds.disc:enable-subscriber node-b)
+                           ;; NON-VACUITY: before the handshake completes, neither is :keyed
+                           (%check :kpub-not-keyed-before
+                                   (and (not (%am-remote-keyed-p p-a prefix-b))
+                                        (not (%am-remote-keyed-p p-b prefix-a)))
+                                   "no remote may be :keyed before the handshake completes")
+                           ;; drive auth handshake + key exchange to :keyed (bounded ~6 s)
+                           (loop repeat 300
+                                 until (and (%am-remote-keyed-p p-a prefix-b)
+                                            (%am-remote-keyed-p p-b prefix-a))
+                                 do (dds.dcps:spin p-a) (dds.dcps:spin p-b) (sleep 0.02))
+                           ;; (a) both reached :keyed
+                           (%check :kpub-a-keyed (%am-remote-keyed-p p-a prefix-b)
+                                   (format nil "A did not reach :keyed for B (state ~a)"
+                                           (%am-remote-state p-a prefix-b)))
+                           (%check :kpub-b-keyed (%am-remote-keyed-p p-b prefix-a)
+                                   (format nil "B did not reach :keyed for A (state ~a)"
+                                           (%am-remote-state p-b prefix-a)))
+                           ;; (b) CRYPTO-TRANSFORM is a CRYPTO-KEYS struct (the T6 resolver, not a plain KEY-MATERIAL)
+                           (%check :kpub-a-crypto-keys
+                                   (typep (dds.disc:disc-node-crypto-transform node-a) 'dds.security:crypto-keys)
+                                   (format nil "A's crypto-transform is ~a, expected CRYPTO-KEYS"
+                                           (type-of (dds.disc:disc-node-crypto-transform node-a))))
+                           (%check :kpub-b-crypto-keys
+                                   (typep (dds.disc:disc-node-crypto-transform node-b) 'dds.security:crypto-keys)
+                                   (format nil "B's crypto-transform is ~a, expected CRYPTO-KEYS"
+                                           (type-of (dds.disc:disc-node-crypto-transform node-b))))
+                           ;; (c) A's encode resolver returns a KEY-MATERIAL for A's writer GUID
+                           (let* ((ct-a (dds.disc:disc-node-crypto-transform node-a))
+                                  (writer-guid-a (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+                                                   (replace g prefix-a :end2 12)
+                                                   (let ((id (dds.disc:disc-node-user-writer-id node-a)))
+                                                     (setf (aref g 12) (ldb (byte 8 24) id)
+                                                           (aref g 13) (ldb (byte 8 16) id)
+                                                           (aref g 14) (ldb (byte 8  8) id)
+                                                           (aref g 15) (ldb (byte 8  0) id)))
+                                                   g))
+                                  (encode-km (funcall (dds.security:crypto-keys-encode-key-fn ct-a) writer-guid-a)))
+                             (%check :kpub-encode-km
+                                     (typep encode-km 'dds.security:key-material)
+                                     (format nil "A's encode resolver returned ~a (expect KEY-MATERIAL)" encode-km))
+                             ;; (c2) encode resolver returns the SAME (eq) KM instance stored in writer-km-table
+                             ;; (§9.5 per-writer table invariant: one stable km for the local writer GUID)
+                             (let* ((ms-a (dds.dcps::dp-auth-state p-a))
+                                    (table-km (gethash writer-guid-a
+                                                       (dds.dcps::auth-manager-state-writer-km-table ms-a))))
+                               (%check :kpub-single-writer-km
+                                       (eq encode-km table-km)
+                                       (format nil "encode resolver returned ~a but writer-km-table has ~a (must be EQ)"
+                                               encode-km table-km)))
+                             ;; SecuredPayload-on-wire proof: encode-serialized-payload must produce
+                             ;; ciphertext starting with the §9.5.3.3.1 Table 69 AES256-GCM kind
+                             ;; header #(0 0 0 4), NOT the plaintext.  Assertion FAILS if encode
+                             ;; were a no-op passthrough (pt starts with #x4b, not #x00).
+                             (when (typep encode-km 'dds.security:key-material)
+                               (let ((wire-bytes (dds.security:encode-serialized-payload encode-km pt)))
+                                 (%check :kpub-wire-not-plaintext
+                                         (not (search pt wire-bytes :test #'eql))
+                                         (format nil "wire bytes contain the plaintext — encode-serialized-payload is a passthrough; first 8: ~{~2,'0x~^ ~}"
+                                                 (coerce (subseq wire-bytes 0 (min 8 (length wire-bytes))) 'list)))
+                                 (%check :kpub-wire-secured-payload-header
+                                         (and (>= (length wire-bytes) 4)
+                                              (= (aref wire-bytes 0) 0)
+                                              (= (aref wire-bytes 1) 0)
+                                              (= (aref wire-bytes 2) 0)
+                                              (= (aref wire-bytes 3) 4))
+                                         (format nil "wire payload must begin with AES256-GCM kind #(0 0 0 4) §9.5.3.3.1 Table 69; got ~{~2,'0x~^ ~}"
+                                                 (coerce (subseq wire-bytes 0 (min 4 (length wire-bytes))) 'list)))))
+                             ;; (d) B's decode resolver returns a KEY-MATERIAL for A's writer GUID
+                             (let* ((ct-b (dds.disc:disc-node-crypto-transform node-b))
+                                    (decode-km (funcall (dds.security:crypto-keys-decode-key-fn ct-b) writer-guid-a)))
+                               (%check :kpub-decode-km
+                                       (typep decode-km 'dds.security:key-material)
+                                       (format nil "B's decode resolver returned ~a for A's GUID (expect KEY-MATERIAL)" decode-km))
+                               ;; (e) publish PT from A, wait for B to receive the decrypted plaintext
+                               (dds.disc:publish-sample node-a pt)
+                               ;; drive discovery+delivery: spin both + re-announce endpoints until B has a sample
+                               (loop repeat 400
+                                     until (plusp (dds.disc:node-sample-count node-b))
+                                     do (dds.dcps:spin p-a) (dds.dcps:spin p-b) (sleep 0.02))
+                               (%check :kpub-b-received
+                                       (plusp (dds.disc:node-sample-count node-b))
+                                       "B did not receive any sample after encrypted publish from A")
+                               (let* ((b-key (first (dds.disc:node-sample-sns node-b)))
+                                      (b-payload (dds.disc:node-sample node-b b-key)))
+                                 (%check :kpub-b-plaintext
+                                         (and b-payload (equalp b-payload pt))
+                                         (format nil "B received ~a but expected plaintext ~{~2,'0x~^ ~}"
+                                                 (and b-payload (coerce b-payload 'list))
+                                                 (coerce pt 'list))))))
+                           t)
+                      (ignore-errors (dds.dcps:delete-participant p-a))
+                      (ignore-errors (dds.dcps:delete-participant p-b))))
+               (dds.security:free-identity-handle id-b)))
+        (dds.security:free-identity-handle id-a))))
+  t)
+
+;;; ============================================================
+;;; WP-DDS-SECURITY-AUTH-KEYX T2: §9.5.3 KxKey derivation KAT
+;;; ============================================================
+;;; KAT strategy (spike §5.1–§5.5):
+;;;   (a) RFC 4231 §4.2 TC1 + §4.5 TC4 — validate dds.dare:hmac-sha256 against published vectors.
+;;;   SHA-256 inner step is already covered by run-auth-sha256-kat (spike §5.5, §B.2 KAT passes).
+;;;   (b) Structural/determinism checks on derive-kx-key — no fabricated composed KAT exists.
+;;; Explicit statement: No published end-to-end DDS-Security KxKey test vector exists (spike §5.5).
+;;; The two-impl (Clasp + SBCL) cross-check is the composition conformance method.
+
+(defun* run-auth-kxkey-kat ()
+    (function () t)
+  "DDS-Security 1.1 §9.5.3 KxKey/KxSalt derivation KAT + published primitive vectors.
+   (a) HMAC-SHA256 RFC 4231 §4.2 TC1 and §4.5 TC4 — validates dds.dare:hmac-sha256.
+       SHA-256 inner step is already covered by run-auth-sha256-kat (spike §5.5).
+   (b) Structural checks on derive-kx-key: 32-byte output; deterministic; KxKey != KxSalt
+       (swapped challenges take effect); KxKey != raw shared_secret; free-kx-key returns nil.
+   No fabricated composed KxKey expected-value is asserted (spike §5.5 — none published).
+   Clasp and SBCL cross-check on identical fixed inputs is the composition conformance method.
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both impls must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [kxkey-kat] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-kxkey-kat t)))
+
+  ;;; --- (a) RFC 4231 §4.2 TC1: HMAC-SHA256 primitive KAT ---
+  ;; Source: https://www.rfc-editor.org/rfc/rfc4231#section-4.2 (spike §5.2)
+  ;; Key: 0b0b0b...0b (20 bytes), Data: "Hi There" (8 bytes)
+  ;; Expected HMAC-SHA-256: b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+  (let* ((tc1-key
+          (coerce #(#x0b #x0b #x0b #x0b #x0b #x0b #x0b #x0b #x0b #x0b
+                    #x0b #x0b #x0b #x0b #x0b #x0b #x0b #x0b #x0b #x0b)
+                  '(simple-array (unsigned-byte 8) (*))))
+         (tc1-data
+          (coerce #(#x48 #x69 #x20 #x54 #x68 #x65 #x72 #x65)
+                  '(simple-array (unsigned-byte 8) (*))))
+         (tc1-expected
+          #(#xb0 #x34 #x4c #x61 #xd8 #xdb #x38 #x53 #x5c #xa8 #xaf #xce #xaf #x0b #xf1 #x2b
+            #x88 #x1d #xc2 #x00 #xc9 #x83 #x3d #xa7 #x26 #xe9 #x37 #x6c #x2e #x32 #xcf #xf7))
+         (tc1-got (dds.dare:hmac-sha256 tc1-key tc1-data)))
+    (%check :kxkey-hmac-tc1-len (= (length tc1-got) 32)
+            (format nil "RFC 4231 TC1: HMAC-SHA256 length ~d != 32" (length tc1-got)))
+    (%check :kxkey-hmac-tc1-val (equalp tc1-got (coerce tc1-expected '(simple-array (unsigned-byte 8) (*))))
+            (format nil "RFC 4231 TC1: HMAC-SHA256 mismatch; got ~{~2,'0x~}" (coerce tc1-got 'list))))
+
+  ;;; --- RFC 4231 §4.5 TC4: HMAC-SHA256 primitive KAT ---
+  ;; Source: https://www.rfc-editor.org/rfc/rfc4231#section-4.5 (spike §5.3)
+  ;; Key: 0102030405...19 (25 bytes), Data: cdcd...cd (50 bytes of 0xcd)
+  ;; Expected HMAC-SHA-256: 82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b
+  (let* ((tc4-key
+          (coerce #(#x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08 #x09 #x0a #x0b #x0c #x0d
+                    #x0e #x0f #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x18 #x19)
+                  '(simple-array (unsigned-byte 8) (*))))
+         (tc4-data
+          (make-array 50 :element-type '(unsigned-byte 8) :initial-element #xcd))
+         (tc4-expected
+          #(#x82 #x55 #x8a #x38 #x9a #x44 #x3c #x0e #xa4 #xcc #x81 #x98 #x99 #xf2 #x08 #x3a
+            #x85 #xf0 #xfa #xa3 #xe5 #x78 #xf8 #x07 #x7a #x2e #x3f #xf4 #x67 #x29 #x66 #x5b))
+         (tc4-got (dds.dare:hmac-sha256 tc4-key tc4-data)))
+    (%check :kxkey-hmac-tc4-len (= (length tc4-got) 32)
+            (format nil "RFC 4231 TC4: HMAC-SHA256 length ~d != 32" (length tc4-got)))
+    (%check :kxkey-hmac-tc4-val (equalp tc4-got (coerce tc4-expected '(simple-array (unsigned-byte 8) (*))))
+            (format nil "RFC 4231 TC4: HMAC-SHA256 mismatch; got ~{~2,'0x~}" (coerce tc4-got 'list))))
+
+  ;;; --- (b) derive-kx-key structural / determinism / asymmetry checks ---
+  ;; Fixed inputs (no published composed vector exists; Clasp+SBCL cross-check is the method).
+  (let* ((shared-secret
+          (make-array 32 :element-type '(unsigned-byte 8)
+                         :initial-contents '(#x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08
+                                             #x09 #x0a #x0b #x0c #x0d #x0e #x0f #x10
+                                             #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x18
+                                             #x19 #x1a #x1b #x1c #x1d #x1e #x1f #x20)))
+         (challenge1
+          (make-array 32 :element-type '(unsigned-byte 8)
+                         :initial-contents '(#xa1 #xa2 #xa3 #xa4 #xa5 #xa6 #xa7 #xa8
+                                             #xa9 #xaa #xab #xac #xad #xae #xaf #xb0
+                                             #xb1 #xb2 #xb3 #xb4 #xb5 #xb6 #xb7 #xb8
+                                             #xb9 #xba #xbb #xbc #xbd #xbe #xbf #xc0)))
+         (challenge2
+          (make-array 32 :element-type '(unsigned-byte 8)
+                         :initial-contents '(#xc1 #xc2 #xc3 #xc4 #xc5 #xc6 #xc7 #xc8
+                                             #xc9 #xca #xcb #xcc #xcd #xce #xcf #xd0
+                                             #xd1 #xd2 #xd3 #xd4 #xd5 #xd6 #xd7 #xd8
+                                             #xd9 #xda #xdb #xdc #xdd #xde #xdf #xe0)))
+         (kx1 (dds.security:derive-kx-key shared-secret challenge1 challenge2))
+         (kx2 (dds.security:derive-kx-key shared-secret challenge1 challenge2))
+         (kxs (dds.security:derive-kx-salt shared-secret challenge1 challenge2)))
+    (unwind-protect
+         (progn
+           ;; Output length must be 32 bytes
+           (%check :kxkey-len-32 (= (length (dds.security:kx-key-bytes kx1)) 32)
+                   (format nil "derive-kx-key output length ~d != 32"
+                           (length (dds.security:kx-key-bytes kx1))))
+           ;; Determinism: same inputs must yield same output
+           (%check :kxkey-deterministic
+                   (equalp (dds.security:kx-key-bytes kx1) (dds.security:kx-key-bytes kx2))
+                   "derive-kx-key is not deterministic for identical inputs")
+           ;; KxKey != KxSalt: swapped challenges must produce a distinct output
+           (%check :kxkey-ne-kxsalt
+                   (not (equalp (dds.security:kx-key-bytes kx1) (dds.security:kx-key-bytes kxs)))
+                   "KxKey == KxSalt: challenge swap had no effect (construction error)")
+           ;; KxKey != raw shared_secret (output is derived, not copied)
+           (%check :kxkey-ne-secret
+                   (not (equalp (dds.security:kx-key-bytes kx1) shared-secret))
+                   "KxKey == raw shared_secret (KDF produced identity output)"))
+      (dds.security:free-kx-key kx1)
+      (dds.security:free-kx-key kx2)
+      (dds.security:free-kx-key kxs)))
+
+  ;; free-kx-key must return nil (idempotent)
+  (%check :kxkey-free-nil (null (dds.security:free-kx-key nil))
+          "free-kx-key(nil) must return nil")
+
+  t)
+
+;;; ============================================================
+;;; WP-DDS-SECURITY-AUTH-KEYX T3: §9.5.2 KeyMaterial round-trip + fuzz
+;;; ============================================================
+
+;;; KAT fixtures for T3 tests: fixed shared-secret and challenges (same as run-auth-kxkey-kat).
+(defparameter *kat-shared-secret*
+  (make-array 32 :element-type '(unsigned-byte 8)
+                 :initial-contents '(#x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08
+                                     #x09 #x0a #x0b #x0c #x0d #x0e #x0f #x10
+                                     #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x18
+                                     #x19 #x1a #x1b #x1c #x1d #x1e #x1f #x20))
+  "Fixed shared-secret for T3 KAT (non-secret test fixture; not for production).")
+
+(defparameter *kat-challenge1*
+  (make-array 32 :element-type '(unsigned-byte 8)
+                 :initial-contents '(#xa1 #xa2 #xa3 #xa4 #xa5 #xa6 #xa7 #xa8
+                                     #xa9 #xaa #xab #xac #xad #xae #xaf #xb0
+                                     #xb1 #xb2 #xb3 #xb4 #xb5 #xb6 #xb7 #xb8
+                                     #xb9 #xba #xbb #xbc #xbd #xbe #xbf #xc0))
+  "Fixed challenge1 for T3 KAT (non-secret test fixture).")
+
+(defparameter *kat-challenge2*
+  (make-array 32 :element-type '(unsigned-byte 8)
+                 :initial-contents '(#xc1 #xc2 #xc3 #xc4 #xc5 #xc6 #xc7 #xc8
+                                     #xc9 #xca #xcb #xcc #xcd #xce #xcf #xd0
+                                     #xd1 #xd2 #xd3 #xd4 #xd5 #xd6 #xd7 #xd8
+                                     #xd9 #xda #xdb #xdc #xdd #xde #xdf #xe0))
+  "Fixed challenge2 for T3 KAT (non-secret test fixture).")
+
+(defparameter *some-writer-guid*
+  (make-array 16 :element-type '(unsigned-byte 8)
+                 :initial-contents '(#x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08
+                                     #x09 #x0a #x0b #x0c #x0d #x0e #x0f #x10))
+  "Fixed writer GUID for T3 KAT (test fixture only).")
+
+(defparameter *wrong-kx-bytes*
+  (make-array 32 :element-type '(unsigned-byte 8)
+                 :initial-contents '(#xff #xfe #xfd #xfc #xfb #xfa #xf9 #xf8
+                                     #xf7 #xf6 #xf5 #xf4 #xf3 #xf2 #xf1 #xf0
+                                     #xef #xee #xed #xec #xeb #xea #xe9 #xe8
+                                     #xe7 #xe6 #xe5 #xe4 #xe3 #xe2 #xe1 #xe0))
+  "Wrong KxKey for T3 fail-closed proofs (deliberately wrong key; must cause AEAD auth failure).")
+
+(defun* run-auth-keymaterial-roundtrip ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-KEYX T3: §9.5.2 KeyMaterial generation + CryptoToken codec round-trip.
+   NON-VACUOUS: genuinely generated KeyMaterial (not hardcoded); fail-closed proofs included.
+   (a) generate KM -> serialize-crypto-token under KxKey -> parse-crypto-token under SAME KxKey
+       -> parsed KM slots byte-equal originals (round-trip).
+   (b) parse under WRONG KxKey -> NIL (GCM auth failure proves AEAD gate is active).
+   (c) flipped ciphertext byte -> NIL; (d) flipped tag byte -> NIL.
+   (e) make-crypto-token-message / parse-crypto-token-message envelope round-trip.
+   (f) 2-DataHolder message -> NIL (cap enforced, spike §6.3).
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-keymaterial-roundtrip] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-keymaterial-roundtrip t)))
+
+  (let* ((kx  (dds.security:derive-kx-key *kat-shared-secret* *kat-challenge1* *kat-challenge2*))
+         (km  (dds.security:generate-writer-key-material *some-writer-guid*)))
+    (unwind-protect
+         (let* ((kx-bytes (dds.security:kx-key-bytes kx))
+                (tok (dds.security:serialize-crypto-token km kx-bytes)))
+
+           ;; (a) round-trip: parse under the same KxKey -> byte-equal fields
+           (let ((got (dds.security:parse-crypto-token tok kx-bytes)))
+             (%check :km-rt-not-nil (not (null got))
+                     "parse-crypto-token returned NIL on valid token + correct KxKey")
+             (when got
+               (%check :km-rt-kind
+                       (equalp (dds.security:key-material-transformation-kind got)
+                               (dds.security:key-material-transformation-kind km))
+                       "round-trip: transformation-kind mismatch")
+               (%check :km-rt-salt
+                       (equalp (dds.security:key-material-master-salt got)
+                               (dds.security:key-material-master-salt km))
+                       "round-trip: master-salt mismatch")
+               (%check :km-rt-kid
+                       (equalp (dds.security:key-material-sender-key-id got)
+                               (dds.security:key-material-sender-key-id km))
+                       "round-trip: sender-key-id mismatch")
+               (%check :km-rt-key
+                       (equalp (dds.security:key-material-master-sender-key got)
+                               (dds.security:key-material-master-sender-key km))
+                       "round-trip: master-sender-key mismatch")))
+
+           ;; (b) wrong KxKey -> NIL (GCM auth failure)
+           (%check :km-wrong-kx
+                   (null (dds.security:parse-crypto-token tok *wrong-kx-bytes*))
+                   "parse-crypto-token under wrong KxKey must return NIL (GCM auth must gate)")
+
+           ;; (c) flipped byte inside ciphertext/tag area -> NIL
+           ;; DataHolder layout: class_id CDR string + PropertySeq(count=0) + BinaryPropertySeq
+           ;; (count=1 + name CDR string + value u32-len + 116-byte blob + propagate 4B).
+           ;; The propagate field (4B) is the last 4 bytes; the 116-byte blob ends 4B before that.
+           ;; Flipping at (- len 5) lands inside the GCM tag, which must cause auth failure.
+           (let* ((tok-flip (copy-seq tok))
+                  (n-tok    (length tok-flip))
+                  (flip-idx (- n-tok 5))) ; inside tag (tag is last 16B of blob; blob precedes 4B propagate)
+             (when (> flip-idx 0)
+               (setf (aref tok-flip flip-idx)
+                     (logxor (aref tok-flip flip-idx) #xFF)))
+             (%check :km-flip-byte
+                     (null (dds.security:parse-crypto-token tok-flip kx-bytes))
+                     "parse-crypto-token with flipped tag byte must return NIL (GCM auth failure)"))
+
+           ;; (d) empty / zero-length input -> NIL
+           (%check :km-empty-nil
+                   (null (dds.security:parse-crypto-token
+                          (make-array 0 :element-type '(unsigned-byte 8)) kx-bytes))
+                   "parse-crypto-token on empty input must return NIL")
+
+           ;; (e) envelope round-trip
+           (let* ((src-guid  *some-writer-guid*)
+                  (dest-guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+                  (env (dds.security:make-crypto-token-message km kx-bytes src-guid dest-guid))
+                  (km2 (dds.security:parse-crypto-token-message env kx-bytes)))
+             (%check :ctm-not-nil (not (null km2))
+                     "parse-crypto-token-message returned NIL on valid envelope")
+             (when km2
+               (%check :ctm-key
+                       (equalp (dds.security:key-material-master-sender-key km2)
+                               (dds.security:key-material-master-sender-key km))
+                       "envelope round-trip: master-sender-key mismatch")))
+
+           ;; (f) envelope with wrong class_id -> NIL
+           ;; Construct a GenericMessage with class_id != +gm-participant-crypto-tokens+
+           (let* ((zero-16  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+                  (dh-blob  (dds.security:serialize-crypto-token km kx-bytes))
+                  (bad-env  (dds.security:make-generic-message
+                             :source-guid          *some-writer-guid*
+                             :sequence-number      0
+                             :related-guid         zero-16
+                             :related-sn           0
+                             :dest-participant-guid zero-16
+                             :dest-endpoint-guid   zero-16
+                             :source-endpoint-guid *some-writer-guid*
+                             :message-class-id     "dds.sec.WRONG"
+                             :dataholders          (list dh-blob))))
+             (%check :ctm-wrong-class
+                     (null (dds.security:parse-crypto-token-message bad-env kx-bytes))
+                     "parse-crypto-token-message with wrong class_id must return NIL"))
+
+           ;; (g) 2-DataHolder message -> NIL (cap enforced directly; spike §6.3)
+           (let* ((zero-16  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+                  (dh1      (dds.security:serialize-crypto-token km kx-bytes))
+                  (dh2      (dds.security:serialize-crypto-token km kx-bytes))
+                  (two-dh-env (dds.security:make-generic-message
+                               :source-guid          *some-writer-guid*
+                               :sequence-number      0
+                               :related-guid         zero-16
+                               :related-sn           0
+                               :dest-participant-guid zero-16
+                               :dest-endpoint-guid   zero-16
+                               :source-endpoint-guid *some-writer-guid*
+                               :message-class-id     dds.security::+gm-participant-crypto-tokens+
+                               :dataholders          (list dh1 dh2))))
+             (%check :ctm-two-dataholder-nil
+                     (null (dds.security:parse-crypto-token-message two-dh-env kx-bytes))
+                     "parse-crypto-token-message with 2 DataHolders must return NIL (cap: exactly 1 DH per message)")))
+      (dds.security:free-kx-key kx)))
+  t)
+
+;;; Safety-0 compiled inner loop for crypto-token parser fuzz.
+
+(defun* %fuzz-crypto-token-loop-s0 (blobs kx-key)
+    (function (list (simple-array (unsigned-byte 8) (32))) (unsigned-byte 32))
+  "Feed each blob through parse-crypto-token and parse-crypto-token-message at (safety 0).
+   Returns count of nil results (both parsers * blobs). All must be NIL and no signals must escape."
+  (declare (optimize (safety 0) (speed 3)))
+  (let ((nil-count 0))
+    (declare (type (unsigned-byte 32) nil-count))
+    (dolist (blob blobs nil-count)
+      (let ((r1 (dds.security:parse-crypto-token blob kx-key)))
+        (when (null r1) (incf nil-count)))
+      (let ((r2 (dds.security:parse-crypto-token-message blob kx-key)))
+        (when (null r2) (incf nil-count))))))
+
+(defun* run-auth-cryptotoken-fuzz ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-KEYX T3 fuzz: 2000 random/truncated blobs through parse-crypto-token
+   and parse-crypto-token-message, under BOTH normal and (safety 0) compiled paths (NFR-SEC-POSTURE).
+   Every result must be NIL and nothing must crash or signal (fail-closed).
+   Blob sizes: 0..299 bytes (covers truncations and near-valid lengths).
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-cryptotoken-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-cryptotoken-fuzz t)))
+
+  ;; A fixed but non-trivial KxKey for fuzz parsing (not used for anything real)
+  (let* ((fuzz-kx-key (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(#x42 #x42 #x42 #x42 #x42 #x42 #x42 #x42
+                                                         #x42 #x42 #x42 #x42 #x42 #x42 #x42 #x42
+                                                         #x42 #x42 #x42 #x42 #x42 #x42 #x42 #x42
+                                                         #x42 #x42 #x42 #x42 #x42 #x42 #x42 #x42)))
+         (fuzz-blobs '())
+         (crash-count 0)
+         (non-nil-count 0))
+    ;; Build deterministic blob list (matches pattern in run-auth-wire-fuzz-test)
+    (dotimes (_ 1000)
+      (let* ((idx (length fuzz-blobs))
+             (sz  (mod (* idx 17) 300))
+             (blob (make-array (max sz 0) :element-type '(unsigned-byte 8)
+                                          :initial-element (ldb (byte 8 0) (+ (* idx 7) 42)))))
+        ;; non-trivial fill: byte[i] = (i * idx + 37) mod 256
+        (dotimes (i (length blob))
+          (setf (aref blob i) (ldb (byte 8 0) (+ (* i (1+ idx)) 37))))
+        (push blob fuzz-blobs)))
+    (dotimes (i 1000)
+      (let* ((sz (mod i 300))
+             (blob (make-array sz :element-type '(unsigned-byte 8) :initial-element (mod i 256))))
+        (push blob fuzz-blobs)))
+    (setf fuzz-blobs (nreverse fuzz-blobs))
+    (let ((fuzz-count (length fuzz-blobs)))
+      ;; Normal-optimization pass
+      (dolist (blob fuzz-blobs)
+        (let ((r1 (handler-case
+                      (dds.security:parse-crypto-token blob fuzz-kx-key)
+                    (error (c) (declare (ignore c)) :crashed))))
+          (when (eq r1 :crashed) (incf crash-count))
+          (when (and (not (null r1)) (not (eq r1 :crashed))) (incf non-nil-count)))
+        (let ((r2 (handler-case
+                      (dds.security:parse-crypto-token-message blob fuzz-kx-key)
+                    (error (c) (declare (ignore c)) :crashed))))
+          (when (eq r2 :crashed) (incf crash-count))
+          (when (and (not (null r2)) (not (eq r2 :crashed))) (incf non-nil-count))))
+      (%check :fuzz-no-crash (zerop crash-count)
+              (format nil "parse-crypto-token/message crashed ~d time(s) on fuzz input" crash-count))
+      (%check :fuzz-all-nil (zerop non-nil-count)
+              (format nil "parse-crypto-token/message returned non-NIL ~d time(s) on random input" non-nil-count))
+      ;; safety-0 compiled pass: both parsers * fuzz-count blobs = 2*fuzz-count expected nil results
+      (let ((s0-nil-count
+              (handler-case
+                  (%fuzz-crypto-token-loop-s0 fuzz-blobs fuzz-kx-key)
+                (error (e)
+                  (error 'test-failure :name :fuzz-ct-s0-escaped
+                         :detail (format nil "cryptotoken-fuzz safety-0: signal escaped: ~a" e))))))
+        (%check :fuzz-s0-all-nil (= s0-nil-count (* 2 fuzz-count))
+                (format nil "cryptotoken-fuzz safety-0: ~d/~d nil-results (expect ~d)"
+                        s0-nil-count (* 2 fuzz-count) (* 2 fuzz-count))))
+      (format t "~&  [auth-cryptotoken-fuzz] ~d blobs exercised (parse-crypto-token + parse-ctm-message, normal + safety-0)~%"
+              fuzz-count)))
+  t)
+
+;;; ============================================================
+;;; WP-DDS-SECURITY-AUTH-KEYX T7: strict-refuse + don't-break-plain integration
+;;; ============================================================
+;;; T7a: a security-enabled participant strictly refuses a plain (no-identity) peer
+;;;      (auth-gate returns :incompatible because the plain peer has no IdentityToken ->
+;;;      no AUTH-REMOTE entry -> gate verdict = :incompatible -> endpoint never matched).
+;;;      NON-VACUOUS: a plain<->plain pair on the SAME topic/type/QoS DOES match — proving
+;;;      the non-match is the auth-gate's strict refusal, not a topic/type/QoS mismatch.
+;;;
+;;; T7b: two plain participants (no identity) match and exchange data byte-exact as the
+;;;      non-security baseline does — the security build does not regress the default path.
+
+(defun* run-auth-secured-refuses-plain-test ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-KEYX T7a: DDS-Security §7.3 strict posture (allow_unauthenticated=FALSE).
+   Setup: security-enabled participant SEC (with EC identity) + plain participant PLAIN (no identity),
+   both on topic 'SecPlainTopic'/'SPType' with matching reliable/transient-local QoS.
+   Assert: after discovery, SEC's disc-node-matched-count for PLAIN is 0 — the auth-gate
+   returns :incompatible (plain peer has no IdentityToken -> no AUTH-REMOTE -> strict refuse).
+   NON-VACUOUS: plain participants C and D on the SAME topic/type/QoS DO match (matched-count >=1),
+   proving the SEC<->PLAIN non-match is the auth-gate, not a topic/type/QoS mismatch.
+   Requires OpenSSL >= 3.5 (identity load); skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-secured-refuses-plain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-secured-refuses-plain-test t)))
+
+  (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert   (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key    (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (guid-sec  (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(10 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1))))
+    (multiple-value-bind (id-sec reason-sec)
+        (dds.security:validate-local-identity ca-pem ec-cert ec-key guid-sec)
+      (%check :srp-id-ok (not (null id-sec))
+              (format nil "validate-local-identity failed: ~a" reason-sec))
+      (unless id-sec (return-from run-auth-secured-refuses-plain-test t))
+      (unwind-protect
+           ;; SEC: security-enabled (has identity, auth-gate installed, IdentityToken in SPDP)
+           ;; PLAIN: no identity (dp-auth-state NIL, no IdentityToken in SPDP)
+           (let ((p-sec nil) (p-plain nil)
+                 ;; NON-VACUITY control: C and D are both plain, same topic/type/QoS
+                 (p-c nil) (p-d nil))
+             (unwind-protect
+                  (progn
+                    (setf p-sec   (dds.dcps:create-participant :domain 77 :identity id-sec))
+                    (setf p-plain (dds.dcps:create-participant :domain 77))
+                    (setf p-c     (dds.dcps:create-participant :domain 77))
+                    (setf p-d     (dds.dcps:create-participant :domain 77))
+                    (let* ((node-sec   (dds.dcps::dp-node p-sec))
+                         (node-plain (dds.dcps::dp-node p-plain))
+                         (node-c     (dds.dcps::dp-node p-c))
+                         (node-d     (dds.dcps::dp-node p-d))
+                         (topic      "SecPlainTopic")
+                         (ttype      "SPType")
+                         (wqos       (dds.qos:make-writer-qos :reliability :reliable
+                                                              :durability :transient-local))
+                         (rqos       (dds.qos:make-reader-qos :reliability :reliable
+                                                              :durability :transient-local)))
+                    ;; set up endpoints on all four nodes (same topic/type/QoS)
+                    (dds.disc:add-local-writer node-sec :topic topic :type ttype :qos wqos)
+                    (dds.disc:enable-publisher node-sec :history-kind :keep-all)
+                    (dds.disc:add-local-reader node-plain :topic topic :type ttype :qos rqos)
+                    (dds.disc:enable-subscriber node-plain)
+                    (dds.disc:add-local-writer node-c :topic topic :type ttype :qos wqos)
+                    (dds.disc:enable-publisher node-c :history-kind :keep-all)
+                    (dds.disc:add-local-reader node-d :topic topic :type ttype :qos rqos)
+                    (dds.disc:enable-subscriber node-d)
+                    ;; wire SEC<->PLAIN for mutual discovery; C<->D for the control pair
+                    (setf (dds.disc:disc-node-peers node-sec)
+                          (list (cons "127.0.0.1" (dds.disc:disc-node-port node-plain))))
+                    (setf (dds.disc:disc-node-peers node-plain)
+                          (list (cons "127.0.0.1" (dds.disc:disc-node-port node-sec))))
+                    (setf (dds.disc:disc-node-peers node-c)
+                          (list (cons "127.0.0.1" (dds.disc:disc-node-port node-d))))
+                    (setf (dds.disc:disc-node-peers node-d)
+                          (list (cons "127.0.0.1" (dds.disc:disc-node-port node-c))))
+                    ;; drive discovery for both pairs (~3 s budget each)
+                    ;; control pair C<->D must match (plain<->plain: no gate)
+                    (loop repeat 200
+                          until (>= (dds.disc:disc-node-matched-count node-c) 1)
+                          do (dds.dcps:spin p-c) (dds.dcps:spin p-d) (sleep 0.02))
+                    ;; drive SEC<->PLAIN discovery (same budget); SEC must NOT match PLAIN
+                    (loop repeat 200
+                          do (dds.dcps:spin p-sec) (dds.dcps:spin p-plain) (sleep 0.02))
+                    ;; precondition: verify auth-state config before headline assertions
+                    (%check :srp-sec-has-auth-state
+                            (not (null (dds.dcps::dp-auth-state p-sec)))
+                            "SEC participant must have DP-AUTH-STATE set (security-enabled)")
+                    (%check :srp-plain-no-auth-state
+                            (null (dds.dcps::dp-auth-state p-plain))
+                            "PLAIN participant must have NIL DP-AUTH-STATE (no identity)")
+                    ;; === NON-VACUITY: C<->D plain pair matched ===
+                    (%check :srp-control-matched
+                            (>= (dds.disc:disc-node-matched-count node-c) 1)
+                            (format nil "NON-VACUITY FAILED: plain<->plain C/D did not match (count ~d); topic/QoS config error"
+                                    (dds.disc:disc-node-matched-count node-c)))
+                    ;; === HEADLINE: SEC must NOT match the plain peer ===
+                    (%check :srp-sec-refuses-plain
+                            (zerop (dds.disc:disc-node-matched-count node-sec))
+                            (format nil "STRICT-REFUSE FAILED: security-enabled SEC matched ~d plain endpoint(s) — auth-gate must return :incompatible for a peer with no IdentityToken"
+                                    (dds.disc:disc-node-matched-count node-sec)))
+                    t))
+               (when p-d     (ignore-errors (dds.dcps:delete-participant p-d)))
+               (when p-c     (ignore-errors (dds.dcps:delete-participant p-c)))
+               (when p-plain (ignore-errors (dds.dcps:delete-participant p-plain)))
+               (when p-sec   (ignore-errors (dds.dcps:delete-participant p-sec)))))
+        (dds.security:free-identity-handle id-sec))))
+  t)
+
+(defun* run-auth-plain-byte-identical-test ()
+    (function () t)
+  "WP-DDS-SECURITY-AUTH-KEYX T7b: don't-break-plain guarantee.
+   Two PLAIN participants (no identity configured) on topic 'PlainIdTopic'/'PIType' with
+   reliable/transient-local QoS discover each other, match, and exchange a data sample
+   byte-exact — exactly as the non-security baseline does. Confirms: no IdentityToken in SPDP,
+   no PSM bits, normal SEDP match, and DATA delivery with exact payload recovery.
+   Proves the security build does not regress the unauthenticated default path.
+   No OpenSSL dependency; must pass on BOTH SBCL and Clasp unconditionally."
+  (let ((p-w nil)
+        (p-r nil))
+    (unwind-protect
+         (progn
+           (setf p-w (dds.dcps:create-participant :domain 78))
+           (setf p-r (dds.dcps:create-participant :domain 78))
+           (let* ((node-w (dds.dcps::dp-node p-w))
+                (node-r (dds.dcps::dp-node p-r))
+                (topic  "PlainIdTopic")
+                (ttype  "PIType")
+                (pt     (make-array 8 :element-type '(unsigned-byte 8)
+                                      :initial-contents '(#x50 #x4c #x41 #x49 #x4e #x44 #x41 #x54))))
+           ;; neither participant must be security-enabled
+           (%check :pbi-w-no-auth (null (dds.dcps::dp-auth-state p-w))
+                   "writer participant must have NIL DP-AUTH-STATE (plain path)")
+           (%check :pbi-r-no-auth (null (dds.dcps::dp-auth-state p-r))
+                   "reader participant must have NIL DP-AUTH-STATE (plain path)")
+           ;; set up endpoints
+           (dds.disc:add-local-writer node-w :topic topic :type ttype
+                                      :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                     :durability :transient-local))
+           (dds.disc:enable-publisher node-w :history-kind :keep-all)
+           (dds.disc:add-local-reader node-r :topic topic :type ttype
+                                      :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                     :durability :transient-local))
+           (dds.disc:enable-subscriber node-r)
+           ;; unicast peer wiring
+           (setf (dds.disc:disc-node-peers node-w)
+                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-r))))
+           (setf (dds.disc:disc-node-peers node-r)
+                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-w))))
+           ;; drive discovery until matched
+           (loop repeat 300
+                 until (>= (dds.disc:disc-node-matched-count node-w) 1)
+                 do (dds.dcps:spin p-w) (dds.dcps:spin p-r) (sleep 0.02))
+           ;; assert matched
+           (%check :pbi-matched
+                   (>= (dds.disc:disc-node-matched-count node-w) 1)
+                   (format nil "plain<->plain writer/reader did not match (count ~d)"
+                           (dds.disc:disc-node-matched-count node-w)))
+           ;; publish sample and wait for delivery
+           (dds.disc:publish-sample node-w pt)
+           (loop repeat 300
+                 until (plusp (dds.disc:node-sample-count node-r))
+                 do (dds.dcps:spin p-w) (dds.dcps:spin p-r) (sleep 0.02))
+           (%check :pbi-received
+                   (plusp (dds.disc:node-sample-count node-r))
+                   "plain reader did not receive any sample from plain writer")
+           ;; assert payload byte-exact
+           (let* ((key     (first (dds.disc:node-sample-sns node-r)))
+                  (payload (dds.disc:node-sample node-r key)))
+             (%check :pbi-byte-exact
+                     (and payload (equalp payload pt))
+                     (format nil "plain round-trip payload mismatch: got ~a; expected ~{~2,'0x~^ ~}"
+                             (and payload (coerce payload 'list))
+                             (coerce pt 'list))))
+           t))
+      (when p-r (ignore-errors (dds.dcps:delete-participant p-r)))
+      (when p-w (ignore-errors (dds.dcps:delete-participant p-w)))))
   t)

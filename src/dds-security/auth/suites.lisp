@@ -47,6 +47,15 @@
      :hash            #'dds.dare:sha-256)
   "Auth suite: DH+MODP-2048-256 + RSASSA-PSS-SHA256 + SHA-256 (DDS-Security 1.1 §9.3 / RFC 3526 §3).")
 
+(defun* %cert-algo->kind (algo-string)
+    (function (string) (or (member :ec :rsa) null))
+  "Map a dds.cert.algo IdentityToken string to a cert kind keyword (§8.7.2.2 / §9.3.1).
+   +token-algo-ec+ (\"EC-prime256v1\") -> :EC; +token-algo-rsa+ (\"RSA-2048\") -> :RSA; else NIL."
+  (cond
+    ((string= algo-string +token-algo-ec+)  :ec)
+    ((string= algo-string +token-algo-rsa+) :rsa)
+    (t nil)))
+
 (defun* select-auth-suite (local-cert-kind remote-cert-kind)
     (function ((member :ec :rsa) (member :ec :rsa)) (or auth-suite null))
   "Select the §9.3.2 auth suite from the local and remote identity certificate key kinds.
@@ -58,3 +67,23 @@
     ((and (eq local-cert-kind :ec)  (eq remote-cert-kind :ec))  +suite-ecdh+)
     ((and (eq local-cert-kind :rsa) (eq remote-cert-kind :rsa)) +suite-ffdh+)
     (t nil)))
+
+(defun* select-suite-for-identities (local-identity remote-id-token-octets)
+    (function (identity-handle (simple-array (unsigned-byte 8) (*))) (or auth-suite null))
+  "Select the §9.3.2 auth suite for a discovered remote from the local identity and the
+   remote IdentityToken octets, deriving both certificate kinds via %CERT-ALGO->KIND on
+   their advertised dds.cert.algo property (§8.7.2.2). Returns NIL — meaning REJECT the
+   remote — when EITHER algo is unsupported/unparseable (%CERT-ALGO->KIND -> NIL) or the
+   kinds yield no common suite (mismatch); else the selected AUTH-SUITE. Keeps the
+   unsupported-algo NIL handling co-located with %CERT-ALGO->KIND so callers whose
+   SELECT-AUTH-SUITE ftype is (member :ec :rsa) never pass NIL (DDS-Security 1.1 §9.3.2)."
+  (let ((local-kind  (%cert-algo->kind
+                      (or (nth-value 1 (%parse-remote-token-strings
+                                        (identity-handle-token-octets local-identity)))
+                          "")))
+        (remote-kind (%cert-algo->kind
+                      (or (nth-value 1 (%parse-remote-token-strings remote-id-token-octets))
+                          ""))))
+    (if (and local-kind remote-kind)
+        (select-auth-suite local-kind remote-kind)
+        nil)))

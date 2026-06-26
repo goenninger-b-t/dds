@@ -68,4 +68,8 @@
            ;; Slice 2b-i: ParticipantStatelessMessage builtin endpoints (DDS-Security 1.1 §7.4.3)
            #:disc-node-on-stateless-message
            #:%send-stateless-message
-           #:%on-stateless-message))
+           #:%on-stateless-message
+           ;; WP-DDS-SECURITY-AUTH-KEYX T4: auth extension points (DDS-Security 1.1 §7.3/7.4.3.2)
+           #:disc-node-on-participant-discovered
+           #:disc-node-auth-gate
+           #:disc-node-auth-state))

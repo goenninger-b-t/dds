@@ -35,11 +35,16 @@
     (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer
                dds.core.buffer:octet-buffer (integer 0) (integer 0)) t)
   "Receiver thread: a DATA from a remote ENTITYID_P2P_BUILTIN_PARTICIPANT_STATELESS_WRITER.
-   Bounds-check + copy the SerializedPayload, parse it as a ParticipantGenericMessage (T2 codec,
-   §7.4.4), extract + parse the first DataHolder as a handshake-token, and invoke
-   disc-node-on-stateless-message if the hook is set. FAIL-CLOSED: any malformed/truncated/
-   missing message or token is silently dropped — the receiver thread MUST NOT crash or signal.
-   WTR/SN accepted for dispatch-signature symmetry with %on-participant-message."
+   Bounds-check the SerializedPayload extent, copy it out of the shared receive buffer, and
+   deliver the RAW ParticipantGenericMessage envelope octets (§7.4.4) to
+   disc-node-on-stateless-message if the hook is set: (funcall hook node src-prefix envelope).
+   dds-disc stays crypto/format-agnostic — the manager (dds-dcps) does parse-generic-message,
+   reads message_class_id, and dispatches handshake vs crypto-token (an auth-message and a
+   crypto-token message arrive on the SAME stateless endpoint with DIFFERENT DataHolders, so a
+   pre-parse to a handshake-token here would silently drop crypto-token messages). FAIL-CLOSED:
+   only the buffer-extent bounds-check happens here; an empty/out-of-range payload is dropped —
+   the receiver thread MUST NOT crash or signal. WTR/SN accepted for dispatch-signature
+   symmetry with %on-participant-message."
   (declare (ignore wtr sn))
   (block %on-psm ; explicit block so (return-from %on-psm t) is a clean early exit
     (unless (and (plusp plen)
@@ -47,19 +52,9 @@
       (return-from %on-psm t))
     (let ((hook (disc-node-on-stateless-message node)))
       (unless hook (return-from %on-psm t))
-      ;; copy payload out of the shared receive buffer before releasing the buffer lock
+      ;; copy the envelope out of the shared receive buffer before releasing the buffer lock,
+      ;; then deliver the RAW octets to the hook outside the node lock (the manager parses/dispatches)
       (let ((octets (make-array plen :element-type '(unsigned-byte 8))))
         (replace octets (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
-        ;; parse-generic-message returns NIL source-guid on any malformed input (fail-closed §7.4.4)
-        (multiple-value-bind (src-guid _sn rel-guid _rel-sn _dest-part _dest-ep _src-ep class-id dh-list)
-            (dds.security:parse-generic-message octets)
-          (declare (ignore _sn rel-guid _rel-sn _dest-part _dest-ep _src-ep class-id))
-          (unless src-guid (return-from %on-psm t))
-          ;; require exactly one DataHolder (the auth token, §8.7.2.4 message format)
-          (unless dh-list (return-from %on-psm t))
-          ;; dataholder->handshake-token returns NIL on any malformed DataHolder (fail-closed)
-          (let ((token (dds.security:dataholder->handshake-token (car dh-list))))
-            (unless token (return-from %on-psm t))
-            ;; all parsing succeeded: invoke the hook outside the node lock (user code)
-            (funcall hook node src-prefix token)))))
-    t))
+        (funcall hook node src-prefix octets))))
+  t)

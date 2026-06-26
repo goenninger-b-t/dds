@@ -1768,3 +1768,35 @@ A signalled `%shmem-send` hard fault is caught in `%send-raw-buf` (`dds.disc`), 
   code. `RTI_PS_TRANSIENT.xml` is configuration (KEEP_ALL relay QoS) authored against the published RTI
   persistence-service XSD (`.../resource/schema/rti_persistence_service.xsd`, read for the element set
   only). The `analyze-capture.py` `--dedup-union` mode is our own. CLEAN-ROOM.
+
+## M7/P6 — WP-DDS-SECURITY-AUTH-KEYX T0: KxKey/KeyMaterial/CryptoToken constants (2026-06-26)
+
+- **OMG DDS-Security 1.1 formal/2018-04-01** — primary authority for §9.5.3 KxKey derivation
+  and §9.5.2 KeyMaterial structure. PDF binary; clause numbers cited in the spike doc.
+- **eProsima Fast DDS (Apache-2.0) — source read for understanding only; no code copied.**
+  Files read:
+  - `src/cpp/security/cryptography/AESGCMGMAC_KeyFactory.cpp` — `create_kx_key()` and
+    `register_matched_remote_participant()`: corroborated the two-step HMAC-SHA256 KDF, the
+    two 16-byte labels (`"key exchange key"`, `"keyexchange salt"`), and the challenge/shared-secret
+    input ordering.
+  - `src/cpp/security/cryptography/AESGCMGMAC_KeyExchange.cpp` — `KeyMaterialCDRSerialize()`,
+    `KeyMaterialCDRDeserialize()`, `create_local_participant_crypto_tokens()`,
+    `set_remote_participant_crypto_tokens()`, `create_local_datawriter_crypto_tokens()`,
+    `set_remote_datawriter_crypto_tokens()`: established the 88-byte CDR layout (3-zero-pad +
+    1-byte length framing), the binary property name `"dds.cryp.keymat"`, the DataHolder
+    class_id `"DDS:Crypto:AES_GCM_GMAC"`, and the MATERIAL FINDING that Fast DDS sends
+    KeyMaterial in plaintext (KxKey-AEAD encryption commented out).
+  - `src/cpp/security/cryptography/AESGCMGMAC_Types.h` — `KeyMaterial_AES_GCM_GMAC` struct
+    field names and types.
+  - `src/cpp/security/authentication/PKIDH.cpp` — confirmed challenge sizes (32 bytes each,
+    BN_rand(256)) and SharedSecret population (32-byte SHA-256 of DH/ECDH output).
+  - `src/cpp/rtps/security/SecurityManager.cpp` — the three `GMCLASSID_SECURITY_*` macro
+    strings: `"dds.sec.participant_crypto_tokens"`, `"dds.sec.datawriter_crypto_tokens"`,
+    `"dds.sec.datareader_crypto_tokens"`.
+  No code was copied. Influence: corroboration only; all constants are independently pinned
+  from the OMG spec clause; Fast DDS confirms or is noted as deviating (KxKey-plaintext).
+- **IETF RFC 4231** — published HMAC-SHA-256 test vectors (TC1, TC4) for KAT validation of
+  `dds.dare:hmac-sha256`. URL: https://www.rfc-editor.org/rfc/rfc4231. Read as data only.
+- **NIST FIPS PUB 180-4 §B.1** — published SHA-256 "abc" test vector for component-primitive
+  KAT. URL: https://csrc.nist.gov/publications/detail/fips/180/4/final. Read as data only.
+- **No RTI Connext source, headers, or generated code consulted.** CLEAN-ROOM.

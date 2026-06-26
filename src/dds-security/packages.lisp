@@ -23,6 +23,11 @@
    #:key-material-iv-counter
    #:key-material-iv-counter-lock
    #:make-test-key-material
+   ;; T6: per-writer key resolver (§9.5.3.3.4.4/4.5 dynamic key lookup, replaces pre-shared km)
+   #:crypto-keys
+   #:make-crypto-keys
+   #:crypto-keys-encode-key-fn
+   #:crypto-keys-decode-key-fn
    ;; Transform ops (§9.5.3.3.4.4/4.5)
    #:encode-serialized-payload
    #:decode-serialized-payload
@@ -48,6 +53,8 @@
    ;; Auth T3: FFDH-2048 + RSA-PSS suite + §9.3.2 selection (WP-DDS-SECURITY-AUTH-2A T3)
    #:+suite-ffdh+
    #:select-auth-suite
+   ;; WP-DDS-SECURITY-AUTH-KEYX T5: identity-derived §9.3.2 suite selection (encapsulates %cert-algo->kind NIL)
+   #:select-suite-for-identities
    #:handshake-token
    #:handshake-token-p
    #:handshake-handle
@@ -56,6 +63,8 @@
    #:handshake-handle-shared-secret
    #:shared-secret-handle
    #:shared-secret-handle-p
+   #:shared-secret-handle-challenge1-bytes
+   #:shared-secret-handle-challenge2-bytes
    #:begin-handshake-request
    #:begin-handshake-reply
    #:process-handshake
@@ -68,4 +77,25 @@
    #:handshake-token->dataholder
    #:dataholder->handshake-token
    #:make-generic-message
-   #:parse-generic-message))
+   #:parse-generic-message
+   ;; KeyMaterial §9.5.2 Table 65: two additional receiver-specific key fields (T3)
+   #:key-material-receiver-specific-key-id
+   #:key-material-master-receiver-specific-key
+   ;; WP-DDS-SECURITY-AUTH-KEYX T2: §9.5.3 KxKey/KxSalt derivation from the SharedSecret
+   #:kx-key-handle
+   #:kx-key-handle-p
+   #:derive-kx-key
+   #:derive-kx-salt
+   #:kx-key-bytes
+   #:free-kx-key
+   ;; WP-DDS-SECURITY-AUTH-KEYX T3: §9.5.2 KeyMaterial generation + KxKey CryptoToken codec
+   #:+crypto-token-class-id+
+   #:+crypto-token-keymat-prop+
+   #:+gm-participant-crypto-tokens+
+   #:+gm-datawriter-crypto-tokens+
+   #:+gm-datareader-crypto-tokens+
+   #:generate-writer-key-material
+   #:serialize-crypto-token
+   #:parse-crypto-token
+   #:make-crypto-token-message
+   #:parse-crypto-token-message))

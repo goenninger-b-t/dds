@@ -204,6 +204,12 @@
   (on-sample nil :type (or null function))
   ;; Slice 2b-i: PSM receiver callback (DDS-Security 1.1 §7.4.3 / §8.7); NIL = PSM messages ignored.
   (on-stateless-message nil :type (or null function))
+  ;; DDS-Security 1.1 §7.3.4: called (node prefix spdp) outside the lock on first SPDP from a security-capable remote.
+  (on-participant-discovered nil :type (or null function))
+  ;; DDS-Security 1.1 §7.3: endpoint auth gate (node remote local) -> :compatible|:incompatible|:pending; NIL = security OFF.
+  (auth-gate nil :type (or null function))
+  ;; DDS-Security 1.1 §7.3: manager-owned per-participant auth state (12-octet prefix -> opaque).
+  (auth-state (make-hash-table :test 'equalp) :type hash-table)
   (mcast-socket nil :type t)
   (mcast-rx-thread nil :type t)
   (rx-thread nil :type t))
@@ -265,9 +271,12 @@
    IDENTITY-TOKEN-OCTETS (§7.4.3.2): CDR-LE IdentityToken DataHolder octets from validate-local-identity
    + identity-token; when non-NIL the node advertises PID_IDENTITY_TOKEN + PSM endpoint-set bits in SPDP.
    NIL (default) = security OFF, byte-identical SPDP (no PID_IDENTITY_TOKEN, no PSM bits).
-   ON-STATELESS-MESSAGE (Slice 2b-i, §7.4.3 / §8.7): function (node src-prefix token) -> t invoked by
-   the receiver thread when a PSM DATA arrives and is successfully parsed (fail-closed: not called on
-   malformed input). NIL (default) = PSM messages silently ignored."
+   ON-STATELESS-MESSAGE (Slice 2b-i, §7.4.3 / §8.7): function (node src-prefix envelope-octets) -> t
+   invoked by the receiver thread when a PSM DATA arrives — delivered the RAW ParticipantGenericMessage
+   envelope octets (§7.4.4); dds-disc stays crypto/format-agnostic and the consumer (the dds-dcps auth
+   manager) does parse-generic-message + dispatch by message_class_id (handshake vs crypto-token, which
+   share this endpoint with different DataHolders). Fail-closed: only the payload buffer-extent is
+   bounds-checked here; a bad-extent payload is dropped. NIL (default) = PSM messages silently ignored."
   ;; In multicast mode bind the unicast socket to 0.0.0.0: a loopback-bound socket
   ;; cannot egress to a multicast group (EADDRNOTAVAIL), and 0.0.0.0 still receives
   ;; unicast SEDP addressed to 127.0.0.1:port.
@@ -672,11 +681,19 @@
    memoized dest is dropped and re-resolved on the next send."
   (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix spdp)))
     (unless (equalp prefix (disc-node-guid-prefix node))
-      (dds.pal:with-lock ((disc-node-lock node))
-        (let ((key (copy-seq prefix)))
-          (setf (gethash key (disc-node-discovered node)) spdp)
-          (setf (gethash key (disc-node-participant-last-seen node)) (%lease-now))
-          (%invalidate-shmem-dest node prefix))))))
+      (let ((hook nil) (new-secure-p nil))
+        (dds.pal:with-lock ((disc-node-lock node))
+          (let ((key (copy-seq prefix)))
+            (let ((was-known (nth-value 1 (gethash key (disc-node-discovered node)))))
+              (setf (gethash key (disc-node-discovered node)) spdp)
+              (setf (gethash key (disc-node-participant-last-seen node)) (%lease-now))
+              (%invalidate-shmem-dest node prefix)
+              (when (and (not was-known)
+                         (dds.rtps.discovery:spdp-data-identity-token-octets spdp))
+                (setf new-secure-p t)
+                (setf hook (disc-node-on-participant-discovered node))))))
+        (when (and new-secure-p hook)
+          (funcall hook node prefix spdp))))))
 
 (defun* %seed-discovered-stale (node prefix lease-seconds seconds-ago)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) integer (integer 0)) t)
@@ -761,6 +778,7 @@
           (remhash prefix (disc-node-discovered node))
           (remhash prefix (disc-node-participant-last-seen node))
           (remhash prefix (disc-node-builtin-readers node))
+          (remhash prefix (disc-node-auth-state node))
           (%invalidate-shmem-dest node prefix)   ; a leased-out peer's cached SHMEM dest must not be reused
           (%purge-prefix node prefix #'disc-node-discovered-writers)
           (%purge-prefix node prefix #'disc-node-discovered-readers)
@@ -850,6 +868,14 @@
   (let ((gate (disc-node-type-gate node)))
     (if gate (funcall gate node remote local) :compatible)))
 
+(defun* %consult-auth-gate (node remote local)
+    (function (disc-node dds.rtps.discovery:endpoint-data dds.rtps.discovery:endpoint-data) t)
+  "Ask the AUTH-GATE hook for an authentication verdict on (REMOTE, LOCAL), outside the
+   node lock (receiver thread). A NIL gate — and any verdict other than :incompatible /
+   :pending — proceeds as :compatible (security OFF = unchanged)."
+  (let ((gate (disc-node-auth-gate node)))
+    (if gate (funcall gate node remote local) :compatible)))
+
 (defun* %park-match (node direction remote)
     (function (disc-node (member :remote-writer :remote-reader) dds.rtps.discovery:endpoint-data) (eql t))
   "Park a TYPE-GATE :pending match decision as (DIRECTION . REMOTE) (lock-guarded),
@@ -896,8 +922,12 @@
                  (%park-match node direction remote)
                  ;; deliberately short-circuits the incompat/inconsistent bookkeeping below
                  (return-from %match-remote-endpoint t))
-                (t (when (%record-match node remote) (%fire-match node direction remote))
-                   (return-from %match-remote-endpoint t))))
+                (t (case (%consult-auth-gate node remote local)
+                     (:incompatible nil) ; auth refuses unauthenticated peer; no INCONSISTENT_TOPIC
+                     (:pending (%park-match node direction remote)
+                               (return-from %match-remote-endpoint t))
+                     (t (when (%record-match node remote) (%fire-match node direction remote))
+                        (return-from %match-remote-endpoint t))))))
           ((string= (dds.rtps.discovery:endpoint-data-topic-name remote)
                     (dds.rtps.discovery:endpoint-data-topic-name local))
            (if (string= (dds.rtps.discovery:endpoint-data-type-name remote)

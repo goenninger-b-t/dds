@@ -7827,6 +7827,62 @@
       (dds.disc:stop-node node2)))
   t)
 
+;;; WP-DDS-SECURITY-AUTH-KEYX T4: auth-gate compose test (stub hooks, no crypto).
+;;; Verifies the auth-gate is consulted as a SECOND sequential gate after the type-gate
+;;; returns :compatible (DDS-Security 1.1 §7.3, disc.lisp %match-remote-endpoint).
+
+(defun* run-auth-gate-compose-test ()
+    (function () t)
+  "AUTH-GATE composed after TYPE-GATE (stub, crypto-free): :incompatible -> no match;
+   :pending -> parked (non-vacuous: match must NOT fire while pending); :compatible after
+   resume-parked-matches -> match fires exactly once."
+  ;; Case 1: auth-gate returns :incompatible -> no match recorded, no INCONSISTENT_TOPIC
+  (multiple-value-bind (node1 node2) (%tg-nodes)
+    (unwind-protect
+         (progn
+           (setf (dds.disc:disc-node-auth-gate node2)
+                 (lambda (node remote local)
+                   (declare (ignore node remote local)) :incompatible))
+           (dds.disc:announce-endpoints node1)
+           (dds.disc:announce-endpoints node2)
+           (sleep 0.15)
+           (%check :auth-incompat-no-match (zerop (dds.disc:disc-node-matched-count node2))
+                   "auth-gate :incompatible must not record a match"))
+      (dds.disc:stop-node node1)
+      (dds.disc:stop-node node2)))
+  ;; Case 2: :pending -> parked (NOT fired); after gate flips :compatible and resume-parked-matches -> fires
+  (multiple-value-bind (node1 node2) (%tg-nodes)
+    (unwind-protect
+         (let ((verdict :pending) (matches '()) (m-lock (dds.pal:make-lock "ag-m")))
+           (setf (dds.disc:disc-node-auth-gate node2)
+                 (lambda (node remote local)
+                   (declare (ignore node remote local)) verdict))
+           (setf (dds.disc:disc-node-on-match node2)
+                 (lambda (kind remote)
+                   (declare (ignore remote))
+                   (dds.pal:with-lock (m-lock) (push kind matches))))
+           (dds.disc:announce-endpoints node1)
+           (dds.disc:announce-endpoints node2)
+           (loop repeat 100 until (plusp (dds.disc:disc-node-parked-count node2)) do (sleep 0.02))
+           ;; non-vacuous: assert match did NOT fire while :pending
+           (%check :auth-pending-no-match (zerop (dds.disc:disc-node-matched-count node2))
+                   "auth-gate :pending must not record a match before resume")
+           (%check :auth-pending-parked (plusp (dds.disc:disc-node-parked-count node2))
+                   "auth-gate :pending must park the match decision")
+           ;; flip to :compatible and resume
+           (setf verdict :compatible)
+           (dds.disc:resume-parked-matches node2)
+           (%check :auth-resumed-match (plusp (dds.disc:disc-node-matched-count node2))
+                   "resume with :compatible auth-gate must record the match")
+           (%check :auth-resumed-fired
+                   (equal '(:remote-writer) (dds.pal:with-lock (m-lock) matches))
+                   "resumed auth match must fire on-match exactly once (:remote-writer)")
+           (%check :auth-drained (zerop (dds.disc:disc-node-parked-count node2))
+                   "resume must drain the parked list"))
+      (dds.disc:stop-node node1)
+      (dds.disc:stop-node node2)))
+  t)
+
 ;;; DCPS assignability-gated matching (M4 Task 4.2, FR-TYPE-4): the DCPS layer installs
 ;;; an assignability gate on the disc-node TYPE-GATE hook — equal EquivalenceHashes match
 ;;; with zero wire traffic; differing hashes fetch the remote Minimal TypeObject via
