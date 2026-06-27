@@ -42,6 +42,9 @@ COMPONENTS = {
     "chipz":            {"version": "0.8", "license": "BSD-3-Clause",
                          "download": "https://github.com/froydnj/chipz",
                          "supplier": "Nathan Froyd"},
+    "xmls":             {"version": "3.3.0", "license": "MIT",
+                         "download": "https://github.com/rpgoldman/xmls",
+                         "supplier": "Robert P. Goldman (rpgoldman)"},
     # OpenSSL is a NATIVE runtime dependency of dds-dare (CNSA-2.0 DARE: AES-256-GCM +
     # ML-KEM-1024 + SHA-384/HKDF via libcrypto, loaded through CFFI — not an ASDF :depends-on),
     # so it is emitted as a native runtime package below (mirroring the SBCL runtime entry),

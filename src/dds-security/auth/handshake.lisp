@@ -263,6 +263,7 @@
    role: :requester (local GUID < remote) or :replier (§8.7.2.4 GUID ordering).
    suite: auth-suite vtable. local-id: local identity-handle.
    remote-pub-key: EVP_PKEY* from peer cert (stored after cert verify; released in free-handshake-handle).
+   peer-subject: the VALIDATED peer-cert subject name (x509-subject-name of the chain-verified c.id cert; §8.7.2.5 — the unforgeable authorization identity; NIL until the peer cert is validated).
    state: :init | :awaiting-reply | :awaiting-final | :authenticated | :rejected.
    my-dh-priv: EVP_PKEY* ephemeral private (released on free or after use).
    my-dh-pub: SubjectPublicKeyInfo DER of ephemeral public key (dh1 or dh2 wire value).
@@ -274,6 +275,7 @@
   (suite         +suite-ecdh+ :type auth-suite)
   (local-id      nil :type (or identity-handle null))
   (remote-pub-key (cffi:null-pointer) :type cffi:foreign-pointer)
+  (peer-subject  nil :type (or null string))
   (state         :init :type (member :init :awaiting-reply :awaiting-final :authenticated :rejected))
   (my-dh-priv    (cffi:null-pointer) :type cffi:foreign-pointer)
   (my-dh-pub     (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*)))
@@ -443,6 +445,8 @@
                                                   :suite suite
                                                   :local-id local
                                                   :remote-pub-key peer-pub-key
+                                                  ;; §8.7.2.5: bind the unforgeable authorization identity to the chain-verified peer cert
+                                                  :peer-subject (dds.dare:x509-subject-name peer-cert)
                                                   :state :awaiting-final
                                                   :my-dh-priv my-dh-priv
                                                   :my-dh-pub my-dh-pub
@@ -569,6 +573,8 @@
                                     (handshake-handle-peer-challenge  handle) challenge2
                                     (handshake-handle-hash-c-peer     handle) hash-c2-recomputed
                                     (handshake-handle-remote-pub-key  handle) peer-pub
+                                    ;; §8.7.2.5: bind the unforgeable authorization identity to the chain-verified peer cert
+                                    (handshake-handle-peer-subject    handle) (dds.dare:x509-subject-name peer-cert)
                                     (handshake-handle-shared-secret   handle) ss
                                     (handshake-handle-state           handle) :authenticated)
                               (setf peer-stored t)

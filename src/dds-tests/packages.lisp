@@ -70,4 +70,7 @@
            #:run-auth-spdp-identity-token-test
            #:run-auth-wire-codec-test
            #:run-auth-wire-fuzz-test
-           #:run-auth-handshake-over-wire-test))
+           #:run-auth-handshake-over-wire-test
+           #:run-cms-verify-kat
+           #:run-access-plugin-validate-test
+           #:run-access-manager-test))

@@ -1800,3 +1800,36 @@ A signalled `%shmem-send` hard fault is caught in `%send-raw-buf` (`dds.disc`), 
 - **NIST FIPS PUB 180-4 §B.1** — published SHA-256 "abc" test vector for component-primitive
   KAT. URL: https://csrc.nist.gov/publications/detail/fips/180/4/final. Read as data only.
 - **No RTI Connext source, headers, or generated code consulted.** CLEAN-ROOM.
+
+## M7 (2026-06-26) — WP-DDS-SECURITY-ACCESS-CONTROL T0 (AccessControl spike)
+
+AccessControl plugin: Governance + Permissions document formats + CMS signing + XML library.
+
+- **OMG DDS-Security 1.1 formal/19-04-03 §9.4.1 + Annex B** — sole normative source for the
+  Governance/Permissions XSD element set (§9.4.1.2.3 Tables 30–34, §9.4.1.3.2 Tables 35–41,
+  Annex B XSD schema locations). No external service; spec read from prior knowledge with
+  clause citations. All element names + enumeration values pinned from §9.4.1.2.3 / §9.4.1.3.2.
+- **OpenSSL 3.6.2 headers** (`/opt/homebrew/opt/openssl@3/include/openssl/cms.h`) — read to pin
+  the exact C API signatures: `SMIME_read_CMS` (line 226), `CMS_verify` (lines 276-277),
+  `CMS_get0_signers` (line 283), and the `CMS_*` flag constants (lines 180-200). No code copied;
+  influence: the FFI binding signature for `dds.dare:cms-verify` (T1).
+- **`xmls` 3.3.0 (MIT, Shannon Spires / rpgoldman)** — added as a runtime dependency for
+  Governance + Permissions XML parsing. Pure Common Lisp, zero transitive dependencies; selected
+  over `cxml` (which also loads on both Clasp and SBCL but adds 4 transitive systems).
+  Justified per the operating contract §9: control-plane only (never on the hot path); the
+  Clasp+SBCL-both-validate directive is satisfied (smoke-loaded on both, identically).
+  SBOM entry: `SPDXRef-xmls`, version 3.3.0, MIT, `https://github.com/rpgoldman/xmls`.
+- Test fixtures generated in `interop/security-access-control/pki/` — a throwaway Permissions CA
+  (EC P-256) + signed governance.xml + signed permissions.xml. Keys are throwaway test-only
+  credentials; committed intentionally. No external CA or existing PKI consulted.
+- **No Fast DDS, Cyclone, OpenDDS, or RTI Connext source read.** CLEAN-ROOM.
+
+## M7 (2026-06-26) — WP-DDS-SECURITY-ACCESS-CONTROL T2 (Governance/Permissions parser + matcher)
+
+- **`xmls` 3.3.0 (MIT)** added to `dds-security.asd :depends-on` for XML parsing; zero transitive
+  deps, pure Common Lisp, T0-verified on both SBCL and Clasp; justification in T0 section above.
+- **OMG DDS-Security 1.1 §9.4.1.2.3 + §9.4.1.3.2** — sole normative source for the element set,
+  first-match-wins rule evaluation order (§9.4.1.3.2.10), and fnmatch topic matching (§9.4.1.3.2.7).
+- Fixtures `interop/security-access-control/pki/governance.xml` + `permissions.xml` (unsigned XML,
+  committed from the T0 gen-test-permissions.sh run) used as parse KAT and fuzz base.
+- **No RTI Connext, Fast DDS, Cyclone, or OpenDDS source read.** CLEAN-ROOM.

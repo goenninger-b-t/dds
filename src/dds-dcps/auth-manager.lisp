@@ -60,7 +60,13 @@
    REMOTE-KM: the installed remote writer KeyMaterial (§9.5.2; NIL until a CryptoToken decrypts).
    ROLE: :requester (local GUID < remote) or :replier (§8.7.2.4 ordering).
    REMOTE-TOKEN: the remote IdentityToken octets (stashed at discovery so the replier can pick
-                 the suite when the request arrives on the wire).
+                 the suite when the request arrives on the wire). SELF-ASSERTED — never the §8.4
+                 authorization identity (a peer can claim any cert-sn here).
+   VALIDATED-SUBJECT: the remote's VALIDATED handshake-cert subject name (x509-subject-name of the
+                 §8.7 chain-verified peer cert, surfaced from the handshake-handle at :authenticated;
+                 §8.7.2.5). The §8.4 permissions-gate authorizes on THIS — unforgeable, since the remote
+                 proved possession of the private key for the cert this subject is read from. NIL until
+                 :authenticated.
    SUITE: the §9.3.2 auth-suite selected for this pair.
    PENDING-CT: CryptoToken envelopes received before KX-KEY existed (best-effort PSM has no
                resend) — drained once KX-KEY is derived. LOCAL-SENT-P dedupes our own send."
@@ -70,6 +76,7 @@
   (remote-km    nil :type (or null dds.security:key-material))
   (role         :requester :type (member :requester :replier))
   (remote-token nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (validated-subject nil :type (or null string))
   (suite        nil :type (or null dds.security:auth-suite))
   (pending-ct   '() :type list)
   (local-km     nil :type (or null dds.security:key-material))
@@ -248,6 +255,27 @@
         (setf (auth-remote-state ar) :authenticated))
       want-send)))
 
+(defun* %am-bind-and-check-subject (ar prefix)
+    (function (auth-remote (simple-array (unsigned-byte 8) (12))) boolean)
+  "Record AR's VALIDATED handshake-cert subject (the §8.4 gate's unforgeable authorization identity,
+   surfaced from the handshake-handle PEER-SUBJECT) and apply the §8.7.2.5 token-vs-credential check.
+   Returns T to proceed, or NIL to REJECT (the caller fails closed) when the validated cert subject
+   disagrees with the cert-sn advertised in AR's self-asserted SPDP IdentityToken (a forged identity
+   claim). A NIL validated-or-claimed subject does not itself reject (the AccessControl gate fail-closes
+   on a NIL validated subject); only a present-but-different pair is a forgery. CALLER HOLDS the lock."
+  (let ((handle (auth-remote-handle ar)))
+    (when handle
+      (setf (auth-remote-validated-subject ar) (dds.security:handshake-handle-peer-subject handle))))
+  (let ((validated (auth-remote-validated-subject ar))
+        (claimed (and (auth-remote-remote-token ar)
+                      (nth-value 0 (dds.security::%parse-remote-token-strings
+                                    (auth-remote-remote-token ar))))))
+    (cond
+      ((and validated claimed (not (string= validated claimed)))
+       (%am-log prefix "8.7.2.5 reject: validated cert subject != advertised IdentityToken cert-sn")
+       nil)
+      (t t))))
+
 ;;; --- discovery hook: requester trigger / replier pre-stash ---
 
 (defun* %am-validate-and-record (ms node prefix spdp)
@@ -369,9 +397,12 @@
                 (when out (setf next-octets out))
                 ;; :continue with our state :authenticated (requester after Reply) OR :authenticated
                 (when (eq (dds.security:handshake-handle-state (auth-remote-handle ar)) :authenticated)
-                  (when (%am-on-authenticated ms node ar)
-                    (setf send-ct t km (auth-remote-local-km ar)
-                          kx-key (auth-remote-kx-key ar)))))))))))
+                  ;; authorize on the VALIDATED handshake-cert subject (unforgeable) + §8.7.2.5 token-vs-cert binding
+                  (if (%am-bind-and-check-subject ar prefix)
+                      (when (%am-on-authenticated ms node ar)
+                        (setf send-ct t km (auth-remote-local-km ar)
+                              kx-key (auth-remote-kx-key ar)))
+                      (setf (auth-remote-state ar) :rejected next-octets nil))))))))))
     ;; send the produced token + the CryptoTokens OUTSIDE the manager lock
     (when next-octets
       (%am-send-handshake node (dds.disc:disc-node-guid-prefix node) prefix next-octets))

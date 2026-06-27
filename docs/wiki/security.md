@@ -854,6 +854,156 @@ See ADR 0034 (`docs/adr/0034-dds-security-auth-keyx.md`) for the full analysis.
 
 ---
 
+## 6quinque. AccessControl plugin — Slice 3 (DDS-Security 1.1 §8.4, §9.4)
+
+Slice 3 (landed 2026-06-26, WP-DDS-SECURITY-ACCESS-CONTROL, ADR 0035) delivers the
+DDS-Security 1.1 **`DDS:Access:Permissions`** builtin AccessControl plugin — the policy layer
+that decides *what* an authenticated participant is allowed to do.
+
+**Scope of Slice 3:** CMS-verify the signed Governance + Permissions documents (signed by a
+Permissions CA) via OpenSSL; parse the XML; enforce allow/deny at the three §8.4 check points
+(participant creation, local DataWriter/DataReader creation, remote endpoint matching), our-to-our.
+
+### 6quinque.1 The two document types (§9.4.1)
+
+**Governance** (`governance.xml`, signed as `governance.p7s`) is a per-domain policy document.
+The subset parsed by this slice:
+
+| Element | Parsed field | Effect |
+|---|---|---|
+| `allow_unauthenticated_participants` | `governance-allow-unauthenticated` | Enforced upstream by the Slice-2 auth-gate |
+| `enable_join_access_control` | `governance-enable-join-ac` | Gates `check_create_participant` |
+| `topic_rule/topic_expression` | First element of each `topic-rules` entry | Matched by `%topic-match-p` |
+| `enable_read_access_control` | `(cadr rule)` | Gates `check_remote_datawriter` / `check_create_datareader` |
+| `enable_write_access_control` | `(cddr rule)` | Gates `check_remote_datareader` / `check_create_datawriter` |
+
+**Permissions** (`permissions.xml`, signed as `permissions.p7s`) is a per-participant policy
+document.  One `<grant>` per participant subject name; each grant contains ordered
+`<allow_rule>` / `<deny_rule>` elements with `<publish>` / `<subscribe>` operations and
+`<topics>` lists.
+
+### 6quinque.2 CMS signature verification (`dds.dare:cms-verify`)
+
+```lisp
+(dds.dare:cms-verify smime-pem-octets ca-store)
+  ;; -> (or (simple-array (unsigned-byte 8) (*)) null)
+  ;; Verify the -----BEGIN PKCS7----- PEM SignedData in SMIME-PEM-OCTETS against CA-STORE
+  ;; (an X509_STORE* from dds.dare:x509-load-ca). Returns the verified plaintext bytes on
+  ;; success; NIL on any failure (fail-closed). Uses PEM_read_bio_CMS + CMS_verify (flags=0:
+  ;; full chain+content+attr verify). DDS-Security 1.1 §9.4.1.1.
+```
+
+`cms-verify` is fail-closed: any parse error, chain failure, or signature mismatch → NIL.
+No hand-rolled crypto (FR-SEC-2): all CMS parsing and verification is via OpenSSL.
+
+### 6quinque.3 The data model (`dds.security`)
+
+| Symbol | Type | Contract |
+|---|---|---|
+| `governance` | `defstruct*` | §9.4.1.2.3 data model: `allow-unauthenticated`, `enable-join-ac`, `topic-rules` (list of `(expr . (read-ac . write-ac))`) |
+| `parse-governance (octets)` | `(or governance null)` | Parse §9.4.1.2.3 XML from OCTETS; NIL on malformed input |
+| `governance-topic-rule (gov topic-name)` | `(values boolean boolean)` | First-matching topic_rule for TOPIC-NAME; `(nil nil)` if none |
+| `permissions` | `defstruct*` | §9.4.1.3.2 grant data model: `subject-name`, `not-before`, `not-after`, `default` (`:allow` / `:deny`), `rules` |
+| `parse-permissions (octets)` | `(or list null)` | Parse §9.4.1.3.2 XML; return list of `permissions` structs (one per `<grant>`); NIL on malformed |
+| `permissions-allow-publish-p (perms topic-name)` | `boolean` | T if PERMS grants publish on TOPIC-NAME (first-match-wins, §9.4.1.3.2.10) |
+| `permissions-allow-subscribe-p (perms topic-name)` | `boolean` | T if PERMS grants subscribe on TOPIC-NAME (first-match-wins, §9.4.1.3.2.10) |
+
+### 6quinque.4 The §8.4 check predicates (`dds.security`)
+
+| Symbol | Contract |
+|---|---|
+| `access-handle` | §8.4 plugin handle: owns the Permissions CA `X509_STORE*` + parsed docs + full grant-list |
+| `validate-local-permissions (pca-oct gov-oct perm-oct local-subject)` | §8.4.2.1: CMS-verify both docs vs PCA; parse; select local grant; return `access-handle` or NIL |
+| `validate-remote-permissions (ah remote-perm-oct remote-subject)` | §8.4.2.2: CMS-verify vs AH's CA; parse; select remote grant; return `permissions` or NIL |
+| `free-access-handle (ah)` | Release the Permissions CA `X509_STORE*` owned by AH |
+| `check-create-participant (ah)` | §8.4.2.3: T when join-AC is off or local permissions bound |
+| `check-create-datawriter (ah topic)` | §8.4.2.4: Governance write-AC toggle + local Permissions publish check |
+| `check-create-datareader (ah topic)` | §8.4.2.5: Governance read-AC toggle + local Permissions subscribe check |
+| `check-remote-datawriter (ah remote-perms topic)` | §8.4.2.7: local Governance read-AC toggle + remote Permissions publish check |
+| `check-remote-datareader (ah remote-perms topic)` | §8.4.2.8: local Governance write-AC toggle + remote Permissions subscribe check |
+
+The **Table 32 toggle semantics** (§9.4.1.2.3): `enable_read_access_control` gates both
+`check_create_datareader` (local subscribe creation) and `check_remote_datawriter` (the local
+read path vets the remote publisher); `enable_write_access_control` gates both
+`check_create_datawriter` and `check_remote_datareader`.
+
+### 6quinque.5 Turning it on (`dds.dcps`)
+
+```lisp
+(let* ((to-oct (lambda (s) (map '(simple-array (unsigned-byte 8) (*)) #'char-code s)))
+       (ca-pca-oct  (funcall to-oct (uiop:read-file-string "pki/pca-cert.pem")))
+       (gov-oct     (funcall to-oct (uiop:read-file-string "pki/governance.p7s")))
+       (perm-oct    (funcall to-oct (uiop:read-file-string "pki/permissions.p7s")))
+       ;; identity already validated (see §6ter.2)
+       (local-subj  (dds.dare:x509-subject-name (dds.security::identity-handle-cert id)))
+       ;; CMS-verify both docs, parse, select local grant
+       (ah          (dds.security:validate-local-permissions ca-pca-oct gov-oct perm-oct local-subj))
+       ;; create participant with identity (auth-gate) then install access control
+       (p           (dds.dcps:create-participant :domain 0 :identity id)))
+  (dds.dcps::%install-access-control p ah)
+  ...)
+```
+
+`%install-access-control (p access-handle)` stores the `access-handle` in `dp-access-state`
+and wires the permissions-gate closure on the disc-node.  With **no** `access-handle`
+installed, `dp-access-state` stays NIL and the participant is the byte-identical plain path
+(all gate calls return `:compatible` unconditionally).
+
+### 6quinque.6 A worked allow/deny example
+
+```lisp
+;;; Governance fixture: enable_read_access_control=true, enable_write_access_control=true, topic="*"
+;;; Permissions fixture (EC grant): allow publish+subscribe "Square"; deny publish+subscribe "Circle"; default DENY
+
+(let* ((xml   (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                   (uiop:read-file-string "pki/permissions.xml")))
+       (perms (dds.security:parse-permissions xml))
+       (grant (find "/CN=TestParticipantEC/O=DDS-Test/C=DE" perms
+                    :key #'dds.security:permissions-subject-name :test #'string=)))
+
+  ;; "Square" — first allow_rule matches:
+  (assert (dds.security:permissions-allow-publish-p   grant "Square") () "Square pub must be allowed")
+  (assert (dds.security:permissions-allow-subscribe-p grant "Square") () "Square sub must be allowed")
+
+  ;; "Circle" — first deny_rule matches:
+  (assert (not (dds.security:permissions-allow-publish-p   grant "Circle")) () "Circle pub must be denied")
+  (assert (not (dds.security:permissions-allow-subscribe-p grant "Circle")) () "Circle sub must be denied")
+
+  ;; "Triangle" — no rule, default DENY:
+  (assert (not (dds.security:permissions-allow-publish-p   grant "Triangle")) () "Triangle -> default DENY")
+
+  ;; Wildcard "Sq*" would also match "Square":
+  (assert (dds.security::%topic-match-p "Sq*" "Square") () "prefix wildcard match"))
+```
+
+End-to-end (full gate ladder, our-to-our): a `"Square"` writer on participant A matches a
+`"Square"` reader on participant B (allow rule fires at the permissions-gate → `:compatible`).
+A `"Circle"` writer on participant A does NOT match a `"Circle"` reader on participant B
+even though both reach `auth-remote` `:keyed` (deny rule fires → `:incompatible`).  Proven
+by `run-access-control-allow-deny-test` (NON-VACUOUS: `sq-b matched-count >= 1` AND
+`ci-b matched-count = 0`; identical identities, QoS, and auth; only the topic name differs).
+
+### 6quinque.7 The honest interop posture for Slice 3
+
+**Level 1 — Our-to-our: authenticate + AccessControl allow/deny enforced (ACHIEVED)**
+Two security-enabled participants with signed Governance + Permissions authenticate (Slice-2
+auth path → both reach `:keyed`), then the permissions-gate enforces the topic-level policy:
+an allowed topic matches and communicates; a denied topic is refused (`:incompatible`).
+`run-access-control-local-deny-test` proves `check_create_datawriter` enforcement.
+349 tests Clasp + SBCL (Clasp first; non-vacuous — both reach `:keyed` before the deny fires;
+the ONLY variable is the topic name).
+
+**Level 2 — Default-OFF (ACHIEVED)** A participant with no Governance/Permissions has
+`dp-access-state=NIL`; the permissions-gate returns `:compatible` unconditionally; the participant
+is byte-identical to the pre-Slice-3 plain path.  Confirmed by `run-access-control-default-off-test`.
+
+**Level 3 — Live Connext-Security AccessControl interop (DEFERRED to Slice 5)** The RTI Security
+Plugins are not installed.  The per-participant `c.perm`-in-handshake exchange, the signed-document
+format (bare PEM-PKCS7 vs MIME-wrapped), and subject-name normalization are self-consistent
+(our-to-our) but unverified against a live Connext-Security peer.  See ADR 0035.
+
+---
+
 ## 7. Roadmap (M7/P6)
 
 | Slice | Description | Status |
@@ -863,6 +1013,6 @@ See ADR 0034 (`docs/adr/0034-dds-security-auth-keyx.md`) for the full analysis.
 | **2b-i** | Wire transport: SPDP IdentityToken + PSM endpoints + DataHolder/envelope codec + our-to-our handshake over UDP (ADR 0033) | **LANDED** |
 | **2b-ii** | Discovery integration: on-participant-discovered hook + auth manager (`%install-auth-manager`) + per-participant `dp-auth-state` + strict endpoint-match auth-gate + `select-suite-for-identities` (ADR 0034 at capstone) | **LANDED** |
 | **2c** | Crypto key-exchange: §9.5.3 KxKey + §9.5.2 per-writer KeyMaterial exchanged over PSM, installed per remote (ADR 0034 at capstone) | **LANDED** |
-| 3 | AccessControl plugin (§8.8): governance/permissions XML, topic-level policy enforcement | pending |
+| **3** | AccessControl plugin (§8.4 / §9.4): CMS-verify signed Governance + Permissions, topic-level allow/deny at all three §8.4 check points, our-to-our (ADR 0035) | **LANDED** |
 | 4 | Secure discovery (§7.4.4): SPDP/SEDP participant/endpoint authentication | pending |
-| 5 | Connext-Security live interop: live cross-vendor PKI-DH auth interop (the P6 exit gate) | pending |
+| 5 | Connext-Security live interop: live cross-vendor PKI-DH auth + AccessControl interop (the P6 exit gate) | pending |

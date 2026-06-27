@@ -1,0 +1,88 @@
+;;;; DDS-Security 1.1 §8.4 AccessControl MANAGER (M7/P6 Slice 3). The DCPS-layer manager that
+;;;; ties the §8.4 AccessControl plugin (dds-security/access-control, T3) to the discovery
+;;;; PERMISSIONS-GATE hook (dds-disc, T4) and the Slice-2 authentication manager (auth-manager.lisp).
+;;;; It mirrors auth-manager.lisp / type-gate.lisp: per-participant state hangs off the
+;;;; domain-participant (DP-ACCESS-STATE = the validated access-handle, analogous to DP-AUTH-STATE);
+;;;; one hook is installed on the disc-node — the PERMISSIONS-GATE — composed as the THIRD sequential
+;;;; gate after the auth-gate at %match-remote-endpoint. dds-disc stays crypto/policy-free (it just
+;;;; calls the gate). The gate body runs OUTSIDE the node lock on the receiver thread and is fail-closed.
+;;;;
+;;;; SHARED-DOCUMENT model (our-to-our this slice): every participant is configured with the SAME
+;;;; signed multi-grant Permissions document; the access-handle retains the FULL grant-list. For a
+;;;; REMOTE participant the gate selects the remote's grant from that list by the remote's VALIDATED
+;;;; handshake-certificate subject name (AUTH-REMOTE-VALIDATED-SUBJECT — the x509-subject-name of the
+;;;; §8.7 chain-verified peer cert, NOT the self-asserted SPDP IdentityToken cert-sn). The remote
+;;;; proved possession of the private key for THAT cert and the subject is read from the validated
+;;;; cert, so it cannot be forged (authorizing on the self-asserted token would let any CA-issued peer
+;;;; escalate by advertising a privileged cert-sn). The conformant per-participant c.perm-in-handshake
+;;;; exchange (each peer sends its OWN signed permissions) is a documented Slice-5 cross-vendor carry (ADR 0035).
+;;;;
+;;;; Spec: OMG DDS-Security 1.1 §8.4 (AccessControl operations), §9.4 (Governance/Permissions builtin
+;;;; plugin + S/MIME signing), §7.3 (endpoint-match gating). Design:
+;;;; docs/superpowers/specs/2026-06-26-dds-security-access-control-design.md.
+
+(in-package #:dds.dcps)
+
+;;; --- the permissions-gate (§8.4 / §7.3, consulted at endpoint match, OUTSIDE the node lock) ---
+
+(defun* %participant-permissions-gate (p node remote local)
+    (function (domain-participant dds.disc:disc-node
+               dds.rtps.discovery:endpoint-data dds.rtps.discovery:endpoint-data)
+              (member :compatible :incompatible :pending))
+  "The DDS-Security §8.4 AccessControl gate installed on P's disc-node PERMISSIONS-GATE hook
+   (consulted as the THIRD sequential gate after the auth-gate returns :compatible, in
+   %MATCH-REMOTE-ENDPOINT; both directions, receiver thread, OUTSIDE the node lock). Verdict ladder:
+     local NOT access-controlled (no DP-ACCESS-STATE)        -> :compatible (AC OFF, byte-identical);
+     no auth manager (DP-AUTH-STATE NIL — misconfig: AC needs auth) -> :pending (fail-closed, never matches);
+     remote AUTH-REMOTE absent / not :keyed (auth in flight) -> :pending (parked; resumed when auth
+                                                                reaches :keyed, which already calls
+                                                                DDS.DISC:RESUME-PARKED-MATCHES);
+     remote VALIDATED subject absent (no handshake-cert subject) -> :incompatible (cannot authorize -> deny);
+     remote subject has NO grant in the shared Permissions   -> :incompatible (no permissions -> deny);
+     remote grant denies the topic (direction-aware)         -> :incompatible (access denied);
+     remote grant allows the topic                           -> :compatible.
+   The remote's grant is selected from the access-handle's FULL grant-list by the remote's VALIDATED
+   handshake-certificate subject name (AUTH-REMOTE-VALIDATED-SUBJECT, surfaced from the §8.7 handshake
+   at :authenticated; §8.7.2.5 — the unforgeable authorization identity, never the self-asserted token).
+   Direction: %REMOTE-WRITER-P decides which §8.4 remote check applies — a remote writer is vetted with
+   CHECK-REMOTE-DATAWRITER (the local read path), a remote reader with CHECK-REMOTE-DATAREADER (the local
+   write path) — over the endpoint's topic name. The auth-remote table is read under the auth manager's
+   lock (the same lock %PARTICIPANT-AUTH-GATE uses). LOCAL is unused (the verdict is per remote subject)."
+  (declare (ignore local))
+  (let ((ah (dp-access-state p))
+        (ms (dp-auth-state p)))
+    (block gate
+      (when (null ah) (return-from gate :compatible))   ; AC OFF: unchanged plain path
+      (when (null ms) (return-from gate :pending))       ; AC requires auth; no auth manager -> fail-closed park
+      (let* ((prefix (%remote-endpoint-prefix remote))
+             ;; snapshot (state . validated-subject) under the lock; the VALIDATED §8.7.2.5 handshake-cert subject, NOT the self-asserted token
+             (snap (dds.pal:with-lock ((auth-manager-state-lock ms))
+                     (let ((ar (gethash prefix (dds.disc:disc-node-auth-state node))))
+                       (when ar (cons (auth-remote-state ar) (auth-remote-validated-subject ar)))))))
+        (when (null snap) (return-from gate :pending))            ; auth-remote not yet recorded
+        (unless (eq (car snap) :keyed) (return-from gate :pending)) ; auth in flight -> park, resumed on :keyed
+        (let ((remote-subject (cdr snap)))                          ; the VALIDATED handshake-cert subject (unforgeable)
+          (when (null remote-subject) (return-from gate :incompatible))   ; no validated subject -> cannot authorize -> deny
+          (let ((grant (find remote-subject (dds.security:access-handle-grants ah)
+                             :key #'dds.security:permissions-subject-name :test #'string=)))
+            (when (null grant) (return-from gate :incompatible))   ; remote subject has no permissions grant -> deny
+            (let* ((topic   (dds.rtps.discovery:endpoint-data-topic-name remote))
+                   (allowed (if (%remote-writer-p remote)
+                                (dds.security:check-remote-datawriter ah grant topic)
+                                (dds.security:check-remote-datareader ah grant topic))))
+              (if allowed :compatible :incompatible))))))))
+
+;;; --- installer (mirror %INSTALL-AUTH-MANAGER) ---
+
+(defun* %install-access-control (p access-handle)
+    (function (domain-participant dds.security:access-handle) domain-participant)
+  "Store ACCESS-HANDLE (the participant's validated §8.4 Governance + shared Permissions, owning the
+   Permissions-CA X509_STORE*) in P's DP-ACCESS-STATE and install %PARTICIPANT-PERMISSIONS-GATE on P's
+   disc-node PERMISSIONS-GATE hook (composed after the Slice-2 auth-gate). Installed ONLY for an
+   access-controlled participant (governance + permissions configured AND an identity); a participant
+   with no permissions keeps DP-ACCESS-STATE NIL and the gate stays :compatible (byte-identical plain
+   path). DELETE-PARTICIPANT frees the held access-handle. Returns P."
+  (setf (dp-access-state p) access-handle)
+  (setf (dds.disc:disc-node-permissions-gate (dp-node p))
+        (lambda (node remote local) (%participant-permissions-gate p node remote local)))
+  p)

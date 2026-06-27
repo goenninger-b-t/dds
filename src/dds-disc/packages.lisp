@@ -72,4 +72,6 @@
            ;; WP-DDS-SECURITY-AUTH-KEYX T4: auth extension points (DDS-Security 1.1 §7.3/7.4.3.2)
            #:disc-node-on-participant-discovered
            #:disc-node-auth-gate
-           #:disc-node-auth-state))
+           #:disc-node-auth-state
+           ;; WP-DDS-SECURITY-ACCESS-CONTROL T4: access-control gate (DDS-Security 1.1 §8.4)
+           #:disc-node-permissions-gate))

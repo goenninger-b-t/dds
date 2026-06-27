@@ -210,6 +210,8 @@
   (auth-gate nil :type (or null function))
   ;; DDS-Security 1.1 §7.3: manager-owned per-participant auth state (12-octet prefix -> opaque).
   (auth-state (make-hash-table :test 'equalp) :type hash-table)
+  ;; DDS-Security 1.1 §8.4: access-control gate (node remote local) -> :compatible|:incompatible|:pending; NIL = AC OFF.
+  (permissions-gate nil :type (or null function))
   (mcast-socket nil :type t)
   (mcast-rx-thread nil :type t)
   (rx-thread nil :type t))
@@ -876,6 +878,14 @@
   (let ((gate (disc-node-auth-gate node)))
     (if gate (funcall gate node remote local) :compatible)))
 
+(defun* %consult-permissions-gate (node remote local)
+    (function (disc-node dds.rtps.discovery:endpoint-data dds.rtps.discovery:endpoint-data) t)
+  "Ask the PERMISSIONS-GATE hook for an access-control verdict on (REMOTE, LOCAL), outside
+   the node lock (receiver thread). A NIL gate — and any verdict other than :incompatible /
+   :pending — proceeds as :compatible (AC OFF = unchanged). DDS-Security 1.1 §8.4."
+  (let ((gate (disc-node-permissions-gate node)))
+    (if gate (funcall gate node remote local) :compatible)))
+
 (defun* %park-match (node direction remote)
     (function (disc-node (member :remote-writer :remote-reader) dds.rtps.discovery:endpoint-data) (eql t))
   "Park a TYPE-GATE :pending match decision as (DIRECTION . REMOTE) (lock-guarded),
@@ -926,8 +936,12 @@
                      (:incompatible nil) ; auth refuses unauthenticated peer; no INCONSISTENT_TOPIC
                      (:pending (%park-match node direction remote)
                                (return-from %match-remote-endpoint t))
-                     (t (when (%record-match node remote) (%fire-match node direction remote))
-                        (return-from %match-remote-endpoint t))))))
+                     (t (case (%consult-permissions-gate node remote local)
+                          (:incompatible nil) ; access denied; no INCONSISTENT_TOPIC
+                          (:pending (%park-match node direction remote)
+                                    (return-from %match-remote-endpoint t))
+                          (t (when (%record-match node remote) (%fire-match node direction remote))
+                             (return-from %match-remote-endpoint t))))))))
           ((string= (dds.rtps.discovery:endpoint-data-topic-name remote)
                     (dds.rtps.discovery:endpoint-data-topic-name local))
            (if (string= (dds.rtps.discovery:endpoint-data-type-name remote)

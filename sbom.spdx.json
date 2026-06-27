@@ -3,7 +3,7 @@
   "@graph": [
     {
       "@id": "_:creationinfo",
-      "created": "2026-06-26T14:02:24Z",
+      "created": "2026-06-27T08:50:55Z",
       "createdBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
       ],
@@ -52,6 +52,12 @@
     },
     {
       "creationInfo": "_:creationinfo",
+      "name": "Robert P. Goldman (rpgoldman)",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/Robert-P.-Goldman-rpgoldman",
+      "type": "Organization"
+    },
+    {
+      "creationInfo": "_:creationinfo",
       "name": "common-lisp-dds scripts/generate-sbom.py",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#tool/generate-sbom",
       "type": "Tool"
@@ -90,8 +96,8 @@
       "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
       "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
       "software_homePage": "https://github.com/goenninger-b-t/dds",
-      "software_packageUrl": "pkg:github/goenninger-b-t/dds@51bf495",
-      "software_packageVersion": "0.0.0-dev+git.51bf495",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@37ba964",
+      "software_packageVersion": "0.0.0-dev+git.37ba964",
       "software_primaryPurpose": "library",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
@@ -185,6 +191,28 @@
       "type": "Relationship"
     },
     {
+      "creationInfo": "_:creationinfo",
+      "name": "xmls",
+      "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
+      "software_downloadLocation": "https://github.com/rpgoldman/xmls",
+      "software_packageUrl": "pkg:generic/xmls",
+      "software_packageVersion": "3.3.0",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/xmls",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/Robert-P.-Goldman-rpgoldman",
+      "type": "software_Package"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-xmls",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/xmls"
+      ],
+      "type": "Relationship"
+    },
+    {
       "comment": "Common Lisp runtime (alternative landed target: Clasp). SBCL is public-domain with BSD/MIT portions -> declared licence omitted (NOASSERTION).",
       "creationInfo": "_:creationinfo",
       "name": "sbcl",
@@ -244,12 +272,14 @@
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
         "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
+        "https://github.com/goenninger-b-t/dds/sbom#package/xmls",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
         "https://github.com/goenninger-b-t/dds/sbom#package/openssl",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-cffi",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-chipz",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-static-vectors",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-xmls",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-openssl"
       ],
@@ -272,6 +302,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-CFFI-authors",
         "https://github.com/goenninger-b-t/dds/sbom#agent/Nathan-Froyd",
         "https://github.com/goenninger-b-t/dds/sbom#agent/Stelian-Ionescu-sionescu",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/Robert-P.-Goldman-rpgoldman",
         "https://github.com/goenninger-b-t/dds/sbom#tool/generate-sbom",
         "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
         "https://github.com/goenninger-b-t/dds/sbom#license/CC0-1.0",
@@ -282,6 +313,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
         "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
+        "https://github.com/goenninger-b-t/dds/sbom#package/xmls",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-OpenSSL-Project",
         "https://github.com/goenninger-b-t/dds/sbom#package/openssl",

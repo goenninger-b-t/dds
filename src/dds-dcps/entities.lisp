@@ -34,12 +34,15 @@
    (user-reader :initform nil :accessor dp-user-reader)   ; v1: one DataReader per participant
    (user-writer :initform nil :accessor dp-user-writer)   ; v1: one DataWriter per participant
    (type-gate-state :initform nil :accessor dp-type-gate-state)   ; FR-TYPE-4 gate (type-gate.lisp)
-   (auth-state :initform nil :accessor dp-auth-state))   ; DDS-Security 1.1 §8.7 auth manager (auth-manager.lisp)
+   (auth-state :initform nil :accessor dp-auth-state)   ; DDS-Security 1.1 §8.7 auth manager (auth-manager.lisp)
+   (access-state :initform nil :accessor dp-access-state))   ; DDS-Security 1.1 §8.4 AccessControl manager (access-control.lisp)
   (:documentation "DDS DomainParticipant: owns a multicast disc-node for its domain and
    its contained entities. v1 holds one DataReader + one DataWriter per participant.
    TYPE-GATE-STATE carries the FR-TYPE-4 assignability gate's TypeObject/verdict caches.
    AUTH-STATE carries the DDS-Security §8.7 authentication manager's local identity +
-   per-remote handshake/key state (NIL = security OFF; see auth-manager.lisp)."))
+   per-remote handshake/key state (NIL = security OFF; see auth-manager.lisp).
+   ACCESS-STATE holds the DDS-Security §8.4 AccessControl access-handle (validated Governance +
+   shared Permissions) driving the permissions-gate (NIL = access-control OFF; see access-control.lisp)."))
 
 (defclass publisher (entity)
   ((participant :initarg :participant :reader pub-participant)
@@ -116,6 +119,11 @@
 ;; create-participant can install the DDS-Security §8.7 auth manager when an identity is configured.
 (declaim (ftype (function (domain-participant dds.security:identity-handle) domain-participant)
                 %install-auth-manager))
+
+;; Defined in access-control.lisp (loaded after this file); forward-declared so create-participant
+;; can install the DDS-Security §8.4 AccessControl manager when governance + permissions are configured.
+(declaim (ftype (function (domain-participant dds.security:access-handle) domain-participant)
+                %install-access-control))
 
 ;; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): forward-declared so create-datareader / delete-participant (defined
 ;; above their bodies in this file) reach the loan helpers without a compile-time undefined-function warning.
@@ -286,10 +294,41 @@
     (loop for i from 3 below 12 do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
+(defun* %validate-access-config (identity permissions-ca governance permissions)
+    (function ((or dds.security:identity-handle null)
+               (or (simple-array (unsigned-byte 8) (*)) null)
+               (or (simple-array (unsigned-byte 8) (*)) null)
+               (or (simple-array (unsigned-byte 8) (*)) null))
+              (or dds.security:access-handle null))
+  "DDS-Security 1.1 §8.4: validate a participant's AccessControl configuration, returning the
+   ACCESS-HANDLE to install, or NIL when AccessControl is OFF (any of IDENTITY / PERMISSIONS-CA /
+   GOVERNANCE / PERMISSIONS absent — AC requires an authenticated identity plus both signed §9.4
+   documents). When all are supplied: CMS-verify the signed Governance + Permissions against the
+   Permissions CA and bind the LOCAL grant by the identity cert's subject name
+   (validate-local-permissions), then gate check_create_participant (§8.4.2.3). Fail-closed: an
+   invalid/denied config SIGNALS a clear error (the participant does not join), freeing the handle on a
+   check_create_participant denial. Validated up-front (before the engine opens) so the error path
+   leaks no node."
+  (when (and identity permissions-ca governance permissions)
+    (let ((subject (dds.dare:x509-subject-name (dds.security:identity-handle-cert identity))))
+      (unless subject
+        (error "create-participant: could not extract subject name from the identity certificate"))
+      (let ((ah (dds.security:validate-local-permissions permissions-ca governance permissions subject)))
+        (unless ah
+          (error "create-participant: AccessControl validate-local-permissions failed (bad Permissions CA / Governance / Permissions signature, or subject ~s not granted)"
+                 subject))
+        (unless (dds.security:check-create-participant ah)
+          (dds.security:free-access-handle ah)
+          (error "create-participant: AccessControl check_create_participant denied subject ~s" subject))
+        ah))))
+
 (defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1") (peers nil)
-                                 (identity nil))
+                                 (identity nil) (permissions-ca nil) (governance nil) (permissions nil))
     (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string) (:peers list)
-                    (:identity t))
+                    (:identity t)
+                    (:permissions-ca (or (simple-array (unsigned-byte 8) (*)) null))
+                    (:governance (or (simple-array (unsigned-byte 8) (*)) null))
+                    (:permissions (or (simple-array (unsigned-byte 8) (*)) null)))
               domain-participant)
   "DomainParticipantFactory::create_participant — open the RTPS engine (a multicast
    disc-node) for DOMAIN, install the match/incompatible-QoS hooks that surface DDS
@@ -303,34 +342,54 @@
    advertises its IdentityToken + PSM bits in SPDP and the auth manager is installed, so the
    participant authenticates every discovered security-enabled peer over the §7.4.3 PSM wire,
    exchanges §9.5.2 key material, and STRICTLY refuses unauthenticated peers (the conformant
-   default). NIL (default) = security OFF, byte-identical plain participant."
-  (let* ((node (dds.disc:make-disc-node :domain domain :multicast t
-                                        :advertise-address advertise-address
-                                        :peers peers
-                                        :guid-prefix (%make-guid-prefix)
-                                        :identity-token-octets
-                                        (when identity (dds.security:identity-token identity))))
-         (p (make-instance 'domain-participant :domain domain :node node :qos qos :enabled t)))
-    ;; Install hooks BEFORE the receiver thread starts so no early SEDP match is lost.
-    (setf (dds.disc:disc-node-on-match node)
-          (lambda (kind remote) (%on-disc-match p kind remote)))
-    (setf (dds.disc:disc-node-on-unmatch node)
-          (lambda (direction remote) (%on-disc-unmatch p direction remote)))
-    (setf (dds.disc:disc-node-on-liveliness-changed node)
-          (lambda (guid alive-p) (%on-disc-liveliness-changed p guid alive-p)))
-    (setf (dds.disc:disc-node-on-lifecycle-event node)
-          (lambda (wid sn kind kh sf) (%on-disc-lifecycle p wid sn kind kh sf)))
-    (setf (dds.disc:disc-node-on-incompatible-qos node)
-          (lambda (kind remote bad) (%on-disc-incompatible p kind remote bad)))
-    (setf (dds.disc:disc-node-on-sample node)
-          (lambda () (%on-participant-sample p)))
-    (setf (dds.disc:disc-node-on-inconsistent-topic node)
-          (lambda (topic-name) (%on-disc-inconsistent-topic p topic-name)))
-    (%install-type-gate p)   ; FR-TYPE-4 assignability gate (type-gate.lisp)
-    (when identity           ; DDS-Security §8.7 auth manager — only for a security-enabled participant
-      (%install-auth-manager p identity))
-    (dds.disc:start-node node)
-    p))
+   default). NIL (default) = security OFF, byte-identical plain participant.
+   PERMISSIONS-CA / GOVERNANCE / PERMISSIONS (DDS-Security 1.1 §8.4 AccessControl): optional octet
+   vectors — the Permissions CA certificate (PEM) plus the S/MIME-signed Governance and Permissions
+   documents (§9.4). When ALL THREE are supplied AND an IDENTITY is configured, the participant is
+   ACCESS-CONTROLLED: validate-local-permissions CMS-verifies both documents against the Permissions CA,
+   binds the LOCAL grant by the identity cert's subject name, gates check_create_participant, installs the
+   permissions-gate (composed after the auth-gate), and the participant matches a remote endpoint only
+   when the remote's validated handshake-cert subject is granted the topic. A failed validation or a denied
+   check_create_participant SIGNALS an error (fail-closed). NIL (default) = access-control OFF,
+   byte-identical."
+  ;; DDS-Security §8.4: validate the AccessControl config BEFORE opening the engine so an invalid or
+  ;; denied config fails closed with no node leak; the resulting handle is installed once the node exists.
+  (let ((access-handle (%validate-access-config identity permissions-ca governance permissions))
+        (installed nil))   ; T once the participant is fully constructed and will be returned
+    (unwind-protect
+        (let* ((node (dds.disc:make-disc-node :domain domain :multicast t
+                                              :advertise-address advertise-address
+                                              :peers peers
+                                              :guid-prefix (%make-guid-prefix)
+                                              :identity-token-octets
+                                              (when identity (dds.security:identity-token identity))))
+               (p (make-instance 'domain-participant :domain domain :node node :qos qos :enabled t)))
+          ;; Install hooks BEFORE the receiver thread starts so no early SEDP match is lost.
+          (setf (dds.disc:disc-node-on-match node)
+                (lambda (kind remote) (%on-disc-match p kind remote)))
+          (setf (dds.disc:disc-node-on-unmatch node)
+                (lambda (direction remote) (%on-disc-unmatch p direction remote)))
+          (setf (dds.disc:disc-node-on-liveliness-changed node)
+                (lambda (guid alive-p) (%on-disc-liveliness-changed p guid alive-p)))
+          (setf (dds.disc:disc-node-on-lifecycle-event node)
+                (lambda (wid sn kind kh sf) (%on-disc-lifecycle p wid sn kind kh sf)))
+          (setf (dds.disc:disc-node-on-incompatible-qos node)
+                (lambda (kind remote bad) (%on-disc-incompatible p kind remote bad)))
+          (setf (dds.disc:disc-node-on-sample node)
+                (lambda () (%on-participant-sample p)))
+          (setf (dds.disc:disc-node-on-inconsistent-topic node)
+                (lambda (topic-name) (%on-disc-inconsistent-topic p topic-name)))
+          (%install-type-gate p)   ; FR-TYPE-4 assignability gate (type-gate.lisp)
+          (when identity           ; DDS-Security §8.7 auth manager — only for a security-enabled participant
+            (%install-auth-manager p identity))
+          (when access-handle      ; DDS-Security §8.4 AccessControl manager — validated above, install the gate
+            (%install-access-control p access-handle))
+          (dds.disc:start-node node)
+          (setf installed t)   ; construction complete; p owns the access-handle via dp-access-state
+          p)
+      ;; Free the access-handle on a non-local exit ONLY if not yet installed (install transfers ownership).
+      (when (and access-handle (not installed))
+        (dds.security:free-access-handle access-handle)))))
 
 (defun* delete-participant (p)
     (function (domain-participant) (eql t))
@@ -341,6 +400,12 @@
    case: ZC off / non-FlatData)."
   (dolist (dr (%participant-readers p)) (return-all-loans dr))
   (dds.disc:stop-node (dp-node p))
+  ;; DDS-Security §8.4: release the participant-owned AccessControl handle (its Permissions-CA X509_STORE*);
+  ;; create-participant created it internally, so the participant owns it. Null-safe + idempotent.
+  (let ((ah (dp-access-state p)))
+    (when ah
+      (dds.security:free-access-handle ah)
+      (setf (dp-access-state p) nil)))
   (setf (entity-enabled-p p) nil)
   t)
 
@@ -414,8 +479,15 @@
     (function (publisher topic &key (:qos t)) data-writer)
   "Publisher::create_datawriter — register a local writer in the engine on the
    topic's name/type with the QoS reliability (v1: the single user writer); the
-   endpoint kind (WITH_KEY/NO_KEY) is selected from the topic type's keyed-ness."
-  (let ((node (dp-node (pub-participant pub))))
+   endpoint kind (WITH_KEY/NO_KEY) is selected from the topic type's keyed-ness.
+   DDS-Security §8.4.2.4: when the participant is access-controlled, check_create_datawriter must
+   grant publish on the topic (local Permissions + Governance write-AC toggle) or the writer is
+   refused (fail-closed SIGNAL). No access-state (default) = unchecked, byte-identical."
+  (let ((node (dp-node (pub-participant pub)))
+        (ah (dp-access-state (pub-participant pub))))
+    (when (and ah (not (dds.security:check-create-datawriter ah (topic-name topic))))
+      (error "create-datawriter: AccessControl check_create_datawriter denied publish on topic ~s"
+             (topic-name topic)))
     (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
                                :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))
@@ -432,8 +504,15 @@
    topic's name/type with the QoS reliability (v1: the single user reader). TOPIC may
    be a Topic or a ContentFilteredTopic; in the latter case the reader applies the
    filter predicate reader-side (only matching samples reach read/take). The
-   endpoint kind (WITH_KEY/NO_KEY) is selected from the topic type's keyed-ness."
-  (let ((node (dp-node (sub-participant sub))))
+   endpoint kind (WITH_KEY/NO_KEY) is selected from the topic type's keyed-ness.
+   DDS-Security §8.4.2.5: when the participant is access-controlled, check_create_datareader must
+   grant subscribe on the topic (local Permissions + Governance read-AC toggle) or the reader is
+   refused (fail-closed SIGNAL). No access-state (default) = unchecked, byte-identical."
+  (let ((node (dp-node (sub-participant sub)))
+        (ah (dp-access-state (sub-participant sub))))
+    (when (and ah (not (dds.security:check-create-datareader ah (topic-name topic))))
+      (error "create-datareader: AccessControl check_create_datareader denied subscribe on topic ~s"
+             (topic-name topic)))
     (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
                                :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))

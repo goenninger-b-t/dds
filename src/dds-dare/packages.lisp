@@ -68,4 +68,6 @@
    #:ffdh-gen-keypair
    #:ffdh-compute
    #:rsa-pss-sign
-   #:rsa-pss-verify))
+   #:rsa-pss-verify
+   ;; T1 (WP-DDS-SECURITY-ACCESS-CONTROL): CMS S/MIME verification (§9.4.1.1 Permissions CA)
+   #:cms-verify))

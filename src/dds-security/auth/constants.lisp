@@ -288,3 +288,11 @@
       (or (uiop:getenv "DDS_REPO_ROOT")
           (asdf:system-source-directory :dds-security))))
   "Root directory of the test-PKI fixture (interop/security-auth/pki/).")
+
+(defparameter +test-ac-pki-root+
+    (uiop:pathname-directory-pathname
+     (merge-pathnames
+      "interop/security-access-control/pki/"
+      (or (uiop:getenv "DDS_REPO_ROOT")
+          (asdf:system-source-directory :dds-security))))
+  "Root directory of the access-control test-PKI fixture (interop/security-access-control/pki/).")

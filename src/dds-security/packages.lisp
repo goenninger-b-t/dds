@@ -33,6 +33,7 @@
    #:decode-serialized-payload
    ;; Auth T1: PKI identity (§8.7 / §9.3) — DDS-Security 1.1 Authentication plugin
    #:+test-pki-root+
+   #:+test-ac-pki-root+
    #:identity-handle
    #:identity-handle-p
    #:identity-handle-cert
@@ -60,6 +61,7 @@
    #:handshake-handle
    #:handshake-handle-p
    #:handshake-handle-state
+   #:handshake-handle-peer-subject
    #:handshake-handle-shared-secret
    #:shared-secret-handle
    #:shared-secret-handle-p
@@ -98,4 +100,41 @@
    #:serialize-crypto-token
    #:parse-crypto-token
    #:make-crypto-token-message
-   #:parse-crypto-token-message))
+   #:parse-crypto-token-message
+   ;; T2: AccessControl Governance/Permissions data model + parser + matcher (WP-DDS-SECURITY-ACCESS-CONTROL)
+   #:governance
+   #:make-governance
+   #:governance-p
+   #:governance-allow-unauthenticated
+   #:governance-enable-join-ac
+   #:governance-topic-rules
+   #:parse-governance
+   #:governance-topic-rule
+   #:permissions
+   #:make-permissions
+   #:permissions-p
+   #:permissions-subject-name
+   #:permissions-not-before
+   #:permissions-not-after
+   #:permissions-default
+   #:permissions-rules
+   #:parse-permissions
+   #:permissions-allow-publish-p
+   #:permissions-allow-subscribe-p
+   ;; T3: AccessControl plugin — validate + check predicates (WP-DDS-SECURITY-ACCESS-CONTROL)
+   #:access-handle
+   #:make-access-handle
+   #:access-handle-p
+   #:access-handle-governance
+   #:access-handle-permissions
+   #:access-handle-grants
+   #:access-handle-ca-store
+   #:access-handle-subject
+   #:validate-local-permissions
+   #:free-access-handle
+   #:validate-remote-permissions
+   #:check-create-participant
+   #:check-create-datawriter
+   #:check-create-datareader
+   #:check-remote-datawriter
+   #:check-remote-datareader))
