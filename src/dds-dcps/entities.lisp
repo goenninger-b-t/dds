@@ -308,7 +308,9 @@
    (validate-local-permissions), then gate check_create_participant (§8.4.2.3). Fail-closed: an
    invalid/denied config SIGNALS a clear error (the participant does not join), freeing the handle on a
    check_create_participant denial. Validated up-front (before the engine opens) so the error path
-   leaks no node."
+   leaks no node. The *_WITH_ORIGIN_AUTHENTICATION discovery tier (receiver-specific MACs for the builtin
+   secure-SEDP endpoints, §9.5.3.3.4.3) is now WIRED (T-ORIGINAUTH), so it is accepted here — its origin-auth
+   flag is carried to the disc-node by %install-access-control (no longer refused)."
   (when (and identity permissions-ca governance permissions)
     (let ((subject (dds.dare:x509-subject-name (dds.security:identity-handle-cert identity))))
       (unless subject
@@ -320,11 +322,17 @@
         (unless (dds.security:check-create-participant ah)
           (dds.security:free-access-handle ah)
           (error "create-participant: AccessControl check_create_participant denied subject ~s" subject))
+        ;; T-ORIGINAUTH: the *_WITH_ORIGIN_AUTHENTICATION secure-discovery tier (receiver-specific MACs,
+        ;; DDS-Security 1.1 §9.5.3.3.4.3) is now WIRED for the builtin secure-SEDP endpoints (origin-auth
+        ;; EntityCrypto registration + receiver-key exchange + per-receiver MACs), so it is no longer refused
+        ;; here — %install-access-control reads protection-kind-base's origin-auth flag onto the disc-node.
         ah))))
 
 (defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1") (peers nil)
+                                 (port 0)
                                  (identity nil) (permissions-ca nil) (governance nil) (permissions nil))
     (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string) (:peers list)
+                    (:port (unsigned-byte 16))
                     (:identity t)
                     (:permissions-ca (or (simple-array (unsigned-byte 8) (*)) null))
                     (:governance (or (simple-array (unsigned-byte 8) (*)) null))
@@ -337,6 +345,9 @@
    (FR-DISC-4) layered on top of multicast — e.g. ((\"127.0.0.1\" . 7410)) reaches a
    same-host peer over loopback when the macOS application firewall silently drops
    LAN-sourced UDP for an unapproved peer binary.
+   PORT (default 0 = ephemeral) binds the metatraffic unicast socket to a FIXED port and
+   advertises it, so a foreign peer can list us in its initialPeers and unicast SPDP back
+   over loopback (the cross-vendor secure-discovery interop reachability pattern, FR-DISC-4).
    IDENTITY (DDS-Security 1.1 §8.7): an optional dds.security:identity-handle from
    validate-local-identity. When supplied the participant is SECURITY-ENABLED — the node
    advertises its IdentityToken + PSM bits in SPDP and the auth manager is installed, so the
@@ -359,7 +370,7 @@
     (unwind-protect
         (let* ((node (dds.disc:make-disc-node :domain domain :multicast t
                                               :advertise-address advertise-address
-                                              :peers peers
+                                              :peers peers :port port
                                               :guid-prefix (%make-guid-prefix)
                                               :identity-token-octets
                                               (when identity (dds.security:identity-token identity))))

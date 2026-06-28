@@ -1011,6 +1011,411 @@
                                         i (length sealed)))))))
       (setf dek (dds.dare:free-secret-octets dek)))))
 
+;;;; WP-DDS-SECURITY-SECURE-DISCOVERY T2 — §8.5.1.7-.9 submessage-protection decode fuzz.
+;;;; The decode path (decode-datawriter-submessage / decode-datareader-submessage) is UNTRUSTED: it
+;;;; parses a SEC_PREFIX ... SEC_POSTFIX bracket off the wire (a SEC_BODY for ENCRYPT; the original
+;;;; submessage verbatim for SIGN, §9.5.3.3.4.3). For ANY input it MUST return NIL or
+;;;; the CORRECT plaintext — NEVER an OOB read, crash, signal, partial decode, or a TAMPERED plaintext
+;;;; (NFR-SEC-POSTURE; the operating contract §4). A (safety 0) wrapper confirms the bracket/bounds
+;;;; guards are safety-independent (same verdict).
+
+(defun* %decode-dw-submessage-safety0 (km secured)
+    (function (dds.security:key-material (simple-array (unsigned-byte 8) (*)))
+              (or (simple-array (unsigned-byte 8) (*)) null))
+  "Call DECODE-DATAWRITER-SUBMESSAGE under (SAFETY 0). The bracket guards (submessageId/order + every
+   field's check-room) are EXPLICIT, hence safety-independent: this must reach the SAME verdict (NIL vs
+   the exact plaintext) as the production-policy call. An OOB would corrupt/crash rather than return."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (dds.security:decode-datawriter-submessage km secured))
+
+(defun* %decode-dr-submessage-safety0 (km secured)
+    (function (dds.security:key-material (simple-array (unsigned-byte 8) (*)))
+              (or (simple-array (unsigned-byte 8) (*)) null))
+  "Call DECODE-DATAREADER-SUBMESSAGE under (SAFETY 0) (see %decode-dw-submessage-safety0)."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (dds.security:decode-datareader-submessage km secured))
+
+(defun* %gen-submessage-decode-case (prng v-enc v-sgn)
+    (function (prng (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (values (simple-array (unsigned-byte 8) (*)) t))
+  "Generate one adversarial submessage-decode case: (values BLOB MUST-ACCEPT-P). MUST-ACCEPT-P is T
+   only for a faithful encoding that MUST decode to the plaintext (a pristine ENCRYPT/SIGN blob, or a
+   pristine blob with trailing bytes — decode stops after SEC_POSTFIX, so trailing = the next
+   submessage). Otherwise NIL: the blob MUST decode to NIL-or-the-correct-plaintext (never a tampered
+   one) — a 1-octet mutation (often rejected; a flip in an ignored octetsToNextHeader/flags field
+   still yields the correct plaintext, which is fine), a truncation, pure-random, all-zero, or a
+   corrupted submessageId."
+  (let ((family (prng-int prng 0 8)))
+    (case family
+      (0 (values (copy-seq v-enc) t))                                       ; pristine ENCRYPT -> accept
+      (1 (values (copy-seq v-sgn) t))                                       ; pristine SIGN -> accept
+      (2 (let* ((b (copy-seq (if (oddp (prng-next prng)) v-enc v-sgn)))     ; 1-octet flip
+                (p (prng-int prng 0 (1- (length b)))))
+           (setf (aref b p) (logxor (aref b p) (1+ (prng-int prng 0 254))))
+           (values b nil)))
+      (3 (let* ((src (if (oddp (prng-next prng)) v-enc v-sgn))              ; strict truncation
+                (n (prng-int prng 0 (1- (length src)))))
+           (values (subseq src 0 n) nil)))
+      (4 (let* ((n (prng-int prng 0 200))                                   ; pure random
+                (b (make-array n :element-type '(unsigned-byte 8))))
+           (dotimes (i n) (setf (aref b i) (prng-int prng 0 255)))
+           (values b nil)))
+      (5 (values (make-array (prng-int prng 0 200) :element-type '(unsigned-byte 8) :initial-element 0)
+                 nil))                                                      ; all-zero
+      (6 (let* ((extra (prng-int prng 1 64))                               ; pristine + trailing -> accept
+                (out (make-array (+ (length v-enc) extra) :element-type '(unsigned-byte 8))))
+           (replace out v-enc)
+           (loop for i from (length v-enc) below (length out)
+                 do (setf (aref out i) (prng-int prng 0 255)))
+           (values out t)))
+      (7 (let ((b (copy-seq v-enc)))                                        ; clobber ENCRYPT SEC_PREFIX id
+           (setf (aref b 0) (prng-int prng 0 255))
+           (values b nil)))
+      (t (let ((b (copy-seq v-sgn)))                                        ; clobber SIGN SEC_POSTFIX id (offset 56; no SEC_BODY for SIGN)
+           (setf (aref b 56) (prng-int prng 0 255))
+           (values b nil))))))
+
+(defun* fuzz-submessage-protection ()
+    (function () t)
+  "Property-based fuzz of the UNTRUSTED §8.5.1.7-.9 submessage-protection decode path
+   (decode-datawriter-submessage + decode-datareader-submessage; WP-DDS-SECURITY-SECURE-DISCOVERY T2,
+   NFR-SEC-POSTURE). Two genuinely-secured seeds (ENCRYPT + SIGN of a fixed submessage under the test
+   key) plus a large corpus of adversarial blobs (1-octet mutations, truncations, pure-random,
+   all-zero, trailing-garbage, corrupted submessageIds) are decoded by BOTH the datawriter and
+   datareader decoders (the §8.5 transforms are the same mechanism) under BOTH production policy and a
+   (safety 0) wrapper. Invariants: a pristine blob (+/- trailing) decodes to the exact plaintext; every
+   other input decodes to NIL or the correct plaintext, NEVER a tampered plaintext, OOB, crash, or
+   escaping signal; all four arms agree (writer==reader, production==safety0). SKIPs cleanly if
+   OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL + Clasp."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [submessage-protection-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from fuzz-submessage-protection t)))
+  (let* ((prng  (make-prng #x5EC5B2))
+         (iters 2500)
+         (sub   (%t2-fixed-plain-submessage))
+         (v-enc (dds.security:encode-datawriter-submessage (dds.security:make-test-key-material) :encrypt sub))
+         (v-sgn (dds.security:encode-datawriter-submessage (dds.security:make-test-key-material) :sign sub))
+         (km    (dds.security:make-test-key-material)))   ; same fixed key -> decode re-derives correctly
+    (dotimes (i iters t)
+      (multiple-value-bind (blob accept-p) (%gen-submessage-decode-case prng v-enc v-sgn)
+        (flet ((run (thunk who)
+                 (handler-case (funcall thunk)
+                   (error (e)
+                     (error 'test-failure :name "submessage-protection-fuzz"
+                            :detail (format nil "iter ~d len ~d: ~a signalled (must fail-closed to NIL): ~a"
+                                            i (length blob) who e))))))
+          (let ((dw  (run (lambda () (dds.security:decode-datawriter-submessage km blob)) "datawriter decode"))
+                (dw0 (run (lambda () (%decode-dw-submessage-safety0 km blob)) "(safety 0) datawriter decode"))
+                (dr  (run (lambda () (dds.security:decode-datareader-submessage km blob)) "datareader decode"))
+                (dr0 (run (lambda () (%decode-dr-submessage-safety0 km blob)) "(safety 0) datareader decode")))
+            ;; pristine (+/- trailing) MUST decode to the exact plaintext.
+            (when (and accept-p (not (%dare-octets= dw sub)))
+              (error 'test-failure :name "submessage-protection-fuzz"
+                     :detail (format nil "iter ~d len ~d: faithful blob did NOT decode to the plaintext (got ~a)"
+                                     i (length blob) (if dw "other" "NIL"))))
+            ;; any input MUST be NIL or the CORRECT plaintext — never a tampered/different one.
+            (unless (or (null dw) (%dare-octets= dw sub))
+              (error 'test-failure :name "submessage-protection-fuzz"
+                     :detail (format nil "iter ~d len ~d: decode returned a DIFFERENT plaintext (integrity/fail-closed violated)"
+                                     i (length blob))))
+            ;; the four arms must agree (writer==reader mechanism; production==safety0 guards).
+            (unless (and (%dare-octets= dw dr) (%dare-octets= dw dw0) (%dare-octets= dw dr0))
+              (error 'test-failure :name "submessage-protection-fuzz"
+                     :detail (format nil "iter ~d len ~d: decode arms disagree dw/dr/dw0/dr0 = ~a/~a/~a/~a"
+                                     i (length blob) (and dw t) (and dr t) (and dw0 t) (and dr0 t))))))))
+    (format t "~&  [submessage-protection-fuzz] ~d iterations exercised (writer+reader x production+safety0)~%" iters)
+    t))
+
+;;;; WP-DDS-SECURITY-SECURE-DISCOVERY T3 — §9.5.3.3.4.3 origin-authentication decode fuzz.
+;;;; The origin-auth decode path (decode-*-submessage with :my-receiver-key-id/:my-receiver-key) is
+;;;; UNTRUSTED: beyond the common_mac it parses the CryptoFooter receiver_specific_macs (count +
+;;;; {key_id,mac}* — a uint32 count an attacker controls) and verifies THIS receiver's entry. For ANY
+;;;; input it MUST return NIL or the CORRECT plaintext — NEVER an OOB read, crash, signal, partial
+;;;; decode, an unbounded allocation on a hostile count, or a TAMPERED plaintext (NFR-SEC-POSTURE; the
+;;;; operating contract §4). A (safety 0) arm confirms the count cap + bounds guards are safety-independent.
+
+(defun* %decode-dw-oa-safety0 (km secured kid key)
+    (function (dds.security:key-material (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (or (simple-array (unsigned-byte 8) (*)) null))
+  "Call DECODE-DATAWRITER-SUBMESSAGE with origin-auth under (SAFETY 0). The footer count cap
+   (+max-receiver-specific-macs+) + every check-room are EXPLICIT, hence safety-independent: this must
+   reach the SAME verdict as the production-policy origin-auth decode (NFR-SEC-POSTURE)."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (dds.security:decode-datawriter-submessage km secured :my-receiver-key-id kid :my-receiver-key key))
+
+(defun* %gen-oa-decode-case (prng v-oa)
+    (function (prng (simple-array (unsigned-byte 8) (*)))
+              (values (simple-array (unsigned-byte 8) (*)) t t))
+  "Generate one adversarial origin-auth decode case: (values BLOB ACCEPT-P STRICT-NIL-P). The seed V-OA
+   is a genuine 128-octet 2-receiver ENCRYPT origin-auth blob (count at [84..87] LE; receiver #1's entry
+   key_id [88..91] ‖ mac [92..107]; receiver #2 [108..127]). Families: pristine (accept); flip MY (#1)
+   receiver MAC; flip MY key_id; clobber the rsm_count with a HOSTILE/oversized value (> the T1 cap, or
+   huge — must hit the cap/bounds -> NIL); truncate into the footer; pure-random; all-zero; arbitrary
+   1-octet flip. STRICT-NIL-P marks the families that MUST decode to NIL (origin-auth or the footer
+   bound rejects them); the rest obey the general NIL-or-correct-plaintext invariant."
+  (let ((family (prng-int prng 0 7)))
+    (case family
+      (0 (values (copy-seq v-oa) t nil))                                   ; pristine -> accept (right key)
+      (1 (let ((b (copy-seq v-oa))                                          ; flip a byte in MY (#1) MAC [92..107] -> NIL
+                (p (prng-int prng 92 107)))
+           (setf (aref b p) (logxor (aref b p) (1+ (prng-int prng 0 254))))
+           (values b nil t)))
+      (2 (let ((b (copy-seq v-oa))                                          ; flip MY (#1) key_id [88..91] -> NIL (no entry targets me)
+                (p (prng-int prng 88 91)))
+           (setf (aref b p) (logxor (aref b p) (1+ (prng-int prng 0 254))))
+           (values b nil t)))
+      (3 (let* ((b (copy-seq v-oa))                                         ; HOSTILE rsm_count [84..87] LE -> must hit the T1 cap/bounds -> NIL
+                (c (case (prng-int prng 0 4)
+                     (0 #xFFFFFFFF)
+                     (1 (1+ dds.security:+max-receiver-specific-macs+))
+                     (2 #x10000)
+                     (3 #x7FFFFFFF)
+                     (t (+ dds.security:+max-receiver-specific-macs+ 1 (prng-int prng 0 1000000))))))
+           (setf (aref b 84) (logand c #xff)
+                 (aref b 85) (logand (ash c -8) #xff)
+                 (aref b 86) (logand (ash c -16) #xff)
+                 (aref b 87) (logand (ash c -24) #xff))
+           (values b nil t)))
+      (4 (let ((n (prng-int prng 84 127)))                                  ; truncate INTO the footer -> NIL
+           (values (subseq v-oa 0 n) nil t)))
+      (5 (let* ((n (prng-int prng 0 200))                                   ; pure random
+                (b (make-array n :element-type '(unsigned-byte 8))))
+           (dotimes (i n) (setf (aref b i) (prng-int prng 0 255)))
+           (values b nil nil)))
+      (6 (values (make-array (prng-int prng 0 200) :element-type '(unsigned-byte 8) :initial-element 0)
+                 nil nil))                                                  ; all-zero
+      (t (let* ((b (copy-seq v-oa))                                         ; arbitrary 1-octet flip
+                (p (prng-int prng 0 (1- (length b)))))
+           (setf (aref b p) (logxor (aref b p) (1+ (prng-int prng 0 254))))
+           (values b nil nil))))))
+
+(defun* fuzz-submessage-origin-auth ()
+    (function () t)
+  "Property-based fuzz of the UNTRUSTED §9.5.3.3.4.3 origin-authentication decode path
+   (decode-datawriter-submessage with :my-receiver-key-id/:my-receiver-key; WP-DDS-SECURITY-SECURE-
+   DISCOVERY T3, NFR-SEC-POSTURE). A genuine 2-receiver ENCRYPT origin-auth seed (decoded AS receiver #1)
+   plus a large corpus of adversarial footers — flipped receiver MACs, flipped key_ids, HOSTILE/oversized
+   rsm_count (> +max-receiver-specific-macs+, must hit the T1 cap), footer truncations, pure-random,
+   all-zero, arbitrary flips — are decoded under BOTH production policy and a (safety 0) wrapper.
+   Invariants: the pristine seed decodes to the exact plaintext; every other input decodes to NIL or the
+   correct plaintext, NEVER a tampered plaintext, OOB, unbounded allocation, crash, or escaping signal;
+   the MAC/key_id/hostile-count/truncation families are strictly NIL; production==safety0. SKIPs cleanly
+   if OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on SBCL + Clasp."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [submessage-origin-auth-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from fuzz-submessage-origin-auth t)))
+  (let* ((prng  (make-prng #x0A1A2A3))
+         (iters 2500)
+         (sub   (%t2-fixed-plain-submessage))
+         (kid1  (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+                  (setf (aref v 0) #xaa (aref v 1) #xaa (aref v 2) #x00 (aref v 3) #x01) v))
+         (mk1   (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11))
+         (kid2  (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+                  (setf (aref v 0) #xbb (aref v 1) #xbb (aref v 2) #x00 (aref v 3) #x02) v))
+         (mk2   (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x22))
+         (recvs (list (cons kid1 mk1) (cons kid2 mk2)))
+         (v-oa  (dds.security:encode-datawriter-submessage
+                 (dds.security:make-test-key-material) :encrypt sub :receivers recvs))
+         (km    (dds.security:make-test-key-material))   ; same fixed key -> common_mac re-derives correctly
+         (cap-hits 0))
+    (dotimes (i iters t)
+      (multiple-value-bind (blob accept-p strict-nil-p) (%gen-oa-decode-case prng v-oa)
+        (flet ((run (thunk who)
+                 (handler-case (funcall thunk)
+                   (error (e)
+                     (error 'test-failure :name "submessage-origin-auth-fuzz"
+                            :detail (format nil "iter ~d len ~d: ~a signalled (must fail-closed to NIL): ~a"
+                                            i (length blob) who e))))))
+          (let ((d  (run (lambda () (dds.security:decode-datawriter-submessage
+                                     km blob :my-receiver-key-id kid1 :my-receiver-key mk1)) "origin-auth decode"))
+                (d0 (run (lambda () (%decode-dw-oa-safety0 km blob kid1 mk1)) "(safety 0) origin-auth decode")))
+            ;; the pristine seed (decoded as receiver #1, right key) MUST recover the plaintext.
+            (when (and accept-p (not (%dare-octets= d sub)))
+              (error 'test-failure :name "submessage-origin-auth-fuzz"
+                     :detail (format nil "iter ~d: the pristine origin-auth seed did NOT decode to the plaintext (got ~a)"
+                                     i (if d "other" "NIL"))))
+            ;; any input MUST be NIL or the CORRECT plaintext — never a tampered/different one.
+            (unless (or (null d) (%dare-octets= d sub))
+              (error 'test-failure :name "submessage-origin-auth-fuzz"
+                     :detail (format nil "iter ~d len ~d: origin-auth decode returned a DIFFERENT plaintext (integrity/fail-closed violated)"
+                                     i (length blob))))
+            ;; MAC/key_id-flip, hostile-count, truncation families MUST be strictly NIL (the gate / the cap).
+            (when (and strict-nil-p d)
+              (error 'test-failure :name "submessage-origin-auth-fuzz"
+                     :detail (format nil "iter ~d len ~d: a receiver-MAC/key_id/hostile-count/truncation blob decoded NON-NIL (origin-auth or the T1 cap failed to reject)"
+                                     i (length blob))))
+            (when strict-nil-p (incf cap-hits))
+            ;; production and (safety 0) must reach the same verdict.
+            (unless (%dare-octets= d d0)
+              (error 'test-failure :name "submessage-origin-auth-fuzz"
+                     :detail (format nil "iter ~d len ~d: production vs (safety 0) origin-auth decode disagree (~a/~a)"
+                                     i (length blob) (and d t) (and d0 t))))))))
+    (format t "~&  [submessage-origin-auth-fuzz] ~d iterations exercised (~d strict-reject incl. hostile receiver-mac counts hitting the T1 cap; production+safety0)~%"
+            iters cap-hits)
+    t))
+
+;;;; WP-DDS-SECURITY-SECURE-DISCOVERY T4 — §8.5.1.10-.12 whole-RTPS-message protection decode fuzz.
+;;;; decode-rtps-message is UNTRUSTED: it parses the SRTPS_PREFIX(0x33) -> {SEC_BODY (ENCRYPT) | verbatim
+;;;; submessage STREAM (SIGN, located by WALKING the stream)} -> SRTPS_POSTFIX(0x34) bracket + the
+;;;; CryptoFooter (a uint32 rsm_count an attacker controls). For ANY input it MUST return NIL or the
+;;;; CORRECT submessage stream — NEVER an OOB read, crash, signal, partial/tampered stream, unbounded
+;;;; allocation on a hostile count, or a non-terminating SIGN walk (NFR-SEC-POSTURE; the operating contract
+;;;; §4). A (safety 0) arm confirms the bracket/walk/count guards are safety-independent.
+
+(defun* %decode-rtps-message-safety0 (km srtps)
+    (function (dds.security:key-material (simple-array (unsigned-byte 8) (*)))
+              (or (simple-array (unsigned-byte 8) (*)) null))
+  "Call DECODE-RTPS-MESSAGE under (SAFETY 0). The bracket guards (submessageId/order + every field's
+   check-room) and the SIGN walk's per-iteration check-room are EXPLICIT, hence safety-independent: this
+   must reach the SAME verdict (NIL vs the exact stream) as the production-policy call (NFR-SEC-POSTURE)."
+  (declare (optimize (speed 3) (safety 0) (debug 0)))
+  (dds.security:decode-rtps-message km srtps))
+
+(defun* %gen-rtps-decode-case (prng v-enc v-sgn)
+    (function (prng (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (values (simple-array (unsigned-byte 8) (*)) t t))
+  "Generate one adversarial whole-RTPS decode case: (values BLOB ACCEPT-P STRICT-NIL-P). V-ENC is a genuine
+   100-octet ENCRYPT seed (rsm_count at [96..99] LE; SRTPS_POSTFIX id at [76]; SEC_BODY id at [24]); V-SGN a
+   genuine 92-octet SIGN seed (SRTPS_POSTFIX id at [68]). ACCEPT-P marks a faithful encoding that MUST decode
+   to the stream (pristine, or pristine+trailing — decode stops after SRTPS_POSTFIX). STRICT-NIL-P marks the
+   families that MUST decode to NIL (bracket/postfix corruption, hostile count, truncation); the rest obey
+   the general NIL-or-correct-stream invariant (a flip in an ignored octetsToNextHeader/flags octet of a SIGN
+   body submessage can still yield the correct stream, which is fine)."
+  (let ((family (prng-int prng 0 9)))
+    (case family
+      (0 (values (copy-seq v-enc) t nil))                                  ; pristine ENCRYPT -> accept
+      (1 (values (copy-seq v-sgn) t nil))                                  ; pristine SIGN -> accept
+      (2 (let* ((b (copy-seq (if (oddp (prng-next prng)) v-enc v-sgn)))    ; 1-octet flip (general invariant)
+                (p (prng-int prng 0 (1- (length b)))))
+           (setf (aref b p) (logxor (aref b p) (1+ (prng-int prng 0 254))))
+           (values b nil nil)))
+      (3 (let* ((src (if (oddp (prng-next prng)) v-enc v-sgn))             ; strict truncation -> NIL
+                (n (prng-int prng 0 (1- (length src)))))
+           (values (subseq src 0 n) nil t)))
+      (4 (let* ((n (prng-int prng 0 200))                                  ; pure random
+                (b (make-array n :element-type '(unsigned-byte 8))))
+           (dotimes (i n) (setf (aref b i) (prng-int prng 0 255)))
+           (values b nil nil)))
+      (5 (values (make-array (prng-int prng 0 200) :element-type '(unsigned-byte 8) :initial-element 0)
+                 nil t))                                                   ; all-zero -> NIL
+      (6 (let* ((extra (prng-int prng 1 64))                              ; pristine + trailing -> accept
+                (out (make-array (+ (length v-enc) extra) :element-type '(unsigned-byte 8))))
+           (replace out v-enc)
+           (loop for i from (length v-enc) below (length out)
+                 do (setf (aref out i) (prng-int prng 0 255)))
+           (values out t nil)))
+      (7 (let ((b (copy-seq v-enc)))                                       ; clobber SRTPS_PREFIX id [0] -> NIL
+           (setf (aref b 0) (logxor #x33 (1+ (prng-int prng 0 254))))
+           (values b nil t)))
+      (8 (let ((b (copy-seq v-enc)))                                       ; clobber SRTPS_POSTFIX id [76] -> NIL
+           (setf (aref b 76) (logxor #x34 (1+ (prng-int prng 0 254))))
+           (values b nil t)))
+      (t (let* ((b (copy-seq v-enc))                                       ; HOSTILE rsm_count [96..99] -> T1 cap -> NIL
+                (c (case (prng-int prng 0 3)
+                     (0 #xFFFFFFFF)
+                     (1 (1+ dds.security:+max-receiver-specific-macs+))
+                     (2 #x10000)
+                     (t (+ dds.security:+max-receiver-specific-macs+ 1 (prng-int prng 0 1000000))))))
+           (setf (aref b 96) (logand c #xff)
+                 (aref b 97) (logand (ash c -8) #xff)
+                 (aref b 98) (logand (ash c -16) #xff)
+                 (aref b 99) (logand (ash c -24) #xff))
+           (values b nil t))))))
+
+(defun* fuzz-rtps-message ()
+    (function () t)
+  "Property-based fuzz of the UNTRUSTED §8.5.1.10-.12 whole-RTPS-message decode path (decode-rtps-message;
+   WP-DDS-SECURITY-SECURE-DISCOVERY T4, NFR-SEC-POSTURE). Two genuine seeds (ENCRYPT + SIGN of a fixed
+   2-submessage stream under the test key) plus a large corpus of adversarial SRTPS blobs — 1-octet
+   mutations, truncations, pure-random, all-zero, trailing-garbage, corrupted SRTPS_PREFIX/SRTPS_POSTFIX
+   ids, HOSTILE/oversized rsm_count (> +max-receiver-specific-macs+, must hit the T1 cap) — are decoded
+   under BOTH production policy and a (safety 0) wrapper. A SEPARATE origin-auth arm decodes a genuine
+   2-receiver seed WITH this receiver's key, mutating the receiver-mac footer (flip my MAC -> NIL; pristine
+   -> stream). Invariants: a pristine blob (+/- trailing) decodes to the exact stream; every other input
+   decodes to NIL or the correct stream, NEVER a tampered stream, OOB, unbounded allocation, non-terminating
+   SIGN walk, crash, or escaping signal; the corruption/hostile-count/truncation families are strictly NIL;
+   production==safety0. SKIPs cleanly if OpenSSL<3.5. N>=2000 iterations, deterministic seed; reproducible on
+   SBCL + Clasp."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [rtps-message-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from fuzz-rtps-message t)))
+  (let* ((prng   (make-prng #x537A7B5))
+         (iters  2500)
+         (stream (%t4-fixed-stream))
+         (v-enc  (dds.security:encode-rtps-message (dds.security:make-test-key-material) :encrypt stream))
+         (v-sgn  (dds.security:encode-rtps-message (dds.security:make-test-key-material) :sign stream))
+         (km     (dds.security:make-test-key-material))   ; same fixed key -> decode re-derives correctly
+         (cap-hits 0))
+    (dotimes (i iters t)
+      (multiple-value-bind (blob accept-p strict-nil-p) (%gen-rtps-decode-case prng v-enc v-sgn)
+        (flet ((run (thunk who)
+                 (handler-case (funcall thunk)
+                   (error (e)
+                     (error 'test-failure :name "rtps-message-fuzz"
+                            :detail (format nil "iter ~d len ~d: ~a signalled (must fail-closed to NIL): ~a"
+                                            i (length blob) who e))))))
+          (let ((d  (run (lambda () (dds.security:decode-rtps-message km blob)) "decode-rtps-message"))
+                (d0 (run (lambda () (%decode-rtps-message-safety0 km blob)) "(safety 0) decode-rtps-message")))
+            ;; pristine (+/- trailing) MUST decode to the exact stream.
+            (when (and accept-p (not (%dare-octets= d stream)))
+              (error 'test-failure :name "rtps-message-fuzz"
+                     :detail (format nil "iter ~d len ~d: faithful blob did NOT decode to the stream (got ~a)"
+                                     i (length blob) (if d "other" "NIL"))))
+            ;; any input MUST be NIL or the CORRECT stream — never a tampered/different one.
+            (unless (or (null d) (%dare-octets= d stream))
+              (error 'test-failure :name "rtps-message-fuzz"
+                     :detail (format nil "iter ~d len ~d: decode returned a DIFFERENT stream (integrity/fail-closed violated)"
+                                     i (length blob))))
+            ;; corruption / hostile-count / truncation families MUST be strictly NIL.
+            (when (and strict-nil-p d)
+              (error 'test-failure :name "rtps-message-fuzz"
+                     :detail (format nil "iter ~d len ~d: a bracket-corrupt/hostile-count/truncation blob decoded NON-NIL (the SRTPS bracket or the T1 cap failed to reject)"
+                                     i (length blob))))
+            (when strict-nil-p (incf cap-hits))
+            ;; production and (safety 0) must reach the same verdict.
+            (unless (%dare-octets= d d0)
+              (error 'test-failure :name "rtps-message-fuzz"
+                     :detail (format nil "iter ~d len ~d: production vs (safety 0) decode disagree (~a/~a)"
+                                     i (length blob) (and d t) (and d0 t))))))))
+    ;; origin-auth arm: decode a genuine 2-receiver seed WITH this receiver's key (non-vacuity under fuzz).
+    (let* ((kid1  (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+                    (setf (aref v 0) #xaa (aref v 1) #xaa (aref v 2) #x00 (aref v 3) #x01) v))
+           (mk1   (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11))
+           (kid2  (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+                    (setf (aref v 0) #xbb (aref v 1) #xbb (aref v 2) #x00 (aref v 3) #x02) v))
+           (mk2   (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x22))
+           (recvs (list (cons kid1 mk1) (cons kid2 mk2)))
+           (oa-iters 256))
+      (dotimes (i oa-iters)
+        (let* ((seed (dds.security:encode-rtps-message
+                      (dds.security:make-test-key-material) (if (oddp i) :sign :encrypt) stream :receivers recvs))
+               (blob (if (zerop (mod i 4))
+                         (copy-seq seed)                                    ; pristine -> stream
+                         (let ((b (copy-seq seed))                          ; flip a byte somewhere in the footer -> NIL
+                               (p (prng-int prng (- (length seed) 40) (1- (length seed)))))
+                           (setf (aref b p) (logxor (aref b p) (1+ (prng-int prng 0 254)))) b)))
+               (d (handler-case (dds.security:decode-rtps-message
+                                 km blob :my-receiver-key-id kid1 :my-receiver-key mk1)
+                    (error (e) (error 'test-failure :name "rtps-message-fuzz"
+                                      :detail (format nil "origin-auth iter ~d signalled: ~a" i e))))))
+          (when (zerop (mod i 4))
+            (unless (%dare-octets= d stream)
+              (error 'test-failure :name "rtps-message-fuzz"
+                     :detail (format nil "origin-auth iter ~d: pristine 2-receiver seed did NOT decode to the stream as receiver #1" i))))
+          (unless (or (null d) (%dare-octets= d stream))
+            (error 'test-failure :name "rtps-message-fuzz"
+                   :detail (format nil "origin-auth iter ~d: decode returned a DIFFERENT stream" i))))))
+    (format t "~&  [rtps-message-fuzz] ~d iterations exercised (~d strict-reject incl. hostile rsm_count hitting the T1 cap; production+safety0) + 256 origin-auth iters~%"
+            iters cap-hits)
+    t))
+
 ;;; ---- generators + properties ----
 
 (defun* gsample= (a b)
@@ -1394,9 +1799,15 @@
     (fuzz-original-writer-info-parse)
     ;; WP-DURABILITY-DARE open-path fuzz: adversarial sealed blobs (short/oversized/tampered/wrong-AAD) + a valid seal -> NIL or the correct plaintext, never OOB; prod + safety-0; SKIPs if OpenSSL<3.5 (NFR-SEC-POSTURE)
     (fuzz-dare-open-payload)
+    ;; WP-DDS-SECURITY-SECURE-DISCOVERY T2 submessage-protection decode fuzz: adversarial SEC_PREFIX/BODY/POSTFIX brackets (mutation/truncation/random/all-zero/trailing/corrupt-id) -> NIL or the correct plaintext, never a tampered one/OOB; writer+reader x prod+safety-0; SKIPs if OpenSSL<3.5 (NFR-SEC-POSTURE, §8.5.1.7-.9)
+    (fuzz-submessage-protection)
+    ;; WP-DDS-SECURITY-SECURE-DISCOVERY T3 origin-authentication decode fuzz: adversarial receiver_specific_macs footers (flipped MACs/key_ids, HOSTILE/oversized rsm_count hitting the T1 cap, footer truncation, random, all-zero) decoded with :my-receiver-key-id/:my-receiver-key -> NIL or the correct plaintext, never tampered/OOB/unbounded-alloc; prod+safety-0; SKIPs if OpenSSL<3.5 (NFR-SEC-POSTURE, §9.5.3.3.4.3)
+    (fuzz-submessage-origin-auth)
+    ;; WP-DDS-SECURITY-SECURE-DISCOVERY T4 whole-RTPS-message decode fuzz: adversarial SRTPS_PREFIX/SEC_BODY/SRTPS_POSTFIX brackets (mutation/truncation/random/all-zero/trailing/corrupt-prefix-or-postfix-id/hostile-rsm_count) + an origin-auth arm -> NIL or the correct stream, never a tampered one/OOB/unbounded-alloc/non-terminating SIGN walk; prod+safety-0; SKIPs if OpenSSL<3.5 (NFR-SEC-POSTURE, §8.5.1.10-.12)
+    (fuzz-rtps-message)
     ;; WP-DURABILITY-PERSISTENT crash-injection fuzz: tail-truncation + garbage-append + mid-file-corruption against file-store replay (NFR-SEC-POSTURE)
     (fuzz-file-store-crash-injection)
-    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0) + owi-parse fuzz 2000 iters (PID_ORIGINAL_WRITER_INFO parse: random/short/oversized/off-end octets + inline-QoS blob walk; BOTH arms prod + safety-0, NFR-SEC-POSTURE) + dare-open-payload fuzz 3000 iters (adversarial sealed blobs -> NIL or correct plaintext, fail-closed + bounds-checked, prod + safety-0; SKIP if OpenSSL<3.5, NFR-SEC-POSTURE) + crash-injection fuzz 4 arms (tail-truncation / garbage-append / mid-file-corruption against file-store replay + epochs.dat torn-tail/mid-file recovery, NFR-SEC-POSTURE), deterministic seed.~%" runs)
+    (format t "~&  pbt: 6 properties x ~d cases each + ring-drain fuzz 2000 iters + zc-resolve fuzz 2500 iters + flatdata-wrap fuzz 4000 iters (non-ZC wrap + safety-0 + forged-len ZC clamp) + flatdata-zc-loan-acquire fuzz 4000 iters (forged loan-acquire clamp, SBCL) + flatdata-transcode fuzz 4000 iters (foreign-rep transcode: 3 transcodable reps + native + random rep-id x swept body lengths, prod + safety-0) + durability-config fuzz 2000 iters (random argv/env -> clean error or valid, prod + safety-0) + owi-parse fuzz 2000 iters (PID_ORIGINAL_WRITER_INFO parse: random/short/oversized/off-end octets + inline-QoS blob walk; BOTH arms prod + safety-0, NFR-SEC-POSTURE) + dare-open-payload fuzz 3000 iters (adversarial sealed blobs -> NIL or correct plaintext, fail-closed + bounds-checked, prod + safety-0; SKIP if OpenSSL<3.5, NFR-SEC-POSTURE) + submessage-protection fuzz 2500 iters (adversarial SEC_PREFIX/BODY/POSTFIX brackets -> NIL or correct plaintext, never tampered; writer+reader x prod+safety-0; SKIP if OpenSSL<3.5, §8.5.1.7-.9 NFR-SEC-POSTURE) + submessage-origin-auth fuzz 2500 iters (adversarial receiver_specific_macs footers: flipped MAC/key_id, hostile/oversized rsm_count hitting the T1 cap, footer truncation, random, all-zero -> NIL or correct plaintext, never tampered/unbounded-alloc; prod+safety-0; SKIP if OpenSSL<3.5, §9.5.3.3.4.3 NFR-SEC-POSTURE) + rtps-message fuzz 2500 iters + 256 origin-auth iters (adversarial SRTPS_PREFIX/SEC_BODY/SRTPS_POSTFIX whole-RTPS brackets: mutation/truncation/random/all-zero/trailing/corrupt-prefix-or-postfix-id/hostile rsm_count hitting the T1 cap -> NIL or correct stream, never tampered/OOB/non-terminating SIGN walk; prod+safety-0; SKIP if OpenSSL<3.5, §8.5.1.10-.12 NFR-SEC-POSTURE) + crash-injection fuzz 4 arms (tail-truncation / garbage-append / mid-file-corruption against file-store replay + epochs.dat torn-tail/mid-file recovery, NFR-SEC-POSTURE), deterministic seed.~%" runs)
     (loop for b across fuzzbufs
           do (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))
     (dds.core.arena:pool-release pool buf)

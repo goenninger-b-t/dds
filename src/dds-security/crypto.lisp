@@ -16,31 +16,33 @@
    (DDS-Security 1.1 §9.5.3.3.1 Table 69; spike §2.2). Endian-independent (opaque octet[4]).
    The boundp-guard makes a reload a no-op so defconstant's same-value rule holds for the literal.")
 
-(defconstant +transformation-kind-len+ 4 "CryptoTransformKind width: octet[4] (§9.5.3.3.1).")
-(defconstant +transformation-key-id-len+ 4 "CryptoTransformKeyId width: octet[4] (§9.5.3.3.1; opaque, spike §8.2).")
-(defconstant +session-id-len+ 4 "SecureDataHeader.session_id width: octet[4] (§9.5.3.3.1; spike §2.2).")
-(defconstant +init-vector-suffix-len+ 8 "SecureDataHeader.init_vector_suffix width: octet[8] (§9.5.3.3.1; spike §2.2).")
-(defconstant +secure-data-header-len+ 20
-  "SecureDataHeader total width = kind(4)+key_id(4)+session_id(4)+iv_suffix(8) (§9.5.3.3.1; spike §2.2).")
-(defconstant +crypto-content-length-len+ 4
-  "crypto_content sequence<octet> length-prefix width: uint32 (§9.5.3.3.4.4; spike §2.3).")
-(defconstant +common-mac-len+ 16
-  "SecureDataTag.common_mac width = AES-GCM 128-bit tag, 16 octets (§9.5.3.3.3; spike §2.4/§5).")
-(defconstant +receiver-specific-macs-count-len+ 4
-  "SecureDataTag.receiver_specific_macs_count width: uint32 (§9.5.3.3.3; spike §2.4).")
+(defconstant +transformation-kind-aes256-gmac+
+    (if (boundp '+transformation-kind-aes256-gmac+)
+        (symbol-value '+transformation-kind-aes256-gmac+)
+        (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(#x00 #x00 #x00 #x03)))
+  "CryptoTransformKind octet[4] for AES256-GMAC (authentication-only, NO encryption) =
+   {0x00,0x00,0x00,0x03}, as a 4-octet vector (DDS-Security 1.1 §9.5.3.3.1 Table 69). Selects the
+   SIGN protection mode: the SEC_BODY carries the plaintext verbatim and the common_mac is a GMAC
+   over it. Used by submessage protection (crypto/submessage.lisp) to signal SIGN vs ENCRYPT on the
+   wire. Corroborated (read-only, no code copied) against eProsima Fast DDS (Apache-2.0)
+   AESGCMGMAC_Types.h CRYPTO_TRANSFORMATION_KIND_AES256_GMAC { {0,0,0,3} }; see docs/provenance.md.
+   The boundp-guard makes a reload a no-op so defconstant's same-value rule holds for the literal.")
+
+;;; The §9.5.3.3 wire-element field widths (+transformation-kind-len+ .. +receiver-specific-macs-count-len+) are pinned in crypto/crypto-header.lisp (the shared §7.3.7 codec, loaded first) as the single source of truth; reused here by name (DRY).
 (defconstant +receiver-specific-macs-count-payload-protection+ 0
   "receiver_specific_macs_count for plain ENCRYPT without WITH_ORIGIN_AUTHENTICATION = 0
    (§9.5.3.3.4.4 step 10; spike §2.4).")
 (defconstant +secure-data-tag-len+ 20
   "SecureDataTag total width for rsm_count=0 = common_mac(16)+count(4) (§9.5.3.3.3; spike §2.4).")
 
-;;; The §9.5.3.3.4.2 KDF id/counter literals (spec Table 70; spike §3.1).
+;;; The §9.5.3.3.4.2 KDF id_string literal (spike §3.1). NOTE: the conformant AES-GCM-GMAC session-key
+;;; KDF has NO trailing counter — Fast DDS compute_sessionkey AND Cyclone crypto_calculate_session_key both
+;;; hash id_string ‖ master_salt ‖ session_id with no counter (corroborated CLEAN-ROOM, read-only; see
+;;; docs/provenance.md, M7/P6 T-RECONCILE). An earlier "0001" counter constant was removed reconciling to
+;;; the wire oracle (the operating contract §4 — the wire is the oracle; non-interop is the worst defect).
 (defconstant +session-key-id-string+
     (if (boundp '+session-key-id-string+) (symbol-value '+session-key-id-string+) "SessionKey")
-  "DDS-Security §9.5.3.3.4.2 Table 70 session-key id_string (ASCII, 10 octets); spike §3.1.")
-(defconstant +session-key-counter-string+
-    (if (boundp '+session-key-counter-string+) (symbol-value '+session-key-counter-string+) "0001")
-  "DDS-Security §9.5.3.3.4.2 Table 70 session-key counter_string (ASCII, 4 octets); spike §3.1.")
+  "DDS-Security §9.5.3.3.4.2 session-key id_string (ASCII, 10 octets); spike §3.1.")
 (defconstant +session-key-len+ 32 "AES-256 session key length in octets (§9.5.3.3.4.2; spike §3.1).")
 
 ;;; CDR-encapsulation-header decision (spec §9.5.3.3.4.4 + spike §2.1/§8 item 1):
@@ -91,11 +93,12 @@
    KIND octet[4] (transformation_kind), KEY-ID octet[4] (transformation_key_id), SESSION-ID octet[4],
    IV-SUFFIX octet[8] (init_vector_suffix), CIPHERTEXT N octets, TAG 16 octets (common_mac).
    Produces (no CDR encapsulation header — see file note):
-     SecureDataHeader(20) || crypto_content.length(uint32 LE)=N || ciphertext(N)
-                          || common_mac(16) || receiver_specific_macs_count(uint32 LE)=0.
+     SecureDataHeader(20) || crypto_content.length(uint32 BE)=N || ciphertext(N)
+                          || common_mac(16) || receiver_specific_macs_count(uint32 BE)=0.
    The 20-byte SecureDataHeader is exactly the AEAD AAD (§9.5.3.3.4.4). Returns a fresh octet vector.
-   crypto_content.length and receiver_specific_macs_count use little-endian (RTPS E-flag=1, the
-   common case; spike §2.3/§8 item 3 — at count=0 the latter is endian-irrelevant)."
+   crypto_content.length and receiver_specific_macs_count are BIG-ENDIAN (§9.5.3.3.3/.4.4; the codec
+   forces it via %put-u32-be independent of the cursor's little-endian stream — Fast-DDS/Cyclone-aligned;
+   see docs/provenance.md, M7/P6 T-RECONCILE; at count=0 the latter is endian-irrelevant)."
   (%require-len kind +transformation-kind-len+ "transformation_kind")
   (%require-len key-id +transformation-key-id-len+ "transformation_key_id")
   (%require-len session-id +session-id-len+ "session_id")
@@ -105,14 +108,10 @@
          (total (+ +secure-data-header-len+ +crypto-content-length-len+ ct-n +secure-data-tag-len+))
          (out   (make-array total :element-type '(unsigned-byte 8)))
          (cur   (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over out) :endianness :little)))
-    (dds.core.buffer:put-octets cur kind 0 +transformation-kind-len+)
-    (dds.core.buffer:put-octets cur key-id 0 +transformation-key-id-len+)
-    (dds.core.buffer:put-octets cur session-id 0 +session-id-len+)
-    (dds.core.buffer:put-octets cur iv-suffix 0 +init-vector-suffix-len+)
-    (dds.core.buffer:put-u32 cur ct-n)
-    (dds.core.buffer:put-octets cur ciphertext 0 ct-n)
-    (dds.core.buffer:put-octets cur tag 0 +common-mac-len+)
-    (dds.core.buffer:put-u32 cur +receiver-specific-macs-count-payload-protection+)
+    ;; DRY: delegate to the §7.3.7 codec (SecureDataHeader=CryptoHeader, crypto_content=CryptoContent, rsm=0 SecureDataTag=empty CryptoFooter).
+    (serialize-crypto-header cur kind key-id session-id iv-suffix)
+    (serialize-crypto-content cur ciphertext)
+    (serialize-crypto-footer cur tag '())
     out))
 
 ;;; --- parse-secured-payload (§9.5.3.3; spike §2.5) — bounds-checked, fail-closed ---
@@ -130,7 +129,8 @@
    Every field read is bounds-checked against the input length BEFORE allocating: a too-short input
    or a declared crypto_content length that overflows the remaining bytes signals
    SECURED-PAYLOAD-MALFORMED, never an OOB read or a partial parse (NFR-SEC-POSTURE), even at
-   (safety 0). crypto_content.length and receiver_specific_macs_count are read little-endian."
+   (safety 0). crypto_content.length and receiver_specific_macs_count are read BIG-ENDIAN (§9.5.3.3.3/.4.4;
+   via %get-u32-be, independent of the cursor's little-endian stream — Fast-DDS/Cyclone-aligned)."
   (let ((n (length octets)))
     (when (< n (+ +secure-data-header-len+ +crypto-content-length-len+
                   +secure-data-tag-len+))
@@ -138,30 +138,56 @@
              :reason (format nil "input ~d octets < minimum ~d (header+ct_len+tag)"
                              n (+ +secure-data-header-len+ +crypto-content-length-len+
                                   +secure-data-tag-len+))))
-    (let* ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over octets) :endianness :little))
-           (kind      (make-array +transformation-kind-len+ :element-type '(unsigned-byte 8)))
-           (key-id    (make-array +transformation-key-id-len+ :element-type '(unsigned-byte 8)))
-           (session-id (make-array +session-id-len+ :element-type '(unsigned-byte 8)))
-           (iv-suffix (make-array +init-vector-suffix-len+ :element-type '(unsigned-byte 8)))
-           (tag       (make-array +common-mac-len+ :element-type '(unsigned-byte 8))))
-      (dds.core.buffer:get-octets cur kind 0 +transformation-kind-len+)
-      (dds.core.buffer:get-octets cur key-id 0 +transformation-key-id-len+)
-      (dds.core.buffer:get-octets cur session-id 0 +session-id-len+)
-      (dds.core.buffer:get-octets cur iv-suffix 0 +init-vector-suffix-len+)
-      (let ((ct-n (dds.core.buffer:get-u32 cur)))
-        (unless (= ct-n (- n +secure-data-header-len+ +crypto-content-length-len+ +secure-data-tag-len+))
-          (error 'secured-payload-malformed
-                 :reason (format nil "crypto_content.length ~d inconsistent with input length ~d" ct-n n)))
-        (let ((ciphertext (make-array ct-n :element-type '(unsigned-byte 8))))
-          (dds.core.buffer:get-octets cur ciphertext 0 ct-n)
-          (dds.core.buffer:get-octets cur tag 0 +common-mac-len+)
-          (let ((rsm-count (dds.core.buffer:get-u32 cur)))
-            (unless (= rsm-count +receiver-specific-macs-count-payload-protection+)
+    (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over octets) :endianness :little)))
+      ;; DRY: delegate field extraction to the §7.3.7 codec; re-assert the Slice-1 invariants (exact length consistency + rsm_count=0).
+      (multiple-value-bind (kind key-id session-id iv-suffix) (parse-crypto-header cur)
+        (unless kind
+          (error 'secured-payload-malformed :reason "truncated SecureDataHeader (CryptoHeader)"))
+        (let ((ciphertext (parse-crypto-content cur)))
+          (unless ciphertext
+            (error 'secured-payload-malformed
+                   :reason "crypto_content.length overflows the input (truncated or over-declared)"))
+          (unless (= (length ciphertext)
+                     (- n +secure-data-header-len+ +crypto-content-length-len+ +secure-data-tag-len+))
+            (error 'secured-payload-malformed
+                   :reason (format nil "crypto_content.length ~d inconsistent with input length ~d"
+                                   (length ciphertext) n)))
+          (multiple-value-bind (tag receiver-macs) (parse-crypto-footer cur)
+            (unless tag
+              (error 'secured-payload-malformed :reason "truncated SecureDataTag (CryptoFooter)"))
+            (unless (= (length receiver-macs) +receiver-specific-macs-count-payload-protection+)
               (error 'secured-payload-malformed
-                     :reason (format nil "receiver_specific_macs_count ~d unsupported (expected 0)" rsm-count))))
-          (values kind key-id session-id iv-suffix ciphertext tag))))))
+                     :reason (format nil "receiver_specific_macs_count ~d unsupported (expected ~d)"
+                                     (length receiver-macs) +receiver-specific-macs-count-payload-protection+)))
+            (values kind key-id session-id iv-suffix ciphertext tag)))))))
 
 ;;; --- derive-session-key (§9.5.3.3.4.2; spike §3.1) ---
+
+(defun* %derive-labeled-session-key (master-key master-salt session-id id-string)
+    (function ((simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*))
+               string)
+              (simple-array (unsigned-byte 8) (32)))
+  "Shared §9.5.3.3.4.2/.4.3 session-key KDF body, parameterized by the ID-STRING label:
+     session_key = HMAC-SHA256(MASTER-KEY, ID-STRING || master_salt || session_id).
+   The single construction behind BOTH derive-session-key (label 'SessionKey', the sender/common key,
+   §9.5.3.3.4.2) AND derive-receiver-specific-session-key (label 'SessionReceiverKey', the origin-auth
+   receiver key, §9.5.3.3.4.3, crypto/submessage.lisp) — so the framing is defined ONCE (DRY).
+   MASTER-KEY/MASTER-SALT 32 octets, SESSION-ID 4 octets (caller validates length). Returns a fresh
+   32-byte vector via dds.dare:hmac-sha256. NO trailing counter: this matches the conformant wire — Fast
+   DDS compute_sessionkey AND Cyclone crypto_calculate_session_key both hash exactly id_string ‖
+   master_salt ‖ session_id (corroborated CLEAN-ROOM; the operating contract §4 — the wire is the oracle;
+   see docs/provenance.md, M7/P6 T-RECONCILE). SESSION-ID is spliced verbatim from the wire SecureDataHeader
+   (Fast-DDS-faithful: its wire session_id == its KDF session_id bytes)."
+  (let* ((id   (%ascii-octets id-string))
+         (data (make-array (+ (length id) (length master-salt) (length session-id))
+                           :element-type '(unsigned-byte 8)))
+         (cur  (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over data) :endianness :little)))
+    (dds.core.buffer:put-octets cur id 0 (length id))
+    (dds.core.buffer:put-octets cur master-salt 0 (length master-salt))
+    (dds.core.buffer:put-octets cur session-id 0 (length session-id))
+    (dds.dare:hmac-sha256 master-key data)))
 
 (defun* derive-session-key (master-key master-salt session-id)
     (function ((simple-array (unsigned-byte 8) (*))
@@ -170,21 +196,14 @@
               (simple-array (unsigned-byte 8) (32)))
   "Derive the 32-byte AES-256 session key per DDS-Security 1.1 §9.5.3.3.4.2 (spike §3.1):
      session_key = HMAC-SHA256(master_sender_key,
-                               'SessionKey' || master_salt || session_id || '0001').
+                               'SessionKey' || master_salt || session_id).
    MASTER-KEY = master_sender_key (32 octets), MASTER-SALT = master_salt (32 octets),
    SESSION-ID = the 4-octet SecureDataHeader.session_id (spliced in verbatim).
    Uses HMAC-SHA256 (NOT HKDF-SHA384) per the spec; the MAC primitive is dds.dare:hmac-sha256.
-   Returns a fresh 32-byte vector. Signals SECURED-PAYLOAD-MALFORMED for wrong-size inputs (fail-closed)."
+   Delegates to the shared %derive-labeled-session-key with the 'SessionKey' label (DRY with the
+   origin-auth receiver-key KDF). Returns a fresh 32-byte vector. Signals SECURED-PAYLOAD-MALFORMED for
+   wrong-size inputs (fail-closed)."
   (%require-len master-key  32 "master_sender_key")
   (%require-len master-salt 32 "master_salt")
   (%require-len session-id   4 "session_id")
-  (let* ((id   (%ascii-octets +session-key-id-string+))
-         (ctr  (%ascii-octets +session-key-counter-string+))
-         (data (make-array (+ (length id) (length master-salt) (length session-id) (length ctr))
-                           :element-type '(unsigned-byte 8)))
-         (cur  (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over data) :endianness :little)))
-    (dds.core.buffer:put-octets cur id 0 (length id))
-    (dds.core.buffer:put-octets cur master-salt 0 (length master-salt))
-    (dds.core.buffer:put-octets cur session-id 0 (length session-id))
-    (dds.core.buffer:put-octets cur ctr 0 (length ctr))
-    (dds.dare:hmac-sha256 master-key data)))
+  (%derive-labeled-session-key master-key master-salt session-id +session-key-id-string+))

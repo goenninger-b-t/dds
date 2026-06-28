@@ -69,6 +69,48 @@
            #:disc-node-on-stateless-message
            #:%send-stateless-message
            #:%on-stateless-message
+           ;; Slice 4 (T7): reliable ParticipantVolatileMessageSecure builtin endpoint (DDS-Security 1.1 §7.4.5 / §9.5.3.1)
+           #:enable-volatile-secure
+           #:disc-node-on-volatile-secure
+           #:%pvms-derive-bootstrap-km
+           #:set-pvms-bootstrap-km
+           #:%send-volatile-secure
+           #:%on-volatile-secure
+           #:%pvms-push-heartbeat
+           #:%pvms-push-heartbeats-all
+           #:%pvms-role-session-id
+           #:*pvms-debug-drop-sns*
+           #:run-volatile-secure-reliable-test
+           #:run-volatile-secure-fail-closed-test
+           #:run-volatile-secure-purge-bound-test
+           #:run-volatile-secure-session-id-on-wire-test
+           ;; Slice 4 (T9): secure SEDP builtin endpoints (DDS-Security 1.1 §7.4.5 / §8.4.1.6 / §9.4.1.2.3)
+           #:disc-node-secure-sedp-encode-km
+           #:disc-node-secure-sedp-decode-km
+           #:disc-node-discovery-protected-topic-p
+           #:disc-node-secure-sedp-protection-kind
+           #:disc-node-secure-sedp-origin-auth
+           #:disc-node-secure-sedp-encode-receivers
+           #:disc-node-secure-sedp-decode-receiver-km
+           ;; Slice 4 (T11): secure participant-message (liveliness) + secure SPDP re-announce
+           #:disc-node-secure-pm-protection-kind
+           #:disc-node-secure-pm-origin-auth
+           #:run-secure-participant-message-test
+           #:run-secure-participant-message-tamper-test
+           #:run-secure-pm-origin-auth-roundtrip-test
+           #:run-secure-pm-origin-auth-tamper-test
+           #:run-secure-spdp-reannounce-test
+           #:disc-node-rtps-protection-kind
+           #:disc-node-rtps-protection-origin-auth
+           #:disc-node-rtps-protection-encode
+           #:disc-node-rtps-protection-decode
+           #:run-secure-sedp-roundtrip-test
+           #:run-secure-sedp-sign-roundtrip-test
+           #:run-secure-sedp-origin-auth-roundtrip-test
+           #:run-secure-sedp-origin-auth-tamper-test
+           #:run-rtps-protection-test
+           #:run-rtps-protection-enforce-test
+           #:run-rtps-protection-enforce-reliability-test
            ;; WP-DDS-SECURITY-AUTH-KEYX T4: auth extension points (DDS-Security 1.1 §7.3/7.4.3.2)
            #:disc-node-on-participant-discovered
            #:disc-node-auth-gate

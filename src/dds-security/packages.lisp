@@ -8,6 +8,40 @@
     crypto, no copied wire constants (every field cited from the §-clause + spike docs).")
   (:export
    #:+transformation-kind-aes256-gcm+
+   #:+transformation-kind-aes256-gmac+
+   ;; Slice 4 (WP-DDS-SECURITY-SECURE-DISCOVERY T2): §8.5.1.7-.9 submessage protection
+   ;; (crypto/submessage.lisp) — SEC_PREFIX/SEC_BODY/SEC_POSTFIX SIGN+ENCRYPT; consumed by T3
+   ;; (origin-auth), T4 (whole-RTPS protection reuses the shared AEAD core) and T9 (secure SEDP).
+   #:encode-datawriter-submessage
+   #:decode-datawriter-submessage
+   #:encode-datareader-submessage
+   #:decode-datareader-submessage
+   ;; Slice 4 (WP-DDS-SECURITY-SECURE-DISCOVERY T4): §8.5.1.10-.12 whole-RTPS-message protection
+   ;; (crypto/rtps-message.lisp) — SRTPS_PREFIX/SEC_BODY/SRTPS_POSTFIX SIGN+ENCRYPT+origin-auth over the
+   ;; shared %encode/%decode-secured-region engine; ParticipantCrypto-keyed. Consumed by T10 (send /
+   ;; %handle-datagram). The whole submessage STREAM is the protected unit (SIGN walks it to SRTPS_POSTFIX).
+   #:encode-rtps-message
+   #:decode-rtps-message
+   ;; Slice 4 (WP-DDS-SECURITY-SECURE-DISCOVERY T3): origin authentication (§9.5.3.3.4.3) —
+   ;; receiver-specific session-key KDF + per-receiver GMAC; encode emits receiver_specific_macs (the
+   ;; encode :receivers key), decode verifies its own (the decode :my-receiver-key-id/:my-receiver-key
+   ;; keys). Consumed by T4 (whole-RTPS protection) / T6 / T8.
+   #:derive-receiver-specific-session-key
+   #:compute-receiver-specific-mac
+   ;; Slice 4 (WP-DDS-SECURITY-SECURE-DISCOVERY T0): §8.5 crypto-plugin + §9.4.1.2 governance constants
+   ;; (crypto/constants.lisp). Secure builtin EntityIds + §7.4.6.1 bits live in dds.rtps.discovery;
+   ;; crypto-token message_class_ids are the +gm-*-crypto-tokens+ in keyexchange.lisp (DRY, not re-pinned).
+   #:+submessage-sec-body+ #:+submessage-sec-prefix+ #:+submessage-sec-postfix+
+   #:+submessage-srtps-prefix+ #:+submessage-srtps-postfix+
+   #:+kdf-label-session-receiver-key+
+   #:+protection-kinds+ #:+basic-protection-kinds+ #:+protection-kind-xsd-strings+
+   ;; Slice 4 (WP-DDS-SECURITY-SECURE-DISCOVERY T1): §7.3.7 shared CryptoHeader/Content/Footer wire
+   ;; codec (crypto/crypto-header.lisp) reused by submessage- (T2) / RTPS-message- (T4) protection +
+   ;; the Slice-1 serialized-payload tier; +max-receiver-specific-macs+ is the parse-side count cap.
+   #:+max-receiver-specific-macs+
+   #:serialize-crypto-header #:parse-crypto-header
+   #:serialize-crypto-content #:parse-crypto-content
+   #:serialize-crypto-footer #:parse-crypto-footer
    #:secured-payload-malformed
    #:secured-payload-malformed-reason
    #:serialize-secured-payload
@@ -34,6 +68,7 @@
    ;; Auth T1: PKI identity (§8.7 / §9.3) — DDS-Security 1.1 Authentication plugin
    #:+test-pki-root+
    #:+test-ac-pki-root+
+   #:+test-ssd-pki-root+
    #:identity-handle
    #:identity-handle-p
    #:identity-handle-cert
@@ -97,19 +132,39 @@
    #:+gm-datawriter-crypto-tokens+
    #:+gm-datareader-crypto-tokens+
    #:generate-writer-key-material
+   ;; T6 (WP-DDS-SECURITY-SECURE-DISCOVERY): generic §8.5 CryptoKeyFactory KeyMaterial generator
+   #:generate-key-material
    #:serialize-crypto-token
    #:parse-crypto-token
    #:make-crypto-token-message
    #:parse-crypto-token-message
+   ;; T8 (WP-DDS-SECURITY-SECURE-DISCOVERY): plaintext CryptoToken DataHolder (§8.5.2, rides inside PVMS)
+   #:serialize-crypto-token-plain
+   #:parse-crypto-token-plain
    ;; T2: AccessControl Governance/Permissions data model + parser + matcher (WP-DDS-SECURITY-ACCESS-CONTROL)
+   ;; T5 (WP-DDS-SECURITY-SECURE-DISCOVERY): protection-kind model
+   #:topic-rule #:make-topic-rule #:topic-rule-p
+   #:topic-rule-topic-expr
+   #:topic-rule-enable-read-ac #:topic-rule-enable-write-ac
+   #:topic-rule-enable-discovery-protection #:topic-rule-enable-liveliness-protection
+   #:topic-rule-metadata-protection-kind #:topic-rule-data-protection-kind
    #:governance
    #:make-governance
    #:governance-p
    #:governance-allow-unauthenticated
    #:governance-enable-join-ac
+   #:governance-discovery-protection-kind
+   #:governance-liveliness-protection-kind
+   #:governance-rtps-protection-kind
    #:governance-topic-rules
    #:parse-governance
    #:governance-topic-rule
+   #:governance-discovery-protection
+   #:governance-liveliness-protection
+   #:governance-rtps-protection
+   #:protection-kind-base
+   #:topic-discovery-protected-p
+   #:topic-metadata-protection
    #:permissions
    #:make-permissions
    #:permissions-p
@@ -119,6 +174,7 @@
    #:permissions-default
    #:permissions-rules
    #:parse-permissions
+   #:permissions-grant-for
    #:permissions-allow-publish-p
    #:permissions-allow-subscribe-p
    ;; T3: AccessControl plugin — validate + check predicates (WP-DDS-SECURITY-ACCESS-CONTROL)

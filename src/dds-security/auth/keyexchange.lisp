@@ -132,7 +132,7 @@
 
 ;;; === T3: §9.5.2 KeyMaterial generation + KxKey-encrypted CryptoToken codec ===
 ;;;
-;;; KeyMaterial CDR layout (88 bytes, AES256-GCM, no receiver-specific key):
+;;; KeyMaterial CDR layout (88 bytes, AES256-GCM, NO receiver-specific key):
 ;;;   [0..3]   transformation_kind = {0x00,0x00,0x00,0x04}     (§9.5.2 Table 65; spike §3.2)
 ;;;   [4..6]   padding              = {0x00,0x00,0x00}
 ;;;   [7]      master_salt length   = 0x20 (= 32)
@@ -143,7 +143,17 @@
 ;;;   [48..79] master_sender_key[0..31]
 ;;;   [80..83] receiver_specific_key_id = {0x00,0x00,0x00,0x00}
 ;;;   [84..87] absent-key marker    = {0x00,0x00,0x00,0x00}
-;;; Source: Fast DDS AESGCMGMAC_KeyExchange.cpp KeyMaterialCDRSerialize(); spike §3.2.
+;;; ORIGIN-AUTH form (120 bytes, AES256-GCM, WITH receiver-specific key — the *_WITH_ORIGIN_AUTHENTICATION
+;;; tier, §9.5.3.3.4.3): identical through [83], then the absent-marker is replaced by a populated
+;;; master_receiver_specific_key sequence:
+;;;   [80..83] receiver_specific_key_id (NON-ZERO — the Fast DDS has_specific_key discriminator)
+;;;   [84..86] padding              = {0x00,0x00,0x00}
+;;;   [87]     master_receiver_specific_key length = 0x20 (= 32)
+;;;   [88..119] master_receiver_specific_key[0..31]
+;;; Source: Fast DDS AESGCMGMAC_KeyExchange.cpp KeyMaterialCDRSerialize() L432-454 (serialize) +
+;;; KeyMaterialCDRDeserialize() L511-528 (parse): the presence of the receiver key is keyed on
+;;; has_specific_key = OR of receiver_specific_key_id's 4 octets (non-zero -> the 3-pad+len(0x20)+32B
+;;; sequence; zero -> 4 zero octets) — corroborated CLEAN-ROOM (read-only, no code copied); spike §3.2.
 ;;; NEEDS-VERIFICATION §6.2 (spike): this is Fast DDS proprietary framing, not standard CDR
 ;;; uint32 sequence-length; cross-vendor Connext alignment deferred to Slice 5 / ADR 0034.
 ;;;
@@ -199,6 +209,12 @@
    Layout: kind(4)+pad(3)+1+salt(32)+kid(4)+pad(3)+1+sender-key(32)+rsm-id(4)+absent-marker(4) = 88.
    Source: Fast DDS KeyMaterialCDRSerialize(); spike §3.2.")
 
+(defconstant +km-cdr-len-origin-auth+ 120
+  "Byte length of the serialized KeyMaterial_AES_GCM_GMAC CDR for AES256-GCM WITH a receiver-specific key
+   (the *_WITH_ORIGIN_AUTHENTICATION tier, §9.5.3.3.4.3): the 88-byte form with the absent-marker[4] replaced
+   by a populated master_receiver_specific_key sequence pad(3)+len(0x20)+key(32). 88-4+36 = 120.
+   Source: Fast DDS KeyMaterialCDRSerialize() L447-453 (the has_specific_key non-zero branch).")
+
 (defconstant +kx-nonce-len+ 12
   "AES-GCM nonce length in bytes. NIST SP 800-38D §8.2.1 96-bit IV for the random construction.")
 
@@ -212,76 +228,94 @@
 
 (defun* %serialize-km-cdr (km)
     (function (key-material) (simple-array (unsigned-byte 8) (*)))
-  "Serialize KM to the 88-byte Fast DDS proprietary KeyMaterial CDR format (spike §3.2).
-   Layout: kind(4){0x00,0x00,0x00,0x04} + pad(3) + len-byte(0x20) + salt(32) +
-           key-id(4) + pad(3) + len-byte(0x20) + sender-key(32) + rsm-id(4){zeros} + absent(4){zeros}.
-   NEEDS-VERIFICATION §6.2: proprietary framing; not standard CDR uint32 sequence-length encoding."
-  (let ((out (make-array +km-cdr-len+ :element-type '(unsigned-byte 8) :initial-element 0))
-        (kind (key-material-transformation-kind km))
-        (salt (key-material-master-salt km))
-        (kid  (key-material-sender-key-id km))
-        (mkey (key-material-master-sender-key km)))
+  "Serialize KM to the Fast DDS proprietary KeyMaterial CDR format (spike §3.2): the 88-byte no-origin-auth
+   form, or the 120-byte *_WITH_ORIGIN_AUTHENTICATION form when KM carries a NON-ZERO receiver_specific_key_id
+   (the Fast DDS has_specific_key discriminator, KeyMaterialCDRSerialize L432-454).
+   Layout: kind(4){0,0,0,4} + pad(3)+len(0x20)+salt(32) + key-id(4) + pad(3)+len(0x20)+sender-key(32) +
+           rsm-id(4) + {absent: zeros(4)} | {present: pad(3)+len(0x20)+recv-key(32)}.
+   Byte-identical to the prior 88-byte serializer when receiver_specific_key_id is all-zero (the SIGN/ENCRYPT
+   path is unchanged). NEEDS-VERIFICATION §6.2: proprietary framing; not standard CDR uint32 sequence-length."
+  (let* ((rsk-id      (key-material-receiver-specific-key-id km))
+         (origin-auth (notevery #'zerop rsk-id))   ; Fast DDS has_specific_key (rsm-id non-zero)
+         (out  (make-array (if origin-auth +km-cdr-len-origin-auth+ +km-cdr-len+)
+                           :element-type '(unsigned-byte 8) :initial-element 0))
+         (kind (key-material-transformation-kind km))
+         (salt (key-material-master-salt km))
+         (kid  (key-material-sender-key-id km))
+         (mkey (key-material-master-sender-key km)))
     ;; [0..3] transformation_kind
-    (setf (aref out 0) (aref kind 0)
-          (aref out 1) (aref kind 1)
-          (aref out 2) (aref kind 2)
-          (aref out 3) (aref kind 3))
-    ;; [4..6] padding = {0x00,0x00,0x00}; [7] = 0x20 (32 = length of master_salt)
+    (dotimes (i 4) (setf (aref out i) (aref kind i)))
+    ;; [4..6] padding = {0x00,0x00,0x00}; [7] = 0x20 (32 = length of master_salt); [8..39] master_salt
     (setf (aref out 7) #x20)
-    ;; [8..39] master_salt
     (dotimes (i 32) (setf (aref out (+ 8 i)) (aref salt i)))
     ;; [40..43] sender_key_id
-    (setf (aref out 40) (aref kid 0)
-          (aref out 41) (aref kid 1)
-          (aref out 42) (aref kid 2)
-          (aref out 43) (aref kid 3))
-    ;; [44..46] padding = {0x00,0x00,0x00}; [47] = 0x20 (32 = length of master_sender_key)
+    (dotimes (i 4) (setf (aref out (+ 40 i)) (aref kid i)))
+    ;; [44..46] padding = {0x00,0x00,0x00}; [47] = 0x20 (32 = length of master_sender_key); [48..79]
     (setf (aref out 47) #x20)
-    ;; [48..79] master_sender_key
     (dotimes (i 32) (setf (aref out (+ 48 i)) (aref mkey i)))
-    ;; [80..83] receiver_specific_key_id = {0x00,0x00,0x00,0x00} (all-zeros = absent)
-    ;; [84..87] absent-key marker        = {0x00,0x00,0x00,0x00}
-    ;; both are already zero from :initial-element 0
+    ;; [80..83] receiver_specific_key_id (all-zero when not origin-auth -> the 88-byte absent form follows)
+    (when origin-auth
+      (let ((rsk (key-material-master-receiver-specific-key km)))
+        (dotimes (i 4) (setf (aref out (+ 80 i)) (aref rsk-id i)))
+        ;; [84..86] padding; [87] = 0x20 (master_receiver_specific_key length); [88..119] the key
+        (setf (aref out 87) #x20)
+        (dotimes (i 32) (setf (aref out (+ 88 i)) (aref rsk i)))))
     out))
 
 ;;; --- KeyMaterial CDR deserializer ---
 
 (defun* %parse-km-cdr (cdr)
     (function ((simple-array (unsigned-byte 8) (*))) (or key-material null))
-  "Parse an 88-byte KeyMaterial CDR blob into a key-material struct. Returns NIL if malformed.
-   Checks: exact length 88; transformation_kind[0..2] must be {0x00,0x00,0x00}; kind[3] in {0x01,0x02,0x04};
-   length bytes at [7] and [47] must be 0x20 (32); bytes [80..87] (receiver_specific_key_id + absent-marker)
-   must all be zero (participant-level AES_GCM only; receiver-specific keys are rejected). Fail-closed (NFR-SEC-POSTURE)."
+  "Parse a KeyMaterial CDR blob (the 88-byte no-origin-auth form OR the 120-byte *_WITH_ORIGIN_AUTHENTICATION
+   form) into a key-material struct. Returns NIL if malformed (fail-closed, NFR-SEC-POSTURE).
+   Checks: length 88 or 120; transformation_kind[0..2] = {0,0,0}; kind[3] in {0x01,0x02,0x04}; length bytes at
+   [7] and [47] = 0x20 (32). The receiver-specific key follows Fast DDS has_specific_key (KeyMaterialCDRDeserialize
+   L511-528): receiver_specific_key_id [80..83] all-zero -> the 88-byte absent form ([84..87] must be zero);
+   non-zero -> the 120-byte form ([84..86]=0, [87]=0x20, master_receiver_specific_key at [88..119]). Any length/
+   form/marker mismatch fails closed. The carried receiver key is retained so the matched-remote EntityCrypto the
+   token installs keeps the remote's origin-auth receiver key (§9.5.3.3.4.3)."
   (block %parse-km
     (let ((n (length cdr)))
-      (unless (= n +km-cdr-len+) (return-from %parse-km nil))
+      (unless (or (= n +km-cdr-len+) (= n +km-cdr-len-origin-auth+)) (return-from %parse-km nil))
       ;; kind[0..2] must be zeros; kind[3] is the actual algorithm byte (0x04 = AES256-GCM)
       (unless (and (zerop (aref cdr 0)) (zerop (aref cdr 1)) (zerop (aref cdr 2)))
         (return-from %parse-km nil))
-      (let ((algo-byte (aref cdr 3)))
-        (unless (member algo-byte '(#x01 #x02 #x04))
-          (return-from %parse-km nil)))
-      ;; length bytes must be 0x20 (= 32)
+      (unless (member (aref cdr 3) '(#x01 #x02 #x04)) (return-from %parse-km nil))
+      ;; master_salt / master_sender_key length bytes must be 0x20 (= 32)
       (unless (and (= (aref cdr 7) #x20) (= (aref cdr 47) #x20))
         (return-from %parse-km nil))
-      ;; receiver_specific_key_id [80..83] and absent-key marker [84..87] must all be zero
-      (unless (and (zerop (aref cdr 80)) (zerop (aref cdr 81))
-                   (zerop (aref cdr 82)) (zerop (aref cdr 83))
-                   (zerop (aref cdr 84)) (zerop (aref cdr 85))
-                   (zerop (aref cdr 86)) (zerop (aref cdr 87)))
-        (return-from %parse-km nil))
-      (let ((kind (make-array 4 :element-type '(unsigned-byte 8)))
-            (salt (make-array 32 :element-type '(unsigned-byte 8)))
-            (kid  (make-array 4 :element-type '(unsigned-byte 8)))
-            (mkey (make-array 32 :element-type '(unsigned-byte 8))))
-        (dotimes (i 4)  (setf (aref kind i) (aref cdr i)))
-        (dotimes (i 32) (setf (aref salt i) (aref cdr (+ 8 i))))
-        (dotimes (i 4)  (setf (aref kid i)  (aref cdr (+ 40 i))))
-        (dotimes (i 32) (setf (aref mkey i) (aref cdr (+ 48 i))))
-        (make-key-material :transformation-kind kind
-                           :master-salt salt
-                           :sender-key-id kid
-                           :master-sender-key mkey)))))
+      ;; receiver_specific_key_id [80..83]; has_specific_key = OR of its 4 octets (Fast DDS L511-519)
+      (let ((rsk-id      (make-array 4 :element-type '(unsigned-byte 8)))
+            (origin-auth nil))
+        (dotimes (i 4)
+          (setf (aref rsk-id i) (aref cdr (+ 80 i)))
+          (unless (zerop (aref rsk-id i)) (setf origin-auth t)))
+        ;; form/marker consistency: absent -> 88B with [84..87]=0; present -> 120B with [84..86]=0,[87]=0x20
+        (if origin-auth
+            (unless (and (= n +km-cdr-len-origin-auth+)
+                         (zerop (aref cdr 84)) (zerop (aref cdr 85)) (zerop (aref cdr 86))
+                         (= (aref cdr 87) #x20))
+              (return-from %parse-km nil))
+            (unless (and (= n +km-cdr-len+)
+                         (zerop (aref cdr 84)) (zerop (aref cdr 85))
+                         (zerop (aref cdr 86)) (zerop (aref cdr 87)))
+              (return-from %parse-km nil)))
+        (let ((kind (make-array 4 :element-type '(unsigned-byte 8)))
+              (salt (make-array 32 :element-type '(unsigned-byte 8)))
+              (kid  (make-array 4 :element-type '(unsigned-byte 8)))
+              (mkey (make-array 32 :element-type '(unsigned-byte 8)))
+              (rsk  (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+          (dotimes (i 4)  (setf (aref kind i) (aref cdr i)))
+          (dotimes (i 32) (setf (aref salt i) (aref cdr (+ 8 i))))
+          (dotimes (i 4)  (setf (aref kid i)  (aref cdr (+ 40 i))))
+          (dotimes (i 32) (setf (aref mkey i) (aref cdr (+ 48 i))))
+          (when origin-auth (dotimes (i 32) (setf (aref rsk i) (aref cdr (+ 88 i)))))
+          (make-key-material :transformation-kind          kind
+                             :master-salt                  salt
+                             :sender-key-id                kid
+                             :master-sender-key            mkey
+                             :receiver-specific-key-id     rsk-id
+                             :master-receiver-specific-key rsk))))))
 
 ;;; --- Key-id derivation from writer GUID ---
 
@@ -296,24 +330,21 @@
 
 ;;; --- Public API ---
 
-(defun* generate-writer-key-material (writer-guid)
-    (function ((simple-array (unsigned-byte 8) (16))) key-material)
-  "Generate a fresh §9.5.2 KeyMaterial_AES_GCM_GMAC for WRITER-GUID.
-   master_salt (32B) and master_sender_key (32B) are cryptographically random (dds.dare:random-bytes).
-   sender_key_id is derived from the first 4 bytes of WRITER-GUID.
-   transformation_kind = {0x00,0x00,0x00,0x04} (AES256-GCM, §9.5.2 Table 65).
-   receiver_specific_key_id = all-zeros (participant-level protection; §9.5.2).
-   Secrets are plain heap vectors (not foreign-backed) — the caller holds the key-material struct
-   and is responsible for zeroizing on teardown (T5 manager allocates and frees these)."
-  ; HARDENING-GAP: KeyMaterial master key/salt are GC-heap (Slice-1 key-material struct); foreign-backing is a follow-on (see ADR 0034). Control-plane, not hot-path.
-  (let* ((kind (copy-seq +transformation-kind-aes256-gcm+))
-         (salt (dds.dare:random-bytes 32))
-         (kid  (%guid-key-id writer-guid))
-         (mkey (dds.dare:random-bytes 32)))
-    (make-key-material :transformation-kind kind
-                       :master-salt         salt
-                       :sender-key-id       kid
-                       :master-sender-key   mkey)))
+(defun* generate-writer-key-material (writer-guid &key (origin-auth nil))
+    (function ((simple-array (unsigned-byte 8) (16)) &key (:origin-auth t)) key-material)
+  "Generate a fresh §9.5.2 KeyMaterial_AES_GCM_GMAC for WRITER-GUID. Delegates the random
+   master_salt / master_sender_key + (under ORIGIN-AUTH) the NON-ZERO receiver-specific fill to the
+   generic GENERATE-KEY-MATERIAL (DRY — the single CryptoKeyFactory primitive, key-material.lisp),
+   then OVERRIDES sender_key_id with the deterministic GUID-derived id (%GUID-KEY-ID: the first 4
+   octets of WRITER-GUID) so the on-wire transformation_key_id ties the KeyMaterial to the writer
+   the participant advertises (§9.5.2 Table 65; the derivation is our-implementation choice, not a
+   spec mandate). transformation_kind = AES256-GCM. ORIGIN-AUTH true additionally carries the
+   non-zero receiver-specific key material for the *_WITH_ORIGIN_AUTHENTICATION kinds (§9.5.3.3.4.3).
+   Secrets are plain heap vectors (ADR 0034 deferral) — the caller owns the key-material struct.
+   Control-plane, not the hot path."
+  (let ((km (generate-key-material :origin-auth origin-auth)))
+    (setf (key-material-sender-key-id km) (%guid-key-id writer-guid))
+    km))
 
 (defun* serialize-crypto-token (km kx-key)
     (function (key-material (simple-array (unsigned-byte 8) (32)))
@@ -386,6 +417,44 @@
                     (fill pt 0) ; wipe decrypted material
                     km))))))))))
 
+
+;;; === T8 (WP-DDS-SECURITY-SECURE-DISCOVERY): PLAINTEXT CryptoToken DataHolder (§8.5.2 conformant) ===
+;;; The conformant §8.5.2 crypto-token exchange rides the §9.5.2 KeyMaterial as a PLAINTEXT DataHolder
+;;; INSIDE a PVMS submessage-protected message — the PVMS ENCRYPT (T7 bootstrap key) provides the
+;;; confidentiality, so the token is NOT app-encrypted. This REPLACES KEYX's interim KxKey-AEAD wrap over
+;;; best-effort PSM (T8 HARD CONSTRAINT #2): the KxKey wrap (serialize-crypto-token / parse-crypto-token)
+;;; remains for the KEYX KAT regression but is no longer on the live exchange path.
+
+(defun* serialize-crypto-token-plain (km)
+    (function (key-material) (simple-array (unsigned-byte 8) (*)))
+  "Serialize KM as a PLAINTEXT CryptoToken CDR-LE DataHolder blob (§8.5.2 / §9.5.2 / §9.3.4) — the
+   conformant token payload that rides INSIDE a PVMS submessage-protected message (T8). DataHolder:
+   class_id +crypto-token-class-id+; one binary property +crypto-token-keymat-prop+ carrying the §9.5.2
+   KeyMaterial CDR (%serialize-km-cdr — 88-byte no-origin-auth or 120-byte *_WITH_ORIGIN_AUTHENTICATION
+   form, carrying the receiver-specific key) IN THE CLEAR. NO KxKey AEAD wrap (the PVMS submessage ENCRYPT
+   is the confidentiality boundary, §6.5). Inverse: parse-crypto-token-plain."
+  (handshake-token->dataholder
+   (%make-handshake-token
+    :class-id     +crypto-token-class-id+
+    :binary-props (list (cons +crypto-token-keymat-prop+ (%serialize-km-cdr km))))))
+
+(defun* parse-crypto-token-plain (octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (or key-material null))
+  "Parse a PLAINTEXT CryptoToken DataHolder (inverse of serialize-crypto-token-plain). Returns the §9.5.2
+   key-material, or NIL on any malformed/truncated/wrong-class/wrong-length input (fail-closed,
+   NFR-SEC-POSTURE). Bounds-checked: dataholder->handshake-token caps every length; exactly 1 binary
+   property named +crypto-token-keymat-prop+; the value is parsed by %parse-km-cdr which enforces the 88-octet
+   no-origin-auth OR 120-octet origin-auth KeyMaterial CDR layout (retaining the receiver-specific key when
+   present). NO decryption (the PVMS layer already authenticated + decrypted)."
+  (block %p
+    (let ((tok (dataholder->handshake-token octets)))
+      (unless tok (return-from %p nil))
+      (unless (string= (handshake-token-class-id tok) +crypto-token-class-id+) (return-from %p nil))
+      (let ((props (handshake-token-binary-props tok)))
+        (unless (= (length props) 1) (return-from %p nil))
+        (let ((pair (car props)))
+          (unless (string= (car pair) +crypto-token-keymat-prop+) (return-from %p nil))
+          (%parse-km-cdr (cdr pair)))))))
 
 (defun* make-crypto-token-message (km kx-key src-guid dest-guid)
     (function (key-material

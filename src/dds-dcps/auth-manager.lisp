@@ -33,14 +33,16 @@
    (keyed by 12-octet prefix); LOCK guards every read/update of those records across the
    receiver + app threads (never held across DDS.DISC:RESUME-PARKED-MATCHES, which takes
    the node lock). A NIL DP-AUTH-STATE means security is OFF for this participant.
-   WRITER-KM-TABLE: per-local-writer KeyMaterial table (16-octet writer GUID -> KEY-MATERIAL).
-   §9.5 requires ONE KeyMaterial per writer shared across ALL authenticated remotes; this table
-   is the get-or-create source so every remote receives the identical key for a given writer
-   GUID, and the encode resolver can return a stable, single value keyed by writer GUID."
+   CRYPTO-MANAGER: the §8.5 key-management hub (crypto-manager.lisp) this participant drives
+   for the §9.5.2 KeyMaterial registries + the §8.5.2 crypto-token exchange over PVMS (T8).
+   Set by %install-crypto-manager; the :authenticated->:keyed promotion is mediated through it
+   (the KEYX per-writer WRITER-KM-TABLE is RETIRED — the per-writer/entity KeyMaterial now lives
+   in the crypto-manager EntityCrypto registries, exchanged over reliable PVMS, design §6.4/§7.2).
+   Typed T to avoid an auth-manager-state<->crypto-manager defstruct cycle (crypto-manager loads after)."
   (identity (error "auth-manager-state: :identity is required (the local identity-handle)")
             :type dds.security:identity-handle)
   (lock (dds.pal:make-lock "auth-manager") :type t)
-  (writer-km-table (make-hash-table :test 'equalp) :type hash-table))
+  (crypto-manager nil :type t))
 
 ;;; --- per-remote auth/key state (DISC-NODE-AUTH-STATE: 12-octet prefix -> AUTH-REMOTE) ---
 
@@ -50,14 +52,14 @@
    machine (§8.7 / §9.5):
      :none          discovered + validated; role/suite/remote-token recorded, no handshake yet.
      :handshaking   an in-flight §8.7.2.4 handshake (HANDLE non-NIL).
-     :authenticated handshake complete (SharedSecret); KX-KEY derived + our CryptoTokens sent;
-                    the remote's KeyMaterial is NOT yet installed.
-     :keyed         authenticated AND the remote writer KeyMaterial installed (REMOTE-KM non-NIL)
-                    -> endpoint matching is resumed (DDS.DISC:RESUME-PARKED-MATCHES).
+     :authenticated handshake complete (SharedSecret); the crypto-manager has been driven to derive the
+                    §9.5.3.1 PVMS bootstrap KM + send our crypto tokens; the remote's tokens are NOT yet in.
+     :keyed         authenticated AND the §8.5 crypto established — the crypto-manager installed the remote's
+                    ParticipantCrypto + core builtin EntityCrypto (T8, design §7.2) -> endpoint matching is
+                    resumed (DDS.DISC:RESUME-PARKED-MATCHES). The keys live in the crypto-manager registries.
      :rejected      terminal refusal (malformed/untrusted remote, unsupported algo, bad handshake).
-   HANDLE: the in-flight handshake-handle (foreign DH/cert state; freed on teardown).
-   KX-KEY: the derived §9.5.3 KxKey (dds.pal foreign buffer; freed on teardown).
-   REMOTE-KM: the installed remote writer KeyMaterial (§9.5.2; NIL until a CryptoToken decrypts).
+   HANDLE: the in-flight handshake-handle (foreign DH/cert state; freed on teardown). At :authenticated it
+                 carries the SharedSecret the crypto-manager derives the PVMS bootstrap KM from (T8).
    ROLE: :requester (local GUID < remote) or :replier (§8.7.2.4 ordering).
    REMOTE-TOKEN: the remote IdentityToken octets (stashed at discovery so the replier can pick
                  the suite when the request arrives on the wire). SELF-ASSERTED — never the §8.4
@@ -68,19 +70,14 @@
                  proved possession of the private key for the cert this subject is read from. NIL until
                  :authenticated.
    SUITE: the §9.3.2 auth-suite selected for this pair.
-   PENDING-CT: CryptoToken envelopes received before KX-KEY existed (best-effort PSM has no
-               resend) — drained once KX-KEY is derived. LOCAL-SENT-P dedupes our own send."
+   (The KEYX KX-KEY / REMOTE-KM / LOCAL-KM / LOCAL-SENT-P / PENDING-CT slots are RETIRED in T8: the §9.5.2
+   KeyMaterial exchange moved off best-effort PSM onto the crypto-manager + reliable PVMS, design §6.4.)"
   (state        :none :type (member :none :handshaking :authenticated :keyed :rejected))
   (handle       nil :type (or null dds.security:handshake-handle))
-  (kx-key       nil :type (or null dds.security:kx-key-handle))
-  (remote-km    nil :type (or null dds.security:key-material))
   (role         :requester :type (member :requester :replier))
   (remote-token nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (validated-subject nil :type (or null string))
-  (suite        nil :type (or null dds.security:auth-suite))
-  (pending-ct   '() :type list)
-  (local-km     nil :type (or null dds.security:key-material))
-  (local-sent-p nil :type t))
+  (suite        nil :type (or null dds.security:auth-suite)))
 
 ;;; --- diagnostics ---
 
@@ -135,13 +132,8 @@
       (when (< ai bi) (return t))
       (when (> ai bi) (return nil)))))
 
-(defun* %local-writer-guid (node)
-    (function (dds.disc:disc-node) (simple-array (unsigned-byte 8) (16)))
-  "The local participant's 16-octet user-data writer GUID (prefix + the node's
-   user-writer EntityId, RTPS 2.5 §9.3.1.2) — the §9.5.2 KeyMaterial sender_key_id source for
-   the CryptoTokens we send (ties the key material to the writer the participant advertises)."
-  (%guid-from-prefix (dds.disc:disc-node-guid-prefix node)
-                     (dds.disc:disc-node-user-writer-id node)))
+;; (T8 removed %local-writer-guid — the KEYX PSM crypto-token senders that used it are retired; the
+;; crypto-manager now builds per-entity GUIDs via %guid-from-prefix + the node's user/builtin EntityIds.)
 
 ;;; --- PSM send helpers ---
 
@@ -172,88 +164,26 @@
         (dds.disc:%send-stateless-message node dest-prefix env))))
   t)
 
-(defun* %am-send-crypto-tokens (node dest-prefix km kx-key)
-    (function (dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
-               dds.security:key-material dds.security:kx-key-handle) t)
-  "Build a §7.4.4 CryptoToken ParticipantGenericMessage carrying KM (the local writer's §9.5.2
-   KeyMaterial), KxKey-encrypted under KX-KEY (keys never in clear, §9.5.3 intent), and send it
-   over the PSM stateless transport to DEST-PREFIX (message_class_id
-   'dds.sec.participant_crypto_tokens', T3)."
-  (dds.disc:%send-stateless-message
-   node dest-prefix
-   (dds.security:make-crypto-token-message
-    km (dds.security:kx-key-bytes kx-key)
-    (%local-writer-guid node)
-    (%guid-from-prefix dest-prefix dds.rtps.message:+entityid-participant+)))
-  t)
+;; Defined in crypto-manager.lisp (loaded after this file); forward-declared so %am-drive-handshake +
+;; %install-auth-manager reach the T8 §8.5 crypto-token exchange / promotion without a compile-time
+;; undefined-function warning (the crypto-manager mediates :authenticated->:keyed, design §7.2).
+(declaim (ftype (function (t dds.disc:disc-node (simple-array (unsigned-byte 8) (12))) (eql t))
+                cm-on-authenticated))
+(declaim (ftype (function (domain-participant auth-manager-state dds.disc:disc-node) t)
+                %install-crypto-manager))
 
-;;; --- key-exchange internals (CALLER HOLDS the manager lock) ---
+;;; --- :authenticated transition (CALLER HOLDS the manager lock) ---
 
-(defun* %am-get-or-create-writer-km (ms writer-guid)
-    (function (auth-manager-state (simple-array (unsigned-byte 8) (16)))
-              dds.security:key-material)
-  "Get-or-create the single §9.5.2 KeyMaterial for WRITER-GUID from MS's WRITER-KM-TABLE.
-   If the table already has an entry for WRITER-GUID return it unchanged (idempotent);
-   otherwise call GENERATE-WRITER-KEY-MATERIAL once and store + return the result.
-   CALLER HOLDS the manager lock (the table is under MS's LOCK). The EQUALP hash-table key
-   ensures 16-octet array identity-by-value, not pointer identity (RTPS 2.5 §9.3.1.2)."
-  (let ((existing (gethash writer-guid (auth-manager-state-writer-km-table ms))))
-    (or existing
-        (let ((km (dds.security:generate-writer-key-material writer-guid)))
-          (setf (gethash (copy-seq writer-guid)
-                         (auth-manager-state-writer-km-table ms))
-                km)
-          km))))
-
-(defun* %am-install-crypto-token (ar env kx-key)
-    (function (auth-remote (simple-array (unsigned-byte 8) (*)) dds.security:kx-key-handle) t)
-  "Parse + authenticate one CryptoToken envelope ENV under KX-KEY and, on success, install the
-   remote writer KeyMaterial into AR (§9.5.2). Fail-closed: PARSE-CRYPTO-TOKEN-MESSAGE returns
-   NIL on any malformed/truncated/forged/wrong-class input (bad KxKey, tamper) -> no install
-   (the remote stays unmatched; no plaintext fallback). CALLER HOLDS the manager lock."
-  (let ((km (dds.security:parse-crypto-token-message env (dds.security:kx-key-bytes kx-key))))
-    (when km
-      (setf (auth-remote-remote-km ar) km)))
-  t)
-
-(defun* %am-on-authenticated (ms node ar)
-    (function (auth-manager-state dds.disc:disc-node auth-remote) t)
-  "In-lock key-exchange work on reaching :authenticated for AR (CALLER HOLDS the manager lock;
-   no network I/O here — the PSM send is done by the caller OUTSIDE the lock, matching the
-   type-gate's never-hold-the-lock-across-a-send discipline). Derive the §9.5.3 KxKey from the
-   handshake's SharedSecret + challenges (idempotent — once). Get-or-create the single §9.5.2
-   writer KeyMaterial for the local writer GUID from MS's WRITER-KM-TABLE (%AM-GET-OR-CREATE-WRITER-KM)
-   and stash it in AR's LOCAL-KM (§9.5: ONE KeyMaterial per writer, identical for every remote).
-   Drain any CryptoTokens that arrived before the KxKey existed. Returns T iff the caller must
-   send the stashed CryptoTokens. Fail-closed: a missing SharedSecret leaves AR with no key
-   material (it stays unmatched)."
-  (let ((handle (auth-remote-handle ar)))
-    (unless (and handle (eq (dds.security:handshake-handle-state handle) :authenticated))
-      (return-from %am-on-authenticated nil))
-    ;; derive the KxKey once (symmetric: both sides get the same key from the same SharedSecret+challenges)
-    (unless (auth-remote-kx-key ar)
-      (let ((ss (dds.security:handshake-shared-secret handle)))
-        (when ss
-          (setf (auth-remote-kx-key ar)
-                (dds.security:derive-kx-key
-                 (dds.security:shared-secret-bytes ss)
-                 (dds.security:shared-secret-handle-challenge1-bytes ss)
-                 (dds.security:shared-secret-handle-challenge2-bytes ss))))))
-    (let ((kx-key (auth-remote-kx-key ar)) (want-send nil))
-      (when kx-key
-        ;; get-or-create the single per-writer KeyMaterial (§9.5: same key sent to every remote)
-        (when (not (auth-remote-local-sent-p ar))
-          (let ((km (%am-get-or-create-writer-km ms (%local-writer-guid node))))
-            (setf (auth-remote-local-km ar) km
-                  want-send t)))
-        ;; drain any CryptoTokens that arrived before the KxKey was ready (PSM best-effort, no resend)
-        (let ((pending (auth-remote-pending-ct ar)))
-          (setf (auth-remote-pending-ct ar) '())
-          (dolist (env (nreverse pending))
-            (%am-install-crypto-token ar env kx-key))))
-      (when (member (auth-remote-state ar) '(:none :handshaking))
-        (setf (auth-remote-state ar) :authenticated))
-      want-send)))
+(defun* %am-mark-authenticated (ar)
+    (function (auth-remote) boolean)
+  "Mark AR :authenticated on a completed §8.7.2.4 handshake (CALLER HOLDS the manager lock). Returns T iff
+   it JUST transitioned from :none/:handshaking (so the caller drives the §8.5 crypto-token exchange ONCE,
+   OUTSIDE the lock — cm-on-authenticated). Idempotent: a no-op NIL if already :authenticated/:keyed/
+   :rejected. The KEYX in-lock KxKey-derive + per-writer-KM + crypto-token-send is RETIRED — the bootstrap-KM
+   derivation + token exchange now live in cm-on-authenticated over reliable PVMS (T8, design §6.4/§7.2)."
+  (when (member (auth-remote-state ar) '(:none :handshaking))
+    (setf (auth-remote-state ar) :authenticated)
+    t))
 
 (defun* %am-bind-and-check-subject (ar prefix)
     (function (auth-remote (simple-array (unsigned-byte 8) (12))) boolean)
@@ -359,11 +289,12 @@
   "Drive the §8.7.2.4 handshake one step for AR given the incoming handshake token (internal
    tagged octets). Under the manager lock: a :replier with no in-flight handle does
    BEGIN-HANDSHAKE-REPLY (first request); otherwise PROCESS-HANDSHAKE drives the next step; on
-   reaching :authenticated the in-lock key-exchange work runs (%AM-ON-AUTHENTICATED). Both the
-   produced next handshake token AND the stashed CryptoTokens are sent over PSM OUTSIDE the lock
-   (never hold the lock across a network send — the type-gate discipline). Fail-closed: a
-   nil/failed handshake step records :rejected and installs no keys. Returns T (hook ignores it)."
-  (let ((next-octets nil) (send-ct nil) (km nil) (kx-key nil))
+   reaching :authenticated AR is marked :authenticated (%AM-MARK-AUTHENTICATED). The produced next
+   handshake token is sent over PSM, and the §8.5 crypto-token exchange (cm-on-authenticated: PVMS
+   bootstrap-KM derive + token send over reliable PVMS) is driven, BOTH OUTSIDE the lock (never hold the
+   lock across a network send — the type-gate discipline). Fail-closed: a nil/failed handshake step records
+   :rejected and installs no keys. Returns T (hook ignores it)."
+  (let ((next-octets nil) (do-cm nil))
     (dds.pal:with-lock ((auth-manager-state-lock ms))
       (block in-lock
         (when (eq (auth-remote-state ar) :rejected)
@@ -399,18 +330,16 @@
                 (when (eq (dds.security:handshake-handle-state (auth-remote-handle ar)) :authenticated)
                   ;; authorize on the VALIDATED handshake-cert subject (unforgeable) + §8.7.2.5 token-vs-cert binding
                   (if (%am-bind-and-check-subject ar prefix)
-                      (when (%am-on-authenticated ms node ar)
-                        (setf send-ct t km (auth-remote-local-km ar)
-                              kx-key (auth-remote-kx-key ar)))
+                      (when (%am-mark-authenticated ar) (setf do-cm t))
                       (setf (auth-remote-state ar) :rejected next-octets nil))))))))))
-    ;; send the produced token + the CryptoTokens OUTSIDE the manager lock
+    ;; send the produced handshake token OUTSIDE the manager lock
     (when next-octets
       (%am-send-handshake node (dds.disc:disc-node-guid-prefix node) prefix next-octets))
-    (when (and send-ct km kx-key)
-      (%am-send-crypto-tokens node prefix km kx-key)
-      (dds.pal:with-lock ((auth-manager-state-lock ms))
-        (setf (auth-remote-local-sent-p ar) t))
-      (%am-log prefix "authenticated; KxKey derived; sent writer CryptoTokens"))
+    ;; drive the §8.5.2 crypto-token exchange over reliable PVMS OUTSIDE the lock (T8): derive+install the
+    ;; §9.5.3.1 bootstrap KM, register local crypto, send our Participant + builtin/user EntityCrypto tokens.
+    (when do-cm
+      (%am-log prefix "authenticated; driving crypto-token exchange over PVMS")
+      (cm-on-authenticated (auth-manager-state-crypto-manager ms) node prefix))
     t))
 
 (defun* %am-on-stateless-message (p node src-prefix envelope-octets)
@@ -418,12 +347,14 @@
                (simple-array (unsigned-byte 8) (*)))
               t)
   "ON-STATELESS-MESSAGE hook (receiver thread, OUTSIDE the node lock, RAW envelope octets from
-   dds-disc per Decision 1): PARSE-GENERIC-MESSAGE, read message_class_id, and DISPATCH —
+   dds-disc per Decision 1): PARSE-GENERIC-MESSAGE, read message_class_id, and DISPATCH the §8.7
+   AUTHENTICATION handshake only —
      +AUTH-MESSAGE-CLASS-ID+ ('dds.sec.auth')          -> handshake path
-       (DATAHOLDER->HANDSHAKE-TOKEN -> %SERIALIZE-TOKEN -> %AM-DRIVE-HANDSHAKE);
-     +GM-PARTICIPANT-CRYPTO-TOKENS+ ('dds.sec.participant_crypto_tokens') -> key-material path
-       (install now if the KxKey exists, else buffer until %AM-ON-AUTHENTICATED drains it).
-   When BOTH authenticated AND the remote KeyMaterial is installed -> :keyed -> resume matches.
+       (DATAHOLDER->HANDSHAKE-TOKEN -> %SERIALIZE-TOKEN -> %AM-DRIVE-HANDSHAKE).
+   The §8.5.2 CRYPTO-TOKEN exchange NO LONGER rides PSM (T8): it moved to the reliable PVMS endpoint
+   (%am-on-volatile-secure -> cm-on-crypto-token), so any non-handshake class here is dropped (the prior
+   best-effort-PSM +gm-participant-crypto-tokens+ path is RETIRED). The :authenticated->:keyed promotion is
+   now mediated by the crypto-manager (%cm-try-promote), not here.
    FAIL-CLOSED throughout (block/return-from; no handler-case in nested mvb — Clasp): any
    malformed/unknown/unsolicited message is silently dropped; the receiver thread MUST NOT crash."
   (block %am-on-psm
@@ -434,68 +365,22 @@
           (dds.security:parse-generic-message envelope-octets)
         (declare (ignore src-guid sn rel-guid rel-sn dest-part dest-ep src-ep))
         (when (null class-id) (return-from %am-on-psm t))
+        ;; only the §8.7 handshake class rides PSM now (crypto tokens moved to PVMS, T8)
+        (unless (string= class-id dds.security:+auth-message-class-id+) (return-from %am-on-psm t))
         ;; locate the per-remote record (must already exist from discovery)
         (let ((ar (dds.pal:with-lock ((auth-manager-state-lock ms))
                     (gethash src-prefix (dds.disc:disc-node-auth-state node)))))
           (when (null ar) (return-from %am-on-psm t))
-          (cond
-            ;; --- handshake path ---
-            ((string= class-id dds.security:+auth-message-class-id+)
-             (when (null dh-list) (return-from %am-on-psm t))
-             (let ((tok (dds.security:dataholder->handshake-token (car dh-list))))
-               (when (null tok) (return-from %am-on-psm t))
-               (%am-drive-handshake ms node src-prefix ar (dds.security::%serialize-token tok))))
-            ;; --- crypto-token (key-material) path ---
-            ((string= class-id dds.security:+gm-participant-crypto-tokens+)
-             (dds.pal:with-lock ((auth-manager-state-lock ms))
-               (let ((kx-key (auth-remote-kx-key ar)))
-                 (if kx-key
-                     (%am-install-crypto-token ar envelope-octets kx-key)
-                     ;; KxKey not derived yet (we authenticate slightly later): buffer it
-                     (push (copy-seq envelope-octets) (auth-remote-pending-ct ar))))))
-            ;; --- unknown class: drop (fail-closed) ---
-            (t (return-from %am-on-psm t)))
-          ;; both authenticated AND remote KeyMaterial installed -> :keyed -> resume (outside lock)
-          (let ((flip nil))
-            (dds.pal:with-lock ((auth-manager-state-lock ms))
-              (when (and (eq (auth-remote-state ar) :authenticated)
-                         (auth-remote-remote-km ar))
-                (setf (auth-remote-state ar) :keyed flip t)))
-            (when flip
-              (%am-log src-prefix "keyed; installing crypto-keys resolver + resuming matches")
-              (%am-install-crypto-resolver p ms node)   ; T6: wire the dynamic key resolver before resuming
-              (dds.disc:resume-parked-matches node)))))))
+          (when (null dh-list) (return-from %am-on-psm t))
+          (let ((tok (dds.security:dataholder->handshake-token (car dh-list))))
+            (when (null tok) (return-from %am-on-psm t))
+            (%am-drive-handshake ms node src-prefix ar (dds.security::%serialize-token tok)))))))
   t)
 
-(defun* %am-install-crypto-resolver (p ms node)
-    (function (domain-participant auth-manager-state dds.disc:disc-node) (eql t))
-  "Install a CRYPTO-KEYS resolver on NODE's CRYPTO-TRANSFORM, backed by MS's WRITER-KM-TABLE
-   (per-writer encode) and per-remote AUTH-REMOTE tables (per-remote decode). Encode closure:
-   resolves the local writer's KeyMaterial by an O(1) lookup in MS's WRITER-KM-TABLE, keyed by
-   the 16-octet writer GUID (§9.5: one KeyMaterial per writer, identical value for ALL remotes;
-   no maphash scan, no non-determinism across multiple authenticated peers). Decode closure:
-   resolves the remote writer's KeyMaterial by the first 12 octets (RTPS 2.5 §9.3.1.2 GuidPrefix_t)
-   of the 16-octet wire GUID, looked up in the per-remote AUTH-REMOTE table (§9.5.2 REMOTE-KM).
-   Both closures hold the manager lock and read dynamically so later :keyed remotes are visible.
-   Fails closed: NIL -> caller drops the sample (no plaintext fallback). CALLER DOES NOT HOLD lock."
-  (declare (ignore p))
-  (setf (dds.disc:disc-node-crypto-transform node)
-        (dds.security:make-crypto-keys
-         :encode-key-fn
-         (lambda (writer-guid)
-           ; O(1) table lookup — the single per-writer KeyMaterial, same for every authenticated remote
-           (dds.pal:with-lock ((auth-manager-state-lock ms))
-             (gethash writer-guid (auth-manager-state-writer-km-table ms))))
-         :decode-key-fn
-         (lambda (remote-writer-guid)
-           ; resolve remote KeyMaterial by the 12-octet GuidPrefix of the wire writer GUID
-           (let ((prefix (make-array 12 :element-type '(unsigned-byte 8))))
-             (replace prefix remote-writer-guid :end2 12)
-             (dds.pal:with-lock ((auth-manager-state-lock ms))
-               (let ((ar (gethash prefix (dds.disc:disc-node-auth-state node))))
-                 (when (and ar (eq (auth-remote-state ar) :keyed))
-                   (auth-remote-remote-km ar))))))))
-  t)
+;; T8: the KEYX %am-install-crypto-resolver (CRYPTO-KEYS backed by WRITER-KM-TABLE encode + per-remote
+;; AUTH-REMOTE REMOTE-KM decode) is RETIRED. The user-data encode/decode resolver is now the crypto-manager's
+;; cm-decode-keys (§8.5 EntityCrypto registries), installed by %cm-try-promote on the :authenticated->:keyed
+;; promotion — the per-writer/entity KeyMaterial flows over reliable PVMS, not best-effort PSM (design §6.4/§7.2).
 
 ;;; --- the strict auth-gate (§7.3, consulted at endpoint match, OUTSIDE the node lock) ---
 
@@ -533,18 +418,22 @@
 (defun* %install-auth-manager (p identity-handle)
     (function (domain-participant dds.security:identity-handle) domain-participant)
   "Create P's DDS-Security §8.7 auth-manager state (holding IDENTITY-HANDLE — the local identity
-   with the private key) and install its three hooks on P's disc-node: ON-PARTICIPANT-DISCOVERED
-   (the requester trigger / replier pre-stash), ON-STATELESS-MESSAGE (the raw-envelope handshake
-   + key-material dispatcher), and AUTH-GATE (the strict §7.3 endpoint-match verdict). Installed
+   with the private key) and install its hooks on P's disc-node: ON-PARTICIPANT-DISCOVERED
+   (the requester trigger / replier pre-stash), ON-STATELESS-MESSAGE (the raw-envelope §8.7 handshake
+   dispatcher), and AUTH-GATE (the strict §7.3 endpoint-match verdict); plus the §8.5 crypto-manager +
+   reliable PVMS endpoint with the crypto-token receiver hook (%install-crypto-manager, T8). Installed
    ONLY for a security-enabled participant (an identity configured); a participant with no
    identity keeps DP-AUTH-STATE NIL and the gate stays :compatible (byte-identical plain path).
    The disc-node must already advertise this identity's IdentityToken in SPDP. Returns P."
-  (setf (dp-auth-state p) (%make-auth-manager-state :identity identity-handle))
-  (let ((node (dp-node p)))
-    (setf (dds.disc:disc-node-on-participant-discovered node)
-          (lambda (n prefix spdp) (%am-on-participant-discovered p n prefix spdp)))
-    (setf (dds.disc:disc-node-on-stateless-message node)
-          (lambda (n src-prefix envelope) (%am-on-stateless-message p n src-prefix envelope)))
-    (setf (dds.disc:disc-node-auth-gate node)
-          (lambda (n remote local) (%participant-auth-gate p n remote local))))
+  (let ((ms (%make-auth-manager-state :identity identity-handle)))
+    (setf (dp-auth-state p) ms)
+    (let ((node (dp-node p)))
+      (setf (dds.disc:disc-node-on-participant-discovered node)
+            (lambda (n prefix spdp) (%am-on-participant-discovered p n prefix spdp)))
+      (setf (dds.disc:disc-node-on-stateless-message node)
+            (lambda (n src-prefix envelope) (%am-on-stateless-message p n src-prefix envelope)))
+      (setf (dds.disc:disc-node-auth-gate node)
+            (lambda (n remote local) (%participant-auth-gate p n remote local)))
+      ;; T8: §8.5 crypto-manager + reliable PVMS endpoint (crypto-token exchange carrier) + receiver hook
+      (%install-crypto-manager p ms node)))
   p)

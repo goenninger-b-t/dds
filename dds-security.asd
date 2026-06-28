@@ -7,9 +7,16 @@
   :pathname "src/dds-security"
   :serial t
   :components ((:file "packages")
+               (:file "crypto/crypto-header")
                (:file "crypto")
                (:file "key-material")
                (:file "transform")
+               (:module "crypto-plugin"
+                :pathname "crypto"
+                :serial t
+                :components ((:file "constants")
+                             (:file "submessage")
+                             (:file "rtps-message")))
                (:module "auth"
                 :serial t
                 :components ((:file "constants")

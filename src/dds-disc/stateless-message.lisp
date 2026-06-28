@@ -9,26 +9,43 @@
 
 (in-package #:dds.disc)
 
+(defun* %psm-encapsulate (envelope-octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
+  "Prefix ENVELOPE-OCTETS (a CDR-LE ParticipantGenericMessage blob) with the 4-octet PLAIN_CDR_LE
+   SerializedPayload encapsulation header (RTPS 2.5 §10.2). The ParticipantStatelessMessage rides a
+   regular builtin DataWriter, so its SerializedPayload MUST carry the encapsulation header like every
+   other DATA — corroborated against Fast DDS SecurityManager.cpp:933-938 (addOctet 0, DEFAULT_ENCAPSULATION,
+   addUInt16 0 before the ParticipantGenericMessage; read back at :1462-1470). Control-plane; per-message alloc fine."
+  (let* ((hdr (dds.core.buffer:make-octet-buffer 4))
+         (hc  (dds.core.buffer:cursor hdr :endianness :little))
+         (out (make-array (+ 4 (length envelope-octets)) :element-type '(unsigned-byte 8))))
+    (dds.cdr:make-encapsulation-header hc :plain-cdr-le)
+    (replace out (dds.core.buffer:octet-buffer-vec hdr) :start1 0 :end1 4)
+    (replace out envelope-octets :start1 4)
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec hdr))
+    out))
+
 (defun* %send-stateless-message (node dest-prefix envelope-octets)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t)
   "Send ENVELOPE-OCTETS (a T2 ParticipantGenericMessage blob) as a best-effort DATA submessage
    with writerId = +entityid-participant-stateless-writer+ and readerId =
    +entityid-participant-stateless-reader+ (DDS-Security 1.1 §7.4.3, best-effort — no HEARTBEAT).
-   The envelope is sent as the SerializedPayload body directly (no encapsulation header added here:
-   the PSM DATA SerializedPayload *is* the CDR-LE envelope, §7.4.4). Destination: DEST-PREFIX's
-   metatraffic unicast locator (looked up under the node lock via %remote-metatraffic). No-op if
-   the remote is not yet discovered or has no usable locator. Uses the rx-tx-msg scratch buffer
-   (called from the receiver thread during handshake callback)."
+   The SerializedPayload is the §10.2 PLAIN_CDR_LE encapsulation header (%psm-encapsulate) + the
+   CDR-LE envelope, matching a conformant peer (Fast DDS prepends/strips this header). Destination:
+   DEST-PREFIX's metatraffic unicast locator (looked up under the node lock via %remote-metatraffic).
+   No-op if the remote is not yet discovered or has no usable locator. Uses the rx-tx-msg scratch
+   buffer (called from the receiver thread during handshake callback)."
   (let ((hp (%remote-metatraffic node dest-prefix)))
     (when hp
-      (%send-msg-buf node (disc-node-rx-tx-msg node)
-                     (lambda (mc)
-                       ;; writer-SN 0: best-effort PSM, no reliable-channel SN discipline (DDS-Security 1.1 §7.4.3)
-                       (dds.rtps.message:write-data
-                        mc dds.rtps.discovery:+entityid-participant-stateless-reader+
-                        dds.rtps.discovery:+entityid-participant-stateless-writer+
-                        0 envelope-octets 0 (length envelope-octets)))
-                     (car hp) (cdr hp))))
+      (let ((payload (%psm-encapsulate envelope-octets)))
+        (%send-msg-buf node (disc-node-rx-tx-msg node)
+                       (lambda (mc)
+                         ;; writer-SN 0: best-effort PSM, no reliable-channel SN discipline (DDS-Security 1.1 §7.4.3)
+                         (dds.rtps.message:write-data
+                          mc dds.rtps.discovery:+entityid-participant-stateless-reader+
+                          dds.rtps.discovery:+entityid-participant-stateless-writer+
+                          0 payload 0 (length payload)))
+                       (car hp) (cdr hp)))))
   t)
 
 (defun* %on-stateless-message (node src-prefix wtr sn buf poff plen)
@@ -47,14 +64,17 @@
    symmetry with %on-participant-message."
   (declare (ignore wtr sn))
   (block %on-psm ; explicit block so (return-from %on-psm t) is a clean early exit
-    (unless (and (plusp plen)
+    ;; Require the 4-octet §10.2 encapsulation header + at least an empty body (fail-closed on a runt).
+    (unless (and (>= plen 4)
                  (<= (+ poff plen) (dds.core.buffer:octet-buffer-capacity buf)))
       (return-from %on-psm t))
     (let ((hook (disc-node-on-stateless-message node)))
       (unless hook (return-from %on-psm t))
-      ;; copy the envelope out of the shared receive buffer before releasing the buffer lock,
-      ;; then deliver the RAW octets to the hook outside the node lock (the manager parses/dispatches)
-      (let ((octets (make-array plen :element-type '(unsigned-byte 8))))
-        (replace octets (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
+      ;; Strip the PLAIN_CDR_LE SerializedPayload encapsulation header (§10.2, %psm-encapsulate's
+      ;; counterpart; Fast DDS SecurityManager.cpp:1462-1470 reads it back) before delivering the bare
+      ;; ParticipantGenericMessage envelope. Copy out of the shared receive buffer under no lock; the
+      ;; manager (dds-dcps) parses/dispatches handshake vs crypto-token.
+      (let ((octets (make-array (- plen 4) :element-type '(unsigned-byte 8))))
+        (replace octets (dds.core.buffer:octet-buffer-vec buf) :start2 (+ poff 4) :end2 (+ poff plen))
         (funcall hook node src-prefix octets))))
   t)

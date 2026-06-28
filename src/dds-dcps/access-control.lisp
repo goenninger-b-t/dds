@@ -63,8 +63,8 @@
         (unless (eq (car snap) :keyed) (return-from gate :pending)) ; auth in flight -> park, resumed on :keyed
         (let ((remote-subject (cdr snap)))                          ; the VALIDATED handshake-cert subject (unforgeable)
           (when (null remote-subject) (return-from gate :incompatible))   ; no validated subject -> cannot authorize -> deny
-          (let ((grant (find remote-subject (dds.security:access-handle-grants ah)
-                             :key #'dds.security:permissions-subject-name :test #'string=)))
+          (let ((grant (dds.security:permissions-grant-for
+                        remote-subject (dds.security:access-handle-grants ah))))
             (when (null grant) (return-from gate :incompatible))   ; remote subject has no permissions grant -> deny
             (let* ((topic   (dds.rtps.discovery:endpoint-data-topic-name remote))
                    (allowed (if (%remote-writer-p remote)
@@ -81,8 +81,56 @@
    disc-node PERMISSIONS-GATE hook (composed after the Slice-2 auth-gate). Installed ONLY for an
    access-controlled participant (governance + permissions configured AND an identity); a participant
    with no permissions keeps DP-ACCESS-STATE NIL and the gate stays :compatible (byte-identical plain
-   path). DELETE-PARTICIPANT frees the held access-handle. Returns P."
+   path). When governance protects discovery, also install the secure-SEDP routing predicate + the
+   EFFECTIVE base protection kind (SECURE-SEDP-PROTECTION-KIND) so the announce HONORS the
+   discovery_protection_kind directive (SIGN vs ENCRYPT). DELETE-PARTICIPANT frees the held access-handle.
+   Returns P."
   (setf (dp-access-state p) access-handle)
   (setf (dds.disc:disc-node-permissions-gate (dp-node p))
         (lambda (node remote local) (%participant-permissions-gate p node remote local)))
+  ;; T9 (DDS-Security 1.1 §9.4.1.2.3): when governance protects discovery (discovery_protection_kind != NONE)
+  ;; install the per-topic predicate that routes a protected topic's DiscoveredWriter/ReaderData ONLY over the
+  ;; secure SEDP endpoints (off plain SEDP) and, being non-NIL, marks secure discovery active (so the disc-node
+  ;; advertises SPDP BuiltinEndpointSet bits 16-19). The announce HONORS the directive's base kind via
+  ;; SECURE-SEDP-PROTECTION-KIND (:sign authenticated-but-visible | :encrypt confidential — NOT a hardcoded
+  ;; ENCRYPT; T9-review conformance fix). T-ORIGINAUTH: protection-kind-base ALSO yields whether the
+  ;; *_WITH_ORIGIN_AUTHENTICATION tier applies — set SECURE-SEDP-ORIGIN-AUTH so the crypto-manager mints
+  ;; receiver-specific keys for the secure-SEDP readers and the announce/decode emit/verify per-receiver MACs
+  ;; (§9.5.3.3.4.3). discovery_protection_kind = NONE leaves all slots default -> the plain SEDP path is
+  ;; byte-identical (the secure-SEDP resolvers installed by %install-crypto-manager never engage —
+  ;; %announce-secure-endpoints is a no-op without a protected-topic predicate; origin-auth stays NIL).
+  (let* ((gov (dds.security:access-handle-governance access-handle))
+         (disc-kind (and gov (dds.security:governance-discovery-protection gov))))
+    (when (and disc-kind (not (eq disc-kind :none)))
+      (multiple-value-bind (base origin-auth) (dds.security:protection-kind-base disc-kind)
+        (setf (dds.disc:disc-node-secure-sedp-protection-kind (dp-node p)) base)
+        (setf (dds.disc:disc-node-secure-sedp-origin-auth (dp-node p)) origin-auth))
+      (setf (dds.disc:disc-node-discovery-protected-topic-p (dp-node p))
+            (lambda (topic) (dds.security:topic-discovery-protected-p gov topic)))))
+  ;; T11 (DDS-Security 1.1 §8.4.1.6 / §9.4.1.2.3): when governance protects liveliness
+  ;; (liveliness_protection_kind != NONE) install the EFFECTIVE base kind (SECURE-PM-PROTECTION-KIND :sign|:encrypt
+  ;; — so the secure WLP HONORS the directive, never a hardcoded ENCRYPT) + the origin-auth flag
+  ;; (SECURE-PM-ORIGIN-AUTH, §9.5.3.3.4.3). When != :none, assert-participant-liveliness routes every WLP assertion
+  ;; over the secure BuiltinParticipantMessageSecureWriter (off plain) and SPDP advertises bits 20/21. The secure
+  ;; SPDP re-announce needs NO install here — it rides the discovery tier above (bits 26/27, gated on
+  ;; discovery-protected-topic-p, protected per SECURE-SEDP-PROTECTION-KIND). NONE leaves the slot :none ->
+  ;; plain WLP, BYTE-IDENTICAL (the secure WLP announce is a no-op without a non-NONE kind).
+  (let* ((gov (dds.security:access-handle-governance access-handle))
+         (live-kind (and gov (dds.security:governance-liveliness-protection gov))))
+    (when (and live-kind (not (eq live-kind :none)))
+      (multiple-value-bind (base origin-auth) (dds.security:protection-kind-base live-kind)
+        (setf (dds.disc:disc-node-secure-pm-protection-kind (dp-node p)) base)
+        (setf (dds.disc:disc-node-secure-pm-origin-auth (dp-node p)) origin-auth))))
+  ;; T10 (DDS-Security 1.1 §9.4.1.2.3 / §8.5.1.10-.12): when governance protects whole-RTPS messages
+  ;; (rtps_protection_kind != NONE) install the EFFECTIVE base kind (RTPS-PROTECTION-KIND :sign|:encrypt — so the
+  ;; engagement HONORS the directive, never a hardcoded ENCRYPT) and the origin-auth flag (protection-kind-base's
+  ;; second value -> RTPS-PROTECTION-ORIGIN-AUTH, driving the crypto-manager to mint the local ParticipantCrypto's
+  ;; receiver-specific key, §9.5.3.3.4.3). rtps_protection_kind = NONE leaves both default -> the data path is plain,
+  ;; BYTE-IDENTICAL (the crypto-manager's rtps-protection-encode resolver never wraps under :none).
+  (let* ((gov (dds.security:access-handle-governance access-handle))
+         (rtps-kind (and gov (dds.security:governance-rtps-protection gov))))
+    (when (and rtps-kind (not (eq rtps-kind :none)))
+      (multiple-value-bind (base origin-auth) (dds.security:protection-kind-base rtps-kind)
+        (setf (dds.disc:disc-node-rtps-protection-kind (dp-node p)) base)
+        (setf (dds.disc:disc-node-rtps-protection-origin-auth (dp-node p)) origin-auth))))
   p)

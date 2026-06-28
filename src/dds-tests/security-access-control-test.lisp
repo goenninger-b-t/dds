@@ -28,10 +28,13 @@
     (let ((rules (dds.security:governance-topic-rules gov)))
       (%check :gov-topic-rules-nonempty (not (null rules)) "topic-rules must be non-empty")
       (let ((r (first rules)))
-        (%check :gov-topic-expr  (string= "*" (car r))
-                (format nil "first topic_expression must be '*'; got ~s" (car r)))
-        (%check :gov-read-ac     (cadr r) "enable_read_access_control must be T for '*'")
-        (%check :gov-write-ac    (cddr r) "enable_write_access_control must be T for '*'")))
+        (%check :gov-topic-rule-type (dds.security:topic-rule-p r) "first rule is not a topic-rule struct")
+        (%check :gov-topic-expr  (string= "*" (dds.security:topic-rule-topic-expr r))
+                (format nil "first topic_expression must be '*'; got ~s" (dds.security:topic-rule-topic-expr r)))
+        (%check :gov-read-ac     (dds.security:topic-rule-enable-read-ac r)
+                "enable_read_access_control must be T for '*'")
+        (%check :gov-write-ac    (dds.security:topic-rule-enable-write-ac r)
+                "enable_write_access_control must be T for '*'")))
     (multiple-value-bind (r-ac w-ac) (dds.security:governance-topic-rule gov "Square")
       (%check :gov-rule-read  r-ac "governance-topic-rule must return read-ac=T for 'Square'")
       (%check :gov-rule-write w-ac "governance-topic-rule must return write-ac=T for 'Square'"))
@@ -269,7 +272,9 @@
   (let* ((asym-gov (dds.security:make-governance
                     :allow-unauthenticated nil
                     :enable-join-ac t
-                    :topic-rules (list (cons "Square" (cons t nil)))))
+                    :topic-rules (list (dds.security:make-topic-rule
+                                        :topic-expr "Square"
+                                        :enable-read-ac t :enable-write-ac nil))))
          ;; deny-perms: empty rules + default=:deny => publish/subscribe both NIL
          (deny-perms (dds.security:make-permissions
                       :subject-name "/CN=AsymTest/O=Test/C=DE"
@@ -408,7 +413,9 @@
              ;; A writer/reader direction swap in the gate inverts both verdicts — this detects it.
              (let* ((dir-gov    (dds.security:make-governance
                                  :allow-unauthenticated nil :enable-join-ac t
-                                 :topic-rules (list (cons "*" (cons t t)))))   ; read-AC=T, write-AC=T
+                                 :topic-rules (list (dds.security:make-topic-rule  ; read-AC=T, write-AC=T
+                                                     :topic-expr "*"
+                                                     :enable-read-ac t :enable-write-ac t))))
                     ;; allow-publish "Asym" only; subscribe falls through to default :deny
                     (dir-perms  (dds.security:make-permissions
                                  :subject-name "/CN=DirTest/O=DDS-Test/C=DE"
@@ -778,4 +785,249 @@
                                (coerce pt 'list))))))
       (when p-off-r (ignore-errors (dds.dcps:delete-participant p-off-r)))
       (when p-off-w (ignore-errors (dds.dcps:delete-participant p-off-w)))))
+  t)
+
+;;; WP-DDS-SECURITY-SECURE-DISCOVERY T5 — Governance protection-kind model.
+
+(defun* %read-ssd-xml (filename)
+    (function (string) (simple-array (unsigned-byte 8) (*)))
+  "Read an unsigned XML fixture file relative to +TEST-SSD-PKI-ROOT+."
+  (let* ((path (merge-pathnames filename dds.security:+test-ssd-pki-root+)))
+    (with-open-file (s path :element-type '(unsigned-byte 8))
+      (let* ((n (file-length s))
+             (v (make-array n :element-type '(unsigned-byte 8))))
+        (read-sequence v s)
+        v))))
+
+(defun* %make-governance-xml-octets (disc-kind-str)
+    (function (string) (simple-array (unsigned-byte 8) (*)))
+  "Build minimal Governance XML with the given DISC-KIND-STR for discovery_protection_kind (test helper)."
+  (let ((xml (format nil
+               "<?xml version=\"1.0\"?><dds><policies><domain_access_rules><domain_rule>~
+                <domains><id>0</id></domains>~
+                <allow_unauthenticated_participants>false</allow_unauthenticated_participants>~
+                <enable_join_access_control>true</enable_join_access_control>~
+                <discovery_protection_kind>~a</discovery_protection_kind>~
+                <liveliness_protection_kind>SIGN</liveliness_protection_kind>~
+                <rtps_protection_kind>SIGN</rtps_protection_kind>~
+                <topic_access_rules><topic_rule>~
+                <topic_expression>*</topic_expression>~
+                <enable_discovery_protection>false</enable_discovery_protection>~
+                <enable_liveliness_protection>false</enable_liveliness_protection>~
+                <enable_read_access_control>true</enable_read_access_control>~
+                <enable_write_access_control>true</enable_write_access_control>~
+                <metadata_protection_kind>ENCRYPT</metadata_protection_kind>~
+                <data_protection_kind>ENCRYPT</data_protection_kind>~
+                </topic_rule></topic_access_rules>~
+                </domain_rule></domain_access_rules></policies></dds>"
+               disc-kind-str)))
+    (map '(simple-array (unsigned-byte 8) (*)) #'char-code xml)))
+
+(defun* %make-governance-xml-no-disc-kind ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "Build minimal Governance XML with discovery_protection_kind ABSENT — proves fail-closed on missing required element."
+  (let ((xml "<?xml version=\"1.0\"?><dds><policies><domain_access_rules><domain_rule>\
+<domains><id>0</id></domains>\
+<allow_unauthenticated_participants>false</allow_unauthenticated_participants>\
+<enable_join_access_control>true</enable_join_access_control>\
+<liveliness_protection_kind>SIGN</liveliness_protection_kind>\
+<rtps_protection_kind>SIGN</rtps_protection_kind>\
+<topic_access_rules><topic_rule>\
+<topic_expression>*</topic_expression>\
+<enable_discovery_protection>false</enable_discovery_protection>\
+<enable_liveliness_protection>false</enable_liveliness_protection>\
+<enable_read_access_control>true</enable_read_access_control>\
+<enable_write_access_control>true</enable_write_access_control>\
+<metadata_protection_kind>ENCRYPT</metadata_protection_kind>\
+<data_protection_kind>ENCRYPT</data_protection_kind>\
+</topic_rule></topic_access_rules>\
+</domain_rule></domain_access_rules></policies></dds>"))
+    (map '(simple-array (unsigned-byte 8) (*)) #'char-code xml)))
+
+(defun* %make-governance-xml-bad-topic-kind ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "Build Governance XML with SIGN_WITH_ORIGIN_AUTHENTICATION in metadata_protection_kind — valid domain token, wrong per-topic tier."
+  (let ((xml "<?xml version=\"1.0\"?><dds><policies><domain_access_rules><domain_rule>\
+<domains><id>0</id></domains>\
+<allow_unauthenticated_participants>false</allow_unauthenticated_participants>\
+<enable_join_access_control>true</enable_join_access_control>\
+<discovery_protection_kind>SIGN</discovery_protection_kind>\
+<liveliness_protection_kind>SIGN</liveliness_protection_kind>\
+<rtps_protection_kind>SIGN</rtps_protection_kind>\
+<topic_access_rules><topic_rule>\
+<topic_expression>*</topic_expression>\
+<enable_discovery_protection>false</enable_discovery_protection>\
+<enable_liveliness_protection>false</enable_liveliness_protection>\
+<enable_read_access_control>true</enable_read_access_control>\
+<enable_write_access_control>true</enable_write_access_control>\
+<metadata_protection_kind>SIGN_WITH_ORIGIN_AUTHENTICATION</metadata_protection_kind>\
+<data_protection_kind>ENCRYPT</data_protection_kind>\
+</topic_rule></topic_access_rules>\
+</domain_rule></domain_access_rules></policies></dds>"))
+    (map '(simple-array (unsigned-byte 8) (*)) #'char-code xml)))
+
+(defun* run-governance-protection-kind-test ()
+    (function () t)
+  "T5 (WP-DDS-SECURITY-SECURE-DISCOVERY): Governance protection-kind model.
+   (a) governance-secure.xml: ENCRYPT/SIGN/ENCRYPT + topic enable_discovery=T + meta/data ENCRYPT.
+   (b) governance-origin-auth.xml: all ENCRYPT_WITH_ORIGIN_AUTHENTICATION / SIGN_WITH_ORIGIN_AUTHENTICATION.
+   (c) governance-none.xml: all NONE; enable_discovery=NIL; meta/data NONE.
+   (d) Missing required discovery_protection_kind element -> NIL (fail-closed; §9.4.1.2.3 requires element).
+   (e) Unknown token -> fail-closed (NIL, never :none).
+   (f) topic-discovery-protected-p: T for * in secure, NIL in none (non-vacuous parse assertions added).
+   (g) topic-metadata-protection: :encrypt for * in secure, :none in none (non-vacuous parse assertions added).
+   (h) Wrong-tier token (SIGN_WITH_ORIGIN_AUTHENTICATION in per-topic metadata field) -> NIL (tier guard)."
+
+  ;; (a) governance-secure.xml — ENCRYPT/SIGN/ENCRYPT
+  (let* ((xml (if (probe-file (merge-pathnames "governance-secure.xml" dds.security:+test-ssd-pki-root+))
+                  (%read-ssd-xml "governance-secure.xml")
+                  nil))
+         (gov (and xml (dds.security:parse-governance xml))))
+    (%check :t5-secure-parsed (not (null gov))
+            "parse-governance(governance-secure.xml) must return a governance struct")
+    (when gov
+      (%check :t5-secure-disc
+              (eq :encrypt (dds.security:governance-discovery-protection gov))
+              (format nil "governance-secure: discovery-protection must be :encrypt; got ~s"
+                      (dds.security:governance-discovery-protection gov)))
+      (%check :t5-secure-live
+              (eq :sign (dds.security:governance-liveliness-protection gov))
+              (format nil "governance-secure: liveliness-protection must be :sign; got ~s"
+                      (dds.security:governance-liveliness-protection gov)))
+      (%check :t5-secure-rtps
+              (eq :encrypt (dds.security:governance-rtps-protection gov))
+              (format nil "governance-secure: rtps-protection must be :encrypt; got ~s"
+                      (dds.security:governance-rtps-protection gov)))
+      (let ((rules (dds.security:governance-topic-rules gov)))
+        (%check :t5-secure-rules-nonempty (not (null rules))
+                "governance-secure: topic-rules must be non-empty")
+        (when rules
+          (let ((r (first rules)))
+            (%check :t5-secure-disc-p
+                    (dds.security:topic-rule-enable-discovery-protection r)
+                    "governance-secure: first topic-rule enable_discovery_protection must be T")
+            (%check :t5-secure-meta
+                    (eq :encrypt (dds.security:topic-rule-metadata-protection-kind r))
+                    (format nil "governance-secure: metadata_protection_kind must be :encrypt; got ~s"
+                            (dds.security:topic-rule-metadata-protection-kind r)))
+            (%check :t5-secure-data
+                    (eq :encrypt (dds.security:topic-rule-data-protection-kind r))
+                    (format nil "governance-secure: data_protection_kind must be :encrypt; got ~s"
+                            (dds.security:topic-rule-data-protection-kind r))))))))
+
+  ;; (b) governance-origin-auth.xml — ENCRYPT_WITH_ORIGIN_AUTHENTICATION
+  (let* ((xml (and (probe-file (merge-pathnames "governance-origin-auth.xml"
+                                                dds.security:+test-ssd-pki-root+))
+                   (%read-ssd-xml "governance-origin-auth.xml")))
+         (gov (and xml (dds.security:parse-governance xml))))
+    (%check :t5-oa-parsed (not (null gov))
+            "parse-governance(governance-origin-auth.xml) must return non-nil")
+    (when gov
+      (%check :t5-oa-disc
+              (eq :encrypt-with-origin-auth (dds.security:governance-discovery-protection gov))
+              (format nil "governance-origin-auth: discovery must be :encrypt-with-origin-auth; got ~s"
+                      (dds.security:governance-discovery-protection gov)))
+      (%check :t5-oa-live
+              (eq :sign-with-origin-auth (dds.security:governance-liveliness-protection gov))
+              (format nil "governance-origin-auth: liveliness must be :sign-with-origin-auth; got ~s"
+                      (dds.security:governance-liveliness-protection gov)))
+      (%check :t5-oa-rtps
+              (eq :encrypt-with-origin-auth (dds.security:governance-rtps-protection gov))
+              (format nil "governance-origin-auth: rtps must be :encrypt-with-origin-auth; got ~s"
+                      (dds.security:governance-rtps-protection gov)))))
+
+  ;; (c) governance-none.xml — all NONE; enable_discovery=NIL
+  (let* ((xml (and (probe-file (merge-pathnames "governance-none.xml"
+                                                dds.security:+test-ssd-pki-root+))
+                   (%read-ssd-xml "governance-none.xml")))
+         (gov (and xml (dds.security:parse-governance xml))))
+    (%check :t5-none-parsed (not (null gov))
+            "parse-governance(governance-none.xml) must return non-nil")
+    (when gov
+      (%check :t5-none-disc
+              (eq :none (dds.security:governance-discovery-protection gov))
+              (format nil "governance-none: discovery must be :none; got ~s"
+                      (dds.security:governance-discovery-protection gov)))
+      (%check :t5-none-live
+              (eq :none (dds.security:governance-liveliness-protection gov))
+              (format nil "governance-none: liveliness must be :none; got ~s"
+                      (dds.security:governance-liveliness-protection gov)))
+      (%check :t5-none-rtps
+              (eq :none (dds.security:governance-rtps-protection gov))
+              (format nil "governance-none: rtps must be :none; got ~s"
+                      (dds.security:governance-rtps-protection gov)))
+      (let ((rules (dds.security:governance-topic-rules gov)))
+        (when rules
+          (let ((r (first rules)))
+            (%check :t5-none-disc-p-false
+                    (not (dds.security:topic-rule-enable-discovery-protection r))
+                    "governance-none: enable_discovery_protection must be NIL")
+            (%check :t5-none-meta
+                    (eq :none (dds.security:topic-rule-metadata-protection-kind r))
+                    (format nil "governance-none: metadata_protection_kind must be :none; got ~s"
+                            (dds.security:topic-rule-metadata-protection-kind r))))))))
+
+  ;; (d) Missing required protection-kind → parse must return NIL (fail-closed; §9.4.1.2.3 requires element)
+  (let* ((xml (%make-governance-xml-no-disc-kind))
+         (gov (dds.security:parse-governance xml)))
+    (%check :t5-missing-disc-fail-closed (null gov)
+            "absent required discovery_protection_kind must make parse-governance return NIL (fail-closed)"))
+
+  ;; (e) Unknown token -> fail-closed (NIL, never :none)
+  (let* ((xml  (%make-governance-xml-octets "BOGUS_UNKNOWN_KIND"))
+         (gov  (dds.security:parse-governance xml)))
+    (%check :t5-unknown-token-nil (null gov)
+            "unknown protection-kind token BOGUS_UNKNOWN_KIND must make parse-governance return NIL (fail-closed)"))
+
+  ;; (f) topic-discovery-protected-p
+  (let* ((xml-s (and (probe-file (merge-pathnames "governance-secure.xml"
+                                                  dds.security:+test-ssd-pki-root+))
+                     (%read-ssd-xml "governance-secure.xml")))
+         (gov-s (and xml-s (dds.security:parse-governance xml-s)))
+         (xml-n (and (probe-file (merge-pathnames "governance-none.xml"
+                                                  dds.security:+test-ssd-pki-root+))
+                     (%read-ssd-xml "governance-none.xml")))
+         (gov-n (and xml-n (dds.security:parse-governance xml-n))))
+    (%check :t5-f-gov-s-parsed (not (null gov-s))
+            "parse-governance(governance-secure.xml) must succeed for (f) subtests")
+    (%check :t5-f-gov-n-parsed (not (null gov-n))
+            "parse-governance(governance-none.xml) must succeed for (f) subtests")
+    (when gov-s
+      (%check :t5-disc-protected-p-secure
+              (dds.security:topic-discovery-protected-p gov-s "*")
+              "topic-discovery-protected-p('*') must be T in governance-secure"))
+    (when gov-n
+      (%check :t5-disc-protected-p-none
+              (not (dds.security:topic-discovery-protected-p gov-n "*"))
+              "topic-discovery-protected-p('*') must be NIL in governance-none")))
+
+  ;; (g) topic-metadata-protection
+  (let* ((xml-s (and (probe-file (merge-pathnames "governance-secure.xml"
+                                                  dds.security:+test-ssd-pki-root+))
+                     (%read-ssd-xml "governance-secure.xml")))
+         (gov-s (and xml-s (dds.security:parse-governance xml-s)))
+         (xml-n (and (probe-file (merge-pathnames "governance-none.xml"
+                                                  dds.security:+test-ssd-pki-root+))
+                     (%read-ssd-xml "governance-none.xml")))
+         (gov-n (and xml-n (dds.security:parse-governance xml-n))))
+    (%check :t5-g-gov-s-parsed (not (null gov-s))
+            "parse-governance(governance-secure.xml) must succeed for (g) subtests")
+    (%check :t5-g-gov-n-parsed (not (null gov-n))
+            "parse-governance(governance-none.xml) must succeed for (g) subtests")
+    (when gov-s
+      (%check :t5-meta-secure
+              (eq :encrypt (dds.security:topic-metadata-protection gov-s "*"))
+              (format nil "topic-metadata-protection('*') must be :encrypt in governance-secure; got ~s"
+                      (dds.security:topic-metadata-protection gov-s "*"))))
+    (when gov-n
+      (%check :t5-meta-none
+              (eq :none (dds.security:topic-metadata-protection gov-n "*"))
+              (format nil "topic-metadata-protection('*') must be :none in governance-none; got ~s"
+                      (dds.security:topic-metadata-protection gov-n "*")))))
+
+  ;; (h) Wrong-tier token: SIGN_WITH_ORIGIN_AUTHENTICATION in per-topic metadata_protection_kind → parse nil (tier guard)
+  (let* ((xml (%make-governance-xml-bad-topic-kind))
+         (gov (dds.security:parse-governance xml)))
+    (%check :t5-bad-topic-tier-nil (null gov)
+            "SIGN_WITH_ORIGIN_AUTHENTICATION in metadata_protection_kind must make parse-governance return NIL (tier guard)"))
   t)

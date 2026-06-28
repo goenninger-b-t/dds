@@ -71,6 +71,27 @@
 (defconstant +entityid-participant-volatile-secure-reader+ #xff0202c4
   "ENTITYID_P2P_BUILTIN_PARTICIPANT_VOLATILE_MESSAGE_SECURE_READER (DDS-Security 1.1 §7.4.5).")
 
+;; DDS-Security 1.1 §7.4.5 secure builtin endpoint EntityIds (WP-DDS-SECURITY-SECURE-DISCOVERY T0).
+;; 0xff entity-key prefix = security-scoped; 0xc2/c7 = reliable BUILTIN_WRITER/READER (WITH_KEY).
+;; Corroboration: Fast DDS include/fastdds/rtps/common/EntityId_t.hpp lines 55-64 (#if HAVE_SECURITY);
+;; Wireshark packet-rtps.c ENTITYID_*_SECURE_* (vendor-neutral, tshark 4.6.6). Spike 2026-06-27.
+(defconstant +entityid-sedp-pub-secure-writer+ #xff0003c2
+  "SEDPbuiltinPublicationsSecureWriter EntityId 0xff0003c2 (DDS-Security 1.1 §7.4.5; Fast DDS EntityId_t.hpp).")
+(defconstant +entityid-sedp-pub-secure-reader+ #xff0003c7
+  "SEDPbuiltinPublicationsSecureReader EntityId 0xff0003c7 (DDS-Security 1.1 §7.4.5; Fast DDS EntityId_t.hpp).")
+(defconstant +entityid-sedp-sub-secure-writer+ #xff0004c2
+  "SEDPbuiltinSubscriptionsSecureWriter EntityId 0xff0004c2 (DDS-Security 1.1 §7.4.5; Fast DDS EntityId_t.hpp).")
+(defconstant +entityid-sedp-sub-secure-reader+ #xff0004c7
+  "SEDPbuiltinSubscriptionsSecureReader EntityId 0xff0004c7 (DDS-Security 1.1 §7.4.5; Fast DDS EntityId_t.hpp).")
+(defconstant +entityid-participant-message-secure-writer+ #xff0200c2
+  "BuiltinParticipantMessageSecureWriter EntityId 0xff0200c2 (DDS-Security 1.1 §7.4.5; Fast DDS EntityId_t.hpp).")
+(defconstant +entityid-participant-message-secure-reader+ #xff0200c7
+  "BuiltinParticipantMessageSecureReader EntityId 0xff0200c7 (DDS-Security 1.1 §7.4.5; Fast DDS EntityId_t.hpp).")
+(defconstant +entityid-spdp-secure-writer+ #xff0101c2
+  "SPDPbuiltinParticipantSecureWriter EntityId 0xff0101c2 (DDS-Security 1.1 §7.4.5; Fast DDS EntityId_t.hpp).")
+(defconstant +entityid-spdp-secure-reader+ #xff0101c7
+  "SPDPbuiltinParticipantSecureReader EntityId 0xff0101c7 (DDS-Security 1.1 §7.4.5; Fast DDS EntityId_t.hpp).")
+
 ;; DDS-Security 1.1 §7.4.6.1 BuiltinEndpointSet security bits (secure SEDP, secure PMD, PSM, PVMS).
 ;; Bits 16-19: secure SEDP pub/sub announcer/detector; 20-21: secure PMD writer/reader.
 (defconstant +be-sedp-pub-secure-writer+ (ash 1 16)

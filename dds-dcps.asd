@@ -13,6 +13,7 @@
                (:file "entities")
                (:file "type-gate")
                (:file "auth-manager")
+               (:file "crypto-manager")
                (:file "access-control")
                (:file "conditions")
                (:file "filter")

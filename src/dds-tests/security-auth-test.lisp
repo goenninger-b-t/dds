@@ -2084,26 +2084,60 @@
   (let ((ar (%am-remote-for p remote-prefix)))
     (when ar (dds.dcps::auth-remote-state ar))))
 
+(defun* %cm-for (p)
+    (function (dds.dcps:domain-participant) t)
+  "P's §8.5 crypto-manager (T8), or NIL if P is not security-enabled."
+  (let ((ms (dds.dcps::dp-auth-state p)))
+    (when ms (dds.dcps::auth-manager-state-crypto-manager ms))))
+
+(defun* %cm-has-remote-participant-p (p remote-prefix)
+    (function (dds.dcps:domain-participant (simple-array (unsigned-byte 8) (12))) t)
+  "T iff P's crypto-manager has installed REMOTE-PREFIX's ParticipantCrypto KeyMaterial (T8 §8.5.2)."
+  (let ((cm (%cm-for p)))
+    (and cm (not (null (dds.dcps::cm-decode-participant-km cm remote-prefix))) t)))
+
+(defun* %cm-has-remote-entity-p (p remote-prefix entity-id)
+    (function (dds.dcps:domain-participant (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32)) t)
+  "T iff P's crypto-manager has installed REMOTE-PREFIX's EntityCrypto for ENTITY-ID (by the 16-octet GUID;
+   T8 §8.5.2). Used to assert the remote secure-SEDP builtin DW/DR + user-endpoint tokens are installed."
+  (let ((cm (%cm-for p)))
+    (and cm
+         (not (null (dds.dcps::cm-decode-entity-km
+                     cm (dds.dcps::%guid-from-prefix remote-prefix entity-id))))
+         t)))
+
+(defun* %cm-local-entity-origin-auth-p (p entity-id)
+    (function (dds.dcps:domain-participant (unsigned-byte 32)) t)
+  "T iff P's crypto-manager registered the LOCAL EntityCrypto for ENTITY-ID WITH origin-auth — a non-zero
+   receiver_specific_key_id (§9.5.3.3.4.3; T-ORIGINAUTH). Proves governance drove the receiver-specific key
+   mint for the secure-SEDP receiving readers."
+  (let ((cm (%cm-for p)))
+    (and cm
+         (let ((km (dds.dcps::cm-encode-entity-km cm entity-id)))
+           (and km (notevery #'zerop (dds.security:key-material-receiver-specific-key-id km)) t)))))
+
 (defun* %am-remote-keyed-p (p remote-prefix)
     (function (dds.dcps:domain-participant (simple-array (unsigned-byte 8) (12))) t)
-  "T iff P's auth-remote for REMOTE-PREFIX is :keyed AND it installed the remote writer
-   KeyMaterial (§9.5.2) — the full key-exchange completion predicate."
+  "T iff P's auth-remote for REMOTE-PREFIX is :keyed AND the crypto-manager installed REMOTE-PREFIX's
+   ParticipantCrypto (T8: the §8.5.2 crypto-token exchange over PVMS landed; the per-writer/entity
+   KeyMaterial now lives in the crypto-manager registries, not the retired auth-remote REMOTE-KM)."
   (let ((ar (%am-remote-for p remote-prefix)))
     (and ar
          (eq (dds.dcps::auth-remote-state ar) :keyed)
-         (not (null (dds.dcps::auth-remote-remote-km ar)))
+         (%cm-has-remote-participant-p p remote-prefix)
          t)))
 
 (defun* run-auth-manager-handshake-test ()
     (function () t)
-  "WP-DDS-SECURITY-AUTH-KEYX T5: the auth manager (dds-dcps) drives the §8.7 handshake +
-   §9.5 key exchange end-to-end between two security-enabled participants on discovery.
+  "WP-DDS-SECURITY-AUTH-KEYX T5 / SECURE-DISCOVERY T8: the auth manager (dds-dcps) drives the §8.7 handshake
+   + §8.5.2 crypto-token exchange end-to-end between two security-enabled participants on discovery.
    (a) Two DomainParticipants are created with distinct EC identities (participant_ec /
        participant_ec_b) -> security-enabled (DP-AUTH-STATE set, IdentityToken advertised).
    (b) NON-VACUITY: before discovery completes, neither holds a :keyed remote.
-   (c) On SPDP discovery the manager runs the handshake (requester by §8.7.2.4 GUID order),
-       derives the KxKey, exchanges KeyMaterial, and reaches :keyed BOTH directions.
-   (d) Each installed the OTHER's writer KeyMaterial (auth-remote-remote-km non-NIL).
+   (c) On SPDP discovery the manager runs the handshake (requester by §8.7.2.4 GUID order), derives the
+       §9.5.3.1 PVMS bootstrap KM, exchanges crypto tokens over reliable PVMS, and reaches :keyed BOTH ways.
+   (d) T8 (migrated off auth-remote-remote-km): each crypto-manager installed the OTHER's ParticipantCrypto
+       (§8.5.2) — the per-writer/entity KeyMaterial now lives in the crypto-manager registries.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
   (handler-case (dds.dare:dare-available-p)
     (dds.dare:dare-unavailable (c)
@@ -2161,17 +2195,14 @@
                       (%check :am-b-keyed-a (%am-remote-keyed-p p-b prefix-a)
                               (format nil "B did not reach :keyed for A (state ~a)"
                                       (%am-remote-state p-b prefix-a)))
-                      ;; each installed the OTHER's writer KeyMaterial (§9.5.2)
+                      ;; T8: each crypto-manager installed the OTHER's ParticipantCrypto (§8.5.2; was
+                      ;; auth-remote-remote-km — now in the crypto-manager EntityCrypto/ParticipantCrypto registry)
                       (%check :am-a-has-b-km
-                              (let ((ar (%am-remote-for p-a prefix-b)))
-                                (and ar (typep (dds.dcps::auth-remote-remote-km ar)
-                                               'dds.security:key-material)))
-                              "A must have installed B's writer KeyMaterial")
+                              (%cm-has-remote-participant-p p-a prefix-b)
+                              "A's crypto-manager must have installed B's ParticipantCrypto")
                       (%check :am-b-has-a-km
-                              (let ((ar (%am-remote-for p-b prefix-a)))
-                                (and ar (typep (dds.dcps::auth-remote-remote-km ar)
-                                               'dds.security:key-material)))
-                              "B must have installed A's writer KeyMaterial"))
+                              (%cm-has-remote-participant-p p-b prefix-a)
+                              "B's crypto-manager must have installed A's ParticipantCrypto"))
                  (dds.dcps:delete-participant p-a)
                  (dds.dcps:delete-participant p-b)))
                (dds.security:free-identity-handle id-b)))
@@ -2293,15 +2324,16 @@
                              (%check :kpub-encode-km
                                      (typep encode-km 'dds.security:key-material)
                                      (format nil "A's encode resolver returned ~a (expect KEY-MATERIAL)" encode-km))
-                             ;; (c2) encode resolver returns the SAME (eq) KM instance stored in writer-km-table
-                             ;; (§9.5 per-writer table invariant: one stable km for the local writer GUID)
-                             (let* ((ms-a (dds.dcps::dp-auth-state p-a))
-                                    (table-km (gethash writer-guid-a
-                                                       (dds.dcps::auth-manager-state-writer-km-table ms-a))))
+                             ;; (c2) T8: the encode resolver returns the SAME (eq) KM the crypto-manager holds
+                             ;; in LOCAL-ENTITY-CRYPTO for A's user-writer EntityId (§8.5: one stable KM per
+                             ;; local entity; the KEYX writer-km-table is RETIRED — keys now in the crypto-manager)
+                             (let* ((cm-a (%cm-for p-a))
+                                    (entity-km (dds.dcps::cm-encode-entity-km
+                                                cm-a (dds.disc:disc-node-user-writer-id node-a))))
                                (%check :kpub-single-writer-km
-                                       (eq encode-km table-km)
-                                       (format nil "encode resolver returned ~a but writer-km-table has ~a (must be EQ)"
-                                               encode-km table-km)))
+                                       (and entity-km (eq encode-km entity-km))
+                                       (format nil "encode resolver returned ~a but crypto-manager LOCAL-ENTITY-CRYPTO has ~a (must be EQ)"
+                                               encode-km entity-km)))
                              ;; SecuredPayload-on-wire proof: encode-serialized-payload must produce
                              ;; ciphertext starting with the §9.5.3.3.1 Table 69 AES256-GCM kind
                              ;; header #(0 0 0 4), NOT the plaintext.  Assertion FAILS if encode
@@ -2320,7 +2352,14 @@
                                               (= (aref wire-bytes 3) 4))
                                          (format nil "wire payload must begin with AES256-GCM kind #(0 0 0 4) §9.5.3.3.1 Table 69; got ~{~2,'0x~^ ~}"
                                                  (coerce (subseq wire-bytes 0 (min 4 (length wire-bytes))) 'list)))))
-                             ;; (d) B's decode resolver returns a KEY-MATERIAL for A's writer GUID
+                             ;; (d) B's decode resolver returns a KEY-MATERIAL for A's user-writer GUID. T8: A's
+                             ;; user-writer EntityCrypto rides datawriter_crypto_tokens over reliable PVMS and is
+                             ;; installed AFTER :keyed (which gates on the participant + secure-SEDP builtins, sent
+                             ;; first), so wait (bounded) for that later token to land before asserting.
+                             (loop repeat 200
+                                   until (%cm-has-remote-entity-p p-b prefix-a
+                                                                  (dds.disc:disc-node-user-writer-id node-a))
+                                   do (dds.dcps:spin p-a) (dds.dcps:spin p-b) (sleep 0.02))
                              (let* ((ct-b (dds.disc:disc-node-crypto-transform node-b))
                                     (decode-km (funcall (dds.security:crypto-keys-decode-key-fn ct-b) writer-guid-a)))
                                (%check :kpub-decode-km
@@ -2342,6 +2381,109 @@
                                          (format nil "B received ~a but expected plaintext ~{~2,'0x~^ ~}"
                                                  (and b-payload (coerce b-payload 'list))
                                                  (coerce pt 'list))))))
+                           t)
+                      (ignore-errors (dds.dcps:delete-participant p-a))
+                      (ignore-errors (dds.dcps:delete-participant p-b))))
+               (dds.security:free-identity-handle id-b)))
+        (dds.security:free-identity-handle id-a))))
+  t)
+
+;;; ============================================================
+;;; WP-DDS-SECURITY-SECURE-DISCOVERY T8: crypto-token exchange over PVMS + :authenticated->:keyed promotion
+;;; ============================================================
+;;; Two security-enabled participants authenticate (Slice 2) then exchange §8.5.2 crypto tokens over the
+;;; reliable PVMS endpoint (T7) and BOTH reach auth-remote :keyed with the remote's ParticipantCrypto +
+;;; secure-SEDP builtin EntityCrypto installed in each crypto-manager (design §6.4/§7.2). The headline
+;;; safety property — DISJOINT per-role nonce spaces for the SYMMETRIC PVMS bootstrap KM — is asserted
+;;; structurally (the two roles' PVMS encode session_ids DIFFER, so no AES-GCM (key, nonce) reuse).
+
+(defun* run-secure-discovery-keyed-test ()
+    (function () t)
+  "WP-DDS-SECURITY-SECURE-DISCOVERY T8: end-to-end :authenticated->:keyed via crypto-token exchange over
+   reliable PVMS. Two security-enabled DomainParticipants (distinct EC identities) discover over SPDP,
+   authenticate (§8.7), derive the §9.5.3.1 PVMS bootstrap KM, exchange Participant + builtin EntityCrypto
+   tokens over PVMS, install the remote's, and reach :keyed BOTH directions. Assertions:
+     (a) NON-VACUITY: before the exchange, neither holds a :keyed remote.
+     (b) both reach :keyed (auth + crypto established).
+     (c) each crypto-manager installed the remote's ParticipantCrypto.
+     (d) each installed the remote's secure-SEDP publications-secure-writer (DW) EntityCrypto (a builtin token).
+     (e) NONCE-DISJOINTNESS (safety-critical, HARD CONSTRAINT #1): %pvms-role-session-id is DIFFERENT for the
+         two directions (A->B vs B->A), so the symmetric bootstrap KM never reuses a (key, nonce) pair.
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [secure-discovery-keyed] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-secure-discovery-keyed-test t)))
+  (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key-a  (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (ec-cert-b (%read-fixture-pem "participant_ec_b/identity_cert.pem"))
+         (ec-key-b  (%read-fixture-pem "participant_ec_b/identity_key.pem"))
+         (guid-a    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))
+         (guid-b    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))
+         (pub-w     dds.rtps.discovery:+entityid-sedp-pub-secure-writer+))
+    (multiple-value-bind (id-a reason-a)
+        (dds.security:validate-local-identity ca-pem ec-cert-a ec-key-a guid-a)
+      (%check :sdk-id-a (not (null id-a)) (format nil "validate-local-identity A failed: ~a" reason-a))
+      (unless id-a (return-from run-secure-discovery-keyed-test t))
+      (unwind-protect
+           (multiple-value-bind (id-b reason-b)
+               (dds.security:validate-local-identity ca-pem ec-cert-b ec-key-b guid-b)
+             (%check :sdk-id-b (not (null id-b)) (format nil "validate-local-identity B failed: ~a" reason-b))
+             (unless id-b (return-from run-secure-discovery-keyed-test t))
+             (unwind-protect
+                  (let ((p-a (dds.dcps:create-participant :domain 0 :identity id-a))
+                        (p-b (dds.dcps:create-participant :domain 0 :identity id-b)))
+                    (unwind-protect
+                         (let* ((node-a (dds.dcps::dp-node p-a))
+                                (node-b (dds.dcps::dp-node p-b))
+                                (prefix-a (dds.disc:disc-node-guid-prefix node-a))
+                                (prefix-b (dds.disc:disc-node-guid-prefix node-b)))
+                           (setf (dds.disc:disc-node-peers node-a)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-b))))
+                           (setf (dds.disc:disc-node-peers node-b)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-a))))
+                           ;; (a) NON-VACUITY: nobody keyed before the exchange
+                           (%check :sdk-not-keyed-before
+                                   (and (not (%am-remote-keyed-p p-a prefix-b))
+                                        (not (%am-remote-keyed-p p-b prefix-a)))
+                                   "no remote may be :keyed before the crypto-token exchange completes")
+                           ;; drive auth + crypto-token exchange to :keyed (bounded ~8 s)
+                           (loop repeat 400
+                                 until (and (%am-remote-keyed-p p-a prefix-b)
+                                            (%am-remote-keyed-p p-b prefix-a))
+                                 do (dds.dcps:spin p-a) (dds.dcps:spin p-b) (sleep 0.02))
+                           ;; (b) both reached :keyed
+                           (%check :sdk-a-keyed (%am-remote-keyed-p p-a prefix-b)
+                                   (format nil "A did not reach :keyed for B (state ~a)"
+                                           (%am-remote-state p-a prefix-b)))
+                           (%check :sdk-b-keyed (%am-remote-keyed-p p-b prefix-a)
+                                   (format nil "B did not reach :keyed for A (state ~a)"
+                                           (%am-remote-state p-b prefix-a)))
+                           ;; (c) each installed the remote ParticipantCrypto
+                           (%check :sdk-a-has-b-participant (%cm-has-remote-participant-p p-a prefix-b)
+                                   "A's crypto-manager must have installed B's ParticipantCrypto")
+                           (%check :sdk-b-has-a-participant (%cm-has-remote-participant-p p-b prefix-a)
+                                   "B's crypto-manager must have installed A's ParticipantCrypto")
+                           ;; (d) each installed the remote secure-SEDP-pub-writer EntityCrypto (a builtin DW token)
+                           (%check :sdk-a-has-b-pubw (%cm-has-remote-entity-p p-a prefix-b pub-w)
+                                   "A must have installed B's secure-SEDP-pub-writer EntityCrypto (DW token)")
+                           (%check :sdk-b-has-a-pubw (%cm-has-remote-entity-p p-b prefix-a pub-w)
+                                   "B must have installed A's secure-SEDP-pub-writer EntityCrypto (DW token)")
+                           ;; (e) NONCE-DISJOINTNESS: the two roles' PVMS encode session_ids MUST differ
+                           (let ((sid-ab (dds.disc:%pvms-role-session-id prefix-a prefix-b))
+                                 (sid-ba (dds.disc:%pvms-role-session-id prefix-b prefix-a)))
+                             (%check :sdk-nonce-disjoint
+                                     (not (equalp sid-ab sid-ba))
+                                     (format nil "PVMS per-role session_ids MUST differ (A->B ~{~2,'0x~} vs B->A ~{~2,'0x~}) — equal => AES-GCM nonce reuse on the symmetric bootstrap KM"
+                                             (coerce sid-ab 'list) (coerce sid-ba 'list)))
+                             ;; both session_ids must be NON-ZERO (distinct from the non-PVMS +fixed-session-id+)
+                             (%check :sdk-nonce-nonzero
+                                     (and (notevery #'zerop sid-ab) (notevery #'zerop sid-ba))
+                                     "PVMS per-role session_ids must be non-zero (distinct from the all-zero non-PVMS session_id)"))
                            t)
                       (ignore-errors (dds.dcps:delete-participant p-a))
                       (ignore-errors (dds.dcps:delete-participant p-b))))
@@ -2630,6 +2772,58 @@
       (dds.security:free-kx-key kx)))
   t)
 
+(defun* run-auth-keymaterial-origin-auth-cdr ()
+    (function () t)
+  "WP-DDS-SECURITY-SECURE-DISCOVERY T-ORIGINAUTH: the §9.5.2 KeyMaterial CDR codec carries the POPULATED
+   receiver-specific fields (the 120-byte *_WITH_ORIGIN_AUTHENTICATION form, Fast DDS KeyMaterialCDRSerialize
+   L432-454 / KeyMaterialCDRDeserialize L511-528 has_specific_key discriminator) — the crypto-token exchange
+   must retain the remote's receiver key so origin-auth can be wired. Deterministic (no OpenSSL — explicit
+   KeyMaterial), both impls. Asserts:
+   (a) a populated origin-auth KeyMaterial serializes to exactly 120 octets and round-trips
+       receiver_specific_key_id + master_receiver_specific_key (and master_salt) byte-exact;
+   (b) NON-VACUOUS byte-identical carry: a no-origin-auth KeyMaterial still serializes to exactly 88 octets
+       with all-zero receiver fields (the SIGN/ENCRYPT token path is unchanged)."
+  (let* ((oa-km (dds.security:make-key-material
+                 :transformation-kind          (copy-seq dds.security:+transformation-kind-aes256-gcm+)
+                 :master-salt                  (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11)
+                 :sender-key-id                (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4))
+                 :master-sender-key            (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x22)
+                 :receiver-specific-key-id     (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(9 8 7 6))
+                 :master-receiver-specific-key (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x33)))
+         (oa-cdr  (dds.security::%serialize-km-cdr oa-km))
+         (oa-back (dds.security::%parse-km-cdr oa-cdr)))
+    (%check :km-oa-len (= (length oa-cdr) 120)
+            (format nil "origin-auth KeyMaterial CDR must be 120 octets; got ~d" (length oa-cdr)))
+    (%check :km-oa-parsed (not (null oa-back)) "%parse-km-cdr must accept the 120-byte origin-auth form")
+    (when oa-back
+      (%check :km-oa-rsk-id
+              (equalp (dds.security:key-material-receiver-specific-key-id oa-back)
+                      (dds.security:key-material-receiver-specific-key-id oa-km))
+              "round-trip must preserve receiver_specific_key_id")
+      (%check :km-oa-rsk-key
+              (equalp (dds.security:key-material-master-receiver-specific-key oa-back)
+                      (dds.security:key-material-master-receiver-specific-key oa-km))
+              "round-trip must preserve master_receiver_specific_key (the receiver key the token carries)")
+      (%check :km-oa-salt
+              (equalp (dds.security:key-material-master-salt oa-back)
+                      (dds.security:key-material-master-salt oa-km))
+              "round-trip must preserve master_salt"))
+    ;; (b) no-origin-auth form stays the byte-identical 88-byte CDR with all-zero receiver fields
+    (let* ((plain-km   (dds.security:make-key-material
+                        :transformation-kind (copy-seq dds.security:+transformation-kind-aes256-gcm+)
+                        :master-salt         (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x44)
+                        :sender-key-id       (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(5 6 7 8))
+                        :master-sender-key   (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x55)))
+           (plain-cdr  (dds.security::%serialize-km-cdr plain-km))
+           (plain-back (dds.security::%parse-km-cdr plain-cdr)))
+      (%check :km-plain-len (= (length plain-cdr) 88)
+              (format nil "no-origin-auth KeyMaterial CDR must stay 88 octets; got ~d" (length plain-cdr)))
+      (%check :km-plain-rsk-zero
+              (and plain-back (every #'zerop (dds.security:key-material-receiver-specific-key-id plain-back))
+                   (every #'zerop (dds.security:key-material-master-receiver-specific-key plain-back)))
+              "no-origin-auth round-trip must keep the receiver-specific fields all-zero")))
+  t)
+
 ;;; Safety-0 compiled inner loop for crypto-token parser fuzz.
 
 (defun* %fuzz-crypto-token-loop-s0 (blobs kx-key)
@@ -2908,6 +3102,263 @@
         (read-sequence v s)
         v))))
 
+(defun* %read-ssd-fixture-pem (relative-path)
+    (function (string) (simple-array (unsigned-byte 8) (*)))
+  "Read a secure-discovery PKI fixture file relative to +TEST-SSD-PKI-ROOT+ (the T0 governance-secure.p7s
+   etc.; the perm-CA + Identity-CA are REUSED from the access-control / auth fixtures, T0 spike)."
+  (let* ((path (merge-pathnames relative-path dds.security:+test-ssd-pki-root+)))
+    (with-open-file (s path :element-type '(unsigned-byte 8))
+      (let* ((n (file-length s))
+             (v (make-array n :element-type '(unsigned-byte 8))))
+        (read-sequence v s)
+        v))))
+
+;;; ============================================================
+;;; WP-DDS-SECURITY-SECURE-DISCOVERY T9: secure SEDP end-to-end (protected DiscoveredWriterData over the
+;;; secure SEDP endpoints; protected topic off plain SEDP; gate on :keyed; plain peer refused)
+;;; ============================================================
+;;; Two security-enabled participants under governance discovery_protection_kind=ENCRYPT + a topic_rule with
+;;; enable_discovery_protection=true authenticate, reach :keyed, and exchange the protected Square endpoint
+;;; ONLY over the submessage-protected secure SEDP builtin endpoints (0xff0003/0xff0004) — never plain SEDP —
+;;; then match + flow user data byte-exact. A PLAIN (unauthenticated) peer on the same topic never learns the
+;;; protected endpoint (the non-vacuous control). Governance NONE -> plain SEDP, asserted byte-identical
+;;; structurally by the disc-level run-secure-sedp-roundtrip-test + the plain-byte-identical auth test.
+
+(defun* %run-secure-discovery-e2e (gov-p7s-name topic-visible-p &optional (origin-auth-p nil))
+    (function (string t &optional t) t)
+  "WP-DDS-SECURITY-SECURE-DISCOVERY T9 (+ T-ORIGINAUTH): secure SEDP DiscoveredWriter/ReaderData end-to-end under
+   the signed governance GOV-P7S-NAME (discovery_protection_kind ENCRYPT, SIGN, or ENCRYPT_WITH_ORIGIN_AUTHENTICATION).
+   Two security-enabled + access-controlled DomainParticipants A (Square writer) and B (Square reader) authenticate
+   and reach :keyed; a third PLAIN participant (no identity) with a Square reader is the non-vacuous control.
+   Assertions:
+     (a) A and B both reach :keyed (auth + crypto established).
+     (b) A advertises secure discovery (the discovery-protected-topic-p predicate is installed -> SPDP
+         BuiltinEndpointSet bits 16-19), and a CryptoHeader/SEC_PREFIX bracket is emitted on the wire.
+     (c) B MATCHES A's Square writer — A's Square endpoint is OMITTED from plain SEDP (protected), so the
+         ONLY path is the submessage-protected secure SEDP endpoint; the endpoints match BOTH directions.
+     (d) a Square sample round-trips byte-exact (user data flows after the secure match).
+     (e) the on-wire posture HONORS the governance directive (NOT a hardcoded ENCRYPT): when TOPIC-VISIBLE-P
+         is NIL (ENCRYPT) the plaintext topic name 'Square' NEVER appears on the wire (confidentiality — it
+         rides only inside the secure SEDP ENCRYPT); when T (SIGN) 'Square' DOES appear in cleartext but ONLY
+         inside a SEC_PREFIX bracket (authenticated-but-visible, never plain SEDP), proving we SIGNed (the
+         review defect was silently ENCRYPTing a SIGN directive).
+     (f) NON-VACUOUS control: the PLAIN peer NEVER matches A's protected writer (invisible over plain SEDP).
+     (g) ORIGIN-AUTH (when ORIGIN-AUTH-P, T-ORIGINAUTH): governance drove the secure-SEDP RECEIVING readers
+         (pub/sub-secure-reader) to be registered WITH a receiver-specific key (non-zero receiver_specific_key_id,
+         §9.5.3.3.4.3) on BOTH A and B. With the local reader keyed for origin-auth, the decode-receiver resolver
+         sets my-receiver-key-id, so decode REQUIRES a valid receiver-specific MAC — hence B's match (c) PROVES the
+         per-receiver MAC was emitted by A and verified by B (decode fails closed without it, even on a valid
+         common_mac). The wrong-receiver-key fail-closed control is run-secure-sedp-origin-auth-tamper-test.
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [secure-discovery-e2e ~a] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              gov-p7s-name (dds.dare:dare-unavailable-reason c))
+      (return-from %run-secure-discovery-e2e t)))
+  (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key-a  (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (ec-cert-b (%read-fixture-pem "participant_ec_b/identity_cert.pem"))
+         (ec-key-b  (%read-fixture-pem "participant_ec_b/identity_key.pem"))
+         (perm-ca   (%read-ac-fixture-pem "perm-ca-cert.pem"))           ; reused (T0): signs the governance .p7s
+         (gov-p7s   (%read-ssd-fixture-pem gov-p7s-name))                ; discovery_protection_kind ENCRYPT | SIGN
+         (perm-p7s  (%read-ac-fixture-pem "permissions.p7s"))            ; allows Square pub/sub for both subjects
+         (guid-a    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 9)))
+         (guid-b    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 13 14 15 9)))
+         (topic       "Square")
+         (topic-bytes (map '(simple-array (unsigned-byte 8) (*)) #'char-code topic))
+         (pt          (make-array 8 :element-type '(unsigned-byte 8)
+                                    :initial-contents '(#x53 #x44 #x50 #x52 #x54 #x30 #x30 #x31)))
+         (captured '())
+         (sec-bracket-seen nil)
+         (rtps-wrapped-seen nil)   ; T10: an SRTPS_PREFIX (0x33) whole-RTPS-message bracket on the wire
+         (lk (dds.pal:make-lock "secure-discovery-protected")))
+    (multiple-value-bind (id-a reason-a)
+        (dds.security:validate-local-identity ca-pem ec-cert-a ec-key-a guid-a)
+      (%check :sdp-id-a (not (null id-a)) (format nil "validate-local-identity A failed: ~a" reason-a))
+      (unless id-a (return-from %run-secure-discovery-e2e t))
+      (unwind-protect
+           (multiple-value-bind (id-b reason-b)
+               (dds.security:validate-local-identity ca-pem ec-cert-b ec-key-b guid-b)
+             (%check :sdp-id-b (not (null id-b)) (format nil "validate-local-identity B failed: ~a" reason-b))
+             (unless id-b (return-from %run-secure-discovery-e2e t))
+             (unwind-protect
+                  (let ((p-a (dds.dcps:create-participant
+                              :domain 88 :identity id-a
+                              :permissions-ca perm-ca :governance gov-p7s :permissions perm-p7s))
+                        (p-b (dds.dcps:create-participant
+                              :domain 88 :identity id-b
+                              :permissions-ca perm-ca :governance gov-p7s :permissions perm-p7s))
+                        (p-plain (dds.dcps:create-participant :domain 88)))   ; plain control: no identity
+                    (unwind-protect
+                         (let* ((node-a (dds.dcps::dp-node p-a))
+                                (node-b (dds.dcps::dp-node p-b))
+                                (node-plain (dds.dcps::dp-node p-plain))
+                                (prefix-a (dds.disc:disc-node-guid-prefix node-a))
+                                (prefix-b (dds.disc:disc-node-guid-prefix node-b))
+                                (wqos (dds.qos:make-writer-qos :reliability :reliable :durability :transient-local))
+                                (rqos (dds.qos:make-reader-qos :reliability :reliable :durability :transient-local)))
+                           (setf (dds.disc:disc-node-peers node-a)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-b))
+                                       (cons "127.0.0.1" (dds.disc:disc-node-port node-plain))))
+                           (setf (dds.disc:disc-node-peers node-b)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-a))))
+                           (setf (dds.disc:disc-node-peers node-plain)
+                                 (list (cons "127.0.0.1" (dds.disc:disc-node-port node-a))))
+                           ;; protected Square writer on A, Square reader on B + on the plain control
+                           (dds.disc:add-local-writer node-a :topic topic :type "ShapeType" :qos wqos)
+                           (dds.disc:enable-publisher node-a :history-kind :keep-all)
+                           (dds.disc:add-local-reader node-b :topic topic :type "ShapeType" :qos rqos)
+                           (dds.disc:enable-subscriber node-b)
+                           (dds.disc:add-local-reader node-plain :topic topic :type "ShapeType" :qos rqos)
+                           (dds.disc:enable-subscriber node-plain)
+                           ;; (b-pre) the protecting governance installed the discovery-protected predicate on A + B
+                           (%check :sdp-a-protected
+                                   (not (null (dds.disc:disc-node-discovery-protected-topic-p node-a)))
+                                   "A must have the discovery-protected-topic-p predicate installed (protecting governance)")
+                           ;; (a-pre) NON-VACUITY: nobody keyed before the exchange
+                           (%check :sdp-not-keyed-before
+                                   (and (not (%am-remote-keyed-p p-a prefix-b))
+                                        (not (%am-remote-keyed-p p-b prefix-a)))
+                                   "no remote may be :keyed before the crypto-token exchange completes")
+                           ;; drive auth + crypto-token exchange to :keyed (bounded ~8 s)
+                           (loop repeat 400
+                                 until (and (%am-remote-keyed-p p-a prefix-b)
+                                            (%am-remote-keyed-p p-b prefix-a))
+                                 do (dds.dcps:spin p-a) (dds.dcps:spin p-b) (dds.dcps:spin p-plain) (sleep 0.02))
+                           ;; (a) both reached :keyed
+                           (%check :sdp-a-keyed (%am-remote-keyed-p p-a prefix-b)
+                                   (format nil "A did not reach :keyed for B (state ~a)" (%am-remote-state p-a prefix-b)))
+                           (%check :sdp-b-keyed (%am-remote-keyed-p p-b prefix-a)
+                                   (format nil "B did not reach :keyed for A (state ~a)" (%am-remote-state p-b prefix-a)))
+                           ;; (g) ORIGIN-AUTH: governance drove the secure-SEDP receiving readers to carry a
+                           ;; receiver-specific key (the receiver-MAC mint) on BOTH peers; with the local reader
+                           ;; keyed, decode demands a valid receiver-specific MAC, so the later match (c) proves it.
+                           (when origin-auth-p
+                             (%check :sdp-a-reader-origin-auth
+                                     (%cm-local-entity-origin-auth-p p-a dds.rtps.discovery:+entityid-sedp-pub-secure-reader+)
+                                     "A's secure-SEDP pub-reader EntityCrypto must be registered WITH origin-auth (non-zero receiver_specific_key_id) under ENCRYPT_WITH_ORIGIN_AUTHENTICATION")
+                             (%check :sdp-b-reader-origin-auth
+                                     (%cm-local-entity-origin-auth-p p-b dds.rtps.discovery:+entityid-sedp-pub-secure-reader+)
+                                     "B's secure-SEDP pub-reader EntityCrypto must be registered WITH origin-auth (non-zero receiver_specific_key_id) under ENCRYPT_WITH_ORIGIN_AUTHENTICATION"))
+                           ;; capture A's + B's outbound datagrams (confidentiality + SEC_PREFIX-on-wire proof)
+                           ;; while driving to the secure match + sample delivery
+                           (let ((dds.disc:*datagram-sink*
+                                   (lambda (dg)
+                                     (dds.pal:with-lock (lk)
+                                       (push dg captured)
+                                       (when (> (length dg) 20)
+                                         (cond ((= (aref dg 20) dds.security:+submessage-sec-prefix+)
+                                                (setf sec-bracket-seen t))
+                                               ((= (aref dg 20) dds.security:+submessage-srtps-prefix+)
+                                                (setf rtps-wrapped-seen t))))))))   ; T10 whole-RTPS bracket
+                             (loop repeat 300
+                                   until (and (plusp (dds.disc:disc-node-matched-count node-b))
+                                              (plusp (dds.disc:node-sample-count node-b)))
+                                   do (when (plusp (dds.disc:disc-node-matched-count node-a))
+                                        (dds.disc:publish-sample node-a pt))
+                                      (dds.dcps:spin p-a) (dds.dcps:spin p-b) (dds.dcps:spin p-plain)
+                                      (sleep 0.02)))
+                           ;; (c) B matched A's protected writer over secure SEDP (A's writer is off plain SEDP)
+                           (%check :sdp-b-matched (plusp (dds.disc:disc-node-matched-count node-b))
+                                   "B did not match A's discovery-protected Square writer (the only path is secure SEDP)")
+                           (%check :sdp-b-matched-topic
+                                   (member topic (dds.disc:disc-node-matched-topics node-b) :test #'string=)
+                                   "B matched the wrong topic (expected the protected Square)")
+                           ;; (b) a SEC_PREFIX submessage-protection bracket carrying the protected SEDP was on the wire
+                           (%check :sdp-sec-prefix-on-wire sec-bracket-seen
+                                   "no SEC_PREFIX submessage-protection bracket was emitted on the wire")
+                           ;; (d) the Square sample round-trips byte-exact
+                           (%check :sdp-b-received (plusp (dds.disc:node-sample-count node-b))
+                                   "B did not receive a Square sample after the secure match")
+                           (let* ((b-key     (first (dds.disc:node-sample-sns node-b)))
+                                  (b-payload (and b-key (dds.disc:node-sample node-b b-key))))
+                             (%check :sdp-byte-exact (and b-payload (equalp b-payload pt))
+                                     (format nil "Square sample byte mismatch; got ~a expected ~{~2,'0x~^ ~}"
+                                             (and b-payload (coerce b-payload 'list)) (coerce pt 'list))))
+                           ;; (h) T10 whole-RTPS-message protection: all three governance fixtures set
+                           ;;     rtps_protection_kind=ENCRYPT, so A's user-data Square DATA to the :keyed B is
+                           ;;     SRTPS-wrapped on the wire (offset 20 = SRTPS_PREFIX) and B decoded it ((d)
+                           ;;     byte-exact above traverses the unwrap+re-dispatch path). The non-vacuous
+                           ;;     wrong-ParticipantCrypto / wrong-receiver-key controls are run-rtps-protection-test.
+                           (%check :sdp-rtps-wrapped (dds.pal:with-lock (lk) rtps-wrapped-seen)
+                                   "T10: no SRTPS whole-RTPS-message bracket on the wire though rtps_protection_kind=ENCRYPT — A's keyed user data must be wrapped")
+                           ;; (e) on-wire posture HONORS the governance directive: ENCRYPT hides the topic name
+                           ;;     (never cleartext); SIGN leaves it VISIBLE but ONLY inside a SEC_PREFIX bracket
+                           ;;     (never plain SEDP) and it MUST appear (proving SIGN, not a silent ENCRYPT).
+                           (if topic-visible-p
+                               (%check :sdp-topic-visible-signed
+                                       (dds.pal:with-lock (lk)
+                                         (and (some (lambda (dg) (search topic-bytes dg)) captured)
+                                              (every (lambda (dg)
+                                                       (or (not (search topic-bytes dg))
+                                                           (and (> (length dg) 20)
+                                                                (= (aref dg 20) dds.security:+submessage-sec-prefix+))))
+                                                     captured)))
+                                       "SIGN secure discovery must expose 'Square' in cleartext INSIDE a SEC_PREFIX bracket (honoring SIGN, never plain SEDP, never silently ENCRYPTed)")
+                               (%check :sdp-topic-not-on-wire
+                                       (dds.pal:with-lock (lk)
+                                         (notany (lambda (dg) (search topic-bytes dg)) captured))
+                                       "confidentiality breach: the protected topic name 'Square' appeared in CLEARTEXT on the wire"))
+                           ;; (f) NON-VACUOUS control: the plain peer never matched A's protected writer
+                           (loop repeat 50
+                                 do (dds.dcps:spin p-a) (dds.dcps:spin p-plain) (sleep 0.02))
+                           (%check :sdp-plain-refused (zerop (dds.disc:disc-node-matched-count node-plain))
+                                   (format nil "control breach: a PLAIN peer matched a discovery-protected endpoint (~d) — it must be invisible over plain SEDP"
+                                           (dds.disc:disc-node-matched-count node-plain)))
+                           t)
+                      (ignore-errors (dds.dcps:delete-participant p-plain))
+                      (ignore-errors (dds.dcps:delete-participant p-b))
+                      (ignore-errors (dds.dcps:delete-participant p-a))))
+               (dds.security:free-identity-handle id-b)))
+        (dds.security:free-identity-handle id-a))))
+  t)
+
+(defun* run-secure-discovery-protected-test ()
+    (function () t)
+  "Secure SEDP e2e under governance discovery_protection_kind = ENCRYPT (confidential): 'Square' never appears
+   on the wire in cleartext. Delegates to %run-secure-discovery-e2e; see its full contract."
+  (%run-secure-discovery-e2e "governance-secure.p7s" nil))
+
+(defun* run-secure-discovery-protected-sign-test ()
+    (function () t)
+  "Secure SEDP e2e under governance discovery_protection_kind = SIGN (authenticated-but-visible; the T9 review
+   conformance fix): A's protected Square DiscoveredWriterData flows SIGNED over secure SEDP — a SEC_PREFIX
+   bracket is emitted and 'Square' IS visible in cleartext INSIDE that bracket (never plain SEDP), proving the
+   announce HONORS SIGN instead of hardcoding ENCRYPT. Delegates to %run-secure-discovery-e2e."
+  (%run-secure-discovery-e2e "governance-sign.p7s" t))
+
+(defun* run-secure-discovery-origin-auth-test ()
+    (function () t)
+  "WP-DDS-SECURITY-SECURE-DISCOVERY T-ORIGINAUTH: secure SEDP e2e under governance discovery_protection_kind =
+   ENCRYPT_WITH_ORIGIN_AUTHENTICATION (the T0 governance-origin-auth.p7s) — the origin-auth tier T9 previously
+   REFUSED is now WIRED. Two security-enabled + access-controlled participants authenticate, reach :keyed
+   (exchanging the 120-byte receiver-specific KeyMaterial), and B matches A's protected Square writer over the
+   secure SEDP endpoints with a per-receiver MAC (§9.5.3.3.4.3). 'Square' never appears in cleartext (ENCRYPT
+   base). The (g) assertions prove BOTH peers minted the secure-SEDP readers WITH a receiver-specific key, so
+   the match is gated on a verified receiver-specific MAC (decode fails closed without it). The non-vacuous
+   wrong-receiver-key control is run-secure-sedp-origin-auth-tamper-test. Delegates to %run-secure-discovery-e2e
+   with ORIGIN-AUTH-P. Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (%run-secure-discovery-e2e "governance-origin-auth.p7s" nil t))
+
+(defun* run-protection-kind-base-test ()
+    (function () t)
+  "WP-DDS-SECURITY-SECURE-DISCOVERY T9 review: dds.security:protection-kind-base decomposes a §9.4.1.2
+   ProtectionKind into (values BASE-KIND ORIGIN-AUTH-P). Deterministic (no OpenSSL); both impls. Asserts the
+   5-value mapping the secure-SEDP announce (base kind) + the origin-auth fail-closed gate (origin-auth-p) rely on."
+  (flet ((base (k) (nth-value 0 (dds.security:protection-kind-base k)))
+         (oa   (k) (nth-value 1 (dds.security:protection-kind-base k))))
+    (%check :pkb-none    (and (eq (base :none) :none)       (not (oa :none)))    "NONE -> (:none nil)")
+    (%check :pkb-sign    (and (eq (base :sign) :sign)       (not (oa :sign)))    "SIGN -> (:sign nil)")
+    (%check :pkb-encrypt (and (eq (base :encrypt) :encrypt) (not (oa :encrypt))) "ENCRYPT -> (:encrypt nil)")
+    (%check :pkb-sign-oa (and (eq (base :sign-with-origin-auth) :sign) (oa :sign-with-origin-auth))
+            "SIGN_WITH_ORIGIN_AUTHENTICATION -> (:sign t)")
+    (%check :pkb-enc-oa  (and (eq (base :encrypt-with-origin-auth) :encrypt) (oa :encrypt-with-origin-auth))
+            "ENCRYPT_WITH_ORIGIN_AUTHENTICATION -> (:encrypt t)"))
+  t)
+
 (defun* run-cms-verify-kat ()
     (function () t)
   "KAT for DDS.DARE:CMS-VERIFY against the Permissions CA (DDS-Security 1.1 §9.4.1.1).
@@ -2952,4 +3403,246 @@
                    (null (dds.dare:cms-verify p7s-octets wrong-ca))
                    "cms-verify(governance.p7s, identity-ca) must return NIL")
         (dds.dare:x509-ca-free wrong-ca))))
+  t)
+
+;;; DDS-Security 1.1 §8.5 CryptoKeyFactory/CryptoKeyExchange hub (T6) tests: the generic
+;;; KeyMaterial generator (generate-key-material) + the dds.dcps crypto-manager registries
+;;; (ParticipantCrypto + EntityCrypto) + the key resolvers the §9.5.3.3 data path uses.
+
+(defun* %cm-generator-units ()
+    (function () t)
+  "generate-key-material (§8.5 CryptoKeyFactory primitive): non-zero random master_salt +
+   master_sender_key; a process-unique NON-ZERO allocated sender_key_id (distinct across calls);
+   all-zero receiver-specific fields by default; NON-ZERO receiver-specific under :origin-auth (the
+   T3 carry fix — zero is the §9.5.3.3.4.3 origin-auth-disabled sentinel). generate-writer-key-material
+   still delegates (its sender_key_id is the GUID-derived first 4 octets; receiver-specific populated)."
+  (let* ((zeros4  (make-array 4  :element-type '(unsigned-byte 8) :initial-element 0))
+         (zeros32 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (km1 (dds.security:generate-key-material))
+         (km2 (dds.security:generate-key-material))
+         (kmo (dds.security:generate-key-material :origin-auth t)))
+    (%check :cm-gen-salt (not (equalp (dds.security:key-material-master-salt km1) zeros32))
+            "generate-key-material fills a non-zero master_salt")
+    (%check :cm-gen-key (not (equalp (dds.security:key-material-master-sender-key km1) zeros32))
+            "generate-key-material fills a non-zero master_sender_key")
+    (%check :cm-gen-kid-nonzero (notevery #'zerop (dds.security:key-material-sender-key-id km1))
+            "generate-key-material allocates a non-zero sender_key_id")
+    (%check :cm-gen-kid-unique (not (equalp (dds.security:key-material-sender-key-id km1)
+                                            (dds.security:key-material-sender-key-id km2)))
+            "generate-key-material allocates DISTINCT sender_key_ids on successive calls (allocator)")
+    (%check :cm-gen-off-zero
+            (and (equalp (dds.security:key-material-receiver-specific-key-id km1) zeros4)
+                 (equalp (dds.security:key-material-master-receiver-specific-key km1) zeros32))
+            "generate-key-material (no :origin-auth) leaves the receiver-specific slots all-zero")
+    (%check :cm-gen-on-nonzero
+            (and (notevery #'zerop (dds.security:key-material-receiver-specific-key-id kmo))
+                 (not (equalp (dds.security:key-material-master-receiver-specific-key kmo) zeros32)))
+            "generate-key-material :origin-auth t populates a NON-ZERO receiver_specific_key_id + master key")
+    (dotimes (i 64)
+      (%check :cm-gen-rskid-never-zero
+              (notevery #'zerop (dds.security:key-material-receiver-specific-key-id
+                                 (dds.security:generate-key-material :origin-auth t)))
+              "receiver_specific_key_id is never the all-zero origin-auth-disabled sentinel (T3 carry fix)"))
+    (let* ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
+           (wkm (dds.security:generate-writer-key-material guid :origin-auth t)))
+      (%check :cm-gen-writer-kid
+              (equalp (dds.security:key-material-sender-key-id wkm)
+                      (make-array 4 :element-type '(unsigned-byte 8) :initial-element 9))
+              "generate-writer-key-material overrides sender_key_id with the GUID-derived id (delegation intact)")
+      (%check :cm-gen-writer-rs
+              (notevery #'zerop (dds.security:key-material-receiver-specific-key-id wkm))
+              "generate-writer-key-material :origin-auth t still populates non-zero receiver-specific (delegation)")))
+  t)
+
+(defun* %cm-participant-registry ()
+    (function () t)
+  "cm-register-local-participant returns a populated KM and is idempotent (one ParticipantCrypto per
+   participant); cm-encode-participant-km returns it. cm-register-matched-remote-participant +
+   cm-decode-participant-km resolve by the 12-octet GUID-prefix; an unknown prefix -> NIL (fail-closed)."
+  (let* ((cm  (dds.dcps::make-crypto-manager))
+         (lp  (dds.dcps::cm-register-local-participant cm :origin-auth t))
+         (lp2 (dds.dcps::cm-register-local-participant cm))
+         (zeros32 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 3))
+         (other  (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7))
+         (rkm (dds.security:generate-key-material)))
+    (%check :cm-lp-populated (not (equalp (dds.security:key-material-master-sender-key lp) zeros32))
+            "cm-register-local-participant returns a KM with a populated master_sender_key")
+    (%check :cm-lp-rs (notevery #'zerop (dds.security:key-material-receiver-specific-key-id lp))
+            "cm-register-local-participant :origin-auth t populates the receiver-specific key_id")
+    (%check :cm-lp-idempotent (eq lp lp2)
+            "cm-register-local-participant is idempotent (same KM instance on re-register)")
+    (%check :cm-lp-encode (eq lp (dds.dcps::cm-encode-participant-km cm))
+            "cm-encode-participant-km returns the registered local participant KM")
+    (dds.dcps::cm-register-matched-remote-participant cm prefix rkm)
+    (%check :cm-rp-resolve (eq rkm (dds.dcps::cm-decode-participant-km cm prefix))
+            "cm-decode-participant-km resolves the remote participant KM by GUID-prefix")
+    (%check :cm-rp-unknown (null (dds.dcps::cm-decode-participant-km cm other))
+            "cm-decode-participant-km returns NIL on an unknown prefix (fail-closed)"))
+  t)
+
+(defun* %cm-entity-registry ()
+    (function () t)
+  "cm-register-local-entity is populated + idempotent per entity-id; cm-encode-entity-km resolves it.
+   cm-register-matched-remote-entity installs under BOTH the (prefix.entity) GUID and the
+   transformation_key_id index; cm-decode-entity-km-by-key-id resolves by the wire transformation_key_id;
+   unknown entity-id / key-id -> NIL (fail-closed)."
+  (let* ((cm  (dds.dcps::make-crypto-manager))
+         (eid #x00000102)
+         (le  (dds.dcps::cm-register-local-entity cm eid))
+         (le2 (dds.dcps::cm-register-local-entity cm eid))
+         (prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 5))
+         (reid #x00000103)
+         (rkm  (dds.security:generate-key-material))
+         (rkid (dds.security:key-material-sender-key-id rkm)))
+    (%check :cm-le-idempotent (eq le le2)
+            "cm-register-local-entity is idempotent per entity-id")
+    (%check :cm-le-encode (eq le (dds.dcps::cm-encode-entity-km cm eid))
+            "cm-encode-entity-km resolves the local entity KM by entity-id")
+    (%check :cm-le-unknown (null (dds.dcps::cm-encode-entity-km cm #x000001c7))
+            "cm-encode-entity-km returns NIL on an unknown entity-id (fail-closed)")
+    (dds.dcps::cm-register-matched-remote-entity cm prefix reid rkm)
+    (%check :cm-re-by-key-id (eq rkm (dds.dcps::cm-decode-entity-km-by-key-id cm rkid))
+            "cm-decode-entity-km-by-key-id resolves the remote entity KM by transformation_key_id")
+    (%check :cm-re-key-id-unknown
+            (null (dds.dcps::cm-decode-entity-km-by-key-id
+                   cm (make-array 4 :element-type '(unsigned-byte 8) :initial-element #xfe)))
+            "cm-decode-entity-km-by-key-id returns NIL on an unknown key-id (fail-closed)"))
+  t)
+
+(defun* %cm-resolvers ()
+    (function () t)
+  "cm-encode-keys / cm-decode-keys return a dds.security:crypto-keys whose closures resolve the
+   EntityCrypto by the 16-octet GUID (the shape the dataplane disc-node CRYPTO-TRANSFORM installs):
+   encode by the local writer GUID (entity-id extracted from octets 12-15), decode by the remote
+   writer GUID; an unknown GUID -> NIL (fail-closed)."
+  (let* ((cm   (dds.dcps::make-crypto-manager))
+         (leid #x00000102)
+         (le   (dds.dcps::cm-register-local-entity cm leid))
+         (lguid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (rprefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 4))
+         (reid #x00000107)
+         (rkm  (dds.security:generate-key-material))
+         (ck-e (dds.dcps::cm-encode-keys cm))
+         (ck-d (dds.dcps::cm-decode-keys cm)))
+    (setf (aref lguid 12) #x00 (aref lguid 13) #x00 (aref lguid 14) #x01 (aref lguid 15) #x02)
+    (%check :cm-ck-encode
+            (eq le (funcall (dds.security:crypto-keys-encode-key-fn ck-e) lguid))
+            "cm-encode-keys' encode closure resolves the local entity KM from the writer GUID's entity-id")
+    (dds.dcps::cm-register-matched-remote-entity cm rprefix reid rkm)
+    (let ((rguid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 4))
+          (unknown (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xab)))
+      (setf (aref rguid 12) #x00 (aref rguid 13) #x00 (aref rguid 14) #x01 (aref rguid 15) #x07)
+      (%check :cm-ck-decode
+              (eq rkm (funcall (dds.security:crypto-keys-decode-key-fn ck-d) rguid))
+              "cm-decode-keys' decode closure resolves the remote entity KM by the wire GUID")
+      (%check :cm-ck-decode-unknown
+              (null (funcall (dds.security:crypto-keys-decode-key-fn ck-d) unknown))
+              "cm-decode-keys' decode closure returns NIL on an unknown GUID (fail-closed)")))
+  t)
+
+(defun* %cm-concurrency-smoke ()
+    (function () t)
+  "Light concurrency smoke: N threads concurrently register disjoint remote entities + resolve them on
+   ONE crypto-manager. After join, every thread's KMs resolved by transformation_key_id and the index
+   holds exactly N*M entries — the single manager lock keeps the registries uncorrupted under concurrent
+   read+write (a lost update would drop the count or fail a resolve). Threads do only register/resolve
+   (no CLOS error-signaling inside threads, per the Clasp threading note)."
+  (let* ((cm (dds.dcps::make-crypto-manager))
+         (n-threads 8)
+         (per 50)
+         (oks (make-array n-threads :initial-element nil)))
+    (let ((threads
+            (loop for ti from 0 below n-threads
+                  collect
+                  (let ((ti ti))
+                    (dds.pal:spawn
+                     (lambda ()
+                       (let ((all-ok t))
+                         (dotimes (j per)
+                           (let* ((prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element ti))
+                                  (eid (+ #x01000000 (* ti 1000) j))
+                                  (km (dds.security:generate-key-material)))
+                             (setf (aref prefix 11) (logand j #xff))
+                             (dds.dcps::cm-register-matched-remote-entity cm prefix eid km)
+                             (unless (eq km (dds.dcps::cm-decode-entity-km-by-key-id
+                                             cm (dds.security:key-material-sender-key-id km)))
+                               (setf all-ok nil))))
+                         (setf (aref oks ti) all-ok)))
+                     :name "cm-smoke")))))
+      (dolist (th threads) (dds.pal:join th)))
+    (%check :cm-smoke-resolves (every #'identity oks)
+            "every thread's concurrently-registered KMs resolved correctly (no lost update under the lock)")
+    (%check :cm-smoke-count
+            (= (* n-threads per) (hash-table-count (dds.dcps::crypto-manager-key-id-index cm)))
+            "the transformation_key_id index holds exactly N*M entries after concurrent registration"))
+  t)
+
+(defun* %cm-rtps-origin-auth ()
+    (function () t)
+  "T10 participant-tier rtps_protection origin-auth resolvers (cm-rtps-encode-receivers / cm-rtps-decode-receiver,
+   §9.5.3.3.4.3) driven THROUGH the real resolvers — the review fold-in (the run-rtps-protection-test wrong-key
+   control used MANUAL closures, leaving cm-rtps-* with only positive e2e coverage). A is the sender; B-good holds
+   the matching participant receiver key, B-bad a DIFFERENT one. A holds B-good's ParticipantCrypto as the matched
+   remote, so cm-rtps-encode-receivers resolves B-good's receiver descriptor (A MACs the per-receiver MAC under
+   it). BOTH B's hold A's ParticipantCrypto, so the common_mac (A's sender key) verifies for BOTH — isolating the
+   receiver-MAC gate. On the SAME SRTPS datagram: cm-rtps-decode-receiver(B-good) recovers the stream byte-exact;
+   a no-receiver-key decode recovers it too (the common_mac alone is valid); cm-rtps-decode-receiver(B-bad) -> NIL
+   (the WRONG participant receiver key fails the receiver-MAC though the common_mac is valid, §9.5.3.3.4.3)."
+  (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x5a))   ; A's prefix (sender)
+         (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x6b))   ; B's prefix (receiver)
+         (cm-a      (dds.dcps::make-crypto-manager))                                   ; the sender
+         (cm-b-good (dds.dcps::make-crypto-manager))                                   ; the correct receiver
+         (cm-b-bad  (dds.dcps::make-crypto-manager))                                   ; the wrong-receiver-key control
+         (km-a    (dds.dcps::cm-register-local-participant cm-a))                      ; A's ParticipantCrypto (sender key)
+         (km-good (dds.dcps::cm-register-local-participant cm-b-good :origin-auth t))  ; B-good's participant receiver key
+         (stream  (map '(simple-array (unsigned-byte 8) (*)) #'char-code "SRTPSPAYLOAD-XYZ")))
+    (dds.dcps::cm-register-local-participant cm-b-bad :origin-auth t)   ; B-bad's DIFFERENT receiver key (read via the resolver)
+    ;; A learns B-good's ParticipantCrypto (from its ParticipantCryptoToken) -> MACs the per-receiver MAC under it.
+    (dds.dcps::cm-register-matched-remote-participant cm-a pb km-good)
+    ;; both B's hold A's ParticipantCrypto -> the common_mac (A's sender key) verifies for BOTH.
+    (dds.dcps::cm-register-matched-remote-participant cm-b-good pa km-a)
+    (dds.dcps::cm-register-matched-remote-participant cm-b-bad  pa km-a)
+    (let* ((receivers (dds.dcps::cm-rtps-encode-receivers cm-a pb))    ; THROUGH the encode resolver -> B-good's descriptor
+           (rd-good   (dds.dcps::cm-rtps-decode-receiver cm-b-good))   ; THROUGH the decode resolver -> B-good's descriptor
+           (rd-bad    (dds.dcps::cm-rtps-decode-receiver cm-b-bad))    ; THROUGH the decode resolver -> the WRONG descriptor
+           (km-good-v (dds.dcps::cm-decode-participant-km cm-b-good pa))
+           (km-bad-v  (dds.dcps::cm-decode-participant-km cm-b-bad pa))
+           (srtps     (dds.security:encode-rtps-message km-a :encrypt stream :receivers receivers)))
+      (%check :cm-rtps-oa-encode-receivers (and receivers (consp (first receivers)))
+              "cm-rtps-encode-receivers resolves the matched-remote participant receiver descriptor (origin-auth)")
+      (%check :cm-rtps-oa-decode-good
+              (equalp stream (dds.security:decode-rtps-message
+                              km-good-v srtps :my-receiver-key-id (car rd-good) :my-receiver-key (cdr rd-good)))
+              "the CORRECT participant receiver key (via cm-rtps-decode-receiver) decodes the SRTPS datagram byte-exact")
+      (%check :cm-rtps-oa-common-mac-valid
+              (equalp stream (dds.security:decode-rtps-message km-bad-v srtps))
+              "the common_mac is valid (a no-receiver-key decode of the SAME datagram recovers the stream) — isolating the receiver-MAC gate")
+      (%check :cm-rtps-oa-decode-wrong
+              (null (dds.security:decode-rtps-message
+                     km-bad-v srtps :my-receiver-key-id (car rd-bad) :my-receiver-key (cdr rd-bad)))
+              "the WRONG participant receiver key (via cm-rtps-decode-receiver) fails closed though the common_mac is valid (§9.5.3.3.4.3)")))
+  t)
+
+(defun* run-security-crypto-manager-test ()
+    (function () t)
+  "DDS-Security 1.1 §8.5 key-management hub (WP-DDS-SECURITY-SECURE-DISCOVERY T6): the generic
+   §9.5.2 KeyMaterial generator (generate-key-material — CryptoKeyFactory primitive, the T3
+   non-zero receiver_specific_key_id fix, and the generate-writer-key-material DRY delegation) plus
+   the dds.dcps crypto-manager ParticipantCrypto + EntityCrypto registries and the encode/decode key
+   resolvers the §9.5.3.3 data path consumes (by GUID-prefix for participant, by transformation_key_id
+   / inner GUID for entity), each fail-closed on a miss, with a light concurrency smoke over the
+   single manager lock. Requires OpenSSL >= 3.5 (random KeyMaterial); skips only if truly absent.
+   Both SBCL and Clasp must pass identically."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [security-crypto-manager] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-security-crypto-manager-test t)))
+  (%cm-generator-units)
+  (%cm-participant-registry)
+  (%cm-entity-registry)
+  (%cm-resolvers)
+  (%cm-rtps-origin-auth)
+  (%cm-concurrency-smoke)
   t)

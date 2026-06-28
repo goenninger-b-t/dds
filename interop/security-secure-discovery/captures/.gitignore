@@ -1,0 +1,3 @@
+# Live-run artifacts: large undissectable lo0 captures + scratch (reproduce via run-fastdds-interop.sh).
+*.pcapng
+work/

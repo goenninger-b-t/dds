@@ -113,3 +113,69 @@
    :master-sender-key   (copy-seq +test-master-sender-key+)
    :iv-counter          0
    :iv-counter-lock     (dds.pal:make-lock "km-iv")))
+
+;;; --- generic §8.5 CryptoKeyFactory KeyMaterial generator (T6) ---
+;;; The single random-fill primitive behind both the participant/entity KeyMaterial the
+;;; crypto-manager mints and the per-writer KeyMaterial (generate-writer-key-material delegates here).
+
+(defparameter *sender-key-id-counter* 0
+  "Monotonic source for the allocated 4-octet CryptoTransformKeyId (sender_key_id, §9.5.2 Table 65)
+   handed out by GENERATE-KEY-MATERIAL. Guarded by *SENDER-KEY-ID-LOCK*; the first allocation is 1
+   (never zero on the wire). Process-global so every KeyMaterial a participant mints carries a
+   distinct transformation_key_id, keeping a receiver's O(1) transformation_key_id -> KeyMaterial
+   decode index unambiguous. NOT a wire constant — an allocation counter (§9.5.2 leaves
+   CryptoTransformKeyId assignment to the implementation).")
+
+(defparameter *sender-key-id-lock* (dds.pal:make-lock "sender-key-id")
+  "Guards *SENDER-KEY-ID-COUNTER* across concurrent GENERATE-KEY-MATERIAL calls (control-plane).")
+
+(defun* %alloc-sender-key-id ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "Allocate the next process-unique, NON-ZERO 4-octet sender_key_id (big-endian; §9.5.2 Table 65),
+   wrapping modulo 2^32 and skipping zero. Control-plane (keying), never the hot path."
+  (let ((n (dds.pal:with-lock (*sender-key-id-lock*)
+             (let ((c (logand (1+ *sender-key-id-counter*) #xffffffff)))
+               (when (zerop c) (setf c 1))
+               (setf *sender-key-id-counter* c)))))
+    (let ((kid (make-array 4 :element-type '(unsigned-byte 8))))
+      (setf (aref kid 0) (ldb (byte 8 24) n)
+            (aref kid 1) (ldb (byte 8 16) n)
+            (aref kid 2) (ldb (byte 8 8) n)
+            (aref kid 3) (ldb (byte 8 0) n))
+      kid)))
+
+(defun* %nonzero-random-key-id ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "A cryptographically random NON-ZERO 4-octet receiver_specific_key_id (§9.5.2 Table 65), resampled
+   until non-zero: zero is the §9.5.3.3.4.3 'origin authentication disabled' sentinel, so a random
+   draw must never collide with it (the T6 fix for the T3 carry). Control-plane."
+  (loop for kid = (dds.dare:random-bytes 4)
+        when (notevery #'zerop kid) return kid))
+
+(defun* generate-key-material (&key (origin-auth nil))
+    (function (&key (:origin-auth t)) key-material)
+  "Generate a fresh §9.5.2 KeyMaterial_AES_GCM_GMAC — the generic §8.5 CryptoKeyFactory primitive
+   reused for participant- and entity-level keys (and, via GENERATE-WRITER-KEY-MATERIAL, per-writer
+   keys). master_salt (32B) + master_sender_key (32B) are cryptographically random
+   (dds.dare:random-bytes); sender_key_id is a process-unique NON-ZERO 4-octet allocation
+   (%ALLOC-SENDER-KEY-ID) so a receiver's O(1) transformation_key_id -> KeyMaterial decode index
+   stays unambiguous; transformation_kind = AES256-GCM (§9.5.2 Table 65). With ORIGIN-AUTH NIL
+   (default) the receiver-specific fields stay all-zero (no per-receiver origin authentication,
+   §9.5.2). With ORIGIN-AUTH true both are populated: a NON-ZERO random receiver_specific_key_id
+   (zero is the §9.5.3.3.4.3 origin-auth-disabled sentinel — never emitted) + a random 32B
+   master_receiver_specific_key, for the *_WITH_ORIGIN_AUTHENTICATION protection kinds (§9.5.3.3.4.3;
+   consumed by derive-receiver-specific-session-key / compute-receiver-specific-mac). Keys are plain
+   heap vectors per ADR 0034 (KeyMaterial foreign-backing + zeroize-on-teardown is a deferred
+   hardening follow-on); the caller owns the key-material lifecycle. Control-plane, not the hot path."
+  ; HARDENING-GAP: KeyMaterial master key/salt are GC-heap (ADR 0034 deferral); not the hot path.
+  (if origin-auth
+      (make-key-material :transformation-kind          (copy-seq +transformation-kind-aes256-gcm+)
+                         :master-salt                  (dds.dare:random-bytes 32)
+                         :sender-key-id                (%alloc-sender-key-id)
+                         :master-sender-key            (dds.dare:random-bytes 32)
+                         :receiver-specific-key-id     (%nonzero-random-key-id)
+                         :master-receiver-specific-key (dds.dare:random-bytes 32))
+      (make-key-material :transformation-kind (copy-seq +transformation-kind-aes256-gcm+)
+                         :master-salt         (dds.dare:random-bytes 32)
+                         :sender-key-id       (%alloc-sender-key-id)
+                         :master-sender-key   (dds.dare:random-bytes 32))))

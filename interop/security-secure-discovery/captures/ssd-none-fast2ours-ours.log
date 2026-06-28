@@ -1,0 +1,50 @@
+WARNING:
+   The new FTYPE proclamation for NET.GOENNINGER.DDS.DCPS::CM-ON-AUTHENTICATED
+     (FUNCTION
+      (NET.GOENNINGER.DDS.DCPS::CRYPTO-MANAGER
+       NET.GOENNINGER.DDS.DISC:DISC-NODE (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (12)))
+      (EQL T))
+   does not match the old FTYPE proclamation
+     (FUNCTION
+      (T NET.GOENNINGER.DDS.DISC:DISC-NODE
+       (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (12)))
+      (VALUES (MEMBER T) &REST T))
+WARNING:
+   The new FTYPE proclamation for
+   NET.GOENNINGER.DDS.DCPS::%INSTALL-CRYPTO-MANAGER
+     (FUNCTION
+      (NET.GOENNINGER.DDS.DCPS:DOMAIN-PARTICIPANT
+       NET.GOENNINGER.DDS.DCPS::AUTH-MANAGER-STATE
+       NET.GOENNINGER.DDS.DISC:DISC-NODE)
+      NET.GOENNINGER.DDS.DCPS::CRYPTO-MANAGER)
+   does not match the old FTYPE proclamation
+     (FUNCTION
+      (NET.GOENNINGER.DDS.DCPS:DOMAIN-PARTICIPANT
+       NET.GOENNINGER.DDS.DCPS::AUTH-MANAGER-STATE
+       NET.GOENNINGER.DDS.DISC:DISC-NODE)
+      *)
+[sub] secure participant up: domain=0 topic=HelloWorldTopic type=HelloWorld guid-prefix=474201E9B5EBED0000000000 port=7420 peers=127.0.0.1:7410
+[sub] discovered=0 matched=0 samples=0 keyed=NIL states=
+; auth-manager[D1437B8E7A95]: remote IdentityToken rejected
+[sub] discovered=1 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED
+; auth-manager[D1437B8E7A95]: remote IdentityToken rejected
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+[sub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
+SUMMARY: role=sub discovered=2 peak-matched=0 peak-samples=0 ever-keyed=NIL sent=0
+RESULT: FAIL

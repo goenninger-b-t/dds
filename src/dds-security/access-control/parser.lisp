@@ -36,6 +36,19 @@
   (let ((child (%ac-node-child parent name)))
     (and child (string= "true" (or (%ac-node-text child) "")))))
 
+(defun* %ac-node-protection-kind (parent name valid-kinds)
+    (function (t string list) (or keyword null))
+  "ProtectionKind from named child of PARENT (§9.4.1.2.3).
+   NIL if the element is absent (required by schema), token is unknown, or keyword is not
+   in VALID-KINDS — fail-closed on every non-conformant case."
+  (let ((child (%ac-node-child parent name)))
+    (if (null child)
+        nil
+        (let* ((text (or (%ac-node-text child) ""))
+               (pair (rassoc text +protection-kind-xsd-strings+ :test #'string=))
+               (kw   (and pair (car pair))))
+          (and kw (member kw valid-kinds) kw)))))
+
 (defun* %ac-node-text-req (parent name)
     (function (t string) (or string null))
   "Trimmed text content of named child of PARENT; NIL if absent or empty."

@@ -43,6 +43,46 @@
                     result)))
           (and result (nreverse result)))))))
 
+(defun* %dn-normalize (s)
+    (function (string) list)
+  "Parse an X.500 Distinguished Name string — OpenSSL oneline (/CN=a/O=b/C=DE, what X509_NAME_oneline
+   emits) OR RFC2253/RFC1779 (CN=a,O=b,C=DE, what X509_NAME_print_ex+XN_FLAG_RFC2253 and Fast DDS's
+   rfc2253_string_compare use) — into a SORTED list of canonical \"ATTR=value\" tokens (ATTR upcased,
+   surrounding whitespace trimmed). Sorting absorbs the oneline-forward vs RFC2253-reverse RDN order;
+   the leading separator selects '/' vs ','. Empty tokens dropped."
+  (let ((toks '()) (start 0) (n (length s))
+        (sep (if (and (plusp (length s)) (char= (char s 0) #\/)) #\/ #\,)))
+    (flet ((emit (piece)
+             (let* ((piece (string-trim " " piece))
+                    (eqp   (position #\= piece)))
+               (when (and eqp (plusp eqp))
+                 (push (concatenate 'string
+                                    (string-upcase (string-trim " " (subseq piece 0 eqp)))
+                                    "=" (string-trim " " (subseq piece (1+ eqp))))
+                       toks)))))
+      (dotimes (i (1+ n))
+        (when (or (= i n) (char= (char s i) sep))
+          (emit (subseq s start i))
+          (setf start (1+ i)))))
+    (sort toks #'string<)))
+
+(defun* %dn-equal (a b)
+    (function (string string) boolean)
+  "T iff DN strings A and B denote the same X.509 subject independent of serialization (OpenSSL oneline
+   vs RFC2253) and RDN order — DDS-Security 1.1 §9.4.1.3 binds the grant by the X.509 subject DN, not by
+   one string form. Requires equal RDN count + every normalized token equal (strict; no false-accept,
+   and the cert is CA-validated upstream so a reordered-RDN forgery is out of scope)."
+  (let ((na (%dn-normalize a)) (nb (%dn-normalize b)))
+    (and na (= (length na) (length nb)) (every #'string= na nb))))
+
+(defun* permissions-grant-for (subject grants)
+    (function (string list) (or permissions null))
+  "The first PERMISSIONS grant in GRANTS whose subject_name denotes the same X.509 DN as SUBJECT, via
+   the serialization-insensitive %dn-equal (DDS-Security 1.1 §9.4.1.3 subject binding). NIL if none. The
+   single subject-match site for both local (validate-local-permissions) and remote (validate-remote-
+   permissions, secure-endpoint authorize) binding, so cross-vendor oneline/RFC2253 forms interoperate."
+  (find-if (lambda (g) (%dn-equal subject (permissions-subject-name g))) grants))
+
 (defun* %permissions-match-p (perms operation topic-name)
     (function (permissions symbol string) boolean)
   "First-match-wins rule evaluation for OPERATION on TOPIC-NAME; default on no match (§9.4.1.3.2.10)."

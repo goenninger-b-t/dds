@@ -56,6 +56,13 @@
            #:run-security-payload-fuzz-test
            #:run-security-encrypted-pubsub-test
            #:run-security-encrypted-fragmented-test
+           #:run-security-crypto-header-corpus-test
+           #:run-security-submessage-corpus-test
+           #:run-security-origin-auth-test
+           #:run-security-rtps-message-corpus-test
+           #:run-security-crypto-manager-test
+           #:run-rtps-message-bench
+           #:run-rtps-protection-bench
            #:run-auth-identity-test
            #:run-auth-sha256-kat
            #:run-auth-ecdsa-kat
@@ -73,4 +80,6 @@
            #:run-auth-handshake-over-wire-test
            #:run-cms-verify-kat
            #:run-access-plugin-validate-test
-           #:run-access-manager-test))
+           #:run-access-manager-test
+           #:run-governance-protection-kind-test
+           #:run-secure-interop-peer))

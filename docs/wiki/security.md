@@ -40,11 +40,11 @@ The 12-byte GCM **nonce** is `session_id (4) || init_vector_suffix (8)` (§9.5.3
 
 ### 1.2 crypto_content (§9.5.3.3.4.4) and SecureDataTag (§9.5.3.3.3)
 
-`crypto_content` is a `sequence<octet>`: a `uint32` length prefix (RTPS E-flag endianness;
-this stack emits little-endian, the common case) followed by the ciphertext (its length
-equals the plaintext length — AES-GCM does not expand).  `SecureDataTag` for
+`crypto_content` is a `sequence<octet>`: a `uint32` length prefix (**BIG-ENDIAN**, §9.5.3.3.4.4 — forced
+independent of the surrounding little-endian RTPS stream, Fast-DDS/Cyclone-aligned; T-RECONCILE) followed
+by the ciphertext (its length equals the plaintext length — AES-GCM does not expand).  `SecureDataTag` for
 serialized-payload protection without origin-authentication is `common_mac (16)` (the
-128-bit GCM tag) `|| receiver_specific_macs_count (4 = 0)`.
+128-bit GCM tag) `|| receiver_specific_macs_count (uint32 BIG-ENDIAN, = 0)`.
 
 ### 1.3 CDR encapsulation header — the decision
 
@@ -176,10 +176,13 @@ For a plaintext payload `#(S Q U A R E SP 0x01)`:
 
 ```
 session_key = HMAC-SHA256(master_sender_key,
-                          "SessionKey" || master_salt || session_id || "0001")
+                          "SessionKey" || master_salt || session_id)
 ```
 
-This is **HMAC-SHA256** (§9.5.3.3.4.2 Table 70) — *not* the HKDF-SHA384 used by
+There is **no trailing counter**: Fast DDS `compute_sessionkey` and Cyclone `crypto_calculate_session_key`
+both hash exactly `id_string ‖ master_salt ‖ session_id` (corroborated clean-room; T-RECONCILE, 2026-06-27 —
+an earlier `"0001"` counter was removed reconciling to the wire oracle, see `docs/provenance.md`).
+This is **HMAC-SHA256** (§9.5.3.3.4.2) — *not* the HKDF-SHA384 used by
 `dds-dare` for the DARE key derivation.  The primitive is `dds.dare:hmac-sha256` (a
 one-shot OpenSSL `EVP_Q_mac` over the existing handle-based libcrypto resolution; the
 foreign key buffer is zeroized before free).
@@ -1004,6 +1007,606 @@ format (bare PEM-PKCS7 vs MIME-wrapped), and subject-name normalization are self
 
 ---
 
+## 6sexto. Secure discovery — Slice 4 (DDS-Security 1.1 §7.3.7, §7.4.5, §9.5)
+
+Slice 4 (landed 2026-06-28, WP-DDS-SECURITY-SECURE-DISCOVERY, ADR 0036) protects the builtin
+discovery traffic and the whole user-data RTPS datagram between matched secure participants,
+governed by the Governance protection-kind policy.  It is effectively the entire §8.5
+Cryptographic plugin beyond Slice-1's serialized-payload protection: **submessage protection**
+(§8.5.1.7-.9), **whole-RTPS-message protection** (§8.5.1.10-.12), **origin authentication** (the
+receiver-specific MAC, §9.5.3.3.4.3), a reliable **ParticipantVolatileMessageSecure** endpoint
+carrying the crypto-token exchange, the **Governance protection-kind model**, and the wiring of
+the **secure builtin discovery endpoints** (secure SEDP, secure participant-message, secure SPDP).
+
+**Three structural choices** (ADR 0036): (1) the new tiers are *additive* — Slice-1's byte-exact
+`crypto.lisp`/`transform.lisp` is untouched and now delegates to a shared
+`crypto/crypto-header.lisp` codec (DRY); (2) a dedicated `crypto-manager` (`src/dds-dcps/`),
+parallel to `auth-manager`, owns the §8.5 ParticipantCrypto/EntityCrypto registries + the token
+exchange; (3) the reliable PVMS endpoint *reuses* the M2 reliable writer/reader engine.
+
+**What is protected, and when:** plain SPDP + the PSM handshake stay clear (the auth bootstrap;
+rtps-protection-exempt); PVMS is submessage-protected with a SharedSecret-derived key; once a pair
+is `:keyed`, the user data plane is whole-RTPS-wrapped (`rtps_protection_kind`), protected topics'
+SEDP rides secure SEDP only (`discovery_protection_kind`), WLP rides secure participant-message
+(`liveliness_protection_kind`), and a secure SPDP re-announce rides the discovery tier.
+**Security-OFF is byte-identical** (no governance, or every kind = NONE → no secure bits, NIL
+crypto resolvers, the plain wire unchanged — the false-REJECT guard).
+
+**Building blocks** (each its own sub-section below; the numbering follows the build order, not the
+reading order):
+
+| Topic | Increment | Sub-section |
+|---|---|---|
+| Origin authentication (submessage tier) — §9.5.3.3.4.3 | T3 | §6sexto.1 |
+| Whole-RTPS-message protection (SRTPS) — §8.5.1.10-.12 | T4 | §6sexto.2 |
+| Reliable ParticipantVolatileMessageSecure (PVMS) — §9.5.3.1 | T7 | §6sexto.3 |
+| Origin-auth for the builtin secure endpoints | T-ORIGINAUTH | §6sexto.4 |
+| `rtps_protection` engagement on the live data path | T10 | §6sexto.5 |
+| Secure participant-message (liveliness) + secure SPDP | T11 | §6sexto.6 |
+| Governance protection-kind model (the knobs) — §9.4.1.2 | T5 | §6sexto.7 |
+| The crypto-manager + crypto-token exchange + `:keyed` promotion | T6, T8 | §6sexto.8 |
+| Secure SEDP wiring + the worked secure-discovery example | T9 | §6sexto.9 |
+
+(Submessage protection itself — `encode/decode-datawriter-submessage` and the datareader twins,
+SIGN + ENCRYPT, §8.5.1.7-.9 — is T2; the shared region engine it introduces backs §6sexto.1, .2,
+.5, .6, .9.  Whole-RTPS-message protection is T4 (§6sexto.2), not T2.)
+
+**Honest interop posture (read this before claiming anything).**  Our-to-our is **complete**: two
+secure participants authenticate, exchange crypto tokens over reliable PVMS, reach `:keyed`,
+announce protected topics only over secure SEDP, match, and exchange data protected at all three
+tiers with origin authentication where governance requires it (§6sexto.9).  **Live Fast
+DDS-Security is PARTIAL:** a SECURITY=ON Fast DDS v3.6.1 peer was built on our PKI and bidirectional
+SPDP discovery achieved, with four conformant wire/config fixes — but the §8.7 auth handshake is
+**REJECTED** at the remote IdentityToken (the propagate-byte divergence, ADR 0036 Carry 1), so
+**no cross-vendor `auth → keyed → secure-SEDP → protected data` was achieved**.  **Live RTI
+Connext-Security is static only** (Security Plugins absent).  The full cross-vendor path + live
+Connext is **Slice 5 — the P6 exit gate**.  See §6sexto.9, ADR 0036, and
+`interop/security-secure-discovery/README.md`.  **Do NOT interpret this section as "cross-vendor
+secure discovery verified."**
+
+T0 (landed 2026-06-27) pinned the wire constants; the §7.3.7 shared CryptoHeader/CryptoContent/
+CryptoFooter codec is T1, §8.5.1.7-.9 submessage protection (SIGN+ENCRYPT) is T2, §9.5.3.3.4.3
+origin authentication is T3 (§6sexto.1), and §8.5.1.10-.12 whole-RTPS-message protection (SRTPS) is
+T4 (§6sexto.2).
+
+**`src/dds-rtps/discovery.lisp`** (`dds.rtps.discovery`) — kept with the other builtin EntityIds (DRY):
+secure builtin EntityIds (`+entityid-*+`) for the secure SEDP/SPDP endpoints and the PVMS/PSM
+endpoints (§7.4.5 / §9.5.1.3 Table 40); and the §7.4.6.1 BuiltinEndpointSet security bits 16–27
+(`+be-*+`) for secure-discovery capability advertisement in SPDP participant data (Table 28).
+
+**`src/dds-security/crypto/constants.lisp`** (`dds.security`): the §7.3.7 security submessage kinds
+(`+submessage-sec-body+` SEC_BODY / `+submessage-sec-prefix+` SEC_PREFIX /
+`+submessage-sec-postfix+` SEC_POSTFIX / `+submessage-srtps-prefix+` SRTPS_PREFIX /
+`+submessage-srtps-postfix+` SRTPS_POSTFIX); the §9.5.3.3.4.3 receiver-specific session-key KDF
+label `+kdf-label-session-receiver-key+` (`"SessionReceiverKey"`); and the §9.4.1.2
+ProtectionKind/BasicProtectionKind keyword enums (`+protection-kinds+` / `+basic-protection-kinds+`)
+plus the XSD-token alist `+protection-kind-xsd-strings+`.  The crypto-token `message_class_ids`
+(`dds.sec.{participant,datawriter,datareader}_crypto_tokens`:
+`+gm-participant-crypto-tokens+` / `+gm-datawriter-crypto-tokens+` / `+gm-datareader-crypto-tokens+`)
+are pinned in `src/dds-security/auth/keyexchange.lisp` (§7.4.4 / §9.5.2.2 — see the DRY header
+comment in `constants.lisp`).
+
+Pinned-values table, spec-clause citations, and dual Fast-DDS/Connext corroboration:
+`docs/superpowers/spikes/2026-06-27-dds-security-secure-discovery.md`.
+
+### 6sexto.1 Origin authentication (T3, DDS-Security 1.1 §9.5.3.3.4.3)
+
+The `*_WITH_ORIGIN_AUTHENTICATION` protection kinds add, on top of the common_mac, a
+**per-matched-receiver MAC** so a receiver can prove the message was authored by the holder of the
+writer's per-receiver key (not merely by some group-key holder). The CryptoFooter then carries
+`receiver_specific_macs_count` + one `{receiver_mac_key_id (4) , receiver_mac (16)}` entry per receiver;
+the SEC_POSTFIX `octetsToNextHeader` grows from 20 to `20 + 20*count`. The seal (ciphertext +
+common_mac) is unchanged from plain SIGN/ENCRYPT — origin-auth only appends to the footer.
+
+Two derivations (both `dds.security`, `crypto/submessage.lisp`):
+
+- **`derive-receiver-specific-session-key (master-receiver-specific-key master-salt session-id)
+  → (octets 32)`** —
+  `HMAC-SHA256(master_receiver_specific_key, "SessionReceiverKey" ‖ master_salt ‖ session_id)` (no
+  trailing counter — Fast-DDS/Cyclone-aligned; T-RECONCILE).
+  The receiver analogue of `derive-session-key`; both share the one framing helper
+  (`%derive-labeled-session-key`, `crypto.lisp`), differing only in the KDF label
+  (`+kdf-label-session-receiver-key+` vs `+session-key-id-string+`).
+- **`compute-receiver-specific-mac (recv-session-key nonce common-mac) → (octets 16)`** —
+  a pure GMAC: `AES-256-GCM(recv_session_key, nonce, AAD = common_mac, plaintext = empty) → tag`. The
+  `nonce` is **the same 12-octet init vector (`session_id ‖ iv_suffix`) the common_mac was sealed with**
+  (corroborated against Fast DDS `AESGCMGMAC_Transform.cpp`; see `docs/provenance.md`).
+
+The encode/decode API (`encode-/decode-datawriter-submessage` and the datareader twins) gains:
+
+- **encode `&key receivers`** — a list of `(receiver-key-id . master-receiver-specific-key)` conses
+  (4- and 32-octet vectors). After the seal, one GMAC over the common_mac is emitted per receiver into
+  the footer. Empty (the default) ⇒ plain SIGN/ENCRYPT (`receiver_specific_macs_count = 0`).
+- **decode `&key my-receiver-key-id my-receiver-key`** — when set, after the common_mac verifies the
+  decoder MUST also find this receiver's footer entry (by `my-receiver-key-id`), recompute its GMAC under
+  `my-receiver-key`, and **constant-time** compare; an absent entry or a mismatch fails-closed to `NIL`
+  **even though the common_mac is valid**. Both `NIL` (the default) ⇒ origin-auth not expected (the
+  common_mac alone governs; backward-compatible).
+
+`generate-writer-key-material` gains **`&key origin-auth`**: with it, the returned KeyMaterial carries a
+random non-zero `receiver_specific_key_id` + `master_receiver_specific_key` (§9.5.2 Table 65); without it
+(the default) those stay all-zero (participant-level, no origin-auth).
+
+Worked example (datawriter, ENCRYPT, two receivers; decode as receiver #2):
+
+```lisp
+(let* ((km    (dds.security:make-test-key-material))
+       (sub   <plain RTPS submessage octets>)
+       (r1    (cons kid1 master-recv-key-1))        ; 4-octet key-id . 32-octet master key
+       (r2    (cons kid2 master-recv-key-2))
+       (blob  (dds.security:encode-datawriter-submessage km :encrypt sub :receivers (list r1 r2))))
+  ;; receiver #2 with its key recovers the plaintext:
+  (dds.security:decode-datawriter-submessage km blob
+                                             :my-receiver-key-id kid2 :my-receiver-key master-recv-key-2)
+  ;; a WRONG receiver key -> NIL though the common_mac is valid (origin-auth gates):
+  (dds.security:decode-datawriter-submessage km blob :my-receiver-key-id kid2 :my-receiver-key wrong-key)
+  ;; origin-auth OFF on the SAME bytes -> the plaintext, on the common_mac alone:
+  (dds.security:decode-datawriter-submessage km blob))
+```
+
+**Honest interop posture (T3).** Self-consistent (our encode ↔ our decode) and byte-reproducible across
+SBCL + Clasp; corpus + property-fuzz (hostile/oversized `receiver_specific_macs_count` is capped by T1
+before any allocation, fail-closed). The two foundational cross-vendor divergences are now **RESOLVED**
+(T-RECONCILE, 2026-06-27): the session-key KDF drops the `"0001"` counter Fast DDS omits, and the footer
+`receiver_specific_macs_count` (plus the `crypto_content` length sibling found in the audit) is BIG-ENDIAN —
+both corroborated clean-room against Fast DDS AND Eclipse Cyclone DDS. See `docs/provenance.md`
+(M7/P6 T-RECONCILE). The remaining open T12 item is the SIGN inter-submessage 4-octet re-alignment (§6sexto.2).
+
+### 6sexto.2 Whole-RTPS-message protection (T4, DDS-Security 1.1 §8.5.1.10-.12)
+
+Where the submessage tier (T2/T3) protects ONE submessage, the RTPS tier protects the **entire submessage
+STREAM** of a datagram — everything AFTER the 20-octet RTPS Header — keyed by the per-participant
+**ParticipantCrypto KeyMaterial** (the `rtps_protection_kind` governance setting selects whether a
+participant applies it). It is the SAME AES-GCM-GMAC mechanism over the SHARED
+`%encode-secured-region` / `%decode-secured-region` engine (DRY, no copy-paste); only three things differ:
+the bracket submessage ids are **`SRTPS_PREFIX` (0x33) / `SRTPS_POSTFIX` (0x34)** (not SEC_PREFIX/SEC_POSTFIX);
+the protected unit is the whole stream; and on SIGN the verbatim body is located by **walking** the stream
+to the trailing `SRTPS_POSTFIX` (the stream is multi-submessage). The caller keeps / re-prepends the RTPS
+Header — the transform operates only on the submessage stream.
+
+Framing (identical to the submessage tier, only the kinds change):
+
+```
+ENCRYPT:  SRTPS_PREFIX(0x33) ‖ CryptoHeader{kind=AES256_GCM}  ‖ SEC_BODY(0x30) ‖ len ‖ ciphertext ‖ SRTPS_POSTFIX(0x34) ‖ CryptoFooter
+SIGN:     SRTPS_PREFIX(0x33) ‖ CryptoHeader{kind=AES256_GMAC} ‖ <original submessage stream VERBATIM>   ‖ SRTPS_POSTFIX(0x34) ‖ CryptoFooter
+```
+
+The API (`dds.security`, `crypto/rtps-message.lisp`):
+
+- **`encode-rtps-message (km kind submessages-octets &key receivers) → (or octets null)`** — `kind` ∈
+  `(:sign :encrypt)`; `submessages-octets` is the stream after the RTPS Header; returns the
+  `SRTPS_PREFIX ‖ <body> ‖ SRTPS_POSTFIX` octets. `:receivers` enables origin authentication exactly as in
+  §6sexto.1 (the footer carries one receiver MAC each).
+- **`decode-rtps-message (km srtps-octets &key my-receiver-key-id my-receiver-key) → (or octets null)`** —
+  recovers the original stream, or `NIL` on any failure (fail-closed). The wire
+  `CryptoHeader.transformation_kind` selects ENCRYPT (open the SEC_BODY ciphertext under empty AAD) vs SIGN
+  (verify the GMAC over the verbatim stream, located by walking to `SRTPS_POSTFIX`). The optional receiver
+  keys gate origin authentication as in §6sexto.1; both `NIL` (the default §8.5.1.12 2-arg contract) ⇒ the
+  common_mac alone governs.
+
+These are consumed by the send / `%handle-datagram` paths at T10. The SIGN decode-locate (walk to the
+trailing `SRTPS_POSTFIX`) is corroborated clean-room against Fast DDS `decode_rtps_message`; see
+`docs/provenance.md` (M7/P6 T4).
+
+Worked example (whole-RTPS, SIGN, our-to-our round-trip):
+
+```lisp
+(let* ((km   (dds.security:make-test-key-material))    ; the ParticipantCrypto KeyMaterial
+       (subs <the datagram's submessage stream, after the 20-octet RTPS Header>)
+       (srtps (dds.security:encode-rtps-message km :sign subs)))   ; SRTPS_PREFIX ‖ stream ‖ SRTPS_POSTFIX
+  ;; the caller keeps the RTPS Header and sends Header ‖ srtps; the peer strips the Header and:
+  (dds.security:decode-rtps-message km srtps))                      ; => subs (byte-exact), or NIL
+```
+
+**Honest interop posture (T4).** Self-consistent (our encode ↔ our decode) and byte-reproducible across
+SBCL + Clasp; corpus (byte-exact 100-octet ENCRYPT + 92-octet SIGN vectors), round-trip, negatives, and
+property-fuzz (adversarial SRTPS brackets + hostile `rsm_count` hitting the T1 cap, prod + `(safety 0)`,
+fail-closed). The shared-foundation divergences (the KDF `"0001"` counter and the footer-count /
+`crypto_content`-length endianness) are now **RESOLVED** (T-RECONCILE, see §6sexto.1) —
+Fast-DDS/Cyclone-aligned. One T4-specific item remains open for live interop (T12): Fast DDS re-aligns each
+walked submessage to 4 octets, where our verbatim write/walk does not (a non-issue for our-to-our and for
+the 4-aligned normal case). See `docs/provenance.md` (M7/P6 T4, T-RECONCILE).
+
+### 6sexto.3 Reliable ParticipantVolatileMessageSecure (PVMS) endpoint (T7, DDS-Security 1.1 §7.4.5 / §9.5.3.1)
+
+The **ParticipantVolatileMessageSecure** builtin endpoint (writer `0xff0202c3` / reader `0xff0202c4`, bits
+24/25) is the **reliable, VOLATILE** carrier for the crypto-token exchange between two authenticated
+participants. It is *reliable* (HEARTBEAT/ACKNACK repair) and *volatile* (KEEP_ALL, **no durability** — a
+late joiner does **not** replay old tokens). Its own traffic is **submessage-protected (ENCRYPT)** with a
+KeyMaterial derived **directly from the authenticated SharedSecret** — no token exchange is needed for the
+endpoint that carries the tokens (§9.5.3.1). T7 delivers this reliable, protected transport plus the
+bootstrap-key derivation; the actual crypto-token payloads + the `:authenticated → :keyed` promotion ride on
+top of it (T8).
+
+**The bootstrap key (`%pvms-derive-bootstrap-km`, `dds.disc`).** The PVMS protection KeyMaterial is Fast
+DDS's *Participant2ParticipantKxKeyMaterial* (corroborated clean-room against `AESGCMGMAC_KeyFactory.cpp
+register_matched_remote_participant`, see `docs/provenance.md` M7/P6 T7):
+
+```
+master_salt       = derive-kx-salt(shared_secret, challenge1, challenge2)   ; KxSalt, §9.5.3
+master_sender_key = derive-kx-key (shared_secret, challenge1, challenge2)   ; KxKey,  §9.5.3
+sender_key_id     = #(0 0 0 0)
+transformation_kind = AES256-GCM {0 0 0 4}
+```
+
+It REUSES the already-pinned §9.5.3 `derive-kx-key`/`derive-kx-salt` KDFs (the SAME primitive the KEYX tier
+uses to *wrap* tokens) — here their outputs become the §9.5.2 `key-material` of the volatile endpoint, which
+plugs straight into `encode/decode-datawriter-submessage`. The protection-kind is **ENCRYPT** (Fast DDS
+marks the endpoint `IS_SUBMESSAGE_ENCRYPTED`).
+
+**API (`dds.disc`).**
+
+| Symbol | Contract |
+|---|---|
+| `(%pvms-derive-bootstrap-km shared-secret challenge1 challenge2)` → `key-material` | The §9.5.3.1 SharedSecret-derived bootstrap KeyMaterial (above). Inputs 32 octets each. |
+| `(enable-volatile-secure node &key on-volatile-secure)` → `node` | Give NODE the reliable VOLATILE PVMS writer + reader (reusing the M2 reliable engine) and install the receiver hook. |
+| `(set-pvms-bootstrap-km node prefix km)` → `km` | Install the per-matched-remote bootstrap KM (keyed by the remote 12-octet GUID prefix); the auth/crypto manager calls this at `:authenticated`. |
+| `(%send-volatile-secure node dest-prefix payload-octets)` → `t` | Reliably send PAYLOAD-OCTETS (an opaque crypto-token `ParticipantGenericMessage`) to DEST-PREFIX, submessage-protected (ENCRYPT) with its bootstrap KM; ACKNACK-repairable. |
+| `(%on-volatile-secure node src-prefix submessage-octets)` → `t` | Decode the SEC_PREFIX…SEC_POSTFIX bracket with SRC-PREFIX's bootstrap KM, then deliver the recovered payload to the `on-volatile-secure` hook exactly once (fail-closed on any error). |
+| `disc-node-on-volatile-secure` | The receiver hook slot `(node src-prefix payload-octets) → t` (mirrors `on-stateless-message`). |
+
+`%handle-datagram` now routes a `SEC_PREFIX` (0x31) submessage to `%on-volatile-secure`, and a clear PVMS
+HEARTBEAT/ACKNACK to the reliable-repair handlers. **Fail-closed (NFR-SEC-POSTURE):** a missing KM, an
+undecryptable/malformed/tampered bracket, or a wrong-EntityId inner DATA is a silent drop — never a signal
+out of the receiver thread, never plaintext on a failure.
+
+**Worked example (our-to-our, reliable repair).**
+
+```lisp
+(let* ((a (dds.disc:make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+       (b (dds.disc:make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0)))
+  ;; ... SPDP-discover a<->b, then once :authenticated both sides know shared_secret/challenges:
+  (dds.disc:enable-volatile-secure a)
+  (dds.disc:enable-volatile-secure b
+    :on-volatile-secure (lambda (node src payload) (declare (ignore node src)) (handle-token payload)))
+  ;; symmetric per-pair bootstrap KM (both derive identical bytes from the same SharedSecret + challenges)
+  (dds.disc:set-pvms-bootstrap-km a pb (dds.disc::%pvms-derive-bootstrap-km ss c1 c2))
+  (dds.disc:set-pvms-bootstrap-km b pa (dds.disc::%pvms-derive-bootstrap-km ss c1 c2))
+  (dds.disc:%send-volatile-secure a pb token-octets))   ; B's hook fires once, after HEARTBEAT/ACKNACK repair if any DATA was lost
+```
+
+**Tests.** `run-volatile-secure-reliable-test` (drop every PVMS DATA while a flag is set → B stays empty;
+clear it → the HEARTBEAT/ACKNACK loop repairs the gap → B delivers EXACTLY once, bytes equal) and
+`run-volatile-secure-fail-closed-test` (B installs a WRONG bootstrap KM → B never delivers; non-vacuous).
+Both green on SBCL + Clasp.
+
+**Carry (T8) — bidirectional nonce uniqueness.** The bootstrap KM is symmetric across the pair; with the
+Slice-1 fixed (all-zeros) `session_id`, two sides encoding under the shared key from `iv-counter` 0 would
+collide AES-GCM nonces. T7 traffic is one-directional per exchange (no collision); the bidirectional token
+exchange (T8) must give the two roles disjoint nonce spaces (distinct `session_id`s or iv ranges), exactly
+as Fast DDS sets a distinct `Session.session_id` per remote crypto. See `docs/provenance.md` (M7/P6 T7).
+
+The full per-symbol API reference will be completed at the Slice 4 capstone.
+
+### 6sexto.4 Origin authentication for the builtin secure endpoints (T-ORIGINAUTH, §9.5.3.3.4.3)
+
+The origin-auth CODEC (§6sexto.1) is wired into the builtin **secure-SEDP** endpoints, so a governance
+`discovery_protection_kind = SIGN_WITH_ORIGIN_AUTHENTICATION` / `ENCRYPT_WITH_ORIGIN_AUTHENTICATION` now adds a
+per-receiver MAC to each protected `DiscoveredWriter/ReaderData` (T9 previously fail-closed-REFUSED this tier;
+that refusal is removed).
+
+**Key model (implemented exactly; corroborated against Fast DDS `serialize_SecureDataTag`).** The
+receiver-specific MAC uses the **RECEIVER's** key. For the secure-SEDP tier the receiving endpoint is the
+matched secure-SEDP **READER** (publications writer `0xff0003c2` ↔ reader `0xff0003c7`; subscriptions writer
+`0xff0004c2` ↔ reader `0xff0004c7`). So only the secure-SEDP **readers** are minted with a receiver-specific
+key; sender A GMACs the common_mac under the matched-remote reader's `master_receiver_specific_key` (received in
+that reader's crypto token) tagged with its `receiver_specific_key_id`, and receiver B verifies the entry tagged
+with its OWN reader's id under its OWN key. The writer encodes under the matched reader's key, never its own.
+
+**Token CDR (the 120-byte form).** `%serialize-km-cdr` / `%parse-km-cdr` (`dds.security`, `auth/keyexchange.lisp`)
+now carry the populated receiver-specific fields: an all-zero `receiver_specific_key_id` ⇒ the 88-byte
+no-origin-auth CDR (byte-identical to before); a non-zero id ⇒ the 120-byte form (`+ pad(3) + len(0x20) +
+master_receiver_specific_key(32)`), keyed on the same `has_specific_key` discriminator Fast DDS uses
+(`KeyMaterialCDRSerialize` L432-454; see `docs/provenance.md` M7/P6 T-ORIGINAUTH). So the matched-remote
+EntityCrypto the crypto token installs retains the remote reader's receiver key.
+
+**Wiring (cross-layer closures on the `disc-node`, the T9 pattern).** Driven from governance by
+`%install-access-control` (`protection-kind-base` yields the base kind + the origin-auth flag onto
+`disc-node-secure-sedp-origin-auth`). The crypto-manager (`src/dds-dcps/crypto-manager.lisp`) mints the
+secure-SEDP readers with `:origin-auth t` and installs two resolvers:
+
+- **`disc-node-secure-sedp-encode-receivers (writer-entity-id remote-prefix)`** → the matched-remote reader's
+  `((receiver_specific_key_id . master_receiver_specific_key))` for `encode-datawriter-submessage :receivers`;
+  `NIL` (⇒ plain SIGN/ENCRYPT) when origin-auth is off or the remote reader is not yet keyed.
+- **`disc-node-secure-sedp-decode-receiver-km (transformation_key_id)`** → the LOCAL receiving reader's
+  `(receiver_specific_key_id . master_receiver_specific_key)` for `decode-datawriter-submessage`'s
+  `my-receiver-key-id`/`my-receiver-key`; `NIL` ⇒ the common_mac alone governs. The channel (pub vs sub) is
+  resolved by mapping the wire `transformation_key_id` → the remote writer's entity-id (the crypto-manager
+  `remote-key-id-entity` index) → the corresponding local reader.
+
+**Tests.** `run-secure-discovery-origin-auth-test` (full e2e: two participants under
+`ENCRYPT_WITH_ORIGIN_AUTHENTICATION` reach `:keyed`, exchange the 120-byte receiver KeyMaterial, and B matches A's
+protected writer with a verified per-receiver MAC — `'Square'` never in cleartext);
+`run-secure-sedp-origin-auth-roundtrip-test` (disc-level wiring: correct receiver key → match) and the
+**non-vacuous** `run-secure-sedp-origin-auth-tamper-test` (the WRONG receiver key, same key_id → B NEVER matches
+**even though the common_mac is valid** — the receiver-MAC gates beyond the common_mac, fail-closed);
+`run-auth-keymaterial-origin-auth-cdr` (the 120-byte CDR round-trip + the byte-identical 88-byte carry). All
+green SBCL + Clasp. SIGN/ENCRYPT (non-origin-auth) + security-OFF remain byte-identical.
+
+### 6sexto.5 `rtps_protection` engagement on the live data path (T10, §8.5.1.10-.12)
+
+The whole-RTPS-message codec of §6sexto.2 is now **engaged** on the live send / receive path for the **user
+data plane** (the hot path). Once two participants are `:keyed`, every user-data datagram A sends to B (DATA,
+HEARTBEAT, ACKNACK, GAP, DATA_FRAG/NACK_FRAG) is wrapped `RTPS-Header ‖ SRTPS_PREFIX ‖ SEC_BODY ‖
+SRTPS_POSTFIX`, keyed by A's per-pair **ParticipantCrypto** (the common_mac under A's sender key; under an
+`*_WITH_ORIGIN_AUTHENTICATION` governance kind, an additional per-receiver MAC under B's ParticipantCrypto
+receiver key, §9.5.3.3.4.3). B resolves A's ParticipantCrypto by the datagram's source GUID-prefix, decrypts,
+and re-dispatches the recovered submessage stream. **Bootstrap SPDP** (multicast, via `%send-paramlist`,
+never through the wrap chokepoint) and the **PSM auth handshake** (sent pre-keying) are EXEMPT.
+
+- **Send** (`dataplane.lisp`): `%send-raw-buf` takes an optional `dest-prefix`; when non-NIL,
+  `%maybe-wrap-srtps` calls the node's `rtps-protection-encode` resolver — installed by the crypto-manager —
+  which returns the local ParticipantCrypto + kind + receivers iff governance `rtps_protection_kind ≠ NONE`
+  **and** the destination is `:keyed` (its ParticipantCrypto is held). The wrap is done **in place** in the
+  thread's own scratch buffer (the RTPS Header `[0,20)` kept verbatim; `[20,…)` overwritten with the SRTPS
+  bracket) — no fresh per-datagram message-sized array. A required-but-failed wrap **drops** (fail-closed).
+  `dest-prefix` NIL (every builtin/discovery/bootstrap send) ⇒ the plain path, byte-identical.
+- **Receive** (`disc.lisp` `%handle-datagram`): when the first submessage is `SRTPS_PREFIX` (0x33) and the
+  crypto-manager installed the `rtps-protection-decode` resolver, resolve the remote ParticipantCrypto by the
+  source prefix, `decode-rtps-message`, overwrite `[20,…)` in place with the recovered stream, and re-dispatch
+  (recurse — the recovered first submessage is never SRTPS, so no further recursion). An unknown/not-keyed
+  source, an undecryptable / forged / origin-auth-failed bracket → a silent **drop** (never dispatch
+  unverified submessages; NFR-SEC-POSTURE).
+- **Receive-side ENFORCEMENT** (`disc.lisp` `%handle-datagram`, `%rtps-protection-required-from`): the receive
+  complement of the wrap. When the datagram is **NOT** SRTPS-wrapped **and** the node's governance requires
+  `rtps_protection` (`disc-node-rtps-protection-kind ≠ NONE`) **and** the source participant is `:keyed` (its
+  ParticipantCrypto resolves through the decode resolver), **every USER-plane submessage** is a **forgeable
+  injection** (anyone can spoof a keyed peer's source GUID-prefix on a plain datagram, no key) and is **dropped
+  fail-closed** before it reaches any user reader / writer or its reliable state. This covers both the user data
+  (**DATA / DATA_FRAG**, discriminated by `%user-writer-entityid-p`: kind `0x02`/`0x03` vs builtin `0xc?`) **and
+  the user reliability-control submessages** — the **HEARTBEAT / ACKNACK / GAP / HEARTBEAT_FRAG / NACK_FRAG**
+  user fall-through branches, each gated on `(not enforce-rtps)`. Without this, a forged plain **GAP** would mark
+  user SNs `:gap` (silent sample suppression), a forged plain **ACKNACK** would advance the acked-base and purge
+  unacked HistoryCache changes the real reader never got (permanent data loss), and a forged plain **HEARTBEAT**
+  would corrupt the reader-proxy / reflect a NACK storm. **Builtin metatraffic is exempt** (it is intentionally
+  plain in this slice — the T12 carry — so SPDP / SEDP / PSM / PVMS / participant-message / TypeLookup are never
+  dropped): builtin DATA is discriminated by writerId, and **builtin reliability** (SEDP / TypeLookup HEARTBEAT,
+  TypeLookup / PVMS ACKNACK / HEARTBEAT) is routed to its builtin handlers in the clauses **before** the gated
+  user fall-through, so it still processes (no false-REJECT). No false-REJECT of legitimate user traffic either:
+  user traffic flows only after `:keyed`, and a legitimate keyed-rtps peer always SRTPS-wraps it, so a plain
+  user-plane submessage from such a peer cannot legitimately occur. The post-SRTPS-decode re-dispatch suppresses
+  the enforcement (the inner plaintext is already authenticated). `NONE` governance / not-keyed source ⇒
+  enforcement off, byte-identical delivery.
+- **Governance → node** (`access-control.lisp`): `%install-access-control` reads `governance-rtps-protection`
+  and `protection-kind-base` and sets `disc-node-rtps-protection-kind` (`:sign`|`:encrypt`) +
+  `-origin-auth`; the crypto-manager mints the local ParticipantCrypto **with** a receiver-specific key under
+  an origin-auth kind. `NONE` leaves both default ⇒ the data path is plain, byte-identical.
+
+Scope: T10 wraps the **user data plane** (the hot path). The builtin **metatraffic** (secure SEDP, PVMS,
+plain SEDP, liveliness, TypeLookup) flows plain — the secure-SEDP tier already carries its own §8.5.1.7-.9
+submessage protection — so the existing secure-discovery e2es stay green (and now exercise the new
+wrap/unwrap: their protected Square sample crosses SRTPS-wrapped and is decoded byte-exact at B). Wrapping
+the builtin metatraffic too is a documented follow-on (ADR 0026 §10 / verification deferral).
+
+**Hot path (NFR-MEM).** The send/receive **buffer is reused in place** (no per-datagram message-sized array).
+The residual per-datagram heap is the codec's `→octets` return + the AEAD intermediates (the inherited T4
+carry) plus one plain-region `subseq` — measured in `bench/report/2026-06-28-wp-secure-discovery-t10.md`
+(ENCRYPT, 256-octet stream: T10-send ≈ T4-encode + ~270 bytes/datagram; T10-recv ≈ T4-decode + ~340
+bytes/datagram; OpenSSL-FFI dominates the ~5 µs/op). `make mem` (the gated CDR serialize/deserialize hot
+path) stays **0 bytes/sample** — T10 does not touch it. A fully zero-alloc SRTPS path needs an into-buffer
+AEAD codec (a `dds.dare`/`dds.security` rewrite) and is the documented follow-on.
+
+**Tests.** `run-rtps-protection-test` (disc-level, deterministic): the SPDP/PSM exemption (NIL dest-prefix
+stays plain), engagement (a `:keyed`-dest send is SRTPS on the wire + the payload never in cleartext),
+decode+dispatch byte-exact, the **non-vacuous** wrong-ParticipantCrypto drop, and origin-auth (correct
+receiver key delivers; the WRONG receiver key, same id, drops though the common_mac is valid). The full
+participant e2e is `run-secure-discovery-protected-test` / `-origin-auth-test` (their `:sdp-rtps-wrapped`
+assertion proves the Square sample is SRTPS on the wire and B decoded it). `run-rtps-protection-enforce-test`
+covers the **receive-side enforcement** for user **DATA** (a forged plain user-DATA spoofing a keyed peer's
+prefix is dropped; **non-vacuous**: the same plain user-DATA is delivered when the source is not keyed and when
+governance `rtps_protection` is NONE; and plain builtin SPDP metatraffic from the keyed peer is still processed
+— no false-REJECT). `run-rtps-protection-enforce-reliability-test` extends that to the user **reliability-control**
+submessages: for each of HEARTBEAT / ACKNACK / GAP / HEARTBEAT_FRAG / NACK_FRAG a forged plain submessage
+spoofing the keyed peer's prefix is dropped (its user handler never fires → no reliable-state mutation), with
+the same two **non-vacuous** controls (delivered from a not-keyed source, and under `rtps_protection` NONE), plus
+a **no-false-REJECT** check that a plain builtin SEDP HEARTBEAT from the keyed peer is still processed (routed to
+`%on-builtin-heartbeat`, advancing the ack counter, never reaching the user gate). The participant-tier
+origin-auth resolvers (`cm-rtps-encode-receivers` /
+`cm-rtps-decode-receiver`) are driven directly in `run-security-crypto-manager-test` (a wrong participant
+receiver key fails the receiver-MAC though the common_mac is valid). All green SBCL + Clasp.
+
+### 6sexto.6 Secure participant-message (liveliness) + secure SPDP re-announce (T11, §7.4.5 / §8.4.1.6)
+
+The last two secure builtin endpoint tiers, built the SAME way as secure SEDP (§6sexto.9): a plaintext DATA
+submessage wrapped in the T2 submessage-protection codec under a per-endpoint **EntityCrypto**, dispatched
+inbound by the wire `transformation_key_id`. Both **reuse the generic secure-builtin resolvers** — the
+`disc-node-secure-sedp-{encode,decode}-km` / `-{encode-receivers,decode-receiver-km}` closures resolve **any**
+registered secure builtin entity by EntityId / key_id, not just SEDP — so the crypto-manager change is just
+registering four more EntityCryptos (`%cm-local-token-entities` now exchanges the secure participant-message
+writer+reader `0xff0200c2/c7` and the secure SPDP writer+reader `0xff0101c2/c7` alongside the secure SEDP set).
+
+- **Secure participant-message** (Writer Liveliness Protocol, bits 20/21). When governance
+  `liveliness_protection_kind ≠ NONE` (`%install-access-control` → `disc-node-secure-pm-protection-kind` +
+  `-origin-auth`), `assert-participant-liveliness` routes **every** WLP assertion through
+  `%announce-secure-liveliness`: the same `ParticipantMessageData` payload as plain WLP, over the secure
+  `BuiltinParticipantMessageSecureWriter` (`0xff0200c2`), submessage-protected per the kind, to the
+  `:authenticated` peers **only** — and plain WLP is **fully suppressed** (a confidential liveliness assertion
+  never rides plain, mirroring the secure-SEDP off-plain partition). The reader path is the **existing**
+  `%on-participant-message`, keyed by the verified datagram source prefix (anti-spoof). A tampered assertion
+  fails the MAC and is dropped (never asserts liveliness).
+- **Secure SPDP re-announce** (bits 26/27, `DISC_BUILTIN_ENDPOINT_PARTICIPANT_SECURE_*`). The plain SPDP keeps
+  bootstrapping (it carries the Identity/Permissions tokens a peer authenticates with); `announce-participant`
+  **additionally** calls `%announce-secure-spdp`, which re-announces the same `ParticipantBuiltinTopicData` over
+  the secure `SPDPbuiltinParticipantSecureWriter` (`0xff0101c2`) submessage-protected. It rides the **discovery**
+  protection tier — gated on `disc-node-discovery-protected-topic-p` (= discovery protection active) and protected
+  per `disc-node-secure-sedp-protection-kind` (the same governance `discovery_protection_kind` as secure SEDP) —
+  so no separate SPDP protection slot is needed. The reader path is `%record-participant`.
+- **SEC_PREFIX disambiguation extended.** The same submessage id (0x31) now carries PVMS (T7), secure SEDP (T9),
+  AND secure participant-message + secure SPDP (T11). `%on-secure-submessage` resolves the EntityCrypto by
+  `transformation_key_id` (PVMS's all-zero bootstrap key_id never lands in the index → it still falls through to
+  the PVMS handler) and hands the bracket to `%on-secure-builtin`, which **decodes once then routes by the
+  recovered inner writerId** to SEDP-match / liveliness / record-participant — each verifying its own writerId,
+  any other → drop fail-closed.
+- **Origin-auth honored for both** (`*_WITH_ORIGIN_AUTHENTICATION`, §9.5.3.3.4.3). The writer→reader pairing
+  (`%secure-sedp-reader-for-writer`) and the per-entity receiver-key minting (`%cm-entity-origin-auth`) were
+  extended to the PM + SPDP pairs, so the existing receiver-specific-MAC encode/decode resolvers cover all three
+  tiers; the PM reader rides the **liveliness** tier flag, the SEDP + SPDP readers the **discovery** tier flag.
+- **SPDP advertisement.** `%node-spdp-data` ORs bits 20/21 when `%secure-pm-active-p`, and bits 26/27 (alongside
+  the secure SEDP bits 16-19) when discovery protection is active. **Security-OFF is byte-identical**: no
+  governance ⇒ no secure bits, plain WLP + plain SPDP exactly as before.
+
+**Tests** (disc-level, deterministic, manually-installed EntityCryptos): `run-secure-participant-message-test`
+(SIGN WLP over `0xff0200`, B detects liveliness, a SEC_PREFIX bracket is emitted),
+`run-secure-participant-message-tamper-test` (a clean assertion records liveliness — non-vacuous — a
+one-octet-flipped copy fails the MAC and is dropped), `run-secure-pm-origin-auth-roundtrip-test` /
+`-tamper-test` (correct receiver key detects; the WRONG key, same id, never detects though the common_mac is
+valid), and `run-secure-spdp-reannounce-test` (a plain node advertises no bits 26/27 but an armed node does;
+plain SPDP still bootstraps; a SEC_PREFIX re-announce is emitted; a FRESH peer that saw no plain SPDP registers
+the participant from the protected re-announce alone). All green SBCL + Clasp.
+
+### 6sexto.7 Governance protection-kind model — the knobs (T5, DDS-Security 1.1 §9.4.1.2)
+
+The Slice-3 `governance` struct (§6quinque.3) gains the protection-kind policy that drives every tier above.
+Two keyword enums (`dds.security`, `crypto/constants.lisp`), pinned in T0 from `dds_governance.xsd`:
+
+| Constant | Values | Used by |
+|---|---|---|
+| `+protection-kinds+` | `(:none :sign :encrypt :sign-with-origin-auth :encrypt-with-origin-auth)` — the 5-value `ProtectionKind` | the domain-rule kinds |
+| `+basic-protection-kinds+` | `(:none :sign :encrypt)` — the 3-value `BasicProtectionKind` | the per-topic kinds |
+| `+protection-kind-xsd-strings+` | keyword ↔ XSD token alist (`:encrypt`↔`ENCRYPT`, `:sign-with-origin-auth`↔`SIGN_WITH_ORIGIN_AUTHENTICATION`, …) | the parser (reverse lookup) |
+
+The struct fields + accessors:
+
+| Field (governance) | Tier | Accessor |
+|---|---|---|
+| `discovery_protection_kind` (domain rule, `ProtectionKind`) | secure SEDP + secure SPDP | `governance-discovery-protection` |
+| `liveliness_protection_kind` (domain rule, `ProtectionKind`) | secure participant-message (WLP) | `governance-liveliness-protection` |
+| `rtps_protection_kind` (domain rule, `ProtectionKind`) | whole-RTPS user data plane | `governance-rtps-protection` |
+| `enable_discovery_protection` / `enable_liveliness_protection` (topic rule, bool) | per-topic gate | `topic-discovery-protected-p` |
+| `metadata_protection_kind` / `data_protection_kind` (topic rule, `BasicProtectionKind`) | per-topic submessage / payload | `topic-metadata-protection` |
+
+`protection-kind-base (kind) → (values base origin-auth-p)` maps a `ProtectionKind` to its base
+(`:sign` | `:encrypt`) + an origin-auth flag, so the announce/encode paths honour SIGN vs ENCRYPT vs
+origin-auth **from governance** (never hard-coded — the T9 fix).
+
+**Fail-closed parse (the T5 review-caught Critical).** The protection-kind elements are **REQUIRED** by the
+XSD and Fast DDS REJECTS them absent, so `%ac-node-protection-kind` returns NIL on a missing element →
+`parse-governance` aborts to NIL (it does **not** substitute a default).  A valid-but-wrong-tier token (e.g. a
+5-value `SIGN_WITH_ORIGIN_AUTHENTICATION` in a 3-value per-topic field) also aborts to NIL.  The struct
+initforms are **constructor defaults, NOT spec defaults** (so documented).  Worked governance excerpt:
+
+```xml
+<domain_rule>
+  <domains><id>0</id></domains>
+  <discovery_protection_kind>ENCRYPT</discovery_protection_kind>
+  <liveliness_protection_kind>SIGN</liveliness_protection_kind>
+  <rtps_protection_kind>ENCRYPT</rtps_protection_kind>
+  <topic_access_rules><topic_rule>
+    <topic_expression>Square</topic_expression>
+    <enable_discovery_protection>true</enable_discovery_protection>
+    <metadata_protection_kind>ENCRYPT</metadata_protection_kind>
+    <data_protection_kind>ENCRYPT</data_protection_kind>
+  </topic_rule></topic_access_rules>
+</domain_rule>
+```
+
+(`governance-none.{xml,p7s}` in `interop/security-secure-discovery/pki/` is the NONE/NONE/NONE baseline — the
+security-OFF byte-identical guard.)
+
+### 6sexto.8 The crypto-manager + crypto-token exchange + `:keyed` promotion (T6, T8)
+
+`src/dds-dcps/crypto-manager.lisp` is the Cryptographic-plugin analogue of the Slice-2 `auth-manager`.  It
+owns four registries behind one manager lock and an O(1) `transformation_key_id` → KeyMaterial index:
+
+- **ParticipantCrypto** — the local participant's master KeyMaterial (for `rtps_protection`) + per matched
+  remote the remote's ParticipantCrypto KeyMaterial (keyed by 12-octet GUID prefix).
+- **EntityCrypto** — one KeyMaterial per local secure builtin endpoint + per matched-remote endpoint.
+
+Four resolvers (every miss → NIL, fail-closed):
+
+| Resolver | Direction | Used by |
+|---|---|---|
+| `cm-encode-participant-km` | LOCAL, for an outgoing datagram | rtps_protection encode (T10) |
+| `cm-decode-participant-km` | REMOTE, by source GUID-prefix | rtps_protection decode (T10) |
+| `cm-encode-entity-km` | LOCAL, by entity-id | secure SEDP / PM / SPDP encode (T9, T11) |
+| `cm-decode-entity-km-by-key-id` | REMOTE, by the wire `transformation_key_id` | secure SEDP / PM / SPDP decode (T9, T11) |
+
+`generate-key-material` mints a fresh §9.5.2 KeyMaterial (random `master_salt` + `master_sender_key` + a
+NON-ZERO `sender_key_id`); with `:origin-auth t` it also mints a random NON-ZERO `receiver_specific_key_id`
+(resample-if-zero — zero is the spec "origin-auth disabled" sentinel) + `master_receiver_specific_key`
+(§6sexto.4).  `generate-writer-key-material` delegates to it (DRY).
+
+**The `:authenticated → :keyed` promotion.**  At `:authenticated`, `cm-on-authenticated` registers the local
+ParticipantCrypto + builtin EntityCryptos and sends the Participant / DataWriter / DataReader crypto tokens
+over **reliable PVMS** (§6sexto.3) — replacing Slice-2c's interim best-effort PSM path.  KEYX's per-writer
+KeyMaterial was migrated PSM → PVMS (under `dds.sec.datawriter_crypto_tokens`); PSM is now handshake-only.
+`cm-on-crypto-token` installs each remote token; `%cm-try-promote` advances `auth-remote` to `:keyed` **only**
+when the ParticipantCrypto + the secure-SEDP pub-W + the secure-SEDP sub-R are all installed.  Adding the four
+PM/SPDP tokens to the local token set does **not** widen that precondition, so keying never hangs against a
+liveliness-unprotected peer.  The crypto-token DataHolders ride as plaintext inside the PVMS-protected
+submessages; a malformed token drops, no promote (fail-closed).
+
+**Nonce disjointness (the T8 crux).**  The PVMS bootstrap KM is symmetric and the codec's non-PVMS tiers use a
+fixed `session_id`, so a bidirectional exchange would reuse AES-GCM nonces.  `%pvms-role-session-id` gives each
+role a distinct non-zero `session_id` (winner = lexicographically-greater GUID prefix → `base-1`, loser →
+`base`; `base = #x80000000 | fold(winner)`) → distinct keys **and** disjoint nonce spaces both directions; an
+on-wire guard parses the actual encoded `session_id` so a revert fails loudly.  `run-secure-discovery-keyed-test`
+asserts the two roles' `session_id`s DIFFER and are non-zero.
+
+### 6sexto.9 Secure SEDP wiring + the worked secure-discovery example (T9)
+
+This is the headline of the slice: protected topics are discovered **only** over the secure SEDP endpoints
+(publications writer `0xff0003c2` / reader `0xff0003c7`, subscriptions `0xff0004c2` / `0xff0004c7`), never over
+plain SEDP — otherwise an outsider reads the topology.
+
+**Cross-layer wiring (the closure pattern; `dds-disc` stays crypto-free).**  The crypto-manager + access-control
+install closures onto the `disc-node`: encode = the LOCAL EntityCrypto by entity-id; decode = the REMOTE
+EntityCrypto by the wire `transformation_key_id`; a governance-gated protected-topic predicate
+(`topic-discovery-protected-p`).  `dds-disc` calls the installed closures and never imports `dds-dcps`.
+
+- **`announce-endpoints` partitions** by `topic-discovery-protected-p`: a protected topic's `DiscoveredWriter/
+  ReaderData` flows ONLY over secure SEDP, submessage-protected (per `discovery_protection_kind` via
+  `protection-kind-base`), to the `:authenticated` peers — and is left OFF plain SEDP.  The SPDP
+  `BuiltinEndpointSet` carries bits 16-19 only when discovery is protected.  Matching is gated on `:keyed`;
+  every decode is fail-closed.
+- **SIGN vs ENCRYPT honoured from governance.**  Under `SIGN` the topic is visible inside the SEC_BODY bracket
+  (authenticity only); under `ENCRYPT` it is ciphertext.  The decode side is kind-agnostic (it reads the wire
+  `transformation_kind`).
+- **SEC_PREFIX disambiguation** (§6sexto.6): the single 0x31 id is resolved by `transformation_key_id` — the
+  PVMS bootstrap key's all-zero `sender_key_id` falls through to PVMS; a non-zero id in the index routes to the
+  secure-builtin handler, which decodes once then routes by the recovered inner `writerId`.
+
+A worked end-to-end secure-discovery example (our-to-our, ENCRYPT discovery + RTPS protection):
+
+```lisp
+;;; Each participant: a Slice-2 identity + a signed Governance whose domain rule sets
+;;; discovery_protection_kind=ENCRYPT, rtps_protection_kind=ENCRYPT, and enable_discovery_protection
+;;; on the protected topic (see §6sexto.7).  validate-local-permissions returns the access-handle.
+(let ((p-a (dds.dcps:create-participant :domain 0 :identity id-a))
+      (p-b (dds.dcps:create-participant :domain 0 :identity id-b)))
+  (dds.dcps::%install-access-control p-a ah-a)   ; governance -> disc-node protection-kind slots
+  (dds.dcps::%install-access-control p-b ah-b)   ; + the crypto-manager mints/installs the closures
+  (dds.disc:add-peer (dp-node p-a) "127.0.0.1")
+  (dds.disc:add-peer (dp-node p-b) "127.0.0.1")
+
+  ;; 1. plain SPDP bootstraps -> §8.7 PKI-DH over plain PSM -> :authenticated
+  ;; 2. crypto tokens exchanged over RELIABLE PVMS -> both reach auth-remote :keyed (§6sexto.8)
+  ;; 3. the protected topic is announced ONLY over secure SEDP (0xff0003/0xff0004), ENCRYPT-wrapped
+  ;; 4. endpoints match (gated on :keyed); user data flows whole-RTPS-wrapped (SRTPS, §6sexto.5)
+  (loop repeat 300 until (both-keyed-p p-a p-b) do (sleep 0.02))
+
+  ;; 5. Publish "Square" from A; B receives the plaintext; the topic name is NEVER in cleartext
+  ;;    on the wire (secure SEDP is ENCRYPT) and the user datagram is SRTPS-wrapped.
+  (dds.disc:publish-sample (dp-node p-a) #(#x53 #x71 #x75 #x61 #x72 #x65)) ; "Square"
+  ;; ... poll for receipt on p-b, assert received = plaintext ...
+  (dds.dcps:delete-participant p-a)
+  (dds.dcps:delete-participant p-b))
+```
+
+`run-secure-discovery-protected-test` is the full participant e2e (ENCRYPT): two participants reach `:keyed`,
+the protected topic matches over secure SEDP, the Square sample crosses SRTPS-wrapped and is decoded byte-exact
+at B, the topic name is asserted **absent** from the cleartext, and a plain peer is refused **non-vacuously**.
+`run-secure-discovery-origin-auth-test` is the `ENCRYPT_WITH_ORIGIN_AUTHENTICATION` variant (§6sexto.4).
+
+**Honest cross-vendor posture.**  The above is our-to-our complete.  Cross-vendor against a live Fast DDS peer,
+only the SECURITY=ON build + bidirectional SPDP discovery + four conformant fixes are achieved; the §8.7
+handshake is REJECTED at the propagate-byte divergence, so the keyed path (PVMS exchange, secure SEDP,
+protected data) was **not** exercised cross-vendor.  Live RTI Connext is static only.  See the "Cross-vendor
+secure-discovery interop status" section below, ADR 0036 (the numbered Slice-5 carries), and
+`interop/security-secure-discovery/README.md`.
+
+---
+
 ## 7. Roadmap (M7/P6)
 
 | Slice | Description | Status |
@@ -1014,5 +1617,28 @@ format (bare PEM-PKCS7 vs MIME-wrapped), and subject-name normalization are self
 | **2b-ii** | Discovery integration: on-participant-discovered hook + auth manager (`%install-auth-manager`) + per-participant `dp-auth-state` + strict endpoint-match auth-gate + `select-suite-for-identities` (ADR 0034 at capstone) | **LANDED** |
 | **2c** | Crypto key-exchange: §9.5.3 KxKey + §9.5.2 per-writer KeyMaterial exchanged over PSM, installed per remote (ADR 0034 at capstone) | **LANDED** |
 | **3** | AccessControl plugin (§8.4 / §9.4): CMS-verify signed Governance + Permissions, topic-level allow/deny at all three §8.4 check points, our-to-our (ADR 0035) | **LANDED** |
-| 4 | Secure discovery (§7.4.4): SPDP/SEDP participant/endpoint authentication | pending |
-| 5 | Connext-Security live interop: live cross-vendor PKI-DH auth + AccessControl interop (the P6 exit gate) | pending |
+| **4** | Secure discovery (§7.3.7 / §8.5): submessage + whole-RTPS protection, origin-auth, reliable PVMS, governance protection-kinds, secure builtin endpoints — **our-to-our complete**; live Fast DDS = bidirectional SPDP discovery + 4 conformant fixes (auth blocked at the propagate-byte divergence) (ADR 0036) | **LANDED** |
+| 5 | Connext-Security live interop + full cross-vendor `auth → keyed → data` (the slice-wide propagate-byte fix + the downstream divergences + live Connext) — the P6 exit gate | pending |
+
+## Cross-vendor secure-discovery interop status (Slice 4 T12, live Fast DDS-Security)
+
+A SECURITY=ON Fast DDS v3.6.1 peer was built and run live against our stack (`interop/security-secure-discovery/README.md`).
+**Achieved cross-vendor:** the SECURITY=ON build, bidirectional SPDP discovery, and Fast DDS full init against
+this repo's reused PKI. Four wire/config divergences were fixed conformantly (our-to-our green, both impls):
+the PSM SerializedPayload encapsulation header (RTPS 2.5 §10.2), the governance `<domain_access_rules>` root
+(dropped the non-conformant `<policies>` wrapper), serialization-insensitive subject-DN matching, and the Fast
+DDS multipart/signed S/MIME container.
+
+New API from this work:
+- **`dds.security:permissions-grant-for (subject grants)`** — the single subject-binding site for local + remote
+  permissions, matching by `%dn-equal` (OpenSSL-oneline vs RFC2253 serialization-insensitive; DDS-Security
+  §9.4.1.3), so cross-vendor DN forms interoperate without false-REJECT.
+- **`dds.dcps:create-participant :port`** — bind+advertise a fixed metatraffic unicast port so a foreign peer
+  can `initialPeers` us over loopback (the macOS multi-NIC cross-vendor reachability pattern).
+
+**Primary residual (handshake blocker, Slice 5 / dedicated WP):** our Token `Property`/`BinaryProperty` codec
+serializes a 4-octet `propagate` field per property that Fast DDS does NOT put on the wire (`propagate` is a
+local include-filter) — misaligning every cross-vendor token, so the §8.7 auth handshake is REJECTED at the
+remote IdentityToken. The conformant fix (drop the propagate field + regenerate the token byte-exact corpus) is
+slice-wide. The downstream candidates (session_id base, GMAC AAD span, SIGN 4-alignment, reliable-pull,
+metatraffic rtps-wrapping) sit behind the handshake and remain Slice-5 carries.

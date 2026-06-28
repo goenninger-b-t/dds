@@ -1833,3 +1833,543 @@ AccessControl plugin: Governance + Permissions document formats + CMS signing + 
 - Fixtures `interop/security-access-control/pki/governance.xml` + `permissions.xml` (unsigned XML,
   committed from the T0 gen-test-permissions.sh run) used as parse KAT and fuzz base.
 - **No RTI Connext, Fast DDS, Cyclone, or OpenDDS source read.** CLEAN-ROOM.
+
+## M7/P6 — WP-DDS-SECURITY-SECURE-DISCOVERY T0: secure-discovery constants spike (2026-06-27)
+
+Pinned the §7.3.7/§7.4.5/§9.5 secure-discovery wire constants (secure builtin EntityIds, secure RTPS
+submessage kinds, the receiver-specific-key KDF label, the governance ProtectionKind enum + XSD encoding),
+each dual-corroborated. Spike: `docs/superpowers/spikes/2026-06-27-dds-security-secure-discovery.md`.
+
+- **OMG DDS-Security 1.1 / DDSI-RTPS 2.5 §-clauses** are the primary source (§7.3.7 submessage kinds;
+  §7.4.5 secure builtin EntityIds; §9.5.3.3.4.2/.3 KDF labels; §9.4.1.2 / Annex B `dds_governance.xsd`
+  ProtectionKind; §9.5.2.2 / §7.4.4 token `message_class_id`s). NOTE: the DDS-Security 1.1 PDF is **not**
+  in `docs/specs/` (only RTPS/DCPS/XTypes are) — clause numbers are carried from the design + brief + the
+  prior in-repo security spikes; values are corroborated by the two independent reads below.
+- **Fast DDS (eProsima, Apache-2.0) — read for understanding only, NO code copied** (clean-room READ is
+  authorized for this slice). Files consulted at `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`:
+  - `include/fastdds/rtps/common/EntityId_t.hpp` lines 55-64 (`#if HAVE_SECURITY`) — corroborated the 8
+    secure builtin EntityIds (`0xff0003c2/c7`, `0xff0004c2/c7`, `0xff0200c2/c7`, `0xff0101c2/c7`).
+  - `src/cpp/rtps/security/cryptography/CryptoTypes.h` lines 27-41 — corroborated the secure submessage
+    kinds (`SEC_BODY 0x30`, `SEC_PREFIX 0x31`, `SEC_POSTFIX 0x32`, `SRTPS_PREFIX 0x33`, `SRTPS_POSTFIX 0x34`)
+    and the three `GMCLASSID_SECURITY_*_CRYPTO_TOKENS` strings (already pinned in `keyexchange.lisp`).
+  - `src/cpp/security/cryptography/AESGCMGMAC_Transform.cpp` lines 1480-1481 — corroborated the KDF
+    id_strings `"SessionKey"` (reused `+session-key-id-string+`) and `"SessionReceiverKey"` (new
+    `+kdf-label-session-receiver-key+`).
+  - `src/cpp/security/accesscontrol/GovernanceParser.cpp` lines 35-52 — corroborated the Governance XML
+    element names and the 5 ProtectionKind XSD tokens (`NONE`, `SIGN`, `ENCRYPT`,
+    `SIGN_WITH_ORIGIN_AUTHENTICATION`, `ENCRYPT_WITH_ORIGIN_AUTHENTICATION`).
+- **Wireshark/tshark 4.6.6 RTPS dissector** (installed; vendor-neutral, OMG-derived) is the Connext-side
+  oracle for these constants; live secure-capture confirmation is folded into T12. **No RTI Connext
+  source/headers read** — confirmed the RTI Security Plugins are absent
+  (`/Applications/rti_connext_dds-7.3.1/lib/arm64Darwin20clang12.0/` has no `libnddssecurity*`).
+- **Fixtures** `interop/security-secure-discovery/pki/` — 3 signed governance variants (secure /
+  origin-auth / none) + signed permissions, signed by the **reused** Slice-3 Permissions CA and
+  referencing the Slice-2 Identity CA (no new CA created). `openssl smime`/`cms -verify` confirmed.
+  Throwaway test keys, committed intentionally; no external CA or production PKI consulted.
+
+## M7/P6 — WP-DDS-SECURITY-SECURE-DISCOVERY T2: submessage protection AAD decision (2026-06-27)
+
+§8.5.1.7-.9 submessage protection (SEC_PREFIX/SEC_BODY/SEC_POSTFIX, SIGN+ENCRYPT — `src/dds-security/
+crypto/submessage.lisp`). The single design decision needing an external oracle was the **AEAD AAD
+composition**, resolved by the controller per the operating contract §4 (the wire is the oracle; match
+the readable conformant impl we must interop with at T12) and independently corroborated here.
+
+- **OMG DDS-Security 1.1 §8.5.1.7-.9 / §9.5.3.3** — primary authority for the 3-submessage bracket
+  and the CryptoHeader/CryptoContent/CryptoFooter elements; §9.5.3.3.1 Table for the CryptoTransformKind
+  octet[4] values. Clause numbers carried from the design + the T0 spike (the DDS-Security 1.1 PDF is
+  not in `docs/specs/`); the two values used (AES256_GCM, AES256_GMAC) are corroborated below.
+- **eProsima Fast DDS (Apache-2.0) — read for understanding only, NO code copied** (clean-room READ is
+  authorized for this slice). File `src/cpp/security/cryptography/AESGCMGMAC_Transform.cpp` at
+  `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`:
+  - `serialize_SecureDataBody` (read at lines ~1531-1705): the **ENCRYPT** branch (the `do_encryption`
+    arm, ~1607-1686) calls `EVP_EncryptUpdate(e_ctx, output_buffer_raw, …, plain_buffer, …)` to encrypt
+    the plaintext with **NO prior `EVP_EncryptUpdate(…, NULL, …)` AAD call** ⇒ **AAD = empty**; the
+    SEC_BODY carries the ciphertext (length-prefixed). The **SIGN/auth-only** branch (`!do_encryption`,
+    ~1578-1606) `memcpy`s the plaintext out **verbatim** and calls
+    `EVP_EncryptUpdate(e_ctx, nullptr, &actual_size, plain_buffer, plain_buffer_len)` ⇒ **AAD = the
+    plaintext**, empty ciphertext (the common_mac is a GMAC over the plaintext). Comment at L1580:
+    "Auth only. SEC_BODY should not be created. Plain buffer should be copied instead."
+  - `deserialize_SecureDataBody` (~1954-2064): symmetric — `do_encryption` reads the BE content length
+    then `EVP_DecryptUpdate(plain, …, input, …)` with no prior AAD; auth-only sets `output=nullptr` so
+    `EVP_DecryptUpdate(NULL, …, input, body_length)` feeds the body as AAD, then `memcpy`s it out.
+  - `encode_datawriter_submessage` (~179-303): `serialize_SecureDataHeader` (the 20-byte CryptoHeader)
+    is serialized SEPARATELY from `serialize_SecureDataBody` and **never fed to the cipher** ⇒ the
+    CryptoHeader is NOT part of the AAD in either mode (it is implicitly integrity-bound: its
+    transformation_key_id/session_id/init_vector_suffix derive the session key + nonce, so tampering
+    them fails the GCM tag).
+  - `AESGCMGMAC_Types.h` lines 45-54 — the CryptoTransformKind octet[4] values pinned for SIGN-vs-ENCRYPT
+    on-wire signalling: `CRYPTO_TRANSFORMATION_KIND_AES256_GCM { {0,0,0,4} }` (ENCRYPT) and
+    `CRYPTO_TRANSFORMATION_KIND_AES256_GMAC { {0,0,0,3} }` (SIGN). `+transformation-kind-aes256-gmac+`
+    (crypto.lisp) is the new pin; the GCM value was already pinned (Slice-1).
+  - **DECISION as implemented (Option A, Fast-DDS-faithful):** ENCRYPT AAD = empty, SEC_BODY =
+    ciphertext; SIGN AAD = the plaintext submessage, SEC_BODY = that plaintext verbatim; the wire
+    transformation_kind (GCM vs GMAC) is what the decoder dispatches on. The shared AEAD core
+    (`%seal-with-km`/`%open-with-km`, transform.lisp) takes the AAD as a PARAMETER so each tier composes
+    its own; the CryptoHeader is never folded in here.
+- **LATENT INTEROP FINDING #1 — Slice-1 serialized-payload AAD diverges from Fast DDS.** Our shipped
+  Slice-1 data-protection tier (`encode-serialized-payload`, §9.5.3.3.4.4) uses **AAD = the 20-byte
+  SecureDataHeader**, whereas Fast DDS `serialize_SecureDataBody` for the SERIALIZED-PAYLOAD path
+  (`encode_serialized_payload` → `serialize_SecureDataBody(submessage=false)`) takes the same empty-AAD
+  ENCRYPT branch as above (no SecureDataHeader in the AAD). This is a real cross-vendor divergence on
+  the data-protection tier (it would break byte-exact data-protection interop with Fast DDS). It is
+  **NOT changed here** (it is shipped wire + anchors our own byte-exact corpus; reconciling it is a
+  separate data-protection decision the controller will carry forward). T2's submessage tier does NOT
+  inherit it — the AAD is a parameter, so the submessage tier uses empty/plaintext per Option A.
+- **RESOLVED (T2 review fix, 2026-06-27) — SIGN now emits NO SEC_BODY, conformant with §9.5.3.3.4.3 +
+  Fast DDS.** The original T2 wire (per the brief's "uniform SEC_BODY") wrapped the SIGN plaintext in a
+  SEC_BODY (0x30) + uint32 length prefix. That is **non-conformant**: a conformant GMAC peer computes the
+  tag over the *original submessage* (it would MAC different bytes ⇒ tag mismatch ⇒ false REJECT), and the
+  recovered "submessage" would start with 0x30 rather than a valid submessageId — both broken by the
+  wrapper. The operating contract Global Constraint (OMG conformance is non-negotiable; a false REJECT is
+  the worst defect class) governs, so the fix emits the conformant framing:
+    * ENCRYPT — unchanged: SEC_PREFIX ‖ SEC_BODY(0x30, length-prefixed ciphertext) ‖ SEC_POSTFIX.
+    * SIGN — SEC_PREFIX ‖ <ORIGINAL submessage VERBATIM, no SEC_BODY, no length prefix> ‖ SEC_POSTFIX;
+      decode recovers the original by parsing its OWN RTPS submessage header (submessageId ‖ flags ‖
+      octetsToNextHeader honoring the embedded E-flag, then octetsToNextHeader octets), verifies the GMAC
+      over it (AAD), and returns it. The GMAC value is byte-identical to the prior framing (same AAD = the
+      original submessage, same key + nonce); only the wrapping changed. SIGN corpus vector shrinks 88→80.
+  Re-corroborated CLEAN-ROOM (read-only, no code copied) against eProsima Fast DDS (Apache-2.0)
+  `src/cpp/security/cryptography/AESGCMGMAC_Transform.cpp` at `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`:
+    * `serialize_SecureDataBody` (L1531) — `do_encryption` is true only for AES128/256-**GCM** (L1542-1543);
+      the auth-only/**GMAC** branch (`!do_encryption`, L1578-1606) `memcpy`s the plaintext submessage
+      **verbatim** onto the wire (L1588) and writes NO SecureBody submessage — comment L1580 verbatim:
+      "Auth only. SEC_BODY should not be created. Plain buffer should be copied instead." The ENCRYPT
+      branch (L1607+) DOES write `SecureBodySubmessage << flags` (L1617-1619) — so SEC_BODY is
+      ENCRYPT-only, exactly the framing the fix now produces.
+    * `predeserialize_SecureDataBody` (L2066-2095) returns `(secure_submsg_id == SecureBodySubmessage)`:
+      Fast DDS detects encryption by whether a SEC_BODY (0x30) follows SEC_PREFIX; for the SIGN case it
+      reads the original submessage's OWN header — submessageId ‖ flags ‖ uint16 length, endianness per
+      `flags & BIT(0)` (the E-flag, L2078-2088) — which is exactly our `%read-embedded-submessage` extent
+      logic.
+  REMAINING T12 NUANCE (live interop only, not a T2 blocker): our GMAC AAD = the FULL original submessage
+  octets (header + payload); Fast DDS's auth-only `EVP_*Update` byte-range is set from its
+  `body_state`/`body_length` (`deserialize_SecureDataBody` L1954-2049), so the exact GMAC AAD span for
+  cross-vendor GMAC verification remains a T12 live-capture reconciliation item — orthogonal to the
+  framing, which is now conformant. NO RTI Connext source consulted. CLEAN-ROOM.
+- **Wireshark/tshark RTPS dissector** is the vendor-neutral oracle for the secure submessageIds
+  (0x30/0x31/0x32, already pinned in T0); live secure-capture confirmation is T12. **No RTI Connext
+  source/headers/generated code consulted.** CLEAN-ROOM.
+
+## M7/P6 — WP-DDS-SECURITY-SECURE-DISCOVERY T3: origin authentication (2026-06-27)
+
+Origin authentication (the §9.5.3.3.4.3 *_WITH_ORIGIN_AUTHENTICATION protection kinds): per-matched-
+receiver session-key material + a `receiver_specific_macs` list in the CryptoFooter — encode emits one
+GMAC per receiver, decode finds + constant-time-verifies its OWN entry in addition to the common_mac.
+The two corroboration questions T3 had to settle from the readable conformant impl (the EXACT receiver-MAC
+input + nonce, and the receiver-specific session-key KDF) are answered below.
+
+- **OMG DDS-Security 1.1 §9.5.3.3.4.3** — primary authority for the receiver-specific session key and the
+  per-receiver MAC. Clause carried from the design + the T0 spike (the DDS-Security 1.1 PDF is not in
+  `docs/specs/`); values corroborated below against the Fast DDS direct reads.
+- **eProsima Fast DDS (Apache-2.0) — read for understanding only, NO code copied** (clean-room READ is
+  authorized for this slice). File `src/cpp/security/cryptography/AESGCMGMAC_Transform.cpp` at
+  `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`:
+  - `compute_sessionkey(receiver_specific=true, …)` (read at L1468-1519): the receiver-specific session
+    key is `HMAC-SHA256(master_receiver_specific_key, source)` where `source = "SessionReceiverKey"(18) ‖
+    master_salt(key_len=32) ‖ session_id(4)` (the label at L1481; the `memcpy` framing L1484-1495). It uses
+    `EVP_DigestSign`/`EVP_sha256` over `EVP_PKEY_HMAC` — i.e. HMAC-SHA256, the same primitive as the sender
+    session key. **Finding — counter divergence:** Fast DDS does NOT append the `"0001"` counter (the
+    `source[18+32+4]` buffer has no room for it). Our `derive-receiver-specific-session-key`
+    (`crypto/submessage.lisp`) DOES append it, mirroring our shipped `derive-session-key` and the §9.5.3.3.4.2
+    Table-70 framing (the shared `%derive-labeled-session-key`, crypto.lisp). This is the SAME pre-existing
+    divergence already present on our COMMON-MAC session key (Slice-1 `derive-session-key`), NOT introduced
+    by T3 — it affects cross-vendor live interop (T12) only; our encode/decode are self-consistent and the
+    corpus is reproducible across SBCL + Clasp. DECISION: keep the spec-faithful counter; reconcile at T12.
+  - `serialize_SecureDataTag` (read at L1708-1827): the per-receiver MAC is a pure GMAC. For each receiving
+    entity it (1) derives the receiver-specific session key (L1767-1768), (2) `EVP_EncryptInit(EVP_aes_256_gcm,
+    SessionKey, initialization_vector)` — **the SAME 12-octet `initialization_vector` (= session_id ‖
+    iv_suffix) as the common_mac**, comment L1771 "Obtain MAC using ReceiverSpecificKey and the same
+    Initialization Vector as before" (L1787-1799), (3) `EVP_EncryptUpdate(e_ctx, NULL, &sz, tag.common_mac.data(),
+    16)` — feeds **the 16-octet common_mac as AAD with NO ciphertext** (L1800), (4) `EVP_EncryptFinal` then
+    `EVP_CIPHER_CTX_ctrl(EVP_CTRL_GCM_GET_TAG, AES_BLOCK_SIZE=16, …)` — the 16-octet GCM tag IS the
+    `receiver_mac` (L1807-1816). So: **receiver_mac = AES-256-GCM-GMAC(key = recv_session_key, nonce = the
+    common_mac's IV, AAD = common_mac, plaintext = empty)**. This is exactly our
+    `compute-receiver-specific-mac (recv-session-key nonce common-mac)` over `dds.dare:aes-256-gcm-seal`
+    (empty plaintext → tag). The nonce is load-bearing, hence the 3-argument signature (the brief's 2-arg
+    sketch omitted the IV it asked to confirm).
+  - `deserialize_SecureDataTag` (read at L2097-2206): the decode side mirrors it — read common_mac + the
+    BIG-ENDIAN `sequence_length`, scan entries for the one whose `receiver_mac_key_id == receiver_specific_key_id`
+    (MY key id; not-found ⇒ "message does not target this Participant" ⇒ reject, L2123-2138), then derive the
+    receiver-specific session key and `EVP_DecryptInit(IV = initialization_vector)` /
+    `EVP_DecryptUpdate(NULL, …, common_mac, 16)` / `EVP_CTRL_GCM_SET_TAG(receiver_mac)` / `EVP_DecryptFinal`
+    (L2147-2202). Our `%verify-receiver-mac` recomputes the GMAC and constant-time-compares (`%ct-equal`)
+    — equivalent to OpenSSL's `EVP_DecryptFinal` tag check; the key_id LOOKUP is not constant-time (key_ids
+    are public on the wire), the MAC COMPARE is. **Finding — count endianness:** Fast DDS serializes/parses
+    the `receiver_specific_macs` count BIG-ENDIAN (L1824 / L2111); our T1 codec (`parse/serialize-crypto-footer`)
+    uses the cursor's little-endian, consistent with our own encode/decode and the rest of our LE wire — a
+    T1-owned cross-vendor divergence (live-interop/T12), not changed here.
+- **Wireshark/tshark RTPS dissector** — the receiver_specific_macs sub-element is part of the SEC_POSTFIX
+  CryptoFooter already pinned in T0/T1; live secure-capture confirmation of the origin-auth footer is folded
+  into T12. **No RTI Connext source/headers/generated code consulted.** CLEAN-ROOM.
+
+## M7/P6 — WP-DDS-SECURITY-SECURE-DISCOVERY T4: whole-RTPS-message protection (2026-06-27)
+
+Whole-RTPS-message protection (DDS-Security 1.1 §8.5.1.10-.12 / §9.5.3.3.4 — the `rtps_protection_kind`
+transform): protect the ENTIRE submessage stream of a datagram (everything AFTER the 20-octet RTPS Header)
+as `SRTPS_PREFIX (0x33)` ‖ `<body>` ‖ `SRTPS_POSTFIX (0x34)`, keyed by the per-participant ParticipantCrypto
+KeyMaterial. Same AES-GCM-GMAC mechanism as the §8.5.1.7-.9 submessage tier (T2/T3) over the SHARED
+`%encode-secured-region` / `%decode-secured-region` engine (`src/dds-security/crypto/submessage.lisp`); the
+tier wrapper is `src/dds-security/crypto/rtps-message.lisp`. The one tier-specific decode question — how to
+LOCATE the verbatim body on SIGN, where the protected unit is the whole (multi-submessage) STREAM rather
+than one submessage — is settled below from the readable conformant impl.
+
+- **OMG DDS-Security 1.1 §8.5.1.10-.12 / §9.5.3.3.4** — primary authority for the SRTPS bracket and the
+  AES-GCM-GMAC framing (the SRTPS submessage kinds 0x33/0x34 were pinned in T0; the CryptoHeader/Content/
+  Footer widths in T1). The DDS-Security 1.1 PDF is not in `docs/specs/`; the layout + the SIGN decode-locate
+  are corroborated below against the Fast DDS direct reads.
+- **eProsima Fast DDS (Apache-2.0) — read for understanding only, NO code copied** (clean-room READ is
+  authorized for this slice). File `src/cpp/security/cryptography/AESGCMGMAC_Transform.cpp` at
+  `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`:
+  - `encode_rtps_message` (read at L463-602): the wire is `SRTPS_PREFIX ‖ flags ‖ length(u16) ‖
+    SecureDataHeader(=20-octet CryptoHeader)` (serialize_SecureDataHeader, L526-541, length = the CryptoHeader
+    octet count), then `serialize_SecureDataBody(...)` — **the SAME body function as the submessage tier**
+    (ENCRYPT emits a SecureBody/SEC_BODY ciphertext; SIGN copies the plain stream verbatim, no SEC_BODY),
+    then `SRTPS_POSTFIX ‖ flags ‖ length(u16) ‖ SecureDataTag(=CryptoFooter)` (L571-582). Confirms our
+    `%encode-secured-region` produces the byte-identical SRTPS bracket as the submessage tier with only the
+    prefix/postfix submessage ids changed (0x31/0x32 → 0x33/0x34) — DRY, no copy-paste.
+  - `decode_rtps_message` (read at L603-805): reads SRTPS_PREFIX + the SecureDataHeader, then
+    `predeserialize_SecureDataBody` (L706 → L2066-2094: returns `is_encrypted` = whether the next submessage
+    id is SecureBody/SEC_BODY 0x30). **The SIGN decode-locate is a WALK:** when NOT encrypted the loop
+    `while (!is_encrypted && (id != SRTPS_POSTFIX)) { … decoder >> length; … decoder.jump(length + body_align);
+    decoder >> id; }` (L726-751) skips submessage-by-submessage — reading each 4-octet SubmessageHeader and
+    advancing octetsToNextHeader — until the next id equals SRTPS_POSTFIX, accumulating the protected body
+    length; then it reads SRTPS_POSTFIX + the SecureDataTag (L753-789). This is exactly our
+    `%walk-verbatim-body` (sign-walk-p T): walk to the trailing SRTPS_POSTFIX, the body = the bytes in
+    between, then re-read the postfix + CryptoFooter. **DECISION — walk, not compute-from-end:** the postfix
+    is NOT fixed-size when origin-auth adds receiver_specific_macs (the CryptoFooter grows with rsm_count, a
+    field INSIDE the postfix), so the start of the postfix cannot be computed from the message end without
+    parsing it; the forward walk Fast DDS uses handles the variable-size postfix and the multi-submessage
+    body uniformly. The ENCRYPT path needs no walk (the SecureBody is the single submessage right after the
+    prefix), matching our shared engine's ENCRYPT branch.
+  - **Finding — submessage alignment:** Fast DDS re-aligns each skipped submessage to a 4-octet boundary in
+    the walk (`body_align = decoder.alignment(…, sizeof(int32_t))`, L744). Our `%encode-secured-region` writes
+    the SIGN body VERBATIM with NO inter-submessage padding and our `%walk-verbatim-body` advances by exactly
+    octetsToNextHeader (no re-align), so our encode↔decode are self-consistent for any stream. For live
+    cross-vendor interop a stream whose submessages are not already 4-aligned could diverge; this is folded
+    into the T12 live-peer reconciliation (alongside the pre-existing T1 footer-count-endianness and the
+    derive-session-key "0001" KDF-counter divergences). For T4 (our-to-our self-consistency) it is a non-issue
+    — RTPS submessages are 4-aligned in the normal case, and the corpus/round-trip/fuzz are reproducible
+    across SBCL + Clasp.
+- **Wireshark/tshark RTPS dissector** — the SRTPS_PREFIX/SRTPS_POSTFIX submessages + their CryptoHeader/
+  CryptoFooter were pinned vendor-neutrally in T0/T1; live SRTPS-capture confirmation is folded into T12.
+  **No RTI Connext source/headers/generated code consulted.** CLEAN-ROOM.
+
+## M7/P6 — WP-DDS-SECURITY-SECURE-DISCOVERY T-RECONCILE: align crypto wire to Fast DDS (2026-06-27)
+
+Owner-directed reconciliation (pulled forward from T12) of the foundational AES-GCM-GMAC wire divergences
+that sat UNDER every crypto tier (serialized-payload, submessage, origin-auth, whole-RTPS). Three fields
+reconciled toward the readable conformant impls. Each was corroborated CLEAN-ROOM against TWO independent
+readable implementations (eProsima Fast DDS, Apache-2.0, read locally; Eclipse Cyclone DDS, EPL-2.0/EDL,
+read via the public GitHub raw source) — they AGREE on all three, which is strong confirmation. **No RTI
+Connext source/headers/generated code consulted.** The OMG DDS-Security 1.1 PDF is not in `docs/specs/` and
+its §9.5.3.3.4.2 text was not freely locatable online; the two impls are the oracle (the operating
+contract §4 — the wire is the oracle; a false-REJECT / non-interop is the worst defect class).
+
+- **Fix 1 — session-key KDF: NO trailing counter** (`src/dds-security/crypto.lisp`
+  `%derive-labeled-session-key`, behind `derive-session-key` AND `derive-receiver-specific-session-key`).
+  - Fast DDS `AESGCMGMAC_Transform.cpp` `compute_sessionkey` (read at L1456-1519, at
+    `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`): `unsigned char source[18 + 32 + 4]`;
+    `seq="SessionKey"` (10) / `receiver_seq="SessionReceiverKey"` (18); `memcpy(source, seq, 10)` then
+    `memcpy(source+sourceLen, master_salt.data(), key_len)` (key_len=32) then
+    `memcpy(source+sourceLen, &session_id, 4)`; HMAC-SHA256 over `source[0:sourceLen]`. The input is exactly
+    `label ‖ master_salt(32) ‖ session_id(4)` (sender 46 B / receiver 54 B) — **the `source` buffer
+    (18+32+4=54) has NO room for a trailing counter.**
+  - Cyclone DDS `crypto_utils.c` `crypto_calculate_session_key` (→ `crypto_calculate_key_impl`, read via
+    raw.githubusercontent.com): `memcpy(buffer, prefix, strlen(prefix)); memcpy(&buffer[strlen(prefix)],
+    master_salt, key_bytes); memcpy(&buffer[strlen(prefix)+key_bytes], &id, sizeof(id))`, size =
+    `strlen(prefix)+key_bytes+sizeof(id)` — **no counter** (AES-256 total = 10+32+4 = 46 B). AGREES with Fast DDS.
+  - Our prior code appended a `"0001"` counter (a T0-spike belief cited to "§9.5.3.3.4.2 Table 70"); both
+    impls omit it, so it was REMOVED (the dead `+session-key-counter-string+` constant, internal/unexported,
+    was deleted; consumers' docstrings + `crypto/constants.lisp` updated). **Session_id note (orthogonal,
+    out of scope):** the two impls differ ONLY on the session_id byte order WITHIN the KDF input — Fast DDS
+    `memcpy(&session_id,4)` (host/LE order), Cyclone `ddsrt_toBE4u(id)` (BE). We splice the wire
+    `SecureDataHeader.session_id` octet[4] VERBATIM, which is Fast-DDS-faithful (its wire session_id ==
+    its KDF session_id bytes, both from `memcpy(&session->session_id,4)`); this is NOT one of the three
+    reconciled fields and is unchanged here.
+- **Fix 2 — CryptoFooter `receiver_specific_macs_count` BIG-ENDIAN** (`crypto/crypto-header.lisp`
+  `serialize/parse-crypto-footer`).
+  - Fast DDS `serialize_SecureDataTag` (L1822-1825 / L1938): `serializer.serialize(length,
+    Cdr::Endianness::BIG_ENDIANNESS)`; `deserialize_SecureDataTag` (L2110-2111):
+    `decoder.deserialize(sequence_length, Cdr::Endianness::BIG_ENDIANNESS)`. The count is FORCED big-endian
+    regardless of the submessage's E-flag (which is LITTLE on LE targets, `flags = BIT(0)`, L234-239).
+  - Cyclone `crypto_transform.c`: `footer->postfix.receiver_specific_macs._length = ddsrt_toBE4u(length+1)`
+    (`add_specific_mac`); `postfix->length = ddsrt_fromBE4u(*(uint32_t*)submsg_view.ptr)` (`read_secure_postfix`).
+    AGREES.
+  - Our T1 codec used the cursor's little-endian; now forced BE via the new `%put-u32-be`/`%get-u32-be`.
+- **Fix 3 — CryptoContent length BIG-ENDIAN (SIBLING found in the Step-2 audit)** (`crypto/crypto-header.lisp`
+  `serialize/parse-crypto-content`). The audit of every multi-byte crypto-wire integer found the
+  `crypto_content` length is the SAME class of divergence as the footer count and ALSO diverged.
+  - Fast DDS `serialize_SecureDataBody` writes a dummy `cnt_length` then OVERWRITES it big-endian:
+    `serializer.serialize(cnt_length, Cdr::Endianness::BIG_ENDIANNESS)` (L1682). It is read big-endian on
+    EVERY decode path: `decode_serialized_payload` (the Slice-1 path) `decoder.deserialize(body_length,
+    BIG_ENDIANNESS)` (L1412); `deserialize_SecureDataBody` (submessage + RTPS paths)
+    `decoder.deserialize(protected_len, BIG_ENDIANNESS)` (L2006). `encode_serialized_payload` (L76-177)
+    routes through the same `serialize_SecureDataBody`, so the serialized-payload tier's length is BE too.
+  - Cyclone: `content->length = ddsrt_toBE4u((uint32_t)encrypted_data.x.length)` (`encode_submessage_encrypt`);
+    `estate->body.data.length = ddsrt_fromBE4u(*(uint32_t*)payload->ptr)` (`split_encoded_serialized_payload`).
+    AGREES — big-endian.
+  - Our codec used the cursor's little-endian; now forced BE via `%put-u32-be`/`%get-u32-be`. This is why the
+    brief's Step-2 audit instruction existed: the brief's "Key facts" pre-analysis (only count>0 footers
+    change) covered the footer count but not this body-length sibling.
+- **Sibling-audit conclusion (Step 2):** the CryptoContent length (Fix 3) is the ONLY additional diverging
+  integer. The submessage `octetsToNextHeader` (uint16, SEC_PREFIX/BODY/POSTFIX + SRTPS) follows the RTPS
+  E-flag (LITTLE on LE) in BOTH us and Fast DDS — a MATCH, not a sibling. All remaining crypto-wire fields
+  are opaque octet arrays (transformation_kind[4], transformation_key_id[4], session_id[4],
+  init_vector_suffix[8], common_mac[16], receiver_mac_key_id[4], receiver_mac[16]) and are NOT
+  endianness-sensitive (Fast DDS `std::array<uint8_t,N>` byte-copy; our put-octets/get-octets).
+- **Mechanism:** new private `%put-u32-be`/`%get-u32-be` in `crypto/crypto-header.lisp` force big-endian by
+  save/set/restore of the cursor endianness around the shared `put-u32`/`get-u32` (DRY), so the
+  surrounding LE RTPS stream is untouched — exactly Fast DDS's per-field `BIG_ENDIANNESS` override. No frozen
+  contract (dds.core.buffer) changed.
+- **Corpus regenerated:** the fix changes the reference bytes for the Slice-1 payload vector + T1
+  byte-identity, T2 ENCRYPT+SIGN, T3 ENCRYPT+SIGN origin-auth (count now BE), and T4 ENCRYPT+SIGN. Recomputed
+  DETERMINISTICALLY (`make-test-key-material`, iv-counter=0, session_id=0) and re-pinned as REAL `equalp`
+  literal-vector assertions (NOT weakened to round-trip-only). Structural fields verified by inspection
+  (ct_len → BE `00000020`/`0000002c`; rsm_count>0 → BE `00000002`; rsm_count=0 unchanged; headers unchanged;
+  T3 prefix/common_mac still == T2). Byte-IDENTICAL on SBCL + Clasp (same OpenSSL ≥ 3.5). This intentionally
+  changes shipped Slice-1 serialized-payload wire (the divergences sat under it).
+- **This RESOLVES** the two divergences logged in the T1 and T3 entries above (footer-count endianness;
+  derive-session-key "0001" counter) AND the body-length sibling — they are no longer deferred to T12. T12
+  remains the LIVE cross-vendor capture; the remaining open item folded into it is the SIGN inter-submessage
+  4-octet re-alignment (T4 finding), unrelated to these three.
+
+## M7/P6 — WP-DDS-SECURITY-SECURE-DISCOVERY T7: PVMS bootstrap-key derivation + protection-kind (2026-06-28)
+
+The reliable ParticipantVolatileMessageSecure (PVMS) builtin endpoint's protection KeyMaterial is derived
+DIRECTLY from the authenticated SharedSecret + the two handshake challenges (DDS-Security 1.1 §9.5.3.1, no
+token exchange — PVMS is the bootstrap carrier for the OTHER tokens). Two interop-critical facts pinned —
+the EXACT derivation and the protection-kind (ENCRYPT vs SIGN) — corroborated CLEAN-ROOM (read-only, no code
+copied) against eProsima Fast DDS (Apache-2.0), read locally at
+`/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`. **No RTI Connext source/headers/generated code
+consulted.** A second readable impl (Cyclone/OpenDDS) was NOT separately read for this fact because the
+underlying KxKey/KxSalt KDFs were ALREADY dual-corroborated in the AUTH-KEYX spike (see the 2026-06-26 entry
+above); T7 only confirms those same KDFs are how Fast DDS assembles the VOLATILE-endpoint KeyMaterial.
+Confidence: **high** (the Fast DDS read is unambiguous + the KDFs are independently pinned).
+
+- **File read:** `src/cpp/security/cryptography/AESGCMGMAC_KeyFactory.cpp`.
+  - `create_kx_key(out, first, cookie, second, shared_secret)` (L48-95): `out = HMAC-SHA256(key =
+    SHA-256(first(32) ‖ cookie(16) ‖ second(32)), data = shared_secret)` — `uint8_t tmp_data[32+16+32]`,
+    `EVP_Digest(...EVP_sha256...)` then `EVP_DigestSign...` over `shared_secret`. IDENTICAL to our
+    `%kx-create-key` (keyexchange.lisp), confirming `derive-kx-key`/`derive-kx-salt` are the right primitives.
+  - `register_matched_remote_participant(...)` (L231+), the `Participant2ParticipantKxKeyMaterial`
+    block "// based on the SharedSecret" (L250+): `challenge_1 = find_data_value(shared_secret,
+    "Challenge1")`, `challenge_2 = ..."Challenge2"`, `shared_secret_ss = ..."SharedSecret"`;
+    `buffer.transformation_kind = c_transfrom_kind_aes256_gcm` (L296);
+    `buffer.sender_key_id.fill(0)` (L297); `buffer.receiver_specific_key_id.fill(0)` (L298);
+    `buffer.master_receiver_specific_key.fill(0)` (L299);
+    `create_kx_key(buffer.master_salt,       challenge_1, "keyexchange salt", challenge_2, shared_secret_ss)` (L303);
+    `create_kx_key(buffer.master_sender_key, challenge_2, "key exchange key", challenge_1, shared_secret_ss)` (L310).
+    So the PVMS KeyMaterial = { kind=AES256-GCM; master_salt=KxSalt; master_sender_key=KxKey; sender_key_id=0;
+    receiver fields=0 }. Mapped to ours: `master_salt = derive-kx-salt(ss, c1, c2)`,
+    `master_sender_key = derive-kx-key(ss, c1, c2)` (BYTE-for-byte, both via `create_kx_key` with the same
+    first/cookie/second ordering), `sender_key_id = #(0 0 0 0)`. This is exactly `%pvms-derive-bootstrap-km`.
+  - Same function (L327-335): that Kx `buffer` is pushed into the builtin key-exchange WRITER handle —
+    `wHandle->EndpointPluginAttributes = PLUGIN_ENDPOINT_SECURITY_ATTRIBUTES_FLAG_IS_SUBMESSAGE_ENCRYPTED`
+    (L329); `wHandle->Participant_master_key_id = c_transformKeyIdZero` (L330);
+    `wHandle->EntityKeyMaterial.push_back(buffer)` (L334); `Entity2RemoteKeyMaterial.push_back(buffer)` (L335).
+    **IS_SUBMESSAGE_ENCRYPTED → PVMS protection-kind = ENCRYPT** (not SIGN). So our codec is invoked as
+    `encode/decode-datawriter-submessage km :encrypt …`.
+  - `register_local_datawriter(...)` (L405-417): when a property `dds.sec.builtin_endpoint_name` equals
+    `"BuiltinParticipantVolatileMessageSecureWriter"` → `use_kx_keys = true`; then
+    `if (use_kx_keys) return participant_handle->Writers.at(0).get();` — i.e. the PVMS local writer REUSES the
+    Kx-key handle built above (it does NOT mint a random per-endpoint key). `register_local_datareader(...)`
+    (L629) does the same for `"BuiltinParticipantVolatileMessageSecureReader"`.
+  - `c_transfrom_kind_aes256_gcm = CRYPTO_TRANSFORMATION_KIND_AES256_GCM` (`AESGCMGMAC_Types.h:65`) =
+    our `+transformation-kind-aes256-gcm+` {0,0,0,4}.
+- **Implementation:** `src/dds-disc/volatile-secure.lisp` `%pvms-derive-bootstrap-km` REUSES
+  `derive-kx-salt` (→ master_salt) + `derive-kx-key` (→ master_sender_key) (DRY — the already-pinned §9.5.3
+  KDFs), `sender_key_id = #(0 0 0 0)`, kind = AES256-GCM, into a §9.5.2 `key-material`. The endpoint reuses
+  the M2 reliable engine (HEARTBEAT/ACKNACK) configured VOLATILE (KEEP_ALL, no durability); each DATA is
+  `:encrypt`-protected with the per-matched-remote bootstrap KM.
+- **CARRY (T8) — bidirectional nonce uniqueness.** The Kx KeyMaterial is SYMMETRIC across the pair (both
+  sides derive identical key bytes). Fast DDS sets a DISTINCT `Session.session_id` per remote crypto
+  (register_matched_remote_participant L319-323: `session_id = max(); if (== local) session_id -= 1`), which
+  separates the two directions' nonces. Our codec currently uses the Slice-1 `+fixed-session-id+` (all-zeros),
+  so two sides encoding under the shared key from iv-counter 0 would COLLIDE nonces. T7 traffic is
+  one-directional per exchange (no collision); T8 (bidirectional token exchange) MUST give the two roles
+  disjoint nonce spaces (distinct session_ids or iv ranges). Flagged in the source + report; never silent.
+
+## M7/P6 — WP-DDS-SECURITY-SECURE-DISCOVERY T8: crypto-token exchange over PVMS + :keyed promotion (2026-06-28)
+
+T8 wires the §8.5.2 crypto-token exchange onto the reliable PVMS endpoint (T7) and drives the §7.2
+`:authenticated→:keyed` promotion through the crypto-manager (T6). Three interop/safety facts:
+
+- **DISJOINT per-role nonce spaces (safety-critical; resolves the T7 carry above).** The PVMS bootstrap KM
+  is SYMMETRIC, the submessage codec's `session_id` was the Slice-1 `+fixed-session-id+` (all-zeros) and each
+  KeyMaterial's `iv-counter` starts at 0 — so if BOTH directions encoded PVMS submessages with `session_id=0`
+  from `iv_suffix=0` they would reuse the IDENTICAL (session-key, nonce) pair → CATASTROPHIC AES-GCM reuse
+  (NIST SP 800-38D §8.3: confidentiality AND integrity break). Resolution: thread a per-role 4-octet
+  `session_id` into the PVMS encode path (`dds.disc:%pvms-role-session-id`, threaded through
+  `encode-datawriter-submessage :session-id` → `%encode-secured-region`; default stays `+fixed-session-id+`
+  so the Slice-1/T2/T4 byte-exact corpus is UNCHANGED — verified: the 7 crypto corpus tests stay green).
+  Rule: the lexicographically GREATER 12-octet GUID prefix is the deterministic "winner" (both peers agree;
+  RTPS GUIDs are unique); `base = (2^31 | fold(winner-prefix))` (high bit set → non-zero); the winner's
+  outbound `session_id = base-1`, the loser's = `base`. Distinct (`base ≠ base-1`), both non-zero, both
+  distinct from the all-zero non-PVMS value. Because the session key is derived from `session_id` AND the
+  nonce is `session_id ∥ iv_suffix`, the two directions use DIFFERENT session keys AND non-overlapping
+  nonces. DECODE needs no agreement — the codec reads `session_id` from the wire CryptoHeader, so the value
+  is self-describing (interop decode works regardless of the peer's derivation). Corroborated CLEAN-ROOM
+  (read-only, no code copied) against eProsima Fast DDS (Apache-2.0) `AESGCMGMAC_KeyFactory.cpp`
+  `register_matched_remote_participant` (per-remote `Session.session_id = max(...)` with a `-=1` tiebreak
+  that separates the two directions). Our exact base derivation is our-implementation-choice (only per-role
+  DISTINCTNESS is load-bearing for our-to-our; the wire self-describes). RTI source NEVER read. Concrete
+  example (test prefixes all-0x0B / all-0x16): A→B `session_id=0x96161616`, B→A `0x96161615` (differ by 1,
+  both non-zero); the prior all-zero scheme gave both `0x00000000` (the demonstrated RED for the no-reuse
+  property). Structural test guard: `run-secure-discovery-keyed-test` asserts the two roles' session_ids
+  DIFFER and are non-zero. INTEROP NOTE (deferred to T12, live Fast DDS): cross-vendor A↔Fast-DDS no-reuse
+  on the shared Kx key would need our base value to MATCH Fast DDS's exact rule; since we couldn't read the
+  exact `max()` operand bytes (Fast DDS source not on disk this run; the T7 author's line-referenced
+  paraphrase is the corroboration), our value derivation may differ — harmless for our-to-our (the headline
+  T8 deliverable) and for cross-vendor DECODE (self-describing wire), flagged for the live T12 cross-vendor run.
+- **Conformant token payload — KxKey app-encryption DROPPED (design §6.5).** KEYX (interim) KxKey-AEAD-wrapped
+  the crypto-token payload over best-effort PSM. The conformant path: the §9.5.2 KeyMaterial rides as a
+  PLAINTEXT DataHolder (`dds.security:serialize-crypto-token-plain` / `parse-crypto-token-plain` — the 88-octet
+  KeyMaterial CDR inside the existing `handshake-token->dataholder` framing, no nonce/cipher) INSIDE the
+  PVMS submessage-protected message; the PVMS ENCRYPT (T7 bootstrap key) is the confidentiality boundary. The
+  KxKey-wrap codec (`serialize-crypto-token`/`parse-crypto-token`) is retained for the KEYX KAT regression but
+  is off the live exchange path. Token classes (T0-pinned): participant→`participant_crypto_tokens`,
+  writer→`datawriter_crypto_tokens`, reader→`datareader_crypto_tokens` (§9.5.2.2).
+- **KEYX per-writer KM migration (reconciliation #2).** KEYX exchanged the participant's single user-writer
+  KeyMaterial under `participant_crypto_tokens` over best-effort PSM into the auth-manager `writer-km-table`
+  + per-remote `auth-remote-remote-km`, with a bespoke CRYPTO-KEYS resolver. T8 RETIRES that entire path
+  (no parallel token paths): the user writer/reader are registered as crypto-manager LOCAL-ENTITY-CRYPTO
+  (keyed by the node's user-writer-id/user-reader-id) and exchanged as `datawriter/datareader_crypto_tokens`
+  over reliable PVMS alongside the secure-SEDP builtin EntityCrypto, landing in the crypto-manager
+  remote-entity registries (keyed by the source_endpoint_key GUID + the transformation_key_id index). The
+  user-data encode/decode resolver is now `cm-decode-keys` (installed on `:keyed` by `%cm-try-promote`). The
+  KEYX tests moved with it (`run-auth-manager-handshake-test` + `run-auth-encrypted-pubsub-keyx-test` now
+  assert the crypto-manager registries, not the retired `writer-km-table`/`auth-remote-remote-km`); both stay
+  green on the migrated PVMS path. Promotion gate: ParticipantCrypto + the secure-SEDP publications-secure-writer
+  (DW) + subscriptions-secure-reader (DR) all installed → `:keyed`.
+
+## M7/P6 — WP-DDS-SECURITY-SECURE-DISCOVERY T-ORIGINAUTH: origin-auth for the builtin secure endpoints (2026-06-28)
+
+Wired the `*_WITH_ORIGIN_AUTHENTICATION` discovery tier (receiver-specific MACs, §9.5.3.3.4.3) for the builtin
+secure-SEDP endpoints: origin-auth EntityCrypto registration + the receiver-specific KeyMaterial exchange (the
+120-byte CDR form) + the secure-SEDP receiver-MAC resolvers, replacing T9's fail-closed refusal. The receiver
+session-key KDF + per-receiver-MAC INPUT were already corroborated in T3 (this section adds the KeyMaterial CDR
+receiver-key carry + the key model).
+
+- **OMG DDS-Security 1.1** — §9.5.2 Table 65 (`CryptoTransformKeyMaterial`: `receiver_specific_key_id` octet[4]
+  + `master_receiver_specific_key` sequence<octet,32>), §9.5.3.3.4.3 (origin authentication: per-receiver MAC
+  under the RECEIVER's receiver-specific key, keyed by the receiver's `receiver_specific_key_id`), §9.4.1.2.3
+  (`discovery_protection_kind` ProtectionKind incl. the `*_WITH_ORIGIN_AUTHENTICATION` variants). PDF binary;
+  clause numbers cited in the source docstrings.
+- **eProsima Fast DDS (Apache-2.0) — source read for understanding only; no code copied.**
+  File `src/cpp/security/cryptography/AESGCMGMAC_KeyExchange.cpp` at
+  `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`:
+  - `KeyMaterialCDRSerialize()` (read at L380-458): corroborated the 120-byte origin-auth CDR form. The
+    `receiver_specific_key_id` is written as 4 octets (L432-438) accumulating `has_specific_key` = OR of those
+    4 octets; when `has_specific_key == 0` the trailer is 4 zero octets (the 88-byte absent form, L440-444),
+    otherwise a `master_receiver_specific_key` sequence = 3 zero pad + 1 length octet (`key_len` = 0x20 for
+    AES256) + 32 key octets (L445-453). Our `%serialize-km-cdr` (`src/dds-security/auth/keyexchange.lisp`)
+    keys the 88-vs-120 choice on the SAME `has_specific_key` discriminator (non-zero `receiver_specific_key_id`)
+    and emits the identical pad(3)+len(0x20)+key(32) layout — byte-identical to the prior 88-byte serializer
+    when the receiver id is all-zero (the SIGN/ENCRYPT path is unchanged).
+  - `KeyMaterialCDRDeserialize()` (read at L460-530): the decode mirror — `has_specific_key` = OR of the
+    `receiver_specific_key_id` octets (L511-517); non-zero -> skip 3 pad, read the 1 length octet, `memcpy`
+    32 key octets (L519-528). Our `%parse-km-cdr` accepts both the 88- and 120-octet forms with the same
+    discriminator + a fail-closed form/marker consistency check, and RETAINS the receiver key so the
+    matched-remote EntityCrypto the crypto token installs keeps the remote's origin-auth receiver key.
+  No code was copied. Influence: corroboration only; the constants are pinned from the OMG clause; Fast DDS
+  confirms the framing. Cross-vendor (Connext) CDR/wire alignment for origin-auth is deferred to Slice 5 / ADR 0034
+  (the same NEEDS-VERIFICATION carry as the 88-byte T8 framing).
+- **Origin-auth KEY MODEL (owner-directed, corroborated against Fast DDS `serialize_SecureDataTag` T3 read).**
+  The receiver-specific MAC uses the RECEIVER's key: sender A, for each matched remote, GMACs the common_mac
+  under the matched-remote READER's receiver-specific session key (derived from that reader's
+  `master_receiver_specific_key`, received in its crypto token) and tags it with that reader's
+  `receiver_specific_key_id`; receiver B verifies the footer entry tagged with its OWN
+  `receiver_specific_key_id` under its OWN `master_receiver_specific_key`. For the builtin secure-SEDP tier the
+  receiving endpoint is the matched secure-SEDP READER (publications writer 0xff0003c2 <-> reader 0xff0003c7;
+  subscriptions writer 0xff0004c2 <-> reader 0xff0004c7), so only the secure-SEDP readers are minted with a
+  receiver-specific key (the writers encode under the matched remote reader's key, never their own). The
+  per-receiver session-key KDF (`derive-receiver-specific-session-key`) uses the SENDER (writer) `master_salt`,
+  which both sides share (the receiver holds the writer's KeyMaterial via the token exchange) — corroborated in
+  the T3 section above (`compute_sessionkey(receiver_specific=true)` source ordering). NEVER read RTI Connext source.
+
+## M7/P6 — WP-DDS-SECURITY-SECURE-DISCOVERY T10: rtps_protection engagement (whole-datagram, live path) (2026-06-28)
+
+Engaged the §8.5.1.10-.12 whole-RTPS-message codec (T4) on the live send / `%handle-datagram` data path: once two
+participants are `:keyed`, user-data datagrams are wrapped `RTPS-Header ‖ SRTPS_PREFIX ‖ SEC_BODY ‖
+SRTPS_POSTFIX` keyed by the per-pair ParticipantCrypto; SPDP + PSM are exempt. No NEW external source was read —
+the SRTPS layout/kinds are T0/T4-pinned, the AES-GCM-GMAC mechanism is T1-T4, and the participant-level origin-auth
+key model is the T-ORIGINAUTH model applied at the participant tier.
+
+- **OMG DDS-Security 1.1** — §8.5.1.10-.12 (`encode/decode_rtps_message`: the SecureRTPSPrefix/SecureRTPSPostfix
+  whole-message transform keyed by the ParticipantCrypto), §9.4.1.2.3 (`rtps_protection_kind` ProtectionKind incl.
+  the `*_WITH_ORIGIN_AUTHENTICATION` variants), §9.5.3.3.4.3 (per-receiver MAC under the receiver's
+  receiver-specific key). §7.4.5 / §8.5.1.10: the bootstrap **SPDP** and the **ParticipantStatelessMessage** (PSM)
+  are NOT subject to rtps_protection (they precede keying). Clause numbers cited in the source docstrings.
+- **Engagement gating (implementation choice, no external source).** rtps_protection is per-pair: the send wrap is
+  gated on the destination being `:keyed` (its ParticipantCrypto is held — `cm-decode-participant-km` non-NIL) AND
+  governance `rtps_protection_kind ≠ NONE`. SPDP is structurally exempt (it is sent via `%send-paramlist`, never
+  through the wrap chokepoint `%send-raw-buf`); PSM is exempt because it is sent pre-keying (the dest is not yet
+  `:keyed`). The receive side decrypts any inbound `SRTPS_PREFIX` (0x33) datagram keyed by the source-prefix
+  ParticipantCrypto and fails closed (drop) on an unknown/not-keyed source or an undecryptable bracket.
+- **Participant-level origin-auth KEY MODEL (the T-ORIGINAUTH model at the participant tier).** A MACs the
+  common_mac under remote B's ParticipantCrypto receiver-specific key (learned from B's ParticipantCryptoToken,
+  §9.5.2); B verifies the footer entry tagged with its OWN `receiver_specific_key_id` under its OWN
+  `master_receiver_specific_key`. rtps_protection is per-pair (one datagram → one destination participant), so the
+  encode `:receivers` list is exactly that one remote's descriptor and decode's `my-receiver-key` is the local
+  participant's own — `cm-rtps-encode-receivers` / `cm-rtps-decode-receiver` mirror the entity-level
+  `cm-secure-sedp-encode-receivers` / `-decode-receiver` (T-ORIGINAUTH) at the participant level. NEVER read RTI
+  Connext source.
+- **Scope (documented residual).** T10 wraps the USER DATA PLANE (the hot path); the builtin metatraffic (secure
+  SEDP, PVMS, plain SEDP, liveliness, TypeLookup) flows plain (secure SEDP carries its own §8.5.1.7-.9 submessage
+  protection). The hot-path NFR-MEM migration reuses the node send/receive BUFFER in place (no per-datagram
+  message-sized array); the residual per-datagram heap is the codec's `→octets` return + AEAD intermediates (the
+  inherited T4 carry) + one plain-region subseq (measured in `bench/report/2026-06-28-wp-secure-discovery-t10.md`).
+  Wrapping the builtin metatraffic + a fully zero-alloc into-buffer AEAD codec are the documented follow-ons.
+
+## WP-DDS-SECURITY-SECURE-DISCOVERY T12 — live Fast DDS-Security cross-vendor (2026-06-28)
+
+Built a **SECURITY=ON** eProsima Fast DDS v3.6.1 (Apache-2.0) from the present source tree and ran it
+live against our stack to find cross-vendor secure-discovery wire divergences. Fast DDS source read for
+understanding only (clean-room; no code copied). RTI Connext source NEVER read. Files consulted + the
+constant/behaviour each corroborates:
+
+- `src/cpp/rtps/security/SecurityManager.cpp:933-938,1462-1470` — ParticipantStatelessMessage SerializedPayload
+  carries the 4-octet CDR encapsulation header (`addOctet 0`, `DEFAULT_ENCAPSULATION`, `addUInt16 0`), read
+  back on receive. Corroborates fix #1 (our PSM omitted it). `:605` — `discovered_participant` calls
+  `security_attributes().match(...)` (with `SecurityMaskUtilities.h` `security_mask_matches`: lenient when
+  either IS_VALID bit is clear) — so a missing PID_PARTICIPANT_SECURITY_INFO is NOT a discovery blocker.
+- `src/cpp/security/accesscontrol/Permissions.cpp:354,408` — governance/permissions parsed with
+  `SMIME_read_PKCS7` + `PKCS7_verify(..., PKCS7_TEXT|PKCS7_NOVERIFY|PKCS7_NOINTERN)`; PKCS7_TEXT requires the
+  multipart/signed `Content-Type: text/plain` MIME container (NOT PEM PKCS7). `:632,1047` — subject_name match
+  via `rfc2253_string_compare(grant.subject_name, cert_sn_rfc2253_)`. Corroborates the .smime MIME-format fix +
+  fix #3 (RFC2253 subject DN). `:255-256,464-469` PID_PARTICIPANT_SECURITY_INFO (0x1005) wire = {uint32
+  security_attributes, uint32 plugin_security_attributes}.
+- `src/cpp/security/accesscontrol/GovernanceParser.cpp:73-88,99-135` — governance root is `<dds>` with
+  `<domain_access_rules>` as a DIRECT child (rejects any other first child). Corroborates fix #2 (our
+  non-conformant `<policies>` wrapper).
+- `src/cpp/security/authentication/PKIDH.cpp:1039-1056` — IdentityToken class_id `DDS:Auth:PKI-DH:1.0` +
+  properties dds.cert.sn/dds.cert.algo/dds.ca.sn/dds.ca.algo (names match ours).
+- `src/cpp/rtps/messages/CDRMessage.cpp:828-906` — **`addProperty`/`readProperty` + `addBinaryProperty`/
+  `readBinaryProperty` serialize/parse a Token Property/BinaryProperty as `{name,value}` ONLY — the
+  `propagate` flag is a local include-filter, NEVER on the wire.** Corroborates the PRIMARY residual divergence
+  (#5): our token codec writes/reads a spurious 4-octet `propagate` field per property, misaligning every
+  cross-vendor token (IdentityToken/handshake/crypto/permissions) — the §8.7 handshake rejects at the remote
+  IdentityToken parse. Spec-conformant fix = drop the propagate field across our Property/BinaryProperty codec
+  + regenerate the token corpus (a slice-wide change; Slice-5 / dedicated WP).
+- `src/cpp/rtps/security/accesscontrol/{ParticipantSecurityAttributes.h,SecurityMaskUtilities.h}` — the
+  Participant + Plugin security-attribute mask bit layout + `match`/`security_mask_matches` semantics.
+- `examples/cpp/security/{PublisherApp.cpp,SubscriberApp.cpp,CLIParser.hpp,secure_*_profile.xml,main.cpp}` —
+  the headless secure HelloWorld peer used as the live oracle (topic HelloWorldTopic, type HelloWorld).
+
+## WP-DDS-SECURITY-SECURE-DISCOVERY T13 — capstone provenance closeout (2026-06-28)
+
+The Slice-4 capstone (ADR 0036 + wiki/README/`verification.csv` + this closeout + the
+`src/dds-tests/security-test.lisp:15` stale-docstring fix + the final dual-impl gate sweep) consulted **no
+new external source** — it is documentation + verification only. Every Fast DDS (Apache-2.0, read for
+understanding only) and Eclipse Cyclone DDS source consulted across the slice is logged in the entries above:
+T0 (secure EntityIds + submessage kinds + KDF labels + ProtectionKind table), T2 (the AESGCMGMAC_Transform
+submessage AAD), T3 (the receiver-specific-MAC input), T4 (the SRTPS body-walk), T-RECONCILE (the no-counter
+session-key KDF + the big-endian footer-count / crypto_content-length, Fast DDS **and** Cyclone), T7 (the
+PVMS bootstrap-key derivation), T8 (the per-role `session_id` derivation), T-ORIGINAUTH (the 88/120-byte
+KeyMaterial CDR + the §9.5.3.3.4.3 receiver-key model), T10 (the participant-tier origin-auth), and T12 (the
+live Fast DDS-Security peer + the propagate-byte / governance-root / RFC2253-DN / S-MIME corroborations).
+**RTI Connext source, headers, and generated code were never read at any point in this slice — clean-room.**
+The DDS-Security 1.1 PDF could not be located in `docs/specs/` (only RTPS/DCPS/XTypes are present); the clause
+sub-numbers are carried from the design/spike, every *value* dual-corroborated against Fast DDS + the tshark
+RTPS-security dissector (the propagate-byte fix's Slice-5 carry explicitly requires pinning the actual OMG
+clause for the on-wire Property layout).

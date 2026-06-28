@@ -134,7 +134,18 @@
            #:+builtin-endpoint-set-default+
            #:+be-participant-stateless-writer+ #:+be-participant-stateless-reader+
            #:+entityid-participant-stateless-writer+ #:+entityid-participant-stateless-reader+
-           #:+pid-identity-token+
+           ;; DDS-Security 1.1 §7.4.5 secure builtin EntityIds + §7.4.6.1 bits (secure-discovery slice)
+           #:+entityid-participant-volatile-secure-writer+ #:+entityid-participant-volatile-secure-reader+
+           #:+entityid-sedp-pub-secure-writer+ #:+entityid-sedp-pub-secure-reader+
+           #:+entityid-sedp-sub-secure-writer+ #:+entityid-sedp-sub-secure-reader+
+           #:+entityid-participant-message-secure-writer+ #:+entityid-participant-message-secure-reader+
+           #:+entityid-spdp-secure-writer+ #:+entityid-spdp-secure-reader+
+           #:+be-sedp-pub-secure-writer+ #:+be-sedp-pub-secure-reader+
+           #:+be-sedp-sub-secure-writer+ #:+be-sedp-sub-secure-reader+
+           #:+be-participant-message-secure-writer+ #:+be-participant-message-secure-reader+
+           #:+be-participant-volatile-secure-writer+ #:+be-participant-volatile-secure-reader+
+           #:+be-participant-secure-announcer+ #:+be-participant-secure-detector+
+           #:+pid-identity-token+ #:+pid-permissions-token+
            #:write-locator #:read-locator #:make-ipv4-locator
            #:locator #:make-locator #:locator-p
            #:locator-kind #:locator-port #:locator-address

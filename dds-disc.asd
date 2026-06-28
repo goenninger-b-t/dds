@@ -13,5 +13,7 @@
                (:file "flow-control")
                (:file "typelookup-endpoints")
                (:file "participant-message")
-               (:file "stateless-message"))
+               (:file "stateless-message")
+               (:file "volatile-secure")
+               (:file "secure-sedp"))
   :in-order-to ((test-op (test-op "dds-tests"))))

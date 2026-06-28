@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- T12 LIVE Fast DDS-Security cross-vendor peer profile (M7/P6 Slice 4).
+     Points the eProsima builtin security plugins at THIS repo's reused PKI via environment-variable
+     expansion (Fast DDS expands ${VAR} in XML values) so no absolute path is committed; the
+     orchestrator run-fastdds-interop.sh exports SSD_IDCA/SSD_PERMCA/SSD_CERT/SSD_KEY/SSD_GOV/SSD_PERM.
+     Transport is pinned LOOPBACK-ONLY UDPv4 (interfaceWhiteList 127.0.0.1) so discovery + dataflow stay
+     on lo0 alongside our Lisp peer. Domain 0 (matches the governance domain_rule + permissions grants). -->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>udp_loopback</transport_id>
+        <type>UDPv4</type>
+        <interfaceWhiteList>
+          <address>127.0.0.1</address>
+        </interfaceWhiteList>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="ssd_secure_participant" is_default_profile="true">
+      <domainId>0</domainId>
+      <rtps>
+        <name>ssd_fastdds_peer</name>
+        <useBuiltinTransports>false</useBuiltinTransports>
+        <userTransports>
+          <transport_id>udp_loopback</transport_id>
+        </userTransports>
+        <builtin>
+          <initialPeersList>
+            <locator>
+              <udpv4>
+                <address>127.0.0.1</address>
+                <port>7420</port>
+              </udpv4>
+            </locator>
+          </initialPeersList>
+        </builtin>
+        <propertiesPolicy>
+          <properties>
+            <property>
+              <name>dds.sec.auth.plugin</name>
+              <value>builtin.PKI-DH</value>
+            </property>
+            <property>
+              <name>dds.sec.auth.builtin.PKI-DH.identity_ca</name>
+              <value>file://${SSD_IDCA}</value>
+            </property>
+            <property>
+              <name>dds.sec.auth.builtin.PKI-DH.identity_certificate</name>
+              <value>file://${SSD_CERT}</value>
+            </property>
+            <property>
+              <name>dds.sec.auth.builtin.PKI-DH.private_key</name>
+              <value>file://${SSD_KEY}</value>
+            </property>
+            <property>
+              <name>dds.sec.access.plugin</name>
+              <value>builtin.Access-Permissions</value>
+            </property>
+            <property>
+              <name>dds.sec.access.builtin.Access-Permissions.permissions_ca</name>
+              <value>file://${SSD_PERMCA}</value>
+            </property>
+            <property>
+              <name>dds.sec.access.builtin.Access-Permissions.governance</name>
+              <value>file://${SSD_GOV}</value>
+            </property>
+            <property>
+              <name>dds.sec.access.builtin.Access-Permissions.permissions</name>
+              <value>file://${SSD_PERM}</value>
+            </property>
+            <property>
+              <name>dds.sec.crypto.plugin</name>
+              <value>builtin.AES-GCM-GMAC</value>
+            </property>
+          </properties>
+        </propertiesPolicy>
+      </rtps>
+    </participant>
+    <data_writer profile_name="ssd_writer" is_default_profile="true">
+      <qos>
+        <reliability>
+          <kind>RELIABLE</kind>
+        </reliability>
+        <durability>
+          <kind>VOLATILE</kind>
+        </durability>
+      </qos>
+    </data_writer>
+    <data_reader profile_name="ssd_reader" is_default_profile="true">
+      <qos>
+        <reliability>
+          <kind>RELIABLE</kind>
+        </reliability>
+        <durability>
+          <kind>VOLATILE</kind>
+        </durability>
+      </qos>
+    </data_reader>
+  </profiles>
+</dds>

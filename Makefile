@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-zc-loan-lockfree bench-async-flow bench-keeplast shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-zc-loan-lockfree bench-async-flow bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -32,6 +32,8 @@ THRUSAMPLES ?= 20000
 KLSAMPLES   ?= 1000000
 KLINSTANCES ?= 100
 KLDEPTH     ?= 2
+RTPSITERS   ?= 100000
+RTPSSIZE    ?= 256
 PEERS    ?=
 LIVELINESS ?=
 LEASE    ?=
@@ -268,6 +270,25 @@ bench-async-flow:
 bench-keeplast:
 	$(SBCL) --eval '(ql:quickload :dds-bench :silent t)' \
 	        --eval '(with-open-file (s "bench/report/2026-06-16-wp-keeplast.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.bench :run-keeplast-bench :samples $(KLSAMPLES) :instances $(KLINSTANCES) :depth $(KLDEPTH) :stream s))' \
+	        --eval '(uiop:quit 0)'
+
+# WP-DDS-SECURITY-SECURE-DISCOVERY T4 (§8.5.1.10-.12): whole-RTPS-message protection (SRTPS) encode+decode
+# micro-bench of a representative datagram submessage stream (SIGN + ENCRYPT); ns/op + GC bytes/op. T4
+# BASELINE (T10 re-measures the integrated path). SBCL is the record (Clasp bytes-consed=0, NFR-PORT).
+# Writes bench/report/2026-06-27-wp-secure-discovery-t4.md.
+bench-rtps-message:
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(with-open-file (s "bench/report/2026-06-27-wp-secure-discovery-t4.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-message-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
+	        --eval '(uiop:quit 0)'
+
+bench-rtps-message-clasp:
+	$(CLASP) --eval '(ql:quickload :dds-tests :silent t)' \
+	         --eval '(with-open-file (s "bench/report/2026-06-27-wp-secure-discovery-t4-clasp.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-message-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
+	         --eval '(uiop:quit 0)'
+
+bench-rtps-protection:
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(with-open-file (s "bench/report/2026-06-28-wp-secure-discovery-t10.md" :direction :output :if-exists :supersede :if-does-not-exist :create) (uiop:symbol-call :dds.tests :run-rtps-protection-bench :iters $(RTPSITERS) :size $(RTPSSIZE) :stream s))' \
 	        --eval '(uiop:quit 0)'
 
 # WP-SHMEM Task F1 (FR-XPORT-2): REAL two-OS-process cross-process SHMEM round-trip.

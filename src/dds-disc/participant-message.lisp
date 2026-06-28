@@ -99,18 +99,28 @@
    AUTOMATIC/MANUAL lease among the writers — which holds for the default leases (the
    harness re-announces well inside any practical lease). A finer per-lease assertion
    timer (one timer per distinct lease duration) is a noted refinement; it is not needed
-   while the cadence already beats the lease."
-  (let ((kinds (%local-liveliness-kinds node)))
-    (when kinds
-      (dolist (p (%discovered-participants node))
-        (let ((loc (dds.rtps.discovery:usable-udpv4-locator
-                    (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))))
-          (when loc
-            (let ((host (dds.rtps.discovery:locator-ipv4-string loc))
-                  (port (%locator-port (dds.rtps.discovery:locator-port loc))))
-              (when (plusp port)
-                (dolist (kind kinds)
-                  (%send-pm-assertion node kind host port)))))))))
+   while the cadence already beats the lease.
+
+   T11 (DDS-Security 1.1 §8.4.1.6): when this participant protects liveliness
+   (%secure-pm-active-p — governance liveliness_protection_kind != NONE) EVERY assertion
+   instead rides the secure BuiltinParticipantMessageSecureWriter (0xff0200c2),
+   submessage-protected, to the :authenticated peers ONLY (%announce-secure-liveliness),
+   and the plain WLP below is SUPPRESSED — a confidential liveliness assertion must never
+   ride plain (mirrors the secure SEDP off-plain partition). NONE (the default) keeps the
+   plain WLP path, byte-identical."
+  (if (%secure-pm-active-p node)
+      (%announce-secure-liveliness node)   ; T11: secure WLP over 0xff0200 (off plain); no-op until a peer is :keyed
+      (let ((kinds (%local-liveliness-kinds node)))
+        (when kinds
+          (dolist (p (%discovered-participants node))
+            (let ((loc (dds.rtps.discovery:usable-udpv4-locator
+                        (dds.rtps.discovery:spdp-data-metatraffic-unicast-locators p))))
+              (when loc
+                (let ((host (dds.rtps.discovery:locator-ipv4-string loc))
+                      (port (%locator-port (dds.rtps.discovery:locator-port loc))))
+                  (when (plusp port)
+                    (dolist (kind kinds)
+                      (%send-pm-assertion node kind host port))))))))))
   t)
 
 (defun* %on-participant-message (node prefix wtr sn buf poff plen)

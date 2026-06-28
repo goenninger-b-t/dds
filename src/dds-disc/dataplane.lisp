@@ -87,10 +87,48 @@
     (ignore-errors (funcall *sender-emit-error-hook* condition :shmem-send-fault n))
     n))
 
-(defun* %send-raw-buf (node buf len host port &optional shmem-dest)
-    (function (disc-node dds.core.buffer:octet-buffer (integer 0) string (unsigned-byte 16) &optional t) t)
+(defun* %maybe-wrap-srtps (node buf len dest-prefix)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0) (simple-array (unsigned-byte 8) (12)))
+              (or null (integer 0)))
+  "T10 whole-RTPS-message protection (DDS-Security 1.1 §8.5.1.10-.12 / §9.4.1.2.3) SEND-side engagement. If
+   rtps_protection is in effect for DEST-PREFIX — the node's RTPS-PROTECTION-ENCODE resolver (installed cross-layer
+   by the crypto-manager) returns the LOCAL ParticipantCrypto KeyMaterial for a :keyed destination under a non-NONE
+   governance rtps_protection_kind — WRAP BUF's post-RTPS-header submessage stream (octets [20,LEN)) as
+   SRTPS_PREFIX ‖ SEC_BODY ‖ SRTPS_POSTFIX via encode-rtps-message (keyed by that KM per the resolver's KIND;
+   :receivers = the destination's ParticipantCrypto receiver descriptor for the *_WITH_ORIGIN_AUTHENTICATION tier,
+   §9.5.3.3.4.3), overwrite [20,…) IN PLACE in BUF (reusing the thread's own scratch — the wrapped stream is at most
+   ~56 octets larger and BUF has datagram-budget headroom; capacity-guarded), and return the new datagram length
+   (the 20-octet RTPS Header at [0,20) is kept verbatim — the transform protects only the submessage stream).
+   Returns LEN UNCHANGED when no wrap applies: no resolver installed (security OFF), or the resolver returns NIL
+   (the dest is not :keyed / rtps_protection NONE) -> plain, BYTE-IDENTICAL. Returns NIL (the caller DROPS,
+   fail-closed; NFR-SEC-POSTURE) only when a wrap WAS required but encode-rtps-message failed or the result would
+   not fit BUF — never emits an unprotected datagram to a keyed peer. The in-place overwrite reuses BUF, so the
+   steady-state datagram needs no fresh message-sized buffer; the residual per-datagram heap is the plain-region
+   copy + encode-rtps-message's own →octets return + the AEAD intermediates (the inherited T4 carry, off the gated
+   CDR hot path — see bench/report)."
+  (let ((enc (disc-node-rtps-protection-encode node)))
+    (if (or (null enc) (<= len 20))
+        len                                            ; no protection installed / header-only -> plain (byte-identical)
+        (multiple-value-bind (km kind receivers) (funcall enc dest-prefix)
+          (if (null km)
+              len                                      ; dest not :keyed / rtps_protection NONE -> plain
+              (let* ((vec   (dds.core.buffer:octet-buffer-vec buf))
+                     (plain (subseq vec 20 len))       ; the submessage stream to protect (T4 →octets input)
+                     (srtps (dds.security:encode-rtps-message km kind plain :receivers receivers)))
+                (if (and srtps (<= (+ 20 (length srtps)) (dds.core.buffer:octet-buffer-capacity buf)))
+                    (progn (replace vec srtps :start1 20) (+ 20 (length srtps)))   ; in-place wrap; header kept
+                    nil)))))))                          ; required but failed/won't fit -> fail-closed drop
+
+(defun* %send-raw-buf (node buf len host port &optional shmem-dest dest-prefix)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0) string (unsigned-byte 16)
+               &optional t (or null (simple-array (unsigned-byte 8) (12)))) t)
   "Send the first LEN octets of BUF (a complete RTPS message) as ONE datagram — the raw one-datagram send
-   shared by %SEND-MSG-BUF and the %SEND-PACKED coalescer (one dds.xport:send = one sendto). When
+   shared by %SEND-MSG-BUF and the %SEND-PACKED coalescer (one dds.xport:send = one sendto). DEST-PREFIX
+   (default NIL), the 12-octet destination GUID-prefix on the USER-DATA path, engages T10 whole-RTPS-message
+   protection: when the dest is :keyed under a non-NONE governance rtps_protection_kind, %MAYBE-WRAP-SRTPS wraps
+   the post-header submessage stream IN PLACE (SRTPS_PREFIX‖SEC_BODY‖SRTPS_POSTFIX) BEFORE *DATAGRAM-SINK* + the
+   send, so the wire (and the sink) carries the SRTPS sandwich; a required-but-failed wrap DROPS (fail-closed).
+   NIL DEST-PREFIX (every discovery/HB/ACKNACK/bootstrap caller) keeps the plain path, byte-identical. When
    SHMEM-DEST (a dds.xport.shmem:shmem-locator) is supplied, the datagram goes over SHARED MEMORY to that
    same-host peer (FR-XPORT-2); if the SHMEM send returns 0 (lane full / claim fail) it FALLS BACK to the
    UDP send to HOST:PORT (no loss, no double-delivery — exactly one of the two carries it). A SIGNALED hard
@@ -100,6 +138,10 @@
    on a SIGNAL; a benign return-0 lane-full takes the silent UDP fallback with no counter/hook). With SHMEM-DEST
    NIL (every discovery/HB/ACKNACK caller, and every cross-host data send) the path is the original UDP send,
    byte-for-byte unchanged. Hands a copy to *DATAGRAM-SINK* first when that test hook is bound."
+  (when dest-prefix   ; T10: engage whole-RTPS-message protection for a :keyed dest (wrap in place; BEFORE the sink)
+    (let ((wrapped-len (%maybe-wrap-srtps node buf len dest-prefix)))
+      (when (null wrapped-len) (return-from %send-raw-buf nil))   ; required wrap failed -> fail-closed drop
+      (setf len wrapped-len)))
   (when *datagram-sink*
     (funcall *datagram-sink* (subseq (dds.core.buffer:octet-buffer-vec buf) 0 len)))
   (when *debug-emit-fault*
@@ -117,14 +159,18 @@
                   (dds.xport.udp:make-udp-locator :host host :port port)
                   buf 0 len))
 
-(defun* %send-msg-buf (node buf build-fn host port)
-    (function (disc-node dds.core.buffer:octet-buffer function string (unsigned-byte 16)) t)
+(defun* %send-msg-buf (node buf build-fn host port &optional dest-prefix)
+    (function (disc-node dds.core.buffer:octet-buffer function string (unsigned-byte 16)
+               &optional (or null (simple-array (unsigned-byte 8) (12)))) t)
   "Build an RTPS message (Header + whatever BUILD-FN writes on the cursor) into BUF
-   and send it to HOST:PORT. BUF selects the thread's scratch message buffer."
+   and send it to HOST:PORT. BUF selects the thread's scratch message buffer. DEST-PREFIX
+   (default NIL) is the 12-octet destination GUID-prefix on the USER-DATA path; non-NIL engages
+   T10 whole-RTPS-message protection at %send-raw-buf when that dest is :keyed (NIL = plain,
+   byte-identical — every builtin/discovery/bootstrap caller leaves it NIL)."
   (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
     (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
     (funcall build-fn mc)
-    (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port)))
+    (%send-raw-buf node buf (dds.core.buffer:cursor-position mc) host port nil dest-prefix)))
 
 (defparameter *coalesce-datagram-budget* 1400
   "Soft upper bound (octets) on a coalesced RTPS datagram built by %SEND-PACKED. Default 1400 keeps the
@@ -361,24 +407,40 @@
   (let ((r (first (disc-node-local-readers node))))
     (if r (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos r)) :volatile)))
 
-(defun* %match-destinations (node want-readers)
+(defun* %match-destinations-prefixed (node want-readers)
     (function (disc-node t) list)
-  "User-traffic (host . port) destinations gated on MATCHING: the union of static
-   PEERS and the participants holding a matched remote endpoint of the wanted kind —
-   readers (WANT-READERS t) for a writer's DATA/HEARTBEAT, writers (nil) for a
-   reader's ACKNACK. RxO-incompatible / topic-mismatched peers never match, so they
-   receive nothing (FR-QOS-2: RxO now blocks delivery, not just the match)."
-  (let ((dests (copy-list (disc-node-peers node)))
+  "User-traffic destinations gated on MATCHING, each a (DEST-PREFIX . (HOST . PORT)) cons: the union of the
+   participants holding a matched remote endpoint of the wanted kind — readers (WANT-READERS t) for a writer's
+   DATA/HEARTBEAT, writers (nil) for a reader's ACKNACK — plus the static PEERS. DEST-PREFIX is the matched
+   participant's 12-octet GUID-prefix (RTPS 2.5 §9.4.4) for a discovered match, NIL for a static PEERS bootstrap
+   entry. A matched (prefix-bearing) entry takes precedence over a static one at the SAME (HOST . PORT), so a
+   :keyed participant's user-data sends engage T10 whole-RTPS-message protection (DEST-PREFIX threads to
+   %send-raw-buf -> %maybe-wrap-srtps). RxO-incompatible / topic-mismatched peers never match, so they receive
+   nothing (FR-QOS-2). The (host . port) SET is identical to the pre-T10 plain helper (only the per-dest prefix
+   is added); %match-destinations is the prefix-stripped projection (DRY)."
+  (let ((dests '())
         (parts (%discovered-participants node)))
-    (dolist (remote (%matched-endpoints node) dests)
+    (dolist (remote (%matched-endpoints node))
       (let ((guid (dds.rtps.discovery:endpoint-data-guid remote)))
         (when (if want-readers (%reader-guid-p guid) (%writer-guid-p guid))
           (let ((spdp (find (subseq guid 0 12) parts
                             :key #'dds.rtps.discovery:spdp-data-guid-prefix :test #'equalp)))
             (when spdp
               (let ((hp (%usable-destination spdp)))
-                (when (and hp (plusp (cdr hp)))
-                  (pushnew hp dests :test #'equal))))))))))
+                (when (and hp (plusp (cdr hp)) (not (member hp dests :key #'cdr :test #'equal)))
+                  (push (cons (subseq guid 0 12) hp) dests))))))))   ; matched: prefix-bearing
+    (dolist (peer (disc-node-peers node))   ; static PEERS not already covered by a matched (host . port)
+      (unless (member peer dests :key #'cdr :test #'equal)
+        (push (cons nil peer) dests)))
+    (nreverse dests)))
+
+(defun* %match-destinations (node want-readers)
+    (function (disc-node t) list)
+  "The prefix-stripped (host . port) projection of %match-destinations-prefixed (DRY) — the union of static
+   PEERS and the participants holding a matched remote endpoint of the wanted kind (readers for a writer's
+   DATA/HEARTBEAT, writers for a reader's ACKNACK). RxO-incompatible / topic-mismatched peers never match
+   (FR-QOS-2). For a send that should engage T10 whole-RTPS-message protection, use the prefixed variant."
+  (mapcar #'cdr (%match-destinations-prefixed node want-readers)))
 
 (defparameter *debug-drop-fragment-numbers* nil
   "Debug-only fragment-loss injection (default NIL = off): a list of 1-based fragment
@@ -535,8 +597,9 @@
                                       shmem-dest))))
       (nconc (nreverse frag-plans) packed))))
 
-(defun* %emit-next-datagram (node buf state)
-    (function (disc-node dds.core.buffer:octet-buffer list) (values (integer 0) t list))
+(defun* %emit-next-datagram (node buf state &optional dest-prefix)
+    (function (disc-node dds.core.buffer:octet-buffer list
+               &optional (or null (simple-array (unsigned-byte 8) (12)))) (values (integer 0) t list))
   "The per-datagram STEP (WP-ASYNC-FLOW core, FR-PF-2): build the NEXT single datagram of STATE into BUF and
    send it, returning (values BYTES-SENT MORE-REMAIN-P NEW-STATE). STATE is a list of (BUILD-THUNK . SHMEM-DEST)
    plan entries with the destination (HOST . PORT) consed on its head — i.e. ((HOST . PORT) . PLAN); NEW-STATE
@@ -551,11 +614,12 @@
         (values 0 nil state)
         (let* ((entry (car plan))
                (len (funcall (car entry) buf)))
-          (%send-raw-buf node buf len (car dest) (cdr dest) (cdr entry))
+          (%send-raw-buf node buf len (car dest) (cdr dest) (cdr entry) dest-prefix)
           (values len (and (cdr plan) t) (cons dest (cdr plan)))))))
 
-(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest (zc-readers 0))
-    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons) &optional t (integer 0)) t)
+(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest (zc-readers 0) dest-prefix)
+    (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons)
+               &optional t (integer 0) (or null (simple-array (unsigned-byte 8) (12)))) t)
   "Send CHANGES (+ optional trailing HEARTBEAT item HB, a (SIZE . BUILD-FN)) to HOST:PORT, coalescing the
    small ones into as few datagrams as fit the budget: this is now the per-datagram STEP run to completion —
    build the %changes-datagram-plan once, then %emit-next-datagram in a loop until no datagram remains. The
@@ -572,7 +636,7 @@
   (let ((state (cons (cons host port)
                      (%changes-datagram-plan node buf changes hb shmem-dest zc-readers))))
     (loop while (cdr state)   ; (cdr state) = the remaining datagram plan; NIL when exhausted
-          do (setf state (nth-value 2 (%emit-next-datagram node buf state))))
+          do (setf state (nth-value 2 (%emit-next-datagram node buf state dest-prefix))))   ; T10: wrap to a keyed dest
     t))
 
 (defun* %send-sample (node buf sn pl host port)
@@ -586,31 +650,35 @@
   (dolist (thunk (%sample-plan node sn pl (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
     (%send-raw-buf node buf (funcall thunk buf) host port)))
 
-(defun* %send-user-heartbeat (node buf first last count host port)
-    (function (disc-node dds.core.buffer:octet-buffer integer integer integer string (unsigned-byte 16)) t)
+(defun* %send-user-heartbeat (node buf first last count host port &optional dest-prefix)
+    (function (disc-node dds.core.buffer:octet-buffer integer integer integer string (unsigned-byte 16)
+               &optional (or null (simple-array (unsigned-byte 8) (12)))) t)
   "Send one NON-FINAL user-writer HEARTBEAT (FIRST,LAST,COUNT) to HOST:PORT (RTPS 2.5 §8.3.7.5;
    readerId = ENTITYID_UNKNOWN, FinalFlag NOT_SET per the Reliable StatefulWriter T7 transition §8.4.9.2.7),
-   prompting the reader to ACKNACK. BUF selects the thread's scratch message buffer."
+   prompting the reader to ACKNACK. BUF selects the thread's scratch message buffer. DEST-PREFIX (default NIL,
+   the 12-octet dest GUID-prefix) engages T10 whole-RTPS-message protection when that dest is :keyed."
   (%send-msg-buf node buf
                  (lambda (mc)
                    (dds.rtps.message:write-heartbeat
                     mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) first last count :final nil))
-                 host port))
+                 host port dest-prefix))
 
-(defun* %send-user-gap (node buf reader-id gap-sns host port)
-    (function (disc-node dds.core.buffer:octet-buffer (unsigned-byte 32) cons string (unsigned-byte 16)) t)
+(defun* %send-user-gap (node buf reader-id gap-sns host port &optional dest-prefix)
+    (function (disc-node dds.core.buffer:octet-buffer (unsigned-byte 32) cons string (unsigned-byte 16)
+               &optional (or null (simple-array (unsigned-byte 8) (12)))) t)
   "Send ONE GAP to HOST:PORT declaring every SN in the non-empty GAP-SNS list irrelevant (RTPS 2.5 §8.3.7.4 /
    §9.4.5.6): readerId = the NACKing reader's EntityId READER-ID, writerId = this user writer's EntityId. The
    SequenceNumberSet is built by seqnum-set-from-sns (shared MSB-first layout) and gapStart = its base, so the
    [gapStart, base) contiguous-prefix range is empty and the set is EXACTLY the bitmapped SNs. The gap SNs all
    came from ONE inbound ACKNACK's SequenceNumberSet, so they fit one 256-SN window. BUF selects the thread's
-   scratch message buffer; mirrors %send-user-heartbeat (single-submessage send via %send-msg-buf)."
+   scratch message buffer; mirrors %send-user-heartbeat (single-submessage send via %send-msg-buf). DEST-PREFIX
+   (default NIL, the 12-octet dest GUID-prefix) engages T10 whole-RTPS-message protection when that dest is :keyed."
   (multiple-value-bind (base numbits bitmap) (dds.rtps.message:seqnum-set-from-sns gap-sns)
     (%send-msg-buf node buf
                    (lambda (mc)
                      (dds.rtps.message:write-gap
                       mc reader-id (disc-node-user-writer-id node) base base numbits bitmap))
-                   host port)))
+                   host port dest-prefix)))
 
 (defun* %reader-push-targets (node)
     (function (disc-node) list)
@@ -676,6 +744,18 @@
   (let ((k (first (cdr group))))   ; a 16-octet GUID for a real matched reader; a u32 reader-id for the PEERS fallback
     (when (typep k '(simple-array (unsigned-byte 8) (16)))
       (%shmem-dest node (subseq k 0 12)))))
+
+(defun* %group-dest-prefix (group)
+    (function (cons) (or null (simple-array (unsigned-byte 8) (12))))
+  "The 12-octet remote participant GUID-prefix of a %reader-push-targets GROUP (the first 12 octets of any
+   matched-reader GUID at that destination — every reader in one group shares a unicast (host . port), hence one
+   participant prefix; RTPS 2.5 §9.3.1.2 / §8.3.5.4), or NIL for the discovery-less PEERS fallback group (whose
+   key is this node's own reader-id, not a remote GUID). Drives T10 whole-RTPS-message protection: a non-NIL
+   prefix lets the user-data send wrap its datagrams when that participant is :keyed (NIL -> plain). Mirrors
+   %group-shmem-dest's prefix resolution; allocates the prefix once per push group (off the per-sample hot path)."
+  (let ((k (first (cdr group))))   ; a 16-octet GUID for a real matched reader; a u32 reader-id for the PEERS fallback
+    (when (typep k '(simple-array (unsigned-byte 8) (16)))
+      (subseq k 0 12))))
 
 (defun* %reader-zc-capable-p (node reader-guid)
     (function (disc-node (simple-array (unsigned-byte 8) (16))) t)
@@ -764,7 +844,8 @@
                               (%merge-unsent writer (cdr group)) (caar group) (cdar group)
                               (%heartbeat-builder node first last count)
                               (%group-shmem-dest node group)
-                              (%zc-readers node (cdr group)))))))
+                              (%zc-readers node (cdr group))
+                              (%group-dest-prefix group))))))   ; T10: wrap user data to a :keyed destination
 
 (defun* %push-data (node)
     (function (disc-node) t)
@@ -786,27 +867,30 @@
         (plan '()))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (dolist (group (%reader-push-targets node))
-        (let ((dest (car group)))
+        (let ((dest (car group)) (dp (%group-dest-prefix group)))   ; T10: the group's :keyed-dest prefix | nil
           (dolist (entry (%changes-datagram-plan node buf (%merge-unsent writer (cdr group))
                                                   (%heartbeat-builder node first last count)
                                                   (%group-shmem-dest node group)
                                                   (%zc-readers node (cdr group))))
-            (push (cons dest entry) plan)))))   ; ((host . port) . (thunk . shmem-dest))
+            (push (cons dest (cons dp entry)) plan)))))   ; ((host . port) DEST-PREFIX BUILD-THUNK . SHMEM-DEST)
     (nreverse plan)))
 
 (defun* %emit-plan-entry (node buf entry &optional before-send)
     (function (disc-node dds.core.buffer:octet-buffer cons &optional (or null function)) (integer 0))
-  "Build ONE node-plan ENTRY — a ((HOST . PORT) BUILD-THUNK . SHMEM-DEST) from %node-datagram-plan — into BUF
-   (the thunk writes the datagram and returns its octet length) and send it, returning the length. The
+  "Build ONE node-plan ENTRY — a ((HOST . PORT) DEST-PREFIX BUILD-THUNK . SHMEM-DEST) from %node-datagram-plan —
+   into BUF (the thunk writes the datagram and returns its octet length) and send it, returning the length. The
    build-then-send SEAM for the Phase-C FlowController scheduler: BEFORE-SEND, when supplied, is called with
    the just-built datagram's LENGTH AFTER the build but BEFORE the %send-raw-buf — so the scheduler interposes
    its token acquire(length) there (build → acquire → send), the built datagram simply held in BUF across any
    deficit wait, never rebuilt. This is the single place that knows the entry cons-shape (DRY): %flow-step-emit
-   passes no BEFORE-SEND (build+send); the scheduler passes its acquire hook."
-  (let* ((dest (car entry)) (thunk (cadr entry)) (shmem-dest (cddr entry))
+   passes no BEFORE-SEND (build+send); the scheduler passes its acquire hook. DEST-PREFIX threads to %send-raw-buf
+   for T10 whole-RTPS-message protection (the datagram is wrapped when that dest is :keyed; NIL -> plain). The
+   token cost is the PLAIN built length; the ~56-octet SRTPS overhead is not separately token-charged (a benign
+   soft-pacing under-charge, off the wire-correctness path)."
+  (let* ((dest (car entry)) (dest-prefix (cadr entry)) (thunk (caddr entry)) (shmem-dest (cdddr entry))
          (len (funcall thunk buf)))
     (when before-send (funcall before-send len))
-    (%send-raw-buf node buf len (car dest) (cdr dest) shmem-dest)
+    (%send-raw-buf node buf len (car dest) (cdr dest) shmem-dest dest-prefix)
     len))
 
 (defun* %flow-step-emit (node buf)
@@ -844,8 +928,8 @@
     (when w
       (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)
         (when (>= last first)
-          (dolist (peer (%match-destinations node t))
-            (%send-user-heartbeat node (disc-node-tx-msg node) first last count (car peer) (cdr peer)))))))
+          (dolist (pd (%match-destinations-prefixed node t))   ; (DEST-PREFIX . (host . port)); T10 wraps a :keyed dest
+            (%send-user-heartbeat node (disc-node-tx-msg node) first last count (cadr pd) (cddr pd) (car pd)))))))
   t)
 
 (defun* %writer-durability-init (node reader-guid reader-durability)
@@ -876,10 +960,11 @@
           (when (and tl-tl (>= last first))              ; retained history exists -> prompt a NACK
             (let* ((prefix (subseq reader-guid 0 12))
                    (dest (%prefix-user-destination node prefix))
-                   (peers (if dest (list dest) (%match-destinations node t))))   ; rx-thread-safe fan-out fallback
-              (dolist (peer peers)
+                   ;; (DEST-PREFIX . (host . port)) entries (T10): the resolved reader's prefix, or the prefixed fan-out
+                   (peers (if dest (list (cons prefix dest)) (%match-destinations-prefixed node t))))
+              (dolist (pd peers)
                 (%send-user-heartbeat node (disc-node-rx-tx-msg node) first last count
-                                      (car peer) (cdr peer)))))))))
+                                      (cadr pd) (cddr pd) (car pd))))))))) ; T10: wrap the prompt HB to a :keyed reader
   t)
 
 (defun* %reader-durability-init (node writer-guid writer-durability)
@@ -1492,14 +1577,14 @@
         (dds.rtps.reliable:reader-on-heartbeat reader wguid first last)
         (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
           (let ((cnt (incf (disc-node-ack-count node))))
-            (dolist (peer (%match-destinations node nil))   ; ACKNACK -> matched writers
+            (dolist (pd (%match-destinations-prefixed node nil))   ; ACKNACK -> matched writers; T10 wraps a :keyed dest
               (%send-msg-buf node (disc-node-rx-tx-msg node)
                              (lambda (mc)
                                ;; writerEntityId = the REMOTE writer's id (WID), so the peer
                                ;; routes the ACKNACK to its writer (not our local convention).
                                (dds.rtps.message:write-acknack
                                 mc (disc-node-user-reader-id node) wid base numbits bitmap cnt :final t))
-                             (car peer) (cdr peer))))))))
+                             (cadr pd) (cddr pd) (car pd))))))))
   t)
 
 (defun* %on-user-gap (node c flags src-prefix)
@@ -1544,10 +1629,12 @@
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
                                                (%source-guid src-prefix rid) base numbits bitmap)
         (let* ((dest (%prefix-user-destination node src-prefix))
-               (peers (if dest (list dest) (%match-destinations node t))))
-          (dolist (peer peers)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
-            (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil)
-            (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer)))))
+               ;; (DEST-PREFIX . (host . port)) (T10): the NACKing reader's prefix (src-prefix), or the prefixed fan-out
+               (peers (if dest (list (cons src-prefix dest)) (%match-destinations-prefixed node t))))
+          (dolist (pd peers)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
+            (let ((peer (cdr pd)))
+              (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil 0 (car pd))
+              (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) (car pd))))))
         ;; the ACKNACK advanced this reader's acked-base -> purge HistoryCache changes ALL matched readers
         ;; have now acknowledged (RTPS 2.5 §8.4.1), bounding the KEEP_ALL writer history. NACKed (resent)
         ;; changes are not fully acked, so they are never purged. A TRANSIENT_LOCAL writer (DDS 1.4
@@ -1586,11 +1673,11 @@
           (dds.rtps.reliable:reader-frag-acknack (disc-node-user-reader node) (%source-guid src-prefix wid) sn)
         (when base
           (let ((cnt (incf (disc-node-ack-count node))))
-            (dolist (peer (%match-destinations node nil))
+            (dolist (pd (%match-destinations-prefixed node nil))   ; T10: wrap the NACK_FRAG to a :keyed writer
               (%send-msg-buf node (disc-node-rx-tx-msg node)
                              (lambda (mc) (dds.rtps.message:write-nack-frag
                                            mc (disc-node-user-reader-id node) wid sn base numbits bitmap cnt))
-                             (car peer) (cdr peer))))))))
+                             (cadr pd) (cddr pd) (car pd))))))))
   t)
 
 (defun* %on-user-nack-frag (node c flags)
@@ -1603,14 +1690,14 @@
             (pl (dds.rtps.reliable:writer-sample-payload (disc-node-user-writer node) sn)))
         (when (and descs pl)
           (let ((size (length pl)))
-            (dolist (peer (%match-destinations node t))
+            (dolist (pd (%match-destinations-prefixed node t))   ; T10: wrap the DATA_FRAG retransmit to a :keyed reader
               (dolist (desc descs)
                 (destructuring-bind (fstart fcount off len) desc
                   (%send-msg-buf node (disc-node-rx-tx-msg node)
                                  (lambda (mc) (dds.rtps.message:write-data-frag
                                                mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn size
                                                fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
-                                 (car peer) (cdr peer)))))))))
+                                 (cadr pd) (cddr pd) (car pd)))))))))
     t))
 
 (defun* enable-publisher (node &key max-samples (max-blocking-ns nil)

@@ -41,8 +41,7 @@
               (unless perms-list
                 (dds.dare:x509-ca-free ca-store)
                 (return-from validate nil))
-              (let ((perms (find local-subject perms-list
-                                 :key #'permissions-subject-name :test #'string=)))
+              (let ((perms (permissions-grant-for local-subject perms-list)))
                 (unless perms
                   (dds.dare:x509-ca-free ca-store)
                   (return-from validate nil))
@@ -69,8 +68,7 @@
       (unless content (return-from validate-remote nil))
       (let ((perms-list (parse-permissions content)))
         (unless perms-list (return-from validate-remote nil))
-        (let ((perms (find remote-subject perms-list
-                           :key #'permissions-subject-name :test #'string=)))
+        (let ((perms (permissions-grant-for remote-subject perms-list)))
           (unless perms (return-from validate-remote nil))
           perms)))))
 

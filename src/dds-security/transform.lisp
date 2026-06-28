@@ -69,6 +69,55 @@
     (dds.core.buffer:put-octets cur iv-suffix 0 +init-vector-suffix-len+)
     hdr))
 
+;;; --- shared session-key + nonce + AES-GCM core (DRY across all §9.5.3.3 protection tiers) ---
+;;; The AAD is a PARAMETER so each tier composes its own authenticated-but-not-encrypted region:
+;;;   * serialized-payload (Slice 1, here): AAD = the 20-byte SecureDataHeader (§9.5.3.3.4.4).
+;;;   * submessage protection (Slice 4 T2, crypto/submessage.lisp): AAD = empty (ENCRYPT) or the
+;;;     plaintext submessage (SIGN/GMAC) — Fast-DDS-faithful (the operating contract §4: the wire is
+;;;     the oracle; corroborated against eProsima Fast DDS AESGCMGMAC_Transform.cpp, see provenance).
+;;; The CryptoHeader is NEVER folded in here; the caller decides the AAD. session_id + iv_suffix
+;;; together form the 12-byte nonce — uniqueness is the caller's responsibility (%km-next-iv-suffix).
+
+(defun* %km-nonce (session-id iv-suffix)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (12)))
+  "Build the 12-byte AES-GCM nonce = session_id(4) ∥ iv_suffix(8) (§9.5.3.3.4.3; NIST SP 800-38D
+   §8.2.1). SESSION-ID must be 4 octets and IV-SUFFIX 8 (caller precondition)."
+  (let ((nonce (make-array 12 :element-type '(unsigned-byte 8))))
+    (replace nonce session-id :start1 0 :end1 4)
+    (replace nonce iv-suffix  :start1 4 :end1 12)
+    nonce))
+
+(defun* %seal-with-km (km session-id iv-suffix aad plaintext)
+    (function (key-material
+               (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (values (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))))
+  "Shared AES-256-GCM seal: derive the session key from KM (derive-session-key over
+   master_sender_key, master_salt, SESSION-ID; §9.5.3.3.4.2), build the nonce from
+   SESSION-ID∥IV-SUFFIX, and seal PLAINTEXT authenticating AAD. Returns (values CIPHERTEXT TAG).
+   AAD is a PARAMETER (see the section note above) — empty PLAINTEXT yields a pure GMAC tag over AAD."
+  (dds.dare:aes-256-gcm-seal (derive-session-key (key-material-master-sender-key km)
+                                                 (key-material-master-salt km)
+                                                 session-id)
+                             (%km-nonce session-id iv-suffix)
+                             aad plaintext))
+
+(defun* %open-with-km (km session-id iv-suffix aad ciphertext tag)
+    (function (key-material
+               (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              (or (simple-array (unsigned-byte 8) (*)) null))
+  "Shared AES-256-GCM open: derive the same session key + nonce as %SEAL-WITH-KM and open
+   CIPHERTEXT/TAG authenticating AAD. Returns the plaintext, or NIL on any GCM authentication
+   failure (fail-closed; NIST SP 800-38D §8.3). AAD is a PARAMETER (see the section note above)."
+  (dds.dare:aes-256-gcm-open (derive-session-key (key-material-master-sender-key km)
+                                                 (key-material-master-salt km)
+                                                 session-id)
+                             (%km-nonce session-id iv-suffix)
+                             aad ciphertext tag))
+
 (defun* encode-serialized-payload (km plaintext)
     (function (key-material (simple-array (unsigned-byte 8) (*)))
               (simple-array (unsigned-byte 8) (*)))
@@ -87,16 +136,11 @@
          (session-id (copy-seq +fixed-session-id+))
          (kind       (key-material-transformation-kind km))
          (key-id     (key-material-sender-key-id km))
-         (skey       (derive-session-key (key-material-master-sender-key km)
-                                         (key-material-master-salt km)
-                                         session-id))
-         (aad        (%assemble-header-aad kind key-id session-id iv-suffix))
-         ;; nonce = session_id(4) ∥ iv_suffix(8), exactly 12 bytes (NIST SP 800-38D §8.2.1)
-         (nonce      (make-array 12 :element-type '(unsigned-byte 8))))
-    (replace nonce session-id :start1 0 :end1 4)
-    (replace nonce iv-suffix  :start1 4 :end1 12)
+         ;; serialized-payload AAD = the exact 20-byte SecureDataHeader (§9.5.3.3.4.4); the shared
+         ;; %seal-with-km derives the session key + nonce (DRY with the submessage tier).
+         (aad        (%assemble-header-aad kind key-id session-id iv-suffix)))
     (multiple-value-bind (ciphertext tag)
-        (dds.dare:aes-256-gcm-seal skey nonce aad plaintext)
+        (%seal-with-km km session-id iv-suffix aad plaintext)
       (serialize-secured-payload kind key-id session-id iv-suffix ciphertext tag))))
 
 (defun* decode-serialized-payload (km secured-octets)
@@ -119,13 +163,10 @@
   (handler-case
       (multiple-value-bind (kind key-id session-id iv-suffix ciphertext tag)
           (parse-secured-payload secured-octets)
-        (let* ((aad   (%assemble-header-aad kind key-id session-id iv-suffix))
-               (skey  (derive-session-key (key-material-master-sender-key km)
-                                          (key-material-master-salt km)
-                                          session-id))
-               (nonce (make-array 12 :element-type '(unsigned-byte 8))))
-          (replace nonce session-id :start1 0 :end1 4)
-          (replace nonce iv-suffix  :start1 4 :end1 12)
-          (dds.dare:aes-256-gcm-open skey nonce aad ciphertext tag)))
+        ;; AAD = the WIRE-PARSED 20-byte SecureDataHeader (§9.5.3.3.4.5); the shared %open-with-km
+        ;; re-derives the session key + nonce. Tampering any header byte changes the AAD -> GCM fail.
+        (%open-with-km km session-id iv-suffix
+                       (%assemble-header-aad kind key-id session-id iv-suffix)
+                       ciphertext tag))
     ;; Any condition (malformed blob, constraint, etc.) -> NIL (fail-closed).
     (error () nil)))
