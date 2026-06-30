@@ -104,6 +104,12 @@
            #:disc-node-rtps-protection-origin-auth
            #:disc-node-rtps-protection-encode
            #:disc-node-rtps-protection-decode
+           ;; Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP): USER-DATA submessage protection (metadata_protection)
+           #:disc-node-user-submessage-protection-kind
+           #:disc-node-user-submessage-encode
+           #:disc-node-user-submessage-decode
+           #:run-user-submessage-protection-test
+           #:run-user-submessage-data-protection-test
            #:run-secure-sedp-roundtrip-test
            #:run-secure-sedp-sign-roundtrip-test
            #:run-secure-sedp-origin-auth-roundtrip-test
@@ -111,6 +117,7 @@
            #:run-rtps-protection-test
            #:run-rtps-protection-enforce-test
            #:run-rtps-protection-enforce-reliability-test
+           #:run-rtps-protection-enforce-user-bracket-test
            ;; WP-DDS-SECURITY-AUTH-KEYX T4: auth extension points (DDS-Security 1.1 §7.3/7.4.3.2)
            #:disc-node-on-participant-discovered
            #:disc-node-auth-gate

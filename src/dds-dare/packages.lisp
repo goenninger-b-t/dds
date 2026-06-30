@@ -47,6 +47,7 @@
    #:x509-verify-chain
    #:x509-public-key
    #:x509-subject-name
+   #:x509-subject-name-sha256
    #:pkey-load-private
    #:pkey-free
    #:pkey-kind
@@ -59,7 +60,9 @@
    #:ecdsa-sign
    #:ecdsa-verify
    #:x509-to-der
+   #:x509-to-pem
    #:x509-load-cert-der
+   #:x509-load-cert-auto
    #:random-bytes
    ;; T2-fix: raw P-256 key import for KATs (EVP_PKEY_fromdata, OpenSSL 3.6.2)
    #:ec-p256-import-private

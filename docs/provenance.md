@@ -2373,3 +2373,685 @@ The DDS-Security 1.1 PDF could not be located in `docs/specs/` (only RTPS/DCPS/X
 sub-numbers are carried from the design/spike, every *value* dual-corroborated against Fast DDS + the tshark
 RTPS-security dissector (the propagate-byte fix's Slice-5 carry explicitly requires pinning the actual OMG
 clause for the on-wire Property layout).
+
+## WP-DDS-SECURITY-FASTDDS-INTEROP T0 — pin the §9.3.4 Property serialization (Slice 5, 2026-06-28)
+
+Slice-5 spike. Re-confirmed the live SECURITY=ON Fast DDS v3.6.1 peer (build intact from T12; runs) and
+reproduced the live baseline (ours↔Fast DDS, GOV=none, both directions: SPDP `discovered=2`, auth REJECT at
+the remote IdentityToken — `captures/ssd-none-{ours2fast,fast2ours}-ours.log`). **Pinned the conformant
+on-wire `Property`/`BinaryProperty` layout the T13 closeout flagged as the explicit Slice-5 carry.** Sources
+consulted for understanding only (clean-room; no code copied). **RTI Connext source NEVER read.**
+
+- **OMG (normative IDL, newly obtained)** — `dds_security_plugins_spis.idl` (DDS-SECURITY/20170901), fetched
+  from `https://www.omg.org/spec/DDS-SECURITY/20170901/dds_security_plugins_spis.idl`: `Property_t {string
+  name; string value; boolean propagate;}`, `BinaryProperty_t {string name; OctetSeq value; boolean
+  propagate;}`, `DataHolder {string class_id; @optional PropertySeq properties; @optional BinaryPropertySeq
+  binary_properties;}`. `propagate` is a **plain boolean with NO `@non-serialized` annotation** — the IDL-
+  literal reading (what our codec did) would emit it; the spec text + both implementations treat it as a
+  *local* flag, never serialized. This is the root-cause tension. (The DDS-Security 1.1 PDF is still absent
+  from `docs/specs/`; the IDL is the OMG-published normative artifact used in its place.)
+- **Fast DDS (Apache-2.0)** — NEW files/lines beyond the T12 `CDRMessage.cpp:828-906` entry:
+  - `include/fastdds/rtps/common/Property.hpp:174-191` `PropertyHelper::serialized_size` — `name`+`value`
+    sizes only `if (propagate())`, else `return 0`; no byte for `propagate`.
+  - `include/fastdds/rtps/common/BinaryProperty.hpp:172-189` `BinaryPropertyHelper::serialized_size` — same
+    (octet-seq value).
+  - `src/cpp/rtps/messages/CDRMessage.cpp:908-929` `addPropertySeq` — wire count = `number_to_serialize` =
+    count of `propagate==true` properties only.
+  - `src/cpp/rtps/messages/CDRMessage.cpp:602-638` `addOctetVector` — `add_final_padding` controls the
+    octet-seq trailing pad (the hash path passes `false`).
+  - `src/cpp/security/authentication/PKIDH.cpp:1396-1410` — hash_c1/c2 = `SHA256` over
+    `addBinaryPropertySeq(&msg, …, /*add_final_padding=*/false)` with **`msg.msg_endian = BIGEND`**:
+    confirms the challenge-hash input is the same no-`propagate` serialization, **Big-Endian** (so our
+    `handshake.lisp` BE endianness is already correct — only the propagate byte must drop).
+- **Eclipse Cyclone DDS (EPL-2.0, GitHub)** — `src/security/core/src/dds_security_serialize.c`
+  (`eclipse-cyclonedds/cyclonedds`, raw.githubusercontent.com): `DDS_Security_Serialize_Property` writes
+  `name`+`value` only; `DDS_Security_Serialize_BinaryProperty` writes `name`+`OctetSeq value` only — no
+  `propagate` field. Independent corroboration of the Fast DDS finding.
+
+Resolution PINNED (T1 consumes): EMIT `name`+`value` only (drop the 4-octet `propagate`+pad) at the 3 codec
+sites (`wire.lisp %cdr-binary-property-le`, `identity.lisp %cdr-property-le`, `handshake.lisp
+%cdr-binary-property-be`) + the matching decode skips + the token corpus regen; `keyexchange.lisp` inherits
+the fix via the shared `handshake-token->dataholder`. Decode-tolerance is NOT cleanly implementable (the
+trailing field is not self-describing) → match conformant on decode too, flag "verify Connext at 5b". Full
+analysis: `docs/superpowers/spikes/2026-06-28-dds-security-fastdds-interop.md`.
+
+## WP-DDS-SECURITY-FASTDDS-INTEROP T2 — the reply-blocker CHAIN (Slice 5, 2026-06-29)
+
+T1 dropped the propagate byte and the live handshake reached HANDSHAKING, but Fast DDS (the replier) sent
+no HandshakeReply. Diagnosed by (a) reading the Fast DDS replier path and (b) TEMPORARILY instrumenting the
+Fast DDS peer (clean-room; Apache-2.0 read only; **RTI Connext source NEVER read**): set
+`Log::SetVerbosity(Warning)` in `examples/cpp/security/main.cpp` (the example only does `Log::Reset()` →
+Error, suppressing every security warning) and added DIAG `EPROSIMA_LOG_WARNING`s in
+`SecurityManager::process_participant_stateless_message` (the SecurityManager.cpp DIAG edits were REVERTED
+after diagnosis; the one-line example SetVerbosity is kept as legitimate diagnostic config). This revealed a
+CHAIN of FOUR silent blockers, each masking the next (all on INFO/no-log paths):
+
+1. **PSM writer sequence number = 0** (RTPS layer). Our `%send-stateless-message` sent the DATA with
+   writerSN 0. `MessageReceiver.cpp:814` rejects `sequenceNumber <= 0` → "Invalid message received, bad
+   sequence Number" → the DATA is dropped before the security layer. RTPS 2.5 §8.3.5.4/§8.4.2: a valid
+   writerSN is >= 1. Fix: monotonic `psm-writer-sn` from 1 (`disc.lisp` + `stateless-message.lisp`).
+2. **`source_endpoint_key` != GUID_UNKNOWN** (PSM envelope). `SecurityManager.cpp:1506` DROPS the message
+   (INFO, compiled out) unless `source_endpoint_key == GUID_t::unknown()`; `generate_authentication_message`
+   (1373-1388) leaves the endpoint keys unknown (§7.4.4). We set it to our participant GUID. Fix: emit
+   GUID_UNKNOWN (`auth-manager.lisp %am-send-handshake`).
+3. **DataHolder octet-vector missing 4-byte alignment padding** (CDR). The WIRE DataHolder is CDR-aligned:
+   `CDRMessage.cpp:1096` calls `addBinaryPropertySeq(..., add_final_padding=true)` and `readOctetVector`
+   (`:432`) advances `pos = (pos+3)&~3` after each value. Our `%cdr-binary-property-le` wrote the value with
+   NO post-pad → `readDataHolderSeq` misaligns → "Cannot deserialize ParticipantGenericMessage". Fix: pad
+   the wire octet-vector to 4 + skip it on decode (`wire.lisp`). WIRE-ONLY — the §8.7 hash/Sign
+   BinaryPropertySeq uses `add_final_padding=false` (T1) and stays UNpadded, so `handshake.lisp` is untouched.
+4. **c.pdata stub + non-§9.3.2.1 GUID** (security layer — the innermost blocker, reached only after 1-3).
+   `begin_handshake_reply` reads `c.pdata` as a BE ParameterList and rejects unless `PID_PARTICIPANT_GUID`'s
+   first 48 bits are the §9.3.2.1 adjusted GUID. Fix: real c.pdata (`%build-c-pdata`) + adjusted GUID
+   (`%adjust-guid-prefix`), below.
+
+After all four, the live Fast DDS now: deserializes the request, `found=1`, calls `on_process_handshake` →
+`begin_handshake_reply` with NO PKIDH rejection, and SENDS a reply. Our peer advances HANDSHAKING → REJECTED
+(it receives the reply but reply-verification fails = the T3 blocker). Source citations:
+
+- **Fast DDS (Apache-2.0)** — `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`:
+  - `src/cpp/rtps/messages/MessageReceiver.cpp:814-818` — DATA `sequenceNumber <= 0` → drop (blocker 1).
+  - `src/cpp/rtps/security/SecurityManager.cpp:1495-1510` — destination_participant_key/endpoint-key/
+    source_endpoint_key preconditions; `:1373-1388` `generate_authentication_message` leaves endpoint keys
+    unknown (blocker 2). `:1455-1485` readParticipantGenericMessage deserialize (blocker 3 surfaces here).
+  - `src/cpp/rtps/messages/CDRMessage.cpp:1096` `addBinaryPropertySeq(..., add_final_padding=true)`,
+    `:416-434` `readOctetVector` pos→(pos+3)&~3, `:889-906` `readBinaryProperty` (name + octet-vector, NO
+    propagate field — confirms the T1 no-propagate wire is correct) (blocker 3).
+  - `src/cpp/security/authentication/PKIDH.cpp:1555-1612` `PKIDH::begin_handshake_reply` — reads `c.pdata`,
+    parses it with `ParameterList::read_guid_from_cdr_msg(cdr_pdata, PID_PARTICIPANT_GUID, ...)` where
+    `cdr_pdata.msg_endian = BIGEND` and `pos = 0`; then REJECTS unless `(guidPrefix[0] & 0x80) == 0x80`
+    ("Bad participant_key's first bit") AND the adjusted `SHA256(subjectName)` 47-bit check matches
+    ("Bad participant_key's 47bits"). A stub `c.pdata` fails the deserialize → "Cannot deserialize
+    ParticipantProxyData in property c.pdata" → VALIDATION_FAILED → no reply. The hash_c1 mismatch here is
+    only a WARNING (non-fatal), confirming T2 only needs a conformant c.pdata + adjusted GUID to unblock.
+  - `src/cpp/security/authentication/PKIDH.cpp:503-568` `adjust_participant_key` — the §9.3.2.1 GUID bit
+    layout pinned byte-for-byte: `gp[0]=0x80|(md[0]>>1)`, `gp[i]=(md[i-1]<<7)|(md[i]>>1)` for i=1..5, where
+    `md=SHA256(X509_NAME of subject)`; `gp[6..11]` impl-defined uniqueness. Mirrored in
+    `dds-security/auth/identity.lisp %adjust-guid-prefix` (we keep the candidate's octets 6-11 for
+    uniqueness — conformant; the spec leaves them impl-defined).
+  - `src/cpp/fastdds/core/policy/ParameterList.cpp:167-200` `read_guid_from_cdr_msg` — scans u16-BE
+    `(pid,length)` parameters from `pos 0` with NO encapsulation-header skip (a leading PL_CDR header is
+    consumed harmlessly as a zero-length pseudo-param). Pins our `c.pdata` as a raw BIG-ENDIAN ParameterList.
+  - `src/cpp/rtps/builtin/discovery/participant/PDP.cpp:1417-1431` + `SecurityManager.cpp:859,870` — the
+    producer side: `get_participant_proxy_data_serialized(BIGEND)` calls `write_to_cdr_message(&cdr, false)`
+    (`write_encapsulation=false`) — so a conformant `c.pdata` carries NO encapsulation header. Mirrored in
+    `dds-security/auth/handshake.lisp %build-c-pdata` (PID_PARTICIPANT_GUID + PID_SENTINEL, BE, no header).
+- **OpenSSL 3.6.2** — `X509_NAME_digest(X509_get_subject_name(cert), EVP_sha256(), md, &len)` is the exact
+  digest Fast DDS uses; wrapped as `dds.dare:x509-subject-name-sha256` (no hand-rolled crypto).
+- **Eclipse Cyclone DDS (EPL-2.0)** — corroboration not re-fetched this task (Cyclone tree absent locally);
+  the §9.3.2.1 adjusted-GUID rule is the same mechanism across implementations; flagged for the 5b
+  Connext cross-check.
+
+OUR-TO-OUR side effect: the adjusted (cert-derived) GUID flips the §8.7.2.4 requester/replier election off
+the old creation-order heuristic, exposing that the best-effort PSM handshake had NO request retransmission
+(`disc.lisp %record-participant` fired `on-participant-discovered` only on FIRST discovery). Fixed
+conformantly: re-fire on SPDP re-announce for secure peers + the auth manager retransmits the request while
+`:awaiting-reply` and re-sends the stored reply on a duplicate request (`auth-manager.lisp`). No spec/vendor
+constant involved — best-effort retransmission is the conformant RTPS behaviour.
+
+## WP-DDS-SECURITY-FASTDDS-INTEROP T3 — c.id credential = PEM; requester drops out-of-role tokens (Slice 5, 2026-06-29)
+
+T2 made Fast DDS accept our request up to the credential load. T2-RESULT claimed "begin_handshake_reply
+succeeds silently (sends the reply)" — that was WRONG (the honesty nit T3 corrects): the committed
+`ssd-none-*-fastdds.log` show `[SECURITY Warning] Cannot load certificate -> begin_handshake_reply`, and on
+VALIDATION_FAILED Fast DDS sends NOTHING. So Fast DDS never replied; the "%process-reply rejects the reply"
+premise was false. T3's live diagnosis (`run-fastdds-interop.sh none`) found the real divergence and a
+second, our-side false-reject.
+
+Sources read (clean-room, **Apache-2.0 Fast DDS only; RTI never read**):
+- `src/cpp/security/authentication/PKIDH.cpp:198-215` `load_certificate(const vector<uint8_t>&)` — reads
+  `c.id` via `BIO_new_mem_buf` + **`PEM_read_bio_X509_AUX`**: the credential MUST be a **PEM** certificate.
+- `:297-310` `store_certificate_in_buffer` — fills `cert_content_` via **`PEM_write_bio_X509`** (so the c.id
+  Fast DDS EMITS is PEM too); `:1346-1350` `begin_handshake_request` and `:1716-1718`
+  `begin_handshake_reply` assign `c.id = cert_content_` (the PEM bytes).
+- `:1487-1508` `begin_handshake_reply` — `find_binary_property_value("c.id")` → `load_certificate(*cid)` →
+  "Cannot load certificate" → VALIDATION_FAILED when the bytes are not PEM. `:1396-1410`
+  `begin_handshake_request` hashes the BinaryPropertySeq (incl. c.id) via `EVP_Digest(...SHA256)` over the
+  **transmitted c.id bytes** — both sides hash the same wire bytes, so hash_c matches regardless of encoding.
+- `:761-867` `generate_dh_peer_key` — for `EVP_PKEY_EC` it deserializes the dh public key via
+  **`o2i_ECPublicKey`** (raw uncompressed EC point), else "Cannot deserialize public key" (`:858`). Called
+  from `:1706` on the request's `dh1`. This is the **NEXT (T4) blocker**: we emit dh1/dh2 as
+  SubjectPublicKeyInfo DER, Fast DDS wants the raw EC point.
+- `:1260-1304` `validate_remote_identity` — role = `lih->participant_key_ < remote_participant_key`
+  (lower-GUID participant is the requester, §8.7.2.4); `SecurityManager.cpp:907-953` `on_process_handshake`
+  only transmits a handshake message for `VALIDATION_PENDING_HANDSHAKE_MESSAGE / OK_WITH_FINAL_MESSAGE` —
+  confirms VALIDATION_FAILED sends nothing.
+- OpenSSL `bio.h:92` `BIO_CTRL_INFO=3`, `:615` `BIO_get_mem_data(b,pp)=BIO_ctrl(b,BIO_CTRL_INFO,0,pp)` —
+  used by the new `dds.dare:x509-to-pem` to read the PEM out of the write BIO (same idiom as `cms-verify`).
+
+Conformant fixes (this WP):
+1. **c.id = PEM certificate** (DDS-Security 1.1 §9.3.2.1 credential serialization). New
+   `dds.dare:x509-to-pem` (PEM_write_bio_X509) replaces `x509-to-der` for c.id at the 2 emit sites
+   (`handshake.lisp` request + reply); the hash_c input uses the same PEM bytes. Decode is **tolerant**: new
+   `dds.dare:x509-load-cert-auto` tries PEM then DER (no false-REJECT of a legacy DER peer). Live result:
+   "Cannot load certificate" GONE — Fast DDS loads our cert and proceeds to the key-agreement stage.
+2. **Requester drops out-of-role tokens** (§8.7.2.4: the requester processes ONLY the HandshakeReply).
+   `auth-manager.lisp %am-drive-handshake`: a `:requester` whose handle is `:awaiting-reply` now DROPS any
+   non-Reply token (new `%am-token-class` helper) instead of feeding it to `%process-reply`, which rejected
+   on the class_id mismatch and latched `:rejected` — which then IGNORED the genuine Reply. The live peer
+   sends us `DDS:Auth:PKI-DH:1.0+Req` tokens (Fast DDS's prefix); we now drop them and stay HANDSHAKING.
+   Symmetric to the replier's existing duplicate-request guard. No wire constant.
+
+No spec/vendor constant invented. Cyclone tree still absent locally (flagged for 5b). our-to-our green both
+impls (SBCL 377 deterministic; Clasp 377 on re-run — the live-socket e2e test flakes on Clasp DOWNSTREAM of
+the handshake, never in the changed path). Live: handshake ADVANCED past credential-load to the dh1 stage
+(T4 = dh1/dh2 raw-EC-point format).
+
+## WP-DDS-SECURITY-FASTDDS-INTEROP T4 — dh1/dh2 raw EC point + hash_c BinaryPropertySeq padding (Slice 5, 2026-06-29)
+
+T3 left two linked cross-vendor divergences (Fast DDS `begin_handshake_reply` logged BOTH `Wrong hash_c1`
+AND `Cannot deserialize public key (PKIDH.cpp:858)` on our request) plus a role-election watch-item. T4
+diagnosed all three from the live peer + clean-room Fast DDS Apache-2.0 source (RTI never read); fixed B + C
+conformant; A is a benign retransmit (no change). Source citations (Fast DDS `src/fastdds/`):
+
+- **(A) role election = BENIGN retransmit, not a disagreement.** `PKIDH.cpp:1064-1258` `validate_local_identity`
+  sets `(*ih)->participant_key_ = adjusted_participant_key` (`:1238`, the §9.3.2.1 adjusted GUID). `:1260-1304`
+  `validate_remote_identity` elects requester iff `lih->participant_key_ < remote_participant_key` (`:1293`) —
+  BOTH sides compare the announced adjusted GUIDs, complementary to our `auth-manager.lisp:244`
+  (`disc-node-guid-prefix` = our adjusted B9… vs the remote's announced adjusted D1…). Our peer (B9…) is the
+  requester, Fast DDS (D1…) the replier — they AGREE. The `+Req` Fast DDS emits is its FAILURE-RETRY:
+  `SecurityManager.cpp:719-732` resets `AUTHENTICATION_FAILED → AUTHENTICATION_REQUEST_NOT_SEND` on the next
+  SPDP re-announce → `on_process_handshake` (`:855` `begin_handshake_request`) re-sends a request. `:862-865`
+  calls `begin_handshake_reply` ONLY from `AUTHENTICATION_WAITING_REQUEST` (the replier) — so the observed
+  `begin_handshake_reply` failure proves Fast DDS is the replier, and the `+Req` are retries triggered by our
+  request failing B+C. Dropping them (T3) is CORRECT; once B+C land, `begin_handshake_reply` succeeds and Fast
+  DDS sends `+Reply` instead of retrying. No code change.
+- **(B) dh1/dh2 = raw uncompressed EC point.** `PKIDH.cpp:680-759` `store_dh_public_key` for `EVP_PKEY_EC`
+  serializes the dh public key via **`EC_POINT_point2oct(grp, pub, EC_KEY_get_conv_form(ec), …)`** (`:737-739`)
+  = the raw point in the key's default UNCOMPRESSED form (`0x04||X||Y`, 65 B for P-256). `:761-867`
+  `generate_dh_peer_key` reads it via **`o2i_ECPublicKey`** (`:833`), else "Cannot deserialize public key"
+  (`:858`). We emitted SubjectPublicKeyInfo DER (`i2d_PUBKEY`). FFDH stays raw `BN_bn2bin` (`:708-714`) — left
+  untouched.
+- **(C) hash_c1/hash_c2 + Sign BinaryPropertySeq value padding.** `PKIDH.cpp:1395-1410`
+  `begin_handshake_request` and `:1654-1657` / `:1764-1768` hash via `CDRMessage::addBinaryPropertySeq(&msg,
+  props, [\"c.\",] false)` (BIGEND), the signature via `:1817-1843` (`addUInt32(6)` then six
+  `addBinaryProperty`, the last `hash_c1` with `add_final_padding=false`). `CDRMessage.cpp:973-1050`
+  `addBinaryPropertySeq` sets each property's `add_final_padding = outer || (number_to_serialize != 0)` → every
+  value padded EXCEPT the last. `:867-887` `addBinaryProperty` → `:602-637` `addOctetVector` pads
+  `(4 - size%4)%4` zero bytes after the value when `add_final_padding`; `:799-812` `add_string` pads the name
+  to a 4-multiple (matches our `%cdr-string-be`). The `\"c.\"` filter (`:1027,1038` `name().find(\"c.\")==0`)
+  selects exactly c.id/c.perm/c.pdata/c.dsign_algo/c.kagree_algo. We never padded the value → `Wrong hash_c1`.
+
+Conformant fixes (this WP):
+1. **dh1/dh2 raw EC point** — `dds.dare:ecdh-gen-keypair` now extracts the public key via
+   `EVP_PKEY_get_octet_string_param` "pub" (OSSL_PKEY_PARAM_PUB_KEY, default uncompressed point = the
+   `EC_POINT_point2oct` form) instead of `i2d_PUBKEY`/SPKI DER (new `%evp-pkey-ec-pub-point`).
+   `dds.dare:ecdh-compute` is decode-tolerant (new `%ecdh-import-peer-pub`): a 65-byte `0x04||X||Y` point →
+   `ec-p256-import-public`; any other input → `d2i_PUBKEY` SPKI DER (keeps the RFC 5903 KAT + legacy peers).
+2. **hash_c/Sign value padding** — `handshake.lisp` `%cdr-octet-seq-be`/`%cdr-binary-property-be`/
+   `%build-cdr-binary-property-seq-be` now 4-pad each octet value EXCEPT the last property in the sequence
+   (`add_final_padding=false` at seq level), matching `addBinaryPropertySeq`. The WIRE DataHolder (`wire.lisp`)
+   already pads ALL values (`add_final_padding=true`); the two paths differ only on the last property.
+
+No spec/vendor constant invented; clean-room (Fast DDS Apache-2.0 read only, RTI never). Cyclone tree still
+absent locally (flagged for 5b). our-to-our green both impls (SBCL 377 deterministic; Clasp 377 on re-run —
+the two live-socket e2e flakes [SDP-BYTE-EXACT, SDP-SEC-PREFIX-ON-WIRE] are DOWNSTREAM of the handshake and
+move between runs, never in the changed crypto path; the handshake/keyed e2e tests pass every run). **Live
+result: the cross-vendor handshake now COMPLETES — HANDSHAKING → Reply → Final → SharedSecret → AUTHENTICATED
+both directions; Fast DDS's security log is clean (`Wrong hash_c1` + `Cannot deserialize public key` GONE).
+[SUPERSEDED by T5: only OUR side authenticated; Fast DDS was stuck WAITING_FINAL until the §7.4.3
+related_message_identity echo — see the T5 entry]**
+Next blocker (T5): the §8.5.2 crypto-token exchange over reliable ParticipantVolatileMessageSecure does not
+complete cross-vendor → never `:keyed` → no endpoint match (the brief's secure-SEDP / PVMS reliable
+HEARTBEAT/ACKNACK-pull candidate).
+
+## WP-DDS-SECURITY-FASTDDS-INTEROP T5 — handshake-Final correlation + PVMS prerequisites (Slice 5, 2026-06-29)
+
+Read-only clean-room study of eProsima Fast DDS (Apache-2.0) — RTI never read. The §8.7 handshake reached
+AUTHENTICATED on OUR side (T0-T4), but Fast DDS (the replier) NEVER reached `participant_authorized` — it
+sent no crypto tokens, matched no user endpoints (no "Subscriber/Publisher matched." in its log), and logged
+no error: it was silently stuck. Isolated by instrumenting our PVMS path (we sent 11 tokens, received ZERO
+inbound) then reading Fast DDS `SecurityManager.cpp`.
+
+Root cause (the live blocker), `SecurityManager::process_participant_stateless_message` (the §7.4.3 PSM
+correlation):
+- **`:1554-1556`** — in `AUTHENTICATION_WAITING_FINAL`, a message whose `related_message_identity.source_guid
+  == GUID_t::unknown()` is treated as "the reply was missed" → Fast DDS RESENDS its Reply, never processing
+  the Final. We sent the Final with `related_message_identity = {GUID_unknown, 0}` (a hardcoded placeholder),
+  so Fast DDS looped on resend forever and never authorized.
+- **`:1582-1589`** — the conformant Final requires `related_message_identity.source_guid ==
+  participant_stateless_message_writer_->getGuid()` (the replier's PSM-WRITER GUID, prefix + 0x000201C3).
+- **`:1590-1597`** — and `related_message_identity.sequence_number == expected_sequence_number_` (the Reply's
+  message_identity.sequence_number). Our-to-our was blind to this: our PSM dispatch keys the handshake by the
+  remote 12-octet prefix and IGNORES message_identity/related (so it never needed the echo).
+
+Conformant fix (§7.4.3 / §8.7.2.4): `auth-manager.lisp` `%am-on-stateless-message` now captures the INCOMING
+message's `message_identity` (source_guid + sequence_number) and threads it through `%am-drive-handshake` →
+`%am-send-handshake`, which echoes it as the response's `related_message_identity`. The first Request keeps
+related = GUID_unknown/0 (it carries none, matching `:1535`). Live-verified: our Final now sends
+`related = {D1437B8E..0x000201C3, 1}` (exactly Fast DDS's Reply message_identity), Fast DDS processes the
+Final and reaches `participant_authorized` BOTH directions.
+
+PVMS crypto-token prerequisites reconciled (all corroborated, now in place for the exchange once authorization
+passes):
+- **PVMS BuiltinEndpointSet bits 24/25** (`disc.lisp` `%node-spdp-data`): advertise
+  `BUILTIN_ENDPOINT_PARTICIPANT_VOLATILE_MESSAGE_SECURE_WRITER/READER` iff the PVMS endpoint exists, mirroring
+  Fast DDS `SecurityManager.cpp` `builtin_endpoints()` (`:2087-2115`); Fast DDS
+  `match_builtin_key_exchange_endpoints` (`:2178-2217`) gates PVMS matching on these bits — without them no
+  tokens flow either way. Live-verified advertised (`builtin-endpoint-set = #x03C0FC3F`, bits 24+25 set).
+- **PVMS SerializedPayload §10.2 encapsulation** (`volatile-secure.lisp`): the PVMS DATA payload now carries
+  the PLAIN_CDR_LE encapsulation header (reuses `%psm-encapsulate`, stripped on receive), required by Fast DDS
+  `process_participant_volatile_message_secure` (`:1700-1718`, reads the 4-octet encap before the
+  ParticipantGenericMessage) — exactly like the PSM path. PL_CDR (0x02/0x03) is silently dropped.
+- **Participant crypto-token `source_endpoint_key` = GUID_unknown** (`crypto-manager.lisp`
+  `cm-make-crypto-token-message`): a PARTICIPANT-class token is participant-level (OMG §8.5.2.1); Fast DDS
+  `:1745-1749` drops it if `source_endpoint_key != GUID_unknown`. DW/DR tokens keep the source endpoint GUID
+  (§8.5.2.2/.3).
+- **Keyed-gate governance sensitivity** (`crypto-manager.lisp` `%cm-remote-keyed-ready-p`): require the
+  secure-SEDP EntityCrypto tokens ONLY when discovery protection is active. Fast DDS exchanges the
+  ParticipantCryptoToken unconditionally when the crypto plugin is loaded (`participant_authorized`
+  `exchange_participant_crypto`, `:4099`, NOT gated on rtps_protection) but creates secure-SEDP endpoints only
+  under discovery_protection — so under GOV=none, keying needs only the ParticipantCrypto.
+
+NEXT blocker (T6), Fast DDS `Permissions.cpp`: with the handshake now completing, `participant_authorized`
+fails — `[SECURITY Error] Error validating remote permissions ... Cannot read as PKCS7 the permissions file
+(:593)`. Cause: our handshake sends an EMPTY `c.perm` (`handshake.lisp:359` placeholder). Fast DDS reads the
+remote permissions credential via `SMIME_read_PKCS7` (`:354`) + `PKCS7_verify(... PKCS7_TEXT | PKCS7_NOVERIFY
+| PKCS7_NOINTERN)` (`:406`) — it requires the S/MIME multipart form (its `.smime`), NOT our PEM PKCS7
+(`-----BEGIN PKCS7-----`). T6 = plumb the local permissions document (S/MIME) into `c.perm` through the
+handshake API + auth-manager. No spec/vendor constant invented; clean-room (Fast DDS Apache-2.0 read only, RTI
+never). our-to-our green both impls (SBCL 377 deterministic; Clasp keyed/PVMS/secure-discovery deterministic,
+the SDP-SEC-PREFIX-ON-WIRE wire-capture e2e is the known NFR-PORT live-socket flake, passes in isolation).
+
+## WP-DDS-SECURITY-FASTDDS-INTEROP T6 — c.perm = S/MIME permissions credential (Slice 5, 2026-06-29)
+
+Read-only clean-room study of eProsima Fast DDS (Apache-2.0) — RTI never read. With the handshake completing
+both directions (T5), Fast DDS `participant_authorized` failed at permissions validation:
+`[SECURITY Error] Error validating remote permissions … Cannot read as PKCS7 the permissions file`. Our
+handshake `c.perm` binary_property was EMPTY (`handshake.lisp:359` placeholder).
+
+Corroboration (the exact c.perm form Fast DDS emits + reads):
+- `src/cpp/security/authentication/PKIDH.cpp:1352-1364` (`begin_handshake_request`; mirrored at `:1536-1552`
+  reply, `:1722-1734` final-store, `:1960-1972`) — `c.perm` value = the `dds.perm.cert` Property of the local
+  `DDS:Access:PermissionsCredential` token, assigned VERBATIM into the handshake `BinaryProperty("c.perm")`.
+- `src/cpp/security/accesscontrol/Permissions.cpp:777-797` `generate_credentials_token` — `dds.perm.cert` is
+  set to the RAW CONTENT of the configured permissions file (`std::ifstream … << ifs.rdbuf()`). So c.perm is
+  the raw signed permissions document bytes, unaltered.
+- `src/cpp/security/accesscontrol/Permissions.cpp:354,406` `load_and_verify_document`
+  (`validate_remote_permissions` → `check_remote_permissions`) — the remote c.perm is parsed with
+  `SMIME_read_PKCS7(in, &indata)` (NULL ⇒ "Input data has not PKCS7 S/MIME format") then verified with
+  `PKCS7_verify(p7, stack, nullptr, indata, out, PKCS7_TEXT | PKCS7_NOVERIFY | PKCS7_NOINTERN)`. PKCS7_TEXT
+  REQUIRES the MIME multipart/signed S/MIME container with a `Content-Type: text/plain` body part — the
+  `.smime` form (`openssl smime -sign -text`, NOT `-outform PEM -nodetach`), NOT the bare-PEM
+  `-----BEGIN PKCS7-----` opaque form our Slice-3 `dds.dare:cms-verify` consumed.
+
+The bare-PEM `.p7s` and the MIME `.smime` are signed over DIFFERENT byte streams (the `.smime` content carries
+a `Content-Type: text/plain\r\n\r\n` prefix; the `.p7s` does not), so the `.p7s` cannot be re-wrapped into the
+`.smime` form without the Permissions-CA private key — they are two distinct signatures. Conformant resolution
+(DDS-Security 1.1 §9.4.1.1 / RFC 5652 + RFC 5751; the spec form IS S/MIME):
+- `dds.dare:cms-verify` (`openssl-ffi.lisp`) is now decode-tolerant: PEM_read_bio_CMS (form 1, flags=0,
+  byte-identical to before) → on NULL, `SMIME_read_CMS` + `CMS_verify(…, CMS_TEXT)` (form 2, cms.h:179
+  CMS_TEXT=0x1, the CMS-API analogue of Fast DDS's PKCS7 path). Pure capability ADDITION — no document
+  previously accepted is now rejected. Verified in isolation: both `.p7s` and `.smime` recover the identical
+  1265-byte permissions XML; garbage ⇒ NIL (fail-closed).
+- The participant's configured signed permissions octets (`create-participant :permissions`) are plumbed
+  through `%install-auth-manager` → the auth-manager-state `perm-credential` slot → the optional
+  `perm-octets` arg of `begin-handshake-request`/`begin-handshake-reply`, emitted as c.perm (§9.3.2.1) AND
+  folded into hash_c (so both ends recompute the identical hash over the transmitted bytes — the hash check is
+  over the wire bytes, independent of c.perm content, which is why T5 authorized with an empty c.perm yet
+  failed only the SEPARATE permissions-validation step). Default empty ⇒ byte-identical to T5 for auth-only /
+  unit / structural-corpus paths. The interop harness feeds our peer the SHARED `.smime` (grants both EC
+  subjects) so c.perm is the conformant form. The §8.7.2.4 PSM send buffer is now sized per-call
+  (`stateless-message.lisp`) — the ~3 KiB c.perm + c.id cert exceeds the fixed 2 KiB rx-tx-msg scratch.
+
+Live re-run (GOV=none, `run-fastdds-interop.sh none 20`, both directions): the `Cannot read as PKCS7` /
+`Error validating remote permissions` log is GONE in BOTH Fast DDS logs — permissions now VALIDATE. Fast DDS
+proceeds past `participant_authorized` to secure SEDP endpoint matching (`RTPS_WRITER … Attempting to add
+existing reader`). Our side reaches AUTHENTICATED and drives the PVMS crypto-token exchange. NEXT blocker
+(T7/next iteration): neither side reaches `:keyed` — the PVMS ParticipantCryptoToken exchange does not complete
+(no inbound token observed), re-exposing the original T5/T6-candidate PVMS reliability / metatraffic-wrapping
+items now that authorization passes. No spec/vendor constant invented; clean-room (Fast DDS Apache-2.0 only,
+RTI never). our-to-our green both impls (SBCL 377 deterministic; Clasp security/auth/access-control/handshake
+deterministic in isolation, the live-socket wire-capture e2e is the known NFR-PORT flake — it moved from
+SDP-SEC-PREFIX-ON-WIRE to SDP-BYTE-EXACT across the two full-suite runs, both pass in isolation).
+
+## WP-DDS-SECURITY-FASTDDS-INTEROP T7-PVMS — crypto-token KeyMaterial kind + protected PVMS HEARTBEAT/ACKNACK (Slice 5, 2026-06-29)
+
+With authorization passing (T6), the live PVMS ParticipantCryptoToken exchange was diagnosed by instrumenting
+our PVMS send/receive/decode/promote paths. Findings: we DO receive + decode Fast DDS's PVMS brackets (the
+§9.5.3.1 bootstrap KM derive-kx-key/-salt is byte-identical cross-vendor; the §9.5.3.3.4.2 session-key KDF +
+nonce match — we splice the wire session_id verbatim, Fast DDS uses the native-LE uint32 for both wire and
+KDF). Fast DDS's participant-token DATA reached our hook but `cm-parse-crypto-token-message` returned NIL.
+TWO conformant divergences, both corroborated CLEAN-ROOM (read-only) vs eProsima Fast DDS (Apache-2.0); RTI
+NEVER read.
+
+**(1) KeyMaterial transformation_kind AES256_GMAC {0,0,0,3} false-REJECT.** `%parse-km-cdr`
+(`auth/keyexchange.lisp`) accepted `transformation_kind[3]` only in `{0x01,0x02,0x04}` — it OMITTED `0x03`.
+The live participant-token KeyMaterial (88-byte form, BIG-ENDIAN seq lengths salt=32/key=32, length markers
+at offsets 7/47 = 0x20 — otherwise byte-exact to our serializer) carried kind `{0,0,0,3}` (Fast DDS
+`AESGCMGMAC_KeyFactory` `c_transfrom_kind_aes256_gmac` for the ParticipantKeyMaterial under the GMAC-tier
+governance). DDS-Security 1.1 §9.5.2.1.1 Table 70 / dds_security_plugins_psm.idl defines four non-NONE kinds
+(AES128_GMAC 0x01, AES128_GCM 0x02, AES256_GMAC 0x03, AES256_GCM 0x04); the parser now accepts all four.
+Pure relaxation (nothing previously accepted is now rejected). → OUR side reaches `:keyed` both directions.
+
+**(2) PVMS HEARTBEAT/ACKNACK must be submessage-PROTECTED (the deferred Slice-4 carry).** Fast DDS
+`RTPSMessageGroup::add_heartbeat` encodes the HEARTBEAT via `encode_writer_submessage` and `add_acknack` the
+ACKNACK via `encode_reader_submessage` when `endpoint.security_attributes().is_submessage_protected` (the PVMS
+endpoint is IS_SUBMESSAGE_ENCRYPTED, `SecurityManager.cpp:1284-1286/1336-1338`), and `MessageReceiver` DROPS
+a CLEAR submessage on a submessage-protected endpoint (`was_decoded || !is_submessage_protected`,
+`MessageReceiver.cpp:135/188/1131/1182/1239/1382`). Our PVMS sent CLEAR HEARTBEAT/ACKNACK (Fast DDS dropped
+them → our token never NACK-pulled) and DROPPED Fast DDS's encrypted HEARTBEAT/ACKNACK (we handled only the
+inner DATA). Fix: `%pvms-emit-heartbeat` ENCRYPTs the HEARTBEAT (encode-datawriter-submessage) and the
+ACKNACK in `%on-pvms-heartbeat` ENCRYPTs via encode-datareader-submessage, both under the bootstrap KM + the
+per-role session_id; `%on-volatile-secure` now DECODEs the bracket then DEMUXes the inner RTPS submessage by
+id (DATA → token delivery, HEARTBEAT → ACKNACK pull, ACKNACK → DATA resend, INFO_TS/other → skip); the dead
+CLEAR PVMS HEARTBEAT/ACKNACK dispatch clauses were removed (`disc.lisp`). → Fast DDS's PVMS reader acks our
+tokens through SN 11 (base=12, resends=0) → Fast DDS receives our participant crypto token → Fast DDS keys.
+
+Live re-run (GOV=none, both directions): the PVMS ParticipantCryptoToken exchange now COMPLETES BOTH
+directions — our side reaches `:keyed` (was NIL), Fast DDS acks all our tokens (no crypto ERROR in its log).
+NEXT blocker (next iteration): no user-endpoint match (`matched=0`) — we receive NO SEDP HEARTBEAT from Fast
+DDS (`%on-builtin-heartbeat` never fires) so we never discover its user endpoints, and Fast DDS's subscriber
+never prints "matched". Post-keying, Fast DDS does not initiate the plain-SEDP/EDP user-endpoint exchange with
+us; this is a SEDP-layer investigation distinct from the (now-resolved) PVMS crypto-token exchange. our-to-our
+green: the 4 PVMS engine tests + 4 secure-discovery e2e tests pass; gate-hotpath(8)/gate-types(2030)/fuzz/
+mem(0.0000) PASS.
+
+### WP-DDS-SECURITY-FASTDDS-INTEROP — GOV=secure two-phase secure discovery: keying gate + DW/DR token destination_endpoint_key (M7/P6 Slice 5)
+
+The headline DoD (PROTECTED user data, both directions) requires the PROTECTED governance (GOV=secure:
+discovery_protection_kind=ENCRYPT, rtps_protection_kind=ENCRYPT, metadata/data_protection_kind=ENCRYPT) — the
+prior PVMS work ran GOV=none (all protection NONE). Under GOV=secure the cross-vendor path was diagnosed by
+instrumenting our crypto-token install + keying-gate + PVMS + secure-builtin receive/dispatch paths (temporary
+`*error-output*` traces, all removed). TWO conformant divergences, both corroborated CLEAN-ROOM (read-only) vs
+eProsima Fast DDS (Apache-2.0); RTI NEVER read. Fast DDS Info logging is compiled out of the prebuilt lib
+(`LOG_NO_INFO=ON`), so the C++ source was read directly.
+
+**(1) `:keyed` gate must NOT require the secure-SEDP endpoint tokens (Fast DDS two-phase secure discovery).**
+Fast DDS keys a remote in TWO phases: PHASE 1 at `participant_authorized` exchanges the ParticipantCrypto +
+the SPDP-secure (0xff0101) endpoint tokens and matches the secure PDP (`SecurityManager.cpp`
+participant_authorized -> `exchange_participant_crypto` + `notifyAboveRemoteEndpoints` ~4098-4140;
+`PDPSimple.cpp` `match_pdp_remote_endpoints` secure); PHASE 2 exchanges the secure-SEDP (0xff0003/0xff0004) +
+secure-PM (0xff0200) endpoint tokens, gated on the secure-SPDP reader having matched the remote secure-SPDP
+writer (`PDPSimple::assignRemoteEndpoints` ~558-574 checks `matched_writer_is_matched(remote_secure_spdp_writer)`
+before `assign_low_level_remote_endpoints(notify_secure=true)` -> `EDPSimple::assignRemoteEndpoints` ~819-876
+secure-endpoint crypto-token exchange). So the secure-SEDP EntityCryptos arrive AFTER the participant
+secure-match — they are NOT a participant-keying precondition. Our `%cm-remote-keyed-ready-p` (added in T8) ALSO
+required the remote's secure-SEDP pub-writer DW + sub-reader DR, which DEADLOCKED against the two-phase peer
+(live: Fast DDS sent ONLY the 3 phase-1 tokens — participant + secure-SPDP DW 0xff0101c2 + DR 0xff0101c7 —
+so our gate's `pubw`/`subr` stayed NIL and our side never left :authenticated). Fix: gate `:keyed` on the
+ParticipantCrypto ALONE (identical for PLAIN and PROTECTED discovery); the endpoint-level secure-builtin
+EntityCryptos install lazily as those endpoints match (the secure receive path resolves each by
+transformation_key_id on arrival, fail-closed until present). -> OUR side reaches `:keyed` BOTH directions under
+GOV=secure (was NIL).
+
+**(2) DW/DR CryptoToken destination_endpoint_key must be the MATCHED REMOTE endpoint GUID, not GUID_unknown.**
+Fast DDS `SecurityManager::process_participant_volatile_message_secure` validates the §7.4.4
+ParticipantGenericMessage endpoint keys by message_class_id: a PARTICIPANT token requires BOTH
+destination_endpoint_key AND source_endpoint_key == `GUID_t::unknown()` (rejected otherwise, ~1739/1745); a
+DATAWRITER/DATAREADER token requires BOTH to be NON-unknown (rejected if `== GUID_t::unknown()` at ~1830/1835
+for datareader, ~1907/1912 for datawriter) and APPLIES the token by looking up the LOCAL endpoint via
+`reader_handles_.find(destination_endpoint_key)` / `writer_handles_.find(destination_endpoint_key)` (~1924/1848)
+then the matched REMOTE via `associated_writers.find(source_endpoint_key)` / `associated_readers.find(...)`
+(~1928/1852). We sent every DW/DR token with destination_endpoint_key = all-zero (GUID_unknown) -> Fast DDS
+REJECTED ALL our endpoint tokens (live: "[SECURITY_CRYPTO] No key material yet" flood; our secure announces
+undecodable) -> phase 2 never triggered. (Our OWN install keys by source_endpoint_key and ignores the
+destination, so our-to-our was tolerant and masked this.) Fix: `%cm-token-dest-entity-id` maps a LOCAL endpoint
+to its matched-remote COMPLEMENTARY endpoint id (builtin secure: §9.3.2 key-kind low byte writer 0xC2 <-> reader
+0xC7 within the same builtin; user: writer-id <-> reader-id), and `cm-make-crypto-token-message` writes
+destination_endpoint_key = GUID_unknown for a participant token, else remote-prefix + the complementary id. ->
+Fast DDS APPLIES our builtin-secure tokens, proceeds to phase 2 + 3, and exchanges ALL its builtin-secure
+endpoint tokens back (live CMTOK-RX after fix: participant + secure-SPDP 0xff0101 + secure-SEDP pub 0xff0003 +
+secure-SEDP sub 0xff0004 + secure-PM 0xff0200, DW+DR each).
+
+Live re-run (GOV=secure, both directions): both sides reach `:keyed` (was NIL); Fast DDS completes the FULL
+builtin-secure crypto-token exchange both ways; our secure receive path now decodes Fast DDS's secure-builtin
+traffic (131/131 brackets decoded). REMAINING blocker (next iteration): secure-builtin RELIABILITY — Fast DDS's
+reliable secure-SEDP/SPDP writers send submessage-protected HEARTBEATs (inner id 7, x99) + ACKNACKs (inner id 6,
+x32) which our `%on-secure-builtin` DROPS (it handles only inner DATA, mirroring the pre-fix PVMS bug), so we
+never ACKNACK-pull Fast DDS's secure-SEDP DiscoveredReaderData -> no user-endpoint match (`matched=0`). The
+conformant fix (next slice) is to demux + answer the secure-builtin HEARTBEAT/ACKNACK exactly like the PVMS
+HEARTBEAT/ACKNACK (reuse `%builtin-acknack-values` + the reliable engine), plus exchange the USER-endpoint
+CryptoTokens at endpoint-match time with the actual matched-remote GUID (cross-vendor user ids are not the
+symmetric our-to-our ids). our-to-our green (both fixes): secure-discovery keyed/protected/protected-sign +
+PVMS reliable/fail-closed e2e tests pass; make test-sbcl=377; gate-types(2031)/gate-hotpath(8)/corpus/fuzz/
+mem(0.0000) PASS.
+
+### M7/P6 Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP) — T9: secure-SEDP RELIABILITY + user-token-at-match + NO_KEY keyed-ness (cross-vendor user-endpoint MATCH achieved both directions)
+
+Implements the "next iteration" fixes the T8sedp entry above identified. Three corroborated divergences,
+CLEAN-ROOM vs eProsima Fast DDS (`src/fastdds`, Apache-2.0) + RTPS 2.5 / DDS-Security 1.1 OMG clauses; **RTI
+Connext never read**.
+
+**(1) The secure builtin endpoints are RELIABLE — answer + emit submessage-protected HEARTBEAT/ACKNACK, not
+only DATA.** A reliable Fast DDS secure-SEDP/SPDP writer drives its matched reader by submessage-PROTECTED
+HEARTBEAT (RTPS 2.5 §8.3.7.5, inner submessage id 0x07) + ACKNACK (§8.3.7.1, id 0x06), never a clear one
+(`RTPSMessageGroup::add_heartbeat`/`add_acknack` route through `encode_writer/reader_submessage` when the
+endpoint `is_submessage_protected`; `MessageReceiver` drops a clear submessage on a protected endpoint:
+`was_decoded || !is_submessage_protected`). Our `%on-secure-builtin` decoded the bracket then handled ONLY
+inner DATA and DROPPED HEARTBEAT/ACKNACK (the same defect the PVMS path had pre-T8), so we never NACK-pulled
+Fast DDS's secure-SEDP DiscoveredReaderData (live T8sedp: `matched=0`). Fix: `%on-secure-builtin` now DEMUXes
+the recovered inner submessage by id (mirroring the PVMS `%on-volatile-secure`): inner DATA records its SN
+(`%builtin-on-data`) then routes SEDP/PM/SPDP as before; inner HEARTBEAT -> `%on-secure-builtin-heartbeat`
+applies the range (`%builtin-acknack-values`) and sends the computed ACKNACK submessage-PROTECTED under OUR
+matched LOCAL receiving reader's EntityCrypto (`%secure-reader-eid-for-writer` maps the §9.3.2 builtin pair
+0xC2 writer -> 0xC7 reader), encoded as a DataReader submessage (`encode-datareader-submessage`, §8.5.1.8/.9 —
+a CLEAR ACKNACK is dropped by a conformant secure writer); inner ACKNACK -> `%on-secure-builtin-acknack`
+resends each NACKed secure-SEDP DiscoveredWriter/ReaderData (`%send-secure-endpoint`, the repair). The new
+`%send-secure-builtin-heartbeats` (hooked into the announce cadence in `disc.lisp` alongside
+`%pvms-push-heartbeats-all`) emits NON-FINAL secure-SEDP HEARTBEATs [1,N] from each protected local secure-SEDP
+writer to every :keyed peer, so Fast DDS NACK-pulls OUR DiscoveredWriter/ReaderData (RTPS 2.5 §8.4.2.2). The
+PVMS HEARTBEAT/ACKNACK builders were refactored to share `%build-plain-{heartbeat,acknack}-sm` (DRY; PVMS
+stays byte-identical). FAIL-CLOSED on every demux branch: an unknown inner id, a non-secure-builtin writer, a
+truncated inner HEARTBEAT (`parse-heartbeat-body` -> NIL is dropped, not signaled — NFR-SEC-POSTURE), an
+unresolved local EntityCrypto, or no metatraffic locator -> a silent drop. NONCE-SAFETY: the added encrypt
+sites under the secure-SEDP-writer KM (HEARTBEAT + ACKNACK-driven DATA resend) and under the reader KM
+(ACKNACK) all draw a UNIQUE iv_suffix from the per-KM monotonic `%km-next-iv-suffix` counter
+(`KM-IV-COUNTER-LOCK`-atomic; `cm-encode-entity-km` returns the stable KM singleton, never a fresh copy), so
+the announce-thread DATA+HEARTBEAT racing the receiver-thread ACKNACK-resend on the same KM cannot reuse a
+(key, nonce).
+
+**(2) USER DW/DR CryptoToken re-exchange at endpoint-MATCH time with the actual matched-remote GUID.** The
+auth-time `cm-on-authenticated` set each USER DW/DR token's destination_endpoint_key = remote-prefix + OUR
+symmetric-assumed complementary entity-id (correct only our-to-our). A cross-vendor peer's user entity-ids are
+its own, so that key is wrong. Fix: `%on-disc-match` (the 16-octet matched-remote GUID is the handle) now calls
+`%cm-user-token-at-match` -> `cm-on-endpoint-match`, which re-sends our Datawriter/DatareaderCryptoToken over
+the reliable PVMS with destination_endpoint_key = the REAL matched-remote endpoint GUID learned from the
+(secure or plain) SEDP Discovered{Writer,Reader}Data (DDS-Security 1.1 §8.5.2.2/.3; Fast DDS
+`process_participant_volatile_message_secure` applies a DW/DR token via `*_handles_.find(dest)`). Gated on the
+remote being :keyed (fail-closed no-op otherwise); idempotent our-to-our (the real GUID equals the auth-time
+guess).
+
+**(3) Interop HelloWorld endpoints declared NO_KEY.** Fast DDS's example HelloWorld has no @key member (NO_KEY,
+RTPS 2.5 §9.3.1.2 Table 9.1: writer 0x03 / reader 0x04). Our interop test endpoints declared WITH_KEY, so
+Fast DDS `valid_matching` rejected the user match on keyed-ness (`INCOMPATIBLE QOS keyed:1 vs keyed:0`). Fix
+(test-harness only, `secure-interop.lisp`): pass `:keyed nil` — match the peer's key-ness (the oracle), not a
+fixed WITH_KEY.
+
+**Live re-run (`run-fastdds-interop.sh secure 45`, GOV=secure, both directions):** USER ENDPOINTS NOW MATCH
+BOTH DIRECTIONS (`peak-matched=1` both; Fast DDS `Publisher matched.` + runs `decode_datawriter_submessage` on
+our data = it matched our writer), keyed both ways — the T8sedp blocker (`matched=0`) is CLOSED. **Protected
+user DATA does NOT yet flow either direction** (`peak-samples=0` both): Fast DDS reports `89× Key material not
+found -> decode_datawriter_submessage` (it lacks our user-WRITER EntityCrypto for the data decode) + `8× Not
+valid SecureDataTag submessage id -> decode_rtps_message` (its rtps_protection/SRTPS whole-message decode
+rejects some of our datagrams); symmetrically we decode 0 of Fast DDS's 91 sent. REMAINING blocker (next
+iteration, a fresh diagnose loop): the user-DATA protection tier — the per-endpoint DatawriterCryptoToken is
+not APPLIED by the peer for the data decode and/or our user-data SRTPS_PREFIX/SEC_BODY/SRTPS_POSTFIX wrap
+(§8.5.1.10-.12) diverges from `AESGCMGMAC_Transform::decode_rtps_message`; the two may be linked (an
+SRTPS-dropped PVMS datagram never installs the token). This tier is reached for the FIRST time because T9 made
+the endpoints match; it is distinct from the T9 secure-DISCOVERY reliability + match this iteration delivers.
+Connext-Security live = the Slice-5b exit gate (RTI Security Plugins absent). our-to-our green both impls:
+secure-discovery keyed/protected/protected-sign/origin-auth + PVMS reliable/fail-closed pass with the new
+reliability branches active; make test-sbcl=377; Clasp (`GC_DONT_GC=1`) secure e2es isolation-green (full-suite
+abort only the documented `[SDP-SEC-PREFIX-ON-WIRE]` NFR-PORT live-socket flake, wanders, SBCL-clean);
+gate-types(2039)/gate-hotpath(8)/corpus/fuzz/mem(0.0000) PASS. Captures:
+`interop/security-secure-discovery/captures/ssd-secure-*.log` + `T9protected-RESULT.md`.
+
+### M7/P6 Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP) — T10: user-DATA protection tier (PROTECTED DATA ONE DIRECTION achieved, fast2ours) (2026-06-29)
+
+Now that the user endpoints match (T9), the user-DATA protection tier is reached cross-vendor for the first
+time. Three conformant divergence fixes; **clean-room, corroborated against the OMG spec + eProsima Fast DDS
+(Apache-2.0); RTI Connext never read.**
+
+**(1) Slice-1 serialized-payload AAD reconciled to EMPTY** (`transform.lisp`, `crypto.lisp`,
+`crypto/submessage.lisp`). The Slice-1 serialized-payload (data_protection) tier sealed with AAD = the 20-byte
+SecureDataHeader (`kind‖key_id‖session_id‖iv_suffix`). Fast DDS does NOT: `AESGCMGMAC_Transform.cpp`
+`serialize_SecureDataBody` is ONE function shared by the serialized-payload AND submessage paths, and its
+ENCRYPT branch calls `EVP_EncryptUpdate` for the plaintext with **no prior AAD `EVP_EncryptUpdate` call** (⇒
+empty AAD); the SecureDataHeader is written as the §9.5.3.3.1 CryptoHeader on the wire but is NOT fed to
+AES-GCM as AAD. OMG DDS-Security 1.1 §9.5.3.3.4.4 specifies the SecureDataHeader serialization but the
+transform computes the tag over the body, not over the header-as-AAD. Reconciled ours to empty AAD
+(`+empty-octets+`, hoisted to `crypto.lisp` so the payload AND submessage tiers share the one instance, DRY).
+**This CHANGES the SHIPPED Slice-1 wire behavior**: the serialized fields are byte-identical, but the
+GCM-authenticated bytes differ ⇒ the GCM **tag value** differs (the SecuredPayload corpus tag literals are
+re-derived). Header integrity is preserved WITHOUT AAD: decode now applies the Fast DDS
+`AESGCMGMAC_Transform::find_key` check (wire `transformation_kind` AND `transformation_key_id` must equal the
+KeyMaterial's, else fail-closed NIL — rejects a kind/key_id tamper), and `session_id`/`iv_suffix` derive the
+AES-GCM session key + nonce (tamper ⇒ GCM auth fail). Recorded as an addendum to ADR 0031.
+
+**(2) KeyMaterial advertised transformation_kind GMAC vs GCM** (`key-material.lisp` `generate-key-material
+:kind`; `crypto-manager.lisp` `cm-register-local-entity :kind` + `%cm-entity-protection-kind`). A SIGN endpoint
+must advertise `CRYPTO_TRANSFORMATION_KIND_AES256_GMAC {0,0,0,3}` and an ENCRYPT endpoint
+`AES256_GCM {0,0,0,4}` (OMG §9.5.2 Table 65 transformation_kind enum), because a conformant receiver's
+`find_key` matches a stored token KeyMaterial to an inbound submessage on `transformation_kind` AND
+`sender_key_id` together — a SIGN endpoint that advertised GCM is rejected `Key material not found`. The AES-256
+master key is identical for GMAC and GCM; only the advertised kind + the SEC_BODY-vs-verbatim framing differ.
+We now map each tier's governance protection_kind → the advertised kind on the local EntityCrypto.
+
+**(3) User-DATA submessage protection (metadata_protection, §8.5.1.7-.9)** (`dataplane.lisp`
+`%maybe-wrap-user-submessages`/`%wrap-one-user-submessage`/`%pad-submessage-to-4` SEND; `secure-sedp.lisp`
+`%on-user-secure-submessage` RECEIVE+re-dispatch; `disc.lisp` slots; `crypto-manager.lisp` resolvers;
+`entities.lisp` `%set-user-metadata-protection`). When governance `metadata_protection_kind != NONE`, each
+user-plane submessage (DATA/DATA_FRAG/HEARTBEAT/GAP/HEARTBEAT_FRAG under the user-WRITER EntityCrypto;
+ACKNACK/NACK_FRAG under the user-READER) is wrapped SEC_PREFIX‖CryptoHeader‖SEC_BODY(ENCRYPT)|verbatim(SIGN)‖
+SEC_POSTFIX, INSIDE the rtps_protection SRTPS wrap (submessage-protect inner, whole-message outer — Fast DDS
+`RTPSMessageGroup` send order payload→submessage→rtps; `%send-raw-buf` calls `%maybe-wrap-user-submessages`
+THEN `%maybe-wrap-srtps`). The plaintext is 4-aligned before sealing (DDSI-RTPS 2.5 §8.3.4; Fast DDS
+`predeserialize_SecureDataBody` re-aligns the SEC_BODY to 4 before the SEC_POSTFIX, so a non-4-aligned
+plaintext overshoots into `Not valid SecureDataTag`). RECEIVE: a SEC_PREFIX whose key_id resolves to a remote
+USER EntityCrypto (not a secure builtin) is decoded and re-dispatched with `rtps-unwrapped=t` (the AEAD already
+authenticated it); fail-closed on any decode failure.
+
+**Live re-run (`run-fastdds-interop.sh secure 45`, GOV=secure, both directions):** **PROTECTED USER DATA NOW
+FLOWS ONE DIRECTION** — fast2ours `peak-samples=89` (our subscriber decodes Fast DDS's rtps+metadata+data-
+protected user DATA end-to-end), was `peak-samples=0` in T9. ours2fast still 0: Fast DDS reports `217× No key
+material yet → Function lookup_reader` (+ `1× Could not find key material → decode_datareader_submessage`) — it
+receives our protected submessages but has not APPLIED our outbound user `DatawriterCryptoToken`. Notably the
+T9 `Not valid SecureDataTag → decode_rtps_message` SRTPS-level rejection is GONE (fronts 1-3 cleared the
+outer/tag framing). Residual (next loop, do not chase): the OUTBOUND user-token application at Fast DDS
+(`process_participant_volatile_message_secure` → reader-handle map); the inbound path is proven. Connext-Security
+live = the Slice-5b exit gate (RTI Security Plugins absent). our-to-our GREEN both impls: `make test-sbcl`=378,
+`make test-clasp`=378 (full suite, no abort; a one-off stale-`perftest.fasl` FASL-loader fault on the first
+attempt cleared by rebuilding the Clasp cache — not a code regression); gate-hotpath(8)/gate-types(2047)/
+corpus(stub)/fuzz/mem(0.0000) PASS. tshark dissector environment-limited (macOS lo0 NULL/loopback, ADR 0036) —
+the 89-sample live inbound decode is the cross-vendor wire proof. Captures:
+`interop/security-secure-discovery/captures/ssd-secure-*.log` + `T10userdata-RESULT.md`.
+
+### M7/P6 Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP) — T10 review fixes: SEC_BODY 4-align pad placement + rtps_protection enforce-gate on bare user brackets (2026-06-29)
+
+Code-review fixes on the T10 user-DATA protection tier (HEAD `3e92d08`). The load-bearing corroboration is for
+fix-2 (the SEC_BODY 4-octet alignment pad placement); **clean-room, read-only against the OMG spec + eProsima
+Fast DDS (Apache-2.0); RTI Connext NEVER read.**
+
+**(fix-2) SEC_BODY CryptoContent 4-align pad — the pad lives in the SEC_BODY container, NOT the plaintext.**
+The shipped T10 send path padded the PLAINTEXT user DATA submessage to a 4-multiple (extending octetsToNextHeader
++ appending zeros) before the §8.5.1.7-.9 submessage wrap. On receive the recovered DATA then carried a trailing
+pad that inflated `parse-data-body`'s `plen`; for a user DATA whose payload is a data_protection §9.5.3.3
+SecuredPayload, `parse-secured-payload`'s STRICT exact-length check rejected the over-long blob -> NIL -> the
+sample was SILENTLY DROPPED (metadata_protection + data_protection + non-4-aligned payload — untested by the
+green suite because the metadata test used a RAW payload and the data_protection e2e predated metadata_protection).
+- **eProsima Fast DDS `src/cpp/security/cryptography/AESGCMGMAC_Transform.cpp`** at
+  `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`:
+  - `serialize_SecureDataBody` (read L1531-1706): the ENCRYPT branch (submessage=true) writes
+    `SecureBodySubmessage(0x30) ‖ flags`, a dummy uint16 length, then the uint32 `cnt_length`, then the
+    ciphertext; at the end it OVERWRITES the SEC_BODY length as `length = (actual_size + final_size + sizeof(uint32_t)); length = (length + 3) & ~3;` (L1677-1679) and serializes `cnt_length` (= the TRUE ciphertext length)
+    BIG-ENDIAN (L1682); then `if (submessage)` "Align submessage to 4" writes `serializer.alignment(pos, sizeof(int32_t))`
+    zero octets AFTER the ciphertext (L1692-1702). So: cnt_length = the TRUE ciphertext length N (NOT padded);
+    SEC_BODY octetsToNextHeader = `(N + 4 + 3) & ~3` (covers cnt_length(4) + ciphertext(N) + pad); the pad is
+    zero octets after the ciphertext, inside the SEC_BODY. The PLAINTEXT is never padded.
+  - `deserialize_SecureDataBody` (read L1954-2064): reads the BE `protected_len` (= N, L2006), decrypts N bytes,
+    sets `plain_buffer_len = N` (L2046), then "Align submessage to 4" advances `decoder.alignment(pos, sizeof(int32_t))`
+    octets (L2052-2061) — skipping the pad so the SEC_POSTFIX is read 4-aligned. `predeserialize_SecureDataBody`
+    (L2066-2095) computes `body_align` past the SEC_BODY.
+  - `encode_rtps_message` calls `serialize_SecureDataBody(..., /*submessage=*/true)` (L554-557), so the
+    whole-RTPS (SRTPS) tier uses the IDENTICAL SEC_BODY framing as the submessage tier — our shared
+    `%encode-secured-region` / `%decode-secured-region` ENCRYPT branch is correct for both.
+- **OMG DDS-Security 1.1 §9.5.3.3.4.4** (crypto_content) + **DDSI-RTPS 2.5 §8.3.4** (submessage 4-alignment).
+- **Implemented:** `%encode-secured-region` (ENCRYPT) sets octetsToNextHeader = `crypto_content_len(4) + |ct| + pad`
+  with `pad = (-|ct|) mod 4` zero octets after the ciphertext (the SEC_BODY content starts 4-aligned, so the
+  position-based align reduces to `(-|ct|) mod 4`); `%decode-secured-region` (ENCRYPT) skips that pad (cursor
+  align-to-4, bounds-checked via check-room — a pad overrunning the bracket fails closed -> NIL, never an OOB
+  read, even at (safety 0)); `%pad-submessage-to-4` (the plaintext padder) is REMOVED — the plaintext is no
+  longer padded, so the recovered submessage's octetsToNextHeader reflects its TRUE length and the inner
+  SecuredPayload round-trips. **Wire impact:** byte-IDENTICAL for any 4-aligned ENCRYPT body (pad=0) — the
+  shipped byte-exact corpus (T2 submessage 32-octet plaintext, T3 origin-auth 32-octet, T4 SRTPS 44-octet
+  stream) is unchanged and all corpus tests pass on BOTH impls; the framing changes ONLY for a non-4-aligned
+  ENCRYPT body (now Fast-DDS-conformant, was a silent-drop bug on receive). The data_protection serialized-payload
+  tier (`serialize-secured-payload`, a separate function) is untouched.
+
+**(fix-1) rtps_protection ENFORCE-gate on bare user metadata_protection brackets (§8.5.1.10-.12).** The receive
+dispatch gated every PLAIN user-plane clause (DATA/HEARTBEAT/ACKNACK/GAP/*_FRAG) on `(not enforce-rtps)` but NOT
+the user SEC_PREFIX bracket route, so a metadata_protection bracket arriving WITHOUT the mandated outer SRTPS wrap
+was decoded + re-dispatched, bypassing the rtps_protection requirement. Fix: `%on-secure-submessage` takes
+`enforce-rtps` and drops the USER-bracket route when set; the legitimate post-SRTPS re-dispatch sets
+rtps-unwrapped=t so enforce-rtps is NIL there (the wrapped bracket IS delivered); BUILTIN secure brackets
+(secure-SEDP/PVMS/SPDP) stay exempt (metatraffic is intentionally plain this slice — the T12 carry). OMG
+§8.5.1.10-.12; no wire constant involved.
+
+**(fix-3) empty-AAD directed-tamper coverage** (`security-test.lisp` run-security-payload-roundtrip-test): added
+directed byte-flip arms for transformation_key_id (find_key reject), session_id and init_vector_suffix (nonce/KDF
+-> GCM auth fail), closing the analytical-only gap left when the AAD was reconciled to EMPTY (T10).
+
+**(fix-4) NONE-tier static-arena short-circuit** (`%maybe-wrap-user-submessages`): when
+`user-submessage-protection-kind` is `:none` the function returns immediately (the encode resolver declines every
+submessage anyway — see the crypto-manager install), skipping the `(+ len 8192)` static alloc + stream walk on
+every keyed user-data send; wire byte-identical.
+
+**our-to-our GREEN both impls:** `make test-sbcl`=380, `make test-clasp`=380 (full suite, no abort; +2 new tests:
+`user-submessage-data-protection`, `rtps-protection-enforce-user-bracket`); gate-hotpath(8)/gate-types(2048)/
+corpus(stub)/fuzz/mem(0.0000) PASS. The fuzz submessage-protection + rtps-message arms (adversarial brackets,
+prod + safety-0) exercise the new decode pad-skip's bounds check. The fix-2 test was written FAILING-FIRST
+(recovered payload 60 vs 57 octets -> decode NIL) then made green. tshark dissector environment-limited (ADR 0036).
+
+## WP-DDS-SECURITY-FASTDDS-INTEROP T11reverse — ours2fast protected user DATA: data-representation match + SecureDataTag 4-align (Slice 5, 2026-06-30)
+
+The REVERSE-direction blocker closed: cross-vendor PROTECTED USER DATA now flows BOTH ways (the DoD). Live
+`run-fastdds-interop.sh secure 45` vs eProsima Fast DDS v3.6.1: ours2fast = Fast DDS RECEIVED 8/8 of our
+ENCRYPT-protected `HelloWorld` ('Hello world from Lisp', index 0..7); fast2ours = we decode 88 of Fast DDS's
+(unchanged). Two divergences in dependency order, each diagnosed from the live peer + the clean-room Fast DDS
+source + our bytes (tshark cannot dissect lo0, ADR 0036).
+
+- **Sources consulted — Fast DDS (Apache-2.0, eProsima) READ FOR UNDERSTANDING ONLY, no code copied; NO RTI.**
+  `src/cpp/rtps/builtin/discovery/endpoint/EDP.cpp` `valid_matching` + `checkDataRepresentationQos` (the
+  XTypes Table 7.57 writer/reader data-representation compatibility, enforced at match); `src/cpp/security/
+  cryptography/AESGCMGMAC_Transform.cpp` `preprocess_secure_submsg`/`lookup_reader`/`decode_serialized_payload`/
+  `serialize_SecureDataTag`/`serialize_SecureDataBody`/`encode_serialized_payload`; `src/cpp/rtps/security/
+  SecurityManager.cpp` `set_remote_datawriter_crypto_tokens` + the discovered-writer crypto-token apply path.
+  Plus the in-repo OMG specs: **DDS-XTypes 1.3 §7.6.3.1.1/.2 Table 7.57/Table 60** (data representation +
+  encapsulation ids) and **DDS-Security 1.1 §9.5.3.3.3** (SecureDataTag).
+
+- **Divergence 1 — data-representation QoS (the match, upstream of all crypto).** Our interop peer's user WRITER
+  offered XCDR2 only (`make-writer-qos` default `(:xcdr2)`; it serialized D_CDR2_LE). Fast DDS's example HelloWorld
+  is `@extensibility(APPENDABLE)` and its DataReader runs the default `DataReaderQos` = an EMPTY DATA_REPRESENTATION
+  sequence = XCDR1 (`checkDataRepresentationQos`: an XCDR2 writer vs an empty/XCDR1 reader = false, Table 7.57), so
+  Fast DDS REJECTED our writer in `valid_matching` ('Incompatible Data Representation QoS') BEFORE any crypto — the
+  user writer never matched its reader, its DatawriterCryptoToken stayed in `remote_writer_pending_messages_`, and
+  the persistent `No key material yet -> lookup_reader` warnings were benign builtin noise (present IDENTICALLY in
+  the working fast2ours direction — the prior iteration's hypothesis that Fast DDS dropped our user token was
+  WRONG). fast2ours matched because our READER accepts `(:xcdr2 :xcdr1)`. CONFORMANT FIX: the interop peer's user
+  writer offers XCDR1 (PLAIN_CDR, `%hello-world-payload :xcdr1`) — the symmetric resolution already recorded for
+  WP-FLATDATA-XCDR-TRANSCODE (this file, M5 2026-06-17: Fast DDS enforces §7.6.3.1.1 on the writer side and won't
+  match its XCDR1-default reader unless XCDR1 is offered). Harness-only (`src/dds-tests/secure-interop.lisp`); no
+  core/wire change; our stack's XCDR2 default is per-spec and unchanged.
+
+- **Divergence 2 — data_protection SecureDataTag 4-byte alignment (the user-DATA decode, surfaced once the match
+  worked).** With the match fixed, Fast DDS reached `decode_serialized_payload` and failed: 'Error in fastcdr
+  trying to deserialize SecureDataTag length'. Fast DDS `serialize_SecureDataTag` aligns the
+  `receiver_specific_macs` sequence length to a 4-byte boundary relative to the SecuredPayload start (AFTER the
+  common_mac) — so a SecuredPayload is `header(20) ‖ ct_len(u32 BE) ‖ ciphertext(N) ‖ common_mac(16) ‖ <pad to
+  4> ‖ rsm_count(u32 BE)`, always 4-aligned in total. Our `serialize-secured-payload`/`serialize-crypto-footer`
+  omitted the pad, so for a non-4-aligned N (our 34-octet XCDR1 payload) Fast DDS read `rsm_count` 2 octets past
+  the buffer end. fast2ours worked only because Fast DDS's own 'Hello world' payload is N=24 (already 4-aligned).
+  CONFORMANT FIX (`serialize-crypto-footer`/`parse-crypto-footer` in `src/dds-security/crypto/crypto-header.lisp`,
+  `serialize-secured-payload`/`parse-secured-payload` in `src/dds-security/crypto.lisp`): `(align cursor 4)` the
+  `rsm_count` relative to the bracket start, exactly as Fast DDS does. PROVABLE NO-OP for the submessage/whole-RTPS
+  brackets (their framing already lands the common_mac 4-aligned, pad 0 — submessage + rtps-message corpus
+  UNCHANGED, byte-exact) and for the existing secured-payload corpus (its ciphertext is 4 octets, pad 0). It only
+  adds the pad for a bare SecuredPayload with non-4-aligned ciphertext — the conformant Fast-DDS-faithful shape.
+  `run-user-submessage-data-protection-test` updated: its pre-fix premise (a non-4-aligned SecuredPayload) was the
+  non-conformance this closes, so it now asserts data_protection self-4-aligns the SecuredPayload (stronger).
+
+**our-to-our GREEN both impls:** `make test-sbcl`=380; `make test-clasp`=380 (full suite, clean this run; the
+documented NFR-PORT live-socket/threading flake is intermittent — it wanders between tests/runs, re-run not
+chased; the secure suite also passes in isolation). gate-hotpath(8)/gate-types(2048)/corpus(stub)/fuzz/
+mem(0.0000) PASS. Connext-Security live stays the Slice-5b exit gate (RTI Security Plugins absent).

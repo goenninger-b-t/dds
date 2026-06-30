@@ -179,6 +179,11 @@
   (tl-req-sn 1 :type integer)
   (tl-reply-sn 1 :type integer)
   (tl-sent '() :type list) ; reply writer resend store: newest-first (sn . reply-octets)
+  ;; ParticipantStatelessMessage writer SN (stateless-message.lisp, DDS-Security 1.1 §7.4.3): a valid
+  ;; RTPS writerSN MUST be >= 1 (RTPS 2.5 §8.3.5.4 / §8.4.2) — a conformant reader (Fast DDS
+  ;; MessageReceiver: sequenceNumber <= 0 -> "bad sequence Number") drops a SN-0 DATA before the
+  ;; security layer. Monotonic from 1 (incf before each send), so handshake retransmits are fresh samples.
+  (psm-writer-sn 0 :type integer)
   ;; Writer Liveliness Protocol state (participant-message.lisp, RTPS 2.5 §8.4.13)
   (pm-writer-sn 1 :type integer) ; BuiltinParticipantMessageWriter per-writer SN (1-based)
   (remote-liveliness (make-hash-table :test 'equalp) :type hash-table) ; (12-octet prefix . kind) -> %lease-now stamp
@@ -285,6 +290,23 @@
   (rtps-protection-origin-auth nil :type boolean)
   (rtps-protection-encode nil :type (or null function))
   (rtps-protection-decode nil :type (or null function))
+  ;; Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP): USER-DATA submessage protection (metadata_protection_kind,
+  ;; DDS-Security 1.1 §8.5.1.7-.9 / §9.4.1.2.3). When governance sets the user topic's metadata_protection_kind
+  ;; != NONE, EACH user-plane submessage (DATA/DATA_FRAG/HEARTBEAT/GAP/HEARTBEAT_FRAG from the writer;
+  ;; ACKNACK/NACK_FRAG from the reader) is individually wrapped as a SEC_PREFIX ‖ CryptoHeader ‖ SEC_BODY (ENCRYPT)
+  ;; | verbatim (SIGN) ‖ SEC_POSTFIX bracket under the LOCAL user endpoint's EntityCrypto, INSIDE the rtps_protection
+  ;; SRTPS wrap (submessage protection is inner, whole-message outer — Fast DDS RTPSMessageGroup send order). INFO_*
+  ;; submessages pass through unprotected. USER-SUBMESSAGE-PROTECTION-KIND is the EFFECTIVE base kind (:none default
+  ;; = OFF, byte-identical; :sign | :encrypt from governance metadata_protection_kind via create-datawriter/reader).
+  ;; USER-SUBMESSAGE-ENCODE (writer-p -> (values local-EntityCrypto-KM kind) | NIL when not keyed / kind NONE) is the
+  ;; SEND wrap resolver (writer-p T = the user WRITER's EntityCrypto for a DATA/HEARTBEAT/…, NIL = the user READER's
+  ;; for an ACKNACK). USER-SUBMESSAGE-DECODE (4-octet transformation_key_id -> the REMOTE user EntityCrypto KM, or NIL
+  ;; when the key_id is not a USER endpoint — so a builtin bracket still routes to %on-secure-builtin) is the RECEIVE
+  ;; resolver. All NIL/default = security OFF / metadata_protection NONE -> the user submessage path is byte-identical.
+  ;; Installed by %install-crypto-manager + create-datawriter/datareader (the kind from governance).
+  (user-submessage-protection-kind :none :type (member :none :sign :encrypt))
+  (user-submessage-encode nil :type (or null function))
+  (user-submessage-decode nil :type (or null function))
   ;; DDS-Security 1.1 §7.3.4: called (node prefix spdp) outside the lock on first SPDP from a security-capable remote.
   (on-participant-discovered nil :type (or null function))
   ;; DDS-Security 1.1 §7.3: endpoint auth gate (node remote local) -> :compatible|:incompatible|:pending; NIL = security OFF.
@@ -454,8 +476,9 @@
          (tok (disc-node-identity-token-octets node))
          ;; OR PSM bits 22/23 when we carry an IdentityToken (Slice 2b-i); secure SEDP bits 16-19 + secure SPDP
          ;; re-announce bits 26/27 when discovery protection is active (T9/T11); secure participant-message bits
-         ;; 20/21 when liveliness protection is active (T11; DDS-Security 1.1 §7.4.6.1). All default off ->
-         ;; byte-identical SPDP (the Slice 2c/4 baseline).
+         ;; 20/21 when liveliness protection is active (T11; DDS-Security 1.1 §7.4.6.1); PVMS bits 24/25 when the
+         ;; reliable ParticipantVolatileMessageSecure crypto-token endpoint is enabled (Slice-5 T5). All default
+         ;; off -> byte-identical SPDP (the Slice 2c/4 baseline).
          (ep-set (logior dds.rtps.discovery:+builtin-endpoint-set-default+
                          (if tok
                              (logior dds.rtps.discovery:+be-participant-stateless-writer+
@@ -472,7 +495,12 @@
                          (if (%secure-pm-active-p node)
                              (logior dds.rtps.discovery:+be-participant-message-secure-writer+
                                      dds.rtps.discovery:+be-participant-message-secure-reader+)
-                             0))))
+                             0)
+                         ;; §7.4.6.1 / §9.5.3.1: advertise PVMS bit 24/25 iff the endpoint exists, so a peer matches
+                         ;; PVMS and exchanges crypto tokens (Fast DDS SecurityManager.cpp builtin_endpoints +
+                         ;; match_builtin_key_exchange_endpoints gate matching on these bits — without them no tokens flow)
+                         (if (disc-node-pvms-writer node) dds.rtps.discovery:+be-participant-volatile-secure-writer+ 0)
+                         (if (disc-node-pvms-reader node) dds.rtps.discovery:+be-participant-volatile-secure-reader+ 0))))
     (dds.rtps.discovery:make-spdp-data
      :guid-prefix (disc-node-guid-prefix node)
      :version-major 2 :version-minor 5
@@ -665,9 +693,9 @@
 ;; the protected SEDP announce; %announce-secure-liveliness the protected WLP announce (called from
 ;; assert-participant-liveliness); %announce-secure-spdp the protected SPDP re-announce (called from
 ;; announce-participant). All no-op when security is OFF (byte-identical).
-(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t) %on-secure-submessage)
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*)) t) t) %on-secure-submessage)
          (ftype (function (disc-node) (eql t)) %announce-secure-endpoints
-                %announce-secure-liveliness %announce-secure-spdp))
+                %announce-secure-liveliness %announce-secure-spdp %send-secure-builtin-heartbeats))
 
 (defun* %builtin-reader-nl (node prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
@@ -802,6 +830,7 @@
   (flush-batch node)        ; WP-BATCH time trigger: flush a partial batch on the announce cadence
   (%push-heartbeat node)
   (%pvms-push-heartbeats-all node)   ; T8: drive reliable PVMS crypto-token delivery + repair to keyed peers
+  (%send-secure-builtin-heartbeats node)   ; T9pull: solicit a reliable peer's ACKNACK of OUR secure-SEDP endpoints
   t)
 
 (defun* %lease-now ()
@@ -832,18 +861,21 @@
    memoized dest is dropped and re-resolved on the next send."
   (let ((prefix (dds.rtps.discovery:spdp-data-guid-prefix spdp)))
     (unless (equalp prefix (disc-node-guid-prefix node))
-      (let ((hook nil) (new-secure-p nil))
+      (let ((hook nil))
         (dds.pal:with-lock ((disc-node-lock node))
           (let ((key (copy-seq prefix)))
-            (let ((was-known (nth-value 1 (gethash key (disc-node-discovered node)))))
-              (setf (gethash key (disc-node-discovered node)) spdp)
-              (setf (gethash key (disc-node-participant-last-seen node)) (%lease-now))
-              (%invalidate-shmem-dest node prefix)
-              (when (and (not was-known)
-                         (dds.rtps.discovery:spdp-data-identity-token-octets spdp))
-                (setf new-secure-p t)
-                (setf hook (disc-node-on-participant-discovered node))))))
-        (when (and new-secure-p hook)
+            (setf (gethash key (disc-node-discovered node)) spdp)
+            (setf (gethash key (disc-node-participant-last-seen node)) (%lease-now))
+            (%invalidate-shmem-dest node prefix)
+            ;; Fire ON-PARTICIPANT-DISCOVERED for a SECURITY-enabled peer on EVERY SPDP (first +
+            ;; re-announce), not only first discovery: the §8.7 handshake rides the best-effort
+            ;; ParticipantStatelessMessage, so the auth manager uses the re-announce cadence to
+            ;; RETRANSMIT a request the replier may have missed (idempotent for an already-recorded /
+            ;; authenticated remote). A plain (no-IdentityToken) peer is unaffected — the hook is
+            ;; installed only for a security-enabled participant.
+            (when (dds.rtps.discovery:spdp-data-identity-token-octets spdp)
+              (setf hook (disc-node-on-participant-discovered node)))))
+        (when hook
           (funcall hook node prefix spdp))))))
 
 (defun* %seed-discovered-stale (node prefix lease-seconds seconds-ago)
@@ -1281,11 +1313,16 @@
           ;; all-zero bootstrap key_id never lands in the EntityCrypto index). Each path decodes the whole bracket
           ;; (codec bounds-checks + ignores trailing octets) + verifies the inner writerId, fail-closed. Trailing
           ;; SEC_BODY/SEC_POSTFIX dispatch-message walks match no clause.
+          ;; T10 review fix-1: ENFORCE-RTPS is passed so a BARE user metadata_protection bracket (no outer SRTPS)
+          ;; from a keyed-rtps peer that REQUIRES rtps_protection is DROPPED on the USER route (§8.5.1.10-.12),
+          ;; like the sibling plain-user clauses below; BUILTIN secure brackets stay exempt (metatraffic plain
+          ;; this slice). On the post-SRTPS re-dispatch ENFORCE-RTPS is NIL (rtps-unwrapped=t), so the legit
+          ;; wrapped user bracket IS delivered.
           (let ((start (- (dds.core.buffer:cursor-position c) 4)))   ; SEC_PREFIX submessage-header start
             (when (and (>= start 0) (> size start))
               (let ((bracket (make-array (- size start) :element-type '(unsigned-byte 8))))
                 (replace bracket (dds.core.buffer:octet-buffer-vec buf) :start2 start :end2 size)
-                (%on-secure-submessage node src-prefix bracket)))))
+                (%on-secure-submessage node src-prefix bracket enforce-rtps)))))
          ((= id dds.rtps.message:+submsg-heartbeat+)
           (let ((pos (dds.core.buffer:cursor-position c)))
             (multiple-value-bind (rid wid first last hcount hfinal hlive)
@@ -1294,31 +1331,27 @@
               (let ((bid (or (%sedp-reader-id-for wid) (%tl-reader-id-for wid))))
                 (cond
                   (bid (%on-builtin-heartbeat node src-prefix bid wid first last))
-                  ;; Slice 4 (T7): a clear PVMS-writer HEARTBEAT -> apply range + ACKNACK (reliable repair).
-                  ((= wid dds.rtps.discovery:+entityid-participant-volatile-secure-writer+)
-                   (%on-pvms-heartbeat node src-prefix first last))
                   ;; T10 receive enforcement: the USER fall-through (a user reader's HEARTBEAT handler,
                   ;; %on-user-heartbeat) — gate on (not enforce-rtps) so a forged PLAIN HEARTBEAT from a
                   ;; keyed-rtps peer is DROPPED before it corrupts the user reader-proxy / reflects a NACK
-                  ;; storm. Builtin HEARTBEAT (SEDP/TL via BID, PVMS) is handled in the clauses ABOVE and is
-                  ;; NEVER reached here -> stays exempt (DDS-Security 1.1 §8.5.1.10; no false-REJECT).
+                  ;; storm. Builtin HEARTBEAT (SEDP/TL via BID) is handled ABOVE; the PVMS HEARTBEAT is now
+                  ;; submessage-protected (decoded via %on-secure-submessage -> %on-volatile-secure demux,
+                  ;; Slice 5), so it NEVER arrives on this clear path -> exempt (DDS-Security 1.1 §8.5.1.10).
                   ((and (disc-node-on-heartbeat node) (not enforce-rtps))
                    (dds.core.buffer:cursor-set-position c pos)
                    (funcall (disc-node-on-heartbeat node) c flags src-prefix)))))))
          ((= id dds.rtps.message:+submsg-acknack+)
           (let ((pos (dds.core.buffer:cursor-position c)))
             (unless (%on-tl-acknack node src-prefix c flags)
-              ;; Slice 4 (T7): a clear PVMS-writer ACKNACK -> resend the NACKed protected DATA (reliable repair).
-              (dds.core.buffer:cursor-set-position c pos)
-              (unless (%on-pvms-acknack node src-prefix c flags)
-                ;; T10 receive enforcement: the USER fall-through (a user writer's ACKNACK handler,
-                ;; %on-user-acknack) — gate on (not enforce-rtps) so a forged PLAIN ACKNACK from a keyed-rtps
-                ;; peer cannot advance the acked-base / purge unacked HistoryCache changes the real reader never
-                ;; got (permanent data loss). Builtin ACKNACK (TypeLookup, PVMS) is consumed in the unless-chain
-                ;; ABOVE and is NEVER reached here -> stays exempt (DDS-Security 1.1 §8.5.1.10; no false-REJECT).
-                (when (and (disc-node-on-acknack node) (not enforce-rtps))
-                  (dds.core.buffer:cursor-set-position c pos)
-                  (funcall (disc-node-on-acknack node) c flags src-prefix))))))
+              ;; T10 receive enforcement: the USER fall-through (a user writer's ACKNACK handler,
+              ;; %on-user-acknack) — gate on (not enforce-rtps) so a forged PLAIN ACKNACK from a keyed-rtps
+              ;; peer cannot advance the acked-base / purge unacked HistoryCache changes the real reader never
+              ;; got (permanent data loss). Builtin ACKNACK (TypeLookup) is consumed ABOVE; the PVMS ACKNACK is
+              ;; now submessage-protected (decoded via %on-secure-submessage -> %on-volatile-secure demux,
+              ;; Slice 5), so it NEVER arrives on this clear path -> exempt (DDS-Security 1.1 §8.5.1.10).
+              (when (and (disc-node-on-acknack node) (not enforce-rtps))
+                (dds.core.buffer:cursor-set-position c pos)
+                (funcall (disc-node-on-acknack node) c flags src-prefix)))))
          ;; T10 receive enforcement: GAP routes ONLY to the user reader's handler (%on-user-gap, itself gated on
          ;; a user writer EntityId — there is NO builtin GAP handler, so builtin GAP is already a no-op here) —
          ;; gate the clause on (not enforce-rtps) so a forged PLAIN GAP from a keyed-rtps peer cannot mark user

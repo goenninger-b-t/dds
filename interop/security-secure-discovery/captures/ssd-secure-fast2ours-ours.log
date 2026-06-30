@@ -1,0 +1,76 @@
+WARNING:
+   The new FTYPE proclamation for NET.GOENNINGER.DDS.DCPS::CM-ON-AUTHENTICATED
+     (FUNCTION
+      (NET.GOENNINGER.DDS.DCPS::CRYPTO-MANAGER
+       NET.GOENNINGER.DDS.DISC:DISC-NODE (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (12)))
+      (EQL T))
+   does not match the old FTYPE proclamation
+     (FUNCTION
+      (T NET.GOENNINGER.DDS.DISC:DISC-NODE
+       (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (12)))
+      (VALUES (MEMBER T) &REST T))
+WARNING:
+   The new FTYPE proclamation for
+   NET.GOENNINGER.DDS.DCPS::%INSTALL-CRYPTO-MANAGER
+     (FUNCTION
+      (NET.GOENNINGER.DDS.DCPS:DOMAIN-PARTICIPANT
+       NET.GOENNINGER.DDS.DCPS::AUTH-MANAGER-STATE
+       NET.GOENNINGER.DDS.DISC:DISC-NODE)
+      NET.GOENNINGER.DDS.DCPS::CRYPTO-MANAGER)
+   does not match the old FTYPE proclamation
+     (FUNCTION
+      (NET.GOENNINGER.DDS.DCPS:DOMAIN-PARTICIPANT
+       NET.GOENNINGER.DDS.DCPS::AUTH-MANAGER-STATE
+       NET.GOENNINGER.DDS.DISC:DISC-NODE)
+      *)
+[sub] secure participant up: domain=0 topic=HelloWorldTopic type=HelloWorld guid-prefix=B9A1E95FB45E7C7C7C7C7C7C port=7420 peers=127.0.0.1:7410
+; auth-manager[D1437B8E7A95]: requester: sent HandshakeRequest
+; auth-manager[D1437B8E7A95]: authenticated; driving crypto-token exchange over PVMS
+[sub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=2 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=4 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=6 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=8 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=10 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=12 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=14 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=16 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=18 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=20 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=22 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=24 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=26 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=28 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=30 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=32 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=34 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=36 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=38 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=40 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=42 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=44 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=46 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=48 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=50 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=52 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=54 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=56 keyed=T states=D1437B8E=KEYED
+[sub] discovered=1 matched=1 samples=58 keyed=T states=D1437B8E=KEYED
+; auth-manager[D1437B8E7A95]: requester: sent HandshakeRequest
+[sub] discovered=3 matched=1 samples=60 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=62 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=64 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=66 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=68 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=70 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=72 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=74 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=76 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=78 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=80 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=82 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=84 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=86 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+[sub] discovered=3 matched=1 samples=88 keyed=T states=D1437B8E=KEYED,D1437B8E=HANDSHAKING,B9A1E95F=NONE
+SUMMARY: role=sub discovered=3 peak-matched=1 peak-samples=88 ever-keyed=T sent=0
+RESULT: PASS

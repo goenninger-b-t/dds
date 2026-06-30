@@ -63,12 +63,9 @@
    bit 0) = 1 (DDSI-RTPS 2.5 §9.4.5.1.2). This codec emits little-endian (the RTPS common case,
    matching the Slice-1/T1 cursor convention and Fast DDS encode_datawriter_submessage flags=BIT(0)).")
 
-(defconstant +empty-octets+
-    (if (boundp '+empty-octets+)
-        (symbol-value '+empty-octets+)
-        (make-array 0 :element-type '(unsigned-byte 8)))
-  "A shared zero-length octet vector: the EMPTY AAD (ENCRYPT) and the EMPTY plaintext (SIGN/GMAC)
-   handed to %seal-with-km / %open-with-km. Boundp-guarded so a reload is a no-op (defconstant rule).")
+;; +empty-octets+ (the shared EMPTY AAD / EMPTY plaintext for %seal-with-km / %open-with-km) is defined in
+;; crypto.lisp (the first dds-security file) so BOTH this submessage tier AND the transform.lisp payload tier
+;; reference the one instance across the load order (DRY) — Fast-DDS-faithful empty AAD, see its docstring.
 
 (defconstant +sec-submessage-header-len+ 4
   "RTPS SubmessageHeader width = submessageId(1)+flags(1)+octetsToNextHeader(u16) (DDSI-RTPS 2.5
@@ -299,9 +296,15 @@
              (postfix-len (+ +common-mac-len+ +receiver-specific-macs-count-len+
                              (* (length receiver-macs)
                                 (+ +transformation-key-id-len+ +common-mac-len+))))
+             ;; ENCRYPT SEC_BODY 4-align pad: zero octets AFTER the ciphertext so the SEC_POSTFIX starts
+             ;; 4-aligned (Fast DDS serialize_SecureDataBody, L1692-1702: "Align submessage to 4"). The
+             ;; SEC_BODY content starts 4-aligned (PREFIX 24 + SEC_BODY hdr 4 + cnt_length 4 = 32), so the
+             ;; align reduces to (-|ciphertext| mod 4); the plaintext is NEVER padded (the recovered submessage
+             ;; reflects its TRUE length). SIGN has no SEC_BODY -> no pad here (its alignment is the T12 carry).
+             (ct-pad (ecase mode (:encrypt (mod (- (length ciphertext)) 4)) (:sign 0)))
              (mid-len (ecase mode
                         (:encrypt (+ +sec-submessage-header-len+ +crypto-content-length-len+
-                                     (length ciphertext)))
+                                     (length ciphertext) ct-pad))
                         (:sign    (length plain-region))))
              (total (+ +sec-submessage-header-len+ +secure-data-header-len+   ; PREFIX
                        mid-len                                                 ; SEC_BODY (ENCRYPT) | verbatim (SIGN)
@@ -313,10 +316,13 @@
                (%write-sec-submessage-header cur prefix-kind +secure-data-header-len+)
                (serialize-crypto-header cur kind key-id session-id iv-suffix)
                (ecase mode
-                 ;; ENCRYPT: SEC_BODY (0x30) ‖ length-prefixed ciphertext (§9.5.3.3.4.4).
+                 ;; ENCRYPT: SEC_BODY (0x30) ‖ crypto_content (cnt_length = TRUE ciphertext length, BE)
+                 ;; ‖ ciphertext ‖ 4-align pad (§9.5.3.3.4.4; Fast DDS serialize_SecureDataBody L1677-1702:
+                 ;; octetsToNextHeader = (|ciphertext|+4+3)&~3 covers cnt_length + ciphertext + pad).
                  (:encrypt (%write-sec-submessage-header cur +submessage-sec-body+
-                                                         (+ +crypto-content-length-len+ (length ciphertext)))
-                           (serialize-crypto-content cur ciphertext))
+                                                         (+ +crypto-content-length-len+ (length ciphertext) ct-pad))
+                           (serialize-crypto-content cur ciphertext)
+                           (dotimes (_ ct-pad) (dds.core.buffer:put-u8 cur 0)))
                  ;; SIGN: the region VERBATIM, no SEC_BODY, no length prefix (§9.5.3.3.4.3).
                  (:sign (dds.core.buffer:put-octets cur plain-region 0 (length plain-region))))
                (%write-sec-submessage-header cur postfix-kind postfix-len)
@@ -498,6 +504,16 @@
                    (return-from decode nil))
                  (let ((body (parse-crypto-content cur)))
                    (unless body (return-from decode nil))
+                   ;; Skip the SEC_BODY 4-align pad (zero octets after the ciphertext) so the SEC_POSTFIX is
+                   ;; read 4-aligned (Fast DDS deserialize_SecureDataBody L2052-2061 "Align submessage to 4").
+                   ;; The cursor position is bracket-relative (origin 0 at the bracket start), so the pad is
+                   ;; (-pos) mod 4 — fixed by the bracket-relative position alone, never the bracket's datagram
+                   ;; offset. check-room bounds it -> a pad overrunning the bracket fails closed (the outer
+                   ;; handler -> NIL), never an OOB read, even at (safety 0) (NFR-SEC-POSTURE).
+                   (let ((pad (mod (- (dds.core.buffer:cursor-position cur)) 4)))
+                     (when (plusp pad)
+                       (dds.core.buffer:check-room cur pad)
+                       (dds.core.buffer:cursor-set-position cur (+ (dds.core.buffer:cursor-position cur) pad))))
                    (multiple-value-bind (common-mac receiver-macs)
                        (%parse-sec-postfix-mac cur postfix-kind)
                      (unless common-mac (return-from decode nil))

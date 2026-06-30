@@ -33,19 +33,31 @@
    The SerializedPayload is the §10.2 PLAIN_CDR_LE encapsulation header (%psm-encapsulate) + the
    CDR-LE envelope, matching a conformant peer (Fast DDS prepends/strips this header). Destination:
    DEST-PREFIX's metatraffic unicast locator (looked up under the node lock via %remote-metatraffic).
-   No-op if the remote is not yet discovered or has no usable locator. Uses the rx-tx-msg scratch
-   buffer (called from the receiver thread during handshake callback)."
+   No-op if the remote is not yet discovered or has no usable locator. Uses a PER-CALL message buffer
+   sized to the payload (RTPS header + DATA + payload), not the fixed 2048-octet rx-tx-msg scratch — a
+   §8.7.2.4 handshake token carrying the c.id certificate plus the §9.3.2.1 c.perm S/MIME Permissions
+   credential can exceed 2 KiB (WP-DDS-SECURITY-FASTDDS-INTEROP T6). Allocated from the static arena and
+   freed here (control-plane; per-message alloc is intentional, no hot-path concern)."
   (let ((hp (%remote-metatraffic node dest-prefix)))
     (when hp
-      (let ((payload (%psm-encapsulate envelope-octets)))
-        (%send-msg-buf node (disc-node-rx-tx-msg node)
-                       (lambda (mc)
-                         ;; writer-SN 0: best-effort PSM, no reliable-channel SN discipline (DDS-Security 1.1 §7.4.3)
-                         (dds.rtps.message:write-data
-                          mc dds.rtps.discovery:+entityid-participant-stateless-reader+
-                          dds.rtps.discovery:+entityid-participant-stateless-writer+
-                          0 payload 0 (length payload)))
-                       (car hp) (cdr hp)))))
+      (let ((payload (%psm-encapsulate envelope-octets))
+            ;; A valid RTPS writerSN is >= 1 (RTPS 2.5 §8.3.5.4 / §8.4.2); SN 0 is rejected by a
+            ;; conformant reader (Fast DDS MessageReceiver "bad sequence Number") BEFORE the security
+            ;; layer. Monotonic from 1 even though the endpoint is best-effort/stateless, so each
+            ;; handshake (re)transmission is a fresh sample the peer's stateless reader accepts.
+            (sn (dds.pal:with-lock ((disc-node-lock node))
+                  (incf (disc-node-psm-writer-sn node)))))
+        ;; RTPS header(20) + DATA(4 + 20 fixed + payload) -> +128 generous slack (mirrors %send-pm-assertion).
+        (let ((buf (dds.core.buffer:make-octet-buffer (+ 128 (length payload)))))
+          (unwind-protect
+               (%send-msg-buf node buf
+                              (lambda (mc)
+                                (dds.rtps.message:write-data
+                                 mc dds.rtps.discovery:+entityid-participant-stateless-reader+
+                                 dds.rtps.discovery:+entityid-participant-stateless-writer+
+                                 sn payload 0 (length payload)))
+                              (car hp) (cdr hp))
+            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))))
   t)
 
 (defun* %on-stateless-message (node src-prefix wtr sn buf poff plen)

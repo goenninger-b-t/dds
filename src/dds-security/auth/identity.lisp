@@ -58,11 +58,13 @@
 
 (defun* %cdr-property-le (name value)
     (function (string string) (simple-array (unsigned-byte 8) (*)))
-  "Encode a DDS-Security Property (name:string, value:string, propagate:boolean=true) in CDR LE.
-   propagate is 1 byte (true=1) + 3 pad bytes to restore 4-byte alignment (DDS-Security §7.2)."
+  "Encode a §9.3.4 DDS-Security Property (name:string, value:string) in CDR LE — name+value ONLY.
+   The propagate flag is a LOCAL include/exclude filter (DDS-Security 1.1 §7.2.2 /
+   dds_security_plugins_spis.idl), NEVER serialized: a propagate=false Property is OMITTED from the
+   PropertySeq entirely; the serialized count = the number of propagate==true Properties. Conformant
+   with Fast DDS (WP-DDS-SECURITY-FASTDDS-INTEROP T1; T0 spike, 4-way-corroborated)."
   (%concat-octets (%cdr-string-le name)
-                  (%cdr-string-le value)
-                  (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 0 0 0))))
+                  (%cdr-string-le value)))
 
 ;;; --- IdentityToken computation (§8.7.2.2 / §9.3.1) ---
 
@@ -105,6 +107,55 @@
   (guid        (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
                :type (simple-array (unsigned-byte 8) (16))))
 
+;;; --- §9.3.2.1 authenticated-participant GUID derivation ---
+;;; DDS-Security 1.1 §9.3.2.1 / §8.7.2.4: an authenticated participant's GUID prefix encodes its
+;;; identity. Bit 0 (MSB of octet 0) is set to 1; the next 47 bits are the first 47 bits of
+;;; SHA-256(DER subject name) of the identity certificate; the remaining 6 octets are
+;;; implementation-defined for uniqueness. A conformant replier (Fast DDS PKIDH::begin_handshake_reply)
+;;; RE-DERIVES these 48 bits from the peer cert and REJECTS the HandshakeRequest unless the GUID in
+;;; c.pdata matches. The bit layout below is corroborated byte-for-byte against Fast DDS
+;;; adjust_participant_key (PKIDH.cpp); provenance: docs/provenance.md (clean-room, Apache-2.0 read only).
+
+(defun* %adjust-guid-prefix (cert candidate-prefix)
+    (function (cffi:foreign-pointer (simple-array (unsigned-byte 8) (12)))
+              (simple-array (unsigned-byte 8) (12)))
+  "The DDS-Security 1.1 §9.3.2.1 adjusted GUID prefix for CERT: octets 0-5 carry bit-0=1 (auth flag)
+   then the first 47 bits of SHA-256(DER subject name); octets 6-11 are the impl-defined uniqueness
+   carried verbatim from CANDIDATE-PREFIX. Returns a fresh 12-octet prefix. Falls back to
+   CANDIDATE-PREFIX unchanged if the subject-name digest is unavailable (fail-soft: a non-adjusted
+   GUID only loses cross-vendor auth, never breaks our-to-our discovery)."
+  (let ((md (dds.dare:x509-subject-name-sha256 cert))
+        (out (make-array 12 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (cond
+      ((null md) (replace out candidate-prefix) out)
+      (t
+       (setf (aref out 0) (logior #x80 (ash (aref md 0) -1)))
+       (setf (aref out 1) (logand #xff (logior (ash (aref md 0) 7) (ash (aref md 1) -1))))
+       (setf (aref out 2) (logand #xff (logior (ash (aref md 1) 7) (ash (aref md 2) -1))))
+       (setf (aref out 3) (logand #xff (logior (ash (aref md 2) 7) (ash (aref md 3) -1))))
+       (setf (aref out 4) (logand #xff (logior (ash (aref md 3) 7) (ash (aref md 4) -1))))
+       (setf (aref out 5) (logand #xff (logior (ash (aref md 4) 7) (ash (aref md 5) -1))))
+       (dotimes (i 6 out) (setf (aref out (+ 6 i)) (aref candidate-prefix (+ 6 i))))))))
+
+(defun* %participant-guid-from-cert (cert candidate)
+    (function (cffi:foreign-pointer (simple-array (unsigned-byte 8) (16)))
+              (simple-array (unsigned-byte 8) (16)))
+  "Build the §9.3.2.1 authenticated participant GUID_t for CERT: the 12-octet adjusted prefix
+   (%ADJUST-GUID-PREFIX over CANDIDATE's octets 0-11) followed by ENTITYID_PARTICIPANT (the 4-octet
+   participant EntityId, RTPS 2.5 §9.3.1.2, MSB-first). This is the participant's authoritative GUID:
+   announced in SPDP AND carried in c.pdata as PID_PARTICIPANT_GUID, so a conformant replier's
+   c.pdata participant_key check passes."
+  (let ((cand-prefix (make-array 12 :element-type '(unsigned-byte 8)))
+        (out (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (dotimes (i 12) (setf (aref cand-prefix i) (aref candidate i)))
+    (let ((adj (%adjust-guid-prefix cert cand-prefix)))
+      (dotimes (i 12) (setf (aref out i) (aref adj i)))
+      (setf (aref out 12) (ldb (byte 8 24) +entityid-participant+)
+            (aref out 13) (ldb (byte 8 16) +entityid-participant+)
+            (aref out 14) (ldb (byte 8  8) +entityid-participant+)
+            (aref out 15) (ldb (byte 8  0) +entityid-participant+))
+      out)))
+
 ;;; --- public API ---
 
 (defun* validate-local-identity (ca-pem cert-pem key-pem guid)
@@ -117,7 +168,10 @@
    CA-PEM: Identity CA certificate PEM octets.
    CERT-PEM: Participant identity certificate PEM octets.
    KEY-PEM: Participant private key PEM octets.
-   GUID: 16-octet participant GUID (used for the §8.7.2.4 role decision in validate-remote-identity).
+   GUID: 16-octet candidate participant GUID. The stored IDENTITY-HANDLE-GUID is the §9.3.2.1
+   AUTHENTICATED GUID derived from it: octets 0-5 are replaced by the cert subject-name SHA-256
+   adjustment (bit-0=1 + first 47 bits of the digest) so a conformant peer accepts our HandshakeRequest;
+   octets 6-11 of GUID are carried verbatim for uniqueness; the EntityId becomes ENTITYID_PARTICIPANT.
    Returns (values IDENTITY-HANDLE NIL) on success, (values NIL reason-string) on failure.
    All foreign handles are owned by the returned identity-handle; caller MUST call
    FREE-IDENTITY-HANDLE when done (DDS-Security 1.1 §8.7.2 / §9.3.1)."
@@ -163,9 +217,12 @@
                        (dds.dare:x509-ca-free ca-store)
                        (return-from validate-local-identity
                          (values nil "failed to extract cert/CA subject names")))
-                     (let ((token (%build-identity-token cert-sn cert-algo ca-sn ca-algo)))
+                     (let ((token     (%build-identity-token cert-sn cert-algo ca-sn ca-algo))
+                           ;; §9.3.2.1: the participant's authoritative GUID is derived from the cert
+                           ;; subject-name SHA-256 (octets 0-5) + GUID's octets 6-11 for uniqueness.
+                           (part-guid (%participant-guid-from-cert cert guid)))
                        (values (%make-identity-handle :cert cert :pkey pkey :ca-store ca-store
-                                                      :token-octets token :guid guid)
+                                                      :token-octets token :guid part-guid)
                                nil))))
               ;; cleanup: free the three temporaries on every exit path
               (when pub-key    (dds.dare:pkey-free pub-key))
@@ -237,11 +294,9 @@
                        (incf pos (+ len pad))
                        s)))
                  (read-cdr-property ()
-                   ;; name:string, value:string, propagate:bool(1)+3pad
+                   ;; §9.3.4 Property = name:string + value:string ONLY (no propagate byte on the wire, T1)
                    (let* ((name  (read-cdr-string))
                           (value (read-cdr-string)))
-                     (when (> (+ pos 4) n) (error "truncated propagate field"))
-                     (incf pos 4)         ; propagate byte + 3 pad
                      (values name value))))
           ;; skip class_id string
           (read-cdr-string)

@@ -366,6 +366,47 @@
                (if (cffi:null-pointer-p cert) nil cert))
           (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil :pointer bio :int))))))
 
+(defun* x509-to-pem (cert)
+    (function (cffi:foreign-pointer) (or (simple-array (unsigned-byte 8) (*)) null))
+  "PEM-encode X509* CERT via PEM_write_bio_X509 over a mem BIO (pem.h, OpenSSL 3.6.2).
+   Returns the '-----BEGIN CERTIFICATE-----' PEM octets (fresh heap vector) or NIL on failure.
+   This is the DDS-Security 1.1 §9.3.2.1 c.id credential form a conformant peer expects:
+   corroborated against Fast DDS store_certificate_in_buffer (PEM_write_bio_X509) which fills
+   the c.id binary-property + load_certificate (PEM_read_bio_X509_AUX) which reads it. Reads the
+   BIO back via BIO_ctrl/BIO_CTRL_INFO=3 (bio.h:92 / BIO_get_mem_data macro bio.h:615)."
+  (let ((bio (cffi:foreign-funcall-pointer
+               (%ossl-sym "BIO_new") nil
+               :pointer (cffi:foreign-funcall-pointer (%ossl-sym "BIO_s_mem") nil :pointer)
+               :pointer)))
+    (when (cffi:null-pointer-p bio) (return-from x509-to-pem nil))
+    (unwind-protect
+         (let ((wc (cffi:foreign-funcall-pointer (%ossl-sym "PEM_write_bio_X509") nil
+                                                  :pointer bio :pointer cert :int)))
+           (unless (= wc 1) (return-from x509-to-pem nil))
+           (cffi:with-foreign-pointer (dptr (cffi:foreign-type-size :pointer))
+             (let ((len (cffi:foreign-funcall-pointer (%ossl-sym "BIO_ctrl") nil
+                                                       :pointer bio
+                                                       :int 3        ; BIO_CTRL_INFO (bio.h:92)
+                                                       :long 0
+                                                       :pointer dptr
+                                                       :long)))
+               (when (<= len 0) (return-from x509-to-pem nil))
+               (let* ((ptr (cffi:mem-ref dptr :pointer))
+                      (out (make-array len :element-type '(unsigned-byte 8))))
+                 (dotimes (j len out)
+                   (setf (aref out j) (cffi:mem-aref ptr :uint8 j)))))))
+      (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil :pointer bio :int))))
+
+(defun* x509-load-cert-auto (octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (or cffi:foreign-pointer null))
+  "Load an X.509 certificate from OCTETS in EITHER PEM or DER form (decode-tolerant).
+   Tries PEM first (X509-LOAD-CERT / PEM_read_bio_X509 — the DDS-Security §9.3.2.1 c.id wire
+   form emitted by Fast DDS and by our own X509-TO-PEM), then falls back to DER (X509-LOAD-CERT-DER
+   / d2i_X509) so a legacy DER-bearing peer is not falsely rejected. Returns a foreign X509*
+   (caller MUST X509-FREE) or NIL if neither parses. Fail-closed: NIL on any malformed input."
+  (or (x509-load-cert octets)
+      (x509-load-cert-der octets)))
+
 (defun* x509-free (cert)
     (function ((or cffi:foreign-pointer null)) t)
   "Release an X509* handle returned by X509-LOAD-CERT (X509_free, x509.h)."
@@ -443,6 +484,28 @@
                                       :int 0
                                       :void)))))
 
+(defun* x509-subject-name-sha256 (cert)
+    (function (cffi:foreign-pointer) (or (simple-array (unsigned-byte 8) (32)) null))
+  "SHA-256 of CERT's DER-encoded subject name via X509_NAME_digest(X509_get_subject_name(cert),
+   EVP_sha256()) (OpenSSL 3.6.2). Returns a fresh 32-octet vector or NIL on error. This is the digest
+   the DDS-Security 1.1 §9.3.2.1 authenticated-participant GUID prefix is derived from (the identical
+   digest a conformant replier recomputes when it checks the c.pdata participant_key's 47 bits)."
+  (let ((name (cffi:foreign-funcall-pointer (%ossl-sym "X509_get_subject_name") nil
+                                             :pointer cert :pointer)))
+    (when (cffi:null-pointer-p name) (return-from x509-subject-name-sha256 nil))
+    (let ((md (cffi:foreign-funcall-pointer (%ossl-sym "EVP_sha256") nil :pointer)))
+      (when (cffi:null-pointer-p md) (return-from x509-subject-name-sha256 nil))
+      (cffi:with-foreign-pointer (out 32)
+        (cffi:with-foreign-pointer (len-ptr (cffi:foreign-type-size :unsigned-int))
+          (setf (cffi:mem-ref len-ptr :unsigned-int) 0)
+          (let ((rc (cffi:foreign-funcall-pointer (%ossl-sym "X509_NAME_digest") nil
+                                                   :pointer name :pointer md
+                                                   :pointer out :pointer len-ptr :int)))
+            (when (or (/= rc 1) (/= (cffi:mem-ref len-ptr :unsigned-int) 32))
+              (return-from x509-subject-name-sha256 nil))
+            (let ((v (make-array 32 :element-type '(unsigned-byte 8))))
+              (dotimes (i 32 v) (setf (aref v i) (cffi:mem-aref out :uint8 i))))))))))
+
 (defun* x509-public-key (cert)
     (function (cffi:foreign-pointer) (or cffi:foreign-pointer null))
   "Extract the public key EVP_PKEY* from CERT (X509*) via X509_get_pubkey (x509.h line 886).
@@ -494,74 +557,105 @@
           ((= id +evp-pkey-nid-ec+)  :ec)
           (t (error "pkey-kind: unrecognized EVP_PKEY NID ~d" id)))))
 
+(defconstant +cms-text+ #x1
+  "OpenSSL CMS_TEXT flag (cms.h:179): require + strip the S/MIME text/plain MIME wrapper from the
+   verified content. Used for the MIME multipart/signed container form (the S/MIME text wrapper).")
+
 (defun* cms-verify (smime-octets ca-store)
     (function ((simple-array (unsigned-byte 8) (*)) cffi:foreign-pointer)
               (or (simple-array (unsigned-byte 8) (*)) null))
-  "Verify the PEM CMS SignedData in SMIME-OCTETS against CA-STORE (X509_STORE*).
-   Returns the verified inner-content bytes on success; NIL on any failure (fail-closed).
-   Uses PEM_read_bio_CMS (pem.h, OpenSSL 3.6.2) to parse the -----BEGIN PKCS7----- PEM
-   wrapper, CMS_verify (cms.h lines 276-277, flags=0: full chain+content+attr verify),
-   then BIO_ctrl/BIO_CTRL_INFO=3 to recover the plaintext from the output mem-BIO.
-   DDS-Security 1.1 §9.4.1.1: documents are opaque CMS SignedData (-----BEGIN PKCS7-----)
-   signed by the Permissions CA with SHA-256; fail-closed matches §8.4 AccessControl policy."
+  "Verify a Permissions-CA-signed governance/permissions document in SMIME-OCTETS against CA-STORE
+   (X509_STORE*), returning the verified inner-content bytes; NIL on any failure (fail-closed).
+   Decode-tolerant of BOTH §9.4.1.1 container forms (DDS-Security 1.1 §9.4.1.1; RFC 5652 + RFC 5751):
+     (1) bare-PEM CMS SignedData (-----BEGIN PKCS7-----, embedded content) via PEM_read_bio_CMS (flags=0);
+     (2) MIME multipart/signed S/MIME (detached content + Content-Type: text/plain wrapper) via
+         SMIME_read_CMS + CMS_TEXT — the form Fast DDS validate_remote_permissions emits/reads
+         (SMIME_read_PKCS7 + PKCS7_verify(PKCS7_TEXT|...), Permissions.cpp:354/406; clean-room, Apache-2.0).
+   Form (1) is tried first (byte-identical to the prior PEM-only path); form (2) is the fallback so a
+   cross-vendor c.perm and any S/MIME-signed document validate (WP-DDS-SECURITY-FASTDDS-INTEROP T6).
+   Both verify the full chain against CA-STORE (CMS_verify, cms.h:276-277) then recover the plaintext
+   via BIO_ctrl/BIO_CTRL_INFO=3 (OpenSSL 3.6.2); fail-closed matches §8.4 AccessControl policy."
   (let ((n (length smime-octets)))
     (cffi:with-foreign-pointer (buf (max 1 n))
       (dotimes (i n)
         (setf (cffi:mem-aref buf :uint8 i) (aref smime-octets i)))
-      (let ((bio-in (cffi:foreign-funcall-pointer (%ossl-sym "BIO_new_mem_buf") nil
-                                                   :pointer buf :int n :pointer)))
-        (when (cffi:null-pointer-p bio-in)
-          (return-from cms-verify nil))
+      (let ((cms       (cffi:null-pointer))
+            (bcont     (cffi:null-pointer))   ; SMIME detached-content BIO (form 2 only)
+            (smime-bio (cffi:null-pointer))   ; kept alive across CMS_verify (form 2 references it)
+            (flags     0))
         (unwind-protect
              (handler-case
-                 (let ((cms (cffi:foreign-funcall-pointer (%ossl-sym "PEM_read_bio_CMS") nil
-                                                           :pointer bio-in
-                                                           :pointer (cffi:null-pointer)
-                                                           :pointer (cffi:null-pointer)
-                                                           :pointer (cffi:null-pointer)
-                                                           :pointer)))
+                 (progn
+                   ;; form (1): bare-PEM CMS (-----BEGIN PKCS7-----); embedded content, flags=0.
+                   (let ((bio1 (cffi:foreign-funcall-pointer (%ossl-sym "BIO_new_mem_buf") nil
+                                                             :pointer buf :int n :pointer)))
+                     (unless (cffi:null-pointer-p bio1)
+                       (unwind-protect
+                            (setf cms (cffi:foreign-funcall-pointer (%ossl-sym "PEM_read_bio_CMS") nil
+                                                                    :pointer bio1
+                                                                    :pointer (cffi:null-pointer)
+                                                                    :pointer (cffi:null-pointer)
+                                                                    :pointer (cffi:null-pointer)
+                                                                    :pointer))
+                         (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil :pointer bio1 :int))))
+                   ;; form (2): MIME multipart/signed S/MIME — only if the PEM parse did not yield a CMS.
+                   (when (cffi:null-pointer-p cms)
+                     (setf smime-bio (cffi:foreign-funcall-pointer (%ossl-sym "BIO_new_mem_buf") nil
+                                                                   :pointer buf :int n :pointer))
+                     (unless (cffi:null-pointer-p smime-bio)
+                       (cffi:with-foreign-object (bcont-ptr :pointer)
+                         (setf (cffi:mem-ref bcont-ptr :pointer) (cffi:null-pointer))
+                         (setf cms (cffi:foreign-funcall-pointer (%ossl-sym "SMIME_read_CMS") nil
+                                                                 :pointer smime-bio
+                                                                 :pointer bcont-ptr
+                                                                 :pointer))
+                         (setf bcont (cffi:mem-ref bcont-ptr :pointer)
+                               flags +cms-text+))))
                    (when (cffi:null-pointer-p cms)
                      (return-from cms-verify nil))
-                   (unwind-protect
-                        (let ((bio-out (cffi:foreign-funcall-pointer
-                                         (%ossl-sym "BIO_new") nil
-                                         :pointer (cffi:foreign-funcall-pointer
-                                                    (%ossl-sym "BIO_s_mem") nil :pointer)
-                                         :pointer)))
-                          (when (cffi:null-pointer-p bio-out)
-                            (return-from cms-verify nil))
-                          (unwind-protect
-                               (let ((rc (cffi:foreign-funcall-pointer
-                                           (%ossl-sym "CMS_verify") nil
-                                           :pointer cms
-                                           :pointer (cffi:null-pointer)  ; certs: use embedded
-                                           :pointer ca-store
-                                           :pointer (cffi:null-pointer)  ; dcont: NULL=embedded
+                   ;; shared tail: chain-verify against CA-STORE, recover the inner content bytes.
+                   (let ((bio-out (cffi:foreign-funcall-pointer
+                                    (%ossl-sym "BIO_new") nil
+                                    :pointer (cffi:foreign-funcall-pointer
+                                               (%ossl-sym "BIO_s_mem") nil :pointer)
+                                    :pointer)))
+                     (when (cffi:null-pointer-p bio-out)
+                       (return-from cms-verify nil))
+                     (unwind-protect
+                          (let ((rc (cffi:foreign-funcall-pointer
+                                      (%ossl-sym "CMS_verify") nil
+                                      :pointer cms
+                                      :pointer (cffi:null-pointer)  ; certs: use embedded / store
+                                      :pointer ca-store
+                                      :pointer bcont                ; detached content (form 2) or NULL (form 1)
+                                      :pointer bio-out
+                                      :unsigned-int flags           ; 0 (form 1) | CMS_TEXT (form 2)
+                                      :int)))
+                            (unless (= rc 1) (return-from cms-verify nil))
+                            (cffi:with-foreign-pointer
+                                (dptr (cffi:foreign-type-size :pointer))
+                              (let ((len (cffi:foreign-funcall-pointer
+                                           (%ossl-sym "BIO_ctrl") nil
                                            :pointer bio-out
-                                           :unsigned-int 0               ; flags: full verify
-                                           :int)))
-                                 (unless (= rc 1) (return-from cms-verify nil))
-                                 (cffi:with-foreign-pointer
-                                     (dptr (cffi:foreign-type-size :pointer))
-                                   (let ((len (cffi:foreign-funcall-pointer
-                                                (%ossl-sym "BIO_ctrl") nil
-                                                :pointer bio-out
-                                                :int 3     ; BIO_CTRL_INFO (bio.h)
-                                                :long 0
-                                                :pointer dptr
-                                                :long)))
-                                     (when (<= len 0)
-                                       (return-from cms-verify nil))
-                                     (let* ((ptr (cffi:mem-ref dptr :pointer))
-                                            (result (make-array len
-                                                      :element-type '(unsigned-byte 8))))
-                                       (dotimes (j len result)
-                                         (setf (aref result j)
-                                               (cffi:mem-aref ptr :uint8 j)))))))
-                            (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil
-                                                           :pointer bio-out :int)))
-                     (cffi:foreign-funcall-pointer (%ossl-sym "CMS_ContentInfo_free") nil
-                                                    :pointer cms :void)))
+                                           :int 3     ; BIO_CTRL_INFO (bio.h)
+                                           :long 0
+                                           :pointer dptr
+                                           :long)))
+                                (when (<= len 0)
+                                  (return-from cms-verify nil))
+                                (let* ((ptr (cffi:mem-ref dptr :pointer))
+                                       (result (make-array len
+                                                 :element-type '(unsigned-byte 8))))
+                                  (dotimes (j len result)
+                                    (setf (aref result j)
+                                          (cffi:mem-aref ptr :uint8 j)))))))
+                       (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil
+                                                      :pointer bio-out :int))))
                (error () nil))
-          (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil
-                                         :pointer bio-in :int))))))
+          ;; outermost cleanup (every exit path): cms handle, SMIME detached content, SMIME source BIO.
+          (unless (cffi:null-pointer-p cms)
+            (cffi:foreign-funcall-pointer (%ossl-sym "CMS_ContentInfo_free") nil :pointer cms :void))
+          (unless (cffi:null-pointer-p bcont)
+            (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil :pointer bcont :int))
+          (unless (cffi:null-pointer-p smime-bio)
+            (cffi:foreign-funcall-pointer (%ossl-sym "BIO_free") nil :pointer smime-bio :int)))))))

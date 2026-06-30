@@ -376,6 +376,115 @@ The `interop/security-crypto/README.md` records this honestly.
   validated by ADR 0025).
 - **FR-SEC-2:** no hand-rolled crypto; all primitives are OpenSSL EVP.
 
+## Addendum (WP-DDS-SECURITY-FASTDDS-INTEROP T10, 2026-06-29) — serialized-payload AAD reconciled to EMPTY (Fast-DDS-faithful)
+
+This Slice-1 serialized-payload (data_protection) transform originally sealed AES-256-GCM with **AAD = the
+20-byte SecureDataHeader** (`kind‖key_id‖session_id‖iv_suffix`, `%assemble-header-aad`), reconstructing it
+byte-identically on decode so a header tamper changed the AAD and forced a GCM auth failure. Live cross-vendor
+work against a SECURITY=ON eProsima Fast DDS peer (Slice 5) showed this **diverges from Fast DDS** and so cannot
+interoperate.
+
+**What changed (and why conformant).** `AESGCMGMAC_Transform.cpp` `serialize_SecureDataBody` is ONE function
+shared by the serialized-payload AND submessage protection paths; its ENCRYPT branch calls `EVP_EncryptUpdate`
+for the plaintext **with no prior AAD `EVP_EncryptUpdate` call** — i.e. **empty AAD**. The SecureDataHeader is
+serialized as the §9.5.3.3.1 CryptoHeader on the wire, but it is NOT fed to AES-GCM as Additional Authenticated
+Data; OMG DDS-Security 1.1 §9.5.3.3.4.4 specifies the header serialization, not a header-as-AAD binding. We
+reconciled all three protection tiers (serialized-payload here, submessage §8.5.1.7-.9, whole-RTPS §8.5.1.10-.12)
+to the **single shared empty AAD** `+empty-octets+` (hoisted from `crypto/submessage.lisp` to `crypto.lisp` so
+the payload and submessage tiers reference one instance, DRY). Clean-room, corroborated against the OMG clause +
+Fast DDS source (Apache-2.0); **RTI Connext never read** (`docs/provenance.md`, T10 entry).
+
+**This CHANGES the SHIPPED Slice-1 wire behavior — a GCM-authenticated-bytes change.** The SecuredPayload
+*structure* and serialized field values (`kind`, `key_id`, `session_id`, `iv_suffix`, ciphertext) are
+byte-identical to before, but because AES-GCM now authenticates an empty AAD instead of the 20-byte header, the
+**16-byte GCM tag value differs** for the same (key, nonce, plaintext). The in-suite SecuredPayload corpus tag
+literals are re-derived accordingly; `security-secured-payload`, `security-payload-roundtrip`,
+`security-payload-fuzz`, `security-encrypted-pubsub`, `security-encrypted-fragmented` all pass on both impls
+(SBCL+Clasp, 378 each). Any out-of-band consumer that pinned the *old* tag bytes must re-pin.
+
+**How header integrity is preserved without AAD.** (1) `decode-serialized-payload` applies the Fast DDS
+`AESGCMGMAC_Transform::find_key` check — the wire `transformation_kind` AND `transformation_key_id` must equal
+the KeyMaterial's, else fail-closed NIL — which rejects a `kind`/`key_id` tamper that the AAD used to catch.
+(2) `session_id` derives the AES-256 session key (§9.5.3.3.4.2) and, with `iv_suffix`, the 12-byte GCM nonce
+(§9.5.3.3.4.3); tampering either changes the key and/or nonce and forces a GCM auth failure. So every byte the
+header-AAD used to integrity-bind is still integrity-bound, via `find_key` (kind/key_id) or the nonce/KDF
+(session_id/iv_suffix). The `security-test.lisp` tamper arm (d) was updated from a header-byte flip to a
+`transformation_kind` flip asserting the `find_key` reject.
+
+This reconciliation is also summarized in the Slice-5 capstone **ADR 0037**.
+
+## Addendum (WP-DDS-SECURITY-FASTDDS-INTEROP T10 review, 2026-06-29) — SEC_BODY 4-align pad placement (submessage + SRTPS ENCRYPT)
+
+The T10 user-DATA submessage-protection send path padded the **plaintext** user DATA submessage to a 4-octet
+multiple before the §8.5.1.7-.9 wrap. That left a trailing pad inside the recovered submessage, inflating
+`parse-data-body`'s `plen`; for a user DATA carrying a data_protection §9.5.3.3 SecuredPayload, the
+strict-exact-length `parse-secured-payload` check then rejected the over-long blob and the sample was **silently
+dropped** (metadata_protection + data_protection + a non-4-aligned payload).
+
+**Conformant fix (clean-room vs Fast DDS, NEVER RTI).** The 4-octet alignment pad belongs in the **SEC_BODY
+CryptoContent container**, not the plaintext. `AESGCMGMAC_Transform::serialize_SecureDataBody` (ENCRYPT,
+submessage=true) sets SEC_BODY `octetsToNextHeader = (|ct| + 4 + 3) & ~3`, writes `cnt_length` = the **true**
+ciphertext length (BIG-ENDIAN), then writes alignment zero octets **after** the ciphertext; `deserialize_SecureDataBody`
+reads `cnt_length`, decrypts that many bytes, then aligns the cursor to 4 (skips the pad) before the SEC_POSTFIX.
+`encode_rtps_message` calls the same body function with submessage=true, so the SRTPS tier shares the framing.
+We implemented this in the shared `%encode-secured-region` / `%decode-secured-region` ENCRYPT branch (the pad =
+`(-|ct|) mod 4`, decode skip bounds-checked / fail-closed) and **removed** the plaintext padder
+(`%pad-submessage-to-4`). The recovered submessage now reflects its TRUE length, so metadata_protection +
+data_protection + a non-4-aligned payload round-trips.
+
+**Wire impact: byte-IDENTICAL for any 4-aligned ENCRYPT body (pad=0)** — the shipped byte-exact corpus (T2/T3
+submessage, T4 SRTPS — all 4-aligned plaintexts) is unchanged and green on both impls. The framing changes ONLY
+for a non-4-aligned ENCRYPT body, which was previously a receive-side silent-drop bug; it is now Fast-DDS-conformant.
+The data_protection serialized-payload tier (`serialize-secured-payload`) is untouched. Also in this review:
+the receive dispatch now **enforce-gates** a bare (non-SRTPS-wrapped) user metadata_protection bracket under a
+required `rtps_protection` (§8.5.1.10-.12, builtin secure brackets exempt), and the empty-AAD directed-tamper
+coverage was extended to key_id / session_id / iv_suffix. Corroboration: `docs/provenance.md` (T10 review entry).
+
+## Addendum (WP-DDS-SECURITY-FASTDDS-INTEROP T11, 2026-06-30) — SecureDataTag `receiver_specific_macs_count` 4-byte alignment
+
+This addendum is **distinct from the SEC_BODY 4-align addendum above**: that one aligns the SEC_BODY
+`CryptoContent` ciphertext inside the *submessage / whole-RTPS* brackets; this one aligns the SecureDataTag
+`receiver_specific_macs_count` (rsm_count) on the *serialized-payload (data_protection) tier* — the
+`serialize-secured-payload` / `parse-secured-payload` codec this ADR ships.
+
+**The divergence (live, ours2fast under GOV=secure).** With cross-vendor user endpoints matched and keyed,
+the eProsima Fast DDS subscriber reached `decode_serialized_payload` on our protected user DATA and failed:
+*"Error in fastcdr trying to deserialize SecureDataTag length."* Fast DDS `AESGCMGMAC_Transform.cpp`
+`serialize_SecureDataTag` **4-aligns** the `receiver_specific_macs` sequence length to a 4-byte boundary
+*relative to the SecuredPayload start* — it aligns `current_position − buffer_pointer` to `sizeof(int32_t)`
+**before** writing the count. So a conformant SecuredPayload is always:
+
+```
+SecureDataHeader(20) || crypto_content.length(uint32 BE) || ciphertext(N) || common_mac(16)
+                     || <pad = (-N) mod 4 zero octets> || receiver_specific_macs_count(uint32 BE)
+```
+
+Our serializer omitted the pad. For a ciphertext length `N` that is **not** a multiple of 4 (our 34-octet
+XCDR1 `HelloWorld` payload), Fast DDS read `rsm_count` past the end of the SecureDataTag and rejected the
+sample. The `fast2ours` direction had worked only because Fast DDS's `'Hello world'` payload is N = 24
+(already 4-aligned, pad = 0), so the bug was invisible until our writer sent a non-aligned payload.
+
+**Conformant fix (clean-room vs Fast DDS Apache-2.0 `serialize_SecureDataTag`; OMG DDS-Security 1.1 §9.5.3.3.3;
+RTI Connext never read — `docs/provenance.md`, T11 entry).** `serialize-crypto-footer` / `parse-crypto-footer`
+(`src/dds-security/crypto/crypto-header.lisp`) `(align cursor 4)` the rsm_count to the protected-unit start, and
+`serialize-secured-payload` / `parse-secured-payload` (`src/dds-security/crypto.lisp`) size / skip the
+`(-N) mod 4` pad accordingly. The pad is zero octets; the parse-side `align` is bounds-checked (`check-room`) and
+fail-closed, and the 1–3 zeroed RX pad octets are consumed, never part of the AEAD AAD.
+
+**Wire impact: byte-IDENTICAL for any 4-aligned SecuredPayload (pad = 0) — no corpus regen.** The shipped
+byte-exact corpus uses a 4-octet ciphertext, so `common_mac` already lands 4-aligned and the pad is empty; the
+existing `run-security-secured-payload-corpus-test` / `-crypto-header-corpus-test` vectors are unchanged and green
+on both impls. The framing changes ONLY for a non-4-aligned ciphertext — previously a receive-side mis-read; now
+Fast-DDS-conformant. The submessage / whole-RTPS brackets are a **provable no-op** (their framing already lands
+`common_mac` 4-aligned). A dedicated offline golden, `run-security-secured-payload-pad-corpus-test`
+(`src/dds-tests/security-test.lisp`), now pins the exact pad PLACEMENT (the zero octets between `common_mac` and
+`rsm_count`) for the non-aligned case across all three non-zero residue classes — deterministic, no live peer, no
+OpenSSL — and asserts the 4-aligned case stays pad-free.
+
+**Result.** With this fix, protected user DATA flows BOTH directions cross-vendor vs the live Fast DDS-Security
+peer (ours2fast 8/8 received + fast2ours 88) — the P6 Fast-DDS exit gate. Summarized in the Slice-5 capstone
+**ADR 0037**.
+
 ## References
 
 - T0 spike: `docs/superpowers/spikes/2026-06-22-dds-security-payload-wire.md`

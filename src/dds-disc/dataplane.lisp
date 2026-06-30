@@ -119,6 +119,94 @@
                     (progn (replace vec srtps :start1 20) (+ 20 (length srtps)))   ; in-place wrap; header kept
                     nil)))))))                          ; required but failed/won't fit -> fail-closed drop
 
+(defun* %wrap-one-user-submessage (node id submsg)
+    (function (disc-node (unsigned-byte 8) (simple-array (unsigned-byte 8) (*)))
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "Submessage-protect ONE complete user-plane RTPS submessage SUBMSG (header+body, submessageId = ID) under
+   the LOCAL user endpoint EntityCrypto per the node's USER-SUBMESSAGE-ENCODE resolver (DDS-Security 1.1
+   §8.5.1.7-.9). The PLAINTEXT submessage is NOT padded — the §8.3.4 4-alignment lives in the SEC_BODY
+   CryptoContent container (encode-datawriter-/datareader-submessage round the SEC_BODY up to a 4-multiple
+   with pad octets AFTER the ciphertext, Fast DDS serialize_SecureDataBody) so the recovered submessage's
+   octetsToNextHeader reflects its TRUE length and a data_protection SecuredPayload payload round-trips
+   (T10 review fix-2). Writer submessages (DATA/DATA_FRAG/HEARTBEAT/GAP/HEARTBEAT_FRAG) are protected under
+   the user WRITER's EntityCrypto via encode-datawriter-submessage; reader submessages (ACKNACK/NACK_FRAG)
+   under the user READER's via encode-datareader-submessage (the §8.5 DataWriter/DataReader transforms are
+   the same mechanism). Returns the SEC_PREFIX … SEC_POSTFIX bracket, or NIL when the resolver declines (not
+   keyed / kind NONE) or ID is not a protectable submessage (INFO_* etc.) — the caller then passes SUBMSG
+   through verbatim."
+  (let ((enc (disc-node-user-submessage-encode node)))
+    (when enc
+      (let ((writer-p (or (= id dds.rtps.message:+submsg-data+)
+                          (= id dds.rtps.message:+submsg-data-frag+)
+                          (= id dds.rtps.message:+submsg-heartbeat+)
+                          (= id dds.rtps.message:+submsg-gap+)
+                          (= id dds.rtps.message:+submsg-heartbeat-frag+)))
+            (reader-p (or (= id dds.rtps.message:+submsg-acknack+)
+                          (= id dds.rtps.message:+submsg-nack-frag+))))
+        (when (or writer-p reader-p)
+          (multiple-value-bind (km kind) (funcall enc writer-p)
+            (when km
+              (if writer-p
+                  (dds.security:encode-datawriter-submessage km kind submsg)
+                  (dds.security:encode-datareader-submessage km kind submsg)))))))))
+
+(defun* %maybe-wrap-user-submessages (node buf len)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0)) (or null (integer 0)))
+  "DDS-Security 1.1 §8.5.1.7-.9 USER-DATA submessage protection (metadata_protection) SEND-side engagement —
+   the INNER complement of %MAYBE-WRAP-SRTPS (which wraps the whole datagram OUTSIDE this). When the node's
+   USER-SUBMESSAGE-ENCODE resolver is installed (security on, metadata_protection != NONE, keyed), WALK BUF's
+   post-RTPS-header submessage stream [20,LEN) and replace each user-plane submessage with its SEC_PREFIX …
+   SEC_POSTFIX bracket (%wrap-one-user-submessage), passing INFO_* (and any submessage the resolver declines)
+   through VERBATIM; rebuild the stream and overwrite BUF in place, returning the new datagram length. Returns LEN
+   UNCHANGED when no resolver is installed / it declines every submessage (security OFF / metadata NONE / not yet
+   keyed) -> byte-identical. The metadata_protection NONE tier short-circuits BEFORE the off-heap scratch alloc +
+   stream walk (the resolver would decline every submessage anyway — see the crypto-manager USER-SUBMESSAGE-ENCODE
+   install — so the walk is pure overhead): a keyed user-data send with metadata_protection NONE pays nothing.
+   Returns NIL (caller DROPS, fail-closed; NFR-SEC-POSTURE) only when a submessage header is malformed/overruns LEN
+   or the rebuilt stream would not fit BUF. The 20-octet RTPS Header [0,20) is kept verbatim. Called BEFORE
+   %MAYBE-WRAP-SRTPS in %SEND-RAW-BUF so the wire is SRTPS( … SEC_PREFIX(submessage) … ), matching Fast DDS
+   RTPSMessageGroup (payload-protect -> submessage-protect -> rtps-protect). Control-plane-ish: the off-heap
+   scratch is freed before return; this is the secured user path (already AEAD-allocating, gated)."
+  (let ((enc (disc-node-user-submessage-encode node)))
+    ;; NONE tier (metadata_protection off): skip the alloc + walk — wire byte-identical (the resolver declines all).
+    (if (or (null enc) (<= len 20)
+            (eq (disc-node-user-submessage-protection-kind node) :none))
+        len
+        (let* ((vec (dds.core.buffer:octet-buffer-vec buf))
+               (cur (dds.core.buffer:cursor buf :endianness :little))
+               (out (dds.core.buffer:make-octet-buffer (+ len 8192)))   ; expansion headroom (~56 octets/submessage)
+               (oc  (dds.core.buffer:cursor out :endianness :little))
+               (any nil))
+          (unwind-protect
+               (block walk
+                 (dds.core.buffer:put-octets oc vec 0 20)               ; RTPS Header verbatim
+                 (dds.core.buffer:cursor-set-position cur 20)
+                 (loop
+                   (when (>= (dds.core.buffer:cursor-position cur) len) (return))
+                   (let ((start (dds.core.buffer:cursor-position cur)))
+                     (multiple-value-bind (id flags octn le) (dds.rtps.message:parse-submessage-header cur)
+                       (declare (ignore flags le))
+                       (unless id (return-from %maybe-wrap-user-submessages nil))   ; malformed -> fail-closed
+                       (let ((sm-end (+ (dds.core.buffer:cursor-position cur)
+                                        (if (zerop octn) (- len (dds.core.buffer:cursor-position cur)) octn))))
+                         (when (> sm-end len) (return-from %maybe-wrap-user-submessages nil))   ; overrun -> fail-closed
+                         (let* ((submsg  (subseq vec start sm-end))
+                                (wrapped (%wrap-one-user-submessage node id submsg))
+                                (emit    (or wrapped submsg)))
+                           (when wrapped (setf any t))
+                           (when (> (+ (dds.core.buffer:cursor-position oc) (length emit))
+                                    (dds.core.buffer:octet-buffer-capacity out))
+                             (return-from %maybe-wrap-user-submessages nil))   ; won't fit -> fail-closed
+                           (dds.core.buffer:put-octets oc emit 0 (length emit)))
+                         (dds.core.buffer:cursor-set-position cur sm-end)))))
+                 (if (null any)
+                     len                                                 ; nothing wrapped -> leave BUF untouched
+                     (let ((newlen (dds.core.buffer:cursor-position oc)))
+                       (if (<= newlen (dds.core.buffer:octet-buffer-capacity buf))
+                           (progn (replace vec (dds.core.buffer:octet-buffer-vec out) :end2 newlen) newlen)
+                           nil))))                                       ; rebuilt won't fit BUF -> fail-closed
+            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out)))))))
+
 (defun* %send-raw-buf (node buf len host port &optional shmem-dest dest-prefix)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) string (unsigned-byte 16)
                &optional t (or null (simple-array (unsigned-byte 8) (12)))) t)
@@ -138,7 +226,12 @@
    on a SIGNAL; a benign return-0 lane-full takes the silent UDP fallback with no counter/hook). With SHMEM-DEST
    NIL (every discovery/HB/ACKNACK caller, and every cross-host data send) the path is the original UDP send,
    byte-for-byte unchanged. Hands a copy to *DATAGRAM-SINK* first when that test hook is bound."
-  (when dest-prefix   ; T10: engage whole-RTPS-message protection for a :keyed dest (wrap in place; BEFORE the sink)
+  (when dest-prefix   ; secured user path (wrap in place; BEFORE the sink)
+    ;; Slice 5: INNER user-DATA submessage protection (metadata_protection, §8.5.1.7-.9) FIRST, then the OUTER
+    ;; whole-RTPS-message protection (T10 rtps_protection, §8.5.1.10-.12) — matching Fast DDS send order.
+    (let ((sm-len (%maybe-wrap-user-submessages node buf len)))
+      (when (null sm-len) (return-from %send-raw-buf nil))   ; required submessage wrap failed -> fail-closed drop
+      (setf len sm-len))
     (let ((wrapped-len (%maybe-wrap-srtps node buf len dest-prefix)))
       (when (null wrapped-len) (return-from %send-raw-buf nil))   ; required wrap failed -> fail-closed drop
       (setf len wrapped-len)))

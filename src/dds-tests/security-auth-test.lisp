@@ -7,34 +7,34 @@
 ;;;
 ;;; IdentityToken regression vector derived from the committed T0 fixture cert
 ;;; (interop/security-auth/pki/participant_ec/identity_cert.pem) by running the CDR LE DataHolder
-;;; serialization on 2026-06-23 and re-locked 2026-06-24 after PKI regeneration (gen-test-pki.sh);
-;;; subject CNs are deterministic so the serialization is byte-stable across regenerations.
+;;; serialization on 2026-06-23, re-locked 2026-06-24 after PKI regeneration (gen-test-pki.sh), and
+;;; re-locked 2026-06-28 (WP-DDS-SECURITY-FASTDDS-INTEROP T1) to the §9.3.4-conformant Property form:
+;;; name+value only, NO propagate byte on the wire (the flag is a LOCAL include/exclude filter, never
+;;; serialized; the serialized count = the propagate==true Property count). Dropping the 4 propagate+pad
+;;; fields takes the DataHolder from 240 to 224 octets. Subject CNs are deterministic so the
+;;; serialization is byte-stable across regenerations.
 ;;; See the operating contract §5 (Definition of Done) for the derivation record.
 
 ;;; Locked byte-exact IdentityToken for the EC participant fixture cert.
 ;;; class_id="DDS:Auth:PKI-DH:1.0", dds.cert.sn="/CN=TestParticipantEC/O=DDS-Test/C=DE",
 ;;; dds.cert.algo="EC-prime256v1", dds.ca.sn="/CN=TestIdentityCA/O=DDS-Test/C=DE",
-;;; dds.ca.algo="EC-prime256v1". CDR LE DataHolder, 240 bytes.
+;;; dds.ca.algo="EC-prime256v1". CDR LE DataHolder, 224 bytes (§9.3.4: name+value Properties, no propagate).
 (defparameter +ec-identity-token-vector+
-    (make-array 240 :element-type '(unsigned-byte 8) :initial-contents
+    (make-array 224 :element-type '(unsigned-byte 8) :initial-contents
      '(20 0 0 0 68 68 83 58 65 117 116 104 58 80 75 73 45 68 72 58 49 46 48 0   ; class_id
        4 0 0 0                                                                    ; prop count=4
        12 0 0 0 100 100 115 46 99 101 114 116 46 115 110 0                       ; "dds.cert.sn"
        38 0 0 0 47 67 78 61 84 101 115 116 80 97 114 116 105 99 105 112 97 110   ; "/CN=TestParticipantEC
        116 69 67 47 79 61 68 68 83 45 84 101 115 116 47 67 61 68 69 0 0 0        ;  /O=DDS-Test/C=DE"
-       1 0 0 0                                                                    ; propagate+pad
        14 0 0 0 100 100 115 46 99 101 114 116 46 97 108 103 111 0 0 0            ; "dds.cert.algo"
        14 0 0 0 69 67 45 112 114 105 109 101 50 53 54 118 49 0 0 0               ; "EC-prime256v1"
-       1 0 0 0                                                                    ; propagate+pad
        10 0 0 0 100 100 115 46 99 97 46 115 110 0 0 0                            ; "dds.ca.sn"
        35 0 0 0 47 67 78 61 84 101 115 116 73 100 101 110 116 105 116 121 67 65  ; "/CN=TestIdentityCA
        47 79 61 68 68 83 45 84 101 115 116 47 67 61 68 69 0 0                    ;  /O=DDS-Test/C=DE"
-       1 0 0 0                                                                    ; propagate+pad
        12 0 0 0 100 100 115 46 99 97 46 97 108 103 111 0                         ; "dds.ca.algo"
        14 0 0 0 69 67 45 112 114 105 109 101 50 53 54 118 49 0 0 0               ; "EC-prime256v1"
-       1 0 0 0                                                                    ; propagate+pad
        0 0 0 0))                                                                  ; binary_properties count=0
-  "Locked byte-exact IdentityToken for the T0 EC participant fixture cert (240 octets, CDR LE).")
+  "Locked byte-exact IdentityToken for the T0 EC participant fixture cert (224 octets, CDR LE; §9.3.4 name+value Properties, no propagate byte).")
 
 (defun* %read-fixture-pem (relative-path)
     (function (string) (simple-array (unsigned-byte 8) (*)))
@@ -50,7 +50,7 @@
     (function () t)
   "DDS-Security §8.7 Auth T1: PKI identity load + IdentityToken byte-exactness.
    (a) validate-local-identity on EC fixture -> identity-handle (not nil).
-   (b) identity-token equals the locked 240-byte regression vector (byte-exact).
+   (b) identity-token equals the locked 224-byte regression vector (byte-exact; §9.3.4 no propagate).
    (c) wrong-CA cert with the test CA -> (values nil reason) (chain-verify fail-closed).
    (d) validate-remote-identity between two distinct-GUID handles -> :ok + :requester/:replier.
    Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
@@ -81,8 +81,8 @@
              (let ((tok (dds.security:identity-token handle)))
                (%check :auth-token-non-empty (> (length tok) 0)
                        "identity-token returned empty vector")
-               (%check :auth-token-length (= (length tok) 240)
-                       (format nil "identity-token length ~d != 240" (length tok)))
+               (%check :auth-token-length (= (length tok) 224)
+                       (format nil "identity-token length ~d != 224" (length tok)))
                (%check :auth-token-byte-exact (equalp tok +ec-identity-token-vector+)
                        (format nil "identity-token byte mismatch; first 20 bytes: ~{~d ~}"
                                (coerce (subseq tok 0 (min 20 (length tok))) 'list))))
@@ -96,8 +96,13 @@
                        "wrong-CA rejection must include a reason string")
                (when bad-handle (dds.security:free-identity-handle bad-handle)))
 
-             ;; (d) validate-remote-identity: use handle (guid-a) as local + token of a second
-             ;; handle (guid-b). Both GUIDs are distinct; role must be consistent with ordering.
+             ;; (d) validate-remote-identity: use handle as local + the IdentityToken of a second handle.
+             ;; Verdict must be :ok and the role deterministic. NOTE: this role is the T1 NON-AUTHORITATIVE
+             ;; stand-in (the IdentityToken carries no GUID; the real §8.7.2.4 role is decided by the auth
+             ;; manager on the real RTPS prefixes, %prefix-lex<). Since validate-local-identity now stores
+             ;; the §9.3.2.1 adjusted GUID (octet 0 has bit-0 set, so >= 0x80) and the remote stand-in GUID
+             ;; is the cert subject-name string (X509_NAME_oneline, leading '/' = 0x2F), the local GUID
+             ;; sorts ABOVE the remote stand-in => :replier (deterministic).
              (multiple-value-bind (handle-b reason-b)
                  (dds.security:validate-local-identity ca-pem ec-cert-pem ec-key-pem guid-b)
                (%check :auth-second-handle-ok (not (null handle-b))
@@ -111,9 +116,11 @@
                                         verdict reason-r))
                         (%check :auth-remote-role-valid (member role '(:requester :replier))
                                 (format nil "validate-remote-identity role ~a not :requester/:replier" role))
-                        ;; guid-a = #(1 2 ...) < guid-b = #(200 2 ...) => local is :requester
-                        (%check :auth-remote-role-correct (eq role :requester)
-                                (format nil "GUID-a < GUID-b so local must be :requester; got ~a" role))))
+                        ;; §9.3.2.1 adjusted local GUID (octet 0 >= 0x80) sorts above the cert-sn stand-in
+                        ;; (leading '/' = 0x2F) => :replier; deterministic (the auth manager decides the
+                        ;; authoritative role on the real RTPS prefixes, not this stand-in).
+                        (%check :auth-remote-role-correct (eq role :replier)
+                                (format nil "adjusted local GUID (>=0x80) sorts above cert-sn stand-in; expected :replier, got ~a" role))))
                  (dds.security:free-identity-handle handle-b))))
         (dds.security:free-identity-handle handle))))
 
@@ -2451,10 +2458,12 @@
                                    (and (not (%am-remote-keyed-p p-a prefix-b))
                                         (not (%am-remote-keyed-p p-b prefix-a)))
                                    "no remote may be :keyed before the crypto-token exchange completes")
-                           ;; drive auth + crypto-token exchange to :keyed (bounded ~8 s)
+                           ;; drive auth + crypto-token exchange to :keyed AND pub-w EntityCrypto installed
                            (loop repeat 400
                                  until (and (%am-remote-keyed-p p-a prefix-b)
-                                            (%am-remote-keyed-p p-b prefix-a))
+                                            (%am-remote-keyed-p p-b prefix-a)
+                                            (%cm-has-remote-entity-p p-a prefix-b pub-w)
+                                            (%cm-has-remote-entity-p p-b prefix-a pub-w))
                                  do (dds.dcps:spin p-a) (dds.dcps:spin p-b) (sleep 0.02))
                            ;; (b) both reached :keyed
                            (%check :sdk-a-keyed (%am-remote-keyed-p p-a prefix-b)
@@ -2701,13 +2710,13 @@
                    "parse-crypto-token under wrong KxKey must return NIL (GCM auth must gate)")
 
            ;; (c) flipped byte inside ciphertext/tag area -> NIL
-           ;; DataHolder layout: class_id CDR string + PropertySeq(count=0) + BinaryPropertySeq
-           ;; (count=1 + name CDR string + value u32-len + 116-byte blob + propagate 4B).
-           ;; The propagate field (4B) is the last 4 bytes; the 116-byte blob ends 4B before that.
-           ;; Flipping at (- len 5) lands inside the GCM tag, which must cause auth failure.
+           ;; DataHolder layout (§9.3.4, T1 name+value-only): class_id CDR string + PropertySeq(count=0) +
+           ;; BinaryPropertySeq (count=1 + name CDR string + value u32-len + 116-byte blob).
+           ;; The 116-byte blob (nonce(12)||ct(88)||tag(16)) is now the LAST field (no trailing propagate);
+           ;; the GCM tag is the final 16 bytes. Flipping the last byte lands in the tag -> auth failure.
            (let* ((tok-flip (copy-seq tok))
                   (n-tok    (length tok-flip))
-                  (flip-idx (- n-tok 5))) ; inside tag (tag is last 16B of blob; blob precedes 4B propagate)
+                  (flip-idx (- n-tok 1))) ; last byte = final GCM tag byte (no trailing propagate, T1)
              (when (> flip-idx 0)
                (setf (aref tok-flip flip-idx)
                      (logxor (aref tok-flip flip-idx) #xFF)))

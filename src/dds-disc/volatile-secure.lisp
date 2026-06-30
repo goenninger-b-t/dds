@@ -216,8 +216,8 @@
   "Build the PLAINTEXT PVMS DATA submessage (RTPS 2.5 §9.4.5.4) carrying PAYLOAD as its SerializedPayload:
    readerId = +entityid-participant-volatile-secure-reader+, writerId =
    +entityid-participant-volatile-secure-writer+, writerSN = SN, E=1 little-endian. PAYLOAD is the opaque
-   crypto-token ParticipantGenericMessage blob (no extra encapsulation header — it IS the SerializedPayload,
-   like the PSM envelope). Returned as a fresh exact-length octet vector — the PLAIN-SUBMESSAGE region the
+   crypto-token ParticipantGenericMessage blob; the §10.2 encapsulation header is prepended by the caller
+   (%send-volatile-secure) before encryption. Returned as a fresh exact-length octet vector — the PLAIN-SUBMESSAGE region the
    T2 submessage codec then protects. Off-heap scratch (control-plane) freed before return."
   (let* ((buf (dds.core.buffer:make-octet-buffer (+ 64 (length payload))))
          (cur (dds.core.buffer:cursor buf :endianness :little)))
@@ -230,18 +230,90 @@
            (subseq (dds.core.buffer:octet-buffer-vec buf) 0 (dds.core.buffer:cursor-position cur)))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
 
+(defun* %pvms-send-secured (node secured host port)
+    (function (disc-node (simple-array (unsigned-byte 8) (*)) string (unsigned-byte 16)) t)
+  "Send an already-encrypted PVMS SEC_PREFIX…SEC_POSTFIX bracket SECURED as one datagram to HOST:PORT
+   (a fresh per-call control-plane message buffer; the reused tx/rx buffers are untouched, so this is
+   safe from any thread). The single send tail shared by the protected PVMS DATA, HEARTBEAT, and ACKNACK
+   paths (DRY)."
+  (let ((buf (dds.core.buffer:make-octet-buffer (+ 64 (length secured)))))
+    (unwind-protect
+         (%send-msg-buf node buf
+                        (lambda (mc) (dds.core.buffer:put-octets mc secured 0 (length secured)))
+                        host port)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))
+  t)
+
+(defun* %build-plain-heartbeat-sm (reader-id writer-id first last count)
+    (function ((unsigned-byte 32) (unsigned-byte 32) integer integer (unsigned-byte 32))
+              (simple-array (unsigned-byte 8) (*)))
+  "Build ONE PLAINTEXT HEARTBEAT submessage (RTPS 2.5 §8.3.7.5) for READER-ID/WRITER-ID over the range
+   [FIRST,LAST] with count COUNT, FinalFlag NOT_SET (soliciting an ACKNACK), E=1 little-endian — the
+   PLAIN-SUBMESSAGE region a submessage-protection codec then protects. The shared builtin-secure HEARTBEAT
+   body (PVMS + secure-SEDP, DRY): only the EntityIds + the count/range source differ by tier. Off-heap
+   scratch (control-plane) freed before return."
+  (let* ((buf (dds.core.buffer:make-octet-buffer 64))
+         (cur (dds.core.buffer:cursor buf :endianness :little)))
+    (unwind-protect
+         (progn
+           (dds.rtps.message:write-heartbeat cur reader-id writer-id first last count :final nil)
+           (subseq (dds.core.buffer:octet-buffer-vec buf) 0 (dds.core.buffer:cursor-position cur)))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
+
+(defun* %build-plain-acknack-sm (reader-id writer-id base numbits bitmap count)
+    (function ((unsigned-byte 32) (unsigned-byte 32) integer (unsigned-byte 32)
+               (simple-array (unsigned-byte 32) (*)) (unsigned-byte 32))
+              (simple-array (unsigned-byte 8) (*)))
+  "Build ONE PLAINTEXT ACKNACK submessage (RTPS 2.5 §8.3.7.1) for READER-ID/WRITER-ID over the
+   SequenceNumberSet (BASE,NUMBITS,BITMAP) with count COUNT, FinalFlag SET, E=1 little-endian — the
+   PLAIN-SUBMESSAGE region a submessage-protection codec then protects. The shared builtin-secure ACKNACK
+   body (PVMS + secure-SEDP, DRY): only the EntityIds differ by tier. Off-heap scratch (control-plane)
+   freed before return."
+  (let* ((buf (dds.core.buffer:make-octet-buffer 64))
+         (cur (dds.core.buffer:cursor buf :endianness :little)))
+    (unwind-protect
+         (progn
+           (dds.rtps.message:write-acknack cur reader-id writer-id base numbits bitmap count :final t)
+           (subseq (dds.core.buffer:octet-buffer-vec buf) 0 (dds.core.buffer:cursor-position cur)))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
+
+(defun* %pvms-build-plain-heartbeat (node)
+    (function (disc-node) (or null (simple-array (unsigned-byte 8) (*))))
+  "Build the PLAINTEXT PVMS-writer HEARTBEAT submessage (RTPS 2.5 §8.3.7.5; firstSN,lastSN,count from the
+   reliable writer, FinalFlag NOT_SET soliciting an ACKNACK), readerId/writerId = the secure PVMS reader/
+   writer EntityIds, E=1 little-endian — the PLAIN-SUBMESSAGE region the T2 codec then ENCRYPT-protects.
+   NIL when the endpoint is not enabled (the generic body is %build-plain-heartbeat-sm, DRY)."
+  (let ((w (disc-node-pvms-writer node)))
+    (when w
+      (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)
+        (%build-plain-heartbeat-sm
+         dds.rtps.discovery:+entityid-participant-volatile-secure-reader+
+         dds.rtps.discovery:+entityid-participant-volatile-secure-writer+
+         first last count)))))
+
+(defun* %pvms-build-plain-acknack (node base numbits bitmap)
+    (function (disc-node integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "Build the PLAINTEXT PVMS-reader ACKNACK submessage (RTPS 2.5 §8.3.7.1) for the SequenceNumberSet
+   (BASE,NUMBITS,BITMAP), readerId/writerId = the secure PVMS reader/writer EntityIds, FinalFlag SET,
+   E=1 little-endian — the PLAIN-SUBMESSAGE region the T2 codec then ENCRYPT-protects (the generic body is
+   %build-plain-acknack-sm, DRY)."
+  (%build-plain-acknack-sm
+   dds.rtps.discovery:+entityid-participant-volatile-secure-reader+
+   dds.rtps.discovery:+entityid-participant-volatile-secure-writer+
+   base numbits bitmap (incf (disc-node-ack-count node))))
+
 (defun* %pvms-emit-data (node km sn payload host port session-id)
     (function (disc-node dds.security:key-material integer (simple-array (unsigned-byte 8) (*))
                string (unsigned-byte 16) (simple-array (unsigned-byte 8) (4))) t)
   "Build the plaintext PVMS DATA for (SN, PAYLOAD), submessage-protect it under KM with ENCRYPT (the T2
    codec encode-datawriter-submessage → SEC_PREFIX ∥ CryptoHeader ∥ SEC_BODY[ciphertext] ∥ SEC_POSTFIX,
    DDS-Security 1.1 §8.5.1.7 / §9.5.3.1 — PVMS is submessage-ENCRYPTED), and send the secured bracket as
-   one datagram to HOST:PORT. A fresh per-call message buffer (control-plane; the reused tx/rx buffers are
-   untouched, so this is safe from any thread). No-op (still T) if the codec returns NIL. Each call re-seals
-   with a fresh nonce (the KM's monotonic iv_suffix), so a RESEND is a new ciphertext over the same plaintext
-   — correct AES-GCM practice; the reader decodes either. SESSION-ID is the per-role 4-octet §9.5.3.3.4.4
-   session_id (%pvms-role-session-id) giving this direction a nonce space DISJOINT from the peer's — the
-   SYMMETRIC bootstrap KM otherwise would reuse (key, nonce) across the pair (T8, safety-critical).
+   one datagram to HOST:PORT (%pvms-send-secured). No-op (still T) if the codec returns NIL. Each call
+   re-seals with a fresh nonce (the KM's monotonic iv_suffix), so a RESEND is a new ciphertext over the same
+   plaintext — correct AES-GCM practice; the reader decodes either. SESSION-ID is the per-role 4-octet
+   §9.5.3.3.4.4 session_id (%pvms-role-session-id) giving this direction a nonce space DISJOINT from the
+   peer's — the SYMMETRIC bootstrap KM otherwise would reuse (key, nonce) across the pair (T8, safety-critical).
    Loss injection: a SN in *pvms-debug-drop-sns* is silently skipped on EVERY send (initial + resend), so
    reliable repair is exercised once the SN is removed."
   (unless (member sn *pvms-debug-drop-sns*)
@@ -249,34 +321,26 @@
            (secured (dds.security:encode-datawriter-submessage km :encrypt plain :session-id session-id)))
       (when secured
         (when *pvms-debug-on-emit* (funcall *pvms-debug-on-emit* secured))   ; test seam: observe the on-wire session_id
-        (let ((buf (dds.core.buffer:make-octet-buffer (+ 64 (length secured)))))
-          (unwind-protect
-               (%send-msg-buf node buf
-                              (lambda (mc) (dds.core.buffer:put-octets mc secured 0 (length secured)))
-                              host port)
-            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))))
+        (%pvms-send-secured node secured host port))))
   t)
 
-(defun* %pvms-emit-heartbeat (node host port)
-    (function (disc-node string (unsigned-byte 16)) t)
-  "Send one NON-FINAL PVMS-writer HEARTBEAT (firstSN,lastSN,count from the reliable writer) to HOST:PORT
-   in the CLEAR (RTPS 2.5 §8.3.7.5 / §8.4.2.2; FinalFlag NOT_SET solicits an ACKNACK) — the control
-   submessage that drives the reliability engine so a peer NACKs a lost PVMS DATA. readerId/writerId = the
-   secure PVMS reader/writer EntityIds. A no-op (still T) when the endpoint is not enabled. Fresh per-call
-   buffer (control-plane)."
-  (let ((w (disc-node-pvms-writer node)))
-    (when w
-      (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)
-        (let ((buf (dds.core.buffer:make-octet-buffer 64)))
-          (unwind-protect
-               (%send-msg-buf node buf
-                              (lambda (mc)
-                                (dds.rtps.message:write-heartbeat
-                                 mc dds.rtps.discovery:+entityid-participant-volatile-secure-reader+
-                                 dds.rtps.discovery:+entityid-participant-volatile-secure-writer+
-                                 first last count :final nil))
-                              host port)
-            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))))
+(defun* %pvms-emit-heartbeat (node dest-prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
+  "Send one NON-FINAL PVMS-writer HEARTBEAT to DEST-PREFIX, submessage-protected (ENCRYPT) under DEST-PREFIX's
+   §9.5.3.1 bootstrap KM with its per-role session_id (DDS-Security 1.1 §8.5.1.9 / RTPS 2.5 §8.4.2.2). A
+   submessage-protected endpoint protects ALL its submessages, HEARTBEAT included — matching Fast DDS
+   RTPSMessageGroup::add_heartbeat (encode_writer_submessage when is_submessage_protected) — and a conformant
+   secure reader DROPS a CLEAR submessage on a protected endpoint (MessageReceiver: was_decoded ||
+   !is_submessage_protected), so the pre-fix clear HEARTBEAT never reached Fast DDS and our token was never
+   NACK-pulled. Corroborated CLEAN-ROOM vs Fast DDS; see docs/provenance.md. A no-op (still T) when the
+   endpoint is not enabled or DEST-PREFIX has no installed bootstrap KM / resolved metatraffic locator."
+  (let ((km    (%pvms-bootstrap-km node dest-prefix))
+        (hp    (%remote-metatraffic node dest-prefix))
+        (sid   (%pvms-role-session-id (disc-node-guid-prefix node) dest-prefix))
+        (plain (%pvms-build-plain-heartbeat node)))
+    (when (and km hp plain)
+      (let ((secured (dds.security:encode-datawriter-submessage km :encrypt plain :session-id sid)))
+        (when secured (%pvms-send-secured node secured (car hp) (cdr hp))))))
   t)
 
 (defun* %send-volatile-secure (node dest-prefix payload-octets)
@@ -285,7 +349,8 @@
    matched remote participant DEST-PREFIX over the ParticipantVolatileMessageSecure endpoint, submessage-
    protected (ENCRYPT) with DEST-PREFIX's §9.5.3.1 bootstrap KM (DDS-Security 1.1 §7.4.5 / §9.5.3.1). Stores
    the payload in the reliable writer's VOLATILE HistoryCache (so the change is ACKNACK-repairable), emits
-   the protected DATA datagram, then a clear HEARTBEAT datagram soliciting the ACKNACK. The DATA and
+   the protected DATA datagram, then a protected HEARTBEAT datagram soliciting the ACKNACK (both ENCRYPT under
+   the bootstrap KM — a submessage-protected endpoint protects its HEARTBEAT too, §8.5.1.9). The DATA and
    HEARTBEAT are SEPARATE datagrams so a lost DATA still leaves a HEARTBEAT to trigger repair (RTPS 2.5
    §8.4.2.2). A no-op (still returns T — the PSM/WLP convention) when DEST-PREFIX has no installed bootstrap
    KM (not yet :authenticated), the endpoint is not enabled, or DEST-PREFIX has no resolved metatraffic
@@ -294,23 +359,25 @@
   (let ((km (%pvms-bootstrap-km node dest-prefix))
         (writer (disc-node-pvms-writer node))
         (hp (%remote-metatraffic node dest-prefix))
-        (sid (%pvms-role-session-id (disc-node-guid-prefix node) dest-prefix)))
+        (sid (%pvms-role-session-id (disc-node-guid-prefix node) dest-prefix))
+        ;; §10.2: the PVMS DATA SerializedPayload MUST carry the PLAIN_CDR_LE encapsulation header (like PSM,
+        ;; %psm-encapsulate, DRY); Fast DDS process_participant_volatile_message_secure reads it (SM:1700-1718).
+        (payload (%psm-encapsulate payload-octets)))
     (when (and km writer hp)
-      (let ((sn (dds.rtps.reliable:writer-write writer payload-octets)))
+      (let ((sn (dds.rtps.reliable:writer-write writer payload)))
         (when (integerp sn)
-          (%pvms-emit-data node km sn payload-octets (car hp) (cdr hp) sid)
-          (%pvms-emit-heartbeat node (car hp) (cdr hp))))))
+          (%pvms-emit-data node km sn payload (car hp) (cdr hp) sid)
+          (%pvms-emit-heartbeat node dest-prefix)))))
   t)
 
 (defun* %pvms-push-heartbeat (node dest-prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
-  "Re-emit the PVMS-writer HEARTBEAT to DEST-PREFIX's metatraffic locator (RTPS 2.5 §8.4.2.2) — the
+  "Re-emit the protected (ENCRYPT) PVMS-writer HEARTBEAT to DEST-PREFIX (RTPS 2.5 §8.4.2.2) — the
    periodic/idempotent re-solicit that keeps reliability live and re-prompts an ACKNACK if a PVMS DATA (or
    an earlier ACKNACK/resend) was lost. A no-op (still T) when the endpoint is not enabled or DEST-PREFIX has
-   no resolved locator. Drives the reliable repair the same way announce-endpoints' %push-heartbeat does for
-   the user writer."
-  (let ((hp (%remote-metatraffic node dest-prefix)))
-    (when hp (%pvms-emit-heartbeat node (car hp) (cdr hp))))
+   no resolved locator / bootstrap KM. Drives the reliable repair the same way announce-endpoints'
+   %push-heartbeat does for the user writer; %pvms-emit-heartbeat resolves the locator + bootstrap KM."
+  (%pvms-emit-heartbeat node dest-prefix)
   t)
 
 (defun* %pvms-authenticated-prefixes (node)
@@ -361,75 +428,98 @@
 
 (defun* %on-volatile-secure (node src-prefix submessage-octets)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t)
-  "Receiver thread: a submessage-protection bracket (SEC_PREFIX ... SEC_POSTFIX) carrying a PVMS DATA from
-   remote SRC-PREFIX. Recover the plaintext DATA submessage with SRC-PREFIX's §9.5.3.1 bootstrap KM (the T2
-   codec decode-datawriter-submessage, DDS-Security 1.1 §8.5.1.7 / §9.5.3.1), parse it, feed its SN to the
-   reliable reader (so the ACKNACK/HEARTBEAT bookkeeping is correct), and deliver the recovered crypto-token
-   ParticipantGenericMessage payload to the ON-VOLATILE-SECURE hook EXACTLY ONCE per (writer,SN) — duplicate
-   SNs (a resend after the original arrived) are de-duplicated (reader-dedup-accept-p) so the hook never
-   double-fires. FAIL-CLOSED (NFR-SEC-POSTURE): a missing KM, an undecryptable/malformed/truncated/tampered
-   bracket, a too-short or wrong-EntityId / no-payload inner DATA → a silent DROP (still returns T), never a
-   signal out of the receiver thread, never plaintext on a failure. The hook fires OUTSIDE the node lock."
+  "Receiver thread: a submessage-protection bracket (SEC_PREFIX ... SEC_POSTFIX) from remote SRC-PREFIX over
+   the ParticipantVolatileMessageSecure endpoint. Recover the plaintext submessage with SRC-PREFIX's §9.5.3.1
+   bootstrap KM (decode-datawriter-submessage decodes ANY §8.5 bracket — DataWriter or DataReader share one
+   transform), then DEMUX the inner RTPS submessage by id. A submessage-protected endpoint protects ALL its
+   submessages, so the PVMS DATA, HEARTBEAT and ACKNACK each arrive ENCRYPTED here, never in the clear
+   (Fast DDS RTPSMessageGroup add_data/add_heartbeat/add_acknack encode_*_submessage; MessageReceiver drops a
+   clear submessage on a protected endpoint — was_decoded || !is_submessage_protected). Demux:
+     DATA      -> feed the SN to the reliable reader + deliver the recovered crypto-token ParticipantGenericMessage
+                  to the ON-VOLATILE-SECURE hook EXACTLY ONCE per (writer,SN) (reader-dedup-accept-p — no double-fire).
+     HEARTBEAT -> %on-pvms-heartbeat (apply range + send the protected ACKNACK; the NACK-pull).
+     ACKNACK   -> %on-pvms-acknack   (resend the NACKed protected DATA; the repair).
+   INFO_TS / any other inner id -> skipped. FAIL-CLOSED (NFR-SEC-POSTURE): a missing KM, an undecryptable/
+   malformed/truncated/tampered bracket, a too-short or wrong-EntityId / no-payload inner DATA -> a silent DROP
+   (still returns T), never a signal out of the receiver thread, never plaintext on a failure. The hook fires
+   OUTSIDE the node lock. Corroborated CLEAN-ROOM vs Fast DDS; see docs/provenance.md."
   (block %on-pvms
     (let ((km (%pvms-bootstrap-km node src-prefix))
           (reader (disc-node-pvms-reader node)))
       (unless (and km reader) (return-from %on-pvms t))                      ; no KM / not enabled -> drop
       (let ((plain (dds.security:decode-datawriter-submessage km submessage-octets)))
         (unless (and plain (>= (length plain) 4)) (return-from %on-pvms t))  ; auth/parse fail -> drop
-        ;; PLAIN is a complete DATA submessage (header + body) we built with write-data (E=1 LE).
+        ;; PLAIN is a complete RTPS submessage (header + body): DATA | HEARTBEAT | ACKNACK | INFO_TS.
         (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over plain) :endianness :little)))
           (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header cur)
-            (unless (and id (= id dds.rtps.message:+submsg-data+)) (return-from %on-pvms t))
+            (unless id (return-from %on-pvms t))
             (dds.core.buffer:cursor-set-endianness cur (if le :little :big))
-            (multiple-value-bind (rdr wid sn has-payload poff plen)
-                (dds.rtps.message:parse-data-body cur flags octets)
-              (declare (ignore rdr))
-              (unless (and sn has-payload (plusp plen)
-                           (= wid dds.rtps.discovery:+entityid-participant-volatile-secure-writer+))
-                (return-from %on-pvms t))
-              (let ((wguid (%source-guid src-prefix wid))
-                    (payload (make-array plen :element-type '(unsigned-byte 8))))
-                ;; PLAIN is the recovered DATA-submessage octet vector itself; copy out [poff, poff+plen).
-                (replace payload plain :start2 poff :end2 (+ poff plen))
-                ;; reliable state ALWAYS (keeps ACKNACK/complete correct); app delivery dedup-gated.
-                (dds.rtps.reliable:reader-on-data reader wguid sn payload)
-                (when (and (dds.rtps.reliable:reader-dedup-accept-p reader wguid sn)
-                           (disc-node-on-volatile-secure node))
-                  (funcall (disc-node-on-volatile-secure node) node src-prefix payload)))))))))
+            (cond
+              ;; inner DATA — a crypto-token ParticipantGenericMessage
+              ((= id dds.rtps.message:+submsg-data+)
+               (multiple-value-bind (rdr wid sn has-payload poff plen)
+                   (dds.rtps.message:parse-data-body cur flags octets)
+                 (declare (ignore rdr))
+                 (unless (and sn has-payload (plusp plen)
+                              (= wid dds.rtps.discovery:+entityid-participant-volatile-secure-writer+))
+                   (return-from %on-pvms t))
+                 (let ((wguid (%source-guid src-prefix wid))
+                       (payload (make-array plen :element-type '(unsigned-byte 8))))
+                   ;; PLAIN is the recovered DATA-submessage octet vector itself; copy out [poff, poff+plen).
+                   (replace payload plain :start2 poff :end2 (+ poff plen))
+                   ;; reliable state ALWAYS (keeps ACKNACK/complete correct); app delivery dedup-gated.
+                   (dds.rtps.reliable:reader-on-data reader wguid sn payload)
+                   ;; §10.2: strip the PLAIN_CDR encapsulation header (%psm-encapsulate's counterpart; Fast DDS
+                   ;; prepends/reads it) before delivering the bare ParticipantGenericMessage; runt (<4) -> drop.
+                   (when (and (>= plen 4)
+                              (dds.rtps.reliable:reader-dedup-accept-p reader wguid sn)
+                              (disc-node-on-volatile-secure node))
+                     (let ((envelope (make-array (- plen 4) :element-type '(unsigned-byte 8))))
+                       (replace envelope payload :start2 4)
+                       (funcall (disc-node-on-volatile-secure node) node src-prefix envelope))))))
+              ;; inner HEARTBEAT — apply range + send the protected ACKNACK (the NACK-pull)
+              ((= id dds.rtps.message:+submsg-heartbeat+)
+               (multiple-value-bind (rid wid first last hcount hfinal hlive)
+                   (dds.rtps.message:parse-heartbeat-body cur flags)
+                 (declare (ignore rid wid hcount hfinal hlive))
+                 (%on-pvms-heartbeat node src-prefix first last)))
+              ;; inner ACKNACK — resend the NACKed protected DATA (the repair)
+              ((= id dds.rtps.message:+submsg-acknack+)
+               (%on-pvms-acknack node src-prefix cur flags))
+              (t nil)))))))                                                  ; INFO_TS / other -> skip
   t)
 
 (defun* %on-pvms-heartbeat (node src-prefix first last)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) integer integer) t)
-  "Receiver thread: a clear HEARTBEAT [FIRST,LAST] from remote SRC-PREFIX's PVMS writer. Apply the range to
-   the reliable reader's writer-proxy (keyed by the remote writer's full 16-octet GUID, §8.3.5.4), compute
-   the ACKNACK (acking received PVMS SNs, NACKing the missing), and send it in the clear to SRC-PREFIX's
-   metatraffic locator (RTPS 2.5 §8.3.7.1) — the repair trigger that pulls a dropped PVMS DATA. writerId in
-   the ACKNACK = the PVMS writer EntityId so the peer routes it to its PVMS writer. A no-op (still T) when the
-   endpoint is not enabled or SRC-PREFIX has no resolved locator. Fresh per-call buffer (control-plane)."
+  "Receiver thread: an inner HEARTBEAT [FIRST,LAST] (decoded from a protected PVMS bracket) from remote
+   SRC-PREFIX's PVMS writer. Apply the range to the reliable reader's writer-proxy (keyed by the remote
+   writer's full 16-octet GUID, §8.3.5.4), compute the ACKNACK (acking received PVMS SNs, NACKing the
+   missing), and send it submessage-protected (ENCRYPT) under SRC-PREFIX's §9.5.3.1 bootstrap KM with this
+   node's per-role session_id to SRC-PREFIX's metatraffic locator (RTPS 2.5 §8.3.7.1; DDS-Security 1.1
+   §8.5.1.9 — the ACKNACK is a reader submessage on a protected endpoint so it is ENCRYPT-protected, matching
+   Fast DDS add_acknack encode_reader_submessage; a CLEAR ACKNACK is dropped by a conformant secure writer).
+   The repair trigger that pulls a dropped PVMS DATA. A no-op (still T) when the endpoint is not enabled or
+   SRC-PREFIX has no resolved locator / bootstrap KM."
   (let ((reader (disc-node-pvms-reader node))
-        (hp (%remote-metatraffic node src-prefix)))
-    (when (and reader hp)
+        (km (%pvms-bootstrap-km node src-prefix))
+        (hp (%remote-metatraffic node src-prefix))
+        (sid (%pvms-role-session-id (disc-node-guid-prefix node) src-prefix)))
+    (when (and reader km hp)
       (let ((wguid (%source-guid src-prefix dds.rtps.discovery:+entityid-participant-volatile-secure-writer+)))
         (dds.rtps.reliable:reader-on-heartbeat reader wguid first last)
         (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
-          (let ((buf (dds.core.buffer:make-octet-buffer 64)))
-            (unwind-protect
-                 (%send-msg-buf node buf
-                                (lambda (mc)
-                                  (dds.rtps.message:write-acknack
-                                   mc dds.rtps.discovery:+entityid-participant-volatile-secure-reader+
-                                   dds.rtps.discovery:+entityid-participant-volatile-secure-writer+
-                                   base numbits bitmap (incf (disc-node-ack-count node)) :final t))
-                                (car hp) (cdr hp))
-              (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))))
+          (let* ((plain   (%pvms-build-plain-acknack node base numbits bitmap))
+                 (secured (dds.security:encode-datareader-submessage km :encrypt plain :session-id sid)))
+            (when secured (%pvms-send-secured node secured (car hp) (cdr hp))))))))
   t)
 
 (defun* %on-pvms-acknack (node src-prefix c flags)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) dds.core.buffer:cursor (unsigned-byte 8)) t)
-  "Receiver thread: parse a clear ACKNACK; when it targets our PVMS writer, RESEND each NACKed change still
+  "Receiver thread: parse the inner ACKNACK (decoded from a protected PVMS bracket by %on-volatile-secure;
+   CURSOR is positioned at the ACKNACK body); when it targets our PVMS writer, RESEND each NACKed change still
    in the reliable writer's HistoryCache as a freshly-protected PVMS DATA to SRC-PREFIX (re-encoded with a
-   fresh nonce under SRC-PREFIX's bootstrap KM), and return T (handled). NIL for any other writer (the
-   caller falls through to the user ACKNACK path). The writer-proxy is keyed by the REMOTE reader's full
+   fresh nonce under SRC-PREFIX's bootstrap KM), and return T (handled). NIL for any other writer. The
+   writer-proxy is keyed by the REMOTE reader's full
    16-octet GUID (SRC-PREFIX + the ACKNACK's reader EntityId, §8.3.5.4). This is the recovery path for a
    dropped PVMS DATA. A no-op resend (still returns T-handled) when the bootstrap KM or the locator is
    missing (fail-closed)."

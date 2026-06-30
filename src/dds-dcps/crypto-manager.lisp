@@ -106,15 +106,21 @@
     (setf (gethash (copy-seq prefix) (crypto-manager-remote-participant-crypto cm)) km))
   t)
 
-(defun* cm-register-local-entity (cm entity-id &key (origin-auth nil))
-    (function (crypto-manager (unsigned-byte 32) &key (:origin-auth t)) dds.security:key-material)
+(defun* cm-register-local-entity (cm entity-id &key (origin-auth nil) (kind :encrypt))
+    (function (crypto-manager (unsigned-byte 32) &key (:origin-auth t) (:kind (member :sign :encrypt)))
+              dds.security:key-material)
   "§8.5 register_local_datawriter/datareader: get-or-create the LOCAL endpoint's §9.5.2 KeyMaterial for
    ENTITY-ID (the submessage/serialized-payload EntityCrypto encode source). Idempotent per ENTITY-ID;
-   ORIGIN-AUTH adds the receiver-specific fields. Under the lock. Returns the KeyMaterial."
+   ORIGIN-AUTH adds the receiver-specific fields. KIND (:encrypt default | :sign) sets the KeyMaterial's
+   advertised transformation_kind — it MUST equal the wire CryptoHeader kind this endpoint's submessages carry
+   (governance protection_kind of the tier: a SIGN endpoint advertises AES256-GMAC, an ENCRYPT one AES256-GCM),
+   because a conformant remote (Fast DDS find_key) matches a stored token KeyMaterial to an inbound submessage on
+   transformation_kind AND sender_key_id together — a SIGN endpoint that advertised GCM is rejected 'Key material
+   not found'. Under the lock. Returns the KeyMaterial."
   (dds.pal:with-lock ((crypto-manager-lock cm))
     (or (gethash entity-id (crypto-manager-local-entity-crypto cm))
         (setf (gethash entity-id (crypto-manager-local-entity-crypto cm))
-              (dds.security:generate-key-material :origin-auth origin-auth)))))
+              (dds.security:generate-key-material :origin-auth origin-auth :kind kind)))))
 
 (defun* cm-register-matched-remote-entity (cm prefix entity-id km)
     (function (crypto-manager (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32)
@@ -176,6 +182,36 @@
   (dds.pal:with-lock ((crypto-manager-lock cm))
     (gethash key-id (crypto-manager-key-id-index cm))))
 
+(defun* %secure-builtin-entity-id-p (entity-id)
+    (function ((unsigned-byte 32)) boolean)
+  "T iff ENTITY-ID is one of the DDS-Security 1.1 §7.4.5 secure BUILTIN endpoint entity-ids (secure SEDP pub/sub,
+   secure participant-message, secure SPDP — the 0xC2 writer / 0xC7 reader of each), NIL for a USER endpoint. The
+   discriminator that routes an inbound SEC_PREFIX bracket whose key_id maps to a builtin entity to %on-secure-builtin
+   vs a USER bracket to user submessage re-dispatch; ENTITY-ID is the remote sender's entity-id REMOTE-KEY-ID-ENTITY records."
+  (and (member entity-id
+               (list dds.rtps.discovery:+entityid-sedp-pub-secure-writer+
+                     dds.rtps.discovery:+entityid-sedp-pub-secure-reader+
+                     dds.rtps.discovery:+entityid-sedp-sub-secure-writer+
+                     dds.rtps.discovery:+entityid-sedp-sub-secure-reader+
+                     dds.rtps.discovery:+entityid-participant-message-secure-writer+
+                     dds.rtps.discovery:+entityid-participant-message-secure-reader+
+                     dds.rtps.discovery:+entityid-spdp-secure-writer+
+                     dds.rtps.discovery:+entityid-spdp-secure-reader+))
+       t))
+
+(defun* cm-user-entity-km-by-key-id (cm key-id)
+    (function (crypto-manager (simple-array (unsigned-byte 8) (*))) (or null dds.security:key-material))
+  "Resolve the REMOTE USER endpoint KeyMaterial by the 4-octet CryptoHeader transformation_key_id, returning the
+   KM ONLY when KEY-ID maps to a remote USER endpoint (not a secure builtin) — the secure-submessage dispatcher
+   routes a USER bracket here (metadata_protection, §8.5.1.7-.9) and a builtin bracket to %on-secure-builtin. Maps
+   KEY-ID -> the remote sender's entity-id (REMOTE-KEY-ID-ENTITY): a secure-builtin entity-id
+   (%secure-builtin-entity-id-p) -> NIL (defer to the builtin path); any other -> the EntityCrypto KM
+   (CM-DECODE-ENTITY-KM-BY-KEY-ID). Fail-closed NIL on an unknown key-id. O(1) under the lock for the eid lookup."
+  (let ((eid (dds.pal:with-lock ((crypto-manager-lock cm))
+               (gethash key-id (crypto-manager-remote-key-id-entity cm)))))
+    (when (and eid (not (%secure-builtin-entity-id-p eid)))
+      (cm-decode-entity-km-by-key-id cm key-id))))
+
 ;;; --- T-ORIGINAUTH: secure-SEDP origin-authentication receiver-key resolvers (§9.5.3.3.4.3) ---
 
 (defun* %km-origin-auth-p (km)
@@ -201,6 +237,33 @@
         ((= entity-id dds.rtps.discovery:+entityid-participant-message-secure-reader+)
          (dds.disc:disc-node-secure-pm-origin-auth node))
         (t nil)))
+
+(defun* %cm-entity-protection-kind (node entity-id)
+    (function (dds.disc:disc-node (unsigned-byte 32)) (member :sign :encrypt))
+  "The §9.5.2 transformation_kind a LOCAL EntityCrypto for ENTITY-ID must ADVERTISE = the governance protection
+   kind of its tier mapped to a CryptoTransformKind (:sign -> AES256-GMAC, :encrypt/:none -> AES256-GCM). A
+   conformant peer's find_key (Fast DDS) matches a stored token KeyMaterial to an inbound submessage on this kind
+   AND the sender_key_id, so a SIGN tier MUST advertise GMAC or it is rejected 'Key material not found'. secure-SEDP
+   / secure-SPDP readers+writers ride disc-node-secure-sedp-protection-kind; secure participant-message (liveliness)
+   readers+writers ride disc-node-secure-pm-protection-kind; the user writer/reader ride
+   disc-node-user-submessage-protection-kind; anything else -> :encrypt. A :none tier maps to :encrypt (inert — that
+   tier emits no protected submessage, so its EntityCrypto kind is never matched against a wire submessage)."
+  (flet ((nz (k) (if (eq k :sign) :sign :encrypt)))   ; :none/:encrypt -> :encrypt; :sign -> :sign
+    (cond
+      ((or (= entity-id dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)
+           (= entity-id dds.rtps.discovery:+entityid-sedp-pub-secure-reader+)
+           (= entity-id dds.rtps.discovery:+entityid-sedp-sub-secure-writer+)
+           (= entity-id dds.rtps.discovery:+entityid-sedp-sub-secure-reader+)
+           (= entity-id dds.rtps.discovery:+entityid-spdp-secure-writer+)
+           (= entity-id dds.rtps.discovery:+entityid-spdp-secure-reader+))
+       (nz (dds.disc:disc-node-secure-sedp-protection-kind node)))
+      ((or (= entity-id dds.rtps.discovery:+entityid-participant-message-secure-writer+)
+           (= entity-id dds.rtps.discovery:+entityid-participant-message-secure-reader+))
+       (nz (dds.disc:disc-node-secure-pm-protection-kind node)))
+      ((or (= entity-id (dds.disc:disc-node-user-writer-id node))
+           (= entity-id (dds.disc:disc-node-user-reader-id node)))
+       (nz (dds.disc:disc-node-user-submessage-protection-kind node)))
+      (t :encrypt))))
 
 (defun* %secure-sedp-reader-for-writer (writer-entity-id)
     (function ((unsigned-byte 32)) (or null (unsigned-byte 32)))
@@ -364,9 +427,26 @@
         (cons (dds.disc:disc-node-user-writer-id node) dds.security:+gm-datawriter-crypto-tokens+)
         (cons (dds.disc:disc-node-user-reader-id node) dds.security:+gm-datareader-crypto-tokens+)))
 
-(defun* cm-make-crypto-token-message (cm class km src-guid dest-prefix)
+(defun* %cm-token-dest-entity-id (node local-eid)
+    (function (dds.disc:disc-node (unsigned-byte 32)) (unsigned-byte 32))
+  "The REMOTE matched-complementary endpoint EntityId for a LOCAL endpoint LOCAL-EID — the §8.5.2.2/.3 DW/DR
+   crypto-token destination_endpoint_key (DDS-Security 1.1 §7.4.4): a DataWriter's tokens are destined for the
+   matched DataReader and vice-versa. The builtin secure endpoints pair deterministically by the §9.3.2 key-kind
+   low byte (writer 0xC2 <-> reader 0xC7 within the SAME builtin: secure SEDP 0xff0003/0xff0004, secure SPDP
+   0xff0101, secure PM 0xff0200); the USER endpoints pair the node's own writer-id <-> reader-id. Fast DDS
+   REQUIRES this key non-unknown for a DW/DR token (SecurityManager.cpp process_participant_volatile_message_secure
+   rejects destination_endpoint_key == GUID_unknown at 1830/1907 and APPLIES the token via reader_handles_/
+   writer_handles_.find(destination_endpoint_key) at 1924/1848)."
+  (cond
+    ((= local-eid (dds.disc:disc-node-user-writer-id node)) (dds.disc:disc-node-user-reader-id node))
+    ((= local-eid (dds.disc:disc-node-user-reader-id node)) (dds.disc:disc-node-user-writer-id node))
+    (t (logior (logand local-eid #xffffff00)
+               (if (= (logand local-eid #xff) #xc2) #xc7 #xc2)))))
+
+(defun* cm-make-crypto-token-message (cm class km src-guid dest-prefix dest-endpoint-guid)
     (function (crypto-manager string dds.security:key-material
-               (simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (12)))
+               (simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (12))
+               (simple-array (unsigned-byte 8) (16)))
               (simple-array (unsigned-byte 8) (*)))
   "Build a §7.4.4 ParticipantGenericMessage (message_class_id = CLASS) wrapping KM as ONE plaintext
    CryptoToken DataHolder (serialize-crypto-token-plain; §8.5.2 — the token rides plaintext, the PVMS
@@ -374,10 +454,14 @@
    SOURCE ENTITY GUID (the participant GUID for a participant token, the endpoint GUID for a DW/DR token);
    it is written into source_endpoint_key so the receiver keys the remote EntityCrypto by the exact entity
    (the §7.4.4 wire carries the per-entity identity the builtin-EntityCrypto model needs, design §6.2).
-   DEST-PREFIX -> destination_participant_key (prefix + ENTITYID_PARTICIPANT). Returns the CDR-LE envelope
-   octets %send-volatile-secure protects + sends. Inverse: cm-parse-crypto-token-message."
+   DEST-ENDPOINT-GUID is the 16-octet destination_endpoint_key — GUID_unknown (all-zero) for a PARTICIPANT
+   token (participant-level), the MATCHED REMOTE endpoint GUID for a DW/DR token (the remote DataReader for our
+   DataWriter's tokens, the remote DataWriter for our DataReader's tokens, §8.5.2.2/.3). DEST-PREFIX ->
+   destination_participant_key (prefix + ENTITYID_PARTICIPANT). Returns the CDR-LE envelope octets
+   %send-volatile-secure protects + sends. Inverse: cm-parse-crypto-token-message."
   (declare (ignore cm))
   (let* ((zero16 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (partp (string= class dds.security:+gm-participant-crypto-tokens+))
          (src-prefix (subseq src-guid 0 12))
          (part-guid (%guid-from-prefix src-prefix dds.rtps.message:+entityid-participant+))
          (dest-guid (%guid-from-prefix dest-prefix dds.rtps.message:+entityid-participant+)))
@@ -387,8 +471,12 @@
      :related-guid          zero16
      :related-sn            0
      :dest-participant-guid dest-guid
-     :dest-endpoint-guid    zero16
-     :source-endpoint-guid  src-guid
+     ;; §8.5.2.1/.2/.3 + Fast DDS SM process_participant_volatile_message_secure: a PARTICIPANT token is
+     ;; participant-level -> BOTH endpoint keys = GUID_unknown (rejected otherwise, SM:1739-1749); a DW/DR token
+     ;; carries the SOURCE endpoint GUID + the matched-remote DESTINATION endpoint GUID (rejected if either is
+     ;; GUID_unknown, SM:1830/1835/1907/1912; the token is APPLIED via *_handles_.find(dest) at 1848/1924).
+     :dest-endpoint-guid    (if partp zero16 dest-endpoint-guid)
+     :source-endpoint-guid  (if partp zero16 src-guid)
      :message-class-id      class
      :dataholders           (list (dds.security:serialize-crypto-token-plain km)))))
 
@@ -417,17 +505,23 @@
       (let ((km (dds.security:parse-crypto-token-plain (car dh-list))))
         (if km (values class-id km src-ep) (values nil nil nil))))))
 
-(defun* %cm-remote-keyed-ready-p (cm prefix)
-    (function (crypto-manager (simple-array (unsigned-byte 8) (12))) t)
-  "T iff remote PREFIX's ParticipantCrypto AND the core secure-SEDP builtin EntityCrypto — the publications
-   secure-writer (DW) + the subscriptions secure-reader (DR) — are all installed: the §7.2
-   :authenticated->:keyed precondition ('crypto established'). Reads the registries directly (no per-remote
-   token tracker); the secure-SEDP pub-W + sub-R are the endpoints T9's secure SEDP needs first, so they are
-   the promotion-gating subset of the full builtin set %cm-local-token-entities exchanges."
-  (and (cm-decode-participant-km cm prefix)
-       (cm-decode-entity-km cm (%guid-from-prefix prefix dds.rtps.discovery:+entityid-sedp-pub-secure-writer+))
-       (cm-decode-entity-km cm (%guid-from-prefix prefix dds.rtps.discovery:+entityid-sedp-sub-secure-reader+))
-       t))
+(defun* %cm-remote-keyed-ready-p (cm node prefix)
+    (function (crypto-manager dds.disc:disc-node (simple-array (unsigned-byte 8) (12))) t)
+  "T iff remote PREFIX's PARTICIPANT-level crypto is established — the §7.2 :authenticated->:keyed
+   precondition. Requires ONLY PREFIX's ParticipantCrypto: the participant-level KeyMaterial Fast DDS
+   exchanges unconditionally at participant_authorized (SecurityManager.cpp exchange_participant_crypto,
+   NOT gated on rtps_protection). The ENDPOINT-level secure-builtin EntityCryptos (secure SEDP 0xff0003/
+   0xff0004, secure SPDP 0xff0101, secure PM 0xff0200) are NOT a keying precondition: a conformant peer
+   exchanges them in a SECOND phase that FOLLOWS the participant secure-match (Fast DDS PDPSimple.cpp
+   assignRemoteEndpoints with notify_secure -> EDPSimple.cpp secure-endpoint pairing, gated on the secure
+   SPDP reader having matched the remote secure SPDP writer — i.e. AFTER :keyed, not before). Requiring the
+   secure-SEDP tokens here would DEADLOCK against that two-phase peer (we would never key, so the matches
+   that drive the secure channel stay parked, so the peer never reaches phase two). So keying gates on the
+   ParticipantCrypto alone (identical for PLAIN and PROTECTED discovery); the secure-SEDP/PM EntityCryptos
+   install lazily as those endpoints match (the secure-SEDP receive path resolves each by transformation_key_id
+   on arrival, NFR-SEC-POSTURE fail-closed until present). Reads the registry directly."
+  (declare (ignore node))
+  (and (cm-decode-participant-km cm prefix) t))
 
 (defun* %cm-try-promote (cm node prefix)
     (function (crypto-manager dds.disc:disc-node (simple-array (unsigned-byte 8) (12))) (eql t))
@@ -438,7 +532,7 @@
    resolver MIGRATED onto the crypto-manager) and resumes the parked matches (resume takes the node lock;
    never held under the manager lock). Idempotent: a no-op once already :keyed, or until the tokens are in."
   (let ((ms (crypto-manager-owner-ms cm)) (flip nil))
-    (when (and ms (%cm-remote-keyed-ready-p cm prefix))
+    (when (and ms (%cm-remote-keyed-ready-p cm node prefix))
       (dds.pal:with-lock ((auth-manager-state-lock ms))
         (let ((ar (gethash prefix (dds.disc:disc-node-auth-state node))))
           (when (and ar (eq (auth-remote-state ar) :authenticated))
@@ -490,23 +584,72 @@
     ;; receiver key -> plain SRTPS, byte-identical.
     (cm-register-local-participant cm :origin-auth (dds.disc:disc-node-rtps-protection-origin-auth node))
     (dolist (e (%cm-local-token-entities node))
-      (cm-register-local-entity cm (car e) :origin-auth (%cm-entity-origin-auth node (car e))))
+      (cm-register-local-entity cm (car e) :origin-auth (%cm-entity-origin-auth node (car e))
+                                           :kind (%cm-entity-protection-kind node (car e))))
     ;; send our ParticipantCryptoToken, then one DatawriterCryptoToken/DatareaderCryptoToken per local entity
-    (let ((part-km (cm-encode-participant-km cm)))
+    (let ((zero16 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+          (part-km (cm-encode-participant-km cm)))
       (when part-km
         (dds.disc:%send-volatile-secure
          node remote-prefix
          (cm-make-crypto-token-message
           cm dds.security:+gm-participant-crypto-tokens+ part-km
-          (%guid-from-prefix local-prefix dds.rtps.message:+entityid-participant+) remote-prefix))))
-    (dolist (e (%cm-local-token-entities node))
-      (let ((km (cm-encode-entity-km cm (car e))))
+          (%guid-from-prefix local-prefix dds.rtps.message:+entityid-participant+) remote-prefix zero16)))
+      ;; §8.5.2.2/.3: each DW/DR token's destination_endpoint_key is the MATCHED REMOTE complementary endpoint
+      ;; GUID = remote-prefix + %cm-token-dest-entity-id (writer<->reader); GUID_unknown is rejected by Fast DDS.
+      (dolist (e (%cm-local-token-entities node))
+        (let ((km (cm-encode-entity-km cm (car e))))
+          (when km
+            (dds.disc:%send-volatile-secure
+             node remote-prefix
+             (cm-make-crypto-token-message
+              cm (cdr e) km (%guid-from-prefix local-prefix (car e)) remote-prefix
+              (%guid-from-prefix remote-prefix (%cm-token-dest-entity-id node (car e)))))))))
+    (%cm-try-promote cm node remote-prefix))
+  t)
+
+(defun* cm-on-endpoint-match (cm node remote-guid local-is-writer-p)
+    (function (crypto-manager dds.disc:disc-node (simple-array (unsigned-byte 8) (16)) t) (eql t))
+  "Re-exchange the USER endpoint's §8.5.2.2/.3 DW/DR CryptoToken at MATCH time, now that the ACTUAL matched-remote
+   user-endpoint GUID REMOTE-GUID is known (learned from the secure-SEDP — or plain-SEDP — Discovered{Writer,
+   Reader}Data, design §7.2 / DDS-Security 1.1 §7.4.4). LOCAL-IS-WRITER-P selects which local user endpoint
+   matched: T = our user WRITER matched a remote READER (send our DatawriterCryptoToken, source = our writer
+   GUID); NIL = our user READER matched a remote WRITER (send our DatareaderCryptoToken, source = our reader
+   GUID). The token's destination_endpoint_key is REMOTE-GUID itself — the matched-remote endpoint GUID, NOT the
+   symmetric-assumed our-own-id cm-on-authenticated sent at auth time (correct ONLY our-to-our; a cross-vendor
+   peer's user entity-ids are its own, so Fast DDS process_participant_volatile_message_secure rejects a wrong
+   destination_endpoint_key as 'Key material not found' and applies a correct one via reader/writer_handles_.find,
+   SM:1848/1924). Sent over the reliable PVMS (%send-volatile-secure). Gated on the remote being KEYED (its
+   ParticipantCrypto present) — a user match via secure SEDP is post-keying; fail-closed no-op otherwise. For
+   our-to-our the real GUID EQUALS the auth-time guess, so this is an idempotent duplicate (cm-register-matched-
+   remote-entity + %cm-try-promote are idempotent) — no regression. A no-op (still T) when the local user
+   EntityCrypto is not registered (security off / not keyed)."
+  (let* ((remote-prefix (subseq remote-guid 0 12))
+         (local-prefix  (dds.disc:disc-node-guid-prefix node)))
+    (when (cm-decode-participant-km cm remote-prefix)            ; remote keyed (PVMS up) — else fail-closed no-op
+      (let* ((local-eid (if local-is-writer-p (dds.disc:disc-node-user-writer-id node)
+                            (dds.disc:disc-node-user-reader-id node)))
+             (class     (if local-is-writer-p dds.security:+gm-datawriter-crypto-tokens+
+                           dds.security:+gm-datareader-crypto-tokens+))
+             (km        (cm-encode-entity-km cm local-eid)))
         (when km
           (dds.disc:%send-volatile-secure
            node remote-prefix
            (cm-make-crypto-token-message
-            cm (cdr e) km (%guid-from-prefix local-prefix (car e)) remote-prefix)))))
-    (%cm-try-promote cm node remote-prefix))
+            cm class km (%guid-from-prefix local-prefix local-eid) remote-prefix remote-guid))))))
+  t)
+
+(defun* %cm-user-token-at-match (p remote-guid local-is-writer-p)
+    (function (domain-participant (simple-array (unsigned-byte 8) (16)) t) (eql t))
+  "DCPS on-match -> §8.5.2 user-token re-exchange bridge: resolve P's crypto-manager (NIL = security OFF / no
+   handshake -> no-op) and re-send the matched USER endpoint's DW/DR CryptoToken keyed to the matched-remote
+   REMOTE-GUID (cm-on-endpoint-match — the destination_endpoint_key fix). LOCAL-IS-WRITER-P: T our user writer
+   matched a remote reader, NIL our user reader matched a remote writer. Called from %on-disc-match (fired once
+   per newly-matched user endpoint, %fire-match dedups). Fail-soft no-op when no auth/crypto manager."
+  (let ((ms (dp-auth-state p)))
+    (when ms
+      (let ((cm (auth-manager-state-crypto-manager ms)))
+        (when cm (cm-on-endpoint-match cm (dp-node p) remote-guid local-is-writer-p)))))
   t)
 
 (defun* cm-on-crypto-token (cm node src-prefix class km &optional entity-guid)
@@ -603,4 +746,20 @@
               (when km
                 (let ((rd (cm-rtps-decode-receiver cm)))   ; (key_id . key) | nil (origin-auth)
                   (values km (car rd) (cdr rd)))))))
+    ;; Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP): user-DATA submessage protection (metadata_protection,
+    ;; §8.5.1.7-.9). USER-SUBMESSAGE-ENCODE (writer-p -> (values LOCAL-user-EntityCrypto-KM kind) | NIL): the SEND
+    ;; wrap resolver — NIL when the node's metadata_protection kind is NONE or the local user EntityCrypto is not yet
+    ;; registered (pre-keying), so %maybe-wrap-user-submessages passes the submessage through plain (byte-identical).
+    ;; USER-SUBMESSAGE-DECODE (key-id -> REMOTE user EntityCrypto KM | NIL): the RECEIVE resolver — NIL when key-id is
+    ;; a secure builtin (a builtin bracket still routes to %on-secure-builtin) or unknown. metadata_protection NONE
+    ;; leaves the encode resolver returning NIL -> the user submessage path is byte-identical to the plain stack.
+    (setf (dds.disc:disc-node-user-submessage-encode node)
+          (lambda (writer-p)
+            (let ((kind (dds.disc:disc-node-user-submessage-protection-kind node)))
+              (unless (eq kind :none)
+                (let ((km (cm-encode-entity-km cm (if writer-p (dds.disc:disc-node-user-writer-id node)
+                                                      (dds.disc:disc-node-user-reader-id node)))))
+                  (when km (values km kind)))))))
+    (setf (dds.disc:disc-node-user-submessage-decode node)
+          (lambda (key-id) (cm-user-entity-km-by-key-id cm key-id)))
     cm))

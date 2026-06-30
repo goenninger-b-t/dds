@@ -8,7 +8,13 @@
 ;;;   class_id: u32-LE(strlen+1) | ascii | NUL | pad4
 ;;;   PropertySeq: u32-LE(count=0)      -- always present; count=0 for HandshakeMessageToken
 ;;;   BinaryPropertySeq: u32-LE(count) | BinaryProperty*
-;;;     BinaryProperty: name(CDR-LE string) | value(u32-LE(len) | bytes) | propagate(1B) | 3pad
+;;;     BinaryProperty: name(CDR-LE string) | value(u32-LE(len) | bytes | pad-to-4)  -- name+value ONLY
+;;;       (propagate is NOT on the wire: §7.2.2 LOCAL include/exclude filter; count = propagate==true count, T1)
+;;;       (the octet-vector value is 4-byte aligned: Fast DDS addBinaryPropertySeq(..., add_final_padding=true)
+;;;        + readOctetVector pos->(pos+3)&~3; the DataHolder sits at a 4-aligned message offset so this is the
+;;;        stream alignment. The §8.7 hash/Sign BinaryPropertySeq (handshake.lisp BE) uses the SAME per-value
+;;;        4-padding but OMITS the pad on the LAST property — its seq-level add_final_padding=false vs =true
+;;;        here on the wire, T4.)
 ;;;
 ;;; ENDIANNESS NOTE: this file is CDR-LE (PSM wire). handshake.lisp BE helpers are for
 ;;;   hash_c1/hash_c2/Sign inputs only. Two distinct serializations; never mixed.
@@ -24,12 +30,18 @@
 
 (defun* %cdr-binary-property-le (name value-octets)
     (function (string (simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
-  "Encode one CDR-LE BinaryProperty: name(CDR-LE string) + value(u32-LE len + bytes) + propagate(1)+3pad.
-   Layout per OMG dds_security_plugins_spis.idl BinaryProperty, CDR-LE (§9.3.4 / §7.4.4)."
-  (let* ((n   (length value-octets))
-         (hdr (%cdr-u32-le n))
-         (pad (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 0 0 0))))
-    (%concat-octets (%cdr-string-le name) hdr value-octets pad)))
+  "Encode one CDR-LE §9.3.4 BinaryProperty: name(CDR-LE string) + value(u32-LE len + bytes + pad-to-4)
+   — name+value ONLY (no propagate; §7.2.2 LOCAL filter, T1). The octet-vector value is padded to the
+   next 4-byte boundary: the WIRE DataHolder is CDR-aligned (Fast DDS addBinaryPropertySeq(..., /*add_final_
+   padding=*/true) at CDRMessage.cpp; readOctetVector advances pos to (pos+3)&~3). The DataHolder is always
+   embedded at a 4-aligned message offset, so DataHolder-local padding equals the stream alignment. This is
+   the WIRE form (add_final_padding=true: every value padded). The §8.7 hash/Sign input (handshake.lisp,
+   add_final_padding=false) 4-pads every value EXCEPT the last property in the sequence (T4)."
+  (let* ((n    (length value-octets))
+         (hdr  (%cdr-u32-le n))
+         (pad  (mod (- 4 (mod n 4)) 4))
+         (padv (make-array pad :element-type '(unsigned-byte 8) :initial-element 0)))
+    (%concat-octets (%cdr-string-le name) hdr value-octets padv)))
 
 (defun* %build-dataholder-le (class-id binary-props)
     (function (string list) (simple-array (unsigned-byte 8) (*)))
@@ -82,14 +94,17 @@
 (defun* %dh-read-octet-seq-le (octets pos n)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum)
               (values (simple-array (unsigned-byte 8) (*)) fixnum))
-  "Read a CDR-LE octet sequence (u32-LE(len) | bytes, no post-pad). Returns (values bytes new-pos).
-   Signals dataholder-parse-error on truncation or if len > 0x1000000."
+  "Read a CDR-LE §9.3.4 BinaryProperty octet sequence (u32-LE(len) | bytes | pad-to-4). Returns
+   (values bytes new-pos) with new-pos advanced PAST the 4-byte alignment padding (Fast DDS
+   readOctetVector aligns pos to (pos+3)&~3). Clamped to N so a missing trailing pad on the final
+   property never reads past the buffer. Signals dataholder-parse-error on truncation or len > 0x1000000."
   (multiple-value-bind (len p2) (%dh-read-u32-le octets pos n)
     (when (> len #x1000000) (%dh-fail))
     (when (> (+ p2 len) n) (%dh-fail))
-    (let ((v (make-array len :element-type '(unsigned-byte 8))))
+    (let ((v   (make-array len :element-type '(unsigned-byte 8)))
+          (end (logand (+ p2 len 3) (lognot 3))))
       (dotimes (i len) (setf (aref v i) (aref octets (+ p2 i))))
-      (values v (+ p2 len)))))
+      (values v (min end n)))))
 
 (defun* %dh-skip-string-le (octets pos n)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum)
@@ -117,24 +132,20 @@
    Signals dataholder-parse-error on any malformed/truncated structure."
   ;; class_id string
   (setf pos (%dh-skip-string-le octets pos n))
-  ;; PropertySeq: u32-LE count + count*(name-str + value-str + 4B propagate)
+  ;; PropertySeq: u32-LE count + count*(name-str + value-str)  -- name+value ONLY, no propagate (T1)
   (multiple-value-bind (pc p2) (%dh-read-u32-le octets pos n)
     (when (> pc 65536) (%dh-fail))
     (setf pos p2)
     (dotimes (_ pc)
-      (setf pos (%dh-skip-string-le octets pos n))  ; name
-      (setf pos (%dh-skip-string-le octets pos n))  ; value
-      (when (> (+ pos 4) n) (%dh-fail))
-      (incf pos 4))
-    ;; BinaryPropertySeq: u32-LE count + count*(name-str + octet-seq + 4B propagate)
+      (setf pos (%dh-skip-string-le octets pos n))    ; name
+      (setf pos (%dh-skip-string-le octets pos n)))   ; value
+    ;; BinaryPropertySeq: u32-LE count + count*(name-str + octet-seq)  -- name+value ONLY, no propagate (T1)
     (multiple-value-bind (bc p3) (%dh-read-u32-le octets pos n)
       (when (> bc 65536) (%dh-fail))
       (setf pos p3)
       (dotimes (_ bc)
-        (setf pos (%dh-skip-string-le  octets pos n))   ; name
-        (setf pos (%dh-skip-octet-seq-le octets pos n)) ; value
-        (when (> (+ pos 4) n) (%dh-fail))
-        (incf pos 4))
+        (setf pos (%dh-skip-string-le  octets pos n))    ; name
+        (setf pos (%dh-skip-octet-seq-le octets pos n)))  ; value
       pos)))
 
 ;;; --- Public DataHolder codec ---
@@ -166,10 +177,8 @@
             (when (> pc 65536) (%dh-fail))
             (setf pos p3)
             (dotimes (_ pc)
-              (setf pos (%dh-skip-string-le octets pos n))   ; name
-              (setf pos (%dh-skip-string-le octets pos n))   ; value
-              (when (> (+ pos 4) n) (%dh-fail))
-              (incf pos 4))                                   ; propagate
+              (setf pos (%dh-skip-string-le octets pos n))    ; name
+              (setf pos (%dh-skip-string-le octets pos n)))   ; value (no propagate on the wire, T1)
             ;; BinaryPropertySeq
             (multiple-value-bind (bc p4) (%dh-read-u32-le octets pos n)
               (when (> bc 65536) (%dh-fail))
@@ -179,12 +188,9 @@
                   ;; name
                   (multiple-value-bind (name p5) (%dh-read-string-le octets pos n)
                     (setf pos p5)
-                    ;; value (octet sequence)
+                    ;; value (octet sequence); §9.3.4 BinaryProperty = name+value ONLY, no propagate (T1)
                     (multiple-value-bind (val p6) (%dh-read-octet-seq-le octets pos n)
                       (setf pos p6)
-                      ;; propagate (4 bytes)
-                      (when (> (+ pos 4) n) (%dh-fail))
-                      (incf pos 4)
                       (push (cons name val) props))))
                 (%make-handshake-token :class-id class-id
                                        :binary-props (nreverse props))))))))))

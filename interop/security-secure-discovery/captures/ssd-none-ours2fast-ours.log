@@ -23,28 +23,23 @@ WARNING:
        NET.GOENNINGER.DDS.DCPS::AUTH-MANAGER-STATE
        NET.GOENNINGER.DDS.DISC:DISC-NODE)
       *)
-[pub] secure participant up: domain=0 topic=HelloWorldTopic type=HelloWorld guid-prefix=474201CDB5EBED0000000000 port=7420 peers=127.0.0.1:7410
-; auth-manager[D1437B8E7A95]: remote IdentityToken rejected
-[pub] discovered=1 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED
-[pub] discovered=1 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED
-; auth-manager[D1437B8E7A95]: remote IdentityToken rejected
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-[pub] discovered=2 matched=0 samples=0 keyed=NIL states=D1437B8E=REJECTED,D1437B8E=REJECTED
-SUMMARY: role=pub discovered=2 peak-matched=0 peak-samples=0 ever-keyed=NIL sent=0
+[pub] secure participant up: domain=0 topic=HelloWorldTopic type=HelloWorld guid-prefix=B9A1E95FB45E7C7C7C7C7C7C port=7420 peers=127.0.0.1:7410
+; auth-manager[D1437B8E7A95]: requester: sent HandshakeRequest
+; auth-manager[D1437B8E7A95]: authenticated; driving crypto-token exchange over PVMS
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+[pub] discovered=1 matched=0 samples=0 keyed=T states=D1437B8E=KEYED
+SUMMARY: role=pub discovered=1 peak-matched=0 peak-samples=0 ever-keyed=T sent=0
 RESULT: FAIL

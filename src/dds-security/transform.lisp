@@ -51,32 +51,16 @@
       (setf (aref buf (- 7 i)) (logand (ash val (* i -8)) #xff)))
     buf))
 
-(defun* %assemble-header-aad (kind key-id session-id iv-suffix)
-    (function ((simple-array (unsigned-byte 8) (*))
-               (simple-array (unsigned-byte 8) (*))
-               (simple-array (unsigned-byte 8) (*))
-               (simple-array (unsigned-byte 8) (*)))
-              (simple-array (unsigned-byte 8) (*)))
-  "Assemble the 20-byte SecureDataHeader = kind(4)∥key_id(4)∥session_id(4)∥iv_suffix(8) as the
-   GCM AAD buffer (§9.5.3.3.4.4). Byte layout mirrors serialize-secured-payload so that decode
-   reconstructs the BYTE-IDENTICAL 20-byte header from the parsed fields — GCM authentication
-   fails if even one bit differs between seal-time AAD and open-time AAD."
-  (let* ((hdr (make-array +secure-data-header-len+ :element-type '(unsigned-byte 8)))
-         (cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over hdr) :endianness :little)))
-    (dds.core.buffer:put-octets cur kind 0 +transformation-kind-len+)
-    (dds.core.buffer:put-octets cur key-id 0 +transformation-key-id-len+)
-    (dds.core.buffer:put-octets cur session-id 0 +session-id-len+)
-    (dds.core.buffer:put-octets cur iv-suffix 0 +init-vector-suffix-len+)
-    hdr))
-
 ;;; --- shared session-key + nonce + AES-GCM core (DRY across all §9.5.3.3 protection tiers) ---
-;;; The AAD is a PARAMETER so each tier composes its own authenticated-but-not-encrypted region:
-;;;   * serialized-payload (Slice 1, here): AAD = the 20-byte SecureDataHeader (§9.5.3.3.4.4).
-;;;   * submessage protection (Slice 4 T2, crypto/submessage.lisp): AAD = empty (ENCRYPT) or the
-;;;     plaintext submessage (SIGN/GMAC) — Fast-DDS-faithful (the operating contract §4: the wire is
-;;;     the oracle; corroborated against eProsima Fast DDS AESGCMGMAC_Transform.cpp, see provenance).
-;;; The CryptoHeader is NEVER folded in here; the caller decides the AAD. session_id + iv_suffix
-;;; together form the 12-byte nonce — uniqueness is the caller's responsibility (%km-next-iv-suffix).
+;;; The AAD is a PARAMETER so each tier composes its own authenticated-but-not-encrypted region. All three
+;;; conformant tiers use the SAME EMPTY AAD (+empty-octets+), corroborated CLEAN-ROOM against Fast DDS
+;;; AESGCMGMAC_Transform.cpp serialize_SecureDataBody (one function, ENCRYPT sets no AAD; see provenance):
+;;;   * serialized-payload (Slice 1, here, T10-INTEROP-RECONCILE): AAD = EMPTY (was the 20-byte SecureDataHeader;
+;;;     reconciled to empty — header integrity now via the decode kind/key_id find_key check + the nonce).
+;;;   * submessage protection (Slice 4 T2, crypto/submessage.lisp): AAD = empty (ENCRYPT) or the plaintext
+;;;     submessage (SIGN/GMAC).
+;;; The CryptoHeader is NEVER folded in here; the caller decides the AAD. session_id + iv_suffix together form the
+;;; 12-byte nonce — uniqueness is the caller's responsibility (%km-next-iv-suffix).
 
 (defun* %km-nonce (session-id iv-suffix)
     (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
@@ -127,20 +111,22 @@
         nonce uniqueness; see the nonce-uniqueness argument at the top of transform.lisp.
      2. Derive the AES-256 session key: derive-session-key(km.master_sender_key, km.master_salt,
         +fixed-session-id+) per §9.5.3.3.4.2.
-     3. Assemble the 20-byte SecureDataHeader (kind∥key_id∥session_id∥iv_suffix) as the GCM AAD.
-     4. AES-256-GCM seal: nonce = session_id(4)∥iv_suffix(8) (12 bytes); returns (ciphertext, tag).
-     5. Serialize via serialize-secured-payload.
-   Returns a fresh octet vector. AAD = the exact 20-byte header placed in the blob so that
-   decode-serialized-payload can reconstruct it byte-identically from the parsed fields."
+     3. AES-256-GCM seal with EMPTY AAD: nonce = session_id(4)∥iv_suffix(8) (12 bytes); returns
+        (ciphertext, tag).
+     4. Serialize via serialize-secured-payload.
+   Returns a fresh octet vector. AAD = EMPTY (+empty-octets+) — Fast-DDS-faithful (corroborated CLEAN-ROOM
+   against eProsima Fast DDS AESGCMGMAC_Transform.cpp encode_serialized_payload -> serialize_SecureDataBody,
+   whose ENCRYPT branch sets NO AAD; the SAME function as the submessage tier, so payload + submessage share
+   the empty-AAD posture, the byte-exact submessage corpus already proves it). The header fields are integrity-
+   bound WITHOUT AAD: session_id/iv_suffix derive the nonce (tamper -> GCM fail), and decode rejects a wire
+   kind/key_id that does not match the KM (the Fast DDS find_key check; see decode-serialized-payload). This is
+   the T10-INTEROP-RECONCILE of the Slice-1 carry (was the 20-byte SecureDataHeader as AAD); see docs/provenance.md."
   (let* ((iv-suffix  (%km-next-iv-suffix km))
          (session-id (copy-seq +fixed-session-id+))
          (kind       (key-material-transformation-kind km))
-         (key-id     (key-material-sender-key-id km))
-         ;; serialized-payload AAD = the exact 20-byte SecureDataHeader (§9.5.3.3.4.4); the shared
-         ;; %seal-with-km derives the session key + nonce (DRY with the submessage tier).
-         (aad        (%assemble-header-aad kind key-id session-id iv-suffix)))
+         (key-id     (key-material-sender-key-id km)))
     (multiple-value-bind (ciphertext tag)
-        (%seal-with-km km session-id iv-suffix aad plaintext)
+        (%seal-with-km km session-id iv-suffix +empty-octets+ plaintext)   ; empty AAD (Fast-DDS-faithful, DRY)
       (serialize-secured-payload kind key-id session-id iv-suffix ciphertext tag))))
 
 (defun* decode-serialized-payload (km secured-octets)
@@ -152,21 +138,24 @@
    Algorithm (§9.5.3.3.4.5):
      1. parse-secured-payload: extract kind, key_id, session_id, iv_suffix, ciphertext, tag.
         Any SECURED-PAYLOAD-MALFORMED signal is caught -> NIL (no crash, no OOB).
-     2. Reconstruct the 20-byte SecureDataHeader as AAD from the WIRE-PARSED kind and key_id
-        (§9.5.3.3.4.5 — AAD = the received SecureDataHeader); on a legitimate blob the wire fields
-        equal the encode-side km fields so the AAD is byte-identical and auth passes, while
-        tampering any header byte changes the AAD and forces a GCM authentication failure.
+     2. Verify the WIRE kind/key_id MATCH the KM (the Fast DDS AESGCMGMAC_Transform::find_key check:
+        transformation_kind AND transformation_key_id both equal the KeyMaterial's) -> NIL on mismatch.
+        This integrity-binds the SecureDataHeader kind/key_id WITHOUT folding them into the AAD (so the
+        wire stays Fast-DDS-faithful with EMPTY AAD); a kind/key_id tamper is rejected here, while a
+        session_id/iv_suffix tamper is caught by the GCM auth (they derive the nonce).
      3. Derive the same session key: derive-session-key(km.master_sender_key, km.master_salt,
         parsed session_id).
-     4. AES-256-GCM open with (skey, nonce, aad, ct, tag): dds.dare:aes-256-gcm-open returns
-        NIL on auth failure — propagate NIL directly."
+     4. AES-256-GCM open with (skey, nonce, EMPTY aad, ct, tag): dds.dare:aes-256-gcm-open returns
+        NIL on auth failure — propagate NIL directly. AAD = EMPTY (Fast-DDS-faithful, T10-INTEROP-RECONCILE)."
   (handler-case
       (multiple-value-bind (kind key-id session-id iv-suffix ciphertext tag)
           (parse-secured-payload secured-octets)
-        ;; AAD = the WIRE-PARSED 20-byte SecureDataHeader (§9.5.3.3.4.5); the shared %open-with-km
-        ;; re-derives the session key + nonce. Tampering any header byte changes the AAD -> GCM fail.
-        (%open-with-km km session-id iv-suffix
-                       (%assemble-header-aad kind key-id session-id iv-suffix)
-                       ciphertext tag))
+        ;; Fast DDS find_key: the wire kind/key_id MUST match the KM, else fail-closed (the header integrity
+        ;; gate now that the AAD is EMPTY; a kind or key_id bit-flip is rejected here, not via the GCM tag).
+        (when (and (equalp kind   (key-material-transformation-kind km))
+                   (equalp key-id (key-material-sender-key-id km)))
+          ;; AAD = EMPTY (+empty-octets+, Fast-DDS-faithful, DRY); session_id/iv_suffix derive the nonce, so
+          ;; tampering them forces a GCM auth failure. The shared %open-with-km re-derives the session key + nonce.
+          (%open-with-km km session-id iv-suffix +empty-octets+ ciphertext tag)))
     ;; Any condition (malformed blob, constraint, etc.) -> NIL (fail-closed).
     (error () nil)))

@@ -152,30 +152,38 @@
   (loop for kid = (dds.dare:random-bytes 4)
         when (notevery #'zerop kid) return kid))
 
-(defun* generate-key-material (&key (origin-auth nil))
-    (function (&key (:origin-auth t)) key-material)
+(defun* generate-key-material (&key (origin-auth nil) (kind :encrypt))
+    (function (&key (:origin-auth t) (:kind (member :sign :encrypt))) key-material)
   "Generate a fresh §9.5.2 KeyMaterial_AES_GCM_GMAC — the generic §8.5 CryptoKeyFactory primitive
    reused for participant- and entity-level keys (and, via GENERATE-WRITER-KEY-MATERIAL, per-writer
    keys). master_salt (32B) + master_sender_key (32B) are cryptographically random
    (dds.dare:random-bytes); sender_key_id is a process-unique NON-ZERO 4-octet allocation
    (%ALLOC-SENDER-KEY-ID) so a receiver's O(1) transformation_key_id -> KeyMaterial decode index
-   stays unambiguous; transformation_kind = AES256-GCM (§9.5.2 Table 65). With ORIGIN-AUTH NIL
-   (default) the receiver-specific fields stay all-zero (no per-receiver origin authentication,
-   §9.5.2). With ORIGIN-AUTH true both are populated: a NON-ZERO random receiver_specific_key_id
-   (zero is the §9.5.3.3.4.3 origin-auth-disabled sentinel — never emitted) + a random 32B
-   master_receiver_specific_key, for the *_WITH_ORIGIN_AUTHENTICATION protection kinds (§9.5.3.3.4.3;
-   consumed by derive-receiver-specific-session-key / compute-receiver-specific-mac). Keys are plain
-   heap vectors per ADR 0034 (KeyMaterial foreign-backing + zeroize-on-teardown is a deferred
-   hardening follow-on); the caller owns the key-material lifecycle. Control-plane, not the hot path."
+   stays unambiguous. KIND selects the §9.5.2 Table 65 transformation_kind the KeyMaterial ADVERTISES:
+   :encrypt (default) -> AES256-GCM {0,0,0,4}; :sign -> AES256-GMAC {0,0,0,3}. This MUST equal the wire
+   CryptoHeader transformation_kind a peer sees for this endpoint's submessages, because a conformant
+   receiver (Fast DDS AESGCMGMAC_Transform::find_key) matches a stored KeyMaterial to an inbound submessage
+   on BOTH transformation_kind AND sender_key_id — a SIGN endpoint advertising a GCM KeyMaterial is rejected
+   'Key material not found' (the AES-256 master key is identical for GCM and GMAC; only the advertised kind +
+   the SEC_BODY-vs-verbatim framing differ). With ORIGIN-AUTH NIL (default) the receiver-specific fields stay
+   all-zero (no per-receiver origin authentication, §9.5.2). With ORIGIN-AUTH true both are populated: a
+   NON-ZERO random receiver_specific_key_id (zero is the §9.5.3.3.4.3 origin-auth-disabled sentinel — never
+   emitted) + a random 32B master_receiver_specific_key, for the *_WITH_ORIGIN_AUTHENTICATION protection kinds
+   (§9.5.3.3.4.3; consumed by derive-receiver-specific-session-key / compute-receiver-specific-mac). Keys are
+   plain heap vectors per ADR 0034 (KeyMaterial foreign-backing + zeroize-on-teardown is a deferred hardening
+   follow-on); the caller owns the key-material lifecycle. Control-plane, not the hot path."
   ; HARDENING-GAP: KeyMaterial master key/salt are GC-heap (ADR 0034 deferral); not the hot path.
-  (if origin-auth
-      (make-key-material :transformation-kind          (copy-seq +transformation-kind-aes256-gcm+)
-                         :master-salt                  (dds.dare:random-bytes 32)
-                         :sender-key-id                (%alloc-sender-key-id)
-                         :master-sender-key            (dds.dare:random-bytes 32)
-                         :receiver-specific-key-id     (%nonzero-random-key-id)
-                         :master-receiver-specific-key (dds.dare:random-bytes 32))
-      (make-key-material :transformation-kind (copy-seq +transformation-kind-aes256-gcm+)
-                         :master-salt         (dds.dare:random-bytes 32)
-                         :sender-key-id       (%alloc-sender-key-id)
-                         :master-sender-key   (dds.dare:random-bytes 32))))
+  (let ((tk (ecase kind
+              (:encrypt +transformation-kind-aes256-gcm+)
+              (:sign    +transformation-kind-aes256-gmac+))))
+    (if origin-auth
+        (make-key-material :transformation-kind          (copy-seq tk)
+                           :master-salt                  (dds.dare:random-bytes 32)
+                           :sender-key-id                (%alloc-sender-key-id)
+                           :master-sender-key            (dds.dare:random-bytes 32)
+                           :receiver-specific-key-id     (%nonzero-random-key-id)
+                           :master-receiver-specific-key (dds.dare:random-bytes 32))
+        (make-key-material :transformation-kind (copy-seq tk)
+                           :master-salt         (dds.dare:random-bytes 32)
+                           :sender-key-id       (%alloc-sender-key-id)
+                           :master-sender-key   (dds.dare:random-bytes 32)))))

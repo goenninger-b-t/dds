@@ -7,10 +7,12 @@
 
 ;;; --- CDR big-endian helpers for BinaryPropertySeq (hash and signature inputs) ---
 ;;; Per Fast DDS PKIDH.cpp: signature inputs + hash inputs use big-endian CDR BinaryPropertySeq.
-;;; BinaryProperty CDR layout (big-endian):
+;;; BinaryProperty CDR layout (big-endian) — name+value ONLY (no propagate byte, T1):
 ;;;   name: uint32-BE(strlen+1) || ascii-bytes || NUL || pad-to-4-bytes
-;;;   value: uint32-BE(count) || bytes (octet sequence, no post-pad)
-;;;   propagate: 1 byte (=1) || 3 pad bytes
+;;;   value: uint32-BE(count) || bytes || pad-to-4 (the octet value is 4-padded for EVERY property
+;;;          EXCEPT the LAST in the sequence — Fast DDS add_final_padding, CDRMessage.cpp
+;;;          addBinaryProperty/addOctetVector with the seq-level add_final_padding=false; T4)
+;;;   propagate: NOT serialized (§7.2.2 LOCAL include/exclude filter; never in the hash/sig input)
 ;;; BinaryPropertySeq: uint32-BE(count) || BinaryProperty* (§9.3.2.2/§9.3.2.3)
 
 (defun* %cdr-u32-be (v)
@@ -38,11 +40,16 @@
       (setf (aref out (+ 4 i)) (aref bytes i)))
     out))
 
-(defun* %cdr-octet-seq-be (value-octets)
-    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
-  "Encode VALUE-OCTETS as CDR BE octet-sequence: uint32-BE(count) || bytes."
-  (let* ((n (length value-octets))
-         (out (make-array (+ 4 n) :element-type '(unsigned-byte 8) :initial-element 0)))
+(defun* %cdr-octet-seq-be (value-octets pad)
+    (function ((simple-array (unsigned-byte 8) (*)) t) (simple-array (unsigned-byte 8) (*)))
+  "Encode VALUE-OCTETS as CDR BE octet-sequence: uint32-BE(count) || bytes || (zero pad to a 4-byte
+   multiple of the VALUE length when PAD). Fast DDS CDRMessage::addOctetVector applies this final
+   padding (add_final_padding) to every BinaryProperty value except the LAST in the hashed/signed
+   BinaryPropertySeq (the seq-level add_final_padding=false; PKIDH.cpp begin_handshake_*/process_*
+   + CDRMessage.cpp). WP-DDS-SECURITY-FASTDDS-INTEROP T4 cross-vendor fix (was always unpadded)."
+  (let* ((n    (length value-octets))
+         (padn (if pad (mod (- 4 (mod n 4)) 4) 0))
+         (out  (make-array (+ 4 n padn) :element-type '(unsigned-byte 8) :initial-element 0)))
     (setf (aref out 0) (ldb (byte 8 24) n)
           (aref out 1) (ldb (byte 8 16) n)
           (aref out 2) (ldb (byte 8  8) n)
@@ -51,22 +58,28 @@
       (setf (aref out (+ 4 i)) (aref value-octets i)))
     out))
 
-(defun* %cdr-binary-property-be (name value-octets)
-    (function (string (simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
-  "Serialize CDR BE BinaryProperty: name(string-BE) + value(octet-seq-BE) + propagate(1)+3pad."
+(defun* %cdr-binary-property-be (name value-octets pad-value)
+    (function (string (simple-array (unsigned-byte 8) (*)) t) (simple-array (unsigned-byte 8) (*)))
+  "Serialize CDR BE §9.3.4 BinaryProperty: name(string-BE) + value(octet-seq-BE, 4-padded when
+   PAD-VALUE) — name+value ONLY. The propagate flag is NEVER serialized (§7.2.2 LOCAL include/exclude
+   filter). PAD-VALUE mirrors Fast DDS add_final_padding: every property value is 4-padded except the
+   LAST in the sequence (T1 dropped propagate; T4 added the value padding to match Fast DDS)."
   (%concat-octets (%cdr-string-be name)
-                  (%cdr-octet-seq-be value-octets)
-                  (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 0 0 0))))
+                  (%cdr-octet-seq-be value-octets pad-value)))
 
 (defun* %build-cdr-binary-property-seq-be (property-pairs)
     (function (list) (simple-array (unsigned-byte 8) (*)))
   "Serialize PROPERTY-PAIRS ((name-string . value-octets)*) as CDR BE BinaryPropertySeq.
-   Layout: uint32-BE(count) | BinaryProperty* — used for hash_c1/hash_c2 and sig inputs (§9.3.2)."
+   Layout: uint32-BE(count) | BinaryProperty* — used for hash_c1/hash_c2 and the Sign inputs (§9.3.2).
+   Each property's octet value is zero-padded to a 4-byte multiple EXCEPT the LAST property, matching
+   Fast DDS CDRMessage::addBinaryPropertySeq(..., add_final_padding=false) (PKIDH.cpp begin_handshake_
+   request/reply + process_handshake_*; CDRMessage.cpp addBinaryProperty/addOctetVector). T4 fix."
   (let ((count (length property-pairs)))
     (apply #'%concat-octets
            (%cdr-u32-be count)
-           (mapcar (lambda (pair) (%cdr-binary-property-be (car pair) (cdr pair)))
-                   property-pairs))))
+           (loop for cell on property-pairs
+                 collect (%cdr-binary-property-be (car (car cell)) (cdr (car cell))
+                                                  (not (null (cdr cell))))))))
 
 ;;; --- Internal token tagged format (in-process only; NOT CDR DataHolder wire format) ---
 ;;; Magic: #xD0 #xDD #x53 #x70 | uint32-LE(class-id-len) | class-id-bytes
@@ -206,7 +219,7 @@
   "Convert ASCII string S to raw octets (for c.dsign_algo / c.kagree_algo binary property values)."
   (map '(simple-array (unsigned-byte 8) (*)) #'char-code s))
 
-(defun* %compute-hash-c (suite cert-der perm-octets pdata dsign-algo-str kagree-algo-str)
+(defun* %compute-hash-c (suite cert-bytes perm-octets pdata dsign-algo-str kagree-algo-str)
     (function (auth-suite
                (simple-array (unsigned-byte 8) (*))
                (simple-array (unsigned-byte 8) (*))
@@ -214,10 +227,12 @@
                string string)
               (simple-array (unsigned-byte 8) (32)))
   "Compute hash_c1 or hash_c2: SHA-256(CDR-BE-BinaryPropertySeq(c.id,c.perm,c.pdata,c.dsign,c.kagree)).
-   Per DDS-Security 1.1 §9.3.2.1 — all 5 c.* properties in this exact order."
+   Per DDS-Security 1.1 §9.3.2.1 — all 5 c.* properties in this exact order. CERT-BYTES here carries the
+   c.id BYTES exactly as placed on the wire (the PEM certificate per §9.3.2.1); both sides hash the
+   identical transmitted c.id bytes, so the recompute matches cross-vendor regardless of encoding."
   (let* ((hash-fn (auth-suite-hash suite))
          (seq (%build-cdr-binary-property-seq-be
-               (list (cons +prop-c-id+          cert-der)
+               (list (cons +prop-c-id+          cert-bytes)
                      (cons +prop-c-perm+         perm-octets)
                      (cons +prop-c-pdata+        pdata)
                      (cons +prop-c-dsign-algo+   (%ascii->octets dsign-algo-str))
@@ -248,13 +263,29 @@
                                 :challenge1-bytes challenge1
                                 :challenge2-bytes challenge2)))
 
-;;; --- stub c.pdata (Slice 2a: 4-byte CDR stub; full PBDTD in Slice 2b) ---
+;;; --- c.pdata = ParticipantBuiltinTopicData ParameterList (§9.3.2.1) ---
 
-(defconstant +pdata-stub+
-    (if (boundp '+pdata-stub+)
-        (symbol-value '+pdata-stub+)
-        #(0 0 0 0))
-  "Stub 4-byte CDR ParticipantBuiltinTopicData for Slice 2a (§9.3.2.1; full PBDTD is Slice 2b).")
+(defun* %build-c-pdata (guid)
+    (function ((simple-array (unsigned-byte 8) (16))) (simple-array (unsigned-byte 8) (*)))
+  "Serialize c.pdata: a ParticipantBuiltinTopicData as a BIG-ENDIAN RTPS ParameterList (NO
+   encapsulation header) carrying PID_PARTICIPANT_GUID = the 16-octet participant GUID, then
+   PID_SENTINEL (DDS-Security 1.1 §9.3.2.1). A conformant replier reads PID_PARTICIPANT_GUID from
+   c.pdata as a big-endian ParameterList scanned from offset 0 — corroborated against Fast DDS
+   PKIDH::begin_handshake_reply + ParameterList::read_guid_from_cdr_msg, and the producer side
+   PDP::get_participant_proxy_data_serialized(BIGEND) which emits write_encapsulation=false. The
+   u16 PID and u16 length are big-endian; the GUID octets are MSB-first (RTPS 2.5 §9.3.1.2 / §9.6.2.2).
+   Replaces the Slice-2a 4-byte stub so the replier's c.pdata participant_key check passes (T2)."
+  (let ((out (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref out 0) (ldb (byte 8 8) +pid-participant-guid+)
+          (aref out 1) (ldb (byte 8 0) +pid-participant-guid+)
+          (aref out 2) 0
+          (aref out 3) 16)
+    (dotimes (i 16) (setf (aref out (+ 4 i)) (aref guid i)))
+    (setf (aref out 20) (ldb (byte 8 8) +pid-sentinel+)
+          (aref out 21) (ldb (byte 8 0) +pid-sentinel+)
+          (aref out 22) 0
+          (aref out 23) 0)
+    out))
 
 ;;; --- handshake-handle ---
 
@@ -269,7 +300,8 @@
    my-dh-pub: SubjectPublicKeyInfo DER of ephemeral public key (dh1 or dh2 wire value).
    my-challenge: 32-byte random nonce. peer-dh-pub: peer ephemeral DH octets. peer-challenge: peer nonce.
    hash-c-local/hash-c-peer: SHA-256 of own / peer c.* BinaryPropertySeq (§9.3.2).
-   c-cert-der/c-perm/c-pdata: own c.* values stored for inclusion in signature inputs.
+   c-cert-bytes/c-perm/c-pdata: own c.* values (c.id = the PEM certificate bytes per §9.3.2.1,
+   c.perm, c.pdata) retained for reference; the §8.7.2.4 Sign inputs use hash_c/challenge/dh only.
    shared-secret: set after successful authentication; NIL until then."
   (role          :requester :type (member :requester :replier))
   (suite         +suite-ecdh+ :type auth-suite)
@@ -285,7 +317,7 @@
   (hash-c-local  (make-array 32 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (32)))
   (hash-c-peer   (make-array 32 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (32)))
   (shared-secret nil :type (or shared-secret-handle null))
-  (c-cert-der    (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*)))
+  (c-cert-bytes  (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*)))
   (c-perm        (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*)))
   (c-pdata       (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*))))
 
@@ -312,26 +344,32 @@
 
 ;;; --- public API ---
 
-(defun* begin-handshake-request (local remote suite)
-    (function (identity-handle identity-handle auth-suite)
+(defun* begin-handshake-request (local remote suite
+                                 &optional (perm-octets (make-array 0 :element-type '(unsigned-byte 8))))
+    (function (identity-handle identity-handle auth-suite
+               &optional (simple-array (unsigned-byte 8) (*)))
               (values (simple-array (unsigned-byte 8) (*)) handshake-handle))
   "Initiate DDS-Security §8.7.2.4 handshake as the requester (local GUID < remote GUID).
    LOCAL: local identity-handle. REMOTE: remote identity-handle (CA used for reply verification).
    SUITE: auth-suite vtable (use +suite-ecdh+ for EC P-256 / ECDSA-SHA256 / SHA-256).
+   PERM-OCTETS (optional, default empty): the local participant's signed Permissions credential placed
+   in the c.perm binary_property (§9.3.2.1) — the S/MIME multipart/signed §9.4.1.1 document a conformant
+   replier reads via validate_remote_permissions (Fast DDS SMIME_read_PKCS7). Empty (the default) emits an
+   empty c.perm for the shared-document model / auth-only flows; it is ALSO folded into hash_c1 either way,
+   so both ends recompute the identical hash over the transmitted bytes (WP-DDS-SECURITY-FASTDDS-INTEROP T6).
    Returns (values REQUEST-TOKEN-OCTETS HANDSHAKE-HANDLE) — HANDLE state = :awaiting-reply."
   (declare (ignore remote))
-  (let* ((cert-der    (dds.dare:x509-to-der (identity-handle-cert local)))
+  (let* ((cert-pem    (dds.dare:x509-to-pem (identity-handle-cert local)))
          (challenge1  (%random-bytes +challenge-len+))
          (dsign-str   (auth-suite-dsign-algo-str suite))
          (kagree-str  (auth-suite-kagree-algo-str suite))
-         (perm-octets (make-array 0 :element-type '(unsigned-byte 8)))
-         (pdata       (coerce +pdata-stub+ '(simple-array (unsigned-byte 8) (*))))
-         (hash-c1     (%compute-hash-c suite cert-der perm-octets pdata dsign-str kagree-str)))
+         (pdata       (%build-c-pdata (identity-handle-guid local)))
+         (hash-c1     (%compute-hash-c suite cert-pem perm-octets pdata dsign-str kagree-str)))
     (multiple-value-bind (my-dh-pub my-dh-priv)
         (funcall (auth-suite-kagree-gen suite))
       (let* ((token (%make-handshake-token
                      :class-id +handshake-request-class-id+
-                     :binary-props (list (cons +prop-c-id+          cert-der)
+                     :binary-props (list (cons +prop-c-id+          cert-pem)
                                          (cons +prop-c-perm+         perm-octets)
                                          (cons +prop-c-pdata+        pdata)
                                          (cons +prop-c-dsign-algo+   (%ascii->octets dsign-str))
@@ -348,28 +386,35 @@
                       :my-dh-pub my-dh-pub
                       :my-challenge challenge1
                       :hash-c-local hash-c1
-                      :c-cert-der cert-der
+                      :c-cert-bytes cert-pem
                       :c-perm perm-octets
                       :c-pdata pdata)))
         (values (%serialize-token token) handle)))))
 
-(defun* begin-handshake-reply (local remote request-token-octets suite)
+(defun* begin-handshake-reply (local remote request-token-octets suite
+                               &optional (perm-octets (make-array 0 :element-type '(unsigned-byte 8))))
     (function (identity-handle identity-handle
                (simple-array (unsigned-byte 8) (*))
-               auth-suite)
+               auth-suite
+               &optional (simple-array (unsigned-byte 8) (*)))
               (values (or (simple-array (unsigned-byte 8) (*)) null)
                       (or handshake-handle null)))
   "Process HandshakeRequestMessageToken as the replier (DDS-Security 1.1 §8.7.2.4 / §9.3.2.2).
    LOCAL: local identity. REMOTE: remote identity (CA trust store for peer cert verification).
    REQUEST-TOKEN-OCTETS: the requester's HandshakeRequestMessageToken (internal tagged format).
-   SUITE: auth-suite vtable. Returns (values REPLY-TOKEN-OCTETS HANDLE) or (values NIL NIL) on failure.
+   SUITE: auth-suite vtable.
+   PERM-OCTETS (optional, default empty): the local participant's signed Permissions credential placed in
+   the reply's c.perm binary_property (§9.3.2.1) — the S/MIME §9.4.1.1 document the requester's
+   validate_remote_permissions reads (Fast DDS SMIME_read_PKCS7). It is also folded into hash_c2, so the
+   requester recomputes the identical hash over the transmitted bytes (WP-DDS-SECURITY-FASTDDS-INTEROP T6).
+   Returns (values REPLY-TOKEN-OCTETS HANDLE) or (values NIL NIL) on failure.
    Verifies peer cert chain, recomputes hash_c1, generates own ephemeral key + Sign2."
   (declare (ignore remote))
   (let ((req-tok (%parse-token request-token-octets)))
     (unless req-tok (return-from begin-handshake-reply (values nil nil)))
     (unless (string= (handshake-token-class-id req-tok) +handshake-request-class-id+)
       (return-from begin-handshake-reply (values nil nil)))
-    (let* ((peer-cert-der    (%token-get req-tok +prop-c-id+))
+    (let* ((peer-cert-bytes  (%token-get req-tok +prop-c-id+))
            (peer-perm        (or (%token-get req-tok +prop-c-perm+)
                                  (make-array 0 :element-type '(unsigned-byte 8))))
            (peer-pdata       (or (%token-get req-tok +prop-c-pdata+)
@@ -381,9 +426,9 @@
            (hash-c1-claimed  (%token-get req-tok +prop-hash-c1+))
            (dh1              (%token-get req-tok +prop-dh1+))
            (challenge1       (%token-get req-tok +prop-challenge1+)))
-      (unless (and peer-cert-der hash-c1-claimed dh1 challenge1)
+      (unless (and peer-cert-bytes hash-c1-claimed dh1 challenge1)
         (return-from begin-handshake-reply (values nil nil)))
-      (let ((peer-cert (dds.dare:x509-load-cert-der peer-cert-der)))
+      (let ((peer-cert (dds.dare:x509-load-cert-auto peer-cert-bytes)))
         (unless peer-cert (return-from begin-handshake-reply (values nil nil)))
         (unwind-protect
              (progn
@@ -391,7 +436,7 @@
                  (return-from begin-handshake-reply (values nil nil)))
                (let* ((peer-dsign-str     (map 'string #'code-char peer-dsign-octs))
                       (peer-kagree-str    (map 'string #'code-char peer-kagree-octs))
-                      (hash-c1-recomputed (%compute-hash-c suite peer-cert-der peer-perm peer-pdata
+                      (hash-c1-recomputed (%compute-hash-c suite peer-cert-bytes peer-perm peer-pdata
                                                             peer-dsign-str peer-kagree-str)))
                  ;; §9.3.2 algo-vs-suite cross-check: peer advertised algos must match selected suite
                  (unless (and (string= peer-dsign-str  (auth-suite-dsign-algo-str suite))
@@ -402,12 +447,12 @@
                  (multiple-value-bind (my-dh-pub my-dh-priv)
                      (funcall (auth-suite-kagree-gen suite))
                    (let* ((challenge2  (%random-bytes +challenge-len+))
-                          (my-cert-der (dds.dare:x509-to-der (identity-handle-cert local)))
-                          (my-perm     (make-array 0 :element-type '(unsigned-byte 8)))
-                          (my-pdata    (coerce +pdata-stub+ '(simple-array (unsigned-byte 8) (*))))
+                          (my-cert-pem (dds.dare:x509-to-pem (identity-handle-cert local)))
+                          (my-perm     perm-octets)
+                          (my-pdata    (%build-c-pdata (identity-handle-guid local)))
                           (dsign-str   (auth-suite-dsign-algo-str suite))
                           (kagree-str  (auth-suite-kagree-algo-str suite))
-                          (hash-c2     (%compute-hash-c suite my-cert-der my-perm my-pdata
+                          (hash-c2     (%compute-hash-c suite my-cert-pem my-perm my-pdata
                                                         dsign-str kagree-str))
                           ;; Sign2 = ECDSA-SHA256 over CDR-BE BinaryPropertySeq(hash_c2,challenge2,dh2,challenge1,dh1,hash_c1)
                           (sig-input   (%build-cdr-binary-property-seq-be
@@ -428,7 +473,7 @@
                               (let* ((reply-tok (%make-handshake-token
                                                  :class-id +handshake-reply-class-id+
                                                  :binary-props (list
-                                                                (cons +prop-c-id+          my-cert-der)
+                                                                (cons +prop-c-id+          my-cert-pem)
                                                                 (cons +prop-c-perm+         my-perm)
                                                                 (cons +prop-c-pdata+        my-pdata)
                                                                 (cons +prop-c-dsign-algo+   (%ascii->octets dsign-str))
@@ -455,7 +500,7 @@
                                                   :peer-challenge challenge1
                                                   :hash-c-local hash-c2
                                                   :hash-c-peer hash-c1-recomputed
-                                                  :c-cert-der my-cert-der
+                                                  :c-cert-bytes my-cert-pem
                                                   :c-perm my-perm
                                                   :c-pdata my-pdata)))
                                 (setf peer-pk-stored t)
@@ -493,7 +538,7 @@
       (unless reply-tok (reject))
       (unless (string= (handshake-token-class-id reply-tok) +handshake-reply-class-id+) (reject))
       (let* ((suite          (handshake-handle-suite handle))
-             (peer-cert-der  (%token-get reply-tok +prop-c-id+))
+             (peer-cert-bytes (%token-get reply-tok +prop-c-id+))
              (peer-perm      (or (%token-get reply-tok +prop-c-perm+)
                                  (make-array 0 :element-type '(unsigned-byte 8))))
              (peer-pdata     (or (%token-get reply-tok +prop-c-pdata+)
@@ -509,12 +554,12 @@
              (ch1-echo       (%token-get reply-tok +prop-challenge1+))
              (challenge2     (%token-get reply-tok +prop-challenge2+))
              (sign2          (%token-get reply-tok +prop-signature+)))
-        (unless (and peer-cert-der hash-c2 dh2 hash-c1-echo dh1-echo ch1-echo challenge2 sign2)
+        (unless (and peer-cert-bytes hash-c2 dh2 hash-c1-echo dh1-echo ch1-echo challenge2 sign2)
           (reject))
         (unless (equalp hash-c1-echo (handshake-handle-hash-c-local handle)) (reject))
         (unless (equalp dh1-echo     (handshake-handle-my-dh-pub handle))    (reject))
         (unless (equalp ch1-echo     (handshake-handle-my-challenge handle))  (reject))
-        (let ((peer-cert (dds.dare:x509-load-cert-der peer-cert-der)))
+        (let ((peer-cert (dds.dare:x509-load-cert-auto peer-cert-bytes)))
           (unless peer-cert (reject))
           (unwind-protect
                (progn
@@ -523,7 +568,7 @@
                    (reject))
                  (let* ((peer-dsign-str     (map 'string #'code-char peer-dsign-o))
                         (peer-kagree-str    (map 'string #'code-char peer-kagree-o))
-                        (hash-c2-recomputed (%compute-hash-c suite peer-cert-der peer-perm peer-pdata
+                        (hash-c2-recomputed (%compute-hash-c suite peer-cert-bytes peer-perm peer-pdata
                                                               peer-dsign-str peer-kagree-str)))
                    ;; §9.3.2 algo-vs-suite cross-check: peer advertised algos must match selected suite
                    (unless (and (string= peer-dsign-str  (auth-suite-dsign-algo-str suite))

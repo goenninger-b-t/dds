@@ -268,7 +268,8 @@
     (function ((simple-array (unsigned-byte 8) (*))) (or key-material null))
   "Parse a KeyMaterial CDR blob (the 88-byte no-origin-auth form OR the 120-byte *_WITH_ORIGIN_AUTHENTICATION
    form) into a key-material struct. Returns NIL if malformed (fail-closed, NFR-SEC-POSTURE).
-   Checks: length 88 or 120; transformation_kind[0..2] = {0,0,0}; kind[3] in {0x01,0x02,0x04}; length bytes at
+   Checks: length 88 or 120; transformation_kind[0..2] = {0,0,0}; kind[3] in {0x01,0x02,0x03,0x04} (the four
+   §9.5.2.1.1 non-NONE CryptoTransformKind values: AES128_GMAC/GCM, AES256_GMAC/GCM); length bytes at
    [7] and [47] = 0x20 (32). The receiver-specific key follows Fast DDS has_specific_key (KeyMaterialCDRDeserialize
    L511-528): receiver_specific_key_id [80..83] all-zero -> the 88-byte absent form ([84..87] must be zero);
    non-zero -> the 120-byte form ([84..86]=0, [87]=0x20, master_receiver_specific_key at [88..119]). Any length/
@@ -277,10 +278,16 @@
   (block %parse-km
     (let ((n (length cdr)))
       (unless (or (= n +km-cdr-len+) (= n +km-cdr-len-origin-auth+)) (return-from %parse-km nil))
-      ;; kind[0..2] must be zeros; kind[3] is the actual algorithm byte (0x04 = AES256-GCM)
+      ;; kind[0..2] must be zeros; kind[3] is the algorithm byte — the FOUR defined non-NONE
+      ;; CryptoTransformKind values (DDS-Security 1.1 §9.5.2.1.1 Table 70 / dds_security_plugins_psm.idl):
+      ;; 0x01 AES128_GMAC, 0x02 AES128_GCM, 0x03 AES256_GMAC, 0x04 AES256_GCM. 0x03 was previously
+      ;; omitted; Fast DDS sends the participant ParticipantKeyMaterial with kind {0,0,0,3} (AES256_GMAC)
+      ;; under a GMAC-tier governance, so a conformant parser MUST accept it (live cross-vendor: the
+      ;; ParticipantCryptoToken KeyMaterial carried 0x03 -> a false REJECT blocked :keyed). Corroborated
+      ;; CLEAN-ROOM vs Fast DDS AESGCMGMAC_KeyFactory (c_transfrom_kind_aes256_gmac); see docs/provenance.md.
       (unless (and (zerop (aref cdr 0)) (zerop (aref cdr 1)) (zerop (aref cdr 2)))
         (return-from %parse-km nil))
-      (unless (member (aref cdr 3) '(#x01 #x02 #x04)) (return-from %parse-km nil))
+      (unless (member (aref cdr 3) '(#x01 #x02 #x03 #x04)) (return-from %parse-km nil))
       ;; master_salt / master_sender_key length bytes must be 0x20 (= 32)
       (unless (and (= (aref cdr 7) #x20) (= (aref cdr 47) #x20))
         (return-from %parse-km nil))

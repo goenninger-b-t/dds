@@ -1,192 +1,33 @@
+[37;1m2026-06-29 13:27:09.978 [33;1m[[37;1mTRANSPORT_UDPV4[33;1m Warning] [37mSupport for interfaceWhiteList will be removed in a future release. Please use interface allowlist/blocklist instead.[34;1m -> Function [36mUDPv4Transport[m
 Subscriber running. Please press Ctrl+C to stop the Subscriber at any time.
-Subscriber matched.
-Message: 'Hello world' with index: '1867' RECEIVED
-Subscriber matched.
-Subscriber matched.
-Message: 'Hello world' with index: '1867' RECEIVED
-Message: 'Hello world' with index: '1868' RECEIVED
-Message: 'Hello world' with index: '1867' RECEIVED
-Message: 'Hello world' with index: '1868' RECEIVED
-Message: 'Hello world' with index: '1869' RECEIVED
-Message: 'Hello world' with index: '1868' RECEIVED
-Message: 'Hello world' with index: '1869' RECEIVED
-Subscriber matched.
-Message: 'Hello world' with index: '1870' RECEIVED
-Message: 'Hello world' with index: '1869' RECEIVED
-Message: 'Hello world' with index: '1867' RECEIVED
-Message: 'Hello world' with index: '1870' RECEIVED
-Message: 'Hello world' with index: '1871' RECEIVED
-Message: 'Hello world' with index: '1870' RECEIVED
-Message: 'Hello world' with index: '1868' RECEIVED
-Message: 'Hello world' with index: '1871' RECEIVED
-Message: 'Hello world' with index: '1872' RECEIVED
-Message: 'Hello world' with index: '1871' RECEIVED
-Message: 'Hello world' with index: '1869' RECEIVED
-Message: 'Hello world' with index: '1872' RECEIVED
-Message: 'Hello world' with index: '1873' RECEIVED
-Message: 'Hello world' with index: '1872' RECEIVED
-Message: 'Hello world' with index: '1870' RECEIVED
-Message: 'Hello world' with index: '1873' RECEIVED
-Message: 'Hello world' with index: '1874' RECEIVED
-Message: 'Hello world' with index: '1873' RECEIVED
-Message: 'Hello world' with index: '1871' RECEIVED
-Message: 'Hello world' with index: '1874' RECEIVED
-Message: 'Hello world' with index: '1875' RECEIVED
-Message: 'Hello world' with index: '1874' RECEIVED
-Message: 'Hello world' with index: '1872' RECEIVED
-Message: 'Hello world' with index: '1875' RECEIVED
-Message: 'Hello world' with index: '1876' RECEIVED
-Message: 'Hello world' with index: '1875' RECEIVED
-Message: 'Hello world' with index: '1873' RECEIVED
-Message: 'Hello world' with index: '1876' RECEIVED
-Message: 'Hello world' with index: '1877' RECEIVED
-Message: 'Hello world' with index: '1876' RECEIVED
-Message: 'Hello world' with index: '1874' RECEIVED
-Message: 'Hello world' with index: '1877' RECEIVED
-Message: 'Hello world' with index: '1878' RECEIVED
-Message: 'Hello world' with index: '1877' RECEIVED
-Message: 'Hello world' with index: '1875' RECEIVED
-Message: 'Hello world' with index: '1878' RECEIVED
-Message: 'Hello world' with index: '1879' RECEIVED
-Message: 'Hello world' with index: '1878' RECEIVED
-Message: 'Hello world' with index: '1876' RECEIVED
-Message: 'Hello world' with index: '1879' RECEIVED
-Message: 'Hello world' with index: '1880' RECEIVED
-Message: 'Hello world' with index: '1879' RECEIVED
-Message: 'Hello world' with index: '1877' RECEIVED
-Message: 'Hello world' with index: '1880' RECEIVED
-Message: 'Hello world' with index: '1881' RECEIVED
-Message: 'Hello world' with index: '1880' RECEIVED
-Message: 'Hello world' with index: '1878' RECEIVED
-Message: 'Hello world' with index: '1881' RECEIVED
-Message: 'Hello world' with index: '1882' RECEIVED
-Message: 'Hello world' with index: '1881' RECEIVED
-Message: 'Hello world' with index: '1879' RECEIVED
-Message: 'Hello world' with index: '1882' RECEIVED
-Message: 'Hello world' with index: '1883' RECEIVED
-Message: 'Hello world' with index: '1882' RECEIVED
-Message: 'Hello world' with index: '1880' RECEIVED
-Message: 'Hello world' with index: '1883' RECEIVED
-Message: 'Hello world' with index: '1884' RECEIVED
-Message: 'Hello world' with index: '1883' RECEIVED
-Message: 'Hello world' with index: '1881' RECEIVED
-Message: 'Hello world' with index: '1884' RECEIVED
-Message: 'Hello world' with index: '1885' RECEIVED
-Message: 'Hello world' with index: '1884' RECEIVED
-Message: 'Hello world' with index: '1882' RECEIVED
-Message: 'Hello world' with index: '1885' RECEIVED
-Message: 'Hello world' with index: '1886' RECEIVED
-Message: 'Hello world' with index: '1885' RECEIVED
-Message: 'Hello world' with index: '1883' RECEIVED
-Message: 'Hello world' with index: '1886' RECEIVED
-Message: 'Hello world' with index: '1887' RECEIVED
-Message: 'Hello world' with index: '1886' RECEIVED
-Message: 'Hello world' with index: '1884' RECEIVED
-Message: 'Hello world' with index: '1887' RECEIVED
-Message: 'Hello world' with index: '1888' RECEIVED
-Message: 'Hello world' with index: '1887' RECEIVED
-Message: 'Hello world' with index: '1885' RECEIVED
-Message: 'Hello world' with index: '1888' RECEIVED
-Message: 'Hello world' with index: '1889' RECEIVED
-Message: 'Hello world' with index: '1888' RECEIVED
-Message: 'Hello world' with index: '1886' RECEIVED
-Message: 'Hello world' with index: '1889' RECEIVED
-Message: 'Hello world' with index: '1890' RECEIVED
-Message: 'Hello world' with index: '1889' RECEIVED
-Message: 'Hello world' with index: '1887' RECEIVED
-Message: 'Hello world' with index: '1890' RECEIVED
-Message: 'Hello world' with index: '1891' RECEIVED
-Message: 'Hello world' with index: '1890' RECEIVED
-Message: 'Hello world' with index: '1888' RECEIVED
-Message: 'Hello world' with index: '1891' RECEIVED
-Message: 'Hello world' with index: '1892' RECEIVED
-Message: 'Hello world' with index: '1891' RECEIVED
-Message: 'Hello world' with index: '1889' RECEIVED
-Message: 'Hello world' with index: '1892' RECEIVED
-Message: 'Hello world' with index: '1893' RECEIVED
-Message: 'Hello world' with index: '1892' RECEIVED
-Message: 'Hello world' with index: '1890' RECEIVED
-Message: 'Hello world' with index: '1893' RECEIVED
-Message: 'Hello world' with index: '1894' RECEIVED
-Message: 'Hello world' with index: '1893' RECEIVED
-Message: 'Hello world' with index: '1891' RECEIVED
-Message: 'Hello world' with index: '1894' RECEIVED
-Message: 'Hello world' with index: '1895' RECEIVED
-Message: 'Hello world' with index: '1894' RECEIVED
-Message: 'Hello world' with index: '1892' RECEIVED
-Message: 'Hello world' with index: '1895' RECEIVED
-Message: 'Hello world' with index: '1896' RECEIVED
-Message: 'Hello world' with index: '1895' RECEIVED
-Message: 'Hello world' with index: '1893' RECEIVED
-Message: 'Hello world' with index: '1896' RECEIVED
-Message: 'Hello world' with index: '1897' RECEIVED
-Message: 'Hello world' with index: '1896' RECEIVED
-Message: 'Hello world' with index: '1894' RECEIVED
-Message: 'Hello world' with index: '1897' RECEIVED
-Message: 'Hello world' with index: '1898' RECEIVED
-Message: 'Hello world' with index: '1897' RECEIVED
-Message: 'Hello world' with index: '1895' RECEIVED
-Message: 'Hello world' with index: '1898' RECEIVED
-Message: 'Hello world' with index: '1899' RECEIVED
-Message: 'Hello world' with index: '1898' RECEIVED
-Message: 'Hello world' with index: '1896' RECEIVED
-Message: 'Hello world' with index: '1899' RECEIVED
-Message: 'Hello world' with index: '1900' RECEIVED
-Message: 'Hello world' with index: '1899' RECEIVED
-Message: 'Hello world' with index: '1897' RECEIVED
-Message: 'Hello world' with index: '1900' RECEIVED
-Message: 'Hello world' with index: '1901' RECEIVED
-Message: 'Hello world' with index: '1900' RECEIVED
-Message: 'Hello world' with index: '1898' RECEIVED
-Message: 'Hello world' with index: '1901' RECEIVED
-Message: 'Hello world' with index: '1902' RECEIVED
-Message: 'Hello world' with index: '1901' RECEIVED
-Message: 'Hello world' with index: '1899' RECEIVED
-Message: 'Hello world' with index: '1902' RECEIVED
-Message: 'Hello world' with index: '1903' RECEIVED
-Message: 'Hello world' with index: '1902' RECEIVED
-Message: 'Hello world' with index: '1900' RECEIVED
-Message: 'Hello world' with index: '1903' RECEIVED
-Message: 'Hello world' with index: '1904' RECEIVED
-Message: 'Hello world' with index: '1903' RECEIVED
-Message: 'Hello world' with index: '1901' RECEIVED
-Message: 'Hello world' with index: '1904' RECEIVED
-Message: 'Hello world' with index: '1905' RECEIVED
-Message: 'Hello world' with index: '1904' RECEIVED
-Message: 'Hello world' with index: '1902' RECEIVED
-Message: 'Hello world' with index: '1905' RECEIVED
-Message: 'Hello world' with index: '1906' RECEIVED
-Message: 'Hello world' with index: '1905' RECEIVED
-Message: 'Hello world' with index: '1903' RECEIVED
-Message: 'Hello world' with index: '1906' RECEIVED
-Message: 'Hello world' with index: '1907' RECEIVED
-Message: 'Hello world' with index: '1906' RECEIVED
-Message: 'Hello world' with index: '1904' RECEIVED
-Message: 'Hello world' with index: '1907' RECEIVED
-Message: 'Hello world' with index: '1908' RECEIVED
-Message: 'Hello world' with index: '1907' RECEIVED
-Message: 'Hello world' with index: '1905' RECEIVED
-Message: 'Hello world' with index: '1908' RECEIVED
-Message: 'Hello world' with index: '1909' RECEIVED
-Message: 'Hello world' with index: '1908' RECEIVED
-Message: 'Hello world' with index: '1906' RECEIVED
-Message: 'Hello world' with index: '1909' RECEIVED
-Message: 'Hello world' with index: '1910' RECEIVED
-Message: 'Hello world' with index: '1909' RECEIVED
-Message: 'Hello world' with index: '1907' RECEIVED
-Message: 'Hello world' with index: '1910' RECEIVED
-Message: 'Hello world' with index: '1911' RECEIVED
-Message: 'Hello world' with index: '1910' RECEIVED
-Message: 'Hello world' with index: '1908' RECEIVED
-Message: 'Hello world' with index: '1911' RECEIVED
-Message: 'Hello world' with index: '1912' RECEIVED
-Message: 'Hello world' with index: '1911' RECEIVED
-Message: 'Hello world' with index: '1909' RECEIVED
-Message: 'Hello world' with index: '1912' RECEIVED
-Message: 'Hello world' with index: '1913' RECEIVED
-Message: 'Hello world' with index: '1912' RECEIVED
-Message: 'Hello world' with index: '1910' RECEIVED
-Message: 'Hello world' with index: '1913' RECEIVED
-Message: 'Hello world' with index: '1914' RECEIVED
+[37;1m2026-06-29 13:27:13.918 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:14.423 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:14.928 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:15.431 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:15.936 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:16.441 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:16.944 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:17.449 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:17.952 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:18.457 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:18.962 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:19.468 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:19.969 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:20.475 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:20.975 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:21.479 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:21.983 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:22.484 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:22.988 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:23.493 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:23.994 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:24.498 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:24.999 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:25.500 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:26.002 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:26.504 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:27.009 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:27.512 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:28.017 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
 
 SIGTERM received, stopping Subscriber execution.

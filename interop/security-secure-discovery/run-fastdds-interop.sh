@@ -41,12 +41,15 @@ export SSD_PERM="${SCRIPT_DIR}/fastdds/certs/permissions-hello.smime"
 export FASTDDS_DEFAULT_PROFILES_FILE="${SCRIPT_DIR}/fastdds/secure_profile.xml"
 export DYLD_LIBRARY_PATH="${FASTDDS_BUILD}/src/cpp:${FASTDDS_INSTALL}/lib:/opt/homebrew/opt/openssl@3/lib:${DYLD_LIBRARY_PATH:-}"
 
-# our Lisp side uses the OTHER EC identity (ECB) + the PEM governance/permissions our dds.dare consumes
+# our Lisp side uses the OTHER EC identity (ECB). dds.dare:cms-verify is now decode-tolerant (PEM PKCS7 +
+# MIME S/MIME), so we consume the SHARED S/MIME permissions document Fast DDS uses — the participant emits it
+# verbatim as the §9.3.2.1 handshake c.perm, which Fast DDS validate_remote_permissions reads via
+# SMIME_read_PKCS7 (T6). Governance stays PEM PKCS7 (.p7s): it is validated locally only, never on the wire.
 OUR_CA="${AUTH_PKI}/ca/ca-cert.pem"
 OUR_CERT="${AUTH_PKI}/participant_ec_b/identity_cert.pem"
 OUR_KEY="${AUTH_PKI}/participant_ec_b/identity_key.pem"
 OUR_GOV="${SCRIPT_DIR}/pki/governance-${GOV}.p7s"
-OUR_PERM="${SCRIPT_DIR}/pki/permissions-hello.p7s"
+OUR_PERM="${SCRIPT_DIR}/fastdds/certs/permissions-hello.smime"
 SBCL="${REPO_ROOT}/scripts/with-sbcl.sh"
 
 for f in "${FASTDDS_BIN}" "${SSD_GOV}" "${SSD_PERM}" "${OUR_GOV}" "${OUR_PERM}" "${SSD_CERT}"; do

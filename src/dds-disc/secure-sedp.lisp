@@ -53,15 +53,41 @@
   (when (>= (length bracket) 12)
     (subseq bracket 8 12)))
 
+(defun* %secure-reader-eid-for-writer (writer-eid)
+    (function ((unsigned-byte 32)) (or null (unsigned-byte 32)))
+  "Map a secure BUILTIN WRITER entity-id to its matched READER entity-id (the §9.3.2 builtin pair, low byte
+   0xC2 writer -> 0xC7 reader): publications 0xff0003c2 -> 0xff0003c7; subscriptions 0xff0004c2 -> 0xff0004c7;
+   participant-message 0xff0200c2 -> 0xff0200c7; SPDP 0xff0101c2 -> 0xff0101c7. NIL for any non-secure-builtin
+   writer (fail-closed — a HEARTBEAT for an unrecognized writer is dropped). The LOCAL receiving reader for an
+   inbound HEARTBEAT (its EntityCrypto encodes our ACKNACK) AND the destination reader of an outbound HEARTBEAT.
+   The disc-layer twin of dds.dcps::%secure-sedp-reader-for-writer (clean-room, identical §9.3.2 pairing)."
+  (when (or (= writer-eid dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)
+            (= writer-eid dds.rtps.discovery:+entityid-sedp-sub-secure-writer+)
+            (= writer-eid dds.rtps.discovery:+entityid-participant-message-secure-writer+)
+            (= writer-eid dds.rtps.discovery:+entityid-spdp-secure-writer+))
+    (logior (logand writer-eid #xffffff00) #xc7)))
+
+;; T9pull: the secure-SEDP reliability HEARTBEAT/ACKNACK handlers, defined after the announce helpers they
+;; reuse (%send-secure-bracket / %send-secure-endpoint / %secure-endpoints-for); forward-declared here because
+;; %on-secure-builtin (below) demuxes to them.
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer integer) t)
+                %on-secure-builtin-heartbeat)
+         (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) dds.core.buffer:cursor (unsigned-byte 8)) t)
+                %on-secure-builtin-acknack))
+
 (defun* %on-secure-builtin (node src-prefix bracket km my-receiver-key-id my-receiver-key)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))
                dds.security:key-material
                (or null (simple-array (unsigned-byte 8) (*)))
                (or null (simple-array (unsigned-byte 8) (*)))) t)
   "Receiver thread: a secure BUILTIN SEC_PREFIX...SEC_POSTFIX bracket from remote SRC-PREFIX, whose
-   transformation_key_id already resolved to the remote secure-builtin-writer EntityCrypto KM. Recover the
-   plaintext DATA submessage (the T2/T3 codec decode-datawriter-submessage, DDS-Security 1.1 §8.5.1.7) and ROUTE
-   by the recovered INNER writerId (T9 + T11), each path verifying its own writerId, fail-closed on a mismatch:
+   transformation_key_id already resolved to the remote secure-builtin EntityCrypto KM. Recover the plaintext
+   submessage (the T2/T3 codec decode-datawriter-submessage decodes ANY §8.5 bracket — DataWriter or DataReader
+   share one transform, DDS-Security 1.1 §8.5.1.7/.8) then DEMUX by the inner submessage id (T9pull, mirroring
+   %on-volatile-secure): a HEARTBEAT -> %on-secure-builtin-heartbeat (apply range + send the protected ACKNACK,
+   the NACK-pull that delivers a reliable Fast DDS writer's DiscoveredWriter/ReaderData); an ACKNACK ->
+   %on-secure-builtin-acknack (resend the NACKed protected SEDP DATA, the repair); a DATA -> ROUTE by the
+   recovered INNER writerId (T9 + T11), each path verifying its own writerId, fail-closed on a mismatch:
      publications 0xff0003c2  -> a DiscoveredWriterData: parse-endpoint-data, record, %match-remote-writer (T9);
      subscriptions 0xff0004c2 -> a DiscoveredReaderData: parse-endpoint-data, record, %match-remote-reader (T9);
      participant-message 0xff0200c2 -> a ParticipantMessageData liveliness assertion: the EXISTING WLP handler
@@ -83,50 +109,72 @@
     (let ((plain (dds.security:decode-datawriter-submessage
                   km bracket :my-receiver-key-id my-receiver-key-id :my-receiver-key my-receiver-key)))
       (unless (and plain (>= (length plain) 4)) (return-from %on-builtin t))   ; auth/parse fail -> drop
-      ;; PLAIN is a complete DATA submessage (header + body) built with write-data (E=1 LE).
+      ;; PLAIN is a complete RTPS submessage (header + body): DATA | HEARTBEAT | ACKNACK (a submessage-protected
+      ;; endpoint protects ALL its submessages — Fast DDS add_data/add_heartbeat/add_acknack encode_*_submessage,
+      ;; T9pull). DEMUX by the inner submessage id, mirroring %on-volatile-secure (PVMS).
       (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over plain) :endianness :little)))
         (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header cur)
-          (unless (and id (= id dds.rtps.message:+submsg-data+)) (return-from %on-builtin t))
+          (unless id (return-from %on-builtin t))
           (dds.core.buffer:cursor-set-endianness cur (if le :little :big))
-          (multiple-value-bind (rdr wid sn has-payload poff plen)
-              (dds.rtps.message:parse-data-body cur flags octets)
-            (declare (ignore rdr))
-            (unless (and has-payload (plusp plen)) (return-from %on-builtin t))
-            (cond
-              ;; secure SEDP (T9): the payload is the PL_CDR ParameterList (encap header + endpoint-data), like plain SEDP.
-              ((or (= wid dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)
-                   (= wid dds.rtps.discovery:+entityid-sedp-sub-secure-writer+))
-               (let ((role (if (= wid dds.rtps.discovery:+entityid-sedp-pub-secure-writer+) :writer :reader))
-                     (pc (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over plain) :endianness :little)))
-                 (dds.core.buffer:cursor-set-position pc poff)
-                 (dds.cdr:parse-encapsulation-header pc)
-                 (let ((ep (dds.rtps.discovery:parse-endpoint-data pc role)))
-                   (when ep
-                     (if (eq role :writer)
-                         (progn
-                           (dds.pal:with-lock ((disc-node-lock node))
-                             (%record-discovered (disc-node-discovered-writers node) ep))
-                           (%match-remote-writer node ep))
-                         (progn
-                           (dds.pal:with-lock ((disc-node-lock node))
-                             (%record-discovered (disc-node-discovered-readers node) ep))
-                           (%match-remote-reader node ep)))))))
-              ;; secure participant-message (T11): hand the inner DATA to the EXISTING WLP handler (keyed by SRC-PREFIX).
-              ((= wid dds.rtps.discovery:+entityid-participant-message-secure-writer+)
-               (%on-participant-message node src-prefix wid sn
-                                        (dds.core.buffer:octet-buffer-over plain) poff plen))
-              ;; secure SPDP re-announce (T11): the payload is the PL_CDR SPDP ParameterList (encap header + spdp-data).
-              ((= wid dds.rtps.discovery:+entityid-spdp-secure-writer+)
-               (let ((pc (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over plain) :endianness :little)))
-                 (dds.core.buffer:cursor-set-position pc poff)
-                 (dds.cdr:parse-encapsulation-header pc)
-                 (let ((spdp (dds.rtps.discovery:parse-spdp-data pc)))
-                   (when spdp (%record-participant node spdp)))))
-              (t nil)))))))   ; not a secure builtin writer -> drop (fail-closed)
+          (cond
+            ;; inner DATA — a DiscoveredWriter/ReaderData (SEDP), liveliness (PM), or SPDP re-announce
+            ((= id dds.rtps.message:+submsg-data+)
+             (multiple-value-bind (rdr wid sn has-payload poff plen)
+                 (dds.rtps.message:parse-data-body cur flags octets)
+               (declare (ignore rdr))
+               (unless (and has-payload (plusp plen)) (return-from %on-builtin t))
+               ;; reliable accounting: record the received SN under the per-remote builtin reader keyed by the
+               ;; secure writer-id, so the HEARTBEAT-driven ACKNACK advances past it (terminates the NACK-pull;
+               ;; matches the plain-SEDP %builtin-on-data). The endpoint-data delivery is the explicit parse below.
+               (when sn (%builtin-on-data node src-prefix wid sn))
+               (cond
+                 ;; secure SEDP (T9): the payload is the PL_CDR ParameterList (encap header + endpoint-data), like plain SEDP.
+                 ((or (= wid dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)
+                      (= wid dds.rtps.discovery:+entityid-sedp-sub-secure-writer+))
+                  (let ((role (if (= wid dds.rtps.discovery:+entityid-sedp-pub-secure-writer+) :writer :reader))
+                        (pc (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over plain) :endianness :little)))
+                    (dds.core.buffer:cursor-set-position pc poff)
+                    (dds.cdr:parse-encapsulation-header pc)
+                    (let ((ep (dds.rtps.discovery:parse-endpoint-data pc role)))
+                      (when ep
+                        (if (eq role :writer)
+                            (progn
+                              (dds.pal:with-lock ((disc-node-lock node))
+                                (%record-discovered (disc-node-discovered-writers node) ep))
+                              (%match-remote-writer node ep))
+                            (progn
+                              (dds.pal:with-lock ((disc-node-lock node))
+                                (%record-discovered (disc-node-discovered-readers node) ep))
+                              (%match-remote-reader node ep)))))))
+                 ;; secure participant-message (T11): hand the inner DATA to the EXISTING WLP handler (keyed by SRC-PREFIX).
+                 ((= wid dds.rtps.discovery:+entityid-participant-message-secure-writer+)
+                  (%on-participant-message node src-prefix wid sn
+                                           (dds.core.buffer:octet-buffer-over plain) poff plen))
+                 ;; secure SPDP re-announce (T11): the payload is the PL_CDR SPDP ParameterList (encap header + spdp-data).
+                 ((= wid dds.rtps.discovery:+entityid-spdp-secure-writer+)
+                  (let ((pc (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over plain) :endianness :little)))
+                    (dds.core.buffer:cursor-set-position pc poff)
+                    (dds.cdr:parse-encapsulation-header pc)
+                    (let ((spdp (dds.rtps.discovery:parse-spdp-data pc)))
+                      (when spdp (%record-participant node spdp)))))
+                 (t nil))))   ; not a secure builtin writer -> drop (fail-closed)
+            ;; inner HEARTBEAT (T9pull) — a reliable secure-builtin writer solicits an ACKNACK; answer it
+            ;; submessage-protected (the NACK-pull that delivers Fast DDS's DiscoveredWriter/ReaderData).
+            ((= id dds.rtps.message:+submsg-heartbeat+)
+             (multiple-value-bind (rid wid first last hcount hfinal hlive)
+                 (dds.rtps.message:parse-heartbeat-body cur flags)
+               (declare (ignore rid hcount hfinal hlive))
+               ;; fail-closed: a truncated inner HEARTBEAT (parse -> NIL) is dropped, not signaled (NFR-SEC-POSTURE)
+               (when (and wid first last)
+                 (%on-secure-builtin-heartbeat node src-prefix wid first last))))
+            ;; inner ACKNACK (T9pull) — the remote's reliable secure-builtin reader NACKs; resend the protected DATA.
+            ((= id dds.rtps.message:+submsg-acknack+)
+             (%on-secure-builtin-acknack node src-prefix cur flags))
+            (t nil))))))   ; unknown inner id -> drop (fail-closed)
   t)
 
-(defun* %on-secure-submessage (node src-prefix bracket)
-    (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t)
+(defun* %on-secure-submessage (node src-prefix bracket enforce-rtps)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*)) t) t)
   "Receiver-thread DISPATCH for ONE inbound SEC_PREFIX...SEC_POSTFIX submessage-protection bracket from
    SRC-PREFIX (DDS-Security 1.1 §8.5.1.7). The SAME submessage id (0x31) carries the reliable PVMS crypto-token
    exchange (T7), the secure SEDP DiscoveredWriter/ReaderData (T9), AND the secure participant-message (liveliness)
@@ -138,19 +186,62 @@
    index, so a PVMS bracket always falls through here). Security OFF / pre-keyed (no resolver, or a key_id it does
    not know) -> the bracket goes to PVMS, exactly as before T9. Fail-closed throughout: each downstream handler
    drops an undecryptable/wrong-writerId bracket.
+   ENFORCE-RTPS (T10 review fix-1, computed once by %handle-datagram = rtps_protection REQUIRED from this :keyed
+   source AND this datagram arrived NOT SRTPS-wrapped) gates the USER-bracket route ONLY: a BARE user
+   metadata_protection bracket arriving WITHOUT the mandated outer whole-RTPS (SRTPS) wrap (§8.5.1.10-.12) is a
+   forgeable un-wrapped injection -> DROPPED fail-closed, mirroring the sibling plain-user-DATA/HEARTBEAT/ACKNACK/
+   GAP enforcement. The LEGITIMATE path re-dispatches post-SRTPS-decode with rtps-unwrapped=t, so ENFORCE-RTPS is
+   NIL there and the inner user bracket IS delivered. BUILTIN secure brackets (secure-SEDP/PVMS/SPDP) are NEVER
+   enforce-gated — metatraffic is intentionally plain this slice (the T12 carry), so they stay exempt (no false-REJECT).
    ORIGIN AUTH (T-ORIGINAUTH): when the secure-builtin path is taken, also resolve the LOCAL receiving READER's
    receiver descriptor (key_id . key) for this bracket's channel via SECURE-SEDP-DECODE-RECEIVER-KM — which maps the
    wire key_id -> the remote sender's entity-id -> the matching local reader's receiver key, covering EVERY secure
    builtin tier (SEDP/PM/SPDP), NIL when origin-auth is not in effect — and pass it to %on-secure-builtin so the
    receiver-specific MAC is verified (§9.5.3.3.4.3). NIL -> no origin-auth verification (the common_mac alone governs)."
-  (let* ((resolver (disc-node-secure-sedp-decode-km node))
-         (recvres  (disc-node-secure-sedp-decode-receiver-km node))
-         (key-id   (%secure-bracket-key-id bracket))
-         (km       (and resolver key-id (funcall resolver key-id))))
-    (if km
-        (let ((rd (and recvres key-id (funcall recvres key-id))))   ; (key_id . key) | nil
-          (%on-secure-builtin node src-prefix bracket km (car rd) (cdr rd)))
-        (%on-volatile-secure node src-prefix bracket)))
+  (let* ((key-id   (%secure-bracket-key-id bracket))
+         (user-fn  (disc-node-user-submessage-decode node))
+         (ukm      (and user-fn key-id (funcall user-fn key-id))))
+    (if ukm
+        ;; Slice 5: a USER-endpoint bracket (metadata_protection, §8.5.1.7-.9) — its key_id resolved to a remote
+        ;; USER EntityCrypto (not a secure builtin). T10 review fix-1: DROP a BARE (non-SRTPS-wrapped) user
+        ;; bracket when rtps_protection is REQUIRED from this :keyed source (ENFORCE-RTPS) — the forgeable
+        ;; un-wrapped framing the §8.5.1.10-.12 enforcement closes; ENFORCE-RTPS is NIL on the legitimate
+        ;; post-SRTPS re-dispatch (rtps-unwrapped=t), so a properly wrapped bracket IS decoded + re-dispatched.
+        (unless enforce-rtps
+          (%on-user-secure-submessage node src-prefix bracket ukm))
+        (let* ((resolver (disc-node-secure-sedp-decode-km node))
+               (recvres  (disc-node-secure-sedp-decode-receiver-km node))
+               (km       (and resolver key-id (funcall resolver key-id))))
+          (if km
+              (let ((rd (and recvres key-id (funcall recvres key-id))))   ; (key_id . key) | nil
+                (%on-secure-builtin node src-prefix bracket km (car rd) (cdr rd)))
+              (%on-volatile-secure node src-prefix bracket)))))
+  t)
+
+(defun* %on-user-secure-submessage (node src-prefix bracket km)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))
+               dds.security:key-material) t)
+  "Receiver thread: a USER-endpoint SEC_PREFIX … SEC_POSTFIX submessage-protection bracket from SRC-PREFIX whose
+   transformation_key_id resolved (USER-SUBMESSAGE-DECODE) to the remote user EntityCrypto KM (DDS-Security 1.1
+   §8.5.1.7-.9, metadata_protection). Recover the plaintext user submessage (decode-datawriter-submessage decodes
+   ANY §8.5 bracket — DataWriter or DataReader share one transform) and RE-DISPATCH it through the normal user
+   data path: synthesize a one-submessage datagram carrying SRC-PREFIX's RTPS Header (so %source-prefix keys the
+   sender correctly, §9.4.4) followed by the recovered submessage, and feed it to %handle-datagram with
+   RTPS-UNWRAPPED set — the bracket's AEAD already authenticated it, so the plain-user-DATA rtps_protection
+   enforcement must NOT re-drop it. So a recovered DATA reaches the user reader (its payload data_protection-decoded
+   by the crypto-transform on-data path), a HEARTBEAT/ACKNACK/GAP drives the user reliable engine — IDENTICAL to a
+   plain user submessage, only the wire framing differed. FAIL-CLOSED (NFR-SEC-POSTURE): an undecryptable/malformed/
+   truncated/tampered bracket -> a silent DROP (no synthetic dispatch, no signal out, no plaintext on failure). The
+   off-heap synthetic-datagram scratch is freed before return."
+  (let ((plain (dds.security:decode-datawriter-submessage km bracket)))
+    (when (and plain (>= (length plain) 4))
+      (let ((buf (dds.core.buffer:make-octet-buffer (+ 20 (length plain)))))
+        (unwind-protect
+             (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
+               (dds.rtps.message:write-header mc src-prefix)               ; 20-octet RTPS Header w/ SRC prefix
+               (dds.core.buffer:put-octets mc plain 0 (length plain))
+               (%handle-datagram node buf (dds.core.buffer:cursor-position mc) t))   ; t = rtps-unwrapped
+          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))
   t)
 
 ;;; --- outbound: build + protect + announce a secure SEDP endpoint ---
@@ -196,21 +287,28 @@
                                           (dds.core.buffer:cursor-position pc)))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec plbuf)))))
 
-(defun* %send-secure-bracket (node km kind plain receivers host port)
+(defun* %send-secure-bracket (node km kind plain receivers host port &key reader)
     (function (disc-node dds.security:key-material (member :sign :encrypt)
-               (simple-array (unsigned-byte 8) (*)) list string (unsigned-byte 16)) t)
-  "Submessage-PROTECT one PLAINTEXT DATA submessage PLAIN under the LOCAL secure-builtin EntityCrypto KM per the
-   governance-EFFECTIVE KIND (the T2/T3 codec encode-datawriter-submessage, DDS-Security 1.1 §8.5.1.7) and send
-   the SEC_PREFIX ... SEC_POSTFIX bracket as ONE datagram to HOST:PORT. :encrypt -> SEC_PREFIX ‖ CryptoHeader ‖
+               (simple-array (unsigned-byte 8) (*)) list string (unsigned-byte 16)
+               &key (:reader t)) t)
+  "Submessage-PROTECT one PLAINTEXT submessage PLAIN under the LOCAL secure-builtin EntityCrypto KM per the
+   governance-EFFECTIVE KIND (the T2/T3 codec, DDS-Security 1.1 §8.5.1.7/.8) and send the SEC_PREFIX ...
+   SEC_POSTFIX bracket as ONE datagram to HOST:PORT. :encrypt -> SEC_PREFIX ‖ CryptoHeader ‖
    SEC_BODY[ciphertext] ‖ SEC_POSTFIX (the plaintext is HIDDEN, §9.4.1.2.3 ENCRYPT); :sign -> SEC_PREFIX ‖
-   CryptoHeader ‖ the DATA submessage VERBATIM ‖ SEC_POSTFIX[GMAC] (authenticated-but-VISIBLE, §9.4.1.2.3 SIGN).
+   CryptoHeader ‖ the submessage VERBATIM ‖ SEC_POSTFIX[GMAC] (authenticated-but-VISIBLE, §9.4.1.2.3 SIGN).
+   READER selects the §8.5 transform: NIL (default) -> encode-datawriter-submessage (DATA / HEARTBEAT, a
+   writer submessage); T -> encode-datareader-submessage (ACKNACK, a reader submessage) — the two delegate to
+   ONE engine (byte-identical wire), the split is only which §8.5 codec the receiver pairs for decode.
    KIND is the node's installed governance-EFFECTIVE base kind (HONORING the directive, never a hardcoded
    ENCRYPT). RECEIVERS is the origin-authentication receiver list (§9.5.3.3.4.3, T-ORIGINAUTH); EMPTY (the
    default for a non-origin-auth kind) emits no receiver-specific MAC (plain SIGN/ENCRYPT, byte-identical).
    Default session_id is safe (each EntityCrypto KM is INDEPENDENT per endpoint — no symmetric-key nonce hazard,
-   unlike PVMS). The shared PROTECT+SEND tail of every secure builtin announce (SEDP / participant-message /
-   SPDP — DRY, T11). A no-op (still T) if the codec returns NIL. Fresh per-call buffer (control-plane), freed."
-  (let ((secured (dds.security:encode-datawriter-submessage km kind plain :receivers receivers)))
+   unlike PVMS). The shared PROTECT+SEND tail of every secure builtin submessage (SEDP DATA / participant-message
+   / SPDP / the secure-SEDP reliability HEARTBEAT+ACKNACK — DRY, T11). A no-op (still T) if the codec returns
+   NIL. Fresh per-call buffer (control-plane), freed."
+  (let ((secured (if reader
+                     (dds.security:encode-datareader-submessage km kind plain :receivers receivers)
+                     (dds.security:encode-datawriter-submessage km kind plain :receivers receivers))))
     (when secured
       (let ((buf (dds.core.buffer:make-octet-buffer (+ 64 (length secured)))))
         (unwind-protect
@@ -291,6 +389,115 @@
                                              dds.rtps.discovery:+entityid-sedp-sub-secure-reader+
                                              dds.rtps.discovery:+entityid-sedp-sub-secure-writer+
                                              r rsn (car hp) (cdr hp) rreceivers)))))))))))
+  t)
+
+;;; --- T9pull: secure-SEDP RELIABILITY (HEARTBEAT/ACKNACK over the protected builtin endpoints) ---
+;;; A reliable secure-SEDP/PM writer (Fast DDS RTPSMessageGroup add_heartbeat/add_acknack ->
+;;; encode_writer/reader_submessage when is_submessage_protected) drives its matched reader via
+;;; submessage-PROTECTED HEARTBEAT/ACKNACK, never a clear one (MessageReceiver drops a clear submessage on a
+;;; protected endpoint: was_decoded || !is_submessage_protected). %on-secure-builtin demuxes them here.
+;;; Corroborated CLEAN-ROOM vs Fast DDS (docs/provenance.md); RTI never read. The our-to-our secure SEDP also
+;;; push-announces (announce-endpoints cadence), so these branches only ADD repair (a lost DATA is re-pulled)
+;;; and the cross-vendor pull — they never replace the push, and a fully-received reader ACKs (numBits 0 ->
+;;; no resend), so our-to-our stays green.
+
+(defun* %on-secure-builtin-heartbeat (node src-prefix wid first last)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32) integer integer) t)
+  "Receiver thread: an inner HEARTBEAT [FIRST,LAST] (decoded from a protected secure-builtin bracket) from
+   remote SRC-PREFIX's secure-builtin writer WID. Apply the range to the per-remote builtin reader (keyed by
+   WID, reusing %builtin-acknack-values + the plain-SEDP builtin-readers — the SNs were recorded by the DATA
+   branch's %builtin-on-data) and send the computed ACKNACK submessage-PROTECTED (the governance KIND) under
+   OUR matched LOCAL receiving reader's EntityCrypto (%secure-reader-eid-for-writer WID -> secure-sedp-encode-km),
+   encoded as a DataReader submessage (:reader t), to SRC-PREFIX's metatraffic locator (RTPS 2.5 §8.3.7.1;
+   DDS-Security 1.1 §8.5.1.8/.9 — the ACKNACK rides protected, a CLEAR one is dropped by a conformant secure
+   writer). The NACK-pull that delivers a reliable Fast DDS writer's DiscoveredWriter/ReaderData (it sends only
+   HEARTBEATs to an unacked late-joining reader-proxy, waiting for the ACKNACK before pushing DATA). The matched
+   remote WRITER holds no receiver-specific key (§9.5.3.3.4.3 — only readers mint one), so receivers = EMPTY
+   (common_mac only). A no-op (still T) when WID is not a secure builtin writer, our local reader EntityCrypto is
+   not yet registered, or SRC-PREFIX has no resolved metatraffic locator (fail-closed, NFR-SEC-POSTURE)."
+  (let* ((reader-eid (%secure-reader-eid-for-writer wid))
+         (enc        (disc-node-secure-sedp-encode-km node))
+         (km         (and enc reader-eid (funcall enc reader-eid)))   ; LOCAL receiving reader's EntityCrypto
+         (hp         (%remote-metatraffic node src-prefix))
+         (kind       (disc-node-secure-sedp-protection-kind node)))
+    (when (and km hp)
+      (multiple-value-bind (base numbits bitmap count)
+          (%builtin-acknack-values node src-prefix wid first last)
+        (%send-secure-bracket node km kind
+                              (%build-plain-acknack-sm reader-eid wid base numbits bitmap count)
+                              '() (car hp) (cdr hp) :reader t))))
+  t)
+
+(defun* %on-secure-builtin-acknack (node src-prefix c flags)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) dds.core.buffer:cursor (unsigned-byte 8)) t)
+  "Receiver thread: parse the inner ACKNACK (decoded from a protected secure-builtin bracket; CURSOR at the
+   ACKNACK body) from remote SRC-PREFIX's secure-SEDP reader. When it targets OUR secure-SEDP publications
+   (0xff0003c2) or subscriptions (0xff0004c2) writer, RESEND each NACKed DiscoveredWriter/ReaderData (the SN
+   is the endpoint's stable 1-based add-order index, %secure-endpoints-for) as a freshly-protected secure-SEDP
+   DATA to SRC-PREFIX (%send-secure-endpoint, the SAME protect path the announce uses, with the matched-remote
+   reader's origin-auth receivers). The repair for a dropped secure-SEDP DATA and the response to Fast DDS's
+   initial pull (its reader NACKs 1..N off our HEARTBEAT). NIL/no-op for any other writer or when not keyed /
+   no locator (fail-closed). NACKed SNs are read base+bit exactly as dds.rtps.reliable:writer-on-acknack does."
+  (multiple-value-bind (rid wid base numbits bitmap count finalp)
+      (dds.rtps.message:parse-acknack-body c flags)
+    (declare (ignore rid count finalp))
+    (let ((pub-p (and wid (= wid dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)))
+          (sub-p (and wid (= wid dds.rtps.discovery:+entityid-sedp-sub-secure-writer+))))
+      (when (or pub-p sub-p)
+        (let* ((enc   (disc-node-secure-sedp-encode-km node))
+               (km    (and enc (funcall enc wid)))    ; LOCAL secure-SEDP writer's EntityCrypto
+               (hp    (%remote-metatraffic node src-prefix))
+               (protp (disc-node-discovery-protected-topic-p node))
+               (kind  (disc-node-secure-sedp-protection-kind node))
+               (recv  (disc-node-secure-sedp-encode-receivers node)))
+          (when (and km hp protp base)
+            (let* ((reader-id (if pub-p dds.rtps.discovery:+entityid-sedp-pub-secure-reader+
+                                  dds.rtps.discovery:+entityid-sedp-sub-secure-reader+))
+                   (eps       (%secure-endpoints-for node protp
+                                                     (if pub-p #'disc-node-local-writers #'disc-node-local-readers)))
+                   (n         (length eps))
+                   (receivers (and recv (funcall recv wid src-prefix))))
+              (dotimes (i numbits)
+                (when (dds.rtps.message:seqnum-set-bit-p bitmap i)
+                  (let ((sn (+ base i)))
+                    (when (<= 1 sn n)
+                      (%send-secure-endpoint node km kind reader-id wid (nth (1- sn) eps) sn
+                                             (car hp) (cdr hp) receivers)))))))))))
+  t)
+
+(defun* %send-secure-builtin-heartbeats (node)
+    (function (disc-node) (eql t))
+  "Announce thread: emit a NON-FINAL secure-SEDP HEARTBEAT [1,N] from each protected local secure-SEDP writer
+   (publications 0xff0003c2 over the local writers, subscriptions 0xff0004c2 over the local readers; N = that
+   channel's discovery-PROTECTED endpoint count) to every :keyed peer, submessage-PROTECTED under the LOCAL
+   secure-SEDP-writer EntityCrypto per the governance KIND with the matched-remote reader's origin-auth receivers
+   — the periodic re-solicit (RTPS 2.5 §8.4.2.2) that makes a reliable Fast DDS secure-SEDP reader NACK-pull OUR
+   DiscoveredWriter/ReaderData (without it Fast DDS never matches us). The destination reader is
+   %secure-reader-eid-for-writer (the peer's matched secure-SEDP reader). A no-op (still T) when secure discovery
+   is not active (no encode-KM / no protected-topic predicate), the local EntityCrypto is not registered, the
+   channel has NO protected endpoints, or there are no :keyed peers — so security OFF is byte-identical. Fanned
+   over %pvms-authenticated-prefixes (the :keyed peers, like %announce-secure-endpoints / PVMS); a not-yet-keyed
+   or PLAIN peer is never in that set (the non-vacuous-control invariant). Fresh per-call buffers (control-plane)."
+  (let ((enc   (disc-node-secure-sedp-encode-km node))
+        (recv  (disc-node-secure-sedp-encode-receivers node))
+        (protp (disc-node-discovery-protected-topic-p node))
+        (kind  (disc-node-secure-sedp-protection-kind node)))
+    (when (and enc protp)
+      (dolist (ch (list (cons dds.rtps.discovery:+entityid-sedp-pub-secure-writer+ #'disc-node-local-writers)
+                        (cons dds.rtps.discovery:+entityid-sedp-sub-secure-writer+ #'disc-node-local-readers)))
+        (let* ((wid        (car ch))
+               (km         (funcall enc wid))
+               (n          (length (%secure-endpoints-for node protp (cdr ch))))
+               (reader-eid (%secure-reader-eid-for-writer wid)))
+          (when (and km reader-eid (plusp n))
+            (dolist (prefix (%pvms-authenticated-prefixes node))
+              (let ((hp (%remote-metatraffic node prefix)))
+                (when hp
+                  (let ((receivers (and recv (funcall recv wid prefix))))
+                    (%send-secure-bracket node km kind
+                                          (%build-plain-heartbeat-sm reader-eid wid 1 n
+                                                                     (incf (disc-node-ack-count node)))
+                                          receivers (car hp) (cdr hp)))))))))))
   t)
 
 ;;; --- T11: secure participant-message (Writer Liveliness Protocol) over 0xff0200 ---
@@ -762,6 +969,160 @@
            t)
       (stop-node node-a) (stop-node node-b))))
 
+(defun* run-user-submessage-protection-test ()
+    (function () (eql t))
+  "WP-DDS-SECURITY-FASTDDS-INTEROP (Slice 5): user-DATA submessage protection (metadata_protection_kind,
+   DDS-Security 1.1 §8.5.1.7-.9) on the live disc data path — deterministic, no auth handshake (a manually-installed
+   user EntityCrypto KM + the user-submessage-encode/decode closures stand in for the dds-dcps crypto-manager; the
+   full :keyed participant e2e + the live Fast DDS cross-vendor run exercise the integrated path). A is the sender,
+   B the receiver holding A's user-writer EntityCrypto. Asserts:
+     (1) EXEMPTION: with the encode resolver installed but USER-SUBMESSAGE-PROTECTION-KIND :none, a send stays PLAIN
+         (first submessage DATA 0x15) — gated on the kind, byte-identical to the non-secure path.
+     (2) ENGAGEMENT: kind :encrypt -> the user DATA submessage is wrapped (first submessage SEC_PREFIX 0x31) and the
+         payload never appears in cleartext (ENCRYPT).
+     (3) 4-ALIGNMENT: the wrapped submessage stream is a 4-octet multiple — the §8.3.4 pad lives in the SEC_BODY
+         CryptoContent container (NOT the plaintext), so a conformant receiver's body_align lands on the SEC_POSTFIX.
+     (4) DECODE+DISPATCH: B (correct user EntityCrypto, resolved by transformation_key_id) decodes the bracket and
+         delivers the inner user DATA through %on-user-secure-submessage -> %handle-datagram re-dispatch; the sent
+         payload is recovered byte-EXACT (no trailing pad — the SEC_BODY carries the alignment, T10 review fix-2).
+     (5) NON-VACUOUS: a receiver WITHOUT A's user EntityCrypto (wrong KM, same key_id) does NOT decode -> fail-closed.
+   Requires the AES-GCM primitive; skips gracefully if absent. Both impls."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [user-submsg] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-user-submessage-protection-test t)))
+  (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 91))
+         (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 92))
+         (node-a (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+         (node-b (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+         (km       (%secure-sedp-test-km #x71 #x35))   ; A's user-writer EntityCrypto; B holds the SAME (received A's token)
+         (km-wrong (%secure-sedp-test-km #x71 #x46))   ; SAME key_id, DIFFERENT key bytes — the non-vacuous wrong-key control
+         (kid      (dds.security:key-material-sender-key-id km))
+         ;; 13 octets -> DATA octetsToNextHeader 20+13=33 (NOT a 4-multiple): the SEC_BODY CryptoContent container
+         ;; carries the §8.3.4 4-align pad after the ciphertext (the plaintext is NOT padded), exercising it.
+         (payload (map '(simple-array (unsigned-byte 8) (*)) #'char-code "USERMETADATA!"))
+         (host "127.0.0.1") (port 7) (cap nil))
+    (unwind-protect
+         (progn
+           ;; (1) EXEMPTION — encode resolver installed, kind :none -> never wrapped (byte-identical plain path)
+           (setf (disc-node-user-submessage-protection-kind node-a) :none
+                 (disc-node-user-submessage-encode node-a)
+                 (lambda (writer-p) (declare (ignore writer-p))
+                   (unless (eq (disc-node-user-submessage-protection-kind node-a) :none)
+                     (values km (disc-node-user-submessage-protection-kind node-a)))))
+           (let ((buf (disc-node-tx-msg node-a)) (*datagram-sink* (lambda (dg) (setf cap dg))))
+             (%send-raw-buf node-a buf (%rtps-build-user-datagram node-a buf 1 payload) host port nil pb))
+           (assert (and (> (length cap) 20) (= (aref cap 20) dds.rtps.message:+submsg-data+)) ()
+                   "user-submsg exemption: kind :none must stay PLAIN (first submessage DATA 0x15)")
+           ;; (2) ENGAGEMENT — kind :encrypt -> SEC_PREFIX-wrapped + confidential
+           (setf (disc-node-user-submessage-protection-kind node-a) :encrypt)
+           (let ((buf (disc-node-tx-msg node-a)) (*datagram-sink* (lambda (dg) (setf cap dg))))
+             (%send-raw-buf node-a buf (%rtps-build-user-datagram node-a buf 1 payload) host port nil pb))
+           (assert (and (> (length cap) 20) (= (aref cap 20) dds.security:+submessage-sec-prefix+)) ()
+                   "user-submsg engagement: kind :encrypt must wrap the user DATA (first submessage SEC_PREFIX 0x31)")
+           (assert (not (search payload cap)) ()
+                   "user-submsg ENCRYPT: the user payload must NOT appear in cleartext in the wrapped datagram")
+           ;; (3) 4-ALIGNMENT — the wrapped submessage stream (after the 20-octet RTPS header) is a 4-multiple: the
+           ;; SEC_BODY CryptoContent container carries the §8.3.4 pad, so a conformant peer's body_align lands on
+           ;; the SEC_POSTFIX (the plaintext is NOT padded — Fast DDS serialize_SecureDataBody).
+           (assert (zerop (mod (- (length cap) 20) 4)) ()
+                   "user-submsg 4-align: the wrapped submessage stream must be a 4-octet multiple (got ~d)" (- (length cap) 20))
+           ;; (4) DECODE+DISPATCH at B (correct user EntityCrypto, resolved by key_id) -> payload byte-EXACT (no pad)
+           (let ((got nil))
+             (setf (disc-node-user-submessage-decode node-b) (lambda (k) (when (equalp k kid) km))
+                   (disc-node-on-data node-b)
+                   (lambda (w sn b poff plen sp og os kh) (declare (ignore w sn sp og os kh))
+                     (setf got (subseq (dds.core.buffer:octet-buffer-vec b) poff (+ poff plen)))))
+             (%rtps-feed-datagram node-b cap)
+             (assert (and got (equalp got payload)) ()
+                     "user-submsg decode: B must recover + dispatch the inner user DATA payload byte-EXACT (no trailing pad)"))
+           ;; (5) NON-VACUOUS — wrong user EntityCrypto (same key_id) -> fail-closed drop (on-data never fires)
+           (let ((fired nil))
+             (setf (disc-node-user-submessage-decode node-b) (lambda (k) (when (equalp k kid) km-wrong))
+                   (disc-node-on-data node-b) (lambda (&rest r) (declare (ignore r)) (setf fired t)))
+             (%rtps-feed-datagram node-b cap)
+             (assert (null fired) ()
+                     "user-submsg fail-closed: a peer WITHOUT A's user EntityCrypto must NOT decode the bracket"))
+           t)
+      (stop-node node-a) (stop-node node-b))))
+
+(defun* run-user-submessage-data-protection-test ()
+    (function () (eql t))
+  "WP-DDS-SECURITY-FASTDDS-INTEROP (Slice 5): the TWO-TIER user-DATA case — both metadata_protection (the
+   §8.5.1.7-.9 SEC_PREFIX submessage wrap) AND data_protection (the §9.5.3.3 serialized-payload SecuredPayload)
+   ENCRYPT on a user DATA whose CDR plaintext length is NOT a 4-multiple. Both tiers Fast-DDS-faithful:
+     - data_protection self-4-aligns the SecuredPayload (T11reverse cross-vendor fix): the §9.5.3.3.3
+       SecureDataTag pads the receiver_specific_macs_count to a 4-byte boundary vs the SecuredPayload start
+       (Fast DDS serialize_SecureDataTag), so a non-4-aligned ciphertext still yields a 4-aligned SecuredPayload.
+       Omitting the pad made Fast DDS decode_serialized_payload mis-read the tag length ('Error in fastcdr
+       trying to deserialize SecureDataTag length') -> the cross-vendor ours2fast user-DATA drop this closes.
+     - metadata_protection keeps the 4-align pad inside the SEC_BODY CryptoContent, not the plaintext (Fast DDS
+       serialize_SecureDataBody, L1677-1700: octetsToNextHeader=(N+4+3)&~3, cnt_length=N true, pad after the
+       ciphertext), so the recovered inner DATA's octetsToNextHeader reflects the TRUE payload length and the
+       inner SecuredPayload round-trips (the T10 silent-drop fix).
+   A is the sender (data_protection km-payload + metadata_protection km-meta, distinct key_ids); B holds
+   km-meta (its user EntityCrypto) and decodes the inner SecuredPayload with km-payload. Deterministic, no
+   handshake (manual KMs, like run-user-submessage-protection-test). Asserts:
+     (0) data_protection 4-aligns the SecuredPayload (the §9.5.3.3.3 tag pad) from a non-4-aligned plaintext.
+     (1) the recovered inner DATA payload region is BYTE-EXACT the §9.5.3.3 SecuredPayload — no spurious
+         trailing 4-align pad (the SEC_BODY carries the metadata pad, not the plaintext).
+     (2) NON-VACUOUS two-tier round-trip: decode-serialized-payload(km-payload, recovered) = the original
+         non-4-aligned plaintext.
+   Requires the AES-GCM primitive; skips gracefully if absent. Both impls (Clasp first)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [user-submsg-data-protection] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-user-submessage-data-protection-test t)))
+  (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 95))
+         (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 96))
+         (node-a (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+         (node-b (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+         (km-meta    (%secure-sedp-test-km #x74 #x38))   ; A's user-writer EntityCrypto (metadata_protection); B holds it
+         (km-payload (dds.security:make-test-key-material))   ; the data_protection (serialized-payload) KM
+         (kid        (dds.security:key-material-sender-key-id km-meta))
+         ;; 13-octet CDR plaintext (NOT a 4-multiple) -> the §9.5.3.3.3 SecureDataTag pads to a 4-aligned
+         ;; SecuredPayload (20 hdr + 4 ct_len + 13 ct + 3 pad + 16 mac + 4 rsm_count = 60): the conformant
+         ;; two-tier shape Fast DDS decode_serialized_payload expects (a non-4-aligned SecuredPayload is the
+         ;; pre-fix non-conformance this closes).
+         (plaintext  (map '(simple-array (unsigned-byte 8) (*)) #'char-code "TWO-TIER-DATA"))
+         (secured    (dds.security:encode-serialized-payload km-payload plaintext))   ; data_protection tier
+         (host "127.0.0.1") (port 7) (cap nil) (got nil))
+    ;; (0) the plaintext is non-4-aligned (so the §9.5.3.3.3 tag pad is non-empty) AND data_protection
+    ;;     self-4-aligns the SecuredPayload (the conformant invariant Fast DDS decode_serialized_payload needs).
+    (assert (plusp (mod (length plaintext) 4)) ()
+            "user-submsg two-tier setup: the plaintext must be NON-4-aligned to exercise the §9.5.3.3.3 tag pad (got ~d)" (length plaintext))
+    (assert (zerop (mod (length secured) 4)) ()
+            "user-submsg two-tier: data_protection must 4-align the SecuredPayload (the §9.5.3.3.3 SecureDataTag pad, Fast DDS-conformant; got ~d)" (length secured))
+    (unwind-protect
+         (progn
+           ;; A wraps the (data_protection-encoded) DATA submessage under metadata_protection ENCRYPT.
+           (setf (disc-node-user-submessage-protection-kind node-a) :encrypt
+                 (disc-node-user-submessage-encode node-a)
+                 (lambda (writer-p) (declare (ignore writer-p)) (values km-meta :encrypt)))
+           (let ((buf (disc-node-tx-msg node-a)) (*datagram-sink* (lambda (dg) (setf cap dg))))
+             (%send-raw-buf node-a buf (%rtps-build-user-datagram node-a buf 1 secured) host port nil pb))
+           (assert (and (> (length cap) 20) (= (aref cap 20) dds.security:+submessage-sec-prefix+)) ()
+                   "user-submsg two-tier: the DATA submessage must be metadata_protection-wrapped (SEC_PREFIX 0x31)")
+           (assert (zerop (mod (- (length cap) 20) 4)) ()
+                   "user-submsg two-tier 4-align: the wrapped submessage stream must stay a 4-octet multiple (SEC_BODY carries the pad)")
+           ;; B decodes the bracket (km-meta) + re-dispatches; capture the recovered inner DATA payload region.
+           (setf (disc-node-user-submessage-decode node-b) (lambda (k) (when (equalp k kid) km-meta))
+                 (disc-node-on-data node-b)
+                 (lambda (w sn b poff plen sp og os kh) (declare (ignore w sn sp og os kh))
+                   (setf got (subseq (dds.core.buffer:octet-buffer-vec b) poff (+ poff plen)))))
+           (%rtps-feed-datagram node-b cap)
+           ;; (1) the recovered DATA payload is byte-exact the SecuredPayload (no trailing 4-align pad).
+           (assert (and got (equalp got secured)) ()
+                   "user-submsg two-tier: the recovered inner DATA payload must be the EXACT SecuredPayload (no trailing pad); got ~d vs ~d octets"
+                   (and got (length got)) (length secured))
+           ;; (2) NON-VACUOUS: the inner data_protection SecuredPayload decodes to the original plaintext
+           ;;     (pre-fix the trailing pad made this NIL — the silent drop this fix closes).
+           (let ((recovered (dds.security:decode-serialized-payload km-payload got)))
+             (assert (and recovered (equalp recovered plaintext)) ()
+                     "user-submsg two-tier: metadata_protection + data_protection + non-4-aligned payload must round-trip byte-exact (was silently dropped)"))
+           t)
+      (stop-node node-a) (stop-node node-b))))
+
 (defun* run-rtps-protection-enforce-test ()
     (function () (eql t))
   "WP-DDS-SECURITY-SECURE-DISCOVERY T10 review: RECEIVE-side rtps_protection ENFORCEMENT (DDS-Security 1.1
@@ -842,6 +1203,83 @@
                      "T10 enforce false-REJECT: plain BUILTIN metatraffic (SPDP) from a :keyed-rtps peer must STILL be processed (metatraffic is intentionally plain in this slice)")
              t)
         (stop-node node-a) (stop-node node-b)))))
+
+(defun* run-rtps-protection-enforce-user-bracket-test ()
+    (function () (eql t))
+  "WP-DDS-SECURITY-FASTDDS-INTEROP (Slice 5, T10 review fix-1): RECEIVE-side rtps_protection ENFORCEMENT on a
+   BARE user metadata_protection bracket (DDS-Security 1.1 §8.5.1.10-.12) — the gap the other enforce tests
+   (run-rtps-protection-enforce-test / -reliability-test, which cover plain DATA/HEARTBEAT/ACKNACK/GAP/*_FRAG)
+   did NOT close: a SEC_PREFIX user bracket arriving WITHOUT the mandated outer SRTPS wrap. A legitimate
+   keyed-rtps peer ALWAYS SRTPS-wraps user traffic, so a bare user bracket claiming to come from the :keyed peer
+   A is forgeable framing — the AEAD authenticates the inner submessage, but the bracket bypassed the required
+   whole-RTPS protection — and MUST be dropped. B requires rtps_protection (ENCRYPT) and is :keyed with A (holds
+   A's ParticipantCrypto km-rtps + A's user EntityCrypto km-meta). A is the sender. Feeding datagrams straight
+   into %handle-datagram (deterministic, no UDP / no handshake; both impls). Asserts:
+     (1) ENFORCEMENT: a BARE user bracket (metadata_protection only, no SRTPS) from the :keyed A is DROPPED —
+         B's user-data hook never fires (the un-wrapped injection is rejected before any user reader).
+     (2) NON-VACUOUS (governance NONE): with rtps_protection = NONE the SAME bare bracket IS delivered —
+         proving the drop is specifically the rtps_protection enforcement (not the bracket decode failing).
+     (3) LEGITIMATE PATH: the SAME user bracket delivered INSIDE the proper SRTPS wrap IS delivered byte-exact
+         (outer SRTPS decode -> re-dispatch rtps-unwrapped=t -> ENFORCE-RTPS NIL -> user bracket decoded), so
+         the fix drops ONLY the bare bracket, never the conformant wrapped one (no false-REJECT).
+   Requires the AES-GCM primitive; skips gracefully if absent. Both impls (Clasp first)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [rtps-enforce-user-bracket] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-rtps-protection-enforce-user-bracket-test t)))
+  (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 97))   ; the :keyed peer A
+         (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 98))   ; node-b: receiver under enforcement
+         (node-a (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+         (node-b (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+         (km-meta (%secure-sedp-test-km #x77 #x39))   ; A's user-writer EntityCrypto (metadata_protection)
+         (km-rtps (%secure-sedp-test-km #x78 #x3a))   ; A's ParticipantCrypto (rtps_protection / SRTPS)
+         (meta-kid (dds.security:key-material-sender-key-id km-meta))
+         (payload (map '(simple-array (unsigned-byte 8) (*)) #'char-code "BARE-DROP"))   ; 9 octets (non-4-aligned)
+         (host "127.0.0.1") (port 7) (cap-bare nil) (cap-srtps nil) (got nil))
+    (unwind-protect
+         (progn
+           ;; A: user metadata_protection ENCRYPT (km-meta) on the user DATA submessage.
+           (setf (disc-node-user-submessage-protection-kind node-a) :encrypt
+                 (disc-node-user-submessage-encode node-a)
+                 (lambda (writer-p) (declare (ignore writer-p)) (values km-meta :encrypt)))
+           ;; Build the BARE user bracket: metadata wrap only (NO rtps-protection-encode -> %maybe-wrap-srtps no-op).
+           (let ((buf (disc-node-tx-msg node-a)) (*datagram-sink* (lambda (dg) (setf cap-bare dg))))
+             (%send-raw-buf node-a buf (%rtps-build-user-datagram node-a buf 1 payload) host port nil pb))
+           (assert (and (> (length cap-bare) 20) (= (aref cap-bare 20) dds.security:+submessage-sec-prefix+)) ()
+                   "enforce-user-bracket setup: the bare datagram must be a SEC_PREFIX user bracket (0x31), not SRTPS")
+           ;; Build the SRTPS-WRAPPED user bracket: metadata wrap THEN whole-RTPS wrap (km-rtps).
+           (setf (disc-node-rtps-protection-encode node-a)
+                 (lambda (dp) (declare (ignore dp)) (values km-rtps :encrypt '())))
+           (let ((buf (disc-node-tx-msg node-a)) (*datagram-sink* (lambda (dg) (setf cap-srtps dg))))
+             (%send-raw-buf node-a buf (%rtps-build-user-datagram node-a buf 2 payload) host port nil pb))
+           (assert (and (> (length cap-srtps) 20) (= (aref cap-srtps 20) dds.security:+submessage-srtps-prefix+)) ()
+                   "enforce-user-bracket setup: the wrapped datagram must be SRTPS (0x33) carrying the inner bracket")
+           ;; B: rtps_protection REQUIRED + :keyed with A (km-rtps) + holds A's user EntityCrypto (km-meta).
+           (setf (disc-node-rtps-protection-kind node-b) :encrypt
+                 (disc-node-rtps-protection-decode node-b)
+                 (lambda (sp) (when (equalp sp pa) (values km-rtps nil nil)))
+                 (disc-node-user-submessage-decode node-b) (lambda (k) (when (equalp k meta-kid) km-meta))
+                 (disc-node-on-data node-b)
+                 (lambda (w sn b poff plen sp og os kh) (declare (ignore w sn sp og os kh))
+                   (setf got (subseq (dds.core.buffer:octet-buffer-vec b) poff (+ poff plen)))))
+           ;; (1) ENFORCEMENT — a BARE user bracket from the :keyed A is DROPPED (no on-data dispatch).
+           (setf got nil)
+           (%rtps-feed-datagram node-b cap-bare)
+           (assert (null got) ()
+                   "T10 enforce-user-bracket: a BARE user metadata_protection bracket (no outer SRTPS) from a :keyed-rtps peer must be DROPPED")
+           ;; (2) NON-VACUOUS (governance NONE) — the SAME bare bracket IS delivered with rtps_protection NONE.
+           (setf got nil (disc-node-rtps-protection-kind node-b) :none)
+           (%rtps-feed-datagram node-b cap-bare)
+           (assert (and got (equalp got payload)) ()
+                   "T10 enforce-user-bracket non-vacuous: with rtps_protection NONE the same bare bracket must be DELIVERED (proves the drop IS the enforcement)")
+           (setf (disc-node-rtps-protection-kind node-b) :encrypt)   ; restore enforce mode
+           ;; (3) LEGITIMATE PATH — the SAME bracket inside the proper SRTPS wrap IS delivered byte-exact.
+           (setf got nil)
+           (%rtps-feed-datagram node-b cap-srtps)
+           (assert (and got (equalp got payload)) ()
+                   "T10 enforce-user-bracket: the SAME user bracket delivered inside the proper SRTPS wrap must be DELIVERED byte-exact (no false-REJECT)")
+           t)
+      (stop-node node-a) (stop-node node-b))))
 
 (defun* %rtps-build-submsg-datagram (src-prefix writer)
     (function ((simple-array (unsigned-byte 8) (12)) function) (simple-array (unsigned-byte 8) (*)))

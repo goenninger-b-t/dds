@@ -117,13 +117,17 @@
 
 ;; Defined in auth-manager.lisp (loaded after this file); forward-declared so
 ;; create-participant can install the DDS-Security §8.7 auth manager when an identity is configured.
-(declaim (ftype (function (domain-participant dds.security:identity-handle) domain-participant)
+(declaim (ftype (function (domain-participant dds.security:identity-handle
+                           &optional (or null (simple-array (unsigned-byte 8) (*))))
+                          domain-participant)
                 %install-auth-manager))
 
 ;; Defined in access-control.lisp (loaded after this file); forward-declared so create-participant
 ;; can install the DDS-Security §8.4 AccessControl manager when governance + permissions are configured.
 (declaim (ftype (function (domain-participant dds.security:access-handle) domain-participant)
                 %install-access-control))
+(declaim (ftype (function (domain-participant (simple-array (unsigned-byte 8) (16)) t) (eql t))
+                %cm-user-token-at-match))
 
 ;; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): forward-declared so create-datareader / delete-participant (defined
 ;; above their bodies in this file) reach the loan helpers without a compile-time undefined-function warning.
@@ -294,6 +298,18 @@
     (loop for i from 3 below 12 do (setf (aref p i) (logand (ash clk (* -8 (- i 3))) #xff)))
     p))
 
+(defun* %participant-guid-prefix (identity)
+    (function (dds.security:identity-handle) (simple-array (unsigned-byte 8) (12)))
+  "The 12-octet GUID prefix for a SECURITY-ENABLED participant: the DDS-Security 1.1 §9.3.2.1
+   authenticated prefix stored in IDENTITY (validate-local-identity derived octets 0-5 from the
+   identity certificate's subject-name SHA-256; octets 6-11 carry the candidate GUID's uniqueness).
+   A conformant peer re-derives + validates these 48 bits before replying to our HandshakeRequest, so
+   a security-enabled participant MUST announce this prefix (not the demo %make-guid-prefix). A fresh
+   typed 12-octet copy for make-disc-node."
+  (let ((g (dds.security:identity-handle-guid identity))
+        (p (make-array 12 :element-type '(unsigned-byte 8))))
+    (dotimes (i 12 p) (setf (aref p i) (aref g i)))))
+
 (defun* %validate-access-config (identity permissions-ca governance permissions)
     (function ((or dds.security:identity-handle null)
                (or (simple-array (unsigned-byte 8) (*)) null)
@@ -350,7 +366,9 @@
    over loopback (the cross-vendor secure-discovery interop reachability pattern, FR-DISC-4).
    IDENTITY (DDS-Security 1.1 §8.7): an optional dds.security:identity-handle from
    validate-local-identity. When supplied the participant is SECURITY-ENABLED — the node
-   advertises its IdentityToken + PSM bits in SPDP and the auth manager is installed, so the
+   announces the DDS-Security 1.1 §9.3.2.1 authenticated GUID (derived from the identity
+   certificate's subject-name, not the demo prefix), advertises its IdentityToken + PSM bits in
+   SPDP, and the auth manager is installed, so the
    participant authenticates every discovered security-enabled peer over the §7.4.3 PSM wire,
    exchanges §9.5.2 key material, and STRICTLY refuses unauthenticated peers (the conformant
    default). NIL (default) = security OFF, byte-identical plain participant.
@@ -371,7 +389,12 @@
         (let* ((node (dds.disc:make-disc-node :domain domain :multicast t
                                               :advertise-address advertise-address
                                               :peers peers :port port
-                                              :guid-prefix (%make-guid-prefix)
+                                              ;; §9.3.2.1: a security-enabled participant announces the
+                                              ;; authenticated GUID derived from its identity cert (so a
+                                              ;; conformant peer accepts our handshake); plain = demo prefix.
+                                              :guid-prefix (if identity
+                                                               (%participant-guid-prefix identity)
+                                                               (%make-guid-prefix))
                                               :identity-token-octets
                                               (when identity (dds.security:identity-token identity))))
                (p (make-instance 'domain-participant :domain domain :node node :qos qos :enabled t)))
@@ -392,7 +415,8 @@
                 (lambda (topic-name) (%on-disc-inconsistent-topic p topic-name)))
           (%install-type-gate p)   ; FR-TYPE-4 assignability gate (type-gate.lisp)
           (when identity           ; DDS-Security §8.7 auth manager — only for a security-enabled participant
-            (%install-auth-manager p identity))
+            ;; pass the configured signed Permissions octets so the handshake emits c.perm (§9.3.2.1, T6)
+            (%install-auth-manager p identity permissions))
           (when access-handle      ; DDS-Security §8.4 AccessControl manager — validated above, install the gate
             (%install-access-control p access-handle))
           (dds.disc:start-node node)
@@ -486,6 +510,20 @@
   (let ((ts (topic-type-support topic)))
     (if ts (dds.types:type-support-keyed-p ts) t)))
 
+(defun* %set-user-metadata-protection (node ah topic-name)
+    (function (dds.disc:disc-node t string) t)
+  "DDS-Security 1.1 §9.4.1.2.4: set NODE's USER-SUBMESSAGE-PROTECTION-KIND (the user-DATA submessage protection
+   tier, metadata_protection) from the access-handle AH's governance metadata_protection_kind for TOPIC-NAME. A
+   NIL AH (no AccessControl) or no governance leaves the slot :none -> the user submessage path stays plain,
+   byte-identical. Called when the user writer/reader is created (it knows the topic name); the resolver installed
+   by %install-crypto-manager reads this kind at send time, so the order (install-then-create) is correct."
+  (when ah
+    (let ((gov (dds.security:access-handle-governance ah)))
+      (when gov
+        (setf (dds.disc:disc-node-user-submessage-protection-kind node)
+              (dds.security:topic-metadata-protection gov topic-name)))))
+  t)
+
 (defun* create-datawriter (pub topic &key (qos (dds.qos:make-writer-qos)))
     (function (publisher topic &key (:qos t)) data-writer)
   "Publisher::create_datawriter — register a local writer in the engine on the
@@ -502,6 +540,7 @@
     (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
                                :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))
+    (%set-user-metadata-protection node ah (topic-name topic))   ; §9.4.1.2.4 user-DATA submessage protection tier
     (dds.disc:enable-publisher node :history-kind (dds.qos:qos-history-kind qos)
                                     :history-depth (dds.qos:qos-history-depth qos))
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
@@ -527,6 +566,7 @@
     (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
                                :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))
+    (%set-user-metadata-protection node ah (topic-name topic))   ; §9.4.1.2.4 user-DATA submessage protection tier
     (dds.disc:enable-subscriber node)
     ;; WP-FLATDATA-ZC-LOAN wiring (FR-PF-3/4, R6, ADR 0017): a :flatdata-topic reader, with ZC armed, is
     ;; loan-capable — the receiver thread defers ZC resolution (holds the slot) and the loan API owns the slot
@@ -1522,7 +1562,10 @@
                               (dds.disc:%reader-durability-init
                                (dp-node p) handle
                                (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote)))
-                              (%assess-and-record-type-compat dr remote))))
+                              (%assess-and-record-type-compat dr remote)))
+                      ;; §8.5.2.3: our user reader matched a remote writer -> (re)send our DatareaderCryptoToken
+                      ;; keyed to the REAL matched-remote writer GUID (the destination_endpoint_key fix).
+                      (%cm-user-token-at-match p handle nil))
       (:remote-reader (let ((dw (dp-user-writer p)))
                         (when dw (%writer-matched dw handle)
                               ;; durability-aware late-joiner proxy init (DDS 1.4 §2.2.3.4): a TL writer
@@ -1531,7 +1574,10 @@
                               (dds.disc:%writer-durability-init
                                (dp-node p) handle
                                (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote)))
-                              (%assess-and-record-type-compat dw remote))))))
+                              (%assess-and-record-type-compat dw remote)))
+                      ;; §8.5.2.2: our user writer matched a remote reader -> (re)send our DatawriterCryptoToken
+                      ;; keyed to the REAL matched-remote reader GUID (the destination_endpoint_key fix).
+                      (%cm-user-token-at-match p handle t))))
   t)
 
 (defun* %on-disc-unmatch (p direction remote)

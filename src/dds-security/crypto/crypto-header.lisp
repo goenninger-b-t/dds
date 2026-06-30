@@ -172,29 +172,37 @@
 (defun* serialize-crypto-footer (cursor common-mac receiver-macs)
     (function (dds.core.buffer:cursor (simple-array (unsigned-byte 8) (*)) list)
               fixnum)
-  "Write the §7.3.7 CryptoFooter at CURSOR; return the octet count. Layout:
-   common_mac(16) ‖ receiver_specific_macs_count(uint32 BIG-ENDIAN) ‖ {receiver_mac_key_id(4) ‖ receiver_mac(16)}*
-   — the §9.5.3.3.3 SecureDataTag. The count is BIG-ENDIAN (§9.5.3.3.3; via %put-u32-be, independent of
-   cursor endianness, Fast-DDS/Cyclone-aligned); the key_id/mac fields are opaque octet arrays. RECEIVER-MACS
-   is a list of (key_id . mac) conses (each key_id 4 octets, each mac 16 octets, caller precondition); an
-   empty list writes count 0 (the Slice-1 serialized-payload tag). COMMON-MAC must be 16 octets. Advances
-   CURSOR by 16 + 4 + 20*count."
-  (let ((count (length receiver-macs)))
+  "Write the §7.3.7 CryptoFooter at CURSOR; return the actual octet count written. Layout:
+   common_mac(16) ‖ <pad to the next 4-byte boundary vs the bracket start> ‖ receiver_specific_macs_count
+   (uint32 BIG-ENDIAN) ‖ {receiver_mac_key_id(4) ‖ receiver_mac(16)}* — the §9.5.3.3.3 SecureDataTag. The
+   receiver_specific_macs sequence length is CDR-aligned to 4 relative to the protected unit's start (Fast DDS
+   AESGCMGMAC_Transform::serialize_SecureDataTag aligns current_position-buffer_pointer to sizeof(int32_t)
+   BEFORE the length): for the submessage/whole-RTPS brackets the common_mac already lands 4-aligned (the
+   bracket framing is 4-padded) so the pad is empty, but for a bare serialized-payload SecuredPayload whose
+   ciphertext length is not a multiple of 4 the pad is 1..3 octets — omitting it desynchronizes a conformant
+   peer's tag read ('Error in fastcdr trying to deserialize SecureDataTag length'). The count is BIG-ENDIAN
+   (§9.5.3.3.3; via %put-u32-be, independent of cursor endianness, Fast-DDS/Cyclone-aligned); the key_id/mac
+   fields are opaque octet arrays. RECEIVER-MACS is a list of (key_id . mac) conses (each key_id 4 octets,
+   each mac 16 octets, caller precondition); an empty list writes count 0 (the Slice-1 serialized-payload
+   tag). COMMON-MAC must be 16 octets. Advances CURSOR by 16 + pad + 4 + 20*count."
+  (let ((start (dds.core.buffer:cursor-position cursor))
+        (count (length receiver-macs)))
     (dds.core.buffer:put-octets cursor common-mac 0 +common-mac-len+)
+    (dds.core.buffer:align cursor 4)   ; §9.5.3.3.3 SecureDataTag: rsm_count is 4-aligned vs the bracket start
     (%put-u32-be cursor count)
     (dolist (entry receiver-macs)
       (dds.core.buffer:put-octets cursor (car entry) 0 +transformation-key-id-len+)
       (dds.core.buffer:put-octets cursor (cdr entry) 0 +common-mac-len+))
-    (+ +common-mac-len+ +receiver-specific-macs-count-len+
-       (* count (+ +transformation-key-id-len+ +common-mac-len+)))))
+    (- (dds.core.buffer:cursor-position cursor) start)))
 
 (defun* parse-crypto-footer (cursor)
     (function (dds.core.buffer:cursor)
               (values (or (simple-array (unsigned-byte 8) (*)) null) list))
   "Parse a §7.3.7 CryptoFooter at CURSOR; return (values COMMON-MAC RECEIVER-MACS) — COMMON-MAC a
    16-octet vector and RECEIVER-MACS a list of (key_id . mac) conses (each in wire order, possibly
-   empty) — or NIL (first value) on any shortfall. The receiver_specific_macs_count is read BIG-ENDIAN
-   (§9.5.3.3.3; via %get-u32-be, independent of cursor endianness, Fast-DDS/Cyclone-aligned), then
+   empty) — or NIL (first value) on any shortfall. The §9.5.3.3.3 4-byte alignment pad after the common_mac
+   (vs the bracket start; serialize-crypto-footer) is skipped before the count. The receiver_specific_macs_count
+   is read BIG-ENDIAN (§9.5.3.3.3; via %get-u32-be, independent of cursor endianness, Fast-DDS/Cyclone-aligned), then
    REJECTED (-> NIL) if it exceeds +max-receiver-specific-macs+ BEFORE any per-entry allocation, and
    the full entry extent is check-room'd before reading; a truncated or hostile footer yields NIL,
    never an OOB read or an unbounded allocation (NFR-SEC-POSTURE), even at (safety 0). A valid empty
@@ -205,6 +213,8 @@
         (dds.core.buffer:check-room cursor +common-mac-len+)
         (let ((common-mac (make-array +common-mac-len+ :element-type '(unsigned-byte 8))))
           (dds.core.buffer:get-octets cursor common-mac 0 +common-mac-len+)
+          ;; skip the §9.5.3.3.3 rsm_count 4-align pad — on RX align zero-fills these 1-3 pad octets in the buffer (harmless: consumed, never in the AEAD AAD; Fast DDS deserialize_SecureDataTag)
+          (dds.core.buffer:align cursor 4)
           (dds.core.buffer:check-room cursor +receiver-specific-macs-count-len+)
           (let ((count (%get-u32-be cursor)))
             (when (> count +max-receiver-specific-macs+)

@@ -1,52 +1,33 @@
+[37;1m2026-06-29 13:27:32.630 [33;1m[[37;1mTRANSPORT_UDPV4[33;1m Warning] [37mSupport for interfaceWhiteList will be removed in a future release. Please use interface allowlist/blocklist instead.[34;1m -> Function [36mUDPv4Transport[m
 Publisher running. Please press Ctrl+C to stop the Publisher at any time.
-Publisher matched.
-Message: 'Hello world' with index: '1' SENT
-Message: 'Hello world' with index: '2' SENT
-Message: 'Hello world' with index: '3' SENT
-Message: 'Hello world' with index: '4' SENT
-Message: 'Hello world' with index: '5' SENT
-Message: 'Hello world' with index: '6' SENT
-Message: 'Hello world' with index: '7' SENT
-Message: 'Hello world' with index: '8' SENT
-Message: 'Hello world' with index: '9' SENT
-Message: 'Hello world' with index: '10' SENT
-Message: 'Hello world' with index: '11' SENT
-Message: 'Hello world' with index: '12' SENT
-Message: 'Hello world' with index: '13' SENT
-Message: 'Hello world' with index: '14' SENT
-Message: 'Hello world' with index: '15' SENT
-Message: 'Hello world' with index: '16' SENT
-Message: 'Hello world' with index: '17' SENT
-Message: 'Hello world' with index: '18' SENT
-Message: 'Hello world' with index: '19' SENT
-Message: 'Hello world' with index: '20' SENT
-Message: 'Hello world' with index: '21' SENT
-Message: 'Hello world' with index: '22' SENT
-Message: 'Hello world' with index: '23' SENT
-Message: 'Hello world' with index: '24' SENT
-Message: 'Hello world' with index: '25' SENT
-Message: 'Hello world' with index: '26' SENT
-Message: 'Hello world' with index: '27' SENT
-Message: 'Hello world' with index: '28' SENT
-Message: 'Hello world' with index: '29' SENT
-Message: 'Hello world' with index: '30' SENT
-Message: 'Hello world' with index: '31' SENT
-Message: 'Hello world' with index: '32' SENT
-Message: 'Hello world' with index: '33' SENT
-Message: 'Hello world' with index: '34' SENT
-Message: 'Hello world' with index: '35' SENT
-Message: 'Hello world' with index: '36' SENT
-Message: 'Hello world' with index: '37' SENT
-Message: 'Hello world' with index: '38' SENT
-Message: 'Hello world' with index: '39' SENT
-Message: 'Hello world' with index: '40' SENT
-Message: 'Hello world' with index: '41' SENT
-Message: 'Hello world' with index: '42' SENT
-Message: 'Hello world' with index: '43' SENT
-Message: 'Hello world' with index: '44' SENT
-Message: 'Hello world' with index: '45' SENT
-Message: 'Hello world' with index: '46' SENT
-Message: 'Hello world' with index: '47' SENT
-Message: 'Hello world' with index: '48' SENT
+[37;1m2026-06-29 13:27:36.573 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:37.077 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:37.578 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:38.079 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:38.584 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:39.086 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:39.591 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:40.096 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:40.602 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:41.106 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:41.612 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:42.114 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:42.619 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:43.124 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:43.629 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:44.132 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:44.638 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:45.140 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:45.644 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:46.148 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:46.654 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:47.162 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:47.664 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:48.167 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:48.672 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:49.178 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:49.683 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:50.188 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
+[37;1m2026-06-29 13:27:50.693 [33;1m[[37;1mRTPS_WRITER[33;1m Warning] [37mAttempting to add existing reader, updating information.[34;1m -> Function [36moperator()[m
 
 SIGTERM received, stopping Publisher execution.

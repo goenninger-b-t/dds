@@ -25,27 +25,32 @@
                           (parse-integer tok :start (1+ c) :junk-allowed t))
                     out))))))))
 
-(defun* %hello-world-xcdr2 (index message)
-    (function ((unsigned-byte 32) string) (simple-array (unsigned-byte 8) (*)))
-  "Serialize Fast DDS's example type @extensibility(APPENDABLE) struct HelloWorld { unsigned long index;
-   string message; } as an XCDR2 DELIMITED_CDR SerializedPayload (XTypes 1.3 §7.4.3.4 / RTPS 2.5 §10):
-   encapsulation header D_CDR2_LE {00 09 00 00} ‖ DHEADER(uint32 LE = body length) ‖ index(uint32 LE) ‖
-   string(uint32 LE length-incl-NUL ‖ chars ‖ NUL). The APPENDABLE DHEADER is what a Fast DDS reader
-   strips before deserializing the members."
+(defun* %hello-world-payload (index message rep)
+    (function ((unsigned-byte 32) string (member :xcdr1 :xcdr2))
+              (simple-array (unsigned-byte 8) (*)))
+  "Serialize Fast DDS's example @extensibility(APPENDABLE) struct HelloWorld { unsigned long index; string
+   message; } as a SerializedPayload in REP (XTypes 1.3 §7.4.3.4, §7.6.3.1.2 Table 60). :xcdr2 -> D_CDR2_LE
+   encapsulation {00 09 00 00} ‖ DHEADER(uint32 LE = body length) ‖ members; :xcdr1 -> PLAIN_CDR_LE {00 01 00 00}
+   ‖ members, with NO DHEADER (XCDR1 carries no APPENDABLE delimiter). Members = index(uint32 LE) ‖ string(uint32
+   LE length-incl-NUL ‖ chars ‖ NUL). A Fast DDS DataReader at the example default DataReaderQos offers only XCDR1
+   (an empty DATA_REPRESENTATION sequence = XCDR_DATA_REPRESENTATION, EDP::checkDataRepresentationQos), so it
+   QoS-matches + decodes the :xcdr1 form; an XCDR2-only writer is data-representation-incompatible with it (the
+   XTypes 1.3 Table 7.57 W=XCDR2/R=XCDR1 = false rule — the live ours2fast 'Incompatible Data Representation QoS')."
   (let* ((mbytes (map '(simple-array (unsigned-byte 8) (*)) #'char-code message))
          (slen   (1+ (length mbytes)))                 ; CDR string length includes the NUL
-         (body-len (+ 4 4 slen))                       ; index(4) + strlen(4) + chars+NUL
-         (out (make-array (+ 4 4 body-len) :element-type '(unsigned-byte 8) :initial-element 0))
-         (i 0))
+         (xcdr2  (eq rep :xcdr2))
+         (dhdr   (if xcdr2 4 0))                        ; XCDR2 APPENDABLE DHEADER; XCDR1 has none
+         (body-len (+ 4 4 slen))                        ; index(4) + strlen(4) + chars+NUL
+         (out (make-array (+ 4 dhdr body-len) :element-type '(unsigned-byte 8) :initial-element 0))
+         (i 4))
     (flet ((u32 (v) (setf (aref out i) (ldb (byte 8 0) v) (aref out (+ i 1)) (ldb (byte 8 8) v)
                           (aref out (+ i 2)) (ldb (byte 8 16) v) (aref out (+ i 3)) (ldb (byte 8 24) v))
              (incf i 4)))
-      (setf (aref out 0) #x00 (aref out 1) #x09 (aref out 2) #x00 (aref out 3) #x00) ; D_CDR2_LE encap
-      (setf i 4)
-      (u32 body-len)                                   ; DHEADER
-      (u32 index)                                      ; index
-      (u32 slen)                                       ; string length (incl NUL)
-      (replace out mbytes :start1 i) (incf i (length mbytes)) ; chars (NUL already 0)
+      (setf (aref out 1) (if xcdr2 #x09 #x01))          ; D_CDR2_LE (XCDR2) / PLAIN_CDR_LE (XCDR1) encap id
+      (when xcdr2 (u32 body-len))                       ; DHEADER — XCDR2 only
+      (u32 index)                                       ; index
+      (u32 slen)                                        ; string length (incl NUL)
+      (replace out mbytes :start1 i)                    ; chars (trailing NUL already 0)
       out)))
 
 (defun* %remote-states (p)
@@ -116,13 +121,26 @@
                          (pubp (string-equal role "pub")))
                     (if pubp
                         (progn
-                          (dds.disc:add-local-writer node :topic topic :type type
-                                                     :qos (dds.qos:make-writer-qos :reliability :reliable))
+                          ;; Fast DDS's example HelloWorld is NO_KEY (no @key member); declare our interop
+                          ;; endpoint NO_KEY too (RTPS 2.5 §9.3.1.2 Table 9.1 writer 0x03 / reader 0x04) so the
+                          ;; user match is not QoS-rejected on keyed-ness (Fast DDS valid_matching INCOMPATIBLE
+                          ;; QOS keyed:0 vs keyed:1) — the peer's key-ness is the oracle, not a fixed WITH_KEY.
+                          ;; Offer XCDR1 (PLAIN_CDR): Fast DDS's example HelloWorld reader uses the default
+                          ;; DataReaderQos = empty DATA_REPRESENTATION = XCDR1, so an XCDR2 writer is QoS-
+                          ;; incompatible (XTypes 1.3 Table 7.57) and Fast DDS REJECTS the match before any crypto.
+                          (dds.disc:add-local-writer node :topic topic :type type :keyed nil
+                                                     :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                                   :data-representation '(:xcdr1)))
                           (dds.disc:enable-publisher node :history-kind :keep-all))
                         (progn
-                          (dds.disc:add-local-reader node :topic topic :type type
+                          (dds.disc:add-local-reader node :topic topic :type type :keyed nil
                                                      :qos (dds.qos:make-reader-qos :reliability :reliable))
                           (dds.disc:enable-subscriber node)))
+                    ;; Slice 5: honor the user topic's metadata_protection_kind on the user-DATA submessage tier.
+                    ;; The harness builds the endpoint via add-local-{writer,reader} (to force NO_KEY for the Fast
+                    ;; DDS HelloWorld match), bypassing create-data{writer,reader}, so set the kind here (the SAME
+                    ;; %set-user-metadata-protection the dcps entity path calls — DRY) from the participant governance.
+                    (dds.dcps::%set-user-metadata-protection node (dds.dcps::dp-access-state p) topic)
                     (format t "~&[~a] secure participant up: domain=~d topic=~a type=~a guid-prefix=~{~2,'0x~} port=~d peers=~a~%"
                             role domain topic type (coerce (dds.disc:disc-node-guid-prefix node) 'list)
                             (dds.disc:disc-node-port node) peers)
@@ -134,7 +152,7 @@
                         (dds.dcps:spin p)
                         (when (and pubp (< sent samples)
                                    (plusp (dds.disc:disc-node-matched-count node)))
-                          (dds.disc:publish-sample node (%hello-world-xcdr2 sent "Hello world from Lisp"))
+                          (dds.disc:publish-sample node (%hello-world-payload sent "Hello world from Lisp" :xcdr1))
                           (incf sent)
                           (format t "~&[pub] SENT HelloWorld index=~d~%" sent) (finish-output))
                         (let ((m (dds.disc:disc-node-matched-count node))

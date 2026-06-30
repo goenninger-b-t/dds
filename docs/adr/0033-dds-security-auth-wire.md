@@ -92,12 +92,28 @@ CDR-LE `DataHolder` octets:
 class_id:          u32-LE(strlen+1) | ascii | NUL | pad-to-4
 PropertySeq:       u32-LE(0)             -- always count=0 for HST; present per §9.3.4
 BinaryPropertySeq: u32-LE(count) | BinaryProperty*
-  BinaryProperty:  name(CDR-LE string) | value(u32-LE(len) | bytes) | propagate(1B) | 3-pad
+  BinaryProperty:  name(CDR-LE string) | value(u32-LE(len) | bytes)   -- name+value ONLY (no propagate)
 ```
 
 `PropertySeq` emits count=0 (empty), not an absent field — the XCDR1 `@optional`
 encoding is count=0, not a 0-byte sequence (pinned from T0 spike §10.5 via Fast DDS
 `CDRMessage::addParticipantGenericMessage`; HIGH confidence).
+
+**Amendment (WP-DDS-SECURITY-FASTDDS-INTEROP T1, 2026-06-28):** the `Property`/`BinaryProperty`
+serialization carries **`name`+`value` only — the `propagate` byte is NEVER on the wire.**  `propagate`
+is a LOCAL include/exclude filter (DDS-Security 1.1 §7.2.2 / `dds_security_plugins_spis.idl`): a
+`propagate=false` property is OMITTED from the serialized sequence entirely, and the serialized count =
+the number of `propagate==true` properties.  The earlier diagram's trailing `propagate(1B) | 3-pad` was a
+non-conformant divergence that misaligned every cross-vendor DataHolder/token (Fast DDS
+`CDRMessage.cpp:828-906` serializes no such byte) — so the §8.7 handshake was REJECTED at the remote
+IdentityToken (ADR 0036 Carry 1).  The fix drops it at all 3 codec sites (`wire.lisp` LE BinaryProperty,
+`identity.lisp` LE Property, `handshake.lisp` BE BinaryProperty for the hash/Sign inputs — the BE hash is
+already correct-endian in both ours and Fast DDS, so only the byte drops).  **Decode is conformant-only
+(NO tolerance):** a trailing `01 00 00 00` is indistinguishable from a following name-length/count, so
+backtracking over network data would be a fail-closed violation; the decoder parses `name`+`value` only and
+fails closed on malformed input.  T0 spike pinned the form (4-way corroborated + reviewer-verified on-host).
+This supersedes ADR 0036 §10 Carry-1's earlier "decode-tolerate both forms" note.  The IdentityToken
+regression vector shrank 240 → 224 octets accordingly.
 
 **`dataholder->handshake-token (octets)`** — the inverse: bounds-checks every length
 field (caps: seq-count ≤ 65536; string len ≤ 65536; value len ≤ 0x1000000); returns NIL

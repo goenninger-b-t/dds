@@ -1,0 +1,190 @@
+[37;1m2026-06-30 01:44:57.276 [33;1m[[37;1mTRANSPORT_UDPV4[33;1m Warning] [37mSupport for interfaceWhiteList will be removed in a future release. Please use interface allowlist/blocklist instead.[34;1m -> Function [36mUDPv4Transport[m
+Publisher running. Please press Ctrl+C to stop the Publisher at any time.
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.291 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.292 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.293 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mNo key material yet[34;1m -> Function [36mlookup_reader[m
+[37;1m2026-06-30 01:45:00.792 [33;1m[[37;1mSECURITY_CRYPTO[33;1m Warning] [37mCould not find key material[34;1m -> Function [36mdecode_datareader_submessage[m
+[37;1m2026-06-30 01:45:00.792 [33;1m[[37;1mSECURITY[33;1m Warning] [37mCannot decode reader RTPS submessage ()[34;1m -> Function [36mdecode_rtps_submessage[m
+Publisher matched.
+Message: 'Hello world' with index: '1' SENT
+Message: 'Hello world' with index: '2' SENT
+Message: 'Hello world' with index: '3' SENT
+Message: 'Hello world' with index: '4' SENT
+Message: 'Hello world' with index: '5' SENT
+Message: 'Hello world' with index: '6' SENT
+Message: 'Hello world' with index: '7' SENT
+Message: 'Hello world' with index: '8' SENT
+Message: 'Hello world' with index: '9' SENT
+Message: 'Hello world' with index: '10' SENT
+Message: 'Hello world' with index: '11' SENT
+Message: 'Hello world' with index: '12' SENT
+Message: 'Hello world' with index: '13' SENT
+Message: 'Hello world' with index: '14' SENT
+Message: 'Hello world' with index: '15' SENT
+Message: 'Hello world' with index: '16' SENT
+Message: 'Hello world' with index: '17' SENT
+Message: 'Hello world' with index: '18' SENT
+Message: 'Hello world' with index: '19' SENT
+Message: 'Hello world' with index: '20' SENT
+Message: 'Hello world' with index: '21' SENT
+Message: 'Hello world' with index: '22' SENT
+Message: 'Hello world' with index: '23' SENT
+Message: 'Hello world' with index: '24' SENT
+Message: 'Hello world' with index: '25' SENT
+Message: 'Hello world' with index: '26' SENT
+Message: 'Hello world' with index: '27' SENT
+Message: 'Hello world' with index: '28' SENT
+Message: 'Hello world' with index: '29' SENT
+Message: 'Hello world' with index: '30' SENT
+Message: 'Hello world' with index: '31' SENT
+Message: 'Hello world' with index: '32' SENT
+Message: 'Hello world' with index: '33' SENT
+Message: 'Hello world' with index: '34' SENT
+Message: 'Hello world' with index: '35' SENT
+Message: 'Hello world' with index: '36' SENT
+Message: 'Hello world' with index: '37' SENT
+Message: 'Hello world' with index: '38' SENT
+Message: 'Hello world' with index: '39' SENT
+Message: 'Hello world' with index: '40' SENT
+Message: 'Hello world' with index: '41' SENT
+Message: 'Hello world' with index: '42' SENT
+Message: 'Hello world' with index: '43' SENT
+Message: 'Hello world' with index: '44' SENT
+Message: 'Hello world' with index: '45' SENT
+Message: 'Hello world' with index: '46' SENT
+Message: 'Hello world' with index: '47' SENT
+Message: 'Hello world' with index: '48' SENT
+Message: 'Hello world' with index: '49' SENT
+Message: 'Hello world' with index: '50' SENT
+Message: 'Hello world' with index: '51' SENT
+Message: 'Hello world' with index: '52' SENT
+Message: 'Hello world' with index: '53' SENT
+Message: 'Hello world' with index: '54' SENT
+Message: 'Hello world' with index: '55' SENT
+Message: 'Hello world' with index: '56' SENT
+Message: 'Hello world' with index: '57' SENT
+Message: 'Hello world' with index: '58' SENT
+Message: 'Hello world' with index: '59' SENT
+Message: 'Hello world' with index: '60' SENT
+Message: 'Hello world' with index: '61' SENT
+Message: 'Hello world' with index: '62' SENT
+Message: 'Hello world' with index: '63' SENT
+Message: 'Hello world' with index: '64' SENT
+Message: 'Hello world' with index: '65' SENT
+Message: 'Hello world' with index: '66' SENT
+Message: 'Hello world' with index: '67' SENT
+Message: 'Hello world' with index: '68' SENT
+Message: 'Hello world' with index: '69' SENT
+Message: 'Hello world' with index: '70' SENT
+Message: 'Hello world' with index: '71' SENT
+Message: 'Hello world' with index: '72' SENT
+Message: 'Hello world' with index: '73' SENT
+Message: 'Hello world' with index: '74' SENT
+Message: 'Hello world' with index: '75' SENT
+Message: 'Hello world' with index: '76' SENT
+Message: 'Hello world' with index: '77' SENT
+Message: 'Hello world' with index: '78' SENT
+Message: 'Hello world' with index: '79' SENT
+Message: 'Hello world' with index: '80' SENT
+Message: 'Hello world' with index: '81' SENT
+Message: 'Hello world' with index: '82' SENT
+Message: 'Hello world' with index: '83' SENT
+Message: 'Hello world' with index: '84' SENT
+Message: 'Hello world' with index: '85' SENT
+Message: 'Hello world' with index: '86' SENT
+Message: 'Hello world' with index: '87' SENT
+Message: 'Hello world' with index: '88' SENT
+Message: 'Hello world' with index: '89' SENT
+Message: 'Hello world' with index: '90' SENT
+
+SIGTERM received, stopping Publisher execution.

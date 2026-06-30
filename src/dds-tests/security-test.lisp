@@ -131,6 +131,78 @@
 
   t)
 
+(defun* run-security-secured-payload-pad-corpus-test ()
+    (function () t)
+  "DDS-Security §9.5.3.3.3 SecureDataTag 4-byte alignment — the NON-4-aligned-ciphertext SecuredPayload
+   byte-exact golden (WP-DDS-SECURITY-FASTDDS-INTEROP Slice-5 cross-vendor reconcile; ADR 0037 + the
+   ADR 0031 SecureDataTag-align addendum). Fast DDS serialize_SecureDataTag 4-aligns the
+   receiver_specific_macs_count to the SecuredPayload start, so the pad after common_mac = (-N) mod 4 octets;
+   omitting it makes a conformant peer's decode_serialized_payload mis-read the tag length. This regression-proofs
+   the pad PLACEMENT (the exact zero octets between common_mac and rsm_count) OFFLINE — no live peer and no
+   OpenSSL, because serialize/parse-secured-payload are pure byte layout. Deterministic: kind/key_id from
+   make-test-key-material, fixed session_id/iv/ct/tag.
+   (a) N=18 (pad=2): byte-exact vs the reference vector incl. the 2 zero pad octets, then round-trip.
+   (b) N in {17,18,19}: the pad = (-N) mod 4 is all-zero, rsm_count lands 4-aligned, and it round-trips.
+   (c) N=4 (already 4-aligned): pad=0, total 48 — byte-identical to the shipped corpus (the no-pad guard).
+   Both SBCL and Clasp must pass identically."
+  ;; (a) N=18 ciphertext (NOT a multiple of 4) -> pad = (-18) mod 4 = 2 zero octets between common_mac and rsm_count.
+  (let* ((km         (dds.security:make-test-key-material))
+         (kind       (dds.security:key-material-transformation-kind km)) ; #(0 0 0 4) AES256-GCM
+         (key-id     (dds.security:key-material-sender-key-id km))       ; #(de ad be ef)
+         (session-id (%hex-octets "01000000"))
+         (iv-suffix  (%hex-octets "1122334455667788"))
+         (ct18       (%hex-octets "000102030405060708090a0b0c0d0e0f1011")) ; 18 octets
+         (tag        (%hex-octets "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"))
+         (expected   (%hex-octets
+                      (concatenate 'string
+                       "00000004" "deadbeef" "01000000" "1122334455667788" ; SecureDataHeader(20)
+                       "00000012"                                          ; crypto_content.length=18 BE
+                       "000102030405060708090a0b0c0d0e0f1011"              ; ciphertext(18)
+                       "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"                  ; common_mac(16)
+                       "0000"                                              ; SecureDataTag 4-align pad = 2 zero octets
+                       "00000000")))                                       ; rsm_count=0 BE, 4-aligned
+         (got        (dds.security:serialize-secured-payload kind key-id session-id iv-suffix ct18 tag)))
+    (%check :pad-secured-payload-len (= (length got) 64)
+            (format nil "non-4-aligned (N=18) SecuredPayload must be 64 octets; got ~d" (length got)))
+    (%check :pad-secured-payload-byte-exact (equalp got expected)
+            (format nil "padded SecuredPayload byte mismatch;~% got ~{~2,'0x~^ ~}" (coerce got 'list)))
+    ;; the pad sits at offsets 58,59 (immediately after the 16-octet common_mac) and MUST be zero.
+    (%check :pad-secured-payload-pad-zero (and (zerop (aref got 58)) (zerop (aref got 59)))
+            "the SecureDataTag 4-align pad octets (58,59) must be zero")
+    (multiple-value-bind (p-kind p-key-id p-sid p-iv p-ct p-tag)
+        (dds.security:parse-secured-payload got)
+      (declare (ignore p-kind p-key-id p-sid p-iv))
+      (%check :pad-secured-payload-rt-ct  (equalp p-ct ct18) "padded SecuredPayload: ciphertext round-trip past the pad")
+      (%check :pad-secured-payload-rt-tag (equalp p-tag tag) "padded SecuredPayload: common_mac round-trip past the pad")))
+  ;; (b) every non-zero residue class: pad = (-N) mod 4 octets, all-zero, rsm_count 4-aligned, round-trips.
+  (let ((kind (%hex-octets "00000004")) (key-id (%hex-octets "deadbeef"))
+        (session-id (%hex-octets "01000000")) (iv-suffix (%hex-octets "1122334455667788"))
+        (tag (%hex-octets "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf")))
+    (dolist (n '(17 18 19))
+      (let* ((ct      (let ((a (make-array n :element-type '(unsigned-byte 8))))
+                        (dotimes (i n) (setf (aref a i) (logand i #xff))) a))
+             (pad     (mod (- n) 4))
+             (pad-off (+ 20 4 n 16))                                    ; header+ct_len+ct+common_mac
+             (blob    (dds.security:serialize-secured-payload kind key-id session-id iv-suffix ct tag)))
+        (%check :pad-residue-len (= (length blob) (+ 20 4 n 16 pad 4))
+                (format nil "N=~d SecuredPayload length must be ~d; got ~d" n (+ 20 4 n 16 pad 4) (length blob)))
+        (%check :pad-residue-zero (every #'zerop (subseq blob pad-off (+ pad-off pad)))
+                (format nil "N=~d the ~d pad octet(s) after common_mac must be zero" n pad))
+        (%check :pad-residue-rsm-aligned (zerop (mod (+ pad-off pad) 4))
+                (format nil "N=~d receiver_specific_macs_count must start 4-aligned (offset ~d)" n (+ pad-off pad)))
+        (multiple-value-bind (k ki s iv c tg) (dds.security:parse-secured-payload blob)
+          (declare (ignore k ki s iv))
+          (%check :pad-residue-rt (and (equalp c ct) (equalp tg tag))
+                  (format nil "N=~d padded SecuredPayload must round-trip past the pad" n))))))
+  ;; (c) no-pad guard: a 4-aligned ciphertext (N=4) emits NO pad -> 48 octets, byte-identical to the shipped corpus.
+  (let* ((kind (%hex-octets "00000004")) (key-id (%hex-octets "deadbeef"))
+         (session-id (%hex-octets "01000000")) (iv-suffix (%hex-octets "1122334455667788"))
+         (ct (%hex-octets "deadbeef")) (tag (%hex-octets "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"))
+         (blob (dds.security:serialize-secured-payload kind key-id session-id iv-suffix ct tag)))
+    (%check :pad-aligned-no-pad (= (length blob) 48)
+            (format nil "a 4-aligned (N=4) SecuredPayload must stay 48 octets (pad=0); got ~d" (length blob))))
+  t)
+
 (defun* run-security-payload-roundtrip-test ()
     (function () t)
   "DDS-Security §9.5.3.3 encode/decode-serialized-payload: round-trip, tamper-fails-closed,
@@ -138,10 +210,19 @@
    (a) Round-trip: decode(km, encode(km, PT)) = PT byte-exact.
    (b) Tamper ciphertext: flip one CT byte -> decode returns NIL (AES-GCM auth failure, fail-closed).
    (c) Tamper tag: flip one tag byte -> decode returns NIL (AES-GCM auth failure, fail-closed).
-   (d) Tamper header: flip one byte in SecureDataHeader (bytes 0-7) -> NIL (AAD from wire; §9.5.3.3.4.5).
+   (d) Tamper transformation_kind (byte 3) -> NIL (find_key kind mismatch; empty-AAD, §9.5.3.3.4.5).
    (e) Garbage blob: short or all-zero blobs -> decode returns NIL (not a crash).
    (f) Nonce-distinct: two consecutive encodes of the same plaintext produce DIFFERENT iv_suffix
        values in the SecureDataHeader — proving the monotonic counter advances (nonce uniqueness).
+   (g) Tamper transformation_key_id (a byte in 4..7) -> NIL (find_key key_id mismatch — the empty-AAD
+       header-integrity gate for key_id, the same mechanism as (d)'s kind).
+   (h) Tamper session_id (a byte in 8..11) -> NIL: session_id derives BOTH the session key (§9.5.3.3.4.2)
+       AND the nonce (§9.5.3.3.4.3), so the GCM tag fails to verify (fail-closed).
+   (i) Tamper init_vector_suffix (a byte in 12..19) -> NIL: it forms the GCM nonce with session_id, so a
+       flip changes the nonce and the GCM tag fails to verify (fail-closed).
+   (g)/(h)/(i) close the empty-AAD directed-tamper coverage gap (T10 review fix-3): with AAD now EMPTY, each
+   SecureDataHeader field's integrity binding (find_key for kind/key_id; the KDF+nonce for session_id/iv_suffix)
+   is exercised by a directed byte flip, not left analytical.
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
   (handler-case (dds.dare:dare-available-p)
     (dds.dare:dare-unavailable (c)
@@ -183,14 +264,15 @@
               (null (dds.security:decode-serialized-payload km bad))
               "1-byte tag tamper must return NIL (AES-GCM fail-closed)"))
 
-    ;; (d) tamper header: flip one byte in bytes 0..7 (transformation_kind or transformation_key_id).
-    ;;   AAD = received SecureDataHeader (§9.5.3.3.4.5); any header bit-flip changes the AAD -> NIL.
+    ;; (d) tamper header transformation_kind (bytes 0..3): the AAD is now EMPTY (Fast-DDS-faithful,
+    ;;   T10-INTEROP-RECONCILE), so kind/key_id integrity is the decode find_key check — the WIRE kind/key_id
+    ;;   must match the KM (Fast DDS AESGCMGMAC_Transform::find_key) — and a kind bit-flip is rejected there.
     (let* ((blob (dds.security:encode-serialized-payload km pt))
            (bad  (copy-seq blob)))
       (setf (aref bad 3) (logxor (aref bad 3) #x01))   ; flip bit in transformation_kind
       (%check :tamper-header-nil
               (null (dds.security:decode-serialized-payload km bad))
-              "1-byte SecureDataHeader tamper (bytes 0-7) must return NIL (AAD from wire; §9.5.3.3.4.5)"))
+              "1-byte transformation_kind tamper must return NIL (find_key kind mismatch; §9.5.3.3.4.5)"))
 
     ;; (e) garbage / short blobs -> NIL (not a crash, not a signal to the caller).
     (dolist (garbage (list
@@ -213,7 +295,34 @@
           (%check :nonce-distinct
                   (not (equalp iv1 iv2))
                   (format nil "two consecutive encodes must produce different iv_suffix values; both got ~{~2,'0x~^ ~}"
-                          (coerce iv1 'list)))))))
+                          (coerce iv1 'list))))))
+
+    ;; (g) tamper transformation_key_id (bytes 4..7): with empty AAD, key_id integrity is the decode find_key
+    ;;     check (the WIRE key_id must equal the KM's), so a key_id bit-flip -> NIL (same gate as kind, byte 4).
+    (let* ((blob (dds.security:encode-serialized-payload km pt))
+           (bad  (copy-seq blob)))
+      (setf (aref bad 4) (logxor (aref bad 4) #x01))   ; flip bit in transformation_key_id
+      (%check :tamper-key-id-nil
+              (null (dds.security:decode-serialized-payload km bad))
+              "1-byte transformation_key_id tamper must return NIL (find_key key_id mismatch; §9.5.3.3.4.5)"))
+
+    ;; (h) tamper session_id (bytes 8..11): session_id derives the session key AND the GCM nonce, so a flip
+    ;;     changes both -> AES-GCM auth fail -> NIL (fail-closed; not a find_key reject).
+    (let* ((blob (dds.security:encode-serialized-payload km pt))
+           (bad  (copy-seq blob)))
+      (setf (aref bad 8) (logxor (aref bad 8) #x01))   ; flip bit in session_id
+      (%check :tamper-session-id-nil
+              (null (dds.security:decode-serialized-payload km bad))
+              "1-byte session_id tamper must return NIL (session-key + nonce change -> GCM fail-closed)"))
+
+    ;; (i) tamper init_vector_suffix (bytes 12..19): it forms the GCM nonce with session_id, so a flip changes
+    ;;     the nonce -> AES-GCM auth fail -> NIL (fail-closed).
+    (let* ((blob (dds.security:encode-serialized-payload km pt))
+           (bad  (copy-seq blob)))
+      (setf (aref bad 12) (logxor (aref bad 12) #x01))   ; flip bit in init_vector_suffix
+      (%check :tamper-iv-suffix-nil
+              (null (dds.security:decode-serialized-payload km bad))
+              "1-byte init_vector_suffix tamper must return NIL (nonce change -> GCM fail-closed)")))
 
   t)
 

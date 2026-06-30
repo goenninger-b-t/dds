@@ -38,11 +38,16 @@
    Set by %install-crypto-manager; the :authenticated->:keyed promotion is mediated through it
    (the KEYX per-writer WRITER-KM-TABLE is RETIRED — the per-writer/entity KeyMaterial now lives
    in the crypto-manager EntityCrypto registries, exchanged over reliable PVMS, design §6.4/§7.2).
-   Typed T to avoid an auth-manager-state<->crypto-manager defstruct cycle (crypto-manager loads after)."
+   Typed T to avoid an auth-manager-state<->crypto-manager defstruct cycle (crypto-manager loads after).
+   PERM-CREDENTIAL: the local participant's signed Permissions document octets (the configured create-participant
+   :permissions, the S/MIME §9.4.1.1 form) emitted as the §9.3.2.1 handshake c.perm so a conformant peer's
+   validate_remote_permissions accepts us; empty (default) for an auth-only / no-AccessControl participant (T6)."
   (identity (error "auth-manager-state: :identity is required (the local identity-handle)")
             :type dds.security:identity-handle)
   (lock (dds.pal:make-lock "auth-manager") :type t)
-  (crypto-manager nil :type t))
+  (crypto-manager nil :type t)
+  (perm-credential (make-array 0 :element-type '(unsigned-byte 8))
+                   :type (simple-array (unsigned-byte 8) (*))))
 
 ;;; --- per-remote auth/key state (DISC-NODE-AUTH-STATE: 12-octet prefix -> AUTH-REMOTE) ---
 
@@ -61,6 +66,13 @@
    HANDLE: the in-flight handshake-handle (foreign DH/cert state; freed on teardown). At :authenticated it
                  carries the SharedSecret the crypto-manager derives the PVMS bootstrap KM from (T8).
    ROLE: :requester (local GUID < remote) or :replier (§8.7.2.4 ordering).
+   LAST-SENT: the last handshake token (internal octets) WE transmitted for this remote (the request
+                 for a requester, the reply for a replier). The §8.7 handshake rides the BEST-EFFORT
+                 ParticipantStatelessMessage, so it is RETRANSMITTED on SPDP re-announce until it is
+                 superseded: the requester re-sends its request while still :awaiting-reply (the replier
+                 may not have discovered us when the first request went out), and a replier re-sends this
+                 stored reply on a duplicate request rather than feeding the Req into the Final-expecting
+                 state machine (which would falsely reject). NIL until we send our first token.
    REMOTE-TOKEN: the remote IdentityToken octets (stashed at discovery so the replier can pick
                  the suite when the request arrives on the wire). SELF-ASSERTED — never the §8.4
                  authorization identity (a peer can claim any cert-sn here).
@@ -75,6 +87,7 @@
   (state        :none :type (member :none :handshaking :authenticated :keyed :rejected))
   (handle       nil :type (or null dds.security:handshake-handle))
   (role         :requester :type (member :requester :replier))
+  (last-sent    nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (remote-token nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (validated-subject nil :type (or null string))
   (suite        nil :type (or null dds.security:auth-suite)))
@@ -137,9 +150,10 @@
 
 ;;; --- PSM send helpers ---
 
-(defun* %am-send-handshake (node src-prefix dest-prefix token-octets)
+(defun* %am-send-handshake (node src-prefix dest-prefix token-octets &optional related-guid related-sn)
     (function (dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
-               (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t)
+               (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))
+               &optional (or null (simple-array (unsigned-byte 8) (16))) (or null integer)) t)
   "Wrap a handshake-token (TOKEN-OCTETS = the internal tagged format the handshake API emits)
    as a §7.4.4 ParticipantGenericMessage with message_class_id +AUTH-MESSAGE-CLASS-ID+ and send
    it over the §7.4.3 PSM stateless transport to DEST-PREFIX. The token is parsed back to a
@@ -154,11 +168,20 @@
              (env      (dds.security:make-generic-message
                         :source-guid           src-guid
                         :sequence-number       0
-                        :related-guid          zero
-                        :related-sn            0
+                        ;; §7.4.3 correlation: echo the INCOMING message_identity (RELATED-GUID . RELATED-SN)
+                        ;; into related_message_identity so the replier (Fast DDS) matches our Final to its Reply
+                        ;; (else SecurityManager.cpp:1554 treats it as a missed-reply and resends, never authorizing);
+                        ;; NIL -> GUID_unknown/0 = the first Request (which carries no related, §8.7.2.4).
+                        :related-guid          (or related-guid zero)
+                        :related-sn            (or related-sn 0)
                         :dest-participant-guid dst-guid
                         :dest-endpoint-guid    zero
-                        :source-endpoint-guid  src-guid
+                        ;; source_endpoint_key MUST be GUID_UNKNOWN for the participant-to-participant
+                        ;; auth handshake (§7.4.4): Fast DDS generate_authentication_message leaves it
+                        ;; unknown and its receiver DROPS a message whose source_endpoint_key != unknown
+                        ;; (SecurityManager process_participant_stateless_message). Was src-guid — a
+                        ;; cross-vendor divergence (our own receiver ignores the field, so our-to-our was blind to it).
+                        :source-endpoint-guid  zero
                         :message-class-id      dds.security:+auth-message-class-id+
                         :dataholders           (list dh))))
         (dds.disc:%send-stateless-message node dest-prefix env))))
@@ -259,32 +282,66 @@
   (let ((ms (dp-auth-state p)))
     (when (null ms) (return-from %am-on-participant-discovered t))
     (let ((ar (%am-validate-and-record ms node prefix spdp))
-          (req-octets nil) (req-handle nil) (do-send nil))
+          (req-octets nil) (req-handle nil) (do-send nil) (resend nil))
       (when (null ar) (return-from %am-on-participant-discovered t))
       (dds.pal:with-lock ((auth-manager-state-lock ms))
-        (when (and (eq (auth-remote-state ar) :none)
-                   (eq (auth-remote-role ar) :requester)
-                   (auth-remote-suite ar)
-                   (null (auth-remote-handle ar)))
-          (multiple-value-setq (req-octets req-handle)
-            (dds.security:begin-handshake-request
-             (auth-manager-state-identity ms) (auth-manager-state-identity ms)
-             (auth-remote-suite ar)))
-          (when req-handle
-            (setf (auth-remote-handle ar) req-handle
-                  (auth-remote-state ar) :handshaking
-                  do-send t))))
+        (cond
+          ;; first request: requester begins the §8.7.2.4 handshake
+          ((and (eq (auth-remote-state ar) :none)
+                (eq (auth-remote-role ar) :requester)
+                (auth-remote-suite ar)
+                (null (auth-remote-handle ar)))
+           (multiple-value-setq (req-octets req-handle)
+             (dds.security:begin-handshake-request
+              (auth-manager-state-identity ms) (auth-manager-state-identity ms)
+              (auth-remote-suite ar)
+              ;; §9.3.2.1 c.perm: our signed Permissions credential so the replier's validate_remote_permissions accepts us (T6)
+              (auth-manager-state-perm-credential ms)))
+           (when req-handle
+             (setf (auth-remote-handle ar) req-handle
+                   (auth-remote-state ar) :handshaking
+                   (auth-remote-last-sent ar) req-octets
+                   do-send t)))
+          ;; re-announce while still awaiting the reply: RETRANSMIT the request (best-effort PSM; the
+          ;; replier may not have discovered us when the first request went out — the role/ordering is
+          ;; cert-derived per §9.3.2.1, so the requester can be the later-joining peer)
+          ((and (eq (auth-remote-role ar) :requester)
+                (eq (auth-remote-state ar) :handshaking)
+                (auth-remote-handle ar)
+                (eq (dds.security:handshake-handle-state (auth-remote-handle ar)) :awaiting-reply)
+                (auth-remote-last-sent ar))
+           (setf req-octets (auth-remote-last-sent ar) do-send t resend t))))
       ;; send OUTSIDE the manager lock (PSM send takes the node lock internally)
       (when do-send
-        (%am-log prefix "requester: sent HandshakeRequest")
+        (unless resend (%am-log prefix "requester: sent HandshakeRequest"))
         (%am-send-handshake node (dds.disc:disc-node-guid-prefix node) prefix req-octets))))
   t)
 
 ;;; --- stateless-message hook: parse + dispatch by message_class_id ---
 
-(defun* %am-drive-handshake (ms node prefix ar token-octets)
+(defun* %am-token-class (token-octets)
+    (function ((simple-array (unsigned-byte 8) (*))) (or string null))
+  "Return the §9.3.2.1 handshake-token class_id string for TOKEN-OCTETS (internal tagged format),
+   or NIL on malformed input. Lets the manager recognise an OUT-OF-ROLE handshake message WITHOUT
+   driving the §8.7.2.4 state machine: a Req arriving at an already-replied replier (re-send the
+   stored reply), or a non-Reply arriving at a requester still awaiting the Reply (drop it — never
+   let a stray/duplicate/echoed token false-reject the handshake). Fail-closed: NIL on malformed."
+  (let ((tok (dds.security::%parse-token token-octets)))
+    (and tok (dds.security::handshake-token-class-id tok))))
+
+(defun* %am-token-is-request-p (token-octets)
+    (function ((simple-array (unsigned-byte 8) (*))) boolean)
+  "T iff TOKEN-OCTETS (internal handshake-token format) is a HandshakeRequestMessageToken
+   (§9.3.2.1). Used to recognise a RETRANSMITTED request arriving at an already-replied replier so
+   the manager re-sends its stored reply instead of feeding a Req into the Final-expecting state
+   machine (which would falsely reject the handshake). Fail-closed: NIL on any malformed input."
+  (let ((c (%am-token-class token-octets)))
+    (and c (string= c dds.security::+handshake-request-class-id+) t)))
+
+(defun* %am-drive-handshake (ms node prefix ar token-octets in-guid in-sn)
     (function (auth-manager-state dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
-               auth-remote (simple-array (unsigned-byte 8) (*)))
+               auth-remote (simple-array (unsigned-byte 8) (*))
+               (or null (simple-array (unsigned-byte 8) (16))) integer)
               t)
   "Drive the §8.7.2.4 handshake one step for AR given the incoming handshake token (internal
    tagged octets). Under the manager lock: a :replier with no in-flight handle does
@@ -293,8 +350,11 @@
    handshake token is sent over PSM, and the §8.5 crypto-token exchange (cm-on-authenticated: PVMS
    bootstrap-KM derive + token send over reliable PVMS) is driven, BOTH OUTSIDE the lock (never hold the
    lock across a network send — the type-gate discipline). Fail-closed: a nil/failed handshake step records
-   :rejected and installs no keys. Returns T (hook ignores it)."
-  (let ((next-octets nil) (do-cm nil))
+   :rejected and installs no keys. Returns T (hook ignores it).
+   IN-GUID is nullable (parse-generic-message returns NIL guid on error); IN-SN is non-null integer because
+   parse-generic-message always returns integer for the SN position (0 on error, never NIL) — the asymmetry
+   is intentional and mirrors the VALUES return type of parse-generic-message."
+  (let ((next-octets nil) (do-cm nil) (resend nil))
     (dds.pal:with-lock ((auth-manager-state-lock ms))
       (block in-lock
         (when (eq (auth-remote-state ar) :rejected)
@@ -307,34 +367,61 @@
                (multiple-value-bind (reply-octets reply-handle)
                    (dds.security:begin-handshake-reply
                     (auth-manager-state-identity ms) (auth-manager-state-identity ms)
-                    token-octets suite)
+                    token-octets suite
+                    ;; §9.3.2.1 c.perm: our signed Permissions credential so the requester's validate_remote_permissions accepts us (T6)
+                    (auth-manager-state-perm-credential ms))
                  (cond
                    ((and reply-octets reply-handle)
                     (setf (auth-remote-handle ar) reply-handle
                           (auth-remote-state ar) :handshaking
+                          (auth-remote-last-sent ar) reply-octets
                           next-octets reply-octets)
                     (%am-log prefix "replier: sent HandshakeReply"))
                    (t (setf (auth-remote-state ar) :rejected)
                       (%am-log prefix "replier: begin-handshake-reply failed -> reject")))))))
+          ;; replier, already replied: a RETRANSMITTED request -> re-send the stored reply (best-effort
+          ;; PSM retransmit). Never feed a Req into %process-final — it expects a Final and would reject.
+          ((and (eq (auth-remote-role ar) :replier)
+                (eq (auth-remote-state ar) :handshaking)
+                (auth-remote-handle ar)
+                (auth-remote-last-sent ar)
+                (%am-token-is-request-p token-octets))
+           (setf resend (auth-remote-last-sent ar)))
           ;; in-flight handshake: drive the next step
           ((auth-remote-handle ar)
-           (multiple-value-bind (out status)
-               (dds.security:process-handshake (auth-remote-handle ar) token-octets)
-             (case status
-               (:rejected
-                (setf (auth-remote-state ar) :rejected)
-                (%am-log prefix "handshake step rejected"))
-               ((:continue :authenticated)
-                (when out (setf next-octets out))
-                ;; :continue with our state :authenticated (requester after Reply) OR :authenticated
-                (when (eq (dds.security:handshake-handle-state (auth-remote-handle ar)) :authenticated)
-                  ;; authorize on the VALIDATED handshake-cert subject (unforgeable) + §8.7.2.5 token-vs-cert binding
-                  (if (%am-bind-and-check-subject ar prefix)
-                      (when (%am-mark-authenticated ar) (setf do-cm t))
-                      (setf (auth-remote-state ar) :rejected next-octets nil))))))))))
-    ;; send the produced handshake token OUTSIDE the manager lock
+           (let ((tclass (%am-token-class token-octets)))
+             ;; requester still awaiting the Reply: DROP any non-Reply token (a stray/duplicate/echoed
+             ;; Request or a misrouted message) WITHOUT driving the state machine. Feeding it to
+             ;; %process-reply would reject on the class_id mismatch and latch :rejected, which then
+             ;; IGNORES the genuine HandshakeReply when it arrives (§8.7.2.4: the requester processes
+             ;; ONLY the HandshakeReply). This is the requester-side analogue of the replier's
+             ;; duplicate-request guard above; it never false-rejects on an out-of-role token.
+             (if (and (eq (auth-remote-role ar) :requester)
+                      (eq (dds.security:handshake-handle-state (auth-remote-handle ar)) :awaiting-reply)
+                      (not (and tclass (string= tclass dds.security::+handshake-reply-class-id+))))
+                 (%am-log prefix (format nil "requester: dropped out-of-role token (class=~a; awaiting HandshakeReply)"
+                                         tclass))
+                 (multiple-value-bind (out status)
+                     (dds.security:process-handshake (auth-remote-handle ar) token-octets)
+                   (case status
+                     (:rejected
+                      (setf (auth-remote-state ar) :rejected)
+                      (%am-log prefix "handshake step rejected"))
+                     ((:continue :authenticated)
+                      (when out (setf next-octets out (auth-remote-last-sent ar) out))
+                      ;; :continue with our state :authenticated (requester after Reply) OR :authenticated
+                      (when (eq (dds.security:handshake-handle-state (auth-remote-handle ar)) :authenticated)
+                        ;; authorize on the VALIDATED handshake-cert subject (unforgeable) + §8.7.2.5 token-vs-cert binding
+                        (if (%am-bind-and-check-subject ar prefix)
+                            (when (%am-mark-authenticated ar) (setf do-cm t))
+                            (setf (auth-remote-state ar) :rejected next-octets nil))))))))))))
+    ;; send the produced handshake token OUTSIDE the manager lock; echo the incoming message_identity
+    ;; (IN-GUID . IN-SN) as related_message_identity so a replier peer correlates our Final to its Reply
     (when next-octets
-      (%am-send-handshake node (dds.disc:disc-node-guid-prefix node) prefix next-octets))
+      (%am-send-handshake node (dds.disc:disc-node-guid-prefix node) prefix next-octets in-guid in-sn))
+    ;; retransmit the stored reply for a duplicate request, OUTSIDE the lock (best-effort PSM)
+    (when resend
+      (%am-send-handshake node (dds.disc:disc-node-guid-prefix node) prefix resend in-guid in-sn))
     ;; drive the §8.5.2 crypto-token exchange over reliable PVMS OUTSIDE the lock (T8): derive+install the
     ;; §9.5.3.1 bootstrap KM, register local crypto, send our Participant + builtin/user EntityCrypto tokens.
     (when do-cm
@@ -363,7 +450,7 @@
       ;; parse the envelope (fail-closed: NIL source-guid on any malformed input, §7.4.4)
       (multiple-value-bind (src-guid sn rel-guid rel-sn dest-part dest-ep src-ep class-id dh-list)
           (dds.security:parse-generic-message envelope-octets)
-        (declare (ignore src-guid sn rel-guid rel-sn dest-part dest-ep src-ep))
+        (declare (ignore rel-guid rel-sn dest-part dest-ep src-ep))
         (when (null class-id) (return-from %am-on-psm t))
         ;; only the §8.7 handshake class rides PSM now (crypto tokens moved to PVMS, T8)
         (unless (string= class-id dds.security:+auth-message-class-id+) (return-from %am-on-psm t))
@@ -374,7 +461,7 @@
           (when (null dh-list) (return-from %am-on-psm t))
           (let ((tok (dds.security:dataholder->handshake-token (car dh-list))))
             (when (null tok) (return-from %am-on-psm t))
-            (%am-drive-handshake ms node src-prefix ar (dds.security::%serialize-token tok)))))))
+            (%am-drive-handshake ms node src-prefix ar (dds.security::%serialize-token tok) src-guid sn))))))
   t)
 
 ;; T8: the KEYX %am-install-crypto-resolver (CRYPTO-KEYS backed by WRITER-KM-TABLE encode + per-remote
@@ -415,17 +502,22 @@
 
 ;;; --- installer (mirror %INSTALL-TYPE-GATE) ---
 
-(defun* %install-auth-manager (p identity-handle)
-    (function (domain-participant dds.security:identity-handle) domain-participant)
+(defun* %install-auth-manager (p identity-handle &optional perm-octets)
+    (function (domain-participant dds.security:identity-handle
+               &optional (or null (simple-array (unsigned-byte 8) (*))))
+              domain-participant)
   "Create P's DDS-Security §8.7 auth-manager state (holding IDENTITY-HANDLE — the local identity
-   with the private key) and install its hooks on P's disc-node: ON-PARTICIPANT-DISCOVERED
+   with the private key, and PERM-OCTETS — the configured signed Permissions credential emitted as the
+   §9.3.2.1 handshake c.perm; NIL/absent = empty c.perm) and install its hooks on P's disc-node: ON-PARTICIPANT-DISCOVERED
    (the requester trigger / replier pre-stash), ON-STATELESS-MESSAGE (the raw-envelope §8.7 handshake
    dispatcher), and AUTH-GATE (the strict §7.3 endpoint-match verdict); plus the §8.5 crypto-manager +
    reliable PVMS endpoint with the crypto-token receiver hook (%install-crypto-manager, T8). Installed
    ONLY for a security-enabled participant (an identity configured); a participant with no
    identity keeps DP-AUTH-STATE NIL and the gate stays :compatible (byte-identical plain path).
    The disc-node must already advertise this identity's IdentityToken in SPDP. Returns P."
-  (let ((ms (%make-auth-manager-state :identity identity-handle)))
+  (let ((ms (%make-auth-manager-state
+             :identity identity-handle
+             :perm-credential (or perm-octets (make-array 0 :element-type '(unsigned-byte 8))))))
     (setf (dp-auth-state p) ms)
     (let ((node (dp-node p)))
       (setf (dds.disc:disc-node-on-participant-discovered node)

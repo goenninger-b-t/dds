@@ -28,6 +28,19 @@
    AESGCMGMAC_Types.h CRYPTO_TRANSFORMATION_KIND_AES256_GMAC { {0,0,0,3} }; see docs/provenance.md.
    The boundp-guard makes a reload a no-op so defconstant's same-value rule holds for the literal.")
 
+(defconstant +empty-octets+
+    (if (boundp '+empty-octets+)
+        (symbol-value '+empty-octets+)
+        (make-array 0 :element-type '(unsigned-byte 8)))
+  "A shared zero-length octet vector: the EMPTY AAD passed to %seal-with-km / %open-with-km across ALL the
+   §9.5.3.3 AES-GCM-GMAC protection tiers (serialized-payload, submessage, whole-RTPS) — Fast-DDS-faithful,
+   corroborated CLEAN-ROOM against eProsima Fast DDS (Apache-2.0) AESGCMGMAC_Transform.cpp serialize_SecureDataBody,
+   whose ENCRYPT branch encrypts the plaintext with NO prior EVP_EncryptUpdate AAD call (=> empty AAD) and is the
+   SAME function for the serialized-payload and submessage paths (see docs/provenance.md). Defined here (the first
+   dds-security file) so transform.lisp (payload tier) AND crypto/submessage.lisp (submessage tier) both reference
+   the one instance (DRY across the load order). Also the EMPTY plaintext (SIGN/GMAC) handed to the seal. Boundp-
+   guarded so a reload is a no-op (defconstant same-value rule).")
+
 ;;; The §9.5.3.3 wire-element field widths (+transformation-kind-len+ .. +receiver-specific-macs-count-len+) are pinned in crypto/crypto-header.lisp (the shared §7.3.7 codec, loaded first) as the single source of truth; reused here by name (DRY).
 (defconstant +receiver-specific-macs-count-payload-protection+ 0
   "receiver_specific_macs_count for plain ENCRYPT without WITH_ORIGIN_AUTHENTICATION = 0
@@ -94,8 +107,12 @@
    IV-SUFFIX octet[8] (init_vector_suffix), CIPHERTEXT N octets, TAG 16 octets (common_mac).
    Produces (no CDR encapsulation header — see file note):
      SecureDataHeader(20) || crypto_content.length(uint32 BE)=N || ciphertext(N)
-                          || common_mac(16) || receiver_specific_macs_count(uint32 BE)=0.
-   The 20-byte SecureDataHeader is exactly the AEAD AAD (§9.5.3.3.4.4). Returns a fresh octet vector.
+                          || common_mac(16) || <pad to 4-align> || receiver_specific_macs_count(uint32 BE)=0.
+   The §9.5.3.3.3 SecureDataTag aligns the receiver_specific_macs_count to a 4-byte boundary relative to the
+   SecuredPayload start (Fast DDS serialize_SecureDataTag): the pad = (-N) mod 4 octets after the common_mac
+   (zero when N is a multiple of 4) — without it a conformant peer's decode_serialized_payload mis-reads the
+   tag length ('Error in fastcdr trying to deserialize SecureDataTag length'). serialize-crypto-footer writes
+   the pad. The 20-byte SecureDataHeader is exactly the AEAD AAD (§9.5.3.3.4.4). Returns a fresh octet vector.
    crypto_content.length and receiver_specific_macs_count are BIG-ENDIAN (§9.5.3.3.3/.4.4; the codec
    forces it via %put-u32-be independent of the cursor's little-endian stream — Fast-DDS/Cyclone-aligned;
    see docs/provenance.md, M7/P6 T-RECONCILE; at count=0 the latter is endian-irrelevant)."
@@ -105,7 +122,8 @@
   (%require-len iv-suffix +init-vector-suffix-len+ "init_vector_suffix")
   (%require-len tag +common-mac-len+ "common_mac")
   (let* ((ct-n  (length ciphertext))
-         (total (+ +secure-data-header-len+ +crypto-content-length-len+ ct-n +secure-data-tag-len+))
+         (tag-pad (mod (- ct-n) 4))   ; §9.5.3.3.3 SecureDataTag rsm_count 4-align pad after the common_mac
+         (total (+ +secure-data-header-len+ +crypto-content-length-len+ ct-n tag-pad +secure-data-tag-len+))
          (out   (make-array total :element-type '(unsigned-byte 8)))
          (cur   (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over out) :endianness :little)))
     ;; DRY: delegate to the §7.3.7 codec (SecureDataHeader=CryptoHeader, crypto_content=CryptoContent, rsm=0 SecureDataTag=empty CryptoFooter).
@@ -148,7 +166,8 @@
             (error 'secured-payload-malformed
                    :reason "crypto_content.length overflows the input (truncated or over-declared)"))
           (unless (= (length ciphertext)
-                     (- n +secure-data-header-len+ +crypto-content-length-len+ +secure-data-tag-len+))
+                     (- n +secure-data-header-len+ +crypto-content-length-len+ +secure-data-tag-len+
+                        (mod (- (length ciphertext)) 4)))   ; the §9.5.3.3.3 SecureDataTag 4-align pad
             (error 'secured-payload-malformed
                    :reason (format nil "crypto_content.length ~d inconsistent with input length ~d"
                                    (length ciphertext) n)))
