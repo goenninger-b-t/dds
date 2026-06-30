@@ -27,7 +27,7 @@ OUT (deferred to Slice 5b):
 - **The our-to-our-green invariant:** every wire change MUST keep the our-to-our suite green on both impls (377/377 + corpus byte-exact + fuzz + gate-hotpath + gate-types + mem). The byte-exact corpus is regenerated with each conformant wire change; a change that cannot keep our-to-our byte-exact is a signal to stop and rethink, not to weaken a test.
 - **Clasp AND SBCL both validate, Clasp first.**
 - `defun*`/`defstruct*` + full `ftype` on every function; one-line comments; no reader conditionals outside `dds-pal/`.
-- Docs in lockstep (ADR 0037 + wiki + README + verification.csv at the capstone); SBOM auto-regenerated; no AI/"Claude" attribution (cite "the operating contract §N").
+- Docs in lockstep (ADR 0037 + wiki + README + verification.csv at the capstone); SBOM auto-regenerated; no AI-assistant attribution (cite "the operating contract §N").
 - **HOLD PUSH:** within-WP commits autonomous; the squash-merge to `main` is presented for owner approval; push only on explicit "push".
 
 ## 4. Architecture — the reconciliation campaign

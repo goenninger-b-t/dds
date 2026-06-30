@@ -18,7 +18,7 @@
 4. **Bounds-check every legacy-wire read FIRST** (NFR-SEC-POSTURE), before any arithmetic on the value, exactly as the existing `%lto-*` helpers do (check against the node's VALUE-END / the buffer length).
 5. Lisp: `defun*`/`defstruct*` with full `(function (...) ...)` ftype declarations; docstrings on every exported symbol; one-line comments only, each wire decision citing the provenance differential or the spec clause; no reader conditionals outside `dds-pal/`.
 6. Suite green per task on SBCL (`make test-sbcl`, currently **93**); Clasp at each stage boundary (`GC_DONT_GC=1 make test-clasp`, one retry on the known flake — see clasp-developers/clasp#1793). `make gate-types` + `make gate-hotpath` green (these files are control-plane).
-7. **Every commit message is PRESENTED TO THE OWNER FOR APPROVAL before `git commit`.** No AI attribution anywhere; no "Claude" reference in any repo file; cite "the operating contract", never a config filename.
+7. **Every commit message is PRESENTED TO THE OWNER FOR APPROVAL before `git commit`.** No AI attribution anywhere; no AI-assistant attribution in any repo file; cite "the operating contract", never a config filename.
 8. Docs in lockstep (operating contract §5.1): a changed/added exported symbol updates its docstring + `docs/wiki/type-system.md` + `README.md` if status shifts; `docs/verification.csv` FR-TYPE-4 updated per stage; `docs/provenance.md` gets each differential.
 
 ## Reference: the code you are extending

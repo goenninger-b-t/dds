@@ -8,7 +8,7 @@
 
 **Tech Stack:** Common Lisp (SBCL + Clasp); `dds.disc` (sender/dataplane), `dds.rtps.reliable` (writer/HistoryCache), `dds.pal` (threads/locks/condvars/`monotonic-ns`), `dds.core.buffer` (foreign tx buffers).
 
-**Authoritative spec:** `docs/superpowers/specs/2026-06-15-wp-async-flow-design.md`. **Conventions:** `defun*`+full ftype (FR-LANG-8); one-line comments; the token-bucket acquire path is 0-alloc + CLOS-free (NFR-MEM/NFR-CLOS); no reader conditionals outside `dds-pal/`; SBOM auto-staged; FR-LANG-7 bench; **NO R6 marker** (flow control is standard DDS, not patent-gated); commit autonomously with each task's message; **no AI/Claude/Co-Authored-By attribution** anywhere.
+**Authoritative spec:** `docs/superpowers/specs/2026-06-15-wp-async-flow-design.md`. **Conventions:** `defun*`+full ftype (FR-LANG-8); one-line comments; the token-bucket acquire path is 0-alloc + CLOS-free (NFR-MEM/NFR-CLOS); no reader conditionals outside `dds-pal/`; SBOM auto-staged; FR-LANG-7 bench; **NO R6 marker** (flow control is standard DDS, not patent-gated); commit autonomously with each task's message; **no AI-assistant/Co-Authored-By attribution** anywhere.
 
 ## Verified grounding (from the code)
 - **Send path** (`src/dds-disc/dataplane.lisp`): `%push-data-buf(node,buf)` (:524) flushes ALL unsent — for each `%reader-push-targets` group it calls `%send-changes-packed` with `(%merge-unsent writer ...)`, coalescing DATA+HEARTBEAT into datagrams via `%send-packed` (:69). The unsent watermark is per-reader; `writer-unsent-list` advances `unsent-base` (send-once, RTPS 2.5 §8.4.2.2).

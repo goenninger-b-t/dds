@@ -17,7 +17,7 @@
 3. **No new thread.** The sweeps run from the existing announce cadence (`announce-endpoints`/`announce-participant`), beside `tl-sweep`. Table mutation under the node lock; hooks/listeners fired OUTSIDE the lock (the established discipline — see `%fire-match` / `tl-sweep`).
 4. Lisp: `defun*`/`defstruct*` with full ftype declarations; docstrings on added/changed exported symbols; one-line comments; no reader conditionals outside `dds-pal/`.
 5. Suite green per task on SBCL (`make test-sbcl`, currently **106**); Clasp at each stage boundary (`GC_DONT_GC=1 make test-clasp`, one retry on the known flake clasp#1793). `make gate-types` + `make gate-hotpath` green.
-6. **Every commit message is PRESENTED TO THE OWNER FOR APPROVAL before `git commit`.** No AI attribution; no "Claude" in any repo file; cite "the operating contract".
+6. **Every commit message is PRESENTED TO THE OWNER FOR APPROVAL before `git commit`.** No AI attribution; no AI-assistant attribution in any repo file; cite "the operating contract".
 7. Docs in lockstep (operating contract §5.1): changed exported symbols → docstrings + `docs/wiki/` + `README.md` if status shifts; `docs/verification.csv` FR-RTPS/FR-DCPS per stage; `docs/provenance.md` for the live capture.
 
 ## Reference: the code you are extending

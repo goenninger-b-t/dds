@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-17-wp-sender-error-resilience-design.md` (read it; this plan implements it).
 
-**Conventions (NON-NEGOTIABLE):** one-line code comments only (longer rationale in the commit message); every `defun*` fully type-declared; every struct `defstruct*`; docstrings on the new special var + exported symbols (operating contract §5.1); cite RTPS 2.5 §8.4 where relevant; NO `#+sbcl/#+clasp` outside `dds-pal/`; NO "Claude"/AI/co-author attribution anywhere; clean-room; SBOM auto-staged by the pre-commit hook; present no perf claim without a number (the sender threads are off the measured hot path — assert `make mem` 0.0000 unchanged, no bench needed).
+**Conventions (NON-NEGOTIABLE):** one-line code comments only (longer rationale in the commit message); every `defun*` fully type-declared; every struct `defstruct*`; docstrings on the new special var + exported symbols (operating contract §5.1); cite RTPS 2.5 §8.4 where relevant; NO `#+sbcl/#+clasp` outside `dds-pal/`; NO AI-assistant/co-author attribution anywhere; clean-room; SBOM auto-staged by the pre-commit hook; present no perf claim without a number (the sender threads are off the measured hot path — assert `make mem` 0.0000 unchanged, no bench needed).
 
 ---
 

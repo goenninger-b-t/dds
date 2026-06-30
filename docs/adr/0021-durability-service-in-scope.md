@@ -1,14 +1,14 @@
 # ADR 0021 — The durability/persistence service is in scope (TRANSIENT + PERSISTENT enabled)
 
 - **Status:** Accepted (owner directive, 2026-06-18)
-- **Supersedes (in part):** the service-suite-out-of-scope boundary in `CLAUDE.md` §1/§10 and `REQUIREMENTS.md`
+- **Supersedes (in part):** the service-suite-out-of-scope boundary in the operating contract §1/§10 and `REQUIREMENTS.md`
   §1.2, **for the durability/persistence service only**.
 - **Relates to:** the M6/P5 durability work; `docs/superpowers/specs/2026-06-18-wp-durability-transient-local-design.md`.
 
 ## Context
 
 The operating contract scoped the Connext *Professional* service suite — Routing, Recording/Replay,
-**Persistence**, Cloud Discovery, Admin Console / Monitor — OUT of scope (`CLAUDE.md` §1: "do not start
+**Persistence**, Cloud Discovery, Admin Console / Monitor — OUT of scope (the operating contract §1: "do not start
 building services"; §10: "Never start a Connext Professional service (… Persistence/etc.)"; `REQUIREMENTS.md`
 §1.2: "Persistence Service (as a *separate* service process)"; §13 open-decision #2 left the "Professional"
 scope undecided).
@@ -54,7 +54,7 @@ subagent-driven→squash-merge) and the cross-DDS-interop-per-feature DoD.
 - **Conformance:** the DDS durability semantics are conformant; the service is the standard delivery mechanism.
   The multi-service/supervisor/thread-or-process/CLI/pluggable-persistence/CNSA-2.0-DARE are value-adds ON TOP
   of the conforming behavior (operating-contract extension rule).
-- **Contract:** `REQUIREMENTS.md` §1.2/§13 and `CLAUDE.md` §1/§10 are amended to reflect this (the durability
+- **Contract:** `REQUIREMENTS.md` §1.2/§13 and the operating contract §1/§10 are amended to reflect this (the durability
   service moves in-scope; the rest of the suite stays out). Crypto remains vetted-library-only (§9).
 - **Security posture:** the always-on DARE means the persistence layer never writes plaintext; key management
   (CNSA-2.0 ML-KEM-wrapped keys) and a pluggable KMS hook are part of the service spec.

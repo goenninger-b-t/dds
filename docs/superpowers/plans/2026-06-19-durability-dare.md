@@ -21,7 +21,7 @@
 - **NFR-SEC-POSTURE:** the `open-payload` parse of untrusted sealed bytes is bounds-checked even at `(safety 0)`; fuzzed.
 - **NFR-MEM:** DARE is control-plane (the collect loop ~5 ms poll), OFF the measured CDR hot path → `make mem` stays **0.0000**. (Foreign-buffer crypto is fine here; not the static arena.)
 - **No reader conditionals** (`#+sbcl`/`#+clasp`) outside `dds-pal/` — CFFI is impl-agnostic; a Clasp FFI gap is a documented `(dds.pal:pal-impl-name)` NFR-PORT skip, never a `#+`.
-- **No "Claude"/AI attribution** anywhere; no `Co-Authored-By`. **Docs lockstep** (ADR + wiki + README + verification.csv + provenance) at the capstone. **SBOM** auto-regenerates; add OpenSSL to the pinned table (`scripts/generate-sbom.py`) + record provenance (OpenSSL Apache-2.0 license).
+- **No AI-assistant attribution** anywhere; no `Co-Authored-By`. **Docs lockstep** (ADR + wiki + README + verification.csv + provenance) at the capstone. **SBOM** auto-regenerates; add OpenSSL to the pinned table (`scripts/generate-sbom.py`) + record provenance (OpenSSL Apache-2.0 license).
 - **DoD per task:** compiles + tests green on SBCL AND Clasp (or a documented NFR-PORT gap); applicable gates green; commit references the WP id + requirement id. Verification uses the `make` targets (a bare `sbcl --eval (ql:quickload :dds-tests)` lacks the source registry).
 - **Branch:** `wp-durability-dare` (already created, the design spec committed). Autonomous commits within the branch; **HOLD PUSH** until owner's word; squash-merge presented for approval after the final whole-branch review.
 

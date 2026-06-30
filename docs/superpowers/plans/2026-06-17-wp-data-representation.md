@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-17-wp-data-representation-design.md` (read it).
 
-**Conventions (NON-NEGOTIABLE):** one-line code comments; full type declarations; docstrings on new exported symbols (§5.1) citing the clause; NEVER hardcode a wire value from memory — pin from §7.6.3.1.1 + a capture; bounds-check the SEDP parse even at `(safety 0)` (NFR-SEC-POSTURE); fail-open on an unknown rep (never false-REJECT the SEDP); NO `#+sbcl/#+clasp` outside `dds-pal/`; NO AI/Claude/co-author attribution; clean-room; SBOM auto-staged.
+**Conventions (NON-NEGOTIABLE):** one-line code comments; full type declarations; docstrings on new exported symbols (§5.1) citing the clause; NEVER hardcode a wire value from memory — pin from §7.6.3.1.1 + a capture; bounds-check the SEDP parse even at `(safety 0)` (NFR-SEC-POSTURE); fail-open on an unknown rep (never false-REJECT the SEDP); NO `#+sbcl/#+clasp` outside `dds-pal/`; NO AI-assistant/co-author attribution; clean-room; SBOM auto-staged.
 
 ---
 

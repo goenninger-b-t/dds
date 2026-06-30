@@ -16,7 +16,7 @@
 - **Clean-room:** Fast DDS (Apache) + Cyclone (EPL) readable, provenance-logged in `docs/provenance.md`; **NEVER read RTI Connext source**. Pin the OMG clause where obtainable; never assert a wire form from memory.
 - **OUR-TO-OUR-GREEN INVARIANT:** after every wire change, the our-to-our suite is green on BOTH impls — `make test-clasp` + `make test-sbcl` (377 baseline) + corpus byte-exact + `make fuzz` + `make gate-hotpath` + `make gate-types` + `make mem`. The byte-exact corpus is REGENERATED with each conformant wire change; never weaken a test to pass. A change that can't keep our-to-our byte-exact = stop and rethink.
 - **Clasp AND SBCL both validate, Clasp first** (`scripts/with-clasp.sh` / `make *-clasp`). Known pre-existing flakes (VOLATILE-LATEJOINER-ZERO, keyed-flatdata-copy-behavior, no-double-delivery, durability-latejoiner) — re-run, don't chase (NFR-PORT).
-- `defun*`/`defstruct*` + full `ftype` on every function; one-line comments; no reader conditionals outside `dds-pal/`; no AI/"Claude" attribution (cite "the operating contract §N"); SBOM auto (never hand-edit).
+- `defun*`/`defstruct*` + full `ftype` on every function; one-line comments; no reader conditionals outside `dds-pal/`; no AI-assistant attribution (cite "the operating contract §N"); SBOM auto (never hand-edit).
 - **Live Connext is OUT (Slice 5b)** — the gate this closes is "Fast-DDS-validated," not "Connext-validated." No overclaim anywhere.
 - **HOLD PUSH:** within-WP commits autonomous; the squash-merge to `main` is presented for owner approval; push only on explicit "push".
 

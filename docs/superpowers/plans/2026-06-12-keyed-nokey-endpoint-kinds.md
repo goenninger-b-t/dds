@@ -16,7 +16,7 @@
 2. **Back-compat is sacred.** `:keyed` and `type-support.keyed-p` default to **T**; a keyed type must yield byte-identical wire to today (`0x102`/`0x107`). The keyed ShapeType interop is the regression oracle (S1).
 3. Lisp: `defun*`/`defstruct*` with full `(function (...) ...)` ftype declarations; docstrings on added/changed exported symbols; one-line comments; bounds-check any new network-facing read; no reader conditionals outside `dds-pal/`.
 4. Suite green per task on SBCL (`make test-sbcl`, currently **102**); Clasp at each stage boundary (`GC_DONT_GC=1 make test-clasp`, one retry on the known flake clasp#1793). `make gate-types` + `make gate-hotpath` green.
-5. **Every commit message is PRESENTED TO THE OWNER FOR APPROVAL before `git commit`.** No AI attribution; no "Claude" reference in any repo file; cite "the operating contract", never a config filename.
+5. **Every commit message is PRESENTED TO THE OWNER FOR APPROVAL before `git commit`.** No AI attribution; no AI-assistant attribution in any repo file; cite "the operating contract", never a config filename.
 6. Docs in lockstep (operating contract §5.1): changed exported symbols update docstrings + `docs/wiki/` + `README.md` if status shifts; `docs/verification.csv` FR-RTPS per stage; `docs/provenance.md` for the live capture.
 
 ## Reference: the code you are extending

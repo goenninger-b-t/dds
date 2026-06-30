@@ -16,7 +16,7 @@ This plan is **Phase 1 = spec slices 1–4** (Task 1 the spike; Tasks 2–10 the
 
 ## Global Constraints
 
-(Every task implicitly includes these — from `CLAUDE.md`, `REQUIREMENTS.md`, the memory, and ADR 0021/0022.)
+(Every task implicitly includes these — from the operating contract, `REQUIREMENTS.md`, the memory, and ADR 0021/0022.)
 
 - **`defun*` for every function, `defstruct*` for every struct** (owner directive; `dds.lang`, `src/dds-lang/lisp-lang-tools.lisp`). `defun*` = `(defun* name lambda-list (function (arg-types…) result-type) "docstring" body…)`; the signature's required-arg count must match; docstring mandatory non-empty. `defstruct*` = `(defstruct* (name (:constructor make-name)) "docstring" (slot default :type type)…)`; every slot needs `:type`.
 - **Full type declarations** (REQUIREMENTS FR-LANG-8): every param typed, every function fully ftype-specified. `make gate-types` enforces it.
@@ -24,8 +24,8 @@ This plan is **Phase 1 = spec slices 1–4** (Task 1 the spike; Tasks 2–10 the
 - **No hot-path CLOS / no per-sample heap alloc** (NFR-CLOS/NFR-MEM): the durability service is a control-plane entity (NOT the measured CDR hot path), so CLOS-free is not required here, BUT store growth must be bounded (RESOURCE_LIMITS-style reject on a full store, never unbounded heap growth, never silent loss). `make mem` must stay 0.0000 on the CDR path (the service adds no per-sample CDR work).
 - **Bounds-check every wire-facing / config-facing parse** (NFR-SEC-POSTURE), even at `(safety 0)`.
 - **No reader conditionals** (`#+sbcl`/`#+clasp`) outside `dds-pal/`. Per-impl behavior goes through `dds.pal` or the `(dds.pal:pal-impl-name)` skip pattern in tests.
-- **No "Claude"/AI-attribution** anywhere in the repo (commits, ADRs, docs, source). Cite "the operating contract", never the agent-config filename. No `Co-Authored-By` trailer.
-- **Docs in lockstep** (CLAUDE.md §5.1): any exported symbol gets a docstring; touch the wiki/README/verification.csv in the same unit of work. **SBOM** auto-regenerates via the pre-commit hook (`make hooks` once per clone) — never hand-edit `sbom.spdx.json`.
+- **No AI-assistant attribution** anywhere in the repo (commits, ADRs, docs, source). Cite "the operating contract", never the agent-config filename. No `Co-Authored-By` trailer.
+- **Docs in lockstep** (the operating contract §5.1): any exported symbol gets a docstring; touch the wiki/README/verification.csv in the same unit of work. **SBOM** auto-regenerates via the pre-commit hook (`make hooks` once per clone) — never hand-edit `sbom.spdx.json`.
 - **DoD per task:** compiles + tests green on SBCL AND Clasp (or a documented NFR-PORT gap); applicable gates green (`make test gate-hotpath gate-types mem fuzz`); commit references the WP id + requirement id. **Cross-DDS interop per feature** (Connext 7.3.1 + Fast DDS 3.6.1, agent runs both live peers) — applies at the interop task (Task 9).
 - **Branch:** `wp-durability-service-transient` (already created). Commits autonomous within the branch; **HOLD PUSH** until owner's word; squash-merge presented for approval after the final whole-branch review.
 

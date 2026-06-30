@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-18-wp-durability-transient-local-design.md` (read it).
 
-**Conventions (NON-NEGOTIABLE):** one-line code comments; full type declarations; docstrings on new exported symbols (§5.1) citing DDS 1.4 §2.2.3.4 / RTPS 2.5 §8.4; the default (VOLATILE) path byte-identical; NO `#+sbcl/#+clasp` outside `dds-pal/`; NO AI/Claude/co-author attribution; clean-room; SBOM auto-staged; bench only if a hot-path number moves (it shouldn't — retention/replay is off the measured CDR path; assert `make mem` unaffected).
+**Conventions (NON-NEGOTIABLE):** one-line code comments; full type declarations; docstrings on new exported symbols (§5.1) citing DDS 1.4 §2.2.3.4 / RTPS 2.5 §8.4; the default (VOLATILE) path byte-identical; NO `#+sbcl/#+clasp` outside `dds-pal/`; NO AI-assistant/co-author attribution; clean-room; SBOM auto-staged; bench only if a hot-path number moves (it shouldn't — retention/replay is off the measured CDR path; assert `make mem` unaffected).
 
 ---
 

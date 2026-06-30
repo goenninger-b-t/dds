@@ -14,7 +14,7 @@
 
 1. **Clean-room:** Fast DDS is Apache-2.0 — its source/examples MAY be read for understanding (record what was consulted in `docs/provenance.md`); NEVER copy its code into our `src/`. The harness C++ in `interop/fastdds/` is written fresh; fastddsgen-generated files are committed and provenance-noted as generated artifacts. Never read RTI source or the GPL Wireshark dissector source.
 2. **Never hardcode a wire constant from memory** — pin from the spec clause (`docs/specs/`, pdftotext) or a capture; cite the clause in a comment.
-3. **Every commit message is PRESENTED TO THE OWNER FOR APPROVAL before `git commit` runs.** No Co-Authored-By / AI attribution anywhere. No "Claude" references in any repo file.
+3. **Every commit message is PRESENTED TO THE OWNER FOR APPROVAL before `git commit` runs.** No Co-Authored-By / AI attribution anywhere. No AI-assistant attribution in any repo file.
 4. Lisp changes: `defun*`/`defstruct*` (dds.lang) with full type declarations; docstrings + `docs/wiki/` + `README.md` in lockstep (§5.1); bounds-check every network-facing read (NFR-SEC-POSTURE); no reader conditionals outside `dds-pal/`.
 5. Suite green per task on SBCL (`make test` or the targeted asdf test op); Clasp at stage boundaries via `scripts/with-clasp.sh` with `GC_DONT_GC=1`, one retry on the known intermittent abort.
 6. Any divergence between our bytes and Fast DDS's is resolved **spec-clause-first**: if the clause sides with the peer, fix ours + re-pin the vector (test first); if the peer deviates, record it in `docs/provenance.md` and keep our clause-true bytes (tolerate on receive).

@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-18-wp-shmem-send-self-guard-design.md` (read it).
 
-**Conventions (NON-NEGOTIABLE):** one-line code comments; full type declarations; docstrings on the new special var + the condition + the counter slot (§5.1); the `ignore-errors` around the hook funcall (a signaling hook can't break the send); the injector inert when NIL (byte-identical production); NO `#+sbcl/#+clasp` outside `dds-pal/`; NO AI/Claude/co-author attribution; clean-room; SBOM auto-staged.
+**Conventions (NON-NEGOTIABLE):** one-line code comments; full type declarations; docstrings on the new special var + the condition + the counter slot (§5.1); the `ignore-errors` around the hook funcall (a signaling hook can't break the send); the injector inert when NIL (byte-identical production); NO `#+sbcl/#+clasp` outside `dds-pal/`; NO AI-assistant/co-author attribution; clean-room; SBOM auto-staged.
 
 ---
 
