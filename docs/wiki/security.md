@@ -176,6 +176,100 @@ For a plaintext payload `#(S Q U A R E SP 0x01)`:
 - `plain-node` receives the blob, has no `crypto-transform` → delivers the 60-byte
   ciphertext blob directly to the application.
 
+### 3.3 Zero-alloc secured receive — the decode loan (WP-DDS-SECURITY-ZEROALLOC-AEAD T5b/T5d; ADR 0038)
+
+By default a secured receive decodes into a **freshly allocated** plaintext vector
+(`decode-serialized-payload`) — one GC-heap allocation per sample.  A reader can opt into a
+**zero-alloc** decode by becoming **loan-capable**:
+
+```lisp
+(dds.disc:enable-subscriber sub-node)
+(dds.disc:set-secured-loan-capable sub-node t)   ; decode into a pooled buffer; deliver a loan
+(dds.disc:start-node sub-node)
+```
+
+When loan-capable, the receiver thread decodes each `SecuredPayload` with
+`decode-serialized-payload-into` straight into a buffer drawn from a per-node **decode pool**
+(a fixed pool carved once from a static arena, sized `*secured-pool-capacity* +
+*secured-pool-headroom*` buffers of `*secured-payload-max-bytes*` octets) and stores a
+`secured-loan-handle` — **not** a plaintext vector — in the samples store.  The steady-state
+decode path therefore allocates **zero** bytes per sample for the plaintext.  The loan
+**delivery wrapper** is pooled too: the `secured-loan-handle` itself is drawn from a per-node
+**handle freelist** (recycled on return, never re-allocated), the outstanding-loan **registry**
+is a fixed vector with O(1) swap-remove (no per-loan cons), and `node-take-loaned` fills a
+**reused** result vector (no per-take list cons).  Enabling `data_protection` on the receive
+side therefore adds **0.0000 B/sample** over the non-secured baseline — matching the encode side.
+
+Because the disc-node samples store is never purged, the pooled buffer's lifetime is tied to a
+**loan registry**, not the store.  This changes the secured-reader read contract — the app
+**must** read through the loan API and **return** every loan.  `node-take-loaned` returns
+`(values VEC COUNT)`; read `VEC[0, COUNT)` in place and hand `VEC` + `COUNT` back to
+`node-return-loan`:
+
+```lisp
+(multiple-value-bind (data count) (dds.disc:node-take-loaned sub-node)   ; (values reused-VEC COUNT)
+  (dotimes (i count)
+    (let ((v (aref data i)))
+      (when (dds.disc:secured-loan-handle-p v)                ; a bare vector (arena-carve-fail) has no loan — test first
+        (let ((len   (dds.disc:secured-loan-handle-len v))
+              (bytes (dds.disc:secured-loan-bytes v)))         ; read the plaintext IN PLACE over [0, len) — no copy
+          (use-plaintext bytes len)))))
+  (dds.disc:node-return-loan sub-node data count))              ; obligation: return every loan taken
+```
+
+`VEC` is the node's **reused** scratch buffer (single-consumer: the node's one user reader) and
+the next `node-take-loaned` clobbers it, so it must be consumed and returned before the next
+take.  `node-return-loan` returns each buffer to the pool, **recycles** the handle to the
+freelist (fully dissociated: `buffer → nil`, guid/sn cleared, so a stale reference cannot alias
+a new sample), and removes the dangling samples-store entry so the buffer is never re-read after
+release (no use-after-free, no wrong-bytes).  It is idempotent / double-return-safe (a returned
+handle is skipped) — but a handle **must not be retained or reused after it is returned** (a
+returned handle may be recycled for a new sample; use-after-return is a caller-contract
+violation, memory-safe within the arena but undefined).  `stop-node` calls
+`node-return-all-loans` before tearing the arena down, so a forgotten loan never leaks foreign
+memory at shutdown.
+
+Fail-closed semantics are preserved: a decode failure drops the sample and releases its buffer
+(no leak); **pool exhaustion** (every buffer loaned out) drops the surplus sample, bumps
+`disc-node-decode-pool-rejects` (a `SAMPLE_REJECTED` counter), and leaves the sample
+un-acknowledged so the writer applies backpressure — **never** a silent GC-heap fallback.  A
+leaked loan therefore degrades gracefully (the pool eventually rejects) rather than wedging.
+
+A reader that does **not** call `set-secured-loan-capable` (the default), and any non-secured
+reader, keeps the allocating-decode → bare-vector path **byte-identical** to before.
+
+### 3.4 Zero-alloc secured send + the shared foundation (WP-DDS-SECURITY-ZEROALLOC-AEAD, ADR 0038)
+
+With the decode loan (§3.3) on the receive side and a matching **encode payload pool** on the send
+side, the whole **`data_protection` (serialized-payload) AEAD tier is zero GC-heap-alloc per sample on
+the LIVE secured path** — encode *and* decode.  `make mem` gained security-ON arms
+(`aead-encode` / `aead-decode` / `aead-encode-live` / `aead-live-pub` / `aead-live-rx`, all **0.0000** on
+SBCL) so the gate now **covers the security path** (it previously ran a security-OFF CDR workload only).
+
+**Send side (the encode payload pool).**  When `data_protection` is engaged, `publish-sample` seals each
+sample with `encode-serialized-payload-into` into a buffer drawn from a per-writer pool (carved from the
+disc-node static arena, torn down at `stop-node`); the `cache-change` owns the pooled buffer and it is
+returned to the pool only when the change is evicted **and** its send-refcount has dropped to zero (so a
+retransmit / async / batch thunk that captured the payload by reference has finished copying it into the
+datagram first).  The pool is **lazily provisioned** on the first secured publish, because the crypto keys
+are installed *after* `enable-publisher` on the live DDS-Security handshake path.  Exhaustion → the writer
+`:timeout` / `RETCODE_TIMEOUT` backpressure (RESOURCE_LIMITS), **never** a GC-heap fallback.
+
+**The shared foundation** (reused by Slice 2 for the other tiers): an **into-buffer OpenSSL AEAD FFI**
+(`dds.dare:aes-256-gcm-seal-into` / `-open-into`, writing ciphertext / tag / plaintext through the
+caller's static-vector SAP — NIST-KAT byte-identical to the allocating entries) built on a new,
+non-boxing PAL primitive **`dds.pal:static-sap+`**; a per-`key-material` **session-key cache** (the §4
+KDF is derived **once** per `(master, salt, session_id)` and reused — no per-sample HMAC — published
+barrier-safe via `dds.pal:fence`); and the **into-buffer codec core** `encode/decode-serialized-payload-into`,
+over which the allocating `encode/decode-serialized-payload` entries (§2.3) are now thin wrappers.  Because
+the wrappers delegate to the core, the byte-exact corpus proves the core's wire output is
+**byte-identical** — no corpus was regenerated.
+
+**Scope (no overclaim).**  This is the **`data_protection` tier + the shared foundation only**.  The
+submessage (`metadata_protection`) and whole-RTPS (`rtps_protection`, the ~2.2 KB/datagram) AEAD tiers
+**reuse** this foundation in **Slice 2** — they are **not** zero-alloc yet.  Do not read this as "all AEAD
+tiers are zero-alloc."  See ADR 0038 for the per-component before→after and the residual carries.
+
 ---
 
 ## 4. The session-key KDF (DDS-Security 1.1 §9.5.3.3.4.2)

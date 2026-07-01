@@ -189,8 +189,7 @@
                            (let ((rc (cffi:foreign-funcall-pointer
                                       (%ossl-sym "EVP_EncryptInit_ex") nil
                                       :pointer ctx
-                                      :pointer (cffi:foreign-funcall-pointer
-                                                (%ossl-sym "EVP_aes_256_gcm") nil :pointer)
+                                      :pointer *%aes-256-gcm-cipher*
                                       :pointer (cffi:null-pointer)
                                       :pointer (cffi:null-pointer)
                                       :pointer (cffi:null-pointer)
@@ -306,8 +305,7 @@
                            (let ((rc (cffi:foreign-funcall-pointer
                                       (%ossl-sym "EVP_DecryptInit_ex") nil
                                       :pointer ctx
-                                      :pointer (cffi:foreign-funcall-pointer
-                                                (%ossl-sym "EVP_aes_256_gcm") nil :pointer)
+                                      :pointer *%aes-256-gcm-cipher*
                                       :pointer (cffi:null-pointer)
                                       :pointer (cffi:null-pointer)
                                       :pointer (cffi:null-pointer)
@@ -377,6 +375,265 @@
                       (cffi:foreign-funcall-pointer
                        (%ossl-sym "EVP_CIPHER_CTX_free") nil :pointer ctx :void))
                     (if auth-ok plaintext nil)))))))))))
+
+;;; AES-256-GCM AEAD into-buffer variants — write CT/tag/PT directly through the caller's
+;;; static-vector SAP (dds.pal:static-pointer), zero GC-heap output allocation. The EVP call
+;;; sequence is identical to aes-256-gcm-seal/open, so the output is byte-for-byte identical
+;;; (NIST SP 800-38D Appendix B Test Case 16, asserted by the dare-aes-gcm-kat into-buffer arm).
+
+(defun* aes-256-gcm-seal-into (out ct-off tag-off key nonce-vec nonce-off aad pt pt-off pt-len)
+    (function ((simple-array (unsigned-byte 8) (*))
+               fixnum
+               fixnum
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*))
+               fixnum
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*))
+               fixnum
+               fixnum)
+              (eql t))
+  "AES-256-GCM authenticated encryption into a caller's static buffer (FIPS 197 + NIST SP 800-38D).
+   Writes PT-LEN ciphertext octets into OUT[CT-OFF..] and the 16-byte tag into OUT[TAG-OFF..]
+   directly through OUT's GC-stable static SAP (no make-array; zero GC-heap output allocation).
+   NONCE = NONCE-VEC[NONCE-OFF..+12]; PLAINTEXT = PT[PT-OFF..+PT-LEN]; AAD authenticated in full.
+   OUT MUST be an ALLOC-STATIC-backed vector with room for CT-OFF+PT-LEN and TAG-OFF+16 octets.
+   Same EVP_Encrypt* sequence as AES-256-GCM-SEAL so the output is byte-identical (NIST SP 800-38D
+   Appendix B TC16). Key buffer is zeroized before return. Returns T. Signals on any EVP error.
+   Zero-alloc (~0 GC-heap B/call on SBCL): the plaintext is staged into OUT[CT-OFF..] and encrypted
+   IN PLACE (EVP in==out via dds.pal:static-sap+, an inline non-boxing SAP into OUT), so no per-call
+   ciphertext/plaintext SAP is boxed; NULL args use the cached *%NULL-PTR*; the only scratch is the
+   constant-size key/nonce/outl buffers plus one variable-size AAD buffer."
+  (let ((aad-len (length aad)))
+    ;; O(1) output-extent bounds: unconditional, safety-0-safe (the operating contract §4)
+    (unless (<= (+ ct-off pt-len) (dds.pal:static-length out))
+      (error "aes-256-gcm-seal-into: OUT too small for CT region (need ~d, have ~d)"
+             (+ ct-off pt-len) (dds.pal:static-length out)))
+    (unless (<= (+ tag-off +aes-gcm-tag-len+) (dds.pal:static-length out))
+      (error "aes-256-gcm-seal-into: OUT too small for TAG region (need ~d, have ~d)"
+             (+ tag-off +aes-gcm-tag-len+) (dds.pal:static-length out)))
+    ;; stage plaintext into OUT's CT region for in-place GCM (EVP in==out; static-vector aref, 0 cons)
+    (dotimes (i pt-len)
+      (setf (aref out (+ ct-off i)) (aref pt (+ pt-off i))))
+    (cffi:with-foreign-pointer (key-ptr +aes-256-gcm-key-len+)
+      (cffi:with-foreign-pointer (nonce-ptr +aes-gcm-nonce-len+)
+        (cffi:with-foreign-object (outl-ptr :int)
+          ;; AAD is read-only: pin the caller's vector and pass its SAP in place (no copy, no variable-size scratch, 0 cons)
+          (cffi:with-pointer-to-vector-data (aad-ptr aad)
+            (dotimes (i +aes-256-gcm-key-len+)
+              (setf (cffi:mem-aref key-ptr :uint8 i) (aref key i)))
+            (dotimes (i +aes-gcm-nonce-len+)
+              (setf (cffi:mem-aref nonce-ptr :uint8 i) (aref nonce-vec (+ nonce-off i))))
+            (let* ((sealed nil)
+                   (ctx (cffi:foreign-funcall-pointer
+                         (%ossl-sym "EVP_CIPHER_CTX_new") nil :pointer)))
+              (when (cffi:null-pointer-p ctx)
+                (dotimes (i +aes-256-gcm-key-len+)
+                  (setf (cffi:mem-aref key-ptr :uint8 i) 0))
+                (error "EVP_CIPHER_CTX_new returned NULL"))
+              (unwind-protect
+                   (progn
+                     ;; init cipher, no key/iv yet
+                     (let ((rc (cffi:foreign-funcall-pointer
+                                (%ossl-sym "EVP_EncryptInit_ex") nil
+                                :pointer ctx
+                                :pointer *%aes-256-gcm-cipher*
+                                :pointer *%null-ptr*
+                                :pointer *%null-ptr*
+                                :pointer *%null-ptr*
+                                :int)))
+                       (unless (= rc 1)
+                         (error "EVP_EncryptInit_ex(EVP_aes_256_gcm) failed (rc=~a)" rc)))
+                     ;; set 12-byte nonce length
+                     (let ((rc (cffi:foreign-funcall-pointer
+                                (%ossl-sym "EVP_CIPHER_CTX_ctrl") nil
+                                :pointer ctx :int +gcm-ctrl-set-ivlen+
+                                :int +aes-gcm-nonce-len+
+                                :pointer *%null-ptr* :int)))
+                       (unless (= rc 1)
+                         (error "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed (rc=~a)" rc)))
+                     ;; init key and nonce
+                     (let ((rc (cffi:foreign-funcall-pointer
+                                (%ossl-sym "EVP_EncryptInit_ex") nil
+                                :pointer ctx
+                                :pointer *%null-ptr*
+                                :pointer *%null-ptr*
+                                :pointer key-ptr
+                                :pointer nonce-ptr
+                                :int)))
+                       (unless (= rc 1)
+                         (error "EVP_EncryptInit_ex(key,nonce) failed (rc=~a)" rc)))
+                     ;; feed AAD (outl is discarded for AAD)
+                     (when (> aad-len 0)
+                       (let ((rc (cffi:foreign-funcall-pointer
+                                  (%ossl-sym "EVP_EncryptUpdate") nil
+                                  :pointer ctx
+                                  :pointer *%null-ptr* :pointer outl-ptr
+                                  :pointer aad-ptr :int aad-len
+                                  :int)))
+                         (unless (= rc 1)
+                           (error "EVP_EncryptUpdate(AAD) failed (rc=~a)" rc))))
+                     ;; encrypt plaintext in place at OUT[CT-OFF] (EVP in==out via inline non-boxing SAP)
+                     (when (> pt-len 0)
+                       (let ((rc (cffi:foreign-funcall-pointer
+                                  (%ossl-sym "EVP_EncryptUpdate") nil
+                                  :pointer ctx
+                                  :pointer (dds.pal:static-sap+ out ct-off) :pointer outl-ptr
+                                  :pointer (dds.pal:static-sap+ out ct-off) :int pt-len
+                                  :int)))
+                         (unless (= rc 1)
+                           (error "EVP_EncryptUpdate(PT) failed (rc=~a)" rc))))
+                     ;; finalize (GCM final produces no additional output)
+                     (let ((rc (cffi:foreign-funcall-pointer
+                                (%ossl-sym "EVP_EncryptFinal_ex") nil
+                                :pointer ctx :pointer (dds.pal:static-sap+ out ct-off) :pointer outl-ptr
+                                :int)))
+                       (unless (= rc 1)
+                         (error "EVP_EncryptFinal_ex failed (rc=~a)" rc)))
+                     ;; extract 16-byte tag directly into OUT's SAP at TAG-OFF
+                     (let ((rc (cffi:foreign-funcall-pointer
+                                (%ossl-sym "EVP_CIPHER_CTX_ctrl") nil
+                                :pointer ctx :int +gcm-ctrl-get-tag+
+                                :int +aes-gcm-tag-len+
+                                :pointer (dds.pal:static-sap+ out tag-off) :int)))
+                       (unless (= rc 1)
+                         (error "EVP_CIPHER_CTX_ctrl(GET_TAG) failed (rc=~a)" rc)))
+                     (setf sealed t))   ; tag written: encryption complete, OUT holds ciphertext
+                ;; always: zeroize key, free ctx; on error-path only: wipe staged plaintext (defense-in-depth)
+                (unless sealed
+                  (dotimes (i pt-len)   ; mirror decode-side fail-closed wipe (operating contract §4)
+                    (setf (aref out (+ ct-off i)) 0)))
+                (dotimes (i +aes-256-gcm-key-len+)
+                  (setf (cffi:mem-aref key-ptr :uint8 i) 0))
+                (cffi:foreign-funcall-pointer
+                 (%ossl-sym "EVP_CIPHER_CTX_free") nil :pointer ctx :void)))))))
+    t))
+
+(defun* aes-256-gcm-open-into (pt-out pt-off key nonce-vec nonce-off aad ct-vec ct-off ct-len tag-vec tag-off)
+    (function ((simple-array (unsigned-byte 8) (*))
+               fixnum
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*))
+               fixnum
+               (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*))
+               fixnum
+               fixnum
+               (simple-array (unsigned-byte 8) (*))
+               fixnum)
+              (or (eql t) null))
+  "AES-256-GCM authenticated decryption into a caller's static buffer (FIPS 197 + NIST SP 800-38D).
+   On auth success writes CT-LEN plaintext octets into PT-OUT[PT-OFF..] directly through PT-OUT's
+   GC-stable static SAP and returns T; on authentication failure returns NIL and zeroizes the
+   CT-LEN-octet output region so NO readable plaintext remains (fail-closed, SP 800-38D §7.2).
+   NONCE = NONCE-VEC[NONCE-OFF..+12]; CIPHERTEXT = CT-VEC[CT-OFF..+CT-LEN]; TAG = TAG-VEC[TAG-OFF..+16].
+   PT-OUT MUST be an ALLOC-STATIC-backed vector with room for PT-OFF+CT-LEN octets.
+   Same EVP_Decrypt* sequence as AES-256-GCM-OPEN so the plaintext is byte-identical. Key buffer is
+   zeroized before return; NEVER leaves plaintext readable on auth failure (NIST SP 800-38D §7.2).
+   Zero-alloc (~0 GC-heap B/call on SBCL): the ciphertext is staged into PT-OUT[PT-OFF..] and decrypted
+   IN PLACE (EVP in==out via dds.pal:static-sap+, an inline non-boxing SAP into PT-OUT), so no per-call
+   ciphertext/plaintext SAP is boxed; NULL args use the cached *%NULL-PTR*; the fail-closed wipe zeroes
+   the PT-OUT region through its static-vector aref (0 cons); scratch is the constant-size
+   key/nonce/tag/outl buffers plus one variable-size AAD buffer."
+  (let ((aad-len (length aad)))
+    ;; O(1) output-extent bounds: unconditional, safety-0-safe (the operating contract §4)
+    (unless (<= (+ pt-off ct-len) (dds.pal:static-length pt-out))
+      (error "aes-256-gcm-open-into: PT-OUT too small for plaintext region (need ~d, have ~d)"
+             (+ pt-off ct-len) (dds.pal:static-length pt-out)))
+    ;; stage ciphertext into PT-OUT's plaintext region for in-place GCM (EVP in==out; aref, 0 cons)
+    (dotimes (i ct-len)
+      (setf (aref pt-out (+ pt-off i)) (aref ct-vec (+ ct-off i))))
+    (cffi:with-foreign-pointer (key-ptr +aes-256-gcm-key-len+)
+      (cffi:with-foreign-pointer (nonce-ptr +aes-gcm-nonce-len+)
+        (cffi:with-foreign-pointer (tag-ptr +aes-gcm-tag-len+)
+          (cffi:with-foreign-object (outl-ptr :int)
+            ;; AAD is read-only: pin the caller's vector and pass its SAP in place (no copy, no variable-size scratch, 0 cons)
+            (cffi:with-pointer-to-vector-data (aad-ptr aad)
+              (dotimes (i +aes-256-gcm-key-len+)
+                (setf (cffi:mem-aref key-ptr :uint8 i) (aref key i)))
+              (dotimes (i +aes-gcm-nonce-len+)
+                (setf (cffi:mem-aref nonce-ptr :uint8 i) (aref nonce-vec (+ nonce-off i))))
+              (dotimes (i +aes-gcm-tag-len+)
+                (setf (cffi:mem-aref tag-ptr :uint8 i) (aref tag-vec (+ tag-off i))))
+              (let ((ctx (cffi:foreign-funcall-pointer
+                          (%ossl-sym "EVP_CIPHER_CTX_new") nil :pointer))
+                    (auth-ok nil))
+                (when (cffi:null-pointer-p ctx)
+                  (dotimes (i +aes-256-gcm-key-len+)
+                    (setf (cffi:mem-aref key-ptr :uint8 i) 0))
+                  (error "EVP_CIPHER_CTX_new returned NULL"))
+                (unwind-protect
+                     (progn
+                       (let ((rc (cffi:foreign-funcall-pointer
+                                  (%ossl-sym "EVP_DecryptInit_ex") nil
+                                  :pointer ctx
+                                  :pointer *%aes-256-gcm-cipher*
+                                  :pointer *%null-ptr*
+                                  :pointer *%null-ptr*
+                                  :pointer *%null-ptr*
+                                  :int)))
+                         (unless (= rc 1)
+                           (error "EVP_DecryptInit_ex(EVP_aes_256_gcm) failed (rc=~a)" rc)))
+                       (let ((rc (cffi:foreign-funcall-pointer
+                                  (%ossl-sym "EVP_CIPHER_CTX_ctrl") nil
+                                  :pointer ctx :int +gcm-ctrl-set-ivlen+
+                                  :int +aes-gcm-nonce-len+
+                                  :pointer *%null-ptr* :int)))
+                         (unless (= rc 1)
+                           (error "EVP_CIPHER_CTX_ctrl(SET_IVLEN) failed (rc=~a)" rc)))
+                       (let ((rc (cffi:foreign-funcall-pointer
+                                  (%ossl-sym "EVP_DecryptInit_ex") nil
+                                  :pointer ctx
+                                  :pointer *%null-ptr*
+                                  :pointer *%null-ptr*
+                                  :pointer key-ptr
+                                  :pointer nonce-ptr
+                                  :int)))
+                         (unless (= rc 1)
+                           (error "EVP_DecryptInit_ex(key,nonce) failed (rc=~a)" rc)))
+                       ;; set expected tag BEFORE Final
+                       (let ((rc (cffi:foreign-funcall-pointer
+                                  (%ossl-sym "EVP_CIPHER_CTX_ctrl") nil
+                                  :pointer ctx :int +gcm-ctrl-set-tag+
+                                  :int +aes-gcm-tag-len+
+                                  :pointer tag-ptr :int)))
+                         (unless (= rc 1)
+                           (error "EVP_CIPHER_CTX_ctrl(SET_TAG) failed (rc=~a)" rc)))
+                       ;; feed AAD
+                       (when (> aad-len 0)
+                         (let ((rc (cffi:foreign-funcall-pointer
+                                    (%ossl-sym "EVP_DecryptUpdate") nil
+                                    :pointer ctx
+                                    :pointer *%null-ptr* :pointer outl-ptr
+                                    :pointer aad-ptr :int aad-len
+                                    :int)))
+                           (unless (= rc 1)
+                             (error "EVP_DecryptUpdate(AAD) failed (rc=~a)" rc))))
+                       ;; decrypt ciphertext in place at PT-OUT[PT-OFF] (EVP in==out via inline non-boxing SAP)
+                       (when (> ct-len 0)
+                         (let ((rc (cffi:foreign-funcall-pointer
+                                    (%ossl-sym "EVP_DecryptUpdate") nil
+                                    :pointer ctx
+                                    :pointer (dds.pal:static-sap+ pt-out pt-off) :pointer outl-ptr
+                                    :pointer (dds.pal:static-sap+ pt-out pt-off) :int ct-len
+                                    :int)))
+                           (unless (= rc 1)
+                             (error "EVP_DecryptUpdate(CT) failed (rc=~a)" rc))))
+                       ;; final — returns <=0 on auth failure
+                       (let ((rc (cffi:foreign-funcall-pointer
+                                  (%ossl-sym "EVP_DecryptFinal_ex") nil
+                                  :pointer ctx :pointer (dds.pal:static-sap+ pt-out pt-off) :pointer outl-ptr
+                                  :int)))
+                         (setf auth-ok (> rc 0))))
+                  ;; always: zeroize key; fail-closed: wipe written PT region unless auth-ok; free ctx
+                  (dotimes (i +aes-256-gcm-key-len+)
+                    (setf (cffi:mem-aref key-ptr :uint8 i) 0))
+                  (unless auth-ok
+                    (dotimes (i ct-len)
+                      (setf (aref pt-out (+ pt-off i)) 0)))
+                  (cffi:foreign-funcall-pointer
+                   (%ossl-sym "EVP_CIPHER_CTX_free") nil :pointer ctx :void))
+                (if auth-ok t nil)))))))))
 
 ;;; HKDF-SHA384 — EVP_KDF "HKDF" provider, extract-then-expand (RFC 5869 §2 / SP 800-56C).
 

@@ -613,6 +613,173 @@
                   "reader missing SNs after convergence"))))
     t))
 
+;;; T5a-pre release-safety: cache-change SEND-REFCOUNT acquire/release across the capture/emit sites.
+;;; A captured (in-flight or deferred) send holds the change NON-releasable; the send's completion
+;;; (copy-into-datagram, then release) makes it releasable again. Behaviorally neutral today (the GC pins
+;;; the payload); the gate (cache-change-releasable-p) is what T5a's eviction consults before recycling a
+;;; POOLED payload buffer. Value-level (no sockets) so it is deterministic + identical on both impls.
+
+(defun* run-cache-change-send-refcount-test ()
+    (function () t)
+  "Test (operating contract §4 release-safety): cache-change SEND-REFCOUNT acquire/release — a change is NOT
+   releasable while a send referencing it is pending/in-flight and BECOMES releasable after the send completes.
+   Part A synchronous push capture (writer-capture-unsent + writer-release-change-refs); Part B a DEFERRED
+   (paced/async) snapshot that HOLDS the ref across emit steps until the plan drains; Part C the multi-reader
+   eviction-vs-retransmit interleaving — a change EVICTED while reader B's NACK-retransmit still holds it stays
+   NON-releasable (so T5a defers its pooled-buffer release) until the in-flight send drops the ref."
+  ;; -- Part A: synchronous push capture holds the ref; release frees it; double-release floors at 0 --
+  (let* ((writer (dds.rtps.reliable:make-rtps-writer
+                  :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (rid 7))
+    (dds.rtps.reliable:writer-write writer (octets 1 1 1 1))
+    (dds.rtps.reliable:writer-write writer (octets 2 2 2 2))
+    (let ((ch1 (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1))
+          (ch2 (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 2)))
+      (%check :refc-fresh-releasable
+              (and (dds.rtps.history:cache-change-releasable-p ch1)
+                   (dds.rtps.history:cache-change-releasable-p ch2))
+              "a freshly written change has SEND-REFCOUNT 0 (releasable)")
+      (let ((captured (dds.rtps.reliable:writer-capture-unsent writer (list rid))))
+        (%check :refc-captured-2 (= 2 (length captured)) "capture returns both unsent changes")
+        (%check :refc-captured-held
+                (and (not (dds.rtps.history:cache-change-releasable-p ch1))
+                     (not (dds.rtps.history:cache-change-releasable-p ch2))
+                     (= 1 (dds.rtps.history:cache-change-send-refcount ch1)))
+                "a captured (in-flight) change is NOT releasable (refcount 1) — the eviction gate would defer here")
+        (dds.rtps.reliable:writer-release-change-refs writer captured)
+        (%check :refc-released
+                (and (dds.rtps.history:cache-change-releasable-p ch1)
+                     (dds.rtps.history:cache-change-releasable-p ch2))
+                "after the send copied + released, the change is releasable again"))
+      (dds.rtps.reliable:writer-release-change-ref writer ch1)   ; redundant release
+      (%check :refc-double-release-floored
+              (and (dds.rtps.history:cache-change-releasable-p ch1)
+                   (zerop (dds.rtps.history:cache-change-send-refcount ch1)))
+              "a redundant release floors at 0 (no underflow / wrap)")))
+  ;; -- Part B: a DEFERRED (paced/async) snapshot holds the ref across every emit step until the plan drains --
+  (let* ((writer (dds.rtps.reliable:make-rtps-writer
+                  :hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil)))
+         (rid 9))
+    (dotimes (i 3) (dds.rtps.reliable:writer-write writer (octets (1+ i) 0 0 0)))
+    (let* ((captured (dds.rtps.reliable:writer-capture-unsent writer (list rid)))   ; snapshot acquires (= %node-datagram-plan)
+           (steps (length captured)))
+      (%check :refc-deferred-snapshot-held
+              (every (lambda (c) (not (dds.rtps.history:cache-change-releasable-p c))) captured)
+              "the deferred snapshot holds a send-ref on every captured change")
+      (dotimes (s (max 0 (1- steps)))   ; step the plan one datagram at a time: the ref is HELD across every step
+        (declare (ignorable s))
+        (%check :refc-deferred-mid-held
+                (every (lambda (c) (not (dds.rtps.history:cache-change-releasable-p c))) captured)
+                "mid-drain: a captured change stays NON-releasable until the plan FULLY drains"))
+      (dds.rtps.reliable:writer-release-change-refs writer captured)   ; drain complete (= %flow-step-advance)
+      (%check :refc-deferred-drained
+              (every #'dds.rtps.history:cache-change-releasable-p captured)
+              "on plan drain, every captured change becomes releasable")))
+  ;; -- Part C: multi-reader eviction-vs-retransmit — B's in-flight NACK-retransmit ref survives eviction --
+  (let* ((writer (dds.rtps.reliable:make-rtps-writer
+                  :hc (dds.rtps.history:make-history-cache :keep-all 4 nil nil)))
+         (rkey-b 200)
+         (nack (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+    (dds.rtps.reliable:writer-write writer (octets 1 1 1 1))
+    (dds.rtps.reliable:writer-write writer (octets 2 2 2 2))
+    (dds.rtps.message:seqnum-set-bit nack 0)   ; NACK SN 1 (bit 0 at base 1)
+    (multiple-value-bind (resends gaps) (dds.rtps.reliable:writer-on-acknack writer rkey-b 1 1 nack t)
+      (declare (ignore gaps))
+      (%check :refc-nack-captured (= 1 (length resends)) "B's NACK of SN1 yields one (ref-held) resend")
+      (let ((ch1 (first resends)))
+        (%check :refc-nack-held (not (dds.rtps.history:cache-change-releasable-p ch1))
+                "B's in-flight NACK-retransmit holds SN1 NON-releasable")
+        ;; concurrently SN1 is EVICTED from the HC (a co-publishing thread's KEEP_LAST supersession / purge):
+        ;; it is gone from the cache, but the refcount (the T5a pool-release gate) is still 1 -> NOT releasable,
+        ;; so T5a DEFERS returning SN1's pooled buffer to the pool (no recycle while B's thunk has not copied it)
+        (dds.rtps.history:hc-remove-change (dds.rtps.reliable:rtps-writer-hc writer) 1)
+        (%check :refc-evicted-not-releasable
+                (and (null (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1))
+                     (not (dds.rtps.history:cache-change-releasable-p ch1)))
+                "a change EVICTED while a retransmit holds it is gone from the HC yet NON-releasable (release deferred)")
+        (dds.rtps.reliable:writer-release-change-ref writer ch1)   ; B's retransmit copied + completed
+        (%check :refc-evicted-then-released (dds.rtps.history:cache-change-releasable-p ch1)
+                "once the in-flight retransmit drops its ref, the evicted change is releasable (pool-release fires)"))))
+  t)
+
+(defun* run-secured-encode-pool-balance-test ()
+    (function () t)
+  "Test (WP-DDS-SECURITY-ZEROALLOC-AEAD T5a): the encode payload pool + the refcount-gated DEFERRED pool-release.
+   A writer whose HistoryCache carries a payload-pool: a pooled change holds its buffer while LIVE in the cache;
+   on eviction (%hc-remove-change) the buffer returns to the pool IFF no send still references it (SEND-REFCOUNT 0),
+   else the release is DEFERRED to the LAST send-ref drop. Asserts, across EVERY real send-path capture/release
+   shape (sync push = capture-unsent/release-change-refs; deferred async drain = the same held across steps;
+   ACKNACK retransmit = on-acknack acquire-refs/release-change-refs; NACK_FRAG retransmit = acquire-sample/
+   release-change-ref), that after the send completes AND the change is evicted, the cache-change refcount is 0
+   AND its pooled buffer has returned to the pool (pool-in-use back to baseline) — making the T5a-pre refcount
+   load-bearing-and-proven. Value-level (no sockets / no OpenSSL — it tests the BUFFER LIFECYCLE, the codec is
+   covered by the corpus + e2e), deterministic, identical on both impls. A recycle-while-referenced (corruption)
+   shows as an early pool-in-use drop; a never-released buffer (leak) shows as pool-in-use not returning."
+  (macrolet ((with-pooled-writer ((writer pool kind depth) &body body)
+               `(let* ((arena (dds.core.arena:init-arena :bytes (* 2048 16)))
+                       (,pool (dds.core.arena:make-buffer-pool arena 2048 8))
+                       (,writer (dds.rtps.reliable:make-rtps-writer
+                                 :hc (dds.rtps.history:make-history-cache ,kind ,depth nil nil))))
+                  (setf (dds.rtps.history:history-cache-payload-pool (dds.rtps.reliable:rtps-writer-hc ,writer)) ,pool)
+                  (flet ((pub (n)   ; mimic publish-sample: acquire a pooled buffer + writer-write it onto the change
+                           (let ((buf (dds.rtps.reliable:writer-acquire-payload-buffer ,writer)))
+                             (dds.rtps.reliable:writer-write ,writer (dds.core.buffer:octet-buffer-vec buf) nil nil buf n)
+                             buf)))
+                    (declare (ignorable #'pub))
+                    (unwind-protect (progn ,@body) (dds.core.arena:teardown-arena arena))))))
+    ;; -- Part A: a LIVE pooled change holds its buffer; a completed send does NOT release it; KEEP_LAST evict does --
+    (with-pooled-writer (writer pool :keep-last 1)
+      (%check :pool-a-baseline (zerop (dds.core.arena:pool-in-use pool)) "the pool starts empty")
+      (pub 100)
+      (%check :pool-a-live-held (= 1 (dds.core.arena:pool-in-use pool))
+              "a LIVE (un-evicted) pooled change holds its buffer out of the pool")
+      (let ((cap (dds.rtps.reliable:writer-capture-unsent writer (list 1))))   ; a sync push captures + releases
+        (dds.rtps.reliable:writer-release-change-refs writer cap))
+      (%check :pool-a-live-after-send (= 1 (dds.core.arena:pool-in-use pool))
+              "a COMPLETED send on a still-LIVE change does NOT release its pooled buffer (only eviction does)")
+      (pub 200)   ; KEEP_LAST depth 1: SN2 supersedes + evicts SN1 (refcount 0) -> SN1's buffer returns NOW
+      (%check :pool-a-keeplast-evict (= 1 (dds.core.arena:pool-in-use pool))
+              "KEEP_LAST supersession evicts the prior change and returns its buffer immediately (1 live held)"))
+    ;; -- Part B: sync/async push — a change EVICTED while a send-ref is held DEFERS its release to the last drop --
+    (with-pooled-writer (writer pool :keep-all 4)
+      (pub 10) (pub 20)
+      (%check :pool-b-two (= 2 (dds.core.arena:pool-in-use pool)) "two live pooled changes hold two buffers")
+      (let ((cap (dds.rtps.reliable:writer-capture-unsent writer (list 1))))   ; snapshot acquires a ref on both
+        (%check :pool-b-captured (= 2 (length cap)) "capture returns both unsent changes")
+        (dds.rtps.history:hc-remove-change (dds.rtps.reliable:rtps-writer-hc writer) 1)   ; evict SN1 while its ref is held
+        (%check :pool-b-deferred (= 2 (dds.core.arena:pool-in-use pool))
+                "a change evicted while a send-ref is held does NOT recycle its buffer (release DEFERRED — no wire corruption)")
+        (dds.rtps.reliable:writer-release-change-refs writer cap)   ; drain: last ref drop on the evicted SN1
+        (%check :pool-b-deferred-fired (= 1 (dds.core.arena:pool-in-use pool))
+                "on the LAST send-ref drop the EVICTED change's buffer returns; the still-LIVE change keeps its buffer")))
+    ;; -- Part C: ACKNACK retransmit capture/release balances (evict-while-retransmitting -> deferred release) --
+    (with-pooled-writer (writer pool :keep-all 4)
+      (let ((rkey 5) (nack (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+        (pub 30)
+        (dds.rtps.message:seqnum-set-bit nack 0)   ; NACK SN1
+        (multiple-value-bind (resends gaps) (dds.rtps.reliable:writer-on-acknack writer rkey 1 1 nack t)
+          (declare (ignore gaps))
+          (%check :pool-c-acknack-cap (= 1 (length resends)) "ACKNACK of SN1 yields one ref-held resend")
+          (dds.rtps.history:hc-remove-change (dds.rtps.reliable:rtps-writer-hc writer) 1)
+          (%check :pool-c-acknack-deferred (= 1 (dds.core.arena:pool-in-use pool))
+                  "SN1 evicted while the ACKNACK retransmit holds it -> buffer deferred")
+          (dds.rtps.reliable:writer-release-change-refs writer resends)
+          (%check :pool-c-acknack-released (zerop (dds.core.arena:pool-in-use pool))
+                  "the ACKNACK retransmit drop releases the evicted buffer (refcount 0 + evicted -> pool-in-use baseline)"))))
+    ;; -- Part D: NACK_FRAG retransmit capture/release balances (acquire-sample / release-change-ref) --
+    (with-pooled-writer (writer pool :keep-all 4)
+      (pub 40)
+      (let ((ch (dds.rtps.reliable:writer-acquire-sample writer 1)))
+        (%check :pool-d-nackfrag-cap (and ch (not (dds.rtps.history:cache-change-releasable-p ch)))
+                "acquire-sample (NACK_FRAG path) holds SN1 non-releasable")
+        (dds.rtps.history:hc-remove-change (dds.rtps.reliable:rtps-writer-hc writer) 1)
+        (%check :pool-d-nackfrag-deferred (= 1 (dds.core.arena:pool-in-use pool))
+                "SN1 evicted while the NACK_FRAG retransmit holds it -> buffer deferred")
+        (dds.rtps.reliable:writer-release-change-ref writer ch)
+        (%check :pool-d-nackfrag-released (zerop (dds.core.arena:pool-in-use pool))
+                "the NACK_FRAG retransmit drop releases the evicted buffer (pool-in-use baseline)"))))
+  t)
+
 ;;; GAP: a reader NACKing evicted samples gets a GAP for them and a resend for the
 ;;; samples still in the HistoryCache (RTPS 2.5 §8.3.7.4).
 

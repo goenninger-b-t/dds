@@ -131,10 +131,13 @@
   (or (gethash reader-id (rtps-writer-proxies writer))
       (setf (gethash reader-id (rtps-writer-proxies writer)) (make-reader-proxy))))
 
-(defun* writer-write (writer payload &optional (key-hash nil) (inline-qos nil))
+(defun* writer-write (writer payload &optional (key-hash nil) (inline-qos nil)
+                                               (pooled-buffer nil) (pooled-len nil))
     (function (rtps-writer (array (unsigned-byte 8) (*))
                &optional (or null (array (unsigned-byte 8) (*)))
-                         (or null (simple-array (unsigned-byte 8) (*))))
+                         (or null (simple-array (unsigned-byte 8) (*)))
+                         (or null dds.core.buffer:octet-buffer)
+                         (or null (integer 0)))
               (or integer (eql :timeout)))
   "Add a new :data change to the writer's HistoryCache; return its sequence number, OR the :timeout sentinel
    (RETCODE_TIMEOUT) if a FULL KEEP_ALL cache (RESOURCE_LIMITS max_samples) did not free a slot within the
@@ -149,11 +152,18 @@
    ParameterList octet vector stored on the change's inline-qos slot; the small-DATA emit path (dataplane.lisp
    %data-builder) passes it to write-data :inline-qos; the DATA_FRAG path (%sample-plan) does NOT carry
    inline-QoS (RTPS 2.5 §9.4.5.5 makes it optional; relay samples are always small, never fragment).
-   NIL (the default) → no Q-bit, no extra bytes — byte-identical to the prior behaviour."
+   NIL (the default) → no Q-bit, no extra bytes — byte-identical to the prior behaviour.
+   POOLED-BUFFER / POOLED-LEN (WP-DDS-SECURITY-ZEROALLOC-AEAD T5a; default NIL = not pooled, byte-identical):
+   when set, PAYLOAD is the oversized fixed VEC of POOLED-BUFFER (a payload-pool buffer encoded in place by the
+   data_protection publish path) and POOLED-LEN is its true secured-payload length — recorded on the change so
+   the eviction/ref-drop pool-release gate (hc-try-release-pooled) can return the buffer and every send-path
+   length read (cache-change-payload-len) uses the true length, not the oversized capacity. On a :timeout the
+   change is NOT added, so the CALLER (publish-sample) returns the acquired buffer to the pool directly."
   (%writer-add-bounded
    writer (lambda (sn) (dds.rtps.history:make-cache-change
                         :sn sn :serialized-payload payload :instance-key-hash key-hash
-                        :inline-qos inline-qos))))
+                        :inline-qos inline-qos
+                        :pooled-buffer pooled-buffer :pooled-len pooled-len))))
 
 (defun* writer-lifecycle-change (writer key-hash status-flags &optional (inline-qos nil))
     (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)
@@ -200,6 +210,19 @@
   (%with-writer-lock (writer)
     (%changes-from writer (reader-proxy-acked-base (get-reader-proxy writer reader-id)))))
 
+(defun* %unsent-for-key (writer reader-id)
+    (function (rtps-writer t) list)
+  "INTERNAL (the CALLER must hold the writer LOCK): the UNSENT CacheChanges for READER-ID with SN >= the
+   reader's UNSENT-BASE in SN order, advancing UNSENT-BASE past the highest collected so each change pushes
+   EXACTLY ONCE (RTPS 2.5 §8.4.2.2). Shared lock-free core of writer-unsent-list and writer-capture-unsent
+   (DRY) — kept private because it mutates the proxy watermark, which is only correct under the held lock."
+  (let* ((proxy (get-reader-proxy writer reader-id))
+         (changes (%changes-from writer (reader-proxy-unsent-base proxy))))
+    (when changes
+      (setf (reader-proxy-unsent-base proxy)
+            (1+ (dds.rtps.history:cache-change-sn (first (last changes))))))
+    changes))
+
 (defun* writer-unsent-list (writer reader-id)
     (function (rtps-writer t) list)
   "The UNSENT changes for READER-ID (the opaque per-reader key; next_unsent_change, RTPS 2.5 §8.4.2.2): the
@@ -207,21 +230,154 @@
    UNSENT-BASE watermark is advanced past the highest SN collected, so each change is pushed
    EXACTLY ONCE in pushMode (§8.4.2.2). Lost/late changes are recovered via the ACKNACK repair
    path (writer-on-acknack), not by re-pushing. Each element is the CacheChange (KIND/SN/
-   payload/key-hash/status-info) so a :dispose/:unregister is pushed as a no-payload DATA."
+   payload/key-hash/status-info) so a :dispose/:unregister is pushed as a no-payload DATA. Does NOT
+   acquire a send-ref (the inspection/value-level API); the send path uses writer-capture-unsent."
   (%with-writer-lock (writer)
-    (let* ((proxy (get-reader-proxy writer reader-id))
-           (changes (%changes-from writer (reader-proxy-unsent-base proxy))))
-      (when changes
-        (setf (reader-proxy-unsent-base proxy)
-              (1+ (dds.rtps.history:cache-change-sn (first (last changes))))))
-      changes)))
+    (%unsent-for-key writer reader-id)))
 
-(defun* writer-on-acknack (writer reader-id base numbits bitmap)
-    (function (rtps-writer t integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) (values list list))
+(defun* writer-capture-unsent (writer reader-ids)
+    (function (rtps-writer list) list)
+  "The send-path UNSENT capture: under ONE writer-LOCK acquisition, the SN-deduplicated union of the UNSENT
+   changes to push to the readers READER-IDS (the opaque per-reader keys of one destination), in SN order,
+   advancing EACH reader's UNSENT-BASE (so a sample co-located readers share is pushed once yet send-once
+   accounted per reader, RTPS 2.5 §8.4.2.2 / §8.3.5.4) — AND, atomically with that read, ACQUIRING a send-ref
+   on each returned change (incrementing SEND-REFCOUNT, the operating contract §4 release-safety). Acquiring
+   UNDER THE SAME LOCK as the unsent read closes the recycle race: a concurrent eviction (KEEP_LAST
+   supersession on a co-publishing thread, or the ACKNACK purge on the receiver thread) takes the same lock
+   and sees SEND-REFCOUNT > 0, so it cannot return a captured payload's pooled buffer before the send copies
+   it (T5a). The CALLER MUST release each returned change exactly once (writer-release-change-refs) AFTER the
+   datagram(s) carrying it have been emitted (copied) — synchronously after the emit loop (initial/ACKNACK
+   push) or on plan drain (the paced/async deferred path). For one reader-id this is writer-unsent-list +
+   one acquire (the common single-reader destination); the dedup makes the multi-reader union idempotent.
+   SINGLE-READER FAST PATH: a one-reader destination skips the merge/sort/O(M²)-dedup entirely — %unsent-for-key
+   already returns the changes in ascending SN order with no duplicates, so it is returned directly after one
+   acquire per change (O(M)); only a multi-reader destination pays the union dedup + sort. Load-bearing once the
+   payload is pooled; behaviorally neutral today (the GC pins the payload)."
+  (%with-writer-lock (writer)
+    (if (and reader-ids (null (cdr reader-ids)))
+        (let ((changes (%unsent-for-key writer (car reader-ids))))   ; single reader: already SN-ascending, no dups
+          (dolist (ch changes) (incf (dds.rtps.history:cache-change-send-refcount ch)))   ; acquire each, atomic with the read
+          changes)
+        (let ((merged '()))
+          (dolist (k reader-ids)
+            (dolist (ch (%unsent-for-key writer k))
+              (unless (member (dds.rtps.history:cache-change-sn ch) merged
+                              :key #'dds.rtps.history:cache-change-sn :test #'=)
+                (push ch merged))))
+          (dolist (ch merged) (incf (dds.rtps.history:cache-change-send-refcount ch)))   ; acquire each unique change ONCE, atomic with the read
+          (sort merged #'< :key #'dds.rtps.history:cache-change-sn)))))
+
+(defun* writer-acquire-sample (writer sn)
+    (function (rtps-writer integer) (or null dds.rtps.history:cache-change))
+  "Capture the writer's CacheChange at SN for a (cross-thread) RETRANSMIT send: under the writer LOCK, look it
+   up and — if present — ACQUIRE a send-ref (increment SEND-REFCOUNT) atomically with the lookup, returning the
+   change; NIL if SN is no longer in the HistoryCache (evicted/purged). The atomic lookup+acquire closes the
+   recycle race for the NACK_FRAG retransmit path (%on-user-nack-frag, the receiver thread) exactly as
+   writer-capture-unsent does for the push path: a concurrent KEEP_LAST supersession or ACKNACK purge sees
+   SEND-REFCOUNT > 0 and cannot recycle SN's pooled payload while the retransmit thunks still copy it (T5a).
+   The CALLER MUST writer-release-change-ref the returned change after the retransmit datagrams are emitted.
+   Behaviorally neutral today (the GC pins the payload); load-bearing once the payload is pooled."
+  (%with-writer-lock (writer)
+    (let ((ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
+      (when ch
+        (incf (dds.rtps.history:cache-change-send-refcount ch))
+        ch))))
+
+(defun* writer-release-change-ref (writer change)
+    (function (rtps-writer dds.rtps.history:cache-change) (integer 0))
+  "Release ONE send-ref on CHANGE (decrement SEND-REFCOUNT, FLOORED at 0) under the writer LOCK; return the new
+   count. The release half of writer-acquire-sample / writer-capture-unsent (the operating contract §4
+   release-safety): call AFTER the send that copied CHANGE's payload into its datagram(s) has completed. The
+   floor makes a double-release a validated no-op (never an underflow), mirroring the ZC loan-return idempotency.
+   Under the SAME lock as acquire + the eviction's CACHE-CHANGE-RELEASABLE-P check, so the 1->0 edge is the
+   point a pooled buffer becomes eligible for pool-release: on reaching 0 this calls hc-try-release-pooled, which
+   returns the buffer to the pool IFF the change was ALREADY evicted (the deferred-release half of the operating
+   contract §4; inert for a non-pooled or still-live change — byte-identical, T5a)."
+  (%with-writer-lock (writer)
+    (let ((rc (dds.rtps.history:cache-change-send-refcount change)))
+      (setf (dds.rtps.history:cache-change-send-refcount change) (if (plusp rc) (1- rc) 0))
+      (dds.rtps.history:hc-try-release-pooled (rtps-writer-hc writer) change)   ; deferred pool-release on the last ref drop of an evicted pooled change (T5a)
+      (dds.rtps.history:cache-change-send-refcount change))))
+
+(defun* writer-release-change-refs (writer changes)
+    (function (rtps-writer list) t)
+  "Release one send-ref on EACH change in CHANGES (the list writer-capture-unsent returned) under ONE writer-LOCK
+   acquisition — the release half of the push/retransmit capture (the operating contract §4 release-safety). Each
+   decrement is floored at 0 (a double-release is a no-op). Call AFTER the captured changes' datagrams are emitted
+   (the synchronous emit loop, or the paced/async plan drain). A NIL/empty list releases nothing (idempotent). On
+   a change reaching refcount 0 this calls hc-try-release-pooled, returning its pooled buffer to the pool IFF it
+   was ALREADY evicted (the deferred-release half of the operating contract §4; inert for non-pooled, T5a)."
+  (%with-writer-lock (writer)
+    (let ((hc (rtps-writer-hc writer)))
+      (dolist (ch changes t)
+        (let ((rc (dds.rtps.history:cache-change-send-refcount ch)))
+          (setf (dds.rtps.history:cache-change-send-refcount ch) (if (plusp rc) (1- rc) 0)))
+        (dds.rtps.history:hc-try-release-pooled hc ch)))))   ; deferred pool-release on the last ref drop of an evicted pooled change (T5a)
+
+(defun* writer-acquire-payload-buffer (writer)
+    (function (rtps-writer) t)
+  "Acquire ONE secured-payload buffer from WRITER's HistoryCache PAYLOAD-POOL under the writer LOCK
+   (WP-DDS-SECURITY-ZEROALLOC-AEAD T5a) — so the pool's free-list is mutated under the SAME lock that guards
+   SEND-REFCOUNT + the eviction/ref-drop pool-release (hc-try-release-pooled), never torn by a concurrent
+   release. Returns the octet-buffer, or NIL when the pool is EXHAUSTED (the caller, publish-sample, routes NIL
+   to RESOURCE_LIMITS backpressure — NEVER a GC-heap fallback) OR when no pool is provisioned (security off /
+   not a pooled writer — the caller then takes the allocating path; distinguish the two via
+   history-cache-payload-pool). Does NOT create a change: the caller encodes into the buffer with
+   encode-serialized-payload-into, then threads it onto the change via writer-write (releasing it on a :timeout
+   with writer-release-payload-buffer). No allocation."
+  (%with-writer-lock (writer)
+    (let ((pool (dds.rtps.history:history-cache-payload-pool (rtps-writer-hc writer))))
+      (when pool (dds.core.arena:pool-acquire pool)))))
+
+(defun* writer-release-payload-buffer (writer buffer)
+    (function (rtps-writer t) t)
+  "Return BUFFER (a writer-acquire-payload-buffer result) DIRECTLY to WRITER's PAYLOAD-POOL under the writer
+   LOCK — for the FAILURE paths where it was acquired but NEVER attached to a stored change: an oversize-payload
+   reject, or a full-cache :timeout from writer-write (the change was not added). This keeps a rejected secured
+   publish from leaking a pool slot. A NIL BUFFER or no pool is a no-op. NOT for a CHANGE-OWNED buffer — that is
+   released only through the eviction/ref-drop gate (hc-try-release-pooled); the two paths are mutually exclusive
+   (a buffer is either change-owned or returned here, never both), so there is no double-release
+   (WP-DDS-SECURITY-ZEROALLOC-AEAD T5a). No allocation."
+  (when buffer
+    (%with-writer-lock (writer)
+      (let ((pool (dds.rtps.history:history-cache-payload-pool (rtps-writer-hc writer))))
+        (when pool (dds.core.arena:pool-release pool buffer)))))
+  t)
+
+(defun* writer-ensure-payload-pool (writer provision-fn)
+    (function (rtps-writer function) t)
+  "Install a secured-payload encode pool onto WRITER's HistoryCache UNDER THE WRITER LOCK iff none exists yet,
+   carving it via PROVISION-FN — the thread-safe, idempotent lazy provisioning point for the LIVE DDS-Security
+   handshake, where the crypto keys (and hence the need to pool the encode buffer) are installed AFTER
+   enable-publisher, so the first secured publish must carve the pool (WP-DDS-SECURITY-ZEROALLOC-AEAD T5a).
+   PROVISION-FN is a thunk of the HistoryCache returning a fresh dds.core.arena:buffer-pool (sized by the caller
+   from the HC's HISTORY/RESOURCE_LIMITS), or NIL when no pool could be carved (e.g. the arena has no room).
+   Returns the resulting pool, or NIL when none was carved — the caller then takes the allocating encode path
+   (byte-identical + correct), never an error and never a GC-silent claim. The carve runs at most ONCE (a no-op
+   once a pool exists), under the SAME lock that guards acquire/release/eviction, so a concurrent first publish
+   provisions exactly once. Off the steady state (first publish only), so steady publish stays zero-alloc."
+  (%with-writer-lock (writer)
+    (let ((hc (rtps-writer-hc writer)))
+      (or (dds.rtps.history:history-cache-payload-pool hc)
+          (let ((pool (funcall provision-fn hc)))
+            (when pool
+              (setf (dds.rtps.history:history-cache-payload-pool hc) pool))
+            pool)))))
+
+(defun* writer-on-acknack (writer reader-id base numbits bitmap &optional (acquire-refs nil))
+    (function (rtps-writer t integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)) &optional t)
+              (values list list))
   "Process an ACKNACK from READER-ID (the opaque per-reader key; RTPS 2.5 §8.3.7.1). Confirm SN < BASE, then
    for each NACKed SN (bit set in BITMAP) return a resend if present, else a GAP.
    Returns (values data-resends gap-sns), data-resends a list of CacheChanges (so the
-   resend path dispatches :data vs :dispose/:unregister exactly as the initial push)."
+   resend path dispatches :data vs :dispose/:unregister exactly as the initial push).
+   ACQUIRE-REFS (default NIL = the prior behaviour, byte-identical — the value-level/test callers): when T,
+   ACQUIRE a send-ref on each resend (increment SEND-REFCOUNT) ATOMICALLY under this same lock as it is read
+   from the HistoryCache (the operating contract §4 release-safety) — so a concurrent eviction cannot recycle
+   a resent payload's pooled buffer before the retransmit copies it (T5a). The send-path callers (%on-user-acknack,
+   %pvms-on-acknack) pass T and MUST writer-release-change-refs the returned resends after emitting them; a
+   caller that only inspects the resends (no deferred/cross-thread send) leaves it NIL. Behaviorally neutral
+   today (the GC pins the payload)."
   (%with-writer-lock (writer)
     (let ((proxy (get-reader-proxy writer reader-id))
           (resends '())
@@ -232,7 +388,8 @@
           (let* ((sn (+ base i))
                  (ch (dds.rtps.history:hc-get-change (rtps-writer-hc writer) sn)))
             (if ch
-                (push ch resends)
+                (progn (when acquire-refs (incf (dds.rtps.history:cache-change-send-refcount ch)))   ; acquire atomic with the read (release-safety)
+                       (push ch resends))
                 (push sn gaps)))))
       (values (nreverse resends) (nreverse gaps)))))
 
@@ -587,7 +744,7 @@
       (when (null ch) (return-from writer-frag-heartbeat nil))
       (let ((payload (dds.rtps.history:cache-change-serialized-payload ch)))
         (when (null payload) (return-from writer-frag-heartbeat nil))
-        (values (ceiling (length payload) *fragment-size*)
+        (values (ceiling (dds.rtps.history:cache-change-payload-len ch) *fragment-size*)   ; TRUE length, not the oversized pooled vec (T5a)
                 (incf (rtps-writer-frag-hb-count writer)))))))
 
 (defun* writer-on-nack-frag (writer sn base numbits bitmap)
@@ -600,7 +757,8 @@
       (when (null ch) (return-from writer-on-nack-frag nil))
       (let ((payload (dds.rtps.history:cache-change-serialized-payload ch)))
         (when (null payload) (return-from writer-on-nack-frag nil))
-        (writer-frag-plan-for (length payload) *fragment-size* base numbits bitmap)))))
+        (writer-frag-plan-for (dds.rtps.history:cache-change-payload-len ch)   ; TRUE length, not the oversized pooled vec (T5a)
+                              *fragment-size* base numbits bitmap)))))
 
 (defun* writer-sample-payload (writer sn)
     (function (rtps-writer integer) (or null (array (unsigned-byte 8) (*))))

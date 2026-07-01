@@ -260,7 +260,7 @@
                   (with-sender-emit-guard (:flow-scheduler (flow-controller-emit-errors controller))   ; catch INSIDE the unwind-protect: barrier cleanup still disarms, the error never escapes the loop
                     (dds.disc::%emit-plan-entry node (flow-controller-scratch controller) (car plan)
                                                 (%flow-acquire-hook controller)))
-                  (setf (dds.disc::disc-node-flow-step-state node) (cdr plan)))))   ; advance the cursor whether sent or dropped (Option 1: drop + advance; reliability repairs via NACK/HEARTBEAT)
+                  (dds.disc::%flow-step-advance node plan))))   ; advance the cursor whether sent or dropped (Option 1: drop + advance; reliability repairs via NACK/HEARTBEAT) + release the snapshot's send-refs on drain (release-safety)
           (dds.pal:with-lock ((flow-controller-lock controller))   ; disarm the barrier: emit on NODE is done
             (setf (flow-controller-current-emit-node controller) nil)
             (dds.pal:condvar-signal (flow-controller-emit-done-cv controller)))))))

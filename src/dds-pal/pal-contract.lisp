@@ -16,7 +16,7 @@
    ;; capability introspection
    #:+pal-capabilities+ #:pal-impl-name
    ;; memory (off-heap, non-GC'd, raw-pointer-addressable)
-   #:alloc-static #:free-static #:static-pointer #:static-length
+   #:alloc-static #:free-static #:static-pointer #:static-length #:static-sap+
    #:mem-ref-u8 #:mem-set-u8
    ;; atomics (generic M0 stubs); foreign-SAP fast paths for hot-path use (M1, ADR 0013)
    #:cas #:atomic-incf #:fence

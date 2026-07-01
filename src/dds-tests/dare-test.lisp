@@ -168,6 +168,27 @@
                 (null (dds.dare:aes-256-gcm-open key nonce bad-aad ct tag))
                 "open: 1-bit AAD flip must return NIL (fail-closed)")))
 
+    ;; into-buffer variants must be byte-identical to the allocating entries (NIST TC16)
+    (let* ((out (dds.pal:alloc-static (+ 60 16)))      ; ct(60) || tag(16)
+           (nonce-s (dds.pal:alloc-static 12))
+           (pt-s (dds.pal:alloc-static 60)))
+      (replace nonce-s nonce) (replace pt-s pt)
+      (dds.dare:aes-256-gcm-seal-into out 0 60 key nonce-s 0 aad pt-s 0 60)
+      (%check :aes-gcm-seal-into-ct  (equalp (subseq out 0 60) expected-ct) "seal-into: CT must match NIST KAT")
+      (%check :aes-gcm-seal-into-tag (equalp (subseq out 60 76) expected-tag) "seal-into: tag must match NIST KAT")
+      (let ((pt-out (dds.pal:alloc-static 60)))
+        (%check :aes-gcm-open-into-ok (eq t (dds.dare:aes-256-gcm-open-into pt-out 0 key nonce-s 0 aad out 0 60 out 60))
+                "open-into: must return T for valid (ct,tag)")
+        (%check :aes-gcm-open-into-rt (equalp pt-out pt) "open-into: plaintext must round-trip")
+        (setf (aref out 60) (logxor (aref out 60) 1))   ; tamper tag
+        (%check :aes-gcm-open-into-tamper
+                (null (dds.dare:aes-256-gcm-open-into pt-out 0 key nonce-s 0 aad out 0 60 out 60))
+                "open-into: tag tamper must return NIL (fail-closed)")
+        (%check :aes-gcm-open-into-tamper-wiped (every #'zerop pt-out)
+                "open-into: tampered open must leave the plaintext region zeroed (no leak)")
+        (dds.pal:free-static pt-out))
+      (dds.pal:free-static out) (dds.pal:free-static nonce-s) (dds.pal:free-static pt-s))
+
     t))
 
 (defun* run-dare-ml-kem-kat-test ()

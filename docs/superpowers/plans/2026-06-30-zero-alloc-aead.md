@@ -295,6 +295,17 @@ git commit -m "feat(security): WP-DDS-SECURITY-ZEROALLOC-AEAD — wire the live 
 
 ---
 
+## Task 5 (EXPANDED 2026-06-30): live-path payload pooling — 4 sub-tasks
+
+The original Task 5 (call-site swap to a reused buffer) is SUPERSEDED: the payload is retained by reference (encode→HistoryCache for retransmit/KEEP_LAST; decode→`disc-node-samples` drained by the app thread), so a reused buffer corrupts/races. Owner chose (2026-06-30) full pooling so the LIVE secured path is zero-alloc. Detailed design + lifecycle anchors: `.superpowers/sdd/pooling-design.md`. Four sub-tasks, in order (T5a/T5b independent after T5a-pre; T5c last):
+
+- **T5a-pre — encode release-safety (HIGH risk, first).** Add a refcount(+generation) to `cache-change` (mirror `zerocopy-pool.lisp:16-17`): a send plan/thunk acquires a ref on the payload, releases it after copying into the datagram; the pooled buffer returns to the pool only when evicted AND refcount==0. Lands behaviorally-neutral (no pooling yet) + testable in isolation (a change is not releasable while a send is pending).
+- **T5a — encode payload pool.** Per-node/per-writer `make-buffer-pool` (element-bytes `44+max+3`, capacity depth×instances + in-flight headroom); `publish-sample` encodes via `encode-serialized-payload-into` into a pooled buffer; `%hc-remove-change` `pool-release`s it (gated by T5a-pre); exhaustion → existing `:timeout` backpressure, never GC. Security-OFF byte-identical.
+- **T5b — decode loaned plaintext (MED-HIGH; app-API change).** `%deliver-user-sample` decodes via `decode-serialized-payload-into` into a pooled buffer; store a length-tagged handle in `disc-node-samples`; secured loan-capable reads return a loan via the `dr-loans` registry shape; `return-loan` `pool-release`s it. Secured reads must adopt `take-loaned`/`return-loan` (document the read-contract change). New non-SAP pool plumbing (not the SHMEM ZC slot). Exhaustion → SAMPLE_REJECTED/backpressure, never GC.
+- **T5c — live-path mem arm + exhaustion-backpressure proof.** perftest secured live path asserts 0.0000 B/sample (pub+sub, security ON); a test that pool exhaustion yields RESOURCE_LIMITS/`:timeout` (writer) + SAMPLE_REJECTED/loan-backpressure (reader), never a GC fallback; verification.csv row.
+
+---
+
 ## Task 6: Capstone — ADR 0038 + docs + final gate sweep
 
 **Files:**
@@ -309,6 +320,20 @@ git commit -m "feat(security): WP-DDS-SECURITY-ZEROALLOC-AEAD — wire the live 
 git add docs/adr/0038-zero-alloc-aead.md docs/adr/0036-dds-security-secure-discovery.md docs/wiki/security.md docs/verification.csv
 git commit -m "docs(security): WP-DDS-SECURITY-ZEROALLOC-AEAD — Slice 1 capstone: ADR 0038 + ADR-0036 Carry-3 flip + wiki/verification; data_protection AEAD 0.0000 B/sample, wire byte-identical (M7/P6 Slice 1)"
 ```
+
+---
+
+## Task 1b: Zero-cons AES-GCM FFI (added 2026-06-30 after the zero-cons-FFI spike)
+
+The spike (`.superpowers/sdd/spike-zerocons-ffi.md`) found the into-buffer FFI from Task 1 still conses ~770 B/iter — **~91% from `%ossl-sym` doing a `cffi:foreign-symbol-pointer` lookup ~10×/call**, the rest from boxed-SAP outputs + variable `with-foreign-pointer` input scratch. A prototype reached **0.000 B/iter on SBCL with the NIST KAT byte-identical**. This runs AFTER Task 3, BEFORE Task 4 (so T4's mem arm can assert 0.0000). Two bisectable sub-tasks; the spike report is the detailed brief.
+
+### Task 1b-i: cache the EVP function pointers (≈91% of the win, small)
+**Files:** Modify `src/dds-dare/primitives.lisp`. Cache each EVP symbol pointer once via `(load-time-value (cffi:foreign-symbol-pointer "EVP_…") t)` (and cache the `EVP_aes_256_gcm` cipher pointer) instead of calling `%ossl-sym` per EVP call. Pure ANSI+CFFI; stays in dds-dare; no contract change. Keep the NIST KAT byte-identical. Measure the residual (expect ~80 B/iter after this). our-to-our green both impls.
+
+### Task 1b-ii: `dds.pal:static-sap+` + zero-box outputs/inputs (the last ~80 B → 0)
+**Files:** Modify `src/dds-pal/pal-sbcl.lisp` + `src/dds-pal/pal-clasp.lisp` + the PAL package/contract (additive export of `static-sap+`) + `src/dds-dare/primitives.lisp`. Add `dds.pal:static-sap+ (vec offset) → sap` — an INLINE fn with internal `(safety 0)` returning the SAP at `vec[offset]` without boxing (SBCL `sb-sys:sap+`/`vector-sap`; Clasp `cffi:inc-pointer` over `static-vector-pointer` — Clasp `bytes-consed` is 0 so correctness, not zero-box, is the bar there). Rewrite the `seal-into`/`open-into` output writes to use it (drop boxed `static-pointer`+`inc-pointer`); use a cached null pointer + constant/static input scratch so no per-call SAP is boxed. The inline-fn-with-internal-(safety 0) keeps dds-dare's own bounds + key-zeroize + fail-closed-wipe checks intact (do NOT add whole-function safety 0 — the spike showed it does not help and would drop the security checks). **Preserve byte-for-byte:** the key-zeroization and the fail-closed plaintext wipe must be unchanged in effect; the NIST KAT byte-identical. Measure SBCL ~0.000 B/iter for both entries. This is an ADDITIVE PAL-contract change — record `static-sap+` in ADR 0038 (T6). our-to-our green both impls.
+
+**DoD for Task 1b:** `aes-256-gcm-seal-into` + `aes-256-gcm-open-into` measure ~0.000 B/iter on SBCL (focused bytes-consed loop); NIST KAT + every byte-exact corpus green UNCHANGED; fail-closed wipe + key-zeroize preserved; both impls green.
 
 ---
 

@@ -4,7 +4,7 @@
   (:documentation
    "M0 test harness. run-all-tests is invoked by (asdf:test-system :dds-tests)
     and signals on any failure so the build gate goes red.")
-  (:export #:run-all-tests #:run-echo-test #:run-mem-test #:run-pbt-tests
+  (:export #:run-all-tests #:run-echo-test #:run-mem-test #:run-mem-test-secure #:run-pbt-tests
            #:run-pal-signal-handler-test
            #:run-bench-flatdata #:run-bench-flatdata-zc-loan #:run-bench-zc-loan-lockfree
            #:run-bench-async-flow #:test-failure #:run-durability-store-test
@@ -54,6 +54,7 @@
            #:run-security-secured-payload-corpus-test
            #:run-security-secured-payload-pad-corpus-test
            #:run-security-payload-roundtrip-test
+           #:run-security-payload-into-test
            #:run-security-payload-fuzz-test
            #:run-security-encrypted-pubsub-test
            #:run-security-encrypted-fragmented-test

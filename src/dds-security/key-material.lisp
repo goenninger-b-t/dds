@@ -50,7 +50,38 @@
    :type (simple-array (unsigned-byte 8) (*)))
   ;; Nonce-uniqueness state: iv-counter is the only mutable field; must be incremented atomically.
   (iv-counter 0 :type (unsigned-byte 64))
-  (iv-counter-lock (dds.pal:make-lock "km-iv") :type t))
+  (iv-counter-lock (dds.pal:make-lock "km-iv") :type t)
+  ;; §9.5.3.3.4.2 session-key cache: derived once per (master_sender_key, master_salt, session_id) triplet.
+  (cached-session-id  nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (cached-session-key nil :type (or null (simple-array (unsigned-byte 8) (32)))))
+
+(defun* %km-session-key-at (km session-id-vec session-id-off)
+    (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum) (simple-array (unsigned-byte 8) (32)))
+  "Cached §9.5.3.3.4.2 session key for KM at the 4-octet session_id in SESSION-ID-VEC[OFF..OFF+4]. The key is
+   constant for a fixed master key + salt + session_id, so it is derived once and reused (the per-sample KDF is
+   removed). Hit path is lock-free + zero-alloc; miss path uses a release fence (key store → fence → id store)
+   and hit path uses an acquire fence (id match → fence → key load) to guarantee barrier-safe cache publication
+   on weak-memory platforms (arm64/Apple Silicon; operating contract §4). A benign concurrent same-value miss
+   race is still harmless — both missers derive the identical deterministic key."
+  (assert (<= (+ session-id-off 4) (length session-id-vec)))
+  (let ((cid (key-material-cached-session-id km)))
+    (if (and cid (= (length cid) 4)
+             (= (aref cid 0) (aref session-id-vec session-id-off))
+             (= (aref cid 1) (aref session-id-vec (+ session-id-off 1)))
+             (= (aref cid 2) (aref session-id-vec (+ session-id-off 2)))
+             (= (aref cid 3) (aref session-id-vec (+ session-id-off 3))))
+        (progn
+          ;; Acquire fence: key load must see the release that published it (operating contract §4).
+          (dds.pal:fence :acquire)
+          (key-material-cached-session-key km))
+        (let* ((sid (subseq session-id-vec session-id-off (+ session-id-off 4)))
+               (k   (derive-session-key (key-material-master-sender-key km)
+                                        (key-material-master-salt km) sid)))
+          (setf (key-material-cached-session-key km) k)
+          ;; Release fence: key store visible before the id store (the gate); operating contract §4.
+          (dds.pal:fence :release)
+          (setf (key-material-cached-session-id km) sid)
+          k))))
 
 ;;; Fixed test key material — a known, PUBLISHED, non-secret value for offline round-trip tests.
 ;;; The 32-byte master_sender_key and master_salt are the two consecutive NIST SP 800-56C rev2

@@ -14,7 +14,11 @@
            #:cache-change-instance-key-hash #:cache-change-serialized-payload
            #:cache-change-status-info
            #:cache-change-source-timestamp #:cache-change-inline-qos
-           #:history-cache #:make-history-cache #:hc-change-count #:hc-kind #:hc-max-samples
+           #:cache-change-send-refcount #:cache-change-releasable-p
+           #:cache-change-pooled-buffer #:cache-change-pooled-len #:cache-change-evicted
+           #:cache-change-payload-len
+           #:history-cache #:make-history-cache #:hc-change-count #:hc-kind #:hc-max-samples #:hc-depth
+           #:history-cache-payload-pool #:hc-try-release-pooled
            #:hc-add-change #:hc-remove-change #:hc-purge-below #:hc-get-change
            #:hc-min-seq #:hc-max-seq #:hc-changes-for-reader
            #:history-not-implemented))
@@ -104,7 +108,10 @@
            #:*fragment-size* #:*max-reassembly-bytes* #:*max-reassembly-fragments* #:*max-gap-range*
            #:reader-on-data-frag #:reader-frag-acknack
            #:writer-frag-plan #:writer-frag-plan-for
-           #:writer-frag-heartbeat #:writer-on-nack-frag #:writer-sample-payload))
+           #:writer-frag-heartbeat #:writer-on-nack-frag #:writer-sample-payload
+           #:writer-capture-unsent #:writer-acquire-sample
+           #:writer-release-change-ref #:writer-release-change-refs
+           #:writer-acquire-payload-buffer #:writer-release-payload-buffer #:writer-ensure-payload-pool))
 
 ;;;; dds.rtps.discovery — SPDP Locator_t codec + SPDPdiscoveredParticipantData
 ;;;; build/parse (RTPS 2.5 §8.5.3 / §9.6.2). Wire constants pinned from the in-repo

@@ -465,12 +465,19 @@ work-package ledger:
    `transformation_key_id`-resolved endpoint equals the inner writerId. Benign today (the path requires a
    genuine authenticated+keyed peer's EntityCrypto); a one-line consistency assert (resolved-endpoint ==
    inner writerId) would be defense-in-depth against future routing logic changes.
-3. **Zero-alloc into-buffer AEAD on the data path.** The SRTPS send/receive buffer is reused in place, but the
-   codec's `→octets` return + the AEAD intermediates leave a ~2.2 KB/datagram heap residual (inherited from the
-   T4/Slice-1 return contract; OpenSSL-FFI dominates the ~5 µs/op). A fully zero-alloc path needs an
-   into-buffer AEAD codec (a `dds-dare`/`dds-security` rewrite). **Note:** `make mem` covers the gated CDR
-   serialize/deserialize hot path (0.0000) and does **not** cover the dds-disc rtps path — do not read green
-   `make mem` as covering the T10 allocation.
+3. **Zero-alloc into-buffer AEAD on the data path — PARTIALLY RESOLVED (ADR 0038, WP-DDS-SECURITY-ZEROALLOC-AEAD,
+   2026-07-01).** The **`data_protection` (serialized-payload) tier + the shared into-buffer foundation are resolved
+   in ADR 0038**: an into-buffer AEAD FFI (`aes-256-gcm-{seal,open}-into`) + `dds.pal:static-sap+` (FFI 864 → 0.000
+   B/iter) + a session-key cache + an into-buffer codec core (`encode/decode-serialized-payload-into`; the existing
+   entries are now thin wrappers) + a refcount-gated encode payload pool (353 → 0.0) + a loaned decode-plaintext pool
+   (4042 → 0.0) make the LIVE `data_protection` publish + receive path zero GC-alloc/sample, and `make mem` gained
+   security-ON arms (`aead-encode`/`-decode`/`-live-pub`/`-live-rx`, all 0.0000) that finally cover the security path.
+   **The submessage (`metadata_protection`) + whole-RTPS (`rtps_protection`, the ~2.2 KB/datagram) tiers are CARRIED
+   to Slice 2** — they REUSE the same foundation; they are NOT zero-alloc yet. Wire byte-identical throughout (NIST
+   KAT + every byte-exact corpus green UNCHANGED). Original note (still true for the un-migrated tiers): the SRTPS
+   send/receive buffer is reused in place but the codec's `→octets` return + the AEAD intermediates leave a ~2.2 KB
+   /datagram heap residual (OpenSSL-FFI dominates the ~5 µs/op); do not read a green `make mem` on the CDR path as
+   covering the dds-disc rtps path — the security-ON arms cover only the `data_protection` tier.
 4. **Per-topic `metadata_protection_kind` applied to user endpoints.** The primitive supports it and the
    governance field is parsed, but selective per-user-endpoint submessage protection is not wired —
    `rtps_protection` already protects user datagrams wholesale, so nothing is left in the clear; this is a thin

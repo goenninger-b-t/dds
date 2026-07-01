@@ -16,6 +16,8 @@
    #:hkdf-sha384
    #:aes-256-gcm-seal
    #:aes-256-gcm-open
+   #:aes-256-gcm-seal-into
+   #:aes-256-gcm-open-into
    #:ml-kem-1024-keygen
    #:ml-kem-1024-encapsulate
    #:ml-kem-1024-decapsulate

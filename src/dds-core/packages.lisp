@@ -39,6 +39,6 @@
     engine maps it to RESOURCE_LIMITS, NEVER a GC-heap fallback.")
   (:export #:*static-arena-bytes* #:arena #:init-arena #:teardown-arena
            #:arena-initialized-p #:arena-report
-           #:make-buffer-pool #:pool-acquire #:pool-release
+           #:buffer-pool #:make-buffer-pool #:pool-acquire #:pool-release
            #:pool-high-water #:pool-capacity #:pool-in-use
            #:arena-exhausted))

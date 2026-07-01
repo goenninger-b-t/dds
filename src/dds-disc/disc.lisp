@@ -160,6 +160,7 @@
   (async-tx-msg nil :type (or null dds.core.buffer:octet-buffer)) ; the sender thread's OWN scratch buffer
   (async-emit-errors 0 :type fixnum) ; WP-SENDER-ERROR-RESILIENCE: count of emit errors the async sender thread caught + survived (FR-PF-2)
   (flow-step-state nil :type t) ; WP-ASYNC-FLOW: the node's in-progress per-datagram send plan ((host . port) . PLAN), threaded across %flow-step-emit calls; NIL = rebuild on next call
+  (flow-step-refs nil :type list) ; release-safety (operating contract §4): the CacheChanges %node-datagram-plan acquired a send-ref on at snapshot; released when the plan drains (%flow-step-advance); single-mutator (the draining thread), like flow-step-state
   (flow-controller nil :type t) ; WP-ASYNC-FLOW: the flow-controller this writer is associated with (NIL = none); set/cleared under the CONTROLLER lock; non-NIL makes publish async-and-paced (the controller thread sends)
   (flow-pending nil :type t)    ; WP-ASYNC-FLOW: new unsent work awaiting a fresh plan snapshot; set by %flow-signal, cleared by the scheduler — guarded by the CONTROLLER lock (NOT the node lock)
   (samples (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> payload (§8.3.5.4: SN is per-writer; no per-sample composite-key alloc)
@@ -168,6 +169,36 @@
   (sample-origins (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> (effective-origin-GUID . effective-origin-SN): the PID_ORIGINAL_WRITER_INFO logical origin when the received sample was relayed (RTPS 2.5 §8.3.5.4), absent for a direct sample (then the wire GUID/SN IS the origin)
   (capture-data-key-hash nil :type boolean) ; durability collect node opts in to materialize the wire PID_KEY_HASH on :data (control-plane); default NIL = byte-identical, no hot-path alloc (ADR 0029, RTPS 2.5 §9.6.4.8)
   (crypto-transform nil :type t) ; DDS-Security 1.1 §9.5.3.3 Slice-1: key-material for AES256-GCM serialized-payload protection; NIL = security OFF, byte-identical hot path (ADR 0031)
+  (payload-arena nil :type t) ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: per-node static arena backing the user writer's secured-payload pool (carved by %ensure-secured-payload-pool — at enable when crypto is already on, or lazily on the first secured publish when keys arrive after enable via the live DDS-Security handshake; stop-node tears it down); NIL = security OFF / no pool, byte-identical
+  ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: per-node DECODE side (data_protection RECEIVE). SECURED-LOAN-CAPABLE
+  ;; (opt-in; set-secured-loan-capable) routes a secured receive through the LOAN pattern: the receiver thread
+  ;; decodes the SecuredPayload into a DECODE-POOL buffer (decode-serialized-payload-into, zero per-sample
+  ;; plaintext alloc) and stores a SECURED-LOAN-HANDLE (not a bare plaintext vector) in disc-node-samples — the
+  ;; buffer lifetime is tied to the loan registry (SECURED-LOANS), NOT the never-purged samples store, so it
+  ;; cannot leak/pin. DECODE-ARENA is the static arena backing DECODE-POOL (a fixed pool of plaintext buffers,
+  ;; carved lazily by %ensure-secured-decode-pool). DECODE-POOL-LOCK serializes pool-acquire/release across the
+  ;; single receiver thread + the app thread (return-loan); it nests INSIDE disc-node-lock (lock order:
+  ;; disc-node-lock outer). DECODE-POOL-REJECTS counts samples dropped on pool exhaustion (SAMPLE_REJECTED;
+  ;; un-acked -> writer backpressure, never a GC fallback). WP-DDS-SECURITY-ZEROALLOC-AEAD T5d de-cons the loan
+  ;; WRAPPER so the secured RECEIVE adds 0 B/sample over plain: DECODE-HANDLE-VEC/-TOP is a FREELIST of
+  ;; preallocated secured-loan-handle structs (recycled on return like the buffer pool — no per-sample struct
+  ;; cons; guarded by DECODE-POOL-LOCK, paired 1:1 with the buffer pool so acquire never fails when a buffer was
+  ;; free). SECURED-LOAN-VEC/-COUNT is the outstanding-loan registry as a fixed vector + fill pointer (O(1)
+  ;; register/deregister via the handle's REG-INDEX swap-remove — replaces the per-loan list cons; guarded by
+  ;; disc-node-lock). SECURED-TAKE-VEC is the reused node-take-loaned result buffer (single-consumer — the node's
+  ;; one user reader — so no per-take list cons). All three carved once by %ensure-secured-decode-pool, sized to
+  ;; the pool capacity. All NIL/0/#() default = secured loan OFF -> the allocating decode-serialized-payload path,
+  ;; byte-identical.
+  (secured-loan-capable nil :type boolean)
+  (decode-arena nil :type t)
+  (decode-pool nil :type t)
+  (decode-pool-lock (dds.pal:make-lock "decode-pool") :type t)
+  (decode-handle-vec #() :type simple-vector)
+  (decode-handle-top 0 :type fixnum)
+  (secured-loan-vec #() :type simple-vector)
+  (secured-loan-count 0 :type fixnum)
+  (secured-take-vec nil :type (or null simple-vector))
+  (decode-pool-rejects 0 :type (integer 0))
   (sample-key-hashes (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet wire key-hash of the :data sample (RTPS 2.5 §9.6.4.8), absent when not captured
   (lifecycle-changes (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> (kind key-hash status writer-id source-guid) (§8.3.5.4: SN is per-writer; no per-change composite-key alloc)
   (ack-count 0 :type integer)
@@ -661,6 +692,10 @@
 
 ;; %lease-sweep is defined below but called from announce-endpoints above it.
 (declaim (ftype (function (disc-node) (eql t)) %lease-sweep))
+
+;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: defined in dataplane.lisp (loaded after this file); forward-declared so
+;; stop-node releases every outstanding secured loan (returns its pooled buffer to the pool) before teardown-arena.
+(declaim (ftype (function (disc-node) t) node-return-all-loans))
 
 ;; %source-guid is defined in dataplane.lisp (loaded after this file).
 (declaim (ftype (function ((simple-array (unsigned-byte 8) (12)) (unsigned-byte 32))
@@ -1455,6 +1490,13 @@
   (when (disc-node-rx-tx-msg node)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-rx-tx-msg node)))
     (setf (disc-node-rx-tx-msg node) nil))
+  (when (disc-node-payload-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: free the secured-payload pool's static buffers AFTER every sender/receiver thread is joined (no live acquire/release)
+    (dds.core.arena:teardown-arena (disc-node-payload-arena node))
+    (setf (disc-node-payload-arena node) nil))
+  (when (disc-node-decode-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: return every outstanding secured loan (so loaned buffers re-enter the pool's slots) BEFORE freeing the decode pool's static buffers — the receiver thread is already joined (no live acquire)
+    (node-return-all-loans node)
+    (dds.core.arena:teardown-arena (disc-node-decode-arena node))
+    (setf (disc-node-decode-arena node) nil (disc-node-decode-pool node) nil))
   t)
 
 (defun* disc-node-discovered-count (node)

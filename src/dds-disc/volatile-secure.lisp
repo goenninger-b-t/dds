@@ -534,12 +534,14 @@
             (sid (%pvms-role-session-id (disc-node-guid-prefix node) src-prefix)))
         (when (and writer km hp base)
           (multiple-value-bind (resends gaps)
-              (dds.rtps.reliable:writer-on-acknack writer rkey base numbits bitmap)
+              (dds.rtps.reliable:writer-on-acknack writer rkey base numbits bitmap t)   ; acquire send-refs on resends, atomic with the read (release-safety)
             (declare (ignore gaps))   ; KEEP_ALL volatile never evicts in this slice -> no GAP needed
-            (dolist (ch resends)
-              (let ((sn (dds.rtps.history:cache-change-sn ch))
-                    (pl (dds.rtps.history:cache-change-serialized-payload ch)))
-                (when pl (%pvms-emit-data node km sn pl (car hp) (cdr hp) sid))))
+            (unwind-protect
+                 (dolist (ch resends)
+                   (let ((sn (dds.rtps.history:cache-change-sn ch))
+                         (pl (dds.rtps.history:cache-change-serialized-payload ch)))
+                     (when pl (%pvms-emit-data node km sn pl (car hp) (cdr hp) sid))))
+              (dds.rtps.reliable:writer-release-change-refs writer resends))   ; release after the retransmit DATA is emitted (copied)
             ;; T8 review fix (N>2 correctness): bound the VOLATILE PVMS writer history by the SLOWEST matched
             ;; PVMS reader's ack — purge over ALL matched-remote reader keys, NOT the lone ACKNACKer's rkey
             ;; (the shared one-per-node writer spans every remote on ONE SN space; a single-key purge would

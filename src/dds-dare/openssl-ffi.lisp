@@ -100,8 +100,8 @@
   (setf *libcrypto* (%load-libcrypto)))
 
 (defmacro %ossl-sym (name)
-  "Return the function pointer for OpenSSL symbol NAME from *LIBCRYPTO*."
-  `(cffi:foreign-symbol-pointer ,name :library *libcrypto*))
+  "Cached function pointer for OpenSSL symbol NAME; resolved once at load time via *LIBCRYPTO*."
+  `(load-time-value (cffi:foreign-symbol-pointer ,name :library *libcrypto*) t))
 
 ;;; --- version gate ---
 
@@ -222,6 +222,25 @@
 (defconstant +aes-256-gcm-key-len+  32  "AES-256 key length in octets (FIPS 197 §5).")
 (defconstant +aes-gcm-nonce-len+    12  "GCM standard 96-bit (12-byte) nonce (SP 800-38D §5.2.1.1).")
 (defconstant +aes-gcm-tag-len+      16  "GCM authentication tag length in octets (128-bit, SP 800-38D §5.2.1.2).")
+
+;;; Cached null pointer — (cffi:null-pointer) conses ~16 B per call; this load-time singleton is 0-cons
+;;; at every :pointer-NULL argument site on the AEAD hot path (null is address 0, so it is reload-stable).
+(defvar *%null-ptr* (cffi:null-pointer)
+  "Cached CFFI null pointer for OpenSSL :pointer NULL arguments on the zero-alloc AEAD hot path.
+   Read once into a boxed singleton so passing NULL to FOREIGN-FUNCALL-POINTER conses 0 B/call
+   (vs ~16 B for a fresh (cffi:null-pointer)). Null is address 0, so the cached value is image-reload-safe.")
+
+;;; EVP_aes_256_gcm() returns a const static EVP_CIPHER* — cache the handle once at load time.
+(defvar *%aes-256-gcm-cipher* nil
+  "Cached EVP_aes_256_gcm() cipher singleton (const static EVP_CIPHER*, evp.h line 1104, OpenSSL 3.6.2).
+   Resolved once at load time after *LIBCRYPTO* is set. Valid for the lifetime of *LIBCRYPTO*.")
+
+(eval-when (:load-toplevel :execute)
+  (when *libcrypto*
+    (setf *%aes-256-gcm-cipher*
+          (cffi:foreign-funcall-pointer
+           (cffi:foreign-symbol-pointer "EVP_aes_256_gcm" :library *libcrypto*)
+           nil :pointer))))
 
 ;;; EVP_PKEY KEM bindings for ML-KEM-1024 (Task 3).
 ;;;

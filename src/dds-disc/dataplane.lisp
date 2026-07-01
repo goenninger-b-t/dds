@@ -552,9 +552,9 @@
     (function (dds.rtps.history:cache-change) t)
   "T iff CHANGE is a single-submessage (packable) change: a no-payload dispose/unregister (always
    small) or a :data sample whose serializedPayload fits one DATA submessage (≤ *fragment-size*, so it
-   is NOT fragmented into a DATA_FRAG series). Large samples are sent individually by %send-sample."
+   is NOT fragmented into a DATA_FRAG series). Large samples go through %changes-datagram-plan / %sample-plan."
   (or (not (eq (dds.rtps.history:cache-change-kind change) :data))
-      (<= (length (dds.rtps.history:cache-change-serialized-payload change))
+      (<= (dds.rtps.history:cache-change-payload-len change)   ; TRUE length (a secured change's payload is an oversized pooled vec, T5a)
           dds.rtps.reliable:*fragment-size*)))
 
 (defun* %data-builder (node change)
@@ -569,11 +569,12 @@
         (wid (disc-node-user-writer-id node)))
     (if (eq (dds.rtps.history:cache-change-kind change) :data)
         (let* ((pl (dds.rtps.history:cache-change-serialized-payload change))
+               (len (dds.rtps.history:cache-change-payload-len change))   ; TRUE length, not the oversized pooled vec (T5a)
                (iq (dds.rtps.history:cache-change-inline-qos change))
                (iq-len (if iq (length iq) 0)))
-          (cons (+ 24 iq-len (length pl))
+          (cons (+ 24 iq-len len)
                 (lambda (mc) (dds.rtps.message:write-data
-                              mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 (length pl)
+                              mc dds.rtps.message:+entityid-unknown+ wid sn pl 0 len
                               :inline-qos iq))))
         (let ((kh (dds.rtps.history:cache-change-instance-key-hash change))
               (si (dds.rtps.history:cache-change-status-info change)))
@@ -599,12 +600,19 @@
    reference (%zc-ref-builder). NIL when not ZC-eligible OR the pool is saturated — the caller then emits
    the FULL serialized payload (no loss, exactly one of {ref, payload} per reader). ZC-READERS is used
    only as a >0 GATE; the slot refcount is 1 (this ref reaches ONE destination, resolved ONCE there —
-   see %zc-ref-builder). NOT cleared for ship — pending counsel (R6)."
+   see %zc-ref-builder). The eligibility gate AND the loan span use cache-change-payload-len — the TRUE
+   serialized length — NOT (length serialized-payload): a secured change's payload vec is the OVERSIZED
+   fixed pool buffer (T5a), so loaning (length pl) would copy the garbage tail past the true length into
+   the ZC slot, and the remote decode-serialized-payload-into exact-frame check (len == 44+ct_len+pad)
+   would reject the sample (a secured+ZC false-reject). For a non-pooled change payload-len IS
+   (length serialized-payload) — byte-identical to the prior non-secured ZC path. NOT cleared for ship —
+   pending counsel (R6)."
   (when (and (plusp zc-readers)
              (eq (dds.rtps.history:cache-change-kind change) :data))
-    (let ((pl (dds.rtps.history:cache-change-serialized-payload change)))
-      (when (> (length pl) *zerocopy-min-payload-bytes*)
-        (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 (length pl) 1)))))
+    (let ((pl (dds.rtps.history:cache-change-serialized-payload change))
+          (len (dds.rtps.history:cache-change-payload-len change)))   ; TRUE length, not the oversized pooled vec (T5a)
+      (when (> len *zerocopy-min-payload-bytes*)
+        (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 len 1)))))
 
 (defun* %msg-datagram (node build-fn)
     (function (disc-node function) function)
@@ -618,12 +626,14 @@
       (funcall build-fn mc)
       (dds.core.buffer:cursor-position mc))))
 
-(defun* %sample-plan (node sn pl budget)
-    (function (disc-node integer (simple-array (unsigned-byte 8) (*)) (integer 1)) list)
-  "The ORDERED list of one-datagram build-thunks (each lambda (buf) -> octet-length) for sample (SN, PL):
-   one DATA datagram if PL fits *fragment-size*, else a DATA_FRAG series (packing as many fragments as fit
+(defun* %sample-plan (node sn pl size budget)
+    (function (disc-node integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 1)) list)
+  "The ORDERED list of one-datagram build-thunks (each lambda (buf) -> octet-length) for sample (SN, PL) of
+   SIZE octets (SIZE is the TRUE serialized length — for a secured change PL is the oversized pooled vec and
+   SIZE < (length PL), T5a; the codec offsets all index within [0, SIZE)): one DATA datagram if SIZE fits
+   *fragment-size*, else a DATA_FRAG series (packing as many fragments as fit
    BUDGET per datagram, RTPS 2.5 §9.4.5.5) followed by a HEARTBEAT_FRAG. Loss injection is applied HERE,
-   identically to the prior inline %send-sample: a small DATA whose SN is in *DEBUG-DROP-SAMPLE-NUMBERS* and
+   via *DEBUG-DROP-SAMPLE-NUMBERS*: a small DATA whose SN is in *DEBUG-DROP-SAMPLE-NUMBERS* and
    a DATA_FRAG submessage covering a fragment in *DEBUG-DROP-FRAGMENT-NUMBERS* are omitted (no thunk). The
    HEARTBEAT_FRAG count side-effect (writer-frag-heartbeat increments a counter) runs ONCE here — exactly as
    the prior flush-all ran it once — and the captured (lastfrag count) close over the thunk, so stepping is
@@ -631,8 +641,7 @@
    NOTE: inline-QoS (cache-change-inline-qos) is carried ONLY on the small-DATA path (%data-builder above);
    this DATA_FRAG path does NOT thread inline-QoS — RTPS 2.5 §9.4.5.5 makes it optional, and relay samples
    are ShapeType-sized, always below *fragment-size*, so they never reach this branch."
-  (let ((size (length pl))
-        (wid (disc-node-user-writer-id node)))
+  (let ((wid (disc-node-user-writer-id node)))
     (if (<= size dds.rtps.reliable:*fragment-size*)
         (if (and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*))
             '()
@@ -682,6 +691,7 @@
           ((setf zc (%zc-change-item node change zc-readers)) (push zc items))   ; WP-ZEROCOPY: ref, not payload
           ((%small-change-p change) (push (%data-builder node change) items))
           (t (dolist (thunk (%sample-plan node sn (dds.rtps.history:cache-change-serialized-payload change)
+                                          (dds.rtps.history:cache-change-payload-len change)   ; TRUE length (T5a)
                                           (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
                (push (cons thunk nil) frag-plans))))))   ; large samples: UDP only (v1), one datagram per thunk
     (when hb (push hb items))
@@ -732,16 +742,6 @@
           do (setf state (nth-value 2 (%emit-next-datagram node buf state dest-prefix))))   ; T10: wrap to a keyed dest
     t))
 
-(defun* %send-sample (node buf sn pl host port)
-    (function (disc-node dds.core.buffer:octet-buffer integer (simple-array (unsigned-byte 8) (*)) string (unsigned-byte 16)) t)
-  "Send sample (SN, PL) to HOST:PORT: one DATA submessage if PL fits *fragment-size*, else a
-   series of DATA_FRAG submessages (packing as many fragments as fit the datagram) followed by
-   a HEARTBEAT_FRAG. Now the %sample-plan datagram thunks built+sent in order (byte-identical to the prior
-   inline emit). Uses BUF (tx-msg or rx-tx-msg) as the scratch message buffer. A submessage containing a
-   fragment named in *DEBUG-DROP-FRAGMENT-NUMBERS* is skipped, and a non-fragmented DATA whose SN is in
-   *DEBUG-DROP-SAMPLE-NUMBERS* is skipped (loss injection)."
-  (dolist (thunk (%sample-plan node sn pl (- (dds.core.buffer:octet-buffer-capacity buf) 64)))
-    (%send-raw-buf node buf (funcall thunk buf) host port)))
 
 (defun* %send-user-heartbeat (node buf first last count host port &optional dest-prefix)
     (function (disc-node dds.core.buffer:octet-buffer integer integer integer string (unsigned-byte 16)
@@ -809,22 +809,16 @@
 
 (defun* %merge-unsent (writer keys)
     (function (dds.rtps.reliable:rtps-writer list) list)
-  "The UNSENT CacheChanges to push ONCE to a destination shared by the readers KEYS, in ascending SN
-   order. For the common single-reader destination this is exactly writer-unsent-list (no merge, no
-   extra alloc — byte-identical to the prior path). For co-located readers it calls writer-unsent-list
-   for EACH key — advancing EACH reader's unsent-base watermark so none re-pushes history on a later
-   write (RTPS 2.5 §8.4.2.2) — and returns the SN-deduplicated union (the lower-base set when joins are
-   staggered); one datagram per change reaches every reader at the destination via readerId UNKNOWN
-   (§8.3.5.4)."
-  (if (null (cdr keys))
-      (dds.rtps.reliable:writer-unsent-list writer (car keys))
-      (let ((merged '()))
-        (dolist (k keys)
-          (dolist (ch (dds.rtps.reliable:writer-unsent-list writer k))
-            (let ((sn (dds.rtps.history:cache-change-sn ch)))
-              (unless (find sn merged :key #'dds.rtps.history:cache-change-sn :test #'=)
-                (push ch merged)))))
-        (sort merged #'< :key #'dds.rtps.history:cache-change-sn))))
+  "The UNSENT CacheChanges to push ONCE to a destination shared by the readers KEYS, in ascending SN order
+   (the SN-deduplicated union; advancing EACH reader's unsent-base so none re-pushes history on a later write,
+   RTPS 2.5 §8.4.2.2 / §8.3.5.4 — one datagram per change reaches every reader at the destination via readerId
+   UNKNOWN). The NET-ZERO inspection wrapper over the send-path writer-capture-unsent (DRY): it acquires a
+   send-ref on each unique change then immediately RELEASES it, so the union + watermark advance are identical
+   to the send path but NO send-ref is left held (this entry point does not itself emit). The send path
+   (%push-data-buf / %node-datagram-plan) calls writer-capture-unsent directly and HOLDS the ref across the emit."
+  (let ((changes (dds.rtps.reliable:writer-capture-unsent writer keys)))
+    (dds.rtps.reliable:writer-release-change-refs writer changes)
+    changes))
 
 (defun* %group-shmem-dest (node group)
     (function (disc-node cons) t)
@@ -933,12 +927,15 @@
   (let ((writer (disc-node-user-writer node)))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (dolist (group (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched-reader destination
-        (%send-changes-packed node buf
-                              (%merge-unsent writer (cdr group)) (caar group) (cdar group)
-                              (%heartbeat-builder node first last count)
-                              (%group-shmem-dest node group)
-                              (%zc-readers node (cdr group))
-                              (%group-dest-prefix group))))))   ; T10: wrap user data to a :keyed destination
+        (let ((changes (dds.rtps.reliable:writer-capture-unsent writer (cdr group))))   ; acquire send-refs atomic with the unsent read (release-safety)
+          (unwind-protect
+               (%send-changes-packed node buf
+                                     changes (caar group) (cdar group)
+                                     (%heartbeat-builder node first last count)
+                                     (%group-shmem-dest node group)
+                                     (%zc-readers node (cdr group))
+                                     (%group-dest-prefix group))   ; T10: wrap user data to a :keyed destination
+            (dds.rtps.reliable:writer-release-change-refs writer changes)))))))   ; release after this destination's datagrams are emitted (copied)
 
 (defun* %push-data (node)
     (function (disc-node) t)
@@ -950,22 +947,26 @@
   "The FULL per-datagram send-plan for the node's user writer across ALL its matched-reader destinations —
    a flat list of ((HOST . PORT) BUILD-THUNK . SHMEM-DEST) entries, in the SAME order, with the SAME datagram
    bytes, that %push-data-buf's flush-all would send (it walks %reader-push-targets in the same order and
-   each group's plan is %changes-datagram-plan). The unsent watermark is captured ONCE here (%merge-unsent
-   advances each reader's unsent-base exactly as flush-all does) — so the scheduler must build this plan once
-   and then step it, never rebuild mid-drain (that would re-read an already-advanced watermark and send
-   nothing). The seam the Phase-C FlowController scheduler drives: build the plan (capturing the unsent set),
+   each group's plan is %changes-datagram-plan). The unsent watermark is captured ONCE here
+   (writer-capture-unsent advances each reader's unsent-base exactly as flush-all does, AND acquires a send-ref
+   on each captured change — held until the plan drains, %flow-step-advance, release-safety) — so the scheduler
+   must build this plan once and then step it, never rebuild mid-drain (that would re-read an already-advanced
+   watermark and send nothing). The seam the Phase-C FlowController scheduler drives: build the plan (capturing the unsent set),
    then for each entry build into a scratch buffer (the thunk reports the token cost = datagram length),
    acquire that many tokens, and send — one datagram per RR step. BUF supplies only the packing budget."
   (let ((writer (disc-node-user-writer node))
-        (plan '()))
+        (plan '()) (refs '()))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (dolist (group (%reader-push-targets node))
-        (let ((dest (car group)) (dp (%group-dest-prefix group)))   ; T10: the group's :keyed-dest prefix | nil
-          (dolist (entry (%changes-datagram-plan node buf (%merge-unsent writer (cdr group))
+        (let* ((dest (car group)) (dp (%group-dest-prefix group))   ; T10: the group's :keyed-dest prefix | nil
+               (changes (dds.rtps.reliable:writer-capture-unsent writer (cdr group))))   ; acquire send-refs atomic with the unsent read (release-safety)
+          (dolist (ch changes) (push ch refs))   ; held until the plan drains (%flow-step-advance releases), covering the DEFERRED paced/async emit
+          (dolist (entry (%changes-datagram-plan node buf changes
                                                   (%heartbeat-builder node first last count)
                                                   (%group-shmem-dest node group)
                                                   (%zc-readers node (cdr group))))
             (push (cons dest (cons dp entry)) plan)))))   ; ((host . port) DEST-PREFIX BUILD-THUNK . SHMEM-DEST)
+    (setf (disc-node-flow-step-refs node) refs)   ; release-on-drain set: one entry per per-group acquire (balanced)
     (nreverse plan)))
 
 (defun* %emit-plan-entry (node buf entry &optional before-send)
@@ -986,6 +987,33 @@
     (%send-raw-buf node buf len (car dest) (cdr dest) shmem-dest dest-prefix)
     len))
 
+(defun* %flow-release-step-refs (node)
+    (function (disc-node) t)
+  "Release the send-refs %node-datagram-plan acquired at the last snapshot (DISC-NODE-FLOW-STEP-REFS) and clear
+   the slot — the DEFERRED-emit half of the operating contract §4 release-safety: the paced/async plan HELD a
+   send-ref on each captured change from snapshot until the plan DRAINED, so a pooled payload (T5a) cannot be
+   recycled mid-drain. Idempotent (a NIL slot releases nothing; the floored decrement tolerates a double call).
+   Single-mutator: only the thread draining the plan runs it (the scheduler thread for an associated writer, or
+   the %flow-step-emit caller), the same single-mutator discipline as FLOW-STEP-STATE."
+  (let ((writer (disc-node-user-writer node))
+        (refs (disc-node-flow-step-refs node)))
+    (when (and writer refs)
+      (dds.rtps.reliable:writer-release-change-refs writer refs))
+    (setf (disc-node-flow-step-refs node) nil))
+  t)
+
+(defun* %flow-step-advance (node plan)
+    (function (disc-node list) list)
+  "Advance NODE's flow-step plan past the just-emitted head PLAN: set FLOW-STEP-STATE to PLAN's tail and, when
+   the plan has now DRAINED (tail NIL), release the snapshot's captured send-refs (%flow-release-step-refs).
+   The single drain choke point shared by %flow-step-emit AND the flow-controller scheduler (DRY) so BOTH
+   deferred-emit drivers release the held refs exactly when the last datagram of a snapshot has been emitted
+   (release-safety, operating contract §4). Returns the tail."
+  (let ((next (cdr plan)))
+    (setf (disc-node-flow-step-state node) next)
+    (unless next (%flow-release-step-refs node))
+    next))
+
 (defun* %flow-step-emit (node buf)
     (function (disc-node dds.core.buffer:octet-buffer) (values (integer 0) t))
   "WP-ASYNC-FLOW node-level STEP entry (FR-PF-2): build + send the NEXT single datagram for NODE's user writer
@@ -1004,7 +1032,7 @@
     (if (null plan)
         (progn (setf (disc-node-flow-step-state node) nil) (values 0 nil))
         (let ((len (%emit-plan-entry node buf (car plan))))
-          (setf (disc-node-flow-step-state node) (cdr plan))
+          (%flow-step-advance node plan)   ; advance + release the snapshot's send-refs when the plan drains (release-safety)
           (values len (and (cdr plan) t))))))
 
 (defun* %push-heartbeat (node)
@@ -1176,7 +1204,9 @@
    (%build-key-hash-iq) and carried on the DATA submessage (RTPS 2.5 §9.6.4.8), mirroring the wire
    behaviour of Connext 7.3.1 and Fast DDS 3.6.1 on keyed writes (ADR 0029). NIL KEY-HASH = byte-identical."
   (let ((iq (when (and key-hash (= 16 (length key-hash)))
-              (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16)))))))
+              (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16))))))
+        (writer (disc-node-user-writer node))
+        (pooled nil) (plen nil))   ; T5a: the acquired pool buffer + its TRUE secured-payload length (NIL = non-pooled path)
     ;; DDS-Security §9.5.3.3.4.4 encode (ADR 0031 T6): crypto-keys resolver or Slice-1 key-material; fail-closed on nil key.
     (let ((ct (disc-node-crypto-transform node)))
       (when ct
@@ -1184,10 +1214,34 @@
                       (funcall (dds.security:crypto-keys-encode-key-fn ct) (%local-writer-guid-vec node))
                       ct)))
           (if km
-              (setf payload (dds.security:encode-serialized-payload km payload))
-              (return-from publish-sample t)))))
-    (when (eq :timeout (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload key-hash iq))
-      (return-from publish-sample :timeout)))  ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
+              ;; T5a: encode INTO a POOLED buffer (zero per-sample payload alloc) when a payload-pool is provisioned,
+              ;; else the allocating wrapper (byte-identical). Pool exhaustion / oversize -> RESOURCE_LIMITS, never GC.
+              (let ((hc (dds.rtps.reliable:rtps-writer-hc writer)))
+                ;; T5a review: lazily carve the pool on the FIRST secured publish so the LIVE handshake config
+                ;; (keys installed AFTER enable-publisher by the crypto-manager) is zero-alloc too, not only the
+                ;; static-key config. The unlocked nil-gate keeps steady state to one slot read; the carve
+                ;; re-checks + provisions under the writer lock (idempotent), so it runs at most once.
+                (unless (dds.rtps.history:history-cache-payload-pool hc)
+                  (%ensure-secured-payload-pool node writer))
+                (if (dds.rtps.history:history-cache-payload-pool hc)
+                    (let ((buf (dds.rtps.reliable:writer-acquire-payload-buffer writer)))
+                      (if buf
+                          (let ((committed nil))
+                            (unwind-protect
+                                 (handler-case
+                                     (let ((len (dds.security:encode-serialized-payload-into buf km payload)))
+                                       (setf payload (dds.core.buffer:octet-buffer-vec buf) pooled buf plen len committed t))
+                                   (dds.core.buffer:buffer-overflow ()   ; payload > element-bytes: RESOURCE_LIMITS reject, never a GC fallback
+                                     (return-from publish-sample :timeout)))
+                              (unless committed   ; any non-local exit before commit: release the pool slot
+                                (dds.rtps.reliable:writer-release-payload-buffer writer buf))))
+                          (return-from publish-sample :timeout)))   ; pool exhausted: RESOURCE_LIMITS, never a GC fallback
+                    (setf payload (dds.security:encode-serialized-payload km payload))))   ; carve failed/unavailable: allocating fallback (byte-identical)
+              (return-from publish-sample t)))))   ; fail-closed: no key -> drop
+    (let ((rc (dds.rtps.reliable:writer-write writer payload key-hash iq pooled plen)))
+      (when (eq :timeout rc)
+        (when pooled (dds.rtps.reliable:writer-release-payload-buffer writer pooled))   ; full cache: return the buffer, nothing added
+        (return-from publish-sample :timeout))))  ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
   (cond
     ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))   ; WP-ASYNC-FLOW: paced async send
     ((disc-node-async-thread node) (%async-signal node))   ; WP-ASYNC: hand off to the sender thread
@@ -1567,6 +1621,216 @@
       (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))))
   t)
 
+;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: the loan-registry-backed plaintext handle for a SECURED loan-capable reader.
+(defstruct* (secured-loan-handle (:constructor %make-secured-loan-handle))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: the LOANED decoded plaintext of a secured (data_protection) sample. The
+   receiver thread decodes the SecuredPayload into BUFFER (a decode-pool octet-buffer, via
+   decode-serialized-payload-into — zero per-sample plaintext alloc) and stores THIS handle (not a bare vector)
+   in disc-node-samples, so the pooled buffer's lifetime is tied to the loan registry (disc-node-secured-loan-vec)
+   and node-return-loan, NOT the never-purged samples store. The recovered plaintext is BUFFER's octet vector
+   over [0, LEN) — read it in place via secured-loan-bytes + secured-loan-handle-len (the loan contract; no copy).
+   GUID/SN identify the samples-store slot so node-return-loan invalidates the dangling entry on release.
+   T5d: the handle is itself POOLED (%secured-handle-acquire from disc-node-decode-handle-vec, recycled on
+   release — no per-sample struct cons). On release it is FULLY DISSOCIATED (BUFFER->NIL, LEN->0, SN->0, GUID
+   zeroed, REG-INDEX->-1) BEFORE re-entering the freelist so a stale reference cannot alias a new sample; GUID is
+   reused in place (replace, no alloc) on refill. REG-INDEX is the handle's slot in disc-node-secured-loan-vec
+   (-1 = not registered) — it gives O(1) swap-remove AND is the outstanding-flag that makes node-return-loan
+   idempotent (reg-index<0 AND buffer NIL -> no-op). The freelist NEVER hands out a still-outstanding handle, so
+   a deduped duplicate's fresh handle is always a DISTINCT object from the stored original -> the identity-guarded
+   store-eviction (eq the slot occupant) stays correct with pooling. Distinguishable from a plain plaintext vector
+   by SECURED-LOAN-HANDLE-P, mirroring how zc-loan-marker-p distinguishes the ZC-loan marker. NIL pool / secured
+   loan OFF -> the allocating decode path stores a bare vector, byte-identical."
+  (buffer nil :type t)                                                           ; the pooled octet-buffer (NIL after release)
+  (len 0 :type fixnum)                                                           ; recovered plaintext length (BUFFER[0,LEN))
+  (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+        :type (simple-array (unsigned-byte 8) (16)))                            ; samples-store outer key (source GUID); reused in place on refill
+  (sn 0 :type integer)                                                           ; samples-store inner key (RTPS SN)
+  (reg-index -1 :type fixnum))                                                   ; index in disc-node-secured-loan-vec (-1 = not registered); O(1) swap-remove + outstanding-flag
+
+(defun* secured-loan-bytes (handle)
+    (function (secured-loan-handle) (simple-array (unsigned-byte 8) (*)))
+  "The octet vector backing a secured loan HANDLE: the recovered plaintext lives in [0, secured-loan-handle-len)
+   (read in place — the loan contract; no copy). Signals if the loan was already returned (BUFFER is NIL)."
+  (dds.core.buffer:octet-buffer-vec (secured-loan-handle-buffer handle)))
+
+(defun* %secured-handle-acquire (node)
+    (function (disc-node) t)
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5d: pop a recycled secured-loan-handle off NODE's handle freelist (zero
+   per-sample struct cons — mirrors pool-acquire). NIL on an empty freelist; the freelist is sized == the decode
+   buffer pool and a handle is only acquired AFTER a buffer acquire succeeded (paired 1:1), so this never returns
+   NIL when a buffer was free. CALLER holds decode-pool-lock (freelist top is shared: receiver pops, app pushes)."
+  (let ((top (disc-node-decode-handle-top node)))
+    (if (zerop top)
+        nil
+        (let ((nt (1- top)))
+          (setf (disc-node-decode-handle-top node) nt)
+          (let ((h (svref (disc-node-decode-handle-vec node) nt)))
+            (setf (svref (disc-node-decode-handle-vec node) nt) nil)
+            h)))))
+
+(defun* %secured-handle-recycle (node handle)
+    (function (disc-node secured-loan-handle) (values))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5d: FULLY DISSOCIATE HANDLE (BUFFER->NIL, LEN->0, SN->0, GUID zeroed,
+   REG-INDEX->-1) then return it to NODE's handle freelist for reuse. Dissociation BEFORE re-entry guarantees a
+   stale handle reference cannot alias a freshly-refilled sample and that a recycled handle re-enters as -1/NIL
+   (so a subsequent stray release is a no-op). CALLER holds decode-pool-lock (freelist push)."
+  (setf (secured-loan-handle-buffer handle) nil
+        (secured-loan-handle-len handle) 0
+        (secured-loan-handle-sn handle) 0
+        (secured-loan-handle-reg-index handle) -1)
+  (fill (secured-loan-handle-guid handle) 0)
+  (let ((top (disc-node-decode-handle-top node)))
+    (setf (svref (disc-node-decode-handle-vec node) top) handle
+          (disc-node-decode-handle-top node) (1+ top)))
+  (values))
+
+(defun* %secured-handle-fill (handle buf plen guid sn)
+    (function (secured-loan-handle dds.core.buffer:octet-buffer fixnum
+              (simple-array (unsigned-byte 8) (16)) integer) secured-loan-handle)
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5d: populate a freshly-acquired pooled HANDLE for a new sample — the pooled
+   BUFFER, recovered plaintext length PLEN, and the samples-store keys (GUID copied IN PLACE into the handle's
+   own preallocated array, SN). No allocation (the guid array is reused). Receiver thread solely owns HANDLE here
+   (not yet stored/registered) so no lock is needed."
+  (setf (secured-loan-handle-buffer handle) buf
+        (secured-loan-handle-len handle) plen
+        (secured-loan-handle-sn handle) sn)
+  (replace (secured-loan-handle-guid handle) guid)
+  handle)
+
+(defun* %secured-loan-register (node handle)
+    (function (disc-node secured-loan-handle) (values))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5d: append HANDLE to NODE's outstanding-loan registry vector and stamp its
+   REG-INDEX (O(1), no cons — replaces the per-loan list push). The vector is sized == the decode pool and an
+   outstanding registered loan always pins a pooled buffer, so the fill count never exceeds capacity. CALLER holds
+   disc-node-lock."
+  (let ((v (disc-node-secured-loan-vec node))
+        (n (disc-node-secured-loan-count node)))
+    (setf (svref v n) handle
+          (secured-loan-handle-reg-index handle) n
+          (disc-node-secured-loan-count node) (1+ n)))
+  (values))
+
+(defun* %secured-loan-deregister (node handle)
+    (function (disc-node secured-loan-handle) (values))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5d: remove HANDLE from NODE's registry vector by O(1) swap-remove (move the
+   last entry into HANDLE's slot, fix that entry's REG-INDEX, shrink the count) and set HANDLE's REG-INDEX to -1.
+   Idempotent: a handle already deregistered (REG-INDEX < 0) is a no-op. CALLER holds disc-node-lock."
+  (let ((i (secured-loan-handle-reg-index handle)))
+    (when (>= i 0)
+      (let* ((v (disc-node-secured-loan-vec node))
+             (last (1- (disc-node-secured-loan-count node)))
+             (moved (svref v last)))
+        (setf (svref v i) moved)
+        (when (secured-loan-handle-p moved)
+          (setf (secured-loan-handle-reg-index moved) i))
+        (setf (svref v last) nil
+              (disc-node-secured-loan-count node) last
+              (secured-loan-handle-reg-index handle) -1))))
+  (values))
+
+(defun* %secured-loan-release (node handle)
+    (function (disc-node secured-loan-handle) t)
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5b/T5d: release HANDLE — invalidate its dangling samples-store entry (remhash
+   by GUID/SN — disc-node-samples is never purged, so a surviving handle would point at a recycled buffer = a
+   wrong-bytes read), deregister it from the loan registry, return its pooled plaintext buffer to the decode pool,
+   and RECYCLE the (fully dissociated) handle to the freelist. Two disjoint cases share this one entry point:
+   (1) a REGISTERED handle (REG-INDEX >= 0: a normally-accepted+stored loan) — evict its store slot
+   IDENTITY-GUARDED (clear (GUID,SN) only when THIS handle still occupies it) then deregister; (2) an UNREGISTERED
+   handle (REG-INDEX < 0: a deduped DUPLICATE's fresh handle, never stored/registered) — skip the store/registry
+   entirely and just free its buffer. The identity guard + the never-hand-out-an-outstanding-handle freelist
+   invariant mean a duplicate's handle is a DISTINCT object from the stored original, so the original is never
+   evicted (no silent sample loss / no pinned slot). IDEMPOTENT / double-return-safe: after release REG-INDEX is
+   -1 and BUFFER is NIL, so a repeated release (of a handle NOT since recycled for a new sample) is a no-op.
+   Lock order: disc-node-lock OUTER (samples store + registry), decode-pool-lock INNER (buffer pool + handle
+   freelist)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (when (>= (secured-loan-handle-reg-index handle) 0)   ; registered => a stored loan: evict store (identity-guarded) + deregister
+      ;; T5d review Minor #1: this REG-INDEX>=0 gate is the PRIMARY dup-guard (a dedup duplicate's fresh handle is unregistered -> reg-index<0 -> filtered here, before any store touch); the eq identity-guard below is now redundant belt-and-suspenders.
+      (let ((inner (gethash (secured-loan-handle-guid handle) (disc-node-samples node))))
+        (when (and inner (eq (gethash (secured-loan-handle-sn handle) inner) handle))   ; identity-guard: a deduped duplicate must NOT evict the original occupant (silent loss + pinned slot)
+          (remhash (secured-loan-handle-sn handle) inner)))
+      (%secured-loan-deregister node handle))
+    (let ((buf (secured-loan-handle-buffer handle)))
+      (when buf
+        (dds.pal:with-lock ((disc-node-decode-pool-lock node))
+          (dds.core.arena:pool-release (disc-node-decode-pool node) buf)
+          (%secured-handle-recycle node handle)))))   ; recycle only when a buffer was actually freed -> idempotent
+  t)
+
+(defun* node-return-loan (node loans &optional (count -1))
+    (function (disc-node t &optional fixnum) t)
+  "DataReader::return_loan for the SECURED decode loan (WP-DDS-SECURITY-ZEROALLOC-AEAD T5b/T5d read contract):
+   release the loans taken via node-take-loaned. Each release invalidates the samples-store entry, returns the
+   pooled plaintext buffer to the decode pool, and recycles the handle to the freelist. Three call shapes:
+   (NODE VEC COUNT) — the canonical ZERO-CONS form: release every secured-loan-handle in VEC[0,COUNT) (exactly
+     the (values VEC COUNT) node-take-loaned returns; non-handle bare-vector elements are skipped); (NODE HANDLE)
+     — release a single handle; (NODE LIST) — release each handle in LIST (legacy). IDEMPOTENT (a returned /
+     recycled / never-loaned handle is skipped: its REG-INDEX is < 0 and its buffer NIL). NOTE: a reused
+     node-take-loaned VEC MUST be returned with its COUNT (its tail holds stale handles from prior takes); a
+     vector passed WITHOUT count is iterated whole (only for a caller-owned exact-size vector). The app MUST
+     return every loan it takes AND must NOT retain/reuse a handle after returning it (a returned handle may be
+     recycled for a new sample — use-after-return is a caller-contract violation, memory-safe within the arena but
+     undefined); a leaked loan pins a decode-pool slot until the pool exhausts (SAMPLE_REJECTED / writer
+     backpressure, graceful — never GC, never a crash)."
+  (declare (type fixnum count))
+  (cond ((secured-loan-handle-p loans) (%secured-loan-release node loans))
+        ((and (>= count 0) (simple-vector-p loans))
+         (dotimes (i count) (let ((h (svref loans i))) (when (secured-loan-handle-p h) (%secured-loan-release node h)))))
+        ((listp loans) (dolist (h loans) (when (secured-loan-handle-p h) (%secured-loan-release node h))))
+        ((vectorp loans) (loop for h across loans do (when (secured-loan-handle-p h) (%secured-loan-release node h)))))
+  t)
+
+(defun* node-return-all-loans (node)
+    (function (disc-node) t)
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5b reader-close safety: return EVERY outstanding secured loan (over a snapshot
+   of the registry vector) so stop-node leaves no acquired buffer outside the pool — teardown-arena frees the
+   pool's slots, and an un-returned (acquired) buffer is NOT in the slots, so it must be released first or its
+   static memory leaks. Called by stop-node AFTER the receiver thread is joined (no concurrent acquire). The
+   snapshot is taken first (release swap-removes from the same vector), then each handle is released once; the
+   teardown-time snapshot list is off the hot path."
+  (dolist (h (dds.pal:with-lock ((disc-node-lock node))
+               (loop with v = (disc-node-secured-loan-vec node)
+                     for i below (disc-node-secured-loan-count node)
+                     collect (svref v i))))
+    (%secured-loan-release node h))
+  t)
+
+(defun* node-take-loaned (node)
+    (function (disc-node) (values simple-vector fixnum))
+  "DataReader::take by LOAN for the SECURED decode path (WP-DDS-SECURITY-ZEROALLOC-AEAD T5b/T5d read contract).
+   Snapshot the received user samples into NODE's REUSED take buffer and return (values VEC COUNT): VEC[0,COUNT)
+   are the per-sample values — a secured-loan-handle for a secured loan-capable reader (read the plaintext in
+   place via secured-loan-bytes + secured-loan-handle-len, zero copy) or a bare plaintext vector for any non-loan
+   sample mixed in. Pass VEC and COUNT straight to node-return-loan. VEC is the node's own scratch vector, REUSED
+   across calls (the next take clobbers it) with a SINGLE consumer (the node's one user reader), so a steady-state
+   take conses 0 B (T5d); it grows once (off steady state) only if the store ever holds more samples than the
+   carved capacity (only reachable in the arena-carve-fail bare-vector fallback below). ARENA-CARVE-FAIL FALLBACK:
+   if the decode pool could not be carved (arena exhausted at the first secured sample) the reader stays
+   loan-capable but the store holds BARE plaintext vectors (byte-correct); they ride in VEC with NO loan, so a
+   caller MUST test secured-loan-handle-p before secured-loan-bytes (the same test the mixed non-loan case needs).
+   The buffer is held by the loan until node-return-loan releases it, so the app's in-place read can never race a
+   pool recycle. Leaves the samples in the store until node-return-loan invalidates them (mirrors take-loaned)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((vec (or (disc-node-secured-take-vec node)
+                   (setf (disc-node-secured-take-vec node) (make-array 16 :initial-element nil))))
+          (i 0))
+      (declare (type simple-vector vec) (type fixnum i))
+      (maphash (lambda (guid inner)
+                 (declare (ignore guid))
+                 (loop for v being the hash-values of inner do
+                   (when (>= i (length vec))                                     ; grow (off steady state; carved cap covers the pooled path)
+                     (let ((bigger (make-array (* 2 (length vec)) :initial-element nil)))
+                       (replace bigger vec)
+                       (setf vec bigger (disc-node-secured-take-vec node) bigger)))
+                   (setf (svref vec i) v)
+                   (incf i)))
+               (disc-node-samples node))
+      (values vec i))))
+
+;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: defined after the secured-pool sizing specials (loaded later); forward-declared
+;; so %deliver-user-sample reaches the lazy decode-pool carve without an undefined-function warning.
+(declaim (ftype (function (disc-node) t) %ensure-secured-decode-pool))
+
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix effective-guid effective-sn
                              &optional key-hash)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
@@ -1582,31 +1846,78 @@
    EFFECTIVE-GUID/EFFECTIVE-SN are the logical-origin GUID+SN for dedup (orig-guid/orig-sn on the relay
    path; wire GUID+SN on the direct path) per RTPS 2.5 §8.3.5.4.
    KEY-HASH (ADR 0029, RTPS 2.5 §9.6.4.8): the captured wire PID_KEY_HASH; NIL unless the node has
-   capture-data-key-hash set. Stored via %record-sample-key-hash inside the lock."
-  ;; DDS-Security §9.5.3.3.4.5 decode (ADR 0031 T6): crypto-keys resolver or Slice-1 key-material; fail-closed on nil key or bad ciphertext.
-  (let ((ct (disc-node-crypto-transform node)))
-    (when ct
-      (let* ((remote-guid (%source-guid src-prefix writer-id))
-             (km (if (typep ct 'dds.security:crypto-keys)
-                     (funcall (dds.security:crypto-keys-decode-key-fn ct) remote-guid)
-                     ct)))
-        (unless km (return-from %deliver-user-sample t))
-        (let ((plain (dds.security:decode-serialized-payload km vec)))
-          (unless plain (return-from %deliver-user-sample t))
-          (setf vec plain)))))
-  (let ((guid (%source-guid src-prefix writer-id)))
-    ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too)
-    (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn vec)
-    ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
-    (when (dds.rtps.reliable:reader-dedup-accept-p (disc-node-user-reader node)
-                                                   effective-guid effective-sn)
-      (dds.pal:with-lock ((disc-node-lock node))
-        (setf (gethash sn (%inner-table (disc-node-samples node) guid)) vec
-              (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
-              (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
-        (%record-sample-origin node guid sn effective-guid effective-sn)
-        (%record-sample-key-hash node guid sn key-hash))
-      (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))))
+   capture-data-key-hash set. Stored via %record-sample-key-hash inside the lock.
+   DDS-Security §9.5.3.3.4.5 decode (ADR 0031): crypto-keys resolver or Slice-1 key-material; fail-closed on nil
+   key or bad ciphertext. WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: when the reader is SECURED-LOAN-CAPABLE, decode the
+   SecuredPayload into a DECODE-POOL buffer (decode-serialized-payload-into — zero per-sample plaintext alloc) and
+   store a SECURED-LOAN-HANDLE (not a bare plaintext vector), registering it in the loan registry so node-return-loan
+   releases the buffer; pool exhaustion -> SAMPLE_REJECTED (drop + count, un-acked -> writer backpressure, never GC);
+   decode failure / a deduped duplicate releases the buffer (no leak). WP-DDS-SECURITY-ZEROALLOC-AEAD T5d: the
+   handle is POOLED (%secured-handle-acquire, paired 1:1 with the buffer pool) and the registry is a fixed vector,
+   so the accepted loan wrapper conses 0 B/sample. Security OFF or not loan-capable keeps the allocating decode ->
+   bare-vector path, byte-identical."
+  (let ((guid (%source-guid src-prefix writer-id))   ; ONE source GUID: km-resolve + reliable proxy + the three inner tables + the loan handle
+        (stored vec)                                  ; the value stored in disc-node-samples (a plaintext vec, or a T5b secured-loan-handle)
+        (loan nil))                                   ; non-NIL = the pooled-buffer loan handle to register / release-on-reject (T5b)
+    (let ((ct (disc-node-crypto-transform node)))
+      (when ct
+        (let ((km (if (typep ct 'dds.security:crypto-keys)
+                      (funcall (dds.security:crypto-keys-decode-key-fn ct) guid)
+                      ct)))
+          (unless km (return-from %deliver-user-sample t))
+          (if (disc-node-secured-loan-capable node)
+              ;; T5b LOAN path: decode into a POOLED buffer; store a length-tagged handle (zero per-sample plaintext alloc)
+              (let ((pool (%ensure-secured-decode-pool node)))
+                (if (null pool)
+                    ;; no pool (arena alloc failed) -> allocating decode -> bare vec (byte-identical, correct)
+                    (let ((plain (dds.security:decode-serialized-payload km vec)))
+                      (unless plain (return-from %deliver-user-sample t))
+                      (setf stored plain))
+                    ;; T5d: acquire buffer + pooled handle together (paired 1:1 capacity -> the handle acquire
+                    ;; succeeds whenever a buffer was free; the defensive release keeps it never-crash/never-GC)
+                    (multiple-value-bind (buf h)
+                        (dds.pal:with-lock ((disc-node-decode-pool-lock node))
+                          (let ((b (dds.core.arena:pool-acquire pool)))
+                            (if b
+                                (let ((hh (%secured-handle-acquire node)))
+                                  (if hh
+                                      (values b hh)
+                                      (progn (dds.core.arena:pool-release pool b) (values nil nil))))
+                                (values nil nil))))
+                      (if (null buf)
+                          ;; pool exhausted -> SAMPLE_REJECTED: drop + count, do NOT advance the reliable reader (un-acked -> writer backpressure), never GC
+                          (progn (incf (disc-node-decode-pool-rejects node))
+                                 (return-from %deliver-user-sample t))
+                          (let ((plen (dds.security:decode-serialized-payload-into buf km vec)))
+                            (if (null plen)
+                                ;; decode failed -> release the buffer + recycle the handle (no leak), fail-closed drop
+                                (progn (dds.pal:with-lock ((disc-node-decode-pool-lock node))
+                                         (dds.core.arena:pool-release pool buf)
+                                         (%secured-handle-recycle node h))
+                                       (return-from %deliver-user-sample t))
+                                (progn (%secured-handle-fill h buf plen guid sn)
+                                       (setf stored h loan h))))))))
+              ;; non-loan secured path: allocating decode -> bare vec (byte-identical to the shipped path)
+              (let ((plain (dds.security:decode-serialized-payload km vec)))
+                (unless plain (return-from %deliver-user-sample t))
+                (setf stored plain))))))
+    ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too); the loan path feeds
+    ;; the proxy an EMPTY payload (the plaintext lives in the loaned buffer, not the proxy) — mirrors %deliver-user-marker.
+    (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn
+                                      (if loan (load-time-value (make-array 0 :element-type '(unsigned-byte 8))) stored))
+    (cond
+      ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
+      ((dds.rtps.reliable:reader-dedup-accept-p (disc-node-user-reader node) effective-guid effective-sn)
+       (dds.pal:with-lock ((disc-node-lock node))
+         (setf (gethash sn (%inner-table (disc-node-samples node) guid)) stored
+               (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
+               (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
+         (%record-sample-origin node guid sn effective-guid effective-sn)
+         (%record-sample-key-hash node guid sn key-hash)
+         (when loan (%secured-loan-register node loan)))   ; T5b/T5d: register the loan in the fixed registry vector (receiver registers; app return-loan releases)
+       (when (disc-node-on-sample node) (funcall (disc-node-on-sample node))))
+      ;; T5b: a deduped DUPLICATE on the loan path -> release the unused pooled buffer (no store, no leak)
+      (loan (%secured-loan-release node loan))))
   t)
 
 (defun* %on-user-data (node writer-id sn buf poff plen src-prefix
@@ -1720,14 +2031,16 @@
       (incf (disc-node-acks-in node))   ; a matched reader (incl. RTI) acked our writer
       (multiple-value-bind (resends gaps)
           (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
-                                               (%source-guid src-prefix rid) base numbits bitmap)
-        (let* ((dest (%prefix-user-destination node src-prefix))
-               ;; (DEST-PREFIX . (host . port)) (T10): the NACKing reader's prefix (src-prefix), or the prefixed fan-out
-               (peers (if dest (list (cons src-prefix dest)) (%match-destinations-prefixed node t))))
-          (dolist (pd peers)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
-            (let ((peer (cdr pd)))
-              (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil 0 (car pd))
-              (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) (car pd))))))
+                                               (%source-guid src-prefix rid) base numbits bitmap t)   ; acquire send-refs on resends, atomic with the read (release-safety)
+        (unwind-protect
+             (let* ((dest (%prefix-user-destination node src-prefix))
+                    ;; (DEST-PREFIX . (host . port)) (T10): the NACKing reader's prefix (src-prefix), or the prefixed fan-out
+                    (peers (if dest (list (cons src-prefix dest)) (%match-destinations-prefixed node t))))
+               (dolist (pd peers)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
+                 (let ((peer (cdr pd)))
+                   (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil 0 (car pd))
+                   (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) (car pd))))))
+          (dds.rtps.reliable:writer-release-change-refs (disc-node-user-writer node) resends))   ; release after the retransmit datagrams are emitted (copied)
         ;; the ACKNACK advanced this reader's acked-base -> purge HistoryCache changes ALL matched readers
         ;; have now acknowledged (RTPS 2.5 §8.4.1), bounding the KEEP_ALL writer history. NACKed (resent)
         ;; changes are not fully acked, so they are never purged. A TRANSIENT_LOCAL writer (DDS 1.4
@@ -1779,19 +2092,140 @@
   (multiple-value-bind (rid wid sn base numbits bitmap count) (dds.rtps.message:parse-nack-frag-body c flags)
     (declare (ignore rid count))
     (when (= wid (disc-node-user-writer-id node))
-      (let ((descs (dds.rtps.reliable:writer-on-nack-frag (disc-node-user-writer node) sn base numbits bitmap))
-            (pl (dds.rtps.reliable:writer-sample-payload (disc-node-user-writer node) sn)))
-        (when (and descs pl)
-          (let ((size (length pl)))
-            (dolist (pd (%match-destinations-prefixed node t))   ; T10: wrap the DATA_FRAG retransmit to a :keyed reader
-              (dolist (desc descs)
-                (destructuring-bind (fstart fcount off len) desc
-                  (%send-msg-buf node (disc-node-rx-tx-msg node)
-                                 (lambda (mc) (dds.rtps.message:write-data-frag
-                                               mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn size
-                                               fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
-                                 (cadr pd) (cddr pd) (car pd)))))))))
+      (let ((ch (dds.rtps.reliable:writer-acquire-sample (disc-node-user-writer node) sn)))   ; acquire send-ref atomic with the lookup (release-safety)
+        (when ch
+          (unwind-protect
+               (let ((descs (dds.rtps.reliable:writer-on-nack-frag (disc-node-user-writer node) sn base numbits bitmap))
+                     (pl (dds.rtps.history:cache-change-serialized-payload ch)))   ; read the payload off the ref-held change
+                 (when (and descs pl)
+                   (let ((size (dds.rtps.history:cache-change-payload-len ch)))   ; TRUE length, not the oversized pooled vec (T5a)
+                     (dolist (pd (%match-destinations-prefixed node t))   ; T10: wrap the DATA_FRAG retransmit to a :keyed reader
+                       (dolist (desc descs)
+                         (destructuring-bind (fstart fcount off len) desc
+                           (%send-msg-buf node (disc-node-rx-tx-msg node)
+                                          (lambda (mc) (dds.rtps.message:write-data-frag
+                                                        mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn size
+                                                        fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
+                                          (cadr pd) (cddr pd) (car pd))))))))
+            (dds.rtps.reliable:writer-release-change-ref (disc-node-user-writer node) ch)))))   ; release after the DATA_FRAG retransmits are emitted (copied)
     t))
+
+(defparameter *secured-payload-max-bytes* 16384
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: the maximum PLAINTEXT octet length the data_protection encode pool sizes
+   each buffer for; the pool's fixed element size is (+ 44 *secured-payload-max-bytes* 3) — the SecuredPayload
+   codec's exact upper bound (transform.lisp encode-serialized-payload-into: 44-byte header/tag + N + ≤3 pad).
+   A secured publish of a LARGER plaintext is rejected with RETCODE_TIMEOUT (RESOURCE_LIMITS), NEVER a GC-heap
+   fallback (NFR-MEM). Sized to cover the secured large/fragmented payloads exercised by the suite (≤2000 B) with
+   headroom; raise it (before enable-publisher) for a writer with larger secured samples.")
+
+(defparameter *secured-pool-capacity* 64
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: the number of buffers the data_protection encode pool is provisioned with
+   when the writer's RESOURCE_LIMITS max_samples is unbounded (KEEP_ALL unlimited / KEEP_LAST) — the
+   in-flight working-set budget. A bounded writer instead uses (max_samples + *secured-pool-headroom*). Pool
+   exhaustion routes to RETCODE_TIMEOUT (RESOURCE_LIMITS), never a GC fallback. NOTE: a secured KEEP_ALL writer
+   with no max_samples is thereby effectively capped at this capacity + *secured-pool-headroom* un-acked samples
+   in flight (the pool, not the cache, is the binding bound) — exhaustion yields :timeout and self-corrects once
+   the ACKNACK purge frees buffers; raise *secured-pool-capacity* for a deeper secured backlog.")
+
+(defparameter *secured-pool-headroom* 16
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: extra encode-pool buffers ON TOP of the cache bound, covering the buffers
+   transiently held by in-flight/deferred sends — a change EVICTED while a captured push/retransmit thunk still
+   references it keeps its buffer until the last send-ref drops (hc-try-release-pooled), so it is momentarily
+   out of the pool while a successor occupies the cache slot (the operating contract §4 release-safety).")
+
+(defun* %secured-pool-capacity (kind depth max-samples)
+    (function ((member :keep-last :keep-all) (integer 1) (or null (integer 0))) (integer 1))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: the encode-pool buffer count for a writer with HISTORY (KIND/DEPTH) and
+   RESOURCE_LIMITS MAX-SAMPLES. A bounded cache (finite max_samples) sizes to that bound; an unbounded KEEP_LAST
+   uses max(depth, *secured-pool-capacity*) (per-instance depth × instances is not known at enable time, so the
+   default working-set budget bounds it); an unbounded KEEP_ALL uses *secured-pool-capacity*. *secured-pool-headroom*
+   is added in all cases for the in-flight/deferred-send buffers held across eviction (the deferred pool-release)."
+  (+ (cond (max-samples max-samples)
+           ((eq kind :keep-last) (max depth *secured-pool-capacity*))
+           (t *secured-pool-capacity*))
+     *secured-pool-headroom*))
+
+(defun* %ensure-secured-payload-pool (node writer)
+    (function (disc-node dds.rtps.reliable:rtps-writer) t)
+  "Provision NODE's secured-payload encode pool onto WRITER's HistoryCache if absent — the SINGLE carve point
+   for BOTH enable-publisher (static-key config: crypto on AT enable) AND the LIVE DDS-Security handshake, where
+   the keys (and thus the need to pool) are installed AFTER enable-publisher by the crypto-manager, so the pool
+   is carved LAZILY on the first secured publish (WP-DDS-SECURITY-ZEROALLOC-AEAD T5a). Idempotent and run under
+   the writer lock (writer-ensure-payload-pool), so a concurrent first publish carves exactly once; the carve is
+   off the steady state (first publish only), so steady publish stays 0 B/sample. Sizes element-bytes from
+   *secured-payload-max-bytes* (the encode-serialized-payload-into exact bound) and the pool capacity from the
+   HC's own HISTORY/RESOURCE_LIMITS (%secured-pool-capacity). On arena-allocation failure (no room) leaves the
+   pool NIL and the node arena unset — the publish then takes the allocating encode (byte-identical + correct),
+   never an error and never a GC-silent zero-claim. The arena is stored on NODE only after the pool carve
+   succeeds, so stop-node's teardown reaches exactly the live arena. Returns the pool, or NIL when none carved."
+  (dds.rtps.reliable:writer-ensure-payload-pool
+   writer
+   (lambda (hc)
+     (let ((element-bytes (+ 44 *secured-payload-max-bytes* 3))   ; encode-serialized-payload-into exact bound (transform.lisp)
+           (capacity (%secured-pool-capacity (dds.rtps.history:hc-kind hc)
+                                             (dds.rtps.history:hc-depth hc)
+                                             (dds.rtps.history:hc-max-samples hc))))
+       (handler-case
+           (let* ((arena (dds.core.arena:init-arena :bytes (* element-bytes (1+ capacity))))   ; +1 slot slack
+                  (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity)))
+             (setf (disc-node-payload-arena node) arena)   ; only after the pool carve succeeds (teardown reachability)
+             pool)
+         (error () nil))))))   ; arena-exhausted / static-alloc failure: leave the pool NIL -> allocating encode fallback
+
+(defun* %ensure-secured-decode-pool (node)
+    (function (disc-node) t)
+  "Provision NODE's secured DECODE plaintext pool if absent and return it (or NIL on arena-allocation failure —
+   the caller then falls back to the allocating decode, byte-identical). The SINGLE carve point (DRY) for BOTH
+   the EAGER path (set-secured-loan-capable when crypto is already on) AND the LAZY path (the first secured receive
+   when keys arrive after enable via the live DDS-Security handshake, WP-DDS-SECURITY-ZEROALLOC-AEAD T5b).
+   Idempotent + double-checked under decode-pool-lock so the carve happens exactly once OFF the steady state (first
+   receive only -> steady receive stays 0 B/sample for the plaintext). element-bytes = *secured-payload-max-bytes*
+   (the max recovered plaintext = decode-serialized-payload-into's ct_len output bound); capacity =
+   *secured-pool-capacity* + *secured-pool-headroom* (the in-flight working set + outstanding-loan headroom). PER-NODE
+   ownership: the disc-node owns the pool and its single user reader is the sole consumer. stop-node returns every
+   outstanding loan then tears the arena down. On arena-exhausted leaves the pool NIL (allocating-decode fallback),
+   never an error, never a GC-silent zero-claim (NFR-MEM). WP-DDS-SECURITY-ZEROALLOC-AEAD T5d: alongside the buffer
+   pool this carves (once, off steady state) the CAPACITY-sized loan-WRAPPER structures so the accepted loan
+   conses 0 B/sample — the handle freelist (CAPACITY preallocated secured-loan-handle structs, recycled on
+   return), the registry vector (CAPACITY slots, swap-remove), and the node-take-loaned scratch vector (CAPACITY
+   slots, reused per take). These are plain Lisp heap objects (NOT arena/SAP — like type-support's sample-pool),
+   allocated once at carve; only the off-heap plaintext BUFFERS come from the static arena."
+  (or (disc-node-decode-pool node)                       ; fast unlocked check (steady state: no lock)
+      (dds.pal:with-lock ((disc-node-decode-pool-lock node))
+        (or (disc-node-decode-pool node)                 ; re-check under the lock (double-checked carve)
+            (let ((element-bytes *secured-payload-max-bytes*)
+                  (capacity (+ *secured-pool-capacity* *secured-pool-headroom*)))
+              (handler-case
+                  (let* ((arena (dds.core.arena:init-arena :bytes (* element-bytes (1+ capacity))))   ; +1 slot slack
+                         (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity))
+                         (handles (make-array capacity)))
+                    (dotimes (i capacity) (setf (svref handles i) (%make-secured-loan-handle)))   ; preallocate the handle freelist (recycled, zero per-sample cons)
+                    (setf (disc-node-decode-handle-vec node) handles
+                          (disc-node-decode-handle-top node) capacity
+                          (disc-node-secured-loan-vec node) (make-array capacity :initial-element nil)   ; registry: fixed vector + fill pointer (no per-loan cons)
+                          (disc-node-secured-loan-count node) 0
+                          (disc-node-secured-take-vec node) (make-array capacity :initial-element nil)   ; reused take result (no per-take cons)
+                          (disc-node-decode-arena node) arena   ; only after the carve succeeds (teardown reachability)
+                          (disc-node-decode-pool node) pool)
+                    pool)
+                (error () nil)))))))   ; arena-exhausted / static-alloc failure: leave NIL -> allocating-decode fallback
+
+(defun* set-secured-loan-capable (node capable)
+    (function (disc-node t) t)
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: mark NODE's secured (data_protection) RECEIVE path LOAN-CAPABLE (CAPABLE
+   non-NIL) or not. When capable AND a crypto-transform is present, the receiver thread decodes each SecuredPayload
+   into a DECODE-POOL buffer (decode-serialized-payload-into — zero per-sample plaintext alloc) and stores a
+   SECURED-LOAN-HANDLE instead of a bare plaintext vector; the APP then reads the plaintext IN PLACE via
+   node-take-loaned + secured-loan-bytes / secured-loan-handle-len and MUST node-return-loan each loan (the
+   app-facing read-contract change — a leaked loan pins a pool slot and the pool eventually exhausts:
+   SAMPLE_REJECTED / writer backpressure, graceful, never GC). Carves the decode pool EAGERLY when crypto is
+   already on (so the steady receive never carves under load); otherwise the first secured receive carves it
+   lazily (the live-handshake config). Default NIL leaves the shipped allocating-decode -> bare-vector path
+   byte-unchanged — a plain (non-secured) reader is entirely unaffected."
+  (setf (disc-node-secured-loan-capable node) (and capable t))
+  (when (and capable (disc-node-crypto-transform node))
+    (%ensure-secured-decode-pool node))
+  (disc-node-secured-loan-capable node))
 
 (defun* enable-publisher (node &key max-samples (max-blocking-ns nil)
                                     (history-kind :keep-last) (history-depth 1))
@@ -1811,11 +2245,26 @@
    block keeps the backlog bounded). With MAX-SAMPLES NIL the cache never fills, so MAX-BLOCKING-NS has no
    effect (the bound is the trigger). NOTE (ADR 0019): one engine writer per disc-node is shared by all of a
    publisher's DataWriters, so the HC honors the HISTORY QoS of the DataWriter that (re)enabled the publisher —
-   a pre-existing one-writer-per-node limitation, not introduced here."
+   a pre-existing one-writer-per-node limitation, not introduced here. When NODE has a crypto-transform
+   (data_protection ON), a per-node static arena + a fixed secured-payload pool are carved onto the writer's
+   HistoryCache so a secured publish reuses a buffer (zero per-sample payload alloc, WP-DDS-SECURITY-ZEROALLOC-AEAD
+   T5a): the pool holds %secured-pool-capacity buffers of (44 + *secured-payload-max-bytes* + 3) octets each; a
+   larger secured plaintext OR pool exhaustion is rejected with RETCODE_TIMEOUT (RESOURCE_LIMITS), never a GC
+   fallback. Security OFF leaves no pool — the publish path is byte-identical. stop-node tears the arena down."
   (setf (disc-node-user-writer node)
         (dds.rtps.reliable:make-rtps-writer
          :hc (dds.rtps.history:make-history-cache history-kind history-depth max-samples nil)
          :max-blocking-ns max-blocking-ns))
+  ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: when data_protection is ALREADY engaged at enable (the static-key
+  ;; config), carve the per-node static arena + secured-payload pool onto the writer's HistoryCache now, so a
+  ;; secured publish encodes into a reused buffer (zero per-sample payload alloc). The LIVE handshake config
+  ;; (keys installed AFTER enable by the crypto-manager) carves the SAME pool LAZILY on the first secured publish
+  ;; (publish-sample) — both go through the single %ensure-secured-payload-pool carve point (DRY). Pool ownership
+  ;; is the writer's HC (reachable by the acquire path, the eviction choke %hc-remove-change, AND the ref-drop
+  ;; release — all under the one writer lock). Security OFF (crypto-transform NIL) -> no arena/pool until/unless
+  ;; keys arrive -> publish-sample's allocating path -> byte-identical.
+  (when (disc-node-crypto-transform node)
+    (%ensure-secured-payload-pool node (disc-node-user-writer node)))
   (setf (disc-node-on-acknack node) (lambda (c flags src-prefix) (%on-user-acknack node c flags src-prefix)))
   (setf (disc-node-on-nack-frag node) (lambda (c flags) (%on-user-nack-frag node c flags)))
   node)

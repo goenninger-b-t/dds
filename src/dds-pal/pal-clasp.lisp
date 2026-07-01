@@ -67,6 +67,18 @@
   "Octet length of a static region from ALLOC-STATIC."
   (length vec))
 
+;; CFFI inc-pointer over static-vector-pointer; Clasp bytes-consed=0, so correctness (not zero-box) is the bar
+(declaim (inline static-sap+))
+(defun* static-sap+ (vec offset)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0)) t)
+  "Raw foreign pointer at VEC[OFFSET], computed inline (CFFI inc-pointer over static-vector-pointer).
+   VEC MUST be an ALLOC-STATIC-backed (foreign, non-moving) vector. Equivalent to
+   (static-vectors:static-vector-pointer VEC :offset OFFSET); the boxing entry point STATIC-POINTER
+   remains for control-plane use. (Clasp's BYTES-CONSED returns 0 — a documented NFR-PORT gap — so the
+   binding zero-box gate runs on SBCL; here the contract is functional equivalence.)"
+  (declare (optimize speed (safety 0)))
+  (cffi:inc-pointer (static-vectors:static-vector-pointer vec) offset))
+
 (declaim (inline mem-ref-u8 mem-set-u8))
 (defun* mem-ref-u8 (vec index)
     (function ((simple-array (unsigned-byte 8) (*)) (integer 0)) (unsigned-byte 8))

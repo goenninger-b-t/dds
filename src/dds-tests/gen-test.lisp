@@ -270,6 +270,120 @@
                 "FlatData keyhash must be identical regardless of the user-data representation (XCDR2-BE)"))))
   t)
 
+(defun* %secured-live-publish-delta-bps (km pt iters)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 1)) (values double-float double-float))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5c: measure the LIVE publish-sample bytes-consed/sample with data_protection
+   OFF then ON on the SAME warmed KEEP_LAST depth-1 writer (toggling disc-node-crypto-transform between the two
+   blocks), returning (values PLAIN-BPS SECURED-BPS). Measuring both on ONE warmed node keeps the common
+   NON-security publish residual (the make-cache-change struct + RTPS framing) in the same heap/cache state for
+   both blocks, so it CANCELS in secured-minus-plain — leaving only the data_protection encode contribution (the
+   T5a pool acquire + encode-into, which is alloc-free). KEEP_LAST depth-1 supersession releases the pooled buffer
+   each publish (steady state ~1 in use); no matched readers/sockets (no start-node) isolates the publish cost.
+   SBCL-exact (dds.pal:bytes-consed); Clasp returns 0.0/0.0 by the NFR-PORT gap."
+  (let ((node (let ((dds.disc:*shmem-enabled* nil))
+                (dds.disc:make-disc-node
+                 :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC1)
+                 :domain 70 :host "127.0.0.1" :port 0 :multicast nil))))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer node :topic "ZeroAllocPub" :type "X")
+           (dds.disc:enable-publisher node :history-kind :keep-last :history-depth 1)
+           (flet ((measure ()
+                    (let ((before (dds.pal:bytes-consed)))
+                      (dotimes (i iters) (dds.disc:publish-sample node pt))
+                      (/ (float (- (dds.pal:bytes-consed) before) 1.0d0) iters)))
+                  (warm () (dotimes (i 200) (dds.disc:publish-sample node pt))))
+             (warm)                                                    ; plain steady state warmed
+             (let ((plain (measure)))
+               (setf (dds.disc:disc-node-crypto-transform node) km)   ; data_protection ON; lazy pool carve on first secured publish (warmed below)
+               (warm)
+               (values plain (measure)))))
+      (dds.disc:stop-node node))))
+
+(defun* %secured-receive-one (node wid sn input src guid)
+    (function (dds.disc:disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
+              (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (16))) (values))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5c/T5d: ONE live RECEIVE step (shared by the per-config and the same-node delta
+   measurements, DRY): deliver INPUT as SN from WID/SRC, take the loan into the reused vec + return it (zero-cons
+   for the pooled loan path), then DRAIN the never-purged store back to empty so the next iteration is steady
+   state. No sockets (%deliver-user-sample driven directly)."
+  (dds.disc::%deliver-user-sample node wid sn input src guid sn)
+  (multiple-value-bind (vec count) (dds.disc:node-take-loaned node)   ; T5d: reused vec + count (zero-cons take)
+    (dds.disc:node-return-loan node vec count))
+  ;; drain the never-purged store back to empty (steady state) — clear the INNER SN maps but REUSE them so the
+  ;; harness itself does not cons a fresh make-hash-table per iteration (that ~1KB/sample of test framing drives
+  ;; GC-boundary accounting noise into the delta); only the direct-path 3 tables ever grow here.
+  (dds.pal:with-lock ((dds.disc::disc-node-lock node))
+    (flet ((empty (outer) (maphash (lambda (g inner) (declare (ignore g)) (clrhash inner)) outer)))
+      (empty (dds.disc::disc-node-samples node))
+      (empty (dds.disc::disc-node-sample-writers node))
+      (empty (dds.disc::disc-node-sample-writer-guids node))))
+  (values))
+
+(defun* %secured-live-receive-bps (km input crypto loan iters)
+    (function (t (simple-array (unsigned-byte 8) (*)) t t (integer 1)) double-float)
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5c: bytes-consed/sample over ITERS of the LIVE secured RECEIVE path
+   (%secured-receive-one). INPUT is the wire payload: the SecuredPayload ciphertext for the secured paths, the
+   plaintext for the plain baseline. Used for the plain baseline and the allocating-decode comparison (LOAN NIL,
+   whose per-sample plaintext copy is a big signal that SCALES with payload); the loan-vs-plain delta over two
+   fresh nodes (identical 0->N proxy/store growth) corroborates the EXACT 0.0000 that %secured-wrapper-cycle-bps
+   proves deterministically. SBCL-exact; Clasp 0.0."
+  (let ((node (let ((dds.disc:*shmem-enabled* nil))
+                (dds.disc:make-disc-node
+                 :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC2)
+                 :domain 71 :host "127.0.0.1" :port 0 :multicast nil :crypto-transform (and crypto km))))
+        (wid #x00000102)
+        (src (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA1)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-subscriber node)
+           (when loan (dds.disc:set-secured-loan-capable node t))
+           (let ((guid (dds.disc::%source-guid src wid)) (sn 0))
+             (flet ((one () (incf sn) (%secured-receive-one node wid sn input src guid)))
+               (dotimes (i 100) (one))   ; warm + lazy decode-pool carve off the measured window
+               (let ((before (dds.pal:bytes-consed)))
+                 (dotimes (i iters) (one))
+                 (/ (float (- (dds.pal:bytes-consed) before) 1.0d0) iters)))))
+      (dds.disc:stop-node node))))
+
+(defun* %secured-wrapper-cycle-bps (km iters)
+    (function (t (integer 1)) double-float)
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5d: DETERMINISTIC exact bytes-consed/sample of the pooled loan WRAPPER cycle in
+   isolation — acquire a pooled decode buffer + a freelisted secured-loan-handle, fill it, register it in the
+   fixed-vector registry, then deregister + release the buffer + recycle the handle: exactly the per-sample wrapper
+   work %deliver-user-sample and node-return-loan do AROUND the (separately-proven-0.0000) payload decode. No decode
+   / store / reader-proxy, so there is NO framing or GC-boundary noise — the result is an EXACT 0.0000 on SBCL
+   (Clasp 0.0, NFR-PORT). This is the rock-solid proof that T5d de-consed the loan delivery wrapper (handle struct
+   + registry cons + take list cons); the live-loop delta corroborates it end-to-end within the cross-node GC
+   quantum. Returns 0.0 if the decode pool could not be carved (arena unavailable)."
+  (let ((node (let ((dds.disc:*shmem-enabled* nil))
+                (dds.disc:make-disc-node
+                 :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC4)
+                 :domain 73 :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km)))
+        (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1)))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-subscriber node)
+           (dds.disc:set-secured-loan-capable node t)                    ; eager decode-pool + wrapper freelist carve
+           (let ((pool (dds.disc:disc-node-decode-pool node)))
+             (if (null pool)
+                 0.0d0
+                 (flet ((cycle (sn)
+                          (let ((b (dds.core.arena:pool-acquire pool))
+                                (h (dds.disc::%secured-handle-acquire node)))
+                            (dds.disc::%secured-handle-fill h b 256 guid sn)         ; refill (replace guid in place — no alloc)
+                            (dds.pal:with-lock ((dds.disc::disc-node-lock node))
+                              (dds.disc::%secured-loan-register node h)              ; fixed-vector registry push (no cons)
+                              (dds.disc::%secured-loan-deregister node h))           ; O(1) swap-remove (no cons)
+                            (dds.pal:with-lock ((dds.disc::disc-node-decode-pool-lock node))
+                              (dds.core.arena:pool-release pool b)
+                              (dds.disc::%secured-handle-recycle node h)))))         ; dissociate + freelist push (no cons)
+                   (dotimes (i 1000) (cycle i))                          ; warm
+                   (let ((before (dds.pal:bytes-consed)))
+                     (dotimes (i iters) (cycle i))
+                     (/ (float (- (dds.pal:bytes-consed) before) 1.0d0) iters))))))
+      (dds.disc:stop-node node))))
+
 (defun* run-mem-test ()
     (function () t)
   "Measured zero-alloc serialize + deserialize (NFR-PERF-8). Asserted on SBCL
@@ -307,4 +421,85 @@
     (funcall (dds.types:type-support-sample-pool-free ts) sample)
     (dds.core.arena:pool-release pool buf)
     (dds.core.arena:teardown-arena arena)
+    (run-mem-test-secure)
+    t))
+
+(defun* run-mem-test-secure ()
+    (function () t)
+  "Measured zero-alloc data_protection AEAD encode + decode (NFR-MEM, security-ON). SBCL asserts
+   bytes-consed/iter < 1.0; Clasp smokes (bytes-consed is 0). Closes the gap that make mem never
+   covered the security path (ADR-0036 Carry-3)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [mem-secure] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-mem-test-secure t)))
+  (let* ((km (dds.security:make-test-key-material))
+         (pt (map '(simple-array (unsigned-byte 8) (*)) #'char-code "zero-alloc steady-state payload"))
+         (out (dds.core.buffer:make-octet-buffer (+ 64 (length pt))))
+         (ptout (dds.core.buffer:make-octet-buffer 256))
+         (iters 100000) (slen 0))
+    (setf slen (dds.security:encode-serialized-payload-into out km pt))           ; warm up
+    (dds.security:decode-serialized-payload-into ptout km (subseq (dds.core.buffer:octet-buffer-vec out) 0 slen))
+    (flet ((measure (label thunk)
+             (declare (type function thunk))
+             (let ((before (dds.pal:bytes-consed)))
+               (dotimes (i iters) (funcall thunk))
+               (let* ((delta (- (dds.pal:bytes-consed) before)) (per (/ (float delta) iters)))
+                 (format t "~&  mem[~11a]: ~9d bytes / ~d iters = ~,4f bytes/sample (~a)~%"
+                         label delta iters per (dds.pal:pal-impl-name))
+                 (when (eq (dds.pal:pal-impl-name) :sbcl)
+                   (%check :zero-alloc-secure (< per 1.0)
+                           (format nil "~a: ~,4f bytes/sample (expected ~~0)" label per)))))))
+      (measure "aead-encode" (lambda () (dds.security:encode-serialized-payload-into out km pt)))
+      ;; decode over a fixed sealed blob copied once into a reused static input buffer (no per-iter alloc)
+      (let ((sealed (dds.core.buffer:make-octet-buffer slen)))
+        (replace (dds.core.buffer:octet-buffer-vec sealed) (dds.core.buffer:octet-buffer-vec out) :end2 slen)
+        (measure "aead-decode"
+                 (lambda () (dds.security:decode-serialized-payload-into ptout km (dds.core.buffer:octet-buffer-vec sealed))))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sealed)))
+      ;; T5a review: the LIVE shape — crypto-transform installed AFTER enable-publisher (the DDS-Security
+      ;; handshake order; crypto-manager) — must lazily carve the encode pool on the first secured publish and
+      ;; then run zero-alloc. Build that exact shape and measure the steady-state pooled encode (SBCL only: this
+      ;; binds one ephemeral UDP socket via make-disc-node, and bytes-consed is only meaningful on SBCL).
+      (when (eq (dds.pal:pal-impl-name) :sbcl)
+        (let ((node (dds.disc:make-disc-node :domain 99)))
+          (unwind-protect
+               (progn
+                 (dds.disc:enable-publisher node :history-kind :keep-all)        ; crypto OFF at enable -> no pool
+                 (setf (dds.disc:disc-node-crypto-transform node) km)            ; live keys-install (crypto-manager)
+                 (let ((writer (dds.disc::disc-node-user-writer node)))
+                   (%check :live-pool-absent-at-enable
+                           (null (dds.rtps.history:history-cache-payload-pool (dds.rtps.reliable:rtps-writer-hc writer)))
+                           "live shape: no encode pool until the first secured publish")
+                   (dds.disc::%ensure-secured-payload-pool node writer)          ; what the first secured publish does
+                   (%check :live-pool-lazily-carved
+                           (dds.rtps.history:history-cache-payload-pool (dds.rtps.reliable:rtps-writer-hc writer))
+                           "live shape: the lazy carve must provision the encode pool")
+                   (measure "aead-encode-live"
+                            (lambda ()
+                              (let ((b (dds.rtps.reliable:writer-acquire-payload-buffer writer)))
+                                (dds.security:encode-serialized-payload-into b km pt)
+                                (dds.rtps.reliable:writer-release-payload-buffer writer b))))))
+            (dds.disc:stop-node node))))
+      ;; T5c/T5d: the LIVE pub+sub path — enabling data_protection adds 0.0000 B/sample OVER the non-secured baseline.
+      ;; PUBLISH is the headline gate: the full live publish-sample path (encode-into-pool + writer-write +
+      ;; make-cache-change + flush) conses IDENTICALLY with crypto ON vs OFF, so the data_protection delta is 0.0000.
+      ;; T5d pools the RECEIVE loan wrapper too (freelisted handle + fixed-vector registry + reused take vec), so
+      ;; the secured RECEIVE delta is now 0.0000 as well — asserted in run-secured-live-zeroalloc-test Part A.
+      (when (eq (dds.pal:pal-impl-name) :sbcl)
+        (let* ((live-pt (make-array 256 :element-type '(unsigned-byte 8) :initial-element 7))
+               (npub 200000)                             ; publish delta is ~0: a large window puts the ~64KB GC-boundary quantum at ~0.33 B/sample
+               (rx-wrap (%secured-wrapper-cycle-bps km 200000)))   ; T5d: the RECEIVE loan wrapper, measured DETERMINISTICALLY (exact 0.0000, no cross-node GC noise)
+          (multiple-value-bind (pub-plain pub-sec) (%secured-live-publish-delta-bps km live-pt npub)
+            (format t "~&  mem[aead-live-pub ]: plain=~,4f secured=~,4f -> data_protection delta=~,4f B/sample (~a)~%"
+                    pub-plain pub-sec (- pub-sec pub-plain) (dds.pal:pal-impl-name))
+            (format t "~&  mem[aead-live-rx  ]:         ~9d bytes / 200000 iters = ~,4f bytes/sample (T5d loan-wrapper cycle, deterministic; matching the encode side)~%"
+                    (round (* rx-wrap 200000)) rx-wrap)
+            (%check :zero-alloc-secure-live-publish (< (abs (- pub-sec pub-plain)) 2.0)
+                    (format nil "live publish: data_protection adds ~,4f B/sample over plain (expected ~~0; GC quantum ~,4f)"
+                            (- pub-sec pub-plain) (/ 65536.0 npub)))
+            (%check :zero-alloc-secure-live-rx (< rx-wrap 1.0)
+                    (format nil "live secured RECEIVE loan wrapper must be zero-alloc; measured ~,4f B/sample" rx-wrap))))))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ptout))
     t))

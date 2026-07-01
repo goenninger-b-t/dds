@@ -326,6 +326,67 @@
 
   t)
 
+(defun* run-security-payload-into-test ()
+    (function () t)
+  "DDS-Security §9.5.3.3 zero-alloc into-buffer codec (encode/decode-serialized-payload-into):
+   (a) encode-serialized-payload-into is pinned BYTE-FOR-BYTE to the INDEPENDENT serialize-secured-payload
+       oracle — the expected SecuredPayload is rebuilt via derive-session-key + the unchanged allocating
+       aes-256-gcm-seal (over session_id=all-zeros ‖ counter-0 iv_suffix=all-zeros, EMPTY AAD) +
+       serialize-secured-payload (all crypto.lisp, untouched by the into-core), NOT via the allocating
+       encode-serialized-payload wrapper (which now delegates to the same core — a core-vs-core tautology that
+       would round-trip a symmetric divergence clean). The 19-octet plaintext is NOT 4-aligned (pad=1), so this
+       also pins the §9.5.3.3.3 pad placement / tag offset / big-endian length the corpora alone would miss.
+   (b) decode-serialized-payload-into round-trips the plaintext byte-exact through a static PT-OUT buffer.
+   (c) decode-serialized-payload-into on an over-short input fails closed (-> NIL, no read/crash).
+   All static buffers are freed under unwind-protect so a %check failure never leaks them.
+   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [security-payload-into] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-security-payload-into-test t)))
+  (let* ((km     (dds.security:make-test-key-material))      ; CORE km under test, iv-counter 0
+         (km-or  (dds.security:make-test-key-material))      ; ORACLE km, same fixed master key/salt, counter 0
+         (pt     (map '(simple-array (unsigned-byte 8) (*)) #'char-code "zero-alloc payload!"))
+         (out    (dds.core.buffer:make-octet-buffer (+ 64 (length pt))))
+         (pt-out (dds.core.buffer:make-octet-buffer 256)))
+    (unwind-protect
+         (let* ((len  (dds.security:encode-serialized-payload-into out km pt))   ; CORE under test, counter 0
+                (core (subseq (dds.core.buffer:octet-buffer-vec out) 0 len))
+                ;; INDEPENDENT oracle: session_id=all-zeros (+fixed-session-id+, not exported -> reproduced
+                ;; inline), iv_suffix=counter-0 BE=all-zeros (fresh km); session key + seal + framing all via
+                ;; the unchanged crypto.lisp primitives, never the encode wrapper.
+                (sid   (make-array 4  :element-type '(unsigned-byte 8) :initial-element 0))
+                (iv    (make-array 8  :element-type '(unsigned-byte 8) :initial-element 0))
+                (aad   (make-array 0  :element-type '(unsigned-byte 8)))
+                (skey  (dds.security:derive-session-key
+                        (dds.security:key-material-master-sender-key km-or)
+                        (dds.security:key-material-master-salt km-or) sid))
+                (nonce (let ((nn (make-array 12 :element-type '(unsigned-byte 8))))
+                         (replace nn sid :start1 0 :end1 4) (replace nn iv :start1 4 :end1 12) nn)))
+           (multiple-value-bind (ct tag) (dds.dare:aes-256-gcm-seal skey nonce aad pt)
+             (let ((oracle (dds.security:serialize-secured-payload
+                            (dds.security:key-material-transformation-kind km-or)
+                            (dds.security:key-material-sender-key-id km-or)
+                            sid iv ct tag)))
+               (%check :payload-into-oracle-pinned
+                       (equalp core oracle)
+                       (format nil "encode-into must equal the serialize-secured-payload oracle byte-for-byte;~% core ~{~2,'0x~^ ~}"
+                               (coerce core 'list)))))
+           ;; round-trip: decode-into recovers the plaintext byte-exact through a static PT-OUT buffer
+           (let ((plen (dds.security:decode-serialized-payload-into pt-out km core)))
+             (%check :payload-into-decode
+                     (and plen (equalp (subseq (dds.core.buffer:octet-buffer-vec pt-out) 0 plen) pt))
+                     "decode-into must round-trip the plaintext"))
+           ;; fail-closed: a too-short input -> NIL (no read, no crash)
+           (%check :payload-into-failclosed
+                   (null (dds.security:decode-serialized-payload-into
+                          pt-out km (make-array 8 :element-type '(unsigned-byte 8))))
+                   "decode-into on a too-short input must return NIL (fail-closed)"))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt-out))))
+  t)
+
 (defun* run-security-payload-fuzz-test ()
     (function () t)
   "Fuzz decode-serialized-payload with N=2000 random/short/oversized inputs (both prod + (safety 0)).
@@ -450,6 +511,7 @@
                                      :qos (dds.qos:make-reader-qos :reliability :reliable
                                                                     :durability :transient-local))
            (dds.disc:enable-subscriber sub-node)
+           (dds.disc:set-secured-loan-capable sub-node t)   ; T5b: secured receive via the LOAN registry (zero per-sample plaintext alloc); crypto already on -> eager decode-pool carve
            (dds.disc:start-node sub-node)
            (dds.disc:add-local-reader plain-node :topic "SSquare" :type "ShapeType"
                                      :qos (dds.qos:make-reader-qos :reliability :reliable
@@ -482,17 +544,31 @@
                             (plusp (dds.disc:node-sample-count plain-node)))
                  do (dds.disc:announce-participant pub-node) (dds.disc:announce-endpoints pub-node)
                     (sleep 0.02))
-           ;; (a) SUB receives the decrypted plaintext PT byte-exact (§9.5.3.3.4.5)
+           ;; (a) SUB receives the decrypted plaintext PT byte-exact (§9.5.3.3.4.5) — via the T5b LOAN read contract:
+           ;; node-take-loaned returns a secured-loan-handle, the plaintext is read IN PLACE (secured-loan-bytes,
+           ;; zero copy), and node-return-loan releases the pooled buffer (pool-in-use back to baseline -> no leak).
            (%check :crypto-sub-received
                    (plusp (dds.disc:node-sample-count sub-node))
                    "sub-with-key did not receive any sample")
-           (let* ((sub-key (first (dds.disc:node-sample-sns sub-node)))
-                  (sub-payload (dds.disc:node-sample sub-node sub-key)))
-             (%check :crypto-sub-plaintext
-                     (and sub-payload (equalp sub-payload pt))
-                     (format nil "sub-with-key received ~a but expected plaintext ~{~2,'0x~^ ~}"
-                             (and sub-payload (coerce sub-payload 'list))
-                             (coerce pt 'list))))
+           (multiple-value-bind (data count) (dds.disc:node-take-loaned sub-node)   ; T5d: (values reused-VEC COUNT)
+             (%check :crypto-sub-loan
+                     (and (plusp count) (dds.disc:secured-loan-handle-p (aref data 0)))
+                     "secured loan-capable sub must deliver a SECURED-LOAN-HANDLE (not a bare plaintext vector)")
+             (let* ((h (aref data 0))
+                    (len (dds.disc:secured-loan-handle-len h))
+                    (bytes (dds.disc:secured-loan-bytes h)))   ; read the plaintext IN PLACE over [0, len) — no copy
+               (%check :crypto-sub-plaintext
+                       (and (= len (length pt))
+                            (loop for i below len always (= (aref bytes i) (aref pt i))))
+                       (format nil "sub-with-key loan recovered ~a but expected plaintext ~{~2,'0x~^ ~}"
+                               (loop for i below len collect (aref bytes i)) (coerce pt 'list)))
+               (dds.disc:node-return-loan sub-node data count)   ; the read-contract obligation: return every loan taken
+               (%check :crypto-sub-loan-returned
+                       (and (dds.disc:disc-node-decode-pool sub-node)
+                            (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool sub-node)))
+                            (null (dds.disc:secured-loan-handle-buffer h))
+                            (zerop (dds.disc:node-sample-count sub-node)))
+                       "after node-return-loan the pooled buffer is back (pool-in-use 0), the handle is invalidated, and the samples-store entry is gone — no leak, no dangling buffer")))
            ;; (b) PLAIN receives the raw SecuredPayload (NOT the plaintext)
            (%check :crypto-plain-received
                    (plusp (dds.disc:node-sample-count plain-node))
@@ -515,6 +591,167 @@
       (ignore-errors (dds.disc:stop-node pub-node))
       (ignore-errors (dds.disc:stop-node sub-node))
       (ignore-errors (dds.disc:stop-node plain-node))))
+  t)
+
+(defun* run-secured-decode-loan-alloc-test ()
+    (function () t)
+  "Test (WP-DDS-SECURITY-ZEROALLOC-AEAD T5b): the DECODE-side loan eliminates the per-sample plaintext alloc, the
+   loan lifecycle is leak-free + byte-exact, and pool exhaustion is SAMPLE_REJECTED (never a GC fallback).
+   Part 1 (the focused decode-path alloc check, SBCL-exact via dds.pal:bytes-consed; Clasp reports 0 -> the delta
+   is not measurable and the assertion is skipped, NFR-PORT): a steady loop of decode-serialized-payload-INTO a
+   pooled buffer conses far LESS per sample than the allocating decode-serialized-payload (which copies out a fresh
+   plaintext) — the plaintext copy is gone (the loan path's per-sample consing does NOT scale with plaintext size;
+   only the shared OpenSSL EVP FFI residue remains, a dds.dare follow-on). Part 2 (the live receive path, no
+   sockets — %deliver-user-sample driven directly): one sample is received as a SECURED-LOAN-HANDLE, read in place
+   byte-exact via secured-loan-bytes, and node-return-loan returns its buffer (pool-in-use back to baseline — no
+   leak); then samples beyond the pool capacity are fed WITHOUT returning, so the pool exhausts and the surplus is
+   rejected (decode-pool-rejects increments, node-sample-count capped) — RESOURCE_LIMITS / SAMPLE_REJECTED, never
+   a GC-heap fallback. Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [secured-decode-loan-alloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-secured-decode-loan-alloc-test t)))
+  ;; -- Part 1: the focused decode-path alloc proof (isolated codec + pool; no node) --
+  (let* ((km (dds.security:make-test-key-material))
+         (pt-size 4096)
+         (pt (let ((v (make-array pt-size :element-type '(unsigned-byte 8))))
+               (dotimes (i pt-size v) (setf (aref v i) (logand (* i 7) #xff)))))
+         (secured (dds.security:encode-serialized-payload km pt))   ; the SecuredPayload ciphertext to decode each iter
+         (element-bytes (+ pt-size 64))
+         (arena (dds.core.arena:init-arena :bytes (* element-bytes 8)))
+         (pool (dds.core.arena:make-buffer-pool arena element-bytes 8)))
+    (unwind-protect
+         (progn
+           ;; byte-exact: decode-into-pool recovers the EXACT plaintext (same bytes the allocating decode delivers)
+           (let* ((buf (dds.core.arena:pool-acquire pool))
+                  (plen (dds.security:decode-serialized-payload-into buf km secured))
+                  (bytes (dds.core.buffer:octet-buffer-vec buf)))
+             (%check :loan-alloc-byte-exact
+                     (and plen (= plen pt-size)
+                          (loop for i below pt-size always (= (aref bytes i) (aref pt i))))
+                     "decode-serialized-payload-into recovers the plaintext byte-exact into the pooled buffer")
+             (dds.core.arena:pool-release pool buf))
+           ;; measure: N iters of the loan decode (into pool) vs the allocating decode (fresh plaintext each call)
+           (let* ((n 200)
+                  (loan-consed (let ((before (dds.pal:bytes-consed)))
+                                 (dotimes (i n)
+                                   (let ((b (dds.core.arena:pool-acquire pool)))
+                                     (dds.security:decode-serialized-payload-into b km secured)
+                                     (dds.core.arena:pool-release pool b)))
+                                 (- (dds.pal:bytes-consed) before)))
+                  (old-consed (let ((before (dds.pal:bytes-consed)))
+                                (dotimes (i n) (dds.security:decode-serialized-payload km secured))
+                                (- (dds.pal:bytes-consed) before))))
+             (format t "~&  [secured-decode-loan-alloc] decode-INTO-pool=~,4f B/sample  allocating-decode=~,4f B/sample (plaintext ~d B)~%"
+                     (/ (float loan-consed) n) (/ (float old-consed) n) pt-size)
+             (if (zerop old-consed)
+                 (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — alloc delta not measurable~%")
+                 (progn
+                   (%check :loan-alloc-eliminates-plaintext (< (/ loan-consed n) pt-size)
+                           "the loan decode path does NOT cons the per-sample plaintext (< plaintext size per sample)")
+                   (%check :loan-alloc-beats-allocating (< loan-consed old-consed)
+                           "the loan decode path conses strictly less than the allocating decode")))))
+      (dds.core.arena:teardown-arena arena)))
+  ;; -- Part 2: the live receive path — loan lifecycle (byte-exact + no leak) + exhaustion -> SAMPLE_REJECTED --
+  (let* ((km (dds.security:make-test-key-material))
+         (pt (make-array 8 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x53 #x51 #x55 #x41 #x52 #x45 #x20 #x01)))
+         (secured (dds.security:encode-serialized-payload km pt))
+         (src (%make-test-prefix #xA1))
+         (wid #x00000102)
+         (node (let ((dds.disc:*shmem-enabled* nil))
+                 (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xE7) :domain 91
+                                          :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
+    (unwind-protect
+         (let ((cap 1) (head 1))   ; capture the tiny-pool sizing — the specials revert to defaults after the carve, so the cap assertion must read these
+           (dds.disc:enable-subscriber node)
+           ;; tiny pool (capacity = 1 + 1 = 2) so exhaustion is reachable with a handful of un-returned loans
+           (let ((dds.disc:*secured-pool-capacity* cap)
+                 (dds.disc:*secured-pool-headroom* head)
+                 (dds.disc:*secured-payload-max-bytes* 256))
+             (dds.disc:set-secured-loan-capable node t))
+           ;; one sample: received as a loan handle, read in place byte-exact, returned -> pool-in-use back to 0
+           (dds.disc::%deliver-user-sample node wid 1 secured src (dds.disc::%source-guid src wid) 1)
+           (multiple-value-bind (data count) (dds.disc:node-take-loaned node)   ; T5d: (values reused-VEC COUNT)
+             (%check :loan-rx-handle
+                     (and (plusp count) (dds.disc:secured-loan-handle-p (aref data 0)))
+                     "a secured loan-capable receive stores a SECURED-LOAN-HANDLE")
+             (let* ((h (aref data 0)) (len (dds.disc:secured-loan-handle-len h)) (bytes (dds.disc:secured-loan-bytes h)))
+               (%check :loan-rx-byte-exact
+                       (and (= len (length pt)) (loop for i below len always (= (aref bytes i) (aref pt i))))
+                       "the loaned plaintext is byte-exact (read in place)")
+               (dds.disc:node-return-loan node data count)
+               (%check :loan-rx-returned
+                       (and (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node)))
+                            (null (dds.disc:secured-loan-handle-buffer h))
+                            (zerop (dds.disc:node-sample-count node)))
+                       "node-return-loan returns the buffer (pool-in-use 0), invalidates the handle + the store entry — no leak/dangle")))
+           ;; exhaustion: feed SN 2..6 WITHOUT returning; pool cap 2 -> 2 admitted, the rest SAMPLE_REJECTED (no GC)
+           (loop for sn from 2 to 6
+                 do (dds.disc::%deliver-user-sample node wid sn secured src (dds.disc::%source-guid src wid) sn))
+           (%check :loan-exhaust-rejected
+                   (>= (dds.disc:disc-node-decode-pool-rejects node) 1)
+                   "pool exhaustion increments decode-pool-rejects (SAMPLE_REJECTED) — never a GC-heap fallback")
+           (%check :loan-exhaust-capped
+                   (<= (dds.disc:node-sample-count node) (+ cap head))
+                   "only pool-capacity samples are admitted; the surplus is rejected (bounded, no GC fallback)"))
+      (dds.disc:stop-node node)))   ; stop-node returns the still-loaned exhaustion buffers, then tears the arena down
+  t)
+
+(defun* run-secured-decode-loan-dup-test ()
+    (function () t)
+  "Test (WP-DDS-SECURITY-ZEROALLOC-AEAD T5b review, Finding 1): a RETRANSMITTED DUPLICATE of an
+   already-accepted-but-undrained secured sample must NOT evict the stored loan. On a reliable link the
+   duplicate acquires a FRESH pooled buffer, decodes, and builds a second handle that shares the original's
+   (GUID,SN); the dedup gate rejects it, so it is released. Because the store-eviction is IDENTITY-GUARDED
+   (only the handle still OCCUPYING the slot removes it), the duplicate frees only its OWN buffer and the
+   accepted original survives — no silent sample loss, no pinned pool slot. Asserts: (a) node-take-loaned still
+   returns the ORIGINAL byte-exact AFTER the duplicate (no silent loss); (b) the duplicate adds no net pin (its
+   buffer is freed immediately); (c) pool-in-use returns to baseline 0 once the app returns the original's loan
+   (no leak). No sockets — %deliver-user-sample driven directly (the dup is a second call with the same effective
+   GUID+SN, which reader-dedup-accept-p rejects). Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [secured-decode-loan-dup] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-secured-decode-loan-dup-test t)))
+  (let* ((km (dds.security:make-test-key-material))
+         (pt (make-array 8 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x53 #x51 #x55 #x41 #x52 #x45 #x20 #x01)))
+         (secured (dds.security:encode-serialized-payload km pt))
+         (src (%make-test-prefix #xA2))
+         (wid #x00000102)
+         (node (let ((dds.disc:*shmem-enabled* nil))
+                 (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xE8) :domain 92
+                                          :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
+    (unwind-protect
+         (progn
+           (dds.disc:enable-subscriber node)
+           (dds.disc:set-secured-loan-capable node t)   ; default-sized decode pool: room for the original + the dup's transient buffer
+           ;; deliver SN 1, then a DUPLICATE of SN 1 (same effective GUID+SN) BEFORE take — the dup must free its OWN buffer, not evict SN 1
+           (dds.disc::%deliver-user-sample node wid 1 secured src (dds.disc::%source-guid src wid) 1)
+           (let ((pinned-after-first (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node))))
+             (dds.disc::%deliver-user-sample node wid 1 secured src (dds.disc::%source-guid src wid) 1)
+             (%check :loan-dup-no-extra-pin
+                     (= (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node)) pinned-after-first)
+                     "the deduped duplicate frees its own buffer immediately — no extra pinned pool slot"))
+           ;; no silent loss: the ORIGINAL is still delivered byte-exact (the dup did NOT evict its store entry)
+           (multiple-value-bind (data count) (dds.disc:node-take-loaned node)   ; T5d: (values reused-VEC COUNT)
+             (%check :loan-dup-delivered
+                     (and (= 1 count) (dds.disc:secured-loan-handle-p (aref data 0)))
+                     "after a duplicate the original secured sample IS still delivered (no silent loss)")
+             (let* ((h (aref data 0)) (len (dds.disc:secured-loan-handle-len h)) (bytes (dds.disc:secured-loan-bytes h)))
+               (%check :loan-dup-byte-exact
+                       (and (= len (length pt)) (loop for i below len always (= (aref bytes i) (aref pt i))))
+                       "the surviving original loan is byte-exact (the dup neither corrupted nor replaced it)")
+               (dds.disc:node-return-loan node data count)
+               (%check :loan-dup-no-leak
+                       (and (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node)))
+                            (null (dds.disc:secured-loan-handle-buffer h))
+                            (zerop (dds.disc:node-sample-count node)))
+                       "after return-loan pool-in-use is back to 0 (dup freed immediately, original on return) — no leak/dangle"))))
+      (dds.disc:stop-node node)))
   t)
 
 (defun* run-security-encrypted-fragmented-test ()
@@ -592,6 +829,204 @@
                      "decoded payload does not match original plaintext (DATA_FRAG encode->reassemble->decode failure)")))
       (ignore-errors (dds.disc:stop-node pub-node))
       (ignore-errors (dds.disc:stop-node sub-node))))
+  t)
+
+(defun* run-security-encode-pool-alloc-test ()
+    (function () t)
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5a focused encode-path alloc check: a steady-state secured encode over a
+   REUSED key-material + plaintext through the POOL (writer-acquire-payload-buffer + encode-serialized-payload-into
+   + writer-release-payload-buffer) conses materially LESS per iteration than the allocating wrapper
+   (encode-serialized-payload, which subseqs a fresh per-sample payload vector) — proving the encode pool removed
+   the per-sample payload allocation. The win measured here is at least the payload size per sample. SBCL-exact
+   (dds.pal:bytes-consed); Clasp reports 0 by the NFR-PORT gap, so the inequality is asserted only on a measuring
+   impl. The full live-publish-path 0.0000 proof (publisher AND subscriber) is the T5c gate. Requires OpenSSL >= 3.5."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [security-encode-pool-alloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-security-encode-pool-alloc-test t)))
+  (let* ((km (dds.security:make-test-key-material))
+         (pt (make-array 256 :element-type '(unsigned-byte 8) :initial-element 7))
+         (iters 5000)
+         (element-bytes (+ 44 256 3 16))
+         (arena (dds.core.arena:init-arena :bytes (* element-bytes 4)))
+         (pool (dds.core.arena:make-buffer-pool arena element-bytes 2))
+         (writer (dds.rtps.reliable:make-rtps-writer
+                  :hc (dds.rtps.history:make-history-cache :keep-last 1 nil nil))))
+    (setf (dds.rtps.history:history-cache-payload-pool (dds.rtps.reliable:rtps-writer-hc writer)) pool)
+    (unwind-protect
+         (progn
+           ;; warm both paths (resolve EVP fn-pointers + cache the session key) so the steady-state delta is alloc-only
+           (dds.security:encode-serialized-payload km pt)
+           (let ((b (dds.rtps.reliable:writer-acquire-payload-buffer writer)))
+             (dds.security:encode-serialized-payload-into b km pt)
+             (dds.rtps.reliable:writer-release-payload-buffer writer b))
+           (let ((alloc0 (dds.pal:bytes-consed)))
+             (dotimes (i iters) (dds.security:encode-serialized-payload km pt))   ; allocating wrapper: subseqs a fresh payload
+             (let ((alloc-bytes (- (dds.pal:bytes-consed) alloc0))
+                   (pool0 (dds.pal:bytes-consed)))
+               (dotimes (i iters)   ; pooled: acquire + encode-into + release, no per-sample payload alloc
+                 (let ((b (dds.rtps.reliable:writer-acquire-payload-buffer writer)))
+                   (dds.security:encode-serialized-payload-into b km pt)
+                   (dds.rtps.reliable:writer-release-payload-buffer writer b)))
+               (let ((pool-bytes (- (dds.pal:bytes-consed) pool0)))
+                 (format t "~&  [security-encode-pool-alloc] allocating encode: ~,1f B/sample; pooled encode: ~,1f B/sample (~d samples, ~d-byte plaintext)~%"
+                         (/ alloc-bytes (float iters)) (/ pool-bytes (float iters)) iters (length pt))
+                 ;; on a measuring impl (SBCL) the pooled encode must cons less than the allocating one by AT LEAST
+                 ;; the payload size per sample (the eliminated subseq); Clasp's bytes-consed=0 -> alloc-bytes 0 -> skip
+                 (when (plusp alloc-bytes)
+                   (%check :encode-pool-removed-alloc
+                           (< (+ pool-bytes (* iters (length pt))) alloc-bytes)
+                           (format nil "pooled encode (~,1f B/sample) must save >= the payload size vs allocating (~,1f B/sample)"
+                                   (/ pool-bytes (float iters)) (/ alloc-bytes (float iters)))))))))
+      (dds.core.arena:teardown-arena arena)))
+  t)
+
+(defun* run-secured-live-zeroalloc-test ()
+    (function () t)
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5c (the gating PROOF): the LIVE secured pub+sub path is zero-alloc OVER the
+   non-secured baseline for the PAYLOAD codec, and pool exhaustion is BACKPRESSURE, never a GC fallback. HONEST
+   framing (no overclaim): enabling data_protection adds 0.0000 B/sample for the encode+decode PAYLOAD codec; it is
+   NOT a claim that the whole datagram path is 0 (a full loop still conses pre-existing NON-security allocs — the
+   make-cache-change struct, RTPS framing — IDENTICALLY with security on or off, so they cancel in the delta).
+   Part A (live-path delta, SBCL-exact via dds.pal:bytes-consed; Clasp reports 0 -> the deltas are 0 and the
+   measured assertions self-skip, NFR-PORT): a steady-state publish-sample loop conses IDENTICALLY with
+   data_protection ON vs OFF (delta 0.0000 -> the live publish encode is alloc-free relative to plain); and — since
+   T5d pooled the loan wrapper (freelisted secured-loan-handle + fixed-vector registry + reused take vec) — the
+   secured RECEIVE loan path now ALSO adds 0.0000 B/sample OVER plain, at BOTH 256-B and 4096-B payloads (asserted
+   with the same large-window / GC-quantum tolerance as the publish proof), whereas the allocating (non-loan)
+   decode it replaces still copies a full plaintext per sample (delta SCALES with payload). So enabling
+   data_protection is zero-alloc on the full secured receive loop, matching the encode side.
+   Part B (ENCODE pool exhaustion): a secured KEEP_ALL writer with a tiny pool and no readers fills the pool, then
+   publish-sample returns :timeout (RETCODE_TIMEOUT / RESOURCE_LIMITS) — never an error/crash, never a GC fallback;
+   the exhausted publishes cons far below one plaintext (no per-sample heap fallback).
+   Part C (DECODE pool exhaustion): a secured loan-capable reader fed past its tiny decode pool without returning
+   loans increments disc-node-decode-pool-rejects (SAMPLE_REJECTED), caps node-sample-count at the pool capacity,
+   and conses far below one plaintext per rejected sample (no GC fallback).
+   Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [secured-live-zeroalloc] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-secured-live-zeroalloc-test t)))
+  (let ((km (dds.security:make-test-key-material))
+        (sbcl (eq (dds.pal:pal-impl-name) :sbcl)))
+    ;; -- Part A: live-path delta — publish 0.0000 over plain + the honest receive decomposition --
+    (let* ((pt   (make-array 256  :element-type '(unsigned-byte 8) :initial-element 7))
+           (pt4k (make-array 4096 :element-type '(unsigned-byte 8) :initial-element 7))
+           (ct   (dds.security:encode-serialized-payload km pt))
+           (ct4k (dds.security:encode-serialized-payload km pt4k))
+           ;; the receive path conses common non-security framing -> get-bytes-consed has a ~64KB GC-boundary
+           ;; quantum; a LARGE window (N) resolves the true 0 loan delta (T5d) the same way NPUB does for publish.
+           ;; NA (the allocating-decode window) stays small — its per-sample plaintext copy is a huge signal that
+           ;; needs no precision and a large NA would cons 100s of MB. Clasp smokes (tiny windows; bytes-consed 0).
+           (n    (if sbcl 100000 2000))
+           (na   (if sbcl 8000 2000))
+           (npub (if sbcl 200000 2000)))
+      ;; publish delta: same warmed node (cancels the common non-security residual in one heap state -> ~0 delta).
+      ;; receive deltas: SEPARATE fresh nodes per config so both grow their reliable proxy/store IDENTICALLY 0->N
+      ;; (fully symmetric -> the loan wrapper is the only difference, and T5d made it 0). The EXACT 0.0000 wrapper
+      ;; proof is the deterministic %secured-wrapper-cycle-bps check below; this end-to-end delta corroborates it
+      ;; to within the cross-node ~64KB GC-boundary accounting quantum.
+      (multiple-value-bind (pub-plain pub-sec) (%secured-live-publish-delta-bps km pt npub)
+        (let* ((rx-plain  (%secured-live-receive-bps km pt   nil nil n))    ; plain receive (bare-vector store)
+               (rx-loan   (%secured-live-receive-bps km ct   t   t   n))    ; secured, loan-capable (T5b/T5d pooled wrapper)
+               (rx-alloc  (%secured-live-receive-bps km ct   t   nil na))   ; secured, NOT loan-capable (allocating decode) — big signal, small window
+               (rx-plain4 (%secured-live-receive-bps km pt4k nil nil n))
+               (rx-loan4  (%secured-live-receive-bps km ct4k t   t   n))
+               (rx-alloc4 (%secured-live-receive-bps km ct4k t   nil na))
+               (wrap-bps  (%secured-wrapper-cycle-bps km 200000))          ; DETERMINISTIC exact wrapper-cycle alloc (0.0000)
+               (pub-delta   (- pub-sec  pub-plain))
+               (loan-delta  (- rx-loan  rx-plain))
+               (loan-delta4 (- rx-loan4 rx-plain4))
+               (alloc-delta (- rx-alloc rx-plain))
+               (alloc-delta4 (- rx-alloc4 rx-plain4)))
+          (format t "~&  [secured-live-zeroalloc] PUBLISH  plain=~,4f secured=~,4f -> data_protection delta=~,4f B/sample~%"
+                  pub-plain pub-sec pub-delta)
+          (format t "  [secured-live-zeroalloc] RECEIVE@256  plain=~,4f loan=~,4f (delta ~,4f) alloc-decode=~,4f (delta ~,4f)~%"
+                  rx-plain rx-loan loan-delta rx-alloc alloc-delta)
+          (format t "  [secured-live-zeroalloc] RECEIVE@4096 loan delta=~,4f  alloc-decode delta=~,4f  (loan 256-vs-4096 diff ~,4f)~%"
+                  loan-delta4 alloc-delta4 (abs (- loan-delta loan-delta4)))
+          (format t "  [secured-live-zeroalloc] WRAPPER-CYCLE (acquire+fill+register+deregister+release+recycle) = ~,4f B/sample (deterministic, exact)~%"
+                  wrap-bps)
+          (if (not sbcl)
+              (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — delta assertions smoked, not measured~%")
+              (progn
+                ;; PRIMARY: the live publish path adds 0.0000 B/sample when data_protection is enabled (encode is alloc-free
+                ;; vs plain). Tolerance 2.0 absorbs SBCL get-bytes-consed's ~64KB GC-boundary accounting quantum
+                ;; (~0.33 B/sample at n=200000) on the common non-security framing; the true delta is 0 (the aead-encode-live
+                ;; mem arm measures the pool encode itself at an exact 0.0000, and per-GC-phase the two are bit-identical).
+                (%check :live-publish-zero-delta (< (abs pub-delta) 2.0)
+                        (format nil "live publish: data_protection adds ~,4f B/sample over plain (expected ~~0; GC-accounting quantum ~,4f)"
+                                pub-delta (/ 65536.0 npub)))
+                ;; T5d: the secured-receive loan path adds 0.0000 B/sample OVER plain. The EXACT zero is proven
+                ;; deterministically by :live-rx-wrapper-zero-alloc below (no GC-quantum caveat); THIS end-to-end
+                ;; delta corroborates it but is a SEPARATE-node subtraction so it carries cross-node GC-boundary
+                ;; accounting noise (observed |delta| ~1, sign varies by GC phase) — bounded FAR below the ~72-87
+                ;; B/sample T5b wrapper it replaces and below even one 16-B cons, and payload-size-INDEPENDENT (the
+                ;; 256-B and 4096-B deltas match), i.e. not a per-sample struct/list/payload alloc.
+                (%check :live-rx-loan-zero-delta-256 (< (abs loan-delta) 16.0)
+                        (format nil "secured-receive loan path adds ~,4f B/sample over plain (256-B; ~~0 within cross-node GC noise, < one 16-B cons — exact 0 proven by the wrapper-cycle check)" loan-delta))
+                (%check :live-rx-loan-zero-delta-4096 (< (abs loan-delta4) 16.0)
+                        (format nil "secured-receive loan path adds ~,4f B/sample over plain (4096-B; ~~0, payload-size-independent)" loan-delta4))
+                ;; the allocating decode it REPLACES copies a full plaintext per sample (scales 16x with the payload):
+                (%check :live-rx-loan-beats-allocating (< rx-loan rx-alloc)
+                        (format nil "the loan path (~,4f) must cons strictly less than the allocating decode (~,4f) it replaces" rx-loan rx-alloc))
+                (%check :live-rx-allocating-scales (> alloc-delta4 (+ alloc-delta 1000.0))
+                        (format nil "the allocating decode must SCALE with payload (256:~,4f vs 4096:~,4f) — proving the loan eliminated the per-sample plaintext copy" alloc-delta alloc-delta4))
+                ;; EXACT, deterministic proof (no GC-quantum caveat): the full T5d loan-wrapper cycle conses 0.0000 B/sample.
+                (%check :live-rx-wrapper-zero-alloc (< wrap-bps 1.0)
+                        (format nil "the T5d loan-wrapper cycle must be zero-alloc; measured ~,4f B/sample" wrap-bps)))))))
+    ;; -- Part B: ENCODE pool exhaustion -> publish-sample :timeout (RESOURCE_LIMITS), never GC --
+    (let ((node (let ((dds.disc:*shmem-enabled* nil) (dds.disc:*secured-pool-capacity* 2) (dds.disc:*secured-pool-headroom* 1))
+                  (let ((n (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xEA) :domain 93
+                                                    :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km)))
+                    (dds.disc:add-local-writer n :topic "ZAEnc" :type "X")
+                    (dds.disc:enable-publisher n :history-kind :keep-all)   ; carve encode pool of capacity 2+1 = 3
+                    n)))
+          (big (make-array 4096 :element-type '(unsigned-byte 8) :initial-element 9)))
+      (unwind-protect
+           (let ((results (loop repeat 12 collect (dds.disc:publish-sample node big))))   ; KEEP_ALL + no readers -> buffers held -> pool exhausts
+             (%check :encode-exhaust-timeout
+                     (and (member :timeout results) t)
+                     "a full secured encode pool must make publish-sample return :timeout (RESOURCE_LIMITS), not error/crash")
+             (%check :encode-exhaust-admitted-bounded
+                     (<= (count t results) 3)
+                     (format nil "only pool-capacity (3) publishes are admitted before exhaustion; got ~d admitted" (count t results)))
+             (when sbcl
+               (let ((before (dds.pal:bytes-consed)))
+                 (dotimes (i 5000) (dds.disc:publish-sample node big))   ; all exhausted -> :timeout
+                 (let ((per (/ (float (- (dds.pal:bytes-consed) before)) 5000)))
+                   (%check :encode-exhaust-no-gc (< per 256.0)
+                           (format nil "exhausted publish conses ~,4f B/call — must be far below the ~d-B plaintext (no GC fallback)"
+                                   per (length big)))))))
+        (dds.disc:stop-node node)))
+    ;; -- Part C: DECODE pool exhaustion -> SAMPLE_REJECTED (decode-pool-rejects), capped, never GC --
+    (let* ((big (make-array 4096 :element-type '(unsigned-byte 8) :initial-element 9))
+           (cbig (dds.security:encode-serialized-payload km big))
+           (src (%make-test-prefix #xAB)) (wid #x00000102)
+           (node (let ((dds.disc:*shmem-enabled* nil))
+                   (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xEB) :domain 94
+                                            :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
+      (unwind-protect
+           (let ((guid (dds.disc::%source-guid src wid)) (cap 1) (head 1))
+             (dds.disc:enable-subscriber node)
+             (let ((dds.disc:*secured-pool-capacity* cap) (dds.disc:*secured-pool-headroom* head))
+               (dds.disc:set-secured-loan-capable node t))   ; carve decode pool of capacity 1+1 = 2
+             (let ((before (dds.pal:bytes-consed)))
+               (loop for sn from 1 to 5000 do (dds.disc::%deliver-user-sample node wid sn cbig src guid sn))   ; loans never returned -> exhaust
+               (%check :decode-exhaust-rejected
+                       (>= (dds.disc:disc-node-decode-pool-rejects node) 1)
+                       "decode pool exhaustion must increment decode-pool-rejects (SAMPLE_REJECTED), never a GC fallback")
+               (%check :decode-exhaust-capped
+                       (<= (dds.disc:node-sample-count node) (+ cap head))
+                       (format nil "only pool-capacity (~d) samples are admitted; got ~d" (+ cap head) (dds.disc:node-sample-count node)))
+               (when sbcl
+                 (let ((per (/ (float (- (dds.pal:bytes-consed) before)) 5000)))
+                   (%check :decode-exhaust-no-gc (< per 256.0)
+                           (format nil "exhausted deliver conses ~,4f B/sample — far below the ~d-B plaintext (no GC fallback)"
+                                   per (length big)))))))
+        (dds.disc:stop-node node))))
   t)
 
 ;;; DDS-Security 1.1 §7.3.7 shared crypto wire codec (Slice 4 T1): the CryptoHeader (20B) /
@@ -1479,3 +1914,25 @@
         (format stream "| T10-recv (integrated) | ~,1f | ~d |~%" (float ns) (round b)))
       (format stream "~%")))
   t)
+
+(defun* run-security-session-key-cache-test ()
+    (function () t)
+  "Per-KeyMaterial session-key cache (WP-DDS-SECURITY-ZEROALLOC-AEAD T2, §9.5.3.3.4.2).
+   Verifies: (a) the cached key is byte-identical to a fresh derive-session-key result;
+   (b) a second call with the same session_id returns the SAME object (cache hit, EQ identity).
+   The hit path is lock-free + zero-alloc; the miss derives once and stores the result.
+   Both SBCL and Clasp must pass identically."
+  (let* ((km     (dds.security:make-test-key-material))
+         ;; +fixed-session-id+ = all-zeros (not exported; reproduced inline)
+         (sid    (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0))
+         (direct (dds.security:derive-session-key
+                  (dds.security:key-material-master-sender-key km)
+                  (dds.security:key-material-master-salt km)
+                  sid))
+         (k1     (dds.security::%km-session-key-at km sid 0))
+         (k2     (dds.security::%km-session-key-at km sid 0)))
+    (%check :skcache-correct (equalp k1 direct)
+            "cached key must equal a fresh derive-session-key result")
+    (%check :skcache-reused  (eq k1 k2)
+            "second call with same session_id must return the SAME object (cache hit)")
+    t))

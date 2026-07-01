@@ -47,6 +47,18 @@
   "Octet length of a static region from ALLOC-STATIC."
   (length vec))
 
+;; sb-sys:sap+ over vector-sap == static-vector-pointer for a static-vectors vec (verified); inline-unboxed
+(declaim (inline static-sap+))
+(defun* static-sap+ (vec offset)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0)) t)
+  "Raw foreign SAP at VEC[OFFSET], computed inline WITHOUT boxing the pointer (the safety-0 body
+   preserves unboxing even at a default-safety caller, so a hot-path FFI :pointer arg conses 0 B).
+   VEC MUST be an ALLOC-STATIC-backed (foreign, non-moving) vector — a GC-movable heap vector's SAP
+   would be unsafe. Equivalent to (static-vectors:static-vector-pointer VEC :offset OFFSET) but
+   non-consing; the boxing entry point STATIC-POINTER remains for control-plane use."
+  (declare (optimize speed (safety 0)))
+  (sb-sys:sap+ (sb-sys:vector-sap vec) offset))
+
 (declaim (inline mem-ref-u8 mem-set-u8))
 (defun* mem-ref-u8 (vec index)
     (function ((simple-array (unsigned-byte 8) (*)) (integer 0)) (unsigned-byte 8))

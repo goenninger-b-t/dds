@@ -1362,7 +1362,9 @@
    EXCLUSIVE verdict: that sample is from an identified-but-not-yet-SEDP-matched writer whose strength
    is unresolved (DDS 1.4 §2.2.3.9.2), so the watermark is LEFT PENDING — the reliable engine already
    ACKed it and will never retransmit, so advancing the watermark would lose it permanently; a later
-   drain re-evaluates it once the match completes and the strength is known."
+   drain re-evaluates it once the match completes and the strength is known. A SECURED-LOAN-HANDLE
+   (WP-DDS-SECURITY-ZEROALLOC-AEAD T5b) is disc-node-only and must NEVER reach this DCPS drain; if a future
+   DCPS-loan mis-wire lets one through, the drain ERRORS rather than deserializing the struct as octets."
   (let ((sguid (dds.disc:node-sample-writer-guid node key))
         (sn (dds.disc:node-sample-key-sn key))
         (advance t))                       ; advance the per-writer watermark unless arbitration keeps it pending
@@ -1370,6 +1372,8 @@
     (when (dds.disc:zc-loan-marker-p bytes)            ; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): an UNRESOLVED ZC ref -> acquire a literal-0-copy view, never deserialize
       (%drain-one-loan dr ts key bytes sn sguid)
       (return-from %drain-one-sample t))
+    (when (dds.disc:secured-loan-handle-p bytes)       ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: secured loans are disc-node-only — a handle here = a future DCPS-loan mis-wire; fail loud, never deserialize a struct as octets
+      (error "secured-loan-handle reached the DCPS drain (writer ~a SN ~a): secured loans are disc-node-only; set-secured-loan-capable was mis-wired into DCPS" sguid sn))
     (when bytes
       (let ((data (%deserialize-sample ts bytes)))
         ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
