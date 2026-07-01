@@ -397,6 +397,10 @@
    Writes PT-LEN ciphertext octets into OUT[CT-OFF..] and the 16-byte tag into OUT[TAG-OFF..]
    directly through OUT's GC-stable static SAP (no make-array; zero GC-heap output allocation).
    NONCE = NONCE-VEC[NONCE-OFF..+12]; PLAINTEXT = PT[PT-OFF..+PT-LEN]; AAD authenticated in full.
+   PT-LEN=0 (SIGN/GMAC, DDS-Security §9.5.3.3.4.3): no ciphertext bytes written; only the 16-byte
+   GMAC tag at OUT[TAG-OFF..]. AAD may alias OUT's backing memory (the SIGN verbatim region in the
+   same buffer): EVP_EncryptUpdate(AAD) runs before GET_TAG writes the tag, so aad-ptr / out-SAP
+   aliasing is safe regardless of offset overlap.
    OUT MUST be an ALLOC-STATIC-backed vector with room for CT-OFF+PT-LEN and TAG-OFF+16 octets.
    Same EVP_Encrypt* sequence as AES-256-GCM-SEAL so the output is byte-identical (NIST SP 800-38D
    Appendix B TC16). Key buffer is zeroized before return. Returns T. Signals on any EVP error.
@@ -527,6 +531,9 @@
    GC-stable static SAP and returns T; on authentication failure returns NIL and zeroizes the
    CT-LEN-octet output region so NO readable plaintext remains (fail-closed, SP 800-38D §7.2).
    NONCE = NONCE-VEC[NONCE-OFF..+12]; CIPHERTEXT = CT-VEC[CT-OFF..+CT-LEN]; TAG = TAG-VEC[TAG-OFF..+16].
+   CT-LEN=0 (SIGN/GMAC verify, DDS-Security §9.5.3.3.4.3): no plaintext bytes are written;
+   EVP_DecryptFinal_ex authenticates the AAD-only GHASH against TAG-VEC[TAG-OFF..+16], returning T
+   on match and NIL on mismatch (fail-closed; no-op output wipe since CT-LEN=0).
    PT-OUT MUST be an ALLOC-STATIC-backed vector with room for PT-OFF+CT-LEN octets.
    Same EVP_Decrypt* sequence as AES-256-GCM-OPEN so the plaintext is byte-identical. Key buffer is
    zeroized before return; NEVER leaves plaintext readable on auth failure (NIST SP 800-38D §7.2).
