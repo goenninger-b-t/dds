@@ -2947,6 +2947,7 @@
                  ("security-submessage"          . run-security-submessage-corpus-test)
                  ("security-origin-auth"         . run-security-origin-auth-test)
                  ("security-rtps-message"        . run-security-rtps-message-corpus-test)
+                 ("security-secured-region-into" . run-security-secured-region-into-test)
                  ("pvms-reliable-bootstrap"      . dds.disc:run-volatile-secure-reliable-test)
                  ("pvms-fail-closed"             . dds.disc:run-volatile-secure-fail-closed-test)
                  ("pvms-purge-bound-n2"          . dds.disc:run-volatile-secure-purge-bound-test)

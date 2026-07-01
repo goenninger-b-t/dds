@@ -45,9 +45,19 @@
 ;;;; submessage tier (this file) passes SEC_PREFIX/SEC_POSTFIX; the whole-RTPS-message tier
 ;;;; (crypto/rtps-message.lisp, T4) passes SRTPS_PREFIX/SRTPS_POSTFIX over the same engine. The ONLY
 ;;;; decode difference is locating the SIGN body: the submessage tier wraps ONE submessage
-;;;; (%read-embedded-submessage); the RTPS tier wraps the whole submessage STREAM, so it WALKS
-;;;; submessage-by-submessage to the trailing postfix (%walk-verbatim-body, sign-walk-p) — corroborated
+;;;; (%embedded-submessage-len); the RTPS tier wraps the whole submessage STREAM, so it WALKS
+;;;; submessage-by-submessage to the trailing postfix (%walk-verbatim-len, sign-walk-p) — corroborated
 ;;;; CLEAN-ROOM against Fast DDS decode_rtps_message (see docs/provenance.md, M7/P6 T4).
+;;;;
+;;;; ZERO-ALLOC (Slice 2 / ZA-2): %encode-secured-region / %decode-secured-region are now thin ALLOCATING
+;;;; wrappers over the into-buffer cores %encode-secured-region-into / %decode-secured-region-into, which
+;;;; write/parse the bracket directly through a STATIC octet-buffer by RAW OFFSET (no cursor consed) — the
+;;;; ZA-1 payload-tier trick extended to the submessage + whole-RTPS tiers. The cores are byte-IDENTICAL to
+;;;; the pre-ZA-2 assembly (same field widths/offsets, big-endian %put-u32-be-at, §9.5.3.3.3/.4.4 4-align
+;;;; pads, aes-256-gcm-seal-into ct+tag), so the T2/T4 byte-exact corpora exercise them. Common-path encode
+;;;; (RECEIVERS empty) + ENCRYPT decode are zero GC-heap alloc; SIGN decode materializes the verbatim region
+;;;; once (open-into's full-length AAD); origin-auth (RECEIVERS / my-receiver-key) is the deferred allocating
+;;;; fallback (encode via %compute-receiver-macs, decode via %decode-verify-origin-auth).
 ;;;;
 ;;;; SECURITY POSTURE (NFR-SEC-POSTURE / the operating contract §4): decode is FAIL-CLOSED and
 ;;;; bounds-checked even at (safety 0) — the SEC_PREFIX -> {SEC_BODY (ENCRYPT) | verbatim (SIGN)} ->
@@ -247,88 +257,142 @@
 
 ;;; --- encode (shared core for datawriter + datareader; §8.5 — same mechanism, no copy-paste) ---
 
+(defun* %put-sec-header-at (vec off submessage-id octets-to-next)
+    (function ((simple-array (unsigned-byte 8) (*)) fixnum (unsigned-byte 8) (unsigned-byte 16)) (eql t))
+  "Write a 4-octet RTPS SubmessageHeader into VEC[OFF..OFF+4] by RAW OFFSET, no cursor (the zero-alloc
+   analogue of %write-sec-submessage-header; DDSI-RTPS 2.5 §9.4.5.1): submessageId(1) ‖ flags(1, E=1
+   little-endian = +sec-submessage-le-flags+) ‖ octetsToNextHeader(u16, little-endian low‖high). Emits the
+   SAME 4 octets %write-sec-submessage-header's cursor path does. Caller guarantees OFF+4 <= (length VEC)
+   (the -into O(1) total-extent check bounds it). Returns T."
+  (setf (aref vec off)       submessage-id
+        (aref vec (+ off 1)) +sec-submessage-le-flags+
+        (aref vec (+ off 2)) (logand octets-to-next #xff)
+        (aref vec (+ off 3)) (logand (ash octets-to-next -8) #xff))
+  t)
+
+(defun* %encode-secured-region-into (out-buf out-off km mode plain plain-off plain-len
+                                     receivers prefix-kind postfix-kind
+                                     &optional (session-id +fixed-session-id+))
+    (function (dds.core.buffer:octet-buffer fixnum key-material (member :sign :encrypt)
+               (simple-array (unsigned-byte 8) (*)) fixnum fixnum list
+               (unsigned-byte 8) (unsigned-byte 8)
+               &optional (simple-array (unsigned-byte 8) (*)))
+              fixnum)
+  "Build the PREFIX-KIND ... POSTFIX-KIND bracket protecting PLAIN[PLAIN-OFF..+PLAIN-LEN] under KM per MODE
+   directly INTO the STATIC octet-buffer OUT-BUF starting at OUT-OFF; return the total bracket length. The
+   zero-alloc core behind %encode-secured-region (the thin allocating wrapper), so the T2/T4 byte-exact
+   corpora exercise it — BYTE-IDENTICAL to %encode-secured-region by construction (same field widths/offsets,
+   the SAME big-endian %put-u32-be-at length/count, the SAME §9.5.3.3.3/.4.4 4-align pads, and
+   aes-256-gcm-seal-into emits ct+tag byte-identical to aes-256-gcm-seal). Shared by BOTH the §8.5.1.7-.9
+   submessage tier (SEC_PREFIX 0x31 / SEC_POSTFIX 0x32) AND the §8.5.1.10-.12 whole-RTPS tier (SRTPS_PREFIX
+   0x33 / SRTPS_POSTFIX 0x34) — only the bracket ids + the protected unit differ (DRY).
+   ZERO GC-heap allocation on the common path (RECEIVERS empty): the 4-byte submessage headers, the 20-byte
+   §9.5.3.3.1 CryptoHeader, the SEC_BODY header + cnt_length, the 4-align pads and rsm_count are RAW OFFSET
+   writes (no cursor is consed); the 12-byte AES-GCM nonce is the in-place CryptoHeader session_id‖iv_suffix
+   sub-slice (OUT-BUF[OUT-OFF+12..+24], written first — no nonce buffer); the iv_suffix is stamped in place by
+   %km-next-iv-suffix-into; the session key is cached per KM (%km-session-key-at). ENCRYPT: aes-256-gcm-seal-into
+   writes the ciphertext at the SEC_BODY content offset + the common_mac (tag) at the POSTFIX offset, under
+   EMPTY AAD (§9.5.3.3.4.4). SIGN: the region is copied VERBATIM (no SEC_BODY, §9.5.3.3.4.3) and
+   aes-256-gcm-seal-into with pt-len 0 authenticates AAD = PLAIN (the whole vector = the verbatim region) as
+   a GMAC — so for MODE :sign the caller MUST pass PLAIN-OFF 0 and PLAIN-LEN (length PLAIN) (the wrappers do).
+   RECEIVERS non-empty (origin authentication, §9.5.3.3.4.3) is the DEFERRED allocating fallback: after the
+   seal, %compute-receiver-macs derives each receiver-specific GMAC over the common_mac (read in place) and
+   the {key_id,mac} entries are written into the CryptoFooter (this branch MAY allocate — do not rely on it
+   for zero-alloc; empty RECEIVERS writes rsm_count 0, the plain tag). SESSION-ID (default +fixed-session-id+
+   = all-zeros, the Slice-1/T2/T4 corpus value; T8 PVMS per-role non-zero) is written into the CryptoHeader
+   and folded into the KDF + nonce. OUT-BUF must hold OUT-OFF + the bracket length, else BUFFER-OVERFLOW (an
+   O(1) extent check BEFORE any write, safety-0-safe; NFR-SEC-POSTURE). Returns the total bracket length."
+  (let* ((vec         (dds.core.buffer:octet-buffer-vec out-buf))
+         (count       (length receivers))
+         (kind        (%mode->kind mode))
+         (key-id      (key-material-sender-key-id km))
+         (hdr-loc     +sec-submessage-header-len+)                             ; CryptoHeader start = 4
+         (sid-loc     (+ hdr-loc +transformation-kind-len+ +transformation-key-id-len+))  ; session_id = 12
+         (iv-loc      (+ sid-loc +session-id-len+))                            ; iv_suffix = 16
+         (mid-loc     (+ hdr-loc +secure-data-header-len+))                    ; middle region = 24
+         (ct-len      (ecase mode (:encrypt plain-len) (:sign 0)))
+         ;; §9.5.3.3.4.4 SEC_BODY 4-align pad: the SEC_BODY content starts 4-aligned (24+4+4=32), so it reduces
+         ;; to (-|ciphertext| mod 4); the plaintext is never padded. SIGN has no SEC_BODY -> no pad.
+         (ct-pad      (ecase mode (:encrypt (mod (- ct-len) 4)) (:sign 0)))
+         (ct-loc      (+ mid-loc +sec-submessage-header-len+ +crypto-content-length-len+))  ; ciphertext = 32
+         (postfix-loc (ecase mode (:encrypt (+ ct-loc ct-len ct-pad)) (:sign (+ mid-loc plain-len))))
+         (mac-loc     (+ postfix-loc +sec-submessage-header-len+))             ; common_mac
+         ;; §9.5.3.3.3 rsm_count 4-align vs the bracket start; 0 for the 4-aligned brackets (the T12 carry)
+         (align-pad   (mod (- (+ mac-loc +common-mac-len+)) 4))
+         (rsm-loc     (+ mac-loc +common-mac-len+ align-pad))
+         (entries-loc (+ rsm-loc +receiver-specific-macs-count-len+))
+         (macs-bytes  (* count (+ +transformation-key-id-len+ +common-mac-len+)))
+         (postfix-len (+ +common-mac-len+ +receiver-specific-macs-count-len+ macs-bytes))
+         (total       (+ entries-loc macs-bytes)))
+    (unless (<= (+ out-off total) (length vec))
+      (error 'dds.core.buffer:buffer-overflow :need (+ out-off total) :have (length vec)))
+    ;; PREFIX submessage header ‖ CryptoHeader (kind ‖ key_id ‖ session_id ‖ iv_suffix), by raw offset
+    (%put-sec-header-at vec out-off prefix-kind +secure-data-header-len+)
+    (replace vec kind       :start1 (+ out-off hdr-loc) :end1 (+ out-off hdr-loc +transformation-kind-len+))
+    (replace vec key-id     :start1 (+ out-off hdr-loc +transformation-kind-len+) :end1 (+ out-off sid-loc))
+    (replace vec session-id :start1 (+ out-off sid-loc) :end1 (+ out-off iv-loc))
+    (%km-next-iv-suffix-into km vec (+ out-off iv-loc))
+    ;; middle region + AES-256-GCM seal (nonce = the in-place CryptoHeader session_id‖iv_suffix sub-slice)
+    (ecase mode
+      (:encrypt
+       (%put-sec-header-at vec (+ out-off mid-loc) +submessage-sec-body+
+                           (+ +crypto-content-length-len+ ct-len ct-pad))
+       (%put-u32-be-at vec (+ out-off mid-loc +sec-submessage-header-len+) ct-len)
+       (dds.dare:aes-256-gcm-seal-into vec (+ out-off ct-loc) (+ out-off mac-loc)
+                                       (%km-session-key-at km vec (+ out-off sid-loc))
+                                       vec (+ out-off sid-loc)
+                                       +empty-octets+ plain plain-off plain-len)
+       (dotimes (i ct-pad) (setf (aref vec (+ out-off ct-loc ct-len i)) 0)))
+      (:sign
+       (dotimes (i plain-len) (setf (aref vec (+ out-off mid-loc i)) (aref plain (+ plain-off i))))
+       (dds.dare:aes-256-gcm-seal-into vec (+ out-off mid-loc) (+ out-off mac-loc)
+                                       (%km-session-key-at km vec (+ out-off sid-loc))
+                                       vec (+ out-off sid-loc)
+                                       plain +empty-octets+ 0 0)))
+    ;; POSTFIX submessage header ‖ CryptoFooter (common_mac already sealed at MAC-LOC): 4-align pad ‖ rsm_count
+    (%put-sec-header-at vec (+ out-off postfix-loc) postfix-kind postfix-len)
+    (dotimes (i align-pad) (setf (aref vec (+ out-off mac-loc +common-mac-len+ i)) 0))
+    (%put-u32-be-at vec (+ out-off rsm-loc) count)
+    ;; origin authentication (§9.5.3.3.4.3): compute + write receiver_specific_macs (the allocating fallback)
+    (when (plusp count)
+      (let ((macs (%compute-receiver-macs km
+                                          (subseq vec (+ out-off sid-loc) (+ out-off iv-loc))
+                                          (subseq vec (+ out-off iv-loc) (+ out-off mid-loc))
+                                          (subseq vec (+ out-off mac-loc) (+ out-off mac-loc +common-mac-len+))
+                                          receivers))
+            (eoff (+ out-off entries-loc)))
+        (dolist (e macs)
+          (replace vec (car e) :start1 eoff :end1 (+ eoff +transformation-key-id-len+))
+          (replace vec (cdr e) :start1 (+ eoff +transformation-key-id-len+)
+                               :end1 (+ eoff +transformation-key-id-len+ +common-mac-len+))
+          (incf eoff (+ +transformation-key-id-len+ +common-mac-len+)))))
+    total))
+
 (defun* %encode-secured-region (km mode plain-region receivers prefix-kind postfix-kind
                                 &optional (session-id +fixed-session-id+))
     (function (key-material (member :sign :encrypt) (simple-array (unsigned-byte 8) (*)) list
                (unsigned-byte 8) (unsigned-byte 8) &optional (simple-array (unsigned-byte 8) (*)))
               (or (simple-array (unsigned-byte 8) (*)) null))
-  "Build the PREFIX-KIND ... POSTFIX-KIND bracket protecting the octet region PLAIN-REGION under KM per
-   MODE — the SHARED engine behind BOTH the §8.5.1.7-.9 submessage tier (PREFIX-KIND/POSTFIX-KIND =
-   SEC_PREFIX 0x31 / SEC_POSTFIX 0x32; PLAIN-REGION = one submessage) AND the §8.5.1.10-.12 whole-RTPS
-   tier (T4: SRTPS_PREFIX 0x33 / SRTPS_POSTFIX 0x34; PLAIN-REGION = the whole submessage stream). The two
-   tiers are the SAME crypto mechanism — only the bracket submessage ids and the protected unit differ
-   (DRY, no copy-paste). RECEIVERS is the origin-authentication receiver list — a list of
-   (receiver-key-id . master-receiver-specific-key) conses, EMPTY for plain SIGN/ENCRYPT. AFTER the seal,
-   %compute-receiver-macs derives each receiver-specific session key + GMAC over the common_mac (same IV)
-   and the (key_id . mac) entries fill the CryptoFooter receiver_specific_macs (§9.5.3.3.4.3); an empty
-   RECEIVERS writes rsm_count 0 (the plain Slice-1/T2 tag).
-   SESSION-ID (optional, default +fixed-session-id+ = all-zeros, the Slice-1/T2/T4 corpus value — DO NOT
-   perturb the non-PVMS tiers): the 4-octet §9.5.3.3.4.4 session_id written into the CryptoHeader and
-   folded into BOTH the session-key KDF and the AES-GCM nonce. T8 passes a per-role NON-ZERO session_id for
-   the SYMMETRIC PVMS bootstrap KM so the two directions use DISJOINT (key, nonce) spaces — no AES-GCM nonce
-   reuse across the pair (decode reads session_id from the wire, so this is self-describing; see
-   dds.disc:%pvms-role-session-id and docs/provenance.md M7/P6 T8).
-   Steps:
-     1. Claim a UNIQUE iv_suffix from KM's monotonic counter (%km-next-iv-suffix; structural nonce
-        uniqueness).
-     2. %seal-with-km (DRY): derive the session key, nonce = session_id∥iv_suffix, AES-256-GCM seal.
-        ENCRYPT seals the region under EMPTY AAD -> (ciphertext, tag). SIGN seals EMPTY plaintext
-        under the region as AAD -> (empty, tag=GMAC).
-     3. Assemble the bracket into an off-heap (static-arena) scratch buffer via the T1 codec — ENCRYPT
-        inserts a SEC_BODY (0x30) holding the length-prefixed ciphertext (§9.5.3.3.4.4); SIGN inserts
-        NO SEC_BODY, writing the region VERBATIM between PREFIX and POSTFIX (§9.5.3.3.4.3) — then return
-        a fresh heap copy (no caller free obligation) and free the scratch.
-   Returns NIL only if the AEAD primitive itself fails (it does not, for well-formed inputs)."
-  (let* ((iv-suffix  (%km-next-iv-suffix km))
-         (session-id (copy-seq session-id))
-         (kind       (%mode->kind mode))
-         (key-id     (key-material-sender-key-id km)))
-    (multiple-value-bind (ciphertext tag)
-        (ecase mode
-          (:encrypt (%seal-with-km km session-id iv-suffix +empty-octets+ plain-region))
-          (:sign    (%seal-with-km km session-id iv-suffix plain-region +empty-octets+)))
-      ;; Between PREFIX and POSTFIX: ENCRYPT inserts a SEC_BODY (0x30) holding the length-prefixed
-      ;; ciphertext (§9.5.3.3.4.4); SIGN/GMAC inserts NO SEC_BODY — the region VERBATIM (§9.5.3.3.4.3) —
-      ;; so the middle region's length + writer are mode-dependent. common_mac = tag.
-      ;; Origin auth (§9.5.3.3.4.3): derive each receiver's GMAC over the common_mac (same IV) AFTER the
-      ;; seal — empty RECEIVERS -> empty list -> rsm_count 0 (the plain SIGN/ENCRYPT tag, unchanged).
-      (let* ((receiver-macs (%compute-receiver-macs km session-id iv-suffix tag receivers))
-             (postfix-len (+ +common-mac-len+ +receiver-specific-macs-count-len+
-                             (* (length receiver-macs)
-                                (+ +transformation-key-id-len+ +common-mac-len+))))
-             ;; ENCRYPT SEC_BODY 4-align pad: zero octets AFTER the ciphertext so the SEC_POSTFIX starts
-             ;; 4-aligned (Fast DDS serialize_SecureDataBody, L1692-1702: "Align submessage to 4"). The
-             ;; SEC_BODY content starts 4-aligned (PREFIX 24 + SEC_BODY hdr 4 + cnt_length 4 = 32), so the
-             ;; align reduces to (-|ciphertext| mod 4); the plaintext is NEVER padded (the recovered submessage
-             ;; reflects its TRUE length). SIGN has no SEC_BODY -> no pad here (its alignment is the T12 carry).
-             (ct-pad (ecase mode (:encrypt (mod (- (length ciphertext)) 4)) (:sign 0)))
-             (mid-len (ecase mode
-                        (:encrypt (+ +sec-submessage-header-len+ +crypto-content-length-len+
-                                     (length ciphertext) ct-pad))
-                        (:sign    (length plain-region))))
-             (total (+ +sec-submessage-header-len+ +secure-data-header-len+   ; PREFIX
-                       mid-len                                                 ; SEC_BODY (ENCRYPT) | verbatim (SIGN)
-                       +sec-submessage-header-len+ postfix-len))              ; POSTFIX
-             (scratch (dds.pal:alloc-static total)))      ; off-heap assembly scratch (NFR-MEM)
-        (unwind-protect
-             (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over scratch)
-                                                :endianness :little)))
-               (%write-sec-submessage-header cur prefix-kind +secure-data-header-len+)
-               (serialize-crypto-header cur kind key-id session-id iv-suffix)
-               (ecase mode
-                 ;; ENCRYPT: SEC_BODY (0x30) ‖ crypto_content (cnt_length = TRUE ciphertext length, BE)
-                 ;; ‖ ciphertext ‖ 4-align pad (§9.5.3.3.4.4; Fast DDS serialize_SecureDataBody L1677-1702:
-                 ;; octetsToNextHeader = (|ciphertext|+4+3)&~3 covers cnt_length + ciphertext + pad).
-                 (:encrypt (%write-sec-submessage-header cur +submessage-sec-body+
-                                                         (+ +crypto-content-length-len+ (length ciphertext) ct-pad))
-                           (serialize-crypto-content cur ciphertext)
-                           (dotimes (_ ct-pad) (dds.core.buffer:put-u8 cur 0)))
-                 ;; SIGN: the region VERBATIM, no SEC_BODY, no length prefix (§9.5.3.3.4.3).
-                 (:sign (dds.core.buffer:put-octets cur plain-region 0 (length plain-region))))
-               (%write-sec-submessage-header cur postfix-kind postfix-len)
-               (serialize-crypto-footer cur tag receiver-macs)
-               (subseq scratch 0 total))                  ; fresh heap copy; caller need not free
-          (dds.pal:free-static scratch))))))
+  "Build the PREFIX-KIND ... POSTFIX-KIND bracket protecting PLAIN-REGION under KM per MODE and return a fresh
+   octet vector — the SHARED engine behind BOTH the §8.5.1.7-.9 submessage tier (SEC_PREFIX 0x31 / SEC_POSTFIX
+   0x32; PLAIN-REGION = one submessage) AND the §8.5.1.10-.12 whole-RTPS tier (SRTPS_PREFIX 0x33 / SRTPS_POSTFIX
+   0x34; PLAIN-REGION = the whole submessage stream) — only the bracket ids + protected unit differ (DRY).
+   Thin ALLOCATING wrapper over the zero-alloc core %encode-secured-region-into: allocate a static scratch
+   octet-buffer, build the bracket into it (unique iv_suffix, AES-256-GCM seal, ENCRYPT SEC_BODY / SIGN
+   verbatim, empty AAD / GMAC; see the core for the full algorithm + spec citations), copy out the exact bytes
+   and free the scratch. RECEIVERS is the origin-authentication receiver list (a list of
+   (receiver-key-id . master-receiver-specific-key) conses, EMPTY for plain SIGN/ENCRYPT -> rsm_count 0).
+   SESSION-ID (default +fixed-session-id+ = all-zeros, the Slice-1/T2/T4 corpus value; T8 PVMS per-role non-zero)
+   is written into the CryptoHeader + folded into the KDF + nonce. The wire is byte-identical to the pre-ZA-2
+   assembly (the byte-exact corpora prove it). Returns a fresh octet vector."
+  (let ((out (dds.core.buffer:make-octet-buffer
+              (+ 64 (length plain-region) (* (length receivers)
+                                             (+ +transformation-key-id-len+ +common-mac-len+))))))
+    (unwind-protect
+         (let ((len (%encode-secured-region-into out 0 km mode plain-region 0 (length plain-region)
+                                                 receivers prefix-kind postfix-kind session-id)))
+           (subseq (dds.core.buffer:octet-buffer-vec out) 0 len))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out)))))
 
 (defun* %encode-secured-submessage (km mode plain-submessage receivers
                                     &optional (session-id +fixed-session-id+))
@@ -394,66 +458,178 @@
       (parse-crypto-footer cursor)
       (values nil '())))
 
-(defun* %read-embedded-submessage (cursor)
-    (function (dds.core.buffer:cursor) (simple-array (unsigned-byte 8) (*)))
-  "Read one complete embedded RTPS submessage VERBATIM at CURSOR and return it as a fresh
-   (4 + octetsToNextHeader)-octet vector, advancing CURSOR past it. Layout (DDSI-RTPS 2.5 §9.4.5.1):
-   submessageId(1) ‖ flags(1) ‖ octetsToNextHeader(u16, endianness per the embedded E flag = bit 0 of
-   flags, §9.4.5.1.2) ‖ octetsToNextHeader payload octets. This is the AES256-GMAC (SIGN) recovery
-   (DDS-Security 1.1 §9.5.3.3.4.3): SIGN protection emits NO SEC_BODY — the original submessage sits
-   VERBATIM between SEC_PREFIX and SEC_POSTFIX — so decode parses the submessage's OWN header to find
-   its extent (distinct from %parse-sec-submessage-header, which discards the header bytes + length).
-   check-room guards the payload extent BEFORE allocating the result and get-octets bounds-checks each
-   read; a truncated / over-declared embedded length signals buffer-overflow (caught -> NIL by the
-   decode handler), never an OOB read or an unbounded allocation (NFR-SEC-POSTURE), even at (safety 0)."
-  (let ((hdr (make-array +sec-submessage-header-len+ :element-type '(unsigned-byte 8))))
-    (dds.core.buffer:get-octets cursor hdr 0 +sec-submessage-header-len+)
-    (let ((octn (if (logbitp 0 (aref hdr 1))
-                    (logior (aref hdr 2) (ash (aref hdr 3) 8))      ; E=1 little-endian
-                    (logior (ash (aref hdr 2) 8) (aref hdr 3)))))   ; E=0 big-endian
-      (dds.core.buffer:check-room cursor octn)
-      (let ((out (make-array (+ +sec-submessage-header-len+ octn) :element-type '(unsigned-byte 8))))
-        (replace out hdr)
-        (dds.core.buffer:get-octets cursor out +sec-submessage-header-len+ octn)
-        out))))
+(defun* %embedded-submessage-len (secured off end)
+    (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum) (or fixnum null))
+  "Length (4 + octetsToNextHeader) of ONE embedded RTPS submessage at SECURED[OFF] — the AES256-GMAC (SIGN)
+   submessage-tier verbatim region (§9.5.3.3.4.3) — or NIL if the 4-octet header or its payload would exceed
+   END. Zero-alloc, length-only analogue of the recovery step (no make-array): the embedded E flag (bit 0 of
+   the flags octet, DDSI-RTPS 2.5 §9.4.5.1.2) selects octetsToNextHeader endianness. Every offset is validated
+   against END BEFORE any read; a truncated / over-declared length -> NIL (fail-closed; NFR-SEC-POSTURE), never
+   an OOB read, even at (safety 0)."
+  (when (<= (+ off +sec-submessage-header-len+) end)
+    (let* ((flags (aref secured (+ off 1)))
+           (o0    (aref secured (+ off 2)))
+           (o1    (aref secured (+ off 3)))
+           (octn  (if (logbitp 0 flags) (logior o0 (ash o1 8)) (logior (ash o0 8) o1)))
+           (total (+ +sec-submessage-header-len+ octn)))
+      (when (<= (+ off total) end) total))))
 
-(defun* %walk-verbatim-body (cursor postfix-kind secured-octets)
-    (function (dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (*)))
-              (simple-array (unsigned-byte 8) (*)))
-  "Recover the SIGN/GMAC body of a WHOLE-RTPS-message bracket (T4, §8.5.1.10-.12 / §9.5.3.3.4.3): the
-   protected unit is the ENTIRE submessage STREAM, which sits VERBATIM (no SEC_BODY) between SRTPS_PREFIX
-   and the trailing SRTPS_POSTFIX. Starting at CURSOR (just after the CryptoHeader), WALK the stream
-   submessage-by-submessage — reading each 4-octet RTPS SubmessageHeader (id ‖ flags ‖ octetsToNextHeader,
-   DDSI-RTPS 2.5 §9.4.5.1, the embedded E flag = bit 0 of flags selecting octetsToNextHeader endianness)
-   and advancing octetsToNextHeader payload octets — until the next submessageId equals POSTFIX-KIND
-   (0x34); return the verbatim body = SECURED-OCTETS[body-start, postfix-start) and REWIND CURSOR to the
-   postfix start so the shared %parse-sec-postfix-mac re-reads the postfix header + CryptoFooter (DRY).
-   This is the §8.5.1.12 decode-locate, corroborated CLEAN-ROOM against Fast DDS decode_rtps_message (the
-   `while (!is_encrypted && id != SRTPS_POSTFIX)` submessage-skip loop; see docs/provenance.md, M7/P6 T4).
-   Self-consistent with %encode-secured-region's verbatim write: NO inter-submessage 4-byte re-alignment
-   (the encode pads none); live cross-vendor alignment reconciliation is deferred to T12.
-   check-room guards EVERY 4-octet header read AND each octetsToNextHeader advance BEFORE it happens, so a
-   truncated / over-declared / postfix-less stream signals buffer-overflow (caught -> NIL by the decode
-   handler), never an OOB read, an unbounded scan, or a non-terminating loop (each iteration advances >=4
-   octets, bounded by the buffer extent), even at (safety 0) (NFR-SEC-POSTURE)."
-  (let ((body-start (dds.core.buffer:cursor-position cursor)))
+(defun* %walk-verbatim-len (secured off end postfix-kind)
+    (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum (unsigned-byte 8)) (or fixnum null))
+  "Length of the WHOLE-RTPS-message verbatim body (T4, §8.5.1.12): (postfix-start - OFF), where postfix-start
+   is the first submessage in SECURED[OFF..END) whose submessageId = POSTFIX-KIND — the zero-alloc, length-only
+   analogue of the SIGN stream-walk recovery (no subseq). WALK submessage-by-submessage (4-octet header, the
+   embedded E flag = bit 0 of the flags octet selecting octetsToNextHeader endianness, DDSI-RTPS 2.5
+   §9.4.5.1.2), each iteration advancing >= 4 octets; every read is validated against END BEFORE it happens, so
+   a truncated / postfix-less / over-declared stream -> NIL (fail-closed; NFR-SEC-POSTURE), never an OOB read,
+   an unbounded scan, or a non-terminating loop, even at (safety 0). Corroborated CLEAN-ROOM against Fast DDS
+   decode_rtps_message (the submessage-skip loop; see docs/provenance.md, M7/P6 T4). Self-consistent with the
+   encode verbatim write: NO inter-submessage re-alignment (live cross-vendor reconciliation is the T12 carry)."
+  (let ((pos off))
+    (declare (type fixnum pos))
     (loop
-      (let ((mark (dds.core.buffer:cursor-position cursor)))
-        (dds.core.buffer:check-room cursor +sec-submessage-header-len+)
-        (let ((id (dds.core.buffer:get-u8 cursor)))
-          (when (eql id postfix-kind)
-            ;; rewind to the postfix submessage start; the shared postfix parser re-reads it (DRY).
-            (dds.core.buffer:cursor-set-position cursor mark)
-            (return (subseq secured-octets body-start mark)))
-          (let* ((flags (dds.core.buffer:get-u8 cursor))
-                 (o0    (dds.core.buffer:get-u8 cursor))
-                 (o1    (dds.core.buffer:get-u8 cursor))
-                 (octn  (if (logbitp 0 flags)
-                            (logior o0 (ash o1 8))          ; E=1 little-endian
-                            (logior (ash o0 8) o1))))       ; E=0 big-endian
-            (dds.core.buffer:check-room cursor octn)
-            (dds.core.buffer:cursor-set-position cursor
-                                                 (+ (dds.core.buffer:cursor-position cursor) octn))))))))
+      (when (> (+ pos +sec-submessage-header-len+) end) (return nil))
+      (let ((id (aref secured pos)))
+        (when (= id postfix-kind) (return (- pos off)))
+        (let* ((flags (aref secured (+ pos 1)))
+               (o0    (aref secured (+ pos 2)))
+               (o1    (aref secured (+ pos 3)))
+               (octn  (if (logbitp 0 flags) (logior o0 (ash o1 8)) (logior (ash o0 8) o1)))
+               (next  (+ pos +sec-submessage-header-len+ octn)))
+          (when (> next end) (return nil))
+          (setf pos next))))))
+
+(defun* %footer-bounds-ok-p (secured base mac-loc end)
+    (function ((simple-array (unsigned-byte 8) (*)) fixnum fixnum fixnum) t)
+  "T iff the §9.5.3.3.3 CryptoFooter at MAC-LOC — common_mac(16) ‖ 4-align pad (vs the bracket start BASE) ‖
+   receiver_specific_macs_count(u32 BE) ‖ {key_id(4),mac(16)}*count — fits within END and count <=
+   +max-receiver-specific-macs+; NIL otherwise. The zero-alloc, VERIFY-FREE fail-closed bounds parity with
+   parse-crypto-footer (the receiver_specific_macs themselves are verified by the wrapper's origin-auth gate,
+   not here). Every offset is validated BEFORE any read (NFR-SEC-POSTURE), even at (safety 0)."
+  (let* ((mac-end (- (+ mac-loc +common-mac-len+) base))          ; bracket-relative end of common_mac
+         (rsm-loc (+ mac-loc +common-mac-len+ (mod (- mac-end) 4))))
+    (and (<= (+ rsm-loc +receiver-specific-macs-count-len+) end)
+         (let ((count (%get-u32-be-at secured rsm-loc)))
+           (and (<= count +max-receiver-specific-macs+)
+                (<= (+ rsm-loc +receiver-specific-macs-count-len+
+                       (* count (+ +transformation-key-id-len+ +common-mac-len+)))
+                    end))))))
+
+(defun* %decode-secured-region-into (pt-out pt-off km secured secured-off secured-len sign-walk-p)
+    (function (dds.core.buffer:octet-buffer fixnum key-material
+               (simple-array (unsigned-byte 8) (*)) fixnum fixnum t)
+              (values (or fixnum null) (or (member :sign :encrypt) null) (or fixnum null) (or fixnum null)))
+  "Recover the protected region from a PREFIX ... POSTFIX bracket in SECURED[SECURED-OFF..+SECURED-LEN] by
+   RAW OFFSET (no make-array on the parse path); return (values DATA-LEN MODE DATA-OFF POSTFIX-OFF), or a
+   single NIL on ANY failure (fail-closed; NFR-SEC-POSTURE). The zero-alloc core behind %decode-secured-region
+   (the thin allocating wrapper + the origin-auth gate). The tier is selected by SIGN-WALK-P: NIL = the
+   §8.5.1.7-.9 submessage tier (SEC_PREFIX 0x31 / SEC_POSTFIX 0x32, SIGN reads ONE embedded submessage); T =
+   the §8.5.1.10-.12 whole-RTPS tier (SRTPS_PREFIX 0x33 / SRTPS_POSTFIX 0x34, SIGN WALKS the stream to the
+   trailing postfix) — the expected prefix/postfix ids derive from SIGN-WALK-P (the two callers pass them 1:1).
+   The wire CryptoHeader.transformation_kind selects the mode + framing:
+     ENCRYPT ({0,0,0,4}) — SEC_BODY(0x30) length-prefixed ciphertext; aes-256-gcm-open-into writes the
+       plaintext into PT-OUT[PT-OFF..+DATA-LEN] under EMPTY AAD (§9.5.3.3.4.4); DATA-LEN = plaintext length,
+       DATA-OFF = the ciphertext offset in SECURED. ZERO GC-heap allocation (empty AAD, nonce = SECURED
+       session_id‖iv_suffix in place, session key cached, ct/tag read in place).
+     SIGN ({0,0,0,3}) — the region VERBATIM (no SEC_BODY, §9.5.3.3.4.3); verify the GMAC over it (AAD = the
+       region) and return its bounds — DATA-OFF = the verbatim-region offset in SECURED, DATA-LEN = its length
+       (NO copy into PT-OUT; the wrapper materializes the bounds). The verbatim region is materialized ONCE as
+       the GMAC AAD (the only residual alloc — aes-256-gcm-open-into needs a full-length AAD vector).
+   POSTFIX-OFF (the 4th value) is the POSTFIX submessage-header offset, so the wrapper can parse the
+   CryptoFooter for the origin-auth gate without recomputation. The bracket (submessageId + order + every
+   length within extent, incl. the CryptoFooter via %footer-bounds-ok-p) is validated BEFORE the AEAD open;
+   any malformed / truncated / re-ordered / unknown-kind / GCM-or-GMAC-auth-fail input -> NIL, never an OOB
+   read, never a signal to the caller, never plaintext on a failure, even at (safety 0). Origin-auth
+   (receiver_specific_macs) is NOT verified here — the common_mac governs; the wrapper adds the receiver gate."
+  (handler-case
+      (block dec
+        (let* ((base    secured-off)
+               (end     (+ secured-off secured-len))
+               (prefix  (if sign-walk-p +submessage-srtps-prefix+ +submessage-sec-prefix+))
+               (postfix (if sign-walk-p +submessage-srtps-postfix+ +submessage-sec-postfix+))
+               ;; smallest possible bracket = PREFIX(4)+CryptoHeader(20)+POSTFIX(4)+SecureDataTag(20) = 48
+               (min-len (+ +sec-submessage-header-len+ +secure-data-header-len+
+                           +sec-submessage-header-len+ +secure-data-tag-len+)))
+          (unless (and (<= 0 base) (<= end (length secured)) (>= secured-len min-len)
+                       (= (aref secured base) prefix))
+            (return-from dec nil))
+          (let* ((hdr-loc (+ base +sec-submessage-header-len+))                              ; CryptoHeader
+                 (sid-off (+ hdr-loc +transformation-kind-len+ +transformation-key-id-len+)) ; session_id (nonce)
+                 (kind-u32 (%get-u32-be-at secured hdr-loc))
+                 (mode (cond ((= kind-u32 4) :encrypt) ((= kind-u32 3) :sign) (t nil))))
+            (unless mode (return-from dec nil))
+            (ecase mode
+              (:encrypt
+               (let ((body-loc (+ hdr-loc +secure-data-header-len+)))                        ; SEC_BODY header
+                 (unless (and (<= (+ body-loc +sec-submessage-header-len+ +crypto-content-length-len+) end)
+                              (= (aref secured body-loc) +submessage-sec-body+))
+                   (return-from dec nil))
+                 (let* ((ct-off  (+ body-loc +sec-submessage-header-len+ +crypto-content-length-len+))
+                        (ct-len  (%get-u32-be-at secured (+ body-loc +sec-submessage-header-len+)))
+                        (ct-pad  (mod (- ct-len) 4))
+                        (postfix-loc (+ ct-off ct-len ct-pad))
+                        (mac-loc (+ postfix-loc +sec-submessage-header-len+)))
+                   (unless (and (<= (+ ct-off ct-len) end) (<= (+ mac-loc +common-mac-len+) end)
+                                (%footer-bounds-ok-p secured base mac-loc end)
+                                (= (aref secured postfix-loc) postfix))
+                     (return-from dec nil))
+                   (if (dds.dare:aes-256-gcm-open-into (dds.core.buffer:octet-buffer-vec pt-out) pt-off
+                                                       (%km-session-key-at km secured sid-off)
+                                                       secured sid-off +empty-octets+
+                                                       secured ct-off ct-len secured mac-loc)
+                       (values ct-len :encrypt ct-off postfix-loc)
+                       nil))))
+              (:sign
+               (let* ((region-off (+ hdr-loc +secure-data-header-len+))
+                      (region-len (if sign-walk-p
+                                      (%walk-verbatim-len secured region-off end postfix)
+                                      (%embedded-submessage-len secured region-off end))))
+                 (unless region-len (return-from dec nil))
+                 (let* ((postfix-loc (+ region-off region-len))
+                        (mac-loc (+ postfix-loc +sec-submessage-header-len+)))
+                   (unless (and (<= (+ mac-loc +common-mac-len+) end)
+                                (%footer-bounds-ok-p secured base mac-loc end)
+                                (= (aref secured postfix-loc) postfix))
+                     (return-from dec nil))
+                   ;; GMAC verify: ct-len 0, AAD = the verbatim region (materialized once — open-into needs a
+                   ;; full-length AAD vector; this is the SIGN-only residual, ENCRYPT decode is zero-alloc).
+                   (if (dds.dare:aes-256-gcm-open-into (dds.core.buffer:octet-buffer-vec pt-out) pt-off
+                                                       (%km-session-key-at km secured sid-off)
+                                                       secured sid-off
+                                                       (subseq secured region-off (+ region-off region-len))
+                                                       secured region-off 0 secured mac-loc)
+                       (values region-len :sign region-off postfix-loc)
+                       nil))))))))
+    ;; Any condition (bounds, malformed, EVP, etc.) -> NIL (fail-closed).
+    (error () nil)))
+
+(defun* %decode-verify-origin-auth (km secured postfix-off postfix-kind my-receiver-key-id my-receiver-key)
+    (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum (unsigned-byte 8)
+               (or (simple-array (unsigned-byte 8) (*)) null)
+               (or (simple-array (unsigned-byte 8) (*)) null))
+              boolean)
+  "Origin-authentication gate (§9.5.3.3.4.3) for the decode wrapper — T when MY-RECEIVER-KEY-ID is NIL
+   (origin-auth not requested; the common_mac alone governs, already verified by the -into core) OR when THIS
+   receiver's entry verifies; NIL (fail-closed) if requested but absent/mismatched even though the common_mac
+   is valid. Parse the CryptoFooter at the POSTFIX submessage (POSTFIX-OFF, id POSTFIX-KIND) via the shared
+   %parse-sec-postfix-mac -> (common_mac, receiver_specific_macs), then %verify-receiver-mac (session_id /
+   iv_suffix read from the in-place CryptoHeader at SECURED[bracket offsets 12 / 16]; the constant-time compare
+   is in %verify-receiver-mac). Allocating — the origin-auth path is the deferred allocating fallback. Runs
+   inside %decode-secured-region's fail-closed handler, so any signal still resolves to NIL."
+  (if (null my-receiver-key-id)
+      t
+      (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over secured) :endianness :little)))
+        (dds.core.buffer:cursor-set-position cur postfix-off)
+        (multiple-value-bind (common-mac receiver-macs) (%parse-sec-postfix-mac cur postfix-kind)
+          (and common-mac
+               (%verify-receiver-mac
+                km
+                (subseq secured (+ +sec-submessage-header-len+ +secure-data-header-session-id-off+)
+                        (+ +sec-submessage-header-len+ +secure-data-header-iv-suffix-off+))
+                (subseq secured (+ +sec-submessage-header-len+ +secure-data-header-iv-suffix-off+)
+                        (+ +sec-submessage-header-len+ +secure-data-header-iv-suffix-off+ +init-vector-suffix-len+))
+                common-mac receiver-macs my-receiver-key-id my-receiver-key)
+               t)))))
 
 (defun* %decode-secured-region (km secured-octets my-receiver-key-id my-receiver-key
                                 prefix-kind postfix-kind sign-walk-p)
@@ -462,82 +638,38 @@
                (or (simple-array (unsigned-byte 8) (*)) null)
                (unsigned-byte 8) (unsigned-byte 8) t)
               (or (simple-array (unsigned-byte 8) (*)) null))
-  "Recover the protected region from a PREFIX-KIND ... POSTFIX-KIND bracket produced by
-   %encode-secured-region, or NIL on ANY failure (fail-closed; NFR-SEC-POSTURE) — the SHARED engine
-   behind BOTH the submessage tier (decode-datawriter-/datareader-submessage; PREFIX/POSTFIX-KIND =
-   SEC_PREFIX/SEC_POSTFIX, SIGN-WALK-P NIL) AND the whole-RTPS tier (decode-rtps-message, T4; SRTPS_PREFIX/
-   SRTPS_POSTFIX, SIGN-WALK-P T). The wire CryptoHeader.transformation_kind (parsed from the prefix)
-   selects the mode AND the framing:
-     ENCRYPT — PREFIX ‖ SEC_BODY(0x30, length-prefixed ciphertext) ‖ POSTFIX; open the ciphertext under
-       EMPTY AAD (§9.5.3.3.4.4). Identical for both tiers.
-     SIGN — PREFIX ‖ <region VERBATIM, no SEC_BODY> ‖ POSTFIX; recover the region, verify the GMAC over it
-       (AAD = the region), return it (§9.5.3.3.4.3). Locating the verbatim region is the ONLY tier
-       difference: SIGN-WALK-P NIL reads ONE embedded submessage (%read-embedded-submessage, submessage
-       tier); SIGN-WALK-P T WALKS the whole submessage stream to the trailing postfix
-       (%walk-verbatim-body, RTPS tier — corroborated against Fast DDS decode_rtps_message).
-   ORIGIN AUTH (§9.5.3.3.4.3): when MY-RECEIVER-KEY-ID is non-NIL, AFTER the common_mac verifies the
-   gate %verify-receiver-mac MUST also find + verify THIS receiver's entry in the CryptoFooter
-   receiver_specific_macs (recompute under MY-RECEIVER-KEY, constant-time compare); absent or mismatched
-   -> NIL even though the common_mac is valid. MY-RECEIVER-KEY-ID NIL = origin-auth not expected (the
-   common_mac alone governs; backward-compatible). The bracket (submessageId + order) is validated and
-   every field is bounds-checked against the buffer extent BEFORE use (the T1 parsers +
-   %parse-sec-submessage-header + %read-embedded-submessage + %walk-verbatim-body all check-room first).
-   Any malformed / truncated / re-ordered / unknown-kind / GMAC-or-GCM-auth-fail / receiver-MAC-fail input
-   -> NIL, never an OOB read, never a signal escaping to the caller, never a tampered region on a failure,
-   even at (safety 0)."
-  (handler-case
-      (block decode
-        (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over secured-octets)
-                                           :endianness :little)))
-          ;; PREFIX -> CryptoHeader -> mode (the wire transformation_kind selects the framing).
-          (unless (eql (%parse-sec-submessage-header cur) prefix-kind)
-            (return-from decode nil))
-          (multiple-value-bind (kind key-id session-id iv-suffix) (parse-crypto-header cur)
-            (declare (ignore key-id))
-            (unless kind (return-from decode nil))
-            (let ((mode (%kind->mode kind)))
-              (unless mode (return-from decode nil))
-              (ecase mode
-                ;; ENCRYPT: SEC_BODY(0x30) ciphertext -> POSTFIX -> open under EMPTY AAD.
-                (:encrypt
-                 (unless (eql (%parse-sec-submessage-header cur) +submessage-sec-body+)
-                   (return-from decode nil))
-                 (let ((body (parse-crypto-content cur)))
-                   (unless body (return-from decode nil))
-                   ;; Skip the SEC_BODY 4-align pad (zero octets after the ciphertext) so the SEC_POSTFIX is
-                   ;; read 4-aligned (Fast DDS deserialize_SecureDataBody L2052-2061 "Align submessage to 4").
-                   ;; The cursor position is bracket-relative (origin 0 at the bracket start), so the pad is
-                   ;; (-pos) mod 4 — fixed by the bracket-relative position alone, never the bracket's datagram
-                   ;; offset. check-room bounds it -> a pad overrunning the bracket fails closed (the outer
-                   ;; handler -> NIL), never an OOB read, even at (safety 0) (NFR-SEC-POSTURE).
-                   (let ((pad (mod (- (dds.core.buffer:cursor-position cur)) 4)))
-                     (when (plusp pad)
-                       (dds.core.buffer:check-room cur pad)
-                       (dds.core.buffer:cursor-set-position cur (+ (dds.core.buffer:cursor-position cur) pad))))
-                   (multiple-value-bind (common-mac receiver-macs)
-                       (%parse-sec-postfix-mac cur postfix-kind)
-                     (unless common-mac (return-from decode nil))
-                     (let ((pt (%open-with-km km session-id iv-suffix +empty-octets+ body common-mac)))
-                       (and pt
-                            (%verify-receiver-mac km session-id iv-suffix common-mac receiver-macs
-                                                  my-receiver-key-id my-receiver-key)
-                            pt)))))
-                ;; SIGN: NO SEC_BODY — the region is VERBATIM here (§9.5.3.3.4.3). Recover it (one
-                ;; submessage, or WALK the whole stream), verify the GMAC over it (AAD), return it; never
-                ;; the bytes if the GMAC fails.
-                (:sign
-                 (let ((original (if sign-walk-p
-                                     (%walk-verbatim-body cur postfix-kind secured-octets)
-                                     (%read-embedded-submessage cur))))
-                   (multiple-value-bind (common-mac receiver-macs)
-                       (%parse-sec-postfix-mac cur postfix-kind)
-                     (unless common-mac (return-from decode nil))
-                     (and (%open-with-km km session-id iv-suffix original +empty-octets+ common-mac)
-                          (%verify-receiver-mac km session-id iv-suffix common-mac receiver-macs
-                                                my-receiver-key-id my-receiver-key)
-                          original)))))))))
-    ;; Any condition (bounds, malformed, etc.) -> NIL (fail-closed).
-    (error () nil)))
+  "Recover the protected region from a PREFIX-KIND ... POSTFIX-KIND bracket produced by %encode-secured-region,
+   or NIL on ANY failure (fail-closed; NFR-SEC-POSTURE) — the SHARED engine behind BOTH the submessage tier
+   (decode-datawriter-/datareader-submessage; SEC_PREFIX/SEC_POSTFIX, SIGN-WALK-P NIL) AND the whole-RTPS tier
+   (decode-rtps-message, T4; SRTPS_PREFIX/SRTPS_POSTFIX, SIGN-WALK-P T). Thin ALLOCATING wrapper over the
+   zero-alloc core %decode-secured-region-into (+ the origin-auth gate %decode-verify-origin-auth): allocate a
+   static scratch PT-OUT, recover the region into it (the core validates the bracket + verifies the common_mac —
+   ENCRYPT opens the SEC_BODY ciphertext under EMPTY AAD into PT-OUT; SIGN verifies the GMAC over the verbatim
+   region and returns its bounds), materialize the result (ENCRYPT: copy PT-OUT; SIGN: copy the verbatim-region
+   bounds from SECURED-OCTETS, preserving the return type), free the scratch. PREFIX-KIND is derivable from
+   SIGN-WALK-P (the core validates the wire prefix), so it is unused here; POSTFIX-KIND drives the origin-auth
+   footer parse. ORIGIN AUTH (§9.5.3.3.4.3): when MY-RECEIVER-KEY-ID is non-NIL, AFTER the common_mac verifies
+   the gate ALSO finds + verifies THIS receiver's entry in the CryptoFooter receiver_specific_macs (recompute
+   under MY-RECEIVER-KEY, constant-time compare); absent or mismatched -> NIL even though the common_mac is
+   valid. MY-RECEIVER-KEY-ID NIL = origin-auth not expected (backward-compatible). Any malformed / truncated /
+   re-ordered / unknown-kind / auth-fail / receiver-MAC-fail input -> NIL, never a tampered region, even at
+   (safety 0)."
+  (declare (ignore prefix-kind))
+  (let ((pt-out (dds.core.buffer:make-octet-buffer (max 1 (length secured-octets)))))
+    (unwind-protect
+         (handler-case
+             (multiple-value-bind (len mode region-off postfix-off)
+                 (%decode-secured-region-into pt-out 0 km secured-octets 0 (length secured-octets) sign-walk-p)
+               (when (and len
+                          (or (null my-receiver-key-id)
+                              (%decode-verify-origin-auth km secured-octets postfix-off postfix-kind
+                                                          my-receiver-key-id my-receiver-key)))
+                 (ecase mode
+                   (:encrypt (subseq (dds.core.buffer:octet-buffer-vec pt-out) 0 len))
+                   (:sign    (subseq secured-octets region-off (+ region-off len))))))
+           ;; Any condition (bounds, malformed, etc.) -> NIL (fail-closed).
+           (error () nil))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt-out)))))
 
 (defun* %decode-secured-submessage (km secured-octets my-receiver-key-id my-receiver-key)
     (function (key-material (simple-array (unsigned-byte 8) (*))

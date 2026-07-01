@@ -1807,6 +1807,137 @@
     (%t4-corpus-origin-auth stream))
   t)
 
+;;; --- Slice 2 (ZA-2) T2: the zero-alloc into-buffer bracket core %encode/%decode-secured-region-into ---
+;;; The -into core writes the §8.5.1.7-.12 SEC_PREFIX/SRTPS_PREFIX bracket directly through a STATIC
+;;; octet-buffer with no per-sample GC-heap allocation; the allocating %encode/%decode-secured-region are
+;;; thin wrappers over it (so the T2/T4 byte-exact corpora already exercise the core). These oracle-pin
+;;; the core against the INDEPENDENT frozen corpus goldens (%t2/%t4-*-vector), verified vs Fast DDS +
+;;; tshark, so the pin is not a wrapper-vs-core tautology; the round-trip proves decode-into recovers the
+;;; plaintext (ENCRYPT into PT-OUT) / the verbatim-region bounds (SIGN, no copy); the alloc arm proves 0.
+
+(defun* %za2-region-into-combo (mode plain prefix postfix golden sign-walk-p tier)
+    (function ((member :sign :encrypt) (simple-array (unsigned-byte 8) (*))
+               (unsigned-byte 8) (unsigned-byte 8)
+               (or (simple-array (unsigned-byte 8) (*)) null) t string) t)
+  "ZA-2 oracle-pin + round-trip for one (MODE, TIER) combo: %encode-secured-region-into (fresh km, iv
+   counter 0 -> deterministic iv_suffix/session_id 0) is byte-identical to the INDEPENDENT frozen corpus
+   GOLDEN and to the allocating %encode-secured-region wrapper; %decode-secured-region-into round-trips
+   (ENCRYPT plaintext into PT-OUT; SIGN returns the verbatim-region bounds in SECURED, no copy).
+   PREFIX/POSTFIX select the tier bracket kinds; SIGN-WALK-P selects one-embedded-submessage (submessage
+   tier) vs stream-walk (whole-RTPS tier) SIGN decode; TIER is a label for the failure detail."
+  (let ((km     (dds.security:make-test-key-material))
+        (out    (dds.core.buffer:make-octet-buffer (+ 128 (length plain))))
+        (pt-out (dds.core.buffer:make-octet-buffer (+ 16 (length plain)))))
+    (unwind-protect
+         (let* ((len  (dds.security::%encode-secured-region-into out 0 km mode plain 0 (length plain)
+                                                                 '() prefix postfix))
+                (core (subseq (dds.core.buffer:octet-buffer-vec out) 0 len)))
+           ;; (a) INDEPENDENT golden pin — the core reproduces the frozen Fast-DDS/tshark-verified corpus byte
+           (%check :za2-region-into-golden (equalp core golden)
+                   (format nil "~a ~a encode-into must equal the frozen corpus golden byte-for-byte; got ~(~{~2,'0x~}~)"
+                           tier mode (coerce core 'list)))
+           ;; (b) consistency with the allocating %encode-secured-region wrapper (which now routes the core)
+           (%check :za2-region-into-wrapper
+                   (equalp core (dds.security::%encode-secured-region
+                                 (dds.security:make-test-key-material) mode plain '() prefix postfix))
+                   (format nil "~a ~a encode-into must equal the allocating %encode-secured-region wrapper" tier mode))
+           ;; (c) decode-into round-trip
+           (multiple-value-bind (dlen dmode roff)
+               (dds.security::%decode-secured-region-into pt-out 0 (dds.security:make-test-key-material)
+                                                          core 0 (length core) sign-walk-p)
+             (ecase mode
+               (:encrypt
+                (%check :za2-region-into-decode
+                        (and dlen (eq dmode :encrypt) (= dlen (length plain))
+                             (equalp (subseq (dds.core.buffer:octet-buffer-vec pt-out) 0 dlen) plain))
+                        (format nil "~a ENCRYPT decode-into must recover the plaintext byte-exact into PT-OUT" tier)))
+               (:sign
+                (%check :za2-region-into-decode
+                        (and dlen (eq dmode :sign) (= dlen (length plain)) roff
+                             (equalp (subseq core roff (+ roff dlen)) plain))
+                        (format nil "~a SIGN decode-into must return bounds pointing at the verbatim region byte-exact" tier))))))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt-out))))
+  t)
+
+(defun* %za2-region-into-zeroalloc (sub)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "ZA-2 zero-alloc proof: the %encode-secured-region-into ENCRYPT core, over a REUSED static out-buffer +
+   REUSED key-material, conses ~0 GC-heap B/call (SBCL-exact via dds.pal:bytes-consed; Clasp reports 0 by
+   the NFR-PORT gap -> the delta is 0 and the assertion passes vacuously). Proves the core adds no
+   per-sample GC-heap allocation (the only residual is the EVP-FFI boxing shared with the T1 KAT)."
+  (let ((km    (dds.security:make-test-key-material))
+        (out   (dds.core.buffer:make-octet-buffer 256))
+        (iters 4000))
+    (unwind-protect
+         (progn
+           (dds.security::%encode-secured-region-into out 0 km :encrypt sub 0 (length sub) '()
+                                                      dds.security:+submessage-sec-prefix+
+                                                      dds.security:+submessage-sec-postfix+)  ; warm
+           (let ((before (dds.pal:bytes-consed)))
+             (dotimes (i iters)
+               (dds.security::%encode-secured-region-into out 0 km :encrypt sub 0 (length sub) '()
+                                                          dds.security:+submessage-sec-prefix+
+                                                          dds.security:+submessage-sec-postfix+))
+             (let* ((delta (- (dds.pal:bytes-consed) before))
+                    (per   (/ (float delta) iters)))
+               (format t "~&  [secured-region-into] ENCODE core (ENCRYPT, reused out-buffer) = ~,4f B/call (~d iters, ~d B total)~%"
+                       per iters delta)
+               (%check :za2-region-into-zeroalloc (< per 1.0)
+                       (format nil "encode-into core must cons ~~0 GC-heap B/call; got ~,4f" per)))))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))))
+  t)
+
+(defun* run-security-secured-region-into-test ()
+    (function () t)
+  "DDS-Security 1.1 §8.5.1.7-.12 zero-alloc into-buffer bracket codec (%encode/%decode-secured-region-into,
+   Slice 2 / ZA-2 T2):
+   (a) ENCODE oracle-pin — %encode-secured-region-into (fresh km, iv counter 0) is byte-identical to the
+       INDEPENDENT frozen T2/T4 corpus goldens (%t2-encrypt/sign-vector 88/80, %t4-encrypt/sign-vector
+       100/92), ENCRYPT + SIGN, in BOTH the SEC_PREFIX/SEC_POSTFIX submessage tier AND the SRTPS_PREFIX/
+       SRTPS_POSTFIX whole-RTPS tier; it also equals the allocating %encode-secured-region wrapper.
+   (b) DECODE round-trip — %decode-secured-region-into recovers ENCRYPT plaintext byte-exact into a static
+       PT-OUT; for SIGN it returns the (offset,len) bounds pointing at the verbatim region in SECURED
+       byte-exact (no copy), both tiers (SIGN-WALK-P NIL reads one embedded submessage; T walks the stream).
+   (c) fail-closed — a too-short input -> NIL, both tiers.
+   (d) zero-alloc — the ENCODE core (ENCRYPT, reused out-buffer) conses ~0 B/call on a measuring impl (SBCL).
+   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically (Clasp FIRST)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [security-secured-region-into] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-security-secured-region-into-test t)))
+  (let ((sub    (%t2-fixed-plain-submessage))
+        (stream (%t4-fixed-stream)))
+    ;; submessage tier (SEC_PREFIX/SEC_POSTFIX, sign-walk-p NIL)
+    (%za2-region-into-combo :encrypt sub dds.security:+submessage-sec-prefix+
+                            dds.security:+submessage-sec-postfix+ (%t2-encrypt-vector) nil "submsg")
+    (%za2-region-into-combo :sign sub dds.security:+submessage-sec-prefix+
+                            dds.security:+submessage-sec-postfix+ (%t2-sign-vector) nil "submsg")
+    ;; whole-RTPS tier (SRTPS_PREFIX/SRTPS_POSTFIX, sign-walk-p T)
+    (%za2-region-into-combo :encrypt stream dds.security:+submessage-srtps-prefix+
+                            dds.security:+submessage-srtps-postfix+ (%t4-encrypt-vector) t "srtps")
+    (%za2-region-into-combo :sign stream dds.security:+submessage-srtps-prefix+
+                            dds.security:+submessage-srtps-postfix+ (%t4-sign-vector) t "srtps")
+    ;; fail-closed: a too-short input -> NIL (both tiers)
+    (let ((pt (dds.core.buffer:make-octet-buffer 8)))
+      (unwind-protect
+           (progn
+             (%check :za2-failclosed-submsg
+                     (null (dds.security::%decode-secured-region-into
+                            pt 0 (dds.security:make-test-key-material)
+                            (make-array 8 :element-type '(unsigned-byte 8)) 0 8 nil))
+                     "decode-into on a too-short submessage input must return NIL (fail-closed)")
+             (%check :za2-failclosed-srtps
+                     (null (dds.security::%decode-secured-region-into
+                            pt 0 (dds.security:make-test-key-material)
+                            (make-array 8 :element-type '(unsigned-byte 8)) 0 8 t))
+                     "decode-into on a too-short whole-RTPS input must return NIL (fail-closed)"))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt))))
+    ;; zero-alloc proof for the ENCODE core over a reused out-buffer
+    (%za2-region-into-zeroalloc sub))
+  t)
+
 (defun* %t4-bench-stream (size)
     (function (fixnum) (simple-array (unsigned-byte 8) (*)))
   "A representative SIZE-octet submessage STREAM for the T4 micro-bench: a 4-octet RTPS DATA-shaped
