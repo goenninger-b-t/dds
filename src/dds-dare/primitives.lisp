@@ -513,7 +513,8 @@
                  (%ossl-sym "EVP_CIPHER_CTX_free") nil :pointer ctx :void)))))))
     t))
 
-(defun* aes-256-gcm-open-into (pt-out pt-off key nonce-vec nonce-off aad ct-vec ct-off ct-len tag-vec tag-off)
+(defun* aes-256-gcm-open-into (pt-out pt-off key nonce-vec nonce-off aad ct-vec ct-off ct-len tag-vec tag-off
+                               &optional (aad-off 0) (aad-len (length aad)))
     (function ((simple-array (unsigned-byte 8) (*))
                fixnum
                (simple-array (unsigned-byte 8) (*))
@@ -524,13 +525,15 @@
                fixnum
                fixnum
                (simple-array (unsigned-byte 8) (*))
-               fixnum)
+               fixnum
+               &optional fixnum fixnum)
               (or (eql t) null))
   "AES-256-GCM authenticated decryption into a caller's static buffer (FIPS 197 + NIST SP 800-38D).
    On auth success writes CT-LEN plaintext octets into PT-OUT[PT-OFF..] directly through PT-OUT's
    GC-stable static SAP and returns T; on authentication failure returns NIL and zeroizes the
    CT-LEN-octet output region so NO readable plaintext remains (fail-closed, SP 800-38D §7.2).
    NONCE = NONCE-VEC[NONCE-OFF..+12]; CIPHERTEXT = CT-VEC[CT-OFF..+CT-LEN]; TAG = TAG-VEC[TAG-OFF..+16].
+   AAD = AAD[AAD-OFF..+AAD-LEN] (optional; default aad-off=0, aad-len=(length aad), backward-compatible).
    CT-LEN=0 (SIGN/GMAC verify, DDS-Security §9.5.3.3.4.3): no plaintext bytes are written;
    EVP_DecryptFinal_ex authenticates the AAD-only GHASH against TAG-VEC[TAG-OFF..+16], returning T
    on match and NIL on mismatch (fail-closed; no-op output wipe since CT-LEN=0).
@@ -541,12 +544,16 @@
    IN PLACE (EVP in==out via dds.pal:static-sap+, an inline non-boxing SAP into PT-OUT), so no per-call
    ciphertext/plaintext SAP is boxed; NULL args use the cached *%NULL-PTR*; the fail-closed wipe zeroes
    the PT-OUT region through its static-vector aref (0 cons); scratch is the constant-size
-   key/nonce/tag/outl buffers plus one variable-size AAD buffer."
-  (let ((aad-len (length aad)))
+   key/nonce/tag/outl buffers; AAD is pinned and offset via cffi:inc-pointer (no copy, 0 cons)."
+  (declare (type fixnum aad-off aad-len))
+  (let ()
     ;; O(1) output-extent bounds: unconditional, safety-0-safe (the operating contract §4)
     (unless (<= (+ pt-off ct-len) (dds.pal:static-length pt-out))
       (error "aes-256-gcm-open-into: PT-OUT too small for plaintext region (need ~d, have ~d)"
              (+ pt-off ct-len) (dds.pal:static-length pt-out)))
+    (unless (<= (+ aad-off aad-len) (length aad))
+      (error "aes-256-gcm-open-into: AAD region [~d,+~d) out of bounds (vector length ~d)"
+             aad-off aad-len (length aad)))
     ;; stage ciphertext into PT-OUT's plaintext region for in-place GCM (EVP in==out; aref, 0 cons)
     (dotimes (i ct-len)
       (setf (aref pt-out (+ pt-off i)) (aref ct-vec (+ ct-off i))))
@@ -554,7 +561,7 @@
       (cffi:with-foreign-pointer (nonce-ptr +aes-gcm-nonce-len+)
         (cffi:with-foreign-pointer (tag-ptr +aes-gcm-tag-len+)
           (cffi:with-foreign-object (outl-ptr :int)
-            ;; AAD is read-only: pin the caller's vector and pass its SAP in place (no copy, no variable-size scratch, 0 cons)
+            ;; AAD is read-only: pin caller's vector, advance SAP to aad-off via cffi:inc-pointer (0 cons)
             (cffi:with-pointer-to-vector-data (aad-ptr aad)
               (dotimes (i +aes-256-gcm-key-len+)
                 (setf (cffi:mem-aref key-ptr :uint8 i) (aref key i)))
@@ -606,13 +613,13 @@
                                   :pointer tag-ptr :int)))
                          (unless (= rc 1)
                            (error "EVP_CIPHER_CTX_ctrl(SET_TAG) failed (rc=~a)" rc)))
-                       ;; feed AAD
+                       ;; feed AAD sub-range [aad-off, aad-off+aad-len) via cffi:inc-pointer offset
                        (when (> aad-len 0)
                          (let ((rc (cffi:foreign-funcall-pointer
                                     (%ossl-sym "EVP_DecryptUpdate") nil
                                     :pointer ctx
                                     :pointer *%null-ptr* :pointer outl-ptr
-                                    :pointer aad-ptr :int aad-len
+                                    :pointer (cffi:inc-pointer aad-ptr aad-off) :int aad-len
                                     :int)))
                            (unless (= rc 1)
                              (error "EVP_DecryptUpdate(AAD) failed (rc=~a)" rc))))

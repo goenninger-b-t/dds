@@ -231,6 +231,37 @@
       (dds.pal:free-static gout)
       (dds.pal:free-static gns))
 
+    ;; AAD-region (ZA-2 review fix): open-into with aad-off+aad-len selecting a sub-slice of a larger
+    ;; buffer must be byte-identical to the full-vector call; proves the region path is correct and
+    ;; backward-compatible (NIST SP 800-38D Appendix B TC16 key/nonce/pt/aad/ct/tag reused).
+    (let* ((padded (let ((v (make-array (+ 5 20 3) :element-type '(unsigned-byte 8))))
+                     (replace v aad :start1 5)  ; embed the 20-octet NIST AAD at offset 5 in a 28-byte envelope
+                     v))
+           (ns2    (dds.pal:alloc-static 12))
+           (pt2    (dds.pal:alloc-static 60))
+           (enc    (dds.pal:alloc-static 76)))  ; ct(60) || tag(16)
+      (replace ns2 nonce)
+      (replace pt2 pt)
+      (dds.dare:aes-256-gcm-seal-into enc 0 60 key ns2 0 aad pt2 0 60)  ; seal under the full AAD
+      (let ((pt-r (dds.pal:alloc-static 60)))
+        ;; aad-off=5 aad-len=20 -> padded[5..25] = the real AAD -> must succeed + plaintext byte-exact
+        (%check :aes-gcm-open-into-aad-region-ok
+                (eq t (dds.dare:aes-256-gcm-open-into pt-r 0 key ns2 0 padded enc 0 60 enc 60 5 20))
+                "open-into AAD-region [5,+20): must return T for correct aad sub-slice (NIST TC16)")
+        (%check :aes-gcm-open-into-aad-region-rt
+                (equalp pt-r pt)
+                (format nil "open-into AAD-region: plaintext must match NIST TC16; first 8 B: ~{~2,'0x~^ ~}"
+                        (coerce (subseq pt-r 0 8) 'list)))
+        ;; aad-off=0 -> padded[0..20] are zero-padding, NOT the real AAD -> auth failure (fail-closed)
+        (%check :aes-gcm-open-into-aad-region-mismatch
+                (null (dds.dare:aes-256-gcm-open-into pt-r 0 key ns2 0 padded enc 0 60 enc 60 0 20))
+                "open-into AAD-region: wrong aad-off (zero-padded prefix) must return NIL (fail-closed)")
+        (%check :aes-gcm-open-into-aad-region-mismatch-wiped
+                (every #'zerop pt-r)
+                "open-into AAD-region: auth failure must leave pt-r region zeroed (no leak)")
+        (dds.pal:free-static pt-r))
+      (dds.pal:free-static enc) (dds.pal:free-static pt2) (dds.pal:free-static ns2))
+
     t))
 
 (defun* run-dare-ml-kem-kat-test ()

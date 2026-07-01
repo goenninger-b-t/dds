@@ -591,13 +591,13 @@
                                 (%footer-bounds-ok-p secured base mac-loc end)
                                 (= (aref secured postfix-loc) postfix))
                      (return-from dec nil))
-                   ;; GMAC verify: ct-len 0, AAD = the verbatim region (materialized once — open-into needs a
-                   ;; full-length AAD vector; this is the SIGN-only residual, ENCRYPT decode is zero-alloc).
+                   ;; GMAC verify: ct-len=0, AAD = secured[region-off..+region-len] via aad-off/aad-len (no subseq, zero-alloc).
                    (if (dds.dare:aes-256-gcm-open-into (dds.core.buffer:octet-buffer-vec pt-out) pt-off
                                                        (%km-session-key-at km secured sid-off)
                                                        secured sid-off
-                                                       (subseq secured region-off (+ region-off region-len))
-                                                       secured region-off 0 secured mac-loc)
+                                                       secured
+                                                       secured region-off 0 secured mac-loc
+                                                       region-off region-len)
                        (values region-len :sign region-off postfix-loc)
                        nil))))))))
     ;; Any condition (bounds, malformed, EVP, etc.) -> NIL (fail-closed).

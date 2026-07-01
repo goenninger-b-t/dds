@@ -1888,6 +1888,31 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))))
   t)
 
+(defun* %za2-sign-decode-zeroalloc (blob)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "ZA-2 zero-alloc proof for the SIGN decode path: %decode-secured-region-into with a REUSED pre-encoded
+   SIGN blob + REUSED km + REUSED pt-out must cons ~0 GC-heap B/call after the aad-region fix
+   (was (length plain) B/call from the verbatim-region subseq; Clasp bytes-consed=0 -> skip NFR-PORT)."
+  (let ((km    (dds.security:make-test-key-material))
+        (pt    (dds.core.buffer:make-octet-buffer 128))
+        (iters 4000))
+    (unwind-protect
+         (progn
+           (dds.security::%decode-secured-region-into pt 0 km blob 0 (length blob) nil) ; warm
+           (let ((before (dds.pal:bytes-consed)))
+             (dotimes (i iters)
+               (dds.security::%decode-secured-region-into pt 0 km blob 0 (length blob) nil))
+             (let* ((delta (- (dds.pal:bytes-consed) before))
+                    (per   (/ (float delta) iters)))
+               (format t "~&  [secured-region-into] SIGN decode-into (reused blob+pt) = ~,4f B/call (~d iters, ~d B total)~%"
+                       per iters delta)
+               (if (zerop (dds.pal:bytes-consed))
+                   (format t "  [skip] dds.pal:bytes-consed is 0 on this impl — SIGN decode alloc not measurable~%")
+                   (%check :za2-sign-decode-zeroalloc (< per 1.0)
+                           (format nil "SIGN decode-into must cons ~~0 GC-heap B/call after the region fix; got ~,4f" per))))))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt))))
+  t)
+
 (defun* run-security-secured-region-into-test ()
     (function () t)
   "DDS-Security 1.1 §8.5.1.7-.12 zero-alloc into-buffer bracket codec (%encode/%decode-secured-region-into,
@@ -1935,7 +1960,9 @@
                      "decode-into on a too-short whole-RTPS input must return NIL (fail-closed)"))
         (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt))))
     ;; zero-alloc proof for the ENCODE core over a reused out-buffer
-    (%za2-region-into-zeroalloc sub))
+    (%za2-region-into-zeroalloc sub)
+    ;; SIGN decode bytes-consed: reused pre-encoded blob + km + pt -> ~0 B/call (subseq gone after fix)
+    (%za2-sign-decode-zeroalloc (%t2-sign-vector)))
   t)
 
 (defun* %t4-bench-stream (size)
