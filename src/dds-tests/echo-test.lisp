@@ -2943,6 +2943,7 @@
                  ("security-encode-pool-alloc"   . run-security-encode-pool-alloc-test)
                  ("secured-decode-loan-alloc"    . run-secured-decode-loan-alloc-test)
                  ("secured-decode-loan-dup"      . run-secured-decode-loan-dup-test)
+                 ("secured-store-growth"         . run-secured-store-growth-test)
                  ("secured-live-zeroalloc"       . run-secured-live-zeroalloc-test)
                  ("secured-submsg-exhaust-passthrough" . run-secured-submsg-exhaust-passthrough-test)
                  ("security-crypto-header"       . run-security-crypto-header-corpus-test)

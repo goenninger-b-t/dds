@@ -1977,11 +1977,32 @@
               (secured-loan-handle-reg-index handle) -1))))
   (values))
 
+(defun* %purge-secured-sample (node guid sn)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer) t)
+  "WP-SECURED-STORE-GROWTH: the SINGLE purge choke for a released / evicted / drained secured sample — remove
+   (GUID,SN) from EVERY parallel per-(guid,sn) store table at one place so no table retains a released sample's
+   metadata. Closes a pre-existing unbounded-heap-growth path: %secured-loan-release cleaned only
+   disc-node-samples, leaking the parallel tables (sample-writers / -writer-guids / -origins / -key-hashes) on a
+   never-drained secured stream (memory-exhaustion, attacker-drivable by a keyed peer streaming samples never
+   loaned back). Zero-alloc — 5 gethash + up to 5 remhash, no cons (the macrolet expands inline) — so it stays on
+   the drain/release path without perturbing the secured zero-alloc receive arms (operating contract §4 NFR-MEM).
+   Caller holds the node lock. The inner per-GUID SN maps are left in place (bounded by the matched-writer count,
+   not by sample count — §8.3.5.4), only their (GUID,SN) entry is dropped."
+  (macrolet ((drop (accessor)
+               `(let ((inner (gethash guid (,accessor node)))) (when inner (remhash sn inner)))))   ; no auto-create; zero-cons
+    (drop disc-node-samples)
+    (drop disc-node-sample-writers)
+    (drop disc-node-sample-writer-guids)
+    (drop disc-node-sample-origins)
+    (drop disc-node-sample-key-hashes))
+  t)
+
 (defun* %secured-loan-release (node handle)
     (function (disc-node secured-loan-handle) t)
-  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5b/T5d: release HANDLE — invalidate its dangling samples-store entry (remhash
-   by GUID/SN — disc-node-samples is never purged, so a surviving handle would point at a recycled buffer = a
-   wrong-bytes read), deregister it from the loan registry, return its pooled plaintext buffer to the decode pool,
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5b/T5d: release HANDLE — invalidate its dangling store entry (WP-SECURED-STORE-GROWTH:
+   %purge-secured-sample drops (GUID,SN) from ALL parallel per-(guid,sn) tables at one choke — a surviving handle
+   would point at a recycled buffer = a wrong-bytes read, and the parallel tables would otherwise leak the released
+   sample's metadata unbounded), deregister it from the loan registry, return its pooled plaintext buffer to the decode pool,
    and RECYCLE the (fully dissociated) handle to the freelist. Two disjoint cases share this one entry point:
    (1) a REGISTERED handle (REG-INDEX >= 0: a normally-accepted+stored loan) — evict its store slot
    IDENTITY-GUARDED (clear (GUID,SN) only when THIS handle still occupies it) then deregister; (2) an UNREGISTERED
@@ -1997,7 +2018,7 @@
       ;; T5d review Minor #1: this REG-INDEX>=0 gate is the PRIMARY dup-guard (a dedup duplicate's fresh handle is unregistered -> reg-index<0 -> filtered here, before any store touch); the eq identity-guard below is now redundant belt-and-suspenders.
       (let ((inner (gethash (secured-loan-handle-guid handle) (disc-node-samples node))))
         (when (and inner (eq (gethash (secured-loan-handle-sn handle) inner) handle))   ; identity-guard: a deduped duplicate must NOT evict the original occupant (silent loss + pinned slot)
-          (remhash (secured-loan-handle-sn handle) inner)))
+          (%purge-secured-sample node (secured-loan-handle-guid handle) (secured-loan-handle-sn handle))))   ; WP-SECURED-STORE-GROWTH: purge ALL parallel tables, not just disc-node-samples
       (%secured-loan-deregister node handle))
     (let ((buf (secured-loan-handle-buffer handle)))
       (when buf
@@ -2079,6 +2100,9 @@
 ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: defined after the secured-pool sizing specials (loaded later); forward-declared
 ;; so %deliver-user-sample reaches the lazy decode-pool carve without an undefined-function warning.
 (declaim (ftype (function (disc-node) t) %ensure-secured-decode-pool))
+;; WP-SECURED-STORE-GROWTH: node-sample-count is defined below; forward-declared so the carve-fail cap in
+;; %deliver-user-sample reaches it without an undefined-function warning (build fails on any promoted warning).
+(declaim (ftype (function (disc-node) (integer 0)) node-sample-count))
 
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix effective-guid effective-sn
                              &optional key-hash)
@@ -2118,10 +2142,18 @@
               ;; T5b LOAN path: decode into a POOLED buffer; store a length-tagged handle (zero per-sample plaintext alloc)
               (let ((pool (%ensure-secured-decode-pool node)))
                 (if (null pool)
-                    ;; no pool (arena alloc failed) -> allocating decode -> bare vec (byte-identical, correct)
-                    (let ((plain (dds.security:decode-serialized-payload km vec)))
-                      (unless plain (return-from %deliver-user-sample t))
-                      (setf stored plain))
+                    ;; arena carve failed -> bounded allocating fallback (byte-identical, correct). WP-SECURED-STORE-GROWTH:
+                    ;; a carve-fail bare vector carries no loan, so node-return-loan can never purge it -> an undrained
+                    ;; carve-fail stream would grow the store unbounded. Cap the undrained store at the SAME working-set
+                    ;; budget the pool would have used (*secured-pool-capacity* + *secured-pool-headroom*): fail-closed
+                    ;; RESOURCE_LIMITS (SAMPLE_REJECTED) at the cap, mirroring pool exhaustion, never a GC-silent unbounded
+                    ;; store (operating contract §4 NFR-MEM). The reject precedes reader-on-data -> un-acked -> writer backpressure.
+                    (if (>= (node-sample-count node) (+ *secured-pool-capacity* *secured-pool-headroom*))
+                        (progn (incf (disc-node-decode-pool-rejects node))
+                               (return-from %deliver-user-sample t))
+                        (let ((plain (dds.security:decode-serialized-payload km vec)))
+                          (unless plain (return-from %deliver-user-sample t))
+                          (setf stored plain)))
                     ;; T5d: acquire buffer + pooled handle together (paired 1:1 capacity -> the handle acquire
                     ;; succeeds whenever a buffer was free; the defensive release keeps it never-crash/never-GC)
                     (multiple-value-bind (buf h)
@@ -2457,7 +2489,10 @@
                           (disc-node-decode-arena node) arena   ; only after the carve succeeds (teardown reachability)
                           (disc-node-decode-pool node) pool)
                     pool)
-                (error () nil)))))))   ; arena-exhausted / static-alloc failure: leave NIL -> allocating-decode fallback
+                ;; WP-SECURED-STORE-GROWTH: catch storage-condition too (a real off-heap/static-alloc OOM signals
+                ;; storage-condition, NOT error, on SBCL/Clasp) so carve-fail is graceful as documented — leave NIL ->
+                ;; bounded allocating-decode fallback, never propagate (operating contract §4 NFR-MEM).
+                ((or error storage-condition) () nil)))))))   ; arena-exhausted / static-alloc failure: leave NIL -> allocating-decode fallback
 
 (defun* set-secured-loan-capable (node capable)
     (function (disc-node t) t)

@@ -244,9 +244,12 @@ is a fixed vector with O(1) swap-remove (no per-loan cons), and `node-take-loane
 **reused** result vector (no per-take list cons).  Enabling `data_protection` on the receive
 side therefore adds **0.0000 B/sample** over the non-secured baseline — matching the encode side.
 
-Because the disc-node samples store is never purged, the pooled buffer's lifetime is tied to a
-**loan registry**, not the store.  This changes the secured-reader read contract — the app
-**must** read through the loan API and **return** every loan.  `node-take-loaned` returns
+The pooled buffer's lifetime is tied to a **loan registry**, not the store.  This changes the
+secured-reader read contract — the app **must** read through the loan API and **return** every
+loan.  Every loan **release** purges the sample's metadata from **all** parallel per-`(guid,sn)`
+tables at a single choke (`%purge-secured-sample` — `samples` / `sample-writers` /
+`sample-writer-guids` / `sample-origins` / `sample-key-hashes`), so a never-drained secured stream
+cannot grow those tables unbounded (WP-SECURED-STORE-GROWTH).  `node-take-loaned` returns
 `(values VEC COUNT)`; read `VEC[0, COUNT)` in place and hand `VEC` + `COUNT` back to
 `node-return-loan`:
 
@@ -265,8 +268,10 @@ Because the disc-node samples store is never purged, the pooled buffer's lifetim
 the next `node-take-loaned` clobbers it, so it must be consumed and returned before the next
 take.  `node-return-loan` returns each buffer to the pool, **recycles** the handle to the
 freelist (fully dissociated: `buffer → nil`, guid/sn cleared, so a stale reference cannot alias
-a new sample), and removes the dangling samples-store entry so the buffer is never re-read after
-release (no use-after-free, no wrong-bytes).  It is idempotent / double-return-safe (a returned
+a new sample), and purges the sample's `(guid,sn)` entry from every parallel store table
+(identity-guarded — only when this handle still occupies the slot, so a deduped duplicate never
+evicts the original) so the buffer is never re-read after release (no use-after-free, no
+wrong-bytes) and no table leaks the released metadata.  It is idempotent / double-return-safe (a returned
 handle is skipped) — but a handle **must not be retained or reused after it is returned** (a
 returned handle may be recycled for a new sample; use-after-return is a caller-contract
 violation, memory-safe within the arena but undefined).  `stop-node` calls
@@ -278,6 +283,17 @@ Fail-closed semantics are preserved: a decode failure drops the sample and relea
 `disc-node-decode-pool-rejects` (a `SAMPLE_REJECTED` counter), and leaves the sample
 un-acknowledged so the writer applies backpressure — **never** a silent GC-heap fallback.  A
 leaked loan therefore degrades gracefully (the pool eventually rejects) rather than wedging.
+
+The **arena-carve-fail** fallback is bounded too (WP-SECURED-STORE-GROWTH).  If the decode pool
+cannot be carved (the static arena is exhausted at the first secured receive), the reader stays
+loan-capable but stores **bare** plaintext vectors — which carry no loan, so `node-return-loan`
+can never purge them.  To stop a never-drained carve-fail stream from growing the heap unbounded,
+the undrained carve-fail store is **capped** at the same working-set budget the pool would have
+used (`*secured-pool-capacity* + *secured-pool-headroom*`): at the cap it **fails closed** — drops
+the sample, bumps `disc-node-decode-pool-rejects`, leaves it un-acked (writer backpressure),
+exactly as pool exhaustion does — never a GC-silent unbounded store.  (The carve itself catches a
+`storage-condition` off-heap OOM too, so it always degrades to this bounded fallback rather than
+propagating.)
 
 A reader that does **not** call `set-secured-loan-capable` (the default), and any non-secured
 reader, keeps the allocating-decode → bare-vector path **byte-identical** to before.

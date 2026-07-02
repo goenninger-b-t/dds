@@ -272,10 +272,20 @@ count iterates the whole capacity vec (its stale tail holds prior-take handles �
 double-release). Documented; **all callers pass the count**. Consider making the count mandatory or defaulting to a
 handle-`p` prefix scan.
 
-**(h) PRE-EXISTING secured store growth (NOT introduced by this WP).** `%secured-loan-release` cleans only
-`disc-node-samples`, not the parallel per-`(guid,sn)` tables (`sample-writers` / `-writer-guids` / `-origins` /
-`-key-hashes`); and the arena-carve-fail bare-vector store grows on a never-purged secured stream. A dedicated
-follow-up WP (store lifecycle / purge for secured streams).
+**(h) PRE-EXISTING secured store growth (NOT introduced by this WP). — RESOLVED (WP-SECURED-STORE-GROWTH).**
+`%secured-loan-release` cleaned only `disc-node-samples`, not the parallel per-`(guid,sn)` tables (`sample-writers`
+/ `-writer-guids` / `-origins` / `-key-hashes`); and the arena-carve-fail bare-vector store grew on a never-purged
+secured stream (memory-exhaustion, attacker-drivable by a keyed peer streaming samples never loaned back). **Closed
+by WP-SECURED-STORE-GROWTH:** a single purge choke — `%purge-secured-sample (node guid sn)` — drops `(guid,sn)`
+from ALL five parallel tables at one place (zero-alloc macrolet; the secured receive zero-alloc arms stay 0.0000),
+called under the identity guard from `%secured-loan-release` so every released/evicted secured sample's metadata is
+purged (no table retained). The arena-carve-fail allocating fallback is now **bounded**: the undrained bare-vector
+store is capped at the pool working-set budget (`*secured-pool-capacity* + *secured-pool-headroom*`) and **fails
+closed** (RESOURCE_LIMITS / `decode-pool-rejects`, un-acked → writer backpressure) at the cap, mirroring pool
+exhaustion — never a GC-silent unbounded store; and the carve-fail handler now catches `storage-condition` too so a
+real off-heap OOM degrades gracefully as documented. Leak-proof regression: `run-secured-store-growth-test` (streams
+many secured samples with/without draining, asserts the tables are purged on release and the carve-fail store stays
+bounded; written RED on the pre-fix code).
 
 **(i) DCPS take-loaned-for-secured follow-on.** The secured loan lives at the `disc-node` level; the DCPS
 `read/take` path is byte-identical and NOT opted-in (`%drain-one-sample` errors loudly on a `secured-loan-handle` to

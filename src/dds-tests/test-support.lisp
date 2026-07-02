@@ -144,3 +144,7 @@
   "metadata_protection submessage-scratch EXHAUSTION pass-through isolation offset (ZA-2 review):
    on pool exhaustion the send wrap must pass a no-protectable-submessage datagram THROUGH (LEN),
    not drop it, while still fail-closed dropping a datagram carrying a protectable submessage.")
+(defconstant +td-secured-store-growth+ 39
+  "WP-SECURED-STORE-GROWTH leak-proof test isolation offset: streaming many secured samples must not
+   grow the parallel per-(guid,sn) store tables unbounded (purged on loan release) nor the arena-carve-fail
+   bare-vector store unbounded (bounded high-water, fail-closed RESOURCE_LIMITS at the cap).")

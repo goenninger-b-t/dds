@@ -754,6 +754,112 @@
       (dds.disc:stop-node node)))
   t)
 
+(defun* %secured-store-table-entries (outer)
+    (function (hash-table) (integer 0))
+  "WP-SECURED-STORE-GROWTH: total (GUID,SN) entries across a 2-level per-(guid,sn) store table OUTER (sum of the
+   inner SN-map counts) — the store-growth metric the leak-proof test asserts stays bounded / purged."
+  (let ((n 0))
+    (declare (type (integer 0) n))
+    (maphash (lambda (g inner) (declare (ignore g)) (incf n (hash-table-count inner))) outer)
+    n))
+
+(defun* run-secured-store-growth-test ()
+    (function () t)
+  "Test (WP-SECURED-STORE-GROWTH): closes a PRE-EXISTING unbounded-heap-growth path in the secured-receive
+   samples store (ADR 0038 residual (h), ADR 0039 carry). Two arms, each RED on the pre-fix code:
+   ARM 1 (purged on loan release): stream MANY secured samples, take+return each loan. Pre-fix
+   %secured-loan-release remhashed ONLY disc-node-samples, leaking the parallel per-(guid,sn) tables
+   (sample-writers / -writer-guids / -key-hashes / -origins) — they grew to N. The fix purges ALL tables at one
+   choke (%purge-secured-sample), so after N cycles every table is back to empty.
+   ARM 2 (bounded high-water, if reachable): force the arena-carve-fail path (the decode pool cannot carve) and
+   stream MANY secured samples WITHOUT draining. Pre-fix the bare-vector store grew to N; the fix caps it at the
+   pool working-set budget and fails closed (RESOURCE_LIMITS / SAMPLE_REJECTED). Skipped if carve-fail is
+   unreachable on this impl/platform (the impossibly-large carve unexpectedly succeeded).
+   No sockets — %deliver-user-sample driven directly. Requires OpenSSL >= 3.5; both impls pass identically (Clasp FIRST)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [secured-store-growth] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-secured-store-growth-test t)))
+  (let* ((km (dds.security:make-test-key-material))
+         (pt (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x5A))
+         (secured (dds.security:encode-serialized-payload km pt))
+         (kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x7C))   ; a captured key-hash -> also populates sample-key-hashes
+         (src (%make-test-prefix #xA3))
+         (wid #x00000102)
+         (n 2000))
+    ;; -- ARM 1: parallel-table purge on loan release (deterministic, always runs) --
+    (let ((node (let ((dds.disc:*shmem-enabled* nil))
+                  (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xE9)
+                                           :domain (test-domain +td-secured-store-growth+)
+                                           :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
+      (unwind-protect
+           (let ((guid (dds.disc::%source-guid src wid)))
+             (dds.disc:enable-subscriber node)
+             ;; small pool (cap 4 + headroom 2): take+return each loan so ONE buffer recycles across all N samples
+             ;; -> the pooled buffers never leak; the ONLY thing that can grow is the parallel METADATA tables.
+             (let ((dds.disc:*secured-pool-capacity* 4) (dds.disc:*secured-pool-headroom* 2))
+               (dds.disc:set-secured-loan-capable node t))
+             (dotimes (i n)
+               (let ((sn (1+ i)))
+                 (dds.disc::%deliver-user-sample node wid sn secured src guid sn kh)   ; key-hash populates sample-key-hashes too
+                 (multiple-value-bind (data count) (dds.disc:node-take-loaned node)
+                   (dds.disc:node-return-loan node data count))))
+             ;; after N deliver+take+return cycles EVERY parallel table is purged (fix); pre-fix sample-writers /
+             ;; -writer-guids / -key-hashes each held N entries while disc-node-samples WAS purged (the leak).
+             (dds.pal:with-lock ((dds.disc::disc-node-lock node))
+               (%check :store-growth-samples-purged
+                       (zerop (%secured-store-table-entries (dds.disc::disc-node-samples node)))
+                       (format nil "disc-node-samples must be empty after ~d take+return cycles" n))
+               (%check :store-growth-writers-purged
+                       (zerop (%secured-store-table-entries (dds.disc::disc-node-sample-writers node)))
+                       (format nil "sample-writers must be purged on loan release; pre-fix leaked ~d entries (unbounded)" n))
+               (%check :store-growth-writer-guids-purged
+                       (zerop (%secured-store-table-entries (dds.disc::disc-node-sample-writer-guids node)))
+                       (format nil "sample-writer-guids must be purged on loan release; pre-fix leaked ~d entries (unbounded)" n))
+               (%check :store-growth-key-hashes-purged
+                       (zerop (%secured-store-table-entries (dds.disc::disc-node-sample-key-hashes node)))
+                       (format nil "sample-key-hashes must be purged on loan release; pre-fix leaked ~d entries (unbounded)" n))
+               (%check :store-growth-origins-purged
+                       (zerop (%secured-store-table-entries (dds.disc::disc-node-sample-origins node)))
+                       "sample-origins must be purged on loan release (single-choke invariant)")))
+        (dds.disc:stop-node node)))
+    ;; -- ARM 2: arena-carve-fail bare-vector store bounded (if the carve-fail path is reachable) --
+    (let* ((cap 4) (head 2) (bound (+ cap head))
+           (node (let ((dds.disc:*shmem-enabled* nil))
+                   (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xEA)
+                                            :domain (test-domain +td-secured-store-growth+)
+                                            :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
+      (unwind-protect
+           (let ((guid (dds.disc::%source-guid src wid)))
+             (dds.disc:enable-subscriber node)
+             ;; force carve-fail: an impossibly-large element size makes the static-arena carve fail (graceful,
+             ;; caught -> pool stays NIL -> the allocating bare-vector fallback). If the huge carve unexpectedly
+             ;; succeeds (e.g. a 5-level-paging overcommit), carve-fail is unreachable here -> SKIP the arm.
+             (let ((dds.disc:*secured-payload-max-bytes* (ash 1 48))
+                   (dds.disc:*secured-pool-capacity* cap)
+                   (dds.disc:*secured-pool-headroom* head))
+               (ignore-errors (dds.disc:set-secured-loan-capable node t))
+               (if (dds.disc:disc-node-decode-pool node)
+                   (format t "~&  [secured-store-growth] SKIP ARM 2 — carve-fail unreachable (huge static alloc succeeded on this platform)~%")
+                   (progn
+                     (dotimes (i n)
+                       (dds.disc::%deliver-user-sample node wid (1+ i) secured src guid (1+ i) kh))   ; NO drain -> pre-fix grows unbounded
+                     (%check :carve-fail-store-bounded
+                             (<= (dds.disc:node-sample-count node) bound)
+                             (format nil "arena-carve-fail store must be bounded at the pool budget (~d); got ~d after ~d undrained samples (pre-fix = ~d, unbounded)"
+                                     bound (dds.disc:node-sample-count node) n n))
+                     (%check :carve-fail-tables-bounded
+                             (<= (dds.pal:with-lock ((dds.disc::disc-node-lock node))
+                                   (%secured-store-table-entries (dds.disc::disc-node-sample-writers node)))
+                                 bound)
+                             "the parallel tables must be bounded on the carve-fail path too (same cap)")
+                     (%check :carve-fail-rejected
+                             (>= (dds.disc:disc-node-decode-pool-rejects node) 1)
+                             "carve-fail over the cap must fail-closed (SAMPLE_REJECTED / decode-pool-rejects), never a GC-silent unbounded store")))))
+        (dds.disc:stop-node node))))
+  t)
+
 (defun* run-security-encrypted-fragmented-test ()
     (function () t)
   "DDS-Security §9.5.3.3 Slice-1 DATA_FRAG path: encode -> fragment -> reassemble -> decode (ADR 0031).
