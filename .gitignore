@@ -22,3 +22,6 @@
 # Python bytecode (test/interop tooling)
 __pycache__/
 *.pyc
+
+# ASDF/Quicklisp system index (build artifact)
+system-index.txt
