@@ -38,6 +38,8 @@
            #:disc-node-zc-sends #:+zerocopy-pool-slots+ #:+zerocopy-pool-slot-bytes+ #:*zerocopy-min-payload-bytes*
            ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: data_protection encode-pool sizing knobs + the per-node arena slot
            #:*secured-payload-max-bytes* #:*secured-pool-capacity* #:*secured-pool-headroom* #:disc-node-payload-arena
+           ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T3 (ZA-2): whole-RTPS (rtps_protection / SRTPS) send-scratch pool capacity knob
+           #:*srtps-send-scratch-capacity*
            ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: data_protection DECODE loan (zero-alloc secured receive via the loan registry)
            #:set-secured-loan-capable #:disc-node-secured-loan-capable #:disc-node-decode-pool #:disc-node-decode-pool-rejects
            #:secured-loan-handle #:secured-loan-handle-p #:secured-loan-handle-len
@@ -117,11 +119,14 @@
            #:disc-node-user-submessage-decode
            #:run-user-submessage-protection-test
            #:run-user-submessage-data-protection-test
+           #:run-user-submessage-protection-zeroalloc-test
+           #:run-secured-dataplane-mem-test
            #:run-secure-sedp-roundtrip-test
            #:run-secure-sedp-sign-roundtrip-test
            #:run-secure-sedp-origin-auth-roundtrip-test
            #:run-secure-sedp-origin-auth-tamper-test
            #:run-rtps-protection-test
+           #:run-rtps-protection-zeroalloc-test
            #:run-rtps-protection-enforce-test
            #:run-rtps-protection-enforce-reliability-test
            #:run-rtps-protection-enforce-user-bracket-test

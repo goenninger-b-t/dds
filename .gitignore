@@ -18,3 +18,7 @@
 # Local agent / SDD scratch workspaces (handoff briefs, reports — not deliverables)
 /.superpowers/
 /.claude/
+
+# Python bytecode (test/interop tooling)
+__pycache__/
+*.pyc

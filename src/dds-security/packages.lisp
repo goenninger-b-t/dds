@@ -16,12 +16,26 @@
    #:decode-datawriter-submessage
    #:encode-datareader-submessage
    #:decode-datareader-submessage
+   ;; Slice 2 / ZA-2 (WP-DDS-SECURITY-ZEROALLOC-AEAD T4): zero-alloc into-buffer submessage tier for the live
+   ;; dataplane — wrap/unwrap ONE user submessage bracket (SEC_PREFIX 0x31 / SEC_POSTFIX 0x32) through a
+   ;; caller-owned STATIC buffer by raw offset (no per-submessage subseq / →octets); the shared
+   ;; %encode/%decode-secured-region-into cores, byte-identical wire. Consumed by dds.disc (send multi-bracket
+   ;; wrap + the receive re-dispatch).
+   #:encode-datawriter-submessage-into
+   #:decode-datawriter-submessage-into
+   #:encode-datareader-submessage-into
+   #:decode-datareader-submessage-into
    ;; Slice 4 (WP-DDS-SECURITY-SECURE-DISCOVERY T4): §8.5.1.10-.12 whole-RTPS-message protection
    ;; (crypto/rtps-message.lisp) — SRTPS_PREFIX/SEC_BODY/SRTPS_POSTFIX SIGN+ENCRYPT+origin-auth over the
    ;; shared %encode/%decode-secured-region engine; ParticipantCrypto-keyed. Consumed by T10 (send /
    ;; %handle-datagram). The whole submessage STREAM is the protected unit (SIGN walks it to SRTPS_POSTFIX).
    #:encode-rtps-message
    #:decode-rtps-message
+   ;; Slice 2 / ZA-2 (WP-DDS-SECURITY-ZEROALLOC-AEAD T3): zero-alloc into-buffer whole-RTPS tier for the live
+   ;; dataplane — wrap/unwrap SRTPS through a caller-owned STATIC buffer by raw offset (no per-datagram subseq /
+   ;; →octets); the shared %encode/%decode-secured-region-into cores, byte-identical wire. Consumed by dds.disc.
+   #:encode-rtps-message-into
+   #:decode-rtps-message-into
    ;; Slice 4 (WP-DDS-SECURITY-SECURE-DISCOVERY T3): origin authentication (§9.5.3.3.4.3) —
    ;; receiver-specific session-key KDF + per-receiver GMAC; encode emits receiver_specific_macs (the
    ;; encode :receivers key), decode verifies its own (the decode :my-receiver-key-id/:my-receiver-key

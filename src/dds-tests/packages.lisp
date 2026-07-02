@@ -63,6 +63,7 @@
            #:run-security-submessage-corpus-test
            #:run-security-origin-auth-test
            #:run-security-rtps-message-corpus-test
+           #:run-security-secured-region-into-test
            #:run-security-crypto-manager-test
            #:run-rtps-message-bench
            #:run-rtps-protection-bench

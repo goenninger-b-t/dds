@@ -23,6 +23,44 @@
    Rebind to NIL before make-disc-node to force the all-UDP path (e.g. cross-host deployments where no
    same-host peer can exist). Not a wire constant — a local transport-selection policy.")
 
+;;;; WP-DDS-SECURITY-ZEROALLOC-AEAD T3 (ZA-2): whole-RTPS (rtps_protection / SRTPS) zero-alloc dataplane sizing.
+
+(defconstant +srtps-scratch-datagram-bytes+ 2048
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T3: the datagram byte size the SRTPS send-scratch pool buffers and the SECURE-RX-POOL
+   RX buffers are sized to — the node's message-buffer size (tx-msg / rx-tx-msg / async-tx-msg, all 2048). A wrapped
+   datagram never exceeds this + the SRTPS bracket overhead, and a recovered stream is never longer than the ciphertext;
+   NOT a wire constant (a local buffer-size policy, matching the coalescing/IP-MTU headroom of the send buffers).")
+
+(defconstant +srtps-scratch-overhead+ 56
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T3: the SRTPS whole-RTPS bracket overhead (octets) added over the protected
+   submessage stream — SRTPS_PREFIX(4) + CryptoHeader(20) + SEC_BODY hdr(4) + CryptoContent len(4) + SRTPS_POSTFIX(4)
+   + common_mac(16) + rsm_count(4) = 56 (empty receivers; the 4-align pads ride the 2028-octet input-vs-2048-buffer
+   slack), DDS-Security 1.1 §9.5.3.3.4.3/.4. The send-scratch pool element size is +srtps-scratch-datagram-bytes+
+   + this.")
+
+(defconstant +submsg-scratch-overhead+ 8192
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T4 (ZA-2): the expansion headroom (octets) the per-node SUBMESSAGE-scratch pool adds
+   over +srtps-scratch-datagram-bytes+ (2048) — the metadata_protection (§8.5.1.7-.9) send wrap emits ONE SEC_PREFIX ...
+   SEC_POSTFIX bracket PER user submessage (~+56 octets each, DDS-Security 1.1 §9.5.3.3.4.3/.4: PREFIX(4) +
+   CryptoHeader(20) + [SEC_BODY hdr(4)+cnt_len(4)+pad(<4)] + POSTFIX(4) + common_mac(16) + pad(<4) + rsm_count(4)), so a
+   datagram of N small user submessages expands by ~N*56 during the walk. 8192 = the pre-ZA-2 `(make-octet-buffer (+ len
+   8192))` headroom preserved verbatim (byte-identical drop threshold): it covers ~132 brackets of expansion, far above a
+   2048-datagram's max ~72 submessages*62 = ~4464, so the walk never overflows the scratch on a realistic datagram — the
+   FINAL fit-to-BUF (<= the 2048 send-buffer capacity) check governs the drop exactly as before. A wrapped result larger
+   than the send buffer is fail-closed-dropped (NFR-SEC-POSTURE), matching the pre-ZA-2 code. NOT a wire constant (a local
+   buffer-size policy). Kept a DEDICATED pool (not enlarging the send-scratch pool) so the SRTPS send path keeps its
+   efficient 2104-octet buffers — the 10240-octet submessage buffers are reserved lazily only when metadata_protection engages.")
+
+(defparameter *srtps-send-scratch-capacity* 8
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T3: number of datagram-sized buffers in EACH of a node's SRTPS scratch pools — the
+   send-scratch pool (%maybe-wrap-srtps borrows: the publish caller, the receiver thread's ACKNACK, the async sender,
+   the flow scheduler) AND, since the T3(ZA-2) review, the RX SECURE-RX-POOL (%handle-datagram borrows one per SRTPS
+   unwrap: the unicast / multicast / SHMEM receiver threads — a distinct buffer per concurrent decode, no shared sink).
+   A small fixed count + headroom, comfortably covering both the concurrent sender threads and the <=3 receiver threads.
+   Each borrow is held only for one bracket build / one decode+copy-back then released; exhaustion -> the borrow is NIL
+   -> a fail-closed drop (RESOURCE_LIMITS backpressure, never a GC fallback; NFR-MEM). Raise for deeper concurrency.
+   Not a wire constant.")
+
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0014.
 (defvar *zerocopy-enabled* nil
   "WP-ZEROCOPY master switch (FR-PF-3). DEFAULT NIL — Zero-Copy is patent-gated (R6) and NOT cleared for
@@ -321,6 +359,63 @@
   (rtps-protection-origin-auth nil :type boolean)
   (rtps-protection-encode nil :type (or null function))
   (rtps-protection-decode nil :type (or null function))
+  ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T3 (ZA-2): whole-RTPS (rtps_protection / SRTPS) zero-alloc dataplane scratch.
+  ;; SEND-SCRATCH-POOL is a per-node fixed pool of datagram-sized static octet-buffers %maybe-wrap-srtps borrows to
+  ;; build the SRTPS bracket BY OFFSET (encode-rtps-message-into) with no per-datagram subseq/→octets; SEND-SCRATCH-ARENA
+  ;; backs it, SEND-SCRATCH-LOCK guards its acquire/release + carve. SECURE-RX-POOL is the SYMMETRIC RX pool the SRTPS
+  ;; unwrap borrows a DISTINCT datagram-sized buffer from per decode to open ENCRYPT plaintext into (decode-rtps-message
+  ;; -into) before copying back in place (SIGN moves in place, buffer unused) — a POOL, not one reused buffer, because
+  ;; start-node runs up to THREE receiver threads (unicast / multicast / SHMEM) all feeding %handle-datagram, so a
+  ;; single shared RX sink would race across transports (T3(ZA-2) review: thread A's decode->copy-back window vs thread
+  ;; B decoding into the same buffer -> A copies B's plaintext -> wrong-sample delivery). SECURE-RX-ARENA backs it,
+  ;; SECURE-RX-LOCK guards its acquire/release + carve (a DEDICATED lock so RX pool ops never contend with send pool
+  ;; ops). Both pools are carved LAZILY on the first SRTPS wrap/unwrap (consistent with the other per-node security
+  ;; pools + zero-cost when rtps_protection is off), double-checked under their lock, and torn down in stop-node.
+  ;; Exhaustion -> fail-closed drop (RESOURCE_LIMITS backpressure, never a GC fallback; NFR-MEM). All NIL default =
+  ;; rtps_protection off / not yet engaged -> byte-identical (the pools are never touched, no static memory reserved).
+  (send-scratch-pool nil :type t)
+  (send-scratch-arena nil :type t)
+  (send-scratch-lock (dds.pal:make-lock "send-scratch") :type t)
+  (secure-rx-pool nil :type t)
+  (secure-rx-arena nil :type t)
+  (secure-rx-lock (dds.pal:make-lock "secure-rx") :type t)
+  ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5 (ZA-2): the RX SEC_PREFIX-bracket EXTRACTION pool. %handle-datagram borrows one
+  ;; DISTINCT datagram-sized buffer per secured submessage to copy the [SEC_PREFIX,datagram-end) bracket into (the
+  ;; decode INPUT), replacing the pre-T5 per-bracket (make-array (- size start)). A DEDICATED pool (its own
+  ;; BRACKET-RX-LOCK), SEPARATE from SECURE-RX-POOL, because the bracket is the decode INPUT while %on-user-secure-
+  ;; submessage decodes it INTO a SECURE-RX buffer (the OUTPUT): the two MUST be distinct live buffers, guaranteed here
+  ;; by construction (two pools). Per-thread distinct borrow (≤3 receiver threads) — mirrors the T3 RX-race fix, so no
+  ;; shared-sink race. Carved LAZILY on the first secured-bracket receive, double-checked under BRACKET-RX-LOCK, torn
+  ;; down in stop-node. Runtime EXHAUSTION -> fail-closed drop (RESOURCE_LIMITS, never a GC fallback; NFR-MEM);
+  ;; not-carved (arena exhausted) OR an oversized bracket -> the allocating make-array fallback (byte-identical). NIL
+  ;; default = no secured receive yet -> zero static memory reserved (byte-identical plain path).
+  (bracket-rx-pool nil :type t)
+  (bracket-rx-arena nil :type t)
+  (bracket-rx-lock (dds.pal:make-lock "bracket-rx") :type t)
+  ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5 (ZA-2): the RX key_id scratch pool. %on-secure-submessage borrows one DISTINCT
+  ;; 4-octet buffer per secured bracket to copy the §9.5.3.3.1 CryptoHeader transformation_key_id
+  ;; into (%secure-bracket-key-id-into) before the equalp-keyed key_id resolvers look it up — replacing the pre-T5
+  ;; per-bracket (subseq bracket 8 12). A dynamic-extent stack array cannot serve: this SBCL heap-allocates a
+  ;; dynamic-extent SPECIALIZED (unsigned-byte 8) array (only simple-vectors stack-allocate), and the resolvers require
+  ;; a (simple-array (unsigned-byte 8)); a pooled per-thread buffer is the alloc-free, race-free, resolver-compatible
+  ;; scratch. Per-thread distinct borrow (≤3 receiver threads); carved LAZILY, double-checked under KEY-ID-RX-LOCK,
+  ;; torn down in stop-node. Runtime EXHAUSTION -> fail-closed drop; not-carved (arena exhausted) -> a heap 4-array
+  ;; fallback (byte-identical). NIL default = no secured receive yet -> zero static memory reserved.
+  (key-id-rx-pool nil :type t)
+  (key-id-rx-arena nil :type t)
+  (key-id-rx-lock (dds.pal:make-lock "key-id-rx") :type t)
+  ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T4 (ZA-2): the metadata_protection (§8.5.1.7-.9) SEND multi-bracket wrap
+  ;; (%maybe-wrap-user-submessages) builds the wrapped submessage stream BY OFFSET into a datagram-sized scratch
+  ;; borrowed from this DEDICATED pool (element-bytes +srtps-scratch-datagram-bytes+ + +submsg-scratch-overhead+ =
+  ;; ~10240, sized for the ~+56-octet-per-submessage bracket expansion), replacing the pre-ZA-2 per-datagram
+  ;; (make-octet-buffer (+ len 8192)) + per-submessage subseq. A DEDICATED pool (not the 2104-octet send-scratch
+  ;; pool) so the SRTPS send path stays efficient; carved LAZILY on the first user submessage wrap, double-checked
+  ;; under SUBMSG-SCRATCH-LOCK (dedicated so it never contends with the send / RX pool ops), torn down in stop-node.
+  ;; Exhaustion -> fail-closed drop (RESOURCE_LIMITS, never a GC fallback; NFR-MEM); carve-failed (arena exhausted)
+  ;; -> the allocating fallback. All NIL default = metadata_protection off / not yet engaged -> byte-identical.
+  (submsg-scratch-pool nil :type t)
+  (submsg-scratch-arena nil :type t)
+  (submsg-scratch-lock (dds.pal:make-lock "submsg-scratch") :type t)
   ;; Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP): USER-DATA submessage protection (metadata_protection_kind,
   ;; DDS-Security 1.1 §8.5.1.7-.9 / §9.4.1.2.3). When governance sets the user topic's metadata_protection_kind
   ;; != NONE, EACH user-plane submessage (DATA/DATA_FRAG/HEARTBEAT/GAP/HEARTBEAT_FRAG from the writer;
@@ -728,7 +823,7 @@
 ;; the protected SEDP announce; %announce-secure-liveliness the protected WLP announce (called from
 ;; assert-participant-liveliness); %announce-secure-spdp the protected SPDP re-announce (called from
 ;; announce-participant). All no-op when security is OFF (byte-identical).
-(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*)) t) t) %on-secure-submessage)
+(declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*)) fixnum t) t) %on-secure-submessage)
          (ftype (function (disc-node) (eql t)) %announce-secure-endpoints
                 %announce-secure-liveliness %announce-secure-spdp %send-secure-builtin-heartbeats))
 
@@ -1220,6 +1315,139 @@
          (funcall dec src-prefix)
          t)))
 
+(defmacro %with-scratch ((var pool lock) &body body)
+  "Borrow one datagram-sized scratch octet-buffer from POOL (a dds.core.arena buffer-pool) under LOCK, bind it to
+   VAR, run BODY, and RELEASE it (always, even on non-local exit) — the shared SRTPS zero-alloc borrow used by BOTH
+   the send wrap (%with-send-scratch) and the RX unwrap (%with-secure-rx-scratch), WP-DDS-SECURITY-ZEROALLOC-AEAD T3
+   (+ the T3(ZA-2) review). Evaluates to BODY's value, or NIL when POOL is NIL (not carved) or EXHAUSTED (no buffer
+   free): the caller treats NIL as the fail-closed required-but-failed drop (RESOURCE_LIMITS backpressure, never a GC
+   fallback; NFR-MEM). The acquire + release are O(1) index ops under LOCK so concurrent sender/receiver threads
+   never corrupt the pool AND each gets a DISTINCT buffer; BODY (the AEAD op + copy) runs OUTSIDE the lock."
+  (let ((p (gensym "POOL")) (lk (gensym "LK")) (b (gensym "BUF")))
+    `(let* ((,p  ,pool)
+            (,lk ,lock)
+            (,b  (and ,p (dds.pal:with-lock (,lk) (dds.core.arena:pool-acquire ,p)))))
+       (when ,b
+         (unwind-protect (let ((,var ,b)) ,@body)
+           (dds.pal:with-lock (,lk) (dds.core.arena:pool-release ,p ,b)))))))
+
+(defmacro %with-secure-rx-scratch ((var node) &body body)
+  "Borrow one RX decode buffer from NODE's SECURE-RX-POOL (%with-scratch over the RX pool + its dedicated lock) — the
+   RX twin of %with-send-scratch; NIL body value on a not-carved / exhausted pool (fail-closed drop). Each concurrent
+   receiver thread (unicast / multicast / SHMEM) gets a DISTINCT buffer, so the SRTPS decode->copy-back window never
+   races across transports. WP-DDS-SECURITY-ZEROALLOC-AEAD T3(ZA-2) review."
+  (let ((n (gensym "NODE")))
+    `(let ((,n ,node))
+       (%with-scratch (,var (disc-node-secure-rx-pool ,n) (disc-node-secure-rx-lock ,n))
+         ,@body))))
+
+(defun* %ensure-secure-rx-pool (node)
+    (function (disc-node) t)
+  "Return NODE's SRTPS RX decode pool (SECURE-RX-POOL), carving it (arena + fixed pool of datagram-sized static
+   buffers) lazily on the first SRTPS unwrap and returning it thereafter (WP-DDS-SECURITY-ZEROALLOC-AEAD T3(ZA-2)
+   review). element-bytes = +srtps-scratch-datagram-bytes+ (a recovered stream is never longer than the ciphertext);
+   capacity = *srtps-send-scratch-capacity* (the <=3 receiver threads + headroom). %handle-datagram borrows one
+   DISTINCT buffer per SRTPS unwrap (%with-secure-rx-scratch); decode-rtps-message-into opens ENCRYPT plaintext into
+   it, it is copied back in place, then released (SIGN moves the verbatim region in place, buffer unused) — so the
+   concurrent unicast / multicast / SHMEM receiver threads NEVER share a decode sink (the T3(ZA-2) review fix; the
+   pre-review single reused buffer raced: thread A's decode->copy-back window vs thread B decoding into the same
+   buffer -> A delivered B's plaintext). Carved OFF the steady state (first secured receive only) under SECURE-RX-LOCK,
+   double-checked so it happens exactly once across the receiver threads (a DEDICATED lock, so the RX pool ops never
+   contend with the send-scratch pool ops). On arena/static-alloc failure returns NIL — %handle-datagram then falls
+   back to the allocating decode-rtps-message (correct, byte-identical wire, self-heals when the arena frees), never a
+   per-datagram GC on the pooled path. The arena is stored only after the pool carve succeeds (teardown reachability);
+   stop-node tears it down. NIL until the first unwrap -> a node with rtps_protection off reserves no static memory,
+   consistent with the send-scratch pool + the other per-node security pools (all lazy)."
+  (or (disc-node-secure-rx-pool node)
+      (dds.pal:with-lock ((disc-node-secure-rx-lock node))
+        (or (disc-node-secure-rx-pool node)
+            (handler-case
+                (let* ((eb    +srtps-scratch-datagram-bytes+)
+                       (cap   *srtps-send-scratch-capacity*)
+                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  (setf (disc-node-secure-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
+                        (disc-node-secure-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
+              (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
+
+(defmacro %with-bracket-rx-scratch ((var node) &body body)
+  "Borrow one RX SEC_PREFIX-bracket buffer from NODE's BRACKET-RX-POOL (%with-scratch over the bracket pool + its
+   dedicated lock) — the buffer %handle-datagram copies an inbound submessage-protection bracket INTO before dispatch
+   (WP-DDS-SECURITY-ZEROALLOC-AEAD T5 / ZA-2). NIL body value on a not-carved / EXHAUSTED pool (fail-closed drop). A
+   DEDICATED pool, so the borrowed bracket (the decode INPUT) is a DISTINCT live buffer from the SECURE-RX decode
+   OUTPUT %on-user-secure-submessage opens into; each concurrent receiver thread gets its own bracket buffer (no
+   shared-sink race — the T3(ZA-2) RX-race invariant)."
+  (let ((n (gensym "NODE")))
+    `(let ((,n ,node))
+       (%with-scratch (,var (disc-node-bracket-rx-pool ,n) (disc-node-bracket-rx-lock ,n))
+         ,@body))))
+
+(defun* %ensure-bracket-rx-pool (node)
+    (function (disc-node) t)
+  "Return NODE's RX SEC_PREFIX-bracket EXTRACTION pool (BRACKET-RX-POOL), carving it (arena + fixed pool of
+   datagram-sized static buffers) lazily on the first secured-bracket receive and returning it thereafter
+   (WP-DDS-SECURITY-ZEROALLOC-AEAD T5 / ZA-2). element-bytes = +srtps-scratch-datagram-bytes+ (a bracket is a sub-region
+   of a datagram, never longer than the datagram); capacity = *srtps-send-scratch-capacity* (the <=3 receiver threads +
+   headroom). %handle-datagram borrows one DISTINCT buffer per secured submessage (%with-bracket-rx-scratch) to copy the
+   [SEC_PREFIX,datagram-end) bracket into — the decode INPUT — which %on-user-secure-submessage then decodes INTO a
+   SECURE-RX buffer (the OUTPUT): a DEDICATED pool keeps the two DISTINCT by construction, and gives each receiver thread
+   its own bracket buffer so the extract->dispatch window never races (mirrors %ensure-secure-rx-pool + the T3(ZA-2)
+   RX-race fix; a DEDICATED BRACKET-RX-LOCK so its ops never contend with the SECURE-RX / send pool ops). Carved OFF the
+   steady state (first secured receive only) under BRACKET-RX-LOCK, double-checked so it happens exactly once across the
+   receiver threads. On arena/static-alloc failure returns NIL — %handle-datagram then falls back to the allocating
+   make-array bracket (correct, byte-identical, self-heals when the arena frees), never a per-datagram GC on the pooled
+   path. The arena is stored only after the pool carve succeeds (teardown reachability); stop-node tears it down. NIL
+   until the first secured bracket -> a node that never receives one reserves no static memory (byte-identical plain
+   path), consistent with the other per-node security pools (all lazy)."
+  (or (disc-node-bracket-rx-pool node)
+      (dds.pal:with-lock ((disc-node-bracket-rx-lock node))
+        (or (disc-node-bracket-rx-pool node)
+            (handler-case
+                (let* ((eb    +srtps-scratch-datagram-bytes+)
+                       (cap   *srtps-send-scratch-capacity*)
+                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  (setf (disc-node-bracket-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
+                        (disc-node-bracket-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
+              (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
+
+(defmacro %with-key-id-rx-scratch ((var node) &body body)
+  "Borrow one RX key_id scratch buffer (exactly 4 octets) from NODE's KEY-ID-RX-POOL (%with-scratch over the
+   key_id pool + its dedicated lock) — the per-thread buffer %on-secure-submessage copies the §9.5.3.3.1 CryptoHeader
+   transformation_key_id into before the equalp-keyed key_id resolvers look it up (WP-DDS-SECURITY-ZEROALLOC-AEAD T5 /
+   ZA-2). NIL body value on a not-carved / EXHAUSTED pool. A DEDICATED pool gives each receiver thread its own key_id
+   scratch (no shared-sink race), alloc-free — a dynamic-extent stack array cannot serve (this SBCL heap-allocates
+   dynamic-extent specialized (unsigned-byte 8) arrays; the resolvers require a specialized array)."
+  (let ((n (gensym "NODE")))
+    `(let ((,n ,node))
+       (%with-scratch (,var (disc-node-key-id-rx-pool ,n) (disc-node-key-id-rx-lock ,n))
+         ,@body))))
+
+(defun* %ensure-key-id-rx-pool (node)
+    (function (disc-node) t)
+  "Return NODE's RX key_id scratch pool (KEY-ID-RX-POOL), carving it (arena + fixed pool of small static buffers)
+   lazily on the first secured-bracket receive and returning it thereafter (WP-DDS-SECURITY-ZEROALLOC-AEAD T5 / ZA-2).
+   element-bytes = 4 (the key_id is exactly 4 octets — the equalp resolvers hash the whole vector); capacity = *srtps-send-scratch-capacity*
+   (the <=3 receiver threads + headroom). %on-secure-submessage borrows one DISTINCT buffer per bracket to copy the
+   §9.5.3.3.1 transformation_key_id into (%secure-bracket-key-id-into) for the equalp key_id resolvers — a per-thread
+   alloc-free specialized scratch (a dynamic-extent stack array does NOT stack-allocate for a specialized (unsigned-byte
+   8) array on this SBCL; only simple-vectors do, which the resolvers cannot take). Carved OFF the steady state under a
+   DEDICATED KEY-ID-RX-LOCK, double-checked so it happens exactly once across the receiver threads. On arena/static-alloc
+   failure returns NIL — %on-secure-submessage then falls back to an allocating heap 4-array (correct, byte-identical,
+   self-heals). Torn down in stop-node. NIL until the first secured bracket -> zero static memory when no secured
+   receive occurs, consistent with the other per-node security pools (all lazy)."
+  (or (disc-node-key-id-rx-pool node)
+      (dds.pal:with-lock ((disc-node-key-id-rx-lock node))
+        (or (disc-node-key-id-rx-pool node)
+            (handler-case
+                (let* ((eb    4)   ; the key_id is EXACTLY 4 octets — the equalp key_id resolvers hash the whole vector
+                       (cap   *srtps-send-scratch-capacity*)
+                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  (setf (disc-node-key-id-rx-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
+                        (disc-node-key-id-rx-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
+              (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
+
 (defun* %handle-datagram (node buf size &optional rtps-unwrapped)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) &optional t) t)
   "Dispatch an inbound datagram (bounded by SIZE). DATA is routed by writerId: SPDP
@@ -1263,14 +1491,43 @@
                  (= (aref (dds.core.buffer:octet-buffer-vec buf) 20) dds.security:+submessage-srtps-prefix+))
         (multiple-value-bind (km my-rk-id my-rk) (funcall dec src-prefix)
           (when km
-            (let* ((vec    (dds.core.buffer:octet-buffer-vec buf))
-                   (stream (dds.security:decode-rtps-message km (subseq vec 20 size)
-                                                             :my-receiver-key-id my-rk-id :my-receiver-key my-rk)))
-              (when (and stream (<= (+ 20 (length stream)) (dds.core.buffer:octet-buffer-capacity buf)))
-                (replace vec stream :start1 20)
-                ;; RTPS-UNWRAPPED t: the inner plaintext is already authenticated by this unwrap, so the
-                ;; re-dispatch must NOT re-apply the plain-user-DATA enforcement (it would self-drop the sample).
-                (%handle-datagram node buf (+ 20 (length stream)) t)))))
+            (let* ((vec (dds.core.buffer:octet-buffer-vec buf))
+                   (cap (dds.core.buffer:octet-buffer-capacity buf))
+                   ;; common (no-origin-auth) tier: a per-node RX POOL gives each concurrent receiver thread (unicast /
+                   ;; multicast / SHMEM) a DISTINCT decode buffer — no shared mutable sink, so the decode->copy-back
+                   ;; window never races across transports (T3(ZA-2) review). The WITH_ORIGIN_AUTHENTICATION tier
+                   ;; (my-rk-id set) keeps the allocating decode (its receiver-MAC gate).
+                   (pool (and (null my-rk-id) (%ensure-secure-rx-pool node))))
+              (if pool
+                  ;; ZA-2 zero-alloc + T3(ZA-2) race-fix: BORROW a DISTINCT RX scratch, open the SRTPS bracket at
+                  ;; [20,SIZE) BY OFFSET — ENCRYPT plaintext into the scratch, SIGN returns the verbatim-region bounds
+                  ;; in VEC (moved in place, scratch unused) — copy back at 20, then the borrow scope RELEASES the
+                  ;; scratch BEFORE re-dispatch (the recovered plaintext now lives in BUF). Pool exhausted / decode
+                  ;; fail / won't-fit -> NEW-SIZE NIL -> fail-closed drop (RESOURCE_LIMITS, never a GC fallback). No
+                  ;; subseq / →octets; the recovered stream is never longer than the datagram.
+                  (let ((new-size (%with-secure-rx-scratch (rx node)
+                                    (multiple-value-bind (data-len mode data-off postfix-off)
+                                        (dds.security:decode-rtps-message-into rx 0 km vec 20 (- size 20))
+                                      (declare (ignore postfix-off))
+                                      (when (and data-len (<= (+ 20 data-len) cap))
+                                        (ecase mode
+                                          (:encrypt (replace vec (dds.core.buffer:octet-buffer-vec rx)
+                                                             :start1 20 :end1 (+ 20 data-len) :end2 data-len))
+                                          ;; same-vec move is always LEFTWARD (data-off 44 = 20+SRTPS_PREFIX+CryptoHeader > start1 20) -> forward-copy safe (CLHS overlap impl-defined; NFR-PORT)
+                                          (:sign    (replace vec vec :start1 20 :start2 data-off :end2 (+ data-off data-len))))
+                                        (+ 20 data-len))))))
+                    ;; RTPS-UNWRAPPED t: the inner plaintext is already authenticated by this unwrap, so the
+                    ;; re-dispatch must NOT re-apply the plain-user-DATA enforcement (it would self-drop the sample).
+                    (when new-size (%handle-datagram node buf new-size t)))
+                  ;; origin-auth tier (my-rk-id set) OR the RX pool could not be carved (arena exhausted): the
+                  ;; allocating decode-rtps-message — the deferred allocating fallback (mirrors the encode-side
+                  ;; receivers path); correct + byte-identical wire (a subseq of the recovered stream), self-heals when
+                  ;; the arena frees, never a per-datagram GC on the common pooled path.
+                  (let ((stream (dds.security:decode-rtps-message km (subseq vec 20 size)
+                                                                  :my-receiver-key-id my-rk-id :my-receiver-key my-rk)))
+                    (when (and stream (<= (+ 20 (length stream)) cap))
+                      (replace vec stream :start1 20)
+                      (%handle-datagram node buf (+ 20 (length stream)) t)))))))
         (return-from %handle-datagram t)))   ; SRTPS datagram: decoded+re-dispatched, or dropped (fail-closed)
     (dds.rtps.message:dispatch-message
      cursor
@@ -1355,9 +1612,25 @@
           ;; wrapped user bracket IS delivered.
           (let ((start (- (dds.core.buffer:cursor-position c) 4)))   ; SEC_PREFIX submessage-header start
             (when (and (>= start 0) (> size start))
-              (let ((bracket (make-array (- size start) :element-type '(unsigned-byte 8))))
-                (replace bracket (dds.core.buffer:octet-buffer-vec buf) :start2 start :end2 size)
-                (%on-secure-submessage node src-prefix bracket enforce-rtps)))))
+              ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5 (ZA-2): copy [SEC_PREFIX,datagram-end) — the decode INPUT — into a
+              ;; POOLED per-thread bracket buffer (BRACKET-RX-POOL, DISTINCT from the SECURE-RX decode-OUTPUT pool
+              ;; %on-user-secure-submessage opens into), replacing the pre-T5 per-bracket (make-array (- size start)).
+              ;; %on-secure-submessage consumes the bracket SYNCHRONOUSLY (builtin secure-SEDP/PVMS AND user metadata
+              ;; paths) before the next bracket is extracted, and the recovered plaintext is never itself a SEC_PREFIX,
+              ;; so a per-thread reused bracket buffer is safe (no nested bracket borrow). Runtime pool exhaustion ->
+              ;; %with-bracket-rx-scratch NIL -> a fail-closed DROP (RESOURCE_LIMITS, never a GC fallback; NFR-MEM);
+              ;; a not-carved pool (arena exhausted) OR an oversized bracket -> the allocating make-array fallback
+              ;; (byte-identical to the pre-T5 path; correct; no false-REJECT; self-heals when the arena frees).
+              (let* ((blen (- size start))
+                     (pool (%ensure-bracket-rx-pool node)))
+                (if (and pool (<= blen +srtps-scratch-datagram-bytes+))
+                    (%with-bracket-rx-scratch (br node)
+                      (replace (dds.core.buffer:octet-buffer-vec br) (dds.core.buffer:octet-buffer-vec buf)
+                               :start2 start :end2 size)
+                      (%on-secure-submessage node src-prefix (dds.core.buffer:octet-buffer-vec br) blen enforce-rtps))
+                    (let ((bracket (make-array blen :element-type '(unsigned-byte 8))))
+                      (replace bracket (dds.core.buffer:octet-buffer-vec buf) :start2 start :end2 size)
+                      (%on-secure-submessage node src-prefix bracket blen enforce-rtps)))))))
          ((= id dds.rtps.message:+submsg-heartbeat+)
           (let ((pos (dds.core.buffer:cursor-position c)))
             (multiple-value-bind (rid wid first last hcount hfinal hlive)
@@ -1490,6 +1763,21 @@
   (when (disc-node-rx-tx-msg node)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (disc-node-rx-tx-msg node)))
     (setf (disc-node-rx-tx-msg node) nil))
+  (when (disc-node-secure-rx-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T3(ZA-2) review: free the SRTPS RX decode pool's static buffers AFTER every receiver thread is joined (no live borrow)
+    (dds.core.arena:teardown-arena (disc-node-secure-rx-arena node))
+    (setf (disc-node-secure-rx-arena node) nil (disc-node-secure-rx-pool node) nil))
+  (when (disc-node-bracket-rx-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5(ZA-2): free the RX SEC_PREFIX-bracket pool's static buffers AFTER every receiver thread is joined (no live borrow)
+    (dds.core.arena:teardown-arena (disc-node-bracket-rx-arena node))
+    (setf (disc-node-bracket-rx-arena node) nil (disc-node-bracket-rx-pool node) nil))
+  (when (disc-node-key-id-rx-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5(ZA-2): free the RX key_id scratch pool's static buffers AFTER every receiver thread is joined (no live borrow)
+    (dds.core.arena:teardown-arena (disc-node-key-id-rx-arena node))
+    (setf (disc-node-key-id-rx-arena node) nil (disc-node-key-id-rx-pool node) nil))
+  (when (disc-node-send-scratch-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T3: free the SRTPS send-scratch pool's static buffers AFTER every sender/receiver thread is joined (no live borrow)
+    (dds.core.arena:teardown-arena (disc-node-send-scratch-arena node))
+    (setf (disc-node-send-scratch-arena node) nil (disc-node-send-scratch-pool node) nil))
+  (when (disc-node-submsg-scratch-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T4: free the metadata_protection submessage-scratch pool's static buffers AFTER every sender thread is joined (no live borrow)
+    (dds.core.arena:teardown-arena (disc-node-submsg-scratch-arena node))
+    (setf (disc-node-submsg-scratch-arena node) nil (disc-node-submsg-scratch-pool node) nil))
   (when (disc-node-payload-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: free the secured-payload pool's static buffers AFTER every sender/receiver thread is joined (no live acquire/release)
     (dds.core.arena:teardown-arena (disc-node-payload-arena node))
     (setf (disc-node-payload-arena node) nil))

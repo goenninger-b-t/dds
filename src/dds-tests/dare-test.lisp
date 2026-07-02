@@ -189,6 +189,79 @@
         (dds.pal:free-static pt-out))
       (dds.pal:free-static out) (dds.pal:free-static nonce-s) (dds.pal:free-static pt-s))
 
+    ;; GMAC-into (SIGN, §9.5.3.3.4.3): pt-len=0 writes tag-only, zero ciphertext bytes.
+    ;; Reference: allocating aes-256-gcm-seal(key,nonce,aad,empty-pt) — byte-identical by contract.
+    ;; Overlap-out safety: EVP reads AAD (EncryptUpdate) before GET_TAG writes the tag;
+    ;; sequential EVP call order means aad-ptr / out-SAP aliasing is safe.
+    (let* ((empty-pt  (make-array 0 :element-type '(unsigned-byte 8)))
+           (ref-gmac  (nth-value 1 (dds.dare:aes-256-gcm-seal key nonce aad empty-pt)))
+           (gout      (dds.pal:alloc-static 16))
+           (gns       (dds.pal:alloc-static 12)))
+      (replace gns nonce)
+      ;; seal-into GMAC: ct-off=0, pt-len=0 => 0 CT bytes; tag-off=0 => tag at gout[0..16]
+      (dds.dare:aes-256-gcm-seal-into gout 0 0 key gns 0 aad empty-pt 0 0)
+      (%check :aes-gcm-gmac-into-tag
+              (equalp (subseq gout 0 16) ref-gmac)
+              (format nil "GMAC-into: tag mismatch; got ~{~2,'0x~^ ~}; want ~{~2,'0x~^ ~}"
+                      (coerce (subseq gout 0 16) 'list) (coerce ref-gmac 'list)))
+      ;; open-into GMAC verify: ct-len=0, correct tag -> T
+      (let ((gpto (dds.pal:alloc-static 1)))
+        (%check :aes-gcm-gmac-open-into-ok
+                (eq t (dds.dare:aes-256-gcm-open-into gpto 0 key gns 0 aad gout 0 0 gout 0))
+                "GMAC open-into: must return T for correct tag")
+        ;; tamper tag byte -> fail-closed NIL
+        (setf (aref gout 0) (logxor (aref gout 0) 1))
+        (%check :aes-gcm-gmac-open-into-tamper
+                (null (dds.dare:aes-256-gcm-open-into gpto 0 key gns 0 aad gout 0 0 gout 0))
+                "GMAC open-into: tampered tag must return NIL (fail-closed)")
+        (dds.pal:free-static gpto))
+      ;; overlap-out case: ov-out[0..20] = AAD data, tag at ov-out[20..36]
+      ;; simulates the ZA-2 SIGN core where the verbatim region lives in the same buffer as the tag
+      (let* ((ov-out (dds.pal:alloc-static 36))
+             (ov-ns  (dds.pal:alloc-static 12)))
+        (replace ov-ns nonce)
+        (replace ov-out aad)
+        (dds.dare:aes-256-gcm-seal-into ov-out 0 20 key ov-ns 0 aad empty-pt 0 0)
+        (%check :aes-gcm-gmac-overlap-out
+                (equalp (subseq ov-out 20 36) ref-gmac)
+                (format nil "GMAC overlap-out: tag mismatch; got ~{~2,'0x~^ ~}; want ~{~2,'0x~^ ~}"
+                        (coerce (subseq ov-out 20 36) 'list) (coerce ref-gmac 'list)))
+        (dds.pal:free-static ov-out)
+        (dds.pal:free-static ov-ns))
+      (dds.pal:free-static gout)
+      (dds.pal:free-static gns))
+
+    ;; AAD-region (ZA-2 review fix): open-into with aad-off+aad-len selecting a sub-slice of a larger
+    ;; buffer must be byte-identical to the full-vector call; proves the region path is correct and
+    ;; backward-compatible (NIST SP 800-38D Appendix B TC16 key/nonce/pt/aad/ct/tag reused).
+    (let* ((padded (let ((v (make-array (+ 5 20 3) :element-type '(unsigned-byte 8))))
+                     (replace v aad :start1 5)  ; embed the 20-octet NIST AAD at offset 5 in a 28-byte envelope
+                     v))
+           (ns2    (dds.pal:alloc-static 12))
+           (pt2    (dds.pal:alloc-static 60))
+           (enc    (dds.pal:alloc-static 76)))  ; ct(60) || tag(16)
+      (replace ns2 nonce)
+      (replace pt2 pt)
+      (dds.dare:aes-256-gcm-seal-into enc 0 60 key ns2 0 aad pt2 0 60)  ; seal under the full AAD
+      (let ((pt-r (dds.pal:alloc-static 60)))
+        ;; aad-off=5 aad-len=20 -> padded[5..25] = the real AAD -> must succeed + plaintext byte-exact
+        (%check :aes-gcm-open-into-aad-region-ok
+                (eq t (dds.dare:aes-256-gcm-open-into pt-r 0 key ns2 0 padded enc 0 60 enc 60 5 20))
+                "open-into AAD-region [5,+20): must return T for correct aad sub-slice (NIST TC16)")
+        (%check :aes-gcm-open-into-aad-region-rt
+                (equalp pt-r pt)
+                (format nil "open-into AAD-region: plaintext must match NIST TC16; first 8 B: ~{~2,'0x~^ ~}"
+                        (coerce (subseq pt-r 0 8) 'list)))
+        ;; aad-off=0 -> padded[0..20] are zero-padding, NOT the real AAD -> auth failure (fail-closed)
+        (%check :aes-gcm-open-into-aad-region-mismatch
+                (null (dds.dare:aes-256-gcm-open-into pt-r 0 key ns2 0 padded enc 0 60 enc 60 0 20))
+                "open-into AAD-region: wrong aad-off (zero-padded prefix) must return NIL (fail-closed)")
+        (%check :aes-gcm-open-into-aad-region-mismatch-wiped
+                (every #'zerop pt-r)
+                "open-into AAD-region: auth failure must leave pt-r region zeroed (no leak)")
+        (dds.pal:free-static pt-r))
+      (dds.pal:free-static enc) (dds.pal:free-static pt2) (dds.pal:free-static ns2))
+
     t))
 
 (defun* run-dare-ml-kem-kat-test ()

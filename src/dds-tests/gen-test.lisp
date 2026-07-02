@@ -500,6 +500,10 @@
                             (- pub-sec pub-plain) (/ 65536.0 npub)))
             (%check :zero-alloc-secure-live-rx (< rx-wrap 1.0)
                     (format nil "live secured RECEIVE loan wrapper must be zero-alloc; measured ~,4f B/sample" rx-wrap))))))
+    ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5 (ZA-2): the LIVE submessage (metadata_protection) + whole-RTPS (rtps_protection)
+    ;; dataplane — SEND + RECEIVE each add 0 B/sample over the non-secured baseline (SBCL-asserted; Clasp smokes) +
+    ;; pool-exhaustion fail-closes rather than GC-falling-back. Runs on both impls (self-guards AES-GCM availability).
+    (dds.disc:run-secured-dataplane-mem-test)
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ptout))
     t))

@@ -43,15 +43,24 @@
 
 ;;; --- inbound: SEC_PREFIX bracket discriminator + receive ---
 
-(defun* %secure-bracket-key-id (bracket)
-    (function ((simple-array (unsigned-byte 8) (*))) (or null (simple-array (unsigned-byte 8) (4))))
-  "The 4-octet §9.5.3.3.1 CryptoHeader transformation_key_id of a SEC_PREFIX bracket BRACKET, at offset
-   [8,12): the 4-octet SEC_PREFIX SubmessageHeader (RTPS 2.5 §9.4.5.1) + the CryptoHeader's
-   transformation_kind[4] then transformation_key_id[4] (the same offset T8's %pvms-wire-session-id pins
-   for session_id at [12,16)). Returns a FRESH 4-octet copy, or NIL when BRACKET is too short to hold it
-   — a fail-closed bounds-check before any trust in wire data (NFR-SEC-POSTURE, even at (safety 0))."
-  (when (>= (length bracket) 12)
-    (subseq bracket 8 12)))
+(defun* %secure-bracket-key-id-into (out bracket bracket-len)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)) fixnum)
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "Copy the 4-octet §9.5.3.3.1 CryptoHeader transformation_key_id of the SEC_PREFIX bracket in BRACKET[0,BRACKET-LEN)
+   — at offset [8,12): the 4-octet SEC_PREFIX SubmessageHeader (RTPS 2.5 §9.4.5.1) + the CryptoHeader's
+   transformation_kind[4] then transformation_key_id[4] (the same offset T8's %pvms-wire-session-id pins for
+   session_id at [12,16)) — INTO the caller-provided OUT (which MUST be EXACTLY 4 octets so the equalp-keyed key_id
+   resolvers hash the whole vector, not stale trailing octets) and return OUT, or NIL when BRACKET-LEN is too short to
+   hold it (a fail-closed bounds-check before any trust in wire data; NFR-SEC-POSTURE, even at (safety 0)). The
+   zero-alloc twin of the pre-T5 %secure-bracket-key-id (which subseq'd a fresh 4-octet copy per bracket): the caller
+   (%on-secure-submessage) passes a per-thread 4-octet buffer borrowed from the KEY-ID-RX pool (%with-key-id-rx-scratch)
+   so the RECEIVE key-id lookup conses nothing per bracket (WP-DDS-SECURITY-ZEROALLOC-AEAD T5 / ZA-2). The equalp-keyed
+   key_id resolvers (cm-*-by-key-id) hash + compare OUT without retaining it, so a reused pooled OUT is safe. BRACKET-LEN
+   (not (length BRACKET)) is authoritative — BRACKET may be a longer POOLED buffer whose octets past BRACKET-LEN are
+   stale from a prior bracket."
+  (when (>= bracket-len 12)
+    (replace out bracket :start1 0 :end1 4 :start2 8 :end2 12)
+    out))
 
 (defun* %secure-reader-eid-for-writer (writer-eid)
     (function ((unsigned-byte 32)) (or null (unsigned-byte 32)))
@@ -173,13 +182,15 @@
             (t nil))))))   ; unknown inner id -> drop (fail-closed)
   t)
 
-(defun* %on-secure-submessage (node src-prefix bracket enforce-rtps)
-    (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*)) t) t)
-  "Receiver-thread DISPATCH for ONE inbound SEC_PREFIX...SEC_POSTFIX submessage-protection bracket from
-   SRC-PREFIX (DDS-Security 1.1 §8.5.1.7). The SAME submessage id (0x31) carries the reliable PVMS crypto-token
+(defun* %on-secure-submessage (node src-prefix bracket bracket-len enforce-rtps)
+    (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*)) fixnum t) t)
+  "Receiver-thread DISPATCH for ONE inbound SEC_PREFIX...SEC_POSTFIX submessage-protection bracket in
+   BRACKET[0,BRACKET-LEN) from SRC-PREFIX (DDS-Security 1.1 §8.5.1.7) — BRACKET may be a longer POOLED buffer
+   (WP-DDS-SECURITY-ZEROALLOC-AEAD T5 / ZA-2: %handle-datagram copies the bracket into a per-thread BRACKET-RX pool
+   buffer), so BRACKET-LEN — not (length BRACKET) — bounds it. The SAME submessage id (0x31) carries the reliable PVMS crypto-token
    exchange (T7), the secure SEDP DiscoveredWriter/ReaderData (T9), AND the secure participant-message (liveliness)
    + secure SPDP re-announce (T11), so disambiguate by the wire §9.5.3.3.1 CryptoHeader transformation_key_id
-   (%secure-bracket-key-id): if the installed secure-builtin DECODE resolver maps it to a remote EntityCrypto ->
+   (%secure-bracket-key-id-into): if the installed secure-builtin DECODE resolver maps it to a remote EntityCrypto ->
    %on-secure-builtin (which decodes then routes by the recovered inner writerId to SEDP-match / liveliness /
    record-participant, each verifying its own writerId); else -> %on-volatile-secure (PVMS, which resolves its
    §9.5.3.1 bootstrap KM by SRC-PREFIX — that KM's sender_key_id is all-zeros and never lands in the EntityCrypto
@@ -197,51 +208,109 @@
    receiver descriptor (key_id . key) for this bracket's channel via SECURE-SEDP-DECODE-RECEIVER-KM — which maps the
    wire key_id -> the remote sender's entity-id -> the matching local reader's receiver key, covering EVERY secure
    builtin tier (SEDP/PM/SPDP), NIL when origin-auth is not in effect — and pass it to %on-secure-builtin so the
-   receiver-specific MAC is verified (§9.5.3.3.4.3). NIL -> no origin-auth verification (the common_mac alone governs)."
-  (let* ((key-id   (%secure-bracket-key-id bracket))
-         (user-fn  (disc-node-user-submessage-decode node))
-         (ukm      (and user-fn key-id (funcall user-fn key-id))))
-    (if ukm
-        ;; Slice 5: a USER-endpoint bracket (metadata_protection, §8.5.1.7-.9) — its key_id resolved to a remote
-        ;; USER EntityCrypto (not a secure builtin). T10 review fix-1: DROP a BARE (non-SRTPS-wrapped) user
-        ;; bracket when rtps_protection is REQUIRED from this :keyed source (ENFORCE-RTPS) — the forgeable
-        ;; un-wrapped framing the §8.5.1.10-.12 enforcement closes; ENFORCE-RTPS is NIL on the legitimate
-        ;; post-SRTPS re-dispatch (rtps-unwrapped=t), so a properly wrapped bracket IS decoded + re-dispatched.
-        (unless enforce-rtps
-          (%on-user-secure-submessage node src-prefix bracket ukm))
-        (let* ((resolver (disc-node-secure-sedp-decode-km node))
-               (recvres  (disc-node-secure-sedp-decode-receiver-km node))
-               (km       (and resolver key-id (funcall resolver key-id))))
-          (if km
-              (let ((rd (and recvres key-id (funcall recvres key-id))))   ; (key_id . key) | nil
-                (%on-secure-builtin node src-prefix bracket km (car rd) (cdr rd)))
-              (%on-volatile-secure node src-prefix bracket)))))
+   receiver-specific MAC is verified (§9.5.3.3.4.3). NIL -> no origin-auth verification (the common_mac alone governs).
+   ZERO-ALLOC (WP-DDS-SECURITY-ZEROALLOC-AEAD T5 / ZA-2): the wire key_id is read into a per-thread 4-octet buffer
+   borrowed from the KEY-ID-RX pool (%with-key-id-rx-scratch; a dynamic-extent stack array does NOT stack-allocate for a
+   specialized (unsigned-byte 8) array on this SBCL) via %secure-bracket-key-id-into — no per-bracket subseq — and the
+   equalp-keyed resolvers hash/compare it without retaining, so the USER metadata_protection route (BRACKET + BRACKET-LEN
+   passed BY OFFSET to %on-user-secure-submessage, which decodes into a pooled SECURE-RX buffer) conses ~0 GC-heap
+   B/bracket. Runtime key_id-pool EXHAUSTION -> the borrow is NIL -> a fail-closed drop; a not-carved pool (arena
+   exhausted) -> a heap 4-array fallback (byte-identical). The BUILTIN secure-SEDP / PVMS routes are the allocating
+   control-plane (discovery, not the per-sample data path): they take an exact-length (subseq BRACKET 0 BRACKET-LEN),
+   preserving their prior exact-vector input — the pre-T5 per-bracket alloc simply moves here from %handle-datagram's
+   make-array, net-neutral on the control plane and REMOVED from the user data plane."
+  (flet ((dispatch (kid-buf)
+           (let* ((key-id   (%secure-bracket-key-id-into kid-buf bracket bracket-len))
+                  (user-fn  (disc-node-user-submessage-decode node))
+                  (ukm      (and user-fn key-id (funcall user-fn key-id))))
+             (if ukm
+                 ;; Slice 5: a USER-endpoint bracket (metadata_protection, §8.5.1.7-.9) — its key_id resolved to a remote
+                 ;; USER EntityCrypto (not a secure builtin). T10 review fix-1: DROP a BARE (non-SRTPS-wrapped) user
+                 ;; bracket when rtps_protection is REQUIRED from this :keyed source (ENFORCE-RTPS) — the forgeable
+                 ;; un-wrapped framing the §8.5.1.10-.12 enforcement closes; ENFORCE-RTPS is NIL on the legitimate
+                 ;; post-SRTPS re-dispatch (rtps-unwrapped=t), so a properly wrapped bracket IS decoded + re-dispatched.
+                 ;; ZA-2: BRACKET + BRACKET-LEN BY OFFSET (no subseq) — the zero-alloc data-plane receive.
+                 (unless enforce-rtps
+                   (%on-user-secure-submessage node src-prefix bracket bracket-len ukm))
+                 (let* ((resolver (disc-node-secure-sedp-decode-km node))
+                        (recvres  (disc-node-secure-sedp-decode-receiver-km node))
+                        (km       (and resolver key-id (funcall resolver key-id))))
+                   ;; BUILTIN secure-SEDP / PVMS control-plane (allocating): an exact-length (subseq BRACKET 0 BRACKET-LEN)
+                   ;; preserves the pre-T5 exact-vector input (the make-array moves here from %handle-datagram, net-neutral).
+                   (if km
+                       (let ((rd (and recvres key-id (funcall recvres key-id))))   ; (key_id . key) | nil
+                         (%on-secure-builtin node src-prefix (subseq bracket 0 bracket-len) km (car rd) (cdr rd)))
+                       (%on-volatile-secure node src-prefix (subseq bracket 0 bracket-len))))))
+           t))
+    ;; ZA-2: borrow the per-thread key_id scratch (alloc-free); a not-carved pool (arena exhausted) -> a heap 4-array
+    ;; fallback (byte-identical, self-heals). DISPATCH is called directly (no heap closure), so the common path conses 0.
+    (let ((pool (%ensure-key-id-rx-pool node)))
+      (if pool
+          (%with-key-id-rx-scratch (kb node) (dispatch (dds.core.buffer:octet-buffer-vec kb)))
+          (dispatch (make-array 4 :element-type '(unsigned-byte 8))))))
   t)
 
-(defun* %on-user-secure-submessage (node src-prefix bracket km)
+(defun* %on-user-secure-submessage (node src-prefix bracket bracket-len km)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))
-               dds.security:key-material) t)
-  "Receiver thread: a USER-endpoint SEC_PREFIX … SEC_POSTFIX submessage-protection bracket from SRC-PREFIX whose
+               fixnum dds.security:key-material) t)
+  "Receiver thread: a USER-endpoint SEC_PREFIX … SEC_POSTFIX submessage-protection bracket in BRACKET[0,BRACKET-LEN)
+   (BRACKET may be a longer POOLED buffer — WP-DDS-SECURITY-ZEROALLOC-AEAD T5 — so BRACKET-LEN bounds it) from SRC-PREFIX whose
    transformation_key_id resolved (USER-SUBMESSAGE-DECODE) to the remote user EntityCrypto KM (DDS-Security 1.1
-   §8.5.1.7-.9, metadata_protection). Recover the plaintext user submessage (decode-datawriter-submessage decodes
-   ANY §8.5 bracket — DataWriter or DataReader share one transform) and RE-DISPATCH it through the normal user
-   data path: synthesize a one-submessage datagram carrying SRC-PREFIX's RTPS Header (so %source-prefix keys the
-   sender correctly, §9.4.4) followed by the recovered submessage, and feed it to %handle-datagram with
-   RTPS-UNWRAPPED set — the bracket's AEAD already authenticated it, so the plain-user-DATA rtps_protection
-   enforcement must NOT re-drop it. So a recovered DATA reaches the user reader (its payload data_protection-decoded
-   by the crypto-transform on-data path), a HEARTBEAT/ACKNACK/GAP drives the user reliable engine — IDENTICAL to a
-   plain user submessage, only the wire framing differed. FAIL-CLOSED (NFR-SEC-POSTURE): an undecryptable/malformed/
-   truncated/tampered bracket -> a silent DROP (no synthetic dispatch, no signal out, no plaintext on failure). The
-   off-heap synthetic-datagram scratch is freed before return."
-  (let ((plain (dds.security:decode-datawriter-submessage km bracket)))
-    (when (and plain (>= (length plain) 4))
-      (let ((buf (dds.core.buffer:make-octet-buffer (+ 20 (length plain)))))
-        (unwind-protect
-             (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
-               (dds.rtps.message:write-header mc src-prefix)               ; 20-octet RTPS Header w/ SRC prefix
-               (dds.core.buffer:put-octets mc plain 0 (length plain))
-               (%handle-datagram node buf (dds.core.buffer:cursor-position mc) t))   ; t = rtps-unwrapped
-          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))
+   §8.5.1.7-.9, metadata_protection). Recover the plaintext user submessage (decode-datawriter-submessage-into decodes
+   ANY §8.5 bracket — DataWriter or DataReader share one transform) and RE-DISPATCH it through the normal user data
+   path: synthesize a one-submessage datagram carrying SRC-PREFIX's RTPS Header (so %source-prefix keys the sender
+   correctly, §9.4.4) followed by the recovered submessage, and feed it to %handle-datagram with RTPS-UNWRAPPED set —
+   the bracket's AEAD already authenticated it, so the plain-user-DATA rtps_protection enforcement must NOT re-drop it.
+   So a recovered DATA reaches the user reader (its payload data_protection-decoded by the crypto-transform on-data
+   path), a HEARTBEAT/ACKNACK/GAP drives the user reliable engine — IDENTICAL to a plain user submessage, only the wire
+   framing differed.
+   ZERO-ALLOC (WP-DDS-SECURITY-ZEROALLOC-AEAD T4 / ZA-2): the synthetic datagram is built in a REUSED per-node RX buffer
+   borrowed from the SECURE-RX pool (%with-secure-rx-scratch over %ensure-secure-rx-pool — the SAME pool the SRTPS
+   unwrap uses, which by then has RELEASED its borrow: the SRTPS re-dispatch happens OUTSIDE its %with-secure-rx-scratch
+   scope, so at most ONE RX buffer is held per receiver thread here), dropping the pre-ZA-2 per-call
+   (make-octet-buffer (+ 20 (length plain))). decode-datawriter-submessage-into writes the ENCRYPT plaintext straight
+   into the RX buffer at offset 20 (leaving room for the 20-octet header); SIGN moves the verbatim submessage into
+   [20,…) in place. CONCURRENCY: each receiver thread (unicast / multicast / SHMEM) gets a DISTINCT RX buffer, so the
+   decode->re-dispatch window never races (the T3(ZA-2) RX-pool fix). LIFETIME: the RX buffer is held across the
+   recursive %handle-datagram and released after — SAFE because the inner dispatch consumes the datagram SYNCHRONOUSLY
+   (the inner data_protection DATA copies its payload into its OWN distinct ZA-1 decode loan; the on-data hook copies
+   the payload region before returning — the very invariant the pre-ZA-2 code already relied on when it free-static'd
+   its buffer right after %handle-datagram), and the recovered submessage is a plain DATA/HEARTBEAT/ACKNACK/GAP, never
+   another SEC_PREFIX, so there is no further RX-pool borrow to nest. FAIL-CLOSED (NFR-SEC-POSTURE): an undecryptable /
+   malformed / truncated / tampered bracket, or a recovered datagram that would not fit the RX buffer -> a silent DROP
+   (no synthetic dispatch, no signal out, no plaintext on failure). If the RX pool could not be carved (arena exhausted)
+   the recover DEGRADES to the allocating decode-datawriter-submessage (correct, byte-identical), self-healing when the
+   arena frees."
+  (let ((pool (%ensure-secure-rx-pool node)))
+    (if pool
+        ;; ZA-2: decode the bracket INTO a distinct reused RX buffer at offset 20, prepend the RTPS Header, re-dispatch.
+        (%with-secure-rx-scratch (rx node)
+          (handler-case
+              (let ((vec (dds.core.buffer:octet-buffer-vec rx))
+                    (cap (dds.core.buffer:octet-buffer-capacity rx)))
+                (multiple-value-bind (data-len mode data-off postfix-off)
+                    (dds.security:decode-datawriter-submessage-into rx 20 km bracket 0 bracket-len)
+                  (declare (ignore postfix-off))
+                  (when (and data-len (>= data-len 4) (<= (+ 20 data-len) cap))
+                    (ecase mode
+                      (:encrypt nil)   ; plaintext already written into rx[20,20+data-len) by decode-into
+                      (:sign (replace vec bracket :start1 20 :end1 (+ 20 data-len)   ; verbatim region -> [20,…) in place
+                                      :start2 data-off :end2 (+ data-off data-len))))
+                    (let ((mc (dds.core.buffer:cursor rx :endianness :little)))
+                      (dds.rtps.message:write-header mc src-prefix))   ; 20-octet RTPS Header w/ SRC prefix at [0,20)
+                    (%handle-datagram node rx (+ 20 data-len) t))))   ; t = rtps-unwrapped (AEAD already authenticated)
+            (error () nil)))   ; decode / bounds failure -> fail-closed drop
+        ;; RX pool carve failed (arena exhausted): allocating fallback — correct + byte-identical, self-heals. An
+        ;; exact-length (subseq BRACKET 0 BRACKET-LEN) since BRACKET may be a longer pooled buffer (T5).
+        (let ((plain (dds.security:decode-datawriter-submessage km (subseq bracket 0 bracket-len))))
+          (when (and plain (>= (length plain) 4))
+            (let ((buf (dds.core.buffer:make-octet-buffer (+ 20 (length plain)))))
+              (unwind-protect
+                   (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
+                     (dds.rtps.message:write-header mc src-prefix)
+                     (dds.core.buffer:put-octets mc plain 0 (length plain))
+                     (%handle-datagram node buf (dds.core.buffer:cursor-position mc) t))
+                (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))))
   t)
 
 ;;; --- outbound: build + protect + announce a secure SEDP endpoint ---
@@ -969,6 +1038,177 @@
            t)
       (stop-node node-a) (stop-node node-b))))
 
+(defvar *za2-rx-ctx* nil
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T3(ZA-2) concurrency-test scratch: per-receiver-thread cons
+   (EXPECTED-PAYLOAD . MISMATCH-COUNT) the shared node-b ON-DATA hook checks each SRTPS re-dispatch delivery
+   against, to prove concurrent receiver threads never contaminate each other's RX decode sink. Bound per thread
+   inside run-rtps-protection-zeroalloc-test; NIL (ignored) otherwise. Test-internal, not an API symbol.")
+
+(defun* run-rtps-protection-zeroalloc-test ()
+    (function () (eql t))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T3 (ZA-2) + T3(ZA-2) review: the whole-RTPS (rtps_protection / SRTPS) dataplane is
+   ZERO-ALLOC and CONCURRENCY-SAFE — the SEND wrap borrows a per-node send-scratch pool + encode-rtps-message-into (no
+   per-datagram plain-region subseq, no →octets); the RX unwrap borrows a DISTINCT buffer per decode from a per-node RX
+   pool (SECURE-RX-POOL) and opens ENCRYPT plaintext into it via decode-rtps-message-into, so the concurrent unicast /
+   multicast / SHMEM receiver threads never share a decode sink. A is the sender; B the receiver holding A's
+   ParticipantCrypto. Asserts (ENCRYPT):
+     (a) ROUND-TRIP: a pooled-send SRTPS datagram (first submessage SRTPS_PREFIX 0x33, payload confidential) unwraps
+         through the pooled RX path and delivers the inner user DATA byte-EXACT — exercising BOTH rewired paths; the
+         send-scratch pool + SECURE-RX-POOL are carved (lazy) after the first wrap/unwrap.
+     (b) ZERO-ALLOC (send): a steady-state SRTPS wrap over the reused tx-msg + pooled scratch conses ~0 GC-heap
+         B/datagram (SBCL-exact via dds.pal:bytes-consed; Clasp reports 0 -> skip, NFR-PORT), vs the pre-rewire
+         subseq+encode-rtps-message path. The check is written to FAIL if the new wrap still allocates.
+     (c) EXHAUSTION: with the send-scratch pool fully drained, %maybe-wrap-srtps returns NIL (fail-closed drop,
+         RESOURCE_LIMITS backpressure) — never a GC fallback.
+     (d) CONCURRENCY (the review fix): N receiver threads each feeding their OWN distinct SRTPS-ENCRYPT datagram
+         through %handle-datagram recover ITS OWN plaintext — zero cross-thread contamination (this arm FAILS on the
+         pre-fix single shared RX buffer, verified RED before the fix). Plus a deterministic distinctness check: two
+         concurrent RX-pool borrows return distinct buffers.
+     (f) ZERO-ALLOC (RX): a steady-state pooled RX borrow + decode-rtps-message-into conses ~0 GC-heap B/datagram
+         (SBCL-exact; Clasp skip, NFR-PORT) — the pooled RX borrow adds no allocation over the pre-review single buffer.
+   Requires AES-GCM; skips gracefully if absent. Both impls (Clasp first)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [rtps-protection-zeroalloc] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-rtps-protection-zeroalloc-test t)))
+  (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 71))
+         (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 72))
+         (node-a (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+         (node-b (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+         (km-a (%secure-sedp-test-km 7 #x33))   ; A's ParticipantCrypto; B holds the SAME
+         (payload (map '(simple-array (unsigned-byte 8) (*)) #'char-code "ZEROALLOC-SRTPS!"))
+         (host "127.0.0.1") (port 7) (srtps-dg nil))
+    (unwind-protect
+         (progn
+           (setf (disc-node-rtps-protection-kind node-a) :encrypt
+                 (disc-node-rtps-protection-encode node-a)
+                 (lambda (dp) (declare (ignore dp)) (values km-a :encrypt '())))
+           ;; (a) ROUND-TRIP through the pooled send + pooled-RX path
+           (let ((cap nil))
+             (let ((buf (disc-node-tx-msg node-a)) (*datagram-sink* (lambda (dg) (setf cap dg))))
+               (%send-raw-buf node-a buf (%rtps-build-user-datagram node-a buf 1 payload) host port nil pb))
+             (assert (and (> (length cap) 20) (= (aref cap 20) dds.security:+submessage-srtps-prefix+)) ()
+                     "ZA-2 round-trip: the pooled send must produce an SRTPS datagram (first submessage SRTPS_PREFIX 0x33)")
+             (assert (not (search payload cap)) ()
+                     "ZA-2 round-trip: ENCRYPT must hide the user payload on the wire")
+             (assert (disc-node-send-scratch-pool node-a) ()
+                     "ZA-2: the per-node send-scratch pool must be carved (lazy) after the first wrap")
+             (let ((got nil))
+               (setf (disc-node-rtps-protection-decode node-b) (lambda (sp) (declare (ignore sp)) (values km-a nil nil))
+                     (disc-node-on-data node-b)
+                     (lambda (w sn b poff plen sp og os kh) (declare (ignore w sn sp og os kh))
+                       (setf got (subseq (dds.core.buffer:octet-buffer-vec b) poff (+ poff plen)))))
+               (%rtps-feed-datagram node-b cap)
+               (assert (and got (equalp got payload)) ()
+                       "ZA-2 round-trip: B must recover the inner user DATA byte-exact through the reused-RX decode-rtps-message-into path")
+               (assert (disc-node-secure-rx-pool node-b) ()
+                       "ZA-2: the per-node RX decode pool (SECURE-RX-POOL) must be carved (lazy) after the first unwrap")
+               (setf srtps-dg cap)))   ; keep a clean SRTPS datagram for the RX arms (cap is a fresh subseq; decode never mutates it)
+           ;; (a2) DISTINCTNESS (deterministic, T3(ZA-2) review): two concurrent RX-pool borrows return DISTINCT buffers,
+           ;; so receiver threads decoding at once never share a sink — the mechanism that closes the race.
+           (let* ((pool (%ensure-secure-rx-pool node-b))
+                  (b1 (dds.core.arena:pool-acquire pool))
+                  (b2 (dds.core.arena:pool-acquire pool)))
+             (unwind-protect
+                  (assert (and b1 b2 (not (eq b1 b2))) ()
+                          "ZA-2 distinctness: the RX pool must hand two concurrent borrows DISTINCT buffers (no shared decode sink)")
+               (when b2 (dds.core.arena:pool-release pool b2))
+               (when b1 (dds.core.arena:pool-release pool b1))))
+           ;; (b) ZERO-ALLOC bytes-consed: before (subseq+encode-rtps-message) vs after (%maybe-wrap-srtps), reused buffers
+           (let* ((buf (disc-node-tx-msg node-a))
+                  (vec (dds.core.buffer:octet-buffer-vec buf))
+                  (plen (%rtps-build-user-datagram node-a buf 1 payload))
+                  (plain-copy (subseq vec 0 plen))   ; the plaintext datagram to restore before each wrap
+                  (iters 4000))
+             (dds.security:encode-rtps-message km-a :encrypt (subseq vec 20 plen))   ; warm the old path
+             (replace vec plain-copy :end2 plen) (%maybe-wrap-srtps node-a buf plen pb)   ; warm the new path
+             (let ((old-b (let ((before (dds.pal:bytes-consed)))
+                            (dotimes (i iters)
+                              (dds.security:encode-rtps-message km-a :encrypt (subseq vec 20 plen)))   ; the pre-rewire allocating path
+                            (- (dds.pal:bytes-consed) before)))
+                   (new-b (let ((before (dds.pal:bytes-consed)))
+                            (dotimes (i iters)
+                              (replace vec plain-copy :end2 plen)       ; restore the plaintext (into the reused buf; 0 cons)
+                              (%maybe-wrap-srtps node-a buf plen pb))   ; the pooled zero-alloc wrap
+                            (- (dds.pal:bytes-consed) before))))
+               (let ((old-per (/ (float old-b) iters)) (new-per (/ (float new-b) iters)))
+                 (format t "~&  [rtps-protection-zeroalloc] SRTPS wrap bytes/datagram: before(subseq+encode-rtps-message)=~,2f  after(pooled -into)=~,2f (~d iters)~%"
+                         old-per new-per iters)
+                 (if (zerop (dds.pal:bytes-consed))
+                     (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — SRTPS wrap alloc not measurable~%")
+                     (progn
+                       (assert (< new-per 1.0) ()
+                               "ZA-2: the pooled SRTPS wrap must cons ~~0 GC-heap B/datagram; got ~,2f (would FAIL on the pre-rewire subseq+encode-rtps-message path, ~,2f)" new-per old-per)
+                       (assert (< new-per (* 0.25 old-per)) ()
+                               "ZA-2: the pooled wrap (~,2f B) must cons far less than the old subseq+encode path (~,2f B)" new-per old-per))))))
+           ;; (c) EXHAUSTION -> fail-closed NIL (never a GC fallback)
+           (let* ((buf (disc-node-tx-msg node-a))
+                  (pool (disc-node-send-scratch-pool node-a))
+                  (plen (%rtps-build-user-datagram node-a buf 1 payload))   ; buf holds a fresh plaintext datagram
+                  (held '()))
+             (loop for b = (dds.core.arena:pool-acquire pool) while b do (push b held))   ; drain the pool
+             (unwind-protect
+                  (assert (null (%maybe-wrap-srtps node-a buf plen pb)) ()
+                          "ZA-2 exhaustion: %maybe-wrap-srtps must return NIL (fail-closed drop) when the send-scratch pool is exhausted — never a GC fallback")
+               (dolist (b held) (dds.core.arena:pool-release pool b))))
+           ;; (d) CONCURRENCY — NO CROSS-CONTAMINATION across the receiver threads that share node-b's RX decode sink
+           ;; (T3(ZA-2) review). NTHREADS threads each feed their OWN distinct (same-length) SRTPS-ENCRYPT datagram
+           ;; through %handle-datagram in a tight loop; the shared ON-DATA checks every re-dispatch delivery equals
+           ;; THAT thread's payload. On a single shared RX buffer the decode->copy-back window races (thread A copies
+           ;; B's just-decoded plaintext into A's datagram -> wrong-sample delivery); a distinct buffer per decode
+           ;; (the RX pool) closes it. The 0-mismatch assertion FAILS on the pre-fix single-buffer code.
+           (let* ((nthreads 4) (iters 3000)
+                  (payloads (loop for k below nthreads
+                                  collect (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                                               (format nil "ZA2-CONCUR-T~d!!" k))))   ; distinct, all 16 octets
+                  (dgs (loop for p in payloads
+                             collect (let ((buf (disc-node-tx-msg node-a)) (out nil))
+                                       (let ((*datagram-sink* (lambda (dg) (setf out dg))))
+                                         (%send-raw-buf node-a buf (%rtps-build-user-datagram node-a buf 3 p) host port nil pb))
+                                       out)))
+                  (clock (dds.pal:make-lock "za2-concur")) (total-mismatch 0))
+             (setf (disc-node-rtps-protection-decode node-b) (lambda (sp) (declare (ignore sp)) (values km-a nil nil))
+                   (disc-node-on-data node-b)
+                   (lambda (w sn b poff plen sp og os kh) (declare (ignore w sn sp og os kh))
+                     (when *za2-rx-ctx*
+                       (let ((exp (car *za2-rx-ctx*)))   ; in-place compare, no per-delivery cons
+                         (unless (and (= plen (length exp))
+                                      (null (mismatch exp (dds.core.buffer:octet-buffer-vec b) :start2 poff :end2 (+ poff plen))))
+                           (incf (cdr *za2-rx-ctx*)))))))
+             (%rtps-feed-datagram node-b (first dgs))   ; carve node-b's RX sink before the fan-out
+             (let ((threads (loop for p in payloads for dg in dgs
+                                  collect (dds.pal:spawn
+                                           (let ((mp p) (mdg dg))
+                                             (lambda ()
+                                               (let ((*za2-rx-ctx* (cons mp 0)))
+                                                 (dotimes (i iters) (%rtps-feed-datagram node-b mdg))
+                                                 (dds.pal:with-lock (clock) (incf total-mismatch (cdr *za2-rx-ctx*))))))
+                                           :name "za2-concur"))))
+               (dolist (th threads) (dds.pal:join th)))
+             (assert (zerop total-mismatch) ()
+                     "ZA-2 concurrency: ~d cross-thread RX-buffer contaminations over ~d threads x ~d SRTPS-ENCRYPT decodes — concurrent receiver threads must NOT share a mutable decode sink" total-mismatch nthreads iters))
+           ;; (f) ZERO-ALLOC (RX): a steady-state pooled RX borrow + decode-rtps-message-into over the reused SRTPS
+           ;; ciphertext conses ~0 GC-heap B/datagram — the pooled borrow (O(1) index ops under the RX lock) adds no
+           ;; allocation over the pre-review single reused buffer. SBCL-exact; Clasp bytes-consed=0 -> skip (NFR-PORT).
+           (when srtps-dg
+             (%ensure-secure-rx-pool node-b)
+             (let ((slen (- (length srtps-dg) 20)) (iters 4000))
+               (%with-secure-rx-scratch (rx node-b)                       ; warm
+                 (dds.security:decode-rtps-message-into rx 0 km-a srtps-dg 20 slen))
+               (let ((rx-b (let ((before (dds.pal:bytes-consed)))
+                             (dotimes (i iters)
+                               (%with-secure-rx-scratch (rx node-b)
+                                 (dds.security:decode-rtps-message-into rx 0 km-a srtps-dg 20 slen)))
+                             (- (dds.pal:bytes-consed) before))))
+                 (let ((rx-per (/ (float rx-b) iters)))
+                   (format t "~&  [rtps-protection-zeroalloc] SRTPS RX unwrap (pooled borrow + decode-rtps-message-into) bytes/datagram: ~,2f (~d iters)~%" rx-per iters)
+                   (if (zerop (dds.pal:bytes-consed))
+                       (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — SRTPS RX alloc not measurable~%")
+                       (assert (< rx-per 1.0) ()
+                               "ZA-2: the pooled SRTPS RX unwrap must cons ~~0 GC-heap B/datagram; got ~,2f" rx-per))))))
+           t)
+      (stop-node node-a) (stop-node node-b))))
+
 (defun* run-user-submessage-protection-test ()
     (function () (eql t))
   "WP-DDS-SECURITY-FASTDDS-INTEROP (Slice 5): user-DATA submessage protection (metadata_protection_kind,
@@ -1122,6 +1362,354 @@
                      "user-submsg two-tier: metadata_protection + data_protection + non-4-aligned payload must round-trip byte-exact (was silently dropped)"))
            t)
       (stop-node node-a) (stop-node node-b))))
+
+(defun* %rtps-build-multi-user-datagram (node buf sns payloads)
+    (function (disc-node dds.core.buffer:octet-buffer list list) (integer 0))
+  "Build a plain datagram (20-octet RTPS Header §9.4.4 + one user-writer DATA submessage §9.4.5.4 per (SN, PAYLOAD)
+   pair drawn 1:1 from SNS/PAYLOADS) into BUF and return its length — the MULTI-submessage plaintext input the
+   metadata_protection send wrap protects bracket-by-bracket. Test helper (run-user-submessage-protection-zeroalloc-test)."
+  (let ((mc (dds.core.buffer:cursor buf :endianness :little)))
+    (dds.rtps.message:write-header mc (disc-node-guid-prefix node))
+    (loop for sn in sns for pl in payloads do
+      (dds.rtps.message:write-data mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node)
+                                   sn pl 0 (length pl)))
+    (dds.core.buffer:cursor-position mc)))
+
+(defun* run-user-submessage-protection-zeroalloc-test ()
+    (function () (eql t))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T4 (ZA-2): the metadata_protection (DDS-Security 1.1 §8.5.1.7-.9) user-submessage
+   dataplane is ZERO-ALLOC on BOTH the SEND multi-bracket wrap AND the RECEIVE re-dispatch. The SEND wrap borrows a
+   per-node submessage-scratch pool + the encode-datawriter/datareader-submessage-into cores (dropping the pre-ZA-2
+   per-datagram (make-octet-buffer (+ len 8192)) AND the per-submessage subseq, walking [20,LEN) BY OFFSET); the RECEIVE
+   re-dispatch decodes the bracket via decode-datawriter-submessage-into into a REUSED per-node SECURE-RX buffer
+   (dropping the pre-ZA-2 per-call make-octet-buffer + decode-datawriter-submessage →octets subseq). A is the sender; B
+   the receiver holding A's user-writer EntityCrypto (resolved by transformation_key_id). Deterministic, no auth
+   handshake (manual KMs, like run-user-submessage-protection-test). Asserts (both impls, Clasp first):
+     (a) ENCRYPT + SIGN ROUND-TRIP byte-exact through the pooled send + reused-RX re-dispatch (a single DATA) — the
+         payload is recovered byte-EXACT for BOTH modes (the -into cores are byte-identical to the allocating pair).
+     (b) MULTI-SUBMESSAGE: a datagram of THREE user DATA submessages is wrapped bracket-by-bracket + each recovered
+         byte-EXACT in order (the multi-bracket walk — the pre-ZA-2 per-submessage subseq path replaced by BY-OFFSET).
+     (c) BYTES-CONSED: the pooled SEND wrap AND the pooled RX decode-into each cons ~0 GC-heap B/datagram (SBCL-exact
+         via dds.pal:bytes-consed; Clasp reports 0 -> skip, NFR-PORT), FAR below the pre-rewire allocating path
+         (subseq + encode/decode-datawriter-submessage) — the < 1.0 assertion WOULD FAIL on the pre-rewire +8192/subseq code.
+     (d) EXHAUSTION: with the submessage-scratch pool drained, the SEND wrap returns NIL (fail-closed drop) — never a
+         GC fallback (RESOURCE_LIMITS backpressure; NFR-MEM).
+   Requires the AES-GCM primitive; skips gracefully if absent."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [user-submsg-zeroalloc] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-user-submessage-protection-zeroalloc-test t)))
+  (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 87))
+         (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 88))
+         (node-a (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+         (node-b (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+         (km-meta (%secure-sedp-test-km #x7a #x3c))   ; A's user-writer EntityCrypto; B holds the SAME (received A's token)
+         (kid     (dds.security:key-material-sender-key-id km-meta))
+         (payload (map '(simple-array (unsigned-byte 8) (*)) #'char-code "ZA2-USER-SUBMSG"))   ; 15 octets (non-4-aligned)
+         (host "127.0.0.1") (port 7))
+    (unwind-protect
+         (progn
+           ;; B decodes A's user brackets (key_id -> km-meta); no rtps_protection required -> the bare bracket IS delivered.
+           (setf (disc-node-user-submessage-decode node-b) (lambda (k) (when (equalp k kid) km-meta)))
+           ;; (a) ENCRYPT + SIGN round-trip byte-exact through the pooled send + reused-RX re-dispatch.
+           (dolist (kind '(:encrypt :sign))
+             (setf (disc-node-user-submessage-protection-kind node-a) kind
+                   (disc-node-user-submessage-encode node-a)
+                   (let ((k kind)) (lambda (writer-p) (declare (ignore writer-p)) (values km-meta k))))
+             (let ((cap nil) (got nil))
+               (let ((buf (disc-node-tx-msg node-a)) (*datagram-sink* (lambda (dg) (setf cap dg))))
+                 (%send-raw-buf node-a buf (%rtps-build-user-datagram node-a buf 1 payload) host port nil pb))
+               (assert (and (> (length cap) 20) (= (aref cap 20) dds.security:+submessage-sec-prefix+)) ()
+                       "ZA-2 user-submsg ~(~a~): the pooled send must emit a SEC_PREFIX bracket (0x31)" kind)
+               (setf (disc-node-on-data node-b)
+                     (lambda (w sn b poff plen sp og os kh) (declare (ignore w sn sp og os kh))
+                       (setf got (subseq (dds.core.buffer:octet-buffer-vec b) poff (+ poff plen)))))
+               (%rtps-feed-datagram node-b cap)
+               (assert (and got (equalp got payload)) ()
+                       "ZA-2 user-submsg ~(~a~): the pooled send + reused-RX re-dispatch must recover the payload byte-EXACT" kind)))
+           ;; (b) MULTI-SUBMESSAGE: three DATA submessages in one datagram, each wrapped + recovered byte-exact in order.
+           (setf (disc-node-user-submessage-protection-kind node-a) :encrypt
+                 (disc-node-user-submessage-encode node-a)
+                 (lambda (writer-p) (declare (ignore writer-p)) (values km-meta :encrypt)))
+           (let* ((pls (list (map '(simple-array (unsigned-byte 8) (*)) #'char-code "MULTI-ONE")
+                             (map '(simple-array (unsigned-byte 8) (*)) #'char-code "MULTI-TWO!!")
+                             (map '(simple-array (unsigned-byte 8) (*)) #'char-code "MULTI-THREE")))
+                  (cap nil) (recovered '()))
+             (let ((buf (disc-node-tx-msg node-a)) (*datagram-sink* (lambda (dg) (setf cap dg))))
+               (%send-raw-buf node-a buf (%rtps-build-multi-user-datagram node-a buf '(11 12 13) pls) host port nil pb))
+             (assert (and (> (length cap) 20) (= (aref cap 20) dds.security:+submessage-sec-prefix+)) ()
+                     "ZA-2 user-submsg multi: the pooled send must wrap the first DATA as a SEC_PREFIX bracket")
+             (setf (disc-node-on-data node-b)
+                   (lambda (w sn b poff plen sp og os kh) (declare (ignore w sn sp og os kh))
+                     (push (subseq (dds.core.buffer:octet-buffer-vec b) poff (+ poff plen)) recovered)))
+             (%rtps-feed-datagram node-b cap)
+             (setf recovered (nreverse recovered))
+             (assert (= (length recovered) 3) ()
+                     "ZA-2 user-submsg multi: all THREE wrapped DATA submessages must be recovered (got ~d)" (length recovered))
+             (assert (every #'equalp recovered pls) ()
+                     "ZA-2 user-submsg multi: each recovered DATA payload must be byte-EXACT + in order"))
+           ;; (c) BYTES-CONSED: pooled SEND wrap + pooled RX decode-into each ~0, vs the allocating subseq+encode/decode.
+           (setf (disc-node-user-submessage-protection-kind node-a) :encrypt
+                 (disc-node-user-submessage-encode node-a)
+                 (lambda (writer-p) (declare (ignore writer-p)) (values km-meta :encrypt)))
+           (%ensure-submsg-scratch-pool node-a) (%ensure-secure-rx-pool node-b)   ; warm the lazy carves (off the measure)
+           (let* ((buf (disc-node-tx-msg node-a))
+                  (vec (dds.core.buffer:octet-buffer-vec buf))
+                  (plen (%rtps-build-user-datagram node-a buf 1 payload))
+                  (plain-copy (subseq vec 0 plen))         ; the plaintext datagram, restored before each measured wrap
+                  (bracket nil) (iters 4000))
+             ;; capture ONE wrapped bracket (the RX decode input) — the SEC_PREFIX...SEC_POSTFIX rest of the wrapped datagram
+             (let ((newlen (%maybe-wrap-user-submessages node-a buf plen)))
+               (setf bracket (subseq vec 20 newlen)))
+             (replace vec plain-copy :end2 plen)           ; restore plaintext (the wrap mutated BUF in place)
+             (dds.security:encode-datawriter-submessage km-meta :encrypt (subseq vec 20 plen))   ; warm the old send path
+             (let ((send-old (let ((before (dds.pal:bytes-consed)))
+                               (dotimes (i iters)
+                                 (dds.security:encode-datawriter-submessage km-meta :encrypt (subseq vec 20 plen)))   ; pre-rewire: subseq + →octets
+                               (- (dds.pal:bytes-consed) before)))
+                   (send-new (let ((before (dds.pal:bytes-consed)))
+                               (dotimes (i iters)
+                                 (replace vec plain-copy :end2 plen)   ; restore plaintext into the reused buf (0 cons)
+                                 (%maybe-wrap-user-submessages node-a buf plen))   ; the pooled zero-alloc wrap
+                               (- (dds.pal:bytes-consed) before)))
+                   (slen (length bracket)))
+               (dds.security:decode-datawriter-submessage km-meta bracket)   ; warm the old RX path
+               (%with-secure-rx-scratch (rx node-b)                          ; warm the new RX path
+                 (dds.security:decode-datawriter-submessage-into rx 20 km-meta bracket 0 slen))
+               (let ((rx-old (let ((before (dds.pal:bytes-consed)))
+                               (dotimes (i iters)
+                                 (dds.security:decode-datawriter-submessage km-meta bracket))   ; pre-rewire: make-octet-buffer + →octets subseq
+                               (- (dds.pal:bytes-consed) before)))
+                     (rx-new (let ((before (dds.pal:bytes-consed)))
+                               (dotimes (i iters)
+                                 (%with-secure-rx-scratch (rx node-b)
+                                   (dds.security:decode-datawriter-submessage-into rx 20 km-meta bracket 0 slen)))   ; pooled borrow + into-decode
+                               (- (dds.pal:bytes-consed) before))))
+                 (let ((so (/ (float send-old) iters)) (sn (/ (float send-new) iters))
+                       (ro (/ (float rx-old) iters)) (rn (/ (float rx-new) iters)))
+                   (format t "~&  [user-submsg-zeroalloc] SEND wrap bytes/datagram: before(subseq+encode-datawriter-submessage)=~,2f  after(pooled -into)=~,2f (~d iters)~%" so sn iters)
+                   (format t "  [user-submsg-zeroalloc] RX decode bytes/bracket: before(decode-datawriter-submessage)=~,2f  after(pooled decode-into)=~,2f~%" ro rn)
+                   (if (zerop (dds.pal:bytes-consed))
+                       (format t "  [skip] dds.pal:bytes-consed is 0 on this impl (Clasp NFR-PORT gap) — metadata_protection alloc not measurable~%")
+                       (progn
+                         (assert (< sn 1.0) ()
+                                 "ZA-2: the pooled metadata_protection SEND wrap must cons ~~0 GC-heap B/datagram; got ~,2f (would FAIL on the pre-rewire +8192/subseq path, ~,2f)" sn so)
+                         (assert (< sn (* 0.25 so)) ()
+                                 "ZA-2: the pooled SEND wrap (~,2f B) must cons far less than the old subseq+encode path (~,2f B)" sn so)
+                         (assert (< rn 1.0) ()
+                                 "ZA-2: the pooled metadata_protection RX decode must cons ~~0 GC-heap B/bracket; got ~,2f (would FAIL on the pre-rewire decode+subseq path, ~,2f)" rn ro)
+                         (assert (< rn (* 0.25 ro)) ()
+                                 "ZA-2: the pooled RX decode (~,2f B) must cons far less than the old decode-datawriter-submessage path (~,2f B)" rn ro))))))
+             (replace vec plain-copy :end2 plen))          ; leave BUF holding the plaintext datagram
+           ;; (d) EXHAUSTION -> fail-closed NIL (never a GC fallback)
+           (let* ((buf (disc-node-tx-msg node-a))
+                  (plen (%rtps-build-user-datagram node-a buf 1 payload))
+                  (pool (%ensure-submsg-scratch-pool node-a))
+                  (held '()))
+             (loop for b = (dds.core.arena:pool-acquire pool) while b do (push b held))   ; drain the pool
+             (unwind-protect
+                  (assert (null (%maybe-wrap-user-submessages node-a buf plen)) ()
+                          "ZA-2 exhaustion: %maybe-wrap-user-submessages must return NIL (fail-closed drop) when the submessage-scratch pool is exhausted — never a GC fallback")
+               (dolist (b held) (dds.core.arena:pool-release pool b))))
+           t)
+      (stop-node node-a) (stop-node node-b))))
+
+(defun* run-secured-dataplane-mem-test ()
+    (function () (eql t))
+  "WP-DDS-SECURITY-ZEROALLOC-AEAD T5 (ZA-2): the LIVE `make mem` proof that BOTH secured dataplane tiers — the
+   submessage metadata_protection (DDS-Security 1.1 §8.5.1.7-.9) AND the whole-RTPS rtps_protection (§8.5.1.10-.12) —
+   are ZERO GC-alloc/sample on SEND and RECEIVE, over reused buffers (steady state), and that pool EXHAUSTION
+   fail-closes (drops) rather than falling back to the GC heap. Four DETERMINISTIC bytes-consed/sample arms measure the
+   security TRANSFORM in isolation over reused input/output buffers + the per-node pools (the ZA-1 %secured-wrapper-
+   cycle-bps style — no cross-node framing / GC-boundary noise, so the result is an EXACT 0.0000 on SBCL), each
+   reported as `plain=.. secured=.. -> delta=.. B/sample`:
+     (a) metadata_protection SEND    — %maybe-wrap-user-submessages, resolver OFF (byte-identical no-op) vs ON (pooled
+                                        multi-bracket wrap over the submsg-scratch pool).
+     (b) metadata_protection RECEIVE — the T5 pooled bracket EXTRACTION (%with-bracket-rx-scratch, replacing the pre-T5
+                                        per-bracket make-array) + the zero-alloc key_id read (%secure-bracket-key-id-into
+                                        into a STACK buffer, replacing the pre-T5 subseq) + the key_id resolve + the
+                                        decode INTO a DISTINCT secure-rx buffer (decode-datawriter-submessage-into) — the
+                                        exact security receive transform %handle-datagram + %on-user-secure-submessage run
+                                        (the re-dispatch that then delivers the recovered PLAIN submessage IS the
+                                        non-secured baseline, so it is excluded here — it conses no more than receiving
+                                        that plain submessage always did).
+     (c) rtps_protection SEND        — %maybe-wrap-srtps, resolver OFF vs ON (pooled SRTPS wrap over the send-scratch pool).
+     (d) rtps_protection RECEIVE     — the SRTPS unwrap: decode-rtps-message-into into a pooled secure-rx buffer + the
+                                        in-place copy-back (the exact transform %handle-datagram runs).
+   SBCL asserts each delta is < 1.0 B/sample (dds.pal:bytes-consed is exact); Clasp bytes-consed is 0 (NFR-PORT gap) so
+   the arms run the SAME code paths (smoke) and only report 0.0000. EXHAUSTION (both send + receive): with the submsg-
+   scratch / send-scratch pool drained the SEND wrap returns NIL (fail-closed drop, RESOURCE_LIMITS backpressure — never
+   a GC fallback), and with the bracket-rx pool drained a metadata datagram is DROPPED (its on-data hook never fires — a
+   make-array GC fallback would have delivered it) then DELIVERED once the pool is released (non-vacuous). Deterministic,
+   no auth handshake (manual KMs). Requires the AES-GCM primitive; skips gracefully if absent. Wired into make mem."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [secured-dataplane-mem] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-secured-dataplane-mem-test t)))
+  (let* ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 71))
+         (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 72))
+         (node-a (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+         (node-b (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+         (km-meta (%secure-sedp-test-km #x5a #x2c))       ; A's user EntityCrypto (metadata_protection); B holds the same
+         (km-rtps (%secure-sedp-test-km #x5b #x2d))       ; A's ParticipantCrypto (rtps_protection / SRTPS)
+         (meta-kid (dds.security:key-material-sender-key-id km-meta))
+         (payload (map '(simple-array (unsigned-byte 8) (*)) #'char-code "ZA2-MEM-DATAPLANE"))   ; 17 octets (non-4-aligned)
+         (iters 20000)
+         (sbcl (eq (dds.pal:pal-impl-name) :sbcl)))
+    (labels ((bps (thunk)
+               (declare (type function thunk))
+               (funcall thunk)                            ; warm (lazy carve already forced separately) off the measured window
+               (let ((before (dds.pal:bytes-consed)))
+                 (dotimes (i iters) (funcall thunk))
+                 (/ (float (- (dds.pal:bytes-consed) before) 1.0d0) iters)))
+             (report-arm (label plain secured)
+               (format t "~&  mem[~a]: plain=~,4f secured=~,4f -> delta=~,4f B/sample (~a)~%"
+                       label plain secured (- secured plain) (dds.pal:pal-impl-name))
+               (when sbcl
+                 (assert (< (abs (- secured plain)) 1.0) ()
+                         "ZA-2 T5 ~a: enabling the tier must add ~~0 GC-heap B/sample over the non-secured baseline; got delta ~,4f (plain ~,4f, secured ~,4f)"
+                         label (- secured plain) plain secured))))
+      (unwind-protect
+           (progn
+             ;; ---- (a) metadata_protection SEND: resolver OFF (no-op) vs ON (pooled wrap), over the reused tx buffer ----
+             (setf (disc-node-user-submessage-protection-kind node-a) :encrypt)
+             (%ensure-submsg-scratch-pool node-a)         ; force the lazy carve off the measured window
+             (let* ((buf (disc-node-tx-msg node-a))
+                    (vec (dds.core.buffer:octet-buffer-vec buf))
+                    (plen (%rtps-build-user-datagram node-a buf 1 payload))
+                    (plain-copy (subseq vec 0 plen)))
+               (setf (disc-node-user-submessage-encode node-a) nil)   ; plain baseline: no resolver -> byte-identical no-op
+               (let ((base (bps (lambda () (replace vec plain-copy :end2 plen)
+                                   (%maybe-wrap-user-submessages node-a buf plen)))))
+                 (setf (disc-node-user-submessage-encode node-a)
+                       (lambda (wp) (declare (ignore wp)) (values km-meta :encrypt)))   ; created ONCE, off the measured window
+                 (let ((sec (bps (lambda () (replace vec plain-copy :end2 plen)
+                                    (%maybe-wrap-user-submessages node-a buf plen)))))
+                   (report-arm "meta-send " base sec)))
+               (replace vec plain-copy :end2 plen))       ; leave BUF holding the plaintext datagram
+             ;; ---- (c) rtps_protection SEND: resolver OFF vs ON (pooled SRTPS wrap), over the reused tx buffer ----
+             (setf (disc-node-rtps-protection-kind node-a) :encrypt)
+             (%ensure-send-scratch-pool node-a)
+             (let* ((buf (disc-node-tx-msg node-a))
+                    (vec (dds.core.buffer:octet-buffer-vec buf))
+                    (plen (%rtps-build-user-datagram node-a buf 2 payload))
+                    (plain-copy (subseq vec 0 plen)))
+               (setf (disc-node-rtps-protection-encode node-a) nil)   ; plain baseline
+               (let ((base (bps (lambda () (replace vec plain-copy :end2 plen)
+                                   (%maybe-wrap-srtps node-a buf plen pb)))))
+                 (setf (disc-node-rtps-protection-encode node-a)
+                       (lambda (dp) (declare (ignore dp)) (values km-rtps :encrypt '())))
+                 (let ((sec (bps (lambda () (replace vec plain-copy :end2 plen)
+                                    (%maybe-wrap-srtps node-a buf plen pb)))))
+                   (report-arm "rtps-send " base sec)))
+               (replace vec plain-copy :end2 plen))
+             ;; ---- (b) metadata_protection RECEIVE: pooled bracket extract + stack key_id + resolve + distinct-pool decode ----
+             (setf (disc-node-user-submessage-protection-kind node-a) :encrypt
+                   (disc-node-user-submessage-encode node-a)
+                   (lambda (wp) (declare (ignore wp)) (values km-meta :encrypt))
+                   (disc-node-user-submessage-decode node-b) (lambda (k) (when (equalp k meta-kid) km-meta)))
+             (let* ((buf (disc-node-tx-msg node-a))
+                    (vec (dds.core.buffer:octet-buffer-vec buf))
+                    (plen (%rtps-build-user-datagram node-a buf 3 payload))
+                    (newlen (%maybe-wrap-user-submessages node-a buf plen))   ; vec[0,newlen) = RTPS header + SEC_PREFIX bracket
+                    (dgbuf (dds.core.buffer:make-octet-buffer (max 64 newlen)))
+                    (dgvec (dds.core.buffer:octet-buffer-vec dgbuf))
+                    (start 20) (size newlen) (blen (- newlen 20))
+                    (user-fn (disc-node-user-submessage-decode node-b)))
+               (replace dgvec vec :end2 newlen)           ; the received datagram (reused; RX bracket extraction never mutates it)
+               (%ensure-bracket-rx-pool node-b) (%ensure-key-id-rx-pool node-b) (%ensure-secure-rx-pool node-b)   ; force the lazy carves off the measured window
+               (let ((sec (bps (lambda ()
+                                  (%with-bracket-rx-scratch (br node-b)          ; pooled bracket INPUT (T5, replaces make-array)
+                                    (replace (dds.core.buffer:octet-buffer-vec br) dgvec :start2 start :end2 size)
+                                    (%with-key-id-rx-scratch (kb node-b)         ; pooled key_id scratch (T5, replaces subseq)
+                                      (%secure-bracket-key-id-into (dds.core.buffer:octet-buffer-vec kb)
+                                                                   (dds.core.buffer:octet-buffer-vec br) blen)
+                                      (let ((km (funcall user-fn (dds.core.buffer:octet-buffer-vec kb))))   ; resolve (equalp, no retain)
+                                        (%with-secure-rx-scratch (rx node-b)     ; DISTINCT decode OUTPUT pool
+                                          (dds.security:decode-datawriter-submessage-into
+                                           rx 20 km (dds.core.buffer:octet-buffer-vec br) 0 blen)))))))))
+                 (report-arm "meta-recv " 0.0d0 sec))
+               (dds.pal:free-static dgvec))
+             ;; ---- (d) rtps_protection RECEIVE: SRTPS unwrap into a pooled secure-rx buffer + in-place copy-back ----
+             (setf (disc-node-rtps-protection-kind node-a) :encrypt
+                   (disc-node-rtps-protection-encode node-a)
+                   (lambda (dp) (declare (ignore dp)) (values km-rtps :encrypt '())))
+             (let* ((buf (disc-node-tx-msg node-a))
+                    (vec (dds.core.buffer:octet-buffer-vec buf))
+                    (plen (%rtps-build-user-datagram node-a buf 4 payload))
+                    (wlen (%maybe-wrap-srtps node-a buf plen pb))   ; vec[0,wlen) = the SRTPS datagram
+                    (srtps-copy (subseq vec 0 wlen))
+                    (dgbuf (dds.core.buffer:make-octet-buffer (max 64 wlen)))
+                    (dgvec (dds.core.buffer:octet-buffer-vec dgbuf))
+                    (cap (dds.core.buffer:octet-buffer-capacity dgbuf))
+                    (size wlen))
+               (%ensure-secure-rx-pool node-b)
+               (let ((sec (bps (lambda ()
+                                  (replace dgvec srtps-copy :end2 size)    ; restore (the SRTPS decode mutates [20,) in place)
+                                  (%with-secure-rx-scratch (rx node-b)
+                                    (multiple-value-bind (data-len mode data-off postfix-off)
+                                        (dds.security:decode-rtps-message-into rx 0 km-rtps dgvec 20 (- size 20))
+                                      (declare (ignore postfix-off))
+                                      (when (and data-len (<= (+ 20 data-len) cap))
+                                        (ecase mode
+                                          (:encrypt (replace dgvec (dds.core.buffer:octet-buffer-vec rx)
+                                                             :start1 20 :end1 (+ 20 data-len) :end2 data-len))
+                                          (:sign (replace dgvec dgvec :start1 20 :start2 data-off
+                                                          :end2 (+ data-off data-len)))))))))))
+                 (report-arm "rtps-recv " 0.0d0 sec))
+               (dds.pal:free-static dgvec))
+             ;; ---- EXHAUSTION -> fail-closed drop, NEVER a GC fallback (send AND receive) ----
+             ;; SEND (submsg-scratch): drain -> the required metadata wrap fails-closed NIL.
+             (setf (disc-node-user-submessage-protection-kind node-a) :encrypt
+                   (disc-node-user-submessage-encode node-a)
+                   (lambda (wp) (declare (ignore wp)) (values km-meta :encrypt)))
+             (let* ((buf (disc-node-tx-msg node-a))
+                    (plen (%rtps-build-user-datagram node-a buf 5 payload))
+                    (pool (%ensure-submsg-scratch-pool node-a)) (held '()))
+               (loop for b = (dds.core.arena:pool-acquire pool) while b do (push b held))
+               (unwind-protect
+                    (assert (null (%maybe-wrap-user-submessages node-a buf plen)) ()
+                            "ZA-2 T5 send exhaustion: %maybe-wrap-user-submessages must fail-closed NIL when the submsg-scratch pool is drained (never a GC fallback)")
+                 (dolist (b held) (dds.core.arena:pool-release pool b))))
+             ;; SEND (send-scratch / SRTPS): drain -> the required SRTPS wrap fails-closed NIL.
+             (setf (disc-node-rtps-protection-kind node-a) :encrypt
+                   (disc-node-rtps-protection-encode node-a)
+                   (lambda (dp) (declare (ignore dp)) (values km-rtps :encrypt '())))
+             (let* ((buf (disc-node-tx-msg node-a))
+                    (plen (%rtps-build-user-datagram node-a buf 6 payload))
+                    (pool (%ensure-send-scratch-pool node-a)) (held '()))
+               (loop for b = (dds.core.arena:pool-acquire pool) while b do (push b held))
+               (unwind-protect
+                    (assert (null (%maybe-wrap-srtps node-a buf plen pb)) ()
+                            "ZA-2 T5 send exhaustion: %maybe-wrap-srtps must fail-closed NIL when the send-scratch pool is drained (never a GC fallback)")
+                 (dolist (b held) (dds.core.arena:pool-release pool b))))
+             ;; RECEIVE (bracket-rx): drain -> a metadata datagram is DROPPED (on-data never fires); released -> delivered.
+             (setf (disc-node-user-submessage-protection-kind node-a) :encrypt
+                   (disc-node-user-submessage-encode node-a)
+                   (lambda (wp) (declare (ignore wp)) (values km-meta :encrypt))
+                   (disc-node-user-submessage-decode node-b) (lambda (k) (when (equalp k meta-kid) km-meta))
+                   (disc-node-rtps-protection-kind node-b) :none)   ; no rtps_protection enforcement on B (deliver the bare bracket)
+             (let* ((buf (disc-node-tx-msg node-a))
+                    (vec (dds.core.buffer:octet-buffer-vec buf))
+                    (plen (%rtps-build-user-datagram node-a buf 7 payload))
+                    (newlen (%maybe-wrap-user-submessages node-a buf plen))
+                    (dg (subseq vec 0 newlen))
+                    (pool (%ensure-bracket-rx-pool node-b)) (held '()) (got nil))
+               (setf (disc-node-on-data node-b) (lambda (&rest r) (declare (ignore r)) (setf got t)))
+               (loop for b = (dds.core.arena:pool-acquire pool) while b do (push b held))
+               (unwind-protect
+                    (progn
+                      (%rtps-feed-datagram node-b dg)
+                      (assert (null got) ()
+                              "ZA-2 T5 receive exhaustion: a metadata bracket must be DROPPED when the bracket-rx pool is drained (a make-array GC fallback would fire on-data)"))
+                 (dolist (b held) (dds.core.arena:pool-release pool b)))
+               (setf got nil)
+               (%rtps-feed-datagram node-b dg)
+               (assert got ()
+                       "ZA-2 T5 receive exhaustion non-vacuous: after releasing the bracket-rx pool the SAME datagram must be DELIVERED (on-data fires)"))
+             (format t "~&  [secured-dataplane-mem] exhaustion: metadata + SRTPS SEND fail-closed NIL; bracket-rx RECEIVE drop-then-deliver — no GC fallback~%")
+             t)
+        (stop-node node-a) (stop-node node-b)))))
 
 (defun* run-rtps-protection-enforce-test ()
     (function () (eql t))

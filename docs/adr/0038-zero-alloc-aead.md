@@ -234,10 +234,17 @@ caller-contract violation (memory-safe within the arena, undefined otherwise). D
 
 ## Residual carries (recorded, NOT fixed here)
 
-**(a) Submessage + whole-RTPS tiers reuse the foundation — Slice 2.** The `metadata_protection` (submessage) and
-`rtps_protection` (whole-RTPS, the ~2.2 KB/datagram) tiers are NOT zero-alloc yet; they reuse the into-buffer FFI +
-session-key cache + into-buffer-core + pool/loan foundation. This is the remaining half of ADR-0036 Carry 3.
-When Slice 2 introduces `rtps_protection` rekeying (session_id rotation), it must confirm the decode receiver stays single-threaded OR harden `%km-session-key-at`'s two-slot publish against a concurrent-different-session_id tear (the current fence protocol is tear-safe only while session_id is effectively constant per km and decode is single-threaded).
+**(a) Submessage + whole-RTPS tiers reuse the foundation — Slice 2. RESOLVED (ADR 0039, 2026-07-02).** The
+`metadata_protection` (submessage) and `rtps_protection` (whole-RTPS, the ~2.2 KB/datagram) tiers are now zero-alloc
+on the common ENCRYPT/SIGN path (send + receive), reusing this foundation (the into-buffer FFI — extended with an
+AAD-region arm for the SIGN sub-range — + the session-key cache + the into-buffer-core + thin-wrapper pattern + the
+arena buffer-pool pattern), via `%encode/%decode-secured-region-into` + five per-node static scratch pools. With the
+`data_protection` tier here, **all three AEAD tiers are zero-alloc** → this completes ADR-0036 Carry 3 (flipped to
+fully resolved). Origin authentication (receiver-specific MACs) stays the deferred allocating fallback (ADR 0039
+Residual (a)). **Still open (carried into ADR 0039 Residual (d)):** when a future `rtps_protection` rekeying
+(session_id rotation) lands, it must confirm the decode receiver stays single-threaded OR harden
+`%km-session-key-at`'s two-slot publish against a concurrent-different-session_id tear (the current fence protocol is
+tear-safe only while session_id is effectively constant per km and decode is single-threaded).
 
 **(b) KeyMaterial GC-heap → foreign + zeroize (ADR-0034 deferral).** The session-key cache and the KeyMaterial key
 bytes live on the GC heap. Derived once, so they do not move steady-state `bytes-consed`; migrating all key material
@@ -287,7 +294,7 @@ guard a future DCPS-loan mis-wire). Extending the loan to the DCPS API is a foll
 | 5 | Live Fast DDS-Security cross-vendor (ADR 0037) — the Fast-DDS half of the P6 exit gate | LANDED |
 | 5b | Live RTI Connext-Security secure discovery — the remaining half of the P6 exit gate (RTI plugins gated) | pending |
 | **1-HARDENING (this ADR)** | **Zero-alloc AEAD: the `data_protection` tier + the shared into-buffer foundation (ADR 0038)** | **LANDED** |
-| 2-ZEROALLOC | Extend the foundation to the `metadata_protection` (submessage) + `rtps_protection` (whole-RTPS) tiers | pending |
+| 2-ZEROALLOC | Extend the foundation to the `metadata_protection` (submessage) + `rtps_protection` (whole-RTPS) tiers (ADR 0039) | LANDED |
 
 ---
 

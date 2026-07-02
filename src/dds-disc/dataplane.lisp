@@ -87,6 +87,83 @@
     (ignore-errors (funcall *sender-emit-error-hook* condition :shmem-send-fault n))
     n))
 
+(defun* %ensure-send-scratch-pool (node)
+    (function (disc-node) t)
+  "Return NODE's SRTPS send-scratch pool, carving it (arena + fixed pool of datagram-sized static buffers) lazily
+   on the first %maybe-wrap-srtps and returning it thereafter (WP-DDS-SECURITY-ZEROALLOC-AEAD T3). element-bytes =
+   +srtps-scratch-datagram-bytes+ + +srtps-scratch-overhead+ (a wrapped datagram + the SRTPS bracket); capacity =
+   *srtps-send-scratch-capacity* (concurrent wrapping sender threads + headroom). Carved OFF the steady state (first
+   secured send only) under SEND-SCRATCH-LOCK, double-checked so it happens exactly once across the sender threads;
+   the symmetric RX decode pool carve (%ensure-secure-rx-pool) uses its own dedicated SECURE-RX-LOCK. On arena/static-alloc failure returns
+   NIL — %maybe-wrap-srtps then falls back to the allocating encode-rtps-message (correct, byte-identical wire),
+   never a per-datagram GC on the pooled path. The arena is stored only after the pool carve succeeds (teardown
+   reachability); stop-node tears it down. NIL until the first wrap -> a node with rtps_protection off reserves no
+   static memory (zero-cost when off), consistent with the other per-node security pools (T5a/T5b, all lazy)."
+  (or (disc-node-send-scratch-pool node)
+      (dds.pal:with-lock ((disc-node-send-scratch-lock node))
+        (or (disc-node-send-scratch-pool node)
+            (handler-case
+                (let* ((eb    (+ +srtps-scratch-datagram-bytes+ +srtps-scratch-overhead+))
+                       (cap   *srtps-send-scratch-capacity*)
+                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  (setf (disc-node-send-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
+                        (disc-node-send-scratch-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
+              (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
+
+(defmacro %with-send-scratch ((var node) &body body)
+  "Borrow a datagram-sized scratch octet-buffer from NODE's send-scratch pool (the send twin of %with-secure-rx-scratch;
+   both expand to the shared %with-scratch borrow over their pool + dedicated lock), bind it to VAR, run BODY, and
+   RELEASE it (always, even on non-local exit) — WP-DDS-SECURITY-ZEROALLOC-AEAD T3. Evaluates to BODY's value, or NIL
+   when the pool is not carved / EXHAUSTED: %maybe-wrap-srtps treats NIL as the fail-closed required-but-failed drop
+   (RESOURCE_LIMITS backpressure; never a GC fallback, NFR-MEM). Acquire + release are O(1) index ops under
+   SEND-SCRATCH-LOCK so concurrent sender threads never corrupt the pool; BODY (the AEAD bracket build) runs OUTSIDE
+   the lock. Assumes the pool is already carved (the caller ensures it first)."
+  (let ((n (gensym "NODE")))
+    `(let ((,n ,node))
+       (%with-scratch (,var (disc-node-send-scratch-pool ,n) (disc-node-send-scratch-lock ,n))
+         ,@body))))
+
+(defun* %ensure-submsg-scratch-pool (node)
+    (function (disc-node) t)
+  "Return NODE's metadata_protection SUBMESSAGE-scratch pool, carving it (arena + fixed pool of static buffers) lazily on
+   the first %maybe-wrap-user-submessages and returning it thereafter (WP-DDS-SECURITY-ZEROALLOC-AEAD T4). element-bytes =
+   +srtps-scratch-datagram-bytes+ + +submsg-scratch-overhead+ (a datagram + the per-submessage bracket expansion headroom,
+   ~10240); capacity = *srtps-send-scratch-capacity* (the concurrent wrapping sender threads + headroom — the submessage
+   wrap runs on the SAME sender threads as the SRTPS wrap and RELEASES its borrow before the SRTPS wrap acquires, so peak
+   concurrent submsg borrows = the sender-thread count). A DEDICATED pool (its own SUBMSG-SCRATCH-LOCK, so its ops never
+   contend with the send / RX pool ops), so the SRTPS send-scratch pool keeps its efficient 2104-octet buffers. Carved OFF
+   the steady state (first metadata_protection send only) under SUBMSG-SCRATCH-LOCK, double-checked so it happens exactly
+   once across the sender threads. On arena/static-alloc failure returns NIL — %maybe-wrap-user-submessages then falls back
+   to the allocating make-octet-buffer path (correct, byte-identical wire), never a per-datagram GC on the pooled path. The
+   arena is stored only after the pool carve succeeds (teardown reachability); stop-node tears it down. NIL until the first
+   wrap -> a node with metadata_protection off reserves no static memory (zero-cost when off), consistent with the other
+   per-node security pools (all lazy)."
+  (or (disc-node-submsg-scratch-pool node)
+      (dds.pal:with-lock ((disc-node-submsg-scratch-lock node))
+        (or (disc-node-submsg-scratch-pool node)
+            (handler-case
+                (let* ((eb    (+ +srtps-scratch-datagram-bytes+ +submsg-scratch-overhead+))
+                       (cap   *srtps-send-scratch-capacity*)
+                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  (setf (disc-node-submsg-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
+                        (disc-node-submsg-scratch-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
+              (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> allocating fallback
+
+(defmacro %with-submsg-scratch ((var node) &body body)
+  "Borrow one metadata_protection submessage-scratch octet-buffer from NODE's submsg-scratch pool (the metadata_protection
+   twin of %with-send-scratch; both expand to the shared %with-scratch borrow over their pool + dedicated lock), bind it to
+   VAR, run BODY, and RELEASE it (always, even on non-local exit) — WP-DDS-SECURITY-ZEROALLOC-AEAD T4. Evaluates to BODY's
+   value, or NIL when the pool is not carved / EXHAUSTED: %maybe-wrap-user-submessages treats NIL as the fail-closed
+   required-but-failed drop (RESOURCE_LIMITS backpressure; never a GC fallback, NFR-MEM). Acquire + release are O(1) index
+   ops under SUBMSG-SCRATCH-LOCK so concurrent sender threads never corrupt the pool; BODY (the multi-bracket build) runs
+   OUTSIDE the lock. Assumes the pool is already carved (the caller ensures it first)."
+  (let ((n (gensym "NODE")))
+    `(let ((,n ,node))
+       (%with-scratch (,var (disc-node-submsg-scratch-pool ,n) (disc-node-submsg-scratch-lock ,n))
+         ,@body))))
+
 (defun* %maybe-wrap-srtps (node buf len dest-prefix)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) (simple-array (unsigned-byte 8) (12)))
               (or null (integer 0)))
@@ -94,46 +171,85 @@
    rtps_protection is in effect for DEST-PREFIX — the node's RTPS-PROTECTION-ENCODE resolver (installed cross-layer
    by the crypto-manager) returns the LOCAL ParticipantCrypto KeyMaterial for a :keyed destination under a non-NONE
    governance rtps_protection_kind — WRAP BUF's post-RTPS-header submessage stream (octets [20,LEN)) as
-   SRTPS_PREFIX ‖ SEC_BODY ‖ SRTPS_POSTFIX via encode-rtps-message (keyed by that KM per the resolver's KIND;
-   :receivers = the destination's ParticipantCrypto receiver descriptor for the *_WITH_ORIGIN_AUTHENTICATION tier,
-   §9.5.3.3.4.3), overwrite [20,…) IN PLACE in BUF (reusing the thread's own scratch — the wrapped stream is at most
-   ~56 octets larger and BUF has datagram-budget headroom; capacity-guarded), and return the new datagram length
-   (the 20-octet RTPS Header at [0,20) is kept verbatim — the transform protects only the submessage stream).
+   SRTPS_PREFIX ‖ <body> ‖ SRTPS_POSTFIX keyed by that KM per the resolver's KIND (:receivers = the destination's
+   ParticipantCrypto receiver descriptor for the *_WITH_ORIGIN_AUTHENTICATION tier, §9.5.3.3.4.3), overwrite [20,…)
+   IN PLACE in BUF, and return the new datagram length (the 20-octet RTPS Header at [0,20) is kept verbatim — the
+   transform protects only the submessage stream).
+   ZERO-ALLOC (WP-DDS-SECURITY-ZEROALLOC-AEAD T3 / ZA-2): the bracket is built BY OFFSET straight into a
+   datagram-sized scratch borrowed from NODE's per-node send-scratch pool (%with-send-scratch over
+   %ensure-send-scratch-pool) via encode-rtps-message-into — no per-datagram plain-region subseq, no
+   encode-rtps-message →octets return — then copied back over [20,…) and the scratch released. Steady-state secured
+   send over the reused BUF + pooled scratch conses ~0 GC-heap B/datagram (the origin-auth receivers tier keeps the
+   core's deferred allocating fallback, still into the scratch).
    Returns LEN UNCHANGED when no wrap applies: no resolver installed (security OFF), or the resolver returns NIL
-   (the dest is not :keyed / rtps_protection NONE) -> plain, BYTE-IDENTICAL. Returns NIL (the caller DROPS,
-   fail-closed; NFR-SEC-POSTURE) only when a wrap WAS required but encode-rtps-message failed or the result would
-   not fit BUF — never emits an unprotected datagram to a keyed peer. The in-place overwrite reuses BUF, so the
-   steady-state datagram needs no fresh message-sized buffer; the residual per-datagram heap is the plain-region
-   copy + encode-rtps-message's own →octets return + the AEAD intermediates (the inherited T4 carry, off the gated
-   CDR hot path — see bench/report)."
+   (the dest is not :keyed / rtps_protection NONE) -> plain, BYTE-IDENTICAL (the pool is never touched). Returns NIL
+   (the caller DROPS, fail-closed; NFR-SEC-POSTURE) when a wrap WAS required but the pool is EXHAUSTED
+   (RESOURCE_LIMITS backpressure — never a GC fallback), or the encode failed, or the result would not fit BUF —
+   never emits an unprotected datagram to a keyed peer. If the pool could not be carved (arena exhausted at first
+   wrap) the wrap DEGRADES to the allocating encode-rtps-message (correct, byte-identical wire), self-healing when
+   the arena frees."
   (let ((enc (disc-node-rtps-protection-encode node)))
     (if (or (null enc) (<= len 20))
         len                                            ; no protection installed / header-only -> plain (byte-identical)
         (multiple-value-bind (km kind receivers) (funcall enc dest-prefix)
           (if (null km)
               len                                      ; dest not :keyed / rtps_protection NONE -> plain
-              (let* ((vec   (dds.core.buffer:octet-buffer-vec buf))
-                     (plain (subseq vec 20 len))       ; the submessage stream to protect (T4 →octets input)
-                     (srtps (dds.security:encode-rtps-message km kind plain :receivers receivers)))
-                (if (and srtps (<= (+ 20 (length srtps)) (dds.core.buffer:octet-buffer-capacity buf)))
-                    (progn (replace vec srtps :start1 20) (+ 20 (length srtps)))   ; in-place wrap; header kept
-                    nil)))))))                          ; required but failed/won't fit -> fail-closed drop
+              (let ((vec  (dds.core.buffer:octet-buffer-vec buf))
+                    (cap  (dds.core.buffer:octet-buffer-capacity buf))
+                    (pool (%ensure-send-scratch-pool node)))
+                (if (null pool)
+                    ;; pool carve failed (arena exhausted at first wrap): allocating fallback — correct + byte-identical
+                    ;; wire, never a silent drop of legit keyed traffic (self-heals once the arena frees).
+                    (let ((srtps (dds.security:encode-rtps-message km kind (subseq vec 20 len) :receivers receivers)))
+                      (if (and srtps (<= (+ 20 (length srtps)) cap))
+                          (progn (replace vec srtps :start1 20) (+ 20 (length srtps)))
+                          nil))
+                    ;; ZA-2 zero-alloc: borrow a scratch, build the bracket into it BY OFFSET (no subseq / →octets),
+                    ;; copy [0,BLEN) back over [20,…) in BUF, release the scratch. Pool exhausted -> %with-send-scratch
+                    ;; is NIL -> fail-closed drop (never a GC fallback).
+                    (%with-send-scratch (scratch node)
+                      (handler-case
+                          (let ((blen (dds.security:encode-rtps-message-into
+                                       scratch 0 km kind vec 20 (- len 20) :receivers receivers)))
+                            (when (<= (+ 20 blen) cap)
+                              (replace vec (dds.core.buffer:octet-buffer-vec scratch)
+                                       :start1 20 :end1 (+ 20 blen) :end2 blen)   ; in-place wrap; header kept
+                              (+ 20 blen)))
+                        (error () nil))))))))))          ; encode overflow/failure or won't-fit -> fail-closed drop
 
-(defun* %wrap-one-user-submessage (node id submsg)
-    (function (disc-node (unsigned-byte 8) (simple-array (unsigned-byte 8) (*)))
-              (or null (simple-array (unsigned-byte 8) (*))))
-  "Submessage-protect ONE complete user-plane RTPS submessage SUBMSG (header+body, submessageId = ID) under
-   the LOCAL user endpoint EntityCrypto per the node's USER-SUBMESSAGE-ENCODE resolver (DDS-Security 1.1
-   §8.5.1.7-.9). The PLAINTEXT submessage is NOT padded — the §8.3.4 4-alignment lives in the SEC_BODY
-   CryptoContent container (encode-datawriter-/datareader-submessage round the SEC_BODY up to a 4-multiple
-   with pad octets AFTER the ciphertext, Fast DDS serialize_SecureDataBody) so the recovered submessage's
-   octetsToNextHeader reflects its TRUE length and a data_protection SecuredPayload payload round-trips
-   (T10 review fix-2). Writer submessages (DATA/DATA_FRAG/HEARTBEAT/GAP/HEARTBEAT_FRAG) are protected under
-   the user WRITER's EntityCrypto via encode-datawriter-submessage; reader submessages (ACKNACK/NACK_FRAG)
-   under the user READER's via encode-datareader-submessage (the §8.5 DataWriter/DataReader transforms are
-   the same mechanism). Returns the SEC_PREFIX … SEC_POSTFIX bracket, or NIL when the resolver declines (not
-   keyed / kind NONE) or ID is not a protectable submessage (INFO_* etc.) — the caller then passes SUBMSG
-   through verbatim."
+(defun* %submessage-extent (vec pos len)
+    (function ((simple-array (unsigned-byte 8) (*)) fixnum (integer 0))
+              (values (or null (unsigned-byte 8)) fixnum))
+  "Parse the 4-octet RTPS SubmessageHeader at VEC[POS] (DDSI-RTPS 2.5 §9.4.5.1.2: id ‖ flags ‖ octetsToNextHeader,
+   E flag = bit 0 of flags selects octn endianness; octn 0 = the last submessage runs to LEN, §9.4.5.1.3) and return
+   (VALUES ID SM-END) — SM-END the EXCLUSIVE end offset of this submessage in VEC. Returns (VALUES NIL POS) fail-closed
+   when the 4-octet header is truncated (POS+4 > LEN) or the declared body overruns LEN. The SINGLE walk-extent decision
+   shared by %WRAP-USER-SUBMESSAGES-INTO (the metadata_protection wrap loop) and %PRESCAN-USER-SUBMESSAGES (the pool-
+   exhaustion pre-scan) so their fail-closed malformed / overrun handling AND octn=0 semantics CANNOT diverge (a walk
+   divergence could make the pre-scan skip a submessage the wrap loop would wrap -> leak an unprotected datagram; NFR-
+   SEC-POSTURE). Zero-alloc: raw-offset reads only (assumes POS < LEN — the caller's loop guards end-of-stream first)."
+  (if (> (+ pos 4) len)
+      (values nil pos)                                             ; truncated 4-octet submessage header -> fail-closed
+      (let* ((id     (aref vec pos))
+             (flags  (aref vec (+ pos 1)))
+             (o0     (aref vec (+ pos 2)))
+             (o1     (aref vec (+ pos 3)))
+             (octn   (if (logbitp 0 flags) (logior o0 (ash o1 8)) (logior (ash o0 8) o1)))
+             (body   (+ pos 4))
+             (sm-end (the fixnum (+ body (if (zerop octn) (- len body) octn)))))   ; octn 0 = last submessage runs to LEN
+        (if (> sm-end len) (values nil pos) (values id sm-end)))))                 ; body overruns the datagram -> fail-closed
+
+(defun* %user-submessage-protectable-p (node id)
+    (function (disc-node (unsigned-byte 8)) (values t (or null keyword) t))
+  "The SINGLE metadata_protection (DDS-Security 1.1 §8.5.1.7-.9) protectability predicate for ONE user-plane RTPS
+   submessage of submessageId ID under NODE's USER-SUBMESSAGE-ENCODE resolver — shared by %WRAP-ONE-USER-SUBMESSAGE-INTO
+   (which then PERFORMS the wrap) and %PRESCAN-USER-SUBMESSAGES (which only TESTS it) so the two CANNOT diverge: were the
+   pre-scan to under-detect a submessage the wrap loop WOULD wrap, an unprotected datagram could be emitted to a keyed
+   peer (a security hole). Returns (VALUES KM KIND WRITER-P) — the resolver's KeyMaterial + transformation kind + the
+   writer/reader class — when the submessage IS protectable: a resolver is installed, ID is a WRITER submessage
+   (DATA/DATA_FRAG/HEARTBEAT/GAP/HEARTBEAT_FRAG) or a READER submessage (ACKNACK/NACK_FRAG), AND the resolver returns a
+   non-NIL KM for that class. Returns a single NIL otherwise (no resolver / INFO_* / the resolver declines — not keyed /
+   kind NONE). ONE resolver call per submessage; the wrap uses EXACTLY the KM/KIND/WRITER-P this returns (no re-resolve)."
   (let ((enc (disc-node-user-submessage-encode node)))
     (when enc
       (let ((writer-p (or (= id dds.rtps.message:+submsg-data+)
@@ -145,10 +261,98 @@
                           (= id dds.rtps.message:+submsg-nack-frag+))))
         (when (or writer-p reader-p)
           (multiple-value-bind (km kind) (funcall enc writer-p)
-            (when km
-              (if writer-p
-                  (dds.security:encode-datawriter-submessage km kind submsg)
-                  (dds.security:encode-datareader-submessage km kind submsg)))))))))
+            (when km (values km kind writer-p))))))))
+
+(defun* %wrap-one-user-submessage-into (node id out out-off plain plain-off plain-len)
+    (function (disc-node (unsigned-byte 8) dds.core.buffer:octet-buffer fixnum
+               (simple-array (unsigned-byte 8) (*)) fixnum fixnum)
+              (or null fixnum))
+  "Submessage-protect ONE complete user-plane RTPS submessage PLAIN[PLAIN-OFF..+PLAIN-LEN] (header+body, submessageId
+   = ID) BY OFFSET directly INTO OUT starting at OUT-OFF, under the LOCAL user endpoint EntityCrypto per the node's
+   USER-SUBMESSAGE-ENCODE resolver (DDS-Security 1.1 §8.5.1.7-.9); return the SEC_PREFIX … SEC_POSTFIX bracket LENGTH
+   written, or NIL when the resolver declines (not keyed / kind NONE) or ID is not a protectable submessage (INFO_*
+   etc.) — the caller then copies the submessage through VERBATIM. The zero-alloc, into-buffer twin of the pre-ZA-2
+   %wrap-one-user-submessage (which subseq'd the submessage + returned a fresh bracket vector). The PLAINTEXT submessage
+   is NOT padded — the §8.3.4 4-alignment lives in the SEC_BODY CryptoContent container (the -into core rounds the
+   SEC_BODY up to a 4-multiple with pad octets AFTER the ciphertext, Fast DDS serialize_SecureDataBody) so the recovered
+   submessage's octetsToNextHeader reflects its TRUE length and a data_protection SecuredPayload payload round-trips
+   (T10 review fix-2). Writer submessages (DATA/DATA_FRAG/HEARTBEAT/GAP/HEARTBEAT_FRAG) are protected under the user
+   WRITER's EntityCrypto via encode-datawriter-submessage-into; reader submessages (ACKNACK/NACK_FRAG) under the user
+   READER's via encode-datareader-submessage-into (the §8.5 DataWriter/DataReader transforms are the same mechanism).
+   Signals BUFFER-OVERFLOW (caught by %wrap-user-submessages-into's fail-closed handler) if OUT lacks room at OUT-OFF."
+  (multiple-value-bind (km kind writer-p) (%user-submessage-protectable-p node id)
+    (when km
+      (if writer-p
+          (dds.security:encode-datawriter-submessage-into out out-off km kind plain plain-off plain-len)
+          (dds.security:encode-datareader-submessage-into out out-off km kind plain plain-off plain-len)))))
+
+(defun* %wrap-user-submessages-into (node buf len out)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0) dds.core.buffer:octet-buffer) (or null (integer 0)))
+  "Walk BUF's post-RTPS-header submessage stream [20,LEN) and build the metadata_protection-wrapped stream BY OFFSET
+   into OUT (the submessage stream ONLY, from OUT offset 0): each user-plane submessage becomes its SEC_PREFIX …
+   SEC_POSTFIX bracket (%wrap-one-user-submessage-into, input = BUF's vec + the submessage's OFFSET + LENGTH, NO
+   per-submessage subseq); INFO_* (and any submessage the resolver declines) is copied VERBATIM by offset (no alloc).
+   Return the NEW datagram length (20 + the built stream length) after overwriting BUF[20,newlen) in place, or LEN
+   UNCHANGED when nothing was wrapped (the caller leaves BUF untouched — byte-identical), or NIL fail-closed
+   (NFR-SEC-POSTURE) on a malformed / overrunning submessage header, a verbatim copy that would not fit OUT, or a
+   rebuilt stream that would not fit BUF. The SHARED walk for BOTH %maybe-wrap-user-submessages paths — the pooled
+   scratch (common) and the allocating fallback (arena-exhausted carve) — so the multi-bracket logic lives ONCE (DRY).
+   A BUFFER-OVERFLOW from a bracket that would not fit OUT is caught here and mapped to the fail-closed NIL, exactly
+   like a too-big rebuild. The 20-octet RTPS Header BUF[0,20) is kept verbatim (never copied into OUT)."
+  (let ((vec     (dds.core.buffer:octet-buffer-vec buf))
+        (out-vec (dds.core.buffer:octet-buffer-vec out))
+        (out-cap (dds.core.buffer:octet-buffer-capacity out))
+        (buf-cap (dds.core.buffer:octet-buffer-capacity buf))
+        (pos     20)      ; walk BY RAW OFFSET (no cursor consed) — RTPS Header [0,20) kept verbatim in BUF
+        (ooff    0)
+        (any     nil))
+    (declare (type fixnum pos ooff))
+    (handler-case
+        (block walk
+          (loop
+            (when (>= pos len) (return))
+            ;; 4-octet RTPS SubmessageHeader by raw offset (id + exclusive sm-end) via the SHARED %submessage-extent walk,
+            ;; so this wrap loop and the exhaustion pre-scan cannot diverge on malformed / overrun / octn=0 (§9.4.5.1.2/.3).
+            (multiple-value-bind (id sm-end) (%submessage-extent vec pos len)
+              (when (null id) (return-from walk nil))                     ; truncated header / body overruns LEN -> fail-closed
+              (let* ((sublen (- sm-end pos))
+                     (blen   (%wrap-one-user-submessage-into node id out ooff vec pos sublen)))
+                (if blen
+                    (progn (setf any t) (incf ooff blen))                 ; wrapped bracket (the -into's O(1) extent check bounds OUT)
+                    (progn                                                 ; INFO_* / declined -> copy the submessage verbatim by offset
+                      (when (> (+ ooff sublen) out-cap) (return-from walk nil))   ; verbatim won't fit OUT -> fail-closed
+                      (replace out-vec vec :start1 ooff :end1 (+ ooff sublen) :start2 pos :end2 sm-end)
+                      (incf ooff sublen)))
+                (setf pos sm-end))))
+          (if (null any)
+              len                                                         ; nothing wrapped -> leave BUF untouched (byte-identical)
+              (let ((newlen (+ 20 ooff)))
+                (if (<= newlen buf-cap)
+                    (progn (replace vec out-vec :start1 20 :end1 newlen :start2 0 :end2 ooff) newlen)
+                    nil))))                                               ; rebuilt stream won't fit BUF -> fail-closed
+      (error () nil))))                                                   ; -into extent overflow / any signal -> fail-closed drop
+
+(defun* %prescan-user-submessages (node buf len)
+    (function (disc-node dds.core.buffer:octet-buffer (integer 0)) (or null (integer 0)))
+  "Zero-alloc walk of BUF's post-RTPS-header submessage stream [20,LEN) BY RAW OFFSET — the SAME %submessage-extent
+   header-walk + %user-submessage-protectable-p predicate the metadata_protection wrap loop (%WRAP-USER-SUBMESSAGES-INTO)
+   uses, so the two CANNOT diverge — deciding, WITHOUT wrapping, whether the datagram REQUIRES metadata_protection. Used
+   ONLY when the submessage-scratch pool is EXHAUSTED (%MAYBE-WRAP-USER-SUBMESSAGES) to avoid DROPPING a datagram that
+   needs no protection (the ZA-2 review fix — false-REJECT is the worst class). Returns LEN (pass-through, BUF untouched,
+   byte-identical) when NO submessage is protectable; NIL (fail-closed drop, NFR-SEC-POSTURE) when ANY submessage IS
+   protectable (a required wrap could not be performed — never emit an unprotected datagram to a keyed peer) OR a
+   submessage header is malformed / overruns LEN (identical fail-closed to the wrap walk). ZERO-ALLOC: raw-offset reads
+   + the shared predicate (INFO_* short-circuits before the resolver; a protectable id calls the resolver, which conses
+   nothing) — no subseq, no cursor, no per-submessage object."
+  (let ((vec (dds.core.buffer:octet-buffer-vec buf))
+        (pos 20))
+    (declare (type fixnum pos))
+    (loop
+      (when (>= pos len) (return len))                              ; end of stream, nothing protectable -> pass-through
+      (multiple-value-bind (id sm-end) (%submessage-extent vec pos len)
+        (when (null id) (return nil))                              ; truncated header / body overruns LEN -> fail-closed
+        (when (%user-submessage-protectable-p node id) (return nil))   ; a required wrap could not be performed -> drop
+        (setf pos sm-end)))))
 
 (defun* %maybe-wrap-user-submessages (node buf len)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0)) (or null (integer 0)))
@@ -156,56 +360,55 @@
    the INNER complement of %MAYBE-WRAP-SRTPS (which wraps the whole datagram OUTSIDE this). When the node's
    USER-SUBMESSAGE-ENCODE resolver is installed (security on, metadata_protection != NONE, keyed), WALK BUF's
    post-RTPS-header submessage stream [20,LEN) and replace each user-plane submessage with its SEC_PREFIX …
-   SEC_POSTFIX bracket (%wrap-one-user-submessage), passing INFO_* (and any submessage the resolver declines)
-   through VERBATIM; rebuild the stream and overwrite BUF in place, returning the new datagram length. Returns LEN
-   UNCHANGED when no resolver is installed / it declines every submessage (security OFF / metadata NONE / not yet
-   keyed) -> byte-identical. The metadata_protection NONE tier short-circuits BEFORE the off-heap scratch alloc +
+   SEC_POSTFIX bracket (%wrap-user-submessages-into + %wrap-one-user-submessage-into), passing INFO_* (and any
+   submessage the resolver declines) through VERBATIM; rebuild the stream and overwrite BUF in place, returning the
+   new datagram length.
+   ZERO-ALLOC (WP-DDS-SECURITY-ZEROALLOC-AEAD T4 / ZA-2): the wrapped stream is built BY OFFSET straight into a
+   datagram-sized scratch borrowed from NODE's per-node SUBMESSAGE-scratch pool (%with-submsg-scratch over
+   %ensure-submsg-scratch-pool) via the encode-datawriter-/datareader-submessage-into cores — dropping the pre-ZA-2
+   per-datagram (make-octet-buffer (+ len 8192)) AND the per-submessage (subseq vec start sm-end) — then copied back
+   over [20,…) and the scratch released. Steady-state metadata_protection send over the reused BUF + pooled scratch
+   conses ~0 GC-heap B/datagram (the origin-auth receivers tier keeps the core's deferred allocating fallback, still
+   into the scratch).
+   Returns LEN UNCHANGED when no resolver is installed / it declines every submessage (security OFF / metadata NONE /
+   not yet keyed) -> byte-identical. The metadata_protection NONE tier short-circuits BEFORE the scratch borrow +
    stream walk (the resolver would decline every submessage anyway — see the crypto-manager USER-SUBMESSAGE-ENCODE
-   install — so the walk is pure overhead): a keyed user-data send with metadata_protection NONE pays nothing.
-   Returns NIL (caller DROPS, fail-closed; NFR-SEC-POSTURE) only when a submessage header is malformed/overruns LEN
-   or the rebuilt stream would not fit BUF. The 20-octet RTPS Header [0,20) is kept verbatim. Called BEFORE
-   %MAYBE-WRAP-SRTPS in %SEND-RAW-BUF so the wire is SRTPS( … SEC_PREFIX(submessage) … ), matching Fast DDS
-   RTPSMessageGroup (payload-protect -> submessage-protect -> rtps-protect). Control-plane-ish: the off-heap
-   scratch is freed before return; this is the secured user path (already AEAD-allocating, gated)."
+   install — so the walk is pure overhead): a keyed user-data send with metadata_protection NONE pays nothing
+   (byte-identical, the pool is never touched). Returns NIL (caller DROPS, fail-closed; NFR-SEC-POSTURE) when a
+   submessage header is malformed / overruns LEN, the rebuilt stream would not fit BUF, or — for a datagram that HAS a
+   protectable submessage — the submessage-scratch pool is EXHAUSTED (RESOURCE_LIMITS backpressure — never a GC fallback;
+   a required wrap could not be performed, so an unprotected datagram is never emitted to a keyed peer). On pool
+   EXHAUSTION a datagram with NOTHING protectable (all INFO_* / all-declined) is NOT dropped: a zero-alloc pre-scan
+   (%PRESCAN-USER-SUBMESSAGES — the SAME %submessage-extent walk + %user-submessage-protectable-p predicate the wrap loop
+   uses, so the two cannot diverge into leaking an unprotected datagram) returns LEN and it passes through byte-identical
+   (ZA-2 review — a datagram needing no protection must never be false-REJECTed). If the pool could not be carved (arena
+   exhausted at first wrap) the wrap DEGRADES to the allocating make-octet-buffer path (correct, byte-identical wire),
+   self-healing when the arena frees. The 20-octet RTPS Header [0,20) is kept verbatim. Called BEFORE %MAYBE-WRAP-SRTPS
+   in %SEND-RAW-BUF so the wire is SRTPS( … SEC_PREFIX(submessage) … ), matching Fast DDS RTPSMessageGroup
+   (payload-protect -> submessage-protect -> rtps-protect)."
   (let ((enc (disc-node-user-submessage-encode node)))
-    ;; NONE tier (metadata_protection off): skip the alloc + walk — wire byte-identical (the resolver declines all).
+    ;; NONE tier (metadata_protection off): skip the borrow + walk — wire byte-identical (the resolver declines all).
     (if (or (null enc) (<= len 20)
             (eq (disc-node-user-submessage-protection-kind node) :none))
         len
-        (let* ((vec (dds.core.buffer:octet-buffer-vec buf))
-               (cur (dds.core.buffer:cursor buf :endianness :little))
-               (out (dds.core.buffer:make-octet-buffer (+ len 8192)))   ; expansion headroom (~56 octets/submessage)
-               (oc  (dds.core.buffer:cursor out :endianness :little))
-               (any nil))
-          (unwind-protect
-               (block walk
-                 (dds.core.buffer:put-octets oc vec 0 20)               ; RTPS Header verbatim
-                 (dds.core.buffer:cursor-set-position cur 20)
-                 (loop
-                   (when (>= (dds.core.buffer:cursor-position cur) len) (return))
-                   (let ((start (dds.core.buffer:cursor-position cur)))
-                     (multiple-value-bind (id flags octn le) (dds.rtps.message:parse-submessage-header cur)
-                       (declare (ignore flags le))
-                       (unless id (return-from %maybe-wrap-user-submessages nil))   ; malformed -> fail-closed
-                       (let ((sm-end (+ (dds.core.buffer:cursor-position cur)
-                                        (if (zerop octn) (- len (dds.core.buffer:cursor-position cur)) octn))))
-                         (when (> sm-end len) (return-from %maybe-wrap-user-submessages nil))   ; overrun -> fail-closed
-                         (let* ((submsg  (subseq vec start sm-end))
-                                (wrapped (%wrap-one-user-submessage node id submsg))
-                                (emit    (or wrapped submsg)))
-                           (when wrapped (setf any t))
-                           (when (> (+ (dds.core.buffer:cursor-position oc) (length emit))
-                                    (dds.core.buffer:octet-buffer-capacity out))
-                             (return-from %maybe-wrap-user-submessages nil))   ; won't fit -> fail-closed
-                           (dds.core.buffer:put-octets oc emit 0 (length emit)))
-                         (dds.core.buffer:cursor-set-position cur sm-end)))))
-                 (if (null any)
-                     len                                                 ; nothing wrapped -> leave BUF untouched
-                     (let ((newlen (dds.core.buffer:cursor-position oc)))
-                       (if (<= newlen (dds.core.buffer:octet-buffer-capacity buf))
-                           (progn (replace vec (dds.core.buffer:octet-buffer-vec out) :end2 newlen) newlen)
-                           nil))))                                       ; rebuilt won't fit BUF -> fail-closed
-            (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out)))))))
+        (let ((pool (%ensure-submsg-scratch-pool node)))
+          (if (null pool)
+              ;; pool carve failed (arena exhausted at first wrap): allocating fallback — correct + byte-identical wire,
+              ;; never a silent drop of legit keyed traffic (self-heals once the arena frees).
+              (let ((out (dds.core.buffer:make-octet-buffer (+ +srtps-scratch-datagram-bytes+ +submsg-scratch-overhead+))))
+                (unwind-protect (%wrap-user-submessages-into node buf len out)
+                  (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))))
+              ;; ZA-2 zero-alloc: borrow a submessage scratch, build the wrapped stream into it BY OFFSET (no subseq /
+              ;; →octets), copy back over [20,…) in BUF, release. Pool EXHAUSTED -> %with-submsg-scratch never runs the
+              ;; body -> the zero-alloc pre-scan decides (ZA-2 review): a datagram with NOTHING protectable passes through
+              ;; byte-identical (LEN, never a drop); one WITH a protectable submessage stays fail-closed (NIL — a required
+              ;; wrap could not be performed, never emit an unprotected datagram to a keyed peer).
+              (let ((wrapped nil))
+                (if (%with-submsg-scratch (scratch node)
+                      (setf wrapped (%wrap-user-submessages-into node buf len scratch))
+                      t)                                            ; body ran = scratch acquired; the T disambiguates it from an exhausted NIL
+                    wrapped                                         ; acquired: authoritative (LEN / newlen / its own fail-closed NIL)
+                    (%prescan-user-submessages node buf len))))))))
 
 (defun* %send-raw-buf (node buf len host port &optional shmem-dest dest-prefix)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) string (unsigned-byte 16)

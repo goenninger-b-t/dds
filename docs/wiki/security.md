@@ -265,10 +265,68 @@ over which the allocating `encode/decode-serialized-payload` entries (§2.3) are
 the wrappers delegate to the core, the byte-exact corpus proves the core's wire output is
 **byte-identical** — no corpus was regenerated.
 
-**Scope (no overclaim).**  This is the **`data_protection` tier + the shared foundation only**.  The
-submessage (`metadata_protection`) and whole-RTPS (`rtps_protection`, the ~2.2 KB/datagram) AEAD tiers
-**reuse** this foundation in **Slice 2** — they are **not** zero-alloc yet.  Do not read this as "all AEAD
-tiers are zero-alloc."  See ADR 0038 for the per-component before→after and the residual carries.
+**Scope.**  Slice 1 (this section) delivered the **`data_protection` tier + the shared foundation**.  The
+submessage (`metadata_protection`) and whole-RTPS (`rtps_protection`, the ~2.2 KB/datagram) AEAD tiers **reuse**
+this foundation in **Slice 2** (§3.5) — as of **2026-07-02 all three AEAD tiers are zero-alloc** on the common
+path.  The one remaining allocating path is **origin authentication** (receiver-specific MACs) — see §3.5.  See
+ADR 0038 for the Slice-1 per-component before→after and ADR 0039 for Slice 2.
+
+### 3.5 Zero-alloc secured submessage + whole-RTPS — Slice 2 (WP-DDS-SECURITY-ZEROALLOC-AEAD Slice 2, ADR 0039)
+
+Slice 2 extends the §3.4 foundation to the other two AEAD tiers, so **all three tiers are now zero GC-heap-alloc
+per sample** on the live secured path — send **and** receive:
+
+- **submessage (`metadata_protection`, §8.5.1.7-.9)** — the `SEC_PREFIX`(0x31) / `SEC_BODY`(0x30) /
+  `SEC_POSTFIX`(0x32) bracket around each user submessage;
+- **whole-RTPS (`rtps_protection`, §8.5.1.10-.12)** — the `SRTPS_PREFIX`(0x33) / `SRTPS_POSTFIX`(0x34) sandwich
+  around the whole post-header datagram (the ~2.2 KB/datagram dominant cost).
+
+Both go through one shared **into-buffer codec core** `%encode/%decode-secured-region-into` (over which the
+allocating entries — and the six `encode/decode-{datawriter,datareader,rtps}-{sub,}message-into` twins — are now
+thin wrappers, so the byte-exact corpus proves the core's wire is byte-identical). It reuses the §3.4 into-buffer FFI
+extended with an **AAD-region** arm (`aes-256-gcm-{seal,open}-into` gained `&optional aad-off aad-len`): a SIGN
+(integrity-only) GMAC over a sub-range of the datagram now needs **no** verbatim-region `subseq` (SIGN
+decode-into 49.14 → 0.0000 B/call).
+
+**The five per-node scratch pools.**  The dataplane wraps/unwraps borrow from five foreign/static pools on the
+`disc-node` (all lazy-carved on the first secured send/receive — zero static memory when no secured traffic occurs —
+each a per-thread-distinct acquire/release via the one DRY `%with-scratch` macro, torn down at `stop-node`; capacity
+`*srtps-send-scratch-capacity*`, default 8, over the ≤3 receiver threads + the concurrent sender threads):
+
+| Pool | Role |
+|---|---|
+| `send-scratch` | SRTPS wrap output (`%maybe-wrap-srtps`) — replaces a per-call `alloc-static (+ len 8192)` + a `[20,len)` subseq |
+| `submsg-scratch` | multi-bracket submessage wrap output (`%maybe-wrap-user-submessages`) — replaces a per-datagram `make-octet-buffer` + per-submessage subseq |
+| `secure-rx` | decode OUTPUT (SRTPS unwrap / submessage re-dispatch), a **distinct buffer per concurrent decode** |
+| `bracket-rx` | decode INPUT — the `SEC` bracket sub-region copy (replaces a per-`SEC_PREFIX` `make-array`) |
+| `key-id-rx` | the 4-octet `transformation_key_id` scratch for the `equalp` key_id resolvers (replaces a per-datagram subseq) |
+
+The send wrap reads the plaintext from the reused `tx-msg`, writes the (larger: ENCRYPT +56 B / SIGN +48 B) bracket
+into a **separate** pooled scratch, then `replace`s it back in place — no in-place aliasing.  `secure-rx` /
+`bracket-rx` are distinct pools so a decode never reads its input from the buffer it is writing its output into, and
+each concurrent receiver thread borrows its **own** buffer (the Slice-2 review caught and fixed a shared-RX-buffer
+race here).
+
+**Exhaustion is fail-closed, never a GC fallback.**  A drained send/`submsg-scratch` pool → the required wrap returns
+`NIL` (a `RESOURCE_LIMITS` drop); a drained `bracket-rx` pool → the metadata datagram is dropped and re-delivered on
+release.  The drop lands only on reliable/retried paths (reliable PVMS + secure-SEDP, ACKNACK-repairable), never on
+the best-effort plain-DATA path.  A subtlety worth noting: `%maybe-wrap-user-submessages` runs a **zero-alloc
+pre-scan** when the scratch is unavailable, so a pass-through datagram that needs no protection (all `INFO_*`
+submessages) is **not** dropped on exhaustion — the pre-scan shares its protectability predicate with the wrap loop
+(DRY), so the two cannot disagree.
+
+**No new app-facing contract.**  These two tiers are transparent dataplane wraps — the application publishes and
+receives exactly as before; the pools are internal to the `disc-node`.  The inner `data_protection` payload of a
+recovered submessage still uses the §3.3 secured-read loan on a loan-capable reader.
+
+**Scope (no overclaim).**  **Origin authentication** (receiver-specific MACs,
+`..._WITH_ORIGIN_AUTHENTICATION`, §9.5.3.3.4.3) stays the **deferred allocating fallback** — it is off the common
+empty-receivers path (the corpora and e2e use no origin-auth), and the `-into` cores fall back to the allocating
+receiver-MAC path when `receivers` is non-empty (correct, byte-identical, fail-closed, but it allocates).  Do **not**
+read Slice 2 as making origin-auth zero-alloc.  The non-tier ZA-1 residuals (key-material foreign-hardening, ZC ×
+`rtps_protection` SHMEM cleartext, saved-image FFI-pointer re-resolve, PAL atomics stubs) are unchanged/open.  See
+ADR 0039 for the per-component before→after (SRTPS send 196.56 → 0.00; metadata send 196-213 → 0; metadata RX decode
+98 → 0) and the residual carries.
 
 ---
 

@@ -381,7 +381,8 @@
 ;;; sequence is identical to aes-256-gcm-seal/open, so the output is byte-for-byte identical
 ;;; (NIST SP 800-38D Appendix B Test Case 16, asserted by the dare-aes-gcm-kat into-buffer arm).
 
-(defun* aes-256-gcm-seal-into (out ct-off tag-off key nonce-vec nonce-off aad pt pt-off pt-len)
+(defun* aes-256-gcm-seal-into (out ct-off tag-off key nonce-vec nonce-off aad pt pt-off pt-len
+                               &optional (aad-off 0) (aad-len (length aad)))
     (function ((simple-array (unsigned-byte 8) (*))
                fixnum
                fixnum
@@ -391,20 +392,34 @@
                (simple-array (unsigned-byte 8) (*))
                (simple-array (unsigned-byte 8) (*))
                fixnum
-               fixnum)
+               fixnum
+               &optional fixnum fixnum)
               (eql t))
   "AES-256-GCM authenticated encryption into a caller's static buffer (FIPS 197 + NIST SP 800-38D).
    Writes PT-LEN ciphertext octets into OUT[CT-OFF..] and the 16-byte tag into OUT[TAG-OFF..]
    directly through OUT's GC-stable static SAP (no make-array; zero GC-heap output allocation).
-   NONCE = NONCE-VEC[NONCE-OFF..+12]; PLAINTEXT = PT[PT-OFF..+PT-LEN]; AAD authenticated in full.
+   NONCE = NONCE-VEC[NONCE-OFF..+12]; PLAINTEXT = PT[PT-OFF..+PT-LEN]; AAD = AAD[AAD-OFF..+AAD-LEN]
+   (optional; default aad-off=0, aad-len=(length aad), i.e. the whole vector — backward-compatible,
+   so every existing caller is byte-identical). PT-LEN=0 (SIGN/GMAC, DDS-Security §9.5.3.3.4.3): no
+   ciphertext bytes written; only the 16-byte GMAC tag at OUT[TAG-OFF..] over the AAD sub-range — the
+   symmetric mate of AES-256-GCM-OPEN-INTO's aad-off/aad-len, letting a caller GMAC a region of a larger
+   buffer BY OFFSET (no subseq; the whole-RTPS SIGN wrap authenticates exactly the verbatim submessage
+   stream, not the surrounding buffer). AAD may alias OUT's backing memory (the SIGN verbatim region in
+   the same buffer): EVP_EncryptUpdate(AAD) runs before GET_TAG writes the tag, so aad-ptr / out-SAP
+   aliasing is safe regardless of offset overlap.
    OUT MUST be an ALLOC-STATIC-backed vector with room for CT-OFF+PT-LEN and TAG-OFF+16 octets.
    Same EVP_Encrypt* sequence as AES-256-GCM-SEAL so the output is byte-identical (NIST SP 800-38D
    Appendix B TC16). Key buffer is zeroized before return. Returns T. Signals on any EVP error.
    Zero-alloc (~0 GC-heap B/call on SBCL): the plaintext is staged into OUT[CT-OFF..] and encrypted
    IN PLACE (EVP in==out via dds.pal:static-sap+, an inline non-boxing SAP into OUT), so no per-call
-   ciphertext/plaintext SAP is boxed; NULL args use the cached *%NULL-PTR*; the only scratch is the
-   constant-size key/nonce/outl buffers plus one variable-size AAD buffer."
-  (let ((aad-len (length aad)))
+   ciphertext/plaintext SAP is boxed; the AAD is pinned and offset via cffi:inc-pointer (no copy, 0 cons);
+   NULL args use the cached *%NULL-PTR*; the only scratch is the constant-size key/nonce/outl buffers."
+  (let ()
+    (declare (type fixnum aad-off aad-len))
+    ;; O(1) AAD-region bounds (safety-0-safe; NFR-SEC-POSTURE) — mirror aes-256-gcm-open-into
+    (unless (<= (+ aad-off aad-len) (length aad))
+      (error "aes-256-gcm-seal-into: AAD region [~d,+~d) out of bounds (vector length ~d)"
+             aad-off aad-len (length aad)))
     ;; O(1) output-extent bounds: unconditional, safety-0-safe (the operating contract §4)
     (unless (<= (+ ct-off pt-len) (dds.pal:static-length out))
       (error "aes-256-gcm-seal-into: OUT too small for CT region (need ~d, have ~d)"
@@ -463,13 +478,13 @@
                                 :int)))
                        (unless (= rc 1)
                          (error "EVP_EncryptInit_ex(key,nonce) failed (rc=~a)" rc)))
-                     ;; feed AAD (outl is discarded for AAD)
+                     ;; feed AAD sub-range [aad-off, aad-off+aad-len) via cffi:inc-pointer offset (outl discarded for AAD)
                      (when (> aad-len 0)
                        (let ((rc (cffi:foreign-funcall-pointer
                                   (%ossl-sym "EVP_EncryptUpdate") nil
                                   :pointer ctx
                                   :pointer *%null-ptr* :pointer outl-ptr
-                                  :pointer aad-ptr :int aad-len
+                                  :pointer (cffi:inc-pointer aad-ptr aad-off) :int aad-len
                                   :int)))
                          (unless (= rc 1)
                            (error "EVP_EncryptUpdate(AAD) failed (rc=~a)" rc))))
@@ -509,7 +524,8 @@
                  (%ossl-sym "EVP_CIPHER_CTX_free") nil :pointer ctx :void)))))))
     t))
 
-(defun* aes-256-gcm-open-into (pt-out pt-off key nonce-vec nonce-off aad ct-vec ct-off ct-len tag-vec tag-off)
+(defun* aes-256-gcm-open-into (pt-out pt-off key nonce-vec nonce-off aad ct-vec ct-off ct-len tag-vec tag-off
+                               &optional (aad-off 0) (aad-len (length aad)))
     (function ((simple-array (unsigned-byte 8) (*))
                fixnum
                (simple-array (unsigned-byte 8) (*))
@@ -520,13 +536,18 @@
                fixnum
                fixnum
                (simple-array (unsigned-byte 8) (*))
-               fixnum)
+               fixnum
+               &optional fixnum fixnum)
               (or (eql t) null))
   "AES-256-GCM authenticated decryption into a caller's static buffer (FIPS 197 + NIST SP 800-38D).
    On auth success writes CT-LEN plaintext octets into PT-OUT[PT-OFF..] directly through PT-OUT's
    GC-stable static SAP and returns T; on authentication failure returns NIL and zeroizes the
    CT-LEN-octet output region so NO readable plaintext remains (fail-closed, SP 800-38D §7.2).
    NONCE = NONCE-VEC[NONCE-OFF..+12]; CIPHERTEXT = CT-VEC[CT-OFF..+CT-LEN]; TAG = TAG-VEC[TAG-OFF..+16].
+   AAD = AAD[AAD-OFF..+AAD-LEN] (optional; default aad-off=0, aad-len=(length aad), backward-compatible).
+   CT-LEN=0 (SIGN/GMAC verify, DDS-Security §9.5.3.3.4.3): no plaintext bytes are written;
+   EVP_DecryptFinal_ex authenticates the AAD-only GHASH against TAG-VEC[TAG-OFF..+16], returning T
+   on match and NIL on mismatch (fail-closed; no-op output wipe since CT-LEN=0).
    PT-OUT MUST be an ALLOC-STATIC-backed vector with room for PT-OFF+CT-LEN octets.
    Same EVP_Decrypt* sequence as AES-256-GCM-OPEN so the plaintext is byte-identical. Key buffer is
    zeroized before return; NEVER leaves plaintext readable on auth failure (NIST SP 800-38D §7.2).
@@ -534,12 +555,16 @@
    IN PLACE (EVP in==out via dds.pal:static-sap+, an inline non-boxing SAP into PT-OUT), so no per-call
    ciphertext/plaintext SAP is boxed; NULL args use the cached *%NULL-PTR*; the fail-closed wipe zeroes
    the PT-OUT region through its static-vector aref (0 cons); scratch is the constant-size
-   key/nonce/tag/outl buffers plus one variable-size AAD buffer."
-  (let ((aad-len (length aad)))
+   key/nonce/tag/outl buffers; AAD is pinned and offset via cffi:inc-pointer (no copy, 0 cons)."
+  (declare (type fixnum aad-off aad-len))
+  (let ()
     ;; O(1) output-extent bounds: unconditional, safety-0-safe (the operating contract §4)
     (unless (<= (+ pt-off ct-len) (dds.pal:static-length pt-out))
       (error "aes-256-gcm-open-into: PT-OUT too small for plaintext region (need ~d, have ~d)"
              (+ pt-off ct-len) (dds.pal:static-length pt-out)))
+    (unless (<= (+ aad-off aad-len) (length aad))
+      (error "aes-256-gcm-open-into: AAD region [~d,+~d) out of bounds (vector length ~d)"
+             aad-off aad-len (length aad)))
     ;; stage ciphertext into PT-OUT's plaintext region for in-place GCM (EVP in==out; aref, 0 cons)
     (dotimes (i ct-len)
       (setf (aref pt-out (+ pt-off i)) (aref ct-vec (+ ct-off i))))
@@ -547,7 +572,7 @@
       (cffi:with-foreign-pointer (nonce-ptr +aes-gcm-nonce-len+)
         (cffi:with-foreign-pointer (tag-ptr +aes-gcm-tag-len+)
           (cffi:with-foreign-object (outl-ptr :int)
-            ;; AAD is read-only: pin the caller's vector and pass its SAP in place (no copy, no variable-size scratch, 0 cons)
+            ;; AAD is read-only: pin caller's vector, advance SAP to aad-off via cffi:inc-pointer (0 cons)
             (cffi:with-pointer-to-vector-data (aad-ptr aad)
               (dotimes (i +aes-256-gcm-key-len+)
                 (setf (cffi:mem-aref key-ptr :uint8 i) (aref key i)))
@@ -599,13 +624,13 @@
                                   :pointer tag-ptr :int)))
                          (unless (= rc 1)
                            (error "EVP_CIPHER_CTX_ctrl(SET_TAG) failed (rc=~a)" rc)))
-                       ;; feed AAD
+                       ;; feed AAD sub-range [aad-off, aad-off+aad-len) via cffi:inc-pointer offset
                        (when (> aad-len 0)
                          (let ((rc (cffi:foreign-funcall-pointer
                                     (%ossl-sym "EVP_DecryptUpdate") nil
                                     :pointer ctx
                                     :pointer *%null-ptr* :pointer outl-ptr
-                                    :pointer aad-ptr :int aad-len
+                                    :pointer (cffi:inc-pointer aad-ptr aad-off) :int aad-len
                                     :int)))
                            (unless (= rc 1)
                              (error "EVP_DecryptUpdate(AAD) failed (rc=~a)" rc))))

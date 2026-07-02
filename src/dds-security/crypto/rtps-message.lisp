@@ -85,3 +85,47 @@
    to the shared %decode-secured-region engine (sign-walk-p T). Inverse: encode-rtps-message."
   (%decode-secured-region km srtps-octets my-receiver-key-id my-receiver-key
                           +submessage-srtps-prefix+ +submessage-srtps-postfix+ t))
+
+;;;; ZERO-ALLOC (Slice 2 / ZA-2 T3): the into-buffer whole-RTPS tier for the live dataplane. The allocating
+;;;; encode/decode-rtps-message above stay unchanged (the WITH_ORIGIN_AUTHENTICATION receiver-MAC gate + the
+;;;; deferred allocating fallback ride them); the -into entries below let the dds.disc send/receive paths wrap /
+;;;; unwrap SRTPS through a caller-owned STATIC buffer BY RAW OFFSET (no per-datagram subseq / →octets), reusing
+;;;; the SAME %encode/%decode-secured-region-into cores as the submessage tier (DRY). Byte-identical wire.
+
+(defun* encode-rtps-message-into (out-buf out-off km kind plain plain-off plain-len &key (receivers '()))
+    (function (dds.core.buffer:octet-buffer fixnum key-material (member :sign :encrypt)
+               (simple-array (unsigned-byte 8) (*)) fixnum fixnum &key (:receivers list))
+              fixnum)
+  "Protect the submessage stream PLAIN[PLAIN-OFF..+PLAIN-LEN] (everything AFTER the 20-octet RTPS Header) under
+   the ParticipantCrypto KeyMaterial KM per KIND (:sign | :encrypt) directly INTO the caller's STATIC octet-buffer
+   OUT-BUF starting at OUT-OFF, and return the total SRTPS_PREFIX(0x33) ‖ <body> ‖ SRTPS_POSTFIX(0x34) bracket
+   length — the zero-alloc, into-buffer twin of encode-rtps-message (which allocates a fresh →octets vector). The
+   thin whole-RTPS delegation to the shared %encode-secured-region-into core with the SRTPS bracket ids; BYTE-
+   IDENTICAL to encode-rtps-message by construction (same core), so the T4 byte-exact corpus covers it. Works BY
+   OFFSET for BOTH kinds (the SIGN GMAC AAD is bounded to PLAIN[PLAIN-OFF..+PLAIN-LEN]). Common path (RECEIVERS
+   empty) conses ~0 GC-heap B/call; RECEIVERS non-empty (origin authentication, §9.5.3.3.4.3) is the core's
+   deferred allocating fallback (still written into OUT-BUF). OUT-BUF must hold OUT-OFF + the bracket length, else
+   BUFFER-OVERFLOW (an O(1) extent check BEFORE any write, safety-0-safe; NFR-SEC-POSTURE — the caller fail-closes
+   / drops on overflow). Consumed by dds.disc %maybe-wrap-srtps over a per-node send-scratch pool. Inverse:
+   decode-rtps-message-into."
+  (%encode-secured-region-into out-buf out-off km kind plain plain-off plain-len receivers
+                               +submessage-srtps-prefix+ +submessage-srtps-postfix+))
+
+(defun* decode-rtps-message-into (pt-out pt-off km secured secured-off secured-len)
+    (function (dds.core.buffer:octet-buffer fixnum key-material
+               (simple-array (unsigned-byte 8) (*)) fixnum fixnum)
+              (values (or fixnum null) (or (member :sign :encrypt) null) (or fixnum null) (or fixnum null)))
+  "Recover the protected submessage stream from an SRTPS_PREFIX ... SRTPS_POSTFIX bracket in
+   SECURED[SECURED-OFF..+SECURED-LEN] under KM BY RAW OFFSET; return (values DATA-LEN MODE DATA-OFF POSTFIX-OFF),
+   or a single NIL on ANY failure (fail-closed; NFR-SEC-POSTURE) — the zero-alloc, into-buffer twin of
+   decode-rtps-message (which allocates the recovered vector). The thin whole-RTPS delegation to the shared
+   %decode-secured-region-into core (SIGN-WALK-P T — the whole-RTPS SIGN body is located by WALKING the submessage
+   stream to the trailing SRTPS_POSTFIX). The core validates the bracket + verifies the common_mac before any AEAD
+   open. ENCRYPT: aes-256-gcm-open-into writes the recovered stream into PT-OUT[PT-OFF..+DATA-LEN] (zero GC-heap
+   alloc); DATA-OFF is the ciphertext offset in SECURED. SIGN: NO copy into PT-OUT — DATA-OFF is the verbatim-region
+   offset in SECURED (the caller moves it in place); DATA-LEN its length. POSTFIX-OFF is the SRTPS_POSTFIX offset.
+   ORIGIN AUTHENTICATION (§9.5.3.3.4.3) is NOT verified here (the -into core does the common_mac only) — the
+   WITH_ORIGIN_AUTHENTICATION tier stays on the allocating decode-rtps-message (its receiver-MAC gate); dds.disc
+   %handle-datagram routes origin-auth there and the common tier through here. Consumed over a reused per-node RX
+   buffer. Inverse: encode-rtps-message-into."
+  (%decode-secured-region-into pt-out pt-off km secured secured-off secured-len t))

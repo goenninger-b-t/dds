@@ -465,19 +465,24 @@ work-package ledger:
    `transformation_key_id`-resolved endpoint equals the inner writerId. Benign today (the path requires a
    genuine authenticated+keyed peer's EntityCrypto); a one-line consistency assert (resolved-endpoint ==
    inner writerId) would be defense-in-depth against future routing logic changes.
-3. **Zero-alloc into-buffer AEAD on the data path — PARTIALLY RESOLVED (ADR 0038, WP-DDS-SECURITY-ZEROALLOC-AEAD,
-   2026-07-01).** The **`data_protection` (serialized-payload) tier + the shared into-buffer foundation are resolved
-   in ADR 0038**: an into-buffer AEAD FFI (`aes-256-gcm-{seal,open}-into`) + `dds.pal:static-sap+` (FFI 864 → 0.000
-   B/iter) + a session-key cache + an into-buffer codec core (`encode/decode-serialized-payload-into`; the existing
-   entries are now thin wrappers) + a refcount-gated encode payload pool (353 → 0.0) + a loaned decode-plaintext pool
-   (4042 → 0.0) make the LIVE `data_protection` publish + receive path zero GC-alloc/sample, and `make mem` gained
-   security-ON arms (`aead-encode`/`-decode`/`-live-pub`/`-live-rx`, all 0.0000) that finally cover the security path.
-   **The submessage (`metadata_protection`) + whole-RTPS (`rtps_protection`, the ~2.2 KB/datagram) tiers are CARRIED
-   to Slice 2** — they REUSE the same foundation; they are NOT zero-alloc yet. Wire byte-identical throughout (NIST
-   KAT + every byte-exact corpus green UNCHANGED). Original note (still true for the un-migrated tiers): the SRTPS
-   send/receive buffer is reused in place but the codec's `→octets` return + the AEAD intermediates leave a ~2.2 KB
-   /datagram heap residual (OpenSSL-FFI dominates the ~5 µs/op); do not read a green `make mem` on the CDR path as
-   covering the dds-disc rtps path — the security-ON arms cover only the `data_protection` tier.
+3. **Zero-alloc into-buffer AEAD on the data path — FULLY RESOLVED (ADR 0038 + ADR 0039,
+   WP-DDS-SECURITY-ZEROALLOC-AEAD Slices 1+2, 2026-07-02).** **All three AEAD tiers are now zero GC-alloc/sample on
+   the LIVE secured path (send AND receive).** Slice 1 (ADR 0038) resolved the **`data_protection` (serialized-payload)
+   tier + the shared into-buffer foundation**: an into-buffer AEAD FFI (`aes-256-gcm-{seal,open}-into`) +
+   `dds.pal:static-sap+` (FFI 864 → 0.000 B/iter) + a session-key cache + an into-buffer codec core
+   (`encode/decode-serialized-payload-into`; the existing entries are now thin wrappers) + a refcount-gated encode
+   payload pool (353 → 0.0) + a loaned decode-plaintext pool (4042 → 0.0). Slice 2 (ADR 0039) resolved the remaining
+   **submessage (`metadata_protection`, §8.5.1.7-.9) + whole-RTPS (`rtps_protection`, §8.5.1.10-.12, the ~2.2 KB
+   /datagram) tiers** by REUSING that foundation: the `%encode/%decode-secured-region-into` core (the SRTPS + SEC
+   brackets, with an FFI AAD-region arm making the SIGN sub-range subseq-free — SIGN decode-into 49.14 → 0.0000) over
+   the existing entries turned into thin wrappers + five per-node static scratch pools wired into `%maybe-wrap-srtps`
+   (SRTPS send 196.56 → 0.00) and `%maybe-wrap-user-submessages` (metadata send 196-213 → 0, RX decode 98 → 0). `make
+   mem` now covers the security path for every tier (the ZA-1 `aead-*` arms + four ZA-2 `meta-send`/`meta-recv`/
+   `rtps-send`/`rtps-recv` arms, all 0.0000); pool exhaustion → RESOURCE_LIMITS backpressure, never a GC fallback.
+   Wire byte-identical throughout (NIST KAT + every byte-exact corpus green UNCHANGED). **Scope (no overclaim):**
+   origin authentication (receiver-specific MACs, `..._WITH_ORIGIN_AUTHENTICATION`) stays the deferred allocating
+   fallback off the common empty-receivers path — NOT zero-alloc (ADR 0039 Residual (a)); the earlier "~2.2 KB
+   /datagram SRTPS residual" note is superseded for the common path.
 4. **Per-topic `metadata_protection_kind` applied to user endpoints.** The primitive supports it and the
    governance field is parsed, but selective per-user-endpoint submessage protection is not wired —
    `rtps_protection` already protects user datagrams wholesale, so nothing is left in the clear; this is a thin
