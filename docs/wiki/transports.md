@@ -629,6 +629,22 @@ reference is **untrusted cross-process input**: the resolver bounds-checks the s
 even at `(safety 0)` (NFR-SEC-POSTURE); an invalid reference is dropped (best-effort). With `*zerocopy-enabled*`
 `nil` (the default) the data path is **byte-identical** to the non-ZC path.
 
+**Security gate — no cleartext payload in SHMEM for a secured writer (DDS-Security 1.1 §8.5; ADR 0036 Carry 10).**
+The raw Zero-Copy path puts the serialized payload in the shared pool **out-of-band** from the datagram, and the
+datagram-tier transforms — `rtps_protection` (whole-RTPS, §8.5.1.10-.12) and `metadata_protection`
+(user-submessage, §8.5.1.7-.9) — are applied to the *datagram* at send time, which under Zero-Copy carries only the
+16-byte reference. So those transforms would encrypt the reference while the actual payload sat in shared memory **in
+the clear**. Therefore the selection has one more, **fail-closed** requirement: the writer's governance must **not**
+mandate datagram-tier protection — `%zc-payload-wire-protected-p` is T (and the raw Zero-Copy path is disabled) when
+`disc-node-rtps-protection-kind` **or** `disc-node-user-submessage-protection-kind` ≠ `:none`. A secured writer's
+large sample instead takes the normal serialized-DATA path, whose datagram `%send-raw-buf` protects (submessage +
+SRTPS wrap) over UDP **or the SHMEM ring** — the ring wraps the whole datagram in place before transmission, so it
+never leaks; only the out-of-band Zero-Copy pool did. `data_protection` (payload tier) is applied at serialize time,
+so a `data_protection`-only writer keeps Zero-Copy (the pool holds the already-encrypted SecuredPayload). A
+non-secured writer (both kinds `:none`, the default) is untouched — full Zero-Copy performance, byte-identical and
+zero-alloc. Proof: `dds.disc:run-zc-shmem-secured-cleartext-test` (Part B inspects the live pool segment and asserts
+the secured payload is provably absent while a non-secured control's marker is present).
+
 | Symbol | Kind | Meaning |
 |---|---|---|
 | `dds.disc:*zerocopy-enabled*` | special var | **Default `NIL`.** Read once per node at `make-disc-node`; when `T` (and SHMEM is available) the node builds a Zero-Copy writer pool and advertises `PID_ZEROCOPY_CAPABLE`. NOT cleared for ship — pending counsel (R6). |

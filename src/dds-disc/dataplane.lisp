@@ -817,6 +817,24 @@
           (lambda (mc) (dds.rtps.message:write-heartbeat
                         mc dds.rtps.message:+entityid-unknown+ wid first last count :final nil)))))
 
+(defun* %zc-payload-wire-protected-p (node)
+    (function (disc-node) boolean)
+  "T iff NODE's user writer is under a DATAGRAM- or SUBMESSAGE-tier governance protection that the raw
+   Zero-Copy/SHMEM sample-pool would BYPASS: rtps_protection (whole-RTPS, DDS-Security 1.1 §8.5.1.10-.12 /
+   §9.4.1.2.3) or metadata_protection (user-submessage, §8.5.1.7-.9 / §9.4.1.2.4) with a non-NONE kind.
+   Those tiers are applied to the DATAGRAM at send time (%maybe-wrap-user-submessages then %maybe-wrap-srtps
+   in %send-raw-buf), AFTER the sample already sits in the pool — so with Zero-Copy only the 16-byte reference
+   datagram is wrapped while the user payload stays in shared memory in the CLEAR (ADR 0036 Carry 10). When
+   this is T the raw ZC path is DISABLED FAIL-CLOSED (%zc-change-item returns NIL) and the sample is emitted as
+   a normal DATA whose datagram %send-raw-buf protects over UDP or the SHMEM ring — so no cleartext user
+   payload ever lands in the ZC pool for a writer whose governance mandates payload/RTPS confidentiality.
+   data_protection (§9.4.1.2.4 data_protection_kind) is NOT gated here: it is applied at serialize time
+   (publish-sample), so the pool receives the already-transformed SecuredPayload (ciphertext for ENCRYPT,
+   plaintext+MAC for SIGN) and is never LESS protected than the wire at the payload tier. Both kinds default
+   :none, so a non-secured writer -> NIL -> the Zero-Copy/SHMEM fast path stays byte-identical + untouched."
+  (or (not (eq (disc-node-rtps-protection-kind node) :none))
+      (not (eq (disc-node-user-submessage-protection-kind node) :none))))
+
 (defun* %zc-change-item (node change zc-readers)
     (function (disc-node dds.rtps.history:cache-change (integer 0)) (or null cons))
   "WP-ZEROCOPY (FR-PF-3, ADR 0014): if CHANGE is a :data sample whose serialized payload is LARGER than
@@ -830,10 +848,16 @@
    fixed pool buffer (T5a), so loaning (length pl) would copy the garbage tail past the true length into
    the ZC slot, and the remote decode-serialized-payload-into exact-frame check (len == 44+ct_len+pad)
    would reject the sample (a secured+ZC false-reject). For a non-pooled change payload-len IS
-   (length serialized-payload) — byte-identical to the prior non-secured ZC path. NOT cleared for ship —
+   (length serialized-payload) — byte-identical to the prior non-secured ZC path.
+   SECURITY GATE (WP-SECURITY-ZC-SHMEM-CLEARTEXT, ADR 0036 Carry 10, DDS-Security 1.1 §8.5): when
+   %zc-payload-wire-protected-p (rtps_protection or metadata_protection non-NONE) the raw ZC path is
+   DISABLED fail-closed (returns NIL) — the datagram/submessage encryption those tiers apply lives OUTSIDE
+   the pool, so a raw payload in shared memory would be readable by any co-resident participant; the sample
+   instead takes the normal serialize -> %send-raw-buf (submessage+SRTPS wrap) path. NOT cleared for ship —
    pending counsel (R6)."
   (when (and (plusp zc-readers)
-             (eq (dds.rtps.history:cache-change-kind change) :data))
+             (eq (dds.rtps.history:cache-change-kind change) :data)
+             (not (%zc-payload-wire-protected-p node)))   ; fail-closed: never a cleartext payload in SHMEM for a wire-protected writer (ADR 0036 Carry 10)
     (let ((pl (dds.rtps.history:cache-change-serialized-payload change))
           (len (dds.rtps.history:cache-change-payload-len change)))   ; TRUE length, not the oversized pooled vec (T5a)
       (when (> len *zerocopy-min-payload-bytes*)

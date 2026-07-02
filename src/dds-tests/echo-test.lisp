@@ -2967,6 +2967,7 @@
                  ("rtps-protection-enforce"      . dds.disc:run-rtps-protection-enforce-test)
                  ("rtps-protection-enforce-reliability" . dds.disc:run-rtps-protection-enforce-reliability-test)
                  ("rtps-protection-enforce-user-bracket" . dds.disc:run-rtps-protection-enforce-user-bracket-test)
+                 ("zc-shmem-secured-cleartext"   . dds.disc:run-zc-shmem-secured-cleartext-test)
                  ("secure-participant-message"   . dds.disc:run-secure-participant-message-test)
                  ("secure-participant-message-tamper" . dds.disc:run-secure-participant-message-tamper-test)
                  ("secure-pm-origin-auth-roundtrip"   . dds.disc:run-secure-pm-origin-auth-roundtrip-test)

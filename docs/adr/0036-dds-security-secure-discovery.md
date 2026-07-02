@@ -502,9 +502,28 @@ work-package ledger:
    AAD is the 20-byte `SecureDataHeader`, where Fast DDS uses an EMPTY AAD for the payload tier — so the shipped
    Slice-1 data-protection is likely NOT Fast-DDS-interop on the payload tier. This pre-dates this slice and
    warrants its own ADR/decision (own WP or Slice 5); it was not changed here.
-10. **Zero-Copy × `rtps_protection` SHMEM cleartext.** With Zero-Copy/SHMEM transfer, only the 16-byte
-    reference datagram is RTPS-wrapped; the user payload sits in shared memory in the clear. Reconciling
-    SHMEM transfer with `rtps_protection` confidentiality is a backlog item.
+10. **Zero-Copy × `rtps_protection` SHMEM cleartext — RESOLVED (WP-SECURITY-ZC-SHMEM-CLEARTEXT, 2026-07-02).**
+    The leak: `%zc-change-item` → `%zc-ref-builder` → `dds.xport.zerocopy:%zc-loan`
+    (`src/dds-xport/zerocopy-pool.lisp`) copied the RAW cache-change payload into the SHMEM sample-pool slot
+    **out-of-band** from the datagram, while `%send-raw-buf` only wrapped the 16-byte *reference* datagram — so
+    **`rtps_protection`** (§8.5.1.10-.12, whole-RTPS) **and `metadata_protection`** (§8.5.1.7-.9, user-submessage),
+    both applied to the datagram at send time, were **bypassed** for the pool-resident payload, and a co-resident
+    participant mapping the segment could recover the plaintext. **`data_protection` was NOT bypassed** — it is
+    applied at serialize time (`publish-sample`), so the pool receives the already-encrypted SecuredPayload (the
+    T5a path). The fix (Option A, **fail-closed**): `%zc-payload-wire-protected-p` (`src/dds-disc/dataplane.lisp`)
+    **disables the raw Zero-Copy path** — `%zc-change-item` returns NIL, the sample takes the normal
+    serialize → submessage+SRTPS-wrap path over UDP or the SHMEM ring — whenever `rtps_protection_kind` or
+    `metadata_protection_kind` ≠ NONE for the writer; the sample is delivered encrypted, **no cleartext user
+    payload ever lands in SHMEM**. A non-secured writer (both kinds `:none`, the default) keeps full
+    zero-copy/SHMEM performance byte-identical + zero-alloc — the gate keys purely on the writer's governance.
+    Wire byte-identical (a transport-routing gate, not a codec change); the byte-exact security corpora + NIST KAT
+    are UNCHANGED. Proof: `run-zc-shmem-secured-cleartext-test` (Part A deterministic + portable both impls; Part B
+    inspects the live pool segment and asserts the secured payload is provably ABSENT while a non-secured control
+    IS present — non-vacuous). This refines the original carry note, which named only `rtps_protection`.
+    **FORWARD REQUIREMENT (gate obligation on a future WP):** the planned FlatData in-place *loan-write* API
+    (`dataplane.lisp` — writing the sample straight into the pool slot, bypassing `%zc-loan`) MUST apply the same
+    `%zc-payload-wire-protected-p` gate at its new write site, or this SHMEM-cleartext leak reopens for secured
+    writers. Record this in that WP's acceptance criteria.
 11. **Live RTI Connext-Security secure-discovery interop — the P6 exit gate.** Requires the licensed Security
     Plugins (not installed). The Fast DDS-Security peer + harness + run scripts now exist in
     `interop/security-secure-discovery/` for Slice 5.

@@ -366,10 +366,10 @@ recovered submessage still uses the §3.3 secured-read loan on a loan-capable re
 
 **Scope (Slice 2).**  Slice 2 made the common empty-receivers ENCRYPT/SIGN path of both tiers zero-alloc.  **Origin
 authentication** (receiver-specific MACs, `..._WITH_ORIGIN_AUTHENTICATION`, §9.5.3.3.4.3) was left as the deferred
-allocating fallback (ADR 0039 residual (a)) — now **closed** in §3.6.  The non-tier ZA-1 residuals (key-material
-foreign-hardening, ZC × `rtps_protection` SHMEM cleartext, saved-image FFI-pointer re-resolve, PAL atomics stubs) are
-unchanged/open.  See ADR 0039 for the Slice-2 per-component before→after (SRTPS send 196.56 → 0.00; metadata send
-196-213 → 0; metadata RX decode 98 → 0) and the residual carries.
+allocating fallback (ADR 0039 residual (a)) — now **closed** in §3.6.  Of the non-tier ZA-1 residuals, **ZC ×
+`rtps_protection` SHMEM cleartext is now closed in §3.7**; the rest (key-material foreign-hardening, saved-image
+FFI-pointer re-resolve, PAL atomics stubs) are unchanged/open.  See ADR 0039 for the Slice-2 per-component
+before→after (SRTPS send 196.56 → 0.00; metadata send 196-213 → 0; metadata RX decode 98 → 0) and the residual carries.
 
 ### 3.6 Zero-alloc origin authentication — receiver-specific MACs (WP-SECURITY-ORIGIN-AUTH-ZEROALLOC, ADR 0039 residual (a))
 
@@ -415,6 +415,37 @@ fails-closed to a drop).
   `-into` verify entries (right key recovers byte-exact; wrong/absent key → NIL; no key → common_mac alone) and
   `run-security-crypto-manager-test` drives the T10 `cm-rtps-*` resolvers through the memoized path, so the mem arms
   are **non-vacuous**.
+
+### 3.7 No cleartext payload in SHMEM for a secured writer — the Zero-Copy governance gate (ADR 0036 Carry 10)
+
+Zero-Copy over shared memory (`*zerocopy-enabled*`, FR-PF-3) publishes a large sample by copying its serialized
+payload **once** into a per-writer SHMEM sample-pool and transmitting only a **16-byte reference** in the DATA
+submessage.  The datagram-tier security transforms — `rtps_protection` (§8.5.1.10-.12, whole-RTPS) and
+`metadata_protection` (§8.5.1.7-.9, user-submessage) — are applied in `%send-raw-buf` to the **datagram** at send
+time, *after* the payload is already in the pool.  With Zero-Copy that datagram carries only the reference, so those
+transforms would wrap the **reference**, leaving the actual user payload sitting in shared memory **in the clear** —
+a co-resident participant mapping the segment could recover plaintext that governance requires be confidential on the
+wire.  (`data_protection`, §9.4.1.2.4, is different: it is applied at serialize time in `publish-sample`, so the pool
+receives the already-transformed SecuredPayload — ciphertext for ENCRYPT — and is never *less* protected than the
+wire at the payload tier.)
+
+The fix is **fail-closed** and gates purely on the writer's governance.  `%zc-payload-wire-protected-p`
+(`src/dds-disc/dataplane.lisp`) is T when the writer's `rtps_protection_kind` **or** `metadata_protection_kind`
+(`disc-node-rtps-protection-kind` / `disc-node-user-submessage-protection-kind`) is ≠ `:none`.  When it is T,
+`%zc-change-item` returns NIL — **the raw Zero-Copy path is disabled** and the sample is emitted as a normal DATA
+whose datagram `%send-raw-buf` protects (submessage + SRTPS wrap) over UDP **or the SHMEM ring** (the ring send wraps
+the whole datagram in place *before* transmission, so it never leaks — only the out-of-band Zero-Copy pool did).  The
+reader receives and decrypts the sample exactly as on the non-Zero-Copy path.  You cannot both zero-copy *and*
+encrypt the same in-place buffer, so a secured writer trades the raw-pool optimization for confidentiality — the
+bounded, clearly-secure choice.
+
+A **non-secured** writer (both kinds `:none`, the default — no governance, or every kind NONE) is completely
+untouched: the predicate is NIL, so Zero-Copy/SHMEM keeps full performance, byte-identical and zero-alloc.  This is a
+transport-routing gate, **not a codec change** — the wire is byte-identical and every byte-exact security corpus +
+NIST KAT is unchanged.  `run-zc-shmem-secured-cleartext-test` proves it: Part A (deterministic, both impls) checks the
+predicate and that `%zc-change-item` returns NIL under `rtps_protection` and under `metadata_protection`; Part B
+(where SHMEM is available) inspects the **live pool segment** and asserts the secured payload is provably **absent**
+while a non-secured control's marker **is** present (non-vacuous).
 
 ---
 

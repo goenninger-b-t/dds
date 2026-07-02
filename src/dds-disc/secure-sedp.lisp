@@ -1065,6 +1065,94 @@
            t)
       (stop-node node-a) (stop-node node-b))))
 
+(defun* run-zc-shmem-secured-cleartext-test ()
+    (function () (eql t))
+  "WP-SECURITY-ZC-SHMEM-CLEARTEXT (ADR 0036 Carry 10, DDS-Security 1.1 §8.5): the raw Zero-Copy/SHMEM
+   sample-pool must NEVER hold a CLEARTEXT user payload for a writer whose governance mandates payload/RTPS
+   confidentiality. rtps_protection (§8.5.1.10-.12, whole-RTPS) and metadata_protection (§8.5.1.7-.9,
+   user-submessage) wrap the DATAGRAM at send time (%send-raw-buf), AFTER the sample is loaned into the pool
+   — so with Zero-Copy only the 16-byte reference datagram is wrapped while the payload sits in shared memory
+   in the clear (the leak). The fix (%zc-payload-wire-protected-p) DISABLES the raw ZC path fail-closed for
+   such a writer, routing the sample through the normal serialize -> submessage+SRTPS wrap path. data_protection
+   is NOT gated (applied at serialize time -> the pool receives the already-encrypted SecuredPayload). Asserts:
+     Part A (deterministic + portable; NO SHMEM — the gate short-circuits BEFORE any pool access):
+       (A1) the gate predicate: both kinds :none -> NIL (non-secured, ZC allowed); the probe change is
+            ZC-size-eligible (:data, payload-len > the threshold).
+       (A2) rtps_protection :encrypt/:sign -> predicate T and %zc-change-item returns NIL (ZC NOT taken —
+            %zc-loan never called) even with zc-readers>0 + a large payload; likewise metadata_protection
+            :encrypt; resetting both kinds to :none restores eligibility (non-secured fast path untouched).
+     Part B (SHMEM-gated live-segment inspection; skips where SHMEM/ZC is off — Clasp/macOS, ADR 0013): with a
+       REAL writer pool, a NON-secured writer DOES loan the marker into the pool (zc-sends advances, the marker
+       bytes ARE in the segment — the leak the gate closes, so the probe is non-vacuous), while the SAME node
+       under rtps_protection :encrypt with a FRESH marker does NOT (zc-sends unchanged, and the fresh marker is
+       provably ABSENT from the ENTIRE pool segment — no cleartext user payload in SHMEM). Both impls (Clasp first)."
+  (let ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 91))
+        (*zerocopy-min-payload-bytes* 8))                 ; small threshold so the short ASCII markers are ZC-size-eligible
+    ;; Part A — deterministic, portable: the security gate short-circuits BEFORE any pool/SHMEM access.
+    (let ((node (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+          (change (dds.rtps.history:make-cache-change
+                   :kind :data :sn 1
+                   :serialized-payload (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                                            "ZC-CLEARTEXT-PROBE-PAYLOAD-AAAAAAAAAAAAAAAAAAAAAAAAAA"))))
+      (unwind-protect
+           (progn
+             (assert (not (%zc-payload-wire-protected-p node)) ()
+                     "A1: a non-secured writer (both kinds :none) must NOT be wire-protected (ZC allowed)")
+             (assert (and (eq (dds.rtps.history:cache-change-kind change) :data)
+                          (> (dds.rtps.history:cache-change-payload-len change) *zerocopy-min-payload-bytes*)) ()
+                     "A1: the probe change must be ZC-size-eligible (:data, payload-len > the threshold)")
+             (setf (disc-node-rtps-protection-kind node) :encrypt)
+             (assert (%zc-payload-wire-protected-p node) () "A2: rtps_protection :encrypt must be wire-protected")
+             (assert (null (%zc-change-item node change 5)) ()
+                     "A2: a wire-protected (rtps_protection) writer must NOT take the raw ZC path (fail-closed NIL) even with zc-readers>0 + a large payload")
+             (setf (disc-node-rtps-protection-kind node) :sign)
+             (assert (%zc-payload-wire-protected-p node) () "A2: rtps_protection :sign must be wire-protected")
+             (setf (disc-node-rtps-protection-kind node) :none
+                   (disc-node-user-submessage-protection-kind node) :encrypt)   ; metadata_protection alone
+             (assert (%zc-payload-wire-protected-p node) () "A2: metadata_protection :encrypt must be wire-protected")
+             (assert (null (%zc-change-item node change 5)) ()
+                     "A2: a wire-protected (metadata_protection) writer must NOT take the raw ZC path (fail-closed NIL)")
+             (setf (disc-node-user-submessage-protection-kind node) :none)
+             (assert (not (%zc-payload-wire-protected-p node)) ()
+                     "A2: resetting both kinds to :none must restore ZC eligibility (the non-secured fast path is untouched)"))
+        (stop-node node)))
+    ;; Part B — SHMEM-gated live-segment inspection (skips where the pool is not carved: Clasp/macOS, ADR 0013).
+    (let ((*zerocopy-enabled* t))                          ; arm ZC (default OFF, R6); *shmem-enabled* stays ambient (t on SBCL, nil on Clasp/macOS)
+      (let ((node (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0)))
+        (unwind-protect
+             (when (disc-node-zc-pool node)                ; pool carved iff SHMEM available -> run Part B; else skip cleanly
+               (let* ((sap (disc-node-zc-pool-sap node))
+                      (size (dds.xport.zerocopy::%zc-bytes +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+))
+                      (m1 (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                               "ZC-SEG-NONSECURE-MARKER-1111111111111111111111111111"))
+                      (m2 (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                               "ZC-SEG-SECURED-MARKER-22222222222222222222222222222222"))
+                      (ch1 (dds.rtps.history:make-cache-change :kind :data :sn 1 :serialized-payload m1))
+                      (ch2 (dds.rtps.history:make-cache-change :kind :data :sn 2 :serialized-payload m2)))
+                 (flet ((%seg-has (marker)                 ; T iff MARKER's byte sequence occurs anywhere in the pool segment
+                          (let ((mlen (length marker)))
+                            (loop for i from 0 to (- size mlen)
+                                  thereis (loop for j below mlen
+                                                always (= (cffi:mem-ref sap :uint8 (+ i j)) (aref marker j)))))))
+                   ;; NON-secured control: ZC IS taken; the payload lands in the segment (the cleartext-leak vector the gate closes).
+                   (let ((s0 (disc-node-zc-sends node)))
+                     (assert (not (%zc-payload-wire-protected-p node)) () "B: the control node must be non-secured")
+                     (assert (%zc-change-item node ch1 1) () "B: a non-secured writer must take the raw ZC path (a ref is built)")
+                     (assert (> (disc-node-zc-sends node) s0) () "B: the non-secured ZC send must advance zc-sends")
+                     (assert (%seg-has m1) ()
+                             "B: the non-secured payload MUST appear in the SHMEM pool segment (the cleartext-leak vector the gate closes — proving the probe is non-vacuous)"))
+                   ;; SECURED (rtps_protection :encrypt): ZC is DISABLED; the fresh marker never reaches the segment.
+                   (setf (disc-node-rtps-protection-kind node) :encrypt)
+                   (let ((s1 (disc-node-zc-sends node)))
+                     (assert (null (%zc-change-item node ch2 1)) ()
+                             "B: a wire-protected writer must NOT take the raw ZC path (fail-closed NIL)")
+                     (assert (= (disc-node-zc-sends node) s1) ()
+                             "B: a wire-protected writer must NOT loan into the pool (zc-sends must not advance)")
+                     (assert (not (%seg-has m2)) ()
+                             "B: NO cleartext of the secured payload may appear ANYWHERE in the SHMEM pool segment (the fix)")))))
+          (stop-node node)))))
+  t)
+
 (defvar *za2-rx-ctx* nil
   "WP-DDS-SECURITY-ZEROALLOC-AEAD T3(ZA-2) concurrency-test scratch: per-receiver-thread cons
    (EXPECTED-PAYLOAD . MISMATCH-COUNT) the shared node-b ON-DATA hook checks each SRTPS re-dispatch delivery

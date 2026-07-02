@@ -132,6 +132,7 @@
            #:run-rtps-protection-enforce-test
            #:run-rtps-protection-enforce-reliability-test
            #:run-rtps-protection-enforce-user-bracket-test
+           #:run-zc-shmem-secured-cleartext-test
            ;; WP-DDS-SECURITY-AUTH-KEYX T4: auth extension points (DDS-Security 1.1 §7.3/7.4.3.2)
            #:disc-node-on-participant-discovered
            #:disc-node-auth-gate
