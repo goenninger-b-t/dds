@@ -242,11 +242,41 @@ ACKNACK / async sender / flow scheduler).
 
 ## Residual carries (recorded, NOT fixed here)
 
-**(a) Origin authentication (receiver-specific MACs) zero-alloc — DEFERRED.** The `..._WITH_ORIGIN_AUTHENTICATION`
-tier (a per-matched-receiver GMAC under the receiver's key, §9.5.3.3.4.3) stays on the allocating
-`%compute-receiver-macs` path when `receivers` is non-empty — correct, byte-identical, fail-closed, but it allocates.
-It is off the common empty-receivers path (the corpora + e2e use no origin-auth). Zero-alloc-ing it needs a
-receiver-session-key cache parallel to `%km-session-key-at` + footer-region MAC writes + a per-receiver GMAC-into.
+**(a) Origin authentication (receiver-specific MACs) zero-alloc — ✅ RESOLVED (WP-SECURITY-ORIGIN-AUTH-ZEROALLOC,
+2026-07-02; live-path residual closed in the same WP).** The `..._WITH_ORIGIN_AUTHENTICATION` tier (a
+per-matched-receiver GMAC under the receiver's key, §9.5.3.3.4.3) is now zero GC-heap alloc/sample on the **live
+secured datagram path, send AND receive** — closing the last allocating AEAD path (all three tiers + origin-auth now
+zero-alloc). Two layers had to go zero-alloc, and the first cut only did one of them:
+- **The AEAD transform** (the receiver-MAC encode/decode). As predicted here, it took exactly a receiver-session-key
+  cache parallel to `%km-session-key-at` (`%km-receiver-session-key-at` + three cache slots on `key-material`,
+  single-slot / fence-published — the master key is part of the discriminant so a wrong-key probe never shares a
+  slot), footer-region MAC writes by offset, and a per-receiver GMAC-into: encode via `%put-receiver-macs-into`
+  (`aes-256-gcm-seal-into` `pt-len 0` straight into the CryptoFooter over the in-place `common_mac`/nonce), decode via
+  `%verify-receiver-mac-into` (find the entry by offset, verify its GMAC in place via `aes-256-gcm-open-into`
+  `ct-len 0`).
+- **The receiver-descriptor RESOLVER** (the live-path residual, closed here). The transform above is genuinely
+  zero-alloc, but the `dds.dcps` origin-auth resolvers that FEED it — `cm-rtps-encode-receivers` /
+  `cm-rtps-decode-receiver` (whole-RTPS, per datagram) and the secure-SEDP `cm-secure-sedp-{encode,decode}-receiver`
+  pair — still consed the `(list (cons receiver_specific_key_id . master_receiver_specific_key))` descriptor **per
+  call**: the SEND `(list (cons …))` = 32.10 B/datagram, the RECV `(cons …)` = 16.05 B/datagram (SBCL, escaping-sink
+  microbench). The fix MEMOIZES that descriptor list on the `key-material` — one `cached-receiver-descriptor-list`
+  slot, built once from the IMMUTABLE receiver fields, cache-probed first so the hit path is a pure slot load +
+  ACQUIRE fence (release-fence-published on the one-time cold build), exposed as `dds.security:km-receiver-descriptor`
+  / `km-receiver-descriptor-list` and returned by all four resolvers. Invalidation is structural: re-keying mints a
+  NEW `key-material` (fresh empty cache) and participant loss drops the KM (and its cache), so a stale descriptor is
+  impossible — the exact `%km-session-key-at` invalidation model. Pure control-plane caching: same descriptor content,
+  same key per datagram, wire unchanged. **Before → after: SEND 32.10 → 0.00, RECV 16.05 → 0.00 B/datagram.**
+
+Wire byte-identical (the T3 `128`/`120` corpus stays green unchanged); receiver-MAC gate unchanged (bad/absent MAC →
+fail-closed drop). **Proof (honest, live-path):** the `make mem` `oauth-send`/`oauth-recv` arms now DRIVE the real
+memoized resolver (`dds.security:km-receiver-descriptor{-list}`, the exact call the installed `cm-rtps-*-receiver{s}`
+make) INSIDE the measured window — not a pre-built stub list — so they measure the **live origin-auth datagram path
+(resolver + transform)** and still report `delta 0.0000 B/sample` (SBCL; Clasp smokes). The first cold-cache fill
+amortizes off the measured window; the reported 0.0000 is warmed steady-state (matching the `%km-session-key-at`
+convention). `run-security-origin-auth-test` block (4) proves the `-into` verify entries round-trip + fail-closed
+(non-vacuous), and `run-security-crypto-manager-test` drives the T10 `cm-rtps-*` resolvers through the memoized path.
+The old allocating `%compute-receiver-macs` / `%verify-receiver-mac` / `%parse-sec-postfix-mac` are retained as
+byte-identity reference implementations. **No residual remains — both send and receive are closed.**
 
 **(b) `key-id-rx` third pool vs a packed-fixnum key (Minor, accepted).** The 4-octet `transformation_key_id` scratch
 is a third RX pool because a `dynamic-extent` stack array does not stack-allocate for a *specialized*

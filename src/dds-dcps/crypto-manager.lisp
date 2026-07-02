@@ -214,11 +214,9 @@
 
 ;;; --- T-ORIGINAUTH: secure-SEDP origin-authentication receiver-key resolvers (§9.5.3.3.4.3) ---
 
-(defun* %km-origin-auth-p (km)
-    (function (dds.security:key-material) boolean)
-  "T iff KM carries origin-auth receiver-specific key material — a NON-ZERO receiver_specific_key_id (the
-   §9.5.3.3.4.3 origin-auth-enabled marker; an all-zero id is the disabled sentinel)."
-  (notevery #'zerop (dds.security:key-material-receiver-specific-key-id km)))
+;;; The origin-auth predicate + the receiver DESCRIPTOR construction now live with the KM struct in dds.security
+;;; (%km-origin-auth-p / km-receiver-descriptor{-list}); the descriptor list is MEMOIZED on the key-material there,
+;;; so the live per-datagram resolvers below cons ZERO GC-heap bytes and re-keying (a new KM) invalidates for free.
 
 (defun* %cm-entity-origin-auth (node entity-id)
     (function (dds.disc:disc-node (unsigned-byte 32)) boolean)
@@ -285,15 +283,6 @@
          dds.rtps.discovery:+entityid-spdp-secure-reader+)
         (t nil)))
 
-(defun* %km-receiver-descriptor (km)
-    (function (dds.security:key-material) (or null cons))
-  "The origin-auth receiver descriptor (receiver_specific_key_id . master_receiver_specific_key) of KM, or NIL
-   when KM carries no receiver-specific key. The shape encode :receivers / decode my-receiver-key consume
-   (§9.5.3.3.4.3)."
-  (when (%km-origin-auth-p km)
-    (cons (dds.security:key-material-receiver-specific-key-id km)
-          (dds.security:key-material-master-receiver-specific-key km))))
-
 (defun* cm-secure-sedp-encode-receivers (cm writer-entity-id remote-prefix)
     (function (crypto-manager (unsigned-byte 32) (simple-array (unsigned-byte 8) (12))) list)
   "Origin-auth ENCODE resolver (§9.5.3.3.4.3, T-ORIGINAUTH): for a local secure-SEDP WRITER-ENTITY-ID announcing
@@ -305,9 +294,8 @@
    remote reader is not yet keyed, or it carries no receiver key (origin-auth off). Control-plane (announce)."
   (let ((reader-eid (%secure-sedp-reader-for-writer writer-entity-id)))
     (when reader-eid
-      (let* ((rkm  (cm-decode-entity-km cm (%guid-from-prefix remote-prefix reader-eid)))
-             (desc (and rkm (%km-receiver-descriptor rkm))))
-        (when desc (list desc))))))
+      (let ((rkm (cm-decode-entity-km cm (%guid-from-prefix remote-prefix reader-eid))))
+        (and rkm (dds.security:km-receiver-descriptor-list rkm))))))
 
 (defun* cm-secure-sedp-decode-receiver (cm key-id)
     (function (crypto-manager (simple-array (unsigned-byte 8) (*))) (or null cons))
@@ -326,7 +314,7 @@
       (let ((reader-eid (%secure-sedp-reader-for-writer remote-eid)))
         (when reader-eid
           (let ((lkm (cm-encode-entity-km cm reader-eid)))
-            (and lkm (%km-receiver-descriptor lkm))))))))
+            (and lkm (dds.security:km-receiver-descriptor lkm))))))))
 
 ;;; --- T10: whole-RTPS-message-protection (rtps_protection) origin-auth receiver-key resolvers (§9.5.3.3.4.3) ---
 ;;; The PARTICIPANT-level analogue of cm-secure-sedp-encode-receivers / cm-secure-sedp-decode-receiver (the entity
@@ -342,11 +330,11 @@
    to MAC a datagram bound for the remote participant DEST-PREFIX — namely THAT remote's ParticipantCrypto receiver
    descriptor (resolved from the remote ParticipantCrypto KM it sent in its ParticipantCryptoToken,
    cm-decode-participant-km). NIL (empty -> plain SIGN/ENCRYPT) when the remote is not yet keyed or carries no
-   receiver key (origin-auth off). Control-plane-resolved per send (the data path caches nothing). Mirrors
-   cm-secure-sedp-encode-receivers at the participant level."
-  (let* ((rkm  (cm-decode-participant-km cm dest-prefix))
-         (desc (and rkm (%km-receiver-descriptor rkm))))
-    (when desc (list desc))))
+   receiver key (origin-auth off). The descriptor list is MEMOIZED on the remote's KM (km-receiver-descriptor-list),
+   so this resolves per datagram but conses ZERO GC-heap bytes on the hit path (re-keying mints a new KM -> fresh
+   cache). Mirrors cm-secure-sedp-encode-receivers at the participant level."
+  (let ((rkm (cm-decode-participant-km cm dest-prefix)))
+    (and rkm (dds.security:km-receiver-descriptor-list rkm))))
 
 (defun* cm-rtps-decode-receiver (cm)
     (function (crypto-manager) (or null cons))
@@ -356,9 +344,10 @@
    which was minted WITH a receiver-specific key iff governance directs an *_WITH_ORIGIN_AUTHENTICATION rtps tier.
    NIL (no origin-auth verification — the common_mac alone governs) when no local participant crypto or no receiver
    key. Mirrors cm-secure-sedp-decode-receiver at the participant level (no key_id lookup needed — there is exactly
-   one local ParticipantCrypto, so the receiver is unambiguous)."
+   one local ParticipantCrypto, so the receiver is unambiguous). The descriptor is the CAR of the KM's MEMOIZED
+   descriptor list (km-receiver-descriptor) — zero GC-heap alloc per datagram on the hit path."
   (let ((lkm (cm-encode-participant-km cm)))
-    (and lkm (%km-receiver-descriptor lkm))))
+    (and lkm (dds.security:km-receiver-descriptor lkm))))
 
 ;;; --- §9.5.3.3 dataplane CRYPTO-KEYS resolvers (the disc-node CRYPTO-TRANSFORM shape, ADR 0031) ---
 

@@ -111,9 +111,12 @@
   (%encode-secured-region-into out-buf out-off km kind plain plain-off plain-len receivers
                                +submessage-srtps-prefix+ +submessage-srtps-postfix+))
 
-(defun* decode-rtps-message-into (pt-out pt-off km secured secured-off secured-len)
+(defun* decode-rtps-message-into (pt-out pt-off km secured secured-off secured-len
+                                  &key (my-receiver-key-id nil) (my-receiver-key nil))
     (function (dds.core.buffer:octet-buffer fixnum key-material
-               (simple-array (unsigned-byte 8) (*)) fixnum fixnum)
+               (simple-array (unsigned-byte 8) (*)) fixnum fixnum
+               &key (:my-receiver-key-id (or (simple-array (unsigned-byte 8) (*)) null))
+                    (:my-receiver-key (or (simple-array (unsigned-byte 8) (*)) null)))
               (values (or fixnum null) (or (member :sign :encrypt) null) (or fixnum null) (or fixnum null)))
   "Recover the protected submessage stream from an SRTPS_PREFIX ... SRTPS_POSTFIX bracket in
    SECURED[SECURED-OFF..+SECURED-LEN] under KM BY RAW OFFSET; return (values DATA-LEN MODE DATA-OFF POSTFIX-OFF),
@@ -124,8 +127,15 @@
    open. ENCRYPT: aes-256-gcm-open-into writes the recovered stream into PT-OUT[PT-OFF..+DATA-LEN] (zero GC-heap
    alloc); DATA-OFF is the ciphertext offset in SECURED. SIGN: NO copy into PT-OUT — DATA-OFF is the verbatim-region
    offset in SECURED (the caller moves it in place); DATA-LEN its length. POSTFIX-OFF is the SRTPS_POSTFIX offset.
-   ORIGIN AUTHENTICATION (§9.5.3.3.4.3) is NOT verified here (the -into core does the common_mac only) — the
-   WITH_ORIGIN_AUTHENTICATION tier stays on the allocating decode-rtps-message (its receiver-MAC gate); dds.disc
-   %handle-datagram routes origin-auth there and the common tier through here. Consumed over a reused per-node RX
+   ORIGIN AUTHENTICATION (§9.5.3.3.4.3, the *_WITH_ORIGIN_AUTHENTICATION rtps tier): pass MY-RECEIVER-KEY-ID (the
+   LOCAL participant's 4-octet receiver_specific_key_id) + MY-RECEIVER-KEY (its 32-octet master_receiver_specific_key)
+   and the decoder ALSO GMAC-verifies THIS participant's CryptoFooter entry BY OFFSET (%verify-receiver-mac-into,
+   reusing PT-OUT's static vec as the verify sink — nothing written) and fails-closed NIL if absent/mismatched even
+   when the common_mac is valid — now ZERO-ALLOC (ADR-0039 residual (a) closed), so dds.disc %handle-datagram routes
+   BOTH the common tier AND origin-auth through here (no allocating decode-rtps-message fallback on the pooled path).
+   Both NIL (default) = origin-auth not expected — the common_mac alone governs. Consumed over a reused per-node RX
    buffer. Inverse: encode-rtps-message-into."
-  (%decode-secured-region-into pt-out pt-off km secured secured-off secured-len t))
+  (if my-receiver-key-id
+      (%decode-secured-region-verify-into pt-out pt-off km secured secured-off secured-len t
+                                          my-receiver-key-id my-receiver-key)
+      (%decode-secured-region-into pt-out pt-off km secured secured-off secured-len t)))

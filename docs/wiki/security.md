@@ -268,8 +268,9 @@ the wrappers delegate to the core, the byte-exact corpus proves the core's wire 
 **Scope.**  Slice 1 (this section) delivered the **`data_protection` tier + the shared foundation**.  The
 submessage (`metadata_protection`) and whole-RTPS (`rtps_protection`, the ~2.2 KB/datagram) AEAD tiers **reuse**
 this foundation in **Slice 2** (§3.5) — as of **2026-07-02 all three AEAD tiers are zero-alloc** on the common
-path.  The one remaining allocating path is **origin authentication** (receiver-specific MACs) — see §3.5.  See
-ADR 0038 for the Slice-1 per-component before→after and ADR 0039 for Slice 2.
+path, and **origin authentication** (receiver-specific MACs) is now zero-alloc too (§3.6, WP-SECURITY-ORIGIN-AUTH-
+ZEROALLOC, ADR 0039 residual (a) closed).  See ADR 0038 for the Slice-1 per-component before→after and ADR 0039 for
+Slice 2.
 
 ### 3.5 Zero-alloc secured submessage + whole-RTPS — Slice 2 (WP-DDS-SECURITY-ZEROALLOC-AEAD Slice 2, ADR 0039)
 
@@ -319,14 +320,57 @@ submessages) is **not** dropped on exhaustion — the pre-scan shares its protec
 receives exactly as before; the pools are internal to the `disc-node`.  The inner `data_protection` payload of a
 recovered submessage still uses the §3.3 secured-read loan on a loan-capable reader.
 
-**Scope (no overclaim).**  **Origin authentication** (receiver-specific MACs,
-`..._WITH_ORIGIN_AUTHENTICATION`, §9.5.3.3.4.3) stays the **deferred allocating fallback** — it is off the common
-empty-receivers path (the corpora and e2e use no origin-auth), and the `-into` cores fall back to the allocating
-receiver-MAC path when `receivers` is non-empty (correct, byte-identical, fail-closed, but it allocates).  Do **not**
-read Slice 2 as making origin-auth zero-alloc.  The non-tier ZA-1 residuals (key-material foreign-hardening, ZC ×
-`rtps_protection` SHMEM cleartext, saved-image FFI-pointer re-resolve, PAL atomics stubs) are unchanged/open.  See
-ADR 0039 for the per-component before→after (SRTPS send 196.56 → 0.00; metadata send 196-213 → 0; metadata RX decode
-98 → 0) and the residual carries.
+**Scope (Slice 2).**  Slice 2 made the common empty-receivers ENCRYPT/SIGN path of both tiers zero-alloc.  **Origin
+authentication** (receiver-specific MACs, `..._WITH_ORIGIN_AUTHENTICATION`, §9.5.3.3.4.3) was left as the deferred
+allocating fallback (ADR 0039 residual (a)) — now **closed** in §3.6.  The non-tier ZA-1 residuals (key-material
+foreign-hardening, ZC × `rtps_protection` SHMEM cleartext, saved-image FFI-pointer re-resolve, PAL atomics stubs) are
+unchanged/open.  See ADR 0039 for the Slice-2 per-component before→after (SRTPS send 196.56 → 0.00; metadata send
+196-213 → 0; metadata RX decode 98 → 0) and the residual carries.
+
+### 3.6 Zero-alloc origin authentication — receiver-specific MACs (WP-SECURITY-ORIGIN-AUTH-ZEROALLOC, ADR 0039 residual (a))
+
+The `..._WITH_ORIGIN_AUTHENTICATION` tier (§9.5.3.3.4.3) — a per-matched-receiver GMAC over the `common_mac` under
+each receiver's own key, emitted into the CryptoFooter `receiver_specific_macs` and verified by the target receiver —
+is now **zero GC-heap alloc/sample on the live secured path, send AND receive**, completing the zero-alloc AEAD story
+(all three tiers + origin-auth).  The wire is **byte-identical** to the allocating path (the T3 `128`/`120`
+origin-auth corpus stays green **unchanged**), and the receiver-MAC gate is unchanged (a bad/absent MAC still
+fails-closed to a drop).
+
+- **Receiver-session-key cache** (`%km-receiver-session-key-at`, `key-material.lisp`) — the §9.5.3.3.4.3 receiver key
+  `HMAC-SHA256(master_receiver_specific_key, 'SessionReceiverKey' ‖ master_salt ‖ session_id)` is derived **once per
+  `(receiver_specific_key_id, session_id)`** and reused, the exact parallel of the common `%km-session-key-at` cache:
+  single-slot, lock-free hit, fence-published (release on write / acquire on read) so a weak-memory reader sees the
+  published key; a torn read re-derives or fail-closes — never a wrong-key bypass.
+- **Encode** (`%put-receiver-macs-into`) — each 20-octet `{key_id ‖ GMAC}` footer entry is written **by raw offset**:
+  the `key_id` copied in place, the GMAC written straight into the footer via `aes-256-gcm-seal-into` with `pt-len 0`
+  (the T1 GMAC-into) over the **in-place** `common_mac` (AAD) under the **in-place** `session_id ‖ iv_suffix` nonce.
+  No `%km-nonce`, no `subseq`, no `mapcar`/list conses, no allocating `aes-256-gcm-seal`.
+- **Decode** (`%verify-receiver-mac-into`) — the CryptoFooter is located **by offset** from the `postfix-off` the
+  `-into` decode returns; this receiver's entry is found by a by-offset `key_id` compare and its GMAC is verified
+  **in place** via `aes-256-gcm-open-into` with `ct-len 0` (EVP's constant-time tag compare against the wire mac), so
+  nothing is materialized.  The public `-into` decode entries take optional `:my-receiver-key-id` / `:my-receiver-key`;
+  `disc.lisp`'s SRTPS RX now routes origin-auth through the pooled zero-alloc path (no allocating
+  `decode-rtps-message` fallback except on arena-exhausted pool-carve failure).
+- **Receiver-descriptor resolver — the LIVE-path residual, closed** (`km-receiver-descriptor{-list}`,
+  `key-material.lisp`). The transform above is zero-alloc, but the `dds.dcps` origin-auth resolvers that FEED it —
+  `cm-rtps-encode-receivers` / `cm-rtps-decode-receiver` (per datagram) and the secure-SEDP pair — still consed the
+  `(list (cons receiver_specific_key_id . master_receiver_specific_key))` descriptor **per call** (SEND `(list (cons
+  …))` = 32.10 B/datagram, RECV `(cons …)` = 16.05 B/datagram on SBCL). That list is now **memoized on the
+  `key-material`** — one `cached-receiver-descriptor-list` slot, built once from the IMMUTABLE receiver fields,
+  cache-probed first so the hit path is a pure slot load + ACQUIRE fence (release-fence-published on the one-time cold
+  build), returned by all four resolvers. Invalidation is structural: re-keying mints a NEW `key-material` (fresh
+  cache) and participant loss drops the KM — a stale descriptor is impossible, the same `%km-session-key-at`
+  invalidation model. Pure control-plane caching (same descriptor content per datagram; wire unchanged). **SEND 32.10
+  → 0.00, RECV 16.05 → 0.00 B/datagram.**
+- **Proof (live-path)** — the `make mem` `oauth-send` / `oauth-recv` arms now **drive the real memoized resolver**
+  (`dds.security:km-receiver-descriptor{-list}`, the exact call the installed `cm-rtps-*-receiver{s}` make) INSIDE the
+  measured window — not a pre-built stub list — so they measure the **live origin-auth datagram path (resolver +
+  transform)** and still report **`delta 0.0000 B/sample`** over the common empty-receivers baseline on SBCL (Clasp
+  smokes, `bytes-consed` 0). The first cold-cache fill amortizes off the window; the reported 0.0000 is warmed
+  steady-state (the `%km-session-key-at` convention). `run-security-origin-auth-test` block (4) round-trips the
+  `-into` verify entries (right key recovers byte-exact; wrong/absent key → NIL; no key → common_mac alone) and
+  `run-security-crypto-manager-test` drives the T10 `cm-rtps-*` resolvers through the memoized path, so the mem arms
+  are **non-vacuous**.
 
 ---
 

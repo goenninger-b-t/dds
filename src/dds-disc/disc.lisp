@@ -1503,21 +1503,25 @@
           (when km
             (let* ((vec (dds.core.buffer:octet-buffer-vec buf))
                    (cap (dds.core.buffer:octet-buffer-capacity buf))
-                   ;; common (no-origin-auth) tier: a per-node RX POOL gives each concurrent receiver thread (unicast /
-                   ;; multicast / SHMEM) a DISTINCT decode buffer — no shared mutable sink, so the decode->copy-back
-                   ;; window never races across transports (T3(ZA-2) review). The WITH_ORIGIN_AUTHENTICATION tier
-                   ;; (my-rk-id set) keeps the allocating decode (its receiver-MAC gate).
-                   (pool (and (null my-rk-id) (%ensure-secure-rx-pool node))))
+                   ;; A per-node RX POOL gives each concurrent receiver thread (unicast / multicast / SHMEM) a DISTINCT
+                   ;; decode buffer — no shared mutable sink, so the decode->copy-back window never races across
+                   ;; transports (T3(ZA-2) review). The WITH_ORIGIN_AUTHENTICATION tier (my-rk-id set) now ALSO rides
+                   ;; the pool: decode-rtps-message-into GMAC-verifies THIS participant's receiver MAC BY OFFSET,
+                   ;; zero-alloc (ADR-0039 residual (a) closed) — no longer the allocating decode-rtps-message.
+                   (pool (%ensure-secure-rx-pool node)))
               (if pool
                   ;; ZA-2 zero-alloc + T3(ZA-2) race-fix: BORROW a DISTINCT RX scratch, open the SRTPS bracket at
                   ;; [20,SIZE) BY OFFSET — ENCRYPT plaintext into the scratch, SIGN returns the verbatim-region bounds
                   ;; in VEC (moved in place, scratch unused) — copy back at 20, then the borrow scope RELEASES the
-                  ;; scratch BEFORE re-dispatch (the recovered plaintext now lives in BUF). Pool exhausted / decode
-                  ;; fail / won't-fit -> NEW-SIZE NIL -> fail-closed drop (RESOURCE_LIMITS, never a GC fallback). No
-                  ;; subseq / →octets; the recovered stream is never longer than the datagram.
+                  ;; scratch BEFORE re-dispatch (the recovered plaintext now lives in BUF). Origin-auth (my-rk-id set):
+                  ;; the receiver-MAC is verified in place (the scratch doubles as the ct-len-0 GMAC-verify sink) and a
+                  ;; bad/absent MAC -> NIL -> fail-closed drop. Pool exhausted / decode fail / MAC fail / won't-fit ->
+                  ;; NEW-SIZE NIL -> fail-closed drop (RESOURCE_LIMITS, never a GC fallback). No subseq / →octets.
                   (let ((new-size (%with-secure-rx-scratch (rx node)
                                     (multiple-value-bind (data-len mode data-off postfix-off)
-                                        (dds.security:decode-rtps-message-into rx 0 km vec 20 (- size 20))
+                                        (dds.security:decode-rtps-message-into rx 0 km vec 20 (- size 20)
+                                                                               :my-receiver-key-id my-rk-id
+                                                                               :my-receiver-key my-rk)
                                       (declare (ignore postfix-off))
                                       (when (and data-len (<= (+ 20 data-len) cap))
                                         (ecase mode
@@ -1529,10 +1533,10 @@
                     ;; RTPS-UNWRAPPED t: the inner plaintext is already authenticated by this unwrap, so the
                     ;; re-dispatch must NOT re-apply the plain-user-DATA enforcement (it would self-drop the sample).
                     (when new-size (%handle-datagram node buf new-size t)))
-                  ;; origin-auth tier (my-rk-id set) OR the RX pool could not be carved (arena exhausted): the
-                  ;; allocating decode-rtps-message — the deferred allocating fallback (mirrors the encode-side
-                  ;; receivers path); correct + byte-identical wire (a subseq of the recovered stream), self-heals when
-                  ;; the arena frees, never a per-datagram GC on the common pooled path.
+                  ;; the RX pool could not be carved (arena exhausted at first secured receive): the allocating
+                  ;; decode-rtps-message — the degrade path (common tier AND origin-auth, its receiver-MAC gate);
+                  ;; correct + byte-identical wire (a subseq of the recovered stream), self-heals when the arena
+                  ;; frees, never a per-datagram GC on the common pooled path (which now covers origin-auth too).
                   (let ((stream (dds.security:decode-rtps-message km (subseq vec 20 size)
                                                                   :my-receiver-key-id my-rk-id :my-receiver-key my-rk)))
                     (when (and stream (<= (+ 20 (length stream)) cap))

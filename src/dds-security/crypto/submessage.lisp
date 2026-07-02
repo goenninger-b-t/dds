@@ -56,8 +56,14 @@
 ;;;; the pre-ZA-2 assembly (same field widths/offsets, big-endian %put-u32-be-at, §9.5.3.3.3/.4.4 4-align
 ;;;; pads, aes-256-gcm-seal-into ct+tag), so the T2/T4 byte-exact corpora exercise them. Common-path encode
 ;;;; (RECEIVERS empty) + ENCRYPT decode are zero GC-heap alloc; SIGN decode materializes the verbatim region
-;;;; once (open-into's full-length AAD); origin-auth (RECEIVERS / my-receiver-key) is the deferred allocating
-;;;; fallback (encode via %compute-receiver-macs, decode via %decode-verify-origin-auth).
+;;;; once (open-into's full-length AAD).
+;;;; ORIGIN AUTHENTICATION zero-alloc (WP-SECURITY-ORIGIN-AUTH-ZEROALLOC, ADR-0039 residual (a) closed): the
+;;;; RECEIVERS (encode) / my-receiver-key (decode) *_WITH_ORIGIN_AUTHENTICATION path is now ALSO zero GC-heap
+;;;; alloc — encode via %put-receiver-macs-into (each receiver GMAC written straight into the CryptoFooter by
+;;;; offset via aes-256-gcm-seal-into pt-len-0 under the %km-receiver-session-key-at cached key + the in-place
+;;;; common_mac/nonce), decode via %verify-receiver-mac-into (find + GMAC-verify THIS receiver's footer entry
+;;;; IN PLACE via aes-256-gcm-open-into ct-len-0). The old allocating %compute-receiver-macs /
+;;;; %verify-receiver-mac / %parse-sec-postfix-mac are RETAINED as byte-identity reference implementations.
 ;;;;
 ;;;; SECURITY POSTURE (NFR-SEC-POSTURE / the operating contract §4): decode is FAIL-CLOSED and
 ;;;; bounds-checked even at (safety 0) — the SEC_PREFIX -> {SEC_BODY (ENCRYPT) | verbatim (SIGN)} ->
@@ -165,6 +171,65 @@
   (%derive-labeled-session-key master-receiver-specific-key master-salt session-id
                                +kdf-label-session-receiver-key+))
 
+(defun* %recv-key-id-eq-at (vec off key-id)
+    (function ((simple-array (unsigned-byte 8) (*)) fixnum (simple-array (unsigned-byte 8) (*))) boolean)
+  "T iff the 4-octet receiver_specific_key_id VEC[OFF..OFF+4] equals KEY-ID, compared BY OFFSET with no
+   allocation (the CryptoFooter entry key_id match — key_ids are public, so a plain byte compare, not
+   constant-time; NFR-SEC-POSTURE puts the constant-time compare on the MAC, not the id). Caller guarantees
+   OFF+4 <= (length VEC) and (length KEY-ID) = +transformation-key-id-len+."
+  (and (= (length key-id) +transformation-key-id-len+)
+       (= (aref vec off)       (aref key-id 0))
+       (= (aref vec (+ off 1)) (aref key-id 1))
+       (= (aref vec (+ off 2)) (aref key-id 2))
+       (= (aref vec (+ off 3)) (aref key-id 3))))
+
+(defun* %km-receiver-session-key-at (km recv-key-id recv-master-key session-id-vec session-id-off)
+    (function (key-material (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)) fixnum)
+              (simple-array (unsigned-byte 8) (32)))
+  "Cached §9.5.3.3.4.3 receiver-specific session key for origin authentication — the receiver analogue of
+   %km-session-key-at (key-material.lisp), closing the ADR-0039 residual (a) per-receiver KDF alloc. The key
+   is HMAC-SHA256(RECV-MASTER-KEY, 'SessionReceiverKey' || KM.master_salt || session_id) — constant for a fixed
+   (receiver master key, KM salt, session_id) triple, so it is derived ONCE and reused (zero-alloc on hit). The
+   cache discriminant is (RECV-KEY-ID, RECV-MASTER-KEY, the 4-octet session_id at SESSION-ID-VEC[OFF..OFF+4]). The
+   MASTER KEY is part of the discriminant, not just the 4-octet key_id: the SAME key_id may be presented with a
+   DIFFERENT master key (a wrong-key origin-auth probe — an encoder that cached under the CORRECT key must NOT then
+   hand a decoder verifying under a WRONG key the correct derived key), and the derived key depends on the master
+   key — keying by key_id alone would return a stale key and bypass the receiver-MAC gate (the e2e origin-auth
+   breach test). Single-slot + fence-published EXACTLY like %km-session-key-at: the hit path is lock-free +
+   zero-alloc; the miss path stores key -> RELEASE fence -> session_id -> master_key -> key_id (the gate), and the
+   hit path loads key_id + master_key + session_id -> ACQUIRE fence -> key, so a weak-memory reader that observes a
+   matching (key_id, master_key, session_id) is guaranteed to see the published key (arm64/Apple Silicon; the
+   operating contract §4). A torn read (any discriminant field stale) fails the match and re-derives — the
+   deterministic HMAC makes a benign concurrent same-value miss harmless, and a wrong key can never forge a valid
+   GMAC, so the WORST case is a spurious re-derive or a fail-closed drop, never an origin-auth bypass (mirrors
+   %km-session-key-at's tear model)."
+  (assert (<= (+ session-id-off 4) (length session-id-vec)))
+  (let ((ckid (key-material-cached-recv-key-id km))
+        (cmk  (key-material-cached-recv-master-key km))
+        (csid (key-material-cached-recv-session-id km)))
+    (if (and ckid cmk csid
+             (%recv-key-id-eq-at recv-key-id 0 ckid)
+             (equalp cmk recv-master-key)
+             (= (length csid) 4)
+             (= (aref csid 0) (aref session-id-vec session-id-off))
+             (= (aref csid 1) (aref session-id-vec (+ session-id-off 1)))
+             (= (aref csid 2) (aref session-id-vec (+ session-id-off 2)))
+             (= (aref csid 3) (aref session-id-vec (+ session-id-off 3))))
+        (progn
+          ;; Acquire fence: the key load must see the release that published it (operating contract §4).
+          (dds.pal:fence :acquire)
+          (key-material-cached-recv-session-key km))
+        (let* ((sid (subseq session-id-vec session-id-off (+ session-id-off 4)))
+               (k   (derive-receiver-specific-session-key recv-master-key (key-material-master-salt km) sid)))
+          (setf (key-material-cached-recv-session-key km) k)
+          ;; Release fence: the key store is visible before the session_id + master_key + key_id stores (the gate).
+          (dds.pal:fence :release)
+          (setf (key-material-cached-recv-session-id km) sid)
+          (setf (key-material-cached-recv-master-key km) (subseq recv-master-key 0 (length recv-master-key)))
+          (setf (key-material-cached-recv-key-id km) (subseq recv-key-id 0 (length recv-key-id)))
+          k))))
+
 (defun* compute-receiver-specific-mac (recv-session-key nonce common-mac)
     (function ((simple-array (unsigned-byte 8) (*))
                (simple-array (unsigned-byte 8) (*))
@@ -223,6 +288,86 @@
                        (derive-receiver-specific-session-key (cdr r) salt session-id)
                        nonce common-mac)))
               receivers))))
+
+(defun* %put-receiver-macs-into (km vec sid-abs mac-abs entries-abs receivers)
+    (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum fixnum fixnum list) (eql t))
+  "ZERO-ALLOC ENCODE of the CryptoFooter receiver_specific_macs (origin authentication, §9.5.3.3.4.3) — the
+   into-buffer core behind %encode-secured-region-into's origin-auth branch, closing the ADR-0039 residual (a)
+   allocating %compute-receiver-macs fallback. For each (receiver_specific_key_id . master_receiver_specific_key)
+   in RECEIVERS, write its 20-octet {key_id(4) ‖ GMAC(16)} entry directly into VEC starting at ENTRIES-ABS, in
+   order, BY RAW OFFSET: the key_id is copied in place (replace, no cons) and the GMAC is written straight into the
+   footer via aes-256-gcm-seal-into with pt-len 0 (the T1 GMAC-into) — AAD = the common_mac read IN PLACE at
+   VEC[MAC-ABS..+16], nonce = the CryptoHeader session_id‖iv_suffix sub-slice IN PLACE at VEC[SID-ABS..+12] (the
+   SAME 12-octet init vector the common_mac was sealed with), key = the receiver-specific session key from the
+   %km-receiver-session-key-at cache (derived once per (key_id, session_id) — zero-alloc on hit). Byte-IDENTICAL to
+   the allocating %compute-receiver-macs path (same GMAC over the same common_mac under the same derived key), so the
+   T3 128/120 origin-auth corpus proves it. AAD aliases OUT's backing memory — safe (EVP consumes AAD before
+   GET_TAG writes the tag; aes-256-gcm-seal-into docstring). Caller (%encode-secured-region-into) has bounds-checked
+   the whole footer extent; RECEIVERS empty is a no-op (this branch is entered only for a positive count). Returns T."
+  (let ((eoff entries-abs))
+    (declare (type fixnum eoff))
+    (dolist (r receivers t)
+      (let ((rk (%km-receiver-session-key-at km (car r) (cdr r) vec sid-abs)))
+        (replace vec (car r) :start1 eoff :end1 (+ eoff +transformation-key-id-len+))
+        (dds.dare:aes-256-gcm-seal-into vec (+ eoff +transformation-key-id-len+) (+ eoff +transformation-key-id-len+)
+                                        rk vec sid-abs
+                                        vec +empty-octets+ 0 0
+                                        mac-abs +common-mac-len+)
+        (incf eoff (+ +transformation-key-id-len+ +common-mac-len+))))))
+
+(defun* %verify-receiver-mac-into (km secured secured-off postfix-off my-receiver-key-id my-receiver-key scratch)
+    (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum fixnum
+               (or (simple-array (unsigned-byte 8) (*)) null)
+               (or (simple-array (unsigned-byte 8) (*)) null)
+               (simple-array (unsigned-byte 8) (*)))
+              boolean)
+  "ZERO-ALLOC origin-authentication gate (§9.5.3.3.4.3) BY RAW OFFSET — the into-buffer decode counterpart of
+   %put-receiver-macs-into, closing the ADR-0039 residual (a) allocating %decode-verify-origin-auth /
+   %verify-receiver-mac fallback. When MY-RECEIVER-KEY-ID is NIL, origin-auth is NOT requested -> T (the common_mac
+   alone governs, already verified by the -into core). Otherwise, over the bracket at SECURED[SECURED-OFF..] whose
+   POSTFIX submessage header is at POSTFIX-OFF (as returned by %decode-secured-region-into): locate the CryptoFooter
+   IN PLACE — common_mac at MAC-LOC = POSTFIX-OFF+4, then the §9.5.3.3.3 4-align pad (vs the bracket start), then
+   receiver_specific_macs_count(u32 BE), then {key_id(4),mac(16)}* entries — find the entry whose key_id equals
+   MY-RECEIVER-KEY-ID (%recv-key-id-eq-at, by offset, no materialization), and VERIFY its wire GMAC IN PLACE with
+   aes-256-gcm-open-into (ct-len 0): key = the %km-receiver-session-key-at cached receiver key, nonce = SECURED
+   session_id‖iv_suffix in place, AAD = the common_mac in place at MAC-LOC, tag = the wire mac in place — EVP does
+   the constant-time tag compare. SCRATCH is any ALLOC-STATIC-backed vector (nothing is written — ct-len 0 emits no
+   plaintext and no fail-closed wipe; it only satisfies open-into's static PT-OUT). Fail-closed (NIL) if
+   MY-RECEIVER-KEY is NIL, the footer bounds are bad, no entry targets this receiver, or the GMAC mismatches — even
+   when the common_mac is valid (never a bypass). Every offset is validated against END before use, safety-0-safe
+   (NFR-SEC-POSTURE); the caller runs it inside a fail-closed handler so any signal resolves to NIL. Byte-identical
+   verification to the allocating %verify-receiver-mac (same GMAC / same IV / same key)."
+  (if (null my-receiver-key-id)
+      t
+      (and my-receiver-key
+           (let* ((base     secured-off)
+                  (end      (length secured))
+                  (sid-off  (+ base +sec-submessage-header-len+ +secure-data-header-session-id-off+))  ; session_id‖iv_suffix
+                  (mac-loc  (+ postfix-off +sec-submessage-header-len+))
+                  (mac-end  (- (+ mac-loc +common-mac-len+) base))
+                  (rsm-loc  (+ mac-loc +common-mac-len+ (mod (- mac-end) 4)))
+                  (entry-len (+ +transformation-key-id-len+ +common-mac-len+)))
+             (declare (type fixnum base end sid-off mac-loc mac-end rsm-loc entry-len))
+             (and (<= (+ rsm-loc +receiver-specific-macs-count-len+) end)
+                  (let ((count       (%get-u32-be-at secured rsm-loc))
+                        (entries-loc (+ rsm-loc +receiver-specific-macs-count-len+)))
+                    (declare (type (unsigned-byte 32) count))
+                    (and (<= count +max-receiver-specific-macs+)
+                         (<= (+ entries-loc (* count entry-len)) end)
+                         (dotimes (i count nil)
+                           (let ((eoff (+ entries-loc (* i entry-len))))
+                             (when (%recv-key-id-eq-at secured eoff my-receiver-key-id)
+                               (return
+                                 ;; GMAC verify IN PLACE: ct-len 0, AAD = common_mac at MAC-LOC, tag = wire mac at eoff+4.
+                                 (and (dds.dare:aes-256-gcm-open-into
+                                       scratch 0
+                                       (%km-receiver-session-key-at km my-receiver-key-id my-receiver-key secured sid-off)
+                                       secured sid-off
+                                       secured
+                                       secured mac-loc 0
+                                       secured (+ eoff +transformation-key-id-len+)
+                                       mac-loc +common-mac-len+)
+                                      t))))))))))))
 
 (defun* %verify-receiver-mac (km session-id iv-suffix common-mac receiver-macs
                               my-receiver-key-id my-receiver-key)
@@ -355,19 +500,12 @@
     (%put-sec-header-at vec (+ out-off postfix-loc) postfix-kind postfix-len)
     (dotimes (i align-pad) (setf (aref vec (+ out-off mac-loc +common-mac-len+ i)) 0))
     (%put-u32-be-at vec (+ out-off rsm-loc) count)
-    ;; origin authentication (§9.5.3.3.4.3): compute + write receiver_specific_macs (the allocating fallback)
+    ;; origin authentication (§9.5.3.3.4.3): write receiver_specific_macs BY OFFSET (zero-alloc, ADR-0039 residual
+    ;; (a) closed) — each 20-octet {key_id ‖ GMAC} entry written straight into the CryptoFooter via the cached
+    ;; receiver session key + aes-256-gcm-seal-into (GMAC over the in-place common_mac, nonce = the in-place
+    ;; session_id‖iv_suffix); byte-identical to the allocating %compute-receiver-macs path (the T3 corpus proves it).
     (when (plusp count)
-      (let ((macs (%compute-receiver-macs km
-                                          (subseq vec (+ out-off sid-loc) (+ out-off iv-loc))
-                                          (subseq vec (+ out-off iv-loc) (+ out-off mid-loc))
-                                          (subseq vec (+ out-off mac-loc) (+ out-off mac-loc +common-mac-len+))
-                                          receivers))
-            (eoff (+ out-off entries-loc)))
-        (dolist (e macs)
-          (replace vec (car e) :start1 eoff :end1 (+ eoff +transformation-key-id-len+))
-          (replace vec (cdr e) :start1 (+ eoff +transformation-key-id-len+)
-                               :end1 (+ eoff +transformation-key-id-len+ +common-mac-len+))
-          (incf eoff (+ +transformation-key-id-len+ +common-mac-len+)))))
+      (%put-receiver-macs-into km vec (+ out-off sid-loc) (+ out-off mac-loc) (+ out-off entries-loc) receivers))
     total))
 
 (defun* %encode-secured-region (km mode plain-region receivers prefix-kind postfix-kind
@@ -605,33 +743,45 @@
     ;; Any condition (bounds, malformed, EVP, etc.) -> NIL (fail-closed).
     (error () nil)))
 
-(defun* %decode-verify-origin-auth (km secured postfix-off postfix-kind my-receiver-key-id my-receiver-key)
-    (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum (unsigned-byte 8)
+(defun* %decode-secured-region-verify-into (pt-out pt-off km secured secured-off secured-len sign-walk-p
+                                            my-receiver-key-id my-receiver-key)
+    (function (dds.core.buffer:octet-buffer fixnum key-material
+               (simple-array (unsigned-byte 8) (*)) fixnum fixnum t
                (or (simple-array (unsigned-byte 8) (*)) null)
                (or (simple-array (unsigned-byte 8) (*)) null))
+              (values (or fixnum null) (or (member :sign :encrypt) null) (or fixnum null) (or fixnum null)))
+  "ZERO-ALLOC decode + origin-authentication verify BY RAW OFFSET (the ADR-0039 residual (a) live-path core): run
+   %decode-secured-region-into (validates the bracket + verifies the common_mac + recovers the region), then — when
+   MY-RECEIVER-KEY-ID is non-NIL — %verify-receiver-mac-into over the returned POSTFIX-OFF (finds + GMAC-verifies
+   THIS receiver's CryptoFooter entry IN PLACE). Return the same (values DATA-LEN MODE DATA-OFF POSTFIX-OFF) as
+   %decode-secured-region-into on success, or a single NIL on decode failure OR receiver-MAC failure (fail-closed;
+   NFR-SEC-POSTURE — never a bypass, never plaintext on failure). The verify reuses PT-OUT's static vec as the
+   open-into GMAC-verify sink (nothing written — ct-len 0 — so the recovered ENCRYPT plaintext already in PT-OUT is
+   untouched). MY-RECEIVER-KEY-ID NIL = origin-auth not requested -> identical to %decode-secured-region-into. Shared
+   by the whole-RTPS + submessage -into verify entries; wrapped in a fail-closed handler by callers."
+  (multiple-value-bind (data-len mode data-off postfix-off)
+      (%decode-secured-region-into pt-out pt-off km secured secured-off secured-len sign-walk-p)
+    (if (and data-len
+             (%verify-receiver-mac-into km secured secured-off postfix-off my-receiver-key-id my-receiver-key
+                                        (dds.core.buffer:octet-buffer-vec pt-out)))
+        (values data-len mode data-off postfix-off)
+        nil)))
+
+(defun* %decode-verify-origin-auth (km secured postfix-off my-receiver-key-id my-receiver-key scratch)
+    (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum
+               (or (simple-array (unsigned-byte 8) (*)) null)
+               (or (simple-array (unsigned-byte 8) (*)) null)
+               (simple-array (unsigned-byte 8) (*)))
               boolean)
   "Origin-authentication gate (§9.5.3.3.4.3) for the decode wrapper — T when MY-RECEIVER-KEY-ID is NIL
    (origin-auth not requested; the common_mac alone governs, already verified by the -into core) OR when THIS
    receiver's entry verifies; NIL (fail-closed) if requested but absent/mismatched even though the common_mac
-   is valid. Parse the CryptoFooter at the POSTFIX submessage (POSTFIX-OFF, id POSTFIX-KIND) via the shared
-   %parse-sec-postfix-mac -> (common_mac, receiver_specific_macs), then %verify-receiver-mac (session_id /
-   iv_suffix read from the in-place CryptoHeader at SECURED[bracket offsets 12 / 16]; the constant-time compare
-   is in %verify-receiver-mac). Allocating — the origin-auth path is the deferred allocating fallback. Runs
-   inside %decode-secured-region's fail-closed handler, so any signal still resolves to NIL."
-  (if (null my-receiver-key-id)
-      t
-      (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over secured) :endianness :little)))
-        (dds.core.buffer:cursor-set-position cur postfix-off)
-        (multiple-value-bind (common-mac receiver-macs) (%parse-sec-postfix-mac cur postfix-kind)
-          (and common-mac
-               (%verify-receiver-mac
-                km
-                (subseq secured (+ +sec-submessage-header-len+ +secure-data-header-session-id-off+)
-                        (+ +sec-submessage-header-len+ +secure-data-header-iv-suffix-off+))
-                (subseq secured (+ +sec-submessage-header-len+ +secure-data-header-iv-suffix-off+)
-                        (+ +sec-submessage-header-len+ +secure-data-header-iv-suffix-off+ +init-vector-suffix-len+))
-                common-mac receiver-macs my-receiver-key-id my-receiver-key)
-               t)))))
+   is valid. Thin delegation to the ZERO-ALLOC %verify-receiver-mac-into (the ADR-0039 residual (a) fix): the
+   CryptoFooter at the POSTFIX submessage (POSTFIX-OFF) is located + verified BY OFFSET — no cursor / footer
+   parse / subseq materialization. SCRATCH is the caller's static PT-OUT reused as the open-into GMAC-verify
+   sink (nothing is written — ct-len 0). Runs inside %decode-secured-region's fail-closed handler, so any signal
+   still resolves to NIL."
+  (%verify-receiver-mac-into km secured 0 postfix-off my-receiver-key-id my-receiver-key scratch))
 
 (defun* %decode-secured-region (km secured-octets my-receiver-key-id my-receiver-key
                                 prefix-kind postfix-kind sign-walk-p)
@@ -656,7 +806,7 @@
    valid. MY-RECEIVER-KEY-ID NIL = origin-auth not expected (backward-compatible). Any malformed / truncated /
    re-ordered / unknown-kind / auth-fail / receiver-MAC-fail input -> NIL, never a tampered region, even at
    (safety 0)."
-  (declare (ignore prefix-kind))
+  (declare (ignore prefix-kind postfix-kind))
   (let ((pt-out (dds.core.buffer:make-octet-buffer (max 1 (length secured-octets)))))
     (unwind-protect
          (handler-case
@@ -664,8 +814,9 @@
                  (%decode-secured-region-into pt-out 0 km secured-octets 0 (length secured-octets) sign-walk-p)
                (when (and len
                           (or (null my-receiver-key-id)
-                              (%decode-verify-origin-auth km secured-octets postfix-off postfix-kind
-                                                          my-receiver-key-id my-receiver-key)))
+                              (%decode-verify-origin-auth km secured-octets postfix-off
+                                                          my-receiver-key-id my-receiver-key
+                                                          (dds.core.buffer:octet-buffer-vec pt-out))))
                  (ecase mode
                    (:encrypt (subseq (dds.core.buffer:octet-buffer-vec pt-out) 0 len))
                    (:sign    (subseq secured-octets region-off (+ region-off len))))))
@@ -756,9 +907,12 @@
   (%encode-secured-region-into out-buf out-off km kind plain plain-off plain-len receivers
                                +submessage-sec-prefix+ +submessage-sec-postfix+))
 
-(defun* decode-datawriter-submessage-into (pt-out pt-off km secured secured-off secured-len)
+(defun* decode-datawriter-submessage-into (pt-out pt-off km secured secured-off secured-len
+                                           &key (my-receiver-key-id nil) (my-receiver-key nil))
     (function (dds.core.buffer:octet-buffer fixnum key-material
-               (simple-array (unsigned-byte 8) (*)) fixnum fixnum)
+               (simple-array (unsigned-byte 8) (*)) fixnum fixnum
+               &key (:my-receiver-key-id (or (simple-array (unsigned-byte 8) (*)) null))
+                    (:my-receiver-key (or (simple-array (unsigned-byte 8) (*)) null)))
               (values (or fixnum null) (or (member :sign :encrypt) null) (or fixnum null) (or fixnum null)))
   "Recover the protected DataWriter submessage from a SEC_PREFIX(0x31) ... SEC_POSTFIX(0x32) bracket in
    SECURED[SECURED-OFF..+SECURED-LEN] under KM BY RAW OFFSET; return (values DATA-LEN MODE DATA-OFF POSTFIX-OFF), or a
@@ -769,20 +923,34 @@
    common_mac before any AEAD open. ENCRYPT: aes-256-gcm-open-into writes the recovered submessage into
    PT-OUT[PT-OFF..+DATA-LEN] (zero GC-heap alloc); DATA-OFF is the ciphertext offset in SECURED. SIGN: NO copy into
    PT-OUT — DATA-OFF is the verbatim-submessage offset in SECURED (the caller moves it in place); DATA-LEN its length.
-   POSTFIX-OFF is the SEC_POSTFIX offset. ORIGIN AUTHENTICATION (§9.5.3.3.4.3) is NOT verified here (the -into core does
-   the common_mac only) — the WITH_ORIGIN_AUTHENTICATION tier stays on the allocating decode-datawriter-submessage (its
-   receiver-MAC gate). Consumed over a reused per-node RX buffer by dds.disc %on-user-secure-submessage. Inverse:
+   POSTFIX-OFF is the SEC_POSTFIX offset. ORIGIN AUTHENTICATION (§9.5.3.3.4.3, the WITH_ORIGIN_AUTHENTICATION tier):
+   pass MY-RECEIVER-KEY-ID (this receiver's 4-octet receiver_specific_key_id) + MY-RECEIVER-KEY (its 32-octet
+   master_receiver_specific_key) and the decoder ALSO GMAC-verifies THIS receiver's CryptoFooter entry BY OFFSET
+   (%verify-receiver-mac-into, reusing PT-OUT's static vec as the verify sink — nothing written) and fails-closed NIL
+   if absent/mismatched even when the common_mac is valid — now ZERO-ALLOC (ADR-0039 residual (a) closed), no longer
+   the allocating decode-datawriter-submessage fallback. Both NIL (default) = origin-auth not expected (identical to
+   the common tier). Consumed over a reused per-node RX buffer by dds.disc %on-user-secure-submessage. Inverse:
    encode-datawriter-submessage-into."
-  (%decode-secured-region-into pt-out pt-off km secured secured-off secured-len nil))
+  (if my-receiver-key-id
+      (%decode-secured-region-verify-into pt-out pt-off km secured secured-off secured-len nil
+                                          my-receiver-key-id my-receiver-key)
+      (%decode-secured-region-into pt-out pt-off km secured secured-off secured-len nil)))
 
-(defun* decode-datareader-submessage-into (pt-out pt-off km secured secured-off secured-len)
+(defun* decode-datareader-submessage-into (pt-out pt-off km secured secured-off secured-len
+                                           &key (my-receiver-key-id nil) (my-receiver-key nil))
     (function (dds.core.buffer:octet-buffer fixnum key-material
-               (simple-array (unsigned-byte 8) (*)) fixnum fixnum)
+               (simple-array (unsigned-byte 8) (*)) fixnum fixnum
+               &key (:my-receiver-key-id (or (simple-array (unsigned-byte 8) (*)) null))
+                    (:my-receiver-key (or (simple-array (unsigned-byte 8) (*)) null)))
               (values (or fixnum null) (or (member :sign :encrypt) null) (or fixnum null) (or fixnum null)))
   "Recover the protected DataReader submessage from a SEC_PREFIX(0x31) ... SEC_POSTFIX(0x32) bracket in
    SECURED[SECURED-OFF..+SECURED-LEN] under KM BY RAW OFFSET; return (values DATA-LEN MODE DATA-OFF POSTFIX-OFF), or NIL
    on ANY failure (fail-closed) — the zero-alloc twin of decode-datareader-submessage. SAME §8.5 transform as
    decode-datawriter-submessage-into (both delegate to the one shared %decode-secured-region-into core, SIGN-WALK-P NIL —
-   no copy-paste). See decode-datawriter-submessage-into for the full fail-closed contract. Inverse:
+   no copy-paste). MY-RECEIVER-KEY-ID / MY-RECEIVER-KEY enable the ZERO-ALLOC origin-authentication verify exactly as for
+   decode-datawriter-submessage-into. See decode-datawriter-submessage-into for the full fail-closed contract. Inverse:
    encode-datareader-submessage-into."
-  (%decode-secured-region-into pt-out pt-off km secured secured-off secured-len nil))
+  (if my-receiver-key-id
+      (%decode-secured-region-verify-into pt-out pt-off km secured secured-off secured-len nil
+                                          my-receiver-key-id my-receiver-key)
+      (%decode-secured-region-into pt-out pt-off km secured secured-off secured-len nil)))

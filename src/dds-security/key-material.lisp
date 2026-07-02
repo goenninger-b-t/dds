@@ -32,6 +32,12 @@
                            iv-counter-lock to make nonce uniqueness STRUCTURAL — two concurrent
                            encodes of the same km never race to the same counter value.
      iv-counter-lock     : opaque lock — guards iv-counter.
+     cached-session-*    : the §9.5.3.3.4.2 common session-key cache (%km-session-key-at).
+     cached-recv-*       : the §9.5.3.3.4.3 receiver-specific session-key cache for origin authentication
+                           (%km-receiver-session-key-at) — derived once per (receiver_specific_key_id, session_id).
+     cached-receiver-descriptor-list : the §9.5.3.3.4.3 memoized origin-auth receiver-descriptor list
+                           (km-receiver-descriptor{-list}) — built once from the immutable receiver fields, reused
+                           per datagram so the live origin-auth send/receive resolvers cons nothing.
    MVP SCAFFOLD — the Slice-2 Auth handshake replaces make-test-key-material."
   (transformation-kind +transformation-kind-aes256-gcm+
    :type (simple-array (unsigned-byte 8) (*)))
@@ -53,7 +59,24 @@
   (iv-counter-lock (dds.pal:make-lock "km-iv") :type t)
   ;; §9.5.3.3.4.2 session-key cache: derived once per (master_sender_key, master_salt, session_id) triplet.
   (cached-session-id  nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (cached-session-key nil :type (or null (simple-array (unsigned-byte 8) (32)))))
+  (cached-session-key nil :type (or null (simple-array (unsigned-byte 8) (32))))
+  ;; §9.5.3.3.4.3 receiver-specific session-key cache (origin authentication): derived once per
+  ;; (receiver_specific_key_id, master_receiver_specific_key, session_id) — the parallel of the common
+  ;; session-key cache above, closing the ADR-0039 residual (a) allocating fallback. The MASTER key is part of
+  ;; the discriminant (not just the key_id): the SAME key_id may be presented with DIFFERENT master keys (a
+  ;; wrong-key origin-auth probe), and the derived key depends on the master key — keying by key_id alone would
+  ;; return a stale key and bypass the gate. Single-slot + fence-published like %km-session-key-at (a torn read
+  ;; re-derives or fail-closes, never a wrong-key bypass); read/written by %km-receiver-session-key-at.
+  (cached-recv-key-id      nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (cached-recv-master-key  nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (cached-recv-session-id  nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (cached-recv-session-key nil :type (or null (simple-array (unsigned-byte 8) (32))))
+  ;; §9.5.3.3.4.3 origin-auth receiver-descriptor cache: the (list (cons receiver_specific_key_id .
+  ;; master_receiver_specific_key)) the live per-datagram origin-auth resolvers return — built once from the
+  ;; IMMUTABLE receiver fields and reused, so the resolver conses nothing per datagram (km-receiver-descriptor{-list}).
+  ;; NIL = not-yet-built (an origin-auth KM's list is always non-NIL once built; a non-origin-auth KM never reaches
+  ;; the slot — %km-origin-auth-p gates first). Re-keying mints a NEW KM (fresh slot); fence-published like the caches above.
+  (cached-receiver-descriptor-list nil :type (or null cons)))
 
 (defun* %km-session-key-at (km session-id-vec session-id-off)
     (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum) (simple-array (unsigned-byte 8) (32)))
@@ -82,6 +105,47 @@
           (dds.pal:fence :release)
           (setf (key-material-cached-session-id km) sid)
           k))))
+
+(defun* %km-origin-auth-p (km)
+    (function (key-material) boolean)
+  "T iff KM carries origin-auth receiver-specific key material — a NON-ZERO receiver_specific_key_id (the
+   §9.5.3.3.4.3 origin-auth-enabled marker; an all-zero id is the disabled sentinel). The receiver fields are
+   immutable after mint, so this is a stable per-KM predicate."
+  (notevery #'zerop (key-material-receiver-specific-key-id km)))
+
+(defun* km-receiver-descriptor-list (km)
+    (function (key-material) list)
+  "The MEMOIZED §9.5.3.3.4.3 origin-auth receiver-descriptor list of KM: (list (cons receiver_specific_key_id .
+   master_receiver_specific_key)) when KM carries a receiver-specific key, else NIL. This is exactly what the live
+   per-datagram origin-auth ENCODE resolvers return for :receivers (rtps_protection cm-rtps-encode-receivers +
+   secure-SEDP cm-secure-sedp-encode-receivers) and, via KM-RECEIVER-DESCRIPTOR, what the DECODE resolvers return
+   for my-receiver-key — so caching the one list/cons on the KM makes those resolvers cons ZERO GC-heap bytes per
+   datagram (closing the resolver-list residual under ADR-0039's zero-alloc origin-auth claim). The list is built
+   once from KM's IMMUTABLE receiver fields (a benign concurrent double-build derives the identical content);
+   re-keying mints a NEW KeyMaterial (fresh cache) and participant loss drops the KM (and its cache), so a stale
+   descriptor is impossible — the %km-session-key-at invalidation model. Hit path is lock-free + zero-alloc under an
+   ACQUIRE fence; the one-time cold build publishes the list under a RELEASE fence (contents visible before the slot
+   store) — the first fill amortizes, steady state is 0 B (the %km-session-key-at convention). The returned list is
+   READ-ONLY for the transform (%put-receiver-macs-into / %verify-receiver-mac-into read (car r)/(cdr r) only), so
+   sharing the cached instance across datagrams is safe. Cache is probed FIRST so the hit path is a pure slot load +
+   ACQUIRE fence — no %km-origin-auth-p scan — hence guaranteed zero-alloc."
+  (let ((cached (key-material-cached-receiver-descriptor-list km)))
+    (if cached
+        (progn (dds.pal:fence :acquire) cached)
+        (when (%km-origin-auth-p km)
+          (let ((built (list (cons (key-material-receiver-specific-key-id km)
+                                   (key-material-master-receiver-specific-key km)))))
+            (dds.pal:fence :release)
+            (setf (key-material-cached-receiver-descriptor-list km) built)
+            built)))))
+
+(defun* km-receiver-descriptor (km)
+    (function (key-material) (or null cons))
+  "The §9.5.3.3.4.3 origin-auth receiver descriptor (receiver_specific_key_id . master_receiver_specific_key) of
+   KM, or NIL when KM carries no receiver-specific key. The CAR of the MEMOIZED KM-RECEIVER-DESCRIPTOR-LIST — the
+   same single cached cons the ENCODE :receivers list holds — so the DECODE my-receiver-key resolvers
+   (cm-rtps-decode-receiver / cm-secure-sedp-decode-receiver) are zero-alloc per datagram too."
+  (car (km-receiver-descriptor-list km)))
 
 ;;; Fixed test key material — a known, PUBLISHED, non-secret value for offline round-trip tests.
 ;;; The 32-byte master_sender_key and master_salt are the two consecutive NIST SP 800-56C rev2

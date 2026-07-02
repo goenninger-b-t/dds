@@ -1640,6 +1640,80 @@
             "generate-writer-key-material :origin-auth t populates a non-zero receiver-specific key_id + master key"))
   t)
 
+(defun* %t3-into-verify (sub)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "T3 corpus block (4): the ZERO-ALLOC into-buffer origin-auth verify entries (ADR-0039 residual (a)) round-trip
+   IDENTICALLY to the allocating gate — proving the by-offset %put-receiver-macs-into (encode) + %verify-receiver-
+   mac-into (decode) live path is correct AND fail-closed, so the 0 B/sample mem arms are non-vacuous. On the SAME
+   receiver-MAC bracket built by encode-datawriter-submessage-into / encode-rtps-message-into (:receivers), decode
+   via decode-{datawriter-submessage,rtps-message}-into with :my-receiver-key-id/:my-receiver-key: receiver #2 RIGHT
+   key -> byte-exact recovery; WRONG key -> NIL though the common_mac is valid; ABSENT key_id -> NIL; NO key ->
+   common_mac alone. Both submessage (SIGN-walk one embedded) + whole-RTPS (SIGN-walk the stream) tiers."
+  (let ((kid2 (%hex-octets "bbbb0002"))
+        (mk2   (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x22))
+        (wrong (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x99))
+        (absent (%hex-octets "cccc0003")))
+    (flet ((dw-dec (secured blen rkid rk)
+             (let ((pt (dds.core.buffer:make-octet-buffer 256)))
+               (unwind-protect
+                    (multiple-value-bind (dl mode doff poff)
+                        (dds.security:decode-datawriter-submessage-into
+                         pt 0 (dds.security:make-test-key-material) secured 0 blen
+                         :my-receiver-key-id rkid :my-receiver-key rk)
+                      (declare (ignore poff))
+                      (when dl
+                        (ecase mode
+                          (:encrypt (subseq (dds.core.buffer:octet-buffer-vec pt) 0 dl))
+                          (:sign    (subseq secured doff (+ doff dl))))))
+                 (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt)))))
+           (rtps-dec (secured blen rkid rk)
+             (let ((pt (dds.core.buffer:make-octet-buffer 256)))
+               (unwind-protect
+                    (multiple-value-bind (dl mode doff poff)
+                        (dds.security:decode-rtps-message-into
+                         pt 0 (dds.security:make-test-key-material) secured 0 blen
+                         :my-receiver-key-id rkid :my-receiver-key rk)
+                      (declare (ignore poff))
+                      (when dl
+                        (ecase mode
+                          (:encrypt (subseq (dds.core.buffer:octet-buffer-vec pt) 0 dl))
+                          (:sign    (subseq secured doff (+ doff dl))))))
+                 (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt))))))
+      ;; submessage tier (SEC_PREFIX/SEC_POSTFIX), both kinds
+      (dolist (kind '(:encrypt :sign))
+        (let* ((km   (dds.security:make-test-key-material))
+               (obuf (dds.core.buffer:make-octet-buffer 256))
+               (blen (dds.security:encode-datawriter-submessage-into obuf 0 km kind sub 0 (length sub)
+                                                                     :receivers (%t3-recvs)))
+               (secured (dds.core.buffer:octet-buffer-vec obuf)))
+          (unwind-protect
+               (progn
+                 (%check :t3-into-dw-right  (equalp (dw-dec secured blen kid2 mk2) sub)
+                         (format nil "~a -into datawriter: receiver #2 RIGHT key recovers byte-exact" kind))
+                 (%check :t3-into-dw-wrong  (null (dw-dec secured blen kid2 wrong))
+                         (format nil "~a -into datawriter: WRONG receiver key -> NIL (common_mac valid; origin-auth gates)" kind))
+                 (%check :t3-into-dw-absent (null (dw-dec secured blen absent mk2))
+                         (format nil "~a -into datawriter: ABSENT key_id -> NIL (no entry targets me)" kind))
+                 (%check :t3-into-dw-off    (equalp (dw-dec secured blen nil nil) sub)
+                         (format nil "~a -into datawriter: no key -> common_mac alone (non-vacuity)" kind)))
+            (dds.pal:free-static secured))))
+      ;; whole-RTPS tier (SRTPS_PREFIX/SRTPS_POSTFIX), both kinds — SUB is a valid one-submessage stream
+      (dolist (kind '(:encrypt :sign) t)
+        (let* ((km   (dds.security:make-test-key-material))
+               (obuf (dds.core.buffer:make-octet-buffer 256))
+               (blen (dds.security:encode-rtps-message-into obuf 0 km kind sub 0 (length sub)
+                                                            :receivers (%t3-recvs)))
+               (secured (dds.core.buffer:octet-buffer-vec obuf)))
+          (unwind-protect
+               (progn
+                 (%check :t3-into-rtps-right (equalp (rtps-dec secured blen kid2 mk2) sub)
+                         (format nil "~a -into rtps: receiver #2 RIGHT key recovers byte-exact" kind))
+                 (%check :t3-into-rtps-wrong (null (rtps-dec secured blen kid2 wrong))
+                         (format nil "~a -into rtps: WRONG receiver key -> NIL (fail-closed)" kind))
+                 (%check :t3-into-rtps-off   (equalp (rtps-dec secured blen nil nil) sub)
+                         (format nil "~a -into rtps: no key -> common_mac alone" kind)))
+            (dds.pal:free-static secured)))))))
+
 (defun* run-security-origin-auth-test ()
     (function () t)
   "DDS-Security 1.1 §9.5.3.3.4.3 origin authentication corpus (Slice 4 T3): receiver-specific session-key
@@ -1652,6 +1726,9 @@
        plaintext on the common_mac alone (proving the failure is specifically the receiver-MAC check).
    (3) KDF/MAC/generator units (deterministic, label-distinct, IV/input/key-sensitive; :origin-auth slot
        population).
+   (4) the ZERO-ALLOC into-buffer verify entries (ADR-0039 residual (a)): decode-{datawriter-submessage,
+       rtps-message}-into with :my-receiver-key-id/:my-receiver-key round-trip identically + fail-closed,
+       so the origin-auth 0 B/sample mem arms are non-vacuous.
    Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
   (handler-case (dds.dare:dare-available-p)
     (dds.dare:dare-unavailable (c)
@@ -1661,7 +1738,8 @@
   (let ((sub (%t2-fixed-plain-submessage)))
     (%t3-corpus-encode sub)
     (%t3-corpus-decode sub)
-    (%t3-kdf-mac-units))
+    (%t3-kdf-mac-units)
+    (%t3-into-verify sub))
   t)
 
 ;;; --- Slice 4 T4: §8.5.1.10-.12 whole-RTPS-message protection (SRTPS_PREFIX(0x33) ... SRTPS_POSTFIX

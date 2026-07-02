@@ -140,6 +140,9 @@
    ;; KeyMaterial §9.5.2 Table 65: two additional receiver-specific key fields (T3)
    #:key-material-receiver-specific-key-id
    #:key-material-master-receiver-specific-key
+   ;; §9.5.3.3.4.3 memoized origin-auth receiver descriptor (zero-alloc per-datagram resolver, WP-SECURITY-ORIGIN-AUTH-ZEROALLOC)
+   #:km-receiver-descriptor
+   #:km-receiver-descriptor-list
    ;; WP-DDS-SECURITY-AUTH-KEYX T2: §9.5.3 KxKey/KxSalt derivation from the SharedSecret
    #:kx-key-handle
    #:kx-key-handle-p

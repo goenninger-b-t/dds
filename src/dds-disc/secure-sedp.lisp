@@ -1685,6 +1685,70 @@
                                                           :end2 (+ data-off data-len)))))))))))
                  (report-arm "rtps-recv " 0.0d0 sec))
                (dds.pal:free-static dgvec))
+             ;; ---- (e/f) ORIGIN AUTHENTICATION (§9.5.3.3.4.3, *_WITH_ORIGIN_AUTHENTICATION rtps tier): the
+             ;; receiver-specific-MAC encode + decode is 0 B/sample OVER the common (empty-receivers) tier — the
+             ;; WP-SECURITY-ORIGIN-AUTH-ZEROALLOC LIVE-PATH proof. These arms drive the REAL memoized receiver-
+             ;; descriptor resolver (dds.security:km-receiver-descriptor{-list} — the EXACT call the installed
+             ;; cm-rtps-encode-receivers / cm-rtps-decode-receiver make) INSIDE the measured window, not a pre-built
+             ;; stub list, so they measure the LIVE origin-auth datagram path (resolver + transform) and prove the
+             ;; resolver-list residual is closed. km-oa is an origin-auth ParticipantCrypto carrying the receiver
+             ;; key; its descriptor list is memoized on the KM, so the one-time cold-cache build is forced OFF the
+             ;; window and the reported 0.0000 is warmed steady-state (the %km-session-key-at convention). SEND
+             ;; baseline = the common rtps wrap (empty receivers); secured = the SAME wrap DRIVING the resolver ->
+             ;; the delta is the %put-receiver-macs-into cost (cached receiver session key + GMAC-into) + the
+             ;; resolver (memoized -> 0 B). RECV baseline = decode-rtps-message-into WITHOUT the gate; secured = the
+             ;; SAME decode RESOLVING my-receiver-key via the memoized resolver WITH the gate (%verify-receiver-mac-
+             ;; into, in-place GMAC verify). Both over reused buffers + warmed caches -> an EXACT 0.0000 on SBCL (Clasp smokes).
+             (let* ((oa-kid (map '(simple-array (unsigned-byte 8) (*)) #'identity #(#xab #xcd #x12 #x34)))
+                    (oa-mk  (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x5e))
+                    (km-oa  (dds.security:make-key-material                 ; origin-auth KM = the resolver's descriptor source
+                             :receiver-specific-key-id oa-kid :master-receiver-specific-key oa-mk)))
+               (dds.security:km-receiver-descriptor-list km-oa)            ; force the one-time cold-cache build off the window
+               ;; (e) origin-auth SEND: common wrap vs receiver-MAC wrap DRIVING the live resolver, over the reused tx buffer.
+               (setf (disc-node-rtps-protection-kind node-a) :encrypt)
+               (%ensure-send-scratch-pool node-a)
+               (let* ((buf (disc-node-tx-msg node-a))
+                      (vec (dds.core.buffer:octet-buffer-vec buf))
+                      (plen (%rtps-build-user-datagram node-a buf 6 payload))
+                      (plain-copy (subseq vec 0 plen)))
+                 (setf (disc-node-rtps-protection-encode node-a)
+                       (lambda (dp) (declare (ignore dp)) (values km-rtps :encrypt '())))   ; baseline: common tier
+                 (let ((base (bps (lambda () (replace vec plain-copy :end2 plen)
+                                     (%maybe-wrap-srtps node-a buf plen pb)))))
+                   (setf (disc-node-rtps-protection-encode node-a)
+                         (lambda (dp) (declare (ignore dp))
+                           (values km-rtps :encrypt (dds.security:km-receiver-descriptor-list km-oa))))   ; LIVE resolver
+                   (let ((sec (bps (lambda () (replace vec plain-copy :end2 plen)
+                                      (%maybe-wrap-srtps node-a buf plen pb)))))
+                     (report-arm "oauth-send" base sec)))
+                 (replace vec plain-copy :end2 plen))
+               ;; (f) origin-auth RECV: decode the receiver-MAC SRTPS datagram WITHOUT (baseline) vs WITH the gate,
+               ;; RESOLVING my-receiver-key via the live memoized resolver per datagram (cm-rtps-decode-receiver's call).
+               (setf (disc-node-rtps-protection-encode node-a)
+                     (lambda (dp) (declare (ignore dp))
+                       (values km-rtps :encrypt (dds.security:km-receiver-descriptor-list km-oa))))
+               (let* ((buf (disc-node-tx-msg node-a))
+                      (vec (dds.core.buffer:octet-buffer-vec buf))
+                      (plen (%rtps-build-user-datagram node-a buf 7 payload))
+                      (wlen (%maybe-wrap-srtps node-a buf plen pb))   ; vec[0,wlen) = the origin-auth SRTPS datagram
+                      (srtps-copy (subseq vec 0 wlen))
+                      (dgbuf (dds.core.buffer:make-octet-buffer (max 64 wlen)))
+                      (dgvec (dds.core.buffer:octet-buffer-vec dgbuf))
+                      (size wlen))
+                 (%ensure-secure-rx-pool node-b)
+                 (let ((base (bps (lambda ()
+                                     (replace dgvec srtps-copy :end2 size)
+                                     (%with-secure-rx-scratch (rx node-b)
+                                       (dds.security:decode-rtps-message-into rx 0 km-rtps dgvec 20 (- size 20)))))))
+                   (let ((sec (bps (lambda ()
+                                      (replace dgvec srtps-copy :end2 size)
+                                      (%with-secure-rx-scratch (rx node-b)
+                                        (let ((rd (dds.security:km-receiver-descriptor km-oa)))   ; LIVE decode resolver
+                                          (dds.security:decode-rtps-message-into rx 0 km-rtps dgvec 20 (- size 20)
+                                                                                 :my-receiver-key-id (car rd)
+                                                                                 :my-receiver-key (cdr rd))))))))
+                     (report-arm "oauth-recv" base sec)))
+                 (dds.pal:free-static dgvec)))
              ;; ---- EXHAUSTION -> fail-closed drop, NEVER a GC fallback (send AND receive) ----
              ;; SEND (submsg-scratch): drain -> the required metadata wrap fails-closed NIL.
              (setf (disc-node-user-submessage-protection-kind node-a) :encrypt
