@@ -41,6 +41,7 @@
    #:make-file-key-provider
    ;; Task 6b: foreign-backed secret-material lifetime (design spec §6)
    #:free-secret-octets
+   #:octets->secret
    ;; X.509 / EVP_PKEY primitives (WP-DDS-SECURITY-AUTH-2A T1)
    #:x509-load-cert
    #:x509-free

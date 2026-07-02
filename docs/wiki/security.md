@@ -87,12 +87,14 @@ input, or a declared `crypto_content.length` that overflows the buffer, signals
 
 | Slot | Type | Role |
 |---|---|---|
-| `transformation-kind` | `(simple-array (unsigned-byte 8) (*))` | `octet[4]` algorithm selector |
-| `master-salt` | `(simple-array (unsigned-byte 8) (*))` | 32 bytes mixed into the session-key KDF |
-| `sender-key-id` | `(simple-array (unsigned-byte 8) (*))` | 4 bytes placed in SecureDataHeader `transformation_key_id` |
-| `master-sender-key` | `(simple-array (unsigned-byte 8) (*))` | 32-byte HMAC key for the KDF |
+| `transformation-kind` | `(simple-array (unsigned-byte 8) (*))` | `octet[4]` algorithm selector (public, on wire) |
+| `master-salt` | foreign/static `(unsigned-byte 8)` | **SECRET** — 32 bytes mixed into the session-key KDF |
+| `sender-key-id` | `(simple-array (unsigned-byte 8) (*))` | 4 bytes placed in SecureDataHeader `transformation_key_id` (public) |
+| `master-sender-key` | foreign/static `(unsigned-byte 8)` | **SECRET** — 32-byte HMAC key for the KDF |
+| `master-receiver-specific-key` | foreign/static `(unsigned-byte 8)` | **SECRET** — 32-byte origin-auth (§9.5.3.3.4.3) receiver key |
 | `iv-counter` | `(unsigned-byte 64)` | monotonic counter for structural nonce uniqueness |
 | `iv-counter-lock` | opaque | guards `iv-counter` against concurrent encoders |
+| `zeroized` | `boolean` | fail-closed marker set by `zeroize-key-material` (see §2.4) |
 
 **`make-test-key-material`** returns a fresh `key-material` with fixed, published,
 non-secret constants.  It is the **MVP scaffold for offline testing only** — NOT for
@@ -102,6 +104,48 @@ Single-instance constraint: at most **one** `key-material` instance from
 `make-test-key-material` may encode at a time.  Two instances sharing the same master
 key start `iv-counter` at 0 and will produce colliding AES-GCM nonces (catastrophic).
 Slice-2 Auth resolves this by giving each writer a unique derived key.
+
+### 2.4 Secret hygiene — foreign/static MASTER slots + zeroize-on-teardown (ADR 0034)
+
+The KeyMaterial's three MASTER secret byte slots (`master-salt`, `master-sender-key`,
+`master-receiver-specific-key`) live in **foreign/static** memory (off the GC heap, non-moved,
+SAP-addressable) via `dds.dare:octets->secret` — the Lisp-vector companion to the ADR 0025 /
+ADR 0032 `free-secret-octets` secret discipline.  `make-key-material` hardens these master slots
+at construction.  A moving GC can no longer copy the master secrets, freed heap cannot linger with
+them, and they can be reliably wiped (operating contract NFR-MEM / CNSA-2.0 data-at-rest).
+
+The derived §9.5.3.3.4.2/.4.3 session-key caches (`cached-session-key`, `cached-recv-session-key`,
+`cached-recv-master-key`) are **ephemeral plain GC-heap** vectors — re-derivable per `session_id`
+from the master secrets, short-lived, GC-reclaimed; they are **not** long-lived secrets-at-rest.
+They are deliberately NOT foreign-static: a fresh foreign-static copy per `session_id` would
+**unboundedly leak** un-wiped key buffers when a peer rotates `session_id` (the derivation runs
+before the GCM auth check, so it is reachable pre-auth), and free-on-replace would be a
+use-after-free of the lock-free-shared slot handed to a concurrent GCM open.  GC-heap is the
+correct representation: ephemeral, re-derivable, GC-safe, no leak.
+
+**`zeroize-key-material (km)`** is the single teardown choke: it wipes-then-frees the three MASTER
+slots and **drops** (nils; GC reclaims — no wipe/free needed) the ephemeral heap caches, and is
+**idempotent + fail-closed** (a `zeroized` marker is set first, so a second call — or a dedup
+re-walk — is a no-op and a torn-down KM reads as unusable).  It MUST run only when the data path is
+**quiesced**.  Every free path funnels through it: the crypto-manager's `all-kms` roster (which
+covers even re-key-orphaned KMs — never freed mid-run, so no live resolver ever touches freed key
+bytes) is walked by `cm-teardown` from `delete-participant` after `stop-node` joins the receiver
+thread; the disc-node's PVMS bootstrap KeyMaterials are wiped in `stop-node`.
+
+As **defense-in-depth** the entry points that read the freed master secrets — `%km-session-key-at`,
+`%km-receiver-session-key-at`, `km-receiver-descriptor-list` — check the `zeroized` marker first and
+signal `key-material-zeroized-error` on a torn-down KM (a single flag check off the zero-alloc hit
+path), so a zeroized KM cannot use-after-free its freed master buffers; `km-receiver-descriptor-list`
+signals rather than returning NIL, since a NIL descriptor would be a fail-OPEN origin-auth bypass.
+
+This is a **storage-representation** change only — every byte-exact corpus, the NIST AES-GCM KAT, and
+the KDF round-trips are unchanged, and `make mem` stays `0.0000` (the static allocation is at keying,
+the derived-cache miss is a GC-heap alloc off the steady-state hot path, and the session-key HIT path
+is a plain slot load).  Proven by `run-security-keymaterial-harden-test` (green on SBCL + Clasp),
+which sweeps many distinct `session_id`s to prove no per-`session_id` foreign leak.  Off-heap
+discrimination is SBCL-precise (`sb-ext:heap-allocated-p`); Clasp/Boehm is non-moving, so on Clasp
+`dds.pal:static-vector-p` is by-design permissive and the zeroize **wipe** is the master-slot
+hardening evidence (see the per-impl `static-vector-p` docstrings; NFR-PORT).
 
 ### 2.3 Encode / decode
 

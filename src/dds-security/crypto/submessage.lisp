@@ -203,7 +203,12 @@
    operating contract §4). A torn read (any discriminant field stale) fails the match and re-derives — the
    deterministic HMAC makes a benign concurrent same-value miss harmless, and a wrong key can never forge a valid
    GMAC, so the WORST case is a spurious re-derive or a fail-closed drop, never an origin-auth bypass (mirrors
-   %km-session-key-at's tear model)."
+   %km-session-key-at's tear model). The derived key + the cached master-key discriminant copy are EPHEMERAL plain
+   GC-HEAP vectors (re-derivable, GC-reclaimed, not secrets-at-rest — a foreign-static copy per session_id would
+   leak un-wiped keys on session_id rotation; ADR-0034). FAIL-CLOSED: a zeroized KM signals
+   KEY-MATERIAL-ZEROIZED-ERROR before touching the freed master_salt (a single flag check off the zero-alloc hit
+   path)."
+  (when (key-material-zeroized km) (error 'key-material-zeroized-error))
   (assert (<= (+ session-id-off 4) (length session-id-vec)))
   (let ((ckid (key-material-cached-recv-key-id km))
         (cmk  (key-material-cached-recv-master-key km))
@@ -221,12 +226,12 @@
           (dds.pal:fence :acquire)
           (key-material-cached-recv-session-key km))
         (let* ((sid (subseq session-id-vec session-id-off (+ session-id-off 4)))
-               (k   (derive-receiver-specific-session-key recv-master-key (key-material-master-salt km) sid)))
+               (k   (derive-receiver-specific-session-key recv-master-key (key-material-master-salt km) sid)))  ; ephemeral GC-heap key
           (setf (key-material-cached-recv-session-key km) k)
           ;; Release fence: the key store is visible before the session_id + master_key + key_id stores (the gate).
           (dds.pal:fence :release)
           (setf (key-material-cached-recv-session-id km) sid)
-          (setf (key-material-cached-recv-master-key km) (subseq recv-master-key 0 (length recv-master-key)))
+          (setf (key-material-cached-recv-master-key km) (subseq recv-master-key 0 (length recv-master-key)))  ; GC-heap discriminant copy
           (setf (key-material-cached-recv-key-id km) (subseq recv-key-id 0 (length recv-key-id)))
           k))))
 

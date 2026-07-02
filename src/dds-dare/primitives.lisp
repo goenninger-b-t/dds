@@ -796,6 +796,17 @@
     (dds.pal:free-static v))
   nil)
 
+(defun* octets->secret (vec)
+    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
+  "Copy VEC's octets into a fresh foreign-backed secret buffer (static-vector), so the long-lived copy can
+   be reliably zeroized (design spec §6) — the Lisp-vector companion to %FOREIGN->SECRET. SOURCE VEC is left
+   untouched (the caller owns it). Caller MUST release the result via FREE-SECRET-OCTETS. Used by the
+   DDS-Security KeyMaterial secret slots + derived-session-key caches (ADR-0034 secret hygiene)."
+  (let* ((n (length vec))
+         (v (%make-secret-octets n)))
+    (dotimes (i n v)
+      (setf (aref v i) (aref vec i)))))
+
 ;;; RAND_bytes wrapper — exported for DDS-Security nonce generation (not a secret; plain heap vector).
 ;;; RAND_bytes(unsigned char *buf, int num) -> int (1=ok); rand.h (OpenSSL 3.6.2).
 

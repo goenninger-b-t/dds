@@ -317,12 +317,13 @@
           (dotimes (i 4)  (setf (aref kid i)  (aref cdr (+ 40 i))))
           (dotimes (i 32) (setf (aref mkey i) (aref cdr (+ 48 i))))
           (when origin-auth (dotimes (i 32) (setf (aref rsk i) (aref cdr (+ 88 i)))))
-          (make-key-material :transformation-kind          kind
-                             :master-salt                  salt
-                             :sender-key-id                kid
-                             :master-sender-key            mkey
-                             :receiver-specific-key-id     rsk-id
-                             :master-receiver-specific-key rsk))))))
+          (prog1 (make-key-material :transformation-kind          kind
+                                    :master-salt                  salt
+                                    :sender-key-id                kid
+                                    :master-sender-key            mkey
+                                    :receiver-specific-key-id     rsk-id
+                                    :master-receiver-specific-key rsk)
+            (fill salt 0) (fill mkey 0) (fill rsk 0)))))))   ; wipe transient wire-parsed secrets (KM holds static copies; ADR-0034)
 
 ;;; --- Key-id derivation from writer GUID ---
 

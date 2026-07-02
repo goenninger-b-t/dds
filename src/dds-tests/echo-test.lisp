@@ -2934,6 +2934,7 @@
                  ("durability-graceful-teardown-order" . run-durability-graceful-teardown-order-test)
                  ("security-secured-payload"     . run-security-secured-payload-corpus-test)
                  ("security-secured-payload-pad" . run-security-secured-payload-pad-corpus-test)
+                 ("security-keymaterial-harden"  . run-security-keymaterial-harden-test)
                  ("security-payload-roundtrip"   . run-security-payload-roundtrip-test)
                  ("security-payload-into"        . run-security-payload-into-test)
                  ("security-payload-fuzz"        . run-security-payload-fuzz-test)

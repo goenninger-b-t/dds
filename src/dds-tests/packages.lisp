@@ -54,6 +54,7 @@
            #:run-durability-graceful-teardown-order-test
            #:run-security-secured-payload-corpus-test
            #:run-security-secured-payload-pad-corpus-test
+           #:run-security-keymaterial-harden-test
            #:run-security-payload-roundtrip-test
            #:run-security-payload-into-test
            #:run-security-payload-fuzz-test

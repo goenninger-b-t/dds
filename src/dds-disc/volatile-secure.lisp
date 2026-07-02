@@ -107,9 +107,11 @@
     (unwind-protect
          (dds.security:make-key-material
           :transformation-kind (copy-seq dds.security:+transformation-kind-aes256-gcm+)
-          :master-salt         (copy-seq (dds.security:kx-key-bytes salt-h))
+          ;; make-key-material copies the KxSalt/KxKey secrets into foreign-static (ADR-0034), so no extra
+          ;; heap copy-seq here — the KxKey/KxSalt buffers are freed right below (no lingering heap secret).
+          :master-salt         (dds.security:kx-key-bytes salt-h)
           :sender-key-id       (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)
-          :master-sender-key   (copy-seq (dds.security:kx-key-bytes key-h)))
+          :master-sender-key   (dds.security:kx-key-bytes key-h))
       ;; the derived bytes are copied into the KeyMaterial; release the foreign KxKey/KxSalt buffers.
       (dds.security:free-kx-key salt-h)
       (dds.security:free-kx-key key-h))))

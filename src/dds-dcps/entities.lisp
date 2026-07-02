@@ -134,6 +134,8 @@
 (declaim (ftype (function (t) (or null (integer 0))) %flatdata-size))
 (declaim (ftype (function (domain-participant) list) %participant-readers))
 (declaim (ftype (function (data-reader) t) return-all-loans))
+;; ADR-0034: crypto-manager.lisp (loaded after this file) — the delete-participant KeyMaterial-secret-wipe entry.
+(declaim (ftype (function (t) (eql t)) %participant-crypto-teardown))
 
 (defun* %field-resolver (ts)
     (function (t) function)
@@ -435,6 +437,10 @@
    case: ZC off / non-FlatData)."
   (dolist (dr (%participant-readers p)) (return-all-loans dr))
   (dds.disc:stop-node (dp-node p))
+  ;; ADR-0034 secret hygiene: zeroize + free every §9.5.2 KeyMaterial secret this participant holds in its
+  ;; crypto-manager. AFTER stop-node (the receiver thread is joined -> the data path is quiesced -> the secret
+  ;; buffers are safe to free). Null-safe (security OFF -> no-op) + idempotent.
+  (%participant-crypto-teardown (dp-auth-state p))
   ;; DDS-Security §8.4: release the participant-owned AccessControl handle (its Permissions-CA X509_STORE*);
   ;; create-participant created it internally, so the participant owns it. Null-safe + idempotent.
   (let ((ah (dp-access-state p)))

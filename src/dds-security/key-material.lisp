@@ -20,13 +20,23 @@
   "CryptoTransformKeyMaterial.master_receiver_specific_key width: 32 octets (§9.5.2 Table 65).
    All-zeros when receiver_specific_key_id is zero (participant-level protection, no per-receiver key).")
 
-(defstruct* key-material
+(defstruct* (key-material (:constructor %make-key-material))
   "DDS-Security 1.1 §9.5.2 CryptoTransformKeyMaterial_DH — the key bundle used by
-   encode-serialized-payload / decode-serialized-payload. Fields:
-     transformation-kind : octet[4] — the CryptoTransformKind selecting the AEAD algorithm.
-     master-salt         : octet[32] — entropy mixed into the session-key KDF (§9.5.3.3.4.2).
-     sender-key-id       : octet[4]  — the CryptoTransformKeyId placed in SecureDataHeader.
-     master-sender-key   : octet[32] — the HMAC-SHA256 key in the session-key KDF (§9.5.3.3.4.2).
+   encode-serialized-payload / decode-serialized-payload. The three MASTER secret slots (master_salt,
+   master_sender_key, master_receiver_specific_key) are held in FOREIGN/STATIC (off-GC-heap, non-moved,
+   SAP-addressable) memory and WIPED-then-freed on teardown via ZEROIZE-KEY-MATERIAL — a moving GC cannot
+   copy them, freed heap cannot linger with key bytes, and they can be reliably wiped (operating contract
+   NFR-MEM / CNSA-2.0 data-at-rest; ADR-0034 master-slot hardening). The derived session-key caches
+   (cached-session-key, cached-recv-session-key, cached-recv-master-key) are EPHEMERAL plain GC-HEAP vectors —
+   re-derivable per session from the master secrets, short-lived, GC-reclaimed (NOT long-lived
+   secrets-at-rest): a fresh foreign-static copy per session_id would UNBOUNDEDLY leak un-wiped key bytes on
+   session_id rotation (reachable pre-auth, before the GCM auth check), and free-on-replace would be a
+   use-after-free of the lock-free-shared slot pointer — so they stay heap. Build instances with the
+   MAKE-KEY-MATERIAL wrapper (it hardens the master slots); %MAKE-KEY-MATERIAL is the raw constructor. Fields:
+     transformation-kind : octet[4] — the CryptoTransformKind selecting the AEAD algorithm (public, on wire).
+     master-salt         : octet[32] — SECRET; foreign-static; entropy mixed into the session-key KDF (§9.5.3.3.4.2).
+     sender-key-id       : octet[4]  — the CryptoTransformKeyId placed in SecureDataHeader (public, on wire).
+     master-sender-key   : octet[32] — SECRET; foreign-static; the HMAC-SHA256 key in the session-key KDF (§9.5.3.3.4.2).
      iv-counter          : (unsigned-byte 64) — MONOTONIC counter incremented on every encode call;
                            combined with session-id forms the 12-byte AES-GCM nonce. Held under
                            iv-counter-lock to make nonce uniqueness STRUCTURAL — two concurrent
@@ -58,6 +68,7 @@
   (iv-counter 0 :type (unsigned-byte 64))
   (iv-counter-lock (dds.pal:make-lock "km-iv") :type t)
   ;; §9.5.3.3.4.2 session-key cache: derived once per (master_sender_key, master_salt, session_id) triplet.
+  ;; Ephemeral plain GC-heap (re-derivable, GC-reclaimed, not a secret-at-rest — see the struct docstring).
   (cached-session-id  nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (cached-session-key nil :type (or null (simple-array (unsigned-byte 8) (32))))
   ;; §9.5.3.3.4.3 receiver-specific session-key cache (origin authentication): derived once per
@@ -76,16 +87,101 @@
   ;; IMMUTABLE receiver fields and reused, so the resolver conses nothing per datagram (km-receiver-descriptor{-list}).
   ;; NIL = not-yet-built (an origin-auth KM's list is always non-NIL once built; a non-origin-auth KM never reaches
   ;; the slot — %km-origin-auth-p gates first). Re-keying mints a NEW KM (fresh slot); fence-published like the caches above.
-  (cached-receiver-descriptor-list nil :type (or null cons)))
+  (cached-receiver-descriptor-list nil :type (or null cons))
+  ;; ADR-0034 secret hygiene: set T by ZEROIZE-KEY-MATERIAL after the secret slots are wiped + freed. Makes the
+  ;; choke idempotent (a second call / dedup re-walk is a no-op) and marks a torn-down KM structurally UNUSABLE
+  ;; (fail-closed — its foreign secret buffers are freed; NEVER derive/seal/open on a zeroized KM).
+  (zeroized nil :type boolean))
+
+(defun* make-key-material (&key
+                           (transformation-kind +transformation-kind-aes256-gcm+)
+                           (master-salt (make-array +km-master-salt-len+ :element-type '(unsigned-byte 8) :initial-element 0))
+                           (sender-key-id (make-array +km-sender-key-id-len+ :element-type '(unsigned-byte 8) :initial-element 0))
+                           (master-sender-key (make-array +km-master-sender-key-len+ :element-type '(unsigned-byte 8) :initial-element 0))
+                           (receiver-specific-key-id (make-array +km-receiver-specific-key-id-len+ :element-type '(unsigned-byte 8) :initial-element 0))
+                           (master-receiver-specific-key (make-array +km-master-receiver-specific-key-len+ :element-type '(unsigned-byte 8) :initial-element 0))
+                           (iv-counter 0)
+                           (iv-counter-lock (dds.pal:make-lock "km-iv")))
+    (function (&key (:transformation-kind (simple-array (unsigned-byte 8) (*)))
+                    (:master-salt (simple-array (unsigned-byte 8) (*)))
+                    (:sender-key-id (simple-array (unsigned-byte 8) (*)))
+                    (:master-sender-key (simple-array (unsigned-byte 8) (*)))
+                    (:receiver-specific-key-id (simple-array (unsigned-byte 8) (*)))
+                    (:master-receiver-specific-key (simple-array (unsigned-byte 8) (*)))
+                    (:iv-counter (unsigned-byte 64))
+                    (:iv-counter-lock t))
+              key-material)
+  "Construct a §9.5.2 KeyMaterial, hardening the three SECRET master slots (master_salt,
+   master_sender_key, master_receiver_specific_key) into FOREIGN/STATIC (off-GC-heap) buffers via
+   dds.dare:octets->secret — a moving GC cannot copy them and ZEROIZE-KEY-MATERIAL can reliably wipe
+   them on teardown (ADR-0034; operating contract NFR-MEM / CNSA-2.0 data-at-rest). The passed secret
+   vectors are COPIED (caller keeps ownership of its heap copies; a real-secret producer should wipe its
+   own transient); the public fields (transformation_kind, the two key_ids) are stored as passed. Wraps
+   the raw %MAKE-KEY-MATERIAL. Control-plane (keying), never the hot path."
+  (%make-key-material
+   :transformation-kind transformation-kind
+   :master-salt (dds.dare:octets->secret master-salt)
+   :sender-key-id sender-key-id
+   :master-sender-key (dds.dare:octets->secret master-sender-key)
+   :receiver-specific-key-id receiver-specific-key-id
+   :master-receiver-specific-key (dds.dare:octets->secret master-receiver-specific-key)
+   :iv-counter iv-counter
+   :iv-counter-lock iv-counter-lock))
+
+(define-condition key-material-zeroized-error (error)
+  ()
+  (:report (lambda (c s) (declare (ignore c))
+             (format s "operation on a zeroized KeyMaterial (master secret buffers freed; fail-closed, ADR-0034)")))
+  (:documentation
+   "Signaled by the KeyMaterial crypto entry points that read the MASTER secrets (%km-session-key-at,
+    %km-receiver-session-key-at, km-receiver-descriptor-list) when the KM has been zeroized by
+    ZEROIZE-KEY-MATERIAL — its foreign-static master buffers are freed, so any derive/seal/open must
+    FAIL-CLOSED rather than dereference freed memory (a use-after-free). Defense-in-depth beyond the
+    quiescent-teardown contract (ADR-0034). Subclass of ERROR so the decode fail-closed handlers resolve
+    it to NIL, while an encode surfaces it loudly (never a silent wrong result)."))
+
+(defun* zeroize-key-material (km)
+    (function ((or null key-material)) null)
+  "Wipe-then-free the three MASTER secret slots of KM — the single teardown choke for §9.5.2 KeyMaterial secret
+   hygiene (ADR-0034; operating contract NFR-MEM / CNSA-2.0 data-at-rest). Wipes then releases the foreign-static
+   master_salt, master_sender_key, master_receiver_specific_key via dds.dare:free-secret-octets (fill-0 then
+   free-static; SBCL frees, Clasp recycles zeroed), then DROPS the derived §9.5.3.3.4.2/.4.3 session-key caches
+   (cached-session-key, cached-recv-session-key, cached-recv-master-key) and the memoized origin-auth
+   receiver-descriptor cons. The derived caches are EPHEMERAL plain GC-HEAP vectors (re-derivable, not
+   secrets-at-rest), so dropping the references suffices — GC reclaims them; NO wipe/free is done or needed
+   (free-secret-octets on a heap vector would be wrong, and free-on-replace would UAF the lock-free hit path).
+   IDEMPOTENT + fail-closed: the KEY-MATERIAL-ZEROIZED flag is set FIRST so a second call — or a dedup re-walk —
+   is a no-op, and a zeroized KM reads as structurally unusable (the crypto entry points then signal
+   KEY-MATERIAL-ZEROIZED-ERROR). MUST run only when the data path is QUIESCED (participant teardown, after the
+   receiver thread is joined): the master buffers are freed here, so a concurrent reader would use-after-free.
+   NIL is a no-op. Returns NIL."
+  (when (and km (not (key-material-zeroized km)))
+    (setf (key-material-zeroized km) t)
+    (dds.dare:free-secret-octets (key-material-master-salt km))
+    (dds.dare:free-secret-octets (key-material-master-sender-key km))
+    (dds.dare:free-secret-octets (key-material-master-receiver-specific-key km))
+    ;; derived caches are plain GC-heap (ephemeral, re-derivable) — drop the references; no wipe/free (GC reclaims)
+    (setf (key-material-cached-session-key km) nil
+          (key-material-cached-recv-session-key km) nil
+          (key-material-cached-recv-master-key km) nil
+          (key-material-cached-receiver-descriptor-list km) nil))
+  nil)
 
 (defun* %km-session-key-at (km session-id-vec session-id-off)
     (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum) (simple-array (unsigned-byte 8) (32)))
   "Cached §9.5.3.3.4.2 session key for KM at the 4-octet session_id in SESSION-ID-VEC[OFF..OFF+4]. The key is
    constant for a fixed master key + salt + session_id, so it is derived once and reused (the per-sample KDF is
-   removed). Hit path is lock-free + zero-alloc; miss path uses a release fence (key store → fence → id store)
-   and hit path uses an acquire fence (id match → fence → key load) to guarantee barrier-safe cache publication
-   on weak-memory platforms (arm64/Apple Silicon; operating contract §4). A benign concurrent same-value miss
-   race is still harmless — both missers derive the identical deterministic key."
+   removed). The derived key is an EPHEMERAL plain GC-HEAP vector — re-derivable, GC-reclaimed, NOT a
+   secret-at-rest: a fresh foreign-static copy per session_id would UNBOUNDEDLY leak un-wiped keys on session_id
+   rotation (reachable pre-auth: this runs before the GCM auth check, and a hostile peer sets arbitrary session_id
+   per datagram), and free-on-replace would UAF the lock-free-shared slot pointer — so it stays heap (ADR-0034).
+   FAIL-CLOSED: if KM is zeroized (its master buffers are freed) this signals KEY-MATERIAL-ZEROIZED-ERROR BEFORE
+   dereferencing them, so a torn-down KM is structurally unusable — a single flag check off the zero-alloc hit path.
+   Hit path is lock-free + zero-alloc; miss path uses a release fence (key store → fence → id store) and hit path
+   uses an acquire fence (id match → fence → key load) to guarantee barrier-safe cache publication on weak-memory
+   platforms (arm64/Apple Silicon; operating contract §4). A benign concurrent same-value miss race is still
+   harmless — both missers derive the identical deterministic key."
+  (when (key-material-zeroized km) (error 'key-material-zeroized-error))
   (assert (<= (+ session-id-off 4) (length session-id-vec)))
   (let ((cid (key-material-cached-session-id km)))
     (if (and cid (= (length cid) 4)
@@ -99,7 +195,7 @@
           (key-material-cached-session-key km))
         (let* ((sid (subseq session-id-vec session-id-off (+ session-id-off 4)))
                (k   (derive-session-key (key-material-master-sender-key km)
-                                        (key-material-master-salt km) sid)))
+                                        (key-material-master-salt km) sid)))  ; ephemeral GC-heap key, GC-reclaimed
           (setf (key-material-cached-session-key km) k)
           ;; Release fence: key store visible before the id store (the gate); operating contract §4.
           (dds.pal:fence :release)
@@ -128,7 +224,11 @@
    store) — the first fill amortizes, steady state is 0 B (the %km-session-key-at convention). The returned list is
    READ-ONLY for the transform (%put-receiver-macs-into / %verify-receiver-mac-into read (car r)/(cdr r) only), so
    sharing the cached instance across datagrams is safe. Cache is probed FIRST so the hit path is a pure slot load +
-   ACQUIRE fence — no %km-origin-auth-p scan — hence guaranteed zero-alloc."
+   ACQUIRE fence — no %km-origin-auth-p scan — hence guaranteed zero-alloc. FAIL-CLOSED: a zeroized KM signals
+   KEY-MATERIAL-ZEROIZED-ERROR (its master_receiver_specific_key is freed) rather than returning NIL — a NIL
+   descriptor reads as origin-auth-disabled, so returning it for a zeroized origin-auth KM would be a fail-OPEN
+   gate bypass (ADR-0034); the flag check is off the zero-alloc hit path."
+  (when (key-material-zeroized km) (error 'key-material-zeroized-error))
   (let ((cached (key-material-cached-receiver-descriptor-list km)))
     (if cached
         (progn (dds.pal:fence :acquire) cached)
@@ -264,21 +364,27 @@
    all-zero (no per-receiver origin authentication, §9.5.2). With ORIGIN-AUTH true both are populated: a
    NON-ZERO random receiver_specific_key_id (zero is the §9.5.3.3.4.3 origin-auth-disabled sentinel — never
    emitted) + a random 32B master_receiver_specific_key, for the *_WITH_ORIGIN_AUTHENTICATION protection kinds
-   (§9.5.3.3.4.3; consumed by derive-receiver-specific-session-key / compute-receiver-specific-mac). Keys are
-   plain heap vectors per ADR 0034 (KeyMaterial foreign-backing + zeroize-on-teardown is a deferred hardening
-   follow-on); the caller owns the key-material lifecycle. Control-plane, not the hot path."
-  ; HARDENING-GAP: KeyMaterial master key/salt are GC-heap (ADR 0034 deferral); not the hot path.
-  (let ((tk (ecase kind
-              (:encrypt +transformation-kind-aes256-gcm+)
-              (:sign    +transformation-kind-aes256-gmac+))))
+   (§9.5.3.3.4.3; consumed by derive-receiver-specific-session-key / compute-receiver-specific-mac). The
+   KeyMaterial's SECRET master slots are held in FOREIGN/STATIC memory (make-key-material hardens them) and
+   wiped on teardown by ZEROIZE-KEY-MATERIAL (ADR-0034 resolved; operating contract NFR-MEM / CNSA-2.0
+   data-at-rest); the transient heap randoms are wiped here after the copy. The caller owns the key-material
+   lifecycle. Control-plane, not the hot path."
+  (let* ((tk   (ecase kind
+                 (:encrypt +transformation-kind-aes256-gcm+)
+                 (:sign    +transformation-kind-aes256-gmac+)))
+         (salt (dds.dare:random-bytes 32))
+         (mkey (dds.dare:random-bytes 32)))
     (if origin-auth
-        (make-key-material :transformation-kind          (copy-seq tk)
-                           :master-salt                  (dds.dare:random-bytes 32)
-                           :sender-key-id                (%alloc-sender-key-id)
-                           :master-sender-key            (dds.dare:random-bytes 32)
-                           :receiver-specific-key-id     (%nonzero-random-key-id)
-                           :master-receiver-specific-key (dds.dare:random-bytes 32))
-        (make-key-material :transformation-kind (copy-seq tk)
-                           :master-salt         (dds.dare:random-bytes 32)
-                           :sender-key-id       (%alloc-sender-key-id)
-                           :master-sender-key   (dds.dare:random-bytes 32)))))
+        (let ((rsk (dds.dare:random-bytes 32)))
+          (prog1 (make-key-material :transformation-kind          (copy-seq tk)
+                                    :master-salt                  salt
+                                    :sender-key-id                (%alloc-sender-key-id)
+                                    :master-sender-key            mkey
+                                    :receiver-specific-key-id     (%nonzero-random-key-id)
+                                    :master-receiver-specific-key rsk)
+            (fill salt 0) (fill mkey 0) (fill rsk 0)))   ; wipe transient heap randoms (KM holds static copies)
+        (prog1 (make-key-material :transformation-kind (copy-seq tk)
+                                  :master-salt         salt
+                                  :sender-key-id       (%alloc-sender-key-id)
+                                  :master-sender-key   mkey)
+          (fill salt 0) (fill mkey 0)))))

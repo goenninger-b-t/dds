@@ -1799,6 +1799,10 @@
     (node-return-all-loans node)
     (dds.core.arena:teardown-arena (disc-node-decode-arena node))
     (setf (disc-node-decode-arena node) nil (disc-node-decode-pool node) nil))
+  ;; ADR-0034 secret hygiene: zeroize + free the PVMS bootstrap KeyMaterials (KxKey/KxSalt-derived secrets) AFTER the receiver thread is joined (no live PVMS resolver), then clear the table (a post-teardown resolve returns NIL, fail-closed)
+  (maphash (lambda (prefix km) (declare (ignore prefix)) (dds.security:zeroize-key-material km))
+           (disc-node-pvms-bootstrap-kms node))
+  (clrhash (disc-node-pvms-bootstrap-kms node))
   t)
 
 (defun* disc-node-discovered-count (node)

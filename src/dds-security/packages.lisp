@@ -70,6 +70,10 @@
    #:key-material-master-sender-key
    #:key-material-iv-counter
    #:key-material-iv-counter-lock
+   ;; ADR-0034 secret hygiene: foreign/static KeyMaterial master secrets + zeroize-on-teardown choke + fail-closed guard
+   #:zeroize-key-material
+   #:key-material-zeroized
+   #:key-material-zeroized-error
    #:make-test-key-material
    ;; T6: per-writer key resolver (§9.5.3.3.4.4/4.5 dynamic key lookup, replaces pre-shared km)
    #:crypto-keys

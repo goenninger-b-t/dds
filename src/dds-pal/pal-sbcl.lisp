@@ -47,6 +47,17 @@
   "Octet length of a static region from ALLOC-STATIC."
   (length vec))
 
+(defun* static-vector-p (vec)
+    (function (t) boolean)
+  "T iff VEC is an ALLOC-STATIC-backed (foreign, off the GC dynamic space, non-moved, SAP-addressable) octet
+   vector, NIL for a plain GC-heap array. sb-ext:heap-allocated-p returns NIL for a static-vectors foreign
+   vector and a space keyword (e.g. :dynamic) for a heap array. The secret-hygiene predicate: anything a raw
+   SAP addresses must be foreign/static so a MOVING GC cannot copy it (operating contract §4); proves
+   KeyMaterial secrets live off the GC heap (ADR-0034)."
+  (and (typep vec '(simple-array (unsigned-byte 8) (*)))
+       (null (sb-ext:heap-allocated-p vec))
+       t))
+
 ;; sb-sys:sap+ over vector-sap == static-vector-pointer for a static-vectors vec (verified); inline-unboxed
 (declaim (inline static-sap+))
 (defun* static-sap+ (vec offset)

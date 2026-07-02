@@ -57,8 +57,14 @@
                            (§9.5.3.3.4.3). The value is the BUILTIN secure-SEDP writer entity-id (the same across
                            peers), so a cross-peer key_id collision still maps to the same channel; a true
                            mis-map fails closed (the receiver-MAC under the wrong reader key just won't verify).
-   LOCK                  : the single mutex guarding all five registries (no two-lock ordering hazard;
-                           O(1) critical sections; never held across a callback).
+   ALL-KMS               : an EQ set (hash-table) of EVERY §9.5.2 KeyMaterial this manager has minted or
+                           registered — the teardown roster CM-TEARDOWN walks to zeroize+free each KM's secret
+                           slots at quiesced participant teardown (ADR-0034). It holds even KMs replaced/orphaned
+                           by re-keying (they are never freed mid-run — the only free is at teardown — so a live
+                           data-path resolver never uses freed key bytes), and the EQ keying dedups so no KM is
+                           double-freed. Written under LOCK on every register (%CM-TRACK-KM).
+   LOCK                  : the single mutex guarding all five registries + ALL-KMS (no two-lock ordering
+                           hazard; O(1) critical sections; never held across a callback).
    OWNER-MS              : back-reference to this participant's AUTH-MANAGER-STATE (T8). The crypto-manager
                            mediates the §7.2 :authenticated->:keyed promotion, which flips the AUTH-REMOTE
                            state under the auth-manager LOCK; OWNER-MS gives cm-on-crypto-token that lock +
@@ -70,8 +76,18 @@
   (remote-entity-crypto (make-hash-table :test 'equalp) :type hash-table)
   (key-id-index (make-hash-table :test 'equalp) :type hash-table)
   (remote-key-id-entity (make-hash-table :test 'equalp) :type hash-table)
+  (all-kms (make-hash-table :test 'eq) :type hash-table)
   (lock (dds.pal:make-lock "crypto-manager") :type t)
   (owner-ms nil :type t))
+
+(defun* %cm-track-km (cm km)
+    (function (crypto-manager (or null dds.security:key-material)) (or null dds.security:key-material))
+  "Record KM in CM's ALL-KMS teardown roster (caller holds the manager LOCK) and return KM. Guarantees
+   CM-TEARDOWN wipes EVERY minted/registered KeyMaterial — including any later replaced/orphaned by re-keying
+   — with NO mid-run free (the sole free is at quiesced participant teardown), so no live data-path resolver
+   ever touches freed key bytes (ADR-0034 secret hygiene). A NIL KM is ignored."
+  (when km (setf (gethash km (crypto-manager-all-kms cm)) t))
+  km)
 
 ;;; --- GUID helpers (reuse auth-manager %GUID-FROM-PREFIX for prefix+entity-id -> GUID) ---
 
@@ -95,7 +111,7 @@
   (dds.pal:with-lock ((crypto-manager-lock cm))
     (or (crypto-manager-participant-crypto cm)
         (setf (crypto-manager-participant-crypto cm)
-              (dds.security:generate-key-material :origin-auth origin-auth)))))
+              (%cm-track-km cm (dds.security:generate-key-material :origin-auth origin-auth))))))
 
 (defun* cm-register-matched-remote-participant (cm prefix km)
     (function (crypto-manager (simple-array (unsigned-byte 8) (12)) dds.security:key-material) (eql t))
@@ -103,6 +119,7 @@
    under its 12-octet GUID PREFIX (the rtps_protection decode source, resolved by the datagram's source
    GUID-prefix). PREFIX is copied as the stored key (the caller may reuse its buffer). Under the lock."
   (dds.pal:with-lock ((crypto-manager-lock cm))
+    (%cm-track-km cm km)
     (setf (gethash (copy-seq prefix) (crypto-manager-remote-participant-crypto cm)) km))
   t)
 
@@ -120,7 +137,7 @@
   (dds.pal:with-lock ((crypto-manager-lock cm))
     (or (gethash entity-id (crypto-manager-local-entity-crypto cm))
         (setf (gethash entity-id (crypto-manager-local-entity-crypto cm))
-              (dds.security:generate-key-material :origin-auth origin-auth :kind kind)))))
+              (%cm-track-km cm (dds.security:generate-key-material :origin-auth origin-auth :kind kind))))))
 
 (defun* cm-register-matched-remote-entity (cm prefix entity-id km)
     (function (crypto-manager (simple-array (unsigned-byte 8) (12)) (unsigned-byte 32)
@@ -134,6 +151,7 @@
    writes are atomic w.r.t. the resolvers under the single manager lock (no two-lock ordering hazard). PREFIX
    (via the built GUID) and the key-id are copied as the stored keys."
   (dds.pal:with-lock ((crypto-manager-lock cm))
+    (%cm-track-km cm km)
     (let ((guid (%guid-from-prefix prefix entity-id))
           (kid  (copy-seq (dds.security:key-material-sender-key-id km))))
       (setf (gethash guid (crypto-manager-remote-entity-crypto cm)) km
@@ -759,3 +777,37 @@
     (setf (dds.disc:disc-node-user-submessage-decode node)
           (lambda (key-id) (cm-user-entity-km-by-key-id cm key-id)))
     cm))
+
+;;; --- teardown: zeroize + free every KeyMaterial secret (ADR-0034 secret hygiene) ---
+
+(defun* cm-teardown (cm)
+    (function (crypto-manager) (eql t))
+  "Zeroize + free the SECRET slots of EVERY §9.5.2 KeyMaterial this crypto-manager owns — the
+   participant-teardown secret-hygiene choke (ADR-0034; operating contract NFR-MEM / CNSA-2.0 data-at-rest).
+   Walks ALL-KMS (every minted/registered KM, including any replaced by re-keying) running
+   dds.security:zeroize-key-material on each (idempotent; the EQ set dedups so no KM is double-freed), then
+   clears ALL-KMS + the five registries + the two indices so a post-teardown resolver hands out NIL
+   (fail-closed). MUST run only when the data path is QUIESCED (delete-participant, after dds.disc:stop-node
+   has joined the receiver thread): the secret buffers are freed here. Under the manager lock; idempotent."
+  (dds.pal:with-lock ((crypto-manager-lock cm))
+    (maphash (lambda (km present) (declare (ignore present)) (dds.security:zeroize-key-material km))
+             (crypto-manager-all-kms cm))
+    (clrhash (crypto-manager-all-kms cm))
+    (setf (crypto-manager-participant-crypto cm) nil)
+    (clrhash (crypto-manager-remote-participant-crypto cm))
+    (clrhash (crypto-manager-local-entity-crypto cm))
+    (clrhash (crypto-manager-remote-entity-crypto cm))
+    (clrhash (crypto-manager-key-id-index cm))
+    (clrhash (crypto-manager-remote-key-id-entity cm)))
+  t)
+
+(defun* %participant-crypto-teardown (auth-state)
+    (function (t) (eql t))
+  "delete-participant secret-hygiene entry (ADR-0034): zeroize+free every KeyMaterial owned by the
+   participant whose DP-AUTH-STATE is AUTH-STATE (an auth-manager-state, or NIL when security is OFF). NIL —
+   or a manager with no crypto-manager — is a no-op; otherwise runs CM-TEARDOWN. MUST be called only after
+   dds.disc:stop-node has quiesced the data path. Idempotent. Returns T."
+  (when auth-state
+    (let ((cm (auth-manager-state-crypto-manager auth-state)))
+      (when cm (cm-teardown cm))))
+  t)

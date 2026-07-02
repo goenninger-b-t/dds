@@ -302,18 +302,66 @@ for the `master_salt` and `master_sender_key` sequence fields (T0 spike §3.2 / 
 `KeyMaterialCDRSerialize`), not the standard CDR `uint32` sequence-length encoding.  For
 our-to-our this is self-consistent.  **Cross-vendor Connext verification is Slice 5.**
 
-### Carry 4 — KeyMaterial master key/salt in GC-heap (HARDENING-GAP)
+### Carry 4 — KeyMaterial master key/salt in GC-heap (HARDENING-GAP) — RESOLVED for the MASTER slots (WP-SECURITY-KEYMATERIAL-HARDEN, 2026-07-02)
 
-The `key-material` struct (`src/dds-security/key-material.lisp`) stores `master-salt`
-and `master-sender-key` as GC-heap vectors.  This is a control-plane-only structure (not
-on the measured CDR hot path; `make mem` stays `0.0000`).  Moving these secrets to
-foreign-backed `dds.pal:alloc-static` buffers (consistent with the KxKey, SharedSecret,
-and DARE secret disciplines established in ADR 0025 and ADR 0032) is a **secret-hygiene
-follow-on**, noted at the allocation site in `keyexchange.lisp` with the comment:
+**RESOLVED (master slots).**  The `key-material` struct (`src/dds-security/key-material.lisp`)
+now holds its three MASTER secret byte slots — `master-salt`, `master-sender-key`,
+`master-receiver-specific-key` — in FOREIGN/STATIC (off-GC-heap, non-moved, SAP-addressable)
+memory via `dds.dare:octets->secret` (the Lisp-vector companion to the ADR 0025 / ADR 0032
+`free-secret-octets` secret discipline).  `make-key-material` hardens these master slots at
+construction.  A moving GC can no longer copy the master secrets, freed heap cannot linger with
+them, and they are reliably wiped-then-freed on teardown (operating contract NFR-MEM /
+CNSA-2.0 data-at-rest).
 
-```
-; HARDENING-GAP: KeyMaterial master key/salt are GC-heap (Slice-1 key-material struct); foreign-backing is a follow-on (see ADR 0034). Control-plane, not hot-path.
-```
+**Derived session-key caches are EPHEMERAL GC-HEAP (by design, NOT foreign-static).**  The
+`cached-session-key`, `cached-recv-session-key` and `cached-recv-master-key` slots hold plain
+GC-heap vectors — re-derivable per `session_id` from the master secrets, short-lived,
+GC-reclaimed; they are NOT long-lived secrets-at-rest.  Storing a fresh foreign-static copy per
+`session_id` (as an intermediate A2 revision did) was UNSAFE: the cache-miss path `setf`s a new
+foreign buffer without freeing the prior, so a `session_id`-varying peer — reachable PRE-AUTH,
+since `%km-session-key-at` runs before the GCM auth check and a hostile peer sets an arbitrary
+`session_id` per datagram — would UNBOUNDEDLY leak un-wiped foreign key buffers (a foreign-static
+memory-exhaustion DoS plus a key-hygiene failure).  Free-on-replace is NOT a fix either: the
+lock-free hit path hands the slot pointer to a concurrent GCM open, so freeing on replace is a
+use-after-free.  The correct representation is therefore plain GC-heap (the pre-A2 form):
+ephemeral, re-derivable, GC-safe, no leak.
+
+**Fail-closed zeroized guard.**  `%km-session-key-at`, `%km-receiver-session-key-at` and
+`km-receiver-descriptor-list` — the entry points that read the freed MASTER secrets — check
+`key-material-zeroized` FIRST and signal `key-material-zeroized-error` on a torn-down KM, so a
+zeroized KM is structurally unusable rather than a use-after-free of its freed master buffers
+(defense-in-depth beyond the quiescent-teardown contract; a single flag check off the zero-alloc
+hit path).  For `km-receiver-descriptor-list` this is a SIGNAL, not a NIL return: a NIL descriptor
+reads as origin-auth-disabled, so returning NIL for a zeroized origin-auth KM would be a fail-OPEN
+gate bypass.
+
+**Zeroize-on-teardown.**  A single choke `zeroize-key-material` (idempotent, fail-closed via a
+`zeroized` marker) WIPES-then-frees the three MASTER slots and DROPS (nils, GC-reclaims — no
+wipe/free needed) the ephemeral heap caches.  Every free path funnels through it at a QUIESCED
+data path: the crypto-manager's `all-kms` roster (covering even re-key-orphaned KMs, never freed
+mid-run → no use-after-free) is walked by `cm-teardown` from `delete-participant` after
+`stop-node` joins the receiver thread; the disc-node's PVMS bootstrap KeyMaterials
+(KxKey/KxSalt-derived) are wiped in `stop-node`.  The producers (`generate-key-material`,
+`%parse-km`, `%pvms-derive-bootstrap-km`) wipe their transient heap secrets after the copy.
+
+**Wire + crypto UNCHANGED** — a storage-representation change only; the byte-exact corpora,
+the NIST AES-GCM KAT, and the KDF/roundtrip tests are all unchanged.  `make mem` stays
+`0.0000` (the static alloc is at key-material creation; the derived-cache miss is now a GC-heap
+alloc off the steady-state hot path; the A1/ZA-1 zero-alloc arms AND the session-key steady-state
+HIT path are unaffected — still a slot load).  Proven by `run-security-keymaterial-harden-test`
+(master slots foreign-static + zeroize-on-free wipe; derived caches GC-heap; a `session_id`-rotation
+no-leak sweep over many distinct session_ids; the fail-closed guard on all three entry points;
+idempotency), green on SBCL and Clasp.  On SBCL the off-heap discrimination uses
+`sb-ext:heap-allocated-p`; on Clasp/Boehm the GC is non-moving (no foreign/off-heap
+sub-representation) so the WIPE is the master-slot hardening evidence — documented in the
+`dds.pal:static-vector-p` per-impl docstrings (NFR-PORT).
+
+**MINOR-4 (open follow-on) — the `all-kms` roster grows monotonically.**  The crypto-manager's
+`all-kms` EQ roster records every minted/registered KeyMaterial and is walked once at
+`cm-teardown`; remote-participant KMs are HELD (and only zeroized at that teardown), not
+dropped/wiped on unmatch.  A long-lived participant that churns many remote peers therefore
+retains their (foreign-static-master) KMs until its own teardown — bounded by peer count, not a
+per-datagram leak, but an unmatch-time drop-and-zeroize is the hygiene follow-on.
 
 ### Carry 5 — Full 3-participant end-to-end test (DEFERRED)
 

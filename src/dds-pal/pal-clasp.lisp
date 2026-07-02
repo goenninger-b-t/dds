@@ -67,6 +67,16 @@
   "Octet length of a static region from ALLOC-STATIC."
   (length vec))
 
+(defun* static-vector-p (vec)
+    (function (t) boolean)
+  "T iff VEC is an octet vector safe to address by a raw, GC-stable SAP. On Clasp/Boehm the GC is NON-MOVING,
+   so ALLOC-STATIC returns an ordinary (address-stable) Boehm vector INDISTINGUISHABLE from MAKE-ARRAY (same
+   class + type) — there is no foreign/off-heap sub-representation to test for, and the moving-GC secret-copy
+   threat the SBCL predicate guards against does not exist here (documented NFR-PORT semantic). So this answers
+   T for any (simple-array (unsigned-byte 8) (*)); on Clasp the cross-impl hardening evidence is the
+   zeroize-on-teardown WIPE, while the off-heap DISCRIMINATION (heap array -> NIL) is SBCL-only (ADR-0034)."
+  (and (typep vec '(simple-array (unsigned-byte 8) (*))) t))
+
 ;; CFFI inc-pointer over static-vector-pointer; Clasp bytes-consed=0, so correctness (not zero-box) is the bar
 (declaim (inline static-sap+))
 (defun* static-sap+ (vec offset)

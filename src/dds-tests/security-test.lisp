@@ -2248,3 +2248,116 @@
     (%check :skcache-reused  (eq k1 k2)
             "second call with same session_id must return the SAME object (cache hit)")
     t))
+
+(defun* run-security-keymaterial-harden-test ()
+    (function () t)
+  "ADR-0034 KeyMaterial secret hygiene (WP-SECURITY-KEYMATERIAL-HARDEN, M7/P6). Proves:
+   (a) the three §9.5.2 MASTER secret slots (master_salt, master_sender_key, master_receiver_specific_key) are
+       FOREIGN/STATIC (dds.pal:static-vector-p; a plain heap array answers NIL — non-vacuous), while the derived
+       §9.5.3.3.4.2/.4.3 session-key caches are plain GC-HEAP (NOT foreign-static) — the A2 revert: a foreign-static
+       copy per session_id would UNBOUNDEDLY leak un-wiped keys on session_id rotation (reachable pre-auth) and
+       free-on-replace would UAF the lock-free hit path, so the caches stay heap;
+   (b) SESSION_ID-ROTATION NO-LEAK: deriving MANY distinct session_ids through %km-session-key-at (+ the receiver
+       path) yields a plain GC-HEAP key EVERY time — never foreign-static — so a session_id-rotating peer allocates
+       ZERO foreign-static buffers (a bounded single-slot cache, GC-reclaimed; the exact leak the revert closes);
+   (c) zeroize-key-material WIPES the MASTER bytes (fill-0 before release), DROPS the heap caches, and sets the
+       fail-closed KEY-MATERIAL-ZEROIZED marker (a zeroized KM is structurally unusable);
+   (d) FAIL-CLOSED GUARD: after teardown the master-secret-reading entry points (%km-session-key-at,
+       %km-receiver-session-key-at, km-receiver-descriptor-list) SIGNAL key-material-zeroized-error rather than
+       dereference the freed master buffers (defense-in-depth; km-receiver-descriptor-list must NOT return NIL —
+       that would be a fail-OPEN origin-auth bypass);
+   (e) the choke is IDEMPOTENT (a second call is a safe no-op).
+   Wipe proof (both impls, no use-after-free): the choke fills-0 THEN releases each MASTER slot, and in the SAME
+   block sets KEY-MATERIAL-ZEROIZED and NULLs the caches — so the flag + a nulled cache are UAF-safe evidence the
+   wipe path ran. The direct read-back-is-all-zero assertion on the master slots is CLASP-only: Clasp free-static
+   RECYCLES the vector (live, zeroed) so the read is safe, whereas SBCL free-static-vector frees the whole object
+   (header+data) so a post-free read is UAF. The off-heap DISCRIMINATION (a heap array / a derived cache -> NIL) is
+   likewise SBCL-only (Clasp/Boehm is non-moving; static-vector-p answers T for any octet vector by design).
+   STORAGE change only — the corpus/KAT/roundtrip tests prove keys + wire are unchanged. Both SBCL and Clasp must
+   pass identically."
+  (let* ((km   (dds.security:generate-key-material :origin-auth t))
+         (salt (dds.security:key-material-master-salt km))
+         (mkey (dds.security:key-material-master-sender-key km))
+         (rkey (dds.security:key-material-master-receiver-specific-key km))
+         (rkid (dds.security:key-material-receiver-specific-key-id km))
+         (sid  (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(0 0 0 1)))
+         (heap (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+         (sbcl (eq (dds.pal:pal-impl-name) :sbcl)))
+    ;; (a) MASTER secrets are foreign/static, not GC-heap; a plain heap array is NOT (non-vacuous control)
+    (%check :km-salt-static (dds.pal:static-vector-p salt) "master_salt must be foreign/static (off GC heap)")
+    (%check :km-mkey-static (dds.pal:static-vector-p mkey) "master_sender_key must be foreign/static")
+    (%check :km-rkey-static (dds.pal:static-vector-p rkey) "master_receiver_specific_key must be foreign/static")
+    ;; non-vacuous off-heap discrimination is SBCL-only (Clasp/Boehm is non-moving; see the predicate docstring)
+    (when sbcl
+      (%check :heap-not-static (not (dds.pal:static-vector-p heap))
+              "on SBCL a plain GC-heap array must NOT answer static-vector-p (non-vacuous off-heap proof)"))
+    (%check :km-salt-real (notevery #'zerop salt) "master_salt must carry real (non-zero) key bytes pre-wipe")
+    (%check :km-mkey-real (notevery #'zerop mkey) "master_sender_key must carry real key bytes pre-wipe")
+    (%check :km-rkey-real (notevery #'zerop rkey) "master_receiver_specific_key must carry real bytes pre-wipe")
+    ;; derived §9.5.3.3.4.2 session-key cache is EPHEMERAL GC-HEAP (NOT foreign-static) + non-zero — the A2 revert
+    (let ((sk (dds.security::%km-session-key-at km sid 0)))
+      (when sbcl
+        (%check :km-sesskey-heap (not (dds.pal:static-vector-p sk))
+                "derived session key must be GC-heap (not foreign-static) — no per-session_id foreign leak"))
+      (%check :km-sesskey-real (notevery #'zerop sk) "derived session key must be non-zero"))
+    (%check :km-cache-populated (not (null (dds.security::key-material-cached-session-key km)))
+            "session-key cache populated after derive (pre-wipe)")
+    ;; (b) SESSION_ID-ROTATION NO-LEAK: many DISTINCT session_ids -> every derived key GC-heap, never static
+    (dotimes (i 8)
+      (let* ((rsid (make-array 4 :element-type '(unsigned-byte 8) :initial-contents (list 0 0 0 (+ 2 i))))
+             (ck   (dds.security::%km-session-key-at km rsid 0))
+             (rk   (dds.security::%km-receiver-session-key-at km rkid rkey rsid 0)))
+        (%check :km-rot-common-real (notevery #'zerop ck) "rotated common session key non-zero")
+        (%check :km-rot-recv-real   (notevery #'zerop rk) "rotated receiver session key non-zero")
+        (when sbcl
+          (%check :km-rot-common-heap (not (dds.pal:static-vector-p ck))
+                  "each rotated common session key is GC-heap (not foreign-static) — no session_id-rotation leak")
+          (%check :km-rot-recv-heap (not (dds.pal:static-vector-p rk))
+                  "each rotated receiver session key is GC-heap (not foreign-static)")
+          (%check :km-rot-recv-mkey-heap
+                  (not (dds.pal:static-vector-p (dds.security::key-material-cached-recv-master-key km)))
+                  "cached-recv-master-key discriminant is GC-heap (not foreign-static)"))))
+    ;; after rotation the cache slot still holds ONE heap vector (bounded single slot, GC-reclaimable — no leak)
+    (when sbcl
+      (%check :km-cache-slot-heap
+              (not (dds.pal:static-vector-p (dds.security::key-material-cached-session-key km)))
+              "session-key cache slot is a single GC-heap vector after rotation (bounded, no foreign leak)"))
+    ;; (c) zeroize-on-teardown wipes MASTER secrets + drops the caches + marks the KM unusable
+    (%check :km-not-yet-zeroized (not (dds.security:key-material-zeroized km))
+            "KM must not be marked zeroized before the choke (non-vacuous)")
+    (%check :km-zeroize-returns-nil (null (dds.security:zeroize-key-material km))
+            "zeroize-key-material returns NIL")
+    (%check :km-zeroized-flag (dds.security:key-material-zeroized km)
+            "zeroize-key-material sets the fail-closed KEY-MATERIAL-ZEROIZED marker")
+    ;; UAF-safe on both impls: the caches (which held real key bytes) are dropped in the same wipe block
+    (%check :km-cache-nulled (null (dds.security::key-material-cached-session-key km))
+            "derived session-key cache dropped after the choke")
+    (%check :km-recv-cache-nulled (null (dds.security::key-material-cached-recv-master-key km))
+            "receiver-key cache dropped after the choke")
+    ;; direct read-back byte-wipe proof is Clasp-only (recycle-safe); SBCL frees the whole object (post-free = UAF)
+    (when (eq (dds.pal:pal-impl-name) :clasp)
+      (%check :km-salt-wiped (every #'zerop salt) "master_salt bytes wiped to all-zero after the choke (Clasp recycle read)")
+      (%check :km-mkey-wiped (every #'zerop mkey) "master_sender_key bytes wiped to all-zero after the choke")
+      (%check :km-rkey-wiped (every #'zerop rkey) "master_receiver_specific_key bytes wiped to all-zero after the choke"))
+    ;; (d) FAIL-CLOSED GUARD: the master-secret-reading entries SIGNAL on a zeroized KM (no UAF of freed masters)
+    (flet ((fail-closed-p (thunk)
+             (handler-case (progn (funcall thunk) nil)
+               (dds.security:key-material-zeroized-error () t))))
+      (%check :km-guard-session
+              (fail-closed-p (lambda () (dds.security::%km-session-key-at km sid 0)))
+              "%km-session-key-at fails closed (signals) on a zeroized KM — no dereference of freed masters")
+      (%check :km-guard-recv
+              (fail-closed-p (lambda ()
+                               (dds.security::%km-receiver-session-key-at
+                                km
+                                (make-array 4 :element-type '(unsigned-byte 8) :initial-element 1)
+                                (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)
+                                sid 0)))
+              "%km-receiver-session-key-at fails closed on a zeroized KM")
+      (%check :km-guard-descr
+              (fail-closed-p (lambda () (dds.security::km-receiver-descriptor-list km)))
+              "km-receiver-descriptor-list fails closed on a zeroized KM (never a fail-OPEN NIL bypass)"))
+    ;; (e) idempotent: a second call is a safe no-op
+    (%check :km-zeroize-idempotent (null (dds.security:zeroize-key-material km))
+            "zeroize-key-material is idempotent (second call = NIL no-op, no crash)"))
+  t)
