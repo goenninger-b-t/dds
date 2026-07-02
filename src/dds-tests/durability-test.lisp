@@ -39,8 +39,8 @@
 (defun* run-durability-spec-test ()
     (function () t)
   "service-spec topic-filter matching: explicit list and predicate forms."
-  (let ((s1 (dds.durability:make-service-spec :domain 0 :topics '(("Square" . "ShapeType")) :name "shapes"))
-        (s2 (dds.durability:make-service-spec :domain 0
+  (let ((s1 (dds.durability:make-service-spec :domain (test-domain) :topics '(("Square" . "ShapeType")) :name "shapes"))
+        (s2 (dds.durability:make-service-spec :domain (test-domain)
               :topics (lambda (topic type) (declare (ignore type)) (eql 0 (search "Sensor" topic))) :name "sensors")))
     (%check :list-hit (dds.durability:service-spec-matches-p s1 "Square" "ShapeType") "list match")
     (%check :list-miss-type (not (dds.durability:service-spec-matches-p s1 "Square" "Other")) "type must match")
@@ -62,7 +62,7 @@
    absent override keeps the default :transient-local byte-identical to the prior behavior."
   ;; --- (a) explicit :transient override ---
   (let* ((spec-transient (dds.durability:make-service-spec
-                          :domain 137
+                          :domain (test-domain +td-relay-tier+)
                           :topics '(("RTSquare" . "ShapeType"))
                           :qos-overrides '(:relay-durability :transient)
                           :name "relay-tier-transient"))
@@ -81,7 +81,7 @@
       (ignore-errors (dds.durability:service-stop svc-transient))))
   ;; --- (b) no override -> default :transient-local ---
   (let* ((spec-default (dds.durability:make-service-spec
-                        :domain 137
+                        :domain (test-domain +td-relay-tier+)
                         :topics '(("RTCircle" . "ShapeType"))
                         :name "relay-tier-default"))
          (svc-default (dds.durability:make-durability-service spec-default)))
@@ -118,7 +118,7 @@
    absent override keeps the default :transient-local byte-identical to the prior behavior."
   ;; --- (a) explicit :transient override ---
   (let* ((spec-transient (dds.durability:make-service-spec
-                          :domain 138
+                          :domain (test-domain +td-collect-tier+)
                           :topics '(("CTSquare" . "ShapeType"))
                           :qos-overrides '(:collect-durability :transient)
                           :name "collect-tier-transient"))
@@ -137,7 +137,7 @@
       (ignore-errors (dds.durability:service-stop svc-transient))))
   ;; --- (b) no override -> default :transient-local ---
   (let* ((spec-default (dds.durability:make-service-spec
-                        :domain 138
+                        :domain (test-domain +td-collect-tier+)
                         :topics '(("CTCircle" . "ShapeType"))
                         :name "collect-tier-default"))
          (svc-default (dds.durability:make-durability-service spec-default)))
@@ -180,14 +180,14 @@
    writer GUID across all records. Domain 7, loopback unicast, no multicast. MVP: one topic."
   (let* ((svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 7
+                :domain (test-domain +td-collect+)
                 :topics '(("Square" . "ShapeType"))
                 :store (lambda () svc-store)
                 :name "collect-test"))
          (svc (dds.durability:make-durability-service spec :store svc-store))
          ;; publisher node on domain 7, loopback — port 0 = OS-assigned
          (pub-prefix (%make-test-prefix #xC1))
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 7
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-collect+)
                                             :host "127.0.0.1" :port 0
                                             :multicast nil)))
     (unwind-protect
@@ -313,13 +313,13 @@
   (let* ((n 5)
          (svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 17
+                :domain (test-domain +td-transient+)
                 :topics '(("Square" . "ShapeType"))
                 :store (lambda () svc-store)
                 :name "transient-test"))
          (svc (dds.durability:make-durability-service spec :store svc-store))
          (pub-prefix (%make-test-prefix #xD1))
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 17
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-transient+)
                                             :host "127.0.0.1" :port 0 :multicast nil)))
     (unwind-protect
          (progn
@@ -360,7 +360,7 @@
              (sleep 0.1)
              ;; late-joiner 1: TL reader — expects all N from service
              (let* ((lj-prefix (%make-test-prefix #xE1))
-                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 17
+                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-transient+)
                                                       :host "127.0.0.1" :port 0 :multicast nil)))
                (unwind-protect
                     (progn
@@ -395,7 +395,7 @@
                  (ignore-errors (dds.disc:stop-node lj-node))))
              ;; late-joiner 2: VOLATILE reader — expects 0 pre-join history
              (let* ((vl-prefix (%make-test-prefix #xE2))
-                    (vl-node (dds.disc:make-disc-node :guid-prefix vl-prefix :domain 17
+                    (vl-node (dds.disc:make-disc-node :guid-prefix vl-prefix :domain (test-domain +td-transient+)
                                                       :host "127.0.0.1" :port 0 :multicast nil)))
                (unwind-protect
                     (progn
@@ -448,22 +448,22 @@
   (let* ((store-a  (dds.durability:make-memory-store))
          (store-b  (dds.durability:make-memory-store))
          (spec-a   (dds.durability:make-service-spec
-                    :domain 27
+                    :domain (test-domain +td-runner+)
                     :topics '(("Square" . "ShapeType"))
                     :store  (lambda () store-a)
                     :name   "runner-square"))
          (spec-b   (dds.durability:make-service-spec
-                    :domain 27
+                    :domain (test-domain +td-runner+)
                     :topics '(("Circle" . "ShapeType"))
                     :store  (lambda () store-b)
                     :name   "runner-circle"))
          (runner   (dds.durability:make-service-runner (list spec-a spec-b)))
          ;; Two publisher nodes: one per topic (one-writer-per-node invariant)
          (pub-sq-node (dds.disc:make-disc-node
-                       :guid-prefix (%make-test-prefix #xF1) :domain 27
+                       :guid-prefix (%make-test-prefix #xF1) :domain (test-domain +td-runner+)
                        :host "127.0.0.1" :port 0 :multicast nil))
          (pub-ci-node (dds.disc:make-disc-node
-                       :guid-prefix (%make-test-prefix #xF2) :domain 27
+                       :guid-prefix (%make-test-prefix #xF2) :domain (test-domain +td-runner+)
                        :host "127.0.0.1" :port 0 :multicast nil)))
     (unwind-protect
          (progn
@@ -619,7 +619,7 @@
      ;; Sub-test 2: liveness restart.
      ;; Start a runner+supervisor; forcibly stop the service; assert supervisor revives it.
      (let* ((spec (dds.durability:make-service-spec
-                   :domain 37
+                   :domain (test-domain +td-supervisor+)
                    :topics '(("SupSquare" . "ShapeType"))
                    :name "sup-liveness-test"))
             (runner (dds.durability:make-service-runner (list spec))))
@@ -667,7 +667,7 @@
      ;; Sequence: runner-start (no fault) -> kill service -> supervisor-start WITH fault
      ;; so every restart attempt fails immediately -> supervisor sheds after max-restarts.
      (let* ((spec (dds.durability:make-service-spec
-                   :domain 37
+                   :domain (test-domain +td-supervisor+)
                    :topics '(("SupSquare2" . "ShapeType"))
                    :name "sup-crash-test"))
             (runner (dds.durability:make-service-runner (list spec)))
@@ -725,11 +725,13 @@
    --name round-trip, supervisor opts (max-restarts/window-seconds) surfaced."
   ;; --- basic CLI parse: domain + two topics ---
   (let ((specs (dds.durability:parse-durability-config
-                :argv '("--domain" "7" "--topic" "Square:ShapeType" "--topic" "Circle:ShapeType")
+                :argv (list "--domain" (princ-to-string (test-domain +td-cfg-domain+))
+                            "--topic" "Square:ShapeType" "--topic" "Circle:ShapeType")
                 :env  '())))
     (%check :cfg-one-spec (= 1 (length specs)) "CLI parse must yield exactly one spec")
     (let ((s (first specs)))
-      (%check :cfg-domain (= 7 (dds.durability:service-spec-domain s)) "domain must be 7")
+      (%check :cfg-domain (= (test-domain +td-cfg-domain+) (dds.durability:service-spec-domain s))
+              "parsed --domain must equal the configured cfg-domain")
       (%check :cfg-square (dds.durability:service-spec-matches-p s "Square" "ShapeType")
               "Square:ShapeType must match")
       (%check :cfg-circle (dds.durability:service-spec-matches-p s "Circle" "ShapeType")
@@ -745,14 +747,15 @@
             "env DDS_DURABILITY_TOPICS must supply the topic filter"))
   ;; --- CLI --domain overrides env DDS_DURABILITY_DOMAIN ---
   (let ((specs (dds.durability:parse-durability-config
-                :argv '("--domain" "99")
-                :env  '(("DDS_DURABILITY_DOMAIN" . "3")))))
-    (%check :cfg-cli-overrides-env (= 99 (dds.durability:service-spec-domain (first specs)))
+                :argv (list "--domain" (princ-to-string (test-domain +td-cfg-domain+)))
+                :env  (list (cons "DDS_DURABILITY_DOMAIN"
+                                  (princ-to-string (test-domain +td-cfg-env-domain+)))))))
+    (%check :cfg-cli-overrides-env (= (test-domain +td-cfg-domain+) (dds.durability:service-spec-domain (first specs)))
             "CLI --domain must override env DDS_DURABILITY_DOMAIN"))
   ;; --- --name round-trip: CLI --name surfaced on spec, env DDS_DURABILITY_NAME fallback ---
   (multiple-value-bind (specs-n)
       (dds.durability:parse-durability-config
-       :argv '("--name" "my-service" "--domain" "3")
+       :argv (list "--name" "my-service" "--domain" (princ-to-string (test-domain +td-cfg-domain+)))
        :env  '())
     (%check :cfg-name-cli (string= "my-service" (dds.durability:service-spec-name (first specs-n)))
             "CLI --name must be surfaced on the spec"))
@@ -812,7 +815,7 @@
     (format t "~&    [process-smoke] Clasp: skipping (NFR-PORT gap — subprocess mode is SBCL-oriented)~%")
     (return-from run-durability-process-smoke-test t))
   (let* ((spec (dds.durability:make-service-spec
-                :domain 57
+                :domain (test-domain +td-writer-rep+)
                 :topics '(("Square" . "ShapeType") ("Circle" . "ShapeType"))
                 :mode :process
                 :name "proc-smoke"))
@@ -820,8 +823,8 @@
     (multiple-value-bind (reparsed)
         (dds.durability:parse-durability-config :argv argv :env '())
       (let ((r (first reparsed)))
-        (%check :proc-smoke-domain (= 57 (dds.durability:service-spec-domain r))
-                "round-tripped spec must have domain 57")
+        (%check :proc-smoke-domain (= (test-domain +td-writer-rep+) (dds.durability:service-spec-domain r))
+                "round-tripped spec domain must survive the %spec->argv round-trip")
         (%check :proc-smoke-square (dds.durability:service-spec-matches-p r "Square" "ShapeType")
                 "round-tripped spec must match Square:ShapeType")
         (%check :proc-smoke-circle (dds.durability:service-spec-matches-p r "Circle" "ShapeType")
@@ -852,7 +855,7 @@
    absent override keeps the default (:xcdr2) byte-identical to the prior behavior."
   ;; --- (a) explicit (:xcdr1) override ---
   (let* ((spec-xcdr1 (dds.durability:make-service-spec
-                      :domain 57
+                      :domain (test-domain +td-writer-rep+)
                       :topics '(("WRSquare" . "ShapeType"))
                       :qos-overrides '(:data-representation (:xcdr1))
                       :name "wr-rep-xcdr1"))
@@ -871,7 +874,7 @@
       (ignore-errors (dds.durability:service-stop svc-xcdr1))))
   ;; --- (b) no override -> default (:xcdr2) ---
   (let* ((spec-default (dds.durability:make-service-spec
-                        :domain 57
+                        :domain (test-domain +td-writer-rep+)
                         :topics '(("WRCircle" . "ShapeType"))
                         :name "wr-rep-default"))
          (svc-default (dds.durability:make-durability-service spec-default)))
@@ -894,11 +897,11 @@
   "Runner lifecycle (owner directive): runner-stop nulls services; double runner-start is no-op."
   ;; --- (a) runner-stop nulls services ---
   (let* ((spec-a (dds.durability:make-service-spec
-                  :domain 47
+                  :domain (test-domain +td-runner-lifecycle+)
                   :topics '(("LCSquare" . "ShapeType"))
                   :name "lc-runner-a"))
          (spec-b (dds.durability:make-service-spec
-                  :domain 47
+                  :domain (test-domain +td-runner-lifecycle+)
                   :topics '(("LCCircle" . "ShapeType"))
                   :name "lc-runner-b"))
          (runner (dds.durability:make-service-runner (list spec-a spec-b))))
@@ -919,7 +922,7 @@
       (ignore-errors (dds.durability:runner-stop runner))))
   ;; --- (b) double runner-start is a no-op (services count must NOT double) ---
   (let* ((spec (dds.durability:make-service-spec
-                :domain 47
+                :domain (test-domain +td-runner-lifecycle+)
                 :topics '(("LCDouble" . "ShapeType"))
                 :name "lc-double-start"))
          (runner (dds.durability:make-service-runner (list spec))))
@@ -991,13 +994,13 @@
   (let* ((n 3)
          (svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 67
+                :domain (test-domain +td-relay-emit+)
                 :topics '(("RSquare" . "ShapeType"))
                 :store (lambda () svc-store)
                 :name "relay-emit-test"))
          (svc (dds.durability:make-durability-service spec :store svc-store))
          (pub-prefix (%make-test-prefix #xD7))
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 67
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-relay-emit+)
                                             :host "127.0.0.1" :port 0 :multicast nil))
          ;; original publisher GUID: prefix + user-writer EntityId (0x00000102 = key 1, kind 02)
          (orig-guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -1040,7 +1043,7 @@
              (sleep 0.1)
              ;; bring up TL late-joiner
              (let* ((lj-prefix (%make-test-prefix #xE7))
-                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 67
+                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-relay-emit+)
                                                       :host "127.0.0.1" :port 0 :multicast nil))
                     (captured (make-array 0 :element-type t :adjustable t :fill-pointer 0)))
                (unwind-protect
@@ -1165,16 +1168,16 @@
   (let* ((n 3)
          (svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 77
+                :domain (test-domain +td-no-double-delivery+)
                 :topics '(("DSquare" . "ShapeType"))
                 :store (lambda () svc-store)
                 :name "no-double-delivery-test"))
          (svc (dds.durability:make-durability-service spec :store svc-store))
          (pub-prefix (%make-test-prefix #xD9))
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 77
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-no-double-delivery+)
                                             :host "127.0.0.1" :port 0 :multicast nil))
          (sub-prefix (%make-test-prefix #xE9))
-         (sub-node (dds.disc:make-disc-node :guid-prefix sub-prefix :domain 77
+         (sub-node (dds.disc:make-disc-node :guid-prefix sub-prefix :domain (test-domain +td-no-double-delivery+)
                                             :host "127.0.0.1" :port 0 :multicast nil)))
     (unwind-protect
          (progn
@@ -1267,17 +1270,17 @@
          (n-ci 2)
          (svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 87
+                :domain (test-domain +td-multitopic+)
                 :topics '(("Square" . "ShapeType") ("Circle" . "ShapeType"))
                 :store (lambda () svc-store)
                 :name "multitopic-test"))
          (svc (dds.durability:make-durability-service spec :store svc-store))
          ;; two publisher nodes: one per topic (one-writer-per-node invariant)
          (pub-sq-node (dds.disc:make-disc-node
-                       :guid-prefix (%make-test-prefix #xA1) :domain 87
+                       :guid-prefix (%make-test-prefix #xA1) :domain (test-domain +td-multitopic+)
                        :host "127.0.0.1" :port 0 :multicast nil))
          (pub-ci-node (dds.disc:make-disc-node
-                       :guid-prefix (%make-test-prefix #xA2) :domain 87
+                       :guid-prefix (%make-test-prefix #xA2) :domain (test-domain +td-multitopic+)
                        :host "127.0.0.1" :port 0 :multicast nil)))
     (unwind-protect
          (progn
@@ -1354,7 +1357,7 @@
              (sleep 0.1)
              ;; late-joiner 1: TL reader on Square expects N-SQ from the service
              (let* ((lj-sq (dds.disc:make-disc-node
-                             :guid-prefix (%make-test-prefix #xB1) :domain 87
+                             :guid-prefix (%make-test-prefix #xB1) :domain (test-domain +td-multitopic+)
                              :host "127.0.0.1" :port 0 :multicast nil)))
                (unwind-protect
                     (progn
@@ -1385,7 +1388,7 @@
                  (ignore-errors (dds.disc:stop-node lj-sq))))
              ;; late-joiner 2: TL reader on Circle expects N-CI from the service
              (let* ((lj-ci (dds.disc:make-disc-node
-                             :guid-prefix (%make-test-prefix #xB2) :domain 87
+                             :guid-prefix (%make-test-prefix #xB2) :domain (test-domain +td-multitopic+)
                              :host "127.0.0.1" :port 0 :multicast nil)))
                (unwind-protect
                     (progn
@@ -1436,13 +1439,13 @@
   (let* ((n 3)
          (svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 97
+                :domain (test-domain +td-dispose-replay+)
                 :topics '(("DRSquare" . "ShapeType"))
                 :store (lambda () svc-store)
                 :name "dispose-replay-test"))
          (svc (dds.durability:make-durability-service spec :store svc-store))
          (pub-prefix (%make-test-prefix #xC9))
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 97
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-dispose-replay+)
                                             :host "127.0.0.1" :port 0 :multicast nil))
          ;; key-hash used for dispose: 16 bytes, first byte 0xAB
          (kh (let ((k (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
@@ -1490,7 +1493,7 @@
              (sleep 0.1)
              ;; TL late-joiner: receives data history + dispose from the service
              (let* ((lj-prefix (%make-test-prefix #xD9))
-                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 97
+                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-dispose-replay+)
                                                       :host "127.0.0.1" :port 0 :multicast nil)))
                (unwind-protect
                     (progn
@@ -1565,13 +1568,13 @@
          (svc-store (dds.durability:make-encrypted-store
                      (dds.durability:make-memory-store) kp))
          (spec (dds.durability:make-service-spec
-                :domain 107
+                :domain (test-domain +td-dare-transparency+)
                 :topics '(("Square" . "ShapeType"))
                 :store (lambda () svc-store)
                 :name "dare-transparency-test"))
          (svc (dds.durability:make-durability-service spec :store svc-store))
          (pub-prefix (%make-test-prefix #xD3))
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 107
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-dare-transparency+)
                                             :host "127.0.0.1" :port 0 :multicast nil)))
     (unwind-protect
          (progn
@@ -1600,7 +1603,7 @@
              (ignore-errors (dds.disc:stop-node pub-node))
              (sleep 0.1)
              (let* ((lj-prefix (%make-test-prefix #xE3))
-                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 107
+                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-dare-transparency+)
                                                       :host "127.0.0.1" :port 0 :multicast nil)))
                (unwind-protect
                     (progn
@@ -1744,14 +1747,14 @@
          (progn
            ;; --- run 1: publisher writes N samples, service collects + persists ---
            (let* ((spec1 (dds.durability:make-service-spec
-                          :domain 117
+                          :domain (test-domain +td-persistent-service+)
                           :topics '(("PSquare" . "ShapeType"))
                           :store (dds.durability:make-persistent-store-factory
                                   :dir tmp-dir :key-dir key-dir)
                           :name "persistent-run1"))
                   (svc1  (dds.durability:make-durability-service spec1))
                   (pub-prefix (%make-test-prefix #xC5))
-                  (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 117
+                  (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-persistent-service+)
                                                      :host "127.0.0.1" :port 0
                                                      :multicast nil)))
              (unwind-protect
@@ -1795,7 +1798,7 @@
                        (format nil "service-tier DARE: plaintext sample ~d must not appear on disk" (1+ i)))))
            ;; --- run 2: fresh service on same dirs simulates restart ---
            (let* ((spec2 (dds.durability:make-service-spec
-                          :domain 117
+                          :domain (test-domain +td-persistent-service+)
                           :topics '(("PSquare" . "ShapeType"))
                           :store (dds.durability:make-persistent-store-factory
                                   :dir tmp-dir :key-dir key-dir)
@@ -1814,7 +1817,7 @@
                                        (dds.durability:durability-service-store svc2) "PSquare")))
                     (let* ((lj-prefix (%make-test-prefix #xE5))
                            (lj-node (dds.disc:make-disc-node
-                                     :guid-prefix lj-prefix :domain 117
+                                     :guid-prefix lj-prefix :domain (test-domain +td-persistent-service+)
                                      :host "127.0.0.1" :port 0 :multicast nil))
                            (svc2-node (dds.durability:durability-service-node svc2)))
                       (unwind-protect
@@ -2192,13 +2195,13 @@
             (format nil "pre-seed: store must have ~d records before service-start, got ~d"
                     n (dds.durability:store-count svc-store topic)))
     (let* ((spec (dds.durability:make-service-spec
-                  :domain 97
+                  :domain (test-domain +td-dispose-replay+)
                   :topics (list (cons topic "ShapeType"))
                   :store  (lambda () svc-store)
                   :name   "seed-bp-test"))
            (svc (dds.durability:make-durability-service spec :store svc-store))
            (lj-prefix (%make-test-prefix #xBB))
-           (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 97
+           (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-dispose-replay+)
                                              :host "127.0.0.1" :port 0 :multicast nil)))
       (unwind-protect
            (progn
@@ -2329,7 +2332,7 @@
   (let* ((n 3)
          (svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 127
+                :domain (test-domain +td-dynamic-topic+)
                 :topics '(("DynA" . "ShapeType"))
                 :store (lambda () svc-store)
                 :name "dynamic-topic-test"))
@@ -2381,7 +2384,7 @@
                (t
                 ;; svc-b-node is the node returned directly by service-add-topic (no prefix re-derivation)
                 (let* ((pub-prefix (%make-test-prefix #xC7))
-                       (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 127
+                       (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-dynamic-topic+)
                                                           :host "127.0.0.1" :port 0 :multicast nil)))
                   (when svc-b-node
                     (unwind-protect
@@ -2413,7 +2416,7 @@
                            (sleep 0.1)
                            ;; TL late-joiner on DynB: must receive N from the service
                            (let* ((lj-prefix (%make-test-prefix #xE8))
-                                  (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain 127
+                                  (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-dynamic-topic+)
                                                                      :host "127.0.0.1" :port 0
                                                                      :multicast nil)))
                              (unwind-protect
@@ -2458,10 +2461,10 @@
    PID_ORIGINAL_WRITER_INFO reports the ORIGINAL writer's (GUID,SN), not the relaying wire sender; a
    direct sample (no OWI) reports the wire GUID/SN. Two-node loopback, domain 78."
   (let* ((relay-prefix (%make-test-prefix #xA1))
-         (relay-node (dds.disc:make-disc-node :guid-prefix relay-prefix :domain 78
+         (relay-node (dds.disc:make-disc-node :guid-prefix relay-prefix :domain (test-domain +td-origin-accessor+)
                                               :host "127.0.0.1" :port 0 :multicast nil))
          (rdr-prefix (%make-test-prefix #xB2))
-         (rdr-node (dds.disc:make-disc-node :guid-prefix rdr-prefix :domain 78
+         (rdr-node (dds.disc:make-disc-node :guid-prefix rdr-prefix :domain (test-domain +td-origin-accessor+)
                                             :host "127.0.0.1" :port 0 :multicast nil))
          (orig-guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xC3))
          (orig-sn 41))
@@ -2539,12 +2542,12 @@
   (let* ((n 3)
          (svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 79 :topics '(("CSquare" . "ShapeType")) :store (lambda () svc-store)
+                :domain (test-domain +td-collect-origin-convergence+) :topics '(("CSquare" . "ShapeType")) :store (lambda () svc-store)
                 :qos-overrides '(:collect-durability :transient) :name "collect-origin-convergence"))
          (svc (dds.durability:make-durability-service spec :store svc-store))
-         (pub-node (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #x1A) :domain 79
+         (pub-node (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #x1A) :domain (test-domain +td-collect-origin-convergence+)
                                             :host "127.0.0.1" :port 0 :multicast nil))
-         (relay-node (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #x2B) :domain 79
+         (relay-node (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #x2B) :domain (test-domain +td-collect-origin-convergence+)
                                               :host "127.0.0.1" :port 0 :multicast nil)))
     (unwind-protect
          (progn
@@ -2628,13 +2631,13 @@
                               #xA9 #xAA #xAB #xAC #xAD #xAE #xAF #xB0)))
          (svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 81
+                :domain (test-domain +td-collect-keyhash-store+)
                 :topics '(("KHCollect" . "ShapeType"))
                 :store (lambda () svc-store)
                 :name "collect-keyhash-store-test"))
          (svc (dds.durability:make-durability-service spec :store svc-store))
          (pub-prefix (%make-test-prefix #xB1))
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 81
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-collect-keyhash-store+)
                                             :host "127.0.0.1" :port 0 :multicast nil)))
     ;; assert DURABILITY_SERVICE history QoS fields plumbed (DDS 1.4 §2.2.3.5)
     (%check :history-kind-default
@@ -2644,7 +2647,7 @@
             (= 1 (dds.durability:service-spec-history-depth spec))
             "default history-depth must be 1")
     (let* ((spec2 (dds.durability:make-service-spec
-                   :domain 81
+                   :domain (test-domain +td-collect-keyhash-store+)
                    :topics '(("KHCollect2" . "ShapeType"))
                    :history-kind :keep-last
                    :history-depth 5
@@ -2707,14 +2710,14 @@
    nodes on domain 80; writer publishes with a KH16 key-hash; one subscriber with capture ON, one with
    capture OFF."
   (let* ((pub-prefix (%make-test-prefix #xD1))
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 80
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-data-keyhash-capture+)
                                             :host "127.0.0.1" :port 0 :multicast nil))
          (rdr-on-prefix (%make-test-prefix #xE2))
-         (rdr-on (dds.disc:make-disc-node :guid-prefix rdr-on-prefix :domain 80
+         (rdr-on (dds.disc:make-disc-node :guid-prefix rdr-on-prefix :domain (test-domain +td-data-keyhash-capture+)
                                           :host "127.0.0.1" :port 0 :multicast nil
                                           :capture-data-key-hash t))
          (rdr-off-prefix (%make-test-prefix #xF3))
-         (rdr-off (dds.disc:make-disc-node :guid-prefix rdr-off-prefix :domain 80
+         (rdr-off (dds.disc:make-disc-node :guid-prefix rdr-off-prefix :domain (test-domain +td-data-keyhash-capture+)
                                            :host "127.0.0.1" :port 0 :multicast nil))
          (kh16 (make-array 16 :element-type '(unsigned-byte 8) :initial-contents
                            '(#x01 #x02 #x03 #x04 #x05 #x06 #x07 #x08
@@ -3088,7 +3091,7 @@
                (dds.durability:store-close seed-store))
              ;; build spec with :keep-last D — this is the policy that service-start must pass to store-open
              (let* ((spec (dds.durability:make-service-spec
-                           :domain 119
+                           :domain (test-domain +td-keeplast-policy+)
                            :topics (list (cons svc-topic "ShapeType"))
                            :history-kind :keep-last
                            :history-depth d
@@ -3131,7 +3134,7 @@
    prerequisite. Domain 82, in-memory store."
   (let* ((store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
-                :domain 82 :topics '(("GtSquare" . "ShapeType")) :store (lambda () store)
+                :domain (test-domain +td-graceful-teardown+) :topics '(("GtSquare" . "ShapeType")) :store (lambda () store)
                 :name "graceful-teardown"))
          (svc (dds.durability:make-durability-service spec :store store)))
     (dds.durability:service-start svc)

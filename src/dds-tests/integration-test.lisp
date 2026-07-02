@@ -183,8 +183,8 @@
    dcps-msg that a DataReader takes — entirely through the CLOS DCPS entity model and
    the typed type-support codec. Proves the DDS API layer over the RTPS engine."
   (let* ((ts (dds.types:find-type-support "dcps-msg"))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "DcpsTopic" "dcps-msg" ts))
                 (tr (dds.dcps:create-topic p2 "DcpsTopic" "dcps-msg" ts))
@@ -220,8 +220,8 @@
    key-hash, and the dispose's no-payload DATA reaches the subscriber's engine classified :dispose
    carrying that handle (RTPS 2.5 §9.6.4.9). The reader-side instance-state transition is S2."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
                 (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
@@ -276,7 +276,7 @@
    with READER-DURABILITY. Three distinct instances (RED/GREEN/BLUE) are published first, then the late
    reader joins, drains, then a 4th (YELLOW) sample is published."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p1 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
                 (pub (dds.dcps:create-publisher p1))
@@ -289,7 +289,7 @@
            (dds.dcps:write-sample dw (make-shape-type :color "BLUE"  :x 3 :y 3 :shapesize 30))
            (loop repeat 10 do (dds.dcps:spin p1) (sleep 0.01))   ; let the 3 settle in the HC
            ;; NOW the late reader joins.
-           (let ((p2 (dds.dcps:create-participant :domain 0)))
+           (let ((p2 (dds.dcps:create-participant :domain (test-domain))))
              (unwind-protect
                   (let* ((tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
                          (sub (dds.dcps:create-subscriber p2))
@@ -341,7 +341,7 @@
    reader; a late-joining TL reader receives only the LAST sample on that instance (depth 1 per instance),
    not the full 3-sample history (per-instance %hc-index-drop eviction still bounds a TL writer's HC)."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p1 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
                 (pub (dds.dcps:create-publisher p1))
@@ -353,7 +353,7 @@
            (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 2 :y 2 :shapesize 20))
            (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 3 :y 3 :shapesize 30))
            (loop repeat 10 do (dds.dcps:spin p1) (sleep 0.01))
-           (let ((p2 (dds.dcps:create-participant :domain 0)))
+           (let ((p2 (dds.dcps:create-participant :domain (test-domain))))
              (unwind-protect
                   (let* ((tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
                          (sub (dds.dcps:create-subscriber p2))
@@ -391,8 +391,8 @@
    0x104), the endpoints discover + match same-kind, and a sample {a=7 b=9} survives
    write/take. Proves DCPS threads the type's keyed-ness into the endpoint kind."
   (let* ((ts (dds.types:find-type-support "nokey-rt"))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "NoKeyTopic" "nokey-rt" ts))
                 (tr (dds.dcps:create-topic p2 "NoKeyTopic" "nokey-rt" ts))
@@ -451,7 +451,7 @@
    The engine HistoryCache is still hard-coded KEEP_ALL (the QoS flip is Task D1), so this only
    verifies the THREADING; nothing is evicted-on yet."
   (let* ((kts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((ktw (dds.dcps:create-topic p "KlSquare" "shape-type" kts))
                 (kl-pub (dds.dcps:create-publisher p))
@@ -465,7 +465,7 @@
                    "KEEP_LAST keyed writer must thread the type-support keyhash onto the data change"))
       (dds.dcps:delete-participant p)))
   (let* ((uts (dds.types:find-type-support "nokey-rt"))
-           (p2 (dds.dcps:create-participant :domain 0)))
+           (p2 (dds.dcps:create-participant :domain (test-domain))))
       (unwind-protect
            (let* ((utw (dds.dcps:create-topic p2 "KlNoKey" "nokey-rt" uts))
                   (kl-pub2 (dds.dcps:create-publisher p2))
@@ -478,7 +478,7 @@
                      "KEEP_LAST unkeyed writer must thread the shared +instance-handle-nil+ (no per-sample alloc)"))
         (dds.dcps:delete-participant p2)))
     (let* ((kts (dds.types:find-type-support "shape-type"))
-           (p3 (dds.dcps:create-participant :domain 0)))
+           (p3 (dds.dcps:create-participant :domain (test-domain))))
       (unwind-protect
            (let* ((ktw3 (dds.dcps:create-topic p3 "KaSquare" "shape-type" kts))
                   (ka-pub (dds.dcps:create-publisher p3))
@@ -512,8 +512,8 @@
    grouping, READ marking + non-destructive read, view-state NEW->NOT_NEW, and take
    removal."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
                 (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
@@ -590,8 +590,8 @@
    dispose still delivers ALIVE / valid_data TRUE / view-state NEW. A second write REVIVES the
    instance to ALIVE with disposed_generation_count bumped to 1."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
                 (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
@@ -664,8 +664,8 @@
    NO_WRITERS path; under the policy DEFAULT (TRUE) the same unregister would instead DISPOSE the
    instance (covered by run-dcps-autodispose-writer-test / run-dcps-autodispose-reader-test)."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
                 (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
@@ -707,8 +707,8 @@
    (ALIVE), disposes the instance (NOT_ALIVE_DISPOSED), then unregisters it; the reader stays DISPOSED
    and the unregister produces NO new invalid-data sample (no state transition, Issues 1+3)."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
                 (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
@@ -749,7 +749,7 @@
    surfaces a valid_data=FALSE notification. Deterministic offline injection, no UDP wait — the
    writers-set is seeded via the same %reader-revive-instance path the data plane uses."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -829,7 +829,7 @@
    NOT_ALIVE_DISPOSED. Drives %drain directly after staging both changes in the engine's SN maps —
    deterministic, no UDP, no unbounded wait."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -872,7 +872,7 @@
    (0x01) -> NOT_ALIVE_DISPOSED (unchanged). Deterministic offline injection — stage the change with
    an explicit StatusInfo octet, drive %drain once, no UDP."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -954,7 +954,7 @@
          (delay (dds.qos:make-qos-duration 1 0))         ; {1,0}s finite autopurge delay
          (wid #x00000102))
     ;; (a) DEFAULT (both delays INFINITE): a disposed instance is NEVER purged — the no-op default.
-    (let ((p (dds.dcps:create-participant :domain 0)))
+    (let ((p (dds.dcps:create-participant :domain (test-domain))))
       (unwind-protect
            (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                   (sub (dds.dcps:create-subscriber p))
@@ -977,7 +977,7 @@
                      "DEFAULT (INFINITE delay) must NEVER purge cached samples"))
         (dds.dcps:delete-participant p)))
     ;; (b) FINITE autopurge_disposed_samples_delay: disposed instance purged past the delay.
-    (let ((p (dds.dcps:create-participant :domain 0)))
+    (let ((p (dds.dcps:create-participant :domain (test-domain))))
       (unwind-protect
            (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                   (sub (dds.dcps:create-subscriber p))
@@ -1020,7 +1020,7 @@
                        "the fresh instance's first sample view-state must be NEW")))
         (dds.dcps:delete-participant p)))
     ;; (c) FINITE autopurge_nowriter_samples_delay: no-writers instance purged past the delay.
-    (let ((p (dds.dcps:create-participant :domain 0)))
+    (let ((p (dds.dcps:create-participant :domain (test-domain))))
       (unwind-protect
            (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                   (sub (dds.dcps:create-subscriber p))
@@ -1047,7 +1047,7 @@
         (dds.dcps:delete-participant p)))
     ;; (d) cross-policy: a disposed-delay reader must NOT purge a NOT_ALIVE_NO_WRITERS instance, and an
     ;; ALIVE instance is never purged regardless.
-    (let ((p (dds.dcps:create-participant :domain 0)))
+    (let ((p (dds.dcps:create-participant :domain (test-domain))))
       (unwind-protect
            (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                   (sub (dds.dcps:create-subscriber p))
@@ -1089,8 +1089,8 @@
          (du (logior dds.rtps.message:+statusinfo-disposed+
                      dds.rtps.message:+statusinfo-unregistered+)))
     (flet ((scenario (writer-qos)
-             (let ((p1 (dds.dcps:create-participant :domain 0))
-                   (p2 (dds.dcps:create-participant :domain 0)))
+             (let ((p1 (dds.dcps:create-participant :domain (test-domain)))
+                   (p2 (dds.dcps:create-participant :domain (test-domain))))
                (unwind-protect
                     (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
                            (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
@@ -1182,7 +1182,7 @@
    writer A writes again. Returns (values SAMPLES-BEFORE-VANISH SAMPLES-AFTER-TAKEOVER) — the count of
    valid-data samples cached for the instance before B vanished and the extra count A delivered after."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -1222,7 +1222,7 @@
    dropped. Returns (values AFTER-A1 AFTER-B2 AFTER-A3) — the cumulative valid-data sample count for
    the instance after each successive drain."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -1290,7 +1290,7 @@
    for the instance before the match (must be 0) and after (must be 1: the once-pending sample now
    arbitrates and is delivered)."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -1359,7 +1359,7 @@
    instance-A — its ownership clears, but B's ownership of instance-B MUST survive (an EntityId-only
    compare would wrongly cross-clear B). Deterministic offline injection — no UDP."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -1407,7 +1407,7 @@
    must keep both disposes — A's dispose of instance-A and B's dispose of instance-B must each
    land NOT_ALIVE_DISPOSED, not clobber each other. Deterministic offline injection — no UDP."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -1447,13 +1447,25 @@
 ;;; blocks endpoint matching even when topic+type agree. (Gating DATA delivery on the
 ;;; match — so RxO also blocks delivery, not just matching — is the immediate follow-up.)
 
+(defun* %peer-matched-count (p peer)
+    (function (dds.dcps:domain-participant dds.dcps:domain-participant) (integer 0))
+  "TEST-ONLY peer-scoped matched-count: how many of P's matched remote endpoints belong
+   to PEER — i.e. carry PEER's own participant GUID-prefix (RTPS 2.5 §9.3.1.2). Node-wide
+   dds.dcps:matched-count also counts foreign participants on the shared domain (e.g. a
+   domain-0 rtiddsspy that auto-subscribes to the topic), so it cannot prove THIS
+   writer/reader pair matched — this can."
+  (dds.disc::%disc-node-matched-count-for-prefix
+   (dds.dcps::dp-node p)
+   (dds.disc:disc-node-guid-prefix (dds.dcps::dp-node peer))))
+
 (defun* %rxo-scenario (writer-qos reader-qos)
     (function (t t) (values integer t))
   "Create a writer/reader pair with the given QoS on a shared topic; spin discovery,
-   write one sample, and return (values MATCHED-COUNT DATA-RECEIVED-P) — so the test
-   can assert RxO blocks both the match AND delivery."
-  (let ((p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0))
+   write one sample, and return (values PEER-SCOPED-MATCHED-COUNT DATA-RECEIVED-P) — the
+   match count scoped to the p1<->p2 pair (robust to any foreign participant on the
+   domain), so the test can assert RxO blocks both the match AND delivery."
+  (let ((p1 (dds.dcps:create-participant :domain (test-domain +td-rxo+)))
+        (p2 (dds.dcps:create-participant :domain (test-domain +td-rxo+)))
         (ts (dds.types:find-type-support "dcps-msg")))
     (unwind-protect
          (let ((pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
@@ -1462,12 +1474,12 @@
            (let ((dw (dds.dcps:create-datawriter pub tw :qos writer-qos))
                  (dr (dds.dcps:create-datareader sub tr :qos reader-qos)))
              (loop repeat 120
-                   until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                   until (and (plusp (%peer-matched-count p1 p2)) (plusp (%peer-matched-count p2 p1)))
                    do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
              (dds.dcps:write-sample dw (make-dcps-msg :id 1 :text "rxo"))
              (loop repeat 60 until (plusp (dds.dcps:samples-available dr))
                    do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
-             (values (+ (dds.dcps:matched-count p1) (dds.dcps:matched-count p2))
+             (values (+ (%peer-matched-count p1 p2) (%peer-matched-count p2 p1))
                      (plusp (dds.dcps:samples-available dr)))))
       (dds.dcps:delete-participant p1)
       (dds.dcps:delete-participant p2))))
@@ -1504,8 +1516,8 @@
             "guard-condition must trigger after set_trigger_value"))
   ;; ReadCondition + WaitSet over real data
   (let ((ts (dds.types:find-type-support "dcps-msg"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0)))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "WsTopic" "dcps-msg" ts))
                 (tr (dds.dcps:create-topic p2 "WsTopic" "dcps-msg" ts))
@@ -1572,8 +1584,8 @@
    on_subscription_matched + on_publication_matched listeners fire; and get_*_status
    resets the *_change counters while leaving the cumulative counts intact."
   (let ((ts (dds.types:find-type-support "dcps-msg"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain)))
         (rl (make-instance 'capturing-reader-listener))
         (wl (make-instance 'capturing-writer-listener)))
     (unwind-protect
@@ -1624,8 +1636,8 @@
    DURABILITY_QOS_POLICY_ID and a DURABILITY entry in policies, and the
    on_requested_incompatible_qos listener fires — closing the RxO loop to the app."
   (let ((ts (dds.types:find-type-support "dcps-msg"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain)))
         (rl (make-instance 'capturing-reader-listener)))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "IncompatTopic" "dcps-msg" ts))
@@ -1680,8 +1692,8 @@
    triggers it; read_w_condition returns only the matching samples and marks them read,
    leaving the non-matching sample in the cache."
   (let ((ts (dds.types:find-type-support "dcps-msg"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0)))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "QueryTopic" "dcps-msg" ts))
                 (tr (dds.dcps:create-topic p2 "QueryTopic" "dcps-msg" ts))
@@ -1738,8 +1750,8 @@
    WaitSet condvar), the reader's on_data_available listener fires from that thread,
    read_w_condition returns the sample, and an empty WaitSet still times out."
   (let ((ts (dds.types:find-type-support "dcps-msg"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain)))
         (dal (make-instance 'data-available-listener)))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "WakeTopic" "dcps-msg" ts))
@@ -1845,8 +1857,8 @@
    with filter \"x > %0\" / params (50) receives the x=100 and x=200 shapes but not the
    x=10 shape, while still matching the writer on the related topic (FR-DCPS-5)."
   (let ((ts (dds.types:find-type-support "shape-type"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0)))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "Square" "shape-type" ts))
                 (tr (dds.dcps:create-topic p2 "Square" "shape-type" ts))
@@ -1886,7 +1898,7 @@
   "create_querycondition with :expression compiles the DDS query against the reader's
    topic type; the resulting query-fn filters by the SQL expression (FR-DCPS-5)."
   (let ((ts (dds.types:find-type-support "dcps-msg"))
-        (p (dds.dcps:create-participant :domain 0)))
+        (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "QcSqlTopic" "dcps-msg" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -1920,8 +1932,8 @@
    inconsistent-topic-status total_count goes >= 1 and on_inconsistent_topic fires."
   (let ((sts (dds.types:find-type-support "shape-type"))
         (mts (dds.types:find-type-support "dcps-msg"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain)))
         (tl (make-instance 'capturing-topic-listener)))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "IncTopic" "shape-type" sts))
@@ -1961,8 +1973,8 @@
    receives 3 samples; the 3rd is rejected at the DCPS cache (cache stays at 2),
    SAMPLE_REJECTED reports REJECTED_BY_SAMPLES_LIMIT, and on_sample_rejected fires."
   (let ((ts (dds.types:find-type-support "dcps-msg"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain)))
         (rl (make-instance 'capturing-reader-listener)))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "RejTopic" "dcps-msg" ts))
@@ -2009,8 +2021,8 @@
    DCPSParticipant / DCPSPublication / DCPSSubscription / DCPSTopic readers expose the
    discovered participant, the remote writer/reader (topic+type), and the topic."
   (let ((ts (dds.types:find-type-support "dcps-msg"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0)))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "BTopic" "dcps-msg" ts))
                 (tr (dds.dcps:create-topic p2 "BTopic" "dcps-msg" ts))
@@ -2794,7 +2806,7 @@
    type and records the verdict on the local DataReader (ENTITY-TYPE-COMPAT), also writing
    one advisory line to *TYPE-COMPAT-LOG* when bound; it never gates the match (ADR 0009)."
   (let ((ts (dds.types:find-type-support "shape-type"))
-        (p (dds.dcps:create-participant :domain 0)))
+        (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "CompatTopic" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -2833,8 +2845,8 @@
    (1024); assert the reader takes exactly one sample with the original id and byte-exact
    payload. Proves the DCPS API layer fragments transparently."
   (let* ((ts (dds.types:find-type-support "dcps-large"))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain)))
          (payload-size 4000)   ; > *fragment-size* 1024 -> fragments into 4 DATA_FRAG
          (payload (make-array payload-size :element-type '(unsigned-byte 8)))
          (orig-id 77))
@@ -3650,7 +3662,7 @@
    SNs of A AND the last 2 SNs of B — NOT a global last-2 (which would keep only the 4th/5th write and starve
    one key). Proves the activation: the QoS HISTORY now sizes the engine cache and the keyhash drives eviction."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "KlW2Square" "shape-type" ts))
                 (pub (dds.dcps:create-publisher p))
@@ -3814,7 +3826,7 @@
    writes, minus UDP), then assert dr-cache holds EXACTLY A's last 2 and B's last 2. A second single-instance
    variant: deliver 3 of A to a fresh KEEP_LAST-2 reader and assert exactly the last 2 survive."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "KlR2Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p))
@@ -3852,7 +3864,7 @@
       (dds.dcps:delete-participant p)))
   ;; single-instance variant: 3 of A to a fresh KEEP_LAST-2 reader -> exactly the last 2 survive.
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p2 "KlR2bSquare" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p2))
@@ -3884,7 +3896,7 @@
    Reader side: an unkeyed KEEP_LAST-2 reader fed 3 samples through %drain keeps the global last 2 — identical to
    a correct global KEEP_LAST (no per-key partitioning when there is no key)."
   (let* ((uts (dds.types:find-type-support "nokey-rt"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "KlUkNoKey" "nokey-rt" uts))
                 (pub (dds.dcps:create-publisher p))
@@ -3904,7 +3916,7 @@
                      (format nil "the global last 2 SNs (2,3) must be retained, got ~s" (gethash :unkeyed by-instance)))))
       (dds.dcps:delete-participant p)))
   (let* ((uts (dds.types:find-type-support "nokey-rt"))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p2 "KlUkRNoKey" "nokey-rt" uts))
                 (sub (dds.dcps:create-subscriber p2))
@@ -3935,7 +3947,7 @@
    RESOURCE_LIMITS, as before). A KEEP_ALL keyed reader fed several samples for two instances keeps ALL of them
    in dr-cache (no lossy KEEP_LAST drop fires — %reader-keeplast-depth is NIL for KEEP_ALL)."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain 0)))
+         (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "KaW2Square" "shape-type" ts))
                 (pub (dds.dcps:create-publisher p))
@@ -3947,7 +3959,7 @@
                            (dds.rtps.history:hc-change-count (%dw-engine-hc dw)))))
       (dds.dcps:delete-participant p)))
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p2 "KaR2Square" "shape-type" ts))
                 (sub (dds.dcps:create-subscriber p2))
@@ -5932,8 +5944,8 @@
          (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
          (ts (dds.types:find-type-support "fd-abc"))
          (va 200) (vb 3000000000) (vc 12345678901234567890)
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "FdLoan" "fd-abc" ts))
                 (tr (dds.dcps:create-topic p2 "FdLoan" "fd-abc" ts))
@@ -6045,8 +6057,8 @@
          (ts (dds.types:find-type-support "fd-abc"))
          (va1 200) (vb1 3000000000) (vc1 12345678901234567890)   ; sample 1
          (va2 99) (vb2 1234567890) (vc2 9876543210987654321)     ; sample 2 (distinct, to catch a stale alias)
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "FdLoanRR" "fd-abc" ts))
                 (tr (dds.dcps:create-topic p2 "FdLoanRR" "fd-abc" ts))
@@ -6164,8 +6176,8 @@
          (ts (dds.types:find-type-support "fd-abc"))
          (va 200) (vb 3000000000) (vc 12345678901234567890)
          (sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "FdZcE2E" "fd-abc" ts))
                 (tr (dds.dcps:create-topic p2 "FdZcE2E" "fd-abc" ts))
@@ -6271,8 +6283,8 @@
                  (setf (keyed-fd-i32-k-fd b) kb (keyed-fd-i32-v-fd b) 0)
                  (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
                    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (%check :kfdl-kh-distinct (not (equalp kh-a kh-b)) "the two key values must have distinct keyhashes (oracle sanity)")
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "KFdLoan" "keyed-fd-i32" ts))
@@ -6361,8 +6373,8 @@
                  (setf (keyed-fd-i32-k-fd b) kb (keyed-fd-i32-v-fd b) 0)
                  (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
                    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "KFdKlLoan" "keyed-fd-i32" ts))
                 (tr (dds.dcps:create-topic p2 "KFdKlLoan" "keyed-fd-i32" ts))
@@ -6451,8 +6463,8 @@
            (dds.disc:*zerocopy-min-payload-bytes* 4)
            (ts (dds.types:find-type-support "keyed-fd-i32"))
            (kc #x07070707)
-           (p1 (dds.dcps:create-participant :domain 0))
-           (p2 (dds.dcps:create-participant :domain 0)))
+           (p1 (dds.dcps:create-participant :domain (test-domain)))
+           (p2 (dds.dcps:create-participant :domain (test-domain))))
       (unwind-protect
            (let* ((tw (dds.dcps:create-topic p1 "KFdKlUaf" "keyed-fd-i32" ts))
                   (tr (dds.dcps:create-topic p2 "KFdKlUaf" "keyed-fd-i32" ts))
@@ -6511,8 +6523,8 @@
          (dds.disc:*zerocopy-enabled* t)
          (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
          (ts (dds.types:find-type-support "fd-abc"))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "NkFdKlLoan" "fd-abc" ts))
                 (tr (dds.dcps:create-topic p2 "NkFdKlLoan" "fd-abc" ts))
@@ -6574,8 +6586,8 @@
                  (setf (keyed-fd-i32-k-fd b) kb (keyed-fd-i32-v-fd b) 0)
                  (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
                    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (%check :kfdc-kh-distinct (not (equalp kh-a kh-b)) "the two key values must have distinct keyhashes (oracle sanity)")
     (%check :kfdc-kh-not-nil (not (equalp kh-a nil-handle)) "a keyed FlatData keyhash must not be HANDLE_NIL")
     (unwind-protect
@@ -6690,8 +6702,8 @@
                  (setf (keyed-fd-i32-k-fd b) kb (keyed-fd-i32-v-fd b) 0)
                  (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
                    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "KFdDisp" "keyed-fd-i32" ts))
                 (tr (dds.dcps:create-topic p2 "KFdDisp" "keyed-fd-i32" ts))
@@ -6758,8 +6770,8 @@
          (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
          (ts (dds.types:find-type-support "fd-abc"))
          (va 201) (vb 3000000001) (vc 12345678901234567891)
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "FdRelZc" "fd-abc" ts))
                 (tr (dds.dcps:create-topic p2 "FdRelZc" "fd-abc" ts))
@@ -6870,8 +6882,8 @@
          (dds.disc:*zerocopy-min-payload-bytes* 8)
          (ts (dds.types:find-type-support "fd-abc"))
          (va 202) (vb 3000000002) (vc 12345678901234567892)
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain)))
          (held '()))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "FdPoolFull" "fd-abc" ts))
@@ -6946,8 +6958,8 @@
          (ts (dds.types:find-type-support "fd-abc"))
          (va1 211) (vb1 3100000001) (vc1 11111111111111111111)
          (va2 212) (vb2 3100000002) (vc2 12222222222222222222)
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain)))
          (held '()))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "FdMixed" "fd-abc" ts))
@@ -7035,8 +7047,8 @@
          (dds.disc:*zerocopy-min-payload-bytes* 8)
          (ts (dds.types:find-type-support "fd-abc"))
          (va 204) (vb 3000000004) (vc 12345678901234567894)
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 "FdPurge" "fd-abc" ts))
                 (tr (dds.dcps:create-topic p2 "FdPurge" "fd-abc" ts))
@@ -7112,8 +7124,8 @@
   (let* ((ts (dds.types:find-type-support "fd-abc"))
          (reader-qos (dds.qos:make-reader-qos
                       :reliability (dds.qos:qos-reliability writer-qos)))   ; RxO-compatible with the writer
-         (p1 (dds.dcps:create-participant :domain 0))
-         (p2 (dds.dcps:create-participant :domain 0)))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((tw (dds.dcps:create-topic p1 (format nil "FdQos~a" label) "fd-abc" ts))
                 (tr (dds.dcps:create-topic p2 (format nil "FdQos~a" label) "fd-abc" ts))
@@ -7353,7 +7365,7 @@
    fires on-subscription-matched; the DataWriter/PUBLICATION_MATCHED mirror holds
    (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §165/§174)."
   (let ((ts (dds.types:find-type-support "shape-type"))
-        (p (dds.dcps:create-participant :domain 0))
+        (p (dds.dcps:create-participant :domain (test-domain)))
         (rl (make-instance 'capturing-reader-listener))
         (wl (make-instance 'capturing-writer-listener)))
     (unwind-protect
@@ -7444,7 +7456,7 @@
    not_alive_count_change -1). Deterministic: the stamp is backdated, never timed (RTPS 2.5
    §8.4.13 / DDS 1.4 §2.2.4.1)."
   (let ((ts (dds.types:find-type-support "shape-type"))
-        (p (dds.dcps:create-participant :domain 0))
+        (p (dds.dcps:create-participant :domain (test-domain)))
         (rl (make-instance 'capturing-reader-listener)))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "LivTopic" "shape-type" ts))
@@ -7533,7 +7545,7 @@
    by the cadence and never fires while spinning. Deterministic: the stamp is backdated, never
    timed (DDS 1.4 §2.2.3.11)."
   (let ((ts (dds.types:find-type-support "shape-type"))
-        (p (dds.dcps:create-participant :domain 0))
+        (p (dds.dcps:create-participant :domain (test-domain)))
         (wl (make-instance 'capturing-writer-listener)))
     (unwind-protect
          (let* ((tp (dds.dcps:create-topic p "LivLostTopic" "shape-type" ts))
@@ -8015,8 +8027,8 @@
             "a name-erased wire model must be assignable to/from its named original (NameHash)"))
   ;; (a) identical types both sides: match completes, zero TypeLookup queries
   (let ((ts (dds.types:find-type-support "gate-eq-type"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0)))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((t1 (dds.dcps:create-topic p1 "GateEqTopic" "gate-eq-type" ts))
                 (t2 (dds.dcps:create-topic p2 "GateEqTopic" "gate-eq-type" ts))
@@ -8040,8 +8052,8 @@
   ;; (b) same names, non-assignable structures: query runs, no match, INCONSISTENT_TOPIC
   (let ((ts-w (dds.types:find-type-support "gate-w-type"))
         (ts-r (dds.types:find-type-support "gate-r-type"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0)))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((t1 (dds.dcps:create-topic p1 "GateBadTopic" "GateBadType" ts-w))
                 (t2 (dds.dcps:create-topic p2 "GateBadTopic" "GateBadType" ts-r))
@@ -8071,8 +8083,8 @@
   ;; ParameterList yet, so the writer side assesses with the §7.6.3.4.1 defaults.
   (let ((ts-w (dds.types:find-type-support "gate-cw-type"))
         (ts-r (dds.types:find-type-support "gate-cr-type"))
-        (p1 (dds.dcps:create-participant :domain 0))
-        (p2 (dds.dcps:create-participant :domain 0)))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (let* ((t1 (dds.dcps:create-topic p1 "GateImnTopic" "GateImnType" ts-w))
                 (t2 (dds.dcps:create-topic p2 "GateImnTopic" "GateImnType" ts-r))
@@ -8096,7 +8108,7 @@
   ;; locator points at a dead port, so the getTypes goes unanswered and expires via
   ;; tl-sweep -> the gate records the name-based :compatible fallback and the match completes
   (let ((ts (dds.types:find-type-support "shape-type"))
-        (p (dds.dcps:create-participant :domain 0))
+        (p (dds.dcps:create-participant :domain (test-domain)))
         ;; a freshly released ephemeral port: discovered yet unreachable
         (dead-port (let ((dead (dds.disc:make-disc-node :host "127.0.0.1" :port 0)))
                      (prog1 (dds.disc:disc-node-port dead) (dds.disc:stop-node dead)))))
@@ -8193,7 +8205,7 @@
    nested-struct is now the still-degrading driver.)"
   ;; (1) compatible local struct (C_Shape shape) -> assignable -> :compatible
   (let ((ts (dds.types:find-type-support "legacy-good-type"))
-        (p (dds.dcps:create-participant :domain 0)))
+        (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (%check :lg-compatible
                  (eq :compatible
@@ -8203,7 +8215,7 @@
       (dds.dcps:delete-participant p)))
   ;; (2) incompatible local struct (x retyped i64) -> NOT assignable -> :incompatible
   (let ((ts (dds.types:find-type-support "legacy-bad-type"))
-        (p (dds.dcps:create-participant :domain 0)))
+        (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (%check :lg-incompatible
                  (eq :incompatible
@@ -8215,7 +8227,7 @@
   ;; :unsupported (every captured aggregate kind now decodes; the over-depth path still degrades) ->
   ;; name-match :compatible
   (let ((ts (dds.types:find-type-support "legacy-good-type"))
-        (p (dds.dcps:create-participant :domain 0))
+        (p (dds.dcps:create-participant :domain (test-domain)))
         (dds.types:*lto-max-type-depth* 0))
     (unwind-protect
          (%check :lg-unsupported-failopen
@@ -8226,7 +8238,7 @@
       (dds.dcps:delete-participant p)))
   ;; (4) garbage-but-present LB (won't inflate) -> fail-open :compatible
   (let ((ts (dds.types:find-type-support "legacy-good-type"))
-        (p (dds.dcps:create-participant :domain 0)))
+        (p (dds.dcps:create-participant :domain (test-domain))))
     (unwind-protect
          (%check :lg-garbage-failopen
                  (eq :compatible

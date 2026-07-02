@@ -5,6 +5,7 @@
   :pathname "src/dds-tests"
   :serial t
   :components ((:file "packages")
+               (:file "test-support")
                (:file "echo-test")
                (:file "gen-test")
                (:file "rtps-test")

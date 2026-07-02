@@ -1,0 +1,142 @@
+(in-package #:dds.tests)
+
+;;; Configurable test DDS domain (owner directive): every test's DDS domain derives from
+;;; ONE knob, dds.tests:*test-domain*, so the whole suite can be shifted off any domain a
+;;; foreign participant occupies (e.g. an rtiddsspy -domainId 0). Default base is 42 (never
+;;; the shared well-known domain 0). Per-isolation-group NAMED offset constants (+td-*+)
+;;; reproduce the inter-test domain isolation the old absolute literals provided, with no
+;;; absolute domain value anywhere in the suite (the operating contract, owner directive).
+
+(defun* test-domain-from-env ()
+    (function () (or null (integer 0 232)))
+  "Parse env var DDS_TEST_DOMAIN as a DDS domain id; NIL if unset, non-integer, or out of
+   the valid 0..232 range (DDSI-RTPS 2.5 §9.6.1.1 default port mapping PB=7400/DG=250 keeps
+   every UDP port <= 65535 only for domain id <= 232). uiop:getenv is the impl-agnostic
+   accessor already used in production (no reader conditional in test code)."
+  (let ((v (uiop:getenv "DDS_TEST_DOMAIN")))
+    (when (and v (plusp (length v)))
+      (let ((n (ignore-errors (parse-integer v))))
+        (when (and (integerp n) (<= 0 n 232)) n)))))
+
+(defparameter *test-domain* (or (test-domain-from-env) 42)
+  "The configurable BASE DDS domain id for the whole test suite. Read once from env var
+   DDS_TEST_DOMAIN at load (default 42 — deliberately non-zero, off the shared well-known
+   domain 0). Rebind it, or set DDS_TEST_DOMAIN, to shift every test onto a different domain
+   (e.g. to avoid a foreign participant already on the default). Given the current maximum
+   +td-*+ offset (37) and the DDS domain-id ceiling (232), valid bases are 0..195.")
+
+(defun* test-domain (&optional (offset 0))
+    (function (&optional (integer 0)) (integer 0 232))
+  "The DDS domain id for a test: (+ *test-domain* OFFSET). OFFSET is 0 for the shared base
+   (tests that historically ran together on one domain) or a per-isolation-group +td-*+
+   constant (tests that historically used distinct absolute domains). Asserts the result is
+   a valid DDS domain id (0..232, DDSI-RTPS 2.5 §9.6.1.1) so a misconfigured base fails
+   loudly at the offending call site rather than producing an unroutable domain."
+  (let ((d (+ *test-domain* offset)))
+    (assert (<= 0 d 232) (d)
+            "test-domain ~d out of the valid DDS domain-id range 0..232 (base *test-domain*=~d, ~
+             offset=~d); lower DDS_TEST_DOMAIN (valid base 0..195)." d *test-domain* offset)
+    d))
+
+;;; Per-isolation-group offset constants. Each distinct historical absolute domain literal
+;;; maps to ONE offset here (same literal -> same offset everywhere, so the exact inter-test
+;;; domain equivalence classes — both the sharing AND the distinctness — are preserved with
+;;; zero behavioral change). Offsets are small relative values; the actual domain is
+;;; (+ *test-domain* offset). The parenthetical notes the historical absolute domain each
+;;; constant replaces and its representative test(s).
+
+;;; integration-test
+(defconstant +td-rxo+ 1
+  "RxO integration test isolation offset (historical absolute domain 42, the prior
+   +rxo-test-domain+): a non-zero domain distinct from the shared base so the RxO pair does
+   not share a multicast group with a foreign domain-0 participant (RTPS 2.5 §9.6.1.1).")
+
+;;; durability-test
+(defconstant +td-collect+ 2
+  "durability collect-tier isolation offset (historical domain 7; also the access-control
+   manager test, which historically shared domain 7).")
+(defconstant +td-transient+ 3
+  "durability transient-relay isolation offset (historical domain 17).")
+(defconstant +td-runner+ 4
+  "durability multi-service runner isolation offset (historical domain 27).")
+(defconstant +td-supervisor+ 5
+  "durability supervisor isolation offset (historical domain 37).")
+(defconstant +td-runner-lifecycle+ 6
+  "durability runner-lifecycle isolation offset (historical domain 47).")
+(defconstant +td-writer-rep+ 7
+  "durability writer-representation isolation offset (historical domain 57; also the
+   process-smoke %spec->argv round-trip fixture, which historically shared domain 57).")
+(defconstant +td-relay-emit+ 8
+  "durability relay-emit isolation offset (historical domain 67).")
+(defconstant +td-no-double-delivery+ 9
+  "durability no-double-delivery isolation offset (historical domain 77; also the
+   auth-secured-refuses-plain test, which historically shared domain 77).")
+(defconstant +td-origin-accessor+ 10
+  "durability original-writer-info accessor isolation offset (historical domain 78; also the
+   auth-plain-byte-identical test, which historically shared domain 78).")
+(defconstant +td-collect-origin-convergence+ 11
+  "durability collect origin-convergence isolation offset (historical domain 79).")
+(defconstant +td-data-keyhash-capture+ 12
+  "durability DATA key-hash capture isolation offset (historical domain 80).")
+(defconstant +td-collect-keyhash-store+ 13
+  "durability collect key-hash store isolation offset (historical domain 81).")
+(defconstant +td-graceful-teardown+ 14
+  "durability graceful-teardown-order isolation offset (historical domain 82).")
+(defconstant +td-multitopic+ 15
+  "durability multitopic isolation offset (historical domain 87; also the access-control
+   local-deny test, which historically shared domain 87).")
+(defconstant +td-dispose-replay+ 16
+  "durability dispose-replay isolation offset (historical domain 97; also the
+   seed-backpressure test, which historically shared domain 97).")
+(defconstant +td-dare-transparency+ 17
+  "DARE service-transparency isolation offset (historical domain 107).")
+(defconstant +td-persistent-service+ 18
+  "durability persistent-service isolation offset (historical domain 117).")
+(defconstant +td-keeplast-policy+ 19
+  "durability keep-last service-spec policy isolation offset (historical domain 119).")
+(defconstant +td-dynamic-topic+ 20
+  "durability dynamic-topic-add isolation offset (historical domain 127).")
+(defconstant +td-relay-tier+ 21
+  "durability relay-tier QoS-override isolation offset (historical domain 137).")
+(defconstant +td-collect-tier+ 22
+  "durability collect-tier QoS-override isolation offset (historical domain 138).")
+(defconstant +td-cfg-domain+ 23
+  "durability config-parser CLI/spec domain fixture offset (historical parser fixtures 7/99/57).")
+(defconstant +td-cfg-env-domain+ 24
+  "durability config-parser ENV domain fixture offset (historical parser fixture 3); distinct
+   from +td-cfg-domain+ so the CLI-overrides-env precedence check keeps CLI /= env.")
+
+;;; gen-test (bench harnesses)
+(defconstant +td-bench-publish-delta+ 25
+  "secured live publish-delta bench isolation offset (historical domain 70).")
+(defconstant +td-bench-receive+ 26
+  "secured live receive bench isolation offset (historical domain 71).")
+(defconstant +td-bench-wrapper-cycle+ 27
+  "secured wrapper-cycle bench isolation offset (historical domain 73).")
+(defconstant +td-mem-secure+ 28
+  "secure mem-test isolation offset (historical domain 99).")
+
+;;; security-test / security-auth-test / security-access-control-test
+(defconstant +td-encrypted-pubsub+ 29
+  "security encrypted pub/sub isolation offset (historical domain 83).")
+(defconstant +td-encrypted-fragmented+ 30
+  "security encrypted-fragmented isolation offset (historical domain 84).")
+(defconstant +td-ac-allow+ 31
+  "access-control ALLOW-pair isolation offset (historical domain 85); distinct from
+   +td-ac-deny+ so the allow/deny test's two pairs do not cross-discover.")
+(defconstant +td-ac-deny+ 32
+  "access-control DENY-pair isolation offset (historical domain 86); distinct from
+   +td-ac-allow+ so the allow/deny test's two pairs do not cross-discover.")
+(defconstant +td-secure-discovery+ 33
+  "secure-discovery e2e isolation offset (historical domain 88; also the access-control
+   default-off test, which historically shared domain 88).")
+(defconstant +td-secured-decode-loan-alloc+ 34
+  "secured decode-loan alloc isolation offset (historical domain 91).")
+(defconstant +td-secured-decode-loan-dup+ 35
+  "secured decode-loan dup isolation offset (historical domain 92).")
+(defconstant +td-secured-zeroalloc-encode+ 36
+  "secured zero-alloc ENCODE-pool-exhaustion isolation offset (historical domain 93);
+   distinct from +td-secured-zeroalloc-decode+ (the same test's two independent parts).")
+(defconstant +td-secured-zeroalloc-decode+ 37
+  "secured zero-alloc DECODE-pool-exhaustion isolation offset (historical domain 94);
+   distinct from +td-secured-zeroalloc-encode+ (the same test's two independent parts).")

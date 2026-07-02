@@ -492,13 +492,13 @@
          (sub-prefix (%make-test-prefix #xE2))
          (plain-prefix (%make-test-prefix #xE3))
          ;; PUB: encodes on publish; SUB: decodes on receive; PLAIN: no crypto (sees raw wire bytes)
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 83
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-encrypted-pubsub+)
                                             :host "127.0.0.1" :port 0 :multicast nil
                                             :crypto-transform shared-km))
-         (sub-node (dds.disc:make-disc-node :guid-prefix sub-prefix :domain 83
+         (sub-node (dds.disc:make-disc-node :guid-prefix sub-prefix :domain (test-domain +td-encrypted-pubsub+)
                                             :host "127.0.0.1" :port 0 :multicast nil
                                             :crypto-transform shared-km))
-         (plain-node (dds.disc:make-disc-node :guid-prefix plain-prefix :domain 83
+         (plain-node (dds.disc:make-disc-node :guid-prefix plain-prefix :domain (test-domain +td-encrypted-pubsub+)
                                               :host "127.0.0.1" :port 0 :multicast nil)))
     (unwind-protect
          (progn
@@ -661,7 +661,7 @@
          (src (%make-test-prefix #xA1))
          (wid #x00000102)
          (node (let ((dds.disc:*shmem-enabled* nil))
-                 (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xE7) :domain 91
+                 (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xE7) :domain (test-domain +td-secured-decode-loan-alloc+)
                                           :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
     (unwind-protect
          (let ((cap 1) (head 1))   ; capture the tiny-pool sizing — the specials revert to defaults after the carve, so the cap assertion must read these
@@ -723,7 +723,7 @@
          (src (%make-test-prefix #xA2))
          (wid #x00000102)
          (node (let ((dds.disc:*shmem-enabled* nil))
-                 (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xE8) :domain 92
+                 (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xE8) :domain (test-domain +td-secured-decode-loan-dup+)
                                           :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
     (unwind-protect
          (progn
@@ -777,10 +777,10 @@
                (dotimes (i pt-size v) (setf (aref v i) (logand (* i 7) #xff)))))
          (pub-prefix (%make-test-prefix #xF1))
          (sub-prefix (%make-test-prefix #xF2))
-         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain 84
+         (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-encrypted-fragmented+)
                                             :host "127.0.0.1" :port 0 :multicast nil
                                             :crypto-transform shared-km))
-         (sub-node (dds.disc:make-disc-node :guid-prefix sub-prefix :domain 84
+         (sub-node (dds.disc:make-disc-node :guid-prefix sub-prefix :domain (test-domain +td-encrypted-fragmented+)
                                             :host "127.0.0.1" :port 0 :multicast nil
                                             :crypto-transform shared-km)))
     (unwind-protect
@@ -979,7 +979,7 @@
                         (format nil "the T5d loan-wrapper cycle must be zero-alloc; measured ~,4f B/sample" wrap-bps)))))))
     ;; -- Part B: ENCODE pool exhaustion -> publish-sample :timeout (RESOURCE_LIMITS), never GC --
     (let ((node (let ((dds.disc:*shmem-enabled* nil) (dds.disc:*secured-pool-capacity* 2) (dds.disc:*secured-pool-headroom* 1))
-                  (let ((n (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xEA) :domain 93
+                  (let ((n (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xEA) :domain (test-domain +td-secured-zeroalloc-encode+)
                                                     :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km)))
                     (dds.disc:add-local-writer n :topic "ZAEnc" :type "X")
                     (dds.disc:enable-publisher n :history-kind :keep-all)   ; carve encode pool of capacity 2+1 = 3
@@ -1006,7 +1006,7 @@
            (cbig (dds.security:encode-serialized-payload km big))
            (src (%make-test-prefix #xAB)) (wid #x00000102)
            (node (let ((dds.disc:*shmem-enabled* nil))
-                   (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xEB) :domain 94
+                   (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xEB) :domain (test-domain +td-secured-zeroalloc-decode+)
                                             :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
       (unwind-protect
            (let ((guid (dds.disc::%source-guid src wid)) (cap 1) (head 1))

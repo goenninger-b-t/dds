@@ -1524,6 +1524,17 @@
     (loop for v being the hash-values of (disc-node-matches node)
           collect (dds.rtps.discovery:endpoint-data-topic-name v))))
 
+(defun* %disc-node-matched-count-for-prefix (node prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) (integer 0))
+  "TEST-SUPPORT: how many of NODE's matched remote endpoints carry PREFIX as their
+   12-octet participant GUID-prefix (RTPS 2.5 §9.3.1.2) — a peer-scoped matched-count
+   that excludes foreign participants sharing the domain. Lock-guarded like
+   disc-node-matched-count; reuses %guid-prefix-match-p over the match keys (the remote
+   16-octet endpoint GUIDs)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (loop for guid being the hash-keys of (disc-node-matches node)
+          count (%guid-prefix-match-p guid prefix))))
+
 (defun* run-spdp-discovery-test ()
     (function () (eql t))
   "Two participants on 127.0.0.1, each carrying the other as a unicast peer. Both

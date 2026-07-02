@@ -2175,8 +2175,8 @@
                      (format nil "validate-local-identity B failed: ~a" reason-b))
              (unless id-b (return-from run-auth-manager-handshake-test t))
              (unwind-protect
-             (let ((p-a (dds.dcps:create-participant :domain 0 :identity id-a))
-                   (p-b (dds.dcps:create-participant :domain 0 :identity id-b)))
+             (let ((p-a (dds.dcps:create-participant :domain (test-domain) :identity id-a))
+                   (p-b (dds.dcps:create-participant :domain (test-domain) :identity id-b)))
                (unwind-protect
                     (let ((prefix-a (dds.disc:disc-node-guid-prefix (dds.dcps::dp-node p-a)))
                           (prefix-b (dds.disc:disc-node-guid-prefix (dds.dcps::dp-node p-b))))
@@ -2266,8 +2266,8 @@
                      (format nil "validate-local-identity B failed: ~a" reason-b))
              (unless id-b (return-from run-auth-encrypted-pubsub-keyx-test t))
              (unwind-protect
-                  (let ((p-a (dds.dcps:create-participant :domain 0 :identity id-a))
-                        (p-b (dds.dcps:create-participant :domain 0 :identity id-b)))
+                  (let ((p-a (dds.dcps:create-participant :domain (test-domain) :identity id-a))
+                        (p-b (dds.dcps:create-participant :domain (test-domain) :identity id-b)))
                     (unwind-protect
                          (let* ((node-a (dds.dcps::dp-node p-a))
                                 (node-b (dds.dcps::dp-node p-b))
@@ -2442,8 +2442,8 @@
              (%check :sdk-id-b (not (null id-b)) (format nil "validate-local-identity B failed: ~a" reason-b))
              (unless id-b (return-from run-secure-discovery-keyed-test t))
              (unwind-protect
-                  (let ((p-a (dds.dcps:create-participant :domain 0 :identity id-a))
-                        (p-b (dds.dcps:create-participant :domain 0 :identity id-b)))
+                  (let ((p-a (dds.dcps:create-participant :domain (test-domain) :identity id-a))
+                        (p-b (dds.dcps:create-participant :domain (test-domain) :identity id-b)))
                     (unwind-protect
                          (let* ((node-a (dds.dcps::dp-node p-a))
                                 (node-b (dds.dcps::dp-node p-b))
@@ -2962,10 +2962,10 @@
                  (p-c nil) (p-d nil))
              (unwind-protect
                   (progn
-                    (setf p-sec   (dds.dcps:create-participant :domain 77 :identity id-sec))
-                    (setf p-plain (dds.dcps:create-participant :domain 77))
-                    (setf p-c     (dds.dcps:create-participant :domain 77))
-                    (setf p-d     (dds.dcps:create-participant :domain 77))
+                    (setf p-sec   (dds.dcps:create-participant :domain (test-domain +td-no-double-delivery+) :identity id-sec))
+                    (setf p-plain (dds.dcps:create-participant :domain (test-domain +td-no-double-delivery+)))
+                    (setf p-c     (dds.dcps:create-participant :domain (test-domain +td-no-double-delivery+)))
+                    (setf p-d     (dds.dcps:create-participant :domain (test-domain +td-no-double-delivery+)))
                     (let* ((node-sec   (dds.dcps::dp-node p-sec))
                          (node-plain (dds.dcps::dp-node p-plain))
                          (node-c     (dds.dcps::dp-node p-c))
@@ -3040,8 +3040,8 @@
         (p-r nil))
     (unwind-protect
          (progn
-           (setf p-w (dds.dcps:create-participant :domain 78))
-           (setf p-r (dds.dcps:create-participant :domain 78))
+           (setf p-w (dds.dcps:create-participant :domain (test-domain +td-origin-accessor+)))
+           (setf p-r (dds.dcps:create-participant :domain (test-domain +td-origin-accessor+)))
            (let* ((node-w (dds.dcps::dp-node p-w))
                 (node-r (dds.dcps::dp-node p-r))
                 (topic  "PlainIdTopic")
@@ -3195,12 +3195,12 @@
              (unless id-b (return-from %run-secure-discovery-e2e t))
              (unwind-protect
                   (let ((p-a (dds.dcps:create-participant
-                              :domain 88 :identity id-a
+                              :domain (test-domain +td-secure-discovery+) :identity id-a
                               :permissions-ca perm-ca :governance gov-p7s :permissions perm-p7s))
                         (p-b (dds.dcps:create-participant
-                              :domain 88 :identity id-b
+                              :domain (test-domain +td-secure-discovery+) :identity id-b
                               :permissions-ca perm-ca :governance gov-p7s :permissions perm-p7s))
-                        (p-plain (dds.dcps:create-participant :domain 88)))   ; plain control: no identity
+                        (p-plain (dds.dcps:create-participant :domain (test-domain +td-secure-discovery+))))   ; plain control: no identity
                     (unwind-protect
                          (let* ((node-a (dds.dcps::dp-node p-a))
                                 (node-b (dds.dcps::dp-node p-b))

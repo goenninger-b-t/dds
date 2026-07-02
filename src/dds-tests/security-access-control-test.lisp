@@ -348,7 +348,7 @@
     (%check :am-grants-4 (= 4 (length grants))
             (format nil "expected 4 grants in the shared Permissions; got ~d" (length grants)))
     (%check :am-ec-grant (not (null ec-grant)) "EC grant must be present in the shared Permissions")
-    (let ((p (dds.dcps:create-participant :domain 7)))
+    (let ((p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
       (unwind-protect
            (let* ((node   (dds.dcps::dp-node p))
                   (prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xAA))
@@ -515,16 +515,16 @@
                                 ;; create-participant installs identity + AC (validate-local-permissions,
                                 ;; check_create_participant, and %install-access-control) fail-closed
                                 (let ((p-sq-a (dds.dcps:create-participant
-                                               :domain 85 :identity id-sq-a
+                                               :domain (test-domain +td-ac-allow+) :identity id-sq-a
                                                :permissions-ca perm-ca :governance gov-p7s :permissions perm-p7s))
                                       (p-sq-b (dds.dcps:create-participant
-                                               :domain 85 :identity id-sq-b
+                                               :domain (test-domain +td-ac-allow+) :identity id-sq-b
                                                :permissions-ca perm-ca :governance gov-p7s :permissions perm-p7s))
                                       (p-ci-a (dds.dcps:create-participant
-                                               :domain 86 :identity id-ci-a
+                                               :domain (test-domain +td-ac-deny+) :identity id-ci-a
                                                :permissions-ca perm-ca :governance gov-p7s :permissions perm-p7s))
                                       (p-ci-b (dds.dcps:create-participant
-                                               :domain 86 :identity id-ci-b
+                                               :domain (test-domain +td-ac-deny+) :identity id-ci-b
                                                :permissions-ca perm-ca :governance gov-p7s :permissions perm-p7s)))
                                   (unwind-protect
                                        (let* ((node-sq-a (dds.dcps::dp-node p-sq-a))
@@ -674,7 +674,7 @@
       (unless id-ld (return-from run-access-control-local-deny-test t))
       (unwind-protect
            (let ((p-ld (dds.dcps:create-participant
-                        :domain 87 :identity id-ld
+                        :domain (test-domain +td-multitopic+) :identity id-ld
                         :permissions-ca perm-ca :governance gov-p7s :permissions perm-p7s)))
              (unwind-protect
                   (let* ((pub      (dds.dcps:create-publisher p-ld))
@@ -733,8 +733,8 @@
         (p-off-r nil))
     (unwind-protect
          (progn
-           (setf p-off-w (dds.dcps:create-participant :domain 88))
-           (setf p-off-r (dds.dcps:create-participant :domain 88))
+           (setf p-off-w (dds.dcps:create-participant :domain (test-domain +td-secure-discovery+)))
+           (setf p-off-r (dds.dcps:create-participant :domain (test-domain +td-secure-discovery+)))
            (let* ((node-w (dds.dcps::dp-node p-off-w))
                   (node-r (dds.dcps::dp-node p-off-r))
                   (pt     (make-array 8 :element-type '(unsigned-byte 8)

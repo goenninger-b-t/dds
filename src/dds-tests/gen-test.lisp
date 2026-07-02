@@ -283,7 +283,7 @@
   (let ((node (let ((dds.disc:*shmem-enabled* nil))
                 (dds.disc:make-disc-node
                  :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC1)
-                 :domain 70 :host "127.0.0.1" :port 0 :multicast nil))))
+                 :domain (test-domain +td-bench-publish-delta+) :host "127.0.0.1" :port 0 :multicast nil))))
     (unwind-protect
          (progn
            (dds.disc:add-local-writer node :topic "ZeroAllocPub" :type "X")
@@ -331,7 +331,7 @@
   (let ((node (let ((dds.disc:*shmem-enabled* nil))
                 (dds.disc:make-disc-node
                  :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC2)
-                 :domain 71 :host "127.0.0.1" :port 0 :multicast nil :crypto-transform (and crypto km))))
+                 :domain (test-domain +td-bench-receive+) :host "127.0.0.1" :port 0 :multicast nil :crypto-transform (and crypto km))))
         (wid #x00000102)
         (src (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA1)))
     (unwind-protect
@@ -359,7 +359,7 @@
   (let ((node (let ((dds.disc:*shmem-enabled* nil))
                 (dds.disc:make-disc-node
                  :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xC4)
-                 :domain 73 :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km)))
+                 :domain (test-domain +td-bench-wrapper-cycle+) :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km)))
         (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1)))
     (unwind-protect
          (progn
@@ -462,7 +462,7 @@
       ;; then run zero-alloc. Build that exact shape and measure the steady-state pooled encode (SBCL only: this
       ;; binds one ephemeral UDP socket via make-disc-node, and bytes-consed is only meaningful on SBCL).
       (when (eq (dds.pal:pal-impl-name) :sbcl)
-        (let ((node (dds.disc:make-disc-node :domain 99)))
+        (let ((node (dds.disc:make-disc-node :domain (test-domain +td-mem-secure+))))
           (unwind-protect
                (progn
                  (dds.disc:enable-publisher node :history-kind :keep-all)        ; crypto OFF at enable -> no pool
