@@ -1,0 +1,12 @@
+captures/
+# external rtiddsgen build artifacts (clean-room: generated type support never checked in).
+# KEEP: HelloWorld.idl, hello_secure_pub.cxx, Makefile, run-connext-interop.sh, USER_QOS_PROFILES.xml.
+HelloWorld.cxx
+HelloWorld.hpp
+HelloWorldPlugin.cxx
+HelloWorldPlugin.hpp
+*.o
+objs/
+.gen.stamp
+hello_secure_pub
+lib*.dylib

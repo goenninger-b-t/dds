@@ -260,6 +260,39 @@
         "dds.sec.auth")
   "message_class_id for authentication handshake ParticipantStatelessMessage (DDS-Security 1.1 §7.4.4 / §9.3).")
 
+;;; --- §8.7.2.3 AuthRequestMessageToken sub-protocol (challenge-binding / anti-replay) ---
+;;; A full participant precommits its handshake challenge by first sending an AuthRequestMessageToken
+;;; carrying a future_challenge nonce; the peer then requires the handshake challenge to EQUAL that
+;;; nonce (byte-for-byte, no hashing). §8.7.2.3-OPTIONAL: a peer that omits it (Fast DDS v3.6.1) must
+;;; NOT be false-rejected, but a peer that sends it (RTI Connext) enforces the binding. Corroborated
+;;; against OpenDDS AuthenticationBuiltInImpl.cpp (validate_remote_identity/begin_handshake_request/
+;;; begin_handshake_reply, challenges_match) + DdsSecurityCore.idl (read-only, no code copied;
+;;; provenance docs/provenance.md); RTI source NEVER read.
+
+(defconstant +auth-request-message-class-id+
+    (if (boundp '+auth-request-message-class-id+)
+        (symbol-value '+auth-request-message-class-id+)
+        "dds.sec.auth_request")
+  "message_class_id for the §8.7.2.3 AuthRequestMessageToken ParticipantStatelessMessage (DDS-Security
+   1.1 §8.7.2.3 / §7.4.4; OpenDDS GMCLASSID_SECURITY_AUTH_REQUEST). Distinct from the +auth-message-class-id+
+   (\"dds.sec.auth\") that carries the three handshake tokens.")
+
+(defconstant +auth-request-class-id+
+    (if (boundp '+auth-request-class-id+)
+        (symbol-value '+auth-request-class-id+)
+        "DDS:Auth:PKI-DH:1.0+AuthReq")
+  "AuthRequestMessageToken DataHolder class_id (DDS-Security 1.1 §8.7.2.3). Ours emits plugin version 1.0;
+   live RTI Connext 7.3.1 emits 1.2 — the plugin family + \"+AuthReq\" role is the interop contract (matched
+   version-tolerant, same rule as the handshake class_ids). The class_id is NEVER a trust boundary.")
+
+(defconstant +prop-future-challenge+
+    (if (boundp '+prop-future-challenge+)
+        (symbol-value '+prop-future-challenge+)
+        "future_challenge")
+  "AuthRequestMessageToken binary-property name carrying the 256-bit (32-octet) precommitment nonce
+   (DDS-Security 1.1 §8.7.2.3; OpenDDS names it \"future_challenge\"). The handshake challenge1 (requester)
+   / challenge2 (replier) MUST equal this nonce byte-for-byte (§8.7.2.4 / §8.7.2.5).")
+
 ;;; --- DataHolder wire layout (§9.3.4 / OMG dds_security_plugins_spis.idl) ---
 ;;; CDR-LE DataHolder: class_id (string) + PropertySeq (count=0 for HST) + BinaryPropertySeq.
 ;;; For HandshakeMessageToken: PropertySeq is empty (count=0 u32-LE); BinaryPropertySeq carries all values.

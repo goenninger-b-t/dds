@@ -89,6 +89,31 @@
   (dds.core.buffer:put-octets cursor guid-prefix 0 12)
   (dds.core.buffer:cursor-position cursor))
 
+(defun* put-info-src-into (vec off guid-prefix)
+    (function ((simple-array (unsigned-byte 8) (*)) fixnum (simple-array (unsigned-byte 8) (*))) (integer 24 24))
+  "Write a 24-octet INFO_SRC submessage (RTPS 2.5 §9.4.5.9 / §8.3.7.9) into VEC at raw offset OFF declaring
+   GUID-PREFIX (12 octets) as the source of the subsequent submessages, little-endian (E flag set). Layout:
+   SubmessageHeader[INFO_SRC=0x0c, flags=E, octetsToNextHeader=20] ‖ unused(4)=0 ‖ ProtocolVersion(2) ‖
+   VendorId(2) ‖ GuidPrefix(12) = 24 octets. Zero-alloc raw-offset writer (no cursor) for the whole-RTPS-message
+   (SRTPS) send path %MAYBE-WRAP-SRTPS. Its purpose is to bind the protected submessages to their source so an
+   RTPS message can be relayed / whole-RTPS-protected: DDS-Security 1.1 §9.5.3.3.5 has the encoded RTPS payload
+   begin with this source-declaring INFO_SRC, and a strict rtps_protection peer (live RTI Connext) rejects a
+   protected payload whose first recovered submessage is not it (decode_rtps_message 'wrong INFO_SRC'). Returns 24
+   (octets written); the CALLER ensures OFF+24 <= (length VEC)."
+  (assert (= 12 (length guid-prefix)))
+  (setf (aref vec off)        +submsg-info-src+
+        (aref vec (+ off 1))  +flag-endianness+            ; E=1 little-endian
+        (aref vec (+ off 2))  20                            ; octetsToNextHeader = 20 (LE low)
+        (aref vec (+ off 3))  0                             ; octetsToNextHeader (LE high)
+        (aref vec (+ off 4))  0 (aref vec (+ off 5)) 0      ; unused (reserved, ignored)
+        (aref vec (+ off 6))  0 (aref vec (+ off 7)) 0
+        (aref vec (+ off 8))  +protocol-version-major+
+        (aref vec (+ off 9))  +protocol-version-minor+
+        (aref vec (+ off 10)) (ldb (byte 8 8) *vendor-id*)
+        (aref vec (+ off 11)) (ldb (byte 8 0) *vendor-id*))
+  (replace vec guid-prefix :start1 (+ off 12) :end1 (+ off 24) :start2 0 :end2 12)
+  24)
+
 (defun* parse-header (cursor)
     (function (dds.core.buffer:cursor) t)
   "Parse a 20-octet RTPS Header. Returns (values major minor vendor guid-prefix),

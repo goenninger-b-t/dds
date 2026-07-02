@@ -78,7 +78,7 @@ XML
 write_governance "${PKI_DIR}/governance-secure.xml" \
   "ENCRYPT" "SIGN" "ENCRYPT" "true" "ENCRYPT" "ENCRYPT"
 write_governance "${PKI_DIR}/governance-sign.xml" \
-  "SIGN" "SIGN" "ENCRYPT" "true" "ENCRYPT" "ENCRYPT"
+  "SIGN" "SIGN" "SIGN" "true" "ENCRYPT" "ENCRYPT"
 write_governance "${PKI_DIR}/governance-origin-auth.xml" \
   "ENCRYPT_WITH_ORIGIN_AUTHENTICATION" "SIGN_WITH_ORIGIN_AUTHENTICATION" "ENCRYPT_WITH_ORIGIN_AUTHENTICATION" \
   "true" "ENCRYPT" "ENCRYPT"

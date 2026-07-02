@@ -73,6 +73,38 @@
     (some (lambda (sp) (%am-remote-keyed-p p (dds.rtps.discovery:spdp-data-guid-prefix sp)))
           (dds.disc:node-discovered-participants node))))
 
+(defun* %sample-plaintext (x)
+    (function (t) (values (simple-array (unsigned-byte 8) (*)) (integer 0)))
+  "Extract (values OCTETS LEN) from one node-take-loaned element X: a secured-loan-handle (read the plaintext
+   IN PLACE over [0,LEN), zero copy) or a bare plaintext octet-vector (the non-loan / arena-carve-fail form)."
+  (if (dds.disc:secured-loan-handle-p x)
+      (values (dds.disc:secured-loan-bytes x) (dds.disc:secured-loan-handle-len x))
+      (values x (length x))))
+
+(defun* %decode-hello-world (payload len)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0))
+              (values (or null (unsigned-byte 32)) (or null string)))
+  "Deserialize a HelloWorld SerializedPayload PAYLOAD[0,LEN) (the plaintext of a decoded user sample; the
+   inverse of %hello-world-payload) into (values INDEX MESSAGE). Reads the XTypes 1.3 §7.6.3.1.2 Table 60
+   encapsulation id at octet 1 for endianness (LE iff its low bit is 1) and whether an XCDR2 DELIMITED/PL
+   DHEADER prefixes the body (D_CDR2 0x08/0x09, PL_CDR2 0x0a/0x0b -> skip 4), then INDEX(uint32) ‖ strlen
+   (uint32, incl NUL) ‖ chars ‖ NUL. Defensive: returns NIL fields when PAYLOAD is too short to hold them (a
+   real decode failure already dropped fail-closed upstream; this is display-only, never a security gate)."
+  (when (< len 12) (return-from %decode-hello-world (values nil nil)))
+  (let* ((eid (aref payload 1))
+         (le (logbitp 0 eid))
+         (base (if (member eid '(#x08 #x09 #x0a #x0b)) 8 4)))
+    (flet ((u32 (o) (if le
+                        (logior (aref payload o) (ash (aref payload (+ o 1)) 8)
+                                (ash (aref payload (+ o 2)) 16) (ash (aref payload (+ o 3)) 24))
+                        (logior (ash (aref payload o) 24) (ash (aref payload (+ o 1)) 16)
+                                (ash (aref payload (+ o 2)) 8) (aref payload (+ o 3))))))
+      (when (> (+ base 8) len) (return-from %decode-hello-world (values nil nil)))
+      (let ((index (u32 base)) (slen (u32 (+ base 4))) (soff (+ base 8)))
+        (when (or (< slen 1) (> (+ soff slen) len))
+          (return-from %decode-hello-world (values index nil)))
+        (values index (map 'string #'code-char (subseq payload soff (+ soff (1- slen)))))))))
+
 (defun* run-secure-interop-peer (&key (role "sub") (domain 0)
                                       ca cert key perm-ca governance permissions
                                       (topic "HelloWorldTopic") (type "HelloWorld")
@@ -147,7 +179,7 @@
                     (finish-output)
                     (let ((deadline (+ (get-internal-real-time)
                                        (* seconds internal-time-units-per-second)))
-                          (sent 0) (last-tick 0) (peak-match 0) (peak-samples 0) (ever-keyed nil))
+                          (sent 0) (last-tick 0) (peak-match 0) (peak-samples 0) (ever-keyed nil) (recv 0))
                       (loop
                         (dds.dcps:spin p)
                         (when (and pubp (< sent samples)
@@ -168,11 +200,25 @@
                               (finish-output))))
                         (when (> (get-internal-real-time) deadline) (return))
                         (sleep interval))
-                      (format t "~&SUMMARY: role=~a discovered=~d peak-matched=~d peak-samples=~d ever-keyed=~a sent=~d~%"
-                              role (dds.dcps:discovered-count p) peak-match peak-samples ever-keyed sent)
-                      ;; RESULT: a pub succeeds when it matched + sent; a sub succeeds when it matched + received.
+                      ;; Reverse-direction oracle (M7/P6 Slice 5b): decode + print the AEAD-decrypted Connext
+                      ;; user samples (index+message) — the live decode is the proof ours OPENED Connext's
+                      ;; GOV=secure protected DATA. Bare-vec or loan-handle; the take/return leaves the reliable
+                      ;; state intact (return-loan releases any loan handle; bare vecs are read-only peeks).
+                      (unless pubp
+                        (multiple-value-bind (data cnt) (dds.disc:node-take-loaned node)
+                          (dotimes (i cnt)
+                            (multiple-value-bind (bytes blen) (%sample-plaintext (svref data i))
+                              (multiple-value-bind (idx msg) (%decode-hello-world bytes blen)
+                                (incf recv)
+                                (format t "~&[sub] decoded HelloWorld #~d index=~a message=~s~%" recv idx msg))))
+                          (finish-output)
+                          (dds.disc:node-return-loan node data cnt)))
+                      (format t "~&SUMMARY: role=~a discovered=~d peak-matched=~d peak-samples=~d ever-keyed=~a sent=~d decoded=~d~%"
+                              role (dds.dcps:discovered-count p) peak-match peak-samples ever-keyed sent recv)
+                      ;; RESULT: a pub succeeds when it matched + sent; a sub succeeds when it matched + received
+                      ;; (peak-samples = delivered/AEAD-decrypted; recv = decoded-at-drain — either proves receipt).
                       (let ((ok (if pubp (and (plusp peak-match) (plusp sent))
-                                    (and (plusp peak-match) (plusp peak-samples)))))
+                                    (and (plusp peak-match) (or (plusp peak-samples) (plusp recv))))))
                         (format t "~&RESULT: ~a~%" (if ok "PASS" "FAIL")) (finish-output)
                         (return-from run-secure-interop-peer ok)))) ; through both unwind-protects
                (ignore-errors (dds.dcps:delete-participant p))))

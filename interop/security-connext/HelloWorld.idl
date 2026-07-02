@@ -1,0 +1,15 @@
+// Clean-room IDL for the M7/P6 Slice 5b reverse-direction Connext PUBLISHER (external
+// rtiddsgen interop peer; NOT part of the clean-room Lisp stack — see docs/provenance.md).
+//
+// Transcribed from OUR interop type definition (src/dds-tests/secure-interop.lisp): the
+// Fast DDS example @extensibility(APPENDABLE) struct HelloWorld { unsigned long index;
+// string message; } on topic "HelloWorldTopic", type name "HelloWorld", NO_KEY (no @key
+// member), XCDR1/PLAIN_CDR. Authored from the type definition, never copied from RTI
+// source or rtiddsgen output. No @key member => rtiddsgen registers a NO_KEY DataWriter
+// (RTPS 2.5 §9.3.1.2 writer kind 0x03), matching our NO_KEY reader (kind 0x04).
+
+@appendable
+struct HelloWorld {
+    unsigned long index;
+    string message;
+};

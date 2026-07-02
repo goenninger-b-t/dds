@@ -356,9 +356,22 @@
                                           (dds.core.buffer:cursor-position pc)))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec plbuf)))))
 
-(defun* %send-secure-bracket (node km kind plain receivers host port &key reader)
+(defconstant +secure-metatraffic-buffer-slack+ 160
+  "Octet slack the fresh per-call secure-metatraffic send buffer reserves ABOVE the submessage-protected bracket
+   length so the OUTER T10 whole-RTPS-message (rtps_protection) SRTPS wrap can be applied IN PLACE (§8.5.1.10-.12).
+   %maybe-wrap-srtps overwrites [20,…) of BUF, growing it by the RTPS Header(20) + the §9.5.3.3.5 source-binding
+   INFO_SRC prepended to the plaintext (24) + the max SRTPS ENCRYPT overhead = SRTPS_PREFIX(4+CryptoHeader 20 = 24)
+   + SEC_BODY(4 hdr + 4 CryptoContent-len + ≤3 pad = ≤11) + SRTPS_POSTFIX(4 hdr + common_mac 16 + count 4 = 24),
+   plus the *_WITH_ORIGIN_AUTHENTICATION receiver-MAC footer (≤ +20) — ≤ ~123 octets total; 160 is that worst
+   case + margin. NOT a wire constant (a local buffer-size policy). The
+   pre-Phase-4 slack was 64, which fit an UNWRAPPED bracket only — too small once secure metatraffic is SRTPS-
+   wrapped, so %maybe-wrap-srtps silently fail-closed-DROPPED the datagram (the datagram never reached a keyed
+   Connext peer, matched=0). §8.5.1.10-.12.")
+
+(defun* %send-secure-bracket (node km kind plain receivers host port dest-prefix &key reader)
     (function (disc-node dds.security:key-material (member :sign :encrypt)
                (simple-array (unsigned-byte 8) (*)) list string (unsigned-byte 16)
+               (or null (simple-array (unsigned-byte 8) (12)))
                &key (:reader t)) t)
   "Submessage-PROTECT one PLAINTEXT submessage PLAIN under the LOCAL secure-builtin EntityCrypto KM per the
    governance-EFFECTIVE KIND (the T2/T3 codec, DDS-Security 1.1 §8.5.1.7/.8) and send the SEC_PREFIX ...
@@ -374,29 +387,43 @@
    Default session_id is safe (each EntityCrypto KM is INDEPENDENT per endpoint — no symmetric-key nonce hazard,
    unlike PVMS). The shared PROTECT+SEND tail of every secure builtin submessage (SEDP DATA / participant-message
    / SPDP / the secure-SEDP reliability HEARTBEAT+ACKNACK — DRY, T11). A no-op (still T) if the codec returns
-   NIL. Fresh per-call buffer (control-plane), freed."
+   NIL. Fresh per-call buffer (control-plane), freed.
+   DEST-PREFIX (the 12-octet destination-participant GUID-prefix) threads to %send-msg-buf -> %send-raw-buf so
+   T10 whole-RTPS-message protection (rtps_protection, DDS-Security 1.1 §8.5.1.10-.12 / §9.4.1.2.3) SRTPS-wraps
+   the WHOLE datagram when DEST-PREFIX is :keyed under a non-NONE governance rtps_protection_kind — the secure
+   metatraffic (secure-SEDP / secure-PM / secure-SPDP) is then DOUBLY protected (inner submessage-protection +
+   outer whole-RTPS), which a strict rtps_protection=ENCRYPT peer (live RTI Connext) REQUIRES: it DROPS a
+   non-SRTPS metatraffic datagram from a keyed participant ('received unencoded rtps message. Unacceptable due
+   to is_rtps_*_protected = true'). NIL / not-keyed / rtps_protection NONE -> %maybe-wrap-srtps no-ops
+   (byte-identical plain), so DEST-PREFIX is safe to thread unconditionally; the inner SEC_* bracket carries no
+   user-plane submessage id, so the metadata_protection walk (%maybe-wrap-user-submessages) is a verbatim no-op."
   (let ((secured (if reader
                      (dds.security:encode-datareader-submessage km kind plain :receivers receivers)
                      (dds.security:encode-datawriter-submessage km kind plain :receivers receivers))))
     (when secured
-      (let ((buf (dds.core.buffer:make-octet-buffer (+ 64 (length secured)))))
+      (let ((buf (dds.core.buffer:make-octet-buffer (+ +secure-metatraffic-buffer-slack+ (length secured)))))
         (unwind-protect
              (%send-msg-buf node buf
                             (lambda (mc) (dds.core.buffer:put-octets mc secured 0 (length secured)))
-                            host port)
+                            host port dest-prefix)
           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf))))))
   t)
 
-(defun* %send-secure-endpoint (node km kind reader-id writer-id ep sn host port receivers)
+(defun* %send-secure-endpoint (node km kind reader-id writer-id ep sn host port receivers dest-prefix)
     (function (disc-node dds.security:key-material (member :sign :encrypt) (unsigned-byte 32) (unsigned-byte 32)
-               dds.rtps.discovery:endpoint-data integer string (unsigned-byte 16) list) t)
+               dds.rtps.discovery:endpoint-data integer string (unsigned-byte 16) list
+               (or null (simple-array (unsigned-byte 8) (12)))) t)
   "Announce ONE local endpoint EP over the SECURE SEDP writer WRITER-ID to HOST:PORT: build the plaintext
    SEDP DATA submessage (%build-secure-sedp-data) with the STABLE per-writer SN, then submessage-PROTECT + send
    it (%send-secure-bracket) under the LOCAL secure-SEDP EntityCrypto KM per the governance-EFFECTIVE KIND
    (RECEIVERS = the matched-remote READER's origin-auth descriptors, §9.5.3.3.4.3 / T-ORIGINAUTH). Re-announcing
    an endpoint RESENDS the same SN (a retransmission), like plain SEDP %send-endpoint, so a reliable peer never
-   gaps. A no-op (still T) if the codec returns NIL."
-  (%send-secure-bracket node km kind (%build-secure-sedp-data reader-id writer-id sn ep) receivers host port))
+   gaps. DEST-PREFIX (the destination-participant GUID-prefix) threads to %send-secure-bracket for the outer
+   T10 whole-RTPS-message (rtps_protection) SRTPS wrap on this secure-SEDP DATA when the peer is :keyed under a
+   non-NONE rtps_protection_kind (§8.5.1.10-.12) — required by a strict rtps_protection=ENCRYPT peer. A no-op
+   (still T) if the codec returns NIL."
+  (%send-secure-bracket node km kind (%build-secure-sedp-data reader-id writer-id sn ep) receivers host port
+                        dest-prefix))
 
 (defun* %secure-endpoints-for (node protp accessor)
     (function (disc-node function function) list)
@@ -448,7 +475,7 @@
                       (%send-secure-endpoint node wkm kind
                                              dds.rtps.discovery:+entityid-sedp-pub-secure-reader+
                                              dds.rtps.discovery:+entityid-sedp-pub-secure-writer+
-                                             w wsn (car hp) (cdr hp) wreceivers))))
+                                             w wsn (car hp) (cdr hp) wreceivers prefix))))
                 (when rkm
                   (let ((rreceivers (and recv (funcall recv
                                                        dds.rtps.discovery:+entityid-sedp-sub-secure-writer+
@@ -457,7 +484,7 @@
                       (%send-secure-endpoint node rkm kind
                                              dds.rtps.discovery:+entityid-sedp-sub-secure-reader+
                                              dds.rtps.discovery:+entityid-sedp-sub-secure-writer+
-                                             r rsn (car hp) (cdr hp) rreceivers)))))))))))
+                                             r rsn (car hp) (cdr hp) rreceivers prefix)))))))))))
   t)
 
 ;;; --- T9pull: secure-SEDP RELIABILITY (HEARTBEAT/ACKNACK over the protected builtin endpoints) ---
@@ -494,7 +521,7 @@
           (%builtin-acknack-values node src-prefix wid first last)
         (%send-secure-bracket node km kind
                               (%build-plain-acknack-sm reader-eid wid base numbits bitmap count)
-                              '() (car hp) (cdr hp) :reader t))))
+                              '() (car hp) (cdr hp) src-prefix :reader t))))
   t)
 
 (defun* %on-secure-builtin-acknack (node src-prefix c flags)
@@ -531,7 +558,7 @@
                   (let ((sn (+ base i)))
                     (when (<= 1 sn n)
                       (%send-secure-endpoint node km kind reader-id wid (nth (1- sn) eps) sn
-                                             (car hp) (cdr hp) receivers)))))))))))
+                                             (car hp) (cdr hp) receivers src-prefix)))))))))))
   t)
 
 (defun* %send-secure-builtin-heartbeats (node)
@@ -566,7 +593,7 @@
                     (%send-secure-bracket node km kind
                                           (%build-plain-heartbeat-sm reader-eid wid 1 n
                                                                      (incf (disc-node-ack-count node)))
-                                          receivers (car hp) (cdr hp)))))))))))
+                                          receivers (car hp) (cdr hp) prefix))))))))))
   t)
 
 ;;; --- T11: secure participant-message (Writer Liveliness Protocol) over 0xff0200 ---
@@ -616,7 +643,7 @@
                         dds.rtps.discovery:+entityid-participant-message-secure-reader+
                         dds.rtps.discovery:+entityid-participant-message-secure-writer+
                         sn octets 0 (length octets))
-                       receivers (car hp) (cdr hp))))))))))))
+                       receivers (car hp) (cdr hp) prefix)))))))))))
   t)
 
 ;;; --- T11: secure SPDP re-announce over 0xff0101 (protected ParticipantBuiltinTopicData; plain SPDP bootstraps) ---
@@ -679,7 +706,7 @@
                       dds.rtps.discovery:+entityid-spdp-secure-reader+
                       dds.rtps.discovery:+entityid-spdp-secure-writer+
                       sn octets 0 (length octets))
-                     receivers (car hp) (cdr hp)))))))))))
+                     receivers (car hp) (cdr hp) prefix))))))))))
   t)
 
 ;;; --- test (deterministic disc-level round-trip + confidentiality + plain-omission + non-secure control) ---

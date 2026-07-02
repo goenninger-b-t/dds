@@ -34,8 +34,10 @@
    %MATCH-REMOTE-ENDPOINT; both directions, receiver thread, OUTSIDE the node lock). Verdict ladder:
      local NOT access-controlled (no DP-ACCESS-STATE)        -> :compatible (AC OFF, byte-identical);
      no auth manager (DP-AUTH-STATE NIL — misconfig: AC needs auth) -> :pending (fail-closed, never matches);
-     remote AUTH-REMOTE absent / not :keyed (auth in flight) -> :pending (parked; resumed when auth
-                                                                reaches :keyed, which already calls
+     remote AUTH-REMOTE absent / auth in flight (< :authenticated) -> :pending (parked; resumed when auth
+                                                                reaches :keyed — or :authenticated when the
+                                                                governance mandates no protection, §8.5 keying
+                                                                then not a match precondition — both of which call
                                                                 DDS.DISC:RESUME-PARKED-MATCHES);
      remote VALIDATED subject absent (no handshake-cert subject) -> :incompatible (cannot authorize -> deny);
      remote subject has NO grant in the shared Permissions   -> :incompatible (no permissions -> deny);
@@ -60,7 +62,15 @@
                      (let ((ar (gethash prefix (dds.disc:disc-node-auth-state node))))
                        (when ar (cons (auth-remote-state ar) (auth-remote-validated-subject ar)))))))
         (when (null snap) (return-from gate :pending))            ; auth-remote not yet recorded
-        (unless (eq (car snap) :keyed) (return-from gate :pending)) ; auth in flight -> park, resumed on :keyed
+        ;; §8.4.2.9: authorize once the §8.7.2.5 validated subject is bound — at :keyed, OR at :authenticated when
+        ;; the governance mandates NO protection (keying is not a match precondition then, disc-node-crypto-keying-
+        ;; required-p NIL; the auth-gate ran first and already enforced the keying policy). :handshaking/:none ->
+        ;; park (resumed at :authenticated when keying is not required, else at :keyed). NEVER weakens: the subject
+        ;; is the §8.7 chain-verified cert's, and the grant check below still gates authorization.
+        (unless (or (eq (car snap) :keyed)
+                    (and (eq (car snap) :authenticated)
+                         (not (dds.disc:disc-node-crypto-keying-required-p node))))
+          (return-from gate :pending))
         (let ((remote-subject (cdr snap)))                          ; the VALIDATED handshake-cert subject (unforgeable)
           (when (null remote-subject) (return-from gate :incompatible))   ; no validated subject -> cannot authorize -> deny
           (let ((grant (dds.security:permissions-grant-for
@@ -133,4 +143,13 @@
       (multiple-value-bind (base origin-auth) (dds.security:protection-kind-base rtps-kind)
         (setf (dds.disc:disc-node-rtps-protection-kind (dp-node p)) base)
         (setf (dds.disc:disc-node-rtps-protection-origin-auth (dp-node p)) origin-auth))))
+  ;; DDS-Security 1.1 §7.3/§8.5: §8.5 crypto-token keying is a §7.3 endpoint-match precondition ONLY when the
+  ;; governance mandates protection (governance-any-protection-p); an all-NONE governance (authentication +
+  ;; access-control only) matches at :authenticated on §8.7 auth + §8.4 permissions alone (§8.4.2.9 — matching is
+  ;; an access-control decision; a conformant peer such as RTI Connext exchanges no crypto token at GOV=none). A
+  ;; NIL/absent governance leaves the slot default T -> the strict :keyed gate stays (fail-closed).
+  (let ((gov (dds.security:access-handle-governance access-handle)))
+    (when gov
+      (setf (dds.disc:disc-node-crypto-keying-required-p (dp-node p))
+            (dds.security:governance-any-protection-p gov))))
   p)

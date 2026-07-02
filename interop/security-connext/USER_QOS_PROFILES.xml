@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<!-- M7/P6 Slice 5b: live RTI Connext-Security interop. A Connext DomainParticipant configured to share
+     OUR reused PKI (Identity CA security-auth, Permissions CA security-access-control) + our governance +
+     S/MIME permissions, so ours<->Connext mutually authenticate + authorize. The security plugin is loaded
+     by inheriting BuiltinQosLib::Generic.Security (com.rti.serv.secure); we only supply the six dds.sec.*
+     files. Connext peer identity = TestParticipantEC; ours = TestParticipantECB (permissions-hello grants
+     both). file: paths are relative to the run cwd = this directory. -->
+<dds xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:noNamespaceSchemaLocation="http://community.rti.com/schema/7.3.1/rti_dds_qos_profiles.xsd">
+  <qos_library name="OursConnextInterop">
+
+    <!-- GOV=none: authentication + access-control active, protection NONE (isolates auth/permissions). -->
+    <qos_profile name="none" base_name="BuiltinQosLib::Generic.Security" is_default_qos="true">
+      <domain_participant_qos>
+        <discovery>
+          <initial_peers>
+            <element>udpv4://127.0.0.1</element>
+            <element>5@udpv4://127.0.0.1</element>
+          </initial_peers>
+          <multicast_receive_addresses/>
+        </discovery>
+        <transport_builtin><mask>UDPv4</mask></transport_builtin>
+        <property>
+          <value>
+            <element><name>dds.sec.auth.identity_ca</name><value>file:../security-auth/pki/ca/ca-cert.pem</value></element>
+            <element><name>dds.sec.auth.identity_certificate</name><value>file:../security-auth/pki/participant_ec/identity_cert.pem</value></element>
+            <element><name>dds.sec.auth.private_key</name><value>file:../security-auth/pki/participant_ec/identity_key.pem</value></element>
+            <element><name>dds.sec.access.permissions_ca</name><value>file:../security-access-control/pki/perm-ca-cert.pem</value></element>
+            <element><name>dds.sec.access.governance</name><value>file:../security-secure-discovery/fastdds/certs/governance-none.smime</value></element>
+            <element><name>dds.sec.access.permissions</name><value>file:../security-secure-discovery/fastdds/certs/permissions-hello.smime</value></element>
+          </value>
+        </property>
+      </domain_participant_qos>
+    </qos_profile>
+
+    <!-- GOV=secure: all-ENCRYPT discovery + rtps + user data. -->
+    <qos_profile name="secure" base_name="none">
+      <domain_participant_qos>
+        <property>
+          <value>
+            <element><name>dds.sec.access.governance</name><value>file:../security-secure-discovery/fastdds/certs/governance-secure.smime</value></element>
+          </value>
+        </property>
+      </domain_participant_qos>
+    </qos_profile>
+
+  </qos_library>
+</dds>

@@ -987,6 +987,144 @@
 
   t)
 
+(defun* %challenge-differs (nonce)
+    (function ((simple-array (unsigned-byte 8) (32))) (simple-array (unsigned-byte 8) (32)))
+  "Return a fresh 32-octet nonce guaranteed to DIFFER from NONCE (flip byte 0) — a stand-in for a
+   replayed / wrong future_challenge in the §8.7.2.5 anti-replay negative assertions."
+  (let ((out (copy-seq nonce)))
+    (setf (aref out 0) (logxor (aref out 0) #xFF))
+    out))
+
+(defun* run-auth-challenge-binding-test ()
+    (function () t)
+  "WP-DDS-SECURITY-CONNEXT-INTEROP Slice 5b: the §8.7.2.3 AuthRequestMessageToken challenge-binding
+   (anti-replay) gate at the handshake-API layer (dds-security). Requester precommits future_challenge
+   FC1 (challenge1 = FC1 verbatim); replier precommits FC2 (challenge2 = FC2 verbatim). Assertions:
+     (a) BIND-APPLIED: the request token's challenge1 EQUALS the supplied FC1 (verbatim, no hashing).
+     (b) POSITIVE: replier accepts with EXPECTED-CHALLENGE1=FC1; requester accepts the reply with
+         EXPECTED-CHALLENGE2=FC2; both reach :authenticated with byte-equal SharedSecrets.
+     (c) NEG-REPLIER: replier REJECTS (values NIL NIL) when EXPECTED-CHALLENGE1 != the request's challenge1
+         (a replayed/forged request) — the §8.7.2.5 fail-closed replier gate.
+     (d) NEG-REQUESTER: requester REJECTS (:rejected) when EXPECTED-CHALLENGE2 != the reply's challenge2.
+     (e) ABSENCE-TOLERANCE: replier with EXPECTED-CHALLENGE1=NIL (no auth_request seen) still ACCEPTS the
+         bound request — §8.7.2.3-optional, absence must NOT false-reject a conformant peer.
+   Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-challenge-binding] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-challenge-binding-test t)))
+  (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key-a  (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (ec-cert-b (%read-fixture-pem "participant_ec_b/identity_cert.pem"))
+         (ec-key-b  (%read-fixture-pem "participant_ec_b/identity_key.pem"))
+         (guid-a    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 0 2 1 #xC3)))
+         (guid-b    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 0 2 1 #xC3))))
+    (multiple-value-bind (id-a reason-a)
+        (dds.security:validate-local-identity ca-pem ec-cert-a ec-key-a guid-a)
+      (%check :cb-id-a (not (null id-a)) (format nil "validate-local-identity A: ~a" reason-a))
+      (unless id-a (return-from run-auth-challenge-binding-test t))
+      (unwind-protect
+           (multiple-value-bind (id-b reason-b)
+               (dds.security:validate-local-identity ca-pem ec-cert-b ec-key-b guid-b)
+             (%check :cb-id-b (not (null id-b)) (format nil "validate-local-identity B: ~a" reason-b))
+             (unless id-b (return-from run-auth-challenge-binding-test t))
+             (unwind-protect
+                  (let ((fc1 (dds.security:generate-future-challenge))
+                        (fc2 (dds.security:generate-future-challenge)))
+                    ;; --- (a)+(b) positive: bound request, replier verifies FC1, requester verifies FC2 ---
+                    (multiple-value-bind (req-tok req-hdl)
+                        (dds.security:begin-handshake-request
+                         id-a id-b dds.security:+suite-ecdh+
+                         (make-array 0 :element-type '(unsigned-byte 8)) fc1)
+                      (unwind-protect
+                           (progn
+                             ;; (a) the wire challenge1 IS the precommitted future_challenge (verbatim)
+                             (let* ((rt (dds.security::%parse-token req-tok))
+                                    (c1 (and rt (dds.security::%token-get
+                                                 rt dds.security::+prop-challenge1+))))
+                               (%check :cb-bind-applied (and c1 (equalp c1 fc1))
+                                       "request challenge1 must EQUAL the supplied future_challenge FC1"))
+                             (multiple-value-bind (rep-tok rep-hdl)
+                                 (dds.security:begin-handshake-reply
+                                  id-b id-a req-tok dds.security:+suite-ecdh+
+                                  (make-array 0 :element-type '(unsigned-byte 8)) fc1 fc2)
+                               (%check :cb-reply-ok (and rep-tok rep-hdl)
+                                       "replier must ACCEPT a request whose challenge1 == expected FC1")
+                               (unwind-protect
+                                    (multiple-value-bind (final-tok status)
+                                        (dds.security:process-handshake req-hdl rep-tok fc2)
+                                      (%check :cb-req-continue (eq status :continue)
+                                              (format nil "requester step (FC2 ok) status ~a" status))
+                                      (%check :cb-final-tok (not (null final-tok))
+                                              "requester must produce a Final token")
+                                      (when final-tok
+                                        (let ((fs (nth-value 1 (dds.security:process-handshake
+                                                                rep-hdl final-tok))))
+                                          (%check :cb-replier-auth (eq fs :authenticated)
+                                                  (format nil "replier Final status ~a" fs))))
+                                      (let ((ss-a (dds.security:handshake-shared-secret req-hdl))
+                                            (ss-b (dds.security:handshake-shared-secret rep-hdl)))
+                                        (%check :cb-ss-equal
+                                                (and ss-a ss-b
+                                                     (equalp (dds.security:shared-secret-bytes ss-a)
+                                                             (dds.security:shared-secret-bytes ss-b)))
+                                                "SharedSecrets must be byte-equal after bound handshake")))
+                                 (dds.security:free-handshake-handle rep-hdl))))
+                        (dds.security:free-handshake-handle req-hdl)))
+                    ;; --- (c) NEG-REPLIER: wrong expected-challenge1 -> reject (values NIL NIL) ---
+                    (multiple-value-bind (req-tok2 req-hdl2)
+                        (dds.security:begin-handshake-request
+                         id-a id-b dds.security:+suite-ecdh+
+                         (make-array 0 :element-type '(unsigned-byte 8)) fc1)
+                      (unwind-protect
+                           (multiple-value-bind (rep-tok2 rep-hdl2)
+                               (dds.security:begin-handshake-reply
+                                id-b id-a req-tok2 dds.security:+suite-ecdh+
+                                (make-array 0 :element-type '(unsigned-byte 8))
+                                (%challenge-differs fc1) fc2)
+                             (%check :cb-neg-replier (and (null rep-tok2) (null rep-hdl2))
+                                     "replier MUST reject when challenge1 != expected future_challenge")
+                             (when rep-hdl2 (dds.security:free-handshake-handle rep-hdl2)))
+                        (dds.security:free-handshake-handle req-hdl2)))
+                    ;; --- (d) NEG-REQUESTER: wrong expected-challenge2 -> :rejected ---
+                    (multiple-value-bind (req-tok3 req-hdl3)
+                        (dds.security:begin-handshake-request
+                         id-a id-b dds.security:+suite-ecdh+
+                         (make-array 0 :element-type '(unsigned-byte 8)) fc1)
+                      (unwind-protect
+                           (multiple-value-bind (rep-tok3 rep-hdl3)
+                               (dds.security:begin-handshake-reply
+                                id-b id-a req-tok3 dds.security:+suite-ecdh+
+                                (make-array 0 :element-type '(unsigned-byte 8)) fc1 fc2)
+                             (unwind-protect
+                                  (let ((st (nth-value 1 (dds.security:process-handshake
+                                                          req-hdl3 rep-tok3 (%challenge-differs fc2)))))
+                                    (%check :cb-neg-requester (eq st :rejected)
+                                            (format nil "requester MUST reject on wrong FC2 (status ~a)" st)))
+                               (when rep-hdl3 (dds.security:free-handshake-handle rep-hdl3))))
+                        (dds.security:free-handshake-handle req-hdl3)))
+                    ;; --- (e) ABSENCE-TOLERANCE: expected-challenge1 NIL accepts the bound request ---
+                    (multiple-value-bind (req-tok4 req-hdl4)
+                        (dds.security:begin-handshake-request
+                         id-a id-b dds.security:+suite-ecdh+
+                         (make-array 0 :element-type '(unsigned-byte 8)) fc1)
+                      (unwind-protect
+                           (multiple-value-bind (rep-tok4 rep-hdl4)
+                               (dds.security:begin-handshake-reply
+                                id-b id-a req-tok4 dds.security:+suite-ecdh+
+                                (make-array 0 :element-type '(unsigned-byte 8)) nil nil)
+                             (%check :cb-absence-ok (and rep-tok4 rep-hdl4)
+                                     "replier with NIL expected-challenge1 must ACCEPT (absence-tolerance)")
+                             (when rep-hdl4 (dds.security:free-handshake-handle rep-hdl4)))
+                        (dds.security:free-handshake-handle req-hdl4))))
+               (dds.security:free-identity-handle id-b)))
+        (dds.security:free-identity-handle id-a))))
+  t)
+
 (defun* run-auth-token-corpus-test ()
     (function () t)
   "T4 token self-consistency corpus for the internal handshake token format.
@@ -3148,9 +3286,10 @@
      (d) a Square sample round-trips byte-exact (user data flows after the secure match).
      (e) the on-wire posture HONORS the governance directive (NOT a hardcoded ENCRYPT): when TOPIC-VISIBLE-P
          is NIL (ENCRYPT) the plaintext topic name 'Square' NEVER appears on the wire (confidentiality — it
-         rides only inside the secure SEDP ENCRYPT); when T (SIGN) 'Square' DOES appear in cleartext but ONLY
-         inside a SEC_PREFIX bracket (authenticated-but-visible, never plain SEDP), proving we SIGNed (the
-         review defect was silently ENCRYPTing a SIGN directive).
+         rides only inside the secure SEDP ENCRYPT); when T (SIGN, governance-sign — discovery AND rtps both
+         SIGN) 'Square' DOES appear in cleartext but ONLY inside a protection bracket — a SEC_PREFIX, or the
+         verbatim-SIGN whole-RTPS SRTPS_PREFIX wrap that carries it (authenticated-but-visible, never plain
+         SEDP), proving we SIGNed (the review defect was silently ENCRYPTing a SIGN directive).
      (f) NON-VACUOUS control: the PLAIN peer NEVER matches A's protected writer (invisible over plain SEDP).
      (g) ORIGIN-AUTH (when ORIGIN-AUTH-P, T-ORIGINAUTH): governance drove the secure-SEDP RECEIVING readers
          (pub/sub-secure-reader) to be registered WITH a receiver-specific key (non-zero receiver_specific_key_id,
@@ -3287,11 +3426,14 @@
                              (%check :sdp-byte-exact (and b-payload (equalp b-payload pt))
                                      (format nil "Square sample byte mismatch; got ~a expected ~{~2,'0x~^ ~}"
                                              (and b-payload (coerce b-payload 'list)) (coerce pt 'list))))
-                           ;; (h) T10 whole-RTPS-message protection: all three governance fixtures set
-                           ;;     rtps_protection_kind=ENCRYPT, so A's user-data Square DATA to the :keyed B is
-                           ;;     SRTPS-wrapped on the wire (offset 20 = SRTPS_PREFIX) and B decoded it ((d)
-                           ;;     byte-exact above traverses the unwrap+re-dispatch path). The non-vacuous
-                           ;;     wrong-ParticipantCrypto / wrong-receiver-key controls are run-rtps-protection-test.
+                           ;; (h) T10 whole-RTPS-message protection: every governance fixture sets a non-NONE
+                           ;;     rtps_protection_kind (governance-secure/-origin-auth = ENCRYPT, governance-sign =
+                           ;;     SIGN), so ALL of A's keyed traffic — the secure-SEDP metatraffic AND the user-data
+                           ;;     Square DATA to the :keyed B — is SRTPS-wrapped on the wire (offset 20 = SRTPS_PREFIX)
+                           ;;     and B decoded it ((d) byte-exact above traverses the unwrap+re-dispatch path; the
+                           ;;     SIGN wrap rides the topic verbatim, which is why the (e) SIGN visibility check accepts
+                           ;;     an SRTPS_PREFIX). The non-vacuous wrong-ParticipantCrypto / wrong-receiver-key
+                           ;;     controls are run-rtps-protection-test.
                            (%check :sdp-rtps-wrapped (dds.pal:with-lock (lk) rtps-wrapped-seen)
                                    "T10: no SRTPS whole-RTPS-message bracket on the wire though rtps_protection_kind=ENCRYPT — A's keyed user data must be wrapped")
                            ;; (e) on-wire posture HONORS the governance directive: ENCRYPT hides the topic name
@@ -3301,12 +3443,20 @@
                                (%check :sdp-topic-visible-signed
                                        (dds.pal:with-lock (lk)
                                          (and (some (lambda (dg) (search topic-bytes dg)) captured)
+                                              ;; Every 'Square' datagram rides inside a PROTECTION bracket — a bare
+                                              ;; submessage SEC_PREFIX (0x31) OR, under a SIGN rtps_protection tier
+                                              ;; (governance-sign, so the T10 whole-RTPS wrap is verbatim-SIGN, topic
+                                              ;; still visible), a whole-RTPS SRTPS_PREFIX (0x33) with the SEC_PREFIX
+                                              ;; SIGN bracket inside — NEVER a plain SEDP DATA. Accepting SRTPS_PREFIX
+                                              ;; is not a weakening: both are protection brackets (the topic is never
+                                              ;; unprotected on the wire).
                                               (every (lambda (dg)
                                                        (or (not (search topic-bytes dg))
                                                            (and (> (length dg) 20)
-                                                                (= (aref dg 20) dds.security:+submessage-sec-prefix+))))
+                                                                (or (= (aref dg 20) dds.security:+submessage-sec-prefix+)
+                                                                    (= (aref dg 20) dds.security:+submessage-srtps-prefix+)))))
                                                      captured)))
-                                       "SIGN secure discovery must expose 'Square' in cleartext INSIDE a SEC_PREFIX bracket (honoring SIGN, never plain SEDP, never silently ENCRYPTed)")
+                                       "SIGN secure discovery must expose 'Square' in cleartext INSIDE a protection bracket (SEC_PREFIX or a SIGN SRTPS_PREFIX whole-RTPS wrap; honoring SIGN, never plain SEDP, never silently ENCRYPTed)")
                                (%check :sdp-topic-not-on-wire
                                        (dds.pal:with-lock (lk)
                                          (notany (lambda (dg) (search topic-bytes dg)) captured))

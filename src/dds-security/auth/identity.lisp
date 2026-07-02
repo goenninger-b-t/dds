@@ -265,10 +265,14 @@
 
 (defun* %parse-remote-token-strings (token-octets)
     (function ((simple-array (unsigned-byte 8) (*)))
-              (values (or string null) (or string null) (or string null) (or string null)))
-  "Parse a CDR LE IdentityToken octet vector (§8.7.2.2) and extract the 4 property values.
-   Returns (values cert-sn cert-algo ca-sn ca-algo) or (values NIL NIL NIL NIL) on malformed input.
-   Bounds-checks every length before trusting wire data (NFR-SEC-POSTURE)."
+              (values (or string null) (or string null) (or string null) (or string null) boolean))
+  "Parse a CDR LE IdentityToken octet vector (§8.7.2.2 / §9.3.2.1) and extract the property values.
+   Returns (values cert-sn cert-algo ca-sn ca-algo WELL-FORMED-P). WELL-FORMED-P is T iff the CDR
+   DataHolder parsed cleanly (class_id + PropertySeq walked without truncation/overflow); the four
+   property VALUES are each OPTIONAL and NIL when the token omits them (a §9.3.2.1-conformant empty
+   IdentityToken — as advertised by live RTI Connext 7.3.1: class_id only, zero properties — returns
+   all-NIL values with WELL-FORMED-P T). On malformed/truncated input returns all-NIL + WELL-FORMED-P NIL.
+   Bounds-checks every length before trusting wire data (NFR-SEC-POSTURE; fail-closed)."
   (handler-case
       (let ((n (length token-octets))
             (pos 0))
@@ -311,26 +315,33 @@
                         ((string= name +id-token-prop-cert-algo+) (setf cert-algo value))
                         ((string= name +id-token-prop-ca-sn+)     (setf ca-sn     value))
                         ((string= name +id-token-prop-ca-algo+)   (setf ca-algo   value)))))
-              (values cert-sn cert-algo ca-sn ca-algo)))))
-    (error () (values nil nil nil nil))))
+              ;; parsed cleanly -> well-formed T (values may be NIL for a §9.3.2.1 empty token)
+              (values cert-sn cert-algo ca-sn ca-algo t)))))
+    (error () (values nil nil nil nil nil))))
 
 (defun* validate-remote-identity (local remote-identity-token)
     (function (identity-handle (simple-array (unsigned-byte 8) (*)))
               (values (member :ok :rejected) (member :requester :replier) (or string null)))
-  "Validate a remote participant's IdentityToken against the local identity (§8.7.2.4).
+  "Validate a remote participant's IdentityToken against the local identity (§8.7.2.4 / §9.3.2.1).
    LOCAL: the local participant's identity-handle.
    REMOTE-IDENTITY-TOKEN: the remote IdentityToken CDR octets (received on the wire).
    Returns (values VERDICT ROLE REASON):
-     VERDICT: :OK if the token is well-formed and non-empty; :REJECTED otherwise.
+     VERDICT: :OK iff the token is a WELL-FORMED CDR DataHolder; :REJECTED on malformed/truncated input.
      ROLE: :REQUESTER if local GUID < remote (derived) GUID, :REPLIER otherwise (§8.7.2.4).
      REASON: NIL on :OK, or a diagnostic string on :REJECTED.
-   Bounds-checks all wire parsing (NFR-SEC-POSTURE; fail-closed)."
-  ;; parse remote token
-  (multiple-value-bind (remote-cert-sn remote-cert-algo remote-ca-sn remote-ca-algo)
+   The §9.3.2.1 IdentityToken cert.sn/cert.algo/ca.sn/ca.algo Properties are OPTIONAL advertisement
+   hints, NOT trust material: a conformant peer MAY advertise an empty IdentityToken (class_id only —
+   live RTI Connext 7.3.1 does exactly this), so their ABSENCE is NOT a reject reason. The authoritative
+   identity + algo are carried in the §8.7.2.4 handshake (c.id full certificate chain-verify + Sign, and
+   c.kagree_algo/c.dsign_algo), which remains the sole trust gate — this stays fail-closed: a genuinely
+   untrusted/unauthenticated peer is refused there. Bounds-checks all wire parsing (NFR-SEC-POSTURE)."
+  ;; parse remote token; §9.3.2.1 property VALUES are optional, only MALFORMEDNESS rejects (fail-closed)
+  (multiple-value-bind (remote-cert-sn remote-cert-algo remote-ca-sn remote-ca-algo well-formed)
       (%parse-remote-token-strings remote-identity-token)
-    (unless (and remote-cert-sn remote-cert-algo remote-ca-sn remote-ca-algo)
+    (declare (ignore remote-cert-algo remote-ca-sn remote-ca-algo))
+    (unless well-formed
       (return-from validate-remote-identity
-        (values :rejected :requester "remote IdentityToken is malformed or missing required properties")))
+        (values :rejected :requester "remote IdentityToken is malformed (not a well-formed CDR DataHolder)")))
     ;; derive a pseudo-GUID for the remote from the cert-sn hash (deterministic ordering)
     ;; We do NOT have the remote participant's real GUID over-wire at this point in T1.
     ;; The §8.7.2.4 GUID ordering operates on the actual RTPS participant GUIDs.
@@ -339,8 +350,11 @@
     ;; decision, making the local-vs-remote ordering deterministic for same-cert-sn cases.
     ;; NOTE: In T2 (handshake) the real GUID arrives in the ParticipantStatelessMessage.
     (let* ((local-guid   (identity-handle-guid local))
-           (remote-bytes (map '(simple-array (unsigned-byte 8) (*)) #'char-code remote-cert-sn))
-           ;; derive 16 fake remote-GUID bytes from cert-sn (stable ordering, not crypto)
+           ;; derive 16 fake remote-GUID bytes from cert-sn (stable ordering, not crypto); an empty
+           ;; §9.3.2.1 token carries no cert-sn -> all-zero stand-in (the auth manager decides the real role)
+           (remote-bytes (if remote-cert-sn
+                             (map '(simple-array (unsigned-byte 8) (*)) #'char-code remote-cert-sn)
+                             (make-array 0 :element-type '(unsigned-byte 8))))
            (remote-guid  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
       (dotimes (i (min 16 (length remote-bytes)))
         (setf (aref remote-guid i) (aref remote-bytes i)))

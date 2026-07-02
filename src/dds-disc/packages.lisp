@@ -109,6 +109,8 @@
            #:run-secure-pm-origin-auth-roundtrip-test
            #:run-secure-pm-origin-auth-tamper-test
            #:run-secure-spdp-reannounce-test
+           ;; DDS-Security 1.1 §7.3/§8.5: keying is a match precondition only when governance mandates protection
+           #:disc-node-crypto-keying-required-p
            #:disc-node-rtps-protection-kind
            #:disc-node-rtps-protection-origin-auth
            #:disc-node-rtps-protection-encode

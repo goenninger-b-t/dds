@@ -605,7 +605,14 @@
              (cm-make-crypto-token-message
               cm (cdr e) km (%guid-from-prefix local-prefix (car e)) remote-prefix
               (%guid-from-prefix remote-prefix (%cm-token-dest-entity-id node (car e)))))))))
-    (%cm-try-promote cm node remote-prefix))
+    (%cm-try-promote cm node remote-prefix)
+    ;; §7.3/§8.5: an all-NONE governance never reaches :keyed via a peer that (conformantly) exchanges NO
+    ;; participant crypto token when rtps_protection=NONE (e.g. RTI Connext, whose PVMS writer stays empty at
+    ;; GOV=none). Resume the parked user-endpoint matches now that the remote is :authenticated — the auth +
+    ;; permissions gates match at :authenticated on §8.7 auth + §8.4 permissions (§8.4.2.9). Keying-required
+    ;; governance leaves this untouched (the match resumes at :keyed via %cm-try-promote, as before).
+    (unless (dds.disc:disc-node-crypto-keying-required-p node)
+      (dds.disc:resume-parked-matches node)))
   t)
 
 (defun* cm-on-endpoint-match (cm node remote-guid local-is-writer-p)

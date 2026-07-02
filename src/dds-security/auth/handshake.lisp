@@ -96,6 +96,35 @@
   (class-id "" :type string)
   (binary-props '() :type list))
 
+(defun* %class-id-role-match-p (class-id canonical)
+    (function ((or string null) string) boolean)
+  "T iff CLASS-ID names the same DDS:Auth:PKI-DH plugin FAMILY + message ROLE as the CANONICAL
+   handshake class_id constant (+handshake-{request,reply,final}-class-id+), TOLERATING the plugin
+   VERSION between them (§9.3.1 / §9.3.2.1 / §8.7.2.4). Ours emits version 1.0, live RTI Connext 7.3.1
+   emits 1.2 (e.g. \"DDS:Auth:PKI-DH:1.2+Reply\"): the plugin family + the message role are the interop
+   contract; the version is the plugin revision. Both the family prefix (up to and incl. the last ':')
+   and the role suffix (from the last '+') are DERIVED from CANONICAL — no version literal is hard-coded,
+   the match keys off the already-pinned + corpus-locked constants. Fail-closed: NIL for a different
+   plugin family or an unrecognized role. The class_id is NEVER a trust boundary — trust is the §8.7.2.4
+   peer cert-chain verify + Sign, unchanged."
+  (when class-id
+    (let ((colon (position #\: canonical :from-end t))
+          (plus  (position #\+ canonical :from-end t)))
+      (and colon plus
+           (uiop:string-prefix-p (subseq canonical 0 (1+ colon)) class-id)
+           (uiop:string-suffix-p class-id (subseq canonical plus))
+           t))))
+
+(defun* %algo-name-match-p (peer-algo-str suite-algo-str)
+    (function (string string) boolean)
+  "T iff the peer's advertised c.dsign_algo / c.kagree_algo NAME equals the selected suite's algo string
+   (§9.3.2), TOLERATING a trailing C-string NUL terminator on the peer octets: live RTI Connext 7.3.1
+   null-terminates its algo binary-property values (e.g. \"ECDSA-SHA256\\0\"), ours does not. The algo NAME
+   is the interop contract; the NUL is a serialization artifact. Fail-closed — a genuinely different
+   algorithm still mismatches. The verbatim (NUL-included) octets remain the hash_c/Sign input, so the
+   cryptographic binding is UNCHANGED; only this NAME cross-check is NUL-tolerant."
+  (and (string= (string-right-trim '(#\Nul) peer-algo-str) suite-algo-str) t))
+
 (defun* %serialize-token (tok)
     (function (handshake-token) (simple-array (unsigned-byte 8) (*)))
   "Serialize a handshake-token to the internal tagged octet format (in-process only)."
@@ -186,6 +215,17 @@
     (function ((unsigned-byte 32)) (simple-array (unsigned-byte 8) (*)))
   "Generate N cryptographically random bytes via dds.dare:random-bytes (RAND_bytes, OpenSSL 3.6.2)."
   (dds.dare:random-bytes n))
+
+(defun* generate-future-challenge ()
+    (function () (simple-array (unsigned-byte 8) (32)))
+  "Mint a fresh 32-octet (256-bit) §8.7.2.3 future_challenge nonce for the AuthRequestMessageToken
+   sub-protocol (RAND_bytes). The auth manager mints ONE per remote at discovery and reuses it (stable):
+   it is both the nonce sent in our AuthRequestMessageToken and — as the requester's challenge1 / replier's
+   challenge2 — the precommitted handshake challenge the peer binds to byte-for-byte (§8.7.2.4 / §8.7.2.5)."
+  (let ((n (%random-bytes +challenge-len+))
+        (out (make-array 32 :element-type '(unsigned-byte 8))))
+    (replace out n :end2 (min 32 (length n)))
+    out))
 
 ;;; --- SharedSecretHandle ---
 
@@ -344,10 +384,28 @@
 
 ;;; --- public API ---
 
+(defun* %c-id-pem-octets (cert)
+    (function (cffi:foreign-pointer) (simple-array (unsigned-byte 8) (*)))
+  "The c.id binary-property value for CERT: the X.509 identity certificate as a PEM string with a
+   trailing NUL terminator (§9.3.2.1). Live RTI Connext 7.3.1's
+   RTI_Security_Authentication_copyCertificateFromTokenToIdentityHandle REQUIRES the c.id PEM to be a
+   NUL-terminated C-string and REJECTS a non-terminated cert as 'malformed'; ours previously emitted the
+   raw PEM (no NUL). The single NUL is folded into hash_c UNIFORMLY (these exact octets are BOTH the c.id
+   property AND the hash_c input, so both ends recompute the identical hash over the transmitted bytes),
+   and OpenSSL PEM_read ignores any trailing byte after END CERTIFICATE, so a spec-literal peer (Fast DDS /
+   ours) still loads it — an encode-side form BOTH vendors accept, NOT a weakening (the certificate content
+   is unchanged; the trailing NUL is only a C-string terminator)."
+  (let* ((pem (dds.dare:x509-to-pem cert))
+         (out (make-array (1+ (length pem)) :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace out pem)
+    out))
+
 (defun* begin-handshake-request (local remote suite
-                                 &optional (perm-octets (make-array 0 :element-type '(unsigned-byte 8))))
+                                 &optional (perm-octets (make-array 0 :element-type '(unsigned-byte 8)))
+                                           (challenge1-nonce nil))
     (function (identity-handle identity-handle auth-suite
-               &optional (simple-array (unsigned-byte 8) (*)))
+               &optional (simple-array (unsigned-byte 8) (*))
+                         (or null (simple-array (unsigned-byte 8) (*))))
               (values (simple-array (unsigned-byte 8) (*)) handshake-handle))
   "Initiate DDS-Security §8.7.2.4 handshake as the requester (local GUID < remote GUID).
    LOCAL: local identity-handle. REMOTE: remote identity-handle (CA used for reply verification).
@@ -357,10 +415,14 @@
    replier reads via validate_remote_permissions (Fast DDS SMIME_read_PKCS7). Empty (the default) emits an
    empty c.perm for the shared-document model / auth-only flows; it is ALSO folded into hash_c1 either way,
    so both ends recompute the identical hash over the transmitted bytes (WP-DDS-SECURITY-FASTDDS-INTEROP T6).
+   CHALLENGE1-NONCE (optional, default NIL): the §8.7.2.3 future_challenge this participant precommitted in
+   its AuthRequestMessageToken — when non-NIL it becomes challenge1 VERBATIM (the anti-replay binding a full
+   RTI Connext replier enforces, §8.7.2.4); NIL falls back to a fresh random challenge1 (the §8.7.2.3-optional
+   path for a peer that requires no auth_request, e.g. Fast DDS / ours↔ours without the sub-protocol).
    Returns (values REQUEST-TOKEN-OCTETS HANDSHAKE-HANDLE) — HANDLE state = :awaiting-reply."
   (declare (ignore remote))
-  (let* ((cert-pem    (dds.dare:x509-to-pem (identity-handle-cert local)))
-         (challenge1  (%random-bytes +challenge-len+))
+  (let* ((cert-pem    (%c-id-pem-octets (identity-handle-cert local)))
+         (challenge1  (or challenge1-nonce (%random-bytes +challenge-len+)))
          (dsign-str   (auth-suite-dsign-algo-str suite))
          (kagree-str  (auth-suite-kagree-algo-str suite))
          (pdata       (%build-c-pdata (identity-handle-guid local)))
@@ -392,11 +454,15 @@
         (values (%serialize-token token) handle)))))
 
 (defun* begin-handshake-reply (local remote request-token-octets suite
-                               &optional (perm-octets (make-array 0 :element-type '(unsigned-byte 8))))
+                               &optional (perm-octets (make-array 0 :element-type '(unsigned-byte 8)))
+                                         (expected-challenge1 nil)
+                                         (challenge2-nonce nil))
     (function (identity-handle identity-handle
                (simple-array (unsigned-byte 8) (*))
                auth-suite
-               &optional (simple-array (unsigned-byte 8) (*)))
+               &optional (simple-array (unsigned-byte 8) (*))
+                         (or null (simple-array (unsigned-byte 8) (*)))
+                         (or null (simple-array (unsigned-byte 8) (*))))
               (values (or (simple-array (unsigned-byte 8) (*)) null)
                       (or handshake-handle null)))
   "Process HandshakeRequestMessageToken as the replier (DDS-Security 1.1 §8.7.2.4 / §9.3.2.2).
@@ -407,12 +473,18 @@
    the reply's c.perm binary_property (§9.3.2.1) — the S/MIME §9.4.1.1 document the requester's
    validate_remote_permissions reads (Fast DDS SMIME_read_PKCS7). It is also folded into hash_c2, so the
    requester recomputes the identical hash over the transmitted bytes (WP-DDS-SECURITY-FASTDDS-INTEROP T6).
+   EXPECTED-CHALLENGE1 (optional, default NIL): the requester's §8.7.2.3 future_challenge, received in its
+   AuthRequestMessageToken. When non-NIL the request's challenge1 MUST equal it byte-for-byte or the reply is
+   REJECTED (values NIL NIL) — the §8.7.2.5 replier-side anti-replay binding. NIL SKIPS the check (the peer
+   sent no auth_request; §8.7.2.3-optional, absence must not false-reject — matches OpenDDS's conditional).
+   CHALLENGE2-NONCE (optional, default NIL): the replier's OWN §8.7.2.3 future_challenge — when non-NIL it
+   becomes challenge2 VERBATIM (so a full requester can bind to it, §8.7.2.4); NIL = fresh random challenge2.
    Returns (values REPLY-TOKEN-OCTETS HANDLE) or (values NIL NIL) on failure.
    Verifies peer cert chain, recomputes hash_c1, generates own ephemeral key + Sign2."
   (declare (ignore remote))
   (let ((req-tok (%parse-token request-token-octets)))
     (unless req-tok (return-from begin-handshake-reply (values nil nil)))
-    (unless (string= (handshake-token-class-id req-tok) +handshake-request-class-id+)
+    (unless (%class-id-role-match-p (handshake-token-class-id req-tok) +handshake-request-class-id+)
       (return-from begin-handshake-reply (values nil nil)))
     (let* ((peer-cert-bytes  (%token-get req-tok +prop-c-id+))
            (peer-perm        (or (%token-get req-tok +prop-c-perm+)
@@ -428,6 +500,11 @@
            (challenge1       (%token-get req-tok +prop-challenge1+)))
       (unless (and peer-cert-bytes hash-c1-claimed dh1 challenge1)
         (return-from begin-handshake-reply (values nil nil)))
+      ;; §8.7.2.5 anti-replay binding: when the requester precommitted a future_challenge (via its
+      ;; AuthRequestMessageToken), its challenge1 MUST equal it byte-for-byte; a mismatch is a replayed /
+      ;; forged request -> fail-closed. NIL EXPECTED-CHALLENGE1 = no auth_request seen (§8.7.2.3-optional).
+      (when (and expected-challenge1 (not (equalp challenge1 expected-challenge1)))
+        (return-from begin-handshake-reply (values nil nil)))
       (let ((peer-cert (dds.dare:x509-load-cert-auto peer-cert-bytes)))
         (unless peer-cert (return-from begin-handshake-reply (values nil nil)))
         (unwind-protect
@@ -438,16 +515,16 @@
                       (peer-kagree-str    (map 'string #'code-char peer-kagree-octs))
                       (hash-c1-recomputed (%compute-hash-c suite peer-cert-bytes peer-perm peer-pdata
                                                             peer-dsign-str peer-kagree-str)))
-                 ;; §9.3.2 algo-vs-suite cross-check: peer advertised algos must match selected suite
-                 (unless (and (string= peer-dsign-str  (auth-suite-dsign-algo-str suite))
-                              (string= peer-kagree-str (auth-suite-kagree-algo-str suite)))
+                 ;; §9.3.2 algo-vs-suite cross-check: peer advertised algos must match selected suite (NUL-tolerant)
+                 (unless (and (%algo-name-match-p peer-dsign-str  (auth-suite-dsign-algo-str suite))
+                              (%algo-name-match-p peer-kagree-str (auth-suite-kagree-algo-str suite)))
                    (return-from begin-handshake-reply (values nil nil)))
                  (unless (equalp hash-c1-claimed hash-c1-recomputed)
                    (return-from begin-handshake-reply (values nil nil)))
                  (multiple-value-bind (my-dh-pub my-dh-priv)
                      (funcall (auth-suite-kagree-gen suite))
-                   (let* ((challenge2  (%random-bytes +challenge-len+))
-                          (my-cert-pem (dds.dare:x509-to-pem (identity-handle-cert local)))
+                   (let* ((challenge2  (or challenge2-nonce (%random-bytes +challenge-len+)))
+                          (my-cert-pem (%c-id-pem-octets (identity-handle-cert local)))
                           (my-perm     perm-octets)
                           (my-pdata    (%build-c-pdata (identity-handle-guid local)))
                           (dsign-str   (auth-suite-dsign-algo-str suite))
@@ -510,33 +587,41 @@
                            (when peer-pub-key (dds.dare:pkey-free peer-pub-key)))))))))
           (dds.dare:x509-free peer-cert))))))
 
-(defun* process-handshake (handle incoming-token-octets)
-    (function (handshake-handle (simple-array (unsigned-byte 8) (*)))
+(defun* process-handshake (handle incoming-token-octets &optional (expected-challenge2 nil))
+    (function (handshake-handle (simple-array (unsigned-byte 8) (*))
+               &optional (or null (simple-array (unsigned-byte 8) (*))))
               (values (or (simple-array (unsigned-byte 8) (*)) null)
                       (member :continue :authenticated :rejected)))
   "Drive the DDS-Security §8.7.2.4 handshake state machine for subsequent steps.
    Requester (:awaiting-reply): validates Reply, produces Final token; state -> :authenticated.
    Replier (:awaiting-final): validates Final; state -> :authenticated. No further token returned.
+   EXPECTED-CHALLENGE2 (optional, default NIL): the replier's §8.7.2.3 future_challenge (from its
+   AuthRequestMessageToken) — when non-NIL the Reply's challenge2 MUST equal it byte-for-byte or the step
+   is REJECTED (§8.7.2.5 requester-side binding); NIL SKIPS the check (no auth_request seen; §8.7.2.3-optional).
+   Only consulted in the :awaiting-reply (requester) step; ignored for the replier's :awaiting-final step.
    Returns (values next-token-or-nil status): status in {:continue, :authenticated, :rejected}."
   (ecase (handshake-handle-state handle)
-    (:awaiting-reply  (%process-reply  handle incoming-token-octets))
+    (:awaiting-reply  (%process-reply  handle incoming-token-octets expected-challenge2))
     (:awaiting-final  (%process-final  handle incoming-token-octets))
     (:authenticated   (values nil :authenticated))
     (:rejected        (values nil :rejected))
     (:init            (values nil :rejected))))
 
-(defun* %process-reply (handle reply-octets)
-    (function (handshake-handle (simple-array (unsigned-byte 8) (*)))
+(defun* %process-reply (handle reply-octets &optional (expected-challenge2 nil))
+    (function (handshake-handle (simple-array (unsigned-byte 8) (*))
+               &optional (or null (simple-array (unsigned-byte 8) (*))))
               (values (or (simple-array (unsigned-byte 8) (*)) null)
                       (member :continue :authenticated :rejected)))
   "Process replier's Reply token for the requester (§9.3.2.2 / §9.3.2.3).
-   Verifies peer cert, hash_c2, and Sign2; derives SharedSecret; generates Final token."
+   Verifies peer cert, hash_c2, and Sign2; derives SharedSecret; generates Final token.
+   EXPECTED-CHALLENGE2 (optional): when non-NIL, the Reply's challenge2 MUST equal the replier's
+   precommitted §8.7.2.3 future_challenge byte-for-byte or the step is REJECTED (§8.7.2.5); NIL skips it."
   (flet ((reject ()
            (setf (handshake-handle-state handle) :rejected)
            (return-from %process-reply (values nil :rejected))))
     (let ((reply-tok (%parse-token reply-octets)))
       (unless reply-tok (reject))
-      (unless (string= (handshake-token-class-id reply-tok) +handshake-reply-class-id+) (reject))
+      (unless (%class-id-role-match-p (handshake-token-class-id reply-tok) +handshake-reply-class-id+) (reject))
       (let* ((suite          (handshake-handle-suite handle))
              (peer-cert-bytes (%token-get reply-tok +prop-c-id+))
              (peer-perm      (or (%token-get reply-tok +prop-c-perm+)
@@ -554,11 +639,15 @@
              (ch1-echo       (%token-get reply-tok +prop-challenge1+))
              (challenge2     (%token-get reply-tok +prop-challenge2+))
              (sign2          (%token-get reply-tok +prop-signature+)))
-        (unless (and peer-cert-bytes hash-c2 dh2 hash-c1-echo dh1-echo ch1-echo challenge2 sign2)
+        (unless (and peer-cert-bytes dh2 challenge2 sign2)
           (reject))
-        (unless (equalp hash-c1-echo (handshake-handle-hash-c-local handle)) (reject))
-        (unless (equalp dh1-echo     (handshake-handle-my-dh-pub handle))    (reject))
-        (unless (equalp ch1-echo     (handshake-handle-my-challenge handle))  (reject))
+        ;; §8.7.2.5 requester-side binding: when the replier precommitted a future_challenge (its
+        ;; AuthRequestMessageToken), the Reply's challenge2 MUST equal it byte-for-byte -> fail-closed on
+        ;; mismatch. NIL EXPECTED-CHALLENGE2 = no auth_request seen (§8.7.2.3-optional; matches OpenDDS).
+        (when (and expected-challenge2 (not (equalp challenge2 expected-challenge2))) (reject))
+        (when (and hash-c1-echo (not (equalp hash-c1-echo (handshake-handle-hash-c-local handle)))) (reject))
+        (when (and dh1-echo     (not (equalp dh1-echo (handshake-handle-my-dh-pub handle))))         (reject))
+        (when (and ch1-echo     (not (equalp ch1-echo (handshake-handle-my-challenge handle))))       (reject))
         (let ((peer-cert (dds.dare:x509-load-cert-auto peer-cert-bytes)))
           (unless peer-cert (reject))
           (unwind-protect
@@ -570,18 +659,18 @@
                         (peer-kagree-str    (map 'string #'code-char peer-kagree-o))
                         (hash-c2-recomputed (%compute-hash-c suite peer-cert-bytes peer-perm peer-pdata
                                                               peer-dsign-str peer-kagree-str)))
-                   ;; §9.3.2 algo-vs-suite cross-check: peer advertised algos must match selected suite
-                   (unless (and (string= peer-dsign-str  (auth-suite-dsign-algo-str suite))
-                                (string= peer-kagree-str (auth-suite-kagree-algo-str suite)))
+                   ;; §9.3.2 algo-vs-suite cross-check: peer advertised algos must match selected suite (NUL-tolerant)
+                   (unless (and (%algo-name-match-p peer-dsign-str  (auth-suite-dsign-algo-str suite))
+                                (%algo-name-match-p peer-kagree-str (auth-suite-kagree-algo-str suite)))
                      (reject))
-                   (unless (equalp hash-c2 hash-c2-recomputed) (reject))
+                   (when (and hash-c2 (not (equalp hash-c2 hash-c2-recomputed))) (reject))
                    (let ((peer-pub     nil)
                          (peer-stored  nil))
                      (unwind-protect
                           (progn
                             (setf peer-pub (dds.dare:x509-public-key peer-cert))
                             (let ((sig-input (%build-cdr-binary-property-seq-be
-                                              (list (cons +prop-hash-c2+   hash-c2)
+                                              (list (cons +prop-hash-c2+   hash-c2-recomputed)
                                                     (cons +prop-challenge2+ challenge2)
                                                     (cons +prop-dh2+        dh2)
                                                     (cons +prop-challenge1+ (handshake-handle-my-challenge handle))
@@ -640,7 +729,7 @@
            (return-from %process-final (values nil :rejected))))
     (let ((final-tok (%parse-token final-octets)))
       (unless final-tok (reject))
-      (unless (string= (handshake-token-class-id final-tok) +handshake-final-class-id+) (reject))
+      (unless (%class-id-role-match-p (handshake-token-class-id final-tok) +handshake-final-class-id+) (reject))
       (let* ((suite        (handshake-handle-suite handle))
              (hash-c1-echo (%token-get final-tok +prop-hash-c1+))
              (hash-c2-echo (%token-get final-tok +prop-hash-c2+))

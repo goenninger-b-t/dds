@@ -72,18 +72,23 @@
     (function (identity-handle (simple-array (unsigned-byte 8) (*))) (or auth-suite null))
   "Select the §9.3.2 auth suite for a discovered remote from the local identity and the
    remote IdentityToken octets, deriving both certificate kinds via %CERT-ALGO->KIND on
-   their advertised dds.cert.algo property (§8.7.2.2). Returns NIL — meaning REJECT the
-   remote — when EITHER algo is unsupported/unparseable (%CERT-ALGO->KIND -> NIL) or the
-   kinds yield no common suite (mismatch); else the selected AUTH-SUITE. Keeps the
-   unsupported-algo NIL handling co-located with %CERT-ALGO->KIND so callers whose
-   SELECT-AUTH-SUITE ftype is (member :ec :rsa) never pass NIL (DDS-Security 1.1 §9.3.2)."
-  (let ((local-kind  (%cert-algo->kind
-                      (or (nth-value 1 (%parse-remote-token-strings
-                                        (identity-handle-token-octets local-identity)))
-                          "")))
-        (remote-kind (%cert-algo->kind
-                      (or (nth-value 1 (%parse-remote-token-strings remote-id-token-octets))
-                          ""))))
-    (if (and local-kind remote-kind)
-        (select-auth-suite local-kind remote-kind)
+   their advertised dds.cert.algo property (§8.7.2.2 / §9.3.2.1). The remote's dds.cert.algo
+   is an OPTIONAL advertisement hint: when the remote OMITS it (a §9.3.2.1-conformant empty
+   IdentityToken — live RTI Connext 7.3.1) the requester proposes the suite for its OWN cert
+   kind (EFFECTIVE-REMOTE := LOCAL-KIND); the §8.7.2.4 handshake (c.id chain-verify + Sign +
+   c.kagree_algo/c.dsign_algo) then enforces the real algo match FAIL-CLOSED, so a genuine
+   EC/RSA mismatch is refused there. An EXPLICITLY-advertised mismatched algo still yields NIL
+   (REJECT), unchanged. Returns NIL — REJECT — when the LOCAL algo is unsupported/unparseable
+   or the effective kinds yield no common suite; else the selected AUTH-SUITE (DDS-Security 1.1 §9.3.2)."
+  (let* ((local-kind  (%cert-algo->kind
+                       (or (nth-value 1 (%parse-remote-token-strings
+                                         (identity-handle-token-octets local-identity)))
+                           "")))
+         (remote-kind (%cert-algo->kind
+                       (or (nth-value 1 (%parse-remote-token-strings remote-id-token-octets))
+                           "")))
+         ;; §9.3.2.1: dds.cert.algo optional -> when the remote omits it, propose our own kind (handshake enforces)
+         (effective-remote (or remote-kind local-kind)))
+    (if (and local-kind effective-remote)
+        (select-auth-suite local-kind effective-remote)
         nil)))

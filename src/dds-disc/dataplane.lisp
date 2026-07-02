@@ -187,7 +187,14 @@
    (RESOURCE_LIMITS backpressure — never a GC fallback), or the encode failed, or the result would not fit BUF —
    never emits an unprotected datagram to a keyed peer. If the pool could not be carved (arena exhausted at first
    wrap) the wrap DEGRADES to the allocating encode-rtps-message (correct, byte-identical wire), self-healing when
-   the arena frees."
+   the arena frees.
+   §9.5.3.3.5 SOURCE BINDING: before protecting, a 24-octet source-declaring INFO_SRC (NODE's guid-prefix,
+   put-info-src-into) is prepended to the submessage stream via an in-place right-shift of [20,LEN) by 24 — so the
+   protected payload begins with it and a strict rtps_protection peer (live RTI Connext) accepts the SRTPS message
+   (its decode_rtps_message rejects a payload whose first recovered submessage is not this INFO_SRC, 'wrong
+   INFO_SRC'). The INFO_SRC rides INSIDE the SEC_BODY (encrypted for ENCRYPT), so the CLEAR wire is unchanged
+   (SRTPS_PREFIX‖SEC_BODY‖SRTPS_POSTFIX); the receiver's dispatch skips it (an unhandled submessage id) and takes
+   the source prefix from the outer RTPS Header. Zero-alloc (raw-offset shift + write, no per-datagram cons)."
   (let ((enc (disc-node-rtps-protection-encode node)))
     (if (or (null enc) (<= len 20))
         len                                            ; no protection installed / header-only -> plain (byte-identical)
@@ -195,27 +202,42 @@
           (if (null km)
               len                                      ; dest not :keyed / rtps_protection NONE -> plain
               (let ((vec  (dds.core.buffer:octet-buffer-vec buf))
-                    (cap  (dds.core.buffer:octet-buffer-capacity buf))
-                    (pool (%ensure-send-scratch-pool node)))
-                (if (null pool)
-                    ;; pool carve failed (arena exhausted at first wrap): allocating fallback — correct + byte-identical
-                    ;; wire, never a silent drop of legit keyed traffic (self-heals once the arena frees).
-                    (let ((srtps (dds.security:encode-rtps-message km kind (subseq vec 20 len) :receivers receivers)))
-                      (if (and srtps (<= (+ 20 (length srtps)) cap))
-                          (progn (replace vec srtps :start1 20) (+ 20 (length srtps)))
-                          nil))
-                    ;; ZA-2 zero-alloc: borrow a scratch, build the bracket into it BY OFFSET (no subseq / →octets),
-                    ;; copy [0,BLEN) back over [20,…) in BUF, release the scratch. Pool exhausted -> %with-send-scratch
-                    ;; is NIL -> fail-closed drop (never a GC fallback).
-                    (%with-send-scratch (scratch node)
-                      (handler-case
-                          (let ((blen (dds.security:encode-rtps-message-into
-                                       scratch 0 km kind vec 20 (- len 20) :receivers receivers)))
-                            (when (<= (+ 20 blen) cap)
-                              (replace vec (dds.core.buffer:octet-buffer-vec scratch)
-                                       :start1 20 :end1 (+ 20 blen) :end2 blen)   ; in-place wrap; header kept
-                              (+ 20 blen)))
-                        (error () nil))))))))))          ; encode overflow/failure or won't-fit -> fail-closed drop
+                    (cap  (dds.core.buffer:octet-buffer-capacity buf)))
+                (if (> (+ len 24) cap)
+                    nil                                 ; even the §9.5.3.3.5 INFO_SRC prepend won't fit -> fail-closed drop
+                    ;; §9.5.3.3.5 SOURCE BINDING (the T10 whole-RTPS payload must begin with a source-declaring
+                    ;; INFO_SRC so a strict rtps_protection peer accepts it — live RTI Connext's decode_rtps_message
+                    ;; rejects a protected payload whose first recovered submessage is not this INFO_SRC, 'wrong
+                    ;; INFO_SRC'). Zero-alloc: in-place right-shift of the submessage stream [20,LEN) by 24 (reverse
+                    ;; copy, overlap-safe: dest>src so iterate high->low) then write the 24-octet INFO_SRC BY OFFSET at
+                    ;; [20,44); the INFO_SRC is inside the SRTPS SEC_BODY (encrypted for ENCRYPT), so the CLEAR wire is
+                    ;; still SRTPS_PREFIX‖SEC_BODY‖SRTPS_POSTFIX (matches Connext). Decode skips it (dispatch-message
+                    ;; no-ops an unhandled submessage id; the source prefix comes from the outer RTPS Header).
+                    (let ((pool nil))
+                      (loop for i of-type fixnum from (1- len) downto 20
+                            do (setf (aref vec (+ i 24)) (aref vec i)))
+                      (dds.rtps.message:put-info-src-into vec 20 (disc-node-guid-prefix node))
+                      (incf len 24)
+                      (setf pool (%ensure-send-scratch-pool node))
+                      (if (null pool)
+                          ;; pool carve failed (arena exhausted at first wrap): allocating fallback — correct +
+                          ;; byte-identical wire, never a silent drop of legit keyed traffic (self-heals once the arena frees).
+                          (let ((srtps (dds.security:encode-rtps-message km kind (subseq vec 20 len) :receivers receivers)))
+                            (if (and srtps (<= (+ 20 (length srtps)) cap))
+                                (progn (replace vec srtps :start1 20) (+ 20 (length srtps)))
+                                nil))
+                          ;; ZA-2 zero-alloc: borrow a scratch, build the bracket into it BY OFFSET (no subseq / →octets),
+                          ;; copy [0,BLEN) back over [20,…) in BUF, release the scratch. Pool exhausted -> %with-send-scratch
+                          ;; is NIL -> fail-closed drop (never a GC fallback).
+                          (%with-send-scratch (scratch node)
+                            (handler-case
+                                (let ((blen (dds.security:encode-rtps-message-into
+                                             scratch 0 km kind vec 20 (- len 20) :receivers receivers)))
+                                  (when (<= (+ 20 blen) cap)
+                                    (replace vec (dds.core.buffer:octet-buffer-vec scratch)
+                                             :start1 20 :end1 (+ 20 blen) :end2 blen)   ; in-place wrap; header kept
+                                    (+ 20 blen)))
+                              (error () nil)))))))))))) ; encode overflow/failure or won't-fit -> fail-closed drop
 
 (defun* %submessage-extent (vec pos len)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum (integer 0))

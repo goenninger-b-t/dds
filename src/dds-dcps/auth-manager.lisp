@@ -41,13 +41,18 @@
    Typed T to avoid an auth-manager-state<->crypto-manager defstruct cycle (crypto-manager loads after).
    PERM-CREDENTIAL: the local participant's signed Permissions document octets (the configured create-participant
    :permissions, the S/MIME §9.4.1.1 form) emitted as the §9.3.2.1 handshake c.perm so a conformant peer's
-   validate_remote_permissions accepts us; empty (default) for an auth-only / no-AccessControl participant (T6)."
+   validate_remote_permissions accepts us; empty (default) for an auth-only / no-AccessControl participant (T6).
+   PSM-SEQ: the monotonic §7.4.3.3 ParticipantStatelessMessage message_identity.sequence_number counter for this
+   participant's stateless writer — ONE per-participant counter shared across the AuthRequestMessageToken + all
+   handshake tokens (was hardcoded 0, a §7.4.3.3 violation that made a strict RTI Connext stateless reader dedup
+   our retransmits). Bumped under LOCK via %am-next-psm-seq; first emitted value is 1 (OpenDDS stateless_sequence_number_)."
   (identity (error "auth-manager-state: :identity is required (the local identity-handle)")
             :type dds.security:identity-handle)
   (lock (dds.pal:make-lock "auth-manager") :type t)
   (crypto-manager nil :type t)
   (perm-credential (make-array 0 :element-type '(unsigned-byte 8))
-                   :type (simple-array (unsigned-byte 8) (*))))
+                   :type (simple-array (unsigned-byte 8) (*)))
+  (psm-seq 0 :type integer))
 
 ;;; --- per-remote auth/key state (DISC-NODE-AUTH-STATE: 12-octet prefix -> AUTH-REMOTE) ---
 
@@ -82,6 +87,15 @@
                  proved possession of the private key for the cert this subject is read from. NIL until
                  :authenticated.
    SUITE: the §9.3.2 auth-suite selected for this pair.
+   FUTURE-CHALLENGE: our OWN §8.7.2.3 future_challenge nonce for this remote (32 octets), minted ONCE at
+                 discovery and reused (stable). It is BOTH the nonce we send in our AuthRequestMessageToken AND —
+                 as the requester's challenge1 / replier's challenge2 — our precommitted handshake challenge a
+                 full peer (RTI Connext) binds to byte-for-byte (§8.7.2.4/§8.7.2.5). NIL for a non-secured remote.
+   REMOTE-FUTURE-CHALLENGE: the remote's §8.7.2.3 future_challenge (32 octets), parsed from ITS
+                 AuthRequestMessageToken; NIL until received. When non-NIL our replier verifies the request's
+                 challenge1 == it, and our requester verifies the reply's challenge2 == it (§8.7.2.5, fail-closed).
+                 §8.7.2.3-optional: a peer that sends none (Fast DDS) leaves this NIL -> the check is SKIPPED
+                 (absence must not false-reject a conformant peer).
    (The KEYX KX-KEY / REMOTE-KM / LOCAL-KM / LOCAL-SENT-P / PENDING-CT slots are RETIRED in T8: the §9.5.2
    KeyMaterial exchange moved off best-effort PSM onto the crypto-manager + reliable PVMS, design §6.4.)"
   (state        :none :type (member :none :handshaking :authenticated :keyed :rejected))
@@ -90,7 +104,9 @@
   (last-sent    nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (remote-token nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (validated-subject nil :type (or null string))
-  (suite        nil :type (or null dds.security:auth-suite)))
+  (suite        nil :type (or null dds.security:auth-suite))
+  (future-challenge nil :type (or null (simple-array (unsigned-byte 8) (32))))
+  (remote-future-challenge nil :type (or null (simple-array (unsigned-byte 8) (32)))))
 
 ;;; --- diagnostics ---
 
@@ -150,41 +166,75 @@
 
 ;;; --- PSM send helpers ---
 
-(defun* %am-send-handshake (node src-prefix dest-prefix token-octets &optional related-guid related-sn)
-    (function (dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
+(defun* %am-next-psm-seq (ms)
+    (function (auth-manager-state) integer)
+  "Return the next monotonic §7.4.3.3 ParticipantStatelessMessage message_identity.sequence_number for MS's
+   participant — ONE per-participant counter shared across the AuthRequestMessageToken + all handshake tokens
+   (OpenDDS stateless_sequence_number_). First value is 1 (RTPS/DDS-Security a valid PSM seq is >= 1). CALLER
+   MUST NOT already hold the manager lock (this takes it for the bump)."
+  (dds.pal:with-lock ((auth-manager-state-lock ms))
+    (incf (auth-manager-state-psm-seq ms))))
+
+(defun* %am-send-psm-dh (ms node src-prefix dest-prefix message-class-id dh related-guid related-sn)
+    (function (auth-manager-state dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
+               (simple-array (unsigned-byte 8) (12)) string (simple-array (unsigned-byte 8) (*))
+               (or null (simple-array (unsigned-byte 8) (16))) (or null integer)) t)
+  "Wrap one CDR-LE DataHolder DH as a §7.4.4 ParticipantGenericMessage with MESSAGE-CLASS-ID and send it over
+   the §7.4.3 PSM stateless transport to DEST-PREFIX. message_identity.source_guid = the participant GUID
+   (ENTITYID_PARTICIPANT); message_identity.sequence_number = the next monotonic §7.4.3.3 counter
+   (%am-next-psm-seq — a strict RTI Connext stateless reader dedups repeats of a stale seq, so this MUST advance).
+   related_message_identity echoes (RELATED-GUID . RELATED-SN), or GUID_UNKNOWN/0 when originating (§7.4.3)."
+  (let* ((src-guid (%guid-from-prefix src-prefix dds.rtps.message:+entityid-participant+))
+         (dst-guid (%guid-from-prefix dest-prefix dds.rtps.message:+entityid-participant+))
+         (zero     (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (env      (dds.security:make-generic-message
+                    :source-guid           src-guid
+                    :sequence-number       (%am-next-psm-seq ms)
+                    ;; §7.4.3 correlation: echo the INCOMING message_identity (RELATED-GUID . RELATED-SN)
+                    ;; into related_message_identity so the replier (Fast DDS) matches our Final to its Reply
+                    ;; (else SecurityManager.cpp:1554 treats it as a missed-reply and resends, never authorizing);
+                    ;; NIL -> GUID_unknown/0 = an originating message (Request / AuthRequest; §8.7.2.4/§8.7.2.3).
+                    :related-guid          (or related-guid zero)
+                    :related-sn            (or related-sn 0)
+                    :dest-participant-guid dst-guid
+                    :dest-endpoint-guid    zero
+                    ;; source_endpoint_key MUST be GUID_UNKNOWN for the participant-to-participant auth handshake
+                    ;; (§7.4.4): Fast DDS generate_authentication_message leaves it unknown and its receiver DROPS
+                    ;; a message whose source_endpoint_key != unknown (SecurityManager process_participant_stateless_message).
+                    :source-endpoint-guid  zero
+                    :message-class-id      message-class-id
+                    :dataholders           (list dh))))
+    (dds.disc:%send-stateless-message node dest-prefix env))
+  t)
+
+(defun* %am-send-handshake (ms node src-prefix dest-prefix token-octets &optional related-guid related-sn)
+    (function (auth-manager-state dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
                (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))
                &optional (or null (simple-array (unsigned-byte 8) (16))) (or null integer)) t)
-  "Wrap a handshake-token (TOKEN-OCTETS = the internal tagged format the handshake API emits)
-   as a §7.4.4 ParticipantGenericMessage with message_class_id +AUTH-MESSAGE-CLASS-ID+ and send
-   it over the §7.4.3 PSM stateless transport to DEST-PREFIX. The token is parsed back to a
-   handshake-token then re-serialized to a §9.3.4 CDR-LE DataHolder (the wire format) — the
-   2b-i bridge between the handshake's internal format and the DataHolder wire format."
+  "Wrap a handshake-token (TOKEN-OCTETS = the internal tagged format the handshake API emits) as a §7.4.4
+   ParticipantGenericMessage with message_class_id +AUTH-MESSAGE-CLASS-ID+ and send it over the §7.4.3 PSM
+   stateless transport to DEST-PREFIX. The token is parsed back to a handshake-token then re-serialized to a
+   §9.3.4 CDR-LE DataHolder (the wire format) — the 2b-i bridge between the internal format and the wire format."
   (let ((tok (dds.security::%parse-token token-octets)))
     (when tok
-      (let* ((dh       (dds.security:handshake-token->dataholder tok))
-             (src-guid (%guid-from-prefix src-prefix dds.rtps.message:+entityid-participant+))
-             (dst-guid (%guid-from-prefix dest-prefix dds.rtps.message:+entityid-participant+))
-             (zero     (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
-             (env      (dds.security:make-generic-message
-                        :source-guid           src-guid
-                        :sequence-number       0
-                        ;; §7.4.3 correlation: echo the INCOMING message_identity (RELATED-GUID . RELATED-SN)
-                        ;; into related_message_identity so the replier (Fast DDS) matches our Final to its Reply
-                        ;; (else SecurityManager.cpp:1554 treats it as a missed-reply and resends, never authorizing);
-                        ;; NIL -> GUID_unknown/0 = the first Request (which carries no related, §8.7.2.4).
-                        :related-guid          (or related-guid zero)
-                        :related-sn            (or related-sn 0)
-                        :dest-participant-guid dst-guid
-                        :dest-endpoint-guid    zero
-                        ;; source_endpoint_key MUST be GUID_UNKNOWN for the participant-to-participant
-                        ;; auth handshake (§7.4.4): Fast DDS generate_authentication_message leaves it
-                        ;; unknown and its receiver DROPS a message whose source_endpoint_key != unknown
-                        ;; (SecurityManager process_participant_stateless_message). Was src-guid — a
-                        ;; cross-vendor divergence (our own receiver ignores the field, so our-to-our was blind to it).
-                        :source-endpoint-guid  zero
-                        :message-class-id      dds.security:+auth-message-class-id+
-                        :dataholders           (list dh))))
-        (dds.disc:%send-stateless-message node dest-prefix env))))
+      (%am-send-psm-dh ms node src-prefix dest-prefix dds.security:+auth-message-class-id+
+                       (dds.security:handshake-token->dataholder tok) related-guid related-sn)))
+  t)
+
+(defun* %am-send-auth-request (ms node src-prefix dest-prefix nonce)
+    (function (auth-manager-state dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
+               (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (32))) t)
+  "Send our §8.7.2.3 AuthRequestMessageToken to DEST-PREFIX over the PSM stateless transport: message_class_id
+   +AUTH-REQUEST-MESSAGE-CLASS-ID+ ('dds.sec.auth_request'), one DataHolder class_id +AUTH-REQUEST-CLASS-ID+
+   ('DDS:Auth:PKI-DH:1.0+AuthReq') with the single binary property future_challenge = NONCE. related_message_identity
+   = GUID_UNKNOWN/0 (originating; §7.4.3). This precommits our handshake challenge; a full replier (RTI Connext)
+   requires it before it will process our HandshakeRequest. A peer that needs no auth_request (Fast DDS) DISCARDS
+   the unknown class silently (SecurityManager 'Discarted ParticipantGenericMessage'), so this never false-rejects."
+  (let* ((tok (dds.security::%make-handshake-token
+               :class-id dds.security:+auth-request-class-id+
+               :binary-props (list (cons dds.security:+prop-future-challenge+ nonce))))
+         (dh  (dds.security:handshake-token->dataholder tok)))
+    (%am-send-psm-dh ms node src-prefix dest-prefix dds.security:+auth-request-message-class-id+ dh nil nil))
   t)
 
 ;; Defined in crypto-manager.lisp (loaded after this file); forward-declared so %am-drive-handshake +
@@ -246,7 +296,10 @@
     (dds.pal:with-lock ((auth-manager-state-lock ms))
       (let ((existing (gethash prefix (dds.disc:disc-node-auth-state node))))
         (when existing (return-from %am-validate-and-record existing))
-        (let ((ar (%make-auth-remote :remote-token (copy-seq token))))
+        ;; §8.7.2.3: mint our future_challenge ONCE per remote here (stable across retransmits) — it is our
+        ;; AuthRequestMessageToken nonce AND our precommitted handshake challenge1/challenge2 (§8.7.2.4/§8.7.2.5).
+        (let ((ar (%make-auth-remote :remote-token (copy-seq token)
+                                     :future-challenge (dds.security:generate-future-challenge))))
           (setf (gethash (copy-seq prefix) (dds.disc:disc-node-auth-state node)) ar)
           ;; role from the REAL RTPS GUID prefixes (§8.7.2.4): deterministic + complementary on
           ;; both peers (validate-remote-identity's T1 cert-sn-hash stand-in is NOT used for the role)
@@ -282,9 +335,16 @@
   (let ((ms (dp-auth-state p)))
     (when (null ms) (return-from %am-on-participant-discovered t))
     (let ((ar (%am-validate-and-record ms node prefix spdp))
-          (req-octets nil) (req-handle nil) (do-send nil) (resend nil))
+          (req-octets nil) (req-handle nil) (do-send nil) (resend nil)
+          (send-ar nil) (auth-nonce nil))
       (when (null ar) (return-from %am-on-participant-discovered t))
       (dds.pal:with-lock ((auth-manager-state-lock ms))
+        ;; §8.7.2.3: (re)send our AuthRequestMessageToken while not yet authenticated (BOTH roles; OpenDDS sends
+        ;; regardless of role). A full replier (RTI Connext) requires our future_challenge before it processes our
+        ;; HandshakeRequest; ours↔ours/Fast-DDS ignore/tolerate it. Retransmitted on each SPDP re-announce (best-effort PSM).
+        (when (and (member (auth-remote-state ar) '(:none :handshaking))
+                   (auth-remote-future-challenge ar))
+          (setf send-ar t auth-nonce (auth-remote-future-challenge ar)))
         (cond
           ;; first request: requester begins the §8.7.2.4 handshake
           ((and (eq (auth-remote-state ar) :none)
@@ -296,7 +356,9 @@
               (auth-manager-state-identity ms) (auth-manager-state-identity ms)
               (auth-remote-suite ar)
               ;; §9.3.2.1 c.perm: our signed Permissions credential so the replier's validate_remote_permissions accepts us (T6)
-              (auth-manager-state-perm-credential ms)))
+              (auth-manager-state-perm-credential ms)
+              ;; §8.7.2.4: challenge1 = our precommitted future_challenge (verbatim) so a full replier binds to it
+              (auth-remote-future-challenge ar)))
            (when req-handle
              (setf (auth-remote-handle ar) req-handle
                    (auth-remote-state ar) :handshaking
@@ -311,10 +373,13 @@
                 (eq (dds.security:handshake-handle-state (auth-remote-handle ar)) :awaiting-reply)
                 (auth-remote-last-sent ar))
            (setf req-octets (auth-remote-last-sent ar) do-send t resend t))))
-      ;; send OUTSIDE the manager lock (PSM send takes the node lock internally)
+      ;; sends OUTSIDE the manager lock (PSM send takes the node lock internally); the AuthRequestMessageToken
+      ;; goes FIRST so a full replier has our future_challenge before it processes the HandshakeRequest (§8.7.2.3).
+      (when send-ar
+        (%am-send-auth-request ms node (dds.disc:disc-node-guid-prefix node) prefix auth-nonce))
       (when do-send
         (unless resend (%am-log prefix "requester: sent HandshakeRequest"))
-        (%am-send-handshake node (dds.disc:disc-node-guid-prefix node) prefix req-octets))))
+        (%am-send-handshake ms node (dds.disc:disc-node-guid-prefix node) prefix req-octets))))
   t)
 
 ;;; --- stateless-message hook: parse + dispatch by message_class_id ---
@@ -336,7 +401,7 @@
    the manager re-sends its stored reply instead of feeding a Req into the Final-expecting state
    machine (which would falsely reject the handshake). Fail-closed: NIL on any malformed input."
   (let ((c (%am-token-class token-octets)))
-    (and c (string= c dds.security::+handshake-request-class-id+) t)))
+    (dds.security::%class-id-role-match-p c dds.security::+handshake-request-class-id+)))
 
 (defun* %am-drive-handshake (ms node prefix ar token-octets in-guid in-sn)
     (function (auth-manager-state dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
@@ -369,7 +434,11 @@
                     (auth-manager-state-identity ms) (auth-manager-state-identity ms)
                     token-octets suite
                     ;; §9.3.2.1 c.perm: our signed Permissions credential so the requester's validate_remote_permissions accepts us (T6)
-                    (auth-manager-state-perm-credential ms))
+                    (auth-manager-state-perm-credential ms)
+                    ;; §8.7.2.5: verify the request's challenge1 == the requester's precommitted future_challenge
+                    ;; (NIL when no auth_request received -> skip, §8.7.2.3-optional); challenge2 = OUR future_challenge (§8.7.2.4)
+                    (auth-remote-remote-future-challenge ar)
+                    (auth-remote-future-challenge ar))
                  (cond
                    ((and reply-octets reply-handle)
                     (setf (auth-remote-handle ar) reply-handle
@@ -398,11 +467,14 @@
              ;; duplicate-request guard above; it never false-rejects on an out-of-role token.
              (if (and (eq (auth-remote-role ar) :requester)
                       (eq (dds.security:handshake-handle-state (auth-remote-handle ar)) :awaiting-reply)
-                      (not (and tclass (string= tclass dds.security::+handshake-reply-class-id+))))
+                      (not (dds.security::%class-id-role-match-p tclass dds.security::+handshake-reply-class-id+)))
                  (%am-log prefix (format nil "requester: dropped out-of-role token (class=~a; awaiting HandshakeReply)"
                                          tclass))
                  (multiple-value-bind (out status)
-                     (dds.security:process-handshake (auth-remote-handle ar) token-octets)
+                     (dds.security:process-handshake (auth-remote-handle ar) token-octets
+                                                     ;; §8.7.2.5: bind the reply's challenge2 to the replier's
+                                                     ;; precommitted future_challenge (NIL -> skip, §8.7.2.3-optional)
+                                                     (auth-remote-remote-future-challenge ar))
                    (case status
                      (:rejected
                       (setf (auth-remote-state ar) :rejected)
@@ -418,10 +490,10 @@
     ;; send the produced handshake token OUTSIDE the manager lock; echo the incoming message_identity
     ;; (IN-GUID . IN-SN) as related_message_identity so a replier peer correlates our Final to its Reply
     (when next-octets
-      (%am-send-handshake node (dds.disc:disc-node-guid-prefix node) prefix next-octets in-guid in-sn))
+      (%am-send-handshake ms node (dds.disc:disc-node-guid-prefix node) prefix next-octets in-guid in-sn))
     ;; retransmit the stored reply for a duplicate request, OUTSIDE the lock (best-effort PSM)
     (when resend
-      (%am-send-handshake node (dds.disc:disc-node-guid-prefix node) prefix resend in-guid in-sn))
+      (%am-send-handshake ms node (dds.disc:disc-node-guid-prefix node) prefix resend in-guid in-sn))
     ;; drive the §8.5.2 crypto-token exchange over reliable PVMS OUTSIDE the lock (T8): derive+install the
     ;; §9.5.3.1 bootstrap KM, register local crypto, send our Participant + builtin/user EntityCrypto tokens.
     (when do-cm
@@ -429,13 +501,41 @@
       (cm-on-authenticated (auth-manager-state-crypto-manager ms) node prefix))
     t))
 
+(defun* %am-store-remote-future-challenge (ms node src-prefix dh-list)
+    (function (auth-manager-state dds.disc:disc-node (simple-array (unsigned-byte 8) (12)) list) t)
+  "Parse a received §8.7.2.3 AuthRequestMessageToken (the first DataHolder of DH-LIST) and store the peer's
+   future_challenge nonce on its AUTH-REMOTE (REMOTE-FUTURE-CHALLENGE) so our replier binds the request's
+   challenge1 to it and our requester binds the reply's challenge2 to it (§8.7.2.5). Version-tolerant class_id
+   match (RTI emits 1.2, ours 1.0). Accepts only a 32-octet future_challenge value. FAIL-CLOSED: a malformed
+   token, a wrong class, a missing/short nonce, or an unknown remote is a SILENT no-op (never crashes the
+   receiver thread, never installs anything). Absence/failure just leaves REMOTE-FUTURE-CHALLENGE NIL, which
+   makes the §8.7.2.5 binding checks SKIP (spec-optional) — it never false-accepts (a WRONG stored nonce would
+   make the handshake FAIL the byte-exact check, so only a genuine peer nonce ever passes)."
+  (when dh-list
+    (let ((tok (dds.security:dataholder->handshake-token (car dh-list))))
+      (when (and tok
+                 (dds.security::%class-id-role-match-p
+                  (dds.security::handshake-token-class-id tok) dds.security:+auth-request-class-id+))
+        (let ((nonce (dds.security::%token-get tok dds.security:+prop-future-challenge+)))
+          (when (and nonce (= (length nonce) 32))
+            (dds.pal:with-lock ((auth-manager-state-lock ms))
+              (let ((ar (gethash src-prefix (dds.disc:disc-node-auth-state node))))
+                (when ar
+                  (let ((stored (make-array 32 :element-type '(unsigned-byte 8))))
+                    (replace stored nonce :end2 32)
+                    (setf (auth-remote-remote-future-challenge ar) stored))
+                  (%am-log src-prefix "received peer AuthRequestMessageToken (future_challenge stored)")))))))))
+  t)
+
 (defun* %am-on-stateless-message (p node src-prefix envelope-octets)
     (function (domain-participant dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
                (simple-array (unsigned-byte 8) (*)))
               t)
   "ON-STATELESS-MESSAGE hook (receiver thread, OUTSIDE the node lock, RAW envelope octets from
    dds-disc per Decision 1): PARSE-GENERIC-MESSAGE, read message_class_id, and DISPATCH the §8.7
-   AUTHENTICATION handshake only —
+   AUTHENTICATION classes only —
+     +AUTH-REQUEST-MESSAGE-CLASS-ID+ ('dds.sec.auth_request') -> store the peer's §8.7.2.3 future_challenge
+       (%AM-STORE-REMOTE-FUTURE-CHALLENGE); no state-machine drive.
      +AUTH-MESSAGE-CLASS-ID+ ('dds.sec.auth')          -> handshake path
        (DATAHOLDER->HANDSHAKE-TOKEN -> %SERIALIZE-TOKEN -> %AM-DRIVE-HANDSHAKE).
    The §8.5.2 CRYPTO-TOKEN exchange NO LONGER rides PSM (T8): it moved to the reliable PVMS endpoint
@@ -452,7 +552,12 @@
           (dds.security:parse-generic-message envelope-octets)
         (declare (ignore rel-guid rel-sn dest-part dest-ep src-ep))
         (when (null class-id) (return-from %am-on-psm t))
-        ;; only the §8.7 handshake class rides PSM now (crypto tokens moved to PVMS, T8)
+        ;; §8.7.2.3 AuthRequestMessageToken ('dds.sec.auth_request'): store the peer's future_challenge and
+        ;; return (it drives no state machine — it only supplies the nonce the handshake binds to, §8.7.2.5).
+        (when (string= class-id dds.security:+auth-request-message-class-id+)
+          (%am-store-remote-future-challenge ms node src-prefix dh-list)
+          (return-from %am-on-psm t))
+        ;; only the §8.7 handshake class rides PSM otherwise (crypto tokens moved to PVMS, T8)
         (unless (string= class-id dds.security:+auth-message-class-id+) (return-from %am-on-psm t))
         ;; locate the per-remote record (must already exist from discovery)
         (let ((ar (dds.pal:with-lock ((auth-manager-state-lock ms))
@@ -481,7 +586,9 @@
    ladder (Decision: strict authenticated-only, allow_unauthenticated = FALSE):
      local NOT security-enabled (no DP-AUTH-STATE)        -> :compatible (security off, unchanged);
      remote :keyed (authenticated + keys installed)        -> :compatible;
-     remote :handshaking / :authenticated (in flight)      -> :pending (park; resumed on :keyed);
+     remote :authenticated, keying required (protection)   -> :pending (park; resumed on :keyed);
+     remote :authenticated, keying NOT required (all-NONE governance) -> :compatible (§8.4.2.9 auth+permissions);
+     remote :handshaking (in flight)                       -> :pending (park; resumed on :authenticated/:keyed);
      remote has NO AUTH-REMOTE (plain peer, no IdentityToken) OR :rejected / :none
                                                            -> :incompatible (strict refuse).
    LOCAL is unused (the verdict is per remote participant); REMOTE supplies the prefix key."
@@ -497,7 +604,13 @@
                        (auth-remote-state ar))))
           (case state
             (:keyed :compatible)
-            ((:handshaking :authenticated) :pending)
+            ;; §7.3/§8.5: a keying-mandating governance parks :authenticated until :keyed (crypto established);
+            ;; an all-NONE governance (disc-node-crypto-keying-required-p NIL) matches at :authenticated on §8.7
+            ;; auth + §8.4 permissions (§8.4.2.9 — keying is a precondition only for PROTECTED endpoints, and a
+            ;; conformant peer such as RTI Connext sends no crypto token at GOV=none). NEVER weakens: the state
+            ;; must still be :authenticated (§8.7 PKI-DH cert-chain + Sign verified); the §8.4 permissions-gate runs next.
+            (:authenticated (if (dds.disc:disc-node-crypto-keying-required-p node) :pending :compatible))
+            (:handshaking :pending)
             (t :incompatible)))))))   ; :rejected / :none -> strict refuse
 
 ;;; --- installer (mirror %INSTALL-TYPE-GATE) ---

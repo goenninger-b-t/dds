@@ -1830,7 +1830,8 @@ distinct from the PVMS exchange).  Live RTI Connext is static only (Slice-5b exi
 | **2c** | Crypto key-exchange: §9.5.3 KxKey + §9.5.2 per-writer KeyMaterial exchanged over PSM, installed per remote (ADR 0034 at capstone) | **LANDED** |
 | **3** | AccessControl plugin (§8.4 / §9.4): CMS-verify signed Governance + Permissions, topic-level allow/deny at all three §8.4 check points, our-to-our (ADR 0035) | **LANDED** |
 | **4** | Secure discovery (§7.3.7 / §8.5): submessage + whole-RTPS protection, origin-auth, reliable PVMS, governance protection-kinds, secure builtin endpoints — **our-to-our complete**; live Fast DDS = bidirectional SPDP discovery + 4 conformant fixes (auth blocked at the propagate-byte divergence) (ADR 0036) | **LANDED** |
-| 5 | Connext-Security live interop + full cross-vendor `auth → keyed → data` (the slice-wide propagate-byte fix + the downstream divergences + live Connext) — the P6 exit gate | pending |
+| 5 | Cross-vendor `auth → keyed → data` — the slice-wide propagate-byte fix + the downstream divergences; **live Fast DDS-Security protected user DATA both directions COMPLETE** (WP-DDS-SECURITY-FASTDDS-INTEROP, ADR 0037) | **LANDED** |
+| **5b** | **Live RTI Connext 7.3.1 both directions** — the §8.7.2.3 AuthRequestMessageToken sub-protocol (challenge-binding) + §7.4.3.3 monotonic PSM `sequence_number` unblock the full-participant handshake; protected user DATA flows BOTH ways ours↔live Connext (the P6 exit gate) (ADR 0040) | **LANDED — DoD reached 2026-07-02** |
 
 ## Cross-vendor secure-discovery interop status (Slice 4 T12, live Fast DDS-Security)
 
@@ -1900,3 +1901,42 @@ Closing the reverse direction (T11reverse) took two conformant reconciliations i
 
 **Live Connext-Security remains the Slice-5b P6 exit gate** (RTI Security Plugins absent). Captures + honest
 writeup: `interop/security-secure-discovery/captures/` (`T11reverse-RESULT.md`).
+
+## Cross-vendor Connext-Security interop status (Slice 5b — live RTI Connext 7.3.1, DoD REACHED 2026-07-02; ADR 0040)
+
+**Protected user DATA now flows BOTH directions ours↔live RTI Connext 7.3.1** (GOV=secure, all-ENCRYPT), the
+P6 exit gate. The forward direction (ours→Connext) was already live-verified in Phase 4 (Connext decodes 8/8 of
+our AEAD-protected `HelloWorld`). The reverse direction (a FULL Connext participant → ours) was blocked at the
+§8.7 PKI-DH handshake by a spec-optional sub-protocol a full participant (unlike `rtiddsspy`) requires — now
+implemented conformantly:
+
+- **§8.7.2.3 AuthRequestMessageToken (challenge-binding / anti-replay).** On discovering a secured remote, a
+  participant mints a 256-bit `future_challenge` nonce (once per remote, stable) and sends it in an
+  AuthRequestMessageToken (`message_class_id` `dds.sec.auth_request`, DataHolder `class_id`
+  `DDS:Auth:PKI-DH:1.0+AuthReq`, binary property `future_challenge`). It then PRECOMMITS its handshake
+  challenge to that nonce byte-for-byte: the requester's `challenge1` == its own `future_challenge`; the
+  replier's `challenge2` == its own `future_challenge`. A full replier VERIFIES the request's `challenge1` ==
+  the requester's advertised `future_challenge` (and, as requester, the reply's `challenge2` == the replier's)
+  — a mismatch is a replayed/forged handshake and is REJECTED fail-closed (`equalp`, no hashing; the
+  OpenDDS/OMG `challenges_match` `memcmp`). The sub-protocol is **§8.7.2.3-OPTIONAL**: a peer that sends no
+  auth_request (Fast DDS v3.6.1) leaves the expected nonce NIL and the binding check is SKIPPED — absence must
+  NOT false-reject a conformant peer, but PRESENCE (Connext) is honored and bound. Derived clean-room from the
+  OMG clauses + OpenDDS `AuthenticationBuiltInImpl.cpp` (no RTI source read; `docs/provenance.md`).
+- **§7.4.3.3 monotonic PSM `message_identity.sequence_number`.** Was hardcoded `0` (a §7.4.3.3 violation) — a
+  strict Connext stateless reader deduped our retransmits. Now one monotonic per-participant counter shared
+  across the auth_request + all three handshake tokens (`source_guid` = the participant GUID; first value 1).
+
+**Live result (`interop/security-connext/run-connext-interop.sh secure 20`, repeatable):**
+- **reverse (Connext=publisher → ours=subscriber):** ours `keyed=T matched=1 samples>0` decoding Connext's
+  GOV=secure AEAD `HelloWorld` content (`"Hello world from Connext"`), `RESULT: PASS` — no post-auth
+  reconciliation was needed (session_id/AAD/KeyMaterial/secure-SEDP/SRTPS all decoded cleanly once the handshake
+  completed; the spec-faithful `future_challenge` property name is exactly what Connext reads).
+- **forward (ours→Connext):** still 8/8 — `rtiddsspy` logs 8× `New data … topic="HelloWorldTopic"`; the residual
+  `DecryptFinal` errors are the benign participant-metatraffic (`0x000001C1`), not the user-data topic.
+
+**Regression:** ours↔ours (auth/handshake/keyx + secure-SEDP + PVMS + access-manager) green on **both** SBCL and
+Clasp; the byte-exact token/handshake/crypto corpora + KATs are UNCHANGED (this is a protocol-flow addition, no
+emitted codec changed). ours↔Fast-DDS: GOV=secure protected user DATA still flows BOTH directions; the
+handshake still reaches `:keyed` (Fast DDS silently discards our unknown `dds.sec.auth_request`, verified
+against `SecurityManager.cpp`), byte-identical to the pre-WP baseline. The live decode is the oracle (tshark
+cannot dissect the macOS `lo0` NULL link layer). Captures: `interop/security-connext/captures/`.

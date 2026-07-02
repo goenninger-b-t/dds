@@ -341,6 +341,16 @@
   (secure-pm-origin-auth nil :type boolean)
   (secure-pm-writer-sn 1 :type integer)
   (secure-spdp-sn 0 :type integer)
+  ;; DDS-Security 1.1 §7.3 / §8.5: T (default) = §8.5 crypto-token keying (ParticipantCrypto / EntityCrypto
+  ;; exchange over PVMS) is a precondition for endpoint matching — the auth + permissions gates require the
+  ;; remote to reach :keyed. NIL = the participant's governance mandates NO protection (every rtps/discovery/
+  ;; liveliness/metadata/data kind NONE), so matched endpoints communicate in the clear and gate on §8.7
+  ;; authentication + §8.4 permissions at :authenticated alone (§8.4.2.9 — matching is an access-control
+  ;; decision; §8.5 crypto is engaged only for protected endpoints). Set from dds.security:governance-any-
+  ;; protection-p by %install-access-control; DEFAULT T is fail-closed (auth-only / no-AccessControl keeps the
+  ;; strict :keyed gate, byte-identical to before). A conformant reference peer (RTI Connext) exchanges no
+  ;; participant crypto token when rtps_protection=NONE, so requiring :keyed there is an over-strict false-REJECT.
+  (crypto-keying-required-p t :type boolean)
   ;; Slice 4 (T10): whole-RTPS-message protection (rtps_protection_kind, DDS-Security 1.1 §8.5.1.10-.12 /
   ;; §9.4.1.2.3). Once two participants are :keyed, the SENDER wraps the post-RTPS-header submessage stream of
   ;; its USER-DATA datagrams as SRTPS_PREFIX ‖ SEC_BODY ‖ SRTPS_POSTFIX keyed by the per-pair ParticipantCrypto,

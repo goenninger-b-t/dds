@@ -106,6 +106,23 @@
   "ProtectionKind for whole-RTPS-message protection — one of +protection-kinds+ (§9.4.1.2.3)."
   (governance-rtps-protection-kind gov))
 
+(defun* governance-any-protection-p (gov)
+    (function (governance) boolean)
+  "T iff GOV mandates ANY cryptographic protection — a domain rtps/discovery/liveliness kind non-NONE, or a
+   topic rule with metadata/data protection non-NONE or discovery/liveliness protection enabled (§9.4.1.2.3/.4).
+   §8.5 crypto-token keying is a §7.3 endpoint-match precondition ONLY when this holds; when NIL (every kind
+   NONE) matched endpoints communicate in the clear and gate on §8.7 authentication + §8.4 permissions alone
+   (§8.4.2.9 — matching is an access-control decision; §8.5 crypto is engaged only for protected endpoints)."
+  (or (not (eq (governance-rtps-protection-kind gov) :none))
+      (not (eq (governance-discovery-protection-kind gov) :none))
+      (not (eq (governance-liveliness-protection-kind gov) :none))
+      (some (lambda (r)
+              (or (not (eq (topic-rule-metadata-protection-kind r) :none))
+                  (not (eq (topic-rule-data-protection-kind r) :none))
+                  (topic-rule-enable-discovery-protection r)
+                  (topic-rule-enable-liveliness-protection r)))
+            (governance-topic-rules gov))))
+
 (defun* protection-kind-base (kind)
     (function (keyword) (values (member :none :sign :encrypt) boolean))
   "Decompose a DDS-Security 1.1 §9.4.1.2 ProtectionKind KIND into (values BASE-KIND ORIGIN-AUTH-P): the

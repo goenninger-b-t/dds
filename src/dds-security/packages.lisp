@@ -127,6 +127,12 @@
    #:free-handshake-handle
    ;; T2: §9.3.4 DataHolder + §7.4.4 ParticipantGenericMessage wire codec (WP-DDS-SECURITY-AUTH-2BI T2)
    #:+auth-message-class-id+
+   ;; §8.7.2.3 AuthRequestMessageToken sub-protocol (challenge-binding / anti-replay) — full-participant
+   ;; (RTI Connext) interop; §8.7.2.3-optional, absence tolerated (WP-DDS-SECURITY-CONNEXT-INTEROP Slice 5b)
+   #:+auth-request-message-class-id+
+   #:+auth-request-class-id+
+   #:+prop-future-challenge+
+   #:generate-future-challenge
    #:handshake-token->dataholder
    #:dataholder->handshake-token
    #:make-generic-message
@@ -178,6 +184,7 @@
    #:governance-discovery-protection
    #:governance-liveliness-protection
    #:governance-rtps-protection
+   #:governance-any-protection-p
    #:protection-kind-base
    #:topic-discovery-protected-p
    #:topic-metadata-protection

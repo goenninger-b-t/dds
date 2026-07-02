@@ -336,7 +336,8 @@
    (b) a keyed remote whose authenticated subject has the EC grant: Square WRITER -> :compatible,
        Circle WRITER -> :incompatible (check_remote_datawriter); Square READER -> :compatible,
        Circle READER -> :incompatible (check_remote_datareader) — real allow/deny + direction;
-   (c) no auth-remote, and an in-flight (not-:keyed) one -> :pending (parked until auth completes);
+   (c) no auth-remote, and a genuinely in-flight (:handshaking) one -> :pending (parked); an :authenticated
+       remote under this all-NONE governance -> :compatible (§8.5 keying not a match precondition, §8.4.2.9);
    (d) a keyed remote whose authenticated subject has NO grant -> :incompatible (no permissions -> deny)."
   (let* ((subject  "/CN=TestParticipantEC/O=DDS-Test/C=DE")
          (grants   (dds.security:parse-permissions (%read-ac-xml "permissions.xml")))
@@ -372,12 +373,21 @@
              (%check :am-no-authremote-pending
                      (eq :pending (dds.dcps::%participant-permissions-gate p node sq-w local))
                      "no auth-remote (auth not started) must be :pending")
-             ;; in-flight auth-remote (handshake done, key-exchange not -> NOT yet :keyed) -> :pending
-             (let ((ar (%ac-insert-remote node prefix subject :authenticated)))
-               (%check :am-not-keyed-pending
+             ;; genuinely in-flight auth-remote (handshake NOT complete) -> :pending (parked until auth settles)
+             (let ((ar (%ac-insert-remote node prefix subject :handshaking)))
+               (%check :am-handshaking-pending
                        (eq :pending (dds.dcps::%participant-permissions-gate p node sq-w local))
-                       "auth-remote not :keyed (auth in flight) must be :pending")
-               ;; (b) flip to :keyed -> the real allow/deny matcher decides per topic + direction
+                       "auth-remote :handshaking (auth in flight) must be :pending")
+               ;; §8.4.2.9 / §8.5: governance.xml mandates NO protection (every kind NONE) so disc-node-crypto-
+               ;; keying-required-p is NIL -> §8.5 keying is NOT a match precondition. At :authenticated (auth
+               ;; complete, the §8.7.2.5 validated subject bound) the gate authorizes on §8.7 auth + §8.4 permissions
+               ;; alone: the EC grant allows Square + remote writer -> :compatible (a keyed remote is not required —
+               ;; a conformant peer such as RTI Connext sends no crypto token at GOV=none).
+               (setf (dds.dcps::auth-remote-state ar) :authenticated)
+               (%check :am-authenticated-noprotection-compatible
+                       (eq :compatible (dds.dcps::%participant-permissions-gate p node sq-w local))
+                       "auth-remote :authenticated + all-NONE governance -> :compatible (keying not a match precondition, §8.4.2.9)")
+               ;; (b) flip to :keyed -> the real allow/deny matcher decides per topic + direction (unchanged)
                (setf (dds.dcps::auth-remote-state ar) :keyed)
                (%check :am-keyed-square-writer-compatible
                        (eq :compatible (dds.dcps::%participant-permissions-gate p node sq-w local))
