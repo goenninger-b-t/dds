@@ -227,6 +227,16 @@
          (funcall callback)))))
   t)
 
+(defun* register-image-restart-hook (hook)
+    (function ((or symbol function)) (eql t))
+  "Register HOOK (a 0-arg function or fbound symbol) to run at IMAGE STARTUP — after a save-lisp-and-die dump
+   is restarted, before the toplevel — via sb-ext:*init-hooks*. The portable seam for re-resolving state a
+   dumped core cannot carry live across restart (foreign-symbol pointers, re-mapped shared libraries). The
+   owning module registers ONCE at its load time; on a load-from-source run the hook simply never fires (no
+   restart occurs). Idempotent (pushnew, eq). No reader conditional escapes dds-pal/."
+  (pushnew hook sb-ext:*init-hooks* :test #'eq)
+  t)
+
 (defun* gc-suggest ()
     (function () (values))
   "Suggest a GC to the implementation. M0 no-op."

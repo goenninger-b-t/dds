@@ -264,6 +264,66 @@
 
     t))
 
+(defun* run-dare-image-restart-reresolve-test ()
+    (function () t)
+  "WP-ADR-SMALL-CARRIES C3 (ADR 0038/0039 saved-image residual, resolved): the DARE libcrypto foreign-pointer
+   caches survive an image restart (save-lisp-and-die). Actually dumping + restarting an image in-test is
+   impractical, so this SIMULATES the post-restart staleness — NIL out a sample of %ossl-sym boxes + the
+   EVP_aes_256_gcm() cipher singleton (the exact caches a re-mapped libcrypto dangles) — then drives the real
+   image-restart hook %DARE-RERESOLVE-FOREIGN-POINTERS and proves it (a) REPOPULATES every nulled cache and
+   (b) re-resolves them CORRECTLY: a seal/open through the re-resolved pointers is BYTE-IDENTICAL to the same
+   operation through the original (pre-null) pointers, and fail-closed on a tamper. Vectors are self-referential
+   (a reference seal captured before nulling), so no KAT constant is duplicated. Requires OpenSSL >= 3.5."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [dare-image-restart-reresolve] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-dare-image-restart-reresolve-test t)))
+  (let* ((key (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x2a))
+         (nonce (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x13))
+         (aad (octets 1 2 3 4 5 6 7 8))
+         (pt (octets #xde #xad #xbe #xef #xca #xfe #xba #xbe #x00 #x11 #x22 #x33))
+         ;; reference output through the LIVE (pre-restart) caches — the correctness oracle
+         (ref-ct nil) (ref-tag nil)
+         ;; the exact cache set a re-mapped libcrypto dangles: the seal/open EVP boxes + the cipher singleton
+         (box-names '("EVP_EncryptInit_ex" "EVP_EncryptUpdate" "EVP_EncryptFinal_ex"
+                      "EVP_DecryptInit_ex" "EVP_DecryptUpdate" "EVP_CIPHER_CTX_new"))
+         (boxes (mapcar #'dds.dare::%ossl-sym-box box-names)))
+    (multiple-value-bind (ct tag) (dds.dare:aes-256-gcm-seal key nonce aad pt)
+      (setf ref-ct ct ref-tag tag))
+    ;; simulate the dumped-image restart: dangle the cached pointers
+    (dolist (b boxes) (setf (svref b 0) nil))
+    (setf dds.dare::*%aes-256-gcm-cipher* nil)
+    (%check :dare-reresolve-staleness-simulated
+            (and (every (lambda (b) (null (svref b 0))) boxes)
+                 (null dds.dare::*%aes-256-gcm-cipher*))
+            "pre-condition: nulled boxes + cipher must be NIL (dangling-pointer simulation)")
+    ;; drive the REAL image-restart hook
+    (%check :dare-reresolve-returns-t
+            (eq t (dds.dare::%dare-reresolve-foreign-pointers))
+            "%dare-reresolve-foreign-pointers must return T")
+    ;; (a) every nulled cache repopulated
+    (%check :dare-reresolve-boxes-repopulated
+            (every (lambda (b) (svref b 0)) boxes)
+            "re-resolve must repopulate every %ossl-sym box slot (no dangling NIL)")
+    (%check :dare-reresolve-cipher-repopulated
+            dds.dare::*%aes-256-gcm-cipher*
+            "re-resolve must repopulate *%aes-256-gcm-cipher*")
+    ;; (b) re-resolved pointers are CORRECT: byte-identical seal + round-trip open + tamper fail-closed
+    (multiple-value-bind (ct2 tag2) (dds.dare:aes-256-gcm-seal key nonce aad pt)
+      (%check :dare-reresolve-seal-byte-identical
+              (and (equalp ct2 ref-ct) (equalp tag2 ref-tag))
+              "seal through re-resolved pointers must be byte-identical to the pre-restart output")
+      (%check :dare-reresolve-open-roundtrip
+              (equalp (dds.dare:aes-256-gcm-open key nonce aad ct2 tag2) pt)
+              "open through re-resolved pointers must round-trip to the plaintext")
+      (let ((bad (copy-seq tag2)))
+        (setf (aref bad 0) (logxor (aref bad 0) 1))
+        (%check :dare-reresolve-open-tamper-fail-closed
+                (null (dds.dare:aes-256-gcm-open key nonce aad ct2 bad))
+                "open through re-resolved pointers must fail-closed (NIL) on a tampered tag"))))
+  t)
+
 (defun* run-dare-ml-kem-kat-test ()
     (function () t)
   "ML-KEM-1024 (FIPS-203) round-trip + byte-exact decaps KAT + wrong-key tests.

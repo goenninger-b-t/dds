@@ -366,7 +366,11 @@ The send wrap reads the plaintext from the reused `tx-msg`, writes the (larger: 
 into a **separate** pooled scratch, then `replace`s it back in place — no in-place aliasing.  `secure-rx` /
 `bracket-rx` are distinct pools so a decode never reads its input from the buffer it is writing its output into, and
 each concurrent receiver thread borrows its **own** buffer (the Slice-2 review caught and fixed a shared-RX-buffer
-race here).
+race here).  The USER `metadata_protection` RECEIVE path (`%on-user-secure-submessage`) decodes the recovered
+submessage into a `secure-rx` buffer, synthesizes its 20-octet RTPS Header **zero-alloc** via the raw-offset
+`dds.rtps.message:write-header-into` (the cursor-based `write-header` consed ~49 B/sample — a residual the
+`meta-recv` defense-in-depth `make mem` arm, which now drives the REAL `%on-secure-submessage` dispatcher, surfaced
+and closed; WP-ADR-SMALL-CARRIES C2), then re-dispatches through the normal receive path.
 
 **Exhaustion is fail-closed, never a GC fallback.**  A drained send/`submsg-scratch` pool → the required wrap returns
 `NIL` (a `RESOURCE_LIMITS` drop); a drained `bracket-rx` pool → the metadata datagram is dropped and re-delivered on

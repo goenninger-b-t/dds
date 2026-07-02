@@ -549,6 +549,16 @@ honoured first) to avoid binding the system LibreSSL, which lacks ML-KEM; on Lin
 `libcrypto.so.3`. No hand-rolled crypto (FR-SEC-2); OpenSSL is SBOM-pinned and recorded in
 `docs/provenance.md`.
 
+**Dumped-image (`save-lisp-and-die`) contract.** DARE caches every `libcrypto` function pointer (the
+`%ossl-sym` boxes) plus the `EVP_aes_256_gcm()` cipher singleton. Those pointers are resolved once at
+load and would go **stale across a dumped image** — on restart the shared library is re-mapped at a new
+address, so a naively cached pointer would dangle and the first AEAD/X.509 call would crash. DARE closes
+this by resolving through **re-resolvable boxes** and registering an **image-restart hook**
+(`%dare-reresolve-foreign-pointers`) via the portable PAL seam `dds.pal:register-image-restart-hook`
+(SBCL `sb-ext:*init-hooks*`, Clasp `core:*initialize-hooks*`), which re-opens `libcrypto` and
+re-resolves every cached pointer on startup. So a **delivered durability-service executable** built with
+`save-lisp-and-die` re-resolves crypto automatically on launch — no action required by the operator.
+
 ### 7.4 Scope & follow-ons
 
 DARE 3a protects **stored payloads** (confidentiality + integrity + authenticity; tampering is

@@ -278,27 +278,52 @@ convention). `run-security-origin-auth-test` block (4) proves the `-into` verify
 The old allocating `%compute-receiver-macs` / `%verify-receiver-mac` / `%parse-sec-postfix-mac` are retained as
 byte-identity reference implementations. **No residual remains — both send and receive are closed.**
 
-**(b) `key-id-rx` third pool vs a packed-fixnum key (Minor, accepted).** The 4-octet `transformation_key_id` scratch
-is a third RX pool because a `dynamic-extent` stack array does not stack-allocate for a *specialized*
-`(unsigned-byte 8)` array on this SBCL, and the `equalp`-keyed resolvers require a specialized array. An alternative
-that drops the pool entirely is to re-key the resolvers by the 4 octets packed into a fixnum. Accepted as-is (the
-pool is 4 bytes × capacity, torn down at `stop-node`, with an allocating self-healing fallback on carve failure).
+**(b) `key-id-rx` third pool vs a packed-fixnum key — ACCEPTED AS DESIGNED (WP-ADR-SMALL-CARRIES C1, 2026-07-03;
+not an open residual).** The 4-octet `transformation_key_id` scratch is a third per-node RX pool because a
+`dynamic-extent` stack array does not stack-allocate for a *specialized* `(unsigned-byte 8)` array on this SBCL, and
+the `equalp`-keyed resolvers (`cm-*-by-key-id`, secure-SEDP DECODE) require a specialized array. **The pool is the
+accepted design:** it is **bounded** (4 bytes × capacity, the same `*srtps-send-scratch-capacity*` headroom as the
+other four pools), **per-thread-distinct** (each receiver thread borrows its own buffer via the one DRY
+`%with-scratch` macro — no shared sink, no race), **zero-alloc** on the hit path (a pool borrow, not a `subseq`),
+torn down at `stop-node`, and self-healing (an allocating heap-4-array fallback on carve failure — correct,
+byte-identical). The alternative that drops the pool — re-keying every resolver by the 4 octets packed into a fixnum
+— was **assessed and rejected as high-ripple / low-value**: the fixnum key would ripple through the crypto-manager
+key_id index **and ~12 test lambdas** (every `equalp`-keyed decode resolver + its fixtures) for no allocation,
+correctness, or wire benefit over the already-bounded, already-zero-alloc pool. No code change; recorded as the
+settled decision.
 
-**(c) The `meta-recv` mem arm defense-in-depth (Minor).** The `meta-recv` arm inlines the RX transform (pooled
-bracket extract + stack-free key_id read + resolve + distinct-pool decode-into) and stubs the resolver rather than
-driving through the production `%on-secure-submessage` hook. It is baseline-neutral and exercises the **real** pooled
-RX primitives (`%with-bracket-rx-scratch`, `%secure-bracket-key-id-into`, `%with-secure-rx-scratch`,
-`decode-datawriter-submessage-into`); the dispatch wrapper itself is covered by the e2e secure-discovery tests.
-Routing the arm through `%on-secure-submessage` for defense-in-depth was **deliberately deferred** at the capstone:
-it would pull the re-dispatch baseline delivery (loan registration + sample delivery) into the measured window and
-break the EXACT 0.0000 delta, and isolating just the transform through that entry point would require stubbing the
-inner delivery — destabilizing a passing, reviewed test for marginal coverage gain.
+**(c) The `meta-recv` mem arm defense-in-depth. — RESOLVED (WP-ADR-SMALL-CARRIES C2, 2026-07-03).** The `meta-recv`
+arm formerly inlined the RX transform (pooled bracket extract + stack-free key_id read + resolve + distinct-pool
+decode-into) rather than driving the production `%on-secure-submessage` hook, so a future alloc slipping into the
+dispatch WRAPPER (`%on-secure-submessage` / `%on-user-secure-submessage`) would not be caught by `make mem` — only by
+the e2e secure-discovery tests, which do not measure allocation. **Closed by C2:** the arm now drives the REAL
+`%on-secure-submessage` via a DIFFERENTIAL that cancels the re-dispatch delivery cost the capstone was worried about
+— BASE = `%handle-datagram` on the recovered PLAIN datagram (the non-secured baseline: parse/deliver, no transform);
+SEC = the `%with-bracket-rx-scratch` copy (mirroring `%handle-datagram`) + `%on-secure-submessage` (key-id-rx resolve
+→ `%on-user-secure-submessage` decode into secure-rx → the SAME re-dispatch). The identical re-dispatch cancels, so
+the delta is the dispatcher's OWN alloc. **The defense-in-depth immediately paid off: it surfaced a real ~49 B/sample
+residual** — `%on-user-secure-submessage` consed a `dds.core.buffer:cursor` per received sample solely to write the
+20-octet RTPS Header before re-dispatch (a zero-alloc regression the isolated arm never saw). **Fixed** with a
+zero-alloc raw-offset `dds.rtps.message:write-header-into` (byte-identical to `write-header`, mirroring
+`put-info-src-into`), so the user metadata_protection RECEIVE path is genuinely zero-alloc. To keep the delta HONEST,
+BASE re-dispatches `RXFIXED` — a datagram built by the SAME decode + `write-header-into` — so the two `%handle-datagram`
+re-dispatches are byte-identical and cancel exactly. **The SEC pooled RX ops add 0 real B/sample; `meta-recv` reports a
+stable ~0.16 B/sample through the real dispatcher** (SBCL; Clasp smokes) — that residual is **one 64 KB GC-region quantum
+amortized over 400 k iters** (`bytes-consed` rounds to the GC boundary the large ~176 B cancelling re-dispatch crosses;
+it scales as 65536/n, proving it is measurement quantization, NOT a per-sample alloc), well under the `< 1.0` NFR-MEM
+gate. **A second finding, honestly recorded:** an EXACT `0.0000` is NOT achievable while the ~176 B re-dispatch is inside
+the measured window (the GC quantum is irreducible for any practical iter count) — which VALIDATES the capstone's
+deferral rationale; the quantization is amortized (not stubbed) rather than the re-dispatch excluded. No stub, no wire
+change — the recovered header is byte-identical, the corpora + KAT stay green unchanged.
 
 **(d) The ZA-1 non-tier residuals — unchanged/open (tracked under ADR 0038).** Not specific to these two tiers, so
 not touched here: KeyMaterial GC-heap → foreign + zeroize (ADR-0034 deferral); Zero-Copy × `rtps_protection` SHMEM
-cleartext (ADR-0036 Carry 10); saved-image foreign-pointer staleness (the `load-time-value`/`eval-when`-cached EVP
-pointers go stale across `save-lisp-and-die` → add a re-resolve init hook if a build dumps a core); the M0 PAL
-atomics stubs (`dds.pal:cas`/`atomic-incf` unimplemented → the send-refcount uses the writer lock). Also carried from
+cleartext (ADR-0036 Carry 10); saved-image foreign-pointer staleness — **RESOLVED (WP-ADR-SMALL-CARRIES C3):** the
+`load-time-value`-cached EVP pointers went stale across `save-lisp-and-die`; `%ossl-sym` now resolves through a
+re-resolvable box and an image-restart hook (`%dare-reresolve-foreign-pointers`, registered via the new portable
+`dds.pal:register-image-restart-hook` — SBCL `*init-hooks*` / Clasp `core:*initialize-hooks*`) re-resolves every box
++ the cipher on startup (ADR 0038 Residual (d)); the M0 PAL atomics stubs (`dds.pal:cas`/`atomic-incf` unimplemented
+→ the send-refcount uses the writer lock). Also carried from
 ADR 0038 Residual (a): when a future `rtps_protection` **rekeying** (session_id rotation) lands, it must confirm the
 decode receiver stays single-threaded per km OR harden `%km-session-key-at`'s two-slot publish against a
 concurrent-different-session_id tear (the fence protocol is tear-safe only while session_id is effectively constant

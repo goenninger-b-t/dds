@@ -99,9 +99,37 @@
 (eval-when (:load-toplevel :execute)
   (setf *libcrypto* (%load-libcrypto)))
 
+;;; %ossl-sym resolves an OpenSSL symbol to a cached foreign function pointer. To survive a DUMPED IMAGE
+;;; (save-lisp-and-die), the pointer is NOT stored directly in a per-call-site (load-time-value … t): that value is
+;;; frozen into the image and CANNOT be re-resolved after libcrypto is re-mapped at a new address on image restart,
+;;; so the first AEAD/X.509 call after restart would dereference a dangling pointer. Instead each NAME resolves to a
+;;; shared MUTABLE 1-slot box, interned once in *OSSL-SYM-BOXES*; every call site caches the BOX (stable identity) in
+;;; a load-time-value and reads slot 0 per call. The image-restart hook %DARE-RERESOLVE-FOREIGN-POINTERS re-resolves
+;;; every box IN PLACE, so all call sites see live pointers after restart. Per-call cost is one SVREF — no measurable
+;;; change vs the prior direct load-time-value, and still zero cons. (ADR 0038/0039 saved-image residual.)
+(defvar *ossl-sym-boxes* (make-hash-table :test 'equal)
+  "NAME (string) -> a mutable 1-slot (simple-vector 1) box holding the resolved libcrypto foreign-symbol-pointer for
+   NAME (NIL when unresolved). All %ossl-sym call sites for a NAME share ONE box; the boxes are interned at load
+   (each call site's load-time-value evaluates %OSSL-SYM-BOX) and re-resolved IN PLACE by %DARE-RERESOLVE-FOREIGN-
+   POINTERS at image restart, so a dumped image (save-lisp-and-die) re-populates every cached EVP/X.509 pointer
+   rather than dereferencing a dangling one. See %OSSL-SYM for the save-lisp-and-die contract.")
+
+(defun* %ossl-sym-box (name)
+    (function (string) simple-vector)
+  "Return the shared mutable 1-slot box for the libcrypto symbol NAME, interning + resolving it once in
+   *OSSL-SYM-BOXES*. Slot 0 holds (cffi:foreign-symbol-pointer NAME :library *libcrypto*), NIL when libcrypto is
+   absent; it is re-resolved in place by the image-restart hook. Called at LOAD time from each %ossl-sym call site's
+   load-time-value (so the box exists before any AEAD/X.509 call), never on the per-call path."
+  (or (gethash name *ossl-sym-boxes*)
+      (setf (gethash name *ossl-sym-boxes*)
+            (vector (cffi:foreign-symbol-pointer name :library *libcrypto*)))))
+
 (defmacro %ossl-sym (name)
-  "Cached function pointer for OpenSSL symbol NAME; resolved once at load time via *LIBCRYPTO*."
-  `(load-time-value (cffi:foreign-symbol-pointer ,name :library *libcrypto*) t))
+  "Cached function pointer for OpenSSL symbol NAME, resolved through a re-resolvable box (%OSSL-SYM-BOX) so the cache
+   survives a DUMPED IMAGE (save-lisp-and-die): the per-call-site load-time-value caches the shared BOX (stable
+   identity) and slot 0 — re-resolved at image restart by %DARE-RERESOLVE-FOREIGN-POINTERS — carries the live pointer.
+   One SVREF per call (zero cons; no measurable change from the prior direct load-time-value pointer)."
+  `(svref (load-time-value (%ossl-sym-box ,name) nil) 0))
 
 ;;; --- version gate ---
 
@@ -241,6 +269,37 @@
           (cffi:foreign-funcall-pointer
            (cffi:foreign-symbol-pointer "EVP_aes_256_gcm" :library *libcrypto*)
            nil :pointer))))
+
+;;; --- saved-image (save-lisp-and-die) foreign-pointer re-resolution (ADR 0038/0039 residual, resolved) ---
+;;; All libcrypto pointers DARE caches — the %ossl-sym boxes (every EVP/X.509 function pointer) and the
+;;; EVP_aes_256_gcm() cipher singleton — are resolved ONCE at load and frozen into a dumped image; *%null-ptr*
+;;; is address 0 (reload-stable) so it needs no re-resolution. On image restart libcrypto is re-mapped at a new
+;;; address, so the frozen pointers dangle. This hook (registered via the portable dds.pal seam) re-opens
+;;; *libcrypto* and re-resolves every box + the cipher IN PLACE at startup, before any AEAD/X.509 call.
+
+(defun* %dare-reresolve-foreign-pointers ()
+    (function () (eql t))
+  "Re-resolve every cached libcrypto foreign pointer after an image restart (save-lisp-and-die). Re-opens
+   *LIBCRYPTO*, then re-resolves every %OSSL-SYM box in *OSSL-SYM-BOXES* IN PLACE (so all EVP/X.509 call sites see
+   the live pointer) and *%AES-256-GCM-CIPHER*; *%NULL-PTR* is address 0 (reload-stable) and is intentionally left
+   as-is. Registered as an image-restart hook (dds.pal:register-image-restart-hook) at DARE load, so the FIRST
+   AEAD/X.509 call after a dumped core restarts uses live pointers, not dangling ones. Idempotent + safe when
+   libcrypto is absent (the boxes stay NIL). §5.1 save-lisp-and-die contract: any build that dumps a core carrying
+   dds.dare (e.g. a delivered durability-service executable, CLAUDE.md §1) has this hook, so it re-resolves crypto
+   on startup instead of the latent dangling-pointer AEAD call this residual described."
+  (setf *libcrypto* (%load-libcrypto))
+  (when *libcrypto*
+    (maphash (lambda (name box)
+               (setf (svref box 0) (cffi:foreign-symbol-pointer name :library *libcrypto*)))
+             *ossl-sym-boxes*)
+    (setf *%aes-256-gcm-cipher*
+          (cffi:foreign-funcall-pointer
+           (cffi:foreign-symbol-pointer "EVP_aes_256_gcm" :library *libcrypto*)
+           nil :pointer)))
+  t)
+
+(eval-when (:load-toplevel :execute)
+  (dds.pal:register-image-restart-hook '%dare-reresolve-foreign-pointers))
 
 ;;; EVP_PKEY KEM bindings for ML-KEM-1024 (Task 3).
 ;;;

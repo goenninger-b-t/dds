@@ -35,6 +35,10 @@
    #:condvar-broadcast
    ;; process signal handling (SIGTERM/SIGINT -> 0-arg callback; ADR 0026 §10 graceful teardown)
    #:install-signal-handler
+   ;; image lifecycle: run a 0-arg hook at startup after a save-lisp-and-die restart, so a dumped core
+   ;; can re-resolve state it cannot carry live across restart, e.g. foreign-symbol pointers / re-mapped
+   ;; libraries (dds.dare EVP re-resolution; ADR 0038/0039 saved-image residual)
+   #:register-image-restart-hook
    ;; clock
    #:monotonic-ns
    ;; UDPv4 sockets (native, FR-XPORT-1)

@@ -89,6 +89,24 @@
   (dds.core.buffer:put-octets cursor guid-prefix 0 12)
   (dds.core.buffer:cursor-position cursor))
 
+(defun* write-header-into (vec off guid-prefix &optional (vendor *vendor-id*))
+    (function ((simple-array (unsigned-byte 8) (*)) fixnum (simple-array (unsigned-byte 8) (*))
+               &optional (unsigned-byte 16)) (integer 20 20))
+  "Write the 20-octet RTPS Header (RTPS 2.5 §9.4.4) into VEC at raw offset OFF: +protocol-id+(4) ‖
+   version-major(1) ‖ version-minor(1) ‖ VendorId(2) ‖ GuidPrefix(12). The ZERO-ALLOC raw-offset twin of
+   WRITE-HEADER (which conses a dds.core.buffer:cursor per call, ~49 B) — byte-identical output — for the secure
+   metadata_protection RECEIVE re-dispatch hot path (%on-user-secure-submessage synthesizes a header for the
+   recovered submessage per sample). GUID-PREFIX is 12 octets; header fields are octet arrays so there is no
+   endianness. Returns 20 (octets written); the CALLER ensures OFF+20 <= (length VEC)."
+  (assert (= 12 (length guid-prefix)))
+  (replace vec +protocol-id+ :start1 off :end1 (+ off 4) :start2 0 :end2 4)
+  (setf (aref vec (+ off 4)) +protocol-version-major+
+        (aref vec (+ off 5)) +protocol-version-minor+
+        (aref vec (+ off 6)) (ldb (byte 8 8) vendor)
+        (aref vec (+ off 7)) (ldb (byte 8 0) vendor))
+  (replace vec guid-prefix :start1 (+ off 8) :end1 (+ off 20) :start2 0 :end2 12)
+  20)
+
 (defun* put-info-src-into (vec off guid-prefix)
     (function ((simple-array (unsigned-byte 8) (*)) fixnum (simple-array (unsigned-byte 8) (*))) (integer 24 24))
   "Write a 24-octet INFO_SRC submessage (RTPS 2.5 §9.4.5.9 / §8.3.7.9) into VEC at raw offset OFF declaring

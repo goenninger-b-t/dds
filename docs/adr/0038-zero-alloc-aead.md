@@ -254,10 +254,19 @@ to foreign/static buffers with zeroize-on-teardown is the hardening follow-on (A
 reference datagram is RTPS-wrapped; the payload sits in shared memory in the clear. Reconciling SHMEM with
 `rtps_protection` confidentiality is a backlog item (and crypto+ZC is loud-guarded per ADR 0031).
 
-**(d) Saved-image foreign-pointer staleness (T1b-i).** The `load-time-value` / `eval-when`-cached EVP function
-pointers + the `EVP_aes_256_gcm()` handle are correct for load-from-source (tests + `make`) but go **stale across a
-dumped image** (`save-lisp-and-die`). If any build dumps a core/executable, add an `sb-ext:*init-hooks*` (and the
-Clasp equivalent) to re-resolve the EVP pointers + cipher on startup.
+**(d) Saved-image foreign-pointer staleness (T1b-i). — RESOLVED (WP-ADR-SMALL-CARRIES C3, 2026-07-03).** The
+`load-time-value` / `eval-when`-cached EVP function pointers + the `EVP_aes_256_gcm()` handle were correct for
+load-from-source (tests + `make`) but went **stale across a dumped image** (`save-lisp-and-die`): on restart the
+shared library is re-mapped at a new address, so the first AEAD/X.509 call would dereference a dangling pointer.
+**Closed by C3:** `%ossl-sym` now resolves each symbol through a shared, re-resolvable **box** (a 1-slot vector
+interned in `*ossl-sym-boxes*`; per-call cost is one `svref`, still zero cons) instead of a frozen per-call-site
+`load-time-value` pointer, and an image-restart hook `%dare-reresolve-foreign-pointers` re-opens `*libcrypto*` +
+re-resolves every box + `*%aes-256-gcm-cipher*` in place on startup (`*%null-ptr*` is address 0, reload-stable, so
+it is left as-is). The hook is registered through a new **portable PAL seam** `dds.pal:register-image-restart-hook`
+(SBCL `sb-ext:*init-hooks*`, Clasp `core:*initialize-hooks*`; the only place the reader conditional lives is
+`dds-pal/`). `run-dare-image-restart-reresolve-test` simulates the post-restart staleness (nulls a sample of boxes
++ the cipher) and proves the hook repopulates them and that a seal/open through the re-resolved pointers is
+byte-identical to the pre-restart output (fail-closed on tamper). Wire + KAT/corpora unchanged.
 
 **(e) M0 atomics stubs.** `dds.pal:cas` / `atomic-incf` are unimplemented (they error) on both impls, so the
 cache-change send-refcount uses the writer lock (contract §4 sanctions the existing per-cache lock). Revisit the

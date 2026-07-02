@@ -2902,6 +2902,7 @@
                  ("durability-dispose-replay"     . run-durability-dispose-replay-test)
                  ("dare-sha384-hkdf-kat"          . run-dare-sha384-hkdf-kat-test)
                  ("dare-aes-gcm-kat"             . run-dare-aes-gcm-kat-test)
+                 ("dare-image-restart-reresolve" . run-dare-image-restart-reresolve-test)
                  ("dare-ml-kem-kat"              . run-dare-ml-kem-kat-test)
                  ("dare-envelope"                . run-dare-envelope-test)
                  ("dare-key-provider"            . run-dare-key-provider-test)

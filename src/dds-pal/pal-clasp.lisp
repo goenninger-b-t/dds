@@ -281,6 +281,17 @@
                            (remove :int *signal-handlers* :key #'car)))))))
   t)
 
+(defun* register-image-restart-hook (hook)
+    (function ((or symbol function)) (eql t))
+  "Register HOOK (a 0-arg function or fbound symbol) to run at IMAGE STARTUP — after a save-lisp-and-die snapshot
+   is restarted, before the toplevel — via core:*initialize-hooks* (Clasp's standard-toplevel funcalls each hook
+   at startup). The portable seam for re-resolving state a dumped snapshot cannot carry live across restart
+   (foreign-symbol pointers, re-mapped shared libraries; Clasp re-opens CFFI libraries on snapshot restart but
+   self-cached raw pointers still need re-resolution). The owning module registers ONCE at its load time.
+   Idempotent (pushnew, eq). No reader conditional escapes dds-pal/."
+  (pushnew hook core:*initialize-hooks* :test #'eq)
+  t)
+
 (defun* gc-suggest ()
     (function () (values))
   "Suggest a GC to the implementation. M0 no-op."

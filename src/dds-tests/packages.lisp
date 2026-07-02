@@ -26,6 +26,7 @@
            #:run-durability-dispose-replay-test
            #:run-dare-sha384-hkdf-kat-test
            #:run-dare-aes-gcm-kat-test
+           #:run-dare-image-restart-reresolve-test
            #:run-dare-ml-kem-kat-test
            #:run-dare-envelope-test
            #:run-dare-key-provider-test

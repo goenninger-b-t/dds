@@ -296,8 +296,9 @@
                       (:encrypt nil)   ; plaintext already written into rx[20,20+data-len) by decode-into
                       (:sign (replace vec bracket :start1 20 :end1 (+ 20 data-len)   ; verbatim region -> [20,…) in place
                                       :start2 data-off :end2 (+ data-off data-len))))
-                    (let ((mc (dds.core.buffer:cursor rx :endianness :little)))
-                      (dds.rtps.message:write-header mc src-prefix))   ; 20-octet RTPS Header w/ SRC prefix at [0,20)
+                    ;; ZA-2 zero-alloc: write the 20-octet RTPS Header by raw offset (write-header-into) — the cursor
+                    ;; twin (write-header) conses ~49 B/sample, the residual the C2 defense-in-depth arm surfaced.
+                    (dds.rtps.message:write-header-into vec 0 src-prefix)   ; 20-octet RTPS Header w/ SRC prefix at [0,20)
                     (%handle-datagram node rx (+ 20 data-len) t))))   ; t = rtps-unwrapped (AEAD already authenticated)
             (error () nil)))   ; decode / bounds failure -> fail-closed drop
         ;; RX pool carve failed (arena exhausted): allocating fallback — correct + byte-identical, self-heals. An
@@ -1640,14 +1641,19 @@
    reported as `plain=.. secured=.. -> delta=.. B/sample`:
      (a) metadata_protection SEND    — %maybe-wrap-user-submessages, resolver OFF (byte-identical no-op) vs ON (pooled
                                         multi-bracket wrap over the submsg-scratch pool).
-     (b) metadata_protection RECEIVE — the T5 pooled bracket EXTRACTION (%with-bracket-rx-scratch, replacing the pre-T5
-                                        per-bracket make-array) + the zero-alloc key_id read (%secure-bracket-key-id-into
-                                        into a STACK buffer, replacing the pre-T5 subseq) + the key_id resolve + the
-                                        decode INTO a DISTINCT secure-rx buffer (decode-datawriter-submessage-into) — the
-                                        exact security receive transform %handle-datagram + %on-user-secure-submessage run
-                                        (the re-dispatch that then delivers the recovered PLAIN submessage IS the
-                                        non-secured baseline, so it is excluded here — it conses no more than receiving
-                                        that plain submessage always did).
+     (b) metadata_protection RECEIVE — drives the REAL %on-secure-submessage dispatcher (WP-ADR-SMALL-CARRIES C2,
+                                        ADR 0039 residual (c)), NOT an inlined copy, so a future alloc slipping into the
+                                        dispatch wrapper (key-id-rx resolve / %on-user-secure-submessage decode into
+                                        secure-rx / write-header-into) is CAUGHT here. DIFFERENTIAL: SEC = the %with-
+                                        bracket-rx-scratch copy (as %handle-datagram does) + %on-secure-submessage (pooled
+                                        RX ops + the re-dispatch); BASE = %handle-datagram on RXFIXED, a datagram built by
+                                        the SAME decode + write-header-into so the two re-dispatches are BYTE-IDENTICAL and
+                                        cancel EXACTLY. delta = the SEC pooled RX ops = 0 real B/sample; it reports ≈0.16
+                                        (one 64 KB GC-region quantum amortized over 400 k iters — bytes-consed rounds to the
+                                        GC boundary the large ~176 B cancelling re-dispatch crosses, NOT a per-sample alloc;
+                                        it scales as 65536/n, proving it is quantization). The rewire surfaced + fixed a
+                                        REAL ~49 B/sample residual — the write-header cursor in %on-user-secure-submessage
+                                        (now the zero-alloc write-header-into).
      (c) rtps_protection SEND        — %maybe-wrap-srtps, resolver OFF vs ON (pooled SRTPS wrap over the send-scratch pool).
      (d) rtps_protection RECEIVE     — the SRTPS unwrap: decode-rtps-message-into into a pooled secure-rx buffer + the
                                         in-place copy-back (the exact transform %handle-datagram runs).
@@ -1671,12 +1677,12 @@
          (payload (map '(simple-array (unsigned-byte 8) (*)) #'char-code "ZA2-MEM-DATAPLANE"))   ; 17 octets (non-4-aligned)
          (iters 20000)
          (sbcl (eq (dds.pal:pal-impl-name) :sbcl)))
-    (labels ((bps (thunk)
-               (declare (type function thunk))
+    (labels ((bps (thunk &optional (n iters))
+               (declare (type function thunk) (type fixnum n))
                (funcall thunk)                            ; warm (lazy carve already forced separately) off the measured window
                (let ((before (dds.pal:bytes-consed)))
-                 (dotimes (i iters) (funcall thunk))
-                 (/ (float (- (dds.pal:bytes-consed) before) 1.0d0) iters)))
+                 (dotimes (i n) (funcall thunk))
+                 (/ (float (- (dds.pal:bytes-consed) before) 1.0d0) n)))
              (report-arm (label plain secured)
                (format t "~&  mem[~a]: plain=~,4f secured=~,4f -> delta=~,4f B/sample (~a)~%"
                        label plain secured (- secured plain) (dds.pal:pal-impl-name))
@@ -1718,7 +1724,17 @@
                                     (%maybe-wrap-srtps node-a buf plen pb)))))
                    (report-arm "rtps-send " base sec)))
                (replace vec plain-copy :end2 plen))
-             ;; ---- (b) metadata_protection RECEIVE: pooled bracket extract + stack key_id + resolve + distinct-pool decode ----
+             ;; ---- (b) metadata_protection RECEIVE: the REAL %on-secure-submessage dispatcher (ADR 0039 residual (c) closed) ----
+             ;; Drive the PRODUCTION dispatch — %handle-datagram's bracket-rx copy + %on-secure-submessage (key-id-rx
+             ;; resolve -> %on-user-secure-submessage: decode into secure-rx -> write-header-into -> re-dispatch) — NOT an
+             ;; inlined copy, so a future alloc slipping into the dispatch WRAPPER is CAUGHT here (defense-in-depth).
+             ;; %on-user-secure-submessage re-dispatches the recovered PLAIN submessage through %handle-datagram
+             ;; (parse/deliver) — the large (~176 B/datagram), NON-SECURED baseline. To cancel it EXACTLY (not the
+             ;; fragile pre-wrap-datagram differential the capstone warned about), BASE re-dispatches RXFIXED — a datagram
+             ;; built by the SAME decode + write-header-into the SEC path runs, so the two %handle-datagram calls process
+             ;; BYTE-IDENTICAL bytes and cons identically. node-b has no on-data hook, so both re-dispatches parse + drop
+             ;; deterministically; a warm loop drives node-b to steady state on BOTH paths first (no ordering artifact).
+             ;; delta = the SEC pooled RX ops (bracket-rx + key-id-rx + secure-rx + decode + write-header-into) = 0.0000.
              (setf (disc-node-user-submessage-protection-kind node-a) :encrypt
                    (disc-node-user-submessage-encode node-a)
                    (lambda (wp) (declare (ignore wp)) (values km-meta :encrypt))
@@ -1726,25 +1742,38 @@
              (let* ((buf (disc-node-tx-msg node-a))
                     (vec (dds.core.buffer:octet-buffer-vec buf))
                     (plen (%rtps-build-user-datagram node-a buf 3 payload))
-                    (newlen (%maybe-wrap-user-submessages node-a buf plen))   ; vec[0,newlen) = RTPS header + SEC_PREFIX bracket
-                    (dgbuf (dds.core.buffer:make-octet-buffer (max 64 newlen)))
+                    (newlen (%maybe-wrap-user-submessages node-a buf plen))     ; vec[0,newlen) = RTPS header + SEC_PREFIX bracket
+                    (secured-copy (subseq vec 0 newlen))                        ; the received SEC-bracketed datagram (immutable SEC input)
+                    (blen (- newlen 20))
+                    (brkt (subseq secured-copy 20 newlen))                      ; the SEC bracket [0,blen) — one-time RXFIXED decode input
+                    (dgbuf (dds.core.buffer:make-octet-buffer (max 64 newlen)))  ; holds secured-copy; bracket-rx copies FROM it (never mutated)
                     (dgvec (dds.core.buffer:octet-buffer-vec dgbuf))
-                    (start 20) (size newlen) (blen (- newlen 20))
-                    (user-fn (disc-node-user-submessage-decode node-b)))
-               (replace dgvec vec :end2 newlen)           ; the received datagram (reused; RX bracket extraction never mutates it)
+                    (rxbuf (dds.core.buffer:make-octet-buffer (max 64 newlen)))  ; RXFIXED: the byte-identical re-dispatch datagram (BASE input)
+                    (rxvec (dds.core.buffer:octet-buffer-vec rxbuf)))
+               (replace dgvec secured-copy :end2 newlen)
                (%ensure-bracket-rx-pool node-b) (%ensure-key-id-rx-pool node-b) (%ensure-secure-rx-pool node-b)   ; force the lazy carves off the measured window
-               (let ((sec (bps (lambda ()
-                                  (%with-bracket-rx-scratch (br node-b)          ; pooled bracket INPUT (T5, replaces make-array)
-                                    (replace (dds.core.buffer:octet-buffer-vec br) dgvec :start2 start :end2 size)
-                                    (%with-key-id-rx-scratch (kb node-b)         ; pooled key_id scratch (T5, replaces subseq)
-                                      (%secure-bracket-key-id-into (dds.core.buffer:octet-buffer-vec kb)
-                                                                   (dds.core.buffer:octet-buffer-vec br) blen)
-                                      (let ((km (funcall user-fn (dds.core.buffer:octet-buffer-vec kb))))   ; resolve (equalp, no retain)
-                                        (%with-secure-rx-scratch (rx node-b)     ; DISTINCT decode OUTPUT pool
-                                          (dds.security:decode-datawriter-submessage-into
-                                           rx 20 km (dds.core.buffer:octet-buffer-vec br) 0 blen)))))))))
-                 (report-arm "meta-recv " 0.0d0 sec))
-               (dds.pal:free-static dgvec))
+               ;; build RXFIXED exactly as %on-user-secure-submessage does: decode into [20,) + synthesize the header at [0,20).
+               (let ((rdlen (multiple-value-bind (data-len mode data-off postfix-off)
+                                (dds.security:decode-datawriter-submessage-into rxbuf 20 km-meta brkt 0 blen)
+                              (declare (ignore mode data-off postfix-off))
+                              (dds.rtps.message:write-header-into rxvec 0 pa)
+                              (+ 20 data-len))))
+                 (labels ((base-thunk ()
+                            (%handle-datagram node-b rxbuf rdlen t))                  ; the re-dispatch baseline (identical bytes)
+                          (sec-thunk ()
+                            (%with-bracket-rx-scratch (br node-b)                     ; pooled bracket INPUT (as %handle-datagram does)
+                              (replace (dds.core.buffer:octet-buffer-vec br) dgvec :start2 20 :end2 newlen)
+                              (%on-secure-submessage node-b pa (dds.core.buffer:octet-buffer-vec br) blen nil))))
+                   (dotimes (i 4000) (base-thunk) (sec-thunk))                        ; warm node-b to steady state on BOTH paths
+                   ;; The re-dispatch %handle-datagram conses ~176 B/datagram in BOTH arms (it cancels), but each
+                   ;; measured window carries a FIXED ±64 KB GC-region quantization (bytes-consed rounds to the GC
+                   ;; boundary crossed) — that is ±3.3 B/sample at 20 k iters, swamping the true 0 delta. Amortize it
+                   ;; over 400 k iters so the quantum is ±0.16 B/sample (delta stays < 1.0), the honest way to isolate
+                   ;; the SEC pooled RX ops (= 0) over a large, cancelling, GC-quantized baseline.
+                   (let ((base (bps #'base-thunk 400000)) (sec (bps #'sec-thunk 400000)))
+                     (report-arm "meta-recv " base sec))))
+               (dds.pal:free-static dgvec)
+               (dds.pal:free-static rxvec))
              ;; ---- (d) rtps_protection RECEIVE: SRTPS unwrap into a pooled secure-rx buffer + in-place copy-back ----
              (setf (disc-node-rtps-protection-kind node-a) :encrypt
                    (disc-node-rtps-protection-encode node-a)
