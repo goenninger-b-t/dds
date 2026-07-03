@@ -94,7 +94,17 @@
    path). When governance protects discovery, also install the secure-SEDP routing predicate + the
    EFFECTIVE base protection kind (SECURE-SEDP-PROTECTION-KIND) so the announce HONORS the
    discovery_protection_kind directive (SIGN vs ENCRYPT). DELETE-PARTICIPANT frees the held access-handle.
-   Returns P."
+   FAIL-CLOSED REJECTS (a clear error, BEFORE any state is installed) a governance whose topic_rule sets
+   data_protection AND metadata_protection to DIFFERENT non-NONE kinds on the same user endpoint — the single-km
+   downgrade combo (§9.5.2, ADR-0040); same-kind and any-NONE combos are accepted unchanged. Returns P."
+  ;; §9.5.2 single-km fail-closed (ADR-0040): a topic_rule with data AND metadata protection at DIFFERENT non-NONE kinds is unrepresentable by one EntityCrypto key (the payload kind wins -> the metadata tier is DOWNGRADED); reject at install, never silently collapse to one km
+  (let* ((gov (dds.security:access-handle-governance access-handle))
+         (bad (and gov (dds.security:governance-mixed-nonnone-kind-conflict gov))))
+    (when bad
+      (error "%install-access-control: topic_rule ~s sets data_protection=~a and metadata_protection=~a — different non-NONE kinds are unrepresentable by one user-endpoint EntityCrypto key (§9.5.2); the payload kind would win and DOWNGRADE the metadata/submessage tier. Use the same kind for both tiers, or NONE for one (ADR-0040)."
+             (dds.security:topic-rule-topic-expr bad)
+             (dds.security:topic-rule-data-protection-kind bad)
+             (dds.security:topic-rule-metadata-protection-kind bad))))
   (setf (dp-access-state p) access-handle)
   (setf (dds.disc:disc-node-permissions-gate (dp-node p))
         (lambda (node remote local) (%participant-permissions-gate p node remote local)))

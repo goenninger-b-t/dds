@@ -387,14 +387,134 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt-out))))
   t)
 
+(defun* run-security-gmac-payload-test ()
+    (function () t)
+  "DDS-Security §9.5.3.3.4.3 data_protection=SIGN payload-tier GMAC (WP-SECURITY-DATA-SIGN-PAYLOAD): a GMAC km
+   (make-test-key-material :kind :sign, AES256-GMAC {0,0,0,3}) AUTHENTICATES the VISIBLE serialized payload without
+   encrypting it. Asserts, on BOTH impls (Clasp first):
+   (a) round-trip: decode(km, encode(km, PT)) = PT byte-exact.
+   (b) header kind = AES256-GMAC {0,0,0,3} (byte 3 = 3) — the wire signal a peer's find_key dispatches on.
+   (c) VISIBLE: the plaintext appears VERBATIM at offset 20 in the SecuredPayload (not hidden as ciphertext).
+   (d) layout: total = 40 + N for a 4-aligned N (NO crypto_content.length prefix, NO 4-align pad — §9.5.3.3.4.3,
+       Fast DDS serialize_SecureDataBody !do_encryption), vs the ENCRYPT tier's 44 + N + pad.
+   (e) BYTE-EXACT golden: the SecuredPayload equals an INDEPENDENT oracle — header ‖ PT verbatim ‖ GMAC(PT) ‖
+       rsm_count=0, the GMAC via the unchanged allocating aes-256-gcm-seal (AAD=PT, empty plaintext) over
+       derive-session-key(session_id=0) ‖ counter-0 iv_suffix=0, assembled by hand (never the encode wrapper).
+   (f) tamper the VISIBLE payload (offset 20) -> decode NIL (fail-closed; NO false-ACCEPT of a mutated payload).
+   (g) tamper the common_mac -> decode NIL (GMAC mismatch, fail-closed).
+   (h) tamper transformation_kind -> decode NIL (find_key gate).
+   (i) the zero-alloc -into core round-trips a GMAC payload byte-exact and conses no more than the ENCRYPT -into
+       core (both dominated by the shared EVP FFI residual; SBCL-exact via dds.pal:bytes-consed, Clasp reports 0).
+   (j) the ENCRYPT km is UNCHANGED (byte-3 kind = 4, has the length prefix) — the GMAC branch is additive.
+   Requires OpenSSL >= 3.5; skips only if truly absent."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [security-gmac-payload] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-security-gmac-payload-test t)))
+  (let* ((km   (dds.security:make-test-key-material :kind :sign))   ; GMAC km under test, iv-counter 0
+         (pt   (make-array 16 :element-type '(unsigned-byte 8)
+                              :initial-contents '(#xca #xfe #xba #xbe #x01 #x02 #x03 #x04
+                                                  #x05 #x06 #x07 #x08 #x09 #x0a #x0b #x0c)))
+         (n    (length pt)))
+    ;; (a) round-trip
+    (let* ((blob (dds.security:encode-serialized-payload km pt))
+           (rec  (dds.security:decode-serialized-payload km blob)))
+      (%check :gmac-roundtrip (and rec (equalp rec pt)) "GMAC decode(encode(PT)) must equal PT byte-exact")
+      ;; (b) header kind = GMAC {0,0,0,3}
+      (%check :gmac-kind (and (zerop (aref blob 0)) (zerop (aref blob 1)) (zerop (aref blob 2)) (= 3 (aref blob 3)))
+              "SecuredPayload transformation_kind must be AES256-GMAC {0,0,0,3}")
+      ;; (c) VISIBLE plaintext verbatim at offset 20
+      (%check :gmac-visible (equalp (subseq blob 20 (+ 20 n)) pt)
+              "the plaintext must be VISIBLE verbatim at offset 20 (GMAC authenticates but does not encrypt)")
+      ;; (d) layout: total = 40 + N (no length prefix, no pad for 4-aligned N)
+      (%check :gmac-layout (= (length blob) (+ 40 n))
+              (format nil "GMAC SecuredPayload length must be 40+N=~d (no ct_len prefix, no pad); got ~d" (+ 40 n) (length blob))))
+    ;; (e) BYTE-EXACT golden — independent oracle (fresh kms so both use counter-0 iv_suffix = all-zeros)
+    (let* ((km-t  (dds.security:make-test-key-material :kind :sign))   ; encode under test, counter 0
+           (km-or (dds.security:make-test-key-material :kind :sign))   ; oracle key derivation only, counter 0
+           (blob  (dds.security:encode-serialized-payload km-t pt))
+           (sid   (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0))
+           (iv    (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))
+           (empty (make-array 0 :element-type '(unsigned-byte 8)))
+           (skey  (dds.security:derive-session-key
+                   (dds.security:key-material-master-sender-key km-or)
+                   (dds.security:key-material-master-salt km-or) sid))
+           (nonce (let ((nn (make-array 12 :element-type '(unsigned-byte 8))))
+                    (replace nn sid :start1 0 :end1 4) (replace nn iv :start1 4 :end1 12) nn)))
+      (multiple-value-bind (ct tag) (dds.dare:aes-256-gcm-seal skey nonce pt empty)   ; AAD=PT, empty plaintext -> GMAC tag
+        (declare (ignore ct))
+        (let ((oracle (concatenate '(simple-array (unsigned-byte 8) (*))
+                                   (dds.security:key-material-transformation-kind km-or)   ; kind (GMAC)
+                                   (dds.security:key-material-sender-key-id km-or)          ; key_id
+                                   sid iv pt tag
+                                   (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0))))  ; rsm_count=0
+          (%check :gmac-golden (equalp blob oracle)
+                  (format nil "GMAC SecuredPayload must equal the independent oracle byte-for-byte;~% blob ~{~2,'0x~^ ~}"
+                          (coerce blob 'list))))))
+    ;; (f) tamper the VISIBLE payload -> decode fail-closed (no false-ACCEPT)
+    (let* ((blob (dds.security:encode-serialized-payload km pt)) (bad (copy-seq blob)))
+      (setf (aref bad 20) (logxor (aref bad 20) #x01))
+      (%check :gmac-tamper-payload (null (dds.security:decode-serialized-payload km bad))
+              "a 1-byte flip of the VISIBLE payload must fail the GMAC -> NIL (no false-ACCEPT)"))
+    ;; (g) tamper the common_mac -> decode fail-closed
+    (let* ((blob (dds.security:encode-serialized-payload km pt)) (bad (copy-seq blob)))
+      (setf (aref bad (+ 20 n)) (logxor (aref bad (+ 20 n)) #x80))   ; common_mac @ 20+N
+      (%check :gmac-tamper-mac (null (dds.security:decode-serialized-payload km bad))
+              "a 1-byte common_mac flip must fail the GMAC -> NIL (fail-closed)"))
+    ;; (h) tamper transformation_kind -> find_key reject
+    (let* ((blob (dds.security:encode-serialized-payload km pt)) (bad (copy-seq blob)))
+      (setf (aref bad 3) (logxor (aref bad 3) #x01))
+      (%check :gmac-tamper-kind (null (dds.security:decode-serialized-payload km bad))
+              "a transformation_kind flip must return NIL (find_key gate)"))
+    ;; (i) zero-alloc -into core: round-trip byte-exact + conses no more than the ENCRYPT -into core
+    (let ((out    (dds.core.buffer:make-octet-buffer (+ 64 n)))
+          (pt-out (dds.core.buffer:make-octet-buffer 256))
+          (kg     (dds.security:make-test-key-material :kind :sign))
+          (ke     (dds.security:make-test-key-material :kind :encrypt))
+          (sbcl   (eq (dds.pal:pal-impl-name) :sbcl))
+          (iters  1000))
+      (unwind-protect
+           (progn
+             (let ((len (dds.security:encode-serialized-payload-into out kg pt)))
+               (%check :gmac-into-len (= len (+ 40 n)) "encode-into GMAC length = 40+N")
+               (let ((plen (dds.security:decode-serialized-payload-into pt-out kg
+                            (subseq (dds.core.buffer:octet-buffer-vec out) 0 len))))
+                 (%check :gmac-into-roundtrip
+                         (and plen (equalp (subseq (dds.core.buffer:octet-buffer-vec pt-out) 0 plen) pt))
+                         "decode-into must round-trip the GMAC plaintext byte-exact")))
+             ;; alloc parity: GMAC per-iter conses within a small tolerance of ENCRYPT (both share the EVP FFI residual)
+             (let* ((gbps (let ((b (dds.pal:bytes-consed)))
+                            (dotimes (i iters) (dds.security:encode-serialized-payload-into out kg pt))
+                            (/ (float (- (dds.pal:bytes-consed) b)) iters)))
+                    (ebps (let ((b (dds.pal:bytes-consed)))
+                            (dotimes (i iters) (dds.security:encode-serialized-payload-into out ke pt))
+                            (/ (float (- (dds.pal:bytes-consed) b)) iters))))
+               (%check :gmac-into-alloc-parity
+                       (or (not sbcl) (<= gbps (+ ebps 8.0)))
+                       (format nil "GMAC encode-into must cons no more than ENCRYPT (~,4f vs ~,4f B/op)" gbps ebps))))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec out))
+        (dds.pal:free-static (dds.core.buffer:octet-buffer-vec pt-out))))
+    ;; (j) the ENCRYPT tier is UNCHANGED (byte-3 kind = 4, carries the 4-byte crypto_content.length prefix)
+    (let* ((ke   (dds.security:make-test-key-material :kind :encrypt))
+           (eblob (dds.security:encode-serialized-payload ke pt)))
+      (%check :encrypt-unchanged
+              (and (= 4 (aref eblob 3)) (= (length eblob) (+ 44 n (mod (- n) 4))))
+              "the ENCRYPT tier must stay GCM {0,0,0,4} with the ct_len prefix (44+N+pad); the GMAC branch is additive")))
+  t)
+
 (defun* run-security-payload-fuzz-test ()
     (function () t)
-  "Fuzz decode-serialized-payload with N=2000 random/short/oversized inputs (both prod + (safety 0)).
+  "Fuzz decode-serialized-payload with random/short/oversized inputs (both prod + (safety 0)).
    Invariant: for every input, decode returns NIL or the correct plaintext — never OOB, never crash,
-   never a partial decode, never a signal escaping to the caller (NFR-SEC-POSTURE). Includes the
-   minimum-size boundary (< 44 bytes), over-declared ct_len, all-zero payloads of every size 0..80,
-   and fully random 60-byte payloads with random header fields (valid parse, invalid ciphertext).
-   Requires OpenSSL >= 3.5; skips only if truly absent. Both SBCL and Clasp must pass identically."
+   never a partial decode, never a signal escaping to the caller (NFR-SEC-POSTURE). Two km arms:
+   the ENCRYPT (AES256-GCM) km — minimum-size boundary (< 44 bytes), over-declared ct_len, all-zero
+   payloads 0..80, and fully random 60-byte payloads with a valid parse shape (invalid ciphertext);
+   AND the SIGN (AES256-GMAC, data=SIGN) km — the visible-payload GMAC decode branch (§9.5.3.3.4.3),
+   fed sub-minimum (< 40) blobs, all-zero 40..80 blobs, and random 60-byte blobs with a MATCHING
+   kind/key_id header (so find_key passes and the GMAC verify itself must reject) → always NIL, never
+   a tampered accept / OOB / unbounded alloc. Requires OpenSSL >= 3.5; skips only if truly absent.
+   Both SBCL and Clasp must pass identically."
   (handler-case (dds.dare:dare-available-p)
     (dds.dare:dare-unavailable (c)
       (format t "~&  [security-payload-fuzz] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -457,6 +577,39 @@
       (%check :fuzz-valid-still-works
               (and recovered (equalp recovered pt-ok))
               "valid blob must still decode correctly after fuzz run"))
+
+    ;; --- GMAC (data=SIGN) km arm: exercise the visible-payload GMAC decode branch (§9.5.3.3.4.3) ---
+    (let* ((gkm    (dds.security:make-test-key-material :kind :sign))
+           (gvalid (dds.security:encode-serialized-payload gkm pt-ok))   ; pt-ok is 8 B (4-aligned) -> encode ok
+           (ghdr-k (dds.security:key-material-transformation-kind gkm))  ; GMAC {0,0,0,3}
+           (ghdr-i (dds.security:key-material-sender-key-id gkm)))
+      ;; Case G-A: sub-minimum GMAC blobs (< 40 = header 20 + SecureDataTag 20) -> NIL.
+      (dotimes (len 40)
+        (let ((blob (make-array len :element-type '(unsigned-byte 8) :initial-element #x00)))
+          (%check :fuzz-gmac-short-nil (null (dds.security:decode-serialized-payload gkm blob))
+                  (format nil "GMAC fuzz short blob len=~d must return NIL" len))
+          (incf fuzz-count)))
+      ;; Case G-B: all-zero GMAC-shaped blobs 40..80 (valid frame length, zero header mismatches find_key) -> NIL.
+      (loop for len from 40 to 80 do
+        (let ((blob (make-array len :element-type '(unsigned-byte 8) :initial-element #x00)))
+          (%check :fuzz-gmac-zero-blob-nil (null (dds.security:decode-serialized-payload gkm blob))
+                  (format nil "GMAC fuzz all-zero blob len=~d must return NIL" len))
+          (incf fuzz-count)))
+      ;; Case G-C: 2000 random 60-byte GMAC blobs with a MATCHING kind/key_id header (find_key passes, rsm_count=0)
+      ;;           so the GMAC verify ITSELF must reject the random visible-content+mac -> NIL (auth 2^-128).
+      (dotimes (_ 2000)
+        (let ((blob (make-array 60 :element-type '(unsigned-byte 8))))   ; 60 = 40 + N, N=20: content[20,40) mac[40,56) rsm[56,60)
+          (dotimes (i 60) (setf (aref blob i) (random 256)))
+          (replace blob ghdr-k :start1 0 :end1 4)                        ; kind = GMAC so find_key does not short-circuit
+          (replace blob ghdr-i :start1 4 :end1 8)                        ; key_id = gkm so find_key passes -> GMAC must reject
+          (setf (aref blob 56) 0 (aref blob 57) 0 (aref blob 58) 0 (aref blob 59) 0)   ; rsm_count = 0 (BE) so the count gate passes
+          (%check :fuzz-gmac-random-nil (null (dds.security:decode-serialized-payload gkm blob))
+                  "GMAC fuzz random blob must return NIL; non-NIL means GMAC auth bypassed")
+          (incf fuzz-count)))
+      ;; Case G-D: the valid GMAC blob still round-trips (regression guard: fuzz did not corrupt gkm).
+      (let ((rec (dds.security:decode-serialized-payload gkm gvalid)))
+        (%check :fuzz-gmac-valid-still-works (and rec (equalp rec pt-ok))
+                "valid GMAC blob must still decode correctly after fuzz run")))
 
     (format t "~&  [security-payload-fuzz] ~d inputs exercised~%" fuzz-count))
 

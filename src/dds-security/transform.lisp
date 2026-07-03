@@ -155,116 +155,220 @@
         (aref vec (+ off 3)) (logand value           #xff))
   t)
 
+(defun* %km-gmac-p (km)
+    (function (key-material) boolean)
+  "T iff KM advertises the §9.5.3.3.1 AES256-GMAC transformation_kind {0,0,0,3} — the SIGN sub-tier that
+   AUTHENTICATES the VISIBLE serialized payload with a GMAC common_mac and does NOT encrypt it (§9.5.3.3.4.3);
+   NIL for AES256-GCM {0,0,0,4}, the ENCRYPT tier (§9.5.3.3.4.4). Selects the branch in encode/decode-serialized-
+   payload-into. Zero-alloc (a 4-octet mismatch, no consing) so the per-sample secured path stays alloc-free."
+  (null (mismatch (key-material-transformation-kind km) +transformation-kind-aes256-gmac+)))
+
+(defun* %put-crypto-header-into (km vec)
+    (function (key-material (simple-array (unsigned-byte 8) (*))) (eql t))
+  "Write the §9.5.3.3.1 SecureDataHeader — transformation_kind(4) ‖ transformation_key_id(4) ‖ session_id(4) ‖
+   init_vector_suffix(8) = 20 octets — for KM into VEC[0..20], stamping a UNIQUE monotonic iv_suffix in place
+   (%km-next-iv-suffix-into) and session_id = +fixed-session-id+ (all-zeros). The SHARED header writer for BOTH the
+   ENCRYPT (§9.5.3.3.4.4) and GMAC (§9.5.3.3.4.3) branches of encode-serialized-payload-into — the two tiers differ
+   ONLY in the body/tag, never the header (DRY). Zero GC-heap alloc (raw offset writes); the SecuredPayload always
+   starts at VEC position 0 (no submessage bracket at this tier). Caller guarantees (length VEC) >= 20. Returns T."
+  (replace vec (key-material-transformation-kind km) :start1 0 :end1 +transformation-kind-len+)
+  (replace vec (key-material-sender-key-id km)
+           :start1 +transformation-kind-len+ :end1 +secure-data-header-session-id-off+)
+  (replace vec +fixed-session-id+
+           :start1 +secure-data-header-session-id-off+ :end1 +secure-data-header-iv-suffix-off+)
+  (%km-next-iv-suffix-into km vec +secure-data-header-iv-suffix-off+)
+  t)
+
+(defun* %payload-find-key-mismatch-p (secured km)
+    (function ((simple-array (unsigned-byte 8) (*)) key-material) boolean)
+  "T iff the wire SecureDataHeader in SECURED does NOT match KM on transformation_kind[0..4) OR
+   transformation_key_id[4..8) — the §9.5.3.3.4.5 find_key gate (Fast DDS AESGCMGMAC_Transform::find_key), the
+   empty-AAD header-integrity check SHARED by BOTH the ENCRYPT and GMAC decode branches (DRY). Byte-compared in
+   place (mismatch), zero-alloc. A mismatch means this SecuredPayload was not sealed for KM -> the caller
+   fail-closes (NIL). Caller guarantees (length SECURED) >= 8."
+  (or (and (mismatch secured (key-material-transformation-kind km)
+                     :start1 0 :end1 +transformation-kind-len+) t)
+      (and (mismatch secured (key-material-sender-key-id km)
+                     :start1 +transformation-kind-len+ :end1 +secure-data-header-session-id-off+) t)))
+
 (defun* encode-serialized-payload-into (out-buf km plaintext)
     (function (dds.core.buffer:octet-buffer key-material (simple-array (unsigned-byte 8) (*))) fixnum)
   "Build the DDS-Security §9.5.3.3 SecuredPayload for PLAINTEXT under KM into OUT-BUF (a STATIC octet-buffer,
-   dds.core.buffer:make-octet-buffer) starting at position 0; return the total octet length. ZERO GC-heap
-   allocation in this codec: the SecureDataHeader, the crypto_content length, the §9.5.3.3.3 4-align pad and the
-   rsm_count are written through OUT-BUF's vector with RAW OFFSET WRITES — no cursor struct is consed (a cursor
-   cannot be stack-allocated here: dds.core.buffer:cursor is not inlined, so binding one heap-conses per call —
-   measured ~48 B/call, eliminated). The 12-byte AES-GCM nonce is the contiguous OUT-BUF[8..20] sub-slice
-   (session_id(4)‖iv_suffix(8), §9.5.3.3.4.3) written in place — no nonce buffer; ciphertext+tag are sealed
-   directly through OUT-BUF's static SAP by aes-256-gcm-seal-into; the iv_suffix is stamped in place by
-   %km-next-iv-suffix-into; the session key is cached per KM. (The only residual per-call consing is the OpenSSL
-   EVP FFI SAP-boxing inside aes-256-gcm-seal-into, shared IDENTICALLY with decode-serialized-payload-into — a
-   dds.dare follow-on, out of this codec's scope.) OUT-BUF must hold >= 44 + |PLAINTEXT| + 3 octets, else
-   BUFFER-OVERFLOW (O(1) extent check before any write, safety-0-safe; NFR-SEC-POSTURE). Algorithm (§9.5.3.3.4.4):
-   claim a UNIQUE iv_suffix (monotonic counter, STRUCTURAL nonce uniqueness — see the argument at the top of
-   transform.lisp); AES-256-GCM seal under EMPTY AAD (+empty-octets+, Fast-DDS-faithful — Fast DDS
-   serialize_SecureDataBody ENCRYPT sets no AAD; header integrity is the decode find_key kind/key_id check + the
-   nonce; T10-INTEROP-RECONCILE, see docs/provenance.md); rsm_count = 0 (no origin auth). The layout is
-   BYTE-IDENTICAL to serialize-secured-payload (same field widths/offsets + big-endian %put-u32-be-at + the (-N)
-   mod 4 pad; seal-into == seal), proven by the byte-exact corpora AND the serialize-secured-payload oracle pin in
-   run-security-payload-into-test. Returns the total length (44 + N + pad)."
-  (let* ((vec     (dds.core.buffer:octet-buffer-vec out-buf))
-         (n       (length plaintext))
-         (ct-off  (+ +secure-data-header-len+ +crypto-content-length-len+))  ; ciphertext starts at 24
-         (tag-off (+ ct-off n))                                              ; common_mac @ 24+N
-         (pad     (mod (- n) 4))                                             ; §9.5.3.3.3 SecureDataTag 4-align pad
-         (rsm-off (+ tag-off +common-mac-len+ pad))                          ; rsm_count @ 40+N+pad
-         (total   (+ rsm-off +receiver-specific-macs-count-len+)))           ; 44+N+pad
-    ;; O(1) output-extent bound BEFORE any write (safety-0-safe; replaces the cursor check-room) — NFR-SEC-POSTURE
-    (unless (<= total (length vec))
-      (error 'dds.core.buffer:buffer-overflow :need total :have (length vec)))
-    ;; SecureDataHeader kind‖key_id‖session_id by raw offset write (same widths/offsets as serialize-crypto-header)
-    (replace vec (key-material-transformation-kind km) :start1 0 :end1 +transformation-kind-len+)
-    (replace vec (key-material-sender-key-id km)
-             :start1 +transformation-kind-len+ :end1 +secure-data-header-session-id-off+)
-    (replace vec +fixed-session-id+
-             :start1 +secure-data-header-session-id-off+ :end1 +secure-data-header-iv-suffix-off+)
-    ;; stamp the monotonic iv_suffix in place at offset 12 (byte-identical to serialize-secured-payload's header)
-    (%km-next-iv-suffix-into km vec +secure-data-header-iv-suffix-off+)
-    ;; crypto_content length (uint32 BE, §9.5.3.3.4.4) — byte-identical to serialize-crypto-content's %put-u32-be
-    (%put-u32-be-at vec +secure-data-header-len+ n)
-    ;; ciphertext + common_mac sealed directly into OUT-BUF; nonce = OUT-BUF[8..20] sub-slice; EMPTY AAD
-    (dds.dare:aes-256-gcm-seal-into vec ct-off tag-off
-                                    (%km-session-key-at km +fixed-session-id+ 0)
-                                    vec +secure-data-header-session-id-off+
-                                    +empty-octets+ plaintext 0 n)
-    ;; SecureDataTag tail: zero the §9.5.3.3.3 4-align pad after common_mac, then rsm_count=0 (uint32 BE)
-    (dotimes (i pad) (setf (aref vec (+ tag-off +common-mac-len+ i)) 0))
-    (%put-u32-be-at vec rsm-off +receiver-specific-macs-count-payload-protection+)
-    total))
+   dds.core.buffer:make-octet-buffer) starting at position 0; return the total octet length. The tier is selected
+   by KM's transformation_kind (§9.5.3.3.1): AES256-GCM {0,0,0,4} -> ENCRYPT (§9.5.3.3.4.4, the payload is HIDDEN
+   as ciphertext); AES256-GMAC {0,0,0,3} -> SIGN (§9.5.3.3.4.3, the payload stays VISIBLE and is AUTHENTICATED by a
+   GMAC common_mac). Both share the 20-byte §9.5.3.3.1 SecureDataHeader (%put-crypto-header-into) and an rsm_count=0
+   §9.5.3.3.3 SecureDataTag common_mac; they differ ONLY in the body:
+     ENCRYPT: crypto_content.length(4, BE) ‖ ciphertext(N) ‖ common_mac(16) ‖ ((-N) mod 4) pad ‖ rsm_count(4).
+              Total = 44 + N + pad. AES-256-GCM seal under EMPTY AAD -> ciphertext + tag. BYTE-IDENTICAL to
+              serialize-secured-payload (same widths/offsets + big-endian %put-u32-be-at + the pad; seal-into == seal),
+              proven by the byte-exact corpora AND the serialize-secured-payload oracle pin in run-security-payload-into-test.
+     GMAC:    plaintext(N, VERBATIM — NO crypto_content.length prefix) ‖ common_mac(16) ‖ rsm_count(4). Total = 40 + N
+              (no length prefix, no pad — corroborated CLEAN-ROOM against Fast DDS AESGCMGMAC_Transform.cpp
+              serialize_SecureDataBody: the !do_encryption branch memcpy's the plaintext VERBATIM and writes NO
+              cnt_length; the length prefix + submessage 4-align pad are ENCRYPT/submessage-only; decode_serialized_payload
+              recovers N = total - 20(header) - 20(tag); see docs/provenance.md). aes-256-gcm-seal-into with pt-len 0
+              GMACs AAD = the plaintext -> the common_mac (the ZA-2 GMAC-into pattern). Byte-exact to §9.5.3.3.4.3 for
+              4-aligned payloads (the run-security-gmac-payload-test golden); serialized payloads are 4-aligned in practice.
+              A non-4-aligned N SIGNALS a clear error: our 40+N wire carries no rsm_count 4-align pad, so it would diverge
+              from a conformant peer that aligns it — fail loud LOCALLY, never emit a wire that diverges (no false-ACCEPT).
+   ZERO GC-heap allocation in EITHER tier: the SecureDataHeader, lengths, pad and rsm_count are written through OUT-BUF's
+   vector with RAW OFFSET WRITES — no cursor struct is consed; the 12-byte AES-GCM nonce is the contiguous OUT-BUF[8..20]
+   sub-slice (session_id(4)‖iv_suffix(8), §9.5.3.3.4.3) written in place — no nonce buffer; ciphertext/plaintext + tag are
+   sealed directly through OUT-BUF's static SAP by aes-256-gcm-seal-into; the iv_suffix is stamped in place by
+   %km-next-iv-suffix-into (STRUCTURAL nonce uniqueness — see the argument at the top of transform.lisp); the session key
+   is cached per KM. (The only residual per-call consing is the OpenSSL EVP FFI SAP-boxing inside aes-256-gcm-seal-into,
+   shared with decode.) OUT-BUF must hold the total length, else BUFFER-OVERFLOW (an O(1) extent check BEFORE any write,
+   safety-0-safe; NFR-SEC-POSTURE). rsm_count = 0 (no origin auth). Returns the total length."
+  (let* ((vec (dds.core.buffer:octet-buffer-vec out-buf))
+         (n   (length plaintext)))
+    (if (%km-gmac-p km)
+        ;; --- GMAC / SIGN sub-tier (§9.5.3.3.4.3): VISIBLE plaintext + GMAC common_mac, no length prefix, no pad ---
+        (let* ((ct-off  +secure-data-header-len+)                         ; visible plaintext @ 20
+               (tag-off (+ ct-off n))                                     ; common_mac @ 20+N
+               (rsm-off (+ tag-off +common-mac-len+))                     ; rsm_count @ 36+N
+               (total   (+ rsm-off +receiver-specific-macs-count-len+)))  ; 40+N
+          ;; §9.5.3.3.4.3: our 40+N GMAC wire has NO rsm_count 4-align pad; a non-4-aligned N would diverge from a conformant peer (Fast DDS) that 4-aligns the trailing rsm_count — a LOCAL fault, fail loud (real serialized CDR payloads are 4-aligned)
+          (unless (zerop (mod n 4))
+            (error "encode-serialized-payload-into: data=SIGN GMAC serialized payload length ~d is not 4-aligned (§9.5.3.3.4.3 / XCDR); a conformant peer 4-aligns the trailing rsm_count, so this would diverge on the wire" n))
+          (unless (<= total (length vec))
+            (error 'dds.core.buffer:buffer-overflow :need total :have (length vec)))
+          (%put-crypto-header-into km vec)
+          ;; visible plaintext VERBATIM as the CryptoContent (Fast DDS serialize_SecureDataBody !do_encryption)
+          (replace vec plaintext :start1 ct-off :end1 tag-off)
+          ;; GMAC over the plaintext (AAD = plaintext, pt-len 0 -> tag only) -> common_mac @ tag-off; nonce = OUT-BUF[8..20]
+          (dds.dare:aes-256-gcm-seal-into vec ct-off tag-off
+                                          (%km-session-key-at km +fixed-session-id+ 0)
+                                          vec +secure-data-header-session-id-off+
+                                          plaintext +empty-octets+ 0 0 0 n)
+          (%put-u32-be-at vec rsm-off +receiver-specific-macs-count-payload-protection+)
+          total)
+        ;; --- ENCRYPT tier (§9.5.3.3.4.4): ciphertext + GCM tag under EMPTY AAD (UNCHANGED, byte-identical) ---
+        (let* ((ct-off  (+ +secure-data-header-len+ +crypto-content-length-len+))  ; ciphertext starts at 24
+               (tag-off (+ ct-off n))                                              ; common_mac @ 24+N
+               (pad     (mod (- n) 4))                                             ; §9.5.3.3.3 SecureDataTag 4-align pad
+               (rsm-off (+ tag-off +common-mac-len+ pad))                          ; rsm_count @ 40+N+pad
+               (total   (+ rsm-off +receiver-specific-macs-count-len+)))           ; 44+N+pad
+          ;; O(1) output-extent bound BEFORE any write (safety-0-safe; replaces the cursor check-room) — NFR-SEC-POSTURE
+          (unless (<= total (length vec))
+            (error 'dds.core.buffer:buffer-overflow :need total :have (length vec)))
+          (%put-crypto-header-into km vec)
+          ;; crypto_content length (uint32 BE, §9.5.3.3.4.4) — byte-identical to serialize-crypto-content's %put-u32-be
+          (%put-u32-be-at vec +secure-data-header-len+ n)
+          ;; ciphertext + common_mac sealed directly into OUT-BUF; nonce = OUT-BUF[8..20] sub-slice; EMPTY AAD
+          (dds.dare:aes-256-gcm-seal-into vec ct-off tag-off
+                                          (%km-session-key-at km +fixed-session-id+ 0)
+                                          vec +secure-data-header-session-id-off+
+                                          +empty-octets+ plaintext 0 n)
+          ;; SecureDataTag tail: zero the §9.5.3.3.3 4-align pad after common_mac, then rsm_count=0 (uint32 BE)
+          (dotimes (i pad) (setf (aref vec (+ tag-off +common-mac-len+ i)) 0))
+          (%put-u32-be-at vec rsm-off +receiver-specific-macs-count-payload-protection+)
+          total))))
 
 (defun* decode-serialized-payload-into (pt-out km secured)
     (function (dds.core.buffer:octet-buffer key-material (simple-array (unsigned-byte 8) (*)))
               (or fixnum null))
   "Recover the plaintext from a DDS-Security §9.5.3.3 SecuredPayload SECURED under KM into PT-OUT (a STATIC
    octet-buffer); return the plaintext length on success, NIL on ANY failure — fail-closed (NFR-SEC-POSTURE;
-   NIST SP 800-38D §8.3). ZERO GC-heap allocation: the nonce is the SECURED[8..20] sub-slice, the session key
-   is %km-session-key-at(KM, SECURED, 8) (byte-compared against the cache in place), and aes-256-gcm-open-into
-   writes the plaintext through PT-OUT's static SAP — no per-sample vector is materialized. ALL length/offset
-   checks run BEFORE any field read (safe even at (safety 0)): min frame >= 44, then the EXACT frame
-   (len == 44 + ct_len + pad, mirroring parse-secured-payload), which also bounds the ct/tag/nonce reads.
-   The find_key gate (wire kind/key_id byte-compared to the KM, no alloc — the empty-AAD header-integrity gate,
-   Fast DDS AESGCMGMAC_Transform::find_key) and the rsm_count==0 check (payload protection, §9.5.3.3.4.4 step 10)
-   run before the open. AAD = EMPTY (Fast-DDS-faithful, T10-INTEROP-RECONCILE). On NIL no readable plaintext
-   remains (aes-256-gcm-open-into zeroizes its output region; NIST SP 800-38D §7.2). PT-OUT must hold >= ct_len
-   octets. Behaviourally identical to decode-serialized-payload/parse-secured-payload, zero-alloc."
+   NIST SP 800-38D §8.3). The tier is selected by KM's transformation_kind (§9.5.3.3.1): AES256-GCM -> ENCRYPT
+   (§9.5.3.3.4.5, AES-256-GCM open of the ciphertext), AES256-GMAC -> SIGN (§9.5.3.3.4.3, GMAC-verify the VISIBLE
+   plaintext). ZERO GC-heap allocation in EITHER tier: the nonce is the SECURED[8..20] sub-slice, the session key is
+   %km-session-key-at(KM, SECURED, 8) (byte-compared against the cache in place), and aes-256-gcm-open-into
+   writes/verifies through static SAPs — no per-sample vector is materialized. ALL length/offset checks run BEFORE any
+   field read (safe even at (safety 0)); the shared find_key gate (%payload-find-key-mismatch-p — wire kind/key_id
+   byte-compared to KM, the empty-AAD header-integrity gate, Fast DDS AESGCMGMAC_Transform::find_key) and the
+   rsm_count==0 check (payload protection, §9.5.3.3.4.4 step 10) run before the open/verify.
+     ENCRYPT: min frame >= 44, then the EXACT frame (len == 44 + ct_len + pad, mirroring parse-secured-payload),
+              which bounds the ct/tag/nonce reads; AES-256-GCM open (EMPTY AAD, ct/tag in place) -> plaintext via
+              PT-OUT SAP, or NIL on auth failure (aes-256-gcm-open-into zeroizes its output region; SP 800-38D §7.2).
+     GMAC:    min frame >= 40 (header 20 + SecureDataTag 20, NO crypto_content.length at this tier); N = len - 40
+              (Fast DDS decode_serialized_payload !is_encrypted: body = total - sizeof(header) - (sizeof(u32)+16)). N
+              MUST fit PT-OUT — a larger recovered payload fail-closes to NIL (RESOURCE_LIMITS, NFR-MEM), NEVER a silent
+              truncation of a verified payload (the pooled decode buffer is *secured-payload-max-bytes*; the allocating
+              wrapper sizes PT-OUT to len, so it never trips). Then GMAC-verify the VISIBLE content SECURED[20..20+N]
+              (AAD, ct-len 0) against common_mac SECURED[20+N..36+N] with nonce SECURED[8..20]. On verify success the
+              visible plaintext is copied to PT-OUT and its length N returned; on ANY mismatch/tamper -> NIL (no
+              false-ACCEPT of an unauthenticated payload).
+   On NIL no readable plaintext remains. PT-OUT must hold >= the plaintext length. Behaviourally identical to
+   decode-serialized-payload (the allocating wrapper), zero-alloc."
   (handler-case
       (let ((len (length secured)))
-        ;; min frame = header(20) + ct_len(4) + SecureDataTag(20) = 44 (§9.5.3.3)
-        (when (< len (+ +secure-data-header-len+ +crypto-content-length-len+ +secure-data-tag-len+))
-          (return-from decode-serialized-payload-into nil))
-        (let* ((ct-len  (%get-u32-be-at secured +secure-data-header-len+))                ; crypto_content.length BE @ 20
-               (ct-off  (+ +secure-data-header-len+ +crypto-content-length-len+))         ; 24
-               (tag-off (+ ct-off ct-len))                                                ; common_mac @ 24+N
-               (pad     (mod (- ct-len) 4))                                               ; §9.5.3.3.3 4-align pad
-               (rsm-off (+ tag-off +common-mac-len+ pad)))                                ; rsm_count @ 40+N+pad
-          ;; EXACT frame (mirror parse-secured-payload: total == 44+ct_len+pad) — also bounds the ct/tag/nonce reads
-          (when (/= len (+ rsm-off +receiver-specific-macs-count-len+))
-            (return-from decode-serialized-payload-into nil))
-          ;; find_key (empty-AAD header-integrity gate): wire kind/key_id MUST equal the KM, byte-compared, no alloc
-          (when (or (mismatch secured (key-material-transformation-kind km)
-                              :start1 0 :end1 +transformation-kind-len+)
-                    (mismatch secured (key-material-sender-key-id km)
-                              :start1 +transformation-kind-len+ :end1 +secure-data-header-session-id-off+))
-            (return-from decode-serialized-payload-into nil))
-          ;; payload protection: rsm_count MUST be 0 (§9.5.3.3.4.4 step 10) — fail-closed like parse-secured-payload
-          (when (/= +receiver-specific-macs-count-payload-protection+ (%get-u32-be-at secured rsm-off))
-            (return-from decode-serialized-payload-into nil))
-          ;; AES-256-GCM open: nonce = SECURED[8..20], EMPTY AAD, ct/tag read in place, plaintext via PT-OUT SAP
-          (if (dds.dare:aes-256-gcm-open-into (dds.core.buffer:octet-buffer-vec pt-out) 0
-                                              (%km-session-key-at km secured +secure-data-header-session-id-off+)
-                                              secured +secure-data-header-session-id-off+
-                                              +empty-octets+
-                                              secured ct-off ct-len
-                                              secured tag-off)
-              ct-len
-              nil)))
+        (if (%km-gmac-p km)
+            ;; --- GMAC / SIGN verify (§9.5.3.3.4.3): the CryptoContent IS the plaintext; authenticate it ---
+            (progn
+              ;; min frame = header(20) + SecureDataTag(20) = 40 (no crypto_content.length at this tier)
+              (when (< len (+ +secure-data-header-len+ +secure-data-tag-len+))
+                (return-from decode-serialized-payload-into nil))
+              (let* ((n       (- len +secure-data-header-len+ +secure-data-tag-len+))  ; visible content length = len-40
+                     (ct-off  +secure-data-header-len+)                                ; visible content @ 20
+                     (tag-off (+ ct-off n))                                            ; common_mac @ 20+N
+                     (rsm-off (+ tag-off +common-mac-len+)))                           ; rsm_count @ 36+N (= len-4)
+                ;; RESOURCE_LIMITS fail-closed (NFR-MEM): the recovered plaintext N (= len-40) MUST fit PT-OUT — the GMAC replace below is length-bounded by PT-OUT and would SILENTLY TRUNCATE a larger verified payload (the ENCRYPT tier's aes-256-gcm-open-into already extent-guards); reject instead, never truncate a verified payload
+                (when (> n (dds.pal:static-length (dds.core.buffer:octet-buffer-vec pt-out)))
+                  (return-from decode-serialized-payload-into nil))
+                ;; find_key (empty-AAD header-integrity gate): wire kind/key_id MUST equal the KM, byte-compared, no alloc
+                (when (%payload-find-key-mismatch-p secured km)
+                  (return-from decode-serialized-payload-into nil))
+                ;; payload protection: rsm_count MUST be 0 (§9.5.3.3.4.4 step 10)
+                (when (/= +receiver-specific-macs-count-payload-protection+ (%get-u32-be-at secured rsm-off))
+                  (return-from decode-serialized-payload-into nil))
+                ;; GMAC verify IN PLACE: ct-len 0, AAD = the VISIBLE content [20,20+N), tag = common_mac @ tag-off,
+                ;; nonce = SECURED[8..20]. aes-256-gcm-open-into returns T iff the GMAC matches (fail-closed NIL else).
+                (if (dds.dare:aes-256-gcm-open-into (dds.core.buffer:octet-buffer-vec pt-out) 0
+                                                    (%km-session-key-at km secured +secure-data-header-session-id-off+)
+                                                    secured +secure-data-header-session-id-off+
+                                                    secured
+                                                    secured ct-off 0
+                                                    secured tag-off
+                                                    ct-off n)
+                    ;; authenticated: copy the visible plaintext out to PT-OUT and return its length
+                    (progn (replace (dds.core.buffer:octet-buffer-vec pt-out) secured
+                                    :start1 0 :start2 ct-off :end2 tag-off)
+                           n)
+                    nil)))
+            ;; --- ENCRYPT open (§9.5.3.3.4.5): AES-256-GCM decrypt the ciphertext (UNCHANGED, byte-identical) ---
+            (progn
+              ;; min frame = header(20) + ct_len(4) + SecureDataTag(20) = 44 (§9.5.3.3)
+              (when (< len (+ +secure-data-header-len+ +crypto-content-length-len+ +secure-data-tag-len+))
+                (return-from decode-serialized-payload-into nil))
+              (let* ((ct-len  (%get-u32-be-at secured +secure-data-header-len+))                ; crypto_content.length BE @ 20
+                     (ct-off  (+ +secure-data-header-len+ +crypto-content-length-len+))         ; 24
+                     (tag-off (+ ct-off ct-len))                                                ; common_mac @ 24+N
+                     (pad     (mod (- ct-len) 4))                                               ; §9.5.3.3.3 4-align pad
+                     (rsm-off (+ tag-off +common-mac-len+ pad)))                                ; rsm_count @ 40+N+pad
+                ;; EXACT frame (mirror parse-secured-payload: total == 44+ct_len+pad) — also bounds the ct/tag/nonce reads
+                (when (/= len (+ rsm-off +receiver-specific-macs-count-len+))
+                  (return-from decode-serialized-payload-into nil))
+                ;; find_key (empty-AAD header-integrity gate): wire kind/key_id MUST equal the KM, byte-compared, no alloc
+                (when (%payload-find-key-mismatch-p secured km)
+                  (return-from decode-serialized-payload-into nil))
+                ;; payload protection: rsm_count MUST be 0 (§9.5.3.3.4.4 step 10) — fail-closed like parse-secured-payload
+                (when (/= +receiver-specific-macs-count-payload-protection+ (%get-u32-be-at secured rsm-off))
+                  (return-from decode-serialized-payload-into nil))
+                ;; AES-256-GCM open: nonce = SECURED[8..20], EMPTY AAD, ct/tag read in place, plaintext via PT-OUT SAP
+                (if (dds.dare:aes-256-gcm-open-into (dds.core.buffer:octet-buffer-vec pt-out) 0
+                                                    (%km-session-key-at km secured +secure-data-header-session-id-off+)
+                                                    secured +secure-data-header-session-id-off+
+                                                    +empty-octets+
+                                                    secured ct-off ct-len
+                                                    secured tag-off)
+                    ct-len
+                    nil)))))
     ;; Any condition (bounds, constraint, EVP, etc.) -> NIL (fail-closed).
     (error () nil)))
 
 (defun* encode-serialized-payload (km plaintext)
     (function (key-material (simple-array (unsigned-byte 8) (*)))
               (simple-array (unsigned-byte 8) (*)))
-  "Encrypt PLAINTEXT under KM and return a fresh DDS-Security §9.5.3.3 SecuredPayload octet vector. Thin
-   ALLOCATING wrapper over the zero-alloc core encode-serialized-payload-into: it allocates a static scratch
-   octet-buffer, builds the SecuredPayload into it (§9.5.3.3.4.4: unique iv_suffix, AES-256-GCM seal under
-   EMPTY AAD, rsm_count=0; see the core for the full algorithm + spec citations), copies out the exact bytes,
-   and frees the scratch. The wire is byte-identical to serialize-secured-payload (the core reuses the §7.3.7
-   codecs; the byte-exact corpora prove it). AAD = EMPTY (Fast-DDS-faithful, T10-INTEROP-RECONCILE; header
-   integrity is the decode find_key kind/key_id check + the nonce). Returns a fresh octet vector."
+  "Protect PLAINTEXT under KM and return a fresh DDS-Security §9.5.3.3 SecuredPayload octet vector. The tier is
+   selected by KM's transformation_kind: AES256-GCM -> ENCRYPT (§9.5.3.3.4.4, ciphertext, HIDDEN), AES256-GMAC ->
+   SIGN (§9.5.3.3.4.3, the VISIBLE plaintext + a GMAC common_mac). Thin ALLOCATING wrapper over the zero-alloc core
+   encode-serialized-payload-into: it allocates a static scratch octet-buffer, builds the SecuredPayload into it
+   (unique iv_suffix, rsm_count=0; see the core for the full per-tier algorithm + spec citations), copies out the
+   exact bytes, and frees the scratch. The ENCRYPT wire is byte-identical to serialize-secured-payload (the byte-exact
+   corpora prove it); the GMAC wire is byte-exact to §9.5.3.3.4.3 (Fast-DDS-faithful, run-security-gmac-payload-test).
+   AAD = EMPTY (ENCRYPT) or the plaintext (GMAC); header integrity is the decode find_key kind/key_id check + the
+   nonce (T10-INTEROP-RECONCILE). Returns a fresh octet vector."
   (let ((out (dds.core.buffer:make-octet-buffer (+ 64 (length plaintext)))))
     (unwind-protect
          (let ((len (encode-serialized-payload-into out km plaintext)))
@@ -274,14 +378,15 @@
 (defun* decode-serialized-payload (km secured-octets)
     (function (key-material (simple-array (unsigned-byte 8) (*)))
               (or (simple-array (unsigned-byte 8) (*)) null))
-  "Decrypt a DDS-Security §9.5.3.3 SecuredPayload produced by encode-serialized-payload; return the plaintext
-   octet vector on success, NIL on any failure (bounds violation, find_key mismatch, GCM auth failure, or
-   malformed blob) — fail-closed (NFR-SEC-POSTURE; NIST SP 800-38D §8.3). Thin ALLOCATING wrapper over the
-   zero-alloc core decode-serialized-payload-into: it allocates a static scratch octet-buffer, recovers the
-   plaintext into it (§9.5.3.3.4.5: min/exact-frame bounds, find_key kind/key_id gate, rsm_count==0 check,
-   AES-256-GCM open under EMPTY AAD; see the core for the full algorithm + spec citations), copies out the
-   exact plaintext (or NIL), and frees the scratch. AAD = EMPTY (Fast-DDS-faithful, T10-INTEROP-RECONCILE).
-   Returns a fresh octet vector, or NIL."
+  "Recover the plaintext from a DDS-Security §9.5.3.3 SecuredPayload produced by encode-serialized-payload; return
+   the plaintext octet vector on success, NIL on any failure (bounds violation, find_key mismatch, GCM/GMAC auth
+   failure, or malformed blob) — fail-closed (NFR-SEC-POSTURE; NIST SP 800-38D §8.3). The tier is selected by KM's
+   transformation_kind: AES256-GCM -> ENCRYPT (§9.5.3.3.4.5, AES-256-GCM open), AES256-GMAC -> SIGN (§9.5.3.3.4.3,
+   GMAC-verify the VISIBLE plaintext). Thin ALLOCATING wrapper over the zero-alloc core decode-serialized-payload-into:
+   it allocates a static scratch octet-buffer, recovers the plaintext into it (per-tier min/exact-frame bounds, find_key
+   kind/key_id gate, rsm_count==0 check, AES-256-GCM open / GMAC verify; see the core for the full algorithm + spec
+   citations), copies out the exact plaintext (or NIL), and frees the scratch. AAD = EMPTY (ENCRYPT) or the visible
+   plaintext (GMAC) — T10-INTEROP-RECONCILE. Returns a fresh octet vector, or NIL."
   (let ((pt-out (dds.core.buffer:make-octet-buffer (max 1 (length secured-octets)))))
     (unwind-protect
          (let ((plen (decode-serialized-payload-into pt-out km secured-octets)))

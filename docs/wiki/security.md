@@ -62,6 +62,37 @@ Plugins add-on is not installed; spike §1).  A live Connext byte-compare to set
 the **deferred follow-on** (Slice 5).  The header, if ever present, is never part of the
 AAD or the plaintext.
 
+### 1.4 data_protection=SIGN — the GMAC sub-tier (§9.5.3.3.4.3)
+
+The payload tier supports **three** `data_protection` kinds: **NONE** (the payload rides
+plain), **ENCRYPT** (the §1.1–1.2 layout above — the payload is HIDDEN as ciphertext), and
+**SIGN** — a GMAC sub-tier that **AUTHENTICATES the VISIBLE serialized payload** with an
+AES-GMAC common_mac and does **not** encrypt it.  The tier is selected by the KeyMaterial's
+`transformation_kind`: AES256-GCM `{0,0,0,4}` → ENCRYPT, AES256-GMAC `{0,0,0,3}` → SIGN.
+
+The SIGN SecuredPayload differs from ENCRYPT ONLY in the body — the plaintext is copied
+verbatim (visible) with **no `crypto_content.length` prefix and no 4-align pad**:
+
+```
+GMAC SecuredPayload = SecureDataHeader (20: kind={0,0,0,3} || key_id || session_id || iv_suffix)
+                   || plaintext (N, VISIBLE VERBATIM — no length prefix)
+                   || common_mac (16, the GMAC over the plaintext)
+                   || receiver_specific_macs_count (uint32 = 0)     ; total = 40 + N
+```
+
+(vs ENCRYPT's `44 + N + pad`).  The `common_mac` is the AES-GMAC over `AAD = the plaintext`
+(empty ciphertext), nonce `session_id || init_vector_suffix`, under the same §9.5.3.3.4.2
+session key.  Decode GMAC-**verifies** and returns the visible plaintext; any tamper of the
+payload or the mac **fails closed → NIL** (no false-ACCEPT).  Byte-exact to §9.5.3.3.4.3 and
+Fast DDS `serialize_SecureDataBody` (`!do_encryption`) for the 4-aligned serialized payloads
+that occur in practice (`decode_serialized_payload` recovers `N = total − 20 − 20`).  Our `40 + N`
+wire carries **no** trailing `rsm_count` 4-align pad, so a non-4-aligned `N` would diverge from a
+conformant peer that aligns it; encode therefore **signals a clear local error** on a non-4-aligned
+`data=SIGN` payload (fail loud locally, never emit a divergent wire — unreachable for real CDR).  The
+crypto-manager derives the user endpoint's advertised kind from `data_protection` when that
+tier is engaged, so a `data=SIGN` topic emits a GMAC SecuredPayload and a `data=ENCRYPT` one
+the GCM (confidentiality preserved — an ENCRYPT payload is never emitted visible).
+
 ---
 
 ## 2. The API (`dds.security`)
@@ -168,8 +199,8 @@ hardening evidence (see the per-impl `static-vector-p` docstrings; NFR-PORT).
 
 | Symbol | Contract |
 |---|---|
-| `encode-serialized-payload (km plaintext)` | AES256-GCM-seal PLAINTEXT under KM; return a `SecuredPayload` octet vector |
-| `decode-serialized-payload (km secured-octets)` | Parse + AES256-GCM-open; return plaintext or `NIL` (fail-closed on any error) |
+| `encode-serialized-payload (km plaintext)` | Protect PLAINTEXT under KM (tier by KM kind: GCM → ENCRYPT/hidden, GMAC → SIGN/visible+authenticated); return a `SecuredPayload` octet vector |
+| `decode-serialized-payload (km secured-octets)` | AES256-GCM-open (ENCRYPT) or GMAC-verify the visible plaintext (SIGN); return plaintext or `NIL` (fail-closed on any error) |
 
 `decode-serialized-payload` is **fail-closed**: it returns NIL — never plaintext, never
 partial, never an unhandled condition — on any parse error, malformed blob, or GCM
@@ -531,18 +562,21 @@ the plain node).
 summary: structural + KAT conformance is proven; a live Connext-Security byte-compare
 is **deferred** (Slice 5, the P6 exit gate).
 
-### 5.1 Known limitation — `data_protection=SIGN` (payload tier) is not implemented
+### 5.1 Known limitation — mixed `data`≠`metadata` protection kinds on one endpoint
 
-The serialized-payload `data_protection` gate (`%publish-…` / `%deliver-user-sample`) is
-**`NONE`-vs-non-`NONE`**: a non-NONE kind routes into the ENCRYPT-only crypto-transform.
-**Supported `data_protection` tiers: `NONE` + `ENCRYPT`.**  A `data=SIGN` topic — a
-serialized-payload GMAC sub-tier that would authenticate the *visible* payload without
-encrypting it — is **not yet implemented** (`transform.lisp` implements ENCRYPT-only for the
-payload tier); routing it through the ENCRYPT transform would over-encrypt the payload, so a
-`data=SIGN` peer would read garbage / false-REJECT.  This is why the `governance-sign` SIGN
-tier uses `data=NONE` (the visible payload is already authenticated at the submessage tier by
-`metadata_protection`=SIGN, §8.5.1.9).  `data_protection`=SIGN at the payload tier is **future
-work** (ADR 0040 §Slice-5c review follow-ons; ADR 0037 carry #3).
+The `data_protection` payload tier supports **`NONE` + `SIGN` + `ENCRYPT`** (§1.4 above — SIGN is
+the visible-payload GMAC sub-tier).  The remaining limitation is the **single key**: the user
+writer/reader carries ONE EntityCrypto key that serves BOTH the `data_protection` (payload) and
+`metadata_protection` (user submessage) tiers, so it can advertise only ONE `transformation_kind`.
+A `topic_rule` that sets `data` and `metadata` protection to **different non-`NONE`** kinds is
+therefore unrepresentable — the payload kind wins, which is confidentiality-preserving only for
+`data=ENCRYPT + metadata=SIGN` (the SIGN submessage rides the stronger GCM); the reverse,
+`data=SIGN + metadata=ENCRYPT`, would DOWNGRADE the ENCRYPT-mandated submessage onto the visible
+GMAC kind.  That contradictory governance is **fail-closed rejected** at `%install-access-control`
+(create-participant) via `governance-mixed-nonnone-kind-conflict` — a clear error, never a silent
+single-km collapse; **same-kind** (both SIGN / both ENCRYPT) and **any-`NONE`** combos are accepted
+unchanged.  Fast DDS instead carries separate `EntityKeyMaterial`s (payload=last, submessage=first)
+— a possible future extension (ADR 0040).
 
 ---
 

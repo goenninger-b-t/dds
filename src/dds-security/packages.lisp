@@ -199,6 +199,7 @@
    #:topic-data-protection
    #:governance-effective-data-protection
    #:governance-effective-metadata-protection
+   #:governance-mixed-nonnone-kind-conflict
    #:permissions
    #:make-permissions
    #:permissions-p

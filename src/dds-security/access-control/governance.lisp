@@ -206,3 +206,23 @@
    %install-access-control-installed resolver), so a genuine metadata=NONE topic stays NONE (no false-REJECT); this
    most-protective value governs only when no per-topic refinement has run."
   (%governance-effective-basic-protection gov #'topic-rule-metadata-protection-kind))
+
+(defun* governance-mixed-nonnone-kind-conflict (gov)
+    (function (governance) (or null topic-rule))
+  "The first topic_rule whose data_protection AND metadata_protection are BOTH non-NONE §9.4.1.2.4
+   BasicProtectionKinds of DIFFERENT base kind (protection-kind-base: :sign vs :encrypt) — e.g. data=SIGN +
+   metadata=ENCRYPT, or data=ENCRYPT + metadata=SIGN — the mixed-kind combo a SINGLE user-endpoint EntityCrypto
+   key cannot represent (§9.5.2: one transformation_kind serves BOTH the payload/data and submessage/metadata
+   tiers on the user writer/reader). The payload kind WINS in %cm-entity-protection-kind, so data=SIGN would
+   DOWNGRADE an ENCRYPT-mandated user submessage onto the visible GMAC kind — a confidentiality downgrade.
+   NIL when every rule is same-base-kind or has NONE on a tier (both representable — the payload kind and the
+   submessage kind agree, or one tier is inert). Consulted at %install-access-control to FAIL-CLOSED REJECT such a
+   contradictory governance at create-participant (a clear error) rather than silently collapse to one km
+   (ADR-0040). Base-compared (protection-kind-base) so an origin-auth submessage variant of the SAME base kind is
+   NOT flagged (it maps to the same GMAC/GCM km). Fast DDS represents this with separate EntityKeyMaterials
+   (payload=last, submessage=first); we do not, so we reject the unrepresentable combo instead of mis-protecting."
+  (find-if (lambda (r)
+             (let ((d (protection-kind-base (topic-rule-data-protection-kind r)))
+                   (m (protection-kind-base (topic-rule-metadata-protection-kind r))))
+               (and (not (eq d :none)) (not (eq m :none)) (not (eq d m)))))
+           (governance-topic-rules gov)))

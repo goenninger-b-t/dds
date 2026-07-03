@@ -318,17 +318,23 @@
   (encode-key-fn (error "crypto-keys: :encode-key-fn required") :type function)
   (decode-key-fn (error "crypto-keys: :decode-key-fn required") :type function))
 
-(defun* make-test-key-material ()
-    (function () key-material)
+(defun* make-test-key-material (&key (kind :encrypt))
+    (function (&key (:kind (member :sign :encrypt))) key-material)
   "Return a fresh key-material with FIXED pre-shared test values (§9.5.2; Table 65 field names).
    Intended for offline unit / round-trip tests only. The Slice-2 Auth handshake replaces this
    with per-session KEM-derived keys. Every field is a COPY so callers cannot alias the constants.
+   KIND (:encrypt default -> AES256-GCM {0,0,0,4}; :sign -> AES256-GMAC {0,0,0,3}) sets the advertised
+   transformation_kind, selecting the ENCRYPT vs the GMAC/SIGN payload sub-tier in encode/decode-serialized-
+   payload; the fixed master key/salt/id are IDENTICAL for both (only the advertised kind + the seal-vs-GMAC
+   framing differ), so a :sign km yields a DETERMINISTIC GMAC SecuredPayload (the byte-exact golden's oracle).
    NONCE-REUSE WARNING: because this returns a fresh instance with iv-counter=0 over a FIXED
    master key, at most ONE instance may be used to ENCODE at a time — two encoders over this
    fixed key start at the same counter and produce colliding nonces (catastrophic for AES-GCM);
    it is an offline test/round-trip scaffold replaced by the Slice-2 per-writer derived key."
   (make-key-material
-   :transformation-kind (copy-seq +transformation-kind-aes256-gcm+)
+   :transformation-kind (copy-seq (ecase kind
+                                    (:encrypt +transformation-kind-aes256-gcm+)
+                                    (:sign    +transformation-kind-aes256-gmac+)))
    :master-salt         (copy-seq +test-master-salt+)
    :sender-key-id       (copy-seq +test-sender-key-id+)
    :master-sender-key   (copy-seq +test-master-sender-key+)

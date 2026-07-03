@@ -1133,6 +1133,62 @@
         (dds.dcps:delete-participant p))))
   t)
 
+(defun* run-security-mixed-kind-reject-test ()
+    (function () t)
+  "ADR-0040 payload-tier review follow-up (Important 2, DDS-Security 1.1 §9.5.2): the user writer/reader carries ONE
+   EntityCrypto key that serves BOTH the data_protection (payload/SecuredPayload) AND metadata_protection (user
+   submessage) tiers, so a topic_rule setting them to DIFFERENT non-NONE kinds is unrepresentable — the payload kind
+   WINS in %cm-entity-protection-kind and, for data=SIGN + metadata=ENCRYPT, DOWNGRADES the ENCRYPT-mandated submessage
+   onto the visible GMAC kind (a confidentiality downgrade). Such a contradictory governance MUST be FAIL-CLOSED
+   REJECTED at %install-access-control (create-participant), never silently collapsed to one km. Asserts:
+   (a) governance-mixed-nonnone-kind-conflict FLAGS both data=SIGN+metadata=ENCRYPT and data=ENCRYPT+metadata=SIGN, and
+       passes same-kind (SIGN/SIGN, ENCRYPT/ENCRYPT) + any-NONE (SIGN/NONE, NONE/ENCRYPT, NONE/NONE) combos (no
+       false-REJECT of a representable governance);
+   (b) %install-access-control SIGNALS on a mixed-kind governance and does NOT signal on a same-kind one."
+  (flet ((mk (data meta)
+           (dds.security:make-governance
+            :discovery-protection-kind :none :liveliness-protection-kind :none :rtps-protection-kind :none
+            :topic-rules (list (dds.security:make-topic-rule :topic-expr "*"
+                                                             :metadata-protection-kind meta
+                                                             :data-protection-kind data)))))
+    ;; (a) the pure conflict finder: mixed non-NONE kinds -> flagged; same-kind / any-NONE -> NIL
+    (%check :mk-sign-encrypt-flagged  (dds.security:governance-mixed-nonnone-kind-conflict (mk :sign :encrypt))
+            "data=SIGN + metadata=ENCRYPT must be flagged (single-km downgrade)")
+    (%check :mk-encrypt-sign-flagged  (dds.security:governance-mixed-nonnone-kind-conflict (mk :encrypt :sign))
+            "data=ENCRYPT + metadata=SIGN must be flagged (single-km, unrepresentable)")
+    (%check :mk-sign-sign-ok       (null (dds.security:governance-mixed-nonnone-kind-conflict (mk :sign :sign)))
+            "data=SIGN + metadata=SIGN (same kind) must NOT be flagged")
+    (%check :mk-encrypt-encrypt-ok (null (dds.security:governance-mixed-nonnone-kind-conflict (mk :encrypt :encrypt)))
+            "data=ENCRYPT + metadata=ENCRYPT (same kind) must NOT be flagged")
+    (%check :mk-sign-none-ok       (null (dds.security:governance-mixed-nonnone-kind-conflict (mk :sign :none)))
+            "data=SIGN + metadata=NONE (a NONE tier) must NOT be flagged")
+    (%check :mk-none-encrypt-ok    (null (dds.security:governance-mixed-nonnone-kind-conflict (mk :none :encrypt)))
+            "data=NONE + metadata=ENCRYPT (a NONE tier) must NOT be flagged")
+    (%check :mk-none-none-ok       (null (dds.security:governance-mixed-nonnone-kind-conflict (mk :none :none)))
+            "data=NONE + metadata=NONE must NOT be flagged")
+    ;; (b) %install-access-control: FAIL-CLOSED REJECT (signal) on a mixed-kind governance; ACCEPT a same-kind one
+    (let ((p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+      (unwind-protect
+           (progn
+             (setf (dds.dcps::dp-auth-state p)
+                   (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
+             (%check :mk-install-rejects-mixed
+                     (handler-case
+                         (progn (dds.dcps::%install-access-control
+                                 p (dds.security:make-access-handle :governance (mk :sign :encrypt)))
+                                nil)
+                       (error () t))
+                     "%install-access-control must SIGNAL on data=SIGN + metadata=ENCRYPT (fail-closed, no silent single-km collapse)")
+             (%check :mk-install-accepts-samekind
+                     (handler-case
+                         (progn (dds.dcps::%install-access-control
+                                 p (dds.security:make-access-handle :governance (mk :encrypt :encrypt)))
+                                t)
+                       (error () nil))
+                     "%install-access-control must ACCEPT a same-kind (data=ENCRYPT + metadata=ENCRYPT) governance (no false-REJECT)"))
+        (dds.dcps:delete-participant p))))
+  t)
+
 (defun* run-security-dn-match-test ()
     (function () t)
   "ADR-0036 carry (DDS-Security 1.1 §9.4.1.3 subject-name binding; RFC2253 §2-3): the serialization-insensitive

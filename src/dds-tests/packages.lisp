@@ -58,6 +58,7 @@
            #:run-security-keymaterial-harden-test
            #:run-security-payload-roundtrip-test
            #:run-security-payload-into-test
+           #:run-security-gmac-payload-test
            #:run-security-payload-fuzz-test
            #:run-security-encrypted-pubsub-test
            #:run-security-encrypted-fragmented-test

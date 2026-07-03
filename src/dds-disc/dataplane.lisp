@@ -1477,9 +1477,12 @@
         (pooled nil) (plen nil))   ; T5a: the acquired pool buffer + its TRUE secured-payload length (NIL = non-pooled path)
     ;; DDS-Security §9.5.3.3.4.4 encode (ADR 0031 T6): crypto-keys resolver or Slice-1 key-material; fail-closed on nil key.
     ;; §9.4.1.2.4: the SecuredPayload (data_protection) transform is applied UNLESS governance set data_protection=NONE
-    ;; for this topic (the SIGN tier: metadata_protection SIGN authenticates the VISIBLE payload; encrypting it would
-    ;; make a data=NONE peer read garbage). :unset (no governance) keeps the transform — Slice-1 direct-KM path unchanged.
-    ;; data_protection=SIGN (payload-tier GMAC) is NOT yet implemented: this gate is NONE-vs-non-NONE, so a data=SIGN topic routes into the ENCRYPT-only transform (over-encrypt -> peer false-REJECT); supported tiers: NONE + ENCRYPT (ADR-0040/0037 — SIGN at the payload tier is future work).
+    ;; for this topic (data=NONE: the payload rides plain). :unset (no governance) keeps the transform — Slice-1
+    ;; direct-KM path unchanged. The tier (ENCRYPT vs SIGN/GMAC) is selected by the resolved km's transformation_kind
+    ;; (%cm-entity-protection-kind derives it from user-data-protection-kind): data=ENCRYPT -> AES256-GCM ciphertext
+    ;; (HIDDEN); data=SIGN -> AES256-GMAC (the payload rides VISIBLE + GMAC-authenticated, encode-serialized-payload
+    ;; GMAC sub-tier). data_protection=SIGN (payload-tier GMAC) is IMPLEMENTED; supported tiers: NONE + SIGN + ENCRYPT
+    ;; (ADR-0040 §9.5.3.3.4.3).
     (let ((ct (and (not (eq (disc-node-user-data-protection-kind node) :none)) (disc-node-crypto-transform node))))
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
@@ -2155,10 +2158,12 @@
   (let ((guid (%source-guid src-prefix writer-id))   ; ONE source GUID: km-resolve + reliable proxy + the three inner tables + the loan handle
         (stored vec)                                  ; the value stored in disc-node-samples (a plaintext vec, or a T5b secured-loan-handle)
         (loan nil))                                   ; non-NIL = the pooled-buffer loan handle to register / release-on-reject (T5b)
-    ;; §9.4.1.2.4: apply the SecuredPayload (data_protection) DECODE UNLESS governance set data_protection=NONE (the
-    ;; SIGN tier — the payload rides PLAIN, authenticated by metadata_protection SIGN; decoding a plain payload as a
-    ;; SecuredPayload fails-closed and would DROP every sample). :unset (no governance) keeps the decode — direct-KM path unchanged.
-    ;; data_protection=SIGN (payload-tier GMAC) is NOT yet implemented: this gate is NONE-vs-non-NONE, so a data=SIGN topic routes into the ENCRYPT-only transform (over-decrypt -> drop); supported tiers: NONE + ENCRYPT (ADR-0040/0037 — SIGN at the payload tier is future work).
+    ;; §9.4.1.2.4: apply the SecuredPayload (data_protection) DECODE UNLESS governance set data_protection=NONE (data=NONE:
+    ;; the payload rides PLAIN; decoding a plain payload as a SecuredPayload fails-closed and would DROP every sample).
+    ;; :unset (no governance) keeps the decode — direct-KM path unchanged. The tier is selected by the resolved km's
+    ;; transformation_kind: data=ENCRYPT -> AES-256-GCM open; data=SIGN -> AES256-GMAC verify of the VISIBLE payload
+    ;; (decode-serialized-payload GMAC sub-tier, fail-closed on tamper). data_protection=SIGN (payload-tier GMAC) is
+    ;; IMPLEMENTED; supported tiers: NONE + SIGN + ENCRYPT (ADR-0040 §9.5.3.3.4.3).
     (let ((ct (and (not (eq (disc-node-user-data-protection-kind node) :none)) (disc-node-crypto-transform node))))
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)

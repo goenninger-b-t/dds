@@ -277,9 +277,22 @@
    conformant peer's find_key (Fast DDS) matches a stored token KeyMaterial to an inbound submessage on this kind
    AND the sender_key_id, so a SIGN tier MUST advertise GMAC or it is rejected 'Key material not found'. secure-SEDP
    / secure-SPDP readers+writers ride disc-node-secure-sedp-protection-kind; secure participant-message (liveliness)
-   readers+writers ride disc-node-secure-pm-protection-kind; the user writer/reader ride
-   disc-node-user-submessage-protection-kind; anything else -> :encrypt. A :none tier maps to :encrypt (inert — that
-   tier emits no protected submessage, so its EntityCrypto kind is never matched against a wire submessage)."
+   readers+writers ride disc-node-secure-pm-protection-kind; the user writer/reader's EntityCrypto serves BOTH the
+   metadata_protection (submessage, §8.5.1.7-.9) AND the data_protection (payload/SecuredPayload, §9.4.1.2.4) tiers, so
+   its kind is driven by the DATA_PROTECTION tier when that is engaged (non-NONE) — a data=SIGN topic MUST advertise
+   AES256-GMAC so its SecuredPayload rides VISIBLE+authenticated (encode-serialized-payload GMAC sub-tier), a
+   data=ENCRYPT topic AES256-GCM so the payload stays HIDDEN (confidentiality is authoritative — never emit a visible
+   GMAC payload for an ENCRYPT topic); data=NONE/unset falls back to the submessage tier
+   (disc-node-user-submessage-protection-kind). anything else -> :encrypt. A :none tier maps to :encrypt (inert — that
+   tier emits no protected submessage, so its EntityCrypto kind is never matched against a wire submessage). SINGLE-KM
+   LIMITATION: one EntityCrypto km cannot advertise two kinds, so a topic_rule that sets data_protection AND
+   metadata_protection to DIFFERENT non-NONE kinds on the user endpoint is unrepresentable here (Fast DDS uses separate
+   EntityKeyMaterials — the payload 'last' key vs the submessage 'first'). The payload kind wins, which is
+   confidentiality-PRESERVING ONLY for data=ENCRYPT + metadata=SIGN (the SIGN submessage rides the stronger GCM); the
+   REVERSE, data=SIGN + metadata=ENCRYPT, would DOWNGRADE the ENCRYPT-mandated user submessage onto the visible GMAC
+   kind. That contradictory mixed-kind governance is now FAIL-CLOSED REJECTED at %install-access-control
+   (governance-mixed-nonnone-kind-conflict, create-participant), so it can never reach this derivation; same-kind and
+   any-NONE combos are unaffected. ADR-0040."
   (flet ((nz (k) (if (eq k :sign) :sign :encrypt)))   ; :none/:encrypt -> :encrypt; :sign -> :sign
     (cond
       ((or (= entity-id dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)
@@ -294,7 +307,10 @@
        (nz (dds.disc:disc-node-secure-pm-protection-kind node)))
       ((or (= entity-id (dds.disc:disc-node-user-writer-id node))
            (= entity-id (dds.disc:disc-node-user-reader-id node)))
-       (nz (dds.disc:disc-node-user-submessage-protection-kind node)))
+       ;; payload tier is authoritative when engaged (non-NONE), else the submessage tier (unchanged for data=NONE)
+       (if (member (dds.disc:disc-node-user-data-protection-kind node) '(:sign :encrypt))
+           (nz (dds.disc:disc-node-user-data-protection-kind node))
+           (nz (dds.disc:disc-node-user-submessage-protection-kind node))))
       (t :encrypt))))
 
 (defun* %secure-sedp-reader-for-writer (writer-entity-id)

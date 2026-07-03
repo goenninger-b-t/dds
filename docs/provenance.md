@@ -3101,3 +3101,32 @@ behavioral corroboration READ FOR UNDERSTANDING ONLY (no code copied) from two i
   a safe no-op (no false-reject). This grounds the absence-tolerance (ours↔Fast-DDS must not regress).
 NO RTI Connext / libnddssecurity / rtiddsgen SOURCE was read. Fast DDS + OpenDDS read via the local checkouts /
 public GitHub master for understanding only; no code copied into `src/`.
+
+## M7/P6 — WP-SECURITY-DATA-SIGN-PAYLOAD: data_protection=SIGN payload-tier GMAC (2026-07-03)
+
+- **OMG DDS-Security 1.1 §9.5.3.3.4 / §9.5.3.3.4.3** — primary authority for `encode_serialized_payload` and its
+  GMAC (SIGN) variant (authenticate the VISIBLE serialized payload with an AES-GMAC common_mac, no encryption).
+- **eProsima Fast DDS (Apache-2.0) — read for understanding only, NO code copied** (clean-room READ authorized).
+  File `src/cpp/security/cryptography/AESGCMGMAC_Transform.cpp` at `/Users/frgo/gbt Dropbox/gbt/projects/fastdds/src/fastdds`:
+  - `encode_serialized_payload` (read L76-177): serialize_SecureDataHeader (the 20-octet CryptoHeader) then
+    `serialize_SecureDataBody(..., /*submessage=*/false)` then `serialize_SecureDataTag(..., /*submessage=*/false)`.
+    The body function is the SAME one the submessage tier uses; `submessage=false` is the serialized-payload tier.
+  - `serialize_SecureDataBody` (read L1531-1706): `do_encryption` is true ONLY for AES128/256-**GCM** (L1542-1543).
+    The **GMAC** branch (`!do_encryption`, L1578-1606) `memcpy`s the plaintext **VERBATIM** onto the wire (L1588) and
+    writes **NO `cnt_length`** (the 4-byte crypto_content.length + the submessage 4-align pad are inside the
+    `else`/ENCRYPT arm, L1607+ / L1692-1703 `if (submessage)` — ENCRYPT/submessage-only). AAD = the plaintext
+    (`EVP_EncryptUpdate(e_ctx, nullptr, &sz, plain_buffer, plain_buffer_len)`, L1591); the common_mac is the GMAC.
+    Comment L1580 verbatim: "Auth only. SEC_BODY should not be created. Plain buffer should be copied instead."
+  - `serialize_SecureDataTag` (read L1708-1735, empty `receiving_crypto_list`): writes `common_mac(16)`, aligns to 4
+    (relative to the buffer origin — for a 4-aligned payload the pad is 0), then `receiver_specific_macs_count(4)`.
+  - `decode_serialized_payload` (read L1329-1454): for the GMAC case (`!is_encrypted`, L1414-1420) it computes
+    `body_length = encoded_payload.length − sizeof(header)(=20) − (sizeof(uint32_t)+16)(=20)` — i.e. **N = total − 40**,
+    with no length prefix — then `deserialize_SecureDataBody` (L1954-2064, `!do_encryption`, L2018/L2047-2050) GMAC-
+    verifies over the body and `memcpy`s it out. This is only self-consistent when N ≡ 0 mod 4 (serialized CDR
+    payloads are 4-aligned in practice), matching our no-pad, no-length-prefix `40 + N` GMAC layout byte-for-byte.
+  - **DECISION as implemented:** the GMAC serialized-payload SecuredPayload = `SecureDataHeader(20)` ‖ `plaintext(N
+    VERBATIM)` ‖ `common_mac(16)` ‖ `receiver_specific_macs_count(4)=0`, total `40 + N`; the common_mac is a GMAC over
+    the plaintext (AAD=plaintext, empty ciphertext), nonce = session_id ‖ init_vector_suffix, session key via the
+    unchanged §9.5.3.3.4.2 KDF. The ENCRYPT tier (§9.5.3.3.4.4) is byte-identical + UNCHANGED. `transform.lisp`
+    branches on the km's `transformation_kind`; the GMAC uses `aes-256-gcm-seal-into`/`-open-into` with `pt-len`/`ct-len`
+    0 (the ZA-2 submessage-SIGN GMAC-into pattern reused at the payload tier). NO RTI Connext source consulted. CLEAN-ROOM.
