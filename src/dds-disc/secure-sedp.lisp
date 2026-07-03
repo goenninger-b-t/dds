@@ -69,12 +69,10 @@
    participant-message 0xff0200c2 -> 0xff0200c7; SPDP 0xff0101c2 -> 0xff0101c7. NIL for any non-secure-builtin
    writer (fail-closed — a HEARTBEAT for an unrecognized writer is dropped). The LOCAL receiving reader for an
    inbound HEARTBEAT (its EntityCrypto encodes our ACKNACK) AND the destination reader of an outbound HEARTBEAT.
-   The disc-layer twin of dds.dcps::%secure-sedp-reader-for-writer (clean-room, identical §9.3.2 pairing)."
-  (when (or (= writer-eid dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)
-            (= writer-eid dds.rtps.discovery:+entityid-sedp-sub-secure-writer+)
-            (= writer-eid dds.rtps.discovery:+entityid-participant-message-secure-writer+)
-            (= writer-eid dds.rtps.discovery:+entityid-spdp-secure-writer+))
-    (logior (logand writer-eid #xffffff00) #xc7)))
+   Delegates the gate + §9.3.1.2/§9.3.2 pairing to the shared dds.rtps.discovery helpers (ADR-0037 carry 1 DRY —
+   ONE source below both dds.disc + dds.dcps; identical to dds.dcps::%secure-sedp-reader-for-writer)."
+  (when (dds.rtps.discovery:secure-builtin-writer-eid-p writer-eid)
+    (dds.rtps.discovery:builtin-complementary-eid writer-eid)))
 
 ;; T9pull: the secure-SEDP reliability HEARTBEAT/ACKNACK handlers, defined after the announce helpers they
 ;; reuse (%send-secure-bracket / %send-secure-endpoint / %secure-endpoints-for); forward-declared here because
@@ -84,11 +82,12 @@
          (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) dds.core.buffer:cursor (unsigned-byte 8)) t)
                 %on-secure-builtin-acknack))
 
-(defun* %on-secure-builtin (node src-prefix bracket km my-receiver-key-id my-receiver-key)
+(defun* %on-secure-builtin (node src-prefix bracket km my-receiver-key-id my-receiver-key sender-eid)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))
                dds.security:key-material
                (or null (simple-array (unsigned-byte 8) (*)))
-               (or null (simple-array (unsigned-byte 8) (*)))) t)
+               (or null (simple-array (unsigned-byte 8) (*)))
+               (or null (unsigned-byte 32))) t)
   "Receiver thread: a secure BUILTIN SEC_PREFIX...SEC_POSTFIX bracket from remote SRC-PREFIX, whose
    transformation_key_id already resolved to the remote secure-builtin EntityCrypto KM. Recover the plaintext
    submessage (the T2/T3 codec decode-datawriter-submessage decodes ANY §8.5 bracket — DataWriter or DataReader
@@ -108,12 +107,22 @@
    EntityCrypto carries a receiver-specific key — origin-auth in effect for this tier), decode-datawriter-submessage
    ALSO verifies THIS receiver's entry in the CryptoFooter receiver_specific_macs under MY-RECEIVER-KEY and fails
    closed (no plaintext) if it is absent or mismatched — even when the common_mac is valid. Both NIL = no origin-auth
-   (the common_mac alone governs; byte-identical to the non-origin-auth path). FAIL-CLOSED (NFR-SEC-POSTURE): an
-   undecryptable/malformed/truncated/tampered bracket, a wrong/absent inner writerId, a missing/forged receiver-MAC,
-   or an unparseable inner data -> a silent DROP (no match/assert/record on unverified data — a tampered liveliness
-   assertion never asserts liveliness, a forged secure SPDP never registers a participant — no signal out, no
-   plaintext on failure). The SEDP match hooks fire OUTSIDE the node lock (the recorded-endpoint write is the only
-   locked region — mirrors %handle-datagram)."
+   (the common_mac alone governs; byte-identical to the non-origin-auth path).
+   SENDER-EID CROSS-CHECK (ADR-0040 carry — submessage-substitution defense, §8.5.1.9 / §9.5.2 Table 65): the outer
+   CryptoHeader transformation_key_id identifies the SENDING EntityCrypto, hence (REMOTE-KEY-ID-ENTITY) the expected
+   remote sender entity-id SENDER-EID. A writer-sourced inner submessage (DATA / HEARTBEAT) carries its own source
+   writerId; when SENDER-EID is non-NIL and the recovered inner writerId does NOT equal it, the submessage was keyed
+   under one endpoint's EntityCrypto but claims to originate from another -> DROP fail-closed (never delivered/matched),
+   so a legit peer cannot cross-inject one builtin channel's key into another's writerId. SENDER-EID NIL (no resolver
+   / unknown key_id — the direct-KM unit paths) skips the cross-check (no false-REJECT); in the live keyed path the
+   inner writerId ALWAYS equals SENDER-EID (each EntityCrypto is registered under its own endpoint's key_id, so legit
+   traffic never mismatches). The ACKNACK (reader-sourced) is not cross-checked here: its writerId is the LOCAL
+   destination writer (already gated to our secure-SEDP writer ids) and its source is bound by the AEAD key.
+   FAIL-CLOSED (NFR-SEC-POSTURE): an undecryptable/malformed/truncated/tampered bracket, a wrong/absent inner
+   writerId, an inner writerId != SENDER-EID, a missing/forged receiver-MAC, or an unparseable inner data -> a silent
+   DROP (no match/assert/record on unverified data — a tampered liveliness assertion never asserts liveliness, a
+   forged secure SPDP never registers a participant — no signal out, no plaintext on failure). The SEDP match hooks
+   fire OUTSIDE the node lock (the recorded-endpoint write is the only locked region — mirrors %handle-datagram)."
   (block %on-builtin
     (let ((plain (dds.security:decode-datawriter-submessage
                   km bracket :my-receiver-key-id my-receiver-key-id :my-receiver-key my-receiver-key)))
@@ -131,6 +140,10 @@
              (multiple-value-bind (rdr wid sn has-payload poff plen)
                  (dds.rtps.message:parse-data-body cur flags octets)
                (declare (ignore rdr))
+               ;; ADR-0040 carry: submessage-substitution defense — the inner DATA's writerId must equal the outer
+               ;; key_id's registered sender entity (SENDER-EID), else the bracket was keyed under one endpoint but
+               ;; claims another -> DROP fail-closed (§8.5.1.9 / §9.5.2). NIL SENDER-EID (unit direct-KM) skips it.
+               (unless (or (null sender-eid) (and wid (= wid sender-eid))) (return-from %on-builtin t))
                (unless (and has-payload (plusp plen)) (return-from %on-builtin t))
                ;; reliable accounting: record the received SN under the per-remote builtin reader keyed by the
                ;; secure writer-id, so the HEARTBEAT-driven ACKNACK advances past it (terminates the NACK-pull;
@@ -173,8 +186,10 @@
              (multiple-value-bind (rid wid first last hcount hfinal hlive)
                  (dds.rtps.message:parse-heartbeat-body cur flags)
                (declare (ignore rid hcount hfinal hlive))
-               ;; fail-closed: a truncated inner HEARTBEAT (parse -> NIL) is dropped, not signaled (NFR-SEC-POSTURE)
-               (when (and wid first last)
+               ;; fail-closed: a truncated inner HEARTBEAT (parse -> NIL) is dropped, not signaled (NFR-SEC-POSTURE);
+               ;; ADR-0040 carry: the inner HEARTBEAT's writerId must equal the outer key_id's sender entity SENDER-EID
+               ;; (submessage-substitution defense, §8.5.1.9 / §9.5.2) — a mismatch drops. NIL SENDER-EID skips it.
+               (when (and wid first last (or (null sender-eid) (= wid sender-eid)))
                  (%on-secure-builtin-heartbeat node src-prefix wid first last))))
             ;; inner ACKNACK (T9pull) — the remote's reliable secure-builtin reader NACKs; resend the protected DATA.
             ((= id dds.rtps.message:+submsg-acknack+)
@@ -234,12 +249,16 @@
                    (%on-user-secure-submessage node src-prefix bracket bracket-len ukm))
                  (let* ((resolver (disc-node-secure-sedp-decode-km node))
                         (recvres  (disc-node-secure-sedp-decode-receiver-km node))
+                        (sendres  (disc-node-secure-sedp-decode-sender-entity node))
                         (km       (and resolver key-id (funcall resolver key-id))))
                    ;; BUILTIN secure-SEDP / PVMS control-plane (allocating): an exact-length (subseq BRACKET 0 BRACKET-LEN)
                    ;; preserves the pre-T5 exact-vector input (the make-array moves here from %handle-datagram, net-neutral).
                    (if km
-                       (let ((rd (and recvres key-id (funcall recvres key-id))))   ; (key_id . key) | nil
-                         (%on-secure-builtin node src-prefix (subseq bracket 0 bracket-len) km (car rd) (cdr rd)))
+                       ;; ADR-0040 carry: SENDER-EID = the remote entity the key_id was registered under (submessage-
+                       ;; substitution cross-check in %on-secure-builtin); NIL when no resolver / unknown -> no cross-check.
+                       (let ((rd  (and recvres key-id (funcall recvres key-id)))   ; (key_id . key) | nil
+                             (sid (and sendres key-id (funcall sendres key-id))))  ; expected sender entity-id | nil
+                         (%on-secure-builtin node src-prefix (subseq bracket 0 bracket-len) km (car rd) (cdr rd) sid))
                        (%on-volatile-secure node src-prefix (subseq bracket 0 bracket-len))))))
            t))
     ;; ZA-2: borrow the per-thread key_id scratch (alloc-free); a not-carved pool (arena exhausted) -> a heap 4-array
@@ -1401,6 +1420,127 @@
                      "user-submsg fail-closed: a peer WITHOUT A's user EntityCrypto must NOT decode the bracket"))
            t)
       (stop-node node-a) (stop-node node-b))))
+
+(defun* run-secure-builtin-sender-crosscheck-test ()
+    (function () (eql t))
+  "ADR-0040 carry (submessage-substitution defense, §8.5.1.9 / §9.5.2 Table 65): %on-secure-builtin cross-checks a
+   writer-sourced inner submessage's writerId against SENDER-EID — the remote entity the outer transformation_key_id
+   was registered under. Encode ONE valid secure-SEDP-pub DATA (inner writerId 0xff0003c2 = pub-secure-writer) under
+   a test EntityCrypto, then decode+dispatch it three ways: SENDER-EID = the inner writerId (the LEGIT keyed path)
+   RECORDS the discovered writer; SENDER-EID = a DIFFERENT builtin entity (0xff0004c2 — a substituted-sender claim)
+   DROPS it fail-closed (no record); SENDER-EID = NIL (the direct-KM unit path, no resolver installed) RECORDS it
+   (no cross-check -> no false-REJECT). The bracket is byte-identical across the three — only the claimed sender
+   varies, exactly as the crypto-manager resolver would supply it. Requires AES-GCM; skips gracefully if absent."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [secure-builtin-xcheck] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-secure-builtin-sender-crosscheck-test t)))
+  (let* ((pa   (make-array 12 :element-type '(unsigned-byte 8) :initial-element 71))
+         (node (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 72)
+                               :host "127.0.0.1" :port 0))
+         (km   (%secure-sedp-test-km #x51 #x24))
+         (wid  dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)   ; 0xff0003c2 (the LEGIT inner sender)
+         (rid  dds.rtps.discovery:+entityid-sedp-pub-secure-reader+)   ; 0xff0003c7
+         (ep   (dds.rtps.discovery:make-endpoint-data
+                :role :writer :guid (%make-endpoint-guid pa 9 #x02)
+                :topic-name "SecTopic" :type-name "SecType"
+                :qos (dds.qos:make-qos :reliability :reliable)))
+         (plain   (%build-secure-sedp-data rid wid 1 ep))
+         (bracket (dds.security:encode-datawriter-submessage km :encrypt plain)))
+    (unwind-protect
+         (progn
+           (assert bracket () "secure-builtin-xcheck: the test encode must produce a bracket")
+           ;; (1) LEGIT — SENDER-EID == the inner writerId -> the discovered writer IS recorded
+           (clrhash (disc-node-discovered-writers node))
+           (%on-secure-builtin node pa bracket km nil nil wid)
+           (assert (= 1 (hash-table-count (disc-node-discovered-writers node))) ()
+                   "secure-builtin-xcheck: a DATA whose inner writerId EQUALS the outer key_id's sender entity must be recorded")
+           ;; (2) SUBSTITUTION — SENDER-EID is a DIFFERENT builtin entity -> DROP, no record (fail-closed)
+           (clrhash (disc-node-discovered-writers node))
+           (%on-secure-builtin node pa bracket km nil nil
+                               dds.rtps.discovery:+entityid-sedp-sub-secure-writer+)
+           (assert (zerop (hash-table-count (disc-node-discovered-writers node))) ()
+                   "secure-builtin-xcheck: a DATA whose inner writerId does NOT equal the outer key_id's sender entity (a submessage substitution) must be DROPPED fail-closed — no record")
+           ;; (3) NO CROSS-CHECK — SENDER-EID NIL (direct-KM unit path) -> recorded (backward-compatible, no false-REJECT)
+           (clrhash (disc-node-discovered-writers node))
+           (%on-secure-builtin node pa bracket km nil nil nil)
+           (assert (= 1 (hash-table-count (disc-node-discovered-writers node))) ()
+                   "secure-builtin-xcheck: SENDER-EID NIL (no resolver installed) must skip the cross-check and record (no false-REJECT)")
+           t)
+      (stop-node node))))
+
+(defun* run-secure-builtin-acknack-count-test ()
+    (function () (eql t))
+  "ADR-0037 carry 2 (the untested secure-builtin reliable ACKNACK count/behaviour; DDS-Security 1.1 §8.5.1.8/.9,
+   the M2-reliable NACK-pull). Drive %on-secure-builtin-heartbeat directly and COUNT + inspect the protected
+   ACKNACK it emits on the wire (the datagram sink captures the emit). NON-VACUOUS: (1) a HEARTBEAT [1,3] to an
+   EMPTY builtin reader emits EXACTLY ONE datagram; (2) it rides PROTECTED (a SEC_PREFIX bracket at offset 20, not
+   a clear ACKNACK); (3) the disc-node ACKNACK counter incremented by exactly 1; (4) decoded under the matched
+   EntityCrypto, the inner submessage IS an ACKNACK whose readerId/writerId are the secure-SEDP pair
+   (0xff0003c7 <- 0xff0003c2) NACKing THREE SNs (numBits 3 — nothing received yet); (5) after recording SNs 1..3, a
+   second HEARTBEAT [1,3] emits an ACKNACK NACKing ZERO (numBits 0 — a positive ACK, so the reliability count
+   RESPONDS to reader state, not a fixed reply). Requires AES-GCM; skips gracefully if absent."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [secure-builtin-acknack] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-secure-builtin-acknack-count-test t)))
+  (flet ((inner-acknack-numbits (dg km reid wid)   ; decode the protected bracket, assert it is the secure-SEDP ACKNACK, return numBits
+           (let ((plain (dds.security:decode-datawriter-submessage km (subseq dg 20))))
+             (assert plain () "secure-builtin-acknack: the protected ACKNACK must decode under the matched EntityCrypto")
+             (let ((cur (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over plain) :endianness :little)))
+               (multiple-value-bind (id flags octets le) (dds.rtps.message:parse-submessage-header cur)
+                 (declare (ignore octets))
+                 (assert (and id (= id dds.rtps.message:+submsg-acknack+)) ()
+                         "secure-builtin-acknack: the decoded inner submessage must be an ACKNACK (id 6)")
+                 (dds.core.buffer:cursor-set-endianness cur (if le :little :big))
+                 (multiple-value-bind (rid awid base numbits bitmap count finalp)
+                     (dds.rtps.message:parse-acknack-body cur flags)
+                   (declare (ignore base bitmap count finalp))
+                   (assert (and (= rid reid) (= awid wid)) ()
+                           "secure-builtin-acknack: the inner ACKNACK's readerId/writerId must be the secure-SEDP pair (0xff0003c7 <- 0xff0003c2)")
+                   numbits))))))
+    (let* ((pn   (make-array 12 :element-type '(unsigned-byte 8) :initial-element 61))
+           (node (make-disc-node :guid-prefix pn :host "127.0.0.1" :port 0))
+           (peer (make-array 12 :element-type '(unsigned-byte 8) :initial-element 62))
+           (wid  dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)   ; 0xff0003c2 (remote writer)
+           (reid dds.rtps.discovery:+entityid-sedp-pub-secure-reader+)   ; 0xff0003c7 (our receiving reader)
+           (km   (%secure-sedp-test-km #x63 #x27))
+           (loc  (dds.rtps.discovery:make-locator
+                  :kind dds.rtps.discovery:+locator-kind-udpv4+ :port 7411
+                  :address (dds.rtps.discovery:make-ipv4-locator
+                            (coerce #(127 0 0 1) '(simple-array (unsigned-byte 8) (4))))))
+           (caps '()))
+      (unwind-protect
+           (progn
+             (%record-participant node (dds.rtps.discovery:make-spdp-data
+                                        :guid-prefix peer :version-major 2 :version-minor 5
+                                        :metatraffic-unicast-locators (list loc) :default-unicast-locators (list loc)))
+             (setf (disc-node-secure-sedp-encode-km node) (lambda (eid) (when (= eid reid) km))
+                   (disc-node-secure-sedp-protection-kind node) :encrypt)
+             (let ((c0 (disc-node-ack-count node)))
+               (let ((*datagram-sink* (lambda (dg) (push (copy-seq dg) caps))))
+                 (%on-secure-builtin-heartbeat node peer wid 1 3))   ; HB [1,3], nothing received -> NACK 1,2,3
+               (assert (= 1 (length caps)) ()
+                       "secure-builtin-acknack: a HEARTBEAT [1,3] to an empty reader must emit EXACTLY ONE ACKNACK datagram")
+               (assert (= (1+ c0) (disc-node-ack-count node)) ()
+                       "secure-builtin-acknack: the disc-node ACKNACK counter must increment by exactly 1")
+               (assert (and (> (length (first caps)) 20)
+                            (= (aref (first caps) 20) dds.security:+submessage-sec-prefix+)) ()
+                       "secure-builtin-acknack: the ACKNACK must ride PROTECTED (a SEC_PREFIX bracket at offset 20), never clear")
+               (assert (= 3 (inner-acknack-numbits (first caps) km reid wid)) ()
+                       "secure-builtin-acknack: the ACKNACK must NACK THREE SNs (numBits 3) — nothing received yet (non-vacuous)"))
+             (%builtin-on-data node peer wid 1)
+             (%builtin-on-data node peer wid 2)
+             (%builtin-on-data node peer wid 3)
+             (setf caps '())
+             (let ((*datagram-sink* (lambda (dg) (push (copy-seq dg) caps))))
+               (%on-secure-builtin-heartbeat node peer wid 1 3))
+             (assert (= 1 (length caps)) ()
+                     "secure-builtin-acknack: the second HEARTBEAT must still emit exactly one ACKNACK")
+             (assert (= 0 (inner-acknack-numbits (first caps) km reid wid)) ()
+                     "secure-builtin-acknack: after receiving SNs 1..3 the ACKNACK must NACK ZERO (numBits 0 — the count responds to reader state)")
+             t)
+        (stop-node node)))))
 
 (defun* run-user-submessage-data-protection-test ()
     (function () (eql t))

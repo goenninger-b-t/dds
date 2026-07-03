@@ -136,6 +136,25 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (gethash prefix (disc-node-pvms-bootstrap-kms node))))
 
+(defun* %prune-pvms-bootstrap-km (node prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) (or null dds.security:key-material))
+  "ADR-0036/0040 carry (PVMS peer-loss prune): when remote participant PREFIX is LOST/unmatched (%lease-sweep),
+   DROP its §9.5.3.1 PVMS bootstrap KeyMaterial from the active pvms-bootstrap-kms table — so a lost peer's PVMS
+   traffic is UNRESOLVABLE (fail-closed) and the table stays BOUNDED under peer churn — and WIPE its secrets IN
+   PLACE (dds.security:wipe-key-material-secrets: fill-0, prompt hygiene). NO UAF: the wipe does NOT free the
+   foreign-static (KxKey/KxSalt-derived) buffers; the KM is moved to disc-node-retired-pvms-kms so the SOLE free
+   stays at the QUIESCED stop-node teardown (after the receiver thread is joined) — freeing here would UAF a
+   concurrent %on-volatile-secure decode (a lease-expired peer's delayed PVMS datagram resolved before the drop;
+   the no-mid-run-free invariant). A concurrent decode racing the wipe reads zeros -> a fail-closed GCM drop, never
+   freed memory. Lock-guarded; idempotent (no KM -> NIL, no-op). Returns the pruned KM or NIL."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((km (gethash prefix (disc-node-pvms-bootstrap-kms node))))
+      (when km
+        (remhash prefix (disc-node-pvms-bootstrap-kms node))
+        (dds.security:wipe-key-material-secrets km)
+        (push km (disc-node-retired-pvms-kms node)))
+      km)))
+
 ;;; --- per-role session_id: DISJOINT nonce spaces for the SYMMETRIC bootstrap KM (T8, safety-critical) ---
 
 (defun* %pvms-prefix-greater-p (a b)
@@ -635,6 +654,47 @@
       (setf *pvms-debug-drop-sns* nil)
       (stop-node node1)
       (stop-node node2))))
+
+(defun* run-pvms-peer-loss-prune-test ()
+    (function () (eql t))
+  "ADR-0036/0040 carry (PVMS peer-loss prune): a matched remote's §9.5.3.1 PVMS bootstrap KeyMaterial installs
+   into the active pvms-bootstrap-kms table; %prune-pvms-bootstrap-km (fired on lease-out from %lease-sweep) DROPS
+   it (unresolvable -> fail-closed, table BOUNDED) and WIPES its master secrets IN PLACE (fill-0, no free), moving
+   the handle to disc-node-retired-pvms-kms for the single QUIESCED stop-node free (no mid-run free -> no UAF of a
+   concurrent %on-volatile-secure decode). Asserts: resolvable before; the pruned KM returned; its master secrets
+   zero after; unresolvable after (bounded); the handle retired for teardown; a second prune a no-op (idempotent);
+   an UNRELATED peer untouched. Requires AES-GCM (the derived bootstrap KM); skips gracefully if absent."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [pvms-prune] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-pvms-peer-loss-prune-test t)))
+  (let* ((p1    (make-array 12 :element-type '(unsigned-byte 8) :initial-element 33))
+         (node  (make-disc-node :guid-prefix p1 :host "127.0.0.1" :port 0))
+         (peer  (make-array 12 :element-type '(unsigned-byte 8) :initial-element 44))
+         (other (make-array 12 :element-type '(unsigned-byte 8) :initial-element 55))
+         (km    (%pvms-test-derive-km 7))
+         (okm   (%pvms-test-derive-km 9)))
+    (unwind-protect
+         (progn
+           (set-pvms-bootstrap-km node peer km)
+           (set-pvms-bootstrap-km node other okm)
+           (assert (eq km (%pvms-bootstrap-km node peer)) ()
+                   "pvms-prune: the peer's bootstrap KM must resolve before the prune")
+           (assert (eq km (%prune-pvms-bootstrap-km node peer)) ()
+                   "pvms-prune: prune must return the dropped bootstrap KM")
+           (assert (and (every #'zerop (dds.security::key-material-master-sender-key km))
+                        (every #'zerop (dds.security::key-material-master-salt km))) ()
+                   "pvms-prune: the pruned KM's master secrets must be wiped to zero (prompt hygiene)")
+           (assert (null (%pvms-bootstrap-km node peer)) ()
+                   "pvms-prune: the peer's bootstrap KM must be unresolvable after the prune (bounded, fail-closed)")
+           (assert (member km (disc-node-retired-pvms-kms node)) ()
+                   "pvms-prune: the pruned KM handle must be retired for the quiesced-teardown free (no mid-run free)")
+           (assert (null (%prune-pvms-bootstrap-km node peer)) ()
+                   "pvms-prune: a second prune of the same peer is a no-op (idempotent)")
+           (assert (eq okm (%pvms-bootstrap-km node other)) ()
+                   "pvms-prune: an unrelated peer's bootstrap KM must NOT be pruned (no over-drop)")
+           t)
+      (stop-node node))))
 
 (defun* run-volatile-secure-fail-closed-test ()
     (function () (eql t))

@@ -399,6 +399,16 @@ conformantly** (verified our-to-our, both impls green):
 3. **Subject-name DN serialization** — our oneline `string=` vs Fast DDS RFC2253 (`Permissions.cpp:632`).
    Added the serialization-insensitive `%dn-equal` / `permissions-grant-for` (a latent always-wrong-cross-vendor
    bug); all three subject-match sites route through it — reduces false-REJECT.
+   **HARDENED — WP-SECURITY-CARRIES-BATCH (2026-07-03, RFC2253 §2-3).** `%dn-normalize`/`%dn-equal` were RFC2253-
+   naive: the RDN splitter ignored `\`-ESCAPING (an escaped separator was mis-cut → a latent false-REJECT of a
+   conformant DN with a comma/space in a value) and values were never un-escaped. Rewritten to split only on
+   UNESCAPED separators (`%dn-split-unescaped`), find the first UNESCAPED `=` (`%dn-attr-value-pos`), un-escape the
+   value to its canonical form (`%dn-unescape`: `\c` and `\XX` hex), upcase the attribute TYPE while keeping the
+   VALUE case-sensitive, and FAIL-CLOSED to `:malformed` on any malformed RDN (no unescaped `=`, empty type, or bad
+   escape) so an ambiguous/malformed DN NEVER authorizes — not even against an identical malformed grant (no
+   false-ACCEPT). Test `run-security-dn-match-test` (14 cases: ordering / oneline↔RFC2253 / type case-fold /
+   whitespace / escaped-comma / hex-escape MATCH; wrong-value / value-case / escaped-vs-unescaped structure /
+   subset / malformed NO-MATCH). Both impls; existing access-control tests green UNCHANGED.
 4. **S/MIME container + loopback reachability** — Fast DDS needs multipart/signed `text/plain` (`PKCS7_TEXT`,
    `Permissions.cpp:408`); added the MIME fixtures + `create-participant :port` + Fast DDS `initialPeers`
    (the macOS multi-NIC pattern).

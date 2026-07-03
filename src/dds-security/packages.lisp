@@ -72,6 +72,7 @@
    #:key-material-iv-counter-lock
    ;; ADR-0034 secret hygiene: foreign/static KeyMaterial master secrets + zeroize-on-teardown choke + fail-closed guard
    #:zeroize-key-material
+   #:wipe-key-material-secrets
    #:key-material-zeroized
    #:key-material-zeroized-error
    #:make-test-key-material
@@ -197,6 +198,7 @@
    #:topic-metadata-protection
    #:topic-data-protection
    #:governance-effective-data-protection
+   #:governance-effective-metadata-protection
    #:permissions
    #:make-permissions
    #:permissions-p

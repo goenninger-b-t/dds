@@ -92,6 +92,31 @@
 (defconstant +entityid-spdp-secure-reader+ #xff0101c7
   "SPDPbuiltinParticipantSecureReader EntityId 0xff0101c7 (DDS-Security 1.1 §7.4.5; Fast DDS EntityId_t.hpp).")
 
+(defun* builtin-complementary-eid (eid)
+    (function ((unsigned-byte 32)) (unsigned-byte 32))
+  "The complementary builtin EntityId of EID — its matched writer<->reader pair — by flipping ONLY the low
+   EntityKind octet between the with-key builtin WRITER kind 0xC2 and READER kind 0xC7 (RTPS 2.5 §9.3.1.2:
+   EntityId_t's last octet is the EntityKind, and the two builtin-with-key kinds differ ONLY in it; §9.3.2 builtin
+   endpoint pairing). 0xC2 -> 0xC7, any other low byte -> 0xC2; the high 3 octets (the EntityKey identifying the
+   builtin tier — secure SEDP 0xff0003/0xff0004, secure SPDP 0xff0101, secure PM 0xff0200) are preserved. Pure
+   arithmetic — the CALLER gates which EntityIds are valid inputs. The SINGLE shared source for the 0xC2<->0xC7
+   pairing (was open-coded in dds.disc secure-sedp + dds.dcps crypto-manager thrice; ADR-0037 carry 1 DRY)."
+  (logior (logand eid #xffffff00)
+          (if (= (logand eid #xff) #xc2) #xc7 #xc2)))
+
+(defun* secure-builtin-writer-eid-p (eid)
+    (function ((unsigned-byte 32)) boolean)
+  "T iff EID is one of the four secure-BUILTIN WRITER EntityIds (DDS-Security 1.1 §7.4.5): secure-SEDP
+   publications 0xff0003c2 / subscriptions 0xff0004c2, secure participant-message 0xff0200c2, secure SPDP
+   0xff0101c2. The shared gate for the origin-auth secure-builtin writer->reader pairing (with
+   builtin-complementary-eid); NIL for any other EntityId (fail-closed — a HEARTBEAT/DATA for an unrecognized
+   writer is dropped). The SINGLE shared source (was open-coded in dds.disc secure-sedp + dds.dcps crypto-manager)."
+  (and (or (= eid +entityid-sedp-pub-secure-writer+)
+           (= eid +entityid-sedp-sub-secure-writer+)
+           (= eid +entityid-participant-message-secure-writer+)
+           (= eid +entityid-spdp-secure-writer+))
+       t))
+
 ;; DDS-Security 1.1 §7.4.6.1 BuiltinEndpointSet security bits (secure SEDP, secure PMD, PSM, PVMS).
 ;; Bits 16-19: secure SEDP pub/sub announcer/detector; 20-21: secure PMD writer/reader.
 (defconstant +be-sedp-pub-secure-writer+ (ash 1 16)

@@ -18,6 +18,7 @@
            #:disc-node-discovered-count #:disc-node-discovered-prefixes
            #:disc-node-matched-count #:disc-node-matched-topics
            #:disc-node-on-match #:disc-node-on-unmatch
+           #:disc-node-on-participant-lost
            #:disc-node-on-liveliness-changed #:%liveliness-sweep
            #:disc-node-on-lifecycle-event
            #:disc-node-on-incompatible-qos #:disc-node-on-sample
@@ -90,6 +91,7 @@
            #:%pvms-role-session-id
            #:*pvms-debug-drop-sns*
            #:run-volatile-secure-reliable-test
+           #:run-pvms-peer-loss-prune-test
            #:run-volatile-secure-fail-closed-test
            #:run-volatile-secure-purge-bound-test
            #:run-volatile-secure-session-id-on-wire-test
@@ -101,6 +103,7 @@
            #:disc-node-secure-sedp-origin-auth
            #:disc-node-secure-sedp-encode-receivers
            #:disc-node-secure-sedp-decode-receiver-km
+           #:disc-node-secure-sedp-decode-sender-entity
            ;; Slice 4 (T11): secure participant-message (liveliness) + secure SPDP re-announce
            #:disc-node-secure-pm-protection-kind
            #:disc-node-secure-pm-origin-auth
@@ -119,10 +122,13 @@
            #:disc-node-user-submessage-protection-kind
            #:disc-node-user-data-protection-kind
            #:disc-node-topic-data-protection-resolver
+           #:disc-node-topic-metadata-protection-resolver
            #:disc-node-user-submessage-encode
            #:disc-node-user-submessage-decode
            #:run-user-submessage-protection-test
            #:run-user-submessage-data-protection-test
+           #:run-secure-builtin-sender-crosscheck-test
+           #:run-secure-builtin-acknack-count-test
            #:run-user-submessage-protection-zeroalloc-test
            #:run-secured-dataplane-mem-test
            #:run-secure-sedp-roundtrip-test

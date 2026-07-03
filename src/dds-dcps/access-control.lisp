@@ -159,6 +159,20 @@
             (dds.security:governance-effective-data-protection gov))
       (setf (dds.disc:disc-node-topic-data-protection-resolver (dp-node p))
             (lambda (topic) (dds.security:topic-data-protection gov topic)))))
+  ;; §9.4.1.2.4 metadata_protection_kind PARTICIPANT-level default (SYMMETRIC to data_protection above): stamp the
+  ;; MOST-PROTECTIVE user-DATA-submessage tier over all topic rules (governance-effective-metadata-protection) as a
+  ;; FAIL-CLOSED fallback so an endpoint added via add-local-{writer,reader} never DOWNGRADES below a later
+  ;; metadata=SIGN/ENCRYPT rule when the FIRST rule is metadata=NONE (an unprotected user submessage on a protected
+  ;; topic = false-ACCEPT). ALSO install the per-topic resolver (topic -> metadata_protection_kind);
+  ;; add-local-{writer,reader} (%refine-user-protection) REFINE the slot to the endpoint's ACTUAL rule, so a genuine
+  ;; metadata=NONE topic stays :none (no false-REJECT). No governance leaves the slot :none + resolver NIL ->
+  ;; byte-identical (the user submessage path stays plain).
+  (let ((gov (dds.security:access-handle-governance access-handle)))
+    (when gov
+      (setf (dds.disc:disc-node-user-submessage-protection-kind (dp-node p))
+            (dds.security:governance-effective-metadata-protection gov))
+      (setf (dds.disc:disc-node-topic-metadata-protection-resolver (dp-node p))
+            (lambda (topic) (dds.security:topic-metadata-protection gov topic)))))
   ;; DDS-Security 1.1 §7.3/§8.5: §8.5 crypto-token keying is a §7.3 endpoint-match precondition ONLY when the
   ;; governance mandates protection (governance-any-protection-p); an all-NONE governance (authentication +
   ;; access-control only) matches at :authenticated on §8.7 auth + §8.4 permissions alone (§8.4.2.9 — matching is

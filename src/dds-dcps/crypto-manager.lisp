@@ -223,6 +223,16 @@
                      dds.rtps.discovery:+entityid-spdp-secure-reader+))
        t))
 
+(defun* cm-remote-entity-for-key-id (cm key-id)
+    (function (crypto-manager (simple-array (unsigned-byte 8) (*))) (or null (unsigned-byte 32)))
+  "The remote sender's entity-id that CryptoHeader transformation_key_id KEY-ID was registered under
+   (REMOTE-KEY-ID-ENTITY, written ATOMICALLY with the KM by register-remote-entity, §9.5.2 Table 65) — the
+   EXPECTED inner-submessage source endpoint for the ADR-0040 anti-substitution cross-check in %on-secure-builtin
+   (a writer-sourced inner DATA/HEARTBEAT whose writerId != this entity was keyed under one endpoint but claims
+   another -> DROP). NIL (skip the cross-check, no false-REJECT) on an unknown key-id. O(1) under the lock."
+  (dds.pal:with-lock ((crypto-manager-lock cm))
+    (gethash key-id (crypto-manager-remote-key-id-entity cm))))
+
 (defun* cm-user-entity-km-by-key-id (cm key-id)
     (function (crypto-manager (simple-array (unsigned-byte 8) (*))) (or null dds.security:key-material))
   "Resolve the REMOTE USER endpoint KeyMaterial by the 4-octet CryptoHeader transformation_key_id, returning the
@@ -296,16 +306,11 @@
    SPDP 0xff0101c2 -> 0xff0101c7 (secure SPDP re-announce, T11). NIL for any non-secure-builtin-writer entity-id.
    Used by BOTH the ENCODE resolver (local writer -> matched-remote reader's receiver key) and the DECODE
    resolver (remote writer -> local reader's receiver key) — the writer->reader pairing is identical in both
-   directions, so the origin-auth receiver-MAC wiring is one shared mechanism across every secure builtin tier."
-  (cond ((= writer-entity-id dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)
-         dds.rtps.discovery:+entityid-sedp-pub-secure-reader+)
-        ((= writer-entity-id dds.rtps.discovery:+entityid-sedp-sub-secure-writer+)
-         dds.rtps.discovery:+entityid-sedp-sub-secure-reader+)
-        ((= writer-entity-id dds.rtps.discovery:+entityid-participant-message-secure-writer+)
-         dds.rtps.discovery:+entityid-participant-message-secure-reader+)
-        ((= writer-entity-id dds.rtps.discovery:+entityid-spdp-secure-writer+)
-         dds.rtps.discovery:+entityid-spdp-secure-reader+)
-        (t nil)))
+   directions, so the origin-auth receiver-MAC wiring is one shared mechanism across every secure builtin tier.
+   Delegates the gate + §9.3.1.2/§9.3.2 pairing to the shared dds.rtps.discovery helpers (ADR-0037 carry 1 DRY —
+   ONE source below both dds.dcps + dds.disc; identical to dds.disc::%secure-reader-eid-for-writer)."
+  (when (dds.rtps.discovery:secure-builtin-writer-eid-p writer-entity-id)
+    (dds.rtps.discovery:builtin-complementary-eid writer-entity-id)))
 
 (defun* cm-secure-sedp-encode-receivers (cm writer-entity-id remote-prefix)
     (function (crypto-manager (unsigned-byte 32) (simple-array (unsigned-byte 8) (12))) list)
@@ -453,8 +458,8 @@
   (cond
     ((= local-eid (dds.disc:disc-node-user-writer-id node)) (dds.disc:disc-node-user-reader-id node))
     ((= local-eid (dds.disc:disc-node-user-reader-id node)) (dds.disc:disc-node-user-writer-id node))
-    (t (logior (logand local-eid #xffffff00)
-               (if (= (logand local-eid #xff) #xc2) #xc7 #xc2)))))
+    ;; ADR-0037 carry 1 DRY: the builtin writer<->reader §9.3.1.2/§9.3.2 low-byte pairing, one shared source
+    (t (dds.rtps.discovery:builtin-complementary-eid local-eid))))
 
 (defun* cm-make-crypto-token-message (cm class km src-guid dest-prefix dest-endpoint-guid)
     (function (crypto-manager string dds.security:key-material
@@ -749,6 +754,12 @@
             (cm-secure-sedp-encode-receivers cm writer-entity-id remote-prefix)))
     (setf (dds.disc:disc-node-secure-sedp-decode-receiver-km node)
           (lambda (key-id) (cm-secure-sedp-decode-receiver cm key-id)))
+    ;; ADR-0040 carry (submessage-substitution defense, §8.5.1.9 / §9.5.2 Table 65): map an inbound secure-builtin
+    ;; bracket's transformation_key_id -> the EXPECTED remote sender entity-id it was registered under, so
+    ;; %on-secure-builtin drops a writer-sourced inner DATA/HEARTBEAT whose writerId claims a DIFFERENT endpoint.
+    ;; NIL on an unknown key_id -> no cross-check (no false-REJECT); security OFF leaves it NIL -> byte-identical.
+    (setf (dds.disc:disc-node-secure-sedp-decode-sender-entity node)
+          (lambda (key-id) (cm-remote-entity-for-key-id cm key-id)))
     ;; T10: whole-RTPS-message protection (rtps_protection_kind, §8.5.1.10-.12). RTPS-PROTECTION-ENCODE wraps a
     ;; USER-DATA datagram bound for a :keyed destination — gated on governance rtps_protection != NONE
     ;; (RTPS-PROTECTION-KIND, set by %install-access-control) AND the dest having sent its ParticipantCrypto
@@ -786,7 +797,48 @@
                   (when km (values km kind)))))))
     (setf (dds.disc:disc-node-user-submessage-decode node)
           (lambda (key-id) (cm-user-entity-km-by-key-id cm key-id)))
+    ;; ADR-0034 MINOR-4: when a remote participant leases out (%lease-sweep), drop its KeyMaterials from the active
+    ;; crypto registries (unresolve + prompt secret-wipe; the foreign free stays at the quiesced teardown). NIL peer /
+    ;; GOV=none -> cm-forget-remote-participant returns 0 (no-op). Security OFF leaves the hook NIL -> byte-identical.
+    (setf (dds.disc:disc-node-on-participant-lost node)
+          (lambda (prefix) (cm-forget-remote-participant cm prefix) nil))
     cm))
+
+;;; --- participant-lost: drop a lost remote's KeyMaterials from the active registries (ADR-0034 MINOR-4) ---
+
+(defun* cm-forget-remote-participant (cm prefix)
+    (function (crypto-manager (simple-array (unsigned-byte 8) (12))) (integer 0))
+  "ADR-0034 MINOR-4 (remote-KM drop-on-unmatch): when the REMOTE participant PREFIX is LOST/unmatched
+   (fired from %lease-sweep via disc-node-on-participant-lost), DROP its §9.5.2 KeyMaterials from the ACTIVE
+   lookup registries — remote-participant-crypto (12-octet prefix), remote-entity-crypto (every prefix+entity
+   GUID), key-id-index + remote-key-id-entity (by each dropped KM's sender_key_id) — so a lost peer's keys become
+   UNRESOLVABLE (a subsequent decode fails closed) and a peer-CHURNING participant's data-path lookup tables stay
+   BOUNDED. Each dropped KM's SECRETS are WIPED IN PLACE (dds.security:wipe-key-material-secrets: fill-0, NO free)
+   for prompt hygiene. The KM handle is KEPT in ALL-KMS so its foreign buffers are freed EXACTLY ONCE at the
+   QUIESCED participant teardown (cm-teardown, after the receiver thread is joined): freeing here would UAF a
+   concurrent in-flight decode (a lease-expired peer's delayed/replayed datagram resolved before the drop) — the
+   no-mid-run-free invariant. Under the manager lock; idempotent (a re-discovered peer re-registers). Returns the
+   count of KMs dropped (0 = the peer had no registered crypto — GOV=none / never keyed).
+   Contract: do not drive %lease-sweep / announce on a participant concurrently with its own delete-participant
+   (use-after-delete API misuse) — the real receiver-thread axis is closed by the stop-node join-before-free."
+  (dds.pal:with-lock ((crypto-manager-lock cm))
+    (let ((victims '()))
+      (let ((pkm (gethash prefix (crypto-manager-remote-participant-crypto cm))))
+        (when pkm (pushnew pkm victims) (remhash prefix (crypto-manager-remote-participant-crypto cm))))
+      (let ((dead-guids '()))
+        (maphash (lambda (guid km)
+                   (when (loop for i below 12 always (= (aref guid i) (aref prefix i)))
+                     (pushnew km victims) (push guid dead-guids)))
+                 (crypto-manager-remote-entity-crypto cm))
+        (dolist (g dead-guids) (remhash g (crypto-manager-remote-entity-crypto cm))))
+      (dolist (km victims)
+        (let ((kid (dds.security:key-material-sender-key-id km)))
+          (when kid
+            (remhash kid (crypto-manager-key-id-index cm))
+            (remhash kid (crypto-manager-remote-key-id-entity cm))))
+        ;; prompt secret wipe (no free — the buffers stay alive for the single quiesced-teardown free; ALL-KMS keeps the handle)
+        (dds.security:wipe-key-material-secrets km))
+      (length victims))))
 
 ;;; --- teardown: zeroize + free every KeyMaterial secret (ADR-0034 secret hygiene) ---
 

@@ -356,12 +356,22 @@ idempotency), green on SBCL and Clasp.  On SBCL the off-heap discrimination uses
 sub-representation) so the WIPE is the master-slot hardening evidence — documented in the
 `dds.pal:static-vector-p` per-impl docstrings (NFR-PORT).
 
-**MINOR-4 (open follow-on) — the `all-kms` roster grows monotonically.**  The crypto-manager's
-`all-kms` EQ roster records every minted/registered KeyMaterial and is walked once at
-`cm-teardown`; remote-participant KMs are HELD (and only zeroized at that teardown), not
-dropped/wiped on unmatch.  A long-lived participant that churns many remote peers therefore
-retains their (foreign-static-master) KMs until its own teardown — bounded by peer count, not a
-per-datagram leak, but an unmatch-time drop-and-zeroize is the hygiene follow-on.
+**MINOR-4 — remote-KM drop-on-unmatch (RESOLVED for the active tables + prompt secret-wipe;
+WP-SECURITY-CARRIES-BATCH, 2026-07-03).**  When a REMOTE participant leases out (`%lease-sweep` fires the new
+`disc-node-on-participant-lost` hook), `cm-forget-remote-participant` DROPS that peer's KeyMaterials from the
+FOUR ACTIVE lookup registries (`remote-participant-crypto`, `remote-entity-crypto`, `key-id-index`,
+`remote-key-id-entity`) — so a lost peer's keys are UNRESOLVABLE (fail-closed) and a peer-churning participant's
+data-path lookup tables stay BOUNDED — and WIPES each dropped KM's master secrets IN PLACE
+(`wipe-key-material-secrets`: fill-0, prompt hygiene, so key material does not linger until teardown).  The KM
+handle is deliberately KEPT in `all-kms` so its foreign-static master buffers are freed EXACTLY ONCE at the
+QUIESCED participant teardown (`cm-teardown`, after the receiver thread is joined): freeing on lease-out would
+USE-AFTER-FREE a concurrent in-flight decode (a lease-expired peer's delayed/replayed datagram resolved before
+the drop) — the no-mid-run-free invariant.  So `all-kms` still holds one WIPED (secret-free) tiny handle per
+churned peer until teardown — the security concern (lingering key material) is fully resolved; the residual is
+the deferred foreign free, the price of UAF-safety.  Proven by `%cm-forget-remote` (in
+`run-security-crypto-manager-test`): register → forget → asserts the master secrets are zero, the peer is
+unresolvable (bounded), the handle is retained in `all-kms`, an unrelated peer is untouched, and a second forget
+is a no-op.
 
 ### Carry 5 — Full 3-participant end-to-end test (DEFERRED)
 

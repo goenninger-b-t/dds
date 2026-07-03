@@ -271,6 +271,10 @@
   (on-nack-frag nil :type (or null function))
   (on-match nil :type (or null function))
   (on-unmatch nil :type (or null function))
+  ;; ADR-0034 MINOR-4: called (node prefix) OUTSIDE the lock by %lease-sweep for each REMOTE participant that leased out,
+  ;; so the security layer drops that lost peer's KeyMaterials from the crypto-manager (cm-forget-remote-participant:
+  ;; unresolve + wipe secrets; bounded active tables). NIL = security OFF / no crypto-manager -> no-op.
+  (on-participant-lost nil :type (or null function))
   (on-liveliness-changed nil :type (or null function))
   (type-gate nil :type (or null function))
   (on-incompatible-qos nil :type (or null function))
@@ -288,6 +292,10 @@
   (pvms-writer nil :type (or null dds.rtps.reliable:rtps-writer))
   (pvms-reader nil :type (or null dds.rtps.reliable:rtps-reader))
   (pvms-bootstrap-kms (make-hash-table :test 'equalp) :type hash-table)
+  ;; ADR-0036/0040 carry: PVMS bootstrap KMs pruned on peer-loss (%prune-pvms-bootstrap-km) are WIPED in place then
+  ;; parked HERE — their foreign-static buffers are freed at the QUIESCED stop-node teardown (never mid-run: a
+  ;; concurrent %on-volatile-secure decode may still reference a just-pruned KM -> no UAF). Bounded by peer churn per teardown.
+  (retired-pvms-kms nil :type list)
   (on-volatile-secure nil :type (or null function))
   ;; Slice 4 (T9): secure SEDP builtin endpoints (DDS-Security 1.1 §7.4.5 / §8.4.1.6 / §9.4.1.2.3). All three
   ;; closures are installed cross-layer by the dds-dcps managers (the disc layer stays crypto/policy-free):
@@ -320,6 +328,12 @@
   (secure-sedp-origin-auth nil :type boolean)
   (secure-sedp-encode-receivers nil :type (or null function))
   (secure-sedp-decode-receiver-km nil :type (or null function))
+  ;; ADR-0040 carry (submessage-substitution defense, §8.5.1.9 / §9.5.2 Table 65): SECURE-SEDP-DECODE-SENDER-ENTITY
+  ;; (4-octet transformation_key_id) -> the EXPECTED remote sender entity-id the key_id was registered under
+  ;; (crypto-manager REMOTE-KEY-ID-ENTITY, written atomically with the KM), so %on-secure-builtin cross-checks the
+  ;; decrypted INNER writer-sourced submessage's writerId (DATA/HEARTBEAT) against it and DROPS a mismatch
+  ;; fail-closed. NIL (security OFF / no resolver / unknown key_id) -> no cross-check (no false-REJECT), byte-identical.
+  (secure-sedp-decode-sender-entity nil :type (or null function))
   ;; Slice 4 (T11): secure participant-message (liveliness/WLP) + secure SPDP re-announce builtin endpoints
   ;; (DDS-Security 1.1 §7.4.5 / §8.4.1.6 / §9.4.1.2.3). Both tiers REUSE the generic secure-builtin EntityCrypto
   ;; resolvers above (SECURE-SEDP-ENCODE-KM / -DECODE-KM / -ENCODE-RECEIVERS / -DECODE-RECEIVER-KM resolve ANY
@@ -451,6 +465,8 @@
   (user-data-protection-kind :unset :type (member :unset :none :sign :encrypt))
   ;; §9.4.1.2.4 per-topic data_protection resolver (topic-name -> :none|:sign|:encrypt) installed from governance by %install-access-control; add-local-{writer,reader} refine user-data-protection-kind via it to the endpoint's ACTUAL rule (no first-rule participant-default downgrade). NIL = security OFF / no governance -> unchanged.
   (topic-data-protection-resolver nil :type (or null function))
+  ;; §9.4.1.2.4 per-topic metadata_protection resolver (topic-name -> :none|:sign|:encrypt) installed from governance by %install-access-control; add-local-{writer,reader} refine user-submessage-protection-kind via it to the endpoint's ACTUAL rule (no first-rule participant-default downgrade). NIL = security OFF / no governance -> unchanged.
+  (topic-metadata-protection-resolver nil :type (or null function))
   (user-submessage-encode nil :type (or null function))
   (user-submessage-decode nil :type (or null function))
   ;; DDS-Security 1.1 §7.3.4: called (node prefix spdp) outside the lock on first SPDP from a security-capable remote.
@@ -718,17 +734,21 @@
   (dds.qos:make-qos :reliability (if (>= reliability dds.rtps.discovery:+reliability-reliable+)
                                      :reliable :best-effort)))
 
-(defun* %refine-user-data-protection (node topic)
+(defun* %refine-user-protection (node topic)
     (function (disc-node string) t)
-  "DDS-Security 1.1 §9.4.1.2.4: refine NODE's user-data-protection-kind to TOPIC's ACTUAL governance
-   data_protection_kind via the per-topic resolver installed by %install-access-control, so an
-   add-local-{writer,reader} endpoint gates the serialized-payload (SecuredPayload) tier by the topic's REAL
-   rule — neither the first-rule participant-default downgrade (a later ENCRYPT topic wrongly left :none =
-   false-ACCEPT) nor over-protection of a genuine data=NONE topic (false-REJECT). No resolver (security OFF /
-   no governance) leaves the slot unchanged (byte-identical to the pre-security path). Returns T."
-  (let ((resolver (disc-node-topic-data-protection-resolver node)))
-    (when resolver
-      (setf (disc-node-user-data-protection-kind node) (funcall resolver topic))))
+  "DDS-Security 1.1 §9.4.1.2.4: refine NODE's per-topic metadata_protection (user-submessage-protection-kind) AND
+   data_protection (user-data-protection-kind) to TOPIC's ACTUAL governance rule via the resolvers installed by
+   %install-access-control, so an add-local-{writer,reader} endpoint gates BOTH the user-DATA submessage tier and
+   the serialized-payload (SecuredPayload) tier by the topic's REAL rule — neither the first-rule participant-default
+   downgrade (a later SIGN/ENCRYPT topic wrongly left :none = false-ACCEPT) nor over-protection of a genuine
+   metadata/data=NONE topic (false-REJECT). No resolver (security OFF / no governance) leaves that slot unchanged
+   (byte-identical to the pre-security path). Returns T."
+  (let ((mresolver (disc-node-topic-metadata-protection-resolver node))
+        (dresolver (disc-node-topic-data-protection-resolver node)))
+    (when mresolver
+      (setf (disc-node-user-submessage-protection-kind node) (funcall mresolver topic)))
+    (when dresolver
+      (setf (disc-node-user-data-protection-kind node) (funcall dresolver topic))))
   t)
 
 (defun* add-local-writer (node &key (topic "") (type "")
@@ -748,7 +768,7 @@
               :topic-name topic :type-name type :type-information type-information
               :qos (or qos (%qos-from-reliability reliability)))))
     (setf (disc-node-user-writer-id node) (logior (ash key 8) kind))
-    (%refine-user-data-protection node topic)   ; §9.4.1.2.4: per-topic data_protection (no participant-default downgrade)
+    (%refine-user-protection node topic)   ; §9.4.1.2.4: per-topic metadata_protection + data_protection (no participant-default downgrade)
     (push ep (disc-node-local-writers node))
     ep))
 
@@ -770,7 +790,7 @@
               :topic-name topic :type-name type :type-information type-information
               :qos (or qos (%qos-from-reliability reliability)))))
     (setf (disc-node-user-reader-id node) (logior (ash key 8) kind))
-    (%refine-user-data-protection node topic)   ; §9.4.1.2.4: per-topic data_protection (no participant-default downgrade)
+    (%refine-user-protection node topic)   ; §9.4.1.2.4: per-topic metadata_protection + data_protection (no participant-default downgrade)
     (push ep (disc-node-local-readers node))
     ep))
 
@@ -850,7 +870,9 @@
 ;; Slice 4 PVMS handlers: defined in volatile-secure.lisp (loaded after this file).
 (declaim (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) (simple-array (unsigned-byte 8) (*))) t) %on-volatile-secure)
          (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) integer integer) t) %on-pvms-heartbeat)
-         (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) dds.core.buffer:cursor (unsigned-byte 8)) t) %on-pvms-acknack))
+         (ftype (function (disc-node (simple-array (unsigned-byte 8) (12)) dds.core.buffer:cursor (unsigned-byte 8)) t) %on-pvms-acknack)
+         ;; ADR-0036/0040 carry: PVMS bootstrap-KM peer-loss prune, called by %lease-sweep (below).
+         (ftype (function (disc-node (simple-array (unsigned-byte 8) (12))) (or null dds.security:key-material)) %prune-pvms-bootstrap-km))
 
 ;; Slice 4 (T9/T11) secure builtin endpoints: defined in secure-sedp.lisp (loaded after this file).
 ;; %on-secure-submessage is the SEC_PREFIX dispatcher %handle-datagram routes to (it now routes secure SEDP +
@@ -1113,7 +1135,7 @@
    every discovered-writers/readers endpoint + match keyed by that 12-octet prefix,
    collecting the removed MATCHED endpoints; then fire on-unmatch per removed match
    OUTSIDE the lock. Idempotent (a re-announced participant re-adds)."
-  (let ((removed '()))
+  (let ((removed '()) (lost '()))
     (dds.pal:with-lock ((disc-node-lock node))
       (let ((now (%lease-now)) (dead '()))
         (maphash (lambda (prefix spdp)
@@ -1131,8 +1153,13 @@
           (%purge-prefix node prefix #'disc-node-discovered-writers)
           (%purge-prefix node prefix #'disc-node-discovered-readers)
           (%collect-and-remove-matches node prefix
-                                       (lambda (dm) (push dm removed))))))
+                                       (lambda (dm) (push dm removed)))
+          (push prefix lost))))   ; ADR-0034 MINOR-4: fire on-participant-lost per dead peer OUTSIDE the lock
     (dolist (dm removed) (%fire-unmatch node (car dm) (cdr dm)))
+    (dolist (prefix lost)
+      (%prune-pvms-bootstrap-km node prefix)   ; ADR-0036/0040: prune the lost peer's PVMS bootstrap KM (disc-internal)
+      (when (disc-node-on-participant-lost node)
+        (funcall (disc-node-on-participant-lost node) prefix)))   ; ADR-0034: drop the lost peer's crypto-manager KMs
     t))
 
 (defun* %record-match (node remote)
@@ -1834,6 +1861,9 @@
   (maphash (lambda (prefix km) (declare (ignore prefix)) (dds.security:zeroize-key-material km))
            (disc-node-pvms-bootstrap-kms node))
   (clrhash (disc-node-pvms-bootstrap-kms node))
+  ;; ADR-0036/0040 carry: also free the PVMS bootstrap KMs pruned on peer-loss (wiped in place at prune; the sole foreign free is deferred to HERE, the quiesced point — no mid-run free)
+  (dolist (km (disc-node-retired-pvms-kms node)) (dds.security:zeroize-key-material km))
+  (setf (disc-node-retired-pvms-kms node) nil)
   t)
 
 (defun* disc-node-discovered-count (node)

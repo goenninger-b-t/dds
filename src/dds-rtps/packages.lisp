@@ -147,6 +147,7 @@
            #:+entityid-sedp-sub-secure-writer+ #:+entityid-sedp-sub-secure-reader+
            #:+entityid-participant-message-secure-writer+ #:+entityid-participant-message-secure-reader+
            #:+entityid-spdp-secure-writer+ #:+entityid-spdp-secure-reader+
+           #:builtin-complementary-eid #:secure-builtin-writer-eid-p
            #:+be-sedp-pub-secure-writer+ #:+be-sedp-pub-secure-reader+
            #:+be-sedp-sub-secure-writer+ #:+be-sedp-sub-secure-reader+
            #:+be-participant-message-secure-writer+ #:+be-participant-message-secure-reader+

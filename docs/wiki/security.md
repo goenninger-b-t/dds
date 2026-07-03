@@ -132,6 +132,23 @@ covers even re-key-orphaned KMs — never freed mid-run, so no live resolver eve
 bytes) is walked by `cm-teardown` from `delete-participant` after `stop-node` joins the receiver
 thread; the disc-node's PVMS bootstrap KeyMaterials are wiped in `stop-node`.
 
+**Remote-KM drop-on-unmatch (ADR-0034 MINOR-4).**  When a remote participant leases out, `%lease-sweep`
+fires `disc-node-on-participant-lost` → `cm-forget-remote-participant`, which DROPS that peer's
+KeyMaterials from the four ACTIVE lookup registries (`remote-participant-crypto`, `remote-entity-crypto`,
+`key-id-index`, `remote-key-id-entity`) — so a lost peer's keys are unresolvable (fail-closed) and a
+peer-churning participant's data-path tables stay **bounded** — and **wipes their master secrets in place**
+(`wipe-key-material-secrets`: fill-0, no free) for prompt hygiene.  The KM handle is deliberately KEPT in
+`all-kms` so the foreign-static buffers are freed **exactly once at the quiesced teardown** — freeing on
+lease-out would use-after-free a concurrent in-flight decode (a lease-expired peer's delayed/replayed
+datagram resolved before the drop): the **no-mid-run-free** invariant. `wipe-key-material-secrets` does NOT
+set the `zeroized` marker, so `cm-teardown` still performs the free.
+
+The **PVMS bootstrap KMs** (the disc-layer §9.5.3.1 `disc-node-pvms-bootstrap-kms`, prefix→KM) get the same
+peer-loss treatment: `%lease-sweep` also calls `%prune-pvms-bootstrap-km`, which drops the lost peer's bootstrap
+KM from the active table (unresolvable → fail-closed, bounded), wipes its secrets in place, and parks the handle
+on `disc-node-retired-pvms-kms` so the foreign (KxKey/KxSalt-derived) free stays at the quiesced `stop-node`
+teardown — freeing on lease-out would UAF a concurrent `%on-volatile-secure` decode.
+
 As **defense-in-depth** the entry points that read the freed master secrets — `%km-session-key-at`,
 `%km-receiver-session-key-at`, `km-receiver-descriptor-list` — check the `zeroized` marker first and
 signal `key-material-zeroized-error` on a torn-down KM (a single flag check off the zero-alloc hit
@@ -1670,6 +1687,13 @@ secure-SEDP readers with `:origin-auth t` and installs two resolvers:
   `my-receiver-key-id`/`my-receiver-key`; `NIL` ⇒ the common_mac alone governs. The channel (pub vs sub) is
   resolved by mapping the wire `transformation_key_id` → the remote writer's entity-id (the crypto-manager
   `remote-key-id-entity` index) → the corresponding local reader.
+- **`disc-node-secure-sedp-decode-sender-entity (transformation_key_id)`** → the EXPECTED remote sender
+  entity-id the key_id was registered under (`cm-remote-entity-for-key-id`, the `remote-key-id-entity` index —
+  submessage-substitution defense, §8.5.1.9 / §9.5.2 Table 65). `%on-secure-builtin` DROPS a writer-sourced
+  inner DATA/HEARTBEAT whose recovered `writerId` does not equal this entity (a bracket keyed under one
+  endpoint's EntityCrypto but claiming another's writerId) — fail-closed. `NIL` (unknown key_id / no resolver)
+  skips the cross-check ⇒ no false-REJECT; in the live keyed path the inner writerId always equals it (each
+  EntityCrypto is registered under its own endpoint's key_id). Test `run-secure-builtin-sender-crosscheck-test`.
 
 **Tests.** `run-secure-discovery-origin-auth-test` (full e2e: two participants under
 `ENCRYPT_WITH_ORIGIN_AUTHENTICATION` reach `:keyed`, exchange the 120-byte receiver KeyMaterial, and B matches A's
@@ -1830,11 +1854,23 @@ The struct fields + accessors:
 | `liveliness_protection_kind` (domain rule, `ProtectionKind`) | secure participant-message (WLP) | `governance-liveliness-protection` |
 | `rtps_protection_kind` (domain rule, `ProtectionKind`) | whole-RTPS user data plane | `governance-rtps-protection` |
 | `enable_discovery_protection` / `enable_liveliness_protection` (topic rule, bool) | per-topic gate | `topic-discovery-protected-p` |
-| `metadata_protection_kind` / `data_protection_kind` (topic rule, `BasicProtectionKind`) | per-topic submessage / payload | `topic-metadata-protection` |
+| `metadata_protection_kind` / `data_protection_kind` (topic rule, `BasicProtectionKind`) | per-topic submessage / payload | `topic-metadata-protection` / `topic-data-protection` (participant default `governance-effective-{metadata,data}-protection`; per-topic refine `%refine-user-protection`) |
 
 `protection-kind-base (kind) → (values base origin-auth-p)` maps a `ProtectionKind` to its base
 (`:sign` | `:encrypt`) + an origin-auth flag, so the announce/encode paths honour SIGN vs ENCRYPT vs
 origin-auth **from governance** (never hard-coded — the T9 fix).
+
+**Per-topic selectivity — fail-closed participant default + per-topic refine (both `metadata_protection` and
+`data_protection`).**  `metadata_protection` (the user-DATA submessage tier, `user-submessage-protection-kind`)
+and `data_protection` (the serialized-payload tier, `user-data-protection-kind`) are resolved per-topic. At
+`create-participant`, `%install-access-control` stamps the participant-level default to the **MOST-PROTECTIVE**
+kind over ALL topic rules — `governance-effective-metadata-protection` / `governance-effective-data-protection`
+(both `%governance-effective-basic-protection`, max `:encrypt > :sign > :none`) — a **fail-closed fallback** so a
+first-rule `NONE` can never downgrade below a later protected rule (no false-ACCEPT). It also installs the
+per-topic resolvers (`disc-node-topic-{metadata,data}-protection-resolver`); every `add-local-{writer,reader}`
+then calls `%refine-user-protection`, which resolves the endpoint's ACTUAL per-topic kind
+(`topic-metadata-protection` / `topic-data-protection`), so a genuine `metadata`/`data=NONE` topic stays `NONE`
+(no false-REJECT). No governance → resolvers NIL, slots at default → byte-identical to the pre-security path.
 
 **Fail-closed parse (the T5 review-caught Critical).** The protection-kind elements are **REQUIRED** by the
 XSD and Fast DDS REJECTS them absent, so `%ac-node-protection-kind` returns NIL on a missing element →
@@ -1997,7 +2033,11 @@ DDS multipart/signed S/MIME container.
 New API from this work:
 - **`dds.security:permissions-grant-for (subject grants)`** — the single subject-binding site for local + remote
   permissions, matching by `%dn-equal` (OpenSSL-oneline vs RFC2253 serialization-insensitive; DDS-Security
-  §9.4.1.3), so cross-vendor DN forms interoperate without false-REJECT.
+  §9.4.1.3), so cross-vendor DN forms interoperate without false-REJECT. `%dn-normalize` is RFC2253 §2-3 aware:
+  it splits RDNs only on UNESCAPED separators, un-escapes values (`\c` + `\XX` hex) to canonical form, upcases the
+  attribute TYPE (case-insensitive) while keeping the VALUE case-sensitive, and FAIL-CLOSES to `:malformed` on any
+  malformed RDN (no unescaped `=`, empty type, bad escape) — an ambiguous/malformed DN NEVER authorizes, not even
+  against an identical malformed grant (no false-ACCEPT). Regression-covered by `run-security-dn-match-test`.
 - **`dds.dcps:create-participant :port`** — bind+advertise a fixed metatraffic unicast port so a foreign peer
   can `initialPeers` us over loopback (the macOS multi-NIC cross-vendor reachability pattern).
 
@@ -2119,5 +2159,10 @@ cannot dissect the macOS `lo0` NULL link layer). Captures: `interop/security-con
 - **B3 — ADR-0037 residual carries status-reconciled vs Connext.** See the reconciliation table in ADR 0037:
   live-Connext, Zero-Copy×`rtps_protection` SHMEM cleartext, KeyMaterial master slots → foreign/static, and the
   zero-alloc-AEAD send path are RESOLVED; builtin-endpoint keying vs Connext is VALIDATED by the live interop;
-  the 0xC2→0xC7 DRY, the secure-builtin-ACKNACK unit count, the SIGN-tier GMAC AAD span (live gate was
-  all-ENCRYPT), and a handful of hardening items remain OPEN follow-ons (none Connext-blocking).
+  the SIGN-tier GMAC AAD span (live gate was all-ENCRYPT) is RESOLVED (Slice 5c). **WP-SECURITY-CARRIES-BATCH
+  (2026-07-03) closed the 0xC2→0xC7 DRY** (one shared `dds.rtps.discovery:builtin-complementary-eid` +
+  `secure-builtin-writer-eid-p`, byte-identical), metadata_protection per-topic selectivity, the
+  `%on-secure-builtin` inner-writerId cross-check, the `all-kms`/PVMS peer-loss prune, the
+  secure-builtin-ACKNACK count unit test (`run-secure-builtin-acknack-count-test`), and the `%dn-normalize` /
+  `%dn-equal` RFC2253 §2-3 subject-name edges (unescaped-separator split + value un-escape + fail-closed on
+  malformed, `run-security-dn-match-test`). All ADR-0037/0040 residual carries are now closed.

@@ -1085,3 +1085,91 @@
                      "add-local-reader on a genuine data=NONE topic (the FIRST rule) must resolve per-topic to :none, never forced to protection by the most-protective participant default — over-encrypting a NONE topic is a false-REJECT"))
         (dds.dcps:delete-participant p))))
   t)
+
+(defun* run-security-metadata-protection-downgrade-test ()
+    (function () t)
+  "ADR-0040 carry (DDS-Security 1.1 §9.4.1.2.4), SYMMETRIC to run-security-data-protection-downgrade-test but for
+   metadata_protection (the user-DATA submessage tier, disc-node-user-submessage-protection-kind): a MULTI-RULE
+   governance whose FIRST topic_rule is metadata=NONE while a LATER rule is metadata=ENCRYPT for a specific topic
+   must NOT let an add-local-{writer,reader} endpoint inherit the FIRST-rule participant default. The fix: (1) the
+   participant-level default is MOST-PROTECTIVE (governance-effective-metadata-protection, max :encrypt>:sign>:none
+   — fail-closed), and (2) add-local resolves the ACTUAL per-topic metadata_protection via the
+   %install-access-control-installed resolver. Asserts, on the PRE-fix (no add-local metadata refinement, slot
+   stayed the :none default) logic, RED on both a FALSE-ACCEPT (an ENCRYPT topic left :none = an unprotected user
+   submessage on a protected topic) and a FALSE-REJECT (a genuine NONE topic forced to protection). Rules are
+   ordered so the wildcard-free FIRST rule (Square) does NOT shadow the LATER Circle rule (topic-metadata-protection
+   = first-MATCHING rule, §9.4.1.2.4)."
+  (let* ((gov (dds.security:make-governance
+               :discovery-protection-kind :none
+               :liveliness-protection-kind :none
+               :rtps-protection-kind :none
+               :topic-rules
+               (list (dds.security:make-topic-rule :topic-expr "Square"    ; FIRST rule: a genuine metadata=NONE topic
+                                                   :metadata-protection-kind :none
+                                                   :data-protection-kind :none)
+                     (dds.security:make-topic-rule :topic-expr "Circle"    ; LATER rule: metadata=ENCRYPT (Square rule does not shadow it)
+                                                   :metadata-protection-kind :encrypt
+                                                   :data-protection-kind :none))))
+         (ah  (dds.security:make-access-handle :governance gov)))
+    (%check :mp-downgrade-effective-most-protective
+            (eq :encrypt (dds.security:governance-effective-metadata-protection gov))
+            "governance-effective-metadata-protection must be MOST-PROTECTIVE over ALL rules (max :encrypt>:sign>:none): a FIRST metadata=NONE rule must NOT downgrade the participant default below a LATER metadata=ENCRYPT rule (fail-closed)")
+    (let ((p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+      (unwind-protect
+           (let ((node (dds.dcps::dp-node p)))
+             (setf (dds.dcps::dp-auth-state p)
+                   (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
+             (dds.dcps::%install-access-control p ah)
+             ;; the metadata=ENCRYPT topic (a LATER rule) via add-local must resolve per-topic to :encrypt — never the FIRST rule's :none (false-ACCEPT)
+             (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType")
+             (%check :mp-downgrade-encrypt-topic-not-none
+                     (eq :encrypt (dds.disc:disc-node-user-submessage-protection-kind node))
+                     "add-local-writer on the metadata=ENCRYPT topic (a LATER rule; the FIRST rule is metadata=NONE) must resolve per-topic to :encrypt, never :none — an unprotected user submessage emitted on a protected topic is a false-ACCEPT")
+             ;; a genuine metadata=NONE topic (the FIRST rule) via add-local must resolve to :none — never forced to protection by the most-protective default (false-REJECT)
+             (dds.disc:add-local-reader node :topic "Square" :type "ShapeType")
+             (%check :mp-downgrade-none-topic-not-forced
+                     (eq :none (dds.disc:disc-node-user-submessage-protection-kind node))
+                     "add-local-reader on a genuine metadata=NONE topic (the FIRST rule) must resolve per-topic to :none, never forced to protection by the most-protective participant default — protecting a NONE topic's user submessage is a false-REJECT"))
+        (dds.dcps:delete-participant p))))
+  t)
+
+(defun* run-security-dn-match-test ()
+    (function () t)
+  "ADR-0036 carry (DDS-Security 1.1 §9.4.1.3 subject-name binding; RFC2253 §2-3): the serialization-insensitive
+   X.509 DN match (%dn-equal / %dn-normalize) that binds a permissions grant to a peer cert's subject. Covers the
+   previously-untested edges — attribute ordering, oneline vs RFC2253 form, attribute-TYPE case-fold (types
+   case-insensitive, VALUES case-sensitive), whitespace, and RFC2253 `\\`-ESCAPING (an escaped separator is DATA,
+   not a boundary; `\\XX` hex). SECURITY (no false-ACCEPT): a wrong-value / wrong-case-value / different-RDN-count /
+   escaped-vs-unescaped-structure / MALFORMED DN must NOT match — an ambiguous or unparseable DN never authorizes,
+   not even against an identical unparseable grant."
+  ;; POSITIVE — the SAME subject in different conformant serializations MUST match (no false-REJECT)
+  (%check :dn-m-identical (dds.security::%dn-equal "/CN=a/O=b/C=DE" "/CN=a/O=b/C=DE")
+          "identical oneline DNs match")
+  (%check :dn-m-order (dds.security::%dn-equal "/CN=a/O=b/C=DE" "C=DE,O=b,CN=a")
+          "oneline vs RFC2253 (reversed RDN order) match — order-insensitive")
+  (%check :dn-m-attr-case (dds.security::%dn-equal "/CN=Alice/O=Acme" "cn=Alice,o=Acme")
+          "attribute TYPE case-fold: CN==cn, O==o (types are case-insensitive, RFC2253 §2.3)")
+  (%check :dn-m-whitespace (dds.security::%dn-equal "CN=a, O=b, C=DE" "CN=a,O=b,C=DE")
+          "whitespace after the RDN separator is trimmed")
+  (%check :dn-m-escaped-comma (dds.security::%dn-equal "CN=Doe\\, John,O=Acme" "/CN=Doe, John/O=Acme")
+          "RFC2253 escaped-comma value (CN=Doe, John) matches the oneline form — the escaped separator is DATA, not a boundary")
+  (%check :dn-m-hex-escape (dds.security::%dn-equal "CN=\\41,O=x" "CN=A,O=x")
+          "RFC2253 hex escape backslash-41 == 'A'")
+  ;; NEGATIVE — a DIFFERENT or ambiguous subject must NOT match (no false-ACCEPT of a wrong identity)
+  (%check :dn-n-diff-value (not (dds.security::%dn-equal "CN=a,O=b" "CN=a,O=c"))
+          "a different attribute VALUE does not match")
+  (%check :dn-n-value-case (not (dds.security::%dn-equal "CN=Alice" "CN=alice"))
+          "attribute VALUES are case-SENSITIVE (Alice != alice) — the strict/safe default, no false-ACCEPT")
+  (%check :dn-n-escaped-structure (not (dds.security::%dn-equal "CN=a\\,O=x" "CN=a,O=x"))
+          "an escaped comma (ONE RDN, CN value a,O=x) must NOT match an unescaped comma (TWO RDNs) — different subjects")
+  (%check :dn-n-subset (not (dds.security::%dn-equal "CN=a" "CN=a,O=b"))
+          "a subset DN does not match a superset (different RDN count)")
+  (%check :dn-n-malformed-trailing (not (dds.security::%dn-equal "CN=a\\" "CN=a"))
+          "a MALFORMED DN (trailing lone backslash) does not match — fail-closed")
+  (%check :dn-n-malformed-self (not (dds.security::%dn-equal "CN=a\\" "CN=a\\"))
+          "a malformed DN does not even match an IDENTICAL malformed grant — fail-closed (no false-ACCEPT)")
+  (%check :dn-n-no-equals (not (dds.security::%dn-equal "CN" "CN=x"))
+          "a DN with no unescaped '=' is malformed -> no match (fail-closed)")
+  (%check :dn-n-empty-attr (not (dds.security::%dn-equal "=x,CN=a" "CN=a"))
+          "an empty attribute type is malformed -> no match (fail-closed)")
+  t)

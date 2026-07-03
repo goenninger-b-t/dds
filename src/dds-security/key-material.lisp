@@ -167,6 +167,32 @@
           (key-material-cached-receiver-descriptor-list km) nil))
   nil)
 
+(defun* wipe-key-material-secrets (km)
+    (function ((or null key-material)) null)
+  "Zero the three MASTER secret slots of KM IN PLACE (fill-0, WITHOUT freeing the foreign-static buffers) and drop
+   the derived §9.5.3.3.4.2/.4.3 session-key caches — the ADR-0034 MINOR-4 prompt secret-hygiene wipe when a REMOTE
+   participant is LOST/unmatched (cm-forget-remote-participant), so its §9.5.2 key material does not linger in memory
+   until the participant teardown. UNLIKE zeroize-key-material this does NOT free (free-static) the master buffers and
+   does NOT set the terminal KEY-MATERIAL-ZEROIZED flag: the foreign buffers stay ALLOCATED, so a concurrent in-flight
+   decode on the receiver thread (a lease-expired peer's delayed/replayed datagram, resolved before the drop) reads
+   ZEROS -> a wrong session key -> a fail-closed GCM drop, NEVER a use-after-free — the SOLE free stays at the QUIESCED
+   participant teardown (cm-teardown walks all-kms + free-secret-octets each AFTER the receiver thread is joined; the
+   flag is left clear so that free still runs). The derived caches are EPHEMERAL plain GC-heap vectors (re-derivable,
+   GC-reclaimed), so dropping the references suffices — a stale reader keeps its OWN vector alive (no UAF). Skips a
+   KM already zeroized (its buffers are freed — a fill would UAF). Idempotent; NIL is a no-op. Returns NIL."
+  (when (and km (not (key-material-zeroized km)))
+    (let ((s (key-material-master-salt km))
+          (k (key-material-master-sender-key km))
+          (r (key-material-master-receiver-specific-key km)))
+      (when s (fill s 0))
+      (when k (fill k 0))
+      (when r (fill r 0)))
+    (setf (key-material-cached-session-key km) nil
+          (key-material-cached-recv-session-key km) nil
+          (key-material-cached-recv-master-key km) nil
+          (key-material-cached-receiver-descriptor-list km) nil))
+  nil)
+
 (defun* %km-session-key-at (km session-id-vec session-id-off)
     (function (key-material (simple-array (unsigned-byte 8) (*)) fixnum) (simple-array (unsigned-byte 8) (32)))
   "Cached §9.5.3.3.4.2 session key for KM at the 4-octet session_id in SESSION-ID-VEC[OFF..OFF+4]. The key is

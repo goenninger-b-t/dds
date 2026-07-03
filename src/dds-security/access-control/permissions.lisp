@@ -43,37 +43,89 @@
                     result)))
           (and result (nreverse result)))))))
 
+(defun* %dn-unescape (s)
+    (function (string) (or string null))
+  "RFC2253 §2.4 DN-value un-escaping -> the canonical (serialization-independent) value: `\\c` -> the literal char
+   c (an escaped separator / space / #, so it compares as DATA, not a boundary), `\\XX` (exactly two hex digits) ->
+   the byte 0xXX. NIL (FAIL-CLOSED) on a MALFORMED escape — a trailing lone `\\`, or `\\` + a single hex digit — so
+   an ambiguous DN never normalizes to a matchable token (no false-ACCEPT of a wrong identity)."
+  (let ((out (make-string-output-stream)) (i 0) (n (length s)))
+    (loop while (< i n) do
+      (let ((c (char s i)))
+        (cond
+          ((char/= c #\\) (write-char c out) (incf i))
+          ((>= (1+ i) n) (return-from %dn-unescape nil))   ; trailing lone backslash -> malformed
+          (t (let* ((d (char s (1+ i))) (dv (digit-char-p d 16)))
+               (cond
+                 ((null dv) (write-char d out) (incf i 2))   ; \special -> the literal char
+                 ((or (>= (+ i 2) n) (null (digit-char-p (char s (+ i 2)) 16)))
+                  (return-from %dn-unescape nil))            ; \ + a single hex digit -> malformed
+                 (t (write-char (code-char (+ (* 16 dv) (digit-char-p (char s (+ i 2)) 16))) out)
+                    (incf i 3))))))))
+    (get-output-stream-string out)))
+
+(defun* %dn-split-unescaped (s sep)
+    (function (string character) list)
+  "Split DN string S into raw RDN tokens on UNESCAPED SEP only (RFC2253 §2.4 — a `\\`-escaped separator is part of
+   a value, never a boundary; a naive split mis-cut an escaped comma -> a latent false-REJECT of a conformant DN).
+   Escapes are left IN the tokens (unescaped per-field afterwards); a trailing lone `\\` leaves its token ending in
+   `\\` so %dn-unescape then fail-closes it."
+  (let ((toks '()) (start 0) (esc nil) (n (length s)))
+    (dotimes (i n)
+      (let ((c (char s i)))
+        (cond (esc            (setf esc nil))
+              ((char= c #\\)  (setf esc t))
+              ((char= c sep)  (push (subseq s start i) toks) (setf start (1+ i))))))
+    (nreverse (cons (subseq s start n) toks))))
+
+(defun* %dn-attr-value-pos (tok)
+    (function (string) (or fixnum null))
+  "The index of the first UNESCAPED `=` in RDN token TOK — the attribute-type / value boundary (RFC2253 §2.3) — or
+   NIL if TOK has no unescaped `=` (a malformed RDN)."
+  (let ((esc nil))
+    (dotimes (i (length tok) nil)
+      (let ((c (char tok i)))
+        (cond (esc            (setf esc nil))
+              ((char= c #\\)  (setf esc t))
+              ((char= c #\=)  (return i)))))))
+
 (defun* %dn-normalize (s)
-    (function (string) list)
-  "Parse an X.500 Distinguished Name string — OpenSSL oneline (/CN=a/O=b/C=DE, what X509_NAME_oneline
-   emits) OR RFC2253/RFC1779 (CN=a,O=b,C=DE, what X509_NAME_print_ex+XN_FLAG_RFC2253 and Fast DDS's
-   rfc2253_string_compare use) — into a SORTED list of canonical \"ATTR=value\" tokens (ATTR upcased,
-   surrounding whitespace trimmed). Sorting absorbs the oneline-forward vs RFC2253-reverse RDN order;
-   the leading separator selects '/' vs ','. Empty tokens dropped."
-  (let ((toks '()) (start 0) (n (length s))
-        (sep (if (and (plusp (length s)) (char= (char s 0) #\/)) #\/ #\,)))
-    (flet ((emit (piece)
-             (let* ((piece (string-trim " " piece))
-                    (eqp   (position #\= piece)))
-               (when (and eqp (plusp eqp))
-                 (push (concatenate 'string
-                                    (string-upcase (string-trim " " (subseq piece 0 eqp)))
-                                    "=" (string-trim " " (subseq piece (1+ eqp))))
-                       toks)))))
-      (dotimes (i (1+ n))
-        (when (or (= i n) (char= (char s i) sep))
-          (emit (subseq s start i))
-          (setf start (1+ i)))))
+    (function (string) (or list (eql :malformed)))
+  "Parse an X.500 Distinguished Name string — OpenSSL oneline (/CN=a/O=b/C=DE, what X509_NAME_oneline emits) OR
+   RFC2253/RFC1779 (CN=a,O=b,C=DE, what X509_NAME_print_ex+XN_FLAG_RFC2253 and Fast DDS's rfc2253_string_compare
+   use) — into a SORTED list of canonical \"ATTR=value\" tokens (RFC2253 §2-3). The leading char selects the '/'
+   (oneline) vs ',' (RFC2253) RDN separator; RDNs are split only on UNESCAPED separators (%dn-split-unescaped);
+   each attribute TYPE is upcased (types are case-INSENSITIVE, §2.3) while the VALUE keeps its case (values are
+   case-SENSITIVE) and is RFC2253-UN-escaped to its canonical form (%dn-unescape — an escaped comma/space and a
+   `\\XX` hex escape then compare as data). Sorting absorbs the oneline-forward vs RFC2253-reverse RDN order;
+   empty (separator-artifact) RDNs are dropped. Returns :malformed (FAIL-CLOSED — never matched by %dn-equal) on
+   ANY malformed RDN: no unescaped `=`, an empty attribute type, or a malformed escape — so an ambiguous/malformed
+   DN does NOT authorize (no false-ACCEPT)."
+  (let ((sep (if (and (plusp (length s)) (char= (char s 0) #\/)) #\/ #\,))
+        (toks '()))
+    (dolist (raw (%dn-split-unescaped s sep))
+      (let ((tok (string-trim " " raw)))
+        (when (plusp (length tok))
+          (let ((eqp (%dn-attr-value-pos tok)))
+            (unless (and eqp (plusp eqp)) (return-from %dn-normalize :malformed))
+            (let ((val (%dn-unescape (string-trim " " (subseq tok (1+ eqp))))))
+              (unless val (return-from %dn-normalize :malformed))
+              (push (concatenate 'string
+                                 (string-upcase (string-trim " " (subseq tok 0 eqp)))
+                                 "=" val)
+                    toks))))))
     (sort toks #'string<)))
 
 (defun* %dn-equal (a b)
     (function (string string) boolean)
-  "T iff DN strings A and B denote the same X.509 subject independent of serialization (OpenSSL oneline
-   vs RFC2253) and RDN order — DDS-Security 1.1 §9.4.1.3 binds the grant by the X.509 subject DN, not by
-   one string form. Requires equal RDN count + every normalized token equal (strict; no false-accept,
-   and the cert is CA-validated upstream so a reordered-RDN forgery is out of scope)."
+  "T iff DN strings A and B denote the SAME X.509 subject independent of serialization (OpenSSL oneline vs
+   RFC2253), RDN order, attribute-TYPE case, whitespace, and RFC2253 value ESCAPING — DDS-Security 1.1 §9.4.1.3
+   binds the grant by the X.509 subject DN, not by one string form. Requires equal (NON-ZERO) RDN count + every
+   normalized token equal. FAIL-CLOSED: a :malformed or empty normalization on EITHER side -> NIL (no false-ACCEPT
+   of a wrong or ambiguous identity — an unparseable DN never matches, not even an identical unparseable grant);
+   the cert is CA-validated upstream, so a reordered-RDN forgery is out of scope."
   (let ((na (%dn-normalize a)) (nb (%dn-normalize b)))
-    (and na (= (length na) (length nb)) (every #'string= na nb))))
+    (and (consp na) (consp nb) (= (length na) (length nb)) (every #'string= na nb))))
 
 (defun* permissions-grant-for (subject grants)
     (function (string list) (or permissions null))

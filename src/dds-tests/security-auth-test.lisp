@@ -3920,6 +3920,53 @@
               "the WRONG participant receiver key (via cm-rtps-decode-receiver) fails closed though the common_mac is valid (§9.5.3.3.4.3)")))
   t)
 
+(defun* %cm-forget-remote ()
+    (function () t)
+  "ADR-0034 MINOR-4 (remote-KM drop-on-unmatch): a matched remote participant + entity KM register into the active
+   lookup registries + all-kms; cm-forget-remote-participant (fired on lease-out via disc-node-on-participant-lost)
+   DROPS them from the lookup registries (unresolvable -> fail-closed, active tables BOUNDED) and WIPES their master
+   secrets IN PLACE (fill-0, NO free), while the handle is KEPT in all-kms for the single QUIESCED-teardown free (the
+   no-mid-run-free invariant -> no UAF of a concurrent in-flight decode). Asserts: resolvable before; exactly the
+   lost peer's KMs dropped; master secrets all-zero after; unresolvable after; still in all-kms; an UNRELATED remote
+   untouched (no over-drop); a second forget a no-op (idempotent)."
+  (let* ((cm     (dds.dcps::make-crypto-manager))
+         (prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7))
+         (other  (make-array 12 :element-type '(unsigned-byte 8) :initial-element 8))
+         (pkm    (dds.security:generate-key-material))
+         (ekm    (dds.security:generate-key-material))
+         (ekid   (dds.security:key-material-sender-key-id ekm))
+         (okm    (dds.security:generate-key-material))    ; an UNRELATED remote entity (prefix OTHER)
+         (okid   (dds.security:key-material-sender-key-id okm)))
+    (dds.dcps::cm-register-matched-remote-participant cm prefix pkm)
+    (dds.dcps::cm-register-matched-remote-entity cm prefix #x00000103 ekm)
+    (dds.dcps::cm-register-matched-remote-entity cm other #x00000103 okm)
+    (%check :cm-forget-before-participant (dds.dcps::cm-decode-participant-km cm prefix)
+            "the remote participant KM resolves before forget")
+    (%check :cm-forget-before-entity (eq ekm (dds.dcps::cm-decode-entity-km-by-key-id cm ekid))
+            "the remote entity KM resolves by key_id before forget")
+    (%check :cm-forget-before-sender (dds.dcps::cm-remote-entity-for-key-id cm ekid)
+            "the remote sender-entity resolves by key_id before forget")
+    (%check :cm-forget-count (= 2 (dds.dcps::cm-forget-remote-participant cm prefix))
+            "cm-forget-remote-participant drops exactly the lost peer's KMs (participant + 1 entity)")
+    (%check :cm-forget-secrets-wiped
+            (and (every #'zerop (dds.security::key-material-master-sender-key ekm))
+                 (every #'zerop (dds.security::key-material-master-salt ekm))
+                 (every #'zerop (dds.security::key-material-master-sender-key pkm)))
+            "the dropped KMs' master secrets are wiped to zero on forget (prompt hygiene)")
+    (%check :cm-forget-after-participant (null (dds.dcps::cm-decode-participant-km cm prefix))
+            "the lost participant KM is unresolvable after forget (bounded active tables, fail-closed)")
+    (%check :cm-forget-after-entity (null (dds.dcps::cm-decode-entity-km-by-key-id cm ekid))
+            "the lost entity KM is unresolvable by key_id after forget (fail-closed)")
+    (%check :cm-forget-after-sender (null (dds.dcps::cm-remote-entity-for-key-id cm ekid))
+            "the lost sender-entity mapping is dropped after forget")
+    (%check :cm-forget-all-kms-retained (gethash ekm (dds.dcps::crypto-manager-all-kms cm))
+            "the dropped KM handle is retained in all-kms for the single quiesced-teardown free (no mid-run free)")
+    (%check :cm-forget-other-untouched (eq okm (dds.dcps::cm-decode-entity-km-by-key-id cm okid))
+            "an unrelated remote participant's entity KM is NOT dropped (no over-drop)")
+    (%check :cm-forget-idempotent (zerop (dds.dcps::cm-forget-remote-participant cm prefix))
+            "a second forget of the same peer drops nothing (idempotent)"))
+  t)
+
 (defun* run-security-crypto-manager-test ()
     (function () t)
   "DDS-Security 1.1 §8.5 key-management hub (WP-DDS-SECURITY-SECURE-DISCOVERY T6): the generic
@@ -3941,4 +3988,5 @@
   (%cm-resolvers)
   (%cm-rtps-origin-auth)
   (%cm-concurrency-smoke)
+  (%cm-forget-remote)
   t)
