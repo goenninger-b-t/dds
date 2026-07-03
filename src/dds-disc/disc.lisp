@@ -441,6 +441,16 @@
   ;; resolver. All NIL/default = security OFF / metadata_protection NONE -> the user submessage path is byte-identical.
   ;; Installed by %install-crypto-manager + create-datawriter/datareader (the kind from governance).
   (user-submessage-protection-kind :none :type (member :none :sign :encrypt))
+  ;; §9.4.1.2.4 data_protection_kind (serialized-payload SecuredPayload tier). :none = the payload rides PLAIN, so
+  ;; the crypto-transform serialized-payload encode/decode is SKIPPED (a SIGN tier with data=NONE: metadata_protection
+  ;; SIGN authenticates the visible payload; applying data_protection to a plain payload would encrypt-on-send /
+  ;; decode-fail-drop-on-receive). :UNSET (default) = no governance has determined it — the crypto-transform, when
+  ;; installed (a keyed peer / a test that sets it directly), is applied as before (backward-identical); ONLY an
+  ;; EXPLICIT :none from governance skips it. Set from governance (%install-access-control participant default +
+  ;; %set-user-metadata-protection per-topic) to :none | :sign | :encrypt.
+  (user-data-protection-kind :unset :type (member :unset :none :sign :encrypt))
+  ;; §9.4.1.2.4 per-topic data_protection resolver (topic-name -> :none|:sign|:encrypt) installed from governance by %install-access-control; add-local-{writer,reader} refine user-data-protection-kind via it to the endpoint's ACTUAL rule (no first-rule participant-default downgrade). NIL = security OFF / no governance -> unchanged.
+  (topic-data-protection-resolver nil :type (or null function))
   (user-submessage-encode nil :type (or null function))
   (user-submessage-decode nil :type (or null function))
   ;; DDS-Security 1.1 §7.3.4: called (node prefix spdp) outside the lock on first SPDP from a security-capable remote.
@@ -708,6 +718,19 @@
   (dds.qos:make-qos :reliability (if (>= reliability dds.rtps.discovery:+reliability-reliable+)
                                      :reliable :best-effort)))
 
+(defun* %refine-user-data-protection (node topic)
+    (function (disc-node string) t)
+  "DDS-Security 1.1 §9.4.1.2.4: refine NODE's user-data-protection-kind to TOPIC's ACTUAL governance
+   data_protection_kind via the per-topic resolver installed by %install-access-control, so an
+   add-local-{writer,reader} endpoint gates the serialized-payload (SecuredPayload) tier by the topic's REAL
+   rule — neither the first-rule participant-default downgrade (a later ENCRYPT topic wrongly left :none =
+   false-ACCEPT) nor over-protection of a genuine data=NONE topic (false-REJECT). No resolver (security OFF /
+   no governance) leaves the slot unchanged (byte-identical to the pre-security path). Returns T."
+  (let ((resolver (disc-node-topic-data-protection-resolver node)))
+    (when resolver
+      (setf (disc-node-user-data-protection-kind node) (funcall resolver topic))))
+  t)
+
 (defun* add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
                                    (key 1) qos type-information (keyed t))
@@ -725,6 +748,7 @@
               :topic-name topic :type-name type :type-information type-information
               :qos (or qos (%qos-from-reliability reliability)))))
     (setf (disc-node-user-writer-id node) (logior (ash key 8) kind))
+    (%refine-user-data-protection node topic)   ; §9.4.1.2.4: per-topic data_protection (no participant-default downgrade)
     (push ep (disc-node-local-writers node))
     ep))
 
@@ -746,6 +770,7 @@
               :topic-name topic :type-name type :type-information type-information
               :qos (or qos (%qos-from-reliability reliability)))))
     (setf (disc-node-user-reader-id node) (logior (ash key 8) kind))
+    (%refine-user-data-protection node topic)   ; §9.4.1.2.4: per-topic data_protection (no participant-default downgrade)
     (push ep (disc-node-local-readers node))
     ep))
 
@@ -1602,7 +1627,13 @@
                   ;; Slice 2b-i: PSM DATA — ParticipantStatelessMessage (DDS-Security 1.1 §7.4.3)
                   ((= wtr dds.rtps.discovery:+entityid-participant-stateless-writer+)
                    (%on-stateless-message node src-prefix wtr sn buf poff plen))
-                  ((disc-node-on-data node)
+                  ;; USER-writer DATA only (§9.3.1.2 kind 0x02/0x03). A SECURE builtin writerId (0xff..c2) that reaches
+                  ;; the DATA fall-through — a secure-SEDP/SPDP/PM DiscoveredData whose SEC bracket was decoded + the
+                  ;; recovered plain DATA re-dispatched here — is METATRAFFIC (handled by %on-secure-builtin), NOT a user
+                  ;; sample: never deliver it to the user reader. Previously the always-on data_protection decode masked
+                  ;; this (a builtin ParameterList is not a valid SecuredPayload -> dropped); under data_protection=NONE
+                  ;; (the SIGN tier) that filter is gone, so gate the user delivery on %user-writer-entityid-p explicitly.
+                  ((and (disc-node-on-data node) (%user-writer-entityid-p wtr))
                    ;; Pass orig-guid/orig-sn (PID_ORIGINAL_WRITER_INFO, §8.3.5.4) and key-hash
                    ;; (PID_KEY_HASH, §9.6.4.8 — only non-NIL when capture-data-key-hash is set on
                    ;; the node) into the data-plane hook. %on-user-data gates APP delivery; it MUST

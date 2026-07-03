@@ -327,8 +327,9 @@
         (buf-cap (dds.core.buffer:octet-buffer-capacity buf))
         (pos     20)      ; walk BY RAW OFFSET (no cursor consed) — RTPS Header [0,20) kept verbatim in BUF
         (ooff    0)
+        (depth   0)       ; SEC_PREFIX..SEC_POSTFIX bracket nesting depth: wrap ONLY at depth 0 (§8.5.1.7-.9, below)
         (any     nil))
-    (declare (type fixnum pos ooff))
+    (declare (type fixnum pos ooff depth))
     (handler-case
         (block walk
           (loop
@@ -337,14 +338,24 @@
             ;; so this wrap loop and the exhaustion pre-scan cannot diverge on malformed / overrun / octn=0 (§9.4.5.1.2/.3).
             (multiple-value-bind (id sm-end) (%submessage-extent vec pos len)
               (when (null id) (return-from walk nil))                     ; truncated header / body overruns LEN -> fail-closed
-              (let* ((sublen (- sm-end pos))
-                     (blen   (%wrap-one-user-submessage-into node id out ooff vec pos sublen)))
+              (let* ((sublen  (- sm-end pos))
+                     (prefixp (= id dds.security:+submessage-sec-prefix+))
+                     (postfixp (= id dds.security:+submessage-sec-postfix+))
+                     ;; §8.5.1.7-.9: a submessage ALREADY inside a SEC_PREFIX..SEC_POSTFIX protection bracket (a
+                     ;; secure-builtin discovery_protection wrap, or any prior metadata bracket) is NOT re-protected —
+                     ;; under SIGN its inner submessage rides VERBATIM/visible, so without this depth gate the
+                     ;; metadata_protection walk would DOUBLE-wrap it (under ENCRYPT the inner is an opaque SEC_BODY,
+                     ;; never protectable, so it was implicitly skipped — the depth gate makes SIGN behave identically).
+                     (blen    (and (zerop depth) (not prefixp) (not postfixp)
+                                   (%wrap-one-user-submessage-into node id out ooff vec pos sublen))))
+                (when postfixp (when (plusp depth) (decf depth)))         ; leaving a bracket
                 (if blen
                     (progn (setf any t) (incf ooff blen))                 ; wrapped bracket (the -into's O(1) extent check bounds OUT)
-                    (progn                                                 ; INFO_* / declined -> copy the submessage verbatim by offset
+                    (progn                                                 ; INFO_* / already-bracketed / declined -> copy verbatim by offset
                       (when (> (+ ooff sublen) out-cap) (return-from walk nil))   ; verbatim won't fit OUT -> fail-closed
                       (replace out-vec vec :start1 ooff :end1 (+ ooff sublen) :start2 pos :end2 sm-end)
                       (incf ooff sublen)))
+                (when prefixp (incf depth))                               ; entering a bracket (its inners stay verbatim)
                 (setf pos sm-end))))
           (if (null any)
               len                                                         ; nothing wrapped -> leave BUF untouched (byte-identical)
@@ -367,13 +378,21 @@
    + the shared predicate (INFO_* short-circuits before the resolver; a protectable id calls the resolver, which conses
    nothing) — no subseq, no cursor, no per-submessage object."
   (let ((vec (dds.core.buffer:octet-buffer-vec buf))
-        (pos 20))
-    (declare (type fixnum pos))
+        (pos 20)
+        (depth 0))       ; SEC_PREFIX..SEC_POSTFIX depth — MUST mirror %wrap-user-submessages-into (no divergence)
+    (declare (type fixnum pos depth))
     (loop
       (when (>= pos len) (return len))                              ; end of stream, nothing protectable -> pass-through
       (multiple-value-bind (id sm-end) (%submessage-extent vec pos len)
         (when (null id) (return nil))                              ; truncated header / body overruns LEN -> fail-closed
-        (when (%user-submessage-protectable-p node id) (return nil))   ; a required wrap could not be performed -> drop
+        (let ((prefixp (= id dds.security:+submessage-sec-prefix+))
+              (postfixp (= id dds.security:+submessage-sec-postfix+)))
+          (when postfixp (when (plusp depth) (decf depth)))
+          ;; only a depth-0, non-bracket submessage is protectable (mirrors the wrap loop's depth gate — an
+          ;; already-bracketed inner submessage rides verbatim, never re-wrapped, so it must not force a drop)
+          (when (and (zerop depth) (not prefixp) (not postfixp) (%user-submessage-protectable-p node id))
+            (return nil))                                          ; a required wrap could not be performed -> drop
+          (when prefixp (incf depth)))
         (setf pos sm-end)))))
 
 (defun* %maybe-wrap-user-submessages (node buf len)
@@ -1457,7 +1476,11 @@
         (writer (disc-node-user-writer node))
         (pooled nil) (plen nil))   ; T5a: the acquired pool buffer + its TRUE secured-payload length (NIL = non-pooled path)
     ;; DDS-Security §9.5.3.3.4.4 encode (ADR 0031 T6): crypto-keys resolver or Slice-1 key-material; fail-closed on nil key.
-    (let ((ct (disc-node-crypto-transform node)))
+    ;; §9.4.1.2.4: the SecuredPayload (data_protection) transform is applied UNLESS governance set data_protection=NONE
+    ;; for this topic (the SIGN tier: metadata_protection SIGN authenticates the VISIBLE payload; encrypting it would
+    ;; make a data=NONE peer read garbage). :unset (no governance) keeps the transform — Slice-1 direct-KM path unchanged.
+    ;; data_protection=SIGN (payload-tier GMAC) is NOT yet implemented: this gate is NONE-vs-non-NONE, so a data=SIGN topic routes into the ENCRYPT-only transform (over-encrypt -> peer false-REJECT); supported tiers: NONE + ENCRYPT (ADR-0040/0037 — SIGN at the payload tier is future work).
+    (let ((ct (and (not (eq (disc-node-user-data-protection-kind node) :none)) (disc-node-crypto-transform node))))
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
                       (funcall (dds.security:crypto-keys-encode-key-fn ct) (%local-writer-guid-vec node))
@@ -2132,7 +2155,11 @@
   (let ((guid (%source-guid src-prefix writer-id))   ; ONE source GUID: km-resolve + reliable proxy + the three inner tables + the loan handle
         (stored vec)                                  ; the value stored in disc-node-samples (a plaintext vec, or a T5b secured-loan-handle)
         (loan nil))                                   ; non-NIL = the pooled-buffer loan handle to register / release-on-reject (T5b)
-    (let ((ct (disc-node-crypto-transform node)))
+    ;; §9.4.1.2.4: apply the SecuredPayload (data_protection) DECODE UNLESS governance set data_protection=NONE (the
+    ;; SIGN tier — the payload rides PLAIN, authenticated by metadata_protection SIGN; decoding a plain payload as a
+    ;; SecuredPayload fails-closed and would DROP every sample). :unset (no governance) keeps the decode — direct-KM path unchanged.
+    ;; data_protection=SIGN (payload-tier GMAC) is NOT yet implemented: this gate is NONE-vs-non-NONE, so a data=SIGN topic routes into the ENCRYPT-only transform (over-decrypt -> drop); supported tiers: NONE + ENCRYPT (ADR-0040/0037 — SIGN at the payload tier is future work).
+    (let ((ct (and (not (eq (disc-node-user-data-protection-kind node) :none)) (disc-node-crypto-transform node))))
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
                       (funcall (dds.security:crypto-keys-decode-key-fn ct) guid)

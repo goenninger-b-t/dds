@@ -514,6 +514,19 @@ the plain node).
 summary: structural + KAT conformance is proven; a live Connext-Security byte-compare
 is **deferred** (Slice 5, the P6 exit gate).
 
+### 5.1 Known limitation — `data_protection=SIGN` (payload tier) is not implemented
+
+The serialized-payload `data_protection` gate (`%publish-…` / `%deliver-user-sample`) is
+**`NONE`-vs-non-`NONE`**: a non-NONE kind routes into the ENCRYPT-only crypto-transform.
+**Supported `data_protection` tiers: `NONE` + `ENCRYPT`.**  A `data=SIGN` topic — a
+serialized-payload GMAC sub-tier that would authenticate the *visible* payload without
+encrypting it — is **not yet implemented** (`transform.lisp` implements ENCRYPT-only for the
+payload tier); routing it through the ENCRYPT transform would over-encrypt the payload, so a
+`data=SIGN` peer would read garbage / false-REJECT.  This is why the `governance-sign` SIGN
+tier uses `data=NONE` (the visible payload is already authenticated at the submessage tier by
+`metadata_protection`=SIGN, §8.5.1.9).  `data_protection`=SIGN at the payload tier is **future
+work** (ADR 0040 §Slice-5c review follow-ons; ADR 0037 carry #3).
+
 ---
 
 ## 6. Authentication plugin — Slice 2a (DDS-Security 1.1 §8.7, §9.3)

@@ -3052,6 +3052,7 @@
                  ("access-control-local-deny"     . run-access-control-local-deny-test)
                  ("access-control-default-off"    . run-access-control-default-off-test)
                  ("governance-protection-kind"    . run-governance-protection-kind-test)
+                 ("security-data-protection-downgrade" . run-security-data-protection-downgrade-test)
                  ("security-crypto-manager"       . run-security-crypto-manager-test)
                  ("security-session-key-cache"    . run-security-session-key-cache-test))))
     (dolist (test tests)

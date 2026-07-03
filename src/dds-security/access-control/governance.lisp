@@ -151,3 +151,35 @@
   (dolist (rule (governance-topic-rules gov) :none)
     (when (%topic-match-p (topic-rule-topic-expr rule) topic-name)
       (return (topic-rule-metadata-protection-kind rule)))))
+
+(defun* topic-data-protection (gov topic-name)
+    (function (governance string) keyword)
+  "data_protection_kind (BasicProtectionKind, §9.4.1.2.4) for the first topic_rule matching TOPIC-NAME — the
+   serialized-payload (SecuredPayload) protection tier; :none if no rule matches. :none means the payload rides
+   PLAIN (no SecuredPayload) — the crypto-transform serialized-payload encode/decode MUST be skipped, else a plain
+   payload is wrongly encrypted on send / decode-failed-and-dropped on receive (the SIGN-tier data=NONE path)."
+  (dolist (rule (governance-topic-rules gov) :none)
+    (when (%topic-match-p (topic-rule-topic-expr rule) topic-name)
+      (return (topic-rule-data-protection-kind rule)))))
+
+(defun* %data-protection-rank (kind)
+    (function (keyword) (integer 0 2))
+  "Rank a §9.4.1.2.4 BasicProtectionKind for MOST-PROTECTIVE (max) selection: :encrypt 2 > :sign 1 > :none 0.
+   ECASE fail-closes on an unknown keyword — it never silently ranks 0 (a silent protection downgrade)."
+  (ecase kind (:none 0) (:sign 1) (:encrypt 2)))
+
+(defun* governance-effective-data-protection (gov)
+    (function (governance) keyword)
+  "The MOST-PROTECTIVE data_protection_kind over ALL topic_rules (max :encrypt > :sign > :none, §9.4.1.2.4);
+   :none only when EVERY rule (or no rule) is data=NONE. The PARTICIPANT-level serialized-payload default the
+   access layer stamps at create-participant (%install-access-control) as a FAIL-CLOSED fallback: a governance
+   whose FIRST rule is data=NONE while a LATER rule is data=ENCRYPT must NEVER downgrade the participant default
+   to :none (a plain payload wrongly accepted on an ENCRYPT topic = false-ACCEPT). The DCPS create path and
+   add-local-{writer,reader} REFINE this to the endpoint's ACTUAL per-topic kind (topic-data-protection via the
+   %install-access-control-installed resolver), so a genuine data=NONE topic is NOT forced to protection (no
+   false-REJECT); this most-protective value governs only when no per-topic refinement has run."
+  (let ((best :none))
+    (dolist (r (governance-topic-rules gov) best)
+      (when (> (%data-protection-rank (topic-rule-data-protection-kind r))
+               (%data-protection-rank best))
+        (setf best (topic-rule-data-protection-kind r))))))

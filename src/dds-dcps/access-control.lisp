@@ -143,6 +143,22 @@
       (multiple-value-bind (base origin-auth) (dds.security:protection-kind-base rtps-kind)
         (setf (dds.disc:disc-node-rtps-protection-kind (dp-node p)) base)
         (setf (dds.disc:disc-node-rtps-protection-origin-auth (dp-node p)) origin-auth))))
+  ;; §9.4.1.2.4 data_protection_kind PARTICIPANT-level default: stamp the MOST-PROTECTIVE serialized-payload tier
+  ;; over all topic rules (governance-effective-data-protection) as a FAIL-CLOSED fallback so an endpoint added via
+  ;; add-local-{writer,reader} (bypassing create-datawriter/reader, which calls %set-user-metadata-protection
+  ;; per-topic) never DOWNGRADES below a later data=ENCRYPT rule when the FIRST rule is data=NONE (false-ACCEPT).
+  ;; ALSO install the per-topic resolver (topic -> data_protection_kind); add-local-{writer,reader}
+  ;; (%refine-user-data-protection) REFINE the slot to the endpoint's ACTUAL rule, so a genuine data=NONE topic is
+  ;; NOT forced to protection (no false-REJECT) — the most-protective default governs only until a per-topic path
+  ;; runs. :none (governance-sign — the visible SIGN payload) makes %deliver-user-sample / publish-sample SKIP the
+  ;; SecuredPayload transform (plain); data=ENCRYPT keeps it. No governance leaves the slot :unset + resolver NIL ->
+  ;; the transform, when installed, is applied as before (backward-identical — Slice-1 direct-KM + keyed pubsub).
+  (let ((gov (dds.security:access-handle-governance access-handle)))
+    (when gov
+      (setf (dds.disc:disc-node-user-data-protection-kind (dp-node p))
+            (dds.security:governance-effective-data-protection gov))
+      (setf (dds.disc:disc-node-topic-data-protection-resolver (dp-node p))
+            (lambda (topic) (dds.security:topic-data-protection gov topic)))))
   ;; DDS-Security 1.1 §7.3/§8.5: §8.5 crypto-token keying is a §7.3 endpoint-match precondition ONLY when the
   ;; governance mandates protection (governance-any-protection-p); an all-NONE governance (authentication +
   ;; access-control only) matches at :authenticated on §8.7 auth + §8.4 permissions alone (§8.4.2.9 — matching is

@@ -14,7 +14,9 @@
 #          /Applications/rti_connext_dds-7.3.1/resource/app/lib/arm64Darwin20clang12.0/
 #
 # Usage: bash interop/security-connext/run-connext-interop.sh [GOV] [SECS]
-#   GOV  = none (auth+access-control only, protection NONE) | secure (all-ENCRYPT). Default none.
+#   GOV  = none (auth+access-control only, protection NONE) | secure (all-ENCRYPT) |
+#          sign (all-SIGN authenticated-but-visible AES-GMAC: discovery/liveliness/rtps/metadata=SIGN, data=NONE).
+#          Default none. The p7s (ours) and .smime (Connext, USER_QOS_PROFILES.xml OursConnextInterop::${GOV}) are named governance-${GOV}.
 #   SECS = seconds ours runs per direction. Default 25.
 set -uo pipefail
 

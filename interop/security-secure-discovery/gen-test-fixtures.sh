@@ -8,7 +8,7 @@
 #
 # Generates under interop/security-secure-discovery/pki/ (signed CMS/S-MIME PEM, DDS-Security 1.1 §9.4.1.1):
 #   governance-secure.xml/.p7s       -- discovery=ENCRYPT, liveliness=SIGN, rtps=ENCRYPT, enable_discovery_protection=true
-#   governance-sign.xml/.p7s         -- discovery=SIGN (authenticated-but-visible), enable_discovery_protection=true
+#   governance-sign.xml/.p7s         -- all-SIGN authenticated-but-visible tier: discovery/liveliness/rtps/metadata=SIGN (AES-GMAC), data=NONE (visible payload), enable_discovery_protection=true
 #   governance-origin-auth.xml/.p7s  -- the *_WITH_ORIGIN_AUTHENTICATION protection kinds (receiver-specific MACs)
 #   governance-none.xml/.p7s         -- all-NONE baseline (the security-OFF byte-identical guard)
 #   permissions.xml/.p7s             -- publish/subscribe grants for the four test subjects, default DENY
@@ -78,7 +78,7 @@ XML
 write_governance "${PKI_DIR}/governance-secure.xml" \
   "ENCRYPT" "SIGN" "ENCRYPT" "true" "ENCRYPT" "ENCRYPT"
 write_governance "${PKI_DIR}/governance-sign.xml" \
-  "SIGN" "SIGN" "SIGN" "true" "ENCRYPT" "ENCRYPT"
+  "SIGN" "SIGN" "SIGN" "true" "SIGN" "NONE"
 write_governance "${PKI_DIR}/governance-origin-auth.xml" \
   "ENCRYPT_WITH_ORIGIN_AUTHENTICATION" "SIGN_WITH_ORIGIN_AUTHENTICATION" "ENCRYPT_WITH_ORIGIN_AUTHENTICATION" \
   "true" "ENCRYPT" "ENCRYPT"

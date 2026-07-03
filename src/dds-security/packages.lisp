@@ -195,6 +195,8 @@
    #:protection-kind-base
    #:topic-discovery-protected-p
    #:topic-metadata-protection
+   #:topic-data-protection
+   #:governance-effective-data-protection
    #:permissions
    #:make-permissions
    #:permissions-p

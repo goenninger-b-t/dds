@@ -1474,6 +1474,36 @@
             "SIGN CryptoFooter receiver_specific_macs_count = 0"))
   t)
 
+(defun* %t2-corpus-sign-aad-span (sub)
+    (function ((simple-array (unsigned-byte 8) (*))) t)
+  "T2 corpus block (2b) — ADR-0037 SIGN-AAD regression pin (§8.5.1.9 datawriter submessage protection /
+   §9.5.3.3.4.3): assert our SIGN encode's common_mac is the GMAC computed over AAD = EXACTLY the verbatim
+   (visible) submessage region between SEC_PREFIX and SEC_POSTFIX — the confirmed cross-vendor-conformant span.
+   Recomputes the GMAC OUR-TO-OUR via %seal-with-km under the CryptoHeader's OWN session_id/iv_suffix (empty
+   plaintext => a pure GMAC over the AAD) and equalp-compares it to the on-wire common_mac; an off-by-one wider
+   span must NOT reproduce it (the boundary is exact). A future codec change that widened/narrowed the SIGN AAD
+   span FAILS here rather than silently regressing cross-vendor SIGN. Additive assertion; no corpus regen."
+  (let* ((km      (dds.security:make-test-key-material))
+         (sgn     (dds.security:encode-datawriter-submessage km :sign sub))
+         (n       (length sub))
+         (sid     (subseq sgn 12 16))                 ; §7.3.7 CryptoHeader session_id (after SEC_PREFIX hdr(4)+kind(4)+key_id(4))
+         (ivs     (subseq sgn 16 24))                 ; §7.3.7 CryptoHeader init_vector_suffix (8)
+         (span    (subseq sgn 24 (+ 24 n)))           ; AAD = the verbatim visible submessage (NO SEC_BODY), offset 24..24+len
+         (mac-off (+ 24 n 4))                         ; common_mac follows the SEC_POSTFIX submessage header (4)
+         (wire-mac (subseq sgn mac-off (+ mac-off 16)))
+         (empty   (make-array 0 :element-type '(unsigned-byte 8))))
+    (%check :t2-sign-aad-visible-is-input (equalp span sub)
+            "SIGN: the visible AAD span (offset 24..24+len) must be the ORIGINAL submessage verbatim")
+    (multiple-value-bind (ct tag) (dds.security::%seal-with-km km sid ivs span empty)
+      (declare (ignore ct))
+      (%check :t2-sign-aad-span-gmac (equalp tag wire-mac)
+              "SIGN common_mac MUST equal GMAC over AAD = the verbatim visible submessage span (§8.5.1.9 / §9.5.3.3.4.3) — the on-wire GMAC pins the exact AAD span (a widened/narrowed span would break cross-vendor SIGN)"))
+    (multiple-value-bind (ct tag) (dds.security::%seal-with-km km sid ivs (subseq sgn 23 (+ 24 n)) empty)
+      (declare (ignore ct))
+      (%check :t2-sign-aad-span-boundary-exact (not (equalp tag wire-mac))
+              "SIGN AAD span boundary is EXACT: a GMAC over a one-octet-wider span (offset 23, one CryptoHeader byte) must NOT match the on-wire common_mac")))
+  t)
+
 (defun* %t2-corpus-roundtrip (sub)
     (function ((simple-array (unsigned-byte 8) (*))) t)
   "T2 corpus block (3): round-trip both KINDs, both directions — decode(encode(km,KIND,SUB)) = SUB."
@@ -1555,6 +1585,7 @@
   (let ((sub (%t2-fixed-plain-submessage)))
     (%t2-corpus-encrypt sub)
     (%t2-corpus-sign sub)
+    (%t2-corpus-sign-aad-span sub)
     (%t2-corpus-roundtrip sub)
     (%t2-corpus-negatives sub))
   t)

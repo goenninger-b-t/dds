@@ -101,17 +101,23 @@
 
 ;;; --- §8.5 CryptoKeyFactory: register_local_* / register_matched_remote_* ---
 
-(defun* cm-register-local-participant (cm &key (origin-auth nil))
-    (function (crypto-manager &key (:origin-auth t)) dds.security:key-material)
+(defun* cm-register-local-participant (cm &key (origin-auth nil) (kind :encrypt))
+    (function (crypto-manager &key (:origin-auth t) (:kind (member :sign :encrypt))) dds.security:key-material)
   "§8.5 register_local_participant: get-or-create the LOCAL participant's §9.5.2 KeyMaterial (the
    rtps_protection ParticipantCrypto encode source). Idempotent — returns the existing KeyMaterial if
    already registered, else mints one (GENERATE-KEY-MATERIAL; ORIGIN-AUTH adds the receiver-specific
-   fields for rtps_protection WITH_ORIGIN_AUTHENTICATION). Under the manager lock (mirrors auth-manager's
-   get-or-create-under-lock; the leaf GENERATE-KEY-MATERIAL never re-enters the manager). Returns the KM."
+   fields for rtps_protection WITH_ORIGIN_AUTHENTICATION). KIND (:encrypt default | :sign) sets the
+   KeyMaterial's advertised transformation_kind — it MUST equal the wire CryptoHeader kind the whole-RTPS
+   SRTPS wrap carries (rtps_protection_kind of the tier: SIGN advertises AES256-GMAC, ENCRYPT AES256-GCM),
+   because a conformant remote resolves the ParticipantCrypto by sender_key_id then transforms per the
+   advertised kind — a SIGN participant that advertised GCM makes the remote GCM-decrypt a GMAC datagram
+   (Connext 'RTI_Security_Cryptography_decode: DecryptFinal failed'), §9.5.2 Table 65 / §8.5.1.10-.12.
+   Under the manager lock (mirrors auth-manager's get-or-create-under-lock; the leaf GENERATE-KEY-MATERIAL
+   never re-enters the manager). Returns the KM."
   (dds.pal:with-lock ((crypto-manager-lock cm))
     (or (crypto-manager-participant-crypto cm)
         (setf (crypto-manager-participant-crypto cm)
-              (%cm-track-km cm (dds.security:generate-key-material :origin-auth origin-auth))))))
+              (%cm-track-km cm (dds.security:generate-key-material :origin-auth origin-auth :kind kind))))))
 
 (defun* cm-register-matched-remote-participant (cm prefix km)
     (function (crypto-manager (simple-array (unsigned-byte 8) (12)) dds.security:key-material) (eql t))
@@ -589,7 +595,11 @@
     ;; %install-access-control) — so a remote A can MAC an rtps-protected datagram under THIS participant's receiver
     ;; key and this participant verifies it with its own (cm-rtps-decode-receiver). NONE/non-origin-auth -> no
     ;; receiver key -> plain SRTPS, byte-identical.
-    (cm-register-local-participant cm :origin-auth (dds.disc:disc-node-rtps-protection-origin-auth node))
+    ;; The advertised ParticipantCrypto kind MUST equal the wire SRTPS CryptoHeader kind (rtps_protection_kind):
+    ;; SIGN -> AES256-GMAC, else AES256-GCM. Without this a SIGN participant advertised GCM (the default) but emitted
+    ;; a GMAC SRTPS wrap -> the remote finds the key by sender_key_id but transforms as GCM -> DecryptFinal (§9.5.2).
+    (cm-register-local-participant cm :origin-auth (dds.disc:disc-node-rtps-protection-origin-auth node)
+                                      :kind (if (eq (dds.disc:disc-node-rtps-protection-kind node) :sign) :sign :encrypt))
     (dolist (e (%cm-local-token-entities node))
       (cm-register-local-entity cm (car e) :origin-auth (%cm-entity-origin-auth node (car e))
                                            :kind (%cm-entity-protection-kind node (car e))))

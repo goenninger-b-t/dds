@@ -117,6 +117,8 @@
            #:disc-node-rtps-protection-decode
            ;; Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP): USER-DATA submessage protection (metadata_protection)
            #:disc-node-user-submessage-protection-kind
+           #:disc-node-user-data-protection-kind
+           #:disc-node-topic-data-protection-resolver
            #:disc-node-user-submessage-encode
            #:disc-node-user-submessage-decode
            #:run-user-submessage-protection-test

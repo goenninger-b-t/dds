@@ -1041,3 +1041,47 @@
     (%check :t5-bad-topic-tier-nil (null gov)
             "SIGN_WITH_ORIGIN_AUTHENTICATION in metadata_protection_kind must make parse-governance return NIL (tier guard)"))
   t)
+
+(defun* run-security-data-protection-downgrade-test ()
+    (function () t)
+  "Review follow-up (DDS-Security 1.1 §9.4.1.2.4): a MULTI-RULE governance whose FIRST topic_rule is data=NONE
+   while a LATER rule is data=ENCRYPT for a specific topic must NOT let an add-local-{writer,reader} endpoint
+   inherit the FIRST-rule participant default. The fix: (1) the participant-level default is MOST-PROTECTIVE
+   (governance-effective-data-protection, max :encrypt>:sign>:none — fail-closed), and (2) add-local resolves
+   the ACTUAL per-topic data_protection via the %install-access-control-installed resolver. Asserts, on the
+   PRE-fix first-rule logic, RED on both a FALSE-ACCEPT (an ENCRYPT topic left :none) and a FALSE-REJECT (a
+   genuine NONE topic forced to protection). Rules are ordered so the wildcard-free FIRST rule (Square) does
+   NOT shadow the LATER Circle rule (topic-data-protection = first-MATCHING rule, §9.4.1.2.4)."
+  (let* ((gov (dds.security:make-governance
+               :discovery-protection-kind :none
+               :liveliness-protection-kind :none
+               :rtps-protection-kind :none
+               :topic-rules
+               (list (dds.security:make-topic-rule :topic-expr "Square"    ; FIRST rule: a genuine data=NONE topic
+                                                   :metadata-protection-kind :none
+                                                   :data-protection-kind :none)
+                     (dds.security:make-topic-rule :topic-expr "Circle"    ; LATER rule: data=ENCRYPT (Square rule does not shadow it)
+                                                   :metadata-protection-kind :none
+                                                   :data-protection-kind :encrypt))))
+         (ah  (dds.security:make-access-handle :governance gov)))
+    (%check :dp-downgrade-effective-most-protective
+            (eq :encrypt (dds.security:governance-effective-data-protection gov))
+            "governance-effective-data-protection must be MOST-PROTECTIVE over ALL rules (max :encrypt>:sign>:none): a FIRST data=NONE rule must NOT downgrade the participant default below a LATER data=ENCRYPT rule (fail-closed)")
+    (let ((p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+      (unwind-protect
+           (let ((node (dds.dcps::dp-node p)))
+             (setf (dds.dcps::dp-auth-state p)
+                   (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
+             (dds.dcps::%install-access-control p ah)
+             ;; the data=ENCRYPT topic (a LATER rule) via add-local must resolve per-topic to :encrypt — never the FIRST rule's :none (false-ACCEPT)
+             (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType")
+             (%check :dp-downgrade-encrypt-topic-not-none
+                     (eq :encrypt (dds.disc:disc-node-user-data-protection-kind node))
+                     "add-local-writer on the data=ENCRYPT topic (a LATER rule; the FIRST rule is data=NONE) must resolve per-topic to :encrypt, never :none — a plain payload accepted on an ENCRYPT topic is a false-ACCEPT")
+             ;; a genuine data=NONE topic (the FIRST rule) via add-local must resolve to :none — never forced to protection by the most-protective default (false-REJECT)
+             (dds.disc:add-local-reader node :topic "Square" :type "ShapeType")
+             (%check :dp-downgrade-none-topic-not-forced
+                     (eq :none (dds.disc:disc-node-user-data-protection-kind node))
+                     "add-local-reader on a genuine data=NONE topic (the FIRST rule) must resolve per-topic to :none, never forced to protection by the most-protective participant default — over-encrypting a NONE topic is a false-REJECT"))
+        (dds.dcps:delete-participant p))))
+  t)

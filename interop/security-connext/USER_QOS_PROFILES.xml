@@ -44,5 +44,16 @@
       </domain_participant_qos>
     </qos_profile>
 
+    <!-- GOV=sign: all-SIGN authenticated-but-visible (AES-GMAC) discovery/liveliness/rtps/metadata; data NONE (visible payload). -->
+    <qos_profile name="sign" base_name="none">
+      <domain_participant_qos>
+        <property>
+          <value>
+            <element><name>dds.sec.access.governance</name><value>file:../security-secure-discovery/fastdds/certs/governance-sign.smime</value></element>
+          </value>
+        </property>
+      </domain_participant_qos>
+    </qos_profile>
+
   </qos_library>
 </dds>

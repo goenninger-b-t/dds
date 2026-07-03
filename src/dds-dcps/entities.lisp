@@ -527,7 +527,11 @@
     (let ((gov (dds.security:access-handle-governance ah)))
       (when gov
         (setf (dds.disc:disc-node-user-submessage-protection-kind node)
-              (dds.security:topic-metadata-protection gov topic-name)))))
+              (dds.security:topic-metadata-protection gov topic-name))
+        ;; §9.4.1.2.4 data_protection_kind: gates the serialized-payload SecuredPayload tier — :none leaves the
+        ;; payload PLAIN, so the crypto-transform encode/decode is skipped (a SIGN tier with data=NONE).
+        (setf (dds.disc:disc-node-user-data-protection-kind node)
+              (dds.security:topic-data-protection gov topic-name)))))
   t)
 
 (defun* create-datawriter (pub topic &key (qos (dds.qos:make-writer-qos)))
