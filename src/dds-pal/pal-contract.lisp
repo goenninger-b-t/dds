@@ -19,8 +19,9 @@
    #:alloc-static #:free-static #:static-pointer #:static-length #:static-sap+
    #:static-vector-p
    #:mem-ref-u8 #:mem-set-u8
-   ;; atomics (generic M0 stubs); foreign-SAP fast paths for hot-path use (M1, ADR 0013)
-   #:cas #:atomic-incf #:fence
+   ;; atomics: generic CAS / fetch-add over a PAL ATOMIC-CELL (M0 stub CLOSED, ADR 0041);
+   ;; foreign-SAP fast paths for the hot path (M1, ADR 0013)
+   #:cas #:atomic-incf #:fence #:atomic-cell #:make-atomic-cell #:atomic-cell-value
    #:cas-sap-u64 #:cas-sap-u32 #:atomic-incf-sap-u64 #:load-sap-u64 #:store-sap-u64
    ;; foreign-SAP fixed-width unsigned reads — back the FlatData-ZC read-in-place
    ;; accessors (WP-FLATDATA-ZC-LOAN; SBCL-only; R6, NOT cleared for ship — see ADR 0017)
@@ -73,3 +74,20 @@
    are being established; a later ADR drops designated kernels to (safety 0)."
   `(locally (declare (optimize (speed 3) (safety 1) (debug 0) (space 0)))
      ,@body))
+
+;;; ---- atomics: the ATOMIC-CELL the per-impl CAS / ATOMIC-INCF target ----
+;;; Impl-agnostic (identical defstruct on both impls), so it lives in the contract; only the
+;;; per-impl CAS/ATOMIC-INCF ops carry reader conditionals (pal-<impl>.lisp).
+
+(defstruct* (atomic-cell (:constructor make-atomic-cell))
+  "A PAL atomic counter cell: a single (unsigned-byte 64) VALUE slot that CAS and ATOMIC-INCF
+   operate on atomically. It is the CONCRETE PLACE the M0 generic atomics needed to close their
+   stub (ADR 0041): the native read-modify-write primitives (SBCL sb-ext:, Clasp mp:) are
+   place-form MACROS that must see a compile-time-known place, so the old runtime place-fn
+   indirection could not be lowered to a hardware atomic (ADR 0013) — a first-class cell whose
+   FIXED slot those macros target is the portable way to expose them as ordinary functions. A
+   single (unsigned-byte 64) slot is the one representation both sb-ext:cas/atomic-incf and
+   mp:cas/atomic-incf accept for BOTH ops (probed). Build with MAKE-ATOMIC-CELL (VALUE defaults
+   0); read the live value with ATOMIC-CELL-VALUE — a plain (relaxed) load, so use CAS/ATOMIC-INCF
+   for an atomic RMW and FENCE for standalone ordering."
+  (value 0 :type (unsigned-byte 64)))

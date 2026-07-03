@@ -322,8 +322,10 @@ cleartext (ADR-0036 Carry 10); saved-image foreign-pointer staleness — **RESOL
 `load-time-value`-cached EVP pointers went stale across `save-lisp-and-die`; `%ossl-sym` now resolves through a
 re-resolvable box and an image-restart hook (`%dare-reresolve-foreign-pointers`, registered via the new portable
 `dds.pal:register-image-restart-hook` — SBCL `*init-hooks*` / Clasp `core:*initialize-hooks*`) re-resolves every box
-+ the cipher on startup (ADR 0038 Residual (d)); the M0 PAL atomics stubs (`dds.pal:cas`/`atomic-incf` unimplemented
-→ the send-refcount uses the writer lock). Also carried from
++ the cipher on startup (ADR 0038 Residual (d)); the M0 PAL atomics stubs (`dds.pal:cas`/`atomic-incf`) —
+**RESOLVED (WP-PAL-ATOMICS, ADR 0041):** now implemented on both impls over a PAL `atomic-cell`, and the
+send-refcount stays writer-lock-guarded by informed decision (every access site already holds the lock, so
+lock-free wins nothing and would open a releasable-check TOCTOU — see ADR 0041). Also carried from
 ADR 0038 Residual (a): when a future `rtps_protection` **rekeying** (session_id rotation) lands, it must confirm the
 decode receiver stays single-threaded per km OR harden `%km-session-key-at`'s two-slot publish against a
 concurrent-different-session_id tear (the fence protocol is tear-safe only while session_id is effectively constant

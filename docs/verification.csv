@@ -7,7 +7,7 @@ FR-LANG-8,ftype on every defun,scripts/gate-types.sh,all,done,125/125 defuns fty
 NFR-MEM,startup arena report + per-pool high-water,src/dds-core/arena.lisp; dds-tests echo,P4,partial,arena+buffer-pool+sample-pool working Clasp+SBCL; deserialize-into zero-alloc verified (make mem); no-heap-fallback assertion later
 NFR-PERF-8,0 bytes/sample steady state,Makefile mem target; dds-tests run-mem-test,P4,partial,serialize + deserialize + round-trip measured 0 bytes/sample over 100k iters on SBCL (sb-ext:get-bytes-consed); Clasp counter is an NFR-PORT gap; string/sequence member pooling later
 NFR-CLOS,hot-path static analyzer,scripts/gate-hotpath.sh,all,partial,M0 lexical scan green
-DDS.PAL,capability conformance,src/dds-pal/ (pal-clasp+pal-sbcl),M0-M1,partial,Clasp+SBCL memory+clock+threads live; atomics/sockets stubbed (M1)
+DDS.PAL,capability conformance,src/dds-pal/ (pal-clasp+pal-sbcl); dds-tests run-pal-atomics-test,M0-M1,partial,Clasp+SBCL memory+clock+threads+sockets live; generic cas/atomic-incf over an atomic-cell live on BOTH impls (M0 stub closed ADR 0041; concurrency-proven N*M no-lost-updates); SAP-targeted hot-path atomics SBCL-only (Clasp NFR-PORT gap ADR 0013)
 DDS.CORE.BUFFER,unit round-trip,dds-tests echo-test,P0,done-clasp+sbcl,u8/16/32/64 LE+BE + octets round-trip + bounds-check
 DDS.CORE.ARENA,acquire/release/zero-leak,dds-tests echo-test,P0,done-clasp+sbcl,init/pool/acquire/release/high-water verified
 M0-exit,echo over mock transport,dds-tests:run-echo-test,M0,PASSED (owner-commanded),Clasp boehmprecise + SBCL 2.6.5 green; AllegroCL exception by explicit owner command 2026-06-04 (ADR 0004)

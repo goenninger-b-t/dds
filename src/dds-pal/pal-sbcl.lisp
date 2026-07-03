@@ -98,21 +98,27 @@
                                         (/ 1000000000 internal-time-units-per-second)))
     q))
 
-;;; ---- atomics / threads / gc: M0 stubs over portable libs ----
-;;; sb-ext:cas / sb-thread:barrier fast paths land in M1.
+;;; ---- atomics / threads / gc ----
+;;; Generic CAS/fetch-add over an ATOMIC-CELL (M0 stub CLOSED, ADR 0041); the
+;;; SAP-targeted hot-path atomics are below (M1, ADR 0013).
 
-(defun* cas (place-fn old new)
-    (function (t t t) t)
-  "Atomic compare-and-swap. M0 stub: signals PAL-UNIMPLEMENTED; the sb-ext:cas fast
-   path lands in M1."
-  (declare (ignore place-fn old new))
-  (error 'pal-unimplemented :op 'cas))
-(defun* atomic-incf (place-fn &optional (delta 1))
-    (function (t &optional integer) t)
-  "Atomic increment by DELTA. M0 stub: signals PAL-UNIMPLEMENTED; the native fast
-   path lands in M1."
-  (declare (ignore place-fn delta))
-  (error 'pal-unimplemented :op 'atomic-incf))
+(defun* cas (cell old new)
+    (function (atomic-cell (unsigned-byte 64) (unsigned-byte 64)) (unsigned-byte 64))
+  "Atomically compare-and-swap CELL's VALUE: if it = OLD store NEW, and return the PREVIOUS
+   value either way (the swap succeeded iff the return is = OLD). A full-barrier
+   (sequentially-consistent) RMW via sb-ext:cas over the (unsigned-byte 64) ATOMIC-CELL-VALUE
+   slot (lowers to a LOCK CMPXCHG / arm64 CASAL carrying acquire+release ordering). Returns the
+   previous value, matching the SAP sibling CAS-SAP-U64 (ADR 0041)."
+  (sb-ext:cas (atomic-cell-value cell) old new))
+(defun* atomic-incf (cell &optional (delta 1))
+    (function (atomic-cell &optional fixnum) (unsigned-byte 64))
+  "Atomically add DELTA (signed; default 1) to CELL's VALUE modulo 2^64 and return the NEW value.
+   A full-barrier (sequentially-consistent) RMW via sb-ext:atomic-incf, which returns the OLD
+   value on SBCL — normalized here to the new by (+ old delta) masked to 64 bits (matching the SAP
+   sibling ATOMIC-INCF-SAP-U64, which also returns the new). A negative DELTA decrements (modular).
+   (ADR 0041.)"
+  (declare (type fixnum delta))
+  (logand (+ (sb-ext:atomic-incf (atomic-cell-value cell) delta) delta) #xFFFFFFFFFFFFFFFF))
 (defun* fence (&optional (kind :full))
     (function (&optional t) (values))
   "Real memory barrier (M1). :acquire = load barrier, :release = store barrier, :full = full."

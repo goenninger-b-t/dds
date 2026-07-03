@@ -118,21 +118,27 @@
                                         (/ 1000000000 internal-time-units-per-second)))
     q))
 
-;;; ---- atomics / threads / gc: M0 stubs over portable libs ----
-;;; bordeaux-threads is available; native CAS/fence fast paths land in M1.
+;;; ---- atomics / threads / gc ----
+;;; Generic CAS/fetch-add over an ATOMIC-CELL (M0 stub CLOSED, ADR 0041). The SAP-targeted
+;;; foreign-cell atomics below stay a documented NFR-PORT gap (no Clasp foreign atomic, ADR 0013).
 
-(defun* cas (place-fn old new)
-    (function (t t t) t)
-  "Atomic compare-and-swap. M0 stub: signals PAL-UNIMPLEMENTED; a native CAS fast
-   path lands in M1."
-  (declare (ignore place-fn old new))
-  (error 'pal-unimplemented :op 'cas))
-(defun* atomic-incf (place-fn &optional (delta 1))
-    (function (t &optional integer) t)
-  "Atomic increment by DELTA. M0 stub: signals PAL-UNIMPLEMENTED; a native fast path
-   lands in M1."
-  (declare (ignore place-fn delta))
-  (error 'pal-unimplemented :op 'atomic-incf))
+(defun* cas (cell old new)
+    (function (atomic-cell (unsigned-byte 64) (unsigned-byte 64)) (unsigned-byte 64))
+  "Atomically compare-and-swap CELL's VALUE: if it = OLD store NEW, and return the PREVIOUS
+   value either way (the swap succeeded iff the return is = OLD). A full-barrier
+   (sequentially-consistent) RMW via mp:cas over the (unsigned-byte 64) ATOMIC-CELL-VALUE slot
+   (Clasp lowers a known struct-slot place through core:acas — unlike a raw foreign cell, which
+   has no atomic expander, ADR 0013). Returns the previous value, matching the SAP sibling
+   CAS-SAP-U64's contract (ADR 0041)."
+  (mp:cas (atomic-cell-value cell) old new))
+(defun* atomic-incf (cell &optional (delta 1))
+    (function (atomic-cell &optional fixnum) (unsigned-byte 64))
+  "Atomically add DELTA (signed; default 1) to CELL's VALUE modulo 2^64 and return the NEW value.
+   A full-barrier (sequentially-consistent) RMW via mp:atomic-incf, which returns the NEW value on
+   Clasp (masked to 64 bits for the uniform (unsigned-byte 64) contract; matching the SAP sibling
+   ATOMIC-INCF-SAP-U64). A negative DELTA decrements (modular). (ADR 0041.)"
+  (declare (type fixnum delta))
+  (logand (mp:atomic-incf (atomic-cell-value cell) delta) #xFFFFFFFFFFFFFFFF))
 (defun* fence (&optional (kind :full))
     (function (&optional t) (values))
   "Real memory barrier (M1) via mp:fence. KIND maps to the C++11 memory order it expects."

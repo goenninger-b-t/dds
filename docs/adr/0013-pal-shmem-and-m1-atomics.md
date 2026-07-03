@@ -43,7 +43,11 @@ Introduce four SAP-targeted atomic primitives plus a real fence:
 
 The existing generic `cas` and `atomic-incf` stubs are **left in place** (no callers;
 removing them would be an API break per ADR 0002); `fence` signature is unchanged but its
-body becomes a real barrier instead of a no-op.
+body becomes a real barrier instead of a no-op. *(Update, WP-PAL-ATOMICS / ADR 0041: the generic
+`cas`/`atomic-incf` stubs are now CLOSED — implemented on both impls over a PAL `atomic-cell`
+struct, whose compile-time-known slot place the native RMW macros can target, which the runtime
+`place-fn` indirection this ADR describes could not. The SAP-targeted forms and the Clasp
+foreign-atomic gap below are unaffected.)*
 
 **Verified primitive mapping (probed facts):**
 

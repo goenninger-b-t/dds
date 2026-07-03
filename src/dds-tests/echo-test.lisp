@@ -328,6 +328,40 @@
            t)
       (dds.pal:free-static m))))
 
+(defun* run-pal-atomics-test ()
+    (function () (eql t))
+  "The generic PAL atomics (M0 stub CLOSED, ADR 0041) over an ATOMIC-CELL: single-thread
+   correctness of ATOMIC-INCF (returns the NEW value, signed delta) + CAS (returns the PREVIOUS
+   value, succeeds on match / fails on mismatch), then a CONCURRENCY proof that ATOMIC-INCF loses
+   no updates — N threads each ATOMIC-INCF a shared cell M times, asserting the final value is
+   exactly N*M. Runs on BOTH impls (unlike the SBCL-only SAP atomics): sb-ext:cas/atomic-incf on
+   SBCL, mp:cas/atomic-incf on Clasp, over the shared (unsigned-byte 64) slot."
+  ;; (a) atomic-incf: returns the NEW value; signed delta decrements
+  (let ((c (dds.pal:make-atomic-cell)))
+    (%check :ainc-5   (= 5 (dds.pal:atomic-incf c 5)) "atomic-incf returns new value (0+5=5)")
+    (%check :ainc-3   (= 8 (dds.pal:atomic-incf c 3)) "atomic-incf accumulates (5+3=8)")
+    (%check :ainc-neg (= 6 (dds.pal:atomic-incf c -2)) "atomic-incf signed delta decrements (8-2=6)")
+    (%check :ainc-1   (= 7 (dds.pal:atomic-incf c)) "atomic-incf default delta is 1 (6+1=7)")
+    (%check :ainc-val (= 7 (dds.pal:atomic-cell-value c)) "atomic-cell-value reads the live value"))
+  ;; (b) cas: returns the PREVIOUS value; succeeds on match, no-op on mismatch
+  (let ((c (dds.pal:make-atomic-cell)))
+    (%check :cas-ok    (= 0 (dds.pal:cas c 0 8)) "cas match returns previous value (0)")
+    (%check :cas-set   (= 8 (dds.pal:atomic-cell-value c)) "cas match stored new")
+    (%check :cas-swap  (= 8 (dds.pal:cas c 8 100)) "cas match returns previous value (8)")
+    (%check :cas-set2  (= 100 (dds.pal:atomic-cell-value c)) "cas match stored new (100)")
+    (%check :cas-miss  (= 100 (dds.pal:cas c 8 200)) "cas mismatch returns current value (100)")
+    (%check :cas-nochg (= 100 (dds.pal:atomic-cell-value c)) "cas mismatch performed no write"))
+  ;; (c) concurrency: N threads * M atomic-incf each == N*M (no lost updates = atomicity)
+  (let* ((c (dds.pal:make-atomic-cell)) (n 8) (m 100000)
+         (threads (loop repeat n
+                        collect (dds.pal:spawn
+                                 (lambda () (dotimes (i m) (dds.pal:atomic-incf c)))
+                                 :name "pal-atomics-stress"))))
+    (dolist (th threads) (dds.pal:join th))
+    (%check :ainc-concurrent (= (* n m) (dds.pal:atomic-cell-value c))
+            "N threads * M atomic-incf each must sum to exactly N*M (no lost updates)"))
+  t)
+
 (defun* run-sap-ref-test ()
     (function () (eql t))
   "WP-FLATDATA-ZC-LOAN Task A1 (FR-PF-3/4, R6 — NOT cleared for ship, see ADR 0017): the PAL
@@ -2624,6 +2658,7 @@
                  ("pal-fence"                . run-pal-fence-test)
                  ("pal-signal-handler"       . run-pal-signal-handler-test)
                  ("pal-sap-atomics"          . run-pal-sap-atomics-test)
+                 ("pal-atomics"              . run-pal-atomics-test)
                  ("pal-sap-ref"              . run-sap-ref-test)
                  ("pal-shm"                  . run-pal-shm-test)
                  ("pal-pshared"              . run-pal-pshared-test)

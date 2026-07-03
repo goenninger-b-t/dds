@@ -268,9 +268,14 @@ it is left as-is). The hook is registered through a new **portable PAL seam** `d
 + the cipher) and proves the hook repopulates them and that a seal/open through the re-resolved pointers is
 byte-identical to the pre-restart output (fail-closed on tamper). Wire + KAT/corpora unchanged.
 
-**(e) M0 atomics stubs.** `dds.pal:cas` / `atomic-incf` are unimplemented (they error) on both impls, so the
-cache-change send-refcount uses the writer lock (contract §4 sanctions the existing per-cache lock). Revisit the
-refcount to lock-free CAS when the PAL atomics land.
+**(e) M0 atomics stubs. — RESOLVED (WP-PAL-ATOMICS, ADR 0041).** `dds.pal:cas` / `atomic-incf` are now
+implemented on both impls over a PAL `atomic-cell` (SBCL `sb-ext:`, Clasp `mp:`; concurrency-proven). The
+revisit was made an *informed* decision: the cache-change send-refcount **stays writer-lock-guarded** —
+every refcount access site already holds the writer lock for other reasons (the unsent-read / cache-lookup
+on acquire, the pool-release on the ref drop), so lock-free would yield **zero** contention win while
+introducing a releasable-check-vs-acquire TOCTOU (the refcount is one field of a `{refcount, evicted,
+pooled-buffer, pool-freelist, unsent-base}` invariant mutated as a unit). The atomics land as a tested API
+for a future genuinely-lock-free consumer. See ADR 0041 for the full assessment.
 
 **(f) `open-into` CTX_new-NULL OOM path (T1b-ii, Minor).** On the `EVP_CIPHER_CTX_new()` → NULL OOM early path,
 `open-into` leaves the staged **public ciphertext** (NOT plaintext → no confidentiality leak) un-wiped in `pt-out`,

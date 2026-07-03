@@ -118,12 +118,16 @@ per-impl bodies live in `pal-<impl>.lisp`.
 
 | Symbol | Kind | Description |
 |---|---|---|
-| `dds.pal:cas` | function | `(place-fn old new)` — generic place-based atomic compare-and-swap. Still a stub (signals `pal-unimplemented`); it has no callers — the SHMEM ring uses the SAP-targeted forms below. The generic stub is kept (removing it would break the frozen contract, ADR 0002). |
-| `dds.pal:atomic-incf` | function | `(place-fn &optional delta)` — generic place-based atomic increment. Still a stub (signals `pal-unimplemented`), no callers; superseded by the SAP-targeted form below. |
+| `dds.pal:atomic-cell` | struct/type | A PAL atomic counter cell: a single `(unsigned-byte 64)` `value` slot that `cas`/`atomic-incf` operate on atomically. The **concrete place** the generic atomics needed (ADR 0041): the native RMW primitives are place-form macros that must see a compile-time-known place, so the old runtime `place-fn` indirection could not be lowered to a hardware atomic; a first-class cell whose fixed slot they target exposes them as ordinary functions. A single `(unsigned-byte 64)` slot is the one representation both impls accept for BOTH ops (probed). |
+| `dds.pal:make-atomic-cell` | function | `(&key value)` — construct an `atomic-cell` (`value` defaults 0). |
+| `dds.pal:atomic-cell-value` | function | `(cell)` — read the live value; a **plain (relaxed) load** (use `cas`/`atomic-incf` for an atomic RMW, `fence` for standalone ordering). |
+| `dds.pal:cas` | function | `(cell old new)` — **generic compare-and-swap** (M0 stub CLOSED, ADR 0041): if `cell`'s value = `old` store `new`; returns the PREVIOUS value either way (succeeded iff the return is = `old`). Full-barrier (sequentially-consistent) RMW: SBCL `sb-ext:cas`, Clasp `mp:cas` over the `(unsigned-byte 64)` slot. Returns the previous value, matching `cas-sap-u64`. Runs on **both impls** (unlike the SAP forms). |
+| `dds.pal:atomic-incf` | function | `(cell &optional delta)` — **generic fetch-add** (M0 stub CLOSED, ADR 0041): atomically add signed `delta` (default 1) modulo 2^64; returns the NEW value (a negative `delta` decrements). SBCL `sb-ext:atomic-incf` (returns old, normalized to new here), Clasp `mp:atomic-incf` (returns new). Matches `atomic-incf-sap-u64`. Runs on **both impls**. |
 | `dds.pal:fence` | function | `(&optional kind)` — **real memory barrier (M1):** `:acquire` = load barrier, `:release` = store barrier, `:full` = full barrier. SBCL maps to `sb-thread:barrier`; the SHMEM ring uses it for the release/acquire publish/consume of lane cursors and the full StoreLoad fence of the conditional-wakeup handshake. |
 
 **SAP-targeted 64-bit atomics (M1 fast path, ADR 0013)** — the SHMEM ring needs true hardware atomics on a
-raw foreign 64-bit cell addressed by `(sap, byte-offset)`, which the generic `place-fn` stubs cannot lower.
+raw foreign 64-bit cell addressed by `(sap, byte-offset)`, which the generic `atomic-cell` ops (a Lisp
+struct slot, not a foreign cell) do not cover.
 
 | Symbol | Kind | Description |
 |---|---|---|
