@@ -92,8 +92,14 @@
                  as the requester's challenge1 / replier's challenge2 — our precommitted handshake challenge a
                  full peer (RTI Connext) binds to byte-for-byte (§8.7.2.4/§8.7.2.5). NIL for a non-secured remote.
    REMOTE-FUTURE-CHALLENGE: the remote's §8.7.2.3 future_challenge (32 octets), parsed from ITS
-                 AuthRequestMessageToken; NIL until received. When non-NIL our replier verifies the request's
-                 challenge1 == it, and our requester verifies the reply's challenge2 == it (§8.7.2.5, fail-closed).
+                 AuthRequestMessageToken; NIL until received, then LATCHED first-write-wins (a later CONFLICTING
+                 auth_request is IGNORED — the AuthRequestMessageToken rides the UNAUTHENTICATED PSM channel, so a
+                 forged one could poison this; a legit peer's nonce is stable across retransmits, so latching never
+                 rejects a legit update). When present AND equal to the handshake challenge our replier/requester
+                 binds it (§8.7.2.5 defense-in-depth); a MISMATCH (a poisoned/forged nonce) DOWNGRADES to Sign-only
+                 rather than hard-REJECT (%am-effective-expected-challenge), so a forged auth_request cannot
+                 false-REJECT a legitimate peer (an availability DoS) — the §8.7 cert-chain + Sign gate still
+                 decides, never a false-ACCEPT.
                  §8.7.2.3-optional: a peer that sends none (Fast DDS) leaves this NIL -> the check is SKIPPED
                  (absence must not false-reject a conformant peer).
    (The KEYX KX-KEY / REMOTE-KM / LOCAL-KM / LOCAL-SENT-P / PENDING-CT slots are RETIRED in T8: the §9.5.2
@@ -403,6 +409,36 @@
   (let ((c (%am-token-class token-octets)))
     (dds.security::%class-id-role-match-p c dds.security::+handshake-request-class-id+)))
 
+(defun* %am-effective-expected-challenge (stored token-octets prop-name prefix)
+    (function ((or null (simple-array (unsigned-byte 8) (32)))
+               (simple-array (unsigned-byte 8) (*)) string (simple-array (unsigned-byte 8) (12)))
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "The §8.7.2.3 challenge-binding availability hardening (fail-closed DoS guard): decide the EXPECTED-CHALLENGE
+   to feed the strict handshake API for the incoming token, given the LATCHED remote future_challenge STORED
+   (the AuthRequestMessageToken nonce) and the binding property PROP-NAME (+prop-challenge1+ for a replier
+   verifying a Request, +prop-challenge2+ for a requester verifying a Reply). Returns:
+     STORED — when the token's PROP-NAME challenge EQUALS the stored nonce: the §8.7.2.5 binding is ENFORCED
+              (the strict API re-verifies it; a positive freshness proof, defense-in-depth kept);
+     NIL    — when STORED is NIL (no auth_request seen; §8.7.2.3-optional absence-tolerance, unchanged), OR the
+              token carries no such challenge, OR the token's challenge MISMATCHES the stored nonce. A MISMATCH
+              DOWNGRADES the binding to Sign-only (logs a possible forged-auth_request event) rather than letting
+              the strict API hard-REJECT — since a forged auth_request on the unauthenticated PSM channel could
+              poison STORED and thereby false-REJECT a LEGITIMATE peer (an availability DoS, ADR 0040 carry #2).
+   This NEVER causes a false-ACCEPT: the downgrade only ever SKIPS the byte-exact nonce cross-binding (the same
+   absence path a spec-literal Fast DDS peer already takes); the §8.7 cert-chain + Sign1/Sign2 possession proof
+   (and the handshake's own un-poisonable challenge ECHO checks) remain FULLY enforced by the API and decide the
+   verdict. The strict handshake-API binding is UNCHANGED (still fail-closed on a supplied mismatch — the
+   run-auth-challenge-binding-test asserts it); this hardening governs only WHICH nonce the manager trusts to
+   supply from the unauthenticated channel."
+  (when (null stored) (return-from %am-effective-expected-challenge nil))
+  (let* ((tok  (dds.security::%parse-token token-octets))
+         (chal (and tok (dds.security::%token-get tok prop-name))))
+    (cond
+      ((null chal) nil)
+      ((equalp chal stored) stored)
+      (t (%am-log prefix "challenge-binding mismatch vs latched future_challenge -> downgrade to Sign-only (possible forged auth_request DoS)")
+         nil))))
+
 (defun* %am-drive-handshake (ms node prefix ar token-octets in-guid in-sn)
     (function (auth-manager-state dds.disc:disc-node (simple-array (unsigned-byte 8) (12))
                auth-remote (simple-array (unsigned-byte 8) (*))
@@ -435,9 +471,11 @@
                     token-octets suite
                     ;; §9.3.2.1 c.perm: our signed Permissions credential so the requester's validate_remote_permissions accepts us (T6)
                     (auth-manager-state-perm-credential ms)
-                    ;; §8.7.2.5: verify the request's challenge1 == the requester's precommitted future_challenge
-                    ;; (NIL when no auth_request received -> skip, §8.7.2.3-optional); challenge2 = OUR future_challenge (§8.7.2.4)
-                    (auth-remote-remote-future-challenge ar)
+                    ;; §8.7.2.5: bind the request's challenge1 to the requester's LATCHED future_challenge WHEN they
+                    ;; match; a mismatch (poisoned/forged auth_request) DOWNGRADES to Sign-only, never a hard-REJECT
+                    ;; (%am-effective-expected-challenge); NIL when no auth_request (§8.7.2.3-optional). challenge2 = OUR nonce.
+                    (%am-effective-expected-challenge (auth-remote-remote-future-challenge ar)
+                                                      token-octets dds.security::+prop-challenge1+ prefix)
                     (auth-remote-future-challenge ar))
                  (cond
                    ((and reply-octets reply-handle)
@@ -472,9 +510,15 @@
                                          tclass))
                  (multiple-value-bind (out status)
                      (dds.security:process-handshake (auth-remote-handle ar) token-octets
-                                                     ;; §8.7.2.5: bind the reply's challenge2 to the replier's
-                                                     ;; precommitted future_challenge (NIL -> skip, §8.7.2.3-optional)
-                                                     (auth-remote-remote-future-challenge ar))
+                                                     ;; §8.7.2.5: the requester binds the reply's challenge2 to the
+                                                     ;; replier's LATCHED future_challenge WHEN they match; a mismatch
+                                                     ;; DOWNGRADES to Sign-only (not a hard-REJECT). NIL for the replier's
+                                                     ;; :awaiting-final step (the API ignores expected-challenge2 there).
+                                                     (if (eq (auth-remote-role ar) :requester)
+                                                         (%am-effective-expected-challenge
+                                                          (auth-remote-remote-future-challenge ar)
+                                                          token-octets dds.security::+prop-challenge2+ prefix)
+                                                         nil))
                    (case status
                      (:rejected
                       (setf (auth-remote-state ar) :rejected)
@@ -508,9 +552,13 @@
    challenge1 to it and our requester binds the reply's challenge2 to it (§8.7.2.5). Version-tolerant class_id
    match (RTI emits 1.2, ours 1.0). Accepts only a 32-octet future_challenge value. FAIL-CLOSED: a malformed
    token, a wrong class, a missing/short nonce, or an unknown remote is a SILENT no-op (never crashes the
-   receiver thread, never installs anything). Absence/failure just leaves REMOTE-FUTURE-CHALLENGE NIL, which
-   makes the §8.7.2.5 binding checks SKIP (spec-optional) — it never false-accepts (a WRONG stored nonce would
-   make the handshake FAIL the byte-exact check, so only a genuine peer nonce ever passes)."
+   receiver thread, never installs anything). The nonce is LATCHED first-write-wins per remote: the FIRST
+   well-formed auth_request stores it; a later one carrying the SAME nonce is a no-op (legit retransmit); a
+   later one carrying a DIFFERENT nonce is IGNORED (the PSM channel is unauthenticated — a forged auth_request
+   must not overwrite an already-latched nonce, closing the forged-LATER-overwrite false-REJECT DoS variant).
+   Absence just leaves REMOTE-FUTURE-CHALLENGE NIL, so the §8.7.2.5 binding checks SKIP (spec-optional); a
+   poisoned (forged-FIRST) nonce never false-ACCEPTS — a mismatch DOWNGRADES to Sign-only at the bind site
+   (%am-effective-expected-challenge), and the §8.7 cert-chain + Sign gate still decides."
   (when dh-list
     (let ((tok (dds.security:dataholder->handshake-token (car dh-list))))
       (when (and tok
@@ -521,10 +569,20 @@
             (dds.pal:with-lock ((auth-manager-state-lock ms))
               (let ((ar (gethash src-prefix (dds.disc:disc-node-auth-state node))))
                 (when ar
-                  (let ((stored (make-array 32 :element-type '(unsigned-byte 8))))
-                    (replace stored nonce :end2 32)
-                    (setf (auth-remote-remote-future-challenge ar) stored))
-                  (%am-log src-prefix "received peer AuthRequestMessageToken (future_challenge stored)")))))))))
+                  (let ((existing (auth-remote-remote-future-challenge ar)))
+                    (cond
+                      ((null existing)
+                       ;; first-write-wins latch: the first well-formed auth_request stores the nonce
+                       (let ((stored (make-array 32 :element-type '(unsigned-byte 8))))
+                         (replace stored nonce :end2 32)
+                         (setf (auth-remote-remote-future-challenge ar) stored))
+                       (%am-log src-prefix "peer AuthRequestMessageToken: future_challenge latched"))
+                      ((equalp existing nonce)
+                       ;; legit retransmit (a peer's nonce is stable) -> no-op
+                       (%am-log src-prefix "peer AuthRequestMessageToken: retransmit (future_challenge unchanged)"))
+                      (t
+                       ;; a DIFFERENT nonce after latch = a possible forged auth_request on the unauthenticated PSM -> IGNORE
+                       (%am-log src-prefix "peer AuthRequestMessageToken: IGNORED conflicting future_challenge (already latched; possible forged auth_request)"))))))))))))
   t)
 
 (defun* %am-on-stateless-message (p node src-prefix envelope-octets)

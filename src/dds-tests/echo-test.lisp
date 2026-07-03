@@ -3020,6 +3020,7 @@
                  ("auth-handshake-rsa"          . run-auth-handshake-rsa-test)
                  ("auth-negatives"             . run-auth-negatives-test)
                  ("auth-challenge-binding"     . run-auth-challenge-binding-test)
+                 ("auth-forged-request-hardening" . run-auth-forged-request-hardening-test)
                  ("auth-token-corpus"          . run-auth-token-corpus-test)
                  ("auth-token-fuzz"            . run-auth-token-fuzz-test)
                  ("auth-spdp-identity-token"   . run-auth-spdp-identity-token-test)

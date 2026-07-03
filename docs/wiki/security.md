@@ -2079,3 +2079,32 @@ emitted codec changed). ours↔Fast-DDS: GOV=secure protected user DATA still fl
 handshake still reaches `:keyed` (Fast DDS silently discards our unknown `dds.sec.auth_request`, verified
 against `SecurityManager.cpp`), byte-identical to the pre-WP baseline. The live decode is the oracle (tshark
 cannot dissect the macOS `lo0` NULL link layer). Captures: `interop/security-connext/captures/`.
+
+### Slice-5b follow-ons (WP-SLICE5B-FOLLOWONS B1/B2/B3, 2026-07-03; ADR 0040 / 0037)
+
+- **B1 — GOV=none reverse now LIVE-covered.** `run-connext-interop.sh none 20` connext2ours (Connext full
+  publisher → ours=sub) reports `discovered=1 matched=1 samples=38 decoded=38 RESULT: PASS`, decoding Connext's
+  GOV=none (plain, authenticated+authorized) `HelloWorld` (`"Hello world from Connext"`), state `AUTHENTICATED`.
+  `ever-keyed=NIL` is CORRECT at GOV=none: the endpoint match fires at `:authenticated` because
+  `governance-any-protection-p` is NIL and Connext exchanges no ParticipantCryptoToken (§8.4.2.9 — keying is a
+  precondition only for PROTECTED endpoints). No GOV=none-specific reverse divergence; no reconciliation needed.
+  GOV=none is now complete both directions (ADR 0040 carry #1 resolved).
+- **B2 — forged-`auth_request` availability hardening.** The `future_challenge` binding rides the UNAUTHENTICATED
+  ParticipantStatelessMessage channel, so a forged `dds.sec.auth_request` could poison the stored nonce and
+  false-REJECT a legitimate peer (an availability DoS). Two fail-closed guards in `src/dds-dcps/auth-manager.lisp`
+  close it with NO false-ACCEPT: (a) the stored remote `future_challenge` is **LATCHED first-write-wins** per
+  remote (`%am-store-remote-future-challenge`) — a legit peer's nonce is stable across retransmits, and a later
+  CONFLICTING auth_request is IGNORED (closes the forged-LATER-overwrite variant); (b) at the bind site
+  (`%am-effective-expected-challenge`) a stored nonce that MISMATCHES the handshake challenge **DOWNGRADES to
+  Sign-only** instead of hard-REJECT (closes the forged-FIRST variant), so a forged auth_request never
+  false-rejects a legit peer. The strict handshake-API binding is UNCHANGED (still fail-closed on a supplied
+  mismatch); the un-poisonable challenge ECHO checks + §8.7 cert-chain + Sign1/Sign2 still fully decide, so the
+  downgrade only ever falls back to the same absence path a spec-literal Fast DDS peer already takes — never a
+  false-ACCEPT. Proven by `run-auth-forged-request-hardening-test` (both impls): inject a spurious auth_request
+  then a legit handshake → STILL `:authenticated`; the strict API with the poisoned nonce still rejects. The
+  live ours↔Connext GOV=secure both-directions handshake still completes after the change (ADR 0040 carry #2).
+- **B3 — ADR-0037 residual carries status-reconciled vs Connext.** See the reconciliation table in ADR 0037:
+  live-Connext, Zero-Copy×`rtps_protection` SHMEM cleartext, KeyMaterial master slots → foreign/static, and the
+  zero-alloc-AEAD send path are RESOLVED; builtin-endpoint keying vs Connext is VALIDATED by the live interop;
+  the 0xC2→0xC7 DRY, the secure-builtin-ACKNACK unit count, the SIGN-tier GMAC AAD span (live gate was
+  all-ENCRYPT), and a handful of hardening items remain OPEN follow-ons (none Connext-blocking).

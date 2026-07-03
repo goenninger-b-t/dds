@@ -79,6 +79,7 @@
            #:run-auth-handshake-rsa-test
            #:run-auth-negatives-test
            #:run-auth-challenge-binding-test
+           #:run-auth-forged-request-hardening-test
            #:run-auth-token-corpus-test
            #:run-auth-token-fuzz-test
            #:run-auth-spdp-identity-token-test

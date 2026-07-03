@@ -190,6 +190,27 @@ asserts Connext interop.
 
 ---
 
+## Residual-carry status reconciliation vs Connext (WP-SLICE5B-FOLLOWONS B3, 2026-07-03)
+
+Slice 5b (ADR 0040) reconciled the live-Connext half of the P6 exit gate; several carries above were resolved by
+it or by subsequent hardening WPs. Status of each Fast-DDS-era carry against the current tree:
+
+| Carry | Status vs Connext | Evidence |
+|---|---|---|
+| **1 — 0xC2→0xC7 pairing computed in three places (DRY)** | **OPEN — vendor-agnostic, NOT a Connext divergence** | Still open-coded in `dds-disc/volatile-secure.lisp`, `dds-disc/secure-sedp.lisp`, `dds-dcps/crypto-manager.lisp`. A code-quality DRY refactor, not an interop reconciliation; the three derivations agree, and a shared helper would have to sit below both packages (`dds-disc` must not import `dds-dcps`), so it is a deliberate follow-on, not a quick close. The live Connext GOV=secure interop exercised all three sites correctly (protected metatraffic both directions). |
+| **2 — no dedicated our-to-our test counts secure-builtin ACKNACKs** | **OPEN — vendor-agnostic test-hardening** | The secure-builtin reliable NACK-pull is now driven by TWO live cross-vendor peers (Fast DDS AND Connext: the Slice-5b reverse direction needed reliable secure-SEDP under GOV=secure) plus the e2e our-to-our test, but a dedicated unit test asserting an ACKNACK COUNT on the secure-builtin wire is still a follow-on. Not Connext-specific. |
+| **3 — SIGN-tier inter-submessage alignment + GMAC AAD byte-span** | **OPEN vs Connext (live gate was all-ENCRYPT); our-to-our COVERED** | ADR 0040 divergence #7 set the `governance-sign` `rtps_protection` ENCRYPT→SIGN and updated its OUR-TO-OUR test (`run-secure-discovery-protected-sign-test` — the topic inside a SIGN SRTPS_PREFIX bracket). The LIVE Connext DoD gate ran all-ENCRYPT (GOV=secure), so the SIGN GMAC AAD span was NOT exercised LIVE vs Connext. Already tracked in ADR 0040 carry #5. |
+| **4 — live RTI Connext-Security secure discovery (Slice 5b)** | **RESOLVED** | ADR 0040 (WP-DDS-SECURITY-CONNEXT-INTEROP, LANDED 2026-07-02): protected user DATA both directions ours↔live RTI Connext 7.3.1 (GOV=secure, all-ENCRYPT); the §8.7.2.3 AuthRequestMessageToken sub-protocol + §7.4.3.3 monotonic PSM seq unblocked the full-participant handshake. **The P6 exit gate is COMPLETE (both halves).** B1 (this WP) additionally live-covers GOV=none reverse (ADR 0040 carry #1 resolved). |
+| **5a — zero-alloc into-buffer AEAD on the data path** | **RESOLVED (send path) — mem-covered** | ADR 0038/0039 (WP-DDS-SECURITY-ZEROALLOC-AEAD) landed the zero-alloc submessage `metadata_protection` + whole-RTPS `rtps_protection` tiers; `make mem` now COVERS the dds-disc path with the secured SEND arms at 0.0000 B/sample (`meta-send`/`rtps-send`/`rtps-recv` delta 0.0000). The `meta-recv` loan-wrapper residual (~176 B) remains a documented follow-on. |
+| **5b — KeyMaterial GC-heap → foreign/static** | **PARTIALLY RESOLVED** | Commit `6beb08b` (WP-SECURITY-KEYMATERIAL-HARDEN) moved the KeyMaterial MASTER secrets to foreign/static memory + zeroize-on-teardown (ADR-0034 Carry-4 resolved for the master slots). Non-master/session slots remain a follow-on. |
+| **5c — Zero-Copy × `rtps_protection` SHMEM cleartext** | **RESOLVED** | Commit `0308996` (WP-SECURITY-ZC-SHMEM-CLEARTEXT): no cleartext user payload in SHMEM for a secured writer (ADR-0036 Carry-10 resolved). |
+| **5d — builtin-endpoint share-vs-own-key vs Connext** | **VALIDATED by the Slice-5b live interop** | Protected metatraffic (SRTPS + secure-SEDP + secure-PM) flowed both directions ours↔Connext under GOV=secure, so our builtin-endpoint keying interoperates with Connext. The residual benign `DecryptFinal` on participant-metatraffic EntityId `0x000001C1` is ADR 0040 carry #4 (not a keying mismatch). |
+| **5e — per-topic `metadata_protection` selective / `pvms-bootstrap-kms` peer-loss pruning / `%dn-normalize` RFC2253 edges / `%on-secure-builtin` inner-writerId cross-check** | **OPEN — hardening follow-ons, not forced by any live peer** | None is on the P6 exit-gate path; each is a defense-in-depth / resource-cleanup / edge-case follow-on (tracked in ADR 0040 carry #5). |
+
+**Net:** carries 4, 5c RESOLVED; 5a, 5b, 5d substantially resolved/validated by Slice 5b + the zero-alloc/keymaterial WPs; carries 1, 2, 3, 5e remain OPEN follow-ons (none Connext-blocking, none on the exit-gate path). No new large reconciliation was needed vs Connext.
+
+---
+
 ## §M7 roadmap update
 
 | Slice | Description | Status |

@@ -1125,6 +1125,143 @@
         (dds.security:free-identity-handle id-a))))
   t)
 
+(defun* run-auth-forged-request-hardening-test ()
+    (function () t)
+  "WP-SLICE5B-FOLLOWONS B2 (ADR 0040 carry #2): the availability hardening against a FORGED §8.7.2.3
+   AuthRequestMessageToken on the UNAUTHENTICATED ParticipantStatelessMessage channel. A forged auth_request
+   can poison the stored remote future_challenge and thereby FALSE-REJECT a legitimate peer's §8.7 handshake
+   (an availability DoS). Two complementary fail-closed guards, neither a false-ACCEPT:
+     PART A — DOWNGRADE (%am-effective-expected-challenge): a stored nonce that MISMATCHES the handshake
+       challenge downgrades the §8.7.2.5 binding to Sign-only instead of hard-REJECT, so a poisoned nonce no
+       longer false-REJECTs the legit peer; a MATCH still enforces the binding; absence (NIL) still skips.
+     PART B — LATCH (%am-store-remote-future-challenge): the nonce is stored first-write-wins per remote, so a
+       later CONFLICTING (forged) auth_request cannot OVERWRITE it (a legit retransmit is a no-op).
+   Assertions:
+     (A1) absence: stored NIL -> effective expected-challenge NIL (unchanged §8.7.2.3-optional path).
+     (A2) match:   stored == request challenge1 -> effective == stored (binding ENFORCED, defense-in-depth kept).
+     (A3) downgrade: stored != request challenge1 (poisoned) -> effective NIL (the false-REJECT is removed).
+     (A4) DoS closed: begin-handshake-reply with the DOWNGRADED (NIL) expected-challenge1 ACCEPTS the legit
+          request AND the handshake completes to :authenticated (the legit peer is NOT false-rejected).
+     (A5) the DoS being fixed: begin-handshake-reply with the POISONED nonce as the STRICT expected-challenge1
+          REJECTS (values NIL NIL) — the strict handshake API is UNCHANGED; the manager downgrade is what saves
+          the legit peer (proving the hardening is non-trivial, not a pre-existing tolerance).
+     (B1) latch: first auth_request stores N1; a later CONFLICTING auth_request (N2) is IGNORED (stays N1); a
+          retransmit of N1 is a no-op (stays N1).
+   No trust gate is weakened: A2/A5 show the binding still fires on a match and the strict API still rejects a
+   supplied mismatch; the downgrade only ever falls back to the cert-chain+Sign path a Fast DDS peer already
+   takes. Requires OpenSSL >= 3.5; skips gracefully if absent. Both SBCL and Clasp must pass."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [auth-forged-request-hardening] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-auth-forged-request-hardening-test t)))
+  (let* ((ca-pem    (%read-fixture-pem "ca/ca-cert.pem"))
+         (ec-cert-a (%read-fixture-pem "participant_ec/identity_cert.pem"))
+         (ec-key-a  (%read-fixture-pem "participant_ec/identity_key.pem"))
+         (ec-cert-b (%read-fixture-pem "participant_ec_b/identity_cert.pem"))
+         (ec-key-b  (%read-fixture-pem "participant_ec_b/identity_key.pem"))
+         (guid-a    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12 0 2 1 #xC3)))
+         (guid-b    (make-array 16 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(200 2 3 4 5 6 7 8 9 10 11 12 0 2 1 #xC3))))
+    (multiple-value-bind (id-a reason-a)
+        (dds.security:validate-local-identity ca-pem ec-cert-a ec-key-a guid-a)
+      (%check :fr-id-a (not (null id-a)) (format nil "validate-local-identity A: ~a" reason-a))
+      (unless id-a (return-from run-auth-forged-request-hardening-test t))
+      (unwind-protect
+           (multiple-value-bind (id-b reason-b)
+               (dds.security:validate-local-identity ca-pem ec-cert-b ec-key-b guid-b)
+             (%check :fr-id-b (not (null id-b)) (format nil "validate-local-identity B: ~a" reason-b))
+             (unless id-b (return-from run-auth-forged-request-hardening-test t))
+             (unwind-protect
+                  (let ((fc-real   (dds.security:generate-future-challenge))
+                        (fc-forged (dds.security:generate-future-challenge))
+                        (fc2       (dds.security:generate-future-challenge))
+                        (prefix    (make-array 12 :element-type '(unsigned-byte 8)
+                                               :initial-contents '(1 2 3 4 5 6 7 8 9 10 11 12))))
+                    ;; --- PART A: the DOWNGRADE (a legit request whose challenge1 = fc-real) ---
+                    (multiple-value-bind (req-tok req-hdl)
+                        (dds.security:begin-handshake-request
+                         id-a id-b dds.security:+suite-ecdh+
+                         (make-array 0 :element-type '(unsigned-byte 8)) fc-real)
+                      (unwind-protect
+                           (progn
+                             (%check :fr-a1-absence
+                                     (null (dds.dcps::%am-effective-expected-challenge
+                                            nil req-tok dds.security::+prop-challenge1+ prefix))
+                                     "stored NIL -> NIL effective expected-challenge (absence path unchanged)")
+                             (%check :fr-a2-match
+                                     (let ((eff (dds.dcps::%am-effective-expected-challenge
+                                                 fc-real req-tok dds.security::+prop-challenge1+ prefix)))
+                                       (and eff (equalp eff fc-real)))
+                                     "matching stored nonce must be ENFORCED (effective == stored)")
+                             (%check :fr-a3-downgrade
+                                     (null (dds.dcps::%am-effective-expected-challenge
+                                            fc-forged req-tok dds.security::+prop-challenge1+ prefix))
+                                     "poisoned (mismatching) stored nonce must DOWNGRADE to NIL (no false-REJECT)")
+                             ;; (A4) DoS closed: the downgraded (NIL) expected-challenge1 ACCEPTS + authenticates
+                             (multiple-value-bind (rep-tok rep-hdl)
+                                 (dds.security:begin-handshake-reply
+                                  id-b id-a req-tok dds.security:+suite-ecdh+
+                                  (make-array 0 :element-type '(unsigned-byte 8))
+                                  (dds.dcps::%am-effective-expected-challenge
+                                   fc-forged req-tok dds.security::+prop-challenge1+ prefix)
+                                  fc2)
+                               (%check :fr-a4-accept (and rep-tok rep-hdl)
+                                       "downgraded reply must ACCEPT the legit request despite the poisoned nonce")
+                               (unwind-protect
+                                    (when rep-tok
+                                      (multiple-value-bind (final-tok status)
+                                          (dds.security:process-handshake req-hdl rep-tok fc2)
+                                        (%check :fr-a4-continue (eq status :continue)
+                                                (format nil "requester step status ~a" status))
+                                        (when final-tok
+                                          (let ((fs (nth-value 1 (dds.security:process-handshake
+                                                                  rep-hdl final-tok))))
+                                            (%check :fr-a4-authenticated (eq fs :authenticated)
+                                                    (format nil "legit peer must still reach :authenticated (~a)" fs))))))
+                                 (when rep-hdl (dds.security:free-handshake-handle rep-hdl))))
+                             ;; (A5) the DoS being fixed: strict API with the poisoned nonce REJECTS (values NIL NIL)
+                             (multiple-value-bind (rep-tok-x rep-hdl-x)
+                                 (dds.security:begin-handshake-reply
+                                  id-b id-a req-tok dds.security:+suite-ecdh+
+                                  (make-array 0 :element-type '(unsigned-byte 8)) fc-forged fc2)
+                               (%check :fr-a5-strict-rejects (and (null rep-tok-x) (null rep-hdl-x))
+                                       "strict API with the poisoned nonce REJECTS (the DoS the downgrade prevents)")
+                               (when rep-hdl-x (dds.security:free-handshake-handle rep-hdl-x))))
+                        (dds.security:free-handshake-handle req-hdl)))
+                    ;; --- PART B: the LATCH (first-write-wins in %am-store-remote-future-challenge) ---
+                    (let ((p-b (dds.dcps:create-participant :domain (test-domain) :identity id-b)))
+                      (unwind-protect
+                           (let ((ms   (dds.dcps::dp-auth-state p-b))
+                                 (node (dds.dcps::dp-node p-b)))
+                            (setf (gethash prefix (dds.disc:disc-node-auth-state node))
+                                  (dds.dcps::%make-auth-remote))
+                            (flet ((store (nonce)
+                                     (dds.dcps::%am-store-remote-future-challenge
+                                      ms node prefix
+                                      (list (dds.security:handshake-token->dataholder
+                                             (dds.security::%make-handshake-token
+                                              :class-id dds.security:+auth-request-class-id+
+                                              :binary-props (list (cons dds.security:+prop-future-challenge+
+                                                                        nonce)))))))
+                                   (stored ()
+                                     (dds.dcps::auth-remote-remote-future-challenge
+                                      (gethash prefix (dds.disc:disc-node-auth-state node)))))
+                              (store fc-real)
+                              (%check :fr-b1-first (and (stored) (equalp (stored) fc-real))
+                                      "first auth_request must latch nonce N1 (fc-real)")
+                              (store fc-forged)
+                              (%check :fr-b1-latched (and (stored) (equalp (stored) fc-real))
+                                      "a later CONFLICTING auth_request must be IGNORED (N1 stays latched)")
+                              (store fc-real)
+                              (%check :fr-b1-retransmit (and (stored) (equalp (stored) fc-real))
+                                      "a retransmit of N1 must be a no-op (still N1)")))
+                        (dds.dcps:delete-participant p-b))))
+               (dds.security:free-identity-handle id-b)))
+        (dds.security:free-identity-handle id-a))))
+  t)
+
 (defun* run-auth-token-corpus-test ()
     (function () t)
   "T4 token self-consistency corpus for the internal handshake token format.
