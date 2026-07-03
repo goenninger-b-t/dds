@@ -2067,11 +2067,22 @@ DDS multipart/signed S/MIME container.
 New API from this work:
 - **`dds.security:permissions-grant-for (subject grants)`** — the single subject-binding site for local + remote
   permissions, matching by `%dn-equal` (OpenSSL-oneline vs RFC2253 serialization-insensitive; DDS-Security
-  §9.4.1.3), so cross-vendor DN forms interoperate without false-REJECT. `%dn-normalize` is RFC2253 §2-3 aware:
-  it splits RDNs only on UNESCAPED separators, un-escapes values (`\c` + `\XX` hex) to canonical form, upcases the
-  attribute TYPE (case-insensitive) while keeping the VALUE case-sensitive, and FAIL-CLOSES to `:malformed` on any
-  malformed RDN (no unescaped `=`, empty type, bad escape) — an ambiguous/malformed DN NEVER authorizes, not even
-  against an identical malformed grant (no false-ACCEPT). Regression-covered by `run-security-dn-match-test`.
+  §9.4.1.3), so cross-vendor DN forms interoperate without false-REJECT. `%dn-normalize` is RFC2253 §2.1-2.4
+  aware: it splits RDNs only on UNESCAPED separators, un-escapes values (`\c` + `\XX` hex) to canonical form,
+  upcases the attribute TYPE (case-insensitive §2.3) while keeping the VALUE case-sensitive, and FAIL-CLOSES to
+  `:malformed` on any malformed RDN/AVA (no unescaped `=`, empty type, empty AVA, bad escape) — an
+  ambiguous/malformed DN NEVER authorizes, not even against an identical malformed grant (no false-ACCEPT). It
+  recovers the DN's canonical RDN **SEQUENCE** — order is PINNED, never sorted (direction pinning, §2.1: oneline
+  prints the sequence forward, RFC2253 prints it reversed, so both forms of one DN map to the same sequence). RDN
+  order is SIGNIFICANT (X.501), so a genuine RDN reorder (`CN=a,O=b` vs `O=b,CN=a`) correctly does NOT match — the
+  earlier sort-based normalization collapsed such distinct DNs into one token list (a latent identity-confusion /
+  false-ACCEPT, now closed). The canonical form is **STRUCTURAL**: a list of RDNs in sequence order, each RDN the
+  sorted list of its canonical `TYPE=value` AVA strings (multi-valued `+`-joined AVAs, §2.2 — the AVA order within
+  an RDN is a SET, not significant, so it is sorted). The AVA boundary is never re-joined into one string: an
+  un-escaped value may contain literal `+`/`=`, so a joined form is non-injective (`CN=x\+O=y` would forge
+  `CN=x+O=y` — a false-ACCEPT); `%dn-equal` compares RDN-wise with per-RDN element-wise AVA comparison. Trimming
+  removes UNESCAPED spaces only — a `\ `-escaped trailing space is value data (§2.4) and survives (equal to its
+  `\20` hex form, distinct from the untrailed value). Regression-covered by `run-security-dn-match-test`.
 - **`dds.dcps:create-participant :port`** — bind+advertise a fixed metatraffic unicast port so a foreign peer
   can `initialPeers` us over loopback (the macOS multi-NIC cross-vendor reachability pattern).
 

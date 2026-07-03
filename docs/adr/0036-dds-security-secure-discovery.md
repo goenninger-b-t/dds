@@ -409,6 +409,26 @@ conformantly** (verified our-to-our, both impls green):
    false-ACCEPT). Test `run-security-dn-match-test` (14 cases: ordering / oneline↔RFC2253 / type case-fold /
    whitespace / escaped-comma / hex-escape MATCH; wrong-value / value-case / escaped-vs-unescaped structure /
    subset / malformed NO-MATCH). Both impls; existing access-control tests green UNCHANGED.
+   **RESOLVED (residual "multi-valued DN fail-safe" + "RDN-reorder CA-validation") — WP-SECURITY-DN-RFC2253-EDGES
+   (2026-07-03, RFC2253 §2.1/§2.2).** Two edges closed: (a) the sort in `%dn-normalize` collapsed genuinely-
+   different RDN SEQUENCES (`CN=a,O=b` vs `O=b,CN=a`) into one token list — a latent identity-confusion / false-
+   ACCEPT. Replaced with direction-pinned sequences (NO sort of RDNs): oneline is forward, RFC2253 is reverse
+   (§2.1), so both forms of one DN recover the same canonical sequence while a true reorder no longer matches.
+   (b) multi-valued RDNs (`CN=a+SN=b`, §2.2) are now canonicalized as an unordered AVA SET (split on unescaped
+   `+`, sort the AVA strings), closing a false-REJECT of AVA-reordered peers. The canonical form is STRUCTURAL —
+   a list of RDNs in sequence order, each RDN the sorted LIST of its canonical `TYPE=value` AVA strings, compared
+   RDN-wise with per-RDN element-wise AVA comparison (`%dn-equal`) — never re-joined into one string: an
+   un-escaped value may contain literal `+`/`=`, so a joined form is non-injective and let a single-AVA value
+   forge a multi-AVA join (`CN=x\+O=y` vs `CN=x+O=y` — a false-ACCEPT, caught in adversarial review and closed
+   with both attack pairs as regressions). Trimming removes UNESCAPED spaces only (`%dn-trim-unescaped`): a
+   `\ `-escaped trailing space is value DATA (§2.4) — a plain trim stranded its `\` → spurious `:malformed` →
+   false-REJECT of a conformant DN (while the `\20` hex form worked). New `%dn-normalize-ava` /
+   `%dn-normalize-rdn` / `%dn-trim-unescaped` helpers (shared AVA path, DRY); `run-security-dn-match-test` grew
+   to 32 cases (12 positive incl. multi-valued order/cross-form/type-case/escaped-`\+`/escaped-trailing-space;
+   20 negative incl. same-serialization + oneline RDN reorder, reordered twins of the fixed pairs,
+   multi-valued-vs-single/two-RDN, the two join-forgery attack pairs, trailing-space-is-data, malformed
+   multi-valued). Two prior positive cases whose cross-form order was inconsistent under direction pinning were
+   re-DATA'd to denote the same sequence, with negative twins added. Both impls green.
 4. **S/MIME container + loopback reachability** — Fast DDS needs multipart/signed `text/plain` (`PKCS7_TEXT`,
    `Permissions.cpp:408`); added the MIME fixtures + `create-participant :port` + Fast DDS `initialPeers`
    (the macOS multi-NIC pattern).
@@ -506,8 +526,10 @@ work-package ledger:
    there is no new SAP-to-heap path). Migrating it to foreign/static buffers is the hardening follow-on.
 7. **PVMS bootstrap-KM table pruning.** `pvms-bootstrap-kms` is never pruned on peer-loss (safe-direction
    retention); prune via `remhash` on participant-lost / un-auth, like the SEDP matches.
-8. **`%dn-normalize` RFC2253 edge cases.** The DN normaliser is naive on escaped/quoted RFC2253 separators and
-   multi-valued RDNs; harden for the full cross-vendor DN grammar.
+8. **`%dn-normalize` RFC2253 edge cases.** ~~The DN normaliser is naive on escaped/quoted RFC2253 separators and
+   multi-valued RDNs; harden for the full cross-vendor DN grammar.~~ **RESOLVED — WP-SECURITY-DN-RFC2253-EDGES
+   (2026-07-03):** escaped separators handled since WP-SECURITY-CARRIES-BATCH; multi-valued RDNs (§2.2) + the
+   RDN-reorder identity-confusion (direction-pinned sequences, §2.1) closed here (see item 3 above).
 9. **The Slice-1 serialized-payload AAD divergence (the `data_protection` tier).** Slice-1's serialized-payload
    AAD is the 20-byte `SecureDataHeader`, where Fast DDS uses an EMPTY AAD for the payload tier — so the shipped
    Slice-1 data-protection is likely NOT Fast-DDS-interop on the payload tier. This pre-dates this slice and

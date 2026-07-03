@@ -1191,26 +1191,46 @@
 
 (defun* run-security-dn-match-test ()
     (function () t)
-  "ADR-0036 carry (DDS-Security 1.1 §9.4.1.3 subject-name binding; RFC2253 §2-3): the serialization-insensitive
-   X.509 DN match (%dn-equal / %dn-normalize) that binds a permissions grant to a peer cert's subject. Covers the
-   previously-untested edges — attribute ordering, oneline vs RFC2253 form, attribute-TYPE case-fold (types
-   case-insensitive, VALUES case-sensitive), whitespace, and RFC2253 `\\`-ESCAPING (an escaped separator is DATA,
-   not a boundary; `\\XX` hex). SECURITY (no false-ACCEPT): a wrong-value / wrong-case-value / different-RDN-count /
-   escaped-vs-unescaped-structure / MALFORMED DN must NOT match — an ambiguous or unparseable DN never authorizes,
-   not even against an identical unparseable grant."
+  "ADR-0036/0037 carry (DDS-Security 1.1 §9.4.1.3 subject-name binding; RFC2253 §2.1-2.4): the serialization-
+   insensitive X.509 DN match (%dn-equal / %dn-normalize) that binds a permissions grant to a peer cert's subject.
+   Covers oneline vs RFC2253 form (direction pinning §2.1 — oneline forward, RFC2253 reverse), attribute-TYPE
+   case-fold (types case-insensitive §2.3, VALUES case-sensitive), whitespace, RFC2253 `\\`-ESCAPING (an escaped
+   separator/`+` is DATA not a boundary §2.4; `\\XX` hex), and multi-valued RDNs (an X.501 RDN is an UNORDERED SET
+   of `+`-joined AVAs §2.2). SECURITY (no false-ACCEPT): an X.501 DN is a SEQUENCE of RDNs whose ORDER IS
+   SIGNIFICANT — a genuine RDN reorder (CN=a,O=b vs O=b,CN=a) is a DIFFERENT subject and must NOT match (the
+   identity-confusion fix, replacing the old sort-collapse); the canonical form is STRUCTURAL (list of RDNs, each
+   a sorted AVA list — a re-joined string is non-injective and let CN=x\\+O=y forge CN=x+O=y); likewise a
+   wrong-value / wrong-case-value / different-RDN-count-or-grouping / escaped-vs-unescaped-structure / MALFORMED
+   DN must NOT match — an ambiguous or unparseable DN never authorizes, not even against an identical unparseable
+   grant. A trailing `\\ `-escaped space is value DATA (§2.4): it survives trimming (no false-REJECT) and
+   distinguishes 'a ' from 'a'."
   ;; POSITIVE — the SAME subject in different conformant serializations MUST match (no false-REJECT)
   (%check :dn-m-identical (dds.security::%dn-equal "/CN=a/O=b/C=DE" "/CN=a/O=b/C=DE")
           "identical oneline DNs match")
   (%check :dn-m-order (dds.security::%dn-equal "/CN=a/O=b/C=DE" "C=DE,O=b,CN=a")
           "oneline vs RFC2253 (reversed RDN order) match — order-insensitive")
-  (%check :dn-m-attr-case (dds.security::%dn-equal "/CN=Alice/O=Acme" "cn=Alice,o=Acme")
-          "attribute TYPE case-fold: CN==cn, O==o (types are case-insensitive, RFC2253 §2.3)")
+  (%check :dn-m-attr-case (dds.security::%dn-equal "/O=Acme/CN=Alice" "cn=Alice,o=Acme")
+          "attribute TYPE case-fold: CN==cn, O==o (types are case-insensitive, RFC2253 §2.3); same sequence [O,CN] both forms (oneline forward, RFC2253 reverse §2.1)")
   (%check :dn-m-whitespace (dds.security::%dn-equal "CN=a, O=b, C=DE" "CN=a,O=b,C=DE")
           "whitespace after the RDN separator is trimmed")
-  (%check :dn-m-escaped-comma (dds.security::%dn-equal "CN=Doe\\, John,O=Acme" "/CN=Doe, John/O=Acme")
-          "RFC2253 escaped-comma value (CN=Doe, John) matches the oneline form — the escaped separator is DATA, not a boundary")
+  (%check :dn-m-escaped-comma (dds.security::%dn-equal "CN=Doe\\, John,O=Acme" "/O=Acme/CN=Doe, John")
+          "RFC2253 escaped-comma value (CN=Doe, John) matches the oneline form — the escaped separator is DATA, not a boundary; both denote sequence [O,CN] (RFC2253 reverse §2.1)")
   (%check :dn-m-hex-escape (dds.security::%dn-equal "CN=\\41,O=x" "CN=A,O=x")
           "RFC2253 hex escape backslash-41 == 'A'")
+  ;; POSITIVE — multi-valued RDNs (RFC2253 §2.2: an RDN is an UNORDERED SET of `+`-joined AVAs) MUST match regardless of AVA order
+  (%check :dn-m-mv-ava-order (dds.security::%dn-equal "CN=a+SN=b,O=x" "SN=b+CN=a,O=x")
+          "multi-valued RDN AVA order is not significant (RFC2253 §2.2, X.501 RDN is a SET): CN=a+SN=b == SN=b+CN=a")
+  (%check :dn-m-mv-cross-form (dds.security::%dn-equal "/O=x/SN=b+CN=a" "CN=a+SN=b,O=x")
+          "multi-valued RDN, cross-form: oneline [O, {SN,CN}] == RFC2253 reversed [O, {CN,SN}] (§2.1 + §2.2)")
+  (%check :dn-m-mv-type-case (dds.security::%dn-equal "cn=a+sn=b,O=x" "CN=a+SN=b,O=x")
+          "multi-valued RDN with TYPE case-fold: cn=a+sn=b == CN=a+SN=b (types case-insensitive, §2.3)")
+  (%check :dn-m-mv-escaped-plus (dds.security::%dn-equal "CN=a\\+b,O=x" "CN=a\\2Bb,O=x")
+          "an escaped `\\+` is value DATA, not an AVA boundary (§2.4): value literally a+b, matches the `\\2B` hex form of '+' (0x2B)")
+  ;; POSITIVE — a trailing `\\ `-escaped space is value DATA (§2.4) and must survive trimming (no false-REJECT)
+  (%check :dn-m-escaped-trailing-space-self (dds.security::%dn-equal "CN=a\\ " "CN=a\\ ")
+          "a conformant trailing escaped space (CN=a\\ , value 'a ') matches itself — unescaped-only trim, no stranded backslash")
+  (%check :dn-m-escaped-trailing-space-hex (dds.security::%dn-equal "CN=a\\ " "CN=a\\20")
+          "trailing escaped space `\\ ` == its `\\20` hex form (both canonical value 'a ', §2.4)")
   ;; NEGATIVE — a DIFFERENT or ambiguous subject must NOT match (no false-ACCEPT of a wrong identity)
   (%check :dn-n-diff-value (not (dds.security::%dn-equal "CN=a,O=b" "CN=a,O=c"))
           "a different attribute VALUE does not match")
@@ -1228,4 +1248,33 @@
           "a DN with no unescaped '=' is malformed -> no match (fail-closed)")
   (%check :dn-n-empty-attr (not (dds.security::%dn-equal "=x,CN=a" "CN=a"))
           "an empty attribute type is malformed -> no match (fail-closed)")
+  ;; NEGATIVE — RDN SEQUENCE order is SIGNIFICANT (X.501 DN is a SEQUENCE): a reorder is a DIFFERENT subject (the identity-confusion fix, no false-ACCEPT)
+  (%check :dn-n-rdn-reorder (not (dds.security::%dn-equal "CN=a,O=b" "O=b,CN=a"))
+          "same-serialization RDN reorder is a DIFFERENT DN (X.501 sequence order is significant) -> no match (closes the sort-collapse false-ACCEPT)")
+  (%check :dn-n-rdn-reorder-oneline (not (dds.security::%dn-equal "/CN=a/O=b" "/O=b/CN=a"))
+          "the oneline twin: /CN=a/O=b is a different sequence than /O=b/CN=a -> no match")
+  (%check :dn-n-attr-case-reorder (not (dds.security::%dn-equal "/CN=Alice/O=Acme" "cn=Alice,o=Acme"))
+          "inconsistently-ordered twin of :dn-m-attr-case (oneline [CN,O] vs RFC2253-reverse [O,CN]) must NOT match — strictness asserted")
+  (%check :dn-n-escaped-comma-reorder (not (dds.security::%dn-equal "CN=Doe\\, John,O=Acme" "/CN=Doe, John/O=Acme"))
+          "inconsistently-ordered twin of :dn-m-escaped-comma (RFC2253-reverse [O,CN] vs oneline [CN,O]) must NOT match")
+  ;; NEGATIVE — multi-valued vs single-valued / different RDN grouping is a DIFFERENT subject
+  (%check :dn-n-mv-vs-single (not (dds.security::%dn-equal "CN=a+SN=b" "CN=a"))
+          "a multi-valued RDN {CN=a,SN=b} is not the single-AVA RDN {CN=a} -> no match")
+  (%check :dn-n-mv-vs-two-rdns (not (dds.security::%dn-equal "CN=a+SN=b" "CN=a,SN=b"))
+          "ONE multi-valued RDN {CN=a,SN=b} is not TWO RDNs [CN=a][SN=b] (different RDN count/grouping) -> no match")
+  (%check :dn-n-mv-vs-two-avas (not (dds.security::%dn-equal "CN=a\\+b,O=x" "CN=a+B=b,O=x"))
+          "escaped `\\+` (single AVA, value a+b) is not the two-AVA structure CN=a + B=b (structure vs data, §2.2/§2.4) -> no match")
+  ;; NEGATIVE — join-forgery attack pairs: a single-AVA value containing literal '+' and '=' must NOT collide with the multi-AVA structure it spells (structural canonical form, non-injective-join fix)
+  (%check :dn-n-mv-join-forgery (not (dds.security::%dn-equal "CN=x\\+O=y" "CN=x+O=y"))
+          "single AVA CN with value x+O=y must NOT match the AVA set {CN=x, O=y} — a re-joined canonical string collided them (false-ACCEPT)")
+  (%check :dn-n-mv-join-forgery-2 (not (dds.security::%dn-equal "A=1\\+B=2" "A=1+B=2"))
+          "single AVA A with value 1+B=2 must NOT match the AVA set {A=1, B=2} — the sort-independent twin of the join-forgery")
+  ;; NEGATIVE — a trailing escaped space is part of the VALUE ('a ' != 'a')
+  (%check :dn-n-escaped-trailing-space (not (dds.security::%dn-equal "CN=a\\ " "CN=a"))
+          "CN=a\\  (value 'a ') must NOT match CN=a (value 'a') — the escaped trailing space is DATA (§2.4)")
+  ;; NEGATIVE — malformed multi-valued RDN fails closed, not even against itself
+  (%check :dn-n-mv-empty-ava (not (dds.security::%dn-equal "CN=a+" "CN=a+"))
+          "an empty AVA (CN=a+) is malformed -> no match even against an identical malformed grant (fail-closed)")
+  (%check :dn-n-mv-no-equals (not (dds.security::%dn-equal "CN=a+SN" "CN=a+SN"))
+          "a multi-valued AVA with no `=` (CN=a+SN) is malformed -> no match even against itself (fail-closed)")
   t)

@@ -195,7 +195,7 @@ asserts Connext interop.
 5. **The ADR-0036 hardening carries not forced by the live peer:** zero-alloc into-buffer AEAD on the data
    path (~2.2 KB/datagram residual; `make mem` does not cover the dds-disc rtps path); per-topic
    `metadata_protection` applied selectively to user endpoints; `pvms-bootstrap-kms` pruning on peer-loss;
-   `%dn-normalize` RFC2253 escaped/quoted/multi-valued edge cases; KeyMaterial GC-heap → foreign/static
+   `%dn-normalize` RFC2253 escaped/quoted/multi-valued edge cases (multi-valued §2.2 + RDN-reorder §2.1 RESOLVED, WP-SECURITY-DN-RFC2253-EDGES 2026-07-03); KeyMaterial GC-heap → foreign/static
    hardening (ADR 0034); builtin-endpoint share-vs-own-key vs Connext; Zero-Copy × `rtps_protection` SHMEM
    cleartext; the `%on-secure-builtin` inner-writerId cross-check (defense-in-depth). None is on the Fast-DDS
    exit-gate path; each is a follow-on.

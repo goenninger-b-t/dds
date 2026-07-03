@@ -89,43 +89,106 @@
               ((char= c #\\)  (setf esc t))
               ((char= c #\=)  (return i)))))))
 
+(defun* %dn-trim-unescaped (s)
+    (function (string) string)
+  "Trim leading spaces and trailing UNESCAPED spaces from DN fragment S. RFC2253 §2.4: a space at the end of a
+   value may be `\\`-escaped — that space is value DATA and must survive to %dn-unescape (a plain trim stranded
+   its `\\` -> a spurious :malformed -> a false-REJECT of a conformant DN, while the equivalent `\\20` hex form
+   worked). A trailing lone `\\` is preserved so %dn-unescape still fail-closes it."
+  (let* ((n     (length s))
+         (start (or (position #\Space s :test #'char/=) n))
+         (end   start)
+         (esc   nil))
+    (loop for i from start below n
+          for c = (char s i)
+          do (cond (esc                (setf esc nil end (1+ i)))
+                   ((char= c #\\)      (setf esc t))
+                   ((char/= c #\Space) (setf end (1+ i)))))
+    (when esc (setf end n))   ; trailing lone backslash stays -> %dn-unescape fail-closes it
+    (subseq s start end)))
+
+(defun* %dn-normalize-ava (ava)
+    (function (string) (or string null))
+  "Canonicalize ONE RFC2253 AttributeTypeAndValue AVA (§2.3) to \"TYPE=value\": the attribute TYPE upcased (types
+   are case-INSENSITIVE, §2.3) + whitespace-trimmed, the VALUE trimmed of UNESCAPED whitespace only
+   (%dn-trim-unescaped — a `\\ `-escaped trailing space is DATA, §2.4) then RFC2253-UN-escaped to its canonical
+   (serialization-independent) form (%dn-unescape — an escaped separator/space and a `\\XX` hex escape then
+   compare as DATA, §2.4). NIL (FAIL-CLOSED) on a malformed AVA — no unescaped `=`, an empty attribute type,
+   or a malformed escape — so an ambiguous AVA never yields a matchable token (no false-ACCEPT)."
+  (let* ((tok (%dn-trim-unescaped ava))
+         (eqp (%dn-attr-value-pos tok)))
+    (when (and eqp (plusp eqp))
+      (let ((val (%dn-unescape (%dn-trim-unescaped (subseq tok (1+ eqp))))))
+        (when val
+          (concatenate 'string
+                       (string-upcase (string-trim " " (subseq tok 0 eqp)))
+                       "=" val))))))
+
+(defun* %dn-normalize-rdn (rdn)
+    (function (string) (or list (eql :malformed)))
+  "Canonicalize ONE RelativeDistinguishedName — an X.501 RDN is a SET of one-or-more `+`-joined AVAs (RFC2253
+   §2.2) — to the SORTED LIST of canonical AVA strings. STRUCTURAL, never re-joined into one string: a `+`-joined
+   form is NON-INJECTIVE because an un-escaped value may contain literal `+` and `=`, so a single-AVA value could
+   forge a multi-AVA join (CN=x\\+O=y vs CN=x+O=y — a false-ACCEPT); the list keeps the AVA boundary structural.
+   Split on UNESCAPED `+` only (%dn-split-unescaped; an escaped `\\+` stays value DATA, §2.4), canonicalize each
+   AVA (%dn-normalize-ava), then SORT the AVA strings. Sorting is correct HERE (the RDN is a SET — its AVA order
+   is not significant), unlike sorting the RDN SEQUENCE. :MALFORMED (FAIL-CLOSED) if ANY AVA is malformed (no
+   `=`, empty type, empty AVA e.g. `CN=a+`, or bad escape)."
+  (let ((avas '()))
+    (dolist (raw (%dn-split-unescaped rdn #\+))
+      (let ((a (%dn-normalize-ava raw)))
+        (unless a (return-from %dn-normalize-rdn :malformed))
+        (push a avas)))
+    (sort avas #'string<)))
+
 (defun* %dn-normalize (s)
     (function (string) (or list (eql :malformed)))
   "Parse an X.500 Distinguished Name string — OpenSSL oneline (/CN=a/O=b/C=DE, what X509_NAME_oneline emits) OR
    RFC2253/RFC1779 (CN=a,O=b,C=DE, what X509_NAME_print_ex+XN_FLAG_RFC2253 and Fast DDS's rfc2253_string_compare
-   use) — into a SORTED list of canonical \"ATTR=value\" tokens (RFC2253 §2-3). The leading char selects the '/'
-   (oneline) vs ',' (RFC2253) RDN separator; RDNs are split only on UNESCAPED separators (%dn-split-unescaped);
-   each attribute TYPE is upcased (types are case-INSENSITIVE, §2.3) while the VALUE keeps its case (values are
-   case-SENSITIVE) and is RFC2253-UN-escaped to its canonical form (%dn-unescape — an escaped comma/space and a
-   `\\XX` hex escape then compare as data). Sorting absorbs the oneline-forward vs RFC2253-reverse RDN order;
-   empty (separator-artifact) RDNs are dropped. Returns :malformed (FAIL-CLOSED — never matched by %dn-equal) on
-   ANY malformed RDN: no unescaped `=`, an empty attribute type, or a malformed escape — so an ambiguous/malformed
-   DN does NOT authorize (no false-ACCEPT)."
-  (let ((sep (if (and (plusp (length s)) (char= (char s 0) #\/)) #\/ #\,))
-        (toks '()))
-    (dolist (raw (%dn-split-unescaped s sep))
-      (let ((tok (string-trim " " raw)))
+   use) — into the DN's canonical RDN SEQUENCE: a STRUCTURAL list, in DN-sequence order (root-first), of RDNs,
+   each RDN itself the sorted list of its canonical \"TYPE=value\" AVA strings (%dn-normalize-rdn — the AVA
+   boundary stays structural, never re-joined into a string, which would be non-injective). The sequence is
+   ORDER-PRESERVING, NOT sorted: an X.501 DN is a SEQUENCE of RDNs (order is significant) — sorting the sequence
+   would collide two genuinely-different DNs (CN=a,O=b vs O=b,CN=a) into one list (identity confusion /
+   false-ACCEPT). The leading char selects the '/' (oneline) vs ',' (RFC2253) RDN separator; RDNs are split only
+   on UNESCAPED separators (%dn-split-unescaped). DIRECTION PINNING (RFC2253 §2.1): oneline is printed FORWARD
+   (root-first) so parse order IS the sequence; RFC2253 prints the sequence in REVERSE (the string starts with
+   the LAST RDN) so the parse order is reversed to recover the sequence — both forms of one DN thus map to the
+   SAME canonical sequence. Each RDN is canonicalized as an unordered AVA SET (multi-valued `+`, §2.2); each
+   attribute TYPE is upcased (case-INSENSITIVE, §2.3) while the VALUE keeps its case (case-SENSITIVE) and is
+   RFC2253-UN-escaped (§2.4). Empty (separator-artifact) RDNs are dropped. Returns :malformed (FAIL-CLOSED —
+   never matched by %dn-equal) on ANY malformed RDN/AVA: no unescaped `=`, an empty attribute type, an empty
+   AVA, or a malformed escape — so an ambiguous/malformed DN does NOT authorize (no false-ACCEPT)."
+  (let ((oneline (and (plusp (length s)) (char= (char s 0) #\/)))
+        (rdns '()))
+    (dolist (raw (%dn-split-unescaped s (if oneline #\/ #\,)))
+      (let ((tok (%dn-trim-unescaped raw)))
         (when (plusp (length tok))
-          (let ((eqp (%dn-attr-value-pos tok)))
-            (unless (and eqp (plusp eqp)) (return-from %dn-normalize :malformed))
-            (let ((val (%dn-unescape (string-trim " " (subseq tok (1+ eqp))))))
-              (unless val (return-from %dn-normalize :malformed))
-              (push (concatenate 'string
-                                 (string-upcase (string-trim " " (subseq tok 0 eqp)))
-                                 "=" val)
-                    toks))))))
-    (sort toks #'string<)))
+          (let ((c (%dn-normalize-rdn tok)))
+            (when (eq c :malformed) (return-from %dn-normalize :malformed))
+            (push c rdns)))))
+    ;; rdns is in REVERSE parse order (push): oneline sequence = parse order (nreverse); RFC2253 sequence = reverse
+    ;; of parse order (§2.1) = the push order as-accumulated.
+    (if oneline (nreverse rdns) rdns)))
 
 (defun* %dn-equal (a b)
     (function (string string) boolean)
   "T iff DN strings A and B denote the SAME X.509 subject independent of serialization (OpenSSL oneline vs
-   RFC2253), RDN order, attribute-TYPE case, whitespace, and RFC2253 value ESCAPING — DDS-Security 1.1 §9.4.1.3
-   binds the grant by the X.509 subject DN, not by one string form. Requires equal (NON-ZERO) RDN count + every
-   normalized token equal. FAIL-CLOSED: a :malformed or empty normalization on EITHER side -> NIL (no false-ACCEPT
-   of a wrong or ambiguous identity — an unparseable DN never matches, not even an identical unparseable grant);
-   the cert is CA-validated upstream, so a reordered-RDN forgery is out of scope."
+   RFC2253), attribute-TYPE case, whitespace, multi-valued-RDN AVA order (§2.2), and RFC2253 value ESCAPING
+   (§2.4) — DDS-Security 1.1 §9.4.1.3 binds the grant by the X.509 subject DN, not by one string form. The RDN
+   SEQUENCE order is SIGNIFICANT (X.501) and PINNED, not sorted: %dn-normalize recovers the same canonical
+   sequence from either serialization (direction pinning, §2.1), so a genuine RDN reorder (CN=a,O=b vs O=b,CN=a)
+   correctly does NOT match. Comparison is STRUCTURAL: equal (NON-ZERO) RDN count + per-RDN equal AVA count +
+   every AVA string equal, all IN ORDER (RDNs) / in sorted-set order (AVAs within an RDN) — no sort of RDNs, no
+   reversal-tolerant fallback (would reintroduce the reorder collision), no string re-join (would let a value
+   containing literal `+`/`=` forge an AVA boundary — false-ACCEPT). FAIL-CLOSED: a :malformed or empty
+   normalization on EITHER side -> NIL (no false-ACCEPT of a wrong or ambiguous identity — an unparseable DN
+   never matches, not even an identical unparseable grant)."
   (let ((na (%dn-normalize a)) (nb (%dn-normalize b)))
-    (and (consp na) (consp nb) (= (length na) (length nb)) (every #'string= na nb))))
+    (and (consp na) (consp nb) (= (length na) (length nb))
+         (every (lambda (ra rb)
+                  (and (= (length ra) (length rb)) (every #'string= ra rb)))
+                na nb))))
 
 (defun* permissions-grant-for (subject grants)
     (function (string list) (or permissions null))
