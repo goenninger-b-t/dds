@@ -17,6 +17,8 @@
            #:cache-change-send-refcount #:cache-change-releasable-p
            #:cache-change-pooled-buffer #:cache-change-pooled-len #:cache-change-evicted
            #:cache-change-payload-len
+           ;; WP-FLATDATA-LOAN-WRITE pre-committed ZC slot identity (FR-PF-4, R6, ADR 0042)
+           #:cache-change-zc-slot #:cache-change-zc-generation #:cache-change-zc-state
            #:history-cache #:make-history-cache #:hc-change-count #:hc-kind #:hc-max-samples #:hc-depth
            #:history-cache-payload-pool #:hc-try-release-pooled
            #:hc-add-change #:hc-remove-change #:hc-purge-below #:hc-get-change
@@ -111,7 +113,9 @@
            #:writer-frag-heartbeat #:writer-on-nack-frag #:writer-sample-payload
            #:writer-capture-unsent #:writer-acquire-sample
            #:writer-release-change-ref #:writer-release-change-refs
-           #:writer-acquire-payload-buffer #:writer-release-payload-buffer #:writer-ensure-payload-pool))
+           #:writer-acquire-payload-buffer #:writer-release-payload-buffer #:writer-ensure-payload-pool
+           ;; WP-FLATDATA-LOAN-WRITE one-shot pre-committed-slot transitions (FR-PF-4, R6, ADR 0042)
+           #:writer-zc-claim #:writer-zc-unarm))
 
 ;;;; dds.rtps.discovery — SPDP Locator_t codec + SPDPdiscoveredParticipantData
 ;;;; build/parse (RTPS 2.5 §8.5.3 / §9.6.2). Wire constants pinned from the in-repo

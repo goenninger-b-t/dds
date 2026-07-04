@@ -77,6 +77,9 @@
    (listener :initform nil :accessor dw-listener)
    (listener-mask :initform '() :accessor dw-listener-mask)
    (instances :initform (make-hash-table :test 'equalp) :accessor dw-instances) ; 16-octet handle -> :alive (DDS 1.4 §2.2.2.4.2)
+   (loans :initform '() :accessor dw-loans)                ; WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): outstanding writer-loans (writer-close safety sweep)
+   (loan-freelist :initform '() :accessor dw-loan-freelist) ; WP-FLATDATA-LOAN-WRITE: recycled writer-loan structs (the struct+view recycle; the registry cell + retained payload are the documented v1 per-write cost)
+   (loan-encap :initform nil :accessor dw-loan-encap)      ; WP-FLATDATA-LOAN-WRITE (ADR 0042): the type's 4-octet encap header+options, cached once from the FlatData ctor (%loan-encap-header) — written into every slot-backed loan's slot
    (status-lock :initform (dds.pal:make-lock "dw-status") :accessor dw-status-lock))
   (:documentation "DDS DataWriter: publishes typed samples on a Topic, carrying its
    PUBLICATION_MATCHED, OFFERED_INCOMPATIBLE_QOS and LIVELINESS_LOST statuses and optional
@@ -702,6 +705,176 @@
       (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
     +retcode-ok+))
+
+;;;; ---- WP-FLATDATA-LOAN-WRITE zero-copy TX loan API (FR-PF-4, R6, ADR 0042) ----
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0042.
+
+(defstruct* (writer-loan (:constructor %make-writer-loan))
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). A writer-side loaned
+   FlatData sample — the TX dual of the reader's flatdata-view loan. KIND :slot = SLOT-BACKED (SAMPLE is a
+   flatdata-view over a live writer-pool slot the app fills straight through the <name>-<field>-fd setters;
+   POOL-SAP/SLOT/GENERATION/PAYLOAD-BASE/SIZE are the loan handle); KIND :fallback = a heap/foreign FlatData
+   octet-buffer (make-<name>-flatdata) when the node is not ZC-loan-eligible (no pool / too-small type /
+   wire-protected / pool saturated / non-SBCL) — same API, graceful degradation, no error. DONE latches the
+   terminal state (:written / :discarded) so write-loaned / discard-loan are idempotent (a double call, or a
+   write-after-discard, is a validated no-op). Recycled through the DataWriter's loan freelist (no per-sample
+   GC-heap struct cons; NFR-MEM). NOT cleared for ship — pending counsel (R6)."
+  (kind :fallback :type (member :slot :fallback))
+  (sample nil :type t)                       ; the flatdata-view (slot) or octet-buffer (fallback) the app writes
+  (view nil :type t)                         ; the recycled flatdata-view (slot kind); NIL for fallback
+  (pool-sap nil :type t) (slot 0 :type (integer 0)) (generation 0 :type (unsigned-byte 32))
+  (payload-base 0 :type (integer 0)) (size 0 :type (integer 0))
+  (done nil :type (or null (member :written :discarded))))
+
+(defun* %loan-encap-header (ts)
+    (function (t) (simple-array (unsigned-byte 8) (4)))
+  "WP-FLATDATA-LOAN-WRITE (R6, ADR 0042 §4): the type's 4-octet XCDR2-LE encapsulation header + finalized
+   OPTIONS, sourced by funcalling the type's OWN FlatData constructor (make-<name>-flatdata — the SAME
+   dds.cdr:make-encapsulation-header/finalize-encapsulation-options emitters %serialize-sample uses; NEVER
+   hardcoded representation bytes) and copying its first 4 octets. Per-TYPE constant (a FINAL FlatData size is
+   fixed, so the OPTIONS trailing-pad bits are too); cached once per DataWriter (dw-loan-encap) and written into
+   every slot-backed loan's slot at loan-sample so the slot bytes are a SELF-DESCRIBING SerializedPayload —
+   byte-identical in [base,base+4) to what %zc-loan copies in on the classic write-sample path. NOT cleared for
+   ship — pending counsel (R6)."
+  (let ((buf (funcall (dds.types:type-support-flatdata-ctor ts))))
+    (unwind-protect
+         (subseq (dds.core.buffer:octet-buffer-vec buf) 0 4)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
+
+(defun* loan-sample (dw)
+    (function (data-writer) writer-loan)
+  "DataWriter loan-write — WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel).
+   Return a writer-side loaned FlatData sample the app fills via the existing <name>-<field>-fd setters, then
+   publishes with write-loaned (or abandons with discard-loan). When the FULL ZC-TX eligibility holds — the topic
+   type is FlatData, its +<name>-flatdata-size+ clears *zerocopy-min-payload-bytes*, the node has a writer pool,
+   the writer is NOT wire-protected (secured) NOR data_protection-transformed (ADR 0042 §6), and the impl
+   supports foreign-SAP writes (SBCL; ZC is SBCL-only, ADR 0013) — the loan is SLOT-BACKED: a pool slot is
+   acquired (dds.disc:node-loan-write-acquire), the type's 4-octet encap header + OPTIONS are written into the
+   slot head (%loan-encap-header — the slot IS a self-describing SerializedPayload, byte-identical to the
+   classic path's), and the sample is a flatdata-view over the slot's XCDR2 body, so the app's setters write
+   STRAIGHT INTO the shared-memory slot (no app→buffer copy). Otherwise it degrades GRACEFULLY to a
+   make-<name>-flatdata octet-buffer — same API, no error, byte-identical downstream. SECURITY (ADR 0036
+   Carry-10 + ADR 0042 §6, fail-closed at the loan end): a wire-protected OR payload-transforming writer NEVER
+   gets a slot-backed loan — its plaintext must not land in a pool slot at all. ALLOCATION (honest, FR-LANG-7):
+   the writer-loan struct + flatdata-view recycle through the DataWriter's freelist, but each loan-sample CONSES
+   one registry cell (dw-loans) and each write-loaned allocates the RETAINED payload vector + one armed-registry
+   cell — the documented v1 per-write cost (same order as write-sample's %serialize-sample payload; eliminated
+   only by the acked-slot-pinning follow-up, ADR 0042 Follow-ups). NOT cleared for ship — pending counsel (R6)."
+  (let* ((ts (topic-type-support (dw-topic dw)))
+         (node (dp-node (pub-participant (dw-publisher dw))))
+         (lay (dds.types:type-support-flatdata-offset ts))
+         (size (and (dds.types:flatdata-layout-p lay) (dds.types:flatdata-layout-size lay)))
+         (ln (or (pop (dw-loan-freelist dw)) (%make-writer-loan))))
+    (setf (writer-loan-done ln) nil)
+    (when (and size (eq (dds.pal:pal-impl-name) :sbcl)   ; ZC foreign-SAP writes are SBCL-only (ADR 0013)
+               (dds.disc:node-loan-write-eligible-p node size))
+      (multiple-value-bind (sap slot base gen) (dds.disc:node-loan-write-acquire node size)
+        (when sap                                        ; NIL ⇒ pool saturated ⇒ fall through to the fallback
+          (let ((hdr (or (dw-loan-encap dw) (setf (dw-loan-encap dw) (%loan-encap-header ts)))))
+            (dotimes (i 4) (dds.pal:store-sap-u8 sap (+ base i) (aref hdr i))))   ; the slot IS a self-describing SerializedPayload (ADR 0042 §4)
+          (let ((view (or (writer-loan-view ln) (dds.types:make-flatdata-view))))
+            (setf (dds.types:flatdata-view-slot-sap view) sap
+                  (dds.types:flatdata-view-base-offset view) (+ base 4)   ; past the 4-octet encap header
+                  (dds.types:flatdata-view-len view) (max 0 (- size 4))
+                  (dds.types:flatdata-view-pool-sap view) sap
+                  (dds.types:flatdata-view-slot-index view) slot
+                  (dds.types:flatdata-view-generation view) gen)
+            (setf (writer-loan-kind ln) :slot (writer-loan-sample ln) view (writer-loan-view ln) view
+                  (writer-loan-pool-sap ln) sap (writer-loan-slot ln) slot (writer-loan-generation ln) gen
+                  (writer-loan-payload-base ln) base (writer-loan-size ln) size)
+            (push ln (dw-loans dw))
+            (return-from loan-sample ln)))))
+    (let ((ctor (dds.types:type-support-flatdata-ctor ts)))   ; graceful degradation: an owned FlatData buffer
+      (setf (writer-loan-kind ln) :fallback (writer-loan-size ln) (or size 0)
+            (writer-loan-sample ln) (if ctor (funcall ctor) (error "loan-sample: ~a is not a FlatData type" (dds.types:type-support-type-name ts))))
+      (push ln (dw-loans dw))
+      ln)))
+
+(defun* %loan-write-payload (ln)
+    (function (writer-loan) (simple-array (unsigned-byte 8) (*)))
+  "WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): materialise a SLOT-BACKED loan's RETAINED SerializedPayload — a
+   straight slot→heap copy of ALL size octets: the slot is a SELF-DESCRIBING SerializedPayload (loan-sample
+   wrote the type's 4-octet encap header + OPTIONS into it via %loan-encap-header — the same dds.cdr emitters
+   %serialize-sample uses — and the app's SAP setters wrote the body), so the retained vector is byte-identical
+   to what write-sample's %serialize-sample would produce for the same field values. This per-write heap vector
+   is the DOCUMENTED v1 retained-payload cost (ADR 0042 §5): it lives in the writer HistoryCache to serve
+   retransmission / non-ZC / extra-ZC destinations, so it cannot be pooled/reused without corrupting history
+   (eliminated only by the acked-slot-pinning follow-up). NOT cleared for ship — pending counsel (R6)."
+  (let* ((size (writer-loan-size ln))
+         (base (writer-loan-payload-base ln))
+         (sap (writer-loan-pool-sap ln))
+         (vec (make-array size :element-type '(unsigned-byte 8))))
+    (dotimes (i size vec) (setf (aref vec i) (dds.pal:load-sap-u8 sap (+ base i))))))
+
+(defun* %recycle-loan (dw ln)
+    (function (data-writer writer-loan) t)
+  "WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): drop LN from the writer's outstanding-loan registry and recycle its
+   struct (and, for a fallback, free its owned FlatData buffer) to the DataWriter freelist (no GC churn). The
+   embedded flatdata-view is retained on the struct for the next slot loan. NOT cleared for ship — pending
+   counsel (R6)."
+  (setf (dw-loans dw) (delete ln (dw-loans dw)))
+  (when (and (eq (writer-loan-kind ln) :fallback) (typep (writer-loan-sample ln) 'dds.core.buffer:octet-buffer))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec (writer-loan-sample ln))))
+  (setf (writer-loan-sample ln) nil (writer-loan-pool-sap ln) nil)
+  (push ln (dw-loan-freelist dw))
+  t)
+
+(defun* write-loaned (dw loan)
+    (function (data-writer writer-loan) (member :ok :timeout))
+  "DataWriter::write by LOAN — WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending
+   counsel). Publish the loaned sample LOAN filled by the app. SLOT-BACKED: materialise the RETAINED
+   SerializedPayload from the slot (%loan-write-payload — the copy that serves retransmission, non-ZC
+   destinations, and any extra ZC destination; ADR 0042 §5), COMMIT the slot (dds.disc:node-loan-write-commit —
+   the release-fence + generation-store publication point, ADR 0042 §2), then publish with the change CARRYING
+   the pre-committed slot: the send site (%zc-change-item) emits the slot's 20-octet ref to the FIRST
+   ZC-eligible destination with NO payload->slot copy (the end-to-end 0-copy TX leg: the app's SAP-setter
+   writes are the only writes the delivered bytes ever saw), or releases the slot on its fallback decision /
+   the leak sweep — every non-pure case is served from the retained payload exactly as write-sample. On
+   :timeout publish-sample released the slot (nothing was added). FALLBACK: exactly write-sample on the owned
+   FlatData buffer. Returns +RETCODE-OK+ (:ok) or +RETCODE-TIMEOUT+ (:timeout) under the same bounded-cache
+   backpressure as write-sample. IDEMPOTENT: a second write-loaned, or a write after discard-loan, is a
+   validated no-op returning :ok (the loan is already terminal). Recycles the loan on success. NOT cleared for
+   ship — pending counsel (R6)."
+  (when (writer-loan-done loan) (return-from write-loaned +retcode-ok+))   ; already written/discarded: no-op
+  (let ((node (dp-node (pub-participant (dw-publisher dw)))))
+    (if (eq (writer-loan-kind loan) :slot)
+        (let ((payload (%loan-write-payload loan))
+              (kh (when (%writer-keeplast-p dw)
+                    (%instance-handle (topic-type-support (dw-topic dw)) (writer-loan-sample loan)))))  ; keyhash off the view
+          (dds.disc:node-loan-write-commit node (writer-loan-slot loan) (writer-loan-generation loan))  ; publish the slot's generation (ADR 0042 §2)
+          (setf (writer-loan-done loan) :written)
+          (let ((rc (dds.disc:publish-sample node payload kh (writer-loan-slot loan) (writer-loan-generation loan))))
+            (%recycle-loan dw loan)
+            (when (eq :timeout rc) (return-from write-loaned +retcode-timeout+)))   ; slot already released inside publish-sample
+          (assert-liveliness dw)
+          +retcode-ok+)
+        (let ((rc (write-sample dw (writer-loan-sample loan))))   ; fallback: the owned FlatData buffer
+          (setf (writer-loan-done loan) :written)
+          (%recycle-loan dw loan)
+          rc))))
+
+(defun* discard-loan (dw loan)
+    (function (data-writer writer-loan) t)
+  "DataWriter loan discard — WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending
+   counsel). Abandon LOAN WITHOUT publishing: SLOT-BACKED ⇒ node-loan-write-abort the slot (refcount→0, no
+   generation published, invisible to every reader — ADR 0042 §2); FALLBACK ⇒ just drop the owned buffer. Then
+   recycle the loan. IDEMPOTENT / double-discard-safe: a loan already :written or :discarded is a validated
+   no-op. NOT cleared for ship — pending counsel (R6)."
+  (unless (writer-loan-done loan)
+    (when (eq (writer-loan-kind loan) :slot)
+      (dds.disc:node-loan-write-abort (dp-node (pub-participant (dw-publisher dw))) (writer-loan-slot loan)))
+    (setf (writer-loan-done loan) :discarded)
+    (%recycle-loan dw loan))
+  t)
+
+(defun* discard-all-loans (dw)
+    (function (data-writer) t)
+  "WP-FLATDATA-LOAN-WRITE writer-close safety (FR-PF-4, R6, ADR 0042): discard EVERY outstanding writer-loan
+   (mirrors the reader's return-all-loans) so writer-close / delete-participant leaves NO acquired-but-
+   unpublished pool slot held (a leaked slot pins the pool until it gracefully falls back to non-ZC). NOT cleared
+   for ship — pending counsel (R6)."
+  (dolist (ln (copy-list (dw-loans dw))) (discard-loan dw ln))
+  t)
 
 (defparameter +instance-handle-nil+
   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)

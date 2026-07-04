@@ -5905,7 +5905,7 @@
                      (dds.xport.zerocopy::%zc-release sap slot gen)   ; balance the refcount-1 loan
                      (format t "~&  fd-zc-rx: new single-copy = ~d bytes/sample; WP-ZEROCOPY-v1 sink+re-copy = ~d bytes/sample (~a)~%"
                              new-bytes v1-bytes (if sbcl-p "SBCL exact" "Clasp bytes-consed=0 gap"))
-                     (format t "  fd-zc-rx: RX win = one exact-length (~d-octet) owned vector, read in place; no 65536-byte sink, no 2nd copy. TX still has the app->slot copy (loan-write follow-up).~%"
+                     (format t "  fd-zc-rx: RX win = one exact-length (~d-octet) owned vector, read in place; no 65536-byte sink, no 2nd copy. TX app->slot copy eliminated by loan-write (WP-FLATDATA-LOAN-WRITE, ADR 0042).~%"
                              (length payload))
                      (when sbcl-p
                        (%check :fd-zc-rx-bounded
@@ -6035,6 +6035,170 @@
       (dds.dcps:delete-participant p1)
       (when p2 (dds.dcps:delete-participant p2))))
     t))
+
+(defun* run-dcps-loan-write-e2e-test ()
+    (function () t)
+  "WP-FLATDATA-LOAN-WRITE end-to-end proof (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). The
+   full DCPS stack, mirroring run-dcps-loan-roundtrip-test but writing via the ZERO-COPY LOAN-WRITE TX API: two
+   same-host participants, *shmem-enabled* + *zerocopy-enabled*, a FlatData topic (fd-abc). The app loan-samples
+   a SLOT-BACKED writer loan, writes the fields STRAIGHT INTO the SHMEM slot via the SAP-mode -fd setters, and
+   write-loaned publishes it. Asserts, the headline (ADR 0042 send-site integration):
+     (1) SLOT-BACKED LOAN: loan-sample returns a :slot loan (free-count drops by one — the acquire).
+     (2) DELIVERED FROM THE PRE-COMMITTED SLOT: the ZC reader's take-loaned view carries EXACTLY the loan's
+         (slot-index, generation) — the send site emitted the pre-committed slot's ref (a fresh %zc-loan would
+         have taken a DIFFERENT slot / bumped generation), i.e. NO app->payload->slot copy ran on the delivered
+         bytes; zc-sends is exactly 1 and the pool never lost a second slot (free-count stays K-1 while loaned).
+     (3) BYTE-EXACT: every field read off the view equals what the app wrote through the SAP setters.
+     (4) LIFECYCLE: return-loan frees the ONE slot (free-count K); the recycled writer-loan struct is reused by
+         the next loan-sample (freelist, no per-sample struct cons).
+   Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-dcps-loan-write-e2e-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)        ; fd-abc (20 octets) takes the ZC ref path
+         (ts (dds.types:find-type-support "fd-abc"))
+         (va 200) (vb 3000000000) (vc 12345678901234567890)
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "FdLoanW" "fd-abc" ts))
+                (tr (dds.dcps:create-topic p2 "FdLoanW" "fd-abc" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (node1 (dds.dcps::dp-node p1))
+                (node2 (dds.dcps::dp-node p2)))
+           (%check :lwe2e-pools (and (dds.disc::disc-node-zc-pool node1) (dds.disc::disc-node-zc-pool node2))
+                   "both participants must have a ZC writer pool")
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :lwe2e-matched (plusp (dds.dcps:matched-count p1)) "writer/reader did not match")
+           (loop repeat 200                                ; the reader must advertise PID_ZEROCOPY_CAPABLE first
+                 until (plusp (dds.disc::%zc-readers node1
+                                                     (list (dds.rtps.discovery:endpoint-data-guid
+                                                            (first (dds.disc::%matched-endpoints node1))))))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (let* ((wsap (dds.disc::disc-node-zc-pool-sap node1))
+                  (k (dds.xport.zerocopy::%zc-free-count wsap))
+                  (loan (dds.dcps:loan-sample dw)))
+             ;; (1) slot-backed loan
+             (%check :lwe2e-slot-backed (eq (dds.dcps::writer-loan-kind loan) :slot)
+                     "loan-sample on an eligible node must be SLOT-BACKED")
+             (%check :lwe2e-acquired (= (- k 1) (dds.xport.zerocopy::%zc-free-count wsap))
+                     "the loan must hold one pool slot (free-count K-1)")
+             (let ((lslot (dds.dcps::writer-loan-slot loan))
+                   (lgen (dds.dcps::writer-loan-generation loan))
+                   (s (dds.dcps:writer-loan-sample loan)))
+               (setf (fd-abc-a-fd s) va (fd-abc-b-fd s) vb (fd-abc-c-fd s) vc)   ; SAP setters -> straight into the slot
+               (%check :lwe2e-write-ok (eq :ok (dds.dcps:write-loaned dw loan)) "write-loaned must return :ok")
+               (%check :lwe2e-zc-sends (= 1 (dds.disc::disc-node-zc-sends node1))
+                       "exactly ONE zero-copy ref must have been emitted (the pre-committed slot)")
+               (%check :lwe2e-no-second-slot (= (- k 1) (dds.xport.zerocopy::%zc-free-count wsap))
+                       "the send site must NOT have loaned a second slot (the pre-committed one was consumed)")
+               ;; I1 (ADR 0042 §4): the slot is a SELF-DESCRIBING SerializedPayload — its first 4 octets must be
+               ;; byte-identical to the classic path's encap header (the FlatData ctor writes the same emitters).
+               (let ((classic (make-fd-abc-flatdata))
+                     (pbase (+ (dds.xport.zerocopy::%zc-slot-off wsap lslot) dds.xport.zerocopy::+zc-slot-hdr+)))
+                 (%check :lwe2e-slot-encap
+                         (loop for i below 4
+                               always (= (dds.pal:load-sap-u8 wsap (+ pbase i))
+                                         (aref (dds.core.buffer:octet-buffer-vec classic) i)))
+                         "the loan-write slot's first 4 octets must equal the classic encap header (self-describing SerializedPayload)")
+                 (dds.pal:free-static (dds.core.buffer:octet-buffer-vec classic)))
+               (loop repeat 300 until (plusp (dds.disc:node-sample-count node2))
+                     do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+               ;; (2)+(3) delivered FROM the pre-committed slot, byte-exact
+               (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+                 (%check :lwe2e-got-one (= 1 (length data)) "take-loaned must return exactly one sample")
+                 (%check :lwe2e-is-view (dds.types:flatdata-view-p (first data))
+                         "the delivered sample must be a flatdata-view (0-copy loan)")
+                 (let ((view (first data)))
+                   (%check :lwe2e-same-slot (= (dds.types:flatdata-view-slot-index view) lslot)
+                           (format nil "the reader's view must reference the PRE-COMMITTED slot ~d (got ~d)"
+                                   lslot (dds.types:flatdata-view-slot-index view)))
+                   (%check :lwe2e-same-gen (= (dds.types:flatdata-view-generation view) lgen)
+                           (format nil "the reader's view must carry the loan's committed generation ~d (got ~d)"
+                                   lgen (dds.types:flatdata-view-generation view)))
+                   (%check :lwe2e-field-a (= (fd-abc-a-fd view) va)
+                           (format nil "field a: ~d != ~d" (fd-abc-a-fd view) va))
+                   (%check :lwe2e-field-b (= (fd-abc-b-fd view) vb)
+                           (format nil "field b: ~d != ~d" (fd-abc-b-fd view) vb))
+                   (%check :lwe2e-field-c (= (fd-abc-c-fd view) vc)
+                           (format nil "field c: ~d != ~d" (fd-abc-c-fd view) vc)))
+                 ;; (4) lifecycle: return frees the ONE slot; the loan struct recycles
+                 (dds.dcps:return-loan dr loans)
+                 (%check :lwe2e-freed (= k (dds.xport.zerocopy::%zc-free-count wsap))
+                         "after return-loan the pool must be whole again (the single slot freed)")
+                 (let ((loan2 (dds.dcps:loan-sample dw)))
+                   (%check :lwe2e-freelist (eq loan loan2)
+                           "the next loan-sample must reuse the recycled writer-loan struct (freelist)")
+                   (dds.dcps:discard-loan dw loan2))))))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2)))
+  t)
+
+(defun* %lw-pool-scan-marker-p (sap needle)
+    (function (t (simple-array (unsigned-byte 8) (*))) t)
+  "WP-FLATDATA-LOAN-WRITE SHMEM-scan helper (R6, ADR 0042 §6): T iff the 8-octet NEEDLE occurs anywhere in the
+   ENTIRE writer-pool segment at SAP (header + every slot, the full %zc-bytes extent) — the live-segment
+   inspection the run-zc-shmem-secured-cleartext-test proof uses, applied to the loan-write flow."
+  (let ((total (dds.xport.zerocopy::%zc-bytes dds.disc:+zerocopy-pool-slots+ dds.disc:+zerocopy-pool-slot-bytes+))
+        (n (length needle)))
+    (loop for off from 0 upto (- total n)
+            thereis (loop for i below n always (= (dds.pal:load-sap-u8 sap (+ off i)) (aref needle i))))))
+
+(defun* run-loan-write-shmem-cleartext-test ()
+    (function () t)
+  "WP-FLATDATA-LOAN-WRITE SHMEM-cleartext proof (FR-PF-4, R6, ADR 0036 Carry-10 + ADR 0042 §6; NOT cleared for
+   ship — pending counsel). The LITERAL live-segment scan for the LOAN-WRITE flow, mirroring
+   run-zc-shmem-secured-cleartext-test's non-vacuity discipline: drive loan-sample → SAP/field setters →
+   write-loaned with a distinctive 8-octet marker (fd-abc's u64 c field, LE bytes) on three writer configs, then
+   scan the writer pool's ENTIRE segment for the marker bytes:
+     (1) CONTROL (non-secured): the loan is SLOT-BACKED and the marker IS found in the segment — the exact bytes
+         a co-resident process could read; proves the scan is NON-VACUOUS (the leak the gates close is real).
+     (2) WIRE-PROTECTED (rtps_protection :sign): loan-sample degrades to the heap fallback and the marker is
+         ABSENT from the segment — no plaintext ever landed in a pool slot (ADR 0036 Carry-10 at the loan end).
+     (3) DATA-PROTECTED (data_protection :encrypt): likewise fallback + marker ABSENT (the loan-write-specific
+         %loan-write-data-protected-p gate, ADR 0042 §6 — the slot would hold pre-transform plaintext).
+   Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-loan-write-shmem-cleartext-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (ts (dds.types:find-type-support "fd-abc"))
+         (marker #xB16B00B5DEADFACE)                       ; the u64 c value; its 8 LE octets are the scan needle
+         (needle (let ((v (make-array 8 :element-type '(unsigned-byte 8))))
+                   (dotimes (i 8 v) (setf (aref v i) (ldb (byte 8 (* 8 i)) marker))))))
+    (dolist (arm '(:control :wire :data))
+      (let ((p (dds.dcps:create-participant :domain (test-domain))))
+        (unwind-protect
+             (let* ((tw (dds.dcps:create-topic p "LwScan" "fd-abc" ts))
+                    (pub (dds.dcps:create-publisher p))
+                    (dw (dds.dcps:create-datawriter pub tw))
+                    (node (dds.dcps::dp-node p))
+                    (sap (dds.disc::disc-node-zc-pool-sap node)))
+               (%check (intern (format nil "LWSCAN-POOL-~a" arm) :keyword) (and sap t) "the node must have a ZC pool")
+               (ecase arm                                  ; protect the writer BEFORE the loan (the gated configs)
+                 (:control nil)
+                 (:wire (setf (dds.disc::disc-node-rtps-protection-kind node) :sign))
+                 (:data (setf (dds.disc::disc-node-user-data-protection-kind node) :encrypt)))
+               (let* ((loan (dds.dcps:loan-sample dw))
+                      (s (dds.dcps:writer-loan-sample loan)))
+                 (%check (intern (format nil "LWSCAN-KIND-~a" arm) :keyword)
+                         (eq (dds.dcps::writer-loan-kind loan) (if (eq arm :control) :slot :fallback))
+                         (format nil "~a arm: loan must be ~a-backed" arm (if (eq arm :control) "slot" "fallback")))
+                 (setf (fd-abc-a-fd s) 1 (fd-abc-b-fd s) 2 (fd-abc-c-fd s) marker)
+                 (dds.dcps:write-loaned dw loan)
+                 (if (eq arm :control)
+                     (%check :lwscan-control-found (%lw-pool-scan-marker-p sap needle)
+                             "CONTROL: the marker MUST be found in the pool segment (non-vacuity — the leak is real)")
+                     (%check (intern (format nil "LWSCAN-ABSENT-~a" arm) :keyword)
+                             (not (%lw-pool-scan-marker-p sap needle))
+                             (format nil "~a arm: the marker must be ABSENT from the ENTIRE pool segment (no plaintext in SHMEM)" arm)))))
+          (dds.dcps:delete-participant p)))))
+  t)
 
 (defun* run-loan-read-return-take-test ()
     (function () t)

@@ -48,6 +48,8 @@
            #:node-take-loaned #:node-return-loan #:node-return-all-loans
            ;; WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017): loan-capable flag + the unresolved ZC-ref marker
            #:set-zc-loan-capable #:disc-node-zc-loan-capable
+           ;; WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042): TX loan-write pool API
+           #:node-loan-write-eligible-p #:node-loan-write-acquire #:node-loan-write-abort #:node-loan-write-commit
            #:zc-loan-marker #:zc-loan-marker-p #:zc-loan-marker-pool-sap
            #:zc-loan-marker-slot-index #:zc-loan-marker-generation #:zc-loan-marker-len
            #:node-sample-count #:node-sample #:node-sample-sns

@@ -132,13 +132,16 @@
       (setf (gethash reader-id (rtps-writer-proxies writer)) (make-reader-proxy))))
 
 (defun* writer-write (writer payload &optional (key-hash nil) (inline-qos nil)
-                                               (pooled-buffer nil) (pooled-len nil))
+                                               (pooled-buffer nil) (pooled-len nil)
+                                               (zc-slot nil) (zc-gen 0))
     (function (rtps-writer (array (unsigned-byte 8) (*))
                &optional (or null (array (unsigned-byte 8) (*)))
                          (or null (simple-array (unsigned-byte 8) (*)))
                          (or null dds.core.buffer:octet-buffer)
-                         (or null (integer 0)))
-              (or integer (eql :timeout)))
+                         (or null (integer 0))
+                         (or null (integer 0))
+                         (unsigned-byte 32))
+              (values (or integer (eql :timeout)) (or null dds.rtps.history:cache-change)))
   "Add a new :data change to the writer's HistoryCache; return its sequence number, OR the :timeout sentinel
    (RETCODE_TIMEOUT) if a FULL KEEP_ALL cache (RESOURCE_LIMITS max_samples) did not free a slot within the
    writer's max_blocking_time (RELIABILITY.max_blocking_time) — DDS-standard block-up-to-max_blocking_time
@@ -158,12 +161,45 @@
    data_protection publish path) and POOLED-LEN is its true secured-payload length — recorded on the change so
    the eviction/ref-drop pool-release gate (hc-try-release-pooled) can return the buffer and every send-path
    length read (cache-change-payload-len) uses the true length, not the oversized capacity. On a :timeout the
-   change is NOT added, so the CALLER (publish-sample) returns the acquired buffer to the pool directly."
-  (%writer-add-bounded
-   writer (lambda (sn) (dds.rtps.history:make-cache-change
-                        :sn sn :serialized-payload payload :instance-key-hash key-hash
-                        :inline-qos inline-qos
-                        :pooled-buffer pooled-buffer :pooled-len pooled-len))))
+   change is NOT added, so the CALLER (publish-sample) returns the acquired buffer to the pool directly.
+   ZC-SLOT / ZC-GEN (WP-FLATDATA-LOAN-WRITE, FR-PF-4, R6, ADR 0042; default NIL = no slot, byte-identical): a
+   non-NIL ZC-SLOT arms the change with the PRE-COMMITTED Zero-Copy pool slot loan-write already wrote the
+   sample into (refcount=1 held) — the change is BORN :armed under the writer lock, so a concurrent capture can
+   never observe a half-armed change; the send site (%zc-change-item) may then emit the slot's 20-octet ref ONCE
+   (writer-zc-claim) instead of loaning a fresh slot from PAYLOAD. Returns (values SN-or-:timeout CHANGE) — the
+   CHANGE second value (NIL on :timeout) lets the caller register an armed change for the leak-safety sweep."
+  (let ((change nil))
+    (values (%writer-add-bounded
+             writer (lambda (sn) (setf change (dds.rtps.history:make-cache-change
+                                               :sn sn :serialized-payload payload :instance-key-hash key-hash
+                                               :inline-qos inline-qos
+                                               :pooled-buffer pooled-buffer :pooled-len pooled-len
+                                               :zc-slot (or zc-slot -1) :zc-generation zc-gen
+                                               :zc-state (and zc-slot :armed)))))
+            change)))
+
+(defun* writer-zc-claim (writer change)
+    (function (rtps-writer dds.rtps.history:cache-change) boolean)
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). ONE-SHOT claim of
+   CHANGE's pre-committed Zero-Copy slot for ref emission: under WRITER's lock, :armed -> :consumed and T; any
+   other state (NIL / already consumed / released) -> NIL with no transition. The lock serializes the claim
+   against a concurrent emit on another thread (initial push vs ACKNACK retransmit), so the slot's single
+   refcount is spent on EXACTLY ONE emitted ref — a retransmit of a consumed change falls back to the retained
+   payload, never double-emitting the slot."
+  (%with-writer-lock (writer)
+    (and (eq (dds.rtps.history:cache-change-zc-state change) :armed)
+         (progn (setf (dds.rtps.history:cache-change-zc-state change) :consumed) t))))
+
+(defun* writer-zc-unarm (writer change)
+    (function (rtps-writer dds.rtps.history:cache-change) boolean)
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). ONE-SHOT disarm of
+   CHANGE's pre-committed Zero-Copy slot: under WRITER's lock, :armed -> :released and T (the CALLER must then
+   %zc-release the slot exactly once — refcount 1 -> 0, reclaimable); any other state -> NIL, no release owed.
+   Fired by the send-site fallback decision (gate active / no ZC readers — the slot will never be emitted from
+   this decision on) and by the push-pass / teardown leak sweeps (ADR 0042 lifecycle)."
+  (%with-writer-lock (writer)
+    (and (eq (dds.rtps.history:cache-change-zc-state change) :armed)
+         (progn (setf (dds.rtps.history:cache-change-zc-state change) :released) t))))
 
 (defun* writer-lifecycle-change (writer key-hash status-flags &optional (inline-qos nil))
     (function (rtps-writer (simple-array (unsigned-byte 8) (*)) (unsigned-byte 8)

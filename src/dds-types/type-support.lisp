@@ -9,10 +9,12 @@
 
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0017.
 (defstruct* (flatdata-view (:constructor make-flatdata-view))
-  "WP-FLATDATA-ZC-LOAN read-in-place view over a live ZC SHMEM slot (FR-PF-3/4): SLOT-SAP + BASE-OFFSET (=4,
-   past the 4-octet encap header) for the SAP-mode Offset accessors, LEN (validated >= +size+ by the loan
-   path), and the pool handle (POOL-SAP + SLOT-INDEX + GENERATION) for return-loan. Read-only (RX).
-   NOT cleared for ship — pending counsel (R6); see ADR 0017."
+  "WP-FLATDATA-ZC-LOAN in-place view over a live ZC SHMEM slot (FR-PF-3/4): SLOT-SAP + BASE-OFFSET (the XCDR2
+   body start within the segment, past the 4-octet encap header) for the SAP-mode Offset accessors, LEN
+   (validated >= +size+ by the loan path), and the pool handle (POOL-SAP + SLOT-INDEX + GENERATION) for
+   return-loan / loan-write commit. Used BOTH ways: RX read-in-place (ADR 0017, the getters) and WP-FLATDATA-
+   LOAN-WRITE TX write-in-place (ADR 0042 — the setters write the app's fields straight into a writer-loaned
+   slot). NOT cleared for ship — pending counsel (R6); see ADR 0017 / 0042."
   (slot-sap nil :type t) (base-offset 4 :type (integer 0)) (len 0 :type (integer 0))
   (pool-sap nil :type t) (slot-index 0 :type (integer 0)) (generation 0 :type (unsigned-byte 32)))
 
@@ -43,6 +45,10 @@
   (flatdata-offset nil :type (or null function flatdata-layout))
   ;; WP-DATA-REPRESENTATION FlatData TX-transcode (buf,mode,encap)->octets; NIL for non-FlatData (R6, §7.6.3.1.1).
   (flatdata-builder nil :type (or null function))
+  ;; WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): the 0-arg FlatData constructor make-<name>-flatdata (a fresh
+  ;; encap-initialized foreign octet-buffer); NIL for non-FlatData. DCPS loan-sample funcalls it for the
+  ;; graceful-degradation (non-slot) loan AND to source the per-type 4-octet encap header for a slot-backed loan.
+  (flatdata-ctor nil :type (or null function))
   (data-representation-mask 0 :type integer)
   ;; (FIELD-NAME-STRING . unary accessor) per scalar/string member, for content
   ;; filters / query conditions (FR-DCPS-5, ADR 0008). Off the hot path; nil otherwise.

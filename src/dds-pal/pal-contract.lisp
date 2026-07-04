@@ -26,6 +26,9 @@
    ;; foreign-SAP fixed-width unsigned reads — back the FlatData-ZC read-in-place
    ;; accessors (WP-FLATDATA-ZC-LOAN; SBCL-only; R6, NOT cleared for ship — see ADR 0017)
    #:load-sap-u8 #:load-sap-u16 #:load-sap-u32
+   ;; foreign-SAP 8-bit write — backs the FlatData loan-write SAP-mode Offset setters
+   ;; (WP-FLATDATA-LOAN-WRITE; SBCL-only; R6, NOT cleared for ship — see ADR 0042)
+   #:store-sap-u8
    ;; shared memory segments + in-segment PTHREAD_PROCESS_SHARED mutex/condvar (FR-XPORT-2, ADR 0013)
    #:shm-create #:shm-attach #:shm-detach #:shm-destroy #:shm-sap #:shm-segment-size
    #:pshared-mutex-init #:pshared-cond-init #:pshared-lock #:pshared-unlock

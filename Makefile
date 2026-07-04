@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-zc-loan-lockfree bench-async-flow bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-async-flow bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -241,6 +241,15 @@ bench-flatdata:
 bench-flatdata-zc-loan:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-zc-loan :file "bench/report/2026-06-16-wp-flatdata-zc-loan.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+
+# WP-FLATDATA-LOAN-WRITE (FR-PF-4, FR-LANG-7): the 0-copy TX headline — the writer writes a FlatData sample
+# straight into the SHMEM pool slot via the SAP-mode Offset setters, eliminating BOTH intra-host TX copies
+# (app->payload fd-ser + payload->slot %zc-loan) the shipped ZC-TX path pays. BASELINE (two copies) vs LOAN-WRITE
+# (zero copies), GC bytes/sample + ns/sample. Writes bench/report/2026-07-03-wp-flatdata-loan-write.md. SBCL only
+# (ZC + foreign-SAP writes, ADR 0013). NOT cleared for ship — pending counsel (R6); see ADR 0042.
+bench-flatdata-loan-write:
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flatdata-loan-write :file "bench/report/2026-07-03-wp-flatdata-loan-write.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-ZC-LOAN-LOCKFREE Phase C (FR-PF-3/4, NFR-PERF-7, FR-LANG-7): the lock-free 0-alloc loaned RX headline —
 # the loaned RX GC bytes/sample now LITERAL 0 (the lock-free %zc-acquire-for-read + cas-sap-u32 %zc-release),

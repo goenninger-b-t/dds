@@ -2147,6 +2147,256 @@
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
   t)
 
+(defun* %fd-loan-write-view (sap base)
+    (function (t (integer 0)) dds.types:flatdata-view)
+  "WP-FLATDATA-LOAN-WRITE bench helper (R6, ADR 0042): a writer-side flatdata-view over the slot at payload
+   BASE (segment offset) for the SAP-mode Offset SETTERS — slot-sap=SAP, base-offset=BASE+4 (past the encap
+   header). Allocated ONCE and re-pointed per iteration (no per-sample struct cons)."
+  (let ((v (dds.types:make-flatdata-view)))
+    (setf (dds.types:flatdata-view-slot-sap v) sap
+          (dds.types:flatdata-view-base-offset v) (+ base 4)
+          (dds.types:flatdata-view-len v) (max 0 (- +fd-abc-flatdata-size+ 4)))
+    v))
+
+(defun* %fd-loan-write-baseline-bytes (sap fd iters kind)
+    (function (t dds.core.buffer:octet-buffer (integer 1) (member :bytes :ns)) real)
+  "WP-FLATDATA-LOAN-WRITE bench (R6, ADR 0042): the BASELINE TX cycle per sample — the shipped write-sample
+   ZC-TX path: allocate a FRESH SerializedPayload vector (as %serialize-sample does), fd-ser copies the app's
+   FlatData buffer body into it (app→payload copy), then %zc-loan copies it into a pool slot (payload→slot copy),
+   then %zc-release returns the slot. KIND :bytes ⇒ mean dds.pal:bytes-consed/sample; :ns ⇒ mean
+   dds.pal:monotonic-ns/sample. Drives the EXACT primitives write-sample's ZC-TX path funcalls, INCLUDING the
+   per-sample payload allocation loan-write eliminates."
+  (let ((t0 (dds.pal:monotonic-ns)) (before (dds.pal:bytes-consed)))
+    (dotimes (i iters)
+      (let* ((payload (make-array +fd-abc-flatdata-size+ :element-type '(unsigned-byte 8)))   ; fresh per-sample payload (as %serialize-sample allocates)
+             (pc (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over payload) :endianness :little)))
+        (dds.cdr:make-encapsulation-header pc :plain-cdr2-le)
+        (serialize-fd-abc-fd fd pc :xcdr2)                                 ; app→payload identity copy
+        (multiple-value-bind (slot gen) (dds.xport.zerocopy::%zc-loan sap payload 0 +fd-abc-flatdata-size+ 1)  ; payload→slot copy
+          (when slot (dds.xport.zerocopy::%zc-release sap slot gen)))))    ; return the slot
+    (if (eq kind :ns)
+        (/ (float (max 0 (- (dds.pal:monotonic-ns) t0)) 1.0d0) iters)
+        (/ (float (max 0 (- (dds.pal:bytes-consed) before))) iters))))
+
+(defun* %fd-loan-write-bytes (sap view iters kind)
+    (function (t dds.types:flatdata-view (integer 1) (member :bytes :ns)) real)
+  "WP-FLATDATA-LOAN-WRITE bench (R6, ADR 0042): the LOAN-WRITE TX cycle per sample — %zc-loan-acquire a slot,
+   write the SAME fields (a:u8, b:u32, c:u64) STRAIGHT INTO the slot via the SAP-mode Offset setters (NO app→
+   payload copy, NO payload→slot copy), %zc-loan-commit (publish), then %zc-release to return the slot. The view
+   is re-pointed at the freshly acquired slot each iteration (0-alloc). KIND :bytes ⇒ mean bytes-consed/sample
+   (must be ~0), :ns ⇒ mean ns/sample. This is the measured 0-copy TX win."
+  (let ((t0 (dds.pal:monotonic-ns)) (before (dds.pal:bytes-consed)))
+    (dotimes (i iters)
+      (multiple-value-bind (slot base gen) (dds.xport.zerocopy::%zc-loan-acquire sap +fd-abc-flatdata-size+ 1)
+        (when slot
+          (setf (dds.types:flatdata-view-slot-sap view) sap
+                (dds.types:flatdata-view-base-offset view) (+ base 4))
+          (setf (fd-abc-a-fd view) 200 (fd-abc-b-fd view) 3000000000 (fd-abc-c-fd view) 4000000000000000000)  ; fixnum c: the u64 write-in-place is genuinely 0-alloc (a >fixnum value would BOX a bignum in ldb — a Lisp cost, not FlatData)
+          (dds.xport.zerocopy::%zc-loan-commit sap slot gen)
+          (dds.xport.zerocopy::%zc-release sap slot gen))))
+    (if (eq kind :ns)
+        (/ (float (max 0 (- (dds.pal:monotonic-ns) t0)) 1.0d0) iters)
+        (/ (float (max 0 (- (dds.pal:bytes-consed) before))) iters))))
+
+(defun* %fd-loan-write-sendsite (node payload change iters kind armed)
+    (function (t (simple-array (unsigned-byte 8) (*)) t (integer 1) (member :bytes :ns) t) real)
+  "WP-FLATDATA-LOAN-WRITE send-site bench arm (R6, ADR 0042): the per-sample SEND-SITE cost of emitting one
+   large (8 KiB) sample's ZC ref DATA item, measured over the EXACT %zc-change-item the send plan funcalls.
+   ARMED T = the loan-write path: node-loan-write-acquire + commit (the pre-committed slot; the app's field
+   writes happened earlier through the SAP setters and are NOT re-done here), then %zc-change-item CLAIMS the
+   slot and builds the ref item with NO payload->slot copy. ARMED NIL = the write-sample path: %zc-change-item ->
+   %zc-ref-builder -> %zc-loan, which COPIES the 8 KiB payload into a fresh slot. Both arms funcall the item
+   builder into a scratch cursor (the datagram build) and release the slot (as the resolving reader would).
+   KIND :bytes = mean dds.pal:bytes-consed/sample; :ns = mean monotonic-ns/sample."
+  (let* ((sap (dds.disc::disc-node-zc-pool-sap node))
+         (scratch (dds.core.buffer:make-octet-buffer (+ 64 (length payload))))
+         (mc (dds.core.buffer:cursor scratch :endianness :little)))
+    (unwind-protect
+         (let ((t0 (dds.pal:monotonic-ns)) (before (dds.pal:bytes-consed)))
+           (dotimes (i iters)
+             (dds.core.buffer:cursor-reset mc)
+             (if armed
+                 (multiple-value-bind (asap slot base gen) (dds.disc:node-loan-write-acquire node (length payload))
+                   (declare (ignore asap base))
+                   (dds.disc:node-loan-write-commit node slot gen)
+                   (setf (dds.rtps.history:cache-change-zc-slot change) slot
+                         (dds.rtps.history:cache-change-zc-generation change) gen
+                         (dds.rtps.history:cache-change-zc-state change) :armed)
+                   (funcall (cdr (dds.disc::%zc-change-item node change 1)) mc)   ; claim + build: NO copy
+                   (dds.xport.zerocopy::%zc-release sap slot gen))
+                 (progn
+                   (funcall (cdr (dds.disc::%zc-change-item node change 1)) mc)   ; fresh %zc-loan: the 8 KiB copy
+                   (multiple-value-bind (slot gen)
+                       (dds.cdr:parse-zc-reference (dds.core.buffer:octet-buffer-vec scratch) 24 20)   ; the emitted ref names the loaned slot
+                     (dds.xport.zerocopy::%zc-release sap slot gen)))))
+           (if (eq kind :ns)
+               (/ (float (max 0 (- (dds.pal:monotonic-ns) t0)) 1.0d0) iters)
+               (/ (float (max 0 (- (dds.pal:bytes-consed) before))) iters)))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec scratch)))))
+
+(defun* %fd-loan-write-dcps-cycle (dw fd iters kind mode)
+    (function (t dds.core.buffer:octet-buffer (integer 1) (member :bytes :ns) (member :loan :classic)) real)
+  "WP-FLATDATA-LOAN-WRITE bench, the DCPS-level cycle arm (R6, ADR 0042; honest app-visible cost): the REAL
+   write cycle on an unmatched writer (the publish machinery runs; the send-site consume leg is priced by the
+   send-site arm). MODE :loan = loan-sample -> the three -fd setters -> write-loaned (allocates the RETAINED
+   payload + two registry cells per write - the documented v1 cost); :classic = the same field values into a
+   reused owned FlatData buffer FD + write-sample (allocates the %serialize-sample payload per write). KIND
+   :bytes = mean dds.pal:bytes-consed/sample; :ns = mean monotonic-ns/sample."
+  (let ((t0 (dds.pal:monotonic-ns)) (before (dds.pal:bytes-consed)))
+    (dotimes (i iters)
+      (if (eq mode :loan)
+          (let* ((loan (dds.dcps:loan-sample dw))
+                 (s (dds.dcps:writer-loan-sample loan)))
+            (setf (fd-abc-a-fd s) 200 (fd-abc-b-fd s) 3000000000 (fd-abc-c-fd s) 4000000000000000000)
+            (dds.dcps:write-loaned dw loan))
+          (progn
+            (setf (fd-abc-a-fd fd) 200 (fd-abc-b-fd fd) 3000000000 (fd-abc-c-fd fd) 4000000000000000000)
+            (dds.dcps:write-sample dw fd))))
+    (if (eq kind :ns)
+        (/ (float (max 0 (- (dds.pal:monotonic-ns) t0)) 1.0d0) iters)
+        (/ (float (max 0 (- (dds.pal:bytes-consed) before))) iters))))
+
+(defun* run-bench-flatdata-loan-write (&key (file nil) (iters 100000))
+    (function (&key (:file (or null string pathname)) (:iters (integer 1))) t)
+  "WP-FLATDATA-LOAN-WRITE bench (FR-PF-4, FR-LANG-7; R6, ADR 0042 — NOT cleared for ship, counsel R6). The
+   headline 0-copy TX measurement: the writer writes a FlatData sample STRAIGHT INTO the shared-memory pool slot
+   via the SAP-mode Offset setters, eliminating BOTH intra-host TX copies (the app→payload fd-ser copy AND the
+   payload→slot %zc-loan copy) the shipped ZC-TX path pays. Measured over the EXACT pool primitives the loan path
+   funcalls (%zc-loan-acquire / the SAP Offset setters / %zc-loan-commit), for a FINAL fixed-size FlatData type
+   (fd-abc, 20-octet payload). BASELINE = fd-ser + %zc-loan (the two-copy path); LOAN-WRITE = acquire → SAP
+   setters → commit (0 copies). PLUS the SEND-SITE arm (the ADR 0042 integration): %zc-change-item on an ARMED
+   change (claim the pre-committed slot, no copy) vs a plain change (%zc-ref-builder → %zc-loan's 8 KiB copy),
+   over a real disc-node fixture. Prints a markdown report to *standard-output*; when FILE is given, ALSO writes
+   it there. SBCL only (ZC + foreign-SAP writes, ADR 0013); on Clasp the SHMEM by-name attach is unreliable so
+   the bench pass-skips. Per the operating contract no hot-path change lands without a before/after measurement;
+   this is that measurement. NOT cleared for ship — pending counsel (R6)."
+  (let* ((sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
+         (have-shmem (dds.xport.shmem:shm-attach-by-name-reliable-p))
+         (fd (make-fd-abc-flatdata)))
+    (setf (fd-abc-a-fd fd) 200 (fd-abc-b-fd fd) 3000000000 (fd-abc-c-fd fd) 4000000000000000000)
+    (progn
+      (multiple-value-bind (base-bytes base-ns lw-bytes lw-ns ss-plain-bytes ss-plain-ns ss-armed-bytes ss-armed-ns
+                            rx-loan-bytes rx-new-bytes dcps-lw-bytes dcps-lw-ns dcps-ws-bytes dcps-ws-ns)
+          (if (not have-shmem)
+              (values 0 0 0 0 0 0 0 0 0 0 0 0 0 0)
+              (let* ((mem (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 4 +fd-abc-flatdata-size+)))
+                     (sap (dds.pal:static-pointer mem)))
+                (dds.xport.zerocopy::%zc-init sap 4 +fd-abc-flatdata-size+)
+                (multiple-value-bind (pb pn ab an)
+                    ;; the SEND-SITE arm (ADR 0042 integration): a real node fixture, 8 KiB payload, %zc-change-item
+                    (let* ((dds.disc:*shmem-enabled* t) (dds.disc:*zerocopy-enabled* t)
+                           (node (dds.disc:make-disc-node
+                                  :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 88)
+                                  :host "127.0.0.1" :port 0)))
+                      (unwind-protect
+                           (progn
+                             (dds.disc:add-local-writer node :topic "LwBench" :type "fd-abc")
+                             (dds.disc:enable-publisher node)
+                             (let* ((payload (make-array 8192 :element-type '(unsigned-byte 8) :initial-element 42))
+                                    (plain (dds.rtps.history:make-cache-change :sn 1 :serialized-payload payload))
+                                    (armed (dds.rtps.history:make-cache-change :sn 1 :serialized-payload payload))
+                                    (n (max 1 (floor iters 2))))
+                               (values (%fd-loan-write-sendsite node payload plain n :bytes nil)
+                                       (%fd-loan-write-sendsite node payload plain n :ns nil)
+                                       (%fd-loan-write-sendsite node payload armed n :bytes t)
+                                       (%fd-loan-write-sendsite node payload armed n :ns t))))
+                        (dds.disc:stop-node node)))
+                  (multiple-value-bind (dlb dln dwb dwn)
+                      ;; the DCPS-cycle arm (honest app-visible cost): the real loan-sample->write-loaned cycle
+                      (let* ((dds.disc:*shmem-enabled* t) (dds.disc:*zerocopy-enabled* t)
+                             (dds.disc:*zerocopy-min-payload-bytes* 8)
+                             (p (dds.dcps:create-participant :domain (test-domain 3))))
+                        (unwind-protect
+                             (let* ((ts (dds.types:find-type-support "fd-abc"))
+                                    (tw (dds.dcps:create-topic p "LwCycle" "fd-abc" ts))
+                                    (pub (dds.dcps:create-publisher p))
+                                    (dw (dds.dcps:create-datawriter pub tw))
+                                    (cfd (make-fd-abc-flatdata))
+                                    (n (max 1 (floor iters 5))))
+                               (unwind-protect
+                                    (values (%fd-loan-write-dcps-cycle dw cfd n :bytes :loan)
+                                            (%fd-loan-write-dcps-cycle dw cfd n :ns :loan)
+                                            (%fd-loan-write-dcps-cycle dw cfd n :bytes :classic)
+                                            (%fd-loan-write-dcps-cycle dw cfd n :ns :classic))
+                                 (dds.pal:free-static (dds.core.buffer:octet-buffer-vec cfd))))
+                          (dds.dcps:delete-participant p)))
+                    (multiple-value-bind (rlb rnb)
+                        ;; the RX regression check: the pre-existing bench-flatdata-zc-loan RX strategies rerun
+                        (let ((payload (subseq (dds.core.buffer:octet-buffer-vec fd) 0 +fd-abc-flatdata-size+)))
+                          (multiple-value-bind (slot gen)
+                              (dds.xport.zerocopy::%zc-loan sap payload 0 +fd-abc-flatdata-size+ 1)
+                            (let ((lb (%fd-zc-loan-rx-bytes sap slot gen iters))
+                                  (nb (%fd-zc-rx-bytes-new sap slot gen iters)))
+                              (dds.xport.zerocopy::%zc-release sap slot gen)
+                              (values lb nb))))
+                      (unwind-protect
+                           (let ((view (%fd-loan-write-view sap 0)))
+                             (values (%fd-loan-write-baseline-bytes sap fd iters :bytes)
+                                     (%fd-loan-write-baseline-bytes sap fd iters :ns)
+                                     (%fd-loan-write-bytes sap view iters :bytes)
+                                     (%fd-loan-write-bytes sap view iters :ns)
+                                     pb pn ab an rlb rnb dlb dln dwb dwn))
+                        (dds.xport.zerocopy::%zc-destroy sap)
+                        (dds.pal:free-static mem)))))))
+        (flet ((emit (stream)
+                 (format stream "~&# WP-FLATDATA-LOAN-WRITE — zero-copy TX (write the sample straight into the SHMEM pool slot) (FR-PF-4, FR-LANG-7)~%~%")
+                 (format stream "**NOT cleared for ship — pending counsel (R6); see ADR 0042.** `dds.disc:*zerocopy-enabled*` is default OFF and the per-type `:flatdata t` opt-in is off by default; this report exercises the loan-write path with both armed inside the bench only.~%~%")
+                 (format stream "The app-facing loan-write TX API (`loan-sample`/`write-loaned`/`discard-loan`) writes a FlatData sample **directly into the writer's shared-memory pool slot** through the SAP-mode `<name>-<field>-fd` Offset setters, eliminating BOTH intra-host TX copies the shipped Zero-Copy TX path pays: (1) the app→payload identity copy (`serialize-<name>-fd`) and (2) the payload→slot copy (`%zc-loan`). Measured over the EXACT pool primitives the loan path funcalls (`%zc-loan-acquire` / the SAP Offset setters / `%zc-loan-commit`). Generated by `dds.tests:run-bench-flatdata-loan-write` (entry: `make bench-flatdata-loan-write`).~%~%")
+                 (format stream "## Environment~%~%| field | value |~%|-------|-------|~%")
+                 (format stream "| host | ~a (~a) |~%" (machine-instance) (machine-version))
+                 (format stream "| os | ~a ~a ~a |~%" (software-type) (software-version) (machine-type))
+                 (format stream "| impl | ~a ~a |~%" (lisp-implementation-type) (lisp-implementation-version))
+                 (format stream "| HEAD | ~a |~%" (%bench-git-head))
+                 (format stream "| date | ~a |~%" (%bench-date-string))
+                 (format stream "| FlatData type | `fd-abc` (`u8`,`u32`,`u64`) -> `+fd-abc-flatdata-size+` = ~d octets (4 encap + 16 body) |~%" +fd-abc-flatdata-size+)
+                 (format stream "| iters | ~d |~%" iters)
+                 (format stream "~%## Method~%~%")
+                 (format stream "Each row runs one full writer TX cycle `iters` times over a shared pool. BASELINE = `serialize-fd-abc-fd` (app→payload identity copy) + `%zc-loan` (payload→slot block copy) + `%zc-release`. LOAN-WRITE = `%zc-loan-acquire` + the three SAP Offset setters (`a`,`b`,`c` written straight into the slot) + `%zc-loan-commit` + `%zc-release`. GC bytes/sample = `dds.pal:bytes-consed` delta / iters (SBCL-exact, Clasp=0); ns/sample = `dds.pal:monotonic-ns` total / iters (~~us clock, amortised). Both cycles loan + release one slot, so the delta is exactly the two eliminated copies vs the direct field writes.~%~%")
+                 (if (not have-shmem)
+                     (format stream "(SHMEM by-name attach unreliable on this platform — the loan-write bench pass-skipped; Clasp/macOS gap, ADR 0013)~%~%")
+                     (progn
+                       (format stream "## TX per-sample cost — baseline (two copies) vs loan-write (zero copies)~%~%")
+                       (format stream "| TX path | GC bytes/sample | ns/sample | copies |~%")
+                       (format stream "|---------|-----------------|-----------|--------|~%")
+                       (format stream "| BASELINE `%serialize-sample` (fresh payload) + `%zc-loan` | ~,1f | ~,1f | 2 (app→payload, payload→slot) |~%" base-bytes base-ns)
+                       (format stream "| **LOAN-WRITE** acquire + SAP setters + commit | **~,1f** | **~,1f** | **0** (fields written straight into the slot) |~%~%" lw-bytes lw-ns)
+                       (format stream "Loan-write writes the sample **straight into shared memory** — **0** intra-host TX copies. Its **~,1f** GC bytes/sample is ONLY the fixed pool-mutex acquire (a payload-independent CFFI residue the baseline `%zc-loan` ALSO pays); it eliminates the per-sample heap SerializedPayload the shipped write path allocates (the baseline's **~,1f** includes that ~d-octet fresh vector), so the loan-write steady state allocates **no per-sample payload** — the slot is foreign, the view + loan bookkeeping recycle through freelists. In ns, the shipped two-copy path costs **~,1f** ns/sample; loan-write costs **~,1f** ns/sample — a ~~~,1fx TX-primitive speedup, the app→payload intermediate buffer and its identity block-copy eliminated entirely.~%~%"
+                               lw-bytes base-bytes +fd-abc-flatdata-size+ base-ns lw-ns (if (plusp lw-ns) (/ base-ns lw-ns) 0.0d0))
+                       (format stream "## Send-site arm — the ADR 0042 integration (pre-committed slot vs fresh `%zc-loan`, 8 KiB sample)~%~%")
+                       (format stream "The end-to-end delta: for a loan-written change the send plan's `%zc-change-item` CLAIMS the pre-committed slot and builds the 20-octet-ref DATA item with **no payload→slot copy**; a `write-sample` change takes `%zc-ref-builder` → `%zc-loan`, copying the 8192-octet payload into a fresh slot. Both arms build the identical DATA bytes into a scratch cursor and release the slot (as the resolving reader would). ~d iterations each.~%~%" (max 1 (floor iters 2)))
+                       (format stream "| send-site path | GC bytes/sample | ns/sample | payload→slot copy |~%")
+                       (format stream "|----------------|-----------------|-----------|-------------------|~%")
+                       (format stream "| `write-sample` path: `%zc-ref-builder` → `%zc-loan` (copy) | ~,1f | ~,1f | 8192 octets |~%" ss-plain-bytes ss-plain-ns)
+                       (format stream "| **loan-write path: acquire+commit + claim (`%zc-armed-item`)** | **~,1f** | **~,1f** | **0** |~%~%" ss-armed-bytes ss-armed-ns)
+                       (format stream "The loan-write send site emits the ref **~,1fx faster** for this 8 KiB sample (the eliminated copy scales with payload size); GC bytes/sample are the identical fixed item-build cost (the 20-octet ref vec + the builder closure) on both arms.~%~%"
+                               (if (plusp ss-armed-ns) (/ ss-plain-ns ss-armed-ns) 0.0d0))
+                       (format stream "## DCPS-cycle arm — the honest app-visible write cost (FR-LANG-7)~%~%")
+                       (format stream "The REAL `loan-sample` -> `-fd` setters -> `write-loaned` cycle vs `write-sample` on a reused FlatData buffer, unmatched writer, ~d iterations. **v1 `write-loaned` is NOT 0-GC**: it allocates the RETAINED payload vector (it lives in the writer HistoryCache to serve retransmission / non-ZC / extra-ZC destinations — reuse would corrupt history) plus two registry list cells; the loan struct + view recycle through the freelist. This is the documented v1 cost, the same order as `write-sample`'s `%serialize-sample` payload; it is eliminated only by the acked-slot-pinning follow-up (ADR 0042 Follow-ups). NOTE the configuration: with NO ZC destination and a tiny 20-octet sample, loan-write's benefit (the eliminated send-site copy) cannot appear, so its fixed overhead (slot acquire/commit + the slot->heap retained copy + the sweep) makes the cycle SLOWER than `write-sample` here — the win requires a same-host ZC reader and scales with payload size (the send-site arm above: ~~29x at 8 KiB). The 0-copy and 0-GC claims are scoped precisely: the SEND-SITE payload->slot copy is eliminated (send-site arm) and the POOL PRIMITIVES are 0-GC (primitive table); v1 `write-loaned` itself is NOT 0-GC.~%~%"
+                               (max 1 (floor iters 5)))
+                       (format stream "| DCPS write cycle | GC bytes/sample | ns/sample |~%")
+                       (format stream "|------------------|-----------------|-----------|~%")
+                       (format stream "| `write-sample` (reused FlatData buffer) | ~,1f | ~,1f |~%" dcps-ws-bytes dcps-ws-ns)
+                       (format stream "| `loan-sample` -> setters -> `write-loaned` | ~,1f | ~,1f |~%~%" dcps-lw-bytes dcps-lw-ns)
+                       (format stream "## RX regression check (the pre-existing `bench-flatdata-zc-loan` strategies, rerun)~%~%")
+                       (format stream "| RX strategy | GC bytes/sample |~%|-------------|------------------|~%")
+                       (format stream "| literal-0-copy loan RX (`%zc-acquire-for-read` + SAP read) | ~,1f |~%" rx-loan-bytes)
+                       (format stream "| FlatData+ZC v1 single-copy (`%zc-resolve-fresh`) | ~,1f |~%~%" rx-new-bytes)
+                       (format stream "The RX-side loan path is untouched by this WP (the `%zc-loan` split is behaviour-identical); the literal-0-copy loan RX still allocates ~,1f GC bytes/sample vs the v1 single-copy's ~,1f — no regression vs `bench/report/2026-06-16-wp-flatdata-zc-loan.md`.~%~%"
+                               rx-loan-bytes rx-new-bytes)))
+                 (format stream "Correctness envelope (ADR 0042 §5, as shipped): loan-write is an OPTIMIZATION of the ZC TX path — every existing case (non-ZC readers, reliable retransmit, late-joiners, pool saturation, multi-destination) is served identically from the RETAINED payload `write-loaned` materialises once. The PRE-COMMITTED slot is consumed at the FIRST ZC-eligible destination (exactly-one-ZC-destination = the pure end-to-end envelope, proven by `dcps-loan-write-e2e`); any further ZC destination pays a fresh `%zc-loan` exactly as today, a retransmit always uses the retained payload, and a slot the send pass never consumes is released by the fallback decision / the push-pass sweep / the teardown sweep (never a strand, ADR 0042 lifecycle).~%~%")
+                 (format stream "Method: ~d iterations; SBCL-exact (`bytes-consed` + `load/store-sap-u8` are SBCL-only, ZC ADR 0013; Clasp pass-skips). Impl: ~a ~a on ~a.~%"
+                         iters (lisp-implementation-type) (lisp-implementation-version) (machine-instance))
+                 (when (and sbcl-p have-shmem)
+                   (assert (< lw-bytes base-bytes) () "bench: loan-write (~,1f) must allocate strictly less than the baseline (~,1f) — the per-sample payload eliminated" lw-bytes base-bytes)
+                   (assert (<= lw-bytes 64) () "bench: loan-write (~,1f) must be a small fixed mutex residue, not a per-sample payload" lw-bytes))))
+          (emit *standard-output*)
+          (when file
+            (with-open-file (s file :direction :output :if-exists :supersede :if-does-not-exist :create)
+              (emit s))
+            (format t "~&  wrote ~a~%" file)))))
+    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+  t)
+
 (defun* %fd-zc-loan-scan-ns (slots payload iters)
     (function ((integer 1) (simple-array (unsigned-byte 8) (*)) (integer 1)) double-float)
   "WP-ZC-LOAN-LOCKFREE Phase C (R6, ADR 0018; NOT cleared for ship — pending counsel): mean ns/loan of the
@@ -2451,6 +2701,314 @@
       (format t "~&  [skip] flatdata-view-accessor: load-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%"))
   t)
 
+(defun* %fd-sap-setter-byte-exact (ctor-fn field-value-alist)
+    (function (function list) t)
+  "WP-FLATDATA-LOAN-WRITE (R6, ADR 0042) helper (DRY): CTOR-FN returns a fresh encap-initialized FlatData buffer;
+   FIELD-VALUE-ALIST maps each (setf <name>-<field>-fd) function to the value to write. Write every field into a
+   REF buffer via the owned aref setter AND into a TGT buffer via the SAME setter over a flatdata-view onto TGT's
+   SAP (the dual-dispatch view/SAP write branch), then assert the two buffers are byte-IDENTICAL over their whole
+   extent (the owned setter is the byte-exact oracle for the SAP setter). Frees both. NOT cleared for ship (R6)."
+  (let* ((ref (funcall ctor-fn)) (tgt (funcall ctor-fn))
+         (view (dds.types:make-flatdata-view :slot-sap (dds.core.buffer:buffer-sap tgt) :base-offset 4
+                                             :len (dds.core.buffer:octet-buffer-capacity tgt))))
+    (unwind-protect
+         (progn
+           (dolist (fv field-value-alist)
+             (funcall (car fv) (cdr fv) ref)     ; owned aref setter -> REF vec
+             (funcall (car fv) (cdr fv) view))   ; dual-dispatch view setter -> TGT SAP
+           (let ((rv (dds.core.buffer:octet-buffer-vec ref)) (tv (dds.core.buffer:octet-buffer-vec tgt))
+                 (n (dds.core.buffer:octet-buffer-capacity tgt)))
+             (%check :fd-sap-set-byte-exact
+                     (loop for k below n always (= (aref rv k) (aref tv k)))
+                     "the SAP-mode Offset setter (view) must write byte-IDENTICALLY to the owned aref setter")))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ref))
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec tgt)))
+    t))
+
+(defun* run-flatdata-sap-setter-test ()
+    (function () (eql t))
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel): the SAP-mode Offset
+   SETTER (the loan-write write-side dual of the read-in-place getter) writes a flatdata-view (SAP path) byte-
+   IDENTICALLY to the owned octet-buffer (aref path), via the predicted struct-type dispatch branch — for every
+   width + signed-negative + bool. SBCL only (store-sap-u8 is SBCL-only, ZC ADR 0013); Clasp pass-skips."
+  (if (eq (dds.pal:pal-impl-name) :sbcl)
+      (progn
+        (%fd-sap-setter-byte-exact #'make-fd-abc-flatdata
+         (list (cons #'(setf fd-abc-a-fd) 200) (cons #'(setf fd-abc-b-fd) 3000000000)
+               (cons #'(setf fd-abc-c-fd) 12345678901234567890)))
+        (%fd-sap-setter-byte-exact #'make-fd-sig-flatdata
+         (list (cons #'(setf fd-sig-a-fd) 7) (cons #'(setf fd-sig-b-fd) -123456789)
+               (cons #'(setf fd-sig-c-fd) -1234567890123456789)))
+        (%fd-sap-setter-byte-exact #'make-fd-narrow-flatdata
+         (list (cons #'(setf fd-narrow-a-fd) #xBEEF) (cons #'(setf fd-narrow-b-fd) -12345)
+               (cons #'(setf fd-narrow-c-fd) t) (cons #'(setf fd-narrow-d-fd) -42)))
+        (%fd-sap-setter-byte-exact #'make-fd-narrow-flatdata   ; bool nil branch
+         (list (cons #'(setf fd-narrow-c-fd) nil))))
+      (format t "~&  [skip] flatdata-sap-setter: store-sap-u8 is SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%"))
+  t)
+
+(defun* run-loan-write-primitive-test ()
+    (function () (eql t))
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel): the acquire/commit
+   loan-write cycle + the ordering handshake (ADR 0042 §2). %zc-loan-acquire a slot; BEFORE commit a reader
+   acquiring with the loan generation MUST fail (the generation is not yet published — the slot is invisible
+   mid-write); write the FlatData fields STRAIGHT INTO the slot via the SAP-mode Offset setters; %zc-loan-commit;
+   NOW %zc-acquire-for-read succeeds and the fields read back byte-exactly (the SAP setters wrote the slot); a
+   single %zc-release frees it (acquire held refcount=1). SBCL only (store/load-sap-u8 SBCL-only, ZC ADR 0013)."
+  (if (not (eq (dds.pal:pal-impl-name) :sbcl))
+      (progn (format t "~&  [skip] loan-write-primitive: store/load-sap-u8 SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%") t)
+      (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 +fd-abc-flatdata-size+))))
+        (unwind-protect
+             (let ((sap (dds.pal:static-pointer m)))
+               (dds.xport.zerocopy::%zc-init sap 2 +fd-abc-flatdata-size+)
+               (multiple-value-bind (slot base gen) (dds.xport.zerocopy::%zc-loan-acquire sap +fd-abc-flatdata-size+ 1)
+                 (%check :lw-acquire (and slot (integerp slot)) "%zc-loan-acquire must return a slot")
+                 (%check :lw-held (= 1 (dds.xport.zerocopy::%zc-free-count sap)) "after acquire one slot is held (refcount=1)")
+                 ;; ORDERING (ADR 0042 §2): before commit the generation is NOT published — a reader acquiring with it fails
+                 (%check :lw-precommit-invisible (null (dds.xport.zerocopy::%zc-acquire-for-read sap slot gen))
+                         "before %zc-loan-commit the slot generation is unpublished — a reader acquiring with the loan generation MUST fail")
+                 ;; write the fields straight into the slot via the SAP setters (over a writer view)
+                 (let ((wv (dds.types:make-flatdata-view :slot-sap sap :base-offset (+ base 4)
+                                                         :len (max 0 (- +fd-abc-flatdata-size+ 4)))))
+                   (setf (fd-abc-a-fd wv) 200 (fd-abc-b-fd wv) 3000000000 (fd-abc-c-fd wv) 4000000000000000000))
+                 (dds.xport.zerocopy::%zc-loan-commit sap slot gen)
+                 ;; now the slot is published: acquire succeeds and the fields read back byte-exactly
+                 (multiple-value-bind (psap idx rgen len pbase) (dds.xport.zerocopy::%zc-acquire-for-read sap slot gen)
+                   (declare (ignore idx rgen len))
+                   (%check :lw-committed-visible psap "after commit %zc-acquire-for-read must return a handle")
+                   (let ((rv (dds.types:make-flatdata-view :slot-sap psap :base-offset (+ pbase 4)
+                                                           :len (max 0 (- +fd-abc-flatdata-size+ 4)))))
+                     (%check :lw-read-a (= 200 (fd-abc-a-fd rv)) "field a must read back 200")
+                     (%check :lw-read-b (= 3000000000 (fd-abc-b-fd rv)) "field b must read back 3000000000")
+                     (%check :lw-read-c (= 4000000000000000000 (fd-abc-c-fd rv)) "field c must read back 4000000000000000000")))
+                 (dds.xport.zerocopy::%zc-release sap slot gen)
+                 (%check :lw-freed (= 2 (dds.xport.zerocopy::%zc-free-count sap)) "after release the slot frees (acquire held exactly one count)"))
+               (dds.xport.zerocopy::%zc-destroy sap)
+               t)
+          (dds.pal:free-static m)))))
+
+(defun* run-loan-write-abort-test ()
+    (function () (eql t))
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel): %zc-loan-abort
+   releases an acquired-but-uncommitted slot back to reclaimable WITHOUT publishing a generation (invisible to
+   readers, ADR 0042 §2), is idempotent (double-abort is a no-op), and a subsequent acquire reuses the slot.
+   SBCL only (the pool primitives; ZC ADR 0013)."
+  (if (not (eq (dds.pal:pal-impl-name) :sbcl))
+      (progn (format t "~&  [skip] loan-write-abort: pool primitives SBCL-only (ZC, ADR 0013) — NFR-PORT gap~%") t)
+      (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 2 +fd-abc-flatdata-size+))))
+        (unwind-protect
+             (let ((sap (dds.pal:static-pointer m)))
+               (dds.xport.zerocopy::%zc-init sap 2 +fd-abc-flatdata-size+)
+               (multiple-value-bind (slot base gen) (dds.xport.zerocopy::%zc-loan-acquire sap +fd-abc-flatdata-size+ 1)
+                 (declare (ignore base gen))
+                 (%check :lw-abort-held (= 1 (dds.xport.zerocopy::%zc-free-count sap)) "after acquire one slot held")
+                 (dds.xport.zerocopy::%zc-loan-abort sap slot)
+                 (%check :lw-abort-freed (= 2 (dds.xport.zerocopy::%zc-free-count sap)) "abort must return the slot to reclaimable (refcount=0)")
+                 (dds.xport.zerocopy::%zc-loan-abort sap slot)
+                 (%check :lw-abort-double (= 2 (dds.xport.zerocopy::%zc-free-count sap)) "double-abort is a validated no-op")
+                 ;; the aborted slot never published a generation: a stale acquire with the acquire's would-be gen fails
+                 (%check :lw-abort-invisible (null (dds.xport.zerocopy::%zc-acquire-for-read sap slot 1))
+                         "an aborted slot never published a generation ⇒ a reader acquiring gen 1 must fail")
+                 (multiple-value-bind (s2 b2 g2) (dds.xport.zerocopy::%zc-loan-acquire sap +fd-abc-flatdata-size+ 1)
+                   (declare (ignore b2 g2))
+                   (%check :lw-abort-reuse (integerp s2) "after abort a fresh acquire must succeed (slot reusable)")
+                   (dds.xport.zerocopy::%zc-loan-abort sap s2)))
+               (dds.xport.zerocopy::%zc-destroy sap)
+               t)
+          (dds.pal:free-static m)))))
+
+(defun* run-loan-write-eligibility-test ()
+    (function () (eql t))
+  "WP-FLATDATA-LOAN-WRITE loan-end gate (FR-PF-4, R6, ADR 0042 §6; NOT cleared for ship — pending counsel):
+   node-loan-write-eligible-p must fail-closed for EVERY protection tier — the wire-protection kinds
+   (rtps_protection / metadata_protection, the ADR 0036 Carry-10 inheritance) AND data_protection (the
+   loan-write-specific gate: the slot would hold pre-transform PLAINTEXT, unlike the classic ZC path where the
+   pool receives the already-transformed SecuredPayload) — plus the pool + min-size gates. Deterministic slot
+   reads on a bare disc-node struct; both impls (no SAP, no networking)."
+  (let ((n (dds.disc::%make-disc-node)))
+    (%check :lwe-no-pool (not (dds.disc:node-loan-write-eligible-p n 2000))
+            "no ZC pool must not be eligible")
+    (setf (dds.disc::disc-node-zc-pool n) t)
+    (%check :lwe-eligible (dds.disc:node-loan-write-eligible-p n 2000)
+            "pool + size + all-protections-:none must be eligible")
+    (%check :lwe-small (not (dds.disc:node-loan-write-eligible-p n 100))
+            "a size at/below *zerocopy-min-payload-bytes* must not be eligible")
+    (setf (dds.disc::disc-node-rtps-protection-kind n) :sign)
+    (%check :lwe-rtps (not (dds.disc:node-loan-write-eligible-p n 2000))
+            "rtps_protection non-NONE must fail-closed (ADR 0036 Carry-10)")
+    (setf (dds.disc::disc-node-rtps-protection-kind n) :none
+          (dds.disc::disc-node-user-submessage-protection-kind n) :encrypt)
+    (%check :lwe-meta (not (dds.disc:node-loan-write-eligible-p n 2000))
+            "metadata (user-submessage) protection non-NONE must fail-closed (ADR 0036 Carry-10)")
+    (setf (dds.disc::disc-node-user-submessage-protection-kind n) :none
+          (dds.disc::disc-node-user-data-protection-kind n) :encrypt)
+    (%check :lwe-data (not (dds.disc:node-loan-write-eligible-p n 2000))
+            "governance-mandated data_protection (:encrypt) must fail-closed for loan-write (pre-transform plaintext; ADR 0042 §6)")
+    (setf (dds.disc::disc-node-user-data-protection-kind n) :sign)
+    (%check :lwe-data-sign (not (dds.disc:node-loan-write-eligible-p n 2000))
+            "governance-mandated data_protection (:sign) must fail-closed for loan-write (ADR 0042 §6)")
+    (setf (dds.disc::disc-node-user-data-protection-kind n) :unset
+          (dds.disc::disc-node-crypto-transform n) t)
+    (%check :lwe-data-unset-km (not (dds.disc:node-loan-write-eligible-p n 2000))
+            ":unset (no governance) WITH a crypto-transform (Slice-1 direct-KM) transforms the payload — fail-closed (ADR 0042 §6)")
+    (setf (dds.disc::disc-node-crypto-transform n) nil)
+    (%check :lwe-restored (dds.disc:node-loan-write-eligible-p n 2000)
+            ":unset with NO crypto-transform rides plain — eligibility restored")
+    (setf (dds.disc::disc-node-user-data-protection-kind n) :none
+          (dds.disc::disc-node-crypto-transform n) t)
+    (%check :lwe-data-none-km (dds.disc:node-loan-write-eligible-p n 2000)
+            "governance data=NONE rides plain even with a transform installed — eligible (matches publish-sample)"))
+  t)
+
+(defun* %lw-armed-change (node payload)
+    (function (t (simple-array (unsigned-byte 8) (*))) (values (integer 0) (unsigned-byte 32) t))
+  "WP-FLATDATA-LOAN-WRITE test helper (R6, ADR 0042): acquire+commit a pool slot on NODE (as write-loaned does)
+   and writer-write PAYLOAD armed with it; returns (values SLOT GEN CHANGE). The slot's payload bytes are NOT
+   written (these send-site tests assert lifecycle/refcounts, not slot contents)."
+  (multiple-value-bind (sap slot base gen) (dds.disc:node-loan-write-acquire node (length payload))
+    (declare (ignore base))
+    (assert sap () "loan-write acquire failed (pool must have a free slot)")
+    (dds.disc:node-loan-write-commit node slot gen)
+    (multiple-value-bind (sn change)
+        (dds.rtps.reliable:writer-write (dds.disc::disc-node-user-writer node) payload nil nil nil nil slot gen)
+      (declare (ignore sn))
+      (values slot gen change))))
+
+(defun* run-loan-write-sendsite-test ()
+    (function () (eql t))
+  "WP-FLATDATA-LOAN-WRITE send-site lifecycle (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel).
+   Deterministic, single-process (no networking): a real disc-node with a ZC pool + user writer; changes armed
+   with a pre-committed slot are driven through %zc-change-item / the sweeps. Asserts the binding lifecycle:
+     (1) CONSUME: an :armed change at a ZC-eligible destination (zc-readers 1) emits a ref item whose BYTES are
+         exactly the %encode-zc-ref-vec of the PRE-COMMITTED (slot, gen) (no fresh loan — free-count unchanged),
+         one-shot (:consumed), zc-sends bumped.
+     (2) RETRANSMIT-AFTER-CONSUME: a second %zc-change-item on the consumed change with zc-readers 0 (the
+         retransmit path) returns NIL (payload fallback) WITHOUT touching the slot refcount (it belongs to the
+         resolving reader now); with zc-readers 1 it takes the FRESH-loan path (a new slot), never the consumed one.
+     (3) GATE AUTHORITATIVE (ADR 0036 Carry-10): an :armed change on a wire-protected node -> NIL AND the slot is
+         RELEASED (refcount 0, free-count restored), state :released.
+     (4) FALLBACK DECISION: an :armed change with zc-readers 0 -> NIL AND the slot is released.
+     (5) UNMATCHED-BEFORE-SEND: publish-sample with a pre-committed slot on a node with NO destinations -> the
+         synchronous push pass finds zero groups and the post-pass sweep releases the slot (free-count restored,
+         registry drained).
+     (6) CLOSE SWEEP: with batching deferring the flush, the armed change sits in the registry; %zc-armed-sweep
+         (the stop-node teardown call) releases it.
+   SBCL only (ZC pool, ADR 0013); Clasp pass-skips."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (format t "~&  [skip] loan-write-sendsite: SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap~%")
+    (return-from run-loan-write-sendsite-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (payload (make-array 20 :element-type '(unsigned-byte 8) :initial-element 7))
+         (node (dds.disc:make-disc-node
+                :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 77)
+                :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer node :topic "LwSend" :type "fd-abc")
+           (dds.disc:enable-publisher node)
+           (let* ((sap (dds.disc::disc-node-zc-pool-sap node))
+                  (k (dds.xport.zerocopy::%zc-free-count sap)))
+             ;; (1) CONSUME the pre-committed slot at a ZC-eligible destination
+             (multiple-value-bind (slot gen change) (%lw-armed-change node payload)
+               (%check :lws-armed (eq (dds.rtps.history:cache-change-zc-state change) :armed)
+                       "writer-write with a slot must arm the change")
+               (%check :lws-held (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                       "the committed slot must be held (free-count K-1)")
+               (let ((sends0 (dds.disc::disc-node-zc-sends node))
+                     (item (dds.disc::%zc-change-item node change 1)))
+                 (%check :lws-consume-item (consp item) "an armed change at a ZC destination must yield a ref item")
+                 (%check :lws-consumed (eq (dds.rtps.history:cache-change-zc-state change) :consumed)
+                         "the claim must be one-shot (:consumed)")
+                 (%check :lws-zc-sends (= (1+ sends0) (dds.disc::disc-node-zc-sends node))
+                         "zc-sends must bump on the consumed emission")
+                 (%check :lws-no-fresh-loan (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                         "consuming the PRE-COMMITTED slot must NOT loan a fresh one (free-count unchanged)")
+                 ;; the emitted DATA bytes must carry the ref of the PRE-COMMITTED (slot, gen) — the exact emitters
+                 (let* ((got-buf (dds.core.buffer:make-octet-buffer 128))
+                        (gc (dds.core.buffer:cursor got-buf :endianness :little))
+                        (want-buf (dds.core.buffer:make-octet-buffer 128))
+                        (wc (dds.core.buffer:cursor want-buf :endianness :little))
+                        (ref (dds.disc::%encode-zc-ref-vec slot gen dds.disc:+zerocopy-pool-slot-bytes+)))
+                   (funcall (cdr item) gc)
+                   (dds.rtps.message:write-data wc dds.rtps.message:+entityid-unknown+
+                                                (dds.disc::disc-node-user-writer-id node)
+                                                (dds.rtps.history:cache-change-sn change) ref 0 (length ref))
+                   (let ((n (dds.core.buffer:cursor-position gc)))
+                     (%check :lws-ref-bytes
+                             (and (= n (dds.core.buffer:cursor-position wc))
+                                  (loop for i below n
+                                        always (= (aref (dds.core.buffer:octet-buffer-vec got-buf) i)
+                                                  (aref (dds.core.buffer:octet-buffer-vec want-buf) i))))
+                             "the consumed item's DATA bytes must be exactly the pre-committed slot's ref"))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec got-buf))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec want-buf)))
+                 ;; (2) retransmit-after-consume: zc-readers 0 -> NIL, refcount untouched (reader owns it)
+                 (%check :lws-retransmit-nil (null (dds.disc::%zc-change-item node change 0))
+                         "a retransmit (zc-readers 0) of a consumed change must fall back to the payload (NIL)")
+                 (%check :lws-retransmit-holds (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                         "the retransmit fallback must NOT release the consumed slot (the reader owns it)")
+                 ;; a hypothetical ZC re-emit of the consumed change takes a FRESH loan, never the consumed slot
+                 (let ((item2 (dds.disc::%zc-change-item node change 1)))
+                   (%check :lws-reemit-fresh (consp item2) "a ZC re-emit of a consumed change must take the fresh-loan path")
+                   (%check :lws-reemit-new-slot (= (- k 2) (dds.xport.zerocopy::%zc-free-count sap))
+                           "the re-emit must have loaned a FRESH slot (free-count K-2), never the consumed one"))
+                 ;; restore: release the consumed slot (as the reader would) + the fresh probe slot
+                 (dds.xport.zerocopy::%zc-release sap slot gen)
+                 (dotimes (i (dds.xport.zerocopy::%zc-slot-count sap))   ; release the probe slot wherever it landed
+                   (when (plusp (%zc-slot-refcount sap i))
+                     (dds.xport.zerocopy::%zc-release sap i
+                       (dds.pal:load-sap-u32 sap (+ (dds.xport.zerocopy::%zc-slot-off sap i)
+                                                    dds.xport.zerocopy::+zc-slot-off-generation+)))))
+                 (%check :lws-restored (= k (dds.xport.zerocopy::%zc-free-count sap))
+                         "all probe slots must be back (test hygiene)")))
+             ;; (3) GATE AUTHORITATIVE: wire-protected node -> NIL + slot released
+             (multiple-value-bind (slot gen change) (%lw-armed-change node payload)
+               (declare (ignore slot gen))
+               (setf (dds.disc::disc-node-rtps-protection-kind node) :sign)
+               (%check :lws-gate-nil (null (dds.disc::%zc-change-item node change 1))
+                       "the send-site security gate must veto an armed change (fail-closed, ADR 0036 Carry-10)")
+               (%check :lws-gate-released (eq (dds.rtps.history:cache-change-zc-state change) :released)
+                       "the gate veto must RELEASE the armed slot (one-shot :released)")
+               (%check :lws-gate-freed (= k (dds.xport.zerocopy::%zc-free-count sap))
+                       "the gate veto must free the slot (refcount 0)")
+               (setf (dds.disc::disc-node-rtps-protection-kind node) :none))
+             ;; (4) FALLBACK DECISION: zc-readers 0 -> NIL + slot released
+             (multiple-value-bind (slot gen change) (%lw-armed-change node payload)
+               (declare (ignore slot gen))
+               (%check :lws-fallback-nil (null (dds.disc::%zc-change-item node change 0))
+                       "a non-ZC destination decision must return NIL (payload path)")
+               (%check :lws-fallback-freed (= k (dds.xport.zerocopy::%zc-free-count sap))
+                       "the non-ZC fallback decision must release the armed slot"))
+             ;; (5) UNMATCHED-BEFORE-SEND: publish with no destinations -> the post-pass sweep frees the slot
+             (multiple-value-bind (sap2 slot base gen) (dds.disc:node-loan-write-acquire node 20)
+               (declare (ignore base))
+               (%check :lws-pub-acquired (and sap2 t) "acquire for the unmatched-publish case must succeed")
+               (dds.disc:node-loan-write-commit node slot gen)
+               (dds.disc:publish-sample node payload nil slot gen)   ; zero groups -> swept at the end of the pass
+               (%check :lws-unmatched-freed (= k (dds.xport.zerocopy::%zc-free-count sap))
+                       "an armed change that resolves to ZERO destinations must be released by the push-pass sweep")
+               (%check :lws-registry-drained (null (dds.disc::disc-node-zc-armed-changes node))
+                       "the sweep must drain the armed registry"))
+             ;; (6) CLOSE SWEEP: batching defers the flush; the teardown sweep releases the armed slot
+             (setf (dds.disc::disc-node-batch-max-samples node) 1000)
+             (multiple-value-bind (sap3 slot base gen) (dds.disc:node-loan-write-acquire node 20)
+               (declare (ignore sap3 base))
+               (dds.disc:node-loan-write-commit node slot gen)
+               (dds.disc:publish-sample node payload nil slot gen)   ; deferred: no flush, no pass
+               (%check :lws-batch-held (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                       "with the flush deferred the armed slot must still be held")
+               (%check :lws-batch-registered (= 1 (length (dds.disc::disc-node-zc-armed-changes node)))
+                       "the deferred armed change must sit in the registry")
+               (dds.disc::%zc-armed-sweep node)   ; the stop-node teardown call
+               (%check :lws-close-freed (= k (dds.xport.zerocopy::%zc-free-count sap))
+                       "the teardown sweep must release the armed-but-never-pushed slot")
+               (%check :lws-close-drained (null (dds.disc::disc-node-zc-armed-changes node))
+                       "the teardown sweep must drain the registry"))))
+      (dds.disc:stop-node node)))
+  t)
+
 (defun* run-flow-token-bucket-test ()
     (function () t)
   "WP-ASYNC-FLOW (FR-PF-2, flow-control half), ADR 0016: the bytes/period token bucket with a deterministic
@@ -2753,6 +3311,8 @@
                  ("flatdata-zerocopy"        . run-flatdata-zerocopy-test)
                  ("zc-defer"                 . run-zc-defer-test)
                  ("dcps-loan-roundtrip"      . run-dcps-loan-roundtrip-test)
+                 ("dcps-loan-write-e2e"      . run-dcps-loan-write-e2e-test)
+                 ("loan-write-shmem-cleartext" . run-loan-write-shmem-cleartext-test)
                  ("loan-read-return-take"    . run-loan-read-return-take-test)
                  ("loan-handle-dealias"      . run-loan-handle-dealias-test)
                  ("flatdata-zc-loan-e2e"     . run-flatdata-zc-loan-e2e-test)
@@ -2909,7 +3469,12 @@
                  ("flatdata-zero-alloc"      . run-flatdata-zero-alloc-test)
                  ("flatdata-deser-interop"   . run-flatdata-deser-interop-test)
                  ("flatdata-sap-getter"      . run-flatdata-sap-getter-test)
+                 ("flatdata-sap-setter"      . run-flatdata-sap-setter-test)
                  ("flatdata-view-accessor"   . run-flatdata-view-accessor-test)
+                 ("loan-write-primitive"     . run-loan-write-primitive-test)
+                 ("loan-write-abort"         . run-loan-write-abort-test)
+                 ("loan-write-eligibility"   . run-loan-write-eligibility-test)
+                 ("loan-write-sendsite"      . run-loan-write-sendsite-test)
                  ("flatdata-transcode-xcdr1be" . run-flatdata-transcode-xcdr1be-test)
                  ("flatdata-transcode-xcdr1le" . run-flatdata-transcode-xcdr1le-test)
                  ("flatdata-transcode-xcdr2be" . run-flatdata-transcode-xcdr2be-test)

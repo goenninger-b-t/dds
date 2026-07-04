@@ -42,7 +42,17 @@
   (send-refcount 0 :type (integer 0))                                     ; in-flight/deferred send references (operating contract §4 release-safety; mutated only under the owning writer's lock)
   (pooled-buffer nil :type (or null dds.core.buffer:octet-buffer))        ; T5a: the pool buffer this change owns (NIL = not pooled, byte-identical)
   (pooled-len nil :type (or null (integer 0)))                            ; T5a: true secured-payload length within the oversized pooled vec (NIL = not pooled)
-  (evicted nil :type boolean))                                            ; T5a: change has left the cache — gates the deferred pooled-buffer release (mutated only under the owning writer's lock)
+  (evicted nil :type boolean)                                             ; T5a: change has left the cache — gates the deferred pooled-buffer release (mutated only under the owning writer's lock)
+  ;; WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel): the PRE-COMMITTED
+  ;; Zero-Copy pool slot this change's payload already sits in (loan-write wrote the sample straight into the
+  ;; slot; refcount=1 held). ZC-STATE lifecycle — mutated ONLY under the owning writer's lock (writer-zc-claim /
+  ;; writer-zc-unarm): NIL (no slot, the default — byte-identical everywhere), :ARMED (slot committed + held, the
+  ;; send site may emit its ref ONCE), :CONSUMED (the single ref was emitted; the refcount now belongs to the
+  ;; resolving reader; a retransmit falls back to the retained payload), :RELEASED (the send-site fallback
+  ;; decision / sweep %zc-released the slot; the retained payload serves every send). ZC-SLOT -1 = none.
+  (zc-slot -1 :type fixnum)                                               ; ADR 0042: pre-committed pool slot index (-1 = none)
+  (zc-generation 0 :type (unsigned-byte 32))                              ; ADR 0042: the slot's committed generation
+  (zc-state nil :type (member nil :armed :consumed :released)))           ; ADR 0042: one-shot slot lifecycle (under the writer lock)
 
 (defun* cache-change-releasable-p (change)
     (function (cache-change) boolean)

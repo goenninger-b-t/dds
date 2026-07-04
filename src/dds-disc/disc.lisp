@@ -186,6 +186,7 @@
   (zc-sends 0 :type (integer 0))           ; user samples this node published as a zero-copy reference
   (zc-attach-cache (make-hash-table :test 'equalp) :type hash-table) ; reader side: remote 12-octet prefix -> attached pool shm-segment | :none
   (zc-attach-lock (dds.pal:make-lock "zc-attach") :type t)
+  (zc-armed-changes '() :type list)        ; WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): changes born :armed with a pre-committed slot, pending their push pass — the leak-safety sweep registry (guarded by LOCK; drained by %zc-armed-sweep after each push pass / at stop-node)
   (zc-loan-capable nil :type t)            ; WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017): DCPS set this iff the local reader is on a :flatdata topic AND ZC armed -> the receiver thread stores the UNRESOLVED ref (no copy/release; the slot stays loaned via the writer's refcount) and DCPS take-loaned/return-loan owns the slot lifetime. NIL (default) = today's resolve-copy-release. NOT cleared for ship — pending counsel (R6)
   (batch-max-samples 1 :type (integer 1)) ; WP-BATCH size trigger: flush the accumulated batch every N publishes (1 = flush per write, no batching)
   (batch-pending 0 :type (integer 0))     ; samples accumulated since the last flush (a flush pacer; %push-data always sends all unsent)
@@ -1780,6 +1781,48 @@
      (lambda (buf size) (%handle-datagram node buf size))))
   node)
 
+(defun* %zc-drop-armed (node change)
+    (function (disc-node dds.rtps.history:cache-change) t)
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). ONE-SHOT release of
+   CHANGE's pre-committed Zero-Copy slot if (and only if) it is still :armed: writer-zc-unarm flips the state
+   under the writer lock (so a concurrent claim/unarm on another thread can never double-spend the refcount),
+   and on a won transition the slot is %zc-released (refcount 1 -> 0, reclaimable; the committed generation is
+   left in place — a later loan on the slot bumps it, invalidating any stale ref). A change with no slot, or one
+   already :consumed/:released, is an O(1) no-op. Fired by the send-site fallback decision (%zc-change-item: the
+   security gate, a non-ZC destination, or a non-:data/undersized change), the post-push-pass sweep
+   (%zc-armed-sweep), and the stop-node teardown sweep (ADR 0042 lifecycle)."
+  (when (eq (dds.rtps.history:cache-change-zc-state change) :armed)   ; fast hint; the transition re-checks under the lock
+    (let ((writer (disc-node-user-writer node))
+          (sap (disc-node-zc-pool-sap node)))
+      (when (and writer sap
+                 (dds.rtps.reliable:writer-zc-unarm writer change))   ; won the one-shot :armed -> :released
+        (dds.xport.zerocopy::%zc-release sap
+                                         (dds.rtps.history:cache-change-zc-slot change)
+                                         (dds.rtps.history:cache-change-zc-generation change)))))
+  t)
+
+(defun* %zc-armed-sweep (node &optional (snapshot nil snapshot-p))
+    (function (disc-node &optional list) t)
+  "WP-FLATDATA-LOAN-WRITE leak-safety sweep (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel).
+   Release every still-:armed pre-committed slot among SNAPSHOT's registry entries (default: the ENTIRE current
+   registry — the stop-node teardown sweep) and drop the swept entries from the node's registry. The push-pass
+   callers (%push-data-buf / %node-datagram-plan) snapshot the registry head BEFORE the pass and sweep exactly
+   that snapshot AFTER it — entries armed concurrently (a mid-pass publish on another thread) are prepended
+   ahead of the snapshot and survive to their own pass, so a fresh loan is never released before it was ever
+   presented to a destination. A swept change that the pass already consumed/released is a no-op (%zc-drop-armed
+   is one-shot); a change the pass never presented (zero destinations, debug-drop, KEEP_LAST-evicted before its
+   push) is released HERE — a committed slot can therefore never strand at refcount>=1 beyond one push pass
+   (or node lifetime for a never-pushing writer), and the pool degrades gracefully, never wedges (ADR 0042)."
+  (let ((entries (if snapshot-p
+                     snapshot
+                     (dds.pal:with-lock ((disc-node-lock node)) (disc-node-zc-armed-changes node)))))
+    (when entries
+      (dolist (change entries) (%zc-drop-armed node change))
+      (dds.pal:with-lock ((disc-node-lock node))
+        (setf (disc-node-zc-armed-changes node)
+              (ldiff (disc-node-zc-armed-changes node) entries)))))
+  t)
+
 (defun* stop-node (node)
     (function (disc-node) (eql t))
   "Close NODE's socket(s), join its receiver thread(s) — UDP, multicast, AND the SHMEM receiver when on
@@ -1822,6 +1865,7 @@
              (disc-node-zc-attach-cache node))
     (clrhash (disc-node-zc-attach-cache node)))
   (when (disc-node-zc-pool node)
+    (%zc-armed-sweep node)   ; WP-FLATDATA-LOAN-WRITE (ADR 0042): release any armed-but-never-pushed pre-committed slot BEFORE the pool dies (no stranded refcount observable by a still-attached reader)
     (dds.xport.zerocopy::%zc-destroy (disc-node-zc-pool-sap node))
     (dds.pal:shm-detach (disc-node-zc-pool node))
     (dds.pal:shm-destroy (%zc-pool-name (disc-node-guid-prefix node)))

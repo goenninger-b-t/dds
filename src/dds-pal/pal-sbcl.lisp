@@ -157,6 +157,12 @@
     (function (t (integer 0) (unsigned-byte 64)) (unsigned-byte 64))
   "Aligned 64-bit write of VALUE at SAP+OFFSET (bytes)."
   (setf (sb-sys:sap-ref-64 sap offset) value))
+(defun* store-sap-u8 (sap offset value)
+    (function (t (integer 0) (unsigned-byte 8)) (unsigned-byte 8))
+  "8-bit write of VALUE at SAP+OFFSET (bytes). Backs the FlatData loan-write SAP-mode Offset
+   setters (WP-FLATDATA-LOAN-WRITE, R6 — NOT cleared for ship, see ADR 0042): a literal-0-copy
+   field write straight into a SHMEM pool slot SAP, byte-exact to the aref setter (XCDR2-LE)."
+  (setf (sb-sys:sap-ref-8 sap offset) value))
 (defun* cas-sap-u64 (sap offset old new)
     (function (t (integer 0) (unsigned-byte 64) (unsigned-byte 64)) (unsigned-byte 64))
   "Atomic compare-and-swap of the u64 at SAP+OFFSET; returns the PREVIOUS value (= OLD on success)."

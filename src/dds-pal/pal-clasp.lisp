@@ -182,6 +182,13 @@
     (function (t (integer 0) (unsigned-byte 64)) (unsigned-byte 64))
   "Aligned 64-bit write of VALUE at SAP+OFFSET (bytes)."
   (setf (cffi:mem-ref sap :uint64 offset) value))
+(defun* store-sap-u8 (sap offset value)
+    (function (t (integer 0) (unsigned-byte 8)) (unsigned-byte 8))
+  "8-bit write of VALUE at SAP+OFFSET. Same NFR-PORT gap as LOAD-SAP-U8: ZC is SBCL-only
+   (ADR 0013), so the FlatData loan-write SAP-mode setters (WP-FLATDATA-LOAN-WRITE, R6 — NOT
+   cleared for ship, see ADR 0042) never run on Clasp; signals PAL-UNIMPLEMENTED."
+  (declare (ignore sap offset value))
+  (error 'pal-unimplemented :op 'store-sap-u8))
 (defun* cas-sap-u64 (sap offset old new)
     (function (t (integer 0) (unsigned-byte 64) (unsigned-byte 64)) (unsigned-byte 64))
   "Atomic compare-and-swap of the u64 at SAP+OFFSET; returns the PREVIOUS value (= OLD on

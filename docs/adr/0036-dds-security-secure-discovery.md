@@ -556,6 +556,15 @@ work-package ledger:
     (`dataplane.lisp` — writing the sample straight into the pool slot, bypassing `%zc-loan`) MUST apply the same
     `%zc-payload-wire-protected-p` gate at its new write site, or this SHMEM-cleartext leak reopens for secured
     writers. Record this in that WP's acceptance criteria.
+    **RESOLVED (WP-FLATDATA-LOAN-WRITE, ADR 0042):** the loan-write TX API inherits the gate fail-closed at BOTH
+    ends — `dds.dcps:loan-sample` calls `dds.disc:node-loan-write-eligible-p` (which consults
+    `%zc-payload-wire-protected-p`) and returns the NON-slot fallback FlatData sample for a wire-protected writer,
+    so a secured writer's plaintext NEVER lands in a pool slot at all; and the send-site gate at `%zc-change-item`
+    stays authoritative for whatever reaches it — a pre-committed loan-write slot on a gated change is ignored
+    AND released. Loan-write additionally gates `data_protection` (`%loan-write-data-protected-p`), which the
+    classic ZC path intentionally leaves un-gated: there the pool receives the already-transformed
+    SecuredPayload, but a loan-write slot holds the app's PRE-transform field writes, so any transforming config
+    fails closed to the fallback sample. See ADR 0042 §6.
 11. **Live RTI Connext-Security secure-discovery interop — the P6 exit gate.** Requires the licensed Security
     Plugins (not installed). The Fast DDS-Security peer + harness + run scripts now exist in
     `interop/security-secure-discovery/` for Slice 5.

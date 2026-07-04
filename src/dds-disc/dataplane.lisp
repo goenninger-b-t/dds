@@ -854,6 +854,78 @@
   (or (not (eq (disc-node-rtps-protection-kind node) :none))
       (not (eq (disc-node-user-submessage-protection-kind node) :none))))
 
+;;;; WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). The TX loan-write
+;;;; pool API DCPS loan-sample/discard-loan calls: a writer acquires a pool slot, the app writes its FlatData
+;;;; fields straight into the slot via the SAP-mode Offset setters, and the loan is either published (delivered
+;;;; via the normal send path — v1) or aborted. This keeps the pool internals (disc-node-zc-pool-sap +
+;;;; dds.xport.zerocopy) inside dds-disc; DCPS never reaches into them.
+
+(defun* %loan-write-data-protected-p (node)
+    (function (disc-node) boolean)
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042 §6). T iff NODE's user writer would TRANSFORM its
+   SerializedPayload at publish (§9.4.1.2.4 SecuredPayload) — i.e. loan-write's raw slot bytes would diverge
+   from the wire payload AND leak plaintext into SHMEM. Fail-closed: a governance-mandated data_protection
+   (:sign/:encrypt) blocks loan-write even if no crypto-transform is installed yet; :unset (no governance, the
+   Slice-1 direct-KM config) blocks only when a crypto-transform IS installed (publish-sample then applies it —
+   the exact condition its ct binding uses); :none (governance says data=NONE) rides plain — never blocked."
+  (let ((kind (disc-node-user-data-protection-kind node)))
+    (or (and (member kind '(:sign :encrypt)) t)
+        (and (eq kind :unset) (disc-node-crypto-transform node) t))))
+
+(defun* node-loan-write-eligible-p (node size)
+    (function (disc-node (integer 0)) boolean)
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042). T iff NODE can loan-write a SIZE-octet FlatData
+   SerializedPayload straight into its writer pool: the node has a ZC writer pool (built iff *zerocopy-enabled*
+   + SHMEM at make-disc-node), SIZE is above *zerocopy-min-payload-bytes* (a small sample is not worth a slot),
+   the writer is NOT wire-protected (%zc-payload-wire-protected-p) — a secured writer's plaintext must never
+   land in a pool slot at all (ADR 0036 Carry-10, fail-closed at the loan end) — AND the writer's payload is NOT
+   data_protection-transformed (%loan-write-data-protected-p): under data_protection the SerializedPayload is
+   TRANSFORMED at publish (§9.4.1.2.4 SecuredPayload), so the app's raw field writes in a slot would be BOTH a
+   plaintext leak into SHMEM and a payload-format mismatch against the wire — unlike the classic ZC path, where
+   the pool receives the already-transformed bytes (the ADR 0036 rationale for not gating data_protection there
+   does NOT transfer to loan-write; ADR 0042 §6). NIL ⇒ DCPS loan-sample degrades to a heap/pool-backed FlatData
+   sample (graceful, no error)."
+  (and (disc-node-zc-pool node)
+       (> size *zerocopy-min-payload-bytes*)
+       (not (%zc-payload-wire-protected-p node))
+       (not (%loan-write-data-protected-p node))   ; loan-write-specific: the slot would hold pre-transform plaintext (ADR 0042 §6)
+       t))
+
+(defun* node-loan-write-acquire (node size)
+    (function (disc-node (integer 0)) (values t (integer 0) (integer 0) (unsigned-byte 32)))
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042). Acquire a writer-pool slot for a SIZE-octet FlatData loan
+   (%zc-loan-acquire, readers=1): returns (values POOL-SAP SLOT PAYLOAD-BASE GENERATION) — POOL-SAP + PAYLOAD-BASE
+   (the segment byte offset of the slot payload) for the app to store-sap-u8 its sample into, SLOT + GENERATION
+   the loan handle for node-loan-write-abort / the later commit. (values NIL 0 0 0) on pool saturation ⇒ DCPS
+   degrades to a heap sample (graceful). The slot is held (refcount=1) until abort/commit; a lock-free reader can
+   never observe it before commit (ADR 0042 §2)."
+  (let ((sap (disc-node-zc-pool-sap node)))
+    (if (null sap)
+        (values nil 0 0 0)
+        (multiple-value-bind (slot base gen) (dds.xport.zerocopy::%zc-loan-acquire sap size 1)
+          (if (null slot) (values nil 0 0 0) (values sap slot base gen))))))
+
+(defun* node-loan-write-abort (node slot)
+    (function (disc-node (integer 0)) t)
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042). Release an acquired-but-unpublished writer loan on SLOT
+   (%zc-loan-abort): the slot returns to reclaimable (refcount=0) without ever publishing a generation, so it is
+   invisible to every reader. Idempotent-safe (a second abort re-zeroes an already-0 refcount). No-op when the
+   node has no pool."
+  (let ((sap (disc-node-zc-pool-sap node)))
+    (when sap (dds.xport.zerocopy::%zc-loan-abort sap slot)))
+  t)
+
+(defun* node-loan-write-commit (node slot generation)
+    (function (disc-node (integer 0) (unsigned-byte 32)) t)
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042). COMMIT an acquired writer loan on SLOT: %zc-loan-commit —
+   dds.pal:fence :release then store GENERATION LAST, the single release point that publishes the app's field
+   writes to a future lock-free reader (ADR 0042 §2). After commit the slot (still held at refcount=1) may be
+   handed to publish-sample as the change's pre-committed slot; the send site emits its ref once or releases it
+   (%zc-change-item / the sweeps). No-op when the node has no pool."
+  (let ((sap (disc-node-zc-pool-sap node)))
+    (when sap (dds.xport.zerocopy::%zc-loan-commit sap slot generation)))
+  t)
+
 (defun* %zc-change-item (node change zc-readers)
     (function (disc-node dds.rtps.history:cache-change (integer 0)) (or null cons))
   "WP-ZEROCOPY (FR-PF-3, ADR 0014): if CHANGE is a :data sample whose serialized payload is LARGER than
@@ -872,15 +944,29 @@
    %zc-payload-wire-protected-p (rtps_protection or metadata_protection non-NONE) the raw ZC path is
    DISABLED fail-closed (returns NIL) — the datagram/submessage encryption those tiers apply lives OUTSIDE
    the pool, so a raw payload in shared memory would be readable by any co-resident participant; the sample
-   instead takes the normal serialize -> %send-raw-buf (submessage+SRTPS wrap) path. NOT cleared for ship —
-   pending counsel (R6)."
-  (when (and (plusp zc-readers)
-             (eq (dds.rtps.history:cache-change-kind change) :data)
-             (not (%zc-payload-wire-protected-p node)))   ; fail-closed: never a cleartext payload in SHMEM for a wire-protected writer (ADR 0036 Carry 10)
-    (let ((pl (dds.rtps.history:cache-change-serialized-payload change))
-          (len (dds.rtps.history:cache-change-payload-len change)))   ; TRUE length, not the oversized pooled vec (T5a)
-      (when (> len *zerocopy-min-payload-bytes*)
-        (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 len 1)))))
+   instead takes the normal serialize -> %send-raw-buf (submessage+SRTPS wrap) path.
+   WP-FLATDATA-LOAN-WRITE PRE-COMMITTED SLOT (FR-PF-4, R6, ADR 0042): a loan-written change carries the
+   committed pool slot its sample already sits in (zc-state :armed). When the FULL eligibility above holds,
+   the send site PREFERS that slot (%zc-armed-item, a one-shot claim) — the emitted ref bytes are EXACTLY
+   what %zc-ref-builder would emit, with NO payload->slot copy; the claim is spent on the FIRST ZC-eligible
+   destination (exactly-one-ZC-destination = the pure-0-copy envelope; any further ZC destination takes the
+   fresh-loan path from the retained payload, as today). When the decision here is NOT ZC (gate active /
+   zc-readers 0 — including every RETRANSMIT, which passes zc-readers 0 — / non-:data / undersized), an
+   armed slot is RELEASED one-shot (%zc-drop-armed: refcount 1->0, reclaimable, no generation published
+   beyond the committed one) — the send-site gate stays AUTHORITATIVE over the pre-committed slot
+   (ADR 0036 Carry-10 inheritance) and a committed slot never strands on a fallback decision. NOT cleared
+   for ship — pending counsel (R6)."
+  (if (and (plusp zc-readers)
+           (eq (dds.rtps.history:cache-change-kind change) :data)
+           (not (%zc-payload-wire-protected-p node)))   ; fail-closed: never a cleartext payload in SHMEM for a wire-protected writer (ADR 0036 Carry 10)
+      (let ((pl (dds.rtps.history:cache-change-serialized-payload change))
+            (len (dds.rtps.history:cache-change-payload-len change)))   ; TRUE length, not the oversized pooled vec (T5a)
+        (if (> len *zerocopy-min-payload-bytes*)
+            (or (and (eq (dds.rtps.history:cache-change-zc-state change) :armed)   ; fast hint; the claim re-checks under the writer lock
+                     (%zc-armed-item node change))                                 ; ADR 0042: emit the PRE-COMMITTED slot, 0 copies
+                (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 len 1))
+            (progn (%zc-drop-armed node change) nil)))   ; undersized: release an armed slot (one-shot no-op otherwise)
+      (progn (%zc-drop-armed node change) nil)))         ; gated / non-ZC / retransmit: the fallback decision releases an armed slot
 
 (defun* %msg-datagram (node build-fn)
     (function (disc-node function) function)
@@ -1150,34 +1236,59 @@
     (dds.cdr:encode-zc-reference c slot generation slot-bytes)
     v))
 
+(defun* %zc-ref-item (node sn slot gen)
+    (function (disc-node integer (integer 0) (unsigned-byte 32)) cons)
+  "WP-ZEROCOPY/WP-FLATDATA-LOAN-WRITE shared ref-item tail (FR-PF-3/4, ADR 0014/0042; R6): the (SIZE . BUILD-FN)
+   packable DATA item (SN) whose SerializedPayload is the 20-octet zero-copy reference to (SLOT, GEN) — drop-in
+   for %data-builder so the ref rides the existing coalesced DATA path. Byte-identical to what %zc-ref-builder
+   emitted before the factoring (%encode-zc-ref-vec + write-data, the SAME emitters — no wire constant invented);
+   now ALSO consumed by the loan-write send site for a PRE-COMMITTED slot (ADR 0042). Bumps zc-sends."
+  (incf (disc-node-zc-sends node))
+  (let ((ref (%encode-zc-ref-vec slot gen +zerocopy-pool-slot-bytes+))
+        (wid (disc-node-user-writer-id node)))
+    (cons (+ 24 (length ref))   ; mirrors %data-builder's small-:data SIZE (4 hdr + 20 body-prefix + payload)
+          (lambda (mc) (dds.rtps.message:write-data
+                        mc dds.rtps.message:+entityid-unknown+ wid sn ref 0 (length ref))))))
+
 (defun* %zc-ref-builder (node sn payload off len resolves)
     (function (disc-node integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) (integer 1))
               (or null cons))
   "WP-ZEROCOPY (FR-PF-3, ADR 0014): loan PAYLOAD[off,off+len) into this node's writer pool with refcount
-   RESOLVES (the number of times the slot will be resolved+released), and return a (SIZE . BUILD-FN)
-   packable DATA item (SN) whose SerializedPayload is the resulting 20-octet zero-copy reference — drop-in
-   for %data-builder so the ref rides the existing coalesced DATA path. Returns NIL if the pool is
-   saturated / the payload exceeds a slot (%zc-loan NIL) so the caller falls back to the full serialized
-   payload (no loss, no double-delivery). RESOLVES is ONE here: this ref is emitted to a SINGLE
+   RESOLVES (the number of times the slot will be resolved+released), and return the %zc-ref-item for the
+   loaned slot (a (SIZE . BUILD-FN) packable DATA item carrying the 20-octet reference). Returns NIL if the
+   pool is saturated / the payload exceeds a slot (%zc-loan NIL) so the caller falls back to the full
+   serialized payload (no loss, no double-delivery). RESOLVES is ONE here: this ref is emitted to a SINGLE
    destination and a DATA with readerId UNKNOWN is processed ONCE by that participant's receiver
    (%on-user-data -> one %zc-release), regardless of how many reader endpoints are co-located there — so
    refcount 1 frees the slot after that single resolve (refcount = the matched-reader COUNT would leak the
-   slot when a destination has >1 ZC reader endpoint). Bumps zc-sends. WP-FLATDATA-over-ZC (FR-PF-4, ADR
+   slot when a destination has >1 ZC reader endpoint). WP-FLATDATA-over-ZC (FR-PF-4, ADR
    0015): for a FlatData type the published PAYLOAD already IS the FlatData SerializedPayload (the type's
    serialize=IDENTITY block-copy ran once in %serialize-sample), so loaning it here is %zc-loan's single
    app-buffer->slot copy with NO per-field re-serialize — there is no second serialization on the FlatData
-   TX path. (That remaining app->slot copy is the documented v1 limitation; a loan-write API that writes
-   the sample straight into the slot is the explicit follow-up — out of scope here. The Phase-D 0-copy win
-   is on RX.) NOT cleared for ship — counsel (R6)."
+   TX path. (WP-FLATDATA-LOAN-WRITE, ADR 0042, removes even that copy for a loan-written change: its
+   PRE-COMMITTED slot is emitted directly via %zc-armed-item, and this fresh-loan path serves the fallback +
+   any extra destination.) NOT cleared for ship — counsel (R6)."
   (multiple-value-bind (slot gen)
       (dds.xport.zerocopy::%zc-loan (disc-node-zc-pool-sap node) payload off len resolves)
-    (when slot
-      (incf (disc-node-zc-sends node))
-      (let ((ref (%encode-zc-ref-vec slot gen +zerocopy-pool-slot-bytes+))
-            (wid (disc-node-user-writer-id node)))
-        (cons (+ 24 (length ref))   ; mirrors %data-builder's small-:data SIZE (4 hdr + 20 body-prefix + payload)
-              (lambda (mc) (dds.rtps.message:write-data
-                            mc dds.rtps.message:+entityid-unknown+ wid sn ref 0 (length ref))))))))
+    (when slot (%zc-ref-item node sn slot gen))))
+
+(defun* %zc-armed-item (node change)
+    (function (disc-node dds.rtps.history:cache-change) (or null cons))
+  "WP-FLATDATA-LOAN-WRITE send site (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). Consume
+   CHANGE's PRE-COMMITTED Zero-Copy slot: writer-zc-claim wins the ONE-SHOT :armed -> :consumed transition under
+   the writer lock (a concurrent emit on another thread can never double-spend the slot's single refcount) and
+   returns the %zc-ref-item for (zc-slot, zc-generation) — the ref bytes are EXACTLY what %zc-ref-builder emits
+   for a fresh loan (%encode-zc-ref-vec on the same emitters), but with NO payload->slot copy: the sample already
+   sits in the slot, written there by the app's SAP-mode Offset setters (the loan-write 0-copy TX win). NIL when
+   the claim is lost (no slot / already consumed or released) — the caller then takes the fresh-loan
+   %zc-ref-builder path from the retained payload (byte-identical to today). After the claim the slot's
+   refcount=1 belongs to the RESOLVING READER (its %zc-release at resolve/return-loan frees it); a retransmit of
+   the consumed change falls back to the retained payload and never re-emits the slot (ADR 0042 lifecycle)."
+  (let ((writer (disc-node-user-writer node)))
+    (when (and writer (dds.rtps.reliable:writer-zc-claim writer change))
+      (%zc-ref-item node (dds.rtps.history:cache-change-sn change)
+                    (dds.rtps.history:cache-change-zc-slot change)
+                    (dds.rtps.history:cache-change-zc-generation change)))))
 
 (defun* %push-data-buf (node buf)
     (function (disc-node dds.core.buffer:octet-buffer) t)
@@ -1191,8 +1302,13 @@
    same-host SHMEM peer (%group-shmem-dest) the coalesced small-sample datagrams take shared memory with
    UDP fallback (FR-XPORT-2); the reader's ACKNACK return path is UDP (%on-user-heartbeat, untouched).
    When the destination's readers are same-host ZC-capable (%zc-readers > 0, WP-ZEROCOPY FR-PF-3) a large
-   :data sample crosses as a 16-byte reference instead of a fragmented payload; ZC off -> 0 -> untouched."
-  (let ((writer (disc-node-user-writer node)))
+   :data sample crosses as a 16-byte reference instead of a fragmented payload; ZC off -> 0 -> untouched.
+   WP-FLATDATA-LOAN-WRITE leak sweep (ADR 0042): the armed-change registry is SNAPSHOT before the pass and
+   %zc-armed-sweep'd after it — any pre-committed slot the pass never consumed/released (zero destinations,
+   debug-drop, evicted-before-push) is released here, so a committed slot never strands past one push pass;
+   changes armed concurrently by a mid-pass publish survive to their own pass (the snapshot discipline)."
+  (let ((writer (disc-node-user-writer node))
+        (armed (dds.pal:with-lock ((disc-node-lock node)) (disc-node-zc-armed-changes node))))   ; snapshot (ADR 0042)
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (dolist (group (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched-reader destination
         (let ((changes (dds.rtps.reliable:writer-capture-unsent writer (cdr group))))   ; acquire send-refs atomic with the unsent read (release-safety)
@@ -1203,7 +1319,8 @@
                                      (%group-shmem-dest node group)
                                      (%zc-readers node (cdr group))
                                      (%group-dest-prefix group))   ; T10: wrap user data to a :keyed destination
-            (dds.rtps.reliable:writer-release-change-refs writer changes)))))))   ; release after this destination's datagrams are emitted (copied)
+            (dds.rtps.reliable:writer-release-change-refs writer changes)))))   ; release after this destination's datagrams are emitted (copied)
+    (%zc-armed-sweep node armed)))   ; ADR 0042: release any slot the pass never consumed/released
 
 (defun* %push-data (node)
     (function (disc-node) t)
@@ -1223,6 +1340,7 @@
    then for each entry build into a scratch buffer (the thunk reports the token cost = datagram length),
    acquire that many tokens, and send — one datagram per RR step. BUF supplies only the packing budget."
   (let ((writer (disc-node-user-writer node))
+        (armed (dds.pal:with-lock ((disc-node-lock node)) (disc-node-zc-armed-changes node)))   ; snapshot (ADR 0042)
         (plan '()) (refs '()))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (dolist (group (%reader-push-targets node))
@@ -1235,6 +1353,7 @@
                                                   (%zc-readers node (cdr group))))
             (push (cons dest (cons dp entry)) plan)))))   ; ((host . port) DEST-PREFIX BUILD-THUNK . SHMEM-DEST)
     (setf (disc-node-flow-step-refs node) refs)   ; release-on-drain set: one entry per per-group acquire (balanced)
+    (%zc-armed-sweep node armed)   ; ADR 0042: the ref bytes are already materialized in the plan's closures — sweep any slot the plan build never consumed/released
     (nreverse plan)))
 
 (defun* %emit-plan-entry (node buf entry &optional before-send)
@@ -1447,8 +1566,9 @@
             (aref g 15) (ldb (byte 8  0) id)))
     g))
 
-(defun* publish-sample (node payload &optional (key-hash nil))
-    (function (disc-node (simple-array (unsigned-byte 8) (*)) &optional (or null (array (unsigned-byte 8) (*))))
+(defun* publish-sample (node payload &optional (key-hash nil) (zc-slot nil) (zc-gen 0))
+    (function (disc-node (simple-array (unsigned-byte 8) (*))
+               &optional (or null (array (unsigned-byte 8) (*))) (or null (integer 0)) (unsigned-byte 32))
               (or (eql t) (eql :timeout)))
   "Publish PAYLOAD (an opaque SerializedPayload) on the node's user writer: add it to the writer
    HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8). Returns T normally, or the :timeout
@@ -1470,7 +1590,19 @@
    onto the data CacheChange (writer-write) for per-instance KEEP_LAST eviction; NIL (default) is unchanged.
    When KEY-HASH is non-nil and exactly 16 octets, a PID_KEY_HASH inline-QoS block is also built
    (%build-key-hash-iq) and carried on the DATA submessage (RTPS 2.5 §9.6.4.8), mirroring the wire
-   behaviour of Connext 7.3.1 and Fast DDS 3.6.1 on keyed writes (ADR 0029). NIL KEY-HASH = byte-identical."
+   behaviour of Connext 7.3.1 and Fast DDS 3.6.1 on keyed writes (ADR 0029). NIL KEY-HASH = byte-identical.
+   ZC-SLOT / ZC-GEN (WP-FLATDATA-LOAN-WRITE, FR-PF-4, R6, ADR 0042; default NIL = byte-identical): the
+   PRE-COMMITTED Zero-Copy pool slot PAYLOAD's bytes already sit in (loan-write wrote the sample straight into
+   the slot and committed it; refcount=1 held). The data CacheChange is BORN :armed with the slot identity and
+   registered for the leak sweep; the send site (%zc-change-item) then emits the slot's ref ONCE to the first
+   ZC-eligible destination with NO payload->slot copy, or releases the slot on its fallback decision. On
+   :timeout (nothing added -> the slot could never be emitted) the slot is released here. FAIL-SAFE (unreachable
+   through the DCPS loan gate): under data_protection the payload below is TRANSFORMED, so a pre-committed
+   plaintext slot must never be emitted — it is released up front and the publish proceeds payload-only."
+  (when (and zc-slot (%loan-write-data-protected-p node))
+    (when (disc-node-zc-pool-sap node)   ; fail-safe: never emit a plaintext slot for a data_protection writer
+      (dds.xport.zerocopy::%zc-release (disc-node-zc-pool-sap node) zc-slot zc-gen))
+    (setf zc-slot nil))
   (let ((iq (when (and key-hash (= 16 (length key-hash)))
               (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16))))))
         (writer (disc-node-user-writer node))
@@ -1513,10 +1645,16 @@
                           (return-from publish-sample :timeout)))   ; pool exhausted: RESOURCE_LIMITS, never a GC fallback
                     (setf payload (dds.security:encode-serialized-payload km payload))))   ; carve failed/unavailable: allocating fallback (byte-identical)
               (return-from publish-sample t)))))   ; fail-closed: no key -> drop
-    (let ((rc (dds.rtps.reliable:writer-write writer payload key-hash iq pooled plen)))
+    (multiple-value-bind (rc change)
+        (dds.rtps.reliable:writer-write writer payload key-hash iq pooled plen zc-slot zc-gen)
       (when (eq :timeout rc)
         (when pooled (dds.rtps.reliable:writer-release-payload-buffer writer pooled))   ; full cache: return the buffer, nothing added
-        (return-from publish-sample :timeout))))  ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
+        (when (and zc-slot (disc-node-zc-pool-sap node))   ; ADR 0042: nothing added -> the committed slot can never be emitted; release it
+          (dds.xport.zerocopy::%zc-release (disc-node-zc-pool-sap node) zc-slot zc-gen))
+        (return-from publish-sample :timeout))  ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
+      (when (and zc-slot change)   ; ADR 0042: register the armed change for the post-push-pass / teardown leak sweep
+        (dds.pal:with-lock ((disc-node-lock node))
+          (push change (disc-node-zc-armed-changes node))))))
   (cond
     ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))   ; WP-ASYNC-FLOW: paced async send
     ((disc-node-async-thread node) (%async-signal node))   ; WP-ASYNC: hand off to the sender thread

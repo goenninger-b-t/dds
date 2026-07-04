@@ -103,36 +103,87 @@
           (let ((s (dds.pal:load-sap-u64 sap (+ b +zc-slot-off-pubseq+))))
             (when (or (null oldest) (< s oldest-seq)) (setf oldest i oldest-seq s))))))))
 
-(defun* %zc-loan (sap payload off len readers)
-    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) (integer 0))
-              (values (or null (integer 0)) (unsigned-byte 32)))
-  "Single-producer (the owning writer): loan a slot for PAYLOAD[off,off+len) to READERS consumers. Scan the
-   oldest UNLOANED (refcount==0) slot (the freelist was dropped, WP-ZC-LOAN-LOCKFREE). Set len/refcount/pubseq,
-   COPY THE PAYLOAD IN, then a release-fence, then store the bumped generation LAST. Returns (values slot-index
-   generation), or (values NIL 0) if LEN > slot-bytes OR every slot is loaned (refcount>0, none reclaimable —
-   WP-FLATDATA-ZC-LOAN R6, ADR 0017) ⇒ the writer falls back to non-ZC for that sample.
-   ORDERING (WP-ZC-LOAN-LOCKFREE, R6, ADR 0018; NOT cleared for ship — pending counsel): the payload is
-   written FIRST; then dds.pal:fence :release publishes it (+ len/refcount/pubseq); then the generation store
-   is the LAST write — the single RELEASE point that publishes the whole slot to a future lock-free reader
-   (the generation is the release/acquire sync variable, mirroring the WP-SHMEM ring cursor). A reader that
-   acquire-loads the new generation is then guaranteed to see the payload-before stores (no torn read). The
-   writer keeps its pshared-mutex for mutual exclusion vs other writers / force-reclaim; the fence +
-   generation-last is what synchronizes-with the lock-free reader, which does NOT share the mutex."
-  (when (> len (%zc-slot-bytes sap)) (return-from %zc-loan (values nil 0)))
+(defun* %zc-loan-acquire (sap len readers)
+    (function (t (integer 0) (integer 0)) (values (or null (integer 0)) (integer 0) (unsigned-byte 32)))
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). The slot-BOOKKEEPING
+   half of %zc-loan WITHOUT the copy: reject LEN > slot-bytes; take the pool mutex; %zc-take-free-or-reclaim the
+   oldest UNLOANED (refcount==0) slot; set len/refcount=READERS/pubseq; COMPUTE the next generation g=(old+1) but
+   DO NOT store it; release the mutex. Returns (values SLOT PAYLOAD-BASE GENERATION) — PAYLOAD-BASE is the slot's
+   payload byte offset within the segment (slot-off + +zc-slot-hdr+) for the writer to dds.pal:store-sap-u8 its
+   sample straight into, GENERATION is g to hand to %zc-loan-commit — or (values NIL 0 0) if LEN > slot-bytes OR
+   every slot is loaned (saturation ⇒ the caller degrades to non-ZC / a heap sample, never blocks).
+   ORDERING CONTRACT (ADR 0042 §2): the generation g is stored ONLY at commit, AFTER the writer's field writes +
+   a release fence — so a lock-free reader (%zc-acquire-for-read) can NEVER observe the slot mid-write (before
+   commit the stored generation is the OLD value, and the ref carrying g is emitted only after commit). The slot
+   is protected from reclaim/steal between acquire and commit because refcount=READERS>0 and %zc-take-free-or-
+   reclaim only selects refcount==0 slots. An ABORTED loan (%zc-loan-abort) restores refcount=0 without ever
+   storing g, so it is invisible to every reader."
+  (when (> len (%zc-slot-bytes sap)) (return-from %zc-loan-acquire (values nil 0 0)))
   (dds.pal:pshared-lock sap +zc-mutex-off+)
   (unwind-protect
        (let ((i (%zc-take-free-or-reclaim sap)))
-         (unless i (return-from %zc-loan (values nil 0)))
-         (let* ((b (%zc-slot-off sap i))
-                (g (logand (1+ (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+))) #xFFFFFFFF)))
-           (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+)) len
-                 (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-refcount+)) readers)
-           (dds.pal:store-sap-u64 sap (+ b +zc-slot-off-pubseq+) (incf *zc-pubseq*))
-           (dotimes (k len) (setf (cffi:mem-ref sap :uint8 (+ b +zc-slot-hdr+ k)) (aref payload (+ off k))))
-           (dds.pal:fence :release)
-           (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+)) g)
-           (values i g)))
+         (if (null i)
+             (values nil 0 0)
+             (let* ((b (%zc-slot-off sap i))
+                    (g (logand (1+ (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+))) #xFFFFFFFF)))
+               (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-len+)) len
+                     (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-refcount+)) readers)
+               (dds.pal:store-sap-u64 sap (+ b +zc-slot-off-pubseq+) (incf *zc-pubseq*))
+               (values i (+ b +zc-slot-hdr+) g))))
     (dds.pal:pshared-unlock sap +zc-mutex-off+)))
+
+(defun* %zc-loan-commit (sap slot-index generation)
+    (function (t (integer 0) (unsigned-byte 32)) t)
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). The PUBLICATION tail
+   of %zc-loan: dds.pal:fence :release (publishes the writer's field writes + len/refcount/pubseq), then store
+   the slot GENERATION LAST — the single RELEASE point that publishes the fully-written slot to a future
+   lock-free reader (the generation is the release/acquire sync variable, mirroring %zc-loan / the WP-SHMEM ring
+   cursor). NO mutex: once %zc-loan-acquire set refcount>0 only THIS writer touches the slot, so the store's
+   cross-process visibility comes from the fence + generation-store, not the mutex (identical to the reader's
+   lock-free %zc-release; ADR 0018/0042 §2). GENERATION is the value %zc-loan-acquire returned for this slot."
+  (let ((b (%zc-slot-off sap slot-index)))
+    (dds.pal:fence :release)
+    (setf (cffi:mem-ref sap :uint32 (+ b +zc-slot-off-generation+)) generation))
+  t)
+
+(defun* %zc-loan-abort (sap slot-index)
+    (function (t (integer 0)) t)
+  "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). Release an ACQUIRED
+   but UNCOMMITTED loan: under the pool mutex set refcount=0 so the slot is reclaimable again — WITHOUT storing a
+   generation, so no new generation is ever published (ADR 0042 §2). Because a ref bearing the acquire's would-be
+   generation is emitted only at commit → send, no reader can ever present it; a future loan on this slot
+   recomputes old+1 and stores it only on ITS commit. Hence abort is invisible to every reader (pure best-effort
+   discard) and idempotent-safe at the DCPS layer. The mutex prevents a torn refcount read vs a concurrent
+   %zc-take-free-or-reclaim scan."
+  (when (< slot-index (%zc-slot-count sap))
+    (dds.pal:pshared-lock sap +zc-mutex-off+)
+    (unwind-protect
+         (setf (cffi:mem-ref sap :uint32 (+ (%zc-slot-off sap slot-index) +zc-slot-off-refcount+)) 0)
+      (dds.pal:pshared-unlock sap +zc-mutex-off+)))
+  t)
+
+(defun* %zc-loan (sap payload off len readers)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) (integer 0))
+              (values (or null (integer 0)) (unsigned-byte 32)))
+  "Single-producer (the owning writer): loan a slot for PAYLOAD[off,off+len) to READERS consumers. Since
+   WP-FLATDATA-LOAN-WRITE (ADR 0042) this is the byte-behaviour-identical COMPOSITION of the three loan
+   primitives — %zc-loan-acquire (pick+stamp the slot), COPY THE PAYLOAD IN at the returned payload base, then
+   %zc-loan-commit (release-fence + generation store LAST) — NOT a sibling copy (DRY). Returns (values slot-index
+   generation), or (values NIL 0) if LEN > slot-bytes OR every slot is loaned ⇒ the writer falls back to non-ZC
+   for that sample. Same return values, same slot contents, same generation sequence as before the split; only
+   the mutex hold DURATION shrinks (the copy now runs outside the mutex — not observable behaviour).
+   ORDERING (WP-ZC-LOAN-LOCKFREE, R6, ADR 0018/0042; NOT cleared for ship — pending counsel): the payload is
+   written FIRST; then dds.pal:fence :release publishes it (+ len/refcount/pubseq set at acquire); then the
+   generation store is the LAST write — the single RELEASE point that publishes the whole slot to a future
+   lock-free reader. A reader that acquire-loads the new generation is guaranteed to see the payload-before
+   stores (no torn read)."
+  (multiple-value-bind (i base g) (%zc-loan-acquire sap len readers)
+    (if (null i)
+        (values nil 0)
+        (progn
+          (dotimes (k len) (setf (cffi:mem-ref sap :uint8 (+ base k)) (aref payload (+ off k))))
+          (%zc-loan-commit sap i g)
+          (values i g)))))
 
 (defun* %zc-release (sap slot-index generation)
     (function (t (integer 0) (unsigned-byte 32)) t)
