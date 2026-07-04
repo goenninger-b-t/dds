@@ -70,5 +70,5 @@
   (:export #:%zc-bytes #:%zc-init #:%zc-validate #:%zc-destroy
            #:%zc-slot-count #:%zc-slot-bytes #:%zc-free-count
            #:%zc-loan #:%zc-loan-acquire #:%zc-loan-commit #:%zc-loan-abort
-           #:%zc-release #:%zc-resolve #:%zc-acquire-for-read
+           #:%zc-release #:%zc-pin #:%zc-resolve #:%zc-acquire-for-read
            #:*zc-pubseq*))

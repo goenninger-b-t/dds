@@ -2234,6 +2234,28 @@
                (/ (float (max 0 (- (dds.pal:bytes-consed) before))) iters)))
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec scratch)))))
 
+(defun* %fd-loan-write-pin-arm (node payload iters pinned)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 1) t) double-float)
+  "WP-ACKED-SLOT-PINNING bench arm (R6, ADR 0044): the per-sample GC-bytes cost the acked-slot pin ELIMINATES.
+   Both arms acquire+commit a real writer-pool slot for an 8 KiB sample (the loan-write TX leg) then release it.
+   PINNED NIL = the RETAINED-payload materialisation write-loaned pays TODAY: %zc-resolve-fresh copies the whole
+   slot into a fresh heap SerializedPayload (the byte-identical twin of %loan-write-payload) — the per-write heap
+   allocation. PINNED T = the acked-slot pin: %zc-pin adds the TX refcount hold (a 0-GC lock-free CAS) and NO
+   heap payload is materialised (retransmit / non-ZC read the slot on demand instead). Returns mean
+   dds.pal:bytes-consed/sample — the pinned arm is the eliminated retained-payload GC bytes/sample."
+  (let ((sap (dds.disc::disc-node-zc-pool-sap node)))
+    (let ((before (dds.pal:bytes-consed)))
+      (dotimes (i iters)
+        (multiple-value-bind (asap slot base gen) (dds.disc:node-loan-write-acquire node (length payload))
+          (declare (ignore asap base))
+          (dds.disc:node-loan-write-commit node slot gen)
+          (if pinned
+              (progn (dds.xport.zerocopy::%zc-pin sap slot gen)            ; the pin: 0-GC refcount hold, no heap payload
+                     (dds.xport.zerocopy::%zc-release sap slot gen))       ; drop the pin
+              (dds.xport.zerocopy::%zc-resolve-fresh sap slot gen))        ; the RETAINED heap copy pinning eliminates
+          (dds.xport.zerocopy::%zc-release sap slot gen)))                 ; drop the armed loan
+      (/ (float (max 0 (- (dds.pal:bytes-consed) before)) 1.0d0) iters))))
+
 (defun* %fd-loan-write-dcps-cycle (dw fd iters kind mode)
     (function (t dds.core.buffer:octet-buffer (integer 1) (member :bytes :ns) (member :loan :classic)) real)
   "WP-FLATDATA-LOAN-WRITE bench, the DCPS-level cycle arm (R6, ADR 0042; honest app-visible cost): the REAL
@@ -2276,13 +2298,14 @@
     (setf (fd-abc-a-fd fd) 200 (fd-abc-b-fd fd) 3000000000 (fd-abc-c-fd fd) 4000000000000000000)
     (progn
       (multiple-value-bind (base-bytes base-ns lw-bytes lw-ns ss-plain-bytes ss-plain-ns ss-armed-bytes ss-armed-ns
-                            rx-loan-bytes rx-new-bytes dcps-lw-bytes dcps-lw-ns dcps-ws-bytes dcps-ws-ns)
+                            rx-loan-bytes rx-new-bytes dcps-lw-bytes dcps-lw-ns dcps-ws-bytes dcps-ws-ns
+                            pin-ret-bytes pin-pin-bytes)
           (if (not have-shmem)
-              (values 0 0 0 0 0 0 0 0 0 0 0 0 0 0)
+              (values 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0)
               (let* ((mem (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 4 +fd-abc-flatdata-size+)))
                      (sap (dds.pal:static-pointer mem)))
                 (dds.xport.zerocopy::%zc-init sap 4 +fd-abc-flatdata-size+)
-                (multiple-value-bind (pb pn ab an)
+                (multiple-value-bind (pb pn ab an prb ppb)
                     ;; the SEND-SITE arm (ADR 0042 integration): a real node fixture, 8 KiB payload, %zc-change-item
                     (let* ((dds.disc:*shmem-enabled* t) (dds.disc:*zerocopy-enabled* t)
                            (node (dds.disc:make-disc-node
@@ -2299,7 +2322,9 @@
                                (values (%fd-loan-write-sendsite node payload plain n :bytes nil)
                                        (%fd-loan-write-sendsite node payload plain n :ns nil)
                                        (%fd-loan-write-sendsite node payload armed n :bytes t)
-                                       (%fd-loan-write-sendsite node payload armed n :ns t))))
+                                       (%fd-loan-write-sendsite node payload armed n :ns t)
+                                       (%fd-loan-write-pin-arm node payload n nil)     ; ADR 0044: the retained heap copy (before)
+                                       (%fd-loan-write-pin-arm node payload n t))))    ; ADR 0044: the pin (after, 0 heap payload)
                         (dds.disc:stop-node node)))
                   (multiple-value-bind (dlb dln dwb dwn)
                       ;; the DCPS-cycle arm (honest app-visible cost): the real loan-sample->write-loaned cycle
@@ -2335,7 +2360,7 @@
                                      (%fd-loan-write-baseline-bytes sap fd iters :ns)
                                      (%fd-loan-write-bytes sap view iters :bytes)
                                      (%fd-loan-write-bytes sap view iters :ns)
-                                     pb pn ab an rlb rnb dlb dln dwb dwn))
+                                     pb pn ab an rlb rnb dlb dln dwb dwn prb ppb))
                         (dds.xport.zerocopy::%zc-destroy sap)
                         (dds.pal:free-static mem)))))))
         (flet ((emit (stream)
@@ -2371,19 +2396,28 @@
                        (format stream "The loan-write send site emits the ref **~,1fx faster** for this 8 KiB sample (the eliminated copy scales with payload size); GC bytes/sample are the identical fixed item-build cost (the 20-octet ref vec + the builder closure) on both arms.~%~%"
                                (if (plusp ss-armed-ns) (/ ss-plain-ns ss-armed-ns) 0.0d0))
                        (format stream "## DCPS-cycle arm — the honest app-visible write cost (FR-LANG-7)~%~%")
-                       (format stream "The REAL `loan-sample` -> `-fd` setters -> `write-loaned` cycle vs `write-sample` on a reused FlatData buffer, unmatched writer, ~d iterations. **v1 `write-loaned` is NOT 0-GC**: it allocates the RETAINED payload vector (it lives in the writer HistoryCache to serve retransmission / non-ZC / extra-ZC destinations — reuse would corrupt history) plus two registry list cells; the loan struct + view recycle through the freelist. This is the documented v1 cost, the same order as `write-sample`'s `%serialize-sample` payload; it is eliminated only by the acked-slot-pinning follow-up (ADR 0042 Follow-ups). NOTE the configuration: with NO ZC destination and a tiny 20-octet sample, loan-write's benefit (the eliminated send-site copy) cannot appear, so its fixed overhead (slot acquire/commit + the slot->heap retained copy + the sweep) makes the cycle SLOWER than `write-sample` here — the win requires a same-host ZC reader and scales with payload size (the send-site arm above: ~~29x at 8 KiB). The 0-copy and 0-GC claims are scoped precisely: the SEND-SITE payload->slot copy is eliminated (send-site arm) and the POOL PRIMITIVES are 0-GC (primitive table); v1 `write-loaned` itself is NOT 0-GC.~%~%"
+                       (format stream "The REAL `loan-sample` -> `-fd` setters -> `write-loaned` cycle vs `write-sample` on a reused FlatData buffer, unmatched writer, ~d iterations. **v1 `write-loaned` is NOT 0-GC**: it allocates the RETAINED payload vector (it lives in the writer HistoryCache to serve retransmission / non-ZC / extra-ZC destinations — reuse would corrupt history) plus two registry list cells; the loan struct + view recycle through the freelist. This is the documented v1 cost, the same order as `write-sample`'s `%serialize-sample` payload. **For an ELIGIBLE pinned writer this retained copy is now ELIMINATED** (WP-ACKED-SLOT-PINNING, ADR 0044 — see the Acked-slot pinning arm below); this UNMATCHED-writer cycle is NOT pin-eligible (no matched reliable reader would release a pin), so it still shows the retained cost. NOTE the configuration: with NO ZC destination and a tiny 20-octet sample, loan-write's benefit (the eliminated send-site copy) cannot appear, so its fixed overhead (slot acquire/commit + the slot->heap retained copy + the sweep) makes the cycle SLOWER than `write-sample` here — the win requires a same-host ZC reader and scales with payload size (the send-site arm above: ~~29x at 8 KiB). The 0-copy and 0-GC claims are scoped precisely: the SEND-SITE payload->slot copy is eliminated (send-site arm) and the POOL PRIMITIVES are 0-GC (primitive table); v1 `write-loaned` itself is NOT 0-GC.~%~%"
                                (max 1 (floor iters 5)))
                        (format stream "| DCPS write cycle | GC bytes/sample | ns/sample |~%")
                        (format stream "|------------------|-----------------|-----------|~%")
                        (format stream "| `write-sample` (reused FlatData buffer) | ~,1f | ~,1f |~%" dcps-ws-bytes dcps-ws-ns)
                        (format stream "| `loan-sample` -> setters -> `write-loaned` | ~,1f | ~,1f |~%~%" dcps-lw-bytes dcps-lw-ns)
+                       (format stream "## Acked-slot pinning — the retained-payload heap allocation ELIMINATED (WP-ACKED-SLOT-PINNING, FR-PF-4, ADR 0044)~%~%")
+                       (format stream "For an ELIGIBLE writer (reliable + VOLATILE/finalized + a matched reliable reader) `write-loaned` now PINS the committed slot (a second refcount hold via `%zc-pin`, released at the full-ACK purge) INSTEAD of eagerly materialising the retained SerializedPayload — retransmit / non-ZC / extra-ZC sends read the still-pinned slot ON DEMAND. Both arms acquire+commit a real 8 KiB writer-pool slot; RETAINED = `%zc-resolve-fresh` (the per-write heap copy `write-loaned` pays today, the twin of `%loan-write-payload`); PINNED = `%zc-pin` (a 0-GC lock-free CAS, no heap payload). ~d iterations.~%~%" (max 1 (floor iters 2)))
+                       (format stream "| write-loaned retained-payload strategy | GC bytes/sample |~%")
+                       (format stream "|---------------------------------------|-----------------|~%")
+                       (format stream "| RETAINED (eager `%zc-resolve-fresh` heap copy — today) | ~,1f |~%" pin-ret-bytes)
+                       (format stream "| **PINNED (`%zc-pin`, read the slot on demand)** | **~,1f** |~%~%" pin-pin-bytes)
+                       (format stream "The pin ELIMINATES **~,1f** retained-payload GC bytes/sample for the eligible pinned case (the 8 KiB SerializedPayload heap vector `write-loaned` allocated on EVERY write). The pinned arm's **~,1f** GC bytes/sample is the fixed pool-acquire mutex residue (the RETAINED arm pays it TOO, on top of the heap copy) — the pin (`%zc-pin`) itself is a 0-GC lock-free refcount CAS. The retained payload remains the always-correct fallback for an ineligible writer or an exhausted pin budget (ADR 0044 §2).~%~%"
+                               (max 0.0d0 (- pin-ret-bytes pin-pin-bytes)) pin-pin-bytes)
+                       (format stream "**Scope of this measurement (no overclaim, FR-LANG-7):** this is an ISOLATED micro-arm over the exact pool primitives the pinned `write-loaned` leg funcalls (`node-loan-write-acquire`/`-commit` + `%zc-pin`/`%zc-resolve-fresh`), NOT an end-to-end matched-reader `write-loaned` cycle. The DCPS-cycle arm above runs on an UNMATCHED writer, which is by construction NOT pin-eligible (`node-loan-write-pin-capable-p` requires a matched reliable reader whose ACK releases the pin), so it cannot exercise the pinned path; a matched-reader end-to-end bench would add a discovery-spin fixture whose latency dominates and destabilises a per-sample GC-bytes reading. The eliminated allocation is the `%zc-resolve-fresh`/`%loan-write-payload` slot->heap copy priced exactly here, and the end-to-end pin lifecycle (delivery + ACK-release, byte-exact) is proven by the `acked-slot-pin-*` integration tests.~%~%")
                        (format stream "## RX regression check (the pre-existing `bench-flatdata-zc-loan` strategies, rerun)~%~%")
                        (format stream "| RX strategy | GC bytes/sample |~%|-------------|------------------|~%")
                        (format stream "| literal-0-copy loan RX (`%zc-acquire-for-read` + SAP read) | ~,1f |~%" rx-loan-bytes)
                        (format stream "| FlatData+ZC v1 single-copy (`%zc-resolve-fresh`) | ~,1f |~%~%" rx-new-bytes)
                        (format stream "The RX-side loan path is untouched by this WP (the `%zc-loan` split is behaviour-identical); the literal-0-copy loan RX still allocates ~,1f GC bytes/sample vs the v1 single-copy's ~,1f — no regression vs `bench/report/2026-06-16-wp-flatdata-zc-loan.md`.~%~%"
                                rx-loan-bytes rx-new-bytes)))
-                 (format stream "Correctness envelope (ADR 0042 §5, as shipped): loan-write is an OPTIMIZATION of the ZC TX path — every existing case (non-ZC readers, reliable retransmit, late-joiners, pool saturation, multi-destination) is served identically from the RETAINED payload `write-loaned` materialises once. The PRE-COMMITTED slot is consumed at the FIRST ZC-eligible destination (exactly-one-ZC-destination = the pure end-to-end envelope, proven by `dcps-loan-write-e2e`); any further ZC destination pays a fresh `%zc-loan` exactly as today, a retransmit always uses the retained payload, and a slot the send pass never consumes is released by the fallback decision / the push-pass sweep / the teardown sweep (never a strand, ADR 0042 lifecycle).~%~%")
+                 (format stream "Correctness envelope (ADR 0042 §5 + ADR 0044): loan-write is an OPTIMIZATION of the ZC TX path — every existing case (non-ZC readers, reliable retransmit, late-joiners, pool saturation, multi-destination) is served identically. The PRE-COMMITTED slot is consumed at the FIRST ZC-eligible destination (exactly-one-ZC-destination = the pure end-to-end envelope, proven by `dcps-loan-write-e2e`); any further ZC destination, a non-ZC destination, and a retransmit are served from the sample bytes — for a PINNED eligible writer read ON DEMAND from the still-committed slot (ADR 0044, so no per-write retained heap copy), otherwise from the RETAINED payload `write-loaned` materialised eagerly (the always-correct fallback). A pinned slot is released at the full-ACK purge and every change-drop site (KEEP_LAST eviction, dispose, timeout, teardown) exactly once; a slot the send pass never consumes is released by the fallback decision / the push-pass sweep / the teardown sweep (never a strand, ADR 0042/0044 lifecycle).~%~%")
                  (format stream "Method: ~d iterations; SBCL-exact (`bytes-consed` + `load/store-sap-u8` are SBCL-only, ZC ADR 0013; Clasp pass-skips). Impl: ~a ~a on ~a.~%"
                          iters (lisp-implementation-type) (lisp-implementation-version) (machine-instance))
                  (when (and sbcl-p have-shmem)
@@ -3371,6 +3405,12 @@
                  ("reliable-zc-poolfull-fallback" . run-reliable-zc-poolfull-fallback-test)
                  ("reliable-zc-mixed"        . run-reliable-zc-mixed-test)
                  ("reliable-zc-slot-outlives-purge" . run-reliable-zc-slot-outlives-purge-test)
+                 ("acked-slot-pin-happy"     . run-acked-slot-pin-happy-test)
+                 ("acked-slot-pin-retransmit" . run-acked-slot-pin-retransmit-test)
+                 ("acked-slot-pin-budget"    . run-acked-slot-pin-budget-test)
+                 ("acked-slot-pin-ineligible" . run-acked-slot-pin-ineligible-test)
+                 ("acked-slot-pin-keeplast-evict" . run-acked-slot-pin-keeplast-evict-test)
+                 ("acked-slot-pin-defer-on-sendref" . run-acked-slot-pin-defer-on-sendref-test)
                  ("reliable-zc-qos"          . run-reliable-zc-qos-test)
                  ("lease-sweep"              . run-lease-sweep-test)
                  ("tce-disallow-default"     . run-tce-disallow-default-test)

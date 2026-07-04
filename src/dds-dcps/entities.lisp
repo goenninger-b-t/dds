@@ -757,9 +757,11 @@
    Carry-10 + ADR 0042 §6, fail-closed at the loan end): a wire-protected OR payload-transforming writer NEVER
    gets a slot-backed loan — its plaintext must not land in a pool slot at all. ALLOCATION (honest, FR-LANG-7):
    the writer-loan struct + flatdata-view recycle through the DataWriter's freelist, but each loan-sample CONSES
-   one registry cell (dw-loans) and each write-loaned allocates the RETAINED payload vector + one armed-registry
-   cell — the documented v1 per-write cost (same order as write-sample's %serialize-sample payload; eliminated
-   only by the acked-slot-pinning follow-up, ADR 0042 Follow-ups). NOT cleared for ship — pending counsel (R6)."
+   one registry cell (dw-loans) and each write-loaned conses one armed-registry cell. The RETAINED payload vector
+   write-loaned allocated on EVERY write is ELIMINATED for a PIN-ELIGIBLE writer (WP-ACKED-SLOT-PINNING, ADR 0044):
+   reliable + VOLATILE/finalized + a matched reliable reader PINS the committed slot until the full-ACK purge, so
+   retransmit / non-ZC / extra-ZC sends read it on demand; an ineligible writer (or exhausted pin budget) still
+   materialises the retained payload (the always-correct fallback). NOT cleared for ship — pending counsel (R6)."
   (let* ((ts (topic-type-support (dw-topic dw)))
          (node (dp-node (pub-participant (dw-publisher dw))))
          (lay (dds.types:type-support-flatdata-offset ts))
@@ -797,9 +799,10 @@
    wrote the type's 4-octet encap header + OPTIONS into it via %loan-encap-header — the same dds.cdr emitters
    %serialize-sample uses — and the app's SAP setters wrote the body), so the retained vector is byte-identical
    to what write-sample's %serialize-sample would produce for the same field values. This per-write heap vector
-   is the DOCUMENTED v1 retained-payload cost (ADR 0042 §5): it lives in the writer HistoryCache to serve
-   retransmission / non-ZC / extra-ZC destinations, so it cannot be pooled/reused without corrupting history
-   (eliminated only by the acked-slot-pinning follow-up). NOT cleared for ship — pending counsel (R6)."
+   is the ADR 0042 retained-payload fallback: it lives in the writer HistoryCache to serve retransmission / non-ZC
+   / extra-ZC destinations. write-loaned calls this ONLY for a NON-pin-eligible writer (WP-ACKED-SLOT-PINNING, ADR
+   0044); a pin-eligible writer instead PINS the committed slot and reads it on demand, eliminating this per-write
+   copy (see write-loaned). NOT cleared for ship — pending counsel (R6)."
   (let* ((size (writer-loan-size ln))
          (base (writer-loan-payload-base ln))
          (sap (writer-loan-pool-sap ln))
@@ -838,12 +841,19 @@
   (when (writer-loan-done loan) (return-from write-loaned +retcode-ok+))   ; already written/discarded: no-op
   (let ((node (dp-node (pub-participant (dw-publisher dw)))))
     (if (eq (writer-loan-kind loan) :slot)
-        (let ((payload (%loan-write-payload loan))
-              (kh (when (%writer-keeplast-p dw)
-                    (%instance-handle (topic-type-support (dw-topic dw)) (writer-loan-sample loan)))))  ; keyhash off the view
+        ;; WP-ACKED-SLOT-PINNING (ADR 0044): a PIN-CAPABLE writer (reliable + volatile/finalized + >=1 matched
+        ;; reliable reader) PINS the committed slot instead of eagerly copying it to the heap — pass NIL payload +
+        ;; the true length so publish-sample takes the pin (or, at budget, resolves on demand). Otherwise (ADR
+        ;; 0042 fallback) materialise the RETAINED payload eagerly (best-effort / no reliable reader / un-finalized
+        ;; TRANSIENT_LOCAL); either is byte- and behaviour-identical downstream.
+        (let* ((pin-p (dds.disc:node-loan-write-pin-capable-p node))
+               (payload (if pin-p nil (%loan-write-payload loan)))
+               (kh (when (%writer-keeplast-p dw)
+                     (%instance-handle (topic-type-support (dw-topic dw)) (writer-loan-sample loan)))))  ; keyhash off the view
           (dds.disc:node-loan-write-commit node (writer-loan-slot loan) (writer-loan-generation loan))  ; publish the slot's generation (ADR 0042 §2)
           (setf (writer-loan-done loan) :written)
-          (let ((rc (dds.disc:publish-sample node payload kh (writer-loan-slot loan) (writer-loan-generation loan))))
+          (let ((rc (dds.disc:publish-sample node payload kh (writer-loan-slot loan) (writer-loan-generation loan)
+                                             (writer-loan-size loan))))   ; ADR 0044: the true length for the pinned case
             (%recycle-loan dw loan)
             (when (eq :timeout rc) (return-from write-loaned +retcode-timeout+)))   ; slot already released inside publish-sample
           (assert-liveliness dw)

@@ -85,6 +85,16 @@
    so the writer sends it as normal DATA. Only payloads STRICTLY LARGER are stored in the pool and sent
    as a reference. A local policy, NOT a wire constant; tunable.")
 
+;;;; NOT cleared for ship — pending counsel (R6); see ADR 0044.
+(defparameter *zc-pin-budget* 16
+  "WP-ACKED-SLOT-PINNING slot-pin budget (FR-PF-4, R6, ADR 0044): the maximum number of Zero-Copy pool slots
+   that may be simultaneously PINNED (held live until every matched reliable reader ACKs) per node, so an
+   eligible loan-written change can serve retransmit / non-ZC / extra-ZC destinations from the still-committed
+   slot instead of a per-write retained-payload heap copy. Default 16 — half of +zerocopy-pool-slots+ (32) — so
+   pinning never starves fresh classic loans or RX loans. At budget a new eligible write falls back to the
+   retained payload (materialised on demand from its still-armed slot); no starvation, no error. A local
+   resource heuristic, NOT a wire constant; tunable. NOT cleared for ship — pending counsel (R6).")
+
 (defconstant +shmem-default-lane-count+ 8
   "Default per-receiver SHMEM lane count (max concurrent same-host senders); must match the advertised wire locator (FR-XPORT-2).")
 
@@ -187,6 +197,7 @@
   (zc-attach-cache (make-hash-table :test 'equalp) :type hash-table) ; reader side: remote 12-octet prefix -> attached pool shm-segment | :none
   (zc-attach-lock (dds.pal:make-lock "zc-attach") :type t)
   (zc-armed-changes '() :type list)        ; WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): changes born :armed with a pre-committed slot, pending their push pass — the leak-safety sweep registry (guarded by LOCK; drained by %zc-armed-sweep after each push pass / at stop-node)
+  (zc-pin-count (dds.pal:make-atomic-cell) :type dds.pal:atomic-cell)   ; WP-ACKED-SLOT-PINNING (R6, ADR 0044): live count of currently-pinned slots (atomic; incremented at a granted pin in publish-sample, decremented in the HistoryCache zc-release-fn at the change-removal choke) — gates *zc-pin-budget*
   (zc-loan-capable nil :type t)            ; WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017): DCPS set this iff the local reader is on a :flatdata topic AND ZC armed -> the receiver thread stores the UNRESOLVED ref (no copy/release; the slot stays loaned via the writer's refcount) and DCPS take-loaned/return-loan owns the slot lifetime. NIL (default) = today's resolve-copy-release. NOT cleared for ship — pending counsel (R6)
   (batch-max-samples 1 :type (integer 1)) ; WP-BATCH size trigger: flush the accumulated batch every N publishes (1 = flush per write, no batching)
   (batch-pending 0 :type (integer 0))     ; samples accumulated since the last flush (a flush pacer; %push-data always sends all unsent)

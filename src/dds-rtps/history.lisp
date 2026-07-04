@@ -52,7 +52,17 @@
   ;; decision / sweep %zc-released the slot; the retained payload serves every send). ZC-SLOT -1 = none.
   (zc-slot -1 :type fixnum)                                               ; ADR 0042: pre-committed pool slot index (-1 = none)
   (zc-generation 0 :type (unsigned-byte 32))                              ; ADR 0042: the slot's committed generation
-  (zc-state nil :type (member nil :armed :consumed :released)))           ; ADR 0042: one-shot slot lifecycle (under the writer lock)
+  (zc-state nil :type (member nil :armed :consumed :released))            ; ADR 0042: one-shot slot lifecycle (under the writer lock)
+  ;; WP-ACKED-SLOT-PINNING (FR-PF-4, R6, ADR 0044): the TX PIN hold — a SECOND, distinct refcount contribution on
+  ;; ZC-SLOT (over the armed/delivery hold) that keeps the committed slot LIVE until every matched reliable reader
+  ;; ACKs, so retransmit / non-ZC / extra-ZC sends read the slot ON DEMAND instead of a per-write retained payload.
+  ;; ZC-PINNED T = the pin hold is currently held; flipped T->NIL EXACTLY ONCE (under the writer lock) by
+  ;; hc-try-release-pinned at the change-removal choke, which then %zc-releases it. ZC-LEN = the pinned change's
+  ;; TRUE serialized length (SERIALIZED-PAYLOAD is NIL until an on-demand read materialises it) so cache-change-
+  ;; payload-len + the ZC size gate work without touching the slot. Both NIL/0 for a non-pinned change (byte- and
+  ;; alloc-identical). NOT cleared for ship — pending counsel (R6).
+  (zc-pinned nil :type boolean)                                          ; ADR 0044: the TX pin hold is held (one-shot, under the writer lock)
+  (zc-len nil :type (or null (integer 0))))                              ; ADR 0044: true serialized length of a pinned change (serialized-payload NIL until resolved)
 
 (defun* cache-change-releasable-p (change)
     (function (cache-change) boolean)
@@ -76,8 +86,9 @@
    exactly (length serialized-payload) — byte-identical. No allocation (a slot read + length), hot-path-safe."
   (let ((pl (cache-change-pooled-len change)))
     (cond (pl pl)
-          (t (let ((sp (cache-change-serialized-payload change)))
-               (if sp (length sp) 0))))))
+          ((cache-change-serialized-payload change) (length (cache-change-serialized-payload change)))
+          ((cache-change-zc-len change))                ; WP-ACKED-SLOT-PINNING: a pinned change carries its true length (payload NIL until resolved, ADR 0044)
+          (t 0))))
 
 ;;;; HistoryCache (FR-RTPS-5): a change store honouring HISTORY (KEEP_LAST depth /
 ;;;; KEEP_ALL) and RESOURCE_LIMITS (max_samples). v1 keys changes by sequence
@@ -101,7 +112,8 @@
   (changes (make-hash-table :test 'eql) :type hash-table)
   (instances (make-hash-table :test 'equalp) :type hash-table)                   ; keyhash -> SNs oldest-first (per-instance KEEP_LAST, §2.2.3.18)
   (count 0 :type (integer 0))
-  (payload-pool nil :type (or null dds.core.arena:buffer-pool)))                  ; T5a: data_protection secured-payload pool (NIL = no pooling, byte-identical); buffers acquired+released ONLY under the owning writer's lock
+  (payload-pool nil :type (or null dds.core.arena:buffer-pool))                   ; T5a: data_protection secured-payload pool (NIL = no pooling, byte-identical); buffers acquired+released ONLY under the owning writer's lock
+  (zc-release-fn nil :type (or null function)))                                   ; WP-ACKED-SLOT-PINNING (ADR 0044): opaque (lambda (slot generation)) the disc layer installs to %zc-release a pinned change's TX slot at the change-removal choke; NIL = no pinning (layering: history must not depend on dds.xport.zerocopy, so the release is a funcall'd closure, mirroring payload-pool)
 
 (defun* %resolve-max-samples (resource-limits)
     (function (t) t)
@@ -206,6 +218,38 @@
       (setf (cache-change-pooled-buffer change) nil)))
   t)
 
+(defun* hc-try-release-pinned (hc change)
+    (function (history-cache cache-change) t)
+  "WP-ACKED-SLOT-PINNING (FR-PF-4, R6, ADR 0044; NOT cleared for ship — pending counsel). Release CHANGE's TX
+   PIN hold on its Zero-Copy slot iff the release is DUE — the ONE-SHOT, refcount-gated pin-release predicate, the
+   exact STRUCTURAL SIBLING of hc-try-release-pooled: released ONLY when ALL of (i) CHANGE is ZC-PINNED, (ii) HC
+   has a ZC-RELEASE-FN installed (a pinning writer), (iii) CHANGE has been EVICTED from the cache, and (iv) CHANGE
+   has NO outstanding send-ref (CACHE-CHANGE-RELEASABLE-P, SEND-REFCOUNT 0). Conditions (iii)+(iv) are the SAME
+   defer-gate the pooled path uses and are load-bearing for the SAME reason: a captured send build-thunk may still
+   RESOLVE the pinned slot BY REFERENCE (%ensure-change-payload reads the live slot), so the pin — which keeps the
+   slot's generation frozen + refcount>0 — must OUTLIVE any in-flight/deferred send-ref, or the slot could be
+   reclaimed + generation-bumped under a concurrent resolve (a stale resolve then returns NIL — a best-effort
+   dropped datagram, never wrong bytes; but the pin must not race it, ADR 0044 §5). So a change EVICTED while
+   send-referenced DEFERS its pin release to the LAST send-ref drop, exactly like the pooled buffer: this is
+   retried from BOTH triggers that can make it due — the eviction choke (%hc-remove-change, which sets EVICTED) and
+   the last send-ref drop (writer-release-change-ref / -refs). On a due release, flip ZC-PINNED T->NIL (so a second
+   call is a validated no-op — idempotent, mirroring the floored ref-release) and funcall the release-fn with
+   (ZC-SLOT, ZC-GENERATION), which %zc-releases the pin hold (refcount--, one of the two distinct holds — whichever
+   reaches 0 LAST frees the slot) and decrements the live pin budget. Fires for the full-ACK purge, the KEEP_LAST
+   early eviction, and dispose — every drop site — exactly once (ADR 0044 §4.4). MUST run under the owning writer's
+   lock (the same lock ZC-STATE + EVICTED + SEND-REFCOUNT are mutated under) so the due-check cannot race a
+   concurrent acquire/release/eviction; the release-fn itself takes NO lock (a lock-free %zc-release + an
+   atomic-cell decrement), so there is no lock-ordering hazard. Inert (no-op) when the change is not pinned or no
+   release-fn is installed — byte- and behaviour-identical to before."
+  (when (and (cache-change-zc-pinned change)
+             (history-cache-zc-release-fn hc)
+             (cache-change-evicted change)
+             (cache-change-releasable-p change))
+    (setf (cache-change-zc-pinned change) nil)
+    (funcall (history-cache-zc-release-fn hc)
+             (cache-change-zc-slot change) (cache-change-zc-generation change)))
+  t)
+
 (defun* %hc-remove-change (hc seqnum)
     (function (history-cache integer) t)
   "The single change-removal path: drop SEQNUM from BOTH the change table and its per-instance
@@ -222,6 +266,7 @@
       (decf (history-cache-count hc))
       (setf (cache-change-evicted change) t)   ; gate the (possibly deferred) pooled-buffer release
       (hc-try-release-pooled hc change)         ; release NOW if releasable, else defer to the last send-ref drop (T5a)
+      (hc-try-release-pinned hc change)         ; WP-ACKED-SLOT-PINNING: release the TX pin hold on a pinned change (one-shot, ADR 0044)
       t)))
 
 (defun* hc-remove-change (hc seqnum)

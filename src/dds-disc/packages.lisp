@@ -52,6 +52,8 @@
            #:set-zc-loan-capable #:disc-node-zc-loan-capable
            ;; WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042): TX loan-write pool API
            #:node-loan-write-eligible-p #:node-loan-write-acquire #:node-loan-write-abort #:node-loan-write-commit
+           ;; WP-ACKED-SLOT-PINNING (FR-PF-4, R6, ADR 0044): pin-until-ack budget + capability gate
+           #:*zc-pin-budget* #:node-loan-write-pin-capable-p #:disc-node-zc-pin-count
            #:zc-loan-marker #:zc-loan-marker-p #:zc-loan-marker-pool-sap
            #:zc-loan-marker-slot-index #:zc-loan-marker-generation #:zc-loan-marker-len
            #:node-sample-count #:node-sample #:node-sample-sns

@@ -225,6 +225,34 @@
         (when (zerop rc) (return t))
         (when (= rc (dds.pal:cas-sap-u32 sap (+ b +zc-slot-off-refcount+) rc (1- rc))) (return t))))))
 
+(defun* %zc-pin (sap slot-index generation)
+    (function (t (integer 0) (unsigned-byte 32)) t)
+  "WP-ACKED-SLOT-PINNING (FR-PF-4, R6, ADR 0044; NOT cleared for ship — pending counsel). Add ONE extra
+   refcount hold — the TX PIN — to slot SLOT-INDEX at GENERATION: a lock-free cas-sap-u32 ATOMIC INCREMENT of
+   the refcount sub-field, the exact dual of %zc-release's decrement. T if applied, NIL if stale/OOB or the
+   slot is already free (refcount==0 — a dead slot is never pinned). The pin is a DISTINCT hold from the
+   armed/delivery refcount (%zc-loan-acquire's readers count) so a reader's return-loan (%zc-release) cannot
+   free the slot before the writer's ACK-release; whichever of the two holds reaches refcount 0 LAST frees the
+   slot (ADR 0044 §4). GENERATION GUARD: a held slot's generation is STABLE while refcount>0 (force-reclaim only
+   reclaims refcount==0), so the up-front generation read is the stale-ref check — a mismatch (already reclaimed)
+   returns NIL with NO increment. The CAS loop contends only on the refcount cell @+0 (never materialises the
+   combined u64 — 0-alloc at any generation), mirroring %zc-release:
+     gen0 /= GENERATION -> NIL   (stale / reclaimed, no increment)
+     loop: rc := load-u32 refcount@+0
+           rc = 0  -> NIL        (dead slot, never pin)
+           CAS(refcount: rc -> rc+1) succeeds -> T ; else retry
+   MEMORY-ORDERING: dds.pal:cas-sap-u32 is a full-barrier RMW (arm64 CASAL), the same handshake %zc-release
+   uses. Called by the TX publish path AFTER %zc-loan-commit (the slot is committed + still held at refcount>=1),
+   so it can never race a reader that has not yet been handed the ref. Idempotent-unsafe by design (each pin is
+   released by exactly one %zc-release under a one-shot state flag, ADR 0044 §4.2)."
+  (when (>= slot-index (%zc-slot-count sap)) (return-from %zc-pin nil))
+  (let ((b (%zc-slot-off sap slot-index)))
+    (unless (= generation (dds.pal:load-sap-u32 sap (+ b +zc-slot-off-generation+))) (return-from %zc-pin nil))
+    (loop
+      (let ((rc (dds.pal:load-sap-u32 sap (+ b +zc-slot-off-refcount+))))
+        (when (zerop rc) (return nil))
+        (when (= rc (dds.pal:cas-sap-u32 sap (+ b +zc-slot-off-refcount+) rc (1+ rc))) (return t))))))
+
 (defun* %zc-slot-payload-len (sap slot-index generation)
     (function (t (integer 0) (unsigned-byte 32)) (or null (unsigned-byte 32)))
   "CALLER HOLDS THE MUTEX. The slot's recorded payload length CLAMPED to slot-bytes (so a forged on-wire

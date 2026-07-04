@@ -7277,6 +7277,360 @@
       (when p2 (dds.dcps:delete-participant p2))))
     t)
 
+(defun* %acked-pin-setup (p1 p2 topic)
+    (function (t t string) (values t t t t t))
+  "WP-ACKED-SLOT-PINNING test fixture (R6, ADR 0044): a RELIABLE + VOLATILE + KEEP_ALL loan-write writer on P1
+   matched to a RELIABLE loan-capable ZC reader on P2 over TOPIC (fd-abc). Drives discovery until matched AND the
+   writer sees the reader as ZC-capable, then returns (values DW DR NODE1 NODE2 WRITER). The caller loan-samples,
+   fills the SAP setters, write-loaned's, and asserts the pin lifecycle. Mirrors the reliable-zc fixtures."
+  (let* ((ts (dds.types:find-type-support "fd-abc"))
+         (tw (dds.dcps:create-topic p1 topic "fd-abc" ts))
+         (tr (dds.dcps:create-topic p2 topic "fd-abc" ts))
+         (pub (dds.dcps:create-publisher p1))
+         (sub (dds.dcps:create-subscriber p2))
+         (dw (dds.dcps:create-datawriter pub tw))                                       ; RELIABLE + VOLATILE default
+         (dr (dds.dcps:create-datareader sub tr :qos (dds.qos:make-reader-qos :reliability :reliable)))
+         (node1 (dds.dcps::dp-node p1))
+         (node2 (dds.dcps::dp-node p2)))
+    (loop repeat 200
+          until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+    (loop repeat 200
+          until (plusp (dds.disc::%zc-readers node1
+                                              (list (dds.rtps.discovery:endpoint-data-guid
+                                                     (first (dds.disc::%matched-endpoints node1))))))
+          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+    (values dw dr node1 node2 (dds.disc::disc-node-user-writer node1))))
+
+(defun* run-acked-slot-pin-happy-test ()
+    (function () t)
+  "WP-ACKED-SLOT-PINNING scenario 1 — the pin happy path (FR-PF-4, R6, ADR 0044; NOT cleared for ship — pending
+   counsel). An ELIGIBLE reliable+VOLATILE+KEEP_ALL loan-write writer + one reliable ZC reader; loan-write. Asserts
+   the headline: (1) the writer is pin-capable and write-loaned PINS the committed slot — the HistoryCache change
+   for SN 1 carries NO retained serialized-payload (the per-write heap copy is ELIMINATED), is zc-pinned, and
+   records its true length in zc-len; (2) the live pin count is 1 and the slot's refcount is 2 (the delivery hold +
+   the TX pin, ADR 0044 §4.1); (3) the reader receives the sample byte-exact; (4) after the reader ACKs, the
+   full-ACK purge drops the HC change AND releases the pin (live pin count back to 0), and after return-loan the
+   slot frees (refcount 0, free-count restored). Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-happy-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (va 210) (vb 3000000010) (vc 12345678901234567800)
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (multiple-value-bind (dw dr node1 node2 writer) (%acked-pin-setup p1 p2 "FdPinHappy")
+           (%check :pin-capable (dds.disc:node-loan-write-pin-capable-p node1)
+                   "an eligible reliable+VOLATILE writer with a matched reliable reader must be pin-capable")
+           (let* ((sap (dds.disc::disc-node-zc-pool-sap node1))
+                  (loan (dds.dcps:loan-sample dw))
+                  (s (dds.dcps:writer-loan-sample loan))
+                  (slot (dds.dcps::writer-loan-slot loan)))
+             (setf (fd-abc-a-fd s) va (fd-abc-b-fd s) vb (fd-abc-c-fd s) vc)
+             (%check :pin-write-ok (eq :ok (dds.dcps:write-loaned dw loan)) "write-loaned must return :ok")
+             ;; (1) the pinned change: NO retained payload, zc-pinned, true length recorded
+             (let ((ch (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1)))
+               (%check :pin-change-present ch "the writer HC must hold SN 1 after write-loaned")
+               (when ch
+                 (%check :pin-no-retained (null (dds.rtps.history:cache-change-serialized-payload ch))
+                         "a PINNED change must carry NO retained serialized-payload (the per-write heap copy is eliminated)")
+                 (%check :pin-flagged (dds.rtps.history:cache-change-zc-pinned ch)
+                         "the change must be zc-pinned")
+                 (%check :pin-len (eql +fd-abc-flatdata-size+ (dds.rtps.history:cache-change-zc-len ch))
+                         "the pinned change must record its true serialized length in zc-len")))
+             ;; (2) live pin count 1, slot refcount 2 (delivery + pin)
+             (%check :pin-count-1 (= 1 (dds.pal:atomic-cell-value (dds.disc::disc-node-zc-pin-count node1)))
+                     "exactly one slot must be pinned")
+             (%check :pin-refcount-2 (= 2 (%zc-slot-refcount sap slot))
+                     "the pinned slot's refcount must be 2 (the delivery hold + the TX pin)")
+             ;; (3) byte-exact delivery, held as a view BEFORE the ACK purges
+             (loop repeat 300 until (plusp (dds.disc:node-sample-count node2))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+               (%check :pin-got-one (= 1 (length data)) "take-loaned must return exactly one sample")
+               (let ((v (first data)))
+                 (%check :pin-a (= (fd-abc-a-fd v) va) (format nil "field a ~d != ~d" (fd-abc-a-fd v) va))
+                 (%check :pin-b (= (fd-abc-b-fd v) vb) (format nil "field b ~d != ~d" (fd-abc-b-fd v) vb))
+                 (%check :pin-c (= (fd-abc-c-fd v) vc) (format nil "field c ~d != ~d" (fd-abc-c-fd v) vc)))
+               ;; (4) drive the ACK -> full-ACK purge drops the HC change AND releases the pin
+               (loop repeat 120
+                     until (null (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1))
+                     do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+               (%check :pin-purged (null (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1))
+                       "the writer must purge SN 1 after the reader fully ACKs it (§8.4.1)")
+               (%check :pin-released (zerop (dds.pal:atomic-cell-value (dds.disc::disc-node-zc-pin-count node1)))
+                       "the full-ACK purge must RELEASE the pin (live pin count back to 0)")
+               (%check :pin-slot-survives (= 1 (%zc-slot-refcount sap slot))
+                       "the slot must SURVIVE the purge on the reader's still-held delivery hold (refcount 1)")
+               (dds.dcps:return-loan dr loans)
+               (%check :pin-slot-freed (zerop (%zc-slot-refcount sap slot))
+                       "after return-loan the slot must free (refcount 0)")))
+           ;; PHASE 2 (M1) — the REVERSE release order: return-loan BEFORE the full-ACK purge (the code is
+           ;; order-independent; both orders free the slot exactly once). SN 2 on the same instance (KEEP_LAST
+           ;; depth-1) supersedes SN 1's already-purged change.
+           (let* ((sap (dds.disc::disc-node-zc-pool-sap node1))
+                  (loan2 (dds.dcps:loan-sample dw))
+                  (s2 (dds.dcps:writer-loan-sample loan2))
+                  (slot2 (dds.dcps::writer-loan-slot loan2)))
+             (setf (fd-abc-a-fd s2) 220 (fd-abc-b-fd s2) 3000000020 (fd-abc-c-fd s2) 12345678901234567820)
+             (%check :pin2-write-ok (eq :ok (dds.dcps:write-loaned dw loan2)) "write-loaned (SN 2) must return :ok")
+             (loop repeat 300 until (< 1 (dds.disc:node-sample-count node2))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+               (%check :pin2-got (= 1 (length data)) "take-loaned must return SN 2")
+               ;; RETURN the loan FIRST — before driving the ACK-purge (the reverse of phase 1's order). The delivery
+               ;; hold and the pin hold are two independent %zc-release decrements; the exact instant each fires is
+               ;; timing-dependent, but whichever is LAST must free the slot EXACTLY once (no double-free / u32 wrap).
+               (dds.dcps:return-loan dr loans)
+               ;; NOW drive the ACK -> the full-ACK purge releases the pin -> both holds gone -> slot freed once
+               (loop repeat 120
+                     until (zerop (%zc-slot-refcount sap slot2))
+                     do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+               (%check :pin2-freed-reverse (zerop (%zc-slot-refcount sap slot2))
+                       "reverse order (return-loan THEN ACK-purge) must free the slot EXACTLY once (refcount 0, no u32 wrap)")
+               (%check :pin2-count-0 (zerop (dds.pal:atomic-cell-value (dds.disc::disc-node-zc-pin-count node1)))
+                       "the pin count must return to 0 after the reverse-order release"))))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+    t)
+
+(defun* run-acked-slot-pin-retransmit-test ()
+    (function () t)
+  "WP-ACKED-SLOT-PINNING scenario 2 — retransmit-from-pinned-slot (FR-PF-4, R6, ADR 0044; NOT cleared for ship —
+   pending counsel). An eligible pinned writer; the first ref-DATA for SN 1 is DROPPED (*debug-drop-sample-numbers*)
+   so the reader NACKs; the writer's ACKNACK retransmit must deliver the sample byte-exact by reading the STILL-
+   PINNED slot ON DEMAND — NO retained payload ever existed. Asserts: (1) right after write-loaned the HC change is
+   pinned with no retained payload; (2) nothing arrived during the drop; (3) after the drop clears the sample is
+   ultimately received (reliable, no silent loss) and reads a/b/c byte-exact; (4) the retransmit materialised the
+   payload from the slot (the change now carries a resolved serialized-payload). Skips where SHMEM is off."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-retransmit-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (va 211) (vb 3000000011) (vc 12345678901234567801)
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (multiple-value-bind (dw dr node1 node2 writer) (%acked-pin-setup p1 p2 "FdPinReTx")
+           (setf dds.disc:*debug-drop-sample-numbers* (list 1))
+           (let* ((loan (dds.dcps:loan-sample dw))
+                  (s (dds.dcps:writer-loan-sample loan)))
+             (setf (fd-abc-a-fd s) va (fd-abc-b-fd s) vb (fd-abc-c-fd s) vc)
+             (%check :pinretx-write-ok (eq :ok (dds.dcps:write-loaned dw loan)) "write-loaned must return :ok")
+             (let ((ch (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1)))
+               (%check :pinretx-pinned (and ch (dds.rtps.history:cache-change-zc-pinned ch)
+                                            (null (dds.rtps.history:cache-change-serialized-payload ch)))
+                       "the change must be pinned with NO retained payload before the retransmit")
+               ;; M2 KAT: the on-demand read of the pinned slot (the retransmit's byte-source, via write-data) must
+               ;; be BYTE-FOR-BYTE identical to the classic retained-path serialization of the same field values —
+               ;; so a retransmit-from-pinned DATA payload equals what the retained-payload retransmit would emit.
+               (when ch
+                 (let* ((sap (dds.disc::disc-node-zc-pool-sap node1))
+                        (classic (make-fd-abc-flatdata))
+                        (b-pin (dds.xport.zerocopy::%zc-resolve-fresh
+                                sap (dds.rtps.history:cache-change-zc-slot ch)
+                                (dds.rtps.history:cache-change-zc-generation ch))))
+                   (setf (fd-abc-a-fd classic) va (fd-abc-b-fd classic) vb (fd-abc-c-fd classic) vc)
+                   (%check :pinretx-kat-byte-exact
+                           (and b-pin (equalp b-pin (subseq (dds.core.buffer:octet-buffer-vec classic)
+                                                            0 +fd-abc-flatdata-size+)))
+                           "the pinned-slot on-demand read must be BYTE-FOR-BYTE the retained-path serialization (the retransmit DATA payload)")
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec classic)))))
+             (dotimes (i 6) (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (%check :pinretx-dropped (zerop (dds.disc:node-sample-count node2))
+                     "drop hook failed: the reader received SN 1 while it was being dropped")
+             (setf dds.disc:*debug-drop-sample-numbers* nil)
+             (loop repeat 100 until (plusp (dds.disc:node-sample-count node2))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (%check :pinretx-recovered (plusp (dds.disc:node-sample-count node2))
+                     "the pinned sample never recovered after the dropped ref-DATA was retransmitted (silent loss)")
+             (let ((ch (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1)))
+               (when ch   ; may already be purged if the reader ACKed; if present it must show the on-demand resolve
+                 (%check :pinretx-materialized (dds.rtps.history:cache-change-serialized-payload ch)
+                         "the retransmit must have MATERIALISED the payload from the pinned slot on demand")))
+             (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+               (%check :pinretx-one (= 1 (length data)) "take-loaned must return exactly the one recovered sample")
+               (let ((d (first data)))
+                 (%check :pinretx-a (= (fd-abc-a-fd d) va) (format nil "recovered field a ~d != ~d" (fd-abc-a-fd d) va))
+                 (%check :pinretx-b (= (fd-abc-b-fd d) vb) (format nil "recovered field b ~d != ~d" (fd-abc-b-fd d) vb))
+                 (%check :pinretx-c (= (fd-abc-c-fd d) vc) (format nil "recovered field c ~d != ~d" (fd-abc-c-fd d) vc)))
+               (dds.dcps:return-loan dr loans))))
+      (setf dds.disc:*debug-drop-sample-numbers* nil)
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+    t)
+
+(defun* run-acked-slot-pin-budget-test ()
+    (function () t)
+  "WP-ACKED-SLOT-PINNING scenario 3 — pin-budget exhaustion falls back to the retained payload (FR-PF-4, R6, ADR
+   0044). With *zc-pin-budget* bound to 0 an eligible loan-write CANNOT pin; it must fall back — materialise the
+   retained payload on demand from the still-armed slot and publish as a NORMAL change (serialized-payload
+   non-nil, NOT pinned, live pin count stays 0) — and still deliver byte-exact. Skips where SHMEM is off."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-budget-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (dds.disc:*zc-pin-budget* 0)                       ; no pin may be granted
+         (va 212) (vb 3000000012) (vc 12345678901234567802)
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (multiple-value-bind (dw dr node1 node2 writer) (%acked-pin-setup p1 p2 "FdPinBudget")
+           (let* ((loan (dds.dcps:loan-sample dw))
+                  (s (dds.dcps:writer-loan-sample loan)))
+             (setf (fd-abc-a-fd s) va (fd-abc-b-fd s) vb (fd-abc-c-fd s) vc)
+             (%check :pinbud-write-ok (eq :ok (dds.dcps:write-loaned dw loan)) "write-loaned must return :ok")
+             (let ((ch (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1)))
+               (%check :pinbud-present ch "the writer HC must hold SN 1")
+               (when ch
+                 (%check :pinbud-not-pinned (null (dds.rtps.history:cache-change-zc-pinned ch))
+                         "at budget 0 the change must NOT be pinned")
+                 (%check :pinbud-retained (dds.rtps.history:cache-change-serialized-payload ch)
+                         "the budget-exhausted fallback must carry the on-demand-resolved retained payload")))
+             (%check :pinbud-count-0 (zerop (dds.pal:atomic-cell-value (dds.disc::disc-node-zc-pin-count node1)))
+                     "no slot may be pinned when the budget is 0")
+             (loop repeat 300 until (plusp (dds.disc:node-sample-count node2))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+               (%check :pinbud-one (= 1 (length data)) "take-loaned must return the sample")
+               (let ((d (first data)))
+                 (%check :pinbud-a (= (fd-abc-a-fd d) va) (format nil "field a ~d != ~d" (fd-abc-a-fd d) va))
+                 (%check :pinbud-c (= (fd-abc-c-fd d) vc) (format nil "field c ~d != ~d" (fd-abc-c-fd d) vc)))
+               (dds.dcps:return-loan dr loans))))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+    t)
+
+(defun* run-acked-slot-pin-ineligible-test ()
+    (function () t)
+  "WP-ACKED-SLOT-PINNING scenario 4 — ineligibility falls back to the eager retained payload (FR-PF-4, R6, ADR
+   0044). A BEST_EFFORT reader (no ACK -> nothing would release a pin) makes the writer NOT pin-capable: write-loaned
+   must materialise the retained payload eagerly (ADR 0042 behaviour, byte- and alloc-identical) — the change is
+   NOT pinned, carries a serialized-payload, and the live pin count stays 0 — and deliver byte-exact. Skips where
+   SHMEM is off."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-ineligible-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (va 213) (vb 3000000013) (vc 12345678901234567803)
+         (ts (dds.types:find-type-support "fd-abc"))
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "FdPinInelig" "fd-abc" ts))
+                (tr (dds.dcps:create-topic p2 "FdPinInelig" "fd-abc" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))     ; BEST_EFFORT default -> never ACKs -> not pin-capable
+                (node1 (dds.dcps::dp-node p1))
+                (node2 (dds.dcps::dp-node p2))
+                (writer (dds.disc::disc-node-user-writer node1)))
+           (loop repeat 200
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (loop repeat 200
+                 until (plusp (dds.disc::%zc-readers node1
+                                                     (list (dds.rtps.discovery:endpoint-data-guid
+                                                            (first (dds.disc::%matched-endpoints node1))))))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :pininelig-not-capable (not (dds.disc:node-loan-write-pin-capable-p node1))
+                   "a writer with only a BEST_EFFORT reader must NOT be pin-capable (nothing would release the pin)")
+           (let* ((loan (dds.dcps:loan-sample dw))
+                  (s (dds.dcps:writer-loan-sample loan)))
+             (setf (fd-abc-a-fd s) va (fd-abc-b-fd s) vb (fd-abc-c-fd s) vc)
+             (%check :pininelig-write-ok (eq :ok (dds.dcps:write-loaned dw loan)) "write-loaned must return :ok")
+             (let ((ch (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1)))
+               (when ch
+                 (%check :pininelig-not-pinned (null (dds.rtps.history:cache-change-zc-pinned ch))
+                         "an ineligible writer's change must NOT be pinned")
+                 (%check :pininelig-retained (dds.rtps.history:cache-change-serialized-payload ch)
+                         "an ineligible writer must materialise the retained payload eagerly (ADR 0042)")))
+             (%check :pininelig-count-0 (zerop (dds.pal:atomic-cell-value (dds.disc::disc-node-zc-pin-count node1)))
+                     "no pin may be taken for an ineligible writer")
+             (loop repeat 300 until (plusp (dds.disc:node-sample-count node2))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+               (%check :pininelig-one (= 1 (length data)) "take-loaned must return the sample")
+               (let ((d (first data)))
+                 (%check :pininelig-a (= (fd-abc-a-fd d) va) (format nil "field a ~d != ~d" (fd-abc-a-fd d) va))
+                 (%check :pininelig-c (= (fd-abc-c-fd d) vc) (format nil "field c ~d != ~d" (fd-abc-c-fd d) vc)))
+               (dds.dcps:return-loan dr loans))))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+    t)
+
+(defun* run-acked-slot-pin-keeplast-evict-test ()
+    (function () t)
+  "WP-ACKED-SLOT-PINNING scenario 5 — a KEEP_LAST early eviction releases the pin BEFORE the ACK (FR-PF-4, R6,
+   ADR 0044 §4.4). A KEEP_LAST depth-1 pinned writer publishes SN 1 (pinned), then SN 2 for the SAME instance
+   SUPERSEDES it: the hc-add-change eviction of SN 1 fires the change-removal choke, which releases SN 1's pin
+   exactly once (no retransmit owed for a superseded sample). Asserts the pin count returns to 1 (SN 2's pin) after
+   SN 1 is evicted, proving the eviction drop-site releases the pin. Skips where SHMEM is off."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-acked-slot-pin-keeplast-evict-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         ;; the default writer QoS is KEEP_LAST depth 1; keyless fd-abc collapses to one (global) bucket, so
+         ;; SN 2 supersedes SN 1 in the writer HistoryCache
+         (multiple-value-bind (dw dr node1 node2 writer) (%acked-pin-setup p1 p2 "FdPinKL")
+           (declare (ignore dr node2))
+           (%check :pinkl-capable (dds.disc:node-loan-write-pin-capable-p node1) "must be pin-capable")
+           (let ((loan1 (dds.dcps:loan-sample dw)))
+             (setf (fd-abc-a-fd (dds.dcps:writer-loan-sample loan1)) 1
+                   (fd-abc-b-fd (dds.dcps:writer-loan-sample loan1)) 100
+                   (fd-abc-c-fd (dds.dcps:writer-loan-sample loan1)) 1000)
+             (dds.dcps:write-loaned dw loan1))
+           (%check :pinkl-one-pinned (= 1 (dds.pal:atomic-cell-value (dds.disc::disc-node-zc-pin-count node1)))
+                   "SN 1 must be pinned")
+           (let ((loan2 (dds.dcps:loan-sample dw)))
+             (setf (fd-abc-a-fd (dds.dcps:writer-loan-sample loan2)) 1
+                   (fd-abc-b-fd (dds.dcps:writer-loan-sample loan2)) 200
+                   (fd-abc-c-fd (dds.dcps:writer-loan-sample loan2)) 2000)
+             (dds.dcps:write-loaned dw loan2))
+           ;; SN 1 evicted by the KEEP_LAST depth-1 supersession -> its pin released; SN 2 now pinned
+           (%check :pinkl-sn1-evicted (null (dds.rtps.history:hc-get-change (dds.rtps.reliable:rtps-writer-hc writer) 1))
+                   "SN 1 must be evicted by the KEEP_LAST depth-1 supersession")
+           (%check :pinkl-one-after (= 1 (dds.pal:atomic-cell-value (dds.disc::disc-node-zc-pin-count node1)))
+                   "the eviction of SN 1 must RELEASE its pin (live pin count back to 1 = SN 2's pin)"))
+      (dds.dcps:delete-participant p1)
+      (when p2 (dds.dcps:delete-participant p2))))
+    t)
+
+(defun* run-acked-slot-pin-defer-on-sendref-test ()
+    (function () t)
+  "WP-ACKED-SLOT-PINNING I1 regression — the pin release DEFERS on an in-flight send-ref (FR-PF-4, R6, ADR 0044
+   §I1). A captured send build-thunk may still RESOLVE the pinned slot BY REFERENCE (%ensure-change-payload reads
+   the live slot), so hc-try-release-pinned must OUTLIVE any outstanding send-ref — structurally identical to
+   hc-try-release-pooled — or the slot could be reclaimed+generation-bumped under a concurrent resolve. Pure
+   unit-level with a MOCK zc-release-fn (no SHMEM — runs FULLY on BOTH impls, not pass-skipped): install a pinned
+   change, HOLD a send-ref, remove the change (KEEP_LAST/purge), assert the pin is NOT released (deferred), drop
+   the send-ref, assert the deferred release fires EXACTLY once, and a second try is a validated no-op."
+  (let* ((hc (dds.rtps.history:make-history-cache :keep-all 1 nil nil))
+         (released '())
+         (change (dds.rtps.history:make-cache-change
+                  :sn 1 :zc-slot 5 :zc-generation 7 :zc-pinned t :zc-len 100)))
+    (setf (dds.rtps.history:history-cache-zc-release-fn hc)
+          (lambda (slot gen) (push (cons slot gen) released)))
+    (dds.rtps.history:hc-add-change hc change)
+    (incf (dds.rtps.history:cache-change-send-refcount change))   ; an in-flight send captured the change
+    (dds.rtps.history:hc-remove-change hc 1)                      ; remove WHILE the send-ref is held
+    (%check :pindefer-held (and (null released) (dds.rtps.history:cache-change-zc-pinned change))
+            "the pin must NOT release while a send-ref is held (deferred exactly like the pooled path, I1)")
+    (setf (dds.rtps.history:cache-change-send-refcount change) 0)  ; the send finished -> last ref drops
+    (dds.rtps.history:hc-try-release-pinned hc change)            ; the deferred release fires (writer-release-change-refs' retry)
+    (%check :pindefer-released (and (= 1 (length released)) (equal (car released) (cons 5 7))
+                                    (null (dds.rtps.history:cache-change-zc-pinned change)))
+            "the pin must release EXACTLY once when the last send-ref drops (I1)")
+    (dds.rtps.history:hc-try-release-pinned hc change)            ; idempotent one-shot
+    (%check :pindefer-idempotent (= 1 (length released))
+            "a second hc-try-release-pinned after release is a validated no-op (one-shot)"))
+  t)
+
 (defun* %deliver-one-zc-loan (writer-qos label va vb vc)
     (function (t string (unsigned-byte 8) (unsigned-byte 32) (unsigned-byte 64)) t)
   "WP-RELIABLE-ZC scenario 5 helper (R6, ADR 0017; NOT cleared for ship — pending counsel): drive ONE

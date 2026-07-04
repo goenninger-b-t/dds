@@ -133,14 +133,17 @@
 
 (defun* writer-write (writer payload &optional (key-hash nil) (inline-qos nil)
                                                (pooled-buffer nil) (pooled-len nil)
-                                               (zc-slot nil) (zc-gen 0))
-    (function (rtps-writer (array (unsigned-byte 8) (*))
+                                               (zc-slot nil) (zc-gen 0)
+                                               (zc-pinned nil) (zc-len nil))
+    (function (rtps-writer (or null (array (unsigned-byte 8) (*)))
                &optional (or null (array (unsigned-byte 8) (*)))
                          (or null (simple-array (unsigned-byte 8) (*)))
                          (or null dds.core.buffer:octet-buffer)
                          (or null (integer 0))
                          (or null (integer 0))
-                         (unsigned-byte 32))
+                         (unsigned-byte 32)
+                         t
+                         (or null (integer 0)))
               (values (or integer (eql :timeout)) (or null dds.rtps.history:cache-change)))
   "Add a new :data change to the writer's HistoryCache; return its sequence number, OR the :timeout sentinel
    (RETCODE_TIMEOUT) if a FULL KEEP_ALL cache (RESOURCE_LIMITS max_samples) did not free a slot within the
@@ -167,7 +170,12 @@
    sample into (refcount=1 held) — the change is BORN :armed under the writer lock, so a concurrent capture can
    never observe a half-armed change; the send site (%zc-change-item) may then emit the slot's 20-octet ref ONCE
    (writer-zc-claim) instead of loaning a fresh slot from PAYLOAD. Returns (values SN-or-:timeout CHANGE) — the
-   CHANGE second value (NIL on :timeout) lets the caller register an armed change for the leak-safety sweep."
+   CHANGE second value (NIL on :timeout) lets the caller register an armed change for the leak-safety sweep.
+   ZC-PINNED / ZC-LEN (WP-ACKED-SLOT-PINNING, FR-PF-4, R6, ADR 0044; default NIL = byte-identical): when ZC-PINNED
+   the change is born with the TX PIN hold engaged and NO retained SERIALIZED-PAYLOAD (PAYLOAD is NIL) — the
+   committed slot stays live until the full-ACK purge, and retransmit / non-ZC / extra-ZC sends read it on demand;
+   ZC-LEN records the true serialized length so the send-path length reads work without a retained payload. The
+   pin hold is released (once) by hc-try-release-pinned at the change-removal choke (ADR 0044 §4)."
   (let ((change nil))
     (values (%writer-add-bounded
              writer (lambda (sn) (setf change (dds.rtps.history:make-cache-change
@@ -175,7 +183,8 @@
                                                :inline-qos inline-qos
                                                :pooled-buffer pooled-buffer :pooled-len pooled-len
                                                :zc-slot (or zc-slot -1) :zc-generation zc-gen
-                                               :zc-state (and zc-slot :armed)))))
+                                               :zc-state (and zc-slot :armed)
+                                               :zc-pinned (and zc-pinned t) :zc-len zc-len))))
             change)))
 
 (defun* writer-zc-claim (writer change)
@@ -333,6 +342,7 @@
     (let ((rc (dds.rtps.history:cache-change-send-refcount change)))
       (setf (dds.rtps.history:cache-change-send-refcount change) (if (plusp rc) (1- rc) 0))
       (dds.rtps.history:hc-try-release-pooled (rtps-writer-hc writer) change)   ; deferred pool-release on the last ref drop of an evicted pooled change (T5a)
+      (dds.rtps.history:hc-try-release-pinned (rtps-writer-hc writer) change)   ; deferred pin-release on the last ref drop of an evicted pinned change (ADR 0044 I1)
       (dds.rtps.history:cache-change-send-refcount change))))
 
 (defun* writer-release-change-refs (writer changes)
@@ -348,7 +358,8 @@
       (dolist (ch changes t)
         (let ((rc (dds.rtps.history:cache-change-send-refcount ch)))
           (setf (dds.rtps.history:cache-change-send-refcount ch) (if (plusp rc) (1- rc) 0)))
-        (dds.rtps.history:hc-try-release-pooled hc ch)))))   ; deferred pool-release on the last ref drop of an evicted pooled change (T5a)
+        (dds.rtps.history:hc-try-release-pooled hc ch)   ; deferred pool-release on the last ref drop of an evicted pooled change (T5a)
+        (dds.rtps.history:hc-try-release-pinned hc ch)))))   ; deferred pin-release on the last ref drop of an evicted pinned change (ADR 0044 I1)
 
 (defun* writer-acquire-payload-buffer (writer)
     (function (rtps-writer) t)

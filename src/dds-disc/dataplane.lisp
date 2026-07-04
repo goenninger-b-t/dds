@@ -926,6 +926,54 @@
     (when sap (dds.xport.zerocopy::%zc-loan-commit sap slot generation)))
   t)
 
+(defun* node-loan-write-pin-capable-p (node)
+    (function (disc-node) boolean)
+  "WP-ACKED-SLOT-PINNING (FR-PF-4, R6, ADR 0044; NOT cleared for ship — pending counsel). T iff a slot-backed
+   loan-written change on NODE may be PINNED-until-ACK (holding its committed Zero-Copy slot live) INSTEAD of
+   eagerly materialising the per-write retained SerializedPayload. Requires ALL of (ADR 0044 §3): a ZC writer
+   pool with the pin release-fn wired; DURABILITY :volatile OR a FINALIZED writer (an un-finalized
+   TRANSIENT_LOCAL late-joiner could need the sample arbitrarily later — infeasible to pin with 32 slots); and
+   >=1 MATCHED RELIABLE READER (%matched-reader-keys non-empty) — the necessary-and-sufficient condition that the
+   pin will be RELEASED (the pin drops at the full-ACK purge, driven by reliable readers' ACKNACKs; it also
+   subsumes writer-reliability by RxO). NIL ⇒ write-loaned materialises the retained payload eagerly, exactly as
+   ADR 0042 (byte- and alloc-identical). The pin BUDGET is re-checked atomically at the pin site (publish-sample)
+   — this predicate gates only whether the retained copy may be skipped. NOT cleared for ship — pending counsel."
+  (and (disc-node-zc-pool-sap node)
+       (disc-node-user-writer node)
+       (dds.rtps.history:history-cache-zc-release-fn
+        (dds.rtps.reliable:rtps-writer-hc (disc-node-user-writer node)))
+       (let ((d (%local-writer-durability node)))
+         (or (eq d :volatile)
+             (dds.rtps.reliable:rtps-writer-finalized (disc-node-user-writer node))))
+       (consp (%matched-reader-keys node))
+       t))
+
+(defun* %ensure-change-payload (node change)
+    (function (disc-node dds.rtps.history:cache-change) (or null (simple-array (unsigned-byte 8) (*))))
+  "WP-ACKED-SLOT-PINNING on-demand slot read (FR-PF-4, R6, ADR 0044; NOT cleared for ship — pending counsel).
+   Return CHANGE's serialized SerializedPayload for a send that needs the BYTES (a non-ZC destination, an extra
+   ZC destination, a retransmit, or a DATA_FRAG series). For a normal change this is just CACHE-CHANGE-SERIALIZED-
+   PAYLOAD (byte-identical, no-op). For a PINNED change (serialized-payload NIL, the TX pin holding its slot live)
+   it RESOLVES the committed slot ON DEMAND via %zc-resolve-fresh — a fresh heap vector byte-IDENTICAL to what
+   %loan-write-payload would have eagerly produced (both copy the true-length payload from the self-describing
+   slot base) — and CACHES it onto the change (so a later send reuses it and the change thereafter behaves like a
+   fallback change: LAZY retained payload, materialised only WHEN a non-pure-ZC send actually needs it, vs today's
+   eager-on-every-write). The slot is guaranteed live for the read because the pin hold keeps refcount>=1; a
+   legitimate retransmit happens only because the reader NACKed (has not ACKed) ⇒ the pin has not released.
+   %zc-resolve-fresh is generation-guarded, so a theoretical concurrent reclaim is SAFE (returns NIL = a
+   best-effort dropped datagram the reader re-NACKs — never torn/wrong bytes). Returns NIL only for a no-payload
+   change (a dispose/unregister, which needs none) or an impossible stale slot. NOT cleared for ship — counsel."
+  (or (dds.rtps.history:cache-change-serialized-payload change)
+      (when (and (dds.rtps.history:cache-change-zc-pinned change)
+                 (>= (dds.rtps.history:cache-change-zc-slot change) 0)
+                 (disc-node-zc-pool-sap node))
+        (let ((vec (dds.xport.zerocopy::%zc-resolve-fresh
+                    (disc-node-zc-pool-sap node)
+                    (dds.rtps.history:cache-change-zc-slot change)
+                    (dds.rtps.history:cache-change-zc-generation change))))
+          (when vec (setf (dds.rtps.history:cache-change-serialized-payload change) vec))
+          vec))))
+
 (defun* %zc-change-item (node change zc-readers)
     (function (disc-node dds.rtps.history:cache-change (integer 0)) (or null cons))
   "WP-ZEROCOPY (FR-PF-3, ADR 0014): if CHANGE is a :data sample whose serialized payload is LARGER than
@@ -959,12 +1007,12 @@
   (if (and (plusp zc-readers)
            (eq (dds.rtps.history:cache-change-kind change) :data)
            (not (%zc-payload-wire-protected-p node)))   ; fail-closed: never a cleartext payload in SHMEM for a wire-protected writer (ADR 0036 Carry 10)
-      (let ((pl (dds.rtps.history:cache-change-serialized-payload change))
-            (len (dds.rtps.history:cache-change-payload-len change)))   ; TRUE length, not the oversized pooled vec (T5a)
+      (let ((len (dds.rtps.history:cache-change-payload-len change)))   ; TRUE length, not the oversized pooled vec (T5a)
         (if (> len *zerocopy-min-payload-bytes*)
             (or (and (eq (dds.rtps.history:cache-change-zc-state change) :armed)   ; fast hint; the claim re-checks under the writer lock
                      (%zc-armed-item node change))                                 ; ADR 0042: emit the PRE-COMMITTED slot, 0 copies
-                (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 len 1))
+                (let ((pl (%ensure-change-payload node change)))   ; ADR 0044: resolve a pinned slot on demand for the fresh-loan fallback (extra ZC dest)
+                  (and pl (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 len 1))))
             (progn (%zc-drop-armed node change) nil)))   ; undersized: release an armed slot (one-shot no-op otherwise)
       (progn (%zc-drop-armed node change) nil)))         ; gated / non-ZC / retransmit: the fallback decision releases an armed slot
 
@@ -1043,6 +1091,13 @@
         (cond
           ((and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*)))
           ((setf zc (%zc-change-item node change zc-readers)) (push zc items))   ; WP-ZEROCOPY: ref, not payload
+          ;; ADR 0044 (I1 defense-in-depth): materialise a pinned change's payload on demand for a non-ZC / retransmit
+          ;; send, and USE the result — a :data change whose slot resolve returned NIL (a reclaimed/stale slot,
+          ;; unreachable now the pin defers on send-refcount but proven safe) is SKIPPED (best-effort drop, the reader
+          ;; re-NACKs), never a NIL payload with a nonzero length onto the wire. A dispose/unregister carries no
+          ;; payload (NIL is expected) and is emitted as before.
+          ((and (eq (dds.rtps.history:cache-change-kind change) :data)
+                (null (%ensure-change-payload node change))))   ; pinned :data, resolve failed -> drop this datagram
           ((%small-change-p change) (push (%data-builder node change) items))
           (t (dolist (thunk (%sample-plan node sn (dds.rtps.history:cache-change-serialized-payload change)
                                           (dds.rtps.history:cache-change-payload-len change)   ; TRUE length (T5a)
@@ -1566,9 +1621,10 @@
             (aref g 15) (ldb (byte 8  0) id)))
     g))
 
-(defun* publish-sample (node payload &optional (key-hash nil) (zc-slot nil) (zc-gen 0))
-    (function (disc-node (simple-array (unsigned-byte 8) (*))
-               &optional (or null (array (unsigned-byte 8) (*))) (or null (integer 0)) (unsigned-byte 32))
+(defun* publish-sample (node payload &optional (key-hash nil) (zc-slot nil) (zc-gen 0) (zc-len nil))
+    (function (disc-node (or null (simple-array (unsigned-byte 8) (*)))
+               &optional (or null (array (unsigned-byte 8) (*))) (or null (integer 0)) (unsigned-byte 32)
+                         (or null (integer 0)))
               (or (eql t) (eql :timeout)))
   "Publish PAYLOAD (an opaque SerializedPayload) on the node's user writer: add it to the writer
    HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8). Returns T normally, or the :timeout
@@ -1598,15 +1654,36 @@
    ZC-eligible destination with NO payload->slot copy, or releases the slot on its fallback decision. On
    :timeout (nothing added -> the slot could never be emitted) the slot is released here. FAIL-SAFE (unreachable
    through the DCPS loan gate): under data_protection the payload below is TRANSFORMED, so a pre-committed
-   plaintext slot must never be emitted — it is released up front and the publish proceeds payload-only."
+   plaintext slot must never be emitted — it is released up front and the publish proceeds payload-only.
+   ZC-LEN + a NIL PAYLOAD (WP-ACKED-SLOT-PINNING, FR-PF-4, R6, ADR 0044): a PIN REQUEST — a committed slot with
+   NO retained payload (write-loaned skipped %loan-write-payload for a pin-capable writer). A pin-budget slot is
+   reserved + a SECOND refcount hold taken (%zc-pin) so the slot outlives the HistoryCache change and serves
+   retransmit / non-ZC / extra-ZC on demand (the pin drops at the full-ACK purge); at budget (or a stale slot) the
+   retained payload is materialised on demand from the still-armed slot (byte-identical to %loan-write-payload)
+   and the publish proceeds as a normal change (the always-correct fallback, ADR 0044 §2)."
   (when (and zc-slot (%loan-write-data-protected-p node))
     (when (disc-node-zc-pool-sap node)   ; fail-safe: never emit a plaintext slot for a data_protection writer
+      (when (null payload)   ; a pin request would leave NO payload — recover it before dropping the slot
+        (setf payload (dds.xport.zerocopy::%zc-resolve-fresh (disc-node-zc-pool-sap node) zc-slot zc-gen)))
       (dds.xport.zerocopy::%zc-release (disc-node-zc-pool-sap node) zc-slot zc-gen))
     (setf zc-slot nil))
   (let ((iq (when (and key-hash (= 16 (length key-hash)))
               (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16))))))
         (writer (disc-node-user-writer node))
+        (pin-granted nil)          ; ADR 0044: T iff the TX pin was reserved + %zc-pin'd for this write
         (pooled nil) (plen nil))   ; T5a: the acquired pool buffer + its TRUE secured-payload length (NIL = non-pooled path)
+    ;; WP-ACKED-SLOT-PINNING (ADR 0044): a pin request (a committed slot + NO retained payload). Reserve a pin
+    ;; budget slot + %zc-pin (a SECOND, distinct refcount hold, ADR 0044 §4.1); at budget / a stale slot, resolve
+    ;; the retained payload on demand from the still-armed slot and publish as a normal change (the fallback).
+    (when (and zc-slot (null payload))
+      (let ((sap (disc-node-zc-pool-sap node)))
+        (when (and sap
+                   (< (dds.pal:atomic-cell-value (disc-node-zc-pin-count node)) *zc-pin-budget*)
+                   (dds.xport.zerocopy::%zc-pin sap zc-slot zc-gen))
+          (dds.pal:atomic-incf (disc-node-zc-pin-count node) 1)
+          (setf pin-granted t))
+        (unless pin-granted
+          (setf payload (and sap (dds.xport.zerocopy::%zc-resolve-fresh sap zc-slot zc-gen))))))
     ;; DDS-Security §9.5.3.3.4.4 encode (ADR 0031 T6): crypto-keys resolver or Slice-1 key-material; fail-closed on nil key.
     ;; §9.4.1.2.4: the SecuredPayload (data_protection) transform is applied UNLESS governance set data_protection=NONE
     ;; for this topic (data=NONE: the payload rides plain). :unset (no governance) keeps the transform — Slice-1
@@ -1646,11 +1723,15 @@
                     (setf payload (dds.security:encode-serialized-payload km payload))))   ; carve failed/unavailable: allocating fallback (byte-identical)
               (return-from publish-sample t)))))   ; fail-closed: no key -> drop
     (multiple-value-bind (rc change)
-        (dds.rtps.reliable:writer-write writer payload key-hash iq pooled plen zc-slot zc-gen)
+        (dds.rtps.reliable:writer-write writer payload key-hash iq pooled plen zc-slot zc-gen
+                                        pin-granted (and pin-granted zc-len))   ; ADR 0044: born pinned (no retained payload) when the pin was granted
       (when (eq :timeout rc)
         (when pooled (dds.rtps.reliable:writer-release-payload-buffer writer pooled))   ; full cache: return the buffer, nothing added
-        (when (and zc-slot (disc-node-zc-pool-sap node))   ; ADR 0042: nothing added -> the committed slot can never be emitted; release it
+        (when (and zc-slot (disc-node-zc-pool-sap node))   ; ADR 0042: nothing added -> the committed slot can never be emitted; release the armed hold
           (dds.xport.zerocopy::%zc-release (disc-node-zc-pool-sap node) zc-slot zc-gen))
+        (when pin-granted   ; ADR 0044: nothing added -> release the pin hold too + un-reserve the budget
+          (dds.xport.zerocopy::%zc-release (disc-node-zc-pool-sap node) zc-slot zc-gen)
+          (dds.pal:atomic-incf (disc-node-zc-pin-count node) -1))
         (return-from publish-sample :timeout))  ; full bounded cache, max_blocking_time elapsed: nothing added, nothing to push
       (when (and zc-slot change)   ; ADR 0042: register the armed change for the post-push-pass / teardown leak sweep
         (dds.pal:with-lock ((disc-node-lock node))
@@ -2615,7 +2696,7 @@
         (when ch
           (unwind-protect
                (let ((descs (dds.rtps.reliable:writer-on-nack-frag (disc-node-user-writer node) sn base numbits bitmap))
-                     (pl (dds.rtps.history:cache-change-serialized-payload ch)))   ; read the payload off the ref-held change
+                     (pl (%ensure-change-payload node ch)))   ; ADR 0044: resolve a pinned slot on demand; else the retained payload (read off the ref-held change)
                  (when (and descs pl)
                    (let ((size (dds.rtps.history:cache-change-payload-len ch)))   ; TRUE length, not the oversized pooled vec (T5a)
                      (dolist (pd (%match-destinations-prefixed node t))   ; T10: wrap the DATA_FRAG retransmit to a :keyed reader
@@ -2777,6 +2858,16 @@
         (dds.rtps.reliable:make-rtps-writer
          :hc (dds.rtps.history:make-history-cache history-kind history-depth max-samples nil)
          :max-blocking-ns max-blocking-ns))
+  ;; WP-ACKED-SLOT-PINNING (ADR 0044): wire the pin RELEASE-FN onto the writer HistoryCache when the node has a ZC
+  ;; pool. The change-removal choke (%hc-remove-change, under the writer lock) funcalls it to %zc-release a pinned
+  ;; change's TX slot hold + decrement the live-pin budget — the layering-clean release (history must not depend on
+  ;; dds.xport.zerocopy). No pool -> no release-fn -> node-loan-write-pin-capable-p is NIL -> no pinning (ADR 0042).
+  (when (disc-node-zc-pool-sap node)
+    (setf (dds.rtps.history:history-cache-zc-release-fn
+           (dds.rtps.reliable:rtps-writer-hc (disc-node-user-writer node)))
+          (lambda (slot generation)
+            (dds.xport.zerocopy::%zc-release (disc-node-zc-pool-sap node) slot generation)
+            (dds.pal:atomic-incf (disc-node-zc-pin-count node) -1))))
   ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: when data_protection is ALREADY engaged at enable (the static-key
   ;; config), carve the per-node static arena + secured-payload pool onto the writer's HistoryCache now, so a
   ;; secured publish encodes into a reused buffer (zero per-sample payload alloc). The LIVE handshake config

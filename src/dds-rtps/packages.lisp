@@ -19,8 +19,11 @@
            #:cache-change-payload-len
            ;; WP-FLATDATA-LOAN-WRITE pre-committed ZC slot identity (FR-PF-4, R6, ADR 0042)
            #:cache-change-zc-slot #:cache-change-zc-generation #:cache-change-zc-state
+           ;; WP-ACKED-SLOT-PINNING the TX pin hold (FR-PF-4, R6, ADR 0044)
+           #:cache-change-zc-pinned #:cache-change-zc-len
            #:history-cache #:make-history-cache #:hc-change-count #:hc-kind #:hc-max-samples #:hc-depth
            #:history-cache-payload-pool #:hc-try-release-pooled
+           #:history-cache-zc-release-fn #:hc-try-release-pinned
            #:hc-add-change #:hc-remove-change #:hc-purge-below #:hc-get-change
            #:hc-min-seq #:hc-max-seq #:hc-changes-for-reader
            #:history-not-implemented))
