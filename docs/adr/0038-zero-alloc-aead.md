@@ -277,14 +277,18 @@ introducing a releasable-check-vs-acquire TOCTOU (the refcount is one field of a
 pooled-buffer, pool-freelist, unsent-base}` invariant mutated as a unit). The atomics land as a tested API
 for a future genuinely-lock-free consumer. See ADR 0041 for the full assessment.
 
-**(f) `open-into` CTX_new-NULL OOM path (T1b-ii, Minor).** On the `EVP_CIPHER_CTX_new()` → NULL OOM early path,
-`open-into` leaves the staged **public ciphertext** (NOT plaintext → no confidentiality leak) un-wiped in `pt-out`,
-a behavioral change vs the old foreign-scratch. Optional tidy: stage after the NULL check, or wipe that branch.
+**(f) `open-into` CTX_new-NULL OOM path (T1b-ii, Minor). — RESOLVED (WP-RESIDUAL-FIXES-BATCH-A, 2026-07-04).**
+Fixed by the preferred zero-cost shape: the ciphertext staging into `pt-out` now happens **after** the
+`EVP_CIPHER_CTX_new()` NULL check (`src/dds-dare/primitives.lisp` `aes-256-gcm-open-into`), so on the OOM early
+path `pt-out` is never written at all — a failed context allocation leaves no staged bytes (docstring updated).
+No dedicated test: forcing `EVP_CIPHER_CTX_new` to return NULL is not cheaply drivable (allocator-level OOM
+injection into OpenSSL); a code-shape fix verified by inspection + the existing round-trip/KAT suite.
 
-**(g) `node-return-loan` count-discipline edge (T5d, Minor).** A `node-return-loan` call **without** an explicit
-count iterates the whole capacity vec (its stale tail holds prior-take handles → a potential premature
-double-release). Documented; **all callers pass the count**. Consider making the count mandatory or defaulting to a
-handle-`p` prefix scan.
+**(g) `node-return-loan` count-discipline edge (T5d, Minor). — RESOLVED (WP-RESIDUAL-FIXES-BATCH-A, 2026-07-04).**
+The COUNT is now **mandatory for a vector of loans**: `node-return-loan` signals an error on a vector passed
+without its populated count instead of walking the whole capacity vec, so the stale-tail premature double-release
+is impossible by construction (`src/dds-disc/dataplane.lisp`; docstring + wiki updated). The single-handle and
+list shapes are unchanged; all callers already passed the count.
 
 **(h) PRE-EXISTING secured store growth (NOT introduced by this WP). — RESOLVED (WP-SECURED-STORE-GROWTH).**
 `%secured-loan-release` cleaned only `disc-node-samples`, not the parallel per-`(guid,sn)` tables (`sample-writers`

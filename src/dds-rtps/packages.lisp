@@ -103,7 +103,7 @@
            #:init-reader-proxy-base #:writer-finalize-durability #:rtps-writer-finalized
            #:reader-proxy #:reader-proxy-acked-base #:reader-proxy-unsent-base
            #:rtps-reader #:make-rtps-reader #:reader-on-data #:reader-on-heartbeat
-           #:reader-acknack #:reader-on-gap #:reader-complete-p #:init-writer-proxy-durability
+           #:reader-acknack #:reader-on-gap #:reader-suppress-sn #:reader-complete-p #:init-writer-proxy-durability
            #:reader-dedup-accept-p #:rtps-reader-dedup-map
            #:get-writer-proxy #:writer-proxy #:writer-proxy-received #:writer-proxy-last-sn #:writer-proxy-first-sn
            #:writer-proxy-skip-history

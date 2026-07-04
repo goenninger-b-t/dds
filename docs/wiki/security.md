@@ -326,11 +326,32 @@ violation, memory-safe within the arena but undefined).  `stop-node` calls
 `node-return-all-loans` before tearing the arena down, so a forgotten loan never leaks foreign
 memory at shutdown.
 
+The **`COUNT` is mandatory when returning a vector of loans** (ADR 0038 residual g,
+WP-RESIDUAL-FIXES-BATCH-A): the reused take `VEC`'s tail holds handles from *prior* takes that
+may since have been recycled onto new outstanding samples, so walking the whole vector could
+prematurely double-release a live loan — `node-return-loan` therefore **signals an error** on a
+vector passed without its populated count.  The single-handle and list shapes are unchanged.
+
 Fail-closed semantics are preserved: a decode failure drops the sample and releases its buffer
 (no leak); **pool exhaustion** (every buffer loaned out) drops the surplus sample, bumps
 `disc-node-decode-pool-rejects` (a `SAMPLE_REJECTED` counter), and leaves the sample
 un-acknowledged so the writer applies backpressure — **never** a silent GC-heap fallback.  A
 leaked loan therefore degrades gracefully (the pool eventually rejects) rather than wedging.
+
+**Reliable-reader decode-failure retransmit suppression** (ADR 0031 limitation 1 RESOLVED,
+WP-RESIDUAL-FIXES-BATCH-A; RTPS 2.5 §8.3.7.4).  A dropped undecodable sample is un-acked, so a
+reliable writer retransmits it — which is exactly right while the failure is *transient* (the
+key-exchange race: KeyMaterial not yet arrived → the retransmit self-heals with **no data
+loss**; a missing key is never counted), but unbounded churn when the sample can *never* decode
+(persistent AEAD tag failure with the key present = tamper or permanent key mismatch).  The
+reader counts KM-present failures per `(writer-GUID, SN)` and, after
+`dds.disc:*decode-fail-suppress-threshold*` (default 3) failures of the same SN, marks that one
+SN locally GAP-irrelevant (`dds.rtps.reliable:reader-suppress-sn`) so it stops NACKing it and
+the writer stops retransmitting — fail-closed for delivery (the sample is never delivered),
+bounded for availability, and later SNs flow (no head-of-line wedge).  The counter table is
+bounded: cleared on a successful decode, dropped on suppression, capped per writer at
+`dds.disc:*decode-fail-track-limit*` (default 256; at the cap a further distinct failing SN
+keeps retransmitting rather than being tracked), and pruned on writer unmatch.
 
 The **arena-carve-fail** fallback is bounded too (WP-SECURED-STORE-GROWTH).  If the decode pool
 cannot be carved (the static arena is exhausted at the first secured receive), the reader stays

@@ -205,6 +205,7 @@
   (samples (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> payload (§8.3.5.4: SN is per-writer; no per-sample composite-key alloc)
   (sample-writers (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> writer EntityId (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
+  (decode-fail-counts (make-hash-table :test 'equalp) :type hash-table) ; ADR 0031 lim.1: src GUID -> SN -> consecutive KM-PRESENT decode-failure count; bounds retransmit churn of a permanently-undecodable secured sample (never counts a missing-KM failure); pruned on writer unmatch + capped (NFR-MEM/NFR-SEC-POSTURE)
   (sample-origins (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> (effective-origin-GUID . effective-origin-SN): the PID_ORIGINAL_WRITER_INFO logical origin when the received sample was relayed (RTPS 2.5 §8.3.5.4), absent for a direct sample (then the wire GUID/SN IS the origin)
   (capture-data-key-hash nil :type boolean) ; durability collect node opts in to materialize the wire PID_KEY_HASH on :data (control-plane); default NIL = byte-identical, no hot-path alloc (ADR 0029, RTPS 2.5 §9.6.4.8)
   (crypto-transform nil :type t) ; DDS-Security 1.1 §9.5.3.3 Slice-1: key-material for AES256-GCM serialized-payload protection; NIL = security OFF, byte-identical hot path (ADR 0031)
@@ -1153,6 +1154,7 @@
           (%invalidate-shmem-dest node prefix)   ; a leased-out peer's cached SHMEM dest must not be reused
           (%purge-prefix node prefix #'disc-node-discovered-writers)
           (%purge-prefix node prefix #'disc-node-discovered-readers)
+          (%purge-prefix node prefix #'disc-node-decode-fail-counts)   ; ADR 0031 lim.1: drop the lost writer's decode-failure counters
           (%collect-and-remove-matches node prefix
                                        (lambda (dm) (push dm removed)))
           (push prefix lost))))   ; ADR-0034 MINOR-4: fire on-participant-lost per dead peer OUTSIDE the lock

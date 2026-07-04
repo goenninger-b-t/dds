@@ -148,3 +148,7 @@
   "WP-SECURED-STORE-GROWTH leak-proof test isolation offset: streaming many secured samples must not
    grow the parallel per-(guid,sn) store tables unbounded (purged on loan release) nor the arena-carve-fail
    bare-vector store unbounded (bounded high-water, fail-closed RESOURCE_LIMITS at the cap).")
+(defconstant +td-decode-fail-suppress+ 40
+  "WP-RESIDUAL-FIXES-BATCH-A / ADR 0031 lim.1 isolation offset: the reliable-reader decode-failure
+   retransmit-suppression — a missing-KM failure NEVER suppresses (self-heals when the key arrives), while a
+   persistent KM-present tag failure suppresses the SN after a bounded count without wedging later SNs.")

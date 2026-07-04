@@ -551,6 +551,8 @@
    PT-OUT MUST be an ALLOC-STATIC-backed vector with room for PT-OFF+CT-LEN octets.
    Same EVP_Decrypt* sequence as AES-256-GCM-OPEN so the plaintext is byte-identical. Key buffer is
    zeroized before return; NEVER leaves plaintext readable on auth failure (NIST SP 800-38D §7.2).
+   On the EVP_CIPHER_CTX_new OOM branch PT-OUT is left UNTOUCHED — the ciphertext is staged only AFTER the
+   context allocation succeeds, so a failed open never leaves staged bytes in PT-OUT (ADR 0038 residual f).
    Zero-alloc (~0 GC-heap B/call on SBCL): the ciphertext is staged into PT-OUT[PT-OFF..] and decrypted
    IN PLACE (EVP in==out via dds.pal:static-sap+, an inline non-boxing SAP into PT-OUT), so no per-call
    ciphertext/plaintext SAP is boxed; NULL args use the cached *%NULL-PTR*; the fail-closed wipe zeroes
@@ -565,9 +567,6 @@
     (unless (<= (+ aad-off aad-len) (length aad))
       (error "aes-256-gcm-open-into: AAD region [~d,+~d) out of bounds (vector length ~d)"
              aad-off aad-len (length aad)))
-    ;; stage ciphertext into PT-OUT's plaintext region for in-place GCM (EVP in==out; aref, 0 cons)
-    (dotimes (i ct-len)
-      (setf (aref pt-out (+ pt-off i)) (aref ct-vec (+ ct-off i))))
     (cffi:with-foreign-pointer (key-ptr +aes-256-gcm-key-len+)
       (cffi:with-foreign-pointer (nonce-ptr +aes-gcm-nonce-len+)
         (cffi:with-foreign-pointer (tag-ptr +aes-gcm-tag-len+)
@@ -587,6 +586,9 @@
                   (dotimes (i +aes-256-gcm-key-len+)
                     (setf (cffi:mem-aref key-ptr :uint8 i) 0))
                   (error "EVP_CIPHER_CTX_new returned NULL"))
+                ;; stage AFTER the CTX-NULL check (ADR 0038 residual f): on OOM PT-OUT is never written -> holds no ciphertext
+                (dotimes (i ct-len)
+                  (setf (aref pt-out (+ pt-off i)) (aref ct-vec (+ ct-off i))))
                 (unwind-protect
                      (progn
                        (let ((rc (cffi:foreign-funcall-pointer

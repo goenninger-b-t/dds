@@ -1013,6 +1013,132 @@
         (dds.disc:stop-node node))))
   t)
 
+(defun* run-decode-fail-suppress-test ()
+    (function () t)
+  "Test (WP-RESIDUAL-FIXES-BATCH-A / ADR 0031 limitation 1 RESOLVED; RTPS 2.5 §8.3.5 / §8.4): the reliable-reader
+   decode-failure retransmit-suppression is BOUNDED and FAIL-SAFE, avoiding BOTH the data-loss trap and the
+   unbounded-churn bug. No sockets — %deliver-user-sample driven directly.
+   ARM (a) MISSING KM MUST NEVER SUPPRESS (data-loss trap): a decode failure caused by an unresolved remote key
+   (the key-exchange race) records NO failure count and does NOT suppress the SN, so the SN keeps being NACKed;
+   once the key ARRIVES the very same (writer-GUID, SN) is delivered byte-exact — the today self-healing behavior
+   is preserved (NO data loss).
+   ARM (b) PERSISTENT KM-PRESENT TAG FAILURE suppresses AFTER a bounded count, without wedging later SNs: a
+   tampered SecuredPayload with the key PRESENT fails the AEAD tag every time; the SN is NACKed for the first
+   *decode-fail-suppress-threshold*-1 failures (still recoverable) and only THEN marked GAP-irrelevant so the
+   writer stops retransmitting it (fail-closed: it is NEVER delivered). A subsequent GOOD higher SN still decodes
+   and is delivered — no head-of-line wedge.
+   ARM (c) BOUNDED TRACKING (NFR-MEM/NFR-SEC-POSTURE): with *decode-fail-track-limit* rebound small, a flood of
+   DISTINCT failing SNs never grows the per-writer counter map past the cap (an attacker streaming garbage cannot
+   exhaust memory through the counter table), while an already-tracked SN still progresses to suppression.
+   Requires OpenSSL >= 3.5; both impls must pass identically (Clasp FIRST)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [decode-fail-suppress] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-decode-fail-suppress-test t)))
+  (let* ((km (dds.security:make-test-key-material))
+         (pt (make-array 8 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x53 #x51 #x55 #x41 #x52 #x45 #x20 #x02)))
+         (secured (dds.security:encode-serialized-payload km pt))
+         (src (%make-test-prefix #xA4))
+         (wid #x00000102))
+    ;; -- ARM (a): missing-KM failure NEVER suppresses; the sample is delivered once the key arrives (no loss) --
+    (let* ((have-key nil)                                             ; the resolver returns the key only after it "arrives"
+           (ck (dds.security:make-crypto-keys
+                :encode-key-fn (lambda (g) (declare (ignore g)) nil)
+                :decode-key-fn (lambda (g) (declare (ignore g)) (and have-key km))))
+           (node (let ((dds.disc:*shmem-enabled* nil))
+                   (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xEB)
+                                            :domain (test-domain +td-decode-fail-suppress+)
+                                            :host "127.0.0.1" :port 0 :multicast nil :crypto-transform ck))))
+      (unwind-protect
+           (let ((guid (dds.disc::%source-guid src wid)))
+             (dds.disc:enable-subscriber node)
+             (let ((reader (dds.disc::disc-node-user-reader node)))
+             (dds.rtps.reliable:reader-on-heartbeat reader guid 1 1)   ; the writer advertises [1,1]
+             ;; key NOT yet arrived -> decode returns NIL because the KEY is missing (not a tag failure)
+             (dds.disc::%deliver-user-sample node wid 1 secured src guid 1)
+             (%check :dfs-missing-not-delivered
+                     (zerop (dds.disc:node-sample-count node))
+                     "a missing-KM sample must not be delivered (fail-closed)")
+             (%check :dfs-missing-not-counted
+                     (zerop (hash-table-count (dds.disc::disc-node-decode-fail-counts node)))
+                     "a missing-KM failure must record NO failure count (it must not head toward suppression)")
+             (multiple-value-bind (base nb bm) (dds.rtps.reliable:reader-acknack reader guid)
+               (declare (ignore bm))
+               (%check :dfs-missing-still-nacked
+                       (and (= base 1) (>= nb 1))
+                       "the missing-KM SN must STILL be NACKed (never suppressed) so it can self-heal"))
+             ;; the key ARRIVES -> the SAME SN, redelivered on the writer's retransmit, decodes + is delivered (NO loss)
+             (setf have-key t)
+             (dds.disc::%deliver-user-sample node wid 1 secured src guid 1)
+             (%check :dfs-missing-heals
+                     (= 1 (dds.disc:node-sample-count node))
+                     "once the key arrives the previously-undecodable SN is delivered (the self-healing, no data loss)")))
+        (dds.disc:stop-node node)))
+    ;; -- ARM (b): persistent KM-present tag failure suppresses after N, later SNs still flow --
+    (let* ((tampered (let ((v (copy-seq secured))) (setf (aref v (1- (length v))) (logxor #xFF (aref v (1- (length v))))) v))   ; flip the last tag octet -> AEAD verify fails, KEY present
+           (node (let ((dds.disc:*shmem-enabled* nil))
+                   (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xEC)
+                                            :domain (test-domain +td-decode-fail-suppress+)
+                                            :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
+      (unwind-protect
+           (let ((guid (dds.disc::%source-guid src wid))
+                 (thresh dds.disc:*decode-fail-suppress-threshold*))
+             (dds.disc:enable-subscriber node)
+             (let ((reader (dds.disc::disc-node-user-reader node)))
+             (dds.rtps.reliable:reader-on-heartbeat reader guid 1 2)   ; the writer advertises [1,2]
+             ;; the first THRESH-1 tampered deliveries keep the SN NACKable (still recoverable — no premature suppress)
+             (dotimes (i (1- thresh))
+               (dds.disc::%deliver-user-sample node wid 1 tampered src guid 1)
+               (multiple-value-bind (base nb bm) (dds.rtps.reliable:reader-acknack reader guid)
+                 (declare (ignore bm))
+                 (%check :dfs-tamper-still-nacked
+                         (and (= base 1) (>= nb 1))
+                         (format nil "after ~d/~d tag failures SN 1 must still be NACKed (not yet suppressed)" (1+ i) thresh))))
+             ;; the THRESH-th failure trips suppression: SN 1 becomes GAP-irrelevant (never delivered — fail-closed)
+             (dds.disc::%deliver-user-sample node wid 1 tampered src guid 1)
+             (%check :dfs-tamper-not-delivered
+                     (zerop (dds.disc:node-sample-count node))
+                     "a persistently-tampered sample is NEVER delivered (fail-closed)")
+             (%check :dfs-tamper-suppressed
+                     (eq :gap (gethash 1 (dds.rtps.reliable:writer-proxy-received
+                                          (dds.rtps.reliable:get-writer-proxy reader guid))))
+                     "after the threshold the tampered SN is marked GAP-irrelevant (suppressed)")
+             (%check :dfs-counter-cleared
+                     (let ((inner (gethash guid (dds.disc::disc-node-decode-fail-counts node))))
+                       (or (null inner) (null (gethash 1 inner))))
+                     "the failure counter for a suppressed SN is dropped (bounded memory)")
+             ;; a subsequent GOOD higher SN still decodes + delivers -> no head-of-line wedge
+             (dds.disc::%deliver-user-sample node wid 2 secured src guid 2)
+             (%check :dfs-later-sn-flows
+                     (= 1 (dds.disc:node-sample-count node))
+                     "a GOOD later SN still flows after a lower SN was suppressed (no head-of-line wedge)")
+             (multiple-value-bind (base nb bm) (dds.rtps.reliable:reader-acknack reader guid)
+               (declare (ignore bm))
+               (%check :dfs-no-more-nack
+                       (and (= base 3) (zerop nb))
+                       "with SN 1 suppressed (:gap) and SN 2 received, the reader NACKs nothing (writer stops retransmitting)"))))
+        (dds.disc:stop-node node)))
+    ;; -- ARM (c): the counter table is capped per writer (a distinct-SN garbage flood cannot exhaust memory) --
+    (let* ((tampered (let ((v (copy-seq secured))) (setf (aref v (1- (length v))) (logxor #xFF (aref v (1- (length v))))) v))
+           (node (let ((dds.disc:*shmem-enabled* nil))
+                   (dds.disc:make-disc-node :guid-prefix (%make-test-prefix #xED)
+                                            :domain (test-domain +td-decode-fail-suppress+)
+                                            :host "127.0.0.1" :port 0 :multicast nil :crypto-transform km))))
+      (unwind-protect
+           (let ((guid (dds.disc::%source-guid src wid))
+                 (cap 8))
+             (dds.disc:enable-subscriber node)
+             (let ((dds.disc:*decode-fail-track-limit* cap))
+               (loop for sn from 1 to (* 4 cap)   ; 4x the cap of DISTINCT one-shot failing SNs
+                     do (dds.disc::%deliver-user-sample node wid sn tampered src guid sn))
+               (%check :dfs-track-capped
+                       (<= (hash-table-count (gethash guid (dds.disc::disc-node-decode-fail-counts node))) cap)
+                       (format nil "the per-writer failure-counter map must stay <= *decode-fail-track-limit* (~d)" cap))))
+        (dds.disc:stop-node node))))
+  t)
+
 (defun* run-security-encrypted-fragmented-test ()
     (function () t)
   "DDS-Security §9.5.3.3 Slice-1 DATA_FRAG path: encode -> fragment -> reassemble -> decode (ADR 0031).

@@ -2199,19 +2199,22 @@
    (NODE VEC COUNT) — the canonical ZERO-CONS form: release every secured-loan-handle in VEC[0,COUNT) (exactly
      the (values VEC COUNT) node-take-loaned returns; non-handle bare-vector elements are skipped); (NODE HANDLE)
      — release a single handle; (NODE LIST) — release each handle in LIST (legacy). IDEMPOTENT (a returned /
-     recycled / never-loaned handle is skipped: its REG-INDEX is < 0 and its buffer NIL). NOTE: a reused
-     node-take-loaned VEC MUST be returned with its COUNT (its tail holds stale handles from prior takes); a
-     vector passed WITHOUT count is iterated whole (only for a caller-owned exact-size vector). The app MUST
-     return every loan it takes AND must NOT retain/reuse a handle after returning it (a returned handle may be
-     recycled for a new sample — use-after-return is a caller-contract violation, memory-safe within the arena but
+     recycled / never-loaned handle is skipped: its REG-INDEX is < 0 and its buffer NIL). COUNT is MANDATORY for
+     a VECTOR of loans (ADR 0038 residual g RESOLVED): a reused node-take-loaned VEC's tail holds handles from
+     PRIOR takes that may since have been recycled onto NEW outstanding samples, so walking the whole vector could
+     prematurely double-release a live loan; passing a vector WITHOUT its populated COUNT now SIGNALS an error
+     rather than walking that stale tail — the double-release is impossible by construction. The app MUST return
+     every loan it takes AND must NOT retain/reuse a handle after returning it (a returned handle may be recycled
+     for a new sample — use-after-return is a caller-contract violation, memory-safe within the arena but
      undefined); a leaked loan pins a decode-pool slot until the pool exhausts (SAMPLE_REJECTED / writer
      backpressure, graceful — never GC, never a crash)."
   (declare (type fixnum count))
   (cond ((secured-loan-handle-p loans) (%secured-loan-release node loans))
-        ((and (>= count 0) (simple-vector-p loans))
-         (dotimes (i count) (let ((h (svref loans i))) (when (secured-loan-handle-p h) (%secured-loan-release node h)))))
-        ((listp loans) (dolist (h loans) (when (secured-loan-handle-p h) (%secured-loan-release node h))))
-        ((vectorp loans) (loop for h across loans do (when (secured-loan-handle-p h) (%secured-loan-release node h)))))
+        ((vectorp loans)
+         (when (< count 0)   ; ADR 0038 residual g: a vector's stale tail must never be walked -> premature double-release
+           (error "node-return-loan: a vector of loans MUST be returned with its populated COUNT (its stale tail could double-release a live loan)"))
+         (dotimes (i count) (let ((h (aref loans i))) (when (secured-loan-handle-p h) (%secured-loan-release node h)))))
+        ((listp loans) (dolist (h loans) (when (secured-loan-handle-p h) (%secured-loan-release node h)))))
   t)
 
 (defun* node-return-all-loans (node)
@@ -2268,6 +2271,55 @@
 ;; %deliver-user-sample reaches it without an undefined-function warning (build fails on any promoted warning).
 (declaim (ftype (function (disc-node) (integer 0)) node-sample-count))
 
+(defparameter *decode-fail-suppress-threshold* 3
+  "WP-RESIDUAL-FIXES-BATCH-A / ADR 0031 limitation 1 (RTPS 2.5 §8.3.5 / §8.4): the number of CONSECUTIVE
+   KM-PRESENT decode failures of ONE (writer-GUID, SN) after which the reliable reader locally SUPPRESSES that
+   SN — marks it GAP-equivalent-irrelevant (reader-suppress-sn) so the writer stops retransmitting it. NEVER
+   applies to a missing-KM failure (that returns before counting; the key-exchange race must keep self-healing).
+   FAIL-SAFE ordering: BELOW the threshold the sample keeps retransmitting (a transient wire corruption or a
+   slow-arriving-but-present key still recovers — no data loss); AT/ABOVE it, delivery is FAIL-CLOSED
+   (undecodable/tampered data is never delivered) and availability is BOUNDED (the unbounded retransmit churn
+   stops). 3 tolerates a couple of transient re-tries before deciding the sample is permanently undecodable.")
+
+(defparameter *decode-fail-track-limit* 256
+  "WP-RESIDUAL-FIXES-BATCH-A / ADR 0031 limitation 1: the per-writer cap on the decode-failure counter's inner
+   SN map (bounded memory — NFR-MEM / NFR-SEC-POSTURE, mirroring *max-gap-range*). At the cap a further DISTINCT
+   failing SN is not newly tracked (it keeps retransmitting — bounded per-writer churn, never unbounded memory);
+   an ALREADY-tracked SN still progresses to suppression. The whole per-writer map is also pruned on writer
+   unmatch (%lease-sweep), so the table is bounded by matched-writer count × this limit.")
+
+(defun* %decode-fail-clear (node guid sn)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer) t)
+  "ADR 0031 lim.1: drop any decode-failure counter for (GUID, SN) — a sample that DECODED clears its transient
+   failure count so it never counts toward a future unrelated suppression and frees a track-limit slot. Called on
+   the accept path under the node lock, GATED on a non-empty table so the steady-state (zero-failure) zero-alloc
+   secured receive arm is untouched (the guard is one hash-table-count, no gethash/cons). Zero-cons."
+  (let ((inner (gethash guid (disc-node-decode-fail-counts node))))   ; no auto-create
+    (when inner (remhash sn inner)))
+  t)
+
+(defun* %secured-decode-fail (node guid sn)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer) t)
+  "ADR 0031 lim.1 (RTPS 2.5 §8.3.5 / §8.4): record ONE KM-PRESENT decode failure of (GUID, SN) and, once it has
+   failed *decode-fail-suppress-threshold* times, SUPPRESS the SN (reader-suppress-sn marks it GAP-irrelevant) so
+   the reliable writer stops retransmitting a sample that can never decode. Called ONLY from the KM-present decode
+   branches of %deliver-user-sample (the missing-KM branch returns earlier, uncounted — the key race self-heals).
+   Bounded: an existing counter always progresses to suppression; a NEW SN is tracked only below
+   *decode-fail-track-limit* (else it keeps retransmitting — bounded churn over unbounded memory). Node-lock
+   guarded (the counter table is also pruned under that lock by %lease-sweep). Receiver-thread call."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((inner (%inner-table (disc-node-decode-fail-counts node) guid)))
+      (multiple-value-bind (cur present) (gethash sn inner)
+        (let ((n (1+ (if present (the fixnum cur) 0))))
+          (declare (type fixnum n))
+          (cond
+            ((>= n *decode-fail-suppress-threshold*)
+             (dds.rtps.reliable:reader-suppress-sn (disc-node-user-reader node) guid sn)   ; persistent KM-present failure -> stop the NACK/repair of this SN
+             (remhash sn inner))
+            ((or present (< (hash-table-count inner) *decode-fail-track-limit*))
+             (setf (gethash sn inner) n)))))))   ; below cap / already tracked: keep counting (retransmit continues, still recoverable)
+  t)
+
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix effective-guid effective-sn
                              &optional key-hash)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
@@ -2322,7 +2374,7 @@
                         (progn (incf (disc-node-decode-pool-rejects node))
                                (return-from %deliver-user-sample t))
                         (let ((plain (dds.security:decode-serialized-payload km vec)))
-                          (unless plain (return-from %deliver-user-sample t))
+                          (unless plain (%secured-decode-fail node guid sn) (return-from %deliver-user-sample t))   ; ADR 0031 lim.1: KM present, decode failed -> bounded suppression
                           (setf stored plain)))
                     ;; T5d: acquire buffer + pooled handle together (paired 1:1 capacity -> the handle acquire
                     ;; succeeds whenever a buffer was free; the defensive release keeps it never-crash/never-GC)
@@ -2345,12 +2397,13 @@
                                 (progn (dds.pal:with-lock ((disc-node-decode-pool-lock node))
                                          (dds.core.arena:pool-release pool buf)
                                          (%secured-handle-recycle node h))
+                                       (%secured-decode-fail node guid sn)   ; ADR 0031 lim.1: KM present, decode failed (pool-lock released first: node-lock is OUTER)
                                        (return-from %deliver-user-sample t))
                                 (progn (%secured-handle-fill h buf plen guid sn)
                                        (setf stored h loan h))))))))
               ;; non-loan secured path: allocating decode -> bare vec (byte-identical to the shipped path)
               (let ((plain (dds.security:decode-serialized-payload km vec)))
-                (unless plain (return-from %deliver-user-sample t))
+                (unless plain (%secured-decode-fail node guid sn) (return-from %deliver-user-sample t))   ; ADR 0031 lim.1: KM present, decode failed -> bounded suppression
                 (setf stored plain))))))
     ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too); the loan path feeds
     ;; the proxy an EMPTY payload (the plaintext lives in the loaned buffer, not the proxy) — mirrors %deliver-user-marker.
@@ -2365,6 +2418,8 @@
                (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
          (%record-sample-origin node guid sn effective-guid effective-sn)
          (%record-sample-key-hash node guid sn key-hash)
+         (when (plusp (hash-table-count (disc-node-decode-fail-counts node)))   ; ADR 0031 lim.1: gated -> steady-state (no failures) keeps the zero-alloc secured arm untouched
+           (%decode-fail-clear node guid sn))
          (when loan (%secured-loan-register node loan)))   ; T5b/T5d: register the loan in the fixed registry vector (receiver registers; app return-loan releases)
        (when (disc-node-on-sample node) (funcall (disc-node-on-sample node))))
       ;; T5b: a deduped DUPLICATE on the loan path -> release the unused pooled buffer (no store, no leak)

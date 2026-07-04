@@ -276,16 +276,45 @@ The `interop/security-crypto/README.md` records this honestly.
 
 ## Known limitations (Slice 1)
 
-1. **Fail-closed decode-failure drop on the reliable reader path does not record the SN.**
-   If `decode-serialized-payload` returns NIL on a RELIABLE subscription, `%deliver-user-sample`
-   returns early without recording the SN in the reader proxy's received set.  The
-   reliable writer (whose HEARTBEAT still includes that SN) will detect the SN as not
-   acknowledged and retransmit.  This is NOT reachable in the Slice-1 single-pre-shared-key
-   scope (every matched node shares the one key, so legitimate traffic always decrypts).
-   It mirrors the existing zero-copy invalid-ref best-effort drop in `%on-user-data`'s
-   `((null zc))` arm (`src/dds-disc/dataplane.lisp` line ~1441).  **Slice-2 Auth** (matched
-   readers share keys by construction from the DH exchange) removes the precondition
-   entirely.
+1. **Fail-closed decode-failure drop on the reliable reader path does not record the SN. —
+   RESOLVED (WP-RESIDUAL-FIXES-BATCH-A, 2026-07-04).** The original limitation: a decode-failure
+   drop never recorded the SN, so the reliable writer retransmitted a permanently-undecodable
+   sample forever (unbounded churn). The fix is a **bounded, fail-SAFE retransmit suppression**
+   whose design deliberately avoids the data-loss trap (a decode failure is NORMAL during the
+   key-exchange race — KeyMaterial may simply not have arrived — and the retransmit is what makes
+   that case self-heal):
+   - **Missing KM never counts.** `%deliver-user-sample` distinguishes the two failure classes at
+     the site: a NIL key from the `crypto-keys` resolver (key not yet established) returns early
+     *before* any counting — the SN stays NACKed and the writer's retransmit delivers it once the
+     key arrives (no loss; the pre-fix self-healing preserved verbatim).
+   - **KM-present failures are counted per `(writer-GUID, SN)`** (`%secured-decode-fail`, a 2-level
+     GUID→SN table `disc-node-decode-fail-counts` mirroring the samples-store keying, §8.3.5.4).
+     After `dds.disc:*decode-fail-suppress-threshold*` (default 3) failures of the SAME SN with the
+     key present (persistent AEAD tag failure = tamper, or a permanent key mismatch), the reader
+     marks that ONE SN locally GAP-irrelevant (`dds.rtps.reliable:reader-suppress-sn`, an RTPS 2.5
+     §8.3.7.4 GAP-equivalent presence marker) so `reader-acknack` stops NACKing it and the writer
+     stops retransmitting. Delivery stays **fail-closed** (undecodable data is never delivered);
+     availability is **bounded** (the churn stops); later SNs flow (no head-of-line wedge).
+   - **Bounded memory:** a successful decode clears its counter; a suppressed SN's counter is
+     dropped; the per-writer map is capped at `dds.disc:*decode-fail-track-limit*` (default 256 —
+     at the cap a further DISTINCT failing SN keeps retransmitting rather than being tracked:
+     bounded per-writer churn is chosen over unbounded memory, mirroring `*max-gap-range*`); the
+     whole per-writer table is pruned on writer unmatch (`%lease-sweep` → `%purge-prefix`).
+     NFR-MEM / NFR-SEC-POSTURE.
+   - Fail-SAFE ordering as shipped: data-loss NEVER (missing-KM never suppresses; below-threshold
+     failures keep the repair path open), unbounded churn BOUNDED (threshold + cap + prune),
+     security FAIL-CLOSED (a tampered sample is never delivered and is eventually silenced).
+   Regression: `run-decode-fail-suppress-test` (three arms: missing-KM heals with zero counting;
+   persistent tamper suppresses at the threshold with later SNs flowing; the counter table is
+   capped), both impls.
+   - **PRECONDITION (forward requirement on any future KM-rotation/rekey WP):** the "KM-present
+     failure = tamper or permanent mismatch" classification holds only while a live writer-GUID's
+     KeyMaterial is never rotated/replaced with samples in flight (true today: single static
+     per-endpoint KM, `session_id` fixed). If rekeying lands, a sample encoded under a NEW key
+     would count as failures against the STALE KM and be suppressed — then be silently LOST when
+     the retransmit becomes decodable (the SN is already `:gap`). That WP MUST epoch-key
+     `disc-node-decode-fail-counts` (or invalidate a writer's counters on KM replacement) so a
+     key change resets the classification. Record this in its acceptance criteria.
 
 2. **Minor: an `encode-serialized-payload` on a `writer-write` `:timeout` consumes an
    `iv-counter` slot.**  The encode runs before `writer-write` checks the bounded cache;

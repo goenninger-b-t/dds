@@ -39,6 +39,8 @@
            #:disc-node-zc-sends #:+zerocopy-pool-slots+ #:+zerocopy-pool-slot-bytes+ #:*zerocopy-min-payload-bytes*
            ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: data_protection encode-pool sizing knobs + the per-node arena slot
            #:*secured-payload-max-bytes* #:*secured-pool-capacity* #:*secured-pool-headroom* #:disc-node-payload-arena
+           ;; WP-RESIDUAL-FIXES-BATCH-A / ADR 0031 lim.1: reliable-reader decode-failure retransmit-suppression knobs
+           #:*decode-fail-suppress-threshold* #:*decode-fail-track-limit*
            ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T3 (ZA-2): whole-RTPS (rtps_protection / SRTPS) send-scratch pool capacity knob
            #:*srtps-send-scratch-capacity*
            ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: data_protection DECODE loan (zero-alloc secured receive via the loan registry)

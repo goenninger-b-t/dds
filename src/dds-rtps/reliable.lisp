@@ -686,6 +686,21 @@
         (setf (gethash (+ base i) received) :gap)))
     t))
 
+(defun* reader-suppress-sn (reader writer-id sn)
+    (function (rtps-reader t integer) t)
+  "Mark exactly one SN from WRITER-ID as locally IRRELEVANT — a GAP-equivalent presence marker (:gap, RTPS 2.5
+   §8.3.7.4) — so reader-acknack no longer NACKs it and reader-complete-p counts it, WITHOUT delivering it.
+   The secured receive path calls this ONLY after a bounded run of KM-PRESENT decode failures of a sample that
+   can never become decodable (persistent AES-GCM tag failure / key mismatch): the reader locally decides the
+   sample is unrepairable and stops the reliable writer's otherwise-UNBOUNDED retransmission of it (ADR 0031
+   limitation 1). It NEVER runs while the key material is still absent (the key-exchange race must keep
+   self-healing). Marks the ONE named SN and does NOT touch last-sn, so a genuinely-missing LOWER SN still NACKs
+   (no head-of-line suppression) and a forged high SN cannot inflate the ACKNACK range. Receiver-thread-only, the
+   same single-mutator discipline as reader-on-data. Idempotent (a re-mark is a no-op)."
+  (let ((proxy (get-writer-proxy reader writer-id)))
+    (setf (gethash sn (writer-proxy-received proxy)) :gap)
+    t))
+
 (defun* reader-complete-p (reader writer-id)
     (function (rtps-reader t) t)
   "T iff every SN in the available range [first, last] has been received or GAPped."

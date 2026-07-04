@@ -3009,6 +3009,52 @@
       (dds.disc:stop-node node)))
   t)
 
+(defun* run-loan-write-timeout-release-test ()
+    (function () t)
+  "WP-RESIDUAL-FIXES-BATCH-A (task A4): the ADR 0042 publish-sample :timeout leg RELEASES an in-flight loan-write
+   armed slot (the F3 report's missing bounded-cache fixture). A writer with a BOUNDED cache (KEEP_ALL,
+   max_samples 1, max_blocking_time 0) and NO matched readers is filled by one publish; a SECOND publish carrying
+   a pre-committed loan-write slot finds the cache full, blocks up to 0 ns, and returns :timeout — nothing is
+   added, so the committed slot could never be emitted and MUST be released (pool free-count restored, no strand),
+   with the armed registry NOT grown. Asserts: publish returns :timeout cleanly; the slot's refcount is dropped
+   (free-count back to baseline); the zc-armed registry is empty (the timeout leg released, never registered).
+   SBCL only (ZC pool, ADR 0013); Clasp pass-skips."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (format t "~&  [skip] loan-write-timeout-release: SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap~%")
+    (return-from run-loan-write-timeout-release-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (payload (make-array 20 :element-type '(unsigned-byte 8) :initial-element 9))
+         (node (dds.disc:make-disc-node
+                :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 88)
+                :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer node :topic "LwTimeout" :type "fd-abc")
+           ;; bounded cache: KEEP_ALL max_samples 1, non-blocking -> a 2nd publish on the full cache is :timeout
+           (dds.disc:enable-publisher node :history-kind :keep-all :max-samples 1 :max-blocking-ns 0)
+           (let* ((sap (dds.disc::disc-node-zc-pool-sap node))
+                  (k (dds.xport.zerocopy::%zc-free-count sap)))
+             ;; fill the single cache slot with a plain publish (no reader -> stays unacked -> cache full)
+             (%check :lwt-fill (eq t (dds.disc:publish-sample node payload))
+                     "the first publish fills the bounded cache (returns T)")
+             ;; acquire + commit a loan-write slot, then publish WITH it -> the full cache yields :timeout
+             (multiple-value-bind (sap2 slot base gen) (dds.disc:node-loan-write-acquire node (length payload))
+               (declare (ignore base))
+               (%check :lwt-acquired (and sap2 t) "the loan-write acquire must succeed (pool has a free slot)")
+               (%check :lwt-held (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                       "the acquired slot is held (free-count K-1)")
+               (dds.disc:node-loan-write-commit node slot gen)
+               (%check :lwt-timeout (eq :timeout (dds.disc:publish-sample node payload nil slot gen))
+                       "a loan-write publish onto a FULL bounded cache must return :timeout")
+               (%check :lwt-released (= k (dds.xport.zerocopy::%zc-free-count sap))
+                       "the :timeout leg must RELEASE the armed slot (free-count restored to baseline — no strand)")
+               (%check :lwt-registry-empty (null (dds.disc::disc-node-zc-armed-changes node))
+                       "nothing was added, so the armed change must NOT sit in the registry"))))
+      (dds.disc:stop-node node)))
+  t)
+
 (defun* run-flow-token-bucket-test ()
     (function () t)
   "WP-ASYNC-FLOW (FR-PF-2, flow-control half), ADR 0016: the bytes/period token bucket with a deterministic
@@ -3475,6 +3521,7 @@
                  ("loan-write-abort"         . run-loan-write-abort-test)
                  ("loan-write-eligibility"   . run-loan-write-eligibility-test)
                  ("loan-write-sendsite"      . run-loan-write-sendsite-test)
+                 ("loan-write-timeout-release" . run-loan-write-timeout-release-test)
                  ("flatdata-transcode-xcdr1be" . run-flatdata-transcode-xcdr1be-test)
                  ("flatdata-transcode-xcdr1le" . run-flatdata-transcode-xcdr1le-test)
                  ("flatdata-transcode-xcdr2be" . run-flatdata-transcode-xcdr2be-test)
@@ -3546,6 +3593,7 @@
                  ("secured-decode-loan-alloc"    . run-secured-decode-loan-alloc-test)
                  ("secured-decode-loan-dup"      . run-secured-decode-loan-dup-test)
                  ("secured-store-growth"         . run-secured-store-growth-test)
+                 ("decode-fail-suppress"         . run-decode-fail-suppress-test)
                  ("secured-live-zeroalloc"       . run-secured-live-zeroalloc-test)
                  ("secured-submsg-exhaust-passthrough" . run-secured-submsg-exhaust-passthrough-test)
                  ("security-crypto-header"       . run-security-crypto-header-corpus-test)
