@@ -1297,20 +1297,26 @@
                             (equalp kh (dds.durability:durable-record-key-hash (first recs))))
                        "control: keyed record must round-trip byte-exact (key-hash in AAD, no regression)"))
              (dds.durability:store-close enc))
-           ;; TAMPER: flip a key-hash byte in the on-disk frame + recompute the frame CRC so it parses.
-           ;; frame: magic(2)+flags(1)+guid(16)+sn(8)=27, key-hash at 27..42, plen at 43..46.
+           ;; TAMPER: flip a key-hash byte + recompute BOTH the header CRC and the frame CRC so the
+           ;; frame still parses — proving a CRC (which an on-disk adversary can recompute) is NOT a
+           ;; MAC; the key-hash binding is enforced by the AEAD AAD, not the CRCs. v2 keyed frame:
+           ;; magic(2)+flags(1)+guid(16)+sn(8)=27, key-hash 27..42, plen 43..46, header-crc 47..50,
+           ;; payload from 51, frame-crc at 51+plen (ADR 0026 §10.9).
            (let* ((tid (dds.durability::%topic->id topic))
                   (log-path (merge-pathnames (make-pathname :directory '(:relative "topics") :name tid :type "log") d-dir))
                   (raw (with-open-file (fin log-path :element-type '(unsigned-byte 8))
                          (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
                            (read-sequence v fin) v))))
              (setf (aref raw 27) (logxor (aref raw 27) #xFF))
+             ;; recompute the header CRC (over [0,47), which now covers the flipped key-hash) …
+             (dds.durability::%put-u32-le raw 47 (dds.durability::%crc32 raw 0 47))
              (let* ((plen    (dds.durability::%get-u32-le raw 43))
-                    (crc-off (+ 47 plen)))
+                    (crc-off (+ 51 plen)))
+               ;; … and the trailing frame CRC, so the tampered frame passes both CRC gates
                (dds.durability::%put-u32-le raw crc-off (dds.durability::%crc32 raw 0 crc-off))
                (with-open-file (fout log-path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
                  (write-sequence raw fout))))
-           ;; RUN 2: reopen → frame parses (CRC valid) but key-hash is in the AAD → GCM fail → DROP
+           ;; RUN 2: reopen → frame parses (both CRCs valid) but key-hash is in the AAD → GCM fail → DROP
            (let* ((kp2  (dds.dare:make-file-key-provider :dir k-dir))
                   (fs2  (dds.durability:make-file-store :dir d-dir))
                   (enc2 (dds.durability:make-encrypted-store fs2 kp2 :epoch-dir d-dir))

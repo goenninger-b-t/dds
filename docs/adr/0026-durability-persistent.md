@@ -372,18 +372,44 @@ own vertical slice:
    the whole P6 milestone (the relay emits standard plaintext DDS samples on the wire).
 8. **db / microservice persistence backends** — ADR 0021 lists them; **file** is the 3b backend, on
    the same `durable-store` vtable so a db backend drops in later.
-9. **Per-frame header integrity + log-level at-rest integrity** — the sanity cap closes gross length
-   corruption, but a tail-region length corruption under the cap is still indistinguishable from a
-   torn tail, and a disk-write adversary can delete/reorder/truncate whole records undetectably; a
-   per-frame header CRC + a MAC'd log chain (or a sealed/independent index) closes both.
-10. **Parent-directory fsync** — file *contents* are `fdatasync`'d but the containing directory is
-    not; durable directory entries for newly-created logs / `epochs.dat` and the compaction rename
-    across a power loss need a `dds.pal:fsync-directory` (SBCL dir-fd `fsync`; Clasp documented gap).
-11. **`:process`-mode PERSISTENT** — `%spec->argv` does not serialize the store factory, so a
-    `:process`-mode spec silently runs the in-memory tier; serialize the store config across the CLI
-    (or fail-fast). Use `:thread` mode for the PERSISTENT tier until then.
-12. **Store dir `D` 0700 enforcement** — perms are enforced on the key dir `K`; enforcing 0700 on `D`
-    to shield the cleartext frame metadata is deferred (payload confidentiality is DARE, perms-independent).
+9. **Per-frame header integrity** — **RESOLVED** (WP-DURABILITY-HARDENING-BATCH). The on-disk frame
+   is version-bumped to **v2** (the second magic byte is now the format version; the reader dispatches
+   per-frame, so a log may mix legacy v1 + v2 frames — `store-file.lisp` `%frame-record-versioned` /
+   `%parse-frame`). v2 adds a **CRC-32 header integrity field** over the header (magic..payload-len),
+   validated BEFORE payload-len is trusted: a sub-cap length corruption is now caught as `:corrupt`
+   (fail loud) instead of masquerading as a torn tail. Recovery discipline preserved: a torn write
+   yields fewer bytes → `:short` → tail-truncate-recover; a full-but-bad CRC (header OR frame) →
+   `:corrupt` → fail loud (a clean truncating crash can only shorten, never corrupt present bytes, so
+   the discrimination is clean). Writer writes only v2; reader still reads v1 (back-compat). Tests:
+   `run-durability-frame-version-test`, `run-durability-file-recovery-test`, `run-dare-keyhash-aad-test`.
+   Intentional scope: `epochs.dat` entries stay on the entry-CRC-only scheme (a sub-cap kem-ct-len
+   corruption there remains tail-ambiguous) — safe because the ordering invariant appends+fsyncs the
+   epoch entry BEFORE any record references it, so a torn-tail truncation there never orphans a
+   referenced epoch.
+   **Follow-on (still open):** the **MAC'd log chain** (a CRC is not a MAC — a disk-write adversary who
+   recomputes the CRC still can't forge a DARE payload, but can delete/reorder whole records
+   undetectably; a keyed log chain or sealed/independent index closes that).
+10. **Parent-directory fsync** — **RESOLVED** (WP-DURABILITY-HARDENING-BATCH). New PAL seam
+    `dds.pal:fsync-directory (path)` — `open(dir,O_RDONLY)+fsync+close` via CFFI, impl-agnostic
+    (identical body on SBCL and Clasp — a raw directory fd, no NFR-PORT split; macOS `fsync` on a dir
+    fd is valid, F_FULLFSYNC not required). Called after every create/rename of a dirent: new log file
+    (`%ensure-stream`), `epochs.dat` create (`%append-epoch`), compaction rename (`%rewrite-topic-log`),
+    recovery truncate rename (`%truncate-file`), and `topics.map` write (`%write-topics-map`). Test:
+    `run-durability-fsync-directory-test` + transitively every file-store test.
+11. **`:process`-mode PERSISTENT** — **RESOLVED** (WP-DURABILITY-HARDENING-BATCH) via **fail-fast**.
+    The CLI (`%spec->argv` / `durability-service-main`) conveys only the in-memory TRANSIENT tier
+    (domain/topics/mode/name); it cannot serialize a file/DARE store factory. `%start-process-service`
+    now PROBES the spec's store (`%process-mode-store-conveyable-p`: a store whose name ≠ `:memory` is
+    non-conveyable) and **signals an error before launching** rather than silently running the
+    in-memory tier (the worst failure mode — looks durable, is not). Use `:thread` mode for the
+    PERSISTENT tier. Test: `run-durability-process-persistent-refuse-test`.
+    **Follow-on (still open):** full store-factory serialization over argv (dir + DARE key material)
+    so `:process` mode can carry the PERSISTENT tier honestly.
+12. **Store dir `D` 0700 enforcement** — **RESOLVED** (WP-DURABILITY-HARDENING-BATCH). `store-open`
+    now enforces 0700 on `D` exactly as the key dir `K`: chmod 0700 on first creation, then ALWAYS
+    verify (fail-closed refuse on loose/unverifiable perms), reusing the shared
+    `dds.dare:enforce-directory-perms-0700` / `assert-directory-perms-0700` helpers (DRY). Test:
+    `run-durability-store-dir-perms-test`.
 
 ## References
 

@@ -177,11 +177,16 @@
    invariant holds — every record's epoch-id resolves after a crash (spec §9, ADR 0026)."
   (let ((entry (%frame-epoch-entry epoch-id kem-ct))
         (path  (%epochs-dat-path dir)))
-    (ensure-directories-exist path)
-    (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
-                            :if-exists :append :if-does-not-exist :create)
-      (write-sequence entry s)
-      (dds.pal:fsync-stream s)))
+    (let ((existed (probe-file path)))
+      (ensure-directories-exist path)
+      (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                              :if-exists :append :if-does-not-exist :create)
+        (write-sequence entry s)
+        (dds.pal:fsync-stream s))
+      ;; a NEW epochs.dat's dirent must be fsynced into its dir to survive power loss (ADR 0026 §10.10);
+      ;; without this the first epoch's record could reference an epoch whose dirent never persisted
+      (unless existed
+        (dds.pal:fsync-directory (uiop:pathname-directory-pathname path)))))
   t)
 
 (defun* %free-epoch-dek-map (dek-map)

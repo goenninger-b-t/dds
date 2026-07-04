@@ -165,7 +165,9 @@ DDS 1.4 §2.2.3.5 spec clause and the wire observations above.
 - **Online / threshold compaction:** compact the file-store between opens (e.g. when a per-topic
   record count threshold is exceeded), without requiring a `store-close`/`store-open` cycle.
 - **Parent-directory fsync** for the compaction rename across a power loss (shared follow-on with
-  ADR 0026 §10).
+  ADR 0026 §10). **RESOLVED** (WP-DURABILITY-HARDENING-BATCH): `%rewrite-topic-log` now calls
+  `dds.pal:fsync-directory` after the compaction rename (and every other create/rename dirent — see
+  ADR 0026 §10.10).
 
 ## References
 

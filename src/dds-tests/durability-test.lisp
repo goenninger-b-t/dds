@@ -1944,7 +1944,7 @@
              (dds.durability:store-put s-b "R" g0 1 nil :data (funcall p '(11)))
              (dds.durability:store-put s-b "R" g0 2 nil :data (funcall p '(22)))
              (dds.durability:store-close s-b)
-             ;; flip a byte inside the 1st frame's payload body (byte 29 = payload area)
+             ;; flip a byte inside the 1st frame's PAYLOAD body → trips the trailing frame CRC
              (let* ((tid (dds.durability::%topic->id "R"))
                     (log-path (merge-pathnames
                                (make-pathname :directory '(:relative "topics")
@@ -1954,8 +1954,9 @@
                            (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
                              (read-sequence v fin)
                              v))))
-               ;; offset 31 is the first payload byte of frame 1 (magic(2)+flags(1)+guid(16)+sn(8)+plen(4)=31)
-               (setf (aref raw 31) (logxor (aref raw 31) #xFF))
+               ;; v2 no-kh frame: magic(2)+flags(1)+guid(16)+sn(8)+plen(4)+header-crc(4)=35 → offset 35
+               ;; is the first PAYLOAD byte of frame 1 (header CRC is intact; the FRAME CRC catches this)
+               (setf (aref raw 35) (logxor (aref raw 35) #xFF))
                (with-open-file (fout log-path :direction :output :element-type '(unsigned-byte 8)
                                               :if-exists :supersede)
                  (write-sequence raw fout)))
@@ -3153,3 +3154,234 @@
     (%check :gt-not-alive-after (not (dds.durability:service-alive-p svc))
             "after service-stop every collect thread must be joined (not alive)"))
   t)
+
+;;; --- WP-DURABILITY-HARDENING-BATCH residual tests (ADR 0024/0025/0026/0029 §10) ---
+
+(defun* run-durability-fsync-directory-test ()
+    (function () t)
+  "B2 (ADR 0026 §10.10): dds.pal:fsync-directory is callable on BOTH impls — a smoke call on a
+   real temp directory returns T (open(dir,O_RDONLY)+fsync+close). Also exercised transitively by
+   every file-store test (log/epochs.dat create + compaction/truncate rename now fsync the dir)."
+  (let ((tmp (uiop:merge-pathnames*
+              (make-pathname :directory (list :relative (format nil "dds-b2-fsyncdir-~a"
+                                                                (get-universal-time))))
+              (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist tmp)
+           (%check :b2-fsync-directory
+                   (eq t (dds.pal:fsync-directory tmp))
+                   "dds.pal:fsync-directory on a temp dir must return T (open+fsync+close)"))
+      (when (uiop:directory-exists-p tmp)
+        (uiop:delete-directory-tree tmp :validate t)))
+    t))
+
+(defun* run-durability-frame-version-test ()
+    (function () t)
+  "B3 (ADR 0026 §10.9): frame format v2 header-CRC + v1 back-compat read.
+   (1) v2 round-trip: %frame-record -> %parse-frame :ok, fields byte-exact.
+   (2) v1 back-compat: a legacy no-header-CRC frame still parses :ok (the reader reads both versions).
+   (3) mixed-version log: a topics/<tid>.log holding a v1 frame followed by a v2 frame opens with
+       BOTH records present (per-frame version dispatch).
+   (4) header corruption detected: flip a header byte of an interior v2 frame -> store-open errors
+       (a corrupt length/metadata is caught by the header CRC, not mis-parsed as a torn tail)."
+  (let* ((g0 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x5A))
+         (mk (lambda (sn bytes)
+               (dds.durability::make-durable-record
+                :topic "R" :writer-guid g0 :sn sn :key-hash nil :kind :data
+                :payload (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                     :initial-contents bytes))))
+         (rec1 (funcall mk 1 '(11 12)))
+         (rec2 (funcall mk 2 '(21 22 23))))
+    ;; (1) v2 round-trip
+    (let ((f2 (dds.durability::%frame-record rec1)))
+      (multiple-value-bind (r next reason) (dds.durability::%parse-frame f2 0 (length f2) "R")
+        (%check :b3-v2-ok (eq reason :ok) "v2 frame must parse :ok")
+        (%check :b3-v2-next (= next (length f2)) "v2 parse next-pos must be frame end")
+        (%check :b3-v2-sn (and r (= 1 (dds.durability:durable-record-sn r))) "v2 sn round-trips")
+        (%check :b3-v2-payload (and r (equalp (dds.durability:durable-record-payload r)
+                                              (dds.durability:durable-record-payload rec1)))
+                "v2 payload byte-exact")))
+    ;; (2) v1 back-compat read
+    (let ((f1 (dds.durability::%frame-record-versioned rec1 dds.durability::+frame-version-v1+)))
+      (multiple-value-bind (r next reason) (dds.durability::%parse-frame f1 0 (length f1) "R")
+        (declare (ignore next))
+        (%check :b3-v1-ok (eq reason :ok) "legacy v1 frame must still parse :ok (back-compat)")
+        (%check :b3-v1-sn (and r (= 1 (dds.durability:durable-record-sn r))) "v1 sn round-trips")
+        (%check :b3-v1-payload (and r (equalp (dds.durability:durable-record-payload r)
+                                              (dds.durability:durable-record-payload rec1)))
+                "v1 payload byte-exact")))
+    ;; (3) mixed-version log opens with both records
+    (let* ((tmp (uiop:merge-pathnames*
+                 (make-pathname :directory (list :relative (format nil "dds-b3-mixed-~a"
+                                                                   (get-universal-time))))
+                 (uiop:temporary-directory)))
+           (tid (dds.durability::%topic->id "R"))
+           (log (merge-pathnames (make-pathname :directory '(:relative "topics")
+                                                :name tid :type "log") tmp)))
+      (unwind-protect
+           (progn
+             (ensure-directories-exist log)
+             (dds.dare:enforce-directory-perms-0700 (uiop:ensure-directory-pathname tmp))
+             (with-open-file (s log :direction :output :element-type '(unsigned-byte 8)
+                                    :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence (dds.durability::%frame-record-versioned rec1
+                                                                        dds.durability::+frame-version-v1+) s)
+               (write-sequence (dds.durability::%frame-record rec2) s)) ; v2
+             (let ((st (dds.durability:make-file-store :dir tmp)))
+               (unwind-protect
+                    (progn
+                      (dds.durability:store-open st)
+                      (%check :b3-mixed-count (= 2 (dds.durability:store-count st))
+                              (format nil "mixed v1+v2 log must yield 2 records, got ~d"
+                                      (dds.durability:store-count st))))
+                 (ignore-errors (dds.durability:store-close st)))))
+        (when (uiop:directory-exists-p tmp)
+          (uiop:delete-directory-tree tmp :validate t))))
+    ;; (4) interior v2 header-byte corruption detected as :corrupt (store-open errors)
+    (let* ((tmp (uiop:merge-pathnames*
+                 (make-pathname :directory (list :relative (format nil "dds-b3-hdrcorrupt-~a"
+                                                                   (get-universal-time))))
+                 (uiop:temporary-directory)))
+           (tid (dds.durability::%topic->id "R"))
+           (log (merge-pathnames (make-pathname :directory '(:relative "topics")
+                                                :name tid :type "log") tmp)))
+      (unwind-protect
+           (progn
+             (ensure-directories-exist log)
+             (dds.dare:enforce-directory-perms-0700 (uiop:ensure-directory-pathname tmp))
+             (with-open-file (s log :direction :output :element-type '(unsigned-byte 8)
+                                    :if-exists :supersede :if-does-not-exist :create)
+               (write-sequence (dds.durability::%frame-record rec1) s)   ; interior frame
+               (write-sequence (dds.durability::%frame-record rec2) s))
+             ;; flip a GUID byte (offset 3) inside frame 1's header -> header CRC must mismatch
+             (let ((raw (with-open-file (fin log :element-type '(unsigned-byte 8))
+                          (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
+                            (read-sequence v fin) v))))
+               (setf (aref raw 3) (logxor (aref raw 3) #xFF))
+               (with-open-file (fout log :direction :output :element-type '(unsigned-byte 8)
+                                         :if-exists :supersede)
+                 (write-sequence raw fout)))
+             (let ((st (dds.durability:make-file-store :dir tmp)))
+               (%check :b3-hdr-corrupt-detected
+                       (handler-case (progn (dds.durability:store-open st) nil) (error () t))
+                       "an interior v2 header-byte corruption must fail loud (header CRC), not truncate")))
+        (when (uiop:directory-exists-p tmp)
+          (uiop:delete-directory-tree tmp :validate t))))
+    t))
+
+(defun* run-durability-store-dir-perms-test ()
+    (function () t)
+  "B4 (ADR 0026 §10.12): the store dir D is enforced/verified 0700, exactly like the key dir K.
+   (1) a fresh store-open creates D at 0700 (drwx------). (2) loosening D to 0755 -> next store-open
+   REFUSES (fail-closed). (3) *perms-mode-reader* -> nil (ls unavailable) -> store-open REFUSES."
+  (let ((tmp (uiop:merge-pathnames*
+              (make-pathname :directory (list :relative (format nil "dds-b4-perms-~a"
+                                                                (get-universal-time))))
+              (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           ;; (1) fresh open creates + enforces 0700
+           (let ((s (dds.durability:make-file-store :dir tmp)))
+             (dds.durability:store-open s)
+             (let ((mode (dds.dare::%ls-mode-string (uiop:ensure-directory-pathname tmp))))
+               (%check :b4-created-0700
+                       (and mode (>= (length mode) 9)
+                            (char= (char mode 4) #\-) (char= (char mode 5) #\-)
+                            (char= (char mode 7) #\-) (char= (char mode 8) #\-))
+                       (format nil "store dir D must be 0700 after creation; ls mode = ~a" mode)))
+             (dds.durability:store-close s))
+           ;; (2) loosen D to 0755 -> re-open must refuse (existing dir: verify-only, no re-chmod)
+           (uiop:run-program (list "chmod" "755"
+                                   (uiop:native-namestring (uiop:ensure-directory-pathname tmp))))
+           (let ((s2 (dds.durability:make-file-store :dir tmp)))
+             (%check :b4-loose-refuse
+                     (handler-case (progn (dds.durability:store-open s2) nil) (error () t))
+                     "store-open on a 0755 store dir must signal (fail-closed)"))
+           ;; (3) restore 0700, simulate ls unavailable -> refuse (fail-closed on unverifiable)
+           (uiop:run-program (list "chmod" "700"
+                                   (uiop:native-namestring (uiop:ensure-directory-pathname tmp))))
+           (let ((s3 (dds.durability:make-file-store :dir tmp)))
+             (%check :b4-unverifiable-refuse
+                     (let ((dds.dare::*perms-mode-reader* (constantly nil)))
+                       (handler-case (progn (dds.durability:store-open s3) nil) (error () t)))
+                     "store-open must signal when perms cannot be verified (fail-closed)")))
+      (when (uiop:directory-exists-p tmp)
+        (uiop:delete-directory-tree tmp :validate t)))
+    t))
+
+(defun* run-durability-process-persistent-refuse-test ()
+    (function () t)
+  "B1 (ADR 0026 §10.11): a :process-mode PERSISTENT spec FAILS FAST, never silently running the
+   in-memory tier. %process-mode-store-conveyable-p is NIL for a persistent/file store, T for the
+   in-memory store; on SBCL %start-process-service SIGNALS for a persistent :process spec (before
+   any subprocess launch). The in-memory :process path stays conveyable (process-smoke covers it)."
+  (let* ((mem-spec (dds.durability:make-service-spec
+                    :domain 3 :topics '(("PP" . "ShapeType")) :mode :process :name "pp-mem"))
+         (tmp (uiop:merge-pathnames*
+               (make-pathname :directory (list :relative (format nil "dds-b1-~a"
+                                                                 (get-universal-time))))
+               (uiop:temporary-directory)))
+         (persist-spec (dds.durability:make-service-spec
+                        :domain 3 :topics '(("PP" . "ShapeType")) :mode :process
+                        :store (dds.durability:make-persistent-store-factory
+                                :dir tmp :key-dir (merge-pathnames "keys/" tmp))
+                        :name "pp-persist")))
+    (%check :b1-memory-conveyable
+            (dds.durability::%process-mode-store-conveyable-p mem-spec)
+            "in-memory :process store must be conveyable (T)")
+    (%check :b1-persistent-not-conveyable
+            (not (dds.durability::%process-mode-store-conveyable-p persist-spec))
+            "persistent :process store must NOT be conveyable (NIL) — the fail-fast target")
+    ;; SBCL: the subprocess path signals BEFORE launch; Clasp falls to in-thread mode (honors the
+    ;; real store), so the refuse assertion is SBCL-only (NFR-PORT).
+    (when (eq (dds.pal:pal-impl-name) :sbcl)
+      (%check :b1-persistent-process-signals
+              (handler-case (progn (dds.durability::%start-process-service persist-spec) nil)
+                (error () t))
+              "a :process PERSISTENT spec must signal (fail-fast), not launch a degraded subprocess"))
+    t))
+
+(defun* run-durability-origins-cap-test ()
+    (function () t)
+  "B5 (ADR 0024 §10.2 / ADR 0025 §10.2): the collect seen-set caps the number of DISTINCT origin
+   GUIDs at *max-collect-origins*, refusing NEW origins at cap (fail-closed) rather than evicting a
+   tracked origin's watermark (which would risk double-delivery on a relay replay).
+   (1) below cap: distinct new origins are admitted. (2) at cap: a NEW origin is REFUSED
+   (%collect-admit-p NIL) but an already-tracked origin is still admitted (no watermark lost).
+   (3) re-appearing (never-evicted) origin: its old SNs stay seen-p=T — NO double delivery."
+  (let* ((origins (dds.durability::%make-collect-origins))
+         (cap 3)
+         (mkguid (lambda (b) (make-array 16 :element-type '(unsigned-byte 8) :initial-element b))))
+    (let ((dds.durability::*max-collect-origins* cap))
+      ;; (1) admit cap distinct origins
+      (dotimes (i cap)
+        (let ((g (funcall mkguid (+ 10 i))))
+          (%check :b5-below-cap-admit
+                  (dds.durability::%collect-admit-p origins g)
+                  (format nil "origin ~d below cap must be admitted" i))
+          (dds.durability::%collect-mark-seen! origins g 1)))
+      (%check :b5-at-cap-size
+              (= cap (hash-table-count origins))
+              (format nil "origins table must hold exactly cap=~d entries" cap))
+      ;; (2) a NEW origin at cap is refused; a tracked one is still admitted
+      (let ((gnew  (funcall mkguid 99))
+            (gknown (funcall mkguid 10)))
+        (%check :b5-new-refused-at-cap
+                (not (dds.durability::%collect-admit-p origins gnew))
+                "a NEW origin at cap must be REFUSED (fail-closed, no eviction)")
+        (%check :b5-tracked-still-admitted
+                (dds.durability::%collect-admit-p origins gknown)
+                "an already-tracked origin must stay admitted at cap (watermark never evicted)")
+        (%check :b5-size-unchanged
+                (= cap (hash-table-count origins))
+                "refusing a new origin must not grow or shrink the table"))
+      ;; (3) re-appearing origin: its already-delivered SN stays seen -> no double delivery
+      (let ((g0 (funcall mkguid 10)))
+        (dds.durability::%collect-mark-seen! origins g0 2)
+        (dds.durability::%collect-mark-seen! origins g0 3)
+        (%check :b5-no-double-delivery
+                (and (dds.durability::%collect-seen-p origins g0 2)
+                     (dds.durability::%collect-seen-p origins g0 3))
+                "a re-presented already-delivered SN must stay seen (no double delivery under cap policy)")))
+    t))

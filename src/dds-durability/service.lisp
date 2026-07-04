@@ -126,10 +126,32 @@
 ;;; *max-gap-range* entries per GUID; pruning after watermark advance keeps memory O(live
 ;;; origins * *max-gap-range*), not O(total samples delivered).
 
+(defparameter *max-collect-origins* 4096
+  "NFR-MEM resource limit (ADR 0024 §non-goals, ADR 0025 §10.2): the maximum number of DISTINCT
+   origin GUIDs tracked in one collect seen-set. The per-SN growth per origin is already bounded
+   (LO watermark + *max-gap-range* above-set); this bounds the number of ORIGIN ENTRIES, whose
+   growth over a long-lived service (each departed writer leaves a per-GUID entry) was the residual
+   unbounded dimension. AT CAP, a sample from a NEW (untracked) origin is REFUSED (RESOURCE_LIMITS
+   fail-closed backpressure — not stored, not relayed) rather than EVICTING a tracked origin's LO
+   watermark: eviction is UNSAFE here because a later late-joining relay can replay the evicted
+   origin's OLD samples, and a forgotten watermark would re-admit them = double-delivery regression
+   (the ADR 0024 dedup trap). A tracked origin is ALWAYS admitted, so no watermark is ever lost.
+   Generous default; raise it if a deployment legitimately has more concurrent origins.")
+
 (defun* %make-collect-origins ()
     (function () hash-table)
   "Return a fresh per-origin dedup table (GUID equalp -> (lo . above-ht))."
   (make-hash-table :test #'equalp))
+
+(defun* %collect-admit-p (origins guid)
+    (function (hash-table (simple-array (unsigned-byte 8) (*))) t)
+  "T iff a sample from origin GUID may be admitted into ORIGINS. A GUID that ALREADY has an entry
+   (tracked origin) is always admitted (its watermark is intact). A NEW origin is admitted only
+   while the table is below *MAX-COLLECT-ORIGINS*. NIL only for a NEW origin at cap — the caller
+   then REFUSES the sample (fail-closed) rather than evicting a tracked origin's LO watermark,
+   which would risk double-delivery on a later relay replay (ADR 0024 dedup trap / §10.2)."
+  (or (nth-value 1 (gethash guid origins))
+      (< (hash-table-count origins) *max-collect-origins*)))
 
 (defun* %collect-seen-p (origins guid sn)
     (function (hash-table (simple-array (unsigned-byte 8) (*)) integer) t)
@@ -221,7 +243,10 @@
                      (origin-guid (dds.disc:node-sample-origin-guid node key))  ; logical origin (OWI else wire)
                      (origin-sn   (dds.disc:node-sample-origin-sn   node key)))
                 (when (and writer-guid
-                           (not (%collect-seen-p origins-data origin-guid origin-sn)))
+                           (not (%collect-seen-p origins-data origin-guid origin-sn))
+                           ;; at cap, a NEW origin is refused (fail-closed) — never evict a tracked
+                           ;; origin's watermark (would risk double-delivery, ADR 0024 §10.2)
+                           (%collect-admit-p origins-data origin-guid))
                   (%collect-mark-seen! origins-data origin-guid origin-sn)
                   (let ((payload (dds.disc:node-sample node key)))
                     (when payload
@@ -233,7 +258,8 @@
             (dolist (key (dds.disc:node-lifecycle-sns node))
               (let* ((key-guid (car key))
                      (key-sn  (cdr key)))
-                (when (not (%collect-seen-p origins-lc key-guid key-sn))
+                (when (and (not (%collect-seen-p origins-lc key-guid key-sn))
+                           (%collect-admit-p origins-lc key-guid)) ; cap origins-lc too (ADR 0024 §10.2)
                   (%collect-mark-seen! origins-lc key-guid key-sn)
                   (let ((lc (dds.disc:node-lifecycle-change node key)))
                     (when lc

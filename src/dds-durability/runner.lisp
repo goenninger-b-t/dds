@@ -20,6 +20,24 @@
   "Construct a SERVICE-RUNNER from SPECS (a list of SERVICE-SPEC). Not started until RUNNER-START."
   (%make-service-runner :specs specs))
 
+(defun* %process-mode-store-conveyable-p (spec)
+    (function (service-spec) boolean)
+  "T iff SPEC's store factory produces a store the :PROCESS CLI can HONESTLY reconstruct in the
+   child. The durability CLI (%SPEC->ARGV / DURABILITY-SERVICE-MAIN) conveys ONLY the in-memory
+   TRANSIENT tier (domain/topics/mode/name) — it does NOT serialize a file/DARE store factory
+   (full factory serialization over argv is the recorded FEATURE follow-on, ADR 0026 §10.11). So a
+   :memory store IS conveyable; any file/encrypted store is NOT. Probes by CONSTRUCTING the store,
+   reading its NAME, then STORE-CLOSEing it (unwind-protect): construction MAY have side effects —
+   a v1 encrypted store opens its key provider and derives a fresh DEK at construction — so the
+   probed instance is always closed to release them (every built-in store's close is safe on a
+   never-opened instance: memory/file closes are no-ops on empty state; encrypted closes free the
+   DEK/provider idempotently). Used to FAIL-FAST a :process PERSISTENT spec rather than let it
+   silently run the in-memory tier (looks durable, is not — the worst failure mode)."
+  (let ((probe (funcall (service-spec-store spec))))
+    (unwind-protect
+         (eq (durable-store-name probe) :memory)
+      (ignore-errors (store-close probe)))))
+
 (defun* %start-process-service (spec)
     (function (service-spec) durability-service)
   "Start a :PROCESS-mode service by launching a child Lisp invoking DURABILITY-SERVICE-MAIN.
@@ -29,7 +47,18 @@
    On impls where UIOP:ARGV0 is unavailable or empty, falls back to in-thread mode with a note.
    Runtime dispatch on PAL-IMPL-NAME — no reader conditionals (operating contract §10)."
   (if (eq (dds.pal:pal-impl-name) :sbcl)
-      (let* ((argv (dds.durability::%spec->argv spec))
+      (let* ((_conveyable
+              (unless (%process-mode-store-conveyable-p spec)
+                ;; FAIL-FAST: never launch a subprocess that would silently drop durability
+                ;; (the CLI cannot convey a file/DARE store factory) — use :thread mode for the
+                ;; PERSISTENT tier (ADR 0026 §10.11). Erroring here beats a service that looks
+                ;; durable but is not.
+                (error "dds.durability: :process-mode service ~s is configured with a non-memory ~
+                        (persistent/file) store, which the CLI cannot convey across the subprocess ~
+                        boundary — launching would SILENTLY run the in-memory tier (no durability). ~
+                        Use :thread mode for the PERSISTENT tier (ADR 0026 §10.11)."
+                       (service-spec-name spec))))
+             (argv (dds.durability::%spec->argv spec))
              (lisp-bin (uiop:argv0))
              (_ (unless (and lisp-bin (plusp (length lisp-bin)))
                   (error "dds.durability: (uiop:argv0) returned nil/empty — cannot launch subprocess")))
@@ -45,7 +74,7 @@
                                          :error-output :interactive))
              (svc   (%make-durability-service :spec spec))
              (lock  (durability-service-lock svc)))
-        (declare (ignore _))
+        (declare (ignore _ _conveyable))
         (dds.pal:with-lock (lock)
           (setf (durability-service-running svc) t))
         ;; monitor thread: polls subprocess liveness; flips running flag when process exits

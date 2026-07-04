@@ -53,7 +53,11 @@
    ;; optimization hints
    #:with-hot-optimizations
    ;; file sync (group-commit; fdatasync on SBCL, finish-output on Clasp — NFR-PORT)
-   #:fsync-stream))
+   #:fsync-stream
+   ;; directory sync: open(dir,O_RDONLY)+fsync+close so a newly-created/renamed dirent
+   ;; (log file, epochs.dat, compaction rename) survives power loss — POSIX requires
+   ;; fsyncing the CONTAINING directory to persist the dirent (ADR 0026 §10.10)
+   #:fsync-directory))
 
 (in-package #:dds.pal)
 

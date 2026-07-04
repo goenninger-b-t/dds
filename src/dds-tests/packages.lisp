@@ -42,6 +42,11 @@
            #:run-durability-compaction-test
            #:run-durability-seed-backpressure-test
            #:run-durability-seen-prune-test
+           #:run-durability-fsync-directory-test
+           #:run-durability-frame-version-test
+           #:run-durability-store-dir-perms-test
+           #:run-durability-process-persistent-refuse-test
+           #:run-durability-origins-cap-test
            #:run-durability-dynamic-topic-test
            #:run-durability-relay-tier-test
            #:run-durability-collect-tier-test

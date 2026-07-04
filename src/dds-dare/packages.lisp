@@ -39,6 +39,9 @@
    #:key-provider-open
    #:key-provider-close
    #:make-file-key-provider
+   ;; WP-DURABILITY-HARDENING-BATCH (ADR 0026 §10.12): 0700 dir enforce/verify, shared K + store dir D
+   #:enforce-directory-perms-0700
+   #:assert-directory-perms-0700
    ;; Task 6b: foreign-backed secret-material lifetime (design spec §6)
    #:free-secret-octets
    #:octets->secret

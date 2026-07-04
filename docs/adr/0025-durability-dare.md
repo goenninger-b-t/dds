@@ -218,6 +218,10 @@ These were formerly "out of scope"; per owner directive they are MUST, each its 
    Service at the TRANSIENT tier — the TRANSIENT_LOCAL dual-relay proof was not exercisable, ADR
    0024), dynamic-topic-add after service start, and pruning the collect-loop `seen-data`/`seen-lc`
    sets (the unbounded-growth NFR-MEM item the Phase-2 review flagged). Small.
+   **§10.2 seen-set bound RESOLVED** (WP-DURABILITY-HARDENING-BATCH): the distinct-origin count is
+   now capped at `dds.durability:*max-collect-origins*` with fail-closed refuse-new-origins — see the
+   ADR 0024 non-goals entry for the full dedup-safety argument (no watermark is ever evicted, so no
+   double-delivery). Follow-on: safe capacity-reclaim via durable per-origin high-water re-seed.
 3. **(3c) Metadata confidentiality** — seal the record metadata (topic/GUID/SN/kind), not just the
    payload; requires an encrypted/independent index so the store can still locate records (the
    current AAD-cleartext model forfeits this). A DARE extension.

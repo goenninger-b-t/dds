@@ -422,9 +422,11 @@ See `interop/durability-dedup/README.md` for wire evidence and `ADR 0024` for th
   O(live-origins × `*max-gap-range*`) (§8, ADR 0026).
 - **In-memory store** was the Phase-2 default; the disk-backed PERSISTENT tier (always DARE-wrapped,
   survives restart) LANDED in Phase 3b — see §8.
-- **`:process` mode is SBCL-only** (runtime fallback to in-thread on other impls); note `:process`
-  mode does NOT carry the PERSISTENT store factory across the process boundary — use `:thread`
-  mode for the PERSISTENT tier (§8.7).
+- **`:process` mode is SBCL-only** (runtime fallback to in-thread on other impls); the CLI conveys
+  only the in-memory TRANSIENT tier — it does **not** serialize a file/DARE store factory. A
+  `:process`-mode spec configured for the PERSISTENT tier now **fails fast** (`%start-process-service`
+  signals before launch) rather than silently running the in-memory tier — use `:thread` mode for the
+  PERSISTENT tier (§8.7).
 - **Dynamic topic-add to a running service** LANDED in Phase 3b (`service-add-topic`, §8.1).
 
 See ADR 0023 + ADR 0024 for the full boundary.
@@ -629,12 +631,20 @@ To add a topic to an **already-running** service without a restart:
 
 - `D/topics/<topic-id>.log` — one append-only log per topic (`<topic-id>` = lowercase hex of the
   topic UTF-8 bytes; a `D/topics.map` records the readable name).
-- Each record is a framed entry: `magic(2)=DA 01 ∥ flags(1) ∥ writer-guid(16) ∥ sn(8 LE) ∥
-  [key-hash(16) if keyed] ∥ payload-len(4 LE) ∥ payload ∥ crc32(4)`. `flags` encodes the record
-  kind (`:data`/`:dispose`/`:unregister`) + key-hash-present; the CRC32 uses the reflected
-  polynomial `0xEDB88320` (a torn-write integrity check, **not** the security primitive — tamper
-  detection is the GCM tag). The **`payload` is the encrypted-store's opaque sealed blob** (which
-  itself carries the epoch-id); the file store never parses or decrypts it.
+- Each record is a framed entry. The **second byte is the frame format version** (the reader
+  dispatches per-frame, so one log may mix legacy and current frames):
+  - **v2 (current, the only version written)** — `magic(1)=DA ∥ version(1)=02 ∥ flags(1) ∥
+    writer-guid(16) ∥ sn(8 LE) ∥ [key-hash(16) if keyed] ∥ payload-len(4 LE) ∥ **header-crc32(4 LE)**
+    ∥ payload ∥ frame-crc32(4 LE)`. The **header CRC** (over `magic..payload-len`) is validated
+    **before** `payload-len` is trusted, so a corrupt length is detected as corruption (fail loud)
+    instead of masquerading as a torn tail (ADR 0026 §10.9).
+  - **v1 (legacy, read-only)** — `magic(1)=DA ∥ version(1)=01 ∥ … ∥ payload-len(4 LE) ∥ payload ∥
+    frame-crc32(4 LE)` (no header CRC). The reader still reads it for back-compat.
+  `flags` encodes the record kind (`:data`/`:dispose`/`:unregister`) + key-hash-present; both CRC32s
+  use the reflected polynomial `0xEDB88320` (torn-write / length-corruption integrity checks, **not**
+  the security primitive — tamper detection is the GCM tag; a CRC an adversary can recompute is not a
+  MAC, so a MAC'd log chain is a recorded follow-on). The **`payload` is the encrypted-store's opaque
+  sealed blob** (which itself carries the epoch-id); the file store never parses or decrypts it.
 - `D/epochs.dat` — an append-only epoch table; each entry is
   `epoch-id(4 LE) ∥ kem-ct-len(4 LE) ∥ ML-KEM-ciphertext ∥ crc32(4)`.
 - An **in-memory index** (`topic → ((guid . sn) → frame)`) is rebuilt on open; `put` is idempotent
@@ -686,9 +696,12 @@ records from a prior run could not be reopened. 3b adds a persisted **key-epoch*
   (byte-identical to prior behavior). The rewrite is via an atomic rename.
 - The crash path is fuzzed (random truncation/garbage/mid-file corruption of logs + `epochs.dat`,
   including a `(safety 0)` arm): open recovers with no crash/OOB/mis-decode and no nonce reuse.
-- **Caveat (follow-on):** file *contents* are `fdatasync`'d, but the *containing directory* is not —
-  a newly-created log / `epochs.dat` / the compaction rename relies on the parent-directory entry,
-  whose durability across a power loss needs a directory fsync (a §8.7 follow-on).
+- **Parent-directory fsync:** after every create/rename of a directory entry — a new log file,
+  `epochs.dat` creation, the compaction rename, a recovery truncate rename, and the `topics.map`
+  write — the containing directory is fsync'd via `dds.pal:fsync-directory` (`open(dir,O_RDONLY) +
+  fsync + close`), so the dirent survives a power loss (POSIX requires fsyncing the directory, not
+  just the file contents). The PAL seam is impl-agnostic (identical CFFI body on SBCL and Clasp; on
+  macOS `fsync` on a directory fd is valid).
 
 ### 8.5 Deployment requirement — OpenSSL ≥ 3.5
 
@@ -764,10 +777,19 @@ live exactly-once captured dir-a N=545, dir-b N=550)**;
 and `make-persistent-store-factory` accept `:history-kind`/`:history-depth` as factory defaults;
 `make-service-spec` carries `history-kind`/`history-depth` fields; `service-start` passes them to
 `store-open` — making the service-spec the single functional policy source in service mode;
-in-memory store applies online eviction on `store-put`; DARE intact; fuzz green; ADR 0029)**; online/threshold compaction; **parent-directory
-fsync** (durable directory entries for new files + the compaction rename across a power loss);
-**`:process`-mode PERSISTENT** (the store factory is not serialized across the process boundary —
-use `:thread` mode for the PERSISTENT tier); **log-level at-rest integrity** (a MAC'd log chain);
+in-memory store applies online eviction on `store-put`; DARE intact; fuzz green; ADR 0029)**; online/threshold compaction;
+**per-frame header integrity (RESOLVED — WP-DURABILITY-HARDENING-BATCH: on-disk frame v2 adds a
+header CRC over `magic..payload-len`, so a sub-cap length corruption is caught loud instead of
+mis-parsed as a torn tail; version-dispatched reader still reads v1; ADR 0026 §10.9)**;
+**parent-directory fsync (RESOLVED — WP-DURABILITY-HARDENING-BATCH: `dds.pal:fsync-directory` after
+every new-file / `epochs.dat` / compaction-rename / truncate-rename / `topics.map` dirent; ADR 0026
+§10.10)**;
+**`:process`-mode PERSISTENT (RESOLVED — WP-DURABILITY-HARDENING-BATCH: fail-fast — a `:process` spec
+with a non-memory store signals before launch instead of silently running the in-memory tier; use
+`:thread` mode for the PERSISTENT tier; ADR 0026 §10.11)**;
+**store dir `D` 0700 enforcement (RESOLVED — WP-DURABILITY-HARDENING-BATCH: `store-open` enforces
+0700 on `D` exactly as the key dir `K`, shared helper; ADR 0026 §10.12)**;
+**log-level at-rest integrity** (a MAC'd log chain — still open; a CRC is not a MAC);
 **graceful FFI teardown on signal (RESOLVED — ADR 0030, 2026-06-22; `kill -15` exits cleanly
 status 0, no SIGBUS, both impls; see §5.1)**;
 epoch-table retirement; **3c** metadata confidentiality; in-RAM plaintext minimization

@@ -168,6 +168,19 @@ The replay writer replays lifecycle records carrying `PID_ORIGINAL_WRITER_INFO` 
 - `PID_ENTITY_VIRTUAL_GUID (0x8002)` — deferred; see Task 8 below for `PID_SERVICE_KIND`.
 - Dynamic topic-add to a running service.
 - Pruning of the seen-set (dedup-map entries are per-GUID, control-plane; prune is a follow-up).
+  **RESOLVED** (WP-DURABILITY-HARDENING-BATCH) via a **bounded-capacity cap with fail-closed
+  refuse-new-origins** (`service.lisp` `*max-collect-origins*` / `%collect-admit-p`): the number of
+  distinct origin GUIDs is capped; AT cap a NEW origin is REFUSED (RESOURCE_LIMITS backpressure — not
+  stored, not relayed), while a tracked origin is always admitted. **Dedup-safety argument:** an
+  existing origin's LO watermark is NEVER evicted, so a re-presented already-delivered SN stays
+  seen-p=T — no double-delivery is possible. EVICTION (LRU) was deliberately rejected: evicting an
+  origin's watermark would let a later late-joining relay replay that origin's OLD samples and
+  re-deliver them (the double-delivery trap); a safe eviction would need to re-seed the watermark from
+  the durable store's per-origin high-water on re-admission, which for the DARE tier means DECRYPTING
+  every record on each first-sight — too costly. Cap + refuse-new is the fail-closed choice (drops a
+  new origin's samples rather than ever double-delivering). Test: `run-durability-origins-cap-test`.
+  **Follow-on (still open):** safe capacity-RECLAIM (unmatch-based prune with durable per-origin
+  high-water re-seed on re-admission) so a long-lived service can free departed origins' entries.
 - PERSISTENT store (disk + CNSA-2.0 DARE) — Phase 3.
 
 ---

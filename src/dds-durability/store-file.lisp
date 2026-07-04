@@ -3,8 +3,13 @@
 ;;; Task 1 — append-log-per-topic durable-store backend (WP-DURABILITY-PERSISTENT).
 ;;; Layout: D/topics/<topic-id>.log (topic-id = lowercase hex of topic UTF-8 bytes)
 ;;;         D/topics.map (topic-id -> topic-name, one line each)
-;;; Frame: magic(2) flags(1) guid(16) sn(8 LE) [key-hash(16)] payload-len(4 LE) payload crc32(4)
-;;; Stores OPAQUE payload bytes — unaware of DARE.
+;;; Frame v2: magic(1)=0xDA version(1)=0x02 flags(1) guid(16) sn(8 LE) [key-hash(16)]
+;;;           payload-len(4 LE) header-crc32(4 LE) payload frame-crc32(4 LE)
+;;; Frame v1 (legacy, read-only): magic(1)=0xDA version(1)=0x01 flags(1) guid(16) sn(8 LE)
+;;;           [key-hash(16)] payload-len(4 LE) payload frame-crc32(4 LE)   ; NO header-crc
+;;; The header-crc (over magic..payload-len) is validated BEFORE payload-len is trusted, so a
+;;; corrupt length is caught as :corrupt (fail loud) instead of masquerading as a torn tail
+;;; (ADR 0026 §10.9). Stores OPAQUE payload bytes — unaware of DARE.
 
 ;;; CRC-32 (IEEE 802.3 / PKZIP polynomial 0xEDB88320 — bit-reversed).
 ;;; Table-driven; 256-entry table built once at load time.
@@ -31,8 +36,16 @@
     (logxor crc #xFFFFFFFF)))
 
 ;;; Frame constants.
-(defconstant +magic-0+ #xDA "Frame magic byte 0.")
-(defconstant +magic-1+ #x01 "Frame magic byte 1.")
+(defconstant +magic-0+ #xDA "Frame magic byte 0 (fixed).")
+;;; Frame format version occupies the SECOND magic byte (was a fixed #x01). The reader dispatches
+;;; per-frame on it, so a single log may contain v1 frames (from a prior run) followed by v2 frames
+;;; (appended after upgrade) — mirrors the DARE envelope per-blob version byte (ADR 0025 §5).
+(defconstant +frame-version-v1+ #x01
+  "Frame format version 1 (legacy, NO header CRC). Read-only back-compat; never written now.")
+(defconstant +frame-version-v2+ #x02
+  "Frame format version 2: adds a CRC-32 header-integrity field immediately after payload-len, so a
+   corrupt LENGTH field is DETECTED (fail loud) instead of mis-parsed as a torn tail (ADR 0026 §10.9).
+   The sole version the store WRITES.")
 (defconstant +flag-kind-mask+     #x03 "Bits 0-1 of flags byte encode the change kind.")
 (defconstant +flag-key-hash-bit+  #x04 "Bit 2 of flags byte: key-hash present in frame.")
 
@@ -107,6 +120,11 @@
                (setf (aref hex (1+ i))  (char "0123456789abcdef" lo))))
     (coerce hex 'string)))
 
+(defun* %topics-dir (dir)
+    (function (pathname) pathname)
+  "Return the topics/ subdirectory pathname under the store root DIR (the dir that holds the logs)."
+  (merge-pathnames (make-pathname :directory '(:relative "topics")) dir))
+
 (defun* %topic-log-path (dir topic-id)
     (function (pathname string) pathname)
   "Return the path for the topic append-log given the store DIR and TOPIC-ID."
@@ -150,20 +168,24 @@
 
 ;;; Frame serialization.
 
-(defun* %frame-record (record)
-    (function (durable-record) (simple-array (unsigned-byte 8) (*)))
-  "Serialize RECORD into a complete frame (magic+flags+guid+sn+[kh]+plen+payload+crc32)."
-  (let* ((payload   (durable-record-payload record))
-         (key-hash  (durable-record-key-hash record))
-         (kh-p      (not (null key-hash)))
-         (plen      (length payload))
-         (base-len  (+ 2 1 16 8 4 plen 4))         ; magic+flags+guid+sn+plen+payload+crc
-         (frame-len (if kh-p (+ base-len 16) base-len))
-         (frame     (make-array frame-len :element-type '(unsigned-byte 8) :initial-element 0))
-         (flags     (logior (%kind->int (durable-record-kind record))
-                            (if kh-p +flag-key-hash-bit+ 0))))
+(defun* %frame-record-versioned (record version)
+    (function (durable-record (member #x01 #x02)) (simple-array (unsigned-byte 8) (*)))
+  "Serialize RECORD into a frame of format VERSION (#x01 = legacy no-header-CRC, read-only
+   back-compat used only by tests; #x02 = header-CRC after payload-len, the sole version the
+   store WRITES). v2 inserts a 4-byte CRC-32 over the header (magic..payload-len) between the
+   payload-len field and the payload; the trailing frame CRC still covers the whole frame. ADR 0026 §10.9."
+  (let* ((payload    (durable-record-payload record))
+         (key-hash   (durable-record-key-hash record))
+         (kh-p       (not (null key-hash)))
+         (hdr-crc-p  (= version +frame-version-v2+))
+         (plen       (length payload))
+         ;; magic+version(2) flags(1) guid(16) sn(8) [kh(16)] plen(4) [hdr-crc(4)] payload frame-crc(4)
+         (frame-len  (+ 2 1 16 8 (if kh-p 16 0) 4 (if hdr-crc-p 4 0) plen 4))
+         (frame      (make-array frame-len :element-type '(unsigned-byte 8) :initial-element 0))
+         (flags      (logior (%kind->int (durable-record-kind record))
+                             (if kh-p +flag-key-hash-bit+ 0))))
     (setf (aref frame 0) +magic-0+)
-    (setf (aref frame 1) +magic-1+)
+    (setf (aref frame 1) (the (unsigned-byte 8) version))
     (setf (aref frame 2) (the (unsigned-byte 8) flags))
     (replace frame (durable-record-writer-guid record) :start1 3 :end1 19)
     (%put-u64-le frame 19 (durable-record-sn record))
@@ -172,10 +194,20 @@
         (replace frame key-hash :start1 after-sn :end1 (+ after-sn 16))
         (incf after-sn 16))
       (%put-u32-le frame after-sn (the (unsigned-byte 32) plen))
-      (replace frame payload :start1 (+ after-sn 4) :end1 (+ after-sn 4 plen))
-      (let ((crc-offset (+ after-sn 4 plen)))
-        (%put-u32-le frame crc-offset (%crc32 frame 0 crc-offset))))
+      (let ((payload-off (+ after-sn 4)))
+        (when hdr-crc-p
+          ;; header CRC over [0 .. after-sn+4) = magic..payload-len; validated before plen is trusted
+          (%put-u32-le frame payload-off (%crc32 frame 0 payload-off))
+          (setf payload-off (+ after-sn 8)))
+        (replace frame payload :start1 payload-off :end1 (+ payload-off plen))
+        (let ((crc-offset (+ payload-off plen)))
+          (%put-u32-le frame crc-offset (%crc32 frame 0 crc-offset)))))
     frame))
+
+(defun* %frame-record (record)
+    (function (durable-record) (simple-array (unsigned-byte 8) (*)))
+  "Serialize RECORD into a complete v2 frame — the store writes only the current version (ADR 0026 §10.9)."
+  (%frame-record-versioned record +frame-version-v2+))
 
 ;;; Frame parsing for replay; returns (values record next-pos reason).
 ;;; reason: :ok on success; :short = insufficient bytes (torn tail); :corrupt = full bytes present but invalid.
@@ -183,66 +215,82 @@
 (defun* %parse-frame (buf start end topic)
     (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) string)
               (values (or null durable-record) (integer 0) (member :ok :short :corrupt)))
-  "Parse one frame from BUF[START..END) for TOPIC.
+  "Parse one frame (v1 or v2) from BUF[START..END) for TOPIC, dispatching on the version byte.
    Returns (values record next-pos :ok) on success.
    Returns (values nil start :short) when bytes from START to END are fewer than the full declared frame.
-   Returns (values nil start :corrupt) when the full frame is present but magic/kind/CRC is invalid."
+   Returns (values nil start :corrupt) when the full frame is present but magic/version/header-CRC/
+   kind/frame-CRC is invalid. A v2 bad HEADER CRC is :corrupt — a corrupt length is detected here
+   rather than mis-parsed as a torn tail (ADR 0026 §10.9); a torn write yields :short (fewer bytes),
+   never a bad header CRC, so the discrimination is clean."
   (let ((avail (- end start)))
     ;; Not enough bytes even for the minimum frame header → torn tail
     (when (< avail +frame-min-bytes+)
       (return-from %parse-frame (values nil start :short)))
     ;; Wrong magic with full header bytes available → corrupt
-    (unless (and (= (aref buf start) +magic-0+)
-                 (= (aref buf (1+ start)) +magic-1+))
+    (unless (= (aref buf start) +magic-0+)
       (return-from %parse-frame (values nil start :corrupt)))
-    (let* ((flags    (aref buf (+ start 2)))
-           (kh-p     (logbitp 2 flags))
-           (kind-int (logand flags +flag-kind-mask+))
-           (guid     (make-array 16 :element-type '(unsigned-byte 8)))
-           (sn-off   (+ start 19))
-           (kh-off   (+ start 27))
-           (plen-off (if kh-p (+ kh-off 16) kh-off))
-           (hdr-need (+ (- plen-off start) 4 4))) ; bytes needed up to plen field + empty payload + crc
-      ;; Not enough bytes to read the plen field → short (torn at header boundary)
-      (when (< avail hdr-need)
-        (return-from %parse-frame (values nil start :short)))
-      (replace guid buf :start2 (+ start 3) :end2 (+ start 19))
-      (let* ((sn         (%get-u64-le buf sn-off))
-             (kh         (when kh-p
-                           (let ((v (make-array 16 :element-type '(unsigned-byte 8))))
-                             (replace v buf :start2 kh-off :end2 (+ kh-off 16))
-                             v)))
-             (plen       (%get-u32-le buf plen-off))
-             (payload-off (+ plen-off 4))
-             (crc-off    (+ payload-off plen))
-             (frame-end  (+ crc-off 4)))
-        ;; Gross length-field corruption: a declared payload above the sanity cap is corrupt, not a
-        ;; torn tail. Checked BEFORE the frame-end>end test so an absurd plen fails loud rather than
-        ;; masquerading as an incomplete trailing write (which would silently truncate live data).
-        (when (> plen +frame-max-payload+)
-          (return-from %parse-frame (values nil start :corrupt)))
-        ;; Full declared frame does not fit in buffer → short (torn write)
-        (when (> frame-end end)
+    (let ((version (aref buf (1+ start))))
+      ;; Unknown version byte with the magic present → corrupt (fail loud, never silent-skip)
+      (unless (or (= version +frame-version-v1+) (= version +frame-version-v2+))
+        (return-from %parse-frame (values nil start :corrupt)))
+      (let* ((hdr-crc-p (= version +frame-version-v2+))
+             (flags     (aref buf (+ start 2)))
+             (kh-p      (logbitp 2 flags))
+             (kind-int  (logand flags +flag-kind-mask+))
+             (guid      (make-array 16 :element-type '(unsigned-byte 8)))
+             (sn-off    (+ start 19))
+             (kh-off    (+ start 27))
+             (plen-off  (if kh-p (+ kh-off 16) kh-off))
+             (hdr-crc-off (+ plen-off 4))                       ; v2 header CRC sits right after plen
+             (payload-off (if hdr-crc-p (+ hdr-crc-off 4) (+ plen-off 4)))
+             (hdr-need  (+ (- payload-off start) 4)))           ; bytes through header(+hdr-crc) + empty payload + frame-crc
+        ;; Not enough bytes to read the header (incl. v2 header-crc) → short (torn at header boundary)
+        (when (< avail hdr-need)
           (return-from %parse-frame (values nil start :short)))
-        ;; Full frame present; validate kind bits before CRC to keep :corrupt reason consistent
-        (let ((kind (%int->kind kind-int)))
-          (unless kind
+        (replace guid buf :start2 (+ start 3) :end2 (+ start 19))
+        ;; v2: validate the header CRC BEFORE trusting plen. A mismatch means header bytes are
+        ;; present but wrong — a clean truncating crash can only SHORTEN (→ :short above), never
+        ;; corrupt present header bytes; so a bad header CRC is genuine corruption → fail loud.
+        (when hdr-crc-p
+          (let ((stored-hdr (%get-u32-le buf hdr-crc-off))
+                (actual-hdr (%crc32 buf start hdr-crc-off)))
+            (unless (= stored-hdr actual-hdr)
+              (return-from %parse-frame (values nil start :corrupt)))))
+        (let* ((sn         (%get-u64-le buf sn-off))
+               (kh         (when kh-p
+                             (let ((v (make-array 16 :element-type '(unsigned-byte 8))))
+                               (replace v buf :start2 kh-off :end2 (+ kh-off 16))
+                               v)))
+               (plen       (%get-u32-le buf plen-off))
+               (crc-off    (+ payload-off plen))
+               (frame-end  (+ crc-off 4)))
+          ;; Gross length-field corruption: a declared payload above the sanity cap is corrupt, not a
+          ;; torn tail. (For v2 this is normally already caught by the header CRC; retained as the
+          ;; v1 backstop and defense-in-depth.) Checked BEFORE the frame-end>end test.
+          (when (> plen +frame-max-payload+)
             (return-from %parse-frame (values nil start :corrupt)))
-          (let ((stored-crc (%get-u32-le buf crc-off))
-                (actual-crc (%crc32 buf start crc-off)))
-            (unless (= stored-crc actual-crc)
+          ;; Full declared frame does not fit in buffer → short (torn write)
+          (when (> frame-end end)
+            (return-from %parse-frame (values nil start :short)))
+          ;; Full frame present; validate kind bits before CRC to keep :corrupt reason consistent
+          (let ((kind (%int->kind kind-int)))
+            (unless kind
               (return-from %parse-frame (values nil start :corrupt)))
-            (let ((payload (make-array plen :element-type '(unsigned-byte 8))))
-              (replace payload buf :start2 payload-off :end2 crc-off)
-              (values (make-durable-record
-                       :topic      topic
-                       :writer-guid guid
-                       :sn         sn
-                       :key-hash   kh
-                       :kind       kind
-                       :payload    payload)
-                      frame-end
-                      :ok))))))))
+            (let ((stored-crc (%get-u32-le buf crc-off))
+                  (actual-crc (%crc32 buf start crc-off)))
+              (unless (= stored-crc actual-crc)
+                (return-from %parse-frame (values nil start :corrupt)))
+              (let ((payload (make-array plen :element-type '(unsigned-byte 8))))
+                (replace payload buf :start2 payload-off :end2 crc-off)
+                (values (make-durable-record
+                         :topic      topic
+                         :writer-guid guid
+                         :sn         sn
+                         :key-hash   kh
+                         :kind       kind
+                         :payload    payload)
+                        frame-end
+                        :ok)))))))))
 
 ;;; Topics.map I/O.
 
@@ -254,6 +302,8 @@
     (maphash (lambda (id name)
                (format s "~a~c~a~%" id #\Tab name))
              topic-map))
+  ;; persist the topics.map dirent (create/replace) across power loss (ADR 0026 §10.10)
+  (dds.pal:fsync-directory dir)
   t)
 
 (defun* %read-topics-map (dir)
@@ -279,6 +329,8 @@
   (when (zerop offset)
     (with-open-file (s path :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
       (declare (ignore s)))
+    ;; persist the truncated (possibly re-created) dirent (ADR 0026 §10.10)
+    (dds.pal:fsync-directory (uiop:pathname-directory-pathname path))
     (return-from %truncate-file t))
   (let ((tmp (merge-pathnames (make-pathname :name (concatenate 'string (pathname-name path) ".tmp")
                                               :type (pathname-type path))
@@ -294,10 +346,14 @@
                        (when (zerop got) (return))
                        (write-sequence buf out :end got)
                        (decf remaining got))))
-          (finish-output out))))
+          ;; fsync the temp CONTENT before the rename so the durable rename never points at
+          ;; unsynced bytes (mirrors %rewrite-topic-log; ADR 0026 §10.10)
+          (dds.pal:fsync-stream out))))
     ;; delete destination first (rename-file is not atomic-replace on all platforms)
     (when (probe-file path) (delete-file path))
     (rename-file tmp path)
+    ;; fsync the containing dir so the delete+rename dirents survive power loss (ADR 0026 §10.10)
+    (dds.pal:fsync-directory (uiop:pathname-directory-pathname path))
     t))
 
 ;;; Replay one topic log, returning a list of durable-records.
@@ -417,6 +473,8 @@
         (write-sequence (%frame-record r) stm))
       (dds.pal:fsync-stream stm))
     (uiop:rename-file-overwriting-target tmp-path log-path)
+    ;; fsync the containing dir so the compaction rename's dirent survives power loss (ADR 0026 §10.10 / 0029)
+    (dds.pal:fsync-directory (%topics-dir dir))
     t))
 
 ;;; File-store make-file-store.
@@ -448,12 +506,17 @@
            (%ensure-stream (topic-id)
              (or (gethash topic-id streams)
                  (let* ((log-path (%topic-log-path store-dir topic-id))
+                        (existed  (probe-file log-path))
                         (s (open log-path
                                  :direction :output
                                  :element-type '(unsigned-byte 8)
                                  :if-exists :append
                                  :if-does-not-exist :create)))
                    (setf (gethash topic-id streams) s)
+                   ;; a NEW log file's dirent must be fsynced into topics/ to survive power loss
+                   ;; (ADR 0026 §10.10); a re-opened existing log needs no new dirent
+                   (unless existed
+                     (dds.pal:fsync-directory (%topics-dir store-dir)))
                    s)))
            (%record-key (writer-guid sn)
              (cons (coerce writer-guid 'list) sn)))
@@ -516,7 +579,10 @@
                    (remhash tid streams)))
                (let ((log-path (%topic-log-path store-dir tid)))
                  (when (probe-file log-path)
-                   (delete-file log-path)))
+                   (delete-file log-path)
+                   ;; fsync the unlink dirent so a purged topic cannot reappear after
+                   ;; power loss (ADR 0026 §10.10)
+                   (dds.pal:fsync-directory (%topics-dir store-dir))))
                (remhash tid outer)
                (remhash topic id-map)))
            t))
@@ -530,7 +596,14 @@
            (clrhash outer)
            (clrhash id-map)
            (clrhash streams)
-           (ensure-directories-exist (%topic-log-path store-dir "x"))
+           ;; enforce 0700 on the store dir D (holds cleartext frame metadata): chmod ONLY on first
+           ;; creation, then ALWAYS verify (fail-closed refuse on loose/unverifiable perms) — exactly
+           ;; the key-dir K discipline, one shared helper (DRY; ADR 0026 §10.12).
+           (let ((existed (uiop:directory-exists-p store-dir)))
+             (ensure-directories-exist (%topic-log-path store-dir "x"))
+             (unless existed
+               (dds.dare:enforce-directory-perms-0700 store-dir))
+             (dds.dare:assert-directory-perms-0700 store-dir))
            ;; read topics.map to resolve topic-ids back to names
            (let ((tmap (%read-topics-map store-dir)))
              ;; build reverse: id -> topic

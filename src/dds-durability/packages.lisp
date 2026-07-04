@@ -14,6 +14,7 @@
            #:durability-service-store #:durability-service-node #:durability-service-nodes
            #:durability-service-topic-names #:durability-service-spec
            #:*durability-error-hook* #:*durability-debug-start-fault*
+           #:*max-collect-origins*
            #:service-runner #:make-service-runner #:runner-start #:runner-stop #:runner-status
            #:service-runner-services
            #:supervisor #:make-supervisor #:supervisor-start #:supervisor-stop #:supervisor-shed-p

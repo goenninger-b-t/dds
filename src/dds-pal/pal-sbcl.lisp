@@ -272,3 +272,23 @@
                                (cffi:foreign-funcall "fdatasync" :int fd :int))))
       (error "dds.pal:fsync-stream: fdatasync(fd=~d) failed" fd)))
   t)
+
+(defun* fsync-directory (path)
+    (function ((or pathname string)) (eql t))
+  "Persist the DIRENT of a newly-created or renamed file: open(PATH, O_RDONLY), fsync(fd), close(fd).
+   POSIX requires fsyncing the CONTAINING DIRECTORY (not just the file contents) so a create/rename
+   survives a power loss (ADR 0026 §10.10 / §10.11, ADR 0029). The CFFI open/fsync/close path is
+   impl-agnostic (identical body in pal-clasp.lisp — no NFR-PORT split needed, unlike fsync-stream).
+   O_RDONLY = 0 on Linux and macOS. On macOS fsync(2) on a directory fd is valid and flushes the
+   dirent to the drive; F_FULLFSYNC (full platter flush) is a stronger guarantee not required here.
+   SIGNALS an error on open/fsync failure — a dirent flush the OS reports as failed must NOT be
+   reported as success (fail-closed, NFR-SEC-POSTURE)."
+  (let* ((native (uiop:native-namestring (uiop:ensure-directory-pathname path)))
+         (fd     (cffi:foreign-funcall "open" :string native :int 0 :int))) ; O_RDONLY = 0 (POSIX)
+    (when (minusp (the (signed-byte 32) fd))
+      (error "dds.pal:fsync-directory: open(~a, O_RDONLY) failed" native))
+    (unwind-protect
+         (when (minusp (the (signed-byte 32) (cffi:foreign-funcall "fsync" :int fd :int)))
+           (error "dds.pal:fsync-directory: fsync(fd=~d, ~a) failed" fd native))
+      (cffi:foreign-funcall "close" :int fd :int))
+    t))

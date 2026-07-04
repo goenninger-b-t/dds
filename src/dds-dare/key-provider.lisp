@@ -128,12 +128,40 @@
       (char/= (char mode-string 7) #\-)    ; other-read
       (char/= (char mode-string 8) #\-)))  ; other-write
 
+(defun* enforce-directory-perms-0700 (dir-path)
+    (function (pathname) t)
+  "Set directory DIR-PATH to 0700 (owner-only) via chmod. uiop:run-program is impl-agnostic
+   (no #+sbcl/#+clasp; the operating contract §4). Public seam so any directory holding sensitive
+   cleartext (the durability store dir D — cleartext frame metadata) gets the SAME 0700 enforcement
+   as the key dir K, reusing one mechanism (DRY; ADR 0026 §10.12)."
+  (uiop:run-program (list "chmod" "700" (uiop:native-namestring dir-path)))
+  t)
+
+(defun* assert-directory-perms-0700 (dir-path)
+    (function (pathname) t)
+  "Signal a clear error if DIR-PATH has any group/other read/write bit set, or if permissions
+   CANNOT BE VERIFIED (ls unavailable/unparseable). Fail-CLOSED: never proceed unless perms are
+   positively verified as tight (0700). Reuses %ls-mode-string / %perms-too-loose-p /
+   *perms-mode-reader* — the exact mechanism that guards the key dir K (DRY; ADR 0026 §10.12)."
+  (let* ((reader (or *perms-mode-reader* #'%ls-mode-string))
+         (mode   (funcall reader dir-path)))
+    (unless (and mode (>= (length mode) 9))
+      (error "durability store dir ~a: cannot verify permissions ~
+              (ls unavailable or output unparseable); refusing to open (fail-closed)"
+             dir-path))
+    (when (%perms-too-loose-p mode)
+      (error "durability store dir ~a has unsafe permissions (~a); refusing to open — ~
+              must be 0700 (no group or other read/write access)"
+             dir-path mode)))
+  t)
+
 (defun* %enforce-key-perms (priv-path dir-path)
     (function (pathname pathname) t)
   "Set private-key file to 0600 and key directory to 0700 via chmod.
-   uiop:run-program is impl-agnostic (no #+sbcl/#+clasp; the operating contract §4)."
+   uiop:run-program is impl-agnostic (no #+sbcl/#+clasp; the operating contract §4).
+   The 0700 directory step reuses ENFORCE-DIRECTORY-PERMS-0700 (DRY, shared with the store dir D)."
   (uiop:run-program (list "chmod" "600" (uiop:native-namestring priv-path)))
-  (uiop:run-program (list "chmod" "700" (uiop:native-namestring dir-path)))
+  (enforce-directory-perms-0700 dir-path)
   t)
 
 (defun* %assert-key-perms (priv-path)
