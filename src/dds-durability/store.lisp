@@ -27,7 +27,9 @@
   (close      nil     :type (or null function))
   (count-fn   nil     :type (or null function))
   ;; group-commit sync: called after each drain tick; NIL = no-op (memory store)
-  (sync       nil     :type (or null function)))
+  (sync       nil     :type (or null function))
+  ;; keyed log-MAC chain seam (ADR 0045): install a MAC oracle (data)->HMAC; NIL = feature absent
+  (set-chain-mac-fn nil :type (or null function)))
 
 ;;; Public dispatch functions — one slot read + funcall (no CLOS dispatch on the hot path).
 
@@ -90,6 +92,24 @@
   "Flush+fsync any buffered writes; no-op when the backing store has no :sync slot."
   (let ((f (durable-store-sync store)))
     (when f (funcall f)))
+  t)
+
+(defun* store-set-chain-mac-fn (store fn &optional required grandfather-set)
+    (function (durable-store (or null function) &optional t (or null hash-table)) (eql t))
+  "Install the keyed log-MAC chain oracle FN (data-octets)->HMAC-SHA-256 into STORE (ADR 0045),
+   or clear it with NIL. No-op when the backing store has no chain seam (memory / v1 encrypted).
+   The encrypted-store decorator calls this with a closure over its log-MAC key BEFORE it drives
+   store-open, so the inner file store's replay verifies and its puts write the chain — the file
+   store holds only the closure, never the key bytes (keyed-store-only, no key in make-file-store).
+   REQUIRED (ADR 0045 §3.2, downgrade defense): when true the store EXPECTS an active chain — a
+   non-empty topic log that replays to ZERO v3 frames (i.e. a full v3->v2 keyless downgrade) fails
+   the open loudly, BEFORE compaction. GRANDFATHER-SET (a hash-set of topic-ids, or NIL) names the
+   pre-existing legacy topics EXEMPT from that per-topic downgrade check (the authenticated set from
+   the anchor) — so a legacy multi-topic v2 store migrates without a false-REJECT of its dormant
+   topics; a fresh store's set is empty ⇒ every topic is chain-required. REQUIRED=NIL ⇒ no check
+   (fresh/pre-chain store)."
+  (let ((f (durable-store-set-chain-mac-fn store)))
+    (when f (funcall f fn required grandfather-set)))
   t)
 
 ;;; In-memory backing implementation.

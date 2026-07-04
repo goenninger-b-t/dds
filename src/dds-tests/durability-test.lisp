@@ -3269,6 +3269,312 @@
           (uiop:delete-directory-tree tmp :validate t))))
     t))
 
+(defun* run-durability-mac-chain-test ()
+    (function () t)
+  "WP-DURABILITY-MAC-LOG-CHAIN (ADR 0045): keyed running MAC chain over the durability at-rest log
+   makes interior delete/reorder/substitution/insertion tamper-EVIDENT at store-open (fail-closed).
+   (1) v3 round-trip: a keyed epoch store writes N, closes, reopens clean, replays N byte-exact.
+   (2) v3 frame-level: %frame-record-versioned/%parse-frame verify with the oracle; NO oracle (key
+       absent) and WRONG key both ⇒ :corrupt.
+   (3) interior tamper (the core value): DELETE / REORDER / SUBSTITUTE-with-recomputed-CRC / INSERT
+       each fail the store-open loudly; the untampered control opens clean (non-vacuous).
+   (4) cross-restart: write in epoch 1, reopen (epoch 2), append; the full chain across the epoch
+       boundary verifies, and tampering across the boundary is caught.
+   (5) key-absent fail-closed: a v3 store opened by a bare file store (no key) or with the wrong key
+       fails loud, never silently skipping verification.
+   (6) honest torn tail still truncate-recovers; malicious whole-frame tail truncation is the
+       DOCUMENTED deferred-anchor residual (ADR 0045 §7) — asserted here to remain undetected."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [durability-mac-chain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-mac-chain-test t)))
+  (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+        (dirs '())
+        (pay  (lambda (i)
+                (let ((v (make-array 8 :element-type '(unsigned-byte 8))))
+                  (dotimes (j 8 v) (setf (aref v j) (logand (+ (* i 16) j) #xFF)))))))
+    (labels ((%tmp (tag)
+               (let ((d (uiop:merge-pathnames*
+                         (make-pathname :directory
+                                        (list :relative (format nil "dds-mlc-~a-~a-~a"
+                                                                tag (get-universal-time)
+                                                                (random 1000000))))
+                         (uiop:temporary-directory))))
+                 (push d dirs)
+                 d))
+             (%mk (d k)
+               (dds.durability:make-encrypted-store
+                (dds.durability:make-file-store :dir d)
+                (dds.dare:make-file-key-provider :dir k)
+                :epoch-dir d))
+             (%tlog (d)
+               (merge-pathnames (make-pathname :directory '(:relative "topics")
+                                               :name (dds.durability::%topic->id "T") :type "log")
+                                d))
+             (%read (d)
+               (with-open-file (s (%tlog d) :element-type '(unsigned-byte 8))
+                 (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                   (read-sequence v s) v)))
+             (%write (d bytes)
+               (with-open-file (s (%tlog d) :direction :output :element-type '(unsigned-byte 8)
+                                            :if-exists :supersede)
+                 (write-sequence bytes s)))
+             (%put-n (d k n)
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dotimes (i n) (dds.durability:store-put s "T" g0 (1+ i) nil :data (funcall pay i)))
+                 (dds.durability:store-close s)))
+             (%open-errs-p (d k)
+               (let ((s (%mk d k)))
+                 (handler-case (progn (dds.durability:store-open s)
+                                      (ignore-errors (dds.durability:store-close s)) nil)
+                   (error () t)))))
+      (unwind-protect
+           (progn
+             ;; (1) v3 round-trip: 4 records, reopen clean, byte-exact
+             (let ((d (%tmp "rt-d")) (k (%tmp "rt-k")))
+               (%put-n d k 4)
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (let ((recs (dds.durability:store-get-range s "T")))
+                   (%check :mlc-rt-count (= 4 (length recs))
+                           (format nil "v3 round-trip: expected 4 records, got ~d" (length recs)))
+                   (%check :mlc-rt-bytes
+                           (loop for r in recs for i from 0
+                                 always (equalp (dds.durability:durable-record-payload r)
+                                                (funcall pay i)))
+                           "v3 round-trip: all payloads byte-exact after reopen+chain-verify"))
+                 (dds.durability:store-close s)))
+             ;; (2) v3 frame-level: verify with oracle; key-absent + wrong-key ⇒ :corrupt
+             (let* ((key   (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11))
+                    (wrong (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x22))
+                    (mac-fn   (lambda (data) (dds.dare:hmac-sha256 key data)))
+                    (wrong-fn (lambda (data) (dds.dare:hmac-sha256 wrong data)))
+                    (rec   (dds.durability::make-durable-record
+                            :topic "T" :writer-guid g0 :sn 1 :key-hash nil :kind :data
+                            :payload (funcall pay 3)))
+                    (seed  (dds.durability::%chain-seed mac-fn "T")))
+               (multiple-value-bind (frame mac)
+                   (dds.durability::%frame-record-versioned rec dds.durability::+frame-version-v3+
+                                                            seed mac-fn)
+                 (multiple-value-bind (r next reason fmac)
+                     (dds.durability::%parse-frame frame 0 (length frame) "T" mac-fn seed nil)
+                   (declare (ignore r next))
+                   (%check :mlc-v3-ok (eq reason :ok) "v3 frame must verify :ok with the oracle+seed")
+                   (%check :mlc-v3-mac (equalp fmac mac) "v3 parsed frame-mac equals the written MAC"))
+                 (multiple-value-bind (r next reason)
+                     (dds.durability::%parse-frame frame 0 (length frame) "T")
+                   (declare (ignore r next))
+                   (%check :mlc-v3-key-absent (eq reason :corrupt)
+                           "a v3 frame with NO oracle (key absent) must be :corrupt (fail closed)"))
+                 (multiple-value-bind (r next reason)
+                     (dds.durability::%parse-frame frame 0 (length frame) "T" wrong-fn
+                                                   (dds.durability::%chain-seed wrong-fn "T") nil)
+                   (declare (ignore r next))
+                   (%check :mlc-v3-wrong-key (eq reason :corrupt)
+                           "a v3 frame verified under the WRONG key must be :corrupt (fail closed)"))))
+             ;; (3) interior tamper — control opens clean, each tamper fails loud
+             (let ((d (%tmp "ctl-d")) (k (%tmp "ctl-k")))
+               (%put-n d k 3)
+               (%check :mlc-control-clean
+                       (let ((s (%mk d k)))
+                         (dds.durability:store-open s)
+                         (prog1 (= 3 (dds.durability:store-count s "T"))
+                           (dds.durability:store-close s)))
+                       "non-vacuous control: the untampered v3 log opens clean with 3 records")
+               (let* ((raw (%read d)) (len (length raw)))
+                 (%check :mlc-frame-uniform (zerop (mod len 3))
+                         "test setup: 3 equal-size v3 frames (uniform payload)")
+                 (let ((fs (truncate len 3)))
+                   ;; DELETE the interior frame 1
+                   (let ((dd (%tmp "del-d")) (dk (%tmp "del-k")))
+                     (%put-n dd dk 3)
+                     (%write dd (concatenate '(simple-array (unsigned-byte 8) (*))
+                                             (subseq (%read dd) 0 fs) (subseq (%read dd) (* 2 fs))))
+                     (%check :mlc-tamper-delete (%open-errs-p dd dk)
+                             "interior record DELETE must break the chain → store-open fails loud"))
+                   ;; REORDER frames 0 and 1
+                   (let ((dd (%tmp "reo-d")) (dk (%tmp "reo-k")))
+                     (%put-n dd dk 3)
+                     (let ((r (%read dd)))
+                       (%write dd (concatenate '(simple-array (unsigned-byte 8) (*))
+                                               (subseq r fs (* 2 fs)) (subseq r 0 fs)
+                                               (subseq r (* 2 fs)))))
+                     (%check :mlc-tamper-reorder (%open-errs-p dd dk)
+                             "record REORDER must break the chain → store-open fails loud"))
+                   ;; SUBSTITUTE frame 1's bytes — mutate a PAYLOAD byte (offset >= fs+35, PAST the
+                   ;; header-CRC coverage [fs,fs+31) and the header-CRC field), then recompute BOTH the
+                   ;; header CRC and the frame CRC (the disk adversary fixes every CRC). The ONLY gate
+                   ;; left is the keyed MAC — proving the MAC (not a CRC) catches the substitution.
+                   (let ((dd (%tmp "sub-d")) (dk (%tmp "sub-k")))
+                     (%put-n dd dk 3)
+                     (let* ((b (copy-seq (%read dd)))
+                            (hdr-off (+ fs 31))          ; frame 1's header-CRC field
+                            (crc-off (- (* 2 fs) 4)))    ; frame 1's frame-CRC field
+                       (setf (aref b (+ fs 35)) (logxor (aref b (+ fs 35)) #xFF))
+                       (dds.durability::%put-u32-le b hdr-off (dds.durability::%crc32 b fs hdr-off))
+                       (dds.durability::%put-u32-le b crc-off (dds.durability::%crc32 b fs crc-off))
+                       (%write dd b))
+                     (%check :mlc-tamper-substitute (%open-errs-p dd dk)
+                             "record SUBSTITUTION (BOTH CRCs recomputed) must fail the keyed MAC → store-open fails loud"))
+                   ;; INSERT a forged (duplicated) frame mid-chain
+                   (let ((dd (%tmp "ins-d")) (dk (%tmp "ins-k")))
+                     (%put-n dd dk 3)
+                     (let ((r (%read dd)))
+                       (%write dd (concatenate '(simple-array (unsigned-byte 8) (*))
+                                               (subseq r 0 fs) (subseq r 0 fs) (subseq r fs))))
+                     (%check :mlc-tamper-insert (%open-errs-p dd dk)
+                             "record INSERTION must break the chain → store-open fails loud"))
+                   ;; DOWNGRADE (C1 — the core bypass regression): rewrite EVERY v3 frame to a
+                   ;; keyless-VALID v2 frame (version byte->0x02, strip the 32-byte MAC, recompute the
+                   ;; header CRC over [.,+31) AND the trailing frame CRC). The whole log is byte-valid
+                   ;; v2 needing no key — but the store is chain-committed (anchor present), so the
+                   ;; open MUST fail loud (a non-empty chain-required log with zero v3 frames), BEFORE
+                   ;; any compaction could launder the tampered set into a fresh chain (ADR 0045 §3.2).
+                   (let ((dd (%tmp "dg-d")) (dk (%tmp "dg-k")))
+                     (%put-n dd dk 3)
+                     (let* ((raw  (%read dd))
+                            (plen (- fs 71))           ; v3 no-kh frame = 35 hdr + plen + 32 mac + 4 crc
+                            (body (+ 35 plen))          ; v2 no-kh frame prefix = header + payload
+                            (frames '()))
+                       (dotimes (i 3)
+                         (let* ((src (* i fs))
+                                (v2  (make-array (+ body 4) :element-type '(unsigned-byte 8))))
+                           (replace v2 raw :start1 0 :start2 src :end2 (+ src body))
+                           (setf (aref v2 1) dds.durability::+frame-version-v2+)
+                           (dds.durability::%put-u32-le v2 31 (dds.durability::%crc32 v2 0 31))
+                           (dds.durability::%put-u32-le v2 body (dds.durability::%crc32 v2 0 body))
+                           (push v2 frames)))
+                       (%write dd (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                                         (nreverse frames))))
+                     (%check :mlc-downgrade-fails-loud (%open-errs-p dd dk)
+                             "a full v3->v2 keyless downgrade of a chain-committed log MUST fail the open (C1)"))
+                   ;; migration guard (no false-REJECT): a legitimately mixed log — a v2 frame followed
+                   ;; by the real v3 frames (a v3 TAIL proves the chain is active) — still opens.
+                   (let ((dd (%tmp "mix-d")) (dk (%tmp "mix-k")))
+                     (%put-n dd dk 3)
+                     (let* ((v3log  (%read dd))
+                            (v2rec  (dds.durability::make-durable-record
+                                     :topic "T" :writer-guid g0 :sn 99 :key-hash nil :kind :data
+                                     :payload (funcall pay 5)))
+                            (v2frame (dds.durability::%frame-record-versioned
+                                      v2rec dds.durability::+frame-version-v2+)))
+                       (%write dd (concatenate '(simple-array (unsigned-byte 8) (*)) v2frame v3log)))
+                     (%check :mlc-mixed-v3-tail-opens (not (%open-errs-p dd dk))
+                             "a mixed v2-prefix + v3-tail log still opens (migration not false-rejected)")))))
+             ;; (4) cross-restart / epoch boundary
+             (let ((d (%tmp "xr-d")) (k (%tmp "xr-k")))
+               ;; run1: epoch 1, sn 1..2
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dotimes (i 2) (dds.durability:store-put s "T" g0 (1+ i) nil :data (funcall pay i)))
+                 (dds.durability:store-close s))
+               ;; run2: epoch 2, append sn 3..4
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dotimes (i 2) (dds.durability:store-put s "T" g0 (+ 3 i) nil :data (funcall pay (+ 2 i))))
+                 (dds.durability:store-close s))
+               ;; run3: the whole chain across the epoch boundary verifies
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (%check :mlc-xr-count (= 4 (dds.durability:store-count s "T"))
+                         (format nil "cross-restart: expected 4 records across the epoch boundary, got ~d"
+                                 (dds.durability:store-count s "T")))
+                 (dds.durability:store-close s))
+               ;; tamper an epoch-1 frame's PAYLOAD (past header-CRC coverage) + recompute BOTH CRCs →
+               ;; only the keyed MAC is left → chain break caught across the epoch boundary
+               (let* ((raw (%read d)) (fs (truncate (length raw) 4)) (b (copy-seq raw))
+                      (hdr-off (+ fs 31)) (crc-off (- (* 2 fs) 4)))
+                 (setf (aref b (+ fs 35)) (logxor (aref b (+ fs 35)) #xFF))
+                 (dds.durability::%put-u32-le b hdr-off (dds.durability::%crc32 b fs hdr-off))
+                 (dds.durability::%put-u32-le b crc-off (dds.durability::%crc32 b fs crc-off))
+                 (%write d b)
+                 (%check :mlc-xr-tamper (%open-errs-p d k)
+                         "tampering an epoch-1 frame (both CRCs fixed) is caught across the epoch boundary → fails loud")))
+             ;; (5) key-absent / wrong-key fail-closed at store-open
+             (let ((d (%tmp "ka-d")) (k (%tmp "ka-k")))
+               (%put-n d k 3)
+               (%check :mlc-key-absent-bare
+                       (let ((s (dds.durability:make-file-store :dir d)))
+                         (handler-case (progn (dds.durability:store-open s)
+                                              (ignore-errors (dds.durability:store-close s)) nil)
+                           (error () t)))
+                       "a v3 chain store opened by a bare file store (no key) must fail closed")
+               (let ((k2 (%tmp "ka-wrongk")))
+                 (%check :mlc-wrong-key-store (%open-errs-p d k2)
+                         "a v3 chain store opened with the WRONG key must fail closed")))
+             ;; (6) honest torn tail recovers; whole-frame tail truncation is the documented residual
+             (let ((d (%tmp "tt-d")) (k (%tmp "tt-k")))
+               (%put-n d k 3)
+               (let ((sz (length (%read d))))
+                 (dds.durability::%truncate-file (%tlog d) (- sz 4)))    ; tear the last frame's CRC
+               (%check :mlc-torn-recover
+                       (let ((s (%mk d k)))
+                         (dds.durability:store-open s)                   ; must NOT error
+                         (prog1 (= 2 (dds.durability:store-count s "T"))
+                           (dds.durability:store-close s)))
+                       "honest torn tail must truncate-recover to 2 records (no error)")
+               ;; residual (ADR 0045 §7): dropping a COMPLETE valid frame yields a shorter valid chain
+               (let ((fs (truncate (length (%read d)) 2)))
+                 (dds.durability::%truncate-file (%tlog d) fs)
+                 (%check :mlc-tail-truncation-residual
+                         (let ((s (%mk d k)))
+                           (dds.durability:store-open s)                 ; opens CLEAN — NOT detected
+                           (prog1 (= 1 (dds.durability:store-count s "T"))
+                             (dds.durability:store-close s)))
+                         "documented residual (ADR 0045 §7): malicious whole-frame tail truncation is NOT detected")))
+             ;; (7) multi-topic legacy coexistence (the review regression): a DORMANT legacy-v2 topic A
+             ;; (written by a bare file store, no anchor) + a born-chained v3 topic B in ONE store must
+             ;; reopen CLEAN — A is grandfathered (exempt), never false-rejected — while B still
+             ;; chain-verifies and a downgrade of B (non-grandfathered) still fails loud (ADR 0045 §3.2).
+             (let ((d (%tmp "mt-d")) (k (%tmp "mt-k")))
+               ;; topic A: a legacy v2 log (bare file store ⇒ no key, no anchor, v2 frame)
+               (let ((bare (dds.durability:make-file-store :dir d)))
+                 (dds.durability:store-open bare)
+                 (dds.durability:store-put bare "A" g0 1 nil :data (funcall pay 0))
+                 (dds.durability:store-close bare))
+               ;; epoch store: migration open (anchor absent), then B put mints anchor (gf = {A})
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dotimes (i 2) (dds.durability:store-put s "B" g0 (1+ i) nil :data (funcall pay (1+ i))))
+                 (dds.durability:store-close s))
+               (%check :mlc-multitopic-legacy-opens (not (%open-errs-p d k))
+                       "a dormant legacy-v2 topic A coexisting with a chained v3 topic B must reopen clean (no false-REJECT)")
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (let ((recs (dds.durability:store-get-range s "B")))
+                   (%check :mlc-multitopic-b-verified
+                           (and (= 2 (length recs))
+                                (equalp (funcall pay 1) (dds.durability:durable-record-payload (first recs))))
+                           "topic B chain-verifies + decrypts alongside the dormant legacy topic"))
+                 (dds.durability:store-close s))
+               ;; downgrade the born-chained topic B to keyless v2 (both CRCs fixed) → still fails loud
+               (let* ((blog (merge-pathnames (make-pathname :directory '(:relative "topics")
+                                                            :name (dds.durability::%topic->id "B") :type "log") d))
+                      (raw  (with-open-file (fin blog :element-type '(unsigned-byte 8))
+                              (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
+                                (read-sequence v fin) v)))
+                      (fs   (truncate (length raw) 2))
+                      (plen (- fs 71)) (body (+ 35 plen)) (frames '()))
+                 (dotimes (i 2)
+                   (let* ((src (* i fs)) (v2 (make-array (+ body 4) :element-type '(unsigned-byte 8))))
+                     (replace v2 raw :start1 0 :start2 src :end2 (+ src body))
+                     (setf (aref v2 1) dds.durability::+frame-version-v2+)
+                     (dds.durability::%put-u32-le v2 31 (dds.durability::%crc32 v2 0 31))
+                     (dds.durability::%put-u32-le v2 body (dds.durability::%crc32 v2 0 body))
+                     (push v2 frames)))
+                 (with-open-file (fout blog :direction :output :element-type '(unsigned-byte 8)
+                                            :if-exists :supersede)
+                   (write-sequence (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                                          (nreverse frames)) fout))
+                 (%check :mlc-multitopic-b-downgrade-fails (%open-errs-p d k)
+                         "downgrading the born-chained topic B to v2 fails the open even though legacy A is grandfathered (C1 held per-topic)"))))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))))
+  t)
+
 (defun* run-durability-store-dir-perms-test ()
     (function () t)
   "B4 (ADR 0026 §10.12): the store dir D is enforced/verified 0700, exactly like the key dir K.

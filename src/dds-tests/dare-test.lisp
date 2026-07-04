@@ -1202,7 +1202,16 @@
                        "epoch-1 and epoch-2 kem-ct must be DIFFERENT (distinct encapsulations)")))
 
            ;; (sec-b+c) cross-run epoch-id and intra-epoch nonce distinctness via a single ro open.
-           (let* ((fs-ro (dds.durability:make-file-store :dir d-dir)))
+           ;; The on-disk frames are now v3 (keyed chain, ADR 0045), so a plain read-only store must
+           ;; be given the chain MAC oracle (derived from the same key material) to open them —
+           ;; without it a v3 store fails closed at open (key-absent). This installs it exactly as the
+           ;; encrypted decorator does, then reads the still-sealed payload blobs for the assertions.
+           (let* ((kp-ro (dds.dare:make-file-key-provider :dir k-dir))
+                  (fs-ro (dds.durability:make-file-store :dir d-dir)))
+             (dds.dare:key-provider-open kp-ro)
+             (multiple-value-bind (key gf-ids)
+                 (dds.durability::%load-logmac-anchor kp-ro (uiop:ensure-directory-pathname d-dir))
+               (dds.durability::%install-logmac-oracle fs-ro key gf-ids))
              (dds.durability:store-open fs-ro)
              (let ((blobs (mapcar #'dds.durability:durable-record-payload
                                   (dds.durability:store-get-range fs-ro "Square"))))
@@ -1221,7 +1230,8 @@
                  (%check :pst-sec-intra-epoch-nonce-distinct
                          (not (equalp n1 n2))
                          "intra-epoch nonces for sn=1 and sn=2 must be DIFFERENT (counter increments)")))
-             (dds.durability:store-close fs-ro))
+             (dds.durability:store-close fs-ro)
+             (dds.dare:key-provider-close kp-ro))
 
            ;; --- RUN 3: re-open SAME D+K, BOTH runs' records open byte-exact (epoch 1 + 2 re-derived) ---
            (let* ((kp3  (dds.dare:make-file-key-provider :dir k-dir))
@@ -1297,25 +1307,40 @@
                             (equalp kh (dds.durability:durable-record-key-hash (first recs))))
                        "control: keyed record must round-trip byte-exact (key-hash in AAD, no regression)"))
              (dds.durability:store-close enc))
-           ;; TAMPER: flip a key-hash byte + recompute BOTH the header CRC and the frame CRC so the
-           ;; frame still parses — proving a CRC (which an on-disk adversary can recompute) is NOT a
-           ;; MAC; the key-hash binding is enforced by the AEAD AAD, not the CRCs. v2 keyed frame:
-           ;; magic(2)+flags(1)+guid(16)+sn(8)=27, key-hash 27..42, plen 43..46, header-crc 47..50,
-           ;; payload from 51, frame-crc at 51+plen (ADR 0026 §10.9).
+           ;; TAMPER: flip a key-hash byte, then recompute the header CRC, the v3 CHAIN MAC, AND the
+           ;; frame CRC so the frame passes every file-layer gate. Recomputing the chain MAC requires
+           ;; the log-MAC key (ADR 0045) — i.e. this simulates an adversary WITH the key (the
+           ;; authorized-writer layer), because a plain disk adversary who only recomputes CRCs is now
+           ;; caught by the chain at open (that path is the mac-chain SUBSTITUTE test). With the chain
+           ;; satisfied, the GCM AAD (%record-aad-v2) is the REMAINING guard binding key-hash — the
+           ;; original property this test proves. v3 keyed frame: magic(2)+flags(1)+guid(16)+sn(8)=27,
+           ;; key-hash 27..42, plen 43..46, header-crc 47..50, payload from 51, MAC at 51+plen (32 B),
+           ;; frame-crc at 51+plen+32 (ADR 0026 §10.9 + ADR 0045).
            (let* ((tid (dds.durability::%topic->id topic))
                   (log-path (merge-pathnames (make-pathname :directory '(:relative "topics") :name tid :type "log") d-dir))
                   (raw (with-open-file (fin log-path :element-type '(unsigned-byte 8))
                          (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
-                           (read-sequence v fin) v))))
+                           (read-sequence v fin) v)))
+                  (kp-t (dds.dare:make-file-key-provider :dir k-dir))
+                  (lk   (progn (dds.dare:key-provider-open kp-t)
+                               (dds.durability::%derive-logmac-key
+                                kp-t (uiop:ensure-directory-pathname d-dir))))
+                  (mac-fn (lambda (data) (dds.dare:hmac-sha256 lk data))))
              (setf (aref raw 27) (logxor (aref raw 27) #xFF))
              ;; recompute the header CRC (over [0,47), which now covers the flipped key-hash) …
              (dds.durability::%put-u32-le raw 47 (dds.durability::%crc32 raw 0 47))
              (let* ((plen    (dds.durability::%get-u32-le raw 43))
-                    (crc-off (+ 51 plen)))
-               ;; … and the trailing frame CRC, so the tampered frame passes both CRC gates
-               (dds.durability::%put-u32-le raw crc-off (dds.durability::%crc32 raw 0 crc-off))
+                    (mac-off (+ 51 plen))
+                    (seed    (dds.durability::%chain-seed mac-fn topic))    ; sole/first frame ⇒ prev = seed
+                    (mac     (dds.durability::%chain-mac mac-fn seed raw 0 mac-off)))
+               ;; … the chain MAC over the tampered prefix …
+               (replace raw mac :start1 mac-off :end1 (+ mac-off 32))
+               ;; … and the trailing frame CRC, so the tampered frame passes header-CRC + chain + frame-CRC
+               (dds.durability::%put-u32-le raw (+ mac-off 32) (dds.durability::%crc32 raw 0 (+ mac-off 32)))
                (with-open-file (fout log-path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
-                 (write-sequence raw fout))))
+                 (write-sequence raw fout)))
+             (dds.dare:free-secret-octets lk)
+             (dds.dare:key-provider-close kp-t))
            ;; RUN 2: reopen → frame parses (both CRCs valid) but key-hash is in the AAD → GCM fail → DROP
            (let* ((kp2  (dds.dare:make-file-key-provider :dir k-dir))
                   (fs2  (dds.durability:make-file-store :dir d-dir))

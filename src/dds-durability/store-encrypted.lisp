@@ -90,6 +90,201 @@
   "Return the epochs.dat pathname within the encrypted-store epoch directory DIR."
   (uiop:merge-pathnames* "epochs.dat" (uiop:ensure-directory-pathname dir)))
 
+;;; --- log-MAC anchor (ADR 0045 §3.2/§4.3): a persisted ML-KEM ciphertext whose DETERMINISTIC
+;;; decapsulation yields a cross-restart-stable secret for the durability log-MAC key, PLUS an
+;;; authenticated grandfather set (the pre-existing legacy topic-ids exempt from the downgrade
+;;; check). Format:  version(1)=#x01 ∥ ctlen(4 LE) ∥ kem-ct ∥ gf-count(4 LE) ∥ [idlen(4 LE) ∥ id]*
+;;;   ∥ gf-mac(32) ∥ crc32(4).  The gf-mac authenticates the SIGNED region (everything before it)
+;;; under the log-MAC key, so a disk adversary cannot forge/extend the exempt set to evade chaining.
+;;; Minted ONCE (first v3 put), never updated ⇒ crash-safe; a corrupt/forged anchor SIGNALS.
+
+(defconstant +logmac-anchor-version+ #x01
+  "Version byte of the DIR/logmac.anchor file (ADR 0045 §3.2).")
+(defconstant +logmac-gf-mac-len+ 32
+  "Width of the anchor's grandfather-set MAC (HMAC-SHA-256; ADR 0045 §3.2).")
+
+(defparameter %logmac-gf-label
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code "dds-dare/logmac/gf/v1")
+  "ASCII octets of the grandfather-set MAC domain label (ADR 0045 §3.2).")
+
+(defun* %logmac-anchor-path (dir)
+    (function (pathname) pathname)
+  "Return the logmac.anchor pathname within the encrypted-store epoch directory DIR."
+  (uiop:merge-pathnames* "logmac.anchor" (uiop:ensure-directory-pathname dir)))
+
+(defun* %topic-id-octets (id)
+    (function (string) (simple-array (unsigned-byte 8) (*)))
+  "ASCII octets of a topic-id (lowercase hex — always ASCII)."
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code id))
+
+(defun* %enumerate-nonempty-topic-ids (dir)
+    (function (pathname) list)
+  "Topic-ids (log basenames) of every NON-EMPTY *.log in DIR/topics/ — the pre-existing topics at
+   anchor-mint time. Because the anchor is minted on the first v3 put (anchor absent ⇒ no v3 frame
+   written yet), these logs are all legacy v1/v2 and form the grandfather set (ADR 0045 §3.2)."
+  (let ((tdir (%topics-dir dir))
+        (ids '()))
+    (when (uiop:directory-exists-p tdir)
+      (dolist (log (uiop:directory-files tdir "*.log"))
+        (when (plusp (with-open-file (s log :element-type '(unsigned-byte 8)) (file-length s)))
+          (push (pathname-name log) ids))))
+    ids))
+
+(defun* %assemble-anchor-signed (kem-ct grandfather-ids)
+    (function ((simple-array (unsigned-byte 8) (*)) list) (simple-array (unsigned-byte 8) (*)))
+  "Build the anchor's SIGNED region: version ∥ ctlen ∥ kem-ct ∥ gf-count ∥ [idlen ∥ id]* — the exact
+   byte range the grandfather-set MAC and the CRC cover (ADR 0045 §3.2)."
+  (let* ((ctlen  (length kem-ct))
+         (id-oct (mapcar #'%topic-id-octets grandfather-ids))
+         (gf-len (loop for o in id-oct sum (+ 4 (length o))))
+         (buf    (make-array (+ 5 ctlen 4 gf-len) :element-type '(unsigned-byte 8))))
+    (setf (aref buf 0) +logmac-anchor-version+)
+    (%put-u32-le buf 1 (the (unsigned-byte 32) ctlen))
+    (replace buf kem-ct :start1 5 :end1 (+ 5 ctlen))
+    (let ((off (+ 5 ctlen)))
+      (%put-u32-le buf off (the (unsigned-byte 32) (length id-oct)))
+      (incf off 4)
+      (dolist (o id-oct)
+        (%put-u32-le buf off (the (unsigned-byte 32) (length o)))
+        (incf off 4)
+        (replace buf o :start1 off :end1 (+ off (length o)))
+        (incf off (length o))))
+    buf))
+
+(defun* %compute-gf-mac (logmac-key signed)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "Authenticate the anchor's SIGNED region (kem-ct + grandfather set) under the log-MAC key so a disk
+   adversary cannot forge/extend the exempt set: HMAC-SHA-256(key, label ∥ signed) (ADR 0045 §3.2/§7)."
+  (let* ((ln    (length %logmac-gf-label))
+         (input (make-array (+ ln (length signed)) :element-type '(unsigned-byte 8))))
+    (replace input %logmac-gf-label :end1 ln)
+    (replace input signed :start1 ln)
+    (dds.dare:hmac-sha256 logmac-key input)))
+
+(defun* %write-logmac-anchor (dir signed gf-mac)
+    (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) t)
+  "Persist the anchor: SIGNED ∥ gf-mac(32) ∥ crc32(4), fsynced (open→write→fsync-stream, + dir fsync
+   when new) so it survives power loss (ADR 0045 §3.2)."
+  (let* ((slen  (length signed))
+         (entry (make-array (+ slen +logmac-gf-mac-len+ 4) :element-type '(unsigned-byte 8))))
+    (replace entry signed :end1 slen)
+    (replace entry gf-mac :start1 slen :end1 (+ slen +logmac-gf-mac-len+))
+    (let ((crc-off (+ slen +logmac-gf-mac-len+)))
+      (%put-u32-le entry crc-off (%crc32 entry 0 crc-off)))
+    (let* ((path (%logmac-anchor-path dir))
+           (existed (probe-file path)))
+      (ensure-directories-exist path)
+      (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                              :if-exists :supersede :if-does-not-exist :create)
+        (write-sequence entry s)
+        (dds.pal:fsync-stream s))
+      (unless existed
+        (dds.pal:fsync-directory (uiop:pathname-directory-pathname path)))))
+  t)
+
+(defun* %read-logmac-anchor (dir)
+    (function (pathname)
+              (values (or null (simple-array (unsigned-byte 8) (*))) list
+                      (or null (simple-array (unsigned-byte 8) (*)))
+                      (or null (simple-array (unsigned-byte 8) (*)))))
+  "Read DIR/logmac.anchor → (values kem-ct grandfather-ids gf-mac signed-bytes), or (NIL () NIL NIL) if
+   absent. A present-but-corrupt anchor (bad version/length/structure/crc) SIGNALS (fail loud — a
+   lost/garbled anchor must never silently disable verification; ADR 0045 §3.2). SIGNED-BYTES is the
+   region the caller re-MACs to authenticate the grandfather set."
+  (let ((path (%logmac-anchor-path dir)))
+    (unless (probe-file path)
+      (return-from %read-logmac-anchor (values nil '() nil nil)))
+    (let* ((size (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
+           (buf  (make-array size :element-type '(unsigned-byte 8))))
+      (with-open-file (s path :element-type '(unsigned-byte 8) :direction :input)
+        (read-sequence buf s))
+      (flet ((bad (why) (error "dds.durability: corrupt log-MAC anchor ~a (~a; ADR 0045 §3.2)" path why)))
+        (when (< size 13) (bad "truncated"))
+        (unless (= (aref buf 0) +logmac-anchor-version+) (bad "version"))
+        (let ((ctlen (%get-u32-le buf 1)))
+          (when (> ctlen +epochs-max-ctlen+) (bad "ctlen"))
+          (when (> (+ 5 ctlen 4) size) (bad "gf-count-oob"))
+          (let* ((gf-off   (+ 5 ctlen))
+                 (gf-count (%get-u32-le buf gf-off))
+                 (off      (+ gf-off 4))
+                 (ids      '()))
+            (when (> gf-count 1000000) (bad "gf-count"))
+            (dotimes (_ gf-count)
+              (when (> (+ off 4) size) (bad "gf-entry-oob"))
+              (let ((idlen (%get-u32-le buf off)))
+                (incf off 4)
+                (when (> (+ off idlen) size) (bad "gf-id-oob"))
+                (let ((id (make-array idlen :element-type '(unsigned-byte 8))))
+                  (replace id buf :start2 off :end2 (+ off idlen))
+                  (push (map 'string #'code-char id) ids))
+                (incf off idlen)))
+            (let* ((gf-mac-off off)
+                   (crc-off    (+ gf-mac-off +logmac-gf-mac-len+)))
+              (when (/= size (+ crc-off 4)) (bad "size"))
+              (let ((stored (%get-u32-le buf crc-off))
+                    (actual (%crc32 buf 0 crc-off)))
+                (unless (= stored actual) (bad "crc")))
+              (let ((kem-ct (make-array ctlen :element-type '(unsigned-byte 8)))
+                    (gf-mac (make-array +logmac-gf-mac-len+ :element-type '(unsigned-byte 8)))
+                    (signed (make-array gf-mac-off :element-type '(unsigned-byte 8))))
+                (replace kem-ct buf :start2 5 :end2 (+ 5 ctlen))
+                (replace gf-mac buf :start2 gf-mac-off :end2 crc-off)
+                (replace signed buf :start2 0 :end2 gf-mac-off)
+                (values kem-ct (nreverse ids) gf-mac signed)))))))))
+
+(defun* %mint-logmac-anchor (key-provider dir grandfather-ids)
+    (function (dds.dare:key-provider pathname list) (simple-array (unsigned-byte 8) (*)))
+  "Mint the log-MAC anchor ONCE (first v3 put): encapsulate to the recipient key, derive the log-MAC
+   key, authenticate GRANDFATHER-IDS (pre-existing legacy topic-ids, exempt from the downgrade check)
+   under that key, and persist (kem-ct + set + MAC). Returns the foreign log-MAC key (caller frees on
+   close). Written once, never updated ⇒ crash-safe, no migration burst (ADR 0045 §3.2)."
+  (let ((pub (dds.dare:key-provider-recipient-public-key key-provider)))
+    (multiple-value-bind (kem-ct ss) (dds.dare:ml-kem-1024-encapsulate pub)
+      (let ((key (unwind-protect (dds.dare:derive-log-mac-key ss)
+                   (dds.dare:free-secret-octets ss))))
+        (let* ((signed (%assemble-anchor-signed kem-ct grandfather-ids))
+               (gf-mac (%compute-gf-mac key signed)))
+          (%write-logmac-anchor dir signed gf-mac))
+        key))))
+
+(defun* %load-logmac-anchor (key-provider dir)
+    (function (dds.dare:key-provider pathname) (values (simple-array (unsigned-byte 8) (*)) list))
+  "Load an EXISTING anchor: decapsulate the kem-ct (deterministic ⇒ cross-restart-stable), derive the
+   log-MAC key, and VERIFY the grandfather-set MAC under it — a mismatch SIGNALS (a disk adversary
+   cannot forge/extend the exempt set; ADR 0045 §3.2). Returns (values logmac-key grandfather-ids)."
+  (multiple-value-bind (kem-ct gf-ids gf-mac signed) (%read-logmac-anchor dir)
+    (unless kem-ct
+      (error "dds.durability: log-MAC anchor missing in ~a" dir))
+    (let* ((ss  (dds.dare:key-provider-decapsulate key-provider kem-ct))
+           (key (unwind-protect (dds.dare:derive-log-mac-key ss)
+                  (dds.dare:free-secret-octets ss))))
+      (unless (equalp (%compute-gf-mac key signed) gf-mac)
+        (dds.dare:free-secret-octets key)
+        (error "dds.durability: log-MAC anchor grandfather-set MAC mismatch in ~a ~
+                (tamper — refusing to open; ADR 0045 §3.2)" dir))
+      (values key gf-ids))))
+
+(defun* %derive-logmac-key (key-provider dir)
+    (function (dds.dare:key-provider pathname) (simple-array (unsigned-byte 8) (*)))
+  "Derive the cross-restart-stable log-MAC key from DIR's EXISTING anchor — a thin wrapper over
+   %LOAD-LOGMAC-ANCHOR returning just the key (used by tests). Caller frees it (ADR 0045 §4.3)."
+  (values (%load-logmac-anchor key-provider dir)))
+
+(defun* %install-logmac-oracle (inner-store logmac-key grandfather-ids)
+    (function (durable-store (simple-array (unsigned-byte 8) (*)) list) t)
+  "Install the keyed chain MAC oracle (data)->HMAC-SHA-256(LOGMAC-KEY,data) into INNER-STORE, marking
+   the store CHAIN-REQUIRED with GRANDFATHER-IDS exempt (ADR 0045 §3.2). The oracle verifies every v3
+   frame; the downgrade check (a non-empty log that replays to zero v3 frames ⇒ fail) applies to every
+   topic EXCEPT the grandfathered legacy topic-ids. A fresh store has an EMPTY grandfather set ⇒ every
+   topic is chain-required (full protection). The closure captures the key; the file store holds only
+   it, never the key bytes."
+  (let ((k  logmac-key)
+        (gf (make-hash-table :test #'equal)))
+    (dolist (id grandfather-ids) (setf (gethash id gf) t))
+    (store-set-chain-mac-fn inner-store (lambda (data) (dds.dare:hmac-sha256 k data)) t gf))
+  t)
+
 (defun* %frame-epoch-entry (epoch-id kem-ct)
     (function ((unsigned-byte 32) (simple-array (unsigned-byte 8) (*)))
               (simple-array (unsigned-byte 8) (*)))
@@ -336,7 +531,9 @@
          (current-dek   nil)
          (max-epoch-id  0)
          (counter       0)
-         (err-count     0))
+         (err-count     0)
+         ;; cross-restart-stable durability log-MAC key (foreign secret, ADR 0045); freed on close
+         (logmac-key    nil))
     (flet ((%mint-current-epoch ()
              ;; lazily mint a fresh epoch on the first put of this run (caller holds LOCK).
              (let* ((pub    (dds.dare:key-provider-recipient-public-key key-provider))
@@ -354,12 +551,27 @@
                    (setf current-dek   dek)
                    (setf max-epoch-id  new-id)
                    (setf counter       0))))
+             t)
+           (%ensure-logmac ()
+             ;; lazily mint the log-MAC anchor + derive the key + install the oracle on the FIRST v3
+             ;; put of a not-yet-chained store (caller holds LOCK), so the first record is written v3
+             ;; and "anchor present" == "a v3 frame exists". The pre-existing NON-EMPTY topic logs at
+             ;; this moment (all legacy v1/v2, since anchor absent ⇒ no v3 written yet) are recorded as
+             ;; the authenticated GRANDFATHER SET — exempt from the downgrade check — so a legacy
+             ;; multi-topic v2 store migrates topic-by-topic WITHOUT a false-REJECT of its dormant
+             ;; legacy topics, while every born-chained (non-grandfathered) topic still fails a full
+             ;; v3->v2 downgrade. A fresh store has no such logs ⇒ empty set ⇒ full protection (§3.2).
+             (unless logmac-key
+               (let ((gf-ids (%enumerate-nonempty-topic-ids epoch-dir)))
+                 (setf logmac-key (%mint-logmac-anchor key-provider epoch-dir gf-ids))
+                 (%install-logmac-oracle inner-store logmac-key gf-ids)))
              t))
       (%make-durable-store
        :name :encrypted-persistent
        :put
        (lambda (topic writer-guid sn key-hash kind payload)
          (dds.pal:with-lock (lock)
+           (%ensure-logmac)
            (unless current-epoch
              (%mint-current-epoch))
            (incf counter)
@@ -406,14 +618,39 @@
        :open
        (lambda (history-kind history-depth)
          (dds.pal:with-lock (lock)
-           ;; delegate policy to the inner file-store so compaction-on-open uses the effective args
-           (store-open inner-store history-kind history-depth)
-           ;; defensive: a re-open must not leak prior-run DEKs (idempotent on empty); §6
+           ;; defensive: a re-open must not leak prior-run secrets (idempotent on empty/NIL); §6
            (%free-epoch-dek-map dek-map)
            (setf current-epoch nil)
            (setf current-dek   nil)
            (setf counter       0)
-           (dds.dare:key-provider-open key-provider)
+           (setf logmac-key    (dds.dare:free-secret-octets logmac-key))
+           ;; drop any prior-open oracle (it closes over the just-freed key); reinstalled below. This
+           ;; also makes a pathological "v3 frames but missing anchor" fail closed (no key) at replay,
+           ;; never a use-after-free (ADR 0045 fail-closed posture).
+           (store-set-chain-mac-fn inner-store nil)
+           ;; keyed log-MAC chain (ADR 0045). Ordering is perms-sensitive (the key-provider's key-dir
+           ;; may nest UNDER the store dir, so opening it before the file store enforces 0700 would
+           ;; create the store dir at a loose umask) AND downgrade-sensitive (§3.2):
+           ;;  - ANCHOR PRESENT ⇒ this store has already committed to the chain (a v3 frame was
+           ;;    written): dir is already 0700, so open the key-provider, derive the key + install the
+           ;;    oracle (CHAIN-REQUIRED) BEFORE store-open — its replay then verifies the v3 chain AND
+           ;;    rejects a full v3->v2 downgrade, fail-closed.
+           ;;  - ANCHOR ABSENT ⇒ fresh store OR a legacy Batch-B v2 store (no v3 frames yet): store-open
+           ;;    FIRST creates + enforces the 0700 dir and replays v1/v2 in MIGRATION mode (no oracle,
+           ;;    not chain-required — a legacy v2 log must never be false-rejected). The anchor is
+           ;;    minted lazily on the first v3 put (%ensure-logmac), keeping "anchor present" == "a v3
+           ;;    frame exists". (A store whose anchor was DELETED but still holds v3 frames fails here
+           ;;    at replay via key-absent, never opening as bogus migration.)
+           (if (probe-file (%logmac-anchor-path epoch-dir))
+               (multiple-value-bind (key gf-ids) (progn
+                                                   (dds.dare:key-provider-open key-provider)
+                                                   (%load-logmac-anchor key-provider epoch-dir))
+                 (setf logmac-key key)
+                 (%install-logmac-oracle inner-store key gf-ids)
+                 (store-open inner-store history-kind history-depth))
+               (progn
+                 (store-open inner-store history-kind history-depth)
+                 (dds.dare:key-provider-open key-provider)))
            ;; re-derive every persisted epoch's DEK; current stays NIL until the first put
            (setf max-epoch-id (%load-epoch-deks key-provider epoch-dir dek-map))
            t))
@@ -424,6 +661,9 @@
            (%free-epoch-dek-map dek-map)
            (setf current-epoch nil)
            (setf current-dek   nil)
+           ;; zeroize + free the foreign log-MAC key and drop the oracle (it points at freed bytes); §6
+           (setf logmac-key (dds.dare:free-secret-octets logmac-key))
+           (store-set-chain-mac-fn inner-store nil)
            (dds.dare:key-provider-close key-provider)
            ;; close the inner store last: flush + persist its streams/topics.map (spec §5)
            (store-close inner-store)

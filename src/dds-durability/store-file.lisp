@@ -45,7 +45,15 @@
 (defconstant +frame-version-v2+ #x02
   "Frame format version 2: adds a CRC-32 header-integrity field immediately after payload-len, so a
    corrupt LENGTH field is DETECTED (fail loud) instead of mis-parsed as a torn tail (ADR 0026 §10.9).
-   The sole version the store WRITES.")
+   The version the store writes when NO log-MAC chain is active.")
+(defconstant +frame-version-v3+ #x03
+  "Frame format version 3: v2 layout plus a 32-byte keyed HMAC-SHA-256 chain MAC between the payload
+   and the trailing frame-CRC (ADR 0045). MAC_i = HMAC(logmac-key, chain_{i-1} ∥ frame_i[0..mac-off)),
+   binding each frame to its predecessor so interior delete/reorder/substitution/insertion is
+   tamper-evident at store-open. Written ONLY when a chain MAC oracle is installed (keyed store); the
+   reader reads v1/v2/v3 per-frame (mixed logs legal). CRC = accidental detection; MAC = tamper.")
+(defconstant +frame-mac-len+ 32
+  "Width of the v3 frame chain-MAC field: HMAC-SHA-256 output length (FIPS 198-1; ADR 0045).")
 (defconstant +flag-kind-mask+     #x03 "Bits 0-1 of flags byte encode the change kind.")
 (defconstant +flag-key-hash-bit+  #x04 "Bit 2 of flags byte: key-hash present in frame.")
 
@@ -166,24 +174,70 @@
     (dotimes (i 4 v)
       (setf v (logior v (ash (aref vec (+ offset i)) (* 8 i)))))))
 
+;;; Keyed log-MAC chain (ADR 0045). The MAC oracle is a closure (data)->HMAC-SHA-256(logmac-key,data)
+;;; supplied by the encrypted-store decorator; the file store NEVER holds the key, only the oracle.
+
+(defparameter %logmac-seed-label
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code "dds-dare/logmac/seed/v1")
+  "ASCII octets of the per-topic chain-seed HKDF domain label (ADR 0045 §4.2).")
+
+(defun* %chain-mac-input (prev-mac buf start end)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))
+               (integer 0) (integer 0))
+              (simple-array (unsigned-byte 8) (*)))
+  "Assemble one v3 chain-link HMAC input: PREV-MAC (first +frame-mac-len+ bytes) ∥ BUF[START..END)."
+  (let* ((n   (- end start))
+         (out (make-array (+ +frame-mac-len+ n) :element-type '(unsigned-byte 8))))
+    (replace out prev-mac :end1 +frame-mac-len+ :end2 +frame-mac-len+)
+    (replace out buf :start1 +frame-mac-len+ :start2 start :end2 end)
+    out))
+
+(defun* %chain-mac (mac-fn prev-mac buf start mac-off)
+    (function (function (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))
+               (integer 0) (integer 0))
+              (simple-array (unsigned-byte 8) (*)))
+  "Compute the v3 chain MAC for the frame at BUF[START..MAC-OFF): MAC-FN(PREV-MAC ∥ frame-prefix)."
+  (funcall mac-fn (%chain-mac-input prev-mac buf start mac-off)))
+
+(defun* %chain-seed (mac-fn topic)
+    (function (function string) (simple-array (unsigned-byte 8) (*)))
+  "Per-topic keyed chain head: MAC-FN(label ∥ utf8(TOPIC)) (ADR 0045 §4.2). Binds each topic's chain
+   head to the topic identity + log-MAC key so another topic's valid log cannot be swapped in."
+  (let* ((tb    (%string->utf8 topic))
+         (ln    (length %logmac-seed-label))
+         (input (make-array (+ ln (length tb)) :element-type '(unsigned-byte 8))))
+    (replace input %logmac-seed-label :end1 ln)
+    (replace input tb :start1 ln)
+    (funcall mac-fn input)))
+
 ;;; Frame serialization.
 
-(defun* %frame-record-versioned (record version)
-    (function (durable-record (member #x01 #x02)) (simple-array (unsigned-byte 8) (*)))
-  "Serialize RECORD into a frame of format VERSION (#x01 = legacy no-header-CRC, read-only
-   back-compat used only by tests; #x02 = header-CRC after payload-len, the sole version the
-   store WRITES). v2 inserts a 4-byte CRC-32 over the header (magic..payload-len) between the
-   payload-len field and the payload; the trailing frame CRC still covers the whole frame. ADR 0026 §10.9."
+(defun* %frame-record-versioned (record version &optional prev-mac chain-mac-fn)
+    (function (durable-record (member #x01 #x02 #x03) &optional
+               (or null (simple-array (unsigned-byte 8) (*))) (or null function))
+              (values (simple-array (unsigned-byte 8) (*))
+                      (or null (simple-array (unsigned-byte 8) (*)))))
+  "Serialize RECORD into a frame of format VERSION, returning (values frame frame-mac).
+   #x01 = legacy no-header-CRC (read-only back-compat, tests only). #x02 = header-CRC after
+   payload-len (ADR 0026 §10.9). #x03 = v2 layout plus a 32-byte keyed chain MAC before the frame
+   CRC (ADR 0045); v3 REQUIRES PREV-MAC (the previous frame's chain MAC, or the per-topic seed for
+   the first) and CHAIN-MAC-FN (the HMAC oracle). FRAME-MAC is the frame's chain MAC for v3 (the
+   running state for the next frame), NIL for v1/v2. The header/frame CRCs are unchanged; the frame
+   CRC covers through the MAC field (CRC = accidental, MAC = tamper)."
   (let* ((payload    (durable-record-payload record))
          (key-hash   (durable-record-key-hash record))
          (kh-p       (not (null key-hash)))
-         (hdr-crc-p  (= version +frame-version-v2+))
+         (hdr-crc-p  (or (= version +frame-version-v2+) (= version +frame-version-v3+)))
+         (mac-p      (= version +frame-version-v3+))
          (plen       (length payload))
-         ;; magic+version(2) flags(1) guid(16) sn(8) [kh(16)] plen(4) [hdr-crc(4)] payload frame-crc(4)
-         (frame-len  (+ 2 1 16 8 (if kh-p 16 0) 4 (if hdr-crc-p 4 0) plen 4))
+         ;; magic+version(2) flags(1) guid(16) sn(8) [kh(16)] plen(4) [hdr-crc(4)] payload [mac(32)] frame-crc(4)
+         (frame-len  (+ 2 1 16 8 (if kh-p 16 0) 4 (if hdr-crc-p 4 0) plen (if mac-p +frame-mac-len+ 0) 4))
          (frame      (make-array frame-len :element-type '(unsigned-byte 8) :initial-element 0))
+         (frame-mac  nil)
          (flags      (logior (%kind->int (durable-record-kind record))
                              (if kh-p +flag-key-hash-bit+ 0))))
+    (when (and mac-p (or (null prev-mac) (null chain-mac-fn)))
+      (error "dds.durability: v3 frame serialization requires prev-mac + chain-mac-fn (ADR 0045)"))
     (setf (aref frame 0) +magic-0+)
     (setf (aref frame 1) (the (unsigned-byte 8) version))
     (setf (aref frame 2) (the (unsigned-byte 8) flags))
@@ -201,96 +255,125 @@
           (setf payload-off (+ after-sn 8)))
         (replace frame payload :start1 payload-off :end1 (+ payload-off plen))
         (let ((crc-offset (+ payload-off plen)))
+          (when mac-p
+            ;; chain MAC over prev-mac ∥ frame[0..mac-off); frame CRC (below) then covers it
+            (setf frame-mac (%chain-mac chain-mac-fn prev-mac frame 0 crc-offset))
+            (replace frame frame-mac :start1 crc-offset :end1 (+ crc-offset +frame-mac-len+))
+            (setf crc-offset (+ crc-offset +frame-mac-len+)))
           (%put-u32-le frame crc-offset (%crc32 frame 0 crc-offset)))))
-    frame))
+    (values frame frame-mac)))
 
 (defun* %frame-record (record)
     (function (durable-record) (simple-array (unsigned-byte 8) (*)))
-  "Serialize RECORD into a complete v2 frame — the store writes only the current version (ADR 0026 §10.9)."
-  (%frame-record-versioned record +frame-version-v2+))
+  "Serialize RECORD into a complete v2 frame (no chain MAC) — used when NO log-MAC chain is active."
+  (values (%frame-record-versioned record +frame-version-v2+)))
 
 ;;; Frame parsing for replay; returns (values record next-pos reason).
 ;;; reason: :ok on success; :short = insufficient bytes (torn tail); :corrupt = full bytes present but invalid.
 
-(defun* %parse-frame (buf start end topic)
-    (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) string)
-              (values (or null durable-record) (integer 0) (member :ok :short :corrupt)))
-  "Parse one frame (v1 or v2) from BUF[START..END) for TOPIC, dispatching on the version byte.
-   Returns (values record next-pos :ok) on success.
-   Returns (values nil start :short) when bytes from START to END are fewer than the full declared frame.
-   Returns (values nil start :corrupt) when the full frame is present but magic/version/header-CRC/
-   kind/frame-CRC is invalid. A v2 bad HEADER CRC is :corrupt — a corrupt length is detected here
-   rather than mis-parsed as a torn tail (ADR 0026 §10.9); a torn write yields :short (fewer bytes),
-   never a bad header CRC, so the discrimination is clean."
+(defun* %parse-frame (buf start end topic &optional chain-mac-fn prev-mac chain-started)
+    (function ((simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) string &optional
+               (or null function) (or null (simple-array (unsigned-byte 8) (*))) t)
+              (values (or null durable-record) (integer 0) (member :ok :short :corrupt)
+                      (or null (simple-array (unsigned-byte 8) (*)))))
+  "Parse one frame (v1/v2/v3) from BUF[START..END) for TOPIC, dispatching on the version byte.
+   Returns (values record next-pos :ok frame-mac) on success — FRAME-MAC is the v3 chain MAC (the
+   running state for the next frame) or NIL for v1/v2.
+   Returns (values nil start :short nil) when bytes from START to END are fewer than the full frame.
+   Returns (values nil start :corrupt nil) when the full frame is present but invalid.
+   A bad HEADER CRC / kind / frame CRC is :corrupt (a corrupt length is detected here rather than
+   mis-parsed as a torn tail; a clean truncating crash can only SHORTEN → :short — ADR 0026 §10.9).
+   v3 chain (ADR 0045): the frame's keyed HMAC is verified against CHAIN-MAC-FN(PREV-MAC ∥ prefix);
+   a mismatch is :corrupt (tamper). A v3 frame with NO CHAIN-MAC-FN/PREV-MAC is :corrupt (key
+   absent — a chain frame is never accepted unverified). Once the chain has started (CHAIN-STARTED),
+   a subsequent non-v3 frame is a chain break → :corrupt."
   (let ((avail (- end start)))
     ;; Not enough bytes even for the minimum frame header → torn tail
     (when (< avail +frame-min-bytes+)
-      (return-from %parse-frame (values nil start :short)))
+      (return-from %parse-frame (values nil start :short nil)))
     ;; Wrong magic with full header bytes available → corrupt
     (unless (= (aref buf start) +magic-0+)
-      (return-from %parse-frame (values nil start :corrupt)))
+      (return-from %parse-frame (values nil start :corrupt nil)))
     (let ((version (aref buf (1+ start))))
       ;; Unknown version byte with the magic present → corrupt (fail loud, never silent-skip)
-      (unless (or (= version +frame-version-v1+) (= version +frame-version-v2+))
-        (return-from %parse-frame (values nil start :corrupt)))
-      (let* ((hdr-crc-p (= version +frame-version-v2+))
-             (flags     (aref buf (+ start 2)))
-             (kh-p      (logbitp 2 flags))
-             (kind-int  (logand flags +flag-kind-mask+))
-             (guid      (make-array 16 :element-type '(unsigned-byte 8)))
-             (sn-off    (+ start 19))
-             (kh-off    (+ start 27))
-             (plen-off  (if kh-p (+ kh-off 16) kh-off))
-             (hdr-crc-off (+ plen-off 4))                       ; v2 header CRC sits right after plen
-             (payload-off (if hdr-crc-p (+ hdr-crc-off 4) (+ plen-off 4)))
-             (hdr-need  (+ (- payload-off start) 4)))           ; bytes through header(+hdr-crc) + empty payload + frame-crc
-        ;; Not enough bytes to read the header (incl. v2 header-crc) → short (torn at header boundary)
-        (when (< avail hdr-need)
-          (return-from %parse-frame (values nil start :short)))
-        (replace guid buf :start2 (+ start 3) :end2 (+ start 19))
-        ;; v2: validate the header CRC BEFORE trusting plen. A mismatch means header bytes are
-        ;; present but wrong — a clean truncating crash can only SHORTEN (→ :short above), never
-        ;; corrupt present header bytes; so a bad header CRC is genuine corruption → fail loud.
-        (when hdr-crc-p
-          (let ((stored-hdr (%get-u32-le buf hdr-crc-off))
-                (actual-hdr (%crc32 buf start hdr-crc-off)))
-            (unless (= stored-hdr actual-hdr)
-              (return-from %parse-frame (values nil start :corrupt)))))
-        (let* ((sn         (%get-u64-le buf sn-off))
-               (kh         (when kh-p
-                             (let ((v (make-array 16 :element-type '(unsigned-byte 8))))
-                               (replace v buf :start2 kh-off :end2 (+ kh-off 16))
-                               v)))
-               (plen       (%get-u32-le buf plen-off))
-               (crc-off    (+ payload-off plen))
-               (frame-end  (+ crc-off 4)))
-          ;; Gross length-field corruption: a declared payload above the sanity cap is corrupt, not a
-          ;; torn tail. (For v2 this is normally already caught by the header CRC; retained as the
-          ;; v1 backstop and defense-in-depth.) Checked BEFORE the frame-end>end test.
-          (when (> plen +frame-max-payload+)
-            (return-from %parse-frame (values nil start :corrupt)))
-          ;; Full declared frame does not fit in buffer → short (torn write)
-          (when (> frame-end end)
-            (return-from %parse-frame (values nil start :short)))
-          ;; Full frame present; validate kind bits before CRC to keep :corrupt reason consistent
-          (let ((kind (%int->kind kind-int)))
-            (unless kind
-              (return-from %parse-frame (values nil start :corrupt)))
-            (let ((stored-crc (%get-u32-le buf crc-off))
-                  (actual-crc (%crc32 buf start crc-off)))
-              (unless (= stored-crc actual-crc)
-                (return-from %parse-frame (values nil start :corrupt)))
-              (let ((payload (make-array plen :element-type '(unsigned-byte 8))))
-                (replace payload buf :start2 payload-off :end2 crc-off)
-                (values (make-durable-record
-                         :topic      topic
-                         :writer-guid guid
-                         :sn         sn
-                         :key-hash   kh
-                         :kind       kind
-                         :payload    payload)
-                        frame-end
-                        :ok)))))))))
+      (unless (or (= version +frame-version-v1+) (= version +frame-version-v2+)
+                  (= version +frame-version-v3+))
+        (return-from %parse-frame (values nil start :corrupt nil)))
+      (let* ((mac-p     (= version +frame-version-v3+))
+             (hdr-crc-p (or (= version +frame-version-v2+) mac-p)))
+        ;; Chain break: a non-v3 frame after the chain has started (an inserted/spliced pre-chain
+        ;; frame mid-chain, or a truncation-and-append with older framing) → fail loud (ADR 0045).
+        (when (and chain-started (not mac-p))
+          (return-from %parse-frame (values nil start :corrupt nil)))
+        ;; A v3 (chain) frame demands the key: no MAC oracle / no predecessor state ⇒ fail closed.
+        (when (and mac-p (or (null chain-mac-fn) (null prev-mac)))
+          (return-from %parse-frame (values nil start :corrupt nil)))
+        (let* ((flags     (aref buf (+ start 2)))
+               (kh-p      (logbitp 2 flags))
+               (kind-int  (logand flags +flag-kind-mask+))
+               (guid      (make-array 16 :element-type '(unsigned-byte 8)))
+               (sn-off    (+ start 19))
+               (kh-off    (+ start 27))
+               (plen-off  (if kh-p (+ kh-off 16) kh-off))
+               (hdr-crc-off (+ plen-off 4))                     ; v2/v3 header CRC sits right after plen
+               (payload-off (if hdr-crc-p (+ hdr-crc-off 4) (+ plen-off 4)))
+               (hdr-need  (+ (- payload-off start) 4)))         ; bytes through header(+hdr-crc)+empty payload+crc
+          ;; Not enough bytes to read the header (incl. header-crc) → short (torn at header boundary)
+          (when (< avail hdr-need)
+            (return-from %parse-frame (values nil start :short nil)))
+          (replace guid buf :start2 (+ start 3) :end2 (+ start 19))
+          ;; v2/v3: validate the header CRC BEFORE trusting plen (a mismatch is genuine corruption).
+          (when hdr-crc-p
+            (let ((stored-hdr (%get-u32-le buf hdr-crc-off))
+                  (actual-hdr (%crc32 buf start hdr-crc-off)))
+              (unless (= stored-hdr actual-hdr)
+                (return-from %parse-frame (values nil start :corrupt nil)))))
+          (let* ((sn         (%get-u64-le buf sn-off))
+                 (kh         (when kh-p
+                               (let ((v (make-array 16 :element-type '(unsigned-byte 8))))
+                                 (replace v buf :start2 kh-off :end2 (+ kh-off 16))
+                                 v)))
+                 (plen        (%get-u32-le buf plen-off))
+                 (payload-end (+ payload-off plen))             ; = mac-off for v3, = crc-off for v1/v2
+                 (mac-off     payload-end)
+                 (crc-off     (+ payload-end (if mac-p +frame-mac-len+ 0)))
+                 (frame-end   (+ crc-off 4)))
+            ;; Gross length-field corruption: declared payload above the sanity cap is corrupt.
+            (when (> plen +frame-max-payload+)
+              (return-from %parse-frame (values nil start :corrupt nil)))
+            ;; Full declared frame does not fit in buffer → short (torn write)
+            (when (> frame-end end)
+              (return-from %parse-frame (values nil start :short nil)))
+            ;; Full frame present; validate kind bits before CRC to keep :corrupt reason consistent
+            (let ((kind (%int->kind kind-int)))
+              (unless kind
+                (return-from %parse-frame (values nil start :corrupt nil)))
+              (let ((stored-crc (%get-u32-le buf crc-off))
+                    (actual-crc (%crc32 buf start crc-off)))
+                (unless (= stored-crc actual-crc)
+                  (return-from %parse-frame (values nil start :corrupt nil)))
+                ;; v3: verify the keyed chain MAC (the frame CRC above already passed, so a
+                ;; CRC-recomputing substitution adversary is caught HERE — a MAC forgery needs the key).
+                (let ((frame-mac nil))
+                  (when mac-p
+                    (let ((expected (%chain-mac chain-mac-fn prev-mac buf start mac-off))
+                          (stored   (make-array +frame-mac-len+ :element-type '(unsigned-byte 8))))
+                      (replace stored buf :start2 mac-off :end2 crc-off)
+                      (unless (equalp expected stored)
+                        (return-from %parse-frame (values nil start :corrupt nil)))
+                      (setf frame-mac stored)))
+                  (let ((payload (make-array plen :element-type '(unsigned-byte 8))))
+                    (replace payload buf :start2 payload-off :end2 payload-end)
+                    (values (make-durable-record
+                             :topic      topic
+                             :writer-guid guid
+                             :sn         sn
+                             :key-hash   kh
+                             :kind       kind
+                             :payload    payload)
+                            frame-end
+                            :ok
+                            frame-mac)))))))))))
 
 ;;; Topics.map I/O.
 
@@ -360,26 +443,43 @@
 ;;; :short at the tail → truncate to last-valid, recover.
 ;;; :corrupt anywhere → error (fail loud; never silently drop mid-file data).
 
-(defun* %replay-log (path topic)
-    (function (pathname string) list)
-  "Replay frames from PATH for TOPIC into a list of durable-records.
+(defun* %replay-log (path topic &optional chain-mac-fn chain-required)
+    (function (pathname string &optional (or null function) t)
+              (values list (or null (simple-array (unsigned-byte 8) (*)))))
+  "Replay frames from PATH for TOPIC into (values records tail-mac).
    A :short reason at the trailing position truncates to last-valid and recovers.
-   A :corrupt reason at any position signals an error (ADR 0026 §File-store on-disk format)."
+   A :corrupt reason at any position signals an error (ADR 0026 §File-store on-disk format).
+   When CHAIN-MAC-FN is supplied (keyed store, ADR 0045) the per-topic running chain MAC is verified:
+   the seed is the keyed per-topic head, each v3 frame's MAC is checked against its predecessor, and
+   TAIL-MAC is the last v3 frame's MAC (NIL if no v3 frame seen) — the running state the file store
+   carries into the next appended frame, so the chain is continuous across epochs/restarts.
+   When CHAIN-REQUIRED is true (ADR 0045 §3.2 downgrade defense) a non-empty log that replays to ZERO
+   v3 frames — a full v3->v2 keyless downgrade — SIGNALS (fail loud, before any compaction rewrite).
+   (A v2/v1 frame AFTER a v3 frame is already rejected mid-replay, so a v3-tail proves an active chain.)"
   (unless (probe-file path)
-    (return-from %replay-log '()))
+    (return-from %replay-log (values '() nil)))
   (let* ((size   (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
          (buf    (make-array size :element-type '(unsigned-byte 8)))
          (records '())
          (pos     0)
-         (last-valid 0))
+         (last-valid 0)
+         (seed    (when chain-mac-fn (%chain-seed chain-mac-fn topic)))
+         (running seed)                                        ; prev-mac for the next v3 frame
+         (started nil)
+         (tail-mac nil))
     (with-open-file (s path :element-type '(unsigned-byte 8) :direction :input)
       (read-sequence buf s))
     (loop
       (when (>= pos size) (return))
-      (multiple-value-bind (rec next reason) (%parse-frame buf pos size topic)
+      (multiple-value-bind (rec next reason frame-mac)
+          (%parse-frame buf pos size topic chain-mac-fn running started)
         (cond
           (rec
            (push rec records)
+           (when frame-mac                                     ; a v3 frame advances the chain
+             (setf running  frame-mac
+                   tail-mac frame-mac
+                   started  t))
            (setf last-valid next)
            (setf pos next))
           ;; :short → not enough bytes for the full declared frame; torn tail if at last-valid
@@ -387,14 +487,21 @@
            (when (< last-valid size)
              (%truncate-file path last-valid))
            (return))
-          ;; :corrupt → full frame bytes present but magic/kind/CRC invalid; fail loud
+          ;; :corrupt → full frame bytes present but magic/kind/CRC/MAC invalid; fail loud
           (t
            (error "dds.durability: mid-file corruption in ~a at offset ~d (last valid ~d; reason ~s)"
                   path pos last-valid reason)))))
     (when (and (zerop last-valid) (plusp size))
       ;; file had bytes but the very first frame was :short (all-garbage file) → truncate
       (%truncate-file path 0))
-    (nreverse records)))
+    ;; downgrade defense (ADR 0045 §3.2): a chain-committed store whose non-empty log carries NO v3
+    ;; frame has been rolled back to keyless v2 — refuse the open (like a mid-log chain break), and
+    ;; do it HERE so the caller's compaction rewrite can never launder the tampered set into a fresh chain.
+    (when (and chain-required records (not started))
+      (error "dds.durability: chain-required log ~a has ~d record(s) but NO v3 chain frame — ~
+              refusing to open (full v3->v2 downgrade / tamper; ADR 0045 §3.2)"
+             path (length records)))
+    (values (nreverse records) tail-mac)))
 
 ;;; Compaction: drop settled (dispose+unregister both present) instances.
 
@@ -455,27 +562,38 @@
           ;; :keep-all — pass 2 skipped; return settled-only result
           kept))))
 
-(defun* %rewrite-topic-log (dir tid records)
-    (function (pathname string list) (eql t))
-  "Atomically rewrite the log for TID under DIR with RECORDS.
+(defun* %rewrite-topic-log (dir tid records &optional chain-mac-fn topic)
+    (function (pathname string list &optional (or null function) (or null string))
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "Atomically rewrite the log for TID under DIR with RECORDS; return the new tail chain MAC (or NIL).
    Writes to <log>.tmp, fsyncs, then renames .tmp over the original in one atomic step
-   (uiop:rename-file-overwriting-target is POSIX rename(2) — no crash window)."
+   (uiop:rename-file-overwriting-target is POSIX rename(2) — no crash window).
+   When CHAIN-MAC-FN is supplied (keyed store, ADR 0045) the compacted records are re-emitted as a
+   FRESH v3 chain (re-seed from the per-topic keyed head, re-MAC each kept record in order) — an
+   authorized local rewrite an adversary without the key cannot forge; without it, byte-identical v2."
   (let* ((log-path (%topic-log-path dir tid))
          (tmp-path (merge-pathnames
                     (make-pathname :name (concatenate 'string tid ".tmp") :type "log")
-                    (merge-pathnames (make-pathname :directory '(:relative "topics")) dir))))
+                    (merge-pathnames (make-pathname :directory '(:relative "topics")) dir)))
+         (running  (when chain-mac-fn (%chain-seed chain-mac-fn (or topic tid))))
+         (tail-mac  nil))
     (with-open-file (stm tmp-path
                          :direction :output
                          :element-type '(unsigned-byte 8)
                          :if-exists :supersede
                          :if-does-not-exist :create)
       (dolist (r records)
-        (write-sequence (%frame-record r) stm))
+        (if chain-mac-fn
+            (multiple-value-bind (frame mac)
+                (%frame-record-versioned r +frame-version-v3+ running chain-mac-fn)
+              (write-sequence frame stm)
+              (setf running mac tail-mac mac))
+            (write-sequence (%frame-record r) stm)))
       (dds.pal:fsync-stream stm))
     (uiop:rename-file-overwriting-target tmp-path log-path)
     ;; fsync the containing dir so the compaction rename's dirent survives power loss (ADR 0026 §10.10 / 0029)
     (dds.pal:fsync-directory (%topics-dir dir))
-    t))
+    tail-mac))
 
 ;;; File-store make-file-store.
 
@@ -494,7 +612,18 @@
          (streams   (make-hash-table :test #'equal)) ; topic-id -> open output stream
          (id-map    (make-hash-table :test #'equal)) ; topic -> topic-id
          (lock      (dds.pal:make-lock "dds-file-store"))
-         (store-dir (when dir (pathname dir))))
+         (store-dir (when dir (pathname dir)))
+         ;; keyed log-MAC chain (ADR 0045): oracle closure installed by the encrypted decorator;
+         ;; NIL for a bare file store (no key ⇒ writes v2, and a v3 frame on replay fails loud).
+         (chain-mac-fn nil)
+         ;; chain-REQUIRED (ADR 0045 §3.2 downgrade defense): set by the decorator iff the log-MAC
+         ;; anchor is present. When true, a non-empty topic log that replays to ZERO v3 frames
+         ;; (a full v3->v2 keyless downgrade) fails the open loudly, before compaction.
+         (chain-required nil)
+         ;; grandfather set (ADR 0045 §3.2): topic-ids EXEMPT from the per-topic downgrade check
+         ;; (the pre-existing legacy topics recorded, authenticated, in the anchor). NIL = none.
+         (chain-grandfather nil)
+         (chain-macs   (make-hash-table :test #'equal))) ; topic-id -> running chain MAC (32 octets)
 
     (flet ((%inner (topic-id)
              (or (gethash topic-id outer)
@@ -538,9 +667,17 @@
                 (let* ((rec   (make-durable-record :topic topic :writer-guid writer-guid
                                                    :sn sn :key-hash key-hash
                                                    :kind kind :payload payload))
-                       (frame (%frame-record rec))
                        (stm   (%ensure-stream tid)))
-                  (write-sequence frame stm)
+                  (if chain-mac-fn
+                      ;; keyed store: write a v3 frame chained from this topic's running MAC
+                      ;; (seeded per topic on the first put), then advance the running state.
+                      (let ((prev (or (gethash tid chain-macs)
+                                      (%chain-seed chain-mac-fn topic))))
+                        (multiple-value-bind (frame mac)
+                            (%frame-record-versioned rec +frame-version-v3+ prev chain-mac-fn)
+                          (write-sequence frame stm)
+                          (setf (gethash tid chain-macs) mac)))
+                      (write-sequence (%frame-record rec) stm))
                   (finish-output stm)
                   (setf (gethash k inn) rec)
                   t))))))
@@ -596,6 +733,7 @@
            (clrhash outer)
            (clrhash id-map)
            (clrhash streams)
+           (clrhash chain-macs)          ; running chain state is rebuilt from disk on replay (ADR 0045)
            ;; enforce 0700 on the store dir D (holds cleartext frame metadata): chmod ONLY on first
            ;; creation, then ALWAYS verify (fail-closed refuse on loose/unverifiable perms) — exactly
            ;; the key-dir K discipline, one shared helper (DRY; ADR 0026 §10.12).
@@ -615,19 +753,29 @@
                  (when (uiop:directory-exists-p topics-dir)
                    (dolist (log-path (uiop:directory-files topics-dir "*.log"))
                      (let* ((tid   (pathname-name log-path))
-                            (topic (or (gethash tid id->topic) tid)))
-                       (let* ((recs      (%replay-log log-path topic))
-                              (compacted (%compact-topic-records recs eff-hk eff-hd)))
-                         ;; rewrite the log when compaction dropped at least one record
+                            (topic (or (gethash tid id->topic) tid))
+                            ;; per-topic downgrade guard: required unless this legacy topic is
+                            ;; grandfathered (exempt) by the authenticated anchor set (ADR 0045 §3.2)
+                            (topic-required (and chain-required
+                                                 (not (and chain-grandfather
+                                                           (gethash tid chain-grandfather))))))
+                       (multiple-value-bind (recs tail-mac)
+                           (%replay-log log-path topic chain-mac-fn topic-required) ; verifies + downgrade-guards
+                        (let ((compacted (%compact-topic-records recs eff-hk eff-hd)))
+                         ;; rewrite the log when compaction dropped at least one record (a keyed
+                         ;; rewrite re-emits a fresh v3 chain and returns its new tail MAC, ADR 0045)
                          (when (and recs (< (length compacted) (length recs)))
-                           (%rewrite-topic-log store-dir tid compacted))
+                           (setf tail-mac
+                                 (%rewrite-topic-log store-dir tid compacted chain-mac-fn topic)))
+                         ;; carry the replayed (or rewritten) tail into the running chain state
+                         (when tail-mac (setf (gethash tid chain-macs) tail-mac))
                          (when compacted
                            (setf (gethash topic id-map) tid)
                            (let ((inn (%inner tid)))
                              (dolist (r compacted)
                                (let ((k (%record-key (durable-record-writer-guid r)
                                                      (durable-record-sn r))))
-                                 (setf (gethash k inn) r)))))))))
+                                 (setf (gethash k inn) r))))))))))
                  ;; rebuild topics.map with any recovered topics
                  (when (plusp (hash-table-count id-map))
                    (let ((new-map (make-hash-table :test #'equal)))
@@ -670,7 +818,20 @@
                (let* ((tid (gethash topic id-map))
                       (inn (when tid (gethash tid outer))))
                  (if inn (hash-table-count inn) 0))
-               (%total-count))))))))
+               (%total-count))))
+
+       :set-chain-mac-fn
+       ;; keyed-store seam (ADR 0045): the encrypted decorator installs the log-MAC oracle here
+       ;; BEFORE it drives store-open, so replay verifies + writes chain with the key in hand.
+       ;; The file store holds only this closure, never the key bytes. REQUIRED (§3.2) marks the
+       ;; store as chain-committed so a full v3->v2 downgrade of a non-empty log fails the open;
+       ;; GRANDFATHER (a topic-id hash-set or NIL) names legacy topics exempt from that check.
+       (lambda (fn required grandfather)
+         (dds.pal:with-lock (lock)
+           (setf chain-mac-fn fn)
+           (setf chain-required required)
+           (setf chain-grandfather grandfather))
+         t)))))
 
 (defun* file-store-sync (store)
     (function (durable-store) (eql t))

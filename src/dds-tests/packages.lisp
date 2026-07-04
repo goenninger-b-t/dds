@@ -44,6 +44,7 @@
            #:run-durability-seen-prune-test
            #:run-durability-fsync-directory-test
            #:run-durability-frame-version-test
+           #:run-durability-mac-chain-test
            #:run-durability-store-dir-perms-test
            #:run-durability-process-persistent-refuse-test
            #:run-durability-origins-cap-test

@@ -644,18 +644,25 @@ To add a topic to an **already-running** service without a restart:
   topic UTF-8 bytes; a `D/topics.map` records the readable name).
 - Each record is a framed entry. The **second byte is the frame format version** (the reader
   dispatches per-frame, so one log may mix legacy and current frames):
-  - **v2 (current, the only version written)** — `magic(1)=DA ∥ version(1)=02 ∥ flags(1) ∥
-    writer-guid(16) ∥ sn(8 LE) ∥ [key-hash(16) if keyed] ∥ payload-len(4 LE) ∥ **header-crc32(4 LE)**
-    ∥ payload ∥ frame-crc32(4 LE)`. The **header CRC** (over `magic..payload-len`) is validated
-    **before** `payload-len` is trusted, so a corrupt length is detected as corruption (fail loud)
-    instead of masquerading as a torn tail (ADR 0026 §10.9).
+  - **v3 (written when the keyed MAC chain is active — the encrypted/epoch store)** — the v2 layout
+    plus a **32-byte keyed chain MAC** between the payload and the trailing frame CRC:
+    `… ∥ payload-len(4 LE) ∥ header-crc32(4 LE) ∥ payload ∥ **chain-mac(32)** ∥ frame-crc32(4 LE)`.
+    The MAC is `HMAC-SHA-256(logmac-key, prev-chain-MAC ∥ frame-prefix)`, chaining each frame to its
+    predecessor so interior delete/reorder/substitution/insertion is tamper-evident at store-open
+    (ADR 0045; see §8.5).
+  - **v2 (written when no chain is active — the plaintext file store)** — `magic(1)=DA ∥ version(1)=02
+    ∥ flags(1) ∥ writer-guid(16) ∥ sn(8 LE) ∥ [key-hash(16) if keyed] ∥ payload-len(4 LE) ∥
+    **header-crc32(4 LE)** ∥ payload ∥ frame-crc32(4 LE)`. The **header CRC** (over `magic..payload-len`)
+    is validated **before** `payload-len` is trusted, so a corrupt length is detected as corruption
+    (fail loud) instead of masquerading as a torn tail (ADR 0026 §10.9).
   - **v1 (legacy, read-only)** — `magic(1)=DA ∥ version(1)=01 ∥ … ∥ payload-len(4 LE) ∥ payload ∥
     frame-crc32(4 LE)` (no header CRC). The reader still reads it for back-compat.
   `flags` encodes the record kind (`:data`/`:dispose`/`:unregister`) + key-hash-present; both CRC32s
   use the reflected polynomial `0xEDB88320` (torn-write / length-corruption integrity checks, **not**
-  the security primitive — tamper detection is the GCM tag; a CRC an adversary can recompute is not a
-  MAC, so a MAC'd log chain is a recorded follow-on). The **`payload` is the encrypted-store's opaque
-  sealed blob** (which itself carries the epoch-id); the file store never parses or decrypts it.
+  the security primitive — a CRC an adversary can recompute is not a MAC). **Tamper-evidence** is the
+  GCM tag (per-frame payload+metadata authenticity) **plus** the v3 keyed chain (record-sequence
+  integrity — §8.5). The **`payload` is the encrypted-store's opaque sealed blob** (which itself
+  carries the epoch-id); the file store never parses or decrypts it.
 - `D/epochs.dat` — an append-only epoch table; each entry is
   `epoch-id(4 LE) ∥ kem-ct-len(4 LE) ∥ ML-KEM-ciphertext ∥ crc32(4)`.
 - An **in-memory index** (`topic → ((guid . sn) → frame)`) is rebuilt on open; `put` is idempotent
@@ -714,7 +721,58 @@ records from a prior run could not be reopened. 3b adds a persisted **key-epoch*
   just the file contents). The PAL seam is impl-agnostic (identical CFFI body on SBCL and Clasp; on
   macOS `fsync` on a directory fd is valid).
 
-### 8.5 Deployment requirement — OpenSSL ≥ 3.5
+### 8.5 Keyed MAC'd log chain — whole-record tamper-evidence (ADR 0045)
+
+The GCM tag authenticates each frame's payload + metadata **in isolation** — it does not authenticate
+the record **sequence**, so a disk-write adversary could delete, reorder, substitute, or insert whole
+records undetectably (a CRC is not a MAC — an adversary recomputes it). The **keyed running MAC chain**
+closes that gap for the **encrypted/epoch (keyed) store**:
+
+- **Chain construction.** Each v3 frame carries `MAC_i = HMAC-SHA-256(logmac-key, chain_{i-1} ∥
+  frame_i[0..mac-offset))`, where `chain_{i-1}` is the previous frame's MAC and `chain_0` is a
+  per-topic keyed seed `HMAC(logmac-key, "dds-dare/logmac/seed/v1" ∥ topic)`. Store-open replay
+  recomputes the chain in on-disk order; any mismatch → `:corrupt` → the open **fails loud**
+  (same fail-direction as a mid-file CRC). The per-topic seed also binds each topic's chain to its
+  identity, so swapping another topic's valid log into this topic's file is caught.
+- **Cross-restart-stable key.** `new-epoch-per-open` rotates the DEK every restart, so the log-MAC
+  key cannot be a DEK. It is derived from a **stable** secret: a dedicated ML-KEM **anchor ciphertext**
+  (`D/logmac.anchor`, minted once) whose **decapsulation is deterministic** (FIPS-203) ⇒ the same
+  secret every restart ⇒ `HKDF-SHA384(info="dds-dare/logmac/v1")` yields the same 32-byte key, while
+  it stays secret (only the recipient private key can decapsulate it). The key is foreign-backed and
+  zeroized on close, like the DEK. Because the key is epoch-independent and replay restores each
+  topic's running tail MAC, the chain is **continuous across epochs/restarts** — a restart boundary
+  is not a free break point (epoch *N+1*'s first frame chains from epoch *N*'s last).
+- **Keyed-store-only, fail-closed on key absence.** The plaintext `make-file-store` gets **no key** and
+  writes v2. A v3 (chain-expected) frame encountered **without** the key oracle — a bare store, or the
+  **wrong** key — fails the open loudly; verification is never silently skipped.
+- **Downgrade defense.** A per-frame MAC alone would be bypassable by rewriting **every** v3 frame back
+  to a keyless-valid v2 frame (strip the MAC, fix both CRCs) — a byte-valid v2 log needing no key. The
+  `logmac.anchor` file is the store's **chain commitment** (minted lazily on the first v3 put, so
+  *anchor present ⟺ a v3 frame was written*): a chain-committed topic whose **non-empty** log replays
+  to **zero** v3 frames **fails the open**, enforced **before** any compaction rewrite could launder
+  it. Enforcement is **per-topic** (each topic is its own log); to migrate a legacy **multi-topic** v2
+  store without false-rejecting a *dormant* legacy topic, the anchor also carries an **authenticated
+  grandfather set** — the topic-ids that were non-empty legacy logs at mint time — which are exempt
+  from the downgrade check (a topic is chain-required iff *anchor present* **and** *not grandfathered*).
+  The set is MAC-authenticated under the log-MAC key so a disk adversary can't forge/extend it; the
+  anchor is written once (crash-safe, no migration burst). Every born-chained topic (created after the
+  anchor is minted) is fully protected; a legacy Batch-B v2 store is never false-rejected. Caveat: the
+  grandfather set is enumerated from the mint-time on-disk logs, which are untrusted — an adversary who
+  pre-seeds fake v2 logs before mint gets them authenticated as exempt (no more capability than deleting
+  the anchor outright), closed only by the deferred sealed high-water anchor.
+- **Detected:** interior record **delete / reorder / substitution (even with both CRCs recomputed) /
+  insertion**, and **full-log v3→v2 downgrade** of any born-chained topic. **Deferred residuals (ADR
+  0045 §7):** a bare chain **cannot** detect **whole-tail truncation** of a valid prefix (the shorter
+  log is itself a valid chain) — honest torn tails still truncate-recover; detecting *malicious* tail
+  truncation, the combined anchor-deletion-plus-full-downgrade vector, or a full rollback of a
+  *grandfathered* legacy topic, needs a separable **sealed high-water anchor** (documented, deferred).
+  The `epochs.dat` MAC is likewise deferred. Cost is off the sample hot path (one HMAC per put / per
+  frame at open). Verified by `run-durability-mac-chain-test` (round-trip; v1/v2/v3 read; the four
+  interior tampers with a non-vacuous control; the v3→v2 downgrade fails loud while a v3-tail migration
+  log opens; **multi-topic legacy coexistence — a dormant legacy topic opens while a born-chained topic
+  verifies and its downgrade fails**; cross-restart; key-absent/wrong-key; torn-tail + its residual).
+
+### 8.6 Deployment requirement — OpenSSL ≥ 3.5
 
 The PERSISTENT tier is **always DARE-wrapped**, so the §7.3 deployment requirement applies in full:
 **OpenSSL ≥ 3.5 (`libcrypto`) is a hard runtime requirement** (ML-KEM landed in the 3.5 LTS),
@@ -776,9 +834,11 @@ coexistence with a persistence service that does NOT emit standard OWI on its re
 
 PERSISTENT 3b protects **stored payloads on disk**: **confidentiality** (sealed) + **per-record
 authenticity** of the payload AND its AAD-bound metadata (topic/guid/sn/kind/key-hash) — any flipped
-byte fails the GCM tag, fail-closed — and it survives restart. It does **not** provide **log-level
-integrity** (a disk-write adversary can delete/reorder/truncate whole records undetectably — there is
-no MAC'd log chain) nor metadata **confidentiality** (metadata is cleartext on disk). The follow-ons
+byte fails the GCM tag, fail-closed — and it survives restart. It provides **record-sequence
+integrity** via the keyed v3 MAC chain (§8.5): interior delete/reorder/substitution/insertion are
+tamper-evident at store-open. It does **not** yet detect **malicious whole-tail truncation** (the
+deferred sealed-anchor residual, ADR 0045 §7) nor provide metadata **confidentiality** (metadata is
+cleartext on disk). The follow-ons
 (ADR 0026 §10 / ADR 0025 §10): cross-vendor coexistence dedup **(RESOLVED — ADR 0027: RTI PS uses
 standard OWI on its retained-history replay, so no vendor PID is needed; the configurable
 `:relay-durability`/`:collect-durability` tiers landed; ADR 0027 §follow-on 1 RESOLVED — ADR 0028:
@@ -800,7 +860,10 @@ with a non-memory store signals before launch instead of silently running the in
 `:thread` mode for the PERSISTENT tier; ADR 0026 §10.11)**;
 **store dir `D` 0700 enforcement (RESOLVED — WP-DURABILITY-HARDENING-BATCH: `store-open` enforces
 0700 on `D` exactly as the key dir `K`, shared helper; ADR 0026 §10.12)**;
-**log-level at-rest integrity** (a MAC'd log chain — still open; a CRC is not a MAC);
+**log-level at-rest integrity — keyed MAC'd log chain (RESOLVED — WP-DURABILITY-MAC-LOG-CHAIN,
+ADR 0045: v3 frames carry an HMAC-SHA-256 chain keyed by a cross-restart-stable anchor-derived key;
+interior delete/reorder/substitution/insertion tamper-evident at store-open, fail-closed; keyed-store-
+only; malicious whole-tail truncation + `epochs.dat` MAC deferred residuals, §8.5)**;
 **graceful FFI teardown on signal (RESOLVED — ADR 0030, 2026-06-22; `kill -15` exits cleanly
 status 0, no SIGBUS, both impls; see §5.1)**;
 epoch-table retirement; **3c** metadata confidentiality; in-RAM plaintext minimization

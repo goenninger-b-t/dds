@@ -40,6 +40,41 @@
   (or *dek-info-octets*
       (setf *dek-info-octets* (%ascii +dek-info-str+))))
 
+(defconstant +logmac-info-str+
+  (if (boundp '+logmac-info-str+) (symbol-value '+logmac-info-str+) "dds-dare/logmac/v1")
+  "HKDF-SHA384 info label for durability log-MAC-key derivation (ASCII, pinned; change = new
+   format version). Distinct domain separator from +dek-info-str+ so the log-MAC key is
+   cryptographically independent of every DEK (ADR 0045 §4.3). Same reload-safe boundp guard
+   as +dek-info-str+ (DEFCONSTANT-UNEQL — strings are not self-eql — identical SBCL/Clasp).")
+
+(defvar *logmac-info-octets* nil
+  "Cached octet vector for +logmac-info-str+, built lazily on first use.")
+
+(defun* %logmac-info ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "Return (and cache) the HKDF info octet vector for log-MAC-key derivation."
+  (or *logmac-info-octets*
+      (setf *logmac-info-octets* (%ascii +logmac-info-str+))))
+
+(defun* derive-log-mac-key (shared-secret)
+    (function ((simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "Derive a 32-byte durability log-MAC (HMAC-SHA-256) key from a cross-restart-STABLE ML-KEM
+   shared secret via HKDF-SHA384 (ADR 0045 §4.3). Computes
+   HKDF(SHA-384, ikm=SHARED-SECRET, salt=∅, info=ASCII(+logmac-info-str+), L=32).
+   The stable secret is obtained by decapsulating a persisted anchor ciphertext — ML-KEM
+   decapsulation is deterministic in (private-key, ciphertext) (FIPS-203), so a fixed anchor
+   yields the same key on every restart while the key stays secret (only the private key
+   decapsulates it). Mirrors DERIVE-DEK but with a distinct info label so the log-MAC key is
+   independent of the DEK. The key is a foreign-backed secret buffer (static-vector, design
+   spec §6) that never transits a GC-heap array; the caller (the encrypted-store) holds it for
+   the store lifetime and MUST release it with FREE-SECRET-OCTETS on close."
+  (%hkdf-sha384-into shared-secret
+                     (make-array 0 :element-type '(unsigned-byte 8))
+                     (%logmac-info)
+                     32
+                     t))
+
 (defun* derive-dek (shared-secret)
     (function ((simple-array (unsigned-byte 8) (*)))
               (simple-array (unsigned-byte 8) (*)))

@@ -23,6 +23,8 @@
    #:ml-kem-1024-decapsulate
    ;; Task 4: KEM-DEM envelope (v1)
    #:derive-dek
+   ;; WP-DURABILITY-MAC-LOG-CHAIN (ADR 0045): cross-restart-stable log-MAC key derivation
+   #:derive-log-mac-key
    #:seal-payload
    #:open-payload
    #:make-record-aad

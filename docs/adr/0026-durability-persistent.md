@@ -386,9 +386,19 @@ own vertical slice:
    corruption there remains tail-ambiguous) — safe because the ordering invariant appends+fsyncs the
    epoch entry BEFORE any record references it, so a torn-tail truncation there never orphans a
    referenced epoch.
-   **Follow-on (still open):** the **MAC'd log chain** (a CRC is not a MAC — a disk-write adversary who
-   recomputes the CRC still can't forge a DARE payload, but can delete/reorder whole records
-   undetectably; a keyed log chain or sealed/independent index closes that).
+   **Follow-on — RESOLVED** (WP-DURABILITY-MAC-LOG-CHAIN, **ADR 0045**): the **MAC'd log chain**. A
+   CRC is not a MAC, so a disk-write adversary who recomputes the CRC can delete/reorder/substitute/
+   insert whole records undetectably. ADR 0045 adds a **keyed running HMAC-SHA-256 chain** over the
+   per-topic v3 frame sequence (each frame's MAC covers `prev-chain-MAC ∥ frame-prefix`), keyed by a
+   **cross-restart-stable** log-MAC key derived from the recipient key material via a persisted,
+   deterministically-decapsulated anchor ciphertext. Interior delete/reorder/substitution/insertion
+   is now tamper-EVIDENT at store-open (fail-closed, `:corrupt` parity); keyed-store-only (the encrypted
+   epoch store), with a bare/wrong-key open failing closed. Tests: `run-durability-mac-chain-test`
+   (+ the adapted `run-dare-keyhash-aad-test` / `run-dare-persistent-store-test`).
+   **Deferred residuals (ADR 0045 §7):** (a) **whole-tail truncation** — a bare chain provably cannot
+   detect truncation of a valid prefix; needs a separable sealed high-water ANCHOR (documented,
+   deferred). (b) The **`epochs.dat` MAC** stays deferred (entry-CRC-only; the cross-epoch chain
+   linkage rides the frame chain, not a new `epochs.dat` MAC).
 10. **Parent-directory fsync** — **RESOLVED** (WP-DURABILITY-HARDENING-BATCH). New PAL seam
     `dds.pal:fsync-directory (path)` — `open(dir,O_RDONLY)+fsync+close` via CFFI, impl-agnostic
     (identical body on SBCL and Clasp — a raw directory fd, no NFR-PORT split; macOS `fsync` on a dir
