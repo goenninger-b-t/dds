@@ -2477,24 +2477,34 @@
   "Reader side: apply the HEARTBEAT's available range, then answer with an ACKNACK
    (acking received SNs, NACKing the rest) to each peer (uses rx-tx-msg). The reliable reader-proxy is
    keyed by the remote writer's FULL 16-octet GUID (SRC-PREFIX + WID, §9.4.4 / §9.3.1.2) so two writers
-   sharing EntityId 0x102 across participants keep independent received-SN / ACKNACK state (§8.3.5.4)."
+   sharing EntityId 0x102 across participants keep independent received-SN / ACKNACK state (§8.3.5.4).
+   WP-ACKNACK-MATCH-GATE (RTPS 2.5 §8.4.10.1; DDS 1.4 §2.2.3.4): the HEARTBEAT is applied and answered ONLY
+   for a MATCHED writer (%guid-matched-p) — a pre-match HEARTBEAT (a periodic user HEARTBEAT arriving before
+   the reader has processed the writer's SEDP publication) must NOT create a WriterProxy with skip-history NIL
+   nor NACK the full [1..N] pre-join range before the on-match durability baseline is armed (which would let a
+   VOLATILE late-joiner wrongly pull a retaining writer's pre-match history); it is DROPPED and the writer's
+   next periodic HEARTBEAT re-arrives post-match, when the correct durability baseline applies (VOLATILE
+   baselines at the writer's current lastSN; TRANSIENT_LOCAL still requests the retained history)."
   (multiple-value-bind (rid wid first last count finalp livep)
       (dds.rtps.message:parse-heartbeat-body c flags)
     (declare (ignore rid count finalp livep))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid))
       (let ((reader (disc-node-user-reader node))
             (wguid (%source-guid src-prefix wid)))
-        (dds.rtps.reliable:reader-on-heartbeat reader wguid first last)
-        (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
-          (let ((cnt (incf (disc-node-ack-count node))))
-            (dolist (pd (%match-destinations-prefixed node nil))   ; ACKNACK -> matched writers; T10 wraps a :keyed dest
-              (%send-msg-buf node (disc-node-rx-tx-msg node)
-                             (lambda (mc)
-                               ;; writerEntityId = the REMOTE writer's id (WID), so the peer
-                               ;; routes the ACKNACK to its writer (not our local convention).
-                               (dds.rtps.message:write-acknack
-                                mc (disc-node-user-reader-id node) wid base numbits bitmap cnt :final t))
-                             (cadr pd) (cddr pd) (car pd))))))))
+        ;; RESIDUAL (ADR 0043): safe only while SEDP is unicast — match-commit and this HEARTBEAT serialize on
+        ;; ONE rx thread; multicast-SEDP/split-metatraffic must arm the reader baseline with %record-match first
+        (when (%guid-matched-p node wguid)   ; match gate: process/answer only a MATCHED writer's HEARTBEAT (§8.4.10.1)
+          (dds.rtps.reliable:reader-on-heartbeat reader wguid first last)
+          (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
+            (let ((cnt (incf (disc-node-ack-count node))))
+              (dolist (pd (%match-destinations-prefixed node nil))   ; ACKNACK -> matched writers; T10 wraps a :keyed dest
+                (%send-msg-buf node (disc-node-rx-tx-msg node)
+                               (lambda (mc)
+                                 ;; writerEntityId = the REMOTE writer's id (WID), so the peer
+                                 ;; routes the ACKNACK to its writer (not our local convention).
+                                 (dds.rtps.message:write-acknack
+                                  mc (disc-node-user-reader-id node) wid base numbits bitmap cnt :final t))
+                               (cadr pd) (cddr pd) (car pd)))))))))
   t)
 
 (defun* %on-user-gap (node c flags src-prefix)
@@ -2577,10 +2587,13 @@
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8) (simple-array (unsigned-byte 8) (12))) t)
   "Reader side: on a HEARTBEAT_FRAG, NACK_FRAG the still-missing fragments to matched writers. The
    reassembly proxy is keyed by the remote writer's FULL 16-octet GUID (SRC-PREFIX + WID, §9.4.4 /
-   §9.3.1.2) so two writers sharing EntityId 0x102 keep independent reassembly state (§8.3.5.4)."
+   §9.3.1.2) so two writers sharing EntityId 0x102 keep independent reassembly state (§8.3.5.4).
+   WP-ACKNACK-MATCH-GATE (RTPS 2.5 §8.4.10.1): gated on a MATCHED writer, mirroring %on-user-heartbeat — a
+   pre-match HEARTBEAT_FRAG must not NACK_FRAG pre-join history fragments before the match arms."
   (multiple-value-bind (rid wid sn lastfrag count) (dds.rtps.message:parse-heartbeat-frag-body c flags)
     (declare (ignore rid lastfrag count))
-    (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid))
+    (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid)
+               (%guid-matched-p node (%source-guid src-prefix wid)))
       (multiple-value-bind (base numbits bitmap)
           (dds.rtps.reliable:reader-frag-acknack (disc-node-user-reader node) (%source-guid src-prefix wid) sn)
         (when base

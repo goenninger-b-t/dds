@@ -1176,6 +1176,38 @@
           nil
           (progn (setf (gethash key (disc-node-matches node)) remote) t)))))
 
+(defun* %guid-matched-p (node guid)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) t)
+  "T iff the 16-octet GUID is a MATCHED remote endpoint (lock-guarded peek of DISC-NODE-MATCHES, equalp-keyed,
+   RTPS 2.5 §9.4.4). WP-ACKNACK-MATCH-GATE — two uses: (1) the reader-side HEARTBEAT match gate in
+   %on-user-heartbeat / %on-user-heartbeat-frag (RTPS 2.5 §8.4.10.1: a StatefulReader processes a writer's
+   HEARTBEAT — and answers with an ACKNACK / NACK_FRAG — only for a MATCHED writer, so a pre-match user
+   HEARTBEAT never creates a WriterProxy nor NACKs pre-join history before the on-match durability baseline,
+   DDS 1.4 §2.2.3.4, is armed); (2) FIRST-match gating of the writer-side durability pre-arm below."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (nth-value 1 (gethash guid (disc-node-matches node)))))
+
+(defun* %prearm-writer-future-base (node reader-guid)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) (eql t))
+  "WP-ACKNACK-MATCH-GATE (DDS 1.4 §2.2.3.4; RTPS 2.5 §8.4.2.2 / §8.4.10.1): FUTURE-only-base the reliable
+   writer's ReaderProxy for a newly-matched remote READER (READER-GUID) BEFORE the match is RECORDED — i.e.
+   before %reader-push-targets can make the reader a push destination — closing the symmetric writer-side
+   window in which a concurrent publish racing the match would replay pre-join history from the default
+   UNSENT-BASE 1 to a VOLATILE reader. Sets ONLY UNSENT-BASE = lastSN+1 (deadlock-proof: the engine arms it
+   itself, never waiting on the external hook; the WRITER-HEARTBEAT snapshot read intentionally bumps
+   HB-COUNT — a benign gap, Count need only be monotonic per RTPS 2.5 §8.3.7.5); the durability-aware on-match hook
+   (%writer-durability-init) then REFINES it (a TL<->TL match to firstSN for late-joiner replay; the
+   ACKNACK-repair path replays independently of UNSENT-BASE, so TL replay stays intact even though the base
+   starts future-only). The CALLER first-match-gates this (%guid-matched-p) so a re-announce never re-futures
+   past unsent LIVE samples. A no-op (still T) with no user writer — the discovery-less/no-hook path is not
+   pre-armed by the caller and keeps the default UNSENT-BASE 1 push-all (byte-identical)."
+  (let ((w (disc-node-user-writer node)))
+    (when w
+      (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)
+        (declare (ignore first count))
+        (dds.rtps.reliable:init-reader-proxy-base w (copy-seq reader-guid) (1+ last)))))
+  t)
+
 (defun* %record-incompat (node remote)
     (function (disc-node dds.rtps.discovery:endpoint-data) boolean)
   "Record REMOTE as RxO-incompatible (topic+type matched, QoS failed), keyed by its
@@ -1316,8 +1348,16 @@
                           (:incompatible nil) ; access denied; no INCONSISTENT_TOPIC
                           (:pending (%park-match node direction remote)
                                     (return-from %match-remote-endpoint t))
-                          (t (when (%record-match node remote) (%fire-match node direction remote))
-                             (return-from %match-remote-endpoint t))))))))
+                          (t
+                           ;; WP-ACKNACK-MATCH-GATE (DDS 1.4 §2.2.3.4; RTPS 2.5 §8.4.2.2): arm the writer-side
+                           ;; durability baseline BEFORE the match is recorded (before the reader becomes a
+                           ;; %reader-push-targets destination), on the FIRST match only (a re-announce must not
+                           ;; re-future past unsent LIVE samples) — closes the concurrent-publish window.
+                           (unless (or writer-p
+                                       (%guid-matched-p node (dds.rtps.discovery:endpoint-data-guid remote)))
+                             (%prearm-writer-future-base node (dds.rtps.discovery:endpoint-data-guid remote)))
+                           (when (%record-match node remote) (%fire-match node direction remote))
+                           (return-from %match-remote-endpoint t))))))))
           ((string= (dds.rtps.discovery:endpoint-data-topic-name remote)
                     (dds.rtps.discovery:endpoint-data-topic-name local))
            (if (string= (dds.rtps.discovery:endpoint-data-type-name remote)

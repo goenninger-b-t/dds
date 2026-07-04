@@ -422,16 +422,15 @@
                       ;; Settle (WP-RESIDUAL-FIXES-BATCH-A A5): bounded condition-wait on the match (on-match arms the
                       ;; VOLATILE skip-history) + a bounded announce pump so a wrongly-repaired pre-join sample WOULD
                       ;; have arrived before the assert; replaces the blind sleep 0.3 + 20x0.05 settle. The ZERO
-                      ;; assertion is UNCHANGED (no tolerance for a wrong delivery). KNOWN PRODUCT RACE (root-caused
-                      ;; 2026-07-04 — NOT a settle-timing artifact, NOT SBCL-clean, NOT fixable by any settle tuning):
-                      ;; when the service's periodic user HEARTBEAT reaches this node BEFORE the SEDP match (UDP
-                      ;; arrival order), %on-user-heartbeat creates the WriterProxy pre-match (skip-history still NIL,
-                      ;; the on-match %reader-durability-init has not run) and ACKNACKs the FULL [1..N] history to the
-                      ;; STATIC PEER (%match-destinations-prefixed includes peers even unmatched), so the writer
-                      ;; repairs all N pre-join samples and this test fails CORRECTLY. The fix is a product change
-                      ;; (gate the reader's ACKNACK reply on the writer being matched — RTPS 2.5 §8.4.10.1,
-                      ;; WriterProxy per MATCHED writer), out of scope for a test deflake; see the
-                      ;; WP-RESIDUAL-FIXES-BATCH-A report + the corrected ADR 0040 note.
+                      ;; assertion is UNCHANGED (no tolerance for a wrong delivery). PRODUCT RACE FIXED by
+                      ;; WP-ACKNACK-MATCH-GATE (RTPS 2.5 §8.4.10.1; DDS 1.4 §2.2.3.4): the pre-fix flake was a real
+                      ;; DURABILITY violation — when the service's periodic user HEARTBEAT reached this node BEFORE
+                      ;; the SEDP match (UDP arrival order), %on-user-heartbeat created the WriterProxy pre-match
+                      ;; (skip-history NIL) and ACKNACKed the FULL [1..N] history, so the writer repaired all N
+                      ;; pre-join samples. The fix match-gates %on-user-heartbeat on the writer being MATCHED
+                      ;; (%guid-matched-p): a pre-match HEARTBEAT is dropped, and the writer's next periodic HEARTBEAT
+                      ;; re-arrives post-match with skip-history armed (VOLATILE baselines at the current lastSN → 0
+                      ;; pre-join samples). This test is now deterministically green (15/15 SBCL loop, 2026-07-04).
                       (%await-match vl-node svc-node :retries 400 :sleep-s 0.02)
                       (loop repeat 40 do (%announce-both vl-node svc-node) (sleep 0.02))
                       (%check :volatile-latejoiner-zero

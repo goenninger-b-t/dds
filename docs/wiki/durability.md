@@ -48,6 +48,17 @@ At match time, if BOTH the writer AND the matched reader are TRANSIENT_LOCAL (or
 A TRANSIENT_LOCAL reader matched to a retaining writer leaves SKIP-HISTORY NIL → NACKs the full
 retained history → receives it.
 
+**Match-gate (RTPS 2.5 §8.4.10.1).** The reader answers a user HEARTBEAT — and emits the
+history-requesting ACKNACK / NACK_FRAG — only for a **matched** writer (`%guid-matched-p`). A user
+HEARTBEAT that arrives before the reader has processed the writer's SEDP publication is **dropped**
+(it would otherwise create the WriterProxy with SKIP-HISTORY un-armed and NACK the full pre-join
+history to the static peer — a VOLATILE reader would wrongly pull it); the writer's next periodic
+HEARTBEAT re-arrives after the match, when the durability baseline above is armed. The symmetric
+writer-side window is closed the same way: a newly-matched reader's ReaderProxy is future-only-based
+(`UNSENT-BASE = lastSN+1`) before the reader becomes a push destination, so a concurrent publish
+racing the match cannot replay pre-join history; the TRANSIENT_LOCAL replay then refines it to
+`firstSN`. (ADR 0043.)
+
 No new transport path. The replay rides the existing StatefulWriter push / HEARTBEAT / ACKNACK /
 retransmit (RTPS 2.5 §8.4.2.2).
 
