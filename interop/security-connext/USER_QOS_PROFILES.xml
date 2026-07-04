@@ -55,5 +55,17 @@
       </domain_participant_qos>
     </qos_profile>
 
+    <!-- GOV=datasign: all-SIGN INCLUDING the user payload (AES-GMAC SecuredPayload §9.5.3.3.4.3); data SIGN (visible but authenticated).
+         Non-hyphen profile name: rtiddsspy's -qosProfile parameter rejects a hyphenated profile name. -->
+    <qos_profile name="datasign" base_name="none">
+      <domain_participant_qos>
+        <property>
+          <value>
+            <element><name>dds.sec.access.governance</name><value>file:../security-secure-discovery/fastdds/certs/governance-datasign.smime</value></element>
+          </value>
+        </property>
+      </domain_participant_qos>
+    </qos_profile>
+
   </qos_library>
 </dds>

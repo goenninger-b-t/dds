@@ -8,6 +8,7 @@
 #   fastdds/certs/governance-none.smime    -- MIME of the existing pki/governance-none.xml   (auth-only baseline)
 #   fastdds/certs/governance-secure.smime  -- MIME of the existing pki/governance-secure.xml (ENCRYPT discovery+rtps)
 #   fastdds/certs/governance-sign.smime    -- MIME of the existing pki/governance-sign.xml   (all-SIGN authenticated-but-visible)
+#   fastdds/certs/governance-datasign.smime -- MIME of pki/governance-datasign.xml         (all-SIGN incl. payload GMAC §9.5.3.3.4.3)
 #   fastdds/certs/permissions-hello.smime  -- MIME, wildcard topic '*' for EC+ECB (covers the example HelloWorldTopic)
 #   pki/permissions-hello.{xml,p7s}        -- the SAME wildcard permissions in PEM PKCS7 for OUR side
 # Content is identical to the committed .xml; only the signature container differs.
@@ -22,7 +23,7 @@ PERM_CA_CERT="${SSD_DIR}/../security-access-control/pki/perm-ca-cert.pem"
 PERM_CA_KEY="${SSD_DIR}/../security-access-control/pki/perm-ca-key.pem"
 mkdir -p "${CERTS_DIR}"
 
-for f in "${PERM_CA_CERT}" "${PERM_CA_KEY}" "${PKI_DIR}/governance-none.xml" "${PKI_DIR}/governance-secure.xml" "${PKI_DIR}/governance-sign.xml"; do
+for f in "${PERM_CA_CERT}" "${PERM_CA_KEY}" "${PKI_DIR}/governance-none.xml" "${PKI_DIR}/governance-secure.xml" "${PKI_DIR}/governance-sign.xml" "${PKI_DIR}/governance-datasign.xml"; do
   [[ -f "${f}" ]] || { echo "ERROR: missing ${f} (run gen-test-fixtures.sh first)" >&2; exit 1; }
 done
 
@@ -43,9 +44,10 @@ sign_pem() {
   echo "Signed (PEM)  $2"
 }
 
-sign_mime "${PKI_DIR}/governance-none.xml"   "${CERTS_DIR}/governance-none.smime"
-sign_mime "${PKI_DIR}/governance-secure.xml" "${CERTS_DIR}/governance-secure.smime"
-sign_mime "${PKI_DIR}/governance-sign.xml"   "${CERTS_DIR}/governance-sign.smime"
+sign_mime "${PKI_DIR}/governance-none.xml"      "${CERTS_DIR}/governance-none.smime"
+sign_mime "${PKI_DIR}/governance-secure.xml"    "${CERTS_DIR}/governance-secure.smime"
+sign_mime "${PKI_DIR}/governance-sign.xml"      "${CERTS_DIR}/governance-sign.smime"
+sign_mime "${PKI_DIR}/governance-datasign.xml" "${CERTS_DIR}/governance-datasign.smime"
 
 # Wildcard interop permissions: allow publish+subscribe on ANY topic (covers the prebuilt example's
 # HelloWorldTopic) for the two EC subjects, default DENY. Same two identity-CA-issued subjects as
@@ -90,7 +92,7 @@ sign_pem  "${PKI_DIR}/permissions-hello.xml" "${PKI_DIR}/permissions-hello.p7s"
 sign_mime "${PKI_DIR}/permissions-hello.xml" "${CERTS_DIR}/permissions-hello.smime"
 
 # Self-verify each artifact against the reused Permissions CA (independent of the signer above).
-for f in "${CERTS_DIR}/governance-none.smime" "${CERTS_DIR}/governance-secure.smime" "${CERTS_DIR}/governance-sign.smime" "${CERTS_DIR}/permissions-hello.smime"; do
+for f in "${CERTS_DIR}/governance-none.smime" "${CERTS_DIR}/governance-secure.smime" "${CERTS_DIR}/governance-sign.smime" "${CERTS_DIR}/governance-datasign.smime" "${CERTS_DIR}/permissions-hello.smime"; do
   if openssl smime -verify -in "${f}" -CAfile "${PERM_CA_CERT}" >/dev/null 2>&1; then
     echo "Verified (MIME) ${f}"
   else

@@ -9,6 +9,7 @@
 # Generates under interop/security-secure-discovery/pki/ (signed CMS/S-MIME PEM, DDS-Security 1.1 §9.4.1.1):
 #   governance-secure.xml/.p7s       -- discovery=ENCRYPT, liveliness=SIGN, rtps=ENCRYPT, enable_discovery_protection=true
 #   governance-sign.xml/.p7s         -- all-SIGN authenticated-but-visible tier: discovery/liveliness/rtps/metadata=SIGN (AES-GMAC), data=NONE (visible payload), enable_discovery_protection=true
+#   governance-datasign.xml/.p7s     -- all-SIGN INCLUDING payload: discovery/liveliness/rtps/metadata/data=SIGN (AES-GMAC), the SecuredPayload GMAC tier (§9.5.3.3.4.3) on top of the metadata/rtps SIGN, enable_discovery_protection=true (non-hyphen token: rtiddsspy -qosProfile rejects a hyphenated profile name)
 #   governance-origin-auth.xml/.p7s  -- the *_WITH_ORIGIN_AUTHENTICATION protection kinds (receiver-specific MACs)
 #   governance-none.xml/.p7s         -- all-NONE baseline (the security-OFF byte-identical guard)
 #   permissions.xml/.p7s             -- publish/subscribe grants for the four test subjects, default DENY
@@ -79,6 +80,8 @@ write_governance "${PKI_DIR}/governance-secure.xml" \
   "ENCRYPT" "SIGN" "ENCRYPT" "true" "ENCRYPT" "ENCRYPT"
 write_governance "${PKI_DIR}/governance-sign.xml" \
   "SIGN" "SIGN" "SIGN" "true" "SIGN" "NONE"
+write_governance "${PKI_DIR}/governance-datasign.xml" \
+  "SIGN" "SIGN" "SIGN" "true" "SIGN" "SIGN"
 write_governance "${PKI_DIR}/governance-origin-auth.xml" \
   "ENCRYPT_WITH_ORIGIN_AUTHENTICATION" "SIGN_WITH_ORIGIN_AUTHENTICATION" "ENCRYPT_WITH_ORIGIN_AUTHENTICATION" \
   "true" "ENCRYPT" "ENCRYPT"
@@ -186,7 +189,7 @@ sign_doc() {
   echo "Signed  ${outfile}"
 }
 
-for base in governance-secure governance-sign governance-origin-auth governance-none permissions; do
+for base in governance-secure governance-sign governance-datasign governance-origin-auth governance-none permissions; do
   sign_doc "${PKI_DIR}/${base}.xml" "${PKI_DIR}/${base}.p7s"
 done
 
@@ -202,7 +205,7 @@ verify_doc() {
   echo "Verified ${label}: ${nchars} chars of recovered content"
 }
 
-for base in governance-secure governance-sign governance-origin-auth governance-none permissions; do
+for base in governance-secure governance-sign governance-datasign governance-origin-auth governance-none permissions; do
   verify_doc "${PKI_DIR}/${base}.p7s" "${base}.p7s"
 done
 

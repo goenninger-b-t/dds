@@ -15,7 +15,8 @@
 #
 # Usage: bash interop/security-connext/run-connext-interop.sh [GOV] [SECS]
 #   GOV  = none (auth+access-control only, protection NONE) | secure (all-ENCRYPT) |
-#          sign (all-SIGN authenticated-but-visible AES-GMAC: discovery/liveliness/rtps/metadata=SIGN, data=NONE).
+#          sign (all-SIGN authenticated-but-visible AES-GMAC: discovery/liveliness/rtps/metadata=SIGN, data=NONE) |
+#          datasign (all-SIGN INCLUDING the user payload: SecuredPayload AES-GMAC §9.5.3.3.4.3, data=SIGN visible+authenticated; non-hyphen: rtiddsspy -qosProfile rejects a hyphenated name).
 #          Default none. The p7s (ours) and .smime (Connext, USER_QOS_PROFILES.xml OursConnextInterop::${GOV}) are named governance-${GOV}.
 #   SECS = seconds ours runs per direction. Default 25.
 set -uo pipefail

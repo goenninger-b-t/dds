@@ -71,24 +71,29 @@ AES-GMAC common_mac and does **not** encrypt it.  The tier is selected by the Ke
 `transformation_kind`: AES256-GCM `{0,0,0,4}` → ENCRYPT, AES256-GMAC `{0,0,0,3}` → SIGN.
 
 The SIGN SecuredPayload differs from ENCRYPT ONLY in the body — the plaintext is copied
-verbatim (visible) with **no `crypto_content.length` prefix and no 4-align pad**:
+verbatim (visible) with **no `crypto_content.length` prefix**, and the SerializedPayload is
+**4-aligned INSIDE the GMAC'd body** so the whole SecuredPayload is a multiple of 4:
 
 ```
 GMAC SecuredPayload = SecureDataHeader (20: kind={0,0,0,3} || key_id || session_id || iv_suffix)
                    || plaintext (N, VISIBLE VERBATIM — no length prefix)
-                   || common_mac (16, the GMAC over the plaintext)
-                   || receiver_specific_macs_count (uint32 = 0)     ; total = 40 + N
+                   || 4-align pad (((-N) mod 4) zero octets, INSIDE the GMAC'd body)
+                   || common_mac (16, the GMAC over plaintext‖pad)
+                   || receiver_specific_macs_count (uint32 = 0)    ; total = 40 + align4(N)
 ```
 
-(vs ENCRYPT's `44 + N + pad`).  The `common_mac` is the AES-GMAC over `AAD = the plaintext`
+(vs ENCRYPT's `44 + N + pad`).  The `common_mac` is the AES-GMAC over `AAD = plaintext‖pad`
 (empty ciphertext), nonce `session_id || init_vector_suffix`, under the same §9.5.3.3.4.2
-session key.  Decode GMAC-**verifies** and returns the visible plaintext; any tamper of the
-payload or the mac **fails closed → NIL** (no false-ACCEPT).  Byte-exact to §9.5.3.3.4.3 and
-Fast DDS `serialize_SecureDataBody` (`!do_encryption`) for the 4-aligned serialized payloads
-that occur in practice (`decode_serialized_payload` recovers `N = total − 20 − 20`).  Our `40 + N`
-wire carries **no** trailing `rsm_count` 4-align pad, so a non-4-aligned `N` would diverge from a
-conformant peer that aligns it; encode therefore **signals a clear local error** on a non-4-aligned
-`data=SIGN` payload (fail loud locally, never emit a divergent wire — unreachable for real CDR).  The
+session key.  Decode GMAC-**verifies** and returns the visible plaintext (the trailing 4-align
+pad is authenticated and ignored by the CDR deserializer); any tamper of the payload or the
+mac **fails closed → NIL** (no false-ACCEPT).  Byte-exact to §9.5.3.3.4.3 and Fast DDS
+`serialize_SecureDataBody` (`!do_encryption`); `decode_serialized_payload` recovers
+`N = total − 20 − 20`.  **The 4-alignment is required, not cosmetic:** the SecuredPayload replaces
+the DATA submessage's SerializedPayload, and a non-4-aligned SecuredPayload makes the DATA
+submessage's `octetsToNextHeader` non-4-aligned, which a conformant peer's secure-RTPS submessage
+walk rejects (RTPS 2.5 §8.3.3.2.3 / §9.4.5.1.3 — a non-final submessage 4-aligns the next).  This was
+proven **live vs RTI Connext 7.3.1** under an all-SIGN-including-`data` governance, BOTH directions
+(see §5 below).  For a 4-aligned `N` the pad is empty → byte-identical to the corpus golden.  The
 crypto-manager derives the user endpoint's advertised kind from `data_protection` when that
 tier is engaged, so a `data=SIGN` topic emits a GMAC SecuredPayload and a `data=ENCRYPT` one
 the GCM (confidentiality preserved — an ENCRYPT payload is never emitted visible).
@@ -2232,3 +2237,32 @@ cannot dissect the macOS `lo0` NULL link layer). Captures: `interop/security-con
   secure-builtin-ACKNACK count unit test (`run-secure-builtin-acknack-count-test`), and the `%dn-normalize` /
   `%dn-equal` RFC2253 §2-3 subject-name edges (unescaped-separator split + value un-escape + fail-closed on
   malformed, `run-security-dn-match-test`). All ADR-0037/0040 residual carries are now closed.
+
+### Slice-5d — `data_protection=SIGN` payload-tier GMAC live BOTH directions vs Connext (WP-SECURITY-DATA-SIGN-LIVE-CONNEXT, 2026-07-04)
+
+The payload-tier GMAC SecuredPayload (§1.4, §9.5.3.3.4.3) validated **live BOTH directions** ours↔RTI Connext
+7.3.1 under an **all-SIGN-including-`data`** governance (`datasign`: `discovery/liveliness/rtps/metadata/data`=SIGN
+— same base kind, mixed-kind-legal; the payload GMAC is the new tier on top of the already-validated metadata/rtps
+SIGN).  Run it with `interop/security-connext/run-connext-interop.sh datasign 20`.
+
+**Live result (the wire oracle — tshark cannot dissect the macOS `lo0` NULL link layer):**
+- **ours→Connext:** `rtiddsspy` logs 8× `New data … topic="HelloWorldTopic" type="HelloWorld"` — Connext
+  GMAC-verified + read our **visible** `data=SIGN` payloads; ours `sent=8 matched=1 RESULT: PASS`.
+- **Connext→ours:** our peer `[sub] decoded HelloWorld … index=… message="Hello world from Connext"`,
+  `SUMMARY … ever-keyed=t decoded=38 RESULT: PASS` — ours GMAC-verified + read Connext's visible payloads.
+
+**One real reconciliation (clean-room, OMG clause + our byte-exact decode oracle; RTI source never read):** the GMAC
+SecuredPayload must **4-align the SerializedPayload INSIDE the GMAC'd body** (`40 + align4(N)`, §1.4) so the enclosing
+DATA submessage's `octetsToNextHeader` stays a multiple of 4.  A real `HelloWorld` serializes to `N=34` (ours) /
+`N=37` (Connext) — non-4-aligned — so the pre-fix `40+N` SecuredPayload made our DATA submessage non-4-aligned and
+Connext rejected the whole secure-RTPS message (`MIGRtpsTrustSubmessage_skipToSubmessage: The submessage length is not
+aligned to 4 bytes … SECURE_RTPS_POSTFIX not found`).  This was an **encode bug the ENCRYPT (`44+N+pad`) and
+`data=NONE` tiers masked** — the Slice-5c I1 error-guard (which merely *refused* a non-4-aligned payload) is replaced
+by the pad.  Decode was already alignment-agnostic (`N=len−40`), which is exactly why it was encode-only and only a
+real non-4-aligned payload flowing to Connext surfaced it.  Byte-exact corpus golden UNCHANGED (pad=0 for a 4-aligned
+`N`); regression **430 passed** both impls (Clasp first).
+
+**Harness note:** `rtiddsspy -qosProfile` rejects a **hyphenated** profile name (`OursConnextInterop::data-sign` →
+`Error in parameter`), while the identical governance loads under a non-hyphen name; the C++ `QosProvider`
+(`hello_secure_pub`) tolerates the hyphen.  So the fixture/profile/`GOV` token is **`datasign`** throughout (a
+rtiddsspy CLI limitation, not a protocol issue).

@@ -203,15 +203,18 @@
               Total = 44 + N + pad. AES-256-GCM seal under EMPTY AAD -> ciphertext + tag. BYTE-IDENTICAL to
               serialize-secured-payload (same widths/offsets + big-endian %put-u32-be-at + the pad; seal-into == seal),
               proven by the byte-exact corpora AND the serialize-secured-payload oracle pin in run-security-payload-into-test.
-     GMAC:    plaintext(N, VERBATIM — NO crypto_content.length prefix) ‖ common_mac(16) ‖ rsm_count(4). Total = 40 + N
-              (no length prefix, no pad — corroborated CLEAN-ROOM against Fast DDS AESGCMGMAC_Transform.cpp
-              serialize_SecureDataBody: the !do_encryption branch memcpy's the plaintext VERBATIM and writes NO
-              cnt_length; the length prefix + submessage 4-align pad are ENCRYPT/submessage-only; decode_serialized_payload
-              recovers N = total - 20(header) - 20(tag); see docs/provenance.md). aes-256-gcm-seal-into with pt-len 0
-              GMACs AAD = the plaintext -> the common_mac (the ZA-2 GMAC-into pattern). Byte-exact to §9.5.3.3.4.3 for
-              4-aligned payloads (the run-security-gmac-payload-test golden); serialized payloads are 4-aligned in practice.
-              A non-4-aligned N SIGNALS a clear error: our 40+N wire carries no rsm_count 4-align pad, so it would diverge
-              from a conformant peer that aligns it — fail loud LOCALLY, never emit a wire that diverges (no false-ACCEPT).
+     GMAC:    plaintext(N) ‖ 4-align pad (((-N) mod 4) zero octets) ‖ common_mac(16) ‖ rsm_count(4). Total = 40 + align4(N),
+              NO crypto_content.length prefix (that is ENCRYPT-only). The SerializedPayload is 4-aligned so the enclosing
+              DATA submessage's octetsToNextHeader stays a multiple of 4 (RTPS 2.5 §8.3.3.2.3 / §9.4.5.1.3): a non-4-aligned
+              inner submessage makes a conformant peer's secure-RTPS submessage walk fail to locate SRTPS_POSTFIX and reject
+              the whole message — observed LIVE against RTI Connext 7.3.1 (WP-SECURITY-DATA-SIGN-LIVE-CONNEXT). The 4-align
+              pad is part of the GMAC'd body — the common_mac authenticates plaintext‖pad and decode returns align4(N) octets
+              whose trailing pad the CDR deserializer ignores — byte-exact to live Connext (our decode GMAC-verified Connext's
+              4-aligned GMAC payloads). aes-256-gcm-seal-into with pt-len 0 GMACs AAD = OUT-BUF[20,20+align4(N)) -> common_mac
+              (the ZA-2 GMAC-into pattern). Corroborated CLEAN-ROOM against Fast DDS AESGCMGMAC_Transform.cpp
+              serialize_SecureDataBody (!do_encryption: verbatim body, no cnt_length); decode_serialized_payload recovers
+              N = total-20(header)-20(tag); see docs/provenance.md. For a 4-aligned N the pad is 0 -> byte-identical to the
+              run-security-gmac-payload-test golden.
    ZERO GC-heap allocation in EITHER tier: the SecureDataHeader, lengths, pad and rsm_count are written through OUT-BUF's
    vector with RAW OFFSET WRITES — no cursor struct is consed; the 12-byte AES-GCM nonce is the contiguous OUT-BUF[8..20]
    sub-slice (session_id(4)‖iv_suffix(8), §9.5.3.3.4.3) written in place — no nonce buffer; ciphertext/plaintext + tag are
@@ -223,24 +226,25 @@
   (let* ((vec (dds.core.buffer:octet-buffer-vec out-buf))
          (n   (length plaintext)))
     (if (%km-gmac-p km)
-        ;; --- GMAC / SIGN sub-tier (§9.5.3.3.4.3): VISIBLE plaintext + GMAC common_mac, no length prefix, no pad ---
-        (let* ((ct-off  +secure-data-header-len+)                         ; visible plaintext @ 20
-               (tag-off (+ ct-off n))                                     ; common_mac @ 20+N
-               (rsm-off (+ tag-off +common-mac-len+))                     ; rsm_count @ 36+N
-               (total   (+ rsm-off +receiver-specific-macs-count-len+)))  ; 40+N
-          ;; §9.5.3.3.4.3: our 40+N GMAC wire has NO rsm_count 4-align pad; a non-4-aligned N would diverge from a conformant peer (Fast DDS) that 4-aligns the trailing rsm_count — a LOCAL fault, fail loud (real serialized CDR payloads are 4-aligned)
-          (unless (zerop (mod n 4))
-            (error "encode-serialized-payload-into: data=SIGN GMAC serialized payload length ~d is not 4-aligned (§9.5.3.3.4.3 / XCDR); a conformant peer 4-aligns the trailing rsm_count, so this would diverge on the wire" n))
+        ;; --- GMAC / SIGN sub-tier (§9.5.3.3.4.3): VISIBLE 4-aligned plaintext + GMAC common_mac, no length prefix ---
+        (let* ((pad     (mod (- n) 4))                                    ; §8.3.3.2.3 4-align the SerializedPayload so octetsToNextHeader stays 4-aligned
+               (body-n  (+ n pad))                                        ; GMAC'd body = plaintext ‖ 4-align pad
+               (ct-off  +secure-data-header-len+)                         ; visible plaintext @ 20
+               (tag-off (+ ct-off body-n))                                ; common_mac @ 20+align4(N)
+               (rsm-off (+ tag-off +common-mac-len+))                     ; rsm_count @ 36+align4(N)
+               (total   (+ rsm-off +receiver-specific-macs-count-len+)))  ; 40+align4(N), a multiple of 4
+          ;; §9.5.3.3.4.3 GMAC/!encrypt: SecuredPayload = header(20)‖plaintext(N)‖4-align pad‖common_mac(16)‖rsm_count(4); the pad rides INSIDE the GMAC'd body (Fast DDS/Connext-compatible) so the SecuredPayload is 4-aligned — a non-4-aligned inner DATA submessage makes a conformant peer's secure-RTPS submessage walk fail to find SRTPS_POSTFIX (observed live, WP-SECURITY-DATA-SIGN-LIVE-CONNEXT); the trailing pad is authenticated + ignored by the receiver's CDR deserializer
           (unless (<= total (length vec))
             (error 'dds.core.buffer:buffer-overflow :need total :have (length vec)))
           (%put-crypto-header-into km vec)
-          ;; visible plaintext VERBATIM as the CryptoContent (Fast DDS serialize_SecureDataBody !do_encryption)
-          (replace vec plaintext :start1 ct-off :end1 tag-off)
-          ;; GMAC over the plaintext (AAD = plaintext, pt-len 0 -> tag only) -> common_mac @ tag-off; nonce = OUT-BUF[8..20]
+          ;; visible plaintext VERBATIM as the CryptoContent, then the 4-align pad zeroed (Fast DDS serialize_SecureDataBody !do_encryption)
+          (replace vec plaintext :start1 ct-off :end1 (+ ct-off n))
+          (dotimes (i pad) (setf (aref vec (+ ct-off n i)) 0))
+          ;; GMAC over plaintext‖pad IN PLACE (AAD = OUT-BUF[20,20+align4(N)), pt-len 0 -> tag only) -> common_mac @ tag-off; nonce = OUT-BUF[8..20]
           (dds.dare:aes-256-gcm-seal-into vec ct-off tag-off
                                           (%km-session-key-at km +fixed-session-id+ 0)
                                           vec +secure-data-header-session-id-off+
-                                          plaintext +empty-octets+ 0 0 0 n)
+                                          vec +empty-octets+ 0 0 ct-off body-n)
           (%put-u32-be-at vec rsm-off +receiver-specific-macs-count-payload-protection+)
           total)
         ;; --- ENCRYPT tier (§9.5.3.3.4.4): ciphertext + GCM tag under EMPTY AAD (UNCHANGED, byte-identical) ---

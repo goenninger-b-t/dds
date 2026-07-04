@@ -395,8 +395,16 @@
    (a) round-trip: decode(km, encode(km, PT)) = PT byte-exact.
    (b) header kind = AES256-GMAC {0,0,0,3} (byte 3 = 3) — the wire signal a peer's find_key dispatches on.
    (c) VISIBLE: the plaintext appears VERBATIM at offset 20 in the SecuredPayload (not hidden as ciphertext).
-   (d) layout: total = 40 + N for a 4-aligned N (NO crypto_content.length prefix, NO 4-align pad — §9.5.3.3.4.3,
-       Fast DDS serialize_SecureDataBody !do_encryption), vs the ENCRYPT tier's 44 + N + pad.
+   (d) layout: total = 40 + N for a 4-aligned N (NO crypto_content.length prefix; the SerializedPayload is already
+       4-aligned so the pad is empty — §9.5.3.3.4.3, Fast DDS serialize_SecureDataBody !do_encryption), vs the
+       ENCRYPT tier's 44 + N + pad.
+   (k) NON-4-aligned N (WP-SECURITY-DATA-SIGN-LIVE-CONNEXT / Slice-5d): the SerializedPayload is 4-aligned INSIDE the
+       GMAC'd body, so total = 40 + align4(N). For N in {34 (the live HelloWorld payload), 33, 35} (pad widths 2/3/1):
+       (k.1) length = 40 + align4(N), NOT 40+N; (k.2) plaintext visible verbatim at 20; (k.3) decode returns the
+       align4(N) span whose LEADING N octets equal the input (the pad is transparent to the payload — self-delimiting
+       CDR); (k.4) the trailing pad octets are ZERO (deterministic wire); (k.5) flipping a pad octet -> decode NIL
+       (the pad rides INSIDE the GMAC AAD, authenticated, not ignored). Pins the RTPS §8.3.3.2.3 4-alignment the live
+       Connext interop requires — a broken (mod (- n) 4), a non-zero pad, or a GMAC extent off-by-pad now fails `make test`.
    (e) BYTE-EXACT golden: the SecuredPayload equals an INDEPENDENT oracle — header ‖ PT verbatim ‖ GMAC(PT) ‖
        rsm_count=0, the GMAC via the unchanged allocating aes-256-gcm-seal (AAD=PT, empty plaintext) over
        derive-session-key(session_id=0) ‖ counter-0 iv_suffix=0, assembled by hand (never the encode wrapper).
@@ -427,9 +435,40 @@
       ;; (c) VISIBLE plaintext verbatim at offset 20
       (%check :gmac-visible (equalp (subseq blob 20 (+ 20 n)) pt)
               "the plaintext must be VISIBLE verbatim at offset 20 (GMAC authenticates but does not encrypt)")
-      ;; (d) layout: total = 40 + N (no length prefix, no pad for 4-aligned N)
+      ;; (d) layout: total = 40 + N (no length prefix, no pad for the 4-aligned N above)
       (%check :gmac-layout (= (length blob) (+ 40 n))
               (format nil "GMAC SecuredPayload length must be 40+N=~d (no ct_len prefix, no pad); got ~d" (+ 40 n) (length blob))))
+    ;; (k) NON-4-aligned N (WP-SECURITY-DATA-SIGN-LIVE-CONNEXT / Slice-5d, §8.3.3.2.3): the SerializedPayload is
+    ;;     4-aligned INSIDE the GMAC'd body -> total = 40 + align4(N), so the enclosing DATA submessage stays
+    ;;     4-aligned (a non-4-aligned inner submessage makes a conformant peer's secure-RTPS walk reject the
+    ;;     message — the bug the ENCRYPT/data=NONE tiers masked). N=34 is the live HelloWorld payload that
+    ;;     surfaced it; 33 (pad 3) + 35 (pad 1) exercise the other two non-zero pad widths.
+    (dolist (n2 '(34 33 35))
+      (let* ((ptn  (let ((a (make-array n2 :element-type '(unsigned-byte 8))))
+                     (dotimes (i n2 a) (setf (aref a i) (logand (+ i 1) #xff)))))
+             (body (* 4 (ceiling n2 4)))                          ; align4(N)
+             (padw (- body n2))                                   ; ((-N) mod 4), = 2/3/1 here
+             (blob (dds.security:encode-serialized-payload km ptn))
+             (rec  (dds.security:decode-serialized-payload km blob)))
+        ;; (k.1) padded layout: total = 40 + align4(N), NOT 40+N
+        (%check :gmac-nonaligned-layout (= (length blob) (+ 40 body))
+                (format nil "non-aligned GMAC length must be 40+align4(~d)=~d (padded), not 40+N=~d; got ~d"
+                        n2 (+ 40 body) (+ 40 n2) (length blob)))
+        ;; (k.2) VISIBLE plaintext still verbatim at offset 20 (the pad follows it, does not displace it)
+        (%check :gmac-nonaligned-visible (equalp (subseq blob 20 (+ 20 n2)) ptn)
+                "non-aligned: the plaintext must be VISIBLE verbatim at offset 20")
+        ;; (k.3) round-trip: decode returns the align4(N) span whose LEADING N octets equal the input (pad transparent)
+        (%check :gmac-nonaligned-roundtrip
+                (and rec (= (length rec) body) (equalp (subseq rec 0 n2) ptn))
+                (format nil "non-aligned decode must return the align4(~d)=~d span with leading ~d octets = PT" n2 body n2))
+        ;; (k.4) the pad octets [20+N, 20+align4(N)) are ZERO (deterministic, so the wire is reproducible)
+        (%check :gmac-nonaligned-pad-zero (every #'zerop (subseq blob (+ 20 n2) (+ 20 body)))
+                (format nil "non-aligned: the ~d pad octet(s) at [~d,~d) must be zero" padw (+ 20 n2) (+ 20 body)))
+        ;; (k.5) flip a PAD byte -> decode NIL: proves the pad rides INSIDE the GMAC AAD (authenticated), not ignored
+        (let ((bad (copy-seq blob)))
+          (setf (aref bad (+ 20 n2)) (logxor (aref bad (+ 20 n2)) #x01))   ; first pad octet @ 20+N
+          (%check :gmac-nonaligned-pad-authenticated (null (dds.security:decode-serialized-payload km bad))
+                  "flipping a pad octet must fail the GMAC -> NIL (the pad is inside the authenticated body)"))))
     ;; (e) BYTE-EXACT golden — independent oracle (fresh kms so both use counter-0 iv_suffix = all-zeros)
     (let* ((km-t  (dds.security:make-test-key-material :kind :sign))   ; encode under test, counter 0
            (km-or (dds.security:make-test-key-material :kind :sign))   ; oracle key derivation only, counter 0
