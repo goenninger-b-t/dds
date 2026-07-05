@@ -498,10 +498,13 @@ endpoints. (Adapted from `run-dcps-builtin-topics-test`.)
 This is a v1 of the DCPS layer (M3/P2, with M4 XTypes plumbing). The following are visible in
 the source as deferred or simplified — do not rely on them yet:
 
-- **One endpoint pair per participant.** Each `DomainParticipant` holds exactly one
-  `DataWriter` and one `DataReader` (the engine's single user endpoint). Creating a second
-  writer/reader overwrites the back-reference the status hooks use; true multi-endpoint needs
-  per-endpoint RTPS `EntityId`s.
+- **One endpoint pair per participant (N=1).** Each `DomainParticipant` today drives exactly one
+  `DataWriter` and one `DataReader`. As of the N-user-endpoint **Slice S0 registry** (ADR 0048), the
+  engine writer/reader instances are held in entity-id-keyed registries on the disc-node; the compat
+  accessors return the **primary** (first-registered) entry, so N=1 is byte-identical. This is the
+  foundation only — N local user endpoints still need per-endpoint send fan-out (**Slice S1**) and
+  delivery routing (**Slice S2**). Registering a **second, distinct** `EntityId` today fail-fasts with a
+  clear "not yet supported (S1/S2)" error instead of silently clobbering.
 - **Caller-driven discovery.** You must call `dds.dcps:spin` to drive SPDP/SEDP; there is no
   background announcer (the engine's announce buffers are not yet thread-isolated).
 - **Instance lifecycle: writer + reader side (S1 + S2).** Writer side (S1): `register_instance` /

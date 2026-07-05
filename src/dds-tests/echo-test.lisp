@@ -3552,10 +3552,49 @@
             "the next successful write after a :timeout must take SN 3 (no SN consumed by the rejected write — hole-free)"))
   t)
 
+(defun* run-endpoint-registry-test ()
+    (function () t)
+  "WP-N-ENDPOINT-S0-REGISTRY (ADR 0048): the user-endpoint registry — register/lookup/enumerate, the primary
+   (first-registered) compat accessor, same-id replace (pre-S0 clobber semantics), and the 2nd-distinct-id fail-fast."
+  (let* ((node (dds.disc::%make-disc-node))
+         (w1 (dds.rtps.reliable:make-rtps-writer
+              :hc (dds.rtps.history:make-history-cache :keep-last 1 nil nil)))
+         (w2 (dds.rtps.reliable:make-rtps-writer
+              :hc (dds.rtps.history:make-history-cache :keep-last 1 nil nil)))
+         (r1 (dds.rtps.reliable:make-rtps-reader))
+         (r2 (dds.rtps.reliable:make-rtps-reader)))
+    (%check :reg-empty-writer (null (dds.disc::disc-node-user-writer node)) "empty node: no primary writer")
+    (%check :reg-empty-reader (null (dds.disc::disc-node-user-reader node)) "empty node: no primary reader")
+    (dds.disc::%register-user-writer node #x00000102 w1)
+    (dds.disc::%register-user-reader node #x00000107 r1)
+    (%check :reg-primary-writer (eq w1 (dds.disc::disc-node-user-writer node)) "primary writer = first registered")
+    (%check :reg-primary-reader (eq r1 (dds.disc::disc-node-user-reader node)) "primary reader = first registered")
+    (%check :reg-lookup-writer (eq w1 (dds.disc::%user-writer-for node #x00000102)) "%user-writer-for by id")
+    (%check :reg-lookup-reader (eq r1 (dds.disc::%user-reader-for node #x00000107)) "%user-reader-for by id")
+    (%check :reg-lookup-miss (null (dds.disc::%user-writer-for node #x00000202)) "unknown id -> NIL")
+    (%check :reg-all-writers (equal (list w1) (dds.disc::%all-user-writers node)) "enumerate writers")
+    (%check :reg-all-readers (equal (list r1) (dds.disc::%all-user-readers node)) "enumerate readers")
+    (dds.disc::%register-user-writer node #x00000102 w2)
+    (dds.disc::%register-user-reader node #x00000107 r2)
+    (%check :reg-replace-writer (eq w2 (dds.disc::disc-node-user-writer node)) "same-id re-register replaces primary writer")
+    (%check :reg-replace-reader (eq r2 (dds.disc::disc-node-user-reader node)) "same-id re-register replaces primary reader")
+    (%check :reg-replace-count-w (= 1 (length (dds.disc::%all-user-writers node))) "replace keeps one writer entry")
+    (%check :reg-replace-count-r (= 1 (length (dds.disc::%all-user-readers node))) "replace keeps one reader entry")
+    (%check :reg-failfast-writer
+            (handler-case (progn (dds.disc::%register-user-writer node #x00000202 w1) nil) (error () t))
+            "2nd distinct writer id must signal the S1 not-yet-supported error")
+    (%check :reg-failfast-reader
+            (handler-case (progn (dds.disc::%register-user-reader node #x00000407 r1) nil) (error () t))
+            "2nd distinct reader id must signal the S2 not-yet-supported error")
+    (%check :reg-failfast-intact-w (eq w2 (dds.disc::disc-node-user-writer node)) "fail-fast preserves primary writer")
+    (%check :reg-failfast-intact-r (eq r2 (dds.disc::disc-node-user-reader node)) "fail-fast preserves primary reader"))
+  t)
+
 (defun* run-all-tests ()
     (function () t)
   "Run every landed test; signal on first failure, else report and return T."
   (let ((tests '(("md5-rfc1321"               . run-md5-test)
+                 ("endpoint-registry"        . run-endpoint-registry-test)
                  ("echo-over-mock-transport" . run-echo-test)
                  ("pal-fence"                . run-pal-fence-test)
                  ("pal-signal-handler"       . run-pal-signal-handler-test)

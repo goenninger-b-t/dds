@@ -714,9 +714,10 @@
    local-writer's durability IS the engine writer's; :VOLATILE when there is no local writer yet (the
    discovery-less value-level path). Gates the full-ACK purge in %on-user-acknack + the late-joiner replay
    in %writer-durability-init: a TRANSIENT_LOCAL writer retains for late-joiners (writer-purge-acked
-   DURABILITY). NOTE: if v1's one-writer-per-node invariant is ever lifted (multiple DataWriters of mixed
-   durability sharing the engine writer), this single-writer attribution must be revisited — the engine
-   writer would need its own settled durability rather than a list head."
+   DURABILITY). NOTE: N-user-endpoint S0 registry landed (ADR 0048) — the engine writer is now registry-held
+   (disc-node-user-writer = primary), but N-local send fan-out is still S1, so N=1 attribution is unchanged. When
+   S1 lifts single-user-endpoint (multiple DataWriters of mixed durability), this single-writer attribution must be
+   revisited — each engine writer would need its own settled durability rather than a list head."
   (let ((w (first (disc-node-local-writers node))))
     (if w (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos w)) :volatile)))
 
@@ -726,8 +727,9 @@
    TOP of the conformant default). The disc-level bridge for DCPS durability-finalize: forwards to the engine
    writer (writer-finalize-durability on disc-node-user-writer), after which the full-ACK purge in
    %on-user-acknack RELEASES the TRANSIENT_LOCAL writer's retained late-joiner history once all current
-   readers ACK (writer-purge-acked treats a finalized writer as VOLATILE). v1 one-writer-per-node, so this
-   finalizes the node's lone engine writer; a no-op (still T) when there is no user writer. Monotonic."
+   readers ACK (writer-purge-acked treats a finalized writer as VOLATILE). N-user-endpoint S0 registry landed
+   (ADR 0048): this finalizes the node's PRIMARY engine writer (disc-node-user-writer); a no-op (still T) when
+   there is no user writer. N-local send fan-out = S1. Monotonic."
   (let ((w (disc-node-user-writer node)))
     (when w (dds.rtps.reliable:writer-finalize-durability w)))
   t)
@@ -2999,18 +3001,22 @@
    RETCODE_TIMEOUT — DDS-standard block-up-to-max_blocking_time backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS,
    ADR 0016 §Backpressure; pairs with a flow-controller, which paces the drain so a bounded cache + bounded
    block keeps the backlog bounded). With MAX-SAMPLES NIL the cache never fills, so MAX-BLOCKING-NS has no
-   effect (the bound is the trigger). NOTE (ADR 0019): one engine writer per disc-node is shared by all of a
-   publisher's DataWriters, so the HC honors the HISTORY QoS of the DataWriter that (re)enabled the publisher —
-   a pre-existing one-writer-per-node limitation, not introduced here. When NODE has a crypto-transform
+   effect (the bound is the trigger). NOTE (ADR 0019; N-user-endpoint S0 registry landed, ADR 0048): the engine
+   writer is now held in the node's entity-id-keyed user-writer registry (disc-node-user-writer returns the
+   PRIMARY = first-registered). At N=1 the PRIMARY is shared by all of a publisher's DataWriters, so the HC honors
+   the HISTORY QoS of the DataWriter that (re)enabled the publisher — the pre-existing single-user-endpoint limit,
+   now foundation-refactored; N-local send fan-out is Slice S1, deliver routing S2. When NODE has a crypto-transform
    (data_protection ON), a per-node static arena + a fixed secured-payload pool are carved onto the writer's
    HistoryCache so a secured publish reuses a buffer (zero per-sample payload alloc, WP-DDS-SECURITY-ZEROALLOC-AEAD
    T5a): the pool holds %secured-pool-capacity buffers of (44 + *secured-payload-max-bytes* + 3) octets each; a
    larger secured plaintext OR pool exhaustion is rejected with RETCODE_TIMEOUT (RESOURCE_LIMITS), never a GC
    fallback. Security OFF leaves no pool — the publish path is byte-identical. stop-node tears the arena down."
-  (setf (disc-node-user-writer node)
-        (dds.rtps.reliable:make-rtps-writer
-         :hc (dds.rtps.history:make-history-cache history-kind history-depth max-samples nil)
-         :max-blocking-ns max-blocking-ns))
+  ;; WP-N-ENDPOINT-S0-REGISTRY (ADR 0048): register the engine writer under the node's user-writer EntityId (first =
+  ;; primary; re-enable with the same id replaces — byte-identical to the pre-S0 slot clobber). N-local send = S1.
+  (%register-user-writer node (disc-node-user-writer-id node)
+                         (dds.rtps.reliable:make-rtps-writer
+                          :hc (dds.rtps.history:make-history-cache history-kind history-depth max-samples nil)
+                          :max-blocking-ns max-blocking-ns))
   ;; WP-ACKED-SLOT-PINNING (ADR 0044): wire the pin RELEASE-FN onto the writer HistoryCache when the node has a ZC
   ;; pool. The change-removal choke (%hc-remove-change, under the writer lock) funcalls it to %zc-release a pinned
   ;; change's TX slot hold + decrement the live-pin budget — the layering-clean release (history must not depend on
@@ -3040,7 +3046,9 @@
   "Give NODE a reliable user reader and install the reader-side data-plane hooks (store DATA, ACKNACK on
    HEARTBEAT, mark GAP'd SNs irrelevant on GAP, reassemble DATA_FRAG, NACK_FRAG on HEARTBEAT_FRAG). Call after
    add-local-reader."
-  (setf (disc-node-user-reader node) (dds.rtps.reliable:make-rtps-reader))
+  ;; WP-N-ENDPOINT-S0-REGISTRY (ADR 0048): register the engine reader under the node's user-reader EntityId (first =
+  ;; primary; re-enable with the same id replaces — byte-identical to the pre-S0 slot clobber). N-local deliver = S2.
+  (%register-user-reader node (disc-node-user-reader-id node) (dds.rtps.reliable:make-rtps-reader))
   (setf (disc-node-on-data node)
         (lambda (wid sn buf poff plen src-prefix &optional og os kh)
           (%on-user-data node wid sn buf poff plen src-prefix og os kh)))

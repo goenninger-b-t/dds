@@ -172,8 +172,13 @@
   (tx-payload nil :type (or null dds.core.buffer:octet-buffer))
   (tx-msg nil :type (or null dds.core.buffer:octet-buffer))
   (rx-tx-msg nil :type (or null dds.core.buffer:octet-buffer))
-  (user-writer nil :type (or null dds.rtps.reliable:rtps-writer))
-  (user-reader nil :type (or null dds.rtps.reliable:rtps-reader))
+  ;; WP-N-ENDPOINT-S0-REGISTRY (ADR 0048): user endpoint ENGINE-INSTANCE registries — each an alist (EntityId u32 .
+  ;; engine instance). N=1 today: the compat accessors disc-node-user-writer/-reader return the PRIMARY (first-
+  ;; registered) entry, so the ~163 existing read sites are byte-identical. N-local send fan-out = S1, deliver = S2.
+  (user-writers '() :type list)
+  (user-readers '() :type list)
+  (primary-user-writer nil :type (or null dds.rtps.reliable:rtps-writer)) ; first-registered user writer (N=1 identity)
+  (primary-user-reader nil :type (or null dds.rtps.reliable:rtps-reader)) ; first-registered user reader (N=1 identity)
   (user-writer-id #x00000102 :type (unsigned-byte 32)) ; this node's user-data writer EntityId (kind reflects keyed-ness)
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
   ;; FR-XPORT-2 SHMEM intra-host data plane (same-host user DATA only; discovery/HB/ACKNACK stay UDP)
@@ -509,6 +514,73 @@
   (mcast-socket nil :type t)
   (mcast-rx-thread nil :type t)
   (rx-thread nil :type t))
+
+;; WP-N-ENDPOINT-S0-REGISTRY (ADR 0048): compat accessors + register/lookup/enumerate API over the user-endpoint
+;; registries. Control plane (endpoint create/enable), never the per-sample hot path. N=1: exactly one entry, so the
+;; compat accessor returns the sole engine instance the pre-S0 slot returned — byte-identical.
+(defun* disc-node-user-writer (node)
+    (function (disc-node) (or null dds.rtps.reliable:rtps-writer))
+  "This node's PRIMARY (first-registered) user engine writer, or NIL — the N=1 compat accessor over the user-writer
+   registry (WP-N-ENDPOINT-S0; S1 fans out the send path across %all-user-writers)."
+  (disc-node-primary-user-writer node))
+
+(defun* disc-node-user-reader (node)
+    (function (disc-node) (or null dds.rtps.reliable:rtps-reader))
+  "This node's PRIMARY (first-registered) user engine reader, or NIL — the N=1 compat accessor over the user-reader
+   registry (WP-N-ENDPOINT-S0; S2 routes delivery across %all-user-readers)."
+  (disc-node-primary-user-reader node))
+
+(defun* %register-user-writer (node entity-id writer)
+    (function (disc-node (unsigned-byte 32) dds.rtps.reliable:rtps-writer) dds.rtps.reliable:rtps-writer)
+  "Register WRITER under ENTITY-ID in NODE's user-writer registry; the first registered becomes primary (N=1
+   identity for disc-node-user-writer). Re-registering the SAME id REPLACES the entry (byte-identical to the pre-S0
+   enable-publisher engine-writer clobber); a DIFFERENT 2nd id fail-fasts (N-local send fan-out = Slice S1)."
+  (let ((cell (assoc entity-id (disc-node-user-writers node) :test #'eql)))
+    (cond (cell (setf (cdr cell) writer)
+                (setf (disc-node-primary-user-writer node) writer))
+          ((disc-node-primary-user-writer node)
+           (error "disc-node: refusing a 2nd local user DataWriter (EntityId #x~8,'0X) — N-local user endpoints are ~
+                   not yet supported (N-user-endpoint Slice S1); primary EntityId #x~8,'0X"
+                  entity-id (caar (disc-node-user-writers node))))
+          (t (push (cons entity-id writer) (disc-node-user-writers node))
+             (setf (disc-node-primary-user-writer node) writer))))
+  writer)
+
+(defun* %register-user-reader (node entity-id reader)
+    (function (disc-node (unsigned-byte 32) dds.rtps.reliable:rtps-reader) dds.rtps.reliable:rtps-reader)
+  "Register READER under ENTITY-ID in NODE's user-reader registry; the first registered becomes primary (N=1
+   identity for disc-node-user-reader). Re-registering the SAME id REPLACES the entry (byte-identical to the pre-S0
+   enable-subscriber engine-reader clobber); a DIFFERENT 2nd id fail-fasts (N-local deliver routing = Slice S2)."
+  (let ((cell (assoc entity-id (disc-node-user-readers node) :test #'eql)))
+    (cond (cell (setf (cdr cell) reader)
+                (setf (disc-node-primary-user-reader node) reader))
+          ((disc-node-primary-user-reader node)
+           (error "disc-node: refusing a 2nd local user DataReader (EntityId #x~8,'0X) — N-local user endpoints are ~
+                   not yet supported (N-user-endpoint Slice S2); primary EntityId #x~8,'0X"
+                  entity-id (caar (disc-node-user-readers node))))
+          (t (push (cons entity-id reader) (disc-node-user-readers node))
+             (setf (disc-node-primary-user-reader node) reader))))
+  reader)
+
+(defun* %user-writer-for (node entity-id)
+    (function (disc-node (unsigned-byte 32)) (or null dds.rtps.reliable:rtps-writer))
+  "NODE's registered user engine writer for ENTITY-ID, or NIL (S1 send routing)."
+  (cdr (assoc entity-id (disc-node-user-writers node) :test #'eql)))
+
+(defun* %user-reader-for (node entity-id)
+    (function (disc-node (unsigned-byte 32)) (or null dds.rtps.reliable:rtps-reader))
+  "NODE's registered user engine reader for ENTITY-ID, or NIL (S2 deliver routing)."
+  (cdr (assoc entity-id (disc-node-user-readers node) :test #'eql)))
+
+(defun* %all-user-writers (node)
+    (function (disc-node) list)
+  "Fresh list of NODE's registered user engine writers, primary first (S1 send fan-out)."
+  (mapcar #'cdr (disc-node-user-writers node)))
+
+(defun* %all-user-readers (node)
+    (function (disc-node) list)
+  "Fresh list of NODE's registered user engine readers, primary first (S2 deliver fan-out)."
+  (mapcar #'cdr (disc-node-user-readers node)))
 
 (defparameter +spdp-multicast-group+ "239.255.0.1"
   "Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
