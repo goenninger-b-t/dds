@@ -946,6 +946,160 @@
       (dds.disc:stop-node node)))
   t)
 
+(defun* run-dcps-secured-take-loan-test ()
+    (function () t)
+  "Test (WP-DCPS-SECURED-TAKE-LOAN, ADR 0038 residual (i)): the DCPS reader loan lifecycle wires the disc-node
+   secured decode loan up through DataReader::take/read-loaned + return_loan, mirroring the FlatData ZC loan.
+   Driven at the DCPS layer (dds.dcps:create-participant/create-datareader + take-loaned), receiving one secured
+   sample directly via %deliver-user-sample (deterministic, no sockets). Parts:
+     (1) OPT-IN: a secured reader (crypto-transform injected -> node-secured-reader-p) becomes secured-loan-capable
+         at create-datareader; a PLAIN reader (no crypto) does NOT (the allocating decode path stays byte-identical).
+     (2) ROUNDTRIP: take-loaned returns the DESERIALIZED struct as DATA (byte-exact fields vs the sent sample) and
+         the dds.disc:secured-loan-handle in LOANS; the handle is registered in dr-secured-loans, is
+         secured-loan-handle-p and NOT flatdata-view-p (structural type-dispatch proof).
+     (3) RETURN: return-loan releases the loan -> disc-node pool-in-use back to 0, the handle buffer NIL, the
+         samples-store entry gone (no leak/dangle), dr-secured-loans empty, the cache entry invalidated.
+     (4) IDEMPOTENT / no double-free: a SECOND return-loan of the same loans, and a following return-all-loans, are
+         safe no-ops (single-owner + membership-guard + node-return-loan idempotence).
+     (5) SWEEP: a reader that drained a loan but never returned it -> return-all-loans (reader-close) releases it
+         (pool-in-use back to 0) — no lingering plaintext, no leak.
+   Requires OpenSSL >= 3.5 (same gate as the lower-layer secured tests); both impls must pass identically (Clasp FIRST)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [dcps-secured-take-loan] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-dcps-secured-take-loan-test t)))
+  (let* ((km (dds.security:make-test-key-material))
+         (ts (dds.types:find-type-support "shape-type"))
+         (sample (make-shape-type :color "BLUE" :x 100 :y 150 :shapesize 30))
+         (pt (dds.dcps::%serialize-sample ts sample :xcdr2))   ; the plaintext SerializedPayload the reader deserializes
+         (secured (dds.security:encode-serialized-payload km pt))
+         (src (%make-test-prefix #xA5))
+         (wid #x00000102))
+    ;; -- Part 1 (plain reader unaffected): no crypto -> not secured-loan-capable, allocating path byte-identical --
+    (let ((pp (dds.dcps:create-participant :domain (test-domain +td-dcps-secured-take-loan+))))
+      (unwind-protect
+           (let* ((sub (dds.dcps:create-subscriber pp))
+                  (topic (dds.dcps:create-topic pp "PlainSquare" "shape-type" ts)))
+             (dds.dcps:create-datareader sub topic)
+             (%check :dstl-plain-not-loan-capable
+                     (not (dds.disc:disc-node-secured-loan-capable (dds.dcps::dp-node pp)))
+                     "a PLAIN reader (no data_protection) must NOT be secured-loan-capable (allocating path byte-identical)"))
+        (dds.dcps:delete-participant pp)))
+    ;; -- Parts 2-4 (roundtrip + return + idempotent) on a SECURED reader --
+    (let ((p (dds.dcps:create-participant :domain (test-domain +td-dcps-secured-take-loan+))))
+      (unwind-protect
+           (let ((node (dds.dcps::dp-node p)))
+             (setf (dds.disc:disc-node-crypto-transform node) km)   ; data_protection ON (direct-KM :unset+crypto) -> node-secured-reader-p
+             (let* ((sub (dds.dcps:create-subscriber p))
+                    (topic (dds.dcps:create-topic p "SecSquare" "shape-type" ts))
+                    (dr (dds.dcps:create-datareader sub topic)))   ; opt-in fires here (eager decode-pool carve)
+               (%check :dstl-opt-in
+                       (dds.disc:disc-node-secured-loan-capable node)
+                       "a SECURED reader must be secured-loan-capable after create-datareader (the opt-in)")
+               (dds.disc::%deliver-user-sample node wid 1 secured src (dds.disc::%source-guid src wid) 1)
+               (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+                 (%check :dstl-take-one (and (= 1 (length data)) (= 1 (length loans)))
+                         "take-loaned must return exactly one sample + one loan")
+                 (let ((q (first data)) (h (first loans)))
+                   (%check :dstl-data-is-struct
+                           (and (not (dds.disc:secured-loan-handle-p q))
+                                (string= (shape-type-color q) "BLUE") (= (shape-type-x q) 100)
+                                (= (shape-type-y q) 150) (= (shape-type-shapesize q) 30))
+                           "the DATA is the deserialized struct, byte-exact vs the sent sample (typed copy persists)")
+                   (%check :dstl-loan-is-handle
+                           (and (dds.disc:secured-loan-handle-p h)
+                                (not (dds.types:flatdata-view-p h))
+                                (member h (dds.dcps::dr-secured-loans dr)))
+                           "the LOAN is a secured-loan-handle (NOT a flatdata-view), registered in dr-secured-loans (structural type-dispatch)")
+                   (%check :dstl-pool-in-use-1
+                           (= 1 (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node)))
+                           "one decode-pool buffer is in use while the loan is outstanding")
+                   (dds.dcps:return-loan dr loans)
+                   (%check :dstl-returned
+                           (and (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node)))
+                                (null (dds.disc:secured-loan-handle-buffer h))
+                                (zerop (dds.disc:node-sample-count node))
+                                (null (dds.dcps::dr-secured-loans dr)))
+                           "return-loan releases the pooled buffer (pool-in-use 0), invalidates the handle + store entry, empties dr-secured-loans — no leak/dangle")
+                   ;; idempotent: a second return-loan + a return-all-loans are safe no-ops (single-owner, no double-free)
+                   (dds.dcps:return-loan dr loans)
+                   (dds.dcps::return-all-loans dr)
+                   (%check :dstl-idempotent
+                           (and (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node)))
+                                (null (dds.dcps::dr-secured-loans dr)))
+                           "a double return-loan / a following return-all-loans are safe no-ops (no double-free)")))))
+        (dds.dcps:delete-participant p)))
+    ;; -- Part 5 (reader-close sweep of a drained-but-never-returned loan) --
+    (let ((p2 (dds.dcps:create-participant :domain (test-domain +td-dcps-secured-take-loan+))))
+      (unwind-protect
+           (let ((node (dds.dcps::dp-node p2)))
+             (setf (dds.disc:disc-node-crypto-transform node) km)
+             (let* ((sub (dds.dcps:create-subscriber p2))
+                    (topic (dds.dcps:create-topic p2 "SweepSquare" "shape-type" ts))
+                    (dr (dds.dcps:create-datareader sub topic)))
+               (dds.disc::%deliver-user-sample node wid 1 secured src (dds.disc::%source-guid src wid) 1)
+               (multiple-value-bind (data loans) (dds.dcps:take-loaned dr)
+                 (declare (ignore data loans))   ; drained + registered, but DELIBERATELY not returned
+                 (%check :dstl-sweep-pinned
+                         (= 1 (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node)))
+                         "a drained-but-unreturned loan pins one decode-pool buffer"))
+               (dds.dcps::return-all-loans dr)   ; reader-close safety sweep
+               (%check :dstl-sweep-released
+                       (and (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node)))
+                            (null (dds.dcps::dr-secured-loans dr)))
+                       "reader-close (return-all-loans) sweeps the outstanding secured loan — no leak, no lingering plaintext")))
+        (dds.dcps:delete-participant p2)))
+    ;; -- Part 6 (COPY API release-after-snapshot): a secured reader using take-samples / read-samples releases the
+    ;; decode loan per consume, so N >> pool-capacity samples never pin/exhaust the pool (the auto-opt-in regression) --
+    (let ((p3 (dds.dcps:create-participant :domain (test-domain +td-dcps-secured-take-loan+))))
+      (unwind-protect
+           (let ((node (dds.dcps::dp-node p3)))
+             (setf (dds.disc:disc-node-crypto-transform node) km)
+             (let* ((sub (dds.dcps:create-subscriber p3))
+                    (topic (dds.dcps:create-topic p3 "CopySquare" "shape-type" ts))
+                    ;; carve a TINY decode pool (capacity 2+1=3) so an un-released copy-API reader would exhaust it fast
+                    (dr (let ((dds.disc:*secured-pool-capacity* 2)
+                              (dds.disc:*secured-pool-headroom* 1)
+                              (dds.disc:*secured-payload-max-bytes* 256))
+                          (dds.dcps:create-datareader sub topic))))
+               ;; take-samples arm: 10 sequential deliveries (>> capacity 3); each take releases its loan
+               (dotimes (i 10)
+                 (let ((sn (+ 1 i)))
+                   (dds.disc::%deliver-user-sample node wid sn secured src (dds.disc::%source-guid src wid) sn)
+                   (let ((got (dds.dcps:take-samples dr)))
+                     (%check :dstl-copy-take-one
+                             (and (= 1 (length got))
+                                  (= 100 (shape-type-x (dds.dcps:cached-sample-data (first got)))))
+                             "take-samples returns the sample byte-exact on a secured reader")
+                     (%check :dstl-copy-take-released
+                             (and (null (dds.dcps::dr-secured-loans dr))
+                                  (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node))))
+                             "take-samples RELEASES the secured decode loan per consume (registry empty, pool-in-use 0 — no pinning)"))))
+               (%check :dstl-copy-take-no-reject
+                       (zerop (dds.disc:disc-node-decode-pool-rejects node))
+                       "10 take-samples on a capacity-3 pool caused ZERO SAMPLE_REJECTED (release-after-copy fixes the auto-opt-in regression)")
+               ;; read-samples arm: read is non-destructive but also releases the loan (data struct is independent + stays readable)
+               (dds.disc::%deliver-user-sample node wid 11 secured src (dds.disc::%source-guid src wid) 11)
+               (let ((got (dds.dcps:read-samples dr)))
+                 (%check :dstl-copy-read-one
+                         (and (= 1 (length got))
+                              (= 150 (shape-type-y (dds.dcps:cached-sample-data (first got)))))
+                         "read-samples returns the secured sample byte-exact")
+                 (%check :dstl-copy-read-released
+                         (and (null (dds.dcps::dr-secured-loans dr))
+                              (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node))))
+                         "read-samples RELEASES the secured decode loan (registry empty, pool-in-use 0) yet keeps the readable struct in cache"))
+               ;; a SECOND read-samples still returns the same readable struct — no double-release, no error
+               (let ((again (dds.dcps:read-samples dr)))
+                 (%check :dstl-copy-read-idempotent
+                         (and (= 1 (length again))
+                              (= 150 (shape-type-y (dds.dcps:cached-sample-data (first again))))
+                              (zerop (dds.core.arena:pool-in-use (dds.disc:disc-node-decode-pool node))))
+                         "a re-read of an already-released secured sample is a safe no-op (struct still readable, no double-release)"))))
+        (dds.dcps:delete-participant p3))))
+  t)
+
 (defun* %secured-store-table-entries (outer)
     (function (hash-table) (integer 0))
   "WP-SECURED-STORE-GROWTH: total (GUID,SN) entries across a 2-level per-(guid,sn) store table OUTER (sum of the

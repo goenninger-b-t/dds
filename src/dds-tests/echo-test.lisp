@@ -3644,6 +3644,7 @@
                  ("security-encode-pool-alloc"   . run-security-encode-pool-alloc-test)
                  ("secured-decode-loan-alloc"    . run-secured-decode-loan-alloc-test)
                  ("secured-decode-loan-dup"      . run-secured-decode-loan-dup-test)
+                 ("dcps-secured-take-loan"       . run-dcps-secured-take-loan-test)
                  ("secured-store-growth"         . run-secured-store-growth-test)
                  ("decode-fail-suppress"         . run-decode-fail-suppress-test)
                  ("secured-live-zeroalloc"       . run-secured-live-zeroalloc-test)

@@ -152,3 +152,6 @@
   "WP-RESIDUAL-FIXES-BATCH-A / ADR 0031 lim.1 isolation offset: the reliable-reader decode-failure
    retransmit-suppression — a missing-KM failure NEVER suppresses (self-heals when the key arrives), while a
    persistent KM-present tag failure suppresses the SN after a bounded count without wedging later SNs.")
+(defconstant +td-dcps-secured-take-loan+ 41
+  "WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 residual (i)) isolation offset: a secured DCPS reader take/read-loaned a
+   secured sample via the zero-decode-buffer-alloc loan; the loan lifecycle is leak-free + byte-exact + idempotent.")

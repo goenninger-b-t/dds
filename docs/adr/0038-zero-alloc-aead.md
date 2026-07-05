@@ -303,9 +303,29 @@ real off-heap OOM degrades gracefully as documented. Leak-proof regression: `run
 many secured samples with/without draining, asserts the tables are purged on release and the carve-fail store stays
 bounded; written RED on the pre-fix code).
 
-**(i) DCPS take-loaned-for-secured follow-on.** The secured loan lives at the `disc-node` level; the DCPS
-`read/take` path is byte-identical and NOT opted-in (`%drain-one-sample` errors loudly on a `secured-loan-handle` to
-guard a future DCPS-loan mis-wire). Extending the loan to the DCPS API is a follow-on.
+**(i) DCPS take-loaned-for-secured — RESOLVED (WP-DCPS-SECURED-TAKE-LOAN).** The secured decode loan is wired up
+through the DCPS reader loan lifecycle, mirroring the FlatData ZC loan. `create-datareader` opts a **secured** reader
+(`dds.disc:node-secured-reader-p` — its topic's `data_protection` is non-NONE) into the loan path
+(`set-secured-loan-capable`); a plain reader is unaffected (the allocating decode path is byte-identical). The
+former fail-loud guard in `%drain-one-sample` is now a drain branch: `%drain-one-secured` reads the plaintext **in
+place** from the pooled decode buffer (`secured-loan-bytes` + `secured-loan-handle-len`) and deserializes it via
+`%deserialize-payload` (no per-sample decrypt-output allocation), registering the handle in a **separate**
+reader-side registry `dr-secured-loans` (parallel to `dr-loans`, the type-clean two-registry discipline). Teardown
+is **strictly type-dispatched**: `return-loan` / `return-all-loans` release a `secured-loan-handle` via
+`dds.disc:node-return-loan` (NEVER `%zc-release`) and a `flatdata-view` via `%zc-release` — never crossed. The
+handle is single-owner (the `disc-node` registry is the authoritative owner; DCPS holds one reference and returns
+once), so a double return / a return-then-close is an idempotent no-op (the `dr-secured-loans` membership guard plus
+`node-return-loan`'s own `reg-index<0 ∧ buffer NIL` no-op); the cache entry is invalidated before the disc-node
+recycles the buffer (no UAF); reader-close (`return-all-loans`) and participant teardown (`stop-node` →
+`node-return-all-loans`) both sweep — no double-free, no UAF, no leak.
+**Honest scope:** the DCPS-level win is the **decode buffer** (Copy #1, the per-sample decrypt output). The **typed
+deserialize copy (Copy #2) persists** — the DCPS typed read API returns deserialized application structs, so a plain
+XCDR2 secured payload must still be deserialized; DATA is an independent struct and the loan pins only the pooled
+plaintext buffer. So this is "**zero-decode-buffer-alloc secured read via the loan API**", not a literal zero-copy
+typed read. Like the FlatData loan drain, the secured loan drain does not apply the content-filter / RESOURCE_LIMITS
+/ EXCLUSIVE-ownership arbitration (the disc-node decode pool is the hard resource bound). Test:
+`run-dcps-secured-take-loan-test` (DCPS opt-in + roundtrip byte-exact + type-dispatch + idempotent double-return +
+reader-close sweep). No wire change (a receive-side memory/lifetime change).
 
 ---
 

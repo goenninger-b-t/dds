@@ -105,6 +105,8 @@
    (filter :initform nil :accessor dr-filter)              ; ContentFilteredTopic predicate, or nil
    (loans :initform '() :accessor dr-loans)                ; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): outstanding loaned flatdata-views (the loan registry) — return-loan / reader-close release them
    (view-freelist :initform '() :accessor dr-view-freelist) ; WP-FLATDATA-ZC-LOAN: recycled flatdata-view structs (no per-sample GC-heap alloc; NFR-MEM)
+   (secured-loans :initform '() :accessor dr-secured-loans) ; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): outstanding secured decode-loan handles — SEPARATE registry from dr-loans (the type-clean two-registry discipline); return-loan / reader-close node-return-loan them
+   (secured-scratch :initform nil :accessor dr-secured-scratch) ; WP-DCPS-SECURED-TAKE-LOAN: reusable octet-buffer wrapper (repointed per drain) for the in-place [0,len) secured-plaintext deserialize — created once, zero per-sample cons (NFR-MEM)
    (status-lock :initform (dds.pal:make-lock "dr-status") :accessor dr-status-lock))
   (:documentation "DDS DataReader: receives typed samples on a Topic into a read/take
    cache with per-instance SampleInfo, carrying its SUBSCRIPTION_MATCHED,
@@ -175,8 +177,13 @@
   (sequence-number 0 :type integer))
 
 (defstruct* (cached-sample (:constructor make-cached-sample))
-  "A read/take result element: the deserialized DATA + its SAMPLE-INFO."
+  "A read/take result element: the deserialized DATA + its SAMPLE-INFO. LOAN, when non-NIL, is the loan object
+   whose lifetime backs this entry, for a type-dispatched return: a dds.disc:secured-loan-handle for a secured
+   zero-decode-buffer-alloc loan (WP-DCPS-SECURED-TAKE-LOAN, ADR 0038 (i)) — DATA is then the INDEPENDENT
+   deserialized struct and LOAN pins the pooled decode buffer until return-loan releases it. NIL for a copy-backed
+   sample and for a FlatData ZC loan (whose view is DATA itself, dispatched by flatdata-view-p, ADR 0017)."
   (data nil :type t)
+  (loan nil :type t)
   (info nil :type (or null sample-info)))
 
 (defstruct* (instance-rec (:constructor make-instance-rec))
@@ -270,21 +277,32 @@
     ((:plain-cdr2-le nil) (values :xcdr2 :little))
     (:plain-cdr2-be  (values :xcdr2 :big))))
 
-(defun* %deserialize-sample (ts bytes)
-    (function (t (simple-array (unsigned-byte 8) (*))) t)
-  "Deserialize a SerializedPayload (encap header + body) into a sample via TS, decoding the body in the
-   representation the encapsulation header declares (DDS-XTypes 1.3 §7.6.3.1.2; WP-DATA-REPRESENTATION):
-   the parsed encap keyword/name selects the codec mode (XCDR1/XCDR2, the 8-vs-4 alignment) AND the cursor endianness
-   (LE/BE) via %encap->codec, so a reader accepting (:xcdr2 :xcdr1) reads either rep a peer sent. A FlatData
-   type's :deserialize self-dispatches on the rep id and ignores the passed mode (its own RX-transcode)."
-  (let* ((ob (dds.core.buffer:make-octet-buffer (length bytes)))
-         (rc (dds.core.buffer:cursor ob :endianness :little)))
-    (replace (dds.core.buffer:octet-buffer-vec ob) bytes)
+(defun* %deserialize-payload (ts ob)
+    (function (t dds.core.buffer:octet-buffer) t)
+  "Deserialize a SerializedPayload (encap header + body) already RESIDENT in octet-buffer OB into a sample via TS,
+   WITHOUT allocating or freeing OB — the buffer is caller-owned (a scratch buffer for %deserialize-sample, or the
+   pooled secured-decode buffer read IN PLACE for the WP-DCPS-SECURED-TAKE-LOAN loan). The parsed encapsulation
+   keyword selects the codec mode (XCDR1/XCDR2, the 8-vs-4 alignment) AND the cursor endianness (LE/BE) via
+   %encap->codec, so a reader accepting (:xcdr2 :xcdr1) reads either rep a peer sent (DDS-XTypes 1.3 §7.6.3.1.2;
+   WP-DATA-REPRESENTATION). A FlatData type's :deserialize self-dispatches on the rep id and ignores the passed
+   mode (its own RX-transcode). Bounds-checked against OB's capacity (NFR-SEC-POSTURE): the caller sizes OB to the
+   exact payload extent so a wire-supplied length can never over-read past it."
+  (let ((rc (dds.core.buffer:cursor ob :endianness :little)))
     (let ((encap (dds.cdr:parse-encapsulation-header rc)))
       (multiple-value-bind (mode endian) (%encap->codec encap)
         (dds.core.buffer:cursor-set-endianness rc endian)
-        (prog1 (funcall (dds.types:type-support-deserialize ts) rc mode)
-          (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))))
+        (funcall (dds.types:type-support-deserialize ts) rc mode)))))
+
+(defun* %deserialize-sample (ts bytes)
+    (function (t (simple-array (unsigned-byte 8) (*))) t)
+  "Deserialize a SerializedPayload (encap header + body) into a sample via TS. Copies BYTES into a fresh scratch
+   octet-buffer (sized exactly), decodes it in place via %deserialize-payload, then frees the scratch — the
+   allocating deserialize path (the copy-backed and non-secured samples). See %deserialize-payload for the
+   representation-selection contract."
+  (let ((ob (dds.core.buffer:make-octet-buffer (length bytes))))
+    (replace (dds.core.buffer:octet-buffer-vec ob) bytes)
+    (prog1 (%deserialize-payload ts ob)
+      (dds.pal:free-static (dds.core.buffer:octet-buffer-vec ob)))))
 
 ;;; ---- DomainParticipantFactory + participant lifecycle ----
 
@@ -596,6 +614,12 @@
     ;; lifetime. Gated on the TYPE being FlatData AND *zerocopy-enabled*; off either way -> NIL -> byte-unchanged.
     (when (and dds.disc:*zerocopy-enabled* (%flatdata-size (topic-type-support topic)))
       (dds.disc:set-zc-loan-capable node t))
+    ;; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 residual (i)): a SECURED reader (its topic's data_protection is non-NONE,
+    ;; node-secured-reader-p) opts into the zero-decode-buffer-alloc secured LOAN path — the receiver decodes each
+    ;; SecuredPayload into a pooled buffer and take/read-loaned deserialize it in place, no per-sample decrypt
+    ;; vector. A plain reader -> NIL -> the allocating decode path stays byte-identical.
+    (when (dds.disc:node-secured-reader-p node)
+      (dds.disc:set-secured-loan-capable node t))
     (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos :enabled t)))
       (setf (dr-filter dr) (td-filter-predicate topic))   ; nil for a plain Topic
       (push dr (sub-readers sub))
@@ -1252,6 +1276,25 @@
       (return-loan dr (list (cached-sample-data oldest)))))            ; full teardown (release slot + drop dr-loans + recycle); UAF-safe: oldest is :not-read
   t)
 
+(defun* %reader-keeplast-drop-oldest-secured (dr handle depth)
+    (function (data-reader (simple-array (unsigned-byte 8) (16)) (integer 1)) t)
+  "KEEP_LAST per-instance drop, SECURED-LOAN path (DDS 1.4 §2.2.3.18; WP-DCPS-SECURED-TAKE-LOAN, ADR 0038 (i)). The
+   secured sibling of %reader-keeplast-drop-oldest-loan. Unlike a FlatData view (read IN PLACE off the SHMEM slot),
+   a secured sample's cached DATA is an INDEPENDENT deserialized struct — a COPY — so dropping a read-but-held
+   sample is never a use-after-free (RELEASABLE-ONLY NIL, the copy-path age order); but the sample still holds a
+   secured-loan-handle in dr-secured-loans pinning a decode-pool buffer, so a bare dr-cache delete would ORPHAN the
+   loan (a pooled-buffer leak until reader-close -> decode-pool exhaustion, NFR-MEM). The evicted sample gets the
+   full type-dispatched return-loan teardown (invalidate the cache entry + node-return-loan the buffer + drop
+   dr-secured-loans) when it carries a handle; a carve-fail bare-vector fallback sample (LOAN NIL, no pooled buffer)
+   is a plain lossy cache delete (mirrors %reader-keeplast-drop-oldest). O(N) scan via %reader-instance-oldest (DRY)."
+  (multiple-value-bind (count oldest) (%reader-instance-oldest dr handle nil)
+    (when (and (>= count depth) oldest)
+      (let ((loan (cached-sample-loan oldest)))
+        (if (dds.disc:secured-loan-handle-p loan)
+            (return-loan dr (list loan))                              ; full teardown, type-dispatched to node-return-loan
+            (setf (dr-cache dr) (delete oldest (dr-cache dr) :test #'eq))))))   ; carve-fail copy sample: lossy bare drop
+  t)
+
 (defun* %guid> (a b)
     (function ((simple-array (unsigned-byte 8) (16)) (simple-array (unsigned-byte 8) (16))) boolean)
   "Lexicographic 16-octet GUID comparison A>B. The EXCLUSIVE same-strength tie-break: DDS 1.4
@@ -1465,6 +1508,48 @@
       (setf (gethash sguid (dr-drained dr)) (max sn (gethash sguid (dr-drained dr) 0)))))
   t)
 
+(defun* %drain-one-secured (dr node ts key loan sn sguid)
+    (function (data-reader t t cons dds.disc:secured-loan-handle integer t) t)
+  "WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 residual (i)): drain ONE secured sample whose disc-node store slot is a
+   dds.disc:secured-loan-handle (the decode-pool loan the receiver thread built via decode-serialized-payload-into
+   — zero per-sample decrypt-output alloc). The DCPS-level win is the DECODE BUFFER: the plaintext is read IN PLACE
+   from the pooled buffer (secured-loan-bytes + secured-loan-handle-len) over [0, LEN) — no allocating decrypt
+   vector. The typed deserialize copy PERSISTS (Copy #2): a plain XCDR2 secured payload must still be deserialized
+   into an application struct, so DATA is an INDEPENDENT struct and the honest scope is 'zero-decode-buffer-alloc
+   secured read via the loan API', NOT a literal zero-copy read. Mirrors %drain-one-loan: revive the instance,
+   KEEP_LAST-drop, register the LOAN handle in the SEPARATE dr-secured-loans registry BEFORE delivery (so a
+   drained-but-never-taken loan is still swept at reader-close), and append a cached-sample carrying the struct as
+   DATA and the handle as LOAN (for the type-dispatched return). Like %drain-one-loan the loan path does not apply
+   the content-filter / RESOURCE_LIMITS / EXCLUSIVE-ownership arbitration (the disc-node decode pool is the hard
+   resource bound); the per-writer watermark advances for every outcome (the reliable engine already ACKed)."
+  (let* ((len (dds.disc:secured-loan-handle-len loan))
+         (ob (or (dr-secured-scratch dr)
+                 (setf (dr-secured-scratch dr)
+                       (dds.core.buffer:octet-buffer-over (dds.disc:secured-loan-bytes loan)))))
+         (data (progn                                              ; repoint the reusable wrapper at THIS pooled buffer, bound to [0,len) (zero per-sample cons; NFR-SEC-POSTURE bounds)
+                 (setf (dds.core.buffer:octet-buffer-vec ob) (dds.disc:secured-loan-bytes loan)
+                       (dds.core.buffer:octet-buffer-capacity ob) len)
+                 (%deserialize-payload ts ob)))
+         (handle (%instance-handle ts data))
+         (rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node key))))
+    (push loan (dr-secured-loans dr))                             ; register the LOAN handle BEFORE delivery (reader-close safety)
+    (let ((depth (%reader-keeplast-depth dr)))
+      (when depth (%reader-keeplast-drop-oldest-secured dr handle depth)))
+    (setf (dr-cache dr)
+          (nconc (dr-cache dr)
+                 (list (make-cached-sample
+                        :data data
+                        :loan loan
+                        :info (make-sample-info
+                               :sample-state :not-read :view-state :new
+                               :instance-state (instance-rec-state rec) :valid-data t
+                               :instance-handle handle :sequence-number sn
+                               :disposed-generation-count (instance-rec-disposed-gen-count rec)
+                               :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))
+  (when sguid
+    (setf (gethash sguid (dr-drained dr)) (max sn (gethash sguid (dr-drained dr) 0))))
+  t)
+
 (defun* take-loaned (dr)
     (function (data-reader) (values list list))
   "DataReader::take by LOAN — WP-FLATDATA-ZC-LOAN literal-0-copy RX (FR-PF-3/4, NFR-PERF-7, R6, ADR 0017; NOT
@@ -1489,7 +1574,8 @@
         (pushnew handle touched :test #'equalp)
         (setf (sample-info-sample-state info) :read)
         (push d data)
-        (when (dds.types:flatdata-view-p d) (push d loans))))   ; a loaned view (registry slot); NIL otherwise
+        (cond ((dds.types:flatdata-view-p d) (push d loans))     ; FlatData: the view is both DATA and loan (ADR 0017)
+              ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i)); NIL otherwise
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
     (setf (dr-cache dr) '())                                    ; take removes ALL drained samples
     (values (nreverse data) (nreverse loans))))
@@ -1510,7 +1596,8 @@
         (pushnew handle touched :test #'equalp)
         (setf (sample-info-sample-state info) :read)
         (push d data)
-        (when (dds.types:flatdata-view-p d) (push d loans))))
+        (cond ((dds.types:flatdata-view-p d) (push d loans))     ; FlatData: the view is both DATA and loan (ADR 0017)
+              ((dds.disc:secured-loan-handle-p (cached-sample-loan cs)) (push (cached-sample-loan cs) loans)))))   ; secured: the pooled-buffer handle (ADR 0038 (i))
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))
     (values (nreverse data) (nreverse loans))))
 
@@ -1528,25 +1615,43 @@
    the registry (already returned, or never loaned — e.g. a copy-backed sample's NIL) is skipped without a
    second %zc-release and without a second cache scan, and %zc-release itself is generation-validated (a second
    release of an already-freed/regenerated slot is a validated no-op). So return-loan(loans) twice, or returning
-   a view after a read-then-take, is safe. NOT cleared for ship — pending counsel (R6)."
+   a view after a read-then-take, is safe. NOT cleared for ship — pending counsel (R6).
+   WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 residual (i)): each loan is released via a STRICT TYPE DISPATCH — a
+   flatdata-view (ADR 0017) goes to %zc-release; a dds.disc:secured-loan-handle (the zero-decode-buffer-alloc
+   secured loan) goes to dds.disc:node-return-loan and is NEVER %zc-released (and a view is never node-return-loaned).
+   The secured handle is SINGLE-OWNER (the disc-node registry is the authoritative owner; DCPS holds one reference
+   and returns once): the dr-secured-loans membership check plus node-return-loan's own idempotence (reg-index<0 &
+   buffer NIL -> no-op) make a double-return / a return-then-close a safe no-op — no double-free. The cache entry is
+   invalidated (by cached-sample-loan) BEFORE the disc-node recycles the pooled buffer, so a subsequent in-place
+   read can never race a pool recycle (no UAF; the deserialized struct in DATA is an independent copy, so it stays
+   valid regardless)."
   (dolist (v loans)
-    (when (and (dds.types:flatdata-view-p v) (member v (dr-loans dr)))   ; in the registry -> release exactly once
-      (setf (dr-cache dr) (delete v (dr-cache dr) :key #'cached-sample-data)) ; invalidate the cache entry BEFORE recycle (no stale read)
-      (dds.xport.zerocopy::%zc-release (dds.types:flatdata-view-pool-sap v)
-                                       (dds.types:flatdata-view-slot-index v)
-                                       (dds.types:flatdata-view-generation v))
-      (setf (dr-loans dr) (delete v (dr-loans dr)))
-      (push v (dr-view-freelist dr))))                                   ; recycle (NFR-MEM)
+    (cond
+      ((and (dds.types:flatdata-view-p v) (member v (dr-loans dr)))       ; FlatData ZC loan (ADR 0017) -> %zc-release, exactly once
+       (setf (dr-cache dr) (delete v (dr-cache dr) :key #'cached-sample-data)) ; invalidate the cache entry BEFORE recycle (no stale read)
+       (dds.xport.zerocopy::%zc-release (dds.types:flatdata-view-pool-sap v)
+                                        (dds.types:flatdata-view-slot-index v)
+                                        (dds.types:flatdata-view-generation v))
+       (setf (dr-loans dr) (delete v (dr-loans dr)))
+       (push v (dr-view-freelist dr)))                                    ; recycle (NFR-MEM)
+      ((and (dds.disc:secured-loan-handle-p v) (member v (dr-secured-loans dr)))   ; secured decode loan (ADR 0038 (i)) -> node-return-loan, NEVER %zc-release (strict type dispatch)
+       (setf (dr-cache dr) (delete v (dr-cache dr) :key #'cached-sample-loan))     ; invalidate the cache entry BEFORE the disc-node recycles the pooled buffer (no dangling in-place read)
+       (dds.disc:node-return-loan (dp-node (sub-participant (dr-subscriber dr))) v) ; the disc-node is the single owner + idempotent (reg-index<0 & buffer NIL -> no-op): frees the pooled buffer + purges the store entry
+       (setf (dr-secured-loans dr) (delete v (dr-secured-loans dr))))))
   t)
 
 (defun* return-all-loans (dr)
     (function (data-reader) t)
   "WP-FLATDATA-ZC-LOAN reader-close safety (FR-PF-3/4, R6, ADR 0017): return EVERY outstanding loan in DR's
-   registry (return-loan over a snapshot of dr-loans) so reader-close / delete-participant leaves NO held
-   refcount that would pin the writer's pool. Called BEFORE the engine stop-node detaches the reader-side pool
-   mapping (the views' SAP must still be valid for the final %zc-release). NOT cleared for ship — pending counsel
-   (R6)."
-  (return-loan dr (copy-list (dr-loans dr)))
+   registries (return-loan over a snapshot of BOTH dr-loans and, per WP-DCPS-SECURED-TAKE-LOAN / ADR 0038 (i),
+   dr-secured-loans) so reader-close / delete-participant leaves NO held refcount that would pin the writer's ZC
+   pool AND no acquired secured decode buffer outside its pool (the secured plaintext is released — no lingering
+   plaintext, no leak). Called BEFORE the engine stop-node detaches the reader-side pool mapping (the views' SAP
+   must still be valid for the final %zc-release; the secured handles are released before the decode arena is torn
+   down). A reader that drained secured samples but never took/returned them is swept here; stop-node's own
+   dds.disc:node-return-all-loans back-stops any handle the DCPS layer never registered. NOT cleared for ship —
+   pending counsel (R6)."
+  (return-loan dr (append (copy-list (dr-loans dr)) (copy-list (dr-secured-loans dr))))   ; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): sweep BOTH registries, each released via its own type-dispatched path
   t)
 
 (defun* %drain-one-sample (dr node ts key)
@@ -1565,9 +1670,11 @@
    EXCLUSIVE verdict: that sample is from an identified-but-not-yet-SEDP-matched writer whose strength
    is unresolved (DDS 1.4 §2.2.3.9.2), so the watermark is LEFT PENDING — the reliable engine already
    ACKed it and will never retransmit, so advancing the watermark would lose it permanently; a later
-   drain re-evaluates it once the match completes and the strength is known. A SECURED-LOAN-HANDLE
-   (WP-DDS-SECURITY-ZEROALLOC-AEAD T5b) is disc-node-only and must NEVER reach this DCPS drain; if a future
-   DCPS-loan mis-wire lets one through, the drain ERRORS rather than deserializing the struct as octets."
+   drain re-evaluates it once the match completes and the strength is known. A SECURED-LOAN-HANDLE store slot
+   (WP-DCPS-SECURED-TAKE-LOAN, ADR 0038 (i): a secured loan-capable reader) is dispatched to %drain-one-secured —
+   the plaintext is deserialized IN PLACE from the pooled decode buffer (no per-sample decrypt-output alloc) and the
+   handle is registered in dr-secured-loans; a bare-vector store slot (the non-secured / carve-fail path) falls
+   through to the allocating %deserialize-sample below, byte-identical."
   (let ((sguid (dds.disc:node-sample-writer-guid node key))
         (sn (dds.disc:node-sample-key-sn key))
         (advance t))                       ; advance the per-writer watermark unless arbitration keeps it pending
@@ -1575,8 +1682,9 @@
     (when (dds.disc:zc-loan-marker-p bytes)            ; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): an UNRESOLVED ZC ref -> acquire a literal-0-copy view, never deserialize
       (%drain-one-loan dr ts key bytes sn sguid)
       (return-from %drain-one-sample t))
-    (when (dds.disc:secured-loan-handle-p bytes)       ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: secured loans are disc-node-only — a handle here = a future DCPS-loan mis-wire; fail loud, never deserialize a struct as octets
-      (error "secured-loan-handle reached the DCPS drain (writer ~a SN ~a): secured loans are disc-node-only; set-secured-loan-capable was mis-wired into DCPS" sguid sn))
+    (when (dds.disc:secured-loan-handle-p bytes)       ; WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): a secured decode loan -> deserialize IN PLACE from the pooled buffer, register the handle, never allocate a decrypt vector
+      (%drain-one-secured dr node ts key bytes sn sguid)
+      (return-from %drain-one-sample t))
     (when bytes
       (let ((data (%deserialize-sample ts bytes)))
         ;; ContentFilteredTopic: drop reader-side a sample failing the filter.
@@ -1656,6 +1764,26 @@
   (declare (ignore sample))
   t)
 
+(defun* %release-secured-copy-loan (dr node cs)
+    (function (data-reader t cached-sample) t)
+  "WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 (i)): the COPY-API loan release. If cached-sample CS carries a secured decode
+   loan (cached-sample-loan is a dds.disc:secured-loan-handle), release it NOW — node-return-loan frees the pooled
+   decode buffer + purges the store entry — drop it from dr-secured-loans, and clear CS's loan slot so a later
+   return-loan / reader-close is a no-op on this sample. The standard read/take COPY API can release-after-snapshot
+   because the returned DATA is an INDEPENDENT deserialized struct (Copy #2), read exactly once at drain: freeing the
+   pooled plaintext buffer never invalidates it. This restores a secured copy-API reader to UNBOUNDED operation (the
+   pooled buffer is reused per sample) — without it the unconditional secured loan opt-in would pin one decode-pool
+   buffer per drained sample until reader-close (decode-pool exhaustion -> writer backpressure / SAMPLE_REJECTED).
+   STRICT TYPE DISPATCH: ONLY a secured-loan-handle is released here; a flatdata-view is NEVER touched by the copy
+   API (its DATA aliases the SHMEM slot, so an early release would be a use-after-free — the FlatData copy-API
+   behavior is left exactly as-is, its slot pinned until the app return-loans it)."
+  (let ((loan (cached-sample-loan cs)))
+    (when (dds.disc:secured-loan-handle-p loan)
+      (dds.disc:node-return-loan node loan)
+      (setf (dr-secured-loans dr) (delete loan (dr-secured-loans dr))
+            (cached-sample-loan cs) nil)))
+  t)
+
 (defun* read-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
     (function (data-reader &key (:states list) (:where function)) list)
   "DataReader::read — return the cached samples whose sample-state is in STATES
@@ -1663,9 +1791,13 @@
    satisfies WHERE (a predicate over the deserialized sample; %where-any by default —
    the query-condition filter for read_w_condition) WITHOUT removing them; mark each
    READ and set its SampleInfo view-state (NEW the first time the instance is accessed,
-   else NOT_NEW). Returns a list of cached-sample (data + info)."
+   else NOT_NEW). Returns a list of cached-sample (data + info). WP-DCPS-SECURED-TAKE-LOAN
+   (ADR 0038 (i)): a returned secured sample's decode loan is released here (release-after-snapshot,
+   %release-secured-copy-loan) — the sample STAYS in the cache (its DATA struct is independent + still
+   readable), so a secured copy-API reader recycles the pooled buffer per sample instead of pinning it."
   (%drain dr)
-  (let ((out '()) (touched '()))
+  (let ((out '()) (touched '())
+        (node (dp-node (sub-participant (dr-subscriber dr)))))
     (dolist (cs (dr-cache dr))
       (let ((info (cached-sample-info cs)))
         (when (and (member (sample-info-sample-state info) states)
@@ -1675,6 +1807,7 @@
                   (if (gethash handle (dr-instances dr)) :not-new :new))
             (pushnew handle touched :test #'equalp))
           (setf (sample-info-sample-state info) :read)
+          (%release-secured-copy-loan dr node cs)   ; release the secured decode loan (data struct is independent); FlatData view untouched
           (push cs out))))
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))   ; mark accessed after snapshot
     (nreverse out)))
@@ -1683,9 +1816,12 @@
     (function (data-reader &key (:states list) (:where function)) list)
   "DataReader::take — like read-samples but REMOVE the returned samples from the
    cache (default takes both read and unread). WHERE is the same optional query
-   predicate (take_w_condition filter). Returns a list of cached-sample."
+   predicate (take_w_condition filter). Returns a list of cached-sample. WP-DCPS-SECURED-TAKE-LOAN
+   (ADR 0038 (i)): a TAKEN secured sample's decode loan is released here (%release-secured-copy-loan) —
+   the returned DATA struct is independent, so the pooled buffer is recycled per take instead of pinned."
   (%drain dr)
-  (let ((keep '()) (out '()) (touched '()))
+  (let ((keep '()) (out '()) (touched '())
+        (node (dp-node (sub-participant (dr-subscriber dr)))))
     (dolist (cs (dr-cache dr))
       (let ((info (cached-sample-info cs)))
         (if (and (member (sample-info-sample-state info) states)
@@ -1695,6 +1831,7 @@
                 (setf (sample-info-view-state info)
                       (if (gethash handle (dr-instances dr)) :not-new :new))
                 (pushnew handle touched :test #'equalp))
+              (%release-secured-copy-loan dr node cs)   ; taken -> release the secured decode loan (data struct is independent); FlatData view untouched
               (push cs out))
             (push cs keep))))
     (dolist (h touched) (setf (gethash h (dr-instances dr)) t))

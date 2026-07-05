@@ -872,6 +872,21 @@
     (or (and (member kind '(:sign :encrypt)) t)
         (and (eq kind :unset) (disc-node-crypto-transform node) t))))
 
+(defun* node-secured-reader-p (node)
+    (function (disc-node) boolean)
+  "WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 residual (i)). The RECEIVE-side analog of %loan-write-data-protected-p:
+   T iff NODE's user reader DECODES a SecuredPayload (data_protection) on receive — i.e. its topic is secured, so
+   the DCPS opt-in (create-datareader) may route it through the zero-decode-buffer-alloc secured LOAN path
+   (set-secured-loan-capable). Governance-mandated data_protection (:sign/:encrypt) is secured even before a
+   crypto-transform is installed (the LIVE-handshake config carves the decode pool lazily on the first secured
+   receive, when the runtime decode gate's crypto-transform IS present); :unset (no governance, the Slice-1
+   direct-KM config) is secured only when a crypto-transform is already installed (the exact condition the receive
+   decode gate uses, dataplane.lisp %deliver-user-sample); :none (governance says data=NONE) rides plain — never
+   loan-capable. A plain reader (kind :unset, no crypto) -> NIL -> the allocating decode path stays byte-identical."
+  (let ((kind (disc-node-user-reader-data-protection-kind node)))
+    (or (and (member kind '(:sign :encrypt)) t)
+        (and (eq kind :unset) (disc-node-crypto-transform node) t))))
+
 (defun* node-loan-write-eligible-p (node size)
     (function (disc-node (integer 0)) boolean)
   "WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042). T iff NODE can loan-write a SIZE-octet FlatData

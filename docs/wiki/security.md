@@ -337,6 +337,31 @@ may since have been recycled onto new outstanding samples, so walking the whole 
 prematurely double-release a live loan — `node-return-loan` therefore **signals an error** on a
 vector passed without its populated count.  The single-handle and list shapes are unchanged.
 
+**The DCPS reader opts in (WP-DCPS-SECURED-TAKE-LOAN; ADR 0038 (i) RESOLVED).**  The
+`disc-node` loan above is wired up through the DDS `DataReader` loan lifecycle, mirroring the
+FlatData zero-copy loan.  `create-datareader` opts a **secured** reader (its topic's
+`data_protection` is non-NONE — `dds.disc:node-secured-reader-p`) into the loan path; a plain
+reader is unaffected and its decode path stays byte-identical.  Then `dds.dcps:take-loaned` /
+`read-loaned` deliver the sample and return the outstanding `secured-loan-handle`(s) as loans,
+and `dds.dcps:return-loan` / reader-close release them (type-dispatched to `node-return-loan`,
+**never** the FlatData `%zc-release`):
+
+```lisp
+(multiple-value-bind (data loans) (dds.dcps:take-loaned dr)   ; secured reader (opted-in at create-datareader)
+  (dolist (s data) (use-sample s))                            ; DATA is the deserialized struct (typed copy)
+  (dds.dcps:return-loan dr loans))                            ; release the secured decode-buffer loans
+```
+
+**Honest scope:** the DCPS-level win is the **decode buffer** — the per-sample decrypt-output
+allocation is eliminated (the plaintext is deserialized *in place* from the pooled buffer).  The
+**typed deserialize copy persists**: the DCPS typed read API returns deserialized application
+structs, so a plain XCDR2 secured payload is still deserialized into an independent struct and the
+loan pins only the pooled plaintext buffer until returned.  So it is a *zero-decode-buffer-alloc*
+secured read via the loan API, not a literal zero-copy typed read.  The secured handle is
+single-owner and its release is idempotent (a double return / a return-then-close is a safe
+no-op), and reader-close + participant teardown both sweep any outstanding loan — no double-free,
+no use-after-free, no leak, no lingering plaintext.
+
 Fail-closed semantics are preserved: a decode failure drops the sample and releases its buffer
 (no leak); **pool exhaustion** (every buffer loaned out) drops the surplus sample, bumps
 `disc-node-decode-pool-rejects` (a `SAMPLE_REJECTED` counter), and leaves the sample

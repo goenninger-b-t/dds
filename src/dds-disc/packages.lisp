@@ -47,7 +47,7 @@
            #:set-secured-loan-capable #:disc-node-secured-loan-capable #:disc-node-decode-pool #:disc-node-decode-pool-rejects
            #:secured-loan-handle #:secured-loan-handle-p #:secured-loan-handle-len
            #:secured-loan-handle-buffer #:secured-loan-handle-guid #:secured-loan-handle-sn #:secured-loan-bytes
-           #:node-take-loaned #:node-return-loan #:node-return-all-loans
+           #:node-take-loaned #:node-return-loan #:node-return-all-loans #:node-secured-reader-p
            ;; WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017): loan-capable flag + the unresolved ZC-ref marker
            #:set-zc-loan-capable #:disc-node-zc-loan-capable
            ;; WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042): TX loan-write pool API
