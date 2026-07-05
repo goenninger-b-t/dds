@@ -32,6 +32,18 @@ policy, not configuration.
    (today: inflate + name fingerprint; the full parse was deferred by ADR 0009 and is now
    scheduled as the follow-on feature). The Stage-4 `type-gate` consumes whichever source a
    peer provides: standard TypeInformation+TypeLookup, or the 0x8021 legacy TypeObject.
+   > **DISCHARGED (ADR 0011, 2026-06-11):** the full structural parse landed the day after this
+   > ADR — a bounds-checked clean-room TLV parser (`parse-legacy-type-object`, structs/primitives/
+   > strings/sequences/arrays/enums/unions/nested/extensibility/keys) folding into a
+   > `minimal-struct-type`, plus the OMG-standard MinimalTypeObject CDR codec + TypeLookup +
+   > the §7.2.4.4 structural-assignability algorithm (`assignability.lisp`), all wired into the
+   > `%participant-type-gate` and validated LIVE both directions vs RTI Connext 7.3.1 (legacy) and
+   > Fast DDS 3.6.1 (standard) with a proven **no-false-reject** (ADR 0011 Step 3). The
+   > name-fingerprint survives only as an advisory diagnostic (ADR 0009), never a gate. Residual
+   > (marginal, each fail-open): sequence/union/MUTABLE-member EquivalenceHash byte-serialization
+   > (peer-oracle-gated), a few edge legacy constructs (bitmask/multi-dim-array/sequence-of-
+   > aggregate/multi-label-union), and a first-class CompleteTypeObject tree — none block
+   > assignability, which matches on Minimal.
 3. **M4 exit gate amended:** "remote type discovery via TypeLookup interoperates with a
    compliant peer (offline conformance now; Fast DDS under FR-IO-2); type-compatibility
    assessment interoperates with Connext via its legacy TypeObject announcement."
