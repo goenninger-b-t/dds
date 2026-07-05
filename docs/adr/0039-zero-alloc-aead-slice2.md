@@ -59,10 +59,14 @@ send and receive.** With ADR-0038's `data_protection` tier, **all three AEAD tie
 common path.
 
 **Origin authentication (receiver-specific MACs, `..._WITH_ORIGIN_AUTHENTICATION`) is NOT made zero-alloc here.**
-It remains the **deferred allocating fallback** — off the common empty-receivers path (the corpora and the e2e use
-no origin-auth). The `-into` cores fall back to the allocating `%compute-receiver-macs` path when `receivers` is
-non-empty (still written into the out-buffer, but it may allocate). **Do NOT read this as "origin-auth is
-zero-alloc."** Zero-alloc-ing it needs a receiver-session-key cache parallel to `%km-session-key-at` + footer-region
+*(SUPERSEDED — Residual (a) is now RESOLVED, commit `bc3d2c8`, WP-SECURITY-ORIGIN-AUTH-ZEROALLOC. The origin-auth
+receiver-MAC path is zero-alloc end-to-end: a receiver-session-key cache (`%km-receiver-session-key-at` +
+`cached-recv-*` slots) + footer-region GMAC-into + a memoized per-remote receiver-descriptor list. Live mem arms
+`oauth-send`/`oauth-recv` drive the real memoized resolver at 0.0000 B/sample. The pre-resolution text below is kept
+for history.)* It remains the **deferred allocating fallback** — off the common empty-receivers path (the corpora and
+the e2e use no origin-auth). The `-into` cores fall back to the allocating `%compute-receiver-macs` path when
+`receivers` is non-empty (still written into the out-buffer, but it may allocate). **Do NOT read this as "origin-auth
+is zero-alloc."** Zero-alloc-ing it needs a receiver-session-key cache parallel to `%km-session-key-at` + footer-region
 MAC writes + a per-receiver GMAC-into (Residual (a)).
 
 The **ZA-1 non-tier residuals** (key-material foreign-hardening, ZC × `rtps_protection` SHMEM cleartext,

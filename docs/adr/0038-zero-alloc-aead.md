@@ -246,9 +246,7 @@ Residual (a)). **Still open (carried into ADR 0039 Residual (d)):** when a futur
 `%km-session-key-at`'s two-slot publish against a concurrent-different-session_id tear (the current fence protocol is
 tear-safe only while session_id is effectively constant per km and decode is single-threaded).
 
-**(b) KeyMaterial GC-heap → foreign + zeroize (ADR-0034 deferral).** The session-key cache and the KeyMaterial key
-bytes live on the GC heap. Derived once, so they do not move steady-state `bytes-consed`; migrating all key material
-to foreign/static buffers with zeroize-on-teardown is the hardening follow-on (ADR 0034 / ADR-0036 Carry 6).
+**(b) KeyMaterial GC-heap → foreign + zeroize (ADR-0034 deferral). — RESOLVED (commit `6beb08b`, WP-SECURITY-KEYMATERIAL-HARDEN).** The KeyMaterial MASTER secrets (salt/sender/receiver) are now foreign/static + zeroize-on-teardown. The DERIVED session-key caches deliberately stay GC-heap — a review caught that foreign-static-per-session_id would unboundedly leak un-wiped key bytes on session_id rotation (pre-auth-reachable), so they are heap-by-design (ephemeral/re-derivable/GC-safe), with a RED regression guard asserting rotated keys stay GC-heap. Scope closed to the master slots.
 
 **(c) Zero-Copy × `rtps_protection` SHMEM cleartext (ADR-0036 Carry 10).** With ZC/SHMEM transfer only the 16-byte
 reference datagram is RTPS-wrapped; the payload sits in shared memory in the clear. Reconciling SHMEM with
