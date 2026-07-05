@@ -131,6 +131,13 @@ Pool slots are `mmap` foreign/static memory (NFR-MEM). Publish/resolve hooks: sl
 Reliable Zero-Copy; literal 0-copy read-in-place (WP-FLATDATA, ADR 0015 — **update:** WP-FLATDATA shipped a
 **safe SINGLE copy** ~830× RX win; **literal-0-copy is still deferred**, needs an engine-contract change, see
 ADR 0015 *Phase D outcome*); app-facing explicit `get-loan`/`return-loan` write API; cross-vendor ZC interop.
+> **SUPERSEDED (2026-07-05):** literal-0-copy read-in-place IS now DELIVERED — the engine-contract change
+> (store the slot ref as a `zc-loan-marker` and hold it refcount-spanning, read fields through SAP-backed
+> `-fd` accessors) shipped as **WP-FLATDATA-ZC-LOAN (ADR 0017)** and was driven to **0 GC-bytes/sample** by
+> **WP-ZC-LOAN-LOCKFREE (ADR 0018)**: the loaned FlatData RX path performs 0 intra-host copies and 0 heap
+> allocation (measured 65552→79→31→0 B/sample). The app-facing loan-write TX API also shipped (ADR 0042).
+> The one remaining constraint is the one-loan-capable-reader-per-`disc-node` invariant (ADR 0017 §), which
+> the N-user-endpoint refactor lifts — not a literal-0-copy gap.
 
 ## Consequences
 
@@ -240,5 +247,8 @@ Reliable Zero-Copy (slot lifetime vs the ACK path); literal 0-copy **read-in-pla
 ADR 0015 Phase-D outcome:** WP-FLATDATA shipped a **safe SINGLE copy** — it removed the resolve-side sink
 over-allocation the E1 bench surfaced, a ~830× RX win — but **literal-0-copy remains deferred**, needing an
 engine-contract change); an app-facing explicit `get-loan` / `return-loan` write API; cross-vendor ZC interop.
+> **SUPERSEDED (2026-07-05):** literal-0-copy read-in-place + the get-loan/return-loan write API are BOTH
+> DELIVERED — WP-FLATDATA-ZC-LOAN (ADR 0017) + WP-ZC-LOAN-LOCKFREE (ADR 0018, 0 GC-bytes/sample RX) for the
+> read side; WP-FLATDATA-LOAN-WRITE (ADR 0042) for the write side. See the top-of-section note.
 
 **NOT cleared for ship — pending counsel (R6); see the R6 — PATENT GATE section above.**

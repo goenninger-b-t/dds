@@ -174,12 +174,17 @@ WP-FLATDATA v1 ships exactly the following for a `:flatdata t` **FINAL all-fixed
 - **NO_KEY in the original v1; keyed (fixed-size scalar `@key`) lifted 2026-06-17** — see *Keyed FlatData*
   below. A variable-size / string `@key` member remains a **compile-time error** (FlatData v1 fixed-size scalar).
 
-**Deferred (follow-ups — stated as not-done):**
-1. **Literal-0-copy RX** — requires an **engine-contract change**: a SAP-backed (or SAP→Lisp-array) accessor
-   primitive **and** a DCPS-level refcount-spanning, ZC-aware, type-aware read path (slot delivered as a
-   refcounted loan held until the app's read completes). See *Phase D outcome* for the four individually-fatal
-   blockers that make a literal-0-copy SHMEM-slot view a cross-process use-after-free in the current architecture.
-   *(Literal-0-copy RX subsequently delivered — WP-FLATDATA-ZC-LOAN, ADR 0017.)*
+**Deferred (follow-ups — stated as not-done at Phase D; item 1 SUBSEQUENTLY DELIVERED, see note):**
+1. **Literal-0-copy RX — DELIVERED (WP-FLATDATA-ZC-LOAN, ADR 0017; 0-alloc finish WP-ZC-LOAN-LOCKFREE, ADR
+   0018).** The engine-contract change was made exactly as specified: the SAP-backed `-fd` accessor primitive
+   + the DCPS-level refcount-spanning, ZC-aware, type-aware read path (the received slot is stored as a
+   `zc-loan-marker` ref — not a heap copy — and delivered as a refcounted loan held across the app's read via
+   `take-loaned`/`return-loan`). The four Phase-D cross-process-UAF blockers are all resolved (generation-
+   guarded slot lifetime; refcount held until `return-loan`; force-reclaim skips refcount>0). The loaned
+   FlatData RX path is now 0 intra-host copies AND 0 GC-bytes/sample (measured 65552→79→31→0). The one
+   remaining constraint — one loan-capable reader per `disc-node` (ADR 0017 §) — is lifted by the
+   N-user-endpoint refactor, not a literal-0-copy gap. Non-FlatData types are inherently bounded out (their
+   typed read API returns a deserialized struct = a copy).
 2. **The Builder + variable-size FlatData** — strings, sequences, nested/variable members, `@mutable`
    (variable-size / string `@key` members ride this — still deferred).
 3. ~~Keyed FlatData (v1 is NO_KEY).~~ **Done for fixed-size scalar keys** (WP-KEYED-FLATDATA, 2026-06-17) —
@@ -237,7 +242,9 @@ process-local constants) is part of the security pass that must precede any ZC-o
 - `src/dds-tests/integration-test.lisp` — `run-flatdata-zerocopy-test` (round-trip via Offset accessors +
   honest RX bytes/sample measurement) (Phase D)
 - The **literal 0-copy SAP view with refcount lifetime is deferred** (engine-contract change — see
-  *Phase D outcome*); the non-ZC RX path also copies once because the engine frees the RX buffer after delivery
+  *Phase D outcome*) — **SUBSEQUENTLY DELIVERED: WP-FLATDATA-ZC-LOAN (ADR 0017) + WP-ZC-LOAN-LOCKFREE (ADR
+  0018), 0 GC-bytes/sample on the loaned FlatData RX path;** the non-ZC RX path still copies once because the
+  engine frees the RX buffer after delivery (inherent to the non-loan / non-FlatData read)
 
 ## Provenance
 
