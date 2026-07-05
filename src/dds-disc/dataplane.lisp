@@ -2097,6 +2097,29 @@
           (aref g 14) (ldb (byte 8 8) writer-id) (aref g 15) (ldb (byte 8 0) writer-id))
     g))
 
+(defun* %reader-routes-for (node writer-guid)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) list)
+  "WP-N-ENDPOINT-S2 (ADR 0048): the local user readers matched to remote writer WRITER-GUID, as a list of
+   (reader-EntityId . engine-rtps-reader) pairs — the receive-hook DEMUX. The FIRST pair is the CANONICAL reader:
+   it holds the single reliability truth for this writer (received-SN / dedup / reassembly / instance state), so a
+   HEARTBEAT is applied and an ACKNACK is COMPUTED from it once. TODAY THE ROUTE HOLDS EXACTLY ONE reader-id per
+   writer: %match-remote-endpoint route-adds only the FIRST matching local reader per remote-writer GUID, and
+   same-topic multi-reader on one participant is FAIL-FAST-DEFERRED (add-local-reader) — so different-topic readers
+   each match their OWN writer (distinct GUID -> distinct single-entry route). The per-reader emit loop in the
+   HEARTBEAT/NACK_FRAG hooks (dolist over this list) therefore runs exactly once today; it ANTICIPATES the later
+   route-add-all-matching-readers slice (where a same-topic 2nd reader would add a 2nd id, and each remote
+   ReaderProxy needs its own reader-id ACKNACK). An EMPTY route (discovery-less / pre-match / N=1) falls back to
+   the PRIMARY reader under disc-node-user-reader-id — byte-identical to the pre-S2 single-reader hooks. A route id
+   with no live engine reader is skipped (never a crash)."
+  (let ((ids (dds.pal:with-lock ((disc-node-lock node))
+               (copy-list (gethash writer-guid (disc-node-reader-routes node))))))
+    (if ids
+        (loop for rid in ids
+              for r = (%user-reader-for node rid)
+              when r collect (cons rid r))
+        (let ((r (disc-node-user-reader node)))
+          (and r (list (cons (disc-node-user-reader-id node) r)))))))
+
 (defun* %on-user-lifecycle (node writer-id sn kind key-hash status-flags src-prefix)
     (function (disc-node (unsigned-byte 32) integer (member :dispose :unregister) t (unsigned-byte 8)
               (simple-array (unsigned-byte 8) (12))) t)
@@ -2108,9 +2131,11 @@
    DCPS-facing lifecycle-event callback OUTSIDE the node lock (mirrors %deliver-user-sample). Gated on
    a matched user writer EntityId."
   (when (and (disc-node-user-reader node) (%user-writer-entityid-p writer-id))
-    (let ((guid (%source-guid src-prefix writer-id)))
-      (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn
-                                        (make-array 0 :element-type '(unsigned-byte 8)))
+    (let* ((guid (%source-guid src-prefix writer-id))
+           (routes (%reader-routes-for node guid)))   ; WP-N-ENDPOINT-S2: drive the CANONICAL reader matched to this writer (not unconditionally the primary)
+      (when routes
+        (dds.rtps.reliable:reader-on-data (cdr (first routes)) guid sn
+                                          (make-array 0 :element-type '(unsigned-byte 8))))
       (dds.pal:with-lock ((disc-node-lock node))
         ;; 2-level (source-GUID -> SN) keying mirrors the data store: a SequenceNumber is unique only
         ;; within one writer GUID (RTPS 2.5 §8.3.5.4), so two writers sharing EntityId 0x102 on different
@@ -2712,11 +2737,16 @@
                 (setf stored plain))))))
     ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too); the loan path feeds
     ;; the proxy an EMPTY payload (the plaintext lives in the loaned buffer, not the proxy) — mirrors %deliver-user-marker.
-    (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn
-                                      (if loan (load-time-value (make-array 0 :element-type '(unsigned-byte 8))) stored))
+    ;; WP-N-ENDPOINT-S2 (ADR 0048): drive the CANONICAL reader matched to this writer (route demux; N=1/pre-match ->
+    ;; the primary, byte-identical). The node-global store + the per-reader %drain filter separate delivery per reader.
+    (let* ((routes (%reader-routes-for node guid))
+           (canon (and routes (cdr (first routes)))))
+    (when canon
+      (dds.rtps.reliable:reader-on-data canon guid sn
+                                        (if loan (load-time-value (make-array 0 :element-type '(unsigned-byte 8))) stored)))
     (cond
       ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
-      ((dds.rtps.reliable:reader-dedup-accept-p (disc-node-user-reader node) effective-guid effective-sn)
+      ((and canon (dds.rtps.reliable:reader-dedup-accept-p canon effective-guid effective-sn))
        (dds.pal:with-lock ((disc-node-lock node))
          (setf (gethash sn (%inner-table (disc-node-samples node) guid)) stored
                (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
@@ -2728,7 +2758,7 @@
          (when loan (%secured-loan-register node loan)))   ; T5b/T5d: register the loan in the fixed registry vector (receiver registers; app return-loan releases)
        (when (disc-node-on-sample node) (funcall (disc-node-on-sample node))))
       ;; T5b: a deduped DUPLICATE on the loan path -> release the unused pooled buffer (no store, no leak)
-      (loan (%secured-loan-release node loan))))
+      (loan (%secured-loan-release node loan)))))
   t)
 
 (defun* %on-user-data (node writer-id sn buf poff plen src-prefix
@@ -2794,22 +2824,31 @@
       (dds.rtps.message:parse-heartbeat-body c flags)
     (declare (ignore rid count finalp livep))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid))
-      (let ((reader (disc-node-user-reader node))
-            (wguid (%source-guid src-prefix wid)))
+      (let ((wguid (%source-guid src-prefix wid)))
         ;; RESIDUAL (ADR 0043): safe only while SEDP is unicast — match-commit and this HEARTBEAT serialize on
         ;; ONE rx thread; multicast-SEDP/split-metatraffic must arm the reader baseline with %record-match first
         (when (%guid-matched-p node wguid)   ; match gate: process/answer only a MATCHED writer's HEARTBEAT (§8.4.10.1)
-          (dds.rtps.reliable:reader-on-heartbeat reader wguid first last)
-          (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
-            (let ((cnt (incf (disc-node-ack-count node))))
-              (dolist (pd (%match-destinations-prefixed node nil))   ; ACKNACK -> matched writers; T10 wraps a :keyed dest
-                (%send-msg-buf node (disc-node-rx-tx-msg node)
-                               (lambda (mc)
-                                 ;; writerEntityId = the REMOTE writer's id (WID), so the peer
-                                 ;; routes the ACKNACK to its writer (not our local convention).
-                                 (dds.rtps.message:write-acknack
-                                  mc (disc-node-user-reader-id node) wid base numbits bitmap cnt :final t))
-                               (cadr pd) (cddr pd) (car pd)))))))))
+          ;; WP-N-ENDPOINT-S2 (ADR 0048): apply the HEARTBEAT to + compute the ACKNACK from the CANONICAL reader
+          ;; matched to this writer, then EMIT the ACKNACK stamped with the matched local reader's EntityId (a
+          ;; remote ReaderProxy is keyed by the reader GUID it matched — the ACKNACK must carry THAT reader's id,
+          ;; not the primary's). N=1/pre-match -> the primary under disc-node-user-reader-id, byte-identical. The
+          ;; dolist runs EXACTLY ONCE today (the route holds one reader-id per writer; same-topic multi-reader is
+          ;; fail-fast-deferred, %reader-routes-for) — it anticipates the later route-add-all-readers slice.
+          (let ((routes (%reader-routes-for node wguid)))
+            (when routes
+              (let ((reader (cdr (first routes))))
+                (dds.rtps.reliable:reader-on-heartbeat reader wguid first last)
+                (multiple-value-bind (base numbits bitmap) (dds.rtps.reliable:reader-acknack reader wguid)
+                  (dolist (rr routes)
+                    (let ((cnt (incf (disc-node-ack-count node))))
+                      (dolist (pd (%match-destinations-prefixed node nil))   ; ACKNACK -> matched writers; T10 wraps a :keyed dest
+                        (%send-msg-buf node (disc-node-rx-tx-msg node)
+                                       (lambda (mc)
+                                         ;; writerEntityId = the REMOTE writer's id (WID), so the peer
+                                         ;; routes the ACKNACK to its writer (not our local convention).
+                                         (dds.rtps.message:write-acknack
+                                          mc (car rr) wid base numbits bitmap cnt :final t))
+                                       (cadr pd) (cddr pd) (car pd)))))))))))))
   t)
 
 (defun* %on-user-gap (node c flags src-prefix)
@@ -2826,8 +2865,10 @@
   (multiple-value-bind (rid wid gap-start base numbits bitmap) (dds.rtps.message:parse-gap-body c flags)
     (declare (ignore rid))
     (when (and base (disc-node-user-reader node) (%user-writer-entityid-p wid))
-      (dds.rtps.reliable:reader-on-gap (disc-node-user-reader node) (%source-guid src-prefix wid)
-                                       gap-start base numbits bitmap)))
+      (let ((routes (%reader-routes-for node (%source-guid src-prefix wid))))   ; WP-N-ENDPOINT-S2: the CANONICAL reader matched to this writer
+        (when routes
+          (dds.rtps.reliable:reader-on-gap (cdr (first routes)) (%source-guid src-prefix wid)
+                                           gap-start base numbits bitmap)))))
   t)
 
 (defun* %on-user-acknack (node c flags src-prefix)
@@ -2884,13 +2925,15 @@
       (dds.rtps.message:parse-data-frag-body c flags body-len)
     (declare (ignore rdr keyp))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wtr))
-      (let ((region (make-array plen :element-type '(unsigned-byte 8)))
-            (wguid (%source-guid src-prefix wtr)))
-        (replace region (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
-        (let ((done (dds.rtps.reliable:reader-on-data-frag
-                     (disc-node-user-reader node) wguid sn fstart frags fsize ssize region)))
-          ;; DATA_FRAG: no relay forwarding -> wire GUID/SN are the logical origin (no PID_ORIGINAL_WRITER_INFO on frags)
-          (when done (%deliver-user-sample node wtr sn done src-prefix wguid sn))))))
+      (let* ((region (make-array plen :element-type '(unsigned-byte 8)))
+             (wguid (%source-guid src-prefix wtr))
+             (routes (%reader-routes-for node wguid)))   ; WP-N-ENDPOINT-S2: reassemble on the CANONICAL reader matched to this writer (same reader %on-user-heartbeat-frag NACK_FRAGs from)
+        (when routes
+          (replace region (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
+          (let ((done (dds.rtps.reliable:reader-on-data-frag
+                       (cdr (first routes)) wguid sn fstart frags fsize ssize region)))
+            ;; DATA_FRAG: no relay forwarding -> wire GUID/SN are the logical origin (no PID_ORIGINAL_WRITER_INFO on frags)
+            (when done (%deliver-user-sample node wtr sn done src-prefix wguid sn)))))))
   t)
 
 (defun* %on-user-heartbeat-frag (node c flags src-prefix)
@@ -2904,15 +2947,21 @@
     (declare (ignore rid lastfrag count))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid)
                (%guid-matched-p node (%source-guid src-prefix wid)))
-      (multiple-value-bind (base numbits bitmap)
-          (dds.rtps.reliable:reader-frag-acknack (disc-node-user-reader node) (%source-guid src-prefix wid) sn)
-        (when base
-          (let ((cnt (incf (disc-node-ack-count node))))
-            (dolist (pd (%match-destinations-prefixed node nil))   ; T10: wrap the NACK_FRAG to a :keyed writer
-              (%send-msg-buf node (disc-node-rx-tx-msg node)
-                             (lambda (mc) (dds.rtps.message:write-nack-frag
-                                           mc (disc-node-user-reader-id node) wid sn base numbits bitmap cnt))
-                             (cadr pd) (cddr pd) (car pd))))))))
+      ;; WP-N-ENDPOINT-S2 (ADR 0048): NACK_FRAG from the CANONICAL reader (its reassembly proxy, same one
+      ;; %on-user-data-frag fed), stamped with the matched local reader's EntityId (correct wire reader id). The
+      ;; dolist runs EXACTLY ONCE today (one reader-id per writer; same-topic multi-reader fail-fast-deferred).
+      (let ((routes (%reader-routes-for node (%source-guid src-prefix wid))))
+        (when routes
+          (multiple-value-bind (base numbits bitmap)
+              (dds.rtps.reliable:reader-frag-acknack (cdr (first routes)) (%source-guid src-prefix wid) sn)
+            (when base
+              (dolist (rr routes)
+                (let ((cnt (incf (disc-node-ack-count node))))
+                  (dolist (pd (%match-destinations-prefixed node nil))   ; T10: wrap the NACK_FRAG to a :keyed writer
+                    (%send-msg-buf node (disc-node-rx-tx-msg node)
+                                   (lambda (mc) (dds.rtps.message:write-nack-frag
+                                                 mc (car rr) wid sn base numbits bitmap cnt))
+                                   (cadr pd) (cddr pd) (car pd)))))))))))
   t)
 
 (defun* %on-user-nack-frag (node c flags)
@@ -3459,6 +3508,104 @@
                        (dds.rtps.reliable::rtps-writer-frag-hb-count wa))))
            t)
       (stop-node pub))))
+
+(defun* run-n-reader-dataplane-test ()
+    (function () (eql t))
+  "WP-N-ENDPOINT-S2 (ADR 0048): ONE participant with TWO non-secured user DataReaders on DIFFERENT topics, each fed
+   by its own remote writer participant. Asserts: (1) the two readers get DISTINCT EntityIds/GUIDs (pre-S2 both
+   collided on #x0107 — the RED); (2) both readers match their own writer + the DELIVERY ROUTE is correct — reader-A
+   is matched to writer-A's GUID and NOT to writer-B's, and vice-versa (node-reader-matches-writer-p; a cross entry
+   would be the cross-topic-deserialize corruption source); (3) the node store receives BOTH writers' samples under
+   the demux (canonical-reader routing), one per writer. Then the ROUTE LIFECYCLE (unmatch/lease-expiry drops the
+   route, re-announce re-adds it — no dropped own-samples) and the S2 DEFERRAL fail-fasts: a 2nd SECURED reader and
+   a 2nd ZC-loan-capable reader -> Slice S3/S4."
+  (let* ((pp (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(7 7 7 7 7 7 7 7 7 7 7 7)))
+         (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(8 8 8 8 8 8 8 8 8 8 8 8)))
+         (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(9 9 9 9 9 9 9 9 9 9 9 9)))
+         (sub  (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0))   ; ONE participant, TWO readers
+         (puba (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+         (pubb (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+         (payla (make-array 6 :element-type '(unsigned-byte 8) :initial-contents '(#xA1 #xA2 #xA3 #xA4 #xA5 #xA6)))
+         (paylb (make-array 6 :element-type '(unsigned-byte 8) :initial-contents '(#xB1 #xB2 #xB3 #xB4 #xB5 #xB6))))
+    (unwind-protect
+         (let (ida idb wga wgb)
+           (let ((epwa (add-local-writer puba :topic "NRA" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)))
+             (enable-publisher puba)
+             (setf wga (dds.rtps.discovery:endpoint-data-guid epwa)))
+           (let ((epwb (add-local-writer pubb :topic "NRB" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)))
+             (enable-publisher pubb)
+             (setf wgb (dds.rtps.discovery:endpoint-data-guid epwb)))
+           (let ((epra (add-local-reader sub :topic "NRA" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)))
+             (enable-subscriber sub)
+             (setf ida (disc-node-user-reader-id sub))
+             (let ((eprb (add-local-reader sub :topic "NRB" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)))
+               (enable-subscriber sub)
+               (setf idb (disc-node-user-reader-id sub))
+               (assert (/= ida idb) () "the two DataReaders did not get DISTINCT EntityIds (pre-S2 clobber: both #x~8,'0X)" ida)
+               (assert (not (equalp (dds.rtps.discovery:endpoint-data-guid epra)
+                                    (dds.rtps.discovery:endpoint-data-guid eprb)))
+                       () "the two DataReaders announce IDENTICAL SEDP GUIDs (a remote peer would see 1 aliased reader)")))
+           (setf (disc-node-peers sub)  (list (cons "127.0.0.1" (disc-node-port puba)) (cons "127.0.0.1" (disc-node-port pubb)))
+                 (disc-node-peers puba) (list (cons "127.0.0.1" (disc-node-port sub)))
+                 (disc-node-peers pubb) (list (cons "127.0.0.1" (disc-node-port sub))))
+           (start-node sub) (start-node puba) (start-node pubb)
+           (announce-participant sub) (announce-participant puba) (announce-participant pubb)
+           (loop repeat 150
+                 until (and (>= (disc-node-discovered-count sub) 2)
+                            (plusp (disc-node-discovered-count puba))
+                            (plusp (disc-node-discovered-count pubb)))
+                 do (sleep 0.02))
+           (announce-endpoints sub) (announce-endpoints puba) (announce-endpoints pubb)
+           (loop repeat 150
+                 until (and (>= (disc-node-matched-count sub) 2)
+                            (plusp (disc-node-matched-count puba))
+                            (plusp (disc-node-matched-count pubb)))
+                 do (announce-endpoints sub) (sleep 0.02))
+           (assert (>= (disc-node-matched-count sub) 2) () "the 2 readers did not both match their remote writer")
+           ;; (2) route correctness: reader-A <-> writer-A only, reader-B <-> writer-B only (no cross = no corruption source)
+           (assert (node-reader-matches-writer-p sub ida wga) () "reader-A must be routed to writer-A's GUID")
+           (assert (node-reader-matches-writer-p sub idb wgb) () "reader-B must be routed to writer-B's GUID")
+           (assert (not (node-reader-matches-writer-p sub ida wgb)) () "reader-A must NOT be routed to writer-B (cross-topic route = corruption)")
+           (assert (not (node-reader-matches-writer-p sub idb wga)) () "reader-B must NOT be routed to writer-A (cross-topic route = corruption)")
+           ;; (3) both writers publish -> the node store receives each writer's sample (demux canonical routing)
+           (publish-sample puba payla) (publish-sample pubb paylb)
+           (loop repeat 150 until (>= (node-sample-count sub) 2) do (announce-endpoints puba) (announce-endpoints pubb) (sleep 0.02))
+           (assert (= 2 (node-sample-count sub)) () "the store must hold EXACTLY one sample per writer (2)")
+           (assert (equalp payla (node-sample sub (cons wga 1))) () "writer-A's sample must be stored under writer-A's GUID")
+           (assert (equalp paylb (node-sample sub (cons wgb 1))) () "writer-B's sample must be stored under writer-B's GUID")
+           ;; route lifecycle: unmatch/lease-expiry drops the route; a re-announce re-adds it (no dropped own-samples)
+           (dds.pal:with-lock ((disc-node-lock sub)) (%purge-prefix sub pa #'disc-node-reader-routes))
+           (assert (not (node-reader-matches-writer-p sub ida wga)) () "unmatch/lease-expiry must drop reader-A's route to writer-A")
+           (%reader-route-add sub wga ida)
+           (assert (node-reader-matches-writer-p sub ida wga) () "a re-announce must re-add reader-A's route (no permanent drop)")
+           ;; (4) deferral: a 2nd SECURED reader fail-fasts (Slice S3/S4)
+           (let ((sn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
+             (unwind-protect
+                  (progn (add-local-reader sn :topic "SA" :type "X") (enable-subscriber sn)
+                         (setf (disc-node-user-reader-data-protection-kind sn) :sign)   ; mark the node secured (governance data_protection)
+                         (add-local-reader sn :topic "SB" :type "X")
+                         (assert (null (ignore-errors (enable-subscriber sn) t)) ()
+                                 "a 2nd SECURED reader must fail-fast (Slice S3/S4)"))
+               (stop-node sn)))
+           ;; (4b) deferral: a 2nd ZC-loan-capable reader fail-fasts (Slice S3/S4)
+           (let ((zn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
+             (unwind-protect
+                  (progn (add-local-reader zn :topic "ZA" :type "X") (enable-subscriber zn)
+                         (set-zc-loan-capable zn t)   ; mark the node ZC-loan-capable
+                         (add-local-reader zn :topic "ZB" :type "X")
+                         (assert (null (ignore-errors (enable-subscriber zn) t)) ()
+                                 "a 2nd ZC-loan-capable reader must fail-fast (Slice S3/S4)"))
+               (stop-node zn)))
+           ;; (4c) deferral: a 2nd reader on the SAME topic fail-fasts (same-topic multi-reader = later slice); the
+           ;; route holds one reader per writer, so a 2nd same-topic reader would be unrouted -> silent false-REJECT
+           (let ((tn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
+             (unwind-protect
+                  (progn (add-local-reader tn :topic "SAME" :type "X") (enable-subscriber tn)
+                         (assert (null (ignore-errors (add-local-reader tn :topic "SAME" :type "X") t)) ()
+                                 "a 2nd DataReader on the SAME topic must fail-fast (same-topic multi-reader deferred)"))
+               (stop-node tn)))
+           t)
+      (stop-node sub) (stop-node puba) (stop-node pubb))))
 
 (defun* run-dispose-dataplane-test ()
     (function () (eql t))

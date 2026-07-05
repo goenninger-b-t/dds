@@ -182,6 +182,8 @@
   (user-writer-id #x00000102 :type (unsigned-byte 32)) ; this node's user-data writer EntityId (kind reflects keyed-ness)
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
   (user-writer-key-next 1 :type (integer 1)) ; WP-N-ENDPOINT-S1 (ADR 0048): next distinct per-participant USER-writer entity KEY; starts 1 so the first writer keeps EntityId #x0102/#x0103 (byte-identical), each subsequent DataWriter gets a distinct key -> distinct EntityId + SEDP GUID (RTPS 2.5 §9.3.1.2). Builtin/secure keys are untouched.
+  (user-reader-key-next 1 :type (integer 1)) ; WP-N-ENDPOINT-S2 (ADR 0048): next distinct per-participant USER-reader entity KEY; starts 1 so the first reader keeps EntityId #x0107/#x0104 (byte-identical), each subsequent DataReader gets a distinct key -> distinct EntityId + SEDP GUID (RTPS 2.5 §9.3.1.2). Writer/reader keys are SEPARATE counters (kind 0x02/0x03 vs 0x07/0x04 disjoints them); builtin/secure keys are untouched.
+  (reader-routes (make-hash-table :test 'equalp) :type hash-table) ; WP-N-ENDPOINT-S2 (ADR 0048): the DELIVERY ROUTE — remote-writer 16-octet GUID (equalp) -> list of local user-reader EntityIds matched to it. Populated at %match-remote-endpoint (idempotent), purged on unmatch/lease-expiry (by prefix) + re-added on re-announce. The %drain source-GUID filter (each reader deserializes ONLY its matched writers) and the receive-hook demux (drive/ACKNACK the engine reader matched to the source writer, not unconditionally the primary) read it. Node-lock guarded.
   ;; FR-XPORT-2 SHMEM intra-host data plane (same-host user DATA only; discovery/HB/ACKNACK stay UDP)
   (shmem nil :type t)                     ; this node's shmem-transport (NIL = SHMEM off: *shmem-enabled* nil or pkg absent)
   (host-uuid 0 :type (unsigned-byte 64))  ; u64 host id (MD5 of hostname); a remote with the SAME uuid is same-host
@@ -595,21 +597,79 @@
     (setf (disc-node-user-writer-key-next node) (1+ k))
     k))
 
+(defun* %alloc-user-reader-key (node)
+    (function (disc-node) (unsigned-byte 8))
+  "Allocate + return the next distinct per-participant USER-reader entity KEY (WP-N-ENDPOINT-S2, ADR 0048; RTPS
+   2.5 §9.3.1.2). Starts at 1 so the first DataReader keeps EntityId #x0107/#x0104 (byte-identical to pre-S2);
+   each subsequent reader gets a distinct key -> a distinct EntityId + SEDP GUID. Writer + reader keys are
+   SEPARATE counters (the entity KIND — 0x07/0x04 reader vs 0x02/0x03 writer — keeps their EntityIds disjoint even
+   at the same key). Builtin/secure EntityIds are NOT drawn from here. Fail-fasts if the 1-octet key space (255
+   readers/participant) is exhausted."
+  (let ((k (disc-node-user-reader-key-next node)))
+    (when (> k #xff)
+      (error "disc-node: user-reader entity-key space exhausted (>255 DataReaders on one participant)"))
+    (setf (disc-node-user-reader-key-next node) (1+ k))
+    k))
+
+(defun* %node-secured-or-zc-reader-p (node)
+    (function (disc-node) boolean)
+  "T iff NODE is SECURED-loan-capable OR ZC-loan-capable on the receive side (WP-N-ENDPOINT-S2, ADR 0048) — the
+   node either DECODES a SecuredPayload on receive (node-secured-reader-p / an already-armed secured-loan-capable
+   pool) OR resolves a zero-copy loan (zc-loan-capable). Gates the S2 second-reader fail-fast: a 2nd secured or ZC
+   reader needs per-endpoint crypto/loan machinery + closes a cross-reader use-after-free — deferred to Slice
+   S3/S4, never half-fixed. A plain (non-secured, non-ZC) node -> NIL -> the N-local reader delivery is enabled."
+  (or (node-secured-reader-p node)
+      (disc-node-secured-loan-capable node)
+      (and (disc-node-zc-loan-capable node) t)))
+
 (defun* %register-user-reader (node entity-id reader)
     (function (disc-node (unsigned-byte 32) dds.rtps.reliable:rtps-reader) dds.rtps.reliable:rtps-reader)
-  "Register READER under ENTITY-ID in NODE's user-reader registry; the first registered becomes primary (N=1
-   identity for disc-node-user-reader). Re-registering the SAME id REPLACES the entry (byte-identical to the pre-S0
-   enable-subscriber engine-reader clobber); a DIFFERENT 2nd id fail-fasts (N-local deliver routing = Slice S2)."
+  "Register READER under ENTITY-ID in NODE's user-reader registry (WP-N-ENDPOINT-S2, ADR 0048); the first
+   registered becomes primary (N=1 identity for disc-node-user-reader). Re-registering the SAME id REPLACES the
+   entry in place (byte-identical to the pre-S0 enable-subscriber engine-reader clobber), keeping the primary ref
+   current if that id IS the primary. A NEW distinct id ADDS an N-th local reader (each with its own EntityId +
+   engine rtps-reader; the receive-hook demux + the %drain source-GUID filter route delivery per reader) UNLESS
+   deferred: a 2nd SECURED or ZC-loan-capable reader fail-fasts (secured/ZC multi-reader = Slice S3/S4)."
   (let ((cell (assoc entity-id (disc-node-user-readers node) :test #'eql)))
-    (cond (cell (setf (cdr cell) reader)
-                (setf (disc-node-primary-user-reader node) reader))
-          ((disc-node-primary-user-reader node)
-           (error "disc-node: refusing a 2nd local user DataReader (EntityId #x~8,'0X) — N-local user endpoints are ~
-                   not yet supported (N-user-endpoint Slice S2); primary EntityId #x~8,'0X"
-                  entity-id (caar (disc-node-user-readers node))))
-          (t (push (cons entity-id reader) (disc-node-user-readers node))
-             (setf (disc-node-primary-user-reader node) reader))))
+    (cond (cell (let ((was-primary (eq (cdr cell) (disc-node-primary-user-reader node))))
+                  (setf (cdr cell) reader)
+                  (when was-primary (setf (disc-node-primary-user-reader node) reader))))
+          ((null (disc-node-user-readers node))   ; first reader -> primary (N=1 identity)
+           (push (cons entity-id reader) (disc-node-user-readers node))
+           (setf (disc-node-primary-user-reader node) reader))
+          (t (when (%node-secured-or-zc-reader-p node)
+               (error "disc-node: refusing a 2nd SECURED/ZC-loan-capable local user DataReader (EntityId ~
+                       #x~8,'0X) — secured/ZC multi-reader is Slice S3/S4 (N-user-endpoint); primary EntityId ~
+                       #x~8,'0X"
+                      entity-id (caar (last (disc-node-user-readers node)))))
+             (push (cons entity-id reader) (disc-node-user-readers node)))))   ; N-th reader; primary unchanged
   reader)
+
+(defun* %reader-route-add (node writer-guid reader-entity-id)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) (unsigned-byte 32)) t)
+  "WP-N-ENDPOINT-S2 (ADR 0048): record that local reader READER-ENTITY-ID is matched to remote writer WRITER-GUID
+   in the delivery route (node-lock guarded, idempotent — a re-announce never duplicates a reader-id). The route
+   is the source-GUID filter for %drain (no cross-topic deserialize) AND the receive-hook demux key."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let* ((key (copy-seq writer-guid))
+           (ids (gethash key (disc-node-reader-routes node))))
+      (unless (member reader-entity-id ids :test #'eql)
+        (setf (gethash key (disc-node-reader-routes node)) (cons reader-entity-id ids)))))
+  t)
+
+(defun* node-user-reader-count (node)
+    (function (disc-node) (integer 0))
+  "Count of registered local user DataReaders on NODE (WP-N-ENDPOINT-S2). N<=1 keeps the %drain filter a
+   pass-through (byte-identical to pre-S2 single-reader delivery); N>=2 engages the source-GUID filter."
+  (length (disc-node-user-readers node)))
+
+(defun* node-reader-matches-writer-p (node reader-entity-id writer-guid)
+    (function (disc-node (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) boolean)
+  "WP-N-ENDPOINT-S2 (ADR 0048): T iff local reader READER-ENTITY-ID is matched to remote writer WRITER-GUID (route
+   membership, node-lock guarded). The %drain source-GUID filter (N>=2) keeps a stored sample for THIS reader only
+   when this returns T — so a reader deserializes ONLY its own matched writers' bytes (no cross-topic corruption)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (and (member reader-entity-id (gethash writer-guid (disc-node-reader-routes node)) :test #'eql) t)))
 
 (defun* %user-writer-for (node entity-id)
     (function (disc-node (unsigned-byte 32)) (or null dds.rtps.reliable:rtps-writer))
@@ -956,16 +1016,35 @@
 
 (defun* add-local-reader (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-best-effort+)
-                                   (key 1) qos type-information (keyed t))
-    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t) (:keyed t)) dds.rtps.discovery:endpoint-data)
+                                   (key nil) qos type-information (keyed t))
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t)) dds.rtps.discovery:endpoint-data)
   "Register a local subscription (reader endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
    TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP. KEYED
    selects the RTPS entity kind (RTPS 2.5 §9.3.1.2 Table 9.1): T (default) -> 0x07 (reader
    WITH_KEY), NIL -> 0x04 (reader NO_KEY); a keyed reader will not match a no-key remote
    writer (and vice versa) — the disagreement is a silent non-match, not INCONSISTENT_TOPIC.
-   Sets NODE's user-reader-id so the data plane routes HEARTBEAT/ACKNACK with this id."
-  (let* ((kind (if keyed #x07 #x04))
+   KEY (NIL default) draws the next DISTINCT per-participant entity KEY (WP-N-ENDPOINT-S2, ADR 0048)
+   so a 2nd/N-th DataReader gets a distinct EntityId + SEDP GUID (the first stays #x0107/#x0104,
+   byte-identical); pass an explicit KEY to pin it. Sets NODE's user-reader-id so enable-subscriber
+   registers + the data plane routes HEARTBEAT/ACKNACK with this id.
+   WP-N-ENDPOINT-S2 DEFERRAL (ADR 0048): a 2nd reader on a topic ALREADY held by a local reader on this
+   participant FAIL-FASTS (same-topic multi-reader = later slice). %match-remote-endpoint route-adds only the
+   FIRST matching local reader per remote-writer GUID (and %guid-matched-p is keyed by that GUID, so a 2nd
+   same-topic reader gets no further match attempt) — so the source-GUID route can hold only ONE reader-id per
+   writer. Two DIFFERENT-topic readers each match their own writer (distinct GUIDs) and route correctly (the
+   shipping capability); two SAME-topic readers would leave the 2nd unrouted -> its %drain filter (N>=2) drops
+   ALL its own samples = a silent false-REJECT. Guarded here (mirrors the secured/ZC fence) rather than
+   half-fixed; the route-add-all-matching-readers + fan-out delivery is a later slice."
+  (when (find topic (disc-node-local-readers node)
+              :key #'dds.rtps.discovery:endpoint-data-topic-name :test #'string=)
+    (error "disc-node: refusing a 2nd local user DataReader on topic ~s — same-topic multi-reader on one ~
+            participant is a later N-user-endpoint slice (the source-GUID delivery route holds one reader per ~
+            writer today; a 2nd same-topic reader would silently receive nothing). Use distinct topics or ~
+            separate participants."
+           topic))
+  (let* ((key (or key (%alloc-user-reader-key node)))
+         (kind (if keyed #x07 #x04))
          (ep (dds.rtps.discovery:make-endpoint-data
               :role :reader
               :guid (%make-endpoint-guid (disc-node-guid-prefix node) key kind)
@@ -1021,6 +1100,11 @@
 
 ;; User-vs-builtin writer-EntityId classifier (T10 receive enforcement): defined in dataplane.lisp (loaded after this file).
 (declaim (ftype (function ((unsigned-byte 32)) t) %user-writer-entityid-p))
+
+;; WP-N-ENDPOINT-S2: %guid-entityid / node-secured-reader-p are defined in dataplane.lisp (loaded after this file);
+;; forward-declared so %match-remote-endpoint (route-add) and %register-user-reader (fail-fast) reach them clean.
+(declaim (ftype (function ((simple-array (unsigned-byte 8) (16))) (unsigned-byte 32)) %guid-entityid))
+(declaim (ftype (function (disc-node) boolean) node-secured-reader-p))
 
 ;; %lease-sweep is defined below but called from announce-endpoints above it.
 (declaim (ftype (function (disc-node) (eql t)) %lease-sweep))
@@ -1334,6 +1418,7 @@
           (%invalidate-shmem-dest node prefix)   ; a leased-out peer's cached SHMEM dest must not be reused
           (%purge-prefix node prefix #'disc-node-discovered-writers)
           (%purge-prefix node prefix #'disc-node-discovered-readers)
+          (%purge-prefix node prefix #'disc-node-reader-routes)   ; WP-N-ENDPOINT-S2 (ADR 0048): drop the lost writer's delivery route (unmatch/lease-expiry) so a reader stops draining a gone writer; a re-announce re-adds it
           (%purge-prefix node prefix #'disc-node-decode-fail-counts)   ; ADR 0031 lim.1: drop the lost writer's decode-failure counters
           (%collect-and-remove-matches node prefix
                                        (lambda (dm) (push dm removed)))
@@ -1536,6 +1621,13 @@
                            (unless (or writer-p
                                        (%guid-matched-p node (dds.rtps.discovery:endpoint-data-guid remote)))
                              (%prearm-writer-future-base node (dds.rtps.discovery:endpoint-data-guid remote)))
+                           ;; WP-N-ENDPOINT-S2 (ADR 0048): a matched remote WRITER -> record (this local reader <->
+                           ;; that writer-GUID) in the delivery route BEFORE %record-match, so once %guid-matched-p is
+                           ;; true the route is already present (the %drain filter + the receive-hook demux read it;
+                           ;; idempotent so a re-announce re-adds without duplicating — no dropped own-samples).
+                           (when writer-p
+                             (%reader-route-add node (dds.rtps.discovery:endpoint-data-guid remote)
+                                                (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local))))
                            (when (%record-match node remote) (%fire-match node direction remote))
                            (return-from %match-remote-endpoint t))))))))
           ((string= (dds.rtps.discovery:endpoint-data-topic-name remote)

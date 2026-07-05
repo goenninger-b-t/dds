@@ -91,6 +91,8 @@
 (defclass data-reader (entity)
   ((topic :initarg :topic :reader dr-topic)
    (subscriber :initarg :subscriber :reader dr-subscriber)
+   (entity-id :initform 0 :accessor dr-entity-id) ; WP-N-ENDPOINT-S2 (ADR 0048): this reader's DISTINCT engine EntityId (RTPS 2.5 §9.3.1.2), captured at create-datareader; %drain's source-GUID filter keeps only samples whose remote writer is matched to THIS reader-id (node-reader-matches-writer-p) -> no cross-topic deserialize
+
    (cache :initform '() :accessor dr-cache)                       ; list of cached-sample
    (instances :initform (make-hash-table :test 'equalp) :accessor dr-instances) ; handle -> accessed-p
    (instance-recs :initform (make-hash-table :test 'equalp) :accessor dr-instance-recs) ; handle -> instance-rec (DDS 1.4 §2.2.2.5.1.3)
@@ -626,6 +628,9 @@
       (dds.disc:set-secured-loan-capable node t))
     (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos :enabled t)))
       (setf (dr-filter dr) (td-filter-predicate topic))   ; nil for a plain Topic
+      ;; WP-N-ENDPOINT-S2 (ADR 0048): capture THIS reader's distinct EntityId (add-local-reader set it, enable-
+      ;; subscriber registered the engine reader under it) so %drain's source-GUID filter routes delivery per reader.
+      (setf (dr-entity-id dr) (dds.disc:disc-node-user-reader-id node))
       (push dr (sub-readers sub))
       (setf (dp-user-reader (sub-participant sub)) dr)   ; v1 back-ref for status hooks
       dr)))
@@ -1744,14 +1749,30 @@
    instance-recs are never mutated off-thread (S2)."
   (let* ((node (dp-node (sub-participant (dr-subscriber dr))))
          (ts (topic-type-support (dr-topic dr)))
+         (rid (dr-entity-id dr))
+         ;; WP-N-ENDPOINT-S2 (ADR 0048): the SOURCE-GUID FILTER — the data-corruption fix. When N>=2 local readers
+         ;; share this node's ONE received-sample store, keep a stored key for THIS reader ONLY when the sample's
+         ;; source writer GUID is matched to THIS reader (node-reader-matches-writer-p). So each reader deserializes
+         ;; ONLY its own topic's bytes under ITS type-support — a reader NEVER decodes a sibling reader's sample
+         ;; (silent struct garbage / OOB crash). At N<=1 the predicate is a PASS-THROUGH (byte-identical to pre-S2:
+         ;; the sole reader drains every stored sample, exactly as before). A NULL source GUID (never produced for a
+         ;; real stored data sample — %deliver-user-sample always records it) is NOT attributable at N>=2, so it is
+         ;; filtered out (fail-closed against a cross-topic leak); at N<=1 it passes (unchanged).
+         (multi (> (dds.disc:node-user-reader-count node) 1))
          (data-keys (remove-if-not
                      (lambda (key)
                        (let ((g (dds.disc:node-sample-writer-guid node key)))
-                         (or (null g)
-                             (> (dds.disc:node-sample-key-sn key) (gethash g (dr-drained dr) 0)))))
+                         (and (or (not multi)
+                                  (and g (dds.disc:node-reader-matches-writer-p node rid g)))
+                              (or (null g)
+                                  (> (dds.disc:node-sample-key-sn key) (gethash g (dr-drained dr) 0))))))
                      (dds.disc:node-sample-sns node)))
-         (life-keys (set-difference (dds.disc:node-lifecycle-sns node) (dr-lifecycle-drained dr)
-                                    :test #'equalp))
+         (life-keys (remove-if-not
+                     (lambda (key)
+                       (or (not multi)
+                           (dds.disc:node-reader-matches-writer-p node rid (car key))))
+                     (set-difference (dds.disc:node-lifecycle-sns node) (dr-lifecycle-drained dr)
+                                     :test #'equalp)))
          ;; Order by raw RTPS SN (extracted from each composite (GUID . SN) key) so a dispose/revive from
          ;; one writer still lands in §2.2.2.5 SN order (§8.3.5.4: SN is per-writer).
          (pending (sort (nconc (mapcar (lambda (key) (list (dds.disc:node-sample-key-sn key) :data key)) data-keys)

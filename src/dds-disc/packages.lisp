@@ -58,6 +58,7 @@
            #:zc-loan-marker-slot-index #:zc-loan-marker-generation #:zc-loan-marker-len
            #:node-sample-count #:node-sample #:node-sample-sns
            #:node-sample-writer #:node-sample-writer-guid #:node-sample-origin-guid #:node-sample-origin-sn #:node-sample-key-hash #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
+           #:node-user-reader-count #:node-reader-matches-writer-p
            #:dispose-instance #:unregister-instance
            #:node-lifecycle-change #:node-lifecycle-change-by-sn #:node-lifecycle-count #:node-lifecycle-sns
            #:*datagram-sink*
@@ -73,7 +74,7 @@
            #:assert-participant-liveliness #:disc-node-remote-liveliness-stamp
            #:disc-node-discovered-writers-list #:disc-node-discovered-readers-list
            #:run-spdp-discovery-test #:run-sedp-discovery-test
-           #:run-mcast-discovery-test #:run-dataplane-test #:run-n-writer-dataplane-test #:run-n-writer-frag-heartbeat-test
+           #:run-mcast-discovery-test #:run-dataplane-test #:run-n-writer-dataplane-test #:run-n-writer-frag-heartbeat-test #:run-n-reader-dataplane-test
            #:run-large-dataplane-test #:run-participant-liveliness-test
            #:run-locator-filter-test #:run-lost-final-sample-test
            #:run-dispose-dataplane-test #:run-dispose-repair-test

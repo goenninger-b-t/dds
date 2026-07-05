@@ -3554,9 +3554,10 @@
 
 (defun* run-endpoint-registry-test ()
     (function () t)
-  "WP-N-ENDPOINT-S0/S1-REGISTRY (ADR 0048): the user-endpoint registry — register/lookup/enumerate, the primary
+  "WP-N-ENDPOINT-S0/S1/S2-REGISTRY (ADR 0048): the user-endpoint registry — register/lookup/enumerate, the primary
    (first-registered) compat accessor, same-id replace (pre-S0 clobber semantics), the 2nd-distinct WRITER id now
-   ACCEPTED (S1 send fan-out) with the primary preserved, and the 2nd-distinct READER id still fail-fast (S2)."
+   ACCEPTED (S1 send fan-out) AND the 2nd-distinct READER id now ACCEPTED (S2 deliver routing) with the primary
+   preserved (a 2nd SECURED/ZC reader still fail-fasts, tested in the S2 dataplane test)."
   (let* ((node (dds.disc::%make-disc-node))
          (w1 (dds.rtps.reliable:make-rtps-writer
               :hc (dds.rtps.history:make-history-cache :keep-last 1 nil nil)))
@@ -3586,11 +3587,13 @@
             "2nd distinct writer id is ACCEPTED (S1 N-local send fan-out)")
     (%check :reg-2nd-writer-count (= 2 (length (dds.disc::%all-user-writers node))) "2nd distinct writer adds an entry")
     (%check :reg-2nd-writer-lookup (eq w1 (dds.disc::%user-writer-for node #x00000202)) "%user-writer-for reaches the 2nd writer")
-    (%check :reg-failfast-reader
-            (handler-case (progn (dds.disc::%register-user-reader node #x00000407 r1) nil) (error () t))
-            "2nd distinct reader id must signal the S2 not-yet-supported error")
+    (%check :reg-accept-2nd-reader
+            (handler-case (progn (dds.disc::%register-user-reader node #x00000407 r1) t) (error () nil))
+            "2nd distinct reader id is ACCEPTED (S2 N-local deliver routing)")
+    (%check :reg-2nd-reader-count (= 2 (length (dds.disc::%all-user-readers node))) "2nd distinct reader adds an entry")
+    (%check :reg-2nd-reader-lookup (eq r1 (dds.disc::%user-reader-for node #x00000407)) "%user-reader-for reaches the 2nd reader")
     (%check :reg-2nd-writer-primary (eq w2 (dds.disc::disc-node-user-writer node)) "2nd distinct writer preserves the primary")
-    (%check :reg-failfast-intact-r (eq r2 (dds.disc::disc-node-user-reader node)) "fail-fast preserves primary reader"))
+    (%check :reg-2nd-reader-primary (eq r2 (dds.disc::disc-node-user-reader node)) "2nd distinct reader preserves the primary reader"))
   t)
 
 (defun* run-all-tests ()
@@ -3788,6 +3791,7 @@
                  ("reliable-data-over-udp"   . dds.disc:run-dataplane-test)
                  ("n-writer-data-over-udp"   . dds.disc:run-n-writer-dataplane-test)
                  ("n-writer-frag-heartbeat"  . dds.disc:run-n-writer-frag-heartbeat-test)
+                 ("n-reader-data-over-udp"   . dds.disc:run-n-reader-dataplane-test)
                  ("large-data-over-udp"      . dds.disc:run-large-dataplane-test)
                  ("lost-final-sample-repair" . dds.disc:run-lost-final-sample-test)
                  ("dispose-over-udp"         . dds.disc:run-dispose-dataplane-test)
@@ -3796,6 +3800,7 @@
                  ("qos-rxo-truth-table"      . dds.qos:run-qos-rxo-test)
                  ("qos-data-representation-rxo" . dds.qos:run-data-representation-rxo-test)
                  ("dcps-entity-write-take"   . run-dcps-entity-test)
+                 ("dcps-n-reader-per-participant" . run-dcps-n-reader-test)
                  ("nokey-roundtrip"          . run-nokey-roundtrip-test)
                  ("dcps-instance-read-take"  . run-dcps-instance-test)
                  ("dcps-dispose-unregister"  . run-dcps-dispose-test)

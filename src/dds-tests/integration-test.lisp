@@ -212,6 +212,76 @@
       (dds.dcps:delete-participant p2))
     t))
 
+(defun* run-dcps-n-reader-test ()
+    (function () t)
+  "WP-N-ENDPOINT-S2 (ADR 0048): THE data-corruption slice. ONE participant with a Subscriber holding TWO non-
+   secured DataReaders on DIFFERENT topics of DIFFERENT types (dcps-msg vs shape-type), each fed by its own remote
+   writer. Asserts each reader's take returns EXACTLY its own topic's samples, correctly deserialized (byte-exact
+   fields), and NEVER a sibling topic's sample. Pre-S2 a 2nd create-datareader fail-fasted; with the S2 delivery
+   route lifted but WITHOUT the %drain source-GUID filter, reader-A would drain reader-B's shape-type bytes under
+   dcps-msg type-support -> garbage struct / OOB crash + wrong sample count. The filter (node-reader-matches-
+   writer-p) is the binary no-corruption gate: each reader deserializes ONLY its matched writer's bytes. Both impls."
+  (let* ((ts-a (dds.types:find-type-support "dcps-msg"))
+         (ts-b (dds.types:find-type-support "shape-type"))
+         (pa (dds.dcps:create-participant :domain (test-domain)))   ; writer of topic A (dcps-msg)
+         (pb (dds.dcps:create-participant :domain (test-domain)))   ; writer of topic B (shape-type)
+         (pr (dds.dcps:create-participant :domain (test-domain))))  ; ONE participant, TWO readers (the S2 slice)
+    (unwind-protect
+         (let* ((twa (dds.dcps:create-topic pa "S2NRA" "dcps-msg" ts-a))
+                (twb (dds.dcps:create-topic pb "S2NRB" "shape-type" ts-b))
+                (tra (dds.dcps:create-topic pr "S2NRA" "dcps-msg" ts-a))
+                (trb (dds.dcps:create-topic pr "S2NRB" "shape-type" ts-b))
+                (puba (dds.dcps:create-publisher pa))
+                (pubb (dds.dcps:create-publisher pb))
+                (sub  (dds.dcps:create-subscriber pr))   ; ONE subscriber holds BOTH readers
+                (dwa (dds.dcps:create-datawriter puba twa :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                (dwb (dds.dcps:create-datawriter pubb twb :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                (dra (dds.dcps:create-datareader sub tra :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all)))
+                (drb (dds.dcps:create-datareader sub trb :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all))))
+           (%check :s2nr-distinct-ids (/= (dds.dcps::dr-entity-id dra) (dds.dcps::dr-entity-id drb))
+                   "the two DataReaders must get DISTINCT engine EntityIds (pre-S2 both collided on #x0107)")
+           (flet ((%spin () (dds.dcps:spin pa) (dds.dcps:spin pb) (dds.dcps:spin pr) (sleep 0.02)))
+             (loop repeat 250
+                   until (and (plusp (dds.dcps:matched-count pa)) (plusp (dds.dcps:matched-count pb))
+                              (>= (dds.dcps:matched-count pr) 2))
+                   do (%spin))
+             (%check :s2nr-matched (and (plusp (dds.dcps:matched-count pa)) (plusp (dds.dcps:matched-count pb))
+                                        (>= (dds.dcps:matched-count pr) 2))
+                     "both writers must match their own reader on the 2-reader participant")
+             ;; each writer publishes 3 samples of its OWN type
+             (dotimes (i 3) (dds.dcps:write-sample dwa (make-dcps-msg :id (+ 100 i) :text (format nil "A~D" i))))
+             (dotimes (i 3) (dds.dcps:write-sample dwb (make-shape-type :color (format nil "C~D" i) :x (+ 10 i) :y (+ 20 i) :shapesize (+ 30 i))))
+             (loop repeat 300
+                   until (and (>= (dds.dcps:samples-available dra) 3) (>= (dds.dcps:samples-available drb) 3))
+                   do (%spin))
+             (let ((sa (dds.dcps:take-samples dra))
+                   (sb (dds.dcps:take-samples drb)))
+               ;; (1) exact count: no cross-topic OVER-delivery (a sibling sample would push count past 3)
+               (%check :s2nr-count-a (= 3 (length sa)) "reader-A must take EXACTLY its own 3 dcps-msg samples (no cross-topic leak)")
+               (%check :s2nr-count-b (= 3 (length sb)) "reader-B must take EXACTLY its own 3 shape-type samples (no cross-topic leak)")
+               ;; (2) correct type + byte-exact fields: reader-A deserialized dcps-msg (NOT shape-type bytes)
+               (%check :s2nr-type-a (every (lambda (cs) (typep (dds.dcps:cached-sample-data cs) 'dcps-msg)) sa)
+                       "reader-A samples must all be dcps-msg structs (a shape-type would be cross-topic deserialize corruption)")
+               (%check :s2nr-type-b (every (lambda (cs) (typep (dds.dcps:cached-sample-data cs) 'shape-type)) sb)
+                       "reader-B samples must all be shape-type structs")
+               (%check :s2nr-fields-a
+                       (equal (sort (mapcar (lambda (cs) (dcps-msg-id (dds.dcps:cached-sample-data cs))) sa) #'<)
+                              '(100 101 102))
+                       "reader-A must read writer-A's exact dcps-msg ids (byte-exact, no corruption)")
+               (%check :s2nr-fields-b
+                       (equal (sort (mapcar (lambda (cs) (shape-type-x (dds.dcps:cached-sample-data cs))) sb) #'<)
+                              '(10 11 12))
+                       "reader-B must read writer-B's exact shape-type x values (byte-exact, no corruption)")
+               ;; (3) explicit negatives: neither reader EVER saw the sibling topic's field signature
+               (%check :s2nr-a-no-b (notany (lambda (cs) (typep (dds.dcps:cached-sample-data cs) 'shape-type)) sa)
+                       "reader-A must NEVER see a topic-B (shape-type) sample")
+               (%check :s2nr-b-no-a (notany (lambda (cs) (typep (dds.dcps:cached-sample-data cs) 'dcps-msg)) sb)
+                       "reader-B must NEVER see a topic-A (dcps-msg) sample"))))
+      (dds.dcps:delete-participant pa)
+      (dds.dcps:delete-participant pb)
+      (dds.dcps:delete-participant pr))
+    t))
+
 (defun* run-dcps-dispose-test ()
     (function () t)
   "DCPS instance lifecycle S1 (writer side, DDS 1.4 §2.2.2.4.2): on the keyed shape-type a
