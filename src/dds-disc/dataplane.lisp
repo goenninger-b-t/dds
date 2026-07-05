@@ -1031,6 +1031,34 @@
             (progn (%zc-drop-armed node change) nil)))   ; undersized: release an armed slot (one-shot no-op otherwise)
       (progn (%zc-drop-armed node change) nil)))         ; gated / non-ZC / retransmit: the fallback decision releases an armed slot
 
+(defun* %zc-shareable-change-p (node change)
+    (function (disc-node dds.rtps.history:cache-change) boolean)
+  "WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, R6, ADR 0047; NOT cleared for ship — pending counsel). T iff CHANGE is
+   eligible to SHARE one Zero-Copy slot across the ZC-capable destinations that carry it — the change-level half
+   of %zc-change-item's gate (kind :data, NOT wire-protected, payload-len > *zerocopy-min-payload-bytes*), i.e.
+   the per-group %zc-readers>0 count aside. The security gate (%zc-payload-wire-protected-p) is UNCHANGED and
+   authoritative: a secured/wire-protected writer never shares a slot (it never ZCs at all, ADR 0036 Carry-10).
+   Uses cache-change-payload-len (the TRUE serialized length, T5a), matching %zc-change-item byte-for-byte."
+  (and (eq (dds.rtps.history:cache-change-kind change) :data)
+       (not (%zc-payload-wire-protected-p node))
+       (> (dds.rtps.history:cache-change-payload-len change) *zerocopy-min-payload-bytes*)
+       t))
+
+(defun* %zc-emit-item (node change zc-readers shared)
+    (function (disc-node dds.rtps.history:cache-change (integer 0) (or null hash-table)) (or null cons))
+  "WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, R6, ADR 0047; NOT cleared for ship — pending counsel). The per-group ZC
+   DATA-item chooser threaded into %changes-datagram-plan. If CHANGE carries a cross-group SHARED ref (loaned
+   ONCE this pass with refcount = the ZC-eligible GROUP count, %shared-zc-refs) AND this destination is
+   ZC-eligible (ZC-READERS > 0), emit that SAME (slot, gen) ref via %zc-ref-item — the ref BYTES are byte-identical
+   to a fresh %zc-ref-builder / %zc-armed-item emission and zc-sends bumps once per emitted datagram (N groups ->
+   N ref datagrams, still), but NO per-group loan or copy runs (the N-1 slots + copies saved). Otherwise — no
+   sharing this pass, a non-shared change, or a non-ZC destination — the unchanged per-destination %zc-change-item
+   (fresh loan / one-shot armed claim / fallback release). SHARED nil is exactly today's behaviour (byte-identical)."
+  (let ((sh (and shared (plusp zc-readers) (gethash change shared))))
+    (if sh
+        (%zc-ref-item node (dds.rtps.history:cache-change-sn change) (car sh) (cdr sh))
+        (%zc-change-item node change zc-readers))))
+
 (defun* %msg-datagram (node build-fn)
     (function (disc-node function) function)
   "Wrap a submessage BUILD-FN (writing onto a cursor after the Header) as a ONE-DATAGRAM build-thunk
@@ -1087,8 +1115,9 @@
                     thunks)))
           (nreverse thunks)))))
 
-(defun* %changes-datagram-plan (node buf changes hb shmem-dest zc-readers)
-    (function (disc-node dds.core.buffer:octet-buffer list (or null cons) t (integer 0)) list)
+(defun* %changes-datagram-plan (node buf changes hb shmem-dest zc-readers &optional shared)
+    (function (disc-node dds.core.buffer:octet-buffer list (or null cons) t (integer 0)
+               &optional (or null hash-table)) list)
   "The ORDERED per-datagram send-plan for pushing CHANGES (+ optional trailing HEARTBEAT item HB) to ONE
    destination: a list of (BUILD-THUNK . SHMEM-DEST), each BUILD-THUNK a lambda (buf) -> octet-length that
    builds exactly ONE datagram. The order, and each datagram's bytes, are IDENTICAL to the prior flush-all
@@ -1098,14 +1127,16 @@
    (ZC-READERS > 0, WP-ZEROCOPY FR-PF-3 — exactly one of {ref, payload} per reader), and the HEARTBEAT_FRAG
    count side-effect all happen here, once, exactly as before — so consuming this plan one datagram at a time
    (the step) is byte-identical to flush-all by construction. Pure of I/O; BUF supplies only the packing
-   budget (%pack-budget)."
+   budget (%pack-budget). SHARED (WP-ZC-MULTI-DEST-REFCOUNT, ADR 0047; default NIL = byte-identical): the
+   per-pass cross-group CHANGE -> (slot . gen) table so a change reaching >=2 ZC destinations emits ONE shared
+   slot's ref to each (via %zc-emit-item) rather than one fresh loan per destination — the ref bytes are unchanged."
   (let ((frag-plans '()) (items '()) (budget (%pack-budget buf)))
     (dolist (change changes)
       (let ((sn (dds.rtps.history:cache-change-sn change))
             (zc nil))
         (cond
           ((and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*)))
-          ((setf zc (%zc-change-item node change zc-readers)) (push zc items))   ; WP-ZEROCOPY: ref, not payload
+          ((setf zc (%zc-emit-item node change zc-readers shared)) (push zc items))   ; WP-ZEROCOPY / ADR 0047: shared or per-dest ref, not payload
           ;; ADR 0044 (I1 defense-in-depth): materialise a pinned change's payload on demand for a non-ZC / retransmit
           ;; send, and USE the result — a :data change whose slot resolve returned NIL (a reclaimed/stale slot,
           ;; unreachable now the pin defers on send-refcount but proven safe) is SKIPPED (best-effort drop, the reader
@@ -1144,9 +1175,9 @@
           (%send-raw-buf node buf len (car dest) (cdr dest) (cdr entry) dest-prefix)
           (values len (and (cdr plan) t) (cons dest (cdr plan)))))))
 
-(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest (zc-readers 0) dest-prefix)
+(defun* %send-changes-packed (node buf changes host port hb &optional shmem-dest (zc-readers 0) dest-prefix shared)
     (function (disc-node dds.core.buffer:octet-buffer list string (unsigned-byte 16) (or null cons)
-               &optional t (integer 0) (or null (simple-array (unsigned-byte 8) (12)))) t)
+               &optional t (integer 0) (or null (simple-array (unsigned-byte 8) (12))) (or null hash-table)) t)
   "Send CHANGES (+ optional trailing HEARTBEAT item HB, a (SIZE . BUILD-FN)) to HOST:PORT, coalescing the
    small ones into as few datagrams as fit the budget: this is now the per-datagram STEP run to completion —
    build the %changes-datagram-plan once, then %emit-next-datagram in a loop until no datagram remains. The
@@ -1159,9 +1190,11 @@
    byte-for-byte. ZC-READERS > 0 (WP-ZEROCOPY, FR-PF-3) substitutes a 16-byte reference for a large :data
    sample's payload at THIS destination (%zc-change-item) instead of fragmenting it — exactly one of
    {ref, full payload} reaches each reader (no double-delivery); ZC-READERS 0 (the default, and always when
-   *zerocopy-enabled* is nil) is the existing path verbatim."
+   *zerocopy-enabled* is nil) is the existing path verbatim. SHARED (WP-ZC-MULTI-DEST-REFCOUNT, ADR 0047;
+   default NIL) is the per-pass cross-group CHANGE -> (slot . gen) table so a change reaching >=2 ZC destinations
+   emits ONE shared slot's ref here instead of a fresh per-destination loan (byte-identical ref bytes)."
   (let ((state (cons (cons host port)
-                     (%changes-datagram-plan node buf changes hb shmem-dest zc-readers))))
+                     (%changes-datagram-plan node buf changes hb shmem-dest zc-readers shared))))
     (loop while (cdr state)   ; (cdr state) = the remaining datagram plan; NIL when exhausted
           do (setf state (nth-value 2 (%emit-next-datagram node buf state dest-prefix))))   ; T10: wrap to a keyed dest
     t))
@@ -1360,6 +1393,99 @@
                     (dds.rtps.history:cache-change-zc-slot change)
                     (dds.rtps.history:cache-change-zc-generation change)))))
 
+(defstruct* (%zc-push-group (:constructor %make-zc-push-group))
+  "WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, R6, ADR 0047; NOT cleared for ship — pending counsel). One
+   %reader-push-targets destination captured ONCE for a push pass: its (host . port) DEST, T10 DEST-PREFIX,
+   SHMEM dest, same-host ZC-capable reader COUNT (%zc-readers), and the send-ref-held UNSENT CHANGES for it.
+   Capturing every group into these bundles BEFORE any loan/emit is what makes the cross-group shared-ZC
+   refcount EXACT — the count and the emit read the SAME frozen captured sets (ADR 0047 §crux)."
+  (dest nil :type t)
+  (dest-prefix nil :type (or null (simple-array (unsigned-byte 8) (12))))
+  (shmem nil :type t)
+  (zc-count 0 :type (integer 0))
+  (changes '() :type list))
+
+(defun* %capture-push-groups (node writer)
+    (function (disc-node dds.rtps.reliable:rtps-writer) (values list list))
+  "WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, R6, ADR 0047; NOT cleared for ship — pending counsel). Capture EVERY
+   %reader-push-targets destination's UNSENT set ONCE (writer-capture-unsent: advances each reader's unsent-base
+   AND acquires a send-ref, exactly the per-group loop's semantics, just hoisted ahead of any emit), returning
+   (values GROUPS ALL-CHANGES): GROUPS a list of %zc-push-group in %reader-push-targets order (so the per-group
+   emit stays byte-order-identical), ALL-CHANGES the flat list of every captured change (one held send-ref each,
+   released by the caller AFTER the emit / on plan drain — balanced). Freezing all captured sets up front is the
+   whole stability argument: the shared-ZC emitter COUNT and the per-group EMIT read the SAME lists, so refcount
+   = the exact number of receivers that each %zc-release once — no re-scan, no TOCTOU, no extra lock beyond the
+   per-capture writer lock (ADR 0047 §crux/§stability)."
+  (let ((groups '()) (all '()))
+    (dolist (group (%reader-push-targets node))
+      (let ((changes (dds.rtps.reliable:writer-capture-unsent writer (cdr group))))
+        (dolist (ch changes) (push ch all))
+        (push (%make-zc-push-group :dest (car group)
+                                   :dest-prefix (%group-dest-prefix group)
+                                   :shmem (%group-shmem-dest node group)
+                                   :zc-count (%zc-readers node (cdr group))
+                                   :changes changes)
+              groups)))
+    (values (nreverse groups) all)))
+
+(defun* %shared-loan-for (node writer change n)
+    (function (disc-node dds.rtps.reliable:rtps-writer dds.rtps.history:cache-change (integer 2))
+              (values (or null (integer 0)) (unsigned-byte 32)))
+  "WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, R6, ADR 0047; NOT cleared for ship — pending counsel). Loan ONE Zero-Copy
+   slot for CHANGE to be shared across N (>=2) ZC-eligible destination GROUPS; returns (values SLOT GEN) for the
+   shared ref, or (values NIL 0) to FALL BACK to today's per-destination fresh loans (always correct). For an
+   :armed (loan-write) change: win the one-shot writer-zc-claim, then %zc-bump the pre-committed slot's DELIVERY
+   hold from 1 to N (delta N-1, generation-guarded, the dual of %zc-release) — the ADR-0044 TX PIN, a DISTINCT
+   hold, composes ADDITIVELY (refcount becomes N + optional-pin, freed by whichever release is last). A LOST claim
+   (a concurrent emit already won it) -> NIL. A FAILED bump (unreachable for a slot held at refcount>=1) -> release
+   the claimed hold + NIL (the change is now :consumed so the per-group path fresh-loans it). For a non-armed
+   change: ONE %zc-loan readers=N from the change payload (%ensure-change-payload — a pinned change resolves on
+   demand; a classic change is its retained/pooled payload, len = payload-len, T5a). Saturation (%zc-loan NIL) ->
+   NIL. The later-emitted ref bytes are byte-identical to %zc-ref-builder / %zc-armed-item — only the slot is shared."
+  (let ((sap (disc-node-zc-pool-sap node)))
+    (cond
+      ((null sap) (values nil 0))
+      ((eq (dds.rtps.history:cache-change-zc-state change) :armed)
+       (if (dds.rtps.reliable:writer-zc-claim writer change)
+           (let ((slot (dds.rtps.history:cache-change-zc-slot change))
+                 (gen (dds.rtps.history:cache-change-zc-generation change)))
+             (if (dds.xport.zerocopy::%zc-bump sap slot gen (1- n))   ; delivery hold 1 -> N (ADR 0047; the pin composes additively)
+                 (values slot gen)
+                 (progn (dds.xport.zerocopy::%zc-release sap slot gen) (values nil 0))))   ; unreachable defense: undo the claimed hold, per-group fresh-loans
+           (values nil 0)))   ; lost claim -> fall back
+      (t (let ((pl (%ensure-change-payload node change)))
+           (if (null pl)
+               (values nil 0)
+               (multiple-value-bind (slot gen)
+                   (dds.xport.zerocopy::%zc-loan sap pl 0 (dds.rtps.history:cache-change-payload-len change) n)
+                 (if slot (values slot gen) (values nil 0)))))))))
+
+(defun* %shared-zc-refs (node writer groups)
+    (function (disc-node dds.rtps.reliable:rtps-writer list) hash-table)
+  "WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, R6, ADR 0047; NOT cleared for ship — pending counsel). The pool-economy
+   optimization: build the per-pass CHANGE -> (SLOT . GEN) table so a change reaching >=2 ZC-eligible destination
+   GROUPS is loaned ONCE (refcount = that GROUP count) and its SINGLE (slot, gen) ref is emitted to all N groups —
+   saving N-1 slots + N-1 app->slot copies at fan-out. N is the ZC-eligible destination-GROUP count, NOT the
+   %zc-readers endpoint count: a participant-receiver resolves a readerId-UNKNOWN DATA ONCE regardless of how many
+   co-located ZC reader endpoints it has (%zc-ref-builder docstring), so counting endpoints would over-count and
+   LEAK the slot (ADR 0047 §crux). A change appears in exactly those groups whose captured unsent set contains it
+   (divergent late-joiner watermarks are handled EXACTLY — N counts only the emitting groups). N=1 is left to the
+   per-group path (byte-identical to today); a lost claim / failed loan / failed bump adds no entry (per-group
+   fresh-loan fallback). Runs BEFORE the per-group emit, over the frozen captured GROUPS, so the count is exact."
+  (let ((table (make-hash-table :test 'eq))
+        (counts (make-hash-table :test 'eq)))
+    (dolist (g groups)   ; count ZC-eligible emitter groups per shareable change (endpoints NEVER, groups)
+      (when (plusp (%zc-push-group-zc-count g))
+        (dolist (ch (%zc-push-group-changes g))
+          (when (%zc-shareable-change-p node ch)
+            (setf (gethash ch counts 0) (1+ (the fixnum (gethash ch counts 0))))))))
+    (maphash (lambda (ch n)
+               (when (>= n 2)   ; N=1 (single ZC dest) rides today's per-group path, byte-identical
+                 (multiple-value-bind (slot gen) (%shared-loan-for node writer ch n)
+                   (when slot (setf (gethash ch table) (cons slot gen))))))
+             counts)
+    table))
+
 (defun* %push-data-buf (node buf)
     (function (disc-node dds.core.buffer:octet-buffer) t)
   "Writer side: send each UNSENT change ONCE as a DATA (or DATA_FRAG series for large samples)
@@ -1376,20 +1502,27 @@
    WP-FLATDATA-LOAN-WRITE leak sweep (ADR 0042): the armed-change registry is SNAPSHOT before the pass and
    %zc-armed-sweep'd after it — any pre-committed slot the pass never consumed/released (zero destinations,
    debug-drop, evicted-before-push) is released here, so a committed slot never strands past one push pass;
-   changes armed concurrently by a mid-pass publish survive to their own pass (the snapshot discipline)."
+   changes armed concurrently by a mid-pass publish survive to their own pass (the snapshot discipline).
+   WP-ZC-MULTI-DEST-REFCOUNT (ADR 0047): every group is CAPTURED once up front (%capture-push-groups) and the
+   cross-group shared-ZC ref table (%shared-zc-refs) is built from those frozen sets BEFORE any emit, so a change
+   reaching >=2 co-resident ZC destinations shares ONE pool slot (refcount = the ZC-group count) instead of one
+   fresh loan per destination; the send-refs are all released once after the whole emit (strictly release-safe)."
   (let ((writer (disc-node-user-writer node))
         (armed (dds.pal:with-lock ((disc-node-lock node)) (disc-node-zc-armed-changes node))))   ; snapshot (ADR 0042)
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
-      (dolist (group (%reader-push-targets node))   ; DATA + HEARTBEAT -> each matched-reader destination
-        (let ((changes (dds.rtps.reliable:writer-capture-unsent writer (cdr group))))   ; acquire send-refs atomic with the unsent read (release-safety)
+      (multiple-value-bind (groups all-changes) (%capture-push-groups node writer)   ; ADR 0047: freeze every dest's unsent set once
+        (let ((shared (%shared-zc-refs node writer groups)))   ; ADR 0047: one slot per change reaching >=2 ZC dests (exact refcount)
           (unwind-protect
-               (%send-changes-packed node buf
-                                     changes (caar group) (cdar group)
-                                     (%heartbeat-builder node first last count)
-                                     (%group-shmem-dest node group)
-                                     (%zc-readers node (cdr group))
-                                     (%group-dest-prefix group))   ; T10: wrap user data to a :keyed destination
-            (dds.rtps.reliable:writer-release-change-refs writer changes)))))   ; release after this destination's datagrams are emitted (copied)
+               (dolist (g groups)   ; DATA + HEARTBEAT -> each matched-reader destination, in %reader-push-targets order
+                 (%send-changes-packed node buf
+                                       (%zc-push-group-changes g)
+                                       (car (%zc-push-group-dest g)) (cdr (%zc-push-group-dest g))
+                                       (%heartbeat-builder node first last count)
+                                       (%zc-push-group-shmem g)
+                                       (%zc-push-group-zc-count g)
+                                       (%zc-push-group-dest-prefix g)   ; T10: wrap user data to a :keyed destination
+                                       shared))
+            (dds.rtps.reliable:writer-release-change-refs writer all-changes)))))   ; release all send-refs after every destination's datagrams are emitted (copied)
     (%zc-armed-sweep node armed)))   ; ADR 0042: release any slot the pass never consumed/released
 
 (defun* %push-data (node)
@@ -1408,21 +1541,26 @@
    must build this plan once and then step it, never rebuild mid-drain (that would re-read an already-advanced
    watermark and send nothing). The seam the Phase-C FlowController scheduler drives: build the plan (capturing the unsent set),
    then for each entry build into a scratch buffer (the thunk reports the token cost = datagram length),
-   acquire that many tokens, and send — one datagram per RR step. BUF supplies only the packing budget."
+   acquire that many tokens, and send — one datagram per RR step. BUF supplies only the packing budget.
+   WP-ZC-MULTI-DEST-REFCOUNT (ADR 0047): the destinations are CAPTURED once (%capture-push-groups) and the
+   cross-group shared-ZC ref table (%shared-zc-refs) is built from those frozen sets BEFORE the per-group plan
+   build, so a change reaching >=2 co-resident ZC destinations shares ONE slot (refcount = the ZC-group count);
+   the ref bytes are already materialized in the plan closures, so the armed sweep after the build is unchanged."
   (let ((writer (disc-node-user-writer node))
         (armed (dds.pal:with-lock ((disc-node-lock node)) (disc-node-zc-armed-changes node)))   ; snapshot (ADR 0042)
-        (plan '()) (refs '()))
+        (plan '()))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
-      (dolist (group (%reader-push-targets node))
-        (let* ((dest (car group)) (dp (%group-dest-prefix group))   ; T10: the group's :keyed-dest prefix | nil
-               (changes (dds.rtps.reliable:writer-capture-unsent writer (cdr group))))   ; acquire send-refs atomic with the unsent read (release-safety)
-          (dolist (ch changes) (push ch refs))   ; held until the plan drains (%flow-step-advance releases), covering the DEFERRED paced/async emit
-          (dolist (entry (%changes-datagram-plan node buf changes
-                                                  (%heartbeat-builder node first last count)
-                                                  (%group-shmem-dest node group)
-                                                  (%zc-readers node (cdr group))))
-            (push (cons dest (cons dp entry)) plan)))))   ; ((host . port) DEST-PREFIX BUILD-THUNK . SHMEM-DEST)
-    (setf (disc-node-flow-step-refs node) refs)   ; release-on-drain set: one entry per per-group acquire (balanced)
+      (multiple-value-bind (groups all-changes) (%capture-push-groups node writer)   ; ADR 0047: freeze every dest's unsent set once
+        (let ((shared (%shared-zc-refs node writer groups)))   ; ADR 0047: one slot per change reaching >=2 ZC dests (exact refcount)
+          (dolist (g groups)
+            (let ((dest (%zc-push-group-dest g)) (dp (%zc-push-group-dest-prefix g)))   ; T10: the group's :keyed-dest prefix | nil
+              (dolist (entry (%changes-datagram-plan node buf (%zc-push-group-changes g)
+                                                     (%heartbeat-builder node first last count)
+                                                     (%zc-push-group-shmem g)
+                                                     (%zc-push-group-zc-count g)
+                                                     shared))
+                (push (cons dest (cons dp entry)) plan))))   ; ((host . port) DEST-PREFIX BUILD-THUNK . SHMEM-DEST)
+          (setf (disc-node-flow-step-refs node) all-changes))))   ; release-on-drain set: one entry per capture (balanced)
     (%zc-armed-sweep node armed)   ; ADR 0042: the ref bytes are already materialized in the plan's closures — sweep any slot the plan build never consumed/released
     (nreverse plan)))
 

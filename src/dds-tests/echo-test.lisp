@@ -2560,6 +2560,109 @@
     (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
   t)
 
+(defun* %md-loan-ns (sap payload len readers iters)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 1) (integer 1) (integer 1)) double-float)
+  "WP-ZC-MULTI-DEST-REFCOUNT bench helper (R6, ADR 0047): the amortised ns for ONE %zc-loan of LEN octets at
+   refcount READERS (the ONE app->slot copy the shared path runs vs one-per-destination today) balanced by READERS
+   releases, over ITERS cycles; dds.pal:monotonic-ns total / iters (the run-bench-zc-loan-lockfree method). A short
+   untimed warmup first-touches the pool so the cold-cache first loan does not skew the amortised figure."
+  (dotimes (w 64)   ; warmup: first-touch the slot pages so the timed loop is steady-state
+    (multiple-value-bind (slot gen) (dds.xport.zerocopy::%zc-loan sap payload 0 len readers)
+      (when slot (dotimes (r readers) (dds.xport.zerocopy::%zc-release sap slot gen)))))
+  (let ((t0 (dds.pal:monotonic-ns)))
+    (dotimes (i iters)
+      (multiple-value-bind (slot gen) (dds.xport.zerocopy::%zc-loan sap payload 0 len readers)
+        (when slot (dotimes (r readers) (dds.xport.zerocopy::%zc-release sap slot gen)))))   ; balance: READERS releases -> refcount 0
+    (/ (float (max 0 (- (dds.pal:monotonic-ns) t0)) 1.0d0) iters)))
+
+(defun* run-bench-multi-dest-zc (&key (file nil) (iters 50000) (payload-bytes 8192) (ns '(2 4 8)))
+    (function (&key (:file (or null string pathname)) (:iters (integer 1)) (:payload-bytes (integer 1))
+                    (:ns list)) t)
+  "WP-ZC-MULTI-DEST-REFCOUNT bench (FR-PF-4, FR-LANG-7; R6, ADR 0047 — NOT cleared for ship, counsel R6). The
+   HONEST pool-economy measurement of one writer sample fanned out to N co-resident ZC destination GROUPS. TODAY:
+   the first ZC destination consumes the pre-committed/armed slot and every OTHER ZC destination takes a FRESH
+   %zc-loan into its OWN slot -> N slots + N app->slot copies. MULTI-DEST (this WP): ONE %zc-loan with refcount=N
+   (or the pre-committed slot bumped 1->N) shared across all N -> 1 slot + 1 copy, N-1 slots + N-1 copies SAVED.
+   For each N in NS the table shows slots-consumed and app->slot copies dropping from N to 1 (measured at the pool
+   primitive: slots via the %zc-free-count delta, copies inherent in the loan count) plus the amortised loan+copy
+   ns TODAY (N loans) vs MULTI-DEST (1 loan + the N-1 bump) for a PAYLOAD-BYTES-octet sample. The payoff needs >=2
+   co-resident ZC participants (NOT the primary 1:1 same-host case) — stated honestly, not overclaimed. Prints a
+   markdown report to *standard-output*; when FILE is given ALSO writes it there. SBCL only (ZC + foreign-SAP
+   atomics, ADR 0013); on Clasp the SHMEM by-name attach is unreliable so the bench pass-skips. Counsel R6."
+  (let* ((sbcl-p (eq (dds.pal:pal-impl-name) :sbcl))
+         (have-shmem (dds.xport.shmem:shm-attach-by-name-reliable-p))
+         (payload (make-array payload-bytes :element-type '(unsigned-byte 8) :initial-element 42))
+         (rows '()))
+    (when (and sbcl-p have-shmem)
+      (let* ((maxn (reduce #'max ns))
+             (slots (max 4 (* 2 maxn)))
+             (mem (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes slots payload-bytes)))
+             (sap (dds.pal:static-pointer mem)))
+        (dds.xport.zerocopy::%zc-init sap slots payload-bytes)
+        (unwind-protect
+             (dolist (n ns)
+               (let ((k (dds.xport.zerocopy::%zc-free-count sap))
+                     (today-held '()))
+                 (dotimes (i n)   ; TODAY: N independent fresh loans (N slots, N copies)
+                   (multiple-value-bind (s g) (dds.xport.zerocopy::%zc-loan sap payload 0 payload-bytes 1)
+                     (when s (push (cons s g) today-held))))
+                 (let ((today-slots (- k (dds.xport.zerocopy::%zc-free-count sap))))
+                   (dolist (c today-held) (dds.xport.zerocopy::%zc-release sap (car c) (cdr c)))
+                   (multiple-value-bind (ss gg) (dds.xport.zerocopy::%zc-loan sap payload 0 payload-bytes n)   ; MULTI-DEST: 1 slot, refcount N
+                     (let ((md-slots (- k (dds.xport.zerocopy::%zc-free-count sap))))
+                       (when ss (dotimes (r n) (dds.xport.zerocopy::%zc-release sap ss gg)))   ; balance: N releases -> refcount 0 (no leak across N)
+                       (push (list n today-slots md-slots n 1                            ; N slots-today slots-md copies-today(N) copies-md(1)
+                                   (%md-loan-ns sap payload payload-bytes 1 iters)        ; per-loan ns (x N today)
+                                   (%md-loan-ns sap payload payload-bytes n iters))       ; 1 loan + 1 copy ns (multi-dest, refcount N)
+                             rows))))))
+          (dds.xport.zerocopy::%zc-destroy sap)
+          (dds.pal:free-static mem))))
+    (setf rows (nreverse rows))
+    (flet ((emit (stream)
+             (format stream "~&# WP-ZC-MULTI-DEST-REFCOUNT — one shared Zero-Copy slot across N co-resident ZC destinations (FR-PF-4, FR-LANG-7, R6)~%~%")
+             (format stream "**NOT cleared for ship — pending counsel (R6); see ADR 0047 (+ ADR 0014/0042/0044).** This is a pool-economy OPTIMIZATION over the always-correct per-destination fresh-loan fallback, not a ZC capability gap: even before this WP a sample already reached all N co-resident ZC destinations — but by taking **N separate pool slots + N app->slot copies**. This WP makes all N share **ONE** slot (refcount = the ZC destination-GROUP count), saving N-1 slots + N-1 copies at fan-out. The payoff materialises ONLY with >=2 co-resident ZC participants (NOT the primary 1:1 same-host case).~%~%")
+             (format stream "## Environment~%~%| field | value |~%|-------|-------|~%")
+             (format stream "| impl | ~a ~a |~%" (lisp-implementation-type) (lisp-implementation-version))
+             (format stream "| host | ~a (~a) |~%" (machine-instance) (machine-type))
+             (format stream "| HEAD | ~a |~%" (%bench-git-head))
+             (format stream "| date | ~a |~%" (%bench-date-string))
+             (format stream "| payload | ~d octets |~%" payload-bytes)
+             (format stream "| iters (loan ns) | ~d |~%~%" iters)
+             (if (not (and sbcl-p have-shmem))
+                 (format stream "(SHMEM by-name attach unreliable on this platform — the multi-dest ZC bench pass-skipped; Clasp/macOS gap, ADR 0013)~%~%")
+                 (progn
+                   (format stream "## The headline — slots + app->slot copies drop from N to 1~%~%")
+                   (format stream "| ZC dests N | slots TODAY | slots MULTI-DEST | copies TODAY | copies MULTI-DEST | slots saved | copies saved |~%")
+                   (format stream "|-----------|-------------|------------------|--------------|-------------------|-------------|--------------|~%")
+                   (dolist (r rows)
+                     (destructuring-bind (n ts ms tc mc today-ns md-ns) r
+                       (declare (ignore today-ns md-ns))
+                       (format stream "| ~d | ~d | ~d | ~d | ~d | ~d | ~d |~%" n ts ms tc mc (- ts ms) (- tc mc))))
+                   (format stream "~%## The loan+copy time saved (amortised ns; FR-LANG-7 — the honest tradeoff)~%~%")
+                   (format stream "| ZC dests N | TODAY (N loans + N copies) ns | MULTI-DEST (1 loan + 1 copy) ns | speedup |~%")
+                   (format stream "|-----------|------------------------------|--------------------------------|---------|~%")
+                   (dolist (r rows)
+                     (destructuring-bind (n ts ms tc mc today-ns md-ns) r
+                       (declare (ignore ts ms tc mc))
+                       (format stream "| ~d | ~,1f | ~,1f | ~,1fx |~%"
+                               n (* n today-ns) md-ns (%bench-ratio (* n today-ns) md-ns))))
+                   (format stream "~%The per-slot refcount is set to EXACTLY N (the ZC destination-GROUP count) so the slot frees only after all N receivers each `%zc-release` once — a wrong N is a slot LEAK (too high) or a use-after-free (too low), so N is the ZC-eligible destination-GROUP count, never the reader-endpoint count (a participant with >1 co-located ZC endpoint resolves the readerId-UNKNOWN DATA ONCE). The armed (loan-write) slot is bumped 1->N with a generation-guarded CAS (`%zc-bump`, the dual of `%zc-release` / the `%zc-pin` core); the ADR-0044 TX pin composes additively. When N=1, or on any uncertainty (lost claim, pool saturation), the path falls back to today's per-destination fresh loan — byte-identical, always correct.~%~%")))
+             (format stream "Method: pool-primitive measurement (`%zc-loan` / `%zc-bump` / `%zc-release` / `%zc-free-count`) — slots via the free-count delta, copies inherent in the loan count, loan ns = `dds.pal:monotonic-ns` total / iters (amortised, the `run-bench-zc-loan-lockfree` method). Generated by `dds.tests:run-bench-multi-dest-zc` (entry: `make bench-multi-dest-zc`). Impl: ~a ~a.~%"
+                     (lisp-implementation-type) (lisp-implementation-version))))
+      (emit *standard-output*)
+      (when file
+        (with-open-file (s file :direction :output :if-exists :supersede :if-does-not-exist :create)
+          (emit s))
+        (format t "~&  wrote ~a~%" file))
+      (when (and sbcl-p have-shmem)
+        (dolist (r rows)
+          (destructuring-bind (n ts ms tc mc today-ns md-ns) r
+            (declare (ignore tc today-ns md-ns))
+            (assert (= ms 1) () "bench: multi-dest N=~d must consume ONE slot (got ~d)" n ms)
+            (assert (= mc 1) () "bench: multi-dest N=~d must be ONE copy (got ~d)" n mc)
+            (assert (= ts n) () "bench: today N=~d must consume N slots (got ~d)" n ts))))))
+  t)
+
 (defun* run-flatdata-deser-interop-test ()
     (function () (eql t))
   "WP-FLATDATA in-memory==wire at DESERIALIZE (FR-PF-4): the FlatData and classic codecs are interchangeable on
@@ -3089,6 +3192,167 @@
       (dds.disc:stop-node node)))
   t)
 
+(defun* %md-group (change zc-count)
+    (function (dds.rtps.history:cache-change (integer 0)) t)
+  "WP-ZC-MULTI-DEST-REFCOUNT test helper (R6, ADR 0047): a synthetic %zc-push-group for one destination carrying
+   CHANGE with ZC-COUNT same-host ZC-capable reader endpoints (the endpoint count is deliberately variable — the
+   crux is that %shared-zc-refs counts GROUPS, not endpoints). A fixed (host . port) dest; the plan/emit are not
+   driven here, only the shared-ref refcount accounting."
+  (dds.disc::%make-zc-push-group :dest (cons "127.0.0.1" 0) :zc-count zc-count :changes (list change)))
+
+(defun* run-multi-dest-refcount-test ()
+    (function () t)
+  "WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, R6, ADR 0047; NOT cleared for ship — pending counsel). Deterministic,
+   single-process (no networking) proof of the refcount-exactness CRUX: %shared-zc-refs loans ONE Zero-Copy slot
+   for a change reaching N (>=2) ZC-eligible destination GROUPS with refcount = EXACTLY N, freed only after all N
+   receivers each %zc-release once (no leak: back to baseline; no UAF: an extra release is a floored no-op). A
+   real disc-node with a ZC pool + user writer; synthetic push groups (%md-group). Asserts:
+     (1) NON-ARMED SHARED (N=2): a classic ZC change reaching two ZC groups takes ONE fresh slot (free-count K-1,
+         NOT K-2), refcount 2; two releases free it (free-count K); a third release is a floored no-op.
+     (2) N SCALES (N=3): three ZC groups -> ONE slot, refcount 3; three releases free it.
+     (3) GROUPS NOT ENDPOINTS (the LEAK guard): a SINGLE group with TWO co-located ZC endpoints (zc-count 2) is
+         N=1 -> NO shared entry (rides the per-group path, refcount 1) — counting endpoints would leak the slot.
+     (4) ARMED SHARED (N=3): a pre-committed (loan-write) slot is CLAIMED one-shot (:consumed) and BUMPED 1->3
+         with NO fresh slot (free-count unchanged); three releases free it.
+     (5) PIN COMPOSITION (ADR 0044): an armed+PINNED slot (refcount 2 = delivery+pin) shared to N=2 -> bump to
+         refcount 3 (= 2 delivery + 1 pin); freed only after BOTH receiver releases AND the pin release, in
+         EITHER order (no early free, no leak).
+     (6) DIVERGENT UNSENT: a change present in only a SUBSET of the ZC groups shares with refcount = that subset
+         count (a change in 1 group is N=1, no entry) — the emitter count is exact, not the group total.
+     (7) SATURATION FALLBACK: with the pool exhausted a non-armed shared loan returns no entry (each dest falls
+         back to its own fresh loan / payload — always correct).
+   SBCL only (ZC pool, ADR 0013); Clasp pass-skips."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p)
+    (format t "~&  [skip] multi-dest-refcount: SHMEM by-name attach unreliable (ZC, ADR 0013) — NFR-PORT gap~%")
+    (return-from run-multi-dest-refcount-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (payload (make-array 20 :element-type '(unsigned-byte 8) :initial-element 5))
+         (node (dds.disc:make-disc-node
+                :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 66)
+                :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer node :topic "MdRef" :type "fd-abc")
+           (dds.disc:enable-publisher node)
+           (let* ((sap (dds.disc::disc-node-zc-pool-sap node))
+                  (writer (dds.disc::disc-node-user-writer node))
+                  (k (dds.xport.zerocopy::%zc-free-count sap)))
+             ;; (1) NON-ARMED SHARED, N=2: one slot, refcount 2, exact free/no-leak/no-UAF
+             (multiple-value-bind (sn ch) (dds.rtps.reliable:writer-write writer payload)
+               (declare (ignore sn))
+               (let ((table (dds.disc::%shared-zc-refs node writer (list (%md-group ch 1) (%md-group ch 1)))))
+                 (let ((cell (gethash ch table)))
+                   (%check :md-n2-shared (consp cell) "a change reaching 2 ZC groups must get a shared (slot . gen) entry")
+                   (%check :md-n2-one-slot (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                           "the shared change must consume EXACTLY ONE slot (free-count K-1), not one-per-destination")
+                   (%check :md-n2-refcount (= 2 (%zc-slot-refcount sap (car cell)))
+                           "the shared slot's refcount must be N=2 (one delivery hold per ZC destination-group)")
+                   ;; two receivers each release once -> freed exactly when the LAST returns
+                   (dds.xport.zerocopy::%zc-release sap (car cell) (cdr cell))
+                   (%check :md-n2-after1 (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                           "after ONE of two releases the slot must still be held (freed only when the LAST returns)")
+                   (dds.xport.zerocopy::%zc-release sap (car cell) (cdr cell))
+                   (%check :md-n2-freed (= k (dds.xport.zerocopy::%zc-free-count sap))
+                           "after BOTH releases the slot must be freed (no leak: free-count back to baseline)")
+                   (dds.xport.zerocopy::%zc-release sap (car cell) (cdr cell))
+                   (%check :md-n2-floored (= k (dds.xport.zerocopy::%zc-free-count sap))
+                           "a THIRD release must be a floored no-op (no UAF / underflow)"))))
+             ;; (2) N SCALES to 3
+             (multiple-value-bind (sn ch) (dds.rtps.reliable:writer-write writer payload)
+               (declare (ignore sn))
+               (let* ((table (dds.disc::%shared-zc-refs node writer
+                                                        (list (%md-group ch 1) (%md-group ch 1) (%md-group ch 1))))
+                      (cell (gethash ch table)))
+                 (%check :md-n3-one-slot (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                         "N=3 must still consume ONE slot")
+                 (%check :md-n3-refcount (= 3 (%zc-slot-refcount sap (car cell)))
+                         "the shared slot's refcount must be N=3")
+                 (dotimes (i 3) (dds.xport.zerocopy::%zc-release sap (car cell) (cdr cell)))
+                 (%check :md-n3-freed (= k (dds.xport.zerocopy::%zc-free-count sap))
+                         "three releases must free the N=3 shared slot")))
+             ;; (3) GROUPS NOT ENDPOINTS: a single group with 2 ZC endpoints is N=1 -> no shared entry (leak guard)
+             (multiple-value-bind (sn ch) (dds.rtps.reliable:writer-write writer payload)
+               (declare (ignore sn))
+               (let ((table (dds.disc::%shared-zc-refs node writer (list (%md-group ch 2)))))
+                 (%check :md-endpoints-no-share (null (gethash ch table))
+                         "ONE participant-group with 2 co-located ZC endpoints is N=1 (GROUP count) -> NO shared slot (endpoint-count sharing would LEAK)")
+                 (%check :md-endpoints-no-slot (= k (dds.xport.zerocopy::%zc-free-count sap))
+                         "the leak-guard case must consume no slot (per-group path handles it)")))
+             ;; (4) ARMED SHARED, N=3: pre-committed slot claimed + bumped 1->3, NO fresh slot
+             (multiple-value-bind (slot gen change) (%lw-armed-change node payload)
+               (%check :md-armed-held (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                       "the armed pre-committed slot is held (free-count K-1)")
+               (let* ((table (dds.disc::%shared-zc-refs node writer
+                                                        (list (%md-group change 1) (%md-group change 1) (%md-group change 1))))
+                      (cell (gethash change table)))
+                 (%check :md-armed-shared (consp cell) "an armed change reaching 3 ZC groups must get a shared entry")
+                 (%check :md-armed-same-slot (= slot (car cell))
+                         "the shared entry must be the PRE-COMMITTED slot (no fresh loan)")
+                 (%check :md-armed-consumed (eq (dds.rtps.history:cache-change-zc-state change) :consumed)
+                         "the armed claim must be one-shot (:consumed)")
+                 (%check :md-armed-no-fresh (= (- k 1) (dds.xport.zerocopy::%zc-free-count sap))
+                         "the armed multi-dest path must NOT loan a fresh slot (the pre-committed one is bumped)")
+                 (%check :md-armed-refcount (= 3 (%zc-slot-refcount sap slot))
+                         "the pre-committed slot's refcount must be bumped 1 -> N=3")
+                 (dotimes (i 3) (dds.xport.zerocopy::%zc-release sap slot gen))
+                 (%check :md-armed-freed (= k (dds.xport.zerocopy::%zc-free-count sap))
+                         "three releases must free the armed shared slot")))
+             ;; (5) PIN COMPOSITION (ADR 0044): armed + pin (refcount 2) shared to N=2 -> refcount 3, both orders
+             (dolist (pin-first '(nil t))
+               (multiple-value-bind (slot gen change) (%lw-armed-change node payload)
+                 (dds.xport.zerocopy::%zc-pin sap slot gen)   ; simulate the publish-sample pin (delivery + pin = refcount 2)
+                 (%check :md-pin-two (= 2 (%zc-slot-refcount sap slot)) "armed + pin must be refcount 2 before sharing")
+                 (let* ((table (dds.disc::%shared-zc-refs node writer (list (%md-group change 1) (%md-group change 1))))
+                        (cell (gethash change table)))
+                   (declare (ignore cell))
+                   (%check :md-pin-refcount (= 3 (%zc-slot-refcount sap slot))
+                           "shared N=2 over an armed+pinned slot must be refcount 3 (2 delivery + 1 pin) — the pin composes additively")
+                   (if pin-first
+                       (progn
+                         (dds.xport.zerocopy::%zc-release sap slot gen)   ; pin release first
+                         (%check :md-pin-rf-1 (= 2 (%zc-slot-refcount sap slot)) "pin release drops 3->2")
+                         (dds.xport.zerocopy::%zc-release sap slot gen)
+                         (dds.xport.zerocopy::%zc-release sap slot gen))
+                       (progn
+                         (dds.xport.zerocopy::%zc-release sap slot gen)   ; two receiver releases first
+                         (dds.xport.zerocopy::%zc-release sap slot gen)
+                         (%check :md-pin-dr-1 (= 1 (%zc-slot-refcount sap slot)) "two receiver releases drop 3->1 (pin still holds)")
+                         (dds.xport.zerocopy::%zc-release sap slot gen)))   ; pin release last
+                   (%check :md-pin-freed (= k (dds.xport.zerocopy::%zc-free-count sap))
+                           "the armed+pinned shared slot frees only after ALL N receivers AND the pin release"))))
+             ;; (6) DIVERGENT UNSENT: cA in both ZC groups (N=2, shared); cB in one (N=1, no entry)
+             (multiple-value-bind (sa ca) (dds.rtps.reliable:writer-write writer payload)
+               (declare (ignore sa))
+               (multiple-value-bind (sb cb) (dds.rtps.reliable:writer-write writer payload)
+                 (declare (ignore sb))
+                 (let* ((g1 (dds.disc::%make-zc-push-group :dest (cons "127.0.0.1" 0) :zc-count 1 :changes (list ca cb)))
+                        (g2 (dds.disc::%make-zc-push-group :dest (cons "127.0.0.1" 0) :zc-count 1 :changes (list ca)))
+                        (table (dds.disc::%shared-zc-refs node writer (list g1 g2)))
+                        (cell (gethash ca table)))
+                   (%check :md-div-shared (consp cell) "cA reaches BOTH ZC groups -> shared (N=2)")
+                   (%check :md-div-refcount (= 2 (%zc-slot-refcount sap (car cell))) "cA shared refcount = the 2 emitting groups")
+                   (%check :md-div-single (null (gethash cb table)) "cB reaches only ONE ZC group -> N=1 -> no shared entry (exact emitter count)")
+                   (dds.xport.zerocopy::%zc-release sap (car cell) (cdr cell))
+                   (dds.xport.zerocopy::%zc-release sap (car cell) (cdr cell))
+                   (%check :md-div-freed (= k (dds.xport.zerocopy::%zc-free-count sap)) "cA frees after its 2 releases"))))
+             ;; (7) SATURATION FALLBACK: exhaust the pool -> a non-armed shared loan yields no entry (per-dest fallback)
+             (multiple-value-bind (sn ch) (dds.rtps.reliable:writer-write writer payload)
+               (declare (ignore sn))
+               (let ((held '()))
+                 (loop for free = (dds.xport.zerocopy::%zc-free-count sap) while (plusp free)
+                       do (multiple-value-bind (s g) (dds.xport.zerocopy::%zc-loan sap payload 0 20 1)
+                            (if s (push (cons s g) held) (return))))
+                 (%check :md-sat-full (zerop (dds.xport.zerocopy::%zc-free-count sap)) "pool exhausted for the fallback probe")
+                 (let ((table (dds.disc::%shared-zc-refs node writer (list (%md-group ch 1) (%md-group ch 1)))))
+                   (%check :md-sat-fallback (null (gethash ch table))
+                           "with the pool saturated the shared loan must return no entry (each destination falls back to a fresh loan / payload)"))
+                 (dolist (c held) (dds.xport.zerocopy::%zc-release sap (car c) (cdr c)))
+                 (%check :md-sat-restored (= k (dds.xport.zerocopy::%zc-free-count sap)) "probe slots released (test hygiene)")))))
+      (dds.disc:stop-node node)))
+  t)
+
 (defun* run-flow-token-bucket-test ()
     (function () t)
   "WP-ASYNC-FLOW (FR-PF-2, flow-control half), ADR 0016: the bytes/period token bucket with a deterministic
@@ -3398,6 +3662,7 @@
                  ("zc-defer"                 . run-zc-defer-test)
                  ("dcps-loan-roundtrip"      . run-dcps-loan-roundtrip-test)
                  ("dcps-loan-write-e2e"      . run-dcps-loan-write-e2e-test)
+                 ("multi-dest-zc-e2e"        . run-multi-dest-zc-e2e-test)
                  ("loan-write-shmem-cleartext" . run-loan-write-shmem-cleartext-test)
                  ("loan-read-return-take"    . run-loan-read-return-take-test)
                  ("loan-handle-dealias"      . run-loan-handle-dealias-test)
@@ -3568,6 +3833,7 @@
                  ("loan-write-eligibility"   . run-loan-write-eligibility-test)
                  ("loan-write-sendsite"      . run-loan-write-sendsite-test)
                  ("loan-write-timeout-release" . run-loan-write-timeout-release-test)
+                 ("multi-dest-refcount"      . run-multi-dest-refcount-test)
                  ("flatdata-transcode-xcdr1be" . run-flatdata-transcode-xcdr1be-test)
                  ("flatdata-transcode-xcdr1le" . run-flatdata-transcode-xcdr1le-test)
                  ("flatdata-transcode-xcdr2be" . run-flatdata-transcode-xcdr2be-test)

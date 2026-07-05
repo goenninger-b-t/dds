@@ -8,7 +8,7 @@
            #:run-all-tests #:run-echo-test #:run-mem-test #:run-mem-test-secure #:run-pbt-tests
            #:run-pal-signal-handler-test
            #:run-bench-flatdata #:run-bench-flatdata-zc-loan #:run-bench-zc-loan-lockfree
-           #:run-bench-flatdata-loan-write
+           #:run-bench-flatdata-loan-write #:run-bench-multi-dest-zc
            #:run-bench-async-flow #:test-failure #:run-durability-store-test
            #:run-durability-spec-test #:run-durability-collect-test
            #:run-durability-transient-test #:run-durability-runner-test

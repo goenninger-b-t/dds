@@ -6525,6 +6525,101 @@
       (dds.dcps:delete-participant p2)))
   t)
 
+(defun* run-multi-dest-zc-e2e-test ()
+    (function () t)
+  "WP-ZC-MULTI-DEST-REFCOUNT end-to-end proof (FR-PF-4, R6, ADR 0047; NOT cleared for ship — pending counsel).
+   The full DCPS stack across THREE co-resident participants — one writer (p1) and TWO ZC reader participants
+   (p2, p3, each a separate participant = a separate destination GROUP) — *shmem-enabled* + *zerocopy-enabled*,
+   a FlatData topic (fd-abc). ONE write-sample fans out to both ZC destinations over a SINGLE shared pool slot
+   (refcount = the 2 destination GROUPS), the ADR-0047 pool-economy win vs today's 2 slots + 2 copies. Asserts:
+     (1) TWO ZC GROUPS: the writer resolves 2 ZC-eligible destination groups (%reader-push-targets, both zc).
+     (2) ONE SHARED SLOT: the write consumes EXACTLY ONE slot (writer free-count K-1, NOT K-2) though it reaches
+         two destinations; zc-sends = 2 (two ref datagrams, one per destination — the wire is unchanged).
+     (3) BOTH DELIVERED byte-exact: p2 AND p3 each take-loaned a view of the SAME shared slot (refcount 2 while
+         both hold), every field equal to what was written.
+     (4) EXACT LIFECYCLE: the slot frees only after BOTH readers return-loan (refcount 2 -> 1 -> 0; free-count
+         restored to K) — no leak, no premature free / UAF.
+   Skips cleanly where SHMEM is off (Clasp/macOS gap, ADR 0013)."
+  (unless (dds.xport.shmem:shm-attach-by-name-reliable-p) (return-from run-multi-dest-zc-e2e-test t))
+  (let* ((dds.disc:*shmem-enabled* t)
+         (dds.disc:*zerocopy-enabled* t)
+         (dds.disc:*zerocopy-min-payload-bytes* 8)
+         (ts (dds.types:find-type-support "fd-abc"))
+         (va 211) (vb 3000000011) (vc 12345678901234567811)
+         (p1 (dds.dcps:create-participant :domain (test-domain)))
+         (p2 (dds.dcps:create-participant :domain (test-domain)))
+         (p3 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "MdZc" "fd-abc" ts))
+                (tr2 (dds.dcps:create-topic p2 "MdZc" "fd-abc" ts))
+                (tr3 (dds.dcps:create-topic p3 "MdZc" "fd-abc" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr2 (dds.dcps:create-datareader (dds.dcps:create-subscriber p2) tr2
+                                                 :qos (dds.qos:make-reader-qos :reliability :reliable)))
+                (dr3 (dds.dcps:create-datareader (dds.dcps:create-subscriber p3) tr3
+                                                 :qos (dds.qos:make-reader-qos :reliability :reliable)))
+                (node1 (dds.dcps::dp-node p1))
+                (node2 (dds.dcps::dp-node p2))
+                (node3 (dds.dcps::dp-node p3))
+                (fd (make-fd-abc-flatdata)))
+           (setf (fd-abc-a-fd fd) va (fd-abc-b-fd fd) vb (fd-abc-c-fd fd) vc)
+           (loop repeat 300
+                 until (>= (dds.dcps:matched-count p1) 2)
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (dds.dcps:spin p3) (sleep 0.02))
+           (%check :md-e2e-matched (>= (dds.dcps:matched-count p1) 2) "the writer must match BOTH reader participants")
+           ;; both destinations must advertise ZC-capable -> 2 ZC-eligible push groups
+           (loop repeat 300
+                 until (let ((groups (dds.disc::%reader-push-targets node1)))
+                         (and (= 2 (length groups))
+                              (every (lambda (g) (plusp (dds.disc::%zc-readers node1 (cdr g)))) groups)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (dds.dcps:spin p3) (sleep 0.02))
+           (let ((groups (dds.disc::%reader-push-targets node1)))
+             (%check :md-e2e-two-groups
+                     (and (= 2 (length groups))
+                          (every (lambda (g) (plusp (dds.disc::%zc-readers node1 (cdr g)))) groups))
+                     "the writer must see EXACTLY 2 ZC-eligible destination groups"))
+           (let* ((wsap (dds.disc::disc-node-zc-pool-sap node1))
+                  (k (dds.xport.zerocopy::%zc-free-count wsap)))
+             (dds.dcps:write-sample dw fd)
+             (loop repeat 300 until (>= (dds.disc::disc-node-zc-sends node1) 2)
+                   do (dds.dcps:spin p1) (sleep 0.02))
+             ;; (2) ONE shared slot, two ref datagrams
+             (%check :md-e2e-two-sends (= 2 (dds.disc::disc-node-zc-sends node1))
+                     "exactly TWO zero-copy ref datagrams (one per destination) must have been emitted")
+             (%check :md-e2e-one-slot (= (- k 1) (dds.xport.zerocopy::%zc-free-count wsap))
+                     "the fan-out must consume EXACTLY ONE shared slot (free-count K-1), not one-per-destination (K-2)")
+             (loop repeat 400
+                   until (and (plusp (dds.disc:node-sample-count node2)) (plusp (dds.disc:node-sample-count node3)))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (dds.dcps:spin p3) (sleep 0.02))
+             ;; (3) both readers take-loaned a view of the SAME shared slot, byte-exact
+             (multiple-value-bind (d2 l2) (dds.dcps:take-loaned dr2)
+               (multiple-value-bind (d3 l3) (dds.dcps:take-loaned dr3)
+                 (%check :md-e2e-p2-view (and d2 (dds.types:flatdata-view-p (first d2))) "p2 must take a ZC view")
+                 (%check :md-e2e-p3-view (and d3 (dds.types:flatdata-view-p (first d3))) "p3 must take a ZC view")
+                 (let ((v2 (first d2)) (v3 (first d3)))
+                   (%check :md-e2e-same-slot
+                           (= (dds.types:flatdata-view-slot-index v2) (dds.types:flatdata-view-slot-index v3))
+                           "both readers' views must reference the SAME shared writer slot")
+                   (%check :md-e2e-p2-a (= (fd-abc-a-fd v2) va) (format nil "p2 field a ~d != ~d" (fd-abc-a-fd v2) va))
+                   (%check :md-e2e-p2-c (= (fd-abc-c-fd v2) vc) (format nil "p2 field c ~d != ~d" (fd-abc-c-fd v2) vc))
+                   (%check :md-e2e-p3-a (= (fd-abc-a-fd v3) va) (format nil "p3 field a ~d != ~d" (fd-abc-a-fd v3) va))
+                   (%check :md-e2e-p3-c (= (fd-abc-c-fd v3) vc) (format nil "p3 field c ~d != ~d" (fd-abc-c-fd v3) vc))
+                   (%check :md-e2e-held-two (= 2 (%zc-slot-refcount wsap (dds.types:flatdata-view-slot-index v2)))
+                           "while BOTH readers hold, the shared slot's refcount must be 2"))
+                 ;; (4) exact lifecycle: free only after BOTH return
+                 (dds.dcps:return-loan dr2 l2)
+                 (%check :md-e2e-after-one (= (- k 1) (dds.xport.zerocopy::%zc-free-count wsap))
+                         "after ONE reader returns, the shared slot must still be held (the other reader holds it)")
+                 (dds.dcps:return-loan dr3 l3)
+                 (%check :md-e2e-freed (= k (dds.xport.zerocopy::%zc-free-count wsap))
+                         "the shared slot frees only after BOTH readers return-loan (no leak, no early free)"))))
+           (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2)
+      (dds.dcps:delete-participant p3)))
+  t)
+
 (defun* %lw-pool-scan-marker-p (sap needle)
     (function (t (simple-array (unsigned-byte 8) (*))) t)
   "WP-FLATDATA-LOAN-WRITE SHMEM-scan helper (R6, ADR 0042 §6): T iff the 8-octet NEEDLE occurs anywhere in the

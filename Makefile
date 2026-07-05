@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-async-flow bench-flow-edf-priority bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-multi-dest-zc bench-async-flow bench-flow-edf-priority bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -261,6 +261,12 @@ bench-flatdata-loan-write:
 bench-zc-loan-lockfree:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-zc-loan-lockfree :file "bench/report/2026-06-16-wp-zc-loan-lockfree.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+
+# WP-ZC-MULTI-DEST-REFCOUNT (FR-PF-4, FR-LANG-7; R6, ADR 0047): one shared Zero-Copy slot across N co-resident
+# ZC destinations — slots + app->slot copies drop from N to 1 at fan-out. SBCL only (Clasp SHMEM pass-skips).
+bench-multi-dest-zc:
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-multi-dest-zc :file "bench/report/2026-07-05-wp-zc-multi-dest.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-ASYNC-FLOW Phase F1 (FR-PF-2, FR-LANG-7): HONEST rate-shaping report — achieved-vs-configured rate,
 # single-writer paced vs the enable-async UNPACED baseline (pacing ADDS latency by design — no 0-cost claim),
