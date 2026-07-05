@@ -519,22 +519,32 @@
   (let ((ts (topic-type-support topic)))
     (if ts (dds.types:type-support-keyed-p ts) t)))
 
-(defun* %set-user-metadata-protection (node ah topic-name)
-    (function (dds.disc:disc-node t string) t)
-  "DDS-Security 1.1 §9.4.1.2.4: set NODE's USER-SUBMESSAGE-PROTECTION-KIND (the user-DATA submessage protection
-   tier, metadata_protection) from the access-handle AH's governance metadata_protection_kind for TOPIC-NAME. A
-   NIL AH (no AccessControl) or no governance leaves the slot :none -> the user submessage path stays plain,
-   byte-identical. Called when the user writer/reader is created (it knows the topic name); the resolver installed
-   by %install-crypto-manager reads this kind at send time, so the order (install-then-create) is correct."
+(defun* %set-user-metadata-protection (node ah topic-name role)
+    (function (dds.disc:disc-node t string (member :writer :reader)) t)
+  "DDS-Security 1.1 §9.4.1.2.4 (ADR 0046): set ROLE's (the WRITER's or the READER's) OWN metadata_protection +
+   data_protection kind from the access-handle AH's governance for TOPIC-NAME, into the PER-ROLE disc-node fields —
+   so a writer and a reader on DIFFERENT topics keep INDEPENDENT kinds (the cross-role false-ACCEPT downgrade fix).
+   The shared user-{data,submessage}-protection-kind slots are kept at the MONOTONIC MAX over both roles for the
+   participant-scope consumers only. A NIL AH (no AccessControl) or no governance leaves every slot at its default
+   (:none submessage / :unset data) -> the user path stays plain, byte-identical. Called when the user writer/reader
+   is created (it knows the topic name) AFTER add-local-{writer,reader}; both agree on ROLE's fields (idempotent)."
   (when ah
     (let ((gov (dds.security:access-handle-governance ah)))
       (when gov
-        (setf (dds.disc:disc-node-user-submessage-protection-kind node)
-              (dds.security:topic-metadata-protection gov topic-name))
-        ;; §9.4.1.2.4 data_protection_kind: gates the serialized-payload SecuredPayload tier — :none leaves the
-        ;; payload PLAIN, so the crypto-transform encode/decode is skipped (a SIGN tier with data=NONE).
-        (setf (dds.disc:disc-node-user-data-protection-kind node)
-              (dds.security:topic-data-protection gov topic-name)))))
+        (let ((mk (dds.security:topic-metadata-protection gov topic-name))
+              (dk (dds.security:topic-data-protection gov topic-name)))
+          (ecase role
+            (:writer (setf (dds.disc:disc-node-user-writer-submessage-protection-kind node) mk
+                           (dds.disc:disc-node-user-writer-data-protection-kind node) dk))
+            (:reader (setf (dds.disc:disc-node-user-reader-submessage-protection-kind node) mk
+                           (dds.disc:disc-node-user-reader-data-protection-kind node) dk)))
+          ;; §9.4.1.2.4: keep the participant-scope shared slots at the most-protective MAX over both roles (fail-closed)
+          (setf (dds.disc:disc-node-user-submessage-protection-kind node)
+                (dds.disc::%protection-kind-max (dds.disc:disc-node-user-writer-submessage-protection-kind node)
+                                               (dds.disc:disc-node-user-reader-submessage-protection-kind node))
+                (dds.disc:disc-node-user-data-protection-kind node)
+                (dds.disc::%protection-kind-max (dds.disc:disc-node-user-writer-data-protection-kind node)
+                                               (dds.disc:disc-node-user-reader-data-protection-kind node)))))))
   t)
 
 (defun* create-datawriter (pub topic &key (qos (dds.qos:make-writer-qos)))
@@ -553,7 +563,7 @@
     (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
                                :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))
-    (%set-user-metadata-protection node ah (topic-name topic))   ; §9.4.1.2.4 user-DATA submessage protection tier
+    (%set-user-metadata-protection node ah (topic-name topic) :writer)   ; ADR 0046 §9.4.1.2.4: the WRITER's own protection tiers
     (dds.disc:enable-publisher node :history-kind (dds.qos:qos-history-kind qos)
                                     :history-depth (dds.qos:qos-history-depth qos))
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
@@ -579,7 +589,7 @@
     (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
                                :keyed (%topic-keyed-p topic)
                                :qos qos :type-information (%topic-type-information topic))
-    (%set-user-metadata-protection node ah (topic-name topic))   ; §9.4.1.2.4 user-DATA submessage protection tier
+    (%set-user-metadata-protection node ah (topic-name topic) :reader)   ; ADR 0046 §9.4.1.2.4: the READER's own protection tiers
     (dds.disc:enable-subscriber node)
     ;; WP-FLATDATA-ZC-LOAN wiring (FR-PF-3/4, R6, ADR 0017): a :flatdata-topic reader, with ZC armed, is
     ;; loan-capable — the receiver thread defers ZC resolution (holds the slot) and the loan API owns the slot

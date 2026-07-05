@@ -172,7 +172,8 @@
                     ;; The harness builds the endpoint via add-local-{writer,reader} (to force NO_KEY for the Fast
                     ;; DDS HelloWorld match), bypassing create-data{writer,reader}, so set the kind here (the SAME
                     ;; %set-user-metadata-protection the dcps entity path calls — DRY) from the participant governance.
-                    (dds.dcps::%set-user-metadata-protection node (dds.dcps::dp-access-state p) topic)
+                    (dds.dcps::%set-user-metadata-protection node (dds.dcps::dp-access-state p) topic
+                                                             (if pubp :writer :reader))   ; ADR 0046: per-role
                     (format t "~&[~a] secure participant up: domain=~d topic=~a type=~a guid-prefix=~{~2,'0x~} port=~d peers=~a~%"
                             role domain topic type (coerce (dds.disc:disc-node-guid-prefix node) 'list)
                             (dds.disc:disc-node-port node) peers)

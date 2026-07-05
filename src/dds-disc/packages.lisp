@@ -127,6 +127,11 @@
            ;; Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP): USER-DATA submessage protection (metadata_protection)
            #:disc-node-user-submessage-protection-kind
            #:disc-node-user-data-protection-kind
+           ;; ADR 0046: per-role protection kinds (writer's / reader's own topic kind — the cross-role downgrade fix)
+           #:disc-node-user-writer-data-protection-kind
+           #:disc-node-user-writer-submessage-protection-kind
+           #:disc-node-user-reader-data-protection-kind
+           #:disc-node-user-reader-submessage-protection-kind
            #:disc-node-topic-data-protection-resolver
            #:disc-node-topic-metadata-protection-resolver
            #:disc-node-user-submessage-encode

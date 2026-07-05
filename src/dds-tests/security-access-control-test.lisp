@@ -1042,94 +1042,135 @@
             "SIGN_WITH_ORIGIN_AUTHENTICATION in metadata_protection_kind must make parse-governance return NIL (tier guard)"))
   t)
 
+(defun* %pep-cross-role-setup (gov topic-w topic-r crypto)
+    (function (t string string t) (values t dds.disc:disc-node))
+  "ADR 0046 test helper: bring up a secured participant with GOV installed, then add-local-writer on TOPIC-W and
+   add-local-reader on TOPIC-R (each enabled) — the cross-role sequence that triggered the shared-slot last-write-wins
+   protection-kind downgrade. When CRYPTO, install a test EntityCrypto transform so publish-sample exercises the real
+   SecuredPayload path. Returns (values participant node); the caller must delete-participant."
+  (let ((ah (dds.security:make-access-handle :governance gov))
+        (p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+    (let ((node (dds.dcps::dp-node p)))
+      (setf (dds.dcps::dp-auth-state p)
+            (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
+      (dds.dcps::%install-access-control p ah)
+      (dds.disc:add-local-writer node :topic topic-w :type "ShapeType")
+      (dds.disc:enable-publisher node :history-kind :keep-all)
+      (dds.disc:add-local-reader node :topic topic-r :type "ShapeType")
+      (dds.disc:enable-subscriber node)
+      (when crypto (setf (dds.disc::disc-node-crypto-transform node) (dds.security:make-test-key-material)))
+      (values p node))))
+
+(defun* %pep-writer-emits-protected-p (node pt)
+    (function (dds.disc:disc-node (simple-array (unsigned-byte 8) (*))) boolean)
+  "ADR 0046 test helper: publish PT through NODE's live user WRITER (the REAL publish-sample SecuredPayload gate,
+   no networking) and return T iff the emitted serialized-payload is PROTECTED (the transform was applied — the bytes
+   differ from PT), NIL iff PT rode PLAIN. Reads the writer's newest HistoryCache change."
+  (dds.disc:publish-sample node pt)
+  (let* ((w (dds.disc::disc-node-user-writer node))
+         (hc (dds.rtps.reliable:rtps-writer-hc w))
+         (ch (car (last (dds.rtps.history:hc-changes-for-reader hc nil))))
+         (emitted (dds.rtps.history:cache-change-serialized-payload ch)))
+    (not (equalp emitted pt))))
+
 (defun* run-security-data-protection-downgrade-test ()
     (function () t)
-  "Review follow-up (DDS-Security 1.1 §9.4.1.2.4): a MULTI-RULE governance whose FIRST topic_rule is data=NONE
-   while a LATER rule is data=ENCRYPT for a specific topic must NOT let an add-local-{writer,reader} endpoint
-   inherit the FIRST-rule participant default. The fix: (1) the participant-level default is MOST-PROTECTIVE
-   (governance-effective-data-protection, max :encrypt>:sign>:none — fail-closed), and (2) add-local resolves
-   the ACTUAL per-topic data_protection via the %install-access-control-installed resolver. Asserts, on the
-   PRE-fix first-rule logic, RED on both a FALSE-ACCEPT (an ENCRYPT topic left :none) and a FALSE-REJECT (a
-   genuine NONE topic forced to protection). Rules are ordered so the wildcard-free FIRST rule (Square) does
-   NOT shadow the LATER Circle rule (topic-data-protection = first-MATCHING rule, §9.4.1.2.4)."
-  (let* ((gov (dds.security:make-governance
-               :discovery-protection-kind :none
-               :liveliness-protection-kind :none
-               :rtps-protection-kind :none
-               :topic-rules
-               (list (dds.security:make-topic-rule :topic-expr "Square"    ; FIRST rule: a genuine data=NONE topic
-                                                   :metadata-protection-kind :none
-                                                   :data-protection-kind :none)
-                     (dds.security:make-topic-rule :topic-expr "Circle"    ; LATER rule: data=ENCRYPT (Square rule does not shadow it)
-                                                   :metadata-protection-kind :none
-                                                   :data-protection-kind :encrypt))))
-         (ah  (dds.security:make-access-handle :governance gov)))
+  "ADR 0046 (DDS-Security 1.1 §9.4.1.2.4 / §9.5): the CROSS-ROLE SecuredPayload (data_protection) downgrade. The
+   disc-node holds ONE live user writer and ONE live user reader; before the fix they SHARED a single participant-
+   global data_protection slot that add-local-{writer,reader} mutated last-write-wins, and publish-sample read that
+   shared slot — so adding a NONE reader on a live ENCRYPT writer's participant DOWNGRADED the writer to PLAINTEXT (a
+   false-ACCEPT). The fix caches each ROLE's kind from ITS OWN topic and publish uses the WRITER's. Governance: Circle
+   data=ENCRYPT, Square data=NONE. Two scenarios, each driving the real publish path when OpenSSL is available:
+   (A) ENCRYPT-Circle writer + a LATER NONE-Square reader -> the writer STILL emits protected (:encrypt), the reader
+       is :none — RED on the pre-fix shared-slot logic (the writer emitted plaintext after the reader's add);
+   (B) NONE-Square writer + a LATER ENCRYPT-Circle reader -> the writer STILL emits PLAIN (:none), the reader is
+       :encrypt — no over-protection (a NONE topic forced to protection would be a false-REJECT / interop break)."
+  (let ((gov (dds.security:make-governance
+              :discovery-protection-kind :none :liveliness-protection-kind :none :rtps-protection-kind :none
+              :topic-rules
+              (list (dds.security:make-topic-rule :topic-expr "Square"    ; genuine data=NONE topic
+                                                  :metadata-protection-kind :none :data-protection-kind :none)
+                    (dds.security:make-topic-rule :topic-expr "Circle"    ; data=ENCRYPT (Square rule does not shadow it)
+                                                  :metadata-protection-kind :none :data-protection-kind :encrypt))))
+        (dare (handler-case (progn (dds.dare:dare-available-p) t) (dds.dare:dare-unavailable () nil)))
+        (pt (make-array 8 :element-type '(unsigned-byte 8)
+                          :initial-contents '(#x53 #x51 #x55 #x41 #x52 #x45 #x20 #x01))))   ; "SQUARE  "
     (%check :dp-downgrade-effective-most-protective
             (eq :encrypt (dds.security:governance-effective-data-protection gov))
-            "governance-effective-data-protection must be MOST-PROTECTIVE over ALL rules (max :encrypt>:sign>:none): a FIRST data=NONE rule must NOT downgrade the participant default below a LATER data=ENCRYPT rule (fail-closed)")
-    (let ((p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+            "governance-effective-data-protection must be MOST-PROTECTIVE over ALL rules (max :encrypt>:sign>:none, fail-closed)")
+    ;; Scenario A — ENCRYPT-Circle WRITER + a later NONE-Square READER: the writer must STAY :encrypt (no downgrade).
+    (multiple-value-bind (p node) (%pep-cross-role-setup gov "Circle" "Square" dare)
       (unwind-protect
-           (let ((node (dds.dcps::dp-node p)))
-             (setf (dds.dcps::dp-auth-state p)
-                   (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
-             (dds.dcps::%install-access-control p ah)
-             ;; the data=ENCRYPT topic (a LATER rule) via add-local must resolve per-topic to :encrypt — never the FIRST rule's :none (false-ACCEPT)
-             (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType")
-             (%check :dp-downgrade-encrypt-topic-not-none
-                     (eq :encrypt (dds.disc:disc-node-user-data-protection-kind node))
-                     "add-local-writer on the data=ENCRYPT topic (a LATER rule; the FIRST rule is data=NONE) must resolve per-topic to :encrypt, never :none — a plain payload accepted on an ENCRYPT topic is a false-ACCEPT")
-             ;; a genuine data=NONE topic (the FIRST rule) via add-local must resolve to :none — never forced to protection by the most-protective default (false-REJECT)
-             (dds.disc:add-local-reader node :topic "Square" :type "ShapeType")
-             (%check :dp-downgrade-none-topic-not-forced
-                     (eq :none (dds.disc:disc-node-user-data-protection-kind node))
-                     "add-local-reader on a genuine data=NONE topic (the FIRST rule) must resolve per-topic to :none, never forced to protection by the most-protective participant default — over-encrypting a NONE topic is a false-REJECT"))
+           (progn
+             (%check :dp-cross-role-writer-encrypt
+                     (eq :encrypt (dds.disc:disc-node-user-writer-data-protection-kind node))
+                     "the live ENCRYPT-Circle writer's publish-time data_protection kind must STAY :encrypt after a NONE-Square reader is added — the shared-slot last-write-wins downgrade (a plaintext payload on an ENCRYPT topic) is the false-ACCEPT this fixes")
+             (%check :dp-cross-role-reader-none
+                     (eq :none (dds.disc:disc-node-user-reader-data-protection-kind node))
+                     "the NONE-Square reader's data_protection kind must be :none (its own topic's rule), independent of the ENCRYPT writer")
+             (when dare
+               (%check :dp-cross-role-writer-emits-ciphertext
+                       (%pep-writer-emits-protected-p node pt)
+                       "publish-sample on the live ENCRYPT-Circle writer must emit a PROTECTED SecuredPayload (ciphertext), NOT the plaintext, after the NONE-Square reader is added — the cross-role publish RED->GREEN")))
+        (dds.dcps:delete-participant p)))
+    ;; Scenario B — NONE-Square WRITER + a later ENCRYPT-Circle READER: the writer must STAY :none (no over-protection).
+    (multiple-value-bind (p node) (%pep-cross-role-setup gov "Square" "Circle" dare)
+      (unwind-protect
+           (progn
+             (%check :dp-noverprotect-writer-none
+                     (eq :none (dds.disc:disc-node-user-writer-data-protection-kind node))
+                     "a genuine NONE-Square writer must STAY :none after an ENCRYPT-Circle reader is added — raising it to the reader's :encrypt would over-protect a NONE topic (false-REJECT / interop break)")
+             (%check :dp-noverprotect-reader-encrypt
+                     (eq :encrypt (dds.disc:disc-node-user-reader-data-protection-kind node))
+                     "the ENCRYPT-Circle reader's data_protection kind must be :encrypt (its own topic's rule)")
+             (when dare
+               (%check :dp-noverprotect-writer-emits-plain
+                       (not (%pep-writer-emits-protected-p node pt))
+                       "publish-sample on the NONE-Square writer must emit PLAIN even with an ENCRYPT reader live + a crypto-transform installed — no over-protection")))
         (dds.dcps:delete-participant p))))
   t)
 
 (defun* run-security-metadata-protection-downgrade-test ()
     (function () t)
-  "ADR-0040 carry (DDS-Security 1.1 §9.4.1.2.4), SYMMETRIC to run-security-data-protection-downgrade-test but for
-   metadata_protection (the user-DATA submessage tier, disc-node-user-submessage-protection-kind): a MULTI-RULE
-   governance whose FIRST topic_rule is metadata=NONE while a LATER rule is metadata=ENCRYPT for a specific topic
-   must NOT let an add-local-{writer,reader} endpoint inherit the FIRST-rule participant default. The fix: (1) the
-   participant-level default is MOST-PROTECTIVE (governance-effective-metadata-protection, max :encrypt>:sign>:none
-   — fail-closed), and (2) add-local resolves the ACTUAL per-topic metadata_protection via the
-   %install-access-control-installed resolver. Asserts, on the PRE-fix (no add-local metadata refinement, slot
-   stayed the :none default) logic, RED on both a FALSE-ACCEPT (an ENCRYPT topic left :none = an unprotected user
-   submessage on a protected topic) and a FALSE-REJECT (a genuine NONE topic forced to protection). Rules are
-   ordered so the wildcard-free FIRST rule (Square) does NOT shadow the LATER Circle rule (topic-metadata-protection
-   = first-MATCHING rule, §9.4.1.2.4)."
-  (let* ((gov (dds.security:make-governance
-               :discovery-protection-kind :none
-               :liveliness-protection-kind :none
-               :rtps-protection-kind :none
-               :topic-rules
-               (list (dds.security:make-topic-rule :topic-expr "Square"    ; FIRST rule: a genuine metadata=NONE topic
-                                                   :metadata-protection-kind :none
-                                                   :data-protection-kind :none)
-                     (dds.security:make-topic-rule :topic-expr "Circle"    ; LATER rule: metadata=ENCRYPT (Square rule does not shadow it)
-                                                   :metadata-protection-kind :encrypt
-                                                   :data-protection-kind :none))))
-         (ah  (dds.security:make-access-handle :governance gov)))
+  "ADR 0046 (DDS-Security 1.1 §9.4.1.2.4 / §9.5), SYMMETRIC to run-security-data-protection-downgrade-test but for
+   metadata_protection (the user-DATA submessage tier): the writer and reader must NOT share one participant-global
+   metadata_protection slot that either role's add downgrades. The per-role user-{writer,reader}-submessage-protection-
+   kind fields ARE the kinds the disc-node-user-submessage-encode resolver reads per submessage (writer DATA -> the
+   writer's kind, reader ACKNACK -> the reader's). Governance: Circle metadata=ENCRYPT, Square metadata=NONE.
+   (A) ENCRYPT-Circle writer + a LATER NONE-Square reader -> writer submessage kind STAYS :encrypt (no false-ACCEPT
+       downgrade of the writer's user submessages), reader is :none; (B) NONE-Square writer + a LATER ENCRYPT-Circle
+       reader -> writer submessage kind STAYS :none (no over-protection / false-REJECT), reader is :encrypt."
+  (let ((gov (dds.security:make-governance
+              :discovery-protection-kind :none :liveliness-protection-kind :none :rtps-protection-kind :none
+              :topic-rules
+              (list (dds.security:make-topic-rule :topic-expr "Square"    ; genuine metadata=NONE topic
+                                                  :metadata-protection-kind :none :data-protection-kind :none)
+                    (dds.security:make-topic-rule :topic-expr "Circle"    ; metadata=ENCRYPT (Square rule does not shadow it)
+                                                  :metadata-protection-kind :encrypt :data-protection-kind :none)))))
     (%check :mp-downgrade-effective-most-protective
             (eq :encrypt (dds.security:governance-effective-metadata-protection gov))
-            "governance-effective-metadata-protection must be MOST-PROTECTIVE over ALL rules (max :encrypt>:sign>:none): a FIRST metadata=NONE rule must NOT downgrade the participant default below a LATER metadata=ENCRYPT rule (fail-closed)")
-    (let ((p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+            "governance-effective-metadata-protection must be MOST-PROTECTIVE over ALL rules (max :encrypt>:sign>:none, fail-closed)")
+    ;; Scenario A — ENCRYPT-Circle WRITER + a later NONE-Square READER: the writer's submessage kind must STAY :encrypt.
+    (multiple-value-bind (p node) (%pep-cross-role-setup gov "Circle" "Square" nil)
       (unwind-protect
-           (let ((node (dds.dcps::dp-node p)))
-             (setf (dds.dcps::dp-auth-state p)
-                   (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
-             (dds.dcps::%install-access-control p ah)
-             ;; the metadata=ENCRYPT topic (a LATER rule) via add-local must resolve per-topic to :encrypt — never the FIRST rule's :none (false-ACCEPT)
-             (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType")
-             (%check :mp-downgrade-encrypt-topic-not-none
-                     (eq :encrypt (dds.disc:disc-node-user-submessage-protection-kind node))
-                     "add-local-writer on the metadata=ENCRYPT topic (a LATER rule; the FIRST rule is metadata=NONE) must resolve per-topic to :encrypt, never :none — an unprotected user submessage emitted on a protected topic is a false-ACCEPT")
-             ;; a genuine metadata=NONE topic (the FIRST rule) via add-local must resolve to :none — never forced to protection by the most-protective default (false-REJECT)
-             (dds.disc:add-local-reader node :topic "Square" :type "ShapeType")
-             (%check :mp-downgrade-none-topic-not-forced
-                     (eq :none (dds.disc:disc-node-user-submessage-protection-kind node))
-                     "add-local-reader on a genuine metadata=NONE topic (the FIRST rule) must resolve per-topic to :none, never forced to protection by the most-protective participant default — protecting a NONE topic's user submessage is a false-REJECT"))
+           (progn
+             (%check :mp-cross-role-writer-encrypt
+                     (eq :encrypt (dds.disc:disc-node-user-writer-submessage-protection-kind node))
+                     "the ENCRYPT-Circle writer's metadata_protection (user-submessage) kind must STAY :encrypt after a NONE-Square reader is added — an unprotected user submessage on a protected topic is a false-ACCEPT")
+             (%check :mp-cross-role-reader-none
+                     (eq :none (dds.disc:disc-node-user-reader-submessage-protection-kind node))
+                     "the NONE-Square reader's metadata_protection kind must be :none (its own topic's rule)"))
+        (dds.dcps:delete-participant p)))
+    ;; Scenario B — NONE-Square WRITER + a later ENCRYPT-Circle READER: the writer's submessage kind must STAY :none.
+    (multiple-value-bind (p node) (%pep-cross-role-setup gov "Square" "Circle" nil)
+      (unwind-protect
+           (progn
+             (%check :mp-noverprotect-writer-none
+                     (eq :none (dds.disc:disc-node-user-writer-submessage-protection-kind node))
+                     "a genuine NONE-Square writer's metadata_protection kind must STAY :none after an ENCRYPT-Circle reader is added — protecting a NONE topic's user submessage is a false-REJECT")
+             (%check :mp-noverprotect-reader-encrypt
+                     (eq :encrypt (dds.disc:disc-node-user-reader-submessage-protection-kind node))
+                     "the ENCRYPT-Circle reader's metadata_protection kind must be :encrypt (its own topic's rule)"))
         (dds.dcps:delete-participant p))))
   t)
 

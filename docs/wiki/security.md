@@ -604,6 +604,25 @@ single-km collapse; **same-kind** (both SIGN / both ENCRYPT) and **any-`NONE`** 
 unchanged.  Fast DDS instead carries separate `EntityKeyMaterial`s (payload=last, submessage=first)
 — a possible future extension (ADR 0040).
 
+### 5.2 Per-role protection kind (ADR 0046) — a writer is never downgraded by a reader
+
+The user writer and user reader are DIFFERENT EntityIds, so each carries its OWN EntityCrypto key
+and its OWN resolved protection kind — resolved from **that endpoint's own topic** (`add-local-writer`
+caches the writer's `data`/`metadata` kind from the writer's topic; `add-local-reader` the reader's).
+`publish-sample` reads the **writer's** kind, the secured deliver/decode path the **reader's**, and
+each key is minted from its owning role.  So on a participant that hosts an `ENCRYPT`-topic writer AND
+a later `NONE`-topic reader, the writer STILL emits a protected `SecuredPayload` (the reader's add can
+never touch the writer's kind — no false-ACCEPT / plaintext-on-a-protected-topic downgrade), and the
+`NONE` reader's submessages ride PLAIN (no over-protection / false-REJECT).  The outgoing user
+submessages are classified per-submessage (`DATA`/`HEARTBEAT`/… → writer kind; `ACKNACK`/`NACK_FRAG`
+→ reader kind), so a `NONE` reader's `ACKNACK` stays plain even when the participant also has an
+`ENCRYPT` writer.  The retained participant-scope slots are kept as the monotonic **MAX** of the two
+roles and feed only conservative fail-safe consumers (the Zero-Copy disable gate, the loan-write gate,
+the submessage-wrap fast-skip) where a MAX can only over-disable a fast path into a byte-identical
+normal send — never a wire change, never plaintext.  Supporting **N concurrently-live** user
+writers/readers each with an independent kind (the full multi-endpoint model) is the larger follow-on
+(ADR 0046 §scope).
+
 ---
 
 ## 6. Authentication plugin — Slice 2a (DDS-Security 1.1 §8.7, §9.3)

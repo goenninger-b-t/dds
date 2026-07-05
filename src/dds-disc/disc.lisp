@@ -480,6 +480,18 @@
   ;; EXPLICIT :none from governance skips it. Set from governance (%install-access-control participant default +
   ;; %set-user-metadata-protection per-topic) to :none | :sign | :encrypt.
   (user-data-protection-kind :unset :type (member :unset :none :sign :encrypt))
+  ;; ADR 0046 §9.4.1.2.4/§9.5 per-ROLE protection kinds (the FIX for the cross-role false-ACCEPT downgrade): the writer's
+  ;; OWN topic kinds and the reader's OWN topic kinds, resolved+CACHED at add-local time from each role's topic — NEVER a
+  ;; shared slot either role mutates. publish-sample reads user-WRITER-data-protection-kind; %deliver-user-sample reads
+  ;; user-READER-data-protection-kind; user-submessage-encode picks the role's submessage kind by writer-p; %cm-entity-
+  ;; protection-kind derives each role's km from the role that owns the EntityId. Defaults mirror the shared slots
+  ;; (:unset data / :none submessage) so the no-governance / direct-KM / keyed paths stay byte-identical. The shared
+  ;; user-{data,submessage}-protection-kind slots above/below remain as the MOST-PROTECTIVE MAX (monotonic) for the
+  ;; participant-scope consumers ONLY (the datagram fast-skip gate, prescan, ZC/loan wire-protection guards).
+  (user-writer-data-protection-kind :unset :type (member :unset :none :sign :encrypt))
+  (user-writer-submessage-protection-kind :none :type (member :none :sign :encrypt))
+  (user-reader-data-protection-kind :unset :type (member :unset :none :sign :encrypt))
+  (user-reader-submessage-protection-kind :none :type (member :none :sign :encrypt))
   ;; §9.4.1.2.4 per-topic data_protection resolver (topic-name -> :none|:sign|:encrypt) installed from governance by %install-access-control; add-local-{writer,reader} refine user-data-protection-kind via it to the endpoint's ACTUAL rule (no first-rule participant-default downgrade). NIL = security OFF / no governance -> unchanged.
   (topic-data-protection-resolver nil :type (or null function))
   ;; §9.4.1.2.4 per-topic metadata_protection resolver (topic-name -> :none|:sign|:encrypt) installed from governance by %install-access-control; add-local-{writer,reader} refine user-submessage-protection-kind via it to the endpoint's ACTUAL rule (no first-rule participant-default downgrade). NIL = security OFF / no governance -> unchanged.
@@ -751,21 +763,45 @@
   (dds.qos:make-qos :reliability (if (>= reliability dds.rtps.discovery:+reliability-reliable+)
                                      :reliable :best-effort)))
 
-(defun* %refine-user-protection (node topic)
-    (function (disc-node string) t)
-  "DDS-Security 1.1 §9.4.1.2.4: refine NODE's per-topic metadata_protection (user-submessage-protection-kind) AND
-   data_protection (user-data-protection-kind) to TOPIC's ACTUAL governance rule via the resolvers installed by
-   %install-access-control, so an add-local-{writer,reader} endpoint gates BOTH the user-DATA submessage tier and
-   the serialized-payload (SecuredPayload) tier by the topic's REAL rule — neither the first-rule participant-default
+(defun* %protection-kind-max (a b)
+    (function ((member :unset :none :sign :encrypt) (member :unset :none :sign :encrypt))
+              (member :unset :none :sign :encrypt))
+  "ADR 0046: the MORE-protective of two protection kinds (rank :encrypt>:sign>:none>:unset). Used to keep the
+   participant-scope shared user-{data,submessage}-protection-kind slots at the MONOTONIC MAX over both roles, so the
+   datagram fast-skip gate / ZC-loan wire-protection guards never skip a wrap or admit plaintext while ANY live role
+   is protected (conservative, fail-closed; the actual per-role action is decided from the per-role fields)."
+  (flet ((rank (k) (ecase k (:unset 0) (:none 1) (:sign 2) (:encrypt 3))))
+    (if (>= (rank a) (rank b)) a b)))
+
+(defun* %refine-user-protection (node topic role)
+    (function (disc-node string (member :writer :reader)) t)
+  "DDS-Security 1.1 §9.4.1.2.4 (ADR 0046): resolve+cache ROLE's (the WRITER's or the READER's) OWN per-topic
+   metadata_protection AND data_protection from TOPIC via the resolvers installed by %install-access-control, into the
+   PER-ROLE fields (user-{writer,reader}-{data,submessage}-protection-kind) — so add-local-writer gates the writer and
+   add-local-reader the reader by ITS topic's REAL rule, independently: adding a reader never lowers the writer's kind
+   (the cross-role false-ACCEPT downgrade is eliminated by construction). Neither the first-rule participant-default
    downgrade (a later SIGN/ENCRYPT topic wrongly left :none = false-ACCEPT) nor over-protection of a genuine
-   metadata/data=NONE topic (false-REJECT). No resolver (security OFF / no governance) leaves that slot unchanged
-   (byte-identical to the pre-security path). Returns T."
+   metadata/data=NONE topic (false-REJECT). The shared user-{data,submessage}-protection-kind slots are kept at the
+   MONOTONIC MAX over both roles for the participant-scope consumers only. No resolver (security OFF / no governance)
+   leaves every slot unchanged (byte-identical to the pre-security path). Returns T."
   (let ((mresolver (disc-node-topic-metadata-protection-resolver node))
         (dresolver (disc-node-topic-data-protection-resolver node)))
     (when mresolver
-      (setf (disc-node-user-submessage-protection-kind node) (funcall mresolver topic)))
+      (let ((k (funcall mresolver topic)))
+        (ecase role
+          (:writer (setf (disc-node-user-writer-submessage-protection-kind node) k))
+          (:reader (setf (disc-node-user-reader-submessage-protection-kind node) k)))
+        (setf (disc-node-user-submessage-protection-kind node)
+              (%protection-kind-max (disc-node-user-writer-submessage-protection-kind node)
+                                    (disc-node-user-reader-submessage-protection-kind node)))))
     (when dresolver
-      (setf (disc-node-user-data-protection-kind node) (funcall dresolver topic))))
+      (let ((k (funcall dresolver topic)))
+        (ecase role
+          (:writer (setf (disc-node-user-writer-data-protection-kind node) k))
+          (:reader (setf (disc-node-user-reader-data-protection-kind node) k)))
+        (setf (disc-node-user-data-protection-kind node)
+              (%protection-kind-max (disc-node-user-writer-data-protection-kind node)
+                                    (disc-node-user-reader-data-protection-kind node))))))
   t)
 
 (defun* add-local-writer (node &key (topic "") (type "")
@@ -785,7 +821,7 @@
               :topic-name topic :type-name type :type-information type-information
               :qos (or qos (%qos-from-reliability reliability)))))
     (setf (disc-node-user-writer-id node) (logior (ash key 8) kind))
-    (%refine-user-protection node topic)   ; §9.4.1.2.4: per-topic metadata_protection + data_protection (no participant-default downgrade)
+    (%refine-user-protection node topic :writer)   ; ADR 0046 §9.4.1.2.4: cache the WRITER's OWN per-topic metadata + data protection (cross-role downgrade fix)
     (push ep (disc-node-local-writers node))
     ep))
 
@@ -807,7 +843,7 @@
               :topic-name topic :type-name type :type-information type-information
               :qos (or qos (%qos-from-reliability reliability)))))
     (setf (disc-node-user-reader-id node) (logior (ash key 8) kind))
-    (%refine-user-protection node topic)   ; §9.4.1.2.4: per-topic metadata_protection + data_protection (no participant-default downgrade)
+    (%refine-user-protection node topic :reader)   ; ADR 0046 §9.4.1.2.4: cache the READER's OWN per-topic metadata + data protection (cross-role downgrade fix)
     (push ep (disc-node-local-readers node))
     ep))
 

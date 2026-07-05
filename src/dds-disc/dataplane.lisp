@@ -1692,7 +1692,7 @@
     ;; (HIDDEN); data=SIGN -> AES256-GMAC (the payload rides VISIBLE + GMAC-authenticated, encode-serialized-payload
     ;; GMAC sub-tier). data_protection=SIGN (payload-tier GMAC) is IMPLEMENTED; supported tiers: NONE + SIGN + ENCRYPT
     ;; (ADR-0040 §9.5.3.3.4.3).
-    (let ((ct (and (not (eq (disc-node-user-data-protection-kind node) :none)) (disc-node-crypto-transform node))))
+    (let ((ct (and (not (eq (disc-node-user-writer-data-protection-kind node) :none)) (disc-node-crypto-transform node))))   ; ADR 0046: the WRITER's OWN kind (never the shared slot a reader could downgrade)
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
                       (funcall (dds.security:crypto-keys-encode-key-fn ct) (%local-writer-guid-vec node))
@@ -2435,7 +2435,7 @@
     ;; transformation_kind: data=ENCRYPT -> AES-256-GCM open; data=SIGN -> AES256-GMAC verify of the VISIBLE payload
     ;; (decode-serialized-payload GMAC sub-tier, fail-closed on tamper). data_protection=SIGN (payload-tier GMAC) is
     ;; IMPLEMENTED; supported tiers: NONE + SIGN + ENCRYPT (ADR-0040 §9.5.3.3.4.3).
-    (let ((ct (and (not (eq (disc-node-user-data-protection-kind node) :none)) (disc-node-crypto-transform node))))
+    (let ((ct (and (not (eq (disc-node-user-reader-data-protection-kind node) :none)) (disc-node-crypto-transform node))))   ; ADR 0046: the READER's OWN kind (this local reader's topic decode tier)
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
                       (funcall (dds.security:crypto-keys-decode-key-fn ct) guid)

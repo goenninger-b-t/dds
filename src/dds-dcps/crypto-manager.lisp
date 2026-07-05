@@ -292,7 +292,10 @@
    REVERSE, data=SIGN + metadata=ENCRYPT, would DOWNGRADE the ENCRYPT-mandated user submessage onto the visible GMAC
    kind. That contradictory mixed-kind governance is now FAIL-CLOSED REJECTED at %install-access-control
    (governance-mixed-nonnone-kind-conflict, create-participant), so it can never reach this derivation; same-kind and
-   any-NONE combos are unaffected. ADR-0040."
+   any-NONE combos are unaffected. ADR-0040. ADR-0046: the user-endpoint derivation is now PER-ROLE — the
+   user-writer-id's km derives from the WRITER's own kinds (user-writer-{data,submessage}-protection-kind), the
+   user-reader-id's from the READER's own kinds — so a writer and a reader on different-kind topics key independently
+   (the cross-role false-ACCEPT downgrade fix)."
   (flet ((nz (k) (if (eq k :sign) :sign :encrypt)))   ; :none/:encrypt -> :encrypt; :sign -> :sign
     (cond
       ((or (= entity-id dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)
@@ -305,12 +308,16 @@
       ((or (= entity-id dds.rtps.discovery:+entityid-participant-message-secure-writer+)
            (= entity-id dds.rtps.discovery:+entityid-participant-message-secure-reader+))
        (nz (dds.disc:disc-node-secure-pm-protection-kind node)))
-      ((or (= entity-id (dds.disc:disc-node-user-writer-id node))
-           (= entity-id (dds.disc:disc-node-user-reader-id node)))
-       ;; payload tier is authoritative when engaged (non-NONE), else the submessage tier (unchanged for data=NONE)
-       (if (member (dds.disc:disc-node-user-data-protection-kind node) '(:sign :encrypt))
-           (nz (dds.disc:disc-node-user-data-protection-kind node))
-           (nz (dds.disc:disc-node-user-submessage-protection-kind node))))
+      ((= entity-id (dds.disc:disc-node-user-writer-id node))
+       ;; ADR 0046: the WRITER's km from the WRITER's OWN kinds — payload tier authoritative when engaged, else submessage
+       (if (member (dds.disc:disc-node-user-writer-data-protection-kind node) '(:sign :encrypt))
+           (nz (dds.disc:disc-node-user-writer-data-protection-kind node))
+           (nz (dds.disc:disc-node-user-writer-submessage-protection-kind node))))
+      ((= entity-id (dds.disc:disc-node-user-reader-id node))
+       ;; ADR 0046: the READER's km from the READER's OWN kinds (independent of the writer's tier)
+       (if (member (dds.disc:disc-node-user-reader-data-protection-kind node) '(:sign :encrypt))
+           (nz (dds.disc:disc-node-user-reader-data-protection-kind node))
+           (nz (dds.disc:disc-node-user-reader-submessage-protection-kind node))))
       (t :encrypt))))
 
 (defun* %secure-sedp-reader-for-writer (writer-entity-id)
@@ -806,7 +813,10 @@
     ;; leaves the encode resolver returning NIL -> the user submessage path is byte-identical to the plain stack.
     (setf (dds.disc:disc-node-user-submessage-encode node)
           (lambda (writer-p)
-            (let ((kind (dds.disc:disc-node-user-submessage-protection-kind node)))
+            ;; ADR 0046: gate each submessage by ITS role's OWN metadata_protection kind (writer DATA -> writer's kind,
+            ;; reader ACKNACK/NACK_FRAG -> reader's kind), never the shared slot a later NONE endpoint could downgrade.
+            (let ((kind (if writer-p (dds.disc:disc-node-user-writer-submessage-protection-kind node)
+                            (dds.disc:disc-node-user-reader-submessage-protection-kind node))))
               (unless (eq kind :none)
                 (let ((km (cm-encode-entity-km cm (if writer-p (dds.disc:disc-node-user-writer-id node)
                                                       (dds.disc:disc-node-user-reader-id node)))))
