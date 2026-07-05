@@ -55,11 +55,49 @@
   (let ((child (%ac-node-child parent name)))
     (and child (%ac-node-text child))))
 
-;;; Pure-Lisp fnmatch(3) */?-subset for topic matching (§9.4.1.3.2.7, no FFI).
+;;; Pure-Lisp fnmatch(3) */?/[...] for topic matching (§9.4.1.3.2.7, no FFI).
+
+(defun* %bracket-class-match (expr start plen ch)
+    (function (string fixnum fixnum character) (values symbol fixnum boolean))
+  "Match CH against the POSIX fnmatch(3) bracket class in EXPR opening just after the `[` (index START).
+   Returns (values STATUS END MEMBER-P): STATUS=:class + END=index past the closing `]` when the class is
+   well-formed; STATUS=:unterminated + END=START + MEMBER-P=NIL when no closing `]` exists before PLEN
+   (the caller then treats the `[` as a literal, per POSIX). Every EXPR index is bounds-checked against
+   PLEN (no OOB even at safety-0). Negation: `!` (POSIX) or `^` (widely-supported synonym) as the first
+   class char. `]` as the first class char is a literal member (not the terminator). `-` first or last in
+   the class is a literal `-`; otherwise `c1-c2` is an inclusive char-code range (empty when hi<lo)."
+  (let ((i start)
+        (neg nil)
+        (member nil)
+        (first t))
+    (declare (type fixnum i))
+    (when (and (< i plen)
+               (or (char= (char expr i) #\!) (char= (char expr i) #\^)))
+      (setf neg t i (1+ i)))
+    (loop
+      (when (>= i plen)
+        (return (values :unterminated start nil)))
+      (let ((c (char expr i)))
+        (cond
+          ((and (char= c #\]) (not first))
+           (return (values :class (1+ i) (if neg (not member) member))))
+          ((and (< (+ i 2) plen)
+                (char= (char expr (1+ i)) #\-)
+                (not (char= (char expr (+ i 2)) #\])))
+           (when (<= (char-code c) (char-code ch) (char-code (char expr (+ i 2))))
+             (setf member t))
+           (setf i (+ i 3) first nil))
+          (t
+           (when (char= c ch) (setf member t))
+           (setf i (1+ i) first nil)))))))
 
 (defun* %topic-match-p (expr topic-name)
     (function (string string) boolean)
-  "Full-string POSIX fnmatch(3) */?-subset (§9.4.1.3.2.7): * any string, ? any char; [...] bracket classes deferred."
+  "Full-string POSIX fnmatch(3) matcher for topic names (§9.4.1.3.2.7, no FNM_PATHNAME): `*` matches any
+   string (incl. empty), `?` any one char, `[...]` a bracket class (see %bracket-class-match — `!`/`^`
+   negation, `[]...]` literal-`]`, first/last `-` literal, `c1-c2` range, unterminated `[` is a literal `[`).
+   Any other char is literal. Bounds-checked throughout — a malformed class fails safe (deterministic
+   no-match or literal-`[`), never a crash/OOB/unbounded loop/spurious match."
   (let ((plen (length expr))
         (slen (length topic-name)))
     (labels ((match (ei si)
@@ -69,6 +107,12 @@
                      ((= si slen)               nil)
                      ((char= (char expr ei) #\?)
                       (match (1+ ei) (1+ si)))
+                     ((char= (char expr ei) #\[)
+                      (multiple-value-bind (status end member-p)
+                          (%bracket-class-match expr (1+ ei) plen (char topic-name si))
+                        (if (eq status :class)
+                            (and member-p (match end (1+ si)))
+                            (and (char= #\[ (char topic-name si)) (match (1+ ei) (1+ si))))))
                      ((char= (char expr ei) (char topic-name si))
                       (match (1+ ei) (1+ si)))
                      (t                         nil))))

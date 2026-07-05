@@ -127,7 +127,7 @@
 
 (defun* run-access-glob-test ()
     (function () t)
-  "T2: %topic-match-p — */?-subset of POSIX fnmatch (§9.4.1.3.2.7): *, ?, literal, prefix*, *suffix, no-match."
+  "T2: %topic-match-p — POSIX fnmatch (§9.4.1.3.2.7): *, ?, literal, prefix*, *suffix, [...] bracket classes."
   (flet ((m (p n) (dds.security::%topic-match-p p n)))
     (%check :glob-star-any    (m "*" "Square")           "* must match any non-empty string")
     (%check :glob-star-empty  (m "*" "")                 "* must match empty string")
@@ -140,7 +140,61 @@
     (%check :glob-infix-ok    (m "*uare" "Square")       "*suffix matches suffix")
     (%check :glob-any-between (m "S*e" "Square")         "S*e matches 'Square'")
     (%check :glob-empty-both  (m "" "")                  "empty pattern matches empty string")
-    (%check :glob-empty-str   (not (m "" "X"))           "empty pattern must not match non-empty"))
+    (%check :glob-empty-str   (not (m "" "X"))           "empty pattern must not match non-empty")
+    ;; [...] bracket classes — POSIX fnmatch(3)
+    (%check :glob-set-match    (m "[abc]" "b")            "[abc] must match a listed char")
+    (%check :glob-set-no       (not (m "[abc]" "d"))      "[abc] must not match an unlisted char")
+    (%check :glob-set-onechar  (not (m "[abc]" "ab"))     "a class matches exactly one char")
+    (%check :glob-range-match  (m "[a-z]" "m")            "[a-z] must match a char in range")
+    (%check :glob-range-lo     (m "[a-z]" "a")            "[a-z] must match the low boundary")
+    (%check :glob-range-hi     (m "[a-z]" "z")            "[a-z] must match the high boundary")
+    (%check :glob-range-out    (not (m "[a-z]" "0"))      "[a-z] must not match outside the range")
+    (%check :glob-neg-bang     (not (m "[!abc]" "b"))     "[!abc] must not match a listed char")
+    (%check :glob-neg-bang-ok  (m "[!abc]" "d")           "[!abc] must match an unlisted char")
+    (%check :glob-neg-caret    (not (m "[^abc]" "b"))     "[^abc] (synonym) must not match a listed char")
+    (%check :glob-neg-caret-ok (m "[^abc]" "d")           "[^abc] (synonym) must match an unlisted char")
+    (%check :glob-lit-rbracket (m "[]abc]" "]")           "leading ] is a literal class member")
+    (%check :glob-lit-rbr-a    (m "[]abc]" "a")           "[]abc] still matches its other members")
+    (%check :glob-dash-first   (m "[-a]" "-")             "leading - is a literal -")
+    (%check :glob-dash-first-a (m "[-a]" "a")             "[-a] matches its literal member a")
+    (%check :glob-dash-last    (m "[a-]" "-")             "trailing - is a literal -")
+    (%check :glob-dash-last-a  (m "[a-]" "a")             "[a-] matches its literal member a")
+    (%check :glob-unterm-lit   (m "[abc" "[abc")          "unterminated [ matches a literal [")
+    (%check :glob-unterm-no    (not (m "[abc" "a"))       "unterminated [ is literal, not a class")
+    (%check :glob-empty-class  (m "[]" "[]")              "[] is unterminated -> literal [ then literal ]")
+    (%check :glob-mix-star     (m "Shape[0-9]*" "Shape7X") "[0-9] combined with * matches 'Shape7X'")
+    (%check :glob-mix-star-no  (not (m "Shape[0-9]*" "ShapeAX")) "[0-9] rejects a non-digit before *")
+    (%check :glob-mix-q        (m "Sq[a-z]?re" "Square")  "[a-z] combined with ? matches 'Square'")
+    (%check :glob-empty-topic  (not (m "[abc]" ""))       "a class must not match the empty topic"))
+  t)
+
+(defun* run-access-glob-permissions-test ()
+    (function () t)
+  "T2 security-core: a grant whose topic_expression uses a [...] bracket class ALLOWS a matching topic and
+   does NOT allow a non-matching one — no false-ACCEPT / no false-REJECT through the permissions matcher."
+  (let ((perm (dds.security::make-permissions
+               :subject-name "/CN=BracketTest"
+               :default      :deny
+               :rules (list (cons :allow (cons :publish   (list "Square[0-9]")))
+                            (cons :allow (cons :subscribe (list "[A-Z]*")))))))
+    (%check :glob-perm-allow-match
+            (dds.security:permissions-allow-publish-p perm "Square5")
+            "publish 'Square5' must be ALLOWED by the 'Square[0-9]' grant (no false-REJECT)")
+    (%check :glob-perm-allow-lo
+            (dds.security:permissions-allow-publish-p perm "Square0")
+            "publish 'Square0' (range low boundary) must be ALLOWED")
+    (%check :glob-perm-deny-class
+            (not (dds.security:permissions-allow-publish-p perm "SquareX"))
+            "publish 'SquareX' must be DENIED — no false-ACCEPT; [0-9] rejects 'X'")
+    (%check :glob-perm-deny-len
+            (not (dds.security:permissions-allow-publish-p perm "Square42"))
+            "publish 'Square42' must be DENIED — a class matches exactly one char")
+    (%check :glob-perm-sub-allow
+            (dds.security:permissions-allow-subscribe-p perm "Zone")
+            "subscribe 'Zone' must be ALLOWED by the '[A-Z]*' grant")
+    (%check :glob-perm-sub-deny
+            (not (dds.security:permissions-allow-subscribe-p perm "zone"))
+            "subscribe 'zone' must be DENIED — 'z' is not in [A-Z] (no false-ACCEPT)"))
   t)
 
 ;;; Safety-0 inner loop compiled separately to exercise the call path without runtime checks (NFR-SEC-POSTURE).

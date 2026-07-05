@@ -1319,7 +1319,7 @@ The subset parsed by this slice:
 |---|---|---|
 | `allow_unauthenticated_participants` | `governance-allow-unauthenticated` | Enforced upstream by the Slice-2 auth-gate |
 | `enable_join_access_control` | `governance-enable-join-ac` | Gates `check_create_participant` |
-| `topic_rule/topic_expression` | First element of each `topic-rules` entry | Matched by `%topic-match-p` |
+| `topic_rule/topic_expression` | First element of each `topic-rules` entry | Matched by `%topic-match-p` (POSIX fnmatch(3): `*`, `?`, and `[...]` bracket classes — `!`/`^` negation, `[]...]` literal-`]`, first/last `-` literal, `c1-c2` range, unterminated `[` literal; §9.4.1.3.2.7) |
 | `enable_read_access_control` | `(cadr rule)` | Gates `check_remote_datawriter` / `check_create_datareader` |
 | `enable_write_access_control` | `(cddr rule)` | Gates `check_remote_datareader` / `check_create_datawriter` |
 
@@ -1425,7 +1425,12 @@ installed, `dp-access-state` stays NIL and the participant is the byte-identical
   (assert (not (dds.security:permissions-allow-publish-p   grant "Triangle")) () "Triangle -> default DENY")
 
   ;; Wildcard "Sq*" would also match "Square":
-  (assert (dds.security::%topic-match-p "Sq*" "Square") () "prefix wildcard match"))
+  (assert (dds.security::%topic-match-p "Sq*" "Square") () "prefix wildcard match")
+
+  ;; [...] bracket class — one char from a set/range (POSIX fnmatch(3), §9.4.1.3.2.7):
+  (assert (dds.security::%topic-match-p "Square[0-9]" "Square7")  () "digit-class range match")
+  (assert (not (dds.security::%topic-match-p "Square[0-9]" "SquareX")) () "non-digit rejected")
+  (assert (dds.security::%topic-match-p "[!aeiou]*" "Square")     () "[!...] negation: not a vowel"))
 ```
 
 End-to-end (full gate ladder, our-to-our): a `"Square"` writer on participant A matches a

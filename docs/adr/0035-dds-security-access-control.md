@@ -186,9 +186,10 @@ if `op` matches the requested operation AND `some` of `topic-exprs` matches `top
 `%topic-match-p`, the rule fires and returns `(eq action :allow)`.  If no rule fires, the
 `permissions-default` field (`(member :allow :deny)`) decides (per §9.4.1.3.2.10).
 
-`%topic-match-p (expr topic-name)` is a pure-Lisp full-string POSIX fnmatch `*`/`?`-subset
-(§9.4.1.3.2.7): `*` matches zero or more chars, `?` matches exactly one.  `[...]` bracket
-classes are deferred (Carry 4).
+`%topic-match-p (expr topic-name)` is a pure-Lisp full-string POSIX fnmatch(3) matcher
+(§9.4.1.3.2.7, no `FNM_PATHNAME`): `*` matches zero or more chars, `?` matches exactly one,
+and `[...]` bracket classes match one char from a set (`!`/`^` negation, `[]...]` literal-`]`,
+first/last `-` literal, `c1-c2` inclusive char-code range, unterminated `[` is a literal `[`).
 
 ### The permissions-gate verdict ladder
 
@@ -316,11 +317,43 @@ These are strictly additive: the current implementation enforces the subset it c
 (fail-closed on missing/denied permissions) and the deferred items do not invalidate the
 achieved checks.
 
-### Carry 5 — `%topic-match-p` glob: `*`/`?`-subset only, no `[...]` bracket classes
+### Carry 5 — `%topic-match-p` glob: `[...]` bracket classes — RESOLVED (WP-SECURITY-GLOB-BRACKET-CLASSES)
 
-The fnmatch `*`/`?` subset covers the patterns used in all known DDS-Security governance and
-permissions fixtures (including the RTI Connext demo XMLs).  `[...]` bracket classes
-(§9.4.1.3.2.7 mentions the full fnmatch(3) patterns) are deferred.
+`%topic-match-p` now implements full POSIX fnmatch(3) `[...]` bracket classes on top of the
+existing `*`/`?` subset (§9.4.1.3.2.7 references the full fnmatch(3) pattern language; no
+`FNM_PATHNAME` — topic names have no path separators, so `*` still matches everything).
+Semantics chosen (POSIX fnmatch(3), disambiguated and pinned in the `%bracket-class-match`
+docstring):
+
+- `[abc]` matches any one listed char; `[a-z]` is an inclusive char-code range (`a`, `z`
+  boundaries included; an inverted range `hi<lo` matches nothing — safe).
+- **Negation:** `[!...]` (POSIX-canonical) negates. `[^...]` is also honoured as the
+  widely-supported (glibc/BSD/musl) synonym — the brief's test matrix requires `[^abc]` to
+  negate, so treating `^` as a literal member would be a false reading; both `!` and `^` as
+  the first class char negate.
+- **Literal `]`:** a `]` immediately after `[` or `[!`/`[^` is a literal member, not the
+  terminator (`[]abc]` = set `{ ] a b c }`).
+- **Literal `-`:** a `-` first or last in the class (`[-a]`, `[a-]`) is a literal `-`.
+- **Unterminated `[`:** no closing `]` before end-of-pattern → the `[` is a **literal `[`**
+  (POSIX unmatched-`[` rule); `[]` (degenerate empty class) is therefore an unterminated `[`
+  followed by a literal `]`, i.e. it matches the literal string `[]`.
+
+Every pattern index is bounds-checked against the pattern length before access (no OOB even at
+`(safety 0)`); a malformed/unterminated class fails **safe** — a deterministic no-match or the
+literal-`[` reading, never a crash, unbounded loop, or spurious match that could false-ACCEPT.
+`*`/`?`/literal behaviour is byte-for-byte unchanged (`run-access-glob-test` prior cases stay
+green). Covered by extended `run-access-glob-test` + a permissions-level
+`run-access-glob-permissions-test` (a grant with a bracket-class `topic_expression` allows the
+matching topic and denies a non-matching one through `permissions-allow-{publish,subscribe}-p`).
+
+Two conformance boundaries (both non-security, documented for completeness): (i) `^` as a
+negation synonym follows glibc/BSD/musl (every real fnmatch, incl. Connext-on-Linux) rather
+than strict POSIX.1 (which reads a leading `^` as a literal member) — no administrator authors
+a leading `^` intending a literal caret, and this side only ever matches a superset relative to
+a strict-POSIX-only peer, never a subset of an authored ALLOW; (ii) backslash escaping
+(`FNM_NOESCAPE`-off) is not modelled — `\` is a literal char in and out of a class — which is a
+non-path for DDS topic identifiers (no `\` in a topic name/expression). Neither affects the
+bounded/fail-safe/no-false-ACCEPT guarantee above.
 
 ### Carry 6 — `allow_unauthenticated_participants` enforced upstream by the auth-gate
 
@@ -350,7 +383,8 @@ performed.  It requires the licensed Security Plugins add-on (`rti_connext_dds_s
 | `run-access-governance-parse-test` | `parse-governance`: fixture → governance struct; `allow_unauthenticated=NIL`; `enable_join_ac=T`; topic-rules non-empty + correct; `governance-topic-rule` for `"Square"` → `(T T)`; malformed inputs → NIL | T2 |
 | `run-access-permissions-parse-test` | `parse-permissions`: fixture → 4 grants; EC grant fields (subject-name, not-before, not-after, default=`:deny`, rules count); allow rule contains `"Square"`; deny rule contains `"Circle"`; malformed inputs → NIL | T2 |
 | `run-access-matcher-test` | `permissions-allow-publish-p` / `-subscribe-p`: Square allowed, Circle denied, Triangle → default DENY | T2 |
-| `run-access-glob-test` | `%topic-match-p`: `*`, `?`, literal, prefix*, *suffix, infix, empty pattern/string | T2 |
+| `run-access-glob-test` | `%topic-match-p`: `*`, `?`, literal, prefix*, *suffix, infix, empty pattern/string, `[...]` bracket classes (`[abc]`, `[a-z]` range + boundaries, `[!abc]`/`[^abc]` negation, `[]abc]` literal-`]`, `[-a]`/`[a-]` literal-`-`, unterminated `[` → literal, `Shape[0-9]*` mixed) | T2 (bracket classes: WP-SECURITY-GLOB-BRACKET-CLASSES) |
+| `run-access-glob-permissions-test` | permissions-level bracket class: a grant with a `[...]` `topic_expression` allows the matching topic and denies non-matching / wrong-length topics via `permissions-allow-{publish,subscribe}-p` (no false-ACCEPT / false-REJECT) | WP-SECURITY-GLOB-BRACKET-CLASSES |
 | `run-access-ac-fuzz-test` | 2000 adversarial blobs × 2 parsers (`parse-governance` / `parse-permissions`) × normal + `(safety 0)` = 8000 calls; all NIL-or-valid, 0 crashes | T2 |
 | `run-access-plugin-test` | `validate-local-permissions` (signed fixtures → access-handle; wrong CA → NIL; tampered governance → NIL); `check-create-participant` / `check-create-datawriter` / `check-create-datareader` / `check-remote-datawriter` / `check-remote-datareader` (AC-on + allow, AC-on + deny, AC-off via Governance toggle) | T3 |
 | `run-access-manager-test` | `%participant-permissions-gate` unit test (DARE-free, unsigned XML): AC-off → `:compatible`; auth-off → `:pending`; no auth-remote → `:pending`; auth not `:keyed` → `:pending`; no grant → `:incompatible`; deny → `:incompatible`; allow → `:compatible`; **privilege-escalation exploit (final-review fix): a `:keyed` remote whose self-asserted SPDP token claims the granted `/CN=TestParticipantEC` but whose VALIDATED handshake-cert subject is the un-granted `/CN=Eve` → `:incompatible` (the gate authorizes on `auth-remote-validated-subject`, never the token)** | T5 |

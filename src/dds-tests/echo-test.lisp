@@ -3714,6 +3714,7 @@
                  ("access-permissions-parse"      . run-access-permissions-parse-test)
                  ("access-matcher"                . run-access-matcher-test)
                  ("access-glob"                   . run-access-glob-test)
+                 ("access-glob-permissions"       . run-access-glob-permissions-test)
                  ("access-parser-fuzz"            . run-access-parser-fuzz)
                  ("access-plugin-validate"        . run-access-plugin-validate-test)
                  ("access-manager"                . run-access-manager-test)
