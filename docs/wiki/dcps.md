@@ -11,6 +11,18 @@ endpoint), and **discovery is caller-driven** — you call `dds.dcps:spin` to dr
 SPDP/SEDP announcement cycle (there is no background announcer yet). RxO QoS compatibility
 gates matching and delivery; see [QoS](qos.md).
 
+**Multiple DataWriters per participant (WP-N-ENDPOINT-S1, ADR 0048).** A participant may now
+carry **N non-secured `DataWriter`s** on different topics — each gets a distinct `EntityId`
+(and SEDP GUID), publishes into its own HistoryCache, and repairs independently (an inbound
+ACKNACK/NACK_FRAG routes to the addressed writer by its `writerId`). At N=1 the wire and timing
+are byte-identical to before. **Still single-endpoint (follow-on slices):** the `DataReader`
+side remains **one reader per participant** (multi-reader delivery routing is Slice S2); a 2nd
+DataWriter under an associated **flow-controller** fail-fasts (flow-ON multi-writer is Slice
+S1b); a 2nd **secured** DataWriter fail-fasts (secured multi-writer is Slice S3); and a 2nd
+DataWriter on a participant with any **TRANSIENT_LOCAL/TRANSIENT/PERSISTENT** writer fail-fasts
+(durability multi-writer is a later slice). Two or more **VOLATILE** non-secured writers are the
+supported N-writer case.
+
 ## API reference
 
 All symbols below are exported from `dds.dcps`. One-line descriptions are condensed from the
@@ -25,7 +37,7 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:create-publisher` (`p`) | Create an enabled `publisher` (DataWriter factory) in `p`. |
 | `dds.dcps:create-subscriber` (`p`) | Create an enabled `subscriber` (DataReader factory) in `p`. |
 | `dds.dcps:create-topic` (`p name type-name type-support`) | Bind a topic `name` + `type-name` to a registered `type-support` (the generated codec bundle). |
-| `dds.dcps:create-datawriter` (`pub topic &key qos`) | Register the local writer in the engine on the topic's name/type with `qos` (v1: the single user writer). The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. |
+| `dds.dcps:create-datawriter` (`pub topic &key qos`) | Register a local writer in the engine on the topic's name/type with `qos`. **N non-secured writers per participant** (WP-N-ENDPOINT-S1, ADR 0048): each gets a distinct `EntityId` + its own HistoryCache; a 2nd writer under a flow-controller (Slice S1b) or on a secured node (Slice S3) fail-fasts. The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. |
 | `dds.dcps:create-datareader` (`sub topic &key qos`) | Register the local reader (v1: the single user reader). `topic` may be a `topic` or a `content-filtered-topic`. The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. |
 | `dds.dcps:spin` (`p`) | Drive **one** discovery announcement cycle (SPDP + SEDP) for `p`. Caller-driven in v1. |
 | `dds.dcps:discovered-count` (`p`) | Number of remote participants `p` has discovered. |

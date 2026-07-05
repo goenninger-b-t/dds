@@ -100,7 +100,7 @@
    "Stateful reliable RTPS writer + reader (RTPS 2.5 §8.4.2/§8.4.10): ReaderProxy/
     WriterProxy, changes-for-reader, HEARTBEAT/ACKNACK/GAP-driven retransmit and
     reordering. Verified by a lossy/reorder/dup fault-injection suite (NFR-TEST).")
-  (:export #:rtps-writer #:make-rtps-writer #:rtps-writer-hc #:writer-write #:writer-heartbeat
+  (:export #:rtps-writer #:make-rtps-writer #:rtps-writer-hc #:rtps-writer-entityid #:writer-write #:writer-heartbeat
            #:writer-lifecycle-change #:rtps-writer-max-blocking-ns #:%writer-signal-space
            #:writer-data-list #:writer-unsent-list #:writer-on-acknack #:writer-purge-acked #:get-reader-proxy
            #:init-reader-proxy-base #:writer-finalize-durability #:rtps-writer-finalized

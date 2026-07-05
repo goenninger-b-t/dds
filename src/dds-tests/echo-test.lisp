@@ -3554,8 +3554,9 @@
 
 (defun* run-endpoint-registry-test ()
     (function () t)
-  "WP-N-ENDPOINT-S0-REGISTRY (ADR 0048): the user-endpoint registry — register/lookup/enumerate, the primary
-   (first-registered) compat accessor, same-id replace (pre-S0 clobber semantics), and the 2nd-distinct-id fail-fast."
+  "WP-N-ENDPOINT-S0/S1-REGISTRY (ADR 0048): the user-endpoint registry — register/lookup/enumerate, the primary
+   (first-registered) compat accessor, same-id replace (pre-S0 clobber semantics), the 2nd-distinct WRITER id now
+   ACCEPTED (S1 send fan-out) with the primary preserved, and the 2nd-distinct READER id still fail-fast (S2)."
   (let* ((node (dds.disc::%make-disc-node))
          (w1 (dds.rtps.reliable:make-rtps-writer
               :hc (dds.rtps.history:make-history-cache :keep-last 1 nil nil)))
@@ -3580,13 +3581,15 @@
     (%check :reg-replace-reader (eq r2 (dds.disc::disc-node-user-reader node)) "same-id re-register replaces primary reader")
     (%check :reg-replace-count-w (= 1 (length (dds.disc::%all-user-writers node))) "replace keeps one writer entry")
     (%check :reg-replace-count-r (= 1 (length (dds.disc::%all-user-readers node))) "replace keeps one reader entry")
-    (%check :reg-failfast-writer
-            (handler-case (progn (dds.disc::%register-user-writer node #x00000202 w1) nil) (error () t))
-            "2nd distinct writer id must signal the S1 not-yet-supported error")
+    (%check :reg-accept-2nd-writer
+            (handler-case (progn (dds.disc::%register-user-writer node #x00000202 w1) t) (error () nil))
+            "2nd distinct writer id is ACCEPTED (S1 N-local send fan-out)")
+    (%check :reg-2nd-writer-count (= 2 (length (dds.disc::%all-user-writers node))) "2nd distinct writer adds an entry")
+    (%check :reg-2nd-writer-lookup (eq w1 (dds.disc::%user-writer-for node #x00000202)) "%user-writer-for reaches the 2nd writer")
     (%check :reg-failfast-reader
             (handler-case (progn (dds.disc::%register-user-reader node #x00000407 r1) nil) (error () t))
             "2nd distinct reader id must signal the S2 not-yet-supported error")
-    (%check :reg-failfast-intact-w (eq w2 (dds.disc::disc-node-user-writer node)) "fail-fast preserves primary writer")
+    (%check :reg-2nd-writer-primary (eq w2 (dds.disc::disc-node-user-writer node)) "2nd distinct writer preserves the primary")
     (%check :reg-failfast-intact-r (eq r2 (dds.disc::disc-node-user-reader node)) "fail-fast preserves primary reader"))
   t)
 
@@ -3783,6 +3786,8 @@
                  ("participant-liveliness"   . dds.disc:run-participant-liveliness-test)
                  ("foreign-locator-robust"   . dds.disc:run-locator-filter-test)
                  ("reliable-data-over-udp"   . dds.disc:run-dataplane-test)
+                 ("n-writer-data-over-udp"   . dds.disc:run-n-writer-dataplane-test)
+                 ("n-writer-frag-heartbeat"  . dds.disc:run-n-writer-frag-heartbeat-test)
                  ("large-data-over-udp"      . dds.disc:run-large-dataplane-test)
                  ("lost-final-sample-repair" . dds.disc:run-lost-final-sample-test)
                  ("dispose-over-udp"         . dds.disc:run-dispose-dataplane-test)

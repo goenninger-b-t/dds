@@ -69,6 +69,7 @@
 (defclass data-writer (entity)
   ((topic :initarg :topic :reader dw-topic)
    (publisher :initarg :publisher :reader dw-publisher)
+   (entity-id :initform 0 :accessor dw-entity-id) ; WP-N-ENDPOINT-S1 (ADR 0048): this writer's DISTINCT engine EntityId (RTPS 2.5 §9.3.1.2), captured at create-datawriter; write-sample threads it to publish-sample so the sample enters THIS writer's HistoryCache (not the aliased primary)
    (pub-matched :initform (make-publication-matched-status) :accessor dw-pub-matched)
    (off-incompat :initform (make-offered-incompatible-qos-status) :accessor dw-off-incompat)
    (liv-lost :initform (make-liveliness-lost-status) :accessor dw-liv-lost)
@@ -584,7 +585,10 @@
     (%set-user-metadata-protection node ah (topic-name topic) :writer)   ; ADR 0046 §9.4.1.2.4: the WRITER's own protection tiers
     (dds.disc:enable-publisher node :history-kind (dds.qos:qos-history-kind qos)
                                     :history-depth (dds.qos:qos-history-depth qos))
+    ;; WP-N-ENDPOINT-S1 (ADR 0048): capture THIS writer's distinct EntityId (add-local-writer set it, enable-publisher
+    ;; just registered the engine writer under it) so write-sample routes into this writer's own HistoryCache.
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
+      (setf (dw-entity-id dw) (dds.disc:disc-node-user-writer-id node))
       (push dw (pub-writers pub))
       (setf (dp-user-writer (pub-participant pub)) dw)   ; v1 back-ref for status hooks
       dw)))
@@ -735,7 +739,8 @@
     (when (eq :timeout (dds.disc:publish-sample
                         node (%serialize-sample (topic-type-support (dw-topic dw)) sample
                                                 (%writer-tx-rep dw))
-                        (%write-key-hash dw sample)))
+                        (%write-key-hash dw sample) nil 0 nil
+                        (dw-entity-id dw)))   ; WP-N-ENDPOINT-S1: publish into THIS writer's own HistoryCache
       (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
     +retcode-ok+))

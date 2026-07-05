@@ -53,6 +53,7 @@
    VOLATILE — re-enabling the full-ACK purge so the retained late-joiner history is RELEASED once all current
    readers ACK; monotonic (set once by writer-finalize-durability, never cleared in v1)."
   (hc nil :type (or null dds.rtps.history:history-cache))  ; a HistoryCache
+  (entityid 0 :type (unsigned-byte 32))   ; WP-N-ENDPOINT-S1 (ADR 0048): this writer's own RTPS EntityId (RTPS 2.5 §9.3.1.2); the send fan-out stamps it so each local DataWriter's DATA/HEARTBEAT carry its OWN GUID (0 = unset, the pre-S1 default)
   (last-sn 0 :type integer)
   (hb-count 0 :type integer)
   (proxies (make-hash-table :test 'equalp) :type hash-table)   ; reader key (opaque, equalp) -> reader-proxy

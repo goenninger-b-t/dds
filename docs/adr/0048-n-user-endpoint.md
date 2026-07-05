@@ -1,6 +1,6 @@
 # ADR 0048 — N user DataWriters/DataReaders per participant: the endpoint registry (Slice S0) + the milestone slice plan
 
-- **Status:** Accepted (WP-N-ENDPOINT-S0-REGISTRY, 2026-07-05). Slice S0 landed; S1–S5 planned (not started).
+- **Status:** Accepted (WP-N-ENDPOINT-S0-REGISTRY, 2026-07-05). Slice S0 + **S1 (N local writers, send path)** landed; S2–S5 planned (not started).
 - **Deciders:** A0 (integrator), A8 (DCPS), A6 (RTPS engine)
 - **WP:** WP-N-ENDPOINT-S0-REGISTRY (Slice 0 of the N-user-endpoint milestone).
 - **Requires:** REQUIREMENTS FR-DCPS (multiple DataWriters/DataReaders per participant), FR-LANG-8 (full type declarations), NFR-CLOS (hot-path purity — the registry is control-plane), NFR-MEM (no new hot-path allocation); the operating contract §4 (correctness/stability binary gates), §5 (Definition of Done).
@@ -29,7 +29,7 @@ The gap is **N LOCAL user DataWriters / DataReaders per participant**. Today the
 ### The slice plan (S0 = this WP)
 
 - **S0 — endpoint registry (this WP).** Convert the single writer/reader engine slots to entity-id-keyed registries; keep the compat accessors returning the primary; **zero behavior change at N=1**. De-risks everything downstream.
-- **S1 — N local writers.** Send-path fan-out: `publish-sample` / durability / batching iterate `%all-user-writers`; per-writer `EntityId` on the wire.
+- **S1 — N local writers (LANDED, WP-N-ENDPOINT-S1-WRITERS).** Send-path fan-out: `publish-sample` writes into the addressed writer's own HistoryCache; the push drivers iterate the writer registry; per-writer `EntityId` on the wire; ACKNACK/NACK_FRAG retransmit routes by target writerId. See §9 (as-built).
 - **S2 — N local readers.** Delivery routing: `%on-user-data` routes by destination reader `EntityId` to the right engine reader (the `%drain` cross-topic-deserialize hazard lives here).
 - **S3 — per-endpoint crypto key material.** Move `crypto-transform` / EntityCrypto resolution off node-scope to per-endpoint.
 - **S4 — per-endpoint pools.** Per-writer ZC pool + per-reader secured/loan pools (the cross-reader use-after-free; converges with the ZC-loan work).
@@ -101,3 +101,40 @@ Evidence: the full suite passes on both implementations — **Clasp 441 / SBCL 4
 - **Positive.** The foundational data structure for N local endpoints is in place, tested, and byte-identical at N=1. S1–S5 build on a stable register/lookup/enumerate API without touching the disc-node shape again. The second-endpoint failure mode is now an explicit error, not silent data loss.
 - **Neutral.** Two extra struct slots per side (registry alist + cached primary); control-plane only.
 - **Deferred (tracked by this ADR).** S1 (send fan-out), S2 (delivery routing + the `%drain` cross-topic hazard), S3 (per-endpoint crypto), S4 (per-endpoint ZC/secured pools + the cross-reader UAF), S5 (retire the `dp-user-writer` / `dp-user-reader` back-refs). Until S1/S2 land, a second distinct local user endpoint fail-fasts.
+
+---
+
+## 9. Slice S1 — N local writers, send path (as-built, WP-N-ENDPOINT-S1-WRITERS)
+
+A participant with TWO (N) non-secured user DataWriters on different topics now BOTH publish, each remote reader receives from its writer with correct attribution, and reliable retransmit repairs each writer independently. Non-secured, synchronous-send scope; flow-ON and secured multi-writer are deferred (fail-fast, below).
+
+### 9.1 Distinct per-writer EntityId (the single load-bearing fix)
+
+`add-local-writer` draws each user writer's entity KEY from a new per-participant counter `disc-node-user-writer-key-next` (`%alloc-user-writer-key`), starting at 1 — so the FIRST writer keeps EntityId `#x0102`/`#x0103` (byte-identical) and each subsequent DataWriter gets a distinct key → a distinct EntityId AND a distinct SEDP GUID (a remote peer now sees N distinct writers, not one aliased). Builtin/secure EntityIds are untouched (they are not drawn from this counter). This one change also fixes SEDP endpoint distinctness.
+
+### 9.2 Registry accepts N writers; `%register-user-writer`
+
+The S0 second-distinct-writer fail-fast is lifted FOR WRITERS: a distinct id is pushed as an N-th entry, the primary (first-registered) is preserved, and same-id re-register still replaces in place. Readers keep the S0 fail-fast (S2). `%all-user-writers` now enumerates in registration order (primary first), deterministic; the hot push paths iterate the registry alist directly (no per-push cons — NFR-MEM).
+
+### 9.3 dw → engine-writer link + write threading
+
+`rtps-writer` gains an `entityid` slot (set at `enable-publisher`). The DCPS `data-writer` gains an `entity-id` slot, captured at `create-datawriter` from `disc-node-user-writer-id`. `write-sample` threads it to `publish-sample` (new trailing `writer-id` arg), which resolves the addressed engine writer via `%user-writer-for` and writes into THAT writer's own HistoryCache + SN space (no aliasing to the primary). NIL `writer-id` → primary (byte-identical).
+
+### 9.4 Send fan-out + per-writer wire stamping
+
+`%push-data-buf` / `%push-heartbeat` iterate the writer registry, emitting each writer's own unsent changes + HEARTBEATs (`%push-one-writer-changes`). The send path binds a dynamically-scoped `*emit-writer*` (the emitting `rtps-writer`) per writer; `%emit-wid` stamps its EntityId on DATA/HEARTBEAT/GAP AND `%emit-writer` sources the DATA_FRAG **HEARTBEAT_FRAG** from its OWN HistoryCache (fix F1 — a non-primary writer's fragmented sample must draw its fragment count + `frag-hb-count` side-effect from its own HC, not the primary's; RTPS 2.5 §9.4.5.5). Unbound → primary → byte-identical. Push targets are TOPIC-FILTERED per writer (`%reader-push-targets` optional topic, `%writer-topic`): a writer reaches only the readers matched to its topic, never a sibling writer's readers.
+
+### 9.5 ACKNACK / NACK_FRAG routing
+
+`%on-user-acknack` / `%on-user-nack-frag` resolve the addressed local writer by the submessage's target writerId (`%user-writer-for`) and repair from THAT writer's HistoryCache under its own GUID — an ACKNACK for writer 2 never mis-repairs from the primary.
+
+### 9.6 Deferrals (fail-fast, not half-fixed)
+
+- **Flow-ON multi-writer → S1b.** A 2nd writer under an associated flow-controller, or associating a flow-controller on an already-multi-writer participant, fail-fasts ("flow-ON multi-writer is Slice S1b"). The synchronous `%push-data` path fans out; the flow/`%node-datagram-plan` path stays single-writer (primary).
+- **Secured multi-writer → S3.** A 2nd writer on a secured node (`crypto-transform` installed or governance data_protection `:sign`/`:encrypt`) fail-fasts ("secured multi-writer is Slice S3"). The single-secured-writer path stays on the primary + node-global crypto, unchanged.
+- **Durability multi-writer → later slice (fix F2).** A 2nd writer on a node with ANY retaining-durability (TRANSIENT_LOCAL/TRANSIENT/PERSISTENT) writer fail-fasts (`%node-has-durable-writer-p` in `%register-user-writer`). `%writer-durability-init`'s late-joiner replay (proxy-base rewind + prompt HEARTBEAT) is driven off the primary only, so a 2nd durable writer would silently miss its retained-history replay and mis-source the prompt HB; a VOLATILE writer sends no prompt HB, so 2 VOLATILE writers are unaffected. This closes the F2 cross-stamp latent as a guarded deferral (matching flow/secured), not a half-fix.
+- **Multi-reader-per-participant stays S2.** Delivery routing is unchanged; a participant still has one engine reader. (The S1 writer fix unmasked a latent S2 hazard where two readers on one participant share the engine reader and cross-drain — a copy-path KEEP_LAST test was adjusted to a single reader per participant to keep its single-reader property under test without depending on the old double-clobber.)
+
+### 9.7 Verification
+
+Both impls green (SBCL + Clasp, 443 tests). Test `n-writer-data-over-udp` (`run-n-writer-dataplane-test`): distinct EntityIds/GUIDs (RED on pre-S1 — both `#x0102`), both writers deliver correctly-attributed with EXACT-count negative assertions (no over/under-send), independent drop→HEARTBEAT→writerId-routed-ACKNACK retransmit, and the flow-ON (S1b) / secured (S3) / durability deferral fail-fasts. Test `n-writer-frag-heartbeat` (`run-n-writer-frag-heartbeat-test`, fix F1): a non-primary writer's fragmented sample draws its HEARTBEAT_FRAG from its OWN HC — asserted via the `frag-hb-count` side-effect (RED pre-fix: non-primary=0, primary=2; GREEN: each=1), the precise observable since the coalesced regular HEARTBEAT masks end-to-end fragment delivery via the coarse ACKNACK path. N=1 byte-identical (hotpath-purity gate PASS; the whole prior suite unchanged).

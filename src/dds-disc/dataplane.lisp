@@ -676,6 +676,22 @@
    reader 0x07 (vs NO_KEY writer 0x03 / reader 0x04) — RTPS 2.5 §9.3.1.2 Table 9.1."
   (let ((k (aref guid 15))) (or (= k #x02) (= k #x07))))
 
+(defun* %guid-entityid (guid)
+    (function ((simple-array (unsigned-byte 8) (16))) (unsigned-byte 32))
+  "The 4-octet EntityId (u32, big-endian octets 12..15) of a 16-octet GUID (RTPS 2.5 §9.3.1.2)."
+  (logior (ash (aref guid 12) 24) (ash (aref guid 13) 16) (ash (aref guid 14) 8) (aref guid 15)))
+
+(defun* %writer-topic (node writer)
+    (function (disc-node dds.rtps.reliable:rtps-writer) (or null string))
+  "The topic-name of local user WRITER — matched from its RTPS EntityId to the advertised endpoint-data in
+   disc-node-local-writers (WP-N-ENDPOINT-S1, ADR 0048). The per-writer push-target topic filter so a DataWriter
+   pushes DATA only to the remote readers matched to ITS topic (RxO matches on topic-name), never to a sibling
+   writer's readers. NIL (no local endpoint for that id — the discovery-less value path) disables the filter."
+  (let ((eid (dds.rtps.reliable:rtps-writer-entityid writer)))
+    (dolist (w (disc-node-local-writers node))
+      (when (= eid (%guid-entityid (dds.rtps.discovery:endpoint-data-guid w)))
+        (return (dds.rtps.discovery:endpoint-data-topic-name w))))))
+
 (defun* %user-writer-entityid-p (entity-id)
     (function ((unsigned-byte 32)) t)
   "T iff ENTITY-ID's kind is an application-defined writer (0x02 with-key / 0x03 no-key) —
@@ -794,6 +810,29 @@
    non-fragmented DATA %SEND-SAMPLE silently SKIPS, proving lost-final-sample recovery via the
    periodic HEARTBEAT (RTPS 2.5 §8.4.2.2). Never set in production.")
 
+(defparameter *emit-writer* nil
+  "WP-N-ENDPOINT-S1 (ADR 0048): the local user ENGINE WRITER (rtps-writer) whose changes / HEARTBEAT / HEARTBEAT_FRAG
+   / GAP the send path is CURRENTLY emitting — dynamically bound per-writer by the fan-out (%push-one-writer-changes,
+   %push-heartbeat) and by the writerId-routed retransmit (%on-user-acknack). The DATA/HEARTBEAT/GAP builders stamp
+   its EntityId (%emit-wid) AND the DATA_FRAG HEARTBEAT_FRAG is sourced from its OWN HistoryCache (%emit-writer), so
+   each of a participant's N DataWriters emits — and repairs fragments — under its OWN GUID + SN space. NIL (unbound —
+   no fan-out active: the flow/durability/single-writer paths) falls back to the primary, keeping the single-writer
+   wire byte-identical (RTPS 2.5 §9.3.1.2 / §9.4.5.5).")
+
+(defun* %emit-writer (node)
+    (function (disc-node) (or null dds.rtps.reliable:rtps-writer))
+  "The engine writer the send path is CURRENTLY emitting for: the fan-out's bound *emit-writer*, or — absent a
+   binding — the node's primary user writer (WP-N-ENDPOINT-S1; N=1 byte-identical). Used where the emit needs the
+   writer's OWN HistoryCache (the DATA_FRAG HEARTBEAT_FRAG, RTPS 2.5 §9.4.5.5), not just its EntityId."
+  (or *emit-writer* (disc-node-user-writer node)))
+
+(defun* %emit-wid (node)
+    (function (disc-node) (unsigned-byte 32))
+  "The writerId to stamp on the CURRENTLY-emitted user DATA/HEARTBEAT/GAP submessage: the EntityId of the bound
+   per-writer *emit-writer*, or — absent a binding — the node's primary user-writer-id (WP-N-ENDPOINT-S1; N=1
+   byte-identical)."
+  (if *emit-writer* (dds.rtps.reliable:rtps-writer-entityid *emit-writer*) (disc-node-user-writer-id node)))
+
 (defun* %small-change-p (change)
     (function (dds.rtps.history:cache-change) t)
   "T iff CHANGE is a single-submessage (packable) change: a no-payload dispose/unregister (always
@@ -812,7 +851,7 @@
    §9.6.4.9), SIZE = 4 + 52. SIZE is the exact submessage length — the fit bound %send-packed checks
    before writing so the datagram never overflows the buffer."
   (let ((sn (dds.rtps.history:cache-change-sn change))
-        (wid (disc-node-user-writer-id node)))
+        (wid (%emit-wid node)))
     (if (eq (dds.rtps.history:cache-change-kind change) :data)
         (let* ((pl (dds.rtps.history:cache-change-serialized-payload change))
                (len (dds.rtps.history:cache-change-payload-len change))   ; TRUE length, not the oversized pooled vec (T5a)
@@ -833,7 +872,7 @@
   "A (SIZE . BUILD-FN) packable item for one NON-FINAL user-writer HEARTBEAT (FIRST,LAST,COUNT) —
    readerId UNKNOWN, FinalFlag NOT_SET so it solicits an ACKNACK (RTPS 2.5 §8.3.7.5 / §8.4.9.2.7);
    mirrors %send-user-heartbeat. SIZE = 4 submsg-header + 28 body."
-  (let ((wid (disc-node-user-writer-id node)))
+  (let ((wid (%emit-wid node)))
     (cons 32
           (lambda (mc) (dds.rtps.message:write-heartbeat
                         mc dds.rtps.message:+entityid-unknown+ wid first last count :final nil)))))
@@ -1088,7 +1127,7 @@
    NOTE: inline-QoS (cache-change-inline-qos) is carried ONLY on the small-DATA path (%data-builder above);
    this DATA_FRAG path does NOT thread inline-QoS — RTPS 2.5 §9.4.5.5 makes it optional, and relay samples
    are ShapeType-sized, always below *fragment-size*, so they never reach this branch."
-  (let ((wid (disc-node-user-writer-id node)))
+  (let ((wid (%emit-wid node)))
     (if (<= size dds.rtps.reliable:*fragment-size*)
         (if (and *debug-drop-sample-numbers* (member sn *debug-drop-sample-numbers*))
             '()
@@ -1109,7 +1148,7 @@
                                                    fstart fcount dds.rtps.reliable:*fragment-size* pl off len)))
                       thunks))))
           (multiple-value-bind (lastfrag cnt)
-              (dds.rtps.reliable:writer-frag-heartbeat (disc-node-user-writer node) sn)
+              (dds.rtps.reliable:writer-frag-heartbeat (%emit-writer node) sn)   ; WP-N-ENDPOINT-S1 (F1): the EMITTING writer's HC, not the primary
             (when lastfrag
               (push (%msg-datagram node
                                    (lambda (mc) (dds.rtps.message:write-heartbeat-frag
@@ -1212,7 +1251,7 @@
   (%send-msg-buf node buf
                  (lambda (mc)
                    (dds.rtps.message:write-heartbeat
-                    mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) first last count :final nil))
+                    mc dds.rtps.message:+entityid-unknown+ (%emit-wid node) first last count :final nil))
                  host port dest-prefix))
 
 (defun* %send-user-gap (node buf reader-id gap-sns host port &optional dest-prefix)
@@ -1229,11 +1268,11 @@
     (%send-msg-buf node buf
                    (lambda (mc)
                      (dds.rtps.message:write-gap
-                      mc reader-id (disc-node-user-writer-id node) base base numbits bitmap))
+                      mc reader-id (%emit-wid node) base base numbits bitmap))
                    host port dest-prefix)))
 
-(defun* %reader-push-targets (node)
-    (function (disc-node) list)
+(defun* %reader-push-targets (node &optional topic)
+    (function (disc-node &optional (or null string)) list)
   "Per matched-reader DESTINATION, a ((host . port) READER-KEY…) group for the writer push path: the
    keys are the FULL 16-octet GUIDs of EVERY matched reader resolving to that (host . port) (RTPS 2.5
    §8.3.5.4 — a SN is unique only within one writer GUID, and the corresponding ACKNACK keys by the
@@ -1245,12 +1284,16 @@
    resolved to a destination (the discovery-less test path) — a :peers entry is an SPDP metatraffic
    BOOTSTRAP locator (FR-DISC-4), not a user-data destination, so once a real reader is matched its
    DEFAULT_UNICAST locator (§9.6.1.4) is the destination and the SPDP peer is NOT also blasted with user
-   DATA (which a foreign peer binds on a different port from its user-data locator)."
+   DATA (which a foreign peer binds on a different port from its user-data locator). WP-N-ENDPOINT-S1 (ADR 0048):
+   when TOPIC is non-NIL, ONLY matched readers on that topic are targeted — the per-writer push filter so a
+   participant's DataWriter reaches only its OWN readers, never a sibling writer's (RxO matches on topic-name).
+   NIL TOPIC (the default / discovery-less value path) targets every matched reader, byte-identical to pre-S1."
   (let ((groups '())   ; alist: (host . port) -> list of matched reader GUID keys at that destination
         (parts (%discovered-participants node)))
     (dolist (remote (%matched-endpoints node))
       (let ((guid (dds.rtps.discovery:endpoint-data-guid remote)))
-        (when (%reader-guid-p guid)
+        (when (and (%reader-guid-p guid)
+                   (or (null topic) (string= topic (dds.rtps.discovery:endpoint-data-topic-name remote))))
           (let ((spdp (find (subseq guid 0 12) parts
                             :key #'dds.rtps.discovery:spdp-data-guid-prefix :test #'equalp)))
             (when spdp
@@ -1350,7 +1393,7 @@
    now ALSO consumed by the loan-write send site for a PRE-COMMITTED slot (ADR 0042). Bumps zc-sends."
   (incf (disc-node-zc-sends node))
   (let ((ref (%encode-zc-ref-vec slot gen +zerocopy-pool-slot-bytes+))
-        (wid (disc-node-user-writer-id node)))
+        (wid (%emit-wid node)))
     (cons (+ 24 (length ref))   ; mirrors %data-builder's small-:data SIZE (4 hdr + 20 body-prefix + payload)
           (lambda (mc) (dds.rtps.message:write-data
                         mc dds.rtps.message:+entityid-unknown+ wid sn ref 0 (length ref))))))
@@ -1419,7 +1462,7 @@
    = the exact number of receivers that each %zc-release once — no re-scan, no TOCTOU, no extra lock beyond the
    per-capture writer lock (ADR 0047 §crux/§stability)."
   (let ((groups '()) (all '()))
-    (dolist (group (%reader-push-targets node))
+    (dolist (group (%reader-push-targets node (%writer-topic node writer)))   ; WP-N-ENDPOINT-S1: only THIS writer's readers
       (let ((changes (dds.rtps.reliable:writer-capture-unsent writer (cdr group))))
         (dolist (ch changes) (push ch all))
         (push (%make-zc-push-group :dest (car group)
@@ -1473,7 +1516,8 @@
    LEAK the slot (ADR 0047 §crux). A change appears in exactly those groups whose captured unsent set contains it
    (divergent late-joiner watermarks are handled EXACTLY — N counts only the emitting groups). N=1 is left to the
    per-group path (byte-identical to today); a lost claim / failed loan / failed bump adds no entry (per-group
-   fresh-loan fallback). Runs BEFORE the per-group emit, over the frozen captured GROUPS, so the count is exact."
+   fresh-loan fallback). Runs BEFORE the per-group emit, over the frozen captured GROUPS, so the count is exact.
+   WRITER scopes the ZC refcounting to ONE local writer's captured groups (WP-N-ENDPOINT-S1 fan-out)."
   (let ((table (make-hash-table :test 'eq))
         (counts (make-hash-table :test 'eq)))
     (dolist (g groups)   ; count ZC-eligible emitter groups per shareable change (endpoints NEVER, groups)
@@ -1487,6 +1531,9 @@
                    (when slot (setf (gethash ch table) (cons slot gen))))))
              counts)
     table))
+
+(declaim (ftype (function (disc-node dds.core.buffer:octet-buffer dds.rtps.reliable:rtps-writer) t)
+                %push-one-writer-changes))   ; WP-N-ENDPOINT-S1: defined below %push-data-buf, called by it (forward ref)
 
 (defun* %push-data-buf (node buf)
     (function (disc-node dds.core.buffer:octet-buffer) t)
@@ -1509,8 +1556,22 @@
    cross-group shared-ZC ref table (%shared-zc-refs) is built from those frozen sets BEFORE any emit, so a change
    reaching >=2 co-resident ZC destinations shares ONE pool slot (refcount = the ZC-group count) instead of one
    fresh loan per destination; the send-refs are all released once after the whole emit (strictly release-safe)."
-  (let ((writer (disc-node-user-writer node))
-        (armed (dds.pal:with-lock ((disc-node-lock node)) (disc-node-zc-armed-changes node))))   ; snapshot (ADR 0042)
+  ;; WP-N-ENDPOINT-S1 (ADR 0048): fan out over %all-user-writers so EACH local DataWriter pushes its OWN unsent
+  ;; changes + HEARTBEATs; at N=1 the sole writer IS the primary -> byte-identical to the pre-fan-out path. The
+  ;; node-global armed-change leak sweep (ZC) is snapshotted once before the fan-out + swept once after.
+  (let ((armed (dds.pal:with-lock ((disc-node-lock node)) (disc-node-zc-armed-changes node))))   ; snapshot (ADR 0042)
+    (dolist (cell (disc-node-user-writers node))   ; iterate the registry alist directly — no per-push cons (NFR-MEM); N=1 = one writer
+      (%push-one-writer-changes node buf (cdr cell)))
+    (%zc-armed-sweep node armed)))   ; ADR 0042: release any slot the pass never consumed/released
+
+(defun* %push-one-writer-changes (node buf writer)
+    (function (disc-node dds.core.buffer:octet-buffer dds.rtps.reliable:rtps-writer) t)
+  "Emit ONE local user WRITER's unsent changes (DATA/DATA_FRAG) coalesced with its trailing HEARTBEAT to each of
+   its matched-reader destinations (WP-N-ENDPOINT-S1 fan-out unit; the pre-S1 single-writer %push-data-buf body).
+   Captures the writer's push groups once, builds its cross-group shared-ZC ref table, emits, then releases every
+   send-ref after the datagrams are copied out (release-safety, operating contract §4). Binds *emit-writer-entityid*
+   so every DATA/HEARTBEAT it emits carries THIS writer's own EntityId (WP-N-ENDPOINT-S1)."
+  (let ((*emit-writer* writer))   ; WP-N-ENDPOINT-S1: stamp + source (HEARTBEAT_FRAG) from this writer's own GUID/HC
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (multiple-value-bind (groups all-changes) (%capture-push-groups node writer)   ; ADR 0047: freeze every dest's unsent set once
         (let ((shared (%shared-zc-refs node writer groups)))   ; ADR 0047: one slot per change reaching >=2 ZC dests (exact refcount)
@@ -1524,8 +1585,8 @@
                                        (%zc-push-group-zc-count g)
                                        (%zc-push-group-dest-prefix g)   ; T10: wrap user data to a :keyed destination
                                        shared))
-            (dds.rtps.reliable:writer-release-change-refs writer all-changes)))))   ; release all send-refs after every destination's datagrams are emitted (copied)
-    (%zc-armed-sweep node armed)))   ; ADR 0042: release any slot the pass never consumed/released
+            (dds.rtps.reliable:writer-release-change-refs writer all-changes))))))   ; release all send-refs after every destination's datagrams are emitted (copied)
+  t)
 
 (defun* %push-data (node)
     (function (disc-node) t)
@@ -1641,9 +1702,12 @@
    DATA was lost and no further write follows, nothing else re-prompts the reader to NACK, so the
    gap is never repaired; the periodic HEARTBEAT keeps reliability live and triggers the ACKNACK
    repair path. Non-final (FinalFlag NOT_SET) so it solicits an ACKNACK. A no-op on an empty
-   HistoryCache (LAST < FIRST), no user writer, or no matched readers (uses tx-msg, caller thread)."
-  (let ((w (disc-node-user-writer node)))
-    (when w
+   HistoryCache (LAST < FIRST), no user writer, or no matched readers (uses tx-msg, caller thread).
+   WP-N-ENDPOINT-S1 (ADR 0048): fans out over %all-user-writers so EACH local DataWriter emits its OWN periodic
+   HEARTBEAT (its own SN range); at N=1 the sole writer IS the primary, byte-identical to the pre-fan-out path."
+  (dolist (cell (disc-node-user-writers node))   ; iterate the registry alist directly — no per-cadence cons (NFR-MEM)
+    (let* ((w (cdr cell))
+           (*emit-writer* w))   ; WP-N-ENDPOINT-S1: this writer's own GUID/HC
       (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)
         (when (>= last first)
           (dolist (pd (%match-destinations-prefixed node t))   ; (DEST-PREFIX . (host . port)); T10 wraps a :keyed dest
@@ -1776,10 +1840,10 @@
             (aref g 15) (ldb (byte 8  0) id)))
     g))
 
-(defun* publish-sample (node payload &optional (key-hash nil) (zc-slot nil) (zc-gen 0) (zc-len nil))
+(defun* publish-sample (node payload &optional (key-hash nil) (zc-slot nil) (zc-gen 0) (zc-len nil) (writer-id nil))
     (function (disc-node (or null (simple-array (unsigned-byte 8) (*)))
                &optional (or null (array (unsigned-byte 8) (*))) (or null (integer 0)) (unsigned-byte 32)
-                         (or null (integer 0)))
+                         (or null (integer 0)) (or null (unsigned-byte 32)))
               (or (eql t) (eql :timeout)))
   "Publish PAYLOAD (an opaque SerializedPayload) on the node's user writer: add it to the writer
    HistoryCache, then push DATA + HEARTBEAT to peers (FR-RTPS-8). Returns T normally, or the :timeout
@@ -1815,7 +1879,11 @@
    reserved + a SECOND refcount hold taken (%zc-pin) so the slot outlives the HistoryCache change and serves
    retransmit / non-ZC / extra-ZC on demand (the pin drops at the full-ACK purge); at budget (or a stale slot) the
    retained payload is materialised on demand from the still-armed slot (byte-identical to %loan-write-payload)
-   and the publish proceeds as a normal change (the always-correct fallback, ADR 0044 §2)."
+   and the publish proceeds as a normal change (the always-correct fallback, ADR 0044 §2).
+   WRITER-ID (WP-N-ENDPOINT-S1, ADR 0048; default NIL = byte-identical) selects WHICH local user DataWriter's
+   engine writer receives the change: the node's registered engine writer for that EntityId (%user-writer-for),
+   so a participant's 2nd/N-th DataWriter writes into its OWN HistoryCache + per-writer SN space instead of
+   aliasing the primary. NIL (or an unregistered id) resolves to the primary — the pre-S1 single-writer path."
   (when (and zc-slot (%loan-write-data-protected-p node))
     (when (disc-node-zc-pool-sap node)   ; fail-safe: never emit a plaintext slot for a data_protection writer
       (when (null payload)   ; a pin request would leave NO payload — recover it before dropping the slot
@@ -1824,7 +1892,8 @@
     (setf zc-slot nil))
   (let ((iq (when (and key-hash (= 16 (length key-hash)))
               (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16))))))
-        (writer (disc-node-user-writer node))
+        (writer (or (and writer-id (%user-writer-for node writer-id))   ; WP-N-ENDPOINT-S1: write into THIS DataWriter's own HistoryCache/SN space
+                    (disc-node-user-writer node)))   ; NIL writer-id (or unregistered) -> primary (N=1 byte-identical)
         (pin-granted nil)          ; ADR 0044: T iff the TX pin was reserved + %zc-pin'd for this write
         (pooled nil) (plen nil))   ; T5a: the acquired pool buffer + its TRUE secured-payload length (NIL = non-pooled path)
     ;; WP-ACKED-SLOT-PINNING (ADR 0044): a pin request (a committed slot + NO retained payload). Reserve a pin
@@ -2775,31 +2844,36 @@
    0x107 across participants advance independent acked-base watermarks (§8.3.5.4). The resend AND the GAP go
    ONLY to the ACKNACKing participant's destination, resolved from SRC-PREFIX (a NACK is from exactly one
    reader, so fanning out to every matched reader is pure over-send); falls back to every matched reader only
-   when the prefix is undiscovered (the discovery-less test path)."
+   when the prefix is undiscovered (the discovery-less test path). WP-N-ENDPOINT-S1 (ADR 0048): the ACKNACK's
+   target writerId WID selects WHICH local DataWriter repairs — the retransmit + GAP + purge run against that
+   writer's OWN HistoryCache (%user-writer-for), so an ACKNACK for the 2nd writer never mis-repairs from the
+   primary. WID that resolves to no local writer (a foreign/builtin id) is ignored; at N=1 WID IS the primary."
   (multiple-value-bind (rid wid base numbits bitmap count finalp)
       (dds.rtps.message:parse-acknack-body c flags)
     (declare (ignore count finalp))
-    (when (= wid (disc-node-user-writer-id node))
-      (incf (disc-node-acks-in node))   ; a matched reader (incl. RTI) acked our writer
-      (multiple-value-bind (resends gaps)
-          (dds.rtps.reliable:writer-on-acknack (disc-node-user-writer node)
-                                               (%source-guid src-prefix rid) base numbits bitmap t)   ; acquire send-refs on resends, atomic with the read (release-safety)
-        (unwind-protect
-             (let* ((dest (%prefix-user-destination node src-prefix))
-                    ;; (DEST-PREFIX . (host . port)) (T10): the NACKing reader's prefix (src-prefix), or the prefixed fan-out
-                    (peers (if dest (list (cons src-prefix dest)) (%match-destinations-prefixed node t))))
-               (dolist (pd peers)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
-                 (let ((peer (cdr pd)))
-                   (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil 0 (car pd))
-                   (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) (car pd))))))
-          (dds.rtps.reliable:writer-release-change-refs (disc-node-user-writer node) resends))   ; release after the retransmit datagrams are emitted (copied)
-        ;; the ACKNACK advanced this reader's acked-base -> purge HistoryCache changes ALL matched readers
-        ;; have now acknowledged (RTPS 2.5 §8.4.1), bounding the KEEP_ALL writer history. NACKed (resent)
-        ;; changes are not fully acked, so they are never purged. A TRANSIENT_LOCAL writer (DDS 1.4
-        ;; §2.2.3.4) RETAINS its acked history for late-joiners — the durability arg makes the purge a
-        ;; no-op for it (HISTORY-bounded, not ACK-bounded); a VOLATILE writer purges as before.
-        (dds.rtps.reliable:writer-purge-acked (disc-node-user-writer node) (%matched-reader-keys node)
-                                              (%local-writer-durability node)))))
+    (let ((w (%user-writer-for node wid)))   ; route to the addressed local DataWriter (N=1: the primary)
+      (when w
+        (incf (disc-node-acks-in node))   ; a matched reader (incl. RTI) acked our writer
+        (multiple-value-bind (resends gaps)
+            (dds.rtps.reliable:writer-on-acknack w
+                                                 (%source-guid src-prefix rid) base numbits bitmap t)   ; acquire send-refs on resends, atomic with the read (release-safety)
+          (unwind-protect
+               (let* ((*emit-writer* w)   ; WP-N-ENDPOINT-S1: retransmit + GAP + frag-HB under the ADDRESSED writer's own GUID/HC
+                      (dest (%prefix-user-destination node src-prefix))
+                      ;; (DEST-PREFIX . (host . port)) (T10): the NACKing reader's prefix (src-prefix), or the prefixed fan-out
+                      (peers (if dest (list (cons src-prefix dest)) (%match-destinations-prefixed node t))))
+                 (dolist (pd peers)   ; retransmit present DATA(_FRAG)/dispose, then GAP the missing -> the NACKing reader
+                   (let ((peer (cdr pd)))
+                     (%send-changes-packed node (disc-node-rx-tx-msg node) resends (car peer) (cdr peer) nil nil 0 (car pd))
+                     (when gaps (%send-user-gap node (disc-node-rx-tx-msg node) rid gaps (car peer) (cdr peer) (car pd))))))
+            (dds.rtps.reliable:writer-release-change-refs w resends))   ; release after the retransmit datagrams are emitted (copied)
+          ;; the ACKNACK advanced this reader's acked-base -> purge HistoryCache changes ALL matched readers
+          ;; have now acknowledged (RTPS 2.5 §8.4.1), bounding the KEEP_ALL writer history. NACKed (resent)
+          ;; changes are not fully acked, so they are never purged. A TRANSIENT_LOCAL writer (DDS 1.4
+          ;; §2.2.3.4) RETAINS its acked history for late-joiners — the durability arg makes the purge a
+          ;; no-op for it (HISTORY-bounded, not ACK-bounded); a VOLATILE writer purges as before.
+          (dds.rtps.reliable:writer-purge-acked w (%matched-reader-keys node)
+                                                (%local-writer-durability node))))))
   t)
 
 (defun* %on-user-data-frag (node c flags body-len buf src-prefix)
@@ -2843,27 +2917,31 @@
 
 (defun* %on-user-nack-frag (node c flags)
     (function (disc-node dds.core.buffer:cursor (unsigned-byte 8)) t)
-  "Writer side: on a NACK_FRAG, resend exactly the named fragments as DATA_FRAGs to matched readers."
+  "Writer side: on a NACK_FRAG, resend exactly the named fragments as DATA_FRAGs to matched readers. WP-N-ENDPOINT-S1
+   (ADR 0048): the NACK_FRAG's target writerId WID selects WHICH local DataWriter repairs (%user-writer-for) and is
+   echoed as the resent DATA_FRAG's writer EntityId, so a fragment NACK for the 2nd writer repairs from its OWN
+   HistoryCache under its OWN GUID; an unmatched WID is ignored. At N=1 WID IS the primary (byte-identical)."
   (multiple-value-bind (rid wid sn base numbits bitmap count) (dds.rtps.message:parse-nack-frag-body c flags)
     (declare (ignore rid count))
-    (when (= wid (disc-node-user-writer-id node))
-      (let ((ch (dds.rtps.reliable:writer-acquire-sample (disc-node-user-writer node) sn)))   ; acquire send-ref atomic with the lookup (release-safety)
-        (when ch
-          (unwind-protect
-               (let ((descs (dds.rtps.reliable:writer-on-nack-frag (disc-node-user-writer node) sn base numbits bitmap))
-                     (pl (%ensure-change-payload node ch)))   ; ADR 0044: resolve a pinned slot on demand; else the retained payload (read off the ref-held change)
-                 (when (and descs pl)
-                   (let ((size (dds.rtps.history:cache-change-payload-len ch)))   ; TRUE length, not the oversized pooled vec (T5a)
-                     (dolist (pd (%match-destinations-prefixed node t))   ; T10: wrap the DATA_FRAG retransmit to a :keyed reader
-                       (dolist (desc descs)
-                         (destructuring-bind (fstart fcount off len) desc
-                           (%send-msg-buf node (disc-node-rx-tx-msg node)
-                                          (lambda (mc) (dds.rtps.message:write-data-frag
-                                                        mc dds.rtps.message:+entityid-unknown+ (disc-node-user-writer-id node) sn size
-                                                        fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
-                                          (cadr pd) (cddr pd) (car pd))))))))
-            (dds.rtps.reliable:writer-release-change-ref (disc-node-user-writer node) ch)))))   ; release after the DATA_FRAG retransmits are emitted (copied)
-    t))
+    (let ((w (%user-writer-for node wid)))   ; route to the addressed local DataWriter (N=1: the primary)
+      (when w
+        (let ((ch (dds.rtps.reliable:writer-acquire-sample w sn)))   ; acquire send-ref atomic with the lookup (release-safety)
+          (when ch
+            (unwind-protect
+                 (let ((descs (dds.rtps.reliable:writer-on-nack-frag w sn base numbits bitmap))
+                       (pl (%ensure-change-payload node ch)))   ; ADR 0044: resolve a pinned slot on demand; else the retained payload (read off the ref-held change)
+                   (when (and descs pl)
+                     (let ((size (dds.rtps.history:cache-change-payload-len ch)))   ; TRUE length, not the oversized pooled vec (T5a)
+                       (dolist (pd (%match-destinations-prefixed node t))   ; T10: wrap the DATA_FRAG retransmit to a :keyed reader
+                         (dolist (desc descs)
+                           (destructuring-bind (fstart fcount off len) desc
+                             (%send-msg-buf node (disc-node-rx-tx-msg node)
+                                            (lambda (mc) (dds.rtps.message:write-data-frag
+                                                          mc dds.rtps.message:+entityid-unknown+ wid sn size
+                                                          fstart fcount dds.rtps.reliable:*fragment-size* pl off len))
+                                            (cadr pd) (cddr pd) (car pd))))))))
+              (dds.rtps.reliable:writer-release-change-ref w ch)))))))   ; release after the DATA_FRAG retransmits are emitted (copied)
+  t)
 
 (defparameter *secured-payload-max-bytes* 16384
   "WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: the maximum PLAINTEXT octet length the data_protection encode pool sizes
@@ -3016,6 +3094,7 @@
   (%register-user-writer node (disc-node-user-writer-id node)
                          (dds.rtps.reliable:make-rtps-writer
                           :hc (dds.rtps.history:make-history-cache history-kind history-depth max-samples nil)
+                          :entityid (disc-node-user-writer-id node)   ; WP-N-ENDPOINT-S1: the writer stamps its OWN EntityId on the wire
                           :max-blocking-ns max-blocking-ns))
   ;; WP-ACKED-SLOT-PINNING (ADR 0044): wire the pin RELEASE-FN onto the writer HistoryCache when the node has a ZC
   ;; pool. The change-removal choke (%hc-remove-change, under the writer lock) funcalls it to %zc-release a pinned
@@ -3229,6 +3308,157 @@
            t)
       (stop-node node1)
       (stop-node node2))))
+
+(defun* run-n-writer-dataplane-test ()
+    (function () (eql t))
+  "WP-N-ENDPOINT-S1 (ADR 0048): ONE participant with TWO non-secured user DataWriters on DIFFERENT topics, each
+   matched to its own remote reader participant. Asserts: (1) the two writers get DISTINCT EntityIds/GUIDs (pre-S1
+   both collided on #x0102 — the RED); (2) BOTH writers publish and each remote reader receives ITS writer's exact
+   payload (send fan-out over %all-user-writers + writer-id threading, not the aliased primary); (3) independent
+   reliable retransmit — writer-B's sample is dropped, and B's periodic HEARTBEAT + the ACKNACK routed by writerId
+   to B (%user-writer-for) repairs it while writer-A's already-delivered sample is untouched. Also asserts the S1
+   DEFERRAL fail-fasts: a 2nd SECURED writer -> Slice S3; a flow-controller on a 2-writer participant -> Slice S1b."
+  (let* ((pp (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
+         (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
+         (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(3 3 3 3 3 3 3 3 3 3 3 3)))
+         (pub  (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0))
+         (suba (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0))
+         (subb (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+         (payla (make-array 6 :element-type '(unsigned-byte 8) :initial-contents '(#xA1 #xA2 #xA3 #xA4 #xA5 #xA6)))
+         (paylb (make-array 6 :element-type '(unsigned-byte 8) :initial-contents '(#xB1 #xB2 #xB3 #xB4 #xB5 #xB6))))
+    (unwind-protect
+         (let (ida idb)
+           (let ((ea (add-local-writer pub :topic "NWA" :type "X"
+                                           :reliability dds.rtps.discovery:+reliability-reliable+)))
+             (enable-publisher pub)
+             (setf ida (disc-node-user-writer-id pub))
+             (let ((eb (add-local-writer pub :topic "NWB" :type "X"
+                                             :reliability dds.rtps.discovery:+reliability-reliable+)))
+               (enable-publisher pub)
+               (setf idb (disc-node-user-writer-id pub))
+               (assert (/= ida idb) () "the two DataWriters did not get DISTINCT EntityIds (pre-S1 clobber: both #x~8,'0X)" ida)
+               (assert (not (equalp (dds.rtps.discovery:endpoint-data-guid ea)
+                                    (dds.rtps.discovery:endpoint-data-guid eb)))
+                       () "the two DataWriters announce IDENTICAL SEDP GUIDs (a remote peer would see 1 aliased writer)")))
+           (add-local-reader suba :topic "NWA" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-subscriber suba)
+           (add-local-reader subb :topic "NWB" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-subscriber subb)
+           (setf (disc-node-peers pub)  (list (cons "127.0.0.1" (disc-node-port suba)) (cons "127.0.0.1" (disc-node-port subb)))
+                 (disc-node-peers suba) (list (cons "127.0.0.1" (disc-node-port pub)))
+                 (disc-node-peers subb) (list (cons "127.0.0.1" (disc-node-port pub))))
+           (start-node pub) (start-node suba) (start-node subb)
+           (announce-participant pub) (announce-participant suba) (announce-participant subb)
+           (loop repeat 150
+                 until (and (>= (disc-node-discovered-count pub) 2)
+                            (plusp (disc-node-discovered-count suba))
+                            (plusp (disc-node-discovered-count subb)))
+                 do (sleep 0.02))
+           (announce-endpoints pub) (announce-endpoints suba) (announce-endpoints subb)
+           (loop repeat 150
+                 until (and (>= (disc-node-matched-count pub) 2)
+                            (plusp (disc-node-matched-count suba))
+                            (plusp (disc-node-matched-count subb)))
+                 do (announce-endpoints pub) (sleep 0.02))
+           (assert (and (>= (disc-node-matched-count pub) 2)
+                        (plusp (disc-node-matched-count suba))
+                        (plusp (disc-node-matched-count subb)))
+                   () "the 2 writers did not both match their remote readers")
+           ;; (2) both writers publish -> each remote reader receives ITS writer's exact bytes
+           (publish-sample pub payla nil nil 0 nil ida)   ; writer A -> subA
+           (loop repeat 150 until (plusp (node-sample-count suba)) do (sleep 0.02))
+           (assert (equalp (node-sample-by-sn suba 1) payla) () "subA did not receive writer-A's payload")
+           (sleep 0.1)   ; let subA's ACKNACK settle so writer-A's SN 1 is acked before the drop
+           ;; (3) independent retransmit: drop writer-B's SN 1, repair via B's HEARTBEAT + writerId-routed ACKNACK
+           (setf *debug-drop-sample-numbers* (list 1))
+           (publish-sample pub paylb nil nil 0 nil idb)   ; writer B -> subB, SN 1 dropped on send
+           (sleep 0.1)
+           (assert (null (node-sample-by-sn subb 1)) () "drop hook failed: subB received the dropped writer-B DATA")
+           (setf *debug-drop-sample-numbers* nil)
+           (loop repeat 60 until (node-sample-by-sn subb 1) do (announce-endpoints pub) (sleep 0.02))
+           (assert (equalp (node-sample-by-sn subb 1) paylb) ()
+                   "writer-B's dropped sample never recovered via its HEARTBEAT + the writerId-routed ACKNACK")
+           (assert (equalp (node-sample-by-sn suba 1) payla) ()
+                   "writer-A's delivered sample was disturbed by writer-B's retransmit (routing leaked)")
+           ;; over-send guard (explicit negatives): each reader sees EXACTLY its own writer's sample, never the sibling's
+           (assert (= 1 (node-sample-count suba)) ()
+                   "subA must receive EXACTLY writer-A's 1 sample — a 2nd sample means writer-B over-sent to it")
+           (assert (= 1 (node-sample-count subb)) ()
+                   "subB must receive EXACTLY writer-B's 1 sample — a 2nd sample means writer-A over-sent to it")
+           (assert (not (equalp (node-sample-by-sn suba 1) paylb)) () "subA must NEVER see writer-B's payload")
+           (assert (not (equalp (node-sample-by-sn subb 1) payla)) () "subB must NEVER see writer-A's payload")
+           ;; (4a) deferral: a 2nd SECURED writer fail-fasts (Slice S3)
+           (let ((sn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
+             (unwind-protect
+                  (progn (add-local-writer sn :topic "SA" :type "X") (enable-publisher sn)
+                         (setf (disc-node-user-data-protection-kind sn) :sign)   ; mark the node secured (governance data_protection)
+                         (add-local-writer sn :topic "SB" :type "X")
+                         (assert (null (ignore-errors (enable-publisher sn) t)) ()
+                                 "a 2nd SECURED writer must fail-fast (Slice S3)"))
+               (stop-node sn)))
+           ;; (4b) deferral: a flow-controller on a 2-writer participant fail-fasts (Slice S1b)
+           (let ((fc (make-flow-controller :tokens-per-period 100000 :period 1000000 :max-burst 65536)))
+             (unwind-protect
+                  (assert (null (ignore-errors (flow-controller-associate fc pub) t)) ()
+                          "flow-controller-associate on a 2-writer participant must fail-fast (Slice S1b)")
+               (destroy-flow-controller fc)))
+           ;; (4c) deferral: a 2nd writer on a node with a TRANSIENT_LOCAL writer fail-fasts (durability multi-writer = later slice)
+           (let ((dn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
+             (unwind-protect
+                  (progn (add-local-writer dn :topic "DA" :type "X"
+                                              :qos (dds.qos:make-writer-qos :durability :transient-local))
+                         (enable-publisher dn)
+                         (add-local-writer dn :topic "DB" :type "X")
+                         (assert (null (ignore-errors (enable-publisher dn) t)) ()
+                                 "a 2nd writer on a node with a TRANSIENT_LOCAL writer must fail-fast (durability multi-writer)"))
+               (stop-node dn)))
+           t)
+      (setf *debug-drop-sample-numbers* nil)
+      (stop-node pub) (stop-node suba) (stop-node subb))))
+
+(defun* run-n-writer-frag-heartbeat-test ()
+    (function () (eql t))
+  "WP-N-ENDPOINT-S1 (ADR 0048, fix F1): a participant with 2 writers, where the NON-PRIMARY writer publishes a
+   FRAGMENTED (> *fragment-size*) sample, must draw its DATA_FRAG HEARTBEAT_FRAG from ITS OWN HistoryCache — NOT
+   the primary's (the pre-fix %sample-plan bug hard-coded (disc-node-user-writer node) = primary). The precise
+   observable is the writer's HEARTBEAT_FRAG COUNT side-effect (writer-frag-heartbeat increments the SOURCED
+   writer's frag-hb-count): end-to-end delivery is masked here because the coalesced regular HEARTBEAT lets the
+   coarse ACKNACK path re-send all fragments, so the fine-recovery routing is only visible at the frag-HB level.
+   Both writers publish a fragmented SN 1; after both pushes EACH writer's frag-hb-count must be exactly 1 — pre-fix
+   the primary's is 2 (it was consulted for BOTH writers) and the non-primary's is 0 (its recovery was suppressed/
+   mis-sourced). No subscriber needed: a bogus PEER makes the push form a destination so %sample-plan runs."
+  (let* ((pp (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(4 4 4 4 4 4 4 4 4 4 4 4)))
+         (pub (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0))
+         (big-a (make-array (* 3 dds.rtps.reliable:*fragment-size*) :element-type '(unsigned-byte 8)
+                            :initial-element #xAA))
+         (big-b (make-array (* 2 dds.rtps.reliable:*fragment-size*) :element-type '(unsigned-byte 8)
+                            :initial-element #xBB)))
+    (unwind-protect
+         (progn
+           (add-local-writer pub :topic "FA" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-publisher pub)
+           (let ((ida (disc-node-user-writer-id pub)))
+             (add-local-writer pub :topic "FB" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)
+             (enable-publisher pub)
+             (let* ((idb (disc-node-user-writer-id pub))
+                    (wa (%user-writer-for pub ida))
+                    (wb (%user-writer-for pub idb)))
+               (assert (/= ida idb) () "the 2 fragmenting writers must have distinct EntityIds")
+               (setf (disc-node-peers pub) (list (cons "127.0.0.1" 59999)))   ; a bogus dest so each push forms a group + runs %sample-plan
+               (start-node pub)
+               (publish-sample pub big-a nil nil 0 nil ida)   ; primary A: fragmented SN 1
+               (publish-sample pub big-b nil nil 0 nil idb)   ; non-primary B: fragmented SN 1
+               (sleep 0.05)
+               (assert (= 1 (dds.rtps.reliable::rtps-writer-frag-hb-count wb)) ()
+                       "F1: the NON-PRIMARY writer's HEARTBEAT_FRAG must come from ITS OWN HC (frag-hb-count=1); ~
+                        got ~D (pre-fix 0 — the primary was consulted for writer B)"
+                       (dds.rtps.reliable::rtps-writer-frag-hb-count wb))
+               (assert (= 1 (dds.rtps.reliable::rtps-writer-frag-hb-count wa)) ()
+                       "F1: the PRIMARY writer's frag-hb-count must be exactly 1 (its OWN push only); ~
+                        got ~D (pre-fix 2 — it was wrongly consulted for writer B too)"
+                       (dds.rtps.reliable::rtps-writer-frag-hb-count wa))))
+           t)
+      (stop-node pub))))
 
 (defun* run-dispose-dataplane-test ()
     (function () (eql t))

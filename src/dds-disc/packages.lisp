@@ -73,7 +73,7 @@
            #:assert-participant-liveliness #:disc-node-remote-liveliness-stamp
            #:disc-node-discovered-writers-list #:disc-node-discovered-readers-list
            #:run-spdp-discovery-test #:run-sedp-discovery-test
-           #:run-mcast-discovery-test #:run-dataplane-test
+           #:run-mcast-discovery-test #:run-dataplane-test #:run-n-writer-dataplane-test #:run-n-writer-frag-heartbeat-test
            #:run-large-dataplane-test #:run-participant-liveliness-test
            #:run-locator-filter-test #:run-lost-final-sample-test
            #:run-dispose-dataplane-test #:run-dispose-repair-test

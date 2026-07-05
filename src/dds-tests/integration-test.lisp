@@ -7232,7 +7232,8 @@
                  (prog1 (copy-seq (key-hash-keyed-fd-i32-fd b))
                    (dds.pal:free-static (dds.core.buffer:octet-buffer-vec b)))))
          (p1 (dds.dcps:create-participant :domain (test-domain)))
-         (p2 (dds.dcps:create-participant :domain (test-domain))))
+         (p2 (dds.dcps:create-participant :domain (test-domain)))
+         (p3 (dds.dcps:create-participant :domain (test-domain))))   ; the KEEP_LAST reader lives alone (multi-reader-per-participant delivery is Slice S2)
     (%check :kfdc-kh-distinct (not (equalp kh-a kh-b)) "the two key values must have distinct keyhashes (oracle sanity)")
     (%check :kfdc-kh-not-nil (not (equalp kh-a nil-handle)) "a keyed FlatData keyhash must not be HANDLE_NIL")
     (unwind-protect
@@ -7290,26 +7291,30 @@
                      "the keyed FlatData reader must group the samples into exactly 2 instances")
              (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fd)))
            ;; (4) per-instance KEEP_LAST depth-2 on the copy path: a fresh keyed reader fed 3 of ONE key keeps the last 2
-           (let* ((trk (dds.dcps:create-topic p2 "KFdCopyKl" "keyed-fd-i32" ts))
+           ;; The KEEP_LAST reader runs on its OWN participant p3 (a single user reader): multi-reader-per-participant
+           ;; delivery routing is Slice S2, so a 2nd reader on p2 would share p2's engine reader and drain p1's dw
+           ;; samples too — the S1 writer fix (distinct writer GUIDs) unmasks that S2 gap. The copy-path per-instance
+           ;; KEEP_LAST behaviour under test is a single-reader property, verified cleanly here.
+           (let* ((trk (dds.dcps:create-topic p3 "KFdCopyKl" "keyed-fd-i32" ts))
                   (twk (dds.dcps:create-topic p1 "KFdCopyKl" "keyed-fd-i32" ts))
                   (pubk (dds.dcps:create-publisher p1))
-                  (subk (dds.dcps:create-subscriber p2))
+                  (subk (dds.dcps:create-subscriber p3))
                   (dwk (dds.dcps:create-datawriter
                         pubk twk :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
                   (drk (dds.dcps:create-datareader
                         subk trk :qos (dds.qos:make-reader-qos :reliability :reliable
                                                                :history-kind :keep-last :history-depth 2)))
-                  (node2k (dds.dcps::dp-node p2))
+                  (node2k (dds.dcps::dp-node p3))
                   (base (dds.disc:node-sample-count node2k))
                   (fdk (make-keyed-fd-i32-flatdata)))
              (loop repeat 200
-                   until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
-                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                   until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p3)))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p3) (sleep 0.02))
              (dotimes (round 3)                          ; 3 samples of key A > depth 2; deliver all, the drop fires within %drain
                (setf (keyed-fd-i32-k-fd fdk) ka (keyed-fd-i32-v-fd fdk) (+ #x000000a1 round))
                (dds.dcps:write-sample dwk fdk)
                (loop repeat 300 until (> (- (dds.disc:node-sample-count node2k) base) round)
-                     do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02)))
+                     do (dds.dcps:spin p1) (dds.dcps:spin p3) (sleep 0.02)))
              (dds.dcps::%drain drk)                       ; per-instance KEEP_LAST drop runs over the 3 received in one pass
              ;; the per-instance KEEP_LAST cap holds on the copy path: exactly the last 2 of key A survive
              (%check :kfdc-kl-total (= 2 (length (dds.dcps::dr-cache drk)))
@@ -7323,7 +7328,8 @@
                        (format nil "the copy reader must keep key A's LAST 2 values (a2,a3), oldest dropped; got ~x" vals)))
              (dds.pal:free-static (dds.core.buffer:octet-buffer-vec fdk))))
       (dds.dcps:delete-participant p1)
-      (when p2 (dds.dcps:delete-participant p2))))
+      (when p2 (dds.dcps:delete-participant p2))
+      (when p3 (dds.dcps:delete-participant p3))))
   t)
 
 (defun* run-keyed-flatdata-dispose-test ()

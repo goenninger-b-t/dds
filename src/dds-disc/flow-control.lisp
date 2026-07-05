@@ -471,6 +471,10 @@
   (dds.pal:with-lock ((flow-controller-lock controller))
     (when (dds.disc::disc-node-flow-controller node)
       (error "flow-controller-associate: ~S is already associated with a flow-controller (one per writer)." node))
+    (when (> (length (the list (dds.disc::%all-user-writers node))) 1)   ; WP-N-ENDPOINT-S1: flow-ON is single-writer; multi-writer flow is Slice S1b
+      (error "flow-controller-associate: ~S has ~D local user DataWriters — flow-ON multi-writer is Slice S1b ~
+              (N-user-endpoint); associate a flow-controller only on a single-writer participant."
+             node (length (dds.disc::%all-user-writers node))))
     (push node (flow-controller-writers controller))
     (setf (dds.disc::disc-node-flow-controller node) controller)
     (%flow-cache-writer-qos node))

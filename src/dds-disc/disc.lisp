@@ -181,6 +181,7 @@
   (primary-user-reader nil :type (or null dds.rtps.reliable:rtps-reader)) ; first-registered user reader (N=1 identity)
   (user-writer-id #x00000102 :type (unsigned-byte 32)) ; this node's user-data writer EntityId (kind reflects keyed-ness)
   (user-reader-id #x00000107 :type (unsigned-byte 32)) ; this node's user-data reader EntityId
+  (user-writer-key-next 1 :type (integer 1)) ; WP-N-ENDPOINT-S1 (ADR 0048): next distinct per-participant USER-writer entity KEY; starts 1 so the first writer keeps EntityId #x0102/#x0103 (byte-identical), each subsequent DataWriter gets a distinct key -> distinct EntityId + SEDP GUID (RTPS 2.5 §9.3.1.2). Builtin/secure keys are untouched.
   ;; FR-XPORT-2 SHMEM intra-host data plane (same-host user DATA only; discovery/HB/ACKNACK stay UDP)
   (shmem nil :type t)                     ; this node's shmem-transport (NIL = SHMEM off: *shmem-enabled* nil or pkg absent)
   (host-uuid 0 :type (unsigned-byte 64))  ; u64 host id (MD5 of hostname); a remote with the SAME uuid is same-host
@@ -530,21 +531,69 @@
    registry (WP-N-ENDPOINT-S0; S2 routes delivery across %all-user-readers)."
   (disc-node-primary-user-reader node))
 
+(defun* %node-secured-writer-p (node)
+    (function (disc-node) boolean)
+  "T iff NODE's user writer would TRANSFORM its SerializedPayload at publish (§9.4.1.2.4 SecuredPayload) — a
+   crypto-transform is installed OR governance mandates data_protection :sign/:encrypt. Mirrors
+   %loan-write-data-protected-p; gates the S1 second-writer fail-fast (secured multi-writer = Slice S3)."
+  (let ((kind (disc-node-user-data-protection-kind node)))
+    (or (and (member kind '(:sign :encrypt)) t)
+        (and (eq kind :unset) (disc-node-crypto-transform node) t))))
+
+(defun* %node-has-durable-writer-p (node)
+    (function (disc-node) boolean)
+  "T iff ANY local user writer advertises a RETAINING durability (TRANSIENT_LOCAL / TRANSIENT / PERSISTENT, DDS 1.4
+   §2.2.3.4) — read from the advertised endpoint-data QoS. Gates the S1 second-writer fail-fast: durability
+   late-joiner replay (%writer-durability-init: proxy-base rewind + a prompt HEARTBEAT) is driven per-node off the
+   PRIMARY writer only, so a 2nd durable writer would silently miss its retained-history replay (and mis-source the
+   prompt HB) — deferred, not half-fixed. A VOLATILE writer sends no prompt HB, so 2 VOLATILE writers are unaffected."
+  (dolist (w (disc-node-local-writers node) nil)
+    (unless (eq :volatile (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos w)))
+      (return t))))
+
 (defun* %register-user-writer (node entity-id writer)
     (function (disc-node (unsigned-byte 32) dds.rtps.reliable:rtps-writer) dds.rtps.reliable:rtps-writer)
-  "Register WRITER under ENTITY-ID in NODE's user-writer registry; the first registered becomes primary (N=1
-   identity for disc-node-user-writer). Re-registering the SAME id REPLACES the entry (byte-identical to the pre-S0
-   enable-publisher engine-writer clobber); a DIFFERENT 2nd id fail-fasts (N-local send fan-out = Slice S1)."
+  "Register WRITER under ENTITY-ID in NODE's user-writer registry (WP-N-ENDPOINT-S1, ADR 0048); the first
+   registered becomes primary (N=1 identity for disc-node-user-writer). Re-registering the SAME id REPLACES the
+   entry in place (byte-identical to the pre-S0 enable-publisher engine-writer clobber), keeping the primary ref
+   current if that id IS the primary. A NEW distinct id ADDS an N-th local writer (each with its own EntityId +
+   HistoryCache) UNLESS deferred: a 2nd SECURED writer fail-fasts (secured multi-writer = Slice S3), a 2nd writer
+   under an associated flow-controller fail-fasts (flow-ON multi-writer = Slice S1b), and a 2nd writer on a node
+   with any RETAINING-durability writer fail-fasts (durability multi-writer = later slice)."
   (let ((cell (assoc entity-id (disc-node-user-writers node) :test #'eql)))
-    (cond (cell (setf (cdr cell) writer)
-                (setf (disc-node-primary-user-writer node) writer))
-          ((disc-node-primary-user-writer node)
-           (error "disc-node: refusing a 2nd local user DataWriter (EntityId #x~8,'0X) — N-local user endpoints are ~
-                   not yet supported (N-user-endpoint Slice S1); primary EntityId #x~8,'0X"
-                  entity-id (caar (disc-node-user-writers node))))
-          (t (push (cons entity-id writer) (disc-node-user-writers node))
-             (setf (disc-node-primary-user-writer node) writer))))
+    (cond (cell (let ((was-primary (eq (cdr cell) (disc-node-primary-user-writer node))))
+                  (setf (cdr cell) writer)
+                  (when was-primary (setf (disc-node-primary-user-writer node) writer))))
+          ((null (disc-node-user-writers node))   ; first writer -> primary (N=1 identity)
+           (push (cons entity-id writer) (disc-node-user-writers node))
+           (setf (disc-node-primary-user-writer node) writer))
+          (t (when (%node-secured-writer-p node)
+               (error "disc-node: refusing a 2nd SECURED local user DataWriter (EntityId #x~8,'0X) — secured ~
+                       multi-writer is Slice S3 (N-user-endpoint); primary EntityId #x~8,'0X"
+                      entity-id (caar (last (disc-node-user-writers node)))))
+             (when (disc-node-flow-controller node)
+               (error "disc-node: refusing a 2nd local user DataWriter (EntityId #x~8,'0X) under an associated ~
+                       flow-controller — flow-ON multi-writer is Slice S1b; primary EntityId #x~8,'0X"
+                      entity-id (caar (last (disc-node-user-writers node)))))
+             (when (%node-has-durable-writer-p node)
+               (error "disc-node: refusing a 2nd local user DataWriter (EntityId #x~8,'0X) on a node with a ~
+                       RETAINING-durability (TRANSIENT_LOCAL/TRANSIENT/PERSISTENT) writer — durability multi-writer ~
+                       is a later N-user-endpoint slice; primary EntityId #x~8,'0X"
+                      entity-id (caar (last (disc-node-user-writers node)))))
+             (push (cons entity-id writer) (disc-node-user-writers node)))))   ; N-th writer; primary unchanged
   writer)
+
+(defun* %alloc-user-writer-key (node)
+    (function (disc-node) (unsigned-byte 8))
+  "Allocate + return the next distinct per-participant USER-writer entity KEY (WP-N-ENDPOINT-S1, ADR 0048; RTPS
+   2.5 §9.3.1.2). Starts at 1 so the first DataWriter keeps EntityId #x0102/#x0103 (byte-identical to pre-S1);
+   each subsequent writer gets a distinct key -> a distinct EntityId + SEDP GUID. Builtin/secure EntityIds are
+   NOT drawn from here. Fail-fasts if the 1-octet key space (255 writers/participant) is exhausted."
+  (let ((k (disc-node-user-writer-key-next node)))
+    (when (> k #xff)
+      (error "disc-node: user-writer entity-key space exhausted (>255 DataWriters on one participant)"))
+    (setf (disc-node-user-writer-key-next node) (1+ k))
+    k))
 
 (defun* %register-user-reader (node entity-id reader)
     (function (disc-node (unsigned-byte 32) dds.rtps.reliable:rtps-reader) dds.rtps.reliable:rtps-reader)
@@ -574,13 +623,17 @@
 
 (defun* %all-user-writers (node)
     (function (disc-node) list)
-  "Fresh list of NODE's registered user engine writers, primary first (S1 send fan-out)."
-  (mapcar #'cdr (disc-node-user-writers node)))
+  "Fresh list of NODE's registered user engine writers in REGISTRATION order (primary/first-registered first) —
+   the deterministic S1 send fan-out order (each writer pushes its OWN unsent changes + HEARTBEATs, so the order
+   is functionally independent; the enumeration is nonetheless fixed and MUST NOT be assumed 'primary first' by
+   correctness). At N=1 the sole writer is the primary (byte-identical to the pre-fan-out single-primary path)."
+  (nreverse (mapcar #'cdr (disc-node-user-writers node))))
 
 (defun* %all-user-readers (node)
     (function (disc-node) list)
-  "Fresh list of NODE's registered user engine readers, primary first (S2 deliver fan-out)."
-  (mapcar #'cdr (disc-node-user-readers node)))
+  "Fresh list of NODE's registered user engine readers in REGISTRATION order (primary/first-registered first) —
+   the deterministic S2 deliver fan-out order (not yet fanned out; S1 keeps a single user reader)."
+  (nreverse (mapcar #'cdr (disc-node-user-readers node))))
 
 (defparameter +spdp-multicast-group+ "239.255.0.1"
   "Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
@@ -878,15 +931,19 @@
 
 (defun* add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
-                                   (key 1) qos type-information (keyed t))
-    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (unsigned-byte 8)) (:qos t) (:type-information t) (:keyed t)) dds.rtps.discovery:endpoint-data)
+                                   (key nil) qos type-information (keyed t))
+    (function (disc-node &key (:topic string) (:type string) (:reliability integer) (:key (or null (unsigned-byte 8))) (:qos t) (:type-information t) (:keyed t)) dds.rtps.discovery:endpoint-data)
   "Register a local publication (writer endpoint) on NODE with QOS (or a QoS derived from
    the legacy :reliability constant). TYPE-INFORMATION is the opaque serialized XTypes
    TypeInformation for PID_TYPE_INFORMATION. announce-endpoints sends it via SEDP. KEYED
    selects the RTPS entity kind (RTPS 2.5 §9.3.1.2 Table 9.1): T (default) -> 0x02 (writer
    WITH_KEY), NIL -> 0x03 (writer NO_KEY); a keyed remote reader (RTI Connext) will not
-   match a no-key writer. Sets NODE's user-writer-id so the data plane sends with this id."
-  (let* ((kind (if keyed #x02 #x03))
+   match a no-key writer. KEY (NIL default) draws the next DISTINCT per-participant entity KEY
+   (WP-N-ENDPOINT-S1, ADR 0048) so a 2nd/N-th DataWriter gets a distinct EntityId + SEDP GUID
+   (the first stays #x0102/#x0103, byte-identical); pass an explicit KEY to pin it. Sets NODE's
+   user-writer-id so enable-publisher registers + the data plane sends with this id."
+  (let* ((key (or key (%alloc-user-writer-key node)))
+         (kind (if keyed #x02 #x03))
          (ep (dds.rtps.discovery:make-endpoint-data
               :role :writer
               :guid (%make-endpoint-guid (disc-node-guid-prefix node) key kind)
