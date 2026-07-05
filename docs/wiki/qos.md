@@ -42,6 +42,7 @@ a package-qualified accessor.
 | `dds.qos:qos-latency-budget` | LATENCY_BUDGET duration (`qos-duration`) | `+duration-zero+` |
 | `dds.qos:qos-ownership` | OWNERSHIP kind — `:shared` or `:exclusive` | `:shared` |
 | `dds.qos:qos-ownership-strength` | OWNERSHIP_STRENGTH (integer) | `0` |
+| `dds.qos:qos-transport-priority` | TRANSPORT_PRIORITY (`(signed-byte 32)`, DDS 1.4 §2.2.3.13) — writer-local hint; **not** an RxO policy, **not** SEDP-propagated. Anchors the flow-controller `:priority` scheduling policy (see Transports). | `0` |
 | `dds.qos:qos-liveliness` | LIVELINESS kind — `:automatic`, `:manual-by-participant`, `:manual-by-topic` | `:automatic` |
 | `dds.qos:qos-liveliness-lease` | LIVELINESS lease duration (`qos-duration`) | `+duration-infinite+` |
 | `dds.qos:qos-destination-order` | DESTINATION_ORDER kind — `:by-reception-timestamp` or `:by-source-timestamp` | `:by-reception-timestamp` |

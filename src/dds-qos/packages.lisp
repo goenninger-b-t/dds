@@ -15,7 +15,7 @@
            #:duration-nanosec->wire-fraction #:wire-fraction->duration-nanosec
            #:qos #:make-qos #:make-writer-qos #:make-reader-qos #:copy-qos
            #:qos-reliability #:qos-durability #:qos-deadline #:qos-latency-budget
-           #:qos-ownership #:qos-ownership-strength
+           #:qos-ownership #:qos-ownership-strength #:qos-transport-priority
            #:qos-liveliness #:qos-liveliness-lease #:liveliness-rank
            #:qos-destination-order #:qos-presentation-scope
            #:qos-presentation-coherent #:qos-presentation-ordered

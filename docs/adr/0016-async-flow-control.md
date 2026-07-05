@@ -2,7 +2,8 @@
 
 - **Status:** Accepted (Phases A–F delivered 2026-06-15: A token bucket, B1 per-datagram step, C shared
   FlowController + scheduler, D backpressure, E teardown + off-by-default, F1 rate-shaping bench, F2 docs) —
-  created at Phase A
+  created at Phase A; **WP-FLOW-EDF-PRIORITY addendum delivered 2026-07-04** (the deferred `:edf` +
+  `:priority` scheduling policies + the TRANSPORT_PRIORITY QoS slot — see §Addendum below)
 - **Deciders:** A0 (integrator)
 - **Amends:** the `writer-write` / `writer-lifecycle-change` contract (Phase D, **delivered** — they now return
   `(or integer (eql :timeout))`; consumers `publish-sample` / `%dispose-or-unregister` /
@@ -230,6 +231,89 @@ wire). Delivered:
   guarded sender thread), so the interop proves *sender-thread survival + wire validity + delivery preservation*;
   the *guard-vs-no-guard* discrimination is the unit mutation tests, not the interop.
 
+### Addendum — WP-FLOW-EDF-PRIORITY: the two QoS-anchored scheduling policies (DELIVERED 2026-07-04)
+
+This addendum delivers the deferred pluggable policies named above (§Phases B–E, "Scheduler thread"): `:edf`
+(earliest-deadline-first, anchored on **LATENCY_BUDGET**) and `:priority` (highest **TRANSPORT_PRIORITY** first,
+with starvation-avoidance aging). Both are **pure SELECTION** — they change only *which* registered writer the
+scheduler drains next, under the controller lock; the token-bucket pacing (*when*), the per-datagram build/emit,
+the per-node emit barrier, and the wire bytes are all **untouched**. They drop into `make-flow-controller`'s
+policy `ecase` (`:round-robin` | `:edf` | `:priority`) with **no change to `%flow-scheduler-loop`** — the seam
+was designed for exactly this. `:round-robin` and controller-off remain **byte-identical** (the new code is
+additive behind the ecase; RR ignores the new slots). Still **NOT R6** — scheduling is wire-invisible.
+
+**LATENCY_BUDGET as the EDF key (NOT DEADLINE).** The per-sample EDF deadline is `write-time + LATENCY_BUDGET`,
+earliest first. In this stack QoS **DEADLINE** is the *periodicity/liveliness* contract that drives
+OFFERED/REQUESTED_DEADLINE_MISSED (DDS 1.4 §2.2.3.7) — a **different** contract; using it as the EDF key would
+conflate two meanings. **LATENCY_BUDGET** (§2.2.3.8) is precisely a *maximum acceptable delay* / urgency hint,
+so it is the correct ordering anchor. It is a **hint, not a hard cap**: a saturated token bucket may still delay
+a sample beyond its budget — EDF informs **ordering**, it does not guarantee the deadline (the bench measures
+miss *reduction* vs round-robin, not zero misses).
+
+**budget-0 semantics.** The DDS default LATENCY_BUDGET is `{0,0}`. Deadline = `write-time + 0 = write-time`, so a
+budget-0 writer sorts **earliest / most urgent** relative to positive-budget writers enqueued at the same time —
+the spec-faithful reading (`deadline = write-time`), *not* "no preference". Confirmed + tested
+(`run-flow-edf-ordering-test`: a budget-0 writer drains before a budget-10ms one).
+
+**Aging policy + starvation bound.** Effective priority = `base TRANSPORT_PRIORITY + floor((now − last-served)/
+quantum)`, where `quantum = *flow-priority-aging-quantum-ns*` (default 10 ms) and `now` is read via the
+controller's **injected clock-fn** (the token bucket's — reused DRY, so tests advance a settable counter and the
+policy is deterministic; **no raw wall-clock** that would break determinism). `last-served` is stamped on the
+node **each time the `:priority` policy selects it**; a saturating high-priority writer is served every turn, so
+its aging stays ≈ 0, while a starved low-priority writer's aging climbs with elapsed time. **Bound:** behind a
+permanently-saturating writer of base `P_high`, a writer of base `P_low` waits at most **≈ `(P_high − P_low)`
+quanta** (≈ `(P_high − P_low)·quantum` ns) before its effective priority ties then exceeds `P_high` and it is
+selected — **finite for any finite priority gap** (contrast: pure highest-first starves it unboundedly). Ties
+(equal EDF deadline or equal effective priority) fall to a **stable round-robin cursor** tiebreak, so equal-key
+writers rotate and never starve each other. Verified: `run-flow-priority-aging-test` (deterministic clock) +
+the bench's max-consecutive-unserved-gap metric.
+
+**Per-writer-key surfacing path (honours the lock discipline).** The policy runs **under the controller lock**,
+which must **never** nest the writer lock (the binary lock-ordering gate). So the policy **cannot** read the
+writer's HistoryCache/QoS live. Instead the needed keys are **cached onto controller-lock-guarded `disc-node`
+slots**: `flow-latency-budget-ns` + `flow-transport-priority` are read **once at `flow-controller-associate`**
+from the writer endpoint's QoS (`%flow-cache-writer-qos`), and the EDF write-time `flow-head-ns` is stamped
+**(a)** in **`%flow-signal`** on the idle→pending transition (a fresh burst's head write-time) **and (b)** in
+the scheduler at each plan **re-snapshot** (`%flow-head-advance`, when the writer's head-of-line batch has
+drained and a fresh unsent set is captured). Both stamps use the controller clock **now** as the lock-safe
+proxy for the head sample's enqueue time (the HistoryCache — the true timestamp — cannot be read under the
+controller lock). The **(b)** re-stamp is essential under **sustained per-writer backlog**: a continuously-
+pending writer never goes idle, so **(a)** never re-fires; without **(b)** its frozen `flow-head-ns` would grow
+progressively more urgent vs the wall clock and it would **monopolize** selection against newer-but-tighter-
+budget writers. With **(b)**, a *served* writer's key advances each drain (its urgency resets) while an
+*unserved* writer's `flow-head-ns` correctly stays put and ages toward selection — natural EDF anti-starvation.
+The **granularity is the plan (snapshot) batch, not the individual sample** (the plan snapshots the whole
+unsent set at once, so `flow-head-ns` = the current batch's snapshot time, not each sample's exact enqueue):
+EDF ordering is thus exact across writers at each re-snapshot, approximate within a multi-datagram plan. Both
+stamps are **gated by the scheduling policy** — `:edf` stamps `flow-head-ns`, `:priority` stamps
+`flow-last-served-ns` (the aging baseline), **`:round-robin` stamps NEITHER**, so the RR/off path is literally
+additive-behind-the-ecase (byte-identical). All slots are written/read only under the controller lock — **zero
+writer-lock contact from the policy**, and **no per-sample allocation** on the selection path (the key-fns are
+top-level functions, never per-call closures). This is the "cache at associate + stamp at signal/re-snapshot"
+path, chosen over live HistoryCache peeking precisely because live peeking would violate the
+controller-lock-never-nests-writer-lock invariant.
+
+**TRANSPORT_PRIORITY QoS slot (the plumbing gap).** TRANSPORT_PRIORITY was not yet a QoS slot; this WP adds
+`transport-priority` (`(signed-byte 32)`, default **0** per DDS 1.4 §2.2.3.13) to the `qos` struct. It is
+**writer-local, NOT an RxO policy** (absent from `qos-rxo-compatible` — a mismatch neither blocks nor is
+reported) and **NOT propagated in SEDP**: sender-side scheduling needs only the writer's *local* value, and the
+SEDP serializer is explicit per-PID (adding the slot does **not** perturb the wire). Full SEDP propagation is
+deliberately **out of scope** (no test needs it). Verified: `run-flow-transport-priority-qos-test`.
+
+**Tests (6 new) + bench.** `run-flow-transport-priority-qos-test` (slot default 0 + not-RxO + associate
+caching), `run-flow-edf-ordering-test` (min-deadline-first + budget-0-most-urgent + RR tie-rotation),
+`run-flow-edf-backlog-test` (Finding-1: under sustained per-writer backlog WITHOUT the re-snapshot re-stamp the
+tight writer monopolizes and the loose writer starves — served 0, the RED; WITH `%flow-head-advance` the loose
+writer makes bounded progress while the tight writer stays preferential),
+`run-flow-priority-ordering-test` (highest-first), `run-flow-priority-aging-test` (bounded starvation under a
+saturating high writer, injected clock) — all five are **deterministic direct policy exercises** (no threads/
+sockets), so they run on **both** SBCL and Clasp (they are *not* the real-thread flow kind Clasp pass-skips);
+`run-flow-edf-priority-e2e-test` drives a live `:edf` and a live `:priority` controller end-to-end (delivery
+completeness, SBCL-only, Clasp pass-skipped exactly like `run-flow-multiwriter-rr-test`). Bench:
+`run-bench-flow-edf-priority` (`make bench-flow-edf-priority`, `bench/report/2026-07-04-wp-flow-edf-priority.md`)
+— a deterministic discrete-event sim over the **shipped** selectors: EDF deadline-miss count vs round-robin for
+mixed-budget streams, and `:priority` service share + the low-priority starvation bound vs round-robin.
+
 ## OMG DDS / RTPS spec-compliance (wire-invisible / additive on conforming RTPS / NOT R6)
 
 Flow control is **wire-invisible**: it changes only **when** a datagram is sent, never the submessage bytes.
@@ -303,6 +387,14 @@ owns its own scratch buffer, like the async sender). No per-sample heap allocati
   `flow-controller-unregister`, `destroy-flow-controller`, the scheduler thread (`%flow-scheduler-loop`) +
   pluggable policy hook (`%flow-policy-round-robin`) + the per-node emit barrier (Phase C)
 - `src/dds-disc/packages.lisp` — exports the token-bucket + `flow-controller` API
+- **WP-FLOW-EDF-PRIORITY addendum:** `src/dds-qos/qos.lisp` + `packages.lisp` (`transport-priority` slot +
+  `qos-transport-priority` export); `src/dds-disc/disc.lisp` (`flow-latency-budget-ns` / `flow-transport-priority`
+  / `flow-head-ns` / `flow-last-served-ns` node slots); `src/dds-disc/flow-control.lisp`
+  (`*flow-priority-aging-quantum-ns*`, `%flow-controller-now`, `%flow-policy-select`, `%flow-edf-key`,
+  `%flow-priority-key`, `%flow-policy-edf`, `%flow-policy-priority`, `%flow-cache-writer-qos`; `%flow-signal`
+  head/aging stamping; `flow-controller-associate` caching; `make-flow-controller` ecase + docstrings);
+  `src/dds-tests/integration-test.lisp` + `echo-test.lisp` (5 tests + `run-bench-flow-edf-priority`);
+  `Makefile` (`bench-flow-edf-priority`)
 - `src/dds-disc/dataplane.lisp` — the per-datagram "build one datagram into the scratch buffer" step
   (`%node-datagram-plan` / `%emit-plan-entry` / `%flow-step-emit`, Phase B1); `writer-write` /
   `writer-lifecycle-change` block-up-to-`max_blocking_time` + `:timeout` sentinel via `%writer-add-bounded`;

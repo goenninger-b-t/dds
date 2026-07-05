@@ -102,6 +102,7 @@
   (writers '() :type list)           ; registered disc-nodes (guarded by LOCK)
   (rr-cursor 0 :type (integer 0))    ; round-robin index into WRITERS (guarded by LOCK)
   (policy-fn nil :type function)     ; pluggable next-writer selector (default round-robin)
+  (scheduling :round-robin :type symbol) ; the policy KIND (:round-robin | :edf | :priority): gates the QoS-key stamping in %flow-signal / the scheduler so the RR/off path is untouched (WP-FLOW-EDF-PRIORITY)
   (lock (dds.pal:make-lock "flow-controller") :type t)
   (cv (dds.pal:make-condvar) :type t)
   (thread nil :type t)
@@ -141,6 +142,112 @@
               (setf (flow-controller-rr-cursor controller) (mod (1+ idx) n))
               (return-from %flow-policy-round-robin node))))
         nil))))
+
+(defparameter *flow-priority-aging-quantum-ns* 10000000
+  "WP-FLOW-EDF-PRIORITY (ADR 0016 deferred scheduling policies): the :PRIORITY scheduler's
+   starvation-avoidance aging quantum in NANOSECONDS. Each full quantum a pending writer waits UNSERVED
+   raises its EFFECTIVE priority by 1 — effective = base TRANSPORT_PRIORITY + floor((now - last-served)/
+   quantum). Bounds low-priority starvation: behind a permanently-saturating writer of base P_high, a writer
+   of base P_low waits at most ~(P_high - P_low) quanta (≈ (P_high - P_low)·quantum ns) before its effective
+   priority ties then exceeds P_high and it is selected — finite for any finite priority gap. Read via the
+   controller's injected clock-fn, so tests advance it deterministically. Default 10 ms.")
+
+(defun* %flow-controller-now (controller)
+    (function (flow-controller) integer)
+  "Current time in ns from CONTROLLER's injected clock-fn (the token bucket's, reused DRY — the same seam the
+   deterministic pacing tests inject). The :edf/:priority policies + %flow-signal read wall time ONLY through
+   this so scheduling stays deterministic under a test clock (WP-FLOW-EDF-PRIORITY, ADR 0016)."
+  (funcall (flow-token-bucket-clock-fn (flow-controller-bucket controller))))
+
+(defun* %flow-policy-select (controller key-fn)
+    (function (flow-controller function) t)
+  "Shared min-KEY selector for the QoS-anchored policies (WP-FLOW-EDF-PRIORITY, ADR 0016): among the
+   registered writers WITH pending work (%flow-node-pending-p), return the one whose (FUNCALL KEY-FN
+   CONTROLLER NODE) integer key is SMALLEST, breaking ties by round-robin rank (the candidate nearest AFTER
+   RR-CURSOR, wrapping) so equal-key writers rotate and never starve each other, and advance RR-CURSOR past
+   the winner exactly as %FLOW-POLICY-ROUND-ROBIN does. NIL when NO registered writer has pending work. Pure
+   SELECTION (no send, no token math); CALLER HOLDS the controller LOCK; 0-alloc (KEY-FN is a top-level
+   function, never a per-call closure) + CLOS-free. This is the pending/barrier discipline of
+   %FLOW-POLICY-ROUND-ROBIN with the selection order factored out (DRY)."
+  (let ((writers (flow-controller-writers controller)))
+    (when writers
+      (let ((n (length writers))
+            (cursor (flow-controller-rr-cursor controller))
+            (best nil) (best-key 0) (best-rank 0) (best-idx 0))
+        (declare (type (integer 1) n) (type (integer 0) cursor best-rank best-idx)
+                 (type integer best-key))
+        (dotimes (i n)
+          (let ((node (nth i writers)))
+            (when (%flow-node-pending-p controller node)
+              (let ((key (funcall key-fn controller node))
+                    (rank (mod (- i cursor) n)))
+                (declare (type integer key) (type (integer 0) rank))
+                (when (or (null best) (< key best-key)
+                          (and (= key best-key) (< rank best-rank)))
+                  (setf best node best-key key best-rank rank best-idx i))))))
+        (when best
+          (setf (flow-controller-rr-cursor controller) (mod (1+ best-idx) n))
+          best)))))
+
+(defun* %flow-edf-key (controller node)
+    (function (flow-controller dds.disc::disc-node) integer)
+  "EARLIEST-DEADLINE-FIRST key for NODE (WP-FLOW-EDF-PRIORITY, ADR 0016): the per-sample DEADLINE =
+   head-of-unsent write-time + LATENCY_BUDGET (FLOW-HEAD-NS + FLOW-LATENCY-BUDGET-NS, both cached under the
+   controller lock). Keyed on LATENCY_BUDGET, NOT QoS DEADLINE (which here is the periodicity/liveliness
+   contract driving OFFERED/REQUESTED_DEADLINE_MISSED — a different meaning). A budget-0 writer (the DDS
+   default) has deadline = write-time, so it sorts EARLIEST (most urgent) — the spec-faithful reading. Smaller
+   key = earlier deadline = selected first."
+  (declare (ignore controller))
+  (+ (dds.disc::disc-node-flow-head-ns node) (dds.disc::disc-node-flow-latency-budget-ns node)))
+
+(defun* %flow-priority-key (controller node)
+    (function (flow-controller dds.disc::disc-node) integer)
+  "HIGHEST-TRANSPORT_PRIORITY-FIRST key for NODE WITH starvation-avoidance aging (WP-FLOW-EDF-PRIORITY,
+   ADR 0016): effective priority = base TRANSPORT_PRIORITY + floor((now - FLOW-LAST-SERVED-NS)/
+   *FLOW-PRIORITY-AGING-QUANTUM-NS*), where NOW is the controller clock. Returned NEGATED so the shared
+   min-key selector picks the HIGHEST effective priority. Aging lets a starved low-priority writer's effective
+   priority climb until it overtakes a saturating high-priority writer (whose FLOW-LAST-SERVED-NS keeps
+   refreshing at each selection, holding its aging near 0), bounding starvation."
+  (let* ((now (%flow-controller-now controller))
+         (waited (max 0 (- now (dds.disc::disc-node-flow-last-served-ns node))))
+         (aging (floor waited *flow-priority-aging-quantum-ns*)))
+    (declare (type integer now waited aging))
+    (- (+ (dds.disc::disc-node-flow-transport-priority node) aging))))
+
+(defun* %flow-head-advance (controller node)
+    (function (flow-controller dds.disc::disc-node) t)
+  "Re-stamp NODE's EDF head write-time (FLOW-HEAD-NS) to now — called when NODE's per-datagram plan
+   RE-SNAPSHOTS (its head-of-line batch has drained and a fresh unsent set is captured). Under SUSTAINED
+   per-writer backlog (new samples arrive before the plan drains) the writer NEVER goes idle, so the
+   idle->pending stamp in %FLOW-SIGNAL never re-fires; without this re-stamp the frozen FLOW-HEAD-NS would grow
+   progressively more urgent vs the wall clock and the backlogged writer would MONOPOLIZE selection against
+   newer-but-tighter-budget writers. Re-stamping at each re-snapshot makes the :edf key track the writer's
+   CURRENT head batch (now, the lock-safe proxy for the head sample's enqueue time — the HistoryCache cannot be
+   read under the controller lock), so a served writer's urgency resets each drain while an UNSERVED writer's
+   FLOW-HEAD-NS correctly stays put and ages toward selection (natural EDF anti-starvation). CALLER HOLDS the
+   controller LOCK. Only meaningful for :edf (the scheduler gates the call on it)."
+  (setf (dds.disc::disc-node-flow-head-ns node) (%flow-controller-now controller))
+  t)
+
+(defun* %flow-policy-edf (controller)
+    (function (flow-controller) t)
+  "The :EDF pluggable policy (WP-FLOW-EDF-PRIORITY, ADR 0016): select the pending writer whose head-unsent
+   sample has the MIN deadline (write-time + LATENCY_BUDGET, %FLOW-EDF-KEY), RR-tiebroken among equal
+   deadlines. Pure SELECTION under the controller LOCK; drops into make-flow-controller's ecase without
+   touching %FLOW-SCHEDULER-LOOP."
+  (%flow-policy-select controller #'%flow-edf-key))
+
+(defun* %flow-policy-priority (controller)
+    (function (flow-controller) t)
+  "The :PRIORITY pluggable policy (WP-FLOW-EDF-PRIORITY, ADR 0016): select the pending writer with the
+   HIGHEST effective priority (base TRANSPORT_PRIORITY + aging, %FLOW-PRIORITY-KEY), RR-tiebroken, then stamp
+   the winner's FLOW-LAST-SERVED-NS = now so its aging resets (a saturating high-priority writer thus stays
+   near 0 aging while a starved writer's climbs until it wins — bounded starvation). Pure SELECTION under the
+   controller LOCK; drops into make-flow-controller's ecase without touching %FLOW-SCHEDULER-LOOP."
+  (let ((node (%flow-policy-select controller #'%flow-priority-key)))
+    (when node
+      (setf (dds.disc::disc-node-flow-last-served-ns node) (%flow-controller-now controller)))
+    node))
 
 (defun* %flow-acquire-hook (controller)
     (function (flow-controller) function)
@@ -244,7 +351,9 @@
                      (null (dds.disc::disc-node-flow-step-state node))
                      (dds.disc::disc-node-flow-pending node))
             (setf snapshot-needed t                                 ; consume the signal: the build below snapshots
-                  (dds.disc::disc-node-flow-pending node) nil))))
+                  (dds.disc::disc-node-flow-pending node) nil)
+            (when (eq (flow-controller-scheduling controller) :edf)   ; re-stamp the EDF head at plan re-snapshot so a backlogged writer's key tracks its CURRENT head (WP-FLOW-EDF-PRIORITY Finding-1)
+              (%flow-head-advance controller node)))))
       (when stop
         (%flow-flush-all controller)   ; LOCK released: drain every writer ignoring the bucket, then exit
         (return))
@@ -273,8 +382,16 @@
    condvar-signal the controller CV. The caller (publish-sample / %dispose-or-unregister) does NOT send — the
    send is the scheduler thread's, rate-paced. The reliable unsent-list IS the queue; FLOW-PENDING just says
    'there is new unsent work to snapshot'. condvar-SIGNAL (not broadcast) is exact: a controller has exactly
-   ONE scheduler thread waiting on the CV."
+   ONE scheduler thread waiting on the CV. For a QoS-anchored policy this also stamps the node's idle->pending
+   scheduling key (WP-FLOW-EDF-PRIORITY): :edf stamps FLOW-HEAD-NS (the fresh burst's head write-time; a
+   continuous backlog re-stamps at each plan re-snapshot via %FLOW-HEAD-ADVANCE, not here), :priority stamps
+   FLOW-LAST-SERVED-NS (the aging baseline). For :round-robin NEITHER slot is touched — the RR/off path is
+   byte-identical (RR reads no scheduling key), so the QoS policies are literally additive behind the ecase."
   (dds.pal:with-lock ((flow-controller-lock controller))
+    (unless (%flow-node-pending-p controller node)   ; idle->pending: stamp the QoS-policy key (gated so RR is untouched)
+      (case (flow-controller-scheduling controller)
+        (:edf (setf (dds.disc::disc-node-flow-head-ns node) (%flow-controller-now controller)))
+        (:priority (setf (dds.disc::disc-node-flow-last-served-ns node) (%flow-controller-now controller)))))
     (setf (dds.disc::disc-node-flow-pending node) t)
     (dds.pal:condvar-signal (flow-controller-cv controller)))
   t)
@@ -288,18 +405,24 @@
    TOKENS-PER-PERIOD bytes every PERIOD ns (capacity MAX-BURST bytes, clocked by CLOCK-FN), a SCHEDULING
    policy, an empty registered-writer set, the controller's own SCRATCH send-buffer, and its OWN scheduler
    thread (%FLOW-SCHEDULER-LOOP). Each of TOKENS-PER-PERIOD / PERIOD / MAX-BURST MUST be >= 1 (validated as
-   make-flow-token-bucket does). SCHEDULING is :ROUND-ROBIN in v1 (the pluggable policy hook — any other
-   value SIGNALS, the EDF/priority follow-ups being out of scope here). Configure MAX-BURST >= the largest
+   make-flow-token-bucket does). SCHEDULING selects the pluggable next-writer policy (any other value SIGNALS):
+   :ROUND-ROBIN (default — fair cursor rotation); :EDF (earliest-deadline-first on LATENCY_BUDGET,
+   %FLOW-POLICY-EDF); :PRIORITY (highest TRANSPORT_PRIORITY first with starvation-avoidance aging,
+   %FLOW-POLICY-PRIORITY) — WP-FLOW-EDF-PRIORITY, ADR 0016. Selection is ORTHOGONAL to the token-bucket pacing
+   (the policy picks WHICH writer drains next; the bucket paces WHEN), so all three shape to the same aggregate
+   rate. Configure MAX-BURST >= the largest
    datagram so a single datagram costs at most one full-bucket wait. Associate writers with
    flow-controller-associate; tear down with destroy-flow-controller. Off by default — a node with no
    controller associated is byte-identical to before (the controller only diverts publish-sample when the
    flow-controller slot is set)."
   (let* ((policy-fn (ecase scheduling
-                      (:round-robin #'%flow-policy-round-robin)))   ; v1: round-robin only (pluggable hook)
+                      (:round-robin #'%flow-policy-round-robin)     ; fair cursor rotation (v1 default)
+                      (:edf #'%flow-policy-edf)                     ; WP-FLOW-EDF-PRIORITY: LATENCY_BUDGET earliest-deadline-first
+                      (:priority #'%flow-policy-priority)))         ; WP-FLOW-EDF-PRIORITY: highest TRANSPORT_PRIORITY + aging
          (controller (%make-flow-controller
                       :bucket (make-flow-token-bucket :tokens-per-period tokens-per-period :period period
                                                       :max-burst max-burst :clock-fn clock-fn)
-                      :policy-fn policy-fn
+                      :policy-fn policy-fn :scheduling scheduling
                       :scratch (dds.core.buffer:make-octet-buffer 2048))))
     (setf (flow-controller-thread controller)
           (dds.pal:spawn (lambda () (%flow-scheduler-loop controller)) :name "dds-flow-scheduler"))
@@ -320,19 +443,37 @@
     (when w (dds.rtps.reliable:%writer-signal-space w)))
   t)
 
+(defun* %flow-cache-writer-qos (node)
+    (function (dds.disc::disc-node) t)
+  "Cache NODE's writer LATENCY_BUDGET (as ns) + TRANSPORT_PRIORITY onto the node's controller-lock-guarded
+   FLOW-* slots for the :edf / :priority policies (WP-FLOW-EDF-PRIORITY, ADR 0016) — read ONCE here (at
+   associate) from the writer endpoint's QoS so the per-datagram policy never re-reads QoS on the hot path.
+   Only the writer-LOCAL values matter for sender-side scheduling (no SEDP propagation). A node with no local
+   writer endpoint keeps the defaults (budget 0 / priority 0). Caller HOLDS the controller LOCK."
+  (let ((ep (first (dds.disc::disc-node-local-writers node))))
+    (when ep
+      (let ((q (dds.rtps.discovery:endpoint-data-qos ep)))
+        (let ((b (dds.qos:qos-latency-budget q)))
+          (setf (dds.disc::disc-node-flow-latency-budget-ns node)
+                (+ (* (dds.qos:qos-duration-sec b) 1000000000) (dds.qos:qos-duration-nanosec b))
+                (dds.disc::disc-node-flow-transport-priority node) (dds.qos:qos-transport-priority q))))))
+  t)
+
 (defun* flow-controller-associate (controller node)
     (function (flow-controller dds.disc::disc-node) t)
   "Associate writer NODE with CONTROLLER (FR-PF-2, ADR 0016), making its publication async-and-paced (the
    controller's scheduler thread sends, rate-shaped). Under the controller LOCK: SIGNALS if NODE is already
-   bound to a controller (one controller per writer); otherwise pushes NODE onto WRITERS and sets its
-   FLOW-CONTROLLER slot. After this, publish-sample / dispose / unregister on NODE return immediately after
-   signalling the controller (the per-node async sender + batch are superseded for this writer). Returns
-   the controller."
+   bound to a controller (one controller per writer); otherwise pushes NODE onto WRITERS, sets its
+   FLOW-CONTROLLER slot, and caches its writer's LATENCY_BUDGET/TRANSPORT_PRIORITY for the :edf/:priority
+   policies (%FLOW-CACHE-WRITER-QOS; a no-op for :round-robin, which ignores those slots). After this,
+   publish-sample / dispose / unregister on NODE return immediately after signalling the controller (the
+   per-node async sender + batch are superseded for this writer). Returns the controller."
   (dds.pal:with-lock ((flow-controller-lock controller))
     (when (dds.disc::disc-node-flow-controller node)
       (error "flow-controller-associate: ~S is already associated with a flow-controller (one per writer)." node))
     (push node (flow-controller-writers controller))
-    (setf (dds.disc::disc-node-flow-controller node) controller))
+    (setf (dds.disc::disc-node-flow-controller node) controller)
+    (%flow-cache-writer-qos node))
   controller)
 
 (defun* flow-controller-unregister (controller node)

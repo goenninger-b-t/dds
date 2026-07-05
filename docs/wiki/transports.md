@@ -372,7 +372,7 @@ none is patent-gated and none is R6.
 |---|---|---|---|
 | **sync** (default) | nothing | the **calling** (`publish-sample`) thread | inline, immediately on write |
 | **async-unpaced** | `dds.disc:enable-async` | a **per-node** background sender thread | on signal it flushes **all** unsent (the reliable unsent-list *is* the queue), **unpaced** — drains as fast as the link allows |
-| **async-paced** (flow control) | associate with a `dds.disc:flow-controller` | the **controller's** scheduler thread | rate-shaped: one datagram per associated writer per round-robin turn, gated by a bytes/period token bucket |
+| **async-paced** (flow control) | associate with a `dds.disc:flow-controller` | the **controller's** scheduler thread | rate-shaped: one datagram per associated writer per turn (selection policy `:round-robin` / `:edf` / `:priority`), gated by a bytes/period token bucket |
 
 A writer is associated with **at most one** controller; association **supersedes** the per-node unpaced sender
 for that writer (`enable-async` remains for the async-*without*-rate-control case). Flow control is **off by
@@ -497,13 +497,38 @@ byte-identical production).
   errors)
 ```
 
+### Scheduling policies (`:round-robin` | `:edf` | `:priority`)
+
+The next-writer selector is a **pluggable policy hook** chosen by `make-flow-controller`'s `:scheduling`
+keyword; all three shape to the same aggregate rate (selection is orthogonal to the token-bucket pacing —
+it changes only *which* writer drains next, never *when* or the wire bytes):
+
+- **`:round-robin`** (default) — fair cursor rotation, one datagram per writer per turn.
+- **`:edf`** (WP-FLOW-EDF-PRIORITY, ADR 0016) — earliest-deadline-first, keyed on **`LATENCY_BUDGET`**:
+  the pending writer whose head-unsent sample has the smallest deadline (write-time + latency-budget) drains
+  first. Keyed on `LATENCY_BUDGET`, **not** QoS `DEADLINE` (which here is the periodicity/liveliness contract).
+  A budget-0 writer (the default) has deadline = write-time, so it sorts **earliest (most urgent)**.
+  `LATENCY_BUDGET` is a max-delay *hint* that informs *ordering* — a saturated bucket may still miss it.
+- **`:priority`** (WP-FLOW-EDF-PRIORITY, ADR 0016) — highest **`TRANSPORT_PRIORITY`** first, **with
+  starvation-avoidance aging**: effective priority = base + `floor((now − last-served)/`
+  `*flow-priority-aging-quantum-ns*)` (default quantum 10 ms), so a low-priority writer starved behind a
+  saturating high-priority one still wins within ≈ `(P_high − P_low)` quanta — bounded, not the unbounded
+  starvation a pure highest-first policy would inflict.
+
+The writer's `LATENCY_BUDGET` + `TRANSPORT_PRIORITY` are cached onto the node at
+`flow-controller-associate` time (read once from the writer QoS; no per-datagram QoS read on the selection
+path), and the EDF head write-time is stamped both on the idle→pending transition **and** at each plan
+re-snapshot as the writer's head-of-line batch drains (so under sustained backlog the key tracks the writer's
+current head, not its first-ever-pending time — otherwise a continuously-backlogged writer would monopolize);
+these stamps are gated by policy, so the `:round-robin`/off path is untouched. All under the controller lock,
+so the policy never touches the writer lock. Bench: `make bench-flow-edf-priority`
+(`bench/report/2026-07-04-wp-flow-edf-priority.md`) — EDF deadline-miss reduction + priority service-share +
+the aging starvation bound, all vs round-robin.
+
 ### Deferred (v1 → follow-ups)
 
-v1 ships **round-robin only**, behind a **pluggable policy hook** (the scheduler calls it to pick the next
-writer-with-pending-work), so the OMG-standard-QoS-anchored policies drop in without rework:
-`TRANSPORT_PRIORITY` → a highest-priority-first policy; `LATENCY_BUDGET`/`DEADLINE` → an EDF-like policy
-(per-sample deadline ≈ write-time + latency-budget; earliest first — `LATENCY_BUDGET` is a max-delay *hint*, so
-it informs *ordering*, not a hard cap). Also deferred: per-sample priority/deadline, **runtime rate
+Still deferred: SEDP propagation of `TRANSPORT_PRIORITY`/`LATENCY_BUDGET` (sender-local scheduling needs only
+the writer-local value), per-sample priority/deadline, **runtime rate
 re-configuration** (rate is set at `make-flow-controller`), pacing of discovery/HEARTBEAT/ACKNACK (only user
 DATA is paced), and cross-process flow control (a controller is an in-process, sender-side object). The
 `FlowController`, asynchronous `PublishMode`, and the policy *names* are RTI Connext vendor-extension names —

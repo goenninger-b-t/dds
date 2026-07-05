@@ -213,6 +213,10 @@
   (flow-step-refs nil :type list) ; release-safety (operating contract §4): the CacheChanges %node-datagram-plan acquired a send-ref on at snapshot; released when the plan drains (%flow-step-advance); single-mutator (the draining thread), like flow-step-state
   (flow-controller nil :type t) ; WP-ASYNC-FLOW: the flow-controller this writer is associated with (NIL = none); set/cleared under the CONTROLLER lock; non-NIL makes publish async-and-paced (the controller thread sends)
   (flow-pending nil :type t)    ; WP-ASYNC-FLOW: new unsent work awaiting a fresh plan snapshot; set by %flow-signal, cleared by the scheduler — guarded by the CONTROLLER lock (NOT the node lock)
+  (flow-latency-budget-ns 0 :type integer) ; WP-FLOW-EDF-PRIORITY: writer's LATENCY_BUDGET in ns, cached at flow-controller-associate (the :edf key summand); CONTROLLER-lock-guarded
+  (flow-transport-priority 0 :type integer) ; WP-FLOW-EDF-PRIORITY: writer's TRANSPORT_PRIORITY, cached at flow-controller-associate (the :priority base); CONTROLLER-lock-guarded
+  (flow-head-ns 0 :type integer) ; WP-FLOW-EDF-PRIORITY: clock-fn stamp of the OLDEST currently-pending sample (the :edf write-time); set on idle->pending in %flow-signal; CONTROLLER-lock-guarded
+  (flow-last-served-ns 0 :type integer) ; WP-FLOW-EDF-PRIORITY: clock-fn stamp of the last :priority selection (aging baseline: effective = base + floor((now-this)/quantum)); CONTROLLER-lock-guarded
   (samples (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> payload (§8.3.5.4: SN is per-writer; no per-sample composite-key alloc)
   (sample-writers (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> writer EntityId (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)

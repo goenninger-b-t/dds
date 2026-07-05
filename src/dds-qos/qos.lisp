@@ -110,6 +110,11 @@
   (latency-budget +duration-zero+ :type qos-duration)
   (ownership :shared :type (member :shared :exclusive))
   (ownership-strength 0 :type integer)
+  ;; TRANSPORT_PRIORITY (DDS 1.4 §2.2.3.13): a hint on the relative importance of a DataWriter's data;
+  ;; the `value` field is a `long` (int32) with default 0. Writer-local, NOT an RxO policy (no request/
+  ;; offered semantics — absent from qos-rxo-compatible); here it anchors the async flow-controller's
+  ;; :priority scheduling (highest-first, ADR 0016). Not propagated in SEDP (sender-local scheduling only).
+  (transport-priority 0 :type (signed-byte 32))
   (liveliness :automatic :type (member :automatic :manual-by-participant :manual-by-topic))
   (liveliness-lease +duration-infinite+ :type qos-duration)
   (destination-order :by-reception-timestamp

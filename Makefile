@@ -12,7 +12,7 @@ LISP  ?= $(CLASP)
         build-all test-all gate-hotpath gate-types corpus fuzz wire interop \
         square-pub square-sub square-spy large-pub large-sub gated-sub corpus-capture \
         nokey-pub nokey-sub keyed-flat-pub keyed-flat-sub \
-        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-async-flow bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean
+        fastdds-pub fastdds-sub fastdds-tl-probe fastdds-type-probe fastdds-keyed-flat-pub fastdds-keyed-flat-sub bench bench-shmem bench-zerocopy bench-flatdata bench-flatdata-zc-loan bench-flatdata-loan-write bench-zc-loan-lockfree bench-async-flow bench-flow-edf-priority bench-keeplast bench-rtps-message bench-rtps-message-clasp bench-rtps-protection shmem-xproc zc-xproc mem sbom hooks clean
 
 DOMAIN   ?= 0
 COLOR    ?= BLUE
@@ -270,6 +270,15 @@ bench-zc-loan-lockfree:
 bench-async-flow:
 	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
 	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-async-flow :file "bench/report/2026-06-15-wp-async-flow.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
+
+# WP-FLOW-EDF-PRIORITY (ADR 0016; FR-QOS-1, FR-LANG-7): deterministic ordering-quality report for the :edf +
+# :priority scheduling policies vs round-robin — EDF deadline-miss count for mixed LATENCY_BUDGET streams, and
+# :priority high-priority service share + the low-priority aging starvation bound. Oracle = a discrete-event
+# sim over the SHIPPED %flow-policy-* selectors (injected clock). Standard DDS, NOT R6 (ADR 0016). Writes
+# bench/report/2026-07-04-wp-flow-edf-priority.md. SBCL (bench convention; the sim is threadless/impl-agnostic).
+bench-flow-edf-priority:
+	$(SBCL) --eval '(ql:quickload :dds-tests :silent t)' \
+	        --eval '(handler-case (progn (uiop:symbol-call :dds.tests :run-bench-flow-edf-priority :file "bench/report/2026-07-04-wp-flow-edf-priority.md") (uiop:quit 0)) (error (e) (format t "~&~a~%" e) (uiop:quit 1)))'
 
 # WP-KEEPLAST Task E1 (DDS 1.4 §2.2.3.18, FR-LANG-7): HONEST writer-side cost of per-instance
 # KEEP_LAST. Drives dds.rtps.history:hc-add-change directly so the KEEP_LAST-vs-KEEP_ALL delta

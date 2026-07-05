@@ -4345,6 +4345,250 @@
       (dds.disc:stop-node wb) (dds.disc:stop-node rb)))
   t)
 
+;;;; ---- WP-FLOW-EDF-PRIORITY (ADR 0016 deferred scheduling policies; FR-QOS-1) ----
+;;;; The :edf + :priority policies are PURE SELECTION under the controller lock (the token-bucket pacing is
+;;;; orthogonal + untouched). The strongest, most deterministic oracle for a pure selection change is to drive
+;;;; the policy function DIRECTLY over constructed nodes with an injected clock — no threads, no sockets, no
+;;;; timing race — so these run on BOTH impls (unlike the real-thread pacing/RR tests, which Clasp pass-skips).
+;;;; A clock-box is a settable ns counter the controller's clock-fn reads (the same seam the pacing tests use).
+
+(defun* %flow-clock-box ()
+    (function () (values function cons))
+  "A settable ns clock: returns (values CLOCK-FN BOX) where CLOCK-FN reads (car BOX) — advance the clock with
+   (setf (car box) n). Deterministic injected time for the :edf/:priority policy tests (WP-FLOW-EDF-PRIORITY)."
+  (let ((box (list 0)))
+    (values (lambda () (the integer (car box))) box)))
+
+(defun* %flow-fake-node (&key (pending t) (head 0) (budget 0) (priority 0) (last-served 0))
+    (function (&key (:pending t) (:head integer) (:budget integer) (:priority integer) (:last-served integer))
+              dds.disc::disc-node)
+  "A bare disc-node with ONLY the controller-lock-guarded FLOW-* selection slots set (WP-FLOW-EDF-PRIORITY):
+   no socket, no threads — the policy reads only these. HEAD+BUDGET drive the :edf deadline; PRIORITY+
+   LAST-SERVED drive the :priority effective key."
+  (let ((node (dds.disc::%make-disc-node)))
+    (setf (dds.disc::disc-node-flow-pending node) pending
+          (dds.disc::disc-node-flow-head-ns node) head
+          (dds.disc::disc-node-flow-latency-budget-ns node) budget
+          (dds.disc::disc-node-flow-transport-priority node) priority
+          (dds.disc::disc-node-flow-last-served-ns node) last-served)
+    node))
+
+(defun* %flow-policy-controller (clock policy-fn nodes)
+    (function (function function list) dds.disc::flow-controller)
+  "A THREADLESS flow-controller (raw %make-flow-controller — no scheduler spawned) wired to CLOCK + POLICY-FN
+   with NODES already registered, for direct policy-fn exercise (WP-FLOW-EDF-PRIORITY)."
+  (let ((c (dds.disc::%make-flow-controller
+            :bucket (dds.disc::make-flow-token-bucket :tokens-per-period 1 :period 1 :max-burst 1 :clock-fn clock)
+            :policy-fn policy-fn)))
+    (setf (dds.disc::flow-controller-writers c) nodes)
+    c))
+
+(defun* run-flow-transport-priority-qos-test ()
+    (function () t)
+  "WP-FLOW-EDF-PRIORITY (FR-QOS-1, DDS 1.4 §2.2.3.13): the new TRANSPORT_PRIORITY qos slot defaults to 0 and
+   is NOT an RxO policy; flow-controller-associate caches the writer's LATENCY_BUDGET (as ns) + TRANSPORT_PRIORITY
+   onto the node's FLOW-* slots for the :edf/:priority policies. Runs on both impls (no publish/threads race)."
+  (%check :tp-qos-default (= 0 (dds.qos:qos-transport-priority (dds.qos:make-qos)))
+          "TRANSPORT_PRIORITY must default to 0 (DDS 1.4 §2.2.3.13)")
+  (%check :tp-qos-set (= 7 (dds.qos:qos-transport-priority (dds.qos:make-qos :transport-priority 7)))
+          ":transport-priority must round-trip on the qos struct")
+  (%check :tp-qos-not-rxo
+          (null (nth-value 1 (dds.qos:qos-rxo-compatible (dds.qos:make-qos :transport-priority 9)
+                                                         (dds.qos:make-qos :transport-priority 1))))
+          "TRANSPORT_PRIORITY is NOT an RxO policy — a mismatch must not appear in the incompatible list")
+  (let ((node (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x98) :host "127.0.0.1" :port 0))
+        (controller nil))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer node :topic "TP" :type "X"
+                                      :qos (dds.qos:make-qos :reliability :reliable :transport-priority 7
+                                                             :latency-budget (dds.qos:make-qos-duration 0 5000000)))
+           (dds.disc:enable-publisher node)
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 10000 :period 100000000 :max-burst 10000 :scheduling :priority))
+           (dds.disc:flow-controller-associate controller node)
+           (%check :tp-cache-priority (= 7 (dds.disc::disc-node-flow-transport-priority node))
+                   "associate must cache the writer's TRANSPORT_PRIORITY on the node")
+           (%check :tp-cache-budget (= 5000000 (dds.disc::disc-node-flow-latency-budget-ns node))
+                   "associate must cache the writer's LATENCY_BUDGET (ns) on the node"))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node node)))
+  t)
+
+(defun* run-flow-edf-ordering-test ()
+    (function () t)
+  "WP-FLOW-EDF-PRIORITY (ADR 0016; FR-QOS-1): the :edf policy selects the pending node with the MIN deadline
+   (head write-time + LATENCY_BUDGET), draining earliest-first, with budget-0 = most urgent (deadline = write
+   time) and a stable RR tiebreak among equal deadlines. Deterministic direct policy exercise — both impls."
+  (multiple-value-bind (clock box) (%flow-clock-box)
+    (declare (ignore box))
+    ;; Same write-time (100), differing budgets: deadlines D=100 B=110 A=150 C=200 -> drain order D B A C.
+    (let* ((d (%flow-fake-node :head 100 :budget 0))     ; budget-0 -> deadline 100, most urgent
+           (b (%flow-fake-node :head 100 :budget 10))    ; deadline 110
+           (a (%flow-fake-node :head 100 :budget 50))    ; deadline 150
+           (c (%flow-fake-node :head 100 :budget 100))   ; deadline 200
+           (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-edf (list a b c d)))
+           (order '()))
+      (dotimes (i 4)
+        (let ((pick (dds.disc::%flow-policy-edf controller)))
+          (%check :edf-picks-pending pick "EDF must return a pending node while any remain")
+          (push pick order)
+          (setf (dds.disc::disc-node-flow-pending pick) nil)))   ; simulate draining that node
+      (let ((seq (nreverse order)))
+        (%check :edf-order (equal seq (list d b a c))
+                "EDF must drain min-deadline-first: budget-0 (d), then 10 (b), 50 (a), 100 (c)"))
+      (%check :edf-empty (null (dds.disc::%flow-policy-edf controller))
+              "EDF must return NIL when no node is pending")))
+  ;; Tie -> stable RR rotation (equal deadlines never starve each other).
+  (multiple-value-bind (clock box) (%flow-clock-box)
+    (declare (ignore box))
+    (let* ((x (%flow-fake-node :head 100 :budget 0))
+           (y (%flow-fake-node :head 100 :budget 0))
+           (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-edf (list x y))))
+      (let ((p1 (dds.disc::%flow-policy-edf controller))
+            (p2 (dds.disc::%flow-policy-edf controller)))
+        (%check :edf-tie-rotates (and (not (eq p1 p2)) (member p1 (list x y)) (member p2 (list x y)))
+                "equal-deadline nodes must rotate (RR tiebreak), not repeat the same node"))))
+  t)
+
+(defun* %flow-edf-backlog-run (restamp)
+    (function (t) (values (integer 0) (integer 0)))
+  "Sim of TWO continuously-backlogged writers (tight budget 1 vs loose budget 100, both always pending, plan
+   always re-snapshotting) under :edf over 300 turns, one served per turn, clock +1/turn. When RESTAMP, the
+   served node re-snapshots via the SHIPPED %FLOW-HEAD-ADVANCE (the runtime's Finding-1 behavior); when NIL,
+   it does NOT (the pre-fix frozen-head behavior). Returns (values TIGHT-SERVED LOOSE-SERVED)
+   (WP-FLOW-EDF-PRIORITY Finding-1)."
+  (multiple-value-bind (clock box) (%flow-clock-box)
+    (let* ((tight (%flow-fake-node :head 0 :budget 1))
+           (loose (%flow-fake-node :head 0 :budget 100))
+           (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-edf (list tight loose)))
+           (ts 0) (ls 0))
+      (setf (dds.disc::flow-controller-scheduling controller) :edf)
+      (dotimes (turn 300)
+        (setf (car box) turn)
+        (let ((pick (dds.disc::%flow-policy-edf controller)))   ; both stay pending (backlogged); flow-step-state nil ⇒ every pick re-snapshots
+          (cond ((eq pick tight) (incf ts)) ((eq pick loose) (incf ls)))
+          (when restamp (dds.disc::%flow-head-advance controller pick))))   ; the served writer's head-of-line batch drained ⇒ re-stamp its head
+      (values ts ls))))
+
+(defun* run-flow-edf-backlog-test ()
+    (function () t)
+  "WP-FLOW-EDF-PRIORITY (ADR 0016; FR-QOS-1) Finding-1: EDF fidelity under SUSTAINED per-writer backlog. A
+   continuously-pending writer never goes idle, so the idle->pending stamp never re-fires; WITHOUT the
+   re-snapshot re-stamp its frozen head grows ever more urgent and it MONOPOLIZES — a loose-budget writer that
+   is served (thus should re-advance its head) instead freezes-early and starves a tight-budget writer. The fix
+   re-stamps FLOW-HEAD-NS at each plan re-snapshot (%FLOW-HEAD-ADVANCE). This test contrasts both: WITHOUT the
+   re-stamp the tight writer monopolizes and the loose writer is STARVED (served 0 — the RED the pre-fix code
+   fails); WITH it the tight writer is still served PREFERENTIALLY turn-over-turn yet the loose writer makes
+   BOUNDED progress. Deterministic — both impls."
+  (multiple-value-bind (ts-fixed ls-fixed) (%flow-edf-backlog-run t)
+    (multiple-value-bind (ts-buggy ls-buggy) (%flow-edf-backlog-run nil)
+      (%check :edf-backlog-buggy-starves (and (= ls-buggy 0) (= ts-buggy 300))
+              "WITHOUT the re-snapshot re-stamp the tight writer monopolizes and the loose writer STARVES (the bug)")
+      (%check :edf-backlog-fixed-progress (plusp ls-fixed)
+              "WITH the re-stamp the loose writer must make BOUNDED progress (served > 0), not starve")
+      (%check :edf-backlog-fixed-preferential (> ts-fixed (* 10 ls-fixed))
+              (format nil "WITH the re-stamp the tight-budget writer must still be served PREFERENTIALLY (tight ~d >> loose ~d)"
+                      ts-fixed ls-fixed))))
+  t)
+
+(defun* run-flow-priority-ordering-test ()
+    (function () t)
+  "WP-FLOW-EDF-PRIORITY (ADR 0016; FR-QOS-1): the :priority policy selects the pending node with the HIGHEST
+   TRANSPORT_PRIORITY first (aging = 0 at a fixed clock, all just enqueued). Deterministic — both impls."
+  (multiple-value-bind (clock box) (%flow-clock-box)
+    (declare (ignore box))
+    (let* ((p9 (%flow-fake-node :priority 9 :last-served 0))
+           (p5 (%flow-fake-node :priority 5 :last-served 0))
+           (p1 (%flow-fake-node :priority 1 :last-served 0))
+           (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-priority (list p1 p5 p9)))
+           (order '()))
+      (dotimes (i 3)
+        (let ((pick (dds.disc::%flow-policy-priority controller)))
+          (%check :prio-picks-pending pick "priority must return a pending node while any remain")
+          (push pick order)
+          (setf (dds.disc::disc-node-flow-pending pick) nil)))
+      (%check :prio-order (equal (nreverse order) (list p9 p5 p1))
+              "priority must drain highest-TRANSPORT_PRIORITY-first (9, 5, 1)")))
+  t)
+
+(defun* run-flow-priority-aging-test ()
+    (function () t)
+  "WP-FLOW-EDF-PRIORITY (ADR 0016; FR-QOS-1): starvation avoidance. Under a SATURATING high-priority writer
+   (base 10, always pending) a low-priority writer (base 1) STILL wins within the aging bound — effective =
+   base + floor((now - last-served)/quantum); the high writer is served every turn so its aging stays ~1,
+   while the low writer's climbs with elapsed time until it overtakes. Deterministic injected clock — both
+   impls. Contrast: PURE highest-first would starve the low writer forever."
+  (multiple-value-bind (clock box) (%flow-clock-box)
+    (let ((dds.disc::*flow-priority-aging-quantum-ns* 100))   ; small quantum for a short deterministic run
+      (let* ((hi (%flow-fake-node :priority 10 :last-served 0))
+             (lo (%flow-fake-node :priority 1 :last-served 0))
+             (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-priority (list hi lo)))
+             (first-lo -1) (hi-wins 0))
+        (dotimes (turn 20)
+          (setf (car box) (* turn 100))                        ; advance one quantum per turn
+          (let ((pick (dds.disc::%flow-policy-priority controller)))
+            (cond ((eq pick lo) (when (< first-lo 0) (setf first-lo turn)))
+                  ((eq pick hi) (incf hi-wins)))))              ; both stay pending (saturating) — never cleared
+        (format t "~&  [flow-aging] low-priority writer first selected at turn ~d (hi won ~d turns), quantum=100ns~%"
+                first-lo hi-wins)
+        (%check :aging-starved-first (> first-lo 0)
+                "the low-priority writer must be STARVED initially (high-priority wins the first turns)")
+        (%check :aging-eventually-wins (and (>= first-lo 1) (<= first-lo 12))
+                (format nil "aging must let the low writer win within the (P_hi-P_lo) bound; first won at turn ~d" first-lo))
+        (%check :aging-hi-dominates (> hi-wins first-lo)
+                "the high-priority writer must still dominate (win most turns) — aging bounds, not inverts"))))
+  t)
+
+(defun* run-flow-edf-priority-e2e-test ()
+    (function () t)
+  "WP-FLOW-EDF-PRIORITY (ADR 0016): end-to-end wiring smoke — a live :edf controller and a live :priority
+   controller each pace two real writers to best-effort readers and deliver ALL samples (the new policies
+   drive the real scheduler loop, not just the isolated selector). Oracle = completeness + no crash (strict
+   inter-writer ordering is asserted deterministically in the policy tests; e2e order is timing-racy). Real
+   threads ⇒ SBCL only; Clasp pass-skipped (the flow-test NFR-PORT gap, mirrors run-flow-multiwriter-rr-test)."
+  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-edf-priority-e2e-test t))
+  (dolist (scheduling '(:edf :priority))
+    (let* ((n 8)
+           (pa (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x0a))
+           (pb (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x0b))
+           (wa (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x99) :host "127.0.0.1" :port 0))
+           (ra (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xA9) :host "127.0.0.1" :port 0))
+           (wb (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x9a) :host "127.0.0.1" :port 0))
+           (rb (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xAa) :host "127.0.0.1" :port 0))
+           (controller nil))
+      (unwind-protect
+           (progn
+             ;; e2e oracle = delivery completeness (EDF ordering differentiation needs SEDP latency-budget
+             ;; propagation, out of scope + proven deterministically in run-flow-edf-ordering-test); writers
+             ;; carry only the LOCAL TRANSPORT_PRIORITY (not RxO-checked, cached at associate) — budgets stay 0.
+             (dds.disc:add-local-writer wa :topic "FlowSchedA" :type "X"
+                                        :qos (dds.qos:make-qos :reliability :best-effort :transport-priority 8))
+             (dds.disc:enable-publisher wa :history-kind :keep-all)
+             (dds.disc:add-local-reader ra :topic "FlowSchedA" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+             (dds.disc:enable-subscriber ra)
+             (dds.disc:add-local-writer wb :topic "FlowSchedB" :type "X"
+                                        :qos (dds.qos:make-qos :reliability :best-effort :transport-priority 2))
+             (dds.disc:enable-publisher wb :history-kind :keep-all)
+             (dds.disc:add-local-reader rb :topic "FlowSchedB" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+             (dds.disc:enable-subscriber rb)
+             (%flow-match-writer-reader wa ra "FlowSchedA")
+             (%flow-match-writer-reader wb rb "FlowSchedB")
+             (setf controller (dds.disc:make-flow-controller :tokens-per-period 4000 :period 100000000 :max-burst 4000 :scheduling scheduling))
+             (dds.disc:flow-controller-associate controller wa)
+             (dds.disc:flow-controller-associate controller wb)
+             (dotimes (i n) (dds.disc:publish-sample wa pa) (dds.disc:publish-sample wb pb))
+             (loop repeat 1500
+                   until (and (>= (dds.disc:node-sample-count ra) n) (>= (dds.disc:node-sample-count rb) n))
+                   do (sleep 0.005))
+             (%check (list :sched-a-delivered scheduling) (>= (dds.disc:node-sample-count ra) n)
+                     (format nil "~s: writer A's ~d samples must all be delivered" scheduling n))
+             (%check (list :sched-b-delivered scheduling) (>= (dds.disc:node-sample-count rb) n)
+                     (format nil "~s: writer B's ~d samples must all be delivered" scheduling n)))
+        (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+        (dds.disc:stop-node wa) (dds.disc:stop-node ra)
+        (dds.disc:stop-node wb) (dds.disc:stop-node rb))))
+  t)
+
 ;;; WP-ASYNC-FLOW Phase C concurrency/UAF stress (FR-PF-2, ADR 0016 §Teardown): the regression guard for the
 ;;; per-node emit barrier. The shared flow-controller's scheduler picks a node under the lock, RELEASES it,
 ;;; then builds+sends LOCK-FREE; stop-node frees that node's socket/SHMEM/tx-buffers. WITHOUT the barrier a
@@ -5011,6 +5255,148 @@
             (emit s)
             (blocks s))   ; re-run the measured drains into the file stream (keeps the file self-contained)
           (format t "~&  wrote ~a~%" file)))))
+  t)
+
+;;;; ---- WP-FLOW-EDF-PRIORITY bench (ADR 0016; FR-QOS-1, FR-LANG-7) ----
+;;;; Selection ordering is the deliverable, so the oracle is a DETERMINISTIC discrete-event simulation over the
+;;;; REAL policy functions (no threads/timing): (1) EDF vs round-robin deadline-miss count for mixed
+;;;; LATENCY_BUDGET streams under a saturated controller; (2) :priority vs round-robin high-priority service
+;;;; latency + the low-priority starvation bound (max consecutive turns unserved). Both drive the actual
+;;;; %flow-policy-* code with an injected clock, so the numbers are the shipped selectors', not a model of them.
+
+(defun* %flow-bench-edf-sim (policy-fn budgets per-writer service-ns arrival-ns)
+    (function (function list (integer 1) (integer 1) (integer 1)) (values (integer 0) (integer 0) integer))
+  "Discrete-event sim of POLICY-FN over W writers (one per BUDGET, ns) each offering PER-WRITER samples at
+   ARRIVAL-NS spacing, one datagram served per turn costing SERVICE-NS. A sample MISSES if its completion time
+   exceeds its deadline (arrival + budget). Returns (values MISSES SERVED TOTAL-LATENESS-NS). Drives the real
+   %flow-policy-* selector with an injected clock (WP-FLOW-EDF-PRIORITY bench)."
+  (multiple-value-bind (clock box) (%flow-clock-box)
+    (let* ((w (length budgets))
+           (nodes (mapcar (lambda (b) (declare (ignore b)) (%flow-fake-node :pending nil)) budgets))
+           (bvec (coerce budgets 'vector))
+           (nvec (coerce nodes 'vector))
+           (next (make-array w :initial-element 0))          ; index of each writer's next unsent sample
+           (controller (%flow-policy-controller clock policy-fn nodes))
+           (clk 0) (misses 0) (served 0) (lateness 0))
+      (declare (type (integer 0) clk misses served) (type integer lateness))
+      (flet ((arrival (i k) (declare (ignore i)) (* k w arrival-ns))   ; simultaneous per-batch arrivals (W samples every W·arrival ⇒ load 1.0 at arrival=service): the contention that makes ordering matter
+             (deadline (i k) (+ (* k w arrival-ns) (aref bvec i))))
+        (loop while (loop for i below w thereis (< (aref next i) per-writer)) do
+          (setf (car box) clk)
+          (let ((any-ready nil) (next-arrival nil))
+            (dotimes (i w)                                    ; mark writers with an ARRIVED unsent head pending
+              (let ((k (aref next i)) (nd (aref nvec i)))
+                (cond ((>= k per-writer) (setf (dds.disc::disc-node-flow-pending nd) nil))
+                      ((<= (arrival i k) clk)
+                       (setf (dds.disc::disc-node-flow-pending nd) t
+                             (dds.disc::disc-node-flow-head-ns nd) (arrival i k)
+                             (dds.disc::disc-node-flow-latency-budget-ns nd) (aref bvec i)
+                             any-ready t))
+                      (t (setf (dds.disc::disc-node-flow-pending nd) nil)
+                         (setf next-arrival (if next-arrival (min next-arrival (arrival i k)) (arrival i k)))))))
+            (if (not any-ready)
+                (setf clk (or next-arrival clk))              ; idle: jump to the next arrival (no work now)
+                (let* ((pick (funcall policy-fn controller)) (i (position pick nvec)))
+                  (let* ((k (aref next i)) (done (+ clk service-ns)) (dl (deadline i k)))
+                    (incf served)
+                    (when (> done dl) (incf misses) (incf lateness (- done dl)))
+                    (incf (aref next i))
+                    (setf clk done)))))))
+      (values misses served lateness))))
+
+(defun* %flow-bench-priority-sim (policy-fn priorities turns service-ns)
+    (function (function list (integer 1) (integer 1)) (values vector vector))
+  "Saturated (all-backlogged) sim of POLICY-FN over W writers with fixed PRIORITIES, TURNS datagrams served
+   one per turn costing SERVICE-NS. Returns (values SERVED MAX-GAP) per writer, where MAX-GAP is the longest
+   run of consecutive turns a writer went UNSERVED (its observed starvation bound). Drives the real
+   %flow-policy-priority selector with an injected clock (WP-FLOW-EDF-PRIORITY bench)."
+  (multiple-value-bind (clock box) (%flow-clock-box)
+    (let* ((w (length priorities))
+           (nodes (mapcar (lambda (p) (%flow-fake-node :priority p :last-served 0)) priorities))
+           (nvec (coerce nodes 'vector))
+           (controller (%flow-policy-controller clock policy-fn nodes))
+           (served (make-array w :initial-element 0))
+           (gap (make-array w :initial-element 0))
+           (max-gap (make-array w :initial-element 0)))
+      (dotimes (turn turns)
+        (setf (car box) (* turn service-ns))
+        (dolist (nd nodes) (setf (dds.disc::disc-node-flow-pending nd) t))   ; backlogged: always pending
+        (let* ((pick (funcall policy-fn controller)) (win (position pick nvec)))
+          (dotimes (i w)
+            (cond ((= i win) (incf (aref served i)) (setf (aref gap i) 0))
+                  (t (incf (aref gap i))
+                     (when (> (aref gap i) (aref max-gap i)) (setf (aref max-gap i) (aref gap i))))))))
+      (values served max-gap))))
+
+(defun* run-bench-flow-edf-priority (&key (file nil))
+    (function (&key (:file (or null string pathname))) t)
+  "WP-FLOW-EDF-PRIORITY bench (ADR 0016; FR-QOS-1, FR-LANG-7): deterministic ordering-quality report for the
+   :edf + :priority scheduling policies vs the round-robin baseline. Oracle = a discrete-event sim over the
+   REAL %flow-policy-* selectors with an injected clock (the shipped code, not a model). (1) EDF: deadline-miss
+   count for mixed-LATENCY_BUDGET streams under a saturated controller — EDF must miss no more than RR. (2)
+   Priority: high-priority service share + the low-priority STARVATION BOUND (max consecutive unserved turns)
+   — priority favours the high writer yet aging keeps the low writer's gap BOUNDED (RR is fair-but-priority-
+   blind; pure highest-first would starve the low writer unboundedly). Prints markdown; writes FILE when given.
+   Deterministic (no threads) so it is not the Clasp-skipped real-thread kind, but reported under SBCL by
+   convention (a bench is a run-bench-* entry, not a suite test)."
+  (labels ((emit (stream)
+             (format stream "~&# WP-FLOW-EDF-PRIORITY — EDF + priority scheduling vs round-robin (ADR 0016; FR-QOS-1, FR-LANG-7)~%~%")
+             (format stream "Standard DDS, **NOT R6** (ADR 0016 — flow control is wire-invisible). The `:edf` and `:priority` policies are PURE SELECTION under the controller lock (the token-bucket pacing is orthogonal + untouched). Oracle: a DETERMINISTIC discrete-event sim over the SHIPPED `%flow-policy-edf` / `%flow-policy-priority` selectors with an injected clock — the numbers are the real selectors', not a model. Generated by `dds.tests:run-bench-flow-edf-priority` (`make bench-flow-edf-priority`).~%~%")
+             (format stream "| field | value |~%|-------|-------|~%")
+             (format stream "| impl | ~a ~a |~%" (lisp-implementation-type) (lisp-implementation-version))
+             (format stream "| HEAD | ~a |~%" (%bench-git-head))
+             (format stream "| date | ~a |~%" (%bench-date-string))
+             (format stream "| aging quantum | ~d ns |~%~%" dds.disc::*flow-priority-aging-quantum-ns*))
+           (blocks (stream)
+             ;; (1) EDF vs RR deadline misses — mixed budgets, saturated controller.
+             (let* ((budgets (list 10000000 2500000 1500000))   ; 10 ms / 2.5 ms / 1.5 ms — the TIGHT (1.5 ms) stream is last in registration order, so RR's budget-blind rotation serves it LATE
+                    (per 20) (service 1000000) (arrival 1000000)  ; 1 ms service; W simultaneous arrivals per batch ⇒ load 1.0 (EDF-feasible)
+                    (edf (multiple-value-list (%flow-bench-edf-sim #'dds.disc::%flow-policy-edf budgets per service arrival)))
+                    (rr  (multiple-value-list (%flow-bench-edf-sim #'dds.disc::%flow-policy-round-robin budgets per service arrival))))
+               (format stream "## (1) EDF vs round-robin — deadline misses (mixed LATENCY_BUDGET, saturated)~%~%")
+               (format stream "~d writers, budgets ~{~,1f~^/~} ms, ~d samples each, 1 ms service, W simultaneous arrivals per batch (load 1.0, EDF-feasible). A sample MISSES if completion > arrival+budget. The tightest-budget writer is registered LAST, so round-robin's budget-blind rotation reaches it late — EDF reorders by deadline.~%~%"
+                       (length budgets) (mapcar (lambda (b) (/ b 1.0d6)) budgets) per)
+               (format stream "| policy | served | deadline misses | miss rate | total lateness (ms) |~%")
+               (format stream "|--------|--------|-----------------|-----------|---------------------|~%")
+               (format stream "| **:edf** | ~d | ~d | ~,1f% | ~,2f |~%"
+                       (second edf) (first edf) (* 100.0d0 (/ (first edf) (max 1 (second edf)))) (/ (third edf) 1.0d6))
+               (format stream "| round-robin | ~d | ~d | ~,1f% | ~,2f |~%~%"
+                       (second rr) (first rr) (* 100.0d0 (/ (first rr) (max 1 (second rr)))) (/ (third rr) 1.0d6))
+               (format stream "**EDF misses ~d vs round-robin ~d** — EDF orders by deadline, so the tight-budget stream is serviced first and the aggregate miss count is no worse (typically materially better) than budget-blind RR. This is the FR-QOS ordering benefit of the LATENCY_BUDGET-anchored policy.~%~%"
+                       (first edf) (first rr))
+               (assert (<= (first edf) (first rr)) ()
+                       "bench: EDF deadline misses (~d) must be <= round-robin (~d)" (first edf) (first rr))
+               ;; (2) priority vs RR — high-priority share + low-priority starvation bound.
+               (let* ((prios (list 10 5 1)) (turns 300) (svc 1000000))
+                 (multiple-value-bind (pserved pgap) (%flow-bench-priority-sim #'dds.disc::%flow-policy-priority prios turns svc)
+                   (multiple-value-bind (rserved rgap) (%flow-bench-priority-sim #'dds.disc::%flow-policy-round-robin prios turns svc)
+                     (format stream "## (2) :priority vs round-robin — service share + starvation bound~%~%")
+                     (format stream "~d writers, TRANSPORT_PRIORITY ~{~d~^/~}, saturated (all always pending), ~d turns, aging quantum ~d ns / ~d ns service. MAX-GAP = longest run of consecutive turns a writer went UNSERVED (its observed starvation bound).~%~%"
+                             (length prios) prios turns dds.disc::*flow-priority-aging-quantum-ns* svc)
+                     (format stream "| writer (priority) | :priority served | :priority max-gap | round-robin served | round-robin max-gap |~%")
+                     (format stream "|-------------------|------------------|-------------------|--------------------|---------------------|~%")
+                     (loop for p in prios for i from 0 do
+                       (format stream "| prio ~d | ~d | ~d | ~d | ~d |~%"
+                               p (aref pserved i) (aref pgap i) (aref rserved i) (aref rgap i)))
+                     (format stream "~%The high-priority writer (prio 10) takes the LION'S SHARE under `:priority` (~d/~d turns vs RR's fair ~d) — the FR-QOS TRANSPORT_PRIORITY benefit. The low-priority writer (prio 1) is FAVOURED LAST yet its max-gap is BOUNDED at ~d turns (aging lifts its effective priority until it wins) — NOT the unbounded starvation a pure highest-first policy would inflict. RR is priority-blind (every writer's gap ~~ W-1 = ~d).~%~%"
+                             (aref pserved 0) turns (aref rserved 0) (aref pgap (1- (length prios))) (1- (length prios)))
+                     (assert (> (aref pserved 0) (aref rserved 0)) ()
+                             "bench: :priority must give the high-priority writer MORE service than RR")
+                     (assert (< (aref pgap (1- (length prios))) turns) ()
+                             "bench: aging must BOUND the low-priority writer's starvation gap (< all turns)")
+                     (format stream "## Honest framing (FR-LANG-7)~%~%")
+                     (format stream "- Selection is ORTHOGONAL to pacing: `:edf`/`:priority` change only WHICH writer drains next, never the byte rate (all three policies shape to the same aggregate rate) or the wire bytes (ADR 0016).~%")
+                     (format stream "- EDF is keyed on **LATENCY_BUDGET**, not QoS DEADLINE (which is the periodicity/liveliness contract here); LATENCY_BUDGET is a max-delay HINT informing ORDERING, so a saturated bucket may still miss — EDF minimises misses, it does not guarantee zero.~%")
+                     (format stream "- `:priority` favours high-priority writers but AGES pending writers so low-priority progress is bounded (quantum ~d ns); it is priority-WITH-fairness, not strict priority.~%"
+                             dds.disc::*flow-priority-aging-quantum-ns*)
+                     (format stream "- Deterministic sim over the shipped selectors (injected clock); impl ~a ~a.~%"
+                             (lisp-implementation-type) (lisp-implementation-version))))))))
+    (emit *standard-output*)
+    (blocks *standard-output*)
+    (when file
+      (with-open-file (s file :direction :output :if-exists :supersede :if-does-not-exist :create)
+        (emit s) (blocks s))
+      (format t "~&  wrote ~a~%" file)))
   t)
 
 (defun* run-async-decoupled-test ()
