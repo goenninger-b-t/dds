@@ -3948,6 +3948,7 @@
                  ("durability-resurrection-compaction" . run-durability-resurrection-compaction-test)
                  ("durability-sync-delegation"   . run-durability-sync-delegation-test)
                  ("dare-keyhash-aad"             . run-dare-keyhash-aad-test)
+                 ("dare-metadata-conf-3c"        . run-dare-metadata-conf-3c-test)
                  ("dare-epochs-recovery"         . run-dare-epochs-recovery-test)
                  ("durability-seed-backpressure" . run-durability-seed-backpressure-test)
                  ("durability-seen-prune"        . run-durability-seen-prune-test)

@@ -25,6 +25,8 @@
    #:derive-dek
    ;; WP-DURABILITY-MAC-LOG-CHAIN (ADR 0045): cross-restart-stable log-MAC key derivation
    #:derive-log-mac-key
+   ;; WP-DURABILITY-METADATA-CONF-3c (ADR 0025 §10 item 3): cross-restart-stable at-rest metadata key
+   #:derive-meta-key
    #:seal-payload
    #:open-payload
    #:make-record-aad

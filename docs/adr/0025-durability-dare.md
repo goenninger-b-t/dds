@@ -225,6 +225,53 @@ These were formerly "out of scope"; per owner directive they are MUST, each its 
 3. **(3c) Metadata confidentiality** — seal the record metadata (topic/GUID/SN/kind), not just the
    payload; requires an encrypted/independent index so the store can still locate records (the
    current AAD-cleartext model forfeits this). A DARE extension.
+
+   **§10.3 (3c) RESOLVED — AS-BUILT (WP-DURABILITY-METADATA-CONF-3c).** The v2/epoch encrypted-store
+   decorator (`make-encrypted-store` with `:epoch-dir`; both the file AND SQLite backends) now seals
+   the record metadata, not just the payload. No cleartext topic name, writer-GUID, sequence number,
+   or key-hash touches disk — in log filenames, `topics.map`, frame headers, SQLite `topic`/
+   `writer_guid`/`sn`/`key_hash` columns, or the raw file/DB bytes. Mechanism:
+   - **k_meta** — a cross-restart-stable HMAC/AES key derived (`dds.dare:derive-meta-key`, HKDF-SHA384
+     with a distinct `"dds-dare/meta/v1"` info label) as a SIBLING of the ADR-0045 log-MAC key, from
+     the SAME deterministic ML-KEM decapsulation of the persisted `logmac.anchor` ciphertext. A fresh
+     process re-derives k_meta identically (FIPS-203 decapsulation is deterministic) and re-locates +
+     decrypts the sealed metadata. **Zero new key-management surface** (no new key file, no new anchor).
+   - **topic-hash** = `HMAC-SHA-256(k_meta, #x01 ∥ UTF-8(topic))`, hex-encoded, used as the inner
+     store's topic identifier (file log basename / `topics.map` key / SQLite `topic` column). This is
+     the "encrypted/independent index": `store-get-range(topic)` re-hashes the query topic and still
+     locates records by topic equality, while the topic NAME never touches disk.
+   - **Sealed metadata frame** — the real `guid(16) ∥ sn(8 LE) ∥ kind(1) ∥ kh-present(1) ∥ [key-hash(16)]
+     ∥ payload(N)` is sealed together under the per-epoch DEK (`%seal-meta-frame`), with the AEAD AAD =
+     the topic-hash bytes. guid/sn/kind/key-hash are thus GCM-authenticated inside the ciphertext, which
+     **subsumes** the prior `%record-aad-v2` cleartext-key-hash AAD binding.
+   - **Surrogates** — the inner store receives only deterministic surrogates: the topic-hash, a 16-byte
+     guid-surrogate `HMAC(k_meta, #x02 ∥ guid ∥ sn)[0..16)` (unique per (guid,sn) ⇒ preserves the
+     idempotent (guid,sn) dedup), `sn'=0`, NIL key-hash, `kind=:data`. It never sees plaintext metadata.
+   - **Decrypt-then-sort compaction** — the inner store is opened KEEP_ALL (it cannot order the hashed
+     surrogate, and has no real kind/key-hash); `store-get-range` decrypts every blob, recovers the real
+     metadata, sorts by the REAL `(writer-guid, sn)`, then applies the effective KEEP_LAST / settled-drop
+     policy (supplied to `store-open` — the inner store's factory-config `:history-kind`/`:history-depth`
+     is NOT consulted on the encrypted tier, since the inner runs KEEP_ALL; pass the policy to
+     `store-open`, as `service-start` does). Per-topic `store-count topic` is the logical
+     (post-compaction) count; the total `store-count nil` is the inner PHYSICAL count (includes
+     not-yet-physically-reclaimed superseded blobs), so total ≠ Σ per-topic on a KEEP_LAST store — a
+     diagnostic-only divergence. The v3 log-MAC chain (ADR 0045) covers the sealed-metadata frame
+     unchanged (its per-topic seed is keyed on the topic-hash, still per-topic-distinct).
+
+   **Residuals (accepted, documented):**
+   - **Topic-equality linkability** — same topic ⇒ same topic-hash (a deterministic keyed index is
+     required to LOCATE records). Value-confidentiality is met; unlinkability is NOT claimed. An
+     adversary can tell two records share a topic, and count records per topic, without learning the
+     name. (Likewise the GUID-surrogate reveals that two records share a (guid,sn), i.e. are the same
+     retained sample — trivially true anyway.)
+   - **Physical space** — superseded/settled blobs are compacted LOGICALLY (correct reads) but not
+     PHYSICALLY reclaimed on the encrypted tier until `store-purge` (the inner store runs KEEP_ALL,
+     since keep-last-by-real-SN ordering is impossible on a hashed surrogate without leaking SN or an
+     order-preserving construction, both disallowed). A space, not a correctness, tradeoff.
+   - **`store-topics` cross-restart** — the decorator names topics from an in-session reverse map
+     (topic-hash → real name); after a restart the plaintext names are off-disk, so `store-topics`
+     enumerates only topics touched this session. Records are still fully located/served by topic-hash
+     (the durability service matches on discovery, never on a name enumeration).
 4. **In-memory plaintext confidentiality** — minimize plaintext lifetime + `mlock`/zeroize working
    buffers (best-effort). **Honest caveat:** full RAM-plaintext confidentiality is not achievable in
    pure Lisp without OS/hardware support (confidential computing / enclaves / page-locking); this

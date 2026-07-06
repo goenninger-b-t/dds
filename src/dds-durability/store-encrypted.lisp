@@ -250,36 +250,48 @@
                 (values kem-ct (nreverse ids) gf-mac signed)))))))))
 
 (defun* %mint-logmac-anchor (key-provider dir grandfather-ids)
-    (function (dds.dare:key-provider pathname list) (simple-array (unsigned-byte 8) (*)))
+    (function (dds.dare:key-provider pathname list)
+              (values (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))))
   "Mint the log-MAC anchor ONCE (first v3 put): encapsulate to the recipient key, derive the log-MAC
-   key, authenticate GRANDFATHER-IDS (pre-existing legacy topic-ids, exempt from the downgrade check)
-   under that key, and persist (kem-ct + set + MAC). Returns the foreign log-MAC key (caller frees on
-   close). Written once, never updated ⇒ crash-safe, no migration burst (ADR 0045 §3.2)."
+   key AND the at-rest metadata key k_meta (siblings from the SAME shared secret, distinct info labels;
+   ADR 0045 §4.3 / ADR 0025 §10 3c), authenticate GRANDFATHER-IDS (pre-existing legacy topic-ids,
+   exempt from the downgrade check) under the log-MAC key, and persist (kem-ct + set + MAC). Returns
+   (values logmac-key meta-key) — both foreign secrets the caller frees on close. Written once, never
+   updated ⇒ crash-safe, no migration burst (ADR 0045 §3.2). The anchor kem-ct decapsulates
+   deterministically on every restart, so k_meta is cross-restart-stable (ADR 0025 §10 3c)."
   (let ((pub (dds.dare:key-provider-recipient-public-key key-provider)))
     (multiple-value-bind (kem-ct ss) (dds.dare:ml-kem-1024-encapsulate pub)
-      (let ((key (unwind-protect (dds.dare:derive-log-mac-key ss)
-                   (dds.dare:free-secret-octets ss))))
+      (multiple-value-bind (key mkey)
+          (unwind-protect
+               (values (dds.dare:derive-log-mac-key ss) (dds.dare:derive-meta-key ss))
+            (dds.dare:free-secret-octets ss))
         (let* ((signed (%assemble-anchor-signed kem-ct grandfather-ids))
                (gf-mac (%compute-gf-mac key signed)))
           (%write-logmac-anchor dir signed gf-mac))
-        key))))
+        (values key mkey)))))
 
 (defun* %load-logmac-anchor (key-provider dir)
-    (function (dds.dare:key-provider pathname) (values (simple-array (unsigned-byte 8) (*)) list))
+    (function (dds.dare:key-provider pathname)
+              (values (simple-array (unsigned-byte 8) (*)) list (simple-array (unsigned-byte 8) (*))))
   "Load an EXISTING anchor: decapsulate the kem-ct (deterministic ⇒ cross-restart-stable), derive the
-   log-MAC key, and VERIFY the grandfather-set MAC under it — a mismatch SIGNALS (a disk adversary
-   cannot forge/extend the exempt set; ADR 0045 §3.2). Returns (values logmac-key grandfather-ids)."
+   log-MAC key AND the at-rest metadata key k_meta (siblings from the SAME shared secret; ADR 0045
+   §4.3 / ADR 0025 §10 3c), and VERIFY the grandfather-set MAC under the log-MAC key — a mismatch
+   SIGNALS (a disk adversary cannot forge/extend the exempt set; ADR 0045 §3.2). Returns
+   (values logmac-key grandfather-ids meta-key); both keys are foreign secrets the caller frees."
   (multiple-value-bind (kem-ct gf-ids gf-mac signed) (%read-logmac-anchor dir)
     (unless kem-ct
       (error "dds.durability: log-MAC anchor missing in ~a" dir))
-    (let* ((ss  (dds.dare:key-provider-decapsulate key-provider kem-ct))
-           (key (unwind-protect (dds.dare:derive-log-mac-key ss)
-                  (dds.dare:free-secret-octets ss))))
-      (unless (equalp (%compute-gf-mac key signed) gf-mac)
-        (dds.dare:free-secret-octets key)
-        (error "dds.durability: log-MAC anchor grandfather-set MAC mismatch in ~a ~
-                (tamper — refusing to open; ADR 0045 §3.2)" dir))
-      (values key gf-ids))))
+    (let ((ss (dds.dare:key-provider-decapsulate key-provider kem-ct)))
+      (multiple-value-bind (key mkey)
+          (unwind-protect
+               (values (dds.dare:derive-log-mac-key ss) (dds.dare:derive-meta-key ss))
+            (dds.dare:free-secret-octets ss))
+        (unless (equalp (%compute-gf-mac key signed) gf-mac)
+          (dds.dare:free-secret-octets key)
+          (dds.dare:free-secret-octets mkey)
+          (error "dds.durability: log-MAC anchor grandfather-set MAC mismatch in ~a ~
+                  (tamper — refusing to open; ADR 0045 §3.2)" dir))
+        (values key gf-ids mkey)))))
 
 (defun* %derive-logmac-key (key-provider dir)
     (function (dds.dare:key-provider pathname) (simple-array (unsigned-byte 8) (*)))
@@ -435,6 +447,133 @@
            max-id)
       (unless ok (%free-epoch-dek-map dek-map)))))
 
+;;; --- WP-DURABILITY-METADATA-CONF-3c (ADR 0025 §10 item 3): at-rest metadata sealing ---
+;;; The v2/epoch decorator seals the record METADATA (topic/GUID/SN/kind/key-hash), not just the
+;;; payload, so no cleartext topic name, writer-GUID, or sequence number touches disk. Mechanism:
+;;;  (1) k_meta — a cross-restart-stable HMAC/AES key derived (derive-meta-key) as a SIBLING of the
+;;;      ADR-0045 log-MAC key from the SAME deterministic ML-KEM anchor secret; a fresh process
+;;;      re-derives it identically and re-locates + decrypts the sealed metadata.
+;;;  (2) topic-hash = HMAC-SHA-256(k_meta, #x01 ∥ UTF-8(topic)) — deterministic, equality-preserving.
+;;;      Used (hex-encoded) as the inner store's TOPIC identifier (file log basename / topics.map key /
+;;;      SQLite topic column), so store-get-range(topic) still locates records by topic equality while
+;;;      the topic NAME never touches disk. Residual: same-topic⇒same-hash equality-linkability
+;;;      (value-confidentiality is met; unlinkability is NOT claimed — see ADR 0025 §10).
+;;;  (3) The real guid(16) ∥ sn(8 LE) ∥ kind(1) ∥ key-hash(0|16) ride SEALED INSIDE the per-epoch DEK
+;;;      blob (self-describing framing, %seal-meta-frame), recovered on get-range; the AEAD AAD is the
+;;;      topic-hash bytes so a blob cannot be moved to another topic. guid/sn/kind/key-hash are thus
+;;;      GCM-authenticated inside the ciphertext (the %record-aad-v2 key-hash AAD binding is subsumed).
+;;;  (4) The inner store receives ONLY deterministic surrogates: topic-hash, a 16-byte guid-surrogate
+;;;      = HMAC(k_meta,#x02∥guid∥sn)[0..16) (unique per (guid,sn) ⇒ preserves idempotent dedup), sn'=0,
+;;;      NIL key-hash, kind=:data. It never sees plaintext guid/sn/key-hash/kind.
+;;;  (5) KEEP_LAST / settled-instance compaction is DECORATOR-OWNED: the inner store is opened KEEP_ALL
+;;;      (it cannot order by the hashed surrogate, and it has no real kind/key-hash), and get-range
+;;;      decrypts every blob, sorts by the REAL (guid,sn) (%record-guid-sn<), then applies the effective
+;;;      history policy via %compact-topic-records. This keeps get-range results byte-exact and
+;;;      correctly superseded; the residual is that superseded/settled blobs are not PHYSICALLY reclaimed
+;;;      on the encrypted tier until purge (a space, not a correctness, tradeoff — ADR 0025 §10).
+;;;  (6) The v3 log-MAC chain (ADR 0045) covers the sealed-metadata frame unchanged: the chain seed is
+;;;      keyed on the topic-hash (still per-topic-distinct), so per-topic chain-head binding survives.
+
+(defparameter %meta-hex-digits "0123456789abcdef"
+  "Lowercase hex alphabet for the metadata topic-hash string encoding (3c).")
+
+(defun* %meta-hex (octets)
+    (function ((simple-array (unsigned-byte 8) (*))) string)
+  "Lowercase-hex-encode OCTETS into a filesystem/SQL-safe string (the on-disk topic-hash id; 3c)."
+  (let ((hex (make-array (* 2 (length octets)) :element-type 'character)))
+    (loop for b across octets
+          for i from 0 by 2
+          do (setf (aref hex i)      (char %meta-hex-digits (ldb (byte 4 4) b))
+                   (aref hex (1+ i)) (char %meta-hex-digits (ldb (byte 4 0) b))))
+    (coerce hex 'string)))
+
+(defun* %meta-topic-hash-bytes (meta-key topic)
+    (function ((simple-array (unsigned-byte 8) (*)) string) (simple-array (unsigned-byte 8) (*)))
+  "Deterministic keyed topic-hash BYTES: HMAC-SHA-256(k_meta, #x01 ∥ UTF-8(TOPIC)) (ADR 0025 §10 3c).
+   Equality-preserving (same topic ⇒ same hash) so store-get-range still locates a topic's records
+   while the topic NAME never touches disk. Doubles as the AEAD AAD binding a blob to its topic."
+  (let* ((tb (%string->utf8 topic))
+         (in (make-array (1+ (length tb)) :element-type '(unsigned-byte 8))))
+    (setf (aref in 0) #x01)
+    (replace in tb :start1 1)
+    (dds.dare:hmac-sha256 meta-key in)))
+
+(defun* %meta-guid-surrogate (meta-key writer-guid sn)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (16)) (integer 0))
+              (simple-array (unsigned-byte 8) (16)))
+  "Deterministic 16-byte inner-index surrogate for (WRITER-GUID, SN): first 16 bytes of
+   HMAC-SHA-256(k_meta, #x02 ∥ writer-guid(16) ∥ sn(8 LE)) (ADR 0025 §10 3c). Unique per (guid,sn) ⇒
+   preserves the inner store's idempotent (guid,sn) dedup WITHOUT exposing the real guid or sn — both
+   ride sealed inside the blob. The inner store never sees the plaintext writer-guid or sn."
+  (let ((in (make-array 25 :element-type '(unsigned-byte 8))))
+    (setf (aref in 0) #x02)
+    (replace in writer-guid :start1 1 :end1 17)
+    (%put-u64-le in 17 sn)
+    (let ((mac (dds.dare:hmac-sha256 meta-key in))
+          (out (make-array 16 :element-type '(unsigned-byte 8))))
+      (replace out mac :end2 16)
+      out)))
+
+(defconstant +meta-frame-fixed+ 26
+  "Fixed prefix bytes of a sealed metadata frame: guid(16) + sn(8) + kind(1) + kh-present(1) (3c).")
+
+(defun* %seal-meta-frame (writer-guid sn kind key-hash payload)
+    (function ((simple-array (unsigned-byte 8) (16)) (integer 0)
+               (member :data :dispose :unregister)
+               (or null (simple-array (unsigned-byte 8) (16)))
+               (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "Build the self-describing plaintext sealed under the per-epoch DEK (ADR 0025 §10 3c):
+   guid(16) ∥ sn(8 LE) ∥ kind(1) ∥ kh-present(1) ∥ [key-hash(16)] ∥ payload(N). All the real record
+   metadata rides here, so on decrypt %OPEN-META-FRAME recovers each field byte-exact."
+  (let* ((kh-p    (not (null key-hash)))
+         (plen    (length payload))
+         (out-len (+ +meta-frame-fixed+ (if kh-p 16 0) plen))
+         (out     (make-array out-len :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace out writer-guid :end1 16)
+    (%put-u64-le out 16 sn)
+    (setf (aref out 24) (%kind->int kind))
+    (setf (aref out 25) (if kh-p 1 0))
+    (let ((off +meta-frame-fixed+))
+      (when kh-p
+        (replace out key-hash :start1 +meta-frame-fixed+ :end1 (+ +meta-frame-fixed+ 16))
+        (setf off (+ +meta-frame-fixed+ 16)))
+      (replace out payload :start1 off :end1 (+ off plen)))
+    out))
+
+(defun* %open-meta-frame (pt)
+    (function ((simple-array (unsigned-byte 8) (*)))
+              (values (or null (simple-array (unsigned-byte 8) (16))) (integer 0)
+                      (or null (member :data :dispose :unregister))
+                      (or null (simple-array (unsigned-byte 8) (16)))
+                      (or null (simple-array (unsigned-byte 8) (*)))))
+  "Decode a sealed metadata frame (produced by %SEAL-META-FRAME) back to
+   (values guid sn kind key-hash payload). Bounds-checked, fail-closed — returns (values NIL 0 NIL NIL
+   NIL) on any malformed framing (a decode never trusts a length past the buffer, even though the GCM
+   tag already authenticated PT; the operating contract §4)."
+  (let ((n (length pt)))
+    (when (< n +meta-frame-fixed+)
+      (return-from %open-meta-frame (values nil 0 nil nil nil)))
+    (let ((kind (%int->kind (aref pt 24)))
+          (kh-p (= 1 (aref pt 25)))
+          (guid (make-array 16 :element-type '(unsigned-byte 8))))
+      (unless kind
+        (return-from %open-meta-frame (values nil 0 nil nil nil)))
+      (replace guid pt :end1 16 :end2 16)
+      (let ((sn (%get-u64-le pt 16)))
+        (if kh-p
+            (progn
+              (when (< n (+ +meta-frame-fixed+ 16))
+                (return-from %open-meta-frame (values nil 0 nil nil nil)))
+              (let ((kh (make-array 16 :element-type '(unsigned-byte 8)))
+                    (pl (make-array (- n +meta-frame-fixed+ 16) :element-type '(unsigned-byte 8))))
+                (replace kh pt :start2 +meta-frame-fixed+ :end2 (+ +meta-frame-fixed+ 16))
+                (replace pl pt :start2 (+ +meta-frame-fixed+ 16))
+                (values guid sn kind kh pl)))
+            (let ((pl (make-array (- n +meta-frame-fixed+) :element-type '(unsigned-byte 8))))
+              (replace pl pt :start2 +meta-frame-fixed+)
+              (values guid sn kind nil pl)))))))
+
 (defun* make-encrypted-store (inner-store key-provider &key epoch-dir)
     (function (durable-store dds.dare:key-provider &key (:epoch-dir (or null pathname string)))
               durable-store)
@@ -540,7 +679,10 @@
   "Build the v2 (epoch-aware, disk-backed PERSISTENT tier) encrypted-store over EPOCH-DIR.
    Holds an epoch-id -> foreign DEK map (owned for the store lifetime), a lazily-minted current
    epoch (NIL until the first put of a run), a per-current-epoch counter, and the max epoch-id
-   seen (for the next mint = max+1). Constructed CLOSED — store-open loads the persisted epochs."
+   seen (for the next mint = max+1). Constructed CLOSED — store-open loads the persisted epochs.
+   WP-DURABILITY-METADATA-CONF-3c: also seals the record METADATA (topic/GUID/SN/kind/key-hash) —
+   see the module header before make-encrypted-store. k_meta (cross-restart-stable) is derived from
+   the same anchor secret as the log-MAC key; the inner store sees only deterministic surrogates."
   (let* ((dek-map       (make-hash-table :test #'eql))
          (lock          (dds.pal:make-lock "dds-epoch-encrypted-store"))
          (current-epoch nil)
@@ -549,8 +691,46 @@
          (counter       0)
          (err-count     0)
          ;; cross-restart-stable durability log-MAC key (foreign secret, ADR 0045); freed on close
-         (logmac-key    nil))
-    (flet ((%mint-current-epoch ()
+         (logmac-key    nil)
+         ;; cross-restart-stable at-rest metadata key k_meta (foreign secret, ADR 0025 §10 3c); freed on close
+         (meta-key      nil)
+         ;; reverse map topic-hash-string -> real topic name, so store-topics can name this session's
+         ;; topics (the plaintext name is off-disk; cross-restart it is unrecoverable — ADR 0025 §10 3c)
+         (topic-names   (make-hash-table :test #'equal))
+         ;; decorator-owned effective compaction policy (the inner store runs KEEP_ALL; 3c item 5)
+         (eff-hk        :keep-all)
+         (eff-hd        1))
+    (labels ((%th-bytes (topic) (%meta-topic-hash-bytes meta-key topic))
+             (%th (topic) (%meta-hex (%th-bytes topic)))
+             (%drop-hook (r)
+               (let ((n (incf err-count)))
+                 (ignore-errors
+                  (funcall *dare-error-hook*
+                           (format nil "open-payload-v2/meta NIL (~d sealed bytes)"
+                                   (length (durable-record-payload r)))
+                           :dare-open-failed n))))
+             (%locked-get-range (topic)
+               ;; caller holds LOCK + has verified meta-key: locate by topic-hash, decrypt each blob,
+               ;; recover the REAL metadata, sort by real (guid,sn), then apply eff-hk/eff-hd (3c item 5).
+               (let* ((th-bytes (%th-bytes topic))
+                      (th       (%meta-hex th-bytes))
+                      (result   '()))
+                 (setf (gethash th topic-names) topic)
+                 (dolist (r (store-get-range inner-store th))
+                   (let ((opened (dds.dare:open-payload-v2
+                                  (lambda (e) (gethash e dek-map))
+                                  (durable-record-payload r) th-bytes)))
+                     (if opened
+                         (multiple-value-bind (g s knd kh pl) (%open-meta-frame opened)
+                           (if g
+                               (push (make-durable-record
+                                      :topic topic :writer-guid g :sn s
+                                      :key-hash kh :kind knd :payload pl)
+                                     result)
+                               (%drop-hook r)))
+                         (%drop-hook r))))
+                 (%compact-topic-records (sort result #'%record-guid-sn<) eff-hk eff-hd)))
+             (%mint-current-epoch ()
              ;; lazily mint a fresh epoch on the first put of this run (caller holds LOCK).
              (let* ((pub    (dds.dare:key-provider-recipient-public-key key-provider))
                     (new-id (1+ max-epoch-id)))
@@ -579,58 +759,56 @@
              ;; v3->v2 downgrade. A fresh store has no such logs ⇒ empty set ⇒ full protection (§3.2).
              (unless logmac-key
                (let ((gf-ids (%store-grandfather-ids inner-store epoch-dir)))
-                 (setf logmac-key (%mint-logmac-anchor key-provider epoch-dir gf-ids))
+                 (multiple-value-bind (lk mk) (%mint-logmac-anchor key-provider epoch-dir gf-ids)
+                   (setf logmac-key lk)
+                   (setf meta-key   mk))
                  (%install-logmac-oracle inner-store logmac-key gf-ids)))
              t))
       (%make-durable-store
        :name :encrypted-persistent
        :put
+       ;; 3c: seal topic/GUID/SN/kind/key-hash INTO the blob; hand the inner store only surrogates.
        (lambda (topic writer-guid sn key-hash kind payload)
          (dds.pal:with-lock (lock)
-           (%ensure-logmac)
+           (%ensure-logmac)                     ; also derives k_meta on the first put of a fresh store
            (unless current-epoch
              (%mint-current-epoch))
            (incf counter)
            (when (>= counter +max-nonce-counter+)
              (error "dds.durability: per-epoch nonce counter exhausted (2^96) — restart to mint a fresh epoch"))
-           (let* ((nonce  (%render-nonce counter))
-                  (aad    (%record-aad-v2 topic writer-guid sn kind key-hash))
-                  (sealed (dds.dare:seal-payload-v2 current-dek current-epoch nonce aad payload)))
-             (store-put inner-store topic writer-guid sn key-hash kind sealed))))
+           (let* ((th-bytes (%th-bytes topic))
+                  (th       (%meta-hex th-bytes))
+                  (guid*    (%meta-guid-surrogate meta-key writer-guid sn))
+                  (frame    (%seal-meta-frame writer-guid sn kind key-hash payload))
+                  (nonce    (%render-nonce counter))
+                  ;; AAD = topic-hash bytes: binds the blob to its topic (guid/sn/kind/key-hash are now
+                  ;; GCM-authenticated INSIDE the ciphertext, so %record-aad-v2's field binding is subsumed)
+                  (sealed   (dds.dare:seal-payload-v2 current-dek current-epoch nonce th-bytes frame)))
+             (setf (gethash th topic-names) topic)
+             (store-put inner-store th guid* 0 nil :data sealed))))
        :get-range
        (lambda (topic)
          (dds.pal:with-lock (lock)
-           (let ((result '()))
-             (dolist (r (store-get-range inner-store topic))
-               (let* ((aad    (%record-aad-v2
-                               (durable-record-topic r)
-                               (durable-record-writer-guid r)
-                               (durable-record-sn r)
-                               (durable-record-kind r)
-                               (durable-record-key-hash r)))
-                      (opened (dds.dare:open-payload-v2
-                               (lambda (e) (gethash e dek-map))
-                               (durable-record-payload r) aad)))
-                 (if opened
-                     (push (make-durable-record
-                            :topic      (durable-record-topic r)
-                            :writer-guid (durable-record-writer-guid r)
-                            :sn         (durable-record-sn r)
-                            :key-hash   (durable-record-key-hash r)
-                            :kind       (durable-record-kind r)
-                            :payload    opened)
-                           result)
-                     (let ((n (incf err-count)))
-                       (ignore-errors
-                        (funcall *dare-error-hook*
-                                 (format nil "open-payload-v2 NIL (topic ~a, ~d sealed bytes)"
-                                         (durable-record-topic r) (length (durable-record-payload r)))
-                                 :dare-open-failed n))))))
-             (nreverse result))))
+           (if (null meta-key) '() (%locked-get-range topic))))
        :topics
-       (lambda () (store-topics inner-store))
+       ;; 3c: the inner store holds topic-HASHES; name only this session's known topics (plaintext
+       ;; names are off-disk, so cross-restart enumeration by name is unavailable — ADR 0025 §10).
+       (lambda ()
+         (dds.pal:with-lock (lock)
+           (let ((result '()))
+             (dolist (h (store-topics inner-store))
+               (let ((real (gethash h topic-names)))
+                 (when real (push real result))))
+             result)))
        :purge
-       (lambda (topic) (store-purge inner-store topic))
+       (lambda (topic)
+         (dds.pal:with-lock (lock)
+           (if (null meta-key)
+               t
+               (let* ((th-bytes (%th-bytes topic))
+                      (th       (%meta-hex th-bytes)))
+                 (remhash th topic-names)
+                 (store-purge inner-store th)))))
        :open
        (lambda (history-kind history-depth)
          (dds.pal:with-lock (lock)
@@ -640,6 +818,12 @@
            (setf current-dek   nil)
            (setf counter       0)
            (setf logmac-key    (dds.dare:free-secret-octets logmac-key))
+           ;; 3c: free k_meta + drop the session name map; capture the effective compaction policy
+           ;; (the decorator owns compaction — the inner store is opened KEEP_ALL below).
+           (setf meta-key (dds.dare:free-secret-octets meta-key))
+           (clrhash topic-names)
+           (when history-kind  (setf eff-hk history-kind))
+           (when history-depth (setf eff-hd history-depth))
            ;; drop any prior-open oracle (it closes over the just-freed key); reinstalled below. This
            ;; also makes a pathological "v3 frames but missing anchor" fail closed (no key) at replay,
            ;; never a use-after-free (ADR 0045 fail-closed posture).
@@ -657,15 +841,19 @@
            ;;    minted lazily on the first v3 put (%ensure-logmac), keeping "anchor present" == "a v3
            ;;    frame exists". (A store whose anchor was DELETED but still holds v3 frames fails here
            ;;    at replay via key-absent, never opening as bogus migration.)
+           ;; 3c: the inner store is ALWAYS opened KEEP_ALL (it cannot order/interpret the hashed
+           ;; surrogates); the decorator applies eff-hk/eff-hd at get-range post-decrypt.
            (if (probe-file (%logmac-anchor-path epoch-dir))
-               (multiple-value-bind (key gf-ids) (progn
-                                                   (dds.dare:key-provider-open key-provider)
-                                                   (%load-logmac-anchor key-provider epoch-dir))
+               (multiple-value-bind (key gf-ids mkey)
+                   (progn
+                     (dds.dare:key-provider-open key-provider)
+                     (%load-logmac-anchor key-provider epoch-dir))
                  (setf logmac-key key)
+                 (setf meta-key   mkey)
                  (%install-logmac-oracle inner-store key gf-ids)
-                 (store-open inner-store history-kind history-depth))
+                 (store-open inner-store :keep-all nil))
                (progn
-                 (store-open inner-store history-kind history-depth)
+                 (store-open inner-store :keep-all nil)
                  (dds.dare:key-provider-open key-provider)))
            ;; re-derive every persisted epoch's DEK; current stays NIL until the first put
            (setf max-epoch-id (%load-epoch-deks key-provider epoch-dir dek-map))
@@ -677,14 +865,21 @@
            (%free-epoch-dek-map dek-map)
            (setf current-epoch nil)
            (setf current-dek   nil)
-           ;; zeroize + free the foreign log-MAC key and drop the oracle (it points at freed bytes); §6
+           ;; zeroize + free the foreign log-MAC key + k_meta and drop the oracle (points at freed bytes); §6
            (setf logmac-key (dds.dare:free-secret-octets logmac-key))
+           (setf meta-key   (dds.dare:free-secret-octets meta-key))
            (store-set-chain-mac-fn inner-store nil)
            (dds.dare:key-provider-close key-provider)
            ;; close the inner store last: flush + persist its streams/topics.map (spec §5)
            (store-close inner-store)
            t))
        :count-fn
-       (lambda (topic) (store-count inner-store topic))
+       ;; 3c: per-topic count is LOGICAL (post-compaction, matching get-range), since the inner store
+       ;; retains superseded blobs physically (KEEP_ALL); total count (NIL) is the inner physical count.
+       (lambda (topic)
+         (dds.pal:with-lock (lock)
+           (if topic
+               (if (null meta-key) 0 (length (%locked-get-range topic)))
+               (store-count inner-store nil))))
        :sync
        (lambda () (store-sync inner-store))))))

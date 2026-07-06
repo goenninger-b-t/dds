@@ -1,5 +1,39 @@
 (in-package #:dds.tests)
 
+;;; --- WP-DURABILITY-METADATA-CONF-3c test helpers ---
+;;; After 3c, an encrypted store puts records under the k_meta topic-HASH, not the plaintext topic
+;;; name. These helpers derive k_meta from the persisted log-MAC anchor (same deterministic path the
+;;; store uses) so tests that reach the raw on-disk state (log filename / SQLite topic column) can
+;;; compute the actual on-disk identifiers for a real topic.
+
+(defun* %enc-meta-key (d-dir k-dir)
+    (function (t t) (simple-array (unsigned-byte 8) (*)))
+  "Derive the encrypted-store k_meta from the persisted anchor (3c test helper). Caller frees it."
+  (let ((kp (dds.dare:make-file-key-provider :dir k-dir)))
+    (dds.dare:key-provider-open kp)
+    (unwind-protect
+         (multiple-value-bind (lk gf mk)
+             (dds.durability::%load-logmac-anchor kp (uiop:ensure-directory-pathname d-dir))
+           (declare (ignore gf))
+           (dds.dare:free-secret-octets lk)
+           mk)
+      (dds.dare:key-provider-close kp))))
+
+(defun* %enc-topic-hash (d-dir k-dir topic)
+    (function (t t string) string)
+  "The on-disk topic-hash HEX string an encrypted store uses for TOPIC (the SQLite topic column and
+   the pre-%topic->id id; 3c). Derives + frees k_meta from the anchor."
+  (let ((mk (%enc-meta-key d-dir k-dir)))
+    (unwind-protect
+         (dds.durability::%meta-hex (dds.durability::%meta-topic-hash-bytes mk topic))
+      (dds.dare:free-secret-octets mk))))
+
+(defun* %enc-topic-tid (d-dir k-dir topic)
+    (function (t t string) string)
+  "The on-disk file-store log basename (tid) an encrypted store uses for TOPIC (3c): %topic->id of
+   the k_meta topic-hash HEX string."
+  (dds.durability::%topic->id (%enc-topic-hash d-dir k-dir topic)))
+
 (defun* run-durability-store-test ()
     (function () t)
   "In-memory durable-store: put/get-range ordering, idempotent re-put, topic isolation, bounded reject."
@@ -2042,13 +2076,19 @@
                    do (%check (intern (format nil "SQ-DARE-EXACT-~d" i) :keyword)
                               (equalp (%make-small-payload i) (dds.durability:durable-record-payload r))
                               "decrypted payload byte-exact")))
-           ;; sync to flush the WAL into the DB file, then scan: no plaintext sample on disk
+           ;; sync to flush the WAL into the DB file, then scan: no plaintext sample AND (3c) no
+           ;; plaintext topic NAME or writer-GUID bytes on disk (the metadata is sealed too).
            (dds.durability:store-sync store)
-           (let ((raw (%sqlite-read-db-bytes tmp-dir)))
+           (let ((raw   (%sqlite-read-db-bytes tmp-dir))
+                 (tname (map '(simple-array (unsigned-byte 8) (*)) #'char-code "Enc")))
              (dotimes (i n)
                (%check (intern (format nil "SQ-DARE-NO-PLAINTEXT-~d" i) :keyword)
                        (not (%pst-subseq-present-p raw (%make-small-payload (1+ i))))
-                       "DARE at-rest: plaintext sample must not appear in the DB file"))))
+                       "DARE at-rest: plaintext sample must not appear in the DB file"))
+             (%check :sq-dare-no-topic-name (not (%pst-subseq-present-p raw tname))
+                     "3c: the topic NAME 'Enc' must not appear in the SQLite DB bytes")
+             (%check :sq-dare-no-guid (not (%pst-subseq-present-p raw g0))
+                     "3c: the writer-GUID bytes must not appear in the SQLite topic/writer_guid columns or raw bytes")))
       (ignore-errors (dds.durability:store-close store))
       (when (uiop:directory-exists-p tmp-dir)
         (uiop:delete-directory-tree tmp-dir :validate t))))
@@ -3270,7 +3310,10 @@
                   (enc-st2 (dds.durability:make-encrypted-store store2 kp2 :epoch-dir tmp-dir)))
              (unwind-protect
                   (progn
-                    (dds.durability:store-open enc-st2)
+                    ;; 3c: the encrypted decorator owns compaction; the effective KEEP_LAST policy is
+                    ;; supplied to store-open (exactly as service-start does), not inferred from the
+                    ;; inner file-store's factory config.
+                    (dds.durability:store-open enc-st2 :keep-last d)
                     (%check :kl-restart-count
                             (= d (dds.durability:store-count enc-st2 topic))
                             (format nil "after :keep-last ~d reopen: expected ~d records, got ~d"
@@ -3595,16 +3638,16 @@
                 (dds.durability:make-file-store :dir d)
                 (dds.dare:make-file-key-provider :dir k)
                 :epoch-dir d))
-             (%tlog (d)
+             (%tlog (d k)
                (merge-pathnames (make-pathname :directory '(:relative "topics")
-                                               :name (dds.durability::%topic->id "T") :type "log")
+                                               :name (%enc-topic-tid d k "T") :type "log")
                                 d))
-             (%read (d)
-               (with-open-file (s (%tlog d) :element-type '(unsigned-byte 8))
+             (%read (d k)
+               (with-open-file (s (%tlog d k) :element-type '(unsigned-byte 8))
                  (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
                    (read-sequence v s) v)))
-             (%write (d bytes)
-               (with-open-file (s (%tlog d) :direction :output :element-type '(unsigned-byte 8)
+             (%write (d k bytes)
+               (with-open-file (s (%tlog d k) :direction :output :element-type '(unsigned-byte 8)
                                             :if-exists :supersede)
                  (write-sequence bytes s)))
              (%put-n (d k n)
@@ -3670,22 +3713,22 @@
                          (prog1 (= 3 (dds.durability:store-count s "T"))
                            (dds.durability:store-close s)))
                        "non-vacuous control: the untampered v3 log opens clean with 3 records")
-               (let* ((raw (%read d)) (len (length raw)))
+               (let* ((raw (%read d k)) (len (length raw)))
                  (%check :mlc-frame-uniform (zerop (mod len 3))
                          "test setup: 3 equal-size v3 frames (uniform payload)")
                  (let ((fs (truncate len 3)))
                    ;; DELETE the interior frame 1
                    (let ((dd (%tmp "del-d")) (dk (%tmp "del-k")))
                      (%put-n dd dk 3)
-                     (%write dd (concatenate '(simple-array (unsigned-byte 8) (*))
-                                             (subseq (%read dd) 0 fs) (subseq (%read dd) (* 2 fs))))
+                     (%write dd dk (concatenate '(simple-array (unsigned-byte 8) (*))
+                                             (subseq (%read dd dk) 0 fs) (subseq (%read dd dk) (* 2 fs))))
                      (%check :mlc-tamper-delete (%open-errs-p dd dk)
                              "interior record DELETE must break the chain → store-open fails loud"))
                    ;; REORDER frames 0 and 1
                    (let ((dd (%tmp "reo-d")) (dk (%tmp "reo-k")))
                      (%put-n dd dk 3)
-                     (let ((r (%read dd)))
-                       (%write dd (concatenate '(simple-array (unsigned-byte 8) (*))
+                     (let ((r (%read dd dk)))
+                       (%write dd dk (concatenate '(simple-array (unsigned-byte 8) (*))
                                                (subseq r fs (* 2 fs)) (subseq r 0 fs)
                                                (subseq r (* 2 fs)))))
                      (%check :mlc-tamper-reorder (%open-errs-p dd dk)
@@ -3696,20 +3739,20 @@
                    ;; left is the keyed MAC — proving the MAC (not a CRC) catches the substitution.
                    (let ((dd (%tmp "sub-d")) (dk (%tmp "sub-k")))
                      (%put-n dd dk 3)
-                     (let* ((b (copy-seq (%read dd)))
+                     (let* ((b (copy-seq (%read dd dk)))
                             (hdr-off (+ fs 31))          ; frame 1's header-CRC field
                             (crc-off (- (* 2 fs) 4)))    ; frame 1's frame-CRC field
                        (setf (aref b (+ fs 35)) (logxor (aref b (+ fs 35)) #xFF))
                        (dds.durability::%put-u32-le b hdr-off (dds.durability::%crc32 b fs hdr-off))
                        (dds.durability::%put-u32-le b crc-off (dds.durability::%crc32 b fs crc-off))
-                       (%write dd b))
+                       (%write dd dk b))
                      (%check :mlc-tamper-substitute (%open-errs-p dd dk)
                              "record SUBSTITUTION (BOTH CRCs recomputed) must fail the keyed MAC → store-open fails loud"))
                    ;; INSERT a forged (duplicated) frame mid-chain
                    (let ((dd (%tmp "ins-d")) (dk (%tmp "ins-k")))
                      (%put-n dd dk 3)
-                     (let ((r (%read dd)))
-                       (%write dd (concatenate '(simple-array (unsigned-byte 8) (*))
+                     (let ((r (%read dd dk)))
+                       (%write dd dk (concatenate '(simple-array (unsigned-byte 8) (*))
                                                (subseq r 0 fs) (subseq r 0 fs) (subseq r fs))))
                      (%check :mlc-tamper-insert (%open-errs-p dd dk)
                              "record INSERTION must break the chain → store-open fails loud"))
@@ -3721,7 +3764,7 @@
                    ;; any compaction could launder the tampered set into a fresh chain (ADR 0045 §3.2).
                    (let ((dd (%tmp "dg-d")) (dk (%tmp "dg-k")))
                      (%put-n dd dk 3)
-                     (let* ((raw  (%read dd))
+                     (let* ((raw  (%read dd dk))
                             (plen (- fs 71))           ; v3 no-kh frame = 35 hdr + plen + 32 mac + 4 crc
                             (body (+ 35 plen))          ; v2 no-kh frame prefix = header + payload
                             (frames '()))
@@ -3733,7 +3776,7 @@
                            (dds.durability::%put-u32-le v2 31 (dds.durability::%crc32 v2 0 31))
                            (dds.durability::%put-u32-le v2 body (dds.durability::%crc32 v2 0 body))
                            (push v2 frames)))
-                       (%write dd (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
+                       (%write dd dk (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
                                          (nreverse frames))))
                      (%check :mlc-downgrade-fails-loud (%open-errs-p dd dk)
                              "a full v3->v2 keyless downgrade of a chain-committed log MUST fail the open (C1)"))
@@ -3741,13 +3784,13 @@
                    ;; by the real v3 frames (a v3 TAIL proves the chain is active) — still opens.
                    (let ((dd (%tmp "mix-d")) (dk (%tmp "mix-k")))
                      (%put-n dd dk 3)
-                     (let* ((v3log  (%read dd))
+                     (let* ((v3log  (%read dd dk))
                             (v2rec  (dds.durability::make-durable-record
                                      :topic "T" :writer-guid g0 :sn 99 :key-hash nil :kind :data
                                      :payload (funcall pay 5)))
                             (v2frame (dds.durability::%frame-record-versioned
                                       v2rec dds.durability::+frame-version-v2+)))
-                       (%write dd (concatenate '(simple-array (unsigned-byte 8) (*)) v2frame v3log)))
+                       (%write dd dk (concatenate '(simple-array (unsigned-byte 8) (*)) v2frame v3log)))
                      (%check :mlc-mixed-v3-tail-opens (not (%open-errs-p dd dk))
                              "a mixed v2-prefix + v3-tail log still opens (migration not false-rejected)")))))
              ;; (4) cross-restart / epoch boundary
@@ -3771,12 +3814,12 @@
                  (dds.durability:store-close s))
                ;; tamper an epoch-1 frame's PAYLOAD (past header-CRC coverage) + recompute BOTH CRCs →
                ;; only the keyed MAC is left → chain break caught across the epoch boundary
-               (let* ((raw (%read d)) (fs (truncate (length raw) 4)) (b (copy-seq raw))
+               (let* ((raw (%read d k)) (fs (truncate (length raw) 4)) (b (copy-seq raw))
                       (hdr-off (+ fs 31)) (crc-off (- (* 2 fs) 4)))
                  (setf (aref b (+ fs 35)) (logxor (aref b (+ fs 35)) #xFF))
                  (dds.durability::%put-u32-le b hdr-off (dds.durability::%crc32 b fs hdr-off))
                  (dds.durability::%put-u32-le b crc-off (dds.durability::%crc32 b fs crc-off))
-                 (%write d b)
+                 (%write d k b)
                  (%check :mlc-xr-tamper (%open-errs-p d k)
                          "tampering an epoch-1 frame (both CRCs fixed) is caught across the epoch boundary → fails loud")))
              ;; (5) key-absent / wrong-key fail-closed at store-open
@@ -3794,8 +3837,8 @@
              ;; (6) honest torn tail recovers; whole-frame tail truncation is the documented residual
              (let ((d (%tmp "tt-d")) (k (%tmp "tt-k")))
                (%put-n d k 3)
-               (let ((sz (length (%read d))))
-                 (dds.durability::%truncate-file (%tlog d) (- sz 4)))    ; tear the last frame's CRC
+               (let ((sz (length (%read d k))))
+                 (dds.durability::%truncate-file (%tlog d k) (- sz 4)))    ; tear the last frame's CRC
                (%check :mlc-torn-recover
                        (let ((s (%mk d k)))
                          (dds.durability:store-open s)                   ; must NOT error
@@ -3803,8 +3846,8 @@
                            (dds.durability:store-close s)))
                        "honest torn tail must truncate-recover to 2 records (no error)")
                ;; residual (ADR 0045 §7): dropping a COMPLETE valid frame yields a shorter valid chain
-               (let ((fs (truncate (length (%read d)) 2)))
-                 (dds.durability::%truncate-file (%tlog d) fs)
+               (let ((fs (truncate (length (%read d k)) 2)))
+                 (dds.durability::%truncate-file (%tlog d k) fs)
                  (%check :mlc-tail-truncation-residual
                          (let ((s (%mk d k)))
                            (dds.durability:store-open s)                 ; opens CLEAN — NOT detected
@@ -3838,7 +3881,7 @@
                  (dds.durability:store-close s))
                ;; downgrade the born-chained topic B to keyless v2 (both CRCs fixed) → still fails loud
                (let* ((blog (merge-pathnames (make-pathname :directory '(:relative "topics")
-                                                            :name (dds.durability::%topic->id "B") :type "log") d))
+                                                            :name (%enc-topic-tid d k "B") :type "log") d))
                       (raw  (with-open-file (fin blog :element-type '(unsigned-byte 8))
                               (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
                                 (read-sequence v fin) v)))
@@ -3929,7 +3972,7 @@
                  (dds.durability:store-close s)))
              (%open-errs-p (d k &optional (hk :keep-all) (hd 1))
                (let ((s (%mk d k hk hd)))
-                 (handler-case (progn (dds.durability:store-open s)
+                 (handler-case (progn (dds.durability:store-open s hk hd)
                                       (ignore-errors (dds.durability:store-close s)) nil)
                    (error () t))))
              (%raw (d thunk)
@@ -3965,7 +4008,7 @@
                (%raw d (lambda (db)
                          (sqlite:execute-non-query
                           db "UPDATE record SET payload=? WHERE topic=? AND chain_seq=?"
-                          (make-array 8 :element-type '(unsigned-byte 8) :initial-element #xEE) "T" 1)))
+                          (make-array 8 :element-type '(unsigned-byte 8) :initial-element #xEE) (%enc-topic-hash d k "T") 1)))
                (%check :sqmac-tamper-payload (%open-errs-p d k)
                        "interior payload UPDATE via direct SQL must fail the keyed MAC → store-open fails loud"))
              ;; UPDATE an interior mac (row chain_seq=1) → stored mac ≠ recomputed
@@ -3974,7 +4017,7 @@
                (%raw d (lambda (db)
                          (sqlite:execute-non-query
                           db "UPDATE record SET mac=? WHERE topic=? AND chain_seq=?"
-                          (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0) "T" 1)))
+                          (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0) (%enc-topic-hash d k "T") 1)))
                (%check :sqmac-tamper-mac (%open-errs-p d k)
                        "interior mac UPDATE via direct SQL must fail verification → store-open fails loud"))
              ;; DELETE an interior row (chain_seq=1) → chain break over the survivors
@@ -3982,23 +4025,23 @@
                (%put-n d k 3)
                (%raw d (lambda (db)
                          (sqlite:execute-non-query
-                          db "DELETE FROM record WHERE topic=? AND chain_seq=?" "T" 1)))
+                          db "DELETE FROM record WHERE topic=? AND chain_seq=?" (%enc-topic-hash d k "T") 1)))
                (%check :sqmac-tamper-delete (%open-errs-p d k)
                        "interior row DELETE via direct SQL must break the chain → store-open fails loud"))
              ;; REORDER rows 0 and 1 by swapping their chain_seq → running chain mismatches
              (let ((d (%tmp "reo-d")) (k (%tmp "reo-k")))
                (%put-n d k 3)
                (%raw d (lambda (db)
-                         (sqlite:execute-non-query db "UPDATE record SET chain_seq=999 WHERE topic=? AND chain_seq=0" "T")
-                         (sqlite:execute-non-query db "UPDATE record SET chain_seq=0 WHERE topic=? AND chain_seq=1" "T")
-                         (sqlite:execute-non-query db "UPDATE record SET chain_seq=1 WHERE topic=? AND chain_seq=999" "T")))
+                         (sqlite:execute-non-query db "UPDATE record SET chain_seq=999 WHERE topic=? AND chain_seq=0" (%enc-topic-hash d k "T"))
+                         (sqlite:execute-non-query db "UPDATE record SET chain_seq=0 WHERE topic=? AND chain_seq=1" (%enc-topic-hash d k "T"))
+                         (sqlite:execute-non-query db "UPDATE record SET chain_seq=1 WHERE topic=? AND chain_seq=999" (%enc-topic-hash d k "T"))))
                (%check :sqmac-tamper-reorder (%open-errs-p d k)
                        "row REORDER (chain_seq swap) via direct SQL must break the chain → store-open fails loud"))
              ;; (3) downgrade (required): NULL every mac of a non-grandfathered topic
              (let ((d (%tmp "dg-d")) (k (%tmp "dg-k")))
                (%put-n d k 3)
                (%raw d (lambda (db)
-                         (sqlite:execute-non-query db "UPDATE record SET mac=NULL WHERE topic=?" "T")))
+                         (sqlite:execute-non-query db "UPDATE record SET mac=NULL WHERE topic=?" (%enc-topic-hash d k "T"))))
                (%check :sqmac-downgrade-fails (%open-errs-p d k)
                        "a full v3->keyless downgrade (mac NULL on a non-grandfathered topic) fails the open"))
              ;; (4) NO-FALSE-REJECT — KEEP_LAST store compacts+recomputes; reopens clean repeatedly
@@ -4012,7 +4055,7 @@
                (%check :sqmac-nfr-open2 (not (%open-errs-p d k :keep-last 1))
                        "KEEP_LAST chained store reopens clean AGAIN (#2 — chain-recompute-on-compaction holds)")
                (let ((s (%mk d k :keep-last 1)))
-                 (dds.durability:store-open s)
+                 (dds.durability:store-open s :keep-last 1)
                  (let ((recs (dds.durability:store-get-range s "T")))
                    (%check :sqmac-nfr-count (= 1 (length recs))
                            "KEEP_LAST kept exactly depth=1 survivor after repeated reopen")
@@ -4055,7 +4098,7 @@
                          "born-chained topic B chain-verifies + decrypts alongside the dormant legacy topic A")
                  (dds.durability:store-close s))
                (%raw d (lambda (db)
-                         (sqlite:execute-non-query db "UPDATE record SET mac=NULL WHERE topic=?" "B")))
+                         (sqlite:execute-non-query db "UPDATE record SET mac=NULL WHERE topic=?" (%enc-topic-hash d k "B"))))
                (%check :sqmac-gf-b-downgrade (%open-errs-p d k)
                        "downgrading born-chained B fails the open even though legacy A is grandfathered"))
              ;; (6) NIL-oracle regression: bare store round-trips, mac column stays NULL

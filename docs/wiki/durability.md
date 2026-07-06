@@ -527,9 +527,10 @@ The decorator implements the NIST envelope-encryption pattern with the CNSA-2.0 
   plaintext. `store-get-range` **drops** a record that fails to open (counts it, fires
   `dds.durability:*dare-error-hook*`).
 
-Only the CDR payload is encrypted; record metadata stays cleartext-authenticated (metadata
-confidentiality is a MUST follow-on, ADR 0025 §10). **DARE is at-rest only — it adds nothing to the
-wire** (data-in-transit is the separate P6 DDS-Security work).
+For the in-memory TRANSIENT tier (v1, no `:epoch-dir`) only the CDR payload is encrypted; the record
+metadata stays cleartext-authenticated. The **disk-backed PERSISTENT tier now also seals the metadata**
+(topic/GUID/SN/kind/key-hash) — see §8.9 (WP-DURABILITY-METADATA-CONF-3c). **DARE is at-rest only — it
+adds nothing to the wire** (data-in-transit is the separate P6 DDS-Security work).
 
 ### 7.2 Secure-store factory — worked example
 
@@ -855,9 +856,9 @@ PERSISTENT 3b protects **stored payloads on disk**: **confidentiality** (sealed)
 authenticity** of the payload AND its AAD-bound metadata (topic/guid/sn/kind/key-hash) — any flipped
 byte fails the GCM tag, fail-closed — and it survives restart. It provides **record-sequence
 integrity** via the keyed v3 MAC chain (§8.5): interior delete/reorder/substitution/insertion are
-tamper-evident at store-open. It does **not** yet detect **malicious whole-tail truncation** (the
-deferred sealed-anchor residual, ADR 0045 §7) nor provide metadata **confidentiality** (metadata is
-cleartext on disk). The follow-ons
+tamper-evident at store-open. It **also seals the record metadata** (topic/GUID/SN/kind/key-hash) at
+rest — see §8.9 (WP-DURABILITY-METADATA-CONF-3c). It does **not** yet detect **malicious whole-tail
+truncation** (the deferred sealed-anchor residual, ADR 0045 §7). The follow-ons
 (ADR 0026 §10 / ADR 0025 §10): cross-vendor coexistence dedup **(RESOLVED — ADR 0027: RTI PS uses
 standard OWI on its retained-history replay, so no vendor PID is needed; the configurable
 `:relay-durability`/`:collect-durability` tiers landed; ADR 0027 §follow-on 1 RESOLVED — ADR 0028:
@@ -885,7 +886,8 @@ interior delete/reorder/substitution/insertion tamper-evident at store-open, fai
 only; malicious whole-tail truncation + `epochs.dat` MAC deferred residuals, §8.5)**;
 **graceful FFI teardown on signal (RESOLVED — ADR 0030, 2026-06-22; `kill -15` exits cleanly
 status 0, no SIGBUS, both impls; see §5.1)**;
-epoch-table retirement; **3c** metadata confidentiality; in-RAM plaintext minimization
+epoch-table retirement; **3c metadata confidentiality (RESOLVED — §8.9, WP-DURABILITY-METADATA-CONF-3c)**;
+in-RAM plaintext minimization
 (honest pure-Lisp feasibility caveat); **P6** DDS-Security in-transit; and db/microservice
 persistence backends (**db backend RESOLVED — §8.8, ADR 0049: `make-sqlite-store` on the same
 vtable, config-selected via `make-sqlite-store-factory`**).
@@ -976,6 +978,42 @@ byte-behaviorally unchanged. All ADR 0045 §7 residuals (malicious whole-tail tr
 MAC, anchor-deletion full-downgrade, and whole-topic deletion) apply equally. Test:
 `run-durability-sqlite-mac-chain-test` (tamper via DIRECT SQL: UPDATE payload/mac, DELETE, REORDER;
 downgrade; KEEP_LAST reopen-repeatedly; epoch-boundary; grandfather; NIL-oracle regression).
+
+### 8.9 At-rest metadata confidentiality (Phase 3c, WP-DURABILITY-METADATA-CONF-3c)
+
+The PERSISTENT tier (file AND SQLite, via `make-encrypted-store` with `:epoch-dir`) seals the record
+**metadata** — topic, writer-GUID, sequence number, kind, key-hash — not just the payload. **No
+cleartext topic name, GUID, SN, or key-hash touches disk**: not in log filenames, `topics.map`, frame
+headers, the SQLite `topic`/`writer_guid`/`sn`/`key_hash` columns, or the raw file/DB bytes.
+
+How it works (decorator-level, both backends; the bare inner stores are unchanged):
+
+- **k_meta** — a cross-restart-stable key derived (`dds.dare:derive-meta-key`, HKDF-SHA384, distinct
+  `"dds-dare/meta/v1"` info label) as a **sibling of the ADR-0045 log-MAC key** from the SAME
+  deterministic ML-KEM decapsulation of the persisted `logmac.anchor`. A fresh process re-derives it
+  identically and re-locates + decrypts the sealed metadata. No new key file or anchor.
+- **topic-hash** = `HMAC-SHA-256(k_meta, 0x01 ∥ UTF-8(topic))` (hex) — the encrypted/independent index.
+  It replaces the plaintext topic id as the file log basename / `topics.map` key / SQLite `topic`
+  column, so `store-get-range(topic)` re-hashes the query and still locates records by topic equality
+  while the topic NAME never touches disk.
+- **Sealed metadata frame** — `guid ∥ sn ∥ kind ∥ [key-hash] ∥ payload` is sealed together under the
+  per-epoch DEK, AAD = the topic-hash bytes; the metadata is thus GCM-authenticated inside the
+  ciphertext (subsuming the earlier cleartext-key-hash AAD binding).
+- **Surrogates** — the inner store sees only a topic-hash, a deterministic 16-byte guid-surrogate
+  `HMAC(k_meta, 0x02 ∥ guid ∥ sn)[0..16)` (unique per (guid,sn) ⇒ idempotent dedup preserved), `sn'=0`,
+  NIL key-hash, `kind=:data`.
+- **Decrypt-then-sort** — the inner store runs KEEP_ALL; `store-get-range` decrypts, recovers the real
+  metadata, sorts by real `(guid,sn)`, and applies the effective KEEP_LAST / settled-drop policy passed
+  to `store-open`. Per-topic `store-count` is the same logical count. The v3 MAC chain (§8.5) is
+  keyed on the topic-hash and covers the sealed frame unchanged.
+
+**Residuals (accepted):** *topic-equality linkability* (same topic ⇒ same hash — a keyed index must be
+deterministic to locate records; value-confidentiality is met, unlinkability is not claimed);
+*physical space* (superseded blobs are compacted logically for correct reads but not physically
+reclaimed until `store-purge`); *`store-topics` cross-restart* (names come from an in-session reverse
+map — after restart only this-session topics are enumerable; records are still located by topic-hash).
+Tests: `run-dare-metadata-conf-3c-test` (both backends), the extended `run-dare-persistent-store-test`
+/ `run-durability-sqlite-dare-test` no-plaintext scans, `run-dare-keyhash-aad-test`. See ADR 0025 §10.3.
 
 ---
 

@@ -1056,6 +1056,29 @@
         (replace cat v :start1 pos)
         (incf pos (length v))))))
 
+(defun* %pst-topics-map-and-names (dir)
+    (function (pathname) (simple-array (unsigned-byte 8) (*)))
+  "Concatenate the raw bytes of D/topics.map plus every D/topics/*.log FILENAME (for the 3c
+   no-plaintext-metadata scan: the topic NAME must not survive in the map contents or the filenames)."
+  (let ((acc '()))
+    (let ((mp (merge-pathnames (make-pathname :name "topics" :type "map") dir)))
+      (when (probe-file mp)
+        (with-open-file (s mp :element-type '(unsigned-byte 8))
+          (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+            (read-sequence v s) (push v acc)))))
+    (let ((td (merge-pathnames (make-pathname :directory '(:relative "topics")) dir)))
+      (when (uiop:directory-exists-p td)
+        (dolist (p (uiop:directory-files td "*.log"))
+          (push (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                     (concatenate 'string (pathname-name p) "." (or (pathname-type p) "")))
+                acc))))
+    (let* ((total (reduce #'+ acc :key #'length :initial-value 0))
+           (cat   (make-array total :element-type '(unsigned-byte 8)))
+           (pos   0))
+      (dolist (v (nreverse acc) cat)
+        (replace cat v :start1 pos)
+        (incf pos (length v))))))
+
 (defun* %pst-subseq-present-p (haystack needle)
     (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) boolean)
   "Return T iff octet vector NEEDLE occurs as a contiguous subsequence of HAYSTACK."
@@ -1145,20 +1168,31 @@
                        "run1 sn1 payload must round-trip byte-exact")
                (%check :pst1-rt2 (equalp pb (dds.durability:durable-record-payload (second recs)))
                        "run1 sn2 payload must round-trip byte-exact"))
-             ;; (b) the INNER file-store's on-disk frame payloads are SEALED (start #x02, != plaintext)
-             (let ((inner-recs (dds.durability:store-get-range fs1 "Square")))
+             ;; (b) the INNER file-store's on-disk frame payloads are SEALED (start #x02, != plaintext).
+             ;; 3c: the inner store now keys records under the k_meta topic-HASH, not "Square".
+             (let ((inner-recs (dds.durability:store-get-range
+                                fs1 (%enc-topic-hash d-dir k-dir "Square"))))
                (%check :pst1-inner-sealed-v2
                        (= #x02 (aref (dds.durability:durable-record-payload (first inner-recs)) 0))
                        "inner sealed payload must start with v2 version byte #x02")
                (%check :pst1-inner-not-plaintext
                        (not (equalp (dds.durability:durable-record-payload (first inner-recs)) pa))
                        "inner sealed payload must not equal plaintext"))
-             ;; (b') no plaintext on disk: neither pa nor pb appears verbatim in any *.log
-             (let ((raw (%pst-read-all-log-bytes d-dir)))
+             ;; (b') 3c NO-PLAINTEXT-METADATA: neither the payloads NOR the topic NAME NOR the writer
+             ;; GUID bytes appear verbatim in any *.log / topics.map / filename (the metadata is sealed).
+             (let ((raw   (%pst-read-all-log-bytes d-dir))
+                   (tname (map '(simple-array (unsigned-byte 8) (*)) #'char-code "Square")))
                (%check :pst1-disk-no-pa (not (%pst-subseq-present-p raw pa))
                        "plaintext pa must not appear on disk")
                (%check :pst1-disk-no-pb (not (%pst-subseq-present-p raw pb))
-                       "plaintext pb must not appear on disk"))
+                       "plaintext pb must not appear on disk")
+               (%check :pst1-disk-no-topic-name (not (%pst-subseq-present-p raw tname))
+                       "3c: the topic NAME 'Square' must not appear in any log/topics.map/frame bytes")
+               (%check :pst1-disk-no-guid (not (%pst-subseq-present-p raw g1))
+                       "3c: the writer-GUID bytes must not appear in cleartext on disk")
+               (%check :pst1-disk-no-topic-in-names
+                       (not (%pst-subseq-present-p (%pst-topics-map-and-names d-dir) tname))
+                       "3c: the topic NAME must not appear in topics.map contents or log filenames"))
              ;; (c) epochs.dat has exactly 1 epoch after a run with puts
              (%check :pst1-epochs-1 (= 1 (%pst-epoch-count d-dir)) "run1 must mint exactly 1 epoch")
              (dds.durability:store-close enc1))
@@ -1214,7 +1248,8 @@
                (dds.durability::%install-logmac-oracle fs-ro key gf-ids))
              (dds.durability:store-open fs-ro)
              (let ((blobs (mapcar #'dds.durability:durable-record-payload
-                                  (dds.durability:store-get-range fs-ro "Square"))))
+                                  (dds.durability:store-get-range
+                                   fs-ro (%enc-topic-hash d-dir k-dir "Square")))))
                (%check :pst-sec-blobs-count (= 3 (length blobs))
                        (format nil "expected 3 sealed blobs; got ~d" (length blobs)))
                ;; sec-b: run-1 records (first two, sn=1,2) have epoch-id=1; run-2 record (sn=7) has epoch-id=2
@@ -1246,8 +1281,11 @@
                        "run3 epoch-1 record pb byte-exact")
                (%check :pst3-rt-pc (find pc recs :key #'dds.durability:durable-record-payload :test #'equalp)
                        "run3 epoch-2 record pc byte-exact"))
-             ;; tamper: flip a byte inside a sealed on-disk frame -> get-range DROPS it (no error)
-             (let* ((inner (dds.durability:store-get-range fs3 "Square"))
+             ;; tamper: flip a byte inside a sealed on-disk frame -> get-range DROPS it (no error).
+             ;; 3c: the inner store keys under the topic-HASH; the injected blob must go under the same
+             ;; hash (and the surrogate guid') so enc3's get-range("Square") re-hashes to it.
+             (let* ((th     (%enc-topic-hash d-dir k-dir "Square"))
+                    (inner  (dds.durability:store-get-range fs3 th))
                     (target (first inner))
                     (blob   (dds.durability:durable-record-payload target))
                     (tampered (copy-seq blob))
@@ -1255,7 +1293,7 @@
                ;; flip a ciphertext byte (past the v2 header: 1 ver + 4 epoch + 12 nonce = 17)
                (setf (aref tampered 18) (logxor (aref tampered 18) #xff))
                ;; re-inject the tampered blob under a NEW sn directly into the inner file store
-               (dds.durability:store-put fs3 "Square"
+               (dds.durability:store-put fs3 th
                                          (dds.durability:durable-record-writer-guid target)
                                          999 nil :data tampered)
                (let ((dds.durability:*dare-error-hook*
@@ -1272,15 +1310,18 @@
         (uiop:delete-directory-tree k-dir :validate t))))
   t)
 
-;;; --- v2 key-hash AAD binding (WP-DURABILITY-PERSISTENT review) ---
-;;; The file store writes key-hash to the frame in CLEARTEXT (CRC-only). A disk-write adversary
-;;; could flip a record's key-hash and fix the trivial CRC to mis-route an instance's lifecycle.
-;;; %record-aad-v2 binds key-hash into the AEAD, so a flipped key-hash now fails the GCM tag.
+;;; --- key-hash sealed in the blob (WP-DURABILITY-METADATA-CONF-3c) ---
+;;; 3c seals the key-hash INSIDE the per-epoch DEK blob (self-describing metadata frame), so it is
+;;; GCM-authenticated by construction (the earlier %record-aad-v2 cleartext-key-hash AAD binding is
+;;; subsumed). Any flip of a sealed byte fails the tag ⇒ fail-closed drop. This test proves both the
+;;; benign round-trip of the sealed key-hash and the fail-closed drop of a tampered sealed blob.
 
 (defun* run-dare-keyhash-aad-test ()
     (function () t)
-  "v2 AEAD binds key-hash: a disk-tampered (key-hash flipped, CRC fixed) frame must be DROPPED
-   (fail-closed), not returned with the wrong key-hash. Control: the keyed record round-trips untampered."
+  "3c key-hash sealing: a keyed record's key-hash rides SEALED inside the DEK blob (never a cleartext
+   frame field) — it round-trips byte-exact AND is GCM-authenticated. Control: the keyed record
+   round-trips (key-hash recovered). Tamper: a flipped sealed blob re-injected into the inner store
+   under the same topic-hash + surrogate guid' is DROPPED fail-closed (the GCM tag catches it)."
   (handler-case (dds.dare:dare-available-p)
     (dds.dare:dare-unavailable (c)
       (format t "~&  [dare-keyhash-aad] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1294,7 +1335,7 @@
          (topic "K"))
     (unwind-protect
          (progn
-           ;; RUN 1: put a KEYED record, prove benign round-trip (S1 no-regression), seal to disk
+           ;; RUN 1: put a KEYED record; the sealed key-hash round-trips byte-exact (3c control)
            (let* ((kp  (dds.dare:make-file-key-provider :dir k-dir))
                   (fs  (dds.durability:make-file-store :dir d-dir))
                   (enc (dds.durability:make-encrypted-store fs kp :epoch-dir d-dir)))
@@ -1305,61 +1346,147 @@
                        (and (= 1 (length recs))
                             (equalp pa (dds.durability:durable-record-payload (first recs)))
                             (equalp kh (dds.durability:durable-record-key-hash (first recs))))
-                       "control: keyed record must round-trip byte-exact (key-hash in AAD, no regression)"))
+                       "control: sealed key-hash + payload round-trip byte-exact (3c: key-hash in the blob)"))
+             ;; disk assertion: the raw key-hash bytes never appear in any log (sealed, not a frame field)
+             (%check :khaad-no-plaintext-kh
+                     (not (%pst-subseq-present-p (%pst-read-all-log-bytes d-dir) kh))
+                     "3c: the key-hash bytes must not appear in cleartext on disk")
              (dds.durability:store-close enc))
-           ;; TAMPER: flip a key-hash byte, then recompute the header CRC, the v3 CHAIN MAC, AND the
-           ;; frame CRC so the frame passes every file-layer gate. Recomputing the chain MAC requires
-           ;; the log-MAC key (ADR 0045) — i.e. this simulates an adversary WITH the key (the
-           ;; authorized-writer layer), because a plain disk adversary who only recomputes CRCs is now
-           ;; caught by the chain at open (that path is the mac-chain SUBSTITUTE test). With the chain
-           ;; satisfied, the GCM AAD (%record-aad-v2) is the REMAINING guard binding key-hash — the
-           ;; original property this test proves. v3 keyed frame: magic(2)+flags(1)+guid(16)+sn(8)=27,
-           ;; key-hash 27..42, plen 43..46, header-crc 47..50, payload from 51, MAC at 51+plen (32 B),
-           ;; frame-crc at 51+plen+32 (ADR 0026 §10.9 + ADR 0045).
-           (let* ((tid (dds.durability::%topic->id topic))
-                  (log-path (merge-pathnames (make-pathname :directory '(:relative "topics") :name tid :type "log") d-dir))
-                  (raw (with-open-file (fin log-path :element-type '(unsigned-byte 8))
-                         (let ((v (make-array (file-length fin) :element-type '(unsigned-byte 8))))
-                           (read-sequence v fin) v)))
-                  (kp-t (dds.dare:make-file-key-provider :dir k-dir))
-                  (lk   (progn (dds.dare:key-provider-open kp-t)
-                               (dds.durability::%derive-logmac-key
-                                kp-t (uiop:ensure-directory-pathname d-dir))))
-                  (mac-fn (lambda (data) (dds.dare:hmac-sha256 lk data))))
-             (setf (aref raw 27) (logxor (aref raw 27) #xFF))
-             ;; recompute the header CRC (over [0,47), which now covers the flipped key-hash) …
-             (dds.durability::%put-u32-le raw 47 (dds.durability::%crc32 raw 0 47))
-             (let* ((plen    (dds.durability::%get-u32-le raw 43))
-                    (mac-off (+ 51 plen))
-                    (seed    (dds.durability::%chain-seed mac-fn topic))    ; sole/first frame ⇒ prev = seed
-                    (mac     (dds.durability::%chain-mac mac-fn seed raw 0 mac-off)))
-               ;; … the chain MAC over the tampered prefix …
-               (replace raw mac :start1 mac-off :end1 (+ mac-off 32))
-               ;; … and the trailing frame CRC, so the tampered frame passes header-CRC + chain + frame-CRC
-               (dds.durability::%put-u32-le raw (+ mac-off 32) (dds.durability::%crc32 raw 0 (+ mac-off 32)))
-               (with-open-file (fout log-path :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
-                 (write-sequence raw fout)))
-             (dds.dare:free-secret-octets lk)
-             (dds.dare:key-provider-close kp-t))
-           ;; RUN 2: reopen → frame parses (both CRCs valid) but key-hash is in the AAD → GCM fail → DROP
+           ;; RUN 2: reopen, flip a ciphertext byte of the sealed blob, re-inject under the topic-hash +
+           ;; surrogate guid' at a new sn → the GCM tag over the sealed metadata (incl. key-hash) fails → drop
            (let* ((kp2  (dds.dare:make-file-key-provider :dir k-dir))
                   (fs2  (dds.durability:make-file-store :dir d-dir))
                   (enc2 (dds.durability:make-encrypted-store fs2 kp2 :epoch-dir d-dir))
                   (hook-count 0))
              (dds.durability:store-open enc2)
-             (%check :khaad-frame-parses
-                     (= 1 (dds.durability:store-count fs2 topic))
-                     "tampered frame must still parse at the file layer (CRC was recomputed)")
-             (let ((dds.durability:*dare-error-hook*
-                     (lambda (c ctx n) (declare (ignore c ctx)) (setf hook-count n) t)))
-               (let ((recs (dds.durability:store-get-range enc2 topic)))
-                 (%check :khaad-tamper-drop (zerop (length recs))
-                         (format nil "tampered key-hash must be DROPPED by the AEAD; got ~d records" (length recs)))
-                 (%check :khaad-tamper-hook (= 1 hook-count)
-                         "key-hash tamper must fire the dare-error-hook exactly once")))
+             (let* ((th     (%enc-topic-hash d-dir k-dir topic))
+                    (inner  (dds.durability:store-get-range fs2 th))
+                    (target (first inner))
+                    (tampered (copy-seq (dds.durability:durable-record-payload target))))
+               (setf (aref tampered 18) (logxor (aref tampered 18) #xff))   ; a ciphertext byte (past the v2 header)
+               (dds.durability:store-put fs2 th (dds.durability:durable-record-writer-guid target)
+                                         999 nil :data tampered)
+               (let ((dds.durability:*dare-error-hook*
+                       (lambda (c ctx n) (declare (ignore c ctx)) (setf hook-count n) t)))
+                 (let ((recs (dds.durability:store-get-range enc2 topic)))
+                   (%check :khaad-tamper-drop (= 1 (length recs))
+                           (format nil "tampered sealed blob must be DROPPED; expected 1 valid record, got ~d"
+                                   (length recs)))
+                   (%check :khaad-tamper-kh-intact
+                           (and recs (equalp kh (dds.durability:durable-record-key-hash (first recs))))
+                           "the surviving record's key-hash is intact (only the tampered blob dropped)")
+                   (%check :khaad-tamper-hook (= 1 hook-count)
+                           "sealed-blob tamper must fire the dare-error-hook exactly once"))))
              (dds.durability:store-close enc2)))
       (when (uiop:directory-exists-p d-dir) (ignore-errors (uiop:delete-directory-tree d-dir :validate t)))
       (when (uiop:directory-exists-p k-dir) (ignore-errors (uiop:delete-directory-tree k-dir :validate t)))))
+  t)
+
+;;; --- WP-DURABILITY-METADATA-CONF-3c dedicated matrix (ADR 0025 §10 item 3) ---
+;;; The headline 3c test over BOTH backends (file + SQLite): seal topic/GUID/SN/kind/key-hash, prove
+;;; byte-exact round-trip of every field, query-preserved order by (guid,sn), idempotency, and — with
+;;; DISTINCTIVE metadata (a large SN, distinctive GUIDs, a distinctive key-hash) — that NONE of the
+;;; topic NAME, writer-GUID bytes, SN bytes, or key-hash bytes survive in cleartext on disk, plus a
+;;; cross-restart recovery re-deriving k_meta.
+
+(defun* kw (label suffix)
+    (function (string string) keyword)
+  "Intern a per-backend check keyword LABEL/SUFFIX (3c test naming helper)."
+  (intern (format nil "M3C-~a-~a" (string-upcase label) (string-upcase suffix)) :keyword))
+
+(defun* %m3c-run-backend (label inner-factory raw-scanner d-dir k-dir)
+    (function (string function function pathname pathname) t)
+  "Drive the 3c matrix for one backend. INNER-FACTORY makes a fresh inner store over D-DIR; RAW-SCANNER
+   returns the raw on-disk bytes to scan for plaintext-metadata leaks."
+  (let* ((g1  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x51))
+         (g2  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x9E))
+         (kh  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xC7))
+         (sn1 #x4142434445464748)                       ; distinctive 8-byte SN ("ABCDEFGH")
+         (sn2 #x0102030405060708)
+         (pa  (%pst-octets '(#xF0 #xF1 #xF2 #xF3 #xF4 #xF5 #xF6 #xF7)))
+         (pb  (%pst-octets '(#x1A #x2B #x3C #x4D)))
+         (pc  (%pst-octets '(#x99 #x88 #x77)))
+         (topic "Square") (topic2 "Circle"))
+    (labels ((mk () (dds.durability:make-encrypted-store
+                     (funcall inner-factory) (dds.dare:make-file-key-provider :dir k-dir)
+                     :epoch-dir d-dir)))
+      ;; RUN 1: put, round-trip each field, ordering, idempotency
+      (let ((enc (mk)))
+        (dds.durability:store-open enc)
+        (dds.durability:store-put enc topic  g2 sn2 kh  :dispose pb)   ; deliberately out of (guid,sn) order
+        (dds.durability:store-put enc topic  g1 sn1 kh  :data    pa)
+        (dds.durability:store-put enc topic2 g1 sn1 nil :data    pc)
+        (%check (kw label "idempotent")
+                (eq t (dds.durability:store-put enc topic g1 sn1 kh :data pa))
+                "3c: re-put of the same (topic,guid,sn) is an idempotent no-op")
+        (let ((recs (dds.durability:store-get-range enc topic)))
+          (%check (kw label "count") (= 2 (length recs)) "3c: two records for the topic")
+          (%check (kw label "order")               ; g1(0x51) < g2(0x9E) ⇒ g1 record first
+                  (and (equalp g1 (dds.durability:durable-record-writer-guid (first recs)))
+                       (equalp g2 (dds.durability:durable-record-writer-guid (second recs))))
+                  "3c query-preserved: records ordered by (writer-guid, sn)")
+          (let ((r1 (first recs)))
+            (%check (kw label "rt-fields")
+                    (and (= sn1 (dds.durability:durable-record-sn r1))
+                         (eq :data (dds.durability:durable-record-kind r1))
+                         (equalp kh (dds.durability:durable-record-key-hash r1))
+                         (equalp pa (dds.durability:durable-record-payload r1)))
+                    "3c: guid/sn/kind/key-hash/payload all round-trip byte-exact")))
+        (dds.durability:store-close enc))
+      ;; NO-PLAINTEXT-METADATA: none of topic-name/guid/sn/key-hash bytes survive on disk
+      (let ((raw   (funcall raw-scanner d-dir))
+            (tname (map '(simple-array (unsigned-byte 8) (*)) #'char-code topic))
+            (snb   (let ((v (make-array 8 :element-type '(unsigned-byte 8))))
+                     (dotimes (i 8 v) (setf (aref v i) (ldb (byte 8 (* 8 i)) sn1))))))
+        (%check (kw label "no-topic") (not (%pst-subseq-present-p raw tname))
+                "3c: topic NAME must be gone from disk")
+        (%check (kw label "no-guid") (not (%pst-subseq-present-p raw g1))
+                "3c: writer-GUID bytes must be gone from disk")
+        (%check (kw label "no-sn") (not (%pst-subseq-present-p raw snb))
+                "3c: the (distinctive) SN bytes must be gone from disk")
+        (%check (kw label "no-kh") (not (%pst-subseq-present-p raw kh))
+                "3c: key-hash bytes must be gone from disk"))
+      ;; CROSS-RESTART: a fresh store re-derives k_meta + recovers byte-exact; chain verifies
+      (let ((enc (mk)))
+        (dds.durability:store-open enc)
+        (let ((recs (dds.durability:store-get-range enc topic)))
+          (%check (kw label "restart")
+                  (and (= 2 (length recs))
+                       (equalp pa (dds.durability:durable-record-payload (first recs)))
+                       (= sn1 (dds.durability:durable-record-sn (first recs)))
+                       (equalp kh (dds.durability:durable-record-key-hash (first recs))))
+                  "3c cross-restart: k_meta re-derived, all fields recovered byte-exact, chain verifies"))
+        (%check (kw label "restart-topic2")
+                (= 1 (length (dds.durability:store-get-range enc topic2)))
+                "3c cross-restart: second topic located by topic-hash")
+        (dds.durability:store-close enc))))
+  t)
+
+(defun* run-dare-metadata-conf-3c-test ()
+    (function () t)
+  "WP-DURABILITY-METADATA-CONF-3c headline matrix over BOTH backends (file + SQLite): at-rest sealing
+   of topic/GUID/SN/kind/key-hash. Byte-exact round-trip of every field, query-preserved (guid,sn)
+   order, idempotency, NO plaintext topic-name/guid/sn/key-hash on disk, and cross-restart recovery."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [dare-metadata-conf-3c] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-dare-metadata-conf-3c-test t)))
+  (let* ((base (uiop:temporary-directory))
+         (fd (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-m3c-fd-~a" (get-universal-time)))) base))
+         (fk (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-m3c-fk-~a" (get-universal-time)))) base))
+         (sd (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-m3c-sd-~a" (get-universal-time)))) base))
+         (sk (uiop:merge-pathnames* (make-pathname :directory (list :relative (format nil "dds-m3c-sk-~a" (get-universal-time)))) base)))
+    (unwind-protect
+         (progn
+           (%m3c-run-backend "FILE" (lambda () (dds.durability:make-file-store :dir fd))
+                             #'%pst-read-all-log-bytes fd fk)
+           (%m3c-run-backend "SQLITE"
+                             (lambda () (dds.durability:make-sqlite-store
+                                         :path (uiop:merge-pathnames* "durability.sqlite3" sd)))
+                             (lambda (d) (declare (ignore d)) (%sqlite-read-db-bytes sd)) sd sk))
+      (dolist (dir (list fd fk sd sk))
+        (when (uiop:directory-exists-p dir) (ignore-errors (uiop:delete-directory-tree dir :validate t))))))
   t)
 
 ;;; --- epochs.dat replay recovery (WP-DURABILITY-PERSISTENT review) ---

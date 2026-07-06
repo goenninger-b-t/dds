@@ -75,6 +75,42 @@
                      32
                      t))
 
+(defconstant +metakey-info-str+
+  (if (boundp '+metakey-info-str+) (symbol-value '+metakey-info-str+) "dds-dare/meta/v1")
+  "HKDF-SHA384 info label for the durability at-rest METADATA-sealing key k_meta derivation (ASCII,
+   pinned; change = new format version). Distinct domain separator from +dek-info-str+ AND
+   +logmac-info-str+ so k_meta is cryptographically independent of every DEK and of the log-MAC key
+   (ADR 0025 §10 item 3c). Same reload-safe boundp guard as +dek-info-str+ (DEFCONSTANT-UNEQL —
+   strings are not self-eql — identical SBCL/Clasp).")
+
+(defvar *metakey-info-octets* nil
+  "Cached octet vector for +metakey-info-str+, built lazily on first use.")
+
+(defun* %metakey-info ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "Return (and cache) the HKDF info octet vector for k_meta derivation."
+  (or *metakey-info-octets*
+      (setf *metakey-info-octets* (%ascii +metakey-info-str+))))
+
+(defun* derive-meta-key (shared-secret)
+    (function ((simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "Derive a 32-byte durability METADATA-sealing key k_meta (an HMAC-SHA-256 key AND an AES-256 key)
+   from a cross-restart-STABLE ML-KEM shared secret via HKDF-SHA384 (ADR 0025 §10 item 3c). Computes
+   HKDF(SHA-384, ikm=SHARED-SECRET, salt=∅, info=ASCII(+metakey-info-str+), L=32). The stable secret
+   is obtained by decapsulating the SAME persisted log-MAC anchor ciphertext used for the log-MAC key
+   — ML-KEM decapsulation is deterministic in (private-key, ciphertext) (FIPS-203), so a fixed anchor
+   yields the same k_meta on every restart, letting a fresh process re-derive it and re-locate/decrypt
+   the sealed metadata. A SIBLING of DERIVE-LOG-MAC-KEY with a distinct info label so k_meta is
+   independent of the log-MAC key (zero new key-management surface). The key is a foreign-backed secret
+   buffer (static-vector, design spec §6) that never transits a GC-heap array; the caller (the
+   encrypted-store) holds it for the store lifetime and MUST release it with FREE-SECRET-OCTETS on close."
+  (%hkdf-sha384-into shared-secret
+                     (make-array 0 :element-type '(unsigned-byte 8))
+                     (%metakey-info)
+                     32
+                     t))
+
 (defun* derive-dek (shared-secret)
     (function ((simple-array (unsigned-byte 8) (*)))
               (simple-array (unsigned-byte 8) (*)))
