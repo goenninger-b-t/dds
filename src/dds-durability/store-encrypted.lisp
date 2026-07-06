@@ -674,6 +674,19 @@
      :sync
      (lambda () (store-sync inner-store)))))
 
+(defun* %win-entry< (a b)
+    (function (list list) boolean)
+  "Order two Sliver-3a prior-surrogate window entries (real-guid-list, real-sn, inner-surrogate) by the
+   SAME rule as %record-guid-sn< / %keep-last-latest — writer-guid bytes ascending, THEN sn ascending —
+   NOT pure sn. This makes the decorator's physical min-drop keep EXACTLY the records the logical newest-D
+   get-range view keeps, for ALL cases including a single instance fed by multiple writer GUIDs (a pure-sn
+   drop would keep the wrong survivor when the min-sn sample is on the higher writer-guid). DRY with the
+   backends' order (%guid-list<)."
+  (let ((ga (first a)) (gb (first b)))
+    (if (equal ga gb)
+        (< (the (integer 0) (second a)) (the (integer 0) (second b)))
+        (%guid-list< ga gb))))
+
 (defun* %make-epoch-encrypted-store (inner-store key-provider epoch-dir)
     (function (durable-store dds.dare:key-provider pathname) durable-store)
   "Build the v2 (epoch-aware, disk-backed PERSISTENT tier) encrypted-store over EPOCH-DIR.
@@ -699,9 +712,51 @@
          (topic-names   (make-hash-table :test #'equal))
          ;; decorator-owned effective compaction policy (the inner store runs KEEP_ALL; 3c item 5)
          (eff-hk        :keep-all)
-         (eff-hd        1))
+         (eff-hd        1)
+         ;; Sliver 3a online prior-surrogate window (ADR 0025 §10.3): (topic-hash . real-key-hash-list)
+         ;; -> list of (real-sn . inner-surrogate). The surrogate is per-SAMPLE, so the decorator must
+         ;; REMEMBER each instance's live surrogates to physically evict the superseded ones on put.
+         (instance-windows (make-hash-table :test #'equal))
+         ;; whether the inner store implements the additive :delete slot (SQLite yes; file until 3b no).
+         ;; NIL => the decorator SKIPS physical reclaim and stays logical-only (byte-identical to pre-3a).
+         (del-supported    (and (durable-store-delete inner-store) t)))
     (labels ((%th-bytes (topic) (%meta-topic-hash-bytes meta-key topic))
              (%th (topic) (%meta-hex (%th-bytes topic)))
+             (%evict-prior-surrogates (th writer-guid key-hash sn guid*)
+               ;; Sliver 3a physical reclaim (caller holds LOCK + del-supported + :keep-last + :data +
+               ;; non-NIL key-hash). Each window entry is (real-guid-list real-sn inner-surrogate) keyed by
+               ;; the instance (topic-hash . real-key-hash). When the window exceeds eff-hd, physically
+               ;; delete the entries SMALLEST by %win-entry< (writer-guid bytes ascending, THEN sn) —
+               ;; IDENTICAL to the logical view's %keep-last-latest (%record-guid-sn< order), so the physical
+               ;; set == the logical newest-D get-range view EXACTLY for ALL cases, including a single
+               ;; instance fed by multiple writer GUIDs (a pure-sn drop keeps the wrong survivor when the
+               ;; min-sn sample sits on the higher writer-guid). The append is DEDUP'd on the deterministic
+               ;; surrogate so an idempotent re-put of an already-tracked (guid,sn) — which store-put no-ops
+               ;; physically (INSERT OR IGNORE) — never double-counts (which would evict a LIVE newest-D
+               ;; row = data loss). The window is rewritten only AFTER the deletes succeed, so a delete
+               ;; fault (crash-lower-bar) leaves the entries in the window and self-heals on the next put.
+               (let* ((wk  (cons th (coerce key-hash 'list)))
+                      (cur (gethash wk instance-windows)))
+                 (unless (member guid* cur :key #'third :test #'equalp)
+                   (let ((win (cons (list (coerce writer-guid 'list) sn guid*) cur)))
+                     (setf (gethash wk instance-windows) win)
+                     (when (> (length win) eff-hd)
+                       (let* ((sorted  (sort (copy-list win) #'%win-entry<))
+                              (drop-n  (- (length sorted) eff-hd))
+                              (to-drop (subseq sorted 0 drop-n))
+                              (keep    (subseq sorted drop-n)))
+                         (dolist (e to-drop)
+                           (store-delete inner-store th (third e) 0))
+                         (setf (gethash wk instance-windows) keep)))))))
+             (%purge-topic-windows (th)
+               ;; drop every instance window under this topic-hash (its inner rows are being purged) so the
+               ;; decorator RAM stays bounded and a stale window can never mis-evict a later same-instance
+               ;; write (the settled-instance steady-state residual is documented, ADR 0025 §10.3).
+               (let ((to-remove '()))
+                 (maphash (lambda (k v) (declare (ignore v))
+                            (when (equal (car k) th) (push k to-remove)))
+                          instance-windows)
+                 (dolist (k to-remove) (remhash k instance-windows))))
              (%drop-hook (r)
                (let ((n (incf err-count)))
                  (ignore-errors
@@ -785,7 +840,13 @@
                   ;; GCM-authenticated INSIDE the ciphertext, so %record-aad-v2's field binding is subsumed)
                   (sealed   (dds.dare:seal-payload-v2 current-dek current-epoch nonce th-bytes frame)))
              (setf (gethash th topic-names) topic)
-             (store-put inner-store th guid* 0 nil :data sealed))))
+             (let ((r (store-put inner-store th guid* 0 nil :data sealed)))
+               ;; Sliver 3a: physically evict the superseded prior surrogates so the inner physical row
+               ;; count converges to eff-hd (closes the ADR 0025 §10.3 residual for the continuously-open
+               ;; case). SQLite inner store only; a file inner store (no :delete slot) stays logical-only.
+               (when (and del-supported (eq :keep-last eff-hk) (eq :data kind) key-hash)
+                 (%evict-prior-surrogates th writer-guid key-hash sn guid*))
+               r))))
        :get-range
        (lambda (topic)
          (dds.pal:with-lock (lock)
@@ -808,6 +869,7 @@
                (let* ((th-bytes (%th-bytes topic))
                       (th       (%meta-hex th-bytes)))
                  (remhash th topic-names)
+                 (%purge-topic-windows th)
                  (store-purge inner-store th)))))
        :open
        (lambda (history-kind history-depth)
@@ -822,6 +884,9 @@
            ;; (the decorator owns compaction — the inner store is opened KEEP_ALL below).
            (setf meta-key (dds.dare:free-secret-octets meta-key))
            (clrhash topic-names)
+           ;; Sliver 3a: a re-open starts a fresh prior-surrogate window (bounds decorator RAM across
+           ;; reopens + prevents a stale window from mis-evicting; cross-restart ≤D leftovers = 3c).
+           (clrhash instance-windows)
            (when history-kind  (setf eff-hk history-kind))
            (when history-depth (setf eff-hd history-depth))
            ;; drop any prior-open oracle (it closes over the just-freed key); reinstalled below. This
@@ -865,6 +930,8 @@
            (%free-epoch-dek-map dek-map)
            (setf current-epoch nil)
            (setf current-dek   nil)
+           ;; Sliver 3a: drop the prior-surrogate window (bounds decorator RAM across reopens); §6 parity
+           (clrhash instance-windows)
            ;; zeroize + free the foreign log-MAC key + k_meta and drop the oracle (points at freed bytes); §6
            (setf logmac-key (dds.dare:free-secret-octets logmac-key))
            (setf meta-key   (dds.dare:free-secret-octets meta-key))

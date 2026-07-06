@@ -29,7 +29,10 @@
   ;; group-commit sync: called after each drain tick; NIL = no-op (memory store)
   (sync       nil     :type (or null function))
   ;; keyed log-MAC chain seam (ADR 0045): install a MAC oracle (data)->HMAC; NIL = feature absent
-  (set-chain-mac-fn nil :type (or null function)))
+  (set-chain-mac-fn nil :type (or null function))
+  ;; per-record physical delete-by-(topic,writer-guid,sn) (ADR 0025 §10.3 / ADR 0029 §10); NIL = the
+  ;; backend has no physical reclaim (byte-identical to pre-slot) — same NIL-fallback as sync above
+  (delete nil :type (or null function)))
 
 ;;; Public dispatch functions — one slot read + funcall (no CLOS dispatch on the hot path).
 
@@ -111,6 +114,19 @@
   (let ((f (durable-store-set-chain-mac-fn store)))
     (when f (funcall f fn required grandfather-set)))
   t)
+
+(defun* store-delete (store topic writer-guid sn)
+    (function (durable-store string (simple-array (unsigned-byte 8) (16)) (integer 0))
+              (or (eql t) (eql :unsupported)))
+  "Physically remove the single record keyed by (TOPIC, WRITER-GUID, SN); return T on delete or
+   :UNSUPPORTED when the backing store has no :delete slot (the same NIL-fallback binding as store-sync
+   / store-set-chain-mac-fn — an additive vtable slot, not a fork). Per-record delete-by-PRIMARY-KEY,
+   NOT evict-instance: the encrypted decorator opens its inner store keyless with a per-sample surrogate
+   and knows the EXACT prior surrogate to reclaim (ADR 0025 §10.3 physical reclaim / ADR 0029 §10). A
+   backend that omits the slot is byte-identical to pre-slot behavior; the decorator then falls back to
+   today's logical-only compaction (superseded blobs retained until purge)."
+  (let ((f (durable-store-delete store)))
+    (if f (funcall f topic writer-guid sn) :unsupported)))
 
 ;;; In-memory backing implementation.
 ;;; Outer table: topic (string) -> inner table.
@@ -255,4 +271,10 @@
                    (when history-depth (setf (car depth-cell) history-depth))
                    t)
      :close      (lambda () t)
-     :count-fn   (lambda (topic) (%mem-count outer lock topic)))))
+     :count-fn   (lambda (topic) (%mem-count outer lock topic))
+     ;; per-record physical delete (vtable uniformity): remhash the (guid-list . sn) inner key
+     :delete     (lambda (topic writer-guid sn)
+                   (dds.pal:with-lock (lock)
+                     (let ((inn (gethash topic outer)))
+                       (when inn (remhash (cons (coerce writer-guid 'list) sn) inn)))
+                     t)))))

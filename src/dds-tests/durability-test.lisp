@@ -4389,6 +4389,308 @@
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))
       t)))
 
+;;; --- Additive store-delete vtable slot (WP-DURABILITY-ENCRECLAIM-SQLITE, Sliver 3a) ---
+;;; The physical-reclaim seam is an ADDITIVE vtable slot with the EXACT NIL-fallback binding of
+;;; store-sync / store-set-chain-mac-fn: a backend with the :delete slot physically removes a record and
+;;; returns T; a backend without it returns :UNSUPPORTED (byte-identical to pre-slot). Impl-agnostic (no
+;;; DARE) so it runs on both impls unconditionally: memory + SQLite implement it, the file store does not.
+
+(defun* run-durability-store-delete-slot-test ()
+    (function () t)
+  "Additive store-delete slot + NIL-fallback binding (ADR 0025 §10.3 / ADR 0029 §10): memory and SQLite
+   physically remove exactly the (topic,writer-guid,sn) record and return T; the file store (no slot)
+   returns :UNSUPPORTED and is left untouched. Per-record delete-by-PRIMARY-KEY, not evict-instance."
+  (let* ((g0 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xA5))
+         (p  (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (dirs '()))
+    (labels ((%dbp (tag) (let ((d (%sqlite-tmp-db-path tag)))
+                           (push (uiop:pathname-directory-pathname d) dirs) d))
+             (%fdir (tag) (let ((d (%file-store-tmp-dir tag))) (push d dirs) d)))
+      (unwind-protect
+           (progn
+             ;; (1) memory :delete removes exactly the keyed row and returns T
+             (let ((s (dds.durability:make-memory-store)))
+               (dds.durability:store-open s)
+               (dds.durability:store-put s "T" g0 1 kh :data (funcall p '(1)))
+               (dds.durability:store-put s "T" g0 2 kh :data (funcall p '(2)))
+               (%check :del-mem-ret (eq t (dds.durability:store-delete s "T" g0 1))
+                       "memory store-delete returns T")
+               (let ((sns (sort (mapcar #'dds.durability:durable-record-sn
+                                        (dds.durability:store-get-range s "T")) #'<)))
+                 (%check :del-mem-row (equal '(2) sns)
+                         (format nil "memory store-delete removed exactly sn1, got ~s" sns)))
+               (dds.durability:store-close s))
+             ;; (2) SQLite :delete removes exactly the keyed row and returns T
+             (let ((s (dds.durability:make-sqlite-store :path (%dbp "del-sq"))))
+               (dds.durability:store-open s)
+               (dds.durability:store-put s "T" g0 1 kh :data (funcall p '(1)))
+               (dds.durability:store-put s "T" g0 2 kh :data (funcall p '(2)))
+               (%check :del-sq-ret (eq t (dds.durability:store-delete s "T" g0 1))
+                       "sqlite store-delete returns T")
+               (%check :del-sq-count (= 1 (dds.durability:store-count s "T"))
+                       (format nil "sqlite store-delete removed exactly one row, got ~d"
+                               (dds.durability:store-count s "T")))
+               (let ((sns (sort (mapcar #'dds.durability:durable-record-sn
+                                        (dds.durability:store-get-range s "T")) #'<)))
+                 (%check :del-sq-row (equal '(2) sns)
+                         (format nil "sqlite store-delete removed exactly sn1, got ~s" sns)))
+               (dds.durability:store-close s))
+             ;; (3) the file store has NO :delete slot -> :UNSUPPORTED (NIL-fallback), store untouched
+             (let ((s (dds.durability:make-file-store :dir (%fdir "del-file"))))
+               (dds.durability:store-open s)
+               (dds.durability:store-put s "T" g0 1 kh :data (funcall p '(1)))
+               (%check :del-file-unsupported
+                       (eq :unsupported (dds.durability:store-delete s "T" g0 1))
+                       "file store-delete returns :UNSUPPORTED (no slot; NIL-fallback binding)")
+               (%check :del-file-unchanged (= 1 (dds.durability:store-count s "T"))
+                       (format nil "file store untouched after an :unsupported store-delete, got ~d"
+                               (dds.durability:store-count s "T")))
+               (dds.durability:store-close s)))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))
+      t)))
+
+;;; --- Encrypted-tier physical reclaim (WP-DURABILITY-ENCRECLAIM-SQLITE, Sliver 3a; ADR 0025 §10.3) ---
+;;; The v2/epoch/3c encrypted decorator opens its inner store :keep-all + puts a NIL key-hash + a per-
+;;; SAMPLE guid-surrogate, so superseded blobs were logically compacted at get-range but PHYSICALLY
+;;; retained until purge (the inner physical count grew to N). Sliver 3a makes the decorator physically
+;;; evict the superseded prior surrogates on put (SQLite inner store), so the inner physical count
+;;; converges to D. The min-SN drop (NOT oldest-arrived) keeps the physical set == the logical newest-D
+;;; view exactly, even under an out-of-order writer (no data loss).
+
+(defun* run-durability-encrypted-physical-reclaim-test ()
+    (function () t)
+  "Encrypted SQLite physical reclaim (Sliver 3a): a continuously-open encrypted :keep-last D store
+   physically evicts superseded prior surrogates on put so the INNER physical count converges to D
+   (RED pre-3a = N).
+   (1) PHYSICAL RECLAIM — N=6 one instance, no close: inner physical (store-count enc nil) = D=2 (not 6);
+       logical + get-range = newest D by SN, byte-exact.
+   (2) two instances each bounded to D independently.
+   (3) NO DATA LOSS + min-SN — an OUT-OF-ORDER writer (SN arrival != SN order): the newest D by real SN
+       survive; the last-ARRIVED (non-newest-SN) sample is the one physically dropped.
+   (4) CHAIN INTACT — reopen a fresh encrypted store on the same DB: the v3 chain VERIFIES clean (no
+       false-reject; the delete-txn survivor re-MAC is load-bearing) + get-range newest-D byte-exact.
+   (5) CRASH lower-bar — a fault between put and delete leaks the prior blob (physical > D) but get-range
+       still logically compacts (newest D) + the chain verifies + the leak self-heals on the next delete.
+   (6) FALLBACK + KEEP_ALL — a KEEP_ALL encrypted store deletes nothing (physical == N); the FILE
+       encrypted tier (no :delete slot) falls back to logical-only (get-range still newest-D)."
+  (unless (dds.dare:dare-available-p)
+    (format t "~&  [enc-physical-reclaim] SKIP — OpenSSL >= 3.5 not available~%")
+    (return-from run-durability-encrypted-physical-reclaim-test t))
+  (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (kh1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1))
+         (kh2 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xC2))
+         (dirs '()))
+    (labels ((%encdir (tag)
+               (let ((d (uiop:pathname-directory-pathname (%sqlite-tmp-db-path tag))))
+                 (push d dirs) d))
+             (%enc-build (dir)
+               ;; encrypted SQLite store rooted at DIR (db + epochs.dat + logmac.anchor + keys coexist,
+               ;; exactly as run-durability-sqlite-dare-test); constructed CLOSED (caller store-opens).
+               (dds.durability:make-encrypted-store
+                (dds.durability:make-sqlite-store
+                 :path (uiop:merge-pathnames* (make-pathname :name "durability" :type "sqlite3") dir))
+                (dds.dare:make-file-key-provider :dir dir)
+                :epoch-dir dir))
+             (%sns (recs) (sort (mapcar #'dds.durability:durable-record-sn recs) #'<))
+             (%gsig (recs) (mapcar (lambda (r) (cons (aref (dds.durability:durable-record-writer-guid r) 0)
+                                                     (dds.durability:durable-record-sn r)))
+                                   recs)))
+      (unwind-protect
+           (progn
+             ;; (1) PHYSICAL RECLAIM — inner physical converges to D=2 (RED pre-3a = 6)
+             (let* ((dir (%encdir "enc-phys")) (s (%enc-build dir)))
+               (dds.durability:store-open s :keep-last 2)
+               (dotimes (i 6) (dds.durability:store-put s "Enc" g0 (1+ i) kh1 :data (%make-small-payload (1+ i))))
+               (%check :encpr-physical (= 2 (dds.durability:store-count s nil))
+                       (format nil "inner PHYSICAL count converges to D=2 without close (RED pre-3a=6), got ~d"
+                               (dds.durability:store-count s nil)))
+               (%check :encpr-logical (= 2 (dds.durability:store-count s "Enc"))
+                       (format nil "logical per-topic count = D=2, got ~d" (dds.durability:store-count s "Enc")))
+               (let ((recs (dds.durability:store-get-range s "Enc")))
+                 (%check :encpr-newest (equal '(5 6) (%sns recs))
+                         (format nil "get-range = newest D by SN (5 6), got ~s" (%sns recs)))
+                 (%check :encpr-exact
+                         (equalp (%make-small-payload 6)
+                                 (dds.durability:durable-record-payload
+                                  (find 6 recs :key #'dds.durability:durable-record-sn)))
+                         "surviving newest payload decrypts byte-exact"))
+               (dds.durability:store-close s))
+             ;; (2) two instances each converge to D independently
+             (let* ((dir (%encdir "enc-2inst")) (s (%enc-build dir)))
+               (dds.durability:store-open s :keep-last 2)
+               (dotimes (i 5) (dds.durability:store-put s "Enc" g0 (1+ i)  kh1 :data (%make-small-payload (1+ i))))
+               (dotimes (i 5) (dds.durability:store-put s "Enc" g0 (+ 20 i) kh2 :data (%make-small-payload (+ 20 i))))
+               (%check :encpr-2inst-phys (= 4 (dds.durability:store-count s nil))
+                       (format nil "two instances each bounded to D=2 -> inner physical = 4, got ~d"
+                               (dds.durability:store-count s nil)))
+               (let* ((recs (dds.durability:store-get-range s "Enc"))
+                      (k1 (count kh1 recs :key #'dds.durability:durable-record-key-hash :test #'equalp))
+                      (k2 (count kh2 recs :key #'dds.durability:durable-record-key-hash :test #'equalp)))
+                 (%check :encpr-2inst-indep (and (= 2 k1) (= 2 k2))
+                         (format nil "each instance keeps D=2 logically, got kh1=~d kh2=~d" k1 k2)))
+               (dds.durability:store-close s))
+             ;; (3) NO DATA LOSS + min-SN under an OUT-OF-ORDER writer (SNs arrive 3,1,5,2,6,4)
+             (let* ((dir (%encdir "enc-ooo")) (s (%enc-build dir)))
+               (dds.durability:store-open s :keep-last 2)
+               (dolist (sn '(3 1 5 2 6 4))
+                 (dds.durability:store-put s "Enc" g0 sn kh1 :data (%make-small-payload sn)))
+               (%check :encpr-ooo-phys (= 2 (dds.durability:store-count s nil))
+                       (format nil "out-of-order writer: inner physical bounded to D=2, got ~d"
+                               (dds.durability:store-count s nil)))
+               (let ((recs (dds.durability:store-get-range s "Enc")))
+                 (%check :encpr-ooo-newest (equal '(5 6) (%sns recs))
+                         (format nil "min-SN drop keeps newest D by real SN (5 6) under out-of-order arrival ~
+                                 (last-arrived sn4 dropped, not sn5/sn6), got ~s" (%sns recs)))
+                 (%check :encpr-ooo-exact
+                         (and (equalp (%make-small-payload 5)
+                                      (dds.durability:durable-record-payload
+                                       (find 5 recs :key #'dds.durability:durable-record-sn)))
+                              (equalp (%make-small-payload 6)
+                                      (dds.durability:durable-record-payload
+                                       (find 6 recs :key #'dds.durability:durable-record-sn))))
+                         "newest-D payloads (5,6) survive byte-exact — no newest-D sample deleted"))
+               (dds.durability:store-close s))
+             ;; (4) CHAIN INTACT — reopen a fresh encrypted store on the same DB, verify clean + newest-D
+             (let ((dir (%encdir "enc-chain")))
+               (let ((s (%enc-build dir)))
+                 (dds.durability:store-open s :keep-last 2)
+                 (dotimes (i 6) (dds.durability:store-put s "Enc" g0 (1+ i) kh1 :data (%make-small-payload (1+ i))))
+                 (dds.durability:store-close s))
+               (let* ((s2 (%enc-build dir))
+                      (clean (handler-case (progn (dds.durability:store-open s2 :keep-last 2) t)
+                               (error () nil))))
+                 (%check :encpr-chain-clean clean
+                         "reopened encrypted store VERIFIES the v3 chain clean (no false-reject — the delete-txn re-MAC is load-bearing)")
+                 (when clean
+                   (let ((recs (dds.durability:store-get-range s2 "Enc")))
+                     (%check :encpr-chain-newest (equal '(5 6) (%sns recs))
+                             (format nil "reopen: get-range = newest D (5 6), got ~s" (%sns recs)))
+                     (%check :encpr-chain-exact
+                             (equalp (%make-small-payload 5)
+                                     (dds.durability:durable-record-payload
+                                      (find 5 recs :key #'dds.durability:durable-record-sn)))
+                             "reopen: survivor payload decrypts byte-exact")))
+                 (ignore-errors (dds.durability:store-close s2))))
+             ;; (5) CRASH lower-bar — fault between put and delete: leak, logical-correct, self-heal, clean reopen
+             (let* ((dir (%encdir "enc-crash")) (s (%enc-build dir)))
+               (dds.durability:store-open s :keep-last 2)
+               (dds.durability:store-put s "Enc" g0 1 kh1 :data (%make-small-payload 1))
+               (dds.durability:store-put s "Enc" g0 2 kh1 :data (%make-small-payload 2))
+               ;; the 3rd put supersedes -> the decorator issues store-delete; inject the fault mid-delete
+               (let ((dds.durability::*durability-debug-compact-fault* t))
+                 (%check :encpr-crash-faulted
+                         (handler-case (progn (dds.durability:store-put s "Enc" g0 3 kh1 :data (%make-small-payload 3)) nil)
+                           (error () t))
+                         "the store-delete fault propagates through the decorator put (crash between put and delete)"))
+               (%check :encpr-crash-leak (> (dds.durability:store-count s nil) 2)
+                       (format nil "crash between put and delete leaks the prior blob (physical > D), got ~d"
+                               (dds.durability:store-count s nil)))
+               (%check :encpr-crash-logical (equal '(2 3) (%sns (dds.durability:store-get-range s "Enc")))
+                       (format nil "get-range still logically compacts to newest D (2 3) despite the leak, got ~s"
+                               (%sns (dds.durability:store-get-range s "Enc"))))
+               ;; self-heal: a subsequent (fault-cleared) superseding put reclaims the leak -> physical back to D
+               (dds.durability:store-put s "Enc" g0 4 kh1 :data (%make-small-payload 4))
+               (%check :encpr-crash-selfheal (= 2 (dds.durability:store-count s nil))
+                       (format nil "the leak self-heals on the next delete -> physical back to D=2, got ~d"
+                               (dds.durability:store-count s nil)))
+               (%check :encpr-crash-heal-newest (equal '(3 4) (%sns (dds.durability:store-get-range s "Enc")))
+                       (format nil "post-self-heal get-range = newest D (3 4), got ~s"
+                               (%sns (dds.durability:store-get-range s "Enc"))))
+               (dds.durability:store-close s)
+               (let* ((s2 (%enc-build dir))
+                      (clean (handler-case (progn (dds.durability:store-open s2 :keep-last 2) t)
+                               (error () nil))))
+                 (%check :encpr-crash-reopen-clean clean
+                         "after the crash-fault the store reopens CLEAN (the delete rolled back -> chain intact)")
+                 (ignore-errors (dds.durability:store-close s2))))
+             ;; (6a) KEEP_ALL encrypted store deletes nothing (the window guard requires :keep-last)
+             (let* ((dir (%encdir "enc-keepall")) (s (%enc-build dir)))
+               (dds.durability:store-open s :keep-all)
+               (dotimes (i 5) (dds.durability:store-put s "Enc" g0 (1+ i) kh1 :data (%make-small-payload (1+ i))))
+               (%check :encpr-keepall (= 5 (dds.durability:store-count s nil))
+                       (format nil "KEEP_ALL encrypted store deletes nothing (physical == N=5), got ~d"
+                               (dds.durability:store-count s nil)))
+               (dds.durability:store-close s))
+             ;; (6b) FILE encrypted tier (no :delete slot) -> logical-only fallback, byte-identical to pre-3a
+             (let* ((d-dir (uiop:pathname-directory-pathname (%sqlite-tmp-db-path "enc-file-d")))
+                    (k-dir (uiop:pathname-directory-pathname (%sqlite-tmp-db-path "enc-file-k"))))
+               (push d-dir dirs) (push k-dir dirs)
+               (let ((s (dds.durability:make-encrypted-store
+                         (dds.durability:make-file-store :dir d-dir)
+                         (dds.dare:make-file-key-provider :dir k-dir)
+                         :epoch-dir d-dir)))
+                 (dds.durability:store-open s :keep-last 2)
+                 (dotimes (i 6) (dds.durability:store-put s "Enc" g0 (1+ i) kh1 :data (%make-small-payload (1+ i))))
+                 (%check :encpr-file-logical (equal '(5 6) (%sns (dds.durability:store-get-range s "Enc")))
+                         (format nil "file encrypted tier: logical-only fallback still compacts to newest D (5 6), got ~s"
+                                 (%sns (dds.durability:store-get-range s "Enc"))))
+                 (dds.durability:store-close s)))
+             ;; (7) FIX 1 — multi-writer-per-instance: the SQLite physical-reclaim get-range == the file
+             ;; encrypted tier's LOGICAL-ONLY get-range EXACTLY. A pure-min-SN drop kept the WRONG survivor
+             ;; (RED: sqlite kept guidA·sn5 while the logical view keeps guidB·sn3, max by (guid,sn)).
+             (let* ((sdir (%encdir "enc-mw-sq"))
+                    (fd-d (uiop:pathname-directory-pathname (%sqlite-tmp-db-path "enc-mw-fd")))
+                    (fd-k (uiop:pathname-directory-pathname (%sqlite-tmp-db-path "enc-mw-fk")))
+                    (ga   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+                    (gb   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+                    (sq   (%enc-build sdir))
+                    (fl   (dds.durability:make-encrypted-store
+                           (dds.durability:make-file-store :dir fd-d)
+                           (dds.dare:make-file-key-provider :dir fd-k) :epoch-dir fd-d)))
+               (push fd-d dirs) (push fd-k dirs)
+               (setf (aref ga 0) 1) (setf (aref gb 0) 2)     ; A.guid < B.guid
+               (dolist (s (list sq fl)) (dds.durability:store-open s :keep-last 2))
+               ;; one instance (same key-hash) fed by 2 writers; SN order (5,3,1,6) != (guid,sn) order
+               (dolist (spec (list (list ga 5) (list gb 3) (list ga 1) (list gb 6)))
+                 (dolist (s (list sq fl))
+                   (dds.durability:store-put s "Enc" (first spec) (second spec) kh1
+                                             :data (%make-small-payload (second spec)))))
+               (let ((sq-sig (%gsig (dds.durability:store-get-range sq "Enc")))
+                     (fl-sig (%gsig (dds.durability:store-get-range fl "Enc"))))
+                 (%check :encpr-mw-exact (equal sq-sig fl-sig)
+                         (format nil "multi-writer: SQLite physical-reclaim get-range == file logical-only oracle ~
+                                 EXACTLY (drop by (guid,sn), not pure SN); sqlite=~s oracle=~s" sq-sig fl-sig)))
+               (dds.durability:store-close sq) (dds.durability:store-close fl))
+             ;; (8) FIX 2 — an idempotent re-put of an already-stored (guid,sn) must NOT delete a live
+             ;; newest-D row (the deterministic surrogate makes store-put a physical no-op; the window
+             ;; append is dedup'd on the surrogate). RED pre-fix: the duplicate append evicts sn1.
+             (let* ((dir (%encdir "enc-idem")) (s (%enc-build dir)))
+               (dds.durability:store-open s :keep-last 2)
+               (dds.durability:store-put s "Enc" g0 1 kh1 :data (%make-small-payload 1))
+               (dds.durability:store-put s "Enc" g0 2 kh1 :data (%make-small-payload 2))
+               (dds.durability:store-put s "Enc" g0 2 kh1 :data (%make-small-payload 2)) ; idempotent re-put
+               (%check :encpr-idem-phys (= 2 (dds.durability:store-count s nil))
+                       (format nil "idempotent re-put must not delete a live row (physical stays D=2), got ~d"
+                               (dds.durability:store-count s nil)))
+               (%check :encpr-idem-newest (equal '(1 2) (%sns (dds.durability:store-get-range s "Enc")))
+                       (format nil "idempotent re-put must not lose sn1 (get-range stays (1 2)), got ~s"
+                               (%sns (dds.durability:store-get-range s "Enc"))))
+               (dds.durability:store-close s))
+             ;; (9) FIX 3 — :purge clears the prior-surrogate window so a later same-instance write with a
+             ;; LOWER SN than the purged entries is not mis-evicted by the stale window (bounds RAM too).
+             ;; RED pre-fix: the stale window (5,6) drops the fresh sn1 as the min -> physical 0, sn1 lost.
+             (let* ((dir (%encdir "enc-purge")) (s (%enc-build dir)))
+               (dds.durability:store-open s :keep-last 2)
+               (dds.durability:store-put s "Enc" g0 5 kh1 :data (%make-small-payload 5))
+               (dds.durability:store-put s "Enc" g0 6 kh1 :data (%make-small-payload 6))
+               (dds.durability:store-purge s "Enc")
+               (%check :encpr-purge-empty (= 0 (dds.durability:store-count s nil))
+                       (format nil "purge empties the inner store, got ~d" (dds.durability:store-count s nil)))
+               (dds.durability:store-put s "Enc" g0 1 kh1 :data (%make-small-payload 1)) ; lower SN than purged 5,6
+               (%check :encpr-purge-nostale (= 1 (dds.durability:store-count s nil))
+                       (format nil "post-purge lower-SN write survives (window cleared), physical=~d [RED pre-fix=0]"
+                               (dds.durability:store-count s nil)))
+               (%check :encpr-purge-getrange (equal '(1) (%sns (dds.durability:store-get-range s "Enc")))
+                       (format nil "post-purge get-range = (1), got ~s" (%sns (dds.durability:store-get-range s "Enc"))))
+               (dds.durability:store-close s)))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))
+      t)))
+
 ;;; --- File-store runtime threshold compaction (WP-DURABILITY-COMPACTION-FILE, Sliver 2) ---
 ;;; The APPEND-ONLY file store cannot delete-in-place, so a continuously-open KEEP_LAST log grew
 ;;; unboundedly between opens (only on-open compaction, ADR 0029). Sliver 2 adds RUNTIME threshold

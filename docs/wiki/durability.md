@@ -898,9 +898,11 @@ vtable, config-selected via `make-sqlite-store-factory`**).
 
 The `durable-store` vtable (`store.lisp:18-32`) **is the stable, fixed backend contract**: a
 `defstruct` of function slots (`put`/`get-range`/`topics`/`purge`/`open`/`close`/`count-fn`/`sync`/
-`set-chain-mac-fn`) behind the public `store-*` dispatchers. Every backend fills the **same** vtable
-unchanged; selection is the 0-arg store-factory closure on the service-spec. `make-sqlite-store`
-adds a **second on-disk backend** implementing that vtable — it does **not** fork or extend it.
+`set-chain-mac-fn`/`delete`) behind the public `store-*` dispatchers. Every backend fills the **same**
+vtable unchanged; selection is the 0-arg store-factory closure on the service-spec. `make-sqlite-store`
+adds a **second on-disk backend** implementing that vtable — it does **not** fork or extend it. (The
+`delete` slot is the newest **additive** member — physical reclaim, Sliver 3a §8.8.4 — with the same
+NIL-fallback binding as `sync`/`set-chain-mac-fn`: a backend may implement it or leave it NIL.)
 
 **Config-selection is a one-line factory swap.** `make-sqlite-store-factory` mirrors
 `make-persistent-store-factory` exactly — the only change is `make-sqlite-store` in place of
@@ -951,9 +953,11 @@ per-row keyed MAC chain is at parity with the file store (§8.8.1).
 round-trips identically on Clasp and SBCL (no reader conditionals). Transitive: `iterate`; native:
 `libsqlite3` (SBOM + provenance recorded).
 
-**Follow-ons (deferred):** encrypted-tier physical reclaim + whole-topic-deletion residual (Sliver 3);
-dynamic-topic parity. (SQLite online compaction = Sliver 1, RESOLVED §8.8.2; file-store runtime/threshold
-compaction = Sliver 2, RESOLVED §8.8.3; metadata-3c confidentiality = RESOLVED §8.9.)
+**Follow-ons:** encrypted-tier physical reclaim — **SQLite online case RESOLVED (Sliver 3a, §8.8.4)**;
+file backend `:delete` (Sliver 3b) + compaction-on-open cross-restart sweep (Sliver 3c) still deferred;
+plus whole-topic-deletion residual and dynamic-topic parity. (SQLite online compaction = Sliver 1,
+RESOLVED §8.8.2; file-store runtime/threshold compaction = Sliver 2, RESOLVED §8.8.3; metadata-3c
+confidentiality = RESOLVED §8.9.)
 
 #### 8.8.1 SQLite per-row keyed MAC chain (WP-SQLITE-MAC-CHAIN, ADR 0049 §9 / ADR 0045 §9)
 
@@ -1031,8 +1035,8 @@ verifies clean + get-range returns newest DEPTH; pure-Lisp MAC oracle, both impl
 `run-durability-sqlite-crash-consistency-test` (fault injected between the DELETE and the re-MAC at both
 sites → the txn rolls back → fresh reopen verifies clean + recovers the pre-eviction set; RED-proven as a
 `SQCC-OPEN-RECOVERS` false-reject when the on-open transaction is neutralized). Sliver 2 (file-store
-runtime/threshold compaction) is RESOLVED (§8.8.3); Sliver 3 (encrypted-tier physical reclaim +
-whole-topic-deletion residual) follows.
+runtime/threshold compaction) is RESOLVED (§8.8.3); Sliver 3a (encrypted-tier physical reclaim, SQLite
+online case) is RESOLVED (§8.8.4); Sliver 3b (file backend `:delete`) + 3c (cross-restart sweep) follow.
 
 #### 8.8.3 File-store runtime/threshold compaction (WP-DURABILITY-COMPACTION-FILE, Sliver 2)
 
@@ -1058,7 +1062,8 @@ cannot delete-in-place, so — unlike the SQLite per-put DELETE of §8.8.2 — i
   `<tid>.tmp.log` files (an un-renamed temp is uncommitted; the original log is authoritative).
 - **Same exemptions.** KEEP_ALL does no threshold compaction; NIL-key-hash + lifecycle records are never
   depth-evicted; a below-threshold store's append path is byte-identical (no rewrite fires). The
-  durable-store **vtable is unchanged** (internal to `make-file-store`; a `store-delete` slot = Sliver 3).
+  durable-store **vtable is unchanged** (internal to `make-file-store`; the file store's own physical
+  `store-delete` slot = Sliver **3b** — until then a file `store-delete` returns `:unsupported`, §8.8.4).
 - **Logical read view = exactly D.** The physical batching holds up to `D + threshold` records per
   instance between rewrites, so — to keep the exported `store-get-range` / per-topic `store-count`
   contract identical to the memory + SQLite backends (whose online eviction returns the logical newest-D
@@ -1087,6 +1092,65 @@ appended after a mid-run rewrite, are not lost to a stale fd), and
 `run-durability-file-crash-consistency-test` (fault via `*durability-debug-file-rewrite-fault*` after the
 tmp fsync, before the rename → the original log is intact → fresh reopen verifies the chain clean +
 keeps the newest D, no data loss, no false-reject; a pure-Lisp MAC oracle → both impls, no OpenSSL).
+
+#### 8.8.4 Encrypted-tier physical reclaim (WP-DURABILITY-ENCRECLAIM-SQLITE, Sliver 3a)
+
+The 3c encrypted decorator (§8.9) opens its inner store **KEEP_ALL** and puts a NIL key-hash + a
+per-SAMPLE guid-surrogate + `sn'=0`, so the inner store has no instance identity and its own KEEP_LAST
+eviction never fires: superseded blobs were compacted **logically** at `store-get-range` but **physically
+retained** until `store-purge` (the inner `store-count nil` grew to N). Sliver 3a physically reclaims them
+for the **continuously-open SQLite** encrypted tier via three additive pieces:
+
+- **Additive `store-delete` vtable slot** (`store.lisp`) — `store-delete (store topic writer-guid sn) →
+  t | :unsupported`, per-record delete-by-**primary-key** (NOT evict-instance: the decorator knows the
+  exact prior surrogate to reclaim). It is the EXACT NIL-fallback binding of `store-sync` /
+  `store-set-chain-mac-fn`: a NIL slot returns `:unsupported` and the decorator falls back to logical-only
+  (byte-identical to pre-3a). **SQLite and memory implement it; the file store does not** (Sliver 3b) — so
+  the file encrypted tier stays logical-only, unchanged. An additive slot on the stable vtable, not a fork.
+- **Thin SQLite `:delete`** — the `DELETE FROM record WHERE topic=? AND writer_guid=? AND sn=?` + the
+  `%sqlite-recompute-topic` survivor re-MAC of Sliver 1 (§8.8.2), wrapped in **ONE** `sqlite:with-
+  transaction` so it is **internally atomic**: a crash between the DELETE and the re-MAC rolls back, so a
+  clean chained store never false-rejects on reopen (the Sliver-1 hazard, closed by the txn). Reuses the
+  Sliver-1 machinery (DRY).
+- **Decorator online prior-surrogate window** — because the surrogate is per-SAMPLE, the decorator
+  remembers each instance's `(topic-hash, real-key-hash) → {(real-guid, real-sn, surrogate)}` (bounded by
+  the effective depth `D` = `eff-hd` from `store-open`). On each `:keep-last` `:data` put with a non-NIL
+  key-hash, when the window exceeds `D` it physically deletes the entries **smallest by `%record-guid-sn<`**
+  — writer-guid bytes ascending, THEN sn, the SAME order as the logical `%keep-last-latest`
+  (`store-delete inner topic-hash surrogate 0`) — and rewrites the window to the newest `D`. **Ordering by
+  `(guid, sn)` (NOT pure SN, NOT oldest-arrived) is the no-data-loss crux**: KEEP_LAST keeps the newest `D`
+  by `%record-guid-sn<`, so the physical set equals the logical newest-D `%compact-topic-records` view
+  **EXACTLY for ALL cases** — a single instance fed by MULTIPLE writer GUIDs (a pure-sn drop keeps the wrong
+  survivor when the min-sn sample sits on the higher writer-guid — a get-range divergence) and an
+  out-of-order writer (arrival ≠ SN order). The append is **dedup'd on the deterministic surrogate**, so an
+  idempotent re-put of an already-tracked `(guid, sn)` — which `store-put` no-ops physically
+  (`INSERT OR IGNORE`) — never double-counts and evicts a LIVE newest-D row. The window is cleared on
+  `store-close` / `store-open` and per-topic on `store-purge` (bounds decorator RAM; prevents a stale
+  window from mis-evicting a later same-instance write). Residual (bounded, documented — parity with the
+  Sliver-2 tombstone residual): a settled instance's window entry persists until `store-purge`/`store-close`.
+
+The inner `store-count nil` now **converges to Σ D per instance** instead of N. The **put+delete PAIR is
+deliberately NON-atomic** — a LOWER bar than Sliver 1/2: a crash between the decorator's put and its
+`store-delete` leaks the prior blob (physically retained, still logically compacted at get-range) and
+**self-heals on the next delete** — a space leak, never a false-reject. `KEEP_ALL` deletes nothing (the
+window guard requires `:keep-last`).
+
+**Deferred (3a → 3b/3c):** the **file backend `:delete`** (append-log mark-superseded + threshold rewrite)
+is Sliver **3b** (until then the file encrypted tier is `:unsupported` → logical-only); the
+**compaction-on-open sweep** of a prior session's ≤D cross-restart leftovers is Sliver **3c** (3a's online
+window bounds only the continuously-open case).
+
+Tests: `run-durability-store-delete-slot-test` (the additive slot + NIL-fallback binding — memory/SQLite
+delete a keyed row + return T, the file store returns `:unsupported` and is untouched; impl-agnostic, no
+OpenSSL), and `run-durability-encrypted-physical-reclaim-test` (continuously-open encrypted SQLite
+`:keep-last 2`, N=6 one instance → inner physical `store-count nil` = **2**, RED pre-3a = 6; get-range =
+newest D byte-exact; two instances each bounded to D; an **out-of-order** writer's newest-D survive; a
+**multi-writer** single instance → the SQLite physical get-range == the file logical-only oracle EXACTLY
+[`(guid,sn)` drop, not pure SN — RED kept the wrong survivor]; an **idempotent re-put** never deletes a
+live newest-D row [surrogate-dedup'd append — RED lost sn1]; **`store-purge`** clears the window so a later
+lower-SN write is not mis-evicted [RED mis-evicted it]; reopen VERIFIES the v3 chain clean + newest-D; a
+fault between put and delete leaks + get-range stays newest-D + self-heals + reopens clean; KEEP_ALL deletes
+nothing; the file encrypted tier stays logical-only).
 
 ### 8.9 At-rest metadata confidentiality (Phase 3c, WP-DURABILITY-METADATA-CONF-3c)
 

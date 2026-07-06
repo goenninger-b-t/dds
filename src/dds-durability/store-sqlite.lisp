@@ -432,7 +432,37 @@
              (setf (car cmf-cell) fn)
              (setf (car req-cell) required)
              (setf (car gf-cell) grandfather))
-           t))))))
+           t)
+
+         :delete
+         ;; per-record physical reclaim (ADR 0025 §10.3, Sliver 3a — the encrypted decorator's
+         ;; superseded-surrogate eviction): DELETE the (topic, writer-guid, sn) row and re-MAC the
+         ;; survivors in ONE transaction — INTERNALLY ATOMIC (a crash between the DELETE and the re-MAC
+         ;; rolls back so a clean chained store never false-rejects on reopen; the Sliver-1 hazard the
+         ;; txn wrap closed). Near-verbatim lift of the online-evict block's DELETE + %sqlite-recompute-
+         ;; topic + with-transaction (DRY). The put+delete PAIR need NOT be atomic (a LOWER bar than the
+         ;; compacting DELETE): a crash between the decorator's put and this delete leaks the prior blob
+         ;; (get-range still logically compacts it) and self-heals on the next delete.
+         (lambda (topic writer-guid sn)
+           (dds.pal:with-lock (lock)
+             (%ensure-db)
+             (sqlite:with-transaction (car db-cell)
+               (sqlite:execute-non-query
+                (car db-cell)
+                "DELETE FROM record WHERE topic=? AND writer_guid=? AND sn=?"
+                topic writer-guid (%sn->be8 sn))
+               ;; simulated crash between the DELETE and the re-MAC (test-only; rolls back -> leak, no reject)
+               (when *durability-debug-compact-fault*
+                 (error "dds.durability: *durability-debug-compact-fault* — simulated crash between the ~
+                         store-delete DELETE and the chain re-MAC (topic ~a)" topic))
+               ;; re-MAC the survivors so the chain still verifies on the next reopen (ADR 0045; the same
+               ;; machinery the online evict + on-open compaction use after their DELETEs — no false-reject)
+               (when (car cmf-cell)
+                 (let ((tail (%sqlite-recompute-topic (car db-cell) topic (car cmf-cell))))
+                   (if tail
+                       (setf (gethash topic chain-macs) tail)
+                       (remhash topic chain-macs)))))
+             t)))))))
 
 (defun* make-sqlite-store-factory (&key dir key-dir (db-name "durability.sqlite3")
                                         (history-kind :keep-all) (history-depth 1))

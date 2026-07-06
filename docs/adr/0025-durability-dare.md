@@ -255,7 +255,10 @@ These were formerly "out of scope"; per owner directive they are MUST, each its 
      `store-open`, as `service-start` does). Per-topic `store-count topic` is the logical
      (post-compaction) count; the total `store-count nil` is the inner PHYSICAL count (includes
      not-yet-physically-reclaimed superseded blobs), so total ≠ Σ per-topic on a KEEP_LAST store — a
-     diagnostic-only divergence. The v3 log-MAC chain (ADR 0045) covers the sealed-metadata frame
+     diagnostic-only divergence. (Sliver 3a reclaims those superseded blobs online for the **SQLite**
+     backend, so the SQLite total now CONVERGES to the logical Σ; the divergence persists for the file
+     tier until 3b and for cross-restart ≤D leftovers until 3c — see the Physical space residual below.)
+     The v3 log-MAC chain (ADR 0045) covers the sealed-metadata frame
      unchanged (its per-topic seed is keyed on the topic-hash, still per-topic-distinct).
 
    **Residuals (accepted, documented):**
@@ -264,10 +267,45 @@ These were formerly "out of scope"; per owner directive they are MUST, each its 
      adversary can tell two records share a topic, and count records per topic, without learning the
      name. (Likewise the GUID-surrogate reveals that two records share a (guid,sn), i.e. are the same
      retained sample — trivially true anyway.)
-   - **Physical space** — superseded/settled blobs are compacted LOGICALLY (correct reads) but not
-     PHYSICALLY reclaimed on the encrypted tier until `store-purge` (the inner store runs KEEP_ALL,
-     since keep-last-by-real-SN ordering is impossible on a hashed surrogate without leaking SN or an
-     order-preserving construction, both disallowed). A space, not a correctness, tradeoff.
+   - **Physical space (SQLite online case: RESOLVED — AS-BUILT, WP-DURABILITY-ENCRECLAIM-SQLITE / Sliver
+     3a).** Superseded/settled blobs on the encrypted tier were compacted LOGICALLY (correct reads) but
+     physically RETAINED until `store-purge` — the inner store runs KEEP_ALL (keep-last-by-real-SN ordering
+     is impossible on a hashed surrogate without leaking SN), so its own KEEP_LAST eviction never fires.
+     Sliver 3a physically reclaims them for the **continuously-open SQLite** backend via three additive
+     pieces:
+     - an **additive `store-delete` vtable slot** (`store.lisp`) — per-record delete-by-(topic, writer-
+       guid, sn), with the EXACT NIL-fallback binding of `store-sync` / `store-set-chain-mac-fn`: a backend
+       that omits the slot returns `:unsupported` and the decorator falls back to today's logical-only
+       compaction (byte-identical). SQLite + memory implement it; the file store does not (yet — 3b).
+     - a **thin SQLite `:delete`** — the same DELETE + `%sqlite-recompute-topic` survivor re-MAC as the
+       Sliver-1 online evict, wrapped in ONE `sqlite:with-transaction` so it is INTERNALLY ATOMIC (a crash
+       between the DELETE and the re-MAC rolls back ⇒ a clean chained store never false-rejects on reopen).
+     - a **decorator online prior-surrogate window** — the surrogate is per-SAMPLE, so the decorator
+       remembers each instance's `(topic-hash, real-key-hash) → {(real-guid, real-sn, surrogate)}` and, when
+       the window exceeds the effective depth D (`eff-hd` from `store-open`), physically deletes the entries
+       **smallest by `%record-guid-sn<`** (writer-guid bytes ascending, THEN sn — the SAME order as the
+       logical view's `%keep-last-latest`, via `store-delete inner th surrogate 0`), so the physical set
+       equals the logical newest-D `%compact-topic-records` view **EXACTLY for ALL cases** — including a
+       single instance fed by MULTIPLE writer GUIDs (a pure-sn drop would keep the wrong survivor when the
+       min-sn sample sits on the higher writer-guid — a get-range divergence) and an out-of-order writer
+       (the no-data-loss crux). The window append is **dedup'd on the deterministic surrogate**, so an
+       idempotent re-put of an already-tracked (guid,sn) — which `store-put` no-ops physically (INSERT OR
+       IGNORE) — never double-counts and evicts a LIVE newest-D row (a public-API idempotency-contract
+       data-loss defect the naive append had). The window is cleared on `store-close` / `store-open` and
+       per-topic on `store-purge` (bounds decorator RAM; prevents a stale window from mis-evicting a later
+       same-instance write).
+     The inner PHYSICAL count (`store-count nil`) now converges to Σ D per instance instead of N. The
+     put+delete PAIR is deliberately NON-atomic (a LOWER bar than Sliver 1/2): a crash between the put and
+     the delete leaks the prior blob (physically retained, still logically compacted at get-range) and
+     self-heals on the next delete — a space leak, never a false-reject.
+     **Still deferred:** the **file backend `:delete`** (append-log mark-superseded + threshold rewrite) is
+     Sliver **3b** (the file encrypted tier stays logical-only until then, `:unsupported`), and the
+     **compaction-on-open sweep** of a prior session's ≤D cross-restart leftovers is Sliver **3c** (3a's
+     online window bounds only the continuously-open case). A space, not a correctness, tradeoff throughout.
+     **Steady-state window residual (bounded, documented — parity with the Sliver-2 tombstone residual):**
+     a settled/quiescent instance's window entry persists in `instance-windows` until `store-purge` or
+     `store-close` (bounded by the count of live + this-session-touched instances, NOT the sample rate); a
+     put-time settle-hook that prunes a settled instance's window entry is a future refinement.
    - **`store-topics` cross-restart** — the decorator names topics from an in-session reverse map
      (topic-hash → real name); after a restart the plaintext names are off-disk, so `store-topics`
      enumerates only topics touched this session. Records are still fully located/served by topic-hash
