@@ -17,17 +17,22 @@
 (let* ((dir     (or (uiop:getenv "DPERSIST_DIR") "/tmp/dpersist-D"))
        (key-dir (or (uiop:getenv "DPERSIST_KEYDIR") "/tmp/dpersist-K"))
        (secs    (parse-integer (or (uiop:getenv "DPERSIST_SECS") "22")))
+       (backend (or (uiop:getenv "DPERSIST_BACKEND") "file"))
+       (peers   (loop for p in (uiop:split-string
+                                (or (uiop:getenv "DPERSIST_PEERS") "7410,7412,7414,7416,7418")
+                                :separator ",")
+                      collect (cons "127.0.0.1" (parse-integer p))))
        (spec (dds.durability:make-service-spec
               :domain 0
               :topics '(("Square" . "ShapeType"))
-              :store (dds.durability:make-persistent-store-factory
-                      :dir dir :key-dir key-dir)
-              :qos-overrides '(:data-representation (:xcdr1)
-                               :peers (("127.0.0.1" . 7410)))
+              :store (if (string-equal backend "sqlite")
+                         (dds.durability:make-sqlite-store-factory :dir dir :key-dir key-dir)
+                         (dds.durability:make-persistent-store-factory :dir dir :key-dir key-dir))
+              :qos-overrides (list :data-representation '(:xcdr1) :peers peers)
               :name "dpersist-run1"))
        (svc (dds.durability:make-durability-service spec)))
   (dds.durability:service-start svc)
-  (format t "~%SVC1-STARTED dir=~a key-dir=~a~%" dir key-dir) (force-output)
+  (format t "~%SVC1-STARTED dir=~a key-dir=~a backend=~a~%" dir key-dir backend) (force-output)
   (sleep secs)
   (let ((n (dds.durability:store-count (dds.durability:durability-service-store svc) "Square")))
     (format t "~%SVC1-COLLECTED Square=~d~%" n) (force-output))

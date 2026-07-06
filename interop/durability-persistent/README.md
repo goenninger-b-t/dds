@@ -235,6 +235,54 @@ wire surface**; the cryptographic substance is the published NIST/IETF Known-Ans
 `dds-dare` suite (FIPS-180-4 SHA-384, RFC-5869 HKDF, NIST SP800-38D GCM TC16, C2SP/CCTV ML-KEM-1024 —
 never self-generated), plus the in-process restart test above.
 
+## SQLite persistent backend (`DPERSIST_BACKEND=sqlite`) — end-to-end through SQLite, both peers
+
+The same 2-process restart proof, with the persistent store backed by **SQLite** (ADR 0049) instead of
+the append-log file store. `make-sqlite-store-factory` fills the identical fixed `durable-store` vtable
+and composes with the same DARE encrypted-store decorator, so the drivers select it purely by env gate —
+`DPERSIST_BACKEND=sqlite` (default `file`); `DPERSIST_PEERS` overrides the unicast SPDP peer ports
+(default `7410,7412,7414,7416,7418`, so discovery is robust when another domain-0 participant, e.g.
+`rtiddsspy`, already holds `7410`). Nothing else changes: same topic, same `:xcdr1` replay, same wire.
+
+The held copy on disk is `DIR/durability.sqlite3` (+ `-wal`/`-shm` sidecars) alongside `epochs.dat` +
+`logmac.anchor`. The payload BLOB column carries **only DARE-sealed ciphertext** (the `0201…`
+SecuredPayload header + AES-256-GCM body), the `mac` column carries the per-row keyed-MAC tamper-evidence
+chain (ADR 0045 parity), and the topic/guid/sn/kind metadata columns are cleartext by design (same as the
+file store's frame headers).
+
+### Live results (2026-07-06, this host, lo0; SQLite backend)
+
+Both legs run with the publisher **pkill'd and confirmed gone (`0` procs) ~60 s before the late-joiner
+starts**, so the late reader's pre-join history can ONLY have come from process 2's SQLite-served replay —
+not the (dead) publisher's own TRANSIENT_LOCAL retention. `collected == SQLite-reloaded == received` on
+both.
+
+| Leg | Peer | Collected → sealed to `durability.sqlite3` | Fresh proc reload+decrypt | Late-joiner received | First sample | Plaintext `GREEN` in DB |
+|---|---|---|---|---|---|---|
+| **1** | **Connext 7.3.1** | **687** (192 KB DB) | **687** (`SVC2-RELOADED-FROM-DISK`) | **687** | `#1 x=53 y=52` (pre-join origin) | **0** (sealed) |
+| **2** | **Fast DDS** | **200** (65 KB DB) | **200** (`SVC2-RELOADED-FROM-DISK`) | **200** | `1: x=50 y=50` (pre-join origin) | **0** (sealed) |
+
+The data crossed the 2-process boundary existing only as **AES-256-GCM ciphertext inside the SQLite DB**,
+with the tamper-evidence chain active; both an RTI and an eProsima late-joiner pulled it back byte-correct.
+This extends the file-store PERSISTENT proof (above) down to the SQLite backend end-to-end. The authoritative
+in-process cross-restart proof for SQLite is `dds.tests:run-durability-sqlite-service-test`
+(`store-open` reload replay) + `run-durability-sqlite-mac-chain-test` (tamper-evidence).
+
+### Run commands (SQLite variant)
+
+```sh
+# Leg 1 (Connext): DPERSIST_BACKEND=sqlite on both driver processes; fresh D+K; kill the publisher
+# (pkill -f shapes-pub/shapes_pub) BEFORE the late subscriber joins.
+DPERSIST_BACKEND=sqlite DPERSIST_DIR=/tmp/dpersist-sqlite-D DPERSIST_KEYDIR=/tmp/dpersist-sqlite-K \
+  DPERSIST_SECS=45 ./scripts/with-sbcl.sh --load interop/durability-persistent/driver-collect.lisp
+# … Connext TL pub (from this dir), pkill it, then:
+DPERSIST_BACKEND=sqlite DPERSIST_DIR=/tmp/dpersist-sqlite-D DPERSIST_KEYDIR=/tmp/dpersist-sqlite-K \
+  DPERSIST_SECS=45 ./scripts/with-sbcl.sh --load interop/durability-persistent/driver-serve.lisp
+# … then the LATE Connext TL sub. Inspect the sealed DB:
+sqlite3 /tmp/dpersist-sqlite-D/durability.sqlite3 'select count(*), sum(length(payload)) from record;'
+strings /tmp/dpersist-sqlite-D/durability.sqlite3 | grep -c GREEN   # must be 0
+```
+
 ## Clean-room / provenance
 
 Clean-room: the foreign peers are the committed `interop/connext/shapes-*` and `interop/fastdds/shapes`
