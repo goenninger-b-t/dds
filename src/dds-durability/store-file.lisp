@@ -145,6 +145,15 @@
   "Return the path for the topics.map file in DIR."
   (merge-pathnames (make-pathname :name "topics" :type "map") dir))
 
+(defun* %tmp-log-name-p (name)
+    (function ((or null string)) boolean)
+  "T iff NAME is a compaction-rewrite temp basename (`<topic-id>.tmp`, from `<topic-id>.tmp.log`).
+   A real topic-id is lowercase hex (no `.`), so a `.tmp` suffix unambiguously marks an orphaned,
+   UNCOMMITTED rewrite temp left by a crash between %rewrite-topic-log's tmp-write and its atomic
+   rename (the rename is the commit point) — such files are discarded/skipped on open (ADR 0029 §10)."
+  (let ((n (and name (length name))))
+    (and n (>= n 4) (string= ".tmp" (subseq name (- n 4))))))
+
 ;;; u64/u32 little-endian pack/unpack into octet vectors.
 
 (defun* %put-u64-le (vec offset value)
@@ -505,6 +514,30 @@
 
 ;;; Compaction: drop settled (dispose+unregister both present) instances.
 
+(defun* %keep-last-latest (records history-depth)
+    (function (list (integer 1)) list)
+  "Pass-2 KEEP_LAST filter: keep only the newest HISTORY-DEPTH :data records per non-NIL key-hash
+   instance (highest by %record-guid-sn<); lifecycle (:dispose/:unregister) and NIL-key-hash records
+   pass through; append order preserved. Shared by %compact-topic-records pass 2 AND the file store's
+   read-time logical view (store-get-range / per-topic store-count), so the file store's online newest-D
+   view matches the memory + SQLite backends' DEPTH-ONLY online eviction exactly (DRY, one definition).
+   Depth-only (no settled/pass-1 drop) — the bare backends never drop settled instances on read."
+  (let ((drop-set (make-hash-table :test #'eq))     ; record identity -> drop?
+        (buckets  (make-hash-table :test #'equalp))) ; non-NIL key-hash -> its :data records
+    (dolist (r records)
+      (let ((kh (durable-record-key-hash r)))
+        (when (and kh (eq :data (durable-record-kind r)))
+          (push r (gethash kh buckets '())))))
+    (maphash (lambda (kh bucket)
+               (declare (ignore kh))
+               (when (> (length bucket) history-depth)
+                 ;; sort ascending by (guid sn); oldest first; drop all but the newest depth
+                 (let* ((sorted  (sort (copy-list bucket) #'%record-guid-sn<))
+                        (to-drop (subseq sorted 0 (- (length sorted) history-depth))))
+                   (dolist (r to-drop) (setf (gethash r drop-set) t)))))
+             buckets)
+    (loop for r in records unless (gethash r drop-set) collect r)))
+
 (defun* %compact-topic-records (records &optional (history-kind :keep-all) (history-depth 1))
     (function (list &optional (member :keep-all :keep-last) (integer 1)) list)
   "Filter RECORDS keeping only live entries.
@@ -537,30 +570,40 @@
                                     (or (eq lk :dispose) (eq lk :unregister))))
                         collect r)))
       (if (eq history-kind :keep-last)
-          ;; pass 2: per-instance KEEP_LAST — keep only the newest HISTORY-DEPTH :data records
-          ;; per non-NIL key-hash; lifecycle records + NIL-key-hash records pass through
-          (let ((drop-set (make-hash-table :test #'eq))) ; record identity -> drop?
-            ;; bucket :data records per non-NIL key-hash
-            (let ((buckets (make-hash-table :test #'equalp)))
-              (dolist (r kept)
-                (let ((kh (durable-record-key-hash r)))
-                  (when (and kh (eq :data (durable-record-kind r)))
-                    (push r (gethash kh buckets '())))))
-              ;; for each bucket, mark the OLDER (below newest depth) records for dropping
-              (maphash (lambda (kh bucket)
-                         (declare (ignore kh))
-                         (when (> (length bucket) history-depth)
-                           ;; sort ascending by (guid sn); oldest first; drop all but last depth
-                           (let* ((sorted  (sort (copy-list bucket) #'%record-guid-sn<))
-                                  (n-drop  (- (length sorted) history-depth))
-                                  (to-drop (subseq sorted 0 n-drop)))
-                             (dolist (r to-drop)
-                               (setf (gethash r drop-set) t)))))
-                       buckets))
-            ;; filter kept, preserving append order
-            (loop for r in kept unless (gethash r drop-set) collect r))
+          ;; pass 2 (shared %keep-last-latest): per-instance KEEP_LAST — keep only the newest
+          ;; HISTORY-DEPTH :data records per non-NIL key-hash; lifecycle + NIL-key-hash pass through
+          (%keep-last-latest kept history-depth)
           ;; :keep-all — pass 2 skipped; return settled-only result
           kept))))
+
+;;; Runtime threshold compaction (Sliver 2, ADR 0029 §10 / ADR 0026 §10 item 2). The file store is
+;;; APPEND-ONLY — it cannot delete-a-record-in-place — so a continuously-open KEEP_LAST log cannot
+;;; evict per put like the memory/SQLite backends. Instead each superseding put bumps an O(1) per-topic
+;;; counter and crossing *compaction-superseded-threshold* triggers ONE atomic %rewrite-topic-log MID-RUN
+;;; (no close/open cycle), bounding the on-disk log to (live-count + threshold) records. The rewrite is
+;;; the SAME crash-atomic tmp+fsync+rename path the on-open compaction already uses (NO new transaction
+;;; machinery — the atomicity is inherited); the batch amortizes the O(topic) rewrite over ~threshold puts.
+
+(defparameter *compaction-superseded-threshold* 128
+  "Runtime file-store compaction trigger (ADR 0029 §10): the number of KEEP_LAST-superseded :data
+   records a per-topic append-log may accumulate before the store compacts that topic MID-RUN via the
+   atomic %rewrite-topic-log — WITHOUT a store-close/store-open cycle. An append-only log cannot
+   delete-in-place, so it compacts in BATCHES: each superseding :data put bumps an O(1) per-topic
+   counter, and crossing this threshold triggers ONE O(topic) atomic rewrite. Amortizes the rewrite
+   over ~threshold puts and bounds the on-disk log to (live-count + threshold) records (the memory /
+   SQLite backends evict per put, so they bound to live-count exactly; the append-only file store
+   trades a bounded slack for a batched rewrite). Larger ⇒ fewer rewrites, looser bound; smaller ⇒
+   tighter log, more frequent rewrites. Default 128: at most a few KiB of superseded frames per topic
+   between rewrites, negligible against the amortized rewrite cost. A special variable so it is tunable
+   (rebind before/among puts; read per put). KEEP_ALL stores never consult it (no depth supersession).")
+
+(defparameter *durability-debug-file-rewrite-fault* nil
+  "Test-only fault injector (ADR 0029 §10 crash-consistency). NIL (default) ⇒ inert; byte-identical
+   behavior. When non-NIL, %rewrite-topic-log signals an error AFTER the compacted <log>.tmp is written
+   and fsynced but BEFORE the atomic rename over the original — exercising the crash-before-commit path:
+   the original log stays intact, the .tmp is orphaned, and a reopen recovers the pre-rewrite log and
+   recompacts it (no torn log, no data loss, no false-reject). Proves the MID-RUN rewrite inherits the
+   tmp+fsync+rename atomicity exactly. Never set in production code.")
 
 (defun* %rewrite-topic-log (dir tid records &optional chain-mac-fn topic)
     (function (pathname string list &optional (or null function) (or null string))
@@ -590,6 +633,11 @@
               (setf running mac tail-mac mac))
             (write-sequence (%frame-record r) stm)))
       (dds.pal:fsync-stream stm))
+    ;; crash-consistency fault seam (ADR 0029 §10): the <log>.tmp is fully written + fsynced; a crash
+    ;; HERE (before the rename) leaves the ORIGINAL log intact (rename is the atomic commit point).
+    (when *durability-debug-file-rewrite-fault*
+      (error "dds.durability: *durability-debug-file-rewrite-fault* — simulated crash after ~a.tmp ~
+              fsync, before the atomic rename (crash-before-commit; original log intact)" tid))
     (uiop:rename-file-overwriting-target tmp-path log-path)
     ;; fsync the containing dir so the compaction rename's dirent survives power loss (ADR 0026 §10.10 / 0029)
     (dds.pal:fsync-directory (%topics-dir dir))
@@ -623,9 +671,18 @@
          ;; grandfather set (ADR 0045 §3.2): topic-ids EXEMPT from the per-topic downgrade check
          ;; (the pre-existing legacy topics recorded, authenticated, in the anchor). NIL = none.
          (chain-grandfather nil)
-         (chain-macs   (make-hash-table :test #'equal))) ; topic-id -> running chain MAC (32 octets)
+         (chain-macs   (make-hash-table :test #'equal)) ; topic-id -> running chain MAC (32 octets)
+         ;; runtime threshold compaction state (Sliver 2, ADR 0029 §10). The effective policy cells are
+         ;; set by :open (mirroring the memory store's hk-cell/depth-cell) so the :put path knows the
+         ;; depth D + whether KEEP_LAST is active; super-pending counts KEEP_LAST-superseded :data
+         ;; records per topic since the last rewrite; data-counts is a per-instance :data tally giving
+         ;; O(1) supersede detection (no per-put whole-topic scan).
+         (eff-hk-cell  (cons history-kind nil))   ; car = effective history-kind (:keep-all/:keep-last)
+         (eff-hd-cell  (cons history-depth nil))  ; car = effective history-depth D
+         (super-pending (make-hash-table :test #'equal))  ; topic-id -> pending superseded :data count
+         (data-counts  (make-hash-table :test #'equal)))  ; topic-id -> (equalp key-hash -> :data count)
 
-    (flet ((%inner (topic-id)
+    (labels ((%inner (topic-id)
              (or (gethash topic-id outer)
                  (setf (gethash topic-id outer) (make-hash-table :test #'equal))))
            (%total-count ()
@@ -648,7 +705,68 @@
                      (dds.pal:fsync-directory (%topics-dir store-dir)))
                    s)))
            (%record-key (writer-guid sn)
-             (cons (coerce writer-guid 'list) sn)))
+             (cons (coerce writer-guid 'list) sn))
+           (%topic-logical-records (topic-id)
+             ;; the LOGICAL KEEP_LAST view for TOPIC-ID: the raw index records, sorted canonically by
+             ;; %record-guid-sn<, then under :keep-last the shared pass-2 %keep-last-latest (newest-D
+             ;; :data per instance). So store-get-range + per-topic store-count return exactly the
+             ;; newest-D view — matching the memory + SQLite backends' DEPTH-ONLY online eviction — while
+             ;; the physical log stays batched-bounded by the threshold rewrite (ADR 0029 §10.1). Pass-2
+             ;; ONLY, not on-open's pass-1 settled drop: the bare backends never drop settled instances
+             ;; on read (memory keeps them, SQLite keeps them), so :keep-all is the raw sorted view
+             ;; (byte-identical) — the encrypted decorator does its own both-pass compaction on top.
+             (let ((inn (and topic-id (gethash topic-id outer))))
+               (if (null inn)
+                   '()
+                   (let* ((recs   (let ((acc '()))
+                                    (maphash (lambda (k v) (declare (ignore k)) (push v acc)) inn)
+                                    acc))
+                          (sorted (sort recs #'%record-guid-sn<)))
+                     (if (eq :keep-last (car eff-hk-cell))
+                         (%keep-last-latest sorted (car eff-hd-cell))
+                         sorted)))))
+           (%init-topic-counts (topic-id records)
+             ;; (re)seed the Sliver-2 runtime-compaction counters for TOPIC-ID from RECORDS: a zeroed
+             ;; pending counter + a per-instance :data tally (so the next put's supersede test is O(1)).
+             (setf (gethash topic-id super-pending) 0)
+             (let ((dc (make-hash-table :test #'equalp)))
+               (dolist (r records)
+                 (when (and (eq :data (durable-record-kind r)) (durable-record-key-hash r))
+                   (incf (gethash (durable-record-key-hash r) dc 0))))
+               (setf (gethash topic-id data-counts) dc)))
+           (%threshold-compact (topic-id topic)
+             ;; runtime threshold compaction (Sliver 2, ADR 0029 §10): the append-only log cannot
+             ;; delete-in-place, so compact MID-RUN by re-running the on-open trio — replay the log,
+             ;; %compact-topic-records (pass-1 settled + pass-2 KEEP_LAST, IDENTICAL to on-open), then
+             ;; the EXISTING atomic %rewrite-topic-log (tmp+fsync+rename — crash-atomicity inherited, no
+             ;; new transaction machinery). Release the append fd BEFORE the rewrite so no stale fd
+             ;; survives the atomic rename (a stale fd appending to the renamed-away log = DATA LOSS);
+             ;; the next %ensure-stream reopens the rewritten log in :append mode. Prune the in-memory
+             ;; index + counters to the survivors and carry the rewrite's fresh tail chain MAC (ADR 0045).
+             (let ((log-path (%topic-log-path store-dir topic-id))
+                   (stm      (gethash topic-id streams)))
+               (when stm
+                 (ignore-errors (dds.pal:fsync-stream stm))
+                 (ignore-errors (close stm))
+                 (remhash topic-id streams))
+               (let* ((recs      (%replay-log log-path topic chain-mac-fn nil))
+                      (compacted (%compact-topic-records recs (car eff-hk-cell) (car eff-hd-cell))))
+                 (when (and recs (< (length compacted) (length recs)))
+                   (let ((tail (%rewrite-topic-log store-dir topic-id compacted chain-mac-fn topic)))
+                     ;; carry the rewritten tail so the next appended v3 frame chains from it (ADR 0045)
+                     (if tail
+                         (setf (gethash topic-id chain-macs) tail)
+                         (remhash topic-id chain-macs))
+                     (let ((inn (%inner topic-id)))
+                       (clrhash inn)
+                       (dolist (r compacted)
+                         (setf (gethash (%record-key (durable-record-writer-guid r)
+                                                     (durable-record-sn r))
+                                        inn)
+                               r)))
+                     (%init-topic-counts topic-id compacted)))
+                 ;; threshold consumed: reset the pending counter even if nothing was droppable
+                 (setf (gethash topic-id super-pending) 0)))))
 
       (%make-durable-store
        :name :file
@@ -680,18 +798,28 @@
                       (write-sequence (%frame-record rec) stm))
                   (finish-output stm)
                   (setf (gethash k inn) rec)
+                  ;; runtime threshold compaction (Sliver 2, ADR 0029 §10): O(1) supersede detection —
+                  ;; a :data put that pushes a KEEP_LAST instance PAST depth D makes an older record
+                  ;; droppable; bump the per-topic superseded counter and, on crossing
+                  ;; *compaction-superseded-threshold*, run the atomic %rewrite-topic-log MID-RUN so a
+                  ;; continuously-open log stays bounded (~ live-count + threshold) with NO reopen.
+                  (when (and (eq :keep-last (car eff-hk-cell)) (eq :data kind) key-hash)
+                    (let* ((dc (or (gethash tid data-counts)
+                                   (setf (gethash tid data-counts)
+                                         (make-hash-table :test #'equalp))))
+                           (c  (incf (gethash key-hash dc 0))))
+                      (when (and (> c (car eff-hd-cell))
+                                 (>= (incf (gethash tid super-pending 0))
+                                     *compaction-superseded-threshold*))
+                        (%threshold-compact tid topic))))
                   t))))))
 
        :get-range
        (lambda (topic)
          (dds.pal:with-lock (lock)
-           (let* ((tid  (gethash topic id-map))
-                  (inn  (when tid (gethash tid outer))))
-             (if (null inn)
-                 '()
-                 (let ((recs '()))
-                   (maphash (lambda (k v) (declare (ignore k)) (push v recs)) inn)
-                   (sort recs #'%record-guid-sn<))))))
+           ;; LOGICAL KEEP_LAST view (exactly newest-D), matching memory / SQLite / encrypted; the
+           ;; physical log stays batched-bounded by the Sliver-2 threshold rewrite (ADR 0029 §10.1)
+           (%topic-logical-records (gethash topic id-map))))
 
        :topics
        (lambda ()
@@ -729,11 +857,16 @@
          ;; effective policy: caller override wins when non-NIL; fall back to factory default
          (let ((eff-hk (or open-hk history-kind))
                (eff-hd (or open-hd history-depth)))
+           ;; stash the effective policy so the :put path can drive Sliver-2 threshold compaction
+           (setf (car eff-hk-cell) eff-hk
+                 (car eff-hd-cell) eff-hd)
            ;; reset in-memory index so a re-open does not accumulate stale state
            (clrhash outer)
            (clrhash id-map)
            (clrhash streams)
            (clrhash chain-macs)          ; running chain state is rebuilt from disk on replay (ADR 0045)
+           (clrhash super-pending)       ; Sliver-2 runtime-compaction counters reseeded per topic below
+           (clrhash data-counts)
            ;; enforce 0700 on the store dir D (holds cleartext frame metadata): chmod ONLY on first
            ;; creation, then ALWAYS verify (fail-closed refuse on loose/unverifiable perms) — exactly
            ;; the key-dir K discipline, one shared helper (DRY; ADR 0026 §10.12).
@@ -751,7 +884,16 @@
                (let ((topics-dir (merge-pathnames
                                   (make-pathname :directory '(:relative "topics")) store-dir)))
                  (when (uiop:directory-exists-p topics-dir)
-                   (dolist (log-path (uiop:directory-files topics-dir "*.log"))
+                   ;; crash recovery (ADR 0029 §10): discard orphaned <tid>.tmp.log files left by a
+                   ;; crash BETWEEN a compaction rewrite's tmp-write and its atomic rename — the rename
+                   ;; is the commit point, so an un-renamed .tmp is uncommitted and the original
+                   ;; <tid>.log is authoritative. Skip them in replay so the *.log glob never mis-loads
+                   ;; a temp as a bogus topic (which would fail the keyed chain verify → false-reject).
+                   (dolist (pn (uiop:directory-files topics-dir "*.log"))
+                     (when (%tmp-log-name-p (pathname-name pn))
+                       (ignore-errors (delete-file pn))))
+                   (dolist (log-path (remove-if (lambda (pn) (%tmp-log-name-p (pathname-name pn)))
+                                                (uiop:directory-files topics-dir "*.log")))
                      (let* ((tid   (pathname-name log-path))
                             (topic (or (gethash tid id->topic) tid))
                             ;; per-topic downgrade guard: required unless this legacy topic is
@@ -775,7 +917,9 @@
                              (dolist (r compacted)
                                (let ((k (%record-key (durable-record-writer-guid r)
                                                      (durable-record-sn r))))
-                                 (setf (gethash k inn) r))))))))))
+                                 (setf (gethash k inn) r))))
+                           ;; seed the Sliver-2 runtime-compaction counters from the compacted survivors
+                           (%init-topic-counts tid compacted)))))))
                  ;; rebuild topics.map with any recovered topics
                  (when (plusp (hash-table-count id-map))
                    (let ((new-map (make-hash-table :test #'equal)))
@@ -812,12 +956,13 @@
          t)
 
        :count-fn
+       ;; per-topic count is LOGICAL (post-compaction, matching get-range + the encrypted decorator),
+       ;; since the append-only log retains superseded frames physically between threshold rewrites;
+       ;; total count (NIL topic) is the PHYSICAL record count (identical to the decorator's contract).
        (lambda (topic)
          (dds.pal:with-lock (lock)
            (if topic
-               (let* ((tid (gethash topic id-map))
-                      (inn (when tid (gethash tid outer))))
-                 (if inn (hash-table-count inn) 0))
+               (length (%topic-logical-records (gethash topic id-map)))
                (%total-count))))
 
        :set-chain-mac-fn

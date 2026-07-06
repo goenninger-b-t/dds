@@ -4381,6 +4381,286 @@
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))
       t)))
 
+;;; --- File-store runtime threshold compaction (WP-DURABILITY-COMPACTION-FILE, Sliver 2) ---
+;;; The APPEND-ONLY file store cannot delete-in-place, so a continuously-open KEEP_LAST log grew
+;;; unboundedly between opens (only on-open compaction, ADR 0029). Sliver 2 adds RUNTIME threshold
+;;; compaction: each KEEP_LAST-superseded :data put bumps an O(1) per-topic counter, and crossing
+;;; *compaction-superseded-threshold* runs the EXISTING atomic %rewrite-topic-log MID-RUN (tmp+fsync+
+;;; rename — crash-atomicity inherited, no new transaction machinery), bounding the on-disk log to
+;;; (live-count + threshold) WITHOUT a close/open cycle.
+
+(defun* %file-store-tmp-dir (tag)
+    (function (string) pathname)
+  "Fresh unique temp dir for a file-store compaction test case."
+  (uiop:merge-pathnames*
+   (make-pathname :directory (list :relative (format nil "dds-fscompact-~a-~a-~a"
+                                                     tag (get-universal-time) (random 1000000))))
+   (uiop:temporary-directory)))
+
+(defun* %file-store-log-count (dir topic &optional oracle)
+    (function (pathname string &optional (or null function)) (integer 0))
+  "On-disk RAW frame count for TOPIC's append-log under DIR (BEFORE compaction) — the Sliver-2
+   bounded-growth probe. Parses the log with the store's own %replay-log (ORACLE verifies a keyed v3
+   chain, NIL for a bare v2 log)."
+  (length (dds.durability::%replay-log
+           (dds.durability::%topic-log-path dir (dds.durability::%topic->id topic))
+           topic oracle nil)))
+
+(defun* run-durability-file-threshold-compaction-test ()
+    (function () t)
+  "Runtime threshold compaction in the FILE store (WP-DURABILITY-COMPACTION-FILE, Sliver 2, ADR 0029 §10):
+   (A) BOUNDED GROWTH — a continuously-open :keep-last D file store, N=40 same-instance puts, NO close:
+       the ON-DISK log record count stays BOUNDED (<= D + threshold), NOT N (RED pre-Sliver-2 = 40); the
+       in-memory index is likewise bounded; the newest D by SN survive byte-exact.
+   (B) BOUNDARY — writing to a rewrite boundary leaves get-range = EXACTLY the newest D byte-exact
+       (a freshly-compacted read) and the on-disk log rewritten to exactly D.
+   (C) BELOW THRESHOLD — fewer than the first trigger's supersedes ⇒ NO mid-run rewrite (all raw frames
+       still on disk); BUT get-range + per-topic count return the LOGICAL newest-D view (exactly D),
+       matching memory / SQLite / encrypted (cross-backend consistency; RED pre-fix = 5).
+   (D) KEEP_ALL — no threshold compaction (on-disk grows to N).
+   (E) TWO INSTANCES — the shared per-topic threshold bounds the whole topic; each instance keeps its
+       newest D byte-exact (no loss)."
+  (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (kh1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1))
+         (kh2 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xC2))
+         (p   (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (dirs '()))
+    (labels ((%d (tag) (let ((d (%file-store-tmp-dir tag))) (push d dirs) d)))
+      (unwind-protect
+           (let ((dds.durability:*compaction-superseded-threshold* 4)
+                 (d 2))
+             ;; (A) bounded growth to <= D + threshold WITHOUT reopen; newest D byte-exact
+             (let* ((dir (%d "bnd"))
+                    (s   (dds.durability:make-file-store :dir dir)))
+               (dds.durability:store-open s :keep-last d)
+               (dotimes (i 40)
+                 (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (let ((on-disk (%file-store-log-count dir "T")))
+                 (%check :fsc-bounded (<= on-disk (+ d 4))
+                         (format nil "on-disk log must stay <= D+threshold=~d (compacts mid-run), got ~d"
+                                 (+ d 4) on-disk))
+                 (%check :fsc-not-unbounded (< on-disk 40)
+                         (format nil "on-disk log must be << N=40 (RED pre-Sliver-2 = 40), got ~d" on-disk)))
+               (%check :fsc-count-bounded (<= (dds.durability:store-count s "T") (+ d 4))
+                       (format nil "in-memory index bounded to <= D+threshold, got ~d"
+                               (dds.durability:store-count s "T")))
+               (let* ((recs   (dds.durability:store-get-range s "T"))
+                      (newest (subseq (sort (copy-list recs) #'>
+                                            :key #'dds.durability:durable-record-sn)
+                                      0 d))
+                      (sns    (sort (mapcar #'dds.durability:durable-record-sn newest) #'<)))
+                 (%check :fsc-newest-sns (equal '(39 40) sns)
+                         (format nil "newest D by SN must be (39 40), got ~s" sns))
+                 (%check :fsc-newest-payload
+                         (equalp (funcall p '(40))
+                                 (dds.durability:durable-record-payload
+                                  (find 40 recs :key #'dds.durability:durable-record-sn)))
+                         "newest sample payload byte-exact"))
+               (dds.durability:store-close s))
+             ;; (B) boundary: put 6 triggers a rewrite (D=2, threshold=4) -> get-range = exactly D
+             (let* ((dir (%d "exact"))
+                    (s   (dds.durability:make-file-store :dir dir)))
+               (dds.durability:store-open s :keep-last d)
+               (dotimes (i 6)
+                 (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (let* ((recs (dds.durability:store-get-range s "T"))
+                      (sns  (sort (mapcar #'dds.durability:durable-record-sn recs) #'<)))
+                 (%check :fsc-boundary-exact (= d (length recs))
+                         (format nil "at a rewrite boundary get-range = exactly D=~d, got ~d" d (length recs)))
+                 (%check :fsc-boundary-sns (equal '(5 6) sns)
+                         (format nil "boundary survivors are the newest D (5 6), got ~s" sns))
+                 (%check :fsc-boundary-ondisk (= d (%file-store-log-count dir "T"))
+                         (format nil "on-disk log rewritten to exactly D=~d at the boundary, got ~d"
+                                 d (%file-store-log-count dir "T"))))
+               (dds.durability:store-close s))
+             ;; (C) below threshold: 5 puts (3 supersedes < threshold 4) -> NO rewrite, all raw on disk;
+             ;; BUT get-range + per-topic count return the LOGICAL newest-D view (exactly D), matching
+             ;; memory / SQLite / encrypted (the cross-backend consistency lock — RED pre-fix = 5)
+             (let* ((dir (%d "under"))
+                    (s   (dds.durability:make-file-store :dir dir)))
+               (dds.durability:store-open s :keep-last d)
+               (dotimes (i 5)
+                 (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (%check :fsc-under-norewrite (= 5 (%file-store-log-count dir "T"))
+                       (format nil "below-threshold store must NOT rewrite (5 raw frames on disk), got ~d"
+                               (%file-store-log-count dir "T")))
+               (let* ((recs (dds.durability:store-get-range s "T"))
+                      (sns  (sort (mapcar #'dds.durability:durable-record-sn recs) #'<)))
+                 (%check :fsc-under-logical-get-range (= d (length recs))
+                         (format nil "get-range returns the LOGICAL newest-D view = exactly D=~d ~
+                                      (matching memory/SQLite/encrypted; RED pre-fix = 5), got ~d"
+                                 d (length recs)))
+                 (%check :fsc-under-logical-sns (equal '(4 5) sns)
+                         (format nil "logical view is the newest D by SN (4 5), got ~s" sns))
+                 (%check :fsc-under-logical-count (= d (dds.durability:store-count s "T"))
+                         (format nil "per-topic store-count returns the LOGICAL view = exactly D=~d ~
+                                      (RED pre-fix = 5), got ~d" d (dds.durability:store-count s "T")))
+                 (%check :fsc-under-newest-payload
+                         (equalp (funcall p '(5))
+                                 (dds.durability:durable-record-payload
+                                  (find 5 recs :key #'dds.durability:durable-record-sn)))
+                         "logical view newest payload byte-exact"))
+               (dds.durability:store-close s))
+             ;; (D) KEEP_ALL: no threshold compaction at all -> on-disk grows to N
+             (let* ((dir (%d "all"))
+                    (s   (dds.durability:make-file-store :dir dir)))
+               (dds.durability:store-open s :keep-all)
+               (dotimes (i 20)
+                 (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (%check :fsc-keepall (= 20 (%file-store-log-count dir "T"))
+                       (format nil "KEEP_ALL does NO threshold compaction (20 on disk), got ~d"
+                               (%file-store-log-count dir "T")))
+               (dds.durability:store-close s))
+             ;; (E) two instances: shared per-topic threshold bounds the topic; each keeps its newest D
+             (let* ((dir (%d "2inst"))
+                    (s   (dds.durability:make-file-store :dir dir)))
+               (dds.durability:store-open s :keep-last d)
+               (dotimes (i 20)
+                 (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (dotimes (i 20)
+                 (dds.durability:store-put s "T" g0 (+ 101 i) kh2 :data (funcall p (list (mod (+ 101 i) 256)))))
+               (%check :fsc-2inst-bounded (<= (%file-store-log-count dir "T") (+ (* 2 d) 4))
+                       (format nil "two-instance topic bounded to <= 2D+threshold=~d, got ~d"
+                               (+ (* 2 d) 4) (%file-store-log-count dir "T")))
+               (let* ((recs (dds.durability:store-get-range s "T"))
+                      (k1 (count kh1 recs :key #'dds.durability:durable-record-key-hash :test #'equalp))
+                      (k2 (count kh2 recs :key #'dds.durability:durable-record-key-hash :test #'equalp)))
+                 (%check :fsc-2inst-each-bounded (and (<= d k1 (+ d 4)) (<= d k2 (+ d 4)))
+                         (format nil "each instance bounded [D, D+threshold], got kh1=~d kh2=~d" k1 k2))
+                 (%check :fsc-2inst-newest
+                         (and (find 20 recs :key #'dds.durability:durable-record-sn)
+                              (find 120 recs :key #'dds.durability:durable-record-sn))
+                         "each instance retains its newest sample (no loss)"))
+               (dds.durability:store-close s)))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))
+      t)))
+
+(defun* run-durability-file-online-chain-test ()
+    (function () t)
+  "Runtime threshold compaction preserves the v3 MAC chain (Sliver 2, ADR 0045 / 0029 §10): a keyed
+   KEEP_LAST file store, continuously open, threshold-compacts MID-RUN — the atomic %rewrite-topic-log
+   re-emits a FRESH v3 chain over the survivors AND the running chain state is re-pointed to the new
+   tail, so subsequent appends chain correctly and a fresh store REOPENING the same dir VERIFIES clean
+   (no false-reject) and returns the newest D byte-exact. Also proves the append fd is re-pointed
+   post-rewrite: the newest samples (appended after a mid-run rewrite) are NOT lost to a stale fd."
+  (let* ((g0     (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (kh1    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xD3))
+         (p      (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (oracle (lambda (data)
+                   (let ((out (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11)))
+                     (loop for b across data for i from 0
+                           do (setf (aref out (mod i 32)) (logand (+ (aref out (mod i 32)) b i 1) #xFF)))
+                     out)))
+         (dir    (%file-store-tmp-dir "chain")))
+    (unwind-protect
+         (let ((dds.durability:*compaction-superseded-threshold* 4))
+           ;; continuously-open keyed KEEP_LAST 2, threshold 4: 40 same-instance puts -> mid-run rewrites
+           (let ((s (dds.durability:make-file-store :dir dir)))
+             (dds.durability::store-set-chain-mac-fn s oracle)
+             (dds.durability:store-open s :keep-last 2)
+             (dotimes (i 40)
+               (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+             (%check :fschain-bounded (<= (%file-store-log-count dir "T" oracle) 6)
+                     (format nil "keyed online threshold-compact: on-disk bounded <= 6, got ~d"
+                             (%file-store-log-count dir "T" oracle)))
+             (dds.durability:store-close s))
+           ;; reopen a FRESH keyed store on the same dir -> replay MUST verify the chain clean
+           (let ((s2 (dds.durability:make-file-store :dir dir))
+                 (opened-clean nil))
+             (dds.durability::store-set-chain-mac-fn s2 oracle)
+             (setf opened-clean
+                   (handler-case (progn (dds.durability:store-open s2 :keep-last 2) t)
+                     (error (c) (declare (ignore c)) nil)))
+             (%check :fschain-reopen-clean opened-clean
+                     "mid-run-compacted keyed store REOPENS CLEAN — the rewrite re-emitted a fresh v3 chain + re-pointed the running MAC (no false-reject)")
+             (when opened-clean
+               (let* ((recs (dds.durability:store-get-range s2 "T"))
+                      (sns  (sort (mapcar #'dds.durability:durable-record-sn recs) #'<)))
+                 (%check :fschain-reopen-count (= 2 (length recs))
+                         (format nil "reopen: exactly D=2 survivors, got ~d" (length recs)))
+                 (%check :fschain-reopen-sns (equal '(39 40) sns)
+                         (format nil "reopen: survivors are the newest D (39 40) — newest NOT lost to a stale fd, got ~s" sns))
+                 (%check :fschain-reopen-payload
+                         (equalp (funcall p '(40))
+                                 (dds.durability:durable-record-payload
+                                  (find 40 recs :key #'dds.durability:durable-record-sn)))
+                         "reopen: newest survivor payload byte-exact post mid-run rewrite")))
+             (ignore-errors (dds.durability:store-close s2))))
+      (when (uiop:directory-exists-p dir)
+        (ignore-errors (uiop:delete-directory-tree dir :validate t)))))
+  t)
+
+(defun* run-durability-file-crash-consistency-test ()
+    (function () t)
+  "Crash-consistency of the mid-run atomic %rewrite-topic-log (Sliver 2, ADR 0029 §10): a fault injected
+   AFTER the compacted <log>.tmp is written+fsynced but BEFORE the atomic rename (via
+   *durability-debug-file-rewrite-fault*) leaves the ORIGINAL log intact (rename is the commit point) —
+   so a fresh store REOPENS on a CONSISTENT log, the v3 chain VERIFIES clean, the newest D survive
+   (NO data loss), and there is NO false-reject. Proves the mid-run rewrite inherits the tmp+fsync+rename
+   atomicity (no new transaction machinery); the orphaned .tmp is discarded on open."
+  (let* ((g0     (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
+         (kh1    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xE2))
+         (p      (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (oracle (lambda (data)
+                   (let ((out (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x22)))
+                     (loop for b across data for i from 0
+                           do (setf (aref out (mod i 32)) (logand (+ (aref out (mod i 32)) b i 1) #xFF)))
+                     out)))
+         (dir    (%file-store-tmp-dir "crash")))
+    (unwind-protect
+         (let ((dds.durability:*compaction-superseded-threshold* 4))
+           ;; session 1: keyed KEEP_LAST 2; puts 1..5 (no rewrite), then put 6 triggers the mid-run
+           ;; rewrite -> FAULT before the rename -> store-put signals; the original 6-frame log survives
+           (let ((s (dds.durability:make-file-store :dir dir))
+                 (faulted nil))
+             (dds.durability::store-set-chain-mac-fn s oracle)
+             (dds.durability:store-open s :keep-last 2)
+             (dotimes (i 5)
+               (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+             (let ((dds.durability::*durability-debug-file-rewrite-fault* t))
+               (setf faulted
+                     (handler-case
+                         (progn (dds.durability:store-put s "T" g0 6 kh1 :data (funcall p '(6))) nil)
+                       (error () t))))
+             (%check :fscc-faulted faulted
+                     "the mid-run rewrite fault must propagate (store-put signals before the rename)")
+             ;; close writes topics.map so the keyed seed resolves by topic name on reopen; the log is untouched
+             (ignore-errors (dds.durability:store-close s)))
+           ;; session 2: fresh keyed store on the same dir -> MUST reopen clean (old log intact + chain OK)
+           (let ((s2 (dds.durability:make-file-store :dir dir))
+                 (opened-clean nil))
+             (dds.durability::store-set-chain-mac-fn s2 oracle)
+             (setf opened-clean
+                   (handler-case (progn (dds.durability:store-open s2 :keep-last 2) t)
+                     (error (c) (declare (ignore c)) nil)))
+             (%check :fscc-reopen-clean opened-clean
+                     "after a crash BEFORE the rename the store reopens CLEAN — the original log is intact, the chain verifies (no torn log, no false-reject)")
+             (when opened-clean
+               (let* ((recs (dds.durability:store-get-range s2 "T"))
+                      (sns  (sort (mapcar #'dds.durability:durable-record-sn recs) #'<)))
+                 (%check :fscc-no-loss (equal '(5 6) sns)
+                         (format nil "post-crash on-open compaction keeps the newest D=2 (5 6) — no data loss, got ~s" sns))
+                 (%check :fscc-payload
+                         (equalp (funcall p '(6))
+                                 (dds.durability:durable-record-payload
+                                  (find 6 recs :key #'dds.durability:durable-record-sn)))
+                         "post-crash newest payload byte-exact")))
+             (ignore-errors (dds.durability:store-close s2)))
+           ;; session 3: a SECOND reopen is still clean (the recovery on-open rewrite re-emitted a valid
+           ;; chain of D) -> no false-reject accumulation
+           (let ((s3 (dds.durability:make-file-store :dir dir)))
+             (dds.durability::store-set-chain-mac-fn s3 oracle)
+             (%check :fscc-reopen-again-clean
+                     (handler-case (progn (dds.durability:store-open s3 :keep-last 2) t)
+                       (error () nil))
+                     "a second reopen is still clean (the recovery rewrite left a valid chain)")
+             (ignore-errors (dds.durability:store-close s3))))
+      (when (uiop:directory-exists-p dir)
+        (ignore-errors (uiop:delete-directory-tree dir :validate t)))))
+  t)
+
 (defun* run-durability-store-dir-perms-test ()
     (function () t)
   "B4 (ADR 0026 §10.12): the store dir D is enforced/verified 0700, exactly like the key dir K.

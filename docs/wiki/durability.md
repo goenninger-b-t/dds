@@ -868,7 +868,9 @@ live exactly-once captured dir-a N=545, dir-b N=550)**;
 and `make-persistent-store-factory` accept `:history-kind`/`:history-depth` as factory defaults;
 `make-service-spec` carries `history-kind`/`history-depth` fields; `service-start` passes them to
 `store-open` — making the service-spec the single functional policy source in service mode;
-in-memory store applies online eviction on `store-put`; DARE intact; fuzz green; ADR 0029)**; online/threshold compaction;
+in-memory store applies online eviction on `store-put`; DARE intact; fuzz green; ADR 0029)**;
+**online/threshold compaction (RESOLVED — SQLite per-put eviction = Sliver 1 §8.8.2; file-store
+threshold-triggered mid-run rewrite = Sliver 2 §8.8.3, `*compaction-superseded-threshold*`; ADR 0029 §10.1)**;
 **per-frame header integrity (RESOLVED — WP-DURABILITY-HARDENING-BATCH: on-disk frame v2 adds a
 header CRC over `magic..payload-len`, so a sub-cap length corruption is caught loud instead of
 mis-parsed as a torn tail; version-dispatched reader still reads v1; ADR 0026 §10.9)**;
@@ -949,9 +951,9 @@ per-row keyed MAC chain is at parity with the file store (§8.8.1).
 round-trips identically on Clasp and SBCL (no reader conditionals). Transitive: `iterate`; native:
 `libsqlite3` (SBOM + provenance recorded).
 
-**Follow-ons (deferred):** file-store online/threshold compaction (Sliver 2 — the file store still
-compacts only on open); encrypted-tier physical reclaim + whole-topic-deletion residual (Sliver 3);
-metadata-3c confidentiality; dynamic-topic parity. (SQLite online compaction = Sliver 1, RESOLVED §8.8.2.)
+**Follow-ons (deferred):** encrypted-tier physical reclaim + whole-topic-deletion residual (Sliver 3);
+dynamic-topic parity. (SQLite online compaction = Sliver 1, RESOLVED §8.8.2; file-store runtime/threshold
+compaction = Sliver 2, RESOLVED §8.8.3; metadata-3c confidentiality = RESOLVED §8.9.)
 
 #### 8.8.1 SQLite per-row keyed MAC chain (WP-SQLITE-MAC-CHAIN, ADR 0049 §9 / ADR 0045 §9)
 
@@ -1029,8 +1031,62 @@ verifies clean + get-range returns newest DEPTH; pure-Lisp MAC oracle, both impl
 `run-durability-sqlite-crash-consistency-test` (fault injected between the DELETE and the re-MAC at both
 sites → the txn rolls back → fresh reopen verifies clean + recovers the pre-eviction set; RED-proven as a
 `SQCC-OPEN-RECOVERS` false-reject when the on-open transaction is neutralized). Sliver 2 (file-store
-online/threshold compaction + the batched re-MAC) and Sliver 3 (encrypted-tier physical reclaim +
-whole-topic-deletion residual) follow.
+runtime/threshold compaction) is RESOLVED (§8.8.3); Sliver 3 (encrypted-tier physical reclaim +
+whole-topic-deletion residual) follows.
+
+#### 8.8.3 File-store runtime/threshold compaction (WP-DURABILITY-COMPACTION-FILE, Sliver 2)
+
+Compaction-on-open alone leaves a **continuously-open** KEEP_LAST **file** store growing unboundedly
+between reopens (ADR 0029 context — its `:put` is pure append). The file store is **APPEND-ONLY** and
+cannot delete-in-place, so — unlike the SQLite per-put DELETE of §8.8.2 — it compacts in **BATCHES**:
+
+- **O(1)-per-put supersede counter.** A `:keep-last` `:data` put with a non-NIL key-hash bumps a
+  per-instance `:data` tally; when it exceeds depth `D` the put supersedes an older record and bumps a
+  per-topic pending counter. No per-put whole-topic scan.
+- **Threshold-triggered mid-run rewrite.** On crossing **`*compaction-superseded-threshold*`** (a new,
+  docstring'd, tunable special variable, default **128**) the store runs `%compact-topic-records`
+  (pass-1 settled + pass-2 KEEP_LAST, **identical** to on-open) + the **existing** atomic
+  `%rewrite-topic-log` for that topic **mid-run** (no close/open cycle), then prunes the in-memory index
+  + counters to the survivors and resets the counter. The on-disk log stays bounded to
+  **`live-count + threshold`** records; the amortized O(topic) rewrite is spread over ~threshold puts.
+- **Crash-atomicity is INHERITED — no new transaction machinery.** `%rewrite-topic-log` already writes
+  `<log>.tmp`, fsyncs, and atomic-renames over the original (re-emitting a fresh v3 MAC chain). A crash
+  during the mid-run rewrite leaves **either** the old log **or** the new log, never torn (contrast
+  Sliver 1, which had to wrap SQLite's autocommit DELETEs in a transaction). The append fd is
+  **closed + re-pointed** around the rewrite so no stale fd appends to the renamed-away log (a data-loss
+  guard); the running chain MAC is carried to the rewrite's fresh tail. Crash recovery discards orphaned
+  `<tid>.tmp.log` files (an un-renamed temp is uncommitted; the original log is authoritative).
+- **Same exemptions.** KEEP_ALL does no threshold compaction; NIL-key-hash + lifecycle records are never
+  depth-evicted; a below-threshold store's append path is byte-identical (no rewrite fires). The
+  durable-store **vtable is unchanged** (internal to `make-file-store`; a `store-delete` slot = Sliver 3).
+- **Logical read view = exactly D.** The physical batching holds up to `D + threshold` records per
+  instance between rewrites, so — to keep the exported `store-get-range` / per-topic `store-count`
+  contract identical to the memory + SQLite backends (whose online eviction returns the logical newest-D
+  view) — the file store applies the shared **pass-2 `%keep-last-latest`** on **read** under `:keep-last`
+  (sorted by `%record-guid-sn<`, then newest-D `:data` per instance); per-topic `store-count` is that
+  view's length (total `store-count` stays the physical record count, matching the decorator). It is
+  **depth-only** — the bare backends never drop settled instances on read — so `:keep-all` returns the
+  raw sorted view (byte-identical) and lifecycle records survive until the next open. The physical log
+  stays batched-bounded. The encrypted decorator runs its own both-pass compaction on top of its
+  `:keep-all` + NIL-key inner store (pass-1 a no-op there), so this read view neither double-compacts nor
+  regresses it.
+
+**Tracked residual (lower-severity, not fixed here):** `super-pending` tracks only `:data` supersession,
+so the `:data`-supersession unbounded-growth gap is closed at runtime, but an adversarial workload of
+endless DISTINCT settling instances (register → write-once → dispose → unregister, a NEW key-hash each)
+still accumulates settled tombstones between opens — pass-1 reclaims them only on the next `store-open`.
+Bounded by the **instance-churn rate** (not the sample rate), a real bounded residual (a settled-instance
+runtime reclaim is a follow-on), NOT a non-issue.
+
+Tests: `run-durability-file-threshold-compaction-test` (bounded growth to `<= D + threshold` WITHOUT a
+reopen — RED pre-Sliver-2 = N=40; newest-D survive byte-exact; boundary → get-range = exactly D;
+below-threshold never rewrites; KEEP_ALL grows to N; two instances bounded, no loss),
+`run-durability-file-online-chain-test` (the mid-run rewrite re-emits a fresh v3 chain + re-points the
+running MAC → a fresh keyed store reopens clean + returns newest D byte-exact; the newest samples,
+appended after a mid-run rewrite, are not lost to a stale fd), and
+`run-durability-file-crash-consistency-test` (fault via `*durability-debug-file-rewrite-fault*` after the
+tmp fsync, before the rename → the original log is intact → fresh reopen verifies the chain clean +
+keeps the newest D, no data loss, no false-reject; a pure-Lisp MAC oracle → both impls, no OpenSSL).
 
 ### 8.9 At-rest metadata confidentiality (Phase 3c, WP-DURABILITY-METADATA-CONF-3c)
 

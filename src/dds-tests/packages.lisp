@@ -47,6 +47,9 @@
            #:run-durability-sqlite-keeplast-online-test
            #:run-durability-sqlite-online-chain-test
            #:run-durability-sqlite-crash-consistency-test
+           #:run-durability-file-threshold-compaction-test
+           #:run-durability-file-online-chain-test
+           #:run-durability-file-crash-consistency-test
            #:run-durability-compaction-test
            #:run-durability-seed-backpressure-test
            #:run-durability-seen-prune-test

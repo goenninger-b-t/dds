@@ -25,6 +25,7 @@
            #:%spec->argv
            #:make-encrypted-store #:*dare-error-hook*
            #:make-file-store #:file-store-sync
+           #:*compaction-superseded-threshold*
            #:durable-store-sync #:store-sync
            #:make-persistent-store-factory
            #:make-sqlite-store #:make-sqlite-store-factory))

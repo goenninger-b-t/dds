@@ -164,6 +164,77 @@ DDS 1.4 §2.2.3.5 spec clause and the wire observations above.
   indistinguishable without type metadata).
 - **Online / threshold compaction:** compact the file-store between opens (e.g. when a per-topic
   record count threshold is exceeded), without requiring a `store-close`/`store-open` cycle.
+  **RESOLVED** — SQLite backend = **Sliver 1** (WP-DURABILITY-COMPACTION-SQLITE, ADR 0049 §10, online
+  per-put eviction); file backend = **Sliver 2** (WP-DURABILITY-COMPACTION-FILE, §10.1 below).
+  Encrypted-tier physical reclaim of superseded inner blobs remains **Sliver 3**.
+
+## §10.1 Runtime file-store threshold compaction (Sliver 2, WP-DURABILITY-COMPACTION-FILE, as-built)
+
+**The gap.** The file store compacted KEEP_LAST-superseded records **only on open** (`make-file-store`
+`:open` → `%compact-topic-records` → `%rewrite-topic-log` during replay). `:put` is **pure append** —
+no eviction. A continuously-open KEEP_LAST file store's per-topic log therefore grew **unboundedly**
+between opens (the per-instance `:data` count grew without bound), the exact defect §T3 fixed only at
+open time.
+
+**The key difference from Sliver 1.** The file store is **APPEND-ONLY** — it cannot delete a record
+in place, so the SQLite per-put `DELETE` model is impossible. Instead the store **batches**: a per-topic
+counter of KEEP_LAST-superseded `:data` records, and on crossing a **threshold** it runs the *existing*
+atomic `%rewrite-topic-log` **mid-run** (not just on open). Because `%rewrite-topic-log` already writes
+`<log>.tmp`, fsyncs, and atomic-renames over the original (re-emitting a fresh v3 MAC chain), Sliver 2
+**inherits** crash-atomicity — **no new transaction machinery** is needed (contrast Sliver 1, which had
+to wrap SQLite's autocommit DELETEs in a transaction).
+
+**As-built:**
+
+- **O(1)-per-put supersede counter.** `make-file-store` keeps a per-topic `super-pending` count and a
+  per-instance `data-counts` `:data` tally. On a `:keep-last` `:data` put with a non-NIL key-hash, the
+  instance's `:data` count is bumped (O(1)); when it exceeds depth `D` the put **supersedes** an older
+  record, so `super-pending` is bumped. No per-put whole-topic scan.
+- **Threshold trigger.** When `super-pending` crosses **`*compaction-superseded-threshold*`** (a new,
+  docstring'd special variable, default **128**, tunable) the store runs `%compact-topic-records`
+  (pass-1 settled + pass-2 KEEP_LAST, **identical** to on-open) + the atomic `%rewrite-topic-log` for
+  that topic **mid-run**, prunes the in-memory index + counters to the survivors, and resets the counter.
+  The amortized O(topic) rewrite is spread over ~threshold puts, bounding the on-disk log to
+  **`live-count + threshold`** records.
+- **Append fd re-point (data-loss guard).** The store holds an open append stream per topic. The atomic
+  rename unlinks the *old* inode, so a stale append fd would write to the renamed-away log and be lost on
+  reopen. `%threshold-compact` therefore **closes + drops the append stream before the rewrite**; the
+  next `%ensure-stream` reopens the rewritten log in `:append` mode. For a keyed store the running chain
+  MAC is re-pointed to the rewrite's fresh tail so the next appended v3 frame chains correctly.
+- **Crash-atomicity (inherited, verified).** A crash during the mid-run rewrite leaves **either** the old
+  log (rename didn't happen) **or** the new log (rename committed) — never torn. The new
+  **`*durability-debug-file-rewrite-fault*`** injects a fault after the tmp fsync, before the rename; the
+  test then reopens on the intact original log, the chain verifies, the newest `D` survive, no
+  false-reject. Crash recovery also **discards orphaned `<tid>.tmp.log`** files (an un-renamed temp is
+  uncommitted; the original log is authoritative) so the `*.log` replay glob never mis-loads a temp as a
+  bogus topic.
+- **Policy consistency + exemptions.** The mid-run path uses the **same** `%compact-topic-records` and
+  `%record-guid-sn<` order as on-open, the memory store, and Sliver 1. **KEEP_ALL** does no threshold
+  compaction; NIL-key-hash and lifecycle (`:dispose`/`:unregister`) records are never depth-evicted; a
+  below-threshold store never rewrites (append path byte-identical). The durable-store **vtable is
+  unchanged** (Sliver 2 is internal to `make-file-store`; a `store-delete` slot would be Sliver 3).
+- **Logical read view = exactly `D` (cross-backend consistency).** The physical batching means the log +
+  in-memory index hold up to `D + threshold` records for an instance between rewrites. So that the
+  *exported* `store-get-range` / per-topic `store-count` contract still returns the **logical** newest-`D`
+  view — identical to the memory store and the SQLite backend (online per-put DELETE) — the file store
+  applies the shared **pass-2 `%keep-last-latest`** on **read** (records sorted by `%record-guid-sn<`,
+  then newest-`D` `:data` per non-NIL key-hash) under `:keep-last`; per-topic `store-count` is that
+  view's length (total `store-count` stays the physical record count, matching the encrypted decorator).
+  It is **depth-only** (pass 2), NOT on-open's pass-1 settled drop: the bare memory + SQLite backends
+  never drop settled instances on read (their online eviction is depth-only), so `:keep-all` returns the
+  raw sorted view (byte-identical) and a settled instance's lifecycle records survive until the next open
+  — matching them exactly and preserving the on-open compaction demonstrated by
+  `run-durability-compaction-test`. The physical log remains batched-bounded by the threshold rewrite.
+  The encrypted decorator does its own both-pass `%compact-topic-records` on top of its `:keep-all` +
+  NIL-key inner store (where pass-1 is a no-op), so this read view neither double-compacts nor regresses it.
+
+**Tracked residual (honest, lower-severity, NOT fixed here).** `super-pending` tracks **only** `:data`
+supersession, so the *`:data`-supersession* unbounded-growth gap is closed at runtime. An adversarial
+workload of **endless DISTINCT settling instances** (register → write-once → dispose → unregister, a NEW
+key-hash each) still accumulates settled tombstones between opens — pass-1 reclaims them only on the next
+`store-open`. This is bounded by the **instance-churn rate** (not the sample rate), so it is
+lower-severity than the fixed `:data`-supersession gap, and it is out of scope for Sliver 2 — but it is a
+**real bounded residual**, not a non-issue. (A settled-instance runtime reclaim would be a follow-on.)
 - **Parent-directory fsync** for the compaction rename across a power loss (shared follow-on with
   ADR 0026 §10). **RESOLVED** (WP-DURABILITY-HARDENING-BATCH): `%rewrite-topic-log` now calls
   `dds.pal:fsync-directory` after the compaction rename (and every other create/rename dirent — see
@@ -182,10 +253,16 @@ DDS 1.4 §2.2.3.5 spec clause and the wire observations above.
 - `src/dds-durability/spec.lisp` — `service-spec` `history-kind` / `history-depth` fields +
   `make-service-spec` / `make-persistent-store-factory`
 - `src/dds-durability/store.lisp` — `store-open` optional args + memory-store online eviction
-- `src/dds-durability/store-file.lisp` — `%compact-topic-records` pass 2 + `make-file-store`
+- `src/dds-durability/store-file.lisp` — `%compact-topic-records` pass 2 + `make-file-store`;
+  Sliver 2 (§10.1): `*compaction-superseded-threshold*`, `*durability-debug-file-rewrite-fault*`,
+  `%threshold-compact` / `%init-topic-counts` (make-file-store `:put`/`:open`), `%tmp-log-name-p`
+  (orphan-temp skip), the fault seam in `%rewrite-topic-log`
 - `src/dds-durability/service.lisp` — `service-start` → `store-open (spec history-kind history-depth)`
+- `src/dds-durability/store-sqlite.lisp` — Sliver 1: `%sqlite-evict-instance` online per-put eviction
+  (ADR 0049 §10)
 - `src/dds-tests/durability-test.lisp` — `run-durability-keeplast-compaction-test`,
   `run-durability-keeplast-cross-restart-test`, `run-durability-keeplast-service-spec-policy-test`,
-  `run-durability-keeplast-memory-test`
+  `run-durability-keeplast-memory-test`; Sliver 2: `run-durability-file-threshold-compaction-test`,
+  `run-durability-file-online-chain-test`, `run-durability-file-crash-consistency-test`
 - `interop/durability-keeplast/` — cross-DDS restart-seed harness + captures (Leg 1 Connext
   M=302→2, Leg 2 Fast DDS M=134→2)
