@@ -901,7 +901,8 @@ topics/purge/count/open/close/sync to it).
 
 ```
 CREATE TABLE record (topic TEXT, writer_guid BLOB, sn BLOB, key_hash BLOB, kind INTEGER,
-                     payload BLOB, PRIMARY KEY (topic, writer_guid, sn));
+                     payload BLOB, mac BLOB, chain_seq INTEGER,   -- mac/chain_seq: v3 MAC chain (§8.8.1)
+                     PRIMARY KEY (topic, writer_guid, sn));
 CREATE INDEX idx_topic_order ON record(topic, writer_guid, sn);
 ```
 
@@ -918,16 +919,44 @@ the memory + file backends regardless of SQL collation.
 rows (SQLite reopens the file), enforces 0700 on the DB dir (cleartext metadata, as the file store
 does), then runs compaction-on-open via the shared `%compact-topic-records`. `sync`/`close` do a
 `PRAGMA wal_checkpoint(FULL)` durability barrier (journal mode WAL, `synchronous=FULL`; durability is
-off the per-sample hot path, so maximum safety over throughput). `set-chain-mac-fn` is intentionally
-**NIL** — the per-row keyed MAC chain (the ADR 0045 analogue) is a documented follow-on; the slot
-no-ops, so the store composes cleanly with the encrypted decorator's v2 epoch mode.
+off the per-sample hot path, so maximum safety over throughput). `set-chain-mac-fn` is **LIVE** — the
+per-row keyed MAC chain is at parity with the file store (§8.8.1).
 
 **Dependency.** `cl-sqlite` (ASDF `sqlite`, CFFI over `libsqlite3`) — impl-agnostic, loads +
 round-trips identically on Clasp and SBCL (no reader conditionals). Transitive: `iterate`; native:
 `libsqlite3` (SBOM + provenance recorded).
 
-**Follow-ons (deferred):** per-row keyed MAC chain (ADR 0045 analogue); incremental/SQL-side
-compaction at scale; metadata-3c confidentiality; dynamic-topic parity.
+**Follow-ons (deferred):** incremental/SQL-side compaction at scale; metadata-3c confidentiality;
+dynamic-topic parity.
+
+#### 8.8.1 SQLite per-row keyed MAC chain (WP-SQLITE-MAC-CHAIN, ADR 0049 §9 / ADR 0045 §9)
+
+The SQLite backend is at tamper-evidence **parity** with the file store's v3 keyed HMAC chain (§8.5).
+When the encrypted decorator installs the log-MAC oracle (`store-set-chain-mac-fn`), each put writes a
+32-octet chain MAC into the `mac` column and `store-open` verifies every topic's chain (fail-closed)
+**before** compaction, so tamper cannot be laundered by the compacting `DELETE`. The MAC is
+**byte-identical** to the file store: it reuses `%frame-record-versioned`/`%chain-seed`/`%chain-mac` so
+a MAC over a record is the same whichever backend wrote it, and the same anchor/oracle/grandfather
+machinery. Two SQLite-specifics:
+
+- **Chain order is an explicit `chain_seq INTEGER`** (per-topic `MAX+1` on put), NOT rowid — robust
+  against SQLite reusing a rowid after a compacting `DELETE`. Verification/recompute is
+  `ORDER BY chain_seq ASC`.
+- **Chain-recompute-on-compaction (no-false-reject).** A KEEP_LAST compacting `DELETE` breaks the chain
+  over the survivors, so after any compacting delete the surviving rows are re-MAC'd as a fresh chain
+  (re-seed, re-MAC in order, rewrite `mac` + dense `chain_seq`), mirroring `%rewrite-topic-log`. A
+  KEEP_LAST MAC-chained SQLite store therefore reopens clean any number of times.
+
+Downgrade defense (a non-empty non-grandfathered topic with zero chained rows fails the open) and the
+grandfather exemption (a legacy multi-topic store's dormant topics coexist without a false-REJECT) hold
+exactly as for the file store; the grandfather enumeration is **backend-dispatched** (`%store-grandfather-ids`)
+so each backend's ids key identically to its own downgrade lookup — the file store keeps its raw-tid
+log-dir scan (robust to a lost `topics.map`), SQLite maps real topic names via `%topic->id`. A
+**NIL-oracle** bare `make-sqlite-store` writes NULL `mac`/`chain_seq` and skips verification —
+byte-behaviorally unchanged. All ADR 0045 §7 residuals (malicious whole-tail truncation, `epochs.dat`
+MAC, anchor-deletion full-downgrade, and whole-topic deletion) apply equally. Test:
+`run-durability-sqlite-mac-chain-test` (tamper via DIRECT SQL: UPDATE payload/mac, DELETE, REORDER;
+downgrade; KEEP_LAST reopen-repeatedly; epoch-boundary; grandfather; NIL-oracle regression).
 
 ---
 

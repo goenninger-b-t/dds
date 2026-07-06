@@ -305,3 +305,32 @@ fails (§3.2, the multi-topic false-reject regression)**; cross-restart (epoch-b
 cross-boundary tamper caught; key-absent (bare store) and wrong-key both fail-closed; honest
 torn-tail still truncate-recovers. Plus the full DARE/durability integrity suite regression on
 both impls (Clasp first).
+
+## 9. SQLite-backend parity (WP-SQLITE-MAC-CHAIN, ADR 0049 §9)
+
+The keyed v3 MAC chain is now implemented for the SQLite durable-store backend at full parity, closing
+the ADR 0049 §7 deferral (`set-chain-mac-fn` was NIL). The mechanism is **byte-identical**: the SQLite
+store reuses the same `%frame-record-versioned`/`%chain-seed`/`%chain-mac` helpers (a MAC over a record
+is identical whichever backend wrote it) and the same anchor/oracle/grandfather machinery
+(`%mint-logmac-anchor`/`%load-logmac-anchor`/`%install-logmac-oracle`). The mint-time grandfather
+enumeration is **backend-dispatched** (`%store-grandfather-ids`) so each backend's gf-ids key
+IDENTICALLY to its own downgrade-check lookup: the FILE store keeps its original raw-tid log-dir scan
+(`%enumerate-nonempty-topic-ids`, robust to a lost `topics.map` where a topic name degrades to the raw
+tid and a `%topic->id` round-trip would double-encode), while SQLite/memory map real topic NAMES via
+`%topic->id` (matching their `%topic->id(name)` verify key). Two SQLite-specific design points: (a) the
+chain order is an explicit `chain_seq INTEGER` column (stable against SQLite rowid reuse after a
+compacting `DELETE`), not rowid; (b) `%compact-on-open`'s
+KEEP_LAST-superseded `DELETE` breaks the chain over survivors, so after any compacting delete the
+surviving rows are re-MAC'd as a fresh chain (mirroring `%rewrite-topic-log`) — a KEEP_LAST MAC-chained
+SQLite store reopens clean any number of times (the no-false-reject invariant). Verify runs BEFORE
+compaction (fail-closed). All §7 residuals apply equally to the SQLite backend (they are properties of
+the chain design, not the storage medium). **Whole-topic deletion** (dropping every row of a topic so
+it no longer exists at open) joins the shared residual list alongside whole-tail truncation, the
+`epochs.dat` MAC, and anchor-deletion + full-downgrade: it is the topic-granularity form of the
+whole-tail-truncation residual (§7 item 1) and closes only with the same separable **sealed high-water
+anchor** (a store-level authenticated topic/tail index) — a chain-design property, identical for the
+file and SQLite backends, not a storage-backend bug. Verification: `run-durability-sqlite-mac-chain-test`
+(tamper via DIRECT SQL: UPDATE payload/mac, DELETE row, REORDER via chain_seq swap; downgrade; KEEP_LAST
+reopen-repeatedly; epoch-boundary; grandfather; NIL-oracle regression) — both impls, Clasp first. The
+shared-enumerator lift is regression-guarded by `run-durability-mac-chain-test` case (8): a legacy-v2
+file-store topic with a LOST `topics.map` still grandfathers by raw tid and reopens clean.

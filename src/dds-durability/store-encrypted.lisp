@@ -121,7 +121,11 @@
     (function (pathname) list)
   "Topic-ids (log basenames) of every NON-EMPTY *.log in DIR/topics/ — the pre-existing topics at
    anchor-mint time. Because the anchor is minted on the first v3 put (anchor absent ⇒ no v3 frame
-   written yet), these logs are all legacy v1/v2 and form the grandfather set (ADR 0045 §3.2)."
+   written yet), these logs are all legacy v1/v2 and form the grandfather set (ADR 0045 §3.2).
+   FILE-STORE ONLY (the log filenames ARE the raw tids): the returned ids key IDENTICALLY to the file
+   store's downgrade-check grandfather lookup (store-file.lisp, `(gethash tid chain-grandfather)`) in
+   ALL cases — including a lost/corrupt topics.map, where a topic NAME falls back to the raw tid and a
+   %topic->id(tid) round-trip would DOUBLE-ENCODE and never match (a false-REJECT of a degraded store)."
   (let ((tdir (%topics-dir dir))
         (ids '()))
     (when (uiop:directory-exists-p tdir)
@@ -129,6 +133,18 @@
         (when (plusp (with-open-file (s log :element-type '(unsigned-byte 8)) (file-length s)))
           (push (pathname-name log) ids))))
     ids))
+
+(defun* %store-grandfather-ids (inner-store dir)
+    (function (durable-store pathname) list)
+  "Mint-time grandfather set = the pre-existing non-empty topic-IDS of INNER-STORE (ADR 0045 §3.2).
+   Backend-dispatched so each backend's gf-ids key IDENTICALLY to its own downgrade-check lookup:
+   the FILE store scans its log-dir tids DIRECTLY (raw tids = log filenames — robust to a lost
+   topics.map, no %topic->id round-trip); SQLite/memory have no on-disk tid logs, so they map the real
+   topic NAMES via %topic->id (matching their %topic->id(name) verify lookup key). DRY: one dispatch,
+   each path is the backend's own correct enumeration."
+  (if (eq (durable-store-name inner-store) :file)
+      (%enumerate-nonempty-topic-ids dir)
+      (mapcar #'%topic->id (store-topics inner-store))))
 
 (defun* %assemble-anchor-signed (kem-ct grandfather-ids)
     (function ((simple-array (unsigned-byte 8) (*)) list) (simple-array (unsigned-byte 8) (*)))
@@ -562,7 +578,7 @@
              ;; legacy topics, while every born-chained (non-grandfathered) topic still fails a full
              ;; v3->v2 downgrade. A fresh store has no such logs ⇒ empty set ⇒ full protection (§3.2).
              (unless logmac-key
-               (let ((gf-ids (%enumerate-nonempty-topic-ids epoch-dir)))
+               (let ((gf-ids (%store-grandfather-ids inner-store epoch-dir)))
                  (setf logmac-key (%mint-logmac-anchor key-provider epoch-dir gf-ids))
                  (%install-logmac-oracle inner-store logmac-key gf-ids)))
              t))

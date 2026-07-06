@@ -43,6 +43,7 @@
            #:run-durability-sqlite-store-test
            #:run-durability-sqlite-dare-test
            #:run-durability-sqlite-service-test
+           #:run-durability-sqlite-mac-chain-test
            #:run-durability-compaction-test
            #:run-durability-seed-backpressure-test
            #:run-durability-seen-prune-test

@@ -3856,7 +3856,228 @@
                    (write-sequence (apply #'concatenate '(simple-array (unsigned-byte 8) (*))
                                           (nreverse frames)) fout))
                  (%check :mlc-multitopic-b-downgrade-fails (%open-errs-p d k)
-                         "downgrading the born-chained topic B to v2 fails the open even though legacy A is grandfathered (C1 held per-topic)"))))
+                         "downgrading the born-chained topic B to v2 fails the open even though legacy A is grandfathered (C1 held per-topic)")))
+             ;; (8) map-less grandfather (the shared-enumerator lift-regression guard): a legacy-v2
+             ;; file-store topic whose topics.map is LOST must STILL be grandfathered by its RAW tid
+             ;; (the log filename). The grandfather set MUST key identically to the file store's
+             ;; downgrade-check lookup (by raw tid) even in the map-less fallback, where a topic NAME
+             ;; degrades to the raw hex tid and a %topic->id(tid) round-trip would double-encode and
+             ;; never match — a false-REJECT of a degraded store (ADR 0045 §3.2).
+             (let ((d (%tmp "ml-d")) (k (%tmp "ml-k")))
+               (let ((bare (dds.durability:make-file-store :dir d)))
+                 (dds.durability:store-open bare)
+                 (dds.durability:store-put bare "A" g0 1 nil :data (funcall pay 0))
+                 (dds.durability:store-close bare))
+               ;; LOSE topics.map before the mint session (topic name falls back to the raw hex tid)
+               (let ((mp (merge-pathnames (make-pathname :name "topics" :type "map") d)))
+                 (when (probe-file mp) (delete-file mp)))
+               ;; migration open + first v3 put on B mints the anchor; A must be grandfathered by raw tid
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dotimes (i 2) (dds.durability:store-put s "B" g0 (1+ i) nil :data (funcall pay (1+ i))))
+                 (dds.durability:store-close s))
+               (%check :mlc-mapless-grandfather-opens (not (%open-errs-p d k))
+                       "a legacy-v2 topic with a LOST topics.map still grandfathers by RAW tid → reopens clean (lift-regression guard)")))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))))
+  t)
+
+(defun* run-durability-sqlite-mac-chain-test ()
+    (function () t)
+  "WP-SQLITE-MAC-CHAIN (ADR 0049/0045): the SQLite backend at tamper-evidence PARITY with the file
+   store's v3 keyed MAC chain, tampered via DIRECT SQL on the DB (a raw sqlite:connect UPDATE/DELETE).
+   (1) v3 round-trip: a MAC-chained SQLite store writes rows with MACs and reopens CLEAN, byte-exact.
+   (2) interior tamper: UPDATE payload / UPDATE mac / DELETE a row / REORDER (chain_seq swap) each →
+       store-open fails loud; the untampered control opens clean (non-vacuous).
+   (3) downgrade (required): NULL out mac on all rows of a non-grandfathered topic → open fails loud.
+   (4) NO-FALSE-REJECT (the critical case): a KEEP_LAST MAC-chained store compacts on reopen and the
+       chain is RECOMPUTED over the survivors, so it reopens clean repeatedly + across epoch boundaries.
+   (5) grandfather: a legacy-v2 SQLite topic (bare store, NULL mac) coexists with a born-chained topic,
+       reopens clean (legacy grandfathered), and downgrading the chained topic still fails loud.
+   (6) NIL-oracle regression: a bare make-sqlite-store round-trips unchanged (NULL mac column)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [durability-sqlite-mac-chain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-sqlite-mac-chain-test t)))
+  (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+        (kh0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 3))
+        (dirs '())
+        (pay  (lambda (i)
+                (let ((v (make-array 8 :element-type '(unsigned-byte 8))))
+                  (dotimes (j 8 v) (setf (aref v j) (logand (+ (* i 16) j) #xFF)))))))
+    (labels ((%tmp (tag)
+               (let ((d (uiop:merge-pathnames*
+                         (make-pathname :directory
+                                        (list :relative (format nil "dds-sqmac-~a-~a-~a"
+                                                                tag (get-universal-time)
+                                                                (random 1000000))))
+                         (uiop:temporary-directory))))
+                 (push d dirs)
+                 d))
+             (%dbpath (d) (uiop:merge-pathnames* "durability.sqlite3" d))
+             (%mk (d k &optional (hk :keep-all) (hd 1))
+               (dds.durability:make-encrypted-store
+                (dds.durability:make-sqlite-store :path (%dbpath d) :history-kind hk :history-depth hd)
+                (dds.dare:make-file-key-provider :dir k)
+                :epoch-dir d))
+             (%put-n (d k n &optional kh (hk :keep-all) (hd 1))
+               (let ((s (%mk d k hk hd)))
+                 (dds.durability:store-open s)
+                 (dotimes (i n) (dds.durability:store-put s "T" g0 (1+ i) kh :data (funcall pay i)))
+                 (dds.durability:store-close s)))
+             (%open-errs-p (d k &optional (hk :keep-all) (hd 1))
+               (let ((s (%mk d k hk hd)))
+                 (handler-case (progn (dds.durability:store-open s)
+                                      (ignore-errors (dds.durability:store-close s)) nil)
+                   (error () t))))
+             (%raw (d thunk)
+               (let ((db (sqlite:connect (namestring (%dbpath d)))))
+                 (unwind-protect (funcall thunk db) (sqlite:disconnect db)))))
+      (unwind-protect
+           (progn
+             ;; (1) v3 round-trip
+             (let ((d (%tmp "rt-d")) (k (%tmp "rt-k")))
+               (%put-n d k 4)
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (let ((recs (dds.durability:store-get-range s "T")))
+                   (%check :sqmac-rt-count (= 4 (length recs))
+                           (format nil "v3 round-trip: expected 4 records, got ~d" (length recs)))
+                   (%check :sqmac-rt-bytes
+                           (loop for r in recs for i from 0
+                                 always (equalp (dds.durability:durable-record-payload r) (funcall pay i)))
+                           "v3 round-trip: all payloads byte-exact after reopen+chain-verify"))
+                 (dds.durability:store-close s)))
+             ;; (2) interior tamper — control clean, each SQL tamper fails loud
+             (let ((d (%tmp "ctl-d")) (k (%tmp "ctl-k")))
+               (%put-n d k 3)
+               (%check :sqmac-control-clean
+                       (let ((s (%mk d k)))
+                         (dds.durability:store-open s)
+                         (prog1 (= 3 (dds.durability:store-count s "T"))
+                           (dds.durability:store-close s)))
+                       "non-vacuous control: the untampered chained SQLite log opens clean with 3 rows"))
+             ;; UPDATE an interior payload (row chain_seq=1) → MAC over the row mismatches
+             (let ((d (%tmp "upl-d")) (k (%tmp "upl-k")))
+               (%put-n d k 3)
+               (%raw d (lambda (db)
+                         (sqlite:execute-non-query
+                          db "UPDATE record SET payload=? WHERE topic=? AND chain_seq=?"
+                          (make-array 8 :element-type '(unsigned-byte 8) :initial-element #xEE) "T" 1)))
+               (%check :sqmac-tamper-payload (%open-errs-p d k)
+                       "interior payload UPDATE via direct SQL must fail the keyed MAC → store-open fails loud"))
+             ;; UPDATE an interior mac (row chain_seq=1) → stored mac ≠ recomputed
+             (let ((d (%tmp "umac-d")) (k (%tmp "umac-k")))
+               (%put-n d k 3)
+               (%raw d (lambda (db)
+                         (sqlite:execute-non-query
+                          db "UPDATE record SET mac=? WHERE topic=? AND chain_seq=?"
+                          (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0) "T" 1)))
+               (%check :sqmac-tamper-mac (%open-errs-p d k)
+                       "interior mac UPDATE via direct SQL must fail verification → store-open fails loud"))
+             ;; DELETE an interior row (chain_seq=1) → chain break over the survivors
+             (let ((d (%tmp "del-d")) (k (%tmp "del-k")))
+               (%put-n d k 3)
+               (%raw d (lambda (db)
+                         (sqlite:execute-non-query
+                          db "DELETE FROM record WHERE topic=? AND chain_seq=?" "T" 1)))
+               (%check :sqmac-tamper-delete (%open-errs-p d k)
+                       "interior row DELETE via direct SQL must break the chain → store-open fails loud"))
+             ;; REORDER rows 0 and 1 by swapping their chain_seq → running chain mismatches
+             (let ((d (%tmp "reo-d")) (k (%tmp "reo-k")))
+               (%put-n d k 3)
+               (%raw d (lambda (db)
+                         (sqlite:execute-non-query db "UPDATE record SET chain_seq=999 WHERE topic=? AND chain_seq=0" "T")
+                         (sqlite:execute-non-query db "UPDATE record SET chain_seq=0 WHERE topic=? AND chain_seq=1" "T")
+                         (sqlite:execute-non-query db "UPDATE record SET chain_seq=1 WHERE topic=? AND chain_seq=999" "T")))
+               (%check :sqmac-tamper-reorder (%open-errs-p d k)
+                       "row REORDER (chain_seq swap) via direct SQL must break the chain → store-open fails loud"))
+             ;; (3) downgrade (required): NULL every mac of a non-grandfathered topic
+             (let ((d (%tmp "dg-d")) (k (%tmp "dg-k")))
+               (%put-n d k 3)
+               (%raw d (lambda (db)
+                         (sqlite:execute-non-query db "UPDATE record SET mac=NULL WHERE topic=?" "T")))
+               (%check :sqmac-downgrade-fails (%open-errs-p d k)
+                       "a full v3->keyless downgrade (mac NULL on a non-grandfathered topic) fails the open"))
+             ;; (4) NO-FALSE-REJECT — KEEP_LAST store compacts+recomputes; reopens clean repeatedly
+             (let ((d (%tmp "nfr-d")) (k (%tmp "nfr-k")))
+               (let ((s (%mk d k :keep-last 1)))
+                 (dds.durability:store-open s)
+                 (dotimes (i 4) (dds.durability:store-put s "T" g0 (1+ i) kh0 :data (funcall pay i)))
+                 (dds.durability:store-close s))
+               (%check :sqmac-nfr-open1 (not (%open-errs-p d k :keep-last 1))
+                       "KEEP_LAST chained store reopens clean after compaction (#1)")
+               (%check :sqmac-nfr-open2 (not (%open-errs-p d k :keep-last 1))
+                       "KEEP_LAST chained store reopens clean AGAIN (#2 — chain-recompute-on-compaction holds)")
+               (let ((s (%mk d k :keep-last 1)))
+                 (dds.durability:store-open s)
+                 (let ((recs (dds.durability:store-get-range s "T")))
+                   (%check :sqmac-nfr-count (= 1 (length recs))
+                           "KEEP_LAST kept exactly depth=1 survivor after repeated reopen")
+                   (%check :sqmac-nfr-payload (and recs (equalp (funcall pay 3)
+                                                                (dds.durability:durable-record-payload (first recs))))
+                           "survivor payload decrypts byte-exact post-recompute"))
+                 (dds.durability:store-close s)))
+             ;; clean chain across an epoch boundary reopens clean
+             (let ((d (%tmp "xr-d")) (k (%tmp "xr-k")))
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dotimes (i 2) (dds.durability:store-put s "T" g0 (1+ i) nil :data (funcall pay i)))
+                 (dds.durability:store-close s))
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dotimes (i 2) (dds.durability:store-put s "T" g0 (+ 3 i) nil :data (funcall pay (+ 2 i))))
+                 (dds.durability:store-close s))
+               (%check :sqmac-xr-clean (not (%open-errs-p d k))
+                       "clean chain across the epoch boundary reopens clean (no false-reject)")
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (%check :sqmac-xr-count (= 4 (dds.durability:store-count s "T"))
+                         "4 records across the epoch boundary")
+                 (dds.durability:store-close s)))
+             ;; (5) grandfather: legacy-v2 topic A (bare store) + born-chained topic B
+             (let ((d (%tmp "gf-d")) (k (%tmp "gf-k")))
+               (let ((bare (dds.durability:make-sqlite-store :path (%dbpath d))))
+                 (dds.durability:store-open bare)
+                 (dds.durability:store-put bare "A" g0 1 nil :data (funcall pay 0))
+                 (dds.durability:store-close bare))
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dotimes (i 2) (dds.durability:store-put s "B" g0 (1+ i) nil :data (funcall pay (1+ i))))
+                 (dds.durability:store-close s))
+               (%check :sqmac-gf-opens (not (%open-errs-p d k))
+                       "a legacy-v2 topic A grandfathered, coexists with chained B, reopens clean (no false-REJECT)")
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (%check :sqmac-gf-b-verified (= 2 (length (dds.durability:store-get-range s "B")))
+                         "born-chained topic B chain-verifies + decrypts alongside the dormant legacy topic A")
+                 (dds.durability:store-close s))
+               (%raw d (lambda (db)
+                         (sqlite:execute-non-query db "UPDATE record SET mac=NULL WHERE topic=?" "B")))
+               (%check :sqmac-gf-b-downgrade (%open-errs-p d k)
+                       "downgrading born-chained B fails the open even though legacy A is grandfathered"))
+             ;; (6) NIL-oracle regression: bare store round-trips, mac column stays NULL
+             (let ((d (%tmp "nil-d")))
+               (let ((s (dds.durability:make-sqlite-store :path (%dbpath d))))
+                 (dds.durability:store-open s)
+                 (dds.durability:store-put s "T" g0 1 nil :data (funcall pay 0))
+                 (dds.durability:store-put s "T" g0 2 nil :data (funcall pay 1))
+                 (dds.durability:store-close s))
+               (let ((s (dds.durability:make-sqlite-store :path (%dbpath d))))
+                 (dds.durability:store-open s)
+                 (%check :sqmac-nil-count (= 2 (dds.durability:store-count s "T"))
+                         "NIL-oracle bare SQLite store round-trips unchanged")
+                 (let ((recs (dds.durability:store-get-range s "T")))
+                   (%check :sqmac-nil-payload (equalp (funcall pay 0)
+                                                      (dds.durability:durable-record-payload (first recs)))
+                           "NIL-oracle bare store payload byte-exact (no MAC layer)"))
+                 (dds.durability:store-close s))
+               (%raw d (lambda (db)
+                         (%check :sqmac-nil-null-mac
+                                 (null (sqlite:execute-single db "SELECT mac FROM record LIMIT 1"))
+                                 "NIL-oracle store writes a NULL mac column (byte-behaviorally unchanged)")))))
         (dolist (d dirs)
           (when (uiop:directory-exists-p d)
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))))

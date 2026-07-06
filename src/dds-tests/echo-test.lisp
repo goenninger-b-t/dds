@@ -3929,6 +3929,7 @@
                  ("durability-sqlite-store"       . run-durability-sqlite-store-test)
                  ("durability-sqlite-dare"        . run-durability-sqlite-dare-test)
                  ("durability-sqlite-service"     . run-durability-sqlite-service-test)
+                 ("durability-sqlite-mac-chain"   . run-durability-sqlite-mac-chain-test)
                  ("durability-compaction"        . run-durability-compaction-test)
                  ("durability-resurrection-compaction" . run-durability-resurrection-compaction-test)
                  ("durability-sync-delegation"   . run-durability-sync-delegation-test)

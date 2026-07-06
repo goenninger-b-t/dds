@@ -54,11 +54,90 @@
      :kind        kind
      :payload     (%to-octets-n pl-blob (length pl-blob)))))
 
+;;; Per-row keyed-MAC tamper-evidence chain (ADR 0045 parity). The MAC over a row is BYTE-IDENTICAL
+;;; to the file store: reuse %frame-record-versioned to build the canonical v3 frame and take its
+;;; 32-byte chain MAC. The chain order is the explicit chain_seq column (stable vs rowid reuse after a
+;;; compacting DELETE), NOT rowid. Verify runs BEFORE compaction (fail-closed); after any compacting
+;;; DELETE the surviving rows are re-MAC'd as a fresh chain so a clean KEEP_LAST store never
+;;; false-rejects on the next reopen (mirrors %rewrite-topic-log).
+
+(defun* %sqlite-row-mac (fn prev topic wg-blob sn-blob kh-blob kind-int pl-blob)
+    (function (function (simple-array (unsigned-byte 8) (*)) string
+               (array (unsigned-byte 8) (*)) (array (unsigned-byte 8) (*))
+               (or null (array (unsigned-byte 8) (*))) (unsigned-byte 8) (array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "The v3 chain MAC of one row chained over PREV: byte-identical to the file store — reuse
+   %frame-record-versioned to produce the canonical v3 frame and take its 32-byte MAC (ADR 0045)."
+  (let ((rec (%sqlite-row->record topic wg-blob sn-blob kh-blob kind-int pl-blob)))
+    (nth-value 1 (%frame-record-versioned rec +frame-version-v3+ prev fn))))
+
+(defun* %sqlite-verify-topic (db topic fn required grandfather)
+    (function (t string function t (or null hash-table))
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "Verify TOPIC's per-row MAC chain in chain_seq order and return the tail MAC (or NIL). Recompute each
+   row's expected MAC over (running-MAC ∥ canonical frame prefix) and compare to the stored mac column;
+   ANY mismatch/gap/reorder SIGNALS (fail-closed). A NULL-mac row is a legacy/pre-chain prefix row —
+   legal ONLY before the chain starts; a NULL-mac row AFTER a chained row is a chain break (tamper).
+   Downgrade defense (ADR 0045 §3.2): when REQUIRED, a non-empty topic that replays to ZERO chained
+   rows on a NON-grandfathered topic SIGNALS (a full v3->v2 keyless downgrade)."
+  (let ((rows (sqlite:execute-to-list
+               db
+               "SELECT writer_guid, sn, key_hash, kind, payload, mac FROM record WHERE topic=? ORDER BY chain_seq ASC, rowid ASC"
+               topic))
+        (running (%chain-seed fn topic))
+        (started nil)
+        (chained 0)
+        (tail    nil))
+    (dolist (row rows)
+      (destructuring-bind (wg sn-blob kh kind-int pl mac) row
+        (if (null mac)
+            (when started
+              (error "dds.durability: SQLite MAC chain break in topic ~a — unchained row after a ~
+                      chained row (tamper — refusing to open; ADR 0045)" topic))
+            (let ((expected (%sqlite-row-mac fn running topic wg sn-blob kh kind-int pl))
+                  (stored   (%to-octets-n mac +frame-mac-len+)))
+              (unless (equalp expected stored)
+                (error "dds.durability: SQLite chain MAC mismatch in topic ~a ~
+                        (tamper — refusing to open; ADR 0045)" topic))
+              (setf running expected started t tail expected)
+              (incf chained)))))
+    (when (and required rows (zerop chained)
+               (not (and grandfather (gethash (%topic->id topic) grandfather))))
+      (error "dds.durability: SQLite chain-required topic ~a has ~d row(s) but ZERO chained rows — ~
+              refusing to open (full v3->v2 downgrade / tamper; ADR 0045 §3.2)" topic (length rows)))
+    tail))
+
+(defun* %sqlite-recompute-topic (db topic fn)
+    (function (t string function) (or null (simple-array (unsigned-byte 8) (*))))
+  "Re-MAC every surviving row of TOPIC as a FRESH v3 chain in chain_seq order and rewrite its mac +
+   dense chain_seq columns; return the new tail MAC. Called after a compacting DELETE so the surviving
+   rows' chain is continuous — a KEEP_LAST store must reopen clean any number of times (ADR 0045; the
+   no-false-reject invariant, mirroring the file store's %rewrite-topic-log post-compaction)."
+  (let ((rows (sqlite:execute-to-list
+               db
+               "SELECT writer_guid, sn, key_hash, kind, payload FROM record WHERE topic=? ORDER BY chain_seq ASC, rowid ASC"
+               topic))
+        (running (%chain-seed fn topic))
+        (seq  0)
+        (tail nil))
+    (dolist (row rows)
+      (destructuring-bind (wg sn-blob kh kind-int pl) row
+        (let ((mac (%sqlite-row-mac fn running topic wg sn-blob kh kind-int pl)))
+          (sqlite:execute-non-query
+           db
+           "UPDATE record SET mac=?, chain_seq=? WHERE topic=? AND writer_guid=? AND sn=?"
+           mac seq topic wg sn-blob)
+          (setf running mac tail mac)
+          (incf seq))))
+    tail))
+
 ;;; SQL text — pinned once (DRY; no ad-hoc string building on the hot loop).
 
 (defparameter %sqlite-ddl-table
-  "CREATE TABLE IF NOT EXISTS record (topic TEXT NOT NULL, writer_guid BLOB NOT NULL, sn BLOB NOT NULL, key_hash BLOB, kind INTEGER NOT NULL, payload BLOB NOT NULL, PRIMARY KEY (topic, writer_guid, sn))"
-  "DDL for the durable-record table (ADR 0049). SN is an 8-byte big-endian BLOB (full u64, no bound).")
+  "CREATE TABLE IF NOT EXISTS record (topic TEXT NOT NULL, writer_guid BLOB NOT NULL, sn BLOB NOT NULL, key_hash BLOB, kind INTEGER NOT NULL, payload BLOB NOT NULL, mac BLOB, chain_seq INTEGER, PRIMARY KEY (topic, writer_guid, sn))"
+  "DDL for the durable-record table (ADR 0049). SN is an 8-byte big-endian BLOB (full u64, no bound).
+   mac = per-row v3 keyed HMAC chain MAC (32 octets, NULL for pre-chain/legacy rows; ADR 0045).
+   chain_seq = explicit per-topic chain order (NULL for unchained rows; stable vs rowid-reuse-after-DELETE).")
 
 (defparameter %sqlite-ddl-index
   "CREATE INDEX IF NOT EXISTS idx_topic_order ON record(topic, writer_guid, sn)"
@@ -72,6 +151,10 @@
     (sqlite:execute-non-query db "PRAGMA journal_mode=WAL")
     (sqlite:execute-non-query db "PRAGMA synchronous=FULL")
     (sqlite:execute-non-query db %sqlite-ddl-table)
+    ;; migrate a pre-chain (WP-DURABILITY-SQLITE) DB: add the v3 mac/chain_seq columns idempotently
+    ;; (a duplicate-column error on an already-migrated/fresh DB is the expected no-op; ADR 0045)
+    (ignore-errors (sqlite:execute-non-query db "ALTER TABLE record ADD COLUMN mac BLOB"))
+    (ignore-errors (sqlite:execute-non-query db "ALTER TABLE record ADD COLUMN chain_seq INTEGER"))
     (sqlite:execute-non-query db %sqlite-ddl-index)
     db))
 
@@ -87,14 +170,22 @@
    with DEPTH >= 1 additionally keeps only the newest DEPTH :data records per non-NIL-key-hash instance.
    Stores OPAQUE payload bytes (DARE-unaware); wrap with make-encrypted-store for at-rest sealing.
    store-open (re)establishes the connection — a fresh store on an existing PATH replays all prior rows
-   (restart recovery). The chain-MAC seam is intentionally absent (per-row keyed MAC = ADR 0049 §7
-   follow-on); store-set-chain-mac-fn no-ops, composing cleanly with the encrypted decorator."
+   (restart recovery). The keyed per-row MAC chain seam (store-set-chain-mac-fn, ADR 0045) is LIVE:
+   when the encrypted decorator installs the log-MAC oracle each put writes a v3 chain MAC (byte-
+   identical to the file store) into the mac column and verify-on-open (before compaction) fail-closes
+   on any tamper; a NIL-oracle bare store writes NULL mac columns = byte-behaviorally unchanged."
   (let* ((db-path (when path (pathname path)))
          (lock    (dds.pal:make-lock "dds-sqlite-store"))
          (db-cell (list nil))                 ; car = live connection or NIL when closed
          ;; mutable policy cells (factory defaults; store-open overrides car when non-NIL)
          (hk-cell   (cons history-kind nil))
-         (depth-cell (cons history-depth nil)))
+         (depth-cell (cons history-depth nil))
+         ;; keyed log-MAC chain (ADR 0045): oracle closure + downgrade flag + grandfather set, all
+         ;; installed by the encrypted decorator via store-set-chain-mac-fn; NIL = bare store (no MAC).
+         (cmf-cell  (list nil))               ; car = HMAC oracle (data)->HMAC-SHA-256, or NIL
+         (req-cell  (list nil))               ; car = chain-REQUIRED (downgrade defense)
+         (gf-cell   (list nil))               ; car = grandfather-set hash-table (topic-ids) or NIL
+         (chain-macs (make-hash-table :test #'equal))) ; topic -> running chain MAC (32 octets)
     (flet ((%total ()
              (sqlite:execute-single (car db-cell) "SELECT COUNT(*) FROM record")))
       (labels ((%ensure-db ()
@@ -118,6 +209,15 @@
                           (car db-cell)
                           "SELECT writer_guid, sn, key_hash, kind, payload FROM record WHERE topic=? ORDER BY rowid"
                           topic)))
+               (%verify-chains ()
+                 ;; verify EVERY topic's MAC chain BEFORE compaction (fail-closed) so a tampered
+                 ;; store cannot be laundered by the compacting DELETE; seed the running-MAC state
+                 ;; (chain-macs) from each verified tail so subsequent puts continue the chain (ADR 0045).
+                 (clrhash chain-macs)
+                 (dolist (topic (sqlite:execute-to-list (car db-cell) "SELECT DISTINCT topic FROM record"))
+                   (let ((tail (%sqlite-verify-topic (car db-cell) (first topic)
+                                                     (car cmf-cell) (car req-cell) (car gf-cell))))
+                     (when tail (setf (gethash (first topic) chain-macs) tail)))))
                (%compact-on-open (eff-hk eff-hd)
                  ;; compaction-on-open (DDS 1.4 §2.2.3.5): run the SHARED %compact-topic-records per
                  ;; topic (identical to the file store) and DELETE any dropped rows. Cheap (durability
@@ -141,7 +241,13 @@
                               (car db-cell)
                               "DELETE FROM record WHERE topic=? AND writer_guid=? AND sn=?"
                               tn (durable-record-writer-guid r)
-                              (%sn->be8 (durable-record-sn r)))))))))))
+                              (%sn->be8 (durable-record-sn r))))))
+                       ;; recompute the surviving chain so the next reopen never false-rejects (ADR 0045)
+                       (when (car cmf-cell)
+                         (let ((tail (%sqlite-recompute-topic (car db-cell) tn (car cmf-cell))))
+                           (if tail
+                               (setf (gethash tn chain-macs) tail)
+                               (remhash tn chain-macs)))))))))
         (%ensure-db)
         (%make-durable-store
          :name :sqlite
@@ -159,11 +265,25 @@
                ;; bounded store full -> reject (RESOURCE_LIMITS)
                ((and (plusp max-samples) (>= (%total) max-samples)) :rejected)
                (t
-                (sqlite:execute-non-query
-                 (car db-cell)
-                 "INSERT OR IGNORE INTO record (topic, writer_guid, sn, key_hash, kind, payload) VALUES (?,?,?,?,?,?)"
-                 topic writer-guid (%sn->be8 sn) key-hash (%kind->int kind) payload)
-                t))))
+                (let ((mac nil) (seq nil))
+                  (when (car cmf-cell)
+                    ;; keyed store: v3 chain MAC over this topic's running MAC (seeded on the first
+                    ;; put), byte-identical to the file store; explicit chain_seq = per-topic MAX+1.
+                    (let* ((prev (or (gethash topic chain-macs) (%chain-seed (car cmf-cell) topic)))
+                           (rec  (make-durable-record :topic topic :writer-guid writer-guid :sn sn
+                                                      :key-hash key-hash :kind kind :payload payload)))
+                      (setf mac (nth-value 1 (%frame-record-versioned
+                                              rec +frame-version-v3+ prev (car cmf-cell))))
+                      (setf seq (1+ (or (sqlite:execute-single
+                                         (car db-cell)
+                                         "SELECT MAX(chain_seq) FROM record WHERE topic=?" topic)
+                                        -1)))
+                      (setf (gethash topic chain-macs) mac)))
+                  (sqlite:execute-non-query
+                   (car db-cell)
+                   "INSERT OR IGNORE INTO record (topic, writer_guid, sn, key_hash, kind, payload, mac, chain_seq) VALUES (?,?,?,?,?,?,?,?)"
+                   topic writer-guid (%sn->be8 sn) key-hash (%kind->int kind) payload mac seq)
+                  t)))))
 
          :get-range
          (lambda (topic)
@@ -195,6 +315,10 @@
              (%ensure-db)
              (when open-hk (setf (car hk-cell) open-hk))
              (when open-hd (setf (car depth-cell) open-hd))
+             ;; keyed store: verify EVERY chain BEFORE compaction (fail-closed; tamper cannot be
+             ;; laundered by the compacting DELETE). A bare store skips verification (ADR 0045).
+             (when (car cmf-cell)
+               (%verify-chains))
              (%compact-on-open (car hk-cell) (car depth-cell))
              t))
 
@@ -224,6 +348,19 @@
            (dds.pal:with-lock (lock)
              (%ensure-db)
              (sqlite:execute-single (car db-cell) "PRAGMA wal_checkpoint(FULL)"))
+           t)
+
+         :set-chain-mac-fn
+         ;; keyed-store seam (ADR 0045): the encrypted decorator installs the log-MAC oracle here
+         ;; BEFORE it drives store-open, so replay verifies + puts write the chain with the key in
+         ;; hand. The store holds only the closure, never the key bytes. REQUIRED marks the store
+         ;; chain-committed (a full v3->v2 downgrade of a non-empty topic fails the open); GRANDFATHER
+         ;; (a topic-id hash-set or NIL) names legacy topics exempt from that per-topic check.
+         (lambda (fn required grandfather)
+           (dds.pal:with-lock (lock)
+             (setf (car cmf-cell) fn)
+             (setf (car req-cell) required)
+             (setf (car gf-cell) grandfather))
            t))))))
 
 (defun* make-sqlite-store-factory (&key dir key-dir (db-name "durability.sqlite3")

@@ -41,6 +41,7 @@ mandatory first step), so it needs **no reader conditionals** outside `dds-pal/`
 ```
 CREATE TABLE record (topic TEXT NOT NULL, writer_guid BLOB NOT NULL, sn BLOB NOT NULL,
                      key_hash BLOB, kind INTEGER NOT NULL, payload BLOB NOT NULL,
+                     mac BLOB, chain_seq INTEGER,           -- v3 keyed MAC chain (§9, ADR 0045)
                      PRIMARY KEY (topic, writer_guid, sn));
 CREATE INDEX idx_topic_order ON record(topic, writer_guid, sn);
 ```
@@ -84,9 +85,10 @@ authoritative order is the one shared definition (DRY).
 - `sync` — `PRAGMA wal_checkpoint(FULL)` (group-commit durability barrier; failure PROPAGATES,
   fail-closed). Journal mode is WAL, `synchronous=FULL` (durability is off the per-sample hot path,
   so maximum safety is preferred over throughput).
-- `set-chain-mac-fn` — intentionally **absent** (NIL). `store-set-chain-mac-fn` no-ops when a store
-  has no chain seam, so the SQLite store composes cleanly with the encrypted decorator's v2 epoch
-  mode. The per-row keyed MAC chain for SQLite is an explicit follow-on (see §7).
+- `set-chain-mac-fn` — **LIVE** (WP-SQLITE-MAC-CHAIN, §9). Installs the log-MAC oracle + downgrade
+  flag + grandfather set; puts write a per-row v3 chain MAC (byte-identical to the file store) into
+  the `mac` column and `store-open` verifies the chain (before compaction, fail-closed). A NIL oracle
+  = bare store with NULL `mac`/`chain_seq` columns (byte-behaviorally unchanged).
 
 ## 6. DARE composition (always-on at-rest encryption)
 
@@ -99,11 +101,9 @@ stores opaque payload bytes exactly like the file store. `make-sqlite-store-fact
 
 ## 7. Follow-ons (explicitly deferred)
 
-- **Per-row keyed MAC chain (ADR 0045 analogue).** The file store has a v3 HMAC chain making interior
-  delete/reorder/substitution/insertion tamper-evident. The SQLite store leaves `set-chain-mac-fn`
-  NIL for this slice; a per-row MAC chain (a `mac` column chained by rowid, verified on open) is the
-  direct follow-on. Until then the encrypted decorator's per-record GCM tag still authenticates each
-  row's payload+metadata in isolation (no cross-row chaining).
+- **Per-row keyed MAC chain (ADR 0045 analogue).** ✅ **RESOLVED — WP-SQLITE-MAC-CHAIN (§9).**
+  `set-chain-mac-fn` is now LIVE; the SQLite backend is at tamper-evidence parity with the file
+  store's v3 keyed HMAC chain. See §9 for the as-built.
 - **Compaction at scale.** Compaction-on-open loads each topic's rows to run `%compact-topic-records`.
   For very large stores an incremental/SQL-side compaction is a follow-on; the current approach is
   chosen for exact parity with the file store and is cheap off the hot path.
@@ -116,3 +116,50 @@ stores opaque payload bytes exactly like the file store. `make-sqlite-store-fact
 - Both impls (Clasp first, then SBCL) load `:sqlite` and pass the full contract suite identically.
 - No hot-path impact (durability is off the per-sample wire path); no reader conditionals added; SBOM
   gains `sqlite` + `iterate` + native `libsqlite3`; provenance records the clean-room dependency use.
+
+## 9. As-built — WP-SQLITE-MAC-CHAIN (per-row keyed MAC chain, ADR 0045 parity)
+
+Closes the §7 deferral. `set-chain-mac-fn` is now filled; a MAC-chained SQLite store is
+byte-for-byte MAC-compatible with the file store and fails closed on tamper at `store-open`.
+
+- **Schema.** Two nullable columns added to `record` (idempotent `ALTER TABLE ADD COLUMN` migrates a
+  pre-chain DB): `mac BLOB` (32-octet HMAC-SHA-256 chain MAC, NULL for legacy/pre-chain rows) and
+  `chain_seq INTEGER` (the explicit per-topic chain order). The anchor stays as `DIR/logmac.anchor`.
+- **Byte-identical MAC (maximal reuse).** The MAC over a row reuses `%frame-record-versioned` to build
+  the canonical v3 frame and takes its 32-byte MAC, chained by `%chain-seed`/`%chain-mac` — the SAME
+  helpers the file store uses. A MAC computed by either backend over the same record is identical. The
+  store holds only the HMAC oracle closure, never the log-MAC key.
+- **Chain order = explicit `chain_seq`, not rowid.** `chain_seq` is assigned per-topic `MAX+1` on put
+  and is robust against SQLite's rowid reuse after a `DELETE`. Per-topic verification/recompute is
+  `ORDER BY chain_seq ASC, rowid ASC`.
+- **Verify BEFORE compaction (fail-closed).** `store-open` verifies every topic's chain (recompute
+  each row's expected MAC over `running ∥ frame-prefix`, compare to the stored `mac`) BEFORE
+  `%compact-on-open`, so tamper can never be laundered by the compacting `DELETE`. Any
+  mismatch/gap/reorder, or a `NULL`-mac row after a chained row, signals. Downgrade defense: a
+  non-empty non-grandfathered topic with zero chained rows signals (the v3→v2 keyless downgrade).
+- **Chain-recompute-on-compaction (the no-false-reject invariant).** `%compact-on-open` deletes
+  KEEP_LAST-superseded rows, which breaks the chain over the survivors. After any compacting delete
+  the surviving rows are re-MAC'd as a fresh chain (re-seed, re-MAC in `chain_seq` order, rewrite
+  `mac` + dense `chain_seq`), mirroring the file store's `%rewrite-topic-log`. A KEEP_LAST MAC-chained
+  store therefore reopens clean any number of times.
+- **Grandfather enumerator (backend-dispatched, DRY).** The mint-time grandfather set is chosen by
+  `%store-grandfather-ids` so each backend's ids key IDENTICALLY to its own downgrade-check lookup: the
+  FILE store keeps its original raw-tid log-dir scan (`%enumerate-nonempty-topic-ids` — the log
+  filenames ARE the tids, robust to a lost `topics.map` where a topic name degrades to the raw tid and
+  a `%topic->id` round-trip would double-encode → a false-REJECT), while SQLite (and memory) map real
+  topic NAMES via `(mapcar #'%topic->id (store-topics inner-store))` (matching their `%topic->id(name)`
+  verify key). So a legacy multi-topic store on EITHER backend grandfathers its dormant topics without a
+  false-REJECT; a fresh store's set is empty ⇒ full protection. (An earlier fully-shared
+  `store-topics`→`%topic->id` lift regressed the file store's map-less fallback; the dispatch restores
+  the exact pre-lift file semantics — guarded by `run-durability-mac-chain-test` case 8.)
+- **Residual — whole-topic deletion.** Dropping every row of a topic (so it no longer exists at open)
+  is the topic-granularity form of the ADR 0045 §7 whole-tail-truncation residual and joins the shared
+  residual list (whole-tail truncation, `epochs.dat` MAC, anchor-deletion + full downgrade). It closes
+  only with the deferred separable **sealed high-water anchor** — a chain-design property identical for
+  the file and SQLite backends, not a storage bug.
+- **NIL-oracle unchanged.** A bare `make-sqlite-store` (no oracle) writes `NULL` `mac`/`chain_seq` and
+  skips verification — byte-behaviorally identical to the pre-chain backend.
+- **Tests / gates.** `run-durability-sqlite-mac-chain-test` (tamper via DIRECT SQL: UPDATE
+  payload/mac, DELETE row, REORDER via chain_seq swap; downgrade; KEEP_LAST reopen-repeatedly
+  no-false-reject; epoch-boundary; grandfather; NIL-oracle regression). Both impls 454 passed (Clasp
+  first, then SBCL), identical. No new dependency (HMAC is `dds.dare`). No hot-path impact.
