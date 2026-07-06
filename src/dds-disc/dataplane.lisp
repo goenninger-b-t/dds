@@ -722,31 +722,34 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (loop for v being the hash-values of (disc-node-matches node) collect v)))
 
-(defun* %local-writer-durability (node)
-    (function (disc-node) (member :volatile :transient-local :transient :persistent))
+(defun* %local-writer-durability (node &optional writer-id)
+    (function (disc-node &optional (or null (unsigned-byte 32)))
+              (member :volatile :transient-local :transient :persistent))
   "NODE's local user writer's DURABILITY kind (DDS 1.4 §2.2.3.4), read from its advertised endpoint-data
-   QoS (disc-node-local-writers — the same QoS the SEDP advertises + RxO-matches). v1 is one engine writer
-   per node (one-writer-per-node, the enable-publisher note + the single dp-user-writer), so the node's lone
-   local-writer's durability IS the engine writer's; :VOLATILE when there is no local writer yet (the
-   discovery-less value-level path). Gates the full-ACK purge in %on-user-acknack + the late-joiner replay
-   in %writer-durability-init: a TRANSIENT_LOCAL writer retains for late-joiners (writer-purge-acked
-   DURABILITY). NOTE: N-user-endpoint S0 registry landed (ADR 0048) — the engine writer is now registry-held
-   (disc-node-user-writer = primary), but N-local send fan-out is still S1, so N=1 attribution is unchanged. When
-   S1 lifts single-user-endpoint (multiple DataWriters of mixed durability), this single-writer attribution must be
-   revisited — each engine writer would need its own settled durability rather than a list head."
-  (let ((w (first (disc-node-local-writers node))))
+   QoS (disc-node-local-writers — the same QoS the SEDP advertises + RxO-matches). WRITER-ID (WP-N-ENDPOINT-S2B,
+   ADR 0048) selects a SPECIFIC local writer by its engine EntityId — its OWN advertised durability, so the
+   late-joiner replay in %writer-durability-init and the full-ACK purge in %on-user-acknack each consult the
+   ADDRESSED writer's kind, never a list head. NIL (or an unregistered id) -> the head local-writer (the primary;
+   byte-identical N=1); :VOLATILE when there is no local writer yet (the discovery-less value-level path). A
+   TRANSIENT_LOCAL writer retains for late-joiners (writer-purge-acked DURABILITY)."
+  (let ((w (or (and writer-id
+                    (find writer-id (disc-node-local-writers node)
+                          :key (lambda (ep) (%guid-entityid (dds.rtps.discovery:endpoint-data-guid ep)))
+                          :test #'eql))
+               (first (disc-node-local-writers node)))))   ; NIL or an unregistered id -> head (primary), N=1 byte-identical
     (if w (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos w)) :volatile)))
 
-(defun* finalize-writer-durability (node)
-    (function (disc-node) (eql t))
+(defun* finalize-writer-durability (node &optional writer-id)
+    (function (disc-node &optional (or null (unsigned-byte 32))) (eql t))
   "Mark NODE's local user writer FINALIZED (DDS 1.4 §2.2.3.4; the OPT-IN durability-finalize extension ON
    TOP of the conformant default). The disc-level bridge for DCPS durability-finalize: forwards to the engine
-   writer (writer-finalize-durability on disc-node-user-writer), after which the full-ACK purge in
-   %on-user-acknack RELEASES the TRANSIENT_LOCAL writer's retained late-joiner history once all current
-   readers ACK (writer-purge-acked treats a finalized writer as VOLATILE). N-user-endpoint S0 registry landed
-   (ADR 0048): this finalizes the node's PRIMARY engine writer (disc-node-user-writer); a no-op (still T) when
-   there is no user writer. N-local send fan-out = S1. Monotonic."
-  (let ((w (disc-node-user-writer node)))
+   writer (writer-finalize-durability), after which the full-ACK purge in %on-user-acknack RELEASES the
+   TRANSIENT_LOCAL writer's retained late-joiner history once all current readers ACK (writer-purge-acked treats
+   a finalized writer as VOLATILE). WP-N-ENDPOINT-S2B (ADR 0048): WRITER-ID finalizes the SPECIFIC engine writer
+   (the calling DataWriter's own EntityId), so one durable writer's finalize never releases a sibling's retained
+   history; NIL (or unregistered) -> the PRIMARY (byte-identical N=1). A no-op (still T) when there is no user
+   writer. Monotonic."
+  (let ((w (%resolve-user-writer node writer-id)))
     (when w (dds.rtps.reliable:writer-finalize-durability w)))
   t)
 
@@ -1722,39 +1725,46 @@
             (%send-user-heartbeat node (disc-node-tx-msg node) first last count (cadr pd) (cddr pd) (car pd)))))))
   t)
 
-(defun* %writer-durability-init (node reader-guid reader-durability)
+(defun* %writer-durability-init (node reader-guid reader-durability &optional writer-id)
     (function (disc-node (simple-array (unsigned-byte 8) (16))
-               (member :volatile :transient-local :transient :persistent)) (eql t))
+               (member :volatile :transient-local :transient :persistent)
+               &optional (or null (unsigned-byte 32))) (eql t))
   "Writer-side late-joiner proxy init for a newly matched remote reader (DDS 1.4 §2.2.3.4, RTPS 2.5
    §8.4.2.2). Called once at match time from the DCPS on-match hook — on the RECEIVER thread, so every send
    here uses the node's rx-tx-msg buffer, never tx-msg (the announce/caller thread's, dataplane.lisp §top).
-   READER-GUID = the matched handle; READER-DURABILITY = the remote reader's advertised DURABILITY. When
-   BOTH this writer (its advertised DURABILITY) AND the reader are TRANSIENT_LOCAL, initialize the reader's
-   ReaderProxy UNSENT-BASE to firstSN (hc-min-seq) so the existing push (writer-unsent-list) REPLAYS the
-   entire retained history, then send a prompt HEARTBEAT [firstSN,lastSN] so it ACKNACKs and the existing
-   retransmit path delivers the history — to that reader's participant alone when its unicast destination is
-   resolved (by the 12-octet GUID prefix), else fanned out to every matched-reader destination (each reader
-   NACKs only its own gaps). firstSN/lastSN/count are taken from a SINGLE writer-heartbeat call (one lock,
-   one consistent snapshot — no torn read vs a concurrent write/purge). Otherwise (a VOLATILE writer or a
-   VOLATILE reader) init UNSENT-BASE to lastSN+1 — future-only, the effective pre-WP behavior (a new reader
-   never gets the pre-existing history). A no-op (still returns T) when there is no user writer. Sets only
-   the push watermark; the ACKNACK repair watermark (acked-base) is left at its default (independent,
-   §8.4.2.2)."
-  (let ((w (disc-node-user-writer node)))
+   READER-GUID = the matched handle; READER-DURABILITY = the remote reader's advertised DURABILITY.
+   WP-N-ENDPOINT-S2B (ADR 0048): WRITER-ID selects the MATCHED local writer (the one whose topic RxO-matched
+   this reader) — its OWN HistoryCache, advertised durability, and GUID; *emit-writer* is bound to it so the
+   prompt HEARTBEAT (%emit-wid) carries THIS writer's EntityId, not the primary's. So N durable writers each
+   replay their OWN retained history to a matched late reader. NIL (or unregistered) -> the primary
+   (byte-identical N=1). When BOTH this writer (its advertised DURABILITY) AND the reader are TRANSIENT_LOCAL,
+   initialize the reader's ReaderProxy UNSENT-BASE to firstSN (hc-min-seq) so the existing push
+   (writer-unsent-list) REPLAYS the entire retained history, then send a prompt HEARTBEAT [firstSN,lastSN] so it
+   ACKNACKs and the existing retransmit path delivers the history — to that reader's participant alone when its
+   unicast destination is resolved (by the 12-octet GUID prefix), else fanned out to every matched-reader
+   destination (each reader NACKs only its own gaps). firstSN/lastSN/count are taken from a SINGLE
+   writer-heartbeat call (one lock, one consistent snapshot — no torn read vs a concurrent write/purge).
+   Otherwise (a VOLATILE writer or a VOLATILE reader) init UNSENT-BASE to lastSN+1 — future-only, the effective
+   pre-WP behavior (a new reader never gets the pre-existing history). A no-op (still returns T) when there is no
+   user writer. Sets only the push watermark; the ACKNACK repair watermark (acked-base) is left at its default
+   (independent, §8.4.2.2)."
+  (let ((w (%resolve-user-writer node writer-id)))
     (when w
-      (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)   ; one locked snapshot
-        (let* ((tl-tl (and (eq reader-durability :transient-local)
-                           (eq (%local-writer-durability node) :transient-local)))
-               (base (if tl-tl first (1+ last))))
-          (dds.rtps.reliable:init-reader-proxy-base w reader-guid base)
-          (when (and tl-tl (>= last first))              ; retained history exists -> prompt a NACK
-            (let* ((prefix (subseq reader-guid 0 12))
-                   (dest (%prefix-user-destination node prefix))
-                   ;; (DEST-PREFIX . (host . port)) entries (T10): the resolved reader's prefix, or the prefixed fan-out
-                   (peers (if dest (list (cons prefix dest)) (%match-destinations-prefixed node t))))
-              (dolist (pd peers)
-                (%send-user-heartbeat node (disc-node-rx-tx-msg node) first last count
-                                      (cadr pd) (cddr pd) (car pd))))))))) ; T10: wrap the prompt HB to a :keyed reader
+      (let ((*emit-writer* w))   ; the prompt HB (%emit-wid) carries THIS matched writer's EntityId, not the primary's
+        (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)   ; one locked snapshot
+          (let* ((tl-tl (and (eq reader-durability :transient-local)
+                             (eq (%local-writer-durability node (dds.rtps.reliable:rtps-writer-entityid w))
+                                 :transient-local)))
+                 (base (if tl-tl first (1+ last))))
+            (dds.rtps.reliable:init-reader-proxy-base w reader-guid base)
+            (when (and tl-tl (>= last first))              ; retained history exists -> prompt a NACK
+              (let* ((prefix (subseq reader-guid 0 12))
+                     (dest (%prefix-user-destination node prefix))
+                     ;; (DEST-PREFIX . (host . port)) entries (T10): the resolved reader's prefix, or the prefixed fan-out
+                     (peers (if dest (list (cons prefix dest)) (%match-destinations-prefixed node t))))
+                (dolist (pd peers)
+                  (%send-user-heartbeat node (disc-node-rx-tx-msg node) first last count
+                                        (cadr pd) (cddr pd) (car pd)))))))))) ; T10: wrap the prompt HB to a :keyed reader
   t)
 
 (defun* %reader-durability-init (node writer-guid writer-durability)
@@ -2944,7 +2954,8 @@
           ;; §2.2.3.4) RETAINS its acked history for late-joiners — the durability arg makes the purge a
           ;; no-op for it (HISTORY-bounded, not ACK-bounded); a VOLATILE writer purges as before.
           (dds.rtps.reliable:writer-purge-acked w (%matched-reader-keys node)
-                                                (%local-writer-durability node))))))
+                                                (%local-writer-durability
+                                                 node (dds.rtps.reliable:rtps-writer-entityid w)))))))
   t)
 
 (defun* %on-user-data-frag (node c flags body-len buf src-prefix)
@@ -3493,15 +3504,34 @@
                             "the controller must register a per-writer flow-state for EACH of the 2 writers (S1b)")
                     (flow-controller-unregister fc pub))
                (destroy-flow-controller fc)))
-           ;; (4c) deferral: a 2nd writer on a node with a TRANSIENT_LOCAL writer fail-fasts (durability multi-writer = later slice)
+           ;; (4c) WP-N-ENDPOINT-S2B: a 2nd writer on a node with a TRANSIENT_LOCAL writer now REGISTERS (the S1-era
+           ;; fail-fast is LIFTED) — the match-time late-joiner replay (%writer-durability-init / %prearm) is per-writer,
+           ;; so each durable writer replays its OWN retained history. Full per-writer replay + cross-isolation is
+           ;; proven by run-dcps-durability-multiwriter-test.
            (let ((dn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
              (unwind-protect
                   (progn (add-local-writer dn :topic "DA" :type "X"
                                               :qos (dds.qos:make-writer-qos :durability :transient-local))
                          (enable-publisher dn)
-                         (add-local-writer dn :topic "DB" :type "X")
-                         (assert (null (ignore-errors (enable-publisher dn) t)) ()
-                                 "a 2nd writer on a node with a TRANSIENT_LOCAL writer must fail-fast (durability multi-writer)"))
+                         (add-local-writer dn :topic "DB" :type "X"
+                                              :qos (dds.qos:make-writer-qos :durability :transient-local))
+                         (assert (ignore-errors (enable-publisher dn) t) ()
+                                 "a 2nd RETAINING-durability writer must now REGISTER (WP-N-ENDPOINT-S2B — durable multi-writer supported)")
+                         (assert (= 2 (length (%all-user-writer-ids dn))) ()
+                                 "the participant must hold 2 durable user writers with distinct EntityIds (S2B)")
+                         ;; (4d) WP-N-ENDPOINT-S2B same-topic-durable fence: a 2nd writer on an ALREADY-HELD topic
+                         ;; where a RETAINING-durability writer is involved FAIL-FASTS (same-topic durable = 2c;
+                         ;; %match-remote-endpoint matches only the first same-topic writer -> silent missing-history).
+                         (assert (null (ignore-errors
+                                        (add-local-writer dn :topic "DA" :type "X"
+                                                             :qos (dds.qos:make-writer-qos :durability :transient-local))
+                                        t)) ()
+                                 "a 2nd SAME-topic (DA) durable writer must FAIL-FAST (same-topic durable multi-writer = Slice 2c)")
+                         ;; a 2nd SAME-topic VOLATILE writer stays allowed (S1) — the durable fence is scoped to RETAINING durability
+                         (assert (ignore-errors
+                                  (add-local-writer dn :topic "VA" :type "X")
+                                  (add-local-writer dn :topic "VA" :type "X") t) ()
+                                 "two SAME-topic VOLATILE writers must still register (the S2B fence is scoped to RETAINING durability)"))
                (stop-node dn)))
            t)
       (setf *debug-drop-sample-numbers* nil)

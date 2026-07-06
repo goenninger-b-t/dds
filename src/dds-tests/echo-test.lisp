@@ -3812,6 +3812,7 @@
                  ("dcps-instance-read-take"  . run-dcps-instance-test)
                  ("dcps-dispose-unregister"  . run-dcps-dispose-test)
                  ("dcps-durability-latejoiner" . run-dcps-durability-latejoiner-test)
+                 ("dcps-durability-multiwriter" . run-dcps-durability-multiwriter-test)
                  ("dcps-durability-keeplast" . run-dcps-durability-keeplast-test)
                  ("keeplast-keyhash-threaded" . run-keeplast-keyhash-threaded-test)
                  ("dcps-instance-state"      . run-dcps-instance-state-test)

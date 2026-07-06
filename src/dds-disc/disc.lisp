@@ -566,17 +566,6 @@
    registry (WP-N-ENDPOINT-S0; S2 routes delivery across %all-user-readers)."
   (disc-node-primary-user-reader node))
 
-(defun* %node-has-durable-writer-p (node)
-    (function (disc-node) boolean)
-  "T iff ANY local user writer advertises a RETAINING durability (TRANSIENT_LOCAL / TRANSIENT / PERSISTENT, DDS 1.4
-   §2.2.3.4) — read from the advertised endpoint-data QoS. Gates the S1 second-writer fail-fast: durability
-   late-joiner replay (%writer-durability-init: proxy-base rewind + a prompt HEARTBEAT) is driven per-node off the
-   PRIMARY writer only, so a 2nd durable writer would silently miss its retained-history replay (and mis-source the
-   prompt HB) — deferred, not half-fixed. A VOLATILE writer sends no prompt HB, so 2 VOLATILE writers are unaffected."
-  (dolist (w (disc-node-local-writers node) nil)
-    (unless (eq :volatile (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos w)))
-      (return t))))
-
 (defun* %register-user-writer (node entity-id writer)
     (function (disc-node (unsigned-byte 32) dds.rtps.reliable:rtps-writer) dds.rtps.reliable:rtps-writer)
   "Register WRITER under ENTITY-ID in NODE's user-writer registry (WP-N-ENDPOINT-S1, ADR 0048); the first
@@ -585,9 +574,11 @@
    current if that id IS the primary. A NEW distinct id ADDS an N-th local writer (each with its own EntityId +
    HistoryCache; a 2nd SECURED writer is SUPPORTED — WP-N-ENDPOINT-S3, each keyed under its OWN EntityCrypto km; a
    2nd writer under an associated flow-controller is SUPPORTED — WP-N-ENDPOINT-S1B, each becomes a per-writer
-   selection entry) UNLESS deferred: a 2nd writer on a node with any RETAINING-durability writer fail-fasts
-   (durability multi-writer = later slice). When a controller is associated, EACH registered writer (first or N-th,
-   new or re-registered) is (re)registered with it as a per-writer flow-state (flow-controller-add-writer, S1b)."
+   selection entry; a 2nd RETAINING-durability writer is SUPPORTED — WP-N-ENDPOINT-S2B, the match-time late-joiner
+   replay (%writer-durability-init / %prearm-writer-future-base / finalize-writer-durability) is per-writer so each
+   durable writer replays its OWN retained history under its OWN GUID). When a controller is associated, EACH
+   registered writer (first or N-th, new or re-registered) is (re)registered with it as a per-writer flow-state
+   (flow-controller-add-writer, S1b)."
   (let ((cell (assoc entity-id (disc-node-user-writers node) :test #'eql)))
     (cond (cell (let ((was-primary (eq (cdr cell) (disc-node-primary-user-writer node))))
                   (setf (cdr cell) writer)
@@ -595,12 +586,7 @@
           ((null (disc-node-user-writers node))   ; first writer -> primary (N=1 identity)
            (push (cons entity-id writer) (disc-node-user-writers node))
            (setf (disc-node-primary-user-writer node) writer))
-          (t (when (%node-has-durable-writer-p node)
-               (error "disc-node: refusing a 2nd local user DataWriter (EntityId #x~8,'0X) on a node with a ~
-                       RETAINING-durability (TRANSIENT_LOCAL/TRANSIENT/PERSISTENT) writer — durability multi-writer ~
-                       is a later N-user-endpoint slice; primary EntityId #x~8,'0X"
-                      entity-id (caar (last (disc-node-user-writers node)))))
-             (push (cons entity-id writer) (disc-node-user-writers node))))   ; N-th writer; primary unchanged
+          (t (push (cons entity-id writer) (disc-node-user-writers node))))   ; N-th writer (S2B: durable multi-writer supported); primary unchanged
     (when (disc-node-flow-controller node)   ; WP-N-ENDPOINT-S1B: (re)register this writer as a per-writer flow-state
       (flow-controller-add-writer (disc-node-flow-controller node) node writer)))
   writer)
@@ -1075,6 +1061,25 @@
     (or (and dres (and (member (funcall dres topic) '(:sign :encrypt)) t))
         (and mres (and (member (funcall mres topic) '(:sign :encrypt)) t)))))
 
+(defun* %same-topic-durable-writer-conflict-p (node topic new-durability)
+    (function (disc-node string (member :volatile :transient-local :transient :persistent)) boolean)
+  "T iff registering a writer on TOPIC with NEW-DURABILITY would form a SAME-topic multi-writer in which the
+   NEW writer OR an EXISTING same-topic local writer advertises a RETAINING durability (TRANSIENT_LOCAL /
+   TRANSIENT / PERSISTENT, DDS 1.4 §2.2.3.4). Gates the WP-N-ENDPOINT-S2B same-topic-durable fail-fast in
+   add-local-writer: %match-remote-endpoint matches only the FIRST same-topic local writer per remote reader
+   (it (return-from ... t) after the first, and %guid-matched-p is keyed by the remote GUID), so a 2nd
+   same-topic durable writer's retained history would SILENTLY never replay to a matched late reader
+   (missing-history, the worst class). Same-topic VOLATILE writers stay allowed (S1) — a VOLATILE writer
+   retains nothing, so the match-first limitation loses no history there (that is 2c's concern)."
+  (let ((same (loop for ep in (disc-node-local-writers node)
+                    when (string= topic (dds.rtps.discovery:endpoint-data-topic-name ep)) collect ep)))
+    (and same
+         (or (not (eq new-durability :volatile))
+             (some (lambda (ep) (not (eq (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos ep))
+                                         :volatile)))
+                   same))
+         t)))
+
 (defun* add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
                                    (key nil) qos type-information (keyed t))
@@ -1094,7 +1099,13 @@
    same-topic secured writer would miss its match-time key install at a STRICT remote (Fast DDS rejects a
    wrong destination_endpoint_key) -> its samples undecodable there (fail-closed availability loss, never a
    mis-sign). Two DISTINCT-topic secured writers (the S3 shipping capability) and two SAME-topic NON-secured
-   writers (S1) are both unaffected. Mirrors the add-local-reader same-topic guard."
+   writers (S1) are both unaffected. Mirrors the add-local-reader same-topic guard.
+   WP-N-ENDPOINT-S2B DEFERRAL (ADR 0048 §14): a 2nd writer on a topic ALREADY held by a local writer on this
+   participant, where the NEW OR an existing same-topic writer is a RETAINING durability
+   (TRANSIENT_LOCAL/TRANSIENT/PERSISTENT), FAIL-FASTS (same-topic durable multi-writer = Slice 2c) —
+   %match-remote-endpoint matches only the FIRST same-topic writer, so the 2nd durable writer's retained
+   history would silently never replay. Same-topic VOLATILE writers stay allowed (S1). DISTINCT-topic durable
+   writers (the S2B shipping capability) are unaffected."
   (when (and (%topic-secured-writer-p node topic)
              (find topic (disc-node-local-writers node)
                    :key #'dds.rtps.discovery:endpoint-data-topic-name :test #'string=))
@@ -1104,17 +1115,25 @@
             match-time key install at a strict remote and its samples would be undecodable there). Use ~
             distinct topics or separate participants."
            topic))
-  (let* ((key (or key (%alloc-user-writer-key node)))
-         (kind (if keyed #x02 #x03))
-         (ep (dds.rtps.discovery:make-endpoint-data
-              :role :writer
-              :guid (%make-endpoint-guid (disc-node-guid-prefix node) key kind)
-              :topic-name topic :type-name type :type-information type-information
-              :qos (or qos (%qos-from-reliability reliability)))))
-    (setf (disc-node-user-writer-id node) (logior (ash key 8) kind))
-    (%refine-user-protection node topic :writer)   ; ADR 0046 §9.4.1.2.4: cache the WRITER's OWN per-topic metadata + data protection (cross-role downgrade fix)
-    (push ep (disc-node-local-writers node))
-    ep))
+  (let ((wqos (or qos (%qos-from-reliability reliability))))
+    (when (%same-topic-durable-writer-conflict-p node topic (dds.qos:qos-durability wqos))
+      (error "disc-node: refusing a 2nd local user DataWriter on topic ~s involving a RETAINING-durability ~
+              (TRANSIENT_LOCAL/TRANSIENT/PERSISTENT) writer — same-topic durable multi-writer on one ~
+              participant is a later N-user-endpoint slice (2c). %match-remote-endpoint matches only the ~
+              FIRST same-topic writer, so the 2nd durable writer's retained history would silently never ~
+              replay to a matched late reader. Use distinct topics or separate participants."
+             topic))
+    (let* ((key (or key (%alloc-user-writer-key node)))
+           (kind (if keyed #x02 #x03))
+           (ep (dds.rtps.discovery:make-endpoint-data
+                :role :writer
+                :guid (%make-endpoint-guid (disc-node-guid-prefix node) key kind)
+                :topic-name topic :type-name type :type-information type-information
+                :qos wqos)))
+      (setf (disc-node-user-writer-id node) (logior (ash key 8) kind))
+      (%refine-user-protection node topic :writer)   ; ADR 0046 §9.4.1.2.4: cache the WRITER's OWN per-topic metadata + data protection (cross-role downgrade fix)
+      (push ep (disc-node-local-writers node))
+      ep)))
 
 (defun* add-local-reader (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-best-effort+)
@@ -1565,8 +1584,8 @@
   (dds.pal:with-lock ((disc-node-lock node))
     (nth-value 1 (gethash guid (disc-node-matches node)))))
 
-(defun* %prearm-writer-future-base (node reader-guid)
-    (function (disc-node (simple-array (unsigned-byte 8) (16))) (eql t))
+(defun* %prearm-writer-future-base (node reader-guid &optional writer-id)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) &optional (or null (unsigned-byte 32))) (eql t))
   "WP-ACKNACK-MATCH-GATE (DDS 1.4 §2.2.3.4; RTPS 2.5 §8.4.2.2 / §8.4.10.1): FUTURE-only-base the reliable
    writer's ReaderProxy for a newly-matched remote READER (READER-GUID) BEFORE the match is RECORDED — i.e.
    before %reader-push-targets can make the reader a push destination — closing the symmetric writer-side
@@ -1576,10 +1595,13 @@
    HB-COUNT — a benign gap, Count need only be monotonic per RTPS 2.5 §8.3.7.5); the durability-aware on-match hook
    (%writer-durability-init) then REFINES it (a TL<->TL match to firstSN for late-joiner replay; the
    ACKNACK-repair path replays independently of UNSENT-BASE, so TL replay stays intact even though the base
-   starts future-only). The CALLER first-match-gates this (%guid-matched-p) so a re-announce never re-futures
+   starts future-only). WP-N-ENDPOINT-S2B (ADR 0048): WRITER-ID selects the MATCHED local writer (the one whose
+   topic RxO-matched this reader), so the prearm and the durability-init REFINE the SAME (writer,reader) proxy
+   base — never the primary when the match is on an N-th durable writer; NIL (or unregistered) -> the primary
+   (byte-identical N=1). The CALLER first-match-gates this (%guid-matched-p) so a re-announce never re-futures
    past unsent LIVE samples. A no-op (still T) with no user writer — the discovery-less/no-hook path is not
    pre-armed by the caller and keeps the default UNSENT-BASE 1 push-all (byte-identical)."
-  (let ((w (disc-node-user-writer node)))
+  (let ((w (%resolve-user-writer node writer-id)))
     (when w
       (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat w)
         (declare (ignore first count))
@@ -1733,7 +1755,10 @@
                            ;; re-future past unsent LIVE samples) — closes the concurrent-publish window.
                            (unless (or writer-p
                                        (%guid-matched-p node (dds.rtps.discovery:endpoint-data-guid remote)))
-                             (%prearm-writer-future-base node (dds.rtps.discovery:endpoint-data-guid remote)))
+                             ;; WP-N-ENDPOINT-S2B: prearm the MATCHED local writer (LOCAL, resolved by RxO), not
+                             ;; the primary, so it and %writer-durability-init refine the SAME reader-proxy base.
+                             (%prearm-writer-future-base node (dds.rtps.discovery:endpoint-data-guid remote)
+                                                         (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local))))
                            ;; WP-N-ENDPOINT-S2 (ADR 0048): a matched remote WRITER -> record (this local reader <->
                            ;; that writer-GUID) in the delivery route BEFORE %record-match, so once %guid-matched-p is
                            ;; true the route is already present (the %drain filter + the receive-hook demux read it;

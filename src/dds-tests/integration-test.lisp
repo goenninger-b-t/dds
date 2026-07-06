@@ -446,6 +446,76 @@
       (dds.dcps:delete-participant p1))
     t))
 
+(defun* run-dcps-durability-multiwriter-test ()
+    (function () t)
+  "DCPS N durable writers per participant, each replays its OWN retained history (WP-N-ENDPOINT-S2B, ADR 0048;
+   DDS 1.4 §2.2.3.4). ONE participant/ONE publisher owns TWO reliable TRANSIENT_LOCAL KEEP_ALL DataWriters on
+   DIFFERENT topics (Square + Circle); the Square writer publishes 3 samples and the Circle writer 2, all BEFORE
+   any reader. Two late TL readers (one per topic) each receive EXACTLY their own writer's retained history —
+   3 Squares to the Square reader, 2 Circles to the Circle reader — under that writer's OWN GUID. Cross-isolation:
+   neither reader sees the other writer's history. This is the S2B fix: pre-fix the match-time replay armed the
+   PRIMARY (Square) writer for BOTH matches, so the Circle writer's history never replayed (Circle reader got 0);
+   the guard-lift is the precondition (pre-fix the 2nd durable create-datawriter fail-fasted)."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw-sq (dds.dcps:create-topic p1 "Square" "shape-type" ts))
+                (tw-ci (dds.dcps:create-topic p1 "Circle" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (dw-sq (dds.dcps:create-datawriter
+                        pub tw-sq :qos (dds.qos:make-writer-qos :durability :transient-local
+                                                                :history-kind :keep-all)))
+                (dw-ci (dds.dcps:create-datawriter
+                        pub tw-ci :qos (dds.qos:make-writer-qos :durability :transient-local
+                                                                :history-kind :keep-all))))
+           ;; pre-join: each writer RETAINS its OWN samples (3 Squares, 2 Circles) — no reader exists yet.
+           (dds.dcps:write-sample dw-sq (make-shape-type :color "RED"   :x 1 :y 1 :shapesize 10))
+           (dds.dcps:write-sample dw-sq (make-shape-type :color "GREEN" :x 2 :y 2 :shapesize 20))
+           (dds.dcps:write-sample dw-sq (make-shape-type :color "BLUE"  :x 3 :y 3 :shapesize 30))
+           (dds.dcps:write-sample dw-ci (make-shape-type :color "CYAN"    :x 5 :y 5 :shapesize 50))
+           (dds.dcps:write-sample dw-ci (make-shape-type :color "MAGENTA" :x 6 :y 6 :shapesize 60))
+           (loop repeat 10 do (dds.dcps:spin p1) (sleep 0.01))   ; let both writers' history settle
+           (let ((p2 (dds.dcps:create-participant :domain (test-domain))))
+             (unwind-protect
+                  (let* ((tr-sq (dds.dcps:create-topic p2 "Square" "shape-type" ts))
+                         (tr-ci (dds.dcps:create-topic p2 "Circle" "shape-type" ts))
+                         (sub (dds.dcps:create-subscriber p2))
+                         (dr-sq (dds.dcps:create-datareader
+                                 sub tr-sq :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                         :durability :transient-local
+                                                                         :history-kind :keep-all)))
+                         (dr-ci (dds.dcps:create-datareader
+                                 sub tr-ci :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                         :durability :transient-local
+                                                                         :history-kind :keep-all))))
+                    (loop repeat 200
+                          until (and (>= (dds.dcps:matched-count p1) 2) (>= (dds.dcps:matched-count p2) 2))
+                          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                    (%check :ljmw-matched (and (>= (dds.dcps:matched-count p1) 2)
+                                               (>= (dds.dcps:matched-count p2) 2))
+                            "both late TL readers must match their respective durable writers")
+                    (%drain-until dr-sq p1 p2 (lambda () (>= (dds.dcps:samples-available dr-sq) 3)) 200)
+                    (%drain-until dr-ci p1 p2 (lambda () (>= (dds.dcps:samples-available dr-ci) 2)) 200)
+                    (let ((sq (dds.dcps:take-samples dr-sq))
+                          (ci (dds.dcps:take-samples dr-ci)))
+                      (%check :ljmw-sq-count (= 3 (length sq))
+                              "the Square late reader must replay writer-A's OWN 3 retained Squares")
+                      (%check :ljmw-ci-count (= 2 (length ci))
+                              "the Circle late reader must replay writer-B's OWN 2 retained Circles (the S2B fix)")
+                      (%check :ljmw-sq-iso
+                              (every (lambda (s) (member (shape-type-color (dds.dcps:cached-sample-data s))
+                                                         '("RED" "GREEN" "BLUE") :test #'string=))
+                                     sq)
+                              "the Square reader gets ONLY writer-A's Squares — never writer-B's Circle history")
+                      (%check :ljmw-ci-iso
+                              (every (lambda (s) (member (shape-type-color (dds.dcps:cached-sample-data s))
+                                                         '("CYAN" "MAGENTA") :test #'string=))
+                                     ci)
+                              "the Circle reader gets ONLY writer-B's Circles — never writer-A's Square history")))
+               (dds.dcps:delete-participant p2))))
+      (dds.dcps:delete-participant p1))
+    t))
+
 ;;; No-key DCPS round-trip (FR-RTPS S0): a keyless type's DataWriter/DataReader come
 ;;; up NO_KEY (writer 0x03/id 0x103, reader 0x04/id 0x104) — selected by DCPS from the
 ;;; type's keyed-ness — discover, match same-kind, and deliver a sample end to end.

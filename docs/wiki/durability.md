@@ -73,7 +73,25 @@ full-ACK purge: the retained history is released once all current readers ACK; s
 afterward behave VOLATILE. Monotonic (no un-finalize), idempotent, a no-op for a VOLATILE writer.
 This is a non-standard extension on top of the conformant default.
 
-### 2.3 Known edge — VOLATILE-reader ↔ TL-writer match-window race
+### 2.3 N durable writers per participant (different topics)
+
+A single participant may hold multiple RETAINING-durability (TRANSIENT_LOCAL / TRANSIENT /
+PERSISTENT) DataWriters on **distinct** topics; each replays its OWN retained pre-join history to a
+matched late reader — its own `firstSN` base and its own prompt HEARTBEAT under its own GUID
+(WP-N-ENDPOINT-S2B, ADR 0048 §14). The match-time priming resolves the matched local writer by the
+remote reader's topic (`%on-disc-match` → `%participant-writer-for-topic`) and threads it through the
+proxy-base rewind (`%writer-durability-init` / `%prearm-writer-future-base`), the prompt HEARTBEAT
+(bound via `*emit-writer*` so its writerId is that writer's EntityId), and the full-ACK purge — so
+each durable writer is primed off its OWN HistoryCache, never the participant's primary writer. The
+retained-history replay reuses the per-writer retransmit path (the writerId-routed ACKNACK repair).
+`durability-finalize` is per-writer: finalizing one durable writer never releases a sibling's
+retained history. A single durable writer is byte-identical (the matched writer IS the primary).
+Same-topic durable multi-writer is FAIL-FAST-DEFERRED (Slice 2c): a 2nd writer on a topic already held
+by a local writer on this participant, where a RETAINING-durability writer is involved, is rejected loudly
+by `add-local-writer` — `%match-remote-endpoint` matches only the first same-topic writer, so a silent
+2nd durable writer would never replay its history. Same-topic VOLATILE writers stay allowed (ADR 0048 §14.3a).
+
+### 2.4 Known edge — VOLATILE-reader ↔ TL-writer match-window race
 
 For a VOLATILE reader matched to a TL writer, the skip floor is applied on the FIRST HEARTBEAT.
 There is a narrow window between match and that HEARTBEAT in which a newly-written LIVE sample's

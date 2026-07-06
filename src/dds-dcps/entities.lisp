@@ -693,7 +693,7 @@
    returns T) for a VOLATILE writer (it already purges on full-ACK) and when there is no engine writer yet —
    the disc bridge (dds.disc:finalize-writer-durability) guards on (when w ...), so the no-op arises from the
    absence of an engine writer, NOT from an explicit enabled check. Forwards to the engine via that bridge."
-  (dds.disc:finalize-writer-durability (dp-node (pub-participant (dw-publisher dw)))))
+  (dds.disc:finalize-writer-durability (dp-node (pub-participant (dw-publisher dw))) (dw-entity-id dw)))
 
 (defparameter +retcode-ok+ :ok
   "DDS 1.4 ReturnCode_t RETCODE_OK (§2.2.4.4): the operation succeeded. Represented as the keyword :ok.")
@@ -1988,7 +1988,8 @@
                               ;; HEARTBEAT); else future-only. Reader durability is its advertised QoS.
                               (dds.disc:%writer-durability-init
                                (dp-node p) handle
-                               (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote)))
+                               (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote))
+                               (dw-entity-id dw))   ; WP-N-ENDPOINT-S2B: prime THIS matched writer's own history/GUID
                               (%assess-and-record-type-compat dw remote)))
                       ;; §8.5.2.2: our user writer matched a remote reader -> (re)send our DatawriterCryptoToken
                       ;; keyed to the REAL matched-remote reader GUID (the destination_endpoint_key fix). WP-N-ENDPOINT-S3
