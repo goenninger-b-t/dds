@@ -622,9 +622,10 @@
   "T iff NODE is SECURED-loan-capable OR ZC-loan-capable on the receive side (WP-N-ENDPOINT-S2, ADR 0048) — the
    node either DECODES a SecuredPayload on receive (node-secured-reader-p / an already-armed secured-loan-capable
    pool) OR resolves a zero-copy loan (zc-loan-capable). Gated the S2/S3 second-loan-capable-reader fail-fast; that
-   fence is LIFTED in S4 (different-topic loan-capable readers share no slot — the same-topic fence in
-   add-local-reader is now the sole UAF guard). Retained for the future SAME-topic loan-capable multi-reader slice
-   (ADR 0017 refcount-per-reader), where a 2nd same-topic loan-capable reader is the case still to defer."
+   fence is LIFTED in S4 (different-topic loan-capable readers share no slot). WP-N-ENDPOINT-2C1: this predicate is
+   now the SOLE surviving same-topic fence in add-local-reader — a 2nd SAME-topic NON-loan reader registers
+   (route-add-all), but a 2nd SAME-topic LOAN-CAPABLE reader (this returns T) still FAIL-FASTS, deferring the ADR
+   0017 refcount-per-reader use-after-free on a shared loan/decode slot to Slice 2c-3."
   (or (node-secured-reader-p node)
       (disc-node-secured-loan-capable node)
       (and (disc-node-zc-loan-capable node) t)))
@@ -653,9 +654,14 @@
 
 (defun* %reader-route-add (node writer-guid reader-entity-id)
     (function (disc-node (simple-array (unsigned-byte 8) (16)) (unsigned-byte 32)) t)
-  "WP-N-ENDPOINT-S2 (ADR 0048): record that local reader READER-ENTITY-ID is matched to remote writer WRITER-GUID
-   in the delivery route (node-lock guarded, idempotent — a re-announce never duplicates a reader-id). The route
-   is the source-GUID filter for %drain (no cross-topic deserialize) AND the receive-hook demux key."
+  "WP-N-ENDPOINT-S2/2C1 (ADR 0048): record that local reader READER-ENTITY-ID is matched to remote writer
+   WRITER-GUID in the delivery route (node-lock guarded, idempotent — a re-announce never duplicates a reader-id).
+   The route is the source-GUID filter for %drain (no cross-topic deserialize) AND the receive-hook demux key.
+   WP-N-ENDPOINT-2C1: same-topic route-add-all conses the NEW reader to the FRONT, so %reader-routes-for's canonical
+   (first) reader = the LAST-added. A same-topic reader joining MID-STREAM thus becomes canonical with an EMPTY
+   reliable proxy -> a transient full-history re-NACK/retransmit over the shared store until it catches up (bounded,
+   NO data loss — the per-reader dr-drained dedup absorbs the replay). Different-topic / N=1 routes hold a single id
+   (byte-identical). Making canonicity the FIRST-joined reader (append) is a tracked 2c follow-on."
   (dds.pal:with-lock ((disc-node-lock node))
     (let* ((key (copy-seq writer-guid))
            (ids (gethash key (disc-node-reader-routes node))))
@@ -1149,20 +1155,20 @@
    so a 2nd/N-th DataReader gets a distinct EntityId + SEDP GUID (the first stays #x0107/#x0104,
    byte-identical); pass an explicit KEY to pin it. Sets NODE's user-reader-id so enable-subscriber
    registers + the data plane routes HEARTBEAT/ACKNACK with this id.
-   WP-N-ENDPOINT-S2 DEFERRAL (ADR 0048): a 2nd reader on a topic ALREADY held by a local reader on this
-   participant FAIL-FASTS (same-topic multi-reader = later slice). %match-remote-endpoint route-adds only the
-   FIRST matching local reader per remote-writer GUID (and %guid-matched-p is keyed by that GUID, so a 2nd
-   same-topic reader gets no further match attempt) — so the source-GUID route can hold only ONE reader-id per
-   writer. Two DIFFERENT-topic readers each match their own writer (distinct GUIDs) and route correctly (the
-   shipping capability); two SAME-topic readers would leave the 2nd unrouted -> its %drain filter (N>=2) drops
-   ALL its own samples = a silent false-REJECT. Guarded here (mirrors the secured/ZC fence) rather than
-   half-fixed; the route-add-all-matching-readers + fan-out delivery is a later slice."
-  (when (find topic (disc-node-local-readers node)
-              :key #'dds.rtps.discovery:endpoint-data-topic-name :test #'string=)
-    (error "disc-node: refusing a 2nd local user DataReader on topic ~s — same-topic multi-reader on one ~
-            participant is a later N-user-endpoint slice (the source-GUID delivery route holds one reader per ~
-            writer today; a 2nd same-topic reader would silently receive nothing). Use distinct topics or ~
-            separate participants."
+   WP-N-ENDPOINT-2C1 (ADR 0048): a 2nd NON-loan-capable reader on a topic ALREADY held by a local reader on this
+   participant now REGISTERS (fence A lifted for the non-loan case). %match-remote-endpoint route-adds ALL matching
+   local readers per remote-writer GUID (route-add-all — the source-GUID route holds a LIST), so BOTH same-topic
+   readers are routed and each drains W's full stream over its OWN per-reader dr-drained high-water (no cross-
+   consumption). Two DIFFERENT-topic readers still each match their own writer (distinct GUIDs). RETAINED FENCE:
+   a 2nd SAME-topic reader that is LOAN-CAPABLE (%node-secured-or-zc-reader-p — secured-decode or zero-copy) still
+   FAIL-FASTS — the ADR-0017 refcount-per-reader use-after-free on a shared loan/decode slot is Slice 2c-3."
+  (when (and (find topic (disc-node-local-readers node)
+                   :key #'dds.rtps.discovery:endpoint-data-topic-name :test #'string=)
+             (%node-secured-or-zc-reader-p node))
+    (error "disc-node: refusing a 2nd LOAN-CAPABLE local user DataReader on topic ~s — same-topic loan-capable ~
+            (secured-decode / zero-copy) multi-reader is Slice 2c-3 (ADR-0017 refcount-per-reader use-after-free ~
+            on a shared loan/decode slot); the NON-loan same-topic case IS supported (Slice 2c-1: route-add-all + ~
+            per-reader dr-drained fan-out). Use distinct topics or separate participants for the loan-capable reader."
            topic))
   (let* ((key (or key (%alloc-user-reader-key node)))
          (kind (if keyed #x07 #x04))
@@ -1720,7 +1726,7 @@
    parks the decision for resume-parked-matches. Else, against a local on the SAME
    topic name: a different type name is an INCONSISTENT_TOPIC; a matching type whose
    QoS failed RxO is OFFERED/REQUESTED_INCOMPATIBLE_QOS (failing policies)."
-  (let ((incompat nil) (inconsistent nil) (writer-p (eq direction :remote-writer)))
+  (let ((incompat nil) (inconsistent nil) (parked nil) (writer-p (eq direction :remote-writer)))
     (dolist (local (if writer-p (disc-node-local-readers node) (disc-node-local-writers node)))
       (multiple-value-bind (ok bad)
           (if writer-p
@@ -1738,16 +1744,15 @@
                  (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name local)))
                 (:pending
                  (%park-match node direction remote)
-                 ;; deliberately short-circuits the incompat/inconsistent bookkeeping below
-                 (return-from %match-remote-endpoint t))
+                 ;; WP-N-ENDPOINT-2C1: park THIS remote (resume re-runs it) but keep scanning locals so a
+                 ;; sibling same-topic reader that fully matches is still route-added (route-add-all)
+                 (setf parked t))
                 (t (case (%consult-auth-gate node remote local)
                      (:incompatible nil) ; auth refuses unauthenticated peer; no INCONSISTENT_TOPIC
-                     (:pending (%park-match node direction remote)
-                               (return-from %match-remote-endpoint t))
+                     (:pending (%park-match node direction remote) (setf parked t))
                      (t (case (%consult-permissions-gate node remote local)
                           (:incompatible nil) ; access denied; no INCONSISTENT_TOPIC
-                          (:pending (%park-match node direction remote)
-                                    (return-from %match-remote-endpoint t))
+                          (:pending (%park-match node direction remote) (setf parked t))
                           (t
                            ;; WP-ACKNACK-MATCH-GATE (DDS 1.4 §2.2.3.4; RTPS 2.5 §8.4.2.2): arm the writer-side
                            ;; durability baseline BEFORE the match is recorded (before the reader becomes a
@@ -1759,26 +1764,31 @@
                              ;; the primary, so it and %writer-durability-init refine the SAME reader-proxy base.
                              (%prearm-writer-future-base node (dds.rtps.discovery:endpoint-data-guid remote)
                                                          (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local))))
-                           ;; WP-N-ENDPOINT-S2 (ADR 0048): a matched remote WRITER -> record (this local reader <->
-                           ;; that writer-GUID) in the delivery route BEFORE %record-match, so once %guid-matched-p is
-                           ;; true the route is already present (the %drain filter + the receive-hook demux read it;
-                           ;; idempotent so a re-announce re-adds without duplicating — no dropped own-samples).
+                           ;; WP-N-ENDPOINT-2C1 (ADR 0048): a matched remote WRITER -> record (this local reader <->
+                           ;; that writer-GUID) in the delivery route. The route holds a LIST, so route-add ALL
+                           ;; RxO-compatible local readers, not just the first — a 2nd same-topic reader is added too
+                           ;; (route-add-all); the %drain filter + the receive-hook demux then fan-out to both readers.
                            (when writer-p
                              (%reader-route-add node (dds.rtps.discovery:endpoint-data-guid remote)
                                                 (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local))))
-                           (when (%record-match node remote) (%fire-match node direction remote))
-                           (return-from %match-remote-endpoint t))))))))
+                           ;; per-REMOTE match event fires ONCE (idempotent %record-match); the per-LOCAL route-add
+                           ;; above runs for EVERY matching reader -> DO NOT return; continue the dolist (route-add-all).
+                           (when (%record-match node remote) (%fire-match node direction remote)))))))))
           ((string= (dds.rtps.discovery:endpoint-data-topic-name remote)
                     (dds.rtps.discovery:endpoint-data-topic-name local))
            (if (string= (dds.rtps.discovery:endpoint-data-type-name remote)
                         (dds.rtps.discovery:endpoint-data-type-name local))
                (setf incompat bad)
                (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name local)))))))
-    (cond
-      ((and incompat (%record-incompat node remote))
-       (%fire-incompat node direction remote incompat))
-      ((and inconsistent (%record-inconsistent node remote))
-       (%fire-inconsistent node inconsistent))))
+    ;; WP-N-ENDPOINT-2C1: a PARKED (type-pending) local suppresses the incompat/inconsistent verdict for this
+    ;; remote — the pending decision is not yet final (resume-parked-matches re-runs it); mirrors the pre-2c1
+    ;; park short-circuit, which returned before this cond, without stopping the route-add-all scan of siblings.
+    (unless parked
+      (cond
+        ((and incompat (%record-incompat node remote))
+         (%fire-incompat node direction remote incompat))
+        ((and inconsistent (%record-inconsistent node remote))
+         (%fire-inconsistent node inconsistent)))))
   t)
 
 (defun* %match-remote-writer (node remote)

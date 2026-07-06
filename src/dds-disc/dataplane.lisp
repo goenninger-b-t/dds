@@ -2129,18 +2129,18 @@
 
 (defun* %reader-routes-for (node writer-guid)
     (function (disc-node (simple-array (unsigned-byte 8) (16))) list)
-  "WP-N-ENDPOINT-S2 (ADR 0048): the local user readers matched to remote writer WRITER-GUID, as a list of
+  "WP-N-ENDPOINT-S2/2C1 (ADR 0048): the local user readers matched to remote writer WRITER-GUID, as a list of
    (reader-EntityId . engine-rtps-reader) pairs — the receive-hook DEMUX. The FIRST pair is the CANONICAL reader:
    it holds the single reliability truth for this writer (received-SN / dedup / reassembly / instance state), so a
-   HEARTBEAT is applied and an ACKNACK is COMPUTED from it once. TODAY THE ROUTE HOLDS EXACTLY ONE reader-id per
-   writer: %match-remote-endpoint route-adds only the FIRST matching local reader per remote-writer GUID, and
-   same-topic multi-reader on one participant is FAIL-FAST-DEFERRED (add-local-reader) — so different-topic readers
-   each match their OWN writer (distinct GUID -> distinct single-entry route). The per-reader emit loop in the
-   HEARTBEAT/NACK_FRAG hooks (dolist over this list) therefore runs exactly once today; it ANTICIPATES the later
-   route-add-all-matching-readers slice (where a same-topic 2nd reader would add a 2nd id, and each remote
-   ReaderProxy needs its own reader-id ACKNACK). An EMPTY route (discovery-less / pre-match / N=1) falls back to
-   the PRIMARY reader under disc-node-user-reader-id — byte-identical to the pre-S2 single-reader hooks. A route id
-   with no live engine reader is skipped (never a crash)."
+   HEARTBEAT is applied and an ACKNACK is COMPUTED from it once. WP-N-ENDPOINT-2C1: the route now holds N reader-ids
+   per writer — %match-remote-endpoint route-adds ALL matching local readers (route-add-all), so two SAME-topic
+   NON-loan readers each add their id under W's GUID. The per-reader emit loop in the HEARTBEAT/NACK_FRAG hooks
+   (dolist over this list) fans out ONE ACKNACK/NACK_FRAG per reader-id (each remote ReaderProxy is keyed by the
+   reader GUID it matched, so it expects THAT reader's id) while the single canonical reader supplies the reliability
+   truth. Different-topic readers each match their OWN writer (distinct GUID -> distinct single-entry route,
+   byte-identical to S2). An EMPTY route (discovery-less / pre-match / N=1) falls back to the PRIMARY reader under
+   disc-node-user-reader-id — byte-identical to the pre-S2 single-reader hooks. A route id with no live engine
+   reader is skipped (never a crash)."
   (let ((ids (dds.pal:with-lock ((disc-node-lock node))
                (copy-list (gethash writer-guid (disc-node-reader-routes node))))))
     (if ids
@@ -2868,12 +2868,12 @@
         ;; RESIDUAL (ADR 0043): safe only while SEDP is unicast — match-commit and this HEARTBEAT serialize on
         ;; ONE rx thread; multicast-SEDP/split-metatraffic must arm the reader baseline with %record-match first
         (when (%guid-matched-p node wguid)   ; match gate: process/answer only a MATCHED writer's HEARTBEAT (§8.4.10.1)
-          ;; WP-N-ENDPOINT-S2 (ADR 0048): apply the HEARTBEAT to + compute the ACKNACK from the CANONICAL reader
-          ;; matched to this writer, then EMIT the ACKNACK stamped with the matched local reader's EntityId (a
+          ;; WP-N-ENDPOINT-S2/2C1 (ADR 0048): apply the HEARTBEAT to + compute the ACKNACK from the CANONICAL reader
+          ;; matched to this writer, then EMIT the ACKNACK stamped with EACH matched local reader's EntityId (a
           ;; remote ReaderProxy is keyed by the reader GUID it matched — the ACKNACK must carry THAT reader's id,
-          ;; not the primary's). N=1/pre-match -> the primary under disc-node-user-reader-id, byte-identical. The
-          ;; dolist runs EXACTLY ONCE today (the route holds one reader-id per writer; same-topic multi-reader is
-          ;; fail-fast-deferred, %reader-routes-for) — it anticipates the later route-add-all-readers slice.
+          ;; not the primary's). N=1/pre-match -> the primary under disc-node-user-reader-id, byte-identical. WP-2C1:
+          ;; the route now holds N reader-ids (two same-topic readers), so the dolist FANS OUT one ACKNACK per
+          ;; reader-id (each remote ReaderProxy acked under its own id); the single canonical reader is the truth.
           (let ((routes (%reader-routes-for node wguid)))
             (when routes
               (let ((reader (cdr (first routes))))
@@ -2988,9 +2988,9 @@
     (declare (ignore rid lastfrag count))
     (when (and (disc-node-user-reader node) (%user-writer-entityid-p wid)
                (%guid-matched-p node (%source-guid src-prefix wid)))
-      ;; WP-N-ENDPOINT-S2 (ADR 0048): NACK_FRAG from the CANONICAL reader (its reassembly proxy, same one
-      ;; %on-user-data-frag fed), stamped with the matched local reader's EntityId (correct wire reader id). The
-      ;; dolist runs EXACTLY ONCE today (one reader-id per writer; same-topic multi-reader fail-fast-deferred).
+      ;; WP-N-ENDPOINT-S2/2C1 (ADR 0048): NACK_FRAG from the CANONICAL reader (its reassembly proxy, same one
+      ;; %on-user-data-frag fed), stamped with EACH matched local reader's EntityId (correct wire reader id). The
+      ;; dolist FANS OUT one NACK_FRAG per reader-id when the route holds N same-topic readers (route-add-all, 2C1).
       (let ((routes (%reader-routes-for node (%source-guid src-prefix wid))))
         (when routes
           (multiple-value-bind (base numbits bitmap)
@@ -3591,7 +3591,9 @@
    the demux (canonical-reader routing), one per writer. Then the ROUTE LIFECYCLE (unmatch/lease-expiry drops the
    route, re-announce re-adds it — no dropped own-samples). WP-N-ENDPOINT-S4: (4) a 2nd SECURED reader and (4b) a
    2nd ZC-loan-capable reader on DIFFERENT topics now REGISTER (the secured/ZC fence is LIFTED — 2 distinct
-   EntityIds); (4c) a 2nd SAME-topic reader STILL fail-fasts (the UAF-guarding same-topic fence stays)."
+   EntityIds). WP-N-ENDPOINT-2C1: (4c) a 2nd NON-loan SAME-topic reader now REGISTERS and ROUTE-ADD-ALL routes BOTH
+   reader-ids to their common writer's GUID (pre-2c1 only the first matched — the RED); (4d) a 2nd SAME-topic
+   LOAN-CAPABLE reader STILL fail-fasts (the ADR-0017 refcount-per-reader UAF is Slice 2c-3)."
   (let* ((pp (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(7 7 7 7 7 7 7 7 7 7 7 7)))
          (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(8 8 8 8 8 8 8 8 8 8 8 8)))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(9 9 9 9 9 9 9 9 9 9 9 9)))
@@ -3677,13 +3679,39 @@
                            (assert (= 2 (length (%all-user-reader-ids zn))) ()
                                    "the participant must hold 2 ZC-loan-capable user readers with distinct EntityIds (S4)")))
                (stop-node zn)))
-           ;; (4c) deferral: a 2nd reader on the SAME topic fail-fasts (same-topic multi-reader = later slice); the
-           ;; route holds one reader per writer, so a 2nd same-topic reader would be unrouted -> silent false-REJECT
+           ;; (4c) WP-N-ENDPOINT-2C1: a 2nd NON-loan reader on the SAME topic now REGISTERS (fence A lifted for the
+           ;; non-loan case) and ROUTE-ADD-ALL routes BOTH same-topic reader-ids to their ONE common remote writer.
+           (let ((rn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0))
+                 (wn (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 6)
+                                     :host "127.0.0.1" :port 0)))
+             (unwind-protect
+                  (let (r1 r2 wg)
+                    (let ((ep (add-local-writer wn :topic "SAME" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)))
+                      (enable-publisher wn) (setf wg (dds.rtps.discovery:endpoint-data-guid ep)))
+                    (add-local-reader rn :topic "SAME" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)
+                    (enable-subscriber rn) (setf r1 (disc-node-user-reader-id rn))
+                    (add-local-reader rn :topic "SAME" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)
+                    (enable-subscriber rn) (setf r2 (disc-node-user-reader-id rn))
+                    (assert (/= r1 r2) () "the 2 NON-loan same-topic readers must register with DISTINCT ids (fence A lifted for non-loan)")
+                    (setf (disc-node-peers rn) (list (cons "127.0.0.1" (disc-node-port wn)))
+                          (disc-node-peers wn) (list (cons "127.0.0.1" (disc-node-port rn))))
+                    (start-node rn) (start-node wn)
+                    (announce-participant rn) (announce-participant wn)
+                    (loop repeat 150 until (and (plusp (disc-node-discovered-count rn)) (plusp (disc-node-discovered-count wn))) do (sleep 0.02))
+                    (announce-endpoints rn) (announce-endpoints wn)
+                    (loop repeat 150 until (and (node-reader-matches-writer-p rn r1 wg) (node-reader-matches-writer-p rn r2 wg))
+                          do (announce-endpoints rn) (announce-endpoints wn) (sleep 0.02))
+                    ;; route-add-all: BOTH same-topic reader-ids are routed to the ONE writer's GUID (pre-2c1: only the first)
+                    (assert (node-reader-matches-writer-p rn r1 wg) () "reader-1 must be route-added to the same-topic writer")
+                    (assert (node-reader-matches-writer-p rn r2 wg) () "reader-2 must ALSO be route-added to the same-topic writer (route-add-all — the RED: pre-2c1 only the first matched)"))
+               (stop-node rn) (stop-node wn)))
+           ;; (4d) RETAINED FENCE: a 2nd SAME-topic LOAN-CAPABLE reader STILL fail-fasts (ADR-0017 refcount-per-reader UAF = Slice 2c-3)
            (let ((tn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
              (unwind-protect
                   (progn (add-local-reader tn :topic "SAME" :type "X") (enable-subscriber tn)
+                         (set-zc-loan-capable tn t)   ; mark the node loan-capable (ZC) BEFORE the 2nd same-topic add
                          (assert (null (ignore-errors (add-local-reader tn :topic "SAME" :type "X") t)) ()
-                                 "a 2nd DataReader on the SAME topic must fail-fast (same-topic multi-reader deferred)"))
+                                 "a 2nd SAME-topic LOAN-CAPABLE reader must STILL fail-fast (same-topic loan-capable = Slice 2c-3)"))
                (stop-node tn)))
            t)
       (stop-node sub) (stop-node puba) (stop-node pubb))))

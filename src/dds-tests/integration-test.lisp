@@ -282,6 +282,122 @@
       (dds.dcps:delete-participant pr))
     t))
 
+(defun* run-dcps-same-topic-reader-test ()
+    (function () t)
+  "WP-N-ENDPOINT-2C1 (ADR 0048): the SAME-topic route-add-all slice. ONE participant with a Subscriber holding TWO
+   NON-loan DataReaders on the SAME topic/type (shape-type), fed by ONE remote writer W. Asserts BOTH readers take
+   ALL of W's samples, byte-exact, each over its OWN per-reader dr-drained high-water — reader-A TAKING a sample does
+   NOT deny it to reader-B (no cross-consumption over the shared non-purged store). Pre-2c1 the 2nd same-topic reader
+   FENCED (add-local-reader), or — fence lifted WITHOUT route-add-all — was UNROUTED so its %drain source-GUID filter
+   (N>=2) dropped ALL its own samples = silent false-REJECT (the RED). W matches TWO ReaderProxies (matched-count>=2),
+   so the per-reader ACKNACK fan-out in the HEARTBEAT hook is exercised for real. Both impls."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (pw (dds.dcps:create-participant :domain (test-domain)))   ; the remote writer
+         (pr (dds.dcps:create-participant :domain (test-domain))))  ; ONE participant, TWO SAME-topic readers
+    (unwind-protect
+         (let* ((tw  (dds.dcps:create-topic pw "S2C1Same" "shape-type" ts))
+                (tr  (dds.dcps:create-topic pr "S2C1Same" "shape-type" ts))
+                (pub (dds.dcps:create-publisher pw))
+                (sub (dds.dcps:create-subscriber pr))
+                (dw  (dds.dcps:create-datawriter pub tw :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                (dra (dds.dcps:create-datareader sub tr :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all)))
+                (drb (dds.dcps:create-datareader sub tr :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all))))
+           (%check :s2c1-distinct-ids (/= (dds.dcps::dr-entity-id dra) (dds.dcps::dr-entity-id drb))
+                   "the two SAME-topic DataReaders must get DISTINCT engine EntityIds (route-add-all keys the route on them)")
+           (flet ((%spin () (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.02)))
+             (loop repeat 250
+                   until (and (>= (dds.dcps:matched-count pw) 2) (plusp (dds.dcps:matched-count pr)))
+                   do (%spin))
+             (%check :s2c1-writer-two-proxies (>= (dds.dcps:matched-count pw) 2)
+                     "W must match BOTH same-topic readers (2 ReaderProxies -> the per-reader ACKNACK fan-out is real)")
+             (%check :s2c1-readers-matched (plusp (dds.dcps:matched-count pr))
+                     "the 2-reader participant must match the remote writer")
+             ;; W publishes 4 distinct instances (per-instance KEEP_ALL retains all 4)
+             (dotimes (i 4) (dds.dcps:write-sample dw (make-shape-type :color (format nil "K~D" i)
+                                                                       :x (+ 10 i) :y (+ 20 i) :shapesize (+ 30 i))))
+             (loop repeat 300
+                   until (and (>= (dds.dcps:samples-available dra) 4) (>= (dds.dcps:samples-available drb) 4))
+                   do (%spin))
+             ;; (1) NO false-REJECT: BOTH readers received all 4 of W's samples
+             (%check :s2c1-avail-a (>= (dds.dcps:samples-available dra) 4)
+                     "reader-A must receive ALL 4 of W's samples (route-add-all routes reader-A to W)")
+             (%check :s2c1-avail-b (>= (dds.dcps:samples-available drb) 4)
+                     "reader-B must receive ALL 4 of W's samples (the RED: pre-2c1 the 2nd same-topic reader got 0)")
+             ;; (2) NO cross-consumption: A takes all 4; B STILL takes all 4 (per-reader dr-drained, non-purged store)
+             (let ((sa (dds.dcps:take-samples dra)))
+               (%check :s2c1-take-a (= 4 (length sa)) "reader-A must TAKE exactly its own 4 samples")
+               (let ((sb (dds.dcps:take-samples drb)))
+                 (%check :s2c1-take-b-no-cross (= 4 (length sb))
+                         "reader-B must STILL take all 4 AFTER reader-A took them (no cross-consumption over the shared store)")
+                 ;; (3) byte-exact: both readers independently decoded W's exact shape-type x values
+                 (%check :s2c1-fields-a
+                         (equal (sort (mapcar (lambda (cs) (shape-type-x (dds.dcps:cached-sample-data cs))) sa) #'<) '(10 11 12 13))
+                         "reader-A must read W's exact shape-type x values (byte-exact)")
+                 (%check :s2c1-fields-b
+                         (equal (sort (mapcar (lambda (cs) (shape-type-x (dds.dcps:cached-sample-data cs))) sb) #'<) '(10 11 12 13))
+                         "reader-B must read W's exact shape-type x values (byte-exact, independent of A)")
+                 (%check :s2c1-type-ab
+                         (and (every (lambda (cs) (typep (dds.dcps:cached-sample-data cs) 'shape-type)) sa)
+                              (every (lambda (cs) (typep (dds.dcps:cached-sample-data cs) 'shape-type)) sb))
+                         "both readers' samples must all be shape-type structs (correct type-support, no corruption)")))))
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))
+
+(defun* run-dcps-same-topic-repair-test ()
+    (function () t)
+  "WP-N-ENDPOINT-2C1 (ADR 0048): the same-topic per-reader ACKNACK/repair gate — proves the HEARTBEAT-hook ACKNACK
+   fan-out repairs BOTH same-topic readers, not just the canonical one. TWO SAME-topic NON-loan reliable KEEP_ALL
+   DataReaders + ONE reliable KEEP_ALL writer W. W publishes 3 samples; the FINAL one's DATA is DETERMINISTICALLY
+   dropped on every send (*debug-drop-sample-numbers*, incl. resend) so BOTH remote ReaderProxies stall at the gap
+   and must NACK it. The drop is then cleared and W's periodic non-final HEARTBEAT (on the spin cadence) solicits the
+   ACKNACK; the hook computes the gap from the canonical reader and EMITS one ACKNACK per matched reader-id, so W
+   retransmits and — over the store-once + per-reader dr-drained fan-out — BOTH readers recover the dropped sample.
+   Deterministic + bounded (mirrors run-lost-final-sample-test; drops the FINAL SN to avoid any out-of-order drain).
+   RED (pre-2c1): the 2nd same-topic reader is unrouted, so it never even received SN1/SN2 — repair is moot."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (pw (dds.dcps:create-participant :domain (test-domain)))
+         (pr (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw  (dds.dcps:create-topic pw "S2C1Rep" "shape-type" ts))
+                (tr  (dds.dcps:create-topic pr "S2C1Rep" "shape-type" ts))
+                (pub (dds.dcps:create-publisher pw))
+                (sub (dds.dcps:create-subscriber pr))
+                (dw  (dds.dcps:create-datawriter pub tw :qos (dds.qos:make-writer-qos :reliability :reliable :history-kind :keep-all)))
+                (dra (dds.dcps:create-datareader sub tr :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all)))
+                (drb (dds.dcps:create-datareader sub tr :qos (dds.qos:make-reader-qos :reliability :reliable :history-kind :keep-all))))
+           (flet ((%spin () (dds.dcps:spin pw) (dds.dcps:spin pr) (sleep 0.02)))
+             (loop repeat 250 until (and (>= (dds.dcps:matched-count pw) 2) (plusp (dds.dcps:matched-count pr))) do (%spin))
+             (%check :s2c1rep-matched (>= (dds.dcps:matched-count pw) 2)
+                     "W must match BOTH same-topic readers (2 ReaderProxies) before the drop")
+             (setf dds.disc:*debug-drop-sample-numbers* (list 3))   ; drop the FINAL sample's DATA on EVERY send (incl. resend)
+             (unwind-protect
+                  (progn
+                    (dds.dcps:write-sample dw (make-shape-type :color "V0" :x 10 :y 20 :shapesize 30))   ; SN 1
+                    (dds.dcps:write-sample dw (make-shape-type :color "V1" :x 11 :y 21 :shapesize 31))   ; SN 2
+                    (dds.dcps:write-sample dw (make-shape-type :color "V2" :x 12 :y 22 :shapesize 32))   ; SN 3 (dropped)
+                    (loop repeat 60 until (and (>= (dds.dcps:samples-available dra) 2) (>= (dds.dcps:samples-available drb) 2)) do (%spin))
+                    ;; both readers have SN1+SN2 but the dropped SN3 is still missing on BOTH
+                    (%check :s2c1rep-gap-a (and (>= (dds.dcps:samples-available dra) 2) (< (dds.dcps:samples-available dra) 3))
+                            "reader-A must hold SN1+SN2 but NOT the dropped final SN3")
+                    (%check :s2c1rep-gap-b (and (>= (dds.dcps:samples-available drb) 2) (< (dds.dcps:samples-available drb) 3))
+                            "reader-B must hold SN1+SN2 but NOT the dropped final SN3"))
+               (setf dds.disc:*debug-drop-sample-numbers* nil))   ; clear -> the NACK-driven resend now gets through
+             ;; drive W's periodic HEARTBEAT: BOTH proxies NACK SN3, W resends, BOTH readers repair (bounded, no unbounded wait)
+             (loop repeat 200 until (and (>= (dds.dcps:samples-available dra) 3) (>= (dds.dcps:samples-available drb) 3)) do (%spin))
+             (let ((sa (dds.dcps:take-samples dra)) (sb (dds.dcps:take-samples drb)))
+               (%check :s2c1rep-a-all (= 3 (length sa)) "reader-A must repair to ALL 3 (its ACKNACK serviced -> SN3 retransmitted)")
+               (%check :s2c1rep-b-all (= 3 (length sb))
+                       "reader-B must ALSO repair to ALL 3 — its OWN ReaderProxy ACKNACK was serviced by the fan-out (not just the canonical reader)")
+               (%check :s2c1rep-a-has-dropped (member 12 (mapcar (lambda (cs) (shape-type-x (dds.dcps:cached-sample-data cs))) sa))
+                       "reader-A must contain the repaired final sample (x=12)")
+               (%check :s2c1rep-b-has-dropped (member 12 (mapcar (lambda (cs) (shape-type-x (dds.dcps:cached-sample-data cs))) sb))
+                       "reader-B must contain the repaired final sample (x=12) — repaired independently"))))
+      (setf dds.disc:*debug-drop-sample-numbers* nil)
+      (dds.dcps:delete-participant pw)
+      (dds.dcps:delete-participant pr))
+    t))
+
 (defun* run-dcps-dispose-test ()
     (function () t)
   "DCPS instance lifecycle S1 (writer side, DDS 1.4 §2.2.2.4.2): on the keyed shape-type a

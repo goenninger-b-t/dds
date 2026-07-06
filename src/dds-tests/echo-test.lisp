@@ -3807,6 +3807,8 @@
                  ("qos-data-representation-rxo" . dds.qos:run-data-representation-rxo-test)
                  ("dcps-entity-write-take"   . run-dcps-entity-test)
                  ("dcps-n-reader-per-participant" . run-dcps-n-reader-test)
+                 ("dcps-same-topic-readers"  . run-dcps-same-topic-reader-test)
+                 ("dcps-same-topic-repair"   . run-dcps-same-topic-repair-test)
                  ("n-endpoint-s5-status"     . run-n-endpoint-s5-status-test)
                  ("nokey-roundtrip"          . run-nokey-roundtrip-test)
                  ("dcps-instance-read-take"  . run-dcps-instance-test)

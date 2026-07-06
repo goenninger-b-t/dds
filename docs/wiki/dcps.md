@@ -35,10 +35,23 @@ N-reader case.** N **loan-capable** (secured or zero-copy) DataReaders on **dist
 also supported (WP-N-ENDPOINT-S4, ADR 0048): the receive decode tier is per-reader (each decodes
 under ITS OWN topic's protection kind) and the ZC marker path demuxes to the matched reader; the
 cross-reader use-after-free is structurally unreachable (different-topic readers share no source-GUID
-slot). Deferrals: a 2nd reader on a topic **already held** by a local reader on the same participant
-fail-fasts (the delivery route holds one reader per writer today, so a same-topic 2nd reader would
-silently receive nothing — **same-topic multi-reader is a later slice, and same-topic loan-capable
-multi-reader stays deferred past S4** as the UAF-guarding invariant, ADR-0017 refcount-per-reader).
+slot). **Same-topic NON-loan multi-reader (Slice 2c-1, WP-N-ENDPOINT-2C1-READERS, ADR 0048) is now
+supported:** two or more SAME-topic NON-loan-capable `DataReader`s on one participant each receive the
+writer's FULL stream. The endpoint match route-adds ALL matching local readers (route-add-all — the
+delivery route holds a LIST), so both readers' EntityIds are routed to the writer's GUID; the per-reader
+`dr-drained` high-water over the shared NON-purged store gives each reader the complete stream with **no
+cross-consumption** (reader-A taking a sample never denies it to reader-B), and the HEARTBEAT hook fans
+out one ACKNACK per matched reader-id (so a dropped sample is repaired for BOTH readers, each proxy's
+ACKNACK serviced). **Caveat — same-topic per-endpoint STATUS is NOT yet complete:** 2c-1 ships same-topic
+**DATA** delivery to all readers, but the S5 status resolver keys by topic-name, so for two SAME-topic
+readers only ONE receives the `SUBSCRIPTION_MATCHED` / `LIVELINESS_CHANGED` / incompatible-QoS status
+counter + listener callback — per-endpoint STATUS/listener dispatch for same-topic readers is a **tracked
+follow-on** in the 2c sequence (to be resolved by keying the resolver finer than topic-name). Do not rely
+on same-topic per-endpoint status yet. Also newly reachable: two same-topic-NAME readers of DIFFERENT
+types both register (the fence is loan-capable-scoped), so a match fires `INCONSISTENT_TOPIC` for the
+type-mismatched reader alongside `SUBSCRIPTION_MATCHED` for the compatible one (semantically correct, no
+data hazard). Remaining deferral: a 2nd SAME-topic **loan-capable** (secured / zero-copy) reader still
+fail-fasts — the ADR-0017 refcount-per-reader use-after-free on a shared loan/decode slot is **Slice 2c-3**.
 
 **Per-endpoint status/listener dispatch (WP-N-ENDPOINT-S5, ADR 0048) — the milestone is COMPLETE.**
 Every status counter, listener callback, and WaitSet/DATA_AVAILABLE wake is now delivered to the
@@ -71,7 +84,7 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:create-subscriber` (`p`) | Create an enabled `subscriber` (DataReader factory) in `p`. |
 | `dds.dcps:create-topic` (`p name type-name type-support`) | Bind a topic `name` + `type-name` to a registered `type-support` (the generated codec bundle). |
 | `dds.dcps:create-datawriter` (`pub topic &key qos`) | Register a local writer in the engine on the topic's name/type with `qos`. **N non-secured writers per participant** (WP-N-ENDPOINT-S1, ADR 0048): each gets a distinct `EntityId` + its own HistoryCache; a 2nd writer under a flow-controller is supported (Slice S1b — per-writer flow-state) and a 2nd secured writer is supported (Slice S3). The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. |
-| `dds.dcps:create-datareader` (`sub topic &key qos`) | Register a local reader (N readers per participant on **distinct** topics, each a distinct `EntityId`; WP-N-ENDPOINT-S2/S4). `topic` may be a `topic` or a `content-filtered-topic`. The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. N **loan-capable** (secured or ZC) readers on distinct topics are supported (S4 — each decodes under its own tier; the ZC marker demuxes per reader); a 2nd reader on an already-held topic fail-fasts (same-topic multi-reader is a later slice). |
+| `dds.dcps:create-datareader` (`sub topic &key qos`) | Register a local reader (N readers per participant on **distinct** topics, each a distinct `EntityId`; WP-N-ENDPOINT-S2/S4). `topic` may be a `topic` or a `content-filtered-topic`. The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. N **loan-capable** (secured or ZC) readers on distinct topics are supported (S4 — each decodes under its own tier; the ZC marker demuxes per reader). Two or more **SAME-topic NON-loan** readers are supported (Slice 2c-1 — route-add-all: both receive the writer's full stream, no cross-consumption); a 2nd SAME-topic **loan-capable** reader still fail-fasts (Slice 2c-3, the ADR-0017 refcount-per-reader UAF). |
 | `dds.dcps:spin` (`p`) | Drive **one** discovery announcement cycle (SPDP + SEDP) for `p`. Caller-driven in v1. |
 | `dds.dcps:discovered-count` (`p`) | Number of remote participants `p` has discovered. |
 | `dds.dcps:matched-count` (`p`) | Number of remote endpoints matched against `p`'s local endpoints. |
