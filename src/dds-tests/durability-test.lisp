@@ -4126,6 +4126,261 @@
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))))
   t)
 
+;;; --- SQLite online per-instance KEEP_LAST eviction (WP-DURABILITY-COMPACTION-SQLITE, Sliver 1) ---
+;;; A continuously-open KEEP_LAST SQLite store must evict superseded :data rows AT PUT TIME (no
+;;; close/open cycle), mirroring the memory store's %mem-evict-instance (ADR 0029, ADR 0049 §7).
+;;; RED pre-Sliver-1: puts INSERT-only, on-disk row count grows to N (only on-open compaction).
+
+(defun* run-durability-sqlite-keeplast-online-test ()
+    (function () t)
+  "Online per-instance KEEP_LAST eviction in the SQLite store (ADR 0049 §7, DDS 1.4 §2.2.3.5):
+   (1) BOUNDED GROWTH — write N=6 :data to one instance WITHOUT closing under :keep-last 2; the on-disk
+       row count converges to D=2 (the newest, SN 5+6) — the RED pre-Sliver-1 is 6 (INSERT-only).
+   (2) NO DATA LOSS — the surviving D are the newest by SN, byte-exact.
+   (3) two instances converge to D INDEPENDENTLY.
+   (4) NIL-key-hash instance is NEVER online-evicted (keyless stream).
+   (5) lifecycle (:dispose/:unregister) rows are never depth-evicted.
+   (6) KEEP_ALL does NO online eviction (all N survive).
+   (7) never-exceeds-D is unchanged (no eviction fires)."
+  (let* ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (kh1  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1))
+         (kh2  (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xC2))
+         (p    (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (dirs '()))
+    (labels ((%dbp (tag) (let ((d (%sqlite-tmp-db-path tag)))
+                           (push (uiop:pathname-directory-pathname d) dirs) d)))
+      (unwind-protect
+           (progn
+             ;; (1)+(2) bounded growth to D WITHOUT reopen; survivors are newest D byte-exact
+             (let ((s (dds.durability:make-sqlite-store :path (%dbp "kl-bnd"))))
+               (dds.durability:store-open s :keep-last 2)
+               (dotimes (i 6)
+                 (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (%check :sqkl-bounded-online (= 2 (dds.durability:store-count s "T"))
+                       (format nil "online KEEP_LAST 2: on-disk count must converge to 2 without reopen, got ~d"
+                               (dds.durability:store-count s "T")))
+               (let* ((recs (dds.durability:store-get-range s "T"))
+                      (sns  (sort (mapcar #'dds.durability:durable-record-sn recs) #'<)))
+                 (%check :sqkl-newest-survive (equal '(5 6) sns)
+                         (format nil "online KEEP_LAST 2: survivors must be newest SNs (5 6), got ~s" sns))
+                 (%check :sqkl-payload-exact
+                         (equalp (funcall p '(6))
+                                 (dds.durability:durable-record-payload
+                                  (find 6 recs :key #'dds.durability:durable-record-sn)))
+                         "surviving newest payload byte-exact"))
+               (dds.durability:store-close s))
+             ;; (3) two instances converge to D independently (continuously open)
+             (let ((s (dds.durability:make-sqlite-store :path (%dbp "kl-2inst"))))
+               (dds.durability:store-open s :keep-last 2)
+               (dotimes (i 4) (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (dotimes (i 4) (dds.durability:store-put s "T" g0 (+ 10 i) kh2 :data (funcall p (list (+ 10 i)))))
+               (let* ((recs (dds.durability:store-get-range s "T"))
+                      (k1 (count kh1 recs :key #'dds.durability:durable-record-key-hash :test #'equalp))
+                      (k2 (count kh2 recs :key #'dds.durability:durable-record-key-hash :test #'equalp)))
+                 (%check :sqkl-indep (and (= 2 k1) (= 2 k2))
+                         (format nil "two instances each converge to D=2 independently, got kh1=~d kh2=~d" k1 k2)))
+               (dds.durability:store-close s))
+             ;; (4) NIL-key-hash stream is never online-evicted
+             (let ((s (dds.durability:make-sqlite-store :path (%dbp "kl-nil"))))
+               (dds.durability:store-open s :keep-last 2)
+               (dotimes (i 4) (dds.durability:store-put s "T" g0 (1+ i) nil :data (funcall p (list (1+ i)))))
+               (%check :sqkl-nil-kept (= 4 (dds.durability:store-count s "T"))
+                       (format nil "NIL-key-hash stream never online-evicted, expected 4, got ~d"
+                               (dds.durability:store-count s "T")))
+               (dds.durability:store-close s))
+             ;; (5) lifecycle rows are never depth-evicted (kept alongside the D newest :data)
+             (let ((s (dds.durability:make-sqlite-store :path (%dbp "kl-life"))))
+               (dds.durability:store-open s :keep-last 1)
+               (dotimes (i 3) (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (dds.durability:store-put s "T" g0 100 kh1 :dispose (funcall p '(9)))
+               (let* ((recs (dds.durability:store-get-range s "T"))
+                      (ndata (count :data recs :key #'dds.durability:durable-record-kind))
+                      (ndisp (count :dispose recs :key #'dds.durability:durable-record-kind)))
+                 (%check :sqkl-life (and (= 1 ndata) (= 1 ndisp))
+                         (format nil "KEEP_LAST 1 keeps 1 :data + the :dispose lifecycle row, got data=~d dispose=~d"
+                                 ndata ndisp)))
+               (dds.durability:store-close s))
+             ;; (6) KEEP_ALL does NO online eviction
+             (let ((s (dds.durability:make-sqlite-store :path (%dbp "kl-all"))))
+               (dds.durability:store-open s :keep-all)
+               (dotimes (i 5) (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (%check :sqkl-keepall (= 5 (dds.durability:store-count s "T"))
+                       (format nil "KEEP_ALL: no online eviction, expected 5, got ~d"
+                               (dds.durability:store-count s "T")))
+               (dds.durability:store-close s))
+             ;; (7) never-exceeds-D: exactly D puts -> no eviction fires, all D present
+             (let ((s (dds.durability:make-sqlite-store :path (%dbp "kl-under"))))
+               (dds.durability:store-open s :keep-last 3)
+               (dotimes (i 3) (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+               (%check :sqkl-under (= 3 (dds.durability:store-count s "T"))
+                       (format nil "never-exceeds-D unchanged, expected 3, got ~d"
+                               (dds.durability:store-count s "T")))
+               (dds.durability:store-close s)))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))
+      t)))
+
+;;; --- SQLite online eviction preserves the MAC chain (WP-DURABILITY-COMPACTION-SQLITE, Sliver 1) ---
+;;; THE load-bearing correctness test: an online DELETE that does NOT re-MAC leaves the surviving rows
+;;; carrying macs chained over deleted predecessors -> a CLEAN store FALSE-REJECTS on the next open.
+;;; A deterministic pure-Lisp MAC oracle (no OpenSSL) drives the exact chain machinery, so this runs on
+;;; both impls unconditionally. After online eviction the store must reopen clean + return the newest D.
+
+(defun* run-durability-sqlite-online-chain-test ()
+    (function () t)
+  "Online eviction re-MACs the survivors (ADR 0045; ADR 0049 §7): a KEEP_LAST MAC-chained SQLite store,
+   continuously open, evicts on put AND recomputes the surviving chain, so a fresh store reopening the
+   same DB VERIFIES clean (no false-reject) and get-range returns the newest D byte-exact. Without the
+   re-MAC the reopen's verify would fail-closed (proving the recompute is load-bearing)."
+  (let* ((g0    (make-array 16 :element-type '(unsigned-byte 8) :initial-element 5))
+         (kh1   (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xD3))
+         (p     (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         ;; deterministic 32-byte mock MAC oracle: folds every input byte (incl. the prev-mac prefix)
+         ;; so any chain-order change alters the output — catches a missing re-MAC exactly like HMAC.
+         (oracle (lambda (data)
+                   (let ((out (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11)))
+                     (loop for b across data for i from 0
+                           do (setf (aref out (mod i 32))
+                                    (logand (+ (aref out (mod i 32)) b i 1) #xFF)))
+                     out)))
+         (db-path (%sqlite-tmp-db-path "kl-chain"))
+         (dir     (uiop:pathname-directory-pathname db-path)))
+    (unwind-protect
+         (progn
+           ;; continuously-open chained KEEP_LAST 2 store: 6 puts to one instance -> online evict+recompute
+           (let ((s (dds.durability:make-sqlite-store :path db-path)))
+             (dds.durability::store-set-chain-mac-fn s oracle)
+             (dds.durability:store-open s :keep-last 2)
+             (dotimes (i 6)
+               (dds.durability:store-put s "T" g0 (1+ i) kh1 :data (funcall p (list (1+ i)))))
+             (%check :sqchain-online-bounded (= 2 (dds.durability:store-count s "T"))
+                     (format nil "chained online KEEP_LAST 2: count converges to 2, got ~d"
+                             (dds.durability:store-count s "T")))
+             (dds.durability:store-close s))
+           ;; REOPEN a fresh store on the same DB with the same oracle: verify-on-open must NOT reject
+           (let ((s2 (dds.durability:make-sqlite-store :path db-path))
+                 (opened-clean nil))
+             (dds.durability::store-set-chain-mac-fn s2 oracle)
+             (setf opened-clean
+                   (handler-case (progn (dds.durability:store-open s2 :keep-last 2) t)
+                     (error (c) (declare (ignore c)) nil)))
+             (%check :sqchain-reopen-clean opened-clean
+                     "online-evicted chained store REOPENS CLEAN — survivors were re-MAC'd (no false-reject)")
+             (when opened-clean
+               (let* ((recs (dds.durability:store-get-range s2 "T"))
+                      (sns  (sort (mapcar #'dds.durability:durable-record-sn recs) #'<)))
+                 (%check :sqchain-reopen-count (= 2 (length recs))
+                         (format nil "reopen: exactly D=2 survivors, got ~d" (length recs)))
+                 (%check :sqchain-reopen-sns (equal '(5 6) sns)
+                         (format nil "reopen: survivors are newest SNs (5 6), got ~s" sns))
+                 (%check :sqchain-reopen-payload
+                         (equalp (funcall p '(5))
+                                 (dds.durability:durable-record-payload
+                                  (find 5 recs :key #'dds.durability:durable-record-sn)))
+                         "reopen: survivor payload byte-exact post-recompute")))
+             (ignore-errors (dds.durability:store-close s2))))
+      (when (uiop:directory-exists-p dir)
+        (ignore-errors (uiop:delete-directory-tree dir :validate t)))))
+  t)
+
+;;; --- SQLite compacting DELETE + re-MAC crash-consistency (WP-DURABILITY-COMPACTION-SQLITE review) ---
+;;; The compacting DELETE(s) and the survivor chain re-MAC must commit ATOMICALLY: a crash between them
+;;; leaves survivors chained over a deleted row -> a CLEAN store false-rejects on the next open (worst
+;;; class). Both sites (on-open %compact-on-open + online :put evict) wrap them in one sqlite transaction
+;;; so a mid-op failure rolls the DELETE back. *durability-debug-compact-fault* signals after the DELETE
+;;; and before the re-MAC, inside the txn, to exercise the rollback path.
+
+(defun* run-durability-sqlite-crash-consistency-test ()
+    (function () t)
+  "Crash-consistency of the SQLite compacting DELETE + chain re-MAC (ADR 0049 §10): the DELETE(s) and
+   the survivor re-MAC commit in ONE transaction at BOTH the on-open and online-evict sites, so a crash
+   between them rolls the DELETE back and a clean store never false-rejects on reopen.
+   (A) ON-OPEN pass-1 settled compaction (production-reachable — the 3c encrypted tier opens the inner
+       store :keep-all, but pass-1 dispose/unregister compaction + re-MAC still run): fault DURING the
+       on-open compaction -> store-open signals -> a fresh reopen VERIFIES clean (DELETE rolled back) and
+       the recovered compaction keeps exactly the live instance.
+   (B) ONLINE evict-on-put: fault DURING a superseding put -> store-put signals -> a fresh reopen VERIFIES
+       clean and KEEP_LAST compaction on that open yields the newest depth D."
+  (let* ((g0     (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
+         (khs    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xE1)) ; settled instance
+         (khl    (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xE2)) ; live instance
+         (p      (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (oracle (lambda (data)
+                   (let ((out (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x22)))
+                     (loop for b across data for i from 0
+                           do (setf (aref out (mod i 32)) (logand (+ (aref out (mod i 32)) b i 1) #xFF)))
+                     out)))
+         (dirs   '()))
+    (labels ((%dbp (tag) (let ((d (%sqlite-tmp-db-path tag)))
+                           (push (uiop:pathname-directory-pathname d) dirs) d))
+             (%mk (path) (let ((s (dds.durability:make-sqlite-store :path path)))
+                           (dds.durability::store-set-chain-mac-fn s oracle) s))
+             (%open-errs-p (path hk hd)
+               (let ((s (%mk path)))
+                 (prog1 (handler-case (progn (dds.durability:store-open s hk hd) nil) (error () t))
+                   (ignore-errors (dds.durability:store-close s))))))
+      (unwind-protect
+           (progn
+             ;; --- (A) on-open pass-1 settled compaction crash ---
+             (let ((path (%dbp "crash-open")))
+               ;; session 1: a settled instance (khs: data+dispose+unregister) + a live one (khl: data)
+               (let ((s (%mk path)))
+                 (dds.durability:store-open s :keep-all)
+                 (dds.durability:store-put s "T" g0 1 khs :data (funcall p '(1)))
+                 (dds.durability:store-put s "T" g0 2 khs :dispose (funcall p '(2)))
+                 (dds.durability:store-put s "T" g0 3 khs :unregister (funcall p '(3)))
+                 (dds.durability:store-put s "T" g0 4 khl :data (funcall p '(4)))
+                 (dds.durability:store-close s))
+               ;; session 2: fault DURING on-open compaction -> store-open signals, DELETE rolled back
+               (let ((s (%mk path)) (errored nil))
+                 (let ((dds.durability::*durability-debug-compact-fault* t))
+                   (setf errored (handler-case (progn (dds.durability:store-open s :keep-all) nil)
+                                   (error () t))))
+                 (ignore-errors (dds.durability:store-close s))
+                 (%check :sqcc-open-faulted errored
+                         "on-open compaction fault must propagate (store-open signals)"))
+               ;; session 3: NO fault -> reopen CLEAN (rollback preserved the chain) + recovered survivor
+               (let ((s (%mk path)))
+                 (%check :sqcc-open-recovers
+                         (handler-case (progn (dds.durability:store-open s :keep-all) t) (error () nil))
+                         "after a crash mid-compaction the store reopens CLEAN (txn rolled the DELETE back — no false-reject)")
+                 (let ((recs (dds.durability:store-get-range s "T")))
+                   (%check :sqcc-open-live
+                           (and (= 1 (length recs))
+                                (equalp khl (dds.durability:durable-record-key-hash (first recs)))
+                                (equalp (funcall p '(4)) (dds.durability:durable-record-payload (first recs))))
+                           (format nil "post-recovery compaction keeps exactly the live instance, got ~d recs" (length recs))))
+                 (dds.durability:store-close s)))
+             ;; --- (B) online evict-on-put crash ---
+             (let ((path (%dbp "crash-online")))
+               (let ((s (%mk path)))
+                 (dds.durability:store-open s :keep-last 2)
+                 (dds.durability:store-put s "T" g0 1 khl :data (funcall p '(1)))
+                 (dds.durability:store-put s "T" g0 2 khl :data (funcall p '(2)))
+                 ;; the 3rd put supersedes -> online evict fires; inject the fault mid-evict
+                 (let ((dds.durability::*durability-debug-compact-fault* t))
+                   (%check :sqcc-online-faulted
+                           (handler-case (progn (dds.durability:store-put s "T" g0 3 khl :data (funcall p '(3))) nil)
+                             (error () t))
+                           "online evict fault must propagate (store-put signals)"))
+                 (ignore-errors (dds.durability:store-close s)))
+               ;; reopen NO fault: chain intact (evict rolled back; the sn3 INSERT committed) -> clean,
+               ;; then KEEP_LAST compaction on open yields the newest depth D=2 (sn2, sn3)
+               (%check :sqcc-online-recovers (not (%open-errs-p path :keep-last 2))
+                       "after a crash mid-online-evict the store reopens CLEAN (no false-reject)")
+               (let ((s (%mk path)))
+                 (dds.durability:store-open s :keep-last 2)
+                 (let* ((recs (dds.durability:store-get-range s "T"))
+                        (sns  (sort (mapcar #'dds.durability:durable-record-sn recs) #'<)))
+                   (%check :sqcc-online-depth (equal '(2 3) sns)
+                           (format nil "post-recovery KEEP_LAST 2 keeps newest D=2 (2 3), got ~s" sns)))
+                 (dds.durability:store-close s))))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))
+      t)))
+
 (defun* run-durability-store-dir-perms-test ()
     (function () t)
   "B4 (ADR 0026 §10.12): the store dir D is enforced/verified 0700, exactly like the key dir K.

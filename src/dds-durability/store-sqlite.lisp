@@ -131,6 +131,44 @@
           (incf seq))))
     tail))
 
+(defparameter *durability-debug-compact-fault* nil
+  "Test-only fault injector (ADR 0049 §10 crash-consistency). NIL (default) = inert; byte-identical
+   behavior. When non-NIL, the SQLite compaction paths signal an error AFTER the compacting DELETE(s)
+   but BEFORE the survivor chain re-MAC, INSIDE the wrapping transaction — so the rollback path
+   (a crash between the DELETE and the recompute) is exercised. Never set in production code.")
+
+(defun* %sqlite-evict-instance (db topic key-hash depth)
+    (function (t string (simple-array (unsigned-byte 8) (16)) (integer 1)) (integer 0))
+  "Online KEEP_LAST eviction on put (ADR 0029, ADR 0049 §7, DDS 1.4 §2.2.3.5): DELETE the lowest
+   (writer-guid, sn) :data rows of the instance KEY-HASH in TOPIC until at most DEPTH :data rows remain;
+   return the number of rows deleted (0 when nothing was superseded). Same KEEP_LAST intent as the memory
+   store's %mem-evict-instance: only :data rows for a non-NIL key-hash are evicted, lifecycle
+   (:dispose/:unregister) rows are never touched. The drop-candidate order matches the FILE store's
+   %compact-topic-records pass 2 — the shared %record-guid-sn< (writer-guid, then sn); the memory store
+   evicts by PURE sn (ignoring guid) and diverges ONLY for a single instance fed by multiple writer GUIDs
+   (the SQLite/file order is the self-consistent one — it matches get-range's ordering). Bounded by the
+   instance's own :data-row count (a continuously-evicted KEEP_LAST instance holds at most DEPTH+1 rows at
+   put time), never a whole-topic scan. Reuses the on-open compaction DELETE (store-sqlite.lisp) — DRY.
+   The CALLER wraps this DELETE plus the survivor re-MAC in a single transaction (crash-atomic; ADR 0049 §10)."
+  (let ((rows (sqlite:execute-to-list
+               db
+               "SELECT writer_guid, sn FROM record WHERE topic=? AND key_hash=? AND kind=?"
+               topic key-hash (%kind->int :data))))
+    (if (<= (length rows) depth)
+        0
+        (let* ((recs    (mapcar (lambda (row)
+                                  (make-durable-record :writer-guid (%to-octets-n (first row) 16)
+                                                       :sn (%be8->sn (second row))))
+                                rows))
+               (sorted  (sort recs #'%record-guid-sn<))
+               (to-drop (subseq sorted 0 (- (length sorted) depth))))
+          (dolist (r to-drop)
+            (sqlite:execute-non-query
+             db
+             "DELETE FROM record WHERE topic=? AND writer_guid=? AND sn=?"
+             topic (durable-record-writer-guid r) (%sn->be8 (durable-record-sn r))))
+          (length to-drop)))))
+
 ;;; SQL text — pinned once (DRY; no ad-hoc string building on the hot loop).
 
 (defparameter %sqlite-ddl-table
@@ -166,8 +204,11 @@
   "Construct a SQLite-backed durable-store implementing the fixed durable-store vtable (ADR 0049).
    PATH is the DB file (required). MAX-SAMPLES 0 = unbounded; positive caps total records across all
    topics (store-put returns :REJECTED when full). HISTORY-KIND / HISTORY-DEPTH govern per-instance
-   compaction-on-open (DDS 1.4 §2.2.3.5): :keep-all (default) drops only settled instances; :keep-last
-   with DEPTH >= 1 additionally keeps only the newest DEPTH :data records per non-NIL-key-hash instance.
+   compaction (DDS 1.4 §2.2.3.5): :keep-all (default) drops only settled instances; :keep-last with
+   DEPTH >= 1 additionally keeps only the newest DEPTH :data records per non-NIL-key-hash instance,
+   evicted BOTH online on each put (ADR 0049 §7 — a continuously-open store stays bounded without a
+   reopen) AND on compaction-on-open (restart recovery). After an online eviction the surviving rows'
+   keyed MAC chain is recomputed (ADR 0045) so the next reopen verifies clean (no false-reject).
    Stores OPAQUE payload bytes (DARE-unaware); wrap with make-encrypted-store for at-rest sealing.
    store-open (re)establishes the connection — a fresh store on an existing PATH replays all prior rows
    (restart recovery). The keyed per-row MAC chain seam (store-set-chain-mac-fn, ADR 0045) is LIVE:
@@ -227,27 +268,36 @@
                           (recs (%topic-records-in-order tn))
                           (kept (%compact-topic-records recs eff-hk eff-hd)))
                      (when (< (length kept) (length recs))
-                       (let ((keep-keys (make-hash-table :test #'equal)))
-                         (dolist (r kept)
-                           (setf (gethash (cons (coerce (durable-record-writer-guid r) 'list)
-                                                (durable-record-sn r))
-                                          keep-keys)
-                                 t))
-                         (dolist (r recs)
-                           (unless (gethash (cons (coerce (durable-record-writer-guid r) 'list)
+                       ;; ATOMIC (ADR 0049 §10): the compacting DELETE(s) + the survivor re-MAC commit
+                       ;; TOGETHER — a crash between them leaves survivors chained over a deleted row so a
+                       ;; clean store false-rejects on the next open; with-transaction rolls the DELETE(s)
+                       ;; back on any mid-op failure (one fsync at COMMIT under WAL+synchronous=FULL).
+                       (sqlite:with-transaction (car db-cell)
+                         (let ((keep-keys (make-hash-table :test #'equal)))
+                           (dolist (r kept)
+                             (setf (gethash (cons (coerce (durable-record-writer-guid r) 'list)
                                                   (durable-record-sn r))
                                             keep-keys)
-                             (sqlite:execute-non-query
-                              (car db-cell)
-                              "DELETE FROM record WHERE topic=? AND writer_guid=? AND sn=?"
-                              tn (durable-record-writer-guid r)
-                              (%sn->be8 (durable-record-sn r))))))
-                       ;; recompute the surviving chain so the next reopen never false-rejects (ADR 0045)
-                       (when (car cmf-cell)
-                         (let ((tail (%sqlite-recompute-topic (car db-cell) tn (car cmf-cell))))
-                           (if tail
-                               (setf (gethash tn chain-macs) tail)
-                               (remhash tn chain-macs)))))))))
+                                   t))
+                           (dolist (r recs)
+                             (unless (gethash (cons (coerce (durable-record-writer-guid r) 'list)
+                                                    (durable-record-sn r))
+                                              keep-keys)
+                               (sqlite:execute-non-query
+                                (car db-cell)
+                                "DELETE FROM record WHERE topic=? AND writer_guid=? AND sn=?"
+                                tn (durable-record-writer-guid r)
+                                (%sn->be8 (durable-record-sn r))))))
+                         ;; simulated crash between the DELETE and the re-MAC (test-only; rolls back)
+                         (when *durability-debug-compact-fault*
+                           (error "dds.durability: *durability-debug-compact-fault* — simulated crash ~
+                                   between the compacting DELETE and the chain re-MAC (topic ~a)" tn))
+                         ;; recompute the surviving chain so the next reopen never false-rejects (ADR 0045)
+                         (when (car cmf-cell)
+                           (let ((tail (%sqlite-recompute-topic (car db-cell) tn (car cmf-cell))))
+                             (if tail
+                                 (setf (gethash tn chain-macs) tail)
+                                 (remhash tn chain-macs))))))))))
         (%ensure-db)
         (%make-durable-store
          :name :sqlite
@@ -283,6 +333,27 @@
                    (car db-cell)
                    "INSERT OR IGNORE INTO record (topic, writer_guid, sn, key_hash, kind, payload, mac, chain_seq) VALUES (?,?,?,?,?,?,?,?)"
                    topic writer-guid (%sn->be8 sn) key-hash (%kind->int kind) payload mac seq)
+                  ;; online per-instance KEEP_LAST eviction (ADR 0049 §7, Sliver 1): drop superseded
+                  ;; :data rows for this instance so a continuously-open store stays bounded WITHOUT a
+                  ;; reopen (mirrors %mem-put); guard identical to the memory store.
+                  (when (and (eq :keep-last (car hk-cell)) (eq :data kind) key-hash)
+                    ;; ATOMIC (ADR 0049 §10): the evict DELETE(s) + the survivor re-MAC commit TOGETHER —
+                    ;; a crash between them leaves survivors chained over a deleted row so a clean store
+                    ;; false-rejects on the next open; with-transaction rolls the DELETE(s) back on any
+                    ;; mid-op failure (one fsync at COMMIT under WAL+synchronous=FULL, not N).
+                    (sqlite:with-transaction (car db-cell)
+                      (when (plusp (%sqlite-evict-instance (car db-cell) topic key-hash (car depth-cell)))
+                        ;; simulated crash between the DELETE and the re-MAC (test-only; rolls back)
+                        (when *durability-debug-compact-fault*
+                          (error "dds.durability: *durability-debug-compact-fault* — simulated crash ~
+                                  between the online evict DELETE and the chain re-MAC (topic ~a)" topic))
+                        ;; re-MAC the survivors so the chain still verifies on the next reopen (ADR 0045;
+                        ;; the machinery %compact-on-open uses after its DELETEs — no false-reject).
+                        (when (car cmf-cell)
+                          (let ((tail (%sqlite-recompute-topic (car db-cell) topic (car cmf-cell))))
+                            (if tail
+                                (setf (gethash topic chain-macs) tail)
+                                (remhash topic chain-macs)))))))
                   t)))))
 
          :get-range

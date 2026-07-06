@@ -938,7 +938,9 @@ the memory + file backends regardless of SQL collation.
 `INSERT OR IGNORE` (the same three-branch `cond` as the other stores). `open` is the
 **restart-recovery** entry point: a fresh `make-sqlite-store` on an existing DB path replays all prior
 rows (SQLite reopens the file), enforces 0700 on the DB dir (cleartext metadata, as the file store
-does), then runs compaction-on-open via the shared `%compact-topic-records`. `sync`/`close` do a
+does), then runs compaction-on-open via the shared `%compact-topic-records`. Under `:keep-last` the
+store ALSO evicts superseded rows **online on each put** (§8.8.2), so a continuously-open store stays
+bounded without a reopen. `sync`/`close` do a
 `PRAGMA wal_checkpoint(FULL)` durability barrier (journal mode WAL, `synchronous=FULL`; durability is
 off the per-sample hot path, so maximum safety over throughput). `set-chain-mac-fn` is **LIVE** — the
 per-row keyed MAC chain is at parity with the file store (§8.8.1).
@@ -947,8 +949,9 @@ per-row keyed MAC chain is at parity with the file store (§8.8.1).
 round-trips identically on Clasp and SBCL (no reader conditionals). Transitive: `iterate`; native:
 `libsqlite3` (SBOM + provenance recorded).
 
-**Follow-ons (deferred):** incremental/SQL-side compaction at scale; metadata-3c confidentiality;
-dynamic-topic parity.
+**Follow-ons (deferred):** file-store online/threshold compaction (Sliver 2 — the file store still
+compacts only on open); encrypted-tier physical reclaim + whole-topic-deletion residual (Sliver 3);
+metadata-3c confidentiality; dynamic-topic parity. (SQLite online compaction = Sliver 1, RESOLVED §8.8.2.)
 
 #### 8.8.1 SQLite per-row keyed MAC chain (WP-SQLITE-MAC-CHAIN, ADR 0049 §9 / ADR 0045 §9)
 
@@ -978,6 +981,56 @@ byte-behaviorally unchanged. All ADR 0045 §7 residuals (malicious whole-tail tr
 MAC, anchor-deletion full-downgrade, and whole-topic deletion) apply equally. Test:
 `run-durability-sqlite-mac-chain-test` (tamper via DIRECT SQL: UPDATE payload/mac, DELETE, REORDER;
 downgrade; KEEP_LAST reopen-repeatedly; epoch-boundary; grandfather; NIL-oracle regression).
+
+#### 8.8.2 SQLite online per-instance KEEP_LAST eviction (WP-DURABILITY-COMPACTION-SQLITE, Sliver 1)
+
+Compaction-on-open alone leaves a **continuously-open** KEEP_LAST store growing unboundedly between
+reopens (ADR 0029 context). Sliver 1 adds **runtime DELETE-on-put**, mirroring the memory store's
+`%mem-evict-instance` (ADR 0049 §10). After the `INSERT OR IGNORE`, when the effective policy is
+`:keep-last` AND `kind = :data` AND `key-hash` is non-NIL, `%sqlite-evict-instance` DELETEs the lowest-
+`(writer-guid, sn)` `:data` rows of that instance until at most DEPTH remain. `:keep-all` does no online
+eviction; NIL-key-hash streams and lifecycle (`:dispose`/`:unregister`) rows are never depth-evicted;
+idempotent re-puts skip it.
+
+**Ordering nuance (honest).** The drop-candidates sort by `%record-guid-sn<` (writer-guid, then sn),
+matching the FILE store's `%compact-topic-records` pass 2 — **not** the memory store, whose
+`%mem-evict-instance` drops by PURE sn (ignoring guid). They diverge ONLY for a single instance (one
+key-hash) fed by MULTIPLE writer GUIDs; the SQLite/file order is the self-consistent one (it matches
+`get-range`'s ordering), and the memory store is the pre-existing outlier.
+
+**Cost (honest).** The eviction SELECT + DELETE(s) are scoped to the instance
+(`WHERE topic=? AND key_hash=? AND kind=?`; at most DEPTH+1 rows at put time). For a **bare** `:keep-last`
+store (no chain — the realistic online path) the whole put is **O(instance)**, meeting the at-scale
+intent. When a chain oracle IS installed, `%sqlite-recompute-topic` re-MACs the WHOLE topic (O(topic)
+HMACs + UPDATEs) on every superseding put — under sustained writes that is effectively **O(topic) per
+put**; this appears only for keyed + `:keep-last` + real key-hash (not a standard factory — the 3c tier
+opens the inner store `:keep-all` with a NIL inner key-hash, so its inner online eviction never fires). A
+batched/threshold re-MAC is a Sliver-2/3 hardening. **Not O(instance) unconditionally.**
+
+**Re-MAC after eviction (the load-bearing point) + crash-atomicity.** The ADR 0045 chain covers the
+surviving rows in `chain_seq` order; an online DELETE that does NOT recompute leaves survivors carrying
+MACs chained over deleted predecessors → a **clean store false-rejects on the next open**. So when a
+keyed store actually deletes, the topic's chain is recomputed over the survivors via
+`%sqlite-recompute-topic` (the same machinery `%compact-on-open` uses after its DELETEs), and the running
+chain-MAC is updated to the new tail. A bare (NIL-oracle) store has no chain and skips it. **The
+DELETE(s) + the re-MAC are wrapped in a single `sqlite:with-transaction`** at BOTH sites — the online
+`:put` evict AND the pre-existing on-open `%compact-on-open` (whose DELETE-then-recompute was previously
+un-transacted under SQLite autocommit, so a crash between the committed DELETE and the recompute left a
+survivor dangling → a false-reject of a clean store; this shipped and is reachable via the 3c tier's
+on-open pass-1 settled compaction). A crash before COMMIT rolls the DELETE back → the store is at its
+pre-eviction state → reopen verifies clean. Under WAL + `synchronous=FULL` that is one fsync at COMMIT
+(fewer than N per-statement), single-connection under the store lock, no nesting. The durable-store
+**vtable is unchanged** (internal to `:put` / `:open`); reuses `%record-guid-sn<`, the on-open compaction
+DELETE, and `%sqlite-recompute-topic` (DRY). Tests: `run-durability-sqlite-keeplast-online-test` (bounded
+growth to DEPTH without reopen — RED at count=6 with eviction disabled; newest-D survive byte-exact; two
+instances independent; NIL-key-hash never evicted; lifecycle kept; KEEP_ALL unaffected; never-exceeds-D
+unchanged), `run-durability-sqlite-online-chain-test` (online eviction re-MACs survivors → fresh reopen
+verifies clean + get-range returns newest DEPTH; pure-Lisp MAC oracle, both impls, no OpenSSL), and
+`run-durability-sqlite-crash-consistency-test` (fault injected between the DELETE and the re-MAC at both
+sites → the txn rolls back → fresh reopen verifies clean + recovers the pre-eviction set; RED-proven as a
+`SQCC-OPEN-RECOVERS` false-reject when the on-open transaction is neutralized). Sliver 2 (file-store
+online/threshold compaction + the batched re-MAC) and Sliver 3 (encrypted-tier physical reclaim +
+whole-topic-deletion residual) follow.
 
 ### 8.9 At-rest metadata confidentiality (Phase 3c, WP-DURABILITY-METADATA-CONF-3c)
 
