@@ -1131,7 +1131,10 @@
    on first put, v2 seal/open by epoch-id. Three runs over the SAME store dir D + key dir K:
    run1 puts N -> get-range byte-exact, inner frames sealed (start #x02, no plaintext on disk),
    epochs.dat has exactly 1 epoch; run2 re-opens (epoch-1 DEK re-derived) -> N still byte-exact,
-   put M more -> 2 epochs; run3 -> all N+M open byte-exact; a tampered on-disk frame is DROPPED."
+   put M more -> 2 epochs; run3 -> all N+M open byte-exact; a tampered on-disk frame is DROPPED.
+   Security asserts are epoch-GROUPED (permutation-independent, so deterministic under the run-varying
+   raw-store sort): the SET of distinct sealed epoch-ids == {1,2}, and nonces are distinct WITHIN each
+   epoch only (per-epoch counter uniqueness — cross-epoch nonce values may coincide under distinct DEKs)."
   (handler-case (dds.dare:dare-available-p)
     (dds.dare:dare-unavailable (c)
       (format t "~&  [dare-persistent-store] SKIP — OpenSSL >= 3.5 not available: ~a~%"
@@ -1252,19 +1255,23 @@
                                    fs-ro (%enc-topic-hash d-dir k-dir "Square")))))
                (%check :pst-sec-blobs-count (= 3 (length blobs))
                        (format nil "expected 3 sealed blobs; got ~d" (length blobs)))
-               ;; sec-b: run-1 records (first two, sn=1,2) have epoch-id=1; run-2 record (sn=7) has epoch-id=2
-               (let ((eid-run1 (%pst-sealed-epoch-id (first blobs)))
-                     (eid-run2 (%pst-sealed-epoch-id (third blobs))))
-                 (%check :pst-sec-cross-run-epoch-distinct
-                         (not (= eid-run1 eid-run2))
-                         (format nil "run-1 epoch-id ~d must differ from run-2 epoch-id ~d"
-                                 eid-run1 eid-run2)))
-               ;; sec-c: run-1's two records share epoch-1 but must have distinct nonces (counter++)
-               (let ((n1 (%pst-sealed-nonce (first blobs)))
-                     (n2 (%pst-sealed-nonce (second blobs))))
-                 (%check :pst-sec-intra-epoch-nonce-distinct
-                         (not (equalp n1 n2))
-                         "intra-epoch nonces for sn=1 and sn=2 must be DIFFERENT (counter increments)")))
+               ;; permutation-independent: group blobs by sealed epoch-id (raw-store order is run-varying — surrogate guid' at sn=0).
+               (let ((nonces-by-epoch (make-hash-table)))
+                 (dolist (b blobs)
+                   (push (%pst-sealed-nonce b) (gethash (%pst-sealed-epoch-id b) nonces-by-epoch)))
+                 ;; sec-b: the SET of distinct sealed epoch-ids is exactly {1,2} — run-1 minted epoch 1, run-2 minted epoch 2.
+                 (let ((epoch-set (sort (loop for e being the hash-keys of nonces-by-epoch collect e) #'<)))
+                   (%check :pst-sec-cross-run-epoch-distinct
+                           (equal epoch-set '(1 2))
+                           (format nil "the set of distinct sealed epoch-ids must be {1,2}; got ~s" epoch-set)))
+                 ;; sec-c: nonces distinct WITHIN each epoch only (per-epoch counter); equal cross-epoch nonce values are legit under distinct DEKs.
+                 (maphash
+                  (lambda (eid nonces)
+                    (%check :pst-sec-intra-epoch-nonce-distinct
+                            (= (length nonces) (length (remove-duplicates nonces :test #'equalp)))
+                            (format nil "epoch ~d: its ~d intra-epoch nonce(s) must all be DISTINCT (counter++)"
+                                    eid (length nonces))))
+                  nonces-by-epoch)))
              (dds.durability:store-close fs-ro)
              (dds.dare:key-provider-close kp-ro))
 

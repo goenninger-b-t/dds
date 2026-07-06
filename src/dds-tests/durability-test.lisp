@@ -1032,8 +1032,10 @@
   "Relay emit: service replay writer attaches PID_ORIGINAL_WRITER_INFO with the ORIGINAL
    publisher's GUID + SN on every relayed DATA. Domain 67, loopback unicast, N=3 samples.
    Captures the service node's outbound datagrams via *datagram-sink* during the late-joiner
-   drain phase and asserts: (1) every relayed DATA carries PID_ORIGINAL_WRITER_INFO; (2) its
-   GUID matches the original publisher's GUID; (3) its SN is one of the originals {1..N}."
+   drain phase and asserts on the DISTINCT (GUID,SN) OWI PID set (retransmit-insensitive, so
+   deterministic under full-suite load where a reliable TL replay may re-send): (1) exactly N
+   distinct OWI PIDs; (2) every distinct GUID matches the original publisher; (3) the distinct
+   SN set is exactly {1..N}."
   (let* ((n 3)
          (svc-store (dds.durability:make-memory-store))
          (spec (dds.durability:make-service-spec
@@ -1130,22 +1132,28 @@
                         (loop for dg across captured
                               do (dolist (pair (%parse-owi-from-datagram dg))
                                    (push pair owi-hits)))
-                        ;; must have exactly N OWI entries (one per relayed DATA)
-                        (%check :relay-owi-count
-                                (= n (length owi-hits))
-                                (format nil "expected ~d OWI PIDs in captured datagrams, got ~d"
-                                        n (length owi-hits)))
-                        ;; every OWI GUID must match the original publisher
-                        (%check :relay-owi-guid
-                                (every (lambda (pair) (equalp orig-guid (car pair))) owi-hits)
-                                (format nil "OWI GUID mismatch — expected ~s, got ~s"
-                                        (coerce orig-guid 'list)
-                                        (mapcar (lambda (p) (coerce (car p) 'list)) owi-hits)))
-                        ;; every OWI SN must be in {1..N}
-                        (%check :relay-owi-sn
-                                (every (lambda (pair) (<= 1 (cdr pair) n)) owi-hits)
-                                (format nil "OWI SN out of range {1..~d}: ~s"
-                                        n (mapcar #'cdr owi-hits)))))
+                        ;; a reliable TL replay may RETRANSMIT a relayed DATA (NACK/HEARTBEAT under load), re-emitting the same (GUID,SN) OWI PID;
+                        ;; the tested property is the SET of relayed origins, so dedup by (GUID,SN) — a retransmit adds no new member (deterministic).
+                        (let ((distinct (remove-duplicates
+                                         owi-hits
+                                         :test (lambda (a b) (and (equalp (car a) (car b)) (= (cdr a) (cdr b)))))))
+                          ;; exactly N DISTINCT OWI PIDs — one per relayed origin sample (retransmits dedup out)
+                          (%check :relay-owi-count
+                                  (= n (length distinct))
+                                  (format nil "expected ~d DISTINCT OWI PIDs, got ~d (raw hits ~d)"
+                                          n (length distinct) (length owi-hits)))
+                          ;; every distinct OWI GUID must match the original publisher
+                          (%check :relay-owi-guid
+                                  (every (lambda (pair) (equalp orig-guid (car pair))) distinct)
+                                  (format nil "OWI GUID mismatch — expected ~s, got ~s"
+                                          (coerce orig-guid 'list)
+                                          (mapcar (lambda (p) (coerce (car p) 'list)) distinct)))
+                          ;; the distinct OWI SNs must be EXACTLY the original set {1..N}
+                          (%check :relay-owi-sn
+                                  (equal (sort (mapcar #'cdr distinct) #'<)
+                                         (loop for i from 1 to n collect i))
+                                  (format nil "OWI SN set must be {1..~d}, got ~s"
+                                          n (sort (mapcar #'cdr distinct) #'<))))))
                  (ignore-errors (dds.disc:stop-node lj-node))))))
       (ignore-errors (dds.durability:service-stop svc)))))
 
