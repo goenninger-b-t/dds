@@ -4151,12 +4151,14 @@
    outgoing datagram's bytes via *datagram-sink*; return the captured datagrams (fresh octet vectors) in send
    order. Loops one datagram per call until MORE-REMAIN-P is NIL — the Phase-C scheduler's drive loop,
    minus the token pacing."
-  (let ((captured '()))
+  (let ((captured '())
+        (ws (dds.disc::%make-flow-writer-state   ; WP-N-ENDPOINT-S1B: the step now drives a per-writer flow-state (the node's primary writer)
+             :node node :writer (dds.disc::disc-node-user-writer node))))
     (let ((dds.disc::*datagram-sink* (lambda (dg) (push dg captured))))
       (loop with more = t
             while more
             do (multiple-value-bind (bytes more-remain)
-                   (dds.disc::%flow-step-emit node (dds.disc::disc-node-tx-msg node))
+                   (dds.disc::%flow-step-emit ws (dds.disc::disc-node-tx-msg node))
                  (declare (ignore bytes))
                  (setf more (and more-remain t)))))
     (nreverse captured)))
@@ -4418,6 +4420,109 @@
       (dds.disc:stop-node wb) (dds.disc:stop-node rb)))
   t)
 
+(defun* run-flow-multiwriter-onenode-test ()
+    (function () t)
+  "WP-N-ENDPOINT-S1B (ADR 0048; FR-PF-2, ADR 0016): the S1b slice — TWO local user DataWriters on ONE participant
+   under ONE flow-controller, both drained under the SHARED aggregate rate. The controller registers a per-writer
+   flow-state for EACH writer (the lifted S1 fail-fast) and its scheduler round-robins per-writer datagrams; BOTH
+   writers' samples all deliver (neither starves — the per-writer flow-step-state makes their plans independent),
+   and the send is paced at the shared aggregate (one bucket, not one-per-writer). Pre-S1b this FAILED: the
+   flow-controller-associate fail-fast rejected the 2nd writer, and even lifted-without-per-writer-state only the
+   PRIMARY writer drained (writer B starved). Real threads + UDP ⇒ SBCL only; Clasp pass-skipped (the flow-test
+   NFR-PORT gap, mirrors run-flow-multiwriter-rr-test)."
+  (when (eq (uiop:implementation-type) :clasp) (return-from run-flow-multiwriter-onenode-test t))
+  (let* ((n 10)
+         (pa (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x1a))
+         (pb (make-array 600 :element-type '(unsigned-byte 8) :initial-element #x1b))
+         (pub (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x8b) :host "127.0.0.1" :port 0))
+         (ra  (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xB1) :host "127.0.0.1" :port 0))
+         (rb  (dds.disc:make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #xB2) :host "127.0.0.1" :port 0))
+         (controller nil) (ida 0) (idb 0))
+    (unwind-protect
+         (progn
+           (dds.disc:add-local-writer pub :topic "OneNodeA" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher pub :history-kind :keep-all)
+           (setf ida (dds.disc::disc-node-user-writer-id pub))
+           (dds.disc:add-local-writer pub :topic "OneNodeB" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-publisher pub :history-kind :keep-all)
+           (setf idb (dds.disc::disc-node-user-writer-id pub))
+           (%check :onenode-distinct-writers (/= ida idb) "the two DataWriters must get DISTINCT EntityIds")
+           (dds.disc:add-local-reader ra :topic "OneNodeA" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber ra)
+           (dds.disc:add-local-reader rb :topic "OneNodeB" :type "X" :reliability dds.rtps.discovery:+reliability-best-effort+)
+           (dds.disc:enable-subscriber rb)
+           (setf (dds.disc::disc-node-peers pub) (list (cons "127.0.0.1" (dds.disc:disc-node-port ra)) (cons "127.0.0.1" (dds.disc:disc-node-port rb)))
+                 (dds.disc::disc-node-peers ra)  (list (cons "127.0.0.1" (dds.disc:disc-node-port pub)))
+                 (dds.disc::disc-node-peers rb)  (list (cons "127.0.0.1" (dds.disc:disc-node-port pub))))
+           (dds.disc:start-node pub) (dds.disc:start-node ra) (dds.disc:start-node rb)
+           (dds.disc:announce-participant pub) (dds.disc:announce-participant ra) (dds.disc:announce-participant rb)
+           (loop repeat 300 until (and (>= (dds.disc:disc-node-discovered-count pub) 2)
+                                       (plusp (dds.disc:disc-node-discovered-count ra))
+                                       (plusp (dds.disc:disc-node-discovered-count rb)))
+                 do (sleep 0.01))
+           (dds.disc:announce-endpoints pub) (dds.disc:announce-endpoints ra) (dds.disc:announce-endpoints rb)
+           (loop repeat 300 until (and (>= (dds.disc:disc-node-matched-count pub) 2)
+                                       (plusp (dds.disc:disc-node-matched-count ra))
+                                       (plusp (dds.disc:disc-node-matched-count rb)))
+                 do (dds.disc:announce-endpoints pub) (sleep 0.01))
+           (%check :onenode-matched (>= (dds.disc:disc-node-matched-count pub) 2)
+                   "both writers on the one participant must match their readers before publishing")
+           ;; low aggregate rate so the shared-bucket pacing is exercised; both writers publish N samples
+           (setf controller (dds.disc:make-flow-controller :tokens-per-period 5000 :period 100000000 :max-burst 5000))
+           (dds.disc:flow-controller-associate controller pub)
+           (%check :onenode-two-entries (= 2 (length (dds.disc::disc-node-flow-writer-states pub)))
+                   "the controller must register a per-writer flow-state for EACH of the participant's 2 writers")
+           (dotimes (i n) (dds.disc:publish-sample pub pa nil nil 0 nil ida) (dds.disc:publish-sample pub pb nil nil 0 nil idb))
+           (loop repeat 2000 until (and (>= (dds.disc:node-sample-count ra) n) (>= (dds.disc:node-sample-count rb) n))
+                 do (sleep 0.005))
+           (format t "~&  [flow-onenode] writer-A delivered=~d writer-B delivered=~d (of ~d each)~%"
+                   (dds.disc:node-sample-count ra) (dds.disc:node-sample-count rb) n)
+           (%check :onenode-writer-a-drained (>= (dds.disc:node-sample-count ra) n)
+                   (format nil "writer A's ~d samples must ALL deliver under the shared controller (no starvation)" n))
+           (%check :onenode-writer-b-drained (>= (dds.disc:node-sample-count rb) n)
+                   (format nil "writer B's ~d samples must ALL deliver under the shared controller (B must NOT starve behind the primary)" n)))
+      (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
+      (dds.disc:stop-node pub) (dds.disc:stop-node ra) (dds.disc:stop-node rb)))
+  t)
+
+(defun* run-flow-unregister-releases-refs-test ()
+    (function () t)
+  "WP-N-ENDPOINT-S1B (ADR 0048; adversarial-review FIX-1): flow-controller-unregister RELEASES the unregistered
+   node's per-writer MID-DRAIN send-refs, so a SHARED controller that keeps running (a second node still
+   associated, destroy NOT called) never leaks the departing node's captured CacheChanges until stop-node. Two
+   nodes on ONE THREADLESS controller (no scheduler race); node-A's writer-state is given a snapshotted plan +
+   captured refs, then node-A is unregistered while node-B stays — asserting A's step-refs are released (NIL) and
+   B's writer-state is untouched (still registered + associated). Deterministic — both impls."
+  (let* ((na (%flow-step-build-node #x93 #xA3 7841 (list (octets 1 2 3 4 5 6 7 8))))
+         (nb (%flow-step-build-node #x94 #xA4 7842 (list (octets 9 8 7 6 5 4 3 2))))
+         (controller (dds.disc::%make-flow-controller
+                      :bucket (dds.disc::make-flow-token-bucket :tokens-per-period 1 :period 1 :max-burst 1)
+                      :policy-fn #'dds.disc::%flow-policy-round-robin)))   ; threadless: no scheduler spawned
+    (unwind-protect
+         (progn
+           (setf (dds.disc::disc-node-flow-controller na) controller
+                 (dds.disc::disc-node-flow-controller nb) controller)
+           (dds.disc::flow-controller-add-writer controller na (dds.disc::disc-node-user-writer na))
+           (dds.disc::flow-controller-add-writer controller nb (dds.disc::disc-node-user-writer nb))
+           (let ((wsa (dds.disc::%flow-writer-state-for na (dds.disc::disc-node-user-writer na)))
+                 (wsb (dds.disc::%flow-writer-state-for nb (dds.disc::disc-node-user-writer nb))))
+             (multiple-value-bind (plan refs)   ; snapshot A's plan -> populates step-state + captures pinned refs
+                 (dds.disc::%node-datagram-plan na (dds.disc::flow-writer-state-writer wsa) (dds.disc::disc-node-tx-msg na))
+               (setf (dds.disc::flow-writer-state-step-state wsa) plan
+                     (dds.disc::flow-writer-state-step-refs wsa) refs))
+             (%check :unreg-refs-precond (dds.disc::flow-writer-state-step-refs wsa)
+                     "precondition: node-A's writer-state must hold captured mid-drain send-refs")
+             (dds.disc::flow-controller-unregister controller na)   ; unregister A; B stays on the SHARED controller
+             (%check :unreg-refs-released (null (dds.disc::flow-writer-state-step-refs wsa))
+                     "unregister must RELEASE node-A's mid-drain send-refs (no leak on a shared, still-running controller)")
+             (%check :unreg-a-dropped (not (member wsa (dds.disc::flow-controller-writers controller)))
+                     "node-A's writer-state must be removed from the controller's selection set")
+             (%check :unreg-b-untouched (and (member wsb (dds.disc::flow-controller-writers controller))
+                                             (eq controller (dds.disc::disc-node-flow-controller nb)))
+                     "the OTHER node's writer-state must stay registered + associated (the controller keeps serving it)")))
+      (dds.disc:stop-node na) (dds.disc:stop-node nb)))
+  t)
+
 ;;;; ---- WP-FLOW-EDF-PRIORITY (ADR 0016 deferred scheduling policies; FR-QOS-1) ----
 ;;;; The :edf + :priority policies are PURE SELECTION under the controller lock (the token-bucket pacing is
 ;;;; orthogonal + untouched). The strongest, most deterministic oracle for a pure selection change is to drive
@@ -4432,28 +4537,28 @@
   (let ((box (list 0)))
     (values (lambda () (the integer (car box))) box)))
 
-(defun* %flow-fake-node (&key (pending t) (head 0) (budget 0) (priority 0) (last-served 0))
-    (function (&key (:pending t) (:head integer) (:budget integer) (:priority integer) (:last-served integer))
-              dds.disc::disc-node)
-  "A bare disc-node with ONLY the controller-lock-guarded FLOW-* selection slots set (WP-FLOW-EDF-PRIORITY):
-   no socket, no threads — the policy reads only these. HEAD+BUDGET drive the :edf deadline; PRIORITY+
-   LAST-SERVED drive the :priority effective key."
-  (let ((node (dds.disc::%make-disc-node)))
-    (setf (dds.disc::disc-node-flow-pending node) pending
-          (dds.disc::disc-node-flow-head-ns node) head
-          (dds.disc::disc-node-flow-latency-budget-ns node) budget
-          (dds.disc::disc-node-flow-transport-priority node) priority
-          (dds.disc::disc-node-flow-last-served-ns node) last-served)
-    node))
+(defun* %flow-fake-writer-state (&key (pending t) (head 0) (budget 0) (priority 0) (last-served 0) (node nil))
+    (function (&key (:pending t) (:head integer) (:budget integer) (:priority integer) (:last-served integer)
+                    (:node t))
+              dds.disc::flow-writer-state)
+  "A bare per-writer flow-writer-state with ONLY the controller-lock-guarded selection slots set (WP-FLOW-EDF-
+   PRIORITY; WP-N-ENDPOINT-S1B — the selection ENTRY is now a WRITER, not a node): no socket, no threads, no
+   real writer — the policy reads only these. HEAD+BUDGET drive the :edf deadline; PRIORITY+LAST-SERVED drive
+   the :priority effective key. NODE lets a test place several entries on the SAME participant (proving the
+   selector orders ACROSS one node's writers)."
+  (dds.disc::%make-flow-writer-state
+   :node node :writer nil :pending pending :head-ns head :latency-budget-ns budget
+   :transport-priority priority :last-served-ns last-served))
 
-(defun* %flow-policy-controller (clock policy-fn nodes)
+(defun* %flow-policy-controller (clock policy-fn states)
     (function (function function list) dds.disc::flow-controller)
   "A THREADLESS flow-controller (raw %make-flow-controller — no scheduler spawned) wired to CLOCK + POLICY-FN
-   with NODES already registered, for direct policy-fn exercise (WP-FLOW-EDF-PRIORITY)."
+   with STATES (per-writer flow-writer-states, WP-N-ENDPOINT-S1B) already registered, for direct policy-fn
+   exercise (WP-FLOW-EDF-PRIORITY)."
   (let ((c (dds.disc::%make-flow-controller
             :bucket (dds.disc::make-flow-token-bucket :tokens-per-period 1 :period 1 :max-burst 1 :clock-fn clock)
             :policy-fn policy-fn)))
-    (setf (dds.disc::flow-controller-writers c) nodes)
+    (setf (dds.disc::flow-controller-writers c) states)
     c))
 
 (defun* run-flow-transport-priority-qos-test ()
@@ -4479,10 +4584,11 @@
            (dds.disc:enable-publisher node)
            (setf controller (dds.disc:make-flow-controller :tokens-per-period 10000 :period 100000000 :max-burst 10000 :scheduling :priority))
            (dds.disc:flow-controller-associate controller node)
-           (%check :tp-cache-priority (= 7 (dds.disc::disc-node-flow-transport-priority node))
-                   "associate must cache the writer's TRANSPORT_PRIORITY on the node")
-           (%check :tp-cache-budget (= 5000000 (dds.disc::disc-node-flow-latency-budget-ns node))
-                   "associate must cache the writer's LATENCY_BUDGET (ns) on the node"))
+           (let ((ws (dds.disc::%flow-writer-state-for node (dds.disc::disc-node-user-writer node))))   ; WP-N-ENDPOINT-S1B: QoS is cached per-writer
+             (%check :tp-cache-priority (= 7 (dds.disc::flow-writer-state-transport-priority ws))
+                     "associate must cache the writer's TRANSPORT_PRIORITY on its per-writer flow-state")
+             (%check :tp-cache-budget (= 5000000 (dds.disc::flow-writer-state-latency-budget-ns ws))
+                     "associate must cache the writer's LATENCY_BUDGET (ns) on its per-writer flow-state")))
       (when controller (ignore-errors (dds.disc:destroy-flow-controller controller)))
       (dds.disc:stop-node node)))
   t)
@@ -4495,17 +4601,17 @@
   (multiple-value-bind (clock box) (%flow-clock-box)
     (declare (ignore box))
     ;; Same write-time (100), differing budgets: deadlines D=100 B=110 A=150 C=200 -> drain order D B A C.
-    (let* ((d (%flow-fake-node :head 100 :budget 0))     ; budget-0 -> deadline 100, most urgent
-           (b (%flow-fake-node :head 100 :budget 10))    ; deadline 110
-           (a (%flow-fake-node :head 100 :budget 50))    ; deadline 150
-           (c (%flow-fake-node :head 100 :budget 100))   ; deadline 200
+    (let* ((d (%flow-fake-writer-state :head 100 :budget 0))     ; budget-0 -> deadline 100, most urgent
+           (b (%flow-fake-writer-state :head 100 :budget 10))    ; deadline 110
+           (a (%flow-fake-writer-state :head 100 :budget 50))    ; deadline 150
+           (c (%flow-fake-writer-state :head 100 :budget 100))   ; deadline 200
            (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-edf (list a b c d)))
            (order '()))
       (dotimes (i 4)
         (let ((pick (dds.disc::%flow-policy-edf controller)))
           (%check :edf-picks-pending pick "EDF must return a pending node while any remain")
           (push pick order)
-          (setf (dds.disc::disc-node-flow-pending pick) nil)))   ; simulate draining that node
+          (setf (dds.disc::flow-writer-state-pending pick) nil)))   ; simulate draining that node
       (let ((seq (nreverse order)))
         (%check :edf-order (equal seq (list d b a c))
                 "EDF must drain min-deadline-first: budget-0 (d), then 10 (b), 50 (a), 100 (c)"))
@@ -4514,8 +4620,8 @@
   ;; Tie -> stable RR rotation (equal deadlines never starve each other).
   (multiple-value-bind (clock box) (%flow-clock-box)
     (declare (ignore box))
-    (let* ((x (%flow-fake-node :head 100 :budget 0))
-           (y (%flow-fake-node :head 100 :budget 0))
+    (let* ((x (%flow-fake-writer-state :head 100 :budget 0))
+           (y (%flow-fake-writer-state :head 100 :budget 0))
            (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-edf (list x y))))
       (let ((p1 (dds.disc::%flow-policy-edf controller))
             (p2 (dds.disc::%flow-policy-edf controller)))
@@ -4531,8 +4637,8 @@
    it does NOT (the pre-fix frozen-head behavior). Returns (values TIGHT-SERVED LOOSE-SERVED)
    (WP-FLOW-EDF-PRIORITY Finding-1)."
   (multiple-value-bind (clock box) (%flow-clock-box)
-    (let* ((tight (%flow-fake-node :head 0 :budget 1))
-           (loose (%flow-fake-node :head 0 :budget 100))
+    (let* ((tight (%flow-fake-writer-state :head 0 :budget 1))
+           (loose (%flow-fake-writer-state :head 0 :budget 100))
            (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-edf (list tight loose)))
            (ts 0) (ls 0))
       (setf (dds.disc::flow-controller-scheduling controller) :edf)
@@ -4570,16 +4676,16 @@
    TRANSPORT_PRIORITY first (aging = 0 at a fixed clock, all just enqueued). Deterministic — both impls."
   (multiple-value-bind (clock box) (%flow-clock-box)
     (declare (ignore box))
-    (let* ((p9 (%flow-fake-node :priority 9 :last-served 0))
-           (p5 (%flow-fake-node :priority 5 :last-served 0))
-           (p1 (%flow-fake-node :priority 1 :last-served 0))
+    (let* ((p9 (%flow-fake-writer-state :priority 9 :last-served 0))
+           (p5 (%flow-fake-writer-state :priority 5 :last-served 0))
+           (p1 (%flow-fake-writer-state :priority 1 :last-served 0))
            (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-priority (list p1 p5 p9)))
            (order '()))
       (dotimes (i 3)
         (let ((pick (dds.disc::%flow-policy-priority controller)))
           (%check :prio-picks-pending pick "priority must return a pending node while any remain")
           (push pick order)
-          (setf (dds.disc::disc-node-flow-pending pick) nil)))
+          (setf (dds.disc::flow-writer-state-pending pick) nil)))
       (%check :prio-order (equal (nreverse order) (list p9 p5 p1))
               "priority must drain highest-TRANSPORT_PRIORITY-first (9, 5, 1)")))
   t)
@@ -4593,8 +4699,8 @@
    impls. Contrast: PURE highest-first would starve the low writer forever."
   (multiple-value-bind (clock box) (%flow-clock-box)
     (let ((dds.disc::*flow-priority-aging-quantum-ns* 100))   ; small quantum for a short deterministic run
-      (let* ((hi (%flow-fake-node :priority 10 :last-served 0))
-             (lo (%flow-fake-node :priority 1 :last-served 0))
+      (let* ((hi (%flow-fake-writer-state :priority 10 :last-served 0))
+             (lo (%flow-fake-writer-state :priority 1 :last-served 0))
              (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-priority (list hi lo)))
              (first-lo -1) (hi-wins 0))
         (dotimes (turn 20)
@@ -4610,6 +4716,48 @@
                 (format nil "aging must let the low writer win within the (P_hi-P_lo) bound; first won at turn ~d" first-lo))
         (%check :aging-hi-dominates (> hi-wins first-lo)
                 "the high-priority writer must still dominate (win most turns) — aging bounds, not inverts"))))
+  t)
+
+(defun* run-flow-edf-across-writers-test ()
+    (function () t)
+  "WP-N-ENDPOINT-S1B (ADR 0048; FR-QOS-1): EDF orders across the SAME participant's writers. Two writer-states
+   sharing ONE node — a TIGHT LATENCY_BUDGET writer and a LOOSE one, same head write-time — are registered on one
+   :edf controller; the tight-budget writer (earlier deadline) MUST be selected first even though both live on the
+   same participant. This is the S1b semantic: flow control orders the participant's outbound samples globally
+   (the already-node-global %flow-policy-select spans the per-writer entries with NO cross-writer merge). Registered
+   loose-first so a correct result cannot come from list order. Deterministic — both impls."
+  (multiple-value-bind (clock box) (%flow-clock-box)
+    (declare (ignore box))
+    (let* ((node (dds.disc::%make-disc-node))                              ; ONE participant
+           (tight (%flow-fake-writer-state :head 100 :budget 0 :node node))   ; deadline 100 (most urgent)
+           (loose (%flow-fake-writer-state :head 100 :budget 50 :node node))  ; deadline 150
+           (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-edf (list loose tight))))  ; loose FIRST in the list
+      (let ((p1 (dds.disc::%flow-policy-edf controller)))
+        (%check :edf-across-tight-first (eq p1 tight)
+                "EDF must select the TIGHT-budget writer first — across the same node's writers (S1b), not by list order")
+        (setf (dds.disc::flow-writer-state-pending tight) nil)              ; tight drained
+        (%check :edf-across-loose-next (eq (dds.disc::%flow-policy-edf controller) loose)
+                "with the tight writer drained EDF must then select the loose writer (both of one participant drain)"))))
+  t)
+
+(defun* run-flow-priority-across-writers-test ()
+    (function () t)
+  "WP-N-ENDPOINT-S1B (ADR 0048; FR-QOS-1): TRANSPORT_PRIORITY orders across the SAME participant's writers. Two
+   writer-states sharing ONE node — a HIGH-priority writer and a LOW one — are registered on one :priority
+   controller; the high-priority writer MUST be selected first, and with it drained the low one is selected next
+   (no starvation). Registered low-first so the result cannot come from list order. Deterministic — both impls."
+  (multiple-value-bind (clock box) (%flow-clock-box)
+    (declare (ignore box))
+    (let* ((node (dds.disc::%make-disc-node))
+           (hi (%flow-fake-writer-state :priority 9 :last-served 0 :node node))
+           (lo (%flow-fake-writer-state :priority 1 :last-served 0 :node node))
+           (controller (%flow-policy-controller clock #'dds.disc::%flow-policy-priority (list lo hi))))   ; low FIRST in the list
+      (let ((p1 (dds.disc::%flow-policy-priority controller)))
+        (%check :prio-across-hi-first (eq p1 hi)
+                "priority must select the HIGH-TRANSPORT_PRIORITY writer first — across the same node's writers (S1b)")
+        (setf (dds.disc::flow-writer-state-pending hi) nil)                 ; high drained
+        (%check :prio-across-lo-next (eq (dds.disc::%flow-policy-priority controller) lo)
+                "with the high writer drained priority must then select the low writer (no starvation, both drain)"))))
   t)
 
 (defun* run-flow-edf-priority-e2e-test ()
@@ -4873,8 +5021,8 @@
   "WP-ASYNC-FLOW off-by-default regression (FR-PF-2, ADR 0016 §Defaults): a node with NO flow-controller
    associated is byte-identical to the pre-flow path AND never engages the controller machinery. Two parts:
    (1) ENGAGE GUARD — on a controllerless node, disc-node-flow-controller is NIL, so publish-sample's first
-   cond-clause is not taken: a publish leaves flow-pending and flow-step-state NIL (the %flow-signal path,
-   which would set flow-pending, never ran) — the opt-in is provably dormant; (2) BYTE-IDENTITY — a single
+   cond-clause is not taken: a publish creates NO per-writer flow-state (disc-node-flow-writer-states stays
+   empty — the %flow-signal path never ran) — the opt-in is provably dormant; (2) BYTE-IDENTITY — a single
    publish-sample on a controllerless node (default batch-max-samples 1 ⇒ write + immediate %push-data)
    produces the EXACT datagrams that writer-write + a plain %push-data produce for the same sample, for both
    a small DATA and a large DATA_FRAG sample. SBCL + Clasp (deterministic, no threads). Flow control is
@@ -4887,10 +5035,8 @@
                    "a node with no controller associated must have a NIL flow-controller slot")
            (let ((dds.disc::*datagram-sink* (lambda (dg) (declare (ignore dg)))))
              (dds.disc:publish-sample node (octets 1 2 3 4 5 6 7 8)))
-           (%check :flow-off-pending-nil (null (dds.disc::disc-node-flow-pending node))
-                   "a controllerless publish must NOT set flow-pending (the %flow-signal path never ran)")
-           (%check :flow-off-step-state-nil (null (dds.disc::disc-node-flow-step-state node))
-                   "a controllerless publish must NOT build a flow step-plan (flow-step-state stays NIL)"))
+           (%check :flow-off-no-writer-states (null (dds.disc::disc-node-flow-writer-states node))
+                   "a controllerless publish must NOT create any per-writer flow-state (the %flow-signal path never ran)"))
       (dds.disc:stop-node node)))
   ;; -- Part 2a: small DATA — publish-sample (OFF) == writer-write + %push-data, byte-identical --
   (let ((pub-node  (%flow-step-build-node #xC2 #xD2 7822 '()))
@@ -5345,7 +5491,7 @@
    %flow-policy-* selector with an injected clock (WP-FLOW-EDF-PRIORITY bench)."
   (multiple-value-bind (clock box) (%flow-clock-box)
     (let* ((w (length budgets))
-           (nodes (mapcar (lambda (b) (declare (ignore b)) (%flow-fake-node :pending nil)) budgets))
+           (nodes (mapcar (lambda (b) (declare (ignore b)) (%flow-fake-writer-state :pending nil)) budgets))
            (bvec (coerce budgets 'vector))
            (nvec (coerce nodes 'vector))
            (next (make-array w :initial-element 0))          ; index of each writer's next unsent sample
@@ -5359,13 +5505,13 @@
           (let ((any-ready nil) (next-arrival nil))
             (dotimes (i w)                                    ; mark writers with an ARRIVED unsent head pending
               (let ((k (aref next i)) (nd (aref nvec i)))
-                (cond ((>= k per-writer) (setf (dds.disc::disc-node-flow-pending nd) nil))
+                (cond ((>= k per-writer) (setf (dds.disc::flow-writer-state-pending nd) nil))
                       ((<= (arrival i k) clk)
-                       (setf (dds.disc::disc-node-flow-pending nd) t
-                             (dds.disc::disc-node-flow-head-ns nd) (arrival i k)
-                             (dds.disc::disc-node-flow-latency-budget-ns nd) (aref bvec i)
+                       (setf (dds.disc::flow-writer-state-pending nd) t
+                             (dds.disc::flow-writer-state-head-ns nd) (arrival i k)
+                             (dds.disc::flow-writer-state-latency-budget-ns nd) (aref bvec i)
                              any-ready t))
-                      (t (setf (dds.disc::disc-node-flow-pending nd) nil)
+                      (t (setf (dds.disc::flow-writer-state-pending nd) nil)
                          (setf next-arrival (if next-arrival (min next-arrival (arrival i k)) (arrival i k)))))))
             (if (not any-ready)
                 (setf clk (or next-arrival clk))              ; idle: jump to the next arrival (no work now)
@@ -5385,7 +5531,7 @@
    %flow-policy-priority selector with an injected clock (WP-FLOW-EDF-PRIORITY bench)."
   (multiple-value-bind (clock box) (%flow-clock-box)
     (let* ((w (length priorities))
-           (nodes (mapcar (lambda (p) (%flow-fake-node :priority p :last-served 0)) priorities))
+           (nodes (mapcar (lambda (p) (%flow-fake-writer-state :priority p :last-served 0)) priorities))
            (nvec (coerce nodes 'vector))
            (controller (%flow-policy-controller clock policy-fn nodes))
            (served (make-array w :initial-element 0))
@@ -5393,7 +5539,7 @@
            (max-gap (make-array w :initial-element 0)))
       (dotimes (turn turns)
         (setf (car box) (* turn service-ns))
-        (dolist (nd nodes) (setf (dds.disc::disc-node-flow-pending nd) t))   ; backlogged: always pending
+        (dolist (nd nodes) (setf (dds.disc::flow-writer-state-pending nd) t))   ; backlogged: always pending
         (let* ((pick (funcall policy-fn controller)) (win (position pick nvec)))
           (dotimes (i w)
             (cond ((= i win) (incf (aref served i)) (setf (aref gap i) 0))
@@ -5756,7 +5902,7 @@
     ;; assert the 4000-octet sample yields a >=3-ENTRY plan, so the live run below walks a multi-element cursor.
     (let ((twin (%flow-step-build-node #x98 #xA8 7831 (list big))))
       (unwind-protect
-           (let ((plan (dds.disc::%node-datagram-plan twin (dds.disc::disc-node-tx-msg twin))))
+           (let ((plan (dds.disc::%node-datagram-plan twin (dds.disc::disc-node-user-writer twin) (dds.disc::disc-node-tx-msg twin))))
              (%check :no-spin-multi-plan-ge3 (>= (length plan) 3)
                      (format nil "the 4000-octet sample must snapshot a >=3-entry datagram plan to exercise the ~
                                   multi-entry cursor-advance-under-fault path; got ~d" (length plan))))

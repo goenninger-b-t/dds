@@ -14,11 +14,12 @@ gates matching and delivery; see [QoS](qos.md).
 carry **N non-secured `DataWriter`s** on different topics — each gets a distinct `EntityId`
 (and SEDP GUID), publishes into its own HistoryCache, and repairs independently (an inbound
 ACKNACK/NACK_FRAG routes to the addressed writer by its `writerId`). At N=1 the wire and timing
-are byte-identical to before. Deferrals: a 2nd DataWriter under an associated **flow-controller**
-fail-fasts (flow-ON multi-writer is Slice S1b); a 2nd **secured** DataWriter fail-fasts (secured
-multi-writer is Slice S3); and a 2nd DataWriter on a participant with any
-**TRANSIENT_LOCAL/TRANSIENT/PERSISTENT** writer fail-fasts (durability multi-writer is a later
-slice). Two or more **VOLATILE** non-secured writers are the supported N-writer case.
+are byte-identical to before. A 2nd DataWriter under an associated **flow-controller** is **supported**
+(Slice S1b, WP-N-ENDPOINT-S1B-FLOW): the controller drives ALL of a participant's writers as per-writer
+selection entries, rate-paced at the shared aggregate with EDF/priority ordering across them. Remaining
+deferrals: a 2nd **secured** DataWriter fail-fasts (secured multi-writer is Slice S3 — since landed); and a
+2nd DataWriter on a participant with any **TRANSIENT_LOCAL/TRANSIENT/PERSISTENT** writer fail-fasts
+(durability multi-writer is a later slice).
 
 **Multiple DataReaders per participant (WP-N-ENDPOINT-S2, ADR 0048).** A participant (Subscriber)
 may carry **N non-secured `DataReader`s** on different topics — each gets a distinct `EntityId`
@@ -51,8 +52,9 @@ which reader actually sees which sample, so a spurious wake is a benign, permitt
 The old single `dp-user-reader`/`dp-user-writer` back-refs are retired. At N=1 every path is
 byte-identical. With this slice the **different-topic N-user-endpoint capability is complete**: N
 writers + N readers per participant on distinct topics, including secured and loan-capable, each with
-correct per-endpoint status and delivery. Same-topic multi-endpoint, flow-ON multi-writer, and
-RETAINING-durability multi-writer stay deferred.
+correct per-endpoint status and delivery. **Flow-ON multi-writer (Slice S1b) has since landed** (the
+flow-controller drives all of a participant's writers). Same-topic multi-endpoint and RETAINING-durability
+multi-writer stay deferred.
 
 ## API reference
 
@@ -68,7 +70,7 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:create-publisher` (`p`) | Create an enabled `publisher` (DataWriter factory) in `p`. |
 | `dds.dcps:create-subscriber` (`p`) | Create an enabled `subscriber` (DataReader factory) in `p`. |
 | `dds.dcps:create-topic` (`p name type-name type-support`) | Bind a topic `name` + `type-name` to a registered `type-support` (the generated codec bundle). |
-| `dds.dcps:create-datawriter` (`pub topic &key qos`) | Register a local writer in the engine on the topic's name/type with `qos`. **N non-secured writers per participant** (WP-N-ENDPOINT-S1, ADR 0048): each gets a distinct `EntityId` + its own HistoryCache; a 2nd writer under a flow-controller (Slice S1b) or on a secured node (Slice S3) fail-fasts. The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. |
+| `dds.dcps:create-datawriter` (`pub topic &key qos`) | Register a local writer in the engine on the topic's name/type with `qos`. **N non-secured writers per participant** (WP-N-ENDPOINT-S1, ADR 0048): each gets a distinct `EntityId` + its own HistoryCache; a 2nd writer under a flow-controller is supported (Slice S1b — per-writer flow-state) and a 2nd secured writer is supported (Slice S3). The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. |
 | `dds.dcps:create-datareader` (`sub topic &key qos`) | Register a local reader (N readers per participant on **distinct** topics, each a distinct `EntityId`; WP-N-ENDPOINT-S2/S4). `topic` may be a `topic` or a `content-filtered-topic`. The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. N **loan-capable** (secured or ZC) readers on distinct topics are supported (S4 — each decodes under its own tier; the ZC marker demuxes per reader); a 2nd reader on an already-held topic fail-fasts (same-topic multi-reader is a later slice). |
 | `dds.dcps:spin` (`p`) | Drive **one** discovery announcement cycle (SPDP + SEDP) for `p`. Caller-driven in v1. |
 | `dds.dcps:discovered-count` (`p`) | Number of remote participants `p` has discovered. |

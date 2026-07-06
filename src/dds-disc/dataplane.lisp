@@ -1593,25 +1593,30 @@
   "Push unsent changes on the caller thread using tx-msg (the synchronous send path)."
   (%push-data-buf node (disc-node-tx-msg node)))
 
-(defun* %node-datagram-plan (node buf)
-    (function (disc-node dds.core.buffer:octet-buffer) list)
-  "The FULL per-datagram send-plan for the node's user writer across ALL its matched-reader destinations —
-   a flat list of ((HOST . PORT) BUILD-THUNK . SHMEM-DEST) entries, in the SAME order, with the SAME datagram
-   bytes, that %push-data-buf's flush-all would send (it walks %reader-push-targets in the same order and
+(defun* %node-datagram-plan (node writer buf)
+    (function (disc-node dds.rtps.reliable:rtps-writer dds.core.buffer:octet-buffer) (values list list))
+  "The FULL per-datagram send-plan for the explicit WRITER across ALL its matched-reader destinations — a flat
+   list of ((HOST . PORT) DEST-PREFIX BUILD-THUNK . SHMEM-DEST) entries, in the SAME order, with the SAME datagram
+   bytes, that %push-one-writer-changes' flush-all would send (it walks %reader-push-targets in the same order and
    each group's plan is %changes-datagram-plan). The unsent watermark is captured ONCE here
    (writer-capture-unsent advances each reader's unsent-base exactly as flush-all does, AND acquires a send-ref
    on each captured change — held until the plan drains, %flow-step-advance, release-safety) — so the scheduler
    must build this plan once and then step it, never rebuild mid-drain (that would re-read an already-advanced
-   watermark and send nothing). The seam the Phase-C FlowController scheduler drives: build the plan (capturing the unsent set),
-   then for each entry build into a scratch buffer (the thunk reports the token cost = datagram length),
-   acquire that many tokens, and send — one datagram per RR step. BUF supplies only the packing budget.
-   WP-ZC-MULTI-DEST-REFCOUNT (ADR 0047): the destinations are CAPTURED once (%capture-push-groups) and the
-   cross-group shared-ZC ref table (%shared-zc-refs) is built from those frozen sets BEFORE the per-group plan
-   build, so a change reaching >=2 co-resident ZC destinations shares ONE slot (refcount = the ZC-group count);
-   the ref bytes are already materialized in the plan closures, so the armed sweep after the build is unchanged."
-  (let ((writer (disc-node-user-writer node))
+   watermark and send nothing). Returns (values PLAN CAPTURED-CHANGES): the caller stores both on the per-writer
+   flow-state (WP-N-ENDPOINT-S1B — no node-single slot, so N writers of one participant drain independently). The
+   build runs under *emit-writer* = WRITER so every DATA/HEARTBEAT/HEARTBEAT_FRAG carries THIS writer's own EntityId
+   + is sourced from its OWN HistoryCache (RTPS 2.5 §9.3.1.2 / §9.4.5.5); at N=1 the sole writer IS the primary, so
+   the wire is byte-identical to the pre-S1B single-writer plan. The seam the Phase-C FlowController scheduler
+   drives: build the plan (capturing the unsent set), then for each entry build into a scratch buffer (the thunk
+   reports the token cost = datagram length), acquire that many tokens, and send — one datagram per step. BUF
+   supplies only the packing budget. WP-ZC-MULTI-DEST-REFCOUNT (ADR 0047): the destinations are CAPTURED once
+   (%capture-push-groups) and the cross-group shared-ZC ref table (%shared-zc-refs) is built from those frozen sets
+   BEFORE the per-group plan build, so a change reaching >=2 co-resident ZC destinations shares ONE slot (refcount
+   = the ZC-group count); the ref bytes are already materialized in the plan closures, so the armed sweep after the
+   build is unchanged."
+  (let ((*emit-writer* writer)   ; WP-N-ENDPOINT-S1B: stamp + source every submessage from THIS writer's GUID/HC
         (armed (dds.pal:with-lock ((disc-node-lock node)) (disc-node-zc-armed-changes node)))   ; snapshot (ADR 0042)
-        (plan '()))
+        (plan '()) (captured '()))
     (multiple-value-bind (first last count) (dds.rtps.reliable:writer-heartbeat writer)
       (multiple-value-bind (groups all-changes) (%capture-push-groups node writer)   ; ADR 0047: freeze every dest's unsent set once
         (let ((shared (%shared-zc-refs node writer groups)))   ; ADR 0047: one slot per change reaching >=2 ZC dests (exact refcount)
@@ -1623,9 +1628,9 @@
                                                      (%zc-push-group-zc-count g)
                                                      shared))
                 (push (cons dest (cons dp entry)) plan))))   ; ((host . port) DEST-PREFIX BUILD-THUNK . SHMEM-DEST)
-          (setf (disc-node-flow-step-refs node) all-changes))))   ; release-on-drain set: one entry per capture (balanced)
+          (setf captured all-changes))))   ; release-on-drain set: one entry per capture (balanced)
     (%zc-armed-sweep node armed)   ; ADR 0042: the ref bytes are already materialized in the plan's closures — sweep any slot the plan build never consumed/released
-    (nreverse plan)))
+    (values (nreverse plan) captured)))
 
 (defun* %emit-plan-entry (node buf entry &optional before-send)
     (function (disc-node dds.core.buffer:octet-buffer cons &optional (or null function)) (integer 0))
@@ -1645,53 +1650,56 @@
     (%send-raw-buf node buf len (car dest) (cdr dest) shmem-dest dest-prefix)
     len))
 
-(defun* %flow-release-step-refs (node)
-    (function (disc-node) t)
-  "Release the send-refs %node-datagram-plan acquired at the last snapshot (DISC-NODE-FLOW-STEP-REFS) and clear
+(defun* %flow-release-step-refs (ws)
+    (function (flow-writer-state) t)
+  "Release the send-refs %node-datagram-plan acquired at the last snapshot (FLOW-WRITER-STATE-STEP-REFS) and clear
    the slot — the DEFERRED-emit half of the operating contract §4 release-safety: the paced/async plan HELD a
    send-ref on each captured change from snapshot until the plan DRAINED, so a pooled payload (T5a) cannot be
    recycled mid-drain. Idempotent (a NIL slot releases nothing; the floored decrement tolerates a double call).
    Single-mutator: only the thread draining the plan runs it (the scheduler thread for an associated writer, or
-   the %flow-step-emit caller), the same single-mutator discipline as FLOW-STEP-STATE."
-  (let ((writer (disc-node-user-writer node))
-        (refs (disc-node-flow-step-refs node)))
+   the %flow-step-emit caller). Per-writer (WP-N-ENDPOINT-S1B): each writer's refs release when ITS plan drains,
+   so one writer's mid-drain snapshot never holds another writer's changes."
+  (let ((writer (flow-writer-state-writer ws))
+        (refs (flow-writer-state-step-refs ws)))
     (when (and writer refs)
       (dds.rtps.reliable:writer-release-change-refs writer refs))
-    (setf (disc-node-flow-step-refs node) nil))
+    (setf (flow-writer-state-step-refs ws) nil))
   t)
 
-(defun* %flow-step-advance (node plan)
-    (function (disc-node list) list)
-  "Advance NODE's flow-step plan past the just-emitted head PLAN: set FLOW-STEP-STATE to PLAN's tail and, when
-   the plan has now DRAINED (tail NIL), release the snapshot's captured send-refs (%flow-release-step-refs).
+(defun* %flow-step-advance (ws plan)
+    (function (flow-writer-state list) list)
+  "Advance writer-state WS's flow-step plan past the just-emitted head PLAN: set STEP-STATE to PLAN's tail and,
+   when the plan has now DRAINED (tail NIL), release the snapshot's captured send-refs (%flow-release-step-refs).
    The single drain choke point shared by %flow-step-emit AND the flow-controller scheduler (DRY) so BOTH
    deferred-emit drivers release the held refs exactly when the last datagram of a snapshot has been emitted
    (release-safety, operating contract §4). Returns the tail."
   (let ((next (cdr plan)))
-    (setf (disc-node-flow-step-state node) next)
-    (unless next (%flow-release-step-refs node))
+    (setf (flow-writer-state-step-state ws) next)
+    (unless next (%flow-release-step-refs ws))
     next))
 
-(defun* %flow-step-emit (node buf)
-    (function (disc-node dds.core.buffer:octet-buffer) (values (integer 0) t))
-  "WP-ASYNC-FLOW node-level STEP entry (FR-PF-2): build + send the NEXT single datagram for NODE's user writer
-   across its matched-reader push-targets, returning (values BYTES-SENT MORE-REMAIN-P). The first call (when
-   flow-step-state is NIL) snapshots the whole-node datagram plan (%node-datagram-plan, capturing the unsent
-   set ONCE — the watermark is advanced here, not per step); each call thereafter emits exactly ONE datagram
-   (%emit-plan-entry) from the cached plan and advances it; when the plan drains, flow-step-state is cleared so
-   the next call re-snapshots any newly-unsent changes. MORE-REMAIN-P is T while the current plan still holds
-   datagrams. The Phase-C FlowController scheduler drives the same plan but interposes a token acquire between
-   build and send via %emit-plan-entry's BEFORE-SEND seam. Returns (values 0 NIL) when there is nothing to
-   send. Wire-invisible: pacing changes only WHEN a datagram is sent (ADR 0016). BUF is the caller thread's
-   scratch buffer."
-  (when (null (disc-node-flow-step-state node))
-    (setf (disc-node-flow-step-state node) (%node-datagram-plan node buf)))
-  (let ((plan (disc-node-flow-step-state node)))
-    (if (null plan)
-        (progn (setf (disc-node-flow-step-state node) nil) (values 0 nil))
-        (let ((len (%emit-plan-entry node buf (car plan))))
-          (%flow-step-advance node plan)   ; advance + release the snapshot's send-refs when the plan drains (release-safety)
-          (values len (and (cdr plan) t))))))
+(defun* %flow-step-emit (ws buf)
+    (function (flow-writer-state dds.core.buffer:octet-buffer) (values (integer 0) t))
+  "WP-ASYNC-FLOW STEP entry (FR-PF-2; WP-N-ENDPOINT-S1B per-writer): build + send the NEXT single datagram for
+   writer-state WS's writer across its matched-reader push-targets, returning (values BYTES-SENT MORE-REMAIN-P).
+   The first call (when STEP-STATE is NIL) snapshots THIS writer's datagram plan (%node-datagram-plan on WS's
+   explicit writer, capturing the unsent set + its send-refs ONCE — the watermark advances here, not per step);
+   each call thereafter emits exactly ONE datagram (%emit-plan-entry) from the cached plan and advances it; when
+   the plan drains, STEP-STATE is cleared so the next call re-snapshots any newly-unsent changes. MORE-REMAIN-P
+   is T while the current plan still holds datagrams. The build+emit run under *emit-writer* = WS's writer.
+   Returns (values 0 NIL) when there is nothing to send. Wire-invisible: pacing changes only WHEN a datagram is
+   sent (ADR 0016). BUF is the caller thread's scratch buffer."
+  (let ((*emit-writer* (flow-writer-state-writer ws))   ; WP-N-ENDPOINT-S1B: this writer's own GUID/HC across build+emit
+        (node (flow-writer-state-node ws)))
+    (when (null (flow-writer-state-step-state ws))
+      (multiple-value-bind (plan refs) (%node-datagram-plan node (flow-writer-state-writer ws) buf)
+        (setf (flow-writer-state-step-state ws) plan (flow-writer-state-step-refs ws) refs)))
+    (let ((plan (flow-writer-state-step-state ws)))
+      (if (null plan)
+          (progn (setf (flow-writer-state-step-state ws) nil) (values 0 nil))
+          (let ((len (%emit-plan-entry node buf (car plan))))
+            (%flow-step-advance ws plan)   ; advance + release the snapshot's send-refs when the plan drains (release-safety)
+            (values len (and (cdr plan) t)))))))
 
 (defun* %push-heartbeat (node)
     (function (disc-node) (eql t))
@@ -1864,6 +1872,9 @@
    (a flow-controller associated, FR-PF-2, ADR 0016) the write returns immediately after marking the writer
    pending + signalling the controller, whose scheduler thread does the RATE-PACED push off the caller
    thread (an associated controller supersedes both batch and the per-node async sender for that writer).
+   WP-N-ENDPOINT-S1B: the paced tail resolves THIS write's per-writer flow-state via %resolve-user-writer +
+   %flow-writer-state-for — two O(N-local-writers) alist walks (allocation-free; opt-in flow-ON only, the
+   flow-OFF default never reaches this branch and is byte-identical), an accepted O(N) control-plane cost.
    KEY-HASH (WP-KEEPLAST, ADR 0019, DDS 1.4 §2.2.3.18) is the sample's 16-octet instance handle threaded
    onto the data CacheChange (writer-write) for per-instance KEEP_LAST eviction; NIL (default) is unchanged.
    When KEY-HASH is non-nil and exactly 16 octets, a PID_KEY_HASH inline-QoS block is also built
@@ -1895,8 +1906,7 @@
     (setf zc-slot nil))
   (let ((iq (when (and key-hash (= 16 (length key-hash)))
               (%build-key-hash-iq (coerce key-hash '(simple-array (unsigned-byte 8) (16))))))
-        (writer (or (and writer-id (%user-writer-for node writer-id))   ; WP-N-ENDPOINT-S1: write into THIS DataWriter's own HistoryCache/SN space
-                    (disc-node-user-writer node)))   ; NIL writer-id (or unregistered) -> primary (N=1 byte-identical)
+        (writer (%resolve-user-writer node writer-id))   ; WP-N-ENDPOINT-S1: write into THIS DataWriter's own HistoryCache/SN space; NIL/unregistered -> primary (N=1 byte-identical)
         (pin-granted nil)          ; ADR 0044: T iff the TX pin was reserved + %zc-pin'd for this write
         (pooled nil) (plen nil))   ; T5a: the acquired pool buffer + its TRUE secured-payload length (NIL = non-pooled path)
     ;; WP-ACKED-SLOT-PINNING (ADR 0044): a pin request (a committed slot + NO retained payload). Reserve a pin
@@ -1966,7 +1976,9 @@
         (dds.pal:with-lock ((disc-node-lock node))
           (push change (disc-node-zc-armed-changes node))))))
   (cond
-    ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))   ; WP-ASYNC-FLOW: paced async send
+    ((disc-node-flow-controller node)   ; WP-ASYNC-FLOW paced async send; WP-N-ENDPOINT-S1B: signal THIS writer's per-writer flow-state (re-resolve the writer — the writer let has closed)
+     (%flow-signal (disc-node-flow-controller node)
+                   (%flow-writer-state-for node (%resolve-user-writer node writer-id))))
     ((disc-node-async-thread node) (%async-signal node))   ; WP-ASYNC: hand off to the sender thread
     ((>= (incf (disc-node-batch-pending node)) (disc-node-batch-max-samples node)) (flush-batch node))
     (t nil))   ; batch size trigger not reached: defer to the next flush (cadence or fill)
@@ -2017,7 +2029,8 @@
     (when (eq :timeout (dds.rtps.reliable:writer-write (disc-node-user-writer node) payload key-hash iq))
       (return-from publish-relay-sample :timeout))
     (cond
-      ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))
+      ((disc-node-flow-controller node)   ; WP-N-ENDPOINT-S1B: relay writes to the primary writer -> its flow-state
+       (%flow-signal (disc-node-flow-controller node) (%flow-writer-state-for node (disc-node-user-writer node))))
       ((disc-node-async-thread node) (%async-signal node))
       ((>= (incf (disc-node-batch-pending node)) (disc-node-batch-max-samples node)) (flush-batch node))
       (t nil))
@@ -2039,7 +2052,8 @@
     (when (eq sn :timeout) (return-from publish-relay-lifecycle :timeout))
     (setf (disc-node-batch-pending node) 0)
     (cond
-      ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))
+      ((disc-node-flow-controller node)   ; WP-N-ENDPOINT-S1B: relay lifecycle writes to the primary writer -> its flow-state
+       (%flow-signal (disc-node-flow-controller node) (%flow-writer-state-for node (disc-node-user-writer node))))
       ((disc-node-async-thread node) (%async-signal node))
       (t (%push-data node)))
     t))
@@ -2062,7 +2076,8 @@
     (when (eq sn :timeout) (return-from %dispose-or-unregister :timeout))   ; full bounded cache: nothing added, nothing to push
     (setf (disc-node-batch-pending node) 0)   ; the push flushes the pending batch too (data SN < dispose SN)
     (cond
-      ((disc-node-flow-controller node) (%flow-signal (disc-node-flow-controller node) node))   ; WP-ASYNC-FLOW: paced async send
+      ((disc-node-flow-controller node)   ; WP-ASYNC-FLOW paced async send; WP-N-ENDPOINT-S1B: dispose writes to the primary writer -> its flow-state
+       (%flow-signal (disc-node-flow-controller node) (%flow-writer-state-for node (disc-node-user-writer node))))
       ((disc-node-async-thread node) (%async-signal node))
       (t (%push-data node)))
     sn))
@@ -3466,11 +3481,17 @@
                          (assert (= 2 (length (%all-user-writer-ids sn))) ()
                                  "the participant must hold 2 secured user writers with distinct EntityIds (S3)"))
                (stop-node sn)))
-           ;; (4b) deferral: a flow-controller on a 2-writer participant fail-fasts (Slice S1b)
+           ;; (4b) WP-N-ENDPOINT-S1B: a flow-controller now ASSOCIATES on a 2-writer participant (the S1-era fail-fast
+           ;; is LIFTED) — each writer becomes a distinct per-writer selection entry. Full both-drained delivery is
+           ;; proven by run-flow-multiwriter-onenode-test.
            (let ((fc (make-flow-controller :tokens-per-period 100000 :period 1000000 :max-burst 65536)))
              (unwind-protect
-                  (assert (null (ignore-errors (flow-controller-associate fc pub) t)) ()
-                          "flow-controller-associate on a 2-writer participant must fail-fast (Slice S1b)")
+                  (progn
+                    (assert (ignore-errors (flow-controller-associate fc pub) t) ()
+                            "flow-controller-associate on a 2-writer participant must now SUCCEED (WP-N-ENDPOINT-S1B)")
+                    (assert (= 2 (length (disc-node-flow-writer-states pub))) ()
+                            "the controller must register a per-writer flow-state for EACH of the 2 writers (S1b)")
+                    (flow-controller-unregister fc pub))
                (destroy-flow-controller fc)))
            ;; (4c) deferral: a 2nd writer on a node with a TRANSIENT_LOCAL writer fail-fasts (durability multi-writer = later slice)
            (let ((dn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))

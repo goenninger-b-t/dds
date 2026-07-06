@@ -414,10 +414,16 @@ timing — the flow tests pass-skip on Clasp, NFR-PORT).
     (dds.disc:stop-node w)))   ; unregisters w from the controller via the per-node emit barrier BEFORE freeing
 ```
 
-For **two or more** writers, call `flow-controller-associate` once per writer node on the **same** controller:
-the scheduler round-robins one datagram per writer per turn, so their datagrams interleave and the
-**aggregate** byte rate is shaped to the configured rate (not N × it). `stop-node` tears one writer down via a
-**per-node emit barrier** (`flow-controller-unregister`) — it removes the node from the scheduler's writer set
+For **two or more** writers, call `flow-controller-associate` once per writer participant on the **same**
+controller — and, since **Slice S1b** (WP-N-ENDPOINT-S1B-FLOW, ADR 0048), a **single participant with N
+DataWriters** also works: one associate registers a **per-writer selection entry** (`flow-writer-state`) for
+each of the participant's writers, so the scheduler drives ALL of them (not just the primary). Either way the
+scheduler round-robins (or EDF/priority-selects) one datagram per **writer** per turn, so their datagrams
+interleave and the **aggregate** byte rate is shaped to the configured rate (not N × it) — the token bucket is
+one-per-controller, shared across every writer; EDF/priority order the samples **across** the participant's
+writers (a tight-`LATENCY_BUDGET` writer ahead of a loose one on the same participant). `stop-node` tears one
+writer participant down via a **per-node emit barrier** (`flow-controller-unregister`) — it removes all the
+participant's per-writer entries from the scheduler's writer set
 then blocks until the shared scheduler is provably not, and never again will be, mid-emit on it, so freeing the
 node's socket/buffers cannot race a live send; the controller keeps serving its other writers. A large sample
 is paced at **DATA_FRAG fragment** granularity — its fragments spread across periods (the FR-PF-2 headline use

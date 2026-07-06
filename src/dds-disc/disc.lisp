@@ -217,14 +217,8 @@
   (async-stop nil :type t)                ; shutdown requested (guarded by async-lock)
   (async-tx-msg nil :type (or null dds.core.buffer:octet-buffer)) ; the sender thread's OWN scratch buffer
   (async-emit-errors 0 :type fixnum) ; WP-SENDER-ERROR-RESILIENCE: count of emit errors the async sender thread caught + survived (FR-PF-2)
-  (flow-step-state nil :type t) ; WP-ASYNC-FLOW: the node's in-progress per-datagram send plan ((host . port) . PLAN), threaded across %flow-step-emit calls; NIL = rebuild on next call
-  (flow-step-refs nil :type list) ; release-safety (operating contract §4): the CacheChanges %node-datagram-plan acquired a send-ref on at snapshot; released when the plan drains (%flow-step-advance); single-mutator (the draining thread), like flow-step-state
-  (flow-controller nil :type t) ; WP-ASYNC-FLOW: the flow-controller this writer is associated with (NIL = none); set/cleared under the CONTROLLER lock; non-NIL makes publish async-and-paced (the controller thread sends)
-  (flow-pending nil :type t)    ; WP-ASYNC-FLOW: new unsent work awaiting a fresh plan snapshot; set by %flow-signal, cleared by the scheduler — guarded by the CONTROLLER lock (NOT the node lock)
-  (flow-latency-budget-ns 0 :type integer) ; WP-FLOW-EDF-PRIORITY: writer's LATENCY_BUDGET in ns, cached at flow-controller-associate (the :edf key summand); CONTROLLER-lock-guarded
-  (flow-transport-priority 0 :type integer) ; WP-FLOW-EDF-PRIORITY: writer's TRANSPORT_PRIORITY, cached at flow-controller-associate (the :priority base); CONTROLLER-lock-guarded
-  (flow-head-ns 0 :type integer) ; WP-FLOW-EDF-PRIORITY: clock-fn stamp of the OLDEST currently-pending sample (the :edf write-time); set on idle->pending in %flow-signal; CONTROLLER-lock-guarded
-  (flow-last-served-ns 0 :type integer) ; WP-FLOW-EDF-PRIORITY: clock-fn stamp of the last :priority selection (aging baseline: effective = base + floor((now-this)/quantum)); CONTROLLER-lock-guarded
+  (flow-controller nil :type t) ; WP-ASYNC-FLOW: the flow-controller this NODE's writers are associated with (NIL = none); set/cleared under the CONTROLLER lock; non-NIL makes publish async-and-paced (the controller thread sends). NODE-scoped (one participant, one controller); the per-WRITER send cursor + EDF/priority scheduling keys live in FLOW-WRITER-STATES (WP-N-ENDPOINT-S1B)
+  (flow-writer-states '() :type list) ; WP-N-ENDPOINT-S1B (ADR 0048): alist writer-EntityId (u32, eql) -> flow-writer-state, one per associated local user DataWriter — the SELECTION ENTRY the controller round-robins / EDF / priority-selects, so scheduling spans ALL the participant's writers (the already-node-global %flow-policy-select naturally orders across them). Holds each writer's own send cursor (step-state/refs), pending signal, and scheduling keys (head-ns/budget/priority/last-served). Created at flow-controller-associate / register-under-controller. CONTROLLER-lock-guarded
   (samples (make-hash-table :test 'equalp) :type hash-table) ; 2-level: 16-octet src GUID (equalp) -> SN (eql) -> payload (§8.3.5.4: SN is per-writer; no per-sample composite-key alloc)
   (sample-writers (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> writer EntityId (reader-side instance writers-set, DDS 1.4 §2.2.2.5.1.3)
   (sample-writer-guids (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> 16-octet source GUID (EXCLUSIVE ownership arbitration, DDS 1.4 §2.2.3.9.2)
@@ -525,6 +519,38 @@
   (mcast-rx-thread nil :type t)
   (rx-thread nil :type t))
 
+(defstruct* (flow-writer-state (:constructor %make-flow-writer-state))
+  "WP-N-ENDPOINT-S1B (ADR 0048): the per-WRITER flow-control state — the flow-controller's SELECTION ENTRY. One per
+   associated local user DataWriter. The token BUCKET, the scheduler thread, and the RR cursor stay NODE/controller-
+   shared (one participant = one aggregate rate); only the send CURSOR + scheduling keys are per-writer, so the
+   already-node-global EDF/priority min-key selector (%flow-policy-select) naturally orders samples ACROSS the
+   participant's writers (a tight-LATENCY_BUDGET writer ahead of a loose one, even on the same node). NODE + WRITER
+   identify the drained endpoint: the plan builds THIS writer's unsent set into the shared scratch under
+   *emit-writer*. STEP-STATE is the in-progress per-datagram plan (NIL = rebuild); STEP-REFS the send-refs held from
+   snapshot until the plan drains (release-safety, operating contract §4); PENDING the new-unsent-work signal;
+   HEAD-NS/LATENCY-BUDGET-NS the :edf deadline summands; TRANSPORT-PRIORITY/LAST-SERVED-NS the :priority effective-key
+   inputs. All CONTROLLER-lock-guarded except STEP-STATE/STEP-REFS, which only the single scheduler/drain thread
+   mutates (the same single-mutator discipline as the pre-S1B node slots)."
+  (node nil :type t)                     ; the owning disc-node (socket / tx buffers / node lock)
+  (writer nil :type t)                   ; the rtps-writer engine instance (its OWN GUID / HistoryCache / EntityId)
+  (step-state nil :type t)               ; in-progress per-datagram send plan; NIL = rebuild on next step
+  (step-refs nil :type list)             ; send-refs held from snapshot until the plan drains (release-safety)
+  (pending nil :type t)                  ; new unsent work awaiting a fresh plan snapshot
+  (latency-budget-ns 0 :type integer)    ; cached LATENCY_BUDGET (ns) — the :edf key summand
+  (transport-priority 0 :type integer)   ; cached TRANSPORT_PRIORITY — the :priority base
+  (head-ns 0 :type integer)              ; :edf head-of-line write-time
+  (last-served-ns 0 :type integer))      ; :priority aging baseline
+
+(defun* %flow-writer-state-for (node writer)
+    (function (disc-node (or null dds.rtps.reliable:rtps-writer)) t)
+  "The per-writer flow-state (flow-writer-state) for engine WRITER under NODE's associated controller, looked up by
+   EntityId (WP-N-ENDPOINT-S1B); falls back to the first registered state (defensive — every associated writer has
+   one). NIL when the node has no flow-writer-states (no controller associated)."
+  (let ((states (disc-node-flow-writer-states node)))
+    (when states
+      (or (and writer (cdr (assoc (dds.rtps.reliable:rtps-writer-entityid writer) states :test #'eql)))
+          (cdr (first states))))))
+
 ;; WP-N-ENDPOINT-S0-REGISTRY (ADR 0048): compat accessors + register/lookup/enumerate API over the user-endpoint
 ;; registries. Control plane (endpoint create/enable), never the per-sample hot path. N=1: exactly one entry, so the
 ;; compat accessor returns the sole engine instance the pre-S0 slot returned — byte-identical.
@@ -557,9 +583,11 @@
    registered becomes primary (N=1 identity for disc-node-user-writer). Re-registering the SAME id REPLACES the
    entry in place (byte-identical to the pre-S0 enable-publisher engine-writer clobber), keeping the primary ref
    current if that id IS the primary. A NEW distinct id ADDS an N-th local writer (each with its own EntityId +
-   HistoryCache; a 2nd SECURED writer is now SUPPORTED — WP-N-ENDPOINT-S3, each keyed under its OWN EntityCrypto km)
-   UNLESS deferred: a 2nd writer under an associated flow-controller fail-fasts (flow-ON multi-writer = Slice S1b),
-   and a 2nd writer on a node with any RETAINING-durability writer fail-fasts (durability multi-writer = later slice)."
+   HistoryCache; a 2nd SECURED writer is SUPPORTED — WP-N-ENDPOINT-S3, each keyed under its OWN EntityCrypto km; a
+   2nd writer under an associated flow-controller is SUPPORTED — WP-N-ENDPOINT-S1B, each becomes a per-writer
+   selection entry) UNLESS deferred: a 2nd writer on a node with any RETAINING-durability writer fail-fasts
+   (durability multi-writer = later slice). When a controller is associated, EACH registered writer (first or N-th,
+   new or re-registered) is (re)registered with it as a per-writer flow-state (flow-controller-add-writer, S1b)."
   (let ((cell (assoc entity-id (disc-node-user-writers node) :test #'eql)))
     (cond (cell (let ((was-primary (eq (cdr cell) (disc-node-primary-user-writer node))))
                   (setf (cdr cell) writer)
@@ -567,16 +595,14 @@
           ((null (disc-node-user-writers node))   ; first writer -> primary (N=1 identity)
            (push (cons entity-id writer) (disc-node-user-writers node))
            (setf (disc-node-primary-user-writer node) writer))
-          (t (when (disc-node-flow-controller node)
-               (error "disc-node: refusing a 2nd local user DataWriter (EntityId #x~8,'0X) under an associated ~
-                       flow-controller — flow-ON multi-writer is Slice S1b; primary EntityId #x~8,'0X"
-                      entity-id (caar (last (disc-node-user-writers node)))))
-             (when (%node-has-durable-writer-p node)
+          (t (when (%node-has-durable-writer-p node)
                (error "disc-node: refusing a 2nd local user DataWriter (EntityId #x~8,'0X) on a node with a ~
                        RETAINING-durability (TRANSIENT_LOCAL/TRANSIENT/PERSISTENT) writer — durability multi-writer ~
                        is a later N-user-endpoint slice; primary EntityId #x~8,'0X"
                       entity-id (caar (last (disc-node-user-writers node)))))
-             (push (cons entity-id writer) (disc-node-user-writers node)))))   ; N-th writer; primary unchanged
+             (push (cons entity-id writer) (disc-node-user-writers node))))   ; N-th writer; primary unchanged
+    (when (disc-node-flow-controller node)   ; WP-N-ENDPOINT-S1B: (re)register this writer as a per-writer flow-state
+      (flow-controller-add-writer (disc-node-flow-controller node) node writer)))
   writer)
 
 (defun* %alloc-user-writer-key (node)
@@ -669,6 +695,14 @@
     (function (disc-node (unsigned-byte 32)) (or null dds.rtps.reliable:rtps-writer))
   "NODE's registered user engine writer for ENTITY-ID, or NIL (S1 send routing)."
   (cdr (assoc entity-id (disc-node-user-writers node) :test #'eql)))
+
+(defun* %resolve-user-writer (node writer-id)
+    (function (disc-node (or null (unsigned-byte 32))) (or null dds.rtps.reliable:rtps-writer))
+  "Resolve the local user engine writer WRITER-ID names under NODE, or the PRIMARY when WRITER-ID is NIL or
+   unregistered (WP-N-ENDPOINT-S1; the single publish-side writer-selection rule, factored DRY so the flow-signal
+   at the tail of publish-sample resolves the SAME writer the writer-write used). N=1 = the primary, byte-identical."
+  (or (and writer-id (%user-writer-for node writer-id))
+      (disc-node-user-writer node)))
 
 (defun* %user-reader-for (node entity-id)
     (function (disc-node (unsigned-byte 32)) (or null dds.rtps.reliable:rtps-reader))
