@@ -1640,6 +1640,9 @@
 (defmethod dds.dcps:on-liveliness-lost ((l capturing-writer-listener) writer status)
   (declare (ignore writer))
   (dds.pal:with-lock ((cap-lock l)) (push (cons :liv-lost status) (cap-hits l))))
+(defmethod dds.dcps:on-offered-incompatible-qos ((l capturing-writer-listener) writer status)
+  (declare (ignore writer))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :off-incompat status) (cap-hits l))))
 
 (defun* cap-snapshot (l)
     (function (capture-mixin) list)
@@ -8510,6 +8513,120 @@
              (%check :um-pub-total-unchanged
                      (= 1 (dds.dcps:publication-matched-status-total-count pm))
                      "writer PUBLICATION_MATCHED total_count must NOT be decremented (monotonic)")))
+      (dds.dcps:delete-participant p))
+    t))
+
+(defun* run-n-endpoint-s5-status-test ()
+    (function () t)
+  "WP-N-ENDPOINT-S5 (ADR 0048): THE per-endpoint status/listener dispatch slice (the FINAL slice). ONE
+   participant holds TWO different-topic DataReaders (A=dcps-msg, B=shape-type) + TWO DataWriters, each
+   with its OWN capturing listener. The four HARD disc->DCPS status hooks (match/unmatch/incompatible/
+   liveliness) are fired offline for a remote on TOPIC-B; each must land on ENDPOINT-B (its status counter
+   bumps + its listener fires) and NEVER on ENDPOINT-A. Endpoint-B is created FIRST and endpoint-A LAST, so
+   the retired v1 back-ref (dp-user-reader/-writer = LAST-created = A) would mis-deliver every topic-B event
+   to A: the B-counter / A-silent assertions are the RED discriminator (pre-rewire they fail; post-rewire,
+   per-topic resolution makes them GREEN). Offline direct hook firing (no network). Both impls."
+  (let ((ts-a (dds.types:find-type-support "dcps-msg"))
+        (ts-b (dds.types:find-type-support "shape-type"))
+        (p (dds.dcps:create-participant :domain (test-domain)))
+        (rla (make-instance 'capturing-reader-listener))
+        (rlb (make-instance 'capturing-reader-listener))
+        (wla (make-instance 'capturing-writer-listener))
+        (wlb (make-instance 'capturing-writer-listener)))
+    (unwind-protect
+         (let* ((tra (dds.dcps:create-topic p "S5A" "dcps-msg" ts-a))
+                (trb (dds.dcps:create-topic p "S5B" "shape-type" ts-b))
+                (sub (dds.dcps:create-subscriber p))
+                (pub (dds.dcps:create-publisher p))
+                ;; B FIRST, A LAST: the retired back-ref would point at A -> a topic-B event mis-delivers to A (RED).
+                (drb (dds.dcps:create-datareader sub trb))
+                (dwb (dds.dcps:create-datawriter pub trb))
+                (dra (dds.dcps:create-datareader sub tra))
+                (dwa (dds.dcps:create-datawriter pub tra))
+                (node (dds.dcps::dp-node p))
+                (rw-b (dds.rtps.discovery:make-endpoint-data
+                       :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x5b)))
+                               (setf (aref g 15) #x02) g)
+                       :topic-name "S5B" :type-name "ShapeType"))
+                (rr-b (dds.rtps.discovery:make-endpoint-data
+                       :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x5c)))
+                               (setf (aref g 15) #x07) g)
+                       :topic-name "S5B" :type-name "ShapeType")))
+           (dds.dcps:set-reader-listener dra rla '(:subscription-matched :requested-incompatible-qos :liveliness-changed))
+           (dds.dcps:set-reader-listener drb rlb '(:subscription-matched :requested-incompatible-qos :liveliness-changed))
+           (dds.dcps:set-writer-listener dwa wla '(:publication-matched :offered-incompatible-qos))
+           (dds.dcps:set-writer-listener dwb wlb '(:publication-matched :offered-incompatible-qos))
+           ;; (1) MATCH on topic B -> reader-B SUBSCRIPTION_MATCHED + writer-B PUBLICATION_MATCHED; A stays 0.
+           (dds.dcps::%on-disc-match p :remote-writer rw-b)
+           (dds.dcps::%on-disc-match p :remote-reader rr-b)
+           (%check :s5-match-b-sub
+                   (= 1 (dds.dcps:subscription-matched-status-total-count (dds.dcps:get-subscription-matched-status drb)))
+                   "topic-B match must bump reader-B SUBSCRIPTION_MATCHED (RED: retired back-ref delivers to last-created A)")
+           (%check :s5-match-a-sub-zero
+                   (zerop (dds.dcps:subscription-matched-status-total-count (dds.dcps:get-subscription-matched-status dra)))
+                   "reader-A must NOT see topic-B's match")
+           (%check :s5-match-b-pub
+                   (= 1 (dds.dcps:publication-matched-status-total-count (dds.dcps:get-publication-matched-status dwb)))
+                   "topic-B match must bump writer-B PUBLICATION_MATCHED")
+           (%check :s5-match-a-pub-zero
+                   (zerop (dds.dcps:publication-matched-status-total-count (dds.dcps:get-publication-matched-status dwa)))
+                   "writer-A must NOT see topic-B's match")
+           (%check :s5-match-b-rlistener (and (assoc :sub-matched (cap-snapshot rlb)) t)
+                   "reader-B on_subscription_matched must fire")
+           (%check :s5-match-a-rlistener-silent (null (assoc :sub-matched (cap-snapshot rla)))
+                   "reader-A on_subscription_matched must NOT fire")
+           (%check :s5-match-b-wlistener (and (assoc :pub-matched (cap-snapshot wlb)) t)
+                   "writer-B on_publication_matched must fire")
+           (%check :s5-match-a-wlistener-silent (null (assoc :pub-matched (cap-snapshot wla)))
+                   "writer-A on_publication_matched must NOT fire")
+           ;; (2) LIVELINESS on topic B: wire writer-B's S2 route -> reader-B, fire alive->not-alive.
+           (dds.disc::%reader-route-add node (dds.rtps.discovery:endpoint-data-guid rw-b) (dds.dcps::dr-entity-id drb))
+           (dds.dcps::%on-disc-liveliness-changed p (dds.rtps.discovery:endpoint-data-guid rw-b) nil)
+           (%check :s5-liv-b
+                   (= 1 (dds.dcps:liveliness-changed-status-not-alive-count (dds.dcps:get-liveliness-changed-status drb)))
+                   "topic-B liveliness-not-alive must bump reader-B LIVELINESS_CHANGED (routed via %reader-routes-for)")
+           (%check :s5-liv-a-zero
+                   (zerop (dds.dcps:liveliness-changed-status-not-alive-count (dds.dcps:get-liveliness-changed-status dra)))
+                   "reader-A must NOT see topic-B's liveliness change")
+           (%check :s5-liv-b-listener (and (assoc :liv-changed (cap-snapshot rlb)) t)
+                   "reader-B on_liveliness_changed must fire")
+           (%check :s5-liv-a-listener-silent (null (assoc :liv-changed (cap-snapshot rla)))
+                   "reader-A on_liveliness_changed must NOT fire")
+           ;; (3) INCOMPATIBLE_QOS on topic B: reader-B REQUESTED + writer-B OFFERED; A stays 0.
+           (dds.dcps::%on-disc-incompatible p :remote-writer rw-b '(:durability))
+           (dds.dcps::%on-disc-incompatible p :remote-reader rr-b '(:durability))
+           (%check :s5-incompat-b-req
+                   (= 1 (dds.dcps:requested-incompatible-qos-status-total-count (dds.dcps:get-requested-incompatible-qos-status drb)))
+                   "topic-B incompatible must bump reader-B REQUESTED_INCOMPATIBLE_QOS")
+           (%check :s5-incompat-a-req-zero
+                   (zerop (dds.dcps:requested-incompatible-qos-status-total-count (dds.dcps:get-requested-incompatible-qos-status dra)))
+                   "reader-A must NOT see topic-B's incompatible-qos")
+           (%check :s5-incompat-b-off
+                   (= 1 (dds.dcps:offered-incompatible-qos-status-total-count (dds.dcps:get-offered-incompatible-qos-status dwb)))
+                   "topic-B incompatible must bump writer-B OFFERED_INCOMPATIBLE_QOS")
+           (%check :s5-incompat-a-off-zero
+                   (zerop (dds.dcps:offered-incompatible-qos-status-total-count (dds.dcps:get-offered-incompatible-qos-status dwa)))
+                   "writer-A must NOT see topic-B's incompatible-qos")
+           (%check :s5-incompat-b-rlistener (and (assoc :req-incompat (cap-snapshot rlb)) t)
+                   "reader-B on_requested_incompatible_qos must fire")
+           (%check :s5-incompat-a-rlistener-silent (null (assoc :req-incompat (cap-snapshot rla)))
+                   "reader-A on_requested_incompatible_qos must NOT fire")
+           (%check :s5-incompat-b-wlistener (and (assoc :off-incompat (cap-snapshot wlb)) t)
+                   "writer-B on_offered_incompatible_qos must fire")
+           (%check :s5-incompat-a-wlistener-silent (null (assoc :off-incompat (cap-snapshot wla)))
+                   "writer-A on_offered_incompatible_qos must NOT fire")
+           ;; (4) UNMATCH on topic B: reader-B SUBSCRIPTION_MATCHED current_count -> 0; total monotonic; A untouched.
+           (dds.dcps::%on-disc-unmatch p :remote-writer rw-b)
+           (dds.dcps::%on-disc-unmatch p :remote-reader rr-b)
+           (%check :s5-unmatch-b-current-zero
+                   (zerop (dds.dcps:subscription-matched-status-current-count (dds.dcps:get-subscription-matched-status drb)))
+                   "topic-B unmatch must drop reader-B SUBSCRIPTION_MATCHED current_count to 0")
+           (%check :s5-unmatch-b-total-monotonic
+                   (= 1 (dds.dcps:subscription-matched-status-total-count (dds.dcps:get-subscription-matched-status drb)))
+                   "reader-B SUBSCRIPTION_MATCHED total_count must NOT be decremented (monotonic)")
+           (%check :s5-unmatch-a-untouched
+                   (zerop (dds.dcps:subscription-matched-status-total-count (dds.dcps:get-subscription-matched-status dra)))
+                   "reader-A must NOT be touched by topic-B's unmatch"))
       (dds.dcps:delete-participant p))
     t))
 

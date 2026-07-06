@@ -411,6 +411,15 @@ identity-guarded + idempotent, so one reader's `return-loan` never frees another
 loan-capable reader on the **same** topic still fail-fasts (the UAF-guarding invariant; a later slice
 lifts it via refcount-per-reader).
 
+**Per-endpoint status/listener dispatch for secured endpoints** (WP-N-ENDPOINT-S5, ADR 0048).  The
+final N-user-endpoint slice makes every DCPS status counter, listener, and WaitSet wake resolve to
+the endpoint the discovery/status event is **about** (by remote topic, or by the writer-GUID S2 route
+for liveliness), retiring the participant-wide `dp-user-reader`/`dp-user-writer` back-refs — so on a
+participant holding N secured writers + N loaded-capable readers each endpoint's
+SUBSCRIPTION/PUBLICATION_MATCHED, INCOMPATIBLE_QOS, and LIVELINESS_CHANGED land on the correct secured
+endpoint, not the last-created one.  This **completes** the different-topic N-user-endpoint capability
+(incl. secured); same-topic multi-endpoint stays deferred.
+
 ### 3.4 Zero-alloc secured send + the shared foundation (WP-DDS-SECURITY-ZEROALLOC-AEAD, ADR 0038)
 
 With the decode loan (§3.3) on the receive side and a matching **encode payload pool** on the send

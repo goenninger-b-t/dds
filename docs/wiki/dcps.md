@@ -39,6 +39,21 @@ fail-fasts (the delivery route holds one reader per writer today, so a same-topi
 silently receive nothing — **same-topic multi-reader is a later slice, and same-topic loan-capable
 multi-reader stays deferred past S4** as the UAF-guarding invariant, ADR-0017 refcount-per-reader).
 
+**Per-endpoint status/listener dispatch (WP-N-ENDPOINT-S5, ADR 0048) — the milestone is COMPLETE.**
+Every status counter, listener callback, and WaitSet/DATA_AVAILABLE wake is now delivered to the
+`DataWriter`/`DataReader` the event is **about**, not to the last-created endpoint. The disc→DCPS
+hooks resolve the local entity by the remote's **topic** (SUBSCRIPTION/PUBLICATION_MATCHED, unmatch,
+REQUESTED/OFFERED_INCOMPATIBLE_QOS) or by the remote writer GUID's S2 **delivery route**
+(LIVELINESS_CHANGED); an event with no matching local endpoint is dropped, never mis-delivered. The
+two data-ready wakes (dispose/unregister lifecycle and new-data) carry no routable writer identity
+from the disc layer, so they wake every local reader — the S2 source-GUID drain filter still governs
+which reader actually sees which sample, so a spurious wake is a benign, permitted DATA_AVAILABLE.
+The old single `dp-user-reader`/`dp-user-writer` back-refs are retired. At N=1 every path is
+byte-identical. With this slice the **different-topic N-user-endpoint capability is complete**: N
+writers + N readers per participant on distinct topics, including secured and loan-capable, each with
+correct per-endpoint status and delivery. Same-topic multi-endpoint, flow-ON multi-writer, and
+RETAINING-durability multi-writer stay deferred.
+
 ## API reference
 
 All symbols below are exported from `dds.dcps`. One-line descriptions are condensed from the

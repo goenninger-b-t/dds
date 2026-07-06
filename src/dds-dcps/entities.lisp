@@ -1,9 +1,10 @@
 ;;;; DDS 1.4 DCPS entity model (M3/P2, FR-DCPS-1). CLOS — this is control-plane, so
 ;;;; CLOS is the preferred default (FR-LANG-0); none of this is on the hot path. The
 ;;;; entities are a thin, typed facade over the existing RTPS engine (dds.disc): a
-;;;; DomainParticipant owns a multicast disc-node; a DataWriter/DataReader binds to
-;;;; the engine's single user endpoint (v1 limitation — one writer + one reader per
-;;;; participant; multi-endpoint needs per-endpoint RTPS EntityIds, a later step).
+;;;; DomainParticipant owns a multicast disc-node; each DataWriter/DataReader binds to its
+;;;; own distinct engine EntityId (WP-N-ENDPOINT S1/S2), and the disc->DCPS status/listener
+;;;; hooks resolve the endpoint an event is about per-topic / per-route (WP-N-ENDPOINT-S5) — N
+;;;; writers + N readers per participant on distinct topics (same-topic multi-endpoint deferred).
 ;;;; write/take serialize/deserialize through the generated type-support (dds.types).
 
 (in-package #:dds.dcps)
@@ -31,13 +32,13 @@
   ((domain :initarg :domain :reader dp-domain)
    (node :initarg :node :accessor dp-node)
    (children :initform '() :accessor dp-children)
-   (user-reader :initform nil :accessor dp-user-reader)   ; v1: one DataReader per participant
-   (user-writer :initform nil :accessor dp-user-writer)   ; v1: one DataWriter per participant
    (type-gate-state :initform nil :accessor dp-type-gate-state)   ; FR-TYPE-4 gate (type-gate.lisp)
    (auth-state :initform nil :accessor dp-auth-state)   ; DDS-Security 1.1 §8.7 auth manager (auth-manager.lisp)
    (access-state :initform nil :accessor dp-access-state))   ; DDS-Security 1.1 §8.4 AccessControl manager (access-control.lisp)
   (:documentation "DDS DomainParticipant: owns a multicast disc-node for its domain and
-   its contained entities. v1 holds one DataReader + one DataWriter per participant.
+   its contained entities. Holds N DataReaders + N DataWriters (on distinct topics) across its
+   Subscribers/Publishers; the disc->DCPS status/listener hooks resolve the endpoint an event is
+   about per-topic / per-route (WP-N-ENDPOINT-S5), not via a participant-wide back-ref.
    TYPE-GATE-STATE carries the FR-TYPE-4 assignability gate's TypeObject/verdict caches.
    AUTH-STATE carries the DDS-Security §8.7 authentication manager's local identity +
    per-remote handshake/key state (NIL = security OFF; see auth-manager.lisp).
@@ -592,7 +593,6 @@
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
       (setf (dw-entity-id dw) (dds.disc:disc-node-user-writer-id node))
       (push dw (pub-writers pub))
-      (setf (dp-user-writer (pub-participant pub)) dw)   ; v1 back-ref for status hooks
       dw)))
 
 (defun* create-datareader (sub topic &key (qos (dds.qos:make-reader-qos)))
@@ -632,7 +632,6 @@
       ;; subscriber registered the engine reader under it) so %drain's source-GUID filter routes delivery per reader.
       (setf (dr-entity-id dr) (dds.disc:disc-node-user-reader-id node))
       (push dr (sub-readers sub))
-      (setf (dp-user-reader (sub-participant sub)) dr)   ; v1 back-ref for status hooks
       dr)))
 
 (defun* %participant-writers (p)
@@ -1114,10 +1113,13 @@
    lock; this hook must NOT touch the reader cache or instance-recs (those are user-thread state,
    mutated only by %drain — touching them here would race a concurrent read/take/%drain). It just
    fires DATA_AVAILABLE so a waiting reader drains the pending lifecycle change on the user thread.
-   The instance-state transition itself is applied on the user thread by %drain (S2)."
+   The instance-state transition itself is applied on the user thread by %drain (S2).
+   WP-N-ENDPOINT-S5 (ADR 0048): the disc lifecycle callback carries only the remote writer EntityId
+   (not a full GUID, so no S2 route lookup) — wake EVERY local reader; each drains only its own
+   S2-source-GUID-filtered lifecycle change on the user thread, so a spurious wake of a reader with
+   nothing pending is benign (level-triggered DATA_AVAILABLE, DDS 1.4 §2.2.4.1). N=1 == the sole reader."
   (declare (ignore wid sn kind key-hash status-flags))
-  (let ((dr (dp-user-reader p)))
-    (when dr (%wake-reader-data dr)))
+  (dolist (dr (%participant-readers p)) (%wake-reader-data dr))
   t)
 
 (defun* %drain-one-lifecycle (dr node key)
@@ -1427,6 +1429,46 @@
   (let ((rs '()))
     (dolist (c (dp-children p) rs)
       (when (typep c 'subscriber) (setf rs (append (sub-readers c) rs))))))
+
+;;; WP-N-ENDPOINT-S5 (ADR 0048): per-endpoint disc->DCPS dispatch. A status/listener/wake event
+;;; resolves the LOCAL entity it is ABOUT — by the remote's TOPIC (match/unmatch/incompatible) or by
+;;; the remote writer GUID's S2 delivery route (liveliness) — never a participant-wide back-ref. A
+;;; different-topic participant has <=1 endpoint per topic (same-topic is fail-fast-deferred); an event
+;;; with no matching local entity is DROPPED, never mis-delivered to another endpoint.
+
+(defun* %participant-reader-for-topic (p topic-name)
+    (function (domain-participant string) (or null data-reader))
+  "The local DataReader in P bound to TOPIC-NAME, or NIL (WP-N-ENDPOINT-S5): the per-endpoint
+   match/unmatch/incompatible dispatch key. <=1 reader per topic (same-topic deferred), so the first
+   match IS the reader; NIL -> the caller drops the event (never mis-delivers to another endpoint)."
+  (find topic-name (%participant-readers p)
+        :key (lambda (dr) (topic-name (dr-topic dr))) :test #'string=))
+
+(defun* %participant-writer-for-topic (p topic-name)
+    (function (domain-participant string) (or null data-writer))
+  "The local DataWriter in P bound to TOPIC-NAME, or NIL (WP-N-ENDPOINT-S5): writer-side mirror of
+   %participant-reader-for-topic for the match/unmatch/incompatible hooks."
+  (find topic-name (%participant-writers p)
+        :key (lambda (dw) (topic-name (dw-topic dw))) :test #'string=))
+
+(defun* %participant-reader-by-entity-id (p rid)
+    (function (domain-participant (unsigned-byte 32)) (or null data-reader))
+  "The local DataReader in P whose engine EntityId is RID, or NIL (WP-N-ENDPOINT-S5): maps an S2
+   delivery route's reader-EntityId back to its DCPS DataReader (dr-entity-id)."
+  (find rid (%participant-readers p) :key #'dr-entity-id :test #'=))
+
+(defun* %participant-readers-for-writer-guid (p guid)
+    (function (domain-participant (simple-array (unsigned-byte 8) (16))) list)
+  "The local DataReader(s) matched to remote writer GUID (WP-N-ENDPOINT-S5): reuse the S2 delivery
+   route (%reader-routes-for) -> reader-EntityId(s) -> DCPS reader by dr-entity-id. <=1 today
+   (same-topic fence). NOTE: %reader-routes-for falls back to the PRIMARY reader on an empty route
+   (not NIL), so at N=1 this returns the sole reader (byte-identical). This is only called for a
+   MATCHED remote writer (liveliness/lifecycle fire only after %reader-route-add at the match), so at
+   N>=2 the route is always non-empty and resolves the correct matched reader — the primary fallback
+   is unreachable there. Correctness rests on the matched=>routed invariant, not on an empty-route drop."
+  (loop for pair in (dds.disc::%reader-routes-for (dp-node p) guid)
+        for dr = (%participant-reader-by-entity-id p (car pair))
+        when dr collect dr))
 
 ;;;; ---- WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017) ----
 ;;;; NOT cleared for ship — pending counsel (R6); see ADR 0017.
@@ -1920,10 +1962,13 @@
   "ON-MATCH hook: a remote endpoint matched a local one. :remote-writer -> our reader
    gained a publication (SUBSCRIPTION_MATCHED); :remote-reader -> our writer gained a
    subscription (PUBLICATION_MATCHED). The 16-octet remote GUID is the matched handle.
-   Also records an ADVISORY type-object fingerprint verdict on the local entity (ADR 0009)."
-  (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
+   Also records an ADVISORY type-object fingerprint verdict on the local entity (ADR 0009).
+   WP-N-ENDPOINT-S5 (ADR 0048): the local entity is resolved per-endpoint by the remote's TOPIC
+   (%participant-reader/writer-for-topic), so at N>=2 the status/listener lands on the RIGHT one."
+  (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote)))
+        (tname (dds.rtps.discovery:endpoint-data-topic-name remote)))
     (ecase kind
-      (:remote-writer (let ((dr (dp-user-reader p)))
+      (:remote-writer (let ((dr (%participant-reader-for-topic p tname)))
                         (when dr (%reader-matched dr handle)
                               ;; durability-aware late-joiner gate (DDS 1.4 §2.2.3.4): a TL reader matched
                               ;; a retaining writer REQUESTS its history; a VOLATILE reader matched a
@@ -1936,7 +1981,7 @@
                       ;; §8.5.2.3: our user reader matched a remote writer -> (re)send our DatareaderCryptoToken
                       ;; keyed to the REAL matched-remote writer GUID (the destination_endpoint_key fix).
                       (%cm-user-token-at-match p handle nil))
-      (:remote-reader (let ((dw (dp-user-writer p)))
+      (:remote-reader (let ((dw (%participant-writer-for-topic p tname)))
                         (when dw (%writer-matched dw handle)
                               ;; durability-aware late-joiner proxy init (DDS 1.4 §2.2.3.4): a TL writer
                               ;; matched by a TL reader replays its retained history (firstSN + a prompt
@@ -1960,16 +2005,17 @@
   "ON-UNMATCH hook: a previously matched remote endpoint vanished (participant-lease
    expiry, disc.lisp %lease-sweep). :remote-writer -> our reader lost a publication
    (SUBSCRIPTION_MATCHED current_count--); :remote-reader -> our writer lost a
-   subscription (PUBLICATION_MATCHED current_count--). The local entity is located the
-   same way as %on-disc-match (the v1 single user reader/writer back-ref). The remote's
+   subscription (PUBLICATION_MATCHED current_count--). The local entity is resolved per-endpoint by
+   the remote's TOPIC, the same way as %on-disc-match (WP-N-ENDPOINT-S5). The remote's
    16-octet GUID is the unmatched handle (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §165/§174)."
-  (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))))
+  (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote)))
+        (tname (dds.rtps.discovery:endpoint-data-topic-name remote)))
     (ecase direction
-      (:remote-writer (let ((dr (dp-user-reader p)))
+      (:remote-writer (let ((dr (%participant-reader-for-topic p tname)))
                         (when dr (%reader-unmatched dr handle)
                               (%clear-owner-on-vanish dr handle)   ; EXCLUSIVE owner loss -> takeover (S1)
                               (%on-writer-vanished dr (%guid-entityid handle)))))
-      (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-unmatched dw handle))))))
+      (:remote-reader (let ((dw (%participant-writer-for-topic p tname))) (when dw (%writer-unmatched dw handle))))))
   t)
 
 (defun* %on-disc-liveliness-changed (p remote-writer-guid alive-p)
@@ -1977,39 +2023,37 @@
   "ON-LIVELINESS-CHANGED hook (disc announce thread, %liveliness-sweep): matched remote
    writer REMOTE-WRITER-GUID crossed alive<->not-alive (ALIVE-P is the NEW state; RTPS 2.5
    §8.4.13). Bump the local DataReader's LIVELINESS_CHANGED status (DDS 1.4 §2.2.4.1) and
-   fire on_liveliness_changed. The reader is the v1 single user-reader back-ref."
-  (let ((dr (dp-user-reader p)))
-    (when dr
-      (%reader-liveliness-changed dr (copy-seq remote-writer-guid) alive-p)
-      ;; A not-alive writer loses ownership (DDS 1.4 §2.2.3.9.2 cause (c)) -> remaining writer takes over.
-      (unless alive-p (%clear-owner-on-vanish dr remote-writer-guid))))
+   fire on_liveliness_changed. WP-N-ENDPOINT-S5 (ADR 0048): the reader(s) matched to REMOTE-WRITER-GUID
+   are resolved via the S2 delivery route (%participant-readers-for-writer-guid), so at N>=2 the status
+   lands on the RIGHT reader; <=1 today (same-topic fence). N=1 == the sole reader (route fallback)."
+  (dolist (dr (%participant-readers-for-writer-guid p remote-writer-guid))
+    (%reader-liveliness-changed dr (copy-seq remote-writer-guid) alive-p)
+    ;; A not-alive writer loses ownership (DDS 1.4 §2.2.3.9.2 cause (c)) -> remaining writer takes over.
+    (unless alive-p (%clear-owner-on-vanish dr remote-writer-guid)))
   t)
 
 (defun* %on-disc-incompatible (p kind remote bad)
     (function (domain-participant keyword dds.rtps.discovery:endpoint-data list) t)
   "ON-INCOMPATIBLE-QOS hook: topic+type agreed but RxO failed. :remote-writer -> our
    reader's REQUESTED_INCOMPATIBLE_QOS; :remote-reader -> our writer's OFFERED_
-   INCOMPATIBLE_QOS. BAD is the failing-policy keyword list (dds.qos:qos-rxo-compatible)."
-  (declare (ignore remote))
-  (ecase kind
-    (:remote-writer (let ((dr (dp-user-reader p))) (when dr (%reader-incompatible dr bad))))
-    (:remote-reader (let ((dw (dp-user-writer p))) (when dw (%writer-incompatible dw bad)))))
+   INCOMPATIBLE_QOS. BAD is the failing-policy keyword list (dds.qos:qos-rxo-compatible).
+   WP-N-ENDPOINT-S5 (ADR 0048): the local entity is resolved per-endpoint by the remote's TOPIC."
+  (let ((tname (dds.rtps.discovery:endpoint-data-topic-name remote)))
+    (ecase kind
+      (:remote-writer (let ((dr (%participant-reader-for-topic p tname))) (when dr (%reader-incompatible dr bad))))
+      (:remote-reader (let ((dw (%participant-writer-for-topic p tname))) (when dw (%writer-incompatible dw bad))))))
   t)
 
 (defun* %on-participant-sample (p)
     (function (domain-participant) t)
-  "ON-SAMPLE hook (disc receiver thread): new user data arrived for P's reader. Fire
-   on_data_available if a listener is masked for it (snapshot under the status lock,
-   call OUTSIDE it), then wake the reader's WaitSets (DATA_AVAILABLE / ReadCondition /
-   QueryCondition). Holds no node lock here (the disc layer released it before calling)."
-  (let ((dr (dp-user-reader p)))
-    (when dr
-      (let ((fire nil))
-        (dds.pal:with-lock ((dr-status-lock dr))
-          (when (and (dr-listener dr) (member :data-available (dr-listener-mask dr)))
-            (setf fire t)))
-        (when fire (on-data-available (dr-listener dr) dr))
-        (%notify-reader-conditions dr))))
+  "ON-SAMPLE hook (disc receiver thread): new user data arrived for P. Fire on_data_available
+   if a listener is masked for it, then wake the reader's WaitSets (DATA_AVAILABLE / ReadCondition /
+   QueryCondition). Holds no node lock here (the disc layer released it before calling).
+   WP-N-ENDPOINT-S5 (ADR 0048): the disc data-ready callback carries no writer identity, so wake EVERY
+   local reader (DRY via %wake-reader-data); each drains only its own S2-source-GUID-filtered samples,
+   so a spurious wake of a reader with nothing pending is benign (level-triggered DATA_AVAILABLE, DDS
+   1.4 §2.2.4.1). N=1 == the sole reader."
+  (dolist (dr (%participant-readers p)) (%wake-reader-data dr))
   t)
 
 (defun* %reader-matched (dr handle)
