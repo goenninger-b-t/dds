@@ -60,6 +60,7 @@
            #:zc-loan-marker-slot-index #:zc-loan-marker-generation #:zc-loan-marker-len
            #:node-sample-count #:node-sample #:node-sample-sns
            #:node-sample-writer #:node-sample-writer-guid #:node-sample-origin-guid #:node-sample-origin-sn #:node-sample-key-hash #:node-sample-key-sn #:node-sample-by-sn #:matched-writer-ownership
+           #:node-reader-join-watermark
            #:node-user-reader-count #:node-reader-matches-writer-p
            #:dispose-instance #:unregister-instance
            #:node-lifecycle-change #:node-lifecycle-change-by-sn #:node-lifecycle-count #:node-lifecycle-sns
@@ -78,6 +79,7 @@
            #:run-spdp-discovery-test #:run-sedp-discovery-test
            #:run-mcast-discovery-test #:run-dataplane-test #:run-n-writer-dataplane-test #:run-n-same-topic-writer-dataplane-test #:run-n-writer-frag-heartbeat-test #:run-n-reader-dataplane-test
            #:run-n-reader-s4-decode-tier-test #:run-n-reader-s4-zc-marker-test
+           #:run-n-reader-2c3-zc-uaf-test #:run-n-reader-2c3-secured-purge-defer-test #:run-n-reader-2c3-watermark-purge-test
            #:run-large-dataplane-test #:run-participant-liveliness-test
            #:run-locator-filter-test #:run-lost-final-sample-test
            #:run-dispose-dataplane-test #:run-dispose-repair-test

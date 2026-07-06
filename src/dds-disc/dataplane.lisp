@@ -2381,7 +2381,21 @@
    (orig-guid/orig-sn on the relay path; wire GUID+SN on the direct path) per RTPS 2.5 §8.3.5.4.
    WP-N-ENDPOINT-S4 (ADR 0048): the marker is delivered to the CANONICAL reader MATCHED to this writer
    (%reader-routes-for demux, mirroring the secured %deliver-user-sample) — NOT unconditionally the primary — so
-   each ZC reader's loan/marker state is driven only by ITS OWN writers. N=1/pre-match -> primary, byte-identical."
+   each ZC reader's loan/marker state is driven only by ITS OWN writers. N=1/pre-match -> primary, byte-identical.
+   WP-N-ENDPOINT-2C3 (ADR 0017/0048; MEMORY-SAFETY): with K same-topic LOAN-CAPABLE readers co-located on this
+   node, ALL K drain THIS one stored marker (the never-purged store + per-reader dr-drained fan-out) and each
+   %zc-releases the slot once. The writer's %zc-loan preset the slot's refcount to 1 (per-PARTICIPANT, %zc-ref-
+   builder) which covers reader #1; readers #2..#K each need a hold. DEMUX-TIME BUMP: on the receiver thread, K is
+   the route length RE-READ UNDER the node lock (the authoritative membership, NOT the pre-dedup snapshot), and the
+   {K -> %zc-bump(K-1) -> store} sequence runs in ONE node-lock hold BEFORE the marker is stored (hence before it is
+   drainable, hence strictly before any %zc-release). The slot is provably held (refcount>=1 — no reader has
+   drained/released yet; the receiver never releases here), so its generation is STABLE and the bump's up-front
+   generation read cannot race a reclaim. All K holders are counted BEFORE any read/return, so reader-A's return-loan
+   (1 decrement) can never free a slot reader-B still views (the invariant); the slot frees only at the true refcount
+   0. Because a JOINER's high-water freeze (%reader-route-add) runs under the SAME node lock, the demux and the
+   route-add serialize: a marker stored before a joiner joined is <= its watermark (skipped, unbumped-for-it) and one
+   stored after has it in this snapshot (bumped for it) — no drain-an-unbumped-marker window. K=1 (N=1 / different-
+   topic S4) -> no bump, byte-identical. NOT cleared for ship — pending counsel (R6)."
   (let* ((guid (%source-guid src-prefix writer-id))
          (routes (%reader-routes-for node guid))     ; WP-N-ENDPOINT-S4: the ZC reader(s) matched to this writer (mirrors %deliver-user-sample's demux)
          (canon (and routes (cdr (first routes)))))   ; the CANONICAL engine reader (N=1/pre-match -> primary, byte-identical to the old primary-only path)
@@ -2391,11 +2405,28 @@
                                         (make-array 0 :element-type '(unsigned-byte 8)))
       ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
       (when (dds.rtps.reliable:reader-dedup-accept-p canon effective-guid effective-sn)
+        ;; WP-N-ENDPOINT-2C3 (MEMORY-SAFETY): the {route re-snapshot -> K -> %zc-bump(K-1) -> store} sequence is
+        ;; ATOMIC under ONE node-lock hold. Re-read the route UNDER the lock (not the pre-dedup snapshot) so the
+        ;; route membership the bump counts EQUALS the membership at store, and a concurrent %reader-route-add
+        ;; (which freezes a JOINER's high-water under the SAME lock) is strictly before-or-after this whole section:
+        ;; a marker stored before a joiner's route-add is <= its frozen watermark (skipped, never bumped for it); a
+        ;; marker stored after has the joiner in this snapshot (bumped for it). This closes the demux slip a
+        ;; snapshot-outside/store-inside split would leave. The bump counts all K co-located same-topic holders
+        ;; (raising the slot hold from the writer's preset 1 to K) BEFORE the marker is stored -> drainable ->
+        ;; releasable. %zc-bump is a CAS on the pool SAP (no lock), so it is deadlock-free under the node lock.
+        ;; Guarded on a real pool-sap (a NIL-pool test marker never bumps); K=1 -> no bump (N=1 / S4 byte-identical).
         (dds.pal:with-lock ((disc-node-lock node))
-          (setf (gethash sn (%inner-table (disc-node-samples node) guid)) marker
-                (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
-                (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
-          (%record-sample-origin node guid sn effective-guid effective-sn))
+          (let* ((ids (gethash guid (disc-node-reader-routes node)))   ; the AUTHORITATIVE route under the lock (empty -> primary fallback -> K=1)
+                 (k (if ids (length ids) 1)))
+            (when (and (> k 1) (zc-loan-marker-pool-sap marker))
+              (dds.xport.zerocopy::%zc-bump (zc-loan-marker-pool-sap marker)
+                                            (zc-loan-marker-slot-index marker)
+                                            (zc-loan-marker-generation marker)
+                                            (1- k)))
+            (setf (gethash sn (%inner-table (disc-node-samples node) guid)) marker
+                  (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
+                  (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
+            (%record-sample-origin node guid sn effective-guid effective-sn)))
         (when (disc-node-on-sample node) (funcall (disc-node-on-sample node))))))
   t)
 
@@ -2423,7 +2454,8 @@
   (guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
         :type (simple-array (unsigned-byte 8) (16)))                            ; samples-store outer key (source GUID); reused in place on refill
   (sn 0 :type integer)                                                           ; samples-store inner key (RTPS SN)
-  (reg-index -1 :type fixnum))                                                   ; index in disc-node-secured-loan-vec (-1 = not registered); O(1) swap-remove + outstanding-flag
+  (reg-index -1 :type fixnum)                                                    ; index in disc-node-secured-loan-vec (-1 = not registered); O(1) swap-remove + outstanding-flag
+  (return-count 1 :type (integer 1)))                                            ; WP-N-ENDPOINT-2C3 (ADR 0048): # of co-located same-topic readers that will each return this shared handle once; %secured-loan-release purges the store slot + frees the buffer ONLY on the LAST return (defers so an early-returning reader-A does not deny reader-B its sample). 1 = N=1 (immediate purge, byte-identical)
 
 (defun* secured-loan-bytes (handle)
     (function (secured-loan-handle) (simple-array (unsigned-byte 8) (*)))
@@ -2455,7 +2487,8 @@
   (setf (secured-loan-handle-buffer handle) nil
         (secured-loan-handle-len handle) 0
         (secured-loan-handle-sn handle) 0
-        (secured-loan-handle-reg-index handle) -1)
+        (secured-loan-handle-reg-index handle) -1
+        (secured-loan-handle-return-count handle) 1)   ; WP-N-ENDPOINT-2C3: reset the shared-return counter before reuse (a fresh sample starts single-holder)
   (fill (secured-loan-handle-guid handle) 0)
   (let ((top (disc-node-decode-handle-top node)))
     (setf (svref (disc-node-decode-handle-vec node) top) handle
@@ -2544,6 +2577,16 @@
    freelist)."
   (dds.pal:with-lock ((disc-node-lock node))
     (when (>= (secured-loan-handle-reg-index handle) 0)   ; registered => a stored loan: evict store (identity-guarded) + deregister
+      ;; WP-N-ENDPOINT-2C3 (ADR 0048; MEMORY-SAFETY): with K co-located same-topic secured readers, ALL K drain
+      ;; THIS one stored handle (independent-struct deserialize at drain — already memory-safe) and each returns it
+      ;; once. Purge the store slot + free the pooled buffer ONLY on the LAST return: a not-last returner just
+      ;; decrements and leaves the entry live, so an early-returning reader-A can never purge (guid,sn) before a
+      ;; not-yet-drained reader-B finds it (silent sample-LOSS). Per-reader return is single-shot (the DCPS
+      ;; dr-secured-loans membership guard), so the counter decrements exactly K times. K=1 -> LAST immediately
+      ;; (byte-identical). Return the LOCK here (unwinds with-lock) BEFORE touching the buffer.
+      (when (> (secured-loan-handle-return-count handle) 1)
+        (decf (secured-loan-handle-return-count handle))
+        (return-from %secured-loan-release t))
       ;; T5d review Minor #1: this REG-INDEX>=0 gate is the PRIMARY dup-guard (a dedup duplicate's fresh handle is unregistered -> reg-index<0 -> filtered here, before any store touch); the eq identity-guard below is now redundant belt-and-suspenders.
       (let ((inner (gethash (secured-loan-handle-guid handle) (disc-node-samples node))))
         (when (and inner (eq (gethash (secured-loan-handle-sn handle) inner) handle))   ; identity-guard: a deduped duplicate must NOT evict the original occupant (silent loss + pinned slot)
@@ -2594,6 +2637,10 @@
                (loop with v = (disc-node-secured-loan-vec node)
                      for i below (disc-node-secured-loan-count node)
                      collect (svref v i))))
+    ;; WP-N-ENDPOINT-2C3: teardown = no reader will drain/return again, so force the FULL release of every still-
+    ;; registered handle (reset the shared-return counter to 1) — an un-drained multi-reader handle must not stay
+    ;; deferred past teardown (its pooled buffer would leak outside the pool slots before teardown-arena).
+    (when (secured-loan-handle-p h) (setf (secured-loan-handle-return-count h) 1))
     (%secured-loan-release node h))
   t)
 
@@ -2795,7 +2842,12 @@
          (%record-sample-key-hash node guid sn key-hash)
          (when (plusp (hash-table-count (disc-node-decode-fail-counts node)))   ; ADR 0031 lim.1: gated -> steady-state (no failures) keeps the zero-alloc secured arm untouched
            (%decode-fail-clear node guid sn))
-         (when loan (%secured-loan-register node loan)))   ; T5b/T5d: register the loan in the fixed registry vector (receiver registers; app return-loan releases)
+         (when loan
+           ;; WP-N-ENDPOINT-2C3 (ADR 0048): all K readers matched to this writer (ROUTES) drain THIS one stored
+           ;; handle and each returns it once — record K so %secured-loan-release purges the store slot + frees the
+           ;; buffer only on the LAST return (no early-return sample-loss). K=1 (N=1) -> immediate purge, byte-identical.
+           (setf (secured-loan-handle-return-count loan) (max 1 (length routes)))
+           (%secured-loan-register node loan)))   ; T5b/T5d: register the loan in the fixed registry vector (receiver registers; app return-loan releases)
        (when (disc-node-on-sample node) (funcall (disc-node-on-sample node))))
       ;; T5b: a deduped DUPLICATE on the loan path -> release the unused pooled buffer (no store, no leak)
       (loan (%secured-loan-release node loan))))
@@ -3672,8 +3724,9 @@
    route, re-announce re-adds it — no dropped own-samples). WP-N-ENDPOINT-S4: (4) a 2nd SECURED reader and (4b) a
    2nd ZC-loan-capable reader on DIFFERENT topics now REGISTER (the secured/ZC fence is LIFTED — 2 distinct
    EntityIds). WP-N-ENDPOINT-2C1: (4c) a 2nd NON-loan SAME-topic reader now REGISTERS and ROUTE-ADD-ALL routes BOTH
-   reader-ids to their common writer's GUID (pre-2c1 only the first matched — the RED); (4d) a 2nd SAME-topic
-   LOAN-CAPABLE reader STILL fail-fasts (the ADR-0017 refcount-per-reader UAF is Slice 2c-3)."
+   reader-ids to their common writer's GUID (pre-2c1 only the first matched — the RED); WP-N-ENDPOINT-2C3: (4d) a
+   2nd SAME-topic LOAN-CAPABLE reader now REGISTERS with a distinct EntityId (the LAST same-topic fence is lifted;
+   the ADR-0017 refcount-per-reader UAF is closed at its site, not fenced)."
   (let* ((pp (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(7 7 7 7 7 7 7 7 7 7 7 7)))
          (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(8 8 8 8 8 8 8 8 8 8 8 8)))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(9 9 9 9 9 9 9 9 9 9 9 9)))
@@ -3785,13 +3838,19 @@
                     (assert (node-reader-matches-writer-p rn r1 wg) () "reader-1 must be route-added to the same-topic writer")
                     (assert (node-reader-matches-writer-p rn r2 wg) () "reader-2 must ALSO be route-added to the same-topic writer (route-add-all — the RED: pre-2c1 only the first matched)"))
                (stop-node rn) (stop-node wn)))
-           ;; (4d) RETAINED FENCE: a 2nd SAME-topic LOAN-CAPABLE reader STILL fail-fasts (ADR-0017 refcount-per-reader UAF = Slice 2c-3)
+           ;; (4d) WP-N-ENDPOINT-2C3: the LAST same-topic fence is LIFTED — a 2nd SAME-topic LOAN-CAPABLE reader now
+           ;; REGISTERS with a DISTINCT EntityId (mirrors how S4 flipped 4/4b and 2c-1 flipped 4c). The ADR-0017
+           ;; cross-reader UAF is closed at its site (demux bump + joiner freeze + secured purge-defer), not fenced.
            (let ((tn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
              (unwind-protect
                   (progn (add-local-reader tn :topic "SAME" :type "X") (enable-subscriber tn)
                          (set-zc-loan-capable tn t)   ; mark the node loan-capable (ZC) BEFORE the 2nd same-topic add
-                         (assert (null (ignore-errors (add-local-reader tn :topic "SAME" :type "X") t)) ()
-                                 "a 2nd SAME-topic LOAN-CAPABLE reader must STILL fail-fast (same-topic loan-capable = Slice 2c-3)"))
+                         (let ((ta (disc-node-user-reader-id tn)))
+                           (assert (ignore-errors (add-local-reader tn :topic "SAME" :type "X") t) ()
+                                   "a 2nd SAME-topic LOAN-CAPABLE reader must now REGISTER (WP-N-ENDPOINT-2C3, fence lifted)")
+                           (enable-subscriber tn)
+                           (assert (/= ta (disc-node-user-reader-id tn)) ()
+                                   "the 2 same-topic loan-capable readers must get distinct EntityIds (2c-3)")))
                (stop-node tn)))
            t)
       (stop-node sub) (stop-node puba) (stop-node pubb))))
@@ -3938,6 +3997,168 @@
                        "S4 ZC GATE: reader-B's marker must be delivered to reader-B (its OWN dedup) and stored — RED if routed to the primary (reader-A's dedup would reject the shared logical-origin as a duplicate)")))
            t)
       (stop-node zn))))
+
+(defun* run-n-reader-2c3-zc-uaf-test ()
+    (function () (eql t))
+  "WP-N-ENDPOINT-2C3 (ADR 0017/0048; MEMORY-SAFETY): the same-topic ZC cross-reader use-after-free contract + the
+   generation-guard stale-acquire no-op. Model-level (no wire, no SHMEM — a LOCAL static pool), opt-in via
+   set-zc-loan-capable. ONE participant, TWO same-topic ZC-loan-capable readers (distinct EntityIds) both routed to
+   ONE source writer; the writer %zc-loans a 1-slot pool for readers=1 (refcount 1). Delivering the marker must
+   DEMUX-BUMP the slot to refcount K=2 (the (K-1) bump) BEFORE it is drainable. Then, driving the EXACT pool
+   primitives %drain-one-loan / return-loan funcall — %zc-acquire-for-read (NO increment) and %zc-release:
+     (1) reader-A returns (2->1) and the slot is STILL held (NOT reclaimable — a writer re-loan finds no free slot),
+     (2) reader-B STILL reads its CORRECT bytes off its live view (the UAF RED: pre-fix no bump -> A's return frees
+         the slot -> a writer re-loan recycles it -> reader-B reads a DIFFERENT sample's bytes),
+     (3) reader-B returns (1->0) and only THEN is the slot reclaimable (frees at the true 0, after ALL K holders),
+     (4) GENERATION-GUARD: after force-reclaim (a re-loan bumps the generation), reader-B's stale acquire/release at
+         the OLD generation is a validated no-op (NIL) — never a decrement of the reused slot.
+   SBCL-only: the ZC refcount primitives are cas-sap-u32 (SBCL PAL; NFR-PORT ZC gap on Clasp, ADR 0013). NOT cleared
+   for ship — pending counsel (R6)."
+  (if (not (eq (dds.pal:pal-impl-name) :sbcl))
+      (progn (format t "~&  [skip] n-reader-2c3-zc-uaf: %zc-bump/%zc-release use cas-sap-u32 (SBCL-only, ADR 0018) — NFR-PORT gap~%") t)
+      (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 1 64)))
+            (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x5C))
+            (payload (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(#xC1 #xC2 #xC3 #xC4 #xC5 #xC6 #xC7 #xC8)))
+            (other (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(#x11 #x22 #x33 #x44 #x55 #x66 #x77 #x88)))
+            (zn (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x5D)
+                                :host "127.0.0.1" :port 0)))
+        (unwind-protect
+             (let ((sap (dds.pal:static-pointer m)))
+               (flet ((rc (slot) (dds.pal:load-sap-u32 sap (+ (dds.xport.zerocopy::%zc-slot-off sap slot)
+                                                              dds.xport.zerocopy::+zc-slot-off-refcount+))))
+                 (dds.xport.zerocopy::%zc-init sap 1 64)
+                 (set-zc-loan-capable zn t)
+                 (add-local-reader zn :topic "Z2C3" :type "X") (enable-subscriber zn)
+                 (let ((ida (disc-node-user-reader-id zn)))
+                   (add-local-reader zn :topic "Z2C3" :type "X") (enable-subscriber zn)
+                   (let ((idb (disc-node-user-reader-id zn))
+                         (gw (%source-guid pa #x00000102)))
+                     (assert (/= ida idb) () "2c-3: the 2 same-topic ZC readers must get distinct EntityIds")
+                     (%reader-route-add zn gw ida) (%reader-route-add zn gw idb)
+                     (multiple-value-bind (slot gen) (dds.xport.zerocopy::%zc-loan sap payload 0 (length payload) 1)
+                       (assert (and slot (= 1 (rc slot))) () "2c-3: the writer loan must set refcount 1 (the per-participant preset)")
+                       (let ((marker (%make-zc-loan-marker :pool-sap sap :slot-index slot :generation gen :len 64)))
+                         (%deliver-user-marker zn #x00000102 1 marker pa gw 1)
+                         (assert (= 2 (rc slot)) ()
+                                 "2c-3 CORE: the demux must bump the shared slot to refcount K=2 (RED: without the (K-1) bump it stays 1 -> A's return frees B's view)")
+                         (assert (eq marker (node-sample zn (cons gw 1))) () "2c-3: the marker must be stored under the source GUID")
+                         (assert (zerop (dds.xport.zerocopy::%zc-free-count sap)) () "2c-3: with refcount 2 the slot must NOT be reclaimable")
+                         (multiple-value-bind (sa2 sla ga la ba) (dds.xport.zerocopy::%zc-acquire-for-read sap slot gen)
+                           (declare (ignore sla ga la))
+                           (assert sa2 () "2c-3: reader-A must acquire the slot for read (no refcount increment)")
+                           (assert (loop for i below (length payload) always (= (dds.pal:load-sap-u8 sap (+ ba i)) (aref payload i)))
+                                   () "2c-3: reader-A must read the CORRECT payload bytes"))
+                         (dds.xport.zerocopy::%zc-release sap slot gen)   ; reader-A return-loan
+                         (assert (= 1 (rc slot)) () "2c-3 INVARIANT: after reader-A returns, refcount must be 1 (reader-B still holds)")
+                         (assert (zerop (dds.xport.zerocopy::%zc-free-count sap)) ()
+                                 "2c-3 INVARIANT: reader-A's return must NOT free the slot reader-B still views")
+                         (multiple-value-bind (rs rg) (dds.xport.zerocopy::%zc-loan sap other 0 (length other) 1)
+                           (declare (ignore rg))
+                           (assert (null rs) () "2c-3 UAF-SAFETY: while reader-B holds, a writer re-loan must NOT reclaim the slot (no premature recycle)"))
+                         (multiple-value-bind (sb2 slb gb lb bb) (dds.xport.zerocopy::%zc-acquire-for-read sap slot gen)
+                           (declare (ignore slb gb lb))
+                           (assert sb2 () "2c-3: reader-B's view must still be valid (generation stable while held)")
+                           (assert (loop for i below (length payload) always (= (dds.pal:load-sap-u8 sap (+ bb i)) (aref payload i)))
+                                   () "2c-3 UAF RED->GREEN: reader-B must read the CORRECT bytes, not a recycled sample"))
+                         (dds.xport.zerocopy::%zc-release sap slot gen)   ; reader-B return-loan (1->0)
+                         (assert (= 0 (rc slot)) () "2c-3: after BOTH readers return, refcount must be 0")
+                         (assert (= 1 (dds.xport.zerocopy::%zc-free-count sap)) ()
+                                 "2c-3: the slot frees only at the true 0 (after ALL K holders return)")
+                         (multiple-value-bind (rs2 rg2) (dds.xport.zerocopy::%zc-loan sap other 0 (length other) 1)
+                           (assert (and rs2 (/= rg2 gen)) () "2c-3: the writer re-loan must reclaim the freed slot with a bumped generation")
+                           (assert (null (dds.xport.zerocopy::%zc-acquire-for-read sap slot gen)) ()
+                                   "2c-3 GEN-GUARD: a stale acquire at the OLD generation must be a validated no-op (NIL)")
+                           (assert (null (dds.xport.zerocopy::%zc-release sap slot gen)) ()
+                                   "2c-3 GEN-GUARD: a stale release at the OLD generation must be a validated no-op (NIL, never a decrement of the reused slot)")
+                           (assert (= 1 (rc slot)) () "2c-3 GEN-GUARD: the reused slot's refcount must be untouched by the stale release")
+                           (dds.xport.zerocopy::%zc-release sap slot rg2))))))   ; clean up the re-loan
+                 (dds.xport.zerocopy::%zc-destroy sap))
+               t)
+          (stop-node zn)
+          (dds.pal:free-static m)))))
+
+(defun* run-n-reader-2c3-secured-purge-defer-test ()
+    (function () (eql t))
+  "WP-N-ENDPOINT-2C3 (ADR 0048): the SECURED same-topic store-purge-defer (sample-LOSS fix, not a UAF — the secured
+   path is memory-safe via independent-struct deserialize). Model-level, mirrors run-n-reader-s4-decode-tier-test (d)
+   but on ONE shared (guid,sn) handle drained by K=2 co-located same-topic secured readers (return-count 2). Reader-A's
+   early return-loan must NOT purge (guid,sn) nor free the pooled buffer (a not-yet-drained reader-B would otherwise
+   LOSE the sample); only reader-B's return (the LAST, count -> 0) purges the store slot + frees the buffer. Clasp
+   FIRST (no cas — pool-acquire/release only)."
+  (let ((zn (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x5E)
+                            :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (enable-subscriber zn)
+           (set-secured-loan-capable zn t)
+           (let ((pool (%ensure-secured-decode-pool zn)))
+             (when pool
+               (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xC0)))
+                 (multiple-value-bind (buf h)
+                     (dds.pal:with-lock ((disc-node-decode-pool-lock zn))
+                       (values (dds.core.arena:pool-acquire pool) (%secured-handle-acquire zn)))
+                   (%secured-handle-fill h buf 4 g 1)
+                   (setf (secured-loan-handle-return-count h) 2)   ; K=2 co-located same-topic secured readers share this handle
+                   (dds.pal:with-lock ((disc-node-lock zn))
+                     (setf (gethash 1 (%inner-table (disc-node-samples zn) g)) h)
+                     (%secured-loan-register zn h))
+                   (node-return-loan zn h)   ; reader-A returns FIRST -> must DEFER (count 2->1)
+                   (assert (secured-loan-handle-buffer h) () "2c-3 secured: reader-A's early return must NOT free the shared buffer (defer)")
+                   (assert (>= (secured-loan-handle-reg-index h) 0) () "2c-3 secured: the handle must stay REGISTERED after reader-A's return")
+                   (assert (eq h (node-sample zn (cons g 1))) ()
+                           "2c-3 secured GATE: (guid,sn) must SURVIVE reader-A's return so reader-B still finds its sample (RED: pre-fix A's return purged it -> B sample-loss)")
+                   (assert (= 1 (secured-loan-handle-return-count h)) () "2c-3 secured: the shared-return counter must decrement to 1")
+                   (node-return-loan zn h)   ; reader-B returns LAST (count 1->0) -> purge + free
+                   (assert (null (secured-loan-handle-buffer h)) () "2c-3 secured: reader-B's return (the last) must free the buffer")
+                   (assert (null (node-sample zn (cons g 1))) () "2c-3 secured: (guid,sn) must be purged only after ALL K readers return"))))))
+      (stop-node zn)))
+  t)
+
+(defun* run-n-reader-2c3-watermark-purge-test ()
+    (function () (eql t))
+  "WP-N-ENDPOINT-2C3 (ADR 0048/0017): the ZC-joiner high-water is PURGED on unmatch/lease-expiry (alongside the
+   reader-route purge, same node-lock section) and RE-FROZEN on re-match — no unbounded growth, no lease-flap
+   stale-gate sample-loss. Model-level (both impls; no cas, no pool — watermark arithmetic + route/purge). ONE node,
+   TWO same-topic ZC-loan-capable readers. A routed first (empty route -> NOT frozen); 3 markers stored; B joins ->
+   frozen to the max stored SN (3). A participant lease-expiry purges the route AND the watermarks (by prefix). Then
+   a re-announce where the JOINER B re-matches FIRST (empty route -> not frozen): its watermark must be 0 (drains
+   from SN 1), NOT the stale 3. RED (pre-purge): B's stale watermark 3 persists -> B (re-matched first, hence never
+   re-frozen) skips SN 1-3 = bounded sample-loss; and the watermarks table would keep the stale entry (growth). Also
+   asserts the table is PRUNED to 0 entries on purge."
+  (let ((zn (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x5F)
+                            :host "127.0.0.1" :port 0))
+        (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x77)))
+    (unwind-protect
+         (let ((gw (%source-guid pa #x00000102)))
+           (set-zc-loan-capable zn t)
+           (add-local-reader zn :topic "Z2C3P" :type "X") (enable-subscriber zn)
+           (let ((ida (disc-node-user-reader-id zn)))
+             (add-local-reader zn :topic "Z2C3P" :type "X") (enable-subscriber zn)
+             (let ((idb (disc-node-user-reader-id zn)))
+               (assert (/= ida idb) () "2c-3 purge: the 2 same-topic ZC readers must get distinct EntityIds")
+               (%reader-route-add zn gw ida)   ; A first: empty route -> NOT frozen
+               (assert (= 0 (node-reader-join-watermark zn ida gw)) () "2c-3 purge: the first reader (empty route) must NOT be frozen")
+               (dotimes (i 3)   ; store 3 markers for W (route=[A], K=1)
+                 (%deliver-user-marker zn #x00000102 (1+ i) (%make-zc-loan-marker :slot-index (1+ i)) pa gw (1+ i)))
+               (%reader-route-add zn gw idb)   ; B joins: route non-empty -> frozen to max-stored (3)
+               (assert (= 3 (node-reader-join-watermark zn idb gw)) () "2c-3 purge: the joiner must be frozen to the max stored SN (3)")
+               ;; lease-expiry: purge the route + the watermarks (by prefix) under the node lock (as %lease-sweep does)
+               (dds.pal:with-lock ((disc-node-lock zn))
+                 (%purge-prefix zn pa #'disc-node-reader-routes)
+                 (%purge-reader-join-watermarks zn pa))
+               (assert (= 0 (node-reader-join-watermark zn idb gw)) () "2c-3 purge: the watermark must be PURGED on unmatch/lease-expiry (0)")
+               (assert (not (node-reader-matches-writer-p zn idb gw)) () "2c-3 purge: the route must be purged too")
+               (assert (zerop (hash-table-count (disc-node-reader-join-watermarks zn))) ()
+                       "2c-3 purge: the watermarks table must be PRUNED (no stale-entry accumulation / growth)")
+               ;; re-announce with B re-matching FIRST (empty route -> B NOT frozen -> watermark stays the purged 0)
+               (%reader-route-add zn gw idb)
+               (assert (= 0 (node-reader-join-watermark zn idb gw)) ()
+                       "2c-3 purge GATE: after purge, the joiner re-matching FIRST must NOT carry a stale watermark (0 -> drains from SN 1; RED pre-purge: stale 3 -> skips SN 1-3 = sample-loss)")
+               (%reader-route-add zn gw ida)   ; A re-joins: route non-empty -> re-frozen to the current max stored SN
+               (assert (= 3 (node-reader-join-watermark zn ida gw)) ()
+                       "2c-3 purge: a subsequent joiner is RE-FROZEN to the current max stored SN (re-match re-establishes correct gating)"))))
+      (stop-node zn)))
+  t)
 
 (defun* run-dispose-dataplane-test ()
     (function () (eql t))

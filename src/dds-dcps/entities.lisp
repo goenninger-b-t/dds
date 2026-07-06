@@ -631,6 +631,10 @@
       ;; WP-N-ENDPOINT-S2 (ADR 0048): capture THIS reader's distinct EntityId (add-local-reader set it, enable-
       ;; subscriber registered the engine reader under it) so %drain's source-GUID filter routes delivery per reader.
       (setf (dr-entity-id dr) (dds.disc:disc-node-user-reader-id node))
+      ;; WP-N-ENDPOINT-2C3 (ADR 0017/0048): the mid-stream ZC-joiner high-water is frozen at MATCH time (atomic
+      ;; with %reader-route-add under the node lock), NOT here at registration — a registration-time freeze leaves
+      ;; the [freeze,route-add] window open (a marker delivered in the gap is unbumped for this reader yet would be
+      ;; drained+released = UAF). See disc.lisp %reader-route-add + node-reader-join-watermark.
       (push dr (sub-readers sub))
       dr)))
 
@@ -1815,7 +1819,14 @@
                          (and (or (not multi)
                                   (and g (dds.disc:node-reader-matches-writer-p node rid g)))
                               (or (null g)
-                                  (> (dds.disc:node-sample-key-sn key) (gethash g (dr-drained dr) 0))))))
+                                  ;; WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): gate on max(per-writer
+                                  ;; dr-drained, the ZC-joiner match-time high-water) so a mid-stream ZC joiner
+                                  ;; NEVER drains a marker delivered before it joined (whose demux %zc-bump did not
+                                  ;; count it -> its %zc-release would underflow the refcount = cross-reader UAF).
+                                  ;; The watermark is 0 for the first reader / non-loan nodes -> byte-identical.
+                                  (> (dds.disc:node-sample-key-sn key)
+                                     (max (gethash g (dr-drained dr) 0)
+                                          (dds.disc:node-reader-join-watermark node rid g)))))))
                      (dds.disc:node-sample-sns node)))
          (life-keys (remove-if-not
                      (lambda (key)

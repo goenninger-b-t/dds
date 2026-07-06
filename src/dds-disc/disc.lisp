@@ -185,6 +185,7 @@
   (user-writer-key-next 1 :type (integer 1)) ; WP-N-ENDPOINT-S1 (ADR 0048): next distinct per-participant USER-writer entity KEY; starts 1 so the first writer keeps EntityId #x0102/#x0103 (byte-identical), each subsequent DataWriter gets a distinct key -> distinct EntityId + SEDP GUID (RTPS 2.5 §9.3.1.2). Builtin/secure keys are untouched.
   (user-reader-key-next 1 :type (integer 1)) ; WP-N-ENDPOINT-S2 (ADR 0048): next distinct per-participant USER-reader entity KEY; starts 1 so the first reader keeps EntityId #x0107/#x0104 (byte-identical), each subsequent DataReader gets a distinct key -> distinct EntityId + SEDP GUID (RTPS 2.5 §9.3.1.2). Writer/reader keys are SEPARATE counters (kind 0x02/0x03 vs 0x07/0x04 disjoints them); builtin/secure keys are untouched.
   (reader-routes (make-hash-table :test 'equalp) :type hash-table) ; WP-N-ENDPOINT-S2 (ADR 0048): the DELIVERY ROUTE — remote-writer 16-octet GUID (equalp) -> list of local user-reader EntityIds matched to it. Populated at %match-remote-endpoint (idempotent), purged on unmatch/lease-expiry (by prefix) + re-added on re-announce. The %drain source-GUID filter (each reader deserializes ONLY its matched writers) and the receive-hook demux (drive/ACKNACK the engine reader matched to the source writer, not unconditionally the primary) read it. Node-lock guarded.
+  (reader-join-watermarks (make-hash-table :test 'eql) :type hash-table) ; WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): the mid-stream ZC-joiner high-water. local user-reader EntityId (eql) -> hash(remote-writer 16-octet GUID equalp -> highest stored SN AT THE MOMENT this reader was route-added to that writer). Set ATOMICALLY with %reader-route-add (same node-lock section) ONLY for a JOINER (the writer's route was already non-empty) on a ZC-loan-capable node. %drain consults max(dr-drained, this) so a joiner NEVER drains a marker delivered before it joined (a marker whose demux %zc-bump did not count it -> would be a cross-reader use-after-free). Empty for the first reader / non-loan nodes (byte-identical). Node-lock guarded.
   ;; FR-XPORT-2 SHMEM intra-host data plane (same-host user DATA only; discovery/HB/ACKNACK stay UDP)
   (shmem nil :type t)                     ; this node's shmem-transport (NIL = SHMEM off: *shmem-enabled* nil or pkg absent)
   (host-uuid 0 :type (unsigned-byte 64))  ; u64 host id (MD5 of hostname); a remote with the SAME uuid is same-host
@@ -618,19 +619,6 @@
     (setf (disc-node-user-reader-key-next node) (1+ k))
     k))
 
-(defun* %node-secured-or-zc-reader-p (node)
-    (function (disc-node) boolean)
-  "T iff NODE is SECURED-loan-capable OR ZC-loan-capable on the receive side (WP-N-ENDPOINT-S2, ADR 0048) — the
-   node either DECODES a SecuredPayload on receive (node-secured-reader-p / an already-armed secured-loan-capable
-   pool) OR resolves a zero-copy loan (zc-loan-capable). Gated the S2/S3 second-loan-capable-reader fail-fast; that
-   fence is LIFTED in S4 (different-topic loan-capable readers share no slot). WP-N-ENDPOINT-2C1: this predicate is
-   now the SOLE surviving same-topic fence in add-local-reader — a 2nd SAME-topic NON-loan reader registers
-   (route-add-all), but a 2nd SAME-topic LOAN-CAPABLE reader (this returns T) still FAIL-FASTS, deferring the ADR
-   0017 refcount-per-reader use-after-free on a shared loan/decode slot to Slice 2c-3."
-  (or (node-secured-reader-p node)
-      (disc-node-secured-loan-capable node)
-      (and (disc-node-zc-loan-capable node) t)))
-
 (defun* %register-user-reader (node entity-id reader)
     (function (disc-node (unsigned-byte 32) dds.rtps.reliable:rtps-reader) dds.rtps.reliable:rtps-reader)
   "Register READER under ENTITY-ID in NODE's user-reader registry (WP-N-ENDPOINT-S2, ADR 0048); the first
@@ -662,13 +650,51 @@
    (first) reader = the LAST-added. A same-topic reader joining MID-STREAM thus becomes canonical with an EMPTY
    reliable proxy -> a transient full-history re-NACK/retransmit over the shared store until it catches up (bounded,
    NO data loss — the per-reader dr-drained dedup absorbs the replay). Different-topic / N=1 routes hold a single id
-   (byte-identical). Making canonicity the FIRST-joined reader (append) is a tracked 2c follow-on."
+   (byte-identical). Making canonicity the FIRST-joined reader (append) is a tracked 2c follow-on.
+   WP-N-ENDPOINT-2C3 (ADR 0048/0017; MEMORY-SAFETY): the MATCH-TIME ZC-joiner high-water freeze. When this is a
+   JOINER (the writer's route is ALREADY non-empty) on a ZC-loan-capable node, ATOMICALLY — in the SAME node-lock
+   section as the route-add — freeze this reader's join-watermark for this writer to the CURRENT max stored SN. Read
+   BEFORE the id is consed so it reflects the pre-join state. This is the load-bearing atomicity: because the marker
+   demux ({route-snapshot -> %zc-bump(K-1) -> store} in %deliver-user-marker) runs under the SAME node lock, the two
+   critical sections serialize — every marker STORED before this route-add is <= the frozen watermark (the joiner
+   skips it, and it was never bumped for this reader) and every marker STORED after has this reader in its route
+   snapshot (so it was bumped for it). Closes the [freeze,route-add] window that a registration-time freeze left
+   open (a marker delivered in the gap, unbumped, would be drained+released by the joiner -> premature free while a
+   sibling still views = UAF). The FIRST reader (empty route) is NOT frozen (drains from SN 1, byte-identical)."
   (dds.pal:with-lock ((disc-node-lock node))
     (let* ((key (copy-seq writer-guid))
            (ids (gethash key (disc-node-reader-routes node))))
       (unless (member reader-entity-id ids :test #'eql)
+        (when (and ids (disc-node-zc-loan-capable node))   ; JOINER (route already non-empty) on a ZC-loan-capable node -> freeze its ZC high-water NOW, atomic with the route-add
+          (setf (gethash writer-guid
+                         (or (gethash reader-entity-id (disc-node-reader-join-watermarks node))
+                             (setf (gethash reader-entity-id (disc-node-reader-join-watermarks node))
+                                   (make-hash-table :test 'equalp))))
+                (%node-max-stored-sn node writer-guid)))
         (setf (gethash key (disc-node-reader-routes node)) (cons reader-entity-id ids)))))
   t)
+
+(defun* %node-max-stored-sn (node writer-guid)
+    (function (disc-node (simple-array (unsigned-byte 8) (16))) integer)
+  "WP-N-ENDPOINT-2C3 (ADR 0048): the highest RTPS SN currently stored for source writer WRITER-GUID (0 if none).
+   CALLER HOLDS THE NODE LOCK (read against the live store, atomic with %reader-route-add's freeze). The store's
+   inner per-writer SN map is keyed by SN, so this is a max over its keys — bounded by the matched-writer history,
+   not by sample count."
+  (let ((inner (gethash writer-guid (disc-node-samples node)))
+        (m 0))
+    (when inner (loop for sn being the hash-keys of inner do (when (> sn m) (setf m sn))))
+    m))
+
+(defun* node-reader-join-watermark (node reader-entity-id writer-guid)
+    (function (disc-node (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) integer)
+  "WP-N-ENDPOINT-2C3 (ADR 0048/0017): the ZC-joiner high-water for local reader READER-ENTITY-ID against remote
+   writer WRITER-GUID — the max stored SN at the moment this reader was route-added to that writer (0 if this reader
+   is not a frozen joiner for it). %drain gates a stored marker for this reader on max(dr-drained, this), so a
+   mid-stream ZC joiner never drains a marker delivered before it joined (whose demux %zc-bump did not count it).
+   Node-lock guarded."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((inner (gethash reader-entity-id (disc-node-reader-join-watermarks node))))
+      (if inner (gethash writer-guid inner 0) 0))))
 
 (defun* node-user-reader-count (node)
     (function (disc-node) (integer 0))
@@ -1106,17 +1132,13 @@
    participant now REGISTERS (fence A lifted for the non-loan case). %match-remote-endpoint route-adds ALL matching
    local readers per remote-writer GUID (route-add-all — the source-GUID route holds a LIST), so BOTH same-topic
    readers are routed and each drains W's full stream over its OWN per-reader dr-drained high-water (no cross-
-   consumption). Two DIFFERENT-topic readers still each match their own writer (distinct GUIDs). RETAINED FENCE:
-   a 2nd SAME-topic reader that is LOAN-CAPABLE (%node-secured-or-zc-reader-p — secured-decode or zero-copy) still
-   FAIL-FASTS — the ADR-0017 refcount-per-reader use-after-free on a shared loan/decode slot is Slice 2c-3."
-  (when (and (find topic (disc-node-local-readers node)
-                   :key #'dds.rtps.discovery:endpoint-data-topic-name :test #'string=)
-             (%node-secured-or-zc-reader-p node))
-    (error "disc-node: refusing a 2nd LOAN-CAPABLE local user DataReader on topic ~s — same-topic loan-capable ~
-            (secured-decode / zero-copy) multi-reader is Slice 2c-3 (ADR-0017 refcount-per-reader use-after-free ~
-            on a shared loan/decode slot); the NON-loan same-topic case IS supported (Slice 2c-1: route-add-all + ~
-            per-reader dr-drained fan-out). Use distinct topics or separate participants for the loan-capable reader."
-           topic))
+   consumption). Two DIFFERENT-topic readers still each match their own writer (distinct GUIDs).
+   WP-N-ENDPOINT-2C3 (ADR 0017/0048): the LAST same-topic fence is LIFTED — a 2nd SAME-topic LOAN-CAPABLE
+   (secured-decode / zero-copy) reader now REGISTERS with a distinct EntityId. The ADR-0017 cross-reader
+   use-after-free is closed at its true site: the ZC demux-time refcount bump (%deliver-user-marker counts all K
+   co-located holders before any drain/release), the mid-stream-joiner ZC high-water freeze (create-datareader), and
+   the secured store-purge-defer (%secured-loan-release, purge only after all K readers return). This whole
+   participant-with-N-same-topic-loan-capable-readers case is now correct in full generality."
   (let* ((key (or key (%alloc-user-reader-key node)))
          (kind (if keyed #x07 #x04))
          (ep (dds.rtps.discovery:make-endpoint-data
@@ -1460,6 +1482,30 @@
   (dotimes (i 12 t)
     (unless (= (aref guid i) (aref prefix i)) (return nil))))
 
+(defun* %purge-reader-join-watermarks (node prefix)
+    (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
+  "WP-N-ENDPOINT-2C3 (ADR 0048/0017): drop every ZC-joiner high-water whose remote writer GUID prefix equals PREFIX
+   (a lost / lease-expired participant), across EVERY local reader's inner table, and prune a now-empty inner table.
+   CALLER HOLDS the node lock. Mirrors the reader-routes purge (%purge-prefix) but reader-join-watermarks is keyed
+   by the LOCAL reader EntityId at the outer level and the remote writer GUID at the INNER level, so the prefix match
+   is on the inner keys. Correct (never a UAF): the watermark only ever RAISES the drain-gate, so a stale entry can
+   at worst make a reader SKIP a marker it should get (bounded sample-loss); purging it on unmatch/lease-expiry both
+   (a) bounds the table (per-(reader,writer) entries stop accumulating as entity-ids advance) and (b) lets a
+   same-GUID re-announce RE-FREEZE the watermark to the current max stored SN via the match-time %reader-route-add
+   freeze — restoring correct gating with no stale-gate loss."
+  (let ((outer (disc-node-reader-join-watermarks node)) (dead-readers '()))
+    (maphash (lambda (rid inner)
+               (let ((dead '()))
+                 (maphash (lambda (guid sn)
+                            (declare (ignore sn))
+                            (when (%guid-prefix-match-p guid prefix) (push guid dead)))
+                          inner)
+                 (dolist (g dead) (remhash g inner))
+                 (when (zerop (hash-table-count inner)) (push rid dead-readers))))
+             outer)
+    (dolist (rid dead-readers) (remhash rid outer)))
+  t)
+
 (defun* %collect-and-remove-matches (node prefix removed-place)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) function) t)
   "Remove every match whose remote GUID prefix equals PREFIX, classify its direction
@@ -1515,6 +1561,8 @@
           (%purge-prefix node prefix #'disc-node-discovered-writers)
           (%purge-prefix node prefix #'disc-node-discovered-readers)
           (%purge-prefix node prefix #'disc-node-reader-routes)   ; WP-N-ENDPOINT-S2 (ADR 0048): drop the lost writer's delivery route (unmatch/lease-expiry) so a reader stops draining a gone writer; a re-announce re-adds it
+          (%purge-reader-join-watermarks node prefix)   ; WP-N-ENDPOINT-2C3 (ADR 0048): drop the lost writer's ZC-joiner high-waters alongside the route (bounds the table; a re-announce re-freezes the watermark via the match-time route-add so a lease-flap never leaves a stale drain-gate = sample-loss)
+
           (%purge-prefix node prefix #'disc-node-decode-fail-counts)   ; ADR 0031 lim.1: drop the lost writer's decode-failure counters
           (%collect-and-remove-matches node prefix
                                        (lambda (dm) (push dm removed)))

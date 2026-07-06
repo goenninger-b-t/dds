@@ -256,15 +256,26 @@ The **scope-B follow-ups** (deferred) are listed below.
   held, so `%zc-acquire-for-read` could validate the generation **lock-free** (a fenced read instead of taking
   the pool mutex), eliminating the per-sample mutex-cons → a genuinely 0-alloc loaned RX. Deferred: needs a
   careful fenced-read design + a bench.
-- **Multi-loan-capable-reader-per-participant constraint (documented invariant; DIFFERENT-topic case LIFTED by
-  WP-N-ENDPOINT-S4, ADR 0048).** The slot refcount is 1 per destination participant and the `zc-loan-marker` is
-  stored once per source-GUID→SN. Two loan-capable readers **sharing one source-GUID→SN slot** would let the
-  first `return-loan` (`refcount` 1→0) free a slot the second still views (a cross-reader use-after-free).
-  **WP-N-ENDPOINT-S4 supports N loan-capable readers per `disc-node` on DISTINCT topics**: it lifts the
-  secured/ZC-reader fence but KEEPS the same-topic fence, so the two readers always match different remote
-  writers on disjoint source-GUIDs and never share a slot — the UAF precondition is structurally unreachable
-  (and each reader decodes under its own per-reader tier, `%deliver-user-sample`/`%deliver-user-marker` demux by
-  source-GUID). The **same-topic** case (which WOULD share a slot) stays deferred to the later slice that lifts it
-  via refcount-per-reader or per-reader loan markers.
+- **Multi-loan-capable-reader-per-participant — the refcount-per-reader cross-reader UAF — RESOLVED by
+  WP-N-ENDPOINT-2C3 (ADR 0048), both DIFFERENT-topic (S4) and SAME-topic (2c-3).** The slot refcount is 1 per
+  destination participant (`%zc-ref-builder`) and the `zc-loan-marker` is stored once per source-GUID→SN. Two
+  same-topic loan-capable readers co-located on one `disc-node` BOTH drain that one stored marker (the never-purged
+  store + per-reader `dr-drained` fan-out), so the writer's preset `refcount` 1 covered only reader #1 and reader-A's
+  first `return-loan` (`refcount` 1→0) would free a slot reader-B still views (a cross-reader use-after-free).
+  **WP-N-ENDPOINT-2C3 closes it at the true site** (the same-topic fence is LIFTED; N same-topic loan-capable readers
+  are now supported): (1) a **demux-time `%zc-bump` by (K−1)** in `%deliver-user-marker` raises the slot hold to the
+  co-located reader count K on the receiver thread **before the marker is drainable** — so all K holders are counted
+  before any `%zc-release`, the slot is provably held (generation stable) when the bump runs, and it frees only at
+  the true `refcount` 0 after ALL K readers return; (2) a **mid-stream-joiner ZC high-water freeze at MATCH time**,
+  set ATOMICALLY with `%reader-route-add` under the `disc-node-lock` (a `disc-node`-held per-`(reader,writer)`
+  `reader-join-watermarks`, consulted by `%drain` as `max(dr-drained, watermark)`), so a joiner never drains (hence
+  never `%zc-release`s) a marker whose demux bump did not count it — and because the demux `{route-snapshot, bump,
+  store}` runs under the same lock, the `[freeze,route-add]` window a registration-time freeze would leave open (a
+  gap marker drained unbumped → concurrent-holders premature-free) is closed; (3) the SECURED
+  same-topic sample-loss variant (memory-safe already — independent-struct deserialize) is fixed by a **per-(guid,sn)
+  return-count store-purge-defer** in `%secured-loan-release` (purge + free only on the LAST of K returns). K=1
+  (N=1 / different-topic S4) → no bump, byte-identical. Verified by `run-n-reader-2c3-zc-uaf-test` (the A-return-
+  doesn't-free-B-view contract + generation-guard stale-acquire no-op, SBCL), `run-n-reader-2c3-joiner-window-test`,
+  and `run-n-reader-2c3-secured-purge-defer-test`.
 
 **NOT cleared for ship — pending counsel (R6); see the R6 — PATENT GATE section above.**

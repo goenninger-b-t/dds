@@ -398,6 +398,59 @@
       (dds.dcps:delete-participant pr))
     t))
 
+(defun* run-n-reader-2c3-joiner-window-test ()
+    (function () t)
+  "WP-N-ENDPOINT-2C3 (ADR 0017/0048; MEMORY-SAFETY): the mid-stream-joiner [freeze,route-add] WINDOW gate — the RED
+   a registration-time freeze MISSES. The ZC-joiner high-water is frozen at MATCH time (atomic with %reader-route-add
+   under the node lock), NOT at create-datareader. ONE participant on a FlatData topic with *zerocopy-enabled*.
+   Reader-A created + routed to writer W; a marker SN=1 delivered (route=[A], K=1). Reader-B (the joiner) is CREATED
+   but NOT yet route-added: a registration-time freeze would fix B's watermark to the max stored NOW (1). A marker
+   SN=2 is then delivered with the route STILL [A] (B absent) — the [freeze,route-add] GAP marker: K=1, UNBUMPED. THEN
+   B is route-added, which ATOMICALLY freezes B's join-watermark to the CURRENT max stored SN (2). B drains -> it must
+   SKIP SN 1 AND the unbumped SN=2 (both <= 2). RED (the missed window): a registration-time freeze set B's watermark
+   to 1, so B would drain SN=2 (2 > 1) — the marker whose demux %zc-bump did NOT count B -> B %zc-releases a slot a
+   sibling still views = cross-reader use-after-free. Asserts B is NOT frozen at create (join-watermark 0), IS frozen
+   to 2 at route-add, and drains 0. Both impls (watermark arithmetic — no cas; the joiner never acquires). Model-level
+   (markers injected, no SHMEM). NOT cleared for ship — pending counsel (R6)."
+  (let ((dds.disc:*zerocopy-enabled* t)
+        (dds.disc:*shmem-enabled* nil)
+        (ts (dds.types:find-type-support "fd-abc"))
+        (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Fd2C3W" "fd-abc" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dra (dds.dcps:create-datareader sub tp))
+                (node (dds.dcps::dp-node p))
+                (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x6C))
+                (gw (dds.disc::%source-guid pa #x00000102))
+                (rida (dds.dcps::dr-entity-id dra)))
+           (%check :2c3w-loan-capable (dds.disc:disc-node-zc-loan-capable node)
+                   "the reader must be ZC-loan-capable (FlatData topic + *zerocopy-enabled*)")
+           ;; reader-A first: route-add (route empty -> A is NOT a joiner -> not frozen) then deliver SN=1
+           (dds.disc::%reader-route-add node gw rida)
+           (%check :2c3w-a-not-frozen (= 0 (dds.disc:node-reader-join-watermark node rida gw))
+                   "the FIRST reader (empty route) must NOT be frozen (drains from SN 1, byte-identical)")
+           (dds.disc::%deliver-user-marker node #x00000102 1 (dds.disc::%make-zc-loan-marker :slot-index 1) pa gw 1)
+           ;; JOINER reader-B CREATED but NOT yet route-added
+           (let* ((drb (dds.dcps:create-datareader sub tp))
+                  (ridb (dds.dcps::dr-entity-id drb)))
+             (%check :2c3w-distinct (/= rida ridb)
+                     "the 2nd same-topic loan-capable reader must register with a DISTINCT EntityId (fence lifted, 2c-3)")
+             (%check :2c3w-not-frozen-at-create (= 0 (dds.disc:node-reader-join-watermark node ridb gw))
+                     "reader-B must NOT be frozen at create-datareader (the freeze is at MATCH time, not registration)")
+             ;; the [freeze,route-add] GAP: deliver SN=2 while B is still absent from the route (K=1, UNBUMPED)
+             (dds.disc::%deliver-user-marker node #x00000102 2 (dds.disc::%make-zc-loan-marker :slot-index 2) pa gw 2)
+             (%check :2c3w-stored (= 2 (dds.disc:node-sample-count node)) "both markers (incl. the gap marker SN=2) must be stored")
+             ;; NOW route-add B -> the ATOMIC match-time freeze reads the current max stored SN (2)
+             (dds.disc::%reader-route-add node gw ridb)
+             (%check :2c3w-frozen-at-match (= 2 (dds.disc:node-reader-join-watermark node ridb gw))
+                     "reader-B's join-watermark must be FROZEN to the current max stored SN (2) at route-add — covering the GAP marker SN=2 (RED: a registration-time freeze would have fixed it to 1, letting B drain the unbumped SN=2 = UAF)")
+             (dds.dcps::%drain drb)
+             (%check :2c3w-joiner-skips (null (dds.dcps::dr-cache drb))
+                     "reader-B must DRAIN 0 markers — it skips SN 1 AND the unbumped GAP marker SN=2 (no drain-an-unbumped-marker window)")))
+      (dds.dcps:delete-participant p)))
+  t)
+
 (defun* run-dcps-dispose-test ()
     (function () t)
   "DCPS instance lifecycle S1 (writer side, DDS 1.4 §2.2.2.4.2): on the keyed shape-type a
