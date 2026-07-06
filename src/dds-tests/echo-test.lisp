@@ -4041,6 +4041,7 @@
                  ("security-data-protection-downgrade" . run-security-data-protection-downgrade-test)
                  ("security-metadata-protection-downgrade" . run-security-metadata-protection-downgrade-test)
                  ("security-mixed-kind-reject"   . run-security-mixed-kind-reject-test)
+                 ("security-n-secured-writer"    . run-security-n-secured-writer-test)
                  ("security-dn-match"             . run-security-dn-match-test)
                  ("security-crypto-manager"       . run-security-crypto-manager-test)
                  ("security-session-key-cache"    . run-security-session-key-cache-test))))

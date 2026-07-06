@@ -292,10 +292,11 @@
    REVERSE, data=SIGN + metadata=ENCRYPT, would DOWNGRADE the ENCRYPT-mandated user submessage onto the visible GMAC
    kind. That contradictory mixed-kind governance is now FAIL-CLOSED REJECTED at %install-access-control
    (governance-mixed-nonnone-kind-conflict, create-participant), so it can never reach this derivation; same-kind and
-   any-NONE combos are unaffected. ADR-0040. ADR-0046: the user-endpoint derivation is now PER-ROLE — the
-   user-writer-id's km derives from the WRITER's own kinds (user-writer-{data,submessage}-protection-kind), the
-   user-reader-id's from the READER's own kinds — so a writer and a reader on different-kind topics key independently
-   (the cross-role false-ACCEPT downgrade fix)."
+   any-NONE combos are unaffected. ADR-0040. ADR-0046 / WP-N-ENDPOINT-S3 (ADR 0048): the user-endpoint derivation is
+   now PER-ENDPOINT — each of N local writers/readers derives its km kind from ITS OWN topic's kinds via the disc-node
+   per-endpoint map (dds.disc:%user-endpoint-kinds), so N secured writers on different-kind topics key INDEPENDENTLY
+   (never a shared slot another endpoint could downgrade; the cross-role false-ACCEPT downgrade fix, generalized to N).
+   At N=1 the map falls back to the per-role slots -> byte-identical."
   (flet ((nz (k) (if (eq k :sign) :sign :encrypt)))   ; :none/:encrypt -> :encrypt; :sign -> :sign
     (cond
       ((or (= entity-id dds.rtps.discovery:+entityid-sedp-pub-secure-writer+)
@@ -308,17 +309,15 @@
       ((or (= entity-id dds.rtps.discovery:+entityid-participant-message-secure-writer+)
            (= entity-id dds.rtps.discovery:+entityid-participant-message-secure-reader+))
        (nz (dds.disc:disc-node-secure-pm-protection-kind node)))
-      ((= entity-id (dds.disc:disc-node-user-writer-id node))
-       ;; ADR 0046: the WRITER's km from the WRITER's OWN kinds — payload tier authoritative when engaged, else submessage
-       (if (member (dds.disc:disc-node-user-writer-data-protection-kind node) '(:sign :encrypt))
-           (nz (dds.disc:disc-node-user-writer-data-protection-kind node))
-           (nz (dds.disc:disc-node-user-writer-submessage-protection-kind node))))
-      ((= entity-id (dds.disc:disc-node-user-reader-id node))
-       ;; ADR 0046: the READER's km from the READER's OWN kinds (independent of the writer's tier)
-       (if (member (dds.disc:disc-node-user-reader-data-protection-kind node) '(:sign :encrypt))
-           (nz (dds.disc:disc-node-user-reader-data-protection-kind node))
-           (nz (dds.disc:disc-node-user-reader-submessage-protection-kind node))))
-      (t :encrypt))))
+      (t
+       ;; ADR 0046 + WP-N-ENDPOINT-S3 (ADR 0048): a user endpoint's km from ITS OWN topic's kinds via the PER-ENDPOINT
+       ;; map (each of N writers/readers keyed independently — never a shared slot another endpoint could downgrade);
+       ;; payload tier authoritative when engaged, else the submessage tier. A non-user (unknown) entity -> :encrypt
+       ;; (the pre-S3 t-branch default). %user-endpoint-kinds' 3rd value marks a known local user endpoint.
+       (multiple-value-bind (dk mk userp) (dds.disc:%user-endpoint-kinds node entity-id)
+         (if userp
+             (if (member dk '(:sign :encrypt)) (nz dk) (nz mk))
+             :encrypt))))))
 
 (defun* %secure-sedp-reader-for-writer (writer-entity-id)
     (function ((unsigned-byte 32)) (or null (unsigned-byte 32)))
@@ -457,16 +456,21 @@
    secure-builtin resolvers (cm-encode-entity-km / cm-decode-entity-km-by-key-id) resolve those tiers exactly like
    secure SEDP — no tier-specific resolver. Writers -> +gm-datawriter-crypto-tokens+; readers ->
    +gm-datareader-crypto-tokens+ (DDS-Security 1.1 §9.5.2.2)."
-  (list (cons dds.rtps.discovery:+entityid-sedp-pub-secure-writer+ dds.security:+gm-datawriter-crypto-tokens+)
-        (cons dds.rtps.discovery:+entityid-sedp-pub-secure-reader+ dds.security:+gm-datareader-crypto-tokens+)
-        (cons dds.rtps.discovery:+entityid-sedp-sub-secure-writer+ dds.security:+gm-datawriter-crypto-tokens+)
-        (cons dds.rtps.discovery:+entityid-sedp-sub-secure-reader+ dds.security:+gm-datareader-crypto-tokens+)
-        (cons dds.rtps.discovery:+entityid-participant-message-secure-writer+ dds.security:+gm-datawriter-crypto-tokens+)
-        (cons dds.rtps.discovery:+entityid-participant-message-secure-reader+ dds.security:+gm-datareader-crypto-tokens+)
-        (cons dds.rtps.discovery:+entityid-spdp-secure-writer+ dds.security:+gm-datawriter-crypto-tokens+)
-        (cons dds.rtps.discovery:+entityid-spdp-secure-reader+ dds.security:+gm-datareader-crypto-tokens+)
-        (cons (dds.disc:disc-node-user-writer-id node) dds.security:+gm-datawriter-crypto-tokens+)
-        (cons (dds.disc:disc-node-user-reader-id node) dds.security:+gm-datareader-crypto-tokens+)))
+  ;; WP-N-ENDPOINT-S3 (ADR 0048): the 8 secure builtins, then ALL local user WRITERS (the S0 registry alist KEYS)
+  ;; each paired with +gm-datawriter-crypto-tokens+, then ALL local user READERS with +gm-datareader-crypto-tokens+ —
+  ;; so N secured writers each register + exchange their OWN EntityCrypto (was the two node-single ids). At N=1 this is
+  ;; exactly the pre-S3 pair (one writer, one reader) in the same order -> byte-identical token exchange.
+  (append
+   (list (cons dds.rtps.discovery:+entityid-sedp-pub-secure-writer+ dds.security:+gm-datawriter-crypto-tokens+)
+         (cons dds.rtps.discovery:+entityid-sedp-pub-secure-reader+ dds.security:+gm-datareader-crypto-tokens+)
+         (cons dds.rtps.discovery:+entityid-sedp-sub-secure-writer+ dds.security:+gm-datawriter-crypto-tokens+)
+         (cons dds.rtps.discovery:+entityid-sedp-sub-secure-reader+ dds.security:+gm-datareader-crypto-tokens+)
+         (cons dds.rtps.discovery:+entityid-participant-message-secure-writer+ dds.security:+gm-datawriter-crypto-tokens+)
+         (cons dds.rtps.discovery:+entityid-participant-message-secure-reader+ dds.security:+gm-datareader-crypto-tokens+)
+         (cons dds.rtps.discovery:+entityid-spdp-secure-writer+ dds.security:+gm-datawriter-crypto-tokens+)
+         (cons dds.rtps.discovery:+entityid-spdp-secure-reader+ dds.security:+gm-datareader-crypto-tokens+))
+   (mapcar (lambda (eid) (cons eid dds.security:+gm-datawriter-crypto-tokens+)) (dds.disc:%all-user-writer-ids node))
+   (mapcar (lambda (eid) (cons eid dds.security:+gm-datareader-crypto-tokens+)) (dds.disc:%all-user-reader-ids node))))
 
 (defun* %cm-token-dest-entity-id (node local-eid)
     (function (dds.disc:disc-node (unsigned-byte 32)) (unsigned-byte 32))
@@ -660,8 +664,10 @@
       (dds.disc:resume-parked-matches node)))
   t)
 
-(defun* cm-on-endpoint-match (cm node remote-guid local-is-writer-p)
-    (function (crypto-manager dds.disc:disc-node (simple-array (unsigned-byte 8) (16)) t) (eql t))
+(defun* cm-on-endpoint-match (cm node remote-guid local-is-writer-p &optional matched-local-eid)
+    (function (crypto-manager dds.disc:disc-node (simple-array (unsigned-byte 8) (16)) t
+               &optional (or null (unsigned-byte 32)))
+              (eql t))
   "Re-exchange the USER endpoint's §8.5.2.2/.3 DW/DR CryptoToken at MATCH time, now that the ACTUAL matched-remote
    user-endpoint GUID REMOTE-GUID is known (learned from the secure-SEDP — or plain-SEDP — Discovered{Writer,
    Reader}Data, design §7.2 / DDS-Security 1.1 §7.4.4). LOCAL-IS-WRITER-P selects which local user endpoint
@@ -679,7 +685,10 @@
   (let* ((remote-prefix (subseq remote-guid 0 12))
          (local-prefix  (dds.disc:disc-node-guid-prefix node)))
     (when (cm-decode-participant-km cm remote-prefix)            ; remote keyed (PVMS up) — else fail-closed no-op
-      (let* ((local-eid (if local-is-writer-p (dds.disc:disc-node-user-writer-id node)
+      ;; WP-N-ENDPOINT-S3 (ADR 0048): for a WRITER match use the ACTUAL matched local writer's EntityId (resolved by
+      ;; the matched remote reader's topic, %on-disc-match) so each of N secured writers re-sends its OWN DW token —
+      ;; NIL (unresolved / N=1) falls back to the node-single id (byte-identical). The reader path stays node-single (S4).
+      (let* ((local-eid (if local-is-writer-p (or matched-local-eid (dds.disc:disc-node-user-writer-id node))
                             (dds.disc:disc-node-user-reader-id node)))
              (class     (if local-is-writer-p dds.security:+gm-datawriter-crypto-tokens+
                            dds.security:+gm-datareader-crypto-tokens+))
@@ -691,17 +700,21 @@
             cm class km (%guid-from-prefix local-prefix local-eid) remote-prefix remote-guid))))))
   t)
 
-(defun* %cm-user-token-at-match (p remote-guid local-is-writer-p)
-    (function (domain-participant (simple-array (unsigned-byte 8) (16)) t) (eql t))
+(defun* %cm-user-token-at-match (p remote-guid local-is-writer-p &optional matched-local-eid)
+    (function (domain-participant (simple-array (unsigned-byte 8) (16)) t
+               &optional (or null (unsigned-byte 32)))
+              (eql t))
   "DCPS on-match -> §8.5.2 user-token re-exchange bridge: resolve P's crypto-manager (NIL = security OFF / no
    handshake -> no-op) and re-send the matched USER endpoint's DW/DR CryptoToken keyed to the matched-remote
    REMOTE-GUID (cm-on-endpoint-match — the destination_endpoint_key fix). LOCAL-IS-WRITER-P: T our user writer
-   matched a remote reader, NIL our user reader matched a remote writer. Called from %on-disc-match (fired once
-   per newly-matched user endpoint, %fire-match dedups). Fail-soft no-op when no auth/crypto manager."
+   matched a remote reader, NIL our user reader matched a remote writer. MATCHED-LOCAL-EID (WP-N-ENDPOINT-S3, ADR 0048;
+   optional) is the ACTUAL matched local WRITER's EntityId (resolved by the matched remote's topic in %on-disc-match) so
+   each of N secured writers re-sends its OWN DW token; NIL -> the node-single id (byte-identical N=1). Called from
+   %on-disc-match (fired once per newly-matched user endpoint, %fire-match dedups). Fail-soft no-op when no auth/crypto manager."
   (let ((ms (dp-auth-state p)))
     (when ms
       (let ((cm (auth-manager-state-crypto-manager ms)))
-        (when cm (cm-on-endpoint-match cm (dp-node p) remote-guid local-is-writer-p)))))
+        (when cm (cm-on-endpoint-match cm (dp-node p) remote-guid local-is-writer-p matched-local-eid)))))
   t)
 
 (defun* cm-on-crypto-token (cm node src-prefix class km &optional entity-guid)

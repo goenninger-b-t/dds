@@ -232,7 +232,8 @@
   (sample-origins (make-hash-table :test 'equalp) :type hash-table) ; src GUID -> SN -> (effective-origin-GUID . effective-origin-SN): the PID_ORIGINAL_WRITER_INFO logical origin when the received sample was relayed (RTPS 2.5 §8.3.5.4), absent for a direct sample (then the wire GUID/SN IS the origin)
   (capture-data-key-hash nil :type boolean) ; durability collect node opts in to materialize the wire PID_KEY_HASH on :data (control-plane); default NIL = byte-identical, no hot-path alloc (ADR 0029, RTPS 2.5 §9.6.4.8)
   (crypto-transform nil :type t) ; DDS-Security 1.1 §9.5.3.3 Slice-1: key-material for AES256-GCM serialized-payload protection; NIL = security OFF, byte-identical hot path (ADR 0031)
-  (payload-arena nil :type t) ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: per-node static arena backing the user writer's secured-payload pool (carved by %ensure-secured-payload-pool — at enable when crypto is already on, or lazily on the first secured publish when keys arrive after enable via the live DDS-Security handshake; stop-node tears it down); NIL = security OFF / no pool, byte-identical
+  (payload-arena nil :type list) ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: the LIST of per-node static arenas backing the secured-payload pools (carved by %ensure-secured-payload-pool — at enable when crypto is already on, or lazily on the first secured publish when keys arrive after enable via the live DDS-Security handshake; stop-node tears every one down). WP-N-ENDPOINT-S3 (ADR 0048): a LIST (was a single slot) so N secured writers' carved arenas are ALL reachable at teardown — a 2nd secured writer's carve no longer orphans the first's. NIL = security OFF / no pool, byte-identical
+  (payload-arena-lock (dds.pal:make-lock "payload-arena") :type t) ; WP-N-ENDPOINT-S3: guards the payload-arena LIST push (the per-writer carve runs under the per-WRITER lock, so two writers racing their first secured publish would lost-update the shared list — orphaning one arena at teardown; a dedicated LEAF lock serializes the push, no ordering hazard). Read lock-free at stop-node (quiesced, all threads joined).
   ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: per-node DECODE side (data_protection RECEIVE). SECURED-LOAN-CAPABLE
   ;; (opt-in; set-secured-loan-capable) routes a secured receive through the LOAN pattern: the receiver thread
   ;; decodes the SecuredPayload into a DECODE-POOL buffer (decode-serialized-payload-into, zero per-sample
@@ -500,6 +501,12 @@
   (user-writer-submessage-protection-kind :none :type (member :none :sign :encrypt))
   (user-reader-data-protection-kind :unset :type (member :unset :none :sign :encrypt))
   (user-reader-submessage-protection-kind :none :type (member :none :sign :encrypt))
+  ;; WP-N-ENDPOINT-S3 (ADR 0048): the PER-ENDPOINT generalization of the 2 ADR-0046 role slots — EntityId ->
+  ;; (data-protection-kind . metadata/submessage-protection-kind) resolved from THAT endpoint's OWN topic at
+  ;; add-local, so N secured writers each key from their own topic (the send-crux + %cm-entity-protection-kind read
+  ;; it). Strictly FINER than the role slots: adding one endpoint never mutates another's entry (no cross-role/
+  ;; cross-endpoint downgrade). Empty (security OFF / no governance) -> the role-slot fallback -> byte-identical.
+  (user-endpoint-protection-kind (make-hash-table :test 'eql) :type hash-table)
   ;; §9.4.1.2.4 per-topic data_protection resolver (topic-name -> :none|:sign|:encrypt) installed from governance by %install-access-control; add-local-{writer,reader} refine user-data-protection-kind via it to the endpoint's ACTUAL rule (no first-rule participant-default downgrade). NIL = security OFF / no governance -> unchanged.
   (topic-data-protection-resolver nil :type (or null function))
   ;; §9.4.1.2.4 per-topic metadata_protection resolver (topic-name -> :none|:sign|:encrypt) installed from governance by %install-access-control; add-local-{writer,reader} refine user-submessage-protection-kind via it to the endpoint's ACTUAL rule (no first-rule participant-default downgrade). NIL = security OFF / no governance -> unchanged.
@@ -533,15 +540,6 @@
    registry (WP-N-ENDPOINT-S0; S2 routes delivery across %all-user-readers)."
   (disc-node-primary-user-reader node))
 
-(defun* %node-secured-writer-p (node)
-    (function (disc-node) boolean)
-  "T iff NODE's user writer would TRANSFORM its SerializedPayload at publish (§9.4.1.2.4 SecuredPayload) — a
-   crypto-transform is installed OR governance mandates data_protection :sign/:encrypt. Mirrors
-   %loan-write-data-protected-p; gates the S1 second-writer fail-fast (secured multi-writer = Slice S3)."
-  (let ((kind (disc-node-user-data-protection-kind node)))
-    (or (and (member kind '(:sign :encrypt)) t)
-        (and (eq kind :unset) (disc-node-crypto-transform node) t))))
-
 (defun* %node-has-durable-writer-p (node)
     (function (disc-node) boolean)
   "T iff ANY local user writer advertises a RETAINING durability (TRANSIENT_LOCAL / TRANSIENT / PERSISTENT, DDS 1.4
@@ -559,9 +557,9 @@
    registered becomes primary (N=1 identity for disc-node-user-writer). Re-registering the SAME id REPLACES the
    entry in place (byte-identical to the pre-S0 enable-publisher engine-writer clobber), keeping the primary ref
    current if that id IS the primary. A NEW distinct id ADDS an N-th local writer (each with its own EntityId +
-   HistoryCache) UNLESS deferred: a 2nd SECURED writer fail-fasts (secured multi-writer = Slice S3), a 2nd writer
-   under an associated flow-controller fail-fasts (flow-ON multi-writer = Slice S1b), and a 2nd writer on a node
-   with any RETAINING-durability writer fail-fasts (durability multi-writer = later slice)."
+   HistoryCache; a 2nd SECURED writer is now SUPPORTED — WP-N-ENDPOINT-S3, each keyed under its OWN EntityCrypto km)
+   UNLESS deferred: a 2nd writer under an associated flow-controller fail-fasts (flow-ON multi-writer = Slice S1b),
+   and a 2nd writer on a node with any RETAINING-durability writer fail-fasts (durability multi-writer = later slice)."
   (let ((cell (assoc entity-id (disc-node-user-writers node) :test #'eql)))
     (cond (cell (let ((was-primary (eq (cdr cell) (disc-node-primary-user-writer node))))
                   (setf (cdr cell) writer)
@@ -569,11 +567,7 @@
           ((null (disc-node-user-writers node))   ; first writer -> primary (N=1 identity)
            (push (cons entity-id writer) (disc-node-user-writers node))
            (setf (disc-node-primary-user-writer node) writer))
-          (t (when (%node-secured-writer-p node)
-               (error "disc-node: refusing a 2nd SECURED local user DataWriter (EntityId #x~8,'0X) — secured ~
-                       multi-writer is Slice S3 (N-user-endpoint); primary EntityId #x~8,'0X"
-                      entity-id (caar (last (disc-node-user-writers node)))))
-             (when (disc-node-flow-controller node)
+          (t (when (disc-node-flow-controller node)
                (error "disc-node: refusing a 2nd local user DataWriter (EntityId #x~8,'0X) under an associated ~
                        flow-controller — flow-ON multi-writer is Slice S1b; primary EntityId #x~8,'0X"
                       entity-id (caar (last (disc-node-user-writers node)))))
@@ -694,6 +688,21 @@
   "Fresh list of NODE's registered user engine readers in REGISTRATION order (primary/first-registered first) —
    the deterministic S2 deliver fan-out order (not yet fanned out; S1 keeps a single user reader)."
   (nreverse (mapcar #'cdr (disc-node-user-readers node))))
+
+(defun* %all-user-writer-ids (node)
+    (function (disc-node) list)
+  "Fresh list of NODE's registered user WRITER EntityIds (the registry alist KEYS) in registration order — the
+   WP-N-ENDPOINT-S3 (ADR 0048) enumeration %cm-local-token-entities pairs with +gm-datawriter-crypto-tokens+ so the
+   §8.5.2 token exchange registers + sends ONE EntityCrypto per local writer. At N=1 = (list user-writer-id),
+   byte-identical to the pre-S3 node-single id."
+  (nreverse (mapcar #'car (disc-node-user-writers node))))
+
+(defun* %all-user-reader-ids (node)
+    (function (disc-node) list)
+  "Fresh list of NODE's registered user READER EntityIds (the registry alist KEYS) in registration order — the
+   WP-N-ENDPOINT-S3 (ADR 0048) enumeration %cm-local-token-entities pairs with +gm-datareader-crypto-tokens+. At N=1
+   = (list user-reader-id), byte-identical to the pre-S3 node-single id (secured multi-READER stays Slice S4)."
+  (nreverse (mapcar #'car (disc-node-user-readers node))))
 
 (defparameter +spdp-multicast-group+ "239.255.0.1"
   "Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
@@ -986,8 +995,51 @@
           (:reader (setf (disc-node-user-reader-data-protection-kind node) k)))
         (setf (disc-node-user-data-protection-kind node)
               (%protection-kind-max (disc-node-user-writer-data-protection-kind node)
-                                    (disc-node-user-reader-data-protection-kind node))))))
+                                    (disc-node-user-reader-data-protection-kind node)))))
+    ;; WP-N-ENDPOINT-S3 (ADR 0048): also cache THIS endpoint's (data . submessage) kinds keyed by its EntityId, so N
+    ;; secured writers each key from their OWN topic. Reads back the just-set per-role slots (DRY, authoritative). The
+    ;; entity-id is current (add-local-{writer,reader} set user-{writer,reader}-id just before calling here).
+    (when (or mresolver dresolver)
+      (ecase role
+        (:writer (setf (gethash (disc-node-user-writer-id node) (disc-node-user-endpoint-protection-kind node))
+                       (cons (disc-node-user-writer-data-protection-kind node)
+                             (disc-node-user-writer-submessage-protection-kind node))))
+        (:reader (setf (gethash (disc-node-user-reader-id node) (disc-node-user-endpoint-protection-kind node))
+                       (cons (disc-node-user-reader-data-protection-kind node)
+                             (disc-node-user-reader-submessage-protection-kind node)))))))
   t)
+
+(defun* %user-endpoint-kinds (node entity-id)
+    (function (disc-node (unsigned-byte 32))
+              (values (member :unset :none :sign :encrypt) (member :none :sign :encrypt) boolean))
+  "WP-N-ENDPOINT-S3 / ADR 0046: the (values DATA-PROTECTION-KIND SUBMESSAGE-PROTECTION-KIND USERP) of the LOCAL user
+   endpoint ENTITY-ID — from the per-endpoint map (populated per endpoint at add-local from its OWN topic), with a
+   role-slot fallback for N=1 / no-map (byte-identical to the pre-S3 per-role slots). USERP (3rd value) is T iff
+   ENTITY-ID is a known local user endpoint (a map entry OR the primary writer/reader id) — NIL for a builtin /
+   unknown id (the caller then uses its non-user default). The send-crux (publish-sample) reads the DATA kind for the
+   publishing writer; %cm-entity-protection-kind derives each endpoint's km kind from both."
+  (let ((c (gethash entity-id (disc-node-user-endpoint-protection-kind node))))
+    (cond (c (values (car c) (cdr c) t))
+          ((= entity-id (disc-node-user-writer-id node))
+           (values (disc-node-user-writer-data-protection-kind node)
+                   (disc-node-user-writer-submessage-protection-kind node) t))
+          ((= entity-id (disc-node-user-reader-id node))
+           (values (disc-node-user-reader-data-protection-kind node)
+                   (disc-node-user-reader-submessage-protection-kind node) t))
+          (t (values :unset :none nil)))))
+
+(defun* %topic-secured-writer-p (node topic)
+    (function (disc-node string) boolean)
+  "WP-N-ENDPOINT-S3 (ADR 0048): T iff a user writer on TOPIC would be SECURED per governance — its
+   data_protection OR metadata_protection resolves non-NONE via the per-topic resolvers installed by
+   %install-access-control. Gates the same-topic SECURED multi-writer fail-fast: the §8.5.2 crypto-token
+   destination-correction re-exchange (%local-user-writer-id-for-topic) holds ONE writer per topic, so a 2nd
+   secured writer on the SAME topic would miss its match-time key install at a strict remote. No resolvers
+   (security OFF / Slice-1 direct-KM, no governance token exchange) -> NIL — the concern does not apply."
+  (let ((dres (disc-node-topic-data-protection-resolver node))
+        (mres (disc-node-topic-metadata-protection-resolver node)))
+    (or (and dres (and (member (funcall dres topic) '(:sign :encrypt)) t))
+        (and mres (and (member (funcall mres topic) '(:sign :encrypt)) t)))))
 
 (defun* add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
@@ -1001,7 +1053,23 @@
    match a no-key writer. KEY (NIL default) draws the next DISTINCT per-participant entity KEY
    (WP-N-ENDPOINT-S1, ADR 0048) so a 2nd/N-th DataWriter gets a distinct EntityId + SEDP GUID
    (the first stays #x0102/#x0103, byte-identical); pass an explicit KEY to pin it. Sets NODE's
-   user-writer-id so enable-publisher registers + the data plane sends with this id."
+   user-writer-id so enable-publisher registers + the data plane sends with this id.
+   WP-N-ENDPOINT-S3 DEFERRAL (ADR 0048): a 2nd SECURED writer on a topic ALREADY held by a local writer on
+   this participant FAIL-FASTS (same-topic secured multi-writer = later slice). The §8.5.2 crypto-token
+   destination-correction re-exchange resolves the local writer by topic and holds ONE per topic, so a 2nd
+   same-topic secured writer would miss its match-time key install at a STRICT remote (Fast DDS rejects a
+   wrong destination_endpoint_key) -> its samples undecodable there (fail-closed availability loss, never a
+   mis-sign). Two DISTINCT-topic secured writers (the S3 shipping capability) and two SAME-topic NON-secured
+   writers (S1) are both unaffected. Mirrors the add-local-reader same-topic guard."
+  (when (and (%topic-secured-writer-p node topic)
+             (find topic (disc-node-local-writers node)
+                   :key #'dds.rtps.discovery:endpoint-data-topic-name :test #'string=))
+    (error "disc-node: refusing a 2nd SECURED local user DataWriter on topic ~s — same-topic secured ~
+            multi-writer on one participant is a later N-user-endpoint slice (the §8.5.2 crypto-token ~
+            destination-correction re-exchange holds one writer per topic today; a 2nd would miss its ~
+            match-time key install at a strict remote and its samples would be undecodable there). Use ~
+            distinct topics or separate participants."
+           topic))
   (let* ((key (or key (%alloc-user-writer-key node)))
          (kind (if keyed #x02 #x03))
          (ep (dds.rtps.discovery:make-endpoint-data
@@ -1071,6 +1139,17 @@
   (%send-paramlist node reader-id writer-id sn
                    (lambda (c) (dds.rtps.discovery:serialize-endpoint-data c ep))
                    host port))
+
+(defun* %local-user-writer-id-for-topic (node topic)
+    (function (disc-node string) (or null (unsigned-byte 32)))
+  "The EntityId of NODE's local user WRITER on TOPIC (WP-N-ENDPOINT-S3, ADR 0048), or NIL. Resolves the matched
+   local writer for a :remote-reader match so cm-on-endpoint-match re-sends THAT writer's OWN §8.5.2.2 DW CryptoToken
+   (source = its EntityCrypto) keyed to the matched remote — not the node-single writer id. NIL (no local writer on
+   TOPIC) -> the node-single fallback (byte-identical N=1). Uses %guid-entityid (declaimed above; defined in
+   dataplane.lisp)."
+  (let ((ep (find topic (disc-node-local-writers node)
+                  :key #'dds.rtps.discovery:endpoint-data-topic-name :test #'string=)))
+    (and ep (%guid-entityid (dds.rtps.discovery:endpoint-data-guid ep)))))
 
 ;;; ---- Reliable builtin (SEDP) discovery: ACKNACK remote builtin writers so a
 ;;; reliable peer (e.g. RTI Connext) pushes its SEDP DATA(w)/(r). A remote builtin
@@ -2208,9 +2287,9 @@
   (when (disc-node-submsg-scratch-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T4: free the metadata_protection submessage-scratch pool's static buffers AFTER every sender thread is joined (no live borrow)
     (dds.core.arena:teardown-arena (disc-node-submsg-scratch-arena node))
     (setf (disc-node-submsg-scratch-arena node) nil (disc-node-submsg-scratch-pool node) nil))
-  (when (disc-node-payload-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: free the secured-payload pool's static buffers AFTER every sender/receiver thread is joined (no live acquire/release)
-    (dds.core.arena:teardown-arena (disc-node-payload-arena node))
-    (setf (disc-node-payload-arena node) nil))
+  (dolist (a (disc-node-payload-arena node))   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a / WP-N-ENDPOINT-S3: free EVERY secured writer's payload-pool arena (a LIST now) AFTER every sender/receiver thread is joined (no live acquire/release) — no per-writer arena orphaned
+    (dds.core.arena:teardown-arena a))
+  (setf (disc-node-payload-arena node) nil)
   (when (disc-node-decode-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: return every outstanding secured loan (so loaned buffers re-enter the pool's slots) BEFORE freeing the decode pool's static buffers — the receiver thread is already joined (no live acquire)
     (node-return-all-loans node)
     (dds.core.arena:teardown-arena (disc-node-decode-arena node))

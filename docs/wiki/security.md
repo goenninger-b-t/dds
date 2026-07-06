@@ -2045,6 +2045,33 @@ role a distinct non-zero `session_id` (winner = lexicographically-greater GUID p
 on-wire guard parses the actual encoded `session_id` so a revert fails loudly.  `run-secure-discovery-keyed-test`
 asserts the two roles' `session_id`s DIFFER and are non-zero.
 
+**N SECURED DataWriters per participant, each independently keyed (WP-N-ENDPOINT-S3, ADR 0048).**  The EntityCrypto
+registry is already `EntityId`-keyed (get-or-create per EntityId), so N distinct-EntityId writers already get N
+distinct KeyMaterials.  Slice S3 fixes the three call sites that were hardcoded to the node-single user endpoint:
+
+- **The send crux (crypto correctness).**  `publish-sample` derives the §9.5.3.3.4.4 encode key + tier from the
+  **actual publishing writer's** `EntityId` (`rtps-writer-entityid`, threaded into `%local-writer-guid-vec`), not the
+  node-single `user-writer-id` — so a participant's 2nd secured DataWriter signs/encrypts under ITS OWN EntityCrypto
+  km (distinct `sender_key_id`), never the primary's.  A remote's `find_key`/decode resolves each by GUID/`key_id`.
+- **Per-endpoint protection kind.**  A per-`EntityId` protection-kind map (`user-endpoint-protection-kind`, populated
+  at `add-local-{writer,reader}` from each endpoint's OWN topic) replaces the 2 ADR-0046 role slots in
+  `%cm-entity-protection-kind` — strictly FINER, so a writer on a `data=ENCRYPT` topic and a writer on a `data=SIGN`
+  topic each advertise their own kind (no cross-endpoint downgrade; the mixed-kind install-reject stays).
+- **Enumerate-all token exchange.**  `%cm-local-token-entities` enumerates ALL local writers + readers (the S0
+  registry keys), so `cm-on-authenticated` exchanges one crypto token per endpoint; the match-time re-exchange threads
+  the matched local writer's `EntityId`.  At N=1 this is byte-identical to the pre-S3 single pair.
+
+N secured writers are supported on **distinct** topics.  Two secured writers on the **same** topic stays deferred:
+the §8.5.2 crypto-token destination-correction re-exchange resolves the local writer by topic and holds one per
+topic, so a 2nd same-topic secured writer would miss its match-time key install at a strict remote (its samples
+undecodable there — a fail-closed **availability** loss, never a mis-sign).  `add-local-writer` fail-fasts a 2nd
+SECURED writer on an already-held topic (governance-scoped — a 2nd NON-secured same-topic writer stays allowed, S1),
+mirroring the same-topic **reader** guard.  Secured/ZC **readers** also remain single per participant (the per-reader
+secured decode pools are node-scoped) — that is Slice S4.  Test `run-security-n-secured-writer-test` proves each of
+two secured writers (Circle=ENCRYPT, Square=SIGN) encodes under its own km and a remote decodes both by wire `key_id`
+(a cross-key decode fails closed), and that the same-topic secured 2nd writer fail-fasts while same-topic non-secured
+writers still register.
+
 ### 6sexto.9 Secure SEDP wiring + the worked secure-discovery example (T9)
 
 This is the headline of the slice: protected topics are discovered **only** over the secure SEDP endpoints

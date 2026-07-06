@@ -1946,8 +1946,13 @@
                                (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote)))
                               (%assess-and-record-type-compat dw remote)))
                       ;; §8.5.2.2: our user writer matched a remote reader -> (re)send our DatawriterCryptoToken
-                      ;; keyed to the REAL matched-remote reader GUID (the destination_endpoint_key fix).
-                      (%cm-user-token-at-match p handle t))))
+                      ;; keyed to the REAL matched-remote reader GUID (the destination_endpoint_key fix). WP-N-ENDPOINT-S3
+                      ;; (ADR 0048): resolve the ACTUAL matched local writer by the remote reader's TOPIC so each of N
+                      ;; secured writers sends its OWN token (NIL -> node-single fallback, byte-identical N=1).
+                      (%cm-user-token-at-match
+                       p handle t
+                       (dds.disc:%local-user-writer-id-for-topic
+                        (dp-node p) (dds.rtps.discovery:endpoint-data-topic-name remote))))))
   t)
 
 (defun* %on-disc-unmatch (p direction remote)

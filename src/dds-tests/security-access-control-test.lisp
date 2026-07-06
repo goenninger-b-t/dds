@@ -1284,6 +1284,153 @@
         (dds.dcps:delete-participant p))))
   t)
 
+(defun* %s3-newest-secured-payload (node eid)
+    (function (dds.disc:disc-node (unsigned-byte 32)) (or null (simple-array (unsigned-byte 8) (*))))
+  "WP-N-ENDPOINT-S3 test helper: the newest SerializedPayload emitted by NODE's user writer EID (its own HistoryCache
+   change) — the wire SecuredPayload the send-crux encoded under THAT writer's EntityCrypto km."
+  (let* ((w  (dds.disc::%user-writer-for node eid))
+         (hc (dds.rtps.reliable:rtps-writer-hc w))
+         (ch (car (last (dds.rtps.history:hc-changes-for-reader hc nil)))))
+    ;; T5a: a POOLED secured change stores the oversized pool VEC; use cache-change-payload-len (the TRUE
+    ;; secured-payload length that goes on the wire) so the decode gets the exact SecuredPayload, not the garbage tail.
+    (and ch (subseq (dds.rtps.history:cache-change-serialized-payload ch)
+                    0 (dds.rtps.history:cache-change-payload-len ch)))))
+
+(defun* run-security-n-secured-writer-test ()
+    (function () t)
+  "WP-N-ENDPOINT-S3 (ADR 0048; DDS-Security 1.1 §8.5 / §9.4.1.2.4 / §9.5.2): N SECURED DataWriters per participant,
+   each INDEPENDENTLY keyed. ONE participant, TWO secured writers on DIFFERENT topics with DIFFERENT data_protection
+   tiers (Circle data=ENCRYPT, Square data=SIGN) -> distinct EntityIds. The CRYPTO-CORRECTNESS binary gate: each
+   writer signs/encrypts its payload under ITS OWN EntityCrypto km (distinct sender_key_id) advertising ITS OWN
+   topic's kind, and a remote's find_key/decode resolves each by GUID/key_id — NO cross-endpoint km confusion
+   (writer2 must NOT sign under writer1's key, the send-crux). Asserts:
+   (a) the 2nd secured writer REGISTERS (the S1 fail-fast is lifted — the RED: pre-S3 the 2nd enable-publisher errored);
+   (b) %cm-local-token-entities ENUMERATES both writers (piece 1); (c) %cm-entity-protection-kind returns each writer's
+   OWN topic kind (ENCRYPT vs SIGN — piece 2, per-endpoint map, strictly FINER than the role slots, no PEP downgrade);
+   (d) each writer got a DISTINCT km (distinct sender_key_id); (e) each writer's emitted DATA carries ITS OWN km's
+   key_id (the send-crux RED->GREEN — pre-fix both would carry the node-single/last writer's key_id); (f) a REMOTE
+   crypto-manager resolves + DECODES BOTH payloads by wire key_id, and a CROSS-key decode FAILS (fail-closed). The
+   send/decode assertions need OpenSSL (dare); the control-plane assertions (a,b,c,d) run unconditionally. Clasp FIRST."
+  (let ((gov (dds.security:make-governance
+              :discovery-protection-kind :none :liveliness-protection-kind :none :rtps-protection-kind :none
+              :topic-rules
+              (list (dds.security:make-topic-rule :topic-expr "Circle"    ; data=ENCRYPT (GCM, HIDDEN)
+                                                  :metadata-protection-kind :none :data-protection-kind :encrypt)
+                    (dds.security:make-topic-rule :topic-expr "Square"    ; data=SIGN (GMAC, VISIBLE+authenticated)
+                                                  :metadata-protection-kind :none :data-protection-kind :sign)
+                    (dds.security:make-topic-rule :topic-expr "Triangle"  ; NON-secured (both NONE) — same-topic multi-writer stays allowed (S1)
+                                                  :metadata-protection-kind :none :data-protection-kind :none))))
+        (dare (handler-case (progn (dds.dare:dare-available-p) t) (dds.dare:dare-unavailable () nil)))
+        (ptc (make-array 8 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x43 #x49 #x52 #x43 #x4c #x45 #x20 #x01)))   ; "CIRCLE  "
+        (pts (make-array 8 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#x53 #x51 #x55 #x41 #x52 #x45 #x20 #x02))))  ; "SQUARE  "
+    (let ((ah (dds.security:make-access-handle :governance gov))
+          (p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+      (let ((node (dds.dcps::dp-node p)))
+        (unwind-protect
+             (progn
+               (setf (dds.dcps::dp-auth-state p)
+                     (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
+               (dds.dcps::%install-access-control p ah)
+               ;; TWO secured writers on distinct topics -> distinct EntityIds (S1 key alloc). The 2nd enable-publisher
+               ;; is the RED: pre-S3 %register-user-writer fail-fasted on a secured 2nd writer.
+               (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType")
+               (dds.disc:enable-publisher node :history-kind :keep-all)
+               (dds.disc:add-local-writer node :topic "Square" :type "ShapeType")
+               (dds.disc:enable-publisher node :history-kind :keep-all)
+               (let* ((wids (dds.disc::%all-user-writer-ids node))
+                      (e1 (first wids)) (e2 (second wids)))
+                 ;; (a) both registered, distinct ids — the fail-fast is lifted
+                 (%check :s3-two-writers-registered
+                         (and (= 2 (length wids)) e1 e2 (/= e1 e2))
+                         "2 SECURED writers must both register with DISTINCT EntityIds (the 2nd-secured-writer fail-fast is lifted)")
+                 ;; (b) piece 1: the token enumeration carries BOTH writers under the DW token class
+                 (let ((toks (dds.dcps::%cm-local-token-entities node)))
+                   (%check :s3-enumerate-both
+                           (and (assoc e1 toks :test #'eql) (assoc e2 toks :test #'eql))
+                           "%cm-local-token-entities must enumerate BOTH user writers (piece 1: enumerate-all)")
+                   (%check :s3-enumerate-dw-class
+                           (and (string= dds.security:+gm-datawriter-crypto-tokens+ (cdr (assoc e1 toks :test #'eql)))
+                                (string= dds.security:+gm-datawriter-crypto-tokens+ (cdr (assoc e2 toks :test #'eql))))
+                           "each enumerated writer is paired with +gm-datawriter-crypto-tokens+"))
+                 ;; (c) piece 2: each writer's km kind = ITS OWN topic tier (no cross-endpoint downgrade)
+                 (%check :s3-writer1-kind-encrypt
+                         (eq :encrypt (dds.dcps::%cm-entity-protection-kind node e1))
+                         "writer1 (Circle data=ENCRYPT) EntityCrypto kind must be :encrypt (its OWN topic)")
+                 (%check :s3-writer2-kind-sign
+                         (eq :sign (dds.dcps::%cm-entity-protection-kind node e2))
+                         "writer2 (Square data=SIGN) EntityCrypto kind must be :sign (its OWN topic) — NOT downgraded to writer1's ENCRYPT nor writer1 raised to SIGN (per-endpoint map, no PEP downgrade)")
+                 ;; register the local EntityCryptos exactly as cm-on-authenticated does, then check distinct kms
+                 (let ((cm (dds.dcps::make-crypto-manager)))
+                   (dolist (e (dds.dcps::%cm-local-token-entities node))
+                     (dds.dcps::cm-register-local-entity
+                      cm (car e) :kind (dds.dcps::%cm-entity-protection-kind node (car e))))
+                   (let ((km1 (dds.dcps::cm-encode-entity-km cm e1))
+                         (km2 (dds.dcps::cm-encode-entity-km cm e2)))
+                     ;; (d) distinct kms — distinct sender_key_id (the receiver's find_key discriminator)
+                     (%check :s3-distinct-km
+                             (and km1 km2
+                                  (not (equalp (dds.security:key-material-sender-key-id km1)
+                                               (dds.security:key-material-sender-key-id km2))))
+                             "each secured writer must resolve a DISTINCT EntityCrypto km (distinct sender_key_id)")
+                     ;; (e)+(f) THE SEND CRUX — needs OpenSSL
+                     (when dare
+                       (setf (dds.disc::disc-node-crypto-transform node) (dds.dcps::cm-encode-keys cm))
+                       (dds.disc:publish-sample node ptc nil nil 0 nil e1)   ; publish through writer1
+                       (dds.disc:publish-sample node pts nil nil 0 nil e2)   ; publish through writer2
+                       (let ((sp1 (%s3-newest-secured-payload node e1))
+                             (sp2 (%s3-newest-secured-payload node e2)))
+                         (%check :s3-emitted-protected
+                                 (and sp1 sp2 (>= (length sp1) 8) (>= (length sp2) 8)
+                                      (not (equalp sp1 ptc)) (not (equalp sp2 pts)))
+                                 "both writers must emit a PROTECTED SecuredPayload (not the plaintext)")
+                         ;; (e) THE SEND-CRUX GATE: each writer's wire transformation_key_id (octets 4..7) = ITS OWN km
+                         ;; sender_key_id — writer1 must NOT carry writer2's key (pre-fix both carried the node-single id).
+                         (%check :s3-writer1-own-key-id
+                                 (equalp (subseq sp1 4 8) (dds.security:key-material-sender-key-id km1))
+                                 "writer1's DATA must carry writer1's OWN km key_id (the send-crux: not the node-single writer's)")
+                         (%check :s3-writer1-not-under-writer2
+                                 (not (equalp (subseq sp1 4 8) (dds.security:key-material-sender-key-id km2)))
+                                 "writer1 must NOT sign under writer2's km (no cross-endpoint km confusion)")
+                         (%check :s3-writer2-own-key-id
+                                 (equalp (subseq sp2 4 8) (dds.security:key-material-sender-key-id km2))
+                                 "writer2's DATA must carry writer2's OWN km key_id")
+                         ;; (f) a REMOTE crypto-manager resolves + decodes BOTH by wire key_id; cross-key fails closed
+                         (let ((rcm (dds.dcps::make-crypto-manager))
+                               (lprefix (dds.disc:disc-node-guid-prefix node)))
+                           (dds.dcps::cm-register-matched-remote-entity rcm lprefix e1 km1)
+                           (dds.dcps::cm-register-matched-remote-entity rcm lprefix e2 km2)
+                           (%check :s3-remote-resolve-w1
+                                   (eq km1 (dds.dcps::cm-decode-entity-km-by-key-id rcm (subseq sp1 4 8)))
+                                   "remote resolves writer1's km by the wire key_id")
+                           (%check :s3-remote-resolve-w2
+                                   (eq km2 (dds.dcps::cm-decode-entity-km-by-key-id rcm (subseq sp2 4 8)))
+                                   "remote resolves writer2's km by the wire key_id")
+                           (let ((d1 (dds.security:decode-serialized-payload km1 sp1))
+                                 (d2 (dds.security:decode-serialized-payload km2 sp2)))
+                             (%check :s3-remote-decode-w1
+                                     (and d1 (equalp d1 ptc))
+                                     "remote decodes writer1's ENCRYPT payload under km1 -> plaintext CIRCLE")
+                             (%check :s3-remote-decode-w2
+                                     (and d2 (equalp d2 pts))
+                                     "remote decodes writer2's SIGN payload under km2 -> plaintext SQUARE"))
+                           (%check :s3-cross-key-decode-fails
+                                   (null (dds.security:decode-serialized-payload km2 sp1))
+                                   "writer1's payload must NOT decode under writer2's km (each under its OWN km, fail-closed)"))))))
+                 ;; FIX 1 (review): a 2nd SECURED writer on an ALREADY-HELD topic fail-fasts (same-topic secured
+                 ;; multi-writer = later slice — the §8.5.2 destination-correction holds one writer per topic).
+                 (%check :s3-same-topic-secured-rejected
+                         (null (ignore-errors (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType") t))
+                         "a 2nd SECURED writer on an already-held topic (Circle) must FAIL-FAST — same-topic secured multi-writer holds one writer per topic for the crypto-token destination-correction")
+                 ;; a NON-secured (governance data/metadata=NONE) topic keeps same-topic multi-writer (S1) — the guard is SCOPED to secured topics
+                 (%check :s3-same-topic-nonsecured-ok
+                         (and (ignore-errors (dds.disc:add-local-writer node :topic "Triangle" :type "ShapeType") t)
+                              (ignore-errors (dds.disc:add-local-writer node :topic "Triangle" :type "ShapeType") t))
+                         "two NON-secured writers on the same topic (Triangle, data/metadata=NONE) still register — the same-topic fail-fast is scoped to SECURED topics only")))
+          (dds.dcps:delete-participant p)))))
+  t)
+
 (defun* run-security-dn-match-test ()
     (function () t)
   "ADR-0036/0037 carry (DDS-Security 1.1 §9.4.1.3 subject-name binding; RFC2253 §2.1-2.4): the serialization-

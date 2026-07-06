@@ -1828,12 +1828,15 @@
     (if (disc-node-async-thread node) (%async-signal node) (%push-data node)))
   t)
 
-(defun* %local-writer-guid-vec (node)
-    (function (disc-node) (simple-array (unsigned-byte 8) (16)))
-  "The 16-octet local user-data writer GUID (prefix + user-writer-id EntityId, RTPS 2.5 §9.3.1.2) — encode-key resolution key for the crypto-keys resolver (T6)."
+(defun* %local-writer-guid-vec (node &optional (entity-id (disc-node-user-writer-id node)))
+    (function (disc-node &optional (unsigned-byte 32)) (simple-array (unsigned-byte 8) (16)))
+  "The 16-octet local user-data writer GUID (prefix + ENTITY-ID, RTPS 2.5 §9.3.1.2) — the encode-key resolution key
+   for the crypto-keys resolver (T6). WP-N-ENDPOINT-S3 (ADR 0048): ENTITY-ID is the ACTUAL publishing writer's
+   EntityId (the send-crux — each secured writer resolves its OWN EntityCrypto km, never the node-single writer's);
+   it defaults to the node-single user-writer-id (byte-identical N=1)."
   (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
     (replace g (disc-node-guid-prefix node) :end2 12)
-    (let ((id (disc-node-user-writer-id node)))
+    (let ((id entity-id))
       (setf (aref g 12) (ldb (byte 8 24) id)
             (aref g 13) (ldb (byte 8 16) id)
             (aref g 14) (ldb (byte 8  8) id)
@@ -1916,10 +1919,12 @@
     ;; (HIDDEN); data=SIGN -> AES256-GMAC (the payload rides VISIBLE + GMAC-authenticated, encode-serialized-payload
     ;; GMAC sub-tier). data_protection=SIGN (payload-tier GMAC) is IMPLEMENTED; supported tiers: NONE + SIGN + ENCRYPT
     ;; (ADR-0040 §9.5.3.3.4.3).
-    (let ((ct (and (not (eq (disc-node-user-writer-data-protection-kind node) :none)) (disc-node-crypto-transform node))))   ; ADR 0046: the WRITER's OWN kind (never the shared slot a reader could downgrade)
+    (let* ((weid (dds.rtps.reliable:rtps-writer-entityid writer))   ; WP-N-ENDPOINT-S3: the ACTUAL publishing writer's EntityId (the send crux)
+           (wdk  (nth-value 0 (%user-endpoint-kinds node weid)))    ; THIS writer's OWN data_protection kind (per-endpoint, never the node-single slot)
+           (ct   (and (not (eq wdk :none)) (disc-node-crypto-transform node))))   ; ADR 0046/0048: the WRITER's OWN kind (never a shared slot a reader/other writer could downgrade)
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
-                      (funcall (dds.security:crypto-keys-encode-key-fn ct) (%local-writer-guid-vec node))
+                      (funcall (dds.security:crypto-keys-encode-key-fn ct) (%local-writer-guid-vec node weid))   ; resolve THIS writer's EntityCrypto km by its OWN EntityId
                       ct)))
           (if km
               ;; T5a: encode INTO a POOLED buffer (zero per-sample payload alloc) when a payload-pool is provisioned,
@@ -3050,7 +3055,8 @@
        (handler-case
            (let* ((arena (dds.core.arena:init-arena :bytes (* element-bytes (1+ capacity))))   ; +1 slot slack
                   (pool (dds.core.arena:make-buffer-pool arena element-bytes capacity)))
-             (setf (disc-node-payload-arena node) arena)   ; only after the pool carve succeeds (teardown reachability)
+             (dds.pal:with-lock ((disc-node-payload-arena-lock node))   ; WP-N-ENDPOINT-S3: serialize the shared-list push (the carve runs under the per-WRITER lock; a dedicated leaf lock stops two writers' first-publishes lost-updating the list)
+               (push arena (disc-node-payload-arena node)))   ; add to the per-writer arena LIST (never overwrite a prior writer's), only after the carve succeeds (teardown reachability)
              pool)
          (error () nil))))))   ; arena-exhausted / static-alloc failure: leave the pool NIL -> allocating encode fallback
 
@@ -3365,8 +3371,10 @@
    both collided on #x0102 — the RED); (2) BOTH writers publish and each remote reader receives ITS writer's exact
    payload (send fan-out over %all-user-writers + writer-id threading, not the aliased primary); (3) independent
    reliable retransmit — writer-B's sample is dropped, and B's periodic HEARTBEAT + the ACKNACK routed by writerId
-   to B (%user-writer-for) repairs it while writer-A's already-delivered sample is untouched. Also asserts the S1
-   DEFERRAL fail-fasts: a 2nd SECURED writer -> Slice S3; a flow-controller on a 2-writer participant -> Slice S1b."
+   to B (%user-writer-for) repairs it while writer-A's already-delivered sample is untouched. Also asserts: a 2nd
+   SECURED writer now REGISTERS (WP-N-ENDPOINT-S3, secured multi-writer supported — per-key derivation proven by
+   run-security-n-secured-writer-test); the remaining S1 DEFERRAL fail-fasts (a flow-controller on a 2-writer
+   participant -> Slice S1b; a 2nd writer with RETAINING durability -> later slice)."
   (let* ((pp (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
          (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(3 3 3 3 3 3 3 3 3 3 3 3)))
@@ -3436,14 +3444,17 @@
                    "subB must receive EXACTLY writer-B's 1 sample — a 2nd sample means writer-A over-sent to it")
            (assert (not (equalp (node-sample-by-sn suba 1) paylb)) () "subA must NEVER see writer-B's payload")
            (assert (not (equalp (node-sample-by-sn subb 1) payla)) () "subB must NEVER see writer-A's payload")
-           ;; (4a) deferral: a 2nd SECURED writer fail-fasts (Slice S3)
+           ;; (4a) WP-N-ENDPOINT-S3: a 2nd SECURED writer now REGISTERS (each keyed under its OWN EntityCrypto km) — the
+           ;; S1-era fail-fast is LIFTED. The per-writer key derivation is proven by run-security-n-secured-writer-test.
            (let ((sn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
              (unwind-protect
                   (progn (add-local-writer sn :topic "SA" :type "X") (enable-publisher sn)
                          (setf (disc-node-user-data-protection-kind sn) :sign)   ; mark the node secured (governance data_protection)
                          (add-local-writer sn :topic "SB" :type "X")
-                         (assert (null (ignore-errors (enable-publisher sn) t)) ()
-                                 "a 2nd SECURED writer must fail-fast (Slice S3)"))
+                         (assert (ignore-errors (enable-publisher sn) t) ()
+                                 "a 2nd SECURED writer must now REGISTER (WP-N-ENDPOINT-S3 — secured multi-writer supported)")
+                         (assert (= 2 (length (%all-user-writer-ids sn))) ()
+                                 "the participant must hold 2 secured user writers with distinct EntityIds (S3)"))
                (stop-node sn)))
            ;; (4b) deferral: a flow-controller on a 2-writer participant fail-fasts (Slice S1b)
            (let ((fc (make-flow-controller :tokens-per-period 100000 :period 1000000 :max-burst 65536)))
