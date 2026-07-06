@@ -371,7 +371,7 @@
                       (dds.disc:enable-subscriber lj-node)
                       ;; wire on-match: call reader-durability-init so TL reader requests history
                       (setf (dds.disc:disc-node-on-match lj-node)
-                            (lambda (kind remote)
+                            (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                               (when (eq kind :remote-writer)
                                 (dds.disc:%reader-durability-init
                                  lj-node
@@ -406,7 +406,7 @@
                       (dds.disc:enable-subscriber vl-node)
                       ;; wire on-match: call reader-durability-init so VOLATILE reader SKIPS history
                       (setf (dds.disc:disc-node-on-match vl-node)
-                            (lambda (kind remote)
+                            (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                               (when (eq kind :remote-writer)
                                 (dds.disc:%reader-durability-init
                                  vl-node
@@ -1063,7 +1063,7 @@
                                                        :durability :transient-local))
                       (dds.disc:enable-subscriber lj-node)
                       (setf (dds.disc:disc-node-on-match lj-node)
-                            (lambda (kind remote)
+                            (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                               (when (eq kind :remote-writer)
                                 (dds.disc:%reader-durability-init
                                  lj-node
@@ -1206,7 +1206,7 @@
              (dds.disc:enable-subscriber sub-node)
              ;; install on-match to init durability so TL reader requests history from relay
              (setf (dds.disc:disc-node-on-match sub-node)
-                   (lambda (kind remote)
+                   (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                      (when (eq kind :remote-writer)
                        (dds.disc:%reader-durability-init
                         sub-node
@@ -1376,7 +1376,7 @@
                                                        :durability :transient-local))
                       (dds.disc:enable-subscriber lj-sq)
                       (setf (dds.disc:disc-node-on-match lj-sq)
-                            (lambda (kind remote)
+                            (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                               (when (eq kind :remote-writer)
                                 (dds.disc:%reader-durability-init
                                  lj-sq
@@ -1407,7 +1407,7 @@
                                                        :durability :transient-local))
                       (dds.disc:enable-subscriber lj-ci)
                       (setf (dds.disc:disc-node-on-match lj-ci)
-                            (lambda (kind remote)
+                            (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                               (when (eq kind :remote-writer)
                                 (dds.disc:%reader-durability-init
                                  lj-ci
@@ -1512,7 +1512,7 @@
                                                        :durability :transient-local))
                       (dds.disc:enable-subscriber lj-node)
                       (setf (dds.disc:disc-node-on-match lj-node)
-                            (lambda (kind remote)
+                            (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                               (when (eq kind :remote-writer)
                                 (dds.disc:%reader-durability-init
                                  lj-node
@@ -1622,7 +1622,7 @@
                                                        :durability :transient-local))
                       (dds.disc:enable-subscriber lj-node)
                       (setf (dds.disc:disc-node-on-match lj-node)
-                            (lambda (kind remote)
+                            (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                               (when (eq kind :remote-writer)
                                 (dds.disc:%reader-durability-init
                                  lj-node
@@ -1837,7 +1837,7 @@
                                                               :durability :transient-local))
                              (dds.disc:enable-subscriber lj-node)
                              (setf (dds.disc:disc-node-on-match lj-node)
-                                   (lambda (kind remote)
+                                   (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                                      (when (eq kind :remote-writer)
                                        (dds.disc:%reader-durability-init
                                         lj-node
@@ -2133,7 +2133,7 @@
                                                         :qos (dds.qos:make-reader-qos :reliability :reliable :durability :transient-local))
                              (dds.disc:enable-subscriber lj-node)
                              (setf (dds.disc:disc-node-on-match lj-node)
-                                   (lambda (kind remote)
+                                   (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                                      (when (eq kind :remote-writer)
                                        (dds.disc:%reader-durability-init
                                         lj-node
@@ -2512,7 +2512,7 @@
                                                 :durability :transient-local))
                (dds.disc:enable-subscriber lj-node)
                (setf (dds.disc:disc-node-on-match lj-node)
-                     (lambda (kind remote)
+                     (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                        (when (eq kind :remote-writer)
                          (dds.disc:%reader-durability-init
                           lj-node
@@ -2724,7 +2724,7 @@
                                                                      :durability :transient-local))
                                     (dds.disc:enable-subscriber lj-node)
                                     (setf (dds.disc:disc-node-on-match lj-node)
-                                          (lambda (kind remote)
+                                          (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                                             (when (eq kind :remote-writer)
                                               (dds.disc:%reader-durability-init
                                                lj-node

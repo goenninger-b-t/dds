@@ -16,10 +16,13 @@ carry **N non-secured `DataWriter`s** on different topics — each gets a distin
 ACKNACK/NACK_FRAG routes to the addressed writer by its `writerId`). At N=1 the wire and timing
 are byte-identical to before. A 2nd DataWriter under an associated **flow-controller** is **supported**
 (Slice S1b, WP-N-ENDPOINT-S1B-FLOW): the controller drives ALL of a participant's writers as per-writer
-selection entries, rate-paced at the shared aggregate with EDF/priority ordering across them. Remaining
-deferrals: a 2nd **secured** DataWriter fail-fasts (secured multi-writer is Slice S3 — since landed); and a
-2nd DataWriter on a participant with any **TRANSIENT_LOCAL/TRANSIENT/PERSISTENT** writer fail-fasts
-(durability multi-writer is a later slice).
+selection entries, rate-paced at the shared aggregate with EDF/priority ordering across them. **Two or more
+SAME-topic DataWriters on one participant are now supported** (Slice 2c-2, WP-N-ENDPOINT-2C2-WRITERS, ADR 0048
+§16): each gets a distinct `EntityId`/SEDP GUID (S1), and — via the matched-LOCAL EntityId threaded through the
+match hook, fired per-(local,remote) pair — each same-topic writer gets its OWN `PUBLICATION_MATCHED`, its OWN
+§8.5.2 crypto-token keyed to its EntityId (secured), and its OWN durability replay (`add-local-writer` fences B
+[secured] + C [durable] LIFTED). A remote reader dedups the two by their distinct source GUIDs and receives both
+streams.
 
 **Multiple DataReaders per participant (WP-N-ENDPOINT-S2, ADR 0048).** A participant (Subscriber)
 may carry **N non-secured `DataReader`s** on different topics — each gets a distinct `EntityId`
@@ -42,12 +45,12 @@ delivery route holds a LIST), so both readers' EntityIds are routed to the write
 `dr-drained` high-water over the shared NON-purged store gives each reader the complete stream with **no
 cross-consumption** (reader-A taking a sample never denies it to reader-B), and the HEARTBEAT hook fans
 out one ACKNACK per matched reader-id (so a dropped sample is repaired for BOTH readers, each proxy's
-ACKNACK serviced). **Caveat — same-topic per-endpoint STATUS is NOT yet complete:** 2c-1 ships same-topic
-**DATA** delivery to all readers, but the S5 status resolver keys by topic-name, so for two SAME-topic
-readers only ONE receives the `SUBSCRIPTION_MATCHED` / `LIVELINESS_CHANGED` / incompatible-QoS status
-counter + listener callback — per-endpoint STATUS/listener dispatch for same-topic readers is a **tracked
-follow-on** in the 2c sequence (to be resolved by keying the resolver finer than topic-name). Do not rely
-on same-topic per-endpoint status yet. Also newly reachable: two same-topic-NAME readers of DIFFERENT
+ACKNACK serviced). **Same-topic per-endpoint STATUS is now complete (Slice 2c-2):** the match/unmatch/
+incompatible hooks thread the matched-LOCAL EntityId (`%fire-match` → `%on-disc-match`) and resolve the DCPS
+entity by that EntityId (`%participant-reader/writer-by-entity-id`), fired once per (local,remote) pair
+(no double-count on SEDP re-announce; unmatch decrements the right endpoint), so BOTH same-topic readers AND
+writers get their own `SUBSCRIPTION_MATCHED`/`PUBLICATION_MATCHED`/incompatible-QoS status counter + listener
+callback. Also newly reachable: two same-topic-NAME readers of DIFFERENT
 types both register (the fence is loan-capable-scoped), so a match fires `INCONSISTENT_TOPIC` for the
 type-mismatched reader alongside `SUBSCRIPTION_MATCHED` for the compatible one (semantically correct, no
 data hazard). Remaining deferral: a 2nd SAME-topic **loan-capable** (secured / zero-copy) reader still
@@ -66,8 +69,9 @@ The old single `dp-user-reader`/`dp-user-writer` back-refs are retired. At N=1 e
 byte-identical. With this slice the **different-topic N-user-endpoint capability is complete**: N
 writers + N readers per participant on distinct topics, including secured and loan-capable, each with
 correct per-endpoint status and delivery. **Flow-ON multi-writer (Slice S1b) has since landed** (the
-flow-controller drives all of a participant's writers). Same-topic multi-endpoint and RETAINING-durability
-multi-writer stay deferred.
+flow-controller drives all of a participant's writers). **Same-topic multi-reader (2c-1) and same-topic
+multi-WRITER + per-endpoint same-topic status (2c-2) have since landed.** Only the same-topic **loan-capable**
+reader (2c-3, the ADR-0017 refcount-per-reader UAF) stays deferred.
 
 ## API reference
 

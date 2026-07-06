@@ -418,7 +418,8 @@ for liveliness), retiring the participant-wide `dp-user-reader`/`dp-user-writer`
 participant holding N secured writers + N loaded-capable readers each endpoint's
 SUBSCRIPTION/PUBLICATION_MATCHED, INCOMPATIBLE_QOS, and LIVELINESS_CHANGED land on the correct secured
 endpoint, not the last-created one.  This **completes** the different-topic N-user-endpoint capability
-(incl. secured); same-topic multi-endpoint stays deferred.
+(incl. secured); same-topic multi-reader (2c-1) and same-topic multi-secured-writer + per-endpoint same-topic
+status (2c-2, ADR 0048 §16) have since landed — only the same-topic loan-capable reader (2c-3) stays deferred.
 
 ### 3.4 Zero-alloc secured send + the shared foundation (WP-DDS-SECURITY-ZEROALLOC-AEAD, ADR 0038)
 
@@ -2084,16 +2085,16 @@ distinct KeyMaterials.  Slice S3 fixes the three call sites that were hardcoded 
   registry keys), so `cm-on-authenticated` exchanges one crypto token per endpoint; the match-time re-exchange threads
   the matched local writer's `EntityId`.  At N=1 this is byte-identical to the pre-S3 single pair.
 
-N secured writers are supported on **distinct** topics.  Two secured writers on the **same** topic stays deferred:
-the §8.5.2 crypto-token destination-correction re-exchange resolves the local writer by topic and holds one per
-topic, so a 2nd same-topic secured writer would miss its match-time key install at a strict remote (its samples
-undecodable there — a fail-closed **availability** loss, never a mis-sign).  `add-local-writer` fail-fasts a 2nd
-SECURED writer on an already-held topic (governance-scoped — a 2nd NON-secured same-topic writer stays allowed, S1),
-mirroring the same-topic **reader** guard.  Secured/ZC **readers** also remain single per participant (the per-reader
-secured decode pools are node-scoped) — that is Slice S4.  Test `run-security-n-secured-writer-test` proves each of
-two secured writers (Circle=ENCRYPT, Square=SIGN) encodes under its own km and a remote decodes both by wire `key_id`
-(a cross-key decode fails closed), and that the same-topic secured 2nd writer fail-fasts while same-topic non-secured
-writers still register.
+N secured writers are supported on **distinct** topics AND on the **same** topic (Slice 2c-2, WP-N-ENDPOINT-2C2-
+WRITERS, ADR 0048 §16).  The §8.5.2 crypto-token destination-correction re-exchange now keys off the matched-LOCAL
+writer's `EntityId` threaded through the match hook (`%fire-match` → `%on-disc-match` → `%cm-user-token-at-match`),
+fired per-(local,remote) pair, so each same-topic secured writer re-sends its OWN DW CryptoToken under its OWN km
+(distinct `sender_key_id`) keyed to its OWN EntityId — a strict remote (Fast DDS) installs the correct
+`destination_endpoint_key` per writer.  `add-local-writer`'s former 2nd-secured-writer fence B is LIFTED.  Test
+`run-security-n-secured-writer-test` proves each of two secured writers (Circle=ENCRYPT, Square=SIGN) encodes under
+its own km and a remote decodes both by wire `key_id` (a cross-key decode fails closed), AND that a 2nd SECURED
+writer on an already-held topic (Circle) REGISTERS with a distinct EntityId + distinct km (same-topic secured
+multi-writer).  Secured/ZC **readers** remain single per participant on the loan path (Slice 2c-3, ADR-0017 UAF).
 
 ### 6sexto.9 Secure SEDP wiring + the worked secure-discovery example (T9)
 

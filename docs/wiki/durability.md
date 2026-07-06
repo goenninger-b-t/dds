@@ -86,10 +86,11 @@ each durable writer is primed off its OWN HistoryCache, never the participant's 
 retained-history replay reuses the per-writer retransmit path (the writerId-routed ACKNACK repair).
 `durability-finalize` is per-writer: finalizing one durable writer never releases a sibling's
 retained history. A single durable writer is byte-identical (the matched writer IS the primary).
-Same-topic durable multi-writer is FAIL-FAST-DEFERRED (Slice 2c): a 2nd writer on a topic already held
-by a local writer on this participant, where a RETAINING-durability writer is involved, is rejected loudly
-by `add-local-writer` — `%match-remote-endpoint` matches only the first same-topic writer, so a silent
-2nd durable writer would never replay its history. Same-topic VOLATILE writers stay allowed (ADR 0048 §14.3a).
+Same-topic durable multi-writer is SUPPORTED (Slice 2c-2, WP-N-ENDPOINT-2C2-WRITERS, ADR 0048 §16): two+
+TRANSIENT_LOCAL writers on the SAME topic each replay their OWN retained history to a late reader. The match
+hook threads the matched-LOCAL writer EntityId (`%fire-match` → `%on-disc-match`) and fires per-(local,remote)
+pair, so `%writer-durability-init`/`%prearm` prime EACH matched writer off ITS OWN HistoryCache. Fence C in
+`add-local-writer` (the former `%same-topic-durable-writer-conflict-p` guard, ADR 0048 §14.3a) is LIFTED.
 
 ### 2.4 Known edge — VOLATILE-reader ↔ TL-writer match-window race
 

@@ -632,6 +632,59 @@
       (dds.dcps:delete-participant p1))
     t))
 
+(defun* run-dcps-same-topic-durability-multiwriter-test ()
+    (function () t)
+  "WP-N-ENDPOINT-2C2 (ADR 0048; DDS 1.4 §2.2.3.4): TWO SAME-topic TRANSIENT_LOCAL KEEP_ALL DataWriters on ONE
+   participant, each replays ITS OWN retained history to a late reader. dw1 retains 3 samples, dw2 retains 2, all
+   on the SAME topic BEFORE any reader. A late TL reader on that topic matches BOTH writers and receives ALL 5
+   retained samples (the UNION of both writers' histories, each under its OWN source GUID). This is the fence-C
+   lift + per-writer match-side replay: pre-2c2 the 2nd same-topic durable writer fail-fasted (could not register),
+   and even lifted, the pre-2c2 per-remote match armed replay for the FIRST writer only, so dw2's history never
+   replayed (reader got 3, not 5 — the RED). Proves %writer-durability-init fires per matched writer with ITS OWN
+   writer-id. Both impls."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "2C2Dur" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (dw1 (dds.dcps:create-datawriter
+                      pub tw :qos (dds.qos:make-writer-qos :durability :transient-local :history-kind :keep-all)))
+                (dw2 (dds.dcps:create-datawriter
+                      pub tw :qos (dds.qos:make-writer-qos :durability :transient-local :history-kind :keep-all))))
+           (%check :2c2dur-distinct (/= (dds.dcps::dw-entity-id dw1) (dds.dcps::dw-entity-id dw2))
+                   "the two SAME-topic durable writers must get DISTINCT engine EntityIds (fence C lifted)")
+           ;; pre-join: each writer RETAINS its OWN samples (dw1: 3, dw2: 2) — no reader exists yet.
+           (dds.dcps:write-sample dw1 (make-shape-type :color "W1A" :x 1 :y 1 :shapesize 10))
+           (dds.dcps:write-sample dw1 (make-shape-type :color "W1B" :x 2 :y 2 :shapesize 20))
+           (dds.dcps:write-sample dw1 (make-shape-type :color "W1C" :x 3 :y 3 :shapesize 30))
+           (dds.dcps:write-sample dw2 (make-shape-type :color "W2A" :x 4 :y 4 :shapesize 40))
+           (dds.dcps:write-sample dw2 (make-shape-type :color "W2B" :x 5 :y 5 :shapesize 50))
+           (loop repeat 10 do (dds.dcps:spin p1) (sleep 0.01))
+           (let ((p2 (dds.dcps:create-participant :domain (test-domain))))
+             (unwind-protect
+                  (let* ((tr (dds.dcps:create-topic p2 "2C2Dur" "shape-type" ts))
+                         (sub (dds.dcps:create-subscriber p2))
+                         (dr (dds.dcps:create-datareader
+                              sub tr :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                                   :durability :transient-local
+                                                                   :history-kind :keep-all))))
+                    (loop repeat 200
+                          until (and (>= (dds.dcps:matched-count p1) 1) (>= (dds.dcps:matched-count p2) 2))
+                          do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+                    (%check :2c2dur-matched (>= (dds.dcps:matched-count p2) 2)
+                            "the late TL reader must match BOTH same-topic durable writers (2 WriterProxies)")
+                    (%drain-until dr p1 p2 (lambda () (>= (dds.dcps:samples-available dr) 5)) 250)
+                    (let ((s (dds.dcps:take-samples dr)))
+                      (%check :2c2dur-union-count (= 5 (length s))
+                              "the late reader must replay ALL 5 retained samples — the UNION of BOTH same-topic writers' histories (RED: pre-2c2 only dw1's 3 replayed)")
+                      (let ((colors (sort (mapcar (lambda (cs) (shape-type-color (dds.dcps:cached-sample-data cs))) s) #'string<)))
+                        (%check :2c2dur-both-histories
+                                (equal colors '("W1A" "W1B" "W1C" "W2A" "W2B"))
+                                "the reader must receive dw1's OWN 3 AND dw2's OWN 2 retained samples (each writer replayed its OWN history via its OWN writer-id)"))))
+               (dds.dcps:delete-participant p2))))
+      (dds.dcps:delete-participant p1))
+    t))
+
 ;;; No-key DCPS round-trip (FR-RTPS S0): a keyless type's DataWriter/DataReader come
 ;;; up NO_KEY (writer 0x03/id 0x103, reader 0x04/id 0x104) — selected by DCPS from the
 ;;; type's keyed-ness — discover, match same-kind, and deliver a sample end to end.
@@ -8737,7 +8790,8 @@
     (unwind-protect
         (progn
           (setf (dds.disc:disc-node-on-unmatch node)
-                (lambda (direction remote) (push (cons direction remote) unmatched)))
+                (lambda (direction remote &optional local-eid) (declare (ignore local-eid))
+                  (push (cons direction remote) unmatched)))
           (let* ((p2 (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x71))
                  (rw (%remote-writer-ep #x02)))                 ; a remote writer endpoint
             (replace (dds.rtps.discovery:endpoint-data-guid rw) p2 :end1 12)
@@ -8959,6 +9013,106 @@
            (%check :s5-unmatch-a-untouched
                    (zerop (dds.dcps:subscription-matched-status-total-count (dds.dcps:get-subscription-matched-status dra)))
                    "reader-A must NOT be touched by topic-B's unmatch"))
+      (dds.dcps:delete-participant p))
+    t))
+
+(defun* run-n-endpoint-2c2-status-test ()
+    (function () t)
+  "WP-N-ENDPOINT-2C2 (ADR 0048): per-endpoint status dispatch for SAME-topic endpoints (closes the 2c-1 status
+   follow-on). ONE participant holds TWO SAME-topic DataWriters (dw1,dw2) + TWO SAME-topic DataReaders (dra,drb)
+   on ONE topic. The match/unmatch/incompatible hooks are fired offline threading the matched-local EntityId (as
+   the real %fire-match does): each must land on the RIGHT SAME-topic endpoint resolved BY EntityId (its counter +
+   listener), never the first-by-topic (the pre-2c2 RED: topic-first resolution bumped only ONE of the two). Also
+   verifies UNMATCH threaded by EntityId decrements the RIGHT writer, leaving its same-topic sibling untouched.
+   Offline direct hook firing (no network). Both impls."
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p (dds.dcps:create-participant :domain (test-domain)))
+        (rl1 (make-instance 'capturing-reader-listener))
+        (rl2 (make-instance 'capturing-reader-listener))
+        (wl1 (make-instance 'capturing-writer-listener))
+        (wl2 (make-instance 'capturing-writer-listener)))
+    (unwind-protect
+         (let* ((tp  (dds.dcps:create-topic p "2C2S" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (pub (dds.dcps:create-publisher p))
+                (dw1 (dds.dcps:create-datawriter pub tp))
+                (dw2 (dds.dcps:create-datawriter pub tp))
+                (dra (dds.dcps:create-datareader sub tp))
+                (drb (dds.dcps:create-datareader sub tp))
+                (e-w1 (dds.dcps::dw-entity-id dw1)) (e-w2 (dds.dcps::dw-entity-id dw2))
+                (e-ra (dds.dcps::dr-entity-id dra)) (e-rb (dds.dcps::dr-entity-id drb))
+                (rr1 (dds.rtps.discovery:make-endpoint-data
+                      :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x61)))
+                              (setf (aref g 15) #x07) g)
+                      :topic-name "2C2S" :type-name "ShapeType"))
+                (rr2 (dds.rtps.discovery:make-endpoint-data
+                      :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x62)))
+                              (setf (aref g 15) #x07) g)
+                      :topic-name "2C2S" :type-name "ShapeType"))
+                (rw1 (dds.rtps.discovery:make-endpoint-data
+                      :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x63)))
+                              (setf (aref g 15) #x02) g)
+                      :topic-name "2C2S" :type-name "ShapeType"))
+                (rw2 (dds.rtps.discovery:make-endpoint-data
+                      :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x64)))
+                              (setf (aref g 15) #x02) g)
+                      :topic-name "2C2S" :type-name "ShapeType")))
+           (%check :2c2-distinct-writers (/= e-w1 e-w2)
+                   "the two SAME-topic DataWriters must get DISTINCT engine EntityIds")
+           (%check :2c2-distinct-readers (/= e-ra e-rb)
+                   "the two SAME-topic DataReaders must get DISTINCT engine EntityIds")
+           (dds.dcps:set-reader-listener dra rl1 '(:subscription-matched :requested-incompatible-qos))
+           (dds.dcps:set-reader-listener drb rl2 '(:subscription-matched :requested-incompatible-qos))
+           (dds.dcps:set-writer-listener dw1 wl1 '(:publication-matched :offered-incompatible-qos))
+           (dds.dcps:set-writer-listener dw2 wl2 '(:publication-matched :offered-incompatible-qos))
+           ;; (1) PUBLICATION_MATCHED per SAME-topic writer, by threaded EntityId: rr1->dw1, rr2->dw2.
+           (dds.dcps::%on-disc-match p :remote-reader rr1 e-w1)
+           (%check :2c2-pub-w1
+                   (= 1 (dds.dcps:publication-matched-status-total-count (dds.dcps:get-publication-matched-status dw1)))
+                   "the match threaded with writer-1's EntityId must bump ONLY writer-1 PUBLICATION_MATCHED")
+           (%check :2c2-pub-w2-zero
+                   (zerop (dds.dcps:publication-matched-status-total-count (dds.dcps:get-publication-matched-status dw2)))
+                   "writer-2 must NOT see writer-1's match (the RED: pre-2c2 topic-first resolution bumped only the first-by-topic)")
+           (dds.dcps::%on-disc-match p :remote-reader rr2 e-w2)
+           (%check :2c2-pub-w2
+                   (= 1 (dds.dcps:publication-matched-status-total-count (dds.dcps:get-publication-matched-status dw2)))
+                   "the match threaded with writer-2's EntityId must bump writer-2 PUBLICATION_MATCHED (both same-topic writers matched)")
+           (%check :2c2-pub-w1-still-one
+                   (= 1 (dds.dcps:publication-matched-status-total-count (dds.dcps:get-publication-matched-status dw1)))
+                   "writer-1 stays at 1 — writer-2's match does not touch it")
+           (%check :2c2-pub-w1-listener (and (assoc :pub-matched (cap-snapshot wl1)) t)
+                   "writer-1 on_publication_matched must fire")
+           (%check :2c2-pub-w2-listener (and (assoc :pub-matched (cap-snapshot wl2)) t)
+                   "writer-2 on_publication_matched must fire")
+           ;; (2) SUBSCRIPTION_MATCHED per SAME-topic reader, by threaded EntityId: rw1->dra, rw2->drb.
+           (dds.dcps::%on-disc-match p :remote-writer rw1 e-ra)
+           (dds.dcps::%on-disc-match p :remote-writer rw2 e-rb)
+           (%check :2c2-sub-ra
+                   (= 1 (dds.dcps:subscription-matched-status-total-count (dds.dcps:get-subscription-matched-status dra)))
+                   "the match threaded with reader-A's EntityId must bump reader-A SUBSCRIPTION_MATCHED")
+           (%check :2c2-sub-rb
+                   (= 1 (dds.dcps:subscription-matched-status-total-count (dds.dcps:get-subscription-matched-status drb)))
+                   "the match threaded with reader-B's EntityId must bump reader-B SUBSCRIPTION_MATCHED (both same-topic readers matched — closes the 2c-1 follow-on)")
+           (%check :2c2-sub-ra-listener (and (assoc :sub-matched (cap-snapshot rl1)) t)
+                   "reader-A on_subscription_matched must fire")
+           (%check :2c2-sub-rb-listener (and (assoc :sub-matched (cap-snapshot rl2)) t)
+                   "reader-B on_subscription_matched must fire")
+           ;; (3) INCOMPATIBLE_QOS threaded by EntityId lands on the RIGHT same-topic writer only.
+           (dds.dcps::%on-disc-incompatible p :remote-reader rr1 '(:durability) e-w1)
+           (%check :2c2-incompat-w1
+                   (= 1 (dds.dcps:offered-incompatible-qos-status-total-count (dds.dcps:get-offered-incompatible-qos-status dw1)))
+                   "incompatible-qos threaded with writer-1's EntityId must bump ONLY writer-1 OFFERED_INCOMPATIBLE_QOS")
+           (%check :2c2-incompat-w2-zero
+                   (zerop (dds.dcps:offered-incompatible-qos-status-total-count (dds.dcps:get-offered-incompatible-qos-status dw2)))
+                   "writer-2 must NOT see writer-1's incompatible-qos")
+           ;; (4) UNMATCH threaded by EntityId decrements the RIGHT writer, sibling untouched.
+           (dds.dcps::%on-disc-unmatch p :remote-reader rr1 e-w1)
+           (%check :2c2-unmatch-w1-current-zero
+                   (zerop (dds.dcps:publication-matched-status-current-count (dds.dcps:get-publication-matched-status dw1)))
+                   "unmatch threaded with writer-1's EntityId must drop writer-1 PUBLICATION_MATCHED current_count to 0")
+           (%check :2c2-unmatch-w2-untouched
+                   (= 1 (dds.dcps:publication-matched-status-current-count (dds.dcps:get-publication-matched-status dw2)))
+                   "writer-2 current_count must stay 1 — writer-1's unmatch must NOT decrement its same-topic sibling (no missed/mis-directed decrement)"))
       (dds.dcps:delete-participant p))
     t))
 
@@ -9322,7 +9476,7 @@
                  (lambda (node remote local)
                    (declare (ignore node remote local)) verdict))
            (setf (dds.disc:disc-node-on-match node2)
-                 (lambda (kind remote)
+                 (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                    (declare (ignore remote))
                    (dds.pal:with-lock (m-lock) (push kind matches))))
            (dds.disc:announce-endpoints node1)
@@ -9394,7 +9548,7 @@
                  (lambda (node remote local)
                    (declare (ignore node remote local)) verdict))
            (setf (dds.disc:disc-node-on-match node2)
-                 (lambda (kind remote)
+                 (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                    (declare (ignore remote))
                    (dds.pal:with-lock (m-lock) (push kind matches))))
            (dds.disc:announce-endpoints node1)
@@ -9457,7 +9611,7 @@
                  (lambda (node remote local)
                    (declare (ignore node remote local)) verdict))
            (setf (dds.disc:disc-node-on-match node2)
-                 (lambda (kind remote)
+                 (lambda (kind remote &optional local-eid) (declare (ignore local-eid))
                    (declare (ignore remote))
                    (dds.pal:with-lock (m-lock) (push kind matches))))
            (dds.disc:announce-endpoints node1)

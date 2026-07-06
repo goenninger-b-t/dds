@@ -427,15 +427,15 @@
                (p (make-instance 'domain-participant :domain domain :node node :qos qos :enabled t)))
           ;; Install hooks BEFORE the receiver thread starts so no early SEDP match is lost.
           (setf (dds.disc:disc-node-on-match node)
-                (lambda (kind remote) (%on-disc-match p kind remote)))
+                (lambda (kind remote local-eid) (%on-disc-match p kind remote local-eid)))
           (setf (dds.disc:disc-node-on-unmatch node)
-                (lambda (direction remote) (%on-disc-unmatch p direction remote)))
+                (lambda (direction remote local-eid) (%on-disc-unmatch p direction remote local-eid)))
           (setf (dds.disc:disc-node-on-liveliness-changed node)
                 (lambda (guid alive-p) (%on-disc-liveliness-changed p guid alive-p)))
           (setf (dds.disc:disc-node-on-lifecycle-event node)
                 (lambda (wid sn kind kh sf) (%on-disc-lifecycle p wid sn kind kh sf)))
           (setf (dds.disc:disc-node-on-incompatible-qos node)
-                (lambda (kind remote bad) (%on-disc-incompatible p kind remote bad)))
+                (lambda (kind remote bad local-eid) (%on-disc-incompatible p kind remote bad local-eid)))
           (setf (dds.disc:disc-node-on-sample node)
                 (lambda () (%on-participant-sample p)))
           (setf (dds.disc:disc-node-on-inconsistent-topic node)
@@ -1457,6 +1457,14 @@
    delivery route's reader-EntityId back to its DCPS DataReader (dr-entity-id)."
   (find rid (%participant-readers p) :key #'dr-entity-id :test #'=))
 
+(defun* %participant-writer-by-entity-id (p wid)
+    (function (domain-participant (unsigned-byte 32)) (or null data-writer))
+  "The local DataWriter in P whose engine EntityId is WID, or NIL (WP-N-ENDPOINT-2C2, ADR 0048): writer-side
+   mirror of %participant-reader-by-entity-id (keyed on dw-entity-id). Maps the matched-local EntityId threaded
+   by %fire-match back to its DCPS DataWriter, so PUBLICATION_MATCHED/OFFERED_INCOMPATIBLE_QOS + the §8.5.2
+   crypto-token + the durability match-side land on the RIGHT same-topic writer (not the first-by-topic)."
+  (find wid (%participant-writers p) :key #'dw-entity-id :test #'=))
+
 (defun* %participant-readers-for-writer-guid (p guid)
     (function (domain-participant (simple-array (unsigned-byte 8) (16))) list)
   "The local DataReader(s) matched to remote writer GUID (WP-N-ENDPOINT-S5): reuse the S2 delivery
@@ -1957,18 +1965,20 @@
                   verdict missing))
         verdict))))
 
-(defun* %on-disc-match (p kind remote)
-    (function (domain-participant keyword dds.rtps.discovery:endpoint-data) t)
+(defun* %on-disc-match (p kind remote &optional local-eid)
+    (function (domain-participant keyword dds.rtps.discovery:endpoint-data &optional (or null (unsigned-byte 32))) t)
   "ON-MATCH hook: a remote endpoint matched a local one. :remote-writer -> our reader
    gained a publication (SUBSCRIPTION_MATCHED); :remote-reader -> our writer gained a
    subscription (PUBLICATION_MATCHED). The 16-octet remote GUID is the matched handle.
    Also records an ADVISORY type-object fingerprint verdict on the local entity (ADR 0009).
-   WP-N-ENDPOINT-S5 (ADR 0048): the local entity is resolved per-endpoint by the remote's TOPIC
-   (%participant-reader/writer-for-topic), so at N>=2 the status/listener lands on the RIGHT one."
+   WP-N-ENDPOINT-2C2 (ADR 0048): the matched LOCAL endpoint is resolved by the threaded LOCAL-EID
+   (%participant-reader/writer-by-entity-id) so at N>=2 SAME-topic the status/listener + the §8.5.2
+   crypto-token + the durability match-side land on the RIGHT endpoint (NIL -> topic fallback, byte-identical N=1)."
   (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote)))
         (tname (dds.rtps.discovery:endpoint-data-topic-name remote)))
     (ecase kind
-      (:remote-writer (let ((dr (%participant-reader-for-topic p tname)))
+      (:remote-writer (let ((dr (if local-eid (%participant-reader-by-entity-id p local-eid)
+                                    (%participant-reader-for-topic p tname))))
                         (when dr (%reader-matched dr handle)
                               ;; durability-aware late-joiner gate (DDS 1.4 §2.2.3.4): a TL reader matched
                               ;; a retaining writer REQUESTS its history; a VOLATILE reader matched a
@@ -1981,42 +1991,45 @@
                       ;; §8.5.2.3: our user reader matched a remote writer -> (re)send our DatareaderCryptoToken
                       ;; keyed to the REAL matched-remote writer GUID (the destination_endpoint_key fix).
                       (%cm-user-token-at-match p handle nil))
-      (:remote-reader (let ((dw (%participant-writer-for-topic p tname)))
+      (:remote-reader (let ((dw (if local-eid (%participant-writer-by-entity-id p local-eid)
+                                    (%participant-writer-for-topic p tname))))
                         (when dw (%writer-matched dw handle)
                               ;; durability-aware late-joiner proxy init (DDS 1.4 §2.2.3.4): a TL writer
                               ;; matched by a TL reader replays its retained history (firstSN + a prompt
                               ;; HEARTBEAT); else future-only. Reader durability is its advertised QoS.
+                              ;; WP-N-ENDPOINT-2C2: (dw-entity-id dw) == LOCAL-EID -> THIS matched writer's own history/GUID.
                               (dds.disc:%writer-durability-init
                                (dp-node p) handle
                                (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote))
-                               (dw-entity-id dw))   ; WP-N-ENDPOINT-S2B: prime THIS matched writer's own history/GUID
+                               (dw-entity-id dw))
                               (%assess-and-record-type-compat dw remote)))
                       ;; §8.5.2.2: our user writer matched a remote reader -> (re)send our DatawriterCryptoToken
-                      ;; keyed to the REAL matched-remote reader GUID (the destination_endpoint_key fix). WP-N-ENDPOINT-S3
-                      ;; (ADR 0048): resolve the ACTUAL matched local writer by the remote reader's TOPIC so each of N
-                      ;; secured writers sends its OWN token (NIL -> node-single fallback, byte-identical N=1).
-                      (%cm-user-token-at-match
-                       p handle t
-                       (dds.disc:%local-user-writer-id-for-topic
-                        (dp-node p) (dds.rtps.discovery:endpoint-data-topic-name remote))))))
+                      ;; keyed to the REAL matched-remote reader GUID (the destination_endpoint_key fix). WP-N-ENDPOINT-2C2
+                      ;; (ADR 0048): thread the ACTUAL matched local writer's LOCAL-EID so each of N SAME-topic secured
+                      ;; writers re-sends its OWN DW token keyed to its OWN EntityId (NIL -> node-single fallback, byte-identical N=1).
+                      (%cm-user-token-at-match p handle t local-eid))))
   t)
 
-(defun* %on-disc-unmatch (p direction remote)
-    (function (domain-participant keyword dds.rtps.discovery:endpoint-data) t)
+(defun* %on-disc-unmatch (p direction remote &optional local-eid)
+    (function (domain-participant keyword dds.rtps.discovery:endpoint-data &optional (or null (unsigned-byte 32))) t)
   "ON-UNMATCH hook: a previously matched remote endpoint vanished (participant-lease
    expiry, disc.lisp %lease-sweep). :remote-writer -> our reader lost a publication
    (SUBSCRIPTION_MATCHED current_count--); :remote-reader -> our writer lost a
-   subscription (PUBLICATION_MATCHED current_count--). The local entity is resolved per-endpoint by
-   the remote's TOPIC, the same way as %on-disc-match (WP-N-ENDPOINT-S5). The remote's
-   16-octet GUID is the unmatched handle (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §165/§174)."
+   subscription (PUBLICATION_MATCHED current_count--). WP-N-ENDPOINT-2C2 (ADR 0048): the matched LOCAL
+   endpoint is resolved by the threaded LOCAL-EID (fired once per (local,remote) pair by %lease-sweep) so at
+   N>=2 SAME-topic the DECREMENT lands on the RIGHT endpoint (NIL -> topic fallback, byte-identical N=1). The
+   remote's 16-octet GUID is the unmatched handle (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §165/§174)."
   (let ((handle (copy-seq (dds.rtps.discovery:endpoint-data-guid remote)))
         (tname (dds.rtps.discovery:endpoint-data-topic-name remote)))
     (ecase direction
-      (:remote-writer (let ((dr (%participant-reader-for-topic p tname)))
+      (:remote-writer (let ((dr (if local-eid (%participant-reader-by-entity-id p local-eid)
+                                    (%participant-reader-for-topic p tname))))
                         (when dr (%reader-unmatched dr handle)
                               (%clear-owner-on-vanish dr handle)   ; EXCLUSIVE owner loss -> takeover (S1)
                               (%on-writer-vanished dr (%guid-entityid handle)))))
-      (:remote-reader (let ((dw (%participant-writer-for-topic p tname))) (when dw (%writer-unmatched dw handle))))))
+      (:remote-reader (let ((dw (if local-eid (%participant-writer-by-entity-id p local-eid)
+                                    (%participant-writer-for-topic p tname))))
+                        (when dw (%writer-unmatched dw handle))))))
   t)
 
 (defun* %on-disc-liveliness-changed (p remote-writer-guid alive-p)
@@ -2033,16 +2046,21 @@
     (unless alive-p (%clear-owner-on-vanish dr remote-writer-guid)))
   t)
 
-(defun* %on-disc-incompatible (p kind remote bad)
-    (function (domain-participant keyword dds.rtps.discovery:endpoint-data list) t)
+(defun* %on-disc-incompatible (p kind remote bad &optional local-eid)
+    (function (domain-participant keyword dds.rtps.discovery:endpoint-data list &optional (or null (unsigned-byte 32))) t)
   "ON-INCOMPATIBLE-QOS hook: topic+type agreed but RxO failed. :remote-writer -> our
    reader's REQUESTED_INCOMPATIBLE_QOS; :remote-reader -> our writer's OFFERED_
    INCOMPATIBLE_QOS. BAD is the failing-policy keyword list (dds.qos:qos-rxo-compatible).
-   WP-N-ENDPOINT-S5 (ADR 0048): the local entity is resolved per-endpoint by the remote's TOPIC."
+   WP-N-ENDPOINT-2C2 (ADR 0048): the incompatible LOCAL endpoint is resolved by the threaded LOCAL-EID so at
+   N>=2 SAME-topic the status lands on the RIGHT endpoint (NIL -> topic fallback, byte-identical N=1)."
   (let ((tname (dds.rtps.discovery:endpoint-data-topic-name remote)))
     (ecase kind
-      (:remote-writer (let ((dr (%participant-reader-for-topic p tname))) (when dr (%reader-incompatible dr bad))))
-      (:remote-reader (let ((dw (%participant-writer-for-topic p tname))) (when dw (%writer-incompatible dw bad))))))
+      (:remote-writer (let ((dr (if local-eid (%participant-reader-by-entity-id p local-eid)
+                                    (%participant-reader-for-topic p tname))))
+                        (when dr (%reader-incompatible dr bad))))
+      (:remote-reader (let ((dw (if local-eid (%participant-writer-by-entity-id p local-eid)
+                                    (%participant-writer-for-topic p tname))))
+                        (when dw (%writer-incompatible dw bad))))))
   t)
 
 (defun* %on-participant-sample (p)

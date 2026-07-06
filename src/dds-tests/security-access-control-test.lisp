@@ -1310,7 +1310,10 @@
    (d) each writer got a DISTINCT km (distinct sender_key_id); (e) each writer's emitted DATA carries ITS OWN km's
    key_id (the send-crux RED->GREEN — pre-fix both would carry the node-single/last writer's key_id); (f) a REMOTE
    crypto-manager resolves + DECODES BOTH payloads by wire key_id, and a CROSS-key decode FAILS (fail-closed). The
-   send/decode assertions need OpenSSL (dare); the control-plane assertions (a,b,c,d) run unconditionally. Clasp FIRST."
+   send/decode assertions need OpenSSL (dare); the control-plane assertions (a,b,c,d) run unconditionally.
+   WP-N-ENDPOINT-2C2 (ADR 0048): (g) a 2nd SECURED writer on an ALREADY-HELD topic (Circle) now REGISTERS (fence B
+   lifted) with a DISTINCT EntityId and its OWN EntityCrypto km (distinct sender_key_id) — same-topic secured
+   multi-writer supported. Clasp FIRST."
   (let ((gov (dds.security:make-governance
               :discovery-protection-kind :none :liveliness-protection-kind :none :rtps-protection-kind :none
               :topic-rules
@@ -1418,11 +1421,30 @@
                            (%check :s3-cross-key-decode-fails
                                    (null (dds.security:decode-serialized-payload km2 sp1))
                                    "writer1's payload must NOT decode under writer2's km (each under its OWN km, fail-closed)"))))))
-                 ;; FIX 1 (review): a 2nd SECURED writer on an ALREADY-HELD topic fail-fasts (same-topic secured
-                 ;; multi-writer = later slice — the §8.5.2 destination-correction holds one writer per topic).
-                 (%check :s3-same-topic-secured-rejected
-                         (null (ignore-errors (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType") t))
-                         "a 2nd SECURED writer on an already-held topic (Circle) must FAIL-FAST — same-topic secured multi-writer holds one writer per topic for the crypto-token destination-correction")
+                 ;; WP-N-ENDPOINT-2C2 (ADR 0048): a 2nd SECURED writer on an ALREADY-HELD topic (Circle) now REGISTERS
+                 ;; (fence B lifted). %match-remote-endpoint fires per-(local,remote) pair -> each same-topic secured
+                 ;; writer's §8.5.2 crypto-token re-exchanges keyed to its OWN EntityId; it gets its OWN EntityCrypto km
+                 ;; (distinct sender_key_id). Prove: registers with a DISTINCT EntityId + a DISTINCT km from writer1's.
+                 (%check :s3-same-topic-secured-registers
+                         (ignore-errors (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType")
+                                        (dds.disc:enable-publisher node :history-kind :keep-all) t)
+                         "a 2nd SECURED writer on an already-held topic (Circle) must now REGISTER (WP-N-ENDPOINT-2C2 — same-topic secured multi-writer supported, each keyed under its OWN EntityId)")
+                 (let* ((wids2 (dds.disc::%all-user-writer-ids node))
+                        (e-new (find-if (lambda (w) (and (/= w e1) (/= w e2))) wids2)))   ; the 2nd Circle writer (neither original Circle=e1 nor Square=e2)
+                   (%check :s3-same-topic-secured-distinct-eid
+                           (and (= 3 (length wids2)) e-new (/= e-new e1))
+                           "the 2 SAME-topic secured Circle writers must have DISTINCT EntityIds (per-endpoint key, distinct SEDP GUID)")
+                   (let ((cm2 (dds.dcps::make-crypto-manager)))
+                     (dolist (e (dds.dcps::%cm-local-token-entities node))
+                       (dds.dcps::cm-register-local-entity
+                        cm2 (car e) :kind (dds.dcps::%cm-entity-protection-kind node (car e))))
+                     (let ((k-orig (dds.dcps::cm-encode-entity-km cm2 e1))
+                           (k-new  (and e-new (dds.dcps::cm-encode-entity-km cm2 e-new))))
+                       (%check :s3-same-topic-secured-distinct-km
+                               (and k-orig k-new
+                                    (not (equalp (dds.security:key-material-sender-key-id k-orig)
+                                                 (dds.security:key-material-sender-key-id k-new))))
+                               "each SAME-topic secured Circle writer must resolve its OWN EntityCrypto km (distinct sender_key_id) — no cross-endpoint km confusion"))))
                  ;; a NON-secured (governance data/metadata=NONE) topic keeps same-topic multi-writer (S1) — the guard is SCOPED to secured topics
                  (%check :s3-same-topic-nonsecured-ok
                          (and (ignore-errors (dds.disc:add-local-writer node :topic "Triangle" :type "ShapeType") t)

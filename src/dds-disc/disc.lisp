@@ -160,6 +160,7 @@
   (peers '() :type list)
   (discovered (make-hash-table :test 'equalp) :type hash-table)
   (matches (make-hash-table :test 'equalp) :type hash-table)
+  (match-pairs (make-hash-table :test 'equalp) :type hash-table) ; WP-N-ENDPOINT-2C2 (ADR 0048): per-(LOCAL,REMOTE) match set — remote 16-octet GUID (equalp) -> list of matched LOCAL user-endpoint EntityIds. The per-endpoint MATCHED status/crypto/durability fire idempotency key (once per pair, NOT per SEDP re-announce); the lease-sweep fires unmatch per pair. disc-node-matches stays per-remote (presence/count/HB-gate). Node-lock guarded.
   (incompat (make-hash-table :test 'equalp) :type hash-table)
   (inconsistent (make-hash-table :test 'equalp) :type hash-table)
   (parked-matches '() :type list) ; (direction . remote endpoint-data), TYPE-GATE :pending; stale snapshots are pre-empted by SEDP re-announce
@@ -1054,38 +1055,6 @@
                    (disc-node-user-reader-submessage-protection-kind node) t))
           (t (values :unset :none nil)))))
 
-(defun* %topic-secured-writer-p (node topic)
-    (function (disc-node string) boolean)
-  "WP-N-ENDPOINT-S3 (ADR 0048): T iff a user writer on TOPIC would be SECURED per governance — its
-   data_protection OR metadata_protection resolves non-NONE via the per-topic resolvers installed by
-   %install-access-control. Gates the same-topic SECURED multi-writer fail-fast: the §8.5.2 crypto-token
-   destination-correction re-exchange (%local-user-writer-id-for-topic) holds ONE writer per topic, so a 2nd
-   secured writer on the SAME topic would miss its match-time key install at a strict remote. No resolvers
-   (security OFF / Slice-1 direct-KM, no governance token exchange) -> NIL — the concern does not apply."
-  (let ((dres (disc-node-topic-data-protection-resolver node))
-        (mres (disc-node-topic-metadata-protection-resolver node)))
-    (or (and dres (and (member (funcall dres topic) '(:sign :encrypt)) t))
-        (and mres (and (member (funcall mres topic) '(:sign :encrypt)) t)))))
-
-(defun* %same-topic-durable-writer-conflict-p (node topic new-durability)
-    (function (disc-node string (member :volatile :transient-local :transient :persistent)) boolean)
-  "T iff registering a writer on TOPIC with NEW-DURABILITY would form a SAME-topic multi-writer in which the
-   NEW writer OR an EXISTING same-topic local writer advertises a RETAINING durability (TRANSIENT_LOCAL /
-   TRANSIENT / PERSISTENT, DDS 1.4 §2.2.3.4). Gates the WP-N-ENDPOINT-S2B same-topic-durable fail-fast in
-   add-local-writer: %match-remote-endpoint matches only the FIRST same-topic local writer per remote reader
-   (it (return-from ... t) after the first, and %guid-matched-p is keyed by the remote GUID), so a 2nd
-   same-topic durable writer's retained history would SILENTLY never replay to a matched late reader
-   (missing-history, the worst class). Same-topic VOLATILE writers stay allowed (S1) — a VOLATILE writer
-   retains nothing, so the match-first limitation loses no history there (that is 2c's concern)."
-  (let ((same (loop for ep in (disc-node-local-writers node)
-                    when (string= topic (dds.rtps.discovery:endpoint-data-topic-name ep)) collect ep)))
-    (and same
-         (or (not (eq new-durability :volatile))
-             (some (lambda (ep) (not (eq (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos ep))
-                                         :volatile)))
-                   same))
-         t)))
-
 (defun* add-local-writer (node &key (topic "") (type "")
                                    (reliability dds.rtps.discovery:+reliability-reliable+)
                                    (key nil) qos type-information (keyed t))
@@ -1099,36 +1068,14 @@
    (WP-N-ENDPOINT-S1, ADR 0048) so a 2nd/N-th DataWriter gets a distinct EntityId + SEDP GUID
    (the first stays #x0102/#x0103, byte-identical); pass an explicit KEY to pin it. Sets NODE's
    user-writer-id so enable-publisher registers + the data plane sends with this id.
-   WP-N-ENDPOINT-S3 DEFERRAL (ADR 0048): a 2nd SECURED writer on a topic ALREADY held by a local writer on
-   this participant FAIL-FASTS (same-topic secured multi-writer = later slice). The §8.5.2 crypto-token
-   destination-correction re-exchange resolves the local writer by topic and holds ONE per topic, so a 2nd
-   same-topic secured writer would miss its match-time key install at a STRICT remote (Fast DDS rejects a
-   wrong destination_endpoint_key) -> its samples undecodable there (fail-closed availability loss, never a
-   mis-sign). Two DISTINCT-topic secured writers (the S3 shipping capability) and two SAME-topic NON-secured
-   writers (S1) are both unaffected. Mirrors the add-local-reader same-topic guard.
-   WP-N-ENDPOINT-S2B DEFERRAL (ADR 0048 §14): a 2nd writer on a topic ALREADY held by a local writer on this
-   participant, where the NEW OR an existing same-topic writer is a RETAINING durability
-   (TRANSIENT_LOCAL/TRANSIENT/PERSISTENT), FAIL-FASTS (same-topic durable multi-writer = Slice 2c) —
-   %match-remote-endpoint matches only the FIRST same-topic writer, so the 2nd durable writer's retained
-   history would silently never replay. Same-topic VOLATILE writers stay allowed (S1). DISTINCT-topic durable
-   writers (the S2B shipping capability) are unaffected."
-  (when (and (%topic-secured-writer-p node topic)
-             (find topic (disc-node-local-writers node)
-                   :key #'dds.rtps.discovery:endpoint-data-topic-name :test #'string=))
-    (error "disc-node: refusing a 2nd SECURED local user DataWriter on topic ~s — same-topic secured ~
-            multi-writer on one participant is a later N-user-endpoint slice (the §8.5.2 crypto-token ~
-            destination-correction re-exchange holds one writer per topic today; a 2nd would miss its ~
-            match-time key install at a strict remote and its samples would be undecodable there). Use ~
-            distinct topics or separate participants."
-           topic))
+   WP-N-ENDPOINT-2C2 (ADR 0048): a 2nd/N-th SAME-topic user DataWriter — SECURED or RETAINING-durability
+   (TRANSIENT_LOCAL/TRANSIENT/PERSISTENT) — now REGISTERS (fences B + C lifted). %match-remote-endpoint fires
+   the match PER matched local writer keyed by the per-(local,remote) pair, so each same-topic writer gets its
+   OWN PUBLICATION_MATCHED, its OWN §8.5.2 crypto-token re-exchange keyed to its OWN EntityId (each secured
+   writer's DW CryptoToken carries its OWN km/sender_key_id), and its OWN durability match-side replay
+   (%writer-durability-init/%prearm with ITS writer-id). Distinct EntityIds/GUIDs on the wire are correct
+   (RTPS 2.5 §9.3.1.2). Byte-identical at N=1 / distinct topics."
   (let ((wqos (or qos (%qos-from-reliability reliability))))
-    (when (%same-topic-durable-writer-conflict-p node topic (dds.qos:qos-durability wqos))
-      (error "disc-node: refusing a 2nd local user DataWriter on topic ~s involving a RETAINING-durability ~
-              (TRANSIENT_LOCAL/TRANSIENT/PERSISTENT) writer — same-topic durable multi-writer on one ~
-              participant is a later N-user-endpoint slice (2c). %match-remote-endpoint matches only the ~
-              FIRST same-topic writer, so the 2nd durable writer's retained history would silently never ~
-              replay to a matched late reader. Use distinct topics or separate participants."
-             topic))
     (let* ((key (or key (%alloc-user-writer-key node)))
            (kind (if keyed #x02 #x03))
            (ep (dds.rtps.discovery:make-endpoint-data
@@ -1484,12 +1431,15 @@
             (- (%lease-now) (* seconds-ago internal-time-units-per-second)))))
   t)
 
-(defun* %fire-unmatch (node direction remote)
-    (function (disc-node keyword dds.rtps.discovery:endpoint-data) t)
+(defun* %fire-unmatch (node direction remote local-entity-id)
+    (function (disc-node keyword dds.rtps.discovery:endpoint-data (or null (unsigned-byte 32))) t)
   "Invoke the ON-UNMATCH hook (if installed) OUTSIDE the node lock for a REMOTE endpoint
-   unmatched by participant-lease expiry (DIRECTION :remote-writer / :remote-reader)."
+   unmatched by participant-lease expiry (DIRECTION :remote-writer / :remote-reader).
+   WP-N-ENDPOINT-2C2 (ADR 0048): LOCAL-ENTITY-ID is the matched LOCAL endpoint's EntityId (from the
+   per-pair match set), threaded so the status DECREMENT lands on the RIGHT same-topic endpoint; fired
+   once per (local,remote) pair. NIL -> the hook falls back to topic resolution (byte-identical N=1)."
   (when (disc-node-on-unmatch node)
-    (funcall (disc-node-on-unmatch node) direction remote)))
+    (funcall (disc-node-on-unmatch node) direction remote local-entity-id)))
 
 (defun* %purge-prefix (node prefix accessor)
     (function (disc-node (simple-array (unsigned-byte 8) (12)) function) t)
@@ -1514,21 +1464,29 @@
     (function (disc-node (simple-array (unsigned-byte 8) (12)) function) t)
   "Remove every match whose remote GUID prefix equals PREFIX, classify its direction
    from the GUID entity kind (a removed remote WRITER -> :remote-writer, READER ->
-   :remote-reader; RTPS 2.5 §9.3.1.2 Table 9.1 via %writer-guid-p/%reader-guid-p), and
-   push (direction . remote) via REMOVED-PLACE. CALLER HOLDS the node lock."
-  (let ((table (disc-node-matches node)) (dead '()))
+   :remote-reader; RTPS 2.5 §9.3.1.2 Table 9.1 via %writer-guid-p/%reader-guid-p), and push
+   (direction remote . local-entity-id) via REMOVED-PLACE. CALLER HOLDS the node lock.
+   WP-N-ENDPOINT-2C2 (ADR 0048): fire ONE unmatch entry PER matched (local,remote) PAIR (from
+   DISC-NODE-MATCH-PAIRS) so the status DECREMENT lands on the RIGHT same-topic endpoint(s); a remote
+   with no recorded pair (direct-injected match) fires one entry with LOCAL-ENTITY-ID NIL (topic fallback)."
+  (let ((table (disc-node-matches node)) (pairs (disc-node-match-pairs node)) (dead '()))
     (maphash (lambda (guid remote)
                (when (%guid-prefix-match-p guid prefix)
                  (push (cons guid remote) dead)))
              table)
     (dolist (entry dead)
-      (let* ((remote (cdr entry))
+      (let* ((key (car entry))
+             (remote (cdr entry))
              (guid (dds.rtps.discovery:endpoint-data-guid remote))
              (direction (cond ((%writer-guid-p guid) :remote-writer)
                               ((%reader-guid-p guid) :remote-reader)
-                              (t :remote-writer))))
-        (remhash (car entry) table)
-        (funcall removed-place (cons direction remote)))))
+                              (t :remote-writer)))
+             (eids (gethash key pairs)))
+        (remhash key table)
+        (remhash key pairs)
+        (if eids
+            (dolist (eid eids) (funcall removed-place (list* direction remote eid)))
+            (funcall removed-place (list* direction remote nil))))))
   t)
 
 (defun* %lease-sweep (node)
@@ -1561,7 +1519,7 @@
           (%collect-and-remove-matches node prefix
                                        (lambda (dm) (push dm removed)))
           (push prefix lost))))   ; ADR-0034 MINOR-4: fire on-participant-lost per dead peer OUTSIDE the lock
-    (dolist (dm removed) (%fire-unmatch node (car dm) (cdr dm)))
+    (dolist (dm removed) (%fire-unmatch node (car dm) (cadr dm) (cddr dm)))
     (dolist (prefix lost)
       (%prune-pvms-bootstrap-km node prefix)   ; ADR-0036/0040: prune the lost peer's PVMS bootstrap KM (disc-internal)
       (when (disc-node-on-participant-lost node)
@@ -1578,6 +1536,21 @@
       (if (nth-value 1 (gethash key (disc-node-matches node)))
           nil
           (progn (setf (gethash key (disc-node-matches node)) remote) t)))))
+
+(defun* %record-match-pair (node remote local-entity-id)
+    (function (disc-node dds.rtps.discovery:endpoint-data (unsigned-byte 32)) boolean)
+  "WP-N-ENDPOINT-2C2 (ADR 0048): record a matched (LOCAL-ENTITY-ID, REMOTE) PAIR in DISC-NODE-MATCH-PAIRS
+   (remote 16-octet GUID -> list of matched local EntityIds, lock-guarded). Returns T only the FIRST time
+   THIS pair is recorded, so the per-endpoint MATCHED status/crypto/durability fires once per (local,remote)
+   pair and NOT again on a SEDP RE-ANNOUNCE. disc-node-matches (per-remote presence) is recorded separately,
+   so matched-count / the HEARTBEAT gate are unchanged. At N=1 one local per remote -> per-pair == per-remote
+   (byte-identical)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let* ((key (copy-seq (dds.rtps.discovery:endpoint-data-guid remote)))
+           (eids (gethash key (disc-node-match-pairs node))))
+      (if (member local-entity-id eids :test #'=)
+          nil
+          (progn (setf (gethash key (disc-node-match-pairs node)) (cons local-entity-id eids)) t)))))
 
 (defun* %guid-matched-p (node guid)
     (function (disc-node (simple-array (unsigned-byte 8) (16))) t)
@@ -1636,11 +1609,15 @@
           nil
           (progn (setf (gethash key (disc-node-inconsistent node)) remote) t)))))
 
-(defun* %fire-match (node kind remote)
-    (function (disc-node keyword dds.rtps.discovery:endpoint-data) t)
-  "Invoke the ON-MATCH hook (if installed) once for a newly-matched REMOTE endpoint."
+(defun* %fire-match (node kind remote local-entity-id)
+    (function (disc-node keyword dds.rtps.discovery:endpoint-data (or null (unsigned-byte 32))) t)
+  "Invoke the ON-MATCH hook (if installed) once per newly-matched (LOCAL-ENTITY-ID, REMOTE) PAIR.
+   WP-N-ENDPOINT-2C2 (ADR 0048): LOCAL-ENTITY-ID is the EntityId of the matched LOCAL endpoint (the
+   one that RxO-matched REMOTE), threaded so the DCPS hook lands SUBSCRIPTION_MATCHED/PUBLICATION_MATCHED
+   + the §8.5.2 crypto-token + the durability match-side on the RIGHT same-topic endpoint (by EntityId),
+   never the first-by-topic; NIL -> the hook falls back to topic resolution (byte-identical N=1)."
   (when (disc-node-on-match node)
-    (funcall (disc-node-on-match node) kind remote)))
+    (funcall (disc-node-on-match node) kind remote local-entity-id)))
 
 (defun* %fire-inconsistent (node topic-name)
     (function (disc-node string) t)
@@ -1649,12 +1626,15 @@
   (when (disc-node-on-inconsistent-topic node)
     (funcall (disc-node-on-inconsistent-topic node) topic-name)))
 
-(defun* %fire-incompat (node kind remote bad)
-    (function (disc-node keyword dds.rtps.discovery:endpoint-data list) t)
+(defun* %fire-incompat (node kind remote bad local-entity-id)
+    (function (disc-node keyword dds.rtps.discovery:endpoint-data list (or null (unsigned-byte 32))) t)
   "Invoke the ON-INCOMPATIBLE-QOS hook (if installed) for a newly-detected RxO
-   incompatibility, passing the failing-policy keyword list BAD (FR-QOS-2 / FR-DCPS-3)."
+   incompatibility, passing the failing-policy keyword list BAD (FR-QOS-2 / FR-DCPS-3).
+   WP-N-ENDPOINT-2C2 (ADR 0048): LOCAL-ENTITY-ID is the incompatible LOCAL endpoint's EntityId, threaded
+   so REQUESTED/OFFERED_INCOMPATIBLE_QOS lands on the RIGHT same-topic endpoint (by EntityId); NIL ->
+   the hook falls back to topic resolution (byte-identical N=1)."
   (when (disc-node-on-incompatible-qos node)
-    (funcall (disc-node-on-incompatible-qos node) kind remote bad)))
+    (funcall (disc-node-on-incompatible-qos node) kind remote bad local-entity-id)))
 
 (defun* %record-discovered (table remote)
     (function (hash-table dds.rtps.discovery:endpoint-data) t)
@@ -1726,7 +1706,7 @@
    parks the decision for resume-parked-matches. Else, against a local on the SAME
    topic name: a different type name is an INCONSISTENT_TOPIC; a matching type whose
    QoS failed RxO is OFFERED/REQUESTED_INCOMPATIBLE_QOS (failing policies)."
-  (let ((incompat nil) (inconsistent nil) (parked nil) (writer-p (eq direction :remote-writer)))
+  (let ((incompat nil) (incompat-eid nil) (inconsistent nil) (parked nil) (writer-p (eq direction :remote-writer)))
     (dolist (local (if writer-p (disc-node-local-readers node) (disc-node-local-writers node)))
       (multiple-value-bind (ok bad)
           (if writer-p
@@ -1754,31 +1734,36 @@
                           (:incompatible nil) ; access denied; no INCONSISTENT_TOPIC
                           (:pending (%park-match node direction remote) (setf parked t))
                           (t
-                           ;; WP-ACKNACK-MATCH-GATE (DDS 1.4 §2.2.3.4; RTPS 2.5 §8.4.2.2): arm the writer-side
-                           ;; durability baseline BEFORE the match is recorded (before the reader becomes a
-                           ;; %reader-push-targets destination), on the FIRST match only (a re-announce must not
-                           ;; re-future past unsent LIVE samples) — closes the concurrent-publish window.
-                           (unless (or writer-p
-                                       (%guid-matched-p node (dds.rtps.discovery:endpoint-data-guid remote)))
-                             ;; WP-N-ENDPOINT-S2B: prearm the MATCHED local writer (LOCAL, resolved by RxO), not
-                             ;; the primary, so it and %writer-durability-init refine the SAME reader-proxy base.
-                             (%prearm-writer-future-base node (dds.rtps.discovery:endpoint-data-guid remote)
-                                                         (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local))))
-                           ;; WP-N-ENDPOINT-2C1 (ADR 0048): a matched remote WRITER -> record (this local reader <->
-                           ;; that writer-GUID) in the delivery route. The route holds a LIST, so route-add ALL
-                           ;; RxO-compatible local readers, not just the first — a 2nd same-topic reader is added too
-                           ;; (route-add-all); the %drain filter + the receive-hook demux then fan-out to both readers.
-                           (when writer-p
-                             (%reader-route-add node (dds.rtps.discovery:endpoint-data-guid remote)
-                                                (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local))))
-                           ;; per-REMOTE match event fires ONCE (idempotent %record-match); the per-LOCAL route-add
-                           ;; above runs for EVERY matching reader -> DO NOT return; continue the dolist (route-add-all).
-                           (when (%record-match node remote) (%fire-match node direction remote)))))))))
+                           ;; WP-N-ENDPOINT-2C2 (ADR 0048): fire the prearm/route-add/status PER matched LOCAL
+                           ;; endpoint, gated by the per-(local,remote) PAIR so each fires ONCE and NOT again on a
+                           ;; SEDP re-announce. LOCAL-EID = the matched local endpoint's EntityId (threaded to the hook).
+                           (let* ((remote-guid (dds.rtps.discovery:endpoint-data-guid remote))
+                                  (local-eid (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local)))
+                                  (first-pair (%record-match-pair node remote local-eid)))
+                             ;; WP-ACKNACK-MATCH-GATE (DDS 1.4 §2.2.3.4; RTPS 2.5 §8.4.2.2): arm the writer-side
+                             ;; durability baseline BEFORE the match is recorded (before the reader becomes a
+                             ;; %reader-push-targets destination), on the FIRST match of THIS (writer,reader) pair
+                             ;; only (a re-announce must not re-future past unsent LIVE samples). WP-N-ENDPOINT-2C2:
+                             ;; per-pair (was per-remote), so a 2nd same-topic writer's baseline is armed too.
+                             (when (and first-pair (not writer-p))
+                               (%prearm-writer-future-base node remote-guid local-eid))
+                             ;; WP-N-ENDPOINT-2C1 (ADR 0048): a matched remote WRITER -> route-add ALL RxO-compatible
+                             ;; local readers (the route holds a LIST; idempotent), so a 2nd same-topic reader is added too.
+                             (when writer-p
+                               (%reader-route-add node remote-guid local-eid))
+                             ;; per-REMOTE presence (matched-count / HB-gate / lease-sweep) — idempotent; unconditional.
+                             (%record-match node remote)
+                             ;; per-(local,remote) PAIR status/crypto/durability fire — once per pair, threading LOCAL-EID
+                             ;; so it lands on the RIGHT same-topic endpoint. DO NOT return; continue the dolist (all locals).
+                             (when first-pair (%fire-match node direction remote local-eid))))))))))
           ((string= (dds.rtps.discovery:endpoint-data-topic-name remote)
                     (dds.rtps.discovery:endpoint-data-topic-name local))
            (if (string= (dds.rtps.discovery:endpoint-data-type-name remote)
                         (dds.rtps.discovery:endpoint-data-type-name local))
-               (setf incompat bad)
+               ;; WP-N-ENDPOINT-2C2 (ADR 0048): capture the incompatible LOCAL endpoint's EntityId so
+               ;; REQUESTED/OFFERED_INCOMPATIBLE_QOS lands on the RIGHT same-topic endpoint (by EntityId).
+               (setf incompat bad
+                     incompat-eid (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local)))
                (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name local)))))))
     ;; WP-N-ENDPOINT-2C1: a PARKED (type-pending) local suppresses the incompat/inconsistent verdict for this
     ;; remote — the pending decision is not yet final (resume-parked-matches re-runs it); mirrors the pre-2c1
@@ -1786,7 +1771,7 @@
     (unless parked
       (cond
         ((and incompat (%record-incompat node remote))
-         (%fire-incompat node direction remote incompat))
+         (%fire-incompat node direction remote incompat incompat-eid))
         ((and inconsistent (%record-inconsistent node remote))
          (%fire-inconsistent node inconsistent)))))
   t)

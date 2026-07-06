@@ -3409,8 +3409,8 @@
    reliable retransmit — writer-B's sample is dropped, and B's periodic HEARTBEAT + the ACKNACK routed by writerId
    to B (%user-writer-for) repairs it while writer-A's already-delivered sample is untouched. Also asserts: a 2nd
    SECURED writer now REGISTERS (WP-N-ENDPOINT-S3, secured multi-writer supported — per-key derivation proven by
-   run-security-n-secured-writer-test); the remaining S1 DEFERRAL fail-fasts (a flow-controller on a 2-writer
-   participant -> Slice S1b; a 2nd writer with RETAINING durability -> later slice)."
+   run-security-n-secured-writer-test); and a 2nd SAME-topic durable writer now REGISTERS (WP-N-ENDPOINT-2C2,
+   fence C lifted — same-topic durable multi-writer supported; per-writer replay proven by run-dcps-durability-multiwriter-test)."
   (let* ((pp (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(1 1 1 1 1 1 1 1 1 1 1 1)))
          (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(2 2 2 2 2 2 2 2 2 2 2 2)))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(3 3 3 3 3 3 3 3 3 3 3 3)))
@@ -3519,23 +3519,103 @@
                                  "a 2nd RETAINING-durability writer must now REGISTER (WP-N-ENDPOINT-S2B — durable multi-writer supported)")
                          (assert (= 2 (length (%all-user-writer-ids dn))) ()
                                  "the participant must hold 2 durable user writers with distinct EntityIds (S2B)")
-                         ;; (4d) WP-N-ENDPOINT-S2B same-topic-durable fence: a 2nd writer on an ALREADY-HELD topic
-                         ;; where a RETAINING-durability writer is involved FAIL-FASTS (same-topic durable = 2c;
-                         ;; %match-remote-endpoint matches only the first same-topic writer -> silent missing-history).
-                         (assert (null (ignore-errors
-                                        (add-local-writer dn :topic "DA" :type "X"
-                                                             :qos (dds.qos:make-writer-qos :durability :transient-local))
-                                        t)) ()
-                                 "a 2nd SAME-topic (DA) durable writer must FAIL-FAST (same-topic durable multi-writer = Slice 2c)")
-                         ;; a 2nd SAME-topic VOLATILE writer stays allowed (S1) — the durable fence is scoped to RETAINING durability
+                         ;; (4d) WP-N-ENDPOINT-2C2: a 2nd SAME-topic (DA) durable writer now REGISTERS (fence C
+                         ;; LIFTED) — %match-remote-endpoint fires per-(local,remote) pair, so each same-topic durable
+                         ;; writer's match-side replay (%writer-durability-init / %prearm with ITS writer-id) is armed.
+                         ;; Full per-writer same-topic replay + cross-isolation is proven by run-dcps-durability-multiwriter-test.
+                         (assert (ignore-errors
+                                  (add-local-writer dn :topic "DA" :type "X"
+                                                       :qos (dds.qos:make-writer-qos :durability :transient-local))
+                                  (enable-publisher dn) t) ()
+                                 "a 2nd SAME-topic (DA) durable writer must now REGISTER (WP-N-ENDPOINT-2C2 — same-topic durable multi-writer supported)")
+                         (assert (>= (length (%all-user-writer-ids dn)) 3) ()
+                                 "the participant must now hold the 2nd same-topic durable writer with a distinct EntityId (2c-2)")
+                         ;; a 2nd SAME-topic VOLATILE writer stays allowed (S1)
                          (assert (ignore-errors
                                   (add-local-writer dn :topic "VA" :type "X")
                                   (add-local-writer dn :topic "VA" :type "X") t) ()
-                                 "two SAME-topic VOLATILE writers must still register (the S2B fence is scoped to RETAINING durability)"))
+                                 "two SAME-topic VOLATILE writers must still register (S1)"))
                (stop-node dn)))
            t)
       (setf *debug-drop-sample-numbers* nil)
       (stop-node pub) (stop-node suba) (stop-node subb))))
+
+(defun* run-n-same-topic-writer-dataplane-test ()
+    (function () (eql t))
+  "WP-N-ENDPOINT-2C2 (ADR 0048): ONE participant with TWO user DataWriters on the SAME topic, matched to ONE
+   remote reader participant. THE match-side dispatch slice. Asserts: (1) both writers get DISTINCT EntityIds/GUIDs
+   (S1); (2) the ON-MATCH hook fires ONCE PER (writer,reader) PAIR — the counting hook records BOTH writer EntityIds
+   for the :remote-reader match (pre-2c2 the per-remote %record-match gate fired for the FIRST same-topic writer
+   ONLY — the RED); (3) IDEMPOTENCY — repeated SEDP re-announce does NOT re-fire (still exactly 2, one per writer),
+   so PUBLICATION_MATCHED never double-counts; (4) DELIVERY — both writers publish and the remote reader receives
+   BOTH streams (2 samples, dedup by distinct source GUID, automatic once both are matched); (5) UNMATCH per pair —
+   %collect-and-remove-matches yields ONE unmatch entry PER matched (writer,reader) pair, each carrying its OWN
+   writer EntityId (so the DECREMENT lands on the RIGHT endpoint), not a single per-remote entry."
+  (let* ((pp (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(21 21 21 21 21 21 21 21 21 21 21 21)))
+         (pr (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(22 22 22 22 22 22 22 22 22 22 22 22)))
+         (pub (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0))
+         (sub (make-disc-node :guid-prefix pr :host "127.0.0.1" :port 0))
+         (payla (make-array 6 :element-type '(unsigned-byte 8) :initial-contents '(#xA1 #xA2 #xA3 #xA4 #xA5 #xA6)))
+         (paylb (make-array 6 :element-type '(unsigned-byte 8) :initial-contents '(#xB1 #xB2 #xB3 #xB4 #xB5 #xB6)))
+         (matched-eids '()))
+    (unwind-protect
+         (let (ida idb)
+           (let ((ea (add-local-writer pub :topic "STW" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)))
+             (enable-publisher pub)
+             (setf ida (disc-node-user-writer-id pub))
+             (let ((eb (add-local-writer pub :topic "STW" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)))
+               (enable-publisher pub)
+               (setf idb (disc-node-user-writer-id pub))
+               (assert (/= ida idb) () "the two SAME-topic DataWriters did not get DISTINCT EntityIds")
+               (assert (not (equalp (dds.rtps.discovery:endpoint-data-guid ea)
+                                    (dds.rtps.discovery:endpoint-data-guid eb)))
+                       () "the two SAME-topic DataWriters announce IDENTICAL SEDP GUIDs")))
+           (setf (disc-node-on-match pub)
+                 (lambda (kind remote local-eid)
+                   (declare (ignore remote))
+                   (when (eq kind :remote-reader) (push local-eid matched-eids))))
+           (add-local-reader sub :topic "STW" :type "X" :reliability dds.rtps.discovery:+reliability-reliable+)
+           (enable-subscriber sub)
+           (setf (disc-node-peers pub) (list (cons "127.0.0.1" (disc-node-port sub)))
+                 (disc-node-peers sub) (list (cons "127.0.0.1" (disc-node-port pub))))
+           (start-node pub) (start-node sub)
+           (announce-participant pub) (announce-participant sub)
+           (loop repeat 150
+                 until (and (plusp (disc-node-discovered-count pub)) (plusp (disc-node-discovered-count sub)))
+                 do (sleep 0.02))
+           (announce-endpoints pub) (announce-endpoints sub)
+           ;; drive the match; keep re-announcing (exercises the re-announce IDEMPOTENCY path) until both writers fired
+           (loop repeat 150
+                 until (and (= 2 (length (remove-duplicates matched-eids)))
+                            (plusp (disc-node-matched-count sub)))
+                 do (announce-endpoints pub) (announce-endpoints sub) (sleep 0.02))
+           ;; keep hammering re-announce so a double-count bug would show
+           (dotimes (i 20) (announce-endpoints pub) (announce-endpoints sub) (sleep 0.01))
+           ;; (2)+(3) exactly 2 fires, one per writer eid, NO double-count on re-announce
+           (assert (= 2 (length matched-eids)) ()
+                   "the ON-MATCH hook must fire EXACTLY twice (one per same-topic writer), no double-count on re-announce; got ~D" (length matched-eids))
+           (assert (and (member ida matched-eids :test #'=) (member idb matched-eids :test #'=)) ()
+                   "the ON-MATCH hook must fire for BOTH writer EntityIds (per-(local,remote) pair), not the first-by-topic only")
+           ;; (4) both writers deliver -> the remote reader receives BOTH streams
+           (publish-sample pub payla nil nil 0 nil ida)
+           (publish-sample pub paylb nil nil 0 nil idb)
+           (loop repeat 150 until (>= (node-sample-count sub) 2) do (announce-endpoints pub) (sleep 0.02))
+           (assert (>= (node-sample-count sub) 2) ()
+                   "the remote reader must receive BOTH same-topic writers' streams (2 samples, dedup by source GUID)")
+           ;; (5) UNMATCH per pair: %collect-and-remove-matches yields one entry PER matched writer, each with its own eid
+           (let ((removed '()))
+             (dds.pal:with-lock ((disc-node-lock pub))
+               (%collect-and-remove-matches pub (disc-node-guid-prefix sub)
+                                            (lambda (dm) (push dm removed))))
+             (assert (= 2 (length removed)) ()
+                     "unmatch (lease-sweep) must yield ONE entry PER matched (writer,reader) pair (2), not a single per-remote entry; got ~D" (length removed))
+             (let ((eids (mapcar #'cddr removed)))
+               (assert (every (lambda (dm) (eq :remote-reader (car dm))) removed) ()
+                       "each unmatch entry must be direction :remote-reader")
+               (assert (and (member ida eids :test #'eql) (member idb eids :test #'eql)) ()
+                       "unmatch must carry BOTH writers' EntityIds (so the DECREMENT lands on the RIGHT endpoint per writer)")))
+           t)
+      (stop-node pub) (stop-node sub))))
 
 (defun* run-n-writer-frag-heartbeat-test ()
     (function () (eql t))

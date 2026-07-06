@@ -392,7 +392,8 @@
                                      :history-kind :keep-all))
     (dds.disc:enable-subscriber node)
     (setf (dds.disc:disc-node-on-match node)
-          (lambda (kind remote)
+          (lambda (kind remote local-eid)
+            (declare (ignore local-eid))   ; the service holds one replay writer per topic (N=1 resolution)
             (when (eq kind :remote-reader)
               (dds.disc:%writer-durability-init
                node
