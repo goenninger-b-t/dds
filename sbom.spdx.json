@@ -3,7 +3,7 @@
   "@graph": [
     {
       "@id": "_:creationinfo",
-      "created": "2026-07-06T08:48:21Z",
+      "created": "2026-07-06T09:27:05Z",
       "createdBy": [
         "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t"
       ],
@@ -42,6 +42,12 @@
       "creationInfo": "_:creationinfo",
       "name": "Nathan Froyd",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/Nathan-Froyd",
+      "type": "Organization"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "Kalyanov Dmitry",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/Kalyanov-Dmitry",
       "type": "Organization"
     },
     {
@@ -96,8 +102,8 @@
       "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/CC-BY-ND-4.0",
       "software_downloadLocation": "https://github.com/goenninger-b-t/dds",
       "software_homePage": "https://github.com/goenninger-b-t/dds",
-      "software_packageUrl": "pkg:github/goenninger-b-t/dds@2628d03",
-      "software_packageVersion": "0.0.0-dev+git.2628d03",
+      "software_packageUrl": "pkg:github/goenninger-b-t/dds@62e1f7b",
+      "software_packageVersion": "0.0.0-dev+git.62e1f7b",
       "software_primaryPurpose": "library",
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
       "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/goenninger-b-t",
@@ -165,6 +171,27 @@
       "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-chipz",
       "to": [
         "https://github.com/goenninger-b-t/dds/sbom#package/chipz"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "sqlite",
+      "software_downloadLocation": "https://github.com/TeMPOraL/cl-sqlite",
+      "software_packageUrl": "pkg:generic/sqlite",
+      "software_packageVersion": "0.2.1",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/sqlite",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/Kalyanov-Dmitry",
+      "type": "software_Package"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-sqlite",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/sqlite"
       ],
       "type": "Relationship"
     },
@@ -267,21 +294,87 @@
     },
     {
       "creationInfo": "_:creationinfo",
+      "name": "The iterate authors",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/The-iterate-authors",
+      "type": "Organization"
+    },
+    {
+      "comment": "Transitive dependency of cl-sqlite (the SQLite persistence backend, ADR 0049). Not a direct dds-* :depends-on.",
+      "creationInfo": "_:creationinfo",
+      "name": "iterate",
+      "software_declaredLicense": "https://github.com/goenninger-b-t/dds/sbom#license/MIT",
+      "software_downloadLocation": "https://gitlab.common-lisp.net/iterate/iterate",
+      "software_packageUrl": "pkg:generic/iterate@1.6.0",
+      "software_packageVersion": "1.6.0",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/iterate",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/The-iterate-authors",
+      "type": "software_Package"
+    },
+    {
+      "comment": "transitive dependency (via cl-sqlite)",
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/depends-iterate",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/iterate"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "creationInfo": "_:creationinfo",
+      "name": "SQLite Consortium",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#agent/SQLite-Consortium",
+      "type": "Organization"
+    },
+    {
+      "comment": "Native SQLite engine backing the durability SQLite persistence backend (ADR 0049), loaded via cl-sqlite/CFFI. Public domain (no declared licence). Version 3.51.0 verified on this host (docs/provenance.md).",
+      "creationInfo": "_:creationinfo",
+      "name": "libsqlite3",
+      "software_downloadLocation": "https://www.sqlite.org/download.html",
+      "software_homePage": "https://www.sqlite.org/",
+      "software_packageUrl": "pkg:generic/libsqlite3@3.51.0",
+      "software_packageVersion": "3.51.0",
+      "software_primaryPurpose": "library",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#package/libsqlite3",
+      "suppliedBy": "https://github.com/goenninger-b-t/dds/sbom#agent/SQLite-Consortium",
+      "type": "software_Package"
+    },
+    {
+      "comment": "native runtime dependency (durability SQLite backend, ADR 0049)",
+      "creationInfo": "_:creationinfo",
+      "from": "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds",
+      "relationshipType": "dependsOn",
+      "spdxId": "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-libsqlite3",
+      "to": [
+        "https://github.com/goenninger-b-t/dds/sbom#package/libsqlite3"
+      ],
+      "type": "Relationship"
+    },
+    {
+      "creationInfo": "_:creationinfo",
       "element": [
         "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
         "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
+        "https://github.com/goenninger-b-t/dds/sbom#package/sqlite",
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#package/xmls",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
         "https://github.com/goenninger-b-t/dds/sbom#package/openssl",
+        "https://github.com/goenninger-b-t/dds/sbom#package/iterate",
+        "https://github.com/goenninger-b-t/dds/sbom#package/libsqlite3",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-cffi",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-chipz",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-sqlite",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/dependsOn-xmls",
         "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-sbcl",
-        "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-openssl"
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-openssl",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/depends-iterate",
+        "https://github.com/goenninger-b-t/dds/sbom#relationship/runtime-libsqlite3"
       ],
       "rootElement": [
         "https://github.com/goenninger-b-t/dds/sbom#package/common-lisp-dds"
@@ -301,6 +394,7 @@
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-bordeaux-threads-authors",
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-CFFI-authors",
         "https://github.com/goenninger-b-t/dds/sbom#agent/Nathan-Froyd",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/Kalyanov-Dmitry",
         "https://github.com/goenninger-b-t/dds/sbom#agent/Stelian-Ionescu-sionescu",
         "https://github.com/goenninger-b-t/dds/sbom#agent/Robert-P.-Goldman-rpgoldman",
         "https://github.com/goenninger-b-t/dds/sbom#tool/generate-sbom",
@@ -312,11 +406,16 @@
         "https://github.com/goenninger-b-t/dds/sbom#package/bordeaux-threads",
         "https://github.com/goenninger-b-t/dds/sbom#package/cffi",
         "https://github.com/goenninger-b-t/dds/sbom#package/chipz",
+        "https://github.com/goenninger-b-t/dds/sbom#package/sqlite",
         "https://github.com/goenninger-b-t/dds/sbom#package/static-vectors",
         "https://github.com/goenninger-b-t/dds/sbom#package/xmls",
         "https://github.com/goenninger-b-t/dds/sbom#package/sbcl",
         "https://github.com/goenninger-b-t/dds/sbom#agent/The-OpenSSL-Project",
         "https://github.com/goenninger-b-t/dds/sbom#package/openssl",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/The-iterate-authors",
+        "https://github.com/goenninger-b-t/dds/sbom#package/iterate",
+        "https://github.com/goenninger-b-t/dds/sbom#agent/SQLite-Consortium",
+        "https://github.com/goenninger-b-t/dds/sbom#package/libsqlite3",
         "https://github.com/goenninger-b-t/dds/sbom#sbom",
         "https://github.com/goenninger-b-t/dds/sbom#sbom"
       ],

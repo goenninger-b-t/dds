@@ -868,7 +868,66 @@ only; malicious whole-tail truncation + `epochs.dat` MAC deferred residuals, §8
 status 0, no SIGBUS, both impls; see §5.1)**;
 epoch-table retirement; **3c** metadata confidentiality; in-RAM plaintext minimization
 (honest pure-Lisp feasibility caveat); **P6** DDS-Security in-transit; and db/microservice
-persistence backends (the file backend is on the same vtable, so they drop in).
+persistence backends (**db backend RESOLVED — §8.8, ADR 0049: `make-sqlite-store` on the same
+vtable, config-selected via `make-sqlite-store-factory`**).
+
+### 8.8 SQLite persistence backend (ADR 0049)
+
+The `durable-store` vtable (`store.lisp:18-32`) **is the stable, fixed backend contract**: a
+`defstruct` of function slots (`put`/`get-range`/`topics`/`purge`/`open`/`close`/`count-fn`/`sync`/
+`set-chain-mac-fn`) behind the public `store-*` dispatchers. Every backend fills the **same** vtable
+unchanged; selection is the 0-arg store-factory closure on the service-spec. `make-sqlite-store`
+adds a **second on-disk backend** implementing that vtable — it does **not** fork or extend it.
+
+**Config-selection is a one-line factory swap.** `make-sqlite-store-factory` mirrors
+`make-persistent-store-factory` exactly — the only change is `make-sqlite-store` in place of
+`make-file-store`, wrapped by the **same** DARE decorator:
+
+```lisp
+(dds.durability:make-service-spec
+  :domain 0
+  :topics '(("Square" . "ShapeType"))
+  :store (dds.durability:make-sqlite-store-factory     ; <- the only change vs the file tier
+          :dir     #p"/var/lib/dds/durability/"        ; DB + epochs.dat + logmac.anchor
+          :key-dir #p"/var/lib/dds/keys/"))            ; ML-KEM keypair (0700/0600, fail-closed)
+```
+
+The composed store is `(make-encrypted-store (make-sqlite-store :path DIR/durability.sqlite3 …)
+(make-file-key-provider :dir K) :epoch-dir DIR)` — the SQLite store holds only **opaque sealed**
+payload bytes (it has zero crypto knowledge; the decorator seals the payload and delegates
+topics/purge/count/open/close/sync to it).
+
+**Schema** — one row per retained sample, keyed by `(topic, writer_guid, sn)`:
+
+```
+CREATE TABLE record (topic TEXT, writer_guid BLOB, sn BLOB, key_hash BLOB, kind INTEGER,
+                     payload BLOB, PRIMARY KEY (topic, writer_guid, sn));
+CREATE INDEX idx_topic_order ON record(topic, writer_guid, sn);
+```
+
+**The u64-SN choice.** DDS sequence numbers are unsigned 64-bit with no bound; SQLite `INTEGER` is
+**signed** 64-bit, so an SN ≥ 2^63 would sort negative (a silent reorder — the worst class of
+durability defect). SN is therefore stored as an **8-byte big-endian BLOB** (lexicographic == numeric
+u64 order, full range, no bound — matching the no-limit file/memory contract). `get-range` still
+sorts in Lisp via the shared `%record-guid-sn<`, so the returned order is **byte-exact identical** to
+the memory + file backends regardless of SQL collation.
+
+**Vtable semantics.** `put` = existence-check → T (idempotent) / bounded-full → `:rejected` /
+`INSERT OR IGNORE` (the same three-branch `cond` as the other stores). `open` is the
+**restart-recovery** entry point: a fresh `make-sqlite-store` on an existing DB path replays all prior
+rows (SQLite reopens the file), enforces 0700 on the DB dir (cleartext metadata, as the file store
+does), then runs compaction-on-open via the shared `%compact-topic-records`. `sync`/`close` do a
+`PRAGMA wal_checkpoint(FULL)` durability barrier (journal mode WAL, `synchronous=FULL`; durability is
+off the per-sample hot path, so maximum safety over throughput). `set-chain-mac-fn` is intentionally
+**NIL** — the per-row keyed MAC chain (the ADR 0045 analogue) is a documented follow-on; the slot
+no-ops, so the store composes cleanly with the encrypted decorator's v2 epoch mode.
+
+**Dependency.** `cl-sqlite` (ASDF `sqlite`, CFFI over `libsqlite3`) — impl-agnostic, loads +
+round-trips identically on Clasp and SBCL (no reader conditionals). Transitive: `iterate`; native:
+`libsqlite3` (SBOM + provenance recorded).
+
+**Follow-ons (deferred):** per-row keyed MAC chain (ADR 0045 analogue); incremental/SQL-side
+compaction at scale; metadata-3c confidentiality; dynamic-topic parity.
 
 ---
 
@@ -884,6 +943,7 @@ persistence backends (the file backend is on the same vtable, so they drop in).
 - ADR 0028 — Cross-vendor dual-relay exactly-once: live-captured convergence via logical-origin capture (dir-a N=545, dir-b N=550; resolves ADR 0027 §follow-on 1)
 - ADR 0029 — Per-instance KEEP_LAST compaction in the durability service (DDS 1.4 §2.2.3.5; file-store compaction-on-open + in-memory online eviction; service-spec via store-open; Connext M=302→2, Fast DDS M=134→2)
 - ADR 0030 — Graceful FFI teardown on SIGTERM/SIGINT (`dds.pal:install-signal-handler`; orderly drain supervisor-stop → runner-stop → store-close → uiop:quit 0; `kill -15` clean exit both impls; resolves ADR 0026 §10 item 3)
+- ADR 0049 — Durability SQLite persistence backend (`make-sqlite-store` / `make-sqlite-store-factory` on the fixed `durable-store` vtable; SN as big-endian BLOB; DARE-wrapped; §8.8; resolves the "db persistence backend" follow-on)
 - `docs/superpowers/specs/2026-06-19-durability-dare-design.md` — the DARE design spec
 - `docs/superpowers/specs/2026-06-20-durability-persistent-design.md` — the PERSISTENT design spec
 - `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md` — PID_ORIGINAL_WRITER_INFO spike
@@ -896,7 +956,7 @@ persistence backends (the file backend is on the same vtable, so they drop in).
 - `interop/durability-keeplast/` — KEEP_LAST restart-seed cross-DDS harness (Leg 1 Connext M=302→D=2, Leg 2 Fast DDS M=134→D=2); `spike/` — `PID_KEY_HASH` presence confirmations (767 Connext + 362 Fast DDS)
 - `interop/graceful-shutdown/` — `kill -15` clean-exit harness (`driver.lisp` + `run-kill15.sh`); both Clasp and SBCL: status 0, no SIGBUS (ADR 0030)
 - `src/dds-disc/disc.lisp` — `sample-origins` struct slot; `capture-data-key-hash` slot (KEEP_LAST, ADR 0029); `sample-key-hashes` table; `src/dds-disc/dataplane.lisp` — `node-sample-origin-guid` / `node-sample-origin-sn` (logical-origin accessors) + `%record-sample-origin` setter; `node-sample-key-hash (node key)` → captured `PID_KEY_HASH (0x0070)` per `(writer-guid . sn)` (ADR 0029)
-- `src/dds-durability/` — service implementation (store / store-file / spec / service / runner / supervisor / main / store-encrypted)
+- `src/dds-durability/` — service implementation (store / store-file / store-sqlite / spec / service / runner / supervisor / main / store-encrypted)
 - `src/dds-dare/` — DARE crypto (openssl-ffi / primitives / envelope / key-provider)
 - `src/dds-pal/pal-{sbcl,clasp}.lisp` — `fsync-stream` (group-commit; NFR-PORT split: SBCL `fdatasync(2)` / Clasp `finish-output`)
 - `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-durability-file-recovery-test`, `run-dare-*`, `run-durability-collect-origin-convergence-test`, `run-durability-keeplast-compaction-test`, `run-durability-keeplast-cross-restart-test`, `run-durability-keeplast-service-spec-policy-test`, `run-durability-keeplast-memory-test`)

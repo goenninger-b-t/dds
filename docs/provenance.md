@@ -3130,3 +3130,16 @@ public GitHub master for understanding only; no code copied into `src/`.
     unchanged §9.5.3.3.4.2 KDF. The ENCRYPT tier (§9.5.3.3.4.4) is byte-identical + UNCHANGED. `transform.lisp`
     branches on the km's `transformation_kind`; the GMAC uses `aes-256-gcm-seal-into`/`-open-into` with `pt-len`/`ct-len`
     0 (the ZA-2 submessage-SIGN GMAC-into pattern reused at the payload tier). NO RTI Connext source consulted. CLEAN-ROOM.
+
+## WP-DURABILITY-SQLITE (2026-07-06) — SQLite persistence backend (ADR 0049)
+
+- **cl-sqlite (ASDF system `sqlite`, Kalyanov Dmitry, Public Domain) — USED as a dependency**
+  (Quicklisp dist 2026-01-01). CFFI binding over the native `libsqlite3` — the same impl-agnostic
+  native-FFI seam `dds-dare` uses for OpenSSL, so it loads + round-trips identically on Clasp and
+  SBCL (verified as the mandatory first step; no reader conditionals). The durability SQLite backend
+  (`src/dds-durability/store-sqlite.lisp`) is written from the OMG DDS durability contract + the
+  existing in-repo `durable-store` vtable (`store.lisp`) and file-store sibling (`store-file.lisp`);
+  the SQL is standard SQLite DDL/DML. Transitive dependency **iterate** (1.6.0, MIT). Native runtime
+  **libsqlite3** (3.51.0 verified on this host). All three added to `sbom.spdx.json` via
+  `scripts/generate-sbom.py`. **No RTI Connext source/headers/generated code consulted or copied.**
+  **No other DDS implementation's persistence code read.** CLEAN-ROOM.

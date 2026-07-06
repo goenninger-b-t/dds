@@ -53,6 +53,23 @@ COMPONENTS = {
     "openssl":          {"version": "3.6.2", "license": "Apache-2.0",
                          "download": "https://www.openssl.org/source/",
                          "supplier": "The OpenSSL Project"},
+    # cl-sqlite (ASDF system "sqlite") is a top-level :depends-on of dds-durability (the SQLite
+    # persistence backend, ADR 0049) — auto-discovered from the .asd scan below. Public-domain
+    # (its .asd declares "Public Domain" -> no SPDX declared licence, NOASSERTION).
+    "sqlite":           {"version": "0.2.1", "license": "NOASSERTION",
+                         "download": "https://github.com/TeMPOraL/cl-sqlite",
+                         "supplier": "Kalyanov Dmitry"},
+    # iterate is a TRANSITIVE dependency of cl-sqlite (not an ASDF :depends-on of any dds-*.asd),
+    # so it is emitted as a standalone library package below (mirroring the OpenSSL pattern).
+    "iterate":          {"version": "1.6.0", "license": "MIT",
+                         "download": "https://gitlab.common-lisp.net/iterate/iterate",
+                         "supplier": "The iterate authors"},
+    # libsqlite3 is the NATIVE runtime dependency of cl-sqlite (loaded through CFFI, not an ASDF
+    # :depends-on), so it is emitted as a native runtime package below (mirroring OpenSSL). Public
+    # domain. 3.51.0 verified on this host (docs/provenance.md).
+    "libsqlite3":       {"version": "3.51.0", "license": "NOASSERTION",
+                         "download": "https://www.sqlite.org/download.html",
+                         "supplier": "SQLite Consortium"},
 }
 
 
@@ -111,6 +128,8 @@ def main():
     root_pkg = NS + "package/common-lisp-dds"
     rt_pkg = NS + "package/sbcl"
     openssl_pkg = NS + "package/openssl"
+    iterate_pkg = NS + "package/iterate"
+    libsqlite3_pkg = NS + "package/libsqlite3"
 
     graph = []
     elements = []   # every spdxId-bearing element (for SpdxDocument.element)
@@ -230,10 +249,59 @@ def main():
                   "from": root_pkg, "to": [openssl_pkg], "relationshipType": "dependsOn",
                   "comment": "native runtime dependency (dds-dare CNSA-2.0 DARE; OpenSSL >= 3.5)"})
 
+    # Transitive library: iterate (a dependency of cl-sqlite; not an ASDF :depends-on of any dds-*
+    # system, so emitted explicitly here — CRA Annex I coverage of the resolved dependency set).
+    it_meta = COMPONENTS["iterate"]
+    it_sup = it_meta["supplier"]
+    if it_sup not in suppliers:
+        it_sup_id = NS + "agent/" + slug(it_sup)
+        suppliers[it_sup] = it_sup_id
+        graph.append({"spdxId": it_sup_id, "type": "Organization", "creationInfo": ci, "name": it_sup})
+        elements.append(it_sup_id)
+    graph.append({"spdxId": iterate_pkg, "type": "software_Package", "creationInfo": ci,
+                  "name": "iterate", "software_packageVersion": it_meta["version"],
+                  "software_downloadLocation": it_meta["download"],
+                  "software_packageUrl": "pkg:generic/iterate@" + it_meta["version"],
+                  "software_primaryPurpose": "library",
+                  "software_declaredLicense": lic_mit, "suppliedBy": suppliers[it_sup],
+                  "comment": "Transitive dependency of cl-sqlite (the SQLite persistence backend, "
+                             "ADR 0049). Not a direct dds-* :depends-on."})
+    elements.append(iterate_pkg)
+    it_rel = NS + "relationship/depends-iterate"
+    relationships.append(it_rel)
+    graph.append({"spdxId": it_rel, "type": "Relationship", "creationInfo": ci,
+                  "from": root_pkg, "to": [iterate_pkg], "relationshipType": "dependsOn",
+                  "comment": "transitive dependency (via cl-sqlite)"})
+
+    # Native runtime: libsqlite3 (the SQLite engine cl-sqlite loads via CFFI, not an ASDF
+    # :depends-on, so emitted explicitly — CRA Annex I top-level coverage). Public domain.
+    sq_meta = COMPONENTS["libsqlite3"]
+    sq_sup = sq_meta["supplier"]
+    if sq_sup not in suppliers:
+        sq_sup_id = NS + "agent/" + slug(sq_sup)
+        suppliers[sq_sup] = sq_sup_id
+        graph.append({"spdxId": sq_sup_id, "type": "Organization", "creationInfo": ci, "name": sq_sup})
+        elements.append(sq_sup_id)
+    graph.append({"spdxId": libsqlite3_pkg, "type": "software_Package", "creationInfo": ci,
+                  "name": "libsqlite3", "software_packageVersion": sq_meta["version"],
+                  "software_downloadLocation": sq_meta["download"],
+                  "software_homePage": "https://www.sqlite.org/",
+                  "software_packageUrl": "pkg:generic/libsqlite3@" + sq_meta["version"],
+                  "software_primaryPurpose": "library", "suppliedBy": suppliers[sq_sup],
+                  "comment": "Native SQLite engine backing the durability SQLite persistence backend "
+                             "(ADR 0049), loaded via cl-sqlite/CFFI. Public domain (no declared "
+                             "licence). Version 3.51.0 verified on this host (docs/provenance.md)."})
+    elements.append(libsqlite3_pkg)
+    sq_rel = NS + "relationship/runtime-libsqlite3"
+    relationships.append(sq_rel)
+    graph.append({"spdxId": sq_rel, "type": "Relationship", "creationInfo": ci,
+                  "from": root_pkg, "to": [libsqlite3_pkg], "relationshipType": "dependsOn",
+                  "comment": "native runtime dependency (durability SQLite backend, ADR 0049)"})
+
     # The SBOM element (its rootElement is the product; contents are deps + relationships).
     graph.append({"spdxId": sbom_id, "type": "software_Sbom", "creationInfo": ci,
                   "software_sbomType": ["source"], "rootElement": [root_pkg],
-                  "element": dep_ids + [rt_pkg, openssl_pkg] + relationships})
+                  "element": dep_ids + [rt_pkg, openssl_pkg, iterate_pkg, libsqlite3_pkg] + relationships})
     elements.append(sbom_id)
 
     # The containing document.

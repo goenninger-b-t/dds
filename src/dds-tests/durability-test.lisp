@@ -1876,6 +1876,293 @@
         (uiop:delete-directory-tree tmp-dir :validate t))))
   t)
 
+;;; --- SQLite backend (WP-DURABILITY-SQLITE, ADR 0049) ---
+;;; The SQLite store implements the SAME fixed durable-store vtable as make-file-store, so it must
+;;; pass the SAME oracle contract tests: byte-exact record round-trip, (writer-guid, sn) ascending
+;;; ordering, idempotent re-put, bounded reject, RESTART-RECOVERY from the DB file, DARE-wrapped
+;;; transparency, and config-selected service restart -> replay.
+
+(defun* %sqlite-load-smoke ()
+    (function () boolean)
+  "Prove :sqlite loads + a put/get works in-process (the both-impls load smoke as a suite test)."
+  (let ((db (sqlite:connect ":memory:")))
+    (unwind-protect
+         (progn
+           (sqlite:execute-non-query db "create table t(a)")
+           (sqlite:execute-non-query db "insert into t values(?)" 7)
+           (= 7 (sqlite:execute-single db "select a from t")))
+      (sqlite:disconnect db))))
+
+(defun* run-durability-sqlite-load-test ()
+    (function () t)
+  "cl-sqlite loads and a put/get round-trips (the both-impls :sqlite load smoke, in-suite)."
+  (%check :sqlite-load (%sqlite-load-smoke) ":sqlite loads + put/get round-trips")
+  t)
+
+(defun* %sqlite-tmp-db-path (tag)
+    (function (string) pathname)
+  "A fresh temp DB file path under a unique per-run directory."
+  (uiop:merge-pathnames*
+   (make-pathname :name "durability" :type "sqlite3")
+   (uiop:merge-pathnames*
+    (make-pathname :directory (list :relative (format nil "dds-sqlite-~a-~a" tag (get-universal-time))))
+    (uiop:temporary-directory))))
+
+(defun* run-durability-sqlite-store-test ()
+    (function () t)
+  "make-sqlite-store vtable contract: put 5 records across 2 topics, get-range byte-exact + sorted,
+   idempotent re-put, topics=2, count=5, bounded reject, multi-writer byte-order; then REOPEN a fresh
+   store on the same DB path and verify all 5 survive (restart recovery)."
+  (let* ((db-path (%sqlite-tmp-db-path "store"))
+         (tmp-dir (uiop:pathname-directory-pathname db-path))
+         (g0 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+         (g1 (let ((v (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref v 0) 1) v))
+         (p (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (s (dds.durability:make-sqlite-store :path db-path)))
+    (unwind-protect
+         (progn
+           (dds.durability:store-open s)
+           (%check :sq-put-a1 (eq t (dds.durability:store-put s "A" g0 1 nil :data (funcall p '(10 20)))) "put A/g0/1")
+           (%check :sq-put-a2 (eq t (dds.durability:store-put s "A" g0 2 nil :data (funcall p '(30 40)))) "put A/g0/2")
+           (%check :sq-put-a3 (eq t (dds.durability:store-put s "A" g1 1 nil :dispose (funcall p '(50)))) "put A/g1/1 dispose")
+           (%check :sq-put-b1 (eq t (dds.durability:store-put s "B" g0 1 nil :data (funcall p '(1 2 3)))) "put B/g0/1 data")
+           (%check :sq-put-b2 (eq t (dds.durability:store-put s "B" g1 5 nil :unregister (funcall p '(99)))) "put B/g1/5 unregister")
+           (%check :sq-count-total (= 5 (dds.durability:store-count s)) "total count 5")
+           (%check :sq-count-a     (= 3 (dds.durability:store-count s "A")) "topic A count 3")
+           (%check :sq-count-b     (= 2 (dds.durability:store-count s "B")) "topic B count 2")
+           (%check :sq-topics (equal '("A" "B") (sort (copy-list (dds.durability:store-topics s)) #'string<)) "topics A+B")
+           (let ((recs-a (dds.durability:store-get-range s "A")))
+             (%check :sq-a-len  (= 3 (length recs-a)) "A get-range 3 records")
+             (%check :sq-a-ord0 (and (equalp g0 (dds.durability:durable-record-writer-guid (first recs-a)))
+                                     (= 1 (dds.durability:durable-record-sn (first recs-a)))) "A[0] is g0/sn1")
+             (%check :sq-a-ord1 (and (equalp g0 (dds.durability:durable-record-writer-guid (second recs-a)))
+                                     (= 2 (dds.durability:durable-record-sn (second recs-a)))) "A[1] is g0/sn2")
+             (%check :sq-a-ord2 (and (equalp g1 (dds.durability:durable-record-writer-guid (third recs-a)))
+                                     (= 1 (dds.durability:durable-record-sn (third recs-a)))) "A[2] is g1/sn1")
+             (%check :sq-a-kind2 (eq :dispose (dds.durability:durable-record-kind (third recs-a))) "A[2] kind dispose round-trips")
+             (%check :sq-a-payload0 (equalp (funcall p '(10 20)) (dds.durability:durable-record-payload (first recs-a))) "A[0] payload byte-exact")
+             (%check :sq-a-payload2 (equalp (funcall p '(50)) (dds.durability:durable-record-payload (third recs-a))) "A[2] payload byte-exact"))
+           (%check :sq-reput (eq t (dds.durability:store-put s "A" g0 1 nil :data (funcall p '(99)))) "re-put A/g0/1 -> T")
+           (%check :sq-reput-count (= 5 (dds.durability:store-count s)) "count still 5 after re-put")
+           ;; multi-writer ordering: guid first-byte 2 must precede guid first-byte 10 (byte order, not string<)
+           (let ((gw2  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+                 (gw10 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+             (setf (aref gw2 0) 2) (setf (aref gw10 0) 10)
+             (dds.durability:store-put s "T" gw10 1 nil :data (funcall p '(10)))
+             (dds.durability:store-put s "T" gw2  1 nil :data (funcall p '(2)))
+             (let ((recs (dds.durability:store-get-range s "T")))
+               (%check :sq-multi-writer-order (= 2 (aref (dds.durability:durable-record-writer-guid (first recs)) 0))
+                       "byte-2 guid must precede byte-10 guid in store-get-range")))
+           ;; bounded store rejects when full (idempotent re-put of an existing key still returns T)
+           (let* ((bdb (%sqlite-tmp-db-path "bounded"))
+                  (bs (dds.durability:make-sqlite-store :path bdb :max-samples 1)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:store-open bs)
+                    (%check :sq-bounded-put (eq t (dds.durability:store-put bs "A" g0 1 nil :data (funcall p '(1)))) "bounded put1 ok")
+                    (%check :sq-bounded-dup (eq t (dds.durability:store-put bs "A" g0 1 nil :data (funcall p '(1)))) "bounded re-put still T")
+                    (%check :sq-bounded (eq :rejected (dds.durability:store-put bs "A" g0 2 nil :data (funcall p '(2)))) "full store rejects"))
+               (ignore-errors (dds.durability:store-close bs))
+               (when (uiop:directory-exists-p (uiop:pathname-directory-pathname bdb))
+                 (uiop:delete-directory-tree (uiop:pathname-directory-pathname bdb) :validate t))))
+           (dds.durability:store-close s)
+           ;; RESTART RECOVERY: fresh store on the same DB path replays all prior rows byte-exact
+           (let ((s2 (dds.durability:make-sqlite-store :path db-path)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:store-open s2)
+                    (%check :sq-reopen-count  (= 7 (dds.durability:store-count s2)) "reopen: count=7 (5 + 2 multi-writer)")
+                    (%check :sq-reopen-topics (equal '("A" "B" "T")
+                                                     (sort (copy-list (dds.durability:store-topics s2)) #'string<))
+                            "reopen: topics A+B+T")
+                    (let ((recs2 (dds.durability:store-get-range s2 "A")))
+                      (%check :sq-reopen-a-len (= 3 (length recs2)) "reopen A: 3 records")
+                      (%check :sq-reopen-a-ord (and (= 1 (dds.durability:durable-record-sn (first recs2)))
+                                                    (= 2 (dds.durability:durable-record-sn (second recs2))))
+                              "reopen A ordering survives restart")
+                      (%check :sq-reopen-a-payload0
+                              (equalp (funcall p '(10 20)) (dds.durability:durable-record-payload (first recs2)))
+                              "reopen A[0] payload byte-exact")
+                      (%check :sq-reopen-a-kind2 (eq :dispose (dds.durability:durable-record-kind (third recs2)))
+                              "reopen A[2] kind byte-exact"))
+                    (dds.durability:store-close s2))
+               (ignore-errors (dds.durability:store-close s2)))))
+      (ignore-errors (dds.durability:store-close s))
+      (when (uiop:directory-exists-p tmp-dir)
+        (uiop:delete-directory-tree tmp-dir :validate t))))
+  t)
+
+(defun* %sqlite-read-db-bytes (dir)
+    (function (pathname) (simple-array (unsigned-byte 8) (*)))
+  "Concatenate every raw byte of the SQLite DB files in DIR (main + -wal/-shm sidecars) for the
+   no-plaintext-on-disk assertion (mirrors %pst-read-all-log-bytes for the file store)."
+  (let ((out '()))
+    (dolist (path (uiop:directory-files dir))
+      (let ((tp (pathname-type path)))
+        (when (and (stringp tp) (search "sqlite3" tp))
+          (with-open-file (s path :element-type '(unsigned-byte 8))
+            (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+              (read-sequence v s)
+              (push v out))))))
+    (let* ((total (reduce #'+ out :key #'length :initial-value 0))
+           (cat   (make-array total :element-type '(unsigned-byte 8)))
+           (pos   0))
+      (dolist (v (nreverse out) cat)
+        (replace cat v :start1 pos)
+        (incf pos (length v))))))
+
+(defun* run-durability-sqlite-dare-test ()
+    (function () t)
+  "DARE-wrapped SQLite store: make-encrypted-store over make-sqlite-store seals payloads; put N,
+   get-range byte-exact (DARE transparent), and no plaintext sample appears in the DB file."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [sqlite-dare] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-sqlite-dare-test t)))
+  (let* ((db-path (%sqlite-tmp-db-path "dare"))
+         (tmp-dir (uiop:pathname-directory-pathname db-path))
+         (n 5)
+         (g0 (make-array 16 :element-type '(unsigned-byte 8) :initial-element 3))
+         (kp (dds.dare:make-file-key-provider :dir tmp-dir))
+         (store (dds.durability:make-encrypted-store
+                 (dds.durability:make-sqlite-store :path db-path) kp :epoch-dir tmp-dir)))
+    (unwind-protect
+         (progn
+           (dds.durability:store-open store)
+           (dotimes (i n)
+             (%check (intern (format nil "SQ-DARE-PUT-~d" i) :keyword)
+                     (eq t (dds.durability:store-put store "Enc" g0 (1+ i) nil :data (%make-small-payload (1+ i))))
+                     "encrypted put ok"))
+           (%check :sq-dare-count (= n (dds.durability:store-count store "Enc")) "encrypted store count N")
+           (let ((recs (dds.durability:store-get-range store "Enc")))
+             (%check :sq-dare-len (= n (length recs)) "decrypted get-range N records")
+             (loop for r in recs for i from 1
+                   do (%check (intern (format nil "SQ-DARE-EXACT-~d" i) :keyword)
+                              (equalp (%make-small-payload i) (dds.durability:durable-record-payload r))
+                              "decrypted payload byte-exact")))
+           ;; sync to flush the WAL into the DB file, then scan: no plaintext sample on disk
+           (dds.durability:store-sync store)
+           (let ((raw (%sqlite-read-db-bytes tmp-dir)))
+             (dotimes (i n)
+               (%check (intern (format nil "SQ-DARE-NO-PLAINTEXT-~d" i) :keyword)
+                       (not (%pst-subseq-present-p raw (%make-small-payload (1+ i))))
+                       "DARE at-rest: plaintext sample must not appear in the DB file"))))
+      (ignore-errors (dds.durability:store-close store))
+      (when (uiop:directory-exists-p tmp-dir)
+        (uiop:delete-directory-tree tmp-dir :validate t))))
+  t)
+
+;;; Config-selected SQLite service restart -> replay: identical to run-durability-persistent-service-test
+;;; but the store factory is make-sqlite-store-factory (the vtable is the fixed contract both fill).
+;;; Domain +td-persistent-service+ (sequential run, distinct guid prefixes avoid stale-socket confusion).
+
+(defun* run-durability-sqlite-service-test ()
+    (function () t)
+  "PERSISTENT SQLite service tier: write N TL samples; service-stop (store persists to DB); fresh
+   service on same dirs simulates restart (store-open replays); TL late-joiner receives all N byte-exact."
+  (unless (dds.dare:dare-available-p)
+    (format t "~&  [sqlite-service] SKIP — OpenSSL >= 3.5 not available~%")
+    (return-from run-durability-sqlite-service-test t))
+  (let* ((n 4)
+         (tmp-dir (uiop:merge-pathnames*
+                   (make-pathname :directory (list :relative (format nil "dds-sqlite-svc-~a" (get-universal-time))))
+                   (uiop:temporary-directory)))
+         (key-dir (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) tmp-dir)))
+    (unwind-protect
+         (progn
+           ;; --- run 1: publisher writes N samples, service collects + persists to SQLite ---
+           (let* ((spec1 (dds.durability:make-service-spec
+                          :domain (test-domain +td-persistent-service+)
+                          :topics '(("QSquare" . "ShapeType"))
+                          :store (dds.durability:make-sqlite-store-factory :dir tmp-dir :key-dir key-dir)
+                          :name "sqlite-run1"))
+                  (svc1  (dds.durability:make-durability-service spec1))
+                  (pub-prefix (%make-test-prefix #xC7))
+                  (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain (test-domain +td-persistent-service+)
+                                                     :host "127.0.0.1" :port 0 :multicast nil)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:service-start svc1)
+                    (let ((svc1-node (dds.durability:durability-service-node svc1)))
+                      (setf (dds.disc:disc-node-peers pub-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port svc1-node))))
+                      (setf (dds.disc:disc-node-peers svc1-node) (list (cons "127.0.0.1" 0)))
+                      (dds.disc:add-local-writer pub-node :topic "QSquare" :type "ShapeType"
+                                                 :qos (dds.qos:make-writer-qos :reliability :reliable :durability :transient-local))
+                      (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+                      (dds.disc:start-node pub-node)
+                      (setf (dds.disc:disc-node-peers svc1-node)
+                            (list (cons "127.0.0.1" (dds.disc:disc-node-port pub-node))))
+                      (%await-match pub-node svc1-node :retries 300 :sleep-s 0.02)
+                      (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+                      (loop repeat 80 do (%announce-both pub-node svc1-node) (sleep 0.05))
+                      (%await-store-count (dds.durability:durability-service-store svc1) "QSquare" n)
+                      (%check :sqlite-svc-collect
+                              (= n (dds.durability:store-count (dds.durability:durability-service-store svc1) "QSquare"))
+                              (format nil "run1: service should collect ~d before stop" n))
+                      (ignore-errors (dds.disc:stop-node pub-node))))
+               (ignore-errors (dds.durability:service-stop svc1))))
+           ;; DARE-at-rest through the SERVICE composition: no plaintext sample in the DB file.
+           (let ((raw (%sqlite-read-db-bytes tmp-dir)))
+             (dotimes (i n)
+               (%check :sqlite-svc-no-plaintext
+                       (not (%pst-subseq-present-p raw (%make-small-payload (1+ i))))
+                       (format nil "sqlite service-tier DARE: plaintext sample ~d must not appear on disk" (1+ i)))))
+           ;; --- run 2: fresh service on same dirs simulates restart -> store-open replays ---
+           (let* ((spec2 (dds.durability:make-service-spec
+                          :domain (test-domain +td-persistent-service+)
+                          :topics '(("QSquare" . "ShapeType"))
+                          :store (dds.durability:make-sqlite-store-factory :dir tmp-dir :key-dir key-dir)
+                          :name "sqlite-run2"))
+                  (svc2  (dds.durability:make-durability-service spec2)))
+             (unwind-protect
+                  (progn
+                    (dds.durability:service-start svc2)
+                    (%check :sqlite-svc-reload
+                            (= n (dds.durability:store-count (dds.durability:durability-service-store svc2) "QSquare"))
+                            (format nil "run2: reloaded SQLite store expected ~d records" n))
+                    (let* ((lj-prefix (%make-test-prefix #xE7))
+                           (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain (test-domain +td-persistent-service+)
+                                                             :host "127.0.0.1" :port 0 :multicast nil))
+                           (svc2-node (dds.durability:durability-service-node svc2)))
+                      (unwind-protect
+                           (progn
+                             (dds.disc:add-local-reader lj-node :topic "QSquare" :type "ShapeType"
+                                                        :qos (dds.qos:make-reader-qos :reliability :reliable :durability :transient-local))
+                             (dds.disc:enable-subscriber lj-node)
+                             (setf (dds.disc:disc-node-on-match lj-node)
+                                   (lambda (kind remote)
+                                     (when (eq kind :remote-writer)
+                                       (dds.disc:%reader-durability-init
+                                        lj-node
+                                        (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                        (dds.qos:qos-durability (dds.rtps.discovery:endpoint-data-qos remote))))))
+                             (dds.disc:start-node lj-node)
+                             (setf (dds.disc:disc-node-peers lj-node)
+                                   (list (cons "127.0.0.1" (dds.disc:disc-node-port svc2-node))))
+                             (setf (dds.disc:disc-node-peers svc2-node)
+                                   (list (cons "127.0.0.1" (dds.disc:disc-node-port lj-node))))
+                             (%await-match lj-node svc2-node :retries 300 :sleep-s 0.02)
+                             (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
+                             (%check :sqlite-svc-latejoiner
+                                     (= n (dds.disc:node-sample-count lj-node))
+                                     (format nil "sqlite restart late-joiner expected ~d, got ~d"
+                                             n (dds.disc:node-sample-count lj-node)))
+                             (let* ((keys (dds.disc:node-sample-sns lj-node))
+                                    (payloads (sort (mapcar (lambda (k) (dds.disc:node-sample lj-node k)) keys)
+                                                    #'< :key (lambda (p) (aref p 4))))
+                                    (expected (loop for i from 1 to n collect (%make-small-payload i))))
+                               (%check :sqlite-svc-payload-exact
+                                       (and (= n (length payloads)) (every #'equalp payloads expected))
+                                       "sqlite restart payloads byte-exact")))
+                        (ignore-errors (dds.disc:stop-node lj-node)))))
+               (ignore-errors (dds.durability:service-stop svc2)))))
+      (when (uiop:directory-exists-p tmp-dir)
+        (uiop:delete-directory-tree tmp-dir :validate t))))
+  t)
+
 ;;; --- file-store recovery test (T1 review findings 1+2) ---
 ;;; (a) torn tail: truncate last few bytes of 2nd frame → exactly 1 record recovered, no error.
 ;;; (b) mid-file corruption: flip a byte inside the 1st frame body → store-open must signal an error.

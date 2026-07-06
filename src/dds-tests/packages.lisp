@@ -39,6 +39,10 @@
            #:run-durability-file-recovery-test
            #:run-dare-persistent-store-test
            #:run-durability-persistent-service-test
+           #:run-durability-sqlite-load-test
+           #:run-durability-sqlite-store-test
+           #:run-durability-sqlite-dare-test
+           #:run-durability-sqlite-service-test
            #:run-durability-compaction-test
            #:run-durability-seed-backpressure-test
            #:run-durability-seen-prune-test
