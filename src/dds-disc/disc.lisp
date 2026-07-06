@@ -609,9 +609,10 @@
     (function (disc-node) boolean)
   "T iff NODE is SECURED-loan-capable OR ZC-loan-capable on the receive side (WP-N-ENDPOINT-S2, ADR 0048) — the
    node either DECODES a SecuredPayload on receive (node-secured-reader-p / an already-armed secured-loan-capable
-   pool) OR resolves a zero-copy loan (zc-loan-capable). Gates the S2 second-reader fail-fast: a 2nd secured or ZC
-   reader needs per-endpoint crypto/loan machinery + closes a cross-reader use-after-free — deferred to Slice
-   S3/S4, never half-fixed. A plain (non-secured, non-ZC) node -> NIL -> the N-local reader delivery is enabled."
+   pool) OR resolves a zero-copy loan (zc-loan-capable). Gated the S2/S3 second-loan-capable-reader fail-fast; that
+   fence is LIFTED in S4 (different-topic loan-capable readers share no slot — the same-topic fence in
+   add-local-reader is now the sole UAF guard). Retained for the future SAME-topic loan-capable multi-reader slice
+   (ADR 0017 refcount-per-reader), where a 2nd same-topic loan-capable reader is the case still to defer."
   (or (node-secured-reader-p node)
       (disc-node-secured-loan-capable node)
       (and (disc-node-zc-loan-capable node) t)))
@@ -622,8 +623,12 @@
    registered becomes primary (N=1 identity for disc-node-user-reader). Re-registering the SAME id REPLACES the
    entry in place (byte-identical to the pre-S0 enable-subscriber engine-reader clobber), keeping the primary ref
    current if that id IS the primary. A NEW distinct id ADDS an N-th local reader (each with its own EntityId +
-   engine rtps-reader; the receive-hook demux + the %drain source-GUID filter route delivery per reader) UNLESS
-   deferred: a 2nd SECURED or ZC-loan-capable reader fail-fasts (secured/ZC multi-reader = Slice S3/S4)."
+   engine rtps-reader; the receive-hook demux + the %drain source-GUID filter route delivery per reader).
+   WP-N-ENDPOINT-S4 (ADR 0048): the secured/ZC-loan-capable fence is LIFTED — a 2nd loan-capable reader now
+   registers. The SAME-topic fence in add-local-reader STAYS (the UAF-guarding invariant): the two loan-capable
+   readers are therefore always on DIFFERENT topics -> disjoint source-GUIDs -> they never share a (guid,SN) slot
+   or ZC marker, so the ADR-0017 cross-reader use-after-free precondition is structurally unreachable. The
+   per-reader decode tier (%deliver-user-sample) + per-reader dr-secured-loans keep delivery + release isolated."
   (let ((cell (assoc entity-id (disc-node-user-readers node) :test #'eql)))
     (cond (cell (let ((was-primary (eq (cdr cell) (disc-node-primary-user-reader node))))
                   (setf (cdr cell) reader)
@@ -631,12 +636,7 @@
           ((null (disc-node-user-readers node))   ; first reader -> primary (N=1 identity)
            (push (cons entity-id reader) (disc-node-user-readers node))
            (setf (disc-node-primary-user-reader node) reader))
-          (t (when (%node-secured-or-zc-reader-p node)
-               (error "disc-node: refusing a 2nd SECURED/ZC-loan-capable local user DataReader (EntityId ~
-                       #x~8,'0X) — secured/ZC multi-reader is Slice S3/S4 (N-user-endpoint); primary EntityId ~
-                       #x~8,'0X"
-                      entity-id (caar (last (disc-node-user-readers node)))))
-             (push (cons entity-id reader) (disc-node-user-readers node)))))   ; N-th reader; primary unchanged
+          (t (push (cons entity-id reader) (disc-node-user-readers node)))))   ; N-th reader (S4: secured/ZC fence lifted; same-topic fence in add-local-reader is the UAF guard); primary unchanged
   reader)
 
 (defun* %reader-route-add (node writer-guid reader-entity-id)

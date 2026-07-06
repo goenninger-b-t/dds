@@ -256,12 +256,15 @@ The **scope-B follow-ups** (deferred) are listed below.
   held, so `%zc-acquire-for-read` could validate the generation **lock-free** (a fenced read instead of taking
   the pool mutex), eliminating the per-sample mutex-cons → a genuinely 0-alloc loaned RX. Deferred: needs a
   careful fenced-read design + a bench.
-- **Multi-loan-capable-reader-per-participant constraint (documented invariant).** The slot refcount is 1 per
-  destination participant and the `zc-loan-marker` is stored once per source-GUID→SN on the `disc-node` (which
-  holds a single `user-reader`). The v1 loan model therefore assumes **one loan-capable reader per `disc-node`**;
-  two loan-capable readers sharing one node would let the first `return-loan` (`refcount` 1→0) free a slot the
-  second still views (a cross-reader use-after-free). Unreachable as-built (one reader per node), but it MUST be
-  a documented precondition for the reliable / multi-reader follow-up, which would need refcount-per-reader or
-  per-reader loan markers.
+- **Multi-loan-capable-reader-per-participant constraint (documented invariant; DIFFERENT-topic case LIFTED by
+  WP-N-ENDPOINT-S4, ADR 0048).** The slot refcount is 1 per destination participant and the `zc-loan-marker` is
+  stored once per source-GUID→SN. Two loan-capable readers **sharing one source-GUID→SN slot** would let the
+  first `return-loan` (`refcount` 1→0) free a slot the second still views (a cross-reader use-after-free).
+  **WP-N-ENDPOINT-S4 supports N loan-capable readers per `disc-node` on DISTINCT topics**: it lifts the
+  secured/ZC-reader fence but KEEPS the same-topic fence, so the two readers always match different remote
+  writers on disjoint source-GUIDs and never share a slot — the UAF precondition is structurally unreachable
+  (and each reader decodes under its own per-reader tier, `%deliver-user-sample`/`%deliver-user-marker` demux by
+  source-GUID). The **same-topic** case (which WOULD share a slot) stays deferred to the later slice that lifts it
+  via refcount-per-reader or per-reader loan markers.
 
 **NOT cleared for ship — pending counsel (R6); see the R6 — PATENT GATE section above.**

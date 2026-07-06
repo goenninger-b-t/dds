@@ -3792,6 +3792,8 @@
                  ("n-writer-data-over-udp"   . dds.disc:run-n-writer-dataplane-test)
                  ("n-writer-frag-heartbeat"  . dds.disc:run-n-writer-frag-heartbeat-test)
                  ("n-reader-data-over-udp"   . dds.disc:run-n-reader-dataplane-test)
+                 ("n-reader-s4-decode-tier"  . dds.disc:run-n-reader-s4-decode-tier-test)
+                 ("n-reader-s4-zc-marker"    . dds.disc:run-n-reader-s4-zc-marker-test)
                  ("large-data-over-udp"      . dds.disc:run-large-dataplane-test)
                  ("lost-final-sample-repair" . dds.disc:run-lost-final-sample-test)
                  ("dispose-over-udp"         . dds.disc:run-dispose-dataplane-test)

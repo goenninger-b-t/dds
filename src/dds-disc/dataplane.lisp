@@ -2353,20 +2353,25 @@
    fed the marker as the change so ACKNACK/HEARTBEAT bookkeeping advances; the 2-level (source-GUID -> SN) store
    keeps the marker so DCPS %drain can acquire-for-read it. ON-SAMPLE fires outside the node lock. NOT cleared
    for ship — pending counsel (R6). EFFECTIVE-GUID/EFFECTIVE-SN are the logical-origin GUID+SN for dedup
-   (orig-guid/orig-sn on the relay path; wire GUID+SN on the direct path) per RTPS 2.5 §8.3.5.4."
-  (let ((guid (%source-guid src-prefix writer-id)))
-    ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too)
-    (dds.rtps.reliable:reader-on-data (disc-node-user-reader node) guid sn
-                                      (make-array 0 :element-type '(unsigned-byte 8)))
-    ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
-    (when (dds.rtps.reliable:reader-dedup-accept-p (disc-node-user-reader node)
-                                                   effective-guid effective-sn)
-      (dds.pal:with-lock ((disc-node-lock node))
-        (setf (gethash sn (%inner-table (disc-node-samples node) guid)) marker
-              (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
-              (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
-        (%record-sample-origin node guid sn effective-guid effective-sn))
-      (when (disc-node-on-sample node) (funcall (disc-node-on-sample node)))))
+   (orig-guid/orig-sn on the relay path; wire GUID+SN on the direct path) per RTPS 2.5 §8.3.5.4.
+   WP-N-ENDPOINT-S4 (ADR 0048): the marker is delivered to the CANONICAL reader MATCHED to this writer
+   (%reader-routes-for demux, mirroring the secured %deliver-user-sample) — NOT unconditionally the primary — so
+   each ZC reader's loan/marker state is driven only by ITS OWN writers. N=1/pre-match -> primary, byte-identical."
+  (let* ((guid (%source-guid src-prefix writer-id))
+         (routes (%reader-routes-for node guid))     ; WP-N-ENDPOINT-S4: the ZC reader(s) matched to this writer (mirrors %deliver-user-sample's demux)
+         (canon (and routes (cdr (first routes)))))   ; the CANONICAL engine reader (N=1/pre-match -> primary, byte-identical to the old primary-only path)
+    (when canon
+      ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too)
+      (dds.rtps.reliable:reader-on-data canon guid sn
+                                        (make-array 0 :element-type '(unsigned-byte 8)))
+      ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
+      (when (dds.rtps.reliable:reader-dedup-accept-p canon effective-guid effective-sn)
+        (dds.pal:with-lock ((disc-node-lock node))
+          (setf (gethash sn (%inner-table (disc-node-samples node) guid)) marker
+                (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
+                (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
+          (%record-sample-origin node guid sn effective-guid effective-sn))
+        (when (disc-node-on-sample node) (funcall (disc-node-on-sample node))))))
   t)
 
 ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5b: the loan-registry-backed plaintext handle for a SECURED loan-capable reader.
@@ -2680,16 +2685,22 @@
    handle is POOLED (%secured-handle-acquire, paired 1:1 with the buffer pool) and the registry is a fixed vector,
    so the accepted loan wrapper conses 0 B/sample. Security OFF or not loan-capable keeps the allocating decode ->
    bare-vector path, byte-identical."
-  (let ((guid (%source-guid src-prefix writer-id))   ; ONE source GUID: km-resolve + reliable proxy + the three inner tables + the loan handle
-        (stored vec)                                  ; the value stored in disc-node-samples (a plaintext vec, or a T5b secured-loan-handle)
-        (loan nil))                                   ; non-NIL = the pooled-buffer loan handle to register / release-on-reject (T5b)
+  (let* ((guid (%source-guid src-prefix writer-id))   ; ONE source GUID: km-resolve + reliable proxy + the three inner tables + the loan handle
+         (routes (%reader-routes-for node guid))       ; WP-N-ENDPOINT-S2/S4: the reader(s) matched to this writer — resolved ONCE (tier + delivery, DRY)
+         (canon (and routes (cdr (first routes))))     ; the CANONICAL engine reader (single reliability truth for this writer)
+         (rid (if routes (car (first routes)) (disc-node-user-reader-id node)))   ; WP-N-ENDPOINT-S4: the target reader's EntityId (route id; N=1/pre-match -> primary id)
+         (rkind (%user-endpoint-kinds node rid))       ; WP-N-ENDPOINT-S4 (ADR 0046/0048): THIS reader's OWN data_protection tier (per-endpoint map; N=1 -> node-single, byte-identical)
+         (stored vec)                                  ; the value stored in disc-node-samples (a plaintext vec, or a T5b secured-loan-handle)
+         (loan nil))                                   ; non-NIL = the pooled-buffer loan handle to register / release-on-reject (T5b)
     ;; §9.4.1.2.4: apply the SecuredPayload (data_protection) DECODE UNLESS governance set data_protection=NONE (data=NONE:
     ;; the payload rides PLAIN; decoding a plain payload as a SecuredPayload fails-closed and would DROP every sample).
     ;; :unset (no governance) keeps the decode — direct-KM path unchanged. The tier is selected by the resolved km's
     ;; transformation_kind: data=ENCRYPT -> AES-256-GCM open; data=SIGN -> AES256-GMAC verify of the VISIBLE payload
     ;; (decode-serialized-payload GMAC sub-tier, fail-closed on tamper). data_protection=SIGN (payload-tier GMAC) is
-    ;; IMPLEMENTED; supported tiers: NONE + SIGN + ENCRYPT (ADR-0040 §9.5.3.3.4.3).
-    (let ((ct (and (not (eq (disc-node-user-reader-data-protection-kind node) :none)) (disc-node-crypto-transform node))))   ; ADR 0046: the READER's OWN kind (this local reader's topic decode tier)
+    ;; IMPLEMENTED; supported tiers: NONE + SIGN + ENCRYPT (ADR-0040 §9.5.3.3.4.3). WP-N-ENDPOINT-S4: the tier is
+    ;; RKIND — the target reader's OWN topic kind (per-endpoint map), so 2 different-topic readers of different kinds
+    ;; each decode under their OWN tier (no cross-tier decode); N=1 RKIND == the node-single slot (byte-identical).
+    (let ((ct (and (not (eq rkind :none)) (disc-node-crypto-transform node))))
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
                       (funcall (dds.security:crypto-keys-decode-key-fn ct) guid)
@@ -2742,10 +2753,9 @@
                 (setf stored plain))))))
     ;; reader-on-data ALWAYS (keeps reliable NACK/HEARTBEAT state correct for relay proxy too); the loan path feeds
     ;; the proxy an EMPTY payload (the plaintext lives in the loaned buffer, not the proxy) — mirrors %deliver-user-marker.
-    ;; WP-N-ENDPOINT-S2 (ADR 0048): drive the CANONICAL reader matched to this writer (route demux; N=1/pre-match ->
-    ;; the primary, byte-identical). The node-global store + the per-reader %drain filter separate delivery per reader.
-    (let* ((routes (%reader-routes-for node guid))
-           (canon (and routes (cdr (first routes)))))
+    ;; WP-N-ENDPOINT-S2 (ADR 0048): drive the CANONICAL reader matched to this writer (ROUTES/CANON resolved once
+    ;; above; N=1/pre-match -> the primary, byte-identical). The node-global store + the per-reader %drain filter
+    ;; separate delivery per reader.
     (when canon
       (dds.rtps.reliable:reader-on-data canon guid sn
                                         (if loan (load-time-value (make-array 0 :element-type '(unsigned-byte 8))) stored)))
@@ -2763,7 +2773,7 @@
          (when loan (%secured-loan-register node loan)))   ; T5b/T5d: register the loan in the fixed registry vector (receiver registers; app return-loan releases)
        (when (disc-node-on-sample node) (funcall (disc-node-on-sample node))))
       ;; T5b: a deduped DUPLICATE on the loan path -> release the unused pooled buffer (no store, no leak)
-      (loan (%secured-loan-release node loan)))))
+      (loan (%secured-loan-release node loan))))
   t)
 
 (defun* %on-user-data (node writer-id sn buf poff plen src-prefix
@@ -3528,8 +3538,9 @@
    is matched to writer-A's GUID and NOT to writer-B's, and vice-versa (node-reader-matches-writer-p; a cross entry
    would be the cross-topic-deserialize corruption source); (3) the node store receives BOTH writers' samples under
    the demux (canonical-reader routing), one per writer. Then the ROUTE LIFECYCLE (unmatch/lease-expiry drops the
-   route, re-announce re-adds it — no dropped own-samples) and the S2 DEFERRAL fail-fasts: a 2nd SECURED reader and
-   a 2nd ZC-loan-capable reader -> Slice S3/S4."
+   route, re-announce re-adds it — no dropped own-samples). WP-N-ENDPOINT-S4: (4) a 2nd SECURED reader and (4b) a
+   2nd ZC-loan-capable reader on DIFFERENT topics now REGISTER (the secured/ZC fence is LIFTED — 2 distinct
+   EntityIds); (4c) a 2nd SAME-topic reader STILL fail-fasts (the UAF-guarding same-topic fence stays)."
   (let* ((pp (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(7 7 7 7 7 7 7 7 7 7 7 7)))
          (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(8 8 8 8 8 8 8 8 8 8 8 8)))
          (pb (make-array 12 :element-type '(unsigned-byte 8) :initial-contents '(9 9 9 9 9 9 9 9 9 9 9 9)))
@@ -3589,23 +3600,31 @@
            (assert (not (node-reader-matches-writer-p sub ida wga)) () "unmatch/lease-expiry must drop reader-A's route to writer-A")
            (%reader-route-add sub wga ida)
            (assert (node-reader-matches-writer-p sub ida wga) () "a re-announce must re-add reader-A's route (no permanent drop)")
-           ;; (4) deferral: a 2nd SECURED reader fail-fasts (Slice S3/S4)
+           ;; (4) WP-N-ENDPOINT-S4: a 2nd SECURED reader on a DIFFERENT topic now REGISTERS (the S2/S3 fence is LIFTED)
            (let ((sn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
              (unwind-protect
                   (progn (add-local-reader sn :topic "SA" :type "X") (enable-subscriber sn)
                          (setf (disc-node-user-reader-data-protection-kind sn) :sign)   ; mark the node secured (governance data_protection)
-                         (add-local-reader sn :topic "SB" :type "X")
-                         (assert (null (ignore-errors (enable-subscriber sn) t)) ()
-                                 "a 2nd SECURED reader must fail-fast (Slice S3/S4)"))
+                         (let ((sa (disc-node-user-reader-id sn)))
+                           (add-local-reader sn :topic "SB" :type "X")
+                           (assert (ignore-errors (enable-subscriber sn) t) ()
+                                   "a 2nd SECURED reader on a DIFFERENT topic must now REGISTER (WP-N-ENDPOINT-S4)")
+                           (assert (/= sa (disc-node-user-reader-id sn)) () "the 2 secured readers must get distinct EntityIds (S4)")
+                           (assert (= 2 (length (%all-user-reader-ids sn))) ()
+                                   "the participant must hold 2 secured user readers with distinct EntityIds (S4)")))
                (stop-node sn)))
-           ;; (4b) deferral: a 2nd ZC-loan-capable reader fail-fasts (Slice S3/S4)
+           ;; (4b) WP-N-ENDPOINT-S4: a 2nd ZC-loan-capable reader on a DIFFERENT topic now REGISTERS (fence LIFTED)
            (let ((zn (make-disc-node :guid-prefix pp :host "127.0.0.1" :port 0)))
              (unwind-protect
                   (progn (add-local-reader zn :topic "ZA" :type "X") (enable-subscriber zn)
                          (set-zc-loan-capable zn t)   ; mark the node ZC-loan-capable
-                         (add-local-reader zn :topic "ZB" :type "X")
-                         (assert (null (ignore-errors (enable-subscriber zn) t)) ()
-                                 "a 2nd ZC-loan-capable reader must fail-fast (Slice S3/S4)"))
+                         (let ((za (disc-node-user-reader-id zn)))
+                           (add-local-reader zn :topic "ZB" :type "X")
+                           (assert (ignore-errors (enable-subscriber zn) t) ()
+                                   "a 2nd ZC-loan-capable reader on a DIFFERENT topic must now REGISTER (WP-N-ENDPOINT-S4)")
+                           (assert (/= za (disc-node-user-reader-id zn)) () "the 2 ZC readers must get distinct EntityIds (S4)")
+                           (assert (= 2 (length (%all-user-reader-ids zn))) ()
+                                   "the participant must hold 2 ZC-loan-capable user readers with distinct EntityIds (S4)")))
                (stop-node zn)))
            ;; (4c) deferral: a 2nd reader on the SAME topic fail-fasts (same-topic multi-reader = later slice); the
            ;; route holds one reader per writer, so a 2nd same-topic reader would be unrouted -> silent false-REJECT
@@ -3617,6 +3636,149 @@
                (stop-node tn)))
            t)
       (stop-node sub) (stop-node puba) (stop-node pubb))))
+
+(defun* run-n-reader-s4-decode-tier-test ()
+    (function () (eql t))
+  "WP-N-ENDPOINT-S4 (ADR 0048/0046; ADR 0017): the PER-READER DECODE-TIER correctness gate — ONE participant with
+   TWO loan-capable DataReaders on DIFFERENT topics of DIFFERENT data_protection kinds, each decoding under ITS OWN
+   topic tier (%user-endpoint-kinds), NEVER the node-single last-set slot. Two node-single orderings prove BOTH
+   directions of the cross-tier bug %deliver-user-sample would have if the tier stayed node-single (the RED):
+   (1) node-single DOWNGRADED to NONE (the plain reader added LAST): a secured reader must STILL REJECT an
+       unprotected sample under its OWN ENCRYPT tier — a node-single NONE would false-ACCEPT unauthenticated data
+       (the security-critical direction); the plain reader coexisting still receives its plaintext;
+   (2) node-single UPGRADED to secured (the secured reader added LAST): a plain reader must STILL RECEIVE its
+       plaintext under its OWN NONE tier — a node-single ENCRYPT would decode-attempt + DROP it (false-REJECT).
+   (d) no-cross-free: two distinct secured-loan handles in the shared registry — releasing one leaves the other's
+   buffer + registration + stored slot intact (the identity-guarded %secured-loan-release; disjoint different-topic
+   slots). The deterministic arms are DARE-free (a <44-octet plaintext fails the SecuredPayload length gate before
+   any AES); the live ENCRYPT-decode arm is DARE-gated. Clasp FIRST."
+  (let ((km (dds.security:make-test-key-material :kind :encrypt))
+        (payl (make-array 6 :element-type '(unsigned-byte 8) :initial-contents '(#xD1 #xD2 #xD3 #xD4 #xD5 #xD6))))
+    (flet ((dres (tp) (declare (type string tp)) (if (string= tp "TENC") :encrypt :none))
+           (mres (tp) (declare (ignore tp)) :none))
+      ;; --- Scenario 1: node-single DOWNGRADED to NONE (plain reader added last) ---
+      (let ((n (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x51)
+                               :host "127.0.0.1" :port 0)))
+        (unwind-protect
+             (progn
+               (setf (disc-node-topic-data-protection-resolver n) #'dres
+                     (disc-node-topic-metadata-protection-resolver n) #'mres
+                     (disc-node-crypto-transform n) km)
+               (add-local-reader n :topic "TENC" :type "X") (enable-subscriber n)   ; secured reader = primary
+               (let ((id-sec (disc-node-user-reader-id n)))
+                 (add-local-reader n :topic "TPLAIN" :type "X") (enable-subscriber n)   ; plain reader (fence lifted)
+                 (let ((id-plain (disc-node-user-reader-id n)))
+                   (assert (/= id-sec id-plain) () "S4: the 2 different-topic secured/plain readers must get distinct EntityIds")
+                   (assert (eq :encrypt (%user-endpoint-kinds n id-sec)) () "S4: the secured reader's OWN tier must be :encrypt (per-endpoint map)")
+                   (assert (eq :none (%user-endpoint-kinds n id-plain)) () "S4: the plain reader's OWN tier must be :none")
+                   (assert (eq :none (disc-node-user-reader-data-protection-kind n)) () "S4 precondition: node-single slot is :none (plain reader last)")
+                   (let* ((src-sec (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x5A))
+                          (src-pl  (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x5B))
+                          (gsec (%source-guid src-sec #x00000102))
+                          (gpl  (%source-guid src-pl  #x00000102)))
+                     (%reader-route-add n gsec id-sec)
+                     (%reader-route-add n gpl id-plain)
+                     (%deliver-user-sample n #x00000102 1 payl src-sec gsec 1)   ; unprotected sample to the SECURED reader
+                     (assert (null (node-sample n (cons gsec 1))) ()
+                             "S4 GATE (security-critical): a secured reader must REJECT an unprotected sample under its OWN ENCRYPT tier — a node-single NONE downgrade would false-ACCEPT it")
+                     (%deliver-user-sample n #x00000102 1 payl src-pl gpl 1)   ; plaintext to the PLAIN reader
+                     (assert (equalp payl (node-sample n (cons gpl 1))) ()
+                             "S4: the plain reader must RECEIVE its plaintext under its OWN NONE tier (coexisting with the secured reader)")))))
+          (stop-node n)))
+      ;; --- Scenario 2: node-single UPGRADED to secured (secured reader added last) ---
+      (let ((n2 (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x52)
+                                :host "127.0.0.1" :port 0)))
+        (unwind-protect
+             (progn
+               (setf (disc-node-topic-data-protection-resolver n2) #'dres
+                     (disc-node-topic-metadata-protection-resolver n2) #'mres
+                     (disc-node-crypto-transform n2) km)
+               (add-local-reader n2 :topic "TPLAIN" :type "X") (enable-subscriber n2)   ; plain reader = primary
+               (let ((id-plain (disc-node-user-reader-id n2)))
+                 (add-local-reader n2 :topic "TENC" :type "X") (enable-subscriber n2)   ; secured reader (fence lifted)
+                 (let ((id-sec (disc-node-user-reader-id n2)))
+                   (assert (eq :encrypt (disc-node-user-reader-data-protection-kind n2)) () "S4 precondition: node-single slot is :encrypt (secured reader last)")
+                   (let* ((src-pl (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x6B))
+                          (gpl (%source-guid src-pl #x00000102)))
+                     (%reader-route-add n2 gpl id-plain)
+                     (%deliver-user-sample n2 #x00000102 1 payl src-pl gpl 1)   ; plaintext to the PLAIN reader
+                     (assert (equalp payl (node-sample n2 (cons gpl 1))) ()
+                             "S4 GATE: the plain reader must RECEIVE its plaintext under its OWN NONE tier — a node-single ENCRYPT upgrade would decode-attempt + DROP it (false-REJECT)")
+                     (when (handler-case (progn (dds.dare:dare-available-p) t) (dds.dare:dare-unavailable () nil))
+                       (let* ((src-sec (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x6A))
+                              (gsec (%source-guid src-sec #x00000102))
+                              (sealed (dds.security:encode-serialized-payload km payl)))
+                         (%reader-route-add n2 gsec id-sec)
+                         (%deliver-user-sample n2 #x00000102 1 sealed src-sec gsec 1)   ; real ENCRYPT payload to the SECURED reader
+                         (assert (equalp payl (node-sample n2 (cons gsec 1))) ()
+                                 "S4: the secured reader must DECODE a real ENCRYPT payload to plaintext under its OWN tier")))))))
+          (stop-node n2)))
+      ;; --- (d) no-cross-free: releasing reader-A's secured loan must not free reader-B's buffer ---
+      (let ((zn (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x53)
+                                :host "127.0.0.1" :port 0)))
+        (unwind-protect
+             (progn
+               (enable-subscriber zn)
+               (set-secured-loan-capable zn t)
+               (let ((pool (%ensure-secured-decode-pool zn)))
+                 (when pool
+                   (let ((ga (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xA0))
+                         (gb (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB0)))
+                     (multiple-value-bind (ba bb ha hb)
+                         (dds.pal:with-lock ((disc-node-decode-pool-lock zn))
+                           (let ((a (dds.core.arena:pool-acquire pool))
+                                 (b (dds.core.arena:pool-acquire pool)))
+                             (values a b (%secured-handle-acquire zn) (%secured-handle-acquire zn))))
+                       (%secured-handle-fill ha ba 4 ga 1)   ; reader-A's loan: distinct buffer + (GUID,SN) slot
+                       (%secured-handle-fill hb bb 4 gb 1)   ; reader-B's loan: DISJOINT buffer + slot (different-topic source GUID)
+                       (dds.pal:with-lock ((disc-node-lock zn))
+                         (setf (gethash 1 (%inner-table (disc-node-samples zn) ga)) ha
+                               (gethash 1 (%inner-table (disc-node-samples zn) gb)) hb)
+                         (%secured-loan-register zn ha)
+                         (%secured-loan-register zn hb))
+                       (node-return-loan zn ha)   ; reader-A returns ITS loan
+                       (assert (null (secured-loan-handle-buffer ha)) () "S4 no-cross-free: reader-A's returned handle must be dissociated")
+                       (assert (secured-loan-handle-buffer hb) () "S4 no-cross-free: reader-B's buffer must SURVIVE reader-A's return-loan")
+                       (assert (>= (secured-loan-handle-reg-index hb) 0) () "S4 no-cross-free: reader-B's handle must stay REGISTERED after reader-A's return")
+                       (assert (eq hb (node-sample zn (cons gb 1))) () "S4 no-cross-free: reader-B's stored sample must be untouched by reader-A's return")
+                       (node-return-loan zn hb))))))   ; clean up reader-B
+          (stop-node zn)))))
+  t)
+
+(defun* run-n-reader-s4-zc-marker-test ()
+    (function () (eql t))
+  "WP-N-ENDPOINT-S4 (ADR 0048/0017): the ZC-loan MARKER path demux. ONE participant, TWO ZC-loan-capable readers on
+   DIFFERENT topics. %deliver-user-marker must deliver each ZC marker to the CANONICAL reader MATCHED to its source
+   writer (%reader-routes-for) — NOT unconditionally the primary. Proven through the PER-READER dedup: a marker for
+   reader-B carrying a logical-origin (GUID,SN) the PRIMARY reader-A already saw must STILL be ACCEPTED (reader-B's
+   OWN dedup is fresh) and stored under reader-B's source GUID. RED if the marker were routed to the primary:
+   reader-A's dedup would REJECT the shared logical-origin as a duplicate -> reader-B silently loses its marker."
+  (let ((zn (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x54)
+                            :host "127.0.0.1" :port 0)))
+    (unwind-protect
+         (progn
+           (set-zc-loan-capable zn t)
+           (add-local-reader zn :topic "ZMA" :type "X") (enable-subscriber zn)   ; reader-A = primary
+           (let ((ida (disc-node-user-reader-id zn)))
+             (add-local-reader zn :topic "ZMB" :type "X") (enable-subscriber zn)   ; reader-B (fence lifted)
+             (let* ((idb (disc-node-user-reader-id zn))
+                    (src-a (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x7A))
+                    (src-b (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x7B))
+                    (ga (%source-guid src-a #x00000102))
+                    (gb (%source-guid src-b #x00000102))
+                    (origin (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x99))   ; a shared relay logical-origin GUID
+                    (mka (%make-zc-loan-marker :slot-index 1))
+                    (mkb (%make-zc-loan-marker :slot-index 2)))
+               (assert (/= ida idb) () "S4 ZC: the 2 different-topic ZC readers must get distinct EntityIds")
+               (%reader-route-add zn ga ida)
+               (%reader-route-add zn gb idb)
+               (%deliver-user-marker zn #x00000102 1 mka src-a origin 7)   ; reader-A records logical-origin (origin,7)
+               (assert (eq mka (node-sample zn (cons ga 1))) () "S4 ZC: reader-A's marker must be stored under its OWN source GUID")
+               (%deliver-user-marker zn #x00000102 2 mkb src-b origin 7)   ; reader-B: SAME logical-origin, its OWN dedup is fresh
+               (assert (eq mkb (node-sample zn (cons gb 2))) ()
+                       "S4 ZC GATE: reader-B's marker must be delivered to reader-B (its OWN dedup) and stored — RED if routed to the primary (reader-A's dedup would reject the shared logical-origin as a duplicate)")))
+           t)
+      (stop-node zn))))
 
 (defun* run-dispose-dataplane-test ()
     (function () (eql t))

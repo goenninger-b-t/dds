@@ -397,6 +397,20 @@ propagating.)
 A reader that does **not** call `set-secured-loan-capable` (the default), and any non-secured
 reader, keeps the allocating-decode → bare-vector path **byte-identical** to before.
 
+**N secured (loan-capable) readers per participant, on distinct topics** (WP-N-ENDPOINT-S4, ADR
+0048).  A participant may hold multiple loan-capable DataReaders as long as they are on **different**
+topics.  Each reader decodes under **its own topic's** `data_protection` tier: the receive path
+resolves the target reader from the source-GUID (the S2 delivery demux) and reads THAT reader's own
+protection kind (`%user-endpoint-kinds`, the per-endpoint map) — **not** a node-single slot — so a
+`data=NONE` reader's plaintext is never decode-attempted-and-dropped under a sibling's secured tier
+(false-REJECT) and, the security-critical direction, a secured reader's `SecuredPayload` is never
+delivered PLAIN (undecoded) under a sibling's NONE tier (false-ACCEPT of unauthenticated data).  The
+decode pool + handle freelist + loan registry stay **node-shared** (a fixed-capacity resource pool);
+each accepted loan is a distinct handle on a distinct `(guid,SN)` slot and `%secured-loan-release` is
+identity-guarded + idempotent, so one reader's `return-loan` never frees another's buffer.  A 2nd
+loan-capable reader on the **same** topic still fail-fasts (the UAF-guarding invariant; a later slice
+lifts it via refcount-per-reader).
+
 ### 3.4 Zero-alloc secured send + the shared foundation (WP-DDS-SECURITY-ZEROALLOC-AEAD, ADR 0038)
 
 With the decode loan (§3.3) on the receive side and a matching **encode payload pool** on the send
