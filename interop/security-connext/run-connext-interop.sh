@@ -19,10 +19,18 @@
 #          datasign (all-SIGN INCLUDING the user payload: SecuredPayload AES-GMAC §9.5.3.3.4.3, data=SIGN visible+authenticated; non-hyphen: rtiddsspy -qosProfile rejects a hyphenated name).
 #          Default none. The p7s (ours) and .smime (Connext, USER_QOS_PROFILES.xml OursConnextInterop::${GOV}) are named governance-${GOV}.
 #   SECS = seconds ours runs per direction. Default 25.
+#   env WRITERS=2 — 2-SECURED-WRITER MODE (WP-2SECURED-WRITER-CONNEXT, validates WP-N-ENDPOINT-S3 per-endpoint crypto
+#          on the wire): ours runs role "pub2" — ONE participant, TWO independently-keyed secured writers on
+#          HelloWorldTopic + HelloWorldTopic2, each publishing under its OWN EntityCrypto km (DISTINCT §9.5.2
+#          sender_key_id). rtiddsspy (Connext security observer) must decode samples from BOTH writers, each under its
+#          own key. Only the ours2connext direction runs (rtiddsspy observes both writers). WRITERS=1 (default) is
+#          byte-identical to the single-writer modes. Use with GOV=secure (or sign/datasign) so the writers are secured.
 set -uo pipefail
 
 GOV="${1:-none}"
 SECS="${2:-25}"
+WRITERS="${WRITERS:-1}"
+TOPIC2="HelloWorldTopic2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CAP_DIR="${SCRIPT_DIR}/captures"
@@ -63,6 +71,7 @@ run_dir() {
   local clog="${CAP_DIR}/connext-${GOV}-${label}-connext.log"
   local olog="${CAP_DIR}/connext-${GOV}-${label}-ours.log"
   local cpeer; [[ "${orole}" == "sub" ]] && cpeer="hello_secure_pub" || cpeer="rtiddsspy"
+  local t2arg=""; [[ "${orole}" == "pub2" ]] && t2arg=":topic2 \"${TOPIC2}\""   # 2-secured-writer 2nd topic
   echo ""
   echo "--- direction: ${label}  (Connext=${cpeer}, ours=${orole}) ---"
   pkill -9 -f 'rtiddsspy' >/dev/null 2>&1 || true; pkill -9 -f 'hello_secure_pub' >/dev/null 2>&1 || true
@@ -87,19 +96,25 @@ run_dir() {
               :role \"${orole}\" :domain 0 :seconds ${SECS} :port 7420 :peers \"127.0.0.1:7410\"
               :ca \"${OUR_CA}\" :cert \"${OUR_CERT}\" :key \"${OUR_KEY}\"
               :perm-ca \"${OUR_PERMCA}\" :governance \"${OUR_GOV}\" :permissions \"${OUR_PERM}\"
-              :topic \"HelloWorldTopic\" :type \"HelloWorld\" :samples 8 :interval 0.5)" \
+              :topic \"HelloWorldTopic\" ${t2arg} :type \"HelloWorld\" :samples 8 :interval 0.5)" \
     --eval '(uiop:quit 0)' >"${olog}" 2>&1
   sleep 1; kill "${cpid}" "${tpid}" >/dev/null 2>&1 || true
   pkill -9 -f 'rtiddsspy' >/dev/null 2>&1 || true; pkill -9 -f 'hello_secure_pub' >/dev/null 2>&1 || true; sleep 1
   echo "  [ours]    $(grep -aE 'SUMMARY|RESULT' "${olog}" | tail -2 | tr '\n' ' ')"
+  [[ "${orole}" == "pub2" ]] && echo "  [ours-2w] $(grep -aE '\[pub2\]|SUMMARY-2W|distinct-key' "${olog}" | tail -6 | tr '\n' ' | ')"
+  [[ "${orole}" == "pub2" ]] && echo "  [connext-2w] $(grep -aE 'HelloWorldTopic2|HelloWorldTopic' "${clog}" | grep -aviE 'listening|built with' | tail -8 | tr '\n' ' | ')"
   echo "  [ours-sub] $(grep -aiE '\[sub\]|decoded|index=|matched=1|keyed=t' "${olog}" | grep -aviE 'compil|fasl|ftype|proclaim|wrote|cache|load-system' | tail -4 | tr '\n' ' | ')"
   echo "  [ours-auth] $(grep -aiE 'reject|handshake|authenticat|permission-|hash_c|propagate|keyed=t|shared.?secret' "${olog}" | grep -aviE 'compil|fasl|ftype|proclaim|proclamation|wrote|cache|load-system' | tail -3 | tr '\n' ' | ')"
   echo "  [connext] $(grep -aiE 'new |discover|reader|writer|HelloWorld|participant|received|denied|reject|error|sent index|match|crypto|decode' "${clog}" | grep -aviE 'listening|built with|press CTRL' | tail -8 | tr '\n' ' | ')"
   echo "  [pcap]    ${pcap}"
 }
 
-run_dir "ours2connext" pub
-[[ "${GOV}" == "keep" ]] || run_dir "connext2ours" sub
+if [[ "${WRITERS}" == "2" ]]; then
+  run_dir "ours2connext-2w" pub2      # 2-secured-writer mode: rtiddsspy observes BOTH independently-keyed writers; no reverse direction
+else
+  run_dir "ours2connext" pub
+  [[ "${GOV}" == "keep" ]] || run_dir "connext2ours" sub
+fi
 
 echo ""
-echo "=== done (GOV=${GOV}). Captures in ${CAP_DIR}/ ==="
+echo "=== done (GOV=${GOV} WRITERS=${WRITERS}). Captures in ${CAP_DIR}/ ==="

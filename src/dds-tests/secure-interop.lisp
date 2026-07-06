@@ -105,16 +105,36 @@
           (return-from %decode-hello-world (values index nil)))
         (values index (map 'string #'code-char (subseq payload soff (+ soff (1- slen)))))))))
 
+(defun* %key-id-hex (k)
+    (function (t) string)
+  "Hex-render a §9.5.2 sender_key_id octet vector K (or \"nil\") for the 2-secured-writer interop log."
+  (if k (format nil "~{~2,'0x~}" (coerce k 'list)) "nil"))
+
+(defun* %two-writer-key-ids (node id-a id-b)
+    (function (dds.disc:disc-node (unsigned-byte 32) (unsigned-byte 32)) (values t t))
+  "Register NODE's local EntityCryptos in a fresh crypto-manager exactly as cm-on-authenticated does, then
+   return the §9.5.2 sender_key_id of writer ID-A's and writer ID-B's OWN EntityCrypto km (WP-N-ENDPOINT-S3,
+   ADR 0048). The 2-secured-writer live run proves these DISTINCT on the wire — each writer keyed under its
+   own km. Reuses run-security-n-secured-writer-test's assertion shape (control-plane, no OpenSSL needed)."
+  (let ((cm (dds.dcps::make-crypto-manager)))
+    (dolist (e (dds.dcps::%cm-local-token-entities node))
+      (dds.dcps::cm-register-local-entity cm (car e) :kind (dds.dcps::%cm-entity-protection-kind node (car e))))
+    (let ((km-a (dds.dcps::cm-encode-entity-km cm id-a))
+          (km-b (dds.dcps::cm-encode-entity-km cm id-b)))
+      (values (and km-a (dds.security:key-material-sender-key-id km-a))
+              (and km-b (dds.security:key-material-sender-key-id km-b))))))
+
 (defun* run-secure-interop-peer (&key (role "sub") (domain 0)
                                       ca cert key perm-ca governance permissions
-                                      (topic "HelloWorldTopic") (type "HelloWorld")
+                                      (topic "HelloWorldTopic") (topic2 "HelloWorldTopic2")
+                                      (type "HelloWorld")
                                       (seconds 30) (peers "") (samples 5) (interval 0.5)
                                       (advertise "127.0.0.1") (port 0)
                                       (guid-byte #x7c))
     (function (&key (:role string) (:domain (integer 0))
                     (:ca string) (:cert string) (:key string) (:perm-ca string)
                     (:governance string) (:permissions string)
-                    (:topic string) (:type string) (:seconds real) (:peers string)
+                    (:topic string) (:topic2 string) (:type string) (:seconds real) (:peers string)
                     (:samples (integer 0)) (:interval real) (:advertise string)
                     (:port (unsigned-byte 16)) (:guid-byte (unsigned-byte 8)))
               t)
@@ -122,7 +142,11 @@
    (T12). CA/CERT/KEY = our DDS-Security identity (PEM paths); PERM-CA/GOVERNANCE/PERMISSIONS = the
    §8.4 AccessControl config (Permissions-CA PEM + signed S-MIME governance/permissions PEM paths).
    ROLE \"pub\" adds a reliable HelloWorld writer and publishes SAMPLES HelloWorld samples at INTERVAL
-   s; \"sub\" adds a reliable reader and counts received samples. DOMAIN/PEERS/ADVERTISE/PORT plumb
+   s; \"sub\" adds a reliable reader and counts received samples. ROLE \"pub2\" (WP-N-ENDPOINT-S3, ADR 0048)
+   stands up TWO independently-keyed secured writers on TOPIC + TOPIC2 (each its OWN EntityCrypto km) from ONE
+   participant and publishes on EACH under its OWN EntityId (publish-sample writer-id = %local-user-writer-id-
+   for-topic per topic), proving distinct §9.5.2 sender_key_ids so a live secured observer decodes both writers'
+   DATA each under its own key (the S3 per-endpoint crypto on the wire). DOMAIN/PEERS/ADVERTISE/PORT plumb
    discovery (multicast plus optional \"host:port,...\" unicast peers, e.g. the Fast DDS metatraffic
    locator). Runs for SECONDS, spinning announcements, printing per-second discovered/matched/sample/
    keyed status, and a final SUMMARY + RESULT line the orchestrator greps. The receiver thread does the
@@ -150,30 +174,50 @@
                      :advertise-address advertise :peers (%parse-peer-list peers))))
              (unwind-protect
                   (let* ((node (dds.dcps::dp-node p))
-                         (pubp (string-equal role "pub")))
-                    (if pubp
-                        (progn
-                          ;; Fast DDS's example HelloWorld is NO_KEY (no @key member); declare our interop
-                          ;; endpoint NO_KEY too (RTPS 2.5 §9.3.1.2 Table 9.1 writer 0x03 / reader 0x04) so the
-                          ;; user match is not QoS-rejected on keyed-ness (Fast DDS valid_matching INCOMPATIBLE
-                          ;; QOS keyed:0 vs keyed:1) — the peer's key-ness is the oracle, not a fixed WITH_KEY.
-                          ;; Offer XCDR1 (PLAIN_CDR): Fast DDS's example HelloWorld reader uses the default
-                          ;; DataReaderQos = empty DATA_REPRESENTATION = XCDR1, so an XCDR2 writer is QoS-
-                          ;; incompatible (XTypes 1.3 Table 7.57) and Fast DDS REJECTS the match before any crypto.
-                          (dds.disc:add-local-writer node :topic topic :type type :keyed nil
-                                                     :qos (dds.qos:make-writer-qos :reliability :reliable
-                                                                                   :data-representation '(:xcdr1)))
-                          (dds.disc:enable-publisher node :history-kind :keep-all))
-                        (progn
-                          (dds.disc:add-local-reader node :topic topic :type type :keyed nil
-                                                     :qos (dds.qos:make-reader-qos :reliability :reliable))
-                          (dds.disc:enable-subscriber node)))
-                    ;; Slice 5: honor the user topic's metadata_protection_kind on the user-DATA submessage tier.
+                         (pub2p (string-equal role "pub2"))          ; WP-N-ENDPOINT-S3: two secured writers
+                         (pubp (or (string-equal role "pub") pub2p))
+                         (wqos (dds.qos:make-writer-qos :reliability :reliable :data-representation '(:xcdr1)))
+                         (id-a nil) (id-b nil) (kid-a nil) (kid-b nil) (pub2-distinct nil))
+                    ;; Fast DDS's example HelloWorld is NO_KEY (no @key member); declare our interop endpoint
+                    ;; NO_KEY too (RTPS 2.5 §9.3.1.2 Table 9.1 writer 0x03 / reader 0x04) so the user match is not
+                    ;; QoS-rejected on keyed-ness. Offer XCDR1 (PLAIN_CDR): the default DataReaderQos = XCDR1, so
+                    ;; an XCDR2 writer is QoS-incompatible (XTypes 1.3 Table 7.57) and REJECTED before any crypto.
+                    (cond
+                      (pub2p
+                       ;; TWO secured writers on distinct topics -> distinct EntityIds (S1 alloc); enable-publisher
+                       ;; per writer registers each. Both NO_KEY + XCDR1 + reliable (match-compatible, as pub).
+                       (dds.disc:add-local-writer node :topic topic :type type :keyed nil :qos wqos)
+                       (dds.disc:enable-publisher node :history-kind :keep-all)
+                       (dds.disc:add-local-writer node :topic topic2 :type type :keyed nil :qos wqos)
+                       (dds.disc:enable-publisher node :history-kind :keep-all))
+                      (pubp
+                       (dds.disc:add-local-writer node :topic topic :type type :keyed nil :qos wqos)
+                       (dds.disc:enable-publisher node :history-kind :keep-all))
+                      (t
+                       (dds.disc:add-local-reader node :topic topic :type type :keyed nil
+                                                  :qos (dds.qos:make-reader-qos :reliability :reliable))
+                       (dds.disc:enable-subscriber node)))
+                    ;; Slice 5: honor each user topic's metadata_protection_kind on the user-DATA submessage tier.
                     ;; The harness builds the endpoint via add-local-{writer,reader} (to force NO_KEY for the Fast
                     ;; DDS HelloWorld match), bypassing create-data{writer,reader}, so set the kind here (the SAME
                     ;; %set-user-metadata-protection the dcps entity path calls — DRY) from the participant governance.
-                    (dds.dcps::%set-user-metadata-protection node (dds.dcps::dp-access-state p) topic
-                                                             (if pubp :writer :reader))   ; ADR 0046: per-role
+                    (if pub2p
+                        (progn                                        ; ADR 0046: per-role, per-topic (BOTH writers)
+                          (dds.dcps::%set-user-metadata-protection node (dds.dcps::dp-access-state p) topic :writer)
+                          (dds.dcps::%set-user-metadata-protection node (dds.dcps::dp-access-state p) topic2 :writer))
+                        (dds.dcps::%set-user-metadata-protection node (dds.dcps::dp-access-state p) topic
+                                                                 (if pubp :writer :reader)))   ; ADR 0046: per-role
+                    ;; WP-N-ENDPOINT-S3: resolve each writer's OWN EntityId + prove its OWN km's DISTINCT sender_key_id
+                    ;; (the load-bearing bit — each writer publishes under its own km, NOT the primary).
+                    (when pub2p
+                      (setf id-a (dds.disc:%local-user-writer-id-for-topic node topic)
+                            id-b (dds.disc:%local-user-writer-id-for-topic node topic2))
+                      (multiple-value-setq (kid-a kid-b) (%two-writer-key-ids node id-a id-b))
+                      (setf pub2-distinct (and kid-a kid-b (not (equalp kid-a kid-b))))
+                      (format t "~&[pub2] writer-A topic=~a entityid=~6,'0x key_id=~a~%" topic id-a (%key-id-hex kid-a))
+                      (format t "~&[pub2] writer-B topic=~a entityid=~6,'0x key_id=~a~%" topic2 id-b (%key-id-hex kid-b))
+                      (format t "~&[pub2] distinct-key-ids=~a~%" pub2-distinct)
+                      (finish-output))
                     (format t "~&[~a] secure participant up: domain=~d topic=~a type=~a guid-prefix=~{~2,'0x~} port=~d peers=~a~%"
                             role domain topic type (coerce (dds.disc:disc-node-guid-prefix node) 'list)
                             (dds.disc:disc-node-port node) peers)
@@ -185,9 +229,19 @@
                         (dds.dcps:spin p)
                         (when (and pubp (< sent samples)
                                    (plusp (dds.disc:disc-node-matched-count node)))
-                          (dds.disc:publish-sample node (%hello-world-payload sent "Hello world from Lisp" :xcdr1))
-                          (incf sent)
-                          (format t "~&[pub] SENT HelloWorld index=~d~%" sent) (finish-output))
+                          (if pub2p
+                              (progn   ; PER-WRITER publish: each writer under its OWN EntityId's km (the S3 send crux)
+                                (dds.disc:publish-sample node (%hello-world-payload sent (format nil "Hello from ~a" topic) :xcdr1)
+                                                         nil nil 0 nil id-a)
+                                (dds.disc:publish-sample node (%hello-world-payload sent (format nil "Hello from ~a" topic2) :xcdr1)
+                                                         nil nil 0 nil id-b)
+                                (incf sent)
+                                (format t "~&[pub2] SENT A(~a)+B(~a) index=~d~%" topic topic2 sent))
+                              (progn
+                                (dds.disc:publish-sample node (%hello-world-payload sent "Hello world from Lisp" :xcdr1))
+                                (incf sent)
+                                (format t "~&[pub] SENT HelloWorld index=~d~%" sent)))
+                          (finish-output))
                         (let ((m (dds.disc:disc-node-matched-count node))
                               (s (dds.disc:node-sample-count node)))
                           (setf peak-match (max peak-match m) peak-samples (max peak-samples s))
@@ -214,14 +268,65 @@
                                 (format t "~&[sub] decoded HelloWorld #~d index=~a message=~s~%" recv idx msg))))
                           (finish-output)
                           (dds.disc:node-return-loan node data cnt)))
+                      (when pub2p
+                        (format t "~&SUMMARY-2W: topic=~a topic2=~a key-id-A=~a key-id-B=~a distinct-key-ids=~a~%"
+                                topic topic2 (%key-id-hex kid-a) (%key-id-hex kid-b) pub2-distinct)
+                        (finish-output))
                       (format t "~&SUMMARY: role=~a discovered=~d peak-matched=~d peak-samples=~d ever-keyed=~a sent=~d decoded=~d~%"
                               role (dds.dcps:discovered-count p) peak-match peak-samples ever-keyed sent recv)
-                      ;; RESULT: a pub succeeds when it matched + sent; a sub succeeds when it matched + received
-                      ;; (peak-samples = delivered/AEAD-decrypted; recv = decoded-at-drain — either proves receipt).
-                      (let ((ok (if pubp (and (plusp peak-match) (plusp sent))
-                                    (and (plusp peak-match) (or (plusp peak-samples) (plusp recv))))))
+                      ;; RESULT: a pub succeeds when it matched + sent; pub2 additionally requires the 2 writers'
+                      ;; DISTINCT key_ids; a sub succeeds when it matched + received (peak-samples = delivered/AEAD-
+                      ;; decrypted; recv = decoded-at-drain — either proves receipt).
+                      (let ((ok (cond (pub2p (and (plusp peak-match) (plusp sent) pub2-distinct))
+                                      (pubp  (and (plusp peak-match) (plusp sent)))
+                                      (t     (and (plusp peak-match) (or (plusp peak-samples) (plusp recv)))))))
                         (format t "~&RESULT: ~a~%" (if ok "PASS" "FAIL")) (finish-output)
                         (return-from run-secure-interop-peer ok)))) ; through both unwind-protects
                (ignore-errors (dds.dcps:delete-participant p))))
         (dds.security:free-identity-handle id))))
+  t)
+
+(defun* run-security-2secured-writer-harness-test ()
+    (function () t)
+  "WP-2SECURED-WRITER-CONNEXT (validates WP-N-ENDPOINT-S3, ADR 0048): the our-to-our sanity for the
+   2-secured-writer LIVE Connext harness MODE (run-secure-interop-peer ROLE \"pub2\"). Stands up ONE secured
+   participant with TWO secured writers on TWO topics (the pub2 setup — no network), then asserts the harness's
+   per-writer plumbing: (a) %local-user-writer-id-for-topic resolves EACH topic's OWN writer EntityId, DISTINCT;
+   (b) %two-writer-key-ids returns each writer's OWN EntityCrypto km §9.5.2 sender_key_id, DISTINCT — the
+   load-bearing proof that each writer is keyed under its OWN km (not the primary), so a live secured observer
+   decodes both writers' DATA each under its own key; (c) %key-id-hex renders a resolved sender_key_id. Full
+   send/decode crypto correctness (cross-key fails closed) is run-security-n-secured-writer-test; this proves the
+   new harness MODE runs. Control-plane only (no OpenSSL/dare needed). Clasp FIRST."
+  (let ((gov (dds.security:make-governance
+              :discovery-protection-kind :none :liveliness-protection-kind :none :rtps-protection-kind :none
+              :topic-rules
+              (list (dds.security:make-topic-rule :topic-expr "HelloWorldTopic"
+                                                  :metadata-protection-kind :encrypt :data-protection-kind :encrypt)
+                    (dds.security:make-topic-rule :topic-expr "HelloWorldTopic2"
+                                                  :metadata-protection-kind :encrypt :data-protection-kind :encrypt)))))
+    (let ((ah (dds.security:make-access-handle :governance gov))
+          (p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+      (let ((node (dds.dcps::dp-node p)))
+        (unwind-protect
+             (progn
+               (setf (dds.dcps::dp-auth-state p)
+                     (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
+               (dds.dcps::%install-access-control p ah)
+               ;; the pub2 setup: TWO secured writers on distinct topics -> distinct EntityIds
+               (dds.disc:add-local-writer node :topic "HelloWorldTopic" :type "HelloWorld" :keyed nil)
+               (dds.disc:enable-publisher node :history-kind :keep-all)
+               (dds.disc:add-local-writer node :topic "HelloWorldTopic2" :type "HelloWorld" :keyed nil)
+               (dds.disc:enable-publisher node :history-kind :keep-all)
+               (let ((id-a (dds.disc:%local-user-writer-id-for-topic node "HelloWorldTopic"))
+                     (id-b (dds.disc:%local-user-writer-id-for-topic node "HelloWorldTopic2")))
+                 (%check :pub2-ids-resolved (and id-a id-b (/= id-a id-b))
+                         "%local-user-writer-id-for-topic must resolve each topic's OWN writer EntityId (distinct)")
+                 (multiple-value-bind (kid-a kid-b) (%two-writer-key-ids node id-a id-b)
+                   (%check :pub2-distinct-key-ids
+                           (and kid-a kid-b (not (equalp kid-a kid-b)))
+                           "each secured writer resolves its OWN EntityCrypto km sender_key_id, DISTINCT (each under its own km, not the primary)")
+                   (%check :pub2-key-id-hex
+                           (and (plusp (length (%key-id-hex kid-a))) (string/= "nil" (%key-id-hex kid-a)))
+                           "%key-id-hex renders a resolved sender_key_id"))))
+          (dds.dcps:delete-participant p)))))
   t)
