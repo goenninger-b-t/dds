@@ -64,3 +64,12 @@ own km, cross-key decode fails closed) is `run-security-n-secured-writer-test`.
 | `USER_QOS_PROFILES.xml` | `OursConnextInterop::${GOV}` Connext security profiles |
 | `hello_secure_pub.cxx` / `HelloWorld.*` | The reverse-direction Connext secured publisher (built via `make`) |
 | `captures/` | tshark pcapng + per-direction Connext/ours logs |
+
+## Live result (2026-07-06, this host, lo0) — 2-secured-writer vs RTI Connext 7.3.1
+
+`WRITERS=2 bash interop/security-connext/run-connext-interop.sh secure 25` — PASS:
+
+- Ours (`pub2`): `SUMMARY-2W: topic=HelloWorldTopic topic2=HelloWorldTopic2 key-id-A=00000009 key-id-B=0000000A distinct-key-ids=T`, `peak-matched=2`, `keyed=T`, `sent=8`, `RESULT: PASS` — two secured writers, each under its OWN §9.5.2 km (distinct `sender_key_id` 0x09 vs 0x0A).
+- Connext (`rtiddsspy` secured observer): repeated `New data … topic="HelloWorldTopic"` AND `New data … topic="HelloWorldTopic2"` (alternating) — real RTI Connext security installed BOTH writers' crypto tokens and decoded the AEAD-protected user data from EACH independently-keyed secured writer.
+
+This confirms WP-N-ENDPOINT-S3 (per-endpoint crypto km) on the wire against a real RTI peer: the enumerate-all crypto-token exchange (one DataWriter CryptoToken per local writer) and the per-writer encode send-crux both interoperate — a participant with N secured writers has each decoded under its own key by Connext. Capture: `captures/connext-secure-ours2connext-2w.pcapng`.
