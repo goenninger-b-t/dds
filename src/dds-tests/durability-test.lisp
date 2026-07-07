@@ -337,6 +337,19 @@
         do (sleep sleep-s))
   t)
 
+(defun* %inject-discovered-writer (node topic type b0)
+    (function (dds.disc:disc-node string string (unsigned-byte 8)) t)
+  "Test helper: inject a synthetic discovered remote WRITER (topic/type + a GUID whose first byte is B0)
+   into disc-NODE's discovered-writers table under the node lock — simulating an SEDP DiscoveredWriterData
+   arrival WITHOUT a live publisher, so the :auto-discover auto-add path is exercisable deterministically
+   on both impls (no discovery timing)."
+  (let ((ep (dds.rtps.discovery:make-endpoint-data
+             :role :writer :topic-name topic :type-name type
+             :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element b0))))
+    (dds.pal:with-lock ((dds.disc::disc-node-lock node))
+      (dds.disc::%record-discovered (dds.disc::disc-node-discovered-writers node) ep)))
+  t)
+
 (defun* run-durability-transient-test ()
     (function () t)
   "Headline replay end-to-end: publisher writes N=5 TL samples, STOPS (writer gone);
@@ -2793,6 +2806,371 @@
                                (ignore-errors (dds.disc:stop-node lj-node)))))
                       (ignore-errors (dds.disc:stop-node pub-node)))))))))
       (ignore-errors (dds.durability:service-stop svc))))
+  t)
+
+;;; --- dynamic-topic-add DISCOVERY-DRIVEN auto-serve test (WP-DURABILITY-DYNAMIC-TOPIC-DISCOVERY, ADR 0026 Phase-2b) ---
+;;; The discovery-driven half of dynamic-topic-add: an opt-in :auto-discover service sees a SEDP writer for an
+;;; UNCONFIGURED topic at RUNTIME and auto-spins a node to collect + serve it — no explicit service-add-topic call,
+;;; no restart. Structural asserts (the pure filter/select core, the %service-topics relaxation, DEFAULT-OFF
+;;; byte-identical, the start->stop->start lifecycle) run on BOTH impls. The live end-to-end arm (a real publisher
+;;; discovered -> auto-added -> collected -> TL late-joiner replay) is SBCL-only per NFR-PORT (the clasp-threading
+;;; gap), pass-skipped on Clasp exactly like run-durability-dynamic-topic-test. Domain +td-dynamic-topic-discovery+.
+
+(defun* run-durability-dynamic-topic-discovery-test ()
+    (function () t)
+  "Discovery-driven auto-serve: an :auto-discover service auto-adds an unconfigured discovered WRITER topic
+   (passing its filter) via the idempotent service-add-topic, with no explicit add-topic and no restart.
+   Structural (both impls): the filter + selection core, the %service-topics :auto-discover relaxation,
+   DEFAULT-OFF byte-identical (no discovery node/thread when off), and the start->stop->start lifecycle.
+   SBCL-live: a publisher on the new topic DynC is discovered -> auto-added (nodes grow, topic-names gains DynC)
+   -> collected (store-count = N) -> a TL late-joiner gets the N-sample replay; a non-matching 'Other' is NOT
+   served (filter gate). RED contrast: a :auto-discover NIL service never serves DynC (pre-3c behavior)."
+  ;; ============================================================================================
+  ;; PART A — pure selection core (both impls, no threads): filter match, dedup, %service-topics relax
+  ;; ============================================================================================
+  ;; A1: %auto-discover-match-p — NIL match-all, "Dyn*" glob, function predicate, exact string, "*" all
+  (%check :ad-match-nil-all
+          (and (dds.durability::%auto-discover-match-p nil "Anything")
+               (dds.durability::%auto-discover-match-p nil ""))
+          "NIL filter must match every topic-name (match-all default under opt-in)")
+  (%check :ad-match-glob
+          (and (dds.durability::%auto-discover-match-p "Dyn*" "DynX")
+               (dds.durability::%auto-discover-match-p "Dyn*" "DynC")
+               (dds.durability::%auto-discover-match-p "Dyn*" "Dyn")
+               (not (dds.durability::%auto-discover-match-p "Dyn*" "Other"))
+               (not (dds.durability::%auto-discover-match-p "Dyn*" "Dy")))
+          "\"Dyn*\" prefix glob must match Dyn-prefixed names and reject others")
+  (%check :ad-match-star-all
+          (and (dds.durability::%auto-discover-match-p "*" "Anything")
+               (dds.durability::%auto-discover-match-p "*" ""))
+          "\"*\" must match every name")
+  (%check :ad-match-exact
+          (and (dds.durability::%auto-discover-match-p "Exact" "Exact")
+               (not (dds.durability::%auto-discover-match-p "Exact" "Exactly")))
+          "a string with no trailing #\\* must match exactly")
+  (%check :ad-match-predicate
+          (let ((pred (lambda (n) (eql 0 (search "Sensor" n)))))
+            (and (dds.durability::%auto-discover-match-p pred "SensorA")
+                 (not (dds.durability::%auto-discover-match-p pred "Square"))))
+          "a function filter must be applied as a predicate over the topic-name")
+  ;; A2: %auto-discover-pending — filter gates + dedup-by-name + order preserved
+  (let ((pending (dds.durability::%auto-discover-pending
+                  "Dyn*"
+                  '(("DynX" . "TX") ("Other" . "TO") ("DynX" . "TX2") ("DynC" . "TC") ("" . "TE")))))
+    (%check :ad-pending-filter+dedup
+            (equal pending '(("DynX" . "TX") ("DynC" . "TC")))
+            (format nil "pending must keep only matching, de-duped by name (got ~s)" pending)))
+  (let ((pending-all (dds.durability::%auto-discover-pending
+                      nil '(("A" . "T") ("B" . "T") ("A" . "T2")))))
+    (%check :ad-pending-nil-all
+            (equal pending-all '(("A" . "T") ("B" . "T")))
+            (format nil "NIL filter keeps all, de-duped by name (got ~s)" pending-all)))
+  ;; A3: %service-topics relaxation — gated STRICTLY on :auto-discover
+  (flet ((topics-of (spec) (dds.durability::%service-topics spec))
+         (errors-p (spec) (handler-case (progn (dds.durability::%service-topics spec) nil)
+                            (error () t))))
+    (let ((spec-empty-on  (dds.durability:make-service-spec :domain 0 :topics '() :auto-discover t))
+          (spec-pred-on   (dds.durability:make-service-spec :domain 0
+                            :topics (lambda (topic type) (declare (ignore topic type)) t) :auto-discover t))
+          (spec-list-on   (dds.durability:make-service-spec :domain 0
+                            :topics '(("Seed" . "T")) :auto-discover t))
+          (spec-empty-off (dds.durability:make-service-spec :domain 0 :topics '()))
+          (spec-pred-off  (dds.durability:make-service-spec :domain 0
+                            :topics (lambda (topic type) (declare (ignore topic type)) t))))
+      (%check :st-empty-auto-ok
+              (null (topics-of spec-empty-on))
+              ":auto-discover + empty start-list must return '() (no error)")
+      (%check :st-pred-auto-ok
+              (null (topics-of spec-pred-on))
+              ":auto-discover + predicate start-list must return '() (no error)")
+      (%check :st-list-auto-kept
+              (equal '(("Seed" . "T")) (topics-of spec-list-on))
+              ":auto-discover + concrete list must return the list unchanged")
+      (%check :st-empty-off-errors
+              (errors-p spec-empty-off)
+              "without :auto-discover an empty start-list must still error (byte-identical)")
+      (%check :st-pred-off-errors
+              (errors-p spec-pred-off)
+              "without :auto-discover a predicate start-list must still error (byte-identical)")))
+  ;; ============================================================================================
+  ;; PART B — DEFAULT-OFF byte-identical (both impls): :auto-discover NIL -> NO discovery node / thread
+  ;; ============================================================================================
+  (let* ((off-store (dds.durability:make-memory-store))
+         (off-spec  (dds.durability:make-service-spec
+                     :domain (test-domain +td-dynamic-topic-discovery+)
+                     :topics '(("OffA" . "ShapeType"))
+                     :store (lambda () off-store)
+                     :name "auto-discover-off"))
+         (off-svc   (dds.durability:make-durability-service off-spec :store off-store)))
+    (%check :off-spec-flag-nil
+            (null (dds.durability:service-spec-auto-discover off-spec))
+            ":auto-discover must default to NIL")
+    (unwind-protect
+         (progn
+           (dds.durability:service-start off-svc)
+           (%check :off-no-discovery-node
+                   (null (dds.durability:durability-service-discovery-node off-svc))
+                   "a fixed-set (:auto-discover NIL) service must have NO discovery node")
+           (%check :off-alive
+                   (dds.durability:service-alive-p off-svc)
+                   "the fixed-set service must be alive after start")
+           (%check :off-serves-fixed
+                   (dds.durability:service-serves-topic-p off-svc "OffA")
+                   "the fixed-set service must serve its start-list topic OffA"))
+      (ignore-errors (dds.durability:service-stop off-svc))))
+  ;; ============================================================================================
+  ;; PART C — lifecycle (both impls): :auto-discover t + empty -> discovery node/thread up; stop tears down; restart clean
+  ;; ============================================================================================
+  (let* ((lc-store (dds.durability:make-memory-store))
+         (lc-spec  (dds.durability:make-service-spec
+                    :domain (test-domain +td-dynamic-topic-discovery+)
+                    :topics '()                       ; empty start-list, permitted under :auto-discover
+                    :auto-discover t
+                    :store (lambda () lc-store)
+                    :name "auto-discover-lifecycle"))
+         (lc-svc   (dds.durability:make-durability-service lc-spec :store lc-store)))
+    (unwind-protect
+         (progn
+           ;; start #1: discovery node + poll thread come up; alive with ZERO collect nodes
+           (dds.durability:service-start lc-svc)
+           (%check :lc-node-up
+                   (not (null (dds.durability:durability-service-discovery-node lc-svc)))
+                   ":auto-discover service-start must create a discovery node")
+           (%check :lc-alive-empty
+                   (dds.durability:service-alive-p lc-svc)
+                   ":auto-discover service with an empty start-list must be alive (poll thread live)")
+           (%check :lc-no-collect-nodes
+                   (null (dds.durability:durability-service-nodes lc-svc))
+                   "empty start-list -> zero collect nodes at start")
+           ;; stop: tears down discovery node + poll thread (no leak)
+           (dds.durability:service-stop lc-svc)
+           (%check :lc-torn-down
+                   (null (dds.durability:durability-service-discovery-node lc-svc))
+                   "service-stop must tear down the discovery node")
+           (%check :lc-not-alive
+                   (not (dds.durability:service-alive-p lc-svc))
+                   "service must not be alive after stop")
+           ;; start #2: start->stop->start is clean
+           (dds.durability:service-start lc-svc)
+           (%check :lc-restart-node-up
+                   (not (null (dds.durability:durability-service-discovery-node lc-svc)))
+                   "restart must re-create the discovery node (start->stop->start clean)")
+           (%check :lc-restart-alive
+                   (dds.durability:service-alive-p lc-svc)
+                   "service must be alive after restart")
+           ;; --- F1: same-object restart-after-auto-add must NOT orphan a dynamically-added topic, and
+           ;; must NOT leave a serves-topic-p FALSE POSITIVE (a served topic with no rebuilt collect node) ---
+           (let ((dnode2 (dds.durability:durability-service-discovery-node lc-svc)))
+             (%inject-discovered-writer dnode2 "DynLC" "DynLCType" #x33)
+             (dds.durability::%discovery-poll-once lc-svc dnode2)
+             (loop repeat 50 until (dds.durability:service-serves-topic-p lc-svc "DynLC") do (sleep 0.01))
+             (%check :lc-add-served
+                     (dds.durability:service-serves-topic-p lc-svc "DynLC")
+                     "auto-add must serve DynLC on the running (restarted) service"))
+           ;; stop: the dynamically-added DynLC must NOT survive as a stale serves-topic-p T
+           (dds.durability:service-stop lc-svc)
+           (%check :lc-add-cleared-on-stop
+                   (not (dds.durability:service-serves-topic-p lc-svc "DynLC"))
+                   "service-stop must clear a dynamically-added topic (no serves-topic-p false-positive)")
+           ;; start #3 on the SAME object: nothing re-discovers DynLC yet, so it must be correctly UNSERVED
+           ;; (not orphaned as a positive with no collect node — the F1 fix)
+           (dds.durability:service-start lc-svc)
+           (%check :lc-restart3-no-stale-positive
+                   (not (dds.durability:service-serves-topic-p lc-svc "DynLC"))
+                   "after restart the stale DynLC must not be a serves-topic-p false-positive")
+           ;; re-discovery after restart genuinely re-serves + rebuilds a collect node (the restart is clean)
+           (let ((dnode3 (dds.durability:durability-service-discovery-node lc-svc)))
+             (%inject-discovered-writer dnode3 "DynLC" "DynLCType" #x33)
+             (dds.durability::%discovery-poll-once lc-svc dnode3)
+             (loop repeat 50 until (dds.durability:service-serves-topic-p lc-svc "DynLC") do (sleep 0.01))
+             (%check :lc-restart3-reserved
+                     (dds.durability:service-serves-topic-p lc-svc "DynLC")
+                     "re-discovery after restart must re-serve DynLC (a collect node genuinely rebuilt)")
+             (%check :lc-restart3-node-rebuilt
+                     (= 1 (length (dds.durability:durability-service-nodes lc-svc)))
+                     (format nil "re-serve must rebuild exactly one collect node (got ~d)"
+                             (length (dds.durability:durability-service-nodes lc-svc))))))
+      (ignore-errors (dds.durability:service-stop lc-svc))))
+  ;; ============================================================================================
+  ;; PART D — auto-add fires DETERMINISTICALLY on BOTH impls (synthetic discovered writer, no live
+  ;; publisher / timing): inject writers into the discovery node, drive one poll cycle, assert
+  ;; auto-add fires + nodes grow + topic-names gains the topic + the filter gates + idempotent.
+  ;; This exercises exactly the service-add-topic node/thread build the API-driven test already runs
+  ;; on Clasp (durability-dynamic-topic), so it is Clasp-safe.
+  ;; ============================================================================================
+  (let* ((inj-store (dds.durability:make-memory-store))
+         (inj-spec  (dds.durability:make-service-spec
+                     :domain (test-domain +td-dynamic-topic-discovery+)
+                     :topics '()
+                     :auto-discover t
+                     :auto-discover-filter "Dyn*"
+                     :store (lambda () inj-store)
+                     :name "auto-discover-inject"))
+         (inj-svc   (dds.durability:make-durability-service inj-spec :store inj-store)))
+    (unwind-protect
+         (progn
+           (dds.durability:service-start inj-svc)
+           (let ((dnode (dds.durability:durability-service-discovery-node inj-svc)))
+             ;; inject two synthetic discovered WRITERS: DynZ (matches "Dyn*") + OtherZ (non-matching)
+             (%inject-discovered-writer dnode "DynZ" "DynZType" #x11)
+             (%inject-discovered-writer dnode "OtherZ" "OtherZType" #x22)
+             ;; drive one deterministic poll cycle (the poll thread would do the same; both idempotent)
+             (dds.durability::%discovery-poll-once inj-svc dnode)
+             (loop repeat 50 until (dds.durability:service-serves-topic-p inj-svc "DynZ") do (sleep 0.01))
+             (%check :inj-auto-add-fires
+                     (dds.durability:service-serves-topic-p inj-svc "DynZ")
+                     "auto-add must fire for a discovered matching writer (topic-names gains DynZ)")
+             (%check :inj-nodes-grew
+                     (= 1 (length (dds.durability:durability-service-nodes inj-svc)))
+                     (format nil "auto-add must grow nodes to exactly 1 (got ~d)"
+                             (length (dds.durability:durability-service-nodes inj-svc))))
+             (%check :inj-filter-gates
+                     (not (dds.durability:service-serves-topic-p inj-svc "OtherZ"))
+                     "the filter must gate the non-matching OtherZ (never auto-served)")
+             ;; idempotent: a second poll cycle must not double-add
+             (dds.durability::%discovery-poll-once inj-svc dnode)
+             (%check :inj-idempotent
+                     (= 1 (length (dds.durability:durability-service-nodes inj-svc)))
+                     "repeated poll must not double-add (idempotent-by-name)")))
+      (ignore-errors (dds.durability:service-stop inj-svc))))
+  ;; ============================================================================================
+  ;; PART E — SBCL-live end-to-end (Clasp-skipped per NFR-PORT clasp-threading-gap)
+  ;; ============================================================================================
+  (cond
+    ((eq (dds.pal:pal-impl-name) :clasp)
+     (format t "~&    [dynamic-topic-discovery] Clasp: skipping live-thread arm (NFR-PORT gap)~%"))
+    (t
+     (let* ((n 3)
+            (dom (test-domain +td-dynamic-topic-discovery+))
+            (pub-prefix (%make-test-prefix #xD9))
+            (pub-node (dds.disc:make-disc-node :guid-prefix pub-prefix :domain dom
+                                               :host "127.0.0.1" :port 0 :multicast nil)))
+       (unwind-protect
+            (progn
+              ;; publisher with TWO writers: DynC (matches "Dyn*") + Other (non-matching); arbitrary type-names
+              ;; (DynCType/OtherType, NOT ShapeType) prove opaque-bytes / no-type-registration end-to-end
+              (dds.disc:add-local-writer pub-node :topic "DynC" :type "DynCType"
+                                         :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                        :durability :transient-local))
+              (dds.disc:add-local-writer pub-node :topic "Other" :type "OtherType"
+                                         :qos (dds.qos:make-writer-qos :reliability :reliable
+                                                                        :durability :transient-local))
+              (dds.disc:enable-publisher pub-node :history-kind :keep-all)
+              (dds.disc:start-node pub-node)
+              (let ((pub-port (dds.disc:disc-node-port pub-node)))
+                ;; --- RED contrast: a :auto-discover NIL service, same domain + pub, never serves DynC ---
+                (let* ((red-store (dds.durability:make-memory-store))
+                       (red-spec  (dds.durability:make-service-spec
+                                   :domain dom :topics '(("CtrlA" . "ShapeType"))
+                                   :qos-overrides (list :peers (list (cons "127.0.0.1" pub-port)))
+                                   :store (lambda () red-store) :name "auto-discover-red-control"))
+                       (red-svc   (dds.durability:make-durability-service red-spec :store red-store)))
+                  (unwind-protect
+                       (progn
+                         (dds.durability:service-start red-svc)
+                         (loop repeat 60 do (dds.disc:announce-participant pub-node)
+                                            (dds.disc:announce-endpoints pub-node) (sleep 0.02))
+                         (%check :dd-red-dync-not-served
+                                 (not (dds.durability:service-serves-topic-p red-svc "DynC"))
+                                 "RED (pre-3c): a :auto-discover NIL service must NEVER auto-serve DynC"))
+                    (ignore-errors (dds.durability:service-stop red-svc))))
+                ;; --- GREEN: :auto-discover service, filter "Dyn*", empty start-list, pub in :peers ---
+                (let* ((svc-store (dds.durability:make-memory-store))
+                       (spec (dds.durability:make-service-spec
+                              :domain dom
+                              :topics '()
+                              :auto-discover t
+                              :auto-discover-filter "Dyn*"
+                              :qos-overrides (list :peers (list (cons "127.0.0.1" pub-port)))
+                              :store (lambda () svc-store)
+                              :name "auto-discover-green"))
+                       (svc (dds.durability:make-durability-service spec :store svc-store)))
+                  (unwind-protect
+                       (progn
+                         (dds.durability:service-start svc)
+                         (%check :dd-green-starts-empty
+                                 (null (dds.durability:durability-service-nodes svc))
+                                 "GREEN service starts with zero collect nodes (empty start-list)")
+                         ;; drive discovery: pub announces until the service AUTO-ADDS DynC
+                         (loop repeat 500
+                               until (dds.durability:service-serves-topic-p svc "DynC")
+                               do (dds.disc:announce-participant pub-node)
+                                  (dds.disc:announce-endpoints pub-node)
+                                  (sleep 0.02))
+                         ;; --- the point: DynC auto-served (nodes grew, topic-names gained DynC) ---
+                         (%check :dd-auto-serve-dync
+                                 (dds.durability:service-serves-topic-p svc "DynC")
+                                 "GREEN: DynC must be AUTO-SERVED from discovery (no explicit add, no restart)")
+                         (%check :dd-nodes-grew
+                                 (>= (length (dds.durability:durability-service-nodes svc)) 1)
+                                 "auto-add must grow durability-service-nodes")
+                         ;; a few more cycles so any Other SEDP + several poll ticks have surely elapsed
+                         (loop repeat 40 do (dds.disc:announce-participant pub-node)
+                                            (dds.disc:announce-endpoints pub-node) (sleep 0.02))
+                         ;; --- FILTER gate (live): the non-matching Other is NOT served ---
+                         (%check :dd-filter-blocks-other
+                                 (not (dds.durability:service-serves-topic-p svc "Other"))
+                                 "FILTER: the non-matching topic Other must NOT be auto-served")
+                         (%check :dd-dync-still-served
+                                 (dds.durability:service-serves-topic-p svc "DynC")
+                                 "DynC must remain served after further poll cycles (idempotent, no drop)")
+                         ;; --- collect: locate the auto-added DynC collect node (by its relay writer's topic),
+                         ;; wire it bidirectionally to the pub, then publish N and drain (fast announce loop) ---
+                         (let ((dync-node
+                                (let ((pair (find "DynC" (dds.durability:durability-service-nodes svc)
+                                                  :key (lambda (p)
+                                                         (let ((w (dds.disc::disc-node-local-writers (car p))))
+                                                           (and w (dds.rtps.discovery:endpoint-data-topic-name
+                                                                   (first w)))))
+                                                  :test #'equal)))
+                                  (and pair (car pair)))))
+                           (%check :dd-dync-node-found
+                                   (not (null dync-node))
+                                   "the auto-added DynC collect node must be locatable by its relay writer's topic")
+                           (when dync-node
+                             (%wire-unicast dync-node pub-node)
+                             (%await-match dync-node pub-node :retries 300 :sleep-s 0.02)
+                             (dotimes (i n) (dds.disc:publish-sample pub-node (%make-small-payload (1+ i))))
+                             (loop repeat 120
+                                   until (>= (dds.durability:store-count svc-store "DynC") n)
+                                   do (%announce-both pub-node dync-node) (sleep 0.02))
+                             (%check :dd-dync-collected
+                                     (= n (dds.durability:store-count svc-store "DynC"))
+                                     (format nil "DynC store expected ~d, got ~d"
+                                             n (dds.durability:store-count svc-store "DynC")))
+                             ;; --- TL late-joiner replay: stop pub, then a fresh TL reader on DynC gets all N ---
+                             (ignore-errors (dds.disc:stop-node pub-node))
+                             (sleep 0.1)
+                             (let* ((lj-prefix (%make-test-prefix #xE9))
+                                    (lj-node (dds.disc:make-disc-node :guid-prefix lj-prefix :domain dom
+                                                                       :host "127.0.0.1" :port 0 :multicast nil)))
+                               (unwind-protect
+                                    (progn
+                                      (dds.disc:add-local-reader lj-node :topic "DynC" :type "DynCType"
+                                                                 :qos (dds.qos:make-reader-qos
+                                                                       :reliability :reliable
+                                                                       :durability :transient-local))
+                                      (dds.disc:enable-subscriber lj-node)
+                                      (setf (dds.disc:disc-node-on-match lj-node)
+                                            (lambda (kind remote &optional local-eid)
+                                              (declare (ignore local-eid))
+                                              (when (eq kind :remote-writer)
+                                                (dds.disc:%reader-durability-init
+                                                 lj-node
+                                                 (copy-seq (dds.rtps.discovery:endpoint-data-guid remote))
+                                                 (dds.qos:qos-durability
+                                                  (dds.rtps.discovery:endpoint-data-qos remote))))))
+                                      (dds.disc:start-node lj-node)
+                                      (%wire-unicast lj-node dync-node)
+                                      (%await-match lj-node dync-node :retries 300 :sleep-s 0.02)
+                                      (%await-sample-count lj-node n :retries 1200 :sleep-s 0.005)
+                                      (%check :dd-latejoiner-replay
+                                              (= n (dds.disc:node-sample-count lj-node))
+                                              (format nil "DynC TL late-joiner expected ~d samples, got ~d"
+                                                      n (dds.disc:node-sample-count lj-node))))
+                                 (ignore-errors (dds.disc:stop-node lj-node)))))))
+                    (ignore-errors (dds.durability:service-stop svc))))))
+         (ignore-errors (dds.disc:stop-node pub-node))))))
   t)
 
 ;;; --- logical-origin accessor test (Task 1: WP-DURABILITY-COEXIST-LIVE) ---

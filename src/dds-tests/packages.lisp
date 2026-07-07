@@ -65,6 +65,7 @@
            #:run-durability-process-persistent-refuse-test
            #:run-durability-origins-cap-test
            #:run-durability-dynamic-topic-test
+           #:run-durability-dynamic-topic-discovery-test
            #:run-durability-relay-tier-test
            #:run-durability-collect-tier-test
            #:run-durability-origin-accessor-test

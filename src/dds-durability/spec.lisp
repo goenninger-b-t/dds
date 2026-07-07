@@ -8,7 +8,14 @@
    TOPICS is either a list of (topic-string . type-string) conses, a (lambda (topic type) …) predicate, or NIL.
    When TOPICS is NIL (empty list), the service matches no topics — non-erroring no-match, distinct from a predicate.
    HISTORY-KIND + HISTORY-DEPTH are the DURABILITY_SERVICE history QoS (DDS 1.4 §2.2.3.5): :keep-all (default,
-   byte-identical — no compaction) or :keep-last with DEPTH >= 1 (compaction on file-store + eviction on in-memory)."
+   byte-identical — no compaction) or :keep-last with DEPTH >= 1 (compaction on file-store + eviction on in-memory).
+   AUTO-DISCOVER (ADR 0026 dynamic-topic-add Phase-2b) opts the service into DISCOVERY-DRIVEN auto-serve: when
+   non-NIL, service-start also spins a bare SPDP/SEDP discovery node + a poll thread that auto-adds (via the
+   idempotent service-add-topic) any newly-discovered remote WRITER topic that passes AUTO-DISCOVER-FILTER, with
+   NO explicit add-topic call and NO restart. NIL (default) = the fixed start-list behavior, no observable change when off.
+   AUTO-DISCOVER-FILTER guards which discovered topics are served (only consulted when AUTO-DISCOVER is set):
+   NIL = match-all, a function = a (lambda (topic-name) …) predicate, a string = a simple name glob (a lone
+   trailing #\\* matches any suffix, otherwise an exact string= match; pass a function for richer matching)."
   (domain         0         :type (integer 0))
   (topics         nil       :type (or null list function))
   (store          nil       :type (or null function))
@@ -16,7 +23,9 @@
   (qos-overrides  nil       :type list)
   (name           ""        :type string)
   (history-kind   :keep-all :type (member :keep-all :keep-last)) ; DURABILITY_SERVICE history_kind (DDS 1.4 §2.2.3.5)
-  (history-depth  1         :type (integer 1)))                  ; DURABILITY_SERVICE history_depth; KEEP_LAST compaction (file-store) + eviction (in-memory)
+  (history-depth  1         :type (integer 1))                   ; DURABILITY_SERVICE history_depth; KEEP_LAST compaction (file-store) + eviction (in-memory)
+  (auto-discover  nil       :type boolean)                       ; opt-in discovery-driven auto-serve (ADR 0026 Phase-2b); NIL (default) = fixed-set, no observable change when off
+  (auto-discover-filter nil :type (or null function string)))    ; runtime topic-NAME filter under :auto-discover; NIL = match-all, function = predicate over the name, string = simple name glob (trailing #\* prefix-match, else exact)
 
 (defun* make-service-spec (&key (domain 0) topics
                                 (store (lambda () (make-memory-store)))
@@ -24,7 +33,9 @@
                                 (qos-overrides nil)
                                 (name "")
                                 (history-kind  :keep-all)
-                                (history-depth 1))
+                                (history-depth 1)
+                                (auto-discover nil)
+                                (auto-discover-filter nil))
     (function (&key (:domain (integer 0))
                     (:topics (or null list function))
                     (:store (or null function))
@@ -32,7 +43,9 @@
                     (:qos-overrides list)
                     (:name string)
                     (:history-kind  (member :keep-all :keep-last))
-                    (:history-depth (integer 1)))
+                    (:history-depth (integer 1))
+                    (:auto-discover t)
+                    (:auto-discover-filter (or null function string)))
               service-spec)
   "Construct a SERVICE-SPEC for DOMAIN. TOPICS is a list of (topic . type) conses or a predicate function.
    STORE is a 0-arg factory returning a DURABLE-STORE (default: in-memory). MODE is :THREAD or :PROCESS.
@@ -51,10 +64,17 @@
                                     collapses the foreign relay's copies against directly-collected samples,
                                     rather than double-recording them under the foreign relay's own wire GUID).
      :peers <list-of-(host . port)> — initial unicast SPDP peers.
-     :multicast <boolean>           — when T enables multicast SPDP socket."
+     :multicast <boolean>           — when T enables multicast SPDP socket.
+   AUTO-DISCOVER (default NIL, no observable change when off) opts into discovery-driven auto-serve; AUTO-DISCOVER-FILTER
+   (NIL match-all / function predicate over topic-name / string name-glob) gates which discovered topics the
+   service auto-adds. Under AUTO-DISCOVER an empty or predicate TOPICS start-list is permitted (the service
+   starts serving nothing and auto-adds as matching writers appear); without it, TOPICS must be a non-empty
+   concrete (topic . type) list (unchanged)."
   (%make-service-spec :domain domain :topics topics :store store
                       :mode mode :qos-overrides qos-overrides :name name
-                      :history-kind history-kind :history-depth history-depth))
+                      :history-kind history-kind :history-depth history-depth
+                      :auto-discover (and auto-discover t)
+                      :auto-discover-filter auto-discover-filter))
 
 (defun* make-persistent-store-factory (&key dir key-dir
                                             (history-kind :keep-all) (history-depth 1))

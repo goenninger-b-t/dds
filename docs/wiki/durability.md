@@ -658,6 +658,48 @@ To add a topic to an **already-running** service without a restart:
 ;; => (values T node)   ; idempotent by topic name — a duplicate add returns (values NIL NIL)
 ```
 
+#### 8.1.1 Discovery-driven auto-serve (opt-in `:auto-discover`)
+
+`service-add-topic` is the **API-driven** half of dynamic-topic-add — you name the topic. The
+**discovery-driven** half lets a service watch the domain and auto-serve topics **as their writers appear**,
+with no `add-topic` call and no restart. It is **opt-in** and the default is byte-identical:
+
+```lisp
+(defparameter *spec*
+  (dds.durability:make-service-spec
+   :domain 0
+   :topics '()                                  ; empty start-list is OK under :auto-discover
+   :auto-discover t                             ; opt in
+   :auto-discover-filter "Sensor*"              ; NIL = every topic; a function = predicate over the
+                                                ; topic-NAME; a string = a simple name glob (trailing * = prefix)
+   :name "auto"))
+(defparameter *svc* (dds.durability:make-durability-service *spec*))
+(dds.durability:service-start *svc*)            ; also spins a bare SPDP/SEDP discovery node + a poll thread
+;; ... a remote publisher announces a NEW topic "SensorTemp" ...
+;; the service auto-adds it (reusing service-add-topic), collects it, and replays it to TL late-joiners:
+(dds.durability:service-serves-topic-p *svc* "SensorTemp")   ; => T   (auto-served; "Motor42" would be NIL)
+(dds.durability:service-stop *svc*)             ; tears down the poll thread + discovery node (no leak)
+```
+
+- **How.** When `:auto-discover` is set, `service-start` builds ONE **bare** `disc-node` (SPDP/SEDP only, no
+  user endpoints) — it discovers *every* remote participant's published topics. A poll thread (interval
+  `*durability-auto-discover-interval*`, default 0.25 s) scans the discovered **writers** and, for each
+  topic that is not yet served **and** passes `:auto-discover-filter`, calls the ordinary
+  `service-add-topic` (idempotent-by-name, so repeated discovery and races are harmless). Only WRITERS are
+  served (a reader-only topic carries no data).
+- **The filter is the guard.** Without it, `:auto-discover` would spin up a collect node for **every** topic
+  on the domain. `NIL` = match-all (use only on a quiet domain); prefer a predicate or `"Prefix*"` glob.
+- **No type registration.** The service stores/relays **opaque CDR bytes**; SEDP already carries the topic-
+  and type-NAME strings, so an arbitrary discovered type is served verbatim — no XTypes/TypeLookup needed.
+- **Default off.** `:auto-discover` NIL (the default) spawns **no** discovery node and **no** poll thread;
+  `service-start` / `service-stop` and the fixed start-list behavior show **no observable change** from prior
+  releases (behaviorally identical — the off path adds only vacuous, unobservable work).
+- **Stop discards runtime state.** `service-stop` clears the served-topic registry, so a dynamically-added
+  topic (API or auto-discover) does not survive into a same-object restart as a `service-serves-topic-p`
+  false positive; a fixed start-list re-registers on the next `service-start` (its registry is byte-identical
+  after the restart), and runtime additions are re-done (auto-discover re-discovers; the API caller re-adds).
+- Introspect with `durability-service-discovery-node` and `service-serves-topic-p`. See ADR 0026 (Phase-2b).
+
 ### 8.2 On-disk format (append-log-per-topic)
 
 - `D/topics/<topic-id>.log` — one append-only log per topic (`<topic-id>` = lowercase hex of the

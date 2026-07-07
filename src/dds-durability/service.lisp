@@ -47,6 +47,14 @@
    hook is itself swallowed (ignore-errors). Bind to observe collect-loop errors.
    Default = %DEFAULT-DURABILITY-ERROR-HOOK.")
 
+;;; --- discovery-driven auto-serve poll cadence (ADR 0026 dynamic-topic-add Phase-2b) ---
+
+(defparameter *durability-auto-discover-interval* 0.25
+  "Seconds the :auto-discover discovery-poll thread sleeps between scans of the discovery node's
+   discovered-writers list (control-plane, off the wire hot path). Read once per iteration; lower for
+   snappier auto-serve reactivity, higher to reduce idle wakeups. Only consulted when a service-spec has
+   AUTO-DISCOVER set — the default fixed-set service spawns no poll thread and never reads it.")
+
 ;;; --- durability-service struct ---
 
 (defstruct* (durability-service (:constructor %make-durability-service))
@@ -57,7 +65,10 @@
    NODE and THREAD are kept for backward compat (process-mode proxy in runner.lisp) and
    single-arity accessor callers; they mirror the first element of NODES after service-start.
    TOPIC-NAMES is an :equal hash-table of registered topic-name strings; guards idempotency in
-   service-add-topic by name (time-stable) rather than by the time-varying GUID prefix."
+   service-add-topic by name (time-stable) rather than by the time-varying GUID prefix.
+   DISCOVERY-NODE + DISCOVERY-THREAD are populated ONLY when (service-spec-auto-discover spec): a bare
+   discovery disc-node (SPDP/SEDP, no user endpoints) and the poll thread that scans it and auto-adds
+   matching unconfigured topics via service-add-topic. Both NIL for a fixed-set service (no observable change when off)."
   (spec        nil :type (or null service-spec))
   (store       nil :type (or null durable-store))
   (node        nil :type t)
@@ -65,7 +76,11 @@
   (nodes       nil :type list)
   (topic-names (make-hash-table :test #'equal) :type hash-table)
   (lock        (dds.pal:make-lock "dds-durability-service") :type t)
-  (running     nil :type t))
+  (running     nil :type t)
+  ;; :auto-discover only (NIL for a fixed-set service, no observable change when off): a bare SPDP/SEDP discovery node +
+  ;; its poll thread, spun at service-start and torn down at service-stop (ADR 0026 dynamic-topic Phase-2b)
+  (discovery-node   nil :type t)
+  (discovery-thread nil :type t))
 
 
 ;;; --- construction ---
@@ -82,22 +97,30 @@
 
 (defun* %service-topics (spec)
     (function (service-spec) list)
-  "Return the list of (topic-name . type-name) conses to build nodes for.
-   List form: returns the explicit list directly (must be non-empty).
-   Predicate form: error — a predicate cannot enumerate concrete topics at start time;
-   supply an explicit (topic . type) list (dynamic topic-add after start is a documented deferral per design §6).
-   Empty list: error — at least one (topic . type) is required."
-  (let ((f (service-spec-topics spec)))
+  "Return the list of (topic-name . type-name) conses to build INITIAL nodes for.
+   List form: returns the explicit list directly (must be non-empty unless :auto-discover).
+   Predicate form: error UNLESS :auto-discover — a predicate cannot enumerate concrete topics at start
+   time; supply an explicit (topic . type) list, or set :auto-discover so discovery drives the adds.
+   Empty list: error UNLESS :auto-discover — at least one (topic . type) is required.
+   :auto-discover (ADR 0026 Phase-2b) relaxes the non-empty/predicate rejection: an empty or predicate
+   start-list returns '() (serve nothing initially; the discovery poll auto-adds matching topics). A
+   non-empty concrete list is still honored as the initial set. A non-empty MALFORMED list (not conses)
+   still errors even under :auto-discover. When :auto-discover is NIL (default) there is no observable change (the added branch is dead when off)."
+  (let ((f    (service-spec-topics spec))
+        (auto (service-spec-auto-discover spec)))
     (etypecase f
       (list
-       (unless (and (consp f) (consp (car f)))
-         (error "dds.durability: service-spec has no explicit (topic . type) cons — ~
-                 at least one concrete (topic . type) is required"))
-       f)
+       (cond
+         ((and (consp f) (consp (car f))) f)   ; valid non-empty concrete start-list
+         ((and auto (null f)) '())              ; :auto-discover + empty: serve nothing initially
+         (t (error "dds.durability: service-spec has no explicit (topic . type) cons — ~
+                    at least one concrete (topic . type) is required"))))
       (function
-       (error "dds.durability: service-spec topics is a predicate — cannot enumerate ~
-               concrete topics at service-start (supply an explicit (topic . type) list; ~
-               dynamic topic-add after start is a documented deferral per design §6)")))))
+       (cond
+         (auto '())                             ; :auto-discover + predicate: no initial nodes; discovery drives adds
+         (t (error "dds.durability: service-spec topics is a predicate — cannot enumerate ~
+                    concrete topics at service-start (supply an explicit (topic . type) list; ~
+                    dynamic topic-add after start is a documented deferral per design §6)")))))))
 
 ;;; --- GUID prefix for the collect node ---
 
@@ -402,6 +425,8 @@
     (dds.disc:start-node node)
     node))
 
+(declaim (ftype (function (durability-service) t) %service-start-auto-discover))
+
 (defun* service-start (service)
     (function (durability-service) durability-service)
   "Resolve the spec's topics to K concrete (topic . type) pairs, then for each pair build a
@@ -457,6 +482,8 @@
         ;; mirror first pair into legacy node/thread slots for backward compat
         (setf (durability-service-node   service) (caar ordered))
         (setf (durability-service-thread service) (cdar ordered))))
+    ;; opt-in (default NIL, no observable change when off): spin the bare discovery node + poll thread
+    (%service-start-auto-discover service)
     service))
 
 ;;; --- service-stop ---
@@ -466,10 +493,32 @@
   "Signal all collect loops to stop; for each node: JOIN its collect thread THEN stop-node.
    The join precedes stop-node per node so each loop has fully exited before its socket is
    closed (avoids getsockname EBADF on a final in-flight poll). Idempotent.
-   Also handles the process-mode proxy case (single thread in the legacy THREAD slot)."
-  (let ((node-pairs nil) (legacy-th nil))
+   Also handles the process-mode proxy case (single thread in the legacy THREAD slot).
+   :auto-discover teardown (ADR 0026 Phase-2b): the discovery poll thread is JOINED and its bare
+   discovery node STOPPED FIRST — before the collect-node list is snapshotted — so no in-flight
+   auto-add can push a new (node . thread) pair after the snapshot (no leak). Both steps are guarded,
+   so for a fixed-set service (discovery slots NIL) they are no-ops and the teardown has no observable
+   change when off.
+   TOPIC-NAMES is cleared (clrhash) at the end of teardown: stop discards ALL running state, so a
+   dynamically-added topic (via service-add-topic or :auto-discover) does not survive as a stale entry
+   into the next service-start on the SAME object — which would otherwise make a re-add a no-op and
+   leave service-serves-topic-p a FALSE POSITIVE (a served topic with no rebuilt collect node). A fixed
+   service-start re-registers its start-list names, so the fixed-set case is byte-identical after the
+   next start (same topic-names contents); runtime additions are re-done on restart (:auto-discover
+   re-discovers + re-adds; the explicit API caller must re-add — the correct 'stop discards runtime state')."
+  (let ((node-pairs nil) (legacy-th nil) (disc-node nil) (disc-th nil))
     (dds.pal:with-lock ((durability-service-lock service))
       (setf (durability-service-running service) nil)
+      ;; grab + clear the discovery slots under the same lock that flips RUNNING
+      (setf disc-node (durability-service-discovery-node service))
+      (setf disc-th   (durability-service-discovery-thread service))
+      (setf (durability-service-discovery-node   service) nil)
+      (setf (durability-service-discovery-thread service) nil))
+    ;; join the poll thread FIRST (it reads RUNNING each tick -> exits), so no further service-add-topic
+    ;; fires; only then is the collect-node list stable to snapshot below
+    (when disc-th   (ignore-errors (dds.pal:join disc-th)))
+    (when disc-node (ignore-errors (dds.disc:stop-node disc-node)))
+    (dds.pal:with-lock ((durability-service-lock service))
       (setf node-pairs (durability-service-nodes service))
       (setf (durability-service-nodes service) nil)
       ;; process-mode proxy stores monitor thread in the legacy thread slot only
@@ -487,7 +536,11 @@
         (when legacy-th
           (ignore-errors (dds.pal:join legacy-th))))
     (dds.pal:with-lock ((durability-service-lock service))
-      (setf (durability-service-thread service) nil))
+      (setf (durability-service-thread service) nil)
+      ;; discard running topic registry: start rebuilds from the spec (fixed start-list re-registers ->
+      ;; byte-identical after the next start; runtime adds are re-done). Prevents a stale entry making a
+      ;; post-restart re-add a no-op with a serves-topic-p false-positive (no rebuilt collect node).
+      (clrhash (durability-service-topic-names service)))
     ;; close the store: for file-backed tiers this fsyncs logs + frees epoch DEKs
     (ignore-errors (store-close (durability-service-store service))))
   t)
@@ -498,14 +551,36 @@
     (function (durability-service) boolean)
   "T iff the running flag is set and every collect-loop thread is live.
    For thread-mode multi-topic: all K threads in NODES must be non-nil.
-   For the process-mode proxy: the single THREAD slot must be non-nil."
+   For the process-mode proxy: the single THREAD slot must be non-nil.
+   For an :auto-discover service the poll thread must also be live; an :auto-discover service with an
+   EMPTY start-list (zero collect nodes) is alive iff its poll thread is. When DISCOVERY-NODE is NIL
+   (a fixed-set service) the two added discovery clauses are vacuously true, so there is no observable change when off."
   (dds.pal:with-lock ((durability-service-lock service))
     (and (durability-service-running service)
+         ;; A: all collect threads live (vacuously T when there are no collect nodes)
          (let ((pairs (durability-service-nodes service)))
-           (if pairs
-               (every (lambda (p) (if (cdr p) t nil)) pairs)
-               ;; process-mode proxy: use legacy thread slot
-               (if (durability-service-thread service) t nil))))))
+           (if pairs (every (lambda (p) (if (cdr p) t nil)) pairs) t))
+         ;; B: the poll thread is live iff :auto-discover (vacuously T for a fixed-set service)
+         (if (durability-service-discovery-node service)
+             (if (durability-service-discovery-thread service) t nil) t)
+         ;; C: a running service must be backed by SOME live thread — collect nodes, the poll thread, or
+         ;; the process-mode proxy (identical to the prior legacy-thread fallback when discovery is off)
+         (cond
+           ((durability-service-nodes service) t)
+           ((durability-service-discovery-node service) t)
+           (t (if (durability-service-thread service) t nil))))))
+
+;;; --- service-serves-topic-p ---
+
+(defun* service-serves-topic-p (service topic-name)
+    (function (durability-service string) boolean)
+  "T iff SERVICE currently serves TOPIC-NAME — i.e. TOPIC-NAME is registered in the service's
+   topic-name set (a collect node exists or is being built for it). Checked UNDER the service lock, so it
+   is safe to call from any thread concurrently with the collect / discovery-poll threads (which mutate the
+   set under the same lock). Covers start-list topics and dynamically added ones alike (an explicit
+   service-add-topic or an :auto-discover auto-add). The primary consumer is observability / tests."
+  (dds.pal:with-lock ((durability-service-lock service))
+    (if (gethash topic-name (durability-service-topic-names service)) t nil)))
 
 ;;; --- service-add-topic ---
 
@@ -544,3 +619,128 @@
           (setf (gethash topic-name (durability-service-topic-names service)) t)
           (push (cons node th) (durability-service-nodes service)))
         (values t node)))))
+
+;;; --- discovery-driven auto-serve (ADR 0026 dynamic-topic-add, Phase-2b) ---
+;;;
+;;; Opt-in (:auto-discover): a bare SPDP/SEDP discovery node + a poll thread that auto-adds any
+;;; newly-discovered remote WRITER topic (passing the filter) via the existing SERVICE-ADD-TOPIC.
+;;; DRY: the actual node/store/relay build is SERVICE-ADD-TOPIC verbatim — the new code below is only
+;;; the filter, the bare node, the poll, and (in service-start/service-stop) the lifecycle. The default
+;;; (no :auto-discover) never reaches any of this, so the fixed-set path has no observable change when off.
+
+(defun* %auto-discover-match-p (filter topic-name)
+    (function ((or null function string) string) t)
+  "T iff TOPIC-NAME passes the :auto-discover FILTER. NIL = match-all (the default under :auto-discover).
+   A function is a predicate (funcall filter topic-name) -> generalized boolean. A string is a simple name
+   glob: a lone TRAILING #\\* matches any suffix (prefix match — e.g. \"Dyn*\" matches \"DynX\"/\"Dyn\");
+   otherwise an exact string= match. For richer POSIX fnmatch semantics pass a function predicate."
+  (etypecase filter
+    (null t)
+    (function (if (funcall filter topic-name) t nil))
+    (string
+     (let ((plen (length filter)))
+       (if (and (plusp plen) (char= #\* (char filter (1- plen))))
+           (let ((pn (1- plen)))                       ; compare the pre-#\* prefix against the name head
+             (and (>= (length topic-name) pn)
+                  (string= filter topic-name :end1 pn :end2 pn)))
+           (string= filter topic-name))))))
+
+(defun* %auto-discover-pending (filter candidates)
+    (function ((or null function string) list) list)
+  "Pure: from CANDIDATES ((topic-name . type-name) conses) keep those passing FILTER
+   (%auto-discover-match-p), de-duplicated BY topic-name (first type-name wins), original order preserved.
+   Skips malformed / empty-topic entries. Does NOT consult the service's served set — SERVICE-ADD-TOPIC is
+   idempotent-by-name (an already-served topic is an O(1) no-op there), so leaving the served-skip to it
+   keeps this a side-effect-free, unit-testable selection core (the FILTER + IDEMPOTENT gates test it directly)."
+  (let ((seen (make-hash-table :test #'equal)) (out '()))
+    (dolist (c candidates (nreverse out))
+      (let ((topic (car c)) (type (cdr c)))
+        (when (and (stringp topic) (stringp type) (plusp (length topic))
+                   (not (gethash topic seen))
+                   (%auto-discover-match-p filter topic))
+          (setf (gethash topic seen) t)
+          (push c out))))))
+
+(defun* %discovered-topic-types (node)
+    (function (t) list)
+  "Snapshot the discovery NODE's discovered remote PUBLICATIONS as (topic-name . type-name) conses.
+   WRITERS only — a reader-only topic carries no data to persist (react to writers per the brief). Only
+   the topic-NAME + type-NAME strings are needed (SEDP carries both); the payload is stored/relayed opaque,
+   so NO type registration is required to serve an arbitrary discovered type. Skips empty-topic entries."
+  (let ((out '()))
+    (dolist (ep (dds.disc:disc-node-discovered-writers-list node) (nreverse out))
+      (let ((topic (dds.rtps.discovery:endpoint-data-topic-name ep))
+            (type  (dds.rtps.discovery:endpoint-data-type-name ep)))
+        (when (and (stringp topic) (stringp type) (plusp (length topic)))
+          (push (cons topic type) out))))))
+
+(defun* %build-discovery-node (spec)
+    (function (service-spec) t)
+  "Build + start a BARE discovery disc-node for SPEC: SPDP/SEDP discovery ONLY, NO user endpoints, so its
+   receiver records EVERY remote participant's published topics into disc-node-discovered-writers (the
+   'sees all topics' feed the per-topic collect nodes lack). Honors the spec's domain + the :peers /
+   :multicast qos-overrides (same reach as the collect nodes). Returns the started node."
+  (let* ((overrides (service-spec-qos-overrides spec))
+         (node (dds.disc:make-disc-node
+                :guid-prefix (%collect-node-prefix spec "*auto-discover*")   ; distinct from any collect node's prefix
+                :domain (service-spec-domain spec)
+                :host "127.0.0.1"
+                :port 0
+                :peers (or (getf overrides :peers) '())
+                :multicast (getf overrides :multicast))))
+    (dds.disc:start-node node)
+    node))
+
+(defun* %discovery-poll-once (service node)
+    (function (durability-service t) t)
+  "Run ONE discovery scan cycle: for each discovered remote WRITER whose topic passes the service's
+   :auto-discover-filter, call the existing SERVICE-ADD-TOPIC (idempotent-by-name + TOCTOU-guarded, so
+   repeated discovery / a race is harmless — an already-served topic short-circuits before any node is
+   built). The poll thread calls this each tick; tests call it directly for deterministic assertions."
+  (let* ((spec   (durability-service-spec service))
+         (filter (service-spec-auto-discover-filter spec)))
+    (dolist (pair (%auto-discover-pending filter (%discovered-topic-types node)))
+      (service-add-topic service (car pair) (cdr pair))))
+  t)
+
+(defun* %discovery-poll-loop (service node)
+    (function (durability-service t) t)
+  "Discovery-driven auto-serve poll-thread body (ADR 0026 Phase-2b), mirroring %collect-loop's shape:
+   reads RUNNING under the lock each iteration (so service-stop drains + joins it), re-announces NODE's
+   SPDP + SEDP every ~1.5 s (RTPS 2.5 §8.5.3.3) so peers keep discovering the bare node, then runs one
+   %discovery-poll-once scan. Sleeps *durability-auto-discover-interval* between ticks. Each iteration is
+   wrapped in handler-case so a transient error fires *durability-error-hook* and the thread survives."
+  (let ((error-count 0) (last-announce 0))
+    (loop
+      (unless (dds.pal:with-lock ((durability-service-lock service))
+                (durability-service-running service))
+        (return))
+      (handler-case
+          (let ((now (get-internal-real-time)))
+            (when (> (- now last-announce)
+                     (round (* 1.5 internal-time-units-per-second)))
+              (dds.disc:announce-participant node)
+              (dds.disc:announce-endpoints node)
+              (setf last-announce now))
+            (%discovery-poll-once service node))
+        (error (c)
+          (let ((n (incf error-count)))
+            (ignore-errors (funcall *durability-error-hook* c :discovery-poll n)))))
+      (sleep *durability-auto-discover-interval*)))
+  t)
+
+(defun* %service-start-auto-discover (service)
+    (function (durability-service) t)
+  "When (service-spec-auto-discover spec): build the bare discovery node, spawn the poll thread, and
+   record both under the service lock. A NO-OP returning T for a fixed-set service — so the default
+   service-start tail has no observable change when off. Called after RUNNING is already T and the collect nodes are up."
+  (let ((spec (durability-service-spec service)))
+    (when (service-spec-auto-discover spec)
+      (let* ((node (%build-discovery-node spec))
+             (th   (dds.pal:spawn
+                    (let ((n node)) (lambda () (%discovery-poll-loop service n)))
+                    :name (format nil "dds-durability-auto-discover(~a)" (service-spec-name spec)))))
+        (dds.pal:with-lock ((durability-service-lock service))
+          (setf (durability-service-discovery-node   service) node)
+          (setf (durability-service-discovery-thread service) th)))))
+  t)

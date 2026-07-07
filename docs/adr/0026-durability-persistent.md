@@ -199,13 +199,70 @@ encrypted-store seals → the file store writes only sealed bytes under `D`; the
   set (mirroring the receiver-side dedup of ADR 0024). The lifecycle dedup key `(car . cdr)` is
   semantically identical to the old flat `GUID.SN`; no-double-delivery and no-false-reject are
   preserved (proven by `:prune-lc-no-double` + `:prune-shed-readmission`).
-- **Dynamic-topic-add.** `service-add-topic` adds a topic to a running service — a new disc-node
+- **Dynamic-topic-add (API-driven).** `service-add-topic` adds a topic to a running service — a new disc-node
   (reusing `%build-disc-node`, DRY) + a store partition + its own collect/replay pair, **under the
   service lock**; returns `(values t node)` (or `(values nil nil)` if already present).
   **Idempotency is by TOPIC NAME** — a per-service `equal` hash-table populated at `service-start`
   + `add-topic`, time-stable and O(1), with a **TOCTOU-guarded final-lock re-check** (an earlier
   idempotency-by-time-varying-prefix scheme double-added across a 1-second boundary — a review fix,
   see Consequences).
+
+### Dynamic-topic-add — discovery-driven auto-serve (Phase-2b, RESOLVED — WP-DURABILITY-DYNAMIC-TOPIC-DISCOVERY)
+
+The Phase-2 note deferred the *discovery-driven* half of dynamic-topic-add ("a predicate-only spec … signals
+at service-start"; the API-driven `service-add-topic` shipped first). It is now **built** — an **opt-in**
+service that, at RUNTIME, sees a SEDP writer for an **unconfigured** topic and auto-spins a node to collect +
+serve it, with **no** explicit `add-topic` call and **no** restart. The whole feature is a **pure addition
+gated on a flag**; the default (fixed-set) path is untouched.
+
+- **Opt-in on the service-spec.** `service-spec-auto-discover` (default **NIL** ⇒ **no observable change when
+  off** — see the precision note below) + `service-spec-auto-discover-filter` (the runtime topic-NAME guard: **NIL = match-all**, a
+  **function** = a `(lambda (topic-name) …)` predicate, a **string** = a simple name glob — a lone trailing
+  `*` is a prefix match, else exact). Under `:auto-discover`, `%service-topics` also permits an **empty or
+  predicate** start-list (the service starts serving nothing and auto-adds as matching writers appear); the
+  non-empty-list requirement is relaxed **only** under the flag, so with `:auto-discover` NIL the exact prior
+  error is preserved.
+- **A bare discovery node.** `service-start` (only when `:auto-discover`) builds ONE `make-disc-node` with
+  **no user endpoints** — SPDP/SEDP discovery only — so its receiver records **every** remote participant's
+  published topics into `disc-node-discovered-writers` (the "sees all topics" feed the per-topic collect
+  nodes lack). It honors the spec's domain + `:peers` / `:multicast` overrides (same reach as the collect nodes).
+- **A poll thread (mirrors `%collect-loop`).** It reads `RUNNING` under the lock each tick (so `service-stop`
+  drains it), re-announces SPDP/SEDP on the ~1.5 s cadence, and every `*durability-auto-discover-interval*`
+  (default 0.25 s) scans the discovery node's discovered **WRITERS** (a reader-only topic has no data to
+  persist). For each writer whose topic passes the filter it calls the **existing `service-add-topic`
+  verbatim** (DRY — no re-implemented node/store/relay). **Idempotency-by-name** makes repeated discovery /
+  a race harmless: an already-served topic short-circuits under the first lock before any node is built.
+- **Opaque bytes ⇒ no type registration.** The service stores/relays raw CDR bytes, so it needs only the
+  topic-NAME + type-NAME **strings** — both carried by SEDP (`endpoint-data-topic-name` /
+  `endpoint-data-type-name`). An arbitrary discovered type-name is served verbatim; no XTypes/TypeLookup.
+- **Lifecycle.** The discovery node + poll thread are created at `service-start` (opt-in) and torn down FIRST
+  at `service-stop` — the poll thread is **joined before the collect-node list is snapshotted**, so no
+  in-flight auto-add can push a pair after the snapshot (no leak); `start→stop→start` is clean. Both teardown
+  steps are guarded, so a fixed-set service's `service-stop` has **no observable change when off**.
+  `service-stop` also **`clrhash`es the topic-name registry** — stop discards ALL running state, so a
+  dynamically-added topic (API `service-add-topic` or `:auto-discover`) does not survive as a stale entry into
+  the next `service-start` on the **same object**, which would otherwise make a re-add a no-op and leave
+  `service-serves-topic-p` a **false positive** (a "served" topic with no rebuilt collect node — silent
+  data-unavailability for PERSISTENT). A fixed `service-start` re-registers its start-list names, so the
+  fixed-set registry is **byte-identical after the next start**; runtime additions are re-done on restart
+  (`:auto-discover` re-discovers + re-adds; the API caller must re-add — the correct "stop discards runtime
+  state"). The production `runner-start` builds a fresh service per restart, so it was never exposed; the fix
+  makes the same-object restart genuinely clean.
+- **Precision on "no observable change when off".** With `:auto-discover` NIL the default path is
+  **behaviorally identical** — but not literally byte-identical: `service-stop` now takes the lock twice (a
+  split that is unobservable absent a concurrent add), `service-alive-p` evaluates two added (vacuously-true)
+  clauses, and `service-start` runs one extra no-op call. None change observable behavior when off; the
+  fixed-set **data** state (topic-names after a restart) is byte-identical.
+- **Tests** (`run-durability-dynamic-topic-discovery-test`): the pure filter/selection core, the
+  `%service-topics` relaxation, **DEFAULT-OFF** (no discovery node/thread when off), the `start→stop→start`
+  lifecycle **including a restart-after-auto-add** (auto-add a topic, stop ⇒ `serves-topic-p` NIL, restart ⇒
+  no stale false-positive, re-discovery genuinely rebuilds a collect node), and a **deterministic injected
+  auto-add** (fires / nodes grow / topic-names gains the topic / filter gates / idempotent) run on **both**
+  impls; the live end-to-end (a publisher on a new topic `DynC` is discovered → auto-added → collected → a TL
+  late-joiner gets the N-sample replay) + the live filter-gate (`Other` not served) is SBCL-only per NFR-PORT
+  (Clasp pass-skips the live arm, exactly like the API-driven test). **RED** proven: with the poll disabled —
+  and with a `:auto-discover` NIL control — `DynC` is never served; with the `clrhash` disabled the
+  restart-after-auto-add `serves-topic-p` false-positive re-appears.
 
 ### Fail-closed everywhere (binding, NFR-SEC-POSTURE)
 

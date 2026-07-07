@@ -155,3 +155,6 @@
 (defconstant +td-dcps-secured-take-loan+ 41
   "WP-DCPS-SECURED-TAKE-LOAN (ADR 0038 residual (i)) isolation offset: a secured DCPS reader take/read-loaned a
    secured sample via the zero-decode-buffer-alloc loan; the loan lifecycle is leak-free + byte-exact + idempotent.")
+(defconstant +td-dynamic-topic-discovery+ 42
+  "durability dynamic-topic-add DISCOVERY-DRIVEN auto-serve isolation offset (WP-DURABILITY-DYNAMIC-TOPIC-DISCOVERY,
+   ADR 0026 Phase-2b); distinct from +td-dynamic-topic+ (the API-driven variant) so the two never cross-discover.")

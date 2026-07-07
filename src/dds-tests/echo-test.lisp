@@ -3964,6 +3964,7 @@
                  ("durability-seed-backpressure" . run-durability-seed-backpressure-test)
                  ("durability-seen-prune"        . run-durability-seen-prune-test)
                  ("durability-dynamic-topic"     . run-durability-dynamic-topic-test)
+                 ("durability-dynamic-topic-discovery" . run-durability-dynamic-topic-discovery-test)
                  ("durability-relay-tier"        . run-durability-relay-tier-test)
                  ("durability-collect-tier"      . run-durability-collect-tier-test)
                  ("durability-origin-accessor"   . run-durability-origin-accessor-test)
