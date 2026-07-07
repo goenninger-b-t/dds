@@ -50,6 +50,8 @@
            #:run-durability-store-delete-slot-test
            #:run-durability-encrypted-physical-reclaim-test
            #:run-durability-file-encrypted-physical-reclaim-test
+           #:run-durability-encrypted-cross-restart-sweep-test
+           #:run-durability-file-encrypted-cross-restart-sweep-test
            #:run-durability-file-threshold-compaction-test
            #:run-durability-file-online-chain-test
            #:run-durability-file-crash-consistency-test

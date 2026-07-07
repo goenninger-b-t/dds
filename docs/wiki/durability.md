@@ -953,8 +953,9 @@ per-row keyed MAC chain is at parity with the file store (§8.8.1).
 round-trips identically on Clasp and SBCL (no reader conditionals). Transitive: `iterate`; native:
 `libsqlite3` (SBOM + provenance recorded).
 
-**Follow-ons:** encrypted-tier physical reclaim — **SQLite online case RESOLVED (Sliver 3a, §8.8.4)**;
-file backend `:delete` (Sliver 3b) + compaction-on-open cross-restart sweep (Sliver 3c) still deferred;
+**Follow-ons:** encrypted-tier physical reclaim — **RESOLVED, both backends, continuously-open + cross-restart
+(SQLite online Sliver 3a §8.8.4; file `:delete` Sliver 3b §8.8.5; compaction-on-open cross-restart sweep
+Sliver 3c §8.8.6)**;
 plus whole-topic-deletion residual and dynamic-topic parity. (SQLite online compaction = Sliver 1,
 RESOLVED §8.8.2; file-store runtime/threshold compaction = Sliver 2, RESOLVED §8.8.3; metadata-3c
 confidentiality = RESOLVED §8.9.)
@@ -1036,7 +1037,9 @@ verifies clean + get-range returns newest DEPTH; pure-Lisp MAC oracle, both impl
 sites → the txn rolls back → fresh reopen verifies clean + recovers the pre-eviction set; RED-proven as a
 `SQCC-OPEN-RECOVERS` false-reject when the on-open transaction is neutralized). Sliver 2 (file-store
 runtime/threshold compaction) is RESOLVED (§8.8.3); Sliver 3a (encrypted-tier physical reclaim, SQLite
-online case) is RESOLVED (§8.8.4); Sliver 3b (file backend `:delete`) + 3c (cross-restart sweep) follow.
+online case) is RESOLVED (§8.8.4); Sliver 3b (file backend `:delete`, §8.8.5) + Sliver 3c (compaction-on-open
+cross-restart sweep, §8.8.6) are RESOLVED — the encrypted-reclaim story is CLOSED (both backends,
+continuously-open + cross-restart).
 
 #### 8.8.3 File-store runtime/threshold compaction (WP-DURABILITY-COMPACTION-FILE, Sliver 2)
 
@@ -1136,10 +1139,10 @@ deliberately NON-atomic** — a LOWER bar than Sliver 1/2: a crash between the d
 **self-heals on the next delete** — a space leak, never a false-reject. `KEEP_ALL` deletes nothing (the
 window guard requires `:keep-last`).
 
-**Delivered next (3b) / deferred (3c):** the **file backend `:delete`** (append-log mark-superseded +
-threshold rewrite) is Sliver **3b** (§8.8.5, AS-BUILT); the **compaction-on-open sweep** of a prior
-session's ≤D cross-restart leftovers is Sliver **3c** (3a/3b's online window bounds only the
-continuously-open case).
+**Delivered next (3b, 3c — both AS-BUILT):** the **file backend `:delete`** (append-log mark-superseded +
+threshold rewrite) is Sliver **3b** (§8.8.5); the **compaction-on-open sweep** of a prior session's ≤D
+cross-restart leftovers (3a/3b's online window bounds only the continuously-open case) is Sliver **3c**
+(§8.8.6) — the encrypted-reclaim story is now CLOSED for both backends.
 
 Tests: `run-durability-store-delete-slot-test` (the additive slot + NIL-fallback binding — memory/SQLite/file
 delete a keyed row + return T; a slotless vtable returns `:unsupported`; impl-agnostic, no OpenSSL), and
@@ -1191,10 +1194,9 @@ log intact (rename is the commit point; the orphan `<tid>.tmp.log` is discarded 
 the newest D survive. A crash BETWEEN the in-mem remhash and the batched rewrite reappears the surrogate on
 reopen (the remhash was in-memory only) — but `store-get-range` still logically compacts it (correct reads,
 newest-D) and the chain verifies. A same-session rewrite fault self-heals on the next put (the `pending-delete`
-set stays armed — the rewrite faulted before the clear — so the next `store-delete` retries). **Still
-deferred (Sliver 3c):** the compaction-on-open sweep of a prior session's cross-restart leftovers (a fresh
-post-reopen decorator window never re-deletes the pre-restart surrogates); 3b bounds only the
-continuously-open case.
+set stays armed — the rewrite faulted before the clear — so the next `store-delete` retries). The
+**cross-restart** leftovers a fresh post-reopen window never re-deletes are reclaimed by the
+compaction-on-open sweep (Sliver **3c**, §8.8.6 — RESOLVED, both backends).
 
 Test: `run-durability-file-encrypted-physical-reclaim-test` (continuously-open encrypted **file**
 `:keep-last 2`, N=20 one instance, no close → the inner ON-DISK v3-frame count [`%file-store-log-count` on the
@@ -1204,6 +1206,57 @@ clean + newest-D; a reclaim-rewrite fault [`*durability-debug-file-rewrite-fault
 consistent log + chain verifies + no loss; a remhash/rewrite cross-restart split reappears the surrogate but
 get-range stays newest-D [self-healing, 3c sweeps the leftover]; a continuously-open fault self-heals on the
 next put; KEEP_ALL deletes nothing [on-disk == N]; multi-writer + idempotent parity with the decorator window).
+
+#### 8.8.6 Encrypted-tier physical reclaim, CROSS-RESTART (WP-DURABILITY-ENCRECLAIM-SWEEP, Sliver 3c)
+
+3a/3b bound the **continuously-open** case (the online prior-surrogate window physically evicts superseded
+blobs on put). But `instance-windows` is IN-RAM and clrhash'd on `store-open` (bounds decorator RAM +
+prevents a stale window mis-evicting a later write), so after a **RESTART** the fresh window does not know a
+prior session's ≤D newest survivors per instance: post-restart online eviction (which tracks only THIS-session
+puts) never evicts them and they leak until the next restart — across K restarts a hammered instance
+accumulates **~K·D** physical rows. Sliver 3c adds a **decorator compaction-on-open SWEEP** at the END of the
+`:open` lambda (after the DEK reload + the `instance-windows` clrhash), for `:keep-last` only and only once
+`k_meta` is resident:
+
+- for each inner topic-hash (`store-topics inner`), **decrypt its surrogate rows** — REUSING the get-range
+  decrypt (`open-payload-v2` over the epoch-DEK map + `%open-meta-frame`), with the AEAD AAD (the topic-hash
+  bytes) recovered from the on-disk topic-hash hex via `%meta-unhex`, since the plaintext topic name is
+  off-disk cross-restart;
+- **group the `:data` records by their REAL key-hash** (the instance);
+- via the SAME `%trim-window-to-depth` the online evict now shares, **`store-delete` the leftovers beyond
+  newest-D AND SEED `instance-windows` with the surviving newest-D** (same `(real-guid, real-sn, surrogate)`
+  entry shape, same `%win-entry<` writer-guid-then-sn order).
+
+**The window-seed is the crux.** Without it the fresh window stays empty and the next same-instance put cannot
+evict the prior survivors (they leak); WITH it the next higher-SN put pushes the seeded window to D+1 and
+evicts the oldest survivor, so **cross-restart physical converges to D exactly like the continuously-open
+case** (SQLite = ~D in the DB; file = D in the in-mem index, ≤ D+threshold on disk). The sweep is off the hot
+path (once per open, control-plane — it decrypts the whole store once, the same cost the first get-range would
+incur), reuses `store-delete` (a `:unsupported` backend skips the reclaim but is still seeded — the guard
+remains), re-MACs the survivors (SQLite atomic DELETE + re-MAC / file atomic reclaim rewrite) so the chain
+**verifies clean after the sweep**, and is **idempotent** (an already-≤D store finds nothing beyond-D → no
+deletes, no churn). A `:keep-all` reopen runs no sweep (retains all). **No vtable/wire change** — 3c reuses
+the `store-delete` slot + the decrypt path + the window. This CLOSES the encrypted-tier physical-reclaim
+residual for **both backends, continuously-open AND cross-restart**.
+
+Tests: `run-durability-encrypted-cross-restart-sweep-test` (SQLite) and
+`run-durability-file-encrypted-cross-restart-sweep-test` (file). Each writes 6 to one instance, closes,
+reopens, ×K=4 cycles → the inner physical count stays **~D=2**, NOT ~K·D. RED is proven in-suite by the
+test-only `*durability-debug-disable-open-sweep*` switch: sweep-disabled the physical count STRICTLY
+accumulates ((2 4 6 8) across the 4 restart cycles; file on-disk likewise), sweep-enabled it stays bounded
+((2 2 2 2); file on-disk ≤ D+threshold). Also: re-opening a leaked (pre-3c) store WITH the sweep reclaims it
+to D; window-seeded continued post-restart writes (no close) stay D (RED without the seed = leak); get-range
+post-sweep = newest D by real SN byte-exact; reopen-after-sweep verifies the chain clean. A dedicated
+**multi-writer cross-restart** case (one instance fed by two writer GUIDs A\<B) locks that the sweep groups by
+real key-hash and keeps the `(guid,sn)`-newest-D via `%win-entry<` (`B·3,B·6`), NOT the pure-SN `A·5,B·6`.
+
+**Benign residual (FILE only, topics.map-dependent, NOT introduced by 3c):** the file sweep recovers each
+topic-hash AAD from `store-topics` (the file store's `id-map`, rebuilt from `topics.map` on reopen). On a clean
+write→close→reopen (what 3c targets — every test) it always persists. If `topics.map` were LOST, `store-topics`
+falls back to the double-hex `tid`, so `%meta-unhex(tid)` yields the wrong AAD, the GCM tag fails, and the sweep
+silently does not reclaim that topic — a bounded space non-reclaim, **no data loss, no false-reject, no crash**
+(the unhex is bounds-safe; `store-get-range` still serves that topic via the caller's real topic name). An
+orthogonal `topics.map`-durability failure mode; **SQLite is immune** (topic persisted in the DB column).
 
 ### 8.9 At-rest metadata confidentiality (Phase 3c, WP-DURABILITY-METADATA-CONF-3c)
 

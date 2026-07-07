@@ -3950,6 +3950,8 @@
                  ("durability-store-delete-slot"  . run-durability-store-delete-slot-test)
                  ("durability-encrypted-physical-reclaim" . run-durability-encrypted-physical-reclaim-test)
                  ("durability-file-encrypted-physical-reclaim" . run-durability-file-encrypted-physical-reclaim-test)
+                 ("durability-encrypted-cross-restart-sweep" . run-durability-encrypted-cross-restart-sweep-test)
+                 ("durability-file-encrypted-cross-restart-sweep" . run-durability-file-encrypted-cross-restart-sweep-test)
                  ("durability-file-threshold-compaction" . run-durability-file-threshold-compaction-test)
                  ("durability-file-online-chain"  . run-durability-file-online-chain-test)
                  ("durability-file-crash-consistency" . run-durability-file-crash-consistency-test)

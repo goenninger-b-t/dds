@@ -487,6 +487,20 @@
                    (aref hex (1+ i)) (char %meta-hex-digits (ldb (byte 4 0) b))))
     (coerce hex 'string)))
 
+(defun* %meta-unhex (hex)
+    (function (string) (simple-array (unsigned-byte 8) (*)))
+  "Inverse of %META-HEX: decode a lowercase-hex string back to octets. The cross-restart open-sweep (3c)
+   recovers each topic-hash BYTES (the AEAD AAD) from the inner store's on-disk topic-hash id — all it has,
+   since the plaintext topic name is off-disk (ADR 0025 §10 3c). Bounds-safe (the operating contract §4):
+   an odd-length or non-hex input yields a best-effort vector; a wrong AAD then fails the GCM tag ⇒
+   fail-closed drop, never an out-of-bounds access."
+  (let* ((n   (floor (length hex) 2))
+         (out (make-array n :element-type '(unsigned-byte 8) :initial-element 0)))
+    (dotimes (i n out)
+      (let ((hi (digit-char-p (char hex (* 2 i)) 16))
+            (lo (digit-char-p (char hex (1+ (* 2 i))) 16)))
+        (setf (aref out i) (logior (ash (or hi 0) 4) (or lo 0)))))))
+
 (defun* %meta-topic-hash-bytes (meta-key topic)
     (function ((simple-array (unsigned-byte 8) (*)) string) (simple-array (unsigned-byte 8) (*)))
   "Deterministic keyed topic-hash BYTES: HMAC-SHA-256(k_meta, #x01 ∥ UTF-8(TOPIC)) (ADR 0025 §10 3c).
@@ -687,6 +701,12 @@
         (< (the (integer 0) (second a)) (the (integer 0) (second b)))
         (%guid-list< ga gb))))
 
+(defparameter *durability-debug-disable-open-sweep* nil
+  "Test-only switch for the Sliver-3c cross-restart compaction-on-open sweep (ADR 0025 §10.3). NIL
+   (default) = inert; the decorator :open runs the sweep. When non-NIL the sweep is skipped, reproducing
+   the pre-3c behavior (a prior session's <=D survivors leak across restarts + the fresh window is not
+   seeded) so a test can prove the cross-restart-bound RED. Never set in production code.")
+
 (defun* %make-epoch-encrypted-store (inner-store key-provider epoch-dir)
     (function (durable-store dds.dare:key-provider pathname) durable-store)
   "Build the v2 (epoch-aware, disk-backed PERSISTENT tier) encrypted-store over EPOCH-DIR.
@@ -722,32 +742,39 @@
          (del-supported    (and (durable-store-delete inner-store) t)))
     (labels ((%th-bytes (topic) (%meta-topic-hash-bytes meta-key topic))
              (%th (topic) (%meta-hex (%th-bytes topic)))
+             (%trim-window-to-depth (th wk win)
+               ;; Shared window trim (DRY): reused by the online single-put evict (%evict-prior-surrogates,
+               ;; Sliver 3a/3b) AND the cross-restart compaction-on-open sweep (%open-sweep, Sliver 3c). WIN
+               ;; is the instance's live entries (real-guid-list real-sn inner-surrogate) under WK (topic-hash
+               ;; . real-key-hash-list). Set the window to WIN FIRST, then — if it exceeds eff-hd — physically
+               ;; store-delete the entries SMALLEST by %win-entry< (writer-guid bytes ascending, THEN sn:
+               ;; IDENTICAL to %keep-last-latest / %record-guid-sn<, so the physical set == the logical
+               ;; newest-D get-range view EXACTLY, even for one instance fed by multiple writer GUIDs) and
+               ;; overwrite the window with the survivors. The window is rewritten only AFTER the deletes
+               ;; succeed, so a delete fault (crash-lower-bar) leaves the untrimmed WIN in the window and
+               ;; self-heals on the next put. The store-delete is del-supported-gated so a backend without
+               ;; the :delete slot still SEEDS the window (the seed helps even where physical reclaim can't).
+               (setf (gethash wk instance-windows) win)
+               (when (> (length win) eff-hd)
+                 (let* ((sorted  (sort (copy-list win) #'%win-entry<))
+                        (drop-n  (- (length sorted) eff-hd))
+                        (to-drop (subseq sorted 0 drop-n))
+                        (keep    (subseq sorted drop-n)))
+                   (when del-supported
+                     (dolist (e to-drop)
+                       (store-delete inner-store th (third e) 0)))
+                   (setf (gethash wk instance-windows) keep))))
              (%evict-prior-surrogates (th writer-guid key-hash sn guid*)
-               ;; Sliver 3a physical reclaim (caller holds LOCK + del-supported + :keep-last + :data +
-               ;; non-NIL key-hash). Each window entry is (real-guid-list real-sn inner-surrogate) keyed by
-               ;; the instance (topic-hash . real-key-hash). When the window exceeds eff-hd, physically
-               ;; delete the entries SMALLEST by %win-entry< (writer-guid bytes ascending, THEN sn) —
-               ;; IDENTICAL to the logical view's %keep-last-latest (%record-guid-sn< order), so the physical
-               ;; set == the logical newest-D get-range view EXACTLY for ALL cases, including a single
-               ;; instance fed by multiple writer GUIDs (a pure-sn drop keeps the wrong survivor when the
-               ;; min-sn sample sits on the higher writer-guid). The append is DEDUP'd on the deterministic
+               ;; Sliver 3a/3b online physical reclaim (caller holds LOCK + del-supported + :keep-last +
+               ;; :data + non-NIL key-hash). Append this put's entry to the instance window and trim to
+               ;; newest-D via the shared %trim-window-to-depth. The append is DEDUP'd on the deterministic
                ;; surrogate so an idempotent re-put of an already-tracked (guid,sn) — which store-put no-ops
                ;; physically (INSERT OR IGNORE) — never double-counts (which would evict a LIVE newest-D
-               ;; row = data loss). The window is rewritten only AFTER the deletes succeed, so a delete
-               ;; fault (crash-lower-bar) leaves the entries in the window and self-heals on the next put.
+               ;; row = data loss).
                (let* ((wk  (cons th (coerce key-hash 'list)))
                       (cur (gethash wk instance-windows)))
                  (unless (member guid* cur :key #'third :test #'equalp)
-                   (let ((win (cons (list (coerce writer-guid 'list) sn guid*) cur)))
-                     (setf (gethash wk instance-windows) win)
-                     (when (> (length win) eff-hd)
-                       (let* ((sorted  (sort (copy-list win) #'%win-entry<))
-                              (drop-n  (- (length sorted) eff-hd))
-                              (to-drop (subseq sorted 0 drop-n))
-                              (keep    (subseq sorted drop-n)))
-                         (dolist (e to-drop)
-                           (store-delete inner-store th (third e) 0))
-                         (setf (gethash wk instance-windows) keep)))))))
+                   (%trim-window-to-depth th wk (cons (list (coerce writer-guid 'list) sn guid*) cur)))))
              (%purge-topic-windows (th)
                ;; drop every instance window under this topic-hash (its inner rows are being purged) so the
                ;; decorator RAM stays bounded and a stale window can never mis-evict a later same-instance
@@ -764,6 +791,15 @@
                            (format nil "open-payload-v2/meta NIL (~d sealed bytes)"
                                    (length (durable-record-payload r)))
                            :dare-open-failed n))))
+             (%open-inner-blob (r th-bytes)
+               ;; Shared decrypt (DRY get-range + open-sweep): open one inner record's blob under any known
+               ;; epoch DEK, recover the REAL metadata frame; (values guid sn kind key-hash payload) on
+               ;; success, (values NIL 0 NIL NIL NIL) on auth/tamper/malformed-frame. TH-BYTES is the AEAD
+               ;; AAD (topic-hash bytes). The caller decides the fail-closed policy for a NIL result.
+               (let ((opened (dds.dare:open-payload-v2
+                              (lambda (e) (gethash e dek-map))
+                              (durable-record-payload r) th-bytes)))
+                 (if opened (%open-meta-frame opened) (values nil 0 nil nil nil))))
              (%locked-get-range (topic)
                ;; caller holds LOCK + has verified meta-key: locate by topic-hash, decrypt each blob,
                ;; recover the REAL metadata, sort by real (guid,sn), then apply eff-hk/eff-hd (3c item 5).
@@ -772,19 +808,43 @@
                       (result   '()))
                  (setf (gethash th topic-names) topic)
                  (dolist (r (store-get-range inner-store th))
-                   (let ((opened (dds.dare:open-payload-v2
-                                  (lambda (e) (gethash e dek-map))
-                                  (durable-record-payload r) th-bytes)))
-                     (if opened
-                         (multiple-value-bind (g s knd kh pl) (%open-meta-frame opened)
-                           (if g
-                               (push (make-durable-record
-                                      :topic topic :writer-guid g :sn s
-                                      :key-hash kh :kind knd :payload pl)
-                                     result)
-                               (%drop-hook r)))
+                   (multiple-value-bind (g s knd kh pl) (%open-inner-blob r th-bytes)
+                     (if g
+                         (push (make-durable-record
+                                :topic topic :writer-guid g :sn s
+                                :key-hash kh :kind knd :payload pl)
+                               result)
                          (%drop-hook r))))
                  (%compact-topic-records (sort result #'%record-guid-sn<) eff-hk eff-hd)))
+             (%open-sweep ()
+               ;; Sliver 3c cross-restart physical reclaim (ADR 0025 §10.3): once per open, off the hot path
+               ;; (control-plane). After a restart the freshly-clrhash'd window (3a FIX3) does not know a
+               ;; prior session's <=D newest survivors per instance, so post-restart online eviction never
+               ;; evicts them and they leak until the next restart (across K restarts a hammered instance
+               ;; accumulates ~K*D physical rows). For :keep-last only, enumerate each inner topic-hash,
+               ;; decrypt its surrogate rows (reuse %open-inner-blob), group the :data records by their REAL
+               ;; key-hash, and via %trim-window-to-depth store-delete the leftovers beyond newest-D AND SEED
+               ;; the window with the survivors (same entry shape the online path uses). The seed is the crux:
+               ;; without it the window stays empty and the next same-instance put cannot evict the prior
+               ;; survivors; WITH it the next higher-SN put pushes the seeded window to D+1 and evicts the
+               ;; oldest survivor, so cross-restart physical converges to D exactly like the continuously-open
+               ;; case. A backend without :delete skips the reclaim (del-supported gate) but still seeds.
+               (when (and meta-key (eq :keep-last eff-hk)
+                          (not *durability-debug-disable-open-sweep*))
+                 (dolist (th (store-topics inner-store))
+                   (let ((th-bytes    (%meta-unhex th))
+                         (by-instance (make-hash-table :test #'equal)))
+                     (dolist (r (store-get-range inner-store th))
+                       (let ((guid* (durable-record-writer-guid r)))
+                         (multiple-value-bind (g s knd kh pl) (%open-inner-blob r th-bytes)
+                           (declare (ignore pl))
+                           ;; only keyed :data are depth-swept (disposes/unregisters/keyless retained)
+                           (when (and g (eq :data knd) kh)
+                             (push (list (coerce g 'list) s guid*)
+                                   (gethash (coerce kh 'list) by-instance))))))
+                     (maphash (lambda (kh-list entries)
+                                (%trim-window-to-depth th (cons th kh-list) entries))
+                              by-instance)))))
              (%mint-current-epoch ()
              ;; lazily mint a fresh epoch on the first put of this run (caller holds LOCK).
              (let* ((pub    (dds.dare:key-provider-recipient-public-key key-provider))
@@ -922,6 +982,11 @@
                  (dds.dare:key-provider-open key-provider)))
            ;; re-derive every persisted epoch's DEK; current stays NIL until the first put
            (setf max-epoch-id (%load-epoch-deks key-provider epoch-dir dek-map))
+           ;; Sliver 3c: after the DEKs + k_meta are resident and the window is fresh, sweep the inner
+           ;; store — physically reclaim a prior session's beyond-D leftovers AND seed the window with the
+           ;; surviving newest-D so post-restart online eviction is correct (cross-restart == continuously-
+           ;; open). No-op for :keep-all or a not-yet-chained (meta-key NIL) store; ADR 0025 §10.3.
+           (%open-sweep)
            t))
        :close
        (lambda ()

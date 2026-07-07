@@ -4952,6 +4952,375 @@
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))
       t)))
 
+;;; --- Encrypted-tier CROSS-RESTART physical reclaim (WP-DURABILITY-ENCRECLAIM-SWEEP, Sliver 3c; ADR 0025 §10.3) ---
+;;; 3a/3b bound the CONTINUOUSLY-OPEN case (the online prior-surrogate window physically evicts superseded
+;;; blobs on put). But instance-windows is IN-RAM and clrhash'd on :open (3a FIX3), so after a RESTART a
+;;; prior session's newest-D survivors are unknown to the fresh window: post-restart online eviction (which
+;;; tracks only this-session puts) never evicts them and they leak until the next restart — across K restarts
+;;; a hammered instance accumulates ~K*D physical rows. Sliver 3c adds the decorator compaction-on-open
+;;; SWEEP: decrypt each inner topic's surrogate rows (reuse the get-range decrypt), group by real key-hash,
+;;; store-delete the leftovers beyond newest-D AND SEED the window with the survivors, so post-restart online
+;;; eviction continues seamlessly (cross-restart physical == continuously-open). Proven RED by the test-only
+;;; *durability-debug-disable-open-sweep* switch (reproduces the pre-3c leak).
+
+(defun* run-durability-encrypted-cross-restart-sweep-test ()
+    (function () t)
+  "Encrypted SQLite CROSS-RESTART physical reclaim (Sliver 3c, WP-DURABILITY-ENCRECLAIM-SWEEP; ADR 0025 §10.3):
+   the decorator compaction-on-open sweep reclaims a prior session's <=D leftovers AND seeds the window, so
+   cross-restart physical stays ~D. Closes the encrypted-reclaim cross-restart residual (SQLite).
+   (1) CROSS-RESTART BOUND — write 6, close, reopen, x K cycles: inner physical stays D=2, NOT ~K*D.
+   (2) RED + SWEEP RECLAIM — sweep-disabled reproduces the pre-3c accumulation to ~K*D (physical STRICTLY
+       grows across restarts); re-opening that leaked store WITH the sweep reclaims it to D (the reclaim).
+   (3) WINDOW-SEEDED — after reopen+sweep, continued higher-SN writes (no close) stay D (the seed evicts the
+       prior survivors); RED sweep-disabled = the continued writes leak (physical > D).
+   (4) NO-LOSS + CHAIN — get-range post-sweep = newest D by real SN byte-exact; reopen-after-sweep VERIFIES
+       the v3 chain clean (the sweep's store-delete re-MAC is load-bearing, no false-reject).
+   (5) IDEMPOTENT — reopening an already-swept store (no new writes) reclaims nothing (physical stays D).
+   (6) KEEP_ALL — a KEEP_ALL reopen runs no sweep (retains all, physical == N)."
+  (unless (dds.dare:dare-available-p)
+    (format t "~&  [enc-cross-restart-sweep] SKIP — OpenSSL >= 3.5 not available~%")
+    (return-from run-durability-encrypted-cross-restart-sweep-test t))
+  (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (kh1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1))
+         (dirs '()))
+    (labels ((%encdir (tag)
+               (let ((d (uiop:pathname-directory-pathname (%sqlite-tmp-db-path tag))))
+                 (push d dirs) d))
+             (%build (dir)
+               (dds.durability:make-encrypted-store
+                (dds.durability:make-sqlite-store
+                 :path (uiop:merge-pathnames* (make-pathname :name "durability" :type "sqlite3") dir))
+                (dds.dare:make-file-key-provider :dir dir)
+                :epoch-dir dir))
+             (%sns (recs) (sort (mapcar #'dds.durability:durable-record-sn recs) #'<))
+             (%gsig (recs) (mapcar (lambda (r) (cons (aref (dds.durability:durable-record-writer-guid r) 0)
+                                                     (dds.durability:durable-record-sn r)))
+                                   recs))
+             (%write-session (dir cyc kind)
+               ;; one restart cycle: fresh decorator over DIR (cross-restart simulation), open, write 6
+               ;; higher SNs to ONE instance, measure the post-writes inner PHYSICAL count, close; return it.
+               (let ((s (%build dir)))
+                 (if (eq kind :keep-all)
+                     (dds.durability:store-open s :keep-all)
+                     (dds.durability:store-open s :keep-last 2))
+                 (dotimes (i 6)
+                   (let ((sn (+ 1 (* cyc 6) i)))
+                     (dds.durability:store-put s "Enc" g0 sn kh1 :data (%make-small-payload sn))))
+                 (prog1 (dds.durability:store-count s nil)
+                   (dds.durability:store-close s)))))
+      (unwind-protect
+           (let ((k 4))
+             ;; (1) CROSS-RESTART BOUND (sweep enabled): physical stays D across K restart cycles (not K*D)
+             (let ((dir (%encdir "xrs-green")) (counts '()))
+               (dotimes (cyc k) (push (%write-session dir cyc :keep-last) counts))
+               (setf counts (nreverse counts))
+               (%check :xrs-bound (every (lambda (c) (= 2 c)) counts)
+                       (format nil "cross-restart: inner physical stays D=2 across K=~d write-close-reopen cycles ~
+                               (seed+sweep), got ~s [RED pre-3c accumulates ~~K*D]" k counts))
+               (let ((s (%build dir)))
+                 (dds.durability:store-open s :keep-last 2)
+                 (%check :xrs-bound-newest (equal '(23 24) (%sns (dds.durability:store-get-range s "Enc")))
+                         (format nil "post-sweep get-range = newest D of the last cycle (23 24) byte-order, got ~s"
+                                 (%sns (dds.durability:store-get-range s "Enc"))))
+                 (%check :xrs-bound-exact
+                         (equalp (%make-small-payload 24)
+                                 (dds.durability:durable-record-payload
+                                  (find 24 (dds.durability:store-get-range s "Enc")
+                                        :key #'dds.durability:durable-record-sn)))
+                         "post-sweep survivor payload decrypts byte-exact (no data loss)")
+                 (dds.durability:store-close s)))
+             ;; (2) RED PROOF + SWEEP RECLAIM — sweep-disabled accumulates ~K*D; re-enabling reclaims to D
+             (let ((dir (%encdir "xrs-red")) (counts '()))
+               (let ((dds.durability::*durability-debug-disable-open-sweep* t))
+                 (dotimes (cyc k) (push (%write-session dir cyc :keep-last) counts)))
+               (setf counts (nreverse counts))
+               (%check :xrs-red-grows (and (= 2 (first counts)) (apply #'< counts))
+                       (format nil "RED (sweep-disabled): physical STRICTLY ACCUMULATES across restarts toward K*D=~d ~
+                               (pre-3c leak), got ~s" (* 2 k) counts))
+               (let ((s (%build dir)))
+                 (dds.durability:store-open s :keep-last 2)   ; sweep ENABLED -> reclaim the accumulated leak
+                 (%check :xrs-reclaim (= 2 (dds.durability:store-count s nil))
+                         (format nil "the open-sweep RECLAIMS a leaked (pre-3c) store of ~d rows down to D=2, got ~d"
+                                 (car (last counts)) (dds.durability:store-count s nil)))
+                 (%check :xrs-reclaim-newest (equal '(23 24) (%sns (dds.durability:store-get-range s "Enc")))
+                         (format nil "post-reclaim get-range = newest D by real SN (23 24), got ~s"
+                                 (%sns (dds.durability:store-get-range s "Enc"))))
+                 (dds.durability:store-close s))
+               ;; (4) CHAIN + (5) IDEMPOTENT — reopen-after-sweep verifies clean; a 2nd already-swept reopen churns nothing
+               (let* ((s2 (%build dir))
+                      (clean (handler-case (progn (dds.durability:store-open s2 :keep-last 2) t)
+                               (error () nil))))
+                 (%check :xrs-chain-clean clean
+                         "reopen after the sweep VERIFIES the v3 chain clean (no false-reject; the sweep's store-delete re-MAC is load-bearing)")
+                 (when clean
+                   (%check :xrs-idem (= 2 (dds.durability:store-count s2 nil))
+                           (format nil "idempotent sweep: reopening an already-swept store reclaims nothing (physical stays D=2), got ~d"
+                                   (dds.durability:store-count s2 nil))))
+                 (ignore-errors (dds.durability:store-close s2))))
+             ;; (3) WINDOW-SEEDED post-restart (isolate the seed): continued writes after reopen stay D
+             (let ((dir (%encdir "xrs-seed")))
+               (%write-session dir 0 :keep-last)              ; session 1: sns 1..6 -> physical D
+               (let ((s (%build dir)))
+                 (dds.durability:store-open s :keep-last 2)   ; sweep seeds the window with s5,s6
+                 (dotimes (i 6)
+                   (let ((sn (+ 7 i)))
+                     (dds.durability:store-put s "Enc" g0 sn kh1 :data (%make-small-payload sn))))
+                 (%check :xrs-seed (= 2 (dds.durability:store-count s nil))
+                         (format nil "window-seeded: continued post-restart writes stay bounded to D=2 (no close), got ~d"
+                                 (dds.durability:store-count s nil)))
+                 (%check :xrs-seed-newest (equal '(11 12) (%sns (dds.durability:store-get-range s "Enc")))
+                         (format nil "window-seeded: get-range = newest D (11 12), got ~s"
+                                 (%sns (dds.durability:store-get-range s "Enc"))))
+                 (dds.durability:store-close s)))
+             ;; (3-RED) without the seed the continued post-restart writes LEAK the prior survivors
+             (let ((dir (%encdir "xrs-seed-red")))
+               (%write-session dir 0 :keep-last)
+               (let ((s (%build dir))
+                     (dds.durability::*durability-debug-disable-open-sweep* t))
+                 (dds.durability:store-open s :keep-last 2)   ; NO sweep -> fresh window is empty
+                 (dotimes (i 6)
+                   (let ((sn (+ 7 i)))
+                     (dds.durability:store-put s "Enc" g0 sn kh1 :data (%make-small-payload sn))))
+                 (%check :xrs-seed-red (> (dds.durability:store-count s nil) 2)
+                         (format nil "RED (no seed): continued post-restart writes LEAK the prior survivors (physical > D=2), got ~d"
+                                 (dds.durability:store-count s nil)))
+                 (dds.durability:store-close s)))
+             ;; (6) KEEP_ALL reopen runs NO sweep (retains all)
+             (let ((dir (%encdir "xrs-keepall")))
+               (%write-session dir 0 :keep-all)               ; :keep-all session -> physical N=6
+               (let ((s (%build dir)))
+                 (dds.durability:store-open s :keep-all)       ; sweep guard: eff-hk :keep-all -> no sweep
+                 (%check :xrs-keepall (= 6 (dds.durability:store-count s nil))
+                         (format nil "KEEP_ALL reopen runs no sweep (retains all, physical == N=6), got ~d"
+                                 (dds.durability:store-count s nil)))
+                 (dds.durability:store-close s)))
+             ;; (7) MULTI-WRITER CROSS-RESTART — ONE instance (same real key-hash) fed by TWO writer GUIDs
+             ;; A<B: the open-sweep GROUPS by real key-hash and keeps the (guid,sn)-newest-D via %win-entry<
+             ;; (NOT pure-SN), so the CROSS-RESTART survivors match the logical get-range view EXACTLY.
+             ;; Build a >D multi-writer physical state cross-restart (session 1 writes the A samples; a
+             ;; sweep-DISABLED session 2 writes the B samples — the fresh empty window never exceeds D so the
+             ;; A's LEAK); a sweep-ENABLED session 3 reclaims. All-B sort ABOVE all-A (A.guid<B.guid), so
+             ;; %win-entry< keeps B.3,B.6; a pure-SN sweep would WRONGLY keep A.5,B.6 (RED, as the 3a online
+             ;; case proved). Locks the sweep's multi-writer grouping cross-restart (the one path not covered
+             ;; by the single-writer cases above — otherwise only inherited from the shared %win-entry<).
+             (let ((dir (%encdir "xrs-mw"))
+                   (ga (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+                   (gb (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref ga 0) 1) (setf (aref gb 0) 2)       ; A.guid < B.guid
+               (let ((s (%build dir)))                          ; session 1: A.1, A.5 -> physical D=2
+                 (dds.durability:store-open s :keep-last 2)
+                 (dds.durability:store-put s "Enc" ga 1 kh1 :data (%make-small-payload 1))
+                 (dds.durability:store-put s "Enc" ga 5 kh1 :data (%make-small-payload 5))
+                 (dds.durability:store-close s))
+               (let ((s (%build dir))                           ; session 2 (sweep DISABLED): B.3, B.6 -> leak A's
+                     (dds.durability::*durability-debug-disable-open-sweep* t))
+                 (dds.durability:store-open s :keep-last 2)
+                 (dds.durability:store-put s "Enc" gb 3 kh1 :data (%make-small-payload 3))
+                 (dds.durability:store-put s "Enc" gb 6 kh1 :data (%make-small-payload 6))
+                 (%check :xrs-mw-leaked (= 4 (dds.durability:store-count s nil))
+                         (format nil "multi-writer >D physical state built cross-restart (A leaked, empty window), got ~d"
+                                 (dds.durability:store-count s nil)))
+                 (dds.durability:store-close s))
+               (let ((s (%build dir)))                          ; session 3 (sweep ENABLED): reclaim to (guid,sn)-newest-D
+                 (dds.durability:store-open s :keep-last 2)
+                 (%check :xrs-mw-phys (= 2 (dds.durability:store-count s nil))
+                         (format nil "multi-writer cross-restart sweep reclaims to physical == D=2, got ~d"
+                                 (dds.durability:store-count s nil)))
+                 (let ((sig (%gsig (dds.durability:store-get-range s "Enc"))))
+                   (%check :xrs-mw-newest (equal sig '((2 . 3) (2 . 6)))
+                           (format nil "multi-writer cross-restart sweep keeps the (guid,sn)-newest-D EXACTLY (B.3,B.6) ~
+                                   via %win-entry<, NOT pure-SN (which would keep A.5,B.6 = ((1 . 5)(2 . 6))); got ~s" sig)))
+                 (%check :xrs-mw-exact
+                         (equalp (%make-small-payload 6)
+                                 (dds.durability:durable-record-payload
+                                  (find 6 (dds.durability:store-get-range s "Enc")
+                                        :key #'dds.durability:durable-record-sn)))
+                         "multi-writer cross-restart survivor payload (B.6) decrypts byte-exact")
+                 (dds.durability:store-close s))))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))
+      t)))
+
+(defun* run-durability-file-encrypted-cross-restart-sweep-test ()
+    (function () t)
+  "Encrypted FILE CROSS-RESTART physical reclaim (Sliver 3c, WP-DURABILITY-ENCRECLAIM-SWEEP; ADR 0025 §10.3 /
+   ADR 0029 §10): the decorator compaction-on-open sweep over a FILE inner store reclaims a prior session's
+   <=D leftovers AND seeds the window. Measures BOTH the in-memory physical index (converges to D) and the
+   ON-DISK v3 log (bounded <= D+threshold). Closes the encrypted-reclaim cross-restart residual (file).
+   (1) CROSS-RESTART BOUND — write 6, close, reopen, x K cycles: in-mem physical stays D=2, NOT ~K*D; the
+       on-disk log stays <= D+threshold.
+   (2) RED + SWEEP RECLAIM — sweep-disabled accumulates ~K*D (in-mem strictly grows); re-opening WITH the
+       sweep reclaims it (in-mem -> D, on-disk -> <= D+threshold).
+   (3) WINDOW-SEEDED — after reopen+sweep, continued writes (no close) stay D; RED sweep-disabled = leak.
+   (4) NO-LOSS + CHAIN — get-range post-sweep = newest D byte-exact; reopen-after-sweep verifies the chain clean.
+   (5) KEEP_ALL — a KEEP_ALL reopen runs no sweep (on-disk == N)."
+  (unless (dds.dare:dare-available-p)
+    (format t "~&  [file-enc-cross-restart-sweep] SKIP — OpenSSL >= 3.5 not available~%")
+    (return-from run-durability-file-encrypted-cross-restart-sweep-test t))
+  (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7))
+         (kh1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xB1))
+         (dirs '()))
+    (labels ((%dk (tag)
+               (let ((d (uiop:pathname-directory-pathname (%sqlite-tmp-db-path (format nil "fxrs-~a-d" tag))))
+                     (k (uiop:pathname-directory-pathname (%sqlite-tmp-db-path (format nil "fxrs-~a-k" tag)))))
+                 (push d dirs) (push k dirs)
+                 (cons d k)))
+             (%build (dk)
+               (dds.durability:make-encrypted-store
+                (dds.durability:make-file-store :dir (car dk))
+                (dds.dare:make-file-key-provider :dir (cdr dk))
+                :epoch-dir (car dk)))
+             (%sns (recs) (sort (mapcar #'dds.durability:durable-record-sn recs) #'<))
+             (%gsig (recs) (mapcar (lambda (r) (cons (aref (dds.durability:durable-record-writer-guid r) 0)
+                                                     (dds.durability:durable-record-sn r)))
+                                   recs))
+             (%ondisk (dk) (%enc-file-log-count (car dk) (cdr dk) "Enc"))
+             (%write-session (dk cyc kind)
+               ;; one restart cycle over the FILE (d . k) dirs: fresh decorator, open, write 6 higher SNs to
+               ;; ONE instance, measure the post-writes in-mem PHYSICAL index count, close; return it.
+               (let ((s (%build dk)))
+                 (if (eq kind :keep-all)
+                     (dds.durability:store-open s :keep-all)
+                     (dds.durability:store-open s :keep-last 2))
+                 (dotimes (i 6)
+                   (let ((sn (+ 1 (* cyc 6) i)))
+                     (dds.durability:store-put s "Enc" g0 sn kh1 :data (%make-small-payload sn))))
+                 (prog1 (dds.durability:store-count s nil)
+                   (dds.durability:store-close s)))))
+      (unwind-protect
+           (let ((dds.durability:*compaction-superseded-threshold* 4)
+                 (k 4) (d 2))
+             ;; (1) CROSS-RESTART BOUND (sweep enabled): in-mem physical stays D; on-disk <= D+threshold
+             (let ((dk (%dk "green")) (counts '()))
+               (dotimes (cyc k) (push (%write-session dk cyc :keep-last) counts))
+               (setf counts (nreverse counts))
+               (%check :fxrs-bound (every (lambda (c) (= d c)) counts)
+                       (format nil "file cross-restart: in-mem physical stays D=~d across K=~d cycles (seed+sweep), got ~s"
+                               d k counts))
+               (let ((s (%build dk)))
+                 (dds.durability:store-open s :keep-last d)    ; final reopen -> sweep
+                 (%check :fxrs-ondisk (<= (%ondisk dk) (+ d 4))
+                         (format nil "file cross-restart: ON-DISK log stays <= D+threshold=~d (physical reclaim), got ~d"
+                                 (+ d 4) (%ondisk dk)))
+                 (%check :fxrs-bound-newest (equal '(23 24) (%sns (dds.durability:store-get-range s "Enc")))
+                         (format nil "post-sweep get-range = newest D (23 24), got ~s"
+                                 (%sns (dds.durability:store-get-range s "Enc"))))
+                 (%check :fxrs-bound-exact
+                         (equalp (%make-small-payload 24)
+                                 (dds.durability:durable-record-payload
+                                  (find 24 (dds.durability:store-get-range s "Enc")
+                                        :key #'dds.durability:durable-record-sn)))
+                         "post-sweep survivor payload decrypts byte-exact (no data loss)")
+                 (dds.durability:store-close s)))
+             ;; (2) RED PROOF + SWEEP RECLAIM
+             (let ((dk (%dk "red")) (counts '()))
+               (let ((dds.durability::*durability-debug-disable-open-sweep* t))
+                 (dotimes (cyc k) (push (%write-session dk cyc :keep-last) counts)))
+               (setf counts (nreverse counts))
+               (%check :fxrs-red-grows (and (= d (first counts)) (apply #'< counts))
+                       (format nil "RED (sweep-disabled): file in-mem physical STRICTLY ACCUMULATES across restarts toward K*D=~d, got ~s"
+                               (* d k) counts))
+               (let ((s (%build dk)))
+                 (dds.durability:store-open s :keep-last d)    ; sweep ENABLED -> reclaim the leak
+                 (%check :fxrs-reclaim (= d (dds.durability:store-count s nil))
+                         (format nil "the open-sweep reclaims a leaked file store's in-mem index to D=~d, got ~d"
+                                 d (dds.durability:store-count s nil)))
+                 (%check :fxrs-reclaim-ondisk (<= (%ondisk dk) (+ d 4))
+                         (format nil "post-reclaim ON-DISK log <= D+threshold=~d, got ~d" (+ d 4) (%ondisk dk)))
+                 (%check :fxrs-reclaim-newest (equal '(23 24) (%sns (dds.durability:store-get-range s "Enc")))
+                         (format nil "post-reclaim get-range = newest D (23 24), got ~s"
+                                 (%sns (dds.durability:store-get-range s "Enc"))))
+                 (dds.durability:store-close s))
+               ;; (4) CHAIN — reopen-after-sweep verifies clean
+               (let* ((s2 (%build dk))
+                      (clean (handler-case (progn (dds.durability:store-open s2 :keep-last d) t)
+                               (error () nil))))
+                 (%check :fxrs-chain-clean clean
+                         "file reopen after the sweep VERIFIES the v3 chain clean (reclaim rewrite re-emitted a fresh chain — no false-reject)")
+                 (ignore-errors (dds.durability:store-close s2))))
+             ;; (3) WINDOW-SEEDED post-restart (isolate the seed)
+             (let ((dk (%dk "seed")))
+               (%write-session dk 0 :keep-last)
+               (let ((s (%build dk)))
+                 (dds.durability:store-open s :keep-last d)    ; sweep seeds window with s5,s6
+                 (dotimes (i 6)
+                   (let ((sn (+ 7 i)))
+                     (dds.durability:store-put s "Enc" g0 sn kh1 :data (%make-small-payload sn))))
+                 (%check :fxrs-seed (= d (dds.durability:store-count s nil))
+                         (format nil "window-seeded (file): continued post-restart writes stay bounded to D=~d, got ~d"
+                                 d (dds.durability:store-count s nil)))
+                 (%check :fxrs-seed-newest (equal '(11 12) (%sns (dds.durability:store-get-range s "Enc")))
+                         (format nil "window-seeded (file): get-range = newest D (11 12), got ~s"
+                                 (%sns (dds.durability:store-get-range s "Enc"))))
+                 (dds.durability:store-close s)))
+             ;; (3-RED) without the seed the continued writes leak
+             (let ((dk (%dk "seed-red")))
+               (%write-session dk 0 :keep-last)
+               (let ((s (%build dk))
+                     (dds.durability::*durability-debug-disable-open-sweep* t))
+                 (dds.durability:store-open s :keep-last d)    ; NO sweep -> empty window
+                 (dotimes (i 6)
+                   (let ((sn (+ 7 i)))
+                     (dds.durability:store-put s "Enc" g0 sn kh1 :data (%make-small-payload sn))))
+                 (%check :fxrs-seed-red (> (dds.durability:store-count s nil) d)
+                         (format nil "RED (no seed, file): continued post-restart writes LEAK (in-mem physical > D=~d), got ~d"
+                                 d (dds.durability:store-count s nil)))
+                 (dds.durability:store-close s)))
+             ;; (5) KEEP_ALL reopen runs NO sweep (on-disk == N)
+             (let ((dk (%dk "keepall")))
+               (%write-session dk 0 :keep-all)
+               (let ((s (%build dk)))
+                 (dds.durability:store-open s :keep-all)        ; sweep guard: no sweep
+                 (%check :fxrs-keepall (= 6 (%ondisk dk))
+                         (format nil "KEEP_ALL reopen runs no sweep (file on-disk == N=6), got ~d" (%ondisk dk)))
+                 (dds.durability:store-close s)))
+             ;; (6) MULTI-WRITER CROSS-RESTART (file) — ONE instance (same real key-hash) fed by TWO writer
+             ;; GUIDs A<B: the open-sweep GROUPS by real key-hash and keeps the (guid,sn)-newest-D via
+             ;; %win-entry< (NOT pure-SN), cross-restart. Build a >D multi-writer state (session 1 A samples;
+             ;; sweep-DISABLED session 2 B samples leak the A's via the empty window); sweep-ENABLED session 3
+             ;; reclaims -> in-mem index == D, on-disk <= D+threshold, get-range == B.3,B.6 (RED pure-SN=A.5,B.6).
+             (let ((dk (%dk "mw"))
+                   (ga (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0))
+                   (gb (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref ga 0) 1) (setf (aref gb 0) 2)       ; A.guid < B.guid
+               (let ((s (%build dk)))                           ; session 1: A.1, A.5
+                 (dds.durability:store-open s :keep-last d)
+                 (dds.durability:store-put s "Enc" ga 1 kh1 :data (%make-small-payload 1))
+                 (dds.durability:store-put s "Enc" ga 5 kh1 :data (%make-small-payload 5))
+                 (dds.durability:store-close s))
+               (let ((s (%build dk))                            ; session 2 (sweep DISABLED): B.3, B.6 -> leak A's
+                     (dds.durability::*durability-debug-disable-open-sweep* t))
+                 (dds.durability:store-open s :keep-last d)
+                 (dds.durability:store-put s "Enc" gb 3 kh1 :data (%make-small-payload 3))
+                 (dds.durability:store-put s "Enc" gb 6 kh1 :data (%make-small-payload 6))
+                 (%check :fxrs-mw-leaked (= 4 (dds.durability:store-count s nil))
+                         (format nil "file multi-writer >D state built cross-restart (A leaked), got ~d"
+                                 (dds.durability:store-count s nil)))
+                 (dds.durability:store-close s))
+               (let ((s (%build dk)))                           ; session 3 (sweep ENABLED): reclaim
+                 (dds.durability:store-open s :keep-last d)
+                 (%check :fxrs-mw-phys (= d (dds.durability:store-count s nil))
+                         (format nil "file multi-writer cross-restart sweep reclaims in-mem index to D=~d, got ~d"
+                                 d (dds.durability:store-count s nil)))
+                 (%check :fxrs-mw-ondisk (<= (%ondisk dk) (+ d 4))
+                         (format nil "file multi-writer cross-restart on-disk <= D+threshold=~d, got ~d" (+ d 4) (%ondisk dk)))
+                 (let ((sig (%gsig (dds.durability:store-get-range s "Enc"))))
+                   (%check :fxrs-mw-newest (equal sig '((2 . 3) (2 . 6)))
+                           (format nil "file multi-writer cross-restart sweep keeps the (guid,sn)-newest-D EXACTLY ~
+                                   (B.3,B.6) via %win-entry<, NOT pure-SN (A.5,B.6); got ~s" sig)))
+                 (%check :fxrs-mw-exact
+                         (equalp (%make-small-payload 6)
+                                 (dds.durability:durable-record-payload
+                                  (find 6 (dds.durability:store-get-range s "Enc")
+                                        :key #'dds.durability:durable-record-sn)))
+                         "file multi-writer cross-restart survivor payload (B.6) decrypts byte-exact")
+                 (dds.durability:store-close s))))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))
+      t)))
+
 (defun* run-durability-file-threshold-compaction-test ()
     (function () t)
   "Runtime threshold compaction in the FILE store (WP-DURABILITY-COMPACTION-FILE, Sliver 2, ADR 0029 §10):

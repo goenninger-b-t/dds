@@ -267,8 +267,9 @@ These were formerly "out of scope"; per owner directive they are MUST, each its 
      adversary can tell two records share a topic, and count records per topic, without learning the
      name. (Likewise the GUID-surrogate reveals that two records share a (guid,sn), i.e. are the same
      retained sample — trivially true anyway.)
-   - **Physical space (continuously-open case: RESOLVED — AS-BUILT; SQLite = WP-DURABILITY-ENCRECLAIM-SQLITE
-     / Sliver 3a, file = WP-DURABILITY-ENCRECLAIM-FILE / Sliver 3b).** Superseded/settled blobs on the
+   - **Physical space (RESOLVED — AS-BUILT, both backends, continuously-open + cross-restart; continuously-
+     open: SQLite = WP-DURABILITY-ENCRECLAIM-SQLITE / Sliver 3a, file = WP-DURABILITY-ENCRECLAIM-FILE /
+     Sliver 3b; cross-restart: WP-DURABILITY-ENCRECLAIM-SWEEP / Sliver 3c).** Superseded/settled blobs on the
      encrypted tier were compacted LOGICALLY (correct reads) but physically RETAINED until `store-purge` —
      the inner store runs KEEP_ALL (keep-last-by-real-SN ordering is impossible on a hashed surrogate without
      leaking SN), so its own KEEP_LAST eviction never fires. Sliver 3a physically reclaims them for the
@@ -322,9 +323,43 @@ These were formerly "out of scope"; per owner directive they are MUST, each its 
      still logically compacts it (correct reads) and the chain verifies: a **self-healing SPACE leak**, never
      a false-reject or loss. A same-session fault self-heals on the next put (the `pending-delete` set stays
      armed — the rewrite faulted before the clear — so the next `store-delete` retries).
-     **Still deferred:** the **compaction-on-open sweep** of a prior session's ≤D cross-restart leftovers is
-     Sliver **3c** — a fresh post-reopen decorator window never re-deletes the pre-restart surrogates, so 3b
-     bounds only the continuously-open case. A space, not a correctness, tradeoff throughout.
+     **Cross-restart case (RESOLVED — AS-BUILT, WP-DURABILITY-ENCRECLAIM-SWEEP / Sliver 3c, both backends).**
+     `instance-windows` is IN-RAM and clrhash'd on `store-open` (bounds decorator RAM + prevents a stale
+     window from mis-evicting), so after a RESTART the fresh window does not know a prior session's ≤D newest
+     survivors per instance: post-restart online eviction (which tracks only THIS-session puts) never evicts
+     them and they leak until the next restart — across K restarts a hammered instance accumulates ~K·D
+     physical rows. Sliver 3c adds a **decorator compaction-on-open SWEEP** at the END of the `:open` lambda
+     (after the DEK reload + the `instance-windows` clrhash), for `:keep-last` only and only once `k_meta` is
+     resident: for each inner topic-hash (`store-topics inner`), **decrypt its surrogate rows** (REUSING the
+     get-range decrypt — `open-payload-v2` over the epoch-DEK map + `%open-meta-frame`, with the AEAD AAD
+     recovered from the on-disk topic-hash hex via the new `%meta-unhex`, since the plaintext topic name is
+     off-disk), **group the `:data` records by their REAL key-hash**, and — via the SAME
+     `%trim-window-to-depth` the online evict now shares — **`store-delete` the leftovers beyond newest-D AND
+     SEED `instance-windows` with the surviving newest-D** (same `(real-guid, real-sn, surrogate)` entry shape,
+     same `%win-entry<` order). The **window-seed is the crux**: without it the fresh window stays empty and
+     the next same-instance put cannot evict the prior survivors (they leak); WITH it the next higher-SN put
+     pushes the seeded window to D+1 and evicts the oldest survivor, so **cross-restart physical converges to D
+     exactly like the continuously-open case** (SQLite = ~D; file = ≤ D+threshold on disk, = D in the in-mem
+     index). The sweep is off the hot path (once per open, control-plane — it decrypts the whole store once,
+     the same cost the first get-range would incur), reuses `store-delete` (a `:unsupported` backend skips the
+     reclaim but is still seeded — the guard remains), re-MACs the survivors (SQLite atomic DELETE + re-MAC /
+     file atomic reclaim rewrite) so the chain verifies clean after the sweep, and is **idempotent** (an
+     already-≤D store finds nothing beyond-D → no deletes, no churn). No vtable/wire change. Proven RED→GREEN
+     by the test-only `*durability-debug-disable-open-sweep*` switch: sweep-disabled reproduces the pre-3c
+     accumulation (SQLite/file in-mem physical (2 4 6 8) across K=4 restart cycles), sweep-enabled bounds it
+     ((2 2 2 2); file on-disk ≤ D+threshold). Multi-writer-per-instance grouping is locked cross-restart by a
+     dedicated case (one instance fed by two writer GUIDs A\<B: the sweep keeps the (guid,sn)-newest-D `B·3,
+     B·6`, NOT the pure-SN `A·5,B·6`). The encrypted-tier physical-reclaim story is now CLOSED for both
+     backends, continuously-open AND cross-restart. A space, not a correctness, tradeoff throughout.
+     **Benign residual (FILE, topics.map-dependent, NOT introduced by 3c):** the file sweep's cross-restart AAD
+     recovery reads the topic-hash id from `store-topics` (the file store's `id-map`, rebuilt from `topics.map`
+     on reopen). On a clean write→close→reopen (what 3c targets — every test) it always persists. If `topics.map`
+     were LOST, `store-topics` falls back to the double-hex `tid` (`store-file.lisp` `id->topic` miss), so
+     `%meta-unhex(tid)` yields the WRONG AAD, the GCM tag fails, and the sweep SILENTLY does not reclaim that
+     topic — a bounded space non-reclaim, **no data loss, no false-reject, no crash** (the unhex is bounds-safe;
+     `store-get-range` still serves that topic correctly via the caller's real topic name). This is an orthogonal
+     `topics.map`-durability failure mode, not introduced by 3c. **SQLite is immune** (the topic is persisted in
+     the DB `topic` column, not a side map).
      **Steady-state window residual (bounded, documented — parity with the Sliver-2 tombstone residual):**
      a settled/quiescent instance's window entry persists in `instance-windows` until `store-purge` or
      `store-close` (bounded by the count of live + this-session-touched instances, NOT the sample rate); a
