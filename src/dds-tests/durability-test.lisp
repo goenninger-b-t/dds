@@ -4688,6 +4688,234 @@
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))))
   t)
 
+(defun* run-durability-sqlite-tail-anchor-test ()
+    (function () t)
+  "WP-DURABILITY-TAIL-ANCHOR-SQLITE (ADR 0045 §7.1, SQLite tier): the sealed high-water tail anchor now
+   engages for encrypted-store(sqlite-store) — make-sqlite-store FILLS the read-only chain-tails /
+   verify-chain-prefix seam (reusing the shared %sqlite-chain-walk), so the decorator's seal-on-close /
+   verify-on-open closes the whole-tail-truncation / whole-topic-drop / whole-store-rollback residuals for
+   the SQLite tier too, at the SAME (N = chained-count, M_N = tail-MAC) contract as the file tier. Rows are
+   tampered via DIRECT SQL on the DB (raw sqlite:connect), mirroring the SQLite mac-chain tamper tests.
+   (1) TAIL-TRUNCATION DETECTED (RED->GREEN): seal N=4, DELETE the MAX(chain_seq) row. WITH logmac.tail the
+       prefix-containment fails-closed (count 3 < N=4); the RED control (delete logmac.tail too -> no anchor)
+       opens CLEAN — proving the per-row chain verify ALONE misses a truncated-but-valid prefix.
+   (2) WHOLE-TOPIC-DROP DETECTED: seal 2 topics, DELETE every row of one; reopen fails-closed (0 rows -> :truncated).
+   (3) ANCHOR-TAMPER DETECTED: flip a byte in logmac.tail's own MAC (CRC fixed) -> fail-closed (decorator-level keyed MAC).
+   (3b) :diverged DETECTED (whole-store rollback to a DIFFERENT self-valid snapshot): seal snapshot A (4, M_4^a),
+       re-seal a fresh-epoch snapshot B (4, M_4^b != M_4^a), ROLL BACK the DB rows to A; reopen -> the anchor's
+       store-verify-chain-prefix reaches N=4 but running-MAC@N == M_4^a != M_4^b -> :diverged -> fail-closed.
+       ISOLATED: A is a self-valid chain, so without logmac.tail it opens CLEAN (only the anchor catches it).
+   (4) CROSS-RESTART CLEAN + byte-exact: seal, reopen -> anchor verifies clean, get-range recovers byte-exact, re-seals clean.
+   (5) F1 RECLAIM-SHRINK-CRASH CLEAN (the no-false-reject, inherited invalidate-at-open): KEEP_LAST store,
+       seal a larger N, an AUTHORIZED depth-cut reclaim shrinks below N, a crash (skip-seal) leaves the log
+       SHORTER than the sealed N; reopen must OPEN CLEAN (non-vacuous: assert the physical shrink).
+   (5b) F1 RED (skip-invalidate) — the SAME reclaim-shrink+crash with *durability-debug-skip-tail-invalidate* T
+       BRICKS (stale anchor N=5 vs the shrunk log -> :truncated), proving the invalidate is load-bearing for SQLite."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [durability-sqlite-tail-anchor] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-sqlite-tail-anchor-test t)))
+  (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
+        (dirs '())
+        (pay  (lambda (i)
+                (let ((v (make-array 8 :element-type '(unsigned-byte 8))))
+                  (dotimes (j 8 v) (setf (aref v j) (logand (+ (* i 16) j) #xFF)))))))
+    (labels ((%tmp (tag)
+               (let ((d (uiop:merge-pathnames*
+                         (make-pathname :directory
+                                        (list :relative (format nil "dds-sqta-~a-~a-~a"
+                                                                tag (get-universal-time)
+                                                                (random 1000000))))
+                         (uiop:temporary-directory))))
+                 (push d dirs)
+                 d))
+             (%dbpath (d) (uiop:merge-pathnames* "durability.sqlite3" d))
+             (%mk (d k &optional (hk :keep-all) (hd 1))
+               (dds.durability:make-encrypted-store
+                (dds.durability:make-sqlite-store :path (%dbpath d) :history-kind hk :history-depth hd)
+                (dds.dare:make-file-key-provider :dir k)
+                :epoch-dir d))
+             (%put-topic (s topic base n &optional kh)
+               (dotimes (i n) (dds.durability:store-put s topic g0 (+ base i 1) kh :data (funcall pay (+ base i)))))
+             (%seal-topic (d k topic n)
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (%put-topic s topic 0 n)
+                 (dds.durability:store-close s)))
+             (%open-errs-p (d k &optional (hk :keep-all) (hd 1))
+               (let ((s (%mk d k hk hd)))
+                 (handler-case (progn (dds.durability:store-open s hk hd)
+                                      (ignore-errors (dds.durability:store-close s)) nil)
+                   (error () t))))
+             (%raw (d thunk)
+               (let ((db (sqlite:connect (namestring (%dbpath d)))))
+                 (unwind-protect (funcall thunk db) (sqlite:disconnect db))))
+             (%count-topic (d k topic)
+               (%raw d (lambda (db)
+                         (sqlite:execute-single db "SELECT COUNT(*) FROM record WHERE topic=?"
+                                                (%enc-topic-hash d k topic)))))
+             (%tail-path (d) (dds.durability::%logmac-tail-path (uiop:ensure-directory-pathname d)))
+             (%read-bytes (path)
+               (with-open-file (s path :element-type '(unsigned-byte 8))
+                 (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                   (read-sequence v s) v)))
+             (%write-bytes (path bytes)
+               (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+                 (write-sequence bytes s))))
+      (unwind-protect
+           (progn
+             ;; (1) TAIL-TRUNCATION DETECTED — GREEN (with anchor)
+             (let ((d (%tmp "tt-d")) (k (%tmp "tt-k")))
+               (%seal-topic d k "T" 4)                                ; seal N=4, M_4
+               (%raw d (lambda (db)
+                         (sqlite:execute-non-query
+                          db "DELETE FROM record WHERE topic=? AND chain_seq=(SELECT MAX(chain_seq) FROM record WHERE topic=?)"
+                          (%enc-topic-hash d k "T") (%enc-topic-hash d k "T"))))  ; drop the tail row (chain_seq=3)
+               (%check :sqta-tail-truncation-detected (%open-errs-p d k)
+                       "SQLite tail-truncation: DELETE the MAX(chain_seq) row -> prefix-containment fails-closed (count 3 < N=4)"))
+             ;; (1) TAIL-TRUNCATION — RED control (no anchor -> the same truncation opens CLEAN)
+             (let ((d (%tmp "ttred-d")) (k (%tmp "ttred-k")))
+               (%seal-topic d k "T" 4)
+               (%raw d (lambda (db)
+                         (sqlite:execute-non-query
+                          db "DELETE FROM record WHERE topic=? AND chain_seq=(SELECT MAX(chain_seq) FROM record WHERE topic=?)"
+                          (%enc-topic-hash d k "T") (%enc-topic-hash d k "T"))))
+               (delete-file (%tail-path d))                          ; simulate NO tail anchor (the pre-slot RED)
+               (%check :sqta-tail-truncation-red-opens-clean (not (%open-errs-p d k))
+                       "RED (no logmac.tail): a tail-truncated valid prefix opens CLEAN — the per-row chain verify alone misses it"))
+             ;; (2) WHOLE-TOPIC-DROP DETECTED
+             (let ((d (%tmp "wtd-d")) (k (%tmp "wtd-k")))
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (%put-topic s "A" 0 2)
+                 (%put-topic s "B" 0 2)
+                 (dds.durability:store-close s))                     ; seals {A->(2,·), B->(2,·)}
+               (%check :sqta-2topic-control (not (%open-errs-p d k))
+                       "non-vacuous control: the sealed 2-topic SQLite store reopens clean")
+               (%raw d (lambda (db)
+                         (sqlite:execute-non-query db "DELETE FROM record WHERE topic=?" (%enc-topic-hash d k "A"))))
+               (%check :sqta-whole-topic-drop-detected (%open-errs-p d k)
+                       "whole-topic drop: a sealed topic with every row DELETEd is DETECTED at open (0 rows -> :truncated)"))
+             ;; (3) ANCHOR-TAMPER DETECTED — flip a byte in logmac.tail's own MAC, fix the CRC
+             (let ((d (%tmp "at-d")) (k (%tmp "at-k")))
+               (%seal-topic d k "T" 3)
+               (let* ((tp (%tail-path d))
+                      (b  (%read-bytes tp))
+                      (sz (length b))
+                      (mac-byte (- sz 20)))                          ; a byte inside the anchor-mac field
+                 (setf (aref b mac-byte) (logxor (aref b mac-byte) #xFF))
+                 (dds.durability::%put-u32-le b (- sz 4) (dds.durability::%crc32 b 0 (- sz 4)))
+                 (%write-bytes tp b))
+               (%check :sqta-anchor-tamper-detected (%open-errs-p d k)
+                       "anchor-tamper: flipping logmac.tail's MAC (CRC fixed) is DETECTED by the keyed MAC (fail-closed for SQLite too)"))
+             ;; (3a2) PURGE + REPUT + REOPEN CLEAN — the no-false-reject purge fix (purge now clears the stale
+             ;; in-memory chain head so a reput re-seeds from the per-topic head; without the fix reopen BRICKED,
+             ;; because the re-seeded chain verify mismatched at row 0). Also validates the (3b) snapshot-B setup.
+             (let ((d (%tmp "pr-d")) (k (%tmp "pr-k")))
+               (%seal-topic d k "T" 4)
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dds.durability:store-purge s "T")
+                 (%put-topic s "T" 0 4)
+                 (dds.durability:store-close s))
+               (%check :sqta-purge-reput-reopen-clean (not (%open-errs-p d k))
+                       "no-false-reject: purge + reput + reopen opens CLEAN (purge clears the stale chain head so the reput re-seeds; ADR 0045)"))
+             ;; (3b) :diverged DETECTED — a whole-store ROLLBACK to a DIFFERENT self-valid snapshot (>= N rows,
+             ;; running-MAC@N != M_N). The running per-row chain verify PASSES the rolled-back snapshot (it is a
+             ;; VALID chain), so ONLY the anchor's M_N mismatch catches it — isolating the SQLite :diverged arm
+             ;; (the :truncated arms above cover count<N; this covers reached-N-but-different).
+             (let ((d (%tmp "dv-d")) (k (%tmp "dv-k")))
+               (%seal-topic d k "T" 4)                             ; snapshot A: 4 rows under epoch e1, seal (4, M_4^a)
+               (let* ((th (%enc-topic-hash d k "T"))
+                      (snap-a (%raw d (lambda (db)
+                                        (sqlite:execute-to-list db
+                                         "SELECT writer_guid, sn, key_hash, kind, payload, mac, chain_seq FROM record WHERE topic=? ORDER BY chain_seq ASC" th)))))
+                 ;; snapshot B: PURGE + re-put the SAME 4 under a FRESH epoch e2 -> different ciphertext -> different
+                 ;; row macs -> re-seal (4, M_4^b) with M_4^b != M_4^a (a DIFFERENT but self-valid 4-row chain)
+                 (let ((s (%mk d k)))
+                   (dds.durability:store-open s)
+                   (dds.durability:store-purge s "T")
+                   (%put-topic s "T" 0 4)
+                   (dds.durability:store-close s))
+                 ;; ROLL BACK the DB rows to snapshot A; logmac.tail still commits (4, M_4^b) from session B's close
+                 (%raw d (lambda (db)
+                           (sqlite:execute-non-query db "DELETE FROM record WHERE topic=?" th)
+                           (dolist (row snap-a)
+                             (destructuring-bind (wg sn kh kind pl mac cs) row
+                               (sqlite:execute-non-query db
+                                "INSERT INTO record (topic, writer_guid, sn, key_hash, kind, payload, mac, chain_seq) VALUES (?,?,?,?,?,?,?,?)"
+                                th wg sn kh kind pl mac cs)))))
+                 (%check :sqta-diverged-detected (%open-errs-p d k)
+                         "SQLite :diverged: a rollback to a DIFFERENT self-valid snapshot (>=N rows, running-MAC@N != M_N) is DETECTED (fail-closed)")
+                 ;; ISOLATION: snapshot A is itself a self-valid chain, so WITHOUT logmac.tail it opens CLEAN —
+                 ;; only the anchor's M_N mismatch (:diverged) catches this rollback, not the running per-row chain.
+                 (delete-file (%tail-path d))
+                 (%check :sqta-diverged-anchor-isolated (not (%open-errs-p d k))
+                         "isolation: the rolled-back snapshot is a self-valid chain -> without logmac.tail it opens CLEAN; only the anchor's :diverged detects the rollback")))
+             ;; (4) CROSS-RESTART CLEAN + byte-exact recovery
+             (let ((d (%tmp "xr-d")) (k (%tmp "xr-k")))
+               (%seal-topic d k "T" 3)
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)                       ; anchor verifies clean BEFORE compaction
+                 (let ((recs (dds.durability:store-get-range s "T")))
+                   (%check :sqta-xr-count (= 3 (length recs))
+                           (format nil "cross-restart: expected 3 anchor-verified records, got ~d" (length recs)))
+                   (%check :sqta-xr-bytes
+                           (loop for r in recs for i from 0
+                                 always (equalp (dds.durability:durable-record-payload r) (funcall pay i)))
+                           "cross-restart: payloads byte-exact after the anchor verify"))
+                 (dds.durability:store-close s))                     ; re-seals over the clean state
+               (%check :sqta-xr-reopen-clean (not (%open-errs-p d k))
+                       "cross-restart: the re-sealed anchor reopens clean again (no false-reject)"))
+             ;; (5) F1 RECLAIM-SHRINK-CRASH CLEAN — the no-false-reject (inherited invalidate-at-open)
+             (let ((d (%tmp "f1-d")) (k (%tmp "f1-k"))
+                   (kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xC5)))
+               ;; session A: KEEP_LAST 5, 5 samples of ONE instance -> 5 physical chained rows, clean close seals N=5
+               (let ((s (%mk d k :keep-last 5)))
+                 (dds.durability:store-open s :keep-last 5)
+                 (dotimes (i 5) (dds.durability:store-put s "T" g0 (1+ i) kh :data (funcall pay i)))
+                 (dds.durability:store-close s))
+               (%check :sqta-f1-sealed-n (= 5 (%count-topic d k "T"))
+                       "F1 setup: KEEP_LAST 5 seals 5 physical chained rows (N=5)")
+               ;; session B: reopen KEEP_LAST 1 -> verify 5==5 clean + INVALIDATE + the open-sweep AUTHORIZED-
+               ;; shrinks the instance to newest-1; then "crash" (skip-seal) -> the log is now SHORTER than N=5.
+               (let ((dds.durability::*durability-debug-skip-tail-seal* t))
+                 (let ((s (%mk d k :keep-last 1)))
+                   (dds.durability:store-open s :keep-last 1)
+                   (dds.durability:store-close s)))
+               (%check :sqta-f1-reclaim-shrank (< (%count-topic d k "T") 5)
+                       (format nil "F1 non-vacuous: the authorized depth-cut reclaim SHRINKS the log below the sealed N=5 (now ~d rows)"
+                               (%count-topic d k "T")))
+               ;; session C: reopen KEEP_LAST 1 -> must OPEN CLEAN (anchor invalidated at B; skip-seal -> absent), not brick
+               (%check :sqta-f1-reclaim-crash-opens-clean (not (%open-errs-p d k :keep-last 1))
+                       "F1: an authorized reclaim-shrink + crash reopens CLEAN (no false-reject / brick; inherited invalidate-at-open)"))
+             ;; (5b) F1 RED (skip-invalidate) — the SAME reclaim-shrink+crash BRICKS, proving the invalidate-at-open
+             ;; is LOAD-BEARING for the SQLite tier (not resting on the file-tier's RED proof of the shared decorator).
+             (let ((d (%tmp "f1red-d")) (k (%tmp "f1red-k"))
+                   (kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xD7)))
+               (let ((s (%mk d k :keep-last 5)))                   ; session A: KEEP_LAST 5, 5 rows -> seal N=5
+                 (dds.durability:store-open s :keep-last 5)
+                 (dotimes (i 5) (dds.durability:store-put s "T" g0 (1+ i) kh :data (funcall pay i)))
+                 (dds.durability:store-close s))
+               ;; session B: SKIP the invalidate (RED knob) AND the re-seal (crash) -> the STALE anchor N=5 survives
+               ;; the authorized 5->1 reclaim-shrink (the pre-invalidate design that this knob reproduces).
+               (let ((dds.durability::*durability-debug-skip-tail-invalidate* t)
+                     (dds.durability::*durability-debug-skip-tail-seal* t))
+                 (let ((s (%mk d k :keep-last 1)))
+                   (dds.durability:store-open s :keep-last 1)      ; verify 5==5 clean, SKIP invalidate, sweep shrinks 5->1
+                   (dds.durability:store-close s)))                ; SKIP re-seal -> logmac.tail STILL commits N=5 (stale)
+               (%check :sqta-f1-red-shrank (< (%count-topic d k "T") 5)
+                       "F1 RED setup non-vacuous: the authorized reclaim still shrank the log below the sealed N=5")
+               ;; session C: reopen -> the stale anchor (N=5) vs the shrunk log (1 row) -> :truncated -> FAIL-CLOSED (BRICK)
+               (%check :sqta-f1-red-bricks (%open-errs-p d k :keep-last 1)
+                       "F1 RED: with the invalidate SKIPPED, the reclaim-shrink+crash BRICKS (stale anchor N=5 vs the shrunk log -> :truncated) — proving invalidate-at-open is load-bearing for SQLite")))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))))
+  t)
+
 ;;; --- SQLite online per-instance KEEP_LAST eviction (WP-DURABILITY-COMPACTION-SQLITE, Sliver 1) ---
 ;;; A continuously-open KEEP_LAST SQLite store must evict superseded :data rows AT PUT TIME (no
 ;;; close/open cycle), mirroring the memory store's %mem-evict-instance (ADR 0029, ADR 0049 §7).

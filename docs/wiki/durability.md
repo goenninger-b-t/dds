@@ -823,7 +823,7 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   pre-seeds fake v2 logs before mint gets them authenticated as exempt (no more capability than deleting
   the anchor outright), closed only by the deferred sealed high-water anchor.
 - **Sealed high-water tail anchor (whole-tail truncation / whole-topic drop / whole-store rollback —
-  FILE tier, ADR 0045 §7.1).** The running chain provably cannot detect truncation of a valid *prefix*
+  FILE + SQLite tiers, ADR 0045 §7.1).** The running chain provably cannot detect truncation of a valid *prefix*
   (the shorter log is itself a valid chain), so a **separable** store-level anchor commits the expected
   tail. At **clean close** the decorator seals, per chained topic, `{N = v3-frame count, M_N = the
   running chain-MAC after N frames}` plus the **topic-SET**, MAC'd under the log-MAC key
@@ -846,11 +846,15 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   prefix-containment "may extend past `N`" tolerance is currently **vestigial** (harmless; reserved for a
   future periodic-seal — strict `count==N ∧ MAC==M_N` would be equivalent today). The decorator↔store
   boundary is a **read-only additive seam** (`store-chain-tails` for the seal, `store-verify-chain-prefix`
-  for the open check; NIL-fallback like `store-sync`), so the **SQLite + microservice** tiers (seam slot
-  NIL) are unchanged — the tail anchor is **FILE-tier this slice**; those tiers are follow-on WPs.
+  for the open check; NIL-fallback like `store-sync`). The **SQLite tier** now FILLS that seam
+  (WP-DURABILITY-TAIL-ANCHOR-SQLITE — `make-sqlite-store` walks its `mac`/`chain_seq` rows via the shared
+  `%sqlite-chain-walk` at the SAME `{N, M_N}` contract; `N` is the chained-**row count**, `M_N` the tail
+  row's MAC. The authorized reclaim there is the Sliver-3a `store-delete` ⇒ `%sqlite-recompute-topic`
+  shrink, and the backend-agnostic invalidate-at-open gives it the same reclaim-shrink+crash **CLEAN**
+  no-false-reject for free), so only the **microservice** tier's seam stays NIL (a follow-on WP).
 - **Detected:** interior record **delete / reorder / substitution (even with both CRCs recomputed) /
-  insertion**, **full-log v3→v2 downgrade** of any born-chained topic, and — for the **FILE** tier —
-  **whole-tail truncation / whole-topic drop / whole-store rollback** (the sealed high-water anchor
+  insertion**, **full-log v3→v2 downgrade** of any born-chained topic, and — for the **FILE + SQLite**
+  tiers — **whole-tail truncation / whole-topic drop / whole-store rollback** (the sealed high-water anchor
   above, **against an adversary who truncates the log but does not also delete `logmac.tail`**).
   **Deferred residuals (ADR 0045 §7):** the honest-torn-disguise (a truncation that leaves a trailing
   *partial* frame is byte-indistinguishable from a real crash, so it is tolerated); **`logmac.tail`
@@ -858,8 +862,8 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   deletes `logmac.tail`** opens clean (byte-indistinguishable from a legitimate never-cleanly-closed store;
   the **same residual class as anchor-deletion, §7 item 3a** — it cannot be closed by requiring the tail
   file's presence without false-rejecting every legitimately never-closed store; invalidate-at-open widens
-  the legitimate-absent window to any open session, same class); the tail anchor on the **SQLite +
-  microservice** tiers (seam NIL until the follow-on); the combined anchor-deletion-plus-full-downgrade
+  the legitimate-absent window to any open session, same class); the tail anchor on the **microservice**
+  tier (seam NIL until the follow-on); the combined anchor-deletion-plus-full-downgrade
   vector and a full rollback of a *grandfathered* legacy topic; and the `epochs.dat` MAC. Cost is off the
   sample hot path (one HMAC per put / per frame at open; one HMAC over the tail set per close). Verified by
   `run-durability-mac-chain-test` (round-trip; v1/v2/v3 read; the four interior tampers with a non-vacuous
@@ -868,7 +872,15 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   DETECTED**) and `run-durability-tail-anchor-test` (**crash-append CLEAN** + **authorized reclaim-shrink +
   crash reopens CLEAN** [the two no-false-reject / no-brick cases, the second with a non-vacuous
   log-shrank guard]; **whole-topic-drop / anchor-tamper / whole-store-rollback DETECTED**; never-cleanly-closed
-  opens clean).
+  opens clean). The **SQLite tier** anchor is verified by `run-durability-sqlite-tail-anchor-test`
+  (**tail-truncation RED→GREEN**, **whole-topic-drop DETECTED**, anchor-tamper, **:diverged DETECTED** [a
+  rollback to a DIFFERENT self-valid snapshot with running-MAC@N ≠ M_N — the running per-row chain passes it,
+  only the anchor catches it], cross-restart byte-exact, **F1 reclaim-shrink-crash CLEAN** with a non-vacuous
+  log-shrank guard AND a self-contained RED [`*durability-debug-skip-tail-invalidate*` → the same sequence
+  BRICKS, proving the invalidate is load-bearing], and a **purge+reput+reopen CLEAN** no-false-reject arm — all
+  tampered via DIRECT SQL). NO-FALSE-REJECT FIX (both tiers): `store-purge` now clears the in-memory running
+  chain head so a reput to a purged topic re-seeds from the per-topic head (previously the reput chained from
+  the stale pre-purge tail and the next open's re-seeded verify false-rejected the first frame — a brick).
 
 ### 8.6 Deployment requirement — OpenSSL ≥ 3.5
 

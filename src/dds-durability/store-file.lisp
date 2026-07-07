@@ -925,6 +925,9 @@
                    (dds.pal:fsync-directory (%topics-dir store-dir))))
                (remhash tid outer)
                (remhash tid pending-delete)   ; Sliver-3b: drop any pending physical deletes for the purged topic
+               ;; drop the stale running chain head so a reput re-seeds from the per-topic head, not the
+               ;; pre-purge tail — else reopen's re-seeded replay mismatches the first frame (no false-reject; ADR 0045)
+               (remhash tid chain-macs)
                (remhash topic id-map)))
            t))
 

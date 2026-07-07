@@ -44,6 +44,7 @@
            #:run-durability-sqlite-dare-test
            #:run-durability-sqlite-service-test
            #:run-durability-sqlite-mac-chain-test
+           #:run-durability-sqlite-tail-anchor-test
            #:run-durability-sqlite-keeplast-online-test
            #:run-durability-sqlite-online-chain-test
            #:run-durability-sqlite-crash-consistency-test

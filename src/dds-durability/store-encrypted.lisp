@@ -364,6 +364,14 @@
    next open must then accept the longer log as a forward extension (prefix-containment, no false-reject)
    — this flag exercises exactly that no-false-reject path. Never set in production code.")
 
+(defparameter *durability-debug-skip-tail-invalidate* nil
+  "Test-only fault injector (ADR 0045 §7.1 reclaim-crash brick). NIL (default) ⇒ inert; byte-identical
+   behavior. When non-NIL, the encrypted-store :open SKIPS %invalidate-tail-anchor (verify still runs) —
+   reproducing the PRE-invalidate design so a test can prove the invalidate is LOAD-BEARING: with it
+   skipped, an authorized reclaim-shrink + a crash (skip-seal) leaves the STALE anchor (an older, larger N)
+   over a shrunk log ⇒ the next open FALSE-REJECTS (:truncated, bricks). With it on (default) the same
+   sequence reopens clean. Mirrors *durability-debug-skip-tail-seal*. Never set in production code.")
+
 (defun* %assemble-tail-signed (tails)
     (function (hash-table) (simple-array (unsigned-byte 8) (*)))
   "Serialize the per-topic tail set TAILS (tid -> (N . M_N)) into the anchor's SIGNED region:
@@ -1172,7 +1180,8 @@
                  ;; FALSE-REJECT (the store reopens clean; re-sealed at the next clean close over the final
                  ;; state). Verify FIRST keeps detection; invalidate SECOND kills the reclaim-crash brick.
                  (%verify-tail-anchor inner-store epoch-dir key)
-                 (%invalidate-tail-anchor epoch-dir)
+                 (unless *durability-debug-skip-tail-invalidate*
+                   (%invalidate-tail-anchor epoch-dir))
                  (store-open inner-store :keep-all nil))
                (progn
                  (store-open inner-store :keep-all nil)

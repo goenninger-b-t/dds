@@ -71,15 +71,24 @@
   (let ((rec (%sqlite-row->record topic wg-blob sn-blob kh-blob kind-int pl-blob)))
     (nth-value 1 (%frame-record-versioned rec +frame-version-v3+ prev fn))))
 
-(defun* %sqlite-verify-topic (db topic fn required grandfather)
-    (function (t string function t (or null hash-table))
-              (or null (simple-array (unsigned-byte 8) (*))))
-  "Verify TOPIC's per-row MAC chain in chain_seq order and return the tail MAC (or NIL). Recompute each
-   row's expected MAC over (running-MAC ∥ canonical frame prefix) and compare to the stored mac column;
-   ANY mismatch/gap/reorder SIGNALS (fail-closed). A NULL-mac row is a legacy/pre-chain prefix row —
-   legal ONLY before the chain starts; a NULL-mac row AFTER a chained row is a chain break (tamper).
-   Downgrade defense (ADR 0045 §3.2): when REQUIRED, a non-empty topic that replays to ZERO chained
-   rows on a NON-grandfathered topic SIGNALS (a full v3->v2 keyless downgrade)."
+(defun* %sqlite-chain-walk (db topic fn stop-at)
+    (function (t string function (or null (integer 0)))
+              (values (integer 0) (simple-array (unsigned-byte 8) (*))
+                      (member :reached :clean :break :mismatch) (integer 0)))
+  "READ-ONLY walk of TOPIC's per-row v3 MAC chain in chain_seq order under oracle FN — the shared engine
+   of BOTH the open-time verifier (%sqlite-verify-topic) AND the sealed high-water tail-anchor seam
+   (store-chain-tails / store-verify-chain-prefix), the SQLite analogue of the file store's %chain-walk
+   (ADR 0045 §7.1). Seeds from the per-topic keyed head, recomputes each non-NULL-mac row's expected MAC
+   over (running ∥ canonical frame prefix), and counts ONLY chained rows (a NULL-mac legacy/pre-chain
+   prefix is walked over without counting; a NULL-mac row AFTER a chained row is a break). UNLIKE
+   %sqlite-verify-topic it NEVER signals — it RETURNS a reason so each caller applies its own policy.
+   Returns (values chained running reason nrows):
+     STOP-AT non-NIL and reached ⇒ :reached, RUNNING = the running chain MAC after exactly STOP-AT chained
+       rows (the tail anchor's prefix-containment probe; rows past STOP-AT are ignored);
+     else runs to the natural end — :clean (chained < STOP-AT if any) / :break (an unchained row after a
+       chained row) / :mismatch (a stored mac ≠ the recomputed mac). NROWS = rows examined (downgrade check).
+   The tail-anchor SEAL (STOP-AT NIL → chained + tail-MAC) and the prefix-containment VERIFY (STOP-AT N)
+   share this ONE walk, so their counting + MAC computation are byte-identical (no drift)."
   (let ((rows (sqlite:execute-to-list
                db
                "SELECT writer_guid, sn, key_hash, kind, payload, mac FROM record WHERE topic=? ORDER BY chain_seq ASC, rowid ASC"
@@ -87,25 +96,47 @@
         (running (%chain-seed fn topic))
         (started nil)
         (chained 0)
-        (tail    nil))
+        (nrows   0))
     (dolist (row rows)
+      (when (and stop-at (>= chained stop-at))
+        (return-from %sqlite-chain-walk (values chained running :reached nrows)))  ; committed prefix reached
+      (incf nrows)
       (destructuring-bind (wg sn-blob kh kind-int pl mac) row
         (if (null mac)
             (when started
-              (error "dds.durability: SQLite MAC chain break in topic ~a — unchained row after a ~
-                      chained row (tamper — refusing to open; ADR 0045)" topic))
+              (return-from %sqlite-chain-walk (values chained running :break nrows)))  ; unchained-after-chained
             (let ((expected (%sqlite-row-mac fn running topic wg sn-blob kh kind-int pl))
                   (stored   (%to-octets-n mac +frame-mac-len+)))
               (unless (equalp expected stored)
-                (error "dds.durability: SQLite chain MAC mismatch in topic ~a ~
-                        (tamper — refusing to open; ADR 0045)" topic))
-              (setf running expected started t tail expected)
+                (return-from %sqlite-chain-walk (values chained running :mismatch nrows)))  ; stored ≠ recomputed
+              (setf running expected started t)
               (incf chained)))))
-    (when (and required rows (zerop chained)
+    (if (and stop-at (>= chained stop-at))
+        (values chained running :reached nrows)                     ; prefix reached exactly at the last row
+        (values chained running :clean nrows))))                    ; natural end (chained < STOP-AT if any)
+
+(defun* %sqlite-verify-topic (db topic fn required grandfather)
+    (function (t string function t (or null hash-table))
+              (or null (simple-array (unsigned-byte 8) (*))))
+  "Verify TOPIC's per-row MAC chain in chain_seq order and return the tail MAC (or NIL). Delegates the walk
+   to the shared %sqlite-chain-walk (DRY — the SAME engine the tail-anchor seam uses) and applies the
+   fail-closed policy: a :break (a NULL-mac/unchained row after a chained row) or :mismatch (a stored mac ≠
+   the recomputed mac) SIGNALS (tamper — refusing to open). A NULL-mac row is a legacy/pre-chain prefix row,
+   legal ONLY before the chain starts. Downgrade defense (ADR 0045 §3.2): when REQUIRED, a non-empty topic
+   that walks to ZERO chained rows on a NON-grandfathered topic SIGNALS (a full v3->v2 keyless downgrade)."
+  (multiple-value-bind (chained running reason nrows) (%sqlite-chain-walk db topic fn nil)
+    (case reason
+      (:break
+       (error "dds.durability: SQLite MAC chain break in topic ~a — unchained row after a ~
+               chained row (tamper — refusing to open; ADR 0045)" topic))
+      (:mismatch
+       (error "dds.durability: SQLite chain MAC mismatch in topic ~a ~
+               (tamper — refusing to open; ADR 0045)" topic)))
+    (when (and required (plusp nrows) (zerop chained)
                (not (and grandfather (gethash (%topic->id topic) grandfather))))
       (error "dds.durability: SQLite chain-required topic ~a has ~d row(s) but ZERO chained rows — ~
-              refusing to open (full v3->v2 downgrade / tamper; ADR 0045 §3.2)" topic (length rows)))
-    tail))
+              refusing to open (full v3->v2 downgrade / tamper; ADR 0045 §3.2)" topic nrows))
+    (and (plusp chained) running)))
 
 (defun* %sqlite-recompute-topic (db topic fn)
     (function (t string function) (or null (simple-array (unsigned-byte 8) (*))))
@@ -214,7 +245,12 @@
    (restart recovery). The keyed per-row MAC chain seam (store-set-chain-mac-fn, ADR 0045) is LIVE:
    when the encrypted decorator installs the log-MAC oracle each put writes a v3 chain MAC (byte-
    identical to the file store) into the mac column and verify-on-open (before compaction) fail-closes
-   on any tamper; a NIL-oracle bare store writes NULL mac columns = byte-behaviorally unchanged."
+   on any tamper; a NIL-oracle bare store writes NULL mac columns = byte-behaviorally unchanged.
+   The sealed high-water tail-anchor seam (store-chain-tails / store-verify-chain-prefix, ADR 0045 §7.1)
+   is ALSO filled: at the encrypted decorator's clean close the per-topic (chained-count N . tail-MAC M_N)
+   is sealed into D/logmac.tail, and at open prefix-containment closes the whole-tail-truncation /
+   whole-topic-drop / whole-store-rollback residuals for the SQLite tier — reusing the SAME
+   %sqlite-chain-walk as verify-on-open (no new crypto; the (N . M_N) contract matches the file tier)."
   (let* ((db-path (when path (pathname path)))
          (lock    (dds.pal:make-lock "dds-sqlite-store"))
          (db-cell (list nil))                 ; car = live connection or NIL when closed
@@ -376,6 +412,9 @@
            (dds.pal:with-lock (lock)
              (%ensure-db)
              (sqlite:execute-non-query (car db-cell) "DELETE FROM record WHERE topic=?" topic)
+             ;; drop the stale running chain head so a reput re-seeds from the per-topic head, not the
+             ;; pre-purge tail — else reopen's re-seeded verify mismatches at row 0 (no false-reject; ADR 0045)
+             (remhash topic chain-macs)
              t))
 
          :open
@@ -433,6 +472,48 @@
              (setf (car req-cell) required)
              (setf (car gf-cell) grandfather))
            t)
+
+         :chain-tails-fn
+         ;; sealed high-water tail-anchor SEAL seam (ADR 0045 §7.1): for each topic with chained rows,
+         ;; walk its rows via the shared %sqlite-chain-walk to the natural end, yielding (chained-count N .
+         ;; tail-MAC M_N). Keyed by the raw `topic` column value (= the encrypted decorator's topic-hash th,
+         ;; an ASCII hex string) — the SAME value store-verify-chain-prefix re-walks, so the sealed key
+         ;; round-trips through logmac.tail losslessly. The (N . M_N) shape MATCHES the file tier EXACTLY
+         ;; (%chain-walk). A bare (no-oracle) store returns an empty set (no anchor, mirrors the file tier).
+         (lambda ()
+           (dds.pal:with-lock (lock)
+             (%ensure-db)
+             (let ((result (make-hash-table :test #'equal)))
+               (when (car cmf-cell)
+                 (dolist (topic (sqlite:execute-to-list (car db-cell) "SELECT DISTINCT topic FROM record"))
+                   (let ((tn (first topic)))
+                     (multiple-value-bind (n mac reason)
+                         (%sqlite-chain-walk (car db-cell) tn (car cmf-cell) nil)
+                       (declare (ignore reason))
+                       (when (plusp n)
+                         (setf (gethash tn result) (cons n mac)))))))
+               result)))
+
+         :verify-chain-prefix-fn
+         ;; sealed high-water tail-anchor VERIFY seam (ADR 0045 §7.1): re-walk TOPIC's chained rows to
+         ;; ordinal N (%sqlite-chain-walk STOP-AT) and decide prefix-containment, BEFORE the store-open
+         ;; %verify-chains + %compact-on-open mutate the rows. :reached ⇒ compare the running MAC@N to the
+         ;; sealed M_N (== intact/may-extend forward = CLEAN; != = :diverged rollback/substitution); :clean
+         ;; (ran out below N — including 0 rows = a whole-topic drop) ⇒ :truncated; :break/:mismatch (an
+         ;; interior tamper before N) ⇒ tolerate T here, deferring to store-open's fail-loud %verify-chains
+         ;; (parity with the file tier's :corrupt→T). No oracle ⇒ T. RETURN semantics MATCH the file tier EXACTLY.
+         (lambda (topic n mac)
+           (dds.pal:with-lock (lock)
+             (%ensure-db)
+             (if (null (car cmf-cell))
+                 t
+                 (multiple-value-bind (count running reason)
+                     (%sqlite-chain-walk (car db-cell) topic (car cmf-cell) n)
+                   (declare (ignore count))
+                   (cond
+                     ((eq reason :reached) (if (equalp running mac) t :diverged))
+                     ((eq reason :clean)   :truncated)
+                     (t                    t))))))
 
          :delete
          ;; per-record physical reclaim (ADR 0025 §10.3, Sliver 3a — the encrypted decorator's
