@@ -1393,21 +1393,17 @@ inner slot and **no server change**:
 The client **seals + MACs locally**; the ML-KEM anchor, `epochs.dat`, the log-MAC anchor, and `k_meta`
 all live in the local `epoch-dir`/`key-dir`, so the remote server stores **only opaque ciphertext**: a
 hex topic-hash, a 16-byte GUID surrogate, `sn = 0`, a NIL key-hash, and the sealed blob — never a
-plaintext topic name / GUID / SN / key-hash / payload, and never a key. The `:sync` and
-`:set-chain-mac-fn` vtable slots are left **NIL** (the same slot profile as `make-memory-store`): a client
-cannot ship a secret-holding chain-MAC closure over TCP, so the chain-oracle install is a no-op and the
-cross-frame keyed log-MAC chain (ADR 0045) is absent at this tier; **per-record DARE-GCM still authenticates
-each record** (an attacker cannot read, forge, or alter a frame's contents, and reorder is neutralized by the
-client re-sorting on decrypted `(guid,sn)`). **Integrity caveat for the remote case (not memory-parity):**
-what the absent chain leaves open is record-sequence **completeness/freshness** — a malicious or compromised
-*remote* server can silently **drop / truncate / roll back** sealed records undetected. This differs from
-`make-memory-store` (intra-process — an adversary who can tamper already holds the keys); a microservice
-store is across a trust boundary, exactly the untrusted-storage adversary the chain defends, and the
-file/SQLite tiers (same on-disk-tamper threat) **do** carry the chain. A **client-side v3 chain-MAC over the
-microservice tier (shipping the 32-byte MAC as an opaque field the server stores blindly) is a Slice-3b
-requirement** to close this for a production remote deployment. Confidentiality (no plaintext at the server)
-is fully met here. Unlike the
-file/sqlite factories, the inner tier's HISTORY policy is not a factory argument — it is the SERVER's,
+plaintext topic name / GUID / SN / key-hash / payload, and never a key. The `:sync` slot is **NIL**
+(group-commit sync is a local-store concern); the `:set-chain-mac-fn` slot is **LIVE** (Slice 3b, §8.10.2):
+the decorator installs its log-MAC oracle into the client-side store, arming the client-side v3 chain-MAC
+over the remote tier — a malicious server that **drops / reorders / tampers** sealed frames is detected
+fail-closed on open (file/SQLite parity), the 32-byte MAC + `chain_seq` folded into the opaque payload the
+DARE-blind server stores verbatim (server + wire protocol unchanged). Independently, **per-record DARE-GCM
+authenticates each record** (an attacker cannot read, forge, or alter a frame's contents). **Remaining
+residual (deferred, = file/SQLite, ADR 0045 §7):** tail-truncation of a valid prefix + whole-topic-drop (a
+server omitting a topic from `store-topics` is never verified) stay undetected. A bare `microservice-store`
+(no decorator to install the oracle) leaves the chain uninstalled — memory-parity, Slice 1 unchanged. Unlike
+the file/sqlite factories, the inner tier's HISTORY policy is not a factory argument — it is the SERVER's,
 applied at server-start (§8.10.1); the client's `store-open` policy is a confirm/no-op at this shared,
 server-owned tier.
 
@@ -1473,10 +1469,10 @@ multi-segment payloads, torn-read fails cleanly, both impls. Slice 2 (built) = t
 both impls, zero server change. **Slice 3a (built) = server-owned persistent inner (open@start-replay /
 close@stop-fsync) + cross-restart recovery (bare file+SQLite GREEN, memory RED; DARE-wrapped opaque-on-disk
 + client-side decrypt) + server-owned multi-session lifecycle + the `DPERSIST_BACKEND=microservice`
-config-env seam, both impls.** Deferred: the client-side v3 chain over the microservice tier (Slice 3b —
-remote-untrusted-store integrity) + HISTORY-QoS-over-the-wire forwarding (Slice 3c, REQUIRED) + reconnect /
-multi-client / chunked large `get-range` / DoS-hardening / the CLI `--backend` / the live 2-process interop
-(Slice 3c). See ADR 0050.
+config-env seam, both impls.** **Slice 3b (built, §8.10.2) = the client-side v3 chain-MAC over the remote
+tier: drop/reorder/tamper detected fail-closed on open, server + wire protocol byte-identical.** Deferred:
+HISTORY-QoS-over-the-wire forwarding (Slice 3c, REQUIRED) + reconnect / multi-client / chunked large
+`get-range` / DoS-hardening / the CLI `--backend` / the live 2-process interop (Slice 3c). See ADR 0050.
 
 Every wire length/count is bounds-checked and the topic UTF-8 is well-formedness-validated (Unicode
 Table 3-7 / RFC 3629) before `code-char`, so a malformed message raises a clean `microservice-protocol-
@@ -1499,8 +1495,48 @@ restart, memory inner RED recovers 0), `run-durability-microservice-dare-cross-r
 on-disk frames at the server are ciphertext, client with the same local epoch-dir decrypts + recovers real
 records byte-exact across the restart — skips if OpenSSL < 3.5), `run-durability-microservice-lifecycle-test`
 (server-owned inner survives client sessions: client2 sees client1's records), `run-durability-microservice-
-config-env-test` (DPERSIST_BACKEND=microservice selects the microservice factory structurally). Both impls,
-Clasp first; suite 489 → 493.
+config-env-test` (DPERSIST_BACKEND=microservice selects the microservice factory structurally). Slice 3b:
+`run-durability-microservice-remote-chain-test` (malicious-server DROP/TAMPER/REORDER each fail-closed on
+open + a RED bare-store-undetected contrast + the tail-truncation/whole-topic-drop residuals open clean +
+round-trip/cross-restart through the chain + NIL-oracle regression — skips if OpenSSL < 3.5). Both impls,
+Clasp first; suite 489 → 493 → 494.
+
+### 8.10.2 Client-side remote-tier chain-MAC — detecting a malicious server (Slice 3b, built)
+
+Slice 2 sealed each frame (confidentiality); **Slice 3b makes a malicious/compromised remote server's
+DROP / REORDER / TAMPER of sealed frames tamper-EVIDENT** — file/SQLite parity — with **zero server change
+and zero wire-protocol change**. The encrypted-store decorator installs its log-MAC oracle into the
+**client-side** `microservice-store` (same process, `store-set-chain-mac-fn`); only the 32-byte MAC *output*
+ever ships:
+
+- **On put**, the client computes the ADR-0045 v3 chain MAC over the **unwrapped** sealed frame (the reused
+  `%frame-record-versioned`, chained from a per-topic running-MAC table seeded by `%chain-seed`) and FOLDs
+  `sealed' = sealed ∥ mac(32) ∥ chain_seq(u64 LE)` into the payload. The DARE-blind server stores `sealed'`
+  **opaque** — a slightly-longer blob it never parses. `chain_seq` is mandatory: the server returns get-range
+  in `(guid,sn)` order (≠ chain order), so the client stamps the chain order in and re-sorts by it to verify
+  (as SQLite needs an explicit `chain_seq` column). An idempotent re-put does not advance the chain (a
+  client-side `(guid,sn)` index, the microservice analogue of the file store's in-memory index).
+- **On get-range**, the client STRIPS the 40-byte suffix (bounds-checked — a short payload from a malicious
+  server fails cleanly, never OOB), returns `payload = sealed` to the decorator (transparent), and VERIFIES
+  the topic's chain (re-seed, recompute each MAC, `equalp`-compare — a near-verbatim port of
+  `%sqlite-verify-topic`).
+- **On open**, a fail-closed verify pass get-range-verifies **every** topic before any read (file/SQLite
+  parity); a tampered chain fails the open loudly.
+
+```lisp
+;; A DARE-wrapped microservice store now DETECTS a malicious server that drops/reorders/tampers frames:
+(let ((store (funcall (dds.durability:make-microservice-store-factory
+                       :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+  (dds.durability:store-open store)                       ; verify-on-open: fails loud if the server tampered
+  (dds.durability:store-get-range store "Square"))        ; strips the fold + re-verifies the chain per topic
+```
+
+**Detected:** interior DROP (gap → prev-MAC mismatch), REORDER (order-dependent HMAC + `chain_seq` swap),
+TAMPER/SUBSTITUTE/INSERT (recompute fails; DARE-GCM also fails on unseal). **NOT detected (the SAME residual
+as file/SQLite, deferred to the ADR 0045 §7 sealed high-water anchor):** tail-truncation of a valid prefix
+and — the topic-granularity version — whole-topic-drop (a server omitting a topic from `store-topics` is
+never verified). No new crypto, no new dependency; the server code is byte-identical. The chain engages only
+under the encrypted-store; a bare `microservice-store` is memory-parity (Slice 1 unchanged).
 
 ---
 

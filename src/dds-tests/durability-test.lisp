@@ -6705,6 +6705,215 @@
         (when (uiop:directory-exists-p cbase) (uiop:delete-directory-tree cbase :validate t)))))
   t)
 
+(defun* run-durability-microservice-remote-chain-test ()
+    (function () t)
+  "WP-DURABILITY-MICROSERVICE-3B (ADR 0050 §4.3; ADR 0045 log-MAC chain; ADR 0021 cap 6): the client-side
+   v3 chain-MAC over the REMOTE microservice tier makes a malicious/compromised server's DROP / REORDER /
+   TAMPER of sealed frames DETECTED fail-closed on open — file/SQLite tamper-evidence parity, with the
+   server + wire protocol UNCHANGED (the 32-byte MAC + chain_seq fold into the opaque payload the DARE-blind
+   server stores/returns verbatim). Arms (DARE-wrapped, so SKIP if OpenSSL < 3.5):
+   (1) MALICIOUS-SERVER DETECTION: put N to a memory inner, close the session, INJECT into the server's
+       inner, reopen → the on-open verify FAILS-CLOSED: interior DROP, byte TAMPER, and REORDER each a loud
+       error, NOT a silent accept. RED contrast: a BARE microservice-store (no chain) opens CLEAN on the
+       same drop (silent data loss) — proving the chain is what detects.
+   (2) RESIDUALS (documented, ADR 0050 §4.3 / ADR 0045 §7, = file/SQLite): TAIL-TRUNCATION of a valid
+       prefix + WHOLE-TOPIC-DROP each open CLEAN (undetected) — the deferred sealed-anchor residual.
+   (3) CLEAN CONTROL + ROUND-TRIP: an untampered reopen SUCCEEDS non-vacuously (all recovered byte-exact,
+       the mac stripped transparently, the server's inner holds the folded opaque blob).
+   (4) CROSS-RESTART with the chain: a PERSISTENT file inner replays the folded frames across a server
+       restart → the reconnecting client re-verifies the chain clean and recovers byte-exact.
+   (5) NIL-ORACLE regression: a bare microservice-store (no oracle) round-trips unchanged (Slice 1)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [microservice-remote-chain] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-microservice-remote-chain-test t)))
+  (let ((g0  (%tms-guid 5))
+        (pay (lambda (i) (%tms-payload (+ 6 i) (logand (+ 1 i) 255)))))
+    (labels
+        ((%cseq-of (rec)
+           (nth-value 2 (dds.durability::%ms-unfold-payload
+                         (dds.durability:durable-record-payload rec))))
+         (%topic-of (inner) (first (dds.durability:store-topics inner)))
+         (%find-cseq (inner c)
+           (find c (dds.durability:store-get-range inner (%topic-of inner)) :key #'%cseq-of))
+         (%dare-arm (n inject-fn)
+           ;; DARE-wrapped (chained) memory-inner arm: put N to "T"/g0/sn1..N, close the session, run
+           ;; INJECT-FN on the server's inner, reopen → (values opened-clean-p recovered-count). The server +
+           ;; inner survive the session close (server-owned lifecycle); the local DARE anchor persists in BASE.
+           (let* ((inner (dds.durability:make-memory-store))
+                  (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+                  (port  (dds.durability:microservice-server-port srv))
+                  (base  (%tms-tmp-dir "rchain"))
+                  (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base)))
+             (unwind-protect
+                 (progn
+                   (let ((s (funcall (dds.durability:make-microservice-store-factory
+                                      :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+                     (dds.durability:store-open s)
+                     (dotimes (i n) (dds.durability:store-put s "T" g0 (1+ i) nil :data (funcall pay i)))
+                     (dds.durability:store-close s))
+                   (funcall inject-fn inner)
+                   (let ((s2 (funcall (dds.durability:make-microservice-store-factory
+                                       :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+                     (handler-case
+                         (progn (dds.durability:store-open s2)     ; verify-on-open (fail-closed if tampered)
+                                (let ((c (dds.durability:store-count s2 nil)))
+                                  (ignore-errors (dds.durability:store-close s2))
+                                  (values t c)))
+                       (error ()
+                         (ignore-errors (dds.durability:store-close s2))
+                         (values nil 0)))))
+               (progn
+                 (dds.durability:microservice-server-stop srv)
+                 (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t)))))))
+      ;; ---- (1) MALICIOUS-SERVER DETECTION (chained) — interior DROP / TAMPER / REORDER fail-closed ----
+      (multiple-value-bind (clean cnt)
+          (%dare-arm 4 (lambda (inner)
+                         (let ((v (%find-cseq inner 1)))
+                           (dds.durability:store-delete inner (%topic-of inner)
+                                                        (dds.durability:durable-record-writer-guid v) 0))))
+        (declare (ignore cnt))
+        (%check :msrc-detect-drop (not clean)
+                "interior DROP at a malicious server FAILS the on-open chain verify (fail-closed)"))
+      (multiple-value-bind (clean cnt)
+          (%dare-arm 4 (lambda (inner)
+                         (let ((p (dds.durability:durable-record-payload (%find-cseq inner 1))))
+                           (setf (aref p 0) (logxor (aref p 0) #xFF)))))
+        (declare (ignore cnt))
+        (%check :msrc-detect-tamper (not clean)
+                "byte TAMPER of a stored sealed frame FAILS the on-open chain verify (fail-closed)"))
+      (multiple-value-bind (clean cnt)
+          (%dare-arm 4 (lambda (inner)
+                         (let ((r0 (%find-cseq inner 0)) (r1 (%find-cseq inner 1)))
+                           (rotatef (dds.durability:durable-record-payload r0)
+                                    (dds.durability:durable-record-payload r1)))))
+        (declare (ignore cnt))
+        (%check :msrc-detect-reorder (not clean)
+                "REORDER (payload/chain_seq swap) FAILS the on-open chain verify (fail-closed)"))
+      ;; ---- (1-RED) a BARE microservice-store (no chain) does NOT detect the same drop (silent) ----
+      (let* ((inner (dds.durability:make-memory-store))
+             (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+             (port  (dds.durability:microservice-server-port srv)))
+        (unwind-protect
+            (progn
+              (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+                (dds.durability:store-open s)
+                (dotimes (i 4) (dds.durability:store-put s "T" (%tms-guid (1+ i)) (1+ i) nil :data (funcall pay i)))
+                (dds.durability:store-close s))
+              (let ((v (find 2 (dds.durability:store-get-range inner "T")
+                             :key #'dds.durability:durable-record-sn)))
+                (dds.durability:store-delete inner "T" (dds.durability:durable-record-writer-guid v) 2))
+              (let ((s2 (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+                (dds.durability:store-open s2)
+                (%check :msrc-red-bare-undetected (= 3 (dds.durability:store-count s2 nil))
+                        "RED: a BARE microservice-store (no chain) opens CLEAN on the same drop — 3 of 4 silently lost (chain absent)")
+                (dds.durability:store-close s2)))
+          (dds.durability:microservice-server-stop srv)))
+      ;; ---- (2) RESIDUALS (chained) — tail-truncation + whole-topic-drop open CLEAN (documented) ----
+      (multiple-value-bind (clean cnt)
+          (%dare-arm 4 (lambda (inner)
+                         (let ((tail (first (sort (copy-list (dds.durability:store-get-range inner (%topic-of inner)))
+                                                  #'> :key #'%cseq-of))))
+                           (dds.durability:store-delete inner (%topic-of inner)
+                                                        (dds.durability:durable-record-writer-guid tail) 0))))
+        (%check :msrc-residual-tail-truncation (and clean (= 3 cnt))
+                "documented residual (ADR 0050 §4.3): tail-truncation of a valid prefix opens CLEAN (3 of 4, undetected)"))
+      (multiple-value-bind (clean cnt)
+          (%dare-arm 4 (lambda (inner) (dds.durability:store-purge inner (%topic-of inner))))
+        (%check :msrc-residual-whole-topic-drop (and clean (= 0 cnt))
+                "documented residual (ADR 0050 §4.3): whole-topic-drop opens CLEAN (0 records, unverified)"))
+      ;; ---- (3) CLEAN CONTROL (chained) — untampered reopen SUCCEEDS, non-vacuous ----
+      (multiple-value-bind (clean cnt) (%dare-arm 4 (lambda (inner) (declare (ignore inner)) nil))
+        (%check :msrc-clean-control (and clean (= 4 cnt))
+                "non-vacuous control: an untampered chained reopen opens CLEAN with all 4 records (detection is real)"))
+      ;; ---- (3-rt) ROUND-TRIP: the chain engages + get-range recovers byte-exact, mac stripped transparently ----
+      (let* ((inner (dds.durability:make-memory-store))
+             (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+             (port  (dds.durability:microservice-server-port srv))
+             (base  (%tms-tmp-dir "rchain-rt"))
+             (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base)))
+        (unwind-protect
+            (let ((g1 (%tms-guid 1)) (g2 (%tms-guid 2)) (p1 (%tms-payload 7 1)) (p2 (%tms-payload 9 2)))
+              (let ((s (funcall (dds.durability:make-microservice-store-factory
+                                 :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+                (dds.durability:store-open s)
+                (dds.durability:store-put s "Square" g1 1 nil :data p1)
+                (dds.durability:store-put s "Square" g1 2 nil :data p2)
+                (dds.durability:store-put s "Circle" g2 1 nil :data p1)
+                (dds.durability:store-close s))
+              (let ((r (first (dds.durability:store-get-range inner (first (dds.durability:store-topics inner))))))
+                (%check :msrc-rt-folded (> (length (dds.durability:durable-record-payload r)) 40)
+                        "the server's inner holds the FOLDED opaque payload (sealed ∥ mac ∥ chain_seq, > 40 bytes)"))
+              (let ((s2 (funcall (dds.durability:make-microservice-store-factory
+                                  :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+                (dds.durability:store-open s2)                    ; re-verifies the chain clean (no error)
+                (%check :msrc-rt-count (= 3 (dds.durability:store-count s2 nil)) "round-trip count(nil)=3 through the chain")
+                (let ((ra (dds.durability:store-get-range s2 "Square")))
+                  (%check :msrc-rt-a (and (= 2 (length ra))
+                                          (%tms-rec= (first ra)  "Square" g1 1 nil :data p1)
+                                          (%tms-rec= (second ra) "Square" g1 2 nil :data p2))
+                          "get-range(Square) byte-exact + (guid,sn)-ordered, mac stripped transparently"))
+                (let ((rc (dds.durability:store-get-range s2 "Circle")))
+                  (%check :msrc-rt-c (and (= 1 (length rc)) (%tms-rec= (first rc) "Circle" g2 1 nil :data p1))
+                          "get-range(Circle) byte-exact through the chain"))
+                (dds.durability:store-close s2)))
+          (progn
+            (dds.durability:microservice-server-stop srv)
+            (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t)))))
+      ;; ---- (4) CROSS-RESTART with the chain (PERSISTENT file inner) — verify clean + recover ----
+      (let ((sdir  (%tms-tmp-dir "rchain-xr-server"))
+            (cbase (%tms-tmp-dir "rchain-xr-client")))
+        (unwind-protect
+            (let ((kdir (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) cbase))
+                  (g1 (%tms-guid 3)) (p1 (%tms-payload 11 3)) (p2 (%tms-payload 13 4)))
+              (let* ((srv1  (dds.durability:make-microservice-server
+                             :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                     (port1 (dds.durability:microservice-server-port srv1)))
+                (unwind-protect
+                    (let ((s (funcall (dds.durability:make-microservice-store-factory
+                                       :host "127.0.0.1" :port port1 :epoch-dir cbase :key-dir kdir))))
+                      (dds.durability:store-open s)
+                      (dds.durability:store-put s "T" g1 1 nil :data p1)
+                      (dds.durability:store-put s "T" g1 2 nil :data p2)
+                      (dds.durability:store-close s))
+                  (dds.durability:microservice-server-stop srv1)))
+              (let* ((srv2  (dds.durability:make-microservice-server
+                             :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                     (port2 (dds.durability:microservice-server-port srv2)))
+                (unwind-protect
+                    (let ((s2 (funcall (dds.durability:make-microservice-store-factory
+                                        :host "127.0.0.1" :port port2 :epoch-dir cbase :key-dir kdir))))
+                      (dds.durability:store-open s2)               ; re-verifies the folded chain clean across restart
+                      (let ((rs (dds.durability:store-get-range s2 "T")))
+                        (%check :msrc-xr-recover (and (= 2 (length rs))
+                                                      (%tms-rec= (first rs)  "T" g1 1 nil :data p1)
+                                                      (%tms-rec= (second rs) "T" g1 2 nil :data p2))
+                                "cross-restart: server2 replays folded frames → client re-verifies clean → byte-exact"))
+                      (dds.durability:store-close s2))
+                  (dds.durability:microservice-server-stop srv2))))
+          (progn
+            (when (uiop:directory-exists-p sdir) (uiop:delete-directory-tree sdir :validate t))
+            (when (uiop:directory-exists-p cbase) (uiop:delete-directory-tree cbase :validate t)))))
+      ;; ---- (5) NIL-ORACLE regression: a bare microservice-store round-trips unchanged ----
+      (let* ((inner (dds.durability:make-memory-store))
+             (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+             (port  (dds.durability:microservice-server-port srv)))
+        (unwind-protect
+            (let ((s  (dds.durability:make-microservice-store :host "127.0.0.1" :port port))
+                  (g1 (%tms-guid 8)) (p1 (%tms-payload 5 1)))
+              (dds.durability:store-open s)
+              (dds.durability:store-put s "T" g1 1 nil :data p1)
+              (dds.durability:store-put s "T" g1 2 nil :data p1)
+              (%check :msrc-nil-oracle (= 2 (dds.durability:store-count s nil))
+                      "bare microservice-store round-trips (no chain, memory parity)")
+              (let ((r (first (dds.durability:store-get-range s "T"))))
+                (%check :msrc-nil-bytes (%tms-rec= r "T" g1 1 nil :data p1)
+                        "bare store payload byte-exact (no fold)"))
+              (dds.durability:store-close s))
+          (dds.durability:microservice-server-stop srv)))))
+  t)
+
 (defun* run-durability-microservice-lifecycle-test ()
     (function () t)
   "SERVER-OWNED inner lifecycle (ADR 0050 Slice 3a): the inner is opened ONCE at server-start and closed

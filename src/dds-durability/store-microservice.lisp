@@ -15,12 +15,15 @@
 ;;; OVER this client unchanged). Slice 3a (DONE): the server OWNS a PERSISTENT (file/SQLite) inner —
 ;;; opened@server-start (replays from disk) / closed@server-stop (fsync) — proving cross-restart recovery
 ;;; (bare + DARE-wrapped), plus the DPERSIST_BACKEND=microservice config seam (make-durability-store-
-;;; factory). DEFERRED: the client-side v3 chain-MAC over the remote tier (Slice 3b, remote-untrusted-
-;;; store sequence integrity) + graceful reconnect / multi-client concurrency / chunked large get-range /
-;;; DoS-hardening (Slice 3c). The :sync and :set-chain-mac-fn vtable
-;;; slots stay NIL — MEMORY-TIER PARITY: the client cannot ship a secret-holding chain-MAC closure over
-;;; TCP, and per-record DARE-GCM (Slice 2) still authenticates each record; the cross-frame keyed chain
-;;; is a local-store-tier feature (ADR 0045), documented as absent here exactly as for make-memory-store.
+;;; factory). Slice 3b (built) — the client-side v3 log-MAC chain (ADR 0045) over the remote tier: the
+;;; encrypted-store installs its HMAC oracle into the CLIENT-SIDE microservice-store (same process — only
+;;; the 32-byte MAC OUTPUT ships, never the oracle closure), so :set-chain-mac-fn is now a real fn; each
+;;; put computes the v3 MAC client-side and FOLDS mac(32) ∥ chain_seq(8) into the opaque payload (server +
+;;; wire protocol UNCHANGED), and store-open re-verifies every topic's chain fail-closed — DETECTING a
+;;; malicious server's frame DROP / REORDER / TAMPER (file/SQLite tamper-evidence parity; residual =
+;;; tail-truncation-of-a-valid-prefix + whole-topic-drop, the same deferred ADR 0045 §7 sealed-anchor gap
+;;; the local tiers carry). :sync stays NIL (no group-commit over TCP). DEFERRED (Slice 3c): HISTORY-policy
+;;; forwarding + graceful reconnect / multi-client concurrency / chunked large get-range / DoS-hardening.
 ;;;
 ;;; WIRE PROTOCOL (length-prefixed request/response over the single stream; all integers little-endian):
 ;;;   REQUEST:  u32 body-len | u8 op-code | op-payload      (body-len counts the op-code + payload)
@@ -418,47 +421,117 @@
    session and closes the socket. Drop-in for memory/file/sqlite: the same store-put / store-get-range /
    store-count / store-delete dispatchers work identically, byte-exact and (guid,sn)-ordered.
 
-   The :sync and :set-chain-mac-fn vtable slots are NIL — MEMORY-TIER PARITY (documented, exactly as
-   make-memory-store): the client cannot ship a secret-holding chain-MAC closure over TCP, so the
-   cross-frame keyed log-MAC chain (ADR 0045) is absent; per-record DARE-GCM (Slice 2, layered by
-   make-encrypted-store OVER this opaque proxy) still authenticates each record. Slice 1 connects on
-   open with no reconnect (a lost server surfaces as MICROSERVICE-STORE-ERROR; recovery is Slice 3)."
+   The :sync slot is NIL (memory-tier parity — group-commit sync is a local-store concern). The
+   :set-chain-mac-fn slot is LIVE (Slice 3b, ADR 0050 §4.3): the encrypted-store decorator installs its
+   log-MAC oracle into THIS client-side store, arming the client-side v3 chain-MAC over the remote tier —
+   a malicious server that DROPS / REORDERS / TAMPERS sealed frames is detected fail-closed on open
+   (file/SQLite parity). The 32-byte MAC + chain_seq are FOLDED into the OPAQUE payload, so the server +
+   wire protocol are UNCHANGED (the server stores a slightly-longer opaque blob it never parses). A BARE
+   microservice-store (no encrypted-store to install the oracle) leaves the chain uninstalled — memory
+   parity, Slice 1 round-trip unchanged. Slice 1 connects on open with no reconnect (a lost server
+   surfaces as MICROSERVICE-STORE-ERROR; recovery is Slice 3c)."
   (let ((lock (dds.pal:make-lock "dds-durability-microservice"))
         (conn-cell (list nil))
         (host* (or host "127.0.0.1"))
-        (port* port))
+        (port* port)
+        ;; client-side remote-tier chain-MAC state (Slice 3b, ADR 0045/0050 §4.3), installed by the
+        ;; encrypted decorator via :set-chain-mac-fn; NIL oracle ⇒ chain absent (bare store, memory parity).
+        (chain-mac-fn nil)                              ; the log-MAC oracle (data)->HMAC, or NIL
+        (chain-macs   (make-hash-table :test #'equal))  ; topic-hash -> running tail chain MAC (32 octets)
+        (chain-seqs   (make-hash-table :test #'equal))  ; topic-hash -> next monotonic chain_seq (u64)
+        ;; per-topic (guid . sn) set of records already put this session (rebuilt on open/get-range from the
+        ;; server's authoritative records) — the microservice analogue of the file store's in-memory index:
+        ;; an idempotent re-put must NOT advance the chain (else a later put false-rejects on re-verify).
+        (put-index    (make-hash-table :test #'equal)))
     (unless port*
       (error 'microservice-store-error :detail "make-microservice-store requires :port"))
     (%make-durable-store
      :name name
      :put (lambda (topic writer-guid sn key-hash kind payload)
-            (%ms-call conn-cell lock +ms-op-put+
-                      (lambda () (%ms-encode-put topic writer-guid sn key-hash kind payload))
-                      (lambda (r)
-                        (let ((res (%rd-u8 r)))
-                          (cond ((= res +ms-result-t+) t)
-                                ((= res +ms-result-rejected+) :rejected)
-                                (t (error 'microservice-store-error :detail "bad put result")))))))
+            (if chain-mac-fn
+                ;; chained tier: compute the v3 MAC client-side over the UNWRAPPED sealed frame, FOLD
+                ;; mac ∥ chain_seq into the opaque payload, ship the (format-unchanged) put, advance the
+                ;; running MAC + chain_seq. Idempotent re-put (index hit) = no chain advance (file parity);
+                ;; the shared cells thread state build->decode, both running under one %ms-call lock.
+                (let ((reput nil) (new-mac nil) (new-seq 0) (kkey nil) (idx nil))
+                  (%ms-call conn-cell lock +ms-op-put+
+                            (lambda ()
+                              (setf idx (or (gethash topic put-index)
+                                            (setf (gethash topic put-index) (make-hash-table :test #'equal))))
+                              (setf kkey (cons (coerce writer-guid 'list) sn))
+                              (if (gethash kkey idx)
+                                  (progn (setf reput t)
+                                         (%ms-encode-put topic writer-guid sn key-hash kind payload))
+                                  (let* ((prev (or (gethash topic chain-macs) (%chain-seed chain-mac-fn topic)))
+                                         (seq  (the (integer 0) (gethash topic chain-seqs 0)))
+                                         (rec  (make-durable-record :topic topic :writer-guid writer-guid :sn sn
+                                                                    :key-hash key-hash :kind kind :payload payload))
+                                         (mac  (nth-value 1 (%frame-record-versioned
+                                                             rec +frame-version-v3+ prev chain-mac-fn))))
+                                    (setf new-mac mac new-seq seq)
+                                    (%ms-encode-put topic writer-guid sn key-hash kind
+                                                    (%ms-fold-payload
+                                                     payload (the (simple-array (unsigned-byte 8) (*)) mac) seq)))))
+                            (lambda (r)
+                              (let ((res (%rd-u8 r)))
+                                (cond ((= res +ms-result-t+)
+                                       (unless reput
+                                         (setf (gethash topic chain-macs) new-mac)
+                                         (setf (gethash topic chain-seqs) (1+ new-seq))
+                                         (setf (gethash kkey idx) t))
+                                       t)
+                                      ((= res +ms-result-rejected+) :rejected)
+                                      (t (error 'microservice-store-error :detail "bad put result")))))))
+                ;; bare tier: no oracle installed ⇒ no chain (memory parity, Slice 1 unchanged).
+                (%ms-call conn-cell lock +ms-op-put+
+                          (lambda () (%ms-encode-put topic writer-guid sn key-hash kind payload))
+                          (lambda (r)
+                            (let ((res (%rd-u8 r)))
+                              (cond ((= res +ms-result-t+) t)
+                                    ((= res +ms-result-rejected+) :rejected)
+                                    (t (error 'microservice-store-error :detail "bad put result"))))))))
      :get-range (lambda (topic)
-                  (%ms-call conn-cell lock +ms-op-get-range+
-                            (lambda () (%ms-encode-topic topic))
-                            (lambda (r) (%ms-decode-records r topic))))
-     :topics (lambda ()
-               (%ms-call conn-cell lock +ms-op-topics+
-                         (lambda () (%ms-empty-payload))
-                         (lambda (r) (%ms-decode-topics r))))
+                  (if chain-mac-fn
+                      (%ms-get-range-verified conn-cell lock topic chain-mac-fn chain-macs chain-seqs put-index)
+                      (%ms-call conn-cell lock +ms-op-get-range+
+                                (lambda () (%ms-encode-topic topic))
+                                (lambda (r) (%ms-decode-records r topic)))))
+     :topics (lambda () (%ms-topics-list conn-cell lock))
      :purge (lambda (topic)
               (%ms-call conn-cell lock +ms-op-purge+
                         (lambda () (%ms-encode-topic topic))
                         (lambda (r) (%rd-u8 r) t)))
      :open (lambda (history-kind history-depth)
-             (%ms-open conn-cell lock host* port* history-kind history-depth))
+             (%ms-open conn-cell lock host* port* history-kind history-depth)
+             ;; fail-closed-on-OPEN parity (file/SQLite verify EVERY topic at store-open, before any read):
+             ;; with the oracle installed (the decorator installs it BEFORE store-open), get-range-verify
+             ;; each topic — a dropped/reordered/tampered chain FAILS THE OPEN loudly. A WHOLE dropped topic
+             ;; is unverified (documented residual — the topic-granularity tail-truncation; ADR 0050 §4.3).
+             (when chain-mac-fn
+               (dolist (tp (%ms-topics-list conn-cell lock))
+                 (%ms-get-range-verified conn-cell lock tp chain-mac-fn chain-macs chain-seqs put-index)))
+             t)
      :close (lambda () (%ms-close conn-cell lock))
      :count-fn (lambda (topic)
                  (%ms-call conn-cell lock +ms-op-count+
                            (lambda () (%ms-encode-count topic))
                            (lambda (r) (%rd-u64 r))))
-     ;; :sync and :set-chain-mac-fn LEFT NIL — memory-tier parity (see the docstring).
+     ;; :sync LEFT NIL — memory-tier parity (group-commit sync is a local-store concern).
+     ;; :set-chain-mac-fn LIVE (Slice 3b, ADR 0045/0050 §4.3): the decorator installs the log-MAC oracle
+     ;; client-side BEFORE it drives store-open, arming the remote-tier chain (compute+fold on put,
+     ;; strip+verify on get-range/open). Filling the EXISTING slot — no vtable change. REQUIRED /
+     ;; GRANDFATHER are accepted for contract parity but not separately enforced: every chained record is
+     ;; folded (≥ suffix bytes), so the strip+verify already fails-closed on any unfolded/tampered record
+     ;; (subsuming the downgrade check); there is no legacy-unfolded migration path at this tier.
+     :set-chain-mac-fn
+     (lambda (fn required grandfather)
+       (declare (ignore required grandfather))
+       (dds.pal:with-lock (lock)
+         (setf chain-mac-fn fn)
+         (clrhash chain-macs)
+         (clrhash chain-seqs)
+         (clrhash put-index))
+       t)
      :delete (lambda (topic writer-guid sn)
                (%ms-call conn-cell lock +ms-op-delete+
                          (lambda () (%ms-encode-delete topic writer-guid sn))
@@ -492,6 +565,122 @@
     (let ((ts '()))
       (dotimes (i count) (push (%rd-string r) ts))
       (nreverse ts))))
+
+;;; ---- client-side remote-tier chain-MAC (Slice 3b, ADR 0050 §4.3; ADR 0045 log-MAC chain) ----
+;;; A malicious/compromised REMOTE server that silently DROPS / REORDERS / TAMPERS sealed frames is
+;;; DETECTED (fail-closed on open) — reaching file/SQLite tamper-evidence parity — WITHOUT any server or
+;;; protocol change. The encrypted-store decorator installs its log-MAC oracle into THIS client-side store
+;;; (store-set-chain-mac-fn); only the 32-byte MAC OUTPUT ever ships. The v3 chain MAC is computed
+;;; client-side over the UNWRAPPED sealed frame (the REUSED ADR-0045 %frame-record-versioned) and FOLDED
+;;; into the OPAQUE payload — sealed' = sealed ∥ mac(+frame-mac-len+) ∥ chain_seq(u64 LE) — so the DARE-blind
+;;; server stores/returns a slightly-longer opaque blob it never parses. get-range STRIPS the suffix
+;;; (bounds-checked) + VERIFIES the chain (a near-verbatim port of %sqlite-verify-topic); open verifies
+;;; EVERY topic before any read (fail-closed-on-open parity). chain_seq is MANDATORY: the server sorts
+;;; get-range by (guid,sn) (%record-guid-sn<) ≠ append/chain order, so the client assigns chain_seq
+;;; monotonically per topic-hash on put and re-sorts by it to re-verify (same reason SQLite needs an
+;;; explicit chain_seq column). RESIDUAL (documented, ADR 0050 §4.3 / ADR 0045 §7, the SAME as file/SQLite,
+;;; deferred to the sealed high-water anchor — NOT built here): TAIL-TRUNCATION of a valid prefix (a shorter
+;;; chain is itself valid) and — the topic-granularity version — WHOLE-TOPIC-DROP (a server omitting a topic
+;;; from store-topics is never verified). The chain engages ONLY under the encrypted-store (which installs
+;;; the oracle); a bare microservice-store leaves the oracle uninstalled (memory-parity, Slice 1 unchanged).
+
+(defun* %ms-fold-payload (sealed mac chain-seq)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)) (integer 0))
+              (simple-array (unsigned-byte 8) (*)))
+  "Fold the client-computed v3 chain MAC (+frame-mac-len+ bytes) and CHAIN-SEQ (u64 LE) onto SEALED,
+   producing sealed' = sealed ∥ mac ∥ chain_seq — the OPAQUE payload the DARE-blind server stores blindly
+   (server + wire protocol UNCHANGED; the MAC/chain_seq ride INSIDE the payload the server never parses)."
+  (let* ((sl  (length sealed))
+         (out (make-array (+ sl +frame-mac-len+ 8) :element-type '(unsigned-byte 8))))
+    (replace out sealed :end1 sl)
+    (replace out mac :start1 sl :end1 (+ sl +frame-mac-len+))
+    (%put-u64-le out (+ sl +frame-mac-len+) chain-seq)
+    out))
+
+(defun* %ms-unfold-payload (folded)
+    (function ((simple-array (unsigned-byte 8) (*)))
+              (values (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)) (integer 0)))
+  "Strip the folded suffix from FOLDED = sealed ∥ mac(+frame-mac-len+) ∥ chain_seq(u64 LE): return
+   (values sealed mac chain_seq). BOUNDS-CHECKED (operating contract §4, NFR-SEC-POSTURE): a malicious
+   server returning a payload SHORTER than the mac+chain_seq suffix signals MICROSERVICE-PROTOCOL-ERROR (a
+   clean fail-closed), never an out-of-bounds access."
+  (let ((n (length folded))
+        (suffix (+ +frame-mac-len+ 8)))
+    (when (< n suffix)
+      (error 'microservice-protocol-error
+             :detail "folded record payload shorter than the mac+chain_seq suffix (malformed/tampered)"))
+    (let* ((sl     (- n suffix))
+           (sealed (make-array sl :element-type '(unsigned-byte 8)))
+           (mac    (make-array +frame-mac-len+ :element-type '(unsigned-byte 8))))
+      (replace sealed folded :end2 sl)
+      (replace mac folded :start2 sl :end2 (+ sl +frame-mac-len+))
+      (values sealed mac (%get-u64-le folded (+ sl +frame-mac-len+))))))
+
+(defun* %ms-verify-chain (topic fn tuples chain-macs chain-seqs put-index)
+    (function (string function list hash-table hash-table hash-table) t)
+  "Verify TUPLES (each (clean-record stored-mac chain_seq)) as TOPIC's v3 chain in chain_seq order — a
+   near-verbatim port of %sqlite-verify-topic: re-seed via %chain-seed, recompute each expected MAC via the
+   REUSED %frame-record-versioned over the CLEAN record (payload=sealed, the frame the put MAC'd), and
+   equalp-compare to the stored (folded) mac. ANY interior DROP / REORDER / TAMPER breaks the running MAC →
+   a loud error (fail-closed, = file/SQLite parity). On success seeds chain-macs[TOPIC]=tail-mac +
+   chain-seqs[TOPIC]=max chain_seq + 1 (so a continued put chains correctly across a reopen) and rebuilds
+   put-index[TOPIC] from the server's authoritative (guid,sn) keys (the microservice analogue of the file
+   store rebuilding its in-memory index on replay — needed for idempotent re-put detection)."
+  (let ((sorted  (sort (copy-list tuples) #'< :key #'third))
+        (running (%chain-seed fn topic))
+        (tail    nil)
+        (maxseq  -1)
+        (idx     (make-hash-table :test #'equal)))
+    (dolist (tp sorted)
+      (destructuring-bind (rec stored cseq) tp
+        (let ((expected (nth-value 1 (%frame-record-versioned rec +frame-version-v3+ running fn))))
+          (unless (equalp expected stored)
+            (error "dds.durability: microservice chain MAC mismatch in topic ~a — a remote server ~
+                    dropped/reordered/tampered a sealed frame (refusing to open; ADR 0045/0050 §4.3)" topic))
+          (setf running expected tail expected)
+          (when (> cseq maxseq) (setf maxseq cseq))
+          (setf (gethash (cons (coerce (durable-record-writer-guid rec) 'list)
+                               (durable-record-sn rec)) idx) t))))
+    (setf (gethash topic put-index) idx)
+    (when tail
+      (setf (gethash topic chain-macs) tail)
+      (setf (gethash topic chain-seqs) (1+ maxseq)))
+    t))
+
+(defun* %ms-decode-strip-verify (r topic fn chain-macs chain-seqs put-index)
+    (function (ms-reader string function hash-table hash-table hash-table) list)
+  "Decode a get-range response, STRIP the folded (mac ∥ chain_seq) suffix from every record's payload
+   (bounds-checked via %ms-unfold-payload — a <suffix-length payload from a malicious server fails
+   cleanly), VERIFY the per-topic v3 chain (fail-closed), and return the CLEAN (payload=sealed) records
+   (guid,sn)-sorted so the decorator sees only sealed — the mac stripped transparently."
+  (let ((count (%rd-u32 r)))
+    (when (> count (- (ms-reader-end r) (ms-reader-pos r)))
+      (error 'microservice-protocol-error :detail "record count exceeds buffer extent"))
+    (let ((tuples '()))
+      (dotimes (i count)
+        (let ((raw (%rd-frame r topic)))
+          (multiple-value-bind (sealed mac cseq) (%ms-unfold-payload (durable-record-payload raw))
+            (push (list (make-durable-record :topic topic :writer-guid (durable-record-writer-guid raw)
+                                             :sn (durable-record-sn raw) :key-hash (durable-record-key-hash raw)
+                                             :kind (durable-record-kind raw) :payload sealed)
+                        mac cseq)
+                  tuples))))
+      (%ms-verify-chain topic fn tuples chain-macs chain-seqs put-index)
+      (sort (mapcar #'first tuples) #'%record-guid-sn<))))
+
+(defun* %ms-topics-list (conn-cell lock)
+    (function (cons t) list)
+  "The server's non-empty topic list (the shared body of the :topics slot + the open verify pass)."
+  (%ms-call conn-cell lock +ms-op-topics+ (lambda () (%ms-empty-payload)) (lambda (r) (%ms-decode-topics r))))
+
+(defun* %ms-get-range-verified (conn-cell lock topic fn chain-macs chain-seqs put-index)
+    (function (cons t string function hash-table hash-table hash-table) list)
+  "Chained store-get-range: fetch TOPIC's records over the connection, strip the folded mac/chain_seq, and
+   VERIFY the v3 chain (fail-closed), returning the clean (guid,sn)-ordered records. The shared body of the
+   chained :get-range slot + the open verify pass (DRY)."
+  (%ms-call conn-cell lock +ms-op-get-range+
+            (lambda () (%ms-encode-topic topic))
+            (lambda (r) (%ms-decode-strip-verify r topic fn chain-macs chain-seqs put-index))))
 
 ;;; ---- reference server (opaque inner-store proxy) ----
 
@@ -677,9 +866,15 @@
    anchor, and k_meta ALL live in the LOCAL EPOCH-DIR / KEY-DIR, and make-encrypted-store SEALS every
    record before it reaches the wire — so the remote microservice server stores ONLY opaque ciphertext
    (a hex topic-hash, a 16-byte GUID surrogate, sn=0, and the sealed blob), NEVER a plaintext
-   topic/GUID/SN/key-hash/payload or any key. The cross-frame keyed chain-MAC (ADR 0045) is ABSENT at the
-   microservice tier (make-microservice-store leaves :set-chain-mac-fn NIL — MEMORY-TIER PARITY: a
-   secret-holding chain oracle cannot ship over TCP); per-record DARE-GCM still authenticates each frame.
+   topic/GUID/SN/key-hash/payload or any key. The cross-frame keyed chain-MAC (ADR 0045) IS PRESENT at the
+   microservice tier (Slice 3b): the encrypted-store installs its HMAC oracle into the CLIENT-SIDE
+   microservice-store (only the 32-byte MAC output ships, never the oracle/key), each put computes the v3
+   MAC client-side and folds mac ∥ chain_seq into the opaque payload, and store-open re-verifies every
+   topic's chain FAIL-CLOSED — DETECTING a malicious remote server's frame DROP / REORDER / TAMPER
+   (file/SQLite tamper-evidence parity; residual = tail-truncation + whole-topic-drop, the deferred
+   ADR 0045 §7 sealed-anchor gap). Per-record DARE-GCM additionally authenticates each frame. A pre-Slice-3b
+   microservice store (un-folded records) has NO legacy migration path — the fold is unversioned, so a
+   3b reopen would strip 40 real bytes and false-reject; re-create the store under 3b (the backend is new).
    HISTORY-POLICY OWNERSHIP + a KNOWN LIMITATION (ADR 0050 §4.2, Slice 3a). Unlike the sqlite/file
    siblings the inner tier's HISTORY policy is NOT a construction argument here — and, since the Slice-3a
    server-owned-lifecycle refactor, it is NOT forwarded from the client either: the inner's retention is

@@ -3991,6 +3991,7 @@
                  ("durability-microservice-dare"      . run-durability-microservice-dare-test)
                  ("durability-microservice-cross-restart" . run-durability-microservice-cross-restart-test)
                  ("durability-microservice-dare-cross-restart" . run-durability-microservice-dare-cross-restart-test)
+                 ("durability-microservice-remote-chain" . run-durability-microservice-remote-chain-test)
                  ("durability-microservice-lifecycle" . run-durability-microservice-lifecycle-test)
                  ("durability-microservice-config-env" . run-durability-microservice-config-env-test)
                  ("security-secured-payload"     . run-security-secured-payload-corpus-test)
