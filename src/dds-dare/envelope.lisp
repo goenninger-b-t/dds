@@ -111,6 +111,45 @@
                      32
                      t))
 
+(defconstant +epochs-info-str+
+  (if (boundp '+epochs-info-str+) (symbol-value '+epochs-info-str+) "dds-dare/epochs/v1")
+  "HKDF-SHA384 info label for the durability epochs.dat MAC-key derivation (ASCII, pinned; change =
+   new format version). Distinct domain separator from +dek-info-str+, +logmac-info-str+ AND
+   +metakey-info-str+ so the epochs-MAC key is cryptographically independent of every DEK, the log-MAC
+   key and k_meta (ADR 0045 §7.2). Same reload-safe boundp guard as +dek-info-str+ (DEFCONSTANT-UNEQL —
+   strings are not self-eql — identical SBCL/Clasp).")
+
+(defvar *epochs-info-octets* nil
+  "Cached octet vector for +epochs-info-str+, built lazily on first use.")
+
+(defun* %epochs-info ()
+    (function () (simple-array (unsigned-byte 8) (*)))
+  "Return (and cache) the HKDF info octet vector for epochs-MAC-key derivation."
+  (or *epochs-info-octets*
+      (setf *epochs-info-octets* (%ascii +epochs-info-str+))))
+
+(defun* derive-epochs-mac-key (shared-secret)
+    (function ((simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "Derive a 32-byte durability epochs.dat MAC (HMAC-SHA-256) key from a cross-restart-STABLE ML-KEM
+   shared secret via HKDF-SHA384 (ADR 0045 §7.2). Computes
+   HKDF(SHA-384, ikm=SHARED-SECRET, salt=∅, info=ASCII(+epochs-info-str+), L=32).
+   The THIRD sibling off the SAME anchor shared secret as the log-MAC key (DERIVE-LOG-MAC-KEY) and
+   k_meta (DERIVE-META-KEY), with a distinct info label so it is cryptographically independent of the
+   DEK, the log-MAC key and k_meta. It CANNOT derive from any per-epoch DEK — the DEKs ARE the contents
+   of epochs.dat (circular) — so it is minted/loaded from the anchor secret, available whenever there
+   are epochs to verify. The stable secret is obtained by decapsulating the persisted anchor ciphertext
+   — ML-KEM decapsulation is deterministic in (private-key, ciphertext) (FIPS-203), so a fixed anchor
+   yields the same key on every restart while the key stays secret (only the private key decapsulates
+   it). The key is a foreign-backed secret buffer (static-vector, design spec §6) that never transits a
+   GC-heap array; the caller (the encrypted-store) holds it for the store lifetime and MUST release it
+   with FREE-SECRET-OCTETS on close."
+  (%hkdf-sha384-into shared-secret
+                     (make-array 0 :element-type '(unsigned-byte 8))
+                     (%epochs-info)
+                     32
+                     t))
+
 (defun* derive-dek (shared-secret)
     (function ((simple-array (unsigned-byte 8) (*)))
               (simple-array (unsigned-byte 8) (*)))

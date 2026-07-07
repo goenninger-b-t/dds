@@ -115,6 +115,14 @@
   "ASCII octets of the sealed high-water tail-anchor MAC domain label — a FRESH domain separator,
    distinct from the grandfather-set label, so the tail MAC is cryptographically independent (ADR 0045 §7.1).")
 
+(defconstant +epochs-mac-version+ #x01
+  "Version byte of the DIR/epochs.mac sealed epochs.dat MAC file (ADR 0045 §7.2).")
+
+(defparameter %logmac-epochs-label
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code "dds-dare/logmac/epochs/v1")
+  "ASCII octets of the sealed epochs.dat MAC domain label — a FRESH domain separator, distinct from the
+   grandfather-set and tail-anchor labels, so the epochs MAC is cryptographically independent (ADR 0045 §7.2).")
+
 (defun* %logmac-anchor-path (dir)
     (function (pathname) pathname)
   "Return the logmac.anchor pathname within the encrypted-store epoch directory DIR."
@@ -126,6 +134,13 @@
    SEPARATE file from the write-once logmac.anchor — the tail anchor is MUTABLE (re-sealed every clean
    close), so it must never share the crash-safe write-once anchor file (ADR 0045 §7.1)."
   (uiop:merge-pathnames* "logmac.tail" (uiop:ensure-directory-pathname dir)))
+
+(defun* %epochs-mac-path (dir)
+    (function (pathname) pathname)
+  "Return the epochs.mac sealed epochs.dat-MAC pathname within the epoch directory DIR. A SEPARATE,
+   MUTABLE file (re-sealed every clean close), never shared with the write-once logmac.anchor; mirrors
+   %logmac-tail-path (ADR 0045 §7.2)."
+  (uiop:merge-pathnames* "epochs.mac" (uiop:ensure-directory-pathname dir)))
 
 (defun* %topic-id-octets (id)
     (function (string) (simple-array (unsigned-byte 8) (*)))
@@ -287,53 +302,70 @@
 
 (defun* %mint-logmac-anchor (key-provider dir grandfather-ids)
     (function (dds.dare:key-provider pathname list)
-              (values (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))))
+              (values (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))
+                      (simple-array (unsigned-byte 8) (*))))
   "Mint the log-MAC anchor ONCE (first v3 put): encapsulate to the recipient key, derive the log-MAC
-   key AND the at-rest metadata key k_meta (siblings from the SAME shared secret, distinct info labels;
-   ADR 0045 §4.3 / ADR 0025 §10 3c), authenticate GRANDFATHER-IDS (pre-existing legacy topic-ids,
-   exempt from the downgrade check) under the log-MAC key, and persist (kem-ct + set + MAC). Returns
-   (values logmac-key meta-key) — both foreign secrets the caller frees on close. Written once, never
-   updated ⇒ crash-safe, no migration burst (ADR 0045 §3.2). The anchor kem-ct decapsulates
-   deterministically on every restart, so k_meta is cross-restart-stable (ADR 0025 §10 3c)."
+   key, the at-rest metadata key k_meta AND the epochs.dat MAC key k_epochs (THREE siblings from the SAME
+   shared secret, distinct info labels; ADR 0045 §4.3 / §7.2 / ADR 0025 §10 3c), authenticate
+   GRANDFATHER-IDS (pre-existing legacy topic-ids, exempt from the downgrade check) under the log-MAC key,
+   and persist (kem-ct + set + MAC). Returns (values logmac-key meta-key epochs-mac-key) — all three
+   foreign secrets the caller frees on close. Written once, never updated ⇒ crash-safe, no migration burst
+   (ADR 0045 §3.2). The anchor kem-ct decapsulates deterministically on every restart, so all three keys
+   are cross-restart-stable (ADR 0025 §10 3c / ADR 0045 §7.2). k_epochs derives from the anchor secret,
+   NOT any per-epoch DEK — the DEKs are the CONTENTS of epochs.dat (circular)."
   (let ((pub (dds.dare:key-provider-recipient-public-key key-provider)))
     (multiple-value-bind (kem-ct ss) (dds.dare:ml-kem-1024-encapsulate pub)
-      (multiple-value-bind (key mkey)
+      (multiple-value-bind (key mkey ekey)
           (unwind-protect
-               (values (dds.dare:derive-log-mac-key ss) (dds.dare:derive-meta-key ss))
+               (values (dds.dare:derive-log-mac-key ss) (dds.dare:derive-meta-key ss)
+                       (dds.dare:derive-epochs-mac-key ss))
             (dds.dare:free-secret-octets ss))
         (let* ((signed (%assemble-anchor-signed kem-ct grandfather-ids))
                (gf-mac (%compute-gf-mac key signed)))
           (%write-logmac-anchor dir signed gf-mac))
-        (values key mkey)))))
+        (values key mkey ekey)))))
 
 (defun* %load-logmac-anchor (key-provider dir)
     (function (dds.dare:key-provider pathname)
-              (values (simple-array (unsigned-byte 8) (*)) list (simple-array (unsigned-byte 8) (*))))
+              (values (simple-array (unsigned-byte 8) (*)) list (simple-array (unsigned-byte 8) (*))
+                      (simple-array (unsigned-byte 8) (*))))
   "Load an EXISTING anchor: decapsulate the kem-ct (deterministic ⇒ cross-restart-stable), derive the
-   log-MAC key AND the at-rest metadata key k_meta (siblings from the SAME shared secret; ADR 0045
-   §4.3 / ADR 0025 §10 3c), and VERIFY the grandfather-set MAC under the log-MAC key — a mismatch
-   SIGNALS (a disk adversary cannot forge/extend the exempt set; ADR 0045 §3.2). Returns
-   (values logmac-key grandfather-ids meta-key); both keys are foreign secrets the caller frees."
+   log-MAC key, the at-rest metadata key k_meta AND the epochs.dat MAC key k_epochs (THREE siblings from
+   the SAME shared secret; ADR 0045 §4.3 / §7.2 / ADR 0025 §10 3c), and VERIFY the grandfather-set MAC
+   under the log-MAC key — a mismatch SIGNALS (a disk adversary cannot forge/extend the exempt set;
+   ADR 0045 §3.2) AND frees all three keys first (no secret leak). Returns
+   (values logmac-key grandfather-ids meta-key epochs-mac-key); all three keys are foreign secrets the
+   caller frees. k_epochs derives from the anchor secret, NOT any per-epoch DEK (the DEKs are the
+   contents of epochs.dat — circular; ADR 0045 §7.2)."
   (multiple-value-bind (kem-ct gf-ids gf-mac signed) (%read-logmac-anchor dir)
     (unless kem-ct
       (error "dds.durability: log-MAC anchor missing in ~a" dir))
     (let ((ss (dds.dare:key-provider-decapsulate key-provider kem-ct)))
-      (multiple-value-bind (key mkey)
+      (multiple-value-bind (key mkey ekey)
           (unwind-protect
-               (values (dds.dare:derive-log-mac-key ss) (dds.dare:derive-meta-key ss))
+               (values (dds.dare:derive-log-mac-key ss) (dds.dare:derive-meta-key ss)
+                       (dds.dare:derive-epochs-mac-key ss))
             (dds.dare:free-secret-octets ss))
         (unless (equalp (%compute-gf-mac key signed) gf-mac)
           (dds.dare:free-secret-octets key)
           (dds.dare:free-secret-octets mkey)
+          (dds.dare:free-secret-octets ekey)
           (error "dds.durability: log-MAC anchor grandfather-set MAC mismatch in ~a ~
                   (tamper — refusing to open; ADR 0045 §3.2)" dir))
-        (values key gf-ids mkey)))))
+        (values key gf-ids mkey ekey)))))
 
 (defun* %derive-logmac-key (key-provider dir)
     (function (dds.dare:key-provider pathname) (simple-array (unsigned-byte 8) (*)))
   "Derive the cross-restart-stable log-MAC key from DIR's EXISTING anchor — a thin wrapper over
-   %LOAD-LOGMAC-ANCHOR returning just the key (used by tests). Caller frees it (ADR 0045 §4.3)."
-  (values (%load-logmac-anchor key-provider dir)))
+   %LOAD-LOGMAC-ANCHOR returning just the key (used by tests). %LOAD-LOGMAC-ANCHOR derives THREE sibling
+   keys from the same anchor secret (log-MAC key, k_meta, k_epochs; ADR 0045 §4.3 / §7.2 / ADR 0025 §10 3c),
+   so the two siblings unused here are zeroized+freed before returning (no secret leak — a value-truncating
+   call would derive-then-drop 64 bytes of live key material). Caller frees the returned key (ADR 0045 §4.3)."
+  (multiple-value-bind (key gf-ids mkey ekey) (%load-logmac-anchor key-provider dir)
+    (declare (ignore gf-ids))
+    (dds.dare:free-secret-octets mkey)
+    (dds.dare:free-secret-octets ekey)
+    key))
 
 (defun* %install-logmac-oracle (inner-store logmac-key grandfather-ids)
     (function (durable-store (simple-array (unsigned-byte 8) (*)) list) t)
@@ -371,6 +403,15 @@
    skipped, an authorized reclaim-shrink + a crash (skip-seal) leaves the STALE anchor (an older, larger N)
    over a shrunk log ⇒ the next open FALSE-REJECTS (:truncated, bricks). With it on (default) the same
    sequence reopens clean. Mirrors *durability-debug-skip-tail-seal*. Never set in production code.")
+
+(defparameter *durability-debug-skip-epochs-seal* nil
+  "Test-only fault injector (ADR 0045 §7.2 forward crash-append). NIL (default) ⇒ inert; byte-identical
+   behavior. When non-NIL, the encrypted-store :close SKIPS re-sealing the epochs.dat MAC (D/epochs.mac) —
+   simulating a CRASH after a fresh epoch was appended (fsynced) to epochs.dat but BEFORE epochs.mac was
+   re-sealed, leaving epochs.mac STALE at the pre-append count N while epochs.dat holds N+1 entries. The
+   next open must then accept the extra entry as a forward extension (prefix-containment, no false-reject)
+   — this flag exercises exactly that no-false-reject path; a strict whole-table-equality check would BRICK
+   here. Mirrors *durability-debug-skip-tail-seal*. Never set in production code.")
 
 (defun* %assemble-tail-signed (tails)
     (function (hash-table) (simple-array (unsigned-byte 8) (*)))
@@ -640,6 +681,137 @@
            (setf ok t)
            max-id)
       (unless ok (%free-epoch-dek-map dek-map)))))
+
+;;; --- sealed epochs.dat MAC (ADR 0045 §7.2): a keyed MAC over the DARE per-epoch KEM-ciphertext table
+;;; that closes the epochs.dat tamper/rollback/reorder hole (an offline disk adversary can flip a stored
+;;; kem-ct AND recompute its per-entry CRC — CRC is unkeyed — so the entry-CRC-only path misses it). The
+;;; MAC key (k_epochs) is the THIRD anchor sibling (derive-epochs-mac-key), NOT any per-epoch DEK (the
+;;; DEKs ARE the contents of epochs.dat — circular). Committed at CLEAN CLOSE to a SEPARATE, MUTABLE file
+;;; DIR/epochs.mac, verified at OPEN by prefix-containment (forward-tolerant — a 1-ahead crash-append
+;;; reopens CLEAN). UNLIKE the tail anchor there is NO invalidate-at-open: epochs.dat is append-only and
+;;; NEVER authorized-shrinks, so the only at-open divergence is a forward crash-append (accepted CLEAN).
+;;; Format:  version(1)=#x01 ∥ count(4 LE) ∥ [%frame-epoch-entry]* ∥ mac(32) ∥ crc32(4).
+;;;   mac = HMAC-SHA-256(k_epochs, epochs-label ∥ signed-region), so a raw-disk adversary who tampers
+;;; epochs.dat AND rewrites epochs.mac cannot re-seal it (no key).
+
+(defun* %assemble-epochs-signed (sorted-entries)
+    (function (list) (simple-array (unsigned-byte 8) (*)))
+  "Serialize the epoch table SORTED-ENTRIES (a list of (epoch-id . kem-ct) sorted by epoch-id ASCENDING)
+   into the epochs.mac SIGNED region: version(1)=+epochs-mac-version+ ∥ count(4 LE) ∥ [%frame-epoch-entry]*
+   — each entry byte-IDENTICAL to its on-disk epochs.dat image (epoch-id ∥ ctlen ∥ ct ∥ crc), reusing
+   %frame-epoch-entry so seal and verify produce the SAME canonical bytes (ADR 0045 §7.2). Deterministic:
+   sorting by epoch-id makes the image independent of physical append order."
+  (let* ((framed (mapcar (lambda (e)
+                           (%frame-epoch-entry (the (unsigned-byte 32) (car e))
+                                               (the (simple-array (unsigned-byte 8) (*)) (cdr e))))
+                         sorted-entries))
+         (body   (loop for f in framed sum (length f)))
+         (buf    (make-array (+ 5 body) :element-type '(unsigned-byte 8))))
+    (setf (aref buf 0) +epochs-mac-version+)
+    (%put-u32-le buf 1 (the (unsigned-byte 32) (length sorted-entries)))
+    (let ((off 5))
+      (dolist (f framed)
+        (replace buf f :start1 off :end1 (+ off (length f)))
+        (incf off (length f))))
+    buf))
+
+(defun* %read-epochs-mac (dir)
+    (function (pathname)
+              (values (or null (simple-array (unsigned-byte 8) (*)))
+                      (or null (simple-array (unsigned-byte 8) (*)))))
+  "Read DIR/epochs.mac → (values signed-bytes anchor-mac), or (NIL NIL) if absent. A present-but-corrupt
+   file (bad version/count/length/crc) SIGNALS (fail loud, mirrors %read-logmac-tail). EVERY length and
+   offset is bounds-checked against the buffer BEFORE use (NFR-SEC-POSTURE) — mandatory even at (safety 0)
+   — so a malformed file fails clean, never OOB. The committed count N is %get-u32-le(signed, 1);
+   SIGNED-BYTES is the region the caller re-MACs (ADR 0045 §7.2)."
+  (let ((path (%epochs-mac-path dir)))
+    (unless (probe-file path)
+      (return-from %read-epochs-mac (values nil nil)))
+    (let* ((size (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
+           (buf  (make-array size :element-type '(unsigned-byte 8))))
+      (with-open-file (s path :element-type '(unsigned-byte 8) :direction :input)
+        (read-sequence buf s))
+      (flet ((bad (why) (error "dds.durability: corrupt epochs MAC ~a (~a; ADR 0045 §7.2)" path why)))
+        ;; minimum = version(1) + count(4) + mac(32) + crc(4) = 41 (count may be 0)
+        (when (< size (+ 5 +frame-mac-len+ 4)) (bad "truncated"))
+        (unless (= (aref buf 0) +epochs-mac-version+) (bad "version"))
+        (let ((count (%get-u32-le buf 1))
+              (off   5))
+          (when (> count 1000000) (bad "count"))
+          (dotimes (_ count)
+            ;; need epoch-id(4)+ctlen(4) before reading ctlen; then the full entry
+            (when (> (+ off 8) size) (bad "entry-hdr-oob"))
+            (let ((ctlen (%get-u32-le buf (+ off 4))))
+              (when (> ctlen +epochs-max-ctlen+) (bad "ctlen"))
+              (let ((entry-end (+ off 8 ctlen 4)))
+                (when (> entry-end size) (bad "entry-oob"))
+                (setf off entry-end))))
+          (let* ((mac-off off) (crc-off (+ mac-off +frame-mac-len+)))
+            (when (/= size (+ crc-off 4)) (bad "size"))
+            (let ((stored (%get-u32-le buf crc-off))
+                  (actual (%crc32 buf 0 crc-off)))
+              (unless (= stored actual) (bad "crc")))
+            (let ((anchor-mac (make-array +frame-mac-len+ :element-type '(unsigned-byte 8)))
+                  (signed     (make-array mac-off :element-type '(unsigned-byte 8))))
+              (replace anchor-mac buf :start2 mac-off :end2 crc-off)
+              (replace signed buf :start2 0 :end2 mac-off)
+              (values signed anchor-mac))))))))
+
+(defun* %epoch-table->sorted (table)
+    (function (hash-table) list)
+  "Collect epoch TABLE (epoch-id -> kem-ct) into a fresh list of (epoch-id . kem-ct) sorted by epoch-id
+   ASCENDING — the canonical order both %seal-epochs-mac and %verify-epochs-mac feed to
+   %assemble-epochs-signed (ADR 0045 §7.2)."
+  (sort (loop for id being the hash-keys of table using (hash-value ct)
+              collect (cons id ct))
+        #'< :key #'car))
+
+(defun* %seal-epochs-mac (dir epochs-mac-key)
+    (function (pathname (simple-array (unsigned-byte 8) (*))) t)
+  "Seal DIR/epochs.mac at CLEAN CLOSE (ADR 0045 §7.2): re-read the epoch table (close is not hot-path),
+   assemble the canonical signed image over ALL present entries (sorted ascending), HMAC it under
+   EPOCHS-MAC-KEY (epochs-label ∥ region, mirroring %seal-tail-anchor), and persist (signed ∥ mac ∥ CRC,
+   fsynced) via the shared %write-anchor-file. An empty table seals nothing (returns t). Committing the
+   full present count makes an offline ct-tamper / rollback / reorder contradict the sealed image at the
+   next open (prefix-containment)."
+  (let ((table (%load-epoch-table dir)))
+    (when (zerop (hash-table-count table))
+      (return-from %seal-epochs-mac t))
+    (let* ((sorted (%epoch-table->sorted table))
+           (signed (%assemble-epochs-signed sorted))
+           (mac    (%hmac-labeled epochs-mac-key %logmac-epochs-label signed)))
+      (%write-anchor-file (%epochs-mac-path dir) signed mac)))
+  t)
+
+(defun* %verify-epochs-mac (dir epochs-mac-key)
+    (function (pathname (simple-array (unsigned-byte 8) (*))) t)
+  "Verify DIR/epochs.mac at store-open by PREFIX-CONTAINMENT (ADR 0045 §7.2), forward-tolerant. Absent ⇒
+   nothing sealed ⇒ CLEAN (a never-cleanly-closed / legacy-pre-v3 store; mirrors %verify-tail-anchor's
+   absent case). Else re-MAC the stored signed region under EPOCHS-MAC-KEY and fail-LOUD on the .mac's own
+   MAC mismatch (forgery of epochs.mac itself). Then with N = the committed count: a table with FEWER than
+   N entries ⇒ :truncated (rollback / truncation); the first-N entries (ascending) whose canonical image
+   /= the stored signed region ⇒ :diverged (ct-tamper / reorder within the committed prefix); a table with
+   ≥ N whose first-N MATCH ⇒ CLEAN (the extra count-N entries are a forward 1-ahead crash-append — accepted,
+   NOT bricked; a strict whole-table-equality check is REJECTED). Any non-t ⇒ fail-CLOSED (a loud error at
+   open, exactly like %verify-tail-anchor). NO invalidate-at-open: epochs.dat is append-only and never
+   authorized-shrinks, so the only at-open divergence is the forward crash-append."
+  (multiple-value-bind (signed-stored mac-stored) (%read-epochs-mac dir)
+    (unless signed-stored
+      (return-from %verify-epochs-mac t))
+    (unless (equalp (%hmac-labeled epochs-mac-key %logmac-epochs-label signed-stored) mac-stored)
+      (error "dds.durability: epochs.mac MAC mismatch in ~a (tamper — refusing to open; ADR 0045 §7.2)" dir))
+    (let* ((n     (%get-u32-le signed-stored 1))
+           (table (%load-epoch-table dir)))
+      (when (< (hash-table-count table) n)
+        (error "dds.durability: epochs.mac prefix-containment FAILED in ~a (:truncated — fewer epochs than ~
+                sealed, rollback/truncation; refusing to open; ADR 0045 §7.2)" dir))
+      (let* ((sorted     (%epoch-table->sorted table))
+             (prefix     (subseq sorted 0 n))
+             (recomputed (%assemble-epochs-signed prefix)))
+        (unless (equalp recomputed signed-stored)
+          (error "dds.durability: epochs.mac prefix-containment FAILED in ~a (:diverged — ct-tamper/reorder ~
+                  within the committed prefix; refusing to open; ADR 0045 §7.2)" dir))))
+    t))
 
 ;;; --- WP-DURABILITY-METADATA-CONF-3c (ADR 0025 §10 item 3): at-rest metadata sealing ---
 ;;; The v2/epoch decorator seals the record METADATA (topic/GUID/SN/kind/key-hash), not just the
@@ -921,6 +1093,8 @@
          (logmac-key    nil)
          ;; cross-restart-stable at-rest metadata key k_meta (foreign secret, ADR 0025 §10 3c); freed on close
          (meta-key      nil)
+         ;; cross-restart-stable epochs.dat MAC key k_epochs (foreign secret, ADR 0045 §7.2); freed on close
+         (epochs-mac-key nil)
          ;; reverse map topic-hash-string -> real topic name, so store-topics can name this session's
          ;; topics (the plaintext name is off-disk; cross-restart it is unrecoverable — ADR 0025 §10 3c)
          (topic-names   (make-hash-table :test #'equal))
@@ -1068,9 +1242,10 @@
              ;; v3->v2 downgrade. A fresh store has no such logs ⇒ empty set ⇒ full protection (§3.2).
              (unless logmac-key
                (let ((gf-ids (%store-grandfather-ids inner-store epoch-dir)))
-                 (multiple-value-bind (lk mk) (%mint-logmac-anchor key-provider epoch-dir gf-ids)
-                   (setf logmac-key lk)
-                   (setf meta-key   mk))
+                 (multiple-value-bind (lk mk ek) (%mint-logmac-anchor key-provider epoch-dir gf-ids)
+                   (setf logmac-key     lk)
+                   (setf meta-key       mk)
+                   (setf epochs-mac-key ek))
                  (%install-logmac-oracle inner-store logmac-key gf-ids)))
              t))
       (%make-durable-store
@@ -1137,6 +1312,8 @@
            (setf current-dek   nil)
            (setf counter       0)
            (setf logmac-key    (dds.dare:free-secret-octets logmac-key))
+           ;; ADR 0045 §7.2: free k_epochs (idempotent on NIL/foreign); re-derived below if the anchor is present
+           (setf epochs-mac-key (dds.dare:free-secret-octets epochs-mac-key))
            ;; 3c: free k_meta + drop the session name map; capture the effective compaction policy
            ;; (the decorator owns compaction — the inner store is opened KEEP_ALL below).
            (setf meta-key (dds.dare:free-secret-octets meta-key))
@@ -1166,12 +1343,13 @@
            ;; 3c: the inner store is ALWAYS opened KEEP_ALL (it cannot order/interpret the hashed
            ;; surrogates); the decorator applies eff-hk/eff-hd at get-range post-decrypt.
            (if (probe-file (%logmac-anchor-path epoch-dir))
-               (multiple-value-bind (key gf-ids mkey)
+               (multiple-value-bind (key gf-ids mkey ekey)
                    (progn
                      (dds.dare:key-provider-open key-provider)
                      (%load-logmac-anchor key-provider epoch-dir))
-                 (setf logmac-key key)
-                 (setf meta-key   mkey)
+                 (setf logmac-key     key)
+                 (setf meta-key       mkey)
+                 (setf epochs-mac-key ekey)   ; ADR 0045 §7.2: k_epochs for the epochs.dat MAC verify below
                  (%install-logmac-oracle inner-store key gf-ids)
                  ;; sealed high-water tail anchor (ADR 0045 §7.1): VERIFY the at-rest sealed state (detect
                  ;; an OFFLINE truncation / whole-topic drop / rollback) BEFORE store-open, then INVALIDATE
@@ -1188,6 +1366,14 @@
                  (dds.dare:key-provider-open key-provider)))
            ;; re-derive every persisted epoch's DEK; current stays NIL until the first put
            (setf max-epoch-id (%load-epoch-deks key-provider epoch-dir dek-map))
+           ;; sealed epochs.dat MAC (ADR 0045 §7.2): VERIFY the DARE per-epoch kem-ct table by prefix-
+           ;; containment, AFTER %load-epoch-deks has run epochs.dat's torn-tail truncate-recovery so verify
+           ;; composes with it. GUARDED on epochs-mac-key non-NIL: a legacy pre-0045 store (epochs.dat but no
+           ;; anchor) has NIL here ⇒ verify skipped until it goes v3 (mirrors the grandfather exemption).
+           ;; Forward-tolerant (a 1-ahead crash-append reopens CLEAN); NO invalidate (epochs.dat never
+           ;; authorized-shrinks, so there is no reclaim-crash window to cover — simpler than the tail anchor).
+           (when epochs-mac-key
+             (%verify-epochs-mac epoch-dir epochs-mac-key))
            ;; Sliver 3c: after the DEKs + k_meta are resident and the window is fresh, sweep the inner
            ;; store — physically reclaim a prior session's beyond-D leftovers AND seed the window with the
            ;; surviving newest-D so post-restart online eviction is correct (cross-restart == continuously-
@@ -1203,15 +1389,21 @@
            ;; extension is CLEAN); a store that never chained (logmac-key NIL) has no tail to seal.
            (when (and logmac-key (not *durability-debug-skip-tail-seal*))
              (%seal-tail-anchor inner-store epoch-dir logmac-key))
+           ;; sealed epochs.dat MAC (ADR 0045 §7.2): re-seal D/epochs.mac over ALL present epochs BEFORE
+           ;; freeing k_epochs. SEAL-ON-CLOSE only (prefix-containment makes a stale epochs.mac safe on a
+           ;; forward crash-append — CLEAN). A store that never chained (epochs-mac-key NIL) has nothing to seal.
+           (when (and epochs-mac-key (not *durability-debug-skip-epochs-seal*))
+             (%seal-epochs-mac epoch-dir epochs-mac-key))
            ;; free every DEK in the map (the current DEK is held in the map ⇒ freed once); §6
            (%free-epoch-dek-map dek-map)
            (setf current-epoch nil)
            (setf current-dek   nil)
            ;; Sliver 3a: drop the prior-surrogate window (bounds decorator RAM across reopens); §6 parity
            (clrhash instance-windows)
-           ;; zeroize + free the foreign log-MAC key + k_meta and drop the oracle (points at freed bytes); §6
-           (setf logmac-key (dds.dare:free-secret-octets logmac-key))
-           (setf meta-key   (dds.dare:free-secret-octets meta-key))
+           ;; zeroize + free the foreign log-MAC key + k_meta + k_epochs and drop the oracle (points at freed bytes); §6
+           (setf logmac-key     (dds.dare:free-secret-octets logmac-key))
+           (setf meta-key       (dds.dare:free-secret-octets meta-key))
+           (setf epochs-mac-key (dds.dare:free-secret-octets epochs-mac-key))
            (store-set-chain-mac-fn inner-store nil)
            (dds.dare:key-provider-close key-provider)
            ;; close the inner store last: flush + persist its streams/topics.map (spec §5)

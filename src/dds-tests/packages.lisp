@@ -65,6 +65,7 @@
            #:run-durability-frame-version-test
            #:run-durability-mac-chain-test
            #:run-durability-tail-anchor-test
+           #:run-durability-epochs-mac-test
            #:run-durability-store-dir-perms-test
            #:run-durability-process-persistent-refuse-test
            #:run-durability-origins-cap-test

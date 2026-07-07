@@ -3,7 +3,7 @@
 Status: Accepted
 Date: 2026-07-04
 Work package: WP-DURABILITY-MAC-LOG-CHAIN (feature follow-on #2 of 4; resolves the ADR 0026 §10.9 open follow-on)
-Supersedes/updates: ADR 0026 §10.9 (the "MAC'd log chain" follow-on is now RESOLVED — see §7). Update (WP-DURABILITY-TAIL-ANCHOR-FILE): the §7.1 whole-tail-truncation residual (and its §9 whole-topic-drop + §2 whole-store-rollback forms) is now CLOSED for the FILE tier by a sealed high-water tail anchor; the shared decorator logic reaches each backend through a read-only seam. Update (WP-DURABILITY-TAIL-ANCHOR-SQLITE): the SQLite tier now FILLS that seam (store-chain-tails / store-verify-chain-prefix on make-sqlite-store, reusing %sqlite-chain-walk), so those residuals are CLOSED for SQLite too at the SAME (N, M_N) contract. Update (WP-DURABILITY-TAIL-ANCHOR-MS): the MICROSERVICE tier now FILLS that seam CLIENT-SIDE (store-chain-tails / store-verify-chain-prefix on make-microservice-store, reusing an extracted %ms-chain-walk), so those residuals are CLOSED for the microservice tier too — AND the Slice-3b whole-topic-drop-by-a-malicious-server gap is closed because the decorator iterates the CLIENT-TRUSTED sealed topic-SET, not the server's store-topics; the tail anchor is now complete across ALL THREE tiers (file + SQLite + microservice), and the §7.2 epochs.dat MAC stays deferred.
+Supersedes/updates: ADR 0026 §10.9 (the "MAC'd log chain" follow-on is now RESOLVED — see §7). Update (WP-DURABILITY-TAIL-ANCHOR-FILE): the §7.1 whole-tail-truncation residual (and its §9 whole-topic-drop + §2 whole-store-rollback forms) is now CLOSED for the FILE tier by a sealed high-water tail anchor; the shared decorator logic reaches each backend through a read-only seam. Update (WP-DURABILITY-TAIL-ANCHOR-SQLITE): the SQLite tier now FILLS that seam (store-chain-tails / store-verify-chain-prefix on make-sqlite-store, reusing %sqlite-chain-walk), so those residuals are CLOSED for SQLite too at the SAME (N, M_N) contract. Update (WP-DURABILITY-TAIL-ANCHOR-MS): the MICROSERVICE tier now FILLS that seam CLIENT-SIDE (store-chain-tails / store-verify-chain-prefix on make-microservice-store, reusing an extracted %ms-chain-walk), so those residuals are CLOSED for the microservice tier too — AND the Slice-3b whole-topic-drop-by-a-malicious-server gap is closed because the decorator iterates the CLIENT-TRUSTED sealed topic-SET, not the server's store-topics; the tail anchor is now complete across ALL THREE tiers (file + SQLite + microservice). Update (WP-DURABILITY-EPOCHS-MAC): the §7.2 `epochs.dat` MAC is now CLOSED — a keyed HMAC over the DARE per-epoch KEM-ciphertext table (`D/epochs.mac`), sealed at clean close, verified at open by prefix-containment; the MAC key `k_epochs` is the THIRD sibling off the anchor shared secret (alongside the log-MAC key and k_meta), so an offline disk adversary who flips a stored kem-ct AND recomputes its unkeyed per-entry CRC is now DETECTED (see the §7.2 as-built).
 
 ## 1. Context
 
@@ -197,8 +197,10 @@ frame appended in epoch *N+1* for a topic therefore chains from the last frame w
 (`chain_i = MAC` of the prior on-disk frame, whatever epoch wrote it). The restart boundary carries
 no chain discontinuity an adversary could exploit; the "bind each epoch's chain-head to the prior
 epoch's chain-tail" requirement is satisfied structurally by the continuous append chain, with no
-separate per-epoch chaining mechanism and **no** new `epochs.dat` MAC (the cross-epoch linkage
-rides the frame chain; `epochs.dat` stays entry-CRC-only per the Batch-B §10.9 note).
+separate per-epoch chaining mechanism and **no** new `epochs.dat` MAC *for the cross-epoch linkage*
+(that rides the frame chain). (`epochs.dat` was kept entry-CRC-only here; a keyed MAC over it was later
+added for a DIFFERENT purpose — offline tamper/rollback/reorder of the ct table, not chain linkage — by
+WP-DURABILITY-EPOCHS-MAC, §7.2.)
 
 ### 4.5 Compaction-on-open stays chain-correct
 
@@ -248,8 +250,10 @@ silently disable verification, unlike the torn-tail-recoverable `epochs.dat`).
   (§3.4); the single chain link covers the frame prefix instead.
 - **A per-epoch chain reset with an explicit cross-epoch link field** — rejected as more mechanism
   than the continuous append chain, which achieves the same binding for free (§4.4).
-- **MAC `epochs.dat`** — rejected: the cross-epoch linkage rides the frame chain; `epochs.dat`
-  keeps the entry-CRC-only scheme (its ordering invariant already prevents orphaned epochs).
+- **MAC `epochs.dat`** — rejected *for the cross-epoch linkage* (which rides the frame chain), so
+  `epochs.dat` kept the entry-CRC-only scheme here. **Reversed later** by WP-DURABILITY-EPOCHS-MAC (§7.2):
+  a keyed MAC over `epochs.dat` was needed after all — not for linkage, but to close the offline
+  tamper/rollback/reorder of the ct table (an unkeyed CRC an adversary can recompute).
 
 ## 7. Residuals (explicitly deferred — do not build in this WP)
 
@@ -422,7 +426,79 @@ silently disable verification, unlike the torn-tail-recoverable `epochs.dat`).
      the KEEP_LAST reclaim itself is now covered by `run-durability-microservice-keep-last-reclaim-test`.)
    - **The sealed high-water tail anchor is now complete across ALL THREE durability tiers (file + SQLite +
      microservice).**
-2. **`epochs.dat` MAC** — deferred (kept entry-CRC-only; §6).
+2. **`epochs.dat` MAC** — **RESOLVED** by WP-DURABILITY-EPOCHS-MAC (the §7.2 as-built below). `epochs.dat`
+   was entry-CRC-only; because the CRC is **unkeyed**, an offline disk adversary could flip a stored
+   kem-ct **and recompute that entry's CRC** → undetected → the wrong shared-secret decapsulates → the
+   wrong DEK → a fail-closed decrypt-failure (an **availability** brick / tamper-evidence gap); rollback
+   (an older `epochs.dat`) and reorder were likewise unauthenticated. A keyed MAC over `epochs.dat` now
+   closes the tamper/rollback/reorder hole. Whole-file **deletion** of `epochs.dat` stays a documented
+   residual (the shared deletion residual, same class as anchor/tail deletion — §7 item 3a).
+
+   **§7.2 as-built (sealed `epochs.dat` MAC — WP-DURABILITY-EPOCHS-MAC).**
+   - **Key.** `k_epochs = derive-epochs-mac-key(ss) = HKDF-SHA384(ss, salt=∅, info="dds-dare/epochs/v1",
+     L=32)` — the **THIRD sibling** off the same cross-restart-stable anchor shared secret `ss` as the
+     log-MAC key (§4.3) and k_meta (ADR 0025 §10 3c), with a distinct info label so it is cryptographically
+     independent of every DEK, the log-MAC key and k_meta. **Crux:** the MAC key must be available at OPEN
+     and must **NOT** derive from any per-epoch DEK — the DEKs **are** the contents of `epochs.dat`
+     (circular). It derives from `ss = key-provider-decapsulate(logmac.anchor kem-ct)`, decapsulated inside
+     `%mint-logmac-anchor` / `%load-logmac-anchor` (which now derive + return all three keys before freeing
+     `ss`, freeing all three on every error path). Availability is TOTAL: a non-empty `epochs.dat` implies
+     the anchor was minted (`%ensure-logmac` runs before `%mint-current-epoch`), so `k_epochs` is derivable
+     whenever there are epochs to verify.
+   - **Construction.** Canonical signed image `version(1)=#x01 ∥ count(4 LE) ∥ [%frame-epoch-entry(id,ct)]*`
+     over the entries **sorted by epoch-id ASCENDING** (deterministic, independent of physical append
+     order), reusing the existing `%frame-epoch-entry` so each entry image is **byte-identical** to its
+     on-disk `epochs.dat` framing (epoch-id ∥ ctlen ∥ ct ∥ crc). `mac = HMAC-SHA-256(k_epochs,
+     "dds-dare/logmac/epochs/v1" ∥ signed)` — the SAME `%hmac-labeled` construction as the grandfather
+     (§4.6) and tail (§7.1) anchors, a **fresh domain-separator label**, **no new crypto**. Persisted
+     (signed ∥ mac(32) ∥ crc32(4), fsynced) via the shared `%write-anchor-file` into a **SEPARATE, MUTABLE**
+     file `D/epochs.mac` (never extends the write-once `logmac.anchor`). `%read-epochs-mac` bounds-checks
+     **every** offset before use (NFR-SEC-POSTURE, mandatory even at `(safety 0)`); a present-but-corrupt
+     file (bad version/length/crc) SIGNALS (fail loud, mirrors `%read-logmac-tail`).
+   - **Seal / verify lifecycle.** **Seal at CLEAN CLOSE only** (`%seal-epochs-mac`, right after the tail-
+     anchor seal, before the keys are freed): re-read the table, sort ascending, MAC over ALL present
+     entries. **Verify at OPEN** (`%verify-epochs-mac`, AFTER `%load-epoch-deks` has run `epochs.dat`'s
+     torn-tail truncate-recovery so verify composes with it; GUARDED on `k_epochs` non-NIL) by
+     **prefix-containment**, forward-tolerant: absent ⇒ CLEAN (never-cleanly-closed / legacy-pre-v3); a
+     `.mac` MAC mismatch ⇒ fail-closed (forgery of `epochs.mac`); with `N` = the committed count, a table
+     with `< N` entries ⇒ **`:truncated`** (rollback/truncation); the first-`N` entries (ascending) whose
+     canonical image ≠ the stored signed region ⇒ **`:diverged`** (ct-tamper / reorder within the committed
+     prefix); a table with **≥ `N`** whose first-`N` **MATCH** ⇒ **CLEAN** (the extra entries are a forward
+     1-ahead crash-append). A strict whole-table-equality check is **REJECTED** — it would BRICK the
+     1-ahead crash-append.
+   - **No invalidate-at-open (unlike the §7.1 tail anchor).** `epochs.dat` is **append-only and NEVER
+     authorized-shrinks** (unlike topic logs, whose KEEP_LAST physical reclaim shrinks them — the reason
+     the tail anchor needs invalidate-at-open). So the ONLY divergence between `epochs.mac` and `epochs.dat`
+     at open is a forward 1-ahead crash-append (a fresh epoch fsynced, then a crash before re-seal), which
+     prefix-containment accepts CLEAN. There is no authorized-shrink crash window to cover, so there is **no
+     `%invalidate-epochs-mac`** — simpler than the tail anchor. A test-only `*durability-debug-skip-epochs-seal*`
+     knob (mirrors `*durability-debug-skip-tail-seal*`; inert by default) simulates that crash to exercise
+     the no-false-reject path.
+   - **Residuals.** (a) **Unsealed suffix.** Epochs minted AFTER the last clean close are unauthenticated
+     until the next re-seal — inherent to seal-at-CLEAN-CLOSE and the security complement of the forward
+     (1-ahead crash-append) tolerance: an adversary may tamper or append entries beyond the sealed `N`
+     undetected; the damage is bounded to **fail-closed decrypt-failures of the records referencing those
+     suffix epochs** (a wrong-DEK open is rejected per record — availability, never plaintext exposure; the
+     sealed prefix stays fully protected). (b) Whole-file **deletion** of `epochs.dat` (+ its `.mac`) is
+     the shared deletion residual (§7 item 3a class), documented not closed here — its sharpest form is
+     **laundering**: delete `epochs.mac`, tamper the table, and let the NEXT clean close re-seal over the
+     tampered table (absent ⇒ verify skips; the re-seal signs whatever is present) — the same §7 item 3a
+     deletion class. (c) **Nonce-reuse confidentiality is NOT at risk**: each `%mint-current-epoch`
+     encapsulates a FRESH ML-KEM ciphertext even on id reuse, so `epochs.dat` integrity is not what
+     prevents nonce reuse — this WP is integrity/availability + tamper-evidence-completeness, not
+     confidentiality.
+   - **Torn-reseal recovery (operational).** `%write-anchor-file` rewrites `epochs.mac` IN PLACE
+     (`:supersede`, no tmp+rename — the pre-existing `logmac.tail` posture, deliberately shared): an OS
+     crash mid-reseal can leave a torn `epochs.mac` that fail-LOUDS at every subsequent open
+     (`%read-epochs-mac` signals on a bad version/length/crc) until the corrupt `.mac` is manually
+     DELETED — absent ⇒ the store opens clean (running-chain protection only) and the next clean close
+     re-seals it.
+   - **Forward requirement (binds the epoch-table-retirement follow-on).** The no-invalidate design rests
+     on the premise that `epochs.dat` never authorized-shrinks. The queued **epoch-table-retirement**
+     follow-on BREAKS that premise — retirement IS an authorized shrink, and prefix-containment would
+     `:truncated`-brick a retired table — so that WP **MUST rework the seal lifecycle** (e.g.
+     invalidate-before-shrink + re-seal at clean close, tail-anchor style) as part of its scope.
+     (`%read-epochs-mac`'s 1,000,000-entry count cap is a documented parse horizon for the same follow-on.)
 3. **Anchor deletion + full downgrade, and downgrade of a grandfathered topic.** The `logmac.anchor`
    file is the chain commitment (§3.2). Two transition-class residuals remain, both requiring a
    full-control disk adversary to remove/exploit an out-of-band commitment:
@@ -470,6 +546,21 @@ cross-boundary tamper caught; key-absent (bare store) and wrong-key both fail-cl
 torn-tail still truncate-recovers. Plus the full DARE/durability integrity suite regression on
 both impls (Clasp first).
 
+The **§7.2 `epochs.dat` MAC** is verified by `run-durability-epochs-mac-test` (durability-test): the
+**tamper-ct RED→GREEN headline** (flip a stored kem-ct AND recompute its per-entry CRC — the unkeyed
+CRC path still accepts it, `%load-epoch-table` loads it clean, but the keyed `epochs.mac` catches it
+`:diverged` and fail-closes; non-vacuous clean control); **rollback/truncation DETECTED** (restore
+`epochs.dat` with fewer entries than sealed ⇒ `:truncated`) with a **forward-append CONTROL** (a clean
+session appending epoch N+1 reopens clean — detection is not "any change bricks"); **reorder DETECTED**
+(swap the two epochs' kem-ct payloads + fix both per-entry CRCs ⇒ the id↔ct binding differs from the
+sealed canonical image ⇒ `:diverged`); **`epochs.mac`-forge DETECTED** (flip a byte in `epochs.mac`'s own
+MAC + fix its CRC ⇒ the keyed MAC mismatch fail-closes); **cross-restart CLEAN** (reopen/close repeatedly,
+both epochs' records load); the **1-ahead crash-append CLEAN** load-bearing no-false-reject
+(`*durability-debug-skip-epochs-seal*` bound T ⇒ `epochs.dat` N+1 vs `epochs.mac` committed N reopens
+CLEAN via prefix-containment — a strict equality check would BRICK); and **torn-tail CRC-recovery still
+verifies** (a torn trailing epoch truncate-recovers back to N, then verify sees the recovered prefix ⇒
+CLEAN). Both impls (Clasp first), OpenSSL 3.6.2 present so the DARE arms RUN.
+
 ## 9. SQLite-backend parity (WP-SQLITE-MAC-CHAIN, ADR 0049 §9)
 
 The keyed v3 MAC chain is now implemented for the SQLite durable-store backend at full parity, closing
@@ -490,7 +581,7 @@ SQLite store reopens clean any number of times (the no-false-reject invariant). 
 compaction (fail-closed). All §7 residuals apply equally to the SQLite backend (they are properties of
 the chain design, not the storage medium). **Whole-topic deletion** (dropping every row of a topic so
 it no longer exists at open) joins the shared residual list alongside whole-tail truncation, the
-`epochs.dat` MAC, and anchor-deletion + full-downgrade: it is the topic-granularity form of the
+`epochs.dat` MAC (since CLOSED by WP-DURABILITY-EPOCHS-MAC, §7.2), and anchor-deletion + full-downgrade: it is the topic-granularity form of the
 whole-tail-truncation residual (§7 item 1) and closes only with the same separable **sealed high-water
 anchor** (a store-level authenticated topic/tail index) — a chain-design property, identical for the
 file and SQLite backends, not a storage-backend bug. **Update (WP-DURABILITY-TAIL-ANCHOR-FILE):** for the

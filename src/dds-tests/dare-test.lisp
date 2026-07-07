@@ -1246,9 +1246,12 @@
            (let* ((kp-ro (dds.dare:make-file-key-provider :dir k-dir))
                   (fs-ro (dds.durability:make-file-store :dir d-dir)))
              (dds.dare:key-provider-open kp-ro)
-             (multiple-value-bind (key gf-ids)
+             (multiple-value-bind (key gf-ids mkey ekey)
                  (dds.durability::%load-logmac-anchor kp-ro (uiop:ensure-directory-pathname d-dir))
-               (dds.durability::%install-logmac-oracle fs-ro key gf-ids))
+               (dds.durability::%install-logmac-oracle fs-ro key gf-ids)
+               ;; ADR 0045 §7.2 / ADR 0025 §10 3c: the oracle captures only KEY; free the unused siblings
+               (dds.dare:free-secret-octets mkey)
+               (dds.dare:free-secret-octets ekey))
              (dds.durability:store-open fs-ro)
              (let ((blobs (mapcar #'dds.durability:durable-record-payload
                                   (dds.durability:store-get-range

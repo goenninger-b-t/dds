@@ -12,10 +12,11 @@
   (let ((kp (dds.dare:make-file-key-provider :dir k-dir)))
     (dds.dare:key-provider-open kp)
     (unwind-protect
-         (multiple-value-bind (lk gf mk)
+         (multiple-value-bind (lk gf mk ek)
              (dds.durability::%load-logmac-anchor kp (uiop:ensure-directory-pathname d-dir))
            (declare (ignore gf))
            (dds.dare:free-secret-octets lk)
+           (dds.dare:free-secret-octets ek)   ; ADR 0045 §7.2: free the 3rd anchor sibling (unused here)
            mk)
       (dds.dare:key-provider-close kp))))
 
@@ -4483,6 +4484,183 @@
                                                     (ignore-errors (dds.durability:store-close s)) t)
                                  (error () nil)))
                              "F1: an authorized reclaim-shrink + crash reopens CLEAN (no false-reject / brick)"))))))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))))
+  t)
+
+(defun* run-durability-epochs-mac-test ()
+    (function () t)
+  "WP-DURABILITY-EPOCHS-MAC (ADR 0045 §7.2): a keyed MAC over DIR/epochs.dat (the DARE per-epoch KEM-
+   ciphertext table) closes the epochs.dat tamper/rollback/reorder hole the entry-CRC-only path missed.
+   The MAC key k_epochs is the THIRD anchor sibling (derive-epochs-mac-key), sealed at CLEAN CLOSE to a
+   SEPARATE D/epochs.mac, verified at OPEN by prefix-containment (forward-tolerant). Each session mints
+   EXACTLY ONE epoch on its first put; two sessions ⇒ a 2-epoch table sealed at N=2.
+   (a) TAMPER-CT (HEADLINE, RED->GREEN): flip a byte in a stored kem-ct AND recompute that entry's per-
+       entry CRC (so the CRC-only path still passes) ⇒ reopen fail-closed (:diverged — the keyed MAC catches
+       what the CRC missed). Non-vacuous control: the untampered store reopens clean.
+   (b) ROLLBACK/TRUNCATION DETECTED + forward-append CONTROL: restore epochs.dat with FEWER entries
+       (truncate to N-1) ⇒ reopen fail-closed (:truncated). CONTROL: a clean session that appends epoch N+1
+       and closes CLEAN reopens clean (proves rollback-detection is not 'any change bricks').
+   (c) REORDER DETECTED: swap the two epochs' kem-ct payloads (fix both per-entry CRCs) ⇒ the id<->ct
+       binding differs from the sealed canonical image ⇒ reopen fail-closed (:diverged).
+   (d) EPOCHS.MAC-FORGE DETECTED: flip a byte inside epochs.mac's own MAC field, recompute epochs.mac's CRC
+       ⇒ reopen fail-closed (the .mac's own keyed MAC mismatch — attacker lacks k_epochs).
+   (e) CROSS-RESTART CLEAN: seal, reopen, close, reopen — clean every time, 2 epochs' records load.
+   (f) 1-AHEAD CRASH-APPEND CLEAN (the load-bearing no-false-reject): with *durability-debug-skip-epochs-seal*
+       bound T, a session mints a fresh epoch then 'crashes' (skips reseal ⇒ epochs.mac STALE at N, epochs.dat
+       N+1) ⇒ reopen CLEAN (forward extension). A strict whole-table-equality check would BRICK here.
+   (g) TORN-TAIL CRC-RECOVERY still verifies: append a fresh epoch (skip reseal) then TEAR the trailing
+       epochs.dat entry so %load-epoch-table truncate-recovers it back to N ⇒ reopen CLEAN (verify runs AFTER
+       truncate-recovery and composes with it).
+   Arms (a)-(d) assert the EXACT fail path via the condition report text (:diverged / :truncated / the
+   epochs.mac self-MAC-mismatch wording), so botched byte-surgery cannot pass via a different error path
+   (e.g. the pre-existing mid-file-corruption signal)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [durability-epochs-mac] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-epochs-mac-test t)))
+  (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9))
+        (dirs '())
+        (pay  (lambda (i)
+                (let ((v (make-array 8 :element-type '(unsigned-byte 8))))
+                  (dotimes (j 8 v) (setf (aref v j) (logand (+ (* i 16) j) #xFF)))))))
+    (labels ((%tmp (tag)
+               (let ((d (uiop:merge-pathnames*
+                         (make-pathname :directory
+                                        (list :relative (format nil "dds-em-~a-~a-~a"
+                                                                tag (get-universal-time)
+                                                                (random 1000000))))
+                         (uiop:temporary-directory))))
+                 (push d dirs)
+                 d))
+             (%mk (d k)
+               (dds.durability:make-encrypted-store
+                (dds.durability:make-file-store :dir d)
+                (dds.dare:make-file-key-provider :dir k)
+                :epoch-dir d))
+             (%read-bytes (path)
+               (with-open-file (s path :element-type '(unsigned-byte 8))
+                 (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                   (read-sequence v s) v)))
+             (%write-bytes (path bytes)
+               (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+                 (write-sequence bytes s)))
+             (%sess (d k sn)
+               ;; one session = one fresh epoch (minted on the first put); writes one record to topic "T"
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (dds.durability:store-put s "T" g0 sn nil :data (funcall pay sn))
+                 (dds.durability:store-close s)))
+             (%open-err-msg (d k)
+               ;; NIL on a clean open/close; else the condition's report text (asserts the EXACT fail path)
+               (let ((s (%mk d k)))
+                 (handler-case (progn (dds.durability:store-open s)
+                                      (ignore-errors (dds.durability:store-close s)) nil)
+                   (error (c) (format nil "~a" c)))))
+             (%open-errs-p (d k) (and (%open-err-msg d k) t))
+             (%open-count (d k)
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (prog1 (dds.durability:store-count s "T")
+                   (dds.durability:store-close s))))
+             (%edat (d) (dds.durability::%epochs-dat-path (uiop:ensure-directory-pathname d)))
+             (%emac (d) (dds.durability::%epochs-mac-path (uiop:ensure-directory-pathname d)))
+             (%g32 (b off) (dds.durability::%get-u32-le b off))
+             (%p32 (b off v) (dds.durability::%put-u32-le b off (the (unsigned-byte 32) v)))
+             (%crc (b s e) (dds.durability::%crc32 b s e))
+             (%seal2 (d k)                                   ; build a 2-epoch store sealed at N=2
+               (%sess d k 1) (%sess d k 2)))
+      (unwind-protect
+           (progn
+             ;; (a) TAMPER-CT — the RED->GREEN headline
+             (let ((d (%tmp "ct-d")) (k (%tmp "ct-k")))
+               (%seal2 d k)
+               (%check :em-ct-control (not (%open-errs-p d k))
+                       "non-vacuous control: the untampered sealed 2-epoch store reopens clean")
+               (let* ((b (%read-bytes (%edat d)))
+                      (l (%g32 b 4))                         ; entry0 kem-ct length
+                      (crc0 (+ 8 l)))                        ; entry0 crc offset
+                 (setf (aref b 8) (logxor (aref b 8) #xFF))  ; flip one kem-ct byte
+                 (%p32 b crc0 (%crc b 0 crc0))               ; recompute entry0's UNKEYED CRC (CRC-only path passes)
+                 (%write-bytes (%edat d) b))
+               (let ((msg (%open-err-msg d k)))
+                 (%check :em-ct-tamper-detected (and msg (search ":diverged" msg))
+                         (format nil "tamper-ct: a flipped kem-ct with a recomputed per-entry CRC must fail-closed as :diverged via the keyed epochs MAC (not any other error path); got ~s" msg))))
+             ;; (b) ROLLBACK/TRUNCATION DETECTED + forward-append CONTROL
+             (let ((d (%tmp "rb-d")) (k (%tmp "rb-k")))
+               (%seal2 d k)                                  ; seal N=2
+               (let* ((b (%read-bytes (%edat d)))
+                      (l (%g32 b 4))
+                      (e0end (+ 12 l)))                      ; end of entry0 = 8+l+4
+                 (%write-bytes (%edat d) (subseq b 0 e0end)))  ; roll back to N-1=1 valid entry
+               (let ((msg (%open-err-msg d k)))
+                 (%check :em-rollback-detected (and msg (search ":truncated" msg))
+                         (format nil "rollback: an epochs.dat with fewer entries than sealed (count<N) must fail-closed as :truncated (not any other error path); got ~s" msg))))
+             (let ((d (%tmp "fa-d")) (k (%tmp "fa-k")))
+               (%seal2 d k)                                  ; seal N=2
+               (%sess d k 3)                                 ; clean session appends epoch 3, re-seals epochs.mac N=3
+               (%check :em-forward-append-control (not (%open-errs-p d k))
+                       "forward-append CONTROL: a clean session appending epoch N+1 and closing CLEAN reopens clean (rollback-detection is not 'any change bricks')"))
+             ;; (c) REORDER DETECTED — swap the two kem-ct payloads, fix both per-entry CRCs
+             (let ((d (%tmp "ro-d")) (k (%tmp "ro-k")))
+               (%seal2 d k)
+               (let* ((b   (%read-bytes (%edat d)))
+                      (l   (%g32 b 4))                       ; both ML-KEM-1024 cts are equal length
+                      (e1  (+ 12 l))                         ; entry1 start
+                      (c0s 8) (c0e (+ 8 l))                  ; entry0 kem-ct region
+                      (c1s (+ e1 8)) (c1e (+ e1 8 l))        ; entry1 kem-ct region
+                      (ct0 (subseq b c0s c0e))
+                      (ct1 (subseq b c1s c1e)))
+                 (replace b ct1 :start1 c0s)                 ; ct1 -> entry0
+                 (replace b ct0 :start1 c1s)                 ; ct0 -> entry1
+                 (%p32 b c0e (%crc b 0 c0e))                 ; fix entry0 CRC (crc offset = 8+l)
+                 (%p32 b c1e (%crc b e1 c1e))                ; fix entry1 CRC
+                 (%write-bytes (%edat d) b))
+               (let ((msg (%open-err-msg d k)))
+                 (%check :em-reorder-detected (and msg (search ":diverged" msg))
+                         (format nil "reorder: swapping the two epochs' kem-ct payloads (both CRCs fixed) changes the id<->ct binding vs the sealed canonical image and must fail-closed as :diverged; got ~s" msg))))
+             ;; (d) EPOCHS.MAC-FORGE DETECTED — flip a byte in epochs.mac's own MAC, fix its CRC
+             (let ((d (%tmp "fo-d")) (k (%tmp "fo-k")))
+               (%seal2 d k)
+               (let* ((b  (%read-bytes (%emac d)))
+                      (sz (length b))
+                      (mb (- sz 20)))                        ; a byte inside the mac(32) field [sz-36, sz-4)
+                 (setf (aref b mb) (logxor (aref b mb) #xFF))
+                 (%p32 b (- sz 4) (%crc b 0 (- sz 4)))       ; recompute epochs.mac's own CRC
+                 (%write-bytes (%emac d) b))
+               (let ((msg (%open-err-msg d k)))
+                 (%check :em-forge-detected (and msg (search "epochs.mac MAC mismatch" msg))
+                         (format nil "epochs.mac-forge: flipping epochs.mac's own MAC (CRC fixed) must fail-closed on the .mac's own keyed-MAC mismatch (attacker lacks k_epochs); got ~s" msg))))
+             ;; (e) CROSS-RESTART CLEAN — reopen/close repeatedly, 2 records load each time
+             (let ((d (%tmp "cr-d")) (k (%tmp "cr-k")))
+               (%seal2 d k)
+               (%check :em-cross-restart-1 (= 2 (%open-count d k))
+                       "cross-restart: first reopen is clean and both epochs' records load")
+               (%check :em-cross-restart-2 (= 2 (%open-count d k))
+                       "cross-restart: a second reopen/close cycle stays clean (no false-reject, 2 records)"))
+             ;; (f) 1-AHEAD CRASH-APPEND CLEAN — the load-bearing no-false-reject
+             (let ((d (%tmp "ca-d")) (k (%tmp "ca-k")))
+               (%seal2 d k)                                  ; epochs.mac sealed at N=2
+               (let ((dds.durability::*durability-debug-skip-epochs-seal* t))
+                 (%sess d k 3))                              ; mints epoch 3; SKIP epochs reseal ⇒ epochs.mac STALE @2, epochs.dat=3
+               (%check :em-crash-append-clean (not (%open-errs-p d k))
+                       "1-ahead crash-append: epochs.dat N+1 vs epochs.mac committed N reopens CLEAN (forward extension, prefix-containment — a strict equality check would BRICK)")
+               (%check :em-crash-append-loads (= 3 (%open-count d k))
+                       "1-ahead crash-append: all three epochs' records load after the clean reopen"))
+             ;; (g) TORN-TAIL CRC-RECOVERY still verifies
+             (let ((d (%tmp "tt-d")) (k (%tmp "tt-k")))
+               (%seal2 d k)                                  ; epochs.mac sealed at N=2
+               (let ((dds.durability::*durability-debug-skip-epochs-seal* t))
+                 (%sess d k 3))                              ; mints epoch 3; epochs.mac STALE @2, epochs.dat=3
+               (let ((b (%read-bytes (%edat d))))            ; TEAR the trailing entry (drop 5 bytes)
+                 (%write-bytes (%edat d) (subseq b 0 (- (length b) 5))))
+               (%check :em-torn-tail-clean (not (%open-errs-p d k))
+                       "torn-tail: %load-epoch-table truncate-recovers the torn epoch back to N, then epochs-verify sees the recovered prefix ⇒ reopen CLEAN (verify composes with truncate-recovery)")
+               (%check :em-torn-tail-recovered (= 2 (%open-count d k))
+                       "torn-tail: after recovery exactly the 2 committed epochs' records load (the torn epoch's DEK is gone ⇒ its record is dropped)")))
         (dolist (d dirs)
           (when (uiop:directory-exists-p d)
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))))

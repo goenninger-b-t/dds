@@ -862,6 +862,38 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   **client-trusted** enumeration, a malicious server that omits a whole topic is still verified (fetch 0 →
   `:truncated`) — closing the Slice-3b whole-topic-drop-by-a-malicious-server gap. **All three tiers now
   fill the seam.**
+- **Sealed `epochs.dat` MAC (offline ct-tamper / rollback / reorder — ADR 0045 §7.2, WP-DURABILITY-EPOCHS-MAC).**
+  `D/epochs.dat` (the DARE per-epoch KEM-ciphertext table) was **entry-CRC-only**; because the CRC is
+  **unkeyed**, an offline disk adversary could flip a stored kem-ct **and recompute that entry's CRC** →
+  undetected → the wrong shared-secret decapsulates → the wrong DEK → a fail-closed decrypt-failure (an
+  **availability** brick / tamper-evidence gap); rollback and reorder were likewise unauthenticated. A
+  **keyed MAC over `epochs.dat`** now closes this. The MAC key `k_epochs = HKDF-SHA384(ss, info="dds-dare/epochs/v1")`
+  is the **THIRD sibling** off the anchor shared secret (alongside the log-MAC key and k_meta) — it
+  **cannot** derive from any per-epoch DEK (the DEKs **are** the contents of `epochs.dat`, circular), so
+  `%mint-logmac-anchor` / `%load-logmac-anchor` now derive + return all three keys from the same `ss`. At
+  **clean close** the decorator seals the canonical image `version ∥ count ∥ [epoch-id ∥ ctlen ∥ ct ∥ crc]*`
+  over the entries **sorted by epoch-id ascending** (reusing `%frame-epoch-entry`, so each entry is
+  byte-identical to on-disk), MAC'd `HMAC-SHA-256(k_epochs, "dds-dare/logmac/epochs/v1" ∥ signed)` (the
+  same `%hmac-labeled` construction as the grandfather/tail anchors, a fresh label, **no new crypto**) into
+  a **separate, mutable `D/epochs.mac`** (fsync'd; `%read-epochs-mac` bounds-checks every offset even at
+  `(safety 0)`). At **open** (after `epochs.dat`'s torn-tail truncate-recovery has run, guarded on `k_epochs`
+  non-NIL) it verifies by **prefix-containment**, forward-tolerant: absent ⇒ CLEAN; a `.mac` MAC mismatch ⇒
+  fail-closed; with `N` = the committed count, `< N` entries ⇒ **`:truncated`** (rollback/truncation), the
+  first-`N` (ascending) whose canonical image differs ⇒ **`:diverged`** (ct-tamper / reorder), and a table
+  with **≥ `N`** whose first-`N` match ⇒ **CLEAN** (the extra entries are a forward 1-ahead crash-append —
+  a strict whole-table-equality check would BRICK it and is rejected). **Unlike the §7.1 tail anchor there
+  is NO invalidate-at-open**: `epochs.dat` is append-only and never authorized-shrinks, so the only at-open
+  divergence is the forward crash-append (accepted CLEAN) — simpler than the tail anchor. A test-only
+  `*durability-debug-skip-epochs-seal*` knob (mirrors `*durability-debug-skip-tail-seal*`; inert by default)
+  exercises that no-false-reject path. **Residuals:** the **unsealed suffix** — epochs minted after the last
+  clean close are unauthenticated until the next re-seal (inherent to seal-at-close, the security complement
+  of the forward tolerance): an adversary may tamper/append entries beyond the sealed `N` undetected, with
+  damage bounded to fail-closed decrypt-failures of the records referencing those suffix epochs (never
+  plaintext; the sealed prefix stays protected) — and whole-file **deletion** of `epochs.dat`/`epochs.mac`
+  (the shared deletion residual, same class as anchor/tail deletion; its sharpest form is **laundering**:
+  delete `epochs.mac`, tamper the table, and let the next clean close re-seal over the tampered table).
+  Nonce-reuse confidentiality is not at risk (each
+  mint encapsulates a FRESH ciphertext even on id reuse) — this is integrity/availability, not confidentiality.
 - **Detected:** interior record **delete / reorder / substitution (even with both CRCs recomputed) /
   insertion**, **full-log v3→v2 downgrade** of any born-chained topic, and — for **ALL THREE tiers (FILE +
   SQLite + microservice)** — **whole-tail truncation / whole-topic drop / whole-store rollback** (the sealed
@@ -878,8 +910,10 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   survivors + replaces the server's opaque frames via `+ms-op-topic-rewrite+`, so a reclaim reopens CLEAN);
   the ms `:purge` **also** clears the client chain head, mirroring the local tiers, so an authorized purge
   + clean close + reopen opens CLEAN — a false-reject the anchor would otherwise introduce, fixed here); the combined anchor-deletion-plus-full-downgrade
-  vector and a full rollback of a *grandfathered* legacy topic; and the `epochs.dat` MAC. Cost is off the
-  sample hot path (one HMAC per put / per frame at open; one HMAC over the tail set per close). Verified by
+  vector and a full rollback of a *grandfathered* legacy topic; and whole-file **deletion** of `epochs.dat`
+  (the sealed `epochs.dat` MAC itself is now CLOSED — see the §7.2 bullet above). Cost is off the
+  sample hot path (one HMAC per put / per frame at open; one HMAC over the tail set per close; one HMAC over
+  the epoch table per close). Verified by
   `run-durability-mac-chain-test` (round-trip; v1/v2/v3 read; the four interior tampers with a non-vacuous
   control; the v3→v2 downgrade fails loud while a v3-tail migration log opens; **multi-topic legacy
   coexistence**; cross-restart; key-absent/wrong-key; **torn-tail clean + whole-frame tail truncation now
@@ -909,7 +943,12 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   survivors (WP-DURABILITY-MS-RECLAIM-REMAC, §8.10.3 — `run-durability-microservice-keep-last-reclaim-test`). The
   ms `:purge` now clears the client chain head (mirroring file/SQLite), fixing the anchor's introduced brick AND
   the pre-existing purge+reput-same-session brick. The sealed high-water tail anchor is now complete across ALL
-  THREE tiers.
+  THREE tiers. The **sealed `epochs.dat` MAC** (§7.2) is verified by `run-durability-epochs-mac-test`
+  (**tamper-ct RED→GREEN** [flip a stored kem-ct + recompute its per-entry CRC — the unkeyed CRC path still
+  accepts it, only the keyed `epochs.mac` catches it `:diverged`], **rollback DETECTED** [`:truncated`] with a
+  **forward-append CONTROL**, **reorder DETECTED** [swap the two kem-ct payloads + fix both CRCs ⇒ `:diverged`],
+  **`epochs.mac`-forge DETECTED**, **cross-restart CLEAN**, the **1-ahead crash-append CLEAN** no-false-reject
+  [`*durability-debug-skip-epochs-seal*`], and **torn-tail CRC-recovery still verifies**).
 
 ### 8.6 Deployment requirement — OpenSSL ≥ 3.5
 

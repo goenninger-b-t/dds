@@ -27,6 +27,8 @@
    #:derive-log-mac-key
    ;; WP-DURABILITY-METADATA-CONF-3c (ADR 0025 §10 item 3): cross-restart-stable at-rest metadata key
    #:derive-meta-key
+   ;; WP-DURABILITY-EPOCHS-MAC (ADR 0045 §7.2): cross-restart-stable epochs.dat MAC key (3rd anchor sibling)
+   #:derive-epochs-mac-key
    #:seal-payload
    #:open-payload
    #:make-record-aad
