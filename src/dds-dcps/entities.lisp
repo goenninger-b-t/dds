@@ -135,7 +135,9 @@
 ;; can install the DDS-Security §8.4 AccessControl manager when governance + permissions are configured.
 (declaim (ftype (function (domain-participant dds.security:access-handle) domain-participant)
                 %install-access-control))
-(declaim (ftype (function (domain-participant (simple-array (unsigned-byte 8) (16)) t) (eql t))
+(declaim (ftype (function (domain-participant (simple-array (unsigned-byte 8) (16)) t
+                          &optional (or null (unsigned-byte 32)))
+                         (eql t))
                 %cm-user-token-at-match))
 
 ;; WP-FLATDATA-ZC-LOAN (R6, ADR 0017): forward-declared so create-datareader / delete-participant (defined
