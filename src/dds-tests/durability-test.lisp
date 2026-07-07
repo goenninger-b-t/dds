@@ -6069,3 +6069,257 @@
                      (dds.durability::%collect-seen-p origins g0 3))
                 "a re-presented already-delivered SN must stay seen (no double delivery under cap policy)")))
     t))
+
+;;; --- WP-DURABILITY-MICROSERVICE-1 (ADR 0050) — PAL TCP + microservice persistence backend ---
+
+(defun* %tms-guid (b)
+    (function ((unsigned-byte 8)) (simple-array (unsigned-byte 8) (16)))
+  "16-byte writer GUID filled with byte B (test fixture)."
+  (make-array 16 :element-type '(unsigned-byte 8) :initial-element b))
+
+(defun* %tms-payload (n seed)
+    (function ((integer 0) (unsigned-byte 8)) (simple-array (unsigned-byte 8) (*)))
+  "Deterministic N-byte payload keyed by SEED (test fixture; N may be 0 for the empty-payload case)."
+  (let ((v (make-array n :element-type '(unsigned-byte 8))))
+    (dotimes (i n v) (setf (aref v i) (logand (+ seed (* i 31)) 255)))))
+
+(defun* %tms-rec= (r topic guid sn kh kind payload)
+    (function (dds.durability:durable-record string (simple-array (unsigned-byte 8) (16)) (integer 0)
+               (or null (simple-array (unsigned-byte 8) (16)))
+               (member :data :dispose :unregister) (simple-array (unsigned-byte 8) (*)))
+              t)
+  "T iff DURABLE-RECORD R matches every field byte-exactly (topic/guid/sn/key-hash/kind/payload)."
+  (and (string= (dds.durability:durable-record-topic r) topic)
+       (equalp (dds.durability:durable-record-writer-guid r) guid)
+       (= (dds.durability:durable-record-sn r) sn)
+       (equalp (dds.durability:durable-record-key-hash r) kh)
+       (eq (dds.durability:durable-record-kind r) kind)
+       (equalp (dds.durability:durable-record-payload r) payload)))
+
+(defun* run-pal-tcp-loopback-test ()
+    (function () t)
+  "Part A: the native TCPv4 PAL stream primitives round-trip over loopback — bind port 0, read back the
+   ephemeral port, connect, send a buffer, receive it byte-exact (full-frame recv loop), close. Both impls."
+  (let ((ln (dds.pal:tcp-listen "127.0.0.1" 0)))
+    (unwind-protect
+        (let* ((port (dds.pal:tcp-local-port ln))
+               (cli (dds.pal:tcp-connect "127.0.0.1" port)))
+          (%check :tcp-ephemeral-port (plusp port) "tcp-local-port returned an ephemeral port")
+          (unwind-protect
+              (let ((srv (dds.pal:tcp-accept ln))
+                    (out (octets #xde #xad #xbe #xef #x01 #x02 #x03 #x04)))
+                (unwind-protect
+                    (progn
+                      (dds.pal:tcp-send cli out 8)
+                      (let ((in (make-array 8 :element-type '(unsigned-byte 8))))
+                        (%check :tcp-recv-len (eql 8 (dds.pal:tcp-recv srv in 8)) "tcp-recv returned full length")
+                        (%check :tcp-byte-exact (equalp in out) "tcp round-trip byte-exact")))
+                  (dds.pal:tcp-close srv)))
+            (dds.pal:tcp-close cli)))
+      (dds.pal:tcp-close ln))
+    t))
+
+(defun* run-durability-microservice-test ()
+    (function () t)
+  "The MICROSERVICE slice (ADR 0050): a make-microservice-store client proxies the durable-store vtable
+   over TCP to a make-microservice-server holding an inner memory store. Put N records (2 topics, distinct
+   guids/sns/kinds/key-hashes, payloads incl. empty + 100KB) -> get-range byte-exact + (guid,sn)-ordered
+   -> count(topic)+(nil) -> idempotent re-put no-op -> delete -> close -> server-stop. Both impls."
+  (let* ((srv (dds.durability:make-microservice-server :port 0))
+         (port (dds.durability:microservice-server-port srv)))
+    (unwind-protect
+        (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port))
+              (g1 (%tms-guid 1)) (g2 (%tms-guid 2)) (g3 (%tms-guid 3))
+              (kh9 (%tms-guid 9)) (kh7 (%tms-guid 7)) (kh4 (%tms-guid 4))
+              (big (%tms-payload 100000 5))
+              (p3 (%tms-payload 3 1)) (p50 (%tms-payload 50 2)) (empty (%tms-payload 0 0)))
+          (%check :ms-open (eq t (dds.durability:store-open s)) "client store-open connects + opens")
+          ;; distinct guids/sns/kinds/key-hashes; payloads incl. empty + 100KB across 2 topics
+          (%check :ms-put-a2 (eq t (dds.durability:store-put s "A" g1 2 kh9 :data p3)) "put A/g1/2")
+          (%check :ms-put-a1 (eq t (dds.durability:store-put s "A" g1 1 nil :data empty)) "put A/g1/1 empty")
+          (%check :ms-put-a5 (eq t (dds.durability:store-put s "A" g2 5 kh7 :dispose big)) "put A/g2/5 100KB")
+          (%check :ms-put-b1 (eq t (dds.durability:store-put s "B" g3 1 nil :unregister p3)) "put B/g3/1")
+          (%check :ms-put-b9 (eq t (dds.durability:store-put s "B" g3 9 kh4 :data p50)) "put B/g3/9")
+          ;; counts
+          (%check :ms-count-a (= 3 (dds.durability:store-count s "A")) "count(A)=3")
+          (%check :ms-count-b (= 2 (dds.durability:store-count s "B")) "count(B)=2")
+          (%check :ms-count-all (= 5 (dds.durability:store-count s nil)) "count(nil)=5")
+          ;; get-range A byte-exact + ordered by (guid,sn): (g1,1) (g1,2) (g2,5)
+          (let ((ra (dds.durability:store-get-range s "A")))
+            (%check :ms-a-order (equal '(1 2 5) (mapcar #'dds.durability:durable-record-sn ra))
+                    "get-range(A) ordered by (guid,sn)")
+            (%check :ms-a1-exact (%tms-rec= (first ra)  "A" g1 1 nil   :data    empty) "A/g1/1 byte-exact (empty)")
+            (%check :ms-a2-exact (%tms-rec= (second ra) "A" g1 2 kh9   :data    p3)    "A/g1/2 byte-exact")
+            (%check :ms-a5-exact (%tms-rec= (third ra)  "A" g2 5 kh7   :dispose big)   "A/g2/5 byte-exact (100KB)"))
+          ;; get-range B byte-exact + ordered: (g3,1) (g3,9)
+          (let ((rb (dds.durability:store-get-range s "B")))
+            (%check :ms-b-order (equal '(1 9) (mapcar #'dds.durability:durable-record-sn rb))
+                    "get-range(B) ordered by (guid,sn)")
+            (%check :ms-b1-exact (%tms-rec= (first rb)  "B" g3 1 nil :unregister p3)  "B/g3/1 byte-exact")
+            (%check :ms-b9-exact (%tms-rec= (second rb) "B" g3 9 kh4 :data       p50) "B/g3/9 byte-exact"))
+          ;; topics
+          (%check :ms-topics (equal '("A" "B") (sort (copy-list (dds.durability:store-topics s)) #'string<))
+                  "topics list")
+          ;; idempotent re-put: same (A,g1,1) with a DIFFERENT payload -> T, no double-store, ORIGINAL kept
+          (%check :ms-reput-t (eq t (dds.durability:store-put s "A" g1 1 nil :data p50)) "re-put returns T")
+          (%check :ms-reput-count (= 3 (dds.durability:store-count s "A")) "re-put does not double-store")
+          (%check :ms-reput-orig (= 0 (length (dds.durability:durable-record-payload
+                                               (first (dds.durability:store-get-range s "A")))))
+                  "re-put is a no-op: the ORIGINAL (empty) payload is retained")
+          ;; delete removes a single record
+          (%check :ms-delete (eq t (dds.durability:store-delete s "A" g1 2)) "delete A/g1/2 returns T")
+          (%check :ms-delete-count (= 2 (dds.durability:store-count s "A")) "count(A)=2 after delete")
+          (%check :ms-delete-gone (null (%tms-find (dds.durability:store-get-range s "A") g1 2))
+                  "deleted record no longer in get-range")
+          (%check :ms-purge (eq t (dds.durability:store-purge s "B")) "purge B returns T")
+          (%check :ms-purge-count (= 0 (dds.durability:store-count s "B")) "count(B)=0 after purge")
+          (dds.durability:store-close s))
+      (dds.durability:microservice-server-stop srv))
+    t))
+
+(defun* %tms-find (recs guid sn)
+    (function (list (simple-array (unsigned-byte 8) (16)) (integer 0)) t)
+  "Find the record in RECS with writer-guid GUID and sequence number SN, or NIL."
+  (find-if (lambda (r) (and (equalp (dds.durability:durable-record-writer-guid r) guid)
+                            (= (dds.durability:durable-record-sn r) sn)))
+           recs))
+
+(defun* run-durability-microservice-large-test ()
+    (function () t)
+  "Large-payload multi-segment gate (ADR 0050): a >256 KiB record round-trips byte-exact through the
+   u32-length-prefixed framing, proving the full-frame tcp-recv loop reassembles a payload split across
+   many TCP segments. Both impls."
+  (let* ((srv (dds.durability:make-microservice-server :port 0))
+         (port (dds.durability:microservice-server-port srv)))
+    (unwind-protect
+        (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port))
+              (g (%tms-guid 42))
+              (huge (%tms-payload 500000 17)))     ; 500 KB -> forces multi-segment delivery
+          (dds.durability:store-open s)
+          (%check :ms-large-put (eq t (dds.durability:store-put s "L" g 7 nil :data huge)) "put 500KB record")
+          (let ((r (first (dds.durability:store-get-range s "L"))))
+            (%check :ms-large-len (= 500000 (length (dds.durability:durable-record-payload r)))
+                    "500KB payload length preserved")
+            (%check :ms-large-exact (equalp (dds.durability:durable-record-payload r) huge)
+                    "500KB payload byte-exact across TCP segmentation"))
+          (dds.durability:store-close s))
+      (dds.durability:microservice-server-stop srv))
+    t))
+
+(defun* run-durability-microservice-torn-test ()
+    (function () t)
+  "Torn-read gate (ADR 0050): the server closes mid-session; the client's next op must fail cleanly (a
+   MICROSERVICE-STORE-ERROR, no hang, no crash, no garbage) — the full-frame recv returning NIL on
+   peer-close surfaces as a clean signalled error. Both impls."
+  (let* ((srv (dds.durability:make-microservice-server :port 0))
+         (port (dds.durability:microservice-server-port srv))
+         (s (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+    (dds.durability:store-open s)
+    (%check :ms-torn-precheck (= 0 (dds.durability:store-count s "A")) "a normal op succeeds before the tear")
+    ;; tear the connection down under the client (stop closes the served connection + the listener)
+    (dds.durability:microservice-server-stop srv)
+    (%check :ms-torn-clean
+            (handler-case (progn (dds.durability:store-count s "A") nil)
+              (error () t))
+            "client op after server stop signals cleanly (no hang/crash)")
+    ;; store-close is still safe (best-effort) after the tear
+    (%check :ms-torn-close-safe (eq t (ignore-errors (dds.durability:store-close s)))
+            "store-close is safe after a torn connection")
+    t))
+
+(defun* %tms-bad-topic-frame (bad-bytes)
+    (function ((simple-array (unsigned-byte 8) (*))) (simple-array (unsigned-byte 8) (*)))
+  "Build a raw microservice PURGE request whose topic field carries BAD-BYTES (a malformed-UTF-8 topic),
+   bypassing the client encoder (which only emits well-formed UTF-8) — a fuzz fixture."
+  (let ((b (dds.durability::%ms-buf)))
+    (dds.durability::%ms-put-u16 b (length bad-bytes))
+    (dds.durability::%ms-put-bytes b bad-bytes)
+    (dds.durability::%ms-frame-message dds.durability::+ms-op-purge+ (dds.durability::%ms-finalize b))))
+
+(defun* run-durability-microservice-fuzz-test ()
+    (function () t)
+  "Fuzz / survival gate (ADR 0050, the load-bearing network-facing fuzz posture): a malformed-UTF-8 topic
+   must raise a clean MICROSERVICE-PROTOCOL-ERROR (Unicode Table 3-7 / RFC 3629 well-formedness) — never
+   an uncaught TYPE-ERROR from an out-of-range code-char. (1) The bounds+well-formedness decoder rejects a
+   battery of ill-formed sequences and round-trips valid ones. (2) A raw client streams malformed-topic
+   frames at the server: each drops THAT connection and the SERVE THREAD SURVIVES — a SUBSEQUENT valid
+   client store-open + round-trip succeeds (proving the listener kept accepting). (3) Client-symmetric: a
+   malicious server sends a garbled response -> the client op signals MICROSERVICE-STORE-ERROR (not a
+   TYPE-ERROR). Both impls."
+  ;; (1) the decoder itself: ill-formed -> protocol-error; well-formed multibyte -> exact round-trip
+  (dolist (bad (list (octets #xF7 #xBF #xBF #xBF)          ; lead > F4 (> U+10FFFF)
+                     (octets #xC0 #x80)                    ; overlong 2-byte
+                     (octets #xC1 #xBF)                    ; overlong 2-byte
+                     (octets #xED #xA0 #x80)               ; UTF-16 surrogate U+D800
+                     (octets #xE0 #x80 #x80)               ; overlong 3-byte
+                     (octets #xF0 #x80 #x80 #x80)          ; overlong 4-byte
+                     (octets #xF8 #x80 #x80 #x80 #x80)     ; 5-byte lead (invalid)
+                     (octets #x80)                         ; standalone continuation
+                     (octets #xE2 #x28 #xA1)               ; bad continuation byte
+                     (octets #xF4 #x90 #x80 #x80)))        ; F4 90.. -> > U+10FFFF
+    (%check :ms-fuzz-utf8-reject
+            (eq :caught (handler-case (dds.durability::%ms-utf8->string bad 0 (length bad))
+                          (dds.durability::microservice-protocol-error () :caught)))
+            "malformed UTF-8 topic raises a clean protocol error (no TYPE-ERROR / crash)"))
+  (let ((valid "AZ¿ࠀ\U0001F600"))   ; ASCII + 2/3/4-byte scalars
+    (%check :ms-fuzz-utf8-roundtrip
+            (string= valid (let ((u (dds.durability::%string->utf8 valid)))
+                             (dds.durability::%ms-utf8->string u 0 (length u))))
+            "a well-formed multibyte topic round-trips exactly through the validating decoder"))
+  ;; (2) SERVER SURVIVAL: raw malformed-topic frames must not kill the listener
+  (let* ((srv (dds.durability:make-microservice-server :port 0))
+         (port (dds.durability:microservice-server-port srv)))
+    (unwind-protect
+        (progn
+          (dolist (bad (list (octets #xF7 #xBF #xBF #xBF) (octets #xC0 #x80)
+                             (octets #xED #xA0 #x80) (octets #xF8 #x80 #x80 #x80 #x80)
+                             (octets #x80)))
+            (let ((c (dds.pal:tcp-connect "127.0.0.1" port)))
+              (unwind-protect
+                  (let ((msg (%tms-bad-topic-frame bad))
+                        (h (make-array 4 :element-type '(unsigned-byte 8))))
+                    (dds.pal:tcp-send c msg (length msg))
+                    (%check :ms-fuzz-server-drops (null (dds.pal:tcp-recv c h 4))
+                            "server drops the malformed-topic connection (no response)"))
+                (ignore-errors (dds.pal:tcp-close c)))))
+          ;; the listener survived every attack -> a fresh valid client round-trips
+          (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+            (dds.durability:store-open s)
+            (%check :ms-fuzz-server-survives
+                    (eq t (dds.durability:store-put s "ok" (%tms-guid 1) 1 nil :data (octets 1 2 3)))
+                    "SERVE THREAD SURVIVED the malformed topics: a subsequent valid client succeeds")
+            (%check :ms-fuzz-server-roundtrip (= 1 (dds.durability:store-count s "ok"))
+                    "post-fuzz round-trip intact")
+            (dds.durability:store-close s)))
+      (dds.durability:microservice-server-stop srv)))
+  ;; (3) CLIENT SYMMETRIC: a garbled server response -> microservice-store-error (not TYPE-ERROR)
+  (let ((ln (dds.pal:tcp-listen "127.0.0.1" 0)))
+    (unwind-protect
+        (let* ((port (dds.pal:tcp-local-port ln))
+               (th (dds.pal:spawn
+                    (lambda ()
+                      (ignore-errors
+                       (let ((c (dds.pal:tcp-accept ln)))
+                         (dds.durability::%ms-recv-message c)          ; drain the open request
+                         (let ((r (dds.durability::%ms-frame-message dds.durability::+ms-status-ok+
+                                                                     (dds.durability::%ms-empty-payload))))
+                           (dds.pal:tcp-send c r (length r)))          ; valid open response
+                         (dds.durability::%ms-recv-message c)          ; drain the topics request
+                         (let ((b (dds.durability::%ms-buf)))          ; garbled topics response
+                           (dds.durability::%ms-put-u32 b 1)
+                           (dds.durability::%ms-put-u16 b 4)
+                           (dds.durability::%ms-put-bytes b (octets #xF7 #xBF #xBF #xBF))
+                           (let ((r (dds.durability::%ms-frame-message dds.durability::+ms-status-ok+
+                                                                       (dds.durability::%ms-finalize b))))
+                             (dds.pal:tcp-send c r (length r))))
+                         (dds.pal:tcp-close c)))))))
+          (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+            (dds.durability:store-open s)
+            (%check :ms-fuzz-client-clean
+                    (eq :store-err (handler-case (progn (dds.durability:store-topics s) :no-error)
+                                     (dds.durability:microservice-store-error () :store-err)))
+                    "a garbled server response signals microservice-store-error (not a TYPE-ERROR)")
+            (ignore-errors (dds.durability:store-close s)))
+          (ignore-errors (dds.pal:join th)))
+      (ignore-errors (dds.pal:tcp-close ln))))
+  t)

@@ -1338,6 +1338,68 @@ Tests: `run-dare-metadata-conf-3c-test` (both backends), the extended `run-dare-
 
 ---
 
+## 8.10 MICROSERVICE persistence backend — a durable-store proxied over TCP (ADR 0050)
+
+The fourth pluggable persistence tier (ADR 0021 capability 6, after memory / file / SQLite) puts the
+records in a **separate process** reached over TCP. It is the same `durable-store` vtable, *remoted*: a
+**client** store fills every slot by proxying the call to a **reference server** holding an inner store.
+
+```lisp
+;; server: an opaque proxy over an inner store (memory in Slice 1); port 0 = ephemeral
+(let* ((srv  (dds.durability:make-microservice-server :port 0))
+       (port (dds.durability:microservice-server-port srv))
+       (s    (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+  (dds.durability:store-open s)                                  ; connects + opens the inner store
+  (dds.durability:store-put s "Square" guid 1 nil :data payload) ; -> T (or :rejected)
+  (dds.durability:store-get-range s "Square")                    ; -> records, (guid,sn)-ordered, byte-exact
+  (dds.durability:store-close s)                                 ; ends the session, closes the socket
+  (dds.durability:microservice-server-stop srv))                 ; clean thread join + socket close, no leak
+```
+
+**PAL TCP primitives (the enabler).** `dds.pal:tcp-connect / tcp-listen / tcp-accept / tcp-local-port /
+tcp-send / tcp-recv / tcp-close` — native `sb-bsd-sockets` **stream** sockets, the same substrate as the
+UDP primitives (SBCL contrib + Clasp bundled, **no new dependency, no usocket**). A TCP stream is a byte
+pipe, not message-framed, so two loops are load-bearing: `tcp-send` loops over short writes; `tcp-recv`
+loops over partial reads until the full frame is assembled (a large payload splits across TCP segments —
+a partial read is normal, not EOF), returning `NIL` only on genuine peer-close. On Darwin each socket
+sets `SO_NOSIGPIPE` so a write to a dead peer is a catchable `SOCKET-ERROR`, not a SIGPIPE (identical
+clean behaviour on both impls). No reader conditionals outside `dds-pal/`.
+
+**The wire protocol.** Length-prefixed request/response over one connection (little-endian):
+`u32 body-len | u8 op-code | payload` and `u32 body-len | u8 status | payload`. Ops: `put`=1,
+`get-range`=2, `topics`=3, `purge`=4, `count`=5, `open`=6, `close`=7, `delete`=9. A topic is a
+`u16`-length UTF-8 field; a record REUSES the **file-store frame format verbatim** (`%frame-record` /
+`%parse-frame`) — no new record format is invented. Every length and count is bounds-checked against the
+buffer extent before it is trusted (NFR-SEC-POSTURE): a malformed message raises a clean condition
+(server drops the connection; client signals `microservice-store-error`), never an OOB access or a hang.
+
+**Opaque proxy + DARE composition.** The server is **DARE-blind** — it decodes each op and dispatches to
+its inner store's public dispatcher with zero crypto knowledge. Confidentiality composes the other way:
+`make-encrypted-store` layers OVER the client store unchanged (the proxy carries sealed bytes) — that is
+**Slice 2**. The `:sync` and `:set-chain-mac-fn` vtable slots are left **NIL — memory-tier parity**
+(documented, exactly as `make-memory-store`): a client cannot ship a secret-holding chain-MAC closure
+over TCP; per-record DARE-GCM still authenticates each record; the cross-frame keyed chain (ADR 0045) is
+a local-store-tier feature.
+
+**Scope.** Slice 1 (built) = connect-on-open, round-trip byte-exact + `(guid,sn)`-ordered, large
+multi-segment payloads, torn-read fails cleanly, both impls. Deferred: DARE-wrapping (Slice 2);
+persistent inner store + cross-restart + the `DPERSIST_BACKEND=microservice` config seam + reconnect /
+multi-client / chunked large `get-range` (Slice 3). See ADR 0050.
+
+Every wire length/count is bounds-checked and the topic UTF-8 is well-formedness-validated (Unicode
+Table 3-7 / RFC 3629) before `code-char`, so a malformed message raises a clean `microservice-protocol-
+error` (never an out-of-range `code-char` TYPE-ERROR); a `serious-condition` backstop in the per-connection
+serve loop means a single bad message drops that connection and the serve thread keeps accepting.
+
+Tests: `run-pal-tcp-loopback-test` (PAL TCP round-trip), `run-durability-microservice-test` (the slice:
+2 topics, distinct guids/sns/kinds/key-hashes, empty + 100 KB payloads, counts, idempotent re-put no-op,
+delete, purge), `run-durability-microservice-large-test` (500 KB multi-segment byte-exact),
+`run-durability-microservice-torn-test` (clean failure on peer-close), `run-durability-microservice-fuzz-test`
+(malformed-UTF-8 topics → protocol-error + the serve thread SURVIVES + a subsequent valid client succeeds;
+a garbled server response → a clean client `microservice-store-error`). Both impls, Clasp first.
+
+---
+
 ## 9. Cross-references
 
 - ADR 0021 — Durability service scope decision (owner directive 2026-06-18; cap. 7 = always-on DARE)
@@ -1351,6 +1413,7 @@ Tests: `run-dare-metadata-conf-3c-test` (both backends), the extended `run-dare-
 - ADR 0029 — Per-instance KEEP_LAST compaction in the durability service (DDS 1.4 §2.2.3.5; file-store compaction-on-open + in-memory online eviction; service-spec via store-open; Connext M=302→2, Fast DDS M=134→2)
 - ADR 0030 — Graceful FFI teardown on SIGTERM/SIGINT (`dds.pal:install-signal-handler`; orderly drain supervisor-stop → runner-stop → store-close → uiop:quit 0; `kill -15` clean exit both impls; resolves ADR 0026 §10 item 3)
 - ADR 0049 — Durability SQLite persistence backend (`make-sqlite-store` / `make-sqlite-store-factory` on the fixed `durable-store` vtable; SN as big-endian BLOB; DARE-wrapped; §8.8; resolves the "db persistence backend" follow-on)
+- ADR 0050 — Durability MICROSERVICE persistence backend (`make-microservice-store` client + `make-microservice-server` reference server on the fixed `durable-store` vtable, proxied over native PAL TCP; reuses the file-store frame format; opaque DARE-blind proxy; §8.10; ADR 0021 cap. 6 — the last pluggable-persistence tier)
 - `docs/superpowers/specs/2026-06-19-durability-dare-design.md` — the DARE design spec
 - `docs/superpowers/specs/2026-06-20-durability-persistent-design.md` — the PERSISTENT design spec
 - `docs/superpowers/spikes/2026-06-18-durability-virtual-guid-findings.md` — PID_ORIGINAL_WRITER_INFO spike
@@ -1363,7 +1426,7 @@ Tests: `run-dare-metadata-conf-3c-test` (both backends), the extended `run-dare-
 - `interop/durability-keeplast/` — KEEP_LAST restart-seed cross-DDS harness (Leg 1 Connext M=302→D=2, Leg 2 Fast DDS M=134→D=2); `spike/` — `PID_KEY_HASH` presence confirmations (767 Connext + 362 Fast DDS)
 - `interop/graceful-shutdown/` — `kill -15` clean-exit harness (`driver.lisp` + `run-kill15.sh`); both Clasp and SBCL: status 0, no SIGBUS (ADR 0030)
 - `src/dds-disc/disc.lisp` — `sample-origins` struct slot; `capture-data-key-hash` slot (KEEP_LAST, ADR 0029); `sample-key-hashes` table; `src/dds-disc/dataplane.lisp` — `node-sample-origin-guid` / `node-sample-origin-sn` (logical-origin accessors) + `%record-sample-origin` setter; `node-sample-key-hash (node key)` → captured `PID_KEY_HASH (0x0070)` per `(writer-guid . sn)` (ADR 0029)
-- `src/dds-durability/` — service implementation (store / store-file / store-sqlite / spec / service / runner / supervisor / main / store-encrypted)
+- `src/dds-durability/` — service implementation (store / store-file / store-sqlite / store-microservice / spec / service / runner / supervisor / main / store-encrypted)
 - `src/dds-dare/` — DARE crypto (openssl-ffi / primitives / envelope / key-provider)
 - `src/dds-pal/pal-{sbcl,clasp}.lisp` — `fsync-stream` (group-commit; NFR-PORT split: SBCL `fdatasync(2)` / Clasp `finish-output`)
 - `src/dds-tests/durability-test.lisp` — unit + integration tests (incl. `run-durability-no-double-delivery-test`, `run-durability-multitopic-test`, `run-durability-dispose-replay-test`, `run-durability-file-recovery-test`, `run-dare-*`, `run-durability-collect-origin-convergence-test`, `run-durability-keeplast-compaction-test`, `run-durability-keeplast-cross-restart-test`, `run-durability-keeplast-service-spec-policy-test`, `run-durability-keeplast-memory-test`)

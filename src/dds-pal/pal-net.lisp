@@ -99,6 +99,112 @@
   "Close SOCKET."
   (sb-bsd-sockets:socket-close socket))
 
+;; TCPv4 stream sockets (FR-XPORT-1). Same sb-bsd-sockets substrate as UDP above (native on SBCL
+;; contrib + Clasp bundled); no reader conditionals except the OS-specific SO_NOSIGPIPE below.
+;; A stream is a byte pipe, NOT message-framed: tcp-send loops over short writes and tcp-recv loops
+;; until LEN bytes are assembled (a large frame splits across segments). socket-send / socket-receive
+;; write/read at buffer[0] with no offset arg (verified both impls), so the continuation reads/writes
+;; go through a subseq / scratch+replace — the destination offset is honoured in Lisp.
+
+;; SO_NOSIGPIPE (Darwin, SOL_SOCKET=#xffff optname=#x1022): a write to a peer that has closed returns
+;; EPIPE (-> a catchable SOCKET-ERROR) instead of raising SIGPIPE. On Darwin this also keeps Clasp off
+;; its signal->CLOS-condition path (the known Clasp multithreaded-signal fragility), so BOTH impls take
+;; the identical clean EPIPE->SOCKET-ERROR path on a torn connection. Linux runtimes ignore SIGPIPE
+;; process-wide already (SBCL + Clasp), so the option is Darwin-only.
+#+darwin (defconstant +so-nosigpipe+ #x1022 "Darwin SO_NOSIGPIPE optname (suppress SIGPIPE on a dead peer).")
+
+(defun* %tcp-suppress-sigpipe (socket)
+    (function (t) t)
+  "Route a write-to-closed-peer to EPIPE (SOCKET-ERROR) rather than SIGPIPE. Darwin: SO_NOSIGPIPE;
+   elsewhere a no-op (the runtime ignores SIGPIPE process-wide)."
+  (declare (ignorable socket))
+  #+darwin (%setsockopt socket +sol-socket+ +so-nosigpipe+ '(1 0 0 0))
+  t)
+
+(defun* tcp-connect (host port)
+    (function (string (integer 0 65535)) t)
+  "Open a TCPv4 stream socket connected to HOST:PORT. Returns the connected socket."
+  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (%tcp-suppress-sigpipe s)
+    (sb-bsd-sockets:socket-connect s (%parse-ipv4 host) port)
+    s))
+
+(defun* tcp-listen (host port &key (backlog 8))
+    (function (string (integer 0 65535) &key (:backlog (integer 1))) t)
+  "Open a listening TCPv4 stream socket bound to HOST:PORT (port 0 = ephemeral), SO_REUSEADDR set,
+   with the given accept BACKLOG. Returns the listener socket (use tcp-local-port to read an ephemeral
+   port, tcp-accept to take connections)."
+  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (setf (sb-bsd-sockets:sockopt-reuse-address s) t)
+    (sb-bsd-sockets:socket-bind s (%parse-ipv4 host) port)
+    (sb-bsd-sockets:socket-listen s backlog)
+    s))
+
+(defun* tcp-accept (listener)
+    (function (t) t)
+  "Block until a client connects to LISTENER; return the connected stream socket (SIGPIPE suppressed)."
+  (let ((s (sb-bsd-sockets:socket-accept listener)))
+    (%tcp-suppress-sigpipe s)
+    s))
+
+(defun* tcp-local-port (listener)
+    (function (t) (integer 0 65535))
+  "The bound local port of LISTENER (read an ephemeral port after a port-0 bind)."
+  (nth-value 1 (sb-bsd-sockets:socket-name listener)))
+
+(defun* tcp-send (socket buffer len)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) (integer 0))
+  "Send exactly LEN octets of BUFFER[0..LEN) over stream SOCKET, looping over short writes (a stream
+   socket may accept fewer than requested). Returns LEN. Signals on a failed / zero-progress write
+   (peer reset) — the socket-level error is contained here, never leaked to callers as a raw
+   sb-bsd-sockets condition."
+  (let ((sent 0))
+    (declare (type (integer 0) sent))
+    (handler-case
+        (loop while (< sent len)
+              do (let ((n (if (zerop sent)
+                              (sb-bsd-sockets:socket-send socket buffer len)
+                              (sb-bsd-sockets:socket-send socket (subseq buffer sent len) (- len sent)))))
+                   (when (or (null n) (zerop n))
+                     (error "dds.pal: tcp-send made no progress (sent ~d of ~d)" sent len))
+                   (incf sent n)))
+      (sb-bsd-sockets:socket-error (e)
+        (error "dds.pal: tcp-send failed on stream socket: ~a" e)))
+    len))
+
+(defun* tcp-recv (socket buffer len)
+    (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) (or null (integer 0)))
+  "Receive exactly LEN octets into BUFFER[0..LEN) from stream SOCKET, looping over partial reads until
+   the full frame is assembled (TCP is a byte stream — one frame may split across segments; a partial
+   read is normal, NOT end-of-stream). Returns LEN, or NIL on EOF / peer-close / connection-reset
+   before LEN bytes arrive (a torn or short read = the connection dropped). BUFFER must hold >= LEN
+   octets. The first read lands straight in BUFFER; only a genuine split allocates one scratch buffer."
+  (when (zerop len) (return-from tcp-recv 0))
+  (let ((got 0) (scratch nil))
+    (declare (type (integer 0) got))
+    (handler-case
+        (loop while (< got len)
+              do (if (zerop got)
+                     (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive socket buffer len)
+                       (declare (ignore b))
+                       (when (or (null n) (zerop n)) (return-from tcp-recv nil))
+                       (setf got n))
+                     (progn
+                       (unless scratch
+                         (setf scratch (make-array (- len got) :element-type '(unsigned-byte 8))))
+                       (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive socket scratch (- len got))
+                         (declare (ignore b))
+                         (when (or (null n) (zerop n)) (return-from tcp-recv nil))
+                         (replace buffer scratch :start1 got :end1 (+ got n) :end2 n)
+                         (incf got n)))))
+      (sb-bsd-sockets:socket-error () (return-from tcp-recv nil)))
+    len))
+
+(defun* tcp-close (socket)
+    (function (t) t)
+  "Close stream SOCKET."
+  (sb-bsd-sockets:socket-close socket))
+
 ;; POSIX shared-memory segment primitives (FR-XPORT-2). open(2)/mmap(2) flag values
 ;; are OS-specific (Darwin vs Linux), not implementation-specific — hence OS reader
 ;; conditionals, not impl ones, mirroring the socket-option block above. off_t/size_t

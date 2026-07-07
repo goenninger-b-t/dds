@@ -48,6 +48,10 @@
    ;; UDPv4 sockets (native, FR-XPORT-1)
    #:udp-open #:udp-local-port #:udp-send-to #:udp-recv #:udp-close
    #:udp-set-reuse-port #:udp-join-multicast
+   ;; TCPv4 stream sockets (native, FR-XPORT-1). Byte-stream full-send / full-frame recv loops
+   ;; (a stream is not message-framed): tcp-send loops over short writes, tcp-recv loops until LEN
+   ;; bytes or peer-close (NIL). Backs the durability MICROSERVICE persistence backend (ADR 0050).
+   #:tcp-connect #:tcp-listen #:tcp-accept #:tcp-local-port #:tcp-send #:tcp-recv #:tcp-close
    ;; gc control / measurement
    #:gc-suggest #:with-gc-inhibited #:bytes-consed
    ;; optimization hints

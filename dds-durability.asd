@@ -8,6 +8,7 @@
                (:file "store")
                (:file "store-file")
                (:file "store-sqlite")
+               (:file "store-microservice")
                (:file "spec")
                (:file "service")
                (:file "store-encrypted")
