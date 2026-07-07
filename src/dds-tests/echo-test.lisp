@@ -3987,6 +3987,8 @@
                  ("durability-microservice-large"     . run-durability-microservice-large-test)
                  ("durability-microservice-torn"      . run-durability-microservice-torn-test)
                  ("durability-microservice-fuzz"      . run-durability-microservice-fuzz-test)
+                 ("durability-microservice-factory"   . run-durability-microservice-factory-test)
+                 ("durability-microservice-dare"      . run-durability-microservice-dare-test)
                  ("security-secured-payload"     . run-security-secured-payload-corpus-test)
                  ("security-secured-payload-pad" . run-security-secured-payload-pad-corpus-test)
                  ("security-keymaterial-harden"  . run-security-keymaterial-harden-test)

@@ -633,3 +633,39 @@
       (ignore-errors (dds.pal:tcp-close (microservice-server-listener srv)))
       (ignore-errors (store-close (microservice-server-inner srv)))))
   t)
+
+;;; ---- DARE-wrapping store factory (Slice 2 — ADR 0021 cap 6 x cap 7 compose) ----
+
+(defun* make-microservice-store-factory (&key host port epoch-dir key-dir)
+    (function (&key (:host (or null string)) (:port (integer 0 65535))
+                    (:epoch-dir (or pathname string)) (:key-dir (or pathname string)))
+              function)
+  "Return a 0-arg store factory producing the DARE-wrapped MICROSERVICE composition (ADR 0050 Slice 2;
+   ADR 0021 capability 6 x capability 7): make-encrypted-store(make-microservice-store(:host HOST
+   :port PORT), make-file-key-provider(:dir KEY-DIR), :epoch-dir EPOCH-DIR). Sibling of
+   make-sqlite-store-factory / make-persistent-store-factory — the ONLY change is make-microservice-store
+   in place of the local inner store, because the durable-store vtable is the fixed backend contract
+   every tier fills unchanged. Pass this as the :STORE argument to MAKE-SERVICE-SPEC to config-select the
+   encrypted tier whose persistence is a REMOTE microservice.
+
+   The always-on CNSA-2.0 DARE runs entirely CLIENT-SIDE: the ML-KEM-1024 anchor, epochs.dat, the log-MAC
+   anchor, and k_meta ALL live in the LOCAL EPOCH-DIR / KEY-DIR, and make-encrypted-store SEALS every
+   record before it reaches the wire — so the remote microservice server stores ONLY opaque ciphertext
+   (a hex topic-hash, a 16-byte GUID surrogate, sn=0, and the sealed blob), NEVER a plaintext
+   topic/GUID/SN/key-hash/payload or any key. The cross-frame keyed chain-MAC (ADR 0045) is ABSENT at the
+   microservice tier (make-microservice-store leaves :set-chain-mac-fn NIL — MEMORY-TIER PARITY: a
+   secret-holding chain oracle cannot ship over TCP); per-record DARE-GCM still authenticates each frame.
+   Unlike the sqlite/file siblings the inner tier's HISTORY policy is NOT a construction argument — it
+   travels to the remote inner store at STORE-OPEN (the service-spec's history-kind/depth), the same
+   open-time policy path memory and microservice share. HOST defaults to 127.0.0.1; PORT is the server's
+   port. :PROCESS service mode does NOT carry this factory across the subprocess boundary — use :THREAD
+   mode. The returned store requires STORE-OPEN before reads/writes and STORE-CLOSE (frees the DEK map +
+   ends the client session); STORE-CLOSE is mandatory."
+  (let ((h  host)
+        (p  port)
+        (ed (uiop:ensure-directory-pathname epoch-dir))
+        (kd (uiop:ensure-directory-pathname key-dir)))
+    (lambda ()
+      (make-encrypted-store (make-microservice-store :host h :port p)
+                            (dds.dare:make-file-key-provider :dir kd)
+                            :epoch-dir ed))))

@@ -32,7 +32,7 @@
            #:durable-store-sync #:store-sync #:store-delete
            #:make-persistent-store-factory
            #:make-sqlite-store #:make-sqlite-store-factory
-           #:make-microservice-store #:make-microservice-server
+           #:make-microservice-store #:make-microservice-store-factory #:make-microservice-server
            #:microservice-server #:microservice-server-p
            #:microservice-server-port #:microservice-server-stop
            #:microservice-store-error))

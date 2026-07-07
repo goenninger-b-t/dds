@@ -1373,18 +1373,50 @@ clean behaviour on both impls). No reader conditionals outside `dds-pal/`.
 buffer extent before it is trusted (NFR-SEC-POSTURE): a malformed message raises a clean condition
 (server drops the connection; client signals `microservice-store-error`), never an OOB access or a hang.
 
-**Opaque proxy + DARE composition.** The server is **DARE-blind** — it decodes each op and dispatches to
-its inner store's public dispatcher with zero crypto knowledge. Confidentiality composes the other way:
-`make-encrypted-store` layers OVER the client store unchanged (the proxy carries sealed bytes) — that is
-**Slice 2**. The `:sync` and `:set-chain-mac-fn` vtable slots are left **NIL — memory-tier parity**
-(documented, exactly as `make-memory-store`): a client cannot ship a secret-holding chain-MAC closure
-over TCP; per-record DARE-GCM still authenticates each record; the cross-frame keyed chain (ADR 0045) is
-a local-store-tier feature.
+**Opaque proxy + DARE composition (Slice 2, built).** The server is **DARE-blind** — it decodes each op
+and dispatches to its inner store's public dispatcher with zero crypto knowledge. Confidentiality
+composes the other way: `make-encrypted-store` layers OVER the client store unchanged (the proxy carries
+sealed bytes), realised by **`make-microservice-store-factory`** — the exact sibling of
+`make-sqlite-store-factory` / `make-persistent-store-factory`, with `make-microservice-store` in the
+inner slot and **no server change**:
+
+```lisp
+;; config-select the encrypted tier whose persistence is a REMOTE microservice; all DARE state is LOCAL
+:store (dds.durability:make-microservice-store-factory
+        :host "127.0.0.1" :port server-port   ; the opaque inner: the remote server
+        :epoch-dir #p"/var/lib/dds/epochs/"    ; LOCAL: epochs.dat + logmac.anchor (client-side)
+        :key-dir   #p"/var/lib/dds/keys/")     ; LOCAL: the ML-KEM-1024 keypair (client-side)
+;; == (make-encrypted-store (make-microservice-store :host ... :port ...)
+;;                          (make-file-key-provider :dir key-dir) :epoch-dir epoch-dir)
+```
+
+The client **seals + MACs locally**; the ML-KEM anchor, `epochs.dat`, the log-MAC anchor, and `k_meta`
+all live in the local `epoch-dir`/`key-dir`, so the remote server stores **only opaque ciphertext**: a
+hex topic-hash, a 16-byte GUID surrogate, `sn = 0`, a NIL key-hash, and the sealed blob — never a
+plaintext topic name / GUID / SN / key-hash / payload, and never a key. The `:sync` and
+`:set-chain-mac-fn` vtable slots are left **NIL** (the same slot profile as `make-memory-store`): a client
+cannot ship a secret-holding chain-MAC closure over TCP, so the chain-oracle install is a no-op and the
+cross-frame keyed log-MAC chain (ADR 0045) is absent at this tier; **per-record DARE-GCM still authenticates
+each record** (an attacker cannot read, forge, or alter a frame's contents, and reorder is neutralized by the
+client re-sorting on decrypted `(guid,sn)`). **Integrity caveat for the remote case (not memory-parity):**
+what the absent chain leaves open is record-sequence **completeness/freshness** — a malicious or compromised
+*remote* server can silently **drop / truncate / roll back** sealed records undetected. This differs from
+`make-memory-store` (intra-process — an adversary who can tamper already holds the keys); a microservice
+store is across a trust boundary, exactly the untrusted-storage adversary the chain defends, and the
+file/SQLite tiers (same on-disk-tamper threat) **do** carry the chain. A **client-side v3 chain-MAC over the
+microservice tier (shipping the 32-byte MAC as an opaque field the server stores blindly) is a Slice-3
+requirement** to close this for a production remote deployment. Confidentiality (no plaintext at the server)
+is fully met here. Unlike the
+file/sqlite factories, the inner tier's HISTORY policy is not a factory argument — it reaches the remote
+inner store at `store-open` (from the service-spec `history-kind`/`history-depth`), the open-time path
+memory and microservice share.
 
 **Scope.** Slice 1 (built) = connect-on-open, round-trip byte-exact + `(guid,sn)`-ordered, large
-multi-segment payloads, torn-read fails cleanly, both impls. Deferred: DARE-wrapping (Slice 2);
-persistent inner store + cross-restart + the `DPERSIST_BACKEND=microservice` config seam + reconnect /
-multi-client / chunked large `get-range` (Slice 3). See ADR 0050.
+multi-segment payloads, torn-read fails cleanly, both impls. Slice 2 (built) = the
+`make-microservice-store-factory` DARE-wrap + the no-plaintext-at-server proof + round-trip through DARE,
+both impls, zero server change. Deferred: persistent inner store + cross-restart + the
+`DPERSIST_BACKEND=microservice` config/env seam + reconnect / multi-client / chunked large `get-range` +
+an optional client-side v3 chain over the microservice tier (Slice 3). See ADR 0050.
 
 Every wire length/count is bounds-checked and the topic UTF-8 is well-formedness-validated (Unicode
 Table 3-7 / RFC 3629) before `code-char`, so a malformed message raises a clean `microservice-protocol-
@@ -1396,7 +1428,13 @@ Tests: `run-pal-tcp-loopback-test` (PAL TCP round-trip), `run-durability-microse
 delete, purge), `run-durability-microservice-large-test` (500 KB multi-segment byte-exact),
 `run-durability-microservice-torn-test` (clean failure on peer-close), `run-durability-microservice-fuzz-test`
 (malformed-UTF-8 topics → protocol-error + the serve thread SURVIVES + a subsequent valid client succeeds;
-a garbled server response → a clean client `microservice-store-error`). Both impls, Clasp first.
+a garbled server response → a clean client `microservice-store-error`). Slice 2:
+`run-durability-microservice-factory-test` (the factory composes `encrypted-store` over
+`microservice-store`, name `:encrypted-persistent`; DARE-free, always runs) and
+`run-durability-microservice-dare-test` (no-plaintext-at-server: topic `"Square"` / GUID / SN / payload
+ALL absent from a byte-scan of the server's inner records, a RED bare store leaking all four; plus
+round-trip through DARE byte-exact + ordered + idempotent re-put + count — skips if OpenSSL < 3.5). Both
+impls, Clasp first.
 
 ---
 

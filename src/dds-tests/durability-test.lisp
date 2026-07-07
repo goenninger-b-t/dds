@@ -6323,3 +6323,187 @@
           (ignore-errors (dds.pal:join th)))
       (ignore-errors (dds.pal:tcp-close ln))))
   t)
+
+;;; --- WP-DURABILITY-MICROSERVICE-2 (ADR 0050 Slice 2; ADR 0021 cap 6 x cap 7) — DARE-wrap compose ---
+
+(defun* %tms-tmp-dir (tag)
+    (function (string) pathname)
+  "A fresh unique temp directory pathname for one microservice DARE test arm (TAG + time + random)."
+  (uiop:merge-pathnames*
+   (make-pathname :directory (list :relative (format nil "dds-ms-~a-~a-~a" tag (get-universal-time) (random 1000000))))
+   (uiop:temporary-directory)))
+
+(defun* %tms-flatten-store (store)
+    (function (dds.durability:durable-store) (simple-array (unsigned-byte 8) (*)))
+  "Concatenate EVERY octet the inner STORE physically holds — per record, per topic: the topic name
+   UTF-8, the writer-GUID, the sn as 8 little-endian bytes, the key-hash (if any), and the payload — into
+   one octet vector so a no-plaintext scan can prove a plaintext needle is ABSENT from all the server
+   actually stores (the memory-inner analogue of the 3c on-disk byte scan)."
+  (let ((acc (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+    (flet ((push-bytes (v) (loop for x across v do (vector-push-extend x acc))))
+      (dolist (topic (dds.durability:store-topics store))
+        (push-bytes (map '(simple-array (unsigned-byte 8) (*)) #'char-code topic))
+        (dolist (rec (dds.durability:store-get-range store topic))
+          (push-bytes (dds.durability:durable-record-writer-guid rec))
+          (let ((sn (dds.durability:durable-record-sn rec))
+                (snb (make-array 8 :element-type '(unsigned-byte 8))))
+            (dotimes (i 8) (setf (aref snb i) (ldb (byte 8 (* 8 i)) sn)))
+            (push-bytes snb))
+          (let ((kh (dds.durability:durable-record-key-hash rec)))
+            (when kh (push-bytes kh)))
+          (push-bytes (dds.durability:durable-record-payload rec)))))
+    (coerce acc '(simple-array (unsigned-byte 8) (*)))))
+
+(defun* run-durability-microservice-factory-test ()
+    (function () t)
+  "Slice-2 FACTORY/CONFIG (ADR 0050; runs REGARDLESS of OpenSSL — the composition is DARE-free at
+   construction, per %make-epoch-encrypted-store 'Constructed CLOSED'): make-microservice-store-factory
+   returns a 0-arg closure that COMPOSES make-encrypted-store OVER make-microservice-store — the returned
+   store is the encrypted decorator (name :encrypted-persistent), NOT the bare :microservice inner — the
+   same service-spec :store 0-arg-closure contract as make-sqlite-store-factory."
+  (let* ((inner (dds.durability:make-memory-store))
+         (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+         (port  (dds.durability:microservice-server-port srv))
+         (base  (%tms-tmp-dir "factory"))
+         (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base)))
+    (unwind-protect
+        (let ((factory (dds.durability:make-microservice-store-factory
+                        :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir)))
+          (%check :ms-factory-fn (functionp factory)
+                  "make-microservice-store-factory returns a 0-arg closure")
+          (let ((store (funcall factory)))
+            (%check :ms-factory-store (typep store 'dds.durability:durable-store)
+                    "the closure constructs a durable-store")
+            (%check :ms-factory-composed
+                    (eq :encrypted-persistent (dds.durability::durable-store-name store))
+                    "the composition is encrypted-store OVER microservice-store (:encrypted-persistent)")))
+      (dds.durability:microservice-server-stop srv)
+      (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
+  t)
+
+(defun* run-durability-microservice-dare-test ()
+    (function () t)
+  "Slice-2 DARE composition proof (ADR 0050; ADR 0021 cap 6 x cap 7): encrypted-store(microservice-store).
+   (1) NO PLAINTEXT AT THE SERVER — put a record with plaintext topic \"Square\" + a distinctive
+   GUID/SN/payload through the DARE-wrapped client; the remote server's inner store holds ONLY a hex
+   topic-hash, a 16-byte GUID surrogate, sn=0, and sealed ciphertext — the topic name, GUID bytes, SN
+   bytes, AND payload bytes are ALL ABSENT. RED contrast: a BARE microservice-store (no DARE) leaks all
+   four in cleartext. (2) ROUND-TRIP THROUGH DARE — put N over 2 topics with distinct fields; get-range
+   recovers the REAL topic/GUID/SN/kind/key-hash/payload byte-exact + (guid,sn)-ordered; idempotent
+   re-put no-op; logical count. SKIPs if OpenSSL >= 3.5 is unavailable (the DARE-test pattern)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [microservice-dare] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-microservice-dare-test t)))
+  ;; distinctive plaintext needles (multi-byte, collision-negligible)
+  (let ((dguid (make-array 16 :element-type '(unsigned-byte 8)
+                           :initial-contents '(#xDE #xAD #xBE #xEF #xCA #xFE #xBA #xBE
+                                               #x01 #x23 #x45 #x67 #x89 #xAB #xCD #xEF)))
+        (dsn   #x1122334455667788)
+        (dpay  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                    "MICROSERVICE-SLICE2-PLAINTEXT-PAYLOAD-DO-NOT-LEAK"))
+        (tneedle (map '(simple-array (unsigned-byte 8) (*)) #'char-code "Square"))
+        (snb (make-array 8 :element-type '(unsigned-byte 8))))
+    (dotimes (i 8) (setf (aref snb i) (ldb (byte 8 (* 8 i)) dsn)))
+    ;; ---- (1a) GREEN: DARE-wrapped -> the server holds only ciphertext + surrogates ----
+    (let* ((inner (dds.durability:make-memory-store))
+           (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+           (port  (dds.durability:microservice-server-port srv))
+           (base  (%tms-tmp-dir "nopt-green"))
+           (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base))
+           (store (funcall (dds.durability:make-microservice-store-factory
+                            :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+      (unwind-protect
+          (progn
+            (dds.durability:store-open store)
+            (%check :ms-dare-put (eq t (dds.durability:store-put store "Square" dguid dsn nil :data dpay))
+                    "DARE-wrapped put of the plaintext-topic record")
+            (let ((hay (%tms-flatten-store inner)))
+              (%check :ms-dare-no-topic   (not (%pst-subseq-present-p hay tneedle))
+                      "server holds NO plaintext topic name \"Square\"")
+              (%check :ms-dare-no-guid    (not (%pst-subseq-present-p hay dguid))
+                      "server holds NO plaintext writer-GUID bytes")
+              (%check :ms-dare-no-sn      (not (%pst-subseq-present-p hay snb))
+                      "server holds NO plaintext SN bytes (inner sn=0, real sn sealed)")
+              (%check :ms-dare-no-payload (not (%pst-subseq-present-p hay dpay))
+                      "server holds NO plaintext payload bytes (sealed ciphertext only)"))
+            (let ((topics (dds.durability:store-topics inner)))
+              (%check :ms-dare-inner-1topic (= 1 (length topics)) "server inner holds exactly one topic")
+              (%check :ms-dare-inner-hashed (not (string= "Square" (first topics)))
+                      "server inner topic is a hash surrogate, not \"Square\"")
+              (let ((rec (first (dds.durability:store-get-range inner (first topics)))))
+                (%check :ms-dare-inner-sn0 (= 0 (dds.durability:durable-record-sn rec))
+                        "server inner record sn is 0 (the real sn is sealed inside the blob)")
+                (%check :ms-dare-inner-surrogate
+                        (not (equalp dguid (dds.durability:durable-record-writer-guid rec)))
+                        "server inner writer-GUID is a surrogate, not the real GUID"))))
+        (ignore-errors (dds.durability:store-close store))
+        (dds.durability:microservice-server-stop srv)
+        (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
+    ;; ---- (1b) RED: a bare microservice-store (no DARE) LEAKS all four in cleartext ----
+    (let* ((inner (dds.durability:make-memory-store))
+           (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+           (port  (dds.durability:microservice-server-port srv))
+           (store (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+      (unwind-protect
+          (progn
+            (dds.durability:store-open store)
+            (dds.durability:store-put store "Square" dguid dsn nil :data dpay)
+            (let ((hay (%tms-flatten-store inner)))
+              (%check :ms-red-topic   (%pst-subseq-present-p hay tneedle)
+                      "RED: a bare microservice server DOES hold the plaintext topic \"Square\"")
+              (%check :ms-red-guid    (%pst-subseq-present-p hay dguid)
+                      "RED: a bare microservice server DOES hold the plaintext writer-GUID")
+              (%check :ms-red-sn      (%pst-subseq-present-p hay snb)
+                      "RED: a bare microservice server DOES hold the plaintext SN bytes")
+              (%check :ms-red-payload (%pst-subseq-present-p hay dpay)
+                      "RED: a bare microservice server DOES hold the plaintext payload")))
+        (ignore-errors (dds.durability:store-close store))
+        (dds.durability:microservice-server-stop srv))))
+  ;; ---- (2) ROUND-TRIP THROUGH DARE: encrypted(microservice) == encrypted(memory) behavior ----
+  (let* ((inner (dds.durability:make-memory-store))
+         (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+         (port  (dds.durability:microservice-server-port srv))
+         (base  (%tms-tmp-dir "rt"))
+         (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base))
+         (store (funcall (dds.durability:make-microservice-store-factory
+                          :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+    (unwind-protect
+        (let ((g1 (%tms-guid 1)) (g2 (%tms-guid 2)) (g3 (%tms-guid 3))
+              (kh9 (%tms-guid 9)) (kh7 (%tms-guid 7)) (kh4 (%tms-guid 4))
+              (p3 (%tms-payload 3 1)) (p50 (%tms-payload 50 2)) (empty (%tms-payload 0 0))
+              (big (%tms-payload 3000 5)))
+          (dds.durability:store-open store)
+          (%check :ms-rt-put-a2 (eq t (dds.durability:store-put store "Square" g1 2 kh9 :data p3)) "put Square/g1/2")
+          (%check :ms-rt-put-a1 (eq t (dds.durability:store-put store "Square" g1 1 nil :data empty)) "put Square/g1/1 empty")
+          (%check :ms-rt-put-a5 (eq t (dds.durability:store-put store "Square" g2 5 kh7 :dispose big)) "put Square/g2/5")
+          (%check :ms-rt-put-b1 (eq t (dds.durability:store-put store "Circle" g3 1 nil :unregister p3)) "put Circle/g3/1")
+          (%check :ms-rt-put-b9 (eq t (dds.durability:store-put store "Circle" g3 9 kh4 :data p50)) "put Circle/g3/9")
+          (%check :ms-rt-count-a   (= 3 (dds.durability:store-count store "Square")) "count(Square)=3")
+          (%check :ms-rt-count-b   (= 2 (dds.durability:store-count store "Circle")) "count(Circle)=2")
+          (%check :ms-rt-count-all (= 5 (dds.durability:store-count store nil)) "count(nil)=5")
+          (let ((ra (dds.durability:store-get-range store "Square")))
+            (%check :ms-rt-a-order (equal '(1 2 5) (mapcar #'dds.durability:durable-record-sn ra))
+                    "get-range(Square) ordered by (guid,sn) through DARE")
+            (%check :ms-rt-a1 (%tms-rec= (first ra)  "Square" g1 1 nil :data    empty) "Square/g1/1 byte-exact through DARE")
+            (%check :ms-rt-a2 (%tms-rec= (second ra) "Square" g1 2 kh9 :data    p3)    "Square/g1/2 byte-exact through DARE")
+            (%check :ms-rt-a5 (%tms-rec= (third ra)  "Square" g2 5 kh7 :dispose big)   "Square/g2/5 byte-exact through DARE"))
+          (let ((rb (dds.durability:store-get-range store "Circle")))
+            (%check :ms-rt-b-order (equal '(1 9) (mapcar #'dds.durability:durable-record-sn rb))
+                    "get-range(Circle) ordered by (guid,sn) through DARE")
+            (%check :ms-rt-b1 (%tms-rec= (first rb)  "Circle" g3 1 nil :unregister p3)  "Circle/g3/1 byte-exact through DARE")
+            (%check :ms-rt-b9 (%tms-rec= (second rb) "Circle" g3 9 kh4 :data       p50) "Circle/g3/9 byte-exact through DARE"))
+          (%check :ms-rt-topics (equal '("Circle" "Square")
+                                       (sort (copy-list (dds.durability:store-topics store)) #'string<))
+                  "topics list through DARE")
+          ;; idempotent re-put: same (Square,g1,1) with a DIFFERENT payload -> T, no double-store, original kept
+          (%check :ms-rt-reput (eq t (dds.durability:store-put store "Square" g1 1 nil :data p50)) "re-put returns T")
+          (%check :ms-rt-reput-count (= 3 (dds.durability:store-count store "Square")) "re-put does not double-store")
+          (%check :ms-rt-reput-orig (= 0 (length (dds.durability:durable-record-payload
+                                                  (first (dds.durability:store-get-range store "Square")))))
+                  "re-put is a no-op: the ORIGINAL (empty) payload is retained through DARE"))
+      (ignore-errors (dds.durability:store-close store))
+      (dds.durability:microservice-server-stop srv)
+      (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
+  t)
