@@ -7214,19 +7214,26 @@
                         "RED: a BARE microservice-store (no chain) opens CLEAN on the same drop — 3 of 4 silently lost (chain absent)")
                 (dds.durability:store-close s2)))
           (dds.durability:microservice-server-stop srv)))
-      ;; ---- (2) RESIDUALS (chained) — tail-truncation + whole-topic-drop open CLEAN (documented) ----
+      ;; ---- (2) tail-truncation + whole-topic-drop now CLOSED by the sealed high-water tail anchor
+      ;;      (WP-DURABILITY-TAIL-ANCHOR-MS, ADR 0045 §7.1): the factory composes encrypted-store, which now
+      ;;      seals logmac.tail on close + verifies it on open (make-microservice-store fills the seam
+      ;;      client-side), so both former ADR 0050 §4.3 residuals now fail-closed. Full RED->GREEN coverage
+      ;;      is run-durability-microservice-tail-anchor-test; these two arms guard that the anchor engages
+      ;;      through this factory path too (the former residuals are no longer accepted). ----
       (multiple-value-bind (clean cnt)
           (%dare-arm 4 (lambda (inner)
                          (let ((tail (first (sort (copy-list (dds.durability:store-get-range inner (%topic-of inner)))
                                                   #'> :key #'%cseq-of))))
                            (dds.durability:store-delete inner (%topic-of inner)
                                                         (dds.durability:durable-record-writer-guid tail) 0))))
-        (%check :msrc-residual-tail-truncation (and clean (= 3 cnt))
-                "documented residual (ADR 0050 §4.3): tail-truncation of a valid prefix opens CLEAN (3 of 4, undetected)"))
+        (declare (ignore cnt))
+        (%check :msrc-tail-truncation-now-detected (not clean)
+                "tail-truncation of a valid prefix is now DETECTED at open (the sealed high-water anchor closes the former ADR 0050 §4.3 residual)"))
       (multiple-value-bind (clean cnt)
           (%dare-arm 4 (lambda (inner) (dds.durability:store-purge inner (%topic-of inner))))
-        (%check :msrc-residual-whole-topic-drop (and clean (= 0 cnt))
-                "documented residual (ADR 0050 §4.3): whole-topic-drop opens CLEAN (0 records, unverified)"))
+        (declare (ignore cnt))
+        (%check :msrc-whole-topic-drop-now-detected (not clean)
+                "whole-topic-drop is now DETECTED at open (the sealed topic-SET is the client-trusted enumeration — closes the former ADR 0050 §4.3 / store-microservice.lisp :581-584 residual)"))
       ;; ---- (3) CLEAN CONTROL (chained) — untampered reopen SUCCEEDS, non-vacuous ----
       (multiple-value-bind (clean cnt) (%dare-arm 4 (lambda (inner) (declare (ignore inner)) nil))
         (%check :msrc-clean-control (and clean (= 4 cnt))
@@ -7316,6 +7323,245 @@
                         "bare store payload byte-exact (no fold)"))
               (dds.durability:store-close s))
           (dds.durability:microservice-server-stop srv)))))
+  t)
+
+(defun* run-durability-microservice-tail-anchor-test ()
+    (function () t)
+  "WP-DURABILITY-TAIL-ANCHOR-MS (ADR 0045 §7.1, microservice tier — the LAST tier): the sealed high-water
+   tail anchor now engages for encrypted-store(microservice-store) — make-microservice-store FILLS the
+   read-only chain-tails / verify-chain-prefix seam CLIENT-SIDE (chain-tails from the client's chain-macs/
+   chain-seqs; verify-prefix fetches the server's records and re-walks via the shared %ms-chain-walk), so
+   the decorator's seal-on-close / verify-on-open closes tail-truncation AND — uniquely — the WHOLE-TOPIC-
+   DROP-BY-A-MALICIOUS-SERVER gap Slice 3b left open (store-microservice.lisp :581-584), at the SAME
+   (N = chain_seq-count, M_N = tail-MAC) contract as the file/SQLite tiers. logmac.tail lives on the CLIENT's
+   LOCAL epoch-dir; the server is DARE-blind (never sees the anchor). The tail truncation is injected into the
+   server's inner memory store BETWEEN sessions (a malicious offline server); the server-owned lifecycle keeps
+   the inner alive across the client session close (the %dare-arm pattern).
+   (1) TAIL-TRUNCATION DETECTED (RED->GREEN): seal N=4, a malicious server drops the tail record. WITH
+       logmac.tail the prefix-containment fails-closed (count 3 < N=4); the RED control (delete logmac.tail
+       too -> no anchor) opens CLEAN — the Slice-3b baseline (the client chain verify alone misses it).
+   (2) WHOLE-TOPIC-DROP-BY-SERVER DETECTED (the microservice-specific HEADLINE, RED->GREEN): seal 2 topics,
+       a malicious server OMITS a whole topic. WITH the anchor the sealed topic-SET still lists it -> the
+       decorator's verify-prefix fetches 0 records -> :truncated -> fail-closed. RED (no logmac.tail): the
+       server-omitted topic is never verified (the client enumerates the SERVER's topics) -> opens CLEAN
+       (the exact store-microservice.lisp :581-584 gap). The sealed topic-SET is the CLIENT-TRUSTED enumeration.
+   (2b) AUTHORIZED PURGE + CLEAN CLOSE + REOPEN OPENS CLEAN (the introduced-brick guard, the CONTRAST to 2):
+       an authorized client purge clears the client-side chain head (the ms :purge fix mirroring file/SQLite),
+       so store-chain-tails does NOT seal a stale entry for the purged topic -> the clean-close re-seal +
+       reopen opens CLEAN (no false-reject). RED without the fix: the stale seal -> reopen :truncated -> BRICK
+       (the anchor would INTRODUCE a false-reject on a plain put+purge+clean-close+reopen). Also closes the
+       pre-existing purge+reput-same-session brick for the ms tier (the ms :purge was missing the chain-head clear).
+   (3) ANCHOR-TAMPER DETECTED: flip a byte in logmac.tail's own MAC (CRC fixed) -> fail-closed (the
+       decorator-level keyed MAC is backend-agnostic — the client's log-MAC key, never on the server).
+   (4) CROSS-RESTART CLEAN + byte-exact: seal against a PERSISTENT file inner, restart the server, reopen ->
+       the anchor verifies clean across the restart + get-range recovers byte-exact + re-seals clean.
+   (5) F1 RECLAIM-SHRINK-CRASH CLEAN + (5b) RED-brick (inherited invalidate-at-open): an AUTHORIZED shrink
+       below the sealed set + a crash (skip-seal) reopens CLEAN because the decorator INVALIDATES logmac.tail
+       at open (client-side, backend-agnostic); *durability-debug-skip-tail-invalidate* T proves it is
+       load-bearing (the stale anchor then bricks :truncated). NOTE: the shrink here is an authorized PURGE,
+       NOT a KEEP_LAST physical reclaim — the microservice :delete is a plain server proxy that does NOT
+       re-MAC surviving frames (unlike the file store's %rewrite-topic-log / SQLite's %sqlite-recompute-topic),
+       so a KEEP_LAST reclaim would break the client-side chain independent of the anchor (a pre-existing
+       Slice-3b limitation, ADR 0050 §4.3); the purge shrink leaves a valid chain and demonstrates the SAME
+       invalidate-at-open inheritance non-vacuously. SKIP if OpenSSL < 3.5 (the DARE-test pattern). Both impls.
+   Completes the sealed high-water tail anchor across ALL 3 durability tiers (file + SQLite + microservice)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [durability-microservice-tail-anchor] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-microservice-tail-anchor-test t)))
+  (let ((g0  (%tms-guid 5))
+        (g6  (%tms-guid 6))
+        (pay (lambda (i) (%tms-payload (+ 6 i) (logand (+ 1 i) 255)))))
+    (labels ((%cseq-of (rec)
+               (nth-value 2 (dds.durability::%ms-unfold-payload (dds.durability:durable-record-payload rec))))
+             (%tail-path (base) (dds.durability::%logmac-tail-path (uiop:ensure-directory-pathname base)))
+             (%tamper-tail (base)
+               (let* ((tp (%tail-path base))
+                      (b  (with-open-file (s tp :element-type '(unsigned-byte 8))
+                            (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                              (read-sequence v s) v)))
+                      (sz (length b))
+                      (mb (- sz 20)))                          ; a byte inside the anchor-mac field
+                 (setf (aref b mb) (logxor (aref b mb) #xFF))
+                 (dds.durability::%put-u32-le b (- sz 4) (dds.durability::%crc32 b 0 (- sz 4)))
+                 (with-open-file (s tp :direction :output :element-type '(unsigned-byte 8) :if-exists :supersede)
+                   (write-sequence b s))))
+             (%arm (tag put-thunk inject-thunk tail-thunk)
+               ;; server (memory inner I hold) + DARE client seals PUT-THUNK + close (seals logmac.tail);
+               ;; INJECT-THUNK(inner base kdir) mutates the server's inner (malicious offline truncate/drop);
+               ;; TAIL-THUNK(base) optionally mutates/deletes logmac.tail (RED = no anchor / anchor-tamper);
+               ;; a reconnecting DARE client reopens -> (values opened-clean-p count). ALWAYS store-close (even
+               ;; on error) so a leaked TCP conn cannot wedge the single-threaded reference server.
+               (let* ((inner (dds.durability:make-memory-store))
+                      (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+                      (port  (dds.durability:microservice-server-port srv))
+                      (base  (%tms-tmp-dir tag))
+                      (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base)))
+                 (unwind-protect
+                     (progn
+                       (let ((s (funcall (dds.durability:make-microservice-store-factory
+                                          :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+                         (dds.durability:store-open s)
+                         (funcall put-thunk s)
+                         (dds.durability:store-close s))
+                       (funcall inject-thunk inner base kdir)
+                       (when tail-thunk (funcall tail-thunk base))
+                       (let ((s2 (funcall (dds.durability:make-microservice-store-factory
+                                           :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+                         (handler-case
+                             (progn (dds.durability:store-open s2)
+                                    (let ((c (dds.durability:store-count s2 nil)))
+                                      (ignore-errors (dds.durability:store-close s2))
+                                      (values t c)))
+                           (error ()
+                             (ignore-errors (dds.durability:store-close s2))
+                             (values nil 0)))))
+                   (progn
+                     (dds.durability:microservice-server-stop srv)
+                     (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))))
+             (%put-4-T (s) (dotimes (i 4) (dds.durability:store-put s "T" g0 (1+ i) nil :data (funcall pay i))))
+             (%put-2topic (s)
+               (dds.durability:store-put s "A" g0 1 nil :data (funcall pay 0))
+               (dds.durability:store-put s "A" g0 2 nil :data (funcall pay 1))
+               (dds.durability:store-put s "B" g6 1 nil :data (funcall pay 2)))
+             (%drop-tail (inner base kdir)
+               (declare (ignore base kdir))
+               (let* ((tp   (first (dds.durability:store-topics inner)))
+                      (tail (first (sort (copy-list (dds.durability:store-get-range inner tp)) #'> :key #'%cseq-of))))
+                 (dds.durability:store-delete inner tp (dds.durability:durable-record-writer-guid tail) 0)))
+             (%drop-topic-a (inner base kdir)
+               (dds.durability:store-purge inner (%enc-topic-hash base kdir "A")))
+             (%no-inject (inner base kdir) (declare (ignore inner base kdir)) nil))
+      ;; (1) TAIL-TRUNCATION DETECTED (GREEN, with anchor)
+      (multiple-value-bind (clean cnt) (%arm "mta-tt" #'%put-4-T #'%drop-tail nil)
+        (declare (ignore cnt))
+        (%check :mta-tail-truncation-detected (not clean)
+                "microservice tail-truncation: a malicious server dropping the tail record is DETECTED at open (count 3 < N=4 -> :truncated -> fail-closed)"))
+      ;; (1-RED) TAIL-TRUNCATION — no anchor (delete logmac.tail) -> the same truncation opens CLEAN
+      (multiple-value-bind (clean cnt)
+          (%arm "mta-ttred" #'%put-4-T #'%drop-tail (lambda (base) (delete-file (%tail-path base))))
+        (%check :mta-tail-truncation-red-opens-clean (and clean (= 3 cnt))
+                "RED (no logmac.tail): a tail-truncated valid prefix opens CLEAN (3 of 4) — the client chain verify alone misses it (the Slice-3b baseline)"))
+      ;; (2) WHOLE-TOPIC-DROP-BY-SERVER DETECTED (the HEADLINE, GREEN with anchor)
+      (multiple-value-bind (clean cnt) (%arm "mta-wtd" #'%put-2topic #'%drop-topic-a nil)
+        (declare (ignore cnt))
+        (%check :mta-whole-topic-drop-detected (not clean)
+                "WHOLE-TOPIC-DROP-BY-SERVER (headline): a malicious server omitting topic A is DETECTED — the sealed topic-SET still lists A -> verify fetches 0 records -> :truncated -> fail-closed (closes the store-microservice.lisp :581-584 gap)"))
+      ;; (2-control) non-vacuous: the sealed 2-topic store reopens clean untouched
+      (multiple-value-bind (clean cnt) (%arm "mta-wtdctl" #'%put-2topic #'%no-inject nil)
+        (%check :mta-2topic-control (and clean (= 3 cnt))
+                "non-vacuous control: the sealed 2-topic microservice store reopens clean with all 3 records"))
+      ;; (2-RED) WHOLE-TOPIC-DROP — no anchor -> the server-omitted topic is never verified (undetected)
+      (multiple-value-bind (clean cnt)
+          (%arm "mta-wtdred" #'%put-2topic #'%drop-topic-a (lambda (base) (delete-file (%tail-path base))))
+        (%check :mta-whole-topic-drop-red-undetected (and clean (= 1 cnt))
+                "RED (no logmac.tail): the server-omitted topic A is never verified (the client enumerates the SERVER's topics) -> opens CLEAN with only B's 1 record (the exact Slice-3b :581-584 gap)"))
+      ;; (2b) AUTHORIZED PURGE + CLEAN CLOSE + REOPEN — MUST OPEN CLEAN (no false-reject / brick). The
+      ;; CONTRAST to the malicious whole-topic-drop above: an AUTHORIZED client purge clears the client-side
+      ;; chain head (the ms :purge fix mirroring file/SQLite), so store-chain-tails does NOT seal a stale
+      ;; (N, M_N) for the purged topic -> the next open verifies only the surviving topic. RED (without the
+      ;; :purge chain-head clear): the CLEAN close re-seals the STALE purged-topic entry -> the reopen fetches
+      ;; 0 records for it -> :truncated -> BRICK (a false-reject the anchor would INTRODUCE). NO skip-seal here
+      ;; — this is the manifestation the F1 arm's skip-seal hid. Non-vacuous: B survives (count 1).
+      (multiple-value-bind (clean cnt)
+          (%arm "mta-purgecc" (lambda (s) (%put-2topic s) (dds.durability:store-purge s "A"))
+                #'%no-inject nil)
+        (%check :mta-authorized-purge-clean-close-reopen-clean (and clean (= 1 cnt))
+                "authorized purge + CLEAN close + reopen OPENS CLEAN (the ms :purge clears the client chain head, so no stale seal -> no false-reject; B's 1 record survives + verifies) — RED without the fix BRICKS :truncated"))
+      ;; (3) ANCHOR-TAMPER DETECTED — flip a byte in logmac.tail's own MAC, fix the CRC
+      (multiple-value-bind (clean cnt)
+          (%arm "mta-at" (lambda (s) (dotimes (i 3) (dds.durability:store-put s "T" g0 (1+ i) nil :data (funcall pay i))))
+                #'%no-inject #'%tamper-tail)
+        (declare (ignore cnt))
+        (%check :mta-anchor-tamper-detected (not clean)
+                "anchor-tamper: flipping logmac.tail's own MAC (CRC fixed) is DETECTED by the decorator-level keyed MAC (fail-closed, backend-agnostic — the client's log-MAC key, never on the server)"))
+      ;; (4) CROSS-RESTART CLEAN + byte-exact recovery across a SERVER restart (persistent file inner)
+      (let ((sdir  (%tms-tmp-dir "mta-xr-server"))
+            (cbase (%tms-tmp-dir "mta-xr-client")))
+        (unwind-protect
+            (let ((kdir (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) cbase))
+                  (g1 (%tms-guid 3)) (p1 (%tms-payload 11 3)) (p2 (%tms-payload 13 4)))
+              (let* ((srv1  (dds.durability:make-microservice-server
+                             :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                     (port1 (dds.durability:microservice-server-port srv1)))
+                (unwind-protect
+                    (let ((s (funcall (dds.durability:make-microservice-store-factory
+                                       :host "127.0.0.1" :port port1 :epoch-dir cbase :key-dir kdir))))
+                      (dds.durability:store-open s)
+                      (dds.durability:store-put s "T" g1 1 nil :data p1)
+                      (dds.durability:store-put s "T" g1 2 nil :data p2)
+                      (dds.durability:store-close s))                 ; seals logmac.tail (client-local cbase)
+                  (dds.durability:microservice-server-stop srv1)))
+              (let* ((srv2  (dds.durability:make-microservice-server
+                             :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                     (port2 (dds.durability:microservice-server-port srv2)))
+                (unwind-protect
+                    (let ((s2 (funcall (dds.durability:make-microservice-store-factory
+                                        :host "127.0.0.1" :port port2 :epoch-dir cbase :key-dir kdir))))
+                      (dds.durability:store-open s2)               ; anchor verifies clean across the restart
+                      (let ((rs (dds.durability:store-get-range s2 "T")))
+                        (%check :mta-xr-recover (and (= 2 (length rs))
+                                                     (%tms-rec= (first rs)  "T" g1 1 nil :data p1)
+                                                     (%tms-rec= (second rs) "T" g1 2 nil :data p2))
+                                "cross-restart: the anchor verifies clean across the server restart -> byte-exact recovery"))
+                      (dds.durability:store-close s2))               ; re-seals over the clean state
+                  (dds.durability:microservice-server-stop srv2)))
+              (let* ((srv3  (dds.durability:make-microservice-server
+                             :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                     (port3 (dds.durability:microservice-server-port srv3)))
+                (unwind-protect
+                    (%check :mta-xr-reopen-clean
+                            (let ((s3 (funcall (dds.durability:make-microservice-store-factory
+                                                :host "127.0.0.1" :port port3 :epoch-dir cbase :key-dir kdir))))
+                              (handler-case (progn (dds.durability:store-open s3)
+                                                   (ignore-errors (dds.durability:store-close s3)) t)
+                                (error () (ignore-errors (dds.durability:store-close s3)) nil)))
+                            "cross-restart: the re-sealed anchor reopens clean again (no false-reject)")
+                  (dds.durability:microservice-server-stop srv3))))
+          (progn
+            (when (uiop:directory-exists-p sdir) (uiop:delete-directory-tree sdir :validate t))
+            (when (uiop:directory-exists-p cbase) (uiop:delete-directory-tree cbase :validate t)))))
+      ;; (5) F1 RECLAIM-SHRINK-CRASH CLEAN + (5b) RED-brick — inherited invalidate-at-open (via a PURGE shrink;
+      ;; see the docstring: the microservice :delete does not re-MAC survivors, so KEEP_LAST reclaim is N/A)
+      (dolist (arm '((:mta-f1-reopens-clean     nil "F1: an authorized shrink + crash reopens CLEAN (inherited invalidate-at-open, client-side — no false-reject / brick)")
+                     (:mta-f1-red-bricks         t   "F1 RED: with the invalidate SKIPPED, the authorized shrink + crash BRICKS (stale anchor's A:(N) vs 0 A records -> :truncated) — proving invalidate-at-open is load-bearing for the microservice tier too")))
+        (destructuring-bind (key skip-invalidate detail) arm
+          (let* ((inner (dds.durability:make-memory-store))
+                 (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+                 (port  (dds.durability:microservice-server-port srv))
+                 (base  (%tms-tmp-dir "mta-f1"))
+                 (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base)))
+            (labels ((mk () (funcall (dds.durability:make-microservice-store-factory
+                                      :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir)))
+                     (reopen-errs ()
+                       (let ((s (mk)))
+                         (handler-case (progn (dds.durability:store-open s)
+                                              (ignore-errors (dds.durability:store-close s)) nil)
+                           (error () (ignore-errors (dds.durability:store-close s)) t)))))
+              (unwind-protect
+                  (progn
+                    ;; session A: seal A(4) + B(2)
+                    (let ((s (mk)))
+                      (dds.durability:store-open s)
+                      (dotimes (i 4) (dds.durability:store-put s "A" g0 (1+ i) nil :data (funcall pay i)))
+                      (dotimes (i 2) (dds.durability:store-put s "B" g6 (1+ i) nil :data (funcall pay i)))
+                      (dds.durability:store-close s))
+                    ;; session B: reopen, skip-seal (crash), AUTHORIZED purge A (shrink below the sealed set);
+                    ;; the invalidate runs by default (F1) or is SKIPPED (F1 RED — stale anchor survives)
+                    (let ((dds.durability::*durability-debug-skip-tail-seal* t)
+                          (dds.durability::*durability-debug-skip-tail-invalidate* skip-invalidate))
+                      (let ((s (mk)))
+                        (dds.durability:store-open s)
+                        (dds.durability:store-purge s "A")
+                        (dds.durability:store-close s)))
+                    (%check :mta-f1-shrank (= 2 (dds.durability:store-count inner nil))
+                            "F1 non-vacuous: the authorized purge shrinks the store below the sealed set (A dropped, B's 2 remain)")
+                    ;; session C: reopen -> CLEAN (invalidate) or BRICK (skip-invalidate stale anchor)
+                    (%check key (eq (and skip-invalidate t) (and (reopen-errs) t)) detail))
+                (progn
+                  (dds.durability:microservice-server-stop srv)
+                  (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))))))) )
   t)
 
 (defun* run-durability-microservice-lifecycle-test ()

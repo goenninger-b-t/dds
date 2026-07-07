@@ -20,10 +20,16 @@
 ;;; the 32-byte MAC OUTPUT ships, never the oracle closure), so :set-chain-mac-fn is now a real fn; each
 ;;; put computes the v3 MAC client-side and FOLDS mac(32) ∥ chain_seq(8) into the opaque payload (server +
 ;;; wire protocol UNCHANGED), and store-open re-verifies every topic's chain fail-closed — DETECTING a
-;;; malicious server's frame DROP / REORDER / TAMPER (file/SQLite tamper-evidence parity; residual =
-;;; tail-truncation-of-a-valid-prefix + whole-topic-drop, the same deferred ADR 0045 §7 sealed-anchor gap
-;;; the local tiers carry). :sync stays NIL (no group-commit over TCP). DEFERRED (Slice 3c): HISTORY-policy
-;;; forwarding + graceful reconnect / multi-client concurrency / chunked large get-range / DoS-hardening.
+;;; malicious server's frame DROP / REORDER / TAMPER (file/SQLite tamper-evidence parity). WP-DURABILITY-
+;;; TAIL-ANCHOR-MS (ADR 0045 §7.1) now CLOSES the last two residuals for this tier: make-microservice-store
+;;; FILLS the read-only chain-tails / verify-chain-prefix seam CLIENT-SIDE, so the decorator's sealed high-
+;;; water tail anchor engages for encrypted-store(microservice-store) — closing tail-truncation-of-a-valid-
+;;; prefix AND (uniquely) WHOLE-TOPIC-DROP-BY-A-MALICIOUS-SERVER (the sealed topic-SET is the client-trusted
+;;; enumeration, so a server that omits a topic from store-topics is still verified -> :truncated). :sync
+;;; stays NIL (no group-commit over TCP). DEFERRED (Slice 3c): HISTORY-policy forwarding + graceful reconnect
+;;; / multi-client concurrency / chunked large get-range / DoS-hardening; and KEEP_LAST physical reclaim does
+;;; NOT re-MAC surviving frames (the :delete is a plain server proxy, unlike the file/SQLite recompute) —
+;;; documented limitation, so a KEEP_LAST reclaim breaks the client chain independent of the anchor.
 ;;;
 ;;; WIRE PROTOCOL (length-prefixed request/response over the single stream; all integers little-endian):
 ;;;   REQUEST:  u32 body-len | u8 op-code | op-payload      (body-len counts the op-code + payload)
@@ -426,10 +432,13 @@
    log-MAC oracle into THIS client-side store, arming the client-side v3 chain-MAC over the remote tier —
    a malicious server that DROPS / REORDERS / TAMPERS sealed frames is detected fail-closed on open
    (file/SQLite parity). The 32-byte MAC + chain_seq are FOLDED into the OPAQUE payload, so the server +
-   wire protocol are UNCHANGED (the server stores a slightly-longer opaque blob it never parses). A BARE
-   microservice-store (no encrypted-store to install the oracle) leaves the chain uninstalled — memory
-   parity, Slice 1 round-trip unchanged. Slice 1 connects on open with no reconnect (a lost server
-   surfaces as MICROSERVICE-STORE-ERROR; recovery is Slice 3c)."
+   wire protocol are UNCHANGED (the server stores a slightly-longer opaque blob it never parses). The
+   :chain-tails-fn / :verify-chain-prefix-fn seam slots are ALSO LIVE (WP-DURABILITY-TAIL-ANCHOR-MS, ADR 0045
+   §7.1), filled CLIENT-SIDE: the decorator's sealed high-water tail anchor engages for this tier, closing
+   tail-truncation AND whole-topic-drop-by-a-malicious-server (the sealed topic-SET is the client-trusted
+   enumeration). A BARE microservice-store (no encrypted-store to install the oracle) leaves the chain
+   uninstalled and seals no anchor — memory parity, Slice 1 round-trip unchanged. Slice 1 connects on open
+   with no reconnect (a lost server surfaces as MICROSERVICE-STORE-ERROR; recovery is Slice 3c)."
   (let ((lock (dds.pal:make-lock "dds-durability-microservice"))
         (conn-cell (list nil))
         (host* (or host "127.0.0.1"))
@@ -500,13 +509,27 @@
      :purge (lambda (topic)
               (%ms-call conn-cell lock +ms-op-purge+
                         (lambda () (%ms-encode-topic topic))
-                        (lambda (r) (%rd-u8 r) t)))
+                        ;; drop the purged topic's client-side chain head (mirrors the file/SQLite :purge fix,
+                        ;; store-file.lisp / store-sqlite.lisp): the decode-fn runs under the store lock, so
+                        ;; clear it atomically with the purge. Else store-chain-tails would seal a STALE (N, M_N)
+                        ;; for a server-purged topic -> the next open's tail-anchor verify fetches 0 records ->
+                        ;; :truncated -> false-reject/brick; AND a reput to the purged topic in the SAME session
+                        ;; would chain from the stale tail -> reopen mismatch. Clearing all three drops it from
+                        ;; the seal and re-seeds a reput from the per-topic head (no false-reject; ADR 0045).
+                        (lambda (r)
+                          (%rd-u8 r)
+                          (remhash topic chain-macs)
+                          (remhash topic chain-seqs)
+                          (remhash topic put-index)
+                          t)))
      :open (lambda (history-kind history-depth)
              (%ms-open conn-cell lock host* port* history-kind history-depth)
              ;; fail-closed-on-OPEN parity (file/SQLite verify EVERY topic at store-open, before any read):
              ;; with the oracle installed (the decorator installs it BEFORE store-open), get-range-verify
              ;; each topic — a dropped/reordered/tampered chain FAILS THE OPEN loudly. A WHOLE dropped topic
-             ;; is unverified (documented residual — the topic-granularity tail-truncation; ADR 0050 §4.3).
+             ;; is now caught EARLIER by the decorator's sealed high-water tail anchor (the :verify-chain-
+             ;; prefix-fn seam, run BEFORE this store-open over the client-trusted sealed topic-SET; ADR 0045
+             ;; §7.1) — it no longer depends on this server-provided topic list (closes the ADR 0050 §4.3 gap).
              (when chain-mac-fn
                (dolist (tp (%ms-topics-list conn-cell lock))
                  (%ms-get-range-verified conn-cell lock tp chain-mac-fn chain-macs chain-seqs put-index)))
@@ -532,6 +555,44 @@
          (clrhash chain-seqs)
          (clrhash put-index))
        t)
+     ;; sealed high-water tail-anchor SEAL seam (ADR 0045 §7.1), CLIENT-SIDE: the sealed tail set is the
+     ;; CLIENT's own chained topic-hashes (chain-macs keys), NOT the server's store-topics — so a malicious
+     ;; server that later omits a whole topic can NOT shrink the sealed enumeration (this is the microservice
+     ;; whole-topic-drop closure — the anchor's topic-SET becomes the trusted enumeration, closing the
+     ;; Slice-3b store-microservice.lisp gap). Per client-chained topic-hash: N = its chain_seq-count
+     ;; (chain-seqs), M_N = its running tail MAC (chain-macs). No server round-trip — the tail state is
+     ;; client-tracked (server DARE-blind). The (N . M_N) shape MATCHES the file/SQLite tiers EXACTLY; a bare
+     ;; (no-oracle) store returns an empty set (no anchor, mirrors the local tiers).
+     :chain-tails-fn
+     (lambda ()
+       (dds.pal:with-lock (lock)
+         (let ((result (make-hash-table :test #'equal)))
+           (when chain-mac-fn
+             (maphash (lambda (topic tail-mac)
+                        (let ((n (the (integer 0) (gethash topic chain-seqs 0))))
+                          (when (plusp n)
+                            (setf (gethash topic result) (cons n tail-mac)))))
+                      chain-macs))
+           result)))
+     ;; sealed high-water tail-anchor VERIFY seam (ADR 0045 §7.1), CLIENT-SIDE: fetch TOPIC's records from the
+     ;; server (%ms-fetch-tuples connect-on-demand — the decorator runs this BEFORE store-open connects) and
+     ;; re-walk the client chain to ordinal N via the shared read-only %ms-chain-walk, deciding prefix-
+     ;; containment BEFORE store-open's own get-range-verify. :reached ⇒ compare running-MAC@N to the sealed
+     ;; M_N (== may-extend-forward = CLEAN; != = :diverged rollback/substitution); :clean (ran out below N —
+     ;; INCLUDING 0 records = a whole-topic the server omitted) ⇒ :truncated; :mismatch (interior tamper before
+     ;; N) ⇒ tolerate T, deferring to store-open's fail-loud %ms-verify-chain (parity with file/SQLite). No
+     ;; oracle ⇒ T. RETURN semantics MATCH the file/SQLite tiers EXACTLY.
+     :verify-chain-prefix-fn
+     (lambda (topic n mac)
+       (if (null chain-mac-fn)
+           t
+           (let ((tuples (%ms-fetch-tuples conn-cell lock host* port* topic)))
+             (multiple-value-bind (count running reason) (%ms-chain-walk topic chain-mac-fn tuples n)
+               (declare (ignore count))
+               (cond
+                 ((eq reason :reached) (if (equalp running mac) t :diverged))
+                 ((eq reason :clean)   :truncated)
+                 (t                    t))))))
      :delete (lambda (topic writer-guid sn)
                (%ms-call conn-cell lock +ms-op-delete+
                          (lambda () (%ms-encode-delete topic writer-guid sn))
@@ -578,11 +639,14 @@
 ;;; EVERY topic before any read (fail-closed-on-open parity). chain_seq is MANDATORY: the server sorts
 ;;; get-range by (guid,sn) (%record-guid-sn<) ≠ append/chain order, so the client assigns chain_seq
 ;;; monotonically per topic-hash on put and re-sorts by it to re-verify (same reason SQLite needs an
-;;; explicit chain_seq column). RESIDUAL (documented, ADR 0050 §4.3 / ADR 0045 §7, the SAME as file/SQLite,
-;;; deferred to the sealed high-water anchor — NOT built here): TAIL-TRUNCATION of a valid prefix (a shorter
-;;; chain is itself valid) and — the topic-granularity version — WHOLE-TOPIC-DROP (a server omitting a topic
-;;; from store-topics is never verified). The chain engages ONLY under the encrypted-store (which installs
-;;; the oracle); a bare microservice-store leaves the oracle uninstalled (memory-parity, Slice 1 unchanged).
+;;; explicit chain_seq column). The two former RESIDUALS (ADR 0050 §4.3 / ADR 0045 §7, the SAME as
+;;; file/SQLite) are now CLOSED by WP-DURABILITY-TAIL-ANCHOR-MS (ADR 0045 §7.1): the sealed high-water tail
+;;; anchor (the :chain-tails-fn / :verify-chain-prefix-fn seam below, CLIENT-SIDE) detects TAIL-TRUNCATION of
+;;; a valid prefix AND WHOLE-TOPIC-DROP — the latter because the decorator iterates the sealed topic-SET
+;;; (from the CLIENT's logmac.tail), NOT the server's store-topics, so a server omitting a topic still gets a
+;;; verify-prefix that fetches 0 records -> :truncated -> fail-closed. The chain engages ONLY under the
+;;; encrypted-store (which installs the oracle); a bare microservice-store leaves the oracle uninstalled
+;;; (memory-parity, Slice 1 unchanged), and a bare store also seals NO anchor (chain-tails empty).
 
 (defun* %ms-fold-payload (sealed mac chain-seq)
     (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)) (integer 0))
@@ -616,43 +680,73 @@
       (replace mac folded :start2 sl :end2 (+ sl +frame-mac-len+))
       (values sealed mac (%get-u64-le folded (+ sl +frame-mac-len+))))))
 
-(defun* %ms-verify-chain (topic fn tuples chain-macs chain-seqs put-index)
-    (function (string function list hash-table hash-table hash-table) t)
-  "Verify TUPLES (each (clean-record stored-mac chain_seq)) as TOPIC's v3 chain in chain_seq order — a
-   near-verbatim port of %sqlite-verify-topic: re-seed via %chain-seed, recompute each expected MAC via the
-   REUSED %frame-record-versioned over the CLEAN record (payload=sealed, the frame the put MAC'd), and
-   equalp-compare to the stored (folded) mac. ANY interior DROP / REORDER / TAMPER breaks the running MAC →
-   a loud error (fail-closed, = file/SQLite parity). On success seeds chain-macs[TOPIC]=tail-mac +
-   chain-seqs[TOPIC]=max chain_seq + 1 (so a continued put chains correctly across a reopen) and rebuilds
-   put-index[TOPIC] from the server's authoritative (guid,sn) keys (the microservice analogue of the file
-   store rebuilding its in-memory index on replay — needed for idempotent re-put detection)."
+(defun* %ms-chain-walk (topic fn tuples stop-at)
+    (function (string function list (or null (integer 0)))
+              (values (integer 0) (simple-array (unsigned-byte 8) (*)) (member :reached :clean :mismatch)))
+  "READ-ONLY walk of TOPIC's client-side v3 chain over TUPLES (each (clean-record stored-mac chain_seq)) in
+   chain_seq order under oracle FN — the shared engine of BOTH the open-time verifier (%ms-verify-chain) AND
+   the sealed high-water tail-anchor VERIFY seam (store-verify-chain-prefix), the microservice analogue of
+   the file/SQLite %chain-walk / %sqlite-chain-walk (ADR 0045 §7.1). Seeds from the per-topic keyed head
+   (%chain-seed), recomputes each record's expected MAC over the canonical v3 frame via the REUSED
+   %frame-record-versioned, and equalp-compares to the stored (folded) mac. NEVER signals — RETURNS a reason
+   so each caller applies its own policy (open-verify fails loud; the tail seam maps :clean→:truncated).
+   Every folded record carries a mac (there are no unchained rows, UNLIKE SQLite's NULL-mac legacy prefix),
+   so a break can only be a :mismatch. Returns (values chained running reason):
+     STOP-AT non-NIL and reached ⇒ :reached, RUNNING = the running chain MAC after exactly STOP-AT records
+       (the prefix-containment probe; records past STOP-AT are ignored);
+     else runs to the natural end — :clean (chained < STOP-AT if any) or :mismatch (a stored mac ≠ recomputed)."
   (let ((sorted  (sort (copy-list tuples) #'< :key #'third))
         (running (%chain-seed fn topic))
-        (tail    nil)
-        (maxseq  -1)
-        (idx     (make-hash-table :test #'equal)))
+        (chained 0))
     (dolist (tp sorted)
+      (when (and stop-at (>= chained stop-at))
+        (return-from %ms-chain-walk (values chained running :reached)))
       (destructuring-bind (rec stored cseq) tp
+        (declare (ignore cseq))
         (let ((expected (nth-value 1 (%frame-record-versioned rec +frame-version-v3+ running fn))))
           (unless (equalp expected stored)
-            (error "dds.durability: microservice chain MAC mismatch in topic ~a — a remote server ~
-                    dropped/reordered/tampered a sealed frame (refusing to open; ADR 0045/0050 §4.3)" topic))
-          (setf running expected tail expected)
+            (return-from %ms-chain-walk (values chained running :mismatch)))
+          (setf running expected)
+          (incf chained))))
+    (if (and stop-at (>= chained stop-at))
+        (values chained running :reached)
+        (values chained running :clean))))
+
+(defun* %ms-verify-chain (topic fn tuples chain-macs chain-seqs put-index)
+    (function (string function list hash-table hash-table hash-table) t)
+  "Verify TUPLES (each (clean-record stored-mac chain_seq)) as TOPIC's v3 chain in chain_seq order via the
+   shared read-only %ms-chain-walk (DRY — the SAME engine the tail-anchor prefix seam uses, so their counting
+   + MAC computation cannot drift) and apply the fail-closed open policy: a :mismatch (an interior DROP /
+   REORDER / TAMPER that breaks the running MAC) SIGNALS (fail-closed, = file/SQLite parity). On success seeds
+   chain-macs[TOPIC]=tail-mac + chain-seqs[TOPIC]=max chain_seq + 1 (so a continued put chains correctly across
+   a reopen) and rebuilds put-index[TOPIC] from the server's authoritative (guid,sn) keys (the microservice
+   analogue of the file store rebuilding its in-memory index on replay — needed for idempotent re-put detection)."
+  (multiple-value-bind (chained running reason) (%ms-chain-walk topic fn tuples nil)
+    (when (eq reason :mismatch)
+      (error "dds.durability: microservice chain MAC mismatch in topic ~a — a remote server ~
+              dropped/reordered/tampered a sealed frame (refusing to open; ADR 0045/0050 §4.3)" topic))
+    (let ((idx    (make-hash-table :test #'equal))
+          (maxseq -1))
+      (dolist (tp tuples)
+        (destructuring-bind (rec stored cseq) tp
+          (declare (ignore stored))
           (when (> cseq maxseq) (setf maxseq cseq))
           (setf (gethash (cons (coerce (durable-record-writer-guid rec) 'list)
-                               (durable-record-sn rec)) idx) t))))
-    (setf (gethash topic put-index) idx)
-    (when tail
-      (setf (gethash topic chain-macs) tail)
-      (setf (gethash topic chain-seqs) (1+ maxseq)))
-    t))
+                               (durable-record-sn rec)) idx) t)))
+      (setf (gethash topic put-index) idx)
+      (when (plusp chained)
+        (setf (gethash topic chain-macs) running)
+        (setf (gethash topic chain-seqs) (1+ maxseq)))
+      t)))
 
-(defun* %ms-decode-strip-verify (r topic fn chain-macs chain-seqs put-index)
-    (function (ms-reader string function hash-table hash-table hash-table) list)
-  "Decode a get-range response, STRIP the folded (mac ∥ chain_seq) suffix from every record's payload
-   (bounds-checked via %ms-unfold-payload — a <suffix-length payload from a malicious server fails
-   cleanly), VERIFY the per-topic v3 chain (fail-closed), and return the CLEAN (payload=sealed) records
-   (guid,sn)-sorted so the decorator sees only sealed — the mac stripped transparently."
+(defun* %ms-decode-tuples (r topic)
+    (function (ms-reader string) list)
+  "Decode a get-range response into a list of (clean-record folded-mac chain_seq) tuples — the raw,
+   UNVERIFIED input BOTH %ms-decode-strip-verify (open-time full verify) AND the tail-anchor prefix probe
+   (%ms-fetch-tuples) consume (DRY). STRIPS the folded (mac ∥ chain_seq) suffix from each record's payload
+   (bounds-checked via %ms-unfold-payload — a <suffix-length payload from a malicious server fails cleanly).
+   No chain verify + no side effects here — the caller runs %ms-verify-chain / %ms-chain-walk. COUNT is
+   bounded against the remaining buffer (each frame needs ≥ 1 byte); each %rd-frame is itself bounds-checked."
   (let ((count (%rd-u32 r)))
     (when (> count (- (ms-reader-end r) (ms-reader-pos r)))
       (error 'microservice-protocol-error :detail "record count exceeds buffer extent"))
@@ -665,8 +759,16 @@
                                              :kind (durable-record-kind raw) :payload sealed)
                         mac cseq)
                   tuples))))
-      (%ms-verify-chain topic fn tuples chain-macs chain-seqs put-index)
-      (sort (mapcar #'first tuples) #'%record-guid-sn<))))
+      tuples)))
+
+(defun* %ms-decode-strip-verify (r topic fn chain-macs chain-seqs put-index)
+    (function (ms-reader string function hash-table hash-table hash-table) list)
+  "Decode a get-range response (via the shared %ms-decode-tuples), VERIFY the per-topic v3 chain
+   (fail-closed), and return the CLEAN (payload=sealed) records (guid,sn)-sorted so the decorator sees only
+   sealed — the mac stripped transparently."
+  (let ((tuples (%ms-decode-tuples r topic)))
+    (%ms-verify-chain topic fn tuples chain-macs chain-seqs put-index)
+    (sort (mapcar #'first tuples) #'%record-guid-sn<)))
 
 (defun* %ms-topics-list (conn-cell lock)
     (function (cons t) list)
@@ -681,6 +783,23 @@
   (%ms-call conn-cell lock +ms-op-get-range+
             (lambda () (%ms-encode-topic topic))
             (lambda (r) (%ms-decode-strip-verify r topic fn chain-macs chain-seqs put-index))))
+
+(defun* %ms-fetch-tuples (conn-cell lock host port topic)
+    (function (cons t string (integer 0 65535) string) list)
+  "Fetch TOPIC's records from the server and decode them to raw (clean-record folded-mac chain_seq) tuples
+   for the tail-anchor's READ-ONLY prefix probe (store-verify-chain-prefix) — WITHOUT verifying (no side
+   effects on chain-macs/chain-seqs/put-index) and WITHOUT signalling on a mismatch (the caller's
+   %ms-chain-walk maps that to a reason). CONNECT-ON-DEMAND: the decorator runs %verify-tail-anchor BEFORE
+   store-open establishes the connection, so ensure it here (the server owns the inner lifecycle — a
+   get-range needs no prior client open op). A malicious server's records are network-facing, so
+   %ms-unfold-payload's bounds-check + %rd-frame's guards apply (a short/torn payload fails clean as
+   MICROSERVICE-STORE-ERROR, never OOB)."
+  (dds.pal:with-lock (lock)
+    (unless (car conn-cell)
+      (setf (car conn-cell) (dds.pal:tcp-connect host port))))
+  (%ms-call conn-cell lock +ms-op-get-range+
+            (lambda () (%ms-encode-topic topic))
+            (lambda (r) (%ms-decode-tuples r topic))))
 
 ;;; ---- reference server (opaque inner-store proxy) ----
 
@@ -871,8 +990,11 @@
    microservice-store (only the 32-byte MAC output ships, never the oracle/key), each put computes the v3
    MAC client-side and folds mac ∥ chain_seq into the opaque payload, and store-open re-verifies every
    topic's chain FAIL-CLOSED — DETECTING a malicious remote server's frame DROP / REORDER / TAMPER
-   (file/SQLite tamper-evidence parity; residual = tail-truncation + whole-topic-drop, the deferred
-   ADR 0045 §7 sealed-anchor gap). Per-record DARE-GCM additionally authenticates each frame. A pre-Slice-3b
+   (file/SQLite tamper-evidence parity). The former tail-truncation + whole-topic-drop residuals are now
+   CLOSED (WP-DURABILITY-TAIL-ANCHOR-MS, ADR 0045 §7.1): make-microservice-store fills the sealed high-water
+   tail-anchor seam CLIENT-SIDE, so the decorator seals logmac.tail (in the LOCAL epoch-dir) on close and
+   verifies it on open over the CLIENT-TRUSTED sealed topic-SET — a server that truncates a tail or omits a
+   whole topic fails-closed. Per-record DARE-GCM additionally authenticates each frame. A pre-Slice-3b
    microservice store (un-folded records) has NO legacy migration path — the fold is unversioned, so a
    3b reopen would strip 40 real bytes and false-reject; re-create the store under 3b (the backend is new).
    HISTORY-POLICY OWNERSHIP + a KNOWN LIMITATION (ADR 0050 §4.2, Slice 3a). Unlike the sqlite/file

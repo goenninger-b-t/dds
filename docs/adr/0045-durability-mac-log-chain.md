@@ -3,7 +3,7 @@
 Status: Accepted
 Date: 2026-07-04
 Work package: WP-DURABILITY-MAC-LOG-CHAIN (feature follow-on #2 of 4; resolves the ADR 0026 §10.9 open follow-on)
-Supersedes/updates: ADR 0026 §10.9 (the "MAC'd log chain" follow-on is now RESOLVED — see §7). Update (WP-DURABILITY-TAIL-ANCHOR-FILE): the §7.1 whole-tail-truncation residual (and its §9 whole-topic-drop + §2 whole-store-rollback forms) is now CLOSED for the FILE tier by a sealed high-water tail anchor; the shared decorator logic reaches each backend through a read-only seam. Update (WP-DURABILITY-TAIL-ANCHOR-SQLITE): the SQLite tier now FILLS that seam (store-chain-tails / store-verify-chain-prefix on make-sqlite-store, reusing %sqlite-chain-walk), so those residuals are CLOSED for SQLite too at the SAME (N, M_N) contract; the microservice tier stays follow-on, and the §7.2 epochs.dat MAC stays deferred.
+Supersedes/updates: ADR 0026 §10.9 (the "MAC'd log chain" follow-on is now RESOLVED — see §7). Update (WP-DURABILITY-TAIL-ANCHOR-FILE): the §7.1 whole-tail-truncation residual (and its §9 whole-topic-drop + §2 whole-store-rollback forms) is now CLOSED for the FILE tier by a sealed high-water tail anchor; the shared decorator logic reaches each backend through a read-only seam. Update (WP-DURABILITY-TAIL-ANCHOR-SQLITE): the SQLite tier now FILLS that seam (store-chain-tails / store-verify-chain-prefix on make-sqlite-store, reusing %sqlite-chain-walk), so those residuals are CLOSED for SQLite too at the SAME (N, M_N) contract. Update (WP-DURABILITY-TAIL-ANCHOR-MS): the MICROSERVICE tier now FILLS that seam CLIENT-SIDE (store-chain-tails / store-verify-chain-prefix on make-microservice-store, reusing an extracted %ms-chain-walk), so those residuals are CLOSED for the microservice tier too — AND the Slice-3b whole-topic-drop-by-a-malicious-server gap is closed because the decorator iterates the CLIENT-TRUSTED sealed topic-SET, not the server's store-topics; the tail anchor is now complete across ALL THREE tiers (file + SQLite + microservice), and the §7.2 epochs.dat MAC stays deferred.
 
 ## 1. Context
 
@@ -42,8 +42,9 @@ Out of scope (documented residuals, deferred — see §7):
 
 - **Whole-tail truncation of a valid prefix.** A bare running chain provably cannot detect it: the
   shorter log is itself a valid chain. Detecting it needs an external **sealed high-water anchor** —
-  **now CLOSED for the FILE tier** by WP-DURABILITY-TAIL-ANCHOR-FILE and for the **SQLite tier** by
-  WP-DURABILITY-TAIL-ANCHOR-SQLITE (§7.1 as-built; the **microservice tier** is follow-on).
+  **now CLOSED for the FILE tier** by WP-DURABILITY-TAIL-ANCHOR-FILE, the **SQLite tier** by
+  WP-DURABILITY-TAIL-ANCHOR-SQLITE, and the **microservice tier** by WP-DURABILITY-TAIL-ANCHOR-MS
+  (§7.1 as-built — all three tiers now fill the seam).
 - **Cross-store / whole-file replacement of an *older* valid store snapshot.** Same anchor
   territory (a store-level sealed high-water, not a per-frame link) — the file-tier sealed high-water
   anchor detects an older-snapshot roll-back of the log under the current anchor (count < N; §7.1).
@@ -255,9 +256,9 @@ silently disable verification, unlike the torn-tail-recoverable `epochs.dat`).
 1. **Whole-tail truncation detection.** **RESOLVED for the FILE tier** by
    WP-DURABILITY-TAIL-ANCHOR-FILE (the sealed high-water tail anchor, §7.1 as-built below) — against an
    adversary who **truncates the log but does not also delete the mutable `logmac.tail`** (deleting it is
-   the same residual class as anchor-deletion, §7 item 3a; see Residuals (b) in the as-built); **SQLite +
-   microservice tiers are follow-on WPs** (they share the logic through the same read-only seam, whose
-   backend slot is NIL for now). A bare running chain **cannot** detect truncation of a valid prefix —
+   the same residual class as anchor-deletion, §7 item 3a; see Residuals (b) in the as-built); the **SQLite
+   tier** (WP-DURABILITY-TAIL-ANCHOR-SQLITE) and the **microservice tier** (WP-DURABILITY-TAIL-ANCHOR-MS) now
+   FILL the same read-only seam, so all three tiers are done. A bare running chain **cannot** detect truncation of a valid prefix —
    the shorter log verifies clean — so detecting it requires an external, independently **sealed
    high-water anchor**: a per-topic authenticated tail-marker recording the expected chain head (last
    MAC) + record count, written/sealed such that rolling the log back to an earlier valid prefix
@@ -315,8 +316,9 @@ silently disable verification, unlike the torn-tail-recoverable `epochs.dat`).
      presence: that would false-reject every legitimately never-cleanly-closed store. The invalidate-at-open
      model **widens** the legitimate-absent window (the anchor is absent throughout any open session), which
      is the same residual class (an attacker with write access to a *running* store's log was never in the
-     at-rest threat model). (c) The **microservice tier** stays deferred until its seam is filled; the
-     **SQLite tier** now fills the seam — see the §7.1 SQLite as-built immediately below.
+     at-rest threat model). (c) The **SQLite tier** and the **microservice tier** now fill the seam — see the
+     §7.1 SQLite and microservice as-builts immediately below (the microservice tier additionally closes the
+     Slice-3b whole-topic-drop-by-a-malicious-server gap via the client-trusted sealed topic-SET).
 
    **§7.1 as-built (sealed high-water tail anchor, SQLite tier — WP-DURABILITY-TAIL-ANCHOR-SQLITE).**
    The decorator lifecycle (seal-on-close, verify-then-invalidate-at-open, re-seal-at-clean-close) is
@@ -359,6 +361,65 @@ silently disable verification, unlike the torn-tail-recoverable `epochs.dat`).
    - **Residuals (SQLite tier).** Identical class to the file tier: the honest-torn-disguise is N/A for
      SQLite (rows are atomic in the DB — there is no torn trailing row), but the **`logmac.tail`-deletion**
      residual (b) and the anchor-deletion + full-downgrade residual (§7 item 3a) stand unchanged.
+
+   **§7.1 as-built (sealed high-water tail anchor, MICROSERVICE tier — WP-DURABILITY-TAIL-ANCHOR-MS).**
+   The LAST tier. The decorator lifecycle (seal-on-close, verify-then-invalidate-at-open, re-seal-at-clean-
+   close) is the SHARED file above; this WP FILLS the microservice backend's two read-only seam slots
+   **CLIENT-SIDE**, so the anchor engages automatically for `encrypted-store(microservice-store)`. The server
+   is **DARE-blind** and never sees the anchor — `logmac.tail` lives on the CLIENT's LOCAL epoch-dir (the same
+   dir the decorator's `%write-logmac-tail` uses), keyed by the client-side log-MAC key. **No server change,
+   no protocol change, no new crypto** (the tail MAC is `%hmac-labeled` under the client log-MAC key; the seam
+   reuses the client-side chain state and the chain walk).
+   - **`store-chain-tails`** (SEAL): the sealed tail SET is the **CLIENT's own chained topic-hashes**
+     (`chain-macs` keys), NOT the server's `store-topics`. For each: `N` = its `chain_seq`-count
+     (`chain-seqs`), `M_N` = its running tail MAC (`chain-macs`). No server round-trip — the tail state is
+     client-tracked. Same `(N . M_N)` shape as the file/SQLite tiers; a bare (no-oracle) store returns an
+     empty set. **This client-trusted enumeration is the crux of the whole-topic-drop closure** (below).
+   - **`store-verify-chain-prefix`** (VERIFY): fetch the topic's records from the server (**connect-on-demand**
+     — `%verify-tail-anchor` runs BEFORE store-open establishes the connection; the server owns the inner
+     lifecycle, so a get-range needs no prior client open op) and re-walk to ordinal `N` via the shared
+     read-only **`%ms-chain-walk`** (STOP-AT `N`), returning **T** / **`:truncated`** (ran out below `N`, incl.
+     0 records = the server omitted the topic) / **`:diverged`** — the SAME return contract as the file/SQLite
+     seams. An interior tamper before `N` is tolerated here and deferred to store-open's fail-loud
+     `%ms-verify-chain` (parity with the local tiers).
+   - **The whole-topic-drop closure (the microservice-specific headline).** Slice 3b left a gap
+     (`store-microservice.lisp` §581-584): the client enumerates topics via the SERVER's `store-topics`, which
+     a malicious server could omit, so a whole dropped topic was never verified. The tail anchor closes it:
+     `%verify-tail-anchor` iterates the **sealed topic-SET** (from the client's `logmac.tail`), so a server
+     that omits a topic still triggers `store-verify-chain-prefix` for it → the fetch returns 0 records →
+     `:truncated` → fail-closed. The anchor's topic-set is the trusted enumeration, independent of the server.
+   - **DRY / no new crypto.** `%ms-chain-walk` (the microservice analogue of `%sqlite-chain-walk`) is now the
+     shared read-only engine of BOTH the open-time verifier (`%ms-verify-chain`, refactored onto it) AND the
+     verify seam; `%ms-decode-tuples` is the shared decode-without-verify used by both the open-time strip-
+     verify and the prefix probe. It reuses `%frame-record-versioned` + `%chain-seed`; the anchor MAC is
+     decorator-level and unchanged.
+   - **F1 no-false-reject (inherited).** The invalidate-at-open is decorator-level and backend-agnostic, so the
+     microservice tier gets it free: an authorized shrink below the sealed set + a crash reopens CLEAN;
+     `*durability-debug-skip-tail-invalidate*` T proves it is load-bearing (the stale anchor then bricks
+     `:truncated`). **The shrink used to prove this is an authorized PURGE, not a KEEP_LAST physical reclaim**
+     — see the limitation next.
+   - **Introduced-brick fix (the ms `:purge` chain-head clear).** Filling the seam surfaced a NEW false-reject
+     the anchor would otherwise introduce: the microservice `:purge` shipped the purge to the server but did
+     NOT clear the client-side chain head (`chain-macs`/`chain-seqs`/`put-index`) — unlike the file
+     (`store-file.lisp`) and SQLite (`store-sqlite.lisp`) `:purge` fixes. So `store-chain-tails` kept reporting
+     the purged topic with a STALE `(N, M_N)`, a clean close baked it into `logmac.tail`, and the next open
+     fetched 0 records for the (server-purged) topic → `:truncated` → **brick** — reachable by a plain
+     put+purge+clean-close+reopen at KEEP_ALL (no crash, no reput). Fixed by clearing the client chain head in
+     the ms `:purge` seam (mirroring the local tiers), which ALSO closes the pre-existing purge+reput-same-session
+     brick for this tier (the ms `:purge` had been missing the chain-head clear entirely). Verified by a
+     dedicated `authorized purge + CLEAN close + reopen → CLEAN` arm (RED without the clear → `:truncated` brick).
+   - **Residuals + a microservice-specific limitation.** The `logmac.tail`-deletion residual (b) and the
+     anchor-deletion + full-downgrade residual (§7 item 3a) stand unchanged. **Additionally, the microservice
+     tier's KEEP_LAST physical reclaim does NOT re-MAC surviving frames** — its `:delete` slot is a plain
+     server proxy, unlike the file store's `%rewrite-topic-log` / SQLite's `%sqlite-recompute-topic` that
+     re-seed the survivor chain. So a KEEP_LAST reclaim breaks the client-side chain on the next open
+     **independent of the anchor**. This is a pre-existing Slice-3b limitation (ADR 0050 §4.2 — HISTORY policy
+     is not tested through the ms tier; the in-process tests use keep-all); the tail anchor neither introduces
+     nor worsens it. Re-MACing survivors through the wire (a purge-and-reput-all or an update op) is a
+     follow-on if KEEP_LAST-through-microservice is ever required. (This is why the F1 shrink is a PURGE, which
+     now leaves a clean chain, not a KEEP_LAST reclaim.)
+   - **The sealed high-water tail anchor is now complete across ALL THREE durability tiers (file + SQLite +
+     microservice).**
 2. **`epochs.dat` MAC** — deferred (kept entry-CRC-only; §6).
 3. **Anchor deletion + full downgrade, and downgrade of a grandfathered topic.** The `logmac.anchor`
    file is the chain commitment (§3.2). Two transition-class residuals remain, both requiring a

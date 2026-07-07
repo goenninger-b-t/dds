@@ -846,24 +846,38 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   prefix-containment "may extend past `N`" tolerance is currently **vestigial** (harmless; reserved for a
   future periodic-seal — strict `count==N ∧ MAC==M_N` would be equivalent today). The decorator↔store
   boundary is a **read-only additive seam** (`store-chain-tails` for the seal, `store-verify-chain-prefix`
-  for the open check; NIL-fallback like `store-sync`). The **SQLite tier** now FILLS that seam
+  for the open check; NIL-fallback like `store-sync`). The **SQLite tier** FILLS that seam
   (WP-DURABILITY-TAIL-ANCHOR-SQLITE — `make-sqlite-store` walks its `mac`/`chain_seq` rows via the shared
   `%sqlite-chain-walk` at the SAME `{N, M_N}` contract; `N` is the chained-**row count**, `M_N` the tail
   row's MAC. The authorized reclaim there is the Sliver-3a `store-delete` ⇒ `%sqlite-recompute-topic`
   shrink, and the backend-agnostic invalidate-at-open gives it the same reclaim-shrink+crash **CLEAN**
-  no-false-reject for free), so only the **microservice** tier's seam stays NIL (a follow-on WP).
+  no-false-reject for free). The **microservice tier** also FILLS the seam (WP-DURABILITY-TAIL-ANCHOR-MS)
+  **CLIENT-SIDE**: `store-chain-tails` reads the client's own `chain-macs`/`chain-seqs` (`N` = the
+  `chain_seq`-count, `M_N` = the tail MAC), keyed by the **client's own chained topic-hashes — NOT the
+  server's `store-topics`**; `store-verify-chain-prefix` fetches the topic's records from the server
+  (connect-on-demand, since verify runs before store-open connects) and re-walks to ordinal `N` via an
+  extracted read-only `%ms-chain-walk` (the microservice analogue of `%sqlite-chain-walk`; `%ms-verify-chain`
+  refactored onto it). `logmac.tail` lives on the CLIENT-LOCAL epoch-dir (the server is DARE-blind), so
+  there is **no server or protocol change and no new crypto**. Because the anchor's topic-SET is the
+  **client-trusted** enumeration, a malicious server that omits a whole topic is still verified (fetch 0 →
+  `:truncated`) — closing the Slice-3b whole-topic-drop-by-a-malicious-server gap. **All three tiers now
+  fill the seam.**
 - **Detected:** interior record **delete / reorder / substitution (even with both CRCs recomputed) /
-  insertion**, **full-log v3→v2 downgrade** of any born-chained topic, and — for the **FILE + SQLite**
-  tiers — **whole-tail truncation / whole-topic drop / whole-store rollback** (the sealed high-water anchor
-  above, **against an adversary who truncates the log but does not also delete `logmac.tail`**).
+  insertion**, **full-log v3→v2 downgrade** of any born-chained topic, and — for **ALL THREE tiers (FILE +
+  SQLite + microservice)** — **whole-tail truncation / whole-topic drop / whole-store rollback** (the sealed
+  high-water anchor above, **against an adversary who truncates the log but does not also delete
+  `logmac.tail`**; on the microservice tier the whole-topic drop is a malicious server omitting a topic).
   **Deferred residuals (ADR 0045 §7):** the honest-torn-disguise (a truncation that leaves a trailing
   *partial* frame is byte-indistinguishable from a real crash, so it is tolerated); **`logmac.tail`
   deletion** — the anchor is a mutable, non-write-once file, so an adversary who truncates the log **and
   deletes `logmac.tail`** opens clean (byte-indistinguishable from a legitimate never-cleanly-closed store;
   the **same residual class as anchor-deletion, §7 item 3a** — it cannot be closed by requiring the tail
   file's presence without false-rejecting every legitimately never-closed store; invalidate-at-open widens
-  the legitimate-absent window to any open session, same class); the tail anchor on the **microservice**
-  tier (seam NIL until the follow-on); the combined anchor-deletion-plus-full-downgrade
+  the legitimate-absent window to any open session, same class); on the **microservice tier** the additional
+  limitation that its `:delete` does not re-MAC survivors, so a KEEP_LAST physical reclaim breaks the client
+  chain independent of the anchor (a pre-existing Slice-3b limitation — HISTORY policy is untested through that
+  tier; the ms `:purge` **now** clears the client chain head, mirroring the local tiers, so an authorized purge
+  + clean close + reopen opens CLEAN — a false-reject the anchor would otherwise introduce, fixed here); the combined anchor-deletion-plus-full-downgrade
   vector and a full rollback of a *grandfathered* legacy topic; and the `epochs.dat` MAC. Cost is off the
   sample hot path (one HMAC per put / per frame at open; one HMAC over the tail set per close). Verified by
   `run-durability-mac-chain-test` (round-trip; v1/v2/v3 read; the four interior tampers with a non-vacuous
@@ -878,9 +892,23 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   only the anchor catches it], cross-restart byte-exact, **F1 reclaim-shrink-crash CLEAN** with a non-vacuous
   log-shrank guard AND a self-contained RED [`*durability-debug-skip-tail-invalidate*` → the same sequence
   BRICKS, proving the invalidate is load-bearing], and a **purge+reput+reopen CLEAN** no-false-reject arm — all
-  tampered via DIRECT SQL). NO-FALSE-REJECT FIX (both tiers): `store-purge` now clears the in-memory running
+  tampered via DIRECT SQL). NO-FALSE-REJECT FIX (both local tiers): `store-purge` now clears the in-memory running
   chain head so a reput to a purged topic re-seeds from the per-topic head (previously the reput chained from
   the stale pre-purge tail and the next open's re-seeded verify false-rejected the first frame — a brick).
+  The **microservice tier** anchor is verified by `run-durability-microservice-tail-anchor-test`
+  (**tail-truncation RED→GREEN** [a malicious server drops the tail record, injected into the server's inner
+  between sessions], **whole-topic-drop-by-server RED→GREEN** [the headline — a malicious server omits a whole
+  topic; the sealed topic-SET still lists it → verify fetches 0 → `:truncated`; the RED control deletes
+  `logmac.tail` and shows the server-omitted topic is silently lost], an **authorized purge + CLEAN close +
+  reopen → CLEAN** arm [the introduced-brick guard — the CONTRAST to the malicious drop: an authorized client
+  purge clears the client chain head so no stale entry is sealed; RED without the `:purge` fix bricks
+  `:truncated`], **anchor-tamper DETECTED**, **cross-restart byte-exact** across a server restart over a
+  persistent file inner, and **F1 reclaim-shrink-crash CLEAN** + a self-contained **RED-brick** via
+  `*durability-debug-skip-tail-invalidate*`). Because the microservice `:delete` does not re-MAC survivors
+  (unlike the local tiers), F1 uses an authorized PURGE as the shrink, not a KEEP_LAST reclaim (documented
+  limitation). The ms `:purge` now clears the client chain head (mirroring file/SQLite), fixing the anchor's
+  introduced brick AND the pre-existing purge+reput-same-session brick. The sealed high-water tail anchor is
+  now complete across ALL THREE tiers.
 
 ### 8.6 Deployment requirement — OpenSSL ≥ 3.5
 
@@ -947,9 +975,9 @@ authenticity** of the payload AND its AAD-bound metadata (topic/guid/sn/kind/key
 byte fails the GCM tag, fail-closed — and it survives restart. It provides **record-sequence
 integrity** via the keyed v3 MAC chain (§8.5): interior delete/reorder/substitution/insertion are
 tamper-evident at store-open. It **also seals the record metadata** (topic/GUID/SN/kind/key-hash) at
-rest — see §8.9 (WP-DURABILITY-METADATA-CONF-3c). For the **FILE** tier it now also detects **malicious
-whole-tail truncation / whole-topic drop / whole-store rollback** via the sealed high-water tail anchor
-(§8.5, ADR 0045 §7.1); the SQLite + microservice tail anchor remains a follow-on residual. The follow-ons
+rest — see §8.9 (WP-DURABILITY-METADATA-CONF-3c). For **ALL THREE tiers (FILE + SQLite + microservice)** it now
+also detects **malicious whole-tail truncation / whole-topic drop / whole-store rollback** via the sealed
+high-water tail anchor (§8.5, ADR 0045 §7.1); the anchor is complete across every durability tier. The follow-ons
 (ADR 0026 §10 / ADR 0025 §10): cross-vendor coexistence dedup **(RESOLVED — ADR 0027: RTI PS uses
 standard OWI on its retained-history replay, so no vendor PID is needed; the configurable
 `:relay-durability`/`:collect-durability` tiers landed; ADR 0027 §follow-on 1 RESOLVED — ADR 0028:
@@ -976,10 +1004,10 @@ with a non-memory store signals before launch instead of silently running the in
 **log-level at-rest integrity — keyed MAC'd log chain (RESOLVED — WP-DURABILITY-MAC-LOG-CHAIN,
 ADR 0045: v3 frames carry an HMAC-SHA-256 chain keyed by a cross-restart-stable anchor-derived key;
 interior delete/reorder/substitution/insertion tamper-evident at store-open, fail-closed; keyed-store-
-only; **whole-tail truncation / whole-topic drop / whole-store rollback now RESOLVED for the FILE tier by
-the sealed high-water tail anchor — WP-DURABILITY-TAIL-ANCHOR-FILE, ADR 0045 §7.1** (against a truncate-but-not-
-`logmac.tail`-delete adversary; verify-then-invalidate at open so an authorized reclaim-shrink + crash never
-false-rejects); SQLite + microservice tail anchor + `logmac.tail`-deletion + `epochs.dat` MAC remain deferred
+only; **whole-tail truncation / whole-topic drop / whole-store rollback now RESOLVED for ALL THREE tiers (FILE +
+SQLite + microservice) by the sealed high-water tail anchor — WP-DURABILITY-TAIL-ANCHOR-{FILE,SQLITE,MS}, ADR
+0045 §7.1** (against a truncate-but-not-`logmac.tail`-delete adversary; verify-then-invalidate at open so an
+authorized reclaim-shrink + crash never false-rejects); `logmac.tail`-deletion + `epochs.dat` MAC remain deferred
 residuals, §8.5)**;
 **graceful FFI teardown on signal (RESOLVED — ADR 0030, 2026-06-22; `kill -15` exits cleanly
 status 0, no SIGBUS, both impls; see §5.1)**;
@@ -1455,10 +1483,13 @@ the decorator installs its log-MAC oracle into the client-side store, arming the
 over the remote tier — a malicious server that **drops / reorders / tampers** sealed frames is detected
 fail-closed on open (file/SQLite parity), the 32-byte MAC + `chain_seq` folded into the opaque payload the
 DARE-blind server stores verbatim (server + wire protocol unchanged). Independently, **per-record DARE-GCM
-authenticates each record** (an attacker cannot read, forge, or alter a frame's contents). **Remaining
-residual (deferred, = file/SQLite, ADR 0045 §7):** tail-truncation of a valid prefix + whole-topic-drop (a
-server omitting a topic from `store-topics` is never verified) stay undetected. A bare `microservice-store`
-(no decorator to install the oracle) leaves the chain uninstalled — memory-parity, Slice 1 unchanged. Unlike
+authenticates each record** (an attacker cannot read, forge, or alter a frame's contents). The
+`:chain-tails-fn`/`:verify-chain-prefix-fn` seam slots are **ALSO LIVE** (WP-DURABILITY-TAIL-ANCHOR-MS, §8.5),
+filled CLIENT-SIDE: the sealed high-water tail anchor now closes **tail-truncation of a valid prefix AND
+whole-topic-drop-by-a-malicious-server** — the latter because the decorator verifies the CLIENT-TRUSTED sealed
+topic-SET (from the client's `logmac.tail`), not the server's `store-topics`, so a server omitting a topic is
+still verified (fetch 0 → `:truncated` → fail-closed). A bare `microservice-store`
+(no decorator to install the oracle) leaves the chain uninstalled and seals no anchor — memory-parity, Slice 1 unchanged. Unlike
 the file/sqlite factories, the inner tier's HISTORY policy is not a factory argument — it is the SERVER's,
 applied at server-start (§8.10.1); the client's `store-open` policy is a confirm/no-op at this shared,
 server-owned tier.
@@ -1553,9 +1584,10 @@ records byte-exact across the restart — skips if OpenSSL < 3.5), `run-durabili
 (server-owned inner survives client sessions: client2 sees client1's records), `run-durability-microservice-
 config-env-test` (DPERSIST_BACKEND=microservice selects the microservice factory structurally). Slice 3b:
 `run-durability-microservice-remote-chain-test` (malicious-server DROP/TAMPER/REORDER each fail-closed on
-open + a RED bare-store-undetected contrast + the tail-truncation/whole-topic-drop residuals open clean +
-round-trip/cross-restart through the chain + NIL-oracle regression — skips if OpenSSL < 3.5). Both impls,
-Clasp first; suite 489 → 493 → 494.
+open + a RED bare-store-undetected contrast + tail-truncation/whole-topic-drop now DETECTED via the tail anchor
++ round-trip/cross-restart through the chain + NIL-oracle regression — skips if OpenSSL < 3.5). The sealed
+high-water tail anchor for this tier (WP-DURABILITY-TAIL-ANCHOR-MS, §8.5) is verified by
+`run-durability-microservice-tail-anchor-test`. Both impls, Clasp first; suite 489 → 493 → 494 → +1.
 
 ### 8.10.2 Client-side remote-tier chain-MAC — detecting a malicious server (Slice 3b, built)
 
