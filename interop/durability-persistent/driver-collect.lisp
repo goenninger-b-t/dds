@@ -6,7 +6,11 @@
 ;;;; fsync of the sealed log + epochs.dat to D) and EXITS the process.  Process 2
 ;;;; (driver-serve.lisp) re-opens the SAME D + K, proving cross-PROCESS persistence.
 ;;;;
-;;;; Config (env vars): DPERSIST_DIR, DPERSIST_KEYDIR, DPERSIST_SECS.
+;;;; Config (env vars): DPERSIST_DIR, DPERSIST_KEYDIR, DPERSIST_SECS, DPERSIST_BACKEND
+;;;; (file [default] | sqlite | microservice).  When DPERSIST_BACKEND=microservice the store is the
+;;;; REMOTE microservice CLIENT tier: DPERSIST_MS_HOST (default 127.0.0.1) + DPERSIST_MS_PORT address an
+;;;; operator-run make-microservice-server (a separate process holding the persistent inner), while
+;;;; DPERSIST_DIR / DPERSIST_KEYDIR stay the CLIENT-LOCAL DARE epoch-dir / key-dir (ADR 0050 Slice 3a).
 ;;;; The two :qos-overrides are identical to interop/durability-transient/ +
 ;;;; interop/durability-dare/: :data-representation (:xcdr1) so XCDR1-only ShapeType readers
 ;;;; match in SEDP, and :peers (("127.0.0.1" . 7410)) unicast SPDP to the domain-0
@@ -18,6 +22,8 @@
        (key-dir (or (uiop:getenv "DPERSIST_KEYDIR") "/tmp/dpersist-K"))
        (secs    (parse-integer (or (uiop:getenv "DPERSIST_SECS") "22")))
        (backend (or (uiop:getenv "DPERSIST_BACKEND") "file"))
+       (ms-host (or (uiop:getenv "DPERSIST_MS_HOST") "127.0.0.1"))
+       (ms-port (let ((p (uiop:getenv "DPERSIST_MS_PORT"))) (when p (parse-integer p))))
        (peers   (loop for p in (uiop:split-string
                                 (or (uiop:getenv "DPERSIST_PEERS") "7410,7412,7414,7416,7418")
                                 :separator ",")
@@ -25,9 +31,8 @@
        (spec (dds.durability:make-service-spec
               :domain 0
               :topics '(("Square" . "ShapeType"))
-              :store (if (string-equal backend "sqlite")
-                         (dds.durability:make-sqlite-store-factory :dir dir :key-dir key-dir)
-                         (dds.durability:make-persistent-store-factory :dir dir :key-dir key-dir))
+              :store (dds.durability:make-durability-store-factory
+                      backend :dir dir :key-dir key-dir :ms-host ms-host :ms-port ms-port)
               :qos-overrides (list :data-representation '(:xcdr1) :peers peers)
               :name "dpersist-run1"))
        (svc (dds.durability:make-durability-service spec)))

@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-07
-Work package: WP-DURABILITY-MICROSERVICE-1 (Slice 1) + WP-DURABILITY-MICROSERVICE-2 (Slice 2 — DARE-wrap) (ADR 0021 capability 6 — the last of the owner's pluggable persistence tiers: file / db / MICROSERVICE — composed with capability 7, the always-on DARE)
+Work package: WP-DURABILITY-MICROSERVICE-1 (Slice 1) + WP-DURABILITY-MICROSERVICE-2 (Slice 2 — DARE-wrap) + WP-DURABILITY-MICROSERVICE-3A (Slice 3a — server-owned persistent inner + cross-restart + config-env seam) (ADR 0021 capability 6 — the last of the owner's pluggable persistence tiers: file / db / MICROSERVICE — composed with capability 7, the always-on DARE)
 Relates to: ADR 0021 (pluggable persistence vtable), ADR 0026 (file store, DARE at-rest), ADR 0045 (log-MAC chain), ADR 0049 (SQLite backend — the sibling "second implementation of the fixed vtable")
 
 ## 1. Context
@@ -142,13 +142,15 @@ opaque inner store). Concretely (`store-encrypted.lisp:903`) each put hands the 
 microservice server (an inner memory store in the tests) holds **only opaque ciphertext + surrogates**,
 never a plaintext topic name / writer-GUID / SN / key-hash / payload, and never any key.
 
-**One structural difference from the sqlite/file siblings, and it is the memory-parity story:** the
-inner tier's HISTORY policy is **not** a construction argument of the factory. `make-microservice-store`
-takes none; the policy travels to the remote inner store at `store-open` (from the service-spec's
-`history-kind`/`history-depth`, `service.lisp:454`), the same open-time path memory and microservice
-share — whereas the file/sqlite factories bake it into their local inner-store constructor. Adding it to
-the microservice factory would be a dead parameter, so it is omitted (the factory's argument list is
-`&key host port epoch-dir key-dir`).
+**One structural difference from the sqlite/file siblings:** the inner tier's HISTORY policy is **not** a
+construction argument of the factory (`make-microservice-store` takes none; the factory's argument list is
+`&key host port epoch-dir key-dir`), whereas the file/sqlite factories bake it into their local inner-store
+constructor. **In Slice 2 the policy travelled to the remote inner store at `store-open`; Slice 3a's
+server-owned-lifecycle refactor changed this** — the inner is now opened ONCE at server-start with the
+SERVER's configured `:history-kind`/`:history-depth` and a per-client `store-open` is a policy-confirm no-op
+(§4.2), so the client/service HISTORY QoS is **no longer forwarded** to the remote inner (see the §4.2
+known-limitation + the Slice-3c policy-forwarding item in §7). The authoritative statement of the
+history-policy semantics is §4.2, not this Slice-2 paragraph.
 
 The chain-MAC oracle install (`store-set-chain-mac-fn`, driven by the decorator on open + first put) is a
 documented **no-op** at the microservice tier (the `:set-chain-mac-fn` slot is NIL — the same slot profile
@@ -175,6 +177,78 @@ secondary at-rest metadata residual for the remote case: beyond the (documented 
 per-topic-hash record counts, a remote server additionally observes **live access-pattern timing** (put/get
 op arrival) — the standard opaque-proxy tradeoff, noted here for the remote threat model.
 
+### 4.2 Slice 3a — server-owned PERSISTENT inner + cross-restart + config-env (WP-DURABILITY-MICROSERVICE-3A, BUILT)
+
+Slice 1/2 held the inner in *memory*; a persistence backend that cannot survive a restart is incomplete.
+Slice 3a makes the reference server a **real persistence backend**.
+
+**Server-owned inner lifecycle.** The server now OWNS its inner store's lifecycle — correct for a
+persistence tier that OUTLIVES individual client sessions. `make-microservice-server` opens the inner
+**ONCE at server-start** (with new `:history-kind` / `:history-depth` args, NIL = defer to the inner's
+factory default): a persistent `make-file-store` / `make-sqlite-store` inner **REPLAYS from disk**
+(recovering prior history), a memory inner opens empty. It is closed **ONCE at server-stop** (already the
+case in Slice 1: `microservice-server-stop` → `store-close` → fsync). The two per-client op handlers change
+to match:
+
+- **`+ms-op-open+` is a POLICY-CONFIRM no-op** (`%ms-handle-request`): a per-client `store-open` no longer
+  re-opens the inner. A second `store-open` on a file/SQLite inner would **re-replay the whole log per
+  client session** (wasteful; and the file store's re-open rebuilds/leaks its append streams) — and the
+  shared server-owned tier's history policy is an operator/server property set at server-start, not a
+  per-client one. The handler still DECODES the `hk`/`depth` payload (so a malformed open is bounds-rejected
+  and drops the connection), then just acknowledges. **Chosen semantics, documented:** open-at-server-start
+  with the server's configured policy; client-open = policy-confirm/no-op. (The alternative — first-client
+  open drives, subsequent idempotent — is strictly worse for a persistent inner: it either re-replays or
+  needs a vtable set-policy slot the fixed contract forbids.)
+- **`+ms-op-close+` ends only the client SESSION** (unchanged from Slice 1: acknowledge, do NOT close the
+  inner). So multiple client sessions against one server see the SAME persisted store, and the inner
+  survives every client connect/disconnect until the server stops.
+
+**Cross-restart recovery (the point).** A persistent inner on disk `D` survives a server restart: server1
+(inner on `D`) collects the client's puts + fsyncs on stop; server2 (a FRESH inner on the SAME `D`) replays
+`D` on start; a client reconnecting to server2 + `store-get-range` recovers the records byte-exact +
+(guid,sn)-ordered + counted. Proven for BOTH a file inner AND a SQLite inner. **RED:** a memory inner (no
+shared disk) recovers 0 — proving the persistence is real. For the **DARE-wrapped** composition
+`make-encrypted-store(make-microservice-store(server file inner))`, the server persists the **OPAQUE sealed
+frames** to `D` (server2 recovers opaque); the client's DARE state (`epochs.dat` + the ML-KEM key) is
+**client-side** in the LOCAL epoch-dir / key-dir and persists there, so a client with the SAME local
+epoch-dir re-derives the prior epoch DEK and `store-get-range` **decrypts + recovers the REAL records
+byte-exact** — while an on-disk scan of `D`'s topic logs confirms the persisted frames are **ciphertext**
+(the plaintext topic / GUID / SN / payload needles are absent). The server never sees plaintext across the
+restart.
+
+**The config-env seam.** `make-durability-store-factory backend &key dir key-dir ms-host ms-port …`
+(`spec.lisp`) is the single backend-dispatch seam the durability-persistent drivers share (DRY — replacing
+the `(if (string-equal backend "sqlite") …)` that was copy-pasted across `driver-collect` /
+`driver-serve`). `"sqlite"` → `make-sqlite-store-factory`; `"microservice"` →
+`make-microservice-store-factory` (the REMOTE client tier — `:ms-host`/`:ms-port` address the operator-run
+reference server, while `dir`/`key-dir` stay the CLIENT-LOCAL DARE epoch-dir/key-dir; port REQUIRED);
+anything else → `make-persistent-store-factory` (the file default). `interop/durability-persistent/driver-
+collect.lisp` + `driver-serve.lisp` now read `DPERSIST_BACKEND` (`file`|`sqlite`|`microservice`) +
+`DPERSIST_MS_HOST` (default 127.0.0.1) + `DPERSIST_MS_PORT` and dispatch through it. The remote server is a
+separate process the operator runs; the driver is the durability **client**. (The `main.lisp` CLI
+`--backend` remains a Slice-3 follow-on — the driver-env path suffices.) The full live 2-process
+microservice interop is optional this slice; the config-env is proven structurally (the factory builds
+`encrypted-store(microservice-store)`, name `:encrypted-persistent`).
+
+**KNOWN LIMITATION (HISTORY QoS not forwarded — a Slice-3c gap for the live path).** The microservice
+inner tier's retention policy is **SERVER-configured** (`make-microservice-server`
+`:history-kind`/`:history-depth`, applied at server-start), **NOT forwarded from the client/service HISTORY
+QoS over the wire**: the shared dispatch's microservice branch does not pass `history-kind`/`depth` (unlike
+the sqlite/file branches), and `+ms-op-open` decodes them only to bounds-validate, then discards. So a
+durability service configured e.g. KEEP_LAST 5 against a **default keep-all** reference server
+**OVER-RETAINS** — a late joiner receives full history instead of newest-D per instance (a silent DDS
+DURABILITY_SERVICE/HISTORY QoS gap; **over-retention, NOT data-loss/false-reject**). The operator MUST
+configure the reference server's `:history-kind`/`:history-depth` to match the service's HISTORY QoS. This
+only bites the deferred **live 2-process** path (all in-process tests use keep-all and pass). **Forwarding
+the policy over the wire (so the service's HISTORY QoS drives the remote inner's retention) + a
+KEEP_LAST-through-microservice test are a REQUIRED Slice-3c item** (§7) — a durability service that silently
+ignores HISTORY QoS on a backend is a real QoS gap for the live path.
+
+**Deferred beyond 3a:** the client-side v3 chain-MAC over the remote tier (**Slice 3b** — remote-untrusted-
+store sequence integrity, §4.1); HISTORY-QoS-over-the-wire forwarding (**Slice 3c**, REQUIRED — the
+known-limitation above); graceful reconnect / multi-client concurrency / chunked large get-range /
+DoS-hardening (**Slice 3c**). The DARE crypto + the bounds-checked wire parser are unchanged.
+
 ## 5. Files
 
 - `src/dds-pal/pal-contract.lisp` — export the `tcp-*` block.
@@ -182,16 +256,28 @@ op arrival) — the standard opaque-proxy tradeoff, noted here for the remote th
 - `src/dds-durability/store-microservice.lisp` — the protocol, `make-microservice-store` (client),
   `make-microservice-server` / `microservice-server-port` / `microservice-server-stop` (server), and
   **Slice 2** `make-microservice-store-factory` (the DARE-wrapping factory — forward-references
-  `make-encrypted-store` exactly as `make-sqlite-store-factory` does).
+  `make-encrypted-store` exactly as `make-sqlite-store-factory` does). **Slice 3a:**
+  `make-microservice-server` gains `:history-kind`/`:history-depth` + opens the inner at server-start;
+  `+ms-op-open` becomes a policy-confirm no-op.
+- `src/dds-durability/spec.lisp` — **Slice 3a** `make-durability-store-factory` (the shared
+  backend-dispatch seam: file / sqlite / microservice).
 - `src/dds-durability/packages.lisp` — export the new symbols (Slice 2 adds
-  `make-microservice-store-factory`).
+  `make-microservice-store-factory`; Slice 3a adds `make-durability-store-factory`).
+- `interop/durability-persistent/driver-collect.lisp` + `driver-serve.lisp` — **Slice 3a** wire
+  `DPERSIST_BACKEND` (`file`|`sqlite`|`microservice`) + `DPERSIST_MS_HOST`/`DPERSIST_MS_PORT` through the
+  shared dispatch.
 - `dds-durability.asd` — `(:file "store-microservice")` after `store-sqlite`.
 - `src/dds-tests/durability-test.lisp` — Slice 1: `run-pal-tcp-loopback-test`,
   `run-durability-microservice-test`, `run-durability-microservice-large-test`,
   `run-durability-microservice-torn-test`, `run-durability-microservice-fuzz-test`. Slice 2:
   `run-durability-microservice-factory-test` (structural composition, DARE-free) +
   `run-durability-microservice-dare-test` (no-plaintext-at-server GREEN/RED + round-trip-through-DARE;
-  skips if OpenSSL < 3.5), with the `%tms-flatten-store` inner-record byte-scan helper.
+  skips if OpenSSL < 3.5), with the `%tms-flatten-store` inner-record byte-scan helper. **Slice 3a:**
+  `run-durability-microservice-cross-restart-test` (bare file + sqlite GREEN, memory RED),
+  `run-durability-microservice-dare-cross-restart-test` (DARE-wrapped on-disk-ciphertext + decrypt-recover;
+  skips if OpenSSL < 3.5), `run-durability-microservice-lifecycle-test` (server-owned multi-session),
+  `run-durability-microservice-config-env-test` (structural), with the shared `%tms-put-2topic-fixture` /
+  `%tms-verify-2topic-fixture` / `%tms-bare-cross-restart-arm` helpers.
 
 ## 6. Consequences
 
@@ -214,6 +300,15 @@ op arrival) — the standard opaque-proxy tradeoff, noted here for the remote th
   ALL absent from a full byte-scan of the server's inner records; a RED bare `microservice-store` leaks
   all four; **round-trip through DARE** recovers the real topic/GUID/SN/kind/key-hash/payload byte-exact +
   (guid,sn)-ordered + idempotent re-put + logical count). Suite 487 → 489.
+- **Slice 3a (WP-DURABILITY-MICROSERVICE-3A):** the microservice becomes a REAL persistence backend — the
+  server OWNS a persistent (file/SQLite) inner (open@server-start replaying from disk, close@server-stop
+  fsyncing), cross-restart recovery proves out (bare file + SQLite GREEN, memory RED; DARE-wrapped with
+  opaque-on-disk + client-side decrypt), multi-session server-owned lifecycle holds, and the
+  `DPERSIST_BACKEND=microservice` config-env seam (`make-durability-store-factory`) is wired into both
+  drivers. **Zero vtable change; zero wire-protocol change** (the `+ms-op-open`/`+ms-op-close` *semantics*
+  shift to server-owned, the bytes are identical). Both impls green identically, Clasp first: Suite 489 →
+  493 (`durability-microservice-cross-restart`, `durability-microservice-dare-cross-restart`,
+  `durability-microservice-lifecycle`, `durability-microservice-config-env`).
 
 ## 7. Scope — Slice 1 and the deferred slices
 
@@ -227,20 +322,30 @@ microservice-store (the server stays a DARE-blind opaque proxy; zero server chan
 MACs locally, the remote server stores only opaque ciphertext; the no-plaintext-at-server proof + the
 round-trip-through-DARE byte-exactness, both impls.
 
+**Slice 3a (built, §4.2):** the server OWNS a PERSISTENT (file/SQLite) inner (open@server-start replaying
+from disk, close@server-stop fsync); `+ms-op-open` = policy-confirm no-op, `+ms-op-close` = session-end;
+cross-restart recovery proven bare (file + SQLite GREEN, memory RED) + DARE-wrapped (opaque-on-disk at the
+server, client-side decrypt); server-owned multi-session lifecycle; the `DPERSIST_BACKEND=microservice`
+config-env seam (`make-durability-store-factory`) in both durability-persistent drivers.
+
 **Deferred:**
-- **Slice 3 — remote-untrusted-store sequence integrity (client-side v3 chain-MAC).** Close the §4.1
+- **Slice 3b — remote-untrusted-store sequence integrity (client-side v3 chain-MAC).** Close the §4.1
   drop/truncate/rollback gap: compute the ADR-0045 cross-frame keyed log-MAC chain **client-side** in the
   decorator and ship the 32-byte MAC as an extra opaque field the microservice server stores blindly
   (keeping the server a dumb DARE-blind KV proxy), giving the remote tier the same sequence tamper-evidence
   the file/SQLite tiers already have. Required for a production remote deployment against a malicious server
   — not merely optional (the memory-parity analogy does not carry across the trust boundary).
-- **Slice 3 — production posture.** A persistent inner store (file/SQLite) + cross-restart; the
-  `DPERSIST_BACKEND=microservice` config/env seam in the store-factory (`make-persistent-store-factory`
-  sibling); graceful reconnect / error-recovery (Slice 1 surfaces a lost server as a clean
-  `microservice-store-error` and connects-on-open with no retry); multi-client concurrency (Slice 1
-  serves one client at a time); framing for very large `get-range` responses beyond the single-message
-  `+ms-max-message+` ceiling (chunked/streamed).
-- **Slice 3 — DoS hardening (bounded, not a spin, in Slice 1; documented).** `%ms-recv-message` allocates
+- **Slice 3c — HISTORY QoS over the wire (REQUIRED, the §4.2 known-limitation).** Forward the
+  client/service HISTORY QoS (`history-kind`/`depth`) to the remote inner so the service's DURABILITY_SERVICE
+  HISTORY drives the remote retention (today it is SERVER-configured only, and a client KEEP_LAST vs a
+  keep-all server silently OVER-RETAINS on the live path); add a KEEP_LAST-through-microservice test. Not
+  optional — a durability backend that silently ignores HISTORY QoS is a real QoS gap for the live path.
+- **Slice 3c — remaining production posture.** Graceful reconnect / error-recovery (Slice 1 surfaces a lost
+  server as a clean `microservice-store-error` and connects-on-open with no retry); multi-client concurrency
+  (the server serves one client at a time); framing for very large `get-range` responses beyond the
+  single-message `+ms-max-message+` ceiling (chunked/streamed); the `main.lisp` CLI `--backend` (the
+  driver-env path already suffices); the full live 2-process microservice cross-DDS interop run.
+- **Slice 3c — DoS hardening (bounded, not a spin, in Slice 1; documented).** `%ms-recv-message` allocates
   the body buffer from the *declared* length before the body arrives, so a peer declaring up to the
   256 MiB `+ms-max-message+` cap forces a large one-shot allocation on a 4-byte header (an amplification),
   and a never-completing partial send parks the serve thread (a slow-loris — bounded + blocking, *not* a

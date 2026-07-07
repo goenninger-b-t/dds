@@ -6507,3 +6507,267 @@
       (dds.durability:microservice-server-stop srv)
       (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
   t)
+
+;;; --- WP-DURABILITY-MICROSERVICE-3A (ADR 0050 Slice 3a) — server-owned PERSISTENT inner +
+;;;     cross-restart recovery (bare + DARE-wrapped) + server-owned-lifecycle + config-env seam ---
+
+(defun* %tms-put-2topic-fixture (s ta tb)
+    (function (dds.durability:durable-store string string) t)
+  "Put the shared 5-record / 2-topic cross-restart fixture through client store S: 3 records on topic TA
+   (an EMPTY-payload NIL-key :data, a 3-byte :data, a 50-byte :dispose), 2 on TB (an :unregister, a :data)
+   — distinct guids/sns/kinds/key-hashes/payloads. The TA/g1/1 record's payload is EMPTY (#()) so the bare
+   cross-restart proves a zero-length payload round-trips as a genuine empty (not NULL/absent) through the
+   PERSISTENT file + SQLite inners across a restart — no prior test exercised empty->persistent-inner (the
+   Slice-1 empty is memory-inner; the DARE arm seals so the inner never sees an empty blob). Reused by the
+   bare, DARE-wrapped, and multi-session arms so the recovery assertion is defined once (DRY)."
+  (let ((g1 (%tms-guid 1)) (g2 (%tms-guid 2)) (g3 (%tms-guid 3))
+        (kh9 (%tms-guid 9)) (kh7 (%tms-guid 7)) (kh4 (%tms-guid 4))
+        (empty (%tms-payload 0 0)) (p3 (%tms-payload 3 1)) (p50 (%tms-payload 50 2)))
+    (dds.durability:store-put s ta g1 1 nil :data       empty)
+    (dds.durability:store-put s ta g1 2 kh9 :data       p3)
+    (dds.durability:store-put s ta g2 5 kh7 :dispose    p50)
+    (dds.durability:store-put s tb g3 1 nil :unregister p3)
+    (dds.durability:store-put s tb g3 9 kh4 :data       p50))
+  t)
+
+(defun* %tms-verify-2topic-fixture (s ta tb label)
+    (function (dds.durability:durable-store string string string) t)
+  "Verify client store S recovered the shared %tms-put-2topic-fixture set byte-exact + (guid,sn)-ordered
+   + counted (LABEL names the arm in the check details). The TA/g1/1 record is asserted to recover as a
+   genuine EMPTY (#(), zero-length) payload — the empty->persistent-inner cross-restart regression guard."
+  (let ((g1 (%tms-guid 1)) (g2 (%tms-guid 2)) (g3 (%tms-guid 3))
+        (kh9 (%tms-guid 9)) (kh7 (%tms-guid 7)) (kh4 (%tms-guid 4))
+        (empty (%tms-payload 0 0)) (p3 (%tms-payload 3 1)) (p50 (%tms-payload 50 2)))
+    (%check :ms-xr-count-all (= 5 (dds.durability:store-count s nil))
+            (format nil "~a: recovered count(nil)=5" label))
+    (%check :ms-xr-count-a (= 3 (dds.durability:store-count s ta))
+            (format nil "~a: recovered count(~a)=3" label ta))
+    (%check :ms-xr-count-b (= 2 (dds.durability:store-count s tb))
+            (format nil "~a: recovered count(~a)=2" label tb))
+    (let ((ra (dds.durability:store-get-range s ta)))
+      (%check :ms-xr-a-order (equal '(1 2 5) (mapcar #'dds.durability:durable-record-sn ra))
+              (format nil "~a: get-range(~a) ordered by (guid,sn)" label ta))
+      (%check :ms-xr-a1-empty (= 0 (length (dds.durability:durable-record-payload (first ra))))
+              (format nil "~a: ~a/g1/1 recovered payload is EMPTY (zero-length, not NULL) across restart" label ta))
+      (%check :ms-xr-a1 (%tms-rec= (first ra)  ta g1 1 nil :data    empty) (format nil "~a: ~a/g1/1 byte-exact (EMPTY payload)" label ta))
+      (%check :ms-xr-a2 (%tms-rec= (second ra) ta g1 2 kh9 :data    p3)  (format nil "~a: ~a/g1/2 byte-exact" label ta))
+      (%check :ms-xr-a5 (%tms-rec= (third ra)  ta g2 5 kh7 :dispose p50) (format nil "~a: ~a/g2/5 byte-exact (dispose)" label ta)))
+    (let ((rb (dds.durability:store-get-range s tb)))
+      (%check :ms-xr-b-order (equal '(1 9) (mapcar #'dds.durability:durable-record-sn rb))
+              (format nil "~a: get-range(~a) ordered by (guid,sn)" label tb))
+      (%check :ms-xr-b1 (%tms-rec= (first rb)  tb g3 1 nil :unregister p3)  (format nil "~a: ~a/g3/1 byte-exact (unregister)" label tb))
+      (%check :ms-xr-b9 (%tms-rec= (second rb) tb g3 9 kh4 :data       p50) (format nil "~a: ~a/g3/9 byte-exact" label tb))))
+  t)
+
+(defun* %tms-bare-cross-restart-arm (label make-inner expected2)
+    (function (string function (integer 0)) t)
+  "One BARE (non-DARE) microservice cross-restart arm (LABEL names it): server1 (inner from MAKE-INNER) +
+   a client that puts the 2-topic fixture + client-close + server1-stop (store-close inner -> fsync); then
+   server2 (a FRESH inner from MAKE-INNER on the SAME persistent location) + a reconnecting client that
+   recovers. EXPECTED2=5 for a persistent file/SQLite inner (full byte-exact recovery, GREEN); EXPECTED2=0
+   for the RED memory inner (a fresh empty store, no shared disk). MAKE-INNER is called twice — once per
+   server — so a persistent inner rebinds to the same disk while a memory inner is genuinely fresh."
+  (let* ((srv1 (dds.durability:make-microservice-server :port 0 :inner (funcall make-inner)))
+         (port1 (dds.durability:microservice-server-port srv1)))
+    (unwind-protect
+        (let ((c (dds.durability:make-microservice-store :host "127.0.0.1" :port port1)))
+          (dds.durability:store-open c)
+          (%tms-put-2topic-fixture c "A" "B")
+          (%check :ms-xr-s1-count (= 5 (dds.durability:store-count c nil))
+                  (format nil "~a: server1 collected 5 before restart" label))
+          (dds.durability:store-close c))
+      (dds.durability:microservice-server-stop srv1))
+    ;; server2 on the SAME persistent location (a fresh inner replaying from disk)
+    (let* ((srv2 (dds.durability:make-microservice-server :port 0 :inner (funcall make-inner)))
+           (port2 (dds.durability:microservice-server-port srv2)))
+      (unwind-protect
+          (let ((c2 (dds.durability:make-microservice-store :host "127.0.0.1" :port port2)))
+            (dds.durability:store-open c2)
+            (if (zerop expected2)
+                (%check :ms-xr-red (= 0 (dds.durability:store-count c2 nil))
+                        (format nil "~a RED: recovers 0 across restart (no persistence)" label))
+                (%tms-verify-2topic-fixture c2 "A" "B" label))
+            (dds.durability:store-close c2))
+        (dds.durability:microservice-server-stop srv2))))
+  t)
+
+(defun* run-durability-microservice-cross-restart-test ()
+    (function () t)
+  "BARE microservice cross-restart (ADR 0050 Slice 3a — the point of the slice): a PERSISTENT file/SQLite
+   inner store SURVIVES a server restart. server1 (inner on disk D) collects the client's 5-record/2-topic
+   puts + client-close + server1-stop (store-close inner -> fsync); server2 (a FRESH inner on the SAME D)
+   REPLAYS from D on start; a client reconnecting to server2 + store-get-range recovers the 5 records
+   byte-exact + (guid,sn)-ordered + count. Proven for BOTH a make-file-store inner AND a make-sqlite-store
+   inner. RED: a make-memory-store inner (no shared disk) recovers 0 across the restart — proving the
+   persistence is real, not an artefact. Both impls (no OpenSSL — bare)."
+  (let ((fdir (%tms-tmp-dir "xr-file"))
+        (sdir (%tms-tmp-dir "xr-sqlite")))
+    (unwind-protect
+        (progn
+          (%tms-bare-cross-restart-arm
+           "file" (lambda () (dds.durability:make-file-store :dir fdir)) 5)
+          (%tms-bare-cross-restart-arm
+           "sqlite" (lambda () (dds.durability:make-sqlite-store
+                                :path (uiop:merge-pathnames*
+                                       (make-pathname :name "durability" :type "sqlite3") sdir)))
+           5)
+          (%tms-bare-cross-restart-arm
+           "memory" (lambda () (dds.durability:make-memory-store)) 0))
+      (progn
+        (when (uiop:directory-exists-p fdir) (uiop:delete-directory-tree fdir :validate t))
+        (when (uiop:directory-exists-p sdir) (uiop:delete-directory-tree sdir :validate t)))))
+  t)
+
+(defun* run-durability-microservice-dare-cross-restart-test ()
+    (function () t)
+  "DARE-WRAPPED microservice cross-restart (ADR 0050 Slice 3a): encrypted-store(microservice-store(server
+   FILE inner on disk D)) with a CLIENT-LOCAL epoch-dir/key-dir. Run 1: the DARE client seals + puts a
+   distinctive record-set (sealed frames -> server1's file inner on D) + close; server1-stop fsyncs the
+   OPAQUE sealed frames to D. On-disk scan: D's topic logs are CIPHERTEXT — the plaintext topic/GUID/SN/
+   payload needles are ABSENT (the server never saw plaintext across the restart). Run 2: server2 (file
+   inner on the SAME D) replays the opaque frames; a client with the SAME LOCAL epoch-dir/key-dir
+   store-open + get-range DECRYPTS + recovers the REAL records byte-exact + (guid,sn)-ordered. SKIPs if
+   OpenSSL < 3.5 (the DARE-test pattern); the bare cross-restart runs regardless. Both impls."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [microservice-dare-cross-restart] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-microservice-dare-cross-restart-test t)))
+  (let* ((sdir  (%tms-tmp-dir "dxr-server"))   ; the SERVER's file inner dir D (opaque sealed frames on disk)
+         (cbase (%tms-tmp-dir "dxr-client"))   ; the CLIENT-LOCAL DARE state (epochs.dat + ML-KEM key)
+         (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) cbase))
+         ;; high-entropy plaintext needles (collision-negligible) present in the real record, sealed away
+         (dguid (make-array 16 :element-type '(unsigned-byte 8)
+                            :initial-contents '(#xDE #xAD #xBE #xEF #xCA #xFE #xBA #xBE
+                                                #x01 #x23 #x45 #x67 #x89 #xAB #xCD #xEF)))
+         (dsn   #x1122334455667788)
+         (dpay  (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                     "MS-SLICE3A-XRESTART-PLAINTEXT-PAYLOAD-DO-NOT-LEAK"))
+         (tneedle (map '(simple-array (unsigned-byte 8) (*)) #'char-code "Square"))
+         (g2 (%tms-guid 2)) (kh7 (%tms-guid 7)) (g3 (%tms-guid 3)) (kh4 (%tms-guid 4))
+         (p50 (%tms-payload 50 2)) (p50b (%tms-payload 50 8))
+         (snb (make-array 8 :element-type '(unsigned-byte 8))))
+    (dotimes (i 8) (setf (aref snb i) (ldb (byte 8 (* 8 i)) dsn)))
+    (unwind-protect
+        (progn
+          ;; --- run 1: DARE client seals + puts to server1's file inner on D; close; server1-stop (fsync) ---
+          (let* ((srv1  (dds.durability:make-microservice-server
+                         :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                 (port1 (dds.durability:microservice-server-port srv1)))
+            (unwind-protect
+                (let ((store (funcall (dds.durability:make-microservice-store-factory
+                                       :host "127.0.0.1" :port port1 :epoch-dir cbase :key-dir kdir))))
+                  (dds.durability:store-open store)
+                  (%check :ms-dxr-put1 (eq t (dds.durability:store-put store "Square" dguid dsn nil :data dpay))
+                          "run1: DARE-wrapped put of the needle record")
+                  (%check :ms-dxr-put2 (eq t (dds.durability:store-put store "Square" g2 7 kh7 :data p50))
+                          "run1: DARE-wrapped put Square/g2/7")
+                  (%check :ms-dxr-put3 (eq t (dds.durability:store-put store "Circle" g3 9 kh4 :dispose p50b))
+                          "run1: DARE-wrapped put Circle/g3/9 dispose")
+                  (dds.durability:store-close store))
+              (dds.durability:microservice-server-stop srv1)))
+          ;; --- the on-disk frames at the server are CIPHERTEXT: no plaintext needles survive in D's logs ---
+          (let ((raw (%pst-read-all-log-bytes (uiop:ensure-directory-pathname sdir))))
+            (%check :ms-dxr-ondisk-bytes (plusp (length raw)) "server persisted sealed frame bytes to disk D")
+            (%check :ms-dxr-no-topic (not (%pst-subseq-present-p raw tneedle))
+                    "on-disk server frames hold NO plaintext topic \"Square\"")
+            (%check :ms-dxr-no-guid (not (%pst-subseq-present-p raw dguid))
+                    "on-disk server frames hold NO plaintext writer-GUID")
+            (%check :ms-dxr-no-sn (not (%pst-subseq-present-p raw snb))
+                    "on-disk server frames hold NO plaintext SN bytes (inner sn=0, real sn sealed)")
+            (%check :ms-dxr-no-payload (not (%pst-subseq-present-p raw dpay))
+                    "on-disk server frames hold NO plaintext payload (sealed ciphertext only)"))
+          ;; --- run 2: server2 (file inner on the SAME D) replays opaque; client (SAME epoch-dir) decrypts ---
+          (let* ((srv2  (dds.durability:make-microservice-server
+                         :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                 (port2 (dds.durability:microservice-server-port srv2)))
+            (unwind-protect
+                (let ((store2 (funcall (dds.durability:make-microservice-store-factory
+                                        :host "127.0.0.1" :port port2 :epoch-dir cbase :key-dir kdir))))
+                  (dds.durability:store-open store2)
+                  (%check :ms-dxr-count (= 3 (dds.durability:store-count store2 nil))
+                          "run2: recovered count(nil)=3 across the restart")
+                  (let ((rs (dds.durability:store-get-range store2 "Square")))
+                    (%check :ms-dxr-sq-order (equal '(7 #x1122334455667788)
+                                                    (mapcar #'dds.durability:durable-record-sn rs))
+                            "run2: get-range(Square) ordered by (guid,sn) — g2 before dguid")
+                    (%check :ms-dxr-sq-g2 (%tms-rec= (first rs)  "Square" g2 7 kh7 :data p50)
+                            "run2: Square/g2/7 byte-exact through DARE + restart")
+                    (%check :ms-dxr-sq-needle (%tms-rec= (second rs) "Square" dguid dsn nil :data dpay)
+                            "run2: the needle record recovers REAL topic/GUID/SN/payload byte-exact"))
+                  (let ((rc (dds.durability:store-get-range store2 "Circle")))
+                    (%check :ms-dxr-ci (%tms-rec= (first rc) "Circle" g3 9 kh4 :dispose p50b)
+                            "run2: Circle/g3/9 byte-exact (dispose kind round-trips through DARE + restart)"))
+                  (dds.durability:store-close store2))
+              (dds.durability:microservice-server-stop srv2))))
+      (progn
+        (when (uiop:directory-exists-p sdir) (uiop:delete-directory-tree sdir :validate t))
+        (when (uiop:directory-exists-p cbase) (uiop:delete-directory-tree cbase :validate t)))))
+  t)
+
+(defun* run-durability-microservice-lifecycle-test ()
+    (function () t)
+  "SERVER-OWNED inner lifecycle (ADR 0050 Slice 3a): the inner is opened ONCE at server-start and closed
+   ONLY at server-stop — a client connect/disconnect does NOT close/lose it. TWO client SESSIONS against
+   ONE server: client1 opens + puts the 5-record fixture + CLOSES; client2 (a FRESH connection) opens +
+   get-range SEES client1's records (the shared server-owned inner persisted across the session boundary —
+   client-close is session-end, not inner-close); client2 adds one more + closes; client3 sees the
+   cumulative 6. A memory inner suffices (the point is the session boundary, not disk). Both impls."
+  (let* ((srv (dds.durability:make-microservice-server :port 0 :inner (dds.durability:make-memory-store)))
+         (port (dds.durability:microservice-server-port srv)))
+    (unwind-protect
+        (progn
+          (let ((c1 (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+            (dds.durability:store-open c1)
+            (%tms-put-2topic-fixture c1 "A" "B")
+            (%check :ms-life-c1 (= 5 (dds.durability:store-count c1 nil)) "client1 session put 5")
+            (dds.durability:store-close c1))
+          (let ((c2 (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+            (dds.durability:store-open c2)
+            (%check :ms-life-c2-sees (= 5 (dds.durability:store-count c2 nil))
+                    "client2 (new session) SEES client1's 5 records — inner not closed on client-close")
+            (%tms-verify-2topic-fixture c2 "A" "B" "lifecycle-c2")
+            (dds.durability:store-put c2 "A" (%tms-guid 20) 100 nil :data (%tms-payload 4 3))
+            (dds.durability:store-close c2))
+          (let ((c3 (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+            (dds.durability:store-open c3)
+            (%check :ms-life-c3 (= 6 (dds.durability:store-count c3 nil))
+                    "client3 sees the cumulative 6 (5 from c1 + 1 from c2) — one server-owned inner")
+            (dds.durability:store-close c3)))
+      (dds.durability:microservice-server-stop srv)))
+  t)
+
+(defun* run-durability-microservice-config-env-test ()
+    (function () t)
+  "CONFIG-ENV seam (ADR 0050 Slice 3a): DPERSIST_BACKEND=microservice selects the microservice backend via
+   the shared backend dispatch (make-durability-store-factory) that driver-collect / driver-serve call.
+   Structural (DARE-free, runs regardless of OpenSSL per the 'Constructed CLOSED' factory contract):
+   \"microservice\" -> a 0-arg closure building encrypted-store OVER microservice-store (name
+   :encrypted-persistent); \"file\"/\"sqlite\" still select their own factories; the microservice backend
+   REQUIRES a remote port (DPERSIST_MS_PORT). Both impls."
+  (let* ((base (%tms-tmp-dir "cfgenv"))
+         (kdir (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base)))
+    (unwind-protect
+        (progn
+          (let ((f (dds.durability:make-durability-store-factory
+                    "microservice" :dir base :key-dir kdir :ms-host "127.0.0.1" :ms-port 65000)))
+            (%check :ms-cfg-fn (functionp f) "DPERSIST_BACKEND=microservice -> a 0-arg store factory")
+            (let ((store (funcall f)))
+              (%check :ms-cfg-composed
+                      (eq :encrypted-persistent (dds.durability::durable-store-name store))
+                      "microservice backend builds encrypted-store OVER microservice-store (:encrypted-persistent)")))
+          (%check :ms-cfg-file (functionp (dds.durability:make-durability-store-factory
+                                           "file" :dir base :key-dir kdir))
+                  "\"file\" backend still selects a factory")
+          (%check :ms-cfg-sqlite (functionp (dds.durability:make-durability-store-factory
+                                             "sqlite" :dir base :key-dir kdir))
+                  "\"sqlite\" backend still selects a factory")
+          (%check :ms-cfg-port-required
+                  (eq :err (handler-case
+                               (progn (dds.durability:make-durability-store-factory
+                                       "microservice" :dir base :key-dir kdir :ms-host "127.0.0.1")
+                                      :ok)
+                             (error () :err)))
+                  "microservice backend without a port signals (DPERSIST_MS_PORT required)"))
+      (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
+  t)

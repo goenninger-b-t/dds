@@ -102,6 +102,41 @@
                             (dds.dare:make-file-key-provider :dir k)
                             :epoch-dir d))))
 
+(defun* make-durability-store-factory (backend &key dir key-dir ms-host ms-port
+                                                    (history-kind :keep-all) (history-depth 1))
+    (function (string &key (:dir (or pathname string)) (:key-dir (or pathname string))
+                      (:ms-host (or null string)) (:ms-port (or null (integer 0 65535)))
+                      (:history-kind (member :keep-all :keep-last)) (:history-depth (integer 1)))
+              function)
+  "Select+construct the 0-arg durable-store factory for a persistent-tier BACKEND — the single
+   backend-dispatch seam the durability-persistent drivers (interop/durability-persistent/driver-collect
+   + driver-serve) and the DPERSIST_BACKEND config-env share (DRY: one dispatch, not one per driver).
+   BACKEND is case-insensitive (string-equal):
+     \"sqlite\"       -> make-sqlite-store-factory (:dir DIR :key-dir KEY-DIR + HISTORY-KIND/DEPTH);
+     \"microservice\" -> make-microservice-store-factory — the REMOTE client tier: MS-HOST/MS-PORT
+                        address the operator-run reference server (make-microservice-server, a separate
+                        process), while DIR / KEY-DIR are the CLIENT-LOCAL DARE epoch-dir / key-dir
+                        (the ML-KEM anchor + epochs.dat stay local; the remote server holds only opaque
+                        ciphertext). MS-PORT is REQUIRED for this backend; MS-HOST defaults to 127.0.0.1.
+                        HISTORY-KIND/DEPTH are NOT construction args here — the microservice inner's
+                        history policy is the SERVER's, applied at server-start (ADR 0050 §4.1, Slice 3a);
+     anything else   -> make-persistent-store-factory (the file-store default, :dir DIR :key-dir KEY-DIR
+                        + HISTORY-KIND/DEPTH).
+   Every branch yields the same encrypted-store(inner) 0-arg closure the service-spec :STORE slot consumes;
+   the microservice backend needs :THREAD service mode (a factory does not cross a :PROCESS boundary)."
+  (cond
+    ((string-equal backend "sqlite")
+     (make-sqlite-store-factory :dir dir :key-dir key-dir
+                                :history-kind history-kind :history-depth history-depth))
+    ((string-equal backend "microservice")
+     (unless ms-port
+       (error "dds.durability: DPERSIST_BACKEND=microservice requires a remote server port (DPERSIST_MS_PORT)"))
+     (make-microservice-store-factory :host (or ms-host "127.0.0.1") :port ms-port
+                                      :epoch-dir dir :key-dir key-dir))
+    (t
+     (make-persistent-store-factory :dir dir :key-dir key-dir
+                                    :history-kind history-kind :history-depth history-depth))))
+
 (defun* service-spec-matches-p (spec topic type)
     (function (service-spec string string) boolean)
   "Return T if TOPIC/TYPE is covered by SPEC's topic-filter.

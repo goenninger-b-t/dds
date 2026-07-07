@@ -10,10 +10,14 @@
 ;;; file-store basename), so the topic travels as a separate u16-length UTF-8 field.
 ;;;
 ;;; Slice-1 scope (thinnest end-to-end): connect-on-open, put/get-range/topics/purge/open/close/count/
-;;; delete round-trip, byte-exact + ordered, both impls. DEFERRED: DARE-wrapping the proxied bytes
-;;; (Slice 2 — the opaque-proxy composition means make-encrypted-store layers OVER this client
-;;; unchanged); persistent inner store + cross-restart + the DPERSIST_BACKEND=microservice config seam
-;;; + graceful reconnect / error-recovery posture (Slice 3). The :sync and :set-chain-mac-fn vtable
+;;; delete round-trip, byte-exact + ordered, both impls. Slice 2 (DONE): DARE-wrapping the proxied bytes
+;;; (make-microservice-store-factory — the opaque-proxy composition means make-encrypted-store layers
+;;; OVER this client unchanged). Slice 3a (DONE): the server OWNS a PERSISTENT (file/SQLite) inner —
+;;; opened@server-start (replays from disk) / closed@server-stop (fsync) — proving cross-restart recovery
+;;; (bare + DARE-wrapped), plus the DPERSIST_BACKEND=microservice config seam (make-durability-store-
+;;; factory). DEFERRED: the client-side v3 chain-MAC over the remote tier (Slice 3b, remote-untrusted-
+;;; store sequence integrity) + graceful reconnect / multi-client concurrency / chunked large get-range /
+;;; DoS-hardening (Slice 3c). The :sync and :set-chain-mac-fn vtable
 ;;; slots stay NIL — MEMORY-TIER PARITY: the client cannot ship a secret-holding chain-MAC closure over
 ;;; TCP, and per-record DARE-GCM (Slice 2) still authenticates each record; the cross-frame keyed chain
 ;;; is a local-store-tier feature (ADR 0045), documented as absent here exactly as for make-memory-store.
@@ -539,13 +543,15 @@
               (topic (when (= has 1) (%rd-string r))))
          (%ms-put-u64 out (store-count inner topic))))
       ((= code +ms-op-open+)
-       (let* ((hk-code (%rd-u8 r))
-              (depth   (%rd-u32 r))
-              (hk (cond ((= hk-code +ms-hk-keep-all+) :keep-all)
-                        ((= hk-code +ms-hk-keep-last+) :keep-last)
-                        (t nil))))
-         (store-open inner hk (if (zerop depth) nil depth))
-         (%ms-put-u8 out +ms-result-t+)))
+       ;; POLICY-CONFIRM / no-op (ADR 0050 Slice 3a): the SERVER owns the inner, opened ONCE at
+       ;; server-start; a per-client store-open must NOT re-open/re-replay the shared persistent inner
+       ;; (a second store-open on a file/SQLite inner re-replays the whole log per client session —
+       ;; wasteful, and leaks/rebuilds the inner's streams; the server-owned tier's history policy is
+       ;; set once at server-start, not per client). Still DECODE hk-code + depth so the payload is
+       ;; bounds-validated (a malformed open drops the connection) — then just acknowledge.
+       (%rd-u8 r)                       ; hk-code — decoded to bounds-validate, not applied (server owns policy)
+       (%rd-u32 r)                      ; depth
+       (%ms-put-u8 out +ms-result-t+))
       ((= code +ms-op-close+)
        ;; connection-scoped: acknowledge only. The inner store's lifecycle is the SERVER's, closed at
        ;; microservice-server-stop, not on a client disconnect (Slice-3 reconnect keeps the store alive).
@@ -594,14 +600,29 @@
                 (ignore-errors (dds.pal:tcp-close conn))))
         (t nil)))))
 
-(defun* make-microservice-server (&key (host "127.0.0.1") (port 0) (inner (make-memory-store)))
-    (function (&key (:host string) (:port (integer 0 65535)) (:inner durable-store)) microservice-server)
+(defun* make-microservice-server (&key (host "127.0.0.1") (port 0) (inner (make-memory-store))
+                                       history-kind history-depth)
+    (function (&key (:host string) (:port (integer 0 65535)) (:inner durable-store)
+                    (:history-kind (or null (member :keep-all :keep-last)))
+                    (:history-depth (or null (integer 1))))
+              microservice-server)
   "Start a reference microservice server (ADR 0050) that proxies the durable-store vtable over TCP to
-   the INNER store (memory in Slice 1). Binds HOST:PORT (port 0 = ephemeral — read the assigned port
-   with microservice-server-port) and spawns one accept/serve thread. The server is a DUMB opaque proxy:
-   it decodes each request, dispatches to INNER, and encodes the reply, with ZERO DARE/MAC knowledge.
-   One client at a time (inline per-connection serving) is sufficient for Slice 1. Stop it with
-   microservice-server-stop (clean thread join + socket close, no leak)."
+   the INNER store (memory default; a persistent make-file-store / make-sqlite-store is the Slice-3a
+   persistence tier). Binds HOST:PORT (port 0 = ephemeral — read the assigned port with
+   microservice-server-port) and spawns one accept/serve thread. The server is a DUMB opaque proxy: it
+   decodes each request, dispatches to INNER, and encodes the reply, with ZERO DARE/MAC knowledge. One
+   client at a time (inline per-connection serving) is sufficient (multi-client is Slice 3c).
+
+   SERVER-OWNED INNER LIFECYCLE (ADR 0050 Slice 3a): the server OWNS the inner's lifecycle, correct for a
+   persistence tier that OUTLIVES individual client sessions. The inner is opened ONCE here at
+   server-start — a persistent file/SQLite inner REPLAYS from disk (recovers prior history across a
+   restart), a memory inner opens empty — with the server's configured HISTORY-KIND / HISTORY-DEPTH (NIL
+   = defer to the inner's factory default). It is closed ONCE at microservice-server-stop (store-close ->
+   fsync). A client's store-open is then a POLICY-CONFIRM no-op (it does NOT re-open/re-replay the shared
+   inner, see %ms-handle-request +ms-op-open); a client's store-close ends only that client SESSION (it
+   does NOT close the inner). So multiple client sessions against one server see the SAME persisted store,
+   and the inner survives every client connect/disconnect until the server stops. Stop it with
+   microservice-server-stop (clean thread join + socket close + inner close, no leak)."
   (let* ((listener (dds.pal:tcp-listen host port))
          (bound (dds.pal:tcp-local-port listener))
          (stop-cell (list nil))
@@ -609,6 +630,10 @@
          (srv (%make-microservice-server :inner inner :listener listener :port bound :host host
                                          :stop-cell stop-cell :conn-cell conn-cell
                                          :lock (dds.pal:make-lock "dds-durability-microservice-server"))))
+    ;; server-owned lifecycle: open the inner ONCE (persistent inner replays from disk) BEFORE the serve
+    ;; thread accepts, so the inner is ready for the first client; a failed open closes the listener.
+    (handler-case (store-open inner history-kind history-depth)
+      (error (e) (ignore-errors (dds.pal:tcp-close listener)) (error e)))
     (setf (microservice-server-thread srv)
           (dds.pal:spawn (lambda () (%ms-serve-loop listener inner stop-cell conn-cell))
                          :name "dds-durability-ms"))
@@ -655,12 +680,22 @@
    topic/GUID/SN/key-hash/payload or any key. The cross-frame keyed chain-MAC (ADR 0045) is ABSENT at the
    microservice tier (make-microservice-store leaves :set-chain-mac-fn NIL — MEMORY-TIER PARITY: a
    secret-holding chain oracle cannot ship over TCP); per-record DARE-GCM still authenticates each frame.
-   Unlike the sqlite/file siblings the inner tier's HISTORY policy is NOT a construction argument — it
-   travels to the remote inner store at STORE-OPEN (the service-spec's history-kind/depth), the same
-   open-time policy path memory and microservice share. HOST defaults to 127.0.0.1; PORT is the server's
-   port. :PROCESS service mode does NOT carry this factory across the subprocess boundary — use :THREAD
-   mode. The returned store requires STORE-OPEN before reads/writes and STORE-CLOSE (frees the DEK map +
-   ends the client session); STORE-CLOSE is mandatory."
+   HISTORY-POLICY OWNERSHIP + a KNOWN LIMITATION (ADR 0050 §4.2, Slice 3a). Unlike the sqlite/file
+   siblings the inner tier's HISTORY policy is NOT a construction argument here — and, since the Slice-3a
+   server-owned-lifecycle refactor, it is NOT forwarded from the client either: the inner's retention is
+   SERVER-configured at make-microservice-server (:history-kind / :history-depth, applied when the server
+   opens the inner ONCE at server-start), and a per-client store-open is a policy-confirm no-op
+   (+ms-op-open decodes hk/depth to bounds-validate the wire payload, then discards them — it does NOT
+   re-open/re-set the inner). CONSEQUENCE: the client/service HISTORY QoS (e.g. a durability service
+   configured KEEP_LAST 5) is currently DROPPED at this tier; a mismatch (client KEEP_LAST vs a default
+   keep-all reference server) OVER-RETAINS (a late joiner sees full history, not newest-D — a QoS gap, NOT
+   data-loss/false-reject). The operator MUST configure the reference server's :history-kind/:history-depth
+   to match the service's HISTORY QoS. Forwarding the policy over the wire (so the service's HISTORY QoS
+   drives the remote inner) + a KEEP_LAST-through-microservice test are Slice 3c (ADR 0050 §7). All
+   in-process tests use keep-all, so this only bites the deferred live 2-process path. HOST defaults to
+   127.0.0.1; PORT is the server's port. :PROCESS service mode does NOT carry this factory across the
+   subprocess boundary — use :THREAD mode. The returned store requires STORE-OPEN before reads/writes and
+   STORE-CLOSE (frees the DEK map + ends the client session); STORE-CLOSE is mandatory."
   (let ((h  host)
         (p  port)
         (ed (uiop:ensure-directory-pathname epoch-dir))
