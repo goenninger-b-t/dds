@@ -293,10 +293,39 @@ Fast DDS `fastddsgen` output under `interop/fastdds/shapes/gen/` is committed ve
 standards (ADR 0021 cap. 1+7, ADR 0025); the durability/late-joiner service semantics from DDS 1.4
 §2.2.3.4 and RTPS 2.5 §8.4.2.2.
 
+## Discovery-driven dynamic-topic-add leg (`:auto-discover`, ADR 0026 Phase-2b)
+
+A second cross-DDS leg validates the **discovery-driven** dynamic-topic-add (`:auto-discover`) **on the
+wire** against both vendors: our durability service starts with an **EMPTY** topic list + `:auto-discover t`;
+a foreign (Connext / Fast DDS) TRANSIENT_LOCAL publisher appears for `Square/ShapeType` — **a topic the
+service was NEVER configured for**; our bare SPDP/SEDP discovery node parses the foreign vendor's SEDP
+`DiscoveredWriterData` (`PID_TOPIC_NAME` 0x0005 + `PID_TYPE_NAME` 0x0007, XCDR1 CDR strings), auto-adds the
+topic (`service-add-topic`, reused verbatim), collects the foreign samples as **opaque bytes** (only the
+topic-NAME + type-NAME strings are used — no XTypes / type registration), and then serves a foreign
+late-joiner the collected history from our replay writer. The topic name reaches our service **only** via
+the foreign vendor's SEDP — that decode → auto-add is the wire-surface under test. Single long-running
+process (auto-discover needs no restart step); SBCL-only driver (NFR-PORT).
+
+**Status: both legs LIVE-verified in-session (2026-07-07), both peers.** Captures under `captures/`.
+
+| Leg | Peer | Started with | Auto-added from foreign SEDP | Collected (opaque) | Late-joiner received | Capture |
+|---|---|---|---|---|---|---|
+| **1** | **Connext** | `:topics ()` (empty) | **Square** (`nodes 0→1`) | 539 | **444** (24 s read window) | `captures/autodiscover-leg1-connext.pcap` |
+| **2** | **Fast DDS** | `:topics ()` (empty) | **Square** (`nodes 0→1`) | 200 | **200** (exact) | `captures/autodiscover-leg2-fastdds.pcap` |
+
+Run: `interop/durability-persistent/run-autodiscover.sh` (env `DAD_BACKEND=file|sqlite|memory`,
+`DAD_PUB_SECS`, `DAD_SUB_SECS`). PASS = each leg auto-added the topic (foreign SEDP drove the add, no
+pre-config), collected N>0, and the foreign late-joiner received ≥1 sample after the publisher was
+confirmed gone. (The exact received count is a read-window artifact of the live shapes-sub, not the
+auto-discover mechanism, which is what this leg proves; Fast DDS drained the full 200.)
+
 ## Files
 
 - `driver-collect.lisp` — process 1: start PERSISTENT service, collect + seal to disk, stop (fsync), exit.
 - `driver-serve.lisp` — process 2: fresh process, reload + decrypt from disk, serve the late-joiner.
+- `driver-autodiscover.lisp` — single process: start an EMPTY `:auto-discover` service, auto-add a foreign topic from its SEDP, collect + serve the foreign late-joiner (dynamic-topic-add leg).
+- `run-autodiscover.sh` — the 2-leg (Connext + Fast DDS) auto-discover interop runner.
+- `captures/autodiscover-leg{1-connext,2-fastdds}.pcap` — the foreign SEDP → our auto-add → foreign late-joiner replay, both peers.
 - `USER_QOS_PROFILES.xml` — Connext loopback + TRANSIENT_LOCAL/KEEP_ALL/RELIABLE profile.
 - `fastdds-profiles.xml` — Fast DDS loopback-only profile (copy to `interop/fastdds/shapes/profiles.xml`).
 - `captures/leg1-restart-connext.pcap` — proc 2 (post-restart) → late Connext TL reader; `firstSN=1`, CDR_LE, NACK→retransmit.
