@@ -408,16 +408,18 @@ silently disable verification, unlike the torn-tail-recoverable `epochs.dat`).
      the ms `:purge` seam (mirroring the local tiers), which ALSO closes the pre-existing purge+reput-same-session
      brick for this tier (the ms `:purge` had been missing the chain-head clear entirely). Verified by a
      dedicated `authorized purge + CLEAN close + reopen → CLEAN` arm (RED without the clear → `:truncated` brick).
-   - **Residuals + a microservice-specific limitation.** The `logmac.tail`-deletion residual (b) and the
-     anchor-deletion + full-downgrade residual (§7 item 3a) stand unchanged. **Additionally, the microservice
-     tier's KEEP_LAST physical reclaim does NOT re-MAC surviving frames** — its `:delete` slot is a plain
-     server proxy, unlike the file store's `%rewrite-topic-log` / SQLite's `%sqlite-recompute-topic` that
-     re-seed the survivor chain. So a KEEP_LAST reclaim breaks the client-side chain on the next open
-     **independent of the anchor**. This is a pre-existing Slice-3b limitation (ADR 0050 §4.2 — HISTORY policy
-     is not tested through the ms tier; the in-process tests use keep-all); the tail anchor neither introduces
-     nor worsens it. Re-MACing survivors through the wire (a purge-and-reput-all or an update op) is a
-     follow-on if KEEP_LAST-through-microservice is ever required. (This is why the F1 shrink is a PURGE, which
-     now leaves a clean chain, not a KEEP_LAST reclaim.)
+   - **Residuals + a (now-RESOLVED) microservice-specific limitation.** The `logmac.tail`-deletion residual (b)
+     and the anchor-deletion + full-downgrade residual (§7 item 3a) stand unchanged. **The microservice tier's
+     KEEP_LAST physical reclaim used to NOT re-MAC surviving frames** — its `:delete` slot was a plain server
+     proxy, unlike the file store's `%rewrite-topic-log` / SQLite's `%sqlite-recompute-topic` — so a KEEP_LAST
+     reclaim broke the client-side chain on the next open **independent of the anchor** (a pre-existing Slice-3b
+     limitation; the tail anchor neither introduced nor worsened it). **RESOLVED by WP-DURABILITY-MS-RECLAIM-REMAC
+     (ADR 0050 §4.4):** the chained `:delete` now re-MACs the survivors client-side (`%ms-delete-rechain` ⇒
+     `%ms-rechain-survivors`, mirroring `%rewrite-topic-log` / `%sqlite-recompute-topic`) and replaces the
+     server's opaque frames via a new `+ms-op-topic-rewrite+` op + an atomic `store-replace-topic` slot, so a
+     KEEP_LAST reclaim through the microservice reopens CLEAN and the tamper-evidence + tail anchor still hold
+     over the re-chained survivors. (The F1 tail-anchor shrink stays a PURGE — which leaves a clean chain — while
+     the KEEP_LAST reclaim itself is now covered by `run-durability-microservice-keep-last-reclaim-test`.)
    - **The sealed high-water tail anchor is now complete across ALL THREE durability tiers (file + SQLite +
      microservice).**
 2. **`epochs.dat` MAC** — deferred (kept entry-CRC-only; §6).

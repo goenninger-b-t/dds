@@ -543,6 +543,34 @@
                    (if tail
                        (setf (gethash topic chain-macs) tail)
                        (remhash topic chain-macs)))))
+             t))
+
+         :replace-topic-fn
+         ;; atomic whole-topic REPLACE (ADR 0050 §4.4): the microservice server calls this after a KEEP_LAST
+         ;; reclaim re-MACs the survivors client-side, so a persistent SQLite inner swaps the topic's rows in
+         ;; ONE transaction (DELETE the topic + INSERT the survivors) — a crash mid-swap ROLLS BACK (a partial
+         ;; topic would brick the re-MAC'd chain). The DARE-blind server inner is BARE (cmf-cell NIL): the
+         ;; mac/chain_seq COLUMNS stay NULL exactly as the bare :put writes them, and the folded mac/chain_seq
+         ;; ride INSIDE the opaque payload BLOB the server never parses. Reuses the :put INSERT + :purge DELETE
+         ;; shapes (DRY); *durability-debug-compact-fault* exercises the mid-swap rollback.
+         (lambda (topic records)
+           (dds.pal:with-lock (lock)
+             (%ensure-db)
+             (sqlite:with-transaction (car db-cell)
+               (sqlite:execute-non-query (car db-cell) "DELETE FROM record WHERE topic=?" topic)
+               ;; simulated crash between the DELETE and the survivor INSERTs (test-only; rolls back)
+               (when *durability-debug-compact-fault*
+                 (error "dds.durability: *durability-debug-compact-fault* — simulated crash mid ~
+                         topic-rewrite (topic ~a)" topic))
+               (dolist (r records)
+                 (sqlite:execute-non-query
+                  (car db-cell)
+                  "INSERT OR IGNORE INTO record (topic, writer_guid, sn, key_hash, kind, payload, mac, chain_seq) VALUES (?,?,?,?,?,?,?,?)"
+                  topic (durable-record-writer-guid r) (%sn->be8 (durable-record-sn r))
+                  (durable-record-key-hash r) (%kind->int (durable-record-kind r))
+                  (durable-record-payload r) nil nil)))
+             ;; parity with :purge — drop any stale running chain head (a bare inner never seeds it)
+             (remhash topic chain-macs)
              t)))))))
 
 (defun* make-sqlite-store-factory (&key dir key-dir (db-name "durability.sqlite3")

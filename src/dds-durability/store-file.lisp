@@ -1126,6 +1126,37 @@
                      (setf (gethash k pd) t)
                      (when (>= (hash-table-count pd) *compaction-superseded-threshold*)
                        (%reclaim-deleted-topic tid topic)))))))
+           t))
+
+       :replace-topic-fn
+       ;; atomic whole-topic REPLACE (ADR 0050 §4.4): the microservice server calls this after a KEEP_LAST
+       ;; reclaim re-MACs the survivors client-side, so a persistent file inner swaps the topic's frames
+       ;; CRASH-ATOMICALLY (a partial topic would brick the re-MAC'd chain). Reuses the SAME primitives as
+       ;; %compact-topic-log (DRY): release the append fd BEFORE the rewrite (a stale fd appending to the
+       ;; renamed-away log = DATA LOSS), the atomic %rewrite-topic-log (tmp+fsync+rename — the
+       ;; *durability-debug-file-rewrite-fault* seam gives crash-before-commit rollback), rebuild the
+       ;; in-memory index, reseed the Sliver-2 counters, carry the fresh tail chain MAC. A bare inner
+       ;; (chain-mac-fn NIL — the DARE-blind server's) writes byte-identical v2 frames; the folded
+       ;; mac/chain_seq ride as OPAQUE payload bytes the server never parses.
+       (lambda (topic records)
+         (dds.pal:with-lock (lock)
+           (let* ((tid (or (gethash topic id-map)
+                           (setf (gethash topic id-map) (%topic->id topic))))
+                  (stm (gethash tid streams)))
+             (when stm
+               (ignore-errors (dds.pal:fsync-stream stm))
+               (ignore-errors (close stm))
+               (remhash tid streams))
+             (let ((tail (%rewrite-topic-log store-dir tid records chain-mac-fn topic)))
+               (if tail
+                   (setf (gethash tid chain-macs) tail)
+                   (remhash tid chain-macs))
+               (let ((inn (%inner tid)))
+                 (clrhash inn)
+                 (dolist (r records)
+                   (setf (gethash (%record-key (durable-record-writer-guid r)
+                                               (durable-record-sn r)) inn) r)))
+               (%init-topic-counts tid records)))
            t))))))
 
 (defun* file-store-sync (store)

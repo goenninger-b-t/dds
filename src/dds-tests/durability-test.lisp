@@ -7322,7 +7322,44 @@
                 (%check :msrc-nil-bytes (%tms-rec= r "T" g1 1 nil :data p1)
                         "bare store payload byte-exact (no fold)"))
               (dds.durability:store-close s))
-          (dds.durability:microservice-server-stop srv)))))
+          (dds.durability:microservice-server-stop srv)))
+      ;; ---- (6) SUSTAINED TAMPER-EVIDENCE AFTER A RECLAIM (WP-DURABILITY-MS-RECLAIM-REMAC, ADR 0050 §4.4):
+      ;;      a KEEP_LAST reclaim re-MACs the survivors (the chained store-delete + +ms-op-topic-rewrite+),
+      ;;      so a reclaim reopens CLEAN through the SAME factory path; a malicious whole-topic-drop OVER the
+      ;;      re-chained survivor is STILL caught fail-closed (the re-MAC'd chain + the sealed tail anchor). ----
+      (let* ((inner (dds.durability:make-memory-store))
+             (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+             (port  (dds.durability:microservice-server-port srv))
+             (base  (%tms-tmp-dir "rchain-reclaim"))
+             (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base))
+             (kh    (%tms-guid 9)) (g1 (%tms-guid 4))
+             (p1    (%tms-payload 16 1)) (p2 (%tms-payload 16 2)))
+        (unwind-protect
+            (progn
+              (let ((s (funcall (dds.durability:make-microservice-store-factory
+                                 :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+                (dds.durability:store-open s :keep-last 1)
+                (dds.durability:store-put s "T" g1 1 kh :data p1)
+                (dds.durability:store-put s "T" g1 2 kh :data p2)   ; supersede -> reclaim -> re-MAC + rewrite
+                (dds.durability:store-close s))
+              (let ((s2 (funcall (dds.durability:make-microservice-store-factory
+                                  :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+                (dds.durability:store-open s2)                       ; re-verifies the re-MAC'd chain clean
+                (%check :msrc-reclaim-clean
+                        (and (= 1 (dds.durability:store-count s2 nil))
+                             (%tms-rec= (first (dds.durability:store-get-range s2 "T")) "T" g1 2 kh :data p2))
+                        "a KEEP_LAST reclaim reopens CLEAN through the factory path (survivors re-MAC'd) + newest-D byte-exact")
+                (dds.durability:store-close s2))
+              (dds.durability:store-purge inner (first (dds.durability:store-topics inner)))
+              (let ((s3 (funcall (dds.durability:make-microservice-store-factory
+                                  :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+                (%check :msrc-reclaim-tamper
+                        (handler-case (progn (dds.durability:store-open s3)
+                                             (ignore-errors (dds.durability:store-close s3)) nil)
+                          (error () (ignore-errors (dds.durability:store-close s3)) t))
+                        "SUSTAINED TAMPER-EVIDENCE: a whole-topic-drop AFTER a reclaim is still detected at open (the re-MAC'd chain + sealed tail anchor)")))
+          (progn (dds.durability:microservice-server-stop srv)
+                 (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t)))))))
   t)
 
 (defun* run-durability-microservice-tail-anchor-test ()
@@ -7594,6 +7631,256 @@
                     "client3 sees the cumulative 6 (5 from c1 + 1 from c2) — one server-owned inner")
             (dds.durability:store-close c3)))
       (dds.durability:microservice-server-stop srv)))
+  t)
+
+(defun* run-durability-microservice-keep-last-reclaim-test ()
+    (function () t)
+  "WP-DURABILITY-MS-RECLAIM-REMAC (ADR 0050 §4.4): a KEEP_LAST encrypted MICROSERVICE store no longer BRICKS
+   on physical eviction. The chained store-delete now RE-MACs the surviving client chain + REPLACES the
+   server's opaque frames via a new +ms-op-topic-rewrite+ op (the microservice analogue of the file store's
+   %rewrite-topic-log / SQLite's %sqlite-recompute-topic), so a reclaim reopens CLEAN. Arms (DARE-wrapped,
+   SKIP if OpenSSL < 3.5):
+   (1) BRICK-REPRO -> CLEAN (the headline): KEEP_LAST-1, put 2 superseding :data of one instance -> the
+       decorator's %evict-prior-surrogates fires store-delete -> re-MAC + topic-rewrite -> the server inner
+       physically holds 1 record -> reopen OPENS CLEAN + get-range recovers the newest-D byte-exact + the
+       tail anchor composes (a second clean close+reopen stays clean over the re-chained state).
+   (1-RED) revert the re-MAC (*durability-debug-ms-skip-reclaim-remac* T) -> the SAME reclaim BRICKS on
+       reopen (the survivors' stale folded MACs mismatch the re-seeded %ms-verify-chain) — proving
+       %ms-delete-rechain is load-bearing.
+   (2) SERVER DARE-BLIND: the reclaimed survivor is stored as a FOLDED OPAQUE blob (sealed ∥ mac ∥ chain_seq
+       > 40 bytes) and the plaintext payload never appears in the server's inner — the server replaces
+       opaque frames and never parses the mac.
+   (3) SUSTAINED TAMPER-EVIDENCE (the re-MAC'd chain still detects tampering): KEEP_LAST-2, 3 puts -> reclaim
+       leaves 2 re-chained survivors -> a malicious server that TAMPERS a byte / DROPS a survivor / DROPS the
+       WHOLE topic is STILL caught fail-closed at open (the re-MAC'd chain + the sealed tail anchor).
+   (4) CROSS-RESTART with re-MAC (PERSISTENT file inner): reclaim in session A over a file inner, restart the
+       server, reopen in session B -> verifies clean across the restart + byte-exact (the atomic
+       store-replace-topic survives).
+   (5) CRASH-FAULT MID-REPLACE (file inner atomicity): a crash before the atomic rename
+       (*durability-debug-file-rewrite-fault*) during the reclaim rewrite ROLLS BACK the topic -> reopen
+       CLEAN with the pre-reclaim records intact (no partial-topic brick — store-replace-topic is crash-atomic).
+   Both impls."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [durability-microservice-keep-last-reclaim] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-microservice-keep-last-reclaim-test t)))
+  (labels ((%keys (base) (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) base))
+           (%mk (port base) (funcall (dds.durability:make-microservice-store-factory
+                                      :host "127.0.0.1" :port port :epoch-dir base :key-dir (%keys base))))
+           (%fill (port base depth guid kh payloads)
+             ;; session A: open KEEP_LAST-DEPTH, put each payload as a superseding :data of instance (GUID,KH)
+             ;; at sn 1..N -> the decorator's online eviction physically reclaims via the chained store-delete.
+             (let ((s (%mk port base)))
+               (dds.durability:store-open s :keep-last depth)
+               (loop for p in payloads for i from 1
+                     do (dds.durability:store-put s "T" guid i kh :data p))
+               (dds.durability:store-close s)))
+           (%reopen (port base)
+             ;; session B: reopen -> (values opened-clean-p records); a brick surfaces as an error -> NIL.
+             (let ((s (%mk port base)))
+               (handler-case
+                   (progn (dds.durability:store-open s)
+                          (let ((rs (dds.durability:store-get-range s "T")))
+                            (ignore-errors (dds.durability:store-close s))
+                            (values t rs)))
+                 (error () (ignore-errors (dds.durability:store-close s)) (values nil nil)))))
+           (%sqinner (dir)
+             ;; a persistent SQLite server inner on DIR; the store creates DIR itself with 0700 (enforced +
+             ;; asserted by %ensure-db) — do NOT pre-create it (a pre-created 0755 dir fails the 0700 assert).
+             ;; A fresh store on the SAME dir replays its rows on restart (cross-restart recovery).
+             (dds.durability:make-sqlite-store :path (merge-pathnames "durability.sqlite3" dir)))
+           (%cleanup (d) (when (uiop:directory-exists-p d) (uiop:delete-directory-tree d :validate t))))
+    (let ((g  (%tms-guid 1)) (kh (%tms-guid 9))
+          (p1 (%tms-payload 32 11)) (p2 (%tms-payload 32 22)) (p3 (%tms-payload 32 33)))
+      ;; ---- (1) BRICK-REPRO -> CLEAN + (2) SERVER DARE-BLIND (shared memory-inner reclaim) ----
+      (let* ((inner (dds.durability:make-memory-store))
+             (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+             (port  (dds.durability:microservice-server-port srv))
+             (base  (%tms-tmp-dir "klr-brick")))
+        (unwind-protect
+            (progn
+              (%fill port base 1 g kh (list p1 p2))
+              (%check :klr-reclaimed (= 1 (dds.durability:store-count inner nil))
+                      "the KEEP_LAST-1 reclaim physically evicted the superseded surrogate (server inner count 1)")
+              ;; (2) server DARE-blind: the survivor is a folded opaque blob; no plaintext leaks
+              (let ((rr (dds.durability:store-get-range inner (first (dds.durability:store-topics inner)))))
+                (%check :klr-dare-blind-folded
+                        (and (= 1 (length rr)) (> (length (dds.durability:durable-record-payload (first rr))) 40))
+                        "SERVER DARE-BLIND: the reclaimed survivor is a FOLDED OPAQUE blob (sealed ∥ mac ∥ chain_seq > 40 bytes)"))
+              (%check :klr-dare-blind-noplain (not (search p2 (%tms-flatten-store inner)))
+                      "SERVER DARE-BLIND: the plaintext payload never appears in the server's inner (the server never parses the mac/payload)")
+              ;; (1) reopen opens CLEAN + newest-D byte-exact
+              (multiple-value-bind (clean rs) (%reopen port base)
+                (%check :klr-reopen-clean clean
+                        "BRICK-REPRO -> CLEAN: the KEEP_LAST-1 microservice reclaim reopens CLEAN (the re-MAC'd survivor chain verifies)")
+                (%check :klr-newest-exact (and clean (= 1 (length rs)) (%tms-rec= (first rs) "T" g 2 kh :data p2))
+                        "the newest-D survivor is recovered byte-exact after the reclaim + re-MAC"))
+              ;; (1) tail-anchor composition: a SECOND clean close+reopen stays clean over the re-chained state
+              (multiple-value-bind (clean2 rs2) (%reopen port base)
+                (%check :klr-reopen-clean-again (and clean2 (= 1 (length rs2)))
+                        "TAIL-ANCHOR COMPOSES: a second reopen over the re-chained + re-sealed state stays CLEAN (no stale anchor / false-reject)")))
+          (progn (dds.durability:microservice-server-stop srv) (%cleanup base))))
+      ;; ---- (1-RED) revert the re-MAC -> the same reclaim BRICKS ----
+      (let* ((inner (dds.durability:make-memory-store))
+             (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+             (port  (dds.durability:microservice-server-port srv))
+             (base  (%tms-tmp-dir "klr-red")))
+        (unwind-protect
+            (progn
+              (let ((dds.durability::*durability-debug-ms-skip-reclaim-remac* t))
+                (%fill port base 1 g kh (list p1 p2)))
+              (multiple-value-bind (clean rs) (%reopen port base)
+                (declare (ignore rs))
+                (%check :klr-red-bricks (not clean)
+                        "RED: with the reclaim re-MAC SKIPPED, the KEEP_LAST reclaim BRICKS on reopen (%ms-delete-rechain is load-bearing)")))
+          (progn (dds.durability:microservice-server-stop srv) (%cleanup base))))
+      ;; ---- (3) SUSTAINED TAMPER-EVIDENCE after a reclaim (KEEP_LAST-2, 3 puts -> 2 re-chained survivors) ----
+      (flet ((%tamper-arm (tag inject)
+               (let* ((inner (dds.durability:make-memory-store))
+                      (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+                      (port  (dds.durability:microservice-server-port srv))
+                      (base  (%tms-tmp-dir tag)))
+                 (unwind-protect
+                     (progn
+                       (%fill port base 2 g kh (list p1 p2 p3))
+                       (funcall inject inner)
+                       (nth-value 0 (%reopen port base)))
+                   (progn (dds.durability:microservice-server-stop srv) (%cleanup base))))))
+        ;; MULTI-SURVIVOR non-vacuous baseline (NIT-1): the tamper arms below assert NOT-clean, but if the
+        ;; DENSE multi-survivor re-chain (chain_seq 0,1) were broken the un-tampered store would BRICK and the
+        ;; tamper arms would pass for the WRONG reason. So FIRST prove an UN-TAMPERED KEEP_LAST-2 reclaim (3
+        ;; puts -> evict 1 -> 2 survivors) reopens CLEAN with BOTH dense survivors byte-exact + (guid,sn)-ordered.
+        (let* ((inner (dds.durability:make-memory-store))
+               (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+               (port  (dds.durability:microservice-server-port srv))
+               (base  (%tms-tmp-dir "klr-ml-clean")))
+          (unwind-protect
+              (progn
+                (%fill port base 2 g kh (list p1 p2 p3))
+                (%check :klr-multi-reclaimed-2 (= 2 (dds.durability:store-count inner nil))
+                        "KEEP_LAST-2 + 3 puts reclaims to exactly 2 re-chained survivors on the server inner")
+                (multiple-value-bind (clean rs) (%reopen port base)
+                  (%check :klr-multi-reopen-clean
+                          (and clean (= 2 (length rs))
+                               (%tms-rec= (first rs)  "T" g 2 kh :data p2)
+                               (%tms-rec= (second rs) "T" g 3 kh :data p3))
+                          "MULTI-SURVIVOR baseline (non-vacuous): the UN-TAMPERED KEEP_LAST-2 store reopens CLEAN with BOTH dense survivors byte-exact + (guid,sn)-ordered (proves the dense re-chain chain_seq 0,1 is correct — the tamper arms fail for the tamper, not a brick)")))
+            (progn (dds.durability:microservice-server-stop srv) (%cleanup base))))
+        (%check :klr-tamper-byte
+                (not (%tamper-arm "klr-ts-byte"
+                                  (lambda (inner)
+                                    (let* ((tp (first (dds.durability:store-topics inner)))
+                                           (r  (first (dds.durability:store-get-range inner tp)))
+                                           (p  (dds.durability:durable-record-payload r)))
+                                      (setf (aref p 0) (logxor (aref p 0) #xFF))))))
+                "SUSTAINED TAMPER-EVIDENCE: a byte TAMPER of a re-chained survivor is caught fail-closed at open")
+        (%check :klr-tamper-drop
+                (not (%tamper-arm "klr-ts-drop"
+                                  (lambda (inner)
+                                    (let* ((tp (first (dds.durability:store-topics inner)))
+                                           (r  (first (dds.durability:store-get-range inner tp))))
+                                      (dds.durability:store-delete inner tp (dds.durability:durable-record-writer-guid r) 0)))))
+                "SUSTAINED TAMPER-EVIDENCE: DROPPING a re-chained survivor is caught fail-closed at open (the sealed tail anchor)")
+        (%check :klr-tamper-wholetopic
+                (not (%tamper-arm "klr-ts-wtd"
+                                  (lambda (inner)
+                                    (dds.durability:store-purge inner (first (dds.durability:store-topics inner))))))
+                "SUSTAINED TAMPER-EVIDENCE: a WHOLE-TOPIC-DROP after the reclaim is caught fail-closed at open"))
+      ;; ---- (4) CROSS-RESTART with re-MAC (PERSISTENT file inner) ----
+      (let ((sdir  (%tms-tmp-dir "klr-xr-server"))
+            (cbase (%tms-tmp-dir "klr-xr-client")))
+        (unwind-protect
+            (progn
+              (let* ((srv1  (dds.durability:make-microservice-server
+                             :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                     (port1 (dds.durability:microservice-server-port srv1)))
+                (unwind-protect (%fill port1 cbase 1 g kh (list p1 p2))
+                  (dds.durability:microservice-server-stop srv1)))
+              (let* ((srv2  (dds.durability:make-microservice-server
+                             :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                     (port2 (dds.durability:microservice-server-port srv2)))
+                (unwind-protect
+                    (multiple-value-bind (clean rs) (%reopen port2 cbase)
+                      (%check :klr-xr-clean
+                              (and clean (= 1 (length rs)) (%tms-rec= (first rs) "T" g 2 kh :data p2))
+                              "CROSS-RESTART: a persistent file inner replays the re-MAC'd rewrite across a server restart -> reopen CLEAN + byte-exact"))
+                  (dds.durability:microservice-server-stop srv2))))
+          (progn (%cleanup sdir) (%cleanup cbase))))
+      ;; ---- (5) CRASH-FAULT MID-REPLACE (file inner atomicity — rollback) ----
+      (let ((sdir  (%tms-tmp-dir "klr-crash-server"))
+            (cbase (%tms-tmp-dir "klr-crash-client")))
+        (unwind-protect
+            (progn
+              (let* ((srv1  (dds.durability:make-microservice-server
+                             :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                     (port1 (dds.durability:microservice-server-port srv1)))
+                (unwind-protect
+                    ;; the fault fires on the SERVER's serve thread -> a dynamic LET binding would not reach it;
+                    ;; set the GLOBAL flag (reset in the unwind-protect). The reclaim rewrite faults before the
+                    ;; atomic rename -> the server drops the connection -> the client's superseding put errors.
+                    (progn
+                      (setf dds.durability::*durability-debug-file-rewrite-fault* t)
+                      (ignore-errors (%fill port1 cbase 1 g kh (list p1 p2))))
+                  (progn
+                    (setf dds.durability::*durability-debug-file-rewrite-fault* nil)
+                    (dds.durability:microservice-server-stop srv1))))
+              (let* ((srv2  (dds.durability:make-microservice-server
+                             :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                     (port2 (dds.durability:microservice-server-port srv2)))
+                (unwind-protect
+                    (multiple-value-bind (clean rs) (%reopen port2 cbase)
+                      (%check :klr-crash-clean clean
+                              "CRASH-FAULT MID-REPLACE: a crash before the atomic rename ROLLS BACK the topic -> reopen CLEAN (no partial-topic brick; store-replace-topic is crash-atomic)")
+                      (%check :klr-crash-intact (and clean (= 2 (length rs)))
+                              "the pre-reclaim records are intact after the rolled-back replace (the reclaim is simply not applied)"))
+                  (dds.durability:microservice-server-stop srv2))))
+          (progn (%cleanup sdir) (%cleanup cbase))))
+      ;; ---- (6) SQLITE INNER reclaim (NIT-2) — the SQLite store-replace-topic (with-transaction) exercised
+      ;;      end-to-end through a microservice server: HAPPY PATH + CROSS-RESTART, byte-exact ----
+      (let ((sdir  (%tms-tmp-dir "klr-sq-server"))
+            (cbase (%tms-tmp-dir "klr-sq-client")))
+        (unwind-protect
+            (progn
+              (let* ((srv1  (dds.durability:make-microservice-server :port 0 :inner (%sqinner sdir)))
+                     (port1 (dds.durability:microservice-server-port srv1)))
+                (unwind-protect (%fill port1 cbase 1 g kh (list p1 p2))
+                  (dds.durability:microservice-server-stop srv1)))
+              (let* ((srv2  (dds.durability:make-microservice-server :port 0 :inner (%sqinner sdir)))
+                     (port2 (dds.durability:microservice-server-port srv2)))
+                (unwind-protect
+                    (multiple-value-bind (clean rs) (%reopen port2 cbase)
+                      (%check :klr-sq-xr-clean
+                              (and clean (= 1 (length rs)) (%tms-rec= (first rs) "T" g 2 kh :data p2))
+                              "SQLITE INNER: a reclaim through the SQLite store-replace-topic (with-transaction) reopens CLEAN + byte-exact across a server restart"))
+                  (dds.durability:microservice-server-stop srv2))))
+          (progn (%cleanup sdir) (%cleanup cbase))))
+      ;; ---- (7) SQLITE INNER crash-fault mid-transaction (NIT-2, atomicity — ACID rollback) ----
+      (let ((sdir  (%tms-tmp-dir "klr-sqc-server"))
+            (cbase (%tms-tmp-dir "klr-sqc-client")))
+        (unwind-protect
+            (progn
+              (let* ((srv1  (dds.durability:make-microservice-server :port 0 :inner (%sqinner sdir)))
+                     (port1 (dds.durability:microservice-server-port srv1)))
+                (unwind-protect
+                    ;; the fault fires INSIDE the SQLite with-transaction on the SERVER's serve thread -> set the
+                    ;; GLOBAL flag (a dynamic LET would not reach that thread); reset it in the unwind-protect.
+                    (progn
+                      (setf dds.durability::*durability-debug-compact-fault* t)
+                      (ignore-errors (%fill port1 cbase 1 g kh (list p1 p2))))
+                  (progn
+                    (setf dds.durability::*durability-debug-compact-fault* nil)
+                    (dds.durability:microservice-server-stop srv1))))
+              (let* ((srv2  (dds.durability:make-microservice-server :port 0 :inner (%sqinner sdir)))
+                     (port2 (dds.durability:microservice-server-port srv2)))
+                (unwind-protect
+                    (multiple-value-bind (clean rs) (%reopen port2 cbase)
+                      (%check :klr-sq-crash-clean clean
+                              "SQLITE INNER CRASH-FAULT: a fault mid store-replace-topic transaction ROLLS BACK -> reopen CLEAN (no partial topic)")
+                      (%check :klr-sq-crash-intact (and clean (= 2 (length rs)))
+                              "SQLITE INNER: the pre-reclaim rows are intact after the rolled-back transaction (all-or-nothing ACID)"))
+                  (dds.durability:microservice-server-stop srv2))))
+          (progn (%cleanup sdir) (%cleanup cbase))))))
   t)
 
 (defun* run-durability-microservice-config-env-test ()

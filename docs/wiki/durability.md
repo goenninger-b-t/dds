@@ -873,10 +873,10 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   deletes `logmac.tail`** opens clean (byte-indistinguishable from a legitimate never-cleanly-closed store;
   the **same residual class as anchor-deletion, §7 item 3a** — it cannot be closed by requiring the tail
   file's presence without false-rejecting every legitimately never-closed store; invalidate-at-open widens
-  the legitimate-absent window to any open session, same class); on the **microservice tier** the additional
-  limitation that its `:delete` does not re-MAC survivors, so a KEEP_LAST physical reclaim breaks the client
-  chain independent of the anchor (a pre-existing Slice-3b limitation — HISTORY policy is untested through that
-  tier; the ms `:purge` **now** clears the client chain head, mirroring the local tiers, so an authorized purge
+  the legitimate-absent window to any open session, same class); on the **microservice tier** the KEEP_LAST
+  physical-reclaim re-MAC is now done (WP-DURABILITY-MS-RECLAIM-REMAC, §8.10.3 — the `:delete` re-MACs the
+  survivors + replaces the server's opaque frames via `+ms-op-topic-rewrite+`, so a reclaim reopens CLEAN);
+  the ms `:purge` **also** clears the client chain head, mirroring the local tiers, so an authorized purge
   + clean close + reopen opens CLEAN — a false-reject the anchor would otherwise introduce, fixed here); the combined anchor-deletion-plus-full-downgrade
   vector and a full rollback of a *grandfathered* legacy topic; and the `epochs.dat` MAC. Cost is off the
   sample hot path (one HMAC per put / per frame at open; one HMAC over the tail set per close). Verified by
@@ -904,11 +904,12 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   purge clears the client chain head so no stale entry is sealed; RED without the `:purge` fix bricks
   `:truncated`], **anchor-tamper DETECTED**, **cross-restart byte-exact** across a server restart over a
   persistent file inner, and **F1 reclaim-shrink-crash CLEAN** + a self-contained **RED-brick** via
-  `*durability-debug-skip-tail-invalidate*`). Because the microservice `:delete` does not re-MAC survivors
-  (unlike the local tiers), F1 uses an authorized PURGE as the shrink, not a KEEP_LAST reclaim (documented
-  limitation). The ms `:purge` now clears the client chain head (mirroring file/SQLite), fixing the anchor's
-  introduced brick AND the pre-existing purge+reput-same-session brick. The sealed high-water tail anchor is
-  now complete across ALL THREE tiers.
+  `*durability-debug-skip-tail-invalidate*`). F1 uses an authorized PURGE as the shrink (which leaves a valid
+  chain); the KEEP_LAST reclaim shrink itself is covered by its own test now that the ms `:delete` re-MACs the
+  survivors (WP-DURABILITY-MS-RECLAIM-REMAC, §8.10.3 — `run-durability-microservice-keep-last-reclaim-test`). The
+  ms `:purge` now clears the client chain head (mirroring file/SQLite), fixing the anchor's introduced brick AND
+  the pre-existing purge+reput-same-session brick. The sealed high-water tail anchor is now complete across ALL
+  THREE tiers.
 
 ### 8.6 Deployment requirement — OpenSSL ≥ 3.5
 
@@ -1625,6 +1626,55 @@ as file/SQLite, deferred to the ADR 0045 §7 sealed high-water anchor):** tail-t
 and — the topic-granularity version — whole-topic-drop (a server omitting a topic from `store-topics` is
 never verified). No new crypto, no new dependency; the server code is byte-identical. The chain engages only
 under the encrypted-store; a bare `microservice-store` is memory-parity (Slice 1 unchanged).
+
+### 8.10.3 KEEP_LAST reclaim re-MAC over the wire (Slice 3d, built — ADR 0050 §4.4)
+
+A KEEP_LAST **encrypted** microservice store used to **BRICK** on physical eviction. When the decorator's
+online reclaim (`%evict-prior-surrogates` ⇒ `store-delete`) removed a superseded surrogate, the microservice
+`:delete` was a **bare server proxy** — it deleted the record server-side but never re-MAC'd the surviving
+client chain (unlike the file tier's `%rewrite-topic-log` and SQLite's `%sqlite-recompute-topic`, which
+re-seed + re-MAC the survivors after a compacting delete). The survivors' stored **folded MACs went stale**
+(they chained over the deleted predecessor) → the next open's `%ms-verify-chain` re-seeded and hit
+`:mismatch` → **the store refused to open**. Reachable by KEEP_LAST-1 + two superseding puts of one instance.
+
+**The fix** — the chained `:delete` becomes the microservice analogue of SQLite's `:delete = DELETE +
+%sqlite-recompute-topic`. It re-chains the survivors client-side and pushes the result to the server via a new
+whole-topic-rewrite op:
+
+1. **get-range** the topic's current folded records over the wire; **drop** the deleted `(guid,sn)`.
+2. **re-chain** the survivors (`%ms-rechain-survivors`): re-seed `%chain-seed`, re-walk in `chain_seq` order
+   recomputing each MAC via the reused `%frame-record-versioned`, re-fold with a **dense** `chain_seq 0..M-1`
+   — mirroring `%rewrite-topic-log` / `%sqlite-recompute-topic` exactly, so the next open recomputes
+   byte-identical MACs and reopens CLEAN.
+3. **update** the client chain state (`chain-macs`/`chain-seqs`/`put-index`).
+4. **ship** the re-folded survivors in ONE `+ms-op-topic-rewrite+` op (op-code 8); the DARE-blind server
+   **replaces** the topic's opaque frames (it never parses the mac/chain_seq riding inside the payload).
+
+The server-side replace is **atomic** via a new additive NIL-fallback `store-replace-topic` vtable slot (same
+binding as `store-delete` / `sync`): the default **memory** inner uses `store-purge` + bulk `store-put`
+(trivially atomic in-process); a **file** inner reuses the atomic `%rewrite-topic-log` (tmp + fsync + rename); a
+**SQLite** inner uses a single transaction (DELETE topic + INSERT survivors). A partial topic would brick the
+re-MAC'd chain, so the swap is all-or-nothing. **No new crypto** (reuses `%chain-seed` /
+`%frame-record-versioned` / `%ms-fold-payload`), no new dependency.
+
+```lisp
+;; A KEEP_LAST encrypted microservice store now survives a physical reclaim and reopens CLEAN:
+(let ((s (funcall (dds.durability:make-microservice-store-factory
+                   :host "127.0.0.1" :port port :epoch-dir base :key-dir kdir))))
+  (dds.durability:store-open s :keep-last 1)
+  (dds.durability:store-put s "T" guid 1 key-hash :data p1)
+  (dds.durability:store-put s "T" guid 2 key-hash :data p2)   ; supersede → reclaim → re-MAC + topic-rewrite
+  (dds.durability:store-close s))
+;; reopen: the re-MAC'd survivor chain verifies → CLEAN, newest-D recovered byte-exact
+```
+
+Verified by `run-durability-microservice-keep-last-reclaim-test`: **brick-repro → CLEAN** (+ a self-contained
+**RED** via `*durability-debug-ms-skip-reclaim-remac*` that bricks on reopen, proving the re-MAC is
+load-bearing), **server DARE-blind** (a folded opaque blob > 40 bytes, no plaintext at the server), **sustained
+tamper-evidence** (byte-tamper / survivor-drop / whole-topic-drop over the re-chained survivors each caught
+fail-closed), **cross-restart** over a persistent file inner (byte-exact), and **crash-fault mid-replace**
+(a crash before the atomic rename rolls back → reopen CLEAN with the pre-reclaim records intact). Skips if
+OpenSSL < 3.5.
 
 ---
 

@@ -26,10 +26,14 @@
 ;;; water tail anchor engages for encrypted-store(microservice-store) — closing tail-truncation-of-a-valid-
 ;;; prefix AND (uniquely) WHOLE-TOPIC-DROP-BY-A-MALICIOUS-SERVER (the sealed topic-SET is the client-trusted
 ;;; enumeration, so a server that omits a topic from store-topics is still verified -> :truncated). :sync
-;;; stays NIL (no group-commit over TCP). DEFERRED (Slice 3c): HISTORY-policy forwarding + graceful reconnect
-;;; / multi-client concurrency / chunked large get-range / DoS-hardening; and KEEP_LAST physical reclaim does
-;;; NOT re-MAC surviving frames (the :delete is a plain server proxy, unlike the file/SQLite recompute) —
-;;; documented limitation, so a KEEP_LAST reclaim breaks the client chain independent of the anchor.
+;;; stays NIL (no group-commit over TCP). WP-DURABILITY-MS-RECLAIM-REMAC (ADR 0050 §4.4) RESOLVES the former
+;;; KEEP_LAST-reclaim limitation: a reclaim's store-delete now RE-MACs the surviving client chain (mirroring
+;;; the file store's %rewrite-topic-log / SQLite's %sqlite-recompute-topic) and REPLACES the server's opaque
+;;; frames via a new +ms-op-topic-rewrite+ op, so a KEEP_LAST reclaim through the microservice reopens CLEAN
+;;; (the chained :delete = get-range + drop + re-seed + re-walk + re-fold + atomic topic-rewrite; %ms-delete-
+;;; rechain). The server stays DARE-blind (it replaces opaque frames, never parses the mac). DEFERRED (Slice
+;;; 3c): HISTORY-policy forwarding + graceful reconnect / multi-client concurrency / chunked large get-range /
+;;; DoS-hardening.
 ;;;
 ;;; WIRE PROTOCOL (length-prefixed request/response over the single stream; all integers little-endian):
 ;;;   REQUEST:  u32 body-len | u8 op-code | op-payload      (body-len counts the op-code + payload)
@@ -52,6 +56,11 @@
 (defconstant +ms-op-count+     5 "Op-code: count records (payload: u8 has-topic + [topic]).")
 (defconstant +ms-op-open+      6 "Op-code: open the inner store (payload: u8 hk-code + u32 depth[0=nil]).")
 (defconstant +ms-op-close+     7 "Op-code: end this client session (payload: none).")
+(defconstant +ms-op-topic-rewrite+ 8
+  "Op-code: atomically REPLACE a topic's records with the supplied opaque frames (payload: topic +
+   u32 count + count record frames). The client ships the KEEP_LAST-reclaim re-MAC'd survivors here so the
+   DARE-blind server replaces the stale-chained frames — mac/chain_seq ride INSIDE each opaque payload the
+   server never parses (ADR 0050 §4.4).")
 (defconstant +ms-op-delete+    9 "Op-code: delete one record (payload: topic + guid16 + u64 sn).")
 
 (defconstant +ms-status-ok+    0 "Response status byte: the op completed; op-specific result follows.")
@@ -87,6 +96,13 @@
   (:documentation "A wire message was malformed (a length/count/frame exceeded the buffer extent, or an
     op-code was unknown). Raised by the bounds-checked decoder BEFORE any out-of-bounds access; the
     server drops the offending connection, a client op surfaces it (operating contract §4)."))
+
+(defparameter *durability-debug-ms-skip-reclaim-remac* nil
+  "Test-only RED control (ADR 0050 §4.4). NIL (default) ⇒ inert: a KEEP_LAST reclaim's chained store-delete
+   RE-MACs the survivors + rewrites the topic (%ms-delete-rechain), so the store reopens CLEAN. When non-NIL
+   the chained :delete falls back to the OLD bare server-proxy delete (no re-MAC) — reproducing the pre-fix
+   BRICK (the survivors' stale folded MACs mismatch the next open's re-seeded %ms-verify-chain) to prove the
+   re-MAC is load-bearing. Never set in production code (mirrors *durability-debug-skip-tail-invalidate*).")
 
 ;;; ---- message writer (adjustable octet buffer; durability is off the wire hot path) ----
 
@@ -336,6 +352,17 @@
     (%ms-put-string b topic)
     (%ms-put-bytes b (coerce writer-guid '(simple-array (unsigned-byte 8) (*))))
     (%ms-put-u64 b sn)
+    (%ms-finalize b)))
+
+(defun* %ms-encode-topic-rewrite (topic records)
+    (function (string list) (simple-array (unsigned-byte 8) (*)))
+  "Encode a topic-rewrite op payload: topic (u16-len UTF-8) + u32 count + count × record frames (each the
+   REUSED %frame-record of a folded record). The DARE-blind server REPLACES the topic's records with these
+   OPAQUE frames; the mac/chain_seq ride INSIDE each folded payload the server never parses (ADR 0050 §4.4)."
+  (let ((b (%ms-buf)))
+    (%ms-put-string b topic)
+    (%ms-put-u32 b (length records))
+    (dolist (rec records) (%ms-put-frame b (%frame-record rec)))
     (%ms-finalize b)))
 
 (defun* %ms-empty-payload ()
@@ -593,13 +620,21 @@
                  ((eq reason :reached) (if (equalp running mac) t :diverged))
                  ((eq reason :clean)   :truncated)
                  (t                    t))))))
+     ;; chained tier: a KEEP_LAST reclaim's store-delete must RE-MAC the survivors' chain (mirroring the file
+     ;; store's %rewrite-topic-log / SQLite's %sqlite-recompute-topic) and REPLACE the server's opaque frames,
+     ;; else the survivors' stale folded MACs brick the next open's %ms-verify-chain (ADR 0050 §4.4 —
+     ;; RESOLVES the former store-microservice.lisp documented limitation). A BARE store (no oracle) has no
+     ;; chain to re-MAC ⇒ the plain server-proxy delete (memory parity, Slice 1 unchanged).
      :delete (lambda (topic writer-guid sn)
-               (%ms-call conn-cell lock +ms-op-delete+
-                         (lambda () (%ms-encode-delete topic writer-guid sn))
-                         (lambda (r)
-                           (let ((res (%rd-u8 r)))
-                             (if (= res +ms-result-t+) t
-                                 (error 'microservice-store-error :detail "bad delete result")))))))))
+               (if (and chain-mac-fn (not *durability-debug-ms-skip-reclaim-remac*))
+                   (%ms-delete-rechain conn-cell lock host* port* topic writer-guid sn
+                                       chain-mac-fn chain-macs chain-seqs put-index)
+                   (%ms-call conn-cell lock +ms-op-delete+
+                             (lambda () (%ms-encode-delete topic writer-guid sn))
+                             (lambda (r)
+                               (let ((res (%rd-u8 r)))
+                                 (if (= res +ms-result-t+) t
+                                     (error 'microservice-store-error :detail "bad delete result"))))))))))
 
 ;;; ---- client response decoders ----
 
@@ -660,6 +695,31 @@
     (replace out mac :start1 sl :end1 (+ sl +frame-mac-len+))
     (%put-u64-le out (+ sl +frame-mac-len+) chain-seq)
     out))
+
+(defun* %ms-rechain-survivors (topic fn survivors)
+    (function (string function list)
+              (values list (or null (simple-array (unsigned-byte 8) (*))) (integer 0)))
+  "Re-MAC SURVIVORS (clean DURABLE-RECORDs, payload=sealed, IN chain order) as a FRESH v3 chain for TOPIC —
+   the microservice write-side analogue of the file store's %rewrite-topic-log / SQLite's %sqlite-recompute-
+   topic (ADR 0045; the no-false-reject-on-reopen invariant). Re-seeds from the per-topic keyed head
+   (%chain-seed), re-walks assigning DENSE chain_seq 0..M-1 and recomputing each record's MAC over the
+   canonical v3 frame via the REUSED %frame-record-versioned (identical to %ms-chain-walk's per-step
+   expected — so the next open's %ms-verify-chain recomputes the SAME macs and reopens clean), and re-folds
+   each survivor via %ms-fold-payload. NO new crypto. Returns (values folded-records tail-mac count)."
+  (let ((running (%chain-seed fn topic))
+        (seq  0)
+        (tail nil)
+        (out  '()))
+    (dolist (rec survivors)
+      (let ((mac (nth-value 1 (%frame-record-versioned rec +frame-version-v3+ running fn))))
+        (push (make-durable-record :topic topic :writer-guid (durable-record-writer-guid rec)
+                                   :sn (durable-record-sn rec) :key-hash (durable-record-key-hash rec)
+                                   :kind (durable-record-kind rec)
+                                   :payload (%ms-fold-payload (durable-record-payload rec) mac seq))
+              out)
+        (setf running mac tail mac)
+        (incf seq)))
+    (values (nreverse out) tail seq)))
 
 (defun* %ms-unfold-payload (folded)
     (function ((simple-array (unsigned-byte 8) (*)))
@@ -801,6 +861,48 @@
             (lambda () (%ms-encode-topic topic))
             (lambda (r) (%ms-decode-tuples r topic))))
 
+(defun* %ms-delete-rechain (conn-cell lock host port topic writer-guid sn fn chain-macs chain-seqs put-index)
+    (function (cons t string (integer 0 65535) string (simple-array (unsigned-byte 8) (16)) (integer 0)
+               function hash-table hash-table hash-table) (eql t))
+  "Chained store-delete = the microservice analogue of SQLite's :delete = DELETE + %sqlite-recompute-topic
+   (ADR 0050 §4.4). A KEEP_LAST reclaim removed (WRITER-GUID, SN) from TOPIC; the survivors' stored folded
+   MACs are now stale (they chained over the deleted predecessor). FETCH the topic's current folded records
+   (get-range over the wire), DROP the deleted (guid,sn), RE-CHAIN the survivors in chain_seq order via
+   %ms-rechain-survivors (re-seed + dense chain_seq 0..M-1 + running MAC — mirroring file/SQLite EXACTLY, so
+   the next open's %ms-verify-chain recomputes the SAME macs and reopens CLEAN), REPLACE the server's opaque
+   frames with the re-folded survivors in ONE atomic +ms-op-topic-rewrite+, and UPDATE the client chain state
+   (chain-macs/chain-seqs/put-index) to the re-chained state so a continued put, the sealed tail anchor, and
+   the next open all see the fresh chain. Serialized by the DECORATOR's lock (store-delete is called under it,
+   from %evict-prior-surrogates), so the fetch+rewrite two-step needs no cross-op atomicity here; the client
+   state mutation runs UNDER the store lock (the rewrite %ms-call decode-fn). The server stays DARE-BLIND —
+   it replaces OPAQUE frames and never parses the mac/chain_seq. Returns T (store-delete contract)."
+  (let* ((tuples    (%ms-fetch-tuples conn-cell lock host port topic))
+         (survivors (mapcar #'first
+                            (remove-if (lambda (tp)
+                                         (let ((rec (first tp)))
+                                           (and (equalp (durable-record-writer-guid rec) writer-guid)
+                                                (= (durable-record-sn rec) sn))))
+                                       (sort (copy-list tuples) #'< :key #'third)))))
+    (multiple-value-bind (folded tail count) (%ms-rechain-survivors topic fn survivors)
+      (%ms-call conn-cell lock +ms-op-topic-rewrite+
+                (lambda () (%ms-encode-topic-rewrite topic folded))
+                (lambda (r)
+                  (let ((res (%rd-u8 r)))
+                    (unless (= res +ms-result-t+)
+                      (error 'microservice-store-error :detail "bad topic-rewrite result"))
+                    ;; the server confirmed the replace: advance the client chain to the dense survivor state
+                    (if (plusp count)
+                        (progn (setf (gethash topic chain-macs) tail)
+                               (setf (gethash topic chain-seqs) count))
+                        (progn (remhash topic chain-macs)
+                               (remhash topic chain-seqs)))
+                    (let ((idx (make-hash-table :test #'equal)))
+                      (dolist (rec survivors)
+                        (setf (gethash (cons (coerce (durable-record-writer-guid rec) 'list)
+                                             (durable-record-sn rec)) idx) t))
+                      (setf (gethash topic put-index) idx))
+                    t))))))
+
 ;;; ---- reference server (opaque inner-store proxy) ----
 
 (defstruct* (microservice-server (:constructor %make-microservice-server))
@@ -870,6 +972,21 @@
               (sn    (%rd-u64 r))
               (res   (store-delete inner topic (coerce guid '(simple-array (unsigned-byte 8) (16))) sn)))
          (%ms-put-u8 out (if (eq res t) +ms-result-t+ +ms-result-rejected+))))
+      ((= code +ms-op-topic-rewrite+)
+       ;; atomically REPLACE the topic's records with the supplied OPAQUE frames (the client's KEEP_LAST
+       ;; re-MAC'd survivors, ADR 0050 §4.4). DARE-BLIND: %rd-frame decodes each frame to a record whose
+       ;; payload is the folded blob (mac/chain_seq ride inside, never parsed here); store-replace-topic
+       ;; swaps them all-or-nothing (memory: in-process serial; file/SQLite: tmp+rename / transaction).
+       ;; COUNT is bounded against the remaining buffer (each frame needs >= 1 byte, mirroring
+       ;; %ms-decode-records); each %rd-frame is itself bounds-checked (network-facing, no OOB).
+       (let* ((topic (%rd-string r))
+              (count (%rd-u32 r)))
+         (when (> count (- (ms-reader-end r) (ms-reader-pos r)))
+           (error 'microservice-protocol-error :detail "rewrite record count exceeds buffer extent"))
+         (let ((recs '()))
+           (dotimes (i count) (push (%rd-frame r topic) recs))
+           (store-replace-topic inner topic (nreverse recs))
+           (%ms-put-u8 out +ms-result-t+))))
       (t (error 'microservice-protocol-error :detail "unknown op-code")))
     (%ms-frame-message +ms-status-ok+ (%ms-finalize out))))
 

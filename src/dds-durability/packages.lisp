@@ -29,7 +29,7 @@
            #:make-encrypted-store #:*dare-error-hook*
            #:make-file-store #:file-store-sync
            #:*compaction-superseded-threshold*
-           #:durable-store-sync #:store-sync #:store-delete
+           #:durable-store-sync #:store-sync #:store-delete #:store-replace-topic
            #:make-persistent-store-factory
            #:make-durability-store-factory
            #:make-sqlite-store #:make-sqlite-store-factory

@@ -46,6 +46,7 @@
            #:run-durability-sqlite-mac-chain-test
            #:run-durability-sqlite-tail-anchor-test
            #:run-durability-microservice-tail-anchor-test
+           #:run-durability-microservice-keep-last-reclaim-test
            #:run-durability-sqlite-keeplast-online-test
            #:run-durability-sqlite-online-chain-test
            #:run-durability-sqlite-crash-consistency-test

@@ -39,7 +39,12 @@
   (verify-chain-prefix-fn nil :type (or null function))
   ;; per-record physical delete-by-(topic,writer-guid,sn) (ADR 0025 §10.3 / ADR 0029 §10); NIL = the
   ;; backend has no physical reclaim (byte-identical to pre-slot) — same NIL-fallback as sync above
-  (delete nil :type (or null function)))
+  (delete nil :type (or null function))
+  ;; atomic whole-topic REPLACE (ADR 0050 §4.4): (topic records)->t swaps ALL of a topic's records for
+  ;; RECORDS in one all-or-nothing step (a partial topic bricks a re-MAC'd chain). NIL = the same additive
+  ;; NIL-fallback as delete/sync — store-replace-topic then does purge+bulk-put (crash-atomic ONLY for the
+  ;; in-process memory store; a persistent backend SUPPLIES this slot for tmp+rename / transaction atomicity).
+  (replace-topic-fn nil :type (or null function)))
 
 ;;; Public dispatch functions — one slot read + funcall (no CLOS dispatch on the hot path).
 
@@ -163,6 +168,25 @@
    today's logical-only compaction (superseded blobs retained until purge)."
   (let ((f (durable-store-delete store)))
     (if f (funcall f topic writer-guid sn) :unsupported)))
+
+(defun* store-replace-topic (store topic records)
+    (function (durable-store string list) (eql t))
+  "Atomically REPLACE every record of TOPIC with RECORDS (a list of DURABLE-RECORD), all-or-nothing.
+   The microservice server's +ms-op-topic-rewrite+ replaces a topic's opaque frames after a KEEP_LAST
+   reclaim re-MACs the survivors client-side (ADR 0050 §4.4) — a partial topic would brick the re-MAC'd
+   chain, so the swap must be atomic. NIL-fallback (the same additive binding as store-delete): store-purge
+   then store-put each record — trivially atomic for the in-process memory store (one serialized request,
+   no crash-persistence), and correct for a persistent inner too EXCEPT across a mid-swap crash (a file /
+   SQLite inner SUPPLIES the :replace-topic slot for tmp+rename / transaction crash-atomicity). Returns T."
+  (let ((f (durable-store-replace-topic-fn store)))
+    (if f
+        (funcall f topic records)
+        (progn
+          (store-purge store topic)
+          (dolist (r records)
+            (store-put store topic (durable-record-writer-guid r) (durable-record-sn r)
+                       (durable-record-key-hash r) (durable-record-kind r) (durable-record-payload r)))
+          t))))
 
 ;;; In-memory backing implementation.
 ;;; Outer table: topic (string) -> inner table.
