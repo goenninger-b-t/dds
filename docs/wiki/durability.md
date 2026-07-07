@@ -1063,7 +1063,7 @@ cannot delete-in-place, so — unlike the SQLite per-put DELETE of §8.8.2 — i
 - **Same exemptions.** KEEP_ALL does no threshold compaction; NIL-key-hash + lifecycle records are never
   depth-evicted; a below-threshold store's append path is byte-identical (no rewrite fires). The
   durable-store **vtable is unchanged** (internal to `make-file-store`; the file store's own physical
-  `store-delete` slot = Sliver **3b** — until then a file `store-delete` returns `:unsupported`, §8.8.4).
+  `store-delete` slot lands in Sliver **3b**, §8.8.5).
 - **Logical read view = exactly D.** The physical batching holds up to `D + threshold` records per
   instance between rewrites, so — to keep the exported `store-get-range` / per-topic `store-count`
   contract identical to the memory + SQLite backends (whose online eviction returns the logical newest-D
@@ -1105,8 +1105,9 @@ for the **continuously-open SQLite** encrypted tier via three additive pieces:
   t | :unsupported`, per-record delete-by-**primary-key** (NOT evict-instance: the decorator knows the
   exact prior surrogate to reclaim). It is the EXACT NIL-fallback binding of `store-sync` /
   `store-set-chain-mac-fn`: a NIL slot returns `:unsupported` and the decorator falls back to logical-only
-  (byte-identical to pre-3a). **SQLite and memory implement it; the file store does not** (Sliver 3b) — so
-  the file encrypted tier stays logical-only, unchanged. An additive slot on the stable vtable, not a fork.
+  (byte-identical to pre-3a). **SQLite and memory implement it (3a); the file store implements it as of
+  Sliver 3b** (§8.8.5); a slotless backend still gets the `:unsupported` fallback. An additive slot on the
+  stable vtable, not a fork.
 - **Thin SQLite `:delete`** — the `DELETE FROM record WHERE topic=? AND writer_guid=? AND sn=?` + the
   `%sqlite-recompute-topic` survivor re-MAC of Sliver 1 (§8.8.2), wrapped in **ONE** `sqlite:with-
   transaction` so it is **internally atomic**: a crash between the DELETE and the re-MAC rolls back, so a
@@ -1135,22 +1136,74 @@ deliberately NON-atomic** — a LOWER bar than Sliver 1/2: a crash between the d
 **self-heals on the next delete** — a space leak, never a false-reject. `KEEP_ALL` deletes nothing (the
 window guard requires `:keep-last`).
 
-**Deferred (3a → 3b/3c):** the **file backend `:delete`** (append-log mark-superseded + threshold rewrite)
-is Sliver **3b** (until then the file encrypted tier is `:unsupported` → logical-only); the
-**compaction-on-open sweep** of a prior session's ≤D cross-restart leftovers is Sliver **3c** (3a's online
-window bounds only the continuously-open case).
+**Delivered next (3b) / deferred (3c):** the **file backend `:delete`** (append-log mark-superseded +
+threshold rewrite) is Sliver **3b** (§8.8.5, AS-BUILT); the **compaction-on-open sweep** of a prior
+session's ≤D cross-restart leftovers is Sliver **3c** (3a/3b's online window bounds only the
+continuously-open case).
 
-Tests: `run-durability-store-delete-slot-test` (the additive slot + NIL-fallback binding — memory/SQLite
-delete a keyed row + return T, the file store returns `:unsupported` and is untouched; impl-agnostic, no
-OpenSSL), and `run-durability-encrypted-physical-reclaim-test` (continuously-open encrypted SQLite
-`:keep-last 2`, N=6 one instance → inner physical `store-count nil` = **2**, RED pre-3a = 6; get-range =
-newest D byte-exact; two instances each bounded to D; an **out-of-order** writer's newest-D survive; a
-**multi-writer** single instance → the SQLite physical get-range == the file logical-only oracle EXACTLY
-[`(guid,sn)` drop, not pure SN — RED kept the wrong survivor]; an **idempotent re-put** never deletes a
-live newest-D row [surrogate-dedup'd append — RED lost sn1]; **`store-purge`** clears the window so a later
-lower-SN write is not mis-evicted [RED mis-evicted it]; reopen VERIFIES the v3 chain clean + newest-D; a
-fault between put and delete leaks + get-range stays newest-D + self-heals + reopens clean; KEEP_ALL deletes
-nothing; the file encrypted tier stays logical-only).
+Tests: `run-durability-store-delete-slot-test` (the additive slot + NIL-fallback binding — memory/SQLite/file
+delete a keyed row + return T; a slotless vtable returns `:unsupported`; impl-agnostic, no OpenSSL), and
+`run-durability-encrypted-physical-reclaim-test` (continuously-open encrypted SQLite `:keep-last 2`, N=6 one
+instance → inner physical `store-count nil` = **2**, RED pre-3a = 6; get-range = newest D byte-exact; two
+instances each bounded to D; an **out-of-order** writer's newest-D survive; a **multi-writer** single instance
+→ the SQLite and file physical-reclaim get-ranges agree EXACTLY [`(guid,sn)` drop, not pure SN — RED kept the
+wrong survivor]; an **idempotent re-put** never deletes a live newest-D row [surrogate-dedup'd append — RED
+lost sn1]; **`store-purge`** clears the window so a later lower-SN write is not mis-evicted [RED mis-evicted
+it]; reopen VERIFIES the v3 chain clean + newest-D; a fault between put and delete leaks + get-range stays
+newest-D + self-heals + reopens clean; KEEP_ALL deletes nothing).
+
+#### 8.8.5 Encrypted-tier physical reclaim, FILE backend (WP-DURABILITY-ENCRECLAIM-FILE, Sliver 3b)
+
+Sliver 3a added the `store-delete` slot + the decorator window, but the file store had no `:delete` slot, so
+`store-delete` returned `:unsupported`, the decorator skipped physical reclaim, and the encrypted **file**
+tier stayed logical-only (its on-disk log grew to N). Sliver 3b implements the file `:delete` slot so the
+continuously-open encrypted file tier physically reclaims too. **The key difference from SQLite:** the file
+log is append-only (cannot delete-in-place) AND the inner file store is opened **KEEP_ALL** with NIL-key-hash
+surrogates, so the Sliver-2 own-KEEP_LAST threshold counter (§8.8.3) never fires — the file `:delete` needs
+its OWN mark-superseded + reclaim path:
+
+- **(1) Immediate in-memory remhash** — `store-delete (topic-hash, surrogate, sn=0)` remhashes the surrogate
+  row `(%record-key surrogate 0)` from the in-memory index at once, so `store-count nil` + the index reflect
+  the logical removal immediately.
+- **(2) Per-topic `pending-delete` set** — the surrogate key joins a NEW per-topic IN-MEMORY set whose SIZE
+  is the O(1) reclaim trigger (the inner KEEP_ALL store's own KEEP_LAST counter never bumps here — NIL
+  key-hash, so `store-delete` needs its own trigger). `remhash` returns T only for a live row, so an
+  absent/double delete never inflates the set.
+- **(3) Threshold rewrite EXCLUDING pending-delete** — crossing `*compaction-superseded-threshold*` runs a
+  `%rewrite-topic-log` variant (a shared `%compact-topic-log` core, DRY with §8.8.3) that replays the log
+  **excluding the pending-delete surrogate keys** (in addition to the existing `%compact-topic-records`
+  settled pass), then clears the set. It reuses the **SAME Sliver-2 atomic tmp+fsync+rename** rewrite
+  (re-emitting a fresh v3 MAC chain) and **PRESERVES the append-fd close-before-rewrite / reopen-after guard**
+  (a stale fd appending to the renamed-away log = data loss). **No new crash-atomicity machinery** — the
+  atomicity is inherited.
+
+The continuously-open encrypted file tier's on-disk log is thus bounded to **≤ (D + threshold)** per instance
+instead of growing to N (RED pre-3b = N: file `:unsupported` → decorator skips). The decorator's `%win-entry<`
+`(guid,sn)`-ordered drop + surrogate-dedup + window lifecycle (§8.8.4) are unchanged — the file backend
+inherits them, so a multi-writer instance's file get-range equals SQLite's exactly and an idempotent re-put
+never loses a live row. The **bare (non-encrypted) file store's Sliver-2 KEEP_LAST path is unchanged** (the
+slot exists but only the decorator drives it); a **KEEP_ALL** encrypted file tier deletes nothing (on-disk ==
+N — the window guard requires `:keep-last`).
+
+**Crash lower-bar (parity with 3a — a self-healing SPACE leak, never a false-reject or loss):** the
+`pending-delete` set is IN-MEMORY (empty on reopen). A crash DURING the reclaim rewrite leaves the original
+log intact (rename is the commit point; the orphan `<tid>.tmp.log` is discarded on open), the chain verifies,
+the newest D survive. A crash BETWEEN the in-mem remhash and the batched rewrite reappears the surrogate on
+reopen (the remhash was in-memory only) — but `store-get-range` still logically compacts it (correct reads,
+newest-D) and the chain verifies. A same-session rewrite fault self-heals on the next put (the `pending-delete`
+set stays armed — the rewrite faulted before the clear — so the next `store-delete` retries). **Still
+deferred (Sliver 3c):** the compaction-on-open sweep of a prior session's cross-restart leftovers (a fresh
+post-reopen decorator window never re-deletes the pre-restart surrogates); 3b bounds only the
+continuously-open case.
+
+Test: `run-durability-file-encrypted-physical-reclaim-test` (continuously-open encrypted **file**
+`:keep-last 2`, N=20 one instance, no close → the inner ON-DISK v3-frame count [`%file-store-log-count` on the
+`%enc-topic-tid` basename, log-MAC oracle from the anchor] stays **≤ D+threshold**, NOT 20 [RED pre-3b = 20];
+the in-memory physical count converges to D; get-range = newest D byte-exact; reopen VERIFIES the v3 chain
+clean + newest-D; a reclaim-rewrite fault [`*durability-debug-file-rewrite-fault*`] propagates → reopen on a
+consistent log + chain verifies + no loss; a remhash/rewrite cross-restart split reappears the surrogate but
+get-range stays newest-D [self-healing, 3c sweeps the leftover]; a continuously-open fault self-heals on the
+next put; KEEP_ALL deletes nothing [on-disk == N]; multi-writer + idempotent parity with the decorator window).
 
 ### 8.9 At-rest metadata confidentiality (Phase 3c, WP-DURABILITY-METADATA-CONF-3c)
 

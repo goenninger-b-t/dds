@@ -717,7 +717,7 @@
          ;; -> list of (real-sn . inner-surrogate). The surrogate is per-SAMPLE, so the decorator must
          ;; REMEMBER each instance's live surrogates to physically evict the superseded ones on put.
          (instance-windows (make-hash-table :test #'equal))
-         ;; whether the inner store implements the additive :delete slot (SQLite yes; file until 3b no).
+         ;; whether the inner store implements the additive :delete slot (SQLite = Sliver 3a, file = 3b).
          ;; NIL => the decorator SKIPS physical reclaim and stays logical-only (byte-identical to pre-3a).
          (del-supported    (and (durable-store-delete inner-store) t)))
     (labels ((%th-bytes (topic) (%meta-topic-hash-bytes meta-key topic))

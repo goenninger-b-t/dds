@@ -267,16 +267,18 @@ These were formerly "out of scope"; per owner directive they are MUST, each its 
      adversary can tell two records share a topic, and count records per topic, without learning the
      name. (Likewise the GUID-surrogate reveals that two records share a (guid,sn), i.e. are the same
      retained sample — trivially true anyway.)
-   - **Physical space (SQLite online case: RESOLVED — AS-BUILT, WP-DURABILITY-ENCRECLAIM-SQLITE / Sliver
-     3a).** Superseded/settled blobs on the encrypted tier were compacted LOGICALLY (correct reads) but
-     physically RETAINED until `store-purge` — the inner store runs KEEP_ALL (keep-last-by-real-SN ordering
-     is impossible on a hashed surrogate without leaking SN), so its own KEEP_LAST eviction never fires.
-     Sliver 3a physically reclaims them for the **continuously-open SQLite** backend via three additive
-     pieces:
+   - **Physical space (continuously-open case: RESOLVED — AS-BUILT; SQLite = WP-DURABILITY-ENCRECLAIM-SQLITE
+     / Sliver 3a, file = WP-DURABILITY-ENCRECLAIM-FILE / Sliver 3b).** Superseded/settled blobs on the
+     encrypted tier were compacted LOGICALLY (correct reads) but physically RETAINED until `store-purge` —
+     the inner store runs KEEP_ALL (keep-last-by-real-SN ordering is impossible on a hashed surrogate without
+     leaking SN), so its own KEEP_LAST eviction never fires. Sliver 3a physically reclaims them for the
+     **continuously-open SQLite** backend via three additive pieces (Sliver 3b adds the **file** backend
+     below, reusing the same decorator window):
      - an **additive `store-delete` vtable slot** (`store.lisp`) — per-record delete-by-(topic, writer-
        guid, sn), with the EXACT NIL-fallback binding of `store-sync` / `store-set-chain-mac-fn`: a backend
        that omits the slot returns `:unsupported` and the decorator falls back to today's logical-only
-       compaction (byte-identical). SQLite + memory implement it; the file store does not (yet — 3b).
+       compaction (byte-identical). SQLite + memory implement it (3a); the **file store** implements it as of
+       Sliver **3b** (below); a hypothetical slotless backend still gets the `:unsupported` fallback.
      - a **thin SQLite `:delete`** — the same DELETE + `%sqlite-recompute-topic` survivor re-MAC as the
        Sliver-1 online evict, wrapped in ONE `sqlite:with-transaction` so it is INTERNALLY ATOMIC (a crash
        between the DELETE and the re-MAC rolls back ⇒ a clean chained store never false-rejects on reopen).
@@ -298,10 +300,31 @@ These were formerly "out of scope"; per owner directive they are MUST, each its 
      put+delete PAIR is deliberately NON-atomic (a LOWER bar than Sliver 1/2): a crash between the put and
      the delete leaks the prior blob (physically retained, still logically compacted at get-range) and
      self-heals on the next delete — a space leak, never a false-reject.
-     **Still deferred:** the **file backend `:delete`** (append-log mark-superseded + threshold rewrite) is
-     Sliver **3b** (the file encrypted tier stays logical-only until then, `:unsupported`), and the
-     **compaction-on-open sweep** of a prior session's ≤D cross-restart leftovers is Sliver **3c** (3a's
-     online window bounds only the continuously-open case). A space, not a correctness, tradeoff throughout.
+     **File backend `:delete` (RESOLVED — AS-BUILT, WP-DURABILITY-ENCRECLAIM-FILE / Sliver 3b).** The append-
+     only file log cannot delete-in-place AND the inner file store is opened KEEP_ALL with NIL-key-hash
+     surrogates, so the Sliver-2 own-KEEP_LAST threshold counter never fires — the file `:delete` needs its
+     OWN mark-superseded + reclaim: (1) an **immediate in-memory remhash** of the surrogate row (so
+     `store-count nil` + the index reflect the removal at once); (2) the surrogate key joins a per-topic
+     **in-memory `pending-delete` set** whose SIZE is the O(1) reclaim trigger (distinct from the dormant
+     KEEP_LAST counter); (3) crossing `*compaction-superseded-threshold*` runs a `%rewrite-topic-log` variant
+     that replays the log **EXCLUDING the pending-delete surrogate keys** (in addition to the existing
+     `%compact-topic-records` settled pass), then clears the set — reusing the **SAME Sliver-2 atomic
+     tmp+fsync+rename** rewrite (re-emitting a fresh v3 chain) and **PRESERVING the append-fd
+     close-before-rewrite / reopen-after guard** (a stale fd appending to the renamed-away log = data loss).
+     NO new crash-atomicity machinery — the atomicity is inherited. The continuously-open encrypted file tier's
+     on-disk log is thus bounded to **≤ (D + threshold)** per instance instead of growing to N. The bare
+     (non-encrypted) file store's Sliver-2 KEEP_LAST path is unchanged (the slot exists but only the decorator
+     drives it; a KEEP_ALL encrypted file tier deletes nothing, on-disk == N).
+     **Crash lower-bar (parity with 3a):** the `pending-delete` set is IN-MEMORY (empty on reopen). A crash
+     DURING the reclaim rewrite leaves the original log intact (rename is the commit point; the orphan `.tmp`
+     is discarded on open), the chain verifies, the newest D survive. A crash BETWEEN the in-mem remhash and
+     the batched rewrite reappears the surrogate on reopen (the remhash was in-memory only) — but get-range
+     still logically compacts it (correct reads) and the chain verifies: a **self-healing SPACE leak**, never
+     a false-reject or loss. A same-session fault self-heals on the next put (the `pending-delete` set stays
+     armed — the rewrite faulted before the clear — so the next `store-delete` retries).
+     **Still deferred:** the **compaction-on-open sweep** of a prior session's ≤D cross-restart leftovers is
+     Sliver **3c** — a fresh post-reopen decorator window never re-deletes the pre-restart surrogates, so 3b
+     bounds only the continuously-open case. A space, not a correctness, tradeoff throughout.
      **Steady-state window residual (bounded, documented — parity with the Sliver-2 tombstone residual):**
      a settled/quiescent instance's window entry persists in `instance-windows` until `store-purge` or
      `store-close` (bounded by the count of live + this-session-touched instances, NOT the sample rate); a

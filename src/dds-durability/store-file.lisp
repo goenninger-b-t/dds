@@ -680,7 +680,13 @@
          (eff-hk-cell  (cons history-kind nil))   ; car = effective history-kind (:keep-all/:keep-last)
          (eff-hd-cell  (cons history-depth nil))  ; car = effective history-depth D
          (super-pending (make-hash-table :test #'equal))  ; topic-id -> pending superseded :data count
-         (data-counts  (make-hash-table :test #'equal)))  ; topic-id -> (equalp key-hash -> :data count)
+         (data-counts  (make-hash-table :test #'equal))   ; topic-id -> (equalp key-hash -> :data count)
+         ;; Sliver 3b (ADR 0025 §10.3): topic-id -> (equal %record-key -> t) set of surrogates the
+         ;; encrypted decorator's store-delete has remhashed from the index but NOT yet physically excluded
+         ;; from the append log; its size is the O(1) reclaim trigger (the inner :keep-all store's own
+         ;; KEEP_LAST counter never fires here — NIL key-hash). IN-MEMORY (empty on reopen; the surrogates
+         ;; reappear in the log and get-range logically compacts them — self-healing; cross-restart sweep = 3c).
+         (pending-delete (make-hash-table :test #'equal)))
 
     (labels ((%inner (topic-id)
              (or (gethash topic-id outer)
@@ -734,15 +740,16 @@
                  (when (and (eq :data (durable-record-kind r)) (durable-record-key-hash r))
                    (incf (gethash (durable-record-key-hash r) dc 0))))
                (setf (gethash topic-id data-counts) dc)))
-           (%threshold-compact (topic-id topic)
-             ;; runtime threshold compaction (Sliver 2, ADR 0029 §10): the append-only log cannot
-             ;; delete-in-place, so compact MID-RUN by re-running the on-open trio — replay the log,
-             ;; %compact-topic-records (pass-1 settled + pass-2 KEEP_LAST, IDENTICAL to on-open), then
-             ;; the EXISTING atomic %rewrite-topic-log (tmp+fsync+rename — crash-atomicity inherited, no
-             ;; new transaction machinery). Release the append fd BEFORE the rewrite so no stale fd
-             ;; survives the atomic rename (a stale fd appending to the renamed-away log = DATA LOSS);
-             ;; the next %ensure-stream reopens the rewritten log in :append mode. Prune the in-memory
-             ;; index + counters to the survivors and carry the rewrite's fresh tail chain MAC (ADR 0045).
+           (%compact-topic-log (topic-id topic pre-filter reset-thunk)
+             ;; shared MID-RUN atomic-rewrite core (Sliver 2 threshold-compact + Sliver 3b delete-reclaim,
+             ;; DRY): release the append fd BEFORE the rewrite so no stale fd survives the atomic rename (a
+             ;; stale fd appending to the renamed-away log = DATA LOSS); replay the log; apply PRE-FILTER
+             ;; (Sliver-3b pending-delete exclusion; #'identity for Sliver 2); %compact-topic-records
+             ;; (pass-1 settled + pass-2 KEEP_LAST, IDENTICAL to on-open); and on a SHRINK run the EXISTING
+             ;; atomic %rewrite-topic-log (tmp+fsync+rename — crash-atomicity inherited, no new transaction
+             ;; machinery) + rebuild the in-memory index + reseed counters + carry the fresh tail chain MAC
+             ;; (ADR 0045). RESET-THUNK clears the per-topic trigger last (super-pending / pending-delete);
+             ;; a rewrite fault propagates BEFORE it, leaving the trigger armed so the next call retries.
              (let ((log-path (%topic-log-path store-dir topic-id))
                    (stm      (gethash topic-id streams)))
                (when stm
@@ -750,7 +757,8 @@
                  (ignore-errors (close stm))
                  (remhash topic-id streams))
                (let* ((recs      (%replay-log log-path topic chain-mac-fn nil))
-                      (compacted (%compact-topic-records recs (car eff-hk-cell) (car eff-hd-cell))))
+                      (filtered  (funcall pre-filter recs))
+                      (compacted (%compact-topic-records filtered (car eff-hk-cell) (car eff-hd-cell))))
                  (when (and recs (< (length compacted) (length recs)))
                    (let ((tail (%rewrite-topic-log store-dir topic-id compacted chain-mac-fn topic)))
                      ;; carry the rewritten tail so the next appended v3 frame chains from it (ADR 0045)
@@ -765,8 +773,32 @@
                                         inn)
                                r)))
                      (%init-topic-counts topic-id compacted)))
-                 ;; threshold consumed: reset the pending counter even if nothing was droppable
-                 (setf (gethash topic-id super-pending) 0)))))
+                 (funcall reset-thunk))))
+           (%threshold-compact (topic-id topic)
+             ;; Sliver 2 (ADR 0029 §10): the append-only KEEP_LAST log compacts MID-RUN — each superseding
+             ;; put bumps super-pending, and crossing the threshold runs the shared atomic core (identity
+             ;; filter; the KEEP_LAST drop is %compact-topic-records's own pass-2), then resets super-pending.
+             (%compact-topic-log topic-id topic #'identity
+                                 (lambda () (setf (gethash topic-id super-pending) 0))))
+           (%reclaim-deleted-topic (topic-id topic)
+             ;; Sliver 3b (ADR 0025 §10.3): physically reclaim the encrypted decorator's pending-delete
+             ;; surrogates from the append-only log via the shared atomic core, replaying EXCLUDING the
+             ;; pending-delete keys (they are NIL-key-hash, so %compact-topic-records never drops them —
+             ;; store-delete's own size trigger drives this, not the dormant KEEP_LAST counter). Clear the
+             ;; pending-delete set after the rewrite; a rewrite fault leaves it populated (size still over
+             ;; threshold) so the next store-delete retries (self-heals the continuously-open case).
+             (let ((pd (gethash topic-id pending-delete)))
+               (%compact-topic-log topic-id topic
+                                   (if pd
+                                       (lambda (recs)
+                                         (remove-if (lambda (r)
+                                                      (gethash (%record-key
+                                                                (durable-record-writer-guid r)
+                                                                (durable-record-sn r))
+                                                               pd))
+                                                    recs))
+                                       #'identity)
+                                   (lambda () (when pd (clrhash pd)))))))
 
       (%make-durable-store
        :name :file
@@ -849,6 +881,7 @@
                    ;; power loss (ADR 0026 §10.10)
                    (dds.pal:fsync-directory (%topics-dir store-dir))))
                (remhash tid outer)
+               (remhash tid pending-delete)   ; Sliver-3b: drop any pending physical deletes for the purged topic
                (remhash topic id-map)))
            t))
 
@@ -867,6 +900,7 @@
            (clrhash chain-macs)          ; running chain state is rebuilt from disk on replay (ADR 0045)
            (clrhash super-pending)       ; Sliver-2 runtime-compaction counters reseeded per topic below
            (clrhash data-counts)
+           (clrhash pending-delete)      ; Sliver-3b pending physical deletes are IN-MEMORY (empty on reopen; 3c sweeps cross-restart leftovers)
            ;; enforce 0700 on the store dir D (holds cleartext frame metadata): chmod ONLY on first
            ;; creation, then ALWAYS verify (fail-closed refuse on loose/unverifiable perms) — exactly
            ;; the key-dir K discipline, one shared helper (DRY; ADR 0026 §10.12).
@@ -976,7 +1010,35 @@
            (setf chain-mac-fn fn)
            (setf chain-required required)
            (setf chain-grandfather grandfather))
-         t)))))
+         t)
+
+       :delete
+       ;; Sliver 3b (ADR 0025 §10.3 / ADR 0029 §10): per-record physical reclaim for the encrypted
+       ;; decorator's superseded surrogate. The append-only log CANNOT delete-in-place, so: (1) IMMEDIATE
+       ;; remhash from the in-memory index (store-count nil + get-range reflect the logical removal at once);
+       ;; (2) add the surrogate key to the per-topic pending-delete set — its size is the O(1) reclaim
+       ;; trigger (the inner :keep-all store's own KEEP_LAST supersede counter never bumps here — NIL
+       ;; key-hash); (3) crossing *compaction-superseded-threshold* runs %reclaim-deleted-topic (the shared
+       ;; atomic %rewrite-topic-log, replaying EXCLUDING the pending-delete keys, append-fd guard preserved).
+       ;; A crash between the in-mem remhash and the batched rewrite reappears the surrogate on reopen but
+       ;; get-range stays logically newest-D + the chain verifies (self-healing SPACE leak — the 3a
+       ;; lower-bar). A bare (non-encrypted) file store has the slot but no decorator/chain-oracle driving
+       ;; it, so its Sliver-2 KEEP_LAST path is unchanged. remhash returns T iff the key was live, so an
+       ;; absent/double delete is a no-op (never inflates pending-delete).
+       (lambda (topic writer-guid sn)
+         (dds.pal:with-lock (lock)
+           (let* ((tid (gethash topic id-map))
+                  (inn (and tid (gethash tid outer))))
+             (when inn
+               (let ((k (%record-key writer-guid sn)))
+                 (when (remhash k inn)
+                   (let ((pd (or (gethash tid pending-delete)
+                                 (setf (gethash tid pending-delete)
+                                       (make-hash-table :test #'equal)))))
+                     (setf (gethash k pd) t)
+                     (when (>= (hash-table-count pd) *compaction-superseded-threshold*)
+                       (%reclaim-deleted-topic tid topic)))))))
+           t))))))
 
 (defun* file-store-sync (store)
     (function (durable-store) (eql t))
