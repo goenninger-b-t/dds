@@ -107,10 +107,25 @@
   (map '(simple-array (unsigned-byte 8) (*)) #'char-code "dds-dare/logmac/gf/v1")
   "ASCII octets of the grandfather-set MAC domain label (ADR 0045 §3.2).")
 
+(defconstant +logmac-tail-version+ #x01
+  "Version byte of the DIR/logmac.tail sealed high-water tail-anchor file (ADR 0045 §7.1).")
+
+(defparameter %logmac-tail-label
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code "dds-dare/logmac/tail/v1")
+  "ASCII octets of the sealed high-water tail-anchor MAC domain label — a FRESH domain separator,
+   distinct from the grandfather-set label, so the tail MAC is cryptographically independent (ADR 0045 §7.1).")
+
 (defun* %logmac-anchor-path (dir)
     (function (pathname) pathname)
   "Return the logmac.anchor pathname within the encrypted-store epoch directory DIR."
   (uiop:merge-pathnames* "logmac.anchor" (uiop:ensure-directory-pathname dir)))
+
+(defun* %logmac-tail-path (dir)
+    (function (pathname) pathname)
+  "Return the logmac.tail sealed high-water tail-anchor pathname within the epoch directory DIR. A
+   SEPARATE file from the write-once logmac.anchor — the tail anchor is MUTABLE (re-sealed every clean
+   close), so it must never share the crash-safe write-once anchor file (ADR 0045 §7.1)."
+  (uiop:merge-pathnames* "logmac.tail" (uiop:ensure-directory-pathname dir)))
 
 (defun* %topic-id-octets (id)
     (function (string) (simple-array (unsigned-byte 8) (*)))
@@ -167,29 +182,38 @@
         (incf off (length o))))
     buf))
 
+(defun* %hmac-labeled (logmac-key label signed)
+    (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))
+               (simple-array (unsigned-byte 8) (*)))
+              (simple-array (unsigned-byte 8) (*)))
+  "The shared anchor-MAC construction: HMAC-SHA-256(LOGMAC-KEY, LABEL ∥ SIGNED) (ADR 0045 §3.2/§4.6/§7.1).
+   A fresh LABEL domain-separates each anchor tier (grandfather set vs sealed high-water tail). NO new
+   crypto — reuses dds.dare:hmac-sha256 (the DARE NIST/IETF KATs are unchanged)."
+  (let* ((ln    (length label))
+         (input (make-array (+ ln (length signed)) :element-type '(unsigned-byte 8))))
+    (replace input label :end1 ln)
+    (replace input signed :start1 ln)
+    (dds.dare:hmac-sha256 logmac-key input)))
+
 (defun* %compute-gf-mac (logmac-key signed)
     (function ((simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*)))
               (simple-array (unsigned-byte 8) (*)))
   "Authenticate the anchor's SIGNED region (kem-ct + grandfather set) under the log-MAC key so a disk
    adversary cannot forge/extend the exempt set: HMAC-SHA-256(key, label ∥ signed) (ADR 0045 §3.2/§7)."
-  (let* ((ln    (length %logmac-gf-label))
-         (input (make-array (+ ln (length signed)) :element-type '(unsigned-byte 8))))
-    (replace input %logmac-gf-label :end1 ln)
-    (replace input signed :start1 ln)
-    (dds.dare:hmac-sha256 logmac-key input)))
+  (%hmac-labeled logmac-key %logmac-gf-label signed))
 
-(defun* %write-logmac-anchor (dir signed gf-mac)
+(defun* %write-anchor-file (path signed mac)
     (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) t)
-  "Persist the anchor: SIGNED ∥ gf-mac(32) ∥ crc32(4), fsynced (open→write→fsync-stream, + dir fsync
-   when new) so it survives power loss (ADR 0045 §3.2)."
+  "Persist a signed anchor image at PATH: SIGNED ∥ MAC(32) ∥ crc32(4), content-fsynced + dir-fsynced on
+   first create so it survives power loss. Shared by the write-once grandfather anchor and the mutable
+   sealed high-water tail anchor (both :supersede; ADR 0045 §3.2/§7.1). DRY: one serialize+CRC+fsync."
   (let* ((slen  (length signed))
-         (entry (make-array (+ slen +logmac-gf-mac-len+ 4) :element-type '(unsigned-byte 8))))
+         (entry (make-array (+ slen +frame-mac-len+ 4) :element-type '(unsigned-byte 8))))
     (replace entry signed :end1 slen)
-    (replace entry gf-mac :start1 slen :end1 (+ slen +logmac-gf-mac-len+))
-    (let ((crc-off (+ slen +logmac-gf-mac-len+)))
+    (replace entry mac :start1 slen :end1 (+ slen +frame-mac-len+))
+    (let ((crc-off (+ slen +frame-mac-len+)))
       (%put-u32-le entry crc-off (%crc32 entry 0 crc-off)))
-    (let* ((path (%logmac-anchor-path dir))
-           (existed (probe-file path)))
+    (let ((existed (probe-file path)))
       (ensure-directories-exist path)
       (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
                               :if-exists :supersede :if-does-not-exist :create)
@@ -198,6 +222,18 @@
       (unless existed
         (dds.pal:fsync-directory (uiop:pathname-directory-pathname path)))))
   t)
+
+(defun* %write-logmac-anchor (dir signed gf-mac)
+    (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) t)
+  "Persist the write-once grandfather anchor: SIGNED ∥ gf-mac(32) ∥ crc32(4), fsynced (ADR 0045 §3.2)."
+  (%write-anchor-file (%logmac-anchor-path dir) signed gf-mac))
+
+(defun* %write-logmac-tail (dir signed tail-mac)
+    (function (pathname (simple-array (unsigned-byte 8) (*)) (simple-array (unsigned-byte 8) (*))) t)
+  "Persist the MUTABLE sealed high-water tail anchor D/logmac.tail: SIGNED ∥ anchor-mac(32) ∥ crc32(4),
+   fsynced (ADR 0045 §7.1). Re-written (:supersede) on every clean close — UNLIKE the write-once
+   grandfather anchor."
+  (%write-anchor-file (%logmac-tail-path dir) signed tail-mac))
 
 (defun* %read-logmac-anchor (dir)
     (function (pathname)
@@ -311,6 +347,156 @@
         (gf (make-hash-table :test #'equal)))
     (dolist (id grandfather-ids) (setf (gethash id gf) t))
     (store-set-chain-mac-fn inner-store (lambda (data) (dds.dare:hmac-sha256 k data)) t gf))
+  t)
+
+;;; --- sealed high-water tail anchor (ADR 0045 §7.1): the store-level SEALED, authenticated per-topic
+;;; tail index that closes the whole-tail-truncation (§7.1), whole-topic-drop (§9) and whole-store-
+;;; rollback (§2) residuals for the FILE tier. Committed at CLEAN CLOSE, verified at OPEN by prefix-
+;;; containment. SEPARATE, MUTABLE file DIR/logmac.tail (never extends the write-once logmac.anchor).
+;;; Format:  version(1)=#x01 ∥ entry-count(4 LE) ∥ [tidlen(4 LE) ∥ tid ∥ N(4 LE) ∥ M_N(32)]*
+;;;   ∥ anchor-mac(32) ∥ crc32(4).  anchor-mac = HMAC-SHA-256(logmac-key, tail-label ∥ signed-region),
+;;; so a raw-disk adversary who truncates the log AND rewrites logmac.tail cannot re-seal it (no key).
+
+(defparameter *durability-debug-skip-tail-seal* nil
+  "Test-only fault injector (ADR 0045 §7.1 crash-append). NIL (default) ⇒ inert; byte-identical behavior.
+   When non-NIL, the encrypted-store :close SKIPS re-sealing the tail anchor — simulating a CRASH after
+   frames were appended but BEFORE the anchor was re-sealed, leaving logmac.tail STALE (an older N). The
+   next open must then accept the longer log as a forward extension (prefix-containment, no false-reject)
+   — this flag exercises exactly that no-false-reject path. Never set in production code.")
+
+(defun* %assemble-tail-signed (tails)
+    (function (hash-table) (simple-array (unsigned-byte 8) (*)))
+  "Serialize the per-topic tail set TAILS (tid -> (N . M_N)) into the anchor's SIGNED region:
+   version ∥ entry-count ∥ [tidlen ∥ tid ∥ N ∥ M_N]* — entries sorted by tid for a deterministic image
+   (the exact byte range the anchor-mac and CRC cover; ADR 0045 §7.1)."
+  (let* ((entries (sort (loop for tid being the hash-keys of tails using (hash-value nm)
+                              collect (list tid (car nm) (cdr nm)))
+                        #'string< :key #'first))
+         (body    (loop for e in entries
+                        sum (+ 4 (length (%topic-id-octets (first e))) 4 +frame-mac-len+)))
+         (buf     (make-array (+ 5 body) :element-type '(unsigned-byte 8))))
+    (setf (aref buf 0) +logmac-tail-version+)
+    (%put-u32-le buf 1 (the (unsigned-byte 32) (length entries)))
+    (let ((off 5))
+      (dolist (e entries)
+        (destructuring-bind (tid n mac) e
+          (let* ((oct (%topic-id-octets tid)) (tl (length oct)))
+            (%put-u32-le buf off (the (unsigned-byte 32) tl)) (incf off 4)
+            (replace buf oct :start1 off :end1 (+ off tl)) (incf off tl)
+            (%put-u32-le buf off (the (unsigned-byte 32) n)) (incf off 4)
+            (replace buf mac :start1 off :end1 (+ off +frame-mac-len+)) (incf off +frame-mac-len+)))))
+    buf))
+
+(defun* %read-logmac-tail (dir)
+    (function (pathname)
+              (values list (or null (simple-array (unsigned-byte 8) (*)))
+                      (or null (simple-array (unsigned-byte 8) (*)))))
+  "Read DIR/logmac.tail → (values entries signed-bytes anchor-mac), or (NIL NIL NIL) if absent. ENTRIES
+   is a list of (tid N . M_N) (tid string, N integer, M_N 32 octets). A present-but-corrupt tail (bad
+   version/count/length/structure/crc) SIGNALS (fail loud, mirrors %read-logmac-anchor). EVERY length
+   and offset is bounds-checked against the buffer BEFORE use (NFR-SEC-POSTURE) so a malformed tail
+   fails clean, never OOB. SIGNED-BYTES is the region the caller re-MACs to authenticate the tail set."
+  (let ((path (%logmac-tail-path dir)))
+    (unless (probe-file path)
+      (return-from %read-logmac-tail (values nil nil nil)))
+    (let* ((size (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
+           (buf  (make-array size :element-type '(unsigned-byte 8))))
+      (with-open-file (s path :element-type '(unsigned-byte 8) :direction :input)
+        (read-sequence buf s))
+      (flet ((bad (why) (error "dds.durability: corrupt tail anchor ~a (~a; ADR 0045 §7.1)" path why)))
+        (when (< size (+ 5 +frame-mac-len+ 4)) (bad "truncated"))
+        (unless (= (aref buf 0) +logmac-tail-version+) (bad "version"))
+        (let ((count (%get-u32-le buf 1))
+              (off   5)
+              (entries '()))
+          (when (> count 1000000) (bad "entry-count"))
+          (dotimes (_ count)
+            (when (> (+ off 4) size) (bad "tidlen-oob"))
+            (let ((tidlen (%get-u32-le buf off)))
+              (incf off 4)
+              (when (> tidlen 65536) (bad "tidlen"))
+              (when (> (+ off tidlen 4 +frame-mac-len+) size) (bad "entry-oob"))
+              (let ((tid (make-array tidlen :element-type '(unsigned-byte 8))))
+                (replace tid buf :start2 off :end2 (+ off tidlen))
+                (incf off tidlen)
+                (let ((n (%get-u32-le buf off)))
+                  (incf off 4)
+                  (let ((mac (make-array +frame-mac-len+ :element-type '(unsigned-byte 8))))
+                    (replace mac buf :start2 off :end2 (+ off +frame-mac-len+))
+                    (incf off +frame-mac-len+)
+                    (push (list* (map 'string #'code-char tid) n mac) entries))))))
+          (let* ((mac-off off) (crc-off (+ mac-off +frame-mac-len+)))
+            (when (/= size (+ crc-off 4)) (bad "size"))
+            (let ((stored (%get-u32-le buf crc-off))
+                  (actual (%crc32 buf 0 crc-off)))
+              (unless (= stored actual) (bad "crc")))
+            (let ((anchor-mac (make-array +frame-mac-len+ :element-type '(unsigned-byte 8)))
+                  (signed     (make-array mac-off :element-type '(unsigned-byte 8))))
+              (replace anchor-mac buf :start2 mac-off :end2 crc-off)
+              (replace signed buf :start2 0 :end2 mac-off)
+              (values (nreverse entries) signed anchor-mac))))))))
+
+(defun* %seal-tail-anchor (inner-store dir logmac-key)
+    (function (durable-store pathname (simple-array (unsigned-byte 8) (*))) t)
+  "Seal the store-level high-water tail anchor at CLEAN CLOSE (ADR 0045 §7.1): gather each chained
+   topic's (v3-count N . tail-MAC M_N) via the read-only chain-tails seam, HMAC the per-topic tail set
+   under the log-MAC key (label ∥ region, mirroring %compute-gf-mac), and persist DIR/logmac.tail
+   (serialized set ∥ anchor-mac ∥ CRC, fsynced). store-sync FIRST so the seam re-walk reads the durable
+   bytes. A backend without the chain-tails seam (SQLite/microservice — the tail anchor is a FILE-tier
+   feature this slice) writes NO anchor. Committing the PREFIX (N, M_N) makes rolling the log back to a
+   shorter valid prefix — whole-tail truncation, whole-topic drop, whole-store rollback — contradict the
+   anchor at the next open (prefix-containment), while a forward crash-append stays clean."
+  (when (durable-store-chain-tails-fn inner-store)
+    (store-sync inner-store)
+    (let ((tails (store-chain-tails inner-store)))
+      (let* ((signed (%assemble-tail-signed tails))
+             (mac    (%hmac-labeled logmac-key %logmac-tail-label signed)))
+        (%write-logmac-tail dir signed mac))))
+  t)
+
+(defun* %verify-tail-anchor (inner-store dir logmac-key)
+    (function (durable-store pathname (simple-array (unsigned-byte 8) (*))) t)
+  "Verify the sealed high-water tail anchor at store-open, BEFORE the inner replay compacts the logs
+   (ADR 0045 §7.1). Reads DIR/logmac.tail (absent ⇒ nothing sealed ⇒ open CLEAN — a never-cleanly-closed
+   store has only running-chain protection); re-MACs it under the log-MAC key and fail-LOUD on the
+   anchor's own MAC mismatch (tamper of logmac.tail itself); then per sealed topic runs prefix-
+   containment via the read-only verify seam: t ⇒ the committed prefix (N, M_N) is present + intact (may
+   extend forward = crash-append → CLEAN); :truncated ⇒ the chain no longer reaches the sealed high-water
+   (whole-tail truncation / whole-topic drop / whole-store rollback); :diverged ⇒ the prefix MAC differs
+   (rollback / substitution). Either non-t ⇒ fail-CLOSED (a loud error at open, exactly like
+   %load-logmac-anchor's gf-mac mismatch)."
+  (multiple-value-bind (entries signed anchor-mac) (%read-logmac-tail dir)
+    (unless signed
+      (return-from %verify-tail-anchor t))
+    (unless (equalp (%hmac-labeled logmac-key %logmac-tail-label signed) anchor-mac)
+      (error "dds.durability: tail anchor MAC mismatch in ~a (tamper — refusing to open; ADR 0045 §7.1)"
+             dir))
+    (dolist (e entries)
+      (destructuring-bind (tid n . macv) e
+        (let ((r (store-verify-chain-prefix inner-store tid n macv)))
+          (unless (eq r t)
+            (error "dds.durability: tail anchor prefix-containment FAILED for topic-id ~a (~a — whole-tail ~
+                    truncation / whole-topic drop / whole-store rollback; refusing to open; ADR 0045 §7.1)"
+                   tid r)))))
+    t))
+
+(defun* %invalidate-tail-anchor (dir)
+    (function (pathname) t)
+  "Delete DIR/logmac.tail, fsyncing the dirent removal so a crash cannot resurrect a stale anchor
+   (ADR 0045 §7.1). Called at OPEN, AFTER %verify-tail-anchor has checked the at-rest sealed state and
+   BEFORE store-open's compaction sweep / the session's puts mutate the log. The tail anchor commits the
+   PHYSICAL v3-frame chain, but the KEEP_LAST physical-reclaim path (%reclaim-deleted-topic ⇒
+   %rewrite-topic-log) and settled-instance compaction AUTHORIZED-SHRINK it mid-session; two files (the
+   log + logmac.tail) can't be updated atomically, so a re-seal-on-shrink would just move the crash
+   window. Invalidating BEFORE any shrink means an authorized shrink + a crash (no clean re-seal) leaves
+   NO stale anchor to FALSE-REJECT — the store reopens clean (the never-cleanly-closed path), while an
+   OFFLINE truncation of the clean-closed state is still detected (verify ran first). The anchor is
+   RE-SEALED at the next clean close over the final state — so it protects only the at-rest (clean-closed)
+   state, never the mutating in-session log."
+  (let ((path (%logmac-tail-path dir)))
+    (when (probe-file path)
+      (delete-file path)
+      (dds.pal:fsync-directory (uiop:pathname-directory-pathname path))))
   t)
 
 (defun* %frame-epoch-entry (epoch-id kem-ct)
@@ -901,9 +1087,12 @@
                   (sealed   (dds.dare:seal-payload-v2 current-dek current-epoch nonce th-bytes frame)))
              (setf (gethash th topic-names) topic)
              (let ((r (store-put inner-store th guid* 0 nil :data sealed)))
-               ;; Sliver 3a: physically evict the superseded prior surrogates so the inner physical row
+               ;; Sliver 3a/3b: physically evict the superseded prior surrogates so the inner physical row
                ;; count converges to eff-hd (closes the ADR 0025 §10.3 residual for the continuously-open
-               ;; case). SQLite inner store only; a file inner store (no :delete slot) stays logical-only.
+               ;; case). Runs for ANY del-supported inner store — SQLite (Sliver 3a) AND the file store
+               ;; (Sliver 3b: it HAS a :delete slot ⇒ del-supported is T, so the file tier physically
+               ;; reclaims too; this on-disk shrink is exactly why the tail anchor is invalidated at open,
+               ;; ADR 0045 §7.1). A backend without :delete (del-supported NIL) stays logical-only.
                (when (and del-supported (eq :keep-last eff-hk) (eq :data kind) key-hash)
                  (%evict-prior-surrogates th writer-guid key-hash sn guid*))
                r))))
@@ -976,6 +1165,14 @@
                  (setf logmac-key key)
                  (setf meta-key   mkey)
                  (%install-logmac-oracle inner-store key gf-ids)
+                 ;; sealed high-water tail anchor (ADR 0045 §7.1): VERIFY the at-rest sealed state (detect
+                 ;; an OFFLINE truncation / whole-topic drop / rollback) BEFORE store-open, then INVALIDATE
+                 ;; the anchor BEFORE store-open's compaction sweep + this session's puts AUTHORIZED-SHRINK
+                 ;; the log — so an authorized shrink + a crash (no clean re-seal) leaves NO stale anchor to
+                 ;; FALSE-REJECT (the store reopens clean; re-sealed at the next clean close over the final
+                 ;; state). Verify FIRST keeps detection; invalidate SECOND kills the reclaim-crash brick.
+                 (%verify-tail-anchor inner-store epoch-dir key)
+                 (%invalidate-tail-anchor epoch-dir)
                  (store-open inner-store :keep-all nil))
                (progn
                  (store-open inner-store :keep-all nil)
@@ -991,6 +1188,12 @@
        :close
        (lambda ()
          (dds.pal:with-lock (lock)
+           ;; sealed high-water tail anchor (ADR 0045 §7.1): seal the per-topic (N, M_N) BEFORE freeing
+           ;; the log-MAC key + dropping the oracle (both needed to MAC the anchor + re-walk the chain).
+           ;; SEAL-ON-CLOSE only (prefix-containment makes a stale anchor safe on crash — a forward
+           ;; extension is CLEAN); a store that never chained (logmac-key NIL) has no tail to seal.
+           (when (and logmac-key (not *durability-debug-skip-tail-seal*))
+             (%seal-tail-anchor inner-store epoch-dir logmac-key))
            ;; free every DEK in the map (the current DEK is held in the map ⇒ freed once); §6
            (%free-epoch-dek-map dek-map)
            (setf current-epoch nil)

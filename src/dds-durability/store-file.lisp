@@ -448,6 +448,49 @@
     (dds.pal:fsync-directory (uiop:pathname-directory-pathname path))
     t))
 
+(defun* %chain-walk (path topic mac-fn stop-at)
+    (function (pathname string function (or null (integer 0)))
+              (values (integer 0) (simple-array (unsigned-byte 8) (*))
+                      (member :reached :clean :torn :corrupt)))
+  "READ-ONLY walk of the v3 chain in PATH for TOPIC under MAC-FN (never truncates/rewrites, unlike
+   %replay-log) — the shared engine of the sealed high-water tail anchor (ADR 0045 §7.1). Seeds from the
+   per-topic keyed head, verifies each v3 frame's MAC in on-disk order, and counts ONLY v3 frames (a
+   legacy v1/v2 prefix is walked over without counting, matching how the frames were sealed). Returns
+   (values v3-count running-mac end-reason):
+     STOP-AT non-NIL and reached ⇒ :reached, RUNNING-MAC = the running chain MAC after exactly STOP-AT
+       v3 frames (the tail anchor's prefix-containment probe; forward frames past STOP-AT are ignored);
+     else the walk runs to its natural end — :clean (ended on a frame boundary), :torn (a short trailing
+       partial frame = an honest crash mid-append), or :corrupt (a bad/mismatched frame).
+   The tail-anchor SEAL (STOP-AT NIL → v3-count + tail-MAC) and the prefix-containment VERIFY (STOP-AT N)
+   share this ONE walk, so their counting + MAC computation are byte-identical (no drift)."
+  (let ((seed (%chain-seed mac-fn topic)))
+    (unless (probe-file path)
+      (return-from %chain-walk (values 0 seed :clean)))
+    (let* ((size    (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s)))
+           (buf     (make-array size :element-type '(unsigned-byte 8)))
+           (pos     0)
+           (count   0)
+           (running seed)
+           (started nil))
+      (with-open-file (s path :element-type '(unsigned-byte 8) :direction :input)
+        (read-sequence buf s))
+      (loop
+        (when (and stop-at (>= count stop-at))
+          (return (values count running :reached)))     ; committed prefix reached (running = MAC@count)
+        (when (>= pos size)
+          (return (values count running :clean)))        ; ended on a frame boundary (< STOP-AT if any)
+        (multiple-value-bind (rec next reason frame-mac)
+            (%parse-frame buf pos size topic mac-fn running started)
+          (declare (ignore rec))
+          (cond
+            ((eq reason :ok)
+             (when frame-mac                              ; a v3 frame advances + counts the chain
+               (setf running frame-mac started t)
+               (incf count))
+             (setf pos next))
+            ((eq reason :short) (return (values count running :torn)))    ; honest torn trailing frame
+            (t                  (return (values count running :corrupt))))))))) ; tamper — defer to open
+
 ;;; Replay one topic log, returning a list of durable-records.
 ;;; :short at the tail → truncate to last-valid, recover.
 ;;; :corrupt anywhere → error (fail loud; never silently drop mid-file data).
@@ -1011,6 +1054,48 @@
            (setf chain-required required)
            (setf chain-grandfather grandfather))
          t)
+
+       :chain-tails-fn
+       ;; sealed high-water tail-anchor SEAL seam (ADR 0045 §7.1): for each CHAINED topic (a live v3
+       ;; chain in chain-macs), re-walk its on-disk log via the shared %chain-walk to its natural end,
+       ;; yielding (v3-count N . tail-MAC M_N). The re-walk reads the durable bytes (the decorator
+       ;; store-syncs first), so the sealed (N, M_N) is byte-identical to what the open-time verify
+       ;; re-walks. id-map's key is the topic name the frames were sealed under (the encrypted
+       ;; surrogate th), used for the per-topic seed. A bare (un-chained) store returns an empty set.
+       (lambda ()
+         (dds.pal:with-lock (lock)
+           (let ((result (make-hash-table :test #'equal)))
+             (when chain-mac-fn
+               (maphash (lambda (topic tid)
+                          (when (gethash tid chain-macs)
+                            (multiple-value-bind (n mac reason)
+                                (%chain-walk (%topic-log-path store-dir tid) topic chain-mac-fn nil)
+                              (declare (ignore reason))
+                              (when (plusp n)
+                                (setf (gethash tid result) (cons n mac))))))
+                        id-map))
+             result)))
+
+       :verify-chain-prefix-fn
+       ;; sealed high-water tail-anchor VERIFY seam (ADR 0045 §7.1): re-walk TOPIC-ID's on-disk chain to
+       ;; ordinal N (%chain-walk STOP-AT) and decide prefix-containment. Resolve TOPIC-ID -> the seed
+       ;; topic via topics.map (fallback to the raw tid, mirroring the :open replay) since id-map is empty
+       ;; before store-open. :reached ⇒ compare the running MAC@N to the sealed M_N (== intact/may-extend
+       ;; = CLEAN; != = :diverged rollback); :clean (ended below N on a boundary) ⇒ :truncated (whole-tail
+       ;; truncation / whole-topic drop [absent log] / whole-store rollback); :torn (honest crash mid-append)
+       ;; ⇒ tolerate; :corrupt (interior tamper) ⇒ defer to store-open's fail-loud replay. No oracle ⇒ T.
+       (lambda (tid n mac)
+         (dds.pal:with-lock (lock)
+           (if (null chain-mac-fn)
+               t
+               (let ((topic (or (gethash tid (%read-topics-map store-dir)) tid)))
+                 (multiple-value-bind (count running reason)
+                     (%chain-walk (%topic-log-path store-dir tid) topic chain-mac-fn n)
+                   (declare (ignore count))
+                   (cond
+                     ((eq reason :reached) (if (equalp running mac) t :diverged))
+                     ((eq reason :clean)   :truncated)
+                     (t                    t)))))))
 
        :delete
        ;; Sliver 3b (ADR 0025 §10.3 / ADR 0029 §10): per-record physical reclaim for the encrypted

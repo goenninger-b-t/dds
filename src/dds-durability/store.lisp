@@ -30,6 +30,13 @@
   (sync       nil     :type (or null function))
   ;; keyed log-MAC chain seam (ADR 0045): install a MAC oracle (data)->HMAC; NIL = feature absent
   (set-chain-mac-fn nil :type (or null function))
+  ;; sealed high-water tail-anchor seam (ADR 0045 §7.1): read-only, additive NIL-fallback (like sync).
+  ;; chain-tails-fn ()->hash topic-id->(N . M_N) gathers the per-topic (v3-count . tail-MAC) for the
+  ;; seal; verify-chain-prefix-fn (topic-id N M_N)->t|:truncated|:diverged re-walks a topic's on-disk
+  ;; chain for the open-time prefix-containment check. NIL on a backend without the seam (memory /
+  ;; SQLite / microservice) ⇒ the tail anchor is absent for that tier (FILE tier only this slice).
+  (chain-tails-fn nil :type (or null function))
+  (verify-chain-prefix-fn nil :type (or null function))
   ;; per-record physical delete-by-(topic,writer-guid,sn) (ADR 0025 §10.3 / ADR 0029 §10); NIL = the
   ;; backend has no physical reclaim (byte-identical to pre-slot) — same NIL-fallback as sync above
   (delete nil :type (or null function)))
@@ -114,6 +121,35 @@
   (let ((f (durable-store-set-chain-mac-fn store)))
     (when f (funcall f fn required grandfather-set)))
   t)
+
+(defun* store-chain-tails (store)
+    (function (durable-store) hash-table)
+  "Read-only SEAL seam for the sealed high-water tail anchor (ADR 0045 §7.1): return a FRESH hash-table
+   topic-id -> (N . M_N) — the current per-topic (v3-frame count . tail chain-MAC) of the backing store.
+   The encrypted-store decorator seals this set at clean close so that rolling the log back to a shorter
+   valid prefix later contradicts the anchor. An EMPTY table when the backing store has no chain-tails
+   seam (memory / SQLite / microservice — the tail anchor is a FILE-tier feature this slice; those tiers
+   are follow-on WPs). The NIL-fallback mirrors store-sync / store-set-chain-mac-fn — an additive
+   read-only vtable slot, not a fork."
+  (let ((f (durable-store-chain-tails-fn store)))
+    (if f (funcall f) (make-hash-table :test #'equal))))
+
+(defun* store-verify-chain-prefix (store topic-id n mac)
+    (function (durable-store string (integer 0) (simple-array (unsigned-byte 8) (*)))
+              (member t :truncated :diverged))
+  "Read-only VERIFY seam for the tail anchor's prefix-containment (ADR 0045 §7.1). Re-walk TOPIC-ID's
+   on-disk v3 chain and compare against the sealed prefix (N, MAC):
+     T          — the chain reaches AT LEAST N v3 frames AND its running MAC at ordinal N == MAC (the
+                  committed prefix is present + intact; it MAY extend past N = a legitimate crash-append
+                  / forward extension → CLEAN, never a false-reject);
+     :truncated — the chain no longer reaches N complete frames on a clean boundary (whole-tail
+                  truncation / whole-topic drop [topic absent] / whole-store rollback);
+     :diverged  — the chain reaches N but its running MAC differs (prefix rollback / substitution).
+   An honest torn TRAILING frame (a crash mid-append) is tolerated (T) — parity with the truncate-recover
+   path — so a real crash is never a false-reject. T when the backing store has no verify seam (NIL-
+   fallback: the tail anchor is absent for that tier)."
+  (let ((f (durable-store-verify-chain-prefix-fn store)))
+    (if f (funcall f topic-id n mac) t)))
 
 (defun* store-delete (store topic writer-guid sn)
     (function (durable-store string (simple-array (unsigned-byte 8) (16)) (integer 0))

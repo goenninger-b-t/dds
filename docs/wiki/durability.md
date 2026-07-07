@@ -822,17 +822,53 @@ closes that gap for the **encrypted/epoch (keyed) store**:
   grandfather set is enumerated from the mint-time on-disk logs, which are untrusted — an adversary who
   pre-seeds fake v2 logs before mint gets them authenticated as exempt (no more capability than deleting
   the anchor outright), closed only by the deferred sealed high-water anchor.
+- **Sealed high-water tail anchor (whole-tail truncation / whole-topic drop / whole-store rollback —
+  FILE tier, ADR 0045 §7.1).** The running chain provably cannot detect truncation of a valid *prefix*
+  (the shorter log is itself a valid chain), so a **separable** store-level anchor commits the expected
+  tail. At **clean close** the decorator seals, per chained topic, `{N = v3-frame count, M_N = the
+  running chain-MAC after N frames}` plus the **topic-SET**, MAC'd under the log-MAC key
+  (`HMAC-SHA-256(logmac-key, "dds-dare/logmac/tail/v1" ∥ set)` — the same keyed construction as the
+  grandfather anchor, a fresh domain label, no new crypto) into a **separate, mutable `D/logmac.tail`**
+  (fsync'd; never extends the write-once `logmac.anchor`). The anchor protects the **at-rest
+  (clean-closed)** state — NOT the mutating in-session log: authorized ops shrink the physical chain
+  mid-session (the KEEP_LAST **physical reclaim** `%reclaim-deleted-topic` ⇒ `%rewrite-topic-log`, active
+  for the file inner store, and settled-instance compaction re-emit **fewer** re-seeded frames), and two
+  files can't be updated atomically. So at **open** the decorator **verifies** the at-rest anchor (detects
+  an OFFLINE truncation) and then **INVALIDATES it (deletes `logmac.tail`, dir-fsync'd) BEFORE** store-open's
+  sweep / the session's puts mutate the log; it is **re-sealed at the next clean close** over the final
+  state. Verify per sealed topic: the chain must reach ≥ `N` v3 frames with running MAC at `N` == `M_N`
+  (**CLEAN**); a chain ending on a clean boundary below `N` is **`:truncated`** (whole-tail truncation /
+  whole-topic drop [absent log] / whole-store rollback ⇒ **fail-closed**); a divergent prefix MAC is
+  **`:diverged`**. This makes an authorized reclaim-shrink + a **crash** (no clean re-seal) reopen **clean**
+  (no stale anchor to false-reject / brick — the never-cleanly-closed path), while an offline truncation of
+  the clean-closed state is still detected (verify ran first). An honest torn TRAILING frame is tolerated
+  (clean). With invalidate-at-open a present `logmac.tail` always describes an unmutated at-rest log, so the
+  prefix-containment "may extend past `N`" tolerance is currently **vestigial** (harmless; reserved for a
+  future periodic-seal — strict `count==N ∧ MAC==M_N` would be equivalent today). The decorator↔store
+  boundary is a **read-only additive seam** (`store-chain-tails` for the seal, `store-verify-chain-prefix`
+  for the open check; NIL-fallback like `store-sync`), so the **SQLite + microservice** tiers (seam slot
+  NIL) are unchanged — the tail anchor is **FILE-tier this slice**; those tiers are follow-on WPs.
 - **Detected:** interior record **delete / reorder / substitution (even with both CRCs recomputed) /
-  insertion**, and **full-log v3→v2 downgrade** of any born-chained topic. **Deferred residuals (ADR
-  0045 §7):** a bare chain **cannot** detect **whole-tail truncation** of a valid prefix (the shorter
-  log is itself a valid chain) — honest torn tails still truncate-recover; detecting *malicious* tail
-  truncation, the combined anchor-deletion-plus-full-downgrade vector, or a full rollback of a
-  *grandfathered* legacy topic, needs a separable **sealed high-water anchor** (documented, deferred).
-  The `epochs.dat` MAC is likewise deferred. Cost is off the sample hot path (one HMAC per put / per
-  frame at open). Verified by `run-durability-mac-chain-test` (round-trip; v1/v2/v3 read; the four
-  interior tampers with a non-vacuous control; the v3→v2 downgrade fails loud while a v3-tail migration
-  log opens; **multi-topic legacy coexistence — a dormant legacy topic opens while a born-chained topic
-  verifies and its downgrade fails**; cross-restart; key-absent/wrong-key; torn-tail + its residual).
+  insertion**, **full-log v3→v2 downgrade** of any born-chained topic, and — for the **FILE** tier —
+  **whole-tail truncation / whole-topic drop / whole-store rollback** (the sealed high-water anchor
+  above, **against an adversary who truncates the log but does not also delete `logmac.tail`**).
+  **Deferred residuals (ADR 0045 §7):** the honest-torn-disguise (a truncation that leaves a trailing
+  *partial* frame is byte-indistinguishable from a real crash, so it is tolerated); **`logmac.tail`
+  deletion** — the anchor is a mutable, non-write-once file, so an adversary who truncates the log **and
+  deletes `logmac.tail`** opens clean (byte-indistinguishable from a legitimate never-cleanly-closed store;
+  the **same residual class as anchor-deletion, §7 item 3a** — it cannot be closed by requiring the tail
+  file's presence without false-rejecting every legitimately never-closed store; invalidate-at-open widens
+  the legitimate-absent window to any open session, same class); the tail anchor on the **SQLite +
+  microservice** tiers (seam NIL until the follow-on); the combined anchor-deletion-plus-full-downgrade
+  vector and a full rollback of a *grandfathered* legacy topic; and the `epochs.dat` MAC. Cost is off the
+  sample hot path (one HMAC per put / per frame at open; one HMAC over the tail set per close). Verified by
+  `run-durability-mac-chain-test` (round-trip; v1/v2/v3 read; the four interior tampers with a non-vacuous
+  control; the v3→v2 downgrade fails loud while a v3-tail migration log opens; **multi-topic legacy
+  coexistence**; cross-restart; key-absent/wrong-key; **torn-tail clean + whole-frame tail truncation now
+  DETECTED**) and `run-durability-tail-anchor-test` (**crash-append CLEAN** + **authorized reclaim-shrink +
+  crash reopens CLEAN** [the two no-false-reject / no-brick cases, the second with a non-vacuous
+  log-shrank guard]; **whole-topic-drop / anchor-tamper / whole-store-rollback DETECTED**; never-cleanly-closed
+  opens clean).
 
 ### 8.6 Deployment requirement — OpenSSL ≥ 3.5
 
@@ -899,8 +935,9 @@ authenticity** of the payload AND its AAD-bound metadata (topic/guid/sn/kind/key
 byte fails the GCM tag, fail-closed — and it survives restart. It provides **record-sequence
 integrity** via the keyed v3 MAC chain (§8.5): interior delete/reorder/substitution/insertion are
 tamper-evident at store-open. It **also seals the record metadata** (topic/GUID/SN/kind/key-hash) at
-rest — see §8.9 (WP-DURABILITY-METADATA-CONF-3c). It does **not** yet detect **malicious whole-tail
-truncation** (the deferred sealed-anchor residual, ADR 0045 §7). The follow-ons
+rest — see §8.9 (WP-DURABILITY-METADATA-CONF-3c). For the **FILE** tier it now also detects **malicious
+whole-tail truncation / whole-topic drop / whole-store rollback** via the sealed high-water tail anchor
+(§8.5, ADR 0045 §7.1); the SQLite + microservice tail anchor remains a follow-on residual. The follow-ons
 (ADR 0026 §10 / ADR 0025 §10): cross-vendor coexistence dedup **(RESOLVED — ADR 0027: RTI PS uses
 standard OWI on its retained-history replay, so no vendor PID is needed; the configurable
 `:relay-durability`/`:collect-durability` tiers landed; ADR 0027 §follow-on 1 RESOLVED — ADR 0028:
@@ -927,7 +964,11 @@ with a non-memory store signals before launch instead of silently running the in
 **log-level at-rest integrity — keyed MAC'd log chain (RESOLVED — WP-DURABILITY-MAC-LOG-CHAIN,
 ADR 0045: v3 frames carry an HMAC-SHA-256 chain keyed by a cross-restart-stable anchor-derived key;
 interior delete/reorder/substitution/insertion tamper-evident at store-open, fail-closed; keyed-store-
-only; malicious whole-tail truncation + `epochs.dat` MAC deferred residuals, §8.5)**;
+only; **whole-tail truncation / whole-topic drop / whole-store rollback now RESOLVED for the FILE tier by
+the sealed high-water tail anchor — WP-DURABILITY-TAIL-ANCHOR-FILE, ADR 0045 §7.1** (against a truncate-but-not-
+`logmac.tail`-delete adversary; verify-then-invalidate at open so an authorized reclaim-shrink + crash never
+false-rejects); SQLite + microservice tail anchor + `logmac.tail`-deletion + `epochs.dat` MAC remain deferred
+residuals, §8.5)**;
 **graceful FFI teardown on signal (RESOLVED — ADR 0030, 2026-06-22; `kill -15` exits cleanly
 status 0, no SIGBUS, both impls; see §5.1)**;
 epoch-table retirement; **3c metadata confidentiality (RESOLVED — §8.9, WP-DURABILITY-METADATA-CONF-3c)**;
@@ -1027,7 +1068,10 @@ so each backend's ids key identically to its own downgrade lookup — the file s
 log-dir scan (robust to a lost `topics.map`), SQLite maps real topic names via `%topic->id`. A
 **NIL-oracle** bare `make-sqlite-store` writes NULL `mac`/`chain_seq` and skips verification —
 byte-behaviorally unchanged. All ADR 0045 §7 residuals (malicious whole-tail truncation, `epochs.dat`
-MAC, anchor-deletion full-downgrade, and whole-topic deletion) apply equally. Test:
+MAC, anchor-deletion full-downgrade, and whole-topic deletion) apply equally to the SQLite backend —
+its sealed-high-water-anchor seam (`store-chain-tails`/`store-verify-chain-prefix`) is still NIL, so
+whole-tail truncation / whole-topic deletion / whole-store rollback stay open here even though they are
+now CLOSED for the FILE tier (WP-DURABILITY-TAIL-ANCHOR-FILE, ADR 0045 §7.1). Test:
 `run-durability-sqlite-mac-chain-test` (tamper via DIRECT SQL: UPDATE payload/mac, DELETE, REORDER;
 downgrade; KEEP_LAST reopen-repeatedly; epoch-boundary; grandfather; NIL-oracle regression).
 

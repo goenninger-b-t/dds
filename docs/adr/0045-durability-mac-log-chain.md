@@ -3,7 +3,7 @@
 Status: Accepted
 Date: 2026-07-04
 Work package: WP-DURABILITY-MAC-LOG-CHAIN (feature follow-on #2 of 4; resolves the ADR 0026 §10.9 open follow-on)
-Supersedes/updates: ADR 0026 §10.9 (the "MAC'd log chain" follow-on is now RESOLVED, with two residuals left explicitly deferred — see §7)
+Supersedes/updates: ADR 0026 §10.9 (the "MAC'd log chain" follow-on is now RESOLVED — see §7). Update (WP-DURABILITY-TAIL-ANCHOR-FILE): the §7.1 whole-tail-truncation residual (and its §9 whole-topic-drop + §2 whole-store-rollback forms) is now CLOSED for the FILE tier by a sealed high-water tail anchor; SQLite + microservice tiers are follow-on (shared logic via a read-only seam), and the §7.2 epochs.dat MAC stays deferred.
 
 ## 1. Context
 
@@ -41,9 +41,12 @@ adversary cannot compute the keyed HMAC, so cannot forge a valid chain link.
 Out of scope (documented residuals, deferred — see §7):
 
 - **Whole-tail truncation of a valid prefix.** A bare running chain provably cannot detect it: the
-  shorter log is itself a valid chain. Detecting it needs an external **sealed high-water anchor**.
+  shorter log is itself a valid chain. Detecting it needs an external **sealed high-water anchor** —
+  **now CLOSED for the FILE tier** by WP-DURABILITY-TAIL-ANCHOR-FILE (§7.1 as-built; SQLite +
+  microservice tiers are follow-on).
 - **Cross-store / whole-file replacement of an *older* valid store snapshot.** Same anchor
-  territory (a store-level sealed high-water, not a per-frame link).
+  territory (a store-level sealed high-water, not a per-frame link) — the file-tier sealed high-water
+  anchor detects an older-snapshot roll-back of the log under the current anchor (count < N; §7.1).
 
 Explicitly not re-solved (already covered elsewhere): payload confidentiality (GCM), payload
 authenticity (GCM tag), accidental corruption (CRC-32). The chain adds **sequence integrity**.
@@ -249,15 +252,71 @@ silently disable verification, unlike the torn-tail-recoverable `epochs.dat`).
 
 ## 7. Residuals (explicitly deferred — do not build in this WP)
 
-1. **Whole-tail truncation detection.** A bare running chain **cannot** detect truncation of a
-   valid prefix — the shorter log verifies clean. Detecting it requires an external, independently
-   **sealed high-water anchor**: a per-topic authenticated tail-marker recording the expected chain
-   head (last MAC) + record count, written/sealed such that rolling the log back to an earlier valid
-   prefix contradicts the anchor. That anchor is a **separable** mechanism (a store-level sealed
-   index, not a per-frame link) and is deferred. **v1 therefore detects delete/reorder/substitution/
-   insertion of INTERIOR records but not honest-prefix tail truncation.** The honest short-tail case
-   still truncate-recovers (parity with Batch-B); malicious tail truncation is indistinguishable
-   from it without the anchor.
+1. **Whole-tail truncation detection.** **RESOLVED for the FILE tier** by
+   WP-DURABILITY-TAIL-ANCHOR-FILE (the sealed high-water tail anchor, §7.1 as-built below) — against an
+   adversary who **truncates the log but does not also delete the mutable `logmac.tail`** (deleting it is
+   the same residual class as anchor-deletion, §7 item 3a; see Residuals (b) in the as-built); **SQLite +
+   microservice tiers are follow-on WPs** (they share the logic through the same read-only seam, whose
+   backend slot is NIL for now). A bare running chain **cannot** detect truncation of a valid prefix —
+   the shorter log verifies clean — so detecting it requires an external, independently **sealed
+   high-water anchor**: a per-topic authenticated tail-marker recording the expected chain head (last
+   MAC) + record count, written/sealed such that rolling the log back to an earlier valid prefix
+   contradicts the anchor. That anchor is a **separable** mechanism (a store-level sealed index, not a
+   per-frame link). The as-built closes, for the file tier, **whole-tail truncation (§7.1), whole-topic
+   drop (§9), and whole-store rollback (§2)** with ONE anchor; the honest short-tail case still
+   truncate-recovers (the anchor tolerates a torn trailing partial frame — parity with Batch-B), while a
+   malicious drop of one or more **complete** frames down to a clean-boundary prefix below the sealed
+   high-water is now DETECTED (fail-closed at open).
+
+   **§7.1 as-built (sealed high-water tail anchor, file tier).**
+   - **Construction.** At **clean close** the encrypted-store decorator gathers, per chained topic, the
+     pair `{ N = v3-frame count, M_N = the running chain-MAC after N records }` (M_N is itself a
+     cryptographic commitment to the whole prefix `[0..N]`), plus the **topic-SET** (so a dropped topic
+     is caught). The seal is `anchor-mac = HMAC-SHA-256(logmac-key, "dds-dare/logmac/tail/v1" ∥
+     serialized{tid,N,M_N}*)` — the SAME keyed construction as `%compute-gf-mac` (§4.6) with a **fresh
+     domain-separator label** and no new crypto — persisted (serialized set ∥ anchor-mac(32) ∥ crc32,
+     fsynced) into a **SEPARATE, MUTABLE file `D/logmac.tail`** (never extends the write-once
+     `logmac.anchor`). Because the log-MAC key never touches disk (§4.3), a raw-disk adversary who
+     truncates the log **and** rewrites `logmac.tail` cannot re-seal it.
+   - **Update model — verify-then-invalidate at open, re-seal at clean close.** The anchor protects the
+     **at-rest (clean-closed)** state, NOT the mutating in-session log. The seal counts the **physical**
+     v3-frame chain, but authorized operations shrink it mid-session — the KEEP_LAST **physical reclaim**
+     (`%reclaim-deleted-topic` ⇒ `%rewrite-topic-log`, active for the file inner store: `del-supported` is
+     T) and settled-instance compaction atomically rewrite a log to **fewer** re-seeded frames — and the
+     two files (the log + `logmac.tail`) cannot be updated atomically, so a re-seal-on-shrink just moves
+     the crash window. Therefore, at **open**, the decorator **verifies** the at-rest anchor (detecting an
+     OFFLINE truncation) and then **INVALIDATES it** (deletes `logmac.tail`, dir-fsynced) **before**
+     store-open's compaction sweep or the session's puts touch the log. An authorized shrink followed by a
+     **crash** (no clean re-seal) then leaves **no stale anchor to false-reject** — the store reopens clean
+     via the never-cleanly-closed path — while an offline truncation of the clean-closed state is still
+     caught (verify ran first). The anchor is **re-sealed at the next clean close** over the final state.
+     Seal is at close only (not per-put).
+   - **Verify (the load-bearing no-false-reject).** At **open**, AFTER the log-MAC oracle is installed and
+     BEFORE store-open, the decorator reads + MAC-verifies `logmac.tail` (fail-loud on the anchor's own
+     MAC), then per sealed topic re-walks the on-disk chain to ordinal `N`: **CLEAN** iff the chain reaches
+     ≥ `N` v3 frames and the running MAC at `N` == `M_N`; **`:truncated`** iff the chain ends on a clean
+     frame boundary below `N` (whole-tail truncation / whole-topic drop [absent log ⇒ 0 < N] / whole-store
+     rollback); **`:diverged`** iff it reaches `N` but the running MAC differs (rollback / substitution). An
+     honest torn TRAILING frame (a crash mid-append) is tolerated (clean), so a real crash is never a
+     false-reject. Because the anchor is invalidated at open and re-sealed only at a clean close, a present
+     `logmac.tail` always describes an unmutated at-rest log, so the "**MAY extend past `N`**"
+     prefix-containment tolerance is currently **vestigial** (kept harmless — it neither masks an attack,
+     since store-open's running-chain replay rejects any forged append, nor is reachable legitimately — and
+     reserved for a future periodic-seal design; strict equality `count==N ∧ MAC==M_N` would be equivalent
+     today).
+   - **Residuals (file tier).** (a) The **honest-torn-disguise**: a truncation that leaves a trailing
+     *partial* frame is byte-indistinguishable from a real crash, so it is tolerated — the anchor rejects
+     truncation only to a **clean** shorter prefix. (b) **`logmac.tail` deletion.** The anchor is a
+     *mutable, non-write-once* file; under §2's disk adversary an attacker who truncates the log to a valid
+     shorter prefix **and deletes `logmac.tail`** opens clean (byte-indistinguishable from a legitimate
+     never-cleanly-closed / never-chained store), so **the closure is against an adversary who truncates
+     but does NOT delete the tail file** — deleting it defeats detection (the **same residual class as
+     anchor-deletion + full downgrade, §7 item 3a**). It **cannot** be closed by requiring the tail file's
+     presence: that would false-reject every legitimately never-cleanly-closed store. The invalidate-at-open
+     model **widens** the legitimate-absent window (the anchor is absent throughout any open session), which
+     is the same residual class (an attacker with write access to a *running* store's log was never in the
+     at-rest threat model). (c) **SQLite + microservice tiers** stay fully deferred until their seam is
+     filled.
 2. **`epochs.dat` MAC** — deferred (kept entry-CRC-only; §6).
 3. **Anchor deletion + full downgrade, and downgrade of a grandfathered topic.** The `logmac.anchor`
    file is the chain commitment (§3.2). Two transition-class residuals remain, both requiring a
@@ -329,7 +388,11 @@ it no longer exists at open) joins the shared residual list alongside whole-tail
 `epochs.dat` MAC, and anchor-deletion + full-downgrade: it is the topic-granularity form of the
 whole-tail-truncation residual (§7 item 1) and closes only with the same separable **sealed high-water
 anchor** (a store-level authenticated topic/tail index) — a chain-design property, identical for the
-file and SQLite backends, not a storage-backend bug. Verification: `run-durability-sqlite-mac-chain-test`
+file and SQLite backends, not a storage-backend bug. **Update (WP-DURABILITY-TAIL-ANCHOR-FILE):** for the
+**FILE** backend that sealed high-water anchor is now built (§7.1 as-built) — its authenticated topic-SET
+commitment closes whole-topic deletion there (a sealed topic absent at open ⇒ fail-closed); the **SQLite**
+backend's seam slot stays NIL, so its whole-topic-deletion residual stands until the follow-on WP fills the
+shared seam. Verification: `run-durability-sqlite-mac-chain-test`
 (tamper via DIRECT SQL: UPDATE payload/mac, DELETE row, REORDER via chain_seq swap; downgrade; KEEP_LAST
 reopen-repeatedly; epoch-boundary; grandfather; NIL-oracle regression) — both impls, Clasp first. The
 shared-enumerator lift is regression-guarded by `run-durability-mac-chain-test` case (8): a legacy-v2

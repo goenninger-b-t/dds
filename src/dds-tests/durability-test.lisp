@@ -4220,26 +4220,25 @@
                (let ((k2 (%tmp "ka-wrongk")))
                  (%check :mlc-wrong-key-store (%open-errs-p d k2)
                          "a v3 chain store opened with the WRONG key must fail closed")))
-             ;; (6) honest torn tail recovers; whole-frame tail truncation is the documented residual
+             ;; (6) honest torn tail STILL truncate-recovers (the anchor tolerates it); whole-frame tail
+             ;; truncation is now DETECTED by the sealed high-water tail anchor (ADR 0045 §7.1 — was the
+             ;; §7 residual, now CLOSED for the file tier).
              (let ((d (%tmp "tt-d")) (k (%tmp "tt-k")))
-               (%put-n d k 3)
+               (%put-n d k 3)                                            ; close seals N=3, M_3
                (let ((sz (length (%read d k))))
                  (dds.durability::%truncate-file (%tlog d k) (- sz 4)))    ; tear the last frame's CRC
                (%check :mlc-torn-recover
                        (let ((s (%mk d k)))
-                         (dds.durability:store-open s)                   ; must NOT error
-                         (prog1 (= 2 (dds.durability:store-count s "T"))
-                           (dds.durability:store-close s)))
-                       "honest torn tail must truncate-recover to 2 records (no error)")
-               ;; residual (ADR 0045 §7): dropping a COMPLETE valid frame yields a shorter valid chain
+                         (dds.durability:store-open s)                   ; must NOT error (2 complete + a
+                         (prog1 (= 2 (dds.durability:store-count s "T")) ; torn partial → :torn tolerated)
+                           (dds.durability:store-close s)))              ; truncate-recover to 2, re-seal N=2
+                       "honest torn tail must truncate-recover to 2 records (anchor tolerates a torn partial frame)")
+               ;; FLIPPED (ADR 0045 §7.1): dropping a COMPLETE valid frame down to a clean-boundary prefix
+               ;; (1 < the sealed high-water N=2) now CONTRADICTS the anchor → fail-closed at open.
                (let ((fs (truncate (length (%read d k)) 2)))
                  (dds.durability::%truncate-file (%tlog d k) fs)
-                 (%check :mlc-tail-truncation-residual
-                         (let ((s (%mk d k)))
-                           (dds.durability:store-open s)                 ; opens CLEAN — NOT detected
-                           (prog1 (= 1 (dds.durability:store-count s "T"))
-                             (dds.durability:store-close s)))
-                         "documented residual (ADR 0045 §7): malicious whole-frame tail truncation is NOT detected")))
+                 (%check :mlc-tail-truncation-detected (%open-errs-p d k)
+                         "malicious whole-frame tail truncation below the sealed high-water is DETECTED (fail-closed)")))
              ;; (7) multi-topic legacy coexistence (the review regression): a DORMANT legacy-v2 topic A
              ;; (written by a bare file store, no anchor) + a born-chained v3 topic B in ONE store must
              ;; reopen CLEAN — A is grandfathered (exempt), never false-rejected — while B still
@@ -4307,6 +4306,183 @@
                  (dds.durability:store-close s))
                (%check :mlc-mapless-grandfather-opens (not (%open-errs-p d k))
                        "a legacy-v2 topic with a LOST topics.map still grandfathers by RAW tid → reopens clean (lift-regression guard)")))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))))
+  t)
+
+(defun* run-durability-tail-anchor-test ()
+    (function () t)
+  "WP-DURABILITY-TAIL-ANCHOR-FILE (ADR 0045 §7.1 + §9 + §2): the sealed high-water tail anchor closes the
+   whole-tail-truncation / whole-topic-drop / whole-store-rollback residuals for the FILE tier. The anchor
+   commits per-topic (N = v3-count, M_N = tail chain-MAC) + the topic-SET, MAC'd under the log-MAC key into
+   a SEPARATE mutable D/logmac.tail, sealed at CLEAN CLOSE, verified at OPEN by PREFIX-CONTAINMENT.
+   (1) CRASH-APPEND CLEAN (the load-bearing no-false-reject): seal N, append MORE frames without re-sealing
+       (skip-seal debug flag = a crash before re-seal), reopen ⇒ CLEAN (a forward extension past the
+       committed prefix — a naive current-tail==anchor-tail check would false-reject here).
+   (2) WHOLE-TOPIC-DROP DETECTED: seal a 2-topic store, delete a whole topic log, reopen ⇒ fail-closed
+       (the sealed topic is absent — count 0 < N).
+   (3) ANCHOR-TAMPER DETECTED: flip a byte in logmac.tail's own MAC (CRC recomputed so only the keyed MAC
+       is left), reopen ⇒ fail-closed (the anchor's own MAC mismatch).
+   (4) WHOLE-STORE-ROLLBACK DETECTED (§2): advance the anchor to N, restore an OLDER (fewer-record) log
+       snapshot, reopen ⇒ fail-closed (count < N).
+   (5) NEVER-CLEANLY-CLOSED opens CLEAN (documented): a store whose close skipped the seal (crash before
+       the first seal ⇒ no logmac.tail) reopens clean — the anchor only protects SEALED prefixes."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [durability-tail-anchor] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-tail-anchor-test t)))
+  (let ((g0   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 5))
+        (dirs '())
+        (pay  (lambda (i)
+                (let ((v (make-array 8 :element-type '(unsigned-byte 8))))
+                  (dotimes (j 8 v) (setf (aref v j) (logand (+ (* i 16) j) #xFF)))))))
+    (labels ((%tmp (tag)
+               (let ((d (uiop:merge-pathnames*
+                         (make-pathname :directory
+                                        (list :relative (format nil "dds-ta-~a-~a-~a"
+                                                                tag (get-universal-time)
+                                                                (random 1000000))))
+                         (uiop:temporary-directory))))
+                 (push d dirs)
+                 d))
+             (%mk (d k)
+               (dds.durability:make-encrypted-store
+                (dds.durability:make-file-store :dir d)
+                (dds.dare:make-file-key-provider :dir k)
+                :epoch-dir d))
+             (%tlog (d k topic)
+               (merge-pathnames (make-pathname :directory '(:relative "topics")
+                                               :name (%enc-topic-tid d k topic) :type "log")
+                                d))
+             (%read-bytes (path)
+               (with-open-file (s path :element-type '(unsigned-byte 8))
+                 (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                   (read-sequence v s) v)))
+             (%write-bytes (path bytes)
+               (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede :if-does-not-exist :create)
+                 (write-sequence bytes s)))
+             (%put-topic (s topic base n)
+               (dotimes (i n) (dds.durability:store-put s topic g0 (+ base i 1) nil :data (funcall pay (+ base i)))))
+             (%put-n (d k n)
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (%put-topic s "T" 0 n)
+                 (dds.durability:store-close s)))
+             (%open-errs-p (d k)
+               (let ((s (%mk d k)))
+                 (handler-case (progn (dds.durability:store-open s)
+                                      (ignore-errors (dds.durability:store-close s)) nil)
+                   (error () t))))
+             (%tail-path (d)
+               (dds.durability::%logmac-tail-path (uiop:ensure-directory-pathname d))))
+      (unwind-protect
+           (progn
+             ;; (1) CRASH-APPEND CLEAN — the no-false-reject crux
+             (let ((d (%tmp "ca-d")) (k (%tmp "ca-k")))
+               (%put-n d k 5)                                       ; session1: close seals N=5, M_5
+               (let ((dds.durability::*durability-debug-skip-tail-seal* t))
+                 (let ((s (%mk d k)))
+                   (dds.durability:store-open s)                    ; verify N=5 vs 5-frame log → CLEAN
+                   (%put-topic s "T" 5 3)                           ; append SN 6,7,8 (log now 8 frames)
+                   (dds.durability:store-close s)))                 ; SKIP re-seal → anchor STAYS N=5 (stale)
+               (%check :ta-crash-append-clean
+                       (let ((s (%mk d k)))
+                         (dds.durability:store-open s)              ; verify N=5 vs 8-frame log → forward extension
+                         (prog1 (= 8 (dds.durability:store-count s "T"))
+                           (dds.durability:store-close s)))
+                       "crash-append: appending past the sealed high-water opens CLEAN (forward extension, NO false-reject)"))
+             ;; (2) WHOLE-TOPIC-DROP DETECTED
+             (let ((d (%tmp "wtd-d")) (k (%tmp "wtd-k")))
+               (let ((s (%mk d k)))
+                 (dds.durability:store-open s)
+                 (%put-topic s "A" 0 2)
+                 (%put-topic s "B" 0 2)
+                 (dds.durability:store-close s))                    ; seals {A→(2,·), B→(2,·)}
+               (%check :ta-2topic-control
+                       (not (%open-errs-p d k))
+                       "non-vacuous control: the sealed 2-topic store reopens clean")
+               (delete-file (%tlog d k "A"))                        ; drop the WHOLE topic-A log
+               (%check :ta-whole-topic-drop-detected (%open-errs-p d k)
+                       "whole-topic drop: a sealed topic absent at open is DETECTED (fail-closed)"))
+             ;; (3) ANCHOR-TAMPER DETECTED — flip a byte in logmac.tail's own MAC, fix the CRC
+             (let ((d (%tmp "at-d")) (k (%tmp "at-k")))
+               (%put-n d k 3)
+               (let* ((tp (%tail-path d))
+                      (b  (%read-bytes tp))
+                      (sz (length b))
+                      (mac-byte (- sz 20)))                         ; a byte inside the anchor-mac field
+               (setf (aref b mac-byte) (logxor (aref b mac-byte) #xFF))
+               (dds.durability::%put-u32-le b (- sz 4) (dds.durability::%crc32 b 0 (- sz 4)))
+               (%write-bytes tp b))
+               (%check :ta-anchor-tamper-detected (%open-errs-p d k)
+                       "anchor-tamper: flipping logmac.tail's MAC (CRC fixed) is DETECTED by the keyed MAC (fail-closed)"))
+             ;; (4) WHOLE-STORE-ROLLBACK DETECTED — restore an older (fewer-record) log under the newer anchor
+             (let ((d (%tmp "sr-d")) (k (%tmp "sr-k")))
+               (%put-n d k 3)                                       ; session1: 3 frames, seal N=3
+               (let ((old-log (%read-bytes (%tlog d k "T"))))       ; snapshot the 3-frame log
+                 (let ((s (%mk d k)))
+                   (dds.durability:store-open s)
+                   (%put-topic s "T" 3 2)                           ; append SN 4,5 → log 5 frames
+                   (dds.durability:store-close s))                  ; anchor advances to N=5
+                 (%write-bytes (%tlog d k "T") old-log))            ; ROLL BACK the log to the 3-frame snapshot
+               (%check :ta-whole-store-rollback-detected (%open-errs-p d k)
+                       "whole-store rollback: an older (fewer-record) log under the newer anchor (count<N) is DETECTED"))
+             ;; (5) NEVER-CLEANLY-CLOSED opens CLEAN (documented — only running-chain protection)
+             (let ((d (%tmp "nc-d")) (k (%tmp "nc-k")))
+               (let ((dds.durability::*durability-debug-skip-tail-seal* t))
+                 (let ((s (%mk d k)))
+                   (dds.durability:store-open s)
+                   (%put-topic s "T" 0 3)
+                   (dds.durability:store-close s)))                 ; skip-seal ⇒ no logmac.tail ever written
+               (%check :ta-never-closed-opens-clean
+                       (and (not (probe-file (%tail-path d)))
+                            (let ((s (%mk d k)))
+                              (dds.durability:store-open s)
+                              (prog1 (= 3 (dds.durability:store-count s "T"))
+                                (dds.durability:store-close s))))
+                       "never-cleanly-closed (no logmac.tail) opens clean — the anchor only protects sealed prefixes"))
+             ;; (6) F1 REGRESSION — an AUTHORIZED reclaim-shrink of a KEEP_LAST encrypted store followed
+             ;; by a crash (no clean re-seal) must reopen CLEAN, not fail-closed (BRICK). The seal counts
+             ;; PHYSICAL v3 frames; the KEEP_LAST physical-reclaim path (%reclaim-deleted-topic ->
+             ;; %rewrite-topic-log) atomically shrinks the on-disk log to fewer re-seeded frames mid-session;
+             ;; seal-on-close-only would leave the anchor committing the pre-reclaim N. The invalidate-at-open
+             ;; fix (delete logmac.tail after verify, before the sweep/puts mutate the log) makes it clean.
+             (let ((d (%tmp "f1-d")) (k (%tmp "f1-k"))
+                   (kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xAB)))
+               (let ((dds.durability::*compaction-superseded-threshold* 5))
+                 ;; session A: KEEP_LAST 1, 5 superseding keyed puts (pending-delete 4 < threshold 5 ⇒ NO
+                 ;; reclaim); the physical log keeps all 5 frames; clean close seals N=5.
+                 (let ((s (%mk d k)))
+                   (dds.durability:store-open s :keep-last 1)
+                   (dotimes (i 5) (dds.durability:store-put s "T" g0 (1+ i) kh :data (funcall pay i)))
+                   (dds.durability:store-close s))
+                 (let ((size-a (with-open-file (fin (%tlog d k "T") :element-type '(unsigned-byte 8))
+                                 (file-length fin))))
+                   ;; session B: reopen KEEP_LAST 1 (verify 5==5 clean, then INVALIDATE), keep putting so
+                   ;; pending-delete crosses the threshold ⇒ %reclaim-deleted-topic COMMITS an on-disk shrink;
+                   ;; then "crash" (skip-seal ⇒ no re-seal). The at-rest log is now SHORTER than the sealed N=5.
+                   (let ((dds.durability::*durability-debug-skip-tail-seal* t))
+                     (let ((s (%mk d k)))
+                       (dds.durability:store-open s :keep-last 1)
+                       (dotimes (i 2) (dds.durability:store-put s "T" g0 (+ 6 i) kh :data (funcall pay (+ 6 i))))
+                       (dds.durability:store-close s)))
+                   (let ((size-b (with-open-file (fin (%tlog d k "T") :element-type '(unsigned-byte 8))
+                                   (file-length fin))))
+                     (%check :ta-f1-reclaim-shrank (< size-b size-a)
+                             (format nil "F1 setup non-vacuous: the authorized reclaim must SHRINK the physical log below the sealed N (~d -> ~d bytes)"
+                                     size-a size-b))
+                     ;; session C: reopen KEEP_LAST 1 -> must OPEN CLEAN (the anchor was invalidated at B's
+                     ;; open; skip-seal ⇒ never re-sealed ⇒ absent), NOT fail-closed. Before the fix this
+                     ;; reclaim-shrink+crash BRICKED the store (stale anchor N=5 vs a shorter log).
+                     (%check :ta-f1-reclaim-crash-opens-clean
+                             (let ((s (%mk d k)))
+                               (handler-case (progn (dds.durability:store-open s :keep-last 1)
+                                                    (ignore-errors (dds.durability:store-close s)) t)
+                                 (error () nil)))
+                             "F1: an authorized reclaim-shrink + crash reopens CLEAN (no false-reject / brick)"))))))
         (dolist (d dirs)
           (when (uiop:directory-exists-p d)
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))))

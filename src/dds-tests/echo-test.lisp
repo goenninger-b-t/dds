@@ -3979,6 +3979,7 @@
                  ("durability-fsync-directory"        . run-durability-fsync-directory-test)
                  ("durability-frame-version"          . run-durability-frame-version-test)
                  ("durability-mac-chain"              . run-durability-mac-chain-test)
+                 ("durability-tail-anchor"            . run-durability-tail-anchor-test)
                  ("durability-store-dir-perms"        . run-durability-store-dir-perms-test)
                  ("durability-process-persistent-refuse" . run-durability-process-persistent-refuse-test)
                  ("durability-origins-cap"            . run-durability-origins-cap-test)
