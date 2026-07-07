@@ -8095,3 +8095,336 @@
                   "microservice backend without a port signals (DPERSIST_MS_PORT required)"))
       (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
   t)
+
+(defun* run-durability-microservice-reconnect-test ()
+    (function () t)
+  "WP-DURABILITY-MS-RECONNECT (ADR 0050 §4.5, Slice 3c-1): the DARE-wrapped microservice CLIENT RECONNECTS +
+   retries idempotently across a server restart on the SAME port — a dropped connection no longer PERMANENTLY
+   bricks the client store (the Slice-1 dead-socket-in-the-conn-cell). encrypted-store(microservice-store(a
+   server FILE inner on disk D)), fixed port P:
+   (A) RECONNECT-AFTER-RESTART (headline): open, put A, get-range=[A]; STOP server1 (fsync D); START server2 on
+       the SAME P + SAME D (replays the opaque A); put B -> the client RECONNECTS to server2 and the put
+       SUCCEEDS. RED without the fix: the dead socket stays in the conn-cell -> put B fails permanently (brick).
+   (B) RECONNECT-RETRY-IDEMPOTENT: get-range=[A,B] byte-exact + ordered (B stored ONCE across the drop); close
+       the client; REOPEN a fresh client (same local epoch-dir/key-dir, server2) -> the v3 chain VERIFIES CLEAN
+       on open (no false-reject), count=2, A+B byte-exact — the put across the drop advanced the chain
+       post-confirm so the byte-identical retry neither duplicated, lost, nor corrupted the chain.
+   SKIPs if OpenSSL < 3.5 (the DARE-test pattern)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [microservice-reconnect] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-microservice-reconnect-test t)))
+  (let* ((sdir  (%tms-tmp-dir "recon-server"))
+         (cbase (%tms-tmp-dir "recon-client"))
+         (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) cbase))
+         (ga (%tms-guid 1)) (gb (%tms-guid 2)) (kha (%tms-guid 9)) (khb (%tms-guid 7))
+         (pa (%tms-payload 24 3)) (pb (%tms-payload 40 5)))
+    (labels ((%mk (port) (funcall (dds.durability:make-microservice-store-factory
+                                   :host "127.0.0.1" :port port :epoch-dir cbase :key-dir kdir))))
+      (unwind-protect
+          (let* ((srv1  (dds.durability:make-microservice-server
+                         :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+                 (port  (dds.durability:microservice-server-port srv1))
+                 (store (%mk port)))
+            (unwind-protect
+                (progn
+                  ;; --- session 1: open + put A against server1 ---
+                  (dds.durability:store-open store)
+                  (%check :ms-recon-put-a (eq t (dds.durability:store-put store "Square" ga 1 kha :data pa))
+                          "session1: put A succeeds against server1")
+                  (let ((ra (dds.durability:store-get-range store "Square")))
+                    (%check :ms-recon-a-present
+                            (and (= 1 (length ra)) (%tms-rec= (first ra) "Square" ga 1 kha :data pa))
+                            "session1: get-range=[A] byte-exact"))
+                  ;; --- restart: stop server1 (fsync D), start server2 on the SAME port + SAME D (replays A) ---
+                  (dds.durability:microservice-server-stop srv1)
+                  (let ((srv2 (dds.durability:make-microservice-server
+                               :port port :inner (dds.durability:make-file-store :dir sdir))))
+                    (unwind-protect
+                        (progn
+                          ;; (A) headline: put B must RECONNECT to server2 + succeed (RED = permanent brick)
+                          (%check :ms-recon-put-b-reconnects
+                                  (eq t (dds.durability:store-put store "Square" gb 2 khb :data pb))
+                                  "RECONNECT-AFTER-RESTART: put B across the drop reconnects to server2 + SUCCEEDS")
+                          (let ((rab (dds.durability:store-get-range store "Square")))
+                            (%check :ms-recon-ab-order
+                                    (equal '(1 2) (mapcar #'dds.durability:durable-record-sn rab))
+                                    "after reconnect: get-range=[A,B] (guid,sn)-ordered")
+                            (%check :ms-recon-ab-exact
+                                    (and (= 2 (length rab))
+                                         (%tms-rec= (first rab)  "Square" ga 1 kha :data pa)
+                                         (%tms-rec= (second rab) "Square" gb 2 khb :data pb))
+                                    "after reconnect: A stored ONCE + B byte-exact (no dup/loss)"))
+                          (dds.durability:store-close store)
+                          ;; (B) idempotent: reopen a fresh client -> chain verifies clean + count=2 + A once
+                          (let ((store2 (%mk port)))
+                            (handler-case
+                                (progn
+                                  (dds.durability:store-open store2)
+                                  (%check :ms-recon-reopen-count (= 2 (dds.durability:store-count store2 nil))
+                                          "RECONNECT-RETRY-IDEMPOTENT: reopen count=2 (chain verified CLEAN, A once)")
+                                  (let ((rr (dds.durability:store-get-range store2 "Square")))
+                                    (%check :ms-recon-reopen-exact
+                                            (and (= 2 (length rr))
+                                                 (%tms-rec= (first rr)  "Square" ga 1 kha :data pa)
+                                                 (%tms-rec= (second rr) "Square" gb 2 khb :data pb))
+                                            "reopen: A+B byte-exact across the reconnect (no corruption)"))
+                                  (dds.durability:store-close store2))
+                              (error (e)
+                                (ignore-errors (dds.durability:store-close store2))
+                                (%check :ms-recon-reopen-clean nil
+                                        (format nil "reopen after reconnect must verify the chain CLEAN, not brick: ~a" e))))))
+                      (dds.durability:microservice-server-stop srv2))))
+              (progn (ignore-errors (dds.durability:store-close store))
+                     (dds.durability:microservice-server-stop srv1))))
+        (progn
+          (when (uiop:directory-exists-p sdir) (uiop:delete-directory-tree sdir :validate t))
+          (when (uiop:directory-exists-p cbase) (uiop:delete-directory-tree cbase :validate t))))))
+  t)
+
+(defun* run-durability-microservice-reconnect-bare-test ()
+    (function () t)
+  "WP-DURABILITY-MS-RECONNECT (ADR 0050 §4.5, Slice 3c-1) — the BARE (non-DARE) reconnect gates, always run
+   (no OpenSSL needed):
+   (A) BARE RECONNECT-AFTER-RESTART: a bare microservice-store(server FILE inner D) on fixed port P collects a
+       5-record fixture; STOP server1 (fsync D); START server2 on the SAME P + SAME D (replays); an op then
+       RECONNECTS + recovers all records + a further put lands — the transport-level reconnect, DARE-free.
+   (B) SEND-SIDE-ERROR-CLEAN + NO-INFINITE-LOOP: with the server STOPPED (stays DOWN), an op fails with a CLEAN
+       dds.durability:microservice-store-error (the send-side raw tcp-send error no longer escapes — the
+       bounded single reconnect re-dials once, fails fast on ECONNREFUSED, surfaces cleanly) AND returns in
+       BOUNDED time (< 5 s — no hang / no infinite reconnect loop).
+   (C) BARE-DELETE-RETRY-TOLERATES-REJECTED: a bare delete whose server inner returns :UNSUPPORTED (-> the
+       server sends +ms-result-rejected+) is TOLERATED as success (T), not a false 'bad delete result' error —
+       so a reconnect-retry of a delete after the record is already gone never false-errors. Both impls."
+  ;; (A) bare reconnect after a same-port restart over a persistent file inner
+  (let ((sdir (%tms-tmp-dir "recon-bare-server")))
+    (unwind-protect
+        (let* ((srv1 (dds.durability:make-microservice-server
+                      :port 0 :inner (dds.durability:make-file-store :dir sdir)))
+               (port (dds.durability:microservice-server-port srv1))
+               (c    (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+          (unwind-protect
+              (progn
+                (dds.durability:store-open c)
+                (%tms-put-2topic-fixture c "A" "B")
+                (%check :ms-reconb-pre (= 5 (dds.durability:store-count c nil)) "bare session1 put 5")
+                (dds.durability:microservice-server-stop srv1)
+                (let ((srv2 (dds.durability:make-microservice-server
+                             :port port :inner (dds.durability:make-file-store :dir sdir))))
+                  (unwind-protect
+                      (progn
+                        ;; the count op RECONNECTS to server2 (RED without the fix: the dead socket bricks it)
+                        (%check :ms-reconb-recovers (= 5 (dds.durability:store-count c nil))
+                                "BARE RECONNECT-AFTER-RESTART: count reconnects to server2 + recovers 5")
+                        (%tms-verify-2topic-fixture c "A" "B" "bare-reconnect")
+                        ;; a further put lands on the reconnected connection (continued writes post-reconnect)
+                        (dds.durability:store-put c "A" (%tms-guid 20) 100 nil :data (%tms-payload 4 3))
+                        (%check :ms-reconb-put6 (= 6 (dds.durability:store-count c nil))
+                                "after reconnect: a further put lands (count 6)"))
+                    (dds.durability:microservice-server-stop srv2))))
+            (progn (ignore-errors (dds.durability:store-close c))
+                   (dds.durability:microservice-server-stop srv1))))
+      (when (uiop:directory-exists-p sdir) (uiop:delete-directory-tree sdir :validate t))))
+  ;; (B) send-side-clean + no-infinite-loop: server stays DOWN -> a clean, BOUNDED failure (no raw error, no hang)
+  (let* ((srv  (dds.durability:make-microservice-server :port 0 :inner (dds.durability:make-memory-store)))
+         (port (dds.durability:microservice-server-port srv))
+         (c    (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+    (dds.durability:store-open c)
+    (dds.durability:store-put c "T" (%tms-guid 1) 1 nil :data (%tms-payload 8 1))
+    (dds.durability:microservice-server-stop srv)                     ; peer gone + port freed (server down)
+    (let* ((t0 (get-internal-real-time))
+           (result (handler-case
+                       (progn (dds.durability:store-put c "T" (%tms-guid 1) 2 nil :data (%tms-payload 8 2))
+                              :no-error)
+                     (dds.durability:microservice-store-error () :clean)
+                     (error () :raw)))
+           (elapsed (/ (float (- (get-internal-real-time) t0)) internal-time-units-per-second)))
+      (%check :ms-reconb-clean (eq result :clean)
+              "SEND-SIDE-ERROR-CLEAN: an op against a down server signals a CLEAN microservice-store-error (no raw error escapes)")
+      (%check :ms-reconb-bounded (< elapsed 5.0)
+              (format nil "NO-INFINITE-LOOP: the op fails in BOUNDED time (~,2f s < 5 s, no hang)" elapsed)))
+    (ignore-errors (dds.durability:store-close c)))
+  ;; (C) bare delete tolerates +ms-result-rejected+ (the ONLY delete path yielding rejected: an :UNSUPPORTED inner)
+  (let ((inner (dds.durability:make-memory-store)))
+    (setf (dds.durability::durable-store-delete inner) nil)          ; store-delete -> :unsupported -> server sends rejected
+    (let* ((srv  (dds.durability:make-microservice-server :port 0 :inner inner))
+           (port (dds.durability:microservice-server-port srv))
+           (c    (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+      (unwind-protect
+          (progn
+            (dds.durability:store-open c)
+            (dds.durability:store-put c "T" (%tms-guid 1) 1 nil :data (%tms-payload 8 1))
+            (%check :ms-reconb-del-tolerates
+                    (eq t (dds.durability:store-delete c "T" (%tms-guid 1) 1))
+                    "BARE-DELETE-RETRY-TOLERATES-REJECTED: a delete that gets +ms-result-rejected+ returns T (no false-error)"))
+        (progn (ignore-errors (dds.durability:store-close c))
+               (dds.durability:microservice-server-stop srv)))))
+  ;; (D) OP-DURING-OUTAGE-RECOVERS (Fix 2): an op while the server is DOWN -> clean bounded error (sock left
+  ;;     NIL, NOT terminal); RESTART same port; the NEXT op RE-DIALS from the dropped state + succeeds.
+  (let* ((srv1 (dds.durability:make-microservice-server :port 0 :inner (dds.durability:make-memory-store)))
+         (port (dds.durability:microservice-server-port srv1))
+         (c    (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+    (unwind-protect
+        (progn
+          (dds.durability:store-open c)
+          (dds.durability:microservice-server-stop srv1)              ; server down
+          (%check :ms-outage-down-clean
+                  (eq :clean (handler-case (progn (dds.durability:store-count c nil) :no-error)
+                               (dds.durability:microservice-store-error () :clean)
+                               (error () :raw)))
+                  "op while server DOWN -> clean microservice-store-error (sock left NIL, not a raw error)")
+          (let ((srv2 (dds.durability:make-microservice-server :port port :inner (dds.durability:make-memory-store))))
+            (unwind-protect
+                (%check :ms-outage-recovers
+                        (integerp (dds.durability:store-count c nil))
+                        "OP-DURING-OUTAGE-RECOVERS: after restart, the next op RE-DIALS from the dropped state + succeeds (not terminal)")
+              (dds.durability:microservice-server-stop srv2))))
+      (ignore-errors (dds.durability:store-close c))))
+  ;; (E) RED knob (Fix 2): *durability-debug-ms-skip-redial-dropped* -> a dropped conn stays TERMINAL even
+  ;;     after the server returns (the pre-fix behavior), proving the re-dial-from-dropped is load-bearing.
+  (let* ((srv1 (dds.durability:make-microservice-server :port 0 :inner (dds.durability:make-memory-store)))
+         (port (dds.durability:microservice-server-port srv1))
+         (c    (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+    (unwind-protect
+        (let ((dds.durability::*durability-debug-ms-skip-redial-dropped* t))
+          (dds.durability:store-open c)
+          (dds.durability:microservice-server-stop srv1)              ; server down -> the op leaves sock NIL
+          (ignore-errors (dds.durability:store-count c nil))          ; op while down -> mid-op reconnect fails, sock NIL
+          (let ((srv2 (dds.durability:make-microservice-server :port port :inner (dds.durability:make-memory-store))))
+            (unwind-protect
+                (%check :ms-outage-red-terminal
+                        (eq :terminal (handler-case (progn (dds.durability:store-count c nil) :recovered)
+                                        (dds.durability:microservice-store-error () :terminal)))
+                        "RED (skip-redial): a dropped conn stays TERMINAL 'store is not open' even after the server returns")
+              (dds.durability:microservice-server-stop srv2))))
+      (ignore-errors (dds.durability:store-close c))))
+  t)
+
+(defun* run-durability-microservice-reconnect-exhausted-test ()
+    (function () t)
+  "WP-DURABILITY-MS-RECONNECT Fix 1 (ADR 0050 §4.5) — EXHAUSTED-RETRY-NO-FORK: a chained put whose reconnect-
+   retry EXHAUSTS (the server APPLIED the record but BOTH the original + the retry lost their ack) must NOT
+   fork the client chain on the next put of the same topic. Driven deterministically by
+   *durability-debug-ms-force-recv-drop*=2 (both R1 sends reach the server + it applies R1, both acks
+   'drop' -> R1 exhausts, T stale, client chain UNADVANCED, server holds R1@seq0). Then R2 on the same topic:
+   GREEN (the stale-topic re-sync fires) -> R2 chains from R1 -> the next open verifies CLEAN, count 2;
+   RED (*durability-debug-ms-skip-stale-resync*) -> R2 forks a 2nd chain_seq-0 -> the next open BRICKS
+   'chain MAC mismatch' -> proving the re-sync is load-bearing (no false-reject of honest data). DARE-wrapped
+   (skip if OpenSSL < 3.5)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [microservice-reconnect-exhausted] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-microservice-reconnect-exhausted-test t)))
+  (labels ((%reopen-result (skip-resync)
+             ;; drive the exhausted R1 + a following R2 (same topic) in one session, then reopen a fresh
+             ;; client: return (:clean n) if the reopen verifies the chain, or :brick if it fails-closed.
+             (let* ((cbase (%tms-tmp-dir "exh-client"))
+                    (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) cbase))
+                    (srv   (dds.durability:make-microservice-server :port 0 :inner (dds.durability:make-memory-store)))
+                    (port  (dds.durability:microservice-server-port srv)))
+               (flet ((%mk () (funcall (dds.durability:make-microservice-store-factory
+                                        :host "127.0.0.1" :port port :epoch-dir cbase :key-dir kdir))))
+                 (unwind-protect
+                     (let ((dds.durability::*durability-debug-ms-skip-stale-resync* skip-resync))
+                       (let ((store (%mk)))
+                         (dds.durability:store-open store)
+                         ;; R1: the server applies it but both the original + the reconnect-retry lose the ack
+                         (let ((dds.durability::*durability-debug-ms-force-recv-drop* 2))
+                           (handler-case
+                               (dds.durability:store-put store "T" (%tms-guid 1) 1 (%tms-guid 9) :data (%tms-payload 24 3))
+                             (dds.durability:microservice-store-error () :expected-exhaust)))
+                         ;; R2 same topic: GREEN re-syncs (chains from R1); RED skips (forks a 2nd seq-0)
+                         (dds.durability:store-put store "T" (%tms-guid 2) 2 (%tms-guid 9) :data (%tms-payload 24 5))
+                         (dds.durability:store-close store))
+                       (let ((store2 (%mk)))
+                         (handler-case
+                             (progn (dds.durability:store-open store2)
+                                    (let ((n (dds.durability:store-count store2 nil)))
+                                      (dds.durability:store-close store2)
+                                      (list :clean n)))
+                           (error () (ignore-errors (dds.durability:store-close store2)) :brick))))
+                   (progn (dds.durability:microservice-server-stop srv)
+                          (when (uiop:directory-exists-p cbase) (uiop:delete-directory-tree cbase :validate t))))))))
+    ;; GREEN: the re-sync fires -> no fork -> reopen CLEAN + count 2 (R1 applied-unacked + R2)
+    (let ((g (%reopen-result nil)))
+      (%check :ms-exh-green (and (consp g) (eq :clean (first g)))
+              (format nil "EXHAUSTED-RETRY-NO-FORK GREEN: reopen verifies CLEAN after the stale-resync (got ~s)" g))
+      (%check :ms-exh-green-count (and (consp g) (eql 2 (second g)))
+              (format nil "EXHAUSTED-RETRY GREEN: R1 (applied-unacked) + R2 both present, count=2 (got ~s)" g)))
+    ;; RED: skip the re-sync -> R2 forks a 2nd chain_seq-0 -> reopen BRICKS 'chain MAC mismatch'
+    (%check :ms-exh-red (eq :brick (%reopen-result t))
+            "EXHAUSTED-RETRY-NO-FORK RED (skip-stale-resync): R2 forks -> reopen BRICKS (the re-sync is load-bearing)"))
+  t)
+
+(defun* run-durability-microservice-reconnect-seal-test ()
+    (function () t)
+  "WP-DURABILITY-MS-RECONNECT Fix A + Fix B (ADR 0050 §4.5), DARE-wrapped (skip if OpenSSL < 3.5):
+   (A) SEAL-RESYNC-OR-SKIP: an apply-then-ack-lost PURGE (server purges topic T, both acks drop -> T's client
+       tail state is STALE) followed by a CLEAN close must NOT seal a stale (N, M_N) that bricks the next open.
+       GREEN: the seal resyncs T from the server (purged -> 0 -> T dropped from the seal) -> reopen CLEAN,
+       count 1 (the surviving topic U). RED (*durability-debug-ms-skip-stale-resync*): the stale (N, M_N) is
+       sealed -> the next open's tail-anchor prefix-verify fetches 0 records for T -> :truncated -> BRICK of a
+       store holding only HONEST data (a pre-existing worst-class false-reject this WP closes cheaply).
+   (B) SAME-OBJECT-CLOSE-REOPEN: a close->reopen of the SAME encrypted(microservice) store object works — the
+       decorator's PRE-open tail-anchor probe dials (%ms-dial clears closed-p) so its %ms-call is not refused."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [microservice-reconnect-seal] SKIP — OpenSSL >= 3.5 not available: ~a~%"
+              (dds.dare:dare-unavailable-reason c))
+      (return-from run-durability-microservice-reconnect-seal-test t)))
+  ;; ---- (A) apply-then-ack-lost PURGE + clean close: reopen must be CLEAN (GREEN) / BRICK (RED) ----
+  (labels ((%reopen (skip-resync)
+             (let* ((cbase (%tms-tmp-dir "seal-client"))
+                    (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) cbase))
+                    (srv   (dds.durability:make-microservice-server :port 0 :inner (dds.durability:make-memory-store)))
+                    (port  (dds.durability:microservice-server-port srv)))
+               (flet ((%mk () (funcall (dds.durability:make-microservice-store-factory
+                                        :host "127.0.0.1" :port port :epoch-dir cbase :key-dir kdir))))
+                 (unwind-protect
+                     (let ((dds.durability::*durability-debug-ms-skip-stale-resync* skip-resync))
+                       (let ((store (%mk)))
+                         (dds.durability:store-open store)
+                         (dds.durability:store-put store "T" (%tms-guid 1) 1 nil :data (%tms-payload 24 3))
+                         (dds.durability:store-put store "U" (%tms-guid 2) 2 nil :data (%tms-payload 24 5))
+                         ;; apply-then-ack-lost PURGE of T (server purges, both acks drop -> T stale + chain head kept)
+                         (let ((dds.durability::*durability-debug-ms-force-recv-drop-op* dds.durability::+ms-op-purge+)
+                               (dds.durability::*durability-debug-ms-force-recv-drop* 2))
+                           (handler-case (dds.durability:store-purge store "T")
+                             (dds.durability:microservice-store-error () :expected-exhaust)))
+                         (dds.durability:store-close store))       ; CLEAN close -> seal (GREEN reseals T; RED seals stale)
+                       (let ((store2 (%mk)))
+                         (handler-case
+                             (progn (dds.durability:store-open store2)
+                                    (let ((n (dds.durability:store-count store2 nil)))
+                                      (dds.durability:store-close store2)
+                                      (list :clean n)))
+                           (error () (ignore-errors (dds.durability:store-close store2)) :brick))))
+                   (progn (dds.durability:microservice-server-stop srv)
+                          (when (uiop:directory-exists-p cbase) (uiop:delete-directory-tree cbase :validate t))))))))
+    (let ((g (%reopen nil)))
+      (%check :ms-seal-green (and (consp g) (eq :clean (first g)))
+              (format nil "SEAL-RESYNC GREEN: apply-then-ack-lost purge + clean close -> reopen CLEAN (stale topic resync'd at seal) (got ~s)" g))
+      (%check :ms-seal-green-count (and (consp g) (eql 1 (second g)))
+              (format nil "SEAL-RESYNC GREEN: T purged (gone) + U survives -> count 1 (got ~s)" g)))
+    (%check :ms-seal-red (eq :brick (%reopen t))
+            "SEAL-RESYNC RED (skip-stale-resync): a stale (N, M_N) is sealed for the purged T -> reopen BRICKS :truncated (the seal-resync is load-bearing)"))
+  ;; ---- (B) same-object close -> reopen of an encrypted(microservice) store (FIX B) ----
+  (let* ((cbase (%tms-tmp-dir "sameobj-client"))
+         (kdir  (uiop:merge-pathnames* (make-pathname :directory '(:relative "keys")) cbase))
+         (srv   (dds.durability:make-microservice-server :port 0 :inner (dds.durability:make-memory-store)))
+         (port  (dds.durability:microservice-server-port srv)))
+    (unwind-protect
+        (let ((store (funcall (dds.durability:make-microservice-store-factory
+                               :host "127.0.0.1" :port port :epoch-dir cbase :key-dir kdir))))
+          (dds.durability:store-open store)
+          (dds.durability:store-put store "T" (%tms-guid 1) 1 nil :data (%tms-payload 24 3))
+          (dds.durability:store-close store)                       ; closed-p T + seals T's anchor
+          (dds.durability:store-open store)                        ; REOPEN the SAME object -> pre-open probe must work
+          (%check :ms-reopen-sameobj (eql 1 (dds.durability:store-count store nil))
+                  "SAME-OBJECT-CLOSE-REOPEN (Fix B): a close->reopen of the same encrypted(microservice) store works (count 1)")
+          (dds.durability:store-close store))
+      (progn (dds.durability:microservice-server-stop srv)
+             (when (uiop:directory-exists-p cbase) (uiop:delete-directory-tree cbase :validate t)))))
+  t)

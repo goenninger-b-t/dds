@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-07
-Work package: WP-DURABILITY-MICROSERVICE-1 (Slice 1) + WP-DURABILITY-MICROSERVICE-2 (Slice 2 — DARE-wrap) + WP-DURABILITY-MICROSERVICE-3A (Slice 3a — server-owned persistent inner + cross-restart + config-env seam) + WP-DURABILITY-MICROSERVICE-3B (Slice 3b — client-side remote-tier chain-MAC) + WP-DURABILITY-TAIL-ANCHOR-MS (sealed high-water tail anchor) + WP-DURABILITY-MS-RECLAIM-REMAC (Slice 3d — KEEP_LAST reclaim re-MAC over the wire, §4.4) (ADR 0021 capability 6 — the last of the owner's pluggable persistence tiers: file / db / MICROSERVICE — composed with capability 7, the always-on DARE)
+Work package: WP-DURABILITY-MICROSERVICE-1 (Slice 1) + WP-DURABILITY-MICROSERVICE-2 (Slice 2 — DARE-wrap) + WP-DURABILITY-MICROSERVICE-3A (Slice 3a — server-owned persistent inner + cross-restart + config-env seam) + WP-DURABILITY-MICROSERVICE-3B (Slice 3b — client-side remote-tier chain-MAC) + WP-DURABILITY-TAIL-ANCHOR-MS (sealed high-water tail anchor) + WP-DURABILITY-MS-RECLAIM-REMAC (Slice 3d — KEEP_LAST reclaim re-MAC over the wire, §4.4) + WP-DURABILITY-MS-RECONNECT (Slice 3c-1 — bounded client reconnect + idempotent retry, §4.5; HISTORY-QoS-over-the-wire descope, §4.2/§7) (ADR 0021 capability 6 — the last of the owner's pluggable persistence tiers: file / db / MICROSERVICE — composed with capability 7, the always-on DARE)
 Relates to: ADR 0021 (pluggable persistence vtable), ADR 0026 (file store, DARE at-rest), ADR 0045 (log-MAC chain), ADR 0049 (SQLite backend — the sibling "second implementation of the fixed vtable")
 
 ## 1. Context
@@ -229,24 +229,33 @@ separate process the operator runs; the driver is the durability **client**. (Th
 microservice interop is optional this slice; the config-env is proven structurally (the factory builds
 `encrypted-store(microservice-store)`, name `:encrypted-persistent`).
 
-**KNOWN LIMITATION (HISTORY QoS not forwarded — a Slice-3c gap for the live path).** The microservice
-inner tier's retention policy is **SERVER-configured** (`make-microservice-server`
-`:history-kind`/`:history-depth`, applied at server-start), **NOT forwarded from the client/service HISTORY
-QoS over the wire**: the shared dispatch's microservice branch does not pass `history-kind`/`depth` (unlike
-the sqlite/file branches), and `+ms-op-open` decodes them only to bounds-validate, then discards. So a
-durability service configured e.g. KEEP_LAST 5 against a **default keep-all** reference server
-**OVER-RETAINS** — a late joiner receives full history instead of newest-D per instance (a silent DDS
-DURABILITY_SERVICE/HISTORY QoS gap; **over-retention, NOT data-loss/false-reject**). The operator MUST
-configure the reference server's `:history-kind`/`:history-depth` to match the service's HISTORY QoS. This
-only bites the deferred **live 2-process** path (all in-process tests use keep-all and pass). **Forwarding
-the policy over the wire (so the service's HISTORY QoS drives the remote inner's retention) + a
-KEEP_LAST-through-microservice test are a REQUIRED Slice-3c item** (§7) — a durability service that silently
-ignores HISTORY QoS on a backend is a real QoS gap for the live path.
+**HISTORY-POLICY OWNERSHIP — the decorator owns retention; server-side HISTORY-QoS is DESCOPED (was the
+Slice-3a "known limitation", now corrected by WP-DURABILITY-MS-RECLAIM-REMAC + WP-DURABILITY-MS-RECONNECT).**
+The microservice inner tier's retention policy is **SERVER-configured** (`make-microservice-server`
+`:history-kind`/`:history-depth`, applied at server-start) and is deliberately **NOT forwarded from the
+client/service HISTORY QoS over the wire** — and, contrary to the earlier Slice-3a framing, that forwarding
+is **NOT REQUIRED; it is descoped as MOOT and, under DARE, WRONG.** Under the always-on DARE production
+composition `make-encrypted-store(make-microservice-store(…))` the **encrypted-store DECORATOR owns retention
+end-to-end**: it ALWAYS opens the inner **KEEP_ALL** (`store-encrypted.lisp:1343-1344` — "it cannot
+order/interpret the hashed surrogates"), LOGICALLY compacts newest-D on get-range (`%compact-topic-records`,
+`store-encrypted.lisp:1186`) and PHYSICALLY reclaims a keyed KEEP_LAST put's superseded surrogate
+(`%evict-prior-surrogates` `:1279-1280` → the §4.4 chained `store-delete` → `+ms-op-topic-rewrite+` survivor
+re-MAC) — **delivered and TESTED KEEP_LAST-through-microservice** (`run-durability-microservice-keep-last-
+reclaim-test`: newest-D + physical-1 reclaim + cross-restart). The reference **server MUST stay KEEP_ALL**:
+server-side HISTORY-QoS is **INERT** under DARE (the decorator seals with **key-hash NIL**,
+`store-encrypted.lisp:1272`, so the inner's per-instance KEEP_LAST never triggers) **AND WRONG** (a
+server-side eviction of a chained record would break the client's `%ms-verify-chain` → `:mismatch` → **brick**).
+So matching the reference server to a KEEP_LAST HISTORY QoS is not merely unnecessary, it is **AGAINST the
+decorator's model.** The **bare non-DARE microservice path** (no decorator) is not a production composition;
+HISTORY-QoS-over-the-wire forwarding is therefore **descoped**. (All in-process tests use keep-all and pass;
+the earlier "over-retention on the live 2-process path" concern is resolved by the decorator owning retention
+CLIENT-SIDE, independent of the server's policy.)
 
 **Deferred beyond 3a:** the client-side v3 chain-MAC over the remote tier (**Slice 3b** — remote-untrusted-
-store sequence integrity, §4.1); HISTORY-QoS-over-the-wire forwarding (**Slice 3c**, REQUIRED — the
-known-limitation above); graceful reconnect / multi-client concurrency / chunked large get-range /
-DoS-hardening (**Slice 3c**). The DARE crypto + the bounds-checked wire parser are unchanged.
+store sequence integrity, §4.1); multi-client concurrency / chunked large get-range / DoS-hardening
+(**Slice 3c**). Graceful reconnect is now **BUILT** (§4.5, WP-DURABILITY-MS-RECONNECT); HISTORY-QoS-over-the-
+wire forwarding is **DESCOPED** (the decorator owns retention, above). The DARE crypto + the bounds-checked
+wire parser are unchanged.
 
 ### 4.3 Slice 3b — client-side remote-tier chain-MAC (WP-DURABILITY-MICROSERVICE-3B, BUILT)
 
@@ -393,6 +402,122 @@ reopen CLEAN, no partial-topic brick). `run-durability-microservice-remote-chain
 whole-topic-drop-still-detected arm. Both impls **497 → 498 passed** (Clasp first, then SBCL; DARE available so
 all arms executed, not skipped), identical.
 
+### 4.5 Slice 3c-1 — bounded client reconnect + idempotent retry (WP-DURABILITY-MS-RECONNECT, BUILT)
+
+Slice 1–3d connected once at open and **never reconnected**: on a dropped connection (server restart /
+network blip) the dead socket **stayed in the conn-cell**, so every later op re-failed against the corpse —
+a durability tier whose whole point is a **restartable central store** was permanently bricked by any server
+restart. A **send-side wart** compounded it: `tcp-send` signals a plain error, but `%ms-call`'s handler
+translated only `microservice-protocol-error`, so a send-side drop **escaped as a raw generic error**,
+violating the one-clean-error contract. Slice 3c-1 fixes both, **client-side only — zero wire-protocol change,
+zero server change** (the reference server already holds **zero per-session state**: `+ms-op-open` is a
+policy-confirm no-op, `+ms-op-close` an ack, so re-establishment is just a re-dial).
+
+**The conn-cell becomes a struct.** The bare `(sock)` cons is replaced by a small `ms-conn` `defstruct*`
+carrying **`host` + `port` + `sock`** (the dial coordinates, set once at store construction), so `%ms-call` /
+`%ms-exchange` can RE-DIAL — the host/port previously lived only in the `:open`/fetch closures and never
+reached `%ms-call`. Access stays under the store lock (unchanged discipline).
+
+**Bounded single reconnect + idempotent retry.** `%ms-exchange` translates BOTH drop signals — a failed send
+(the wart) and a server-closed read (`%ms-recv-message` NIL) — to a new **`microservice-conn-lost`** (a
+**subtype** of `microservice-store-error`, so existing handlers still catch it, but distinguishable). On
+`microservice-conn-lost`, `%ms-call` **closes+clears** the dead socket, **re-dials ONCE** (`%ms-reconnect`:
+one short bounded backoff then `tcp-connect host:port`), and **retries the op ONCE**. A second consecutive
+drop, or a failed re-dial (server still down → fast `ECONNREFUSED`), surfaces a clean `microservice-store-error`
+— a **bounded** single reconnect, never an unbounded loop or a hang (a full read-idle timeout stays a later
+Slice-3c item; here the re-dial to a down port fails fast). A non-drop server error (bad status) is **not**
+retried.
+
+**Idempotent-retry safety (the correctness crux).** The retry re-invokes both `build-fn` and `decode-fn`,
+which is safe because every op is idempotent AND advances client chain/put-index state **only in `decode-fn`
+after a confirmed response**:
+
+- **put** — chain state (`chain-macs`/`chain-seqs`/`put-index`) advances post-confirm, so a retry recomputes
+  the **byte-identical** folded frame (same `prev`/`seq`) and re-ships it; the server INSERT-OR-IGNOREs by
+  `(guid,sn)` (`store.lisp:241`). Even if the original put **succeeded but its response was lost**, the retry
+  re-sends, the server ignores the dup, returns success, and the client advances exactly once.
+- **chained delete / topic-rewrite** (`%ms-delete-rechain`) — the fetch is read-only; the rewrite replaces the
+  **same survivor set** (idempotent); state advances post-confirm. The 2-step is safe to retry whole (the
+  decorator's lock serializes it), and each `%ms-call` inside also reconnects independently.
+- **purge** — idempotent; **count/get-range/topics** — read-only.
+- **bare `:delete`** — a retry after the record is already gone must **tolerate `+ms-result-rejected+`** (the
+  record is gone = the delete's goal); the decode now treats a post-delete rejected as success (T) instead of
+  a false "bad delete result". (In practice the standard memory/file/SQLite inners return T on an absent
+  delete, so a delete-retry gets `+ms-result-t+`; `+ms-result-rejected+` on a delete arises **only** from an
+  inner with **no `:delete` slot** — `store-delete` → `:unsupported` → the server maps it to rejected. The
+  tolerance is a defensive idempotency hardening, proven by a test that forces the rejected path.)
+- The **single-retry** path does NOT re-run chain verification (the client chain state is authoritative for
+  a retry-succeeds). The **double-failure** (exhausted-retry) is the exception — see below.
+
+**Double-failure (exhausted-retry) + availability (Fix 1 + Fix 2, they interact).** The single-retry safety
+above covers the retry-SUCCEEDS leg. Two follow-on findings (adversarial review) — both **newly reachable
+BECAUSE the session now survives a drop** (on the pre-fix base, a dropped socket bricked the store, masking
+them) — are fixed together:
+
+- **Fix 1 — exhausted-retry chain divergence → later-open false-reject brick (the worst class).** If a
+  *chained* put's original AND its reconnect-retry both drop while the server APPLIED the record (an
+  apply-then-ack window), the client chain state stays **unadvanced** while the server holds the record. The
+  session survives (the whole point of the WP), so the next put of the same topic chains from the **seed**
+  again → **two records claim `chain_seq` 0** → the next open's `%ms-verify-chain` (or the sealed tail anchor,
+  `:diverged`) **fails-closed on honest data** — a permanent false-reject **brick**, violating ADR 0045's
+  no-false-reject invariant. **Fix:** a per-store **STALE-TOPICS** set — when `%ms-call` exhausts for a
+  chain-mutating op (chained put / topic-rewrite / oracle-purge), the topic is marked STALE; before the next
+  chained mutation of a stale topic, `%ms-resync-if-stale` FORCE-re-syncs the client chain state from the
+  server (`%ms-resync-topic`: get-range + **clear-then**-`%ms-verify-chain`, so a purged/empty topic stays
+  cleared) — re-learning whether the exhausted op was applied (server has it → `chain-seqs` advances; server
+  empty → stays 0). The next mutation then chains from **ground truth** → no fork → no brick, regardless of
+  the exhausted op's fate. The re-sync is DEFERRED to the next chained op (at exhaustion time the server is
+  unreachable); it reuses `%ms-get-range-verified`'s machinery (no wire change, no new crypto). This is the
+  one **targeted** mid-session re-verify — the common single-retry path still does not re-verify.
+- **Fix 2 — op-during-outage recovery (availability; interacts with Fix 1).** `%ms-reconnect` leaves `sock`
+  NIL on a failed re-dial. Before Fix 2, `%ms-call` then refused **every** later op ("store is not open")
+  with no re-dial — TERMINAL: an op *during* an outage (the common case under write load) permanently
+  disabled the store even after the server returned. **Fix:** `ms-conn` distinguishes **DROPPED**
+  (`sock` NIL but `ever-connected-p` — the connection was established then dropped) from **CLOSED** (`closed-p`,
+  set only by `%ms-close`) and **never-opened**. `%ms-call` RE-DIALS once from the DROPPED state on the next
+  op (bounded), so an op-during-outage recovers when the server returns; only an explicitly-closed or
+  never-opened store is terminal. **Why both together:** Fix 2 *widens* Fix 1 — once ops re-dial from
+  dropped-NIL, the server-restart flavor of the Fix-1 collision becomes reachable, so Fix 1's stale-topic
+  re-sync MUST be in place.
+- **Fix A — seal never commits a stale/diverged `(N, M_N)` (a pre-existing worst-class brick closed cheaply
+  by the stale-topics machinery).** An apply-then-ack-lost **PURGE** or **TOPIC-REWRITE** followed by a clean
+  close with NO further chained mutation on that topic sealed a **stale** `(N, M_N)` — `:chain-tails-fn`
+  ignored `stale-topics`. The next open's tail-anchor prefix-verify then **bricked HONEST data** (`:truncated`
+  for a purge-applied → 0 server records; `:truncated`/`:diverged` for a rewrite-applied shrink below the
+  sealed N). Reachable at BASE (a single ack-lost drop, no reconnect — the exhausted-PUT+close flavor is CLEAN
+  because prefix-containment tolerates forward growth, so only purge/rewrite-**shrink** needed this). **Fix:**
+  `%ms-reseal-stale-topics` runs in `:chain-tails-fn` BEFORE the seal maphash — for each STALE topic it PREFERS
+  to `%ms-resync-topic` from the server (a clean close means the server is reachable → the correct `(N, M_N)`,
+  with a purged topic clearing its head → not sealed), and FALLS BACK to SKIPPING the topic from the seal (its
+  head dropped) if it can't be resync'd (server unreachable, or a genuine tamper). Either way **no
+  stale/diverged value is ever sealed → no false-reject brick**; the narrow protection gap heals at the
+  topic's next successful mutation + re-seal (a genuine tamper is still caught by store-open's own verify).
+  Non-stale topics are untouched (`store-chain-tails` byte-identical for them).
+- **Fix B (introduced NIT) — same-object close→reopen.** With a sealed anchor, a close→reopen of the SAME
+  encrypted(microservice) store object failed loudly: the decorator runs `%verify-tail-anchor` (its `%ms-fetch-
+  tuples` probe) BEFORE `store-open`, and the probe's `%ms-call` was refused by the `closed-p` guard because
+  `%ms-open`'s `closed-p` clear ran too late for the pre-open probe. **Fix:** `%ms-dial` clears `closed-p` (a
+  successful dial re-establishes the connection → the store is usable), so the pre-open probe's dial re-arms
+  the store. (Latent in shipped flows — the tests reopen a fresh store object — but now covered by a test.)
+
+**Tests** (`run-durability-microservice-reconnect-test`, DARE-wrapped, skip if OpenSSL < 3.5;
+`run-durability-microservice-reconnect-bare-test`, bare, always runs; `run-durability-microservice-reconnect-
+exhausted-test` + `run-durability-microservice-reconnect-seal-test`, DARE-wrapped): **RECONNECT-AFTER-RESTART**
+(encrypted, a file inner on the SAME disk + SAME port across a `microservice-server-stop`/restart — put across
+the drop reconnects + succeeds; **RED without the fix: permanent brick**); **RECONNECT-RETRY-IDEMPOTENT** (put
+across the drop → stored ONCE + the chain verifies CLEAN on the next open); **EXHAUSTED-RETRY-NO-FORK** (Fix 1 —
+a chained put whose retry EXHAUSTS while the server applied it, then a 2nd put on the topic → the stale-resync
+fires → reopen CLEAN + count 2; **RED via `*durability-debug-ms-skip-stale-resync*`: R2 forks → reopen bricks**,
+driven by `*durability-debug-ms-force-recv-drop*`); **SEAL-RESYNC-OR-SKIP** (Fix A — an apply-then-ack-lost
+PURGE + clean close → reopen CLEAN; **RED via `*...-skip-stale-resync*`: the stale `(N, M_N)` is sealed → reopen
+bricks `:truncated`**); **SAME-OBJECT-CLOSE-REOPEN** (Fix B); **OP-DURING-OUTAGE-RECOVERS** (Fix 2 — a
+down-server op fails cleanly, then after restart the next op re-dials + succeeds; **RED via
+`*durability-debug-ms-skip-redial-dropped*`: terminal 'store is not open'**); **BARE RECONNECT-AFTER-RESTART**;
+**SEND-SIDE-ERROR-CLEAN**; **NO-INFINITE-LOOP** (a down server fails in bounded time, no hang);
+**BARE-DELETE-RETRY-TOLERATES-REJECTED**. Both impls **502 → 503 passed** (Clasp first, then SBCL; DARE
+available so all arms executed), identical; gate-hotpath + gate-types PASS; SBOM unchanged. No new crypto, no
+new dependency, no reader conditionals outside `dds-pal`.
+
 ## 5. Files
 
 - `src/dds-pal/pal-contract.lisp` — export the `tcp-*` block.
@@ -409,7 +534,18 @@ all arms executed, not skipped), identical.
   the server functions are byte-identical. **Slice 3d (§4.4):** the chained `:delete` becomes
   `%ms-delete-rechain` (get-range + drop + `%ms-rechain-survivors` re-MAC + `+ms-op-topic-rewrite+` op),
   the server gains the `+ms-op-topic-rewrite+` opaque-replace branch, and `*durability-debug-ms-skip-reclaim-remac*`
-  is the RED knob.
+  is the RED knob. **Slice 3c-1 (§4.5):** the conn-cell becomes an `ms-conn` `defstruct*`
+  (host/port/sock + `ever-connected-p` + `closed-p`) + the `%ms-dial` (clears `closed-p` on a successful dial
+  — Fix B) / `%ms-ensure-connected` / `%ms-reconnect` / `%ms-resync-topic` / `%ms-resync-if-stale` /
+  `%ms-reseal-stale-topics` helpers + the `microservice-conn-lost` condition + `*ms-reconnect-backoff-seconds*`
+  + the `stale-topics` set; `%ms-exchange` translates send/recv drops to `microservice-conn-lost`, `%ms-call`
+  does the bounded reconnect+retry-once **and re-dials from the DROPPED state (Fix 2)**, the chained put /
+  purge / `%ms-delete-rechain` **mark stale on exhaustion + re-sync before the next mutation (Fix 1)**, the
+  `:chain-tails-fn` seal **resyncs-or-skips stale topics (Fix A)** so no diverged `(N, M_N)` is committed, and
+  the bare `:delete` tolerates `+ms-result-rejected+`. Five test-only knobs
+  (`*durability-debug-ms-force-recv-drop*` [+ `*...-drop-op*`] / `*...-skip-stale-resync*` /
+  `*...-skip-redial-dropped*`). The factory docstring's HISTORY-QoS "known limitation" is rewritten to the
+  **descope** (the decorator owns retention; server stays KEEP_ALL). Client-side only — server byte-identical.
 - `src/dds-durability/store.lisp` — **Slice 3d** the additive NIL-fallback `store-replace-topic` dispatcher
   + `replace-topic-fn` vtable slot (the fallback is `store-purge` + bulk `store-put`).
 - `src/dds-durability/store-file.lisp` — **Slice 3d** the atomic `:replace-topic-fn` slot (reuses
@@ -442,6 +578,10 @@ all arms executed, not skipped), identical.
   `run-durability-microservice-keep-last-reclaim-test` (brick-repro → CLEAN + RED knob + server-DARE-blind +
   sustained tamper-evidence + cross-restart re-MAC + crash-fault-mid-replace rollback; skips if OpenSSL < 3.5),
   and `run-durability-microservice-remote-chain-test` gains a reclaim + whole-topic-drop-still-detected arm.
+  **Slice 3c-1 (§4.5):** `run-durability-microservice-reconnect-test` (DARE-wrapped reconnect-after-restart +
+  idempotent-retry-chain-verify; skips if OpenSSL < 3.5) + `run-durability-microservice-reconnect-bare-test`
+  (bare reconnect-after-restart + send-side-error-clean + no-infinite-loop + bare-delete-tolerates-rejected;
+  always runs) — the fixed-port restart via ephemeral-then-reuse (SO_REUSEADDR).
 
 ## 6. Consequences
 
@@ -481,6 +621,17 @@ all arms executed, not skipped), identical.
   `%sqlite-verify-topic` shape (no new crypto, no new dep). Verify-on-open is fail-closed. Residual (deferred,
   = file/SQLite): tail-truncation + whole-topic-drop → ADR 0045 §7 anchor. Both impls green identically, Clasp
   first: Suite 493 → 494 (`durability-microservice-remote-chain`).
+- **Slice 3c-1 (WP-DURABILITY-MS-RECONNECT):** the client no longer bricks on a dropped connection — a server
+  restart / network blip triggers a **bounded single reconnect + idempotent retry** (§4.5), the send-side
+  raw-error wart is translated to the one clean `microservice-store-error`, an **exhausted-retry marks the
+  topic stale + re-syncs before the next chained mutation** (Fix 1: no chain fork → no false-reject brick), an
+  **op-during-outage re-dials** from the DROPPED state (Fix 2: no terminal "store is not open"), the **clean-
+  close seal resyncs-or-skips stale topics** (Fix A: an apply-then-ack-lost purge/rewrite never seals a
+  diverged `(N, M_N)` → no later-open false-reject brick — a pre-existing worst-class bug closed cheaply), and
+  a **same-object close→reopen works** (Fix B). **Client-side only; zero server / wire-protocol change** (the
+  server holds zero per-session state). HISTORY-QoS-over-the-wire forwarding is **descoped** (the decorator owns
+  retention; the server stays KEEP_ALL — §4.2/§7). Both impls green identically, Clasp first: Suite 499 → 503
+  (`durability-microservice-reconnect`, `...-bare`, `...-exhausted`, `...-seal`).
 
 ## 7. Scope — Slice 1 and the deferred slices
 
@@ -514,16 +665,30 @@ opaque frames via a new `+ms-op-topic-rewrite+` op + an additive NIL-fallback `s
 now reopens CLEAN through a physical reclaim; the server stays DARE-blind; tamper-evidence + the tail anchor
 still hold over the re-chained survivors.
 
+**Slice 3c-1 (built, §4.5):** bounded client reconnect + idempotent retry — the conn-cell becomes an
+`ms-conn` struct carrying host/port/sock; a dropped connection (server restart / network blip) triggers a
+BOUNDED single reconnect (close+clear+re-dial-once+retry-once, no unbounded loop / no hang) instead of the
+Slice-1 permanent brick; the send-side raw-error wart is translated to the one clean `microservice-store-error`
+(via `microservice-conn-lost`, a store-error subtype); every op is idempotent so a byte-identical retry cannot
+dup/lose/corrupt (put INSERT-OR-IGNORE + post-confirm chain advance; topic-rewrite same-survivor replace; bare
+delete tolerates `+ms-result-rejected+`). Client-side only, zero server / wire change (the server holds zero
+per-session state).
+
+**Descoped:**
+- **Slice 3c — HISTORY QoS over the wire (DESCOPED — MOOT under DARE, and WRONG).** Forwarding the
+  client/service HISTORY QoS (`history-kind`/`depth`) to the remote inner is **not required** and is
+  **descoped**: under the always-on DARE production composition the **encrypted-store decorator owns retention
+  CLIENT-SIDE** — it opens the inner KEEP_ALL, logically compacts newest-D on get-range, and physically
+  reclaims a keyed KEEP_LAST put's superseded surrogate via the §4.4 `store-delete`→`+ms-op-topic-rewrite+`
+  survivor re-MAC (delivered + TESTED KEEP_LAST-through-microservice). The server MUST stay KEEP_ALL:
+  server-side HISTORY-QoS is INERT under DARE (key-hash NIL) and WRONG (a server eviction of a chained record
+  bricks the client `%ms-verify-chain`). The bare non-DARE path is not a production composition. (This
+  supersedes the earlier Slice-3a "REQUIRED" framing; see §4.2.)
+
 **Deferred:**
-- **Slice 3c — HISTORY QoS over the wire (REQUIRED, the §4.2 known-limitation).** Forward the
-  client/service HISTORY QoS (`history-kind`/`depth`) to the remote inner so the service's DURABILITY_SERVICE
-  HISTORY drives the remote retention (today it is SERVER-configured only, and a client KEEP_LAST vs a
-  keep-all server silently OVER-RETAINS on the live path). The survivor re-MAC prerequisite is now met
-  (Slice 3d, §4.4) — Slice 3c is the wire-forwarding of the policy itself. Not optional — a durability backend
-  that silently ignores HISTORY QoS is a real QoS gap for the live path.
-- **Slice 3c — remaining production posture.** Graceful reconnect / error-recovery (Slice 1 surfaces a lost
-  server as a clean `microservice-store-error` and connects-on-open with no retry); multi-client concurrency
-  (the server serves one client at a time); framing for very large `get-range` responses beyond the
+- **Slice 3c — remaining production posture.** Multi-client concurrency (the server serves one client at a
+  time); a per-connection **read-idle timeout** (the reconnect is a bounded SINGLE re-dial + retry — §4.5 — but
+  a blocked-mid-response read still has no timeout); framing for very large `get-range` responses beyond the
   single-message `+ms-max-message+` ceiling (chunked/streamed); the `main.lisp` CLI `--backend` (the
   driver-env path already suffices); the full live 2-process microservice cross-DDS interop run.
 - **Slice 3c — DoS hardening (bounded, not a spin, in Slice 1; documented).** `%ms-recv-message` allocates
