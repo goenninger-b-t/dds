@@ -1301,6 +1301,19 @@ on a mid-compaction crash. The on-disk frame count **and** the in-memory index n
 under settling churn. The shared `settle-tally` / `%settle-tally-fold` (in `store.lisp`) is reused by the
 encrypted decorator's RAM window reclaim (§8.9, ADR 0025 §10.3), so the settle predicate is defined once.
 
+**Settle-tally count-exactness (WP-DURABILITY-SETTLE-COUNT-EXACT):** as first shipped the settle charged the
+instance's *entire* frame count into `super-pending`, while the KEEP_LAST supersession path had *already*
+charged +1 per superseded `:data` frame of that instance. For an instance FIRST superseded THEN settled, the
+overlapping superseded `:data` frames were counted **twice**, so the threshold was crossed slightly **early** —
+a marginally-more-frequent rewrite (a **safe over-count**: earlier compaction, tighter log, never data loss).
+The count is now **exact**: the `settle-tally` carries a `superseded` field the supersession path increments in
+lockstep with its `super-pending` charge, and the settle contributes only `frames − superseded`, so each
+reclaimable frame is charged **exactly once** (both fields reset on charge, so a resurrect → re-settle re-counts
+cleanly). The settle **predicate**, the pass-1 reclaim, and the rewrite / chain-MAC path are **unchanged** —
+only the count arithmetic changed. Pure churn (`≤ D` `:data`, no supersession) has no overlap, so it was already
+exact and is untouched (the bounded-on-disk headline stays green). Proven by
+`run-durability-settle-count-exact-test`.
+
 Tests: `run-durability-file-threshold-compaction-test` (bounded growth to `<= D + threshold` WITHOUT a
 reopen — RED pre-Sliver-2 = N=40; newest-D survive byte-exact; boundary → get-range = exactly D;
 below-threshold never rewrites; KEEP_ALL grows to N; two instances bounded, no loss),
@@ -1315,7 +1328,13 @@ RED→GREEN (N=50 distinct settling instances continuously open → on-disk + in
 RED = 3N via `*durability-debug-disable-settle-trigger*`); (B) no-false-reclaim (a live data-only instance
 and a settle-then-reregister instance both survive a settle-triggered compaction, get-range correct);
 (C) chain-MAC + crash-fault (a settle-triggered compaction of a keyed store reopens clean, and a fault
-mid-settle-compaction rolls back to the intact original log — no data loss).
+mid-settle-compaction rolls back to the intact original log — no data loss). Settle-count-exactness is
+proven by `run-durability-settle-count-exact-test`: (A) count-exact RED→GREEN — a superseded-then-settled
+instance's `super-pending` reaches exactly 7 (= all its frames, pinned by the threshold-7-fires /
+threshold-8-does-not pair) where the pre-fix double-count 11 fired **early** at threshold 8 (RED via
+`*durability-debug-double-count-settle*`); (B) no-under-count at scale — K superseded-then-settled instances
+stay bounded on disk (the exact trigger still fires, so the residual stays closed); (C) pure churn is
+identical under the exact fix and the double-count.
 
 #### 8.8.4 Encrypted-tier physical reclaim (WP-DURABILITY-ENCRECLAIM-SQLITE, Sliver 3a)
 

@@ -906,8 +906,16 @@
                            (tally (or (gethash key-hash st)
                                       (setf (gethash key-hash st) (%make-settle-tally)))))
                       (when (%settle-tally-fold tally kind)
-                        (let ((reclaim (settle-tally-frames tally)))
-                          (setf (settle-tally-frames tally) 0)   ; charge each frame at most once/rewrite
+                        ;; count-exactness (ADR 0029 §10.1): charge only the frames the supersede block did
+                        ;; NOT already charge (frames - superseded), so a superseded-THEN-settled instance's
+                        ;; overlapping :data frames count ONCE; the RED flag restores the pre-fix full-frame
+                        ;; double-count. Reset both so each frame charges at most once per rewrite window.
+                        (let ((reclaim (if *durability-debug-double-count-settle*
+                                           (settle-tally-frames tally)
+                                           (- (settle-tally-frames tally)
+                                              (settle-tally-superseded tally)))))
+                          (setf (settle-tally-frames tally) 0
+                                (settle-tally-superseded tally) 0)
                           (when (>= (incf (gethash tid super-pending 0) reclaim)
                                     *compaction-superseded-threshold*)
                             (%threshold-compact tid topic))))))
@@ -921,10 +929,18 @@
                                    (setf (gethash tid data-counts)
                                          (make-hash-table :test #'equalp))))
                            (c  (incf (gethash key-hash dc 0))))
-                      (when (and (> c (car eff-hd-cell))
-                                 (>= (incf (gethash tid super-pending 0))
-                                     *compaction-superseded-threshold*))
-                        (%threshold-compact tid topic))))
+                      (when (> c (car eff-hd-cell))
+                        ;; count-exactness (ADR 0029 §10.1): mark on this instance's settle-tally that the
+                        ;; supersede path charged this frame, so a later settle subtracts it (no double-count).
+                        ;; The tally exists — the settle block ran first this put — unless the settle trigger
+                        ;; is disabled (RED), where the count is moot.
+                        (let ((st (gethash tid settle-tallies)))
+                          (when st
+                            (let ((tally (gethash key-hash st)))
+                              (when tally (incf (settle-tally-superseded tally))))))
+                        (when (>= (incf (gethash tid super-pending 0))
+                                  *compaction-superseded-threshold*)
+                          (%threshold-compact tid topic)))))
                   t))))))
 
        :get-range

@@ -6728,6 +6728,106 @@
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))
       t)))
 
+;;; --- Settle-tally count-exactness (WP-DURABILITY-SETTLE-COUNT-EXACT, ADR 0029 §10.1) ---
+;;; The settled-instance-churn trigger folds a settled instance's reclaimable frame count into the SAME
+;;; per-topic super-pending counter the KEEP_LAST supersession path already feeds. For an instance FIRST
+;;; superseded (its old :data frames charged +1 each) THEN settled (all its frames charged by the settle),
+;;; the OVERLAPPING superseded :data frames were counted TWICE -> super-pending crossed the threshold EARLY
+;;; (a safe over-count: earlier compaction, never data loss). The fix charges each reclaimable frame ONCE
+;;; (the settle contributes frames-minus-already-superseded), so the trigger is EXACT. Trigger-only: the
+;;; settle predicate + pass-1 reclaim + rewrite/chain-MAC path are UNCHANGED (only the count arithmetic).
+
+(defun* run-durability-settle-count-exact-test ()
+    (function () t)
+  "Settle-tally count-exactness, FILE store (WP-DURABILITY-SETTLE-COUNT-EXACT, ADR 0029 §10.1): a
+   superseded-THEN-settled instance's overlapping :data frames are charged to *compaction-superseded-
+   threshold* EXACTLY once (each reclaimable frame once, whether reclaimable via KEEP_LAST supersession or
+   via settle). Pre-fix they were counted TWICE, crossing the threshold EARLY.
+   (A) COUNT-EXACT RED->GREEN — one instance (KEEP_LAST 1) writes M=5 :data (4 superseded) then dispose+
+       unregister (7 frames). The EXACT super-pending at the settle is 7 (every frame once); the RED double-
+       count is 11 (4 supersession + 7 full settle). At threshold 8 the RED double-count COMPACTS EARLY
+       (on-disk -> 0) while the EXACT count does NOT (on-disk stays 7); at threshold 7 the EXACT count fires
+       at EXACTLY 7 (on-disk -> 0) — pinning super-pending to 7 (no over- AND no under-count).
+   (B) NO-UNDER-COUNT AT SCALE — K superseded-then-settled instances stay BOUNDED on disk (the exact trigger
+       still FIRES, just at the exact not the early threshold — the settled-instance-churn residual stays
+       CLOSED; an under-count would delay/skip compaction and re-open it).
+   (C) PURE-CHURN UNCHANGED — a no-supersession churn workload (M<=D) has NO overlap, so the exact fix and
+       the pre-fix double-count are IDENTICAL (the R3 bounded-on-disk headline is untouched)."
+  (let* ((g0  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 5))
+         (p   (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (khf (lambda (i) (let ((a (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+                            (setf (aref a 0) (mod i 256))
+                            (setf (aref a 1) (mod (floor i 256) 256))
+                            a)))
+         (dirs '()))
+    (labels ((%d (tag) (let ((d (%file-store-tmp-dir tag))) (push d dirs) d))
+             (%sup-settle (s topic kh base m)
+               ;; one superseded-THEN-settled instance: M :data (sns base..base+M-1) -> dispose -> unregister
+               (dotimes (j m)
+                 (dds.durability:store-put s topic g0 (+ base j) kh :data (funcall p (list (mod (+ base j) 256)))))
+               (dds.durability:store-put s topic g0 (+ base m)   kh :dispose    (funcall p '()))
+               (dds.durability:store-put s topic g0 (+ base m 1) kh :unregister (funcall p '())))
+             (%run-a (tag threshold double-count)
+               ;; ONE M=5 superseded-then-settled instance (KEEP_LAST 1) at THRESHOLD; return the on-disk frame count
+               (let ((dir (%d tag)))
+                 (let ((s (dds.durability:make-file-store :dir dir))
+                       (dds.durability:*compaction-superseded-threshold* threshold)
+                       (dds.durability::*durability-debug-double-count-settle* double-count))
+                   (dds.durability:store-open s :keep-last 1)
+                   (%sup-settle s "T" (funcall khf 1) 1 5)     ; sns 1..5 :data, 6 :dispose, 7 :unregister
+                   (prog1 (%file-store-log-count dir "T")
+                     (dds.durability:store-close s)))))
+             (%run-churn (tag double-count)
+               ;; K=10 PURE-churn instances (M=1<=D=1, NO supersession) at threshold 8; return on-disk frames
+               (let ((dir (%d tag)))
+                 (let ((s (dds.durability:make-file-store :dir dir))
+                       (dds.durability:*compaction-superseded-threshold* 8)
+                       (dds.durability::*durability-debug-double-count-settle* double-count))
+                   (dds.durability:store-open s :keep-last 1)
+                   (dotimes (i 10) (%sup-settle s "P" (funcall khf (+ 200 i)) (+ 2000 (* 10 i)) 1))
+                   (prog1 (%file-store-log-count dir "P")
+                     (dds.durability:store-close s))))))
+      (unwind-protect
+           (progn
+             ;; (A) COUNT-EXACT RED->GREEN + exact-boundary (pins super-pending == 7 == all frames, not 11)
+             (let ((green-hi (%run-a "cx-green-hi" 8 nil))   ; exact sp=7 (< 8)  -> NO compaction
+                   (red-hi   (%run-a "cx-red-hi"   8 t))     ; double sp=11 (>=8) -> compaction EARLY
+                   (green-lo (%run-a "cx-green-lo" 7 nil)))  ; exact sp=7 (>= 7)  -> compaction AT the exact count
+               (%check :cx-green-not-early (= 7 green-hi)
+                       (format nil "EXACT count: super-pending=7 (< threshold 8) must NOT compact early — all 7 frames stay on disk, got ~d"
+                               green-hi))
+               (%check :cx-red-early (= 0 red-hi)
+                       (format nil "RED double-count: super-pending=11 (>= threshold 8) compacts EARLY — settled instance dropped (on-disk 0), got ~d"
+                               red-hi))
+               (%check :cx-green-fires-at-exact (= 0 green-lo)
+                       (format nil "EXACT count fires at EXACTLY 7 (threshold 7) — no under-count, residual closes (on-disk 0), got ~d"
+                               green-lo)))
+             ;; (B) NO-UNDER-COUNT AT SCALE — bounded on disk (the exact trigger still fires)
+             (let* ((dir (%d "cx-scale")) (k 25) (m 3)
+                    (s (dds.durability:make-file-store :dir dir))
+                    (dds.durability:*compaction-superseded-threshold* 8))
+               (dds.durability:store-open s :keep-last 1)
+               (dotimes (i k) (%sup-settle s "S" (funcall khf (+ 100 i)) (+ 1000 (* 10 i)) m))
+               (let ((on-disk (%file-store-log-count dir "S")))
+                 (%check :cx-scale-bounded (<= on-disk 15)
+                         (format nil "the EXACT settle trigger still fires -> on-disk bounded (~~ threshold), got ~d" on-disk))
+                 (%check :cx-scale-not-unbounded (< on-disk (* k (+ m 2)))
+                         (format nil "on-disk (~d) must be << K*(M+2)=~d (the trigger did NOT under-count/skip compaction)"
+                                 on-disk (* k (+ m 2)))))
+               (dds.durability:store-close s))
+             ;; (C) PURE-CHURN UNCHANGED — no supersession -> the exact fix == the double-count (R3 headline untouched)
+             (let ((churn-off (%run-churn "cx-churn-off" nil))
+                   (churn-on  (%run-churn "cx-churn-on"  t)))
+               (%check :cx-purechurn-identical (= churn-off churn-on)
+                       (format nil "PURE churn (M<=D, no supersession): the exact fix and the double-count are IDENTICAL (no overlap) — exact=~d double=~d"
+                               churn-off churn-on))
+               (%check :cx-purechurn-bounded (< churn-off 30)
+                       (format nil "pure churn stays bounded on disk under the exact fix, got ~d" churn-off))))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))
+      t)))
+
 (defun* run-durability-store-dir-perms-test ()
     (function () t)
   "B4 (ADR 0026 §10.12): the store dir D is enforced/verified 0700, exactly like the key dir K.

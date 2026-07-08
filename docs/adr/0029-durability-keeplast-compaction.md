@@ -248,6 +248,27 @@ pass-1 exactly and the trigger only *counts* (the unchanged compaction does the 
 endlessly-distinct settling churn (test A, RED→GREEN via `*durability-debug-disable-settle-trigger*`). The
 shared detector (`settle-tally` / `%settle-tally-fold` in `store.lisp`) is reused by the encrypted decorator's
 RAM window reclaim (ADR 0025 §10.3), so the settle predicate is defined **once** (DRY).
+
+**Settle-tally count-exactness — RESOLVED (WP-DURABILITY-SETTLE-COUNT-EXACT).** As first shipped, the settle
+charge folded the instance's *entire* frame count into `super-pending`, while the KEEP_LAST supersession path
+had *already* charged +1 for each `:data` frame of that instance beyond depth D. For an instance FIRST
+superseded THEN settled, the overlapping superseded `:data` frames were therefore counted **twice**, so
+`super-pending` crossed `*compaction-superseded-threshold*` slightly **early** — a marginally-more-frequent
+rewrite (a **safe over-count**: earlier compaction, tighter log, never data loss; the R3-review OBSERVATION-1).
+The count is now **exact**: the `settle-tally` carries a `superseded` field the supersession path increments in
+lockstep with its `super-pending` charge, and the settle contributes only `frames − superseded`, so each
+reclaimable frame is charged to the threshold **exactly once** — whether it became reclaimable via supersession
+or via settle. Both `frames` and `superseded` reset together on a settle charge, so a resurrect→re-settle
+re-counts cleanly (`data-counts` is cumulative and would desync across a resurrect; the per-tally `superseded`
+does not). The settle **predicate**, the pass-1 reclaim, and the rewrite / chain-MAC / `tmp+fsync+rename` path
+are **UNCHANGED** — only the arithmetic feeding the threshold changed (trigger-only, as the residual close
+itself was). In the pure-churn scenario (each instance ≤ D `:data`, no supersession) there is no overlap, so
+the count was already exact and is **unchanged** (the §10.1 bounded-on-disk headline stays green). Proven by
+`run-durability-settle-count-exact-test`: (A) a superseded-then-settled instance — `super-pending`=7=all-frames,
+pinned by the threshold-7-fires / threshold-8-does-not pair, vs the pre-fix double-count 11 that fires **early**
+at threshold 8 (RED→GREEN via `*durability-debug-double-count-settle*`); (B) K superseded-then-settled instances
+stay bounded on disk — the exact trigger still fires, so no under-count delays/skips compaction and the residual
+stays closed; (C) pure churn is byte-for-count identical under the exact fix and the double-count.
 - **Parent-directory fsync** for the compaction rename across a power loss (shared follow-on with
   ADR 0026 §10). **RESOLVED** (WP-DURABILITY-HARDENING-BATCH): `%rewrite-topic-log` now calls
   `dds.pal:fsync-directory` after the compaction rename (and every other create/rename dirent — see
@@ -268,7 +289,8 @@ RAM window reclaim (ADR 0025 §10.3), so the settle predicate is defined **once*
 - `src/dds-durability/store.lisp` — `store-open` optional args + memory-store online eviction
 - `src/dds-durability/store.lisp` — settled-instance-churn detector (WP-DURABILITY-SETTLED-RECLAIM,
   §10.1): `settle-tally` / `%settle-tally-fold` (the shared pass-1-equal settle predicate, reused by
-  ADR 0025 §10.3), `*durability-debug-disable-settle-trigger*`
+  ADR 0025 §10.3), `*durability-debug-disable-settle-trigger*`; count-exactness
+  (WP-DURABILITY-SETTLE-COUNT-EXACT): the `settle-tally` `superseded` field + `*durability-debug-double-count-settle*`
 - `src/dds-durability/store-file.lisp` — `%compact-topic-records` pass 2 + `make-file-store`;
   Sliver 2 (§10.1): `*compaction-superseded-threshold*`, `*durability-debug-file-rewrite-fault*`,
   `%threshold-compact` / `%init-topic-counts` (make-file-store `:put`/`:open`), `%tmp-log-name-p`
@@ -282,6 +304,7 @@ RAM window reclaim (ADR 0025 §10.3), so the settle predicate is defined **once*
   `run-durability-keeplast-memory-test`; Sliver 2: `run-durability-file-threshold-compaction-test`,
   `run-durability-file-online-chain-test`, `run-durability-file-crash-consistency-test`;
   settled-instance-churn: `run-durability-settled-reclaim-test` (bounded-on-disk RED→GREEN,
-  no-false-reclaim, chain-MAC + crash-fault)
+  no-false-reclaim, chain-MAC + crash-fault); settle-count-exactness:
+  `run-durability-settle-count-exact-test` (count-exact RED→GREEN, no-under-count at scale, pure-churn unchanged)
 - `interop/durability-keeplast/` — cross-DDS restart-seed harness + captures (Leg 1 Connext
   M=302→2, Leg 2 Fast DDS M=134→2)

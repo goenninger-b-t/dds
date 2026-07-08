@@ -59,6 +59,7 @@
            #:run-durability-file-online-chain-test
            #:run-durability-file-crash-consistency-test
            #:run-durability-settled-reclaim-test
+           #:run-durability-settle-count-exact-test
            #:run-durability-compaction-test
            #:run-durability-seed-backpressure-test
            #:run-durability-seen-prune-test

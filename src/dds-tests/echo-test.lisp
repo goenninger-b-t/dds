@@ -3961,6 +3961,7 @@
                  ("durability-file-online-chain"  . run-durability-file-online-chain-test)
                  ("durability-file-crash-consistency" . run-durability-file-crash-consistency-test)
                  ("durability-settled-reclaim"    . run-durability-settled-reclaim-test)
+                 ("durability-settle-count-exact" . run-durability-settle-count-exact-test)
                  ("durability-compaction"        . run-durability-compaction-test)
                  ("durability-resurrection-compaction" . run-durability-resurrection-compaction-test)
                  ("durability-sync-delegation"   . run-durability-sync-delegation-test)

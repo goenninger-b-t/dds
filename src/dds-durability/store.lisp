@@ -30,16 +30,28 @@
    and the instance-windows entry count (encrypted) grow with the settled-instance count until reopen
    — so a test proves the bounded RED→GREEN. Never set in production code.")
 
+(defparameter *durability-debug-double-count-settle* nil
+  "Test-only RED control (ADR 0029 §10.1 — settle-tally count-exactness). NIL (default) ⇒ inert: the
+   file store's settle charge subtracts the frames the KEEP_LAST supersession path already counted
+   (SETTLE-TALLY-SUPERSEDED), so each reclaimable frame is charged to *compaction-superseded-threshold*
+   EXACTLY once. When non-NIL the settle charges the FULL frame count without the subtraction —
+   reproducing the pre-fix double-count of a superseded-THEN-settled instance's overlapping :data frames,
+   which crosses the threshold EARLY (compaction fires sooner than the true reclaimable count warrants).
+   A test toggles it to prove the count-exact RED→GREEN. Never set in production code.")
+
 (defstruct* (settle-tally (:constructor %make-settle-tally))
   "Per-instance put-time lifecycle tally for settle-triggered reclaim (ADR 0029 §10.1 / ADR 0025 §10.3).
    Mirrors the pass-1 settle predicate: DISPOSE-SEEN / UNREG-SEEN are sticky (ever-seen) flags, LAST-KIND
    is the most-recent record's kind (a tombstone last ⇒ settled). FRAMES counts records not yet charged
-   to a reclaim trigger (the file store's reclaimable count); COUNTED marks a settle already charged so a
-   redundant tombstone never double-charges."
+   to a reclaim trigger (the file store's reclaimable count); SUPERSEDED counts how many of those frames
+   the KEEP_LAST supersession path already charged to the SAME trigger, so the settle charges only
+   FRAMES-minus-SUPERSEDED and each reclaimable frame is counted exactly once (ADR 0029 §10.1 count-
+   exactness); COUNTED marks a settle already charged so a redundant tombstone never double-charges."
   (dispose-seen nil   :type boolean)
   (unreg-seen   nil   :type boolean)
   (last-kind    :data :type (member :data :dispose :unregister))
   (frames       0     :type (integer 0))
+  (superseded   0     :type (integer 0))
   (counted      nil   :type boolean))
 
 (defun* %settle-tally-fold (tally kind)
