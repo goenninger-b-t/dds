@@ -28,6 +28,11 @@ SBCL="$REPO/scripts/with-sbcl.sh"
 LOGS="$HERE/logs"
 mkdir -p "$LOGS"
 
+# The server driver start_server launches. LEG 1/2 use the direct-helper driver; LEG 3 swaps in the
+# OPERATOR CLI driver (durability-service-main --backend server) to prove the CLI entrypoint (both go
+# through the SAME shared %run-microservice-server, so both emit the MS-SERVER-* markers below).
+SERVER_DRIVER="${SERVER_DRIVER:-$HERE/driver-ms-server.lisp}"
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dms-2proc.XXXXXX")"
 # The store dirs are NOT pre-created: make-file-store / the encrypted epoch-dir + key-dir CREATE them
 # 0700 on first open (they fail-closed ASSERT 0700 on an already-existing dir, ADR 0026 §10.12) — a
@@ -92,7 +97,7 @@ wait_server_listening() {  # $1=log $2=secs  -> 0 listening / 1 (timeout or the 
 start_server() {  # $1=logfile ; sets SRV_PID + waits (bounded) for LISTENING
   local log="$1"
   DPERSIST_MS_PORT="$PORT" DPERSIST_MS_INNER="$SRV_INNER" DPERSIST_MS_HOST=127.0.0.1 \
-    "$SBCL" --load "$HERE/driver-ms-server.lisp" >"$log" 2>&1 &
+    "$SBCL" --load "$SERVER_DRIVER" >"$log" 2>&1 &
   SRV_PID=$!
   if wait_server_listening "$log" 75; then
     echo "  server process up (pid $SRV_PID) listening on 127.0.0.1:$PORT"
@@ -180,6 +185,44 @@ fi
 wait_pid_gone "$RC_PID" 15 || { kill -9 "$RC_PID" 2>/dev/null || true; }
 RC_PID=""
 stop_server "$SRV_LOG2"
+
+# ── LEG 3: server via the OPERATOR CLI entrypoint (durability-service-main --backend server) ────
+# Proves the operator-runnable CLI server mode (WP-DURABILITY-MS-SERVER-CLI, ADR 0050 §4.8): the server
+# is launched THROUGH durability-service-main (parse --backend server + dispatch to %run-microservice-
+# server), STOPPED (SIGTERM -> MS-SERVER-STOPPED), RESTARTED on the SAME port + inner dir (persisted
+# frames replay from disk), and a fresh GET client recovers them BYTE-EXACT — persistent + clean-stop +
+# restart, all via the CLI entrypoint. Fresh port + inner + client dirs so it is independent of LEG 1/2.
+echo "--- LEG 3: server via the CLI entrypoint (--backend server) + stop/restart + persistent recovery ---"
+SERVER_DRIVER="$HERE/driver-ms-server-cli.lisp"
+PORT="$(( 34000 + (RANDOM % 20000) ))"
+SRV_INNER="$WORK/server-inner-cli"
+CLI_D="$WORK/client-D-cli"
+CLI_K="$WORK/client-K-cli"
+
+SRV_LOG3="$LOGS/ms-2proc-server3-cli.log"
+start_server "$SRV_LOG3" || echo "  (CLI-entrypoint server failed to start)"
+
+PUT_LOG3="$LOGS/ms-2proc-put-cli.log"
+run_client put "$PUT_LOG3"
+if grep -qE "MS-PUT-DONE topic=[A-Za-z0-9]" "$PUT_LOG3"; then
+  echo "  PUT client persisted $N records via the CLI-launched server"
+else
+  fail "PUT client (CLI server) did not report MS-PUT-DONE"; tail -6 "$PUT_LOG3" 2>/dev/null | sed 's/^/    | /'
+fi
+
+echo "  stopping the CLI server (SIGTERM -> clean stop), then restarting on the SAME port + inner dir"
+stop_server "$SRV_LOG3"
+SRV_LOG3B="$LOGS/ms-2proc-server3b-cli.log"
+start_server "$SRV_LOG3B" || echo "  (CLI-entrypoint server failed to restart)"
+
+GET_LOG3="$LOGS/ms-2proc-get-cli.log"
+run_client get "$GET_LOG3"
+if grep -qE "MS-GET-OK topic=[A-Za-z0-9]" "$GET_LOG3"; then
+  echo "  *** LEG 3 PASS: CLI-entrypoint server persisted across stop+restart, GET client BYTE-EXACT ***"
+else
+  fail "GET client (CLI server restart) did not report MS-GET-OK"; tail -6 "$GET_LOG3" 2>/dev/null | sed 's/^/    | /'
+fi
+stop_server "$SRV_LOG3B"
 
 echo "=== 2-PROCESS MICROSERVICE INTEROP COMPLETE ==="
 if [ "$FAILED" -eq 0 ]; then

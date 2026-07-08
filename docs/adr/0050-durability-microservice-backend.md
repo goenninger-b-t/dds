@@ -224,8 +224,10 @@ reference server, while `dir`/`key-dir` stay the CLIENT-LOCAL DARE epoch-dir/key
 anything else → `make-persistent-store-factory` (the file default). `interop/durability-persistent/driver-
 collect.lisp` + `driver-serve.lisp` now read `DPERSIST_BACKEND` (`file`|`sqlite`|`microservice`) +
 `DPERSIST_MS_HOST` (default 127.0.0.1) + `DPERSIST_MS_PORT` and dispatch through it. The remote server is a
-separate process the operator runs; the driver is the durability **client**. (The `main.lisp` CLI
-`--backend` remains a Slice-3 follow-on — the driver-env path suffices.) The full live 2-process
+separate process the operator runs; the driver is the durability **client**. (Running that remote SERVER
+via the real CLI — `durability-service-main --backend server`, semantics B — is now SHIPPED, §4.9; the
+distinct `--backend file|sqlite|microservice` that would select the durability SERVICE's own client-side
+persistence backend, semantics A, remains a follow-on — the store-factory config-env path suffices.) The full live 2-process
 microservice interop is optional this slice; the config-env is proven structurally (the factory builds
 `encrypted-store(microservice-store)`, name `:encrypted-persistent`).
 
@@ -741,17 +743,64 @@ server entrypoint** (`make-microservice-server` appeared only in the store, test
   marker **followed by a real value** `port=<digits>` / `topic=<alnum>` a `FORMAT` directive can never
   produce, never the echoed form.) Live run: **ALL LEGS PASS** (both servers "stopped cleanly").
 
-**Optional `main.lisp --backend microservice` — DEFERRED (follow-on).** The map's optional operator-runnable
-CLI server mode is **not** taken this slice: `durability-service-main` builds a *service* (runner +
-supervisor), whereas a microservice *server* is a different entity (a listener over an inner store) — folding
-it in would balloon `main.lisp` with a parallel mode for little gain. The **`driver-ms-server.lisp` entrypoint
-is the shipped artifact**; a real `--backend microservice --port --inner-dir` mode remains a clean follow-on.
+**Optional `main.lisp --backend server` — RESOLVED (§4.9, WP-DURABILITY-MS-SERVER-CLI).** The map's optional
+operator-runnable CLI server mode was deferred this slice (`durability-service-main` built only a *service* —
+runner + supervisor — whereas a microservice *server* is a different entity, a listener over an inner store).
+It is now **taken as a follow-on** (§4.9): `durability-service-main --backend server` runs the DARE-blind
+server as a first-class CLI entrypoint, and — crucially — the server-run lifecycle is **factored into ONE
+shared `%run-microservice-server` helper** that BOTH the CLI mode AND `driver-ms-server.lisp` call, so the
+driver did **not** balloon `main.lisp` (no duplicated body; the concern that motivated the deferral is
+answered by the DRY factoring, not avoided).
 
 Both impls **513 → 514 passed** (Clasp first, then SBCL), identical (the `stop-wakes` gate; the pre-existing
 SUP-HOOK-CONTEXT supervisor-test flake is also folded in — the test now waits for the `:supervisor-shed` HOOK
 context, not the shed FLAG the hook races). The `run-microservice.sh` harness runs via the interop target /
 manually (like `run-autodiscover.sh`), not the unit `make test`. gate-hotpath + gate-types PASS; SBOM
 regenerated. No new crypto, no new dependency, no reader conditionals outside `dds-pal`.
+
+### 4.9 The operator server CLI entrypoint — `durability-service-main --backend server` (WP-DURABILITY-MS-SERVER-CLI, BUILT — resolves the §4.8 deferral)
+
+The §4.8 follow-on: make the DARE-blind microservice **SERVER** operator-runnable as a **first-class CLI
+entrypoint** (**semantics B** — run the KV server clients connect to, *not* select a client-side persistence
+backend), promoting the `driver-ms-server.lisp` pattern to production. **No wire-protocol change, no new
+crypto, no new dependency, no new CLI-arg library (reuses `main.lisp`'s existing hand-rolled arg-parsing), no
+reader conditionals outside `dds-pal`.**
+
+- **A second `durability-service-main` mode, additively.** A discriminator (`%durability-server-mode-p`,
+  scanned BEFORE `parse-durability-config`) selects server mode on **`--backend server`** (or env
+  `DDS_DURABILITY_BACKEND=server`); everything else stays the **default durability SERVICE mode, byte-for-byte
+  unchanged** (the existing `%parse-argv` / `parse-durability-config` are untouched — the service path just
+  moved into the `cond`'s else arm). `-h` / `--help` prints `durability-usage` (both modes).
+- **A sibling PURE parser, mirroring the existing style.** `parse-durability-server-config` (exported) walks
+  the server flags into a `server-config` struct with the SAME flag-loop + env-fallback + `%config-error`
+  idiom as `%parse-argv` (a `%config-parse-int` helper factors the repeated parse+range check — DRY):
+  `--host` (default `127.0.0.1`), `--port` (**REQUIRED**), `--inner-backend file|sqlite` (default `file`),
+  `--inner-dir` (**REQUIRED**), `--max-connections` (default 64), `--recv-timeout` (default 30 s). Every flag
+  has a `DDS_DURABILITY_*` env equivalent (matching `main.lisp`'s existing `DDS_DURABILITY_DOMAIN/...`
+  convention); precedence CLI > env > defaults. A missing required flag / bad value / unknown flag signals a
+  clean `durability-config-error` (an explicit, `(safety 0)`-independent manual check), never a crash.
+- **The DRY shared lifecycle — `%run-microservice-server`.** ONE helper runs the whole server lifecycle and is
+  called by BOTH the CLI mode AND `driver-ms-server.lisp` (updated to call it — its body was **not** copied
+  into `main.lisp`): build the **DARE-BLIND** persistent inner (`%make-server-inner`: `make-file-store` /
+  `make-sqlite-store` on `--inner-dir`, opened **`KEEP_ALL`, NO DARE key** — the server is DARE-blind, the
+  clients own the keys + retention, §4.2) → `make-microservice-server` on `--port` (0 = ephemeral) with the
+  cap + timeout → log `MS-SERVER-LISTENING port=P ...` (an operator line that is ALSO the harness readiness
+  marker) → **`:block t`** installs the SIGTERM/SIGINT handler, BLOCKS, then `microservice-server-stop` (the
+  clean §4.8 `tcp-shutdown` wake), logs `MS-SERVER-STOPPED port=P ... stopped cleanly`, `uiop:quit 0`;
+  **`:block nil`** returns the running server (in-process / testing).
+- **Gates (both impls, Clasp first).** Three new unit tests: `durability-server-mode-cli` (the headline —
+  `durability-service-main --backend server` `:block nil` STARTS + a client round-trips byte-exact +
+  `microservice-server-stop` drains CLEAN), `durability-server-mode-restart` (PERSISTENT + clean-stop +
+  RESTART on the same port + inner dir via the CLI entrypoint → a fresh client recovers byte-exact),
+  `durability-server-mode-config` (the full CLI parse + defaults + env fallback + CLI>env + the bad-args
+  battery → clean `durability-config-error` incl. `(safety 0)` + the `%durability-server-mode-p` discriminator
+  proving the SERVICE mode stays the default + `durability-usage` shows the server mode). The
+  `run-microservice.sh` harness gains **LEG 3** (SBCL-only, bounded, like `run-autodiscover.sh`): the
+  `driver-ms-server-cli.lisp` server launched **through the CLI entrypoint** persists across a live 2-process
+  stop+restart, GET byte-exact — **ALL LEGS PASS** (all servers "stopped cleanly").
+
+Both impls **519 → 522 passed** (Clasp FIRST then SBCL), identical; gate-hotpath (durability off the hot path)
++ gate-types PASS; SBOM unchanged (no new dependency). The §4.8 `main.lisp --backend` deferral is **RESOLVED**.
 
 ## 5. Files
 
@@ -1004,7 +1053,9 @@ recovery** (harness live run: ALL LEGS PASS, both servers stopped cleanly). The 
 (`shutdown(2)` `SHUT_RDWR`) replaces `microservice-server-stop`'s drain `tcp-close` as the serve-thread WAKE:
 portable (Linux + Darwin) recv-unblock that does NOT free the fd, so the socket owner does the single close —
 closing the Linux-no-wake stall AND the double-close TOCTOU (gate `run-durability-microservice-stop-wakes-test`).
-`main.lisp --backend microservice` remains a clean follow-on (the driver is the shipped entrypoint). Both impls
+The operator-runnable server CLI entrypoint (`durability-service-main --backend server`, semantics B) is now
+SHIPPED — see §4.9 (WP-DURABILITY-MS-SERVER-CLI): the `driver-ms-server.lisp` lifecycle was factored into a
+shared `%run-microservice-server` helper that both the CLI and the interop driver call. Both impls
 green identically, Clasp first: Suite 513 → 514.
 
 **Descoped:**
@@ -1020,8 +1071,10 @@ green identically, Clasp first: Suite 513 → 514.
 
 **Deferred:**
 - **Slice 3c — remaining production posture.** Framing for very large `get-range` responses beyond the
-  single-message `+ms-max-message+` ceiling (chunked/streamed); the `main.lisp` CLI `--backend` (the
-  driver-env path already suffices); the full live 2-process microservice cross-DDS interop run. (**Multi-client
+  single-message `+ms-max-message+` ceiling (chunked/streamed); the `main.lisp` CLI **semantics-A** `--backend
+  file|sqlite|microservice` (selecting the durability SERVICE's own client-side persistence backend — distinct
+  from the now-SHIPPED **semantics-B** `--backend server` server-mode entrypoint, §4.9; the store-factory
+  config-env path already suffices for A); the full live 2-process microservice cross-DDS interop run. (**Multi-client
   concurrency** is now **BUILT** — §4.7, WP-DURABILITY-MS-MULTICLIENT; the per-connection **read-idle timeout**
   a blocked-mid-response read lacked is **BUILT** — §4.6.)
 - **Slice 3c — DoS hardening (BUILT, §4.6, WP-DURABILITY-MS-DOS).** The three Slice-1 residuals are now closed:

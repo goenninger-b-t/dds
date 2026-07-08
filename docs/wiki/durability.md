@@ -216,19 +216,31 @@ permanently, stop the supervisor or the runner.
 ;; Signals DURABILITY-CONFIG-ERROR on malformed input (explicit, safety-level-independent)
 (dds.durability:parse-durability-config &key (argv '()) (env '()))
 
+;; PURE parse of the microservice-SERVER mode (--backend server; ADR 0050 §4.8) -> a SERVER-CONFIG
+(dds.durability:parse-durability-server-config &key (argv '()) (env '()))
+
+;; The full usage/help text (both modes); printed on --help/-h
+(dds.durability:durability-usage)
+
 ;; Main entrypoint (subprocess body or embedded start)
 ;; ARGV defaults to UIOP:COMMAND-LINE-ARGUMENTS when NIL
-;; BLOCK T = loop until killed; NIL = return (cons runner sup)
+;; BLOCK T = loop until killed; NIL = return (cons runner sup) [service] / the server [--backend server]
 (dds.durability:durability-service-main &key argv env (block t))
 ```
 
-CLI flags: `--domain N`, `--topic NAME:TYPE`, `--mode thread|process`,
-`--max-restarts N`, `--window-seconds N`, `--name S`.
-
+**Default mode (durability SERVICE)** — CLI flags: `--domain N`, `--topic NAME:TYPE`,
+`--mode thread|process`, `--max-restarts N`, `--window-seconds N`, `--name S`.
 Env vars: `DDS_DURABILITY_DOMAIN`, `DDS_DURABILITY_TOPICS` (comma-separated `NAME:TYPE`),
 `DDS_DURABILITY_MODE`, `DDS_DURABILITY_NAME`.
 
-Config precedence: CLI > env > defaults.
+**Microservice SERVER mode (`--backend server`, ADR 0050 §4.8, semantics B)** — run the DARE-blind
+persistent key-value server durability clients connect to as their microservice backend. CLI flags:
+`--host HOST` (default `127.0.0.1`), `--port PORT` (**required**), `--inner-backend file|sqlite`
+(default `file`), `--inner-dir DIR` (**required**), `--max-connections N` (default 64),
+`--recv-timeout SECONDS` (default 30). Env: `DDS_DURABILITY_BACKEND=server` +
+`DDS_DURABILITY_{HOST,PORT,INNER_BACKEND,INNER_DIR,MAX_CONNECTIONS,RECV_TIMEOUT}`. See §5.2 and §8.10.8.
+
+Config precedence: CLI > env > defaults. `--help` / `-h` prints the usage for both modes.
 
 ---
 
@@ -357,6 +369,34 @@ No reader conditional escapes `dds-pal/`.
 **Live proof:** `interop/graceful-shutdown/run-kill15.sh` — launches a PERSISTENT (DARE/file)
 service on both Clasp and SBCL, sends `kill -15`, and asserts: status 0, no SIGBUS.
 Result (2026-06-22): **both impls clean exit, no SIGBUS** (ADR 0026 §10 item 3 RESOLVED).
+
+### 5.2 Microservice SERVER mode (`--backend server`, ADR 0050 §4.8)
+
+Run the DARE-blind persistent microservice **server** — the KV server durability clients connect to as
+their microservice backend (§8.10) — as a first-class CLI entrypoint (semantics B: run the server, *not*
+select a client-side persistence backend):
+
+```
+sbcl --eval '(require :asdf)' \
+     --eval '(asdf:load-system :dds-durability)' \
+     --eval '(dds.durability:durability-service-main
+              :argv (list "--backend" "server"
+                          "--port" "8080"
+                          "--inner-backend" "file"        ; or "sqlite"
+                          "--inner-dir" "/var/lib/dds/ms-inner/"))'
+# logs:  MS-SERVER-LISTENING port=8080 — durability microservice server listening (inner: file /var/lib/dds/ms-inner/, host 127.0.0.1)
+# on SIGTERM/SIGINT:  MS-SERVER-STOPPED port=8080 — durability microservice server stopped cleanly
+```
+
+Or via env (`DDS_DURABILITY_BACKEND=server` + the `DDS_DURABILITY_{HOST,PORT,INNER_BACKEND,INNER_DIR,MAX_CONNECTIONS,RECV_TIMEOUT}` set).
+`--port` and `--inner-dir` are **required**; a missing/bad flag prints a clean `durability-config-error`, never a crash.
+The server is **DARE-blind**: the inner store is a **plain** `make-file-store` / `make-sqlite-store` opened
+`KEEP_ALL` with **no DARE key** — it holds only opaque frames; the connecting clients hold the DARE keys +
+the log-MAC chain (§8.10.2) and own retention. Clients point `make-microservice-store-factory :host :port`
+at it. The whole server-run lifecycle (build inner → listen → block-until-signal → clean stop) is the
+**shared `%run-microservice-server` helper** that `interop/durability-persistent/driver-ms-server.lisp`
+also calls (DRY). Stop is the clean §4.8 `tcp-shutdown` wake (§8.10.7): no hang, no leaked thread/socket.
+The default (no `--backend server`) durability SERVICE mode is unchanged.
 
 ---
 
@@ -1967,9 +2007,44 @@ interop/durability-persistent/run-microservice.sh    # LEG 1 PUT->GET + LEG 2 re
 ```
 
 The server is **DARE-BLIND** (it stores only opaque sealed frames; the client holds the DARE key + the
-log-MAC chain in its LOCAL epoch-dir/key-dir). An operator-runnable `main.lisp --backend microservice` CLI
-mode is a clean **follow-on** — the `driver-ms-server.lisp` entrypoint is the shipped artifact this slice.
-Both impls green identically, Clasp first (Suite **513 → 514**).
+log-MAC chain in its LOCAL epoch-dir/key-dir). An operator-runnable `main.lisp --backend server` CLI mode was
+a clean **follow-on** this slice — now **built** (§8.10.8). Both impls green identically, Clasp first
+(Suite **513 → 514**).
+
+### 8.10.8 The operator server CLI entrypoint — `durability-service-main --backend server` (WP-DURABILITY-MS-SERVER-CLI, ADR 0050 §4.9)
+
+The §8.10.7 follow-on, resolved: the DARE-blind microservice **server** is now operator-runnable as a
+**first-class CLI entrypoint** (semantics B — run the KV server clients connect to, *not* select a
+client-side persistence backend). `durability-service-main` gains a second mode, **additively** — the
+default durability SERVICE mode is byte-for-byte unchanged.
+
+```
+# run the server an operator hosts; clients point make-microservice-store-factory :host :port at it
+durability-service-main --backend server --port 8080 --inner-backend file --inner-dir /var/lib/dds/ms-inner/
+```
+
+- **Discriminator + PURE sibling parser.** `--backend server` (or env `DDS_DURABILITY_BACKEND=server`)
+  selects server mode (scanned before `parse-durability-config`, so the service parser is untouched);
+  `parse-durability-server-config` walks `--host` / `--port` (**required**) / `--inner-backend file|sqlite`
+  / `--inner-dir` (**required**) / `--max-connections` / `--recv-timeout` (+ `DDS_DURABILITY_*` env
+  equivalents, precedence CLI > env > defaults) into a `server-config`, mirroring the existing `%parse-argv`
+  flag-loop + `%config-error` idiom (no new CLI-arg library). Bad/missing args → a clean
+  `durability-config-error` (explicit, `(safety 0)`-independent); `--help` / `-h` prints `durability-usage`
+  (both modes). See §5.2.
+- **The DRY shared lifecycle.** `%run-microservice-server` runs the whole server lifecycle — build the
+  **DARE-BLIND** persistent inner (`make-file-store` / `make-sqlite-store` on `--inner-dir`, `KEEP_ALL`, **no
+  DARE key**) → `make-microservice-server` → log `MS-SERVER-LISTENING` → install the SIGTERM/SIGINT handler →
+  block → `microservice-server-stop` (the §8.10.7 clean `tcp-shutdown` wake) → log `MS-SERVER-STOPPED` →
+  `uiop:quit 0` — and is called by BOTH the CLI mode AND `interop/durability-persistent/driver-ms-server.lisp`
+  (updated to call it: no duplicated body). `:block nil` returns the running server (in-process/testing).
+- **Gates (both impls, Clasp first, Suite 519 → 522).** `durability-server-mode-cli` (STARTS + client
+  round-trip byte-exact + CLEAN stop), `durability-server-mode-restart` (PERSISTENT + clean-stop + RESTART
+  on the same port + inner dir via the CLI → byte-exact recovery), `durability-server-mode-config` (the full
+  CLI parse + defaults + env + CLI>env + the bad-args battery + the SERVICE-mode-unchanged discriminator +
+  `durability-usage`). `run-microservice.sh` gains **LEG 3** (SBCL-only, bounded): the
+  `driver-ms-server-cli.lisp` server launched through the CLI entrypoint persists across a live 2-process
+  stop+restart — GET byte-exact, ALL LEGS PASS. No wire/crypto/dependency change; no reader conditionals
+  outside `dds-pal`.
 
 ---
 

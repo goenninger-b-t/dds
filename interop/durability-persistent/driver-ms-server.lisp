@@ -17,24 +17,19 @@
 ;;;; Config (env vars): DPERSIST_MS_PORT (REQUIRED, the fixed listen port), DPERSIST_MS_INNER (REQUIRED, the
 ;;;; server-side persistent file-inner dir), DPERSIST_MS_HOST (default 127.0.0.1).
 
+;;;; NOTE (WP-DURABILITY-MS-SERVER-CLI, ADR 0050 §4.8 follow-on): the whole server-run lifecycle — build
+;;;; the DARE-blind persistent KEEP_ALL inner, bind the port, log MS-SERVER-LISTENING, block until
+;;;; SIGTERM/SIGINT, microservice-server-stop (clean §4.8 tcp-shutdown wake), log MS-SERVER-STOPPED, quit —
+;;;; now lives in the SHARED dds.durability::%run-microservice-server helper that durability-service-main's
+;;;; --backend server mode ALSO calls (DRY: one server-run entrypoint, no duplicated body). This driver is
+;;;; the direct-helper entrypoint; driver-ms-server-cli.lisp is the SAME server via the operator CLI.
+
 (asdf:load-system :dds-durability)
 
-(let* ((host  (or (uiop:getenv "DPERSIST_MS_HOST") "127.0.0.1"))
-       (port  (parse-integer (or (uiop:getenv "DPERSIST_MS_PORT")
-                                 (error "driver-ms-server: DPERSIST_MS_PORT is required"))))
-       (inner (or (uiop:getenv "DPERSIST_MS_INNER")
-                  (error "driver-ms-server: DPERSIST_MS_INNER (server file-inner dir) is required")))
-       (stop  (list nil))
-       (srv   (dds.durability:make-microservice-server
-               :host host :port port
-               :inner (dds.durability:make-file-store
-                       :dir (uiop:ensure-directory-pathname inner) :history-kind :keep-all))))
-  (format t "~%MS-SERVER-LISTENING port=~d host=~a inner=~a~%"
-          (dds.durability:microservice-server-port srv) host inner)
-  (force-output)
-  (dds.pal:install-signal-handler '(:term :int) (lambda () (setf (car stop) t)))
-  (loop until (car stop) do (sleep 0.2))
-  (dds.durability:microservice-server-stop srv)
-  (format t "~%MS-SERVER-STOPPED port=~d~%" port) (force-output)
-  (finish-output)
-  (uiop:quit 0))
+(let ((host  (or (uiop:getenv "DPERSIST_MS_HOST") "127.0.0.1"))
+      (port  (parse-integer (or (uiop:getenv "DPERSIST_MS_PORT")
+                                (error "driver-ms-server: DPERSIST_MS_PORT is required"))))
+      (inner (or (uiop:getenv "DPERSIST_MS_INNER")
+                 (error "driver-ms-server: DPERSIST_MS_INNER (server file-inner dir) is required"))))
+  (dds.durability::%run-microservice-server
+   :host host :port port :inner-backend :file :inner-dir inner :block t))

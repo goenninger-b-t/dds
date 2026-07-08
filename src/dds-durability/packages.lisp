@@ -24,6 +24,8 @@
            #:%restart-allowed-p
            #:durability-service-main
            #:parse-durability-config
+           #:parse-durability-server-config
+           #:durability-usage
            #:durability-config-error
            #:%spec->argv
            #:make-encrypted-store #:*dare-error-hook*

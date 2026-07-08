@@ -8322,6 +8322,174 @@
       (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
   t)
 
+(defun* run-durability-server-mode-cli-test ()
+    (function () t)
+  "WP-DURABILITY-MS-SERVER-CLI (ADR 0050 §4.8, semantics B): durability-service-main --backend server STARTS
+   the DARE-blind persistent microservice SERVER, a client round-trips byte-exact through it, and the server
+   STOPS cleanly. In-process: invoke the REAL CLI parse+dispatch (durability-service-main :block nil with the
+   argv an operator would pass) -> the running microservice-server; a bare make-microservice-store client
+   connects + put N -> get-range byte-exact + (guid,sn)-ordered; microservice-server-stop drains clean (the
+   same stop the SIGTERM handler calls — no hang/leak). File inner, both impls."
+  (let ((sdir (%tms-tmp-dir "srvcli")))
+    (unwind-protect
+        (let ((srv (let ((*standard-output* (make-broadcast-stream)))   ; silence the operator MS-SERVER log in-suite
+                     (dds.durability:durability-service-main
+                      :argv (list "--backend" "server" "--port" "0"
+                                  "--inner-backend" "file" "--inner-dir" (namestring sdir))
+                      :block nil))))
+          (%check :srvcli-is-server (dds.durability:microservice-server-p srv)
+                  "--backend server (block nil) returns a running microservice-server")
+          (unwind-protect
+              (let* ((port (dds.durability:microservice-server-port srv))
+                     (s  (dds.durability:make-microservice-store :host "127.0.0.1" :port port))
+                     (g1 (%tms-guid 1)) (g2 (%tms-guid 2))
+                     (p1 (%tms-payload 16 1)) (p2 (%tms-payload 40 2)) (empty (%tms-payload 0 0)))
+                (%check :srvcli-open (eq t (dds.durability:store-open s)) "client connects to the CLI-launched server")
+                (%check :srvcli-put1 (eq t (dds.durability:store-put s "Square" g1 1 nil :data p1))    "put Square/g1/1")
+                (%check :srvcli-put2 (eq t (dds.durability:store-put s "Square" g1 2 nil :data empty)) "put Square/g1/2 empty")
+                (%check :srvcli-put3 (eq t (dds.durability:store-put s "Square" g2 5 nil :dispose p2)) "put Square/g2/5")
+                (let ((r (dds.durability:store-get-range s "Square")))
+                  (%check :srvcli-order (equal '(1 2 5) (mapcar #'dds.durability:durable-record-sn r))
+                          "get-range (guid,sn)-ordered through the CLI server")
+                  (%check :srvcli-exact
+                          (and (= 3 (length r))
+                               (%tms-rec= (first r)  "Square" g1 1 nil :data    p1)
+                               (%tms-rec= (second r) "Square" g1 2 nil :data    empty)
+                               (%tms-rec= (third r)  "Square" g2 5 nil :dispose p2))
+                          "records byte-exact through the CLI-launched server"))
+                (dds.durability:store-close s)
+                (%check :srvcli-clean-stop (eq t (dds.durability:microservice-server-stop srv))
+                        "microservice-server-stop drains the CLI-launched server cleanly (no hang/leak)"))
+            (ignore-errors (dds.durability:microservice-server-stop srv))))    ; idempotent safety net
+      (when (uiop:directory-exists-p sdir) (uiop:delete-directory-tree sdir :validate t))))
+  t)
+
+(defun* run-durability-server-mode-restart-test ()
+    (function () t)
+  "WP-DURABILITY-MS-SERVER-CLI (ADR 0050 §4.8): the CLI-entrypoint server's persistent inner SURVIVES a
+   stop+restart. durability-service-main --backend server (file inner on dir D): open server1 (ephemeral
+   port P) -> a client puts N -> get byte-exact -> microservice-server-stop (fsync D). Restart server2 via
+   the SAME CLI entrypoint on the SAME port P + SAME dir D (replays the fsync'd frames) -> a FRESH client
+   recovers N byte-exact + (guid,sn)-ordered. Persistent + clean-stop + restart through the operator CLI,
+   both impls (the SBCL-only run-microservice.sh LEG 3 is the live 2-process analogue)."
+  (let ((sdir (%tms-tmp-dir "srvcli-restart")))
+    (labels ((run-server (port)
+               (let ((*standard-output* (make-broadcast-stream)))
+                 (dds.durability:durability-service-main
+                  :argv (list "--backend" "server" "--port" (princ-to-string port)
+                              "--inner-backend" "file" "--inner-dir" (namestring sdir))
+                  :block nil)))
+             (put-fixture (port)
+               (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+                 (dds.durability:store-open s)
+                 (dotimes (i 4)
+                   (dds.durability:store-put s "Square" (%tms-guid (1+ i)) (1+ i) nil :data (%tms-payload (+ 8 i) i)))
+                 (dds.durability:store-close s)))
+             (get-ok (port)
+               (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port)))
+                 (dds.durability:store-open s)
+                 (let ((r (dds.durability:store-get-range s "Square")))
+                   (dds.durability:store-close s)
+                   (and (= 4 (length r))
+                        (equal '(1 2 3 4) (mapcar #'dds.durability:durable-record-sn r))
+                        (loop for rec in r for i from 0
+                              always (%tms-rec= rec "Square" (%tms-guid (1+ i)) (1+ i) nil :data (%tms-payload (+ 8 i) i))))))))
+      (unwind-protect
+          (let* ((srv1 (run-server 0))
+                 (port (dds.durability:microservice-server-port srv1)))
+            (put-fixture port)
+            (%check :srvcli-restart-pre (get-ok port) "server1: N records byte-exact before restart")
+            (dds.durability:microservice-server-stop srv1)
+            (let ((srv2 (run-server port)))
+              (unwind-protect
+                  (%check :srvcli-restart-recover (get-ok port)
+                          "server2 (same port+dir via the CLI entrypoint) replays the persisted frames byte-exact")
+                (dds.durability:microservice-server-stop srv2))))
+        (when (uiop:directory-exists-p sdir) (uiop:delete-directory-tree sdir :validate t)))))
+  t)
+
+(defun* run-durability-server-mode-config-test ()
+    (function () t)
+  "WP-DURABILITY-MS-SERVER-CLI (ADR 0050 §4.8): server-mode CLI arg parsing + usage + the SERVICE mode stays
+   the default. parse-durability-server-config: full flags -> the SERVER-CONFIG slots; defaults
+   (host/inner-backend/max-connections/recv-timeout) when omitted; env fallback + CLI>env precedence; a
+   battery of BAD args (missing --port / missing --inner-dir / bad --inner-backend / non-integer --port /
+   --max-connections 0 / unknown flag) each signal a CLEAN durability-config-error (never a crash), incl. at
+   (safety 0). %durability-server-mode-p selects server mode ONLY for --backend server (a plain service argv
+   stays the default durability-service mode — no regression). durability-usage shows the server mode. PURE,
+   both impls."
+  (let ((cfg (dds.durability:parse-durability-server-config
+              :argv (list "--backend" "server" "--host" "10.0.0.7" "--port" "5555"
+                          "--inner-backend" "sqlite" "--inner-dir" "/tmp/x"
+                          "--max-connections" "9" "--recv-timeout" "3")
+              :env '())))
+    (%check :srvcfg-host (string= "10.0.0.7" (dds.durability::server-config-host cfg)) "--host parsed")
+    (%check :srvcfg-port (= 5555 (dds.durability::server-config-port cfg)) "--port parsed")
+    (%check :srvcfg-backend (eq :sqlite (dds.durability::server-config-inner-backend cfg)) "--inner-backend sqlite parsed")
+    (%check :srvcfg-dir (string= "/tmp/x" (dds.durability::server-config-inner-dir cfg)) "--inner-dir parsed")
+    (%check :srvcfg-maxconn (= 9 (dds.durability::server-config-max-connections cfg)) "--max-connections parsed")
+    (%check :srvcfg-recvto (= 3 (dds.durability::server-config-recv-timeout cfg)) "--recv-timeout parsed"))
+  (let ((cfg (dds.durability:parse-durability-server-config
+              :argv (list "--backend" "server" "--port" "6000" "--inner-dir" "/tmp/y") :env '())))
+    (%check :srvcfg-def-host (string= "127.0.0.1" (dds.durability::server-config-host cfg)) "default host 127.0.0.1")
+    (%check :srvcfg-def-backend (eq :file (dds.durability::server-config-inner-backend cfg)) "default inner-backend :file")
+    (%check :srvcfg-def-maxconn (= 64 (dds.durability::server-config-max-connections cfg)) "default max-connections 64")
+    (%check :srvcfg-def-recvto (= 30 (dds.durability::server-config-recv-timeout cfg)) "default recv-timeout 30"))
+  (let ((cfg (dds.durability:parse-durability-server-config
+              :argv '() :env '(("DDS_DURABILITY_PORT" . "7001") ("DDS_DURABILITY_INNER_DIR" . "/tmp/env")
+                               ("DDS_DURABILITY_INNER_BACKEND" . "sqlite") ("DDS_DURABILITY_HOST" . "192.168.1.5")))))
+    (%check :srvcfg-env-port (= 7001 (dds.durability::server-config-port cfg)) "env DDS_DURABILITY_PORT")
+    (%check :srvcfg-env-dir (string= "/tmp/env" (dds.durability::server-config-inner-dir cfg)) "env DDS_DURABILITY_INNER_DIR")
+    (%check :srvcfg-env-backend (eq :sqlite (dds.durability::server-config-inner-backend cfg)) "env DDS_DURABILITY_INNER_BACKEND")
+    (%check :srvcfg-env-host (string= "192.168.1.5" (dds.durability::server-config-host cfg)) "env DDS_DURABILITY_HOST"))
+  (let ((cfg (dds.durability:parse-durability-server-config
+              :argv (list "--backend" "server" "--port" "8080" "--inner-dir" "/tmp/cli")
+              :env '(("DDS_DURABILITY_PORT" . "9999") ("DDS_DURABILITY_INNER_DIR" . "/tmp/env")))))
+    (%check :srvcfg-cli-wins-port (= 8080 (dds.durability::server-config-port cfg)) "CLI --port overrides env")
+    (%check :srvcfg-cli-wins-dir (string= "/tmp/cli" (dds.durability::server-config-inner-dir cfg)) "CLI --inner-dir overrides env"))
+  (flet ((bad (argv)
+           (eq :err (handler-case
+                        (progn (dds.durability:parse-durability-server-config :argv argv :env '()) :ok)
+                      (dds.durability:durability-config-error () :err)))))
+    (%check :srvcfg-bad-noport (bad (list "--backend" "server" "--inner-dir" "/tmp/x")) "missing --port -> config-error")
+    (%check :srvcfg-bad-nodir (bad (list "--backend" "server" "--port" "5000")) "missing --inner-dir -> config-error")
+    (%check :srvcfg-bad-backend (bad (list "--backend" "server" "--port" "5000" "--inner-dir" "/x" "--inner-backend" "mongo"))
+            "bad --inner-backend -> config-error")
+    (%check :srvcfg-bad-port (bad (list "--backend" "server" "--port" "notaport" "--inner-dir" "/x")) "non-integer --port -> config-error")
+    (%check :srvcfg-bad-maxconn (bad (list "--backend" "server" "--port" "5000" "--inner-dir" "/x" "--max-connections" "0"))
+            "--max-connections 0 -> config-error")
+    (%check :srvcfg-bad-unknown (bad (list "--backend" "server" "--port" "5000" "--inner-dir" "/x" "--frobnicate"))
+            "unknown server-mode flag -> config-error"))
+  (%check :srvcfg-bad-safety0
+          (eq :err (handler-case
+                       (locally (declare (optimize (safety 0)))
+                         (dds.durability:parse-durability-server-config
+                          :argv (list "--backend" "server" "--inner-dir" "/x") :env '()))
+                     (dds.durability:durability-config-error () :err)))
+          "missing --port signals even at (safety 0) — explicit manual check")
+  (%check :srvcfg-detect-cli (dds.durability::%durability-server-mode-p (list "--backend" "server" "--port" "1") '())
+          "%durability-server-mode-p T for --backend server")
+  (%check :srvcfg-detect-env (dds.durability::%durability-server-mode-p '() '(("DDS_DURABILITY_BACKEND" . "server")))
+          "%durability-server-mode-p T for env DDS_DURABILITY_BACKEND=server")
+  (%check :srvcfg-detect-service-default
+          (not (dds.durability::%durability-server-mode-p (list "--domain" "5" "--topic" "Square:ShapeType") '()))
+          "a plain service argv is NOT server mode (the durability SERVICE stays the default)")
+  (%check :srvcfg-detect-empty (not (dds.durability::%durability-server-mode-p '() '()))
+          "empty argv/env is NOT server mode (default = durability service)")
+  (let ((specs (dds.durability:parse-durability-config
+                :argv (list "--domain" "3" "--topic" "Square:ShapeType") :env '())))
+    (%check :srvcfg-service-unchanged
+            (and (= 1 (length specs)) (dds.durability:service-spec-matches-p (first specs) "Square" "ShapeType"))
+            "the default durability SERVICE config parse is UNCHANGED"))
+  (%check :srvcfg-help-detect (dds.durability::%durability-help-requested-p (list "--help")) "-h/--help detected")
+  (let ((u (dds.durability:durability-usage)))
+    (%check :srvcfg-usage-server (search "--backend server" u) "usage shows --backend server")
+    (%check :srvcfg-usage-port (search "--port" u) "usage shows --port")
+    (%check :srvcfg-usage-innerbackend (search "--inner-backend" u) "usage shows --inner-backend")
+    (%check :srvcfg-usage-innerdir (search "--inner-dir" u) "usage shows --inner-dir")
+    (%check :srvcfg-usage-service (search "--domain" u) "usage also shows the default service-mode flags"))
+  t)
+
 (defun* run-durability-microservice-reconnect-test ()
     (function () t)
   "WP-DURABILITY-MS-RECONNECT (ADR 0050 §4.5, Slice 3c-1): the DARE-wrapped microservice CLIENT RECONNECTS +
