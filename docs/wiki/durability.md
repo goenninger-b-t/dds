@@ -233,6 +233,19 @@ permanently, stop the supervisor or the runner.
 Env vars: `DDS_DURABILITY_DOMAIN`, `DDS_DURABILITY_TOPICS` (comma-separated `NAME:TYPE`),
 `DDS_DURABILITY_MODE`, `DDS_DURABILITY_NAME`.
 
+**Service persistence backend (`--backend {file|sqlite|microservice}`, ADR 0050 §4.9, semantics A)** —
+selects the durability SERVICE's OWN client-side persistence store (wired to the shared
+`make-durability-store-factory`; see §5.3). CLI flags: `--backend file|sqlite|microservice`,
+`--dir DIR` (**required** for `--backend file|sqlite` — the durable store dir, no temp fallback; for
+`--backend microservice` the client-local DARE epoch-dir, default `<tmp>/dds-durability/`),
+`--key-dir DIR` (ML-KEM-1024 key dir; default `DIR/keys/`),
+`--ms-host HOST` (default `127.0.0.1`) and `--ms-port PORT` (**required** for `--backend microservice`).
+Env: `DDS_DURABILITY_{BACKEND,DIR,KEY_DIR,MS_HOST,MS_PORT}`. **When `--backend` is omitted the service keeps
+its in-memory default — no behavior change.** The value `server` is **reserved** for the SERVER mode below
+(semantics B); the two `--backend` roles never collide (`%durability-server-mode-p` intercepts `server`
+before the service parser). A bad value → a clean `durability-config-error` naming
+`{file|sqlite|microservice|server}`.
+
 **Microservice SERVER mode (`--backend server`, ADR 0050 §4.8, semantics B)** — run the DARE-blind
 persistent key-value server durability clients connect to as their microservice backend. CLI flags:
 `--host HOST` (default `127.0.0.1`), `--port PORT` (**required**), `--inner-backend file|sqlite`
@@ -397,6 +410,46 @@ at it. The whole server-run lifecycle (build inner → listen → block-until-si
 **shared `%run-microservice-server` helper** that `interop/durability-persistent/driver-ms-server.lisp`
 also calls (DRY). Stop is the clean §4.8 `tcp-shutdown` wake (§8.10.7): no hang, no leaked thread/socket.
 The default (no `--backend server`) durability SERVICE mode is unchanged.
+
+---
+
+### 5.3 Service persistence backend (`--backend {file|sqlite|microservice}`, ADR 0050 §4.9, semantics A)
+
+Select the durability **SERVICE**'s OWN client-side persistence store at the command line (semantics A: pick
+the store the service persists to — distinct from the semantics-B `--backend server` which *runs* a server).
+The flag wires to the shared `make-durability-store-factory` dispatch (§8.10 / spec.lisp) — the CLI does not
+reimplement backend selection:
+
+```
+# file backend (encrypted append-log on disk):
+durability-service-main --backend file   --dir /var/lib/dds/durability/ --topic Square:ShapeType
+
+# sqlite backend (encrypted SQLite DB on disk):
+durability-service-main --backend sqlite --dir /var/lib/dds/durability/ --topic Square:ShapeType
+
+# microservice backend (persist to a remote DARE-blind server — see §5.2 for running one):
+durability-service-main --backend microservice --ms-host 10.0.0.7 --ms-port 8080 \
+                        --dir /var/lib/dds/durability/ --topic Square:ShapeType
+```
+
+- `--dir DIR` is **required** for `--backend file|sqlite` — the durable on-disk store dir. A PERSISTENT
+  backend must name its dir; there is **no `<tmp>` fallback** (a silent temp-dir default would lose
+  "persistent" data a reboot / tmpreaper clears — omitting `--dir` is a clean `durability-config-error`
+  naming the flag, mirroring the SERVER mode's required `--inner-dir`). For `--backend microservice`, `--dir`
+  is the CLIENT-LOCAL DARE epoch-dir (the durable records live on the remote server) and defaults to
+  `<tmp>/dds-durability/`. `--key-dir DIR` (the ML-KEM-1024 keypair) defaults to `DIR/keys/`. Both file/sqlite
+  stores are always DARE-encrypted at rest (the store dir's 0700 perms are enforced fail-closed); the
+  microservice backend seals **client-side** (the remote server holds only opaque ciphertext, §8.10).
+- `--backend microservice` **requires** `--ms-port` (the remote server to connect to); `--ms-host` defaults to
+  `127.0.0.1`. These are the same coordinates the interop drivers pass via `DPERSIST_MS_HOST`/`DPERSIST_MS_PORT`.
+- Every flag has a `DDS_DURABILITY_*` env equivalent (`DDS_DURABILITY_{BACKEND,DIR,KEY_DIR,MS_HOST,MS_PORT}`);
+  precedence CLI > env > defaults.
+- **Reconciliation with `--backend server` (semantics B).** `--backend` carries two roles: a **MODE** (the
+  reserved value `server` → run the microservice SERVER, §5.2) and a **BACKEND VALUE**
+  (`file|sqlite|microservice` → the service's persistence). `%durability-server-mode-p` intercepts `server`
+  **before** the service parser, so `--backend server` keeps its §5.2 meaning and the three backend values
+  reach the service. A bad value → a clean `durability-config-error` naming `{file|sqlite|microservice|server}`.
+- **Omitting `--backend` keeps the in-memory default** — no behavior change for any existing invocation.
 
 ---
 

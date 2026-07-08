@@ -56,20 +56,61 @@
                      while end)))
     (mapcar #'%parse-topic-pair parts)))
 
+;;; --- service persistence backend selection (semantics A; ADR 0050 §4.9) ---
+;;; --backend {file|sqlite|microservice} selects the durability SERVICE's OWN client-side persistence
+;;; store, wired to the shared make-durability-store-factory dispatch (spec.lisp). Distinct from the
+;;; reserved --backend server MODE value (semantics B, %durability-server-mode-p) which the pre-parser
+;;; intercepts BEFORE this parser — so the two roles never silently collide.
+
+(defun* %default-persistence-dir ()
+    (function () string)
+  "Default CLIENT-LOCAL DARE directory for --backend microservice when --dir (env DDS_DURABILITY_DIR) is
+   omitted: <temporary-directory>/dds-durability/. Only the microservice backend reaches this default — its
+   durable records live on the REMOTE server, so the local dir holds only the DARE epoch-dir/key material.
+   The file/sqlite backends do NOT fall back here: they REQUIRE --dir (a durable store dir must be named
+   explicitly; %SERVICE-STORE-FACTORY errors otherwise — no silent temp-dir data loss)."
+  (namestring (merge-pathnames "dds-durability/" (uiop:temporary-directory))))
+
+(defun* %parse-service-backend (source val)
+    (function (string (or null string)) string)
+  "Parse VAL into a durability-SERVICE persistence backend: the canonical lowercase \"file\" / \"sqlite\"
+   / \"microservice\" string consumed by MAKE-DURABILITY-STORE-FACTORY, else DURABILITY-CONFIG-ERROR naming
+   the valid set (an explicit, safety-level-independent check). SOURCE names the origin (a flag or env var)
+   for the message. The reserved value \"server\" is REJECTED here with a steering message: it selects the
+   microservice-SERVER MODE (semantics B, ADR 0050 §4.9), which %DURABILITY-SERVER-MODE-P intercepts BEFORE
+   this service parser ever runs, so it is not a service persistence backend."
+  (cond ((null val) (%config-error "~a requires an argument (one of: file, sqlite, microservice)" source))
+        ((string-equal val "file") "file")
+        ((string-equal val "sqlite") "sqlite")
+        ((string-equal val "microservice") "microservice")
+        ((string-equal val "server")
+         (%config-error "~a server selects the microservice SERVER mode, not a durability-service persistence backend; run the SERVER with --backend server, or pick a service backend (one of: file, sqlite, microservice)" source))
+        (t (%config-error "~a ~s is not a durability-service persistence backend (expected one of: file, sqlite, microservice; 'server' selects the microservice SERVER mode)" source val))))
+
 ;;; --- argv tokenizer ---
 
 (defun* %parse-argv (argv env)
     (function (list (or list function))
-              (values (integer 0) list (member :thread :process) (integer 0) (integer 1) string))
-  "Walk ARGV collecting --domain, --topic, --mode, --max-restarts, --window-seconds, --name.
-   Unknown flags → DURABILITY-CONFIG-ERROR. Returns 6 values:
-   (domain topics mode max-restarts window-seconds name)."
+              (values (integer 0) list (member :thread :process) (integer 0) (integer 1) string
+                      (or null string) (or null string) (or null (integer 0 65535))
+                      (or null string) (or null string)))
+  "Walk ARGV collecting --domain, --topic, --mode, --max-restarts, --window-seconds, --name and the
+   persistence-backend flags --backend, --ms-host, --ms-port, --dir, --key-dir (ADR 0050 §4.9, semantics A).
+   Unknown flags → DURABILITY-CONFIG-ERROR. Returns 11 values:
+   (domain topics mode max-restarts window-seconds name backend ms-host ms-port dir key-dir).
+   BACKEND is NIL when neither --backend nor env DDS_DURABILITY_BACKEND is given (the caller then keeps the
+   in-memory default — the DEFAULT-UNCHANGED path); otherwise a canonical \"file\"/\"sqlite\"/\"microservice\"."
   (let ((domain nil)
         (topics '())
         (mode   nil)
         (max-restarts nil)
         (window-seconds nil)
         (name nil)
+        (backend nil)
+        (ms-host nil)
+        (ms-port nil)
+        (dir nil)
+        (key-dir nil)
         (rest argv))
     (loop while rest do
       (let ((flag (pop rest)))
@@ -110,6 +151,28 @@
            (let ((val (pop rest)))
              (unless val (%config-error "--name requires an argument"))
              (setf name val)))
+          ((string= flag "--backend")
+           (setf backend (%parse-service-backend "--backend" (pop rest))))
+          ((string= flag "--ms-host")
+           (let ((val (pop rest)))
+             (unless val (%config-error "--ms-host requires an argument"))
+             (setf ms-host val)))
+          ((string= flag "--ms-port")
+           (let ((val (pop rest)))
+             (unless val (%config-error "--ms-port requires an argument"))
+             (let ((n (handler-case (parse-integer val)
+                        (error () (%config-error "--ms-port argument ~s is not an integer" val)))))
+               (when (or (minusp n) (> n 65535))
+                 (%config-error "--ms-port ~d must be in [0,65535]" n))
+               (setf ms-port n))))
+          ((string= flag "--dir")
+           (let ((val (pop rest)))
+             (unless val (%config-error "--dir requires an argument"))
+             (setf dir val)))
+          ((string= flag "--key-dir")
+           (let ((val (pop rest)))
+             (unless val (%config-error "--key-dir requires an argument"))
+             (setf key-dir val)))
           (t
            (%config-error "unknown flag ~s" flag)))))
     ;; env fallbacks
@@ -134,12 +197,63 @@
       (let ((v (%env-get env "DDS_DURABILITY_NAME")))
         (when (and v (plusp (length v)))
           (setf name v))))
+    (unless backend
+      (let ((v (%env-get env "DDS_DURABILITY_BACKEND")))
+        (when (and v (plusp (length v)))
+          (setf backend (%parse-service-backend "env DDS_DURABILITY_BACKEND" v)))))
+    (unless ms-host
+      (let ((v (%env-get env "DDS_DURABILITY_MS_HOST")))
+        (when (and v (plusp (length v))) (setf ms-host v))))
+    (unless ms-port
+      (let ((v (%env-get env "DDS_DURABILITY_MS_PORT")))
+        (when v
+          (let ((n (handler-case (parse-integer v)
+                     (error () (%config-error "env DDS_DURABILITY_MS_PORT ~s is not an integer" v)))))
+            (when (or (minusp n) (> n 65535))
+              (%config-error "env DDS_DURABILITY_MS_PORT ~d must be in [0,65535]" n))
+            (setf ms-port n)))))
+    (unless dir
+      (let ((v (%env-get env "DDS_DURABILITY_DIR")))
+        (when (and v (plusp (length v))) (setf dir v))))
+    (unless key-dir
+      (let ((v (%env-get env "DDS_DURABILITY_KEY_DIR")))
+        (when (and v (plusp (length v))) (setf key-dir v))))
     (values (or domain 0)
             (nreverse topics)
             (or mode :thread)
             (or max-restarts 3)
             (or window-seconds 5)
-            (or name ""))))
+            (or name "")
+            backend ms-host ms-port dir key-dir)))
+
+;;; --- service persistence store-factory (semantics A; ADR 0050 §4.9) ---
+
+(defun* %service-store-factory (backend dir key-dir ms-host ms-port)
+    (function ((or null string) (or null string) (or null string)
+               (or null string) (or null (integer 0 65535)))
+              (or null function))
+  "Return the 0-arg persistence store-factory the durability SERVICE should use for BACKEND, or NIL when
+   BACKEND is NIL (the caller then keeps MAKE-SERVICE-SPEC's in-memory default — the DEFAULT-UNCHANGED path,
+   no behavior change when --backend is omitted). Reuses the shared MAKE-DURABILITY-STORE-FACTORY dispatch
+   (spec.lisp) — it does NOT reimplement backend selection; it only wires the CLI-parsed values into it.
+   REQUIRED-ARG discipline (a PERSISTENT backend must name its durable directory — no silent temp fallback,
+   mirroring the microservice --ms-port and the SERVER mode's --inner-dir requirements):
+     file / sqlite -> DIR is REQUIRED (the on-disk durable store dir); a missing DIR signals
+                      DURABILITY-CONFIG-ERROR naming --dir — never a temp-dir fallback that would SILENTLY
+                      lose data a reboot / tmpreaper clears;
+     microservice  -> MS-PORT is REQUIRED (the remote server; MS-HOST defaults 127.0.0.1); the durable
+                      records live on the REMOTE server, so DIR here is only the CLIENT-LOCAL DARE epoch-dir
+                      and defaults to %DEFAULT-PERSISTENCE-DIR when omitted.
+   KEY-DIR (the ML-KEM-1024 key dir) defaults to DIR/keys/. All checks are explicit + safety-level-independent."
+  (when backend
+    (let ((ms (string-equal backend "microservice")))
+      (when (and ms (null ms-port))
+        (%config-error "--backend microservice requires --ms-port (or env DDS_DURABILITY_MS_PORT): the remote microservice server to connect to"))
+      (when (and (not ms) (null dir))
+        (%config-error "--backend ~a requires --dir (or env DDS_DURABILITY_DIR): a PERSISTENT backend must name its durable store directory (there is no temp-dir fallback)" backend))
+      (let* ((d (or dir (%default-persistence-dir)))    ; only microservice reaches the default (client-local DARE epoch-dir)
+             (k (or key-dir (namestring (merge-pathnames "keys/" (uiop:ensure-directory-pathname d))))))
+        (make-durability-store-factory backend :dir d :key-dir k :ms-host ms-host :ms-port ms-port)))))
 
 ;;; --- public parse entry point (PURE — no I/O) ---
 
@@ -150,16 +264,24 @@
    SPECS is a list of one SERVICE-SPEC (MVP single-service).
    MAX-RESTARTS and WINDOW-SECONDS are the parsed supervisor opts (defaults 3 / 5).
    ARGV is a list of CLI token strings. ENV is an alist of (NAME . VALUE) or a 1-arg fn.
-   Precedence: CLI > env > defaults. Signals DURABILITY-CONFIG-ERROR on malformed input."
-  (multiple-value-bind (domain topics mode max-restarts window-seconds name)
+   Precedence: CLI > env > defaults. Signals DURABILITY-CONFIG-ERROR on malformed input.
+   PERSISTENCE BACKEND (semantics A, ADR 0050 §4.9): --backend {file|sqlite|microservice} (env
+   DDS_DURABILITY_BACKEND) selects the service's own store via %SERVICE-STORE-FACTORY → the shared
+   MAKE-DURABILITY-STORE-FACTORY; --dir/--key-dir/--ms-host/--ms-port supply its coordinates. When --backend
+   is omitted the spec keeps MAKE-SERVICE-SPEC's in-memory default (no behavior change). The reserved
+   --backend server MODE value (semantics B) is intercepted upstream by %DURABILITY-SERVER-MODE-P and never
+   reaches this parser."
+  (multiple-value-bind (domain topics mode max-restarts window-seconds name backend ms-host ms-port dir key-dir)
       (%parse-argv argv env)
-    (values (list (make-service-spec
-                   :domain domain
-                   :topics topics
-                   :mode   mode
-                   :name   name))
-            max-restarts
-            window-seconds)))
+    (let ((store (%service-store-factory backend dir key-dir ms-host ms-port)))
+      (values (list (apply #'make-service-spec
+                           :domain domain
+                           :topics topics
+                           :mode   mode
+                           :name   name
+                           (when store (list :store store))))
+              max-restarts
+              window-seconds))))
 
 ;;; --- spec -> argv serializer (used by runner for subprocess launch) ---
 
@@ -323,8 +445,10 @@
 (defun* durability-usage ()
     (function () string)
   "The DURABILITY-SERVICE-MAIN usage/help text covering BOTH modes: the default durability SERVICE
-   (collect/serve/supervisor, ADR 0021) and the microservice SERVER mode (--backend server, ADR 0050 §4.8).
-   Printed on --help/-h. Kept in lockstep with the CLI flags (operating contract §5.1)."
+   (collect/serve/supervisor, ADR 0021 — including its --backend {file|sqlite|microservice} persistence
+   selection, semantics A, ADR 0050 §4.9) and the microservice SERVER mode (--backend server, semantics B,
+   ADR 0050 §4.8/§4.9). Documents BOTH roles of --backend: the persistence-backend VALUES and the reserved
+   server MODE value. Printed on --help/-h. Kept in lockstep with the CLI flags (operating contract §5.1)."
   (format nil "Usage: durability-service-main [OPTIONS]~%~%~
      Default mode — durability SERVICE (collect + serve TRANSIENT/PERSISTENT durability, ADR 0021):~%~
      ~4t--domain N              DDS domain id (default 0; env DDS_DURABILITY_DOMAIN)~%~
@@ -333,10 +457,22 @@
      ~4t--name NAME             service instance name (env DDS_DURABILITY_NAME)~%~
      ~4t--max-restarts N        supervisor restart budget (default 3)~%~
      ~4t--window-seconds N      supervisor restart window seconds (default 5)~%~%~
+     ~2tService persistence backend (semantics A, ADR 0050 §4.9) — selects the SERVICE's OWN store; when~%~
+     ~2tomitted the service keeps its in-memory default (no behavior change):~%~
+     ~4t--backend BACKEND       file | sqlite | microservice (env DDS_DURABILITY_BACKEND); the reserved~%~
+     ~29tvalue 'server' instead selects the SERVER mode below (semantics B)~%~
+     ~4t--dir DIR               durable store dir — REQUIRED for --backend file|sqlite (no temp fallback;~%~
+     ~29ta persistent backend must name its dir); for --backend microservice the~%~
+     ~29tclient-local DARE epoch-dir (default <tmp>/dds-durability/); env DDS_DURABILITY_DIR~%~
+     ~4t--key-dir DIR           ML-KEM-1024 key dir (default DIR/keys/; env DDS_DURABILITY_KEY_DIR)~%~
+     ~4t--ms-host HOST          remote microservice server host (--backend microservice; default~%~
+     ~29t127.0.0.1; env DDS_DURABILITY_MS_HOST)~%~
+     ~4t--ms-port PORT          remote microservice server port (--backend microservice; REQUIRED for it;~%~
+     ~29tenv DDS_DURABILITY_MS_PORT)~%~%~
      Microservice SERVER mode — run the DARE-blind persistent key-value server durability clients~%~
      connect to as their microservice backend (--backend server; env DDS_DURABILITY_BACKEND=server;~%~
      ADR 0050 §4.8). The server stores OPAQUE frames only; the connecting clients hold the DARE keys:~%~
-     ~4t--backend server        select server mode (required to enter it)~%~
+     ~4t--backend server        select server mode (the reserved --backend MODE value; required to enter it)~%~
      ~4t--host HOST             listen host (default 127.0.0.1; env DDS_DURABILITY_HOST)~%~
      ~4t--port PORT             listen port, REQUIRED (env DDS_DURABILITY_PORT)~%~
      ~4t--inner-backend file|sqlite  persistent inner store (default file; env DDS_DURABILITY_INNER_BACKEND)~%~
@@ -403,12 +539,21 @@
    then tears down in order (supervisor-stop -> runner-stop) and calls UIOP:QUIT 0.
    When NIL, returns (CONS runner sup).
 
+   SERVICE PERSISTENCE BACKEND (semantics A, ADR 0050 §4.9): in the default SERVICE mode,
+   --backend {file|sqlite|microservice} (env DDS_DURABILITY_BACKEND) selects the service's own persistence
+   store via PARSE-DURABILITY-CONFIG → %SERVICE-STORE-FACTORY → the shared MAKE-DURABILITY-STORE-FACTORY
+   (--dir/--key-dir for file/sqlite + the client-local DARE state; --ms-host/--ms-port for the remote
+   microservice server). Omitting --backend keeps the in-memory default — no behavior change.
+
    MICROSERVICE SERVER MODE (semantics B, ADR 0050 §4.8): when --backend server (or env
    DDS_DURABILITY_BACKEND=server) is present, runs the DARE-blind persistent microservice SERVER
    (%RUN-MICROSERVICE-SERVER over PARSE-DURABILITY-SERVER-CONFIG) instead of the durability service — an
-   operator-runnable KV server durability clients connect to as their microservice backend. --help/-h
-   prints DURABILITY-USAGE. The default (no --backend server) durability SERVICE path is UNCHANGED; server
-   mode with BLOCK NIL returns the running MICROSERVICE-SERVER (for in-process callers/tests)."
+   operator-runnable KV server durability clients connect to as their microservice backend. The two
+   --backend roles never collide: %DURABILITY-SERVER-MODE-P intercepts the reserved 'server' MODE value
+   BEFORE the service parser, so a service backend value (file|sqlite|microservice) reaches semantics A and
+   'server' reaches semantics B. --help/-h prints DURABILITY-USAGE. The default (no --backend server)
+   durability SERVICE path is UNCHANGED; server mode with BLOCK NIL returns the running MICROSERVICE-SERVER
+   (for in-process callers/tests)."
   (let ((effective-argv (or argv (uiop:command-line-arguments))))
     (cond
       ((%durability-help-requested-p effective-argv)

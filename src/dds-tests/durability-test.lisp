@@ -8590,6 +8590,192 @@
     (%check :srvcfg-usage-service (search "--domain" u) "usage also shows the default service-mode flags"))
   t)
 
+(defun* run-durability-service-backend-select-test ()
+    (function () t)
+  "WP-DURABILITY-BACKEND-SELECT (ADR 0050 §4.9, semantics A): durability-service-main
+   --backend {file|sqlite|microservice} selects the durability SERVICE's OWN client-side persistence store,
+   RECONCILED with the shipped --backend server MODE value (semantics B). parse-durability-config wires the
+   CLI value to the shared make-durability-store-factory (%service-store-factory) — it does NOT reimplement
+   selection. Arms:
+   (1) SERVICE-ON-BACKEND (selection, DARE-free): --backend file/sqlite/microservice -> the spec store-factory
+       constructs the encrypted-persistent tier (name :encrypted-persistent), NOT the in-memory default.
+   (2) DEFAULT-UNCHANGED: no --backend -> the in-memory default (:memory) + the (specs max-restarts
+       window-seconds) contract byte-unchanged (no behavior change when --backend is omitted).
+   (3) PURE parse observability: %parse-argv surfaces backend (canonical lowercase) / ms-host / ms-port /
+       dir / key-dir; env fallback + CLI>env precedence.
+   (4) RECONCILIATION: %durability-server-mode-p partitions the reserved 'server' MODE value (B) from the
+       file/sqlite/microservice backend values (A) — server -> server mode, the three backends -> the service
+       parser (semantics A), so the two roles never silently collide.
+   (5) BAD VALUE -> a clean durability-config-error naming the valid set (incl. the reserved 'server' steer +
+       a missing --ms-port for microservice + (safety 0)).
+   (6) USAGE documents BOTH roles.
+   (7) DARE-gated round-trip (skips if OpenSSL<3.5): the file backend persists to the file-store on-disk
+       layout, the sqlite backend to the sqlite db, and the microservice backend round-trips byte-exact
+       through a running in-process server — proving the SERVICE actually USES the selected backend.
+   PURE arms both impls; the DARE round-trip runs where OpenSSL>=3.5, bounded + cleaned up."
+  (labels ((sstore-name (argv &optional env)
+             (dds.durability::durable-store-name
+              (funcall (dds.durability::service-spec-store
+                        (first (dds.durability:parse-durability-config :argv argv :env (or env '())))))))
+           (cfg-err (argv &optional env)
+             (eq :err (handler-case
+                          (progn (dds.durability:parse-durability-config :argv argv :env (or env '())) :ok)
+                        (dds.durability:durability-config-error () :err)))))
+    ;; (1) SERVICE-ON-BACKEND — the selected backend is the encrypted-persistent tier (DARE-free construction)
+    (%check :bsel-file-selected
+            (eq :encrypted-persistent (sstore-name (list "--backend" "file" "--dir" "/tmp/bsel-sel")))
+            "--backend file selects the encrypted-persistent (file) store, not the memory default")
+    (%check :bsel-sqlite-selected
+            (eq :encrypted-persistent (sstore-name (list "--backend" "sqlite" "--dir" "/tmp/bsel-sel")))
+            "--backend sqlite selects the encrypted-persistent (sqlite) store")
+    (%check :bsel-ms-selected
+            (eq :encrypted-persistent (sstore-name (list "--backend" "microservice" "--ms-port" "5555")))
+            "--backend microservice selects the encrypted-persistent (microservice client) store")
+    ;; (2) DEFAULT-UNCHANGED — no --backend keeps the in-memory default + the return contract is unchanged
+    (%check :bsel-default-memory
+            (eq :memory (sstore-name (list "--topic" "Square:ShapeType")))
+            "no --backend keeps the in-memory default store (:memory) — no behavior change")
+    (multiple-value-bind (specs mr ws)
+        (dds.durability:parse-durability-config :argv (list "--topic" "Square:ShapeType") :env '())
+      (%check :bsel-default-contract (and (= 1 (length specs)) (= 3 mr) (= 5 ws))
+              "default parse: 1 spec + default supervisor opts (3/5) unchanged"))
+    ;; (3) PURE parse observability + canonicalization
+    (multiple-value-bind (d tp m mr ws n be mh mp dir kd)
+        (dds.durability::%parse-argv (list "--backend" "MicroService" "--ms-host" "H"
+                                           "--ms-port" "7" "--dir" "/d" "--key-dir" "/k") '())
+      (declare (ignore d tp m mr ws n))
+      (%check :bsel-parse-be (string= "microservice" be) "--backend canonicalized to lowercase")
+      (%check :bsel-parse-mh (string= "H" mh) "--ms-host parsed")
+      (%check :bsel-parse-mp (eql 7 mp) "--ms-port parsed")
+      (%check :bsel-parse-dir (string= "/d" dir) "--dir parsed")
+      (%check :bsel-parse-kd (string= "/k" kd) "--key-dir parsed"))
+    (%check :bsel-env-backend
+            (eq :encrypted-persistent
+                (sstore-name '() '(("DDS_DURABILITY_BACKEND" . "sqlite") ("DDS_DURABILITY_DIR" . "/tmp/bsel-env"))))
+            "env DDS_DURABILITY_BACKEND selects the backend")
+    (multiple-value-bind (d tp m mr ws n be)
+        (dds.durability::%parse-argv (list "--backend" "file") '(("DDS_DURABILITY_BACKEND" . "sqlite")))
+      (declare (ignore d tp m mr ws n))
+      (%check :bsel-cli-over-env (string= "file" be) "CLI --backend overrides env DDS_DURABILITY_BACKEND"))
+    ;; (4) RECONCILIATION — server-mode-p partitions the 'server' MODE value from the backend values
+    (%check :bsel-recon-server (dds.durability::%durability-server-mode-p (list "--backend" "server") '())
+            "--backend server -> server MODE (semantics B, unchanged)")
+    (%check :bsel-recon-file (not (dds.durability::%durability-server-mode-p (list "--backend" "file") '()))
+            "--backend file is NOT server mode -> reaches the service parser (semantics A)")
+    (%check :bsel-recon-sqlite (not (dds.durability::%durability-server-mode-p (list "--backend" "sqlite") '()))
+            "--backend sqlite is NOT server mode")
+    (%check :bsel-recon-ms (not (dds.durability::%durability-server-mode-p (list "--backend" "microservice") '()))
+            "--backend microservice is NOT server mode")
+    ;; (5) BAD VALUE / reserved-server-steer / missing-ms-port -> clean config-error (incl. safety 0)
+    (%check :bsel-bad-bogus (cfg-err (list "--backend" "bogus")) "--backend bogus -> config-error naming the set")
+    (%check :bsel-bad-server-via-svc (cfg-err (list "--backend" "server"))
+            "--backend server through the SERVICE parser -> config-error (reserved MODE value, steered)")
+    (%check :bsel-bad-ms-noport (cfg-err (list "--backend" "microservice"))
+            "--backend microservice without --ms-port -> config-error")
+    ;; the PERSISTENT file/sqlite backends REQUIRE --dir (no silent temp-dir data loss; mirrors --inner-dir)
+    (%check :bsel-bad-file-nodir (cfg-err (list "--backend" "file"))
+            "--backend file WITHOUT --dir -> config-error (a persistent backend must name its durable dir; no temp fallback)")
+    (%check :bsel-bad-sqlite-nodir (cfg-err (list "--backend" "sqlite"))
+            "--backend sqlite WITHOUT --dir -> config-error")
+    (%check :bsel-bad-file-nodir-names-dir
+            (let ((msg (handler-case
+                           (progn (dds.durability:parse-durability-config :argv (list "--backend" "file")) "")
+                         (dds.durability:durability-config-error (c)
+                           (dds.durability::durability-config-error-message c)))))
+              (and (search "--dir" msg) (search "file" msg)))
+            "the missing-dir error names --dir (and the backend)")
+    ;; microservice does NOT require --dir — its durable records are REMOTE; the local dir is only the
+    ;; client-side DARE epoch-dir (tmp-default). The asymmetry is intentional.
+    (%check :bsel-ms-nodir-ok
+            (not (cfg-err (list "--backend" "microservice" "--ms-port" "5555")))
+            "--backend microservice WITHOUT --dir does NOT error (client-local DARE dir defaults; durable data is remote)")
+    (%check :bsel-bad-safety0
+            (eq :err (handler-case
+                         (locally (declare (optimize (safety 0)))
+                           (dds.durability:parse-durability-config :argv (list "--backend" "bogus") :env '()))
+                       (dds.durability:durability-config-error () :err)))
+            "bad --backend signals even at (safety 0) — explicit manual check")
+    ;; (6) USAGE documents BOTH roles
+    (let ((u (dds.durability:durability-usage)))
+      (%check :bsel-usage-values (search "file | sqlite | microservice" u) "usage documents the service backend values")
+      (%check :bsel-usage-mshost (search "--ms-host" u) "usage documents --ms-host")
+      (%check :bsel-usage-msport (search "--ms-port" u) "usage documents --ms-port")
+      (%check :bsel-usage-dir (search "--dir" u) "usage documents --dir")
+      (%check :bsel-usage-server (search "--backend server" u) "usage still documents the reserved server MODE value")))
+  ;; (7) DARE-gated round-trip — proves the SERVICE actually USES the selected backend (skips if OpenSSL<3.5)
+  (when (handler-case (dds.dare:dare-available-p) (error () nil))
+    (let ((g1 (%tms-guid 1)) (g2 (%tms-guid 2)) (p1 (%tms-payload 24 1)) (p2 (%tms-payload 40 2)))
+      ;; file backend -> the file-store on-disk layout (topics/), NOT a sqlite db
+      (let* ((base  (%tms-tmp-dir "bsel-file"))
+             (specs (dds.durability:parse-durability-config
+                     :argv (list "--backend" "file" "--dir" (namestring base) "--topic" "Square:ShapeType")))
+             (store (funcall (dds.durability::service-spec-store (first specs)))))
+        (unwind-protect
+             (progn
+               (dds.durability:store-open store)
+               (dds.durability:store-put store "Square" g1 1 nil :data p1)
+               (dds.durability:store-put store "Square" g2 5 nil :data p2)
+               (let ((r (dds.durability:store-get-range store "Square")))
+                 (%check :bsel-rt-file-exact
+                         (and (= 2 (length r))
+                              (%tms-rec= (first r)  "Square" g1 1 nil :data p1)
+                              (%tms-rec= (second r) "Square" g2 5 nil :data p2))
+                         "file backend service store round-trips byte-exact"))
+               (dds.durability:store-close store)
+               (%check :bsel-rt-file-artifact
+                       (and (uiop:directory-exists-p (merge-pathnames "topics/" base))
+                            (not (uiop:file-exists-p (merge-pathnames "durability.sqlite3" base))))
+                       "file backend wrote the file-store on-disk layout (topics/), not a sqlite db"))
+          (ignore-errors (dds.durability:store-close store))
+          (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
+      ;; sqlite backend -> the sqlite db file on disk
+      (let* ((base  (%tms-tmp-dir "bsel-sqlite"))
+             (specs (dds.durability:parse-durability-config
+                     :argv (list "--backend" "sqlite" "--dir" (namestring base) "--topic" "Square:ShapeType")))
+             (store (funcall (dds.durability::service-spec-store (first specs)))))
+        (unwind-protect
+             (progn
+               (dds.durability:store-open store)
+               (dds.durability:store-put store "Square" g1 1 nil :data p1)
+               (let ((r (dds.durability:store-get-range store "Square")))
+                 (%check :bsel-rt-sqlite-exact
+                         (and (= 1 (length r)) (%tms-rec= (first r) "Square" g1 1 nil :data p1))
+                         "sqlite backend service store round-trips byte-exact"))
+               (dds.durability:store-close store)
+               (%check :bsel-rt-sqlite-artifact
+                       (uiop:file-exists-p (merge-pathnames "durability.sqlite3" base))
+                       "sqlite backend wrote the sqlite db file"))
+          (ignore-errors (dds.durability:store-close store))
+          (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))
+      ;; microservice backend -> round-trips byte-exact through a running in-process server
+      (let* ((inner (dds.durability:make-memory-store))
+             (srv   (dds.durability:make-microservice-server :port 0 :inner inner))
+             (port  (dds.durability:microservice-server-port srv))
+             (base  (%tms-tmp-dir "bsel-ms"))
+             (specs (dds.durability:parse-durability-config
+                     :argv (list "--backend" "microservice" "--ms-host" "127.0.0.1"
+                                 "--ms-port" (princ-to-string port) "--dir" (namestring base)
+                                 "--topic" "Square:ShapeType")))
+             (store (funcall (dds.durability::service-spec-store (first specs)))))
+        (unwind-protect
+             (progn
+               (dds.durability:store-open store)
+               (dds.durability:store-put store "Square" g1 1 nil :data p1)
+               (dds.durability:store-put store "Square" g2 5 nil :data p2)
+               (let ((r (dds.durability:store-get-range store "Square")))
+                 (%check :bsel-rt-ms-order (equal '(1 5) (mapcar #'dds.durability:durable-record-sn r))
+                         "microservice backend get-range (guid,sn)-ordered through the server")
+                 (%check :bsel-rt-ms-exact
+                         (and (= 2 (length r))
+                              (%tms-rec= (first r)  "Square" g1 1 nil :data p1)
+                              (%tms-rec= (second r) "Square" g2 5 nil :data p2))
+                         "microservice backend service store round-trips byte-exact through the in-process server"))
+               (dds.durability:store-close store))
+          (ignore-errors (dds.durability:store-close store))
+          (ignore-errors (dds.durability:microservice-server-stop srv))
+          (when (uiop:directory-exists-p base) (uiop:delete-directory-tree base :validate t))))))
+  t)
+
 (defun* run-durability-microservice-reconnect-test ()
     (function () t)
   "WP-DURABILITY-MS-RECONNECT (ADR 0050 §4.5, Slice 3c-1): the DARE-wrapped microservice CLIENT RECONNECTS +

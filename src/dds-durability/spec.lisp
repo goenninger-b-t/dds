@@ -88,8 +88,9 @@
    HISTORY-KIND / HISTORY-DEPTH are forwarded to the file-store for compaction-on-open
    (DDS 1.4 §2.2.3.5): :keep-all (default, byte-identical) or :keep-last with DEPTH >= 1.
    KEY-DIR holds the ML-KEM-1024 keypair (perms enforced 0700 dir / 0600 key, checked at open,
-   fail-closed by the key-provider); DIR holds the DARE-sealed topic logs + epochs.dat (DIR's own
-   0700 enforcement is a follow-on, ADR 0026 §10). NOTE: :PROCESS service mode does NOT carry this
+   fail-closed by the key-provider); DIR holds the DARE-sealed topic logs + epochs.dat and its own 0700
+   perms are ENFORCED fail-closed by the file-store (chmod 0700 on first create, assert-directory-perms-0700
+   on reopen; WP-DURABILITY-HARDENING-BATCH, ADR 0026 §10.12). NOTE: :PROCESS service mode does NOT carry this
    factory across the subprocess boundary — use :THREAD mode for the PERSISTENT tier (ADR 0026 §10).
    The returned store requires STORE-OPEN before reads or writes, and STORE-CLOSE to flush
    and fsync the sealed log to disk; calling STORE-CLOSE is mandatory to avoid data loss."

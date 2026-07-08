@@ -4023,6 +4023,7 @@
                  ("durability-server-mode-cli"     . run-durability-server-mode-cli-test)
                  ("durability-server-mode-restart" . run-durability-server-mode-restart-test)
                  ("durability-server-mode-config"  . run-durability-server-mode-config-test)
+                 ("durability-service-backend-select" . run-durability-service-backend-select-test)
                  ("security-secured-payload"     . run-security-secured-payload-corpus-test)
                  ("security-secured-payload-pad" . run-security-secured-payload-pad-corpus-test)
                  ("security-keymaterial-harden"  . run-security-keymaterial-harden-test)

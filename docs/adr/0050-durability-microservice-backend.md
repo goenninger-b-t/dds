@@ -226,8 +226,9 @@ collect.lisp` + `driver-serve.lisp` now read `DPERSIST_BACKEND` (`file`|`sqlite`
 `DPERSIST_MS_HOST` (default 127.0.0.1) + `DPERSIST_MS_PORT` and dispatch through it. The remote server is a
 separate process the operator runs; the driver is the durability **client**. (Running that remote SERVER
 via the real CLI — `durability-service-main --backend server`, semantics B — is now SHIPPED, §4.9; the
-distinct `--backend file|sqlite|microservice` that would select the durability SERVICE's own client-side
-persistence backend, semantics A, remains a follow-on — the store-factory config-env path suffices.) The full live 2-process
+distinct `--backend file|sqlite|microservice` that selects the durability SERVICE's own client-side
+persistence backend, semantics A, is now ALSO SHIPPED, §4.10, RECONCILED with the reserved `server` mode
+value.) The full live 2-process
 microservice interop is optional this slice; the config-env is proven structurally (the factory builds
 `encrypted-store(microservice-store)`, name `:encrypted-persistent`).
 
@@ -802,6 +803,61 @@ reader conditionals outside `dds-pal`.**
 Both impls **519 → 522 passed** (Clasp FIRST then SBCL), identical; gate-hotpath (durability off the hot path)
 + gate-types PASS; SBOM unchanged (no new dependency). The §4.8 `main.lisp --backend` deferral is **RESOLVED**.
 
+### 4.10 The service persistence-backend CLI selector — `durability-service-main --backend {file|sqlite|microservice}` (WP-DURABILITY-BACKEND-SELECT, BUILT — resolves the §7 semantics-A deferral)
+
+The complement of §4.9: make the durability **SERVICE**'s OWN client-side persistence backend selectable **at
+the command line** (**semantics A** — pick the store the service persists to: an encrypted file-store, an
+encrypted SQLite store, or a remote microservice server), promoting the `DPERSIST_BACKEND` config-env seam to
+a first-class operator CLI flag. **No wire-protocol change, no new crypto, no new dependency, no new CLI-arg
+library (reuses `main.lisp`'s existing hand-rolled `%parse-argv`), no reader conditionals outside `dds-pal`.**
+
+- **The two `--backend` roles, RECONCILED (the #1-review flag).** `--backend` now carries two roles that must
+  not silently collide: a **MODE** (`server` → run the microservice SERVER, semantics B, §4.9) and a
+  **BACKEND VALUE** (`file`|`sqlite`|`microservice` → the service's persistence, semantics A). The **preferred
+  non-breaking** reconciliation was taken: `%durability-server-mode-p` (scanned BEFORE the service parser,
+  UNCHANGED) intercepts the reserved value **`server`** and routes to server mode; everything else flows to the
+  service parser, where `--backend {file|sqlite|microservice}` selects persistence. So `--backend server`
+  keeps its shipped §4.9 meaning **byte-for-byte** (all three §4.9 tests stay green), and `--backend file`
+  (previously an "unknown → `durability-config-error`") now selects the file-backed service. The service
+  parser REJECTS the reserved `server` with a **steering** message (it is a MODE, not a service backend), and
+  any other value → a clean `durability-config-error` **naming the valid set `{file|sqlite|microservice|server}`**.
+- **The CLI wires to the shared factory — it does NOT reimplement selection.** `%parse-argv` gains
+  `--backend` (canonicalised lowercase via a new `%parse-service-backend`), `--ms-host`, `--ms-port`, `--dir`,
+  `--key-dir` (each with a `DDS_DURABILITY_*` env equivalent — `DDS_DURABILITY_{BACKEND,MS_HOST,MS_PORT,DIR,KEY_DIR}`,
+  matching `main.lisp`'s convention; CLI > env > defaults), returning them alongside the existing values. A tiny
+  `%service-store-factory` maps the parsed values onto the **already-existing `make-durability-store-factory`
+  dispatch** (spec.lisp) — the SAME seam the interop drivers use (DRY, one dispatch) — and `parse-durability-config`
+  sets the resulting 0-arg factory on the service-spec `:store`. **Required-arg discipline (a PERSISTENT backend
+  must name its durable dir — no silent temp-dir data loss):** `--backend file|sqlite` **REQUIRE `--dir`** (a
+  missing `--dir` → a `durability-config-error` naming the flag — consistent with the SERVER mode's required
+  `--inner-dir` and the microservice's required `--ms-port`; there is **no** `<tmp>` fallback for the durable
+  data). `--backend microservice` REQUIRES `--ms-port` (`--ms-host` defaults `127.0.0.1`, the same coordinates
+  the drivers pass via `DPERSIST_MS_HOST`/`PORT`); its durable records live on the REMOTE server, so `--dir`
+  there is only the CLIENT-LOCAL DARE epoch-dir and defaults to `<tmp>/dds-durability/`. `--key-dir` defaults to
+  `DIR/keys/`. Only the EPHEMERAL default (no `--backend` → in-memory) needs no dir.
+- **DEFAULT-UNCHANGED is structural.** When `--backend` (and its env) is omitted, `%service-store-factory`
+  returns `NIL` and `parse-durability-config` passes **no** `:store` — so `make-service-spec` keeps its
+  in-memory default. The `(specs max-restarts window-seconds)` return contract is byte-unchanged; there is **no
+  behaviour change** for any existing invocation.
+- **Gates (both impls, Clasp first).** One new unit test `durability-service-backend-select`: (1)
+  SERVICE-ON-BACKEND — `--backend file/sqlite/microservice` selects the `:encrypted-persistent` tier (DARE-free
+  construction), NOT the `:memory` default; (2) DEFAULT-UNCHANGED — no `--backend` → `:memory` + the return
+  contract unchanged; (3) PURE parse observability (backend canonicalisation, ms-host/ms-port/dir/key-dir, env
+  fallback + CLI>env); (4) RECONCILIATION — `%durability-server-mode-p` partitions `server` (B) from the three
+  backend values (A); (5) BAD VALUE / REQUIRED-ARG → a clean `durability-config-error` (bogus + the
+  reserved-`server` steer + a missing `--ms-port` + **`--backend file`/`sqlite` WITHOUT `--dir`, the error
+  naming `--dir`** + `(safety 0)`), plus the asymmetry arm (`--backend microservice` WITHOUT `--dir` does NOT
+  error — the local dir defaults); (6) `durability-usage` documents BOTH roles; (7) a DARE-gated round-trip
+  (skips if OpenSSL < 3.5) proving the file backend persists to the file-store on-disk layout, the sqlite
+  backend to the sqlite db, and the microservice backend round-trips byte-exact through a running in-process
+  server.
+
+Both impls **523 → 524 passed** (Clasp FIRST then SBCL), identical; gate-hotpath (durability off the hot path)
++ gate-types PASS; SBOM unchanged (no new dependency). The §7 semantics-A `--backend {file|sqlite|microservice}`
+deferral is **RESOLVED**. (Follow-up review nit: `--backend file`/`sqlite` now **REQUIRE `--dir`** — the earlier
+`<tmp>` fallback for the durable data was a silent-data-loss footgun, inconsistent with the SERVER mode's
+required `--inner-dir`; only the microservice client-local DARE dir keeps the `<tmp>` default.)
+
 ## 5. Files
 
 - `src/dds-pal/pal-contract.lisp` — export the `tcp-*` block; **Slice 3c-2 (§4.6):** add `pal-timeout`
@@ -868,7 +924,15 @@ Both impls **519 → 522 passed** (Clasp FIRST then SBCL), identical; gate-hotpa
 - `src/dds-durability/store-sqlite.lisp` — **Slice 3d** the atomic `:replace-topic-fn` slot (a single
   transaction: DELETE topic + INSERT survivors).
 - `src/dds-durability/spec.lisp` — **Slice 3a** `make-durability-store-factory` (the shared
-  backend-dispatch seam: file / sqlite / microservice).
+  backend-dispatch seam: file / sqlite / microservice; **§4.10** the `--backend` CLI selector wires to it,
+  not a reimplementation).
+- `src/dds-durability/main.lisp` — **§4.9 (semantics B)** `%durability-server-mode-p` +
+  `parse-durability-server-config` + `%run-microservice-server` + the `--backend server` mode; **§4.10
+  (semantics A)** `%parse-service-backend` (canonicalise + reject/steer the reserved `server`),
+  `%default-persistence-dir`, `%service-store-factory` (maps the parsed values onto
+  `make-durability-store-factory`), `%parse-argv` extended with `--backend`/`--ms-host`/`--ms-port`/`--dir`/
+  `--key-dir` (+ `DDS_DURABILITY_*` env), `parse-durability-config` sets the spec `:store` (NIL → in-memory
+  default, DEFAULT-UNCHANGED), and `durability-usage` documents BOTH `--backend` roles.
 - `src/dds-durability/packages.lisp` — export the new symbols (Slice 2 adds
   `make-microservice-store-factory`; Slice 3a adds `make-durability-store-factory`; Slice 3d adds
   `store-replace-topic`).
@@ -910,7 +974,15 @@ Both impls **519 → 522 passed** (Clasp FIRST then SBCL), identical; gate-hotpa
   `run-durability-microservice-slow-drip-concurrent-test` (a stalled client parks its own thread, a concurrent
   client is served); the `%tms-wait-until` / `%tms-live-conns` bounded-probe helpers; and
   `run-durability-microservice-slow-loris-test` is **re-targeted** from "denies → served" (serial) to
-  "slot not-reclaimed → reclaimed" (multi-client).
+  "slot not-reclaimed → reclaimed" (multi-client). **§4.10 (semantics A):**
+  `run-durability-service-backend-select-test` (`--backend file/sqlite/microservice` selection →
+  `:encrypted-persistent` vs the `:memory` default; DEFAULT-UNCHANGED contract; PURE parse observability +
+  env fallback + CLI>env; the `%durability-server-mode-p` reconciliation partitioning `server` from the three
+  backend values; bad-value / reserved-`server`-steer / missing-`--ms-port` / `(safety 0)` config-errors;
+  usage documents both roles; a DARE-gated round-trip proving the file/sqlite on-disk layout + a microservice
+  byte-exact round-trip through an in-process server, skips if OpenSSL < 3.5).
+- `src/dds-tests/echo-test.lisp` / `src/dds-tests/packages.lisp` — register + export the new test
+  (`durability-service-backend-select`).
 - `src/dds-pal/pal-net.lisp` / `pal-contract.lisp` — **Slice 3c-2** the `tcp-set-recv-timeout` prim +
   `pal-timeout` condition + the `tcp-recv` timeout/EOF split (see §4.6 / the §5 PAL entries above).
   **Slice 3c-3 nit:** the `tcp-recv` docstring is corrected — `n=NIL` is a timeout OR an EINTR-interrupted
@@ -1071,12 +1143,12 @@ green identically, Clasp first: Suite 513 → 514.
 
 **Deferred:**
 - **Slice 3c — remaining production posture.** Framing for very large `get-range` responses beyond the
-  single-message `+ms-max-message+` ceiling (chunked/streamed); the `main.lisp` CLI **semantics-A** `--backend
-  file|sqlite|microservice` (selecting the durability SERVICE's own client-side persistence backend — distinct
-  from the now-SHIPPED **semantics-B** `--backend server` server-mode entrypoint, §4.9; the store-factory
-  config-env path already suffices for A); the full live 2-process microservice cross-DDS interop run. (**Multi-client
-  concurrency** is now **BUILT** — §4.7, WP-DURABILITY-MS-MULTICLIENT; the per-connection **read-idle timeout**
-  a blocked-mid-response read lacked is **BUILT** — §4.6.)
+  single-message `+ms-max-message+` ceiling (chunked/streamed); the full live 2-process microservice cross-DDS
+  interop run. (**Multi-client concurrency** is now **BUILT** — §4.7, WP-DURABILITY-MS-MULTICLIENT; the
+  per-connection **read-idle timeout** a blocked-mid-response read lacked is **BUILT** — §4.6. The `main.lisp`
+  CLI **semantics-A** `--backend file|sqlite|microservice` — selecting the durability SERVICE's own client-side
+  persistence backend, distinct from the **semantics-B** `--backend server` server-mode entrypoint, §4.9 — is
+  now **BUILT + RECONCILED**, §4.10, WP-DURABILITY-BACKEND-SELECT.)
 - **Slice 3c — DoS hardening (BUILT, §4.6, WP-DURABILITY-MS-DOS).** The three Slice-1 residuals are now closed:
   (a) the **read/idle timeout** — `%ms-recv-message` no longer parks the serial serve thread on a slow-loris;
   a stalled recv trips `pal-timeout` (via the new `tcp-set-recv-timeout` / `SO_RCVTIMEO` PAL prim) and the

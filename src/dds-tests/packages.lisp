@@ -14,6 +14,7 @@
            #:run-durability-transient-test #:run-durability-runner-test
            #:run-durability-supervisor-test #:run-durability-runner-lifecycle-test
            #:run-durability-config-test #:run-durability-process-smoke-test
+           #:run-durability-service-backend-select-test
            #:run-durability-writer-rep-test
            #:run-original-writer-info-vector-test
            #:run-data-inline-qos-emit-test
