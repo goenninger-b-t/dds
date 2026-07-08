@@ -51,10 +51,12 @@
    ;; TCPv4 stream sockets (native, FR-XPORT-1). Byte-stream full-send / full-frame recv loops
    ;; (a stream is not message-framed): tcp-send loops over short writes, tcp-recv loops until LEN
    ;; bytes or peer-close (NIL). tcp-set-recv-timeout arms SO_RCVTIMEO so a stalled tcp-recv raises
-   ;; PAL-TIMEOUT (a DoS/idle guard) instead of blocking forever. Backs the durability MICROSERVICE
+   ;; PAL-TIMEOUT (a DoS/idle guard) instead of blocking forever. tcp-shutdown (shutdown(2) SHUT_RDWR)
+   ;; portably WAKES a thread blocked in tcp-recv (Linux + Darwin) WITHOUT freeing the fd — the clean
+   ;; cross-thread server-stop wake, no double-close (ADR 0050 §4.8). Backs the durability MICROSERVICE
    ;; persistence backend (ADR 0050).
    #:tcp-connect #:tcp-listen #:tcp-accept #:tcp-local-port #:tcp-send #:tcp-recv #:tcp-close
-   #:tcp-set-recv-timeout
+   #:tcp-shutdown #:tcp-set-recv-timeout
    ;; gc control / measurement
    #:gc-suggest #:with-gc-inhibited #:bytes-consed
    ;; optimization hints

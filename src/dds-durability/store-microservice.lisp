@@ -1264,10 +1264,11 @@
 (defstruct* (ms-conn-slot (:constructor %make-ms-conn-slot))
   "One LIVE server-side connection in the multi-client registry (WP-DURABILITY-MS-MULTICLIENT, ADR 0050
    §4.7): its accepted socket CONN and the per-connection serve THREAD. The registry is a lock-guarded
-   list of these; microservice-server-stop drains it — closing each CONN wakes a serve thread parked in
-   recv, and each THREAD is then joined for a clean, leak-free shutdown. A serve thread self-removes its
-   slot from the registry (under the registry lock) when its connection closes, so a closed connection
-   frees its concurrency-cap slot promptly."
+   list of these; microservice-server-stop drains it — tcp-shutdown of each CONN wakes its serve thread
+   parked in recv (portable Linux + Darwin, §4.8), and each THREAD is then joined for a clean, leak-free
+   shutdown. A serve thread self-removes its slot from the registry (under the registry lock) when its
+   connection closes AND performs the SOLE tcp-close of its socket, so a closed connection frees its
+   concurrency-cap slot promptly and no socket is double-closed."
   (conn   nil :type t)
   (thread nil :type t))
 
@@ -1408,15 +1409,21 @@
   "Body of one per-connection serve THREAD (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7): serve SLOT's
    connection to completion (%ms-serve-connection — read/dispatch/reply until EOF or a per-connection
    fault, with the SERIOUS-CONDITION backstop + the armed RECV-TIMEOUT unchanged), then in an
-   unwind-protect cleanup SELF-REMOVE SLOT from the registry (under REG-LOCK) and close the socket. So a
-   normally-closing client frees its concurrency-cap slot promptly, and a fault / recv-timeout drops only
-   THIS thread — never another client's. Idempotent with stop's drain: if stop already removed the slot,
-   the DELETE is a no-op and the double tcp-close is ignore-error'd."
+   unwind-protect cleanup — ALL UNDER REG-LOCK — SELF-REMOVE SLOT from the registry AND tcp-close the
+   socket. So a normally-closing client frees its concurrency-cap slot promptly, and a fault / recv-timeout
+   drops only THIS thread — never another client's. This unwind is the SOLE tcp-close of the socket (ADR
+   0050 §4.8): microservice-server-stop's drain only tcp-shutdowns the socket to WAKE this thread's recv (no
+   stop-side close), so the socket owner closes it EXACTLY ONCE — no double-close fd-reuse TOCTOU. The
+   tcp-close runs UNDER REG-LOCK (not after it) so it is MUTUALLY EXCLUSIVE with stop's tcp-shutdown drain
+   (also under REG-LOCK): for any slot, stop's shutdown strictly precedes OR follows the owner's close,
+   never races it — closing the narrow stale-fd window (stop reading socket-file-descriptor mid-close and
+   shutting down a just-freed/reused fd). Idempotent with stop's drain: if stop already cleared the
+   registry, the DELETE is a no-op; the tcp-close is ignore-error'd."
   (unwind-protect
       (%ms-serve-connection (ms-conn-slot-conn slot) inner recv-timeout)
     (dds.pal:with-lock (reg-lock)
-      (setf (car reg-cell) (delete slot (car reg-cell))))
-    (ignore-errors (dds.pal:tcp-close (ms-conn-slot-conn slot)))))
+      (setf (car reg-cell) (delete slot (car reg-cell)))
+      (ignore-errors (dds.pal:tcp-close (ms-conn-slot-conn slot))))))
 
 (defun* %ms-serve-loop (listener inner stop-cell reg-cell reg-lock max-connections recv-timeout)
     (function (t durable-store cons cons t (integer 1) (or null (real 0))) t)
@@ -1555,18 +1562,36 @@
 
 (defun* microservice-server-stop (srv)
     (function (microservice-server) (eql t))
-  "Stop SRV cleanly and idempotently (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7): set the stop flag, wake
-   the blocked accept with a throwaway self-connection, JOIN the accept-loop thread (so no new connection is
-   registered after), DRAIN the connection registry — close every live connection (waking any serve thread
-   parked in recv) and JOIN every per-connection serve thread — close the listener, and FINALLY close the
-   inner store. Closing the inner LAST, after every serve thread has joined, guarantees no in-flight inner op
-   races the close (no half-write to a persistent inner). No thread leak, no lingering socket, no hang.
-   Returns T.
+  "Stop SRV cleanly and idempotently (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7; §4.8 clean-wake): set the
+   stop flag, wake the blocked accept with a throwaway self-connection, JOIN the accept-loop thread (so no
+   new connection is registered after), DRAIN the connection registry — SHUT DOWN every live connection
+   (tcp-shutdown, waking any serve thread parked in recv) and JOIN every per-connection serve thread — close
+   the listener, and FINALLY close the inner store. Closing the inner LAST, after every serve thread has
+   joined, guarantees no in-flight inner op races the close (no half-write to a persistent inner). No thread
+   leak, no lingering socket, no hang. Returns T.
+
+   CLEAN WAKE (ADR 0050 §4.8, N-A): the drain uses dds.pal:tcp-shutdown — shutdown(2) SHUT_RDWR — NOT
+   tcp-close, to wake a parked serve thread. shutdown portably unblocks a blocked recv on BOTH Linux +
+   Darwin (a cross-thread close does NOT reliably wake a foreign recv on Linux — the former 30 s / NIL-
+   timeout stall) and does NOT free the fd, so the SERVE THREAD (the socket owner) performs the SINGLE
+   tcp-close in its own unwind (%ms-serve-connection-in-thread). stop shuts down (wakes); the owner closes
+   once — eliminating BOTH the Linux-no-wake stall AND the stop-vs-serve double-close fd-reuse TOCTOU.
+
+   REG-LOCK SERIALIZATION (closes the stale-fd window): stop's tcp-shutdown drain pass runs UNDER REG-LOCK,
+   in the SAME critical section that grabs + clears the registry; the owner's tcp-close ALSO runs under
+   REG-LOCK (its self-removal section). So for any slot, stop's shutdown and the owner's close are MUTUALLY
+   EXCLUSIVE — one strictly precedes the other, never races. This closes the otherwise-narrow window where a
+   SPONTANEOUSLY-disconnecting owner is mid-close (after close(2), before the fd-slot=-1 write) when stop
+   reads its socket-file-descriptor and would shut down a just-freed/reused fd. The JOINS stay OUTSIDE
+   REG-LOCK (stop releases it before joining), so a woken serve thread can take REG-LOCK to self-remove +
+   close and exit — still deadlock-free.
 
    Ordering rationale: the accept-loop thread is joined BEFORE the drain so the registry is FINAL when
-   drained; the serve threads are joined WITHOUT holding REG-LOCK so a woken thread can take REG-LOCK to
-   self-remove (a no-op after the drain) and exit — no deadlock. The outer LOCK only guards double-stop; the
-   accept/serve threads never take it, so holding it across the joins is deadlock-free."
+   drained; the shutdown pass is UNDER REG-LOCK but the serve threads are joined WITHOUT holding REG-LOCK so
+   a woken thread can take REG-LOCK to self-remove + close (a no-op delete after the drain) and exit — no
+   deadlock (shutdown-under-lock → release → join-outside-lock → listener + inner LAST). The outer LOCK only
+   guards double-stop; the accept/serve threads never take it, so holding it across the joins is
+   deadlock-free."
   (dds.pal:with-lock ((microservice-server-lock srv))
     (unless (car (microservice-server-stop-cell srv))
       (setf (car (microservice-server-stop-cell srv)) t)
@@ -1576,12 +1601,25 @@
          (dds.pal:tcp-close waker)))
       ;; join the ACCEPT-LOOP thread first, so no new connection slot is registered after this point
       (ignore-errors (dds.pal:join (microservice-server-thread srv)))
-      ;; drain the registry: grab the live slots under REG-LOCK + clear it, then (outside the lock) close
-      ;; every connection to wake a parked serve thread and JOIN every serve thread for a clean exit
+      ;; drain the registry: UNDER REG-LOCK grab the live slots, clear the registry, AND tcp-shutdown every
+      ;; drained socket to WAKE its parked serve thread — all in ONE critical section; then RELEASE the lock
+      ;; and JOIN every serve thread OUTSIDE it for a clean exit. tcp-shutdown (not tcp-close) is the WAKE
+      ;; (ADR 0050 §4.8, N-A): shutdown(2) portably unblocks a recv on BOTH Linux + Darwin (close does NOT
+      ;; reliably wake a foreign recv on Linux -> a 30 s / NIL-timeout stall) AND does not free the fd, so the
+      ;; SERVE THREAD (the socket owner) does the SINGLE tcp-close in its own unwind — no double-close.
+      ;; The shutdown pass runs UNDER REG-LOCK, and the owner's tcp-close ALSO runs under REG-LOCK (its
+      ;; self-removal section), so the two are MUTUALLY EXCLUSIVE: stop's shutdown of a drained slot strictly
+      ;; precedes OR follows (never races) that slot owner's close — closing the narrow stale-fd window (a
+      ;; spontaneous-disconnect owner mid-close whose fd stop would otherwise read + shut down after reuse).
+      ;; CRITICAL: the JOINS stay OUTSIDE reg-lock — a woken serve thread needs reg-lock to self-remove +
+      ;; close, so holding it across the join would DEADLOCK; stop releases it first (shutdown-under-lock,
+      ;; release, join-outside-lock, then listener + inner LAST).
       (let ((slots (dds.pal:with-lock ((microservice-server-reg-lock srv))
-                     (prog1 (car (microservice-server-reg-cell srv))
-                       (setf (car (microservice-server-reg-cell srv)) nil)))))
-        (dolist (slot slots) (ignore-errors (dds.pal:tcp-close (ms-conn-slot-conn slot))))
+                     (let ((live (car (microservice-server-reg-cell srv))))
+                       (setf (car (microservice-server-reg-cell srv)) nil)
+                       (dolist (slot live)
+                         (ignore-errors (dds.pal:tcp-shutdown (ms-conn-slot-conn slot))))
+                       live))))
         (dolist (slot slots)
           (let ((th (ms-conn-slot-thread slot)))
             (when th (ignore-errors (dds.pal:join th))))))

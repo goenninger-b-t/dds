@@ -1911,6 +1911,44 @@ reject → existing-connection-works → close → recover), and `run-durability
 **structurally fixed**). Both impls green identically, Clasp first (Suite **507 → 512**; SBCL is the
 race-correctness oracle).
 
+### 8.10.7 Live 2-process interop + a server entrypoint + `tcp-shutdown` clean stop-wake (Slice 3c-4, the CAPSTONE — ADR 0050 §4.8)
+
+Slices 1–3c-3 were exercised in ONE Lisp image. Slice 3c-4 (WP-DURABILITY-MS-2PROCESS) exercises the backend
+**across REAL OS PROCESSES**, and closes the last cross-cutting defect (**N-A**) in the stop path.
+
+- **`dds.pal:tcp-shutdown (sock &optional direction)`** — `shutdown(2)` `SHUT_RDWR` (constant `2`, identical
+  on Darwin + Linux, no reader conditional). It portably **WAKES a thread blocked in `recv`** on BOTH OSes
+  (a cross-thread `tcp-close` does NOT reliably wake a foreign `recv` on Linux) AND does **not free the fd**.
+  `microservice-server-stop`'s registry drain now `tcp-shutdown`s each live connection to WAKE its serve
+  thread; the **serve thread (the socket owner) then does the SINGLE `tcp-close`** in its own unwind. stop
+  shuts down → wakes → joins; the owner closes once — closing **both** the Linux-no-wake **stall** AND the
+  stop-vs-serve **double-close TOCTOU**. Both stop's shutdown pass and the owner's close run **under
+  `reg-lock`** (mutually exclusive), which closes the narrow stale-fd window where a spontaneously-closing
+  owner's fd could be read mid-close + shut down after reuse; the JOINS stay OUTSIDE `reg-lock`, so the
+  lifecycle is still deadlock-free (shutdown-under-lock → release → join-outside-lock → listener + inner
+  LAST). Verified by `run-durability-microservice-stop-wakes-test` (both impls, bounded): N serve threads
+  blocked in `recv` with `:recv-timeout NIL` (so only the wake can unblock them) → stop (run under a 10 s
+  **watchdog** so a wake regression fails RED, never hangs the suite) returns promptly + drains to 0 + every
+  thread exits clean.
+- **A server entrypoint + a live 2-process harness.** `interop/durability-persistent/driver-ms-server.lisp`
+  runs a reference server as its own process (over a DARE-blind persistent `make-file-store` inner opened
+  `KEEP_ALL`, block-until-`SIGTERM`); `driver-ms-client.lisp` is a small put / get-range / reconnect client
+  built via the SAME `make-durability-store-factory "microservice"` seam the DDS drivers use;
+  `run-microservice.sh` is a BOUNDED harness (every wait deadline-capped, all PIDs + the temp tree cleaned in
+  a trap, non-zero on failure) proving **LEG 1** a PUT client process → a GET client process recovers
+  **byte-exact across processes**, and **LEG 2** a server-process RESTART (same port + inner dir, v2 replays
+  the fsync'd frames) with a mid-session **client reconnect (Slice 1) + persistent byte-exact recovery**.
+
+```sh
+# live 2-process proof (server process + client processes); BOUNDED, self-cleaning, non-zero on failure
+interop/durability-persistent/run-microservice.sh    # LEG 1 PUT->GET + LEG 2 restart+reconnect, ALL LEGS PASS
+```
+
+The server is **DARE-BLIND** (it stores only opaque sealed frames; the client holds the DARE key + the
+log-MAC chain in its LOCAL epoch-dir/key-dir). An operator-runnable `main.lisp --backend microservice` CLI
+mode is a clean **follow-on** — the `driver-ms-server.lisp` entrypoint is the shipped artifact this slice.
+Both impls green identically, Clasp first (Suite **513 → 514**).
+
 ---
 
 ## 9. Cross-references

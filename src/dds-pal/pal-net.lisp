@@ -231,6 +231,32 @@
         (sb-bsd-sockets:socket-error () (return-from tcp-recv nil))))
     len))
 
+;; shutdown(2) SHUT_RDWR (disable BOTH directions of a connected stream socket). The value 2 is IDENTICAL
+;; on Darwin (sys/socket.h) and Linux (bits/socket.h) — a POSIX/OS ABI constant, NOT impl-specific — so it
+;; carries NO #+sbcl/#+clasp conditional (verified against both OS headers: SHUT_RD 0 / SHUT_WR 1 /
+;; SHUT_RDWR 2 on each). Raw foreign-funcall like %setsockopt above (sb-bsd-sockets exposes no portable
+;; shutdown across both impls); the fd comes from socket-file-descriptor, native on SBCL contrib + Clasp.
+(defconstant +shut-rdwr+ 2
+  "shutdown(2) SHUT_RDWR: disable both directions. Value 2 on Darwin + Linux (verified vs sys/socket.h).")
+
+(defun* tcp-shutdown (socket &optional (direction +shut-rdwr+))
+    (function (t &optional fixnum) t)
+  "shutdown(2) stream SOCKET in DIRECTION (default +shut-rdwr+ = both directions). WAKES a thread blocked
+   in tcp-recv on SOCKET on BOTH Darwin + Linux (portably — unlike tcp-close, which does not reliably
+   unblock a foreign recv on Linux) and does NOT release the fd — so, unlike close, it never ITSELF orphans
+   or reuses the fd. This is the cross-thread WAKE the durability microservice-server-stop sends a parked
+   serve thread so the thread's OWN unwind does the single tcp-close (stop shuts down; the socket owner
+   closes exactly once — no double-close TOCTOU). CAVEAT: the fd is read here via socket-file-descriptor, so
+   if this is called CONCURRENTLY with the socket owner's tcp-close of the SAME socket, that read can be
+   stale (mid-close: after close(2), before the impl writes fd=-1) and shutdown could then land on a
+   just-freed/reused fd. tcp-shutdown does not itself serialize that — the CALLER must (microservice-server-
+   stop shuts down + the owner closes both UNDER the registry lock, so the two are mutually exclusive; ADR
+   0050 §4.8). Ignores the syscall return: a shutdown on an already-closed / already-shutdown /
+   never-connected socket is a harmless no-op (callers wrap it in ignore-errors regardless)."
+  (cffi:foreign-funcall "shutdown" :int (sb-bsd-sockets:socket-file-descriptor socket)
+                        :int direction :int)
+  t)
+
 (defun* tcp-close (socket)
     (function (t) t)
   "Close stream SOCKET."

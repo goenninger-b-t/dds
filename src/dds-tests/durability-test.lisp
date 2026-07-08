@@ -752,9 +752,15 @@
                   (unwind-protect
                        (progn
                          (dds.durability:supervisor-start sup)
-                         ;; wait up to 5 s for shed
+                         ;; wait up to 5 s for the SHED HOOK to fire (not just the shed flag): the flag is
+                         ;; set UNDER the supervisor lock, but the :supervisor-shed hook fires AFTER the lock
+                         ;; releases, so waiting on the flag races the hook's shed-context setf (SUP-HOOK-
+                         ;; CONTEXT flake). Waiting until shed-context is :supervisor-shed guarantees the hook
+                         ;; has fired with the terminal context (the flag was necessarily set earlier); a
+                         ;; transient :supervisor-restart-failed hook call is overwritten, so this can't
+                         ;; false-exit. Test-only wait condition — the supervisor is untouched. Bounded.
                          (loop repeat 1000
-                               until (dds.durability:supervisor-shed-p sup "sup-crash-test")
+                               until (eq :supervisor-shed shed-context)
                                do (sleep 0.005)))
                     (setf dds.durability:*durability-debug-start-fault* nil))
                   (%check :sup-shed
@@ -8848,6 +8854,75 @@
                          clients)
                   "every former client connection is closed — a post-stop op signals cleanly (no hang/crash)"))
       (progn (dolist (s clients) (ignore-errors (dds.durability:store-close s)))
+             (ignore-errors (dds.durability:microservice-server-stop srv)))))
+  t)
+
+(defun* run-durability-microservice-stop-wakes-test ()
+    (function () t)
+  "N-A CLEAN-WAKE gate (WP-DURABILITY-MS-2PROCESS, ADR 0050 §4.8): with N serve threads BLOCKED in recv on
+   a server whose :recv-timeout is NIL — so a parked serve thread has NO idle timeout to self-wake and the
+   ONLY thing that can unblock its recv is stop's wake — microservice-server-stop returns PROMPTLY, drains
+   the registry to 0, and every serve thread exits clean. This proves dds.pal:tcp-shutdown WAKES the parked
+   recvs and the wake is LOAD-BEARING: were it a no-op, stop's join would hang (recv-timeout NIL removes any
+   internal rescue). The wake is tcp-shutdown (portable Linux + Darwin), NOT tcp-close, so the SERVE THREAD
+   is the SOLE closer of its socket — no stop-vs-serve double-close fd-reuse TOCTOU, and (NIT-1) stop's
+   shutdown + the owner's close are BOTH under reg-lock so they never race (§4.8).
+
+   WATCHDOG (NIT-3): stop is run on a throwaway thread and awaited under a bounded 10 s deadline, so a WAKE
+   REGRESSION FAILS RED here within seconds instead of HANGING the suite (stop has no internal deadline and
+   recv-timeout NIL removes the rescue). The SUBSET arm (2 clients close NORMALLY before stop → their serve
+   threads self-remove from the registry AND self-close UNDER reg-lock BEFORE stop's drain) proves stop
+   cleanly drains + joins a registry some clients have ALREADY LEFT — it does NOT exercise 'shutdown of an
+   already-owner-closed socket' (those slots have left the registry, so stop never shuts them down; with
+   NIT-1's reg-lock serialization stop never shuts down an already-closed slot at all). tcp-shutdown's
+   already-closed safety is BY CONSTRUCTION (a shutdown of an owner-closed socket reads fd=-1 → harmless
+   EBADF), not proven by this arm. Plus IDEMPOTENCE (a second stop is a no-op). Bounded throughout. Both
+   impls, Clasp first (the RED — a cross-thread close not waking a foreign recv — manifests as a stop stall
+   on Linux; on Darwin the gate proves the GREEN wake + the single-close/no-double-close + drained
+   invariants hold; a regression fails via the watchdog on either)."
+  (let* ((n 5)
+         (srv  (dds.durability:make-microservice-server :port 0 :recv-timeout nil))   ; NIL: only stop's wake unblocks a parked recv
+         (port (dds.durability:microservice-server-port srv))
+         (parked '())
+         (closed-early '()))
+    (unwind-protect
+        (progn
+          ;; N clients open (one round-trip each) -> their serve threads then park in recv (no timeout to self-wake)
+          (dotimes (i n)
+            (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+              (dds.durability:store-open s)
+              (push s parked)))
+          (%check :ms-wake-live-n (%tms-wait-until (lambda () (= n (%tms-live-conns srv))) 5)
+                  (format nil "the registry holds ~d serve threads parked in recv before stop" n))
+          ;; SUBSET arm: close 2 clients normally FIRST -> their serve threads self-remove from the registry
+          ;; + self-close UNDER reg-lock BEFORE stop, so stop's drain sees a SUBSET (only the still-parked
+          ;; remainder) and never touches the already-gone slots. Proves stop cleanly drains a registry some
+          ;; clients have left; NOT a shutdown-of-an-already-closed socket (those slots left the registry).
+          (dotimes (i 2)
+            (let ((s (pop parked))) (push s closed-early) (dds.durability:store-close s)))
+          (%check :ms-wake-live-subset (%tms-wait-until (lambda () (= (- n 2) (%tms-live-conns srv))) 5)
+                  (format nil "after 2 normal closes exactly ~d serve threads remain parked (the rest self-exited)" (- n 2)))
+          ;; stop under a WATCHDOG (NIT-3): run stop on a throwaway thread + await it under a bounded deadline,
+          ;; so a wake REGRESSION fails RED here (recv-timeout NIL -> stop would otherwise hang the suite).
+          (let* ((done (list nil)) (ret (list nil))
+                 (t0 (get-internal-real-time)))
+            (dds.pal:spawn (lambda () (setf (car ret) (dds.durability:microservice-server-stop srv))
+                             (setf (car done) t))
+                           :name "ms-stop-wakes-watchdog")
+            (let* ((completed (%tms-wait-until (lambda () (car done)) 10))   ; bounded: a wake regression FAILS, never hangs
+                   (elapsed (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+              (%check :ms-wake-no-hang completed
+                      (format nil "stop completed within the 10 s WATCHDOG (a wake regression FAILS red here, not a suite hang; ~,2f s)" elapsed))
+              (%check :ms-wake-returns (eq t (car ret)) "microservice-server-stop returned T")
+              (%check :ms-wake-prompt (and completed (< elapsed 5))
+                      (format nil "stop WOKE (tcp-shutdown) + joined all parked serve threads PROMPTLY (~,2f s, no recv-NIL stall)" elapsed))
+              (%check :ms-wake-drained (and completed (= 0 (%tms-live-conns srv)))
+                      "the registry is DRAINED to 0 (every serve thread woke, self-removed, single-closed — no leak)")))
+          ;; idempotent: a second stop is a clean no-op (the outer LOCK + stop-cell guard double-invocation)
+          (%check :ms-wake-idempotent (eq t (dds.durability:microservice-server-stop srv))
+                  "a second microservice-server-stop is an idempotent no-op (returns T, no crash)"))
+      (progn (dolist (s parked) (ignore-errors (dds.durability:store-close s)))
+             (dolist (s closed-early) (ignore-errors (dds.durability:store-close s)))
              (ignore-errors (dds.durability:microservice-server-stop srv)))))
   t)
 

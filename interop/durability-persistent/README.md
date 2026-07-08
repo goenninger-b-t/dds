@@ -87,6 +87,33 @@ Everything else (the foreign QoS profiles, ports, kill-stale-procs-first, the pu
 late-joiner) is **identical** to the `interop/durability-transient/` and `interop/durability-dare/`
 runbooks. Read `interop/durability-transient/README.md` for the full annotated rationale.
 
+## Microservice backend — live 2-process interop (ADR 0050 §4.8, WP-DURABILITY-MS-2PROCESS)
+
+A SELF-CONTAINED (no foreign DDS) proof that the durability **MICROSERVICE** backend works across REAL OS
+PROCESSES — a server process + separate client processes. Three artifacts:
+
+- **`driver-ms-server.lisp`** — a reference microservice server as its own process: `make-microservice-server`
+  over a **DARE-BLIND** persistent `make-file-store` inner (opened `KEEP_ALL`; the encrypted-store decorator
+  owns retention), on the FIXED port `DPERSIST_MS_PORT` with the inner dir `DPERSIST_MS_INNER`. Logs
+  `MS-SERVER-LISTENING port=P`, **blocks until `SIGTERM`/`SIGINT`**, then `microservice-server-stop` (the
+  clean `dds.pal:tcp-shutdown` stop-wake) and logs `MS-SERVER-STOPPED`. The server stores only opaque frames;
+  the CLIENT holds the DARE key + the log-MAC chain in its LOCAL `DPERSIST_DIR`/`DPERSIST_KEYDIR`.
+- **`driver-ms-client.lisp`** — a small `put` / `get` / `reconnect` client (env `DPERSIST_MS_OP`), built via
+  the SAME `make-durability-store-factory "microservice"` seam `driver-collect`/`driver-serve` use.
+- **`run-microservice.sh`** — a **BOUNDED** harness (every wait deadline-capped, all PIDs + the temp tree
+  cleaned in a trap, non-zero on failure — it never hangs). **LEG 1**: a PUT client process → a GET client
+  process recovers **byte-exact across processes**. **LEG 2**: a server-process RESTART (same port + inner
+  dir, v2 replays the fsync'd frames) with a mid-session **client reconnect (Slice 1) + persistent byte-exact
+  recovery**.
+
+```sh
+# from repo root; SBCL-only (NFR-PORT); needs OpenSSL >= 3.5 (always-on DARE) — ALL LEGS PASS
+interop/durability-persistent/run-microservice.sh
+```
+
+(An operator-runnable `main.lisp --backend microservice` CLI mode is a clean follow-on — the server driver
+is the entrypoint this slice.)
+
 ## Foreign-peer configuration
 
 Copied verbatim from `interop/durability-dare/` so this harness is self-contained:

@@ -4010,6 +4010,7 @@
                  ("durability-mem-replace-atomicity"  . run-durability-mem-replace-atomicity-test)
                  ("durability-microservice-concurrent-clients" . run-durability-microservice-concurrent-clients-test)
                  ("durability-microservice-stop-closes-all" . run-durability-microservice-stop-closes-all-test)
+                 ("durability-microservice-stop-wakes" . run-durability-microservice-stop-wakes-test)
                  ("durability-microservice-max-connections" . run-durability-microservice-max-connections-test)
                  ("durability-microservice-slow-drip-concurrent" . run-durability-microservice-slow-drip-concurrent-test)
                  ("durability-microservice-spawn-fail" . run-durability-microservice-spawn-fail-test)
