@@ -3802,6 +3802,7 @@
                  ("n-reader-2c3-zc-uaf"      . dds.disc:run-n-reader-2c3-zc-uaf-test)
                  ("n-reader-2c3-secured-purge-defer" . dds.disc:run-n-reader-2c3-secured-purge-defer-test)
                  ("n-reader-2c3-watermark-purge" . dds.disc:run-n-reader-2c3-watermark-purge-test)
+                 ("n-reader-2c3-zc-refcount-leak" . dds.disc:run-n-reader-2c3-zc-refcount-leak-test)
                  ("n-reader-2c3-joiner-window" . run-n-reader-2c3-joiner-window-test)
                  ("large-data-over-udp"      . dds.disc:run-large-dataplane-test)
                  ("lost-final-sample-repair" . dds.disc:run-lost-final-sample-test)

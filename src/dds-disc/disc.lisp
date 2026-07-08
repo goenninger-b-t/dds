@@ -686,6 +686,15 @@
     (when inner (loop for sn being the hash-keys of inner do (when (> sn m) (setf m sn))))
     m))
 
+(defun* %node-reader-join-watermark-unlocked (node reader-entity-id writer-guid)
+    (function (disc-node (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) integer)
+  "WP-DDS-ZC-REFCOUNT-LEAK (ADR 0048 §17.7): the lock-free body of node-reader-join-watermark — the frozen ZC-joiner
+   high-water for local reader READER-ENTITY-ID against remote writer WRITER-GUID (0 if not a frozen joiner). CALLER
+   HOLDS THE NODE LOCK. Split out so the demux (%deliver-user-marker via %count-eligible-drainers, already under the
+   node lock) reads watermarks WITHOUT re-taking the lock — calling the public lock-taking accessor there would deadlock."
+  (let ((inner (gethash reader-entity-id (disc-node-reader-join-watermarks node))))
+    (if inner (gethash writer-guid inner 0) 0)))
+
 (defun* node-reader-join-watermark (node reader-entity-id writer-guid)
     (function (disc-node (unsigned-byte 32) (simple-array (unsigned-byte 8) (16))) integer)
   "WP-N-ENDPOINT-2C3 (ADR 0048/0017): the ZC-joiner high-water for local reader READER-ENTITY-ID against remote
@@ -694,8 +703,26 @@
    mid-stream ZC joiner never drains a marker delivered before it joined (whose demux %zc-bump did not count it).
    Node-lock guarded."
   (dds.pal:with-lock ((disc-node-lock node))
-    (let ((inner (gethash reader-entity-id (disc-node-reader-join-watermarks node))))
-      (if inner (gethash writer-guid inner 0) 0))))
+    (%node-reader-join-watermark-unlocked node reader-entity-id writer-guid)))
+
+(defun* %count-eligible-drainers (node writer-guid sn ids)
+    (function (disc-node (simple-array (unsigned-byte 8) (16)) integer list) (integer 0))
+  "WP-DDS-ZC-REFCOUNT-LEAK (ADR 0048 §17.7): count the route members (local reader EntityIds IDS, matched to remote
+   writer WRITER-GUID) that WILL drain the marker at SN — those for whom SN > their frozen join-watermark, the EXACT
+   W-term of the %drain gate (dds.dcps %drain: SN > max(dr-drained, join-watermark)). %deliver-user-marker sizes the
+   ZC slot refcount bump to (this - 1) (over the writer's preset 1) so a FROZEN joiner (watermark >= SN, which SKIPS
+   the marker) is NOT counted -> its phantom +1 is never added -> the slot's refcount can reach 0 -> no leak. CALLER
+   HOLDS THE NODE LOCK.
+   MEMORY-SAFETY (the #1 constraint): this omits the dcps-layer dr-drained term (unreachable from dds.disc — dds.dcps
+   depends on dds.disc, never the reverse), and dr-drained can only RAISE the effective watermark; hence this count is
+   a SUPERSET of the true drainers (SN > max(dr-drained, wm) implies SN > wm) and NEVER a subset — it can OVER-count
+   (a smaller SAFE leak) but NEVER UNDER-count (an under-count would free a slot a drainer still holds = a cross-reader
+   use-after-free, strictly worse than the leak). The frozen watermark is CONSTANT from demux through drain for a
+   matched reader (frozen at route-add, purged only on unmatch), so a reader counted here is EXACTLY a reader the drain
+   gate's W-term admits — no premature release. The strict `>` matches the drain gate: SN == watermark is NOT a drainer."
+  (let ((n 0))
+    (dolist (rid ids n)
+      (when (> sn (%node-reader-join-watermark-unlocked node rid writer-guid)) (incf n)))))
 
 (defun* node-user-reader-count (node)
     (function (disc-node) (integer 0))

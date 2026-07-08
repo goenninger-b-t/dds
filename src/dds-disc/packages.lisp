@@ -80,6 +80,7 @@
            #:run-mcast-discovery-test #:run-dataplane-test #:run-n-writer-dataplane-test #:run-n-same-topic-writer-dataplane-test #:run-n-writer-frag-heartbeat-test #:run-n-reader-dataplane-test
            #:run-n-reader-s4-decode-tier-test #:run-n-reader-s4-zc-marker-test
            #:run-n-reader-2c3-zc-uaf-test #:run-n-reader-2c3-secured-purge-defer-test #:run-n-reader-2c3-watermark-purge-test
+           #:run-n-reader-2c3-zc-refcount-leak-test
            #:run-large-dataplane-test #:run-participant-liveliness-test
            #:run-locator-filter-test #:run-lost-final-sample-test
            #:run-dispose-dataplane-test #:run-dispose-repair-test

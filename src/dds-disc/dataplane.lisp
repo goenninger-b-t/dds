@@ -2382,20 +2382,26 @@
    WP-N-ENDPOINT-S4 (ADR 0048): the marker is delivered to the CANONICAL reader MATCHED to this writer
    (%reader-routes-for demux, mirroring the secured %deliver-user-sample) — NOT unconditionally the primary — so
    each ZC reader's loan/marker state is driven only by ITS OWN writers. N=1/pre-match -> primary, byte-identical.
-   WP-N-ENDPOINT-2C3 (ADR 0017/0048; MEMORY-SAFETY): with K same-topic LOAN-CAPABLE readers co-located on this
-   node, ALL K drain THIS one stored marker (the never-purged store + per-reader dr-drained fan-out) and each
-   %zc-releases the slot once. The writer's %zc-loan preset the slot's refcount to 1 (per-PARTICIPANT, %zc-ref-
-   builder) which covers reader #1; readers #2..#K each need a hold. DEMUX-TIME BUMP: on the receiver thread, K is
-   the route length RE-READ UNDER the node lock (the authoritative membership, NOT the pre-dedup snapshot), and the
-   {K -> %zc-bump(K-1) -> store} sequence runs in ONE node-lock hold BEFORE the marker is stored (hence before it is
-   drainable, hence strictly before any %zc-release). The slot is provably held (refcount>=1 — no reader has
-   drained/released yet; the receiver never releases here), so its generation is STABLE and the bump's up-front
-   generation read cannot race a reclaim. All K holders are counted BEFORE any read/return, so reader-A's return-loan
-   (1 decrement) can never free a slot reader-B still views (the invariant); the slot frees only at the true refcount
-   0. Because a JOINER's high-water freeze (%reader-route-add) runs under the SAME node lock, the demux and the
-   route-add serialize: a marker stored before a joiner joined is <= its watermark (skipped, unbumped-for-it) and one
-   stored after has it in this snapshot (bumped for it) — no drain-an-unbumped-marker window. K=1 (N=1 / different-
-   topic S4) -> no bump, byte-identical. NOT cleared for ship — pending counsel (R6)."
+   WP-N-ENDPOINT-2C3 / WP-DDS-ZC-REFCOUNT-LEAK (ADR 0017/0048 §17.7; MEMORY-SAFETY): with same-topic LOAN-CAPABLE
+   readers co-located on this node, each reader that WILL drain THIS one stored marker (the never-purged store +
+   per-reader dr-drained fan-out) %zc-releases the slot once; a FROZEN joiner does NOT drain it, so it must NOT be
+   counted. The writer's %zc-loan preset the slot's refcount to 1 (per-PARTICIPANT, %zc-ref-builder) which covers ONE
+   drainer; the OTHER drainers each need a hold. DEMUX-TIME BUMP: on the receiver thread, ELIGIBLE = %count-eligible-
+   drainers = the route members (RE-READ UNDER the node lock — authoritative, NOT the pre-dedup snapshot) that WILL
+   drain THIS marker (SN > their frozen join-watermark, the EXACT W-term of the %drain gate), and the {ELIGIBLE ->
+   %zc-bump(ELIGIBLE-1) -> store} sequence runs in ONE node-lock hold BEFORE the marker is stored (hence before it is
+   drainable, hence strictly before any %zc-release). A FROZEN joiner (watermark >= SN) is EXCLUDED from ELIGIBLE, so
+   its phantom +1 is NEVER added -> the slot reaches refcount 0 -> reclaimable (§17.7: raw route-length K counted the
+   joiner -> a permanently leaked slot). refcount = preset 1 + (ELIGIBLE-1) = ELIGIBLE; each drainer releases once ->
+   0. ELIGIBLE omits the dcps dr-drained term (unreachable from disc) which only RAISES the drain bar, so ELIGIBLE is a
+   SUPERSET of the true drainers -> NEVER under-counts a drainer -> a drainer's slot is never freed under its read (an
+   under-count would be a cross-reader use-after-free, strictly worse than the leak). The slot is provably held
+   (refcount>=1 — no reader has drained/released yet; the receiver never releases here), so its generation is STABLE
+   and the bump's up-front generation read cannot race a reclaim; the slot frees only at the true refcount 0. Because a
+   JOINER's high-water freeze (%reader-route-add) runs under the SAME node lock, the demux and the route-add serialize:
+   a marker stored before a joiner joined is <= its watermark (skipped AND excluded from ELIGIBLE) and one stored after
+   has it in this snapshot (counted iff it will drain) — no drain-an-unbumped-marker window. ELIGIBLE <= 1 / route
+   length <= 1 (N=1 / different-topic S4) -> no bump, byte-identical. NOT cleared for ship — pending counsel (R6)."
   (let* ((guid (%source-guid src-prefix writer-id))
          (routes (%reader-routes-for node guid))     ; WP-N-ENDPOINT-S4: the ZC reader(s) matched to this writer (mirrors %deliver-user-sample's demux)
          (canon (and routes (cdr (first routes)))))   ; the CANONICAL engine reader (N=1/pre-match -> primary, byte-identical to the old primary-only path)
@@ -2405,24 +2411,29 @@
                                         (make-array 0 :element-type '(unsigned-byte 8)))
       ;; app delivery gated: only if this (logical-origin GUID, SN) pair is new (§8.3.5.4)
       (when (dds.rtps.reliable:reader-dedup-accept-p canon effective-guid effective-sn)
-        ;; WP-N-ENDPOINT-2C3 (MEMORY-SAFETY): the {route re-snapshot -> K -> %zc-bump(K-1) -> store} sequence is
-        ;; ATOMIC under ONE node-lock hold. Re-read the route UNDER the lock (not the pre-dedup snapshot) so the
-        ;; route membership the bump counts EQUALS the membership at store, and a concurrent %reader-route-add
-        ;; (which freezes a JOINER's high-water under the SAME lock) is strictly before-or-after this whole section:
-        ;; a marker stored before a joiner's route-add is <= its frozen watermark (skipped, never bumped for it); a
-        ;; marker stored after has the joiner in this snapshot (bumped for it). This closes the demux slip a
-        ;; snapshot-outside/store-inside split would leave. The bump counts all K co-located same-topic holders
-        ;; (raising the slot hold from the writer's preset 1 to K) BEFORE the marker is stored -> drainable ->
-        ;; releasable. %zc-bump is a CAS on the pool SAP (no lock), so it is deadlock-free under the node lock.
-        ;; Guarded on a real pool-sap (a NIL-pool test marker never bumps); K=1 -> no bump (N=1 / S4 byte-identical).
+        ;; WP-N-ENDPOINT-2C3 / WP-DDS-ZC-REFCOUNT-LEAK (ADR 0048 §17.7; MEMORY-SAFETY): {re-snapshot the route ->
+        ;; ELIGIBLE -> %zc-bump(ELIGIBLE-1) -> store} ATOMIC under ONE node-lock hold (serialises with the joiner
+        ;; freeze in %reader-route-add, which runs under the SAME lock). ELIGIBLE = %count-eligible-drainers = the
+        ;; route members that WILL drain THIS marker (SN > their frozen join-watermark, the EXACT W-term of the %drain
+        ;; gate), so a FROZEN joiner (watermark >= SN, which SKIPS this marker) is EXCLUDED -> no phantom +1 -> the
+        ;; slot's refcount reaches 0 (§17.7 leak fix; raw route-length K counted the joiner -> a permanently leaked slot).
+        ;; ELIGIBLE omits the dcps dr-drained term (unreachable from disc) which only RAISES the drain bar, so ELIGIBLE
+        ;; is a SUPERSET of the true drainers -> NEVER under-counts a drainer -> never frees a slot a drainer still holds
+        ;; (an under-count would be a use-after-free, strictly worse than the leak — see %count-eligible-drainers).
+        ;; refcount = preset 1 + (ELIGIBLE-1) = ELIGIBLE; each drainer %zc-releases once -> reaches exactly 0. The bump
+        ;; is a lock-free CAS run BEFORE the marker is stored (hence before drainable, before any release), so it is
+        ;; deadlock-free under the node lock and its up-front generation read cannot race a reclaim (refcount>=1). Real
+        ;; pool-sap only (a NIL-pool test marker never bumps); route length <= 1 or ELIGIBLE <= 1 -> no bump (the delta
+        ;; is clamped >= 0 — no negative bump / refcount underflow; N=1 / different-topic S4 stays byte-identical).
         (dds.pal:with-lock ((disc-node-lock node))
-          (let* ((ids (gethash guid (disc-node-reader-routes node)))   ; the AUTHORITATIVE route under the lock (empty -> primary fallback -> K=1)
-                 (k (if ids (length ids) 1)))
-            (when (and (> k 1) (zc-loan-marker-pool-sap marker))
-              (dds.xport.zerocopy::%zc-bump (zc-loan-marker-pool-sap marker)
-                                            (zc-loan-marker-slot-index marker)
-                                            (zc-loan-marker-generation marker)
-                                            (1- k)))
+          (let ((ids (gethash guid (disc-node-reader-routes node))))   ; the AUTHORITATIVE route under the lock (empty / length-1 -> primary fallback -> no bump)
+            (when (and ids (cdr ids) (zc-loan-marker-pool-sap marker))   ; route length >= 2 AND a real pool slot
+              (let ((eligible (%count-eligible-drainers node guid sn ids)))   ; count ONLY members that WILL drain (SN > join-watermark) — frozen joiners excluded (§17.7)
+                (when (> eligible 1)   ; preset 1 covers one drainer; bump the rest (eligible-1) >= 1; eligible <= 1 -> no bump (no negative delta -> no underflow)
+                  (dds.xport.zerocopy::%zc-bump (zc-loan-marker-pool-sap marker)
+                                                (zc-loan-marker-slot-index marker)
+                                                (zc-loan-marker-generation marker)
+                                                (1- eligible)))))
             (setf (gethash sn (%inner-table (disc-node-samples node) guid)) marker
                   (gethash sn (%inner-table (disc-node-sample-writers node) guid)) writer-id
                   (gethash sn (%inner-table (disc-node-sample-writer-guids node) guid)) guid)
@@ -4073,6 +4084,97 @@
                            (assert (= 1 (rc slot)) () "2c-3 GEN-GUARD: the reused slot's refcount must be untouched by the stale release")
                            (dds.xport.zerocopy::%zc-release sap slot rg2))))))   ; clean up the re-loan
                  (dds.xport.zerocopy::%zc-destroy sap))
+               t)
+          (stop-node zn)
+          (dds.pal:free-static m)))))
+
+(defun* run-n-reader-2c3-zc-refcount-leak-test ()
+    (function () (eql t))
+  "WP-DDS-ZC-REFCOUNT-LEAK (ADR 0048 §17.7; MEMORY-SAFETY): the out-of-order-across-join ZC slot refcount LEAK — the
+   headline RED->GREEN — plus the NO-UAF / no-under-count + ELIGIBLE>=1 clamp gates. Model-level (a LOCAL 1-slot static
+   pool), ONE participant, TWO same-topic ZC-loan-capable readers A,B routed to ONE source writer W. A routed FIRST
+   (empty route -> NOT frozen, watermark 0). A marker SN=5 is stored (raising max-stored to 5); THEN B joins -> frozen
+   to 5. A LOWER-SN marker SN=3 arrives OUT OF ORDER: B's watermark 5 >= 3 -> B SKIPS it in %drain. The demux bumps by
+   (ELIGIBLE-1), ELIGIBLE = {A} (SN=3 > watermark 0; B excluded, SN=3 > 5 false) = 1 -> NO bump -> refcount stays at
+   the writer's preset 1. A drains (acquire+release) -> refcount 0 -> the slot is RECLAIMABLE (a writer re-loan reuses
+   it). RED (pre-fix, raw route-length K=2): the demux bumped K-1=1 -> refcount 2; A's single release -> 1; B skips
+   (never releases) -> refcount STUCK at 1 -> the slot NEVER reclaims -> the pool erodes (a later writer degrades to
+   non-ZC). This test drives BOTH bumps on the slot to prove RED->GREEN directly.
+   NO-UAF / NO-UNDER-COUNT: ELIGIBLE is the EXACT drain-gate W-term (SN > join-watermark) — unit-checked incl. the
+   boundary (SN==watermark -> NOT eligible, matching the strict `>` gate) — and a SUPERSET of the true drainers (it
+   omits dr-drained), so every reader that ACTUALLY drains IS counted (A here) -> the refcount never underflows -> a
+   drainer's slot is never freed under its read (A's read is asserted refcount-protected). ELIGIBLE>=1 invariant: with
+   the never-frozen first reader A present ELIGIBLE >= 1 (unit-checked); with only frozen readers ELIGIBLE=0
+   (unit-checked) -> the `(> eligible 1)` demux guard clamps the delta to >= 0 (never a -1 bump). SBCL-only: the ZC
+   refcount primitives are cas-sap-u32 (SBCL PAL; NFR-PORT ZC gap on Clasp, ADR 0018). NOT cleared for ship (R6)."
+  (if (not (eq (dds.pal:pal-impl-name) :sbcl))
+      (progn (format t "~&  [skip] n-reader-2c3-zc-refcount-leak: %zc-bump/%zc-release use cas-sap-u32 (SBCL-only, ADR 0018) — NFR-PORT gap~%") t)
+      (let ((m (dds.pal:alloc-static (dds.xport.zerocopy::%zc-bytes 1 64)))
+            (pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x60))
+            (payload (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(#xA1 #xA2 #xA3 #xA4 #xA5 #xA6 #xA7 #xA8)))
+            (other (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(#x1F #x2F #x3F #x4F #x5F #x6F #x7F #x8F)))
+            (zn (make-disc-node :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element #x61)
+                                :host "127.0.0.1" :port 0)))
+        (unwind-protect
+             (let ((sap (dds.pal:static-pointer m)))
+               (flet ((rc (slot) (dds.pal:load-sap-u32 sap (+ (dds.xport.zerocopy::%zc-slot-off sap slot)
+                                                              dds.xport.zerocopy::+zc-slot-off-refcount+))))
+                 (dds.xport.zerocopy::%zc-init sap 1 64)
+                 (set-zc-loan-capable zn t)
+                 (add-local-reader zn :topic "Z2C3L" :type "X") (enable-subscriber zn)
+                 (let ((ida (disc-node-user-reader-id zn)))
+                   (add-local-reader zn :topic "Z2C3L" :type "X") (enable-subscriber zn)
+                   (let ((idb (disc-node-user-reader-id zn))
+                         (gw (%source-guid pa #x00000102)))
+                     (assert (/= ida idb) () "2c-3 leak: the 2 same-topic ZC readers must get distinct EntityIds")
+                     (%reader-route-add zn gw ida)   ; A FIRST: empty route -> NOT frozen (watermark 0)
+                     (assert (= 0 (node-reader-join-watermark zn ida gw)) () "2c-3 leak: the first reader (empty route) must NOT be frozen")
+                     (%deliver-user-marker zn #x00000102 5 (%make-zc-loan-marker :slot-index 0) pa gw 5)   ; NIL-pool SN=5 -> raises max-stored to 5 (no refcount)
+                     (%reader-route-add zn gw idb)   ; B joins: route non-empty -> frozen to max-stored (5)
+                     (assert (= 5 (node-reader-join-watermark zn idb gw)) () "2c-3 leak: the joiner B must be frozen to the max stored SN (5)")
+                     ;; ELIGIBLE unit checks (caller-holds-lock): the EXACT drain-gate W-term + boundary + the ELIGIBLE>=1 / =0 clamp
+                     (dds.pal:with-lock ((disc-node-lock zn))
+                       (let ((ids (gethash gw (disc-node-reader-routes zn))))
+                         (assert (= 1 (%count-eligible-drainers zn gw 3 ids)) () "2c-3 leak: ELIGIBLE(SN=3)=1 (A only; B frozen@5 excluded — the headline)")
+                         (assert (= 2 (%count-eligible-drainers zn gw 7 ids)) () "2c-3 leak: ELIGIBLE(SN=7)=2 (both above watermark — byte-identical to raw K)")
+                         (assert (= 1 (%count-eligible-drainers zn gw 5 ids)) () "2c-3 leak: ELIGIBLE(SN=5)=1 (boundary: SN==watermark is NOT eligible — strict `>` drain gate)")
+                         (assert (= 0 (%count-eligible-drainers zn gw 3 (list idb))) () "2c-3 leak: ELIGIBLE=0 for an all-frozen route (clamp: the demux guard yields delta 0, never -1)")
+                         (assert (>= (%count-eligible-drainers zn gw 3 ids) 1) () "2c-3 leak INVARIANT: ELIGIBLE >= 1 while the never-frozen first reader A is routed")))
+                     ;; GREEN: the SN=3 out-of-order marker through the FIXED demux -> ELIGIBLE=1 -> NO bump -> refcount 1
+                     (multiple-value-bind (slot gen) (dds.xport.zerocopy::%zc-loan sap payload 0 (length payload) 1)
+                       (assert (and slot (= 1 (rc slot))) () "2c-3 leak: the writer loan presets refcount 1")
+                       (let ((mk (%make-zc-loan-marker :pool-sap sap :slot-index slot :generation gen :len 64)))
+                         (%deliver-user-marker zn #x00000102 3 mk pa gw 3)
+                         (assert (= 1 (rc slot)) ()
+                                 "2c-3 leak GREEN: the demux must NOT bump for the out-of-order SN=3 (ELIGIBLE=1, B excluded) -> refcount stays 1 (RED raw-K would bump to 2)")
+                         (assert (eq mk (node-sample zn (cons gw 3))) () "2c-3 leak: the SN=3 marker must be stored")
+                         (assert (zerop (dds.xport.zerocopy::%zc-free-count sap)) () "2c-3 leak: with refcount 1 the slot is NOT yet reclaimable")
+                         (multiple-value-bind (sa sl gg ln ba) (dds.xport.zerocopy::%zc-acquire-for-read sap slot gen)
+                           (declare (ignore sl gg ln))
+                           (assert sa () "2c-3 leak: reader-A must acquire the slot for read")
+                           (assert (>= (rc slot) 1) () "2c-3 leak NO-UAF: A's read is refcount-PROTECTED (>=1) — the slot cannot be reclaimed under it")
+                           (assert (loop for i below (length payload) always (= (dds.pal:load-sap-u8 sap (+ ba i)) (aref payload i)))
+                                   () "2c-3 leak: reader-A must read the CORRECT payload bytes"))
+                         (dds.xport.zerocopy::%zc-release sap slot gen)   ; reader-A return-loan (the ONLY drainer)
+                         (assert (= 0 (rc slot)) ()
+                                 "2c-3 leak GREEN: after A's SINGLE release the refcount reaches EXACTLY 0 (the joiner B added no phantom +1) — LEAK CLOSED")
+                         (assert (= 1 (dds.xport.zerocopy::%zc-free-count sap)) () "2c-3 leak GREEN: the slot is now RECLAIMABLE (refcount 0)"))
+                       ;; reclaimability: a writer re-loan reuses the freed slot (pre-fix it was stuck at 1 -> pool erosion)
+                       (multiple-value-bind (rs rg) (dds.xport.zerocopy::%zc-loan sap other 0 (length other) 1)
+                         (assert rs () "2c-3 leak GREEN: a writer re-loan must reclaim the freed slot (the leak would have degraded this to non-ZC)")
+                         (dds.xport.zerocopy::%zc-release sap rs rg)))
+                     ;; RED contrast on the (now-free) slot: the OLD raw-K bump (K=2 -> +1) leaks under the SAME A-drains/B-skips
+                     (multiple-value-bind (slot gen) (dds.xport.zerocopy::%zc-loan sap payload 0 (length payload) 1)
+                       (assert (and slot (= 1 (rc slot))) () "2c-3 leak RED: the writer loan presets refcount 1")
+                       (dds.xport.zerocopy::%zc-bump sap slot gen 1)   ; the OLD raw-K bump: K-1=1 for route length 2 (counts the frozen joiner)
+                       (assert (= 2 (rc slot)) () "2c-3 leak RED: the raw-K bump raises the refcount to 2 (counting the joiner B)")
+                       (dds.xport.zerocopy::%zc-release sap slot gen)   ; reader-A releases; B skips -> no second release
+                       (assert (= 1 (rc slot)) ()
+                               "2c-3 leak RED: A's single release leaves the refcount STUCK at 1 (the joiner's phantom +1) — the LEAK the fix removes")
+                       (assert (zerop (dds.xport.zerocopy::%zc-free-count sap)) () "2c-3 leak RED: the leaked slot is NOT reclaimable (refcount 1)")
+                       (assert (null (nth-value 0 (dds.xport.zerocopy::%zc-loan sap other 0 (length other) 1))) ()
+                               "2c-3 leak RED: the leaked slot blocks a re-loan -> the writer degrades to non-ZC (capacity erosion)"))
+                     (dds.xport.zerocopy::%zc-destroy sap))))
                t)
           (stop-node zn)
           (dds.pal:free-static m)))))
