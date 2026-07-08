@@ -1808,6 +1808,63 @@ retention; the server stays KEEP_ALL — see §8.10.1 and ADR 0050 §4.2).
 
 ---
 
+### 8.10.5 Server DoS-hardening — read/idle timeout + incremental allocation + accept backoff (Slice 3c-2, built — ADR 0050 §4.6)
+
+Slice 3c-1 made the **client** survive a dropped connection; Slice 3c-2 (WP-DURABILITY-MS-DOS) hardens the
+**server** (and the shared reader, which also protects the client) against a malicious/abusive peer. Three
+holes are closed — **no wire-protocol change, no new crypto, no new dependency**:
+
+- **Read/idle timeout (the worst hole — a slow-loris hung the SERIAL server forever).** `tcp-recv` used to
+  block indefinitely, so a client that sent the 4-byte length header then STALLED parked the single serve
+  thread **forever** and **denied every other client**. A new PAL primitive
+  **`dds.pal:tcp-set-recv-timeout (sock seconds)`** (`setsockopt(SO_RCVTIMEO)`, a 16-byte `struct timeval`,
+  portable across SBCL + Clasp — the `SO_RCVTIMEO` optname is OS-specific, an `#+darwin`/`#-darwin` constant
+  inside `dds-pal` like the existing socket-option constants, never an impl conditional) arms an idle
+  deadline; `tcp-recv` now signals a distinct **`pal-timeout`** when the deadline fires (`socket-receive`
+  returns `n=NIL` on a timeout vs `n=0` on a clean close — identical on both impls — so a timeout is never
+  confused with EOF or data). The **server** arms it on each accepted socket (`make-microservice-server
+  :recv-timeout`, default 30 s), so a stalled recv trips `pal-timeout`, the per-connection backstop **drops**
+  that connection, and the accept loop **survives to serve the next client**. The **client** arms it on its
+  connection (`make-microservice-store :recv-timeout`), so a stalled/half-open server surfaces as a clean
+  `microservice-conn-lost` → the §8.10.4 reconnect path, never an infinite hang.
+- **Incremental body allocation (amplification guard).** `%ms-recv-message` used to allocate the **declared**
+  body length up front, so a 4-byte header declaring 256 MiB (`+ms-max-message+`) forced a 256 MiB allocation
+  *before any body byte arrived*. `%ms-recv-body` now reads the body **incrementally** — the accumulator
+  starts at 64 KiB and grows geometrically (capped at the declared length) **only as bytes actually arrive**,
+  so allocated memory stays ≤ ~2× the bytes received. The `+ms-max-message+` **hard cap is kept** (an over-cap
+  declare is rejected immediately, before any allocation). Because the reader is shared, it also caps a
+  malicious server's huge-declared *response* against the client.
+- **Accept-loop backoff (no hot-spin).** A persistent `tcp-accept` failure (fd exhaustion / EMFILE) used to
+  spin the CPU. The serve loop now counts consecutive failures and applies `%ms-accept-backoff`: a bounded
+  50 ms sleep then retry below the threshold, a logged stop past it. A successful accept resets the count, so
+  a transient failure is non-fatal.
+
+```lisp
+;; A slow-loris (header then stall) no longer denies the serial server; a subsequent client is served:
+(let* ((srv (dds.durability:make-microservice-server :port 0 :recv-timeout 1))   ; short idle timeout
+       (port (dds.durability:microservice-server-port srv))
+       (loris (dds.pal:tcp-connect "127.0.0.1" port)))
+  (dds.pal:tcp-send loris (dds.tests::octets 64 0 0 0) 4)   ; declare a 64-byte body, send nothing (stall)
+  (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+    (dds.durability:store-open s)
+    (dds.durability:store-put s "ok" g 1 nil :data p)       ; SERVED — the server dropped the loris after ~1 s
+    (dds.durability:store-close s))
+  (dds.durability:microservice-server-stop srv))
+```
+
+Verified by `run-durability-microservice-slow-loris-test` (headline **RED→GREEN in one test**: RED with the
+server timeout DISABLED — a slow-loris denies a subsequent client; GREEN with a 1 s timeout — the client is
+served), `run-durability-microservice-huge-declared-test` (over-cap rejected before alloc; a huge at-cap
+declare with no body times out via the incremental reader and allocates **<< the declared length** — a
+numeric bound on SBCL, a behavioral no-hang/no-OOM proof on Clasp), `run-durability-microservice-client-
+timeout-test` (a stalling server → the client recv-timeout → clean `microservice-store-error`, bounded), and
+`run-durability-microservice-accept-backoff-test` (the `%ms-accept-backoff` decision + a fault-injected
+backoff-then-recover); the fuzz gate (`run-durability-microservice-fuzz-test`) is extended with slow-loris +
+over-cap arms. Both impls green identically, Clasp first (Suite 503 → 507). The timeouts default to 30 s and
+are configurable; `NIL` disables (the pre-hardening blocking behavior).
+
+---
+
 ## 9. Cross-references
 
 - ADR 0021 — Durability service scope decision (owner directive 2026-06-18; cap. 7 = always-on DARE)

@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-07
-Work package: WP-DURABILITY-MICROSERVICE-1 (Slice 1) + WP-DURABILITY-MICROSERVICE-2 (Slice 2 — DARE-wrap) + WP-DURABILITY-MICROSERVICE-3A (Slice 3a — server-owned persistent inner + cross-restart + config-env seam) + WP-DURABILITY-MICROSERVICE-3B (Slice 3b — client-side remote-tier chain-MAC) + WP-DURABILITY-TAIL-ANCHOR-MS (sealed high-water tail anchor) + WP-DURABILITY-MS-RECLAIM-REMAC (Slice 3d — KEEP_LAST reclaim re-MAC over the wire, §4.4) + WP-DURABILITY-MS-RECONNECT (Slice 3c-1 — bounded client reconnect + idempotent retry, §4.5; HISTORY-QoS-over-the-wire descope, §4.2/§7) (ADR 0021 capability 6 — the last of the owner's pluggable persistence tiers: file / db / MICROSERVICE — composed with capability 7, the always-on DARE)
+Work package: WP-DURABILITY-MICROSERVICE-1 (Slice 1) + WP-DURABILITY-MICROSERVICE-2 (Slice 2 — DARE-wrap) + WP-DURABILITY-MICROSERVICE-3A (Slice 3a — server-owned persistent inner + cross-restart + config-env seam) + WP-DURABILITY-MICROSERVICE-3B (Slice 3b — client-side remote-tier chain-MAC) + WP-DURABILITY-TAIL-ANCHOR-MS (sealed high-water tail anchor) + WP-DURABILITY-MS-RECLAIM-REMAC (Slice 3d — KEEP_LAST reclaim re-MAC over the wire, §4.4) + WP-DURABILITY-MS-RECONNECT (Slice 3c-1 — bounded client reconnect + idempotent retry, §4.5; HISTORY-QoS-over-the-wire descope, §4.2/§7) + WP-DURABILITY-MS-DOS (Slice 3c-2 — server DoS-hardening: read/idle timeout, incremental body allocation, accept-loop backoff, §4.6) (ADR 0021 capability 6 — the last of the owner's pluggable persistence tiers: file / db / MICROSERVICE — composed with capability 7, the always-on DARE)
 Relates to: ADR 0021 (pluggable persistence vtable), ADR 0026 (file store, DARE at-rest), ADR 0045 (log-MAC chain), ADR 0049 (SQLite backend — the sibling "second implementation of the fixed vtable")
 
 ## 1. Context
@@ -424,8 +424,9 @@ reached `%ms-call`. Access stays under the store lock (unchanged discipline).
 `microservice-conn-lost`, `%ms-call` **closes+clears** the dead socket, **re-dials ONCE** (`%ms-reconnect`:
 one short bounded backoff then `tcp-connect host:port`), and **retries the op ONCE**. A second consecutive
 drop, or a failed re-dial (server still down → fast `ECONNREFUSED`), surfaces a clean `microservice-store-error`
-— a **bounded** single reconnect, never an unbounded loop or a hang (a full read-idle timeout stays a later
-Slice-3c item; here the re-dial to a down port fails fast). A non-drop server error (bad status) is **not**
+— a **bounded** single reconnect, never an unbounded loop or a hang (the full read-idle timeout that turns a
+blocked-mid-response read into a conn-lost is now BUILT in §4.6; here the re-dial to a down port fails
+fast). A non-drop server error (bad status) is **not**
 retried.
 
 **Idempotent-retry safety (the correctness crux).** The retry re-invokes both `build-fn` and `decode-fn`,
@@ -518,10 +519,96 @@ down-server op fails cleanly, then after restart the next op re-dials + succeeds
 available so all arms executed), identical; gate-hotpath + gate-types PASS; SBOM unchanged. No new crypto, no
 new dependency, no reader conditionals outside `dds-pal`.
 
+### 4.6 Slice 3c-2 — server DoS-hardening: read/idle timeout + incremental allocation + accept backoff (WP-DURABILITY-MS-DOS, BUILT)
+
+Slice 3c-1 made the client survive a dropped connection, but the SERVER (and the shared reader, which also
+protects the client) still had **three concrete holes against a malicious/abusive peer**, the worst of which
+denied *every* client. Slice 3c-2 closes all three — **no wire-protocol change, no new crypto, no new
+dependency**.
+
+**Gap (a) — read/idle timeout (the worst hole: a slow-loris hangs the SERIAL server forever).** `tcp-recv`
+had **no timeout** — it blocked indefinitely. A slow-loris that connects and sends the 4-byte length header
+then STALLS parks the serve thread in `%ms-recv-message` **forever**; because the server is serial (one
+accept+serve thread), one stalled socket **denied every other client** until server-stop. A malicious server
+could equally stall the client's `tcp-recv`. **Fix, three parts:**
+
+1. **New PAL prim `dds.pal:tcp-set-recv-timeout (sock seconds)`** → `setsockopt(SO_RCVTIMEO)` with a 16-byte
+   `struct timeval` (tv_sec 8 LE ∥ tv_usec-as-4-LE ∥ 4 pad — one encoding valid for BOTH the Darwin int32
+   tv_usec *and* the Linux long tv_usec, verified). **Portable across SBCL + Clasp**: it reuses the existing
+   `%setsockopt`/`sb-bsd-sockets` layer, and `+so-rcvtimeo+` is **OS**-specific (Darwin `#x1006` / Linux `20`)
+   — an `#+darwin`/`#-darwin` constant like the `SO_REUSEPORT`/`SO_NOSIGPIPE` ones already in `pal-net.lisp`,
+   **never** an impl (`#+sbcl`/`#+clasp`) conditional, so the one-allowed-place rule holds. `tcp-recv` was
+   wired to make a timeout a **DISTINCT catchable outcome**: an empirical probe on BOTH impls showed
+   `sb-bsd-sockets:socket-receive` returns **`n=0` on a clean peer-close** but **`n=NIL` on an SO_RCVTIMEO
+   timeout** — identical on SBCL and Clasp — so `tcp-recv` now splits them: `n=NIL` → signals **`pal-timeout`**
+   (a new `pal-error` subtype), `n=0` → returns NIL (clean EOF, unchanged), `n>0` → data. A socket with **no**
+   timeout armed is byte-for-byte unchanged (still blocks, still NIL on close).
+2. **Server read-deadline** — `make-microservice-server :recv-timeout` (default `+ms-default-recv-timeout+` =
+   30 s; NIL disables) is armed on each accepted socket **inside** `%ms-serve-connection`'s `handler-case`. A
+   stalled recv trips `pal-timeout`, which the existing **`serious-condition` backstop** catches → the
+   connection is DROPPED → the accept loop **survives** and serves the next client. The slow-loris no longer
+   denies anyone.
+3. **Client read-deadline** — `make-microservice-store :recv-timeout` (same default) is armed at every dial
+   (`%ms-dial`, so a reconnect re-arms the fresh socket). A stalled server surfaces in `%ms-exchange` as a
+   clean **`microservice-conn-lost`** (`pal-timeout` translated) → the §4.5 bounded reconnect+retry path,
+   never an infinite hang. (This also closes the Slice-1 review's *loopback-shaped boundedness* nit — a
+   half-open peer can no longer block the client's `tcp-recv` forever.)
+
+**Gap (b) — one-shot allocation amplification.** `%ms-recv-message` allocated the **declared** body length
+up-front, so a 4-byte header declaring 256 MiB (the `+ms-max-message+` cap) forced a 256 MiB allocation
+**before any body byte arrived** — a trickle of tiny requests each declaring 256 MiB = memory amplification.
+**Fix:** the body is now read **incrementally** (`%ms-recv-body`) — the accumulator starts at
+`min(body-len, +ms-recv-chunk+)` (64 KiB) and **grows geometrically, capped at body-len, only as bytes
+actually arrive**, so allocated memory stays ≤ ~2× the bytes received. The `+ms-max-message+` **hard cap is
+kept** (an over-cap declare is still rejected immediately, before any allocation). This is in the **shared**
+reader, so it also caps a malicious server's huge-declared *response* against the client. (Measured: a
+declared 256 MiB body with no data allocated **~3.6 MiB** on SBCL — 72× under the declared length, well below
+the cap/4 test threshold — vs the ≥256 MiB the old code forced.)
+
+**Gap (c) — accept-loop hot-spin.** The serve loop's `(t nil)` arm swallowed an accept failure and
+immediately re-looped, so a persistent accept failure (fd exhaustion / EMFILE) became a **tight CPU spin**.
+**Fix:** the loop counts consecutive accept failures and applies the pure `%ms-accept-backoff` policy —
+**`:retry`** (sleep the bounded `*ms-accept-backoff-seconds*` = 50 ms then re-accept) below
+`+ms-accept-max-fails+` = 128, **`:stop`** (end the loop with a log) past it. A successful accept resets the
+count, so a transient failure stays non-fatal. No hot-spin, no silent infinite retry.
+
+**Bounds-checking intact.** The incremental reader still validates every length/offset against the cap and
+the buffer extent (operating contract §4); the DoS guards (max-message cap, read timeout, incremental alloc,
+accept backoff) **are** the §4 resource-exhaustion guards. `defun*`/full ftypes throughout; DRY (the timeout
+prim reuses `%setsockopt`; the shared reader protects both sides).
+
+**Tests** (all bare-transport, always run — the hardening is below DARE):
+- **`run-durability-microservice-slow-loris-test`** (headline, RED→GREEN in one test): RED (server
+  `:recv-timeout` NIL) — a slow-loris parks the serial serve thread and a spawned subsequent client is
+  **DENIED** (bounded 2 s wait, `done` never set); GREEN (server `:recv-timeout 1`) — the read-timeout drops
+  the loris and the subsequent client is **SERVED**. Standalone confirmation: `served=NIL` (RED) vs `served=T`
+  (GREEN).
+- **`run-durability-microservice-huge-declared-test`**: an over-cap declare is rejected as a protocol error
+  before any allocation; a huge (at-cap) declare with no body **times out** via the incremental reader (no
+  infinite block / OOM — behavioral proof on both impls) and allocates **<< the declared length** (numeric
+  proof where the impl exposes a consing counter — SBCL; Clasp `bytes-consed`=0, a documented NFR-PORT gap, so
+  the numeric bound is runtime-gated on `(plusp (bytes-consed))`, **not** a reader conditional).
+- **`run-durability-microservice-client-timeout-test`**: a stalling server → the client recv-timeout →
+  `conn-lost` → reconnect → retry → clean `microservice-store-error`, **bounded** (asserted < 10 s), no hang.
+- **`run-durability-microservice-accept-backoff-test`**: UNIT — `%ms-accept-backoff` returns `:retry` below
+  the threshold and `:stop` past it, and the pause is positive+bounded; FAULT-INJECTION — 3 forced accept
+  failures (`*durability-debug-ms-force-accept-fail*`, set GLOBALLY so the serve thread sees it) drive the
+  backoff path then the loop **recovers** and serves a round-trip (transient failure non-fatal).
+- **`run-durability-microservice-fuzz-test`** EXTENDED with a slow-loris arm (a header then stall → server
+  read-timeout drop, serve thread survives) and an over-cap arm (protocol-error drop, serve thread survives),
+  then a valid client round-trips.
+
+Both impls **503 → 507 passed** (Clasp first, then SBCL), identical; gate-hotpath (8 files clean) +
+gate-types (2594 ftype'd) PASS; SBOM unchanged. No new crypto, no new dependency, no reader conditionals
+outside `dds-pal`.
+
 ## 5. Files
 
-- `src/dds-pal/pal-contract.lisp` — export the `tcp-*` block.
+- `src/dds-pal/pal-contract.lisp` — export the `tcp-*` block; **Slice 3c-2 (§4.6):** add `pal-timeout`
+  condition + `tcp-set-recv-timeout` to the exports.
 - `src/dds-pal/pal-net.lisp` — the seven TCP primitives + Darwin `SO_NOSIGPIPE`, mirroring the UDP block.
+  **Slice 3c-2 (§4.6):** `+so-rcvtimeo+` OS constant, `tcp-set-recv-timeout` (SO_RCVTIMEO struct-timeval), and
+  `tcp-recv` split so a timeout (`n=NIL`) signals `pal-timeout` distinct from a clean EOF (`n=0` → NIL).
 - `src/dds-durability/store-microservice.lisp` — the protocol, `make-microservice-store` (client),
   `make-microservice-server` / `microservice-server-port` / `microservice-server-stop` (server), and
   **Slice 2** `make-microservice-store-factory` (the DARE-wrapping factory — forward-references
@@ -546,6 +633,12 @@ new dependency, no reader conditionals outside `dds-pal`.
   (`*durability-debug-ms-force-recv-drop*` [+ `*...-drop-op*`] / `*...-skip-stale-resync*` /
   `*...-skip-redial-dropped*`). The factory docstring's HISTORY-QoS "known limitation" is rewritten to the
   **descope** (the decorator owns retention; server stays KEEP_ALL). Client-side only — server byte-identical.
+  **Slice 3c-2 (§4.6):** the DoS hardening — `+ms-default-recv-timeout+` / `+ms-recv-chunk+` /
+  `+ms-accept-max-fails+` constants + `*ms-accept-backoff-seconds*` / `*durability-debug-ms-force-accept-fail*`
+  params; `%ms-recv-body` (incremental body read) replaces the one-shot alloc in `%ms-recv-message`; the
+  `ms-conn` + server structs gain a `recv-timeout` slot (`%ms-dial` / `make-microservice-store` client-side,
+  `%ms-serve-connection` / `make-microservice-server` server-side); `%ms-exchange` translates `pal-timeout`
+  → `microservice-conn-lost`; `%ms-serve-loop` gains the `%ms-accept-backoff` policy + backoff sleep.
 - `src/dds-durability/store.lisp` — **Slice 3d** the additive NIL-fallback `store-replace-topic` dispatcher
   + `replace-topic-fn` vtable slot (the fallback is `store-purge` + bulk `store-put`).
 - `src/dds-durability/store-file.lisp` — **Slice 3d** the atomic `:replace-topic-fn` slot (reuses
@@ -582,6 +675,13 @@ new dependency, no reader conditionals outside `dds-pal`.
   idempotent-retry-chain-verify; skips if OpenSSL < 3.5) + `run-durability-microservice-reconnect-bare-test`
   (bare reconnect-after-restart + send-side-error-clean + no-infinite-loop + bare-delete-tolerates-rejected;
   always runs) — the fixed-port restart via ephemeral-then-reuse (SO_REUSEADDR).
+  **Slice 3c-2 (§4.6):** `run-durability-microservice-slow-loris-test` (RED-denied → GREEN-served),
+  `run-durability-microservice-huge-declared-test` (over-cap reject + at-cap incremental-read timeout +
+  bounded alloc), `run-durability-microservice-client-timeout-test` (stalling server → clean conn-lost,
+  bounded), `run-durability-microservice-accept-backoff-test` (unit decision + fault-injected recover) — all
+  bare-transport, always run; plus the slow-loris + over-cap arms added to `run-durability-microservice-fuzz-test`.
+- `src/dds-pal/pal-net.lisp` / `pal-contract.lisp` — **Slice 3c-2** the `tcp-set-recv-timeout` prim +
+  `pal-timeout` condition + the `tcp-recv` timeout/EOF split (see §4.6 / the §5 PAL entries above).
 
 ## 6. Consequences
 
@@ -632,6 +732,19 @@ new dependency, no reader conditionals outside `dds-pal`.
   server holds zero per-session state). HISTORY-QoS-over-the-wire forwarding is **descoped** (the decorator owns
   retention; the server stays KEEP_ALL — §4.2/§7). Both impls green identically, Clasp first: Suite 499 → 503
   (`durability-microservice-reconnect`, `...-bare`, `...-exhausted`, `...-seal`).
+- **Slice 3c-2 (WP-DURABILITY-MS-DOS):** the server (and the shared reader, which also protects the client) is
+  hardened against a malicious/abusive peer — a **read/idle timeout** (new PAL `tcp-set-recv-timeout` /
+  `SO_RCVTIMEO` → `pal-timeout`, portable both impls, reader-conditionals inside `dds-pal` only) so a
+  **slow-loris no longer denies the serial server** (it is dropped and the accept loop serves the next
+  client) and a stalled server surfaces as a clean client `conn-lost` (the §4.5 reconnect); **incremental body
+  allocation** so a huge *declared* length no longer forces a huge up-front alloc (amplification guard,
+  measured ~3.6 MiB for a declared 256 MiB); and an **accept-loop backoff** so a persistent accept failure
+  backs off instead of hot-spinning. The `+ms-max-message+` hard cap is kept. **No wire-protocol change, no new
+  crypto, no new dependency.** Configurable timeouts (`make-microservice-server` / `make-microservice-store`
+  `:recv-timeout`, default 30 s). Both impls green identically, Clasp first: Suite 503 → 507
+  (`durability-microservice-slow-loris`, `...-huge-declared`, `...-client-timeout`, `...-accept-backoff`; +
+  the fuzz gate extended). Headline RED→GREEN: with the timeout DISABLED a slow-loris denies a subsequent
+  client (`served=NIL`), with it enabled the client is served (`served=T`).
 
 ## 7. Scope — Slice 1 and the deferred slices
 
@@ -687,15 +800,16 @@ per-session state).
 
 **Deferred:**
 - **Slice 3c — remaining production posture.** Multi-client concurrency (the server serves one client at a
-  time); a per-connection **read-idle timeout** (the reconnect is a bounded SINGLE re-dial + retry — §4.5 — but
-  a blocked-mid-response read still has no timeout); framing for very large `get-range` responses beyond the
-  single-message `+ms-max-message+` ceiling (chunked/streamed); the `main.lisp` CLI `--backend` (the
-  driver-env path already suffices); the full live 2-process microservice cross-DDS interop run.
-- **Slice 3c — DoS hardening (bounded, not a spin, in Slice 1; documented).** `%ms-recv-message` allocates
-  the body buffer from the *declared* length before the body arrives, so a peer declaring up to the
-  256 MiB `+ms-max-message+` cap forces a large one-shot allocation on a 4-byte header (an amplification),
-  and a never-completing partial send parks the serve thread (a slow-loris — bounded + blocking, *not* a
-  spin; the cap correctly defeats the multi-GB case, and the per-connection `serious-condition` backstop
-  means one stuck connection cannot corrupt others). Slice 3 hardens this with incremental allocation (grow
-  the body buffer as bytes arrive) and a per-connection read-idle timeout, consistent with the error/DoS
-  posture already deferred here.
+  time); framing for very large `get-range` responses beyond the single-message `+ms-max-message+` ceiling
+  (chunked/streamed); the `main.lisp` CLI `--backend` (the driver-env path already suffices); the full live
+  2-process microservice cross-DDS interop run. (The per-connection **read-idle timeout** that a blocked-mid-
+  response read lacked is now **BUILT** — §4.6.)
+- **Slice 3c — DoS hardening (BUILT, §4.6, WP-DURABILITY-MS-DOS).** The three Slice-1 residuals are now closed:
+  (a) the **read/idle timeout** — `%ms-recv-message` no longer parks the serial serve thread on a slow-loris;
+  a stalled recv trips `pal-timeout` (via the new `tcp-set-recv-timeout` / `SO_RCVTIMEO` PAL prim) and the
+  connection is dropped so the accept loop serves the next client (and the client side surfaces a clean
+  `conn-lost` → reconnect); (b) the **one-shot allocation** — `%ms-recv-body` grows the body buffer as bytes
+  arrive (the `+ms-max-message+` cap still rejects an over-cap declare up front), so a huge *declared* length
+  no longer forces a huge allocation (the amplification is closed); (c) the **accept-loop hot-spin** — a
+  persistent accept failure now backs off (`%ms-accept-backoff`) instead of spinning. Configurable timeouts,
+  both impls, reader-conditionals inside `dds-pal` only.

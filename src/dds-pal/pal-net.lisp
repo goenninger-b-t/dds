@@ -26,6 +26,7 @@
 (progn
   (defconstant +sol-socket+ #xffff)
   (defconstant +so-reuseport+ #x0200)
+  (defconstant +so-rcvtimeo+ #x1006)
   (defconstant +ipproto-ip+ 0)
   (defconstant +ip-add-membership+ 12)
   (defconstant +ip-multicast-loop+ 11))
@@ -33,6 +34,7 @@
 (progn
   (defconstant +sol-socket+ 1)
   (defconstant +so-reuseport+ 15)
+  (defconstant +so-rcvtimeo+ 20)
   (defconstant +ipproto-ip+ 0)
   (defconstant +ip-add-membership+ 35)
   (defconstant +ip-multicast-loop+ 34))
@@ -152,6 +154,26 @@
   "The bound local port of LISTENER (read an ephemeral port after a port-0 bind)."
   (nth-value 1 (sb-bsd-sockets:socket-name listener)))
 
+(defun* tcp-set-recv-timeout (socket seconds)
+    (function (t (real 0)) t)
+  "Arm SO_RCVTIMEO on stream SOCKET so a blocking tcp-recv that makes no progress for SECONDS raises a
+   PAL-TIMEOUT (a DISTINCT catchable outcome, not a clean-EOF NIL and not data) instead of blocking
+   forever — the read/idle DoS guard for the durability microservice (ADR 0050 §4.6, operating contract
+   §4). SECONDS 0 clears the timeout (block indefinitely, the default). The option value is a 16-byte
+   struct timeval: tv_sec as 8 little-endian octets, then tv_usec (< 10^6, so < 2^32) as 4 little-endian
+   octets + 4 zero octets — a layout valid for BOTH the Darwin int32 tv_usec (offset 8, 4 tail-pad bytes)
+   AND the Linux long tv_usec (offset 8, 8 bytes), so ONE encoding is portable across OSes. SO_RCVTIMEO
+   optname is OS-specific (+so-rcvtimeo+: Darwin #x1006 / Linux 20), like the SO_REUSEPORT constants above
+   — never impl-specific, so this carries no #+sbcl/#+clasp conditional. Reuses %setsockopt (DRY)."
+  (let* ((sec (floor seconds))
+         (usec (floor (* (- seconds sec) 1000000))))
+    (%setsockopt socket +sol-socket+ +so-rcvtimeo+
+                 (list (ldb (byte 8 0) sec)  (ldb (byte 8 8) sec)  (ldb (byte 8 16) sec) (ldb (byte 8 24) sec)
+                       (ldb (byte 8 32) sec) (ldb (byte 8 40) sec) (ldb (byte 8 48) sec) (ldb (byte 8 56) sec)
+                       (ldb (byte 8 0) usec) (ldb (byte 8 8) usec) (ldb (byte 8 16) usec) (ldb (byte 8 24) usec)
+                       0 0 0 0))
+    t))
+
 (defun* tcp-send (socket buffer len)
     (function (t (simple-array (unsigned-byte 8) (*)) (integer 0)) (integer 0))
   "Send exactly LEN octets of BUFFER[0..LEN) over stream SOCKET, looping over short writes (a stream
@@ -177,27 +199,34 @@
   "Receive exactly LEN octets into BUFFER[0..LEN) from stream SOCKET, looping over partial reads until
    the full frame is assembled (TCP is a byte stream — one frame may split across segments; a partial
    read is normal, NOT end-of-stream). Returns LEN, or NIL on EOF / peer-close / connection-reset
-   before LEN bytes arrive (a torn or short read = the connection dropped). BUFFER must hold >= LEN
-   octets. The first read lands straight in BUFFER; only a genuine split allocates one scratch buffer."
+   before LEN bytes arrive (a torn or short read = the connection dropped). If SOCKET has a recv timeout
+   armed (tcp-set-recv-timeout) and no data arrives within the deadline, SIGNALS PAL-TIMEOUT — a DISTINCT
+   catchable outcome, NOT confused with a clean EOF (NIL): sb-bsd-sockets:socket-receive returns n=0 on a
+   clean peer-close but n=NIL on an SO_RCVTIMEO timeout (verified identical on SBCL + Clasp), so this
+   splits them. BUFFER must hold >= LEN octets. The first read lands straight in BUFFER; only a genuine
+   split allocates one scratch buffer."
   (when (zerop len) (return-from tcp-recv 0))
   (let ((got 0) (scratch nil))
     (declare (type (integer 0) got))
-    (handler-case
-        (loop while (< got len)
-              do (if (zerop got)
-                     (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive socket buffer len)
-                       (declare (ignore b))
-                       (when (or (null n) (zerop n)) (return-from tcp-recv nil))
-                       (setf got n))
-                     (progn
-                       (unless scratch
-                         (setf scratch (make-array (- len got) :element-type '(unsigned-byte 8))))
-                       (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive socket scratch (- len got))
+    (flet ((step-outcome (n)          ; n>0 = data; n=0 = clean EOF -> NIL; n=NIL = SO_RCVTIMEO -> PAL-TIMEOUT
+             (cond ((null n) (error 'pal-timeout :op 'tcp-recv))
+                   ((zerop n) (return-from tcp-recv nil)))))
+      (handler-case
+          (loop while (< got len)
+                do (if (zerop got)
+                       (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive socket buffer len)
                          (declare (ignore b))
-                         (when (or (null n) (zerop n)) (return-from tcp-recv nil))
-                         (replace buffer scratch :start1 got :end1 (+ got n) :end2 n)
-                         (incf got n)))))
-      (sb-bsd-sockets:socket-error () (return-from tcp-recv nil)))
+                         (step-outcome n)
+                         (setf got n))
+                       (progn
+                         (unless scratch
+                           (setf scratch (make-array (- len got) :element-type '(unsigned-byte 8))))
+                         (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive socket scratch (- len got))
+                           (declare (ignore b))
+                           (step-outcome n)
+                           (replace buffer scratch :start1 got :end1 (+ got n) :end2 n)
+                           (incf got n)))))
+        (sb-bsd-sockets:socket-error () (return-from tcp-recv nil))))
     len))
 
 (defun* tcp-close (socket)

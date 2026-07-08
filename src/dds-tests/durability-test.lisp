@@ -6904,6 +6904,40 @@
             (ignore-errors (dds.durability:store-close s)))
           (ignore-errors (dds.pal:join th)))
       (ignore-errors (dds.pal:tcp-close ln))))
+  ;; (4) DoS SURVIVAL (WP-DURABILITY-MS-DOS, ADR 0050 §4.6): a SLOW-LORIS (a length header then a stall)
+  ;; and an OVER-CAP declared length must each DROP that connection (server read-timeout / cap reject) and
+  ;; the SERIAL SERVE THREAD SURVIVES — a subsequent valid client round-trips. Short server recv-timeout (1 s)
+  ;; keeps it bounded.
+  (let* ((srv (dds.durability:make-microservice-server :port 0 :recv-timeout 1))
+         (port (dds.durability:microservice-server-port srv)))
+    (unwind-protect
+        (progn
+          ;; slow-loris: declare a 65-byte body then send NO body -> the server read-timeout drops it (~1 s)
+          (let ((c (dds.pal:tcp-connect "127.0.0.1" port))
+                (h (make-array 4 :element-type '(unsigned-byte 8))))
+            (unwind-protect
+                (progn (dds.pal:tcp-send c (octets 65 0 0 0) 4)
+                       (%check :ms-fuzz-loris-drops (null (dds.pal:tcp-recv c h 4))
+                               "server read-timeout DROPS a slow-loris (header then stall) — no infinite park"))
+              (ignore-errors (dds.pal:tcp-close c))))
+          ;; over-cap declared body-len (+ms-max-message+ + 1 = #x10000001) -> protocol-error drop, no alloc
+          (let ((c (dds.pal:tcp-connect "127.0.0.1" port))
+                (h (make-array 4 :element-type '(unsigned-byte 8))))
+            (unwind-protect
+                (progn (dds.pal:tcp-send c (octets 1 0 0 16) 4)
+                       (%check :ms-fuzz-overcap-drops (null (dds.pal:tcp-recv c h 4))
+                               "server DROPS an over-cap declared body length (resource guard, no up-front alloc)"))
+              (ignore-errors (dds.pal:tcp-close c))))
+          ;; survivors: a fresh valid client round-trips (the serve thread survived both DoS attacks)
+          (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+            (dds.durability:store-open s)
+            (%check :ms-fuzz-dos-survives
+                    (eq t (dds.durability:store-put s "ok" (%tms-guid 1) 1 nil :data (octets 1 2 3)))
+                    "SERVE THREAD SURVIVED the slow-loris + over-cap attacks: a subsequent valid client succeeds")
+            (%check :ms-fuzz-dos-roundtrip (= 1 (dds.durability:store-count s "ok"))
+                    "post-DoS round-trip intact")
+            (dds.durability:store-close s)))
+      (dds.durability:microservice-server-stop srv)))
   t)
 
 ;;; --- WP-DURABILITY-MICROSERVICE-2 (ADR 0050 Slice 2; ADR 0021 cap 6 x cap 7) — DARE-wrap compose ---
@@ -8427,4 +8461,183 @@
           (dds.durability:store-close store))
       (progn (dds.durability:microservice-server-stop srv)
              (when (uiop:directory-exists-p cbase) (uiop:delete-directory-tree cbase :validate t)))))
+  t)
+
+;;; --- WP-DURABILITY-MS-DOS (ADR 0050 §4.6) — microservice server DoS-hardening (Slice 3c-2) ---
+
+(defun* run-durability-microservice-slow-loris-test ()
+    (function () t)
+  "WP-DURABILITY-MS-DOS headline (ADR 0050 §4.6): a SLOW-LORIS — a client that sends the length header then
+   STALLS (no body) — must NOT deny the SERIAL server. RED (server :recv-timeout NIL): the stalled client
+   parks the single serve thread forever, so a subsequent client is DENIED (proven BOUNDED: a spawned client
+   op does NOT complete within a 2 s window). GREEN (server :recv-timeout 1): the server read-timeout DROPS
+   the slow-loris after ~1 s and the accept loop SERVES the next client. Bare (non-DARE) transport gate —
+   always runs. Bounded (short server timeout + a bounded RED wait; the test itself never hangs)."
+  ;; ---- RED: with the server read-timeout DISABLED, a slow-loris denies a subsequent client ----
+  (let* ((srv   (dds.durability:make-microservice-server :port 0 :recv-timeout nil))
+         (port  (dds.durability:microservice-server-port srv))
+         (loris (dds.pal:tcp-connect "127.0.0.1" port))
+         (done  (list nil)))
+    (unwind-protect
+        (progn
+          (dds.pal:tcp-send loris (octets 64 0 0 0) 4)          ; declare a 64-byte body, send nothing -> serve thread parks
+          (sleep 0.2)                                            ; let the server accept + park on the loris body recv
+          (let ((th (dds.pal:spawn
+                     (lambda ()
+                       (ignore-errors
+                        (let ((s (dds.durability:make-microservice-store
+                                  :host "127.0.0.1" :port port :recv-timeout nil)))
+                          (dds.durability:store-open s)
+                          (dds.durability:store-count s "X")
+                          (setf (car done) t))))
+                     :name "ms-loris-red-client")))
+            (let ((deadline (+ (get-internal-real-time) (round (* 2 internal-time-units-per-second)))))
+              (loop until (or (car done) (> (get-internal-real-time) deadline)) do (sleep 0.05)))
+            (%check :ms-loris-red-denied (null (car done))
+                    "RED: a slow-loris DENIES a subsequent client when the server read-timeout is DISABLED (serial serve thread parked)")
+            (ignore-errors (dds.pal:tcp-close loris))            ; unblock the parked serve thread
+            (dds.durability:microservice-server-stop srv)        ; closes the listener -> the waiting client thread unblocks
+            (ignore-errors (dds.pal:join th))))
+      (ignore-errors (dds.durability:microservice-server-stop srv))))
+  ;; ---- GREEN: with a 1 s server read-timeout, the slow-loris is dropped + the next client is SERVED ----
+  (let* ((srv   (dds.durability:make-microservice-server :port 0 :recv-timeout 1))
+         (port  (dds.durability:microservice-server-port srv))
+         (loris (dds.pal:tcp-connect "127.0.0.1" port)))
+    (unwind-protect
+        (progn
+          (dds.pal:tcp-send loris (octets 64 0 0 0) 4)          ; header then stall -> the server drops it after ~1 s
+          (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+            (dds.durability:store-open s)
+            (%check :ms-loris-green-served
+                    (eq t (dds.durability:store-put s "ok" (%tms-guid 1) 1 nil :data (octets 1 2 3)))
+                    "GREEN: the server read-timeout drops the slow-loris -> a SUBSEQUENT client is SERVED (service not denied)")
+            (%check :ms-loris-green-count (= 1 (dds.durability:store-count s "ok"))
+                    "GREEN: the subsequent client's round-trip is intact")
+            (dds.durability:store-close s)))
+      (progn (ignore-errors (dds.pal:tcp-close loris))
+             (dds.durability:microservice-server-stop srv))))
+  t)
+
+(defun* run-durability-microservice-huge-declared-test ()
+    (function () t)
+  "WP-DURABILITY-MS-DOS amplification gate (ADR 0050 §4.6): a huge DECLARED body length must NOT force a
+   huge up-front allocation. (i) An OVER-CAP declared length (> +ms-max-message+) is rejected as a protocol
+   error BEFORE any body buffer is allocated. (ii) A huge AT-CAP declared length with NO body TIMES OUT via
+   the incremental reader (a bounded chunk, not the full 256 MiB) — proven BEHAVIORALLY (it returns via
+   PAL-TIMEOUT, no infinite block / OOM) on both impls, and NUMERICALLY (allocated << the declared length)
+   where the impl exposes a consing counter (SBCL; Clasp reports 0, a documented NFR-PORT gap). Read INLINE
+   on a raw socketpair (the test thread) so the allocation is measurable. Bounded (1 s reader timeout)."
+  ;; (i) OVER-CAP declared length -> protocol error, no allocation
+  (let* ((ln (dds.pal:tcp-listen "127.0.0.1" 0)) (port (dds.pal:tcp-local-port ln))
+         (cli (dds.pal:tcp-connect "127.0.0.1" port)) (srv (dds.pal:tcp-accept ln)))
+    (unwind-protect
+        (progn
+          (dds.pal:tcp-set-recv-timeout srv 1)
+          (dds.pal:tcp-send cli (octets 1 0 0 16) 4)             ; body-len = #x10000001 = +ms-max-message+ + 1 (over-cap)
+          (%check :ms-huge-overcap-rejected
+                  (eq :proto (handler-case (progn (dds.durability::%ms-recv-message srv) :no-error)
+                               (dds.durability::microservice-protocol-error () :proto)))
+                  "an OVER-CAP declared body-len is rejected as a protocol error BEFORE any body allocation"))
+      (progn (ignore-errors (dds.pal:tcp-close cli)) (ignore-errors (dds.pal:tcp-close srv))
+             (ignore-errors (dds.pal:tcp-close ln)))))
+  ;; (ii) huge AT-CAP declared length + no body -> incremental read times out, allocation bounded (not 256 MiB)
+  (let* ((ln (dds.pal:tcp-listen "127.0.0.1" 0)) (port (dds.pal:tcp-local-port ln))
+         (cli (dds.pal:tcp-connect "127.0.0.1" port)) (srv (dds.pal:tcp-accept ln)))
+    (unwind-protect
+        (progn
+          (dds.pal:tcp-set-recv-timeout srv 1)
+          (dds.pal:tcp-send cli (octets 0 0 0 16) 4)             ; body-len = #x10000000 = +ms-max-message+ (256 MiB), send NO body
+          (let ((consed0 (dds.pal:bytes-consed)))
+            (%check :ms-huge-times-out
+                    (eq :timeout (handler-case (progn (dds.durability::%ms-recv-message srv) :no-timeout)
+                                   (dds.pal:pal-timeout () :timeout)))
+                    "a huge (at-cap) declared body with NO data TIMES OUT via the incremental reader (no infinite block, no OOM)")
+            (let ((delta (- (dds.pal:bytes-consed) consed0)))
+              (%check :ms-huge-bounded-alloc
+                      (or (zerop (dds.pal:bytes-consed))          ; Clasp: no consing counter -> behavioral proof only
+                          (< delta (floor dds.durability::+ms-max-message+ 4)))
+                      (format nil "the huge declared length did NOT force a full up-front allocation (incremental read; delta=~d << cap ~d)"
+                              delta dds.durability::+ms-max-message+)))))
+      (progn (ignore-errors (dds.pal:tcp-close cli)) (ignore-errors (dds.pal:tcp-close srv))
+             (ignore-errors (dds.pal:tcp-close ln)))))
+  t)
+
+(defun* run-durability-microservice-client-timeout-test ()
+    (function () t)
+  "WP-DURABILITY-MS-DOS client gate (ADR 0050 §4.6): a malicious/half-open server that ACCEPTS then STALLS
+   (never responds) must surface via the CLIENT recv-timeout as a clean microservice-store-error (conn-lost
+   -> the bounded reconnect+retry path) instead of an infinite tcp-recv hang. A raw stalling server: accept,
+   read+ack the open, read the next request, then HOLD the connection open (no response) until released. The
+   client (:recv-timeout 1) opens (ok), then a store-count TIMES OUT -> conn-lost -> reconnect -> retry ->
+   times out -> clean store-error, BOUNDED (asserted < 10 s). Bare (non-DARE) transport gate — always runs."
+  (let ((release (list nil))
+        (ln (dds.pal:tcp-listen "127.0.0.1" 0)))
+    (unwind-protect
+        (let* ((port (dds.pal:tcp-local-port ln))
+               (th (dds.pal:spawn
+                    (lambda ()
+                      (ignore-errors
+                       (let ((c (dds.pal:tcp-accept ln)))
+                         (dds.durability::%ms-recv-message c)            ; read the open request
+                         (let ((r (dds.durability::%ms-frame-message dds.durability::+ms-status-ok+
+                                                                     (dds.durability::%ms-empty-payload))))
+                           (dds.pal:tcp-send c r (length r)))            ; ack the open
+                         (dds.durability::%ms-recv-message c)            ; read the next request ... then STALL (no response)
+                         (loop until (car release) do (sleep 0.05))      ; hold the connection open until released
+                         (ignore-errors (dds.pal:tcp-close c)))))
+                    :name "ms-client-timeout-stall-server")))
+          (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 1)))
+            (dds.durability:store-open s)                                ; opens fine (the server acks)
+            (let ((t0 (get-internal-real-time)))
+              (%check :ms-client-timeout-clean
+                      (eq :store-err (handler-case (progn (dds.durability:store-count s "X") :no-error)
+                                       (dds.durability:microservice-store-error () :store-err)))
+                      "a stalling server surfaces via the client recv-timeout as a clean microservice-store-error (conn-lost -> reconnect -> retry -> clean; no infinite hang)")
+              (%check :ms-client-timeout-bounded
+                      (< (/ (- (get-internal-real-time) t0) internal-time-units-per-second) 10)
+                      "the stalled client op returned BOUNDED (a few seconds via the recv-timeout), not an infinite hang"))
+            (setf (car release) t)                                       ; release the stalling server thread
+            (ignore-errors (dds.durability:store-close s)))
+          (ignore-errors (dds.pal:join th)))
+      (progn (setf (car release) t) (ignore-errors (dds.pal:tcp-close ln)))))
+  t)
+
+(defun* run-durability-microservice-accept-backoff-test ()
+    (function () t)
+  "WP-DURABILITY-MS-DOS accept-backoff gate (ADR 0050 §4.6): a persistent tcp-accept failure must BACK OFF
+   (a bounded sleep), never a tight CPU hot-spin, and a transient failure is non-fatal (the loop recovers).
+   (i) UNIT: the pure %ms-accept-backoff policy returns :RETRY below +ms-accept-max-fails+ and :STOP past it,
+   and *ms-accept-backoff-seconds* is a positive bounded pause. (ii) FAULT-INJECTION: force N accept failures
+   (*durability-debug-ms-force-accept-fail*, read by the serve thread — set GLOBALLY so the child thread sees
+   it) — the serve loop takes the bounded backoff path N times then RECOVERS and serves a normal round-trip.
+   Bounded."
+  ;; (i) UNIT: the backoff decision + the bounded pause
+  (%check :ms-backoff-retry-low (eq :retry (dds.durability::%ms-accept-backoff 1))
+          "%ms-accept-backoff: a single accept failure -> :retry (bounded backoff, non-fatal)")
+  (%check :ms-backoff-retry-threshold
+          (eq :retry (dds.durability::%ms-accept-backoff dds.durability::+ms-accept-max-fails+))
+          "%ms-accept-backoff: at the threshold -> still :retry")
+  (%check :ms-backoff-stop-past
+          (eq :stop (dds.durability::%ms-accept-backoff (1+ dds.durability::+ms-accept-max-fails+)))
+          "%ms-accept-backoff: PAST the threshold -> :stop (persistent failure fatal-with-a-log, no silent infinite spin)")
+  (%check :ms-backoff-bounded-pause
+          (and (realp dds.durability::*ms-accept-backoff-seconds*)
+               (< 0 dds.durability::*ms-accept-backoff-seconds* 5))
+          "*ms-accept-backoff-seconds* is a positive bounded pause (no hot-spin, no long stall)")
+  ;; (ii) FAULT-INJECTION: forced accept failures -> the serve loop backs off then RECOVERS (transient = non-fatal)
+  (setf dds.durability::*durability-debug-ms-force-accept-fail* 3)   ; GLOBAL: the serve thread does not inherit dynamic bindings
+  (unwind-protect
+      (let* ((srv (dds.durability:make-microservice-server :port 0 :recv-timeout 5))
+             (port (dds.durability:microservice-server-port srv)))
+        (unwind-protect
+            (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+              (dds.durability:store-open s)
+              (%check :ms-backoff-recovers
+                      (eq t (dds.durability:store-put s "b" (%tms-guid 1) 1 nil :data (octets 7 8 9)))
+                      "the serve loop took the backoff path for 3 forced accept failures then RECOVERED + served a round-trip (transient failure non-fatal)")
+              (%check :ms-backoff-recovers-count (= 1 (dds.durability:store-count s "b"))
+                      "post-backoff round-trip intact")
+              (dds.durability:store-close s))
+          (dds.durability:microservice-server-stop srv)))
+    (setf dds.durability::*durability-debug-ms-force-accept-fail* 0))
   t)

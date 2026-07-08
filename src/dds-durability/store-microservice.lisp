@@ -79,6 +79,31 @@
    and a whole slice-scale get-range response) so a legitimate message is never false-rejected; a Slice-3
    chunked/streamed get-range removes the single-message ceiling for very large topics.")
 
+(defconstant +ms-recv-chunk+ (* 64 1024)
+  "Incremental body-read chunk size (bytes) for %ms-recv-message (WP-DURABILITY-MS-DOS, ADR 0050 §4.6). A
+   message body is read in chunks of at most this size, GROWING the accumulator as bytes ACTUALLY arrive,
+   so a huge DECLARED body-len (up to +ms-max-message+) never forces a full up-front allocation — the
+   amplification guard: allocated memory stays proportional to bytes actually received (≤ ~2×), so a
+   trickle of tiny requests each declaring 256 MiB cannot OOM the server (operating contract §4). Shared
+   by client + server, so it also caps a malicious server's huge-declared response against the client.")
+
+(defconstant +ms-accept-max-fails+ 128
+  "Consecutive-tcp-accept-failure threshold for the serve loop (WP-DURABILITY-MS-DOS, ADR 0050 §4.6):
+   past this many BACK-TO-BACK accept failures the loop STOPS (logged) rather than spin — a persistent
+   accept failure (fd exhaustion / EMFILE) is fatal-with-a-log, never a silent infinite retry. Below it a
+   failure is transient (a bounded backoff then retry; the count resets on the next successful accept).")
+
+(defconstant +ms-default-recv-timeout+ 30
+  "Default idle/read timeout (seconds) armed on both the server's accepted sockets and the client's
+   connection (WP-DURABILITY-MS-DOS, ADR 0050 §4.6). A tcp-recv that makes NO progress for this long
+   surfaces as a PAL-TIMEOUT: the SERIAL server DROPS the stalled connection (a slow-loris no longer
+   denies every other client), and the client treats a stalled server as a lost connection (the Slice-3c-1
+   reconnect path) instead of an infinite hang. Generous (30 s) so a legitimately slow-but-progressing
+   transfer is never dropped — SO_RCVTIMEO resets on each partial read, so only a full 30 s of silence
+   trips it. Configurable per server (make-microservice-server :recv-timeout) / client (make-microservice-
+   store :recv-timeout); NIL disables it (block indefinitely, pre-DoS-hardening behavior). Tests pass a
+   short value (e.g. 1 s) to stay bounded.")
+
 ;;; ---- conditions ----
 
 (define-condition microservice-store-error (error)
@@ -115,6 +140,19 @@
    the chained :delete falls back to the OLD bare server-proxy delete (no re-MAC) — reproducing the pre-fix
    BRICK (the survivors' stale folded MACs mismatch the next open's re-seeded %ms-verify-chain) to prove the
    re-MAC is load-bearing. Never set in production code (mirrors *durability-debug-skip-tail-invalidate*).")
+
+(defparameter *ms-accept-backoff-seconds* 0.05
+  "The SHORT bounded pause the serve loop sleeps after a tcp-accept FAILURE before retrying (WP-DURABILITY-
+   MS-DOS, ADR 0050 §4.6) — turns a persistent accept failure (fd exhaustion / EMFILE) from a tight CPU
+   SPIN into a bounded poll. 50 ms: a transient failure recovers near-instantly; a persistent one is capped
+   at ~+ms-accept-max-fails+ × this before the loop stops. Not a per-op path — only the failure branch.")
+
+(defparameter *durability-debug-ms-force-accept-fail* 0
+  "Test-only DRIVER (ADR 0050 §4.6). A positive integer N makes the next N serve-loop iterations treat
+   tcp-accept as FAILED (simulating fd exhaustion) — each decrements N and takes the bounded backoff path —
+   so a test drives the accept-backoff-THEN-RECOVER behavior deterministically WITHOUT actually exhausting
+   file descriptors (a transient accept failure is non-fatal: the loop resumes serving). Never set in
+   production code (mirrors the other *durability-debug-ms-* knobs).")
 
 (defparameter *ms-reconnect-backoff-seconds* 0.05
   "The SHORT bounded pause before a single reconnect re-dial (%ms-reconnect, ADR 0050 §4.5, Slice 3c-1),
@@ -431,12 +469,18 @@
    store proceed: EVER-CONNECTED-P (a dial has succeeded at least once) marks the DROPPED state (sock NIL
    after a failed re-dial, but the connection WAS established) as re-dial-able on the next op — vs a
    never-opened store (sock NIL, EVER-CONNECTED-P NIL) which is 'store is not open'. CLOSED-P (set only by
-   %ms-close) is the TERMINAL state: after store-close no op re-dials. store-open clears CLOSED-P (re-open)."
+   %ms-close) is the TERMINAL state: after store-close no op re-dials. store-open clears CLOSED-P (re-open).
+
+   RECV-TIMEOUT (WP-DURABILITY-MS-DOS, ADR 0050 §4.6): the idle/read timeout (seconds, or NIL to disable)
+   armed on the socket at every dial (%ms-dial) so a stalled server surfaces as a clean conn-lost via the
+   client recv timeout (the reconnect path) instead of an infinite tcp-recv hang — carried in the conn so a
+   re-dial after a drop re-arms it on the fresh socket."
   (host "127.0.0.1" :type string)
   (port 0 :type (integer 0 65535))
   (sock nil :type t)
   (ever-connected-p nil :type t)
-  (closed-p nil :type t))
+  (closed-p nil :type t)
+  (recv-timeout nil :type (or null (real 0))))
 
 (defun* %ms-dial (conn)
     (function (ms-conn) t)
@@ -445,8 +489,12 @@
    success marks EVER-CONNECTED-P (so a later sock=NIL is a re-dial-able DROP, not a never-opened store) and
    clears CLOSED-P (FIX B, ADR 0050 §4.5): a successful dial re-establishes the connection, so a same-object
    close→reopen works — the decorator's PRE-open tail-anchor probe (%ms-fetch-tuples) dials here and must not
-   then be refused by %ms-call's closed-p guard (which %ms-open clears too late for the pre-open probe)."
+   then be refused by %ms-call's closed-p guard (which %ms-open clears too late for the pre-open probe).
+   Arms the conn's RECV-TIMEOUT on the fresh socket (WP-DURABILITY-MS-DOS) so a stalled server can never
+   hang the client's tcp-recv — re-armed here because a reconnect re-dials into a NEW socket."
   (setf (ms-conn-sock conn) (dds.pal:tcp-connect (ms-conn-host conn) (ms-conn-port conn)))
+  (when (ms-conn-recv-timeout conn)
+    (dds.pal:tcp-set-recv-timeout (ms-conn-sock conn) (ms-conn-recv-timeout conn)))
   (setf (ms-conn-ever-connected-p conn) t)
   (setf (ms-conn-closed-p conn) nil)
   (ms-conn-sock conn))
@@ -476,20 +524,53 @@
                              (ms-conn-host conn) (ms-conn-port conn) e))))
   t)
 
+(defun* %ms-recv-body (sock body-len)
+    (function (t (integer 1)) (or null (simple-array (unsigned-byte 8) (*))))
+  "Read a message body of exactly BODY-LEN octets from SOCK INCREMENTALLY (WP-DURABILITY-MS-DOS, ADR 0050
+   §4.6): the accumulator starts at min(BODY-LEN, +ms-recv-chunk+) and GROWS geometrically (capped at
+   BODY-LEN) as bytes ACTUALLY arrive, so a huge DECLARED BODY-LEN never forces a full up-front allocation
+   — the amplification guard (allocated memory stays ≤ ~2× the bytes received, so a trickle of tiny
+   requests each declaring 256 MiB cannot OOM the peer; operating contract §4). Returns the exact-length
+   body simple vector, or NIL on a clean EOF/peer-close before BODY-LEN bytes arrive; a stalled peer (no
+   data within the socket's armed recv timeout) raises PAL-TIMEOUT from tcp-recv (propagated to the
+   caller). Each chunk is read via the bounds-checked tcp-recv. The common small case (BODY-LEN ≤ chunk)
+   is one exact allocation + one read straight into the buffer — no growth, no scratch (old-code parity)."
+  (let ((buf (make-array (min body-len +ms-recv-chunk+) :element-type '(unsigned-byte 8)))
+        (got 0))
+    (declare (type (integer 0) got) (type (simple-array (unsigned-byte 8) (*)) buf))
+    (loop while (< got body-len)
+          do (let ((want (min +ms-recv-chunk+ (- body-len got))))
+               (when (> (+ got want) (length buf))                          ; grow: geometric, capped at BODY-LEN
+                 (let ((new (make-array (min body-len (max (+ got want) (* 2 (length buf))))
+                                        :element-type '(unsigned-byte 8))))
+                   (replace new buf :end2 got)
+                   (setf buf new)))
+               (if (zerop got)
+                   (unless (dds.pal:tcp-recv sock buf want)                  ; first/only chunk: straight into buf
+                     (return-from %ms-recv-body nil))
+                   (let ((chunk (make-array want :element-type '(unsigned-byte 8))))
+                     (unless (dds.pal:tcp-recv sock chunk want)
+                       (return-from %ms-recv-body nil))
+                     (replace buf chunk :start1 got :end1 (+ got want))))
+               (incf got want)))
+    buf))
+
 (defun* %ms-recv-message (sock)
     (function (t) (or null (simple-array (unsigned-byte 8) (*))))
   "Read one length-prefixed message body (op-code/status + payload) from SOCK. Returns the body simple
-   vector, or NIL on EOF / peer-close. The declared body-len is bounds-checked against +ms-max-message+
-   BEFORE the body buffer is allocated (resource guard); a zero or over-cap length is a protocol error.
-   Shared by the client (reading responses) and the server (reading requests)."
+   vector, or NIL on a clean EOF/peer-close. The declared body-len is bounds-checked against
+   +ms-max-message+ BEFORE any body buffer is allocated (resource guard); a zero or over-cap length is a
+   protocol error (refused without allocating). The body is then read INCREMENTALLY (%ms-recv-body) so a
+   huge DECLARED length never forces a huge up-front allocation (amplification guard, WP-DURABILITY-MS-DOS
+   ADR 0050 §4.6). A stalled peer trips the socket's armed recv timeout — tcp-recv raises PAL-TIMEOUT,
+   which propagates (server: the serve-connection backstop drops the connection; client: %ms-exchange
+   re-signals conn-lost). Shared by the client (reading responses) and the server (reading requests)."
   (let ((hdr (make-array 4 :element-type '(unsigned-byte 8))))
     (unless (dds.pal:tcp-recv sock hdr 4) (return-from %ms-recv-message nil))
     (let ((body-len (%get-u32-le hdr 0)))
       (when (or (zerop body-len) (> body-len +ms-max-message+))
         (error 'microservice-protocol-error :detail "message body length out of range"))
-      (let ((body (make-array body-len :element-type '(unsigned-byte 8))))
-        (unless (dds.pal:tcp-recv sock body body-len) (return-from %ms-recv-message nil))
-        body))))
+      (%ms-recv-body sock body-len))))
 
 (defun* %ms-exchange (sock code payload)
     (function (t (unsigned-byte 8) (simple-array (unsigned-byte 8) (*))) ms-reader)
@@ -512,7 +593,12 @@
       (decf *durability-debug-ms-force-recv-drop*)
       (%ms-recv-message sock)
       (error 'microservice-conn-lost :detail "forced post-send recv drop (test-only)"))
-    (let ((body (%ms-recv-message sock)))
+    ;; a stalled server that never responds trips the socket's armed recv timeout -> tcp-recv raises
+    ;; PAL-TIMEOUT; translate it to conn-lost so %ms-call takes the bounded reconnect path (a malicious/
+    ;; half-open server can NEVER hang the client's tcp-recv forever — WP-DURABILITY-MS-DOS, ADR 0050 §4.6).
+    (let ((body (handler-case (%ms-recv-message sock)
+                  (dds.pal:pal-timeout ()
+                    (error 'microservice-conn-lost :detail "server stalled (client recv timeout)")))))
       (unless body (error 'microservice-conn-lost :detail "server closed the connection"))
       (let ((r (%make-ms-reader :buf body :pos 0 :end (length body))))
         (let ((status (%rd-u8 r)))
@@ -590,8 +676,10 @@
 
 ;;; ---- client store factory ----
 
-(defun* make-microservice-store (&key host port (name :microservice))
-    (function (&key (:host (or null string)) (:port (integer 0 65535)) (:name keyword)) durable-store)
+(defun* make-microservice-store (&key host port (name :microservice)
+                                      (recv-timeout +ms-default-recv-timeout+))
+    (function (&key (:host (or null string)) (:port (integer 0 65535)) (:name keyword)
+                    (:recv-timeout (or null (real 0)))) durable-store)
   "Construct a MICROSERVICE-backed durable-store (ADR 0050) that implements the fixed durable-store
    vtable by proxying every operation over ONE TCP connection to a make-microservice-server holding an
    inner store. HOST defaults to 127.0.0.1; PORT is the server's (ephemeral) port from
@@ -612,12 +700,16 @@
    uninstalled and seals no anchor — memory parity, Slice 1 round-trip unchanged. store-open connects on
    demand; a mid-session drop (server restart / network blip) triggers a BOUNDED single reconnect +
    idempotent retry per op in %ms-call (Slice 3c-1, ADR 0050 §4.5) — a restarted server on the SAME port is
-   transparently re-dialled; a server that stays down surfaces a clean MICROSERVICE-STORE-ERROR (no hang)."
+   transparently re-dialled; a server that stays down surfaces a clean MICROSERVICE-STORE-ERROR (no hang).
+   :RECV-TIMEOUT (seconds, default +ms-default-recv-timeout+ = 30 s; NIL disables) arms SO_RCVTIMEO on the
+   client socket (WP-DURABILITY-MS-DOS, ADR 0050 §4.6): a stalled/half-open server surfaces as a clean
+   conn-lost (-> the reconnect path), never an infinite tcp-recv hang — closing the Slice-1 loopback-shaped
+   boundedness nit."
   (let* ((lock (dds.pal:make-lock "dds-durability-microservice"))
          (host* (or host "127.0.0.1"))
          ;; the conn carries host/port so %ms-call can RE-DIAL after a drop (Slice 3c-1); :port is REQUIRED.
          (port* (or port (error 'microservice-store-error :detail "make-microservice-store requires :port")))
-         (conn (%make-ms-conn :host host* :port port* :sock nil))
+         (conn (%make-ms-conn :host host* :port port* :sock nil :recv-timeout recv-timeout))
          ;; client-side remote-tier chain-MAC state (Slice 3b, ADR 0045/0050 §4.3), installed by the
          ;; encrypted decorator via :set-chain-mac-fn; NIL oracle ⇒ chain absent (bare store, memory parity).
          (chain-mac-fn nil)                              ; the log-MAC oracle (data)->HMAC, or NIL
@@ -1153,7 +1245,8 @@
 (defstruct* (microservice-server (:constructor %make-microservice-server))
   "Handle for a running reference microservice server: the inner durable-store it proxies, the TCP
    listener, the accept/serve thread, the bound (ephemeral) PORT clients connect to, the HOST, a
-   one-shot STOP-CELL flag, and a LOCK guarding stop against double-invocation."
+   one-shot STOP-CELL flag, the per-connection RECV-TIMEOUT (idle/read DoS guard), and a LOCK guarding
+   stop against double-invocation."
   (inner (make-memory-store) :type durable-store)
   (listener nil :type t)
   (thread   nil :type t)
@@ -1163,7 +1256,20 @@
   ;; car = the connection currently being served, or NIL. Closing it on stop unblocks a serve thread
   ;; parked in recv on an idle client (a stop must never hang on a still-connected client).
   (conn-cell (list nil) :type cons)
+  ;; idle/read timeout (seconds, NIL disables) armed on each accepted socket so a slow-loris cannot park
+  ;; the SERIAL serve thread forever and deny every other client (WP-DURABILITY-MS-DOS, ADR 0050 §4.6).
+  (recv-timeout +ms-default-recv-timeout+ :type (or null (real 0)))
   (lock nil :type t))
+
+(defun* %ms-accept-backoff (fails)
+    (function ((integer 0)) (member :retry :stop))
+  "Accept-failure policy for the serve loop (WP-DURABILITY-MS-DOS, ADR 0050 §4.6): after FAILS consecutive
+   tcp-accept failures, return :RETRY (the loop sleeps *ms-accept-backoff-seconds* then re-accepts — a
+   BOUNDED pause, never a tight CPU spin) until FAILS exceeds +ms-accept-max-fails+, then :STOP (a
+   persistent accept failure — fd exhaustion / EMFILE — ends the loop with a log, no silent infinite spin).
+   A single transient failure stays non-fatal (the loop's count resets on the next successful accept). Pure
+   + side-effect-free so a unit test can drive the escalation deterministically without exhausting fds."
+  (if (> fails +ms-accept-max-fails+) :stop :retry))
 
 (defun* %ms-handle-request (body inner)
     (function ((simple-array (unsigned-byte 8) (*)) durable-store) (simple-array (unsigned-byte 8) (*)))
@@ -1235,46 +1341,72 @@
       (t (error 'microservice-protocol-error :detail "unknown op-code")))
     (%ms-frame-message +ms-status-ok+ (%ms-finalize out))))
 
-(defun* %ms-serve-connection (conn inner)
-    (function (t durable-store) t)
-  "Serve one client connection: read a request, dispatch, reply, repeat until the client closes (EOF) or
-   ANY per-connection fault occurs. A MICROSERVICE-PROTOCOL-ERROR (a bounds/well-formedness violation) is
-   the common clean case — it drops the connection fail-safe. The outer SERIOUS-CONDITION handler is the
-   defense-in-depth BACKSTOP mandated for a network listener serving untrusted clients: any UNANTICIPATED
-   per-connection error (a decode fault, a torn send, …) drops THAT connection and returns so the accept
-   loop KEEPS ACCEPTING — a single malformed message can never kill the serve thread or wedge the
-   listener. It closes the connection + continues (never retries the faulting op), so there is no spin."
+(defun* %ms-serve-connection (conn inner recv-timeout)
+    (function (t durable-store (or null (real 0))) t)
+  "Serve one client connection: arm the idle/read RECV-TIMEOUT on CONN (WP-DURABILITY-MS-DOS), then read a
+   request, dispatch, reply, repeat until the client closes (EOF) or ANY per-connection fault occurs. A
+   MICROSERVICE-PROTOCOL-ERROR (a bounds/well-formedness violation) is the common clean case — it drops the
+   connection fail-safe. A stalled/slow-loris client (a header then no body, or a bare connect then
+   silence) trips the armed recv timeout so tcp-recv raises PAL-TIMEOUT after RECV-TIMEOUT seconds. The
+   outer SERIOUS-CONDITION handler is the defense-in-depth BACKSTOP mandated for a network listener serving
+   untrusted clients: any per-connection error — a decode fault, a torn send, AND now the read-timeout
+   PAL-TIMEOUT (a serious-condition) — drops THAT connection and returns so the accept loop KEEPS ACCEPTING.
+   So a slow-loris can no longer park the SERIAL serve thread forever and deny every other client; a single
+   malformed message can never kill the serve thread or wedge the listener. It closes the connection +
+   continues (never retries the faulting op), so there is no spin. Arming the timeout INSIDE the handler-
+   case means even a setsockopt failure is contained (drop + keep accepting)."
   (handler-case
-      (loop
-        (let ((body (%ms-recv-message conn)))
-          (when (null body) (return t))
-          (let ((resp (%ms-handle-request body inner)))
-            (dds.pal:tcp-send conn resp (length resp)))))
+      (progn
+        (when recv-timeout (dds.pal:tcp-set-recv-timeout conn recv-timeout))
+        (loop
+          (let ((body (%ms-recv-message conn)))
+            (when (null body) (return t))
+            (let ((resp (%ms-handle-request body inner)))
+              (dds.pal:tcp-send conn resp (length resp))))))
     (serious-condition () t)))
 
-(defun* %ms-serve-loop (listener inner stop-cell conn-cell)
-    (function (t durable-store cons cons) t)
-  "The server accept loop: accept a connection (recording it in CONN-CELL so stop can close it), serve
-   it to completion, loop, until STOP-CELL is set. microservice-server-stop sets the flag, closes the
-   in-flight connection to wake a serve thread parked in recv, then makes a throwaway self-connection to
-   wake a serve thread parked in accept (closing the listener alone does not portably unblock accept)."
-  (loop
-    (when (car stop-cell) (return t))
-    (let ((conn (handler-case (dds.pal:tcp-accept listener)
-                  (error () nil))))
-      (cond
-        ((car stop-cell) (when conn (ignore-errors (dds.pal:tcp-close conn))) (return t))
-        (conn (setf (car conn-cell) conn)
-              (unwind-protect (%ms-serve-connection conn inner)
-                (setf (car conn-cell) nil)
-                (ignore-errors (dds.pal:tcp-close conn))))
-        (t nil)))))
+(defun* %ms-serve-loop (listener inner stop-cell conn-cell recv-timeout)
+    (function (t durable-store cons cons (or null (real 0))) t)
+  "The server accept loop: accept a connection (recording it in CONN-CELL so stop can close it), serve it
+   to completion with the idle/read RECV-TIMEOUT armed, loop, until STOP-CELL is set. microservice-server-
+   stop sets the flag, closes the in-flight connection to wake a serve thread parked in recv, then makes a
+   throwaway self-connection to wake a serve thread parked in accept (closing the listener alone does not
+   portably unblock accept). ACCEPT BACKOFF (WP-DURABILITY-MS-DOS, ADR 0050 §4.6): a tcp-accept FAILURE
+   (conn NIL) no longer immediately re-loops (the former (t nil) hot-spin) — the loop counts consecutive
+   failures and BACKS OFF (%ms-accept-backoff -> a bounded *ms-accept-backoff-seconds* sleep) before
+   retrying, so a persistent accept failure (fd exhaustion / EMFILE) becomes a bounded poll, not a tight
+   CPU spin; past +ms-accept-max-fails+ it STOPS (logged). A successful accept resets the count (a transient
+   failure is non-fatal). The *durability-debug-ms-force-accept-fail* knob forces N failures for the test."
+  (let ((accept-fails 0))
+    (declare (type (integer 0) accept-fails))
+    (loop
+      (when (car stop-cell) (return t))
+      (let ((conn (if (plusp *durability-debug-ms-force-accept-fail*)
+                      (progn (decf *durability-debug-ms-force-accept-fail*) nil)   ; test-only forced accept failure
+                      (handler-case (dds.pal:tcp-accept listener)
+                        (error () nil)))))
+        (cond
+          ((car stop-cell) (when conn (ignore-errors (dds.pal:tcp-close conn))) (return t))
+          (conn (setf accept-fails 0)                                             ; success resets the failure count
+                (setf (car conn-cell) conn)
+                (unwind-protect (%ms-serve-connection conn inner recv-timeout)
+                  (setf (car conn-cell) nil)
+                  (ignore-errors (dds.pal:tcp-close conn))))
+          (t (incf accept-fails)                                                  ; accept failed: backoff, never hot-spin
+             (when (eq :stop (%ms-accept-backoff accept-fails))
+               (format *error-output*
+                       "~&dds.durability microservice: ~d consecutive accept failures — stopping the serve loop~%"
+                       accept-fails)
+               (return t))
+             (sleep *ms-accept-backoff-seconds*)))))))
 
 (defun* make-microservice-server (&key (host "127.0.0.1") (port 0) (inner (make-memory-store))
-                                       history-kind history-depth)
+                                       history-kind history-depth
+                                       (recv-timeout +ms-default-recv-timeout+))
     (function (&key (:host string) (:port (integer 0 65535)) (:inner durable-store)
                     (:history-kind (or null (member :keep-all :keep-last)))
-                    (:history-depth (or null (integer 1))))
+                    (:history-depth (or null (integer 1)))
+                    (:recv-timeout (or null (real 0))))
               microservice-server)
   "Start a reference microservice server (ADR 0050) that proxies the durable-store vtable over TCP to
    the INNER store (memory default; a persistent make-file-store / make-sqlite-store is the Slice-3a
@@ -1282,6 +1414,14 @@
    microservice-server-port) and spawns one accept/serve thread. The server is a DUMB opaque proxy: it
    decodes each request, dispatches to INNER, and encodes the reply, with ZERO DARE/MAC knowledge. One
    client at a time (inline per-connection serving) is sufficient (multi-client is Slice 3c).
+
+   DoS HARDENING (WP-DURABILITY-MS-DOS, ADR 0050 §4.6): :RECV-TIMEOUT (seconds, default
+   +ms-default-recv-timeout+ = 30 s; NIL disables) arms an idle/read timeout on every accepted socket so a
+   SLOW-LORIS — a client that sends a length header then stalls — trips the timeout and is DROPPED (the
+   serve-connection backstop), and the SERIAL accept loop survives to serve the next client instead of
+   being parked forever. The accept loop also BACKS OFF on a persistent accept failure (no CPU hot-spin),
+   and message bodies are read incrementally (a huge DECLARED length never forces a huge up-front alloc).
+   Tests pass a short :recv-timeout (e.g. 1 s) to stay bounded.
 
    SERVER-OWNED INNER LIFECYCLE (ADR 0050 Slice 3a): the server OWNS the inner's lifecycle, correct for a
    persistence tier that OUTLIVES individual client sessions. The inner is opened ONCE here at
@@ -1298,14 +1438,14 @@
          (stop-cell (list nil))
          (conn-cell (list nil))
          (srv (%make-microservice-server :inner inner :listener listener :port bound :host host
-                                         :stop-cell stop-cell :conn-cell conn-cell
+                                         :stop-cell stop-cell :conn-cell conn-cell :recv-timeout recv-timeout
                                          :lock (dds.pal:make-lock "dds-durability-microservice-server"))))
     ;; server-owned lifecycle: open the inner ONCE (persistent inner replays from disk) BEFORE the serve
     ;; thread accepts, so the inner is ready for the first client; a failed open closes the listener.
     (handler-case (store-open inner history-kind history-depth)
       (error (e) (ignore-errors (dds.pal:tcp-close listener)) (error e)))
     (setf (microservice-server-thread srv)
-          (dds.pal:spawn (lambda () (%ms-serve-loop listener inner stop-cell conn-cell))
+          (dds.pal:spawn (lambda () (%ms-serve-loop listener inner stop-cell conn-cell recv-timeout))
                          :name "dds-durability-ms"))
     srv))
 

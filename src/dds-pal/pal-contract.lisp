@@ -12,7 +12,7 @@
     threads, sockets, monotonic clock, GC control, optimization hints.")
   (:export
    ;; conditions
-   #:pal-error #:pal-unimplemented #:pal-op
+   #:pal-error #:pal-unimplemented #:pal-op #:pal-timeout
    ;; capability introspection
    #:+pal-capabilities+ #:pal-impl-name
    ;; memory (off-heap, non-GC'd, raw-pointer-addressable)
@@ -50,8 +50,11 @@
    #:udp-set-reuse-port #:udp-join-multicast
    ;; TCPv4 stream sockets (native, FR-XPORT-1). Byte-stream full-send / full-frame recv loops
    ;; (a stream is not message-framed): tcp-send loops over short writes, tcp-recv loops until LEN
-   ;; bytes or peer-close (NIL). Backs the durability MICROSERVICE persistence backend (ADR 0050).
+   ;; bytes or peer-close (NIL). tcp-set-recv-timeout arms SO_RCVTIMEO so a stalled tcp-recv raises
+   ;; PAL-TIMEOUT (a DoS/idle guard) instead of blocking forever. Backs the durability MICROSERVICE
+   ;; persistence backend (ADR 0050).
    #:tcp-connect #:tcp-listen #:tcp-accept #:tcp-local-port #:tcp-send #:tcp-recv #:tcp-close
+   #:tcp-set-recv-timeout
    ;; gc control / measurement
    #:gc-suggest #:with-gc-inhibited #:bytes-consed
    ;; optimization hints
@@ -74,6 +77,16 @@
              (format s "PAL capability not implemented on this build: ~s"
                      (pal-op c))))
   (:documentation "Signalled by a capability stub not yet provided for this impl."))
+
+(define-condition pal-timeout (pal-error)
+  ((op :initarg :op :reader pal-op :initform nil))
+  (:report (lambda (c s) (format s "PAL socket operation timed out: ~s" (pal-op c))))
+  (:documentation "A blocking PAL socket receive (TCP-RECV) reached its SO_RCVTIMEO deadline before any
+    data arrived — the read/idle timeout fired (armed by TCP-SET-RECV-TIMEOUT). A DISTINCT catchable
+    outcome, NOT a clean EOF (TCP-RECV's NIL return) and NOT data: a stalled/slow-loris peer surfaces here
+    so a caller DROPS the connection (server) or treats it as a lost connection (client) rather than
+    blocking forever. Only sockets with a timeout armed can raise it; a socket without SO_RCVTIMEO set
+    still blocks and returns NIL on a genuine peer-close, exactly as before."))
 
 (defparameter +pal-capabilities+
   '(:memory :atomics :threads :sockets :clock :gc-control :opt-hints)
