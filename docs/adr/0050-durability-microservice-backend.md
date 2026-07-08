@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-07
-Work package: WP-DURABILITY-MICROSERVICE-1 (Slice 1) + WP-DURABILITY-MICROSERVICE-2 (Slice 2 — DARE-wrap) + WP-DURABILITY-MICROSERVICE-3A (Slice 3a — server-owned persistent inner + cross-restart + config-env seam) + WP-DURABILITY-MICROSERVICE-3B (Slice 3b — client-side remote-tier chain-MAC) + WP-DURABILITY-TAIL-ANCHOR-MS (sealed high-water tail anchor) + WP-DURABILITY-MS-RECLAIM-REMAC (Slice 3d — KEEP_LAST reclaim re-MAC over the wire, §4.4) + WP-DURABILITY-MS-RECONNECT (Slice 3c-1 — bounded client reconnect + idempotent retry, §4.5; HISTORY-QoS-over-the-wire descope, §4.2/§7) + WP-DURABILITY-MS-DOS (Slice 3c-2 — server DoS-hardening: read/idle timeout, incremental body allocation, accept-loop backoff, §4.6) (ADR 0021 capability 6 — the last of the owner's pluggable persistence tiers: file / db / MICROSERVICE — composed with capability 7, the always-on DARE)
+Work package: WP-DURABILITY-MICROSERVICE-1 (Slice 1) + WP-DURABILITY-MICROSERVICE-2 (Slice 2 — DARE-wrap) + WP-DURABILITY-MICROSERVICE-3A (Slice 3a — server-owned persistent inner + cross-restart + config-env seam) + WP-DURABILITY-MICROSERVICE-3B (Slice 3b — client-side remote-tier chain-MAC) + WP-DURABILITY-TAIL-ANCHOR-MS (sealed high-water tail anchor) + WP-DURABILITY-MS-RECLAIM-REMAC (Slice 3d — KEEP_LAST reclaim re-MAC over the wire, §4.4) + WP-DURABILITY-MS-RECONNECT (Slice 3c-1 — bounded client reconnect + idempotent retry, §4.5; HISTORY-QoS-over-the-wire descope, §4.2/§7) + WP-DURABILITY-MS-DOS (Slice 3c-2 — server DoS-hardening: read/idle timeout, incremental body allocation, accept-loop backoff, §4.6) + WP-DURABILITY-MS-MULTICLIENT (Slice 3c-3 — server multi-client concurrency: per-connection serve threads, a lock-guarded connection registry + a max-connections cap, and an ATOMIC memory `store-replace-topic`, §4.7) (ADR 0021 capability 6 — the last of the owner's pluggable persistence tiers: file / db / MICROSERVICE — composed with capability 7, the always-on DARE)
 Relates to: ADR 0021 (pluggable persistence vtable), ADR 0026 (file store, DARE at-rest), ADR 0045 (log-MAC chain), ADR 0049 (SQLite backend — the sibling "second implementation of the fixed vtable")
 
 ## 1. Context
@@ -577,6 +577,71 @@ the buffer extent (operating contract §4); the DoS guards (max-message cap, rea
 accept backoff) **are** the §4 resource-exhaustion guards. `defun*`/full ftypes throughout; DRY (the timeout
 prim reuses `%setsockopt`; the shared reader protects both sides).
 
+### 4.7 Slice 3c-3 — server multi-client concurrency (WP-DURABILITY-MS-MULTICLIENT, BUILT)
+
+Slices 1–3c-2 left the server strictly **SERIAL**: one accept+serve thread served each connection to
+completion (`%ms-serve-connection` looping to EOF) before accepting the next. A slow / stalled client parked
+that single thread; the Slice-3c-2 read-timeout stopped it denying *forever*, but a client was still served
+one-at-a-time. Slice 3c-3 makes the server serve **concurrent clients in parallel — SERVER-ONLY, zero
+client / wire-protocol change** (the client chain state is client-side and unchanged).
+
+**Per-connection serve threads + a locked registry.** `%ms-serve-loop` now **spawns a dedicated serve
+thread** (`dds.pal:spawn` → `%ms-serve-connection-in-thread`) for each accepted connection and immediately
+loops to accept the next — so a slow client parks only **its own** thread. The single Slice-1 `conn-cell` is
+replaced by a **lock-guarded connection registry** (`reg-cell` = a list of `ms-conn-slot {conn, thread}`,
+guarded by `reg-lock`). `microservice-server-stop` sets the stop flag, wakes + **joins the accept-loop
+thread first** (so no new slot is added after), then **drains the registry** — closing every live connection
+(waking any serve thread parked in recv) and **joining every serve thread** — before closing the listener
+and, LAST, the inner store (so no in-flight inner op races the close). A serve thread **self-removes** its
+slot (under `reg-lock`) when its connection closes, freeing its cap slot promptly. The registration is
+**race-free**: the reserve-and-spawn runs *under* `reg-lock`, so a serve thread cannot self-remove (nor stop
+drain) before its slot's `thread` is stored.
+
+**Connection cap.** `make-microservice-server :max-connections` (default `+ms-default-max-connections+` = 64)
+bounds the concurrent serve threads: under `reg-lock`, if the live count (`(length (car reg-cell))`, read
+under the lock — no separate counter to drift) has reached the cap a newly accepted connection is
+**REJECTED** (closed immediately) — a connection flood cannot grow threads unbounded (operating contract §4).
+A slot frees the moment any connection closes, so the cap **recovers**.
+
+**The load-bearing correctness — every server-side shared mutable state is locked.** The concurrency
+audit (the enumeration the review demanded):
+
+1. **The inner store** — shared across serve threads; every op handler dispatches to an **internally-locked**
+   inner op (memory `%mem-*` under one lock; file / SQLite under their own lock [+ SQLite transaction]).
+   Each `%ms-handle-request` op is exactly ONE inner call, over fresh per-request buffers — no server-side
+   unlocked access to inner internals, no cross-op read-modify-write in a handler.
+2. **THE critical fix — `store-replace-topic` atomicity.** The memory inner's `store-replace-topic` was the
+   NIL-fallback **purge + bulk-put — two SEPARATE locked ops**, atomic *only because the server was serial*.
+   Under concurrency a `get-range` interleaving between the purge and the re-put sees a **partial / empty
+   topic** → a corrupt / short read (for the client chain verify, a spurious mismatch or data loss). Slice
+   3c-3 gives the memory store a native **`:replace-topic-fn` that holds its lock ACROSS the clear + bulk
+   re-insert as ONE critical section** (`%mem-replace-topic`, reusing `%mem-put-unlocked` per record, DRY),
+   so no concurrent op ever observes a partial topic. (The file `%rewrite-topic-log` tmp+rename and the
+   SQLite single transaction were **already** atomic *and* serialize under their per-store lock — confirmed;
+   only the memory tier had the two-op window.) This is proven RED→GREEN by
+   `run-durability-mem-replace-atomicity-test`: a debug barrier lands a concurrent `get-range` at the swap
+   midpoint — non-atomic (`*durability-debug-mem-replace-nonatomic*` T) it reads an EMPTY partial (RED);
+   atomic (default) it blocks on the held lock and reads the full post topic (GREEN).
+3. **The registry + live count** — every add / remove / drain / count under `reg-lock`.
+4. **Per-connection state** — the `ms-conn-slot`, the `ms-reader`, the `%ms-buf` accumulator, the received
+   body — all per-thread / freshly allocated; no two serve threads share a connection or a buffer.
+5. **Stop vs a mid-op serve thread** — a clean shutdown (close-to-wake + join, inner closed LAST): an
+   in-flight inner op (atomic) completes before its thread exits; no half-write to a persistent inner.
+
+**The slow-drip residual (§7) is STRUCTURALLY FIXED** — a stalled client parks only its own serve thread; a
+concurrent client is served in parallel, the service is not denied
+(`run-durability-microservice-slow-drip-concurrent-test`, with the server read-timeout NIL, so it isolates
+the structural fix from the DoS timeout). The read-timeout's remaining multi-client role is to **reclaim** a
+parked slow-loris's thread + cap slot (`run-durability-microservice-slow-loris-test`, re-targeted from
+"denies → served" to "slot not-reclaimed → reclaimed").
+
+**Portable + clean-room.** `dds.pal:spawn` / `join` / `make-lock` / `with-lock` only (the reader
+conditionals stay in `dds-pal`); no new crypto, no new dependency, `defun*` / full ftypes, DRY, bounds-checks
+intact. Five new tests (headline concurrent-clients-correct, memory-replace-atomicity RED→GREEN,
+stop-closes-all, max-connections-cap, slow-drip-parks-own-thread); both impls green **identically, Clasp
+first: Suite 507 → 512** (SBCL is the race-correctness oracle; Clasp threading held — no NFR-PORT flake this
+slice).
+
 **Tests** (all bare-transport, always run — the hardening is below DARE):
 - **`run-durability-microservice-slow-loris-test`** (headline, RED→GREEN in one test): RED (server
   `:recv-timeout` NIL) — a slow-loris parks the serial serve thread and a spawned subsequent client is
@@ -639,8 +704,18 @@ outside `dds-pal`.
   `ms-conn` + server structs gain a `recv-timeout` slot (`%ms-dial` / `make-microservice-store` client-side,
   `%ms-serve-connection` / `make-microservice-server` server-side); `%ms-exchange` translates `pal-timeout`
   → `microservice-conn-lost`; `%ms-serve-loop` gains the `%ms-accept-backoff` policy + backoff sleep.
+  **Slice 3c-3 (§4.7):** the multi-client server — the `+ms-default-max-connections+` constant + an
+  `ms-conn-slot` `defstruct*`; the server struct swaps the single `conn-cell` for a lock-guarded registry
+  (`reg-cell` + `reg-lock`) + a `max-connections` cap; `%ms-serve-loop` now spawns `%ms-serve-connection-in-thread`
+  per accepted connection (race-free reserve-and-spawn under `reg-lock` + the cap reject) instead of serving
+  inline; `microservice-server-stop` joins the accept loop then drains the registry (close-to-wake + join
+  every serve thread, inner closed LAST). Server-only, client + wire byte-identical.
 - `src/dds-durability/store.lisp` — **Slice 3d** the additive NIL-fallback `store-replace-topic` dispatcher
-  + `replace-topic-fn` vtable slot (the fallback is `store-purge` + bulk `store-put`).
+  + `replace-topic-fn` vtable slot (the fallback is `store-purge` + bulk `store-put`). **Slice 3c-3 (§4.7):**
+  the memory store now SUPPLIES `:replace-topic-fn` — `%mem-replace-topic` holds the store lock ACROSS the
+  clear + bulk re-insert (ONE critical section, reusing the extracted lock-free `%mem-put-unlocked`, DRY), so
+  a concurrent multi-client op never sees a partial topic (the serial-era purge+bulk-put window is closed);
+  `*durability-debug-mem-replace-nonatomic*` / `*-barrier*` are the RED/GREEN test knobs.
 - `src/dds-durability/store-file.lisp` — **Slice 3d** the atomic `:replace-topic-fn` slot (reuses
   `%rewrite-topic-log` tmp+fsync+rename + index/counter rebuild).
 - `src/dds-durability/store-sqlite.lisp` — **Slice 3d** the atomic `:replace-topic-fn` slot (a single
@@ -680,8 +755,19 @@ outside `dds-pal`.
   bounded alloc), `run-durability-microservice-client-timeout-test` (stalling server → clean conn-lost,
   bounded), `run-durability-microservice-accept-backoff-test` (unit decision + fault-injected recover) — all
   bare-transport, always run; plus the slow-loris + over-cap arms added to `run-durability-microservice-fuzz-test`.
+  **Slice 3c-3 (§4.7):** the multi-client suite — `run-durability-mem-replace-atomicity-test`
+  (the memory-replace RED→GREEN via the barrier knob), `run-durability-microservice-concurrent-clients-test`
+  (headline: N clients × mixed ops × rounds → byte-exact, no loss/dup/corruption),
+  `run-durability-microservice-stop-closes-all-test` (N live conns → drained + joined, no leak/hang),
+  `run-durability-microservice-max-connections-test` (cap reject → existing-works → close → recover), and
+  `run-durability-microservice-slow-drip-concurrent-test` (a stalled client parks its own thread, a concurrent
+  client is served); the `%tms-wait-until` / `%tms-live-conns` bounded-probe helpers; and
+  `run-durability-microservice-slow-loris-test` is **re-targeted** from "denies → served" (serial) to
+  "slot not-reclaimed → reclaimed" (multi-client).
 - `src/dds-pal/pal-net.lisp` / `pal-contract.lisp` — **Slice 3c-2** the `tcp-set-recv-timeout` prim +
   `pal-timeout` condition + the `tcp-recv` timeout/EOF split (see §4.6 / the §5 PAL entries above).
+  **Slice 3c-3 nit:** the `tcp-recv` docstring is corrected — `n=NIL` is a timeout OR an EINTR-interrupted
+  receive, both conservatively classified `pal-timeout` (identical disposition: drop / reconnect).
 
 ## 6. Consequences
 
@@ -743,8 +829,21 @@ outside `dds-pal`.
   crypto, no new dependency.** Configurable timeouts (`make-microservice-server` / `make-microservice-store`
   `:recv-timeout`, default 30 s). Both impls green identically, Clasp first: Suite 503 → 507
   (`durability-microservice-slow-loris`, `...-huge-declared`, `...-client-timeout`, `...-accept-backoff`; +
-  the fuzz gate extended). Headline RED→GREEN: with the timeout DISABLED a slow-loris denies a subsequent
-  client (`served=NIL`), with it enabled the client is served (`served=T`).
+  the fuzz gate extended). Headline (as of Slice 3c-2): with the timeout DISABLED a slow-loris denied a
+  subsequent client on the SERIAL server. **(Superseded by Slice 3c-3, §4.7:** the server is now multi-client,
+  so a slow-loris no longer denies anyone regardless of the timeout — the read-timeout's role becomes
+  RECLAIMING the parked slot, and the slow-loris test is re-targeted accordingly.)
+- **Slice 3c-3 (WP-DURABILITY-MS-MULTICLIENT):** the server serves **concurrent clients in parallel** —
+  per-connection serve threads + a lock-guarded connection registry (drained + joined on stop, no leak/hang)
+  + a `:max-connections` cap (default 64; a flood is rejected, not unbounded thread growth). The load-bearing
+  fix is the memory `store-replace-topic` **atomicity** (one lock hold across clear+refill; the serial-era
+  two-op purge+bulk-put window is closed) — proven RED→GREEN. Every server-side shared mutable state is
+  locked (inner store internally-locked per op + the now-atomic replace; the registry under `reg-lock`;
+  per-connection buffers are per-thread). The §7 slow-drip residual is **structurally fixed** (a stalled
+  client parks its own thread). Server-only — client + wire byte-identical; no new crypto / dependency. Both
+  impls green identically, Clasp first: **Suite 507 → 512** (`durability-mem-replace-atomicity`,
+  `...-concurrent-clients`, `...-stop-closes-all`, `...-max-connections`, `...-slow-drip-concurrent`). SBCL is
+  the race oracle; Clasp threading held (no NFR-PORT flake this slice).
 
 ## 7. Scope — Slice 1 and the deferred slices
 
@@ -787,6 +886,17 @@ dup/lose/corrupt (put INSERT-OR-IGNORE + post-confirm chain advance; topic-rewri
 delete tolerates `+ms-result-rejected+`). Client-side only, zero server / wire change (the server holds zero
 per-session state).
 
+**Slice 3c-3 (built, §4.7):** server multi-client concurrency — `%ms-serve-loop` spawns a per-connection
+serve thread (`%ms-serve-connection-in-thread`) and immediately loops, so concurrent clients are served in
+parallel; the single `conn-cell` becomes a lock-guarded registry (`reg-cell` + `reg-lock`) that
+`microservice-server-stop` drains (close-to-wake + join every serve thread, inner closed LAST); a
+`:max-connections` cap (default 64) rejects a connection flood. The load-bearing correctness is that EVERY
+server-side shared mutable state is locked — the critical fix being the memory `store-replace-topic`
+**atomicity** (a native `:replace-topic-fn` holding the store lock across clear+refill, replacing the
+serial-era two-op purge+bulk-put that a concurrent `get-range` could catch mid-swap). Server-only — client +
+wire byte-identical; no new crypto / dependency. This **structurally fixes the slow-drip residual** below (a
+stalled client now parks only its own thread). Both impls green identically, Clasp first: Suite 507 → 512.
+
 **Descoped:**
 - **Slice 3c — HISTORY QoS over the wire (DESCOPED — MOOT under DARE, and WRONG).** Forwarding the
   client/service HISTORY QoS (`history-kind`/`depth`) to the remote inner is **not required** and is
@@ -799,11 +909,11 @@ per-session state).
   supersedes the earlier Slice-3a "REQUIRED" framing; see §4.2.)
 
 **Deferred:**
-- **Slice 3c — remaining production posture.** Multi-client concurrency (the server serves one client at a
-  time); framing for very large `get-range` responses beyond the single-message `+ms-max-message+` ceiling
-  (chunked/streamed); the `main.lisp` CLI `--backend` (the driver-env path already suffices); the full live
-  2-process microservice cross-DDS interop run. (The per-connection **read-idle timeout** that a blocked-mid-
-  response read lacked is now **BUILT** — §4.6.)
+- **Slice 3c — remaining production posture.** Framing for very large `get-range` responses beyond the
+  single-message `+ms-max-message+` ceiling (chunked/streamed); the `main.lisp` CLI `--backend` (the
+  driver-env path already suffices); the full live 2-process microservice cross-DDS interop run. (**Multi-client
+  concurrency** is now **BUILT** — §4.7, WP-DURABILITY-MS-MULTICLIENT; the per-connection **read-idle timeout**
+  a blocked-mid-response read lacked is **BUILT** — §4.6.)
 - **Slice 3c — DoS hardening (BUILT, §4.6, WP-DURABILITY-MS-DOS).** The three Slice-1 residuals are now closed:
   (a) the **read/idle timeout** — `%ms-recv-message` no longer parks the serial serve thread on a slow-loris;
   a stalled recv trips `pal-timeout` (via the new `tcp-set-recv-timeout` / `SO_RCVTIMEO` PAL prim) and the

@@ -8465,52 +8465,66 @@
 
 ;;; --- WP-DURABILITY-MS-DOS (ADR 0050 §4.6) — microservice server DoS-hardening (Slice 3c-2) ---
 
+(defun* %tms-wait-until (pred seconds)
+    (function (function (real 0)) t)
+  "Busy-wait (BOUNDED) until PRED returns non-NIL or SECONDS elapse; return PRED's value (non-NIL if it
+   became true, NIL on timeout). Keeps a multi-client / DoS test bounded — no unbounded wait can hang the
+   suite (WP-DURABILITY-MS-MULTICLIENT / -MS-DOS)."
+  (let ((deadline (+ (get-internal-real-time) (round (* seconds internal-time-units-per-second)))))
+    (loop
+      (let ((v (funcall pred)))
+        (when v (return v))
+        (when (> (get-internal-real-time) deadline) (return nil))
+        (sleep 0.002)))))
+
+(defun* %tms-live-conns (srv)
+    (function (dds.durability:microservice-server) (integer 0))
+  "The server's current live server-side connection count, read UNDER the registry lock (never an unlocked
+   read of the concurrently-mutating registry list) — the multi-client tests' cap / drain / reclaim probe."
+  (dds.pal:with-lock ((dds.durability::microservice-server-reg-lock srv))
+    (length (the list (car (dds.durability::microservice-server-reg-cell srv))))))
+
 (defun* run-durability-microservice-slow-loris-test ()
     (function () t)
-  "WP-DURABILITY-MS-DOS headline (ADR 0050 §4.6): a SLOW-LORIS — a client that sends the length header then
-   STALLS (no body) — must NOT deny the SERIAL server. RED (server :recv-timeout NIL): the stalled client
-   parks the single serve thread forever, so a subsequent client is DENIED (proven BOUNDED: a spawned client
-   op does NOT complete within a 2 s window). GREEN (server :recv-timeout 1): the server read-timeout DROPS
-   the slow-loris after ~1 s and the accept loop SERVES the next client. Bare (non-DARE) transport gate —
-   always runs. Bounded (short server timeout + a bounded RED wait; the test itself never hangs)."
-  ;; ---- RED: with the server read-timeout DISABLED, a slow-loris denies a subsequent client ----
+  "WP-DURABILITY-MS-DOS read-timeout gate (ADR 0050 §4.6), updated for the MULTI-CLIENT server (§4.7): a
+   SLOW-LORIS — a client that sends the length header then STALLS — now parks only ITS OWN serve thread
+   (it no longer denies others; that structural no-denial fix is run-durability-microservice-slow-drip-
+   concurrent-test). The read-timeout's remaining job under multi-client is to RECLAIM the parked
+   slow-loris's serve thread + its connection-cap slot, so a slow-loris cannot silently exhaust the cap.
+   RED (server :recv-timeout NIL): the parked slow-loris slot is NOT reclaimed (lingers until stop). GREEN
+   (server :recv-timeout 1): the read-timeout DROPS the slow-loris after ~1 s so its slot is RECLAIMED
+   (live-conns → 0), and a subsequent client is served. Bare (non-DARE) transport gate — always runs.
+   Bounded (short timeout + deadline-capped waits; the test never hangs)."
+  ;; ---- RED: with the read-timeout DISABLED, the parked slow-loris slot is NOT reclaimed ----
   (let* ((srv   (dds.durability:make-microservice-server :port 0 :recv-timeout nil))
          (port  (dds.durability:microservice-server-port srv))
-         (loris (dds.pal:tcp-connect "127.0.0.1" port))
-         (done  (list nil)))
+         (loris (dds.pal:tcp-connect "127.0.0.1" port)))
     (unwind-protect
         (progn
-          (dds.pal:tcp-send loris (octets 64 0 0 0) 4)          ; declare a 64-byte body, send nothing -> serve thread parks
-          (sleep 0.2)                                            ; let the server accept + park on the loris body recv
-          (let ((th (dds.pal:spawn
-                     (lambda ()
-                       (ignore-errors
-                        (let ((s (dds.durability:make-microservice-store
-                                  :host "127.0.0.1" :port port :recv-timeout nil)))
-                          (dds.durability:store-open s)
-                          (dds.durability:store-count s "X")
-                          (setf (car done) t))))
-                     :name "ms-loris-red-client")))
-            (let ((deadline (+ (get-internal-real-time) (round (* 2 internal-time-units-per-second)))))
-              (loop until (or (car done) (> (get-internal-real-time) deadline)) do (sleep 0.05)))
-            (%check :ms-loris-red-denied (null (car done))
-                    "RED: a slow-loris DENIES a subsequent client when the server read-timeout is DISABLED (serial serve thread parked)")
-            (ignore-errors (dds.pal:tcp-close loris))            ; unblock the parked serve thread
-            (dds.durability:microservice-server-stop srv)        ; closes the listener -> the waiting client thread unblocks
-            (ignore-errors (dds.pal:join th))))
-      (ignore-errors (dds.durability:microservice-server-stop srv))))
-  ;; ---- GREEN: with a 1 s server read-timeout, the slow-loris is dropped + the next client is SERVED ----
+          (dds.pal:tcp-send loris (octets 64 0 0 0) 4)          ; declare a 64-byte body, send nothing -> its serve thread parks
+          (%check :ms-loris-red-parked (%tms-wait-until (lambda () (>= (%tms-live-conns srv) 1)) 5)
+                  "the slow-loris serve thread is live + parked in recv")
+          (sleep 1.5)                                            ; well past a would-be short read-timeout
+          (%check :ms-loris-red-not-reclaimed (>= (%tms-live-conns srv) 1)
+                  "RED: with the read-timeout DISABLED the parked slow-loris slot is NOT reclaimed (it lingers until stop)"))
+      (progn (ignore-errors (dds.pal:tcp-close loris))
+             (dds.durability:microservice-server-stop srv))))
+  ;; ---- GREEN: with a 1 s read-timeout, the slow-loris is dropped + its slot reclaimed; a client is served ----
   (let* ((srv   (dds.durability:make-microservice-server :port 0 :recv-timeout 1))
          (port  (dds.durability:microservice-server-port srv))
          (loris (dds.pal:tcp-connect "127.0.0.1" port)))
     (unwind-protect
         (progn
           (dds.pal:tcp-send loris (octets 64 0 0 0) 4)          ; header then stall -> the server drops it after ~1 s
+          (%check :ms-loris-green-parked (%tms-wait-until (lambda () (>= (%tms-live-conns srv) 1)) 5)
+                  "the slow-loris serve thread parks in recv")
+          (%check :ms-loris-green-reclaimed (%tms-wait-until (lambda () (= 0 (%tms-live-conns srv))) 5)
+                  "GREEN: the read-timeout DROPS the slow-loris after ~1 s -> its serve thread exits + its cap slot is RECLAIMED")
           (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
             (dds.durability:store-open s)
             (%check :ms-loris-green-served
                     (eq t (dds.durability:store-put s "ok" (%tms-guid 1) 1 nil :data (octets 1 2 3)))
-                    "GREEN: the server read-timeout drops the slow-loris -> a SUBSEQUENT client is SERVED (service not denied)")
+                    "GREEN: a subsequent client is SERVED (round-trip intact)")
             (%check :ms-loris-green-count (= 1 (dds.durability:store-count s "ok"))
                     "GREEN: the subsequent client's round-trip is intact")
             (dds.durability:store-close s)))
@@ -8640,4 +8654,314 @@
               (dds.durability:store-close s))
           (dds.durability:microservice-server-stop srv)))
     (setf dds.durability::*durability-debug-ms-force-accept-fail* 0))
+  t)
+
+;;; --- WP-DURABILITY-MS-MULTICLIENT (ADR 0050 §4.7) — server multi-client concurrency ---
+
+(defun* run-durability-mem-replace-atomicity-test ()
+    (function () t)
+  "WP-DURABILITY-MS-MULTICLIENT critical-fix RED→GREEN (ADR 0050 §4.7): a concurrent get-range on topic T
+   WHILE another thread drives a store-replace-topic (the +ms-op-topic-rewrite+ primitive) of T must see
+   EITHER the pre- OR the post-replace topic, NEVER a partial/empty one. A debug barrier lands the reader
+   deterministically at the swap MIDPOINT (after clear, before refill). RED (*mem-replace-nonatomic* T —
+   the OLD purge+bulk-put two-phase): the lock is DROPPED across the midpoint, so the reader sees an EMPTY
+   topic (a partial read = data loss for the client's chain verify). GREEN (atomic, default): the whole
+   clear+refill is ONE lock hold, so the reader BLOCKS and sees the full post state. Driven directly on a
+   memory store (the unit under test). Bounded (all waits deadline-capped; the knobs are reset in an
+   unwind-protect so a failure cannot corrupt the pervasively-used memory store). SBCL is the race oracle."
+  (let* ((mem   (dds.durability:make-memory-store))
+         (g     (%tms-guid 1))
+         ;; PRE = 3 records (sns 1..3); POST = 2 records (sns 7,8) — distinct sizes so partial != either
+         (pre   (list (dds.durability::make-durable-record :topic "T" :writer-guid g :sn 1 :kind :data :payload (%tms-payload 4 1))
+                      (dds.durability::make-durable-record :topic "T" :writer-guid g :sn 2 :kind :data :payload (%tms-payload 4 2))
+                      (dds.durability::make-durable-record :topic "T" :writer-guid g :sn 3 :kind :data :payload (%tms-payload 4 3))))
+         (post  (list (dds.durability::make-durable-record :topic "T" :writer-guid g :sn 7 :kind :data :payload (%tms-payload 4 7))
+                      (dds.durability::make-durable-record :topic "T" :writer-guid g :sn 8 :kind :data :payload (%tms-payload 4 8))))
+         (purged    (list nil))
+         (read-done (list nil))
+         (observed  (list :unset)))
+    (labels ((seed-pre ()
+               (dds.durability:store-purge mem "T")
+               (dolist (r pre) (dds.durability:store-put mem "T" (dds.durability:durable-record-writer-guid r)
+                                                         (dds.durability:durable-record-sn r) nil :data
+                                                         (dds.durability:durable-record-payload r))))
+             (spawn-reader ()
+               (dds.pal:spawn
+                (lambda ()
+                  (%tms-wait-until (lambda () (car purged)) 5)     ; wait for the swap midpoint
+                  (setf (car observed) (length (dds.durability:store-get-range mem "T")))
+                  (setf (car read-done) t))
+                :name "ms-replace-reader")))
+      (unwind-protect
+          (progn
+            ;; ---- RED: non-atomic (lock dropped across the midpoint) -> reader sees the EMPTY partial ----
+            (setf dds.durability::*durability-debug-mem-replace-nonatomic* t)
+            (setf dds.durability::*durability-debug-mem-replace-barrier*
+                  (lambda () (setf (car purged) t) (%tms-wait-until (lambda () (car read-done)) 5)))
+            (seed-pre)
+            (setf (car purged) nil (car read-done) nil (car observed) :unset)
+            (let ((rd (spawn-reader)))
+              (dds.durability:store-replace-topic mem "T" post)   ; blocks in the barrier until the reader has read
+              (ignore-errors (dds.pal:join rd)))
+            (%check :ms-replace-red-partial (eql 0 (car observed))
+                    "RED (non-atomic two-phase): a concurrent get-range mid-swap sees an EMPTY partial topic (0 records) — the race")
+            (%check :ms-replace-red-final (= 2 (dds.durability:store-count mem "T"))
+                    "RED: the replace still completes (post = 2 records) after the racy read")
+            ;; ---- GREEN: atomic (one lock hold across the midpoint) -> reader BLOCKS, sees full POST ----
+            (setf dds.durability::*durability-debug-mem-replace-nonatomic* nil)
+            (setf dds.durability::*durability-debug-mem-replace-barrier*
+                  (lambda () (setf (car purged) t)))              ; signal midpoint, return (lock HELD; must NOT wait)
+            (seed-pre)
+            (setf (car purged) nil (car read-done) nil (car observed) :unset)
+            (let ((rd (spawn-reader)))
+              (dds.durability:store-replace-topic mem "T" post)
+              (%tms-wait-until (lambda () (car read-done)) 5)
+              (ignore-errors (dds.pal:join rd)))
+            (%check :ms-replace-green-whole (eql 2 (car observed))
+                    "GREEN (atomic): the concurrent get-range sees the FULL post topic (2 records), NEVER a partial — the reader blocked on the held lock")
+            (%check :ms-replace-green-nonpartial (not (member (car observed) '(0 1 3)))
+                    "GREEN: the reader never observed an empty (0), short (1), or stale-pre (3) partial")
+            (%check :ms-replace-green-final (= 2 (dds.durability:store-count mem "T"))
+                    "GREEN: final state is the post topic (2 records)"))
+        (progn
+          (setf dds.durability::*durability-debug-mem-replace-nonatomic* nil)
+          (setf dds.durability::*durability-debug-mem-replace-barrier* nil)))))
+  t)
+
+(defun* run-durability-microservice-concurrent-clients-test ()
+    (function () t)
+  "WP-DURABILITY-MS-MULTICLIENT headline (ADR 0050 §4.7): N clients concurrently drive mixed ops
+   (put/get-range/count/delete) against ONE multi-client server — to the SAME topic AND per-client topics —
+   over multiple rounds; the accumulated state is then verified byte-exact with NO loss / dup / cross-client
+   corruption. Proves the per-connection-thread server + the internally-locked inner serve concurrent
+   clients CORRECTLY (the serial server could not run them in parallel at all). Bounded (every client thread
+   is self-limited — finite ops + a client recv-timeout so no op can hang; all joined). Both impls (SBCL is
+   the race-correctness oracle; a Clasp-internal threading SIGSEGV is the documented NFR-PORT gap)."
+  (let* ((nclients 6) (nputs 8) (nrounds 2)
+         (srv  (dds.durability:make-microservice-server :port 0 :recv-timeout 5))
+         (port (dds.durability:microservice-server-port srv))
+         (results (make-array nclients :initial-element nil)))
+    (labels ((oseed (i sn) (logand (+ (* i 7) sn 11) 255))
+             (sseed (i sn) (logand (+ (* i 7) sn 131) 255))
+             (client (ci round last-round-p)
+               (setf (aref results ci)
+                     (ignore-errors
+                      (let ((s   (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5))
+                            (g   (%tms-guid (+ 1 ci)))
+                            (own (format nil "own-~d" ci)))
+                        (dds.durability:store-open s)
+                        (dotimes (j nputs)
+                          (let ((sn (+ (* round nputs) j 1)))
+                            (dds.durability:store-put s own g sn nil :data (%tms-payload 6 (oseed ci sn)))
+                            (dds.durability:store-put s "shared" g sn nil :data (%tms-payload 6 (sseed ci sn)))
+                            (dds.durability:store-get-range s "shared")   ; interleave a read (time-varying; not asserted here)
+                            (dds.durability:store-count s own)))
+                        (when last-round-p                                ; concurrent delete of THIS client's last own record
+                          (dds.durability:store-delete s own g (* nrounds nputs)))
+                        (dds.durability:store-close s)
+                        t)))))
+      (unwind-protect
+          (progn
+            (dotimes (round nrounds)
+              (let ((threads '())
+                    (last-round-p (= round (1- nrounds))))
+                (dotimes (i nclients)
+                  (let ((ci i))
+                    (push (dds.pal:spawn (lambda () (client ci round last-round-p))
+                                         :name (format nil "ms-mc-client-~d" ci))
+                          threads)))
+                (dolist (th threads) (ignore-errors (dds.pal:join th)))))
+            ;; every concurrent client completed WITHOUT error
+            (dotimes (i nclients)
+              (%check :ms-mc-client-ok (eq t (aref results i))
+                      (format nil "concurrent client ~d completed all its ops without error" i)))
+            ;; verify accumulated state single-threaded now (all writers joined)
+            (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+              (dds.durability:store-open s)
+              ;; per-client topic: exactly the written sns MINUS the deleted top sn, byte-exact (no loss/dup/corruption)
+              (dotimes (i nclients)
+                (let* ((own (format nil "own-~d" i))
+                       (g   (%tms-guid (+ 1 i)))
+                       (recs (dds.durability:store-get-range s own))
+                       (sns  (mapcar #'dds.durability:durable-record-sn recs))
+                       (expect (loop for sn from 1 below (* nrounds nputs) collect sn)))   ; 1..K-1 (top deleted)
+                  (%check :ms-mc-own-sns (equal sns expect)
+                          (format nil "own-~d has exactly sns ~a (no loss/dup; the concurrent delete removed only the top sn ~d)"
+                                  i expect (* nrounds nputs)))
+                  (%check :ms-mc-own-exact
+                          (every (lambda (r) (%tms-rec= r own g (dds.durability:durable-record-sn r) nil :data
+                                                        (%tms-payload 6 (oseed i (dds.durability:durable-record-sn r)))))
+                                 recs)
+                          (format nil "own-~d records byte-exact (no cross-client corruption)" i))))
+              ;; shared topic: every client's full sn-range present under its own guid, byte-exact
+              (let ((shared (dds.durability:store-get-range s "shared")))
+                (%check :ms-mc-shared-count (= (* nclients nrounds nputs) (length shared))
+                        (format nil "shared has exactly ~d records (~d clients x ~d puts — no loss/dup)"
+                                (* nclients nrounds nputs) nclients (* nrounds nputs)))
+                (dotimes (i nclients)
+                  (let* ((g (%tms-guid (+ 1 i)))
+                         (mine (remove-if-not (lambda (r) (equalp (dds.durability:durable-record-writer-guid r) g)) shared))
+                         (sns  (mapcar #'dds.durability:durable-record-sn mine)))
+                    (%check :ms-mc-shared-sns (equal sns (loop for sn from 1 to (* nrounds nputs) collect sn))
+                            (format nil "shared/client-~d has exactly sns 1..~d (no cross-client loss/dup)" i (* nrounds nputs)))
+                    (%check :ms-mc-shared-exact
+                            (every (lambda (r) (%tms-rec= r "shared" g (dds.durability:durable-record-sn r) nil :data
+                                                          (%tms-payload 6 (sseed i (dds.durability:durable-record-sn r)))))
+                                   mine)
+                            (format nil "shared/client-~d records byte-exact (no concurrent-write corruption)" i)))))
+              (dds.durability:store-close s)))
+        (dds.durability:microservice-server-stop srv))))
+  t)
+
+(defun* run-durability-microservice-stop-closes-all-test ()
+    (function () t)
+  "WP-DURABILITY-MS-MULTICLIENT SERVER-STOP-CLOSES-ALL (ADR 0050 §4.7): with N live connections (each a
+   client whose serve thread is parked in recv), microservice-server-stop closes ALL of them + joins every
+   serve thread cleanly — no leaked thread, no hang. Proven: the registry holds N live slots before stop;
+   stop returns PROMPTLY (bounded) with the registry DRAINED to 0; a post-stop op on a former connection
+   fails cleanly. The idle connections are opened in the MAIN thread (their serve threads park server-side —
+   the only concurrency under test), so the test itself never spawns an unbounded waiter."
+  (let* ((n 4)
+         (srv  (dds.durability:make-microservice-server :port 0 :recv-timeout nil))   ; NIL: serve threads park until stop closes them
+         (port (dds.durability:microservice-server-port srv))
+         (clients '()))
+    (unwind-protect
+        (progn
+          (dotimes (i n)
+            (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+              (dds.durability:store-open s)                    ; one round-trip -> its serve thread then parks in recv
+              (push s clients)))
+          (%check :ms-stop-live-n (%tms-wait-until (lambda () (= n (%tms-live-conns srv))) 5)
+                  (format nil "the registry holds ~d live connections before stop" n))
+          (let* ((t0 (get-internal-real-time))
+                 (ok (dds.durability:microservice-server-stop srv))
+                 (elapsed (/ (- (get-internal-real-time) t0) internal-time-units-per-second)))
+            (%check :ms-stop-returns (eq t ok) "microservice-server-stop returned T")
+            (%check :ms-stop-prompt (< elapsed 5)
+                    (format nil "stop closed + joined all ~d serve threads promptly (~,2f s, no hang)" n elapsed))
+            (%check :ms-stop-drained (= 0 (%tms-live-conns srv))
+                    "the connection registry is DRAINED to 0 (every serve thread self-removed / was joined — no leak)"))
+          ;; a post-stop op on a former connection fails cleanly (server down; bounded reconnect then clean error)
+          (%check :ms-stop-clients-closed
+                  (every (lambda (s) (handler-case (progn (dds.durability:store-count s "x") nil)
+                                       (error () t)))
+                         clients)
+                  "every former client connection is closed — a post-stop op signals cleanly (no hang/crash)"))
+      (progn (dolist (s clients) (ignore-errors (dds.durability:store-close s)))
+             (ignore-errors (dds.durability:microservice-server-stop srv)))))
+  t)
+
+(defun* run-durability-microservice-max-connections-test ()
+    (function () t)
+  "WP-DURABILITY-MS-MULTICLIENT MAX-CONNECTIONS-CAP (ADR 0050 §4.7): past :max-connections a newly accepted
+   connection is REJECTED (closed immediately) — no unbounded serve-thread growth (a connection-flood DoS
+   guard) — while EXISTING connections keep working; after a connection closes a NEW one is accepted again.
+   Driven single-threaded from the main thread (A/B fill the cap of 2, C is rejected, A still serves, B
+   closes to free a slot, D then opens) — only the server serve threads run concurrently. Bounded."
+  (let* ((srv  (dds.durability:make-microservice-server :port 0 :recv-timeout 5 :max-connections 2))
+         (port (dds.durability:microservice-server-port srv))
+         (a nil) (b nil))
+    (unwind-protect
+        (progn
+          (setf a (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5))
+          (setf b (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5))
+          (dds.durability:store-open a)
+          (dds.durability:store-open b)
+          (%check :ms-cap-full (%tms-wait-until (lambda () (= 2 (%tms-live-conns srv))) 5)
+                  "the cap (2) is filled by connections A + B")
+          ;; C is over the cap: the server accepts then closes it, so C's store-open fails cleanly (bounded)
+          (%check :ms-cap-reject
+                  (handler-case
+                      (let ((c (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+                        (dds.durability:store-open c)
+                        (dds.durability:store-count c "x")   ; force a round-trip if open somehow slipped through
+                        nil)
+                    (error () t))
+                  "a connection past the cap is REJECTED — its op signals cleanly (no unbounded thread growth)")
+          (%check :ms-cap-still-2 (= 2 (%tms-live-conns srv))
+                  "the rejected connection did NOT add a registry slot (still 2 live)")
+          ;; existing connection A keeps working while the cap is full
+          (%check :ms-cap-existing-works
+                  (eq t (dds.durability:store-put a "A" (%tms-guid 1) 1 nil :data (octets 1 2 3)))
+                  "an EXISTING connection (A) keeps serving while the cap is full")
+          ;; close B -> its serve thread exits + self-removes -> a slot frees
+          (dds.durability:store-close b) (setf b nil)
+          (%check :ms-cap-freed (%tms-wait-until (lambda () (= 1 (%tms-live-conns srv))) 5)
+                  "closing B frees its cap slot (live drops to 1)")
+          ;; D now fits under the cap -> opens + round-trips
+          (let ((d (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+            (dds.durability:store-open d)
+            (%check :ms-cap-recovers
+                    (eq t (dds.durability:store-put d "D" (%tms-guid 4) 9 nil :data (octets 4 5 6)))
+                    "after a close a NEW connection (D) is accepted + served (cap recovered)")
+            (dds.durability:store-close d)))
+      (progn (ignore-errors (dds.durability:store-close a))
+             (when b (ignore-errors (dds.durability:store-close b)))
+             (dds.durability:microservice-server-stop srv))))
+  t)
+
+(defun* run-durability-microservice-slow-drip-concurrent-test ()
+    (function () t)
+  "WP-DURABILITY-MS-MULTICLIENT SLOW-DRIP-PARKS-OWN-THREAD (ADR 0050 §4.7, the §7 structural fix): a
+   slow-drip/stalled client now parks only ITS OWN serve thread — a CONCURRENT normal client is served in
+   parallel, the service is NOT denied. Server :recv-timeout NIL, so this proves the STRUCTURAL multi-client
+   fix ALONE (not the DoS read-timeout): even with the timeout disabled, the parked slow-loris cannot deny
+   another client (whereas the serial server needed the timeout to survive one — run-durability-microservice-
+   slow-loris-test). Bounded (the loris is a raw socket the test closes; the normal client has a recv-timeout)."
+  (let* ((srv   (dds.durability:make-microservice-server :port 0 :recv-timeout nil))
+         (port  (dds.durability:microservice-server-port srv))
+         (loris (dds.pal:tcp-connect "127.0.0.1" port)))
+    (unwind-protect
+        (progn
+          (dds.pal:tcp-send loris (octets 64 0 0 0) 4)         ; declare a 64-byte body, send nothing -> its serve thread parks in recv
+          (%check :ms-drip-loris-parked (%tms-wait-until (lambda () (>= (%tms-live-conns srv) 1)) 5)
+                  "the slow-drip client's serve thread is live + parked in recv")
+          ;; a CONCURRENT normal client is served in parallel (the slow-drip did NOT deny it) — the payoff
+          (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+            (dds.durability:store-open s)
+            (%check :ms-drip-other-served
+                    (eq t (dds.durability:store-put s "ok" (%tms-guid 1) 1 nil :data (octets 1 2 3)))
+                    "a concurrent normal client is SERVED while the slow-drip parks its OWN thread (service NOT denied — the structural multi-client fix, recv-timeout NIL)")
+            (%check :ms-drip-other-count (= 1 (dds.durability:store-count s "ok"))
+                    "the concurrent client's round-trip is intact")
+            (dds.durability:store-close s)))
+      (progn (ignore-errors (dds.pal:tcp-close loris))
+             (dds.durability:microservice-server-stop srv))))
+  t)
+
+(defun* run-durability-microservice-spawn-fail-test ()
+    (function () t)
+  "WP-DURABILITY-MS-MULTICLIENT spawn-guard (ADR 0050 §4.7, Fable review N-B): a serve-thread SPAWN failure
+   (thread / fd exhaustion) must REJECT that connection cleanly + leave NO leaked registry slot + the
+   ACCEPTOR must SURVIVE (a transient spawn failure must never kill the acceptor). Driven by the
+   *durability-debug-ms-force-spawn-fail* knob (set GLOBALLY — the acceptor thread does not inherit dynamic
+   bindings, like the accept-fail knob). A raw connection triggers ONE forced spawn failure; the acceptor
+   rejects it (no slot) and keeps accepting; a subsequent normal client is then served. Bounded (the knob is
+   reset in an unwind-protect; all waits deadline-capped)."
+  (setf dds.durability::*durability-debug-ms-force-spawn-fail* 1)   ; GLOBAL: the acceptor reads the global value
+  (unwind-protect
+      (let* ((srv  (dds.durability:make-microservice-server :port 0 :recv-timeout 5))
+             (port (dds.durability:microservice-server-port srv)))
+        (unwind-protect
+            (progn
+              ;; a raw connection whose serve-thread spawn is FORCED to fail -> the acceptor rejects it + survives
+              (let ((raw (dds.pal:tcp-connect "127.0.0.1" port)))
+                (%check :ms-spawn-fail-consumed
+                        (%tms-wait-until (lambda () (= 0 dds.durability::*durability-debug-ms-force-spawn-fail*)) 5)
+                        "the acceptor processed the connection + hit the forced spawn failure")
+                (ignore-errors (dds.pal:tcp-close raw)))
+              (%check :ms-spawn-fail-no-leak
+                      (%tms-wait-until (lambda () (= 0 (%tms-live-conns srv))) 5)
+                      "N-B: a serve-thread spawn failure leaves NO registered slot (no nil-thread leak) — the connection is rejected cleanly")
+              ;; the acceptor SURVIVED the spawn failure -> a subsequent normal client is served
+              (let ((s (dds.durability:make-microservice-store :host "127.0.0.1" :port port :recv-timeout 5)))
+                (dds.durability:store-open s)
+                (%check :ms-spawn-fail-acceptor-survives
+                        (eq t (dds.durability:store-put s "ok" (%tms-guid 1) 1 nil :data (octets 1 2 3)))
+                        "N-B: the acceptor SURVIVED the spawn failure -> a subsequent client is SERVED (a transient spawn failure never kills the acceptor)")
+                (%check :ms-spawn-fail-count (= 1 (dds.durability:store-count s "ok"))
+                        "the subsequent client's round-trip is intact")
+                (dds.durability:store-close s)))
+          (dds.durability:microservice-server-stop srv)))
+    (setf dds.durability::*durability-debug-ms-force-spawn-fail* 0))
   t)

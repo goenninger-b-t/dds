@@ -40,10 +40,12 @@
   ;; per-record physical delete-by-(topic,writer-guid,sn) (ADR 0025 §10.3 / ADR 0029 §10); NIL = the
   ;; backend has no physical reclaim (byte-identical to pre-slot) — same NIL-fallback as sync above
   (delete nil :type (or null function))
-  ;; atomic whole-topic REPLACE (ADR 0050 §4.4): (topic records)->t swaps ALL of a topic's records for
-  ;; RECORDS in one all-or-nothing step (a partial topic bricks a re-MAC'd chain). NIL = the same additive
-  ;; NIL-fallback as delete/sync — store-replace-topic then does purge+bulk-put (crash-atomic ONLY for the
-  ;; in-process memory store; a persistent backend SUPPLIES this slot for tmp+rename / transaction atomicity).
+  ;; atomic whole-topic REPLACE (ADR 0050 §4.4/§4.7): (topic records)->t swaps ALL of a topic's records for
+  ;; RECORDS in one all-or-nothing step (a partial topic bricks a re-MAC'd chain). EVERY in-tree backend
+  ;; SUPPLIES a native atomic slot (memory holds the store lock across clear+refill; file tmp+rename; SQLite
+  ;; txn) — a NEW backend MUST too. NIL = the additive purge+bulk-put fallback, which is TWO separate locked
+  ;; ops = NOT atomic under a concurrent server (a get-range interleaving sees a partial topic, §4.7) — safe
+  ;; only for a backend with no concurrent multi-writer exposure.
   (replace-topic-fn nil :type (or null function)))
 
 ;;; Public dispatch functions — one slot read + funcall (no CLOS dispatch on the hot path).
@@ -174,10 +176,15 @@
   "Atomically REPLACE every record of TOPIC with RECORDS (a list of DURABLE-RECORD), all-or-nothing.
    The microservice server's +ms-op-topic-rewrite+ replaces a topic's opaque frames after a KEEP_LAST
    reclaim re-MACs the survivors client-side (ADR 0050 §4.4) — a partial topic would brick the re-MAC'd
-   chain, so the swap must be atomic. NIL-fallback (the same additive binding as store-delete): store-purge
-   then store-put each record — trivially atomic for the in-process memory store (one serialized request,
-   no crash-persistence), and correct for a persistent inner too EXCEPT across a mid-swap crash (a file /
-   SQLite inner SUPPLIES the :replace-topic slot for tmp+rename / transaction crash-atomicity). Returns T."
+   chain, so the swap must be atomic. EVERY in-tree backend SUPPLIES a NATIVE atomic :replace-topic-fn:
+   memory holds the store lock ACROSS the clear + bulk re-insert (ADR 0050 §4.7), file uses tmp+fsync+rename,
+   SQLite uses one transaction — each also SERIALIZES against concurrent get-range/count under the same
+   per-store lock, so no concurrent reader sees a partial topic. NIL-fallback (the same additive binding as
+   store-delete): store-purge then store-put each record — this is two SEPARATE locked ops, so it is NOT
+   atomic under a CONCURRENT server (ADR 0050 §4.7 made the microservice server multi-client): a get-range
+   interleaving BETWEEN the purge and the bulk-put sees an EMPTY/partial topic → a corrupt read / a bricked
+   re-MAC'd chain. A NEW backend MUST therefore supply an atomic :replace-topic-fn (do NOT rely on the racy
+   NIL-fallback); the fallback remains only for a backend with no concurrent multi-writer exposure. Returns T."
   (let ((f (durable-store-replace-topic-fn store)))
     (if f
         (funcall f topic records)
@@ -224,6 +231,31 @@
         (remhash min-k inn))))
   t)
 
+(defun* %mem-put-unlocked (outer max-samples hk-cell depth-cell topic writer-guid sn key-hash kind payload)
+    (function (hash-table (integer 0) cons cons string
+               (simple-array (unsigned-byte 8) (16)) (integer 0)
+               (or null (simple-array (unsigned-byte 8) (16)))
+               (member :data :dispose :unregister)
+               (simple-array (unsigned-byte 8) (*)))
+              (or (eql t) (eql :rejected)))
+  "Insert-or-idempotent-noop body of %mem-put WITHOUT taking the store lock — the CALLER already holds it.
+   Extracted so the atomic %mem-replace-topic reuses the EXACT put semantics (idempotent dedup + max-samples
+   cap + KEEP_LAST evict) per record INSIDE its single critical section without a recursive lock acquisition
+   (dds.pal locks are non-recursive); DRY with %mem-put."
+  (let* ((inn (%mem-inner outer topic))
+         (k   (cons (coerce writer-guid 'list) sn)))
+    (cond
+      ((gethash k inn) t)
+      ((and (plusp max-samples) (>= (%mem-total-count outer) max-samples)) :rejected)
+      (t (setf (gethash k inn)
+               (make-durable-record :topic topic :writer-guid writer-guid :sn sn
+                                    :key-hash key-hash :kind kind :payload payload))
+         (when (and (eq :keep-last (car hk-cell))
+                    (eq :data kind)
+                    key-hash)
+           (%mem-evict-instance inn key-hash (car depth-cell)))
+         t))))
+
 (defun* %mem-put (outer lock max-samples hk-cell depth-cell topic writer-guid sn key-hash kind payload)
     (function (hash-table t (integer 0) cons cons string
                (simple-array (unsigned-byte 8) (16)) (integer 0)
@@ -231,23 +263,11 @@
                (member :data :dispose :unregister)
                (simple-array (unsigned-byte 8) (*)))
               (or (eql t) (eql :rejected)))
-  "Insert or idempotently no-op a record; return :REJECTED when bounded store is full.
-   When the stashed policy (HK-CELL car) is :keep-last, evicts the lowest-SN :data
-   records for the inserted instance until DEPTH-CELL car records remain (DDS 1.4 §2.2.3.5)."
+  "Insert or idempotently no-op a record under the store LOCK; return :REJECTED when bounded store is full.
+   When the stashed policy (HK-CELL car) is :keep-last, evicts the lowest-SN :data records for the inserted
+   instance until DEPTH-CELL car records remain (DDS 1.4 §2.2.3.5). The locked wrapper over %mem-put-unlocked."
   (dds.pal:with-lock (lock)
-    (let* ((inn (%mem-inner outer topic))
-           (k   (cons (coerce writer-guid 'list) sn)))
-      (cond
-        ((gethash k inn) t)
-        ((and (plusp max-samples) (>= (%mem-total-count outer) max-samples)) :rejected)
-        (t (setf (gethash k inn)
-                 (make-durable-record :topic topic :writer-guid writer-guid :sn sn
-                                      :key-hash key-hash :kind kind :payload payload))
-           (when (and (eq :keep-last (car hk-cell))
-                      (eq :data kind)
-                      key-hash)
-             (%mem-evict-instance inn key-hash (car depth-cell)))
-           t)))))
+    (%mem-put-unlocked outer max-samples hk-cell depth-cell topic writer-guid sn key-hash kind payload)))
 
 (defun* %guid-list< (ga gb)
     (function (list list) boolean)
@@ -306,6 +326,52 @@
           (if inn (hash-table-count inn) 0))
         (%mem-total-count outer))))
 
+(defparameter *durability-debug-mem-replace-nonatomic* nil
+  "Test-only RED control (ADR 0050 §4.7 — memory store-replace-topic atomicity). NIL (default) ⇒ inert:
+   %mem-replace-topic is ATOMIC — it holds the memory store lock ACROSS the clear + bulk re-insert as ONE
+   critical section, so no concurrent op (get-range / count / topics / put) can ever observe a partial /
+   empty topic mid-swap. When non-NIL, %mem-replace-topic instead takes the OLD NON-ATOMIC two-phase path
+   (clear under the lock, RELEASE the lock, re-insert under the lock) — the same window the pre-fix
+   purge+bulk-put store-replace-topic fallback had — so a concurrent get-range interleaving between the two
+   phases sees an EMPTY topic, proving the race the atomic path closes. Never set in production code (mirrors
+   the *durability-debug-ms-* knobs in store-microservice.lisp).")
+
+(defparameter *durability-debug-mem-replace-barrier* nil
+  "Test-only synchronization hook (ADR 0050 §4.7). NIL (default) ⇒ inert. When bound to a function of no
+   args, %mem-replace-topic FUNCALLs it at the swap MIDPOINT (after clearing the old records, before
+   inserting the new) so a test deterministically lands a concurrent get-range in that exact window — with
+   the lock HELD (atomic path ⇒ the concurrent op BLOCKS then sees the post state) or RELEASED (nonatomic
+   RED path ⇒ the concurrent op proceeds and sees the empty state). Never set in production code.")
+
+(defun* %mem-replace-topic (outer lock max-samples hk-cell depth-cell topic records)
+    (function (hash-table t (integer 0) cons cons string list) (eql t))
+  "Atomically REPLACE all of TOPIC's records with RECORDS, holding the store LOCK across the clear + bulk
+   re-insert as ONE critical section (ADR 0050 §4.7) — so no concurrent op observes a partial / empty topic
+   mid-swap. This is the memory-tier atomicity the MULTI-CLIENT microservice server needs for the
+   +ms-op-topic-rewrite+ op (a KEEP_LAST reclaim re-MACs the survivors client-side; a partial topic would
+   brick the re-MAC'd chain). It supersedes the store-replace-topic purge+bulk-put fallback, which is two
+   SEPARATE locked ops — atomic ONLY under a serial server. The clear is remhash TOPIC (exactly the purge
+   semantics); the refill reuses %mem-put-unlocked per record (DRY — identical dedup / cap / evict). Returns
+   T. The *durability-debug-mem-replace-nonatomic* / *-barrier* knobs drive the atomicity RED/GREEN test."
+  (flet ((clear ()  (remhash topic outer))
+         (refill () (dolist (r records)
+                      (%mem-put-unlocked outer max-samples hk-cell depth-cell topic
+                                         (durable-record-writer-guid r) (durable-record-sn r)
+                                         (durable-record-key-hash r) (durable-record-kind r)
+                                         (durable-record-payload r))))
+         (midpoint () (when *durability-debug-mem-replace-barrier*
+                        (funcall *durability-debug-mem-replace-barrier*))))
+    (if *durability-debug-mem-replace-nonatomic*
+        (progn                                    ; RED: lock DROPPED across the midpoint (two-phase)
+          (dds.pal:with-lock (lock) (clear))
+          (midpoint)
+          (dds.pal:with-lock (lock) (refill)))
+        (dds.pal:with-lock (lock)                 ; GREEN: ONE critical section (atomic)
+          (clear)
+          (midpoint)
+          (refill))))
+  t)
+
 (defun* make-memory-store (&key (max-samples 0))
     (function (&key (:max-samples (integer 0))) durable-store)
   "Construct an in-memory durable-store. MAX-SAMPLES 0 means unbounded; a positive value
@@ -337,4 +403,8 @@
                    (dds.pal:with-lock (lock)
                      (let ((inn (gethash topic outer)))
                        (when inn (remhash (cons (coerce writer-guid 'list) sn) inn)))
-                     t)))))
+                     t))
+     ;; atomic whole-topic REPLACE (ADR 0050 §4.7): clear + bulk re-insert under ONE lock hold so a
+     ;; concurrent multi-client op never sees a partial topic (the serial-era purge+bulk-put was racy)
+     :replace-topic-fn (lambda (topic records)
+                         (%mem-replace-topic outer lock max-samples hk-cell depth-cell topic records)))))

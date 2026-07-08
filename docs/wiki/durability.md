@@ -1852,9 +1852,11 @@ holes are closed — **no wire-protocol change, no new crypto, no new dependency
   (dds.durability:microservice-server-stop srv))
 ```
 
-Verified by `run-durability-microservice-slow-loris-test` (headline **RED→GREEN in one test**: RED with the
-server timeout DISABLED — a slow-loris denies a subsequent client; GREEN with a 1 s timeout — the client is
-served), `run-durability-microservice-huge-declared-test` (over-cap rejected before alloc; a huge at-cap
+Verified by `run-durability-microservice-slow-loris-test` (**RE-TARGETED for the multi-client server, §8.10.6**:
+under the Slice-3c-3 per-connection-thread server a slow-loris no longer denies anyone regardless of the
+timeout, so this test now proves the timeout's remaining role — RED with the timeout DISABLED the parked
+slow-loris's cap slot is NOT reclaimed; GREEN with a 1 s timeout it is DROPPED + its slot RECLAIMED, and a
+subsequent client is served), `run-durability-microservice-huge-declared-test` (over-cap rejected before alloc; a huge at-cap
 declare with no body times out via the incremental reader and allocates **<< the declared length** — a
 numeric bound on SBCL, a behavioral no-hang/no-OOM proof on Clasp), `run-durability-microservice-client-
 timeout-test` (a stalling server → the client recv-timeout → clean `microservice-store-error`, bounded), and
@@ -1862,6 +1864,52 @@ timeout-test` (a stalling server → the client recv-timeout → clean `microser
 backoff-then-recover); the fuzz gate (`run-durability-microservice-fuzz-test`) is extended with slow-loris +
 over-cap arms. Both impls green identically, Clasp first (Suite 503 → 507). The timeouts default to 30 s and
 are configurable; `NIL` disables (the pre-hardening blocking behavior).
+
+### 8.10.6 Server multi-client concurrency (Slice 3c-3, built — ADR 0050 §4.7)
+
+Slices 1–3c-2 served clients **serially** (one accept+serve thread, each connection to EOF before the next).
+Slice 3c-3 (WP-DURABILITY-MS-MULTICLIENT) serves **concurrent clients in parallel — SERVER-ONLY, zero client
+/ wire change**:
+
+- **Per-connection serve threads.** `%ms-serve-loop` spawns a dedicated thread (`dds.pal:spawn` →
+  `%ms-serve-connection-in-thread`) per accepted connection and immediately loops — a slow client parks only
+  its own thread.
+- **Lock-guarded connection registry.** The single `conn-cell` becomes a list of `ms-conn-slot {conn, thread}`
+  under `reg-lock`. `microservice-server-stop` joins the accept loop first (no new slot after), then drains
+  the registry — closing every connection (waking a parked recv) and **joining every serve thread** — then
+  closes the listener and, LAST, the inner store (no in-flight inner op races the close). A serve thread
+  self-removes its slot on close, freeing its slot promptly.
+- **Max-connections cap.** `make-microservice-server :max-connections` (default 64) bounds the concurrent
+  serve threads: past the cap a newly accepted connection is **rejected** (closed) — no unbounded thread
+  growth (a connection-flood DoS guard); a slot frees on any close, so the cap recovers.
+
+**The load-bearing correctness — every server-side shared mutable state is locked.** The inner store is
+internally locked per op (each `%ms-handle-request` op is exactly ONE inner call over fresh per-request
+buffers); the registry + live count are under `reg-lock`; per-connection buffers are per-thread. **THE
+critical fix** was the memory `store-replace-topic`: the NIL-fallback purge + bulk-put is **two separate
+locked ops**, atomic *only* under a serial server — under concurrency a `get-range` interleaving between them
+sees a **partial / empty topic**. The memory store now supplies a native `:replace-topic-fn`
+(`%mem-replace-topic`) that holds the store lock **across** the clear + bulk re-insert as ONE critical
+section, so no concurrent op ever observes a partial topic. (The file tmp+rename and the SQLite single
+transaction were already atomic *and* serialize under their per-store lock.)
+
+```lisp
+;; the server serves concurrent clients in parallel; a slow client parks only its OWN thread
+(let* ((srv  (dds.durability:make-microservice-server :port 0 :max-connections 64))
+       (port (dds.durability:microservice-server-port srv)))
+  ;; N clients on N threads, each its own connection, mixed ops to shared + per-client topics -> all correct
+  (dds.durability:microservice-server-stop srv))   ; closes + joins every serve thread, no leak/hang
+```
+
+Verified by `run-durability-mem-replace-atomicity-test` (the memory-replace RED→GREEN: a barrier lands a
+concurrent `get-range` at the swap midpoint — non-atomic reads an EMPTY partial, atomic blocks + reads the
+full post topic), `run-durability-microservice-concurrent-clients-test` (headline: N clients × mixed ops ×
+rounds → byte-exact, no loss / dup / cross-client corruption), `run-durability-microservice-stop-closes-all-test`
+(N live connections drained + joined, no leak/hang), `run-durability-microservice-max-connections-test` (cap
+reject → existing-connection-works → close → recover), and `run-durability-microservice-slow-drip-concurrent-test`
+(a stalled client parks its own thread while a concurrent client is served — the §8.10.5 slow-drip residual
+**structurally fixed**). Both impls green identically, Clasp first (Suite **507 → 512**; SBCL is the
+race-correctness oracle).
 
 ---
 

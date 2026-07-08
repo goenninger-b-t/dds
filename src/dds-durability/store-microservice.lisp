@@ -96,13 +96,23 @@
 (defconstant +ms-default-recv-timeout+ 30
   "Default idle/read timeout (seconds) armed on both the server's accepted sockets and the client's
    connection (WP-DURABILITY-MS-DOS, ADR 0050 §4.6). A tcp-recv that makes NO progress for this long
-   surfaces as a PAL-TIMEOUT: the SERIAL server DROPS the stalled connection (a slow-loris no longer
-   denies every other client), and the client treats a stalled server as a lost connection (the Slice-3c-1
+   surfaces as a PAL-TIMEOUT: the server DROPS the stalled connection — reclaiming its OWN serve thread + cap
+   slot under the per-connection-thread model (§4.7; the acceptor + other connections are never denied) —
+   and the client treats a stalled server as a lost connection (the Slice-3c-1
    reconnect path) instead of an infinite hang. Generous (30 s) so a legitimately slow-but-progressing
    transfer is never dropped — SO_RCVTIMEO resets on each partial read, so only a full 30 s of silence
    trips it. Configurable per server (make-microservice-server :recv-timeout) / client (make-microservice-
    store :recv-timeout); NIL disables it (block indefinitely, pre-DoS-hardening behavior). Tests pass a
    short value (e.g. 1 s) to stay bounded.")
+
+(defconstant +ms-default-max-connections+ 64
+  "Default cap on CONCURRENT server-side connections (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7). The
+   multi-client serve loop spawns one serve THREAD per accepted connection; this bounds the live thread
+   count so a connection-flood cannot grow threads without limit (a resource-exhaustion guard, operating
+   contract §4 / NFR-SEC-POSTURE). Past the cap a newly accepted connection is REJECTED (closed
+   immediately) — existing connections keep working, and a slot frees the moment any connection closes.
+   Generous for a persistence tier's expected fan-in; configurable per server (make-microservice-server
+   :max-connections). Tests pass a small value to exercise the cap bounded.")
 
 ;;; ---- conditions ----
 
@@ -153,6 +163,15 @@
    so a test drives the accept-backoff-THEN-RECOVER behavior deterministically WITHOUT actually exhausting
    file descriptors (a transient accept failure is non-fatal: the loop resumes serving). Never set in
    production code (mirrors the other *durability-debug-ms-* knobs).")
+
+(defparameter *durability-debug-ms-force-spawn-fail* 0
+  "Test-only DRIVER (ADR 0050 §4.7). A positive integer N makes the next N accepted connections' serve-thread
+   SPAWN fail (simulating thread / fd exhaustion) — each decrements N and signals inside the accept loop's
+   spawn guard — so a test drives the SPAWN-FAILURE-REJECTS-CLEANLY behavior deterministically: the acceptor
+   REJECTS that connection (closes the socket, leaves NO registered slot) and SURVIVES (keeps accepting),
+   never dying and never leaking a nil-thread slot. Read as a GLOBAL in the acceptor thread (which does not
+   inherit dynamic bindings — set it with SETF, like *durability-debug-ms-force-accept-fail*). Never set in
+   production code.")
 
 (defparameter *ms-reconnect-backoff-seconds* 0.05
   "The SHORT bounded pause before a single reconnect re-dial (%ms-reconnect, ADR 0050 §4.5, Slice 3c-1),
@@ -1242,22 +1261,39 @@
 
 ;;; ---- reference server (opaque inner-store proxy) ----
 
+(defstruct* (ms-conn-slot (:constructor %make-ms-conn-slot))
+  "One LIVE server-side connection in the multi-client registry (WP-DURABILITY-MS-MULTICLIENT, ADR 0050
+   §4.7): its accepted socket CONN and the per-connection serve THREAD. The registry is a lock-guarded
+   list of these; microservice-server-stop drains it — closing each CONN wakes a serve thread parked in
+   recv, and each THREAD is then joined for a clean, leak-free shutdown. A serve thread self-removes its
+   slot from the registry (under the registry lock) when its connection closes, so a closed connection
+   frees its concurrency-cap slot promptly."
+  (conn   nil :type t)
+  (thread nil :type t))
+
 (defstruct* (microservice-server (:constructor %make-microservice-server))
   "Handle for a running reference microservice server: the inner durable-store it proxies, the TCP
-   listener, the accept/serve thread, the bound (ephemeral) PORT clients connect to, the HOST, a
-   one-shot STOP-CELL flag, the per-connection RECV-TIMEOUT (idle/read DoS guard), and a LOCK guarding
-   stop against double-invocation."
+   listener, the ACCEPT-LOOP thread, the bound (ephemeral) PORT clients connect to, the HOST, a one-shot
+   STOP-CELL flag, the per-connection RECV-TIMEOUT (idle/read DoS guard), the MULTI-CLIENT connection
+   registry + its cap, and a LOCK guarding stop against double-invocation."
   (inner (make-memory-store) :type durable-store)
   (listener nil :type t)
+  ;; the ACCEPT-LOOP thread (spawns one serve thread per accepted connection; WP-DURABILITY-MS-MULTICLIENT)
   (thread   nil :type t)
   (port     0   :type (integer 0 65535))
   (host     "127.0.0.1" :type string)
   (stop-cell (list nil) :type cons)
-  ;; car = the connection currently being served, or NIL. Closing it on stop unblocks a serve thread
-  ;; parked in recv on an idle client (a stop must never hang on a still-connected client).
-  (conn-cell (list nil) :type cons)
-  ;; idle/read timeout (seconds, NIL disables) armed on each accepted socket so a slow-loris cannot park
-  ;; the SERIAL serve thread forever and deny every other client (WP-DURABILITY-MS-DOS, ADR 0050 §4.6).
+  ;; multi-client connection registry (ADR 0050 §4.7): car = a list of LIVE ms-conn-slots. Every add
+  ;; (accept), remove (serve-thread exit), drain (stop), and count (cap check) is under REG-LOCK, so the
+  ;; live-connection count is exactly (length (car reg-cell)) read under that lock — no separate counter to
+  ;; drift. Replaces the Slice-1..3c single conn-cell (which held the one serially-served connection).
+  (reg-cell (list nil) :type cons)
+  (reg-lock nil :type t)
+  ;; cap on concurrent connections (spawned serve threads) — past it a new connection is rejected/closed so
+  ;; a connection flood cannot grow threads unbounded (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7).
+  (max-connections +ms-default-max-connections+ :type (integer 1))
+  ;; idle/read timeout (seconds, NIL disables) armed on each accepted socket so a slow-drip client parks
+  ;; only ITS OWN serve thread (multi-client) and is dropped after the timeout (WP-DURABILITY-MS-DOS §4.6).
   (recv-timeout +ms-default-recv-timeout+ :type (or null (real 0)))
   (lock nil :type t))
 
@@ -1350,11 +1386,13 @@
    silence) trips the armed recv timeout so tcp-recv raises PAL-TIMEOUT after RECV-TIMEOUT seconds. The
    outer SERIOUS-CONDITION handler is the defense-in-depth BACKSTOP mandated for a network listener serving
    untrusted clients: any per-connection error — a decode fault, a torn send, AND now the read-timeout
-   PAL-TIMEOUT (a serious-condition) — drops THAT connection and returns so the accept loop KEEPS ACCEPTING.
-   So a slow-loris can no longer park the SERIAL serve thread forever and deny every other client; a single
-   malformed message can never kill the serve thread or wedge the listener. It closes the connection +
-   continues (never retries the faulting op), so there is no spin. Arming the timeout INSIDE the handler-
-   case means even a setsockopt failure is contained (drop + keep accepting)."
+   PAL-TIMEOUT (a serious-condition) — drops THAT connection and returns so THIS thread exits cleanly. Under
+   the per-connection-thread model (WP-DURABILITY-MS-MULTICLIENT, §4.7) each connection runs on its OWN
+   thread, so a slow-loris / faulting client parks or drops only ITS OWN thread — the acceptor and every
+   other connection are unaffected (never denied); a single malformed message can never kill another
+   connection or wedge the listener. It closes the connection + returns (never retries the faulting op), so
+   there is no spin. Arming the timeout INSIDE the handler-case means even a setsockopt failure is contained
+   (drop this connection, the acceptor keeps accepting)."
   (handler-case
       (progn
         (when recv-timeout (dds.pal:tcp-set-recv-timeout conn recv-timeout))
@@ -1365,18 +1403,43 @@
               (dds.pal:tcp-send conn resp (length resp))))))
     (serious-condition () t)))
 
-(defun* %ms-serve-loop (listener inner stop-cell conn-cell recv-timeout)
-    (function (t durable-store cons cons (or null (real 0))) t)
-  "The server accept loop: accept a connection (recording it in CONN-CELL so stop can close it), serve it
-   to completion with the idle/read RECV-TIMEOUT armed, loop, until STOP-CELL is set. microservice-server-
-   stop sets the flag, closes the in-flight connection to wake a serve thread parked in recv, then makes a
-   throwaway self-connection to wake a serve thread parked in accept (closing the listener alone does not
-   portably unblock accept). ACCEPT BACKOFF (WP-DURABILITY-MS-DOS, ADR 0050 §4.6): a tcp-accept FAILURE
-   (conn NIL) no longer immediately re-loops (the former (t nil) hot-spin) — the loop counts consecutive
-   failures and BACKS OFF (%ms-accept-backoff -> a bounded *ms-accept-backoff-seconds* sleep) before
-   retrying, so a persistent accept failure (fd exhaustion / EMFILE) becomes a bounded poll, not a tight
-   CPU spin; past +ms-accept-max-fails+ it STOPS (logged). A successful accept resets the count (a transient
-   failure is non-fatal). The *durability-debug-ms-force-accept-fail* knob forces N failures for the test."
+(defun* %ms-serve-connection-in-thread (slot inner recv-timeout reg-cell reg-lock)
+    (function (ms-conn-slot durable-store (or null (real 0)) cons t) t)
+  "Body of one per-connection serve THREAD (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7): serve SLOT's
+   connection to completion (%ms-serve-connection — read/dispatch/reply until EOF or a per-connection
+   fault, with the SERIOUS-CONDITION backstop + the armed RECV-TIMEOUT unchanged), then in an
+   unwind-protect cleanup SELF-REMOVE SLOT from the registry (under REG-LOCK) and close the socket. So a
+   normally-closing client frees its concurrency-cap slot promptly, and a fault / recv-timeout drops only
+   THIS thread — never another client's. Idempotent with stop's drain: if stop already removed the slot,
+   the DELETE is a no-op and the double tcp-close is ignore-error'd."
+  (unwind-protect
+      (%ms-serve-connection (ms-conn-slot-conn slot) inner recv-timeout)
+    (dds.pal:with-lock (reg-lock)
+      (setf (car reg-cell) (delete slot (car reg-cell))))
+    (ignore-errors (dds.pal:tcp-close (ms-conn-slot-conn slot)))))
+
+(defun* %ms-serve-loop (listener inner stop-cell reg-cell reg-lock max-connections recv-timeout)
+    (function (t durable-store cons cons t (integer 1) (or null (real 0))) t)
+  "The MULTI-CLIENT accept loop (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7): accept a connection and
+   SPAWN a dedicated serve THREAD for it (%ms-serve-connection-in-thread), then immediately loop to accept
+   the next — so concurrent clients are served IN PARALLEL (no client waits behind another). The accepted
+   connection is registered in the lock-guarded REG-CELL BEFORE the loop moves on, so stop can close every
+   live connection + join every serve thread. CONNECTION CAP: under REG-LOCK, if the live count
+   ((length (car reg-cell))) has reached MAX-CONNECTIONS the new connection is REJECTED (closed
+   immediately) — a connection flood cannot grow serve threads unbounded (operating contract §4). The
+   reserve-and-spawn runs under REG-LOCK so a serve thread cannot self-remove (nor stop drain) before its
+   slot's THREAD is stored — the registration is race-free; the slot is PUSHED ONLY AFTER A SUCCESSFUL
+   SPAWN, and the spawn is GUARDED (handler-case): a spawn failure (thread / fd exhaustion) REJECTS that
+   connection (close it, no leaked nil-thread slot) and the acceptor CONTINUES — a transient spawn failure
+   NEVER kills the acceptor (mirroring the accept-backoff posture; *durability-debug-ms-force-spawn-fail*
+   drives it for the test).
+
+   microservice-server-stop sets STOP-CELL, wakes this loop with a throwaway self-connection (closing the
+   listener alone does not portably unblock accept), JOINS this accept-loop thread (so no new slot is added
+   after), THEN drains the registry. ACCEPT BACKOFF (WP-DURABILITY-MS-DOS, ADR 0050 §4.6, unchanged): a
+   tcp-accept FAILURE backs off (%ms-accept-backoff → bounded *ms-accept-backoff-seconds* sleep) rather than
+   hot-spinning, and STOPS (logged) past +ms-accept-max-fails+; a successful accept resets the count. The
+   *durability-debug-ms-force-accept-fail* knob forces N failures for the test."
   (let ((accept-fails 0))
     (declare (type (integer 0) accept-fails))
     (loop
@@ -1387,11 +1450,36 @@
                         (error () nil)))))
         (cond
           ((car stop-cell) (when conn (ignore-errors (dds.pal:tcp-close conn))) (return t))
-          (conn (setf accept-fails 0)                                             ; success resets the failure count
-                (setf (car conn-cell) conn)
-                (unwind-protect (%ms-serve-connection conn inner recv-timeout)
-                  (setf (car conn-cell) nil)
-                  (ignore-errors (dds.pal:tcp-close conn))))
+          (conn
+           (setf accept-fails 0)                                                  ; success resets the failure count
+           ;; reserve a registry slot + spawn the serve thread UNDER REG-LOCK so the slot's THREAD is
+           ;; stored before any self-remove / stop-drain can observe the slot (race-free registration); the
+           ;; SLOT IS PUSHED ONLY AFTER A SUCCESSFUL SPAWN, so a spawn failure leaves no nil-thread slot. Over
+           ;; the cap OR on a spawn failure the connection is REJECTED (closed) and the acceptor CONTINUES —
+           ;; a transient spawn failure (thread/fd exhaustion) must NEVER kill the acceptor (§4.7; mirrors the
+           ;; accept-backoff posture — nothing kills the acceptor).
+           (let ((rejected nil) (spawn-failed nil))
+             (dds.pal:with-lock (reg-lock)
+               (if (>= (length (the list (car reg-cell))) max-connections)
+                   (setf rejected t)
+                   (let ((slot (%make-ms-conn-slot :conn conn :thread nil)))
+                     (handler-case
+                         (progn
+                           (when (plusp *durability-debug-ms-force-spawn-fail*)   ; test-only forced spawn failure
+                             (decf *durability-debug-ms-force-spawn-fail*)
+                             (error "dds.durability microservice: forced serve-thread spawn failure (test-only)"))
+                           (setf (ms-conn-slot-thread slot)
+                                 (dds.pal:spawn
+                                  (lambda ()
+                                    (%ms-serve-connection-in-thread slot inner recv-timeout reg-cell reg-lock))
+                                  :name "dds-durability-ms-conn"))
+                           (push slot (car reg-cell)))                            ; commit ONLY after a successful spawn
+                       (serious-condition (e) (setf spawn-failed e))))))
+             (when (or rejected spawn-failed) (ignore-errors (dds.pal:tcp-close conn)))
+             (when spawn-failed
+               (format *error-output*
+                       "~&dds.durability microservice: serve-thread spawn failed (~a) — connection rejected, acceptor continues~%"
+                       spawn-failed))))
           (t (incf accept-fails)                                                  ; accept failed: backoff, never hot-spin
              (when (eq :stop (%ms-accept-backoff accept-fails))
                (format *error-output*
@@ -1402,24 +1490,37 @@
 
 (defun* make-microservice-server (&key (host "127.0.0.1") (port 0) (inner (make-memory-store))
                                        history-kind history-depth
-                                       (recv-timeout +ms-default-recv-timeout+))
+                                       (recv-timeout +ms-default-recv-timeout+)
+                                       (max-connections +ms-default-max-connections+))
     (function (&key (:host string) (:port (integer 0 65535)) (:inner durable-store)
                     (:history-kind (or null (member :keep-all :keep-last)))
                     (:history-depth (or null (integer 1)))
-                    (:recv-timeout (or null (real 0))))
+                    (:recv-timeout (or null (real 0)))
+                    (:max-connections (integer 1)))
               microservice-server)
   "Start a reference microservice server (ADR 0050) that proxies the durable-store vtable over TCP to
    the INNER store (memory default; a persistent make-file-store / make-sqlite-store is the Slice-3a
    persistence tier). Binds HOST:PORT (port 0 = ephemeral — read the assigned port with
-   microservice-server-port) and spawns one accept/serve thread. The server is a DUMB opaque proxy: it
-   decodes each request, dispatches to INNER, and encodes the reply, with ZERO DARE/MAC knowledge. One
-   client at a time (inline per-connection serving) is sufficient (multi-client is Slice 3c).
+   microservice-server-port) and spawns one ACCEPT-LOOP thread. The server is a DUMB opaque proxy: it
+   decodes each request, dispatches to INNER, and encodes the reply, with ZERO DARE/MAC knowledge.
+
+   MULTI-CLIENT (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7): the accept loop SPAWNS one serve thread per
+   accepted connection and immediately loops, so concurrent clients are served IN PARALLEL — a slow / stalled
+   client parks only ITS OWN serve thread, never the service. The live connections are held in a lock-guarded
+   registry so stop closes + joins them all cleanly. :MAX-CONNECTIONS (default +ms-default-max-connections+ =
+   64) caps the concurrent serve threads: past the cap a newly accepted connection is REJECTED (closed
+   immediately) so a connection flood cannot grow threads unbounded (operating contract §4); a slot frees the
+   moment any connection closes. Server-side shared state is the INNER store (each op dispatches to an
+   internally-locked inner op; the whole-topic +ms-op-topic-rewrite+ replace is ATOMIC on every tier — memory
+   store-replace-topic now holds its lock across the clear+refill, file = tmp+rename, SQLite = one
+   transaction) plus the registry (REG-LOCK) — no server state is shared unlocked across serve threads.
 
    DoS HARDENING (WP-DURABILITY-MS-DOS, ADR 0050 §4.6): :RECV-TIMEOUT (seconds, default
    +ms-default-recv-timeout+ = 30 s; NIL disables) arms an idle/read timeout on every accepted socket so a
    SLOW-LORIS — a client that sends a length header then stalls — trips the timeout and is DROPPED (the
-   serve-connection backstop), and the SERIAL accept loop survives to serve the next client instead of
-   being parked forever. The accept loop also BACKS OFF on a persistent accept failure (no CPU hot-spin),
+   serve-connection backstop); under the per-connection-thread model (§4.7) this reclaims that slow-loris's
+   OWN serve thread + its connection-cap slot (the acceptor and other connections are never denied — that
+   no-denial is structural, not the timeout). The accept loop also BACKS OFF on a persistent accept failure (no CPU hot-spin),
    and message bodies are read incrementally (a huge DECLARED length never forces a huge up-front alloc).
    Tests pass a short :recv-timeout (e.g. 1 s) to stay bounded.
 
@@ -1436,35 +1537,54 @@
   (let* ((listener (dds.pal:tcp-listen host port))
          (bound (dds.pal:tcp-local-port listener))
          (stop-cell (list nil))
-         (conn-cell (list nil))
+         (reg-cell (list nil))
+         (reg-lock (dds.pal:make-lock "dds-durability-microservice-registry"))
          (srv (%make-microservice-server :inner inner :listener listener :port bound :host host
-                                         :stop-cell stop-cell :conn-cell conn-cell :recv-timeout recv-timeout
+                                         :stop-cell stop-cell :reg-cell reg-cell :reg-lock reg-lock
+                                         :max-connections max-connections :recv-timeout recv-timeout
                                          :lock (dds.pal:make-lock "dds-durability-microservice-server"))))
     ;; server-owned lifecycle: open the inner ONCE (persistent inner replays from disk) BEFORE the serve
     ;; thread accepts, so the inner is ready for the first client; a failed open closes the listener.
     (handler-case (store-open inner history-kind history-depth)
       (error (e) (ignore-errors (dds.pal:tcp-close listener)) (error e)))
     (setf (microservice-server-thread srv)
-          (dds.pal:spawn (lambda () (%ms-serve-loop listener inner stop-cell conn-cell recv-timeout))
+          (dds.pal:spawn (lambda () (%ms-serve-loop listener inner stop-cell reg-cell reg-lock
+                                                    max-connections recv-timeout))
                          :name "dds-durability-ms"))
     srv))
 
 (defun* microservice-server-stop (srv)
     (function (microservice-server) (eql t))
-  "Stop SRV cleanly and idempotently: set the stop flag, wake the blocked accept with a throwaway
-   self-connection, join the serve thread, close the listener, and close the inner store. No thread
-   leak, no lingering socket. Returns T."
+  "Stop SRV cleanly and idempotently (WP-DURABILITY-MS-MULTICLIENT, ADR 0050 §4.7): set the stop flag, wake
+   the blocked accept with a throwaway self-connection, JOIN the accept-loop thread (so no new connection is
+   registered after), DRAIN the connection registry — close every live connection (waking any serve thread
+   parked in recv) and JOIN every per-connection serve thread — close the listener, and FINALLY close the
+   inner store. Closing the inner LAST, after every serve thread has joined, guarantees no in-flight inner op
+   races the close (no half-write to a persistent inner). No thread leak, no lingering socket, no hang.
+   Returns T.
+
+   Ordering rationale: the accept-loop thread is joined BEFORE the drain so the registry is FINAL when
+   drained; the serve threads are joined WITHOUT holding REG-LOCK so a woken thread can take REG-LOCK to
+   self-remove (a no-op after the drain) and exit — no deadlock. The outer LOCK only guards double-stop; the
+   accept/serve threads never take it, so holding it across the joins is deadlock-free."
   (dds.pal:with-lock ((microservice-server-lock srv))
     (unless (car (microservice-server-stop-cell srv))
       (setf (car (microservice-server-stop-cell srv)) t)
-      ;; unblock a serve thread parked in recv on the live connection
-      (let ((c (car (microservice-server-conn-cell srv))))
-        (when c (ignore-errors (dds.pal:tcp-close c))))
-      ;; unblock a serve thread parked in accept via a throwaway self-connection
+      ;; wake the accept loop parked in accept via a throwaway self-connection
       (ignore-errors
        (let ((waker (dds.pal:tcp-connect (microservice-server-host srv) (microservice-server-port srv))))
          (dds.pal:tcp-close waker)))
+      ;; join the ACCEPT-LOOP thread first, so no new connection slot is registered after this point
       (ignore-errors (dds.pal:join (microservice-server-thread srv)))
+      ;; drain the registry: grab the live slots under REG-LOCK + clear it, then (outside the lock) close
+      ;; every connection to wake a parked serve thread and JOIN every serve thread for a clean exit
+      (let ((slots (dds.pal:with-lock ((microservice-server-reg-lock srv))
+                     (prog1 (car (microservice-server-reg-cell srv))
+                       (setf (car (microservice-server-reg-cell srv)) nil)))))
+        (dolist (slot slots) (ignore-errors (dds.pal:tcp-close (ms-conn-slot-conn slot))))
+        (dolist (slot slots)
+          (let ((th (ms-conn-slot-thread slot)))
+            (when th (ignore-errors (dds.pal:join th))))))
       (ignore-errors (dds.pal:tcp-close (microservice-server-listener srv)))
       (ignore-errors (store-close (microservice-server-inner srv)))))
   t)

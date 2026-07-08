@@ -202,9 +202,11 @@
    before LEN bytes arrive (a torn or short read = the connection dropped). If SOCKET has a recv timeout
    armed (tcp-set-recv-timeout) and no data arrives within the deadline, SIGNALS PAL-TIMEOUT — a DISTINCT
    catchable outcome, NOT confused with a clean EOF (NIL): sb-bsd-sockets:socket-receive returns n=0 on a
-   clean peer-close but n=NIL on an SO_RCVTIMEO timeout (verified identical on SBCL + Clasp), so this
-   splits them. BUFFER must hold >= LEN octets. The first read lands straight in BUFFER; only a genuine
-   split allocates one scratch buffer."
+   clean peer-close but n=NIL on an SO_RCVTIMEO timeout OR an EINTR-interrupted receive (verified identical
+   on SBCL + Clasp), so this splits them. EINTR is thus CONSERVATIVELY classified as a timeout (n=NIL ⟸
+   timeout OR EINTR) — the disposition is identical either way (drop / reconnect), so folding the rare
+   interrupted-syscall case into PAL-TIMEOUT is safe and keeps the branch minimal. BUFFER must hold >= LEN
+   octets. The first read lands straight in BUFFER; only a genuine split allocates one scratch buffer."
   (when (zerop len) (return-from tcp-recv 0))
   (let ((got 0) (scratch nil))
     (declare (type (integer 0) got))
