@@ -722,8 +722,14 @@
          ;; O(1) supersede detection (no per-put whole-topic scan).
          (eff-hk-cell  (cons history-kind nil))   ; car = effective history-kind (:keep-all/:keep-last)
          (eff-hd-cell  (cons history-depth nil))  ; car = effective history-depth D
-         (super-pending (make-hash-table :test #'equal))  ; topic-id -> pending superseded :data count
+         (super-pending (make-hash-table :test #'equal))  ; topic-id -> pending superseded/settled reclaimable count
          (data-counts  (make-hash-table :test #'equal))   ; topic-id -> (equalp key-hash -> :data count)
+         ;; settled-instance-churn trigger (ADR 0029 §10.1): topic-id -> (equalp key-hash -> settle-tally).
+         ;; Mirrors data-counts but tracks the FULL lifecycle so a settling instance (dispose+unregister,
+         ;; final tombstone — the pass-1 predicate) that never bumps the KEEP_LAST supersede counter still
+         ;; folds its reclaimable frame count into super-pending, firing the SAME threshold rewrite (which
+         ;; pass-1 reclaims). TRIGGER-ONLY: the rewrite machinery is unchanged; a live instance never settles.
+         (settle-tallies (make-hash-table :test #'equal))
          ;; Sliver 3b (ADR 0025 §10.3): topic-id -> (equal %record-key -> t) set of surrogates the
          ;; encrypted decorator's store-delete has remhashed from the index but NOT yet physically excluded
          ;; from the append log; its size is the O(1) reclaim trigger (the inner :keep-all store's own
@@ -775,14 +781,24 @@
                          (%keep-last-latest sorted (car eff-hd-cell))
                          sorted)))))
            (%init-topic-counts (topic-id records)
-             ;; (re)seed the Sliver-2 runtime-compaction counters for TOPIC-ID from RECORDS: a zeroed
-             ;; pending counter + a per-instance :data tally (so the next put's supersede test is O(1)).
+             ;; (re)seed the runtime-compaction counters for TOPIC-ID from RECORDS (append order): a zeroed
+             ;; pending counter + a per-instance :data tally (O(1) supersede test) + a per-instance settle
+             ;; tally (O(1) settle test + reclaimable count). RECORDS are the post-compaction survivors, so
+             ;; no instance is settled here (pass-1 already dropped those) ⇒ every reseeded tally ends
+             ;; COUNTED nil (a resurrected survivor's trailing :data clears the transient settle).
              (setf (gethash topic-id super-pending) 0)
-             (let ((dc (make-hash-table :test #'equalp)))
+             (let ((dc (make-hash-table :test #'equalp))
+                   (st (make-hash-table :test #'equalp)))
                (dolist (r records)
-                 (when (and (eq :data (durable-record-kind r)) (durable-record-key-hash r))
-                   (incf (gethash (durable-record-key-hash r) dc 0))))
-               (setf (gethash topic-id data-counts) dc)))
+                 (let ((kh (durable-record-key-hash r)))
+                   (when kh
+                     (when (eq :data (durable-record-kind r))
+                       (incf (gethash kh dc 0)))
+                     (%settle-tally-fold (or (gethash kh st)
+                                             (setf (gethash kh st) (%make-settle-tally)))
+                                         (durable-record-kind r)))))
+               (setf (gethash topic-id data-counts) dc)
+               (setf (gethash topic-id settle-tallies) st)))
            (%compact-topic-log (topic-id topic pre-filter reset-thunk)
              ;; shared MID-RUN atomic-rewrite core (Sliver 2 threshold-compact + Sliver 3b delete-reclaim,
              ;; DRY): release the append fd BEFORE the rewrite so no stale fd survives the atomic rename (a
@@ -873,6 +889,28 @@
                       (write-sequence (%frame-record rec) stm))
                   (finish-output stm)
                   (setf (gethash k inn) rec)
+                  ;; settled-instance-churn trigger (ADR 0029 §10.1): an endlessly-distinct settling
+                  ;; instance (new key → ≤D :data → dispose → unregister, never re-touched) stays within
+                  ;; depth D, so it NEVER bumps the KEEP_LAST supersede counter below → a continuously-open
+                  ;; log would grow without bound. Fold every keyed put into a per-instance lifecycle tally
+                  ;; and, on the SETTLE transition (the pass-1 predicate: dispose+unregister both seen AND
+                  ;; this tombstone is the final record), charge its reclaimable frame count into super-
+                  ;; pending — the SAME threshold then fires the SAME atomic %rewrite-topic-log, whose
+                  ;; UNCHANGED pass-1 reclaims the settle. TRIGGER-ONLY (only the counting is new); a live
+                  ;; instance never settles ⇒ no false-reclaim. Runs BEFORE the :data-gated supersede block
+                  ;; (a tombstone put never also supersedes), so a compaction here reseeds cleanly.
+                  (when (and key-hash (not *durability-debug-disable-settle-trigger*))
+                    (let* ((st    (or (gethash tid settle-tallies)
+                                      (setf (gethash tid settle-tallies)
+                                            (make-hash-table :test #'equalp))))
+                           (tally (or (gethash key-hash st)
+                                      (setf (gethash key-hash st) (%make-settle-tally)))))
+                      (when (%settle-tally-fold tally kind)
+                        (let ((reclaim (settle-tally-frames tally)))
+                          (setf (settle-tally-frames tally) 0)   ; charge each frame at most once/rewrite
+                          (when (>= (incf (gethash tid super-pending 0) reclaim)
+                                    *compaction-superseded-threshold*)
+                            (%threshold-compact tid topic))))))
                   ;; runtime threshold compaction (Sliver 2, ADR 0029 §10): O(1) supersede detection —
                   ;; a :data put that pushes a KEEP_LAST instance PAST depth D makes an older record
                   ;; droppable; bump the per-topic superseded counter and, on crossing
@@ -925,6 +963,7 @@
                    (dds.pal:fsync-directory (%topics-dir store-dir))))
                (remhash tid outer)
                (remhash tid pending-delete)   ; Sliver-3b: drop any pending physical deletes for the purged topic
+               (remhash tid settle-tallies)   ; drop the purged topic's settle tally (ADR 0029 §10.1; mirrors pending-delete)
                ;; drop the stale running chain head so a reput re-seeds from the per-topic head, not the
                ;; pre-purge tail — else reopen's re-seeded replay mismatches the first frame (no false-reject; ADR 0045)
                (remhash tid chain-macs)
@@ -946,6 +985,7 @@
            (clrhash chain-macs)          ; running chain state is rebuilt from disk on replay (ADR 0045)
            (clrhash super-pending)       ; Sliver-2 runtime-compaction counters reseeded per topic below
            (clrhash data-counts)
+           (clrhash settle-tallies)      ; settled-instance-churn tallies reseeded per topic below (ADR 0029 §10.1)
            (clrhash pending-delete)      ; Sliver-3b pending physical deletes are IN-MEMORY (empty on reopen; 3c sweeps cross-restart leftovers)
            ;; enforce 0700 on the store dir D (holds cleartext frame metadata): chmod ONLY on first
            ;; creation, then ALWAYS verify (fail-closed refuse on loose/unverifiable perms) — exactly

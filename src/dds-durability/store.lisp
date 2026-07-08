@@ -13,6 +13,57 @@
   (kind    :data :type (member :data :dispose :unregister))
   (payload (make-array 0 :element-type '(unsigned-byte 8)) :type (simple-array (unsigned-byte 8) (*))))
 
+;;; Put-time settle detection (ADR 0029 §10.1 file store / ADR 0025 §10.3 encrypted decorator). A
+;;; per-instance lifecycle tally mirrors the on-open pass-1 settle predicate (%compact-topic-records):
+;;; an instance SETTLES when a :dispose AND an :unregister have both been seen AND its most-recent
+;;; record is a tombstone (order-aware — a later :data resurrects it). The file store folds a settled
+;;; instance's reclaimable frame count into its threshold counter; the encrypted decorator remhashes a
+;;; settled instance's eviction window. Both reuse this ONE detector so the settle predicate is defined
+;;; once (DRY) and equals pass-1 exactly — the trigger only COUNTS; the unchanged compaction reclaims.
+
+(defparameter *durability-debug-disable-settle-trigger* nil
+  "Test-only RED control (ADR 0029 §10.1 / ADR 0025 §10.3 — settled-instance-churn reclaim). NIL
+   (default) ⇒ inert: the file store's settle-triggered compaction AND the encrypted decorator's
+   settle window-reclaim both run, so a continuously-open store under endlessly-distinct settling
+   instances (new key → write → dispose → unregister) stays bounded on disk / in RAM. When non-NIL
+   BOTH settle hooks are skipped, reproducing the pre-fix behavior — the on-disk frame count (file)
+   and the instance-windows entry count (encrypted) grow with the settled-instance count until reopen
+   — so a test proves the bounded RED→GREEN. Never set in production code.")
+
+(defstruct* (settle-tally (:constructor %make-settle-tally))
+  "Per-instance put-time lifecycle tally for settle-triggered reclaim (ADR 0029 §10.1 / ADR 0025 §10.3).
+   Mirrors the pass-1 settle predicate: DISPOSE-SEEN / UNREG-SEEN are sticky (ever-seen) flags, LAST-KIND
+   is the most-recent record's kind (a tombstone last ⇒ settled). FRAMES counts records not yet charged
+   to a reclaim trigger (the file store's reclaimable count); COUNTED marks a settle already charged so a
+   redundant tombstone never double-charges."
+  (dispose-seen nil   :type boolean)
+  (unreg-seen   nil   :type boolean)
+  (last-kind    :data :type (member :data :dispose :unregister))
+  (frames       0     :type (integer 0))
+  (counted      nil   :type boolean))
+
+(defun* %settle-tally-fold (tally kind)
+    (function (settle-tally (member :data :dispose :unregister)) boolean)
+  "Fold one put of KIND into TALLY in place; return T iff this put TRANSITIONS the instance into a
+   NEWLY-settled state (both tombstone kinds ever seen AND this put is a tombstone AND not already
+   charged) — the caller then reclaims exactly once per settle. A :data clears COUNTED (resurrect), so a
+   re-registered-then-re-settled instance charges again. The settled test IS the pass-1 predicate
+   (dispose-seen ∧ unreg-seen ∧ last-kind a tombstone), so a live / partially-torn-down instance never
+   settles here — the trigger fires the SAME unchanged compaction, which reclaims only true settles (no
+   false-reclaim of a live instance)."
+  (incf (settle-tally-frames tally))
+  (setf (settle-tally-last-kind tally) kind)
+  (ecase kind
+    (:dispose    (setf (settle-tally-dispose-seen tally) t))
+    (:unregister (setf (settle-tally-unreg-seen   tally) t))
+    (:data       (setf (settle-tally-counted      tally) nil)))
+  (if (and (settle-tally-dispose-seen tally)
+           (settle-tally-unreg-seen tally)
+           (not (eq :data kind))
+           (not (settle-tally-counted tally)))
+      (progn (setf (settle-tally-counted tally) t) t)
+      nil))
+
 ;;; durable-store vtable: function slots mirror the transport pattern (FR-XPORT-5 analogue).
 
 (defstruct* (durable-store (:constructor %make-durable-store))

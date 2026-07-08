@@ -5666,7 +5666,36 @@
                                (dds.durability:store-count s nil)))
                (%check :encpr-purge-getrange (equal '(1) (%sns (dds.durability:store-get-range s "Enc")))
                        (format nil "post-purge get-range = (1), got ~s" (%sns (dds.durability:store-get-range s "Enc"))))
-               (dds.durability:store-close s)))
+               (dds.durability:store-close s))
+             ;; (10) SETTLED-INSTANCE-CHURN window bound (WP-DURABILITY-SETTLED-RECLAIM, ADR 0025 §10.3):
+             ;; N distinct settling instances (each: data -> dispose -> unregister) through the encrypted
+             ;; decorator; the put-time settle-hook remhashes each settled instance's window so
+             ;; instance-windows stays bounded. RED (*durability-debug-disable-settle-trigger*) grows to N.
+             (let ((n 30))
+               (flet ((%run (dir disable)
+                        (let ((s (%enc-build dir))
+                              (max-win 0))
+                          (let ((dds.durability::*durability-debug-disable-settle-trigger* disable)
+                                (dds.durability::*durability-debug-window-count-hook*
+                                  (lambda (c) (when (> c max-win) (setf max-win c)))))
+                            (dds.durability:store-open s :keep-last 2)
+                            (dotimes (i n)
+                              (let ((kh (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+                                (setf (aref kh 0) (mod i 256))
+                                (setf (aref kh 1) (mod (floor i 256) 256))
+                                (dds.durability:store-put s "Enc" g0 (+ 1 (* 3 i)) kh :data       (%make-small-payload (1+ i)))
+                                (dds.durability:store-put s "Enc" g0 (+ 2 (* 3 i)) kh :dispose    (%make-small-payload 0))
+                                (dds.durability:store-put s "Enc" g0 (+ 3 (* 3 i)) kh :unregister (%make-small-payload 0))))
+                            (dds.durability:store-close s))
+                          max-win)))
+                 (let ((green (%run (%encdir "enc-settle-g") nil))
+                       (red   (%run (%encdir "enc-settle-r") t)))
+                   (%check :encpr-settle-window-bounded (<= green 2)
+                           (format nil "GREEN: settle-hook keeps instance-windows bounded (<=2) across ~d settling instances, got ~d"
+                                   n green))
+                   (%check :encpr-settle-window-red (= red n)
+                           (format nil "RED (settle trigger off): instance-windows grows to N=~d (non-vacuous), got ~d"
+                                   n red))))))
         (dolist (d dirs)
           (when (uiop:directory-exists-p d)
             (ignore-errors (uiop:delete-directory-tree d :validate t)))))
@@ -6541,6 +6570,163 @@
       (when (uiop:directory-exists-p dir)
         (ignore-errors (uiop:delete-directory-tree dir :validate t)))))
   t)
+
+;;; --- Settled-instance-churn compaction (WP-DURABILITY-SETTLED-RECLAIM, ADR 0029 §10.1) ---
+;;; The Sliver-2 runtime trigger counts ONLY KEEP_LAST :data supersession, so a workload of endlessly-
+;;; DISTINCT settling instances (each: new key -> <=D :data -> dispose -> unregister, never re-touched)
+;;; stays within depth D, never bumps the supersede counter, and a continuously-open log grows without
+;;; bound (<=D+2 frames/instance) until reopen. The settle-triggered compaction folds a settled
+;;; instance's reclaimable frame count into the SAME threshold counter, firing the SAME unchanged atomic
+;;; %rewrite-topic-log (pass-1 reclaims the settle) — TRIGGER-ONLY: no false-reclaim of a live instance,
+;;; chain-MAC + crash-atomicity preserved (the rewrite path is untouched).
+
+(defun* run-durability-settled-reclaim-test ()
+    (function () t)
+  "Settled-instance-churn compaction, FILE store (WP-DURABILITY-SETTLED-RECLAIM, ADR 0029 §10.1):
+   (A) BOUNDED-ON-DISK RED->GREEN — N=50 distinct settling instances, continuously open: with the settle
+       trigger ON the on-disk frame count (+ the in-memory index) stays BOUNDED (~ threshold); with it
+       OFF (*durability-debug-disable-settle-trigger*) the log grows to 3N (RED, the residual).
+   (B) NO-FALSE-RECLAIM — a LIVE instance (data, no settle) is never reclaimed across a settle-triggered
+       compaction; get-range stays the newest-D live view; a settle-THEN-reregister instance keeps its
+       resurrected data (the settle predicate == pass-1 exactly).
+   (C) CHAIN-MAC + CRASH-FAULT — a settle-triggered compaction of a KEYED store re-emits a valid v3 chain
+       (reopens clean, no false-reject) AND is crash-atomic: a fault mid-settle-compaction rolls back to
+       the intact original log (reopen clean, no data loss)."
+  (let* ((g0     (make-array 16 :element-type '(unsigned-byte 8) :initial-element 3))
+         (p      (lambda (b) (make-array (length b) :element-type '(unsigned-byte 8) :initial-contents b)))
+         (khf    (lambda (i) (let ((a (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+                               (setf (aref a 0) (mod i 256))
+                               (setf (aref a 1) (mod (floor i 256) 256))
+                               a)))
+         (oracle (lambda (data)
+                   (let ((out (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x33)))
+                     (loop for b across data for i from 0
+                           do (setf (aref out (mod i 32)) (logand (+ (aref out (mod i 32)) b i 1) #xFF)))
+                     out)))
+         (dirs   '()))
+    (labels ((%d (tag) (let ((d (%file-store-tmp-dir tag))) (push d dirs) d))
+             (%settle (s topic kh base)
+               ;; one full settle: 1 :data (sn=base) -> dispose (base+1) -> unregister (base+2)
+               (dds.durability:store-put s topic g0 base       kh :data       (funcall p (list (mod base 256))))
+               (dds.durability:store-put s topic g0 (+ base 1) kh :dispose    (funcall p '()))
+               (dds.durability:store-put s topic g0 (+ base 2) kh :unregister (funcall p '()))))
+      (unwind-protect
+           (let ((dds.durability:*compaction-superseded-threshold* 16)
+                 (n 50))
+             ;; (A) GREEN: settle trigger ON -> bounded on disk + bounded in-memory index
+             (let* ((dir (%d "green")) (s (dds.durability:make-file-store :dir dir)))
+               (dds.durability:store-open s :keep-last 1)
+               (dotimes (i n) (%settle s "T" (funcall khf i) (1+ (* 3 i))))
+               (let ((on-disk (%file-store-log-count dir "T"))
+                     (bound   (+ 16 (* 2 3))))                 ; ~ threshold + a couple in-flight instances
+                 (%check :sr-green-bounded (<= on-disk bound)
+                         (format nil "settle-triggered compaction bounds the on-disk log to ~d, got ~d" bound on-disk))
+                 (%check :sr-green-not-unbounded (< on-disk (* 3 n))
+                         (format nil "on-disk (~d) must be << RED 3N=~d (non-vacuous)" on-disk (* 3 n)))
+                 (%check :sr-green-index-bounded (<= (dds.durability:store-count s nil) bound)
+                         (format nil "the in-memory index stays bounded to ~d, got ~d"
+                                 bound (dds.durability:store-count s nil))))
+               (dds.durability:store-close s))
+             ;; (A) RED: settle trigger DISABLED -> the log grows to exactly 3N (the residual)
+             (let* ((dir (%d "red")) (s (dds.durability:make-file-store :dir dir))
+                    (dds.durability::*durability-debug-disable-settle-trigger* t))
+               (dds.durability:store-open s :keep-last 1)
+               (dotimes (i n) (%settle s "T" (funcall khf i) (1+ (* 3 i))))
+               (%check :sr-red-grows (= (* 3 n) (%file-store-log-count dir "T"))
+                       (format nil "RED (settle trigger off): the log grows to 3N=~d (unbounded until reopen), got ~d"
+                               (* 3 n) (%file-store-log-count dir "T")))
+               (dds.durability:store-close s))
+             ;; (B) NO-FALSE-RECLAIM: a live instance + a settle-then-reregister instance survive a
+             ;; settle-triggered compaction driven by distinct churn instances; get-range stays correct.
+             (let* ((dir (%d "nofalse")) (s (dds.durability:make-file-store :dir dir))
+                    (kh-live (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xAA))
+                    (kh-rr   (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xBB)))
+               (dds.durability:store-open s :keep-last 2)
+               ;; live: 2 :data (within D=2), no tombstone
+               (dds.durability:store-put s "U" g0 1 kh-live :data (funcall p '(11)))
+               (dds.durability:store-put s "U" g0 2 kh-live :data (funcall p '(12)))
+               ;; settle-then-reregister: data -> dispose -> unregister (settled) -> data (resurrected)
+               (dds.durability:store-put s "U" g0 3 kh-rr :data       (funcall p '(31)))
+               (dds.durability:store-put s "U" g0 4 kh-rr :dispose    (funcall p '()))
+               (dds.durability:store-put s "U" g0 5 kh-rr :unregister (funcall p '()))
+               (dds.durability:store-put s "U" g0 6 kh-rr :data       (funcall p '(66)))   ; resurrected LIVE
+               ;; churn: 40 distinct settling instances (keys 100+) -> crosses threshold -> compactions fire
+               (dotimes (i 40) (%settle s "U" (funcall khf (+ 100 i)) (+ 1000 (* 3 i))))
+               (let* ((recs (dds.durability:store-get-range s "U"))
+                      (live (count kh-live recs :key #'dds.durability:durable-record-key-hash :test #'equalp))
+                      (rr-data (find-if (lambda (r) (and (equalp kh-rr (dds.durability:durable-record-key-hash r))
+                                                         (eq :data (dds.durability:durable-record-kind r))
+                                                         (= 6 (dds.durability:durable-record-sn r))))
+                                        recs)))
+                 (%check :sr-live-survives (= 2 live)
+                         (format nil "the LIVE instance (data, no settle) is NOT reclaimed — its newest D=2 survive, got ~d" live))
+                 (%check :sr-live-payload
+                         (equalp (funcall p '(12))
+                                 (dds.durability:durable-record-payload
+                                  (find 2 recs :key #'dds.durability:durable-record-sn)))
+                         "live instance newest payload byte-exact after settle-triggered compaction")
+                 (%check :sr-rr-survives rr-data
+                         "the settle-THEN-reregister instance keeps its resurrected live data (settle predicate == pass-1)"))
+               (dds.durability:store-close s))
+             ;; (C1) CHAIN-MAC: a settle-triggered compaction of a KEYED store re-emits a valid v3 chain
+             (let ((dir (%d "keyed")))
+               (let ((s (dds.durability:make-file-store :dir dir)))
+                 (dds.durability::store-set-chain-mac-fn s oracle)
+                 (dds.durability:store-open s :keep-last 1)
+                 (dds.durability:store-put s "K" g0 1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xCE)
+                                           :data (funcall p '(7)))                ; a live instance (survives)
+                 (dotimes (i 20) (%settle s "K" (funcall khf i) (+ 100 (* 3 i)))) ; churn -> settle-compactions
+                 (%check :sr-keyed-bounded (<= (%file-store-log-count dir "K" oracle) (+ 16 9))
+                         (format nil "keyed settle-triggered compaction bounds the on-disk log, got ~d"
+                                 (%file-store-log-count dir "K" oracle)))
+                 (dds.durability:store-close s))
+               (let ((s2 (dds.durability:make-file-store :dir dir)))
+                 (dds.durability::store-set-chain-mac-fn s2 oracle)
+                 (%check :sr-keyed-reopen-clean
+                         (handler-case (progn (dds.durability:store-open s2 :keep-last 1) t)
+                           (error () nil))
+                         "settle-compacted KEYED store REOPENS CLEAN — the rewrite re-emitted a valid v3 chain (no false-reject)")
+                 (let ((live (find #xCE (dds.durability:store-get-range s2 "K")
+                                   :key (lambda (r) (aref (dds.durability:durable-record-key-hash r) 0)))))
+                   (%check :sr-keyed-live-survives live
+                           "reopen: the live instance survives the settle-triggered compactions (no data loss)"))
+                 (ignore-errors (dds.durability:store-close s2))))
+             ;; (C2) CRASH-FAULT: a fault mid settle-triggered rewrite rolls back to the intact original log
+             (let ((dir (%d "crash")))
+               (let ((s (dds.durability:make-file-store :dir dir))
+                     (faulted nil)
+                     (dds.durability:*compaction-superseded-threshold* 4))
+                 (dds.durability::store-set-chain-mac-fn s oracle)
+                 (dds.durability:store-open s :keep-last 1)
+                 (dds.durability:store-put s "C" g0 1 (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xDE)
+                                           :data (funcall p '(9)))                ; live instance (survives)
+                 (%settle s "C" (funcall khf 1) 100)                             ; instance 1 settles (sp=3)
+                 (dds.durability:store-put s "C" g0 201 (funcall khf 2) :data    (funcall p '(2)))
+                 (dds.durability:store-put s "C" g0 202 (funcall khf 2) :dispose (funcall p '()))
+                 ;; instance 2's unregister settles it (sp 3->6 crosses threshold 4) -> settle-rewrite -> FAULT
+                 (let ((dds.durability::*durability-debug-file-rewrite-fault* t))
+                   (setf faulted
+                         (handler-case
+                             (progn (dds.durability:store-put s "C" g0 203 (funcall khf 2) :unregister (funcall p '())) nil)
+                           (error () t))))
+                 (%check :sr-crash-faulted faulted
+                         "the settle-triggered rewrite fault propagates (store-put signals before the rename)")
+                 (ignore-errors (dds.durability:store-close s)))
+               (let ((s2 (dds.durability:make-file-store :dir dir)))
+                 (dds.durability::store-set-chain-mac-fn s2 oracle)
+                 (%check :sr-crash-reopen-clean
+                         (handler-case (progn (dds.durability:store-open s2 :keep-last 1) t)
+                           (error () nil))
+                         "after a crash BEFORE the settle-rewrite rename the store reopens CLEAN (original log intact, chain verifies)")
+                 (let ((live (find #xDE (dds.durability:store-get-range s2 "C")
+                                   :key (lambda (r) (aref (dds.durability:durable-record-key-hash r) 0)))))
+                   (%check :sr-crash-no-loss live
+                           "post-crash the live instance survives the on-open compaction (no data loss)"))
+                 (ignore-errors (dds.durability:store-close s2)))))
+        (dolist (d dirs)
+          (when (uiop:directory-exists-p d)
+            (ignore-errors (uiop:delete-directory-tree d :validate t)))))
+      t)))
 
 (defun* run-durability-store-dir-perms-test ()
     (function () t)

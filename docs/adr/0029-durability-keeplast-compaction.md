@@ -228,13 +228,26 @@ to wrap SQLite's autocommit DELETEs in a transaction).
   The encrypted decorator does its own both-pass `%compact-topic-records` on top of its `:keep-all` +
   NIL-key inner store (where pass-1 is a no-op), so this read view neither double-compacts nor regresses it.
 
-**Tracked residual (honest, lower-severity, NOT fixed here).** `super-pending` tracks **only** `:data`
-supersession, so the *`:data`-supersession* unbounded-growth gap is closed at runtime. An adversarial
-workload of **endless DISTINCT settling instances** (register → write-once → dispose → unregister, a NEW
-key-hash each) still accumulates settled tombstones between opens — pass-1 reclaims them only on the next
-`store-open`. This is bounded by the **instance-churn rate** (not the sample rate), so it is
-lower-severity than the fixed `:data`-supersession gap, and it is out of scope for Sliver 2 — but it is a
-**real bounded residual**, not a non-issue. (A settled-instance runtime reclaim would be a follow-on.)
+**Settled-instance-churn residual — RESOLVED (WP-DURABILITY-SETTLED-RECLAIM, additive settle trigger).**
+As originally shipped, `super-pending` tracked **only** `:data` supersession, so an adversarial workload of
+**endless DISTINCT settling instances** (register → write-once → dispose → unregister, a NEW key-hash each,
+never re-touched) stayed within depth D, never bumped the counter, and accumulated ≤ D+2 settled frames per
+instance between opens — pass-1 reclaimed them only on the next `store-open`, so a continuously-open log grew
+without bound (rate-bounded by instance churn, not absolutely bounded). This is now closed at runtime by a
+**TRIGGER-ONLY** addition: the `:put` path folds every keyed put into a per-instance lifecycle tally
+(`settle-tally`, mirroring `data-counts`) and, on the **SETTLE transition** — the *exact* pass-1 predicate
+(a `:dispose` AND an `:unregister` both seen AND the final record a tombstone; order-aware, so a resurrecting
+`:data` un-settles it) — charges that instance's **reclaimable frame count** into `super-pending`, firing the
+**SAME** unchanged atomic `%rewrite-topic-log` (whose pass-1 reclaims the settle). Only the *counting* is new:
+the rewrite / chain-MAC re-seed / `tmp+fsync+rename` crash-atomicity path is **untouched**, so a
+settle-triggered compaction reopens on a valid re-seeded v3 chain and a crash mid-compaction rolls back to the
+intact original log — proven by `run-durability-settled-reclaim-test` (C). Because the settle predicate equals
+pass-1 exactly and the trigger only *counts* (the unchanged compaction does the reclaim), a **live** instance
+(data, no settle) is **never** false-reclaimed, and a settle-then-reregister keeps its resurrected data
+(test B). The on-disk frame count **and** the in-memory index now stay bounded (~ threshold) under
+endlessly-distinct settling churn (test A, RED→GREEN via `*durability-debug-disable-settle-trigger*`). The
+shared detector (`settle-tally` / `%settle-tally-fold` in `store.lisp`) is reused by the encrypted decorator's
+RAM window reclaim (ADR 0025 §10.3), so the settle predicate is defined **once** (DRY).
 - **Parent-directory fsync** for the compaction rename across a power loss (shared follow-on with
   ADR 0026 §10). **RESOLVED** (WP-DURABILITY-HARDENING-BATCH): `%rewrite-topic-log` now calls
   `dds.pal:fsync-directory` after the compaction rename (and every other create/rename dirent — see
@@ -253,16 +266,22 @@ lower-severity than the fixed `:data`-supersession gap, and it is out of scope f
 - `src/dds-durability/spec.lisp` — `service-spec` `history-kind` / `history-depth` fields +
   `make-service-spec` / `make-persistent-store-factory`
 - `src/dds-durability/store.lisp` — `store-open` optional args + memory-store online eviction
+- `src/dds-durability/store.lisp` — settled-instance-churn detector (WP-DURABILITY-SETTLED-RECLAIM,
+  §10.1): `settle-tally` / `%settle-tally-fold` (the shared pass-1-equal settle predicate, reused by
+  ADR 0025 §10.3), `*durability-debug-disable-settle-trigger*`
 - `src/dds-durability/store-file.lisp` — `%compact-topic-records` pass 2 + `make-file-store`;
   Sliver 2 (§10.1): `*compaction-superseded-threshold*`, `*durability-debug-file-rewrite-fault*`,
   `%threshold-compact` / `%init-topic-counts` (make-file-store `:put`/`:open`), `%tmp-log-name-p`
-  (orphan-temp skip), the fault seam in `%rewrite-topic-log`
+  (orphan-temp skip), the fault seam in `%rewrite-topic-log`; settle trigger: the `settle-tallies`
+  map + the `:put` settle block (charges the reclaimable count into `super-pending`)
 - `src/dds-durability/service.lisp` — `service-start` → `store-open (spec history-kind history-depth)`
 - `src/dds-durability/store-sqlite.lisp` — Sliver 1: `%sqlite-evict-instance` online per-put eviction
   (ADR 0049 §10)
 - `src/dds-tests/durability-test.lisp` — `run-durability-keeplast-compaction-test`,
   `run-durability-keeplast-cross-restart-test`, `run-durability-keeplast-service-spec-policy-test`,
   `run-durability-keeplast-memory-test`; Sliver 2: `run-durability-file-threshold-compaction-test`,
-  `run-durability-file-online-chain-test`, `run-durability-file-crash-consistency-test`
+  `run-durability-file-online-chain-test`, `run-durability-file-crash-consistency-test`;
+  settled-instance-churn: `run-durability-settled-reclaim-test` (bounded-on-disk RED→GREEN,
+  no-false-reclaim, chain-MAC + crash-fault)
 - `interop/durability-keeplast/` — cross-DDS restart-seed harness + captures (Leg 1 Connext
   M=302→2, Leg 2 Fast DDS M=134→2)

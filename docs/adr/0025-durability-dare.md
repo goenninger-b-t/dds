@@ -360,10 +360,20 @@ These were formerly "out of scope"; per owner directive they are MUST, each its 
      `store-get-range` still serves that topic correctly via the caller's real topic name). This is an orthogonal
      `topics.map`-durability failure mode, not introduced by 3c. **SQLite is immune** (the topic is persisted in
      the DB `topic` column, not a side map).
-     **Steady-state window residual (bounded, documented — parity with the Sliver-2 tombstone residual):**
-     a settled/quiescent instance's window entry persists in `instance-windows` until `store-purge` or
-     `store-close` (bounded by the count of live + this-session-touched instances, NOT the sample rate); a
-     put-time settle-hook that prunes a settled instance's window entry is a future refinement.
+     **Steady-state window residual — RESOLVED (WP-DURABILITY-SETTLED-RECLAIM, put-time settle-hook).**
+     As originally shipped, a settled/quiescent instance's window entry persisted in `instance-windows`
+     until `store-purge` or `store-close`, so a workload of endlessly-distinct settling instances grew the
+     decorator RAM with the settled-instance count. The decorator now sees the REAL `kind`/`key-hash` (the
+     inner store sees only `:data` surrogates and cannot detect a settle), so its `:put` folds every keyed
+     put into a per-instance `settle-tally` and, on the SETTLE transition — the **shared** pass-1-equal
+     predicate (`%settle-tally-fold` in `store.lisp`, the SAME detector the file store's settle trigger uses,
+     ADR 0029 §10.1) — `remhash`es the instance's `instance-windows` entry (and its tally), mirroring
+     `%purge-topic-windows`' per-key removal. Clearing the window on settle is exactly the `:purge` FIX-3
+     discipline, so a later re-registration seeds a fresh window and is never mis-evicted. `instance-windows`
+     now stays bounded to the live + in-flight instance count under settling churn — proven by
+     `run-durability-encrypted-physical-reclaim-test` case (10) (RED→GREEN via
+     `*durability-debug-disable-settle-trigger*`, observed through `*durability-debug-window-count-hook*`).
+     RAM-only (the inner physical settled-instance rows are the separate file/SQLite on-disk concern).
    - **`store-topics` cross-restart** — the decorator names topics from an in-session reverse map
      (topic-hash → real name); after a restart the plaintext names are off-disk, so `store-topics`
      enumerates only topics touched this session. Records are still fully located/served by topic-hash

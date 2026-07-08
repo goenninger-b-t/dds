@@ -1073,6 +1073,13 @@
    the pre-3c behavior (a prior session's <=D survivors leak across restarts + the fresh window is not
    seeded) so a test can prove the cross-restart-bound RED. Never set in production code.")
 
+(defparameter *durability-debug-window-count-hook* nil
+  "Test-only introspection hook (ADR 0025 §10.3 — encrypted decorator instance-windows bound). NIL
+   (default) ⇒ inert. When bound to a function of one arg, the encrypted decorator's :put FUNCALLs it
+   with the live instance-windows entry count AFTER each put, so a test can assert the window stays
+   bounded under settling-instance churn (the put-time settle-hook remhashes a settled instance's
+   window). Never set in production code.")
+
 (defun* %make-epoch-encrypted-store (inner-store key-provider epoch-dir)
     (function (durable-store dds.dare:key-provider pathname) durable-store)
   "Build the v2 (epoch-aware, disk-backed PERSISTENT tier) encrypted-store over EPOCH-DIR.
@@ -1105,6 +1112,12 @@
          ;; -> list of (real-sn . inner-surrogate). The surrogate is per-SAMPLE, so the decorator must
          ;; REMEMBER each instance's live surrogates to physically evict the superseded ones on put.
          (instance-windows (make-hash-table :test #'equal))
+         ;; settled-instance-churn window reclaim (ADR 0025 §10.3): (topic-hash . real-key-hash-list) ->
+         ;; settle-tally. The decorator sees the REAL kind/key-hash (the inner store sees only :data
+         ;; surrogates), so it detects a settle at put-time (the pass-1 predicate, shared %settle-tally-fold)
+         ;; and remhashes the settled instance's window entry — else a settling instance's window entry (and
+         ;; this tally) persist until purge/close, so decorator RAM grows with the settled-instance count.
+         (settle-tallies (make-hash-table :test #'equal))
          ;; whether the inner store implements the additive :delete slot (SQLite = Sliver 3a, file = 3b).
          ;; NIL => the decorator SKIPS physical reclaim and stays logical-only (byte-identical to pre-3a).
          (del-supported    (and (durable-store-delete inner-store) t)))
@@ -1144,14 +1157,31 @@
                  (unless (member guid* cur :key #'third :test #'equalp)
                    (%trim-window-to-depth th wk (cons (list (coerce writer-guid 'list) sn guid*) cur)))))
              (%purge-topic-windows (th)
-               ;; drop every instance window under this topic-hash (its inner rows are being purged) so the
-               ;; decorator RAM stays bounded and a stale window can never mis-evict a later same-instance
-               ;; write (the settled-instance steady-state residual is documented, ADR 0025 §10.3).
+               ;; drop every instance window (and its settle tally) under this topic-hash (its inner rows are
+               ;; being purged) so the decorator RAM stays bounded and a stale window can never mis-evict a
+               ;; later same-instance write (ADR 0025 §10.3).
                (let ((to-remove '()))
                  (maphash (lambda (k v) (declare (ignore v))
                             (when (equal (car k) th) (push k to-remove)))
                           instance-windows)
-                 (dolist (k to-remove) (remhash k instance-windows))))
+                 (dolist (k to-remove) (remhash k instance-windows)))
+               (let ((to-remove '()))
+                 (maphash (lambda (k v) (declare (ignore v))
+                            (when (equal (car k) th) (push k to-remove)))
+                          settle-tallies)
+                 (dolist (k to-remove) (remhash k settle-tallies))))
+             (%settle-window-reclaim (th key-hash kind)
+               ;; settled-instance-churn window reclaim (ADR 0025 §10.3): fold this put into the instance's
+               ;; settle tally (the pass-1 predicate, shared %settle-tally-fold); on the SETTLE transition
+               ;; remhash its eviction window + tally (mirrors %purge-topic-windows' per-key removal) so a
+               ;; settling instance leaves no decorator RAM. Clearing the window on settle is exactly the
+               ;; :purge FIX-3 discipline (a later re-registration seeds a fresh window — never mis-evicted).
+               (let* ((wk    (cons th (coerce key-hash 'list)))
+                      (tally (or (gethash wk settle-tallies)
+                                 (setf (gethash wk settle-tallies) (%make-settle-tally)))))
+                 (when (%settle-tally-fold tally kind)
+                   (remhash wk instance-windows)
+                   (remhash wk settle-tallies))))
              (%drop-hook (r)
                (let ((n (incf err-count)))
                  (ignore-errors
@@ -1278,6 +1308,14 @@
                ;; ADR 0045 §7.1). A backend without :delete (del-supported NIL) stays logical-only.
                (when (and del-supported (eq :keep-last eff-hk) (eq :data kind) key-hash)
                  (%evict-prior-surrogates th writer-guid key-hash sn guid*))
+               ;; settled-instance-churn window reclaim (ADR 0025 §10.3): the decorator sees the REAL kind,
+               ;; so a settle here remhashes the instance's window (the inner store only saw :data surrogates
+               ;; and cannot). Same del-supported/:keep-last gate the window itself lives under.
+               (when (and del-supported (eq :keep-last eff-hk) key-hash
+                          (not *durability-debug-disable-settle-trigger*))
+                 (%settle-window-reclaim th key-hash kind))
+               (when *durability-debug-window-count-hook*
+                 (funcall *durability-debug-window-count-hook* (hash-table-count instance-windows)))
                r))))
        :get-range
        (lambda (topic)
@@ -1321,6 +1359,7 @@
            ;; Sliver 3a: a re-open starts a fresh prior-surrogate window (bounds decorator RAM across
            ;; reopens + prevents a stale window from mis-evicting; cross-restart ≤D leftovers = 3c).
            (clrhash instance-windows)
+           (clrhash settle-tallies)      ; settled-instance-churn tallies are per-session (ADR 0025 §10.3)
            (when history-kind  (setf eff-hk history-kind))
            (when history-depth (setf eff-hd history-depth))
            ;; drop any prior-open oracle (it closes over the just-freed key); reinstalled below. This
@@ -1400,6 +1439,7 @@
            (setf current-dek   nil)
            ;; Sliver 3a: drop the prior-surrogate window (bounds decorator RAM across reopens); §6 parity
            (clrhash instance-windows)
+           (clrhash settle-tallies)      ; settled-instance-churn tallies (ADR 0025 §10.3)
            ;; zeroize + free the foreign log-MAC key + k_meta + k_epochs and drop the oracle (points at freed bytes); §6
            (setf logmac-key     (dds.dare:free-secret-octets logmac-key))
            (setf meta-key       (dds.dare:free-secret-octets meta-key))

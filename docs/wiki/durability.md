@@ -1245,12 +1245,21 @@ cannot delete-in-place, so — unlike the SQLite per-put DELETE of §8.8.2 — i
   `:keep-all` + NIL-key inner store (pass-1 a no-op there), so this read view neither double-compacts nor
   regresses it.
 
-**Tracked residual (lower-severity, not fixed here):** `super-pending` tracks only `:data` supersession,
-so the `:data`-supersession unbounded-growth gap is closed at runtime, but an adversarial workload of
-endless DISTINCT settling instances (register → write-once → dispose → unregister, a NEW key-hash each)
-still accumulates settled tombstones between opens — pass-1 reclaims them only on the next `store-open`.
-Bounded by the **instance-churn rate** (not the sample rate), a real bounded residual (a settled-instance
-runtime reclaim is a follow-on), NOT a non-issue.
+**Settled-instance-churn residual — RESOLVED (WP-DURABILITY-SETTLED-RECLAIM, TRIGGER-ONLY settle trigger):**
+`super-pending` originally tracked only `:data` supersession, so an adversarial workload of endless DISTINCT
+settling instances (register → write-once → dispose → unregister, a NEW key-hash each, never re-touched)
+stayed within depth D, never bumped the counter, and a continuously-open log grew without bound (pass-1
+reclaimed the settled tombstones only on the next `store-open`). The `:put` path now folds every keyed put
+into a per-instance `settle-tally` and, on the **SETTLE transition** — the *exact* pass-1 predicate (a
+`:dispose` AND an `:unregister` both seen AND the final record a tombstone; order-aware, so a resurrecting
+`:data` un-settles it) — charges that instance's **reclaimable frame count** into the SAME `super-pending`,
+firing the **SAME** unchanged atomic `%rewrite-topic-log` (pass-1 reclaims the settle). Only the *counting*
+is new — the rewrite / chain-MAC re-seed / `tmp+fsync+rename` crash-atomicity path is untouched — so the
+settle predicate equals pass-1 exactly (a **live** instance is never false-reclaimed; a settle-then-reregister
+keeps its resurrected data) and a settle-triggered compaction reopens on a valid re-seeded chain / rolls back
+on a mid-compaction crash. The on-disk frame count **and** the in-memory index now stay bounded (~ threshold)
+under settling churn. The shared `settle-tally` / `%settle-tally-fold` (in `store.lisp`) is reused by the
+encrypted decorator's RAM window reclaim (§8.9, ADR 0025 §10.3), so the settle predicate is defined once.
 
 Tests: `run-durability-file-threshold-compaction-test` (bounded growth to `<= D + threshold` WITHOUT a
 reopen — RED pre-Sliver-2 = N=40; newest-D survive byte-exact; boundary → get-range = exactly D;
@@ -1261,6 +1270,12 @@ appended after a mid-run rewrite, are not lost to a stale fd), and
 `run-durability-file-crash-consistency-test` (fault via `*durability-debug-file-rewrite-fault*` after the
 tmp fsync, before the rename → the original log is intact → fresh reopen verifies the chain clean +
 keeps the newest D, no data loss, no false-reject; a pure-Lisp MAC oracle → both impls, no OpenSSL).
+The settled-instance-churn trigger is proven by `run-durability-settled-reclaim-test`: (A) bounded-on-disk
+RED→GREEN (N=50 distinct settling instances continuously open → on-disk + index bounded to ~ threshold;
+RED = 3N via `*durability-debug-disable-settle-trigger*`); (B) no-false-reclaim (a live data-only instance
+and a settle-then-reregister instance both survive a settle-triggered compaction, get-range correct);
+(C) chain-MAC + crash-fault (a settle-triggered compaction of a keyed store reopens clean, and a fault
+mid-settle-compaction rolls back to the intact original log — no data loss).
 
 #### 8.8.4 Encrypted-tier physical reclaim (WP-DURABILITY-ENCRECLAIM-SQLITE, Sliver 3a)
 
@@ -1296,8 +1311,15 @@ for the **continuously-open SQLite** encrypted tier via three additive pieces:
   idempotent re-put of an already-tracked `(guid, sn)` — which `store-put` no-ops physically
   (`INSERT OR IGNORE`) — never double-counts and evicts a LIVE newest-D row. The window is cleared on
   `store-close` / `store-open` and per-topic on `store-purge` (bounds decorator RAM; prevents a stale
-  window from mis-evicting a later same-instance write). Residual (bounded, documented — parity with the
-  Sliver-2 tombstone residual): a settled instance's window entry persists until `store-purge`/`store-close`.
+  window from mis-evicting a later same-instance write). Settled-instance-churn residual — **RESOLVED**
+  (WP-DURABILITY-SETTLED-RECLAIM): the decorator sees the REAL kind/key-hash (the inner store sees only
+  `:data` surrogates), so its `:put` folds every keyed put into a per-instance `settle-tally` and, on the
+  SETTLE transition (the **shared** pass-1-equal `%settle-tally-fold`, the SAME detector the file settle
+  trigger uses, §8.8.3 / ADR 0029 §10.1), `remhash`es the instance's window (and tally) — mirroring the
+  `store-purge` clearing, so a later re-registration seeds a fresh window and is never mis-evicted.
+  `instance-windows` now stays bounded to live + in-flight instances under settling churn; proven by
+  `run-durability-encrypted-physical-reclaim-test` case (10) (RED→GREEN via
+  `*durability-debug-disable-settle-trigger*`, observed via `*durability-debug-window-count-hook*`).
 
 The inner `store-count nil` now **converges to Σ D per instance** instead of N. The **put+delete PAIR is
 deliberately NON-atomic** — a LOWER bar than Sliver 1/2: a crash between the decorator's put and its
