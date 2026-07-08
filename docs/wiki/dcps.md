@@ -50,7 +50,15 @@ incompatible hooks thread the matched-LOCAL EntityId (`%fire-match` → `%on-dis
 entity by that EntityId (`%participant-reader/writer-by-entity-id`), fired once per (local,remote) pair
 (no double-count on SEDP re-announce; unmatch decrements the right endpoint), so BOTH same-topic readers AND
 writers get their own `SUBSCRIPTION_MATCHED`/`PUBLICATION_MATCHED`/incompatible-QoS status counter + listener
-callback. Also newly reachable: two same-topic-NAME readers of DIFFERENT
+callback. **`REQUESTED`/`OFFERED_INCOMPATIBLE_QOS` is fully per-pair** (WP-DDS-INCOMPAT-QOS-PERPAIR, ADR 0048
+§16.3): the incompatible path COLLECTS one `(local-eid . bad)` entry per incompatible `(local,remote)` pair and
+fires once per NEW pair, gated by `%record-incompat-pair`/`disc-node-incompat-pairs` (the exact mirror of the
+match-pair path), so when BOTH same-topic locals are incompatible with one remote BOTH get the status (not just
+the last), a LATE local created after the remote was recorded fires, a re-announce re-fires nothing, and a
+re-discovery after unmatch/lease-expiry re-fires. `INCOMPATIBLE_QOS` (endpoint status) and `INCONSISTENT_TOPIC`
+(Topic status) are **independent** (DDS 1.4 §2.2.4.1): a remote with a QoS-incompatible same-type local AND a
+type-inconsistent local fires BOTH, and `disc-node-inconsistent` is purged on lease-expiry so a re-discovered
+inconsistent remote re-fires. Also newly reachable: two same-topic-NAME readers of DIFFERENT
 types both register (the fence is loan-capable-scoped), so a match fires `INCONSISTENT_TOPIC` for the
 type-mismatched reader alongside `SUBSCRIPTION_MATCHED` for the compatible one (semantically correct, no
 data hazard). **Same-topic LOAN-CAPABLE multi-reader (Slice 2c-3, WP-N-ENDPOINT-2C3-LOAN-UAF, ADR 0048/0017)

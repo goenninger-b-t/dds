@@ -9169,6 +9169,201 @@
       (dds.dcps:delete-participant p))
     t))
 
+(defun* run-incompat-qos-perpair-test ()
+    (function () t)
+  "WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): INCOMPATIBLE_QOS is now PER-(local,remote) PAIR, mirroring the
+   match-pair path (%record-match-pair/%fire-match). A bare disc-node holds SAME-topic local readers, all
+   RxO-incompatible (durability: they REQUEST transient-local, the remote writer OFFERS volatile); a capturing
+   on-incompatible-qos hook records the fired (local-eid . bad) pairs. Exercises the disc-layer DETECTION->
+   DISPATCH that the fix changed (no network). RED before this WP: the 2-scalar collector fired once-per-remote
+   carrying ONLY the last-in-dolist local eid, so a sibling / late local silently missed the status. Covers:
+   BOTH-LOCALS (both fire), PER-PAIR IDEMPOTENT (a re-announce re-fires nothing), LATE-LOCAL (a local created
+   after the remote was recorded fires), MIXED (a compatible sibling never fires), RE-DISCOVERY (after a
+   lease-sweep purge, a re-match re-fires — no stuck gate / unbounded growth). Both impls."
+  (let* ((node (dds.disc:make-disc-node
+                :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 1)
+                :host "127.0.0.1" :port 0))
+         (fired '())
+         (rq (dds.qos:make-qos :durability :transient-local))   ; reader REQUESTS transient-local
+         (wq (dds.qos:make-qos :durability :volatile))          ; remote writer OFFERS volatile -> durability RxO fails
+         (remote (dds.rtps.discovery:make-endpoint-data
+                  :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9)))
+                          (setf (aref g 15) #x02) g)            ; remote WRITER, WITH_KEY kind 0x02
+                  :topic-name "IQP" :type-name "X" :qos wq)))
+    (setf (dds.disc:disc-node-on-incompatible-qos node)
+          (lambda (kind remote bad eid) (declare (ignore kind remote))
+            (push (cons eid bad) fired)))
+    (unwind-protect
+         (let* ((r1 (dds.disc:add-local-reader node :topic "IQP" :type "X" :qos rq))
+                (r2 (dds.disc:add-local-reader node :topic "IQP" :type "X" :qos rq))
+                (e1 (dds.disc::%guid-entityid (dds.rtps.discovery:endpoint-data-guid r1)))
+                (e2 (dds.disc::%guid-entityid (dds.rtps.discovery:endpoint-data-guid r2))))
+           (%check :iqp-distinct-eids (/= e1 e2)
+                   "the two SAME-topic local readers must get DISTINCT engine EntityIds")
+           ;; (1) BOTH-LOCALS-INCOMPAT: ONE match pass fires BOTH local eids (RED: only the last-in-dolist).
+           (dds.disc::%match-remote-writer node remote)
+           (%check :iqp-both-e1 (and (assoc e1 fired) t)
+                   "reader-1 must get INCOMPATIBLE_QOS")
+           (%check :iqp-both-e2 (and (assoc e2 fired) t)
+                   "reader-2 must ALSO get INCOMPATIBLE_QOS (RED: the 2-scalar collector overwrote/dropped the sibling — only the last-in-dolist local fired)")
+           (%check :iqp-both-bad (equal '(:durability) (cdr (assoc e1 fired)))
+                   "the failing-policy list threaded per endpoint must be (:durability)")
+           (%check :iqp-both-count (= 2 (length fired))
+                   "exactly TWO firings for two incompatible same-topic locals (each pair fires once, no double-count)")
+           ;; (2) PER-PAIR IDEMPOTENT: a SEDP re-announce (2nd match pass) re-fires NOTHING (both pairs already fired).
+           (dds.disc::%match-remote-writer node remote)
+           (%check :iqp-idempotent (= 2 (length fired))
+                   "re-processing the SAME remote must NOT re-fire either pair (per-pair idempotency — mirrors match-pairs)")
+           ;; (3) LATE-LOCAL: a THIRD same-topic incompatible reader created AFTER the remote was recorded fires.
+           (let* ((r3 (dds.disc:add-local-reader node :topic "IQP" :type "X" :qos rq))
+                  (e3 (dds.disc::%guid-entityid (dds.rtps.discovery:endpoint-data-guid r3))))
+             (dds.disc::%match-remote-writer node remote)
+             (%check :iqp-late-e3 (and (assoc e3 fired) t)
+                     "a LATE same-topic incompatible reader must fire (RED: the per-remote gate was already tripped + never purged -> L3 never fired)")
+             (%check :iqp-late-only-one (= 3 (length fired))
+                     "ONLY the late reader re-fires; the two already-fired pairs stay idempotent"))
+           ;; (4) MIXED: a COMPATIBLE + an INCOMPATIBLE same-topic reader with a remote -> only the incompatible fires.
+           (let* ((rc (dds.disc:add-local-reader node :topic "MIX" :type "X"
+                                                 :qos (dds.qos:make-qos :durability :volatile)))   ; requests volatile -> RxO-COMPATIBLE
+                  (ri (dds.disc:add-local-reader node :topic "MIX" :type "X" :qos rq))             ; requests transient-local -> INCOMPATIBLE
+                  (ec (dds.disc::%guid-entityid (dds.rtps.discovery:endpoint-data-guid rc)))
+                  (ei (dds.disc::%guid-entityid (dds.rtps.discovery:endpoint-data-guid ri)))
+                  (mremote (dds.rtps.discovery:make-endpoint-data
+                            :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 8)))
+                                    (setf (aref g 15) #x02) g)
+                            :topic-name "MIX" :type-name "X" :qos wq)))
+             (dds.disc::%match-remote-writer node mremote)
+             (%check :iqp-mixed-incompat (and (assoc ei fired) t)
+                     "the INCOMPATIBLE same-topic reader must fire INCOMPATIBLE_QOS")
+             (%check :iqp-mixed-compat-silent (null (assoc ec fired))
+                     "the COMPATIBLE same-topic reader must NOT fire INCOMPATIBLE_QOS (it matches; no MIXED-case regression)")
+             (%check :iqp-mixed-one-new (= 4 (length fired))
+                     "exactly ONE new incompat firing in the mixed case"))
+           ;; (5) RE-DISCOVERY: a lease-sweep purge of the remote participant clears the incompat pairs -> a re-match re-fires.
+           (let ((prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 9)))   ; the remote's 12-octet participant prefix
+             (setf (gethash (copy-seq prefix) (dds.disc::disc-node-discovered node))
+                   (dds.rtps.discovery:make-spdp-data :guid-prefix (copy-seq prefix) :lease-duration-seconds 1))
+             (setf (gethash (copy-seq prefix) (dds.disc::disc-node-participant-last-seen node))
+                   (- (dds.disc::%lease-now) (* 5 internal-time-units-per-second)))   ; 5s old vs a 1s lease -> stale
+             (dds.disc::%lease-sweep node)
+             (dds.disc::%match-remote-writer node remote)
+             (%check :iqp-rediscovery-refire (= 7 (length fired))
+                     "after a lease-sweep purge of the remote, the re-discovered incompatible pairs must RE-fire (3 IQP readers -> +3; no stuck gate / bounded growth)")))
+      (dds.disc:stop-node node)))
+  t)
+
+(defun* run-incompat-qos-perpair-dcps-test ()
+    (function () t)
+  "WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3), DCPS end-to-end: TWO SAME-topic DataReaders BOTH requesting
+   TRANSIENT_LOCAL (RxO-incompatible with a VOLATILE remote writer). Driving the REAL %match-remote-writer on
+   the participant's node must land REQUESTED_INCOMPATIBLE_QOS on BOTH readers — each total_count = 1 and each
+   on_requested_incompatible_qos listener fires (RED before this WP: the once-per-remote dispatch bumped ONLY
+   the last-in-dolist reader, so the sibling's counter stayed 0 and its listener never fired). A re-match must
+   NOT double-count (per-pair idempotency). Offline disc match (no network); real disc->DCPS eid dispatch via
+   %on-disc-incompatible. Both impls."
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p (dds.dcps:create-participant :domain (test-domain)))
+        (rl1 (make-instance 'capturing-reader-listener))
+        (rl2 (make-instance 'capturing-reader-listener)))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "IQPD" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr1 (dds.dcps:create-datareader sub tp :qos (dds.qos:make-reader-qos :durability :transient-local)))
+                (dr2 (dds.dcps:create-datareader sub tp :qos (dds.qos:make-reader-qos :durability :transient-local)))
+                (node (dds.dcps::dp-node p))
+                ;; A synthetic remote WRITER on the SAME topic/type, OFFERING volatile -> durability RxO fails
+                ;; against BOTH transient-local readers. type-name is the topic's type string verbatim (string= match).
+                (remote (dds.rtps.discovery:make-endpoint-data
+                         :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element #x3d)))
+                                 (setf (aref g 15) #x02) g)
+                         :topic-name "IQPD" :type-name "shape-type"
+                         :qos (dds.qos:make-writer-qos :durability :volatile))))
+           (%check :iqpd-distinct (/= (dds.dcps::dr-entity-id dr1) (dds.dcps::dr-entity-id dr2))
+                   "the two SAME-topic DataReaders must get DISTINCT engine EntityIds")
+           (dds.dcps:set-reader-listener dr1 rl1 '(:requested-incompatible-qos))
+           (dds.dcps:set-reader-listener dr2 rl2 '(:requested-incompatible-qos))
+           ;; Drive the REAL disc match: both readers are RxO-incompatible -> both pairs collected + fired by eid.
+           (dds.disc::%match-remote-writer node remote)
+           (%check :iqpd-dr1-count
+                   (= 1 (dds.dcps:requested-incompatible-qos-status-total-count
+                         (dds.dcps:get-requested-incompatible-qos-status dr1)))
+                   "reader-1 REQUESTED_INCOMPATIBLE_QOS total_count must be 1")
+           (%check :iqpd-dr2-count
+                   (= 1 (dds.dcps:requested-incompatible-qos-status-total-count
+                         (dds.dcps:get-requested-incompatible-qos-status dr2)))
+                   "reader-2 REQUESTED_INCOMPATIBLE_QOS total_count must ALSO be 1 (RED: the once-per-remote dispatch left the sibling at 0)")
+           (%check :iqpd-dr1-listener (and (assoc :req-incompat (cap-snapshot rl1)) t)
+                   "reader-1 on_requested_incompatible_qos must fire")
+           (%check :iqpd-dr2-listener (and (assoc :req-incompat (cap-snapshot rl2)) t)
+                   "reader-2 on_requested_incompatible_qos must ALSO fire (RED: the sibling's listener never fired)")
+           ;; PER-PAIR IDEMPOTENT end-to-end: a re-announce must not DOUBLE-count either reader.
+           (dds.disc::%match-remote-writer node remote)
+           (%check :iqpd-dr1-no-doublecount
+                   (= 1 (dds.dcps:requested-incompatible-qos-status-total-count
+                         (dds.dcps:get-requested-incompatible-qos-status dr1)))
+                   "reader-1 total_count must stay 1 across a re-announce (no per-pair double-count)")
+           (%check :iqpd-dr2-no-doublecount
+                   (= 1 (dds.dcps:requested-incompatible-qos-status-total-count
+                         (dds.dcps:get-requested-incompatible-qos-status dr2)))
+                   "reader-2 total_count must stay 1 across a re-announce (no per-pair double-count)"))
+      (dds.dcps:delete-participant p))
+    t))
+
+(defun* run-incompat-inconsistent-independent-test ()
+    (function () t)
+  "WP-DDS-INCOMPAT-QOS-PERPAIR F1/F1b (ADR 0048 §16.3): INCOMPATIBLE_QOS (an endpoint status) and INCONSISTENT_TOPIC
+   (a Topic status) are INDEPENDENT (DDS 1.4 §2.2.4.1) on DIFFERENT entities — no spec basis for mutual exclusion.
+   A remote (topic T, type X) matched against a participant holding a QoS-incompatible same-type local L1 AND a
+   type-inconsistent local L2 (type Y) must fire BOTH statuses (F1: the per-pair-incompat epilogue must NOT SHADOW
+   the inconsistent fire — the RED this WP briefly introduced with a bare `incompats` cond clause). And
+   disc-node-inconsistent is purged on lease-expiry, so a re-discovered inconsistent remote re-fires (F1b: a
+   pre-existing stuck-gate, now made symmetric with the incompat purge). Bare disc-node + capturing hooks (no
+   network). RED(F1): inconsistent never fires next to an incompatible sibling. RED(F1b): stuck, never re-fires."
+  (let* ((node (dds.disc:make-disc-node
+                :guid-prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 1)
+                :host "127.0.0.1" :port 0))
+         (fired-incompat '())
+         (fired-inconsistent '())
+         (wq (dds.qos:make-qos :durability :volatile))
+         (remote (dds.rtps.discovery:make-endpoint-data
+                  :guid (let ((g (make-array 16 :element-type '(unsigned-byte 8) :initial-element 7)))
+                          (setf (aref g 15) #x02) g)            ; remote WRITER, WITH_KEY kind 0x02
+                  :topic-name "IND" :type-name "X" :qos wq)))
+    (setf (dds.disc:disc-node-on-incompatible-qos node)
+          (lambda (kind r bad eid) (declare (ignore kind r bad)) (push eid fired-incompat)))
+    (setf (dds.disc:disc-node-on-inconsistent-topic node)
+          (lambda (tname) (push tname fired-inconsistent)))
+    (unwind-protect
+         (let* ((l1 (dds.disc:add-local-reader node :topic "IND" :type "X"
+                                               :qos (dds.qos:make-qos :durability :transient-local)))   ; same-type, QoS-INCOMPATIBLE
+                (l2 (dds.disc:add-local-reader node :topic "IND" :type "Y" :qos wq))                    ; type-MISMATCH -> INCONSISTENT_TOPIC
+                (e1 (dds.disc::%guid-entityid (dds.rtps.discovery:endpoint-data-guid l1))))
+           (declare (ignore l2))
+           ;; (F1) ONE scan fires BOTH INCOMPATIBLE_QOS (for L1) AND INCONSISTENT_TOPIC (for the topic) — independent.
+           (dds.disc::%match-remote-writer node remote)
+           (%check :f1-incompat-fires (and (member e1 fired-incompat) t)
+                   "the QoS-incompatible same-type local must fire INCOMPATIBLE_QOS")
+           (%check :f1-inconsistent-fires (and (member "IND" fired-inconsistent :test #'string=) t)
+                   "the type-inconsistent sibling must ALSO fire INCONSISTENT_TOPIC (RED: the per-pair-incompat epilogue SHADOWED it — inconsistent never fired next to an incompatible sibling)")
+           ;; idempotent: a re-announce re-fires NEITHER status (both gates hold).
+           (let ((ni (length fired-incompat)) (nc (length fired-inconsistent)))
+             (dds.disc::%match-remote-writer node remote)
+             (%check :f1-idempotent (and (= ni (length fired-incompat)) (= nc (length fired-inconsistent)))
+                     "a re-announce must re-fire NEITHER status (both the per-pair incompat gate and the per-remote inconsistent gate hold)"))
+           ;; (F1b) RE-DISCOVERY: a lease-sweep purge of disc-node-inconsistent (+ incompat) -> a re-match re-fires INCONSISTENT_TOPIC.
+           (let ((prefix (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7))
+                 (nc (length fired-inconsistent)))
+             (setf (gethash (copy-seq prefix) (dds.disc::disc-node-discovered node))
+                   (dds.rtps.discovery:make-spdp-data :guid-prefix (copy-seq prefix) :lease-duration-seconds 1))
+             (setf (gethash (copy-seq prefix) (dds.disc::disc-node-participant-last-seen node))
+                   (- (dds.disc::%lease-now) (* 5 internal-time-units-per-second)))   ; 5s old vs a 1s lease -> stale
+             (dds.disc::%lease-sweep node)
+             (dds.disc::%match-remote-writer node remote)
+             (%check :f1b-inconsistent-refire (> (length fired-inconsistent) nc)
+                     "after a lease-sweep purge, a re-discovered INCONSISTENT_TOPIC remote must RE-fire (RED: disc-node-inconsistent was never purged -> stuck gate, asymmetric with the purged incompat tables)")))
+      (dds.disc:stop-node node)))
+  t)
+
 ;;; Reader-side Writer Liveliness timing -> LIVELINESS_CHANGED (RTPS 2.5 §8.4.13,
 ;;; DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §123-129): %liveliness-sweep, run on the announce
 ;;; cadence, judges each MATCHED remote writer alive/not-alive from the latest inbound

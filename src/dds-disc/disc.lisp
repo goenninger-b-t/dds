@@ -162,6 +162,7 @@
   (matches (make-hash-table :test 'equalp) :type hash-table)
   (match-pairs (make-hash-table :test 'equalp) :type hash-table) ; WP-N-ENDPOINT-2C2 (ADR 0048): per-(LOCAL,REMOTE) match set — remote 16-octet GUID (equalp) -> list of matched LOCAL user-endpoint EntityIds. The per-endpoint MATCHED status/crypto/durability fire idempotency key (once per pair, NOT per SEDP re-announce); the lease-sweep fires unmatch per pair. disc-node-matches stays per-remote (presence/count/HB-gate). Node-lock guarded.
   (incompat (make-hash-table :test 'equalp) :type hash-table)
+  (incompat-pairs (make-hash-table :test 'equalp) :type hash-table) ; WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): per-(LOCAL,REMOTE) INCOMPATIBLE_QOS fire set — remote 16-octet GUID (equalp) -> list of already-fired incompatible LOCAL EntityIds. Mirrors match-pairs EXACTLY: the per-endpoint {OFFERED,REQUESTED}_INCOMPATIBLE_QOS idempotency key (once per (local,remote) pair, NOT per SEDP re-announce), so BOTH same-topic incompatible locals fire + a LATE local (created after the remote was recorded) fires. disc-node-incompat stays per-remote presence. Both purged by prefix on lease-expiry/participant-lost (%lease-sweep) so a re-discovery re-fires + the tables stay bounded. Node-lock guarded.
   (inconsistent (make-hash-table :test 'equalp) :type hash-table)
   (parked-matches '() :type list) ; (direction . remote endpoint-data), TYPE-GATE :pending; stale snapshots are pre-empted by SEDP re-announce
 
@@ -1564,6 +1565,9 @@
           (%purge-reader-join-watermarks node prefix)   ; WP-N-ENDPOINT-2C3 (ADR 0048): drop the lost writer's ZC-joiner high-waters alongside the route (bounds the table; a re-announce re-freezes the watermark via the match-time route-add so a lease-flap never leaves a stale drain-gate = sample-loss)
 
           (%purge-prefix node prefix #'disc-node-decode-fail-counts)   ; ADR 0031 lim.1: drop the lost writer's decode-failure counters
+          (%purge-prefix node prefix #'disc-node-incompat)         ; WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): drop the lost peer's INCOMPATIBLE_QOS presence
+          (%purge-prefix node prefix #'disc-node-incompat-pairs)   ; ...and its per-pair fire set (an incompatible remote is NOT in disc-node-matches, so it needs its OWN prefix-purge — %collect-and-remove-matches only covers matched remotes); a re-discovery re-fires + the tables stay bounded
+          (%purge-prefix node prefix #'disc-node-inconsistent)     ; WP-DDS-INCOMPAT-QOS-PERPAIR F1b: drop the lost peer's INCONSISTENT_TOPIC gate too (pre-existing stuck-gate, now symmetric with incompat) so a re-discovered inconsistent remote re-fires
           (%collect-and-remove-matches node prefix
                                        (lambda (dm) (push dm removed)))
           (push prefix lost))))   ; ADR-0034 MINOR-4: fire on-participant-lost per dead peer OUTSIDE the lock
@@ -1645,6 +1649,21 @@
       (if (nth-value 1 (gethash key (disc-node-incompat node)))
           nil
           (progn (setf (gethash key (disc-node-incompat node)) remote) t)))))
+
+(defun* %record-incompat-pair (node remote local-entity-id)
+    (function (disc-node dds.rtps.discovery:endpoint-data (unsigned-byte 32)) boolean)
+  "WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): record an RxO-INCOMPATIBLE (LOCAL-ENTITY-ID, REMOTE) PAIR in
+   DISC-NODE-INCOMPAT-PAIRS (remote 16-octet GUID (equalp) -> list of already-fired incompatible LOCAL EntityIds,
+   lock-guarded). Returns T only the FIRST time THIS pair is recorded, so the per-endpoint {OFFERED,REQUESTED}_
+   INCOMPATIBLE_QOS status fires once per (local,remote) pair and NOT again on a SEDP RE-ANNOUNCE. Mirrors
+   %record-match-pair EXACTLY; disc-node-incompat (per-remote presence) is recorded separately. At N=1 one
+   incompatible local per remote -> per-pair == per-remote (byte-identical)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let* ((key (copy-seq (dds.rtps.discovery:endpoint-data-guid remote)))
+           (eids (gethash key (disc-node-incompat-pairs node))))
+      (if (member local-entity-id eids :test #'=)
+          nil
+          (progn (setf (gethash key (disc-node-incompat-pairs node)) (cons local-entity-id eids)) t)))))
 
 (defun* %record-inconsistent (node remote)
     (function (disc-node dds.rtps.discovery:endpoint-data) boolean)
@@ -1753,8 +1772,14 @@
    announces the match; :incompatible joins the INCONSISTENT_TOPIC path; :pending
    parks the decision for resume-parked-matches. Else, against a local on the SAME
    topic name: a different type name is an INCONSISTENT_TOPIC; a matching type whose
-   QoS failed RxO is OFFERED/REQUESTED_INCOMPATIBLE_QOS (failing policies)."
-  (let ((incompat nil) (incompat-eid nil) (inconsistent nil) (parked nil) (writer-p (eq direction :remote-writer)))
+   QoS failed RxO is OFFERED/REQUESTED_INCOMPATIBLE_QOS (failing policies).
+   WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): the incompatible verdict is collected PER (local,remote) PAIR
+   (not a single overwritten scalar) and fired once per NEW pair, gated by %record-incompat-pair — so BOTH
+   same-topic incompatible locals fire, a LATE local (created after REMOTE was recorded) fires, and a re-announce
+   re-fires nothing; mirrors the match path's %record-match-pair/%fire-match. INCONSISTENT_TOPIC stays per-remote and
+   fires INDEPENDENTLY of INCOMPATIBLE_QOS (F1: a remote with both a QoS-incompatible same-type sibling and a
+   type-inconsistent sibling fires BOTH statuses — they are separate DDS 1.4 §2.2.4.1 statuses on different entities)."
+  (let ((incompats nil) (inconsistent nil) (parked nil) (writer-p (eq direction :remote-writer)))
     (dolist (local (if writer-p (disc-node-local-readers node) (disc-node-local-writers node)))
       (multiple-value-bind (ok bad)
           (if writer-p
@@ -1808,20 +1833,29 @@
                     (dds.rtps.discovery:endpoint-data-topic-name local))
            (if (string= (dds.rtps.discovery:endpoint-data-type-name remote)
                         (dds.rtps.discovery:endpoint-data-type-name local))
-               ;; WP-N-ENDPOINT-2C2 (ADR 0048): capture the incompatible LOCAL endpoint's EntityId so
-               ;; REQUESTED/OFFERED_INCOMPATIBLE_QOS lands on the RIGHT same-topic endpoint (by EntityId).
-               (setf incompat bad
-                     incompat-eid (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local)))
+               ;; WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): COLLECT one (local-eid . bad) entry per incompatible
+               ;; (local,remote) pair — NOT a single overwritten scalar — so BOTH same-topic incompatible locals (and
+               ;; a LATE one) each fire REQUESTED/OFFERED_INCOMPATIBLE_QOS on the RIGHT endpoint (by EntityId).
+               (push (cons (%guid-entityid (dds.rtps.discovery:endpoint-data-guid local)) bad) incompats)
                (setf inconsistent (dds.rtps.discovery:endpoint-data-topic-name local)))))))
     ;; WP-N-ENDPOINT-2C1: a PARKED (type-pending) local suppresses the incompat/inconsistent verdict for this
     ;; remote — the pending decision is not yet final (resume-parked-matches re-runs it); mirrors the pre-2c1
     ;; park short-circuit, which returned before this cond, without stopping the route-add-all scan of siblings.
     (unless parked
-      (cond
-        ((and incompat (%record-incompat node remote))
-         (%fire-incompat node direction remote incompat incompat-eid))
-        ((and inconsistent (%record-inconsistent node remote))
-         (%fire-inconsistent node inconsistent)))))
+      ;; WP-DDS-INCOMPAT-QOS-PERPAIR (ADR 0048 §16.3): fire INCOMPATIBLE_QOS once per NEW (local,remote) pair,
+      ;; threading THAT pair's local-eid (mirrors the match path's %record-match-pair/%fire-match). %record-incompat
+      ;; keeps the per-remote presence (analog of %record-match), recorded once; a re-announce re-fires nothing.
+      (when incompats
+        (%record-incompat node remote)
+        (dolist (pair incompats)
+          (when (%record-incompat-pair node remote (car pair))
+            (%fire-incompat node direction remote (cdr pair) (car pair)))))
+      ;; WP-DDS-INCOMPAT-QOS-PERPAIR F1: INCONSISTENT_TOPIC is an INDEPENDENT status on the Topic entity (DDS 1.4
+      ;; §2.2.4.1), NOT mutually exclusive with a SIBLING's INCOMPATIBLE_QOS — fire it per NEW inconsistent remote
+      ;; regardless of any incompat pair this scan (its own per-remote idempotency gate). A remote with BOTH a
+      ;; QoS-incompatible same-type sibling AND a type-inconsistent sibling fires BOTH statuses (was: incompat SHADOWED it).
+      (when (and inconsistent (%record-inconsistent node remote))
+        (%fire-inconsistent node inconsistent))))
   t)
 
 (defun* %match-remote-writer (node remote)
