@@ -21,12 +21,19 @@
 (defclass entity ()
   ((qos :initarg :qos :initform nil :accessor entity-qos)
    (enabled :initarg :enabled :initform nil :accessor entity-enabled-p)
-   (type-compat :initform nil :accessor entity-type-compat))
+   (type-compat :initform nil :accessor entity-type-compat)
+   (status-changes :initform 0 :type (unsigned-byte 32) :accessor %entity-status-changes)
+   (status-condition :initform nil :accessor %entity-owned-status-condition))
   (:documentation "Base DDS Entity: carries the QoS and the enabled flag shared by all
    DCPS entities (DomainParticipant, Publisher/Subscriber, Topic, DataWriter/DataReader).
    TYPE-COMPAT holds the ADVISORY type-object fingerprint verdict for the most recently
    matched remote endpoint (ADR 0009; DataReader/DataWriter only, NIL on other entities and
-   until a first match) — a heuristic signal, never a match gate; see ENTITY-TYPE-COMPAT."))
+   until a first match) — a heuristic signal, never a match gate; see ENTITY-TYPE-COMPAT.
+   STATUS-CHANGES is the DDS 1.4 StatusMask (dds_rtf2_dcps.idl §684) of communication
+   statuses changed since last read, maintained by %notify-status and read by
+   get_status_changes (guarded by the entity's status lock; DataReader/DataWriter/Topic).
+   STATUS-CONDITION is the entity's lazily-created, entity-owned StatusCondition (S0.T4;
+   dds_rtf2_dcps.idl §682), NIL until get_statuscondition is first called."))
 
 (defclass domain-participant (entity)
   ((domain :initarg :domain :reader dp-domain)
@@ -147,6 +154,48 @@
 (declaim (ftype (function (data-reader) t) return-all-loans))
 ;; ADR-0034: crypto-manager.lisp (loaded after this file) — the delete-participant KeyMaterial-secret-wipe entry.
 (declaim (ftype (function (t) (eql t)) %participant-crypto-teardown))
+
+;; conditions.lisp (loaded after this file): forward-declared so %notify-status /
+;; %trigger-status-condition (S0.T3/T4) reach the WaitSet wake helpers without a warning.
+(declaim (ftype (function (t) t) %notify-condition))
+
+;;; ---- WP-DCPS-API-COMPLETION S0: per-entity status-changes bitmask + introspection ----
+
+(defun* %entity-status-lock (entity)
+    (function (entity) t)
+  "The lock guarding ENTITY's communication-status structs + its status-changes bitmask.
+   DataReader/DataWriter/Topic each own one; other entities have none (no communication
+   status fires on them), returning NIL."
+  (typecase entity
+    (data-reader (dr-status-lock entity))
+    (data-writer (dw-status-lock entity))
+    (topic (topic-status-lock entity))
+    (t nil)))
+
+(defun* %set-status-changed (entity bit)
+    (function (entity (unsigned-byte 32)) t)
+  "Set BIT in ENTITY's status-changes bitmask (DDS 1.4 StatusMask, dds_rtf2_dcps.idl §684).
+   CALLER HOLDS the entity's status lock (%entity-status-lock)."
+  (setf (%entity-status-changes entity) (logior (%entity-status-changes entity) bit))
+  t)
+
+(defun* %clear-status-changed (entity bit)
+    (function (entity (unsigned-byte 32)) t)
+  "Clear BIT in ENTITY's status-changes bitmask (the read-communication-status reset, DDS
+   1.4 §2.2.2.1.9). CALLER HOLDS the entity's status lock (%entity-status-lock)."
+  (setf (%entity-status-changes entity) (logandc2 (%entity-status-changes entity) bit))
+  t)
+
+(defun* get-status-changes (entity)
+    (function (entity) (unsigned-byte 32))
+  "DDS Entity::get_status_changes (dds_rtf2_dcps.idl §684): the StatusMask of communication
+   statuses that have changed on ENTITY since the app last read them. A status bit is set by
+   %notify-status when the status fires and cleared when the app reads that status via its
+   get_<status>_status getter (§2.2.2.1.9) — for DATA_AVAILABLE/DATA_ON_READERS the reset is
+   the read/take path. Read under the entity's status lock when it has one."
+  (let ((lk (%entity-status-lock entity)))
+    (if lk (dds.pal:with-lock (lk) (%entity-status-changes entity))
+        (%entity-status-changes entity))))
 
 (defun* %field-resolver (ts)
     (function (t) function)

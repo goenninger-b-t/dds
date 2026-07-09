@@ -2027,6 +2027,35 @@
               "requested-deadline-missed-status fields round-trip")))
   t)
 
+(defun* run-dcps-status-changes-test ()
+    (function () t)
+  "S0.T2 (dds_rtf2_dcps.idl §684 Entity::get_status_changes): a per-entity status-changes
+   bitmask, read by get_status_changes and driven by the internal %set-status-changed /
+   %clear-status-changed helpers (the %notify-status chokepoint wiring is S0.T3). A fresh
+   entity reports 0; setting SUBSCRIPTION_MATCHED + SAMPLE_REJECTED surfaces both; clearing
+   one removes only that bit."
+  (let ((p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((ts (dds.types:find-type-support "dcps-msg"))
+                (tp (dds.dcps:create-topic p "ChgTopic" "dcps-msg" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp)))
+           (%check :chg-initial (zerop (dds.dcps:get-status-changes dr))
+                   "a freshly-created reader has an empty status-changes mask")
+           (dds.dcps::%set-status-changed dr dds.dcps:+status-subscription-matched+)
+           (dds.dcps::%set-status-changed dr dds.dcps:+status-sample-rejected+)
+           (%check :chg-set
+                   (and (logtest dds.dcps:+status-subscription-matched+ (dds.dcps:get-status-changes dr))
+                        (logtest dds.dcps:+status-sample-rejected+ (dds.dcps:get-status-changes dr)))
+                   "%set-status-changed must surface both bits via get_status_changes")
+           (dds.dcps::%clear-status-changed dr dds.dcps:+status-subscription-matched+)
+           (%check :chg-clear-one
+                   (and (not (logtest dds.dcps:+status-subscription-matched+ (dds.dcps:get-status-changes dr)))
+                        (logtest dds.dcps:+status-sample-rejected+ (dds.dcps:get-status-changes dr)))
+                   "%clear-status-changed must clear only the named bit"))
+      (dds.dcps:delete-participant p))
+    t))
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a

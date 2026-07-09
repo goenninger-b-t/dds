@@ -35,6 +35,14 @@
            #:sample-info-absolute-generation-rank #:sample-info-sequence-number
            #:cached-sample #:cached-sample-data #:cached-sample-info
            #:spin #:discovered-count #:matched-count
+           ;; WP-DCPS-API-COMPLETION S0.T2: per-entity status-changes bitmask + StatusKind bits
+           #:get-status-changes
+           #:+status-inconsistent-topic+ #:+status-offered-deadline-missed+
+           #:+status-requested-deadline-missed+ #:+status-offered-incompatible-qos+
+           #:+status-requested-incompatible-qos+ #:+status-sample-lost+
+           #:+status-sample-rejected+ #:+status-data-on-readers+ #:+status-data-available+
+           #:+status-liveliness-lost+ #:+status-liveliness-changed+
+           #:+status-publication-matched+ #:+status-subscription-matched+
            #:wait-condition #:guard-condition #:read-condition #:query-condition
            #:status-condition #:wait-set
            #:make-guard-condition #:set-trigger-value #:create-readcondition

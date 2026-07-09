@@ -3844,6 +3844,7 @@
                  ("dcps-conditions-waitset"  . run-dcps-waitset-test)
                  ("dcps-matched-status"      . run-dcps-matched-status-test)
                  ("dcps-status-structs"      . run-dcps-status-structs-test)
+                 ("dcps-status-changes"      . run-dcps-status-changes-test)
                  ("lease-unmatch"            . run-lease-unmatch-test)
                  ("liveliness-changed"       . run-liveliness-changed-test)
                  ("liveliness-lost"          . run-liveliness-lost-test)
