@@ -3854,6 +3854,7 @@
                  ("dcps-default-qos"         . run-dcps-default-qos-test)
                  ("dcps-pubsub-immutability" . run-dcps-pubsub-immutability-test)
                  ("dcps-factory"             . run-dcps-factory-test)
+                 ("dcps-children-registry"   . run-dcps-children-registry-test)
                  ("lease-unmatch"            . run-lease-unmatch-test)
                  ("liveliness-changed"       . run-liveliness-changed-test)
                  ("liveliness-lost"          . run-liveliness-lost-test)

@@ -720,6 +720,34 @@
     (push tp (dp-children p))
     tp))
 
+;;; ---- WP-DCPS-API-COMPLETION S2.T2: the parent->children containment registry (DDS 1.4 §2.2.2) ----
+
+(defun* participant-publishers (p)
+    (function (domain-participant) list)
+  "The Publishers contained in participant P (DDS 1.4 §2.2.2.2.1) — the Publisher children of P's
+   containment tree, filtered from the mixed child list. A fresh list; mutating it does not affect P."
+  (remove-if-not (lambda (c) (typep c 'publisher)) (dp-children p)))
+
+(defun* participant-subscribers (p)
+    (function (domain-participant) list)
+  "The Subscribers contained in participant P (DDS 1.4 §2.2.2.2.1). A fresh list."
+  (remove-if-not (lambda (c) (typep c 'subscriber)) (dp-children p)))
+
+(defun* participant-topics (p)
+    (function (domain-participant) list)
+  "The Topics contained in participant P (DDS 1.4 §2.2.2.2.1). A fresh list."
+  (remove-if-not (lambda (c) (typep c 'topic)) (dp-children p)))
+
+(defun* publisher-datawriters (pub)
+    (function (publisher) list)
+  "The DataWriters contained in Publisher PUB (DDS 1.4 §2.2.2.4.1). A fresh list."
+  (copy-list (pub-writers pub)))
+
+(defun* subscriber-datareaders (sub)
+    (function (subscriber) list)
+  "The DataReaders contained in Subscriber SUB (DDS 1.4 §2.2.2.5.1). A fresh list."
+  (copy-list (sub-readers sub)))
+
 ;;; ---- DataWriter / DataReader ----
 
 (defun* %topic-type-information (topic)

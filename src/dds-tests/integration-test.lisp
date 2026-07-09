@@ -2372,6 +2372,35 @@
                 "delete_participant unregisters it from the factory (lookup returns NIL)"))))
   t)
 
+(defun* run-dcps-children-registry-test ()
+    (function () t)
+  "S2.T2 (DDS 1.4 §2.2.2.2.1 / §2.2.2.4 / §2.2.2.5 the containment tree): a parent enumerates the
+   children created within it — a DomainParticipant lists its Publishers, Subscribers and Topics;
+   a Publisher lists its DataWriters; a Subscriber lists its DataReaders. Each create_* registers
+   the child with its parent."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "ChildTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p))
+                (sub (dds.dcps:create-subscriber p))
+                (dw (dds.dcps:create-datawriter pub tp))
+                (dr (dds.dcps:create-datareader sub tp)))
+           (%check :creg-pub (member pub (dds.dcps:participant-publishers p))
+                   "the participant enumerates its Publisher")
+           (%check :creg-sub (member sub (dds.dcps:participant-subscribers p))
+                   "the participant enumerates its Subscriber")
+           (%check :creg-topic (member tp (dds.dcps:participant-topics p))
+                   "the participant enumerates its Topic")
+           (%check :creg-pub-only (= 1 (length (dds.dcps:participant-publishers p)))
+                   "participant-publishers returns only Publishers (not Subscribers/Topics)")
+           (%check :creg-dw (member dw (dds.dcps:publisher-datawriters pub))
+                   "the Publisher enumerates its DataWriter")
+           (%check :creg-dr (member dr (dds.dcps:subscriber-datareaders sub))
+                   "the Subscriber enumerates its DataReader"))
+      (dds.dcps:delete-participant p)))
+  t)
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a
