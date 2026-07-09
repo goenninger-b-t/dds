@@ -2421,73 +2421,87 @@
 
 (defun* get-subscription-matched-status (dr)
     (function (data-reader) subscription-matched-status)
-  "DataReader::get_subscription_matched_status — a snapshot; resets the *_change
-   counters per DDS read-resets-change semantics."
+  "DataReader::get_subscription_matched_status — a snapshot; the read-communication-status
+   reset (DDS 1.4 §2.2.2.1.9) resets the *_change counters and clears the SUBSCRIPTION_MATCHED
+   bit in the reader's status-changes bitmask."
   (dds.pal:with-lock ((dr-status-lock dr))
     (let ((s (dr-sub-matched dr)))
       (prog1 (copy-subscription-matched-status s)
         (setf (subscription-matched-status-total-count-change s) 0
-              (subscription-matched-status-current-count-change s) 0)))))
+              (subscription-matched-status-current-count-change s) 0)
+        (%clear-status-changed dr +status-subscription-matched+)))))
 
 (defun* get-publication-matched-status (dw)
     (function (data-writer) publication-matched-status)
-  "DataWriter::get_publication_matched_status — snapshot + reset the *_change counters."
+  "DataWriter::get_publication_matched_status — snapshot; the read-communication-status reset
+   (DDS 1.4 §2.2.2.1.9) resets the *_change counters and clears the PUBLICATION_MATCHED bit."
   (dds.pal:with-lock ((dw-status-lock dw))
     (let ((s (dw-pub-matched dw)))
       (prog1 (copy-publication-matched-status s)
         (setf (publication-matched-status-total-count-change s) 0
-              (publication-matched-status-current-count-change s) 0)))))
+              (publication-matched-status-current-count-change s) 0)
+        (%clear-status-changed dw +status-publication-matched+)))))
 
 (defun* get-requested-incompatible-qos-status (dr)
     (function (data-reader) requested-incompatible-qos-status)
-  "DataReader::get_requested_incompatible_qos_status — snapshot (policies deep-copied)
-   + reset total_count_change; the cumulative policies counts are retained per DDS."
+  "DataReader::get_requested_incompatible_qos_status — snapshot (policies deep-copied); the
+   read-communication-status reset (DDS 1.4 §2.2.2.1.9) resets total_count_change and clears the
+   REQUESTED_INCOMPATIBLE_QOS bit; the cumulative policies counts are retained per DDS."
   (dds.pal:with-lock ((dr-status-lock dr))
     (let* ((s (dr-req-incompat dr))
            (snap (copy-requested-incompatible-qos-status s)))
       (setf (requested-incompatible-qos-status-policies snap)
             (mapcar #'copy-qos-policy-count (requested-incompatible-qos-status-policies s)))
       (setf (requested-incompatible-qos-status-total-count-change s) 0)
+      (%clear-status-changed dr +status-requested-incompatible-qos+)
       snap)))
 
 (defun* get-offered-incompatible-qos-status (dw)
     (function (data-writer) offered-incompatible-qos-status)
-  "DataWriter::get_offered_incompatible_qos_status — snapshot (policies deep-copied)
-   + reset total_count_change; the cumulative policies counts are retained per DDS."
+  "DataWriter::get_offered_incompatible_qos_status — snapshot (policies deep-copied); the
+   read-communication-status reset (DDS 1.4 §2.2.2.1.9) resets total_count_change and clears the
+   OFFERED_INCOMPATIBLE_QOS bit; the cumulative policies counts are retained per DDS."
   (dds.pal:with-lock ((dw-status-lock dw))
     (let* ((s (dw-off-incompat dw))
            (snap (copy-offered-incompatible-qos-status s)))
       (setf (offered-incompatible-qos-status-policies snap)
             (mapcar #'copy-qos-policy-count (offered-incompatible-qos-status-policies s)))
       (setf (offered-incompatible-qos-status-total-count-change s) 0)
+      (%clear-status-changed dw +status-offered-incompatible-qos+)
       snap)))
 
 (defun* get-sample-rejected-status (dr)
     (function (data-reader) sample-rejected-status)
-  "DataReader::get_sample_rejected_status — snapshot + reset total_count_change."
+  "DataReader::get_sample_rejected_status — snapshot; the read-communication-status reset
+   (DDS 1.4 §2.2.2.1.9) resets total_count_change and clears the SAMPLE_REJECTED bit."
   (dds.pal:with-lock ((dr-status-lock dr))
     (let ((s (dr-sample-rejected dr)))
       (prog1 (copy-sample-rejected-status s)
-        (setf (sample-rejected-status-total-count-change s) 0)))))
+        (setf (sample-rejected-status-total-count-change s) 0)
+        (%clear-status-changed dr +status-sample-rejected+)))))
 
 (defun* get-liveliness-changed-status (dr)
     (function (data-reader) liveliness-changed-status)
-  "DataReader::get_liveliness_changed_status — a snapshot; resets the *_change counters
-   per DDS read-resets-change semantics (DDS 1.4 §2.2.4.1)."
+  "DataReader::get_liveliness_changed_status — a snapshot; the read-communication-status reset
+   (DDS 1.4 §2.2.4.1 / §2.2.2.1.9) resets the *_change counters and clears the LIVELINESS_CHANGED
+   bit."
   (dds.pal:with-lock ((dr-status-lock dr))
     (let ((s (dr-liv-changed dr)))
       (prog1 (copy-liveliness-changed-status s)
         (setf (liveliness-changed-status-alive-count-change s) 0
-              (liveliness-changed-status-not-alive-count-change s) 0)))))
+              (liveliness-changed-status-not-alive-count-change s) 0)
+        (%clear-status-changed dr +status-liveliness-changed+)))))
 
 (defun* get-liveliness-lost-status (dw)
     (function (data-writer) liveliness-lost-status)
-  "DataWriter::get_liveliness_lost_status — a snapshot; resets total_count_change per DDS
-   read-resets-change semantics (DDS 1.4 §2.2.4.1, dds_rtf2_dcps.idl §118-121)."
+  "DataWriter::get_liveliness_lost_status — a snapshot; the read-communication-status reset
+   (DDS 1.4 §2.2.4.1 / §2.2.2.1.9, dds_rtf2_dcps.idl §118-121) resets total_count_change and
+   clears the LIVELINESS_LOST bit."
   (dds.pal:with-lock ((dw-status-lock dw))
     (let ((s (dw-liv-lost dw)))
       (prog1 (copy-liveliness-lost-status s)
-        (setf (liveliness-lost-status-total-count-change s) 0)))))
+        (setf (liveliness-lost-status-total-count-change s) 0)
+        (%clear-status-changed dw +status-liveliness-lost+)))))
 
 ;;; ---- set_listener (DDS 1.4 Entity::set_listener) ----
 
@@ -2537,11 +2551,13 @@
 
 (defun* get-inconsistent-topic-status (tp)
     (function (topic) inconsistent-topic-status)
-  "Topic::get_inconsistent_topic_status — snapshot + reset the total_count_change."
+  "Topic::get_inconsistent_topic_status — snapshot; the read-communication-status reset (DDS
+   1.4 §2.2.2.1.9) resets total_count_change and clears the INCONSISTENT_TOPIC bit."
   (dds.pal:with-lock ((topic-status-lock tp))
     (let ((s (topic-inconsistent-status tp)))
       (prog1 (copy-inconsistent-topic-status s)
-        (setf (inconsistent-topic-status-total-count-change s) 0)))))
+        (setf (inconsistent-topic-status-total-count-change s) 0)
+        (%clear-status-changed tp +status-inconsistent-topic+)))))
 
 (defun* set-topic-listener (tp listener mask)
     (function (topic (or null listener) list) topic)

@@ -215,6 +215,9 @@ A **latent reliability/memory bug** was found + fixed in the course of this work
 | `dds.dcps:create-querycondition` (`reader &key states query expression parameters`) | `DataReader::create_querycondition`. With `:expression` (a DDS Annex B query) + `:parameters`, compiles against the topic type; otherwise `:query` is a Lisp predicate over the deserialized sample. |
 | `dds.dcps:qc-query-fn` (`qc`) | The compiled query predicate of a `query-condition`. |
 | `dds.dcps:make-status-condition` (`entity &key mask`) | A `StatusCondition` for `entity` enabled for the statuses in `mask` (default `(:data-available)`). |
+| `dds.dcps:get-statuscondition` (`entity`) | `Entity::get_statuscondition` (dds_rtf2_dcps.idl §682) — the entity's own StatusCondition, created lazily with all applicable statuses enabled and bound to its status-changes bitmask; idempotent. |
+| `dds.dcps:set-enabled-statuses` (`sc mask`) | `StatusCondition::set_enabled_statuses` (§288) — restrict which status keywords make `sc` trigger (its trigger becomes the entity's status-changes bitmask ∧ `mask`, plus level-based `:data-available`). |
+| `dds.dcps:get-enabled-statuses` (`sc`) | `StatusCondition::get_enabled_statuses` (§287) — the currently enabled status keywords. |
 | `dds.dcps:make-wait-set` () | Create a `WaitSet`. |
 | `dds.dcps:attach-condition` (`ws c`) | `WaitSet::attach_condition`. |
 | `dds.dcps:detach-condition` (`ws c`) | `WaitSet::detach_condition`. |
@@ -232,12 +235,18 @@ A **latent reliability/memory bug** was found + fixed in the course of this work
 ### Statuses + listeners
 
 Communication statuses (FR-DCPS-3) are value structs mutated on the receiver thread under the
-entity's status lock; reading a status via a `get-*-status` accessor snapshots it and resets
-its `*_change` counters (DDS read-resets-change semantics).
+entity's status lock. Every status flows through one internal `%notify-status` chokepoint that
+(a) updates the struct, (b) sets the status's bit in the entity's **status-changes bitmask**,
+(c) triggers the entity's StatusCondition, and (d) fires the masked listener. Reading a status
+via a `get-*-status` accessor snapshots it and performs the DDS read-communication-status reset
+(DDS 1.4 §2.2.2.1.9): it resets the `*_change` counters **and** clears that status's bit in the
+bitmask. `get-status-changes` (below) reports the bitmask.
 
 | Symbol | Description |
 |---|---|
-| `dds.dcps:get-subscription-matched-status` (`dr`) | Snapshot the reader's SUBSCRIPTION_MATCHED status (resets `*_change`). |
+| `dds.dcps:get-status-changes` (`entity`) | `Entity::get_status_changes` (dds_rtf2_dcps.idl §684) — the StatusMask of communication statuses changed since last read (set on fire, cleared by the matching `get-*-status`). |
+| `dds.dcps:+status-subscription-matched+` … | The 13 DDS `StatusKind` bit constants (dds_rtf2_dcps.idl §80-92): `+status-inconsistent-topic+`, `+status-offered-deadline-missed+`, `+status-requested-deadline-missed+`, `+status-offered-incompatible-qos+`, `+status-requested-incompatible-qos+`, `+status-sample-lost+`, `+status-sample-rejected+`, `+status-data-on-readers+`, `+status-data-available+`, `+status-liveliness-lost+`, `+status-liveliness-changed+`, `+status-publication-matched+`, `+status-subscription-matched+`. |
+| `dds.dcps:get-subscription-matched-status` (`dr`) | Snapshot the reader's SUBSCRIPTION_MATCHED status (resets `*_change`, clears the bit). |
 | `dds.dcps:get-publication-matched-status` (`dw`) | Snapshot the writer's PUBLICATION_MATCHED status. |
 | `dds.dcps:get-requested-incompatible-qos-status` (`dr`) | Snapshot the reader's REQUESTED_INCOMPATIBLE_QOS status. |
 | `dds.dcps:get-offered-incompatible-qos-status` (`dw`) | Snapshot the writer's OFFERED_INCOMPATIBLE_QOS status. |
@@ -252,6 +261,8 @@ its `*_change` counters (DDS read-resets-change semantics).
 | `dds.dcps:sample-rejected-status` | SAMPLE_REJECTED struct (`-total-count`, `-total-count-change`, `-last-reason`, `-last-instance-handle`). |
 | `dds.dcps:liveliness-changed-status` | LIVELINESS_CHANGED struct (`-alive-count`, `-not-alive-count`, `-alive-count-change`, `-not-alive-count-change`, `-last-publication-handle`). |
 | `dds.dcps:liveliness-lost-status` | LIVELINESS_LOST struct (`-total-count` monotonic, `-total-count-change`); a writer that fails to assert its own liveliness within its offered lease. |
+| `dds.dcps:sample-lost-status` | SAMPLE_LOST struct (`-total-count`, `-total-count-change`); dds_rtf2_dcps.idl §99-102 (no `last_reason` in RTF2). **Struct only — not yet fired (S4).** |
+| `dds.dcps:offered-deadline-missed-status` / `requested-deadline-missed-status` | The deadline-missed structs (`-total-count`, `-total-count-change`, `-last-instance-handle`); dds_rtf2_dcps.idl §131-135 / §137-141. **Structs only — not yet fired (S4).** |
 | `dds.dcps:sample-rejected-reason` | The reason type: `:not-rejected` / `:rejected-by-instances-limit` / `:rejected-by-samples-limit` / `:rejected-by-samples-per-instance-limit`. |
 | `dds.dcps:qos-policy-count` / `make-qos-policy-count` / `qos-policy-count-policy-id` / `qos-policy-count-count` | A `{policy-id, count}` entry in an incompatible-QoS `policies` list. |
 | `dds.dcps:rxo-policy-id` (`keyword`) | The DDS `QosPolicyId_t` for an RxO failing-policy keyword. |

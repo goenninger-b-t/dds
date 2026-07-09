@@ -2027,6 +2027,45 @@
               "requested-deadline-missed-status fields round-trip")))
   t)
 
+(defun* run-dcps-read-status-reset-test ()
+    (function () t)
+  "S0.T5 (DDS 1.4 §2.2.2.1.9 read-communication-status reset): reading a plain-communication
+   status via its get_*_status getter clears its bit in the entity's status-changes bitmask
+   (so get_status_changes stops reporting it) and resets its *_change counters."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "ResetTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "ResetTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr)))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :reset-bit-before
+                   (logtest dds.dcps:+status-subscription-matched+ (dds.dcps:get-status-changes dr))
+                   "the reader's SUBSCRIPTION_MATCHED bit must be set after a match")
+           (dds.dcps:get-subscription-matched-status dr) ; read resets change + clears the bit
+           (%check :reset-bit-after
+                   (not (logtest dds.dcps:+status-subscription-matched+ (dds.dcps:get-status-changes dr)))
+                   "get_subscription_matched_status must clear the SUBSCRIPTION_MATCHED bit")
+           (let ((sm2 (dds.dcps:get-subscription-matched-status dr)))
+             (%check :reset-change-zero
+                     (zerop (dds.dcps:subscription-matched-status-total-count-change sm2))
+                     "a second read shows the *_change counters stay reset"))
+           (%check :reset-w-bit-before
+                   (logtest dds.dcps:+status-publication-matched+ (dds.dcps:get-status-changes dw))
+                   "the writer's PUBLICATION_MATCHED bit must be set after a match")
+           (dds.dcps:get-publication-matched-status dw)
+           (%check :reset-w-bit-after
+                   (not (logtest dds.dcps:+status-publication-matched+ (dds.dcps:get-status-changes dw)))
+                   "get_publication_matched_status must clear the PUBLICATION_MATCHED bit"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
 (defun* run-dcps-entity-statuscondition-test ()
     (function () t)
   "S0.T4 (dds_rtf2_dcps.idl §682 get_statuscondition / §287-288 get/set_enabled_statuses):
