@@ -50,7 +50,10 @@
    (default-subscriber-qos :initform nil :accessor dp-default-subscriber-qos) ; DDS 1.4 §2.2.2.2 get/set_default_subscriber_qos
    (type-gate-state :initform nil :accessor dp-type-gate-state)   ; FR-TYPE-4 gate (type-gate.lisp)
    (auth-state :initform nil :accessor dp-auth-state)   ; DDS-Security 1.1 §8.7 auth manager (auth-manager.lisp)
-   (access-state :initform nil :accessor dp-access-state))   ; DDS-Security 1.1 §8.4 AccessControl manager (access-control.lisp)
+   (access-state :initform nil :accessor dp-access-state)   ; DDS-Security 1.1 §8.4 AccessControl manager (access-control.lisp)
+   (listener :initform nil :accessor dp-listener)            ; WP-DCPS-API-COMPLETION S3.T1: DomainParticipantListener (DDS 1.4 §2.2.4.1)
+   (listener-mask :initform '() :accessor dp-listener-mask)
+   (listener-lock :initform (dds.pal:make-lock "dp-listener") :accessor dp-listener-lock))
   (:documentation "DDS DomainParticipant: owns a multicast disc-node for its domain and
    its contained entities. Holds N DataReaders + N DataWriters (on distinct topics) across its
    Subscribers/Publishers; the disc->DCPS status/listener hooks resolve the endpoint an event is
@@ -64,13 +67,19 @@
 (defclass publisher (entity)
   ((participant :initarg :participant :reader pub-participant)
    (writers :initform '() :accessor pub-writers)
-   (default-datawriter-qos :initform nil :accessor pub-default-datawriter-qos)) ; DDS 1.4 §2.2.2.4.1 get/set_default_datawriter_qos
+   (default-datawriter-qos :initform nil :accessor pub-default-datawriter-qos) ; DDS 1.4 §2.2.2.4.1 get/set_default_datawriter_qos
+   (listener :initform nil :accessor pub-listener)            ; WP-DCPS-API-COMPLETION S3.T1: PublisherListener (DDS 1.4 §2.2.4.1)
+   (listener-mask :initform '() :accessor pub-listener-mask)
+   (listener-lock :initform (dds.pal:make-lock "pub-listener") :accessor pub-listener-lock))
   (:documentation "DDS Publisher: a factory/container for DataWriters in its participant."))
 
 (defclass subscriber (entity)
   ((participant :initarg :participant :reader sub-participant)
    (readers :initform '() :accessor sub-readers)
-   (default-datareader-qos :initform nil :accessor sub-default-datareader-qos)) ; DDS 1.4 §2.2.2.5.1 get/set_default_datareader_qos
+   (default-datareader-qos :initform nil :accessor sub-default-datareader-qos) ; DDS 1.4 §2.2.2.5.1 get/set_default_datareader_qos
+   (listener :initform nil :accessor sub-listener)            ; WP-DCPS-API-COMPLETION S3.T1: SubscriberListener (DDS 1.4 §2.2.4.1)
+   (listener-mask :initform '() :accessor sub-listener-mask)
+   (listener-lock :initform (dds.pal:make-lock "sub-listener") :accessor sub-listener-lock))
   (:documentation "DDS Subscriber: a factory/container for DataReaders in its participant."))
 
 (defclass topic (entity)
@@ -2879,6 +2888,66 @@
       (prog1 (copy-liveliness-lost-status s)
         (setf (liveliness-lost-status-total-count-change s) 0)
         (%clear-status-changed dw +status-liveliness-lost+)))))
+
+;;; ---- set_listener / get_listener on all six entity kinds (DDS 1.4 §2.2.4.1, S3.T1) ----
+
+(defun* %entity-listener-lock (entity)
+    (function (entity) t)
+  "The lock guarding ENTITY's listener + listener-mask slots. DataReader/DataWriter/Topic
+   reuse their status-lock (their listener slots live beside the status structs);
+   Publisher/Subscriber/DomainParticipant have a dedicated listener-lock."
+  (typecase entity
+    (data-reader (dr-status-lock entity))
+    (data-writer (dw-status-lock entity))
+    (topic (topic-status-lock entity))
+    (publisher (pub-listener-lock entity))
+    (subscriber (sub-listener-lock entity))
+    (domain-participant (dp-listener-lock entity))
+    (t nil)))
+
+(defun* %entity-listener (entity)
+    (function (entity) (values t list))
+  "ENTITY's installed listener + its enabled-status mask (a list of status keywords), or
+   (values NIL NIL). The per-kind slot accessor behind the uniform listener-propagation walk
+   (DDS 1.4 §2.2.4.1). Callers that need consistency take %entity-listener-lock first."
+  (typecase entity
+    (data-reader (values (dr-listener entity) (dr-listener-mask entity)))
+    (data-writer (values (dw-listener entity) (dw-listener-mask entity)))
+    (topic (values (topic-listener-obj entity) (topic-listener-mask entity)))
+    (publisher (values (pub-listener entity) (pub-listener-mask entity)))
+    (subscriber (values (sub-listener entity) (sub-listener-mask entity)))
+    (domain-participant (values (dp-listener entity) (dp-listener-mask entity)))
+    (t (values nil nil))))
+
+(defun* %set-entity-listener (entity listener mask)
+    (function (entity t list) t)
+  "Store LISTENER + MASK into ENTITY's per-kind listener slots. CALLER HOLDS the listener lock."
+  (typecase entity
+    (data-reader (setf (dr-listener entity) listener (dr-listener-mask entity) mask))
+    (data-writer (setf (dw-listener entity) listener (dw-listener-mask entity) mask))
+    (topic (setf (topic-listener-obj entity) listener (topic-listener-mask entity) mask))
+    (publisher (setf (pub-listener entity) listener (pub-listener-mask entity) mask))
+    (subscriber (setf (sub-listener entity) listener (sub-listener-mask entity) mask))
+    (domain-participant (setf (dp-listener entity) listener (dp-listener-mask entity) mask)))
+  t)
+
+(defun* set-listener (entity listener mask)
+    (function (entity (or null listener) list) entity)
+  "DDS Entity::set_listener (dds_rtf2_dcps.idl §749/§803/§888/§1006, DDS 1.4 §2.2.4.1): install
+   LISTENER on ENTITY for the statuses named in MASK (a list of status keywords, e.g.
+   (:publication-matched)); NIL clears it. Works uniformly on all six entity kinds
+   (DomainParticipant, Publisher, Subscriber, Topic, DataWriter, DataReader). Held under
+   ENTITY's listener lock."
+  (dds.pal:with-lock ((%entity-listener-lock entity))
+    (%set-entity-listener entity listener mask))
+  entity)
+
+(defun* get-listener (entity)
+    (function (entity) t)
+  "DDS Entity::get_listener (dds_rtf2_dcps.idl §751/§890/§1008, DDS 1.4 §2.2.4.1): ENTITY's
+   currently installed listener object (NIL if none). Works on all six entity kinds."
+  (dds.pal:with-lock ((%entity-listener-lock entity))
+    (values (%entity-listener entity))))
 
 ;;; ---- set_listener (DDS 1.4 Entity::set_listener) ----
 

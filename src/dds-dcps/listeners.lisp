@@ -23,9 +23,35 @@
 (defclass topic-listener (listener) ()
   (:documentation "DDS TopicListener (dds_rtf2_dcps.idl §201)."))
 
+(defclass publisher-listener (listener) ()
+  (:documentation "DDS PublisherListener (dds_rtf2_dcps.idl §221): the DataWriterListener
+   callbacks, no additional callback of its own. Sits above its DataWriters in the
+   listener-propagation chain (DDS 1.4 §2.2.4.1)."))
+
+(defclass subscriber-listener (listener) ()
+  (:documentation "DDS SubscriberListener (dds_rtf2_dcps.idl §247): the DataReaderListener
+   callbacks plus on_data_on_readers. Sits above its DataReaders in the propagation chain
+   (DDS 1.4 §2.2.4.1)."))
+
+(defclass domain-participant-listener (listener) ()
+  (:documentation "DDS DomainParticipantListener (dds_rtf2_dcps.idl §253): aggregates every
+   Topic/Publisher/Subscriber/DataWriter/DataReader callback. It is the last (least specific)
+   link in the listener-propagation chain (DDS 1.4 §2.2.4.1), catching a status no more
+   specific enabled listener handled. All on-* generics dispatch on the base LISTENER, so a
+   participant listener inherits every callback."))
+
 (defgeneric on-inconsistent-topic (listener topic status)
   (:documentation "TopicListener::on_inconsistent_topic.")
   (:method ((listener listener) topic status) (declare (ignore topic status)) nil))
+
+;;; ---- SubscriberListener method (§247-250); base method is a no-op ----
+
+(defgeneric on-data-on-readers (listener subscriber)
+  (:documentation "SubscriberListener::on_data_on_readers (dds_rtf2_dcps.idl §248, DDS 1.4
+   §2.2.4.1): one or more of SUBSCRIBER's DataReaders have new data. When a Subscriber (or a
+   DomainParticipant) listener enabled for DATA_ON_READERS handles this, it TAKES PRECEDENCE
+   over the readers' on_data_available, which is then not called. Base method is a no-op.")
+  (:method ((listener listener) subscriber) (declare (ignore subscriber)) nil))
 
 ;;; ---- DataReaderListener methods (§224-245); base methods are no-ops ----
 

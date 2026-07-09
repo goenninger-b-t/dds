@@ -3848,6 +3848,7 @@
                  ("dcps-notify-status"       . run-dcps-notify-status-test)
                  ("dcps-entity-statuscondition" . run-dcps-entity-statuscondition-test)
                  ("dcps-read-status-reset"   . run-dcps-read-status-reset-test)
+                 ("dcps-listener-levels"     . run-dcps-listener-levels-test)
                  ("dcps-qos-immutability-table" . run-dcps-qos-immutability-table-test)
                  ("dcps-qos-consistency"     . run-dcps-qos-consistency-test)
                  ("dcps-get-set-qos"         . run-dcps-get-set-qos-test)

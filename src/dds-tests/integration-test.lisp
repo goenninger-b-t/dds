@@ -2179,6 +2179,52 @@
       (dds.dcps:delete-participant p))
     t))
 
+;;; WP-DCPS-API-COMPLETION S3 — the full DDS 1.4 listener model (DDS 1.4 §2.2.4.1).
+
+(defun* run-dcps-listener-levels-test ()
+    (function () t)
+  "S3.T1 (dds_rtf2_dcps.idl §221/§247/§253, DDS 1.4 §2.2.4.1): the three missing listener
+   interfaces (subscriber-listener/publisher-listener/domain-participant-listener) exist,
+   on_data_on_readers is a defined SubscriberListener callback with a no-op default, and
+   set_listener/get_listener round-trip a listener on ALL SIX entity kinds (participant,
+   publisher, subscriber, topic, data-writer, data-reader)."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "LvlTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p))
+                (sub (dds.dcps:create-subscriber p))
+                (dw (dds.dcps:create-datawriter pub tp))
+                (dr (dds.dcps:create-datareader sub tp))
+                (pl (make-instance 'dds.dcps:domain-participant-listener))
+                (subl (make-instance 'dds.dcps:subscriber-listener))
+                (publ (make-instance 'dds.dcps:publisher-listener))
+                (tl (make-instance 'dds.dcps:topic-listener))
+                (wl (make-instance 'dds.dcps:data-writer-listener))
+                (rl (make-instance 'dds.dcps:data-reader-listener)))
+           (dds.dcps:set-listener p pl '(:publication-matched))
+           (dds.dcps:set-listener sub subl '(:data-on-readers))
+           (dds.dcps:set-listener pub publ '(:publication-matched))
+           (dds.dcps:set-listener tp tl '(:inconsistent-topic))
+           (dds.dcps:set-listener dw wl '(:publication-matched))
+           (dds.dcps:set-listener dr rl '(:subscription-matched))
+           (%check :gl-participant (eq pl (dds.dcps:get-listener p))
+                   "participant set_listener/get_listener must round-trip")
+           (%check :gl-subscriber (eq subl (dds.dcps:get-listener sub))
+                   "subscriber set_listener/get_listener must round-trip")
+           (%check :gl-publisher (eq publ (dds.dcps:get-listener pub))
+                   "publisher set_listener/get_listener must round-trip")
+           (%check :gl-topic (eq tl (dds.dcps:get-listener tp))
+                   "topic set_listener/get_listener must round-trip")
+           (%check :gl-writer (eq wl (dds.dcps:get-listener dw))
+                   "data-writer set_listener/get_listener must round-trip")
+           (%check :gl-reader (eq rl (dds.dcps:get-listener dr))
+                   "data-reader set_listener/get_listener must round-trip")
+           (%check :odor-default (null (dds.dcps:on-data-on-readers subl sub))
+                   "on_data_on_readers must have a no-op default method"))
+      (dds.dcps:delete-participant p))
+    t))
+
 (defun* run-dcps-qos-immutability-table-test ()
     (function () t)
   "S1.T1 (DDS 1.4 §2.2.3 the per-policy 'changeable' column): the QoS policy immutability

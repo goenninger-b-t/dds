@@ -138,6 +138,9 @@
            #:durability-finalize
            ;; Listeners (FR-DCPS-2)
            #:listener #:data-reader-listener #:data-writer-listener #:topic-listener
+           ;; WP-DCPS-API-COMPLETION S3.T1: the 3 missing listener interfaces (DDS 1.4 §2.2.4.1)
+           #:publisher-listener #:subscriber-listener #:domain-participant-listener
+           #:on-data-on-readers
            #:on-data-available #:on-subscription-matched #:on-requested-incompatible-qos
            #:on-requested-deadline-missed #:on-sample-rejected #:on-sample-lost
            #:on-liveliness-changed
@@ -145,6 +148,8 @@
            #:on-offered-deadline-missed #:on-liveliness-lost
            #:on-inconsistent-topic
            #:set-reader-listener #:set-writer-listener
+           ;; WP-DCPS-API-COMPLETION S3.T1: uniform set_listener/get_listener on all six kinds
+           #:set-listener #:get-listener
            ;; Content-filter / query SQL-subset grammar (FR-DCPS-5)
            #:compile-filter #:lex-filter #:filter-error #:filter-error-detail
            #:content-filtered-topic #:create-contentfilteredtopic
