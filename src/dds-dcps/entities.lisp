@@ -864,10 +864,10 @@
   (multiple-value-bind (okp failing-id) (%qos-consistent-p qos)
     (declare (ignore failing-id))
     (unless okp (return-from set-qos +retcode-inconsistent-policy+)))
-  (let ((old (entity-qos entity)))
-    (when (and (entity-enabled-p entity) (typep old 'dds.qos:qos)
-               (/= +qos-policy-id-invalid+ (%qos-immutable-violation old qos)))
-      (return-from set-qos +retcode-immutable-policy+)))
+  (when (entity-enabled-p entity)
+    (let ((old (get-qos entity)))   ; normalize an absent stored QoS to the effective default, as get_qos does
+      (when (/= +qos-policy-id-invalid+ (%qos-immutable-violation old qos))
+        (return-from set-qos +retcode-immutable-policy+))))
   (setf (entity-qos entity) qos)
   +retcode-ok+)
 
@@ -883,7 +883,9 @@
     (function (dds.qos:qos) (member :ok :inconsistent-policy))
   "Validate QOS for set_default_*_qos (DDS 1.4 §2.2.3 consistency): :ok if consistent (the caller
    then stores it), else :inconsistent-policy (nothing stored)."
-  (if (%qos-consistent-p qos) +retcode-ok+ +retcode-inconsistent-policy+))
+  (multiple-value-bind (okp failing-id) (%qos-consistent-p qos)
+    (declare (ignore failing-id))
+    (if okp +retcode-ok+ +retcode-inconsistent-policy+)))
 
 (defun* get-default-datawriter-qos (pub)
     (function (publisher) dds.qos:qos)

@@ -2326,6 +2326,24 @@
         (dds.dcps:delete-participant p))
       t)))
 
+(defun* run-dcps-pubsub-immutability-test ()
+    (function () t)
+  "S1 review fix (DDS 1.4 §2.2.3 IMMUTABLE_POLICY): an entity created ENABLED with no concrete
+   QoS (a Publisher/Subscriber/Topic created with :qos NIL and no parent default) still enforces
+   immutability — set_qos normalizes the absent stored QoS to the effective default BEFORE the
+   immutability diff, so a post-enable change to an immutable policy (DURABILITY) returns
+   :immutable-policy while a mutable-only change (DEADLINE) returns :ok. Closes the previously
+   untested pub/sub/topic immutability path (only DataWriter/DataReader, always concrete, were exercised)."
+  (dolist (class '(dds.dcps:publisher dds.dcps:subscriber dds.dcps:topic) t)
+    (let ((e (make-instance class :enabled t :qos nil)))
+      (%check (list :immnil-immutable class)
+              (eq :immutable-policy
+                  (dds.dcps:set-qos e (dds.qos:make-qos :durability :transient-local)))
+              "post-enable set_qos of DURABILITY (immutable) on a :qos-NIL entity must return :immutable-policy")
+      (%check (list :immnil-mutable class)
+              (eq :ok (dds.dcps:set-qos e (dds.qos:make-qos :deadline (dds.qos:make-qos-duration 1 0))))
+              "post-enable set_qos of DEADLINE (mutable) on a :qos-NIL entity must return :ok"))))
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a
