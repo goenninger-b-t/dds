@@ -794,6 +794,42 @@
    backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS, ADR 0016 §Backpressure). Represented as the keyword
    :timeout, the same sentinel the engine (dds.disc:publish-sample) surfaces.")
 
+(defparameter +retcode-immutable-policy+ :immutable-policy
+  "DDS 1.4 ReturnCode_t RETCODE_IMMUTABLE_POLICY (§2.2.4.4): set_qos on an ENABLED entity tried
+   to change a policy the DDS 1.4 §2.2.3 'changeable' column marks immutable-after-enable.
+   Represented as the keyword :immutable-policy; the QoS is left unchanged.")
+
+(defparameter +retcode-inconsistent-policy+ :inconsistent-policy
+  "DDS 1.4 ReturnCode_t RETCODE_INCONSISTENT_POLICY (§2.2.4.4): set_qos was given a QoS whose
+   policies are mutually inconsistent (the §2.2.3.18/§2.2.3.19 cross-policy rules; see
+   %qos-consistent-p). Represented as the keyword :inconsistent-policy; the QoS is left unchanged.")
+
+(defun* get-qos (entity)
+    (function (entity) dds.qos:qos)
+  "Entity::get_qos (DDS 1.4 §2.2.4.1) — return a COPY of ENTITY's effective QoS set so the
+   caller cannot mutate the stored policies in place. An entity created without an explicit QoS
+   (a Publisher/Subscriber/DomainParticipant/Topic in this v1) reports a fresh default QoS."
+  (let ((q (entity-qos entity)))
+    (if (typep q 'dds.qos:qos) (dds.qos:copy-qos q) (dds.qos:make-qos))))
+
+(defun* set-qos (entity qos)
+    (function (entity dds.qos:qos) (member :ok :immutable-policy :inconsistent-policy))
+  "Entity::set_qos (DDS 1.4 §2.2.4.1) — install QOS as ENTITY's effective QoS, returning the
+   DDS ReturnCode_t. First the §2.2.3.18/§2.2.3.19 consistency rules run (-> :inconsistent-policy
+   on failure, QoS unchanged); then, if ENTITY is already enabled, the §2.2.3 immutability table
+   rejects any change to an immutable-after-enable policy (-> :immutable-policy, QoS unchanged).
+   Otherwise QOS is stored and :ok returned. (Enabled state uses the provisional entity-enabled-p;
+   WP-DCPS-API-COMPLETION S2 formalizes enable().)"
+  (multiple-value-bind (okp failing-id) (%qos-consistent-p qos)
+    (declare (ignore failing-id))
+    (unless okp (return-from set-qos +retcode-inconsistent-policy+)))
+  (let ((old (entity-qos entity)))
+    (when (and (entity-enabled-p entity) (typep old 'dds.qos:qos)
+               (/= +qos-policy-id-invalid+ (%qos-immutable-violation old qos)))
+      (return-from set-qos +retcode-immutable-policy+)))
+  (setf (entity-qos entity) qos)
+  +retcode-ok+)
+
 (defun* %writer-keeplast-p (dw)
     (function (data-writer) boolean)
   "T iff DW's effective HISTORY QoS kind is KEEP_LAST (DDS 1.4 §2.2.3.18); defaults to T (the

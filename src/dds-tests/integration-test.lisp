@@ -2236,6 +2236,45 @@
       (%check :cons-unlimited okp "LENGTH_UNLIMITED (-1) limits disable the depth bound")))
   t)
 
+(defun* run-dcps-get-set-qos-test ()
+    (function () t)
+  "S1.T3 (DDS 1.4 §2.2.4.1 get_qos/set_qos; §2.2.3 IMMUTABLE_POLICY / INCONSISTENT_POLICY):
+   get_qos returns the entity's effective QoS; set_qos rejects an inconsistent QoS with
+   :inconsistent-policy, accepts an immutable-policy change while the entity is disabled, and
+   once the entity is enabled returns :immutable-policy for an immutable-policy change while
+   still accepting a mutable-only change. Uses the provisional entity-enabled-p flag (S2
+   formalizes enable())."
+  (let ((dw (make-instance 'dds.dcps:data-writer :qos (dds.qos:make-writer-qos) :enabled nil)))
+    (%check :gq-reliable (eq :reliable (dds.qos:qos-reliability (dds.dcps:get-qos dw)))
+            "get_qos returns the writer's effective RELIABILITY")
+    (%check :sq-inconsistent
+            (eq :inconsistent-policy
+                (dds.dcps:set-qos dw (dds.qos:make-writer-qos :history-kind :keep-all
+                                       :resource-max-samples 5 :resource-max-samples-per-instance 10)))
+            "set_qos rejects an inconsistent QoS with :inconsistent-policy")
+    (%check :sq-preenable-ok
+            (eq :ok (dds.dcps:set-qos dw (dds.qos:make-writer-qos :reliability :best-effort)))
+            "pre-enable set_qos of an immutable policy is accepted (:ok)")
+    (%check :sq-preenable-stored
+            (eq :best-effort (dds.qos:qos-reliability (dds.dcps:get-qos dw)))
+            "the pre-enable change is stored (get_qos reflects it)")
+    (setf (dds.dcps:entity-enabled-p dw) t)
+    (%check :sq-immutable
+            (eq :immutable-policy
+                (dds.dcps:set-qos dw (dds.qos:make-writer-qos :reliability :reliable)))
+            "post-enable set_qos of RELIABILITY (immutable) returns :immutable-policy")
+    (%check :sq-immutable-unchanged
+            (eq :best-effort (dds.qos:qos-reliability (dds.dcps:get-qos dw)))
+            "a rejected immutable set_qos leaves the effective QoS unchanged")
+    (let ((q (dds.dcps:get-qos dw)))
+      (setf (dds.qos:qos-deadline q) (dds.qos:make-qos-duration 1 0))
+      (%check :sq-mutable-ok (eq :ok (dds.dcps:set-qos dw q))
+              "post-enable set_qos of DEADLINE (mutable) is accepted (:ok)")
+      (%check :sq-mutable-stored
+              (= 1 (dds.qos:qos-duration-sec (dds.qos:qos-deadline (dds.dcps:get-qos dw))))
+              "the mutable change is stored")))
+  t)
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a
