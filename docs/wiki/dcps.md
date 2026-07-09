@@ -133,6 +133,22 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:get-default-topic-qos` / `-publisher-qos` / `-subscriber-qos` (`p [qos]`) | DomainParticipant default Topic/Publisher/Subscriber QoS (DDS 1.4 §2.2.2.2.2), applied by `create-topic`/`create-publisher`/`create-subscriber`. |
 | `dds.dcps:get-default-participant-qos` / `set-default-participant-qos` (`[qos]`) | The DomainParticipantFactory default participant QoS (DDS 1.4 §2.2.2.2.2), applied by `create-participant`. Provisional module-level home until S2's factory singleton formalizes it. |
 
+### Entity lifecycle (DDS 1.4 §2.2.2, WP-DCPS-API-COMPLETION S2, ADR 0052)
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:get-participant-factory` / `get-instance` | `DomainParticipantFactory::get_instance` (DDS 1.4 §2.2.2.2.2) — the process-wide factory **singleton** (both names return the same object). |
+| `dds.dcps:lookup-participant` (`factory domain`) | `DomainParticipantFactory::lookup_participant` — a registered participant on `domain`, or `nil`. `create-participant` registers with the factory; `delete-participant` unregisters. |
+| `dds.dcps:participant-factory-autoenable-p` / `set-participant-factory-autoenable` (`factory [bool]`) | The factory's `ENTITY_FACTORY` `autoenable_created_entities` policy (DDS 1.4 §2.2.3.23) — `T` (default) auto-enables a participant at `create-participant`, `nil` creates it disabled. A **local** policy, never on the wire. |
+| `dds.dcps:participant-publishers` / `-subscribers` / `-topics` (`p`) | Enumerate a DomainParticipant's contained Publishers / Subscribers / Topics (DDS 1.4 §2.2.2.2.1). Fresh lists. |
+| `dds.dcps:publisher-datawriters` (`pub`) / `subscriber-datareaders` (`sub`) | Enumerate a Publisher's DataWriters / a Subscriber's DataReaders (DDS 1.4 §2.2.2.4.1 / §2.2.2.5.1). |
+| `dds.dcps:entity-autoenable-created-entities` (`entity`) | An entity's own `ENTITY_FACTORY` `autoenable_created_entities` (DDS 1.4 §2.2.3.23) — governs whether the children IT creates are enabled at create (default `T`). |
+| `dds.dcps:enable` (`entity`) | `Entity::enable` (DDS 1.4 §2.2.2.1.1.7) — transition to enabled; idempotent (`:ok`), `:precondition-not-met` if the factory-parent is still disabled. A **disabled** entity's `write-sample`/`read-samples`/`take-samples` return `:not-enabled`; the NOT_ENABLED-safe set (`get_qos`/`set_qos`/`enable`/`get_statuscondition`/`set_listener`) stays live. |
+| `dds.dcps:delete-datawriter` / `delete-datareader` (`parent child`) | `Publisher::delete_datawriter` / `Subscriber::delete_datareader` (DDS 1.4 §2.2.2.4.1.5 / §2.2.2.5.1.5) — `:ok`, or `:precondition-not-met` if not contained. Returns/discards the child's outstanding loans, unregisters it from discovery + the engine (no use-after-free), disables it. |
+| `dds.dcps:delete-publisher` / `delete-subscriber` / `delete-topic` (`p child`) | DomainParticipant child deletes (DDS 1.4 §2.2.2.2.1) — `:precondition-not-met` if the Publisher/Subscriber still holds endpoints, or the Topic is still referenced by an endpoint; else `:ok`. |
+| `dds.dcps:delete-contained-entities` (`entity`) | Recursive teardown (DDS 1.4 §2.2.2.2.1.11 / §2.2.2.4.1.13 / §2.2.2.5.1.13) — a Publisher/Subscriber deletes its endpoints; a DomainParticipant empties+deletes Publishers, Subscribers, then Topics. Always `:ok`. |
+| `dds.dcps:+retcode-not-enabled+` / `+retcode-precondition-not-met+` | The `:not-enabled` / `:precondition-not-met` return codes (DDS 1.4 §2.2.4.4). |
+
 ### Write / read / take + SampleInfo
 
 | Symbol | Description |
