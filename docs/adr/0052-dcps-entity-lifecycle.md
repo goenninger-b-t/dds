@@ -74,12 +74,14 @@ mixed `dp-children`), `publisher-datawriters`, `subscriber-datareaders` — each
   enabled) this is T — **byte-identical to the pre-S2.T3 always-enabled create paths.**
 - `enable entity` transitions to enabled: idempotent (:ok), returns `:precondition-not-met` if the
   factory-parent is still disabled, else sets enabled.
-- **Disabled-entity operation restriction.** The data operations `write-sample`, `read-samples`,
-  `take-samples` return `+retcode-not-enabled+` (:not-enabled) while the entity is disabled; the
-  NOT_ENABLED-safe set (`set_qos`, `get_qos`, `enable`, `get_statuscondition`, `set_listener`) keeps
-  working. This **formalizes the provisional `entity-enabled-p`** S1 keyed its immutability check on —
-  the flag is now the real DDS enabled state, and the S1 immutability tests + pub/sub/topic immutability
-  test still pass unchanged.
+- **Disabled-entity operation restriction (full data-operation set).** Every operation OUTSIDE the
+  NOT_ENABLED-safe set returns `+retcode-not-enabled+` (:not-enabled) while the entity is disabled: on the
+  DataReader `read-samples`/`take-samples`; on the DataWriter `write-sample`, `register-instance`,
+  `dispose-instance`, `unregister-instance`, `loan-sample`, `write-loaned`. The NOT_ENABLED-safe set
+  (`get_qos`, `set_qos`, `enable`, `get_statuscondition`, `set_listener`) keeps working. This
+  **formalizes the provisional `entity-enabled-p`** S1 keyed its immutability check on — the flag is now
+  the real DDS enabled state, and the S1 immutability tests + pub/sub/topic immutability test still pass
+  unchanged.
 
 ### 2.4 Child delete_* (S2.T4) + delete_contained_entities (S2.T5)
 
@@ -87,10 +89,17 @@ mixed `dp-children`), `publisher-datawriters`, `subscriber-datareaders` — each
   `delete-topic`, each returning `:ok` or `+retcode-precondition-not-met+`. Preconditions (§2.2.2):
   the child must be contained in the parent; a Publisher/Subscriber with live endpoints is refused; a
   Topic still referenced by any DataWriter/DataReader is refused.
-- **Resource cleanup discipline (mirrors `delete-participant`/`stop-node`).** `delete-datareader` first
-  `return-all-loans` (the delete-participant discipline — no held refcount pins a writer pool, and the
-  final ZC release runs while the views are still mapped: no use-after-free), then unregisters the
-  endpoint. `delete-datawriter` first `discard-all-loans` (no stranded TX pool slot), then unregisters.
+- **Resource cleanup discipline (mirrors `delete-participant`/`stop-node`).** `delete-datareader` unregisters
+  the endpoint FIRST (`remove-local-reader` purges its delivery routes under the node lock, so the receiver
+  stops demuxing new samples to it), THEN `return-all-loans` (the pool is still mapped — freed only at
+  stop-node — so no use-after-free, and no held refcount pins a writer pool). This route-purge-before-loan-
+  return ordering closes the window where one more demuxed sample would create a never-returned loan (a
+  bounded refcount pin, not a UAF). `delete-datawriter` `discard-all-loans` (no stranded TX pool slot), then
+  unregisters. The default (non-secured/non-ZC) writer HistoryCache holds its `serialized-payload` as a
+  fresh **GC-heap** vector (`%serialize-sample` copies out of the static scratch, then frees it), so dropping
+  the rtps-writer at delete lets GC reclaim the retained payloads — **no static/foreign leak, no `free-static`
+  needed**. The only static-backed retention is the node-scoped secured payload pool / ZC slots (freed at
+  stop-node), correctly not torn down at per-endpoint delete.
 - Two new **disc-layer** primitives (`src/dds-disc/disc.lisp`), exported from `dds.disc`:
   `remove-local-writer` and `remove-local-reader`. Both mutate the disc-node **under the node lock** —
   the SAME lock the receiver/sender push drivers and the receive-hook demux take — so removal never races
@@ -112,9 +121,13 @@ mixed `dp-children`), `publisher-datawriters`, `subscriber-datareaders` — each
   those are released at participant teardown. Consequence: an early per-endpoint delete does not
   early-reclaim node-scoped pools — a bounded, non-leaking deferral over the participant's lifetime, not a
   UAF. Tracked as a follow-on if early reclaim is ever needed.
-- **A DataWriter under an associated flow-controller** keeps its per-writer flow-state until `stop-node`
-  (the flow-controller has no per-writer removal with an emit barrier yet). No test associates a
-  flow-controller with a writer it then deletes; per-writer flow removal is a tracked follow-on.
+- **A DataWriter under an associated flow-controller** is unregistered from the controller synchronously at
+  `delete_datawriter` via the new `flow-controller-remove-writer` (`src/dds-disc/flow-control.lisp`) — the
+  per-writer analogue of `flow-controller-unregister`: under the controller lock it drops the writer's
+  selection entry + flow-writer-state, then blocks on the per-node emit barrier so no scheduler send
+  references the writer after delete returns, and releases its mid-drain step-refs. Called from
+  `remove-local-writer` OUTSIDE the node lock (the barrier must not hold it — no lock-order inversion with
+  the scheduler's emit path). The node keeps its flow-controller association and its OTHER writers untouched.
 - **Deferred engine registration is not done.** A created-disabled endpoint still eagerly registers with
   the engine at create (the disabled state is enforced at the DCPS data ops). Since discovery is
   `spin`-driven, a disabled endpoint that is never spun never announces; true deferred-registration is a

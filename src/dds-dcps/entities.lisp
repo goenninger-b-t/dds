@@ -1235,7 +1235,7 @@
       (dds.pal:free-static (dds.core.buffer:octet-buffer-vec buf)))))
 
 (defun* loan-sample (dw)
-    (function (data-writer) writer-loan)
+    (function (data-writer) (or writer-loan (eql :not-enabled)))
   "DataWriter loan-write — WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel).
    Return a writer-side loaned FlatData sample the app fills via the existing <name>-<field>-fd setters, then
    publishes with write-loaned (or abandons with discard-loan). When the FULL ZC-TX eligibility holds — the topic
@@ -1254,7 +1254,9 @@
    write-loaned allocated on EVERY write is ELIMINATED for a PIN-ELIGIBLE writer (WP-ACKED-SLOT-PINNING, ADR 0044):
    reliable + VOLATILE/finalized + a matched reliable reader PINS the committed slot until the full-ACK purge, so
    retransmit / non-ZC / extra-ZC sends read it on demand; an ineligible writer (or exhausted pin budget) still
-   materialises the retained payload (the always-correct fallback). NOT cleared for ship — pending counsel (R6)."
+   materialises the retained payload (the always-correct fallback). NOT cleared for ship — pending counsel (R6).
+   A DISABLED DataWriter refuses with :not-enabled (outside the NOT_ENABLED-safe set, DDS 1.4 §2.2.2.1.1.7)."
+  (unless (entity-enabled-p dw) (return-from loan-sample +retcode-not-enabled+))
   (let* ((ts (topic-type-support (dw-topic dw)))
          (node (dp-node (pub-participant (dw-publisher dw))))
          (lay (dds.types:type-support-flatdata-offset ts))
@@ -1316,7 +1318,7 @@
   t)
 
 (defun* write-loaned (dw loan)
-    (function (data-writer writer-loan) (member :ok :timeout))
+    (function (data-writer writer-loan) (member :ok :timeout :not-enabled))
   "DataWriter::write by LOAN — WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending
    counsel). Publish the loaned sample LOAN filled by the app. SLOT-BACKED: materialise the RETAINED
    SerializedPayload from the slot (%loan-write-payload — the copy that serves retransmission, non-ZC
@@ -1330,7 +1332,8 @@
    FlatData buffer. Returns +RETCODE-OK+ (:ok) or +RETCODE-TIMEOUT+ (:timeout) under the same bounded-cache
    backpressure as write-sample. IDEMPOTENT: a second write-loaned, or a write after discard-loan, is a
    validated no-op returning :ok (the loan is already terminal). Recycles the loan on success. NOT cleared for
-   ship — pending counsel (R6)."
+   ship — pending counsel (R6). A DISABLED DataWriter refuses with :not-enabled (DDS 1.4 §2.2.2.1.1.7)."
+  (unless (entity-enabled-p dw) (return-from write-loaned +retcode-not-enabled+))
   (when (writer-loan-done loan) (return-from write-loaned +retcode-ok+))   ; already written/discarded: no-op
   (let ((node (dp-node (pub-participant (dw-publisher dw)))))
     (if (eq (writer-loan-kind loan) :slot)
@@ -1411,23 +1414,28 @@
       (%instance-handle (topic-type-support (dw-topic dw)) sample-or-handle)))
 
 (defun* register-instance (dw sample)
-    (function (data-writer t) (simple-array (unsigned-byte 8) (16)))
+    (function (data-writer t) (or (simple-array (unsigned-byte 8) (16)) (eql :not-enabled)))
   "DataWriter::register_instance (DDS 1.4 §2.2.2.4.2.5) — register the instance of SAMPLE and
    return its 16-octet handle (the type-support key-hash). Records the handle as :alive in the
    writer's instance table; HANDLE_NIL for an unkeyed type. No wire message is emitted (registration
-   is a writer-local act; the instance becomes visible to readers on the first write/dispose)."
+   is a writer-local act; the instance becomes visible to readers on the first write/dispose).
+   A DISABLED DataWriter refuses with :not-enabled (outside the NOT_ENABLED-safe set, DDS 1.4
+   §2.2.2.1.1.7, S2.T3)."
+  (unless (entity-enabled-p dw) (return-from register-instance +retcode-not-enabled+))
   (let ((handle (%instance-handle (topic-type-support (dw-topic dw)) sample)))
     (dds.pal:with-lock ((dw-status-lock dw))
       (setf (gethash handle (dw-instances dw)) :alive))
     handle))
 
 (defun* dispose-instance (dw sample-or-handle)
-    (function (data-writer t) (or (simple-array (unsigned-byte 8) (16)) (eql :timeout)))
+    (function (data-writer t) (or (simple-array (unsigned-byte 8) (16)) (member :timeout :not-enabled)))
   "DataWriter::dispose (DDS 1.4 §2.2.2.4.2.10) — dispose the instance named by SAMPLE-OR-HANDLE
    (a sample or a registered handle): emit a no-payload dispose DATA (StatusInfo Disposed, RTPS 2.5
    §9.6.4.9) over the reliable engine so matched readers see NOT_ALIVE_DISPOSED. Returns the handle, or
    +RETCODE-TIMEOUT+ (:timeout) if the bounded cache was full and max_blocking_time elapsed (WP-ASYNC-FLOW
-   backpressure, ADR 0016 §Backpressure; on :timeout nothing was emitted and liveliness is not asserted)."
+   backpressure, ADR 0016 §Backpressure; on :timeout nothing was emitted and liveliness is not asserted).
+   A DISABLED DataWriter refuses with :not-enabled (outside the NOT_ENABLED-safe set, DDS 1.4 §2.2.2.1.1.7)."
+  (unless (entity-enabled-p dw) (return-from dispose-instance +retcode-not-enabled+))
   (let ((handle (%resolve-handle dw sample-or-handle))
         (node (dp-node (pub-participant (dw-publisher dw)))))
     (when (eq :timeout (dds.disc:dispose-instance node handle))
@@ -1443,7 +1451,7 @@
     (if (typep qos 'dds.qos:qos) (dds.qos:qos-autodispose-unregistered-instances qos) t)))
 
 (defun* unregister-instance (dw sample-or-handle)
-    (function (data-writer t) (or (simple-array (unsigned-byte 8) (16)) (eql :timeout)))
+    (function (data-writer t) (or (simple-array (unsigned-byte 8) (16)) (member :timeout :not-enabled)))
   "DataWriter::unregister_instance (DDS 1.4 §2.2.2.4.2.7) — unregister the instance named by
    SAMPLE-OR-HANDLE: emit a no-payload unregister DATA over the reliable engine, relinquishing this
    writer's ownership of the instance. Per WRITER_DATA_LIFECYCLE (DDS 1.4 §2.2.3.21,
@@ -1452,7 +1460,9 @@
    the writer's QoS sets autodispose FALSE, in which case it carries only Unregistered (0x02, RTPS 2.5
    §9.6.4.9). Drops the handle from the writer's instance table. Returns the handle, or +RETCODE-TIMEOUT+
    (:timeout) if the bounded cache was full and max_blocking_time elapsed (WP-ASYNC-FLOW backpressure, ADR
-   0016 §Backpressure; on :timeout nothing was emitted, the handle is NOT dropped, liveliness not asserted)."
+   0016 §Backpressure; on :timeout nothing was emitted, the handle is NOT dropped, liveliness not asserted).
+   A DISABLED DataWriter refuses with :not-enabled (outside the NOT_ENABLED-safe set, DDS 1.4 §2.2.2.1.1.7)."
+  (unless (entity-enabled-p dw) (return-from unregister-instance +retcode-not-enabled+))
   (let ((handle (%resolve-handle dw sample-or-handle))
         (node (dp-node (pub-participant (dw-publisher dw)))))
     (when (eq :timeout (dds.disc:unregister-instance node handle (%writer-autodispose-p dw)))
@@ -2954,14 +2964,15 @@
 (defun* delete-datareader (sub dr)
     (function (subscriber data-reader) (member :ok :precondition-not-met))
   "Subscriber::delete_datareader (DDS 1.4 §2.2.2.5.1.5) — delete DR from SUB. Returns
-   :precondition-not-met if DR is not contained in SUB. Otherwise: return every outstanding read/
-   secured loan FIRST (the delete-participant discipline — no held refcount pins a writer pool, and the
-   final release runs while the views are still mapped: no use-after-free), remove the reader from
-   discovery + the engine registry (remove-local-reader purges its delivery routes so no arriving sample
-   is demuxed to it), drop it from the Subscriber, and mark it disabled."
+   :precondition-not-met if DR is not contained in SUB. Otherwise, in this ORDER: (1) remove the reader
+   from discovery + the engine registry FIRST (remove-local-reader purges its delivery routes under the
+   node lock, so the receiver STOPS demuxing new samples to DR — closing the window where one more sample
+   would create a never-returned loan); (2) THEN return every outstanding read/secured loan (the pool is
+   still mapped — freed only at stop-node — so no use-after-free, and no held refcount pins a writer pool);
+   (3) drop it from the Subscriber and mark it disabled."
   (unless (member dr (sub-readers sub)) (return-from delete-datareader +retcode-precondition-not-met+))
-  (return-all-loans dr)
   (dds.disc:remove-local-reader (dp-node (sub-participant sub)) (dr-disc-endpoint dr) (dr-entity-id dr))
+  (return-all-loans dr)
   (setf (sub-readers sub) (remove dr (sub-readers sub))
         (entity-enabled-p dr) nil)
   +retcode-ok+)

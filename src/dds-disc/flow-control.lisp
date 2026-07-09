@@ -580,6 +580,32 @@
   (%flow-unblock-writer node)   ; wake any publish blocked on a full bounded cache (ADR 0016 §Backpressure / §Teardown): paced drain stops, so it must reach its TIMEOUT
   t)
 
+(defun* flow-controller-remove-writer (controller node writer)
+    (function (flow-controller dds.disc::disc-node dds.rtps.reliable:rtps-writer) t)
+  "Remove ONE local user WRITER of NODE from CONTROLLER — the PER-WRITER analogue of
+   flow-controller-unregister (WP-DCPS-API-COMPLETION S2.T4 delete_datawriter; ADR 0016 §Teardown / ADR 0052).
+   Under the controller LOCK: drop WRITER's selection entry from WRITERS and its flow-writer-state from NODE's
+   registry (so the scheduler can never NEWLY pick it), clear its pending, then BLOCK on the per-NODE emit
+   barrier (LOOP WHILE current-emit-node = NODE, bounded CONDVAR-WAIT on EMIT-DONE-CV) until any in-flight
+   scheduler emit on NODE finishes — so no scheduler send references WRITER after this returns (delete is
+   SYNCHRONOUS for the deleted writer). Finally release WRITER's mid-drain step-refs (no leaked pinned
+   CacheChange). NODE keeps its flow-controller association and its OTHER writers untouched — unlike
+   flow-controller-unregister, which detaches the whole node. A no-op if WRITER is not registered (idempotent)."
+  (let ((weid (dds.rtps.reliable:rtps-writer-entityid writer)))
+    (dds.pal:with-lock ((flow-controller-lock controller))
+      (let ((cell (assoc weid (dds.disc::disc-node-flow-writer-states node) :test #'eql)))
+        (when cell
+          (let ((ws (cdr cell)))
+            (setf (flow-controller-writers controller) (remove ws (flow-controller-writers controller))
+                  (dds.disc::disc-node-flow-writer-states node)
+                  (remove cell (dds.disc::disc-node-flow-writer-states node))
+                  (dds.disc::flow-writer-state-pending ws) nil)
+            (loop while (eq (flow-controller-current-emit-node controller) node)   ; block on any in-flight emit on NODE
+                  do (dds.pal:condvar-wait (flow-controller-emit-done-cv controller)
+                                           (flow-controller-lock controller) 0.5))
+            (dds.disc::%flow-release-step-refs ws))))))
+  t)
+
 (defun* destroy-flow-controller (controller)
     (function (flow-controller) t)
   "Tear down CONTROLLER (FR-PF-2, ADR 0016): under the LOCK set STOP + condvar-signal the scheduler, JOIN

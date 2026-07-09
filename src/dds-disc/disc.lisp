@@ -802,10 +802,15 @@
    user-writer registry (repointing the primary to the next remaining writer, or NIL, if it WAS primary)
    and remove EP from disc-node-local-writers so announce-endpoints stops advertising it via SEDP. Taking
    the node lock is what makes this race-free against a concurrent send/retransmit (no use-after-free).
-   Idempotent (an unregistered id / absent EP removes nothing). NODE-SCOPED resources shared with other
-   endpoints (the ZC pool, the secured payload pools, the flow-controller) are released at stop-node, not
-   here — deleting one of N endpoints must not tear down a pool a sibling still uses; a writer under an
-   associated flow-controller keeps its flow-state until stop-node (per-writer flow removal is a follow-on)."
+   Idempotent (an unregistered id / absent EP removes nothing). When the writer is under an associated
+   flow-controller it is first removed from that controller (flow-controller-remove-writer — its own lock +
+   per-node emit barrier, so pacing STOPS synchronously for this writer and delete is not left racing a queued
+   datagram; done OUTSIDE the node lock to avoid a lock-order inversion with the scheduler's emit path). Other
+   NODE-SCOPED resources shared with sibling endpoints (the ZC pool, the secured payload pools) are released at
+   stop-node — deleting one of N endpoints must not tear down a pool a sibling still uses."
+  (let ((fc (disc-node-flow-controller node))   ; flow removal FIRST, outside the node lock (barrier must not hold it)
+        (w (cdr (assoc entity-id (disc-node-user-writers node) :test #'eql))))
+    (when (and fc w) (flow-controller-remove-writer fc node w)))
   (dds.pal:with-lock ((disc-node-lock node))
     (let ((cell (assoc entity-id (disc-node-user-writers node) :test #'eql)))
       (when cell

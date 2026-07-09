@@ -37,7 +37,7 @@
            #:flow-token-bucket #:flow-token-bucket-p #:make-flow-token-bucket
            #:flow-token-bucket-tokens #:flow-token-bucket-max-burst
            #:flow-controller #:flow-controller-p #:make-flow-controller #:destroy-flow-controller
-           #:flow-controller-associate #:flow-controller-unregister #:flow-controller-thread
+           #:flow-controller-associate #:flow-controller-unregister #:flow-controller-remove-writer #:flow-controller-thread
            #:*shmem-enabled* #:*zerocopy-enabled* #:disc-node-shmem #:disc-node-shmem-sends #:disc-node-shmem-send-faults #:disc-node-host-uuid
            #:disc-node-zc-sends #:+zerocopy-pool-slots+ #:+zerocopy-pool-slot-bytes+ #:*zerocopy-min-payload-bytes*
            ;; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a: data_protection encode-pool sizing knobs + the per-node arena slot

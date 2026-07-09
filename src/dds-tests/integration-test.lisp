@@ -2365,11 +2365,15 @@
                        "autoenable_created_entities defaults to TRUE (DDS 1.4 §2.2.3.23)")
                (dds.dcps:set-participant-factory-autoenable f1 nil)
                (%check :fac-autoenable-set (not (dds.dcps:participant-factory-autoenable-p f1))
-                       "set of ENTITY_FACTORY autoenable_created_entities round-trips")
-               (dds.dcps:set-participant-factory-autoenable f1 t))
+                       "set of ENTITY_FACTORY autoenable_created_entities round-trips"))
+          ;; restore the process-global ENTITY_FACTORY flag + delete the participant in CLEANUP so a
+          ;; %check failure above cannot leak autoenable=nil (cascading later tests) — mirror run-dcps-enable-test.
+          (dds.dcps:set-participant-factory-autoenable f1 t)
           (dds.dcps:delete-participant p))
-        (%check :fac-delete-unregisters (null (dds.dcps:lookup-participant f1 dom))
-                "delete_participant unregisters it from the factory (lookup returns NIL)"))))
+        ;; the process-global singleton + shared test-domain means other tests' participants may share DOM;
+        ;; assert the SPECIFIC deleted participant is absent from the registry, not global emptiness.
+        (%check :fac-delete-unregisters (not (member p (dds.dcps::dpf-participants f1)))
+                "delete_participant unregisters THIS participant from the factory"))))
   t)
 
 (defun* run-dcps-children-registry-test ()
@@ -2460,6 +2464,44 @@
         (dds.dcps:delete-participant p))))
   t)
 
+(defun* run-dcps-disabled-ops-test ()
+    (function () t)
+  "S2.T3 review (DDS 1.4 §2.2.2.1.1.7 NOT_ENABLED covers the FULL data-operation set): a DISABLED
+   DataWriter's register_instance / dispose / unregister_instance / loan-sample / write-loaned ALL
+   return :not-enabled (not just write); after enable() register/dispose/unregister perform normally
+   (a handle). Closes the gap where only write/read/take were guarded. (loan-sample/write-loaned's
+   ENABLED path is FlatData/ZC-gated — exercised elsewhere; here only their disabled guard is asserted,
+   which fires before the FlatData check.)"
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "DisOpsTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p)))
+           (setf (dds.dcps:entity-autoenable-created-entities pub) nil)
+           (let ((dw (dds.dcps:create-datawriter pub tp))
+                 (s (make-dcps-msg :id 1 :text "de")))
+             (%check :dis-dw-disabled (not (dds.dcps:entity-enabled-p dw))
+                     "the DataWriter is created disabled (autoenable-OFF Publisher)")
+             (%check :dis-register (eq :not-enabled (dds.dcps:register-instance dw s))
+                     "register_instance on a disabled writer returns :not-enabled")
+             (%check :dis-dispose (eq :not-enabled (dds.dcps:dispose-instance dw s))
+                     "dispose on a disabled writer returns :not-enabled")
+             (%check :dis-unregister (eq :not-enabled (dds.dcps:unregister-instance dw s))
+                     "unregister_instance on a disabled writer returns :not-enabled")
+             (%check :dis-loan (eq :not-enabled (dds.dcps:loan-sample dw))
+                     "loan-sample on a disabled writer returns :not-enabled")
+             (%check :dis-write-loaned (eq :not-enabled (dds.dcps:write-loaned dw (dds.dcps::%make-writer-loan)))
+                     "write-loaned on a disabled writer returns :not-enabled (guard fires before touching the loan)")
+             (%check :dis-enable (eq :ok (dds.dcps:enable dw)) "enable() returns :ok")
+             (%check :dis-register-ok (not (eq :not-enabled (dds.dcps:register-instance dw s)))
+                     "register_instance after enable returns a handle (not :not-enabled)")
+             (%check :dis-dispose-ok (not (eq :not-enabled (dds.dcps:dispose-instance dw s)))
+                     "dispose after enable returns a handle / :timeout (not :not-enabled)")
+             (%check :dis-unregister-ok (not (eq :not-enabled (dds.dcps:unregister-instance dw s)))
+                     "unregister_instance after enable returns a handle / :timeout (not :not-enabled)")))
+      (dds.dcps:delete-participant p)))
+  t)
+
 (defun* run-dcps-delete-child-test ()
     (function () t)
   "S2.T4 (DDS 1.4 §2.2.2.4.1.5 / §2.2.2.5.1.5 / §2.2.2.2.1.6/8/10 delete_datawriter / delete_datareader /
@@ -2508,6 +2550,43 @@
                    "delete_subscriber succeeds once the Subscriber is empty")
            (%check :del-part-empty (null (dds.dcps::dp-children p))
                    "the participant's child list is empty after deleting all children"))
+      (dds.dcps:delete-participant p)))
+  t)
+
+(defun* run-dcps-delete-flow-writer-test ()
+    (function () t)
+  "S2.T4 review (concern #2, ADR 0052 / ADR 0016 §Teardown): delete_datawriter of a FLOW-CONTROLLED writer
+   unregisters it from its flow-controller (flow-controller-remove-writer) so the scheduler can no longer pace
+   it — delete is synchronous. A writer created under an associated controller appears in the node's
+   flow-writer-states; after delete_datawriter it is gone from BOTH the node registry and the controller's
+   selection set, while the node keeps its controller association."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p (dds.dcps:create-participant :domain (test-domain)))
+        (controller (dds.disc:make-flow-controller :tokens-per-period 10000 :period 100000000 :max-burst 10000)))
+    (unwind-protect
+         (let ((node (dds.dcps::dp-node p)))
+           (dds.disc:flow-controller-associate controller node)
+           (let* ((tp (dds.dcps:create-topic p "FlowDelTopic" "dcps-msg" ts))
+                  (pub (dds.dcps:create-publisher p))
+                  (dw (dds.dcps:create-datawriter pub tp))
+                  (weid (dds.dcps::dw-entity-id dw)))
+             (%check :fdw-registered (assoc weid (dds.disc::disc-node-flow-writer-states node) :test #'eql)
+                     "a flow-controlled writer is registered in the node's flow-writer-states")
+             (%check :fdw-in-controller
+                     (find node (dds.disc::flow-controller-writers controller)
+                           :key #'dds.disc::flow-writer-state-node)
+                     "the writer's flow-state is in the controller's selection set")
+             (%check :fdw-delete (eq :ok (dds.dcps:delete-datawriter pub dw))
+                     "delete_datawriter of a flow-controlled writer returns :ok")
+             (%check :fdw-unregistered (null (assoc weid (dds.disc::disc-node-flow-writer-states node) :test #'eql))
+                     "after delete the writer is gone from the node's flow-writer-states")
+             (%check :fdw-not-in-controller
+                     (null (find node (dds.disc::flow-controller-writers controller)
+                                 :key #'dds.disc::flow-writer-state-node))
+                     "after delete the writer's flow-state is gone from the controller's selection set")
+             (%check :fdw-node-still-associated (eq controller (dds.disc::disc-node-flow-controller node))
+                     "the node keeps its flow-controller association after one writer's delete")))
+      (ignore-errors (dds.disc:destroy-flow-controller controller))
       (dds.dcps:delete-participant p)))
   t)
 
