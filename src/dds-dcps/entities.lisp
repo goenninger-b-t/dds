@@ -234,24 +234,75 @@
         (when sc (%notify-condition sc))))
   t)
 
-(defun* %notify-status (entity status-bit apply-fn)
-    (function (entity (unsigned-byte 32) function) (eql t))
+(defparameter *status-listener-invokers*
+  (list (cons :inconsistent-topic (lambda (l e s) (on-inconsistent-topic l e s)))
+        (cons :subscription-matched (lambda (l e s) (on-subscription-matched l e s)))
+        (cons :publication-matched (lambda (l e s) (on-publication-matched l e s)))
+        (cons :requested-incompatible-qos (lambda (l e s) (on-requested-incompatible-qos l e s)))
+        (cons :offered-incompatible-qos (lambda (l e s) (on-offered-incompatible-qos l e s)))
+        (cons :sample-rejected (lambda (l e s) (on-sample-rejected l e s)))
+        (cons :sample-lost (lambda (l e s) (on-sample-lost l e s)))
+        (cons :liveliness-changed (lambda (l e s) (on-liveliness-changed l e s)))
+        (cons :liveliness-lost (lambda (l e s) (on-liveliness-lost l e s)))
+        (cons :requested-deadline-missed (lambda (l e s) (on-requested-deadline-missed l e s)))
+        (cons :offered-deadline-missed (lambda (l e s) (on-offered-deadline-missed l e s))))
+  "Maps a communication-status keyword to the closure invoking its on_<status> listener callback
+   (listener entity snapshot). The status-generic seam the %notify-status propagation walk uses to
+   deliver a status to whichever listener in the containment chain handles it (DDS 1.4 §2.2.4.1).")
+
+(defun* %listener-ancestry (entity)
+    (function (entity) list)
+  "ENTITY then its containment parents up to the DomainParticipant, MOST-SPECIFIC FIRST — the DDS
+   1.4 §2.2.4.1 listener-propagation chain. DataReader: reader -> Subscriber -> participant;
+   DataWriter: writer -> Publisher -> participant; Topic: topic -> participant;
+   Publisher/Subscriber: itself -> participant; DomainParticipant: itself."
+  (typecase entity
+    (data-reader (let ((s (dr-subscriber entity))) (list entity s (sub-participant s))))
+    (data-writer (let ((pb (dw-publisher entity))) (list entity pb (pub-participant pb))))
+    (topic (list entity (topic-participant entity)))
+    (publisher (list entity (pub-participant entity)))
+    (subscriber (list entity (sub-participant entity)))
+    (t (list entity))))
+
+(defun* %find-enabled-listener (entity status-kw)
+    (function (entity keyword) t)
+  "The MOST-SPECIFIC listener in ENTITY's containment chain that is installed AND enabled for
+   STATUS-KW (its mask contains STATUS-KW), or NIL (DDS 1.4 §2.2.4.1). Walks %listener-ancestry,
+   reading each entity's listener under its own listener lock; the walk STOPS at the first
+   enabled listener (that listener handles the status; propagation goes no further up)."
+  (dolist (e (%listener-ancestry entity) nil)
+    (multiple-value-bind (l mask)
+        (dds.pal:with-lock ((%entity-listener-lock e)) (%entity-listener e))
+      (when (and l (member status-kw mask)) (return l)))))
+
+(defun* %notify-status (entity status-bit status-kw apply-fn)
+    (function (entity (unsigned-byte 32) keyword function) (eql t))
   "The single communication-status notification chokepoint (DDS 1.4 §2.2.4.1). Under ENTITY's
-   status lock it runs APPLY-FN — the status-specific update, which mutates the status struct
-   and returns (values CHANGED-P FIRE), where FIRE is a zero-arg thunk closing over a snapshot
-   to invoke the (already mask-gated) listener callback, or NIL when no listener is masked.
-   When CHANGED-P, %notify-status sets STATUS-BIT in the status-changes bitmask (so
-   get_status_changes reflects it) under the same lock; then, OUTSIDE the lock, it fires the
-   listener (behavior-preserving: the exact prior on_<status> callback under the exact prior
-   mask gate) and triggers ENTITY's StatusCondition / reader WaitSets. Bit-set + condition
-   trigger are additive; the listener call is unchanged. S3 (listener-hierarchy propagation)
-   and S4 (deadline / SAMPLE_LOST firing) reuse THIS chokepoint — there is no parallel path."
-  (let ((changed nil) (fire nil) (lk (%entity-status-lock entity)))
+   status lock it runs APPLY-FN — the status-specific update, which mutates the status struct and
+   returns (values CHANGED-P SNAPSHOT RESET-THUNK): SNAPSHOT is a fresh copy of the status handed
+   to whichever listener handles it (built whenever CHANGED, so an ancestor listener can receive
+   it); RESET-THUNK zeroes the live struct's *_change counters and is run ONLY if a listener
+   handles the status. When CHANGED-P, sets STATUS-BIT in the status-changes bitmask under the
+   same lock. Then, OUTSIDE the lock, it walks the containment chain (%find-enabled-listener) and
+   delivers SNAPSHOT to the MOST-SPECIFIC enabled listener, STOPPING there. If a listener handled
+   it, %notify-status runs RESET-THUNK and CLEARS STATUS-BIT (the §2.2.4.1 reset-on-listener-
+   invocation: a status a listener consumed is no longer 'changed', so its StatusCondition no
+   longer triggers). If no listener is enabled anywhere up the chain, the bit stays set and no
+   callback fires. Finally it triggers ENTITY's StatusCondition / reader WaitSets. Behavior-
+   preserving: an entity with its own enabled listener is the most-specific link, so it still gets
+   the exact prior callback. S4 (deadline / SAMPLE_LOST) reuses THIS chokepoint — no parallel path."
+  (let ((changed nil) (snapshot nil) (reset-thunk nil) (lk (%entity-status-lock entity)))
     (dds.pal:with-lock (lk)
-      (multiple-value-setq (changed fire) (funcall apply-fn))
+      (multiple-value-setq (changed snapshot reset-thunk) (funcall apply-fn))
       (when changed (%set-status-changed entity status-bit)))
-    (when fire (funcall fire))
-    (when changed (%trigger-status-condition entity)))
+    (when changed
+      (let ((l (%find-enabled-listener entity status-kw)))
+        (when l
+          (funcall (cdr (assoc status-kw *status-listener-invokers*)) l entity snapshot)
+          (dds.pal:with-lock (lk)
+            (when reset-thunk (funcall reset-thunk))
+            (%clear-status-changed entity status-bit))))
+      (%trigger-status-condition entity)))
   t)
 
 (defun* %field-resolver (ts)
@@ -1510,18 +1561,15 @@
   "Bump DR's SAMPLE_REJECTED status (reason + instance handle) via the %notify-status
    chokepoint: set the bitmask bit, trigger the StatusCondition, and fire on_sample_rejected
    if a listener is masked for it."
-  (%notify-status dr +status-sample-rejected+
+  (%notify-status dr +status-sample-rejected+ :sample-rejected
    (lambda ()
      (let ((s (dr-sample-rejected dr)))
        (incf (sample-rejected-status-total-count s))
        (incf (sample-rejected-status-total-count-change s))
        (setf (sample-rejected-status-last-reason s) reason
              (sample-rejected-status-last-instance-handle s) handle)
-       (values t
-               (when (and (dr-listener dr) (member :sample-rejected (dr-listener-mask dr)))
-                 (let ((snapshot (copy-sample-rejected-status s)))
-                   (setf (sample-rejected-status-total-count-change s) 0)
-                   (lambda () (on-sample-rejected (dr-listener dr) dr snapshot))))))))
+       (values t (copy-sample-rejected-status s)
+               (lambda () (setf (sample-rejected-status-total-count-change s) 0))))))
   t)
 
 (defun* %reader-instance-rec (dr handle)
@@ -2564,7 +2612,7 @@
   "Bump DR's SUBSCRIPTION_MATCHED status via the %notify-status chokepoint (bitmask bit +
    StatusCondition + listener): if a listener is masked, fire on-subscription-matched with a
    snapshot (resetting the *_change counters per DDS)."
-  (%notify-status dr +status-subscription-matched+
+  (%notify-status dr +status-subscription-matched+ :subscription-matched
    (lambda ()
      (let ((s (dr-sub-matched dr)))
        (incf (subscription-matched-status-total-count s))
@@ -2572,12 +2620,9 @@
        (incf (subscription-matched-status-current-count s))
        (incf (subscription-matched-status-current-count-change s))
        (setf (subscription-matched-status-last-publication-handle s) handle)
-       (values t
-               (when (and (dr-listener dr) (member :subscription-matched (dr-listener-mask dr)))
-                 (let ((snapshot (copy-subscription-matched-status s)))
-                   (setf (subscription-matched-status-total-count-change s) 0
-                         (subscription-matched-status-current-count-change s) 0)
-                   (lambda () (on-subscription-matched (dr-listener dr) dr snapshot))))))))
+       (values t (copy-subscription-matched-status s)
+               (lambda () (setf (subscription-matched-status-total-count-change s) 0
+                                (subscription-matched-status-current-count-change s) 0))))))
   t)
 
 (defun* %writer-matched (dw handle)
@@ -2585,7 +2630,7 @@
   "Bump DW's PUBLICATION_MATCHED status via the %notify-status chokepoint (bitmask bit +
    StatusCondition + listener): if a listener is masked, fire on-publication-matched with a
    snapshot (resetting the *_change counters per DDS)."
-  (%notify-status dw +status-publication-matched+
+  (%notify-status dw +status-publication-matched+ :publication-matched
    (lambda ()
      (let ((s (dw-pub-matched dw)))
        (incf (publication-matched-status-total-count s))
@@ -2593,12 +2638,9 @@
        (incf (publication-matched-status-current-count s))
        (incf (publication-matched-status-current-count-change s))
        (setf (publication-matched-status-last-subscription-handle s) handle)
-       (values t
-               (when (and (dw-listener dw) (member :publication-matched (dw-listener-mask dw)))
-                 (let ((snapshot (copy-publication-matched-status s)))
-                   (setf (publication-matched-status-total-count-change s) 0
-                         (publication-matched-status-current-count-change s) 0)
-                   (lambda () (on-publication-matched (dw-listener dw) dw snapshot))))))))
+       (values t (copy-publication-matched-status s)
+               (lambda () (setf (publication-matched-status-total-count-change s) 0
+                                (publication-matched-status-current-count-change s) 0))))))
   t)
 
 (defun* %reader-unmatched (dr handle)
@@ -2609,19 +2651,16 @@
    UNCHANGED (monotonic, dds_rtf2_dcps.idl §174). Routes through the %notify-status chokepoint
    (bitmask bit + StatusCondition + listener): fires on-subscription-matched if masked (snapshot
    + reset the *_change counters per DDS), then wakes the reader's WaitSets."
-  (%notify-status dr +status-subscription-matched+
+  (%notify-status dr +status-subscription-matched+ :subscription-matched
    (lambda ()
      (let ((s (dr-sub-matched dr)))
        (when (plusp (subscription-matched-status-current-count s))
          (decf (subscription-matched-status-current-count s)))
        (decf (subscription-matched-status-current-count-change s))
        (setf (subscription-matched-status-last-publication-handle s) handle)
-       (values t
-               (when (and (dr-listener dr) (member :subscription-matched (dr-listener-mask dr)))
-                 (let ((snapshot (copy-subscription-matched-status s)))
-                   (setf (subscription-matched-status-total-count-change s) 0
-                         (subscription-matched-status-current-count-change s) 0)
-                   (lambda () (on-subscription-matched (dr-listener dr) dr snapshot))))))))
+       (values t (copy-subscription-matched-status s)
+               (lambda () (setf (subscription-matched-status-total-count-change s) 0
+                                (subscription-matched-status-current-count-change s) 0))))))
   t)
 
 (defun* %reader-liveliness-changed (dr handle alive-p)
@@ -2634,7 +2673,7 @@
    %notify-status chokepoint (bitmask bit + StatusCondition + listener): fires
    on-liveliness-changed if masked (snapshot + reset the *_change counters per DDS), then
    wakes the reader's WaitSets."
-  (%notify-status dr +status-liveliness-changed+
+  (%notify-status dr +status-liveliness-changed+ :liveliness-changed
    (lambda ()
      (let ((s (dr-liv-changed dr)))
        (if alive-p
@@ -2651,12 +2690,9 @@
              (decf (liveliness-changed-status-alive-count-change s))
              (incf (liveliness-changed-status-not-alive-count-change s))))
        (setf (liveliness-changed-status-last-publication-handle s) handle)
-       (values t
-               (when (and (dr-listener dr) (member :liveliness-changed (dr-listener-mask dr)))
-                 (let ((snapshot (copy-liveliness-changed-status s)))
-                   (setf (liveliness-changed-status-alive-count-change s) 0
-                         (liveliness-changed-status-not-alive-count-change s) 0)
-                   (lambda () (on-liveliness-changed (dr-listener dr) dr snapshot))))))))
+       (values t (copy-liveliness-changed-status s)
+               (lambda () (setf (liveliness-changed-status-alive-count-change s) 0
+                                (liveliness-changed-status-not-alive-count-change s) 0))))))
   t)
 
 (defun* %lease-internal-units (duration)
@@ -2685,19 +2721,16 @@
              (lease (%lease-internal-units dur)))
         (when (and (< (dds.qos:qos-duration-sec dur) #x7fffffff)
                    (plusp lease))
-          (%notify-status dw +status-liveliness-lost+
+          (%notify-status dw +status-liveliness-lost+ :liveliness-lost
            (lambda ()
              (if (and (dw-alive-p dw) (> (- now (dw-last-assertion dw)) lease))
                  (let ((s (dw-liv-lost dw)))
                    (incf (liveliness-lost-status-total-count s))
                    (incf (liveliness-lost-status-total-count-change s))
                    (setf (dw-alive-p dw) nil)
-                   (values t
-                           (when (and (dw-listener dw) (member :liveliness-lost (dw-listener-mask dw)))
-                             (let ((snapshot (copy-liveliness-lost-status s)))
-                               (setf (liveliness-lost-status-total-count-change s) 0)
-                               (lambda () (on-liveliness-lost (dw-listener dw) dw snapshot))))))
-                 (values nil nil)))))))
+                   (values t (copy-liveliness-lost-status s)
+                           (lambda () (setf (liveliness-lost-status-total-count-change s) 0))))
+                 (values nil nil nil)))))))
     t))
 
 (defun* %writer-liveliness-sweep (p)
@@ -2727,19 +2760,16 @@
    unmatched remote's GUID, total_count UNCHANGED (monotonic, dds_rtf2_dcps.idl §165).
    Routes through the %notify-status chokepoint (bitmask bit + StatusCondition + listener):
    fires on-publication-matched if masked (snapshot + reset the *_change counters)."
-  (%notify-status dw +status-publication-matched+
+  (%notify-status dw +status-publication-matched+ :publication-matched
    (lambda ()
      (let ((s (dw-pub-matched dw)))
        (when (plusp (publication-matched-status-current-count s))
          (decf (publication-matched-status-current-count s)))
        (decf (publication-matched-status-current-count-change s))
        (setf (publication-matched-status-last-subscription-handle s) handle)
-       (values t
-               (when (and (dw-listener dw) (member :publication-matched (dw-listener-mask dw)))
-                 (let ((snapshot (copy-publication-matched-status s)))
-                   (setf (publication-matched-status-total-count-change s) 0
-                         (publication-matched-status-current-count-change s) 0)
-                   (lambda () (on-publication-matched (dw-listener dw) dw snapshot))))))))
+       (values t (copy-publication-matched-status s)
+               (lambda () (setf (publication-matched-status-total-count-change s) 0
+                                (publication-matched-status-current-count-change s) 0))))))
   t)
 
 (defun* %apply-requested-incompatible (s bad)
@@ -2772,17 +2802,15 @@
   "Bump DR's REQUESTED_INCOMPATIBLE_QOS status via the %notify-status chokepoint (bitmask bit
    + StatusCondition + listener): fire on-requested-incompatible-qos if masked (snapshot
    deep-copying the policies)."
-  (%notify-status dr +status-requested-incompatible-qos+
+  (%notify-status dr +status-requested-incompatible-qos+ :requested-incompatible-qos
    (lambda ()
      (let ((s (dr-req-incompat dr)))
        (%apply-requested-incompatible s bad)
-       (values t
-               (when (and (dr-listener dr) (member :requested-incompatible-qos (dr-listener-mask dr)))
-                 (let ((snapshot (copy-requested-incompatible-qos-status s)))
-                   (setf (requested-incompatible-qos-status-policies snapshot)
-                         (mapcar #'copy-qos-policy-count (requested-incompatible-qos-status-policies s)))
-                   (setf (requested-incompatible-qos-status-total-count-change s) 0)
-                   (lambda () (on-requested-incompatible-qos (dr-listener dr) dr snapshot))))))))
+       (let ((snapshot (copy-requested-incompatible-qos-status s)))
+         (setf (requested-incompatible-qos-status-policies snapshot)
+               (mapcar #'copy-qos-policy-count (requested-incompatible-qos-status-policies s)))
+         (values t snapshot
+                 (lambda () (setf (requested-incompatible-qos-status-total-count-change s) 0)))))))
   t)
 
 (defun* %writer-incompatible (dw bad)
@@ -2790,17 +2818,15 @@
   "Bump DW's OFFERED_INCOMPATIBLE_QOS status via the %notify-status chokepoint (bitmask bit +
    StatusCondition + listener): fire on-offered-incompatible-qos if masked (snapshot
    deep-copying the policies)."
-  (%notify-status dw +status-offered-incompatible-qos+
+  (%notify-status dw +status-offered-incompatible-qos+ :offered-incompatible-qos
    (lambda ()
      (let ((s (dw-off-incompat dw)))
        (%apply-offered-incompatible s bad)
-       (values t
-               (when (and (dw-listener dw) (member :offered-incompatible-qos (dw-listener-mask dw)))
-                 (let ((snapshot (copy-offered-incompatible-qos-status s)))
-                   (setf (offered-incompatible-qos-status-policies snapshot)
-                         (mapcar #'copy-qos-policy-count (offered-incompatible-qos-status-policies s)))
-                   (setf (offered-incompatible-qos-status-total-count-change s) 0)
-                   (lambda () (on-offered-incompatible-qos (dw-listener dw) dw snapshot))))))))
+       (let ((snapshot (copy-offered-incompatible-qos-status s)))
+         (setf (offered-incompatible-qos-status-policies snapshot)
+               (mapcar #'copy-qos-policy-count (offered-incompatible-qos-status-policies s)))
+         (values t snapshot
+                 (lambda () (setf (offered-incompatible-qos-status-total-count-change s) 0)))))))
   t)
 
 ;;; ---- get_*_status (app thread): snapshot + reset the *_change counters (DDS 1.4) ----
@@ -2983,16 +3009,13 @@
    + listener); fire on_inconsistent_topic if masked."
   (let ((tp (%find-topic p name)))
     (when tp
-      (%notify-status tp +status-inconsistent-topic+
+      (%notify-status tp +status-inconsistent-topic+ :inconsistent-topic
        (lambda ()
          (let ((s (topic-inconsistent-status tp)))
            (incf (inconsistent-topic-status-total-count s))
            (incf (inconsistent-topic-status-total-count-change s))
-           (values t
-                   (when (and (topic-listener-obj tp) (member :inconsistent-topic (topic-listener-mask tp)))
-                     (let ((snapshot (copy-inconsistent-topic-status s)))
-                       (setf (inconsistent-topic-status-total-count-change s) 0)
-                       (lambda () (on-inconsistent-topic (topic-listener-obj tp) tp snapshot))))))))))
+           (values t (copy-inconsistent-topic-status s)
+                   (lambda () (setf (inconsistent-topic-status-total-count-change s) 0))))))))
   t)
 
 (defun* get-inconsistent-topic-status (tp)

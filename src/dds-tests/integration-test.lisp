@@ -2129,12 +2129,14 @@
                  until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
                  do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
            (loop repeat 60 until (assoc :pub-matched (cap-snapshot wl)) do (sleep 0.02))
-           ;; writer path: (d) listener + (b) bitmask bit
+           ;; writer path: (d) listener fired; the writer's own listener HANDLED the status, so the
+           ;; §2.2.4.1 reset-on-listener-invocation (S3.T2) clears the writer's bitmask bit — the
+           ;; unhandled reader (no listener) below is where (b) the set-bit is asserted.
            (%check :notify-listener (and (assoc :pub-matched (cap-snapshot wl)) t)
                    "(d) on_publication_matched must fire through %notify-status")
-           (%check :notify-writer-bit
-                   (logtest dds.dcps:+status-publication-matched+ (dds.dcps:get-status-changes dw))
-                   "(b) %notify-status must set PUBLICATION_MATCHED in the writer's bitmask")
+           (%check :notify-writer-bit-reset
+                   (not (logtest dds.dcps:+status-publication-matched+ (dds.dcps:get-status-changes dw)))
+                   "(b') a writer-listener that handled PUBLICATION_MATCHED clears the bit (§2.2.4.1)")
            ;; reader path (no listener): (b) bit + (c) condition + (a) struct
            (%check :notify-reader-bit
                    (logtest dds.dcps:+status-subscription-matched+ (dds.dcps:get-status-changes dr))
@@ -2223,6 +2225,61 @@
            (%check :odor-default (null (dds.dcps:on-data-on-readers subl sub))
                    "on_data_on_readers must have a no-op default method"))
       (dds.dcps:delete-participant p))
+    t))
+
+(defclass capturing-participant-listener (capture-mixin dds.dcps:domain-participant-listener) ())
+(defmethod dds.dcps:on-publication-matched ((l capturing-participant-listener) writer status)
+  (declare (ignore writer))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :pub-matched status) (cap-hits l))))
+(defmethod dds.dcps:on-subscription-matched ((l capturing-participant-listener) reader status)
+  (declare (ignore reader))
+  (dds.pal:with-lock ((cap-lock l)) (push (cons :sub-matched status) (cap-hits l))))
+
+(defun* run-dcps-listener-propagation-test ()
+    (function () t)
+  "S3.T2 (DDS 1.4 §2.2.4.1): %notify-status walks Entity -> parent (Publisher/Subscriber) ->
+   DomainParticipant, delivering a status to the MOST SPECIFIC ENABLED listener and stopping.
+   A participant listener catches on_publication_matched when the writer has no listener; a
+   reader whose own listener is masked OUT of SUBSCRIPTION_MATCHED lets that status propagate to
+   the participant listener (its own listener does not fire). A status a listener handled clears
+   the SOURCE entity's status-changed bit and leaves its StatusCondition untriggered (the
+   reset-on-listener-invocation half of §2.2.4.1)."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain)))
+        (ppl (make-instance 'capturing-participant-listener))
+        (rpl (make-instance 'capturing-participant-listener))
+        (rl (make-instance 'capturing-reader-listener)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "PropTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "PropTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (wsc (dds.dcps:get-statuscondition dw)))
+           (dds.dcps:set-listener p1 ppl '(:publication-matched)) ; writer has no listener -> participant catches
+           (dds.dcps:set-listener dr rl '(:sample-rejected))       ; reader listener masked OUT of subscription-matched
+           (dds.dcps:set-listener p2 rpl '(:subscription-matched)) ; -> propagates to the participant
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (loop repeat 80
+                 until (and (assoc :pub-matched (cap-snapshot ppl))
+                            (assoc :sub-matched (cap-snapshot rpl)))
+                 do (sleep 0.02))
+           (%check :prop-writer-to-participant (and (assoc :pub-matched (cap-snapshot ppl)) t)
+                   "on_publication_matched must propagate to the participant listener when the writer has none")
+           (%check :prop-reader-masked-to-participant (and (assoc :sub-matched (cap-snapshot rpl)) t)
+                   "on_subscription_matched must propagate to the participant when the reader listener masks it out")
+           (%check :prop-reader-own-not-fired (null (assoc :sub-matched (cap-snapshot rl)))
+                   "the reader's own listener, masked out of subscription-matched, must NOT fire it")
+           (%check :prop-bit-reset
+                   (not (logtest dds.dcps:+status-publication-matched+ (dds.dcps:get-status-changes dw)))
+                   "a listener-handled status must clear the source entity's status-changed bit (§2.2.4.1)")
+           (%check :prop-sc-cleared (null (dds.dcps:condition-trigger-value wsc))
+                   "a listener-handled status must leave the source entity's StatusCondition untriggered (§2.2.4.1)"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
     t))
 
 (defun* run-dcps-qos-immutability-table-test ()
