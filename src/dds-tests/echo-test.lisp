@@ -3846,6 +3846,7 @@
                  ("dcps-status-structs"      . run-dcps-status-structs-test)
                  ("dcps-status-changes"      . run-dcps-status-changes-test)
                  ("dcps-notify-status"       . run-dcps-notify-status-test)
+                 ("dcps-entity-statuscondition" . run-dcps-entity-statuscondition-test)
                  ("lease-unmatch"            . run-lease-unmatch-test)
                  ("liveliness-changed"       . run-liveliness-changed-test)
                  ("liveliness-lost"          . run-liveliness-lost-test)

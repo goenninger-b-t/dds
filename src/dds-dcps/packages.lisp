@@ -48,6 +48,8 @@
            #:make-guard-condition #:set-trigger-value #:create-readcondition
            #:create-querycondition #:qc-query-fn #:read-w-condition #:take-w-condition
            #:make-status-condition #:make-wait-set
+           ;; WP-DCPS-API-COMPLETION S0.T4: entity-owned StatusCondition + enabled-statuses
+           #:get-statuscondition #:set-enabled-statuses #:get-enabled-statuses
            #:attach-condition #:detach-condition #:wait-set-wait #:condition-trigger-value
            ;; Communication statuses (FR-DCPS-3)
            #:subscription-matched-status #:publication-matched-status

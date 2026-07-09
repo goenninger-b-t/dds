@@ -44,7 +44,7 @@
 
 (defclass status-condition (wait-condition)
   ((entity :initarg :entity :reader sc-entity)
-   (mask :initarg :mask :initform '(:data-available) :reader sc-mask))
+   (mask :initarg :mask :initform '(:data-available) :accessor sc-mask))
   (:documentation "Triggers when an enabled status named in MASK is active on ENTITY.
    v1 supports :data-available (reader has unread samples) plus the change-driven
    statuses :subscription-matched / :requested-incompatible-qos (reader) and
@@ -123,6 +123,45 @@
     (when (typep entity 'data-reader) (push c (dr-conditions entity)))
     c))
 
+(defun* %default-enabled-statuses (entity)
+    (function (entity) list)
+  "The default enabled_statuses for ENTITY's StatusCondition — the DDS 1.4 default is the full
+   set of communication statuses that apply to the entity kind (dds_rtf2_dcps.idl §684): a
+   DataReader's read + reader statuses, a DataWriter's writer statuses, a Topic's
+   INCONSISTENT_TOPIC. Kinds whose firing is a later slice (deadline/sample-lost, S4) are
+   included so enabling them needs no API change; they simply stay inactive until they fire."
+  (typecase entity
+    (data-reader '(:data-available :subscription-matched :requested-incompatible-qos
+                   :sample-rejected :liveliness-changed :requested-deadline-missed :sample-lost))
+    (data-writer '(:publication-matched :offered-incompatible-qos :liveliness-lost
+                   :offered-deadline-missed))
+    (topic '(:inconsistent-topic))
+    (t '())))
+
+(defun* get-statuscondition (entity)
+    (function (entity) status-condition)
+  "DDS Entity::get_statuscondition (dds_rtf2_dcps.idl §682): ENTITY's own StatusCondition,
+   created lazily on first call with all applicable statuses enabled (the DDS default
+   enabled_statuses is the full set) and bound to ENTITY's status-changes bitmask. Idempotent —
+   subsequent calls return the same object."
+  (or (%entity-owned-status-condition entity)
+      (setf (%entity-owned-status-condition entity)
+            (make-status-condition entity :mask (%default-enabled-statuses entity)))))
+
+(defun* set-enabled-statuses (sc mask)
+    (function (status-condition list) status-condition)
+  "DDS StatusCondition::set_enabled_statuses (dds_rtf2_dcps.idl §288): restrict which statuses
+   (a list of DDS status keywords) make SC trigger. Its trigger becomes the entity's
+   status-changes bitmask ∧ MASK (plus the level-based :data-available)."
+  (setf (sc-mask sc) mask)
+  sc)
+
+(defun* get-enabled-statuses (sc)
+    (function (status-condition) list)
+  "DDS StatusCondition::get_enabled_statuses (dds_rtf2_dcps.idl §287): the statuses currently
+   enabled on SC (a list of DDS status keywords)."
+  (sc-mask sc))
+
 (defun* %count-matching (dr states)
     (function (data-reader list) (integer 0))
   "Drain newly-received samples and count those whose sample-state is in STATES."
@@ -149,31 +188,16 @@
   (plusp (%count-matching-query (rc-reader c) (rc-states c) (qc-query-fn c))))
 (defun* %status-active-p (entity kind)
     (function (entity keyword) t)
-  "Whether the communication status KIND is currently active on ENTITY (the trigger
-   predicate for a StatusCondition). :data-available follows unread samples; the
-   matched/incompatible kinds follow their *_change counter (reset by get_*_status)."
-  (case kind
-    (:data-available
-     (and (typep entity 'data-reader) (plusp (%count-matching entity '(:not-read)))))
-    (:subscription-matched
-     (and (typep entity 'data-reader)
-          (plusp (subscription-matched-status-total-count-change (dr-sub-matched entity)))))
-    (:requested-incompatible-qos
-     (and (typep entity 'data-reader)
-          (plusp (requested-incompatible-qos-status-total-count-change (dr-req-incompat entity)))))
-    (:sample-rejected
-     (and (typep entity 'data-reader)
-          (plusp (sample-rejected-status-total-count-change (dr-sample-rejected entity)))))
-    (:publication-matched
-     (and (typep entity 'data-writer)
-          (plusp (publication-matched-status-total-count-change (dw-pub-matched entity)))))
-    (:offered-incompatible-qos
-     (and (typep entity 'data-writer)
-          (plusp (offered-incompatible-qos-status-total-count-change (dw-off-incompat entity)))))
-    (:inconsistent-topic
-     (and (typep entity 'topic)
-          (plusp (inconsistent-topic-status-total-count-change (topic-inconsistent-status entity)))))
-    (t nil)))
+  "Whether the communication status KIND is currently active on ENTITY (the trigger predicate
+   for a StatusCondition). :data-available is level-based on unread samples; every other kind is
+   active iff its StatusChangedFlag bit is set in ENTITY's status-changes bitmask — set by the
+   %notify-status chokepoint when the status fires, cleared by the matching get_*_status
+   (read-communication-status reset, DDS 1.4 §2.2.4.1 / §2.2.2.1.9). This is the entity
+   bitmask ∧ the StatusCondition's enabled_statuses (the caller intersects with sc-mask)."
+  (if (eq kind :data-available)
+      (and (typep entity 'data-reader) (plusp (%count-matching entity '(:not-read))) t)
+      (let ((bit (cdr (assoc kind *status-kind->bit*))))
+        (and bit (logtest bit (%entity-status-changes entity)) t))))
 
 (defmethod condition-trigger-value ((c status-condition))
   (and (some (lambda (kind) (%status-active-p (sc-entity c) kind)) (sc-mask c)) t))

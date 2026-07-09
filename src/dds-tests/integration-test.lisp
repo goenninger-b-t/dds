@@ -2027,6 +2027,44 @@
               "requested-deadline-missed-status fields round-trip")))
   t)
 
+(defun* run-dcps-entity-statuscondition-test ()
+    (function () t)
+  "S0.T4 (dds_rtf2_dcps.idl §682 get_statuscondition / §287-288 get/set_enabled_statuses):
+   an entity owns a single StatusCondition (get_statuscondition is idempotent) whose
+   enabled_statuses gate which statuses trigger it; a WaitSet on it wakes when an ENABLED
+   status fires and stays blocked when only a DISABLED one does."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "ScTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "ScTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (sc (dds.dcps:get-statuscondition dr))
+                (ws (dds.dcps:make-wait-set)))
+           (declare (ignore dw))
+           (%check :sc-type (typep sc 'dds.dcps:status-condition)
+                   "get_statuscondition must return a StatusCondition")
+           (%check :sc-idem (eq sc (dds.dcps:get-statuscondition dr))
+                   "get_statuscondition must return the same entity-owned StatusCondition")
+           (dds.dcps:set-enabled-statuses sc '(:publication-matched)) ; never fires on a reader
+           (%check :sc-enabled-rt (equal '(:publication-matched) (dds.dcps:get-enabled-statuses sc))
+                   "set/get_enabled_statuses must round-trip")
+           (dds.dcps:attach-condition ws sc)
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (%check :sc-disabled-no-wake (null (dds.dcps:wait-set-wait ws 0.3))
+                   "a disabled status (publication-matched on a reader) must not wake the WaitSet")
+           (dds.dcps:set-enabled-statuses sc '(:subscription-matched))
+           (%check :sc-enabled-wake (and (member sc (dds.dcps:wait-set-wait ws 1.0)) t)
+                   "enabling SUBSCRIPTION_MATCHED (already fired) must wake the WaitSet"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
 (defun* run-dcps-notify-status-test ()
     (function () t)
   "S0.T3 (dds_rtf2_dcps.idl §684 / DDS 1.4 §2.2.4.1): every communication status flows through

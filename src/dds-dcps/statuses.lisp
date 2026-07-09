@@ -38,6 +38,23 @@
 (defconstant +status-subscription-matched+       (ash 1 14)
   "DDS StatusKind bit SUBSCRIPTION_MATCHED_STATUS (dds_rtf2_dcps.idl §92).")
 
+(defparameter *status-kind->bit*
+  (list (cons :inconsistent-topic +status-inconsistent-topic+)
+        (cons :offered-deadline-missed +status-offered-deadline-missed+)
+        (cons :requested-deadline-missed +status-requested-deadline-missed+)
+        (cons :offered-incompatible-qos +status-offered-incompatible-qos+)
+        (cons :requested-incompatible-qos +status-requested-incompatible-qos+)
+        (cons :sample-lost +status-sample-lost+)
+        (cons :sample-rejected +status-sample-rejected+)
+        (cons :data-on-readers +status-data-on-readers+)
+        (cons :data-available +status-data-available+)
+        (cons :liveliness-lost +status-liveliness-lost+)
+        (cons :liveliness-changed +status-liveliness-changed+)
+        (cons :publication-matched +status-publication-matched+)
+        (cons :subscription-matched +status-subscription-matched+))
+  "Maps a DDS communication-status keyword to its StatusKind bit (dds_rtf2_dcps.idl §80-92),
+   shared by %notify-status callers and the StatusCondition trigger predicate.")
+
 ;;; ---- QosPolicyId_t (dds_rtf2_dcps.idl §363-385; DATA_REPRESENTATION from
 ;;;      xtypes-1_3-discovery-builtin-topic.idl §177) ----
 
