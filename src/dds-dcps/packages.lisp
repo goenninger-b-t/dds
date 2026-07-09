@@ -84,6 +84,19 @@
            #:liveliness-lost-status
            #:liveliness-lost-status-total-count #:liveliness-lost-status-total-count-change
            #:get-liveliness-lost-status #:assert-liveliness
+           ;; WP-DCPS-API-COMPLETION S0.T1: SAMPLE_LOST + OFFERED/REQUESTED_DEADLINE_MISSED
+           #:sample-lost-status #:make-sample-lost-status #:copy-sample-lost-status
+           #:sample-lost-status-total-count #:sample-lost-status-total-count-change
+           #:offered-deadline-missed-status #:make-offered-deadline-missed-status
+           #:copy-offered-deadline-missed-status
+           #:offered-deadline-missed-status-total-count
+           #:offered-deadline-missed-status-total-count-change
+           #:offered-deadline-missed-status-last-instance-handle
+           #:requested-deadline-missed-status #:make-requested-deadline-missed-status
+           #:copy-requested-deadline-missed-status
+           #:requested-deadline-missed-status-total-count
+           #:requested-deadline-missed-status-total-count-change
+           #:requested-deadline-missed-status-last-instance-handle
            #:durability-finalize
            ;; Listeners (FR-DCPS-2)
            #:listener #:data-reader-listener #:data-writer-listener #:topic-listener

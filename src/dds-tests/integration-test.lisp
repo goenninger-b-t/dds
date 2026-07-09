@@ -1992,6 +1992,41 @@
       (dds.dcps:delete-participant p2))
     t))
 
+;;; WP-DCPS-API-COMPLETION S0 — status/introspection foundation (DDS 1.4).
+
+(defun* run-dcps-status-structs-test ()
+    (function () t)
+  "S0.T1 (dds_rtf2_dcps.idl §99-102 / §131-135 / §137-141): the SAMPLE_LOST,
+   OFFERED_DEADLINE_MISSED and REQUESTED_DEADLINE_MISSED status structs exist as exported
+   value structs with their spec fields (total_count/total_count_change, plus
+   last_instance_handle for the two deadline statuses; the RTF2 SampleLostStatus carries no
+   SampleLostStatusKind, so no last_reason)."
+  (flet ((ext (name) (eq :external (nth-value 1 (find-symbol name "NET.GOENNINGER.DDS.DCPS")))))
+    (%check :sl-exported (ext "MAKE-SAMPLE-LOST-STATUS")
+            "make-sample-lost-status must be exported")
+    (%check :odm-exported (ext "MAKE-OFFERED-DEADLINE-MISSED-STATUS")
+            "make-offered-deadline-missed-status must be exported")
+    (%check :rdm-exported (ext "MAKE-REQUESTED-DEADLINE-MISSED-STATUS")
+            "make-requested-deadline-missed-status must be exported"))
+  (let ((sl (dds.dcps:make-sample-lost-status :total-count 3 :total-count-change 2)))
+    (%check :sl-fields (and (= 3 (dds.dcps:sample-lost-status-total-count sl))
+                            (= 2 (dds.dcps:sample-lost-status-total-count-change sl)))
+            "sample-lost-status total_count/total_count_change round-trip"))
+  (let ((h (octets 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)))
+    (let ((odm (dds.dcps:make-offered-deadline-missed-status
+                :total-count 1 :total-count-change 1 :last-instance-handle h)))
+      (%check :odm-fields (and (= 1 (dds.dcps:offered-deadline-missed-status-total-count odm))
+                               (= 1 (dds.dcps:offered-deadline-missed-status-total-count-change odm))
+                               (eq h (dds.dcps:offered-deadline-missed-status-last-instance-handle odm)))
+              "offered-deadline-missed-status fields round-trip"))
+    (let ((rdm (dds.dcps:make-requested-deadline-missed-status
+                :total-count 4 :total-count-change 4 :last-instance-handle h)))
+      (%check :rdm-fields (and (= 4 (dds.dcps:requested-deadline-missed-status-total-count rdm))
+                               (= 4 (dds.dcps:requested-deadline-missed-status-total-count-change rdm))
+                               (eq h (dds.dcps:requested-deadline-missed-status-last-instance-handle rdm)))
+              "requested-deadline-missed-status fields round-trip")))
+  t)
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a

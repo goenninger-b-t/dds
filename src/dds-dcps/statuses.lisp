@@ -131,6 +131,37 @@
   (total-count 0 :type integer)
   (total-count-change 0 :type integer))
 
+(defstruct* (sample-lost-status (:constructor make-sample-lost-status)
+                               (:copier copy-sample-lost-status))
+  "DataReader SAMPLE_LOST status (dds_rtf2_dcps.idl §99-102): total_count is the cumulative
+   number of samples that were lost (never made available to the DataReader), never
+   decremented; total_count_change accumulates the delta since the status was last read. The
+   RTF2 SampleLostStatus carries no SampleLostStatusKind, so there is no last_reason field."
+  (total-count 0 :type integer)
+  (total-count-change 0 :type integer))
+
+(defstruct* (offered-deadline-missed-status (:constructor make-offered-deadline-missed-status)
+                                           (:copier copy-offered-deadline-missed-status))
+  "DataWriter OFFERED_DEADLINE_MISSED status (dds_rtf2_dcps.idl §131-135): the local writer
+   failed to write a sample for an instance within its offered DEADLINE period. total_count is
+   the cumulative number of missed deadlines (monotonic); total_count_change accumulates the
+   delta since the status was last read; last_instance_handle is the most recently missed
+   instance's 16-octet handle."
+  (total-count 0 :type integer)
+  (total-count-change 0 :type integer)
+  (last-instance-handle nil :type (or null (array (unsigned-byte 8) (*)))))
+
+(defstruct* (requested-deadline-missed-status (:constructor make-requested-deadline-missed-status)
+                                             (:copier copy-requested-deadline-missed-status))
+  "DataReader REQUESTED_DEADLINE_MISSED status (dds_rtf2_dcps.idl §137-141): no sample was
+   received for an instance within the reader's requested DEADLINE period. total_count is the
+   cumulative number of missed deadlines (monotonic); total_count_change accumulates the delta
+   since the status was last read; last_instance_handle is the most recently missed instance's
+   16-octet handle."
+  (total-count 0 :type integer)
+  (total-count-change 0 :type integer)
+  (last-instance-handle nil :type (or null (array (unsigned-byte 8) (*)))))
+
 (defstruct* (qos-policy-count (:constructor make-qos-policy-count (policy-id count))
                              (:copier copy-qos-policy-count))
   "DDS QosPolicyCount (dds_rtf2_dcps.idl §143): a policy id + how many times it failed."
