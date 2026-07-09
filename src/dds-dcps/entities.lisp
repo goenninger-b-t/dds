@@ -468,6 +468,85 @@
    built-in policy defaults. Read/written by get/set_default_participant_qos and applied by
    create_participant when no explicit :qos is supplied.")
 
+;;; ---- WP-DCPS-API-COMPLETION S2.T1: the DomainParticipantFactory singleton (DDS 1.4 §2.2.2.2.2) ----
+
+(defclass domain-participant-factory ()
+  ((participants :initform '() :accessor dpf-participants)
+   (autoenable :initform t :accessor dpf-autoenable)
+   (lock :initform (dds.pal:make-lock "dpf") :accessor dpf-lock))
+  (:documentation "DDS 1.4 DomainParticipantFactory (§2.2.2.2.2): the process-wide singleton
+   entry point that creates, looks up and deletes DomainParticipants and holds the factory-scope
+   defaults. PARTICIPANTS is the live registry (create_participant registers, delete_participant
+   unregisters), read by lookup_participant. AUTOENABLE is the factory's ENTITY_FACTORY
+   autoenable_created_entities policy (§2.2.3.23) — TRUE (the spec default) auto-enables each
+   participant at create_participant, FALSE creates it disabled until enable() is called. The
+   DomainParticipantFactory is NOT itself a DDS Entity (§2.2.2.2.2), so it carries no QoS/status/
+   listener beyond ENTITY_FACTORY. The default participant QoS lives in *default-participant-qos*
+   (S1), which this factory logically owns. LOCK guards the registry against concurrent creates."))
+
+(defvar *participant-factory* nil
+  "The lazily-created DomainParticipantFactory process singleton (DDS 1.4 §2.2.2.2.2
+   get_instance). NIL until the first get-participant-factory / get-instance call.")
+
+(defvar *participant-factory-init-lock* (dds.pal:make-lock "dpf-singleton")
+  "The lock guarding the one-time lazy construction of *participant-factory* so two threads
+   racing the first get_instance still observe a SINGLE factory (DDS 1.4 §2.2.2.2.2).")
+
+(defun* get-participant-factory ()
+    (function () domain-participant-factory)
+  "DomainParticipantFactory::get_instance (DDS 1.4 §2.2.2.2.2) — return the process-wide
+   DomainParticipantFactory singleton, constructing it on first use. Every call returns the SAME
+   object (double-checked under *participant-factory-init-lock*)."
+  (or *participant-factory*
+      (dds.pal:with-lock (*participant-factory-init-lock*)
+        (or *participant-factory*
+            (setf *participant-factory* (make-instance 'domain-participant-factory))))))
+
+(defun* get-instance ()
+    (function () domain-participant-factory)
+  "DomainParticipantFactory::get_instance (DDS 1.4 §2.2.2.2.2) — the spec-named alias for
+   get-participant-factory; returns the one process-wide factory singleton."
+  (get-participant-factory))
+
+(defun* participant-factory-autoenable-p (factory)
+    (function (domain-participant-factory) boolean)
+  "The factory's ENTITY_FACTORY autoenable_created_entities policy (DDS 1.4 §2.2.3.23): T (the
+   spec default) means create_participant auto-enables the new participant; NIL creates it
+   disabled until enable() is called."
+  (and (dpf-autoenable factory) t))
+
+(defun* set-participant-factory-autoenable (factory enable)
+    (function (domain-participant-factory t) (member :ok))
+  "Set the factory's ENTITY_FACTORY autoenable_created_entities policy (DDS 1.4 §2.2.3.23;
+   DomainParticipantFactory::set_qos with only ENTITY_FACTORY) — ENABLE non-NIL auto-enables
+   participants at create_participant, NIL creates them disabled. ENTITY_FACTORY is mutable, so
+   this always succeeds (:ok); it governs only participants created AFTER the call."
+  (setf (dpf-autoenable factory) (and enable t))
+  +retcode-ok+)
+
+(defun* %factory-register-participant (factory p)
+    (function (domain-participant-factory domain-participant) domain-participant)
+  "Register participant P in FACTORY's live registry (DDS 1.4 §2.2.2.2.2 create_participant),
+   lock-guarded; returns P."
+  (dds.pal:with-lock ((dpf-lock factory))
+    (push p (dpf-participants factory)))
+  p)
+
+(defun* %factory-unregister-participant (factory p)
+    (function (domain-participant-factory domain-participant) (eql t))
+  "Remove participant P from FACTORY's registry (DDS 1.4 §2.2.2.2.2 delete_participant),
+   lock-guarded + idempotent."
+  (dds.pal:with-lock ((dpf-lock factory))
+    (setf (dpf-participants factory) (remove p (dpf-participants factory))))
+  t)
+
+(defun* lookup-participant (factory domain)
+    (function (domain-participant-factory (integer 0)) (or null domain-participant))
+  "DomainParticipantFactory::lookup_participant (DDS 1.4 §2.2.2.2.2) — return one of FACTORY's
+   registered participants bound to DOMAIN, or NIL if none. Lock-guarded snapshot of the registry."
+  (dds.pal:with-lock ((dpf-lock factory))
+    (find domain (dpf-participants factory) :key #'dp-domain :test #'=)))
+
 (defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1") (peers nil)
                                  (port 0)
                                  (identity nil) (permissions-ca nil) (governance nil) (permissions nil))
@@ -547,6 +626,7 @@
             (%install-access-control p access-handle))
           (dds.disc:start-node node)
           (setf installed t)   ; construction complete; p owns the access-handle via dp-access-state
+          (%factory-register-participant (get-participant-factory) p)   ; S2.T1: the free-fn is the factory shim (DDS 1.4 §2.2.2.2.2)
           p)
       ;; Free the access-handle on a non-local exit ONLY if not yet installed (install transfers ownership).
       (when (and access-handle (not installed))
@@ -560,6 +640,7 @@
    the views' SAP is still mapped (no use-after-free at teardown). A no-op for readers with no loans (the common
    case: ZC off / non-FlatData)."
   (dolist (dr (%participant-readers p)) (return-all-loans dr))
+  (%factory-unregister-participant (get-participant-factory) p)   ; S2.T1: the free-fn is the factory delete_participant shim (DDS 1.4 §2.2.2.2.2)
   (dds.disc:stop-node (dp-node p))
   ;; ADR-0034 secret hygiene: zeroize + free every §9.5.2 KeyMaterial secret this participant holds in its
   ;; crypto-manager. AFTER stop-node (the receiver thread is joined -> the data path is quiesced -> the secret

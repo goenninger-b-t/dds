@@ -2344,6 +2344,34 @@
               (eq :ok (dds.dcps:set-qos e (dds.qos:make-qos :deadline (dds.qos:make-qos-duration 1 0))))
               "post-enable set_qos of DEADLINE (mutable) on a :qos-NIL entity must return :ok"))))
 
+(defun* run-dcps-factory-test ()
+    (function () t)
+  "S2.T1 (DDS 1.4 §2.2.2.2.2 DomainParticipantFactory): the factory is a process singleton
+   (two get_instance calls return the SAME object); it creates/looks-up/deletes participants
+   (a created participant is found by lookup_participant on its domain, and delete removes it so
+   lookup returns NIL); and its ENTITY_FACTORY autoenable_created_entities policy (§2.2.3.23)
+   round-trips through get/set. The existing create-participant free function is the shim that
+   registers the participant with the factory."
+  (let ((f1 (dds.dcps:get-participant-factory))
+        (f2 (dds.dcps:get-instance)))
+    (%check :fac-singleton (eq f1 f2) "get_instance returns the one process-wide factory singleton")
+    (let ((dom (test-domain)))
+      (let ((p (dds.dcps:create-participant :domain dom)))
+        (unwind-protect
+             (progn
+               (%check :fac-lookup (eq p (dds.dcps:lookup-participant f1 dom))
+                       "lookup_participant finds the participant created on its domain")
+               (%check :fac-autoenable-default (dds.dcps:participant-factory-autoenable-p f1)
+                       "autoenable_created_entities defaults to TRUE (DDS 1.4 §2.2.3.23)")
+               (dds.dcps:set-participant-factory-autoenable f1 nil)
+               (%check :fac-autoenable-set (not (dds.dcps:participant-factory-autoenable-p f1))
+                       "set of ENTITY_FACTORY autoenable_created_entities round-trips")
+               (dds.dcps:set-participant-factory-autoenable f1 t))
+          (dds.dcps:delete-participant p))
+        (%check :fac-delete-unregisters (null (dds.dcps:lookup-participant f1 dom))
+                "delete_participant unregisters it from the factory (lookup returns NIL)"))))
+  t)
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a

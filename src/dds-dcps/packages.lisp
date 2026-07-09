@@ -18,6 +18,10 @@
            #:create-participant #:delete-participant
            #:create-publisher #:create-subscriber #:create-topic
            #:create-datawriter #:create-datareader
+           ;; WP-DCPS-API-COMPLETION S2.T1: DomainParticipantFactory singleton (DDS 1.4 §2.2.2.2.2)
+           #:domain-participant-factory #:get-participant-factory #:get-instance
+           #:lookup-participant
+           #:participant-factory-autoenable-p #:set-participant-factory-autoenable
            #:write-sample #:read-samples #:take-samples #:samples-available
            ;; WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017)
            #:take-loaned #:read-loaned #:return-loan #:return-all-loans
