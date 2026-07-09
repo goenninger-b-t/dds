@@ -120,6 +120,19 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 | `dds.dcps:entity-qos` (`e`) | The entity's QoS object. |
 | `dds.dcps:entity-enabled-p` (`e`) | The entity's enabled flag. |
 
+### QoS management (DDS 1.4 §2.2.4.1 / §2.2.3, WP-DCPS-API-COMPLETION S1)
+
+| Symbol | Description |
+|---|---|
+| `dds.dcps:get-qos` (`entity`) | `Entity::get_qos` (DDS 1.4 §2.2.4.1) — return a **copy** of the entity's effective QoS. An entity created without an explicit QoS reports a fresh default. |
+| `dds.dcps:set-qos` (`entity qos`) | `Entity::set_qos` (DDS 1.4 §2.2.4.1) — install `qos`, returning `:ok`, `:inconsistent-policy` (the §2.2.3.18/§2.2.3.19 cross-policy rules failed), or `:immutable-policy` (a §2.2.3-immutable policy changed while the entity is enabled). On a non-`:ok` code the QoS is left unchanged. |
+| `dds.dcps:qos-policy-immutable-p` (`policy`) | `T` iff the QoS `policy` keyword is immutable-after-`enable` per the DDS 1.4 §2.2.3 per-policy "changeable" column (immutable: `:reliability` `:durability` `:presentation` `:ownership` `:liveliness` `:destination-order` `:history` `:resource-limits` `:data-representation` `:type-consistency`; every other policy is changeable). |
+| `dds.dcps:+retcode-immutable-policy+` / `+retcode-inconsistent-policy+` | The `set_qos` return codes `:immutable-policy` / `:inconsistent-policy` (DDS 1.4 §2.2.4.4). |
+| `dds.dcps:get-default-datawriter-qos` / `set-default-datawriter-qos` (`pub [qos]`) | Publisher default DataWriter QoS (DDS 1.4 §2.2.2.4.1), applied by `create-datawriter` when no explicit `:qos` is given. `set-` returns `:ok`/`:inconsistent-policy`. |
+| `dds.dcps:get-default-datareader-qos` / `set-default-datareader-qos` (`sub [qos]`) | Subscriber default DataReader QoS (DDS 1.4 §2.2.2.5.1), applied by `create-datareader`. |
+| `dds.dcps:get-default-topic-qos` / `-publisher-qos` / `-subscriber-qos` (`p [qos]`) | DomainParticipant default Topic/Publisher/Subscriber QoS (DDS 1.4 §2.2.2.2.2), applied by `create-topic`/`create-publisher`/`create-subscriber`. |
+| `dds.dcps:get-default-participant-qos` / `set-default-participant-qos` (`[qos]`) | The DomainParticipantFactory default participant QoS (DDS 1.4 §2.2.2.2.2), applied by `create-participant`. Provisional module-level home until S2's factory singleton formalizes it. |
+
 ### Write / read / take + SampleInfo
 
 | Symbol | Description |
