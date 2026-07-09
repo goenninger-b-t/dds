@@ -2460,6 +2460,57 @@
         (dds.dcps:delete-participant p))))
   t)
 
+(defun* run-dcps-delete-child-test ()
+    (function () t)
+  "S2.T4 (DDS 1.4 §2.2.2.4.1.5 / §2.2.2.5.1.5 / §2.2.2.2.1.6/8/10 delete_datawriter / delete_datareader /
+   delete_publisher / delete_subscriber / delete_topic): a non-empty delete is refused with
+   :precondition-not-met (a Publisher with a live DataWriter, a Subscriber with a live DataReader, a Topic
+   still referenced by an endpoint); a child delete tears the endpoint down (removed from the parent AND
+   from the disc-node's local-endpoint list, so discovery no longer announces it); a repeat delete of an
+   already-removed child returns :precondition-not-met."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((node (dds.dcps::dp-node p))
+                (tp (dds.dcps:create-topic p "DelTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p))
+                (sub (dds.dcps:create-subscriber p))
+                (dw (dds.dcps:create-datawriter pub tp))
+                (dr (dds.dcps:create-datareader sub tp)))
+           (%check :del-lw1 (= 1 (length (dds.disc::disc-node-local-writers node)))
+                   "the writer is announced in the disc-node local-writers before delete")
+           (%check :del-pub-nonempty (eq :precondition-not-met (dds.dcps:delete-publisher p pub))
+                   "delete_publisher of a Publisher with a live DataWriter returns :precondition-not-met")
+           (%check :del-sub-nonempty (eq :precondition-not-met (dds.dcps:delete-subscriber p sub))
+                   "delete_subscriber of a Subscriber with a live DataReader returns :precondition-not-met")
+           (%check :del-topic-referenced (eq :precondition-not-met (dds.dcps:delete-topic p tp))
+                   "delete_topic of a Topic still referenced by an endpoint returns :precondition-not-met")
+           (%check :del-dw-ok (eq :ok (dds.dcps:delete-datawriter pub dw))
+                   "delete_datawriter of a contained writer returns :ok")
+           (%check :del-dw-gone (null (dds.dcps:publisher-datawriters pub))
+                   "the deleted writer is no longer contained in the Publisher")
+           (%check :del-dw-disc (zerop (length (dds.disc::disc-node-local-writers node)))
+                   "discovery reflects the removal (writer dropped from the disc-node local-writers)")
+           (%check :del-dw-again (eq :precondition-not-met (dds.dcps:delete-datawriter pub dw))
+                   "a repeat delete_datawriter of an already-removed writer returns :precondition-not-met")
+           (%check :del-dr-ok (eq :ok (dds.dcps:delete-datareader sub dr))
+                   "delete_datareader of a contained reader returns :ok")
+           (%check :del-dr-disc (zerop (length (dds.disc::disc-node-local-readers node)))
+                   "discovery reflects the removal (reader dropped from the disc-node local-readers)")
+           ;; now the Topic is unreferenced and the containers are empty -> all deletable
+           (%check :del-topic-ok (eq :ok (dds.dcps:delete-topic p tp))
+                   "delete_topic succeeds once no endpoint references it")
+           (%check :del-topic-gone (null (dds.dcps:participant-topics p))
+                   "the deleted Topic is no longer contained in the participant")
+           (%check :del-pub-ok (eq :ok (dds.dcps:delete-publisher p pub))
+                   "delete_publisher succeeds once the Publisher is empty")
+           (%check :del-sub-ok (eq :ok (dds.dcps:delete-subscriber p sub))
+                   "delete_subscriber succeeds once the Subscriber is empty")
+           (%check :del-part-empty (null (dds.dcps::dp-children p))
+                   "the participant's child list is empty after deleting all children"))
+      (dds.dcps:delete-participant p)))
+  t)
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a

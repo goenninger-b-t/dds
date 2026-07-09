@@ -794,6 +794,56 @@
    = (list user-reader-id), byte-identical to the pre-S3 node-single id (secured multi-READER stays Slice S4)."
   (nreverse (mapcar #'car (disc-node-user-readers node))))
 
+(defun* remove-local-writer (node ep entity-id)
+    (function (disc-node (or null dds.rtps.discovery:endpoint-data) (unsigned-byte 32)) (eql t))
+  "WP-DCPS-API-COMPLETION S2.T4 (DDS 1.4 §2.2.2.4.1.5 delete_datawriter): remove the local user writer
+   ENTITY-ID (its SEDP endpoint EP, or NIL) from NODE. Under the NODE LOCK — the SAME lock the receiver/
+   sender push drivers take when they iterate the user-writer registry — drop the writer from the
+   user-writer registry (repointing the primary to the next remaining writer, or NIL, if it WAS primary)
+   and remove EP from disc-node-local-writers so announce-endpoints stops advertising it via SEDP. Taking
+   the node lock is what makes this race-free against a concurrent send/retransmit (no use-after-free).
+   Idempotent (an unregistered id / absent EP removes nothing). NODE-SCOPED resources shared with other
+   endpoints (the ZC pool, the secured payload pools, the flow-controller) are released at stop-node, not
+   here — deleting one of N endpoints must not tear down a pool a sibling still uses; a writer under an
+   associated flow-controller keeps its flow-state until stop-node (per-writer flow removal is a follow-on)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((cell (assoc entity-id (disc-node-user-writers node) :test #'eql)))
+      (when cell
+        (setf (disc-node-user-writers node) (remove cell (disc-node-user-writers node)))
+        (when (eq (disc-node-primary-user-writer node) (cdr cell))
+          (setf (disc-node-primary-user-writer node) (cdr (first (disc-node-user-writers node)))))))
+    (when ep
+      (setf (disc-node-local-writers node) (remove ep (disc-node-local-writers node)))))
+  t)
+
+(defun* remove-local-reader (node ep entity-id)
+    (function (disc-node (or null dds.rtps.discovery:endpoint-data) (unsigned-byte 32)) (eql t))
+  "WP-DCPS-API-COMPLETION S2.T4 (DDS 1.4 §2.2.2.5.1.5 delete_datareader): remove the local user reader
+   ENTITY-ID (its SEDP endpoint EP, or NIL) from NODE. Under the NODE LOCK — the SAME lock the receive-hook
+   demux + %reader-route-add take — drop the reader from the user-reader registry (repointing the primary if
+   it WAS primary), remove EP from disc-node-local-readers (SEDP stops advertising it), purge ENTITY-ID from
+   every remote-writer delivery route in disc-node-reader-routes so no arriving sample is demuxed to the gone
+   reader, and drop its mid-stream ZC-joiner high-water map. Taking the node lock serializes this against the
+   receiver thread (no use-after-free). Idempotent. The CALLER (delete_datareader) MUST have returned this
+   reader's outstanding loans BEFORE calling this (the delete-participant discipline), so no held refcount pins
+   a writer pool. Node-scoped pools are freed at stop-node (a sibling reader may still use them)."
+  (dds.pal:with-lock ((disc-node-lock node))
+    (let ((cell (assoc entity-id (disc-node-user-readers node) :test #'eql)))
+      (when cell
+        (setf (disc-node-user-readers node) (remove cell (disc-node-user-readers node)))
+        (when (eq (disc-node-primary-user-reader node) (cdr cell))
+          (setf (disc-node-primary-user-reader node) (cdr (first (disc-node-user-readers node)))))))
+    (when ep
+      (setf (disc-node-local-readers node) (remove ep (disc-node-local-readers node))))
+    (maphash (lambda (guid ids)
+               (let ((pruned (remove entity-id ids :test #'eql)))
+                 (if pruned
+                     (setf (gethash guid (disc-node-reader-routes node)) pruned)
+                     (remhash guid (disc-node-reader-routes node)))))
+             (disc-node-reader-routes node))
+    (remhash entity-id (disc-node-reader-join-watermarks node)))
+  t)
+
 (defparameter +spdp-multicast-group+ "239.255.0.1"
   "Well-known SPDP DefaultMulticastLocator address (RTPS 2.5 §9.6.1.1): all
    participants announce + listen on UDPv4 239.255.0.1 : spdp-multicast-port.")

@@ -25,6 +25,7 @@
            #:disc-node-on-inconsistent-topic
            #:disc-node-type-gate #:resume-parked-matches #:disc-node-parked-count
            #:add-local-writer #:add-local-reader
+           #:remove-local-writer #:remove-local-reader
            #:disc-node-user-writer-id #:disc-node-user-reader-id
            ;; WP-N-ENDPOINT-S3 (ADR 0048): per-endpoint enumeration + protection-kind resolvers (crypto-manager consumers)
            #:%all-user-writer-ids #:%all-user-reader-ids #:%user-endpoint-kinds #:%local-user-writer-id-for-topic

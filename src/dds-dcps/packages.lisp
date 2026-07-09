@@ -28,6 +28,9 @@
            ;; WP-DCPS-API-COMPLETION S2.T3: enable() + disabled-entity semantics (DDS 1.4 §2.2.2.1.1.7)
            #:enable #:entity-autoenable-created-entities
            #:+retcode-not-enabled+ #:+retcode-precondition-not-met+
+           ;; WP-DCPS-API-COMPLETION S2.T4/T5: child delete_* + delete_contained_entities (DDS 1.4 §2.2.2)
+           #:delete-datawriter #:delete-datareader #:delete-publisher #:delete-subscriber
+           #:delete-topic #:delete-contained-entities
            #:write-sample #:read-samples #:take-samples #:samples-available
            ;; WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017)
            #:take-loaned #:read-loaned #:return-loan #:return-all-loans

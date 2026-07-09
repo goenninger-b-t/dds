@@ -89,6 +89,8 @@
   ((topic :initarg :topic :reader dw-topic)
    (publisher :initarg :publisher :reader dw-publisher)
    (entity-id :initform 0 :accessor dw-entity-id) ; WP-N-ENDPOINT-S1 (ADR 0048): this writer's DISTINCT engine EntityId (RTPS 2.5 §9.3.1.2), captured at create-datawriter; write-sample threads it to publish-sample so the sample enters THIS writer's HistoryCache (not the aliased primary)
+   (disc-endpoint :initform nil :accessor dw-disc-endpoint) ; WP-DCPS-API-COMPLETION S2.T4: this writer's SEDP endpoint-data (from add-local-writer), so delete_datawriter can remove-local-writer it from discovery
+
    (pub-matched :initform (make-publication-matched-status) :accessor dw-pub-matched)
    (off-incompat :initform (make-offered-incompatible-qos-status) :accessor dw-off-incompat)
    (liv-lost :initform (make-liveliness-lost-status) :accessor dw-liv-lost)
@@ -111,6 +113,7 @@
   ((topic :initarg :topic :reader dr-topic)
    (subscriber :initarg :subscriber :reader dr-subscriber)
    (entity-id :initform 0 :accessor dr-entity-id) ; WP-N-ENDPOINT-S2 (ADR 0048): this reader's DISTINCT engine EntityId (RTPS 2.5 §9.3.1.2), captured at create-datareader; %drain's source-GUID filter keeps only samples whose remote writer is matched to THIS reader-id (node-reader-matches-writer-p) -> no cross-topic deserialize
+   (disc-endpoint :initform nil :accessor dr-disc-endpoint) ; WP-DCPS-API-COMPLETION S2.T4: this reader's SEDP endpoint-data (from add-local-reader), so delete_datareader can remove-local-reader it from discovery
 
    (cache :initform '() :accessor dr-cache)                       ; list of cached-sample
    (instances :initform (make-hash-table :test 'equalp) :accessor dr-instances) ; handle -> accessed-p
@@ -821,9 +824,9 @@
     (when (and ah (not (dds.security:check-create-datawriter ah (topic-name topic))))
       (error "create-datawriter: AccessControl check_create_datawriter denied publish on topic ~s"
              (topic-name topic)))
-    (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
-                               :keyed (%topic-keyed-p topic)
-                               :qos qos :type-information (%topic-type-information topic))
+    (let ((ep (dds.disc:add-local-writer node :topic (topic-name topic) :type (topic-type-name topic)
+                                         :keyed (%topic-keyed-p topic)
+                                         :qos qos :type-information (%topic-type-information topic))))
     (%set-user-metadata-protection node ah (topic-name topic) :writer)   ; ADR 0046 §9.4.1.2.4: the WRITER's own protection tiers
     (dds.disc:enable-publisher node :history-kind (dds.qos:qos-history-kind qos)
                                     :history-depth (dds.qos:qos-history-depth qos))
@@ -832,8 +835,9 @@
     (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos
                                           :enabled (%child-created-enabled-p pub))))
       (setf (dw-entity-id dw) (dds.disc:disc-node-user-writer-id node))
+      (setf (dw-disc-endpoint dw) ep)   ; S2.T4: retain the SEDP endpoint so delete_datawriter can remove it
       (push dw (pub-writers pub))
-      dw)))
+      dw))))
 
 (defun* create-datareader (sub topic &key (qos nil qos-supplied-p))
     (function (subscriber t &key (:qos t)) data-reader)
@@ -854,9 +858,9 @@
     (when (and ah (not (dds.security:check-create-datareader ah (topic-name topic))))
       (error "create-datareader: AccessControl check_create_datareader denied subscribe on topic ~s"
              (topic-name topic)))
-    (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
-                               :keyed (%topic-keyed-p topic)
-                               :qos qos :type-information (%topic-type-information topic))
+    (let ((ep (dds.disc:add-local-reader node :topic (topic-name topic) :type (topic-type-name topic)
+                                         :keyed (%topic-keyed-p topic)
+                                         :qos qos :type-information (%topic-type-information topic))))
     (%set-user-metadata-protection node ah (topic-name topic) :reader)   ; ADR 0046 §9.4.1.2.4: the READER's own protection tiers
     (dds.disc:enable-subscriber node)
     ;; WP-FLATDATA-ZC-LOAN wiring (FR-PF-3/4, R6, ADR 0017): a :flatdata-topic reader, with ZC armed, is
@@ -876,12 +880,13 @@
       ;; WP-N-ENDPOINT-S2 (ADR 0048): capture THIS reader's distinct EntityId (add-local-reader set it, enable-
       ;; subscriber registered the engine reader under it) so %drain's source-GUID filter routes delivery per reader.
       (setf (dr-entity-id dr) (dds.disc:disc-node-user-reader-id node))
+      (setf (dr-disc-endpoint dr) ep)   ; S2.T4: retain the SEDP endpoint so delete_datareader can remove it
       ;; WP-N-ENDPOINT-2C3 (ADR 0017/0048): the mid-stream ZC-joiner high-water is frozen at MATCH time (atomic
       ;; with %reader-route-add under the node lock), NOT here at registration — a registration-time freeze leaves
       ;; the [freeze,route-add] window open (a marker delivered in the gap is unbumped for this reader yet would be
       ;; drained+released = UAF). See disc.lisp %reader-route-add + node-reader-join-watermark.
       (push dr (sub-readers sub))
-      dr)))
+      dr))))
 
 (defun* %participant-writers (p)
     (function (domain-participant) list)
@@ -2928,3 +2933,101 @@
   (dds.pal:with-lock ((topic-status-lock tp))
     (setf (topic-listener-obj tp) listener (topic-listener-mask tp) mask))
   tp)
+
+;;; ---- WP-DCPS-API-COMPLETION S2.T4/T5: child delete_* + delete_contained_entities (DDS 1.4 §2.2.2) ----
+
+(defun* delete-datawriter (pub dw)
+    (function (publisher data-writer) (member :ok :precondition-not-met))
+  "Publisher::delete_datawriter (DDS 1.4 §2.2.2.4.1.5) — delete DW from PUB. Returns
+   :precondition-not-met if DW is not contained in PUB (§2.2.2.4.1.5). Otherwise: discard any
+   outstanding zero-copy write loans (no stranded pool slot), remove the writer from discovery + the
+   engine registry (remove-local-writer — SEDP stops announcing it, no delivery routes to it), drop it
+   from the Publisher, and mark it disabled. Node-scoped pools/threads (shared with sibling endpoints)
+   are freed at delete_participant/stop-node, not here."
+  (unless (member dw (pub-writers pub)) (return-from delete-datawriter +retcode-precondition-not-met+))
+  (discard-all-loans dw)
+  (dds.disc:remove-local-writer (dp-node (pub-participant pub)) (dw-disc-endpoint dw) (dw-entity-id dw))
+  (setf (pub-writers pub) (remove dw (pub-writers pub))
+        (entity-enabled-p dw) nil)
+  +retcode-ok+)
+
+(defun* delete-datareader (sub dr)
+    (function (subscriber data-reader) (member :ok :precondition-not-met))
+  "Subscriber::delete_datareader (DDS 1.4 §2.2.2.5.1.5) — delete DR from SUB. Returns
+   :precondition-not-met if DR is not contained in SUB. Otherwise: return every outstanding read/
+   secured loan FIRST (the delete-participant discipline — no held refcount pins a writer pool, and the
+   final release runs while the views are still mapped: no use-after-free), remove the reader from
+   discovery + the engine registry (remove-local-reader purges its delivery routes so no arriving sample
+   is demuxed to it), drop it from the Subscriber, and mark it disabled."
+  (unless (member dr (sub-readers sub)) (return-from delete-datareader +retcode-precondition-not-met+))
+  (return-all-loans dr)
+  (dds.disc:remove-local-reader (dp-node (sub-participant sub)) (dr-disc-endpoint dr) (dr-entity-id dr))
+  (setf (sub-readers sub) (remove dr (sub-readers sub))
+        (entity-enabled-p dr) nil)
+  +retcode-ok+)
+
+(defun* delete-publisher (p pub)
+    (function (domain-participant publisher) (member :ok :precondition-not-met))
+  "DomainParticipant::delete_publisher (DDS 1.4 §2.2.2.2.1.6) — delete PUB from P. Returns
+   :precondition-not-met if PUB is not contained in P, or if PUB still contains DataWriters (delete
+   them first, or call delete_contained_entities on PUB). Otherwise unregister PUB from P and disable it."
+  (unless (member pub (dp-children p)) (return-from delete-publisher +retcode-precondition-not-met+))
+  (when (pub-writers pub) (return-from delete-publisher +retcode-precondition-not-met+))
+  (setf (dp-children p) (remove pub (dp-children p))
+        (entity-enabled-p pub) nil)
+  +retcode-ok+)
+
+(defun* delete-subscriber (p sub)
+    (function (domain-participant subscriber) (member :ok :precondition-not-met))
+  "DomainParticipant::delete_subscriber (DDS 1.4 §2.2.2.2.1.8) — delete SUB from P. Returns
+   :precondition-not-met if SUB is not contained in P, or if SUB still contains DataReaders. Otherwise
+   unregister SUB from P and disable it."
+  (unless (member sub (dp-children p)) (return-from delete-subscriber +retcode-precondition-not-met+))
+  (when (sub-readers sub) (return-from delete-subscriber +retcode-precondition-not-met+))
+  (setf (dp-children p) (remove sub (dp-children p))
+        (entity-enabled-p sub) nil)
+  +retcode-ok+)
+
+(defun* %topic-referenced-p (p tp)
+    (function (domain-participant topic) boolean)
+  "T iff any DataWriter or DataReader contained in P still uses Topic TP — the delete_topic
+   precondition (DDS 1.4 §2.2.2.2.1.10): a Topic still referenced by an endpoint cannot be deleted."
+  (or (and (some (lambda (w) (eq (dw-topic w) tp)) (%participant-writers p)) t)
+      (and (some (lambda (r) (eq (dr-topic r) tp)) (%participant-readers p)) t)))
+
+(defun* delete-topic (p tp)
+    (function (domain-participant topic) (member :ok :precondition-not-met))
+  "DomainParticipant::delete_topic (DDS 1.4 §2.2.2.2.1.10) — delete Topic TP from P. Returns
+   :precondition-not-met if TP is not contained in P, or if any DataWriter/DataReader still references
+   it (%topic-referenced-p). Otherwise unregister TP from P and disable it."
+  (unless (member tp (dp-children p)) (return-from delete-topic +retcode-precondition-not-met+))
+  (when (%topic-referenced-p p tp) (return-from delete-topic +retcode-precondition-not-met+))
+  (setf (dp-children p) (remove tp (dp-children p))
+        (entity-enabled-p tp) nil)
+  +retcode-ok+)
+
+(defun* delete-contained-entities (entity)
+    (function (entity) (member :ok))
+  "Recursively delete every entity contained in ENTITY (DDS 1.4: DomainParticipant §2.2.2.2.1.11,
+   Publisher §2.2.2.4.1.13, Subscriber §2.2.2.5.1.13 delete_contained_entities). A Publisher deletes
+   its DataWriters; a Subscriber deletes its DataReaders; a DomainParticipant first empties then deletes
+   its Publishers and Subscribers, THEN deletes its Topics (deleted last, once no endpoint references
+   them, so the delete_topic precondition holds). After this ENTITY holds no children and is itself
+   deletable. Always :ok (each contained delete's precondition is satisfied by the recursion order)."
+  (typecase entity
+    (domain-participant
+     (dolist (pub (participant-publishers entity))
+       (delete-contained-entities pub)
+       (delete-publisher entity pub))
+     (dolist (sub (participant-subscribers entity))
+       (delete-contained-entities sub)
+       (delete-subscriber entity sub))
+     (dolist (tp (participant-topics entity))
+       (delete-topic entity tp)))
+    (publisher
+     (dolist (dw (publisher-datawriters entity))
+       (delete-datawriter entity dw)))
+    (subscriber
+     (dolist (dr (subscriber-datareaders entity))
+       (delete-datareader entity dr))))
+  +retcode-ok+)
