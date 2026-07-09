@@ -2403,42 +2403,56 @@
                   (dds.xport.zerocopy::%zc-validate (dds.pal:shm-sap seg))   ; ABI magic/version guard
                   (dds.pal:shm-sap seg))))))))
 
+(defun* %zc-ref-overlay-p (buf poff plen)
+    (function (dds.core.buffer:octet-buffer (integer 0) (integer 0)) boolean)
+  "WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): T iff BUF[poff,poff+plen) is a ZC reference whose reserved field
+   is +zc-ref-overlay-secured+ (the slot holds a data_protection SecuredPayload). Used at the receive dispatch
+   to force copy-on-read for a loan-capable reader (an overlay slot cannot be read in place — it is ciphertext)."
+  (multiple-value-bind (slot gen slot-bytes overlay)
+      (dds.cdr:parse-zc-reference (dds.core.buffer:octet-buffer-vec buf) poff plen)
+    (declare (ignore gen slot-bytes))
+    (and slot (= overlay dds.cdr:+zc-ref-overlay-secured+) t)))
+
 (defun* %zc-try-resolve (node buf poff plen src-prefix)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) (integer 0)
-              (simple-array (unsigned-byte 8) (12))) t)
+              (simple-array (unsigned-byte 8) (12))) (values t (unsigned-byte 32)))
   "WP-ZEROCOPY / WP-FLATDATA reader side (FR-PF-3/4, ADR 0014/0015; NOT cleared for ship — pending counsel
    R6): test the DATA SerializedPayload at BUF[poff,poff+plen) for a 16-byte zero-copy reference. Returns
-   :NOT-A-REF for a normal payload (the caller delivers it unchanged); a fresh (simple-array (unsigned-byte 8))
-   holding the RESOLVED serialized payload on a valid ref; or NIL when it IS a ref but resolution fails
-   (stale/forced-reclaimed/OOB/attach-fail) — best-effort DROP, no delivery, no crash. READ-THEN-RELEASE
-   lifetime (the Phase-D crux): the resolved payload is read IN PLACE from the writer's SHMEM pool slot
-   straight into a fresh exact-length node-OWNED vector under the slot mutex (%zc-resolve-fresh — a SINGLE
-   intra-host copy; the WP-ZEROCOPY v1 resolve-into-slot-sized-sink-then-re-copy is gone), then the slot is
-   %zc-released IMMEDIATELY. The slot's cross-process lifetime therefore ends here and never spans the app's
-   later (other-thread, %drain/read) access — so a writer force-reclaim cannot corrupt a delivered sample
-   (no cross-process use-after-free). A literal-0-copy SHMEM VIEW handed to the reader is NOT done in v1 and
-   would be unsafe here: this stack delivers samples into an async store read on another thread with no
-   slot-aware release hook, and an octet-buffer cannot wrap a raw foreign SAP (the FlatData accessors need a
-   Lisp simple-array) — see ADR 0015. The ref is UNTRUSTED cross-process input: parse-zc-reference
-   bounds-checks the payload region and %zc-resolve-fresh clamps the copy to the fixed slot-bytes + validates
-   generation against the slot header (NFR-SEC-POSTURE: never OOB into SHMEM)."
-  (multiple-value-bind (slot gen slot-bytes)
+   TWO values (RESOLVED . OVERLAY): the 1st is :NOT-A-REF for a normal payload (the caller delivers it
+   unchanged); a fresh (simple-array (unsigned-byte 8)) holding the RESOLVED serialized payload on a valid
+   ref; or NIL when it IS a ref but resolution fails (stale/forced-reclaimed/OOB/attach-fail) — best-effort
+   DROP, no delivery, no crash. The 2nd value is the reference's reserved OVERLAY field (0 for a normal ref;
+   +zc-ref-overlay-secured+ when the slot holds a data_protection SecuredPayload, ADR 0051) — the caller
+   threads it into %deliver-user-sample to force the in-slot decode; 0 on the :not-a-ref / attach-fail arms.
+   READ-THEN-RELEASE lifetime (the Phase-D crux): the resolved payload is read IN PLACE from the writer's
+   SHMEM pool slot straight into a fresh exact-length node-OWNED vector under the slot mutex
+   (%zc-resolve-fresh — a SINGLE intra-host copy; the WP-ZEROCOPY v1 resolve-into-slot-sized-sink-then-re-copy
+   is gone), then the slot is %zc-released IMMEDIATELY. The slot's cross-process lifetime therefore ends here
+   and never spans the app's later (other-thread, %drain/read) access — so a writer force-reclaim cannot
+   corrupt a delivered sample (no cross-process use-after-free). A literal-0-copy SHMEM VIEW handed to the
+   reader is NOT done in v1 and would be unsafe here: this stack delivers samples into an async store read on
+   another thread with no slot-aware release hook, and an octet-buffer cannot wrap a raw foreign SAP (the
+   FlatData accessors need a Lisp simple-array) — see ADR 0015. The ref is UNTRUSTED cross-process input:
+   parse-zc-reference bounds-checks the payload region and %zc-resolve-fresh clamps the copy to the fixed
+   slot-bytes + validates generation against the slot header (NFR-SEC-POSTURE: never OOB into SHMEM)."
+  (multiple-value-bind (slot gen slot-bytes overlay)
       (dds.cdr:parse-zc-reference (dds.core.buffer:octet-buffer-vec buf) poff plen)
     (declare (ignore slot-bytes))
     (if (null slot)
-        :not-a-ref
+        (values :not-a-ref 0)
         (let ((sap (%zc-attach-pool node src-prefix)))
-          (when sap
-            ;; READ-THEN-RELEASE (the WP-FLATDATA-over-ZC single-copy RX path): %zc-resolve-fresh reads the
-            ;; slot IN PLACE straight into a freshly-allocated, exact-payload-length owned vector under one
-            ;; mutex acquisition (no slot-sized scratch sink + re-copy, as WP-ZEROCOPY v1 did), then we
-            ;; %zc-release the slot IMMEDIATELY. The payload now lives in a node-owned Lisp vector, so the
-            ;; slot's cross-process lifetime ends here and does NOT span the app's later (other-thread,
-            ;; %drain) read — no cross-process use-after-free. The copy is clamped to the fixed slot-bytes,
-            ;; never OOB into SHMEM (NFR-SEC-POSTURE).
-            (let ((vec (dds.xport.zerocopy::%zc-resolve-fresh sap slot gen)))
-              (dds.xport.zerocopy::%zc-release sap slot gen)   ; release now: bytes already copied into the owned VEC
-              vec))))))
+          (if (null sap)
+              (values nil 0)
+              ;; READ-THEN-RELEASE (the WP-FLATDATA-over-ZC single-copy RX path): %zc-resolve-fresh reads the
+              ;; slot IN PLACE straight into a freshly-allocated, exact-payload-length owned vector under one
+              ;; mutex acquisition (no slot-sized scratch sink + re-copy, as WP-ZEROCOPY v1 did), then we
+              ;; %zc-release the slot IMMEDIATELY. The payload now lives in a node-owned Lisp vector, so the
+              ;; slot's cross-process lifetime ends here and does NOT span the app's later (other-thread,
+              ;; %drain) read — no cross-process use-after-free. The copy is clamped to the fixed slot-bytes,
+              ;; never OOB into SHMEM (NFR-SEC-POSTURE).
+              (let ((vec (dds.xport.zerocopy::%zc-resolve-fresh sap slot gen)))
+                (dds.xport.zerocopy::%zc-release sap slot gen)   ; release now: bytes already copied into the owned VEC
+                (values vec overlay)))))))
 
 (defun* %zc-defer (node buf poff plen src-prefix)
     (function (disc-node dds.core.buffer:octet-buffer (integer 0) (integer 0)
@@ -2839,11 +2853,11 @@
   t)
 
 (defun* %deliver-user-sample (node writer-id sn vec src-prefix effective-guid effective-sn
-                             &optional key-hash)
+                             &optional key-hash overlay-secured)
     (function (disc-node (unsigned-byte 32) integer (simple-array (unsigned-byte 8) (*))
               (simple-array (unsigned-byte 8) (12))
               (simple-array (unsigned-byte 8) (16)) integer
-              &optional (or null (simple-array (unsigned-byte 8) (*)))) t)
+              &optional (or null (simple-array (unsigned-byte 8) (*))) t) t)
   "Feed a complete user sample VEC (SN from WRITER-ID at SRC-PREFIX) to the reliable reader, record it
    under the 2-level (source-GUID -> SN) store (payload + writer EntityId for the S2 writers-set + full
    source GUID for S1 EXCLUSIVE ownership arbitration), then fire ON-SAMPLE outside the node lock
@@ -2862,7 +2876,13 @@
    decode failure / a deduped duplicate releases the buffer (no leak). WP-DDS-SECURITY-ZEROALLOC-AEAD T5d: the
    handle is POOLED (%secured-handle-acquire, paired 1:1 with the buffer pool) and the registry is a fixed vector,
    so the accepted loan wrapper conses 0 B/sample. Security OFF or not loan-capable keeps the allocating decode ->
-   bare-vector path, byte-identical."
+   bare-vector path, byte-identical.
+   OVERLAY-SECURED (WP-SECURITY-ZC-SHMEM-OVERLAY, ADR 0051): T when this sample is a resolved ZC overlay slot —
+   a data_protection SecuredPayload sealed under the writer's EntityCrypto key (%on-user-data threads it from
+   %zc-try-resolve's reserved-field 2nd value). It ORs into the decode gate so the SecuredPayload is decoded to
+   plaintext EVEN when the reader's OWN data_protection governance is NONE (an ENCRYPT-tier writer regains
+   Zero-Copy with no cleartext in SHMEM); the KM resolves + fail-closes via the SAME block as a normal
+   data_protection decode (no parallel path). NIL (default) is byte-identical to every pre-overlay caller."
   (let* ((guid (%source-guid src-prefix writer-id))   ; ONE source GUID: km-resolve + reliable proxy + the three inner tables + the loan handle
          (routes (%reader-routes-for node guid))       ; WP-N-ENDPOINT-S2/S4: the reader(s) matched to this writer — resolved ONCE (tier + delivery, DRY)
          (canon (and routes (cdr (first routes))))     ; the CANONICAL engine reader (single reliability truth for this writer)
@@ -2878,7 +2898,10 @@
     ;; IMPLEMENTED; supported tiers: NONE + SIGN + ENCRYPT (ADR-0040 §9.5.3.3.4.3). WP-N-ENDPOINT-S4: the tier is
     ;; RKIND — the target reader's OWN topic kind (per-endpoint map), so 2 different-topic readers of different kinds
     ;; each decode under their OWN tier (no cross-tier decode); N=1 RKIND == the node-single slot (byte-identical).
-    (let ((ct (and (not (eq rkind :none)) (disc-node-crypto-transform node))))
+    ;; WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): a ZC overlay sample is a data_protection SecuredPayload even when
+    ;; the reader's own data_protection governance is NONE — OVERLAY-SECURED forces the decode (the KM resolves as
+    ;; the remote-writer EntityCrypto key exactly as the normal data_protection decode; fail-closed reuse below).
+    (let ((ct (and (or overlay-secured (not (eq rkind :none))) (disc-node-crypto-transform node))))
       (when ct
         (let ((km (if (typep ct 'dds.security:crypto-keys)
                       (funcall (dds.security:crypto-keys-decode-key-fn ct) guid)
@@ -2988,21 +3011,26 @@
    threaded into %deliver-user-sample/%deliver-user-marker for the dedup gate."
   ;; effective-guid/sn: relay path uses PID values; direct path uses the wire writer GUID + SN
   (let* ((eff-guid (or orig-guid (%source-guid src-prefix writer-id)))
-         (eff-sn   (or orig-sn sn))
-         (zc (cond
-               ((null (disc-node-zc-pool node)) :not-a-ref)         ; ZC off -> normal path
-               ((disc-node-zc-loan-capable node)
-                (%zc-defer node buf poff plen src-prefix))
-               (t (%zc-try-resolve node buf poff plen src-prefix)))))
-    (cond
-      ((null zc))                                                   ; armed + ref present but defer/resolve FAILED -> drop (best-effort)
-      ((eq zc :not-a-ref)                                           ; normal payload (or ZC off)
-       (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
-         (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
-         (%deliver-user-sample node writer-id sn vec src-prefix eff-guid eff-sn key-hash)))
-      ((zc-loan-marker-p zc)
-       (%deliver-user-marker node writer-id sn zc src-prefix eff-guid eff-sn)) ; loan-capable: the unresolved marker
-      (t (%deliver-user-sample node writer-id sn zc src-prefix eff-guid eff-sn key-hash))) ; resolved ZC payload (non-loan-capable)
+         (eff-sn   (or orig-sn sn)))
+    (multiple-value-bind (zc overlay)
+        (cond
+          ((null (disc-node-zc-pool node)) :not-a-ref)              ; ZC off -> normal path (overlay -> NIL, unused: :not-a-ref arm)
+          ((and (disc-node-zc-loan-capable node)
+                (not (%zc-ref-overlay-p buf poff plen)))            ; ADR 0051: an overlay slot is ciphertext -> cannot be read in place -> copy-on-read
+           (%zc-defer node buf poff plen src-prefix))
+          (t (%zc-try-resolve node buf poff plen src-prefix)))      ; the ONLY arm that yields a numeric overlay (2nd value)
+      (cond
+        ((null zc))                                                 ; armed + ref present but defer/resolve FAILED -> drop (best-effort)
+        ((eq zc :not-a-ref)                                         ; normal payload (or ZC off)
+         (let ((vec (make-array plen :element-type '(unsigned-byte 8))))
+           (replace vec (dds.core.buffer:octet-buffer-vec buf) :start2 poff :end2 (+ poff plen))
+           (%deliver-user-sample node writer-id sn vec src-prefix eff-guid eff-sn key-hash)))
+        ((zc-loan-marker-p zc)
+         (%deliver-user-marker node writer-id sn zc src-prefix eff-guid eff-sn)) ; loan-capable: the unresolved marker
+        ;; resolved ZC payload (non-loan-capable): OVERLAY is numeric here (only the %zc-try-resolve arm reaches this);
+        ;; a data_protection SecuredPayload slot (ADR 0051) forces the in-slot decode in %deliver-user-sample.
+        (t (%deliver-user-sample node writer-id sn zc src-prefix eff-guid eff-sn key-hash
+                                 (= (or overlay 0) dds.cdr:+zc-ref-overlay-secured+)))))
     t))
 
 (defun* %on-user-heartbeat (node c flags src-prefix)

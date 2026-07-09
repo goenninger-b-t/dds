@@ -1270,7 +1270,31 @@
                      (assert (> (disc-node-zc-sends node) s1) ()
                              "B: the overlay ZC send must advance zc-sends")
                      (assert (not (%seg-has m2)) ()
-                             "B: the overlay slot must hold CIPHERTEXT — the plaintext must be provably ABSENT from the segment (the fix)")))))
+                             "B: the overlay slot must hold CIPHERTEXT — the plaintext must be provably ABSENT from the segment (the fix)"))
+                   ;; Part C — full loopback (read side, Task 3): a second reader whose OWN data_protection is NONE
+                   ;; attaches the WRITER's pool (same process, derived from the src-prefix), resolves the overlay ref,
+                   ;; and DECODES the in-slot data_protection SecuredPayload to plaintext — the overlay sentinel forces
+                   ;; the copy-on-read decode even though the reader's governance is NONE. Fed through the REAL receive
+                   ;; entry (%rtps-feed-datagram -> %handle-datagram -> disc-node-on-data -> %on-user-data), no hand-parse.
+                   (let* ((pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 94))
+                          (reader (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+                          (m3 (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                                   "ZC-OVERLAY-ROUNDTRIP-PLAINTEXT-33333333333333333333333333"))
+                          (ch3 (dds.rtps.history:make-cache-change :kind :data :sn 3 :serialized-payload m3)))
+                     (unwind-protect
+                          (when (disc-node-zc-pool reader)          ; the reader also needs a carved pool to resolve — else skip cleanly
+                            (enable-subscriber reader)               ; wires disc-node-on-data -> %on-user-data + registers the user reader
+                            (setf (disc-node-user-reader-data-protection-kind reader) :none   ; the reader's OWN data_protection is NONE (no governance decode)
+                                  (disc-node-crypto-transform reader) km)                      ; the SAME EntityCrypto KM (raw -> %deliver-user-sample resolves it directly)
+                            (let ((item (%zc-change-item node ch3 1))
+                                  (buf (dds.core.buffer:make-octet-buffer 512)))
+                              (assert item () "C: the overlay write must produce a ref item")
+                              (let ((len (funcall (%msg-datagram node (cdr item)) buf)))   ; header + the ref DATA submessage the item emits
+                                (%rtps-feed-datagram reader (subseq (dds.core.buffer:octet-buffer-vec buf) 0 len)))
+                              (let ((got (node-sample-by-sn reader 3)))
+                                (assert (and got (equalp got m3)) ()
+                                        "C: the reader must recover the overlay plaintext byte-exact through the copy-on-read decode"))))
+                       (stop-node reader))))))
           (stop-node node)))))
   t)
 
