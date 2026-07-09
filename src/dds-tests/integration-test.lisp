@@ -2179,6 +2179,27 @@
       (dds.dcps:delete-participant p))
     t))
 
+(defun* run-dcps-qos-immutability-table-test ()
+    (function () t)
+  "S1.T1 (DDS 1.4 §2.2.3 the per-policy 'changeable' column): the QoS policy immutability
+   table classifies each policy immutable-after-enable correctly. RELIABILITY, DURABILITY,
+   HISTORY, RESOURCE_LIMITS, OWNERSHIP, LIVELINESS, DESTINATION_ORDER, PRESENTATION and
+   DATA_REPRESENTATION are immutable; LATENCY_BUDGET, DEADLINE and PARTITION are mutable."
+  (flet ((imm (p) (dds.dcps:qos-policy-immutable-p p)))
+    (%check :imm-reliability (imm :reliability) "RELIABILITY is immutable after enable")
+    (%check :imm-durability (imm :durability) "DURABILITY is immutable after enable")
+    (%check :imm-history (imm :history) "HISTORY is immutable after enable")
+    (%check :imm-resource-limits (imm :resource-limits) "RESOURCE_LIMITS is immutable after enable")
+    (%check :imm-ownership (imm :ownership) "OWNERSHIP is immutable after enable")
+    (%check :imm-liveliness (imm :liveliness) "LIVELINESS is immutable after enable")
+    (%check :imm-dest-order (imm :destination-order) "DESTINATION_ORDER is immutable after enable")
+    (%check :imm-presentation (imm :presentation) "PRESENTATION is immutable after enable")
+    (%check :imm-data-rep (imm :data-representation) "DATA_REPRESENTATION is immutable after enable")
+    (%check :mut-latency-budget (not (imm :latency-budget)) "LATENCY_BUDGET is mutable")
+    (%check :mut-deadline (not (imm :deadline)) "DEADLINE is mutable")
+    (%check :mut-partition (not (imm :partition)) "PARTITION is mutable"))
+  t)
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a

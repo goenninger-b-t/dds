@@ -73,10 +73,18 @@
   "DDS QosPolicyId_t for LIVELINESS (dds_rtf2_dcps.idl §363-385).")
 (defconstant +qos-policy-id-reliability+ 11
   "DDS QosPolicyId_t for RELIABILITY (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-time-based-filter+ 9
+  "DDS QosPolicyId_t for TIME_BASED_FILTER (dds_rtf2_dcps.idl §363-385).")
 (defconstant +qos-policy-id-destination-order+ 12
   "DDS QosPolicyId_t for DESTINATION_ORDER (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-history+ 13
+  "DDS QosPolicyId_t for HISTORY (dds_rtf2_dcps.idl §363-385).")
+(defconstant +qos-policy-id-resource-limits+ 14
+  "DDS QosPolicyId_t for RESOURCE_LIMITS (dds_rtf2_dcps.idl §363-385).")
 (defconstant +qos-policy-id-data-representation+ 23
   "DDS QosPolicyId_t for DATA_REPRESENTATION (xtypes-1_3-discovery-builtin-topic.idl §177).")
+(defconstant +qos-policy-id-type-consistency+ 24
+  "DDS QosPolicyId_t for TYPE_CONSISTENCY_ENFORCEMENT (xtypes-1_3-discovery-builtin-topic.idl §191).")
 
 (defparameter *rxo-keyword->policy-id*
   (list (cons :reliability +qos-policy-id-reliability+)

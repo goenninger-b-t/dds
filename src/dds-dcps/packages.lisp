@@ -76,6 +76,10 @@
            #:+qos-policy-id-ownership+ #:+qos-policy-id-liveliness+
            #:+qos-policy-id-destination-order+ #:+qos-policy-id-presentation+
            #:+qos-policy-id-data-representation+
+           #:+qos-policy-id-time-based-filter+ #:+qos-policy-id-history+
+           #:+qos-policy-id-resource-limits+ #:+qos-policy-id-type-consistency+
+           ;; WP-DCPS-API-COMPLETION S1.T1/T2: QoS immutability table + consistency validator
+           #:qos-policy-immutable-p
            #:get-subscription-matched-status #:get-publication-matched-status
            #:get-requested-incompatible-qos-status #:get-offered-incompatible-qos-status
            #:inconsistent-topic-status #:inconsistent-topic-status-total-count

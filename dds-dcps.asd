@@ -9,6 +9,7 @@
   :serial t
   :components ((:file "packages")
                (:file "statuses")
+               (:file "qos-validate")
                (:file "listeners")
                (:file "entities")
                (:file "type-gate")
