@@ -15,7 +15,7 @@
            #:flatdata-rx-rep-plan
            #:make-encapsulation-header #:parse-encapsulation-header
            #:finalize-encapsulation-options
-           #:encode-zc-reference #:parse-zc-reference
+           #:encode-zc-reference #:parse-zc-reference #:+zc-ref-overlay-secured+
            #:cdr-not-implemented
            ;; XCDR primitive + composite codec (FR-CDR-1/2)
            #:cdr-mode #:cdr-align #:cdr-size-align

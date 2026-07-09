@@ -1173,6 +1173,27 @@
           (stop-node node)))))
   t)
 
+(defun* run-zc-ref-overlay-sentinel-test ()
+    (function () (eql t))
+  "WP-SECURITY-ZC-SHMEM-OVERLAY T1 (ADR 0051): the ZC reference datagram carries an overlay sentinel in its
+   reserved u32 — encode with overlay set round-trips through parse; the default (overlay 0) is byte-identical
+   to the pre-change reference (no wire drift for non-overlay ZC)."
+  (let* ((v0 (dds.disc::%encode-zc-ref-vec 7 3 65536))                          ; default overlay 0
+         (v1 (let ((b (make-array 20 :element-type '(unsigned-byte 8)))) b)))
+    ;; encode WITH the overlay sentinel into v1
+    (let ((c (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over v1) :endianness :little)))
+      (dds.cdr:encode-zc-reference c 7 3 65536 dds.cdr:+zc-ref-overlay-secured+))
+    (multiple-value-bind (s0 g0 sb0 ov0) (dds.cdr:parse-zc-reference v0 0 20)
+      (assert (and (eql s0 7) (eql g0 3) (eql sb0 65536) (eql ov0 0)) ()
+              "T1: default reference must parse overlay=0"))
+    (multiple-value-bind (s1 g1 sb1 ov1) (dds.cdr:parse-zc-reference v1 0 20)
+      (assert (and (eql s1 7) (eql g1 3) (eql sb1 65536) (eql ov1 dds.cdr:+zc-ref-overlay-secured+)) ()
+              "T1: overlay reference must parse the sentinel"))
+    ;; byte-identity of the default path: only the reserved u32 (body offset 16 => vec offset 16..19) may differ
+    (assert (every #'= (subseq v0 0 16) (subseq v1 0 16)) ()
+            "T1: the first 16 octets (encap + slot + gen + slot-bytes) must be identical regardless of overlay"))
+  t)
+
 (defvar *za2-rx-ctx* nil
   "WP-DDS-SECURITY-ZEROALLOC-AEAD T3(ZA-2) concurrency-test scratch: per-receiver-thread cons
    (EXPECTED-PAYLOAD . MISMATCH-COUNT) the shared node-b ON-DATA hook checks each SRTPS re-dispatch delivery
