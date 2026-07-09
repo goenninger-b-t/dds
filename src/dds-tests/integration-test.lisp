@@ -2511,6 +2511,45 @@
       (dds.dcps:delete-participant p)))
   t)
 
+(defun* run-dcps-delete-contained-test ()
+    (function () t)
+  "S2.T5 (DDS 1.4 §2.2.2.2.1.11 / §2.2.2.4.1.13 / §2.2.2.5.1.13 delete_contained_entities): one call on a
+   DomainParticipant recursively tears down its WHOLE tree — all DataWriters + DataReaders, then Publishers +
+   Subscribers, then Topics — leaving the participant empty (no children, no engine endpoints) and deletable.
+   Publisher/Subscriber delete_contained_entities delete their own endpoints."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((node (dds.dcps::dp-node p))
+                (t1 (dds.dcps:create-topic p "DceT1" "dcps-msg" ts))
+                (t2 (dds.dcps:create-topic p "DceT2" "dcps-msg" ts))
+                (pub1 (dds.dcps:create-publisher p))
+                (pub2 (dds.dcps:create-publisher p))
+                (sub1 (dds.dcps:create-subscriber p)))
+           (dds.dcps:create-datawriter pub1 t1)
+           (dds.dcps:create-datawriter pub2 t2)
+           (dds.dcps:create-datareader sub1 t1)
+           ;; Publisher-level delete_contained_entities empties one Publisher first
+           (%check :dce-pub1-nonempty (= 1 (length (dds.dcps:publisher-datawriters pub1)))
+                   "pub1 has its DataWriter before delete_contained_entities")
+           (%check :dce-pub1 (eq :ok (dds.dcps:delete-contained-entities pub1))
+                   "Publisher::delete_contained_entities returns :ok")
+           (%check :dce-pub1-empty (null (dds.dcps:publisher-datawriters pub1))
+                   "pub1 has no DataWriters after delete_contained_entities")
+           ;; participant-level delete_contained_entities tears down the entire remaining tree
+           (%check :dce-part (eq :ok (dds.dcps:delete-contained-entities p))
+                   "DomainParticipant::delete_contained_entities returns :ok")
+           (%check :dce-pubs (null (dds.dcps:participant-publishers p)) "no Publishers remain")
+           (%check :dce-subs (null (dds.dcps:participant-subscribers p)) "no Subscribers remain")
+           (%check :dce-topics (null (dds.dcps:participant-topics p)) "no Topics remain")
+           (%check :dce-children (null (dds.dcps::dp-children p)) "the participant's child list is empty")
+           (%check :dce-lw (zerop (length (dds.disc::disc-node-local-writers node)))
+                   "no engine writers remain on the disc-node")
+           (%check :dce-lr (zerop (length (dds.disc::disc-node-local-readers node)))
+                   "no engine readers remain on the disc-node"))
+      (dds.dcps:delete-participant p)))
+  t)
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a

@@ -3857,6 +3857,7 @@
                  ("dcps-children-registry"   . run-dcps-children-registry-test)
                  ("dcps-enable"              . run-dcps-enable-test)
                  ("dcps-delete-child"        . run-dcps-delete-child-test)
+                 ("dcps-delete-contained"    . run-dcps-delete-contained-test)
                  ("lease-unmatch"            . run-lease-unmatch-test)
                  ("liveliness-changed"       . run-liveliness-changed-test)
                  ("liveliness-lost"          . run-liveliness-lost-test)
