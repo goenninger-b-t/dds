@@ -463,6 +463,15 @@
   (submsg-scratch-pool nil :type t)
   (submsg-scratch-arena nil :type t)
   (submsg-scratch-lock (dds.pal:make-lock "submsg-scratch") :type t)
+  ;; WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): lazily-carved pool of slot-sized static octet-buffers a wire-protected
+  ;; ENCRYPT-tier writer seals its in-slot data_protection SecuredPayload into (encode-serialized-payload-into), so the
+  ;; Zero-Copy/SHMEM slot holds CIPHERTEXT, never the cleartext payload. NIL until the first overlay publish (a node with
+  ;; no ENCRYPT-tier ZC writer reserves no static memory); arena stored only after the carve succeeds (teardown
+  ;; reachability); stop-node tears it down. Exhaustion/carve-fail -> fail-closed skip (writer stays gated off, never a GC
+  ;; fallback). Dedicated ZC-OVERLAY-SCRATCH-LOCK so its ops never contend with the send / RX / submsg pool ops.
+  (zc-overlay-scratch-pool nil :type t)
+  (zc-overlay-scratch-arena nil :type t)
+  (zc-overlay-scratch-lock (dds.pal:make-lock "zc-overlay-scratch") :type t)
   ;; Slice 5 (WP-DDS-SECURITY-FASTDDS-INTEROP): USER-DATA submessage protection (metadata_protection_kind,
   ;; DDS-Security 1.1 §8.5.1.7-.9 / §9.4.1.2.3). When governance sets the user topic's metadata_protection_kind
   ;; != NONE, EACH user-plane submessage (DATA/DATA_FRAG/HEARTBEAT/GAP/HEARTBEAT_FRAG from the writer;
@@ -2450,6 +2459,9 @@
   (when (disc-node-submsg-scratch-arena node)   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T4: free the metadata_protection submessage-scratch pool's static buffers AFTER every sender thread is joined (no live borrow)
     (dds.core.arena:teardown-arena (disc-node-submsg-scratch-arena node))
     (setf (disc-node-submsg-scratch-arena node) nil (disc-node-submsg-scratch-pool node) nil))
+  (when (disc-node-zc-overlay-scratch-arena node)   ; WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): free the in-slot SecuredPayload seal-scratch pool's static buffers AFTER every sender thread is joined (no live borrow)
+    (dds.core.arena:teardown-arena (disc-node-zc-overlay-scratch-arena node))
+    (setf (disc-node-zc-overlay-scratch-arena node) nil (disc-node-zc-overlay-scratch-pool node) nil))
   (dolist (a (disc-node-payload-arena node))   ; WP-DDS-SECURITY-ZEROALLOC-AEAD T5a / WP-N-ENDPOINT-S3: free EVERY secured writer's payload-pool arena (a LIST now) AFTER every sender/receiver thread is joined (no live acquire/release) — no per-writer arena orphaned
     (dds.core.arena:teardown-arena a))
   (setf (disc-node-payload-arena node) nil)

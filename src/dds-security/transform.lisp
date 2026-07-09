@@ -163,6 +163,15 @@
    payload-into. Zero-alloc (a 4-octet mismatch, no consing) so the per-sample secured path stays alloc-free."
   (null (mismatch (key-material-transformation-kind km) +transformation-kind-aes256-gmac+)))
 
+(defun* key-material-encrypt-p (km)
+    (function (key-material) boolean)
+  "T iff KM is the §9.5.3.3.1 AES256-GCM ENCRYPT tier {0,0,0,4} — the CONFIDENTIALITY sub-tier that HIDES the
+   serialized payload as ciphertext (§9.5.3.3.4.4); NIL for AES256-GMAC {0,0,0,3}, the SIGN sub-tier that leaves
+   the payload VISIBLE (§9.5.3.3.4.3). The negation of %km-gmac-p (DRY). Consumed by the ZC/SHMEM in-slot overlay
+   eligibility gate (WP-SECURITY-ZC-SHMEM-OVERLAY, ADR 0051): only an ENCRYPT payload key makes the sealed slot
+   confidential. Zero-alloc (a 4-octet compare, no consing)."
+  (not (%km-gmac-p km)))
+
 (defun* %put-crypto-header-into (km vec)
     (function (key-material (simple-array (unsigned-byte 8) (*))) (eql t))
   "Write the §9.5.3.3.1 SecureDataHeader — transformation_kind(4) ‖ transformation_key_id(4) ‖ session_id(4) ‖

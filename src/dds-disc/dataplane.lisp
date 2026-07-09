@@ -898,6 +898,57 @@
   (or (not (eq (disc-node-rtps-protection-kind node) :none))
       (not (eq (disc-node-user-submessage-protection-kind node) :none))))
 
+(defun* %zc-overlay-km (node)
+    (function (disc-node) (or null dds.security:key-material))
+  "WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): resolve THIS node's primary user writer's EntityCrypto KeyMaterial
+   for the in-slot data_protection SecuredPayload overlay. Mirrors the publish-time resolution (publish-sample):
+   a crypto-keys resolver -> the writer's EntityCrypto km by its own GUID; a raw key-material -> itself (Slice-1 /
+   test config). NIL when no crypto-transform is installed (fail-closed). N=1 (the MVP): the primary user-writer
+   id; multi-writer overlay keys per-endpoint as a follow-on (ADR 0051)."
+  (let ((ct (disc-node-crypto-transform node)))
+    (and ct
+         (if (typep ct 'dds.security:crypto-keys)
+             (funcall (dds.security:crypto-keys-encode-key-fn ct)
+                      (%local-writer-guid-vec node (disc-node-user-writer-id node)))
+             ct))))
+
+(defun* %zc-overlay-eligible-p (node)
+    (function (disc-node) boolean)
+  "WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): T iff a wire-protected writer may use Zero-Copy/SHMEM via the in-slot
+   data_protection SecuredPayload overlay instead of being gated off (%zc-payload-wire-protected-p). Requires: the
+   writer IS wire-protected (rtps/metadata_protection non-NONE — else it takes the raw ZC fast path, no overlay);
+   its data_protection is explicitly NONE (data=SIGN/ENCRYPT already puts a SecuredPayload in the slot via the
+   existing ungated path; :unset with a crypto-transform installed would be sealed at publish, so the change
+   payload is NOT known-plaintext -> not overlay-eligible); AND a usable ENCRYPT (AES256-GCM, confidentiality)
+   EntityCrypto KM resolves (%zc-overlay-km + key-material-encrypt-p). A SIGN-only payload key (GMAC) is NOT
+   eligible here (deferred — a SIGN payload is not confidential, so raw ZC would be a follow-on, ADR 0051).
+   Fail-closed: no KM -> NIL (stays gated off)."
+  (and (%zc-payload-wire-protected-p node)
+       (eq (disc-node-user-data-protection-kind node) :none)
+       (let ((km (%zc-overlay-km node)))
+         (and km (dds.security:key-material-encrypt-p km) t))))
+
+(defun* %ensure-zc-overlay-scratch (node)
+    (function (disc-node) (or null dds.core.arena:buffer-pool))
+  "WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): lazily carve NODE's overlay seal-scratch pool — static octet-buffers
+   each sized to hold a slot's worth of data_protection SecuredPayload (44 + slot-bytes + 3, the ENCRYPT-tier
+   upper bound: the 44-octet §9.5.3.3 header/tag framing + up to a slot of ciphertext + <=3 pad). Returns the
+   pool, or NIL if the arena carve fails (caller then skips the overlay -> the writer stays gated off for that
+   sample, fail-closed, never a GC fallback). Idempotent, double-checked under the dedicated overlay lock; the
+   arena is stored only after the carve succeeds (teardown reachability); stop-node tears it down. Mirrors
+   %ensure-submsg-scratch-pool / %ensure-secure-rx-pool (init-arena + make-buffer-pool)."
+  (or (disc-node-zc-overlay-scratch-pool node)
+      (dds.pal:with-lock ((disc-node-zc-overlay-scratch-lock node))
+        (or (disc-node-zc-overlay-scratch-pool node)
+            (handler-case
+                (let* ((eb    (+ 44 +zerocopy-pool-slot-bytes+ 3))
+                       (cap   4)
+                       (arena (dds.core.arena:init-arena :bytes (* eb (1+ cap))))   ; +1 slot slack
+                       (pool  (dds.core.arena:make-buffer-pool arena eb cap)))
+                  (setf (disc-node-zc-overlay-scratch-arena node) arena   ; store the arena only after the carve succeeds (teardown reachability)
+                        (disc-node-zc-overlay-scratch-pool node) pool))   ; set the pool LAST — the double-checked-carve flag
+              (error () nil))))))   ; arena-exhausted / static-alloc failure -> leave NIL -> fail-closed skip
+
 ;;;; WP-FLATDATA-LOAN-WRITE (FR-PF-4, R6, ADR 0042; NOT cleared for ship — pending counsel). The TX loan-write
 ;;;; pool API DCPS loan-sample/discard-loan calls: a writer acquires a pool slot, the app writes its FlatData
 ;;;; fields straight into the slot via the SAP-mode Offset setters, and the loan is either published (delivered
@@ -1052,6 +1103,11 @@
    DISABLED fail-closed (returns NIL) — the datagram/submessage encryption those tiers apply lives OUTSIDE
    the pool, so a raw payload in shared memory would be readable by any co-resident participant; the sample
    instead takes the normal serialize -> %send-raw-buf (submessage+SRTPS wrap) path.
+   OVERLAY (WP-SECURITY-ZC-SHMEM-OVERLAY, ADR 0051): when the wire-protected writer is ENCRYPT-tier with an
+   ENCRYPT EntityCrypto KM and data_protection = NONE (%zc-overlay-eligible-p), the payload is instead SEALED as
+   a data_protection SecuredPayload into a pooled scratch and loaned into the slot (the slot holds ciphertext),
+   and the emitted ref carries +zc-ref-overlay-secured+ — so an ENCRYPT-tier writer regains Zero-Copy with no
+   cleartext in SHMEM. Fail-closed: no KM / no scratch / carve-fail -> NIL (the writer stays gated off).
    WP-FLATDATA-LOAN-WRITE PRE-COMMITTED SLOT (FR-PF-4, R6, ADR 0042): a loan-written change carries the
    committed pool slot its sample already sits in (zc-state :armed). When the FULL eligibility above holds,
    the send site PREFERS that slot (%zc-armed-item, a one-shot claim) — the emitted ref bytes are EXACTLY
@@ -1063,17 +1119,51 @@
    beyond the committed one) — the send-site gate stays AUTHORITATIVE over the pre-committed slot
    (ADR 0036 Carry-10 inheritance) and a committed slot never strands on a fallback decision. NOT cleared
    for ship — pending counsel (R6)."
-  (if (and (plusp zc-readers)
-           (eq (dds.rtps.history:cache-change-kind change) :data)
-           (not (%zc-payload-wire-protected-p node)))   ; fail-closed: never a cleartext payload in SHMEM for a wire-protected writer (ADR 0036 Carry 10)
-      (let ((len (dds.rtps.history:cache-change-payload-len change)))   ; TRUE length, not the oversized pooled vec (T5a)
-        (if (> len *zerocopy-min-payload-bytes*)
-            (or (and (eq (dds.rtps.history:cache-change-zc-state change) :armed)   ; fast hint; the claim re-checks under the writer lock
-                     (%zc-armed-item node change))                                 ; ADR 0042: emit the PRE-COMMITTED slot, 0 copies
-                (let ((pl (%ensure-change-payload node change)))   ; ADR 0044: resolve a pinned slot on demand for the fresh-loan fallback (extra ZC dest)
-                  (and pl (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 len 1))))
-            (progn (%zc-drop-armed node change) nil)))   ; undersized: release an armed slot (one-shot no-op otherwise)
-      (progn (%zc-drop-armed node change) nil)))         ; gated / non-ZC / retransmit: the fallback decision releases an armed slot
+  (cond
+    ;; raw ZC (non-secured / data_protection already SecuredPayload) — UNCHANGED
+    ((and (plusp zc-readers)
+          (eq (dds.rtps.history:cache-change-kind change) :data)
+          (not (%zc-payload-wire-protected-p node)))   ; fail-closed: never a cleartext payload in SHMEM for a wire-protected writer (ADR 0036 Carry 10)
+     (let ((len (dds.rtps.history:cache-change-payload-len change)))   ; TRUE length, not the oversized pooled vec (T5a)
+       (if (> len *zerocopy-min-payload-bytes*)
+           (or (and (eq (dds.rtps.history:cache-change-zc-state change) :armed)   ; fast hint; the claim re-checks under the writer lock
+                    (%zc-armed-item node change))                                 ; ADR 0042: emit the PRE-COMMITTED slot, 0 copies
+               (let ((pl (%ensure-change-payload node change)))   ; ADR 0044: resolve a pinned slot on demand for the fresh-loan fallback (extra ZC dest)
+                 (and pl (%zc-ref-builder node (dds.rtps.history:cache-change-sn change) pl 0 len 1))))
+           (progn (%zc-drop-armed node change) nil))))   ; undersized: release an armed slot (one-shot no-op otherwise)
+    ;; WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): a wire-protected ENCRYPT-tier writer (data=NONE) seals the payload as a
+    ;; data_protection SecuredPayload INTO the slot instead of being gated off — no cleartext in SHMEM, the wire reference
+    ;; stays rtps/metadata-wrapped, and the ref carries the overlay sentinel (copy-on-read decode only — Task 3).
+    ((and (plusp zc-readers)
+          (eq (dds.rtps.history:cache-change-kind change) :data)
+          (%zc-overlay-eligible-p node))
+     ;; INVARIANT: an overlay-eligible writer (wire-protected, data=NONE/ENCRYPT KM) never carries an :armed
+     ;; loan-written slot — %loan-write-data-protected-p blocks arming for :sign/:encrypt and :unset+ct — so the
+     ;; fail-closed NIL branches below need no %zc-drop-armed (nothing to strand); a future change that lets a
+     ;; secured writer arm a slot MUST revisit this (add the drop like the raw undersized arm / the t fallback).
+     (let ((len (dds.rtps.history:cache-change-payload-len change)))
+       ;; SIZE GATE (fail-closed, no exception-driven control flow): the raw arm caps only *zerocopy-min-payload-bytes*,
+       ;; but the ENCRYPT SecuredPayload (44 + len + <=3 pad) must ALSO fit a pool slot — else the seal would overflow
+       ;; the scratch buffer / never loan. Gate BEFORE the pool carve so the over-slot case is portable (returns NIL,
+       ;; no SHMEM touched) and the sample falls through to the normal serialize path.
+       (if (and (> len *zerocopy-min-payload-bytes*)
+                (<= (+ 44 len 3) +zerocopy-pool-slot-bytes+))
+           (let ((pl   (%ensure-change-payload node change))     ; data=NONE => pl is the exact plaintext, (length pl)==len
+                 (km   (%zc-overlay-km node))
+                 (pool (%ensure-zc-overlay-scratch node)))
+             (if (and pl km pool)
+                 (let ((sb (dds.core.arena:pool-acquire pool)))
+                   (if (null sb)
+                       nil                                        ; scratch exhausted: fail-closed skip (no ZC this sample)
+                       (unwind-protect
+                            (let ((slen (dds.security:encode-serialized-payload-into sb km pl)))   ; seal exactly (length pl)==len plaintext bytes; fits by the size gate above
+                              (%zc-ref-builder node (dds.rtps.history:cache-change-sn change)   ; loan the SecuredPayload bytes into the slot; ref carries the overlay sentinel
+                                               (dds.core.buffer:octet-buffer-vec sb) 0 slen 1
+                                               dds.cdr:+zc-ref-overlay-secured+))
+                         (dds.core.arena:pool-release pool sb))))
+                 nil))
+           nil)))
+    (t (progn (%zc-drop-armed node change) nil))))     ; gated / non-ZC / retransmit: the fallback decision releases an armed slot
 
 (defun* %zc-shareable-change-p (node change)
     (function (disc-node dds.rtps.history:cache-change) boolean)
@@ -1377,33 +1467,37 @@
                 targets)
       0))
 
-(defun* %encode-zc-ref-vec (slot generation slot-bytes)
-    (function ((unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32)) (simple-array (unsigned-byte 8) (20)))
+(defun* %encode-zc-ref-vec (slot generation slot-bytes &optional (overlay 0))
+    (function ((unsigned-byte 32) (unsigned-byte 32) (unsigned-byte 32) &optional (unsigned-byte 32))
+              (simple-array (unsigned-byte 8) (20)))
   "Encode a 20-octet WP-ZEROCOPY SerializedPayload reference (encode-zc-reference) into a fresh vector.
    The 20-byte alloc is negligible against the large-sample payload copy it REPLACES; this file is not a
-   measured hot path (the gated hot-path files are untouched). ADR 0014, FR-PF-3."
+   measured hot path (the gated hot-path files are untouched). OVERLAY (default 0) is the reserved field:
+   +zc-ref-overlay-secured+ marks the slot as holding a data_protection SecuredPayload (ADR 0051); 0 is
+   byte-identical to every pre-change caller. ADR 0014, FR-PF-3."
   (let* ((v (make-array 20 :element-type '(unsigned-byte 8)))
          (c (dds.core.buffer:cursor (dds.core.buffer:octet-buffer-over v) :endianness :little)))
-    (dds.cdr:encode-zc-reference c slot generation slot-bytes)
+    (dds.cdr:encode-zc-reference c slot generation slot-bytes overlay)
     v))
 
-(defun* %zc-ref-item (node sn slot gen)
-    (function (disc-node integer (integer 0) (unsigned-byte 32)) cons)
+(defun* %zc-ref-item (node sn slot gen &optional (overlay 0))
+    (function (disc-node integer (integer 0) (unsigned-byte 32) &optional (unsigned-byte 32)) cons)
   "WP-ZEROCOPY/WP-FLATDATA-LOAN-WRITE shared ref-item tail (FR-PF-3/4, ADR 0014/0042; R6): the (SIZE . BUILD-FN)
    packable DATA item (SN) whose SerializedPayload is the 20-octet zero-copy reference to (SLOT, GEN) — drop-in
    for %data-builder so the ref rides the existing coalesced DATA path. Byte-identical to what %zc-ref-builder
    emitted before the factoring (%encode-zc-ref-vec + write-data, the SAME emitters — no wire constant invented);
-   now ALSO consumed by the loan-write send site for a PRE-COMMITTED slot (ADR 0042). Bumps zc-sends."
+   now ALSO consumed by the loan-write send site for a PRE-COMMITTED slot (ADR 0042). OVERLAY (default 0) marks a
+   data_protection SecuredPayload slot (ADR 0051). Bumps zc-sends."
   (incf (disc-node-zc-sends node))
-  (let ((ref (%encode-zc-ref-vec slot gen +zerocopy-pool-slot-bytes+))
+  (let ((ref (%encode-zc-ref-vec slot gen +zerocopy-pool-slot-bytes+ overlay))
         (wid (%emit-wid node)))
     (cons (+ 24 (length ref))   ; mirrors %data-builder's small-:data SIZE (4 hdr + 20 body-prefix + payload)
           (lambda (mc) (dds.rtps.message:write-data
                         mc dds.rtps.message:+entityid-unknown+ wid sn ref 0 (length ref))))))
 
-(defun* %zc-ref-builder (node sn payload off len resolves)
-    (function (disc-node integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) (integer 1))
-              (or null cons))
+(defun* %zc-ref-builder (node sn payload off len resolves &optional (overlay 0))
+    (function (disc-node integer (simple-array (unsigned-byte 8) (*)) (integer 0) (integer 0) (integer 1)
+              &optional (unsigned-byte 32)) (or null cons))
   "WP-ZEROCOPY (FR-PF-3, ADR 0014): loan PAYLOAD[off,off+len) into this node's writer pool with refcount
    RESOLVES (the number of times the slot will be resolved+released), and return the %zc-ref-item for the
    loaned slot (a (SIZE . BUILD-FN) packable DATA item carrying the 20-octet reference). Returns NIL if the
@@ -1418,10 +1512,11 @@
    app-buffer->slot copy with NO per-field re-serialize — there is no second serialization on the FlatData
    TX path. (WP-FLATDATA-LOAN-WRITE, ADR 0042, removes even that copy for a loan-written change: its
    PRE-COMMITTED slot is emitted directly via %zc-armed-item, and this fresh-loan path serves the fallback +
-   any extra destination.) NOT cleared for ship — counsel (R6)."
+   any extra destination.) OVERLAY (default 0) marks a data_protection SecuredPayload slot (ADR 0051). NOT
+   cleared for ship — counsel (R6)."
   (multiple-value-bind (slot gen)
       (dds.xport.zerocopy::%zc-loan (disc-node-zc-pool-sap node) payload off len resolves)
-    (when slot (%zc-ref-item node sn slot gen))))
+    (when slot (%zc-ref-item node sn slot gen overlay))))
 
 (defun* %zc-armed-item (node change)
     (function (disc-node dds.rtps.history:cache-change) (or null cons))

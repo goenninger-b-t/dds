@@ -70,6 +70,8 @@
    #:key-material-master-sender-key
    #:key-material-iv-counter
    #:key-material-iv-counter-lock
+   ;; §9.5.3.3.1 tier predicate: ENCRYPT (AES256-GCM) vs SIGN (AES256-GMAC) — the ZC/SHMEM overlay eligibility gate
+   #:key-material-encrypt-p
    ;; ADR-0034 secret hygiene: foreign/static KeyMaterial master secrets + zeroize-on-teardown choke + fail-closed guard
    #:zeroize-key-material
    #:wipe-key-material-secrets

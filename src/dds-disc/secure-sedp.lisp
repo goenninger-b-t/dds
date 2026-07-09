@@ -1194,6 +1194,86 @@
             "T1: the first 16 octets (encap + slot + gen + slot-bytes) must be identical regardless of overlay"))
   t)
 
+(defun* run-zc-shmem-secured-overlay-test ()
+    (function () (eql t))
+  "WP-SECURITY-ZC-SHMEM-OVERLAY T2 (ADR 0051, DDS-Security 1.1 §9.5.3.3): an ENCRYPT-tier writer
+   (rtps/metadata_protection = ENCRYPT, data_protection = NONE) MAY now use Zero-Copy/SHMEM — the serialized
+   payload is sealed into the pool slot as a data_protection SecuredPayload under the writer's EntityCrypto
+   key, so a co-resident process reading the segment recovers only ciphertext. Asserts:
+     Part A (deterministic, portable): with an ENCRYPT EntityCrypto KM installed as the crypto-transform (and
+       an EXPLICIT governance data_protection = NONE, so the change payload rides plain and the overlay is the
+       thing that seals it), %zc-overlay-eligible-p is T; WITHOUT a KM it stays fail-closed NIL; a GMAC (SIGN)
+       payload key stays NIL (key-material-encrypt-p gates — a SIGN payload is not confidential, deferred).
+     Part B (SHMEM-gated live-segment): the sealed slot holds CIPHERTEXT — the plaintext marker is provably
+       ABSENT from the entire pool segment (with a non-secured control whose plaintext IS present), and
+       zc-sends advances (the overlay DID take ZC). Both impls (Clasp first; Part B skips cleanly on Clasp/macOS)."
+  (handler-case (dds.dare:dare-available-p)
+    (dds.dare:dare-unavailable (c)
+      (format t "~&  [zc-shmem-secured-overlay] SKIP — AES-GCM not available: ~a~%" (dds.dare:dare-unavailable-reason c))
+      (return-from run-zc-shmem-secured-overlay-test t)))
+  (let ((pa (make-array 12 :element-type '(unsigned-byte 8) :initial-element 93))
+        (*zerocopy-min-payload-bytes* 8)
+        (km (%secure-sedp-test-km 7 #x33)))          ; ENCRYPT (AES256-GCM) EntityCrypto KM
+    ;; Part A — deterministic predicate + routing (the NIL branches need no SHMEM; the ref branch is folded into Part B).
+    (let ((node (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0)))
+      (unwind-protect
+           (progn
+             (setf (disc-node-rtps-protection-kind node) :encrypt          ; wire-protected ENCRYPT tier
+                   (disc-node-user-data-protection-kind node) :none)       ; governance data=NONE -> the change payload is plaintext, the overlay seals it
+             (assert (%zc-payload-wire-protected-p node) () "A: ENCRYPT writer is wire-protected")
+             (assert (not (%zc-overlay-eligible-p node)) () "A: no KM installed -> NOT overlay-eligible (fail-closed)")
+             (setf (disc-node-crypto-transform node) km)                   ; install the ENCRYPT EntityCrypto KM
+             (assert (%zc-overlay-eligible-p node) () "A: ENCRYPT tier + ENCRYPT KM + data=NONE -> overlay-eligible")
+             (setf (disc-node-crypto-transform node)                       ; a GMAC (SIGN) payload key is NOT confidential
+                   (dds.security:make-test-key-material :kind :sign))
+             (assert (not (%zc-overlay-eligible-p node)) () "A: a GMAC (SIGN) payload key -> NOT overlay-eligible (deferred)")
+             (setf (disc-node-crypto-transform node) km)                   ; restore the ENCRYPT KM
+             ;; OVER-SLOT payload: the ENCRYPT SecuredPayload (44+len+pad) would exceed a pool slot -> the overlay arm
+             ;; must FAIL CLOSED to NIL (the sample takes the normal serialize path), never SIGNAL a buffer-overflow.
+             ;; Portable: the size gate short-circuits before any pool carve / SHMEM access.
+             (let ((big (dds.rtps.history:make-cache-change
+                         :kind :data :sn 9
+                         :serialized-payload (make-array (+ +zerocopy-pool-slot-bytes+ 4096)
+                                                         :element-type '(unsigned-byte 8) :initial-element 66))))
+               (assert (%zc-overlay-eligible-p node) () "A: the writer is still overlay-eligible for the over-slot check")
+               (assert (null (%zc-change-item node big 1)) ()
+                       "A: an over-slot payload (SecuredPayload > slot-bytes) must fail closed to NIL, never signal buffer-overflow")))
+        (stop-node node)))
+    ;; Part B — SHMEM-gated live-segment inspection (skips where the pool is not carved: Clasp/macOS, ADR 0013).
+    (let ((*zerocopy-enabled* t))
+      (let ((node (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0)))
+        (unwind-protect
+             (when (disc-node-zc-pool node)
+               (let* ((sap (disc-node-zc-pool-sap node))
+                      (size (dds.xport.zerocopy::%zc-bytes +zerocopy-pool-slots+ +zerocopy-pool-slot-bytes+))
+                      (m1 (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                               "ZC-OVERLAY-CONTROL-PLAINTEXT-1111111111111111111111111111"))
+                      (m2 (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                               "ZC-OVERLAY-SECURED-PLAINTEXT-22222222222222222222222222222222"))
+                      (ch1 (dds.rtps.history:make-cache-change :kind :data :sn 1 :serialized-payload m1))
+                      (ch2 (dds.rtps.history:make-cache-change :kind :data :sn 2 :serialized-payload m2)))
+                 (flet ((%seg-has (marker)
+                          (let ((mlen (length marker)))
+                            (loop for i from 0 to (- size mlen)
+                                  thereis (loop for j below mlen
+                                                always (= (cffi:mem-ref sap :uint8 (+ i j)) (aref marker j)))))))
+                   ;; NON-secured control: raw ZC, plaintext lands in the segment.
+                   (assert (%zc-change-item node ch1 1) () "B: non-secured control takes raw ZC")
+                   (assert (%seg-has m1) () "B: the non-secured control plaintext MUST appear in the segment (non-vacuity)")
+                   ;; ENCRYPT overlay: ZC IS taken, but the slot holds ciphertext -> the plaintext is ABSENT.
+                   (setf (disc-node-rtps-protection-kind node) :encrypt
+                         (disc-node-user-data-protection-kind node) :none
+                         (disc-node-crypto-transform node) km)
+                   (let ((s1 (disc-node-zc-sends node)))
+                     (assert (%zc-change-item node ch2 1) ()
+                             "B: an ENCRYPT-tier writer with an EntityCrypto KM MUST now take the ZC overlay path (a ref is built)")
+                     (assert (> (disc-node-zc-sends node) s1) ()
+                             "B: the overlay ZC send must advance zc-sends")
+                     (assert (not (%seg-has m2)) ()
+                             "B: the overlay slot must hold CIPHERTEXT — the plaintext must be provably ABSENT from the segment (the fix)")))))
+          (stop-node node)))))
+  t)
+
 (defvar *za2-rx-ctx* nil
   "WP-DDS-SECURITY-ZEROALLOC-AEAD T3(ZA-2) concurrency-test scratch: per-receiver-thread cons
    (EXPECTED-PAYLOAD . MISMATCH-COUNT) the shared node-b ON-DATA hook checks each SRTPS re-dispatch delivery
