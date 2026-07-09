@@ -2401,6 +2401,65 @@
       (dds.dcps:delete-participant p)))
   t)
 
+(defun* run-dcps-enable-test ()
+    (function () t)
+  "S2.T3 (DDS 1.4 §2.2.2.1.1.7 enable / §2.2.3.23 ENTITY_FACTORY): autoenable_created_entities on
+   the governing parent gates whether a child is enabled at create; a disabled entity restricts its
+   operations to the NOT_ENABLED-safe set (get_qos/set_qos/enable/set_listener) and returns
+   :not-enabled from data operations (write/read/take); enable() flips it and is idempotent; and
+   enable() on a child whose factory-parent is still disabled returns :precondition-not-met."
+  (let ((f (dds.dcps:get-participant-factory))
+        (ts (dds.types:find-type-support "dcps-msg")))
+    ;; Part A — factory autoenable OFF creates the participant disabled; enable() enables it.
+    (dds.dcps:set-participant-factory-autoenable f nil)
+    (let ((p (unwind-protect (dds.dcps:create-participant :domain (test-domain))
+               (dds.dcps:set-participant-factory-autoenable f t))))
+      (unwind-protect
+           (progn
+             (%check :en-part-disabled (not (dds.dcps:entity-enabled-p p))
+                     "factory autoenable OFF creates the participant DISABLED")
+             ;; a child of a still-disabled participant cannot be enabled (precondition)
+             (let ((pub0 (dds.dcps:create-publisher p)))
+               (%check :en-child-disabled (not (dds.dcps:entity-enabled-p pub0))
+                       "a Publisher created in a disabled participant is itself disabled")
+               (%check :en-precondition
+                       (eq :precondition-not-met (dds.dcps:enable pub0))
+                       "enable() on a child of a still-disabled participant returns :precondition-not-met"))
+             (%check :en-part-enable (eq :ok (dds.dcps:enable p))
+                     "enable() on the participant returns :ok")
+             (%check :en-part-enabled (dds.dcps:entity-enabled-p p)
+                     "the participant is enabled after enable()")
+             (%check :en-idempotent (eq :ok (dds.dcps:enable p))
+                     "enable() on an already-enabled entity is idempotent (:ok)")
+             ;; Part B — a disabled DataWriter refuses write and enables cleanly.
+             (let* ((tp (dds.dcps:create-topic p "EnableTopic" "dcps-msg" ts))
+                    (pub (dds.dcps:create-publisher p))
+                    (sub (dds.dcps:create-subscriber p)))
+               (setf (dds.dcps:entity-autoenable-created-entities pub) nil
+                     (dds.dcps:entity-autoenable-created-entities sub) nil)
+               (let ((dw (dds.dcps:create-datawriter pub tp))
+                     (dr (dds.dcps:create-datareader sub tp)))
+                 (%check :en-dw-disabled (not (dds.dcps:entity-enabled-p dw))
+                         "a DataWriter created under an autoenable-OFF Publisher is disabled")
+                 (%check :en-dw-write-refused
+                         (eq :not-enabled (dds.dcps:write-sample dw (make-dcps-msg :id 1 :text "en")))
+                         "write on a disabled DataWriter returns :not-enabled")
+                 (%check :en-dr-read-refused (eq :not-enabled (dds.dcps:read-samples dr))
+                         "read on a disabled DataReader returns :not-enabled")
+                 (%check :en-dr-take-refused (eq :not-enabled (dds.dcps:take-samples dr))
+                         "take on a disabled DataReader returns :not-enabled")
+                 ;; NOT_ENABLED-safe set: get_qos still works on a disabled entity
+                 (%check :en-safe-getqos (typep (dds.dcps:get-qos dr) 'dds.qos:qos)
+                         "get_qos is in the NOT_ENABLED-safe set (works while disabled)")
+                 (%check :en-dw-enable (eq :ok (dds.dcps:enable dw)) "enable() on the DataWriter returns :ok")
+                 (%check :en-dr-enable (eq :ok (dds.dcps:enable dr)) "enable() on the DataReader returns :ok")
+                 (%check :en-dw-write-ok (eq :ok (dds.dcps:write-sample dw (make-dcps-msg :id 1 :text "en")))
+                         "write on the now-enabled DataWriter returns :ok")
+                 (%check :en-dr-read-ok (listp (dds.dcps:read-samples dr))
+                         "read on the now-enabled DataReader returns a list"))))
+        (dds.dcps:delete-participant p))))
+  t)
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a

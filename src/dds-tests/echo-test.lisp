@@ -3855,6 +3855,7 @@
                  ("dcps-pubsub-immutability" . run-dcps-pubsub-immutability-test)
                  ("dcps-factory"             . run-dcps-factory-test)
                  ("dcps-children-registry"   . run-dcps-children-registry-test)
+                 ("dcps-enable"              . run-dcps-enable-test)
                  ("lease-unmatch"            . run-lease-unmatch-test)
                  ("liveliness-changed"       . run-liveliness-changed-test)
                  ("liveliness-lost"          . run-liveliness-lost-test)

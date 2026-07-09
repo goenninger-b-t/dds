@@ -21,6 +21,8 @@
 (defclass entity ()
   ((qos :initarg :qos :initform nil :accessor entity-qos)
    (enabled :initarg :enabled :initform nil :accessor entity-enabled-p)
+   (autoenable-created-entities :initarg :autoenable :initform t
+                                :accessor entity-autoenable-created-entities)
    (type-compat :initform nil :accessor entity-type-compat)
    (status-changes :initform 0 :type (unsigned-byte 32) :accessor %entity-status-changes)
    (status-condition :initform nil :accessor %entity-owned-status-condition))
@@ -33,7 +35,11 @@
    statuses changed since last read, maintained by %notify-status and read by
    get_status_changes (guarded by the entity's status lock; DataReader/DataWriter/Topic).
    STATUS-CONDITION is the entity's lazily-created, entity-owned StatusCondition (S0.T4;
-   dds_rtf2_dcps.idl §682), NIL until get_statuscondition is first called."))
+   dds_rtf2_dcps.idl §682), NIL until get_statuscondition is first called.
+   AUTOENABLE-CREATED-ENTITIES is this entity's ENTITY_FACTORY autoenable_created_entities policy
+   (DDS 1.4 §2.2.3.23, S2.T3): T (the spec default) auto-enables each CHILD this entity creates at
+   create time, NIL creates the child disabled until enable() is called (a local policy, never on
+   the wire). ENABLED is the DDS enabled state (§2.2.2.1.1.7) formalized by enable()/S2."))
 
 (defclass domain-participant (entity)
   ((domain :initarg :domain :reader dp-domain)
@@ -600,7 +606,8 @@
                                                                (%make-guid-prefix))
                                               :identity-token-octets
                                               (when identity (dds.security:identity-token identity))))
-               (p (make-instance 'domain-participant :domain domain :node node :enabled t
+               (p (make-instance 'domain-participant :domain domain :node node
+                                 :enabled (%child-created-enabled-p (get-participant-factory))   ; S2.T3: factory ENTITY_FACTORY autoenable
                                  :qos (or qos (when (typep *default-participant-qos* 'dds.qos:qos)
                                                 (dds.qos:copy-qos *default-participant-qos*))))))
           ;; Install hooks BEFORE the receiver thread starts so no early SEDP match is lost.
@@ -695,7 +702,7 @@
     (function (domain-participant) publisher)
   "DomainParticipant::create_publisher — create an enabled Publisher in P, adopting the
    participant's default Publisher QoS (DDS 1.4 §2.2.2.2.2) when one has been set."
-  (let ((pub (make-instance 'publisher :participant p :enabled t
+  (let ((pub (make-instance 'publisher :participant p :enabled (%child-created-enabled-p p)
                                        :qos (%parent-default-qos (dp-default-publisher-qos p)))))
     (push pub (dp-children p))
     pub))
@@ -704,7 +711,7 @@
     (function (domain-participant) subscriber)
   "DomainParticipant::create_subscriber — create an enabled Subscriber in P, adopting the
    participant's default Subscriber QoS (DDS 1.4 §2.2.2.2.2) when one has been set."
-  (let ((sub (make-instance 'subscriber :participant p :enabled t
+  (let ((sub (make-instance 'subscriber :participant p :enabled (%child-created-enabled-p p)
                                         :qos (%parent-default-qos (dp-default-subscriber-qos p)))))
     (push sub (dp-children p))
     sub))
@@ -715,7 +722,8 @@
    §2.2.2.2.2) when one has been set. TYPE-SUPPORT is a registered dds.types type-support (the
    generated codec bundle) used by write/take."
   (let ((tp (make-instance 'topic :name name :type-name type-name
-                                  :type-support type-support :participant p :enabled t
+                                  :type-support type-support :participant p
+                                  :enabled (%child-created-enabled-p p)
                                   :qos (%parent-default-qos (dp-default-topic-qos p)))))
     (push tp (dp-children p))
     tp))
@@ -821,7 +829,8 @@
                                     :history-depth (dds.qos:qos-history-depth qos))
     ;; WP-N-ENDPOINT-S1 (ADR 0048): capture THIS writer's distinct EntityId (add-local-writer set it, enable-publisher
     ;; just registered the engine writer under it) so write-sample routes into this writer's own HistoryCache.
-    (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos :enabled t)))
+    (let ((dw (make-instance 'data-writer :topic topic :publisher pub :qos qos
+                                          :enabled (%child-created-enabled-p pub))))
       (setf (dw-entity-id dw) (dds.disc:disc-node-user-writer-id node))
       (push dw (pub-writers pub))
       dw)))
@@ -861,7 +870,8 @@
     ;; vector. A plain reader -> NIL -> the allocating decode path stays byte-identical.
     (when (dds.disc:node-secured-reader-p node)
       (dds.disc:set-secured-loan-capable node t))
-    (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos :enabled t)))
+    (let ((dr (make-instance 'data-reader :topic topic :subscriber sub :qos qos
+                                          :enabled (%child-created-enabled-p sub))))
       (setf (dr-filter dr) (td-filter-predicate topic))   ; nil for a plain Topic
       ;; WP-N-ENDPOINT-S2 (ADR 0048): capture THIS reader's distinct EntityId (add-local-reader set it, enable-
       ;; subscriber registered the engine reader under it) so %drain's source-GUID filter routes delivery per reader.
@@ -944,6 +954,17 @@
    backpressure (WP-ASYNC-FLOW, FR-PF-2/FR-QOS, ADR 0016 §Backpressure). Represented as the keyword
    :timeout, the same sentinel the engine (dds.disc:publish-sample) surfaces.")
 
+(defparameter +retcode-not-enabled+ :not-enabled
+  "DDS 1.4 ReturnCode_t RETCODE_NOT_ENABLED (§2.2.4.4): an operation outside the NOT_ENABLED-safe
+   set (§2.2.2.1.1.7 — set_qos, get_qos, enable, get_statuscondition, set_listener) was called on a
+   still-disabled entity. Represented as the keyword :not-enabled; the operation had no effect.")
+
+(defparameter +retcode-precondition-not-met+ :precondition-not-met
+  "DDS 1.4 ReturnCode_t RETCODE_PRECONDITION_NOT_MET (§2.2.4.4): a precondition for the operation
+   was not met — enable() on an entity whose factory-parent is still disabled (§2.2.2.1.1.7), or
+   delete_* of a container that still holds contained entities / a Topic still referenced by an
+   endpoint (§2.2.2.2.1.5). Represented as the keyword :precondition-not-met; nothing was deleted.")
+
 (defparameter +retcode-immutable-policy+ :immutable-policy
   "DDS 1.4 ReturnCode_t RETCODE_IMMUTABLE_POLICY (§2.2.4.4): set_qos on an ENABLED entity tried
    to change a policy the DDS 1.4 §2.2.3 'changeable' column marks immutable-after-enable.
@@ -979,6 +1000,50 @@
         (return-from set-qos +retcode-immutable-policy+))))
   (setf (entity-qos entity) qos)
   +retcode-ok+)
+
+;;; ---- WP-DCPS-API-COMPLETION S2.T3: enable() + disabled-entity semantics (DDS 1.4 §2.2.2.1.1.7) ----
+
+(defun* %entity-factory-parent-enabled-p (entity)
+    (function (entity) boolean)
+  "Whether ENTITY's factory-parent (the entity that created it) is itself enabled (DDS 1.4
+   §2.2.2.1.1.7): a DomainParticipant's factory-parent is the DomainParticipantFactory (always
+   enabled -> T); a Publisher/Subscriber/Topic's is its DomainParticipant; a DataWriter's is its
+   Publisher; a DataReader's is its Subscriber. An entity can only transition to enabled once its
+   factory-parent is enabled."
+  (typecase entity
+    (domain-participant t)
+    (publisher (entity-enabled-p (pub-participant entity)))
+    (subscriber (entity-enabled-p (sub-participant entity)))
+    (topic (entity-enabled-p (topic-participant entity)))
+    (data-writer (entity-enabled-p (dw-publisher entity)))
+    (data-reader (entity-enabled-p (dr-subscriber entity)))
+    (t t)))
+
+(defun* enable (entity)
+    (function (entity) (member :ok :precondition-not-met))
+  "Entity::enable (DDS 1.4 §2.2.2.1.1.7) — transition ENTITY to the enabled state. Idempotent: an
+   already-enabled entity returns :ok with no effect. An entity whose factory-parent is still
+   disabled cannot be enabled and returns :precondition-not-met (the parent must be enabled first).
+   Enabling is monotonic (there is no disable in DDS). Once enabled, the entity's operations leave
+   the NOT_ENABLED-safe set and its QoS immutable-after-enable policies are frozen (set_qos, S1)."
+  (when (entity-enabled-p entity) (return-from enable +retcode-ok+))
+  (unless (%entity-factory-parent-enabled-p entity)
+    (return-from enable +retcode-precondition-not-met+))
+  (setf (entity-enabled-p entity) t)
+  +retcode-ok+)
+
+(defun* %child-created-enabled-p (parent)
+    (function (t) boolean)
+  "Whether a child created under PARENT is created ENABLED (DDS 1.4 §2.2.2.1.1.7 + §2.2.3.23): TRUE
+   iff PARENT's ENTITY_FACTORY autoenable_created_entities is set AND PARENT is itself enabled — a
+   child of a DISABLED factory-parent is ALWAYS created disabled (it cannot be enabled before its
+   parent). The DomainParticipantFactory is always enabled, so a participant's create-enabled state
+   is just the factory's autoenable flag. At the default (autoenable T, parent enabled) this is T —
+   byte-identical to the pre-S2.T3 always-enabled create paths. Consulted by every create_*."
+  (typecase parent
+    (domain-participant-factory (participant-factory-autoenable-p parent))
+    (entity (and (entity-autoenable-created-entities parent) (entity-enabled-p parent) t))
+    (t t)))
 
 ;;; ---- S1.T4: default-QoS getters/setters (DDS 1.4 §2.2.2), applied at create_* ----
 
@@ -1100,7 +1165,7 @@
     (%instance-handle (topic-type-support (dw-topic dw)) sample)))
 
 (defun* write-sample (dw sample)
-    (function (data-writer t) (member :ok :timeout))
+    (function (data-writer t) (member :ok :timeout :not-enabled))
   "DataWriter::write — serialize SAMPLE via the topic type-support and publish it reliably over the engine
    to all matched/discovered readers. Returns the DDS ReturnCode_t +RETCODE-OK+ (:ok) normally, or
    +RETCODE-TIMEOUT+ (:timeout) if the writer's HistoryCache was full and RELIABILITY.max_blocking_time
@@ -1115,7 +1180,10 @@
    WP-DATA-REPRESENTATION step 2 (DDS-XTypes 1.3 §7.6.3.1.1): the sample is serialized in DW's OFFERED
    representation (%writer-tx-rep = the first of its data-representation QoS) — :xcdr2 (default, PLAIN_CDR2_LE,
    byte-identical existing wire) or :xcdr1 (PLAIN_CDR_LE), so an XCDR1-offering writer can serve an XCDR1-only
-   reader; the rep applies to the payload only, never to the keyhash (always XCDR2-BE, RTPS 2.5 §9.6.4.8)."
+   reader; the rep applies to the payload only, never to the keyhash (always XCDR2-BE, RTPS 2.5 §9.6.4.8).
+   A DISABLED DataWriter refuses the write with +RETCODE-NOT-ENABLED+ (:not-enabled), the write outside
+   the NOT_ENABLED-safe set on a disabled entity (DDS 1.4 §2.2.2.1.1.7, S2.T3)."
+  (unless (entity-enabled-p dw) (return-from write-sample +retcode-not-enabled+))
   (let ((node (dp-node (pub-participant (dw-publisher dw)))))
     (when (eq :timeout (dds.disc:publish-sample
                         node (%serialize-sample (topic-type-support (dw-topic dw)) sample
@@ -2247,7 +2315,7 @@
   t)
 
 (defun* read-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
-    (function (data-reader &key (:states list) (:where function)) list)
+    (function (data-reader &key (:states list) (:where function)) (or list (member :not-enabled)))
   "DataReader::read — return the cached samples whose sample-state is in STATES
    (default ANY_SAMPLE_STATE, both read + not-read, per DDS 1.4) and whose data
    satisfies WHERE (a predicate over the deserialized sample; %where-any by default —
@@ -2256,7 +2324,10 @@
    else NOT_NEW). Returns a list of cached-sample (data + info). WP-DCPS-SECURED-TAKE-LOAN
    (ADR 0038 (i)): a returned secured sample's decode loan is released here (release-after-snapshot,
    %release-secured-copy-loan) — the sample STAYS in the cache (its DATA struct is independent + still
-   readable), so a secured copy-API reader recycles the pooled buffer per sample instead of pinning it."
+   readable), so a secured copy-API reader recycles the pooled buffer per sample instead of pinning it.
+   A DISABLED DataReader refuses the read with :not-enabled (outside the NOT_ENABLED-safe set,
+   DDS 1.4 §2.2.2.1.1.7, S2.T3)."
+  (unless (entity-enabled-p dr) (return-from read-samples +retcode-not-enabled+))
   (%drain dr)
   (let ((out '()) (touched '())
         (node (dp-node (sub-participant (dr-subscriber dr)))))
@@ -2275,12 +2346,15 @@
     (nreverse out)))
 
 (defun* take-samples (dr &key (states '(:read :not-read)) (where #'%where-any))
-    (function (data-reader &key (:states list) (:where function)) list)
+    (function (data-reader &key (:states list) (:where function)) (or list (member :not-enabled)))
   "DataReader::take — like read-samples but REMOVE the returned samples from the
    cache (default takes both read and unread). WHERE is the same optional query
    predicate (take_w_condition filter). Returns a list of cached-sample. WP-DCPS-SECURED-TAKE-LOAN
    (ADR 0038 (i)): a TAKEN secured sample's decode loan is released here (%release-secured-copy-loan) —
-   the returned DATA struct is independent, so the pooled buffer is recycled per take instead of pinned."
+   the returned DATA struct is independent, so the pooled buffer is recycled per take instead of pinned.
+   A DISABLED DataReader refuses the take with :not-enabled (outside the NOT_ENABLED-safe set,
+   DDS 1.4 §2.2.2.1.1.7, S2.T3)."
+  (unless (entity-enabled-p dr) (return-from take-samples +retcode-not-enabled+))
   (%drain dr)
   (let ((keep '()) (out '()) (touched '())
         (node (dp-node (sub-participant (dr-subscriber dr)))))

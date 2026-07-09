@@ -25,6 +25,9 @@
            ;; WP-DCPS-API-COMPLETION S2.T2: parent->children containment registry (DDS 1.4 §2.2.2)
            #:participant-publishers #:participant-subscribers #:participant-topics
            #:publisher-datawriters #:subscriber-datareaders
+           ;; WP-DCPS-API-COMPLETION S2.T3: enable() + disabled-entity semantics (DDS 1.4 §2.2.2.1.1.7)
+           #:enable #:entity-autoenable-created-entities
+           #:+retcode-not-enabled+ #:+retcode-precondition-not-met+
            #:write-sample #:read-samples #:take-samples #:samples-available
            ;; WP-FLATDATA-ZC-LOAN literal-0-copy loan API (FR-PF-3/4, R6, ADR 0017)
            #:take-loaned #:read-loaned #:return-loan #:return-all-loans
