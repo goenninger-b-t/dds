@@ -3850,6 +3850,7 @@
                  ("dcps-read-status-reset"   . run-dcps-read-status-reset-test)
                  ("dcps-listener-levels"     . run-dcps-listener-levels-test)
                  ("dcps-listener-propagation" . run-dcps-listener-propagation-test)
+                 ("dcps-data-on-readers"     . run-dcps-data-on-readers-test)
                  ("dcps-qos-immutability-table" . run-dcps-qos-immutability-table-test)
                  ("dcps-qos-consistency"     . run-dcps-qos-consistency-test)
                  ("dcps-get-set-qos"         . run-dcps-get-set-qos-test)

@@ -150,6 +150,8 @@
            #:set-reader-listener #:set-writer-listener
            ;; WP-DCPS-API-COMPLETION S3.T1: uniform set_listener/get_listener on all six kinds
            #:set-listener #:get-listener
+           ;; WP-DCPS-API-COMPLETION S3.T3: on_data_on_readers + get_datareaders/notify_datareaders
+           #:get-datareaders #:notify-datareaders
            ;; Content-filter / query SQL-subset grammar (FR-DCPS-5)
            #:compile-filter #:lex-filter #:filter-error #:filter-error-detail
            #:content-filtered-topic #:create-contentfilteredtopic

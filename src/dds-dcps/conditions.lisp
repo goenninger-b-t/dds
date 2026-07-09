@@ -135,6 +135,7 @@
                    :sample-rejected :liveliness-changed :requested-deadline-missed :sample-lost))
     (data-writer '(:publication-matched :offered-incompatible-qos :liveliness-lost
                    :offered-deadline-missed))
+    (subscriber '(:data-on-readers))
     (topic '(:inconsistent-topic))
     (t '())))
 
@@ -189,15 +190,20 @@
 (defun* %status-active-p (entity kind)
     (function (entity keyword) t)
   "Whether the communication status KIND is currently active on ENTITY (the trigger predicate
-   for a StatusCondition). :data-available is level-based on unread samples; every other kind is
-   active iff its StatusChangedFlag bit is set in ENTITY's status-changes bitmask — set by the
-   %notify-status chokepoint when the status fires, cleared by the matching get_*_status
-   (read-communication-status reset, DDS 1.4 §2.2.4.1 / §2.2.2.1.9). This is the entity
-   bitmask ∧ the StatusCondition's enabled_statuses (the caller intersects with sc-mask)."
-  (if (eq kind :data-available)
-      (and (typep entity 'data-reader) (plusp (%count-matching entity '(:not-read))) t)
-      (let ((bit (cdr (assoc kind *status-kind->bit*))))
-        (and bit (logtest bit (%entity-status-changes entity)) t))))
+   for a StatusCondition). :data-available (reader) and :data-on-readers (subscriber) are level-
+   based on unread samples; every other kind is active iff its StatusChangedFlag bit is set in
+   ENTITY's status-changes bitmask — set by the %notify-status chokepoint when the status fires,
+   cleared by the matching get_*_status OR by a listener consuming it (read/invocation reset, DDS
+   1.4 §2.2.4.1 / §2.2.2.1.9). This is the entity bitmask ∧ the StatusCondition's enabled_statuses
+   (the caller intersects with sc-mask)."
+  (cond
+    ((eq kind :data-available)
+     (and (typep entity 'data-reader) (plusp (%count-matching entity '(:not-read))) t))
+    ((eq kind :data-on-readers)
+     (and (typep entity 'subscriber)
+          (some (lambda (dr) (plusp (%count-matching dr '(:not-read)))) (sub-readers entity)) t))
+    (t (let ((bit (cdr (assoc kind *status-kind->bit*))))
+         (and bit (logtest bit (%entity-status-changes entity)) t)))))
 
 (defmethod condition-trigger-value ((c status-condition))
   (and (some (lambda (kind) (%status-active-p (sc-entity c) kind)) (sc-mask c)) t))

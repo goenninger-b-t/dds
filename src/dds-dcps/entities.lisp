@@ -181,6 +181,9 @@
 ;; conditions.lisp (loaded after this file): forward-declared so %notify-status /
 ;; %trigger-status-condition (S0.T3/T4) reach the WaitSet wake helpers without a warning.
 (declaim (ftype (function (t) t) %notify-condition))
+;; conditions.lisp: forward-declared so get_datareaders (S3.T3) can drain+count a reader's
+;; newly-received samples on the app thread without a compile-time undefined-function warning.
+(declaim (ftype (function (data-reader list) (integer 0)) %count-matching))
 
 ;;; ---- WP-DCPS-API-COMPLETION S0: per-entity status-changes bitmask + introspection ----
 
@@ -1611,16 +1614,21 @@
   (setf (instance-rec-not-alive-since rec) (%lease-now))
   t)
 
+(defun* %fire-data-available (dr)
+    (function (data-reader) t)
+  "Fire DR's DATA_AVAILABLE on the MOST-SPECIFIC enabled listener in reader -> Subscriber ->
+   DomainParticipant (DDS 1.4 §2.2.4.1 propagation), if any — OUTSIDE any status lock. A level-
+   based status (unread samples), so no bitmask bit / reset is involved."
+  (let ((l (%find-enabled-listener dr :data-available)))
+    (when l (on-data-available l dr)))
+  t)
+
 (defun* %wake-reader-data (dr)
     (function (data-reader) t)
-  "Fire DR's on_data_available (if masked) OUTSIDE the status lock, then wake its WaitSets —
-   the same DATA_AVAILABLE notification path as the on-sample hook (DDS 1.4 §2.2.4.1)."
-  (let ((fire nil))
-    (dds.pal:with-lock ((dr-status-lock dr))
-      (when (and (dr-listener dr) (member :data-available (dr-listener-mask dr)))
-        (setf fire t)))
-    (when fire (on-data-available (dr-listener dr) dr))
-    (%notify-reader-conditions dr))
+  "Fire DR's on_data_available (propagated up its containment chain) then wake its WaitSets —
+   the DATA_AVAILABLE notification path (DDS 1.4 §2.2.4.1) when DATA_ON_READERS was not handled."
+  (%fire-data-available dr)
+  (%notify-reader-conditions dr)
   t)
 
 (defun* %on-disc-lifecycle (p wid sn kind key-hash status-flags)
@@ -1638,7 +1646,7 @@
    S2-source-GUID-filtered lifecycle change on the user thread, so a spurious wake of a reader with
    nothing pending is benign (level-triggered DATA_AVAILABLE, DDS 1.4 §2.2.4.1). N=1 == the sole reader."
   (declare (ignore wid sn kind key-hash status-flags))
-  (dolist (dr (%participant-readers p)) (%wake-reader-data dr))
+  (%deliver-data-on-readers p)
   t)
 
 (defun* %drain-one-lifecycle (dr node key)
@@ -2595,16 +2603,55 @@
                         (when dw (%writer-incompatible dw bad))))))
   t)
 
+(defun* %deliver-data-on-readers (p)
+    (function (domain-participant) t)
+  "The DATA_ON_READERS / DATA_AVAILABLE delivery decision on new data for participant P (DDS 1.4
+   §2.2.4.1 precedence). For each Subscriber with DataReaders: if a listener enabled for
+   DATA_ON_READERS exists on the Subscriber or the DomainParticipant, invoke on_data_on_readers on
+   the MOST-SPECIFIC such listener and DO NOT fire the readers' on_data_available (the precedence
+   rule) — but still wake their WaitSets so a waiting reader drains; otherwise fire each reader's
+   on_data_available (propagated up its own chain via %wake-reader-data). The disc callbacks are
+   participant-coarse (no reader identity), so this is level-triggered — a spurious notification of a
+   subscriber whose readers have nothing pending is benign (mirrors the existing DATA_AVAILABLE wake)."
+  (dolist (sub (participant-subscribers p))
+    (let ((readers (sub-readers sub)))
+      (when readers
+        (let ((l (%find-enabled-listener sub :data-on-readers)))
+          (if l
+              (progn
+                (on-data-on-readers l sub)
+                (dolist (dr readers) (%notify-reader-conditions dr)))
+              (dolist (dr readers) (%wake-reader-data dr)))))))
+  t)
+
 (defun* %on-participant-sample (p)
     (function (domain-participant) t)
-  "ON-SAMPLE hook (disc receiver thread): new user data arrived for P. Fire on_data_available
-   if a listener is masked for it, then wake the reader's WaitSets (DATA_AVAILABLE / ReadCondition /
-   QueryCondition). Holds no node lock here (the disc layer released it before calling).
-   WP-N-ENDPOINT-S5 (ADR 0048): the disc data-ready callback carries no writer identity, so wake EVERY
-   local reader (DRY via %wake-reader-data); each drains only its own S2-source-GUID-filtered samples,
-   so a spurious wake of a reader with nothing pending is benign (level-triggered DATA_AVAILABLE, DDS
-   1.4 §2.2.4.1). N=1 == the sole reader."
-  (dolist (dr (%participant-readers p)) (%wake-reader-data dr))
+  "ON-SAMPLE hook (disc receiver thread): new user data arrived for P. Route through the
+   DATA_ON_READERS / DATA_AVAILABLE precedence decision (%deliver-data-on-readers, DDS 1.4
+   §2.2.4.1). Holds no node lock here (the disc layer released it before calling).
+   WP-N-ENDPOINT-S5 (ADR 0048): the disc data-ready callback carries no writer identity, so every
+   local reader is considered; each drains only its own S2-source-GUID-filtered samples, so a
+   spurious wake of a reader with nothing pending is benign (level-triggered). N=1 == the sole reader."
+  (%deliver-data-on-readers p)
+  t)
+
+(defun* get-datareaders (subscriber &key (sample-states '(:not-read)))
+    (function (subscriber &key (:sample-states list)) list)
+  "DDS Subscriber::get_datareaders (dds_rtf2_dcps.idl §993, DDS 1.4 §2.2.2.5.2.7): the list of
+   SUBSCRIBER's DataReaders that hold at least one sample whose sample_state is in SAMPLE-STATES
+   (default (:not-read) — readers with NEW data). Runs on the app thread and drains each reader's
+   newly-received samples first (via %count-matching), so a reader that just received data is
+   included. The DDS view_state / instance_state filters are v1-deferred (sample_state only)."
+  (remove-if-not (lambda (dr) (plusp (%count-matching dr sample-states)))
+                 (sub-readers subscriber)))
+
+(defun* notify-datareaders (subscriber)
+    (function (subscriber) t)
+  "DDS Subscriber::notify_datareaders (dds_rtf2_dcps.idl §998, DDS 1.4 §2.2.2.5.2.8): invoke
+   on_data_available on each of SUBSCRIBER's DataReaders that has new data (get_datareaders). The
+   application calls this from on_data_on_readers to cascade DATA_ON_READERS down to the per-reader
+   DATA_AVAILABLE callbacks (each propagated up its own reader -> Subscriber -> participant chain)."
+  (dolist (dr (get-datareaders subscriber)) (%fire-data-available dr))
   t)
 
 (defun* %reader-matched (dr handle)

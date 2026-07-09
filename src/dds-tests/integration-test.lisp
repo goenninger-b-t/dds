@@ -2282,6 +2282,50 @@
       (dds.dcps:delete-participant p2))
     t))
 
+(defclass capturing-subscriber-listener (capture-mixin dds.dcps:subscriber-listener) ())
+(defmethod dds.dcps:on-data-on-readers ((l capturing-subscriber-listener) subscriber)
+  (declare (ignore subscriber))
+  (dds.pal:with-lock ((cap-lock l)) (push :data-on-readers (cap-hits l))))
+
+(defun* run-dcps-data-on-readers-test ()
+    (function () t)
+  "S3.T3 (dds_rtf2_dcps.idl §248/§993/§998, DDS 1.4 §2.2.4.1): on data arrival a Subscriber
+   listener enabled for DATA_ON_READERS receives on_data_on_readers, and its readers'
+   on_data_available is SUPPRESSED (precedence). get_datareaders lists the readers with new
+   data; notify_datareaders then fires on_data_available on each."
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain)))
+        (subl (make-instance 'capturing-subscriber-listener))
+        (dal (make-instance 'data-available-listener)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "DorTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "DorTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr)))
+           (dds.dcps:set-listener sub subl '(:data-on-readers))
+           (dds.dcps:set-reader-listener dr dal '(:data-available))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (dds.dcps:write-sample dw (make-dcps-msg :id 42 :text "dor"))
+           (loop repeat 80 until (member :data-on-readers (cap-snapshot subl)) do (sleep 0.02))
+           (%check :dor-fired (and (member :data-on-readers (cap-snapshot subl)) t)
+                   "on_data_on_readers must fire on the subscriber listener when new data arrives")
+           (%check :dor-suppresses-available (null (member :data-available (cap-snapshot dal)))
+                   "on_data_available must NOT fire while on_data_on_readers handled DATA_ON_READERS")
+           (let ((rs (dds.dcps:get-datareaders sub :sample-states '(:not-read))))
+             (%check :dor-get-datareaders (and (member dr rs) t)
+                     "get_datareaders must list the reader that has new data"))
+           (dds.dcps:notify-datareaders sub)
+           (loop repeat 60 until (member :data-available (cap-snapshot dal)) do (sleep 0.02))
+           (%check :dor-notify-datareaders (and (member :data-available (cap-snapshot dal)) t)
+                   "notify_datareaders must fire on_data_available on each reader with data"))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
 (defun* run-dcps-qos-immutability-table-test ()
     (function () t)
   "S1.T1 (DDS 1.4 §2.2.3 the per-policy 'changeable' column): the QoS policy immutability
