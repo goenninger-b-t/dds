@@ -73,3 +73,33 @@
   (dolist (entry *qos-immutability-table* +qos-policy-id-invalid+)
     (unless (funcall (the function (third entry)) old new)
       (return (the integer (second entry))))))
+
+;;; ---- S1.T2: the cross-policy consistency validator (INCONSISTENT_POLICY) ----
+
+(defun* %resource-limit-bounded-p (n)
+    (function (integer) boolean)
+  "T iff a RESOURCE_LIMITS limit N is an active finite bound (>= 0), i.e. NOT the DDS
+   LENGTH_UNLIMITED sentinel -1 (dds_rtf2_dcps.idl LENGTH_UNLIMITED). An unlimited limit
+   imposes no consistency constraint."
+  (>= n 0))
+
+(defun* %qos-consistent-p (qos)
+    (function (dds.qos:qos) (values boolean integer))
+  "Validate the DDS 1.4 cross-policy consistency rules that raise INCONSISTENT_POLICY,
+   returning (values OK-P FAILING-POLICY-ID). The rules (a LENGTH_UNLIMITED -1 limit disables
+   its bound): §2.2.3.19 RESOURCE_LIMITS.max_samples >= max_samples_per_instance (else the
+   RESOURCE_LIMITS id); §2.2.3.18 HISTORY (KEEP_LAST) depth <= RESOURCE_LIMITS.max_samples_per_
+   instance (else the HISTORY id). A consistent QoS yields (values T +qos-policy-id-invalid+).
+   Policies the stack does not yet model (TIME_BASED_FILTER minimum_separation vs DEADLINE) are
+   not checked here — recorded as a follow-on, not silently claimed."
+  (let ((max-samples (dds.qos:qos-resource-max-samples qos))
+        (mspi (dds.qos:qos-resource-max-samples-per-instance qos)))
+    (when (and (%resource-limit-bounded-p max-samples)
+               (%resource-limit-bounded-p mspi)
+               (> mspi max-samples))
+      (return-from %qos-consistent-p (values nil +qos-policy-id-resource-limits+)))
+    (when (and (eq :keep-last (dds.qos:qos-history-kind qos))
+               (%resource-limit-bounded-p mspi)
+               (> (dds.qos:qos-history-depth qos) mspi))
+      (return-from %qos-consistent-p (values nil +qos-policy-id-history+)))
+    (values t +qos-policy-id-invalid+)))

@@ -2200,6 +2200,42 @@
     (%check :mut-partition (not (imm :partition)) "PARTITION is mutable"))
   t)
 
+(defun* run-dcps-qos-consistency-test ()
+    (function () t)
+  "S1.T2 (DDS 1.4 §2.2.3.18 HISTORY / §2.2.3.19 RESOURCE_LIMITS — INCONSISTENT_POLICY):
+   %qos-consistent-p returns (values ok-p failing-policy-id). A default QoS is consistent;
+   RESOURCE_LIMITS.max_samples_per_instance > max_samples fails with the RESOURCE_LIMITS id;
+   HISTORY KEEP_LAST depth > RESOURCE_LIMITS.max_samples_per_instance fails with the HISTORY id;
+   LENGTH_UNLIMITED (-1) limits disable the bound (a bounded valid combo is consistent)."
+  (flet ((cons-p (q) (dds.dcps::%qos-consistent-p q)))
+    (multiple-value-bind (okp pid) (cons-p (dds.qos:make-qos))
+      (%check :cons-default okp "a default qos is consistent")
+      (%check :cons-default-pid (= pid dds.dcps:+qos-policy-id-invalid+)
+              "a consistent qos yields the INVALID policy id"))
+    (multiple-value-bind (okp pid)
+        (cons-p (dds.qos:make-qos :history-kind :keep-all
+                                  :resource-max-samples 5 :resource-max-samples-per-instance 10))
+      (%check :cons-rl-bad (not okp) "max_samples_per_instance (10) > max_samples (5) is inconsistent")
+      (%check :cons-rl-pid (= pid dds.dcps:+qos-policy-id-resource-limits+)
+              "the RESOURCE_LIMITS max_samples relation reports the RESOURCE_LIMITS id"))
+    (multiple-value-bind (okp pid)
+        (cons-p (dds.qos:make-qos :history-kind :keep-last :history-depth 20
+                                  :resource-max-samples-per-instance 10 :resource-max-samples 100))
+      (%check :cons-hist-bad (not okp) "KEEP_LAST depth (20) > max_samples_per_instance (10) is inconsistent")
+      (%check :cons-hist-pid (= pid dds.dcps:+qos-policy-id-history+)
+              "the HISTORY depth relation reports the HISTORY id"))
+    (multiple-value-bind (okp pid)
+        (cons-p (dds.qos:make-qos :history-kind :keep-last :history-depth 5
+                                  :resource-max-samples-per-instance 10 :resource-max-samples 100))
+      (declare (ignore pid))
+      (%check :cons-valid okp "depth (5) <= mspi (10) <= max_samples (100) is consistent"))
+    (multiple-value-bind (okp pid)
+        (cons-p (dds.qos:make-qos :history-kind :keep-last :history-depth 50
+                                  :resource-max-samples-per-instance -1 :resource-max-samples -1))
+      (declare (ignore pid))
+      (%check :cons-unlimited okp "LENGTH_UNLIMITED (-1) limits disable the depth bound")))
+  t)
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a
