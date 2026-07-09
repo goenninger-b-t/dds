@@ -680,6 +680,19 @@ non-secured writer (both kinds `:none`, the default) is untouched — full Zero-
 zero-alloc. Proof: `dds.disc:run-zc-shmem-secured-cleartext-test` (Part B inspects the live pool segment and asserts
 the secured payload is provably absent while a non-secured control's marker is present).
 
+**Confidential Zero-Copy for an ENCRYPT-tier writer — the in-slot SecuredPayload overlay (ADR 0051).** Gating off
+means a wire-protected writer forfeits Zero-Copy on every large sample. WP-SECURITY-ZC-SHMEM-OVERLAY closes that for
+the **ENCRYPT** case: an ENCRYPT-tier writer with `data_protection` = NONE now **keeps Zero-Copy** by sealing the
+serialized payload **into the pool slot as a `data_protection` `SecuredPayload`** under its per-writer EntityCrypto
+key (`%zc-overlay-eligible-p` T ⇒ `%zc-change-item` takes the overlay arm instead of returning NIL). The slot holds
+ciphertext, and the 20-octet reference carries an integrity-protected **overlay sentinel**
+(`dds.cdr:+zc-ref-overlay-secured+`, in the `reserved` field inside the rtps/metadata wrap) so the reader decodes
+the slot copy-on-read — regardless of its own governance — and drops fail-closed on a missing key or a tampered
+slot. `SIGN`-only and loan-write writers stay gated (a SIGN payload is visible on the wire; a raw-ZC-for-SIGN
+relaxation is deferred), so the leak stays closed for all tiers. Non-overlay references stay `reserved = 0` — wire
+byte-identical. See [security.md §3.8](security.md) and ADR 0051. Proof:
+`dds.disc:run-zc-shmem-secured-overlay-test`.
+
 | Symbol | Kind | Meaning |
 |---|---|---|
 | `dds.disc:*zerocopy-enabled*` | special var | **Default `NIL`.** Read once per node at `make-disc-node`; when `T` (and SHMEM is available) the node builds a Zero-Copy writer pool and advertises `PID_ZEROCOPY_CAPABLE`. NOT cleared for ship — pending counsel (R6). |
@@ -687,7 +700,8 @@ the secured payload is provably absent while a non-secured control's marker is p
 | `dds.disc:+zerocopy-pool-slots+` / `+zerocopy-pool-slot-bytes+` | constants | Shared pool geometry (32 slots x 65536 octets), used by **both** pool creation and the reader's attach sizing (one definition). |
 | `dds.disc:disc-node-zc-sends` | accessor | Count of samples this node published as a 16-byte reference (proof/diagnostic). |
 | `dds.rtps.discovery:endpoint-data-zerocopy-capable` | accessor | T iff the endpoint advertised `PID_ZEROCOPY_CAPABLE` (fail-open: absent → NIL). |
-| `dds.cdr:+zc-encapsulation-id+` / `encode-zc-reference` / `parse-zc-reference` | constant / functions | The 20-octet reference codec (4-octet encapsulation header + `{slot-index, generation, slot-bytes, reserved}` LE). |
+| `dds.cdr:+zc-encapsulation-id+` / `encode-zc-reference` / `parse-zc-reference` | constant / functions | The 20-octet reference codec (4-octet encapsulation header + `{slot-index, generation, slot-bytes, reserved}` LE). `parse-zc-reference` returns the `reserved` field as a 4th value. |
+| `dds.cdr:+zc-ref-overlay-secured+` | constant | The overlay sentinel (value 1) placed in the reference's `reserved` u32 when the slot holds a `data_protection` `SecuredPayload` overlay (ENCRYPT-tier ZC, ADR 0051); 0 = raw (byte-identical to a non-overlay reference). A LOCAL transport discriminator in our own ZC reference format, not an OMG wire constant; it rides inside the rtps/metadata wrap so a SHMEM attacker cannot flip it. |
 | `dds.xport.zerocopy` | package | The SHMEM sample-pool. The mutex'd copy-resolve (`%zc-resolve`/`%zc-resolve-fresh`) keeps full Clasp parity; the **loaned-RX path is lock-free** (WP-ZC-LOAN-LOCKFREE, ADR 0018, R6): `%zc-loan` writes payload → `fence :release` → generation-store-LAST (the generation is the release/acquire sync variable), `%zc-acquire-for-read` is a generation acquire-load + `fence :acquire` + clamped read (0-copy/0-alloc), and `%zc-release` is a direct `cas-sap-u32` refcount decrement (0-alloc at any generation; the freelist was dropped, so the writer's loan scans the lowest-pubseq `refcount==0` slot, O(slots)). The lock-free path is SBCL-only (foreign-SAP atomics, ADR 0013); Clasp pass-skips. |
 
 The pool segment name derives deterministically from the writer GUID (`seg-name-for-guid` + `"z"`), so the

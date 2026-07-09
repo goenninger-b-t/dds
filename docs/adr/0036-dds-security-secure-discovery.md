@@ -565,6 +565,16 @@ work-package ledger:
     classic ZC path intentionally leaves un-gated: there the pool receives the already-transformed
     SecuredPayload, but a loan-write slot holds the app's PRE-transform field writes, so any transforming config
     fails closed to the fallback sample. See ADR 0042 §6.
+    **ENCRYPT-tier writers now get ZC via an in-slot overlay (WP-SECURITY-ZC-SHMEM-OVERLAY, ADR 0051,
+    2026-07-09).** Rather than only gating off, a wire-protected ENCRYPT-tier writer (`rtps_protection` or
+    `metadata_protection` = ENCRYPT, `data_protection` = NONE) MAY now use Zero-Copy/SHMEM by sealing the
+    serialized payload **into the pool slot as a `data_protection` `SecuredPayload` overlay** under its
+    per-writer EntityCrypto key (reusing `encode/decode-serialized-payload-into`, ADR 0038); the slot holds
+    ciphertext, an integrity-protected overlay sentinel rides inside the wire-protected reference datagram, and
+    the reader decodes copy-on-read fail-closed. **The leak stays closed for ALL tiers:** a wire-protected
+    writer now either seals the overlay (ENCRYPT) or is gated off (SIGN-only + loan-write). **SIGN-only stays
+    gated pending the follow-on** — a SIGN payload is visible on the wire, so plaintext-in-SHMEM is not a new
+    exposure; relaxing it to raw ZC (no overlay needed) is deferred. See ADR 0051.
 11. **Live RTI Connext-Security secure-discovery interop — the P6 exit gate.** Requires the licensed Security
     Plugins (not installed). The Fast DDS-Security peer + harness + run scripts now exist in
     `interop/security-secure-discovery/` for Slice 5.

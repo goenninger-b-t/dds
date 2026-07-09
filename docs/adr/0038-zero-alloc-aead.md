@@ -248,9 +248,17 @@ tear-safe only while session_id is effectively constant per km and decode is sin
 
 **(b) KeyMaterial GC-heap → foreign + zeroize (ADR-0034 deferral). — RESOLVED (commit `6beb08b`, WP-SECURITY-KEYMATERIAL-HARDEN).** The KeyMaterial MASTER secrets (salt/sender/receiver) are now foreign/static + zeroize-on-teardown. The DERIVED session-key caches deliberately stay GC-heap — a review caught that foreign-static-per-session_id would unboundedly leak un-wiped key bytes on session_id rotation (pre-auth-reachable), so they are heap-by-design (ephemeral/re-derivable/GC-safe), with a RED regression guard asserting rotated keys stay GC-heap. Scope closed to the master slots.
 
-**(c) Zero-Copy × `rtps_protection` SHMEM cleartext (ADR-0036 Carry 10).** With ZC/SHMEM transfer only the 16-byte
-reference datagram is RTPS-wrapped; the payload sits in shared memory in the clear. Reconciling SHMEM with
-`rtps_protection` confidentiality is a backlog item (and crypto+ZC is loud-guarded per ADR 0031).
+**(c) Zero-Copy × `rtps_protection` SHMEM cleartext (ADR-0036 Carry 10). — RESOLVED for the ENCRYPT case
+(WP-SECURITY-ZC-SHMEM-OVERLAY, ADR 0051, 2026-07-09).** With ZC/SHMEM transfer only the 20-byte reference
+datagram is RTPS-wrapped; the payload sits in shared memory in the clear, so the raw ZC path was gated OFF for
+any `rtps_protection`/`metadata_protection` writer (ADR 0036 Carry 10; crypto+ZC loud-guarded per ADR 0031 §4).
+**ADR 0051 relaxes the guard for the ENCRYPT tier:** an ENCRYPT-tier writer (`data_protection` = NONE) now uses
+ZC by sealing the serialized payload **into the pool slot as a `data_protection` `SecuredPayload` overlay**
+under its per-writer EntityCrypto key — REUSING the `encode/decode-serialized-payload-into` core delivered by
+this ADR verbatim, with the overlay discriminator carried inside the wire-protected reference datagram and a
+copy-on-read fail-closed decode. So the slot holds ciphertext and no cleartext user payload lands in SHMEM.
+**SIGN-only tiers stay gated** (deferred follow-on: a SIGN payload is visible on the wire, so plaintext-in-SHMEM
+is not a new exposure — raw ZC for SIGN needs no overlay and is future work). See ADR 0051.
 
 **(d) Saved-image foreign-pointer staleness (T1b-i). — RESOLVED (WP-ADR-SMALL-CARRIES C3, 2026-07-03).** The
 `load-time-value` / `eval-when`-cached EVP function pointers + the `EVP_aes_256_gcm()` handle were correct for

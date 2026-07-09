@@ -159,12 +159,25 @@ references (`%zc-defer` declines the marker when the overlay sentinel is set), b
 ### 4.6 Nonce uniqueness
 
 `encode-serialized-payload-into` advances the writer EntityCrypto KM's monotonic,
-lock-guarded `iv-counter` (`transform.lisp:49`). When `data_protection` = NONE, the overlay
-encode is the *only* consumer of that KM's counter (the rtps/metadata wire wrap uses the
-participant KM, not the EntityCrypto KM). Nonce uniqueness per (key, session_id) is therefore
-structural. Sending the same cache-change to both a remote reader (wire wrap, participant KM)
-and a local reader (overlay, EntityCrypto KM) advances only the EntityCrypto counter once for
-the overlay; the two encodings are independent and both yield the same plaintext on decode.
+lock-guarded `iv-counter` via `%km-next-iv-suffix-into` (`transform.lisp:49`). Nonce
+uniqueness per (key, session_id) holds because **every consumer of the writer's EntityCrypto
+key resolves the SAME `key-material` object, and that object has a SINGLE monotonic,
+lock-guarded `iv-counter`** — so each encode draws a distinct counter value ⇒ a distinct IV ⇒
+no (key, nonce) reuse. This matters precisely because, for the `metadata_protection=ENCRYPT`
+eligibility trigger, the EntityCrypto counter has **two** consumers, not one: the
+`metadata_protection` submessage wrap of the reference DATA resolves its key via
+`cm-encode-entity-km cm user-writer-id` (`crypto-manager.lisp:834`), and the overlay resolves
+via `%zc-overlay-km` → `crypto-keys` `encode-key-fn` → `cm-encode-entity-km cm user-writer-id`
+(`crypto-manager.lisp:418`); `cm-register-local-entity` mints exactly ONE KeyMaterial per
+entity-id (idempotent get-or-create), so both resolve the identical KM object and both draw
+from its one shared counter — distinct values each. (Only `rtps_protection` uses the separate
+*participant* KM, a different object with its own counter.)
+
+> **Warning (tie to the forward requirement).** Do NOT assume the overlay is the sole consumer
+> of the EntityCrypto counter. Nonce safety rests on all consumers **sharing one KM object**. A
+> future optimization that introduced a SECOND COPY of the EntityCrypto KM (rather than sharing
+> the one object) would give each copy its own counter, silently reintroducing catastrophic
+> AES-GCM (key, nonce) reuse. Any such change MUST preserve the single-shared-KM invariant.
 
 ## 5. Gate / routing summary
 

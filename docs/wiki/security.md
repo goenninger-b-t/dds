@@ -590,6 +590,70 @@ predicate and that `%zc-change-item` returns NIL under `rtps_protection` and und
 (where SHMEM is available) inspects the **live pool segment** and asserts the secured payload is provably **absent**
 while a non-secured control's marker **is** present (non-vacuous).
 
+### 3.8 Confidential Zero-Copy for an ENCRYPT-tier writer — the in-slot SecuredPayload overlay (ADR 0051)
+
+§3.7 keeps a secured writer's plaintext out of SHMEM by **gating off** Zero-Copy for any writer whose
+`rtps_protection`/`metadata_protection` is non-NONE — correct, but such a writer then forfeits Zero-Copy on every
+large sample.  ADR 0051 (WP-SECURITY-ZC-SHMEM-OVERLAY) closes that gap for the **confidentiality (ENCRYPT)** case:
+an ENCRYPT-tier writer whose `data_protection` is NONE now **keeps Zero-Copy** by sealing the serialized payload
+**into the pool slot as a `data_protection` `SecuredPayload`** (§1) under its own **per-writer EntityCrypto key** —
+the same AES256-GCM key already minted at `cm-register-local-entity` and shipped to every matched reader as a
+`datawriter_crypto_tokens` CryptoToken.  The slot holds ciphertext, so a co-resident process mapping the segment
+recovers only an AES-GCM ciphertext+tag; the reader **decodes copy-on-read** and delivers the plaintext.  No new
+key, no new derivation, no new exchange, and **no new wire format** — the overlay bytes are the identical,
+byte-exact-tested §9.5.3.3 `SecuredPayload`.
+
+**How the reader knows the slot is an overlay.**  The 20-octet Zero-Copy reference datagram's spare `reserved`
+u32 is repurposed as an **overlay sentinel** (`dds.cdr:+zc-ref-overlay-secured+` = 1; 0 = raw, byte-identical to a
+non-overlay reference).  It rides **inside** the `rtps`/`metadata` wrap, so it is integrity-protected — a
+SHMEM-resident attacker cannot flip it to make the reader treat ciphertext as plaintext.  When
+`parse-zc-reference` reports the sentinel, the copy-on-read path decodes the resolved slot bytes with the
+**remote-writer** EntityCrypto KM (resolved by the writer GUID through the reader's `crypto-keys` decode-fn),
+**regardless of the reader's own `data_protection` governance** — a governance-NONE reader still decodes the
+overlay.  Fail-closed: a missing KM (reader not yet keyed) or a failed GCM tag (tampered slot) **drops** the
+sample with `%secured-decode-fail` accounting, delivering nothing.  A loan-capable (literal-zero-copy) reader is
+forced onto copy-on-read for overlay references (a `flatdata-view` cannot read fields off an encrypted slot) — the
+accepted "zero-copy → single-copy" floor for confidential SHMEM.
+
+**Use-case — a large confidential telemetry stream, same host.**  A writer under `metadata_protection = ENCRYPT`
+governance publishes 16 KiB frames to a co-located subscriber.  Before ADR 0051 the writer was gated off Zero-Copy
+and paid the full serialize + submessage-wrap + SHMEM-ring double-buffer on every frame.  Now it takes Zero-Copy:
+the slot receives one sealed `SecuredPayload` and the transport carries a 20-octet reference — the large payload
+never leaves the pool, and it is confidential in the pool.  A local monitoring reader whose own topic governance is
+NONE still decodes the frames, because the overlay decode keys on the **writer's** EntityCrypto KM, not the
+reader's governance.
+
+```lisp
+;; Writer: metadata_protection = ENCRYPT, data_protection = NONE, Zero-Copy on.
+(let ((*zerocopy-enabled* t)
+      (*zerocopy-min-payload-bytes* 8))
+  (let ((w (make-disc-node :guid-prefix wpfx :host "127.0.0.1" :port 0)))
+    (setf (disc-node-user-submessage-protection-kind w) :encrypt   ; wire-protected ENCRYPT tier
+          (disc-node-user-data-protection-kind w)        :none      ; governance data=NONE -> the overlay seals the slot
+          (disc-node-crypto-transform w)                 encrypt-km) ; the per-writer AES256-GCM EntityCrypto KM
+    ;; %zc-overlay-eligible-p is now T: a large publish seals the SecuredPayload into the pool slot,
+    ;; emits a 20-octet reference with +zc-ref-overlay-secured+ set, and advances disc-node-zc-sends.
+    ;; The plaintext is provably ABSENT from the pool segment (ciphertext only).
+
+    ;; Reader: its OWN data_protection is NONE, but it holds the writer's EntityCrypto KM.
+    (let ((r (make-disc-node :guid-prefix rpfx :host "127.0.0.1" :port 0)))
+      (enable-subscriber r)
+      (setf (disc-node-user-reader-data-protection-kind r) :none    ; no governance decode of its own
+            (disc-node-crypto-transform r)                 encrypt-km) ; same writer EntityCrypto KM
+      ;; On the copy-on-read path the overlay sentinel forces the SecuredPayload decode:
+      ;; the reader recovers the 16 KiB plaintext byte-exact.  A reader WITHOUT the KM, or a
+      ;; one-octet ciphertext tamper in the slot, DROPS fail-closed (%secured-decode-fail), delivering nothing.
+      )))) 
+```
+
+Every other governance stays exactly as §3.7: **`data_protection`=ENCRYPT** already puts a `SecuredPayload` in
+the slot (unchanged); **SIGN-only** and **loan-write** writers stay gated off (a SIGN payload is visible on the
+wire, so plaintext-in-SHMEM is not a *new* exposure — a raw-ZC-for-SIGN relaxation is a deferred follow-on); a
+**non-secured** writer keeps full raw Zero-Copy, byte-identical and zero-alloc.  Proof:
+`dds.disc:run-zc-shmem-secured-overlay-test` (Part A the eligibility predicate + fail-closed branches; Part B the
+live-segment ciphertext/absence check + `zc-sends` advance; Part C the governance-NONE reader full-loopback
+byte-exact recovery; Part D the no-KM drop + ciphertext-tamper `%secured-decode-fail` drop).
+
 ---
 
 ## 4. The session-key KDF (DDS-Security 1.1 §9.5.3.3.4.2)
