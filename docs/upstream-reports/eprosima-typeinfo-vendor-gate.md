@@ -4,7 +4,7 @@
 - **Fast DDS version:** 3.6.1 (git tag `v3.6.1`, commit `4e81e8b`; `package.xml` `<version>3.6.1</version>`, `CMakeLists.txt` `project(fastdds VERSION "3.6.1.0")`)
 - **Platform observed:** Linux/macOS, built from source; reproducible by inspection on any platform
 - **Severity:** Interoperability defect — breaks standard cross-vendor XTypes type discovery
-- **Status:** Confirmed reproducible on v3.6.1 by source inspection and a live cross-vendor capture. Please verify it is still present on `master` before triage.
+- **Status:** Confirmed reproducible on v3.6.1 by source inspection and a live cross-vendor capture. Re-verified 2026-07-09: the vendor-gate block is byte-identical on both the pinned `v3.6.1` (`4e81e8b`) and current `master` (`WriterProxyData.cpp` + `ReaderProxyData.cpp`), so it is not fixed upstream.
 
 ## Summary
 

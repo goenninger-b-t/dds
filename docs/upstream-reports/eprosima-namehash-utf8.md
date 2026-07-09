@@ -4,7 +4,7 @@
 - **Fast DDS version:** 3.6.1 (git tag `v3.6.1`, commit `4e81e8b`; `package.xml` `<version>3.6.1</version>`, `CMakeLists.txt` `project(fastdds VERSION "3.6.1.0")`)
 - **Platform observed:** Any platform (`uint8_t` == `unsigned char` everywhere); reproducible by inspection
 - **Severity:** Correctness — produces malformed (non-UTF-8) member names; breaks downstream UTF-8 consumers such as `json_serialize`
-- **Status:** Confirmed present on v3.6.1 by source inspection and a live symptom (`type_error.316` from the JSON serializer). Please verify it is still present on `master` before triage.
+- **Status:** Confirmed present on v3.6.1 by source inspection and a live symptom (`type_error.316` from the JSON serializer). Re-verified 2026-07-09: the defective body is byte-identical on both the pinned `v3.6.1` (`4e81e8b`) and current `master` (`<iomanip>` still absent), so it is not fixed upstream.
 
 ## Summary
 
