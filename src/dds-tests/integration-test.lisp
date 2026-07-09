@@ -2275,6 +2275,57 @@
               "the mutable change is stored")))
   t)
 
+(defun* run-dcps-default-qos-test ()
+    (function () t)
+  "S1.T4 (DDS 1.4 §2.2.2.3/§2.2.2.4 get/set_default_*_qos): a default QoS set on a factory
+   parent flows into a newly-created child at create_*, an explicit create :qos still overrides
+   it, and every parent-level default get/set round-trips (Publisher default DataWriter QoS,
+   Subscriber default DataReader QoS, and the participant-level Topic/Publisher/Subscriber and
+   provisional Participant defaults). set_default rejects an inconsistent QoS."
+  (let ((dds.dcps::*default-participant-qos* nil))   ; isolate the provisional global default
+    (let ((ts (dds.types:find-type-support "dcps-msg"))
+          (p (dds.dcps:create-participant :domain (test-domain))))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "DefQosTopic" "dcps-msg" ts))
+                  (tp2 (dds.dcps:create-topic p "DefQosTopic2" "dcps-msg" ts))
+                  (pub (dds.dcps:create-publisher p))
+                  (sub (dds.dcps:create-subscriber p)))
+             (dds.dcps:set-default-datawriter-qos pub (dds.qos:make-writer-qos :ownership :exclusive))
+             (%check :ddw-roundtrip
+                     (eq :exclusive (dds.qos:qos-ownership (dds.dcps:get-default-datawriter-qos pub)))
+                     "set/get_default_datawriter_qos round-trips")
+             (let ((dw (dds.dcps:create-datawriter pub tp)))
+               (%check :ddw-flows (eq :exclusive (dds.qos:qos-ownership (dds.dcps:get-qos dw)))
+                       "the Publisher's default DataWriter QoS flows into a new writer"))
+             (let ((dw2 (dds.dcps:create-datawriter pub tp2 :qos (dds.qos:make-writer-qos :ownership :shared))))
+               (%check :ddw-override (eq :shared (dds.qos:qos-ownership (dds.dcps:get-qos dw2)))
+                       "an explicit create :qos overrides the default"))
+             (dds.dcps:set-default-datareader-qos sub (dds.qos:make-reader-qos :durability :transient-local))
+             (let ((dr (dds.dcps:create-datareader sub tp)))
+               (%check :ddr-flows (eq :transient-local (dds.qos:qos-durability (dds.dcps:get-qos dr)))
+                       "the Subscriber's default DataReader QoS flows into a new reader"))
+             (dds.dcps:set-default-publisher-qos p (dds.qos:make-qos :partition '("X")))
+             (let ((pub2 (dds.dcps:create-publisher p)))
+               (%check :dpub-flows (equal '("X") (dds.qos:qos-partition (dds.dcps:get-qos pub2)))
+                       "the participant's default Publisher QoS flows into a new publisher"))
+             (dds.dcps:set-default-subscriber-qos p (dds.qos:make-qos :partition '("S")))
+             (%check :dsub-rt (equal '("S") (dds.qos:qos-partition (dds.dcps:get-default-subscriber-qos p)))
+                     "set/get_default_subscriber_qos round-trips")
+             (dds.dcps:set-default-topic-qos p (dds.qos:make-qos :durability :transient-local))
+             (%check :dtopic-rt (eq :transient-local (dds.qos:qos-durability (dds.dcps:get-default-topic-qos p)))
+                     "set/get_default_topic_qos round-trips")
+             (dds.dcps:set-default-participant-qos (dds.qos:make-qos :partition '("P")))
+             (%check :dpart-rt (equal '("P") (dds.qos:qos-partition (dds.dcps:get-default-participant-qos)))
+                     "set/get_default_participant_qos round-trips")
+             (%check :ddefault-inconsistent
+                     (eq :inconsistent-policy
+                         (dds.dcps:set-default-datawriter-qos
+                          pub (dds.qos:make-writer-qos :history-kind :keep-all
+                                :resource-max-samples 5 :resource-max-samples-per-instance 10)))
+                     "set_default_*_qos rejects an inconsistent QoS with :inconsistent-policy"))
+        (dds.dcps:delete-participant p))
+      t)))
+
 (defun* run-dcps-incompatible-qos-test ()
     (function () t)
   "REQUESTED/OFFERED_INCOMPATIBLE_QOS surfaced to the app (FR-QOS-2/FR-DCPS-3): a

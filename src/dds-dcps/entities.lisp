@@ -39,6 +39,9 @@
   ((domain :initarg :domain :reader dp-domain)
    (node :initarg :node :accessor dp-node)
    (children :initform '() :accessor dp-children)
+   (default-topic-qos :initform nil :accessor dp-default-topic-qos)          ; DDS 1.4 §2.2.2.2 get/set_default_topic_qos
+   (default-publisher-qos :initform nil :accessor dp-default-publisher-qos)  ; DDS 1.4 §2.2.2.2 get/set_default_publisher_qos
+   (default-subscriber-qos :initform nil :accessor dp-default-subscriber-qos) ; DDS 1.4 §2.2.2.2 get/set_default_subscriber_qos
    (type-gate-state :initform nil :accessor dp-type-gate-state)   ; FR-TYPE-4 gate (type-gate.lisp)
    (auth-state :initform nil :accessor dp-auth-state)   ; DDS-Security 1.1 §8.7 auth manager (auth-manager.lisp)
    (access-state :initform nil :accessor dp-access-state))   ; DDS-Security 1.1 §8.4 AccessControl manager (access-control.lisp)
@@ -54,12 +57,14 @@
 
 (defclass publisher (entity)
   ((participant :initarg :participant :reader pub-participant)
-   (writers :initform '() :accessor pub-writers))
+   (writers :initform '() :accessor pub-writers)
+   (default-datawriter-qos :initform nil :accessor pub-default-datawriter-qos)) ; DDS 1.4 §2.2.2.4.1 get/set_default_datawriter_qos
   (:documentation "DDS Publisher: a factory/container for DataWriters in its participant."))
 
 (defclass subscriber (entity)
   ((participant :initarg :participant :reader sub-participant)
-   (readers :initform '() :accessor sub-readers))
+   (readers :initform '() :accessor sub-readers)
+   (default-datareader-qos :initform nil :accessor sub-default-datareader-qos)) ; DDS 1.4 §2.2.2.5.1 get/set_default_datareader_qos
   (:documentation "DDS Subscriber: a factory/container for DataReaders in its participant."))
 
 (defclass topic (entity)
@@ -456,6 +461,13 @@
         ;; here — %install-access-control reads protection-kind-base's origin-auth flag onto the disc-node.
         ah))))
 
+(defvar *default-participant-qos* nil
+  "The DDS DomainParticipantFactory's default DomainParticipant QoS (DDS 1.4 §2.2.2.2.2
+   get/set_default_participant_qos). Provisional module-level home until WP-DCPS-API-COMPLETION
+   S2 introduces the DomainParticipantFactory singleton that formally owns it; NIL selects the
+   built-in policy defaults. Read/written by get/set_default_participant_qos and applied by
+   create_participant when no explicit :qos is supplied.")
+
 (defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1") (peers nil)
                                  (port 0)
                                  (identity nil) (permissions-ca nil) (governance nil) (permissions nil))
@@ -509,7 +521,9 @@
                                                                (%make-guid-prefix))
                                               :identity-token-octets
                                               (when identity (dds.security:identity-token identity))))
-               (p (make-instance 'domain-participant :domain domain :node node :qos qos :enabled t)))
+               (p (make-instance 'domain-participant :domain domain :node node :enabled t
+                                 :qos (or qos (when (typep *default-participant-qos* 'dds.qos:qos)
+                                                (dds.qos:copy-qos *default-participant-qos*))))))
           ;; Install hooks BEFORE the receiver thread starts so no early SEDP match is lost.
           (setf (dds.disc:disc-node-on-match node)
                 (lambda (kind remote local-eid) (%on-disc-match p kind remote local-eid)))
@@ -583,26 +597,45 @@
 
 ;;; ---- Publisher / Subscriber / Topic ----
 
+(defun* %parent-default-qos (stored)
+    (function (t) (or null dds.qos:qos))
+  "An independent COPY of a STORED parent default QoS if one is set, else NIL — for the create_*
+   paths (Publisher/Subscriber/Topic) whose entities carry no role-default QoS (NIL when unset)."
+  (when (typep stored 'dds.qos:qos) (dds.qos:copy-qos stored)))
+
+(defun* %default-qos-for-create (stored fallback)
+    (function (t dds.qos:qos) dds.qos:qos)
+  "The effective QoS a create_* applies to a new child when the caller gave no explicit QoS: an
+   independent COPY of the parent's STORED default if set, else FALLBACK (the role default). The
+   copy keeps each child's QoS independent of the shared default."
+  (if (typep stored 'dds.qos:qos) (dds.qos:copy-qos stored) fallback))
+
 (defun* create-publisher (p)
     (function (domain-participant) publisher)
-  "DomainParticipant::create_publisher — create an enabled Publisher in P."
-  (let ((pub (make-instance 'publisher :participant p :enabled t)))
+  "DomainParticipant::create_publisher — create an enabled Publisher in P, adopting the
+   participant's default Publisher QoS (DDS 1.4 §2.2.2.2.2) when one has been set."
+  (let ((pub (make-instance 'publisher :participant p :enabled t
+                                       :qos (%parent-default-qos (dp-default-publisher-qos p)))))
     (push pub (dp-children p))
     pub))
 
 (defun* create-subscriber (p)
     (function (domain-participant) subscriber)
-  "DomainParticipant::create_subscriber — create an enabled Subscriber in P."
-  (let ((sub (make-instance 'subscriber :participant p :enabled t)))
+  "DomainParticipant::create_subscriber — create an enabled Subscriber in P, adopting the
+   participant's default Subscriber QoS (DDS 1.4 §2.2.2.2.2) when one has been set."
+  (let ((sub (make-instance 'subscriber :participant p :enabled t
+                                        :qos (%parent-default-qos (dp-default-subscriber-qos p)))))
     (push sub (dp-children p))
     sub))
 
 (defun* create-topic (p name type-name type-support)
     (function (domain-participant string string t) topic)
-  "DomainParticipant::create_topic. TYPE-SUPPORT is a registered dds.types
-   type-support (the generated codec bundle) used by write/take."
+  "DomainParticipant::create_topic, adopting the participant's default Topic QoS (DDS 1.4
+   §2.2.2.2.2) when one has been set. TYPE-SUPPORT is a registered dds.types type-support (the
+   generated codec bundle) used by write/take."
   (let ((tp (make-instance 'topic :name name :type-name type-name
-                                  :type-support type-support :participant p :enabled t)))
+                                  :type-support type-support :participant p :enabled t
+                                  :qos (%parent-default-qos (dp-default-topic-qos p)))))
     (push tp (dp-children p))
     tp))
 
@@ -654,16 +687,20 @@
                                                (dds.disc:disc-node-user-reader-data-protection-kind node)))))))
   t)
 
-(defun* create-datawriter (pub topic &key (qos (dds.qos:make-writer-qos)))
+(defun* create-datawriter (pub topic &key (qos nil qos-supplied-p))
     (function (publisher topic &key (:qos t)) data-writer)
   "Publisher::create_datawriter — register a local writer in the engine on the
    topic's name/type with the QoS reliability (v1: the single user writer); the
    endpoint kind (WITH_KEY/NO_KEY) is selected from the topic type's keyed-ness.
+   When no explicit :qos is supplied, the Publisher's default DataWriter QoS applies
+   (DDS 1.4 §2.2.2.4.1, set_default_datawriter_qos), falling back to the role default.
    DDS-Security §8.4.2.4: when the participant is access-controlled, check_create_datawriter must
    grant publish on the topic (local Permissions + Governance write-AC toggle) or the writer is
    refused (fail-closed SIGNAL). No access-state (default) = unchecked, byte-identical."
   (let ((node (dp-node (pub-participant pub)))
-        (ah (dp-access-state (pub-participant pub))))
+        (ah (dp-access-state (pub-participant pub)))
+        (qos (if qos-supplied-p qos
+                 (%default-qos-for-create (pub-default-datawriter-qos pub) (dds.qos:make-writer-qos)))))
     (when (and ah (not (dds.security:check-create-datawriter ah (topic-name topic))))
       (error "create-datawriter: AccessControl check_create_datawriter denied publish on topic ~s"
              (topic-name topic)))
@@ -680,18 +717,22 @@
       (push dw (pub-writers pub))
       dw)))
 
-(defun* create-datareader (sub topic &key (qos (dds.qos:make-reader-qos)))
+(defun* create-datareader (sub topic &key (qos nil qos-supplied-p))
     (function (subscriber t &key (:qos t)) data-reader)
   "Subscriber::create_datareader — register a local reader in the engine on the
    topic's name/type with the QoS reliability (v1: the single user reader). TOPIC may
    be a Topic or a ContentFilteredTopic; in the latter case the reader applies the
    filter predicate reader-side (only matching samples reach read/take). The
    endpoint kind (WITH_KEY/NO_KEY) is selected from the topic type's keyed-ness.
+   When no explicit :qos is supplied, the Subscriber's default DataReader QoS applies
+   (DDS 1.4 §2.2.2.5.1, set_default_datareader_qos), falling back to the role default.
    DDS-Security §8.4.2.5: when the participant is access-controlled, check_create_datareader must
    grant subscribe on the topic (local Permissions + Governance read-AC toggle) or the reader is
    refused (fail-closed SIGNAL). No access-state (default) = unchecked, byte-identical."
   (let ((node (dp-node (sub-participant sub)))
-        (ah (dp-access-state (sub-participant sub))))
+        (ah (dp-access-state (sub-participant sub)))
+        (qos (if qos-supplied-p qos
+                 (%default-qos-for-create (sub-default-datareader-qos sub) (dds.qos:make-reader-qos)))))
     (when (and ah (not (dds.security:check-create-datareader ah (topic-name topic))))
       (error "create-datareader: AccessControl check_create_datareader denied subscribe on topic ~s"
              (topic-name topic)))
@@ -829,6 +870,106 @@
       (return-from set-qos +retcode-immutable-policy+)))
   (setf (entity-qos entity) qos)
   +retcode-ok+)
+
+;;; ---- S1.T4: default-QoS getters/setters (DDS 1.4 §2.2.2), applied at create_* ----
+
+(defun* %default-qos-or (stored fallback-fn)
+    (function (t function) dds.qos:qos)
+  "Return an independent COPY of the STORED default QoS if one is set, else a fresh default
+   from FALLBACK-FN. Backs every get_default_*_qos so callers never alias the stored default."
+  (if (typep stored 'dds.qos:qos) (dds.qos:copy-qos stored) (funcall fallback-fn)))
+
+(defun* %store-default-qos (qos)
+    (function (dds.qos:qos) (member :ok :inconsistent-policy))
+  "Validate QOS for set_default_*_qos (DDS 1.4 §2.2.3 consistency): :ok if consistent (the caller
+   then stores it), else :inconsistent-policy (nothing stored)."
+  (if (%qos-consistent-p qos) +retcode-ok+ +retcode-inconsistent-policy+))
+
+(defun* get-default-datawriter-qos (pub)
+    (function (publisher) dds.qos:qos)
+  "Publisher::get_default_datawriter_qos (DDS 1.4 §2.2.2.4.1.21): the QoS create_datawriter uses
+   when no explicit QoS is supplied; a fresh DataWriter default until set."
+  (%default-qos-or (pub-default-datawriter-qos pub) #'dds.qos:make-writer-qos))
+
+(defun* set-default-datawriter-qos (pub qos)
+    (function (publisher dds.qos:qos) (member :ok :inconsistent-policy))
+  "Publisher::set_default_datawriter_qos (DDS 1.4 §2.2.2.4.1.22): install QOS as the default for
+   subsequently-created DataWriters; :inconsistent-policy (nothing stored) if QOS is inconsistent."
+  (let ((rc (%store-default-qos qos)))
+    (when (eq +retcode-ok+ rc) (setf (pub-default-datawriter-qos pub) qos))
+    rc))
+
+(defun* get-default-datareader-qos (sub)
+    (function (subscriber) dds.qos:qos)
+  "Subscriber::get_default_datareader_qos (DDS 1.4 §2.2.2.5.1.22): the QoS create_datareader uses
+   when no explicit QoS is supplied; a fresh DataReader default until set."
+  (%default-qos-or (sub-default-datareader-qos sub) #'dds.qos:make-reader-qos))
+
+(defun* set-default-datareader-qos (sub qos)
+    (function (subscriber dds.qos:qos) (member :ok :inconsistent-policy))
+  "Subscriber::set_default_datareader_qos (DDS 1.4 §2.2.2.5.1.23): install QOS as the default for
+   subsequently-created DataReaders; :inconsistent-policy (nothing stored) if QOS is inconsistent."
+  (let ((rc (%store-default-qos qos)))
+    (when (eq +retcode-ok+ rc) (setf (sub-default-datareader-qos sub) qos))
+    rc))
+
+(defun* get-default-topic-qos (p)
+    (function (domain-participant) dds.qos:qos)
+  "DomainParticipant::get_default_topic_qos (DDS 1.4 §2.2.2.2.2): the QoS create_topic uses when
+   no explicit QoS is supplied; a fresh default until set."
+  (%default-qos-or (dp-default-topic-qos p) #'dds.qos:make-qos))
+
+(defun* set-default-topic-qos (p qos)
+    (function (domain-participant dds.qos:qos) (member :ok :inconsistent-policy))
+  "DomainParticipant::set_default_topic_qos (DDS 1.4 §2.2.2.2.2): install QOS as the default for
+   subsequently-created Topics; :inconsistent-policy (nothing stored) if QOS is inconsistent."
+  (let ((rc (%store-default-qos qos)))
+    (when (eq +retcode-ok+ rc) (setf (dp-default-topic-qos p) qos))
+    rc))
+
+(defun* get-default-publisher-qos (p)
+    (function (domain-participant) dds.qos:qos)
+  "DomainParticipant::get_default_publisher_qos (DDS 1.4 §2.2.2.2.2): the QoS create_publisher
+   uses when no explicit QoS is supplied; a fresh default until set."
+  (%default-qos-or (dp-default-publisher-qos p) #'dds.qos:make-qos))
+
+(defun* set-default-publisher-qos (p qos)
+    (function (domain-participant dds.qos:qos) (member :ok :inconsistent-policy))
+  "DomainParticipant::set_default_publisher_qos (DDS 1.4 §2.2.2.2.2): install QOS as the default
+   for subsequently-created Publishers; :inconsistent-policy (nothing stored) if inconsistent."
+  (let ((rc (%store-default-qos qos)))
+    (when (eq +retcode-ok+ rc) (setf (dp-default-publisher-qos p) qos))
+    rc))
+
+(defun* get-default-subscriber-qos (p)
+    (function (domain-participant) dds.qos:qos)
+  "DomainParticipant::get_default_subscriber_qos (DDS 1.4 §2.2.2.2.2): the QoS create_subscriber
+   uses when no explicit QoS is supplied; a fresh default until set."
+  (%default-qos-or (dp-default-subscriber-qos p) #'dds.qos:make-qos))
+
+(defun* set-default-subscriber-qos (p qos)
+    (function (domain-participant dds.qos:qos) (member :ok :inconsistent-policy))
+  "DomainParticipant::set_default_subscriber_qos (DDS 1.4 §2.2.2.2.2): install QOS as the default
+   for subsequently-created Subscribers; :inconsistent-policy (nothing stored) if inconsistent."
+  (let ((rc (%store-default-qos qos)))
+    (when (eq +retcode-ok+ rc) (setf (dp-default-subscriber-qos p) qos))
+    rc))
+
+(defun* get-default-participant-qos ()
+    (function () dds.qos:qos)
+  "DomainParticipantFactory::get_default_participant_qos (DDS 1.4 §2.2.2.2.2): the QoS
+   create_participant uses when no explicit QoS is supplied; a fresh default until set. Reads the
+   provisional *default-participant-qos* (S2 moves this onto the DomainParticipantFactory)."
+  (%default-qos-or *default-participant-qos* #'dds.qos:make-qos))
+
+(defun* set-default-participant-qos (qos)
+    (function (dds.qos:qos) (member :ok :inconsistent-policy))
+  "DomainParticipantFactory::set_default_participant_qos (DDS 1.4 §2.2.2.2.2): install QOS as the
+   default for subsequently-created DomainParticipants; :inconsistent-policy (nothing stored) if
+   inconsistent. Writes the provisional *default-participant-qos* (S2 formalizes on the factory)."
+  (let ((rc (%store-default-qos qos)))
+    (when (eq +retcode-ok+ rc) (setf *default-participant-qos* qos))
+    rc))
 
 (defun* %writer-keeplast-p (dw)
     (function (data-writer) boolean)

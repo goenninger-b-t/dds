@@ -29,6 +29,13 @@
            ;; WP-DCPS-API-COMPLETION S1.T3: get_qos/set_qos + IMMUTABLE/INCONSISTENT return codes
            #:get-qos #:set-qos
            #:+retcode-immutable-policy+ #:+retcode-inconsistent-policy+
+           ;; WP-DCPS-API-COMPLETION S1.T4: default-QoS getters/setters (DDS 1.4 §2.2.2)
+           #:get-default-datawriter-qos #:set-default-datawriter-qos
+           #:get-default-datareader-qos #:set-default-datareader-qos
+           #:get-default-topic-qos #:set-default-topic-qos
+           #:get-default-publisher-qos #:set-default-publisher-qos
+           #:get-default-subscriber-qos #:set-default-subscriber-qos
+           #:get-default-participant-qos #:set-default-participant-qos
            #:sample-info #:make-sample-info
            #:sample-info-sample-state #:sample-info-view-state #:sample-info-instance-state
            #:sample-info-source-timestamp #:sample-info-instance-handle
