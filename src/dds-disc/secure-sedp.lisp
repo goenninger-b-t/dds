@@ -1295,6 +1295,92 @@
                                 (assert (and got (equalp got m3)) ()
                                         "C: the reader must recover the overlay plaintext byte-exact through the copy-on-read decode"))))
                        (stop-node reader))))))
+          (stop-node node))))
+    ;; Part D — fail-closed proofs (SHMEM-gated, ADR 0051; skips cleanly where the pool is not carved — Clasp/macOS):
+    ;;   (i) a reader with NO EntityCrypto key for the writer resolves the overlay ref but DROPS it — the resolved km is
+    ;;       nil, so %deliver-user-sample takes the missing-KM early return (nothing delivered, no crash, uncounted).
+    ;;   (ii) with the KM installed a NON-tampered control of the SAME shape DELIVERS (the harness is sound), then
+    ;;       flipping ONE ciphertext octet in the sealed writer pool slot fails the AES-GCM tag -> decode-serialized-
+    ;;       payload nil -> %secured-decode-fail DROPS it and advances the node's secured-decode-fail counter
+    ;;       (disc-node-decode-fail-counts), delivering NOTHING — so the drop is attributable to the tamper, not the
+    ;;       harness. Reuses Part C's real receive path (%msg-datagram + %rtps-feed-datagram), no hand-parse.
+    (let ((*zerocopy-enabled* t))
+      (let ((node (make-disc-node :guid-prefix pa :host "127.0.0.1" :port 0)))   ; the ENCRYPT-tier overlay writer
+        (unwind-protect
+             (when (disc-node-zc-pool node)
+               (setf (disc-node-rtps-protection-kind node) :encrypt
+                     (disc-node-user-data-protection-kind node) :none
+                     (disc-node-crypto-transform node) km)
+               ;; (i) NO-KM reader: a crypto-keys resolver that returns NIL for every writer GUID -> resolved km nil -> drop.
+               (let* ((pb (make-array 12 :element-type '(unsigned-byte 8) :initial-element 95))
+                      (reader (make-disc-node :guid-prefix pb :host "127.0.0.1" :port 0))
+                      (m4 (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                               "ZC-OVERLAY-NOKM-DROP-PLAINTEXT-44444444444444444444444444444"))
+                      (ch4 (dds.rtps.history:make-cache-change :kind :data :sn 4 :serialized-payload m4)))
+                 (unwind-protect
+                      (when (disc-node-zc-pool reader)          ; the reader needs a carved pool for the ZC resolve path to trigger
+                        (enable-subscriber reader)
+                        (setf (disc-node-user-reader-data-protection-kind reader) :none
+                              (disc-node-crypto-transform reader)
+                              (dds.security:make-crypto-keys     ; a resolver holding NO key for the writer -> decode km resolves nil
+                               :encode-key-fn (lambda (g) (declare (ignore g)) nil)
+                               :decode-key-fn (lambda (g) (declare (ignore g)) nil)))
+                        (let ((item (%zc-change-item node ch4 1))
+                              (buf (dds.core.buffer:make-octet-buffer 512)))
+                          (assert item () "D(i): the overlay write must produce a ref item")
+                          (let ((len (funcall (%msg-datagram node (cdr item)) buf)))
+                            (%rtps-feed-datagram reader (subseq (dds.core.buffer:octet-buffer-vec buf) 0 len)))
+                          (assert (null (node-sample-by-sn reader 4)) ()
+                                  "D(i): a reader with NO KM for the writer must fail-closed DROP the overlay sample (nothing delivered)")))
+                   (stop-node reader)))
+               ;; (ii) TAMPER: with the KM installed, a NON-tampered control delivers; a flipped ciphertext octet drops.
+               (let* ((pc (make-array 12 :element-type '(unsigned-byte 8) :initial-element 96))
+                      (reader (make-disc-node :guid-prefix pc :host "127.0.0.1" :port 0))
+                      (mc (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                               "ZC-OVERLAY-TAMPER-CONTROL-PLAINTEXT-5555555555555555555555"))
+                      (mt (map '(simple-array (unsigned-byte 8) (*)) #'char-code
+                               "ZC-OVERLAY-TAMPER-VICTIM-PLAINTEXT-66666666666666666666666666"))
+                      (chc (dds.rtps.history:make-cache-change :kind :data :sn 5 :serialized-payload mc))
+                      (cht (dds.rtps.history:make-cache-change :kind :data :sn 6 :serialized-payload mt)))
+                 (unwind-protect
+                      (when (disc-node-zc-pool reader)
+                        (enable-subscriber reader)
+                        (setf (disc-node-user-reader-data-protection-kind reader) :none
+                              (disc-node-crypto-transform reader) km)               ; the SAME EntityCrypto KM -> the control DECODES
+                        ;; control (un-tampered): the same overlay shape DELIVERS -> the harness is sound (non-vacuity).
+                        (let ((item (%zc-change-item node chc 1))
+                              (buf (dds.core.buffer:make-octet-buffer 512)))
+                          (assert item () "D(ii): the control overlay write must produce a ref item")
+                          (let ((len (funcall (%msg-datagram node (cdr item)) buf)))
+                            (%rtps-feed-datagram reader (subseq (dds.core.buffer:octet-buffer-vec buf) 0 len)))
+                          (assert (equalp (node-sample-by-sn reader 5) mc) ()
+                                  "D(ii): a NON-tampered overlay control MUST deliver (the drop is attributable to the tamper, not the harness)"))
+                        ;; tamper: seal the victim, flip ONE ciphertext octet in the sealed writer pool slot, then drive the ref.
+                        (let ((fails0 (hash-table-count (disc-node-decode-fail-counts reader)))
+                              (item (%zc-change-item node cht 1))
+                              (buf (dds.core.buffer:make-octet-buffer 512))
+                              (sap (disc-node-zc-pool-sap node)))
+                          (assert item () "D(ii): the victim overlay write must produce a ref item")
+                          ;; the freshly-sealed slot is the ONLY occupied one now (the control slot was resolve-released);
+                          ;; XOR one bit of its last sealed octet -> the AES-GCM tag fails on the reader's resolve+decode.
+                          (let ((slot (loop for i below +zerocopy-pool-slots+
+                                            when (plusp (cffi:mem-ref sap :uint32
+                                                          (+ (dds.xport.zerocopy::%zc-slot-off sap i)
+                                                             dds.xport.zerocopy::+zc-slot-off-refcount+)))
+                                              return i)))
+                            (assert slot () "D(ii): the sealed overlay slot must be occupied before the tamper")
+                            (let* ((b    (dds.xport.zerocopy::%zc-slot-off sap slot))
+                                   (slen (cffi:mem-ref sap :uint32 (+ b dds.xport.zerocopy::+zc-slot-off-len+)))
+                                   (off  (+ b dds.xport.zerocopy::+zc-slot-hdr+ (1- slen))))
+                              (setf (cffi:mem-ref sap :uint8 off)
+                                    (logxor (cffi:mem-ref sap :uint8 off) 1))))
+                          (let ((len (funcall (%msg-datagram node (cdr item)) buf)))
+                            (%rtps-feed-datagram reader (subseq (dds.core.buffer:octet-buffer-vec buf) 0 len)))
+                          (assert (null (node-sample-by-sn reader 6)) ()
+                                  "D(ii): a tampered overlay slot (AES-GCM tag fail) must fail-closed DROP (nothing delivered)")
+                          (assert (> (hash-table-count (disc-node-decode-fail-counts reader)) fails0) ()
+                                  "D(ii): a KM-present decode failure must advance the node's secured-decode-fail counter (ADR 0031 lim.1)")))
+                   (stop-node reader))))
           (stop-node node)))))
   t)
 
