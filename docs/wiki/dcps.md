@@ -266,10 +266,15 @@ A **latent reliability/memory bug** was found + fixed in the course of this work
 Communication statuses (FR-DCPS-3) are value structs mutated on the receiver thread under the
 entity's status lock. Every status flows through one internal `%notify-status` chokepoint that
 (a) updates the struct, (b) sets the status's bit in the entity's **status-changes bitmask**,
-(c) triggers the entity's StatusCondition, and (d) fires the masked listener. Reading a status
-via a `get-*-status` accessor snapshots it and performs the DDS read-communication-status reset
-(DDS 1.4 §2.2.2.1.9): it resets the `*_change` counters **and** clears that status's bit in the
-bitmask. `get-status-changes` (below) reports the bitmask.
+(c) triggers the entity's StatusCondition, and (d) delivers the status to a listener up the
+**containment hierarchy** (WP-DCPS-API-COMPLETION S3, ADR 0053, DDS 1.4 §2.2.4.1): it walks
+entity → parent (Publisher/Subscriber) → DomainParticipant and fires the **most-specific enabled**
+listener (whose mask names the status), stopping there. If a listener handles the status, the
+chokepoint also resets its `*_change` counters and **clears the status bit** — the §2.2.4.1
+reset-on-listener-invocation, so a StatusCondition watching the same status no longer triggers. If
+no listener up the chain is enabled, the bit stays set and no callback fires. Reading a status via a
+`get-*-status` accessor performs the SAME reset (DDS 1.4 §2.2.2.1.9): reset the `*_change` counters
+**and** clear the bit. `get-status-changes` (below) reports the bitmask.
 
 | Symbol | Description |
 |---|---|
@@ -296,11 +301,14 @@ bitmask. `get-status-changes` (below) reports the bitmask.
 | `dds.dcps:qos-policy-count` / `make-qos-policy-count` / `qos-policy-count-policy-id` / `qos-policy-count-count` | A `{policy-id, count}` entry in an incompatible-QoS `policies` list. |
 | `dds.dcps:rxo-policy-id` (`keyword`) | The DDS `QosPolicyId_t` for an RxO failing-policy keyword. |
 | `dds.dcps:+qos-policy-id-durability+` / `-reliability+` / `-deadline+` / `-latency-budget+` / `-ownership+` / `-liveliness+` / `-destination-order+` / `-presentation+` / `-data-representation+` | The DDS `QosPolicyId_t` constants. |
-| `dds.dcps:listener` / `data-reader-listener` / `data-writer-listener` / `topic-listener` | The CLOS listener base classes; subclass and override the `on-*` methods you care about (base methods are no-ops). |
-| `dds.dcps:set-reader-listener` (`dr listener mask`) | `DataReader::set_listener` — install `listener` for the status keywords in `mask`. |
-| `dds.dcps:set-writer-listener` (`dw listener mask`) | `DataWriter::set_listener`. |
-| `dds.dcps:set-topic-listener` (`tp listener mask`) | `Topic::set_listener` (v1 mask: `(:inconsistent-topic)`). |
-| `dds.dcps:on-data-available` (`l reader`) | DataReaderListener callback — fires from the receiver thread on new user data. |
+| `dds.dcps:listener` / `data-reader-listener` / `data-writer-listener` / `topic-listener` / `publisher-listener` / `subscriber-listener` / `domain-participant-listener` | The CLOS listener base classes — all six DDS 1.4 interfaces (dds_rtf2_dcps.idl §199/§206/§221/§224/§247/§253). Subclass and override the `on-*` methods you care about (base methods are no-ops); a `domain-participant-listener` may override any callback (it aggregates all). |
+| `dds.dcps:set-listener` (`entity listener mask`) | `Entity::set_listener` (DDS 1.4 §2.2.4.1) — uniform installer on **all six** entity kinds; `mask` is the list of status keywords the listener handles (participates in hierarchy propagation); `nil` clears. |
+| `dds.dcps:get-listener` (`entity`) | `Entity::get_listener` — the installed listener object (or `nil`), on all six kinds. |
+| `dds.dcps:set-reader-listener` / `set-writer-listener` / `set-topic-listener` (`entity listener mask`) | The endpoint/topic-specific setters (retained; equivalent to `set-listener` on those kinds). |
+| `dds.dcps:on-data-on-readers` (`l subscriber`) | SubscriberListener callback (dds_rtf2_dcps.idl §248) — fires when a Subscriber/Participant listener is enabled for `:data-on-readers`; handling it **suppresses** the readers' `on_data_available` (precedence, DDS 1.4 §2.2.4.1). |
+| `dds.dcps:get-datareaders` (`subscriber &key sample-states`) | `Subscriber::get_datareaders` (§993) — the readers holding a sample whose `sample_state` is in `sample-states` (default `(:not-read)`). |
+| `dds.dcps:notify-datareaders` (`subscriber`) | `Subscriber::notify_datareaders` (§998) — fire `on_data_available` on each reader with new data (call from `on_data_on_readers`). |
+| `dds.dcps:on-data-available` (`l reader`) | DataReaderListener callback — fires from the receiver thread on new user data (unless a `on_data_on_readers` handled DATA_ON_READERS first). |
 | `dds.dcps:on-subscription-matched` / `on-requested-incompatible-qos` / `on-sample-rejected` / `on-liveliness-changed` (`l reader status`) | DataReaderListener callbacks that fire in v1. `on-liveliness-changed` fires from the announce cadence when a matched remote writer's liveliness goes stale/fresh (RTPS 2.5 §8.4.13). |
 | `dds.dcps:on-publication-matched` / `on-offered-incompatible-qos` / `on-liveliness-lost` (`l writer status`) | DataWriterListener callbacks that fire in v1. `on-liveliness-lost` fires from the announce cadence (`spin`) when a local writer fails to assert its own liveliness within its offered lease (DDS 1.4 §2.2.3.11). |
 | `dds.dcps:on-inconsistent-topic` (`l topic status`) | TopicListener callback that fires in v1. |
