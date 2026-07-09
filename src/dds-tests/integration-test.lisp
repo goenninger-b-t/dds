@@ -2027,6 +2027,52 @@
               "requested-deadline-missed-status fields round-trip")))
   t)
 
+(defun* run-dcps-notify-status-test ()
+    (function () t)
+  "S0.T3 (dds_rtf2_dcps.idl §684 / DDS 1.4 §2.2.4.1): every communication status flows through
+   the single %notify-status chokepoint, which updates all four surfaces. On a compatible match
+   the reader (no listener installed) shows (a) its subscription-matched struct, (b) its
+   status-changes bitmask bit, and (c) its StatusCondition trigger; the writer (listener
+   installed) shows (d) on_publication_matched fired plus its own struct + bitmask bit. (A
+   listener that consumes a status resets the *_change counter — DDS-correct — so (c) is
+   checked on the no-listener reader.)"
+  (let ((ts (dds.types:find-type-support "dcps-msg"))
+        (p1 (dds.dcps:create-participant :domain (test-domain)))
+        (p2 (dds.dcps:create-participant :domain (test-domain)))
+        (wl (make-instance 'capturing-writer-listener)))
+    (unwind-protect
+         (let* ((tw (dds.dcps:create-topic p1 "NotifyTopic" "dcps-msg" ts))
+                (tr (dds.dcps:create-topic p2 "NotifyTopic" "dcps-msg" ts))
+                (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                (dw (dds.dcps:create-datawriter pub tw))
+                (dr (dds.dcps:create-datareader sub tr))
+                (sc (dds.dcps:make-status-condition dr :mask '(:subscription-matched))))
+           (dds.dcps:set-writer-listener dw wl '(:publication-matched))
+           (loop repeat 150
+                 until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                 do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+           (loop repeat 60 until (assoc :pub-matched (cap-snapshot wl)) do (sleep 0.02))
+           ;; writer path: (d) listener + (b) bitmask bit
+           (%check :notify-listener (and (assoc :pub-matched (cap-snapshot wl)) t)
+                   "(d) on_publication_matched must fire through %notify-status")
+           (%check :notify-writer-bit
+                   (logtest dds.dcps:+status-publication-matched+ (dds.dcps:get-status-changes dw))
+                   "(b) %notify-status must set PUBLICATION_MATCHED in the writer's bitmask")
+           ;; reader path (no listener): (b) bit + (c) condition + (a) struct
+           (%check :notify-reader-bit
+                   (logtest dds.dcps:+status-subscription-matched+ (dds.dcps:get-status-changes dr))
+                   "(b) %notify-status must set SUBSCRIPTION_MATCHED in the reader's bitmask")
+           (%check :notify-condition (and (dds.dcps:condition-trigger-value sc) t)
+                   "(c) the reader's StatusCondition(:subscription-matched) must trigger")
+           (let ((sm (dds.dcps:get-subscription-matched-status dr)))
+             (%check :notify-struct-once
+                     (and (= 1 (dds.dcps:subscription-matched-status-total-count sm))
+                          (= 1 (dds.dcps:subscription-matched-status-current-count sm)))
+                     "(a) the subscription-matched status struct must report exactly one match")))
+      (dds.dcps:delete-participant p1)
+      (dds.dcps:delete-participant p2))
+    t))
+
 (defun* run-dcps-status-changes-test ()
     (function () t)
   "S0.T2 (dds_rtf2_dcps.idl §684 Entity::get_status_changes): a per-entity status-changes
