@@ -108,7 +108,7 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 
 | Symbol | Description |
 |---|---|
-| `dds.dcps:create-participant` (`&key domain qos advertise-address autonomous`) | Open the RTPS engine (a multicast disc-node) for `domain`, install the status hooks, start the receiver, return an enabled `domain-participant`. `:autonomous t` (S7, ADR 0056) starts a background announcer thread so discovery/matching/aging need no `spin`; it is stopped + joined on `delete-participant`. |
+| `dds.dcps:create-participant` (`&key domain qos advertise-address peers autonomous`) | Open the RTPS engine (a multicast disc-node) for `domain`, install the status hooks, start the receiver, return an enabled `domain-participant`. `:autonomous t` (S7, ADR 0056) starts a background announcer thread so discovery/matching/aging need no `spin`; it is stopped + joined on `delete-participant`. The announcer's cadence and the leaseDuration we announce to peers come from the **DISCOVERY_CONFIG** vendor-extension QoS (`qos-discovery-announce-period`, default 1 s; `qos-discovery-lease-duration`, default 100 s — see the [QoS](qos.md) page); both are changeable via `set_qos` and apply **live**. |
 | `dds.dcps:delete-participant` (`p`) | Delete the participant and its contained entities; stop the engine. |
 | `dds.dcps:create-publisher` (`p`) | Create an enabled `publisher` (DataWriter factory) in `p`. |
 | `dds.dcps:create-subscriber` (`p`) | Create an enabled `subscriber` (DataReader factory) in `p`. |

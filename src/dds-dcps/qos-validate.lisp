@@ -83,13 +83,32 @@
    imposes no consistency constraint."
   (>= n 0))
 
+(defun* %discovery-config-consistent-p (qos)
+    (function (dds.qos:qos) boolean)
+  "T iff QOS's DISCOVERY_CONFIG (vendor extension, WP-DCPS-API-COMPLETION S7) is self-consistent: the
+   announce period is FINITE and POSITIVE (a cadence of zero or DURATION_INFINITE announces nothing), and
+   — when the announced leaseDuration is finite — it is STRICTLY SHORTER than that lease. An announce
+   period at or above the lease is self-defeating: peers would age this participant out (RTPS 2.5
+   §8.5.3.3.2) between its own announcements, so it flaps in and out of every peer's discovery set. This
+   raises INCONSISTENT_POLICY citing +qos-policy-id-invalid+ — the policy is a vendor extension with no OMG
+   QosPolicyId_t, and an id is never invented (see the qos struct docstring)."
+  (let ((period (dds.qos:qos-discovery-announce-period qos))
+        (lease (dds.qos:qos-discovery-lease-duration qos)))
+    (and (not (dds.qos:duration-infinite-p period))
+         (plusp (dds.qos:duration->seconds period))
+         (or (dds.qos:duration-infinite-p lease)
+             (< (dds.qos:duration->seconds period) (dds.qos:duration->seconds lease))))))
+
 (defun* %qos-consistent-p (qos)
     (function (dds.qos:qos) (values boolean integer))
   "Validate the DDS 1.4 cross-policy consistency rules that raise INCONSISTENT_POLICY,
    returning (values OK-P FAILING-POLICY-ID). The rules (a LENGTH_UNLIMITED -1 limit disables
    its bound): §2.2.3.19 RESOURCE_LIMITS.max_samples >= max_samples_per_instance (else the
    RESOURCE_LIMITS id); §2.2.3.18 HISTORY (KEEP_LAST) depth <= RESOURCE_LIMITS.max_samples_per_
-   instance (else the HISTORY id). A consistent QoS yields (values T +qos-policy-id-invalid+).
+   instance (else the HISTORY id). A consistent QoS yields (values T +qos-policy-id-invalid+). Also
+   enforced: the DISCOVERY_CONFIG vendor extension (announce period finite, positive, and shorter than the
+   announced lease — %discovery-config-consistent-p), reporting +qos-policy-id-invalid+ as it carries no
+   OMG policy id.
    Policies the stack does not yet model (TIME_BASED_FILTER minimum_separation vs DEADLINE) are
    not checked here — recorded as a follow-on, not silently claimed."
   (let ((max-samples (dds.qos:qos-resource-max-samples qos))
@@ -102,4 +121,6 @@
                (%resource-limit-bounded-p mspi)
                (> (dds.qos:qos-history-depth qos) mspi))
       (return-from %qos-consistent-p (values nil +qos-policy-id-history+)))
+    (unless (%discovery-config-consistent-p qos)
+      (return-from %qos-consistent-p (values nil +qos-policy-id-invalid+)))
     (values t +qos-policy-id-invalid+)))

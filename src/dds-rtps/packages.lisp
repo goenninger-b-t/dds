@@ -170,7 +170,8 @@
            #:spdp-data-guid-prefix #:spdp-data-version-major #:spdp-data-version-minor
            #:spdp-data-vendor-id
            #:spdp-data-default-unicast-locators #:spdp-data-metatraffic-unicast-locators
-           #:spdp-data-lease-duration-seconds #:spdp-data-builtin-endpoint-set
+           #:spdp-data-lease-duration-seconds #:spdp-data-lease-duration-nanosec
+           #:spdp-data-builtin-endpoint-set
            #:spdp-data-host-uuid #:spdp-data-identity-token-octets
            #:serialize-spdp-data #:parse-spdp-data
            #:run-discovery-test

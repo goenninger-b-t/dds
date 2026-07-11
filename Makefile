@@ -26,6 +26,8 @@ TYPENAME  ?= C_Shape
 LOCALTYPE ?= shape-type
 COUNT    ?= 0
 DEADLINE_MS ?= 1500
+ANNOUNCE_MS ?= 1000
+LEASE_SECONDS ?= 100
 KEYS     ?= 3
 DISPOSE_AFTER ?= 0
 LATSAMPLES  ?= 10000
@@ -154,6 +156,20 @@ deadline-pub:
 deadline-sub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-deadline-subscriber :domain $(DOMAIN) :deadline-ms $(DEADLINE_MS) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
+
+# WP-DCPS-API-COMPLETION S7 live AUTONOMOUS-DISCOVERY interop (ADR 0056; interop/autodiscovery). The same
+# DCPS runners in AUTONOMOUS mode: the loop calls NO spin — a background announcer thread drives SPDP/SEDP
+# on the ANNOUNCE_MS cadence and announces a LEASE_SECONDS leaseDuration. DEADLINE_MS=0 = no finite
+# deadline, so the stock Connext/Fast DDS shapes peer matches with no QoS tweak.
+autodisc-pub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-deadline-publisher :domain $(DOMAIN) :deadline-ms 0 :count $(COUNT) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)" :autonomous t :announce-ms $(ANNOUNCE_MS) :lease-seconds $(LEASE_SECONDS) $(REP_ARGS))' \
+	        --eval '(uiop:quit 0)'
+
+autodisc-sub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-deadline-subscriber :domain $(DOMAIN) :deadline-ms 0 :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" :peers "$(PEERS)" :autonomous t :announce-ms $(ANNOUNCE_MS) :lease-seconds $(LEASE_SECONDS))' \
 	        --eval '(uiop:quit 0)'
 
 # Clean-room legacy-TypeObject capture: dump a peer's PID_TYPE_OBJECT_LB as a Lisp byte vector.

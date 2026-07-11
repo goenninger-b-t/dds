@@ -37,6 +37,8 @@
    ;; = wait forever, else bounded; re-check the predicate on wake — ADR 0007)
    #:spawn #:join #:make-lock #:with-lock #:make-condvar #:condvar-wait #:condvar-signal
    #:condvar-broadcast
+   ;; thread introspection (control-plane: the background-thread lifecycle gates, WP-DCPS-API-COMPLETION S7)
+   #:live-threads #:thread-name
    ;; process signal handling (SIGTERM/SIGINT -> 0-arg callback; ADR 0026 §10 graceful teardown)
    #:install-signal-handler
    ;; image lifecycle: run a 0-arg hook at startup after a save-lisp-and-die restart, so a dumped core

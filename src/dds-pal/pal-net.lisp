@@ -25,6 +25,22 @@
         (+ (* (cffi:mem-ref tp :int64 0) 1000000000) (cffi:mem-ref tp :int64 8))
         (* (- (get-universal-time) 2208988800) 1000000000))))
 
+;;; ---- thread introspection (control-plane; lifecycle assertions, never the hot path) ----
+
+(defun* live-threads ()
+    (function () list)
+  "Every thread currently alive in this image (bordeaux-threads:all-threads — portable, so this lives in
+   the SHARED PAL file with no reader conditional, alongside SPAWN/JOIN which are the same call on both
+   implementations). Control-plane ONLY: the thread-lifecycle gates assert that a create/enable/delete cycle
+   leaves the thread set exactly as it found it (no leaked background thread). Never called on the hot path."
+  (bordeaux-threads:all-threads))
+
+(defun* thread-name (thread)
+    (function (t) string)
+  "THREAD's name, as given to SPAWN (bordeaux-threads:thread-name). Control-plane only: lets a lifecycle
+   assertion name the specific background thread it expects to be gone (e.g. \"dds-autodiscovery\")."
+  (bordeaux-threads:thread-name thread))
+
 (defun* %parse-ipv4 (host)
     (function (string) (simple-array (unsigned-byte 8) (4)))
   "Parse a dotted-quad string into a 4-octet address vector."

@@ -126,7 +126,13 @@
    §7.6.3.4.1 — when introspecting a remote endpoint that provides no
    TypeConsistencyEnforcementQosPolicy, the Service SHALL assume DISALLOW_TYPE_COERCION
    (so conformant + non-conformant peers reach the same matching conclusion) — we
-   assume DISALLOW for the remote reader rather than its (default ALLOW) parsed policy."
+   assume DISALLOW for the remote reader rather than its (default ALLOW) parsed policy.
+   NOTE (ADR 0057): this derivation does NOT govern the LEGACY PID_TYPE_OBJECT_LB rung,
+   which overrides it with %LEGACY-ASSESSMENT-TCE. Applying DISALLOW-equivalence to a
+   lossy legacy TypeObject false-REJECTS a peer using the same type (rtiddsgen's invented
+   255 string bound), and the peer — enforcing consistency on ITS reader, as DDS requires —
+   matches us, so the two sides would reach OPPOSITE conclusions: the exact outcome
+   §7.6.3.4.1's rationale demands we avoid."
   (if (%remote-writer-p remote)
       (dds.qos:qos-type-consistency (dds.rtps.discovery:endpoint-data-qos local))
       (dds.qos:make-type-consistency-enforcement :kind :disallow-type-coercion)))
@@ -146,6 +152,41 @@
   (%tg-log remote verdict reason)
   verdict)
 
+(defun* %gate-assess-legacy (remote local-to remote-model)
+    (function (dds.rtps.discovery:endpoint-data
+               dds.types:minimal-struct-type dds.types:minimal-struct-type)
+              (member :compatible :incompatible))
+  "The verdict for a remote model parsed from a peer's LEGACY PID_TYPE_OBJECT_LB (ADR 0009 /
+   ADR 0057): reader-side is-assignable-from writer-side (direction from REMOTE's GUID
+   entityKind) under ALLOW_TYPE_COERCION with ALL BOUNDS IGNORED — sequence, string, AND the
+   §7.2.4.4.8 KEY sub-bound.
+
+   A legacy TypeObject is not a faithful encoding of the peer's declared type: rtiddsgen silently
+   bounds an unbounded `string` at 255 (ADR 0009 §Context.2), so a stock Connext peer whose IDL
+   declares `@key string color` announces `color` as a 255-bounded KEY. Two rules then bite on
+   that artifact rather than on the type: an EQUIVALENCE test (the DISALLOW_TYPE_COERCION assumed
+   for a remote reader per §7.6.3.4.1) compares the invented bound, and the KEY sub-bound rule —
+   which ignore_string_bounds deliberately does NOT relax — rejects our unbounded key against
+   their 255. Either one false-REJECTS a peer using the very same type, while the peer, enforcing
+   consistency on ITS reader as DDS requires, matches us — so the two sides reach OPPOSITE
+   conclusions: the exact outcome §7.6.3.4.1's rationale demands we avoid, and the interop
+   regression ADR 0009 exists to prevent.
+
+   Bounds from a lossy source are therefore treated as NO EVIDENCE. Everything else still gates —
+   extensibility, member count, ids, names, kinds, key FLAGS, must_understand all reject as usual:
+   this ignores invented bounds, it does not disarm the gate. Consequence (ADR 0057): against a
+   legacy-only peer an explicit local DISALLOW_TYPE_COERCION cannot be honoured soundly and is
+   downgraded to this assessment; the verdict is logged."
+  (let* ((remote-writer-p (%remote-writer-p remote))
+         (reader-model (if remote-writer-p local-to remote-model))
+         (writer-model (if remote-writer-p remote-model local-to))
+         (opts (dds.types:make-assignability-options :ignore-sequence-bounds t
+                                                     :ignore-string-bounds t
+                                                     :ignore-key-bounds t)))
+    (if (dds.types:struct-assignable-from reader-model writer-model opts)
+        :compatible
+        :incompatible)))
+
 (defun* %gate-assess (remote local local-to remote-model)
     (function (dds.rtps.discovery:endpoint-data dds.rtps.discovery:endpoint-data
                dds.types:minimal-struct-type dds.types:minimal-struct-type)
@@ -154,8 +195,10 @@
    is-assignable-from the writer-side type under the reader's
    TYPE_CONSISTENCY_ENFORCEMENT (XTypes 1.3 §7.6.3.4.2 Step 1, via
    dds.types:enforce-type-consistency). Direction comes from REMOTE's GUID entityKind
-   (%REMOTE-WRITER-P): a remote writer makes LOCAL the reader, and vice versa."
+   (%REMOTE-WRITER-P): a remote writer makes LOCAL the reader, and vice versa. The LEGACY
+   PID_TYPE_OBJECT_LB rung does NOT use this derivation — see %GATE-ASSESS-LEGACY."
   (let* ((tce (%reader-side-tce remote local))
+         (remote-writer-p (%remote-writer-p remote))
          (remote-writer-p (%remote-writer-p remote))
          (reader-model (if remote-writer-p local-to remote-model))
          (writer-model (if remote-writer-p remote-model local-to)))
@@ -303,15 +346,17 @@
   "The FR-TYPE-4 FAIL-OPEN legacy-TypeObject gate rung for a stock Connext peer that
    advertised PID_TYPE_OBJECT_LB (0x8021) but NO PID_TYPE_INFORMATION (ADR 0009).
    Inflate + structurally parse LB (DDS.TYPES:INFLATE-TYPE-OBJECT-LB ->
-   PARSE-LEGACY-TYPE-OBJECT): ONLY a confident MINIMAL-STRUCT-TYPE parse gates — it
-   is assessed against the LOCAL type-support's TypeObject under the reader-side
-   TYPE_CONSISTENCY_ENFORCEMENT (the SAME %GATE-ASSESS derivation the TypeInformation
-   path uses); the verdict is recorded per remote GUID (the verdict-table replay rung
-   above short-circuits the re-parse on every re-run). EVERY non-model outcome —
-   :unsupported / NIL (degraded or untokenizable parse), or no local TypeObject to
-   assess against — falls OPEN to :compatible (name-match, logged); a non-model parse
-   result can NEVER reject. The advisory ASSESS-TYPE-OBJECT-LB fingerprint (run at
-   %ON-DISC-MATCH per ADR 0009) is a separate diagnostic."
+   PARSE-LEGACY-TYPE-OBJECT): ONLY a confident MINIMAL-STRUCT-TYPE parse gates — it is
+   assessed against the LOCAL type-support's TypeObject by ASSIGNABILITY WITH BOUNDS
+   IGNORED (%LEGACY-ASSESSMENT-TCE), NEVER by equivalence: the legacy encoding is lossy
+   (rtiddsgen silently bounds an unbounded string at 255), so an equivalence test would
+   compare a generator artifact and false-REJECT a peer using the very same type — see
+   ADR 0057. The verdict is recorded per remote GUID (the verdict-table replay rung above
+   short-circuits the re-parse on every re-run). EVERY non-model outcome — :unsupported /
+   NIL (degraded or untokenizable parse), or no local TypeObject to assess against — falls
+   OPEN to :compatible (name-match, logged); a non-model parse result can NEVER reject.
+   The advisory ASSESS-TYPE-OBJECT-LB fingerprint (run at %ON-DISC-MATCH per ADR 0009) is
+   a separate diagnostic."
   (let* ((inflated (handler-case (dds.types:inflate-type-object-lb lb) (error () nil)))
          (model (and inflated
                      (handler-case (dds.types:parse-legacy-type-object inflated)
@@ -326,8 +371,8 @@
               (%gate-record-verdict state remote :compatible
                                     "no local TypeObject to assess legacy peer (fail-open)")
               (%gate-record-verdict state remote
-                                    (%gate-assess remote local local-to model)
-                                    "legacy-TypeObject assignability"))))))
+                                    (%gate-assess-legacy remote local-to model)
+                                    "legacy-TypeObject assignability (bounds ignored — lossy source)"))))))
 
 (defun* %participant-type-gate (p node remote local)
     (function (domain-participant dds.disc:disc-node

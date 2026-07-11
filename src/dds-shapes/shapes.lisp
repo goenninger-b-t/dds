@@ -910,36 +910,76 @@
     t))
 
 (defun* %deadline-duration (ms)
-    (function ((integer 1)) t)
+    (function ((integer 0)) t)
   "A dds.qos:qos-duration of MS milliseconds — the offered/requested DEADLINE period for the S4 live
-   interop runners (DDS 1.4 §2.2.3.7)."
-  (dds.qos:make-qos-duration (floor ms 1000) (* (mod ms 1000) 1000000)))
+   interop runners (DDS 1.4 §2.2.3.7). MS = 0 means NO finite deadline: it yields DURATION_INFINITE (the
+   spec default), so the endpoint imposes no DEADLINE RxO constraint on the peer — which is what the S7
+   autonomous-cadence interop wants (a finite requested deadline would ALSO demand a finite offered
+   deadline from the foreign writer, an unrelated obstacle to matching)."
+  (if (zerop ms)
+      dds.qos:+duration-infinite+
+      (dds.qos:make-qos-duration (floor ms 1000) (* (mod ms 1000) 1000000))))
+
+(defun* %discovery-qos (announce-ms lease-seconds)
+    (function ((integer 1) (integer 1)) dds.qos:qos)
+  "A participant QoS carrying the DISCOVERY_CONFIG vendor extension (WP-DCPS-API-COMPLETION S7): announce
+   every ANNOUNCE-MS and advertise a LEASE-SECONDS leaseDuration in SPDP (PID_PARTICIPANT_LEASE_DURATION).
+   Drives the autonomous announcer's SPDP/SEDP cadence in the live interop runners."
+  (dds.qos:make-qos
+   :discovery-announce-period (dds.qos:make-qos-duration (floor announce-ms 1000)
+                                                         (* (mod announce-ms 1000) 1000000))
+   :discovery-lease-duration (dds.qos:make-qos-duration lease-seconds 0)))
 
 (defun* run-deadline-publisher (&key (domain 0) (deadline-ms 1500) (count 5) (rate 2) (seconds 25)
-                                     (advertise-address "127.0.0.1"))
-    (function (&key (:domain (integer 0)) (:deadline-ms (integer 1)) (:count (integer 1))
-                    (:rate (integer 1)) (:seconds (integer 0)) (:advertise-address string)) t)
+                                     (advertise-address "127.0.0.1") (peers nil)
+                                     (autonomous nil) (announce-ms 1000) (lease-seconds 100)
+                                     (data-representation :xcdr2))
+    (function (&key (:domain (integer 0)) (:deadline-ms (integer 0)) (:count (integer 1))
+                    (:rate (integer 1)) (:seconds (integer 0)) (:advertise-address string)
+                    (:peers (or null string))
+                    (:autonomous t) (:announce-ms (integer 1)) (:lease-seconds (integer 1))
+                    (:data-representation (member :xcdr2 :xcdr1))) t)
   "S4 live interop (DDS 1.4 §2.2.3.7): a DCPS DataWriter that OFFERS a finite DEADLINE of DEADLINE-MS,
    publishes COUNT animated Square/ShapeType samples at RATE/s, then STOPS writing while keeping the
    participant alive. A default foreign reader (Connext/Fast DDS shapes_sub, requested DURATION_INFINITE)
    matches by RxO (offered period <= requested) and receives the COUNT samples; once we stop rearming,
    our OFFERED_DEADLINE_MISSED climbs (the per-participant deadline monitor fires each elapsed period).
    Prints the match transition + the periodic OFFERED_DEADLINE_MISSED total_count so a live run shows both
-   the interop delivery and the local miss firing."
+   the interop delivery and the local miss firing.
+   AUTONOMOUS (WP-DCPS-API-COMPLETION S7): T creates the participant in autonomous mode with an ANNOUNCE-MS
+   SPDP/SEDP cadence and a LEASE-SECONDS announced leaseDuration (DISCOVERY_CONFIG), and the loop calls NO
+   spin at all — the background announcer thread drives every announce and sweep. This is the S7 live
+   cadence interop: a foreign peer (Connext / Fast DDS) must discover, match, and receive from a
+   participant whose announces come off a background thread instead of the app loop. DEADLINE-MS 0 drops
+   the finite deadline (DURATION_INFINITE) so DEADLINE RxO imposes nothing on the peer.
+   DATA-REPRESENTATION (:xcdr2 default | :xcdr1; XTypes 1.3 §7.6.3.1.1) is the writer's OFFERED
+   representation. A stock Connext `shapes_sub` DataReader advertises XCDR1 ONLY (RTI's default reader
+   data_representation), and DATA_REPRESENTATION is an RxO policy — an XCDR2-only offer does NOT match it.
+   So the Connext-reader interop leg needs :xcdr1 (the same knob run-publisher carries for this peer).
+   PEERS is an optional \"host:port[,host:port]\" list of unicast SPDP announce targets layered on top of
+   multicast (FR-DISC-4) — needed to reach a peer pinned to loopback (the Fast DDS interop profile whitelists
+   127.0.0.1 only, so its builtin metatraffic unicast port 127.0.0.1:7410 is the reachable SPDP target)."
   (let* ((ts (dds.types:find-type-support "shape-type"))
-         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :peers (%parse-peers peers)
+                                         :autonomous autonomous
+                                         :qos (%discovery-qos announce-ms lease-seconds)))
          (tp (dds.dcps:create-topic p "Square" "ShapeType" ts))
          (pub (dds.dcps:create-publisher p))
          (dw (dds.dcps:create-datawriter pub tp
                :qos (dds.qos:make-writer-qos :reliability :reliable
+                                             :data-representation (list data-representation)
                                              :deadline (%deadline-duration deadline-ms)))))
     (format t "~&[deadline-pub] Square/ShapeType offered-deadline=~dms count=~d domain=~d.~%"
             deadline-ms count domain)
+    (when autonomous
+      (format t "~&[deadline-pub] AUTONOMOUS: announce=~dms lease=~ds — the announcer thread drives SPDP/SEDP; the loop calls NO spin.~%"
+              announce-ms lease-seconds))
     (unwind-protect
          (let ((x 50) (y 50) (dx 3) (dy 2) (start (get-internal-real-time)) (n 0) (last-matched 0)
                (last-report 0) (stopped-at nil))
            (loop
-             (dds.dcps:spin p)
+             (unless autonomous (dds.dcps:spin p))   ; S7: in autonomous mode the announcer thread is the ONLY announce driver
              (let ((ms (dds.dcps:matched-count p)))
                (when (/= ms last-matched)
                  (format t "~&[deadline-pub] MATCHED ~d -> ~d remote reader(s).~%" last-matched ms)
@@ -974,9 +1014,11 @@
     t))
 
 (defun* run-deadline-subscriber (&key (domain 0) (deadline-ms 2000) (seconds 25)
-                                      (advertise-address "127.0.0.1"))
-    (function (&key (:domain (integer 0)) (:deadline-ms (integer 1)) (:seconds (integer 0))
-                    (:advertise-address string)) t)
+                                      (advertise-address "127.0.0.1") (peers nil)
+                                      (autonomous nil) (announce-ms 1000) (lease-seconds 100))
+    (function (&key (:domain (integer 0)) (:deadline-ms (integer 0)) (:seconds (integer 0))
+                    (:advertise-address string) (:peers (or null string))
+                    (:autonomous t) (:announce-ms (integer 1)) (:lease-seconds (integer 1))) t)
   "S4 live interop (DDS 1.4 §2.2.3.7 / §2.2.4.1): a DCPS DataReader that REQUESTS a finite DEADLINE of
    DEADLINE-MS. It matches a foreign writer (Connext/Fast DDS) ONLY if that writer OFFERS a deadline <=
    DEADLINE-MS (RxO) — so the peer must be configured with a finite offered deadline. On each received
@@ -984,10 +1026,22 @@
    period, the per-participant deadline monitor fires REQUESTED_DEADLINE_MISSED. SAMPLE_LOST is also
    reported (a reliable GAP for never-received SNs, or a best-effort skip). Prints the match transition,
    samples, and the periodic REQUESTED_DEADLINE_MISSED + SAMPLE_LOST total_count so a live run shows the
-   cross-vendor DEADLINE RxO match AND our monitor reacting to the real remote peer's silence."
+   cross-vendor DEADLINE RxO match AND our monitor reacting to the real remote peer's silence.
+   AUTONOMOUS (WP-DCPS-API-COMPLETION S7): T creates the participant in autonomous mode with an ANNOUNCE-MS
+   SPDP/SEDP cadence and a LEASE-SECONDS announced leaseDuration (DISCOVERY_CONFIG), and the loop calls NO
+   spin — the background announcer thread drives every announce and sweep, so a live run proves a foreign
+   peer (Connext / Fast DDS) discovers, matches, and delivers to a zero-spin participant. DEADLINE-MS 0
+   drops the finite requested deadline (DURATION_INFINITE), so the peer's writer needs no finite offered
+   deadline to match by RxO — the plain cadence interop.
+   PEERS is an optional \"host:port[,host:port]\" list of unicast SPDP announce targets layered on top of
+   multicast (FR-DISC-4) — needed to reach a peer pinned to loopback (the Fast DDS interop profile whitelists
+   127.0.0.1 only, so its builtin metatraffic unicast port 127.0.0.1:7410 is the reachable SPDP target)."
   (let* ((ts (dds.types:find-type-support "shape-type"))
          (fa (dds.types:type-support-field-accessors ts))
-         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address
+                                         :peers (%parse-peers peers)
+                                         :autonomous autonomous
+                                         :qos (%discovery-qos announce-ms lease-seconds)))
          (tp (dds.dcps:create-topic p "Square" "ShapeType" ts))
          (sub (dds.dcps:create-subscriber p))
          (dr (dds.dcps:create-datareader sub tp
@@ -995,11 +1049,14 @@
                                              :deadline (%deadline-duration deadline-ms)))))
     (format t "~&[deadline-sub] Square/ShapeType requested-deadline=~dms domain=~d (peer writer must offer <= ~dms).~%"
             deadline-ms domain deadline-ms)
+    (when autonomous
+      (format t "~&[deadline-sub] AUTONOMOUS: announce=~dms lease=~ds — the announcer thread drives SPDP/SEDP; the loop calls NO spin.~%"
+              announce-ms lease-seconds))
     (flet ((field (s name) (funcall (cdr (assoc name fa :test #'string-equal)) s)))
       (unwind-protect
            (let ((seen 0) (start (get-internal-real-time)) (last-matched 0) (last-report 0))
              (loop
-               (dds.dcps:spin p)
+               (unless autonomous (dds.dcps:spin p))   ; S7: in autonomous mode the announcer thread is the ONLY announce driver
                (dolist (cs (dds.dcps:take-samples dr))
                  (let ((info (dds.dcps:cached-sample-info cs)))
                    (when (dds.dcps:sample-info-valid-data info)

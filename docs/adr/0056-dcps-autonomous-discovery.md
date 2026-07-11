@@ -57,15 +57,40 @@ participant discovers, matches, ages, and exchanges data with **no** app-driven 
 - **Cost.** One `dds.pal:spawn`'d thread per autonomous participant, waking once per `period-seconds` to
   run the same announce/sweep work `spin` did — control plane, not the measured hot path.
 
-## 4. Remaining (S7 exit gate, checkpointed)
+## 4. S7 exit gate — CLOSED (2026-07-11)
 
-- An explicit T3 thread-lifecycle test (create/enable/delete cycles leave no live threads — a stronger
-  assertion than the implicit teardown above).
-- A killed-participant-ages-out test (a short announced lease so the peer's `%lease-sweep`, now
-  announcer-driven, prunes it observably).
-- Live interop vs Connext 7.3.1 + Fast DDS (the SPDP/SEDP announce cadence on the wire — the one wire
-  surface, though the announce content is unchanged from the spin path).
-- Configurable `period-seconds` / lease via QoS (default 1 s today).
+All four checkpointed items landed; the slice is complete.
+
+- **Configurable cadence + announced lease via QoS.** A vendor-extension `DISCOVERY_CONFIG` on the
+  participant QoS: `discovery-announce-period` (default `{1,0}`) drives the announcer, and
+  `discovery-lease-duration` (default `{100,0}` = the RTPS 2.5 Table 9.18 `PID_PARTICIPANT_LEASE_DURATION`
+  default, so the wire is unchanged at defaults) is the leaseDuration we announce. Both are **changeable**:
+  `set_qos` re-applies them live (`%apply-discovery-cadence` — the new lease rides the next SPDP; a running
+  announcer is signalled under its lock and re-waits on the new cadence). A period ≥ the lease is
+  `INCONSISTENT_POLICY` (peers would age us out between our own announcements). No OMG `QosPolicyId_t` was
+  invented: the inconsistency reports `+qos-policy-id-invalid+`.
+- **Latent bug fixed alongside it (would have been armed by the knob).** Our SPDP wrote the leaseDuration
+  `Duration_t` **fraction** as 0 and *ignored* a peer's fraction on receive (RTPS 2.5 §9.3.2.3). A
+  sub-second lease would therefore have read as **0 → instantly stale → a live peer pruned on the next
+  sweep** (a false REJECT). TX now emits the fraction and RX parses it (`%spdp-lease-seconds`), reusing the
+  existing `dds.qos:duration-nanosec->wire-fraction` pair. Byte-identical at whole-second leases.
+- **Thread-lifecycle test** `dcps-autonomous-lifecycle`: repeated create/delete cycles return the live
+  announcer-thread count to baseline (no leak); a non-autonomous participant spawns none; create-DISABLED →
+  `enable` spawns exactly one (and a second `enable` does not); `delete_participant` joins it.
+- **Killed-participant-ages-out test** `dcps-autonomous-lease-expiry`: a peer announcing a 1 s lease is
+  killed (`delete_participant` closes its sockets and sends no SPDP dispose — a *silent* death, exactly the
+  §8.5.3.3.2 stale-entry case); the surviving autonomous participant's announcer-driven `%lease-sweep`
+  prunes it observably (discovered 1→0, matched 1→0, `SUBSCRIPTION_MATCHED` current_count → 0), with no
+  spin. Falsified against the default 100 s lease, where the killed peer is still present after 10 s — so
+  the test tracks the lease, not some other purge path.
+- **Live SPDP/SEDP-cadence interop, both vendors, both directions** (`interop/autodiscovery/README.md`),
+  every leg with **no** `spin` call: Connext 7.3.1 → our reader 252 samples; our writer → Connext 27;
+  Fast DDS → our reader 131; our writer → Fast DDS 29.
+
+  This leg surfaced a **pre-existing false REJECT unrelated to S7** (it reproduced identically on the
+  spin-driven path): the FR-TYPE-4 type gate rejected *every* stock vendor `DataReader`, so our DCPS
+  `DataWriter` could never match one. Root-caused and fixed in-slice — see **ADR 0057**. Both outbound legs
+  above were `matched=0, 0 samples` before that fix.
 
 ## 5. Alternatives considered
 

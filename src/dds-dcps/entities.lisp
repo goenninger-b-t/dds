@@ -164,7 +164,8 @@
 (declaim (ftype (function (domain-participant) t) %deadline-monitor-stop))
 ;; Defined in autodiscovery.lisp (loaded after this file, WP-DCPS-API-COMPLETION S7); forward-declared so
 ;; create-participant/enable (start) and delete-participant (stop+join) reach the announcer clean.
-(declaim (ftype (function (domain-participant) t) %start-auto-announcer %stop-auto-announcer))
+(declaim (ftype (function (domain-participant) t) %start-auto-announcer %stop-auto-announcer
+                %apply-discovery-cadence))
 
 ;; Defined in conditions.lisp (loaded after this file); forward-declared so the data-
 ;; arrival hook below can wake the reader's WaitSets without a compile-time warning.
@@ -653,6 +654,12 @@
   "DomainParticipantFactory::create_participant — open the RTPS engine (a multicast
    disc-node) for DOMAIN, install the match/incompatible-QoS hooks that surface DDS
    statuses to the application, start the receiver, and return an enabled participant.
+   AUTONOMOUS (WP-DCPS-API-COMPLETION S7): T spawns a background announcer thread that drives the SPDP/SEDP
+   announce + the lease/liveliness/autopurge sweeps on the DISCOVERY_CONFIG announce-period cadence, so the
+   application never calls spin (spin becomes a no-op). NIL (default) = the deterministic app-driven spin.
+   QOS carries the DISCOVERY_CONFIG vendor extension that tunes that cadence and the leaseDuration this
+   participant announces to peers (dds.qos: qos-discovery-announce-period / qos-discovery-lease-duration;
+   defaults 1 s / 100 s). Both are changeable via set_qos.
    PEERS is an optional ((host . port) ...) list of unicast SPDP announce targets
    (FR-DISC-4) layered on top of multicast — e.g. ((\"127.0.0.1\" . 7410)) reaches a
    same-host peer over loopback when the macOS application firewall silently drops
@@ -724,6 +731,7 @@
             (%install-access-control p access-handle))
           (dds.disc:start-node node)
           (setf (dp-autonomous-p p) autonomous)   ; WP-DCPS-API-COMPLETION S7: autonomous discovery mode
+          (%apply-discovery-cadence p)   ; S7: push the DISCOVERY_CONFIG announced leaseDuration onto the node BEFORE the first announce
           (setf installed t)   ; construction complete; p owns the access-handle via dp-access-state
           (%factory-register-participant (get-participant-factory) p)   ; S2.T1: the free-fn is the factory shim (DDS 1.4 §2.2.2.2.2)
           (%start-auto-announcer p)   ; S7: spawn the announcer if autonomous + enabled (idempotent; no-op otherwise)
@@ -1103,7 +1111,10 @@
    on failure, QoS unchanged); then, if ENTITY is already enabled, the §2.2.3 immutability table
    rejects any change to an immutable-after-enable policy (-> :immutable-policy, QoS unchanged).
    Otherwise QOS is stored and :ok returned. (Enabled state uses the provisional entity-enabled-p;
-   WP-DCPS-API-COMPLETION S2 formalizes enable().)"
+   WP-DCPS-API-COMPLETION S2 formalizes enable().)
+   On a DomainParticipant the DISCOVERY_CONFIG vendor extension (announce period + announced lease) is
+   CHANGEABLE and applied LIVE (%apply-discovery-cadence): the new lease rides the next SPDP announce and a
+   running autonomous announcer re-waits on the new cadence — no restart, no silent no-op."
   (multiple-value-bind (okp failing-id) (%qos-consistent-p qos)
     (declare (ignore failing-id))
     (unless okp (return-from set-qos +retcode-inconsistent-policy+)))
@@ -1112,6 +1123,8 @@
       (when (/= +qos-policy-id-invalid+ (%qos-immutable-violation old qos))
         (return-from set-qos +retcode-immutable-policy+))))
   (setf (entity-qos entity) qos)
+  (when (typep entity 'domain-participant)
+    (%apply-discovery-cadence entity))   ; WP-DCPS-API-COMPLETION S7: DISCOVERY_CONFIG is CHANGEABLE — re-apply the cadence + announced lease live
   +retcode-ok+)
 
 ;;; ---- WP-DCPS-API-COMPLETION S2.T3: enable() + disabled-entity semantics (DDS 1.4 §2.2.2.1.1.7) ----

@@ -178,6 +178,44 @@ The enforcement *decision* (assignability vs structural equivalence) lives in th
 see `enforce-type-consistency` on the [Type system](type-system.md) page; this policy is just
 the value carrier the reader holds.
 
+One caveat, recorded in **ADR 0057**: against a peer that advertises its type *only* via the legacy
+`PID_TYPE_OBJECT_LB` (a stock Connext peer — no `PID_TYPE_INFORMATION`, no TCE on the wire), an
+explicit `:disallow-type-coercion` **cannot be honoured soundly** and is downgraded to assignability
+with all bounds ignored. A legacy TypeObject's bounds are a code-generator artifact (`rtiddsgen`
+silently bounds an unbounded `string` at 255), so judging *equivalence* from one would reject a peer
+using the very same type. Structure (members, ids, kinds, key flags) still gates normally.
+
+### DISCOVERY_CONFIG (vendor extension) — announce cadence + announced lease
+
+DDS 1.4 standardizes **no** discovery-cadence policy, so — as every vendor does — this stack supplies
+one as an extension. It is **participant-scoped** (ignored on any other entity), has **no** RxO
+semantics, is never advertised in SEDP, and is **changeable**: `set_qos` re-applies both fields live
+(no restart). Because it carries no OMG `QosPolicyId_t`, an inconsistency reports
+`+qos-policy-id-invalid+` rather than an invented id.
+
+| Accessor | Meaning | Default |
+|---|---|---|
+| `dds.qos:qos-discovery-announce-period` | How often an `:autonomous` participant's background announcer re-sends SPDP + SEDP and runs the lease/liveliness/autopurge sweeps | `{1, 0}` (1 s) |
+| `dds.qos:qos-discovery-lease-duration` | The `leaseDuration` we announce in SPDP (`PID_PARTICIPANT_LEASE_DURATION`): how long a peer keeps us alive after our last announcement before pruning us as stale (RTPS 2.5 §8.5.3.3.2) | `{100, 0}` (100 s) |
+
+The lease default is the **spec** default (RTPS 2.5 Table 9.18), so the wire is unchanged unless you
+change it. The announce-period default (1 s) is deliberately *more frequent* than the RTPS 2.5 §9.6.2.4
+default announcement rate (`resendPeriod = {30, 0}`), trading a little metatraffic for prompt discovery;
+announcing more often than a peer requires is always interop-safe.
+
+**Consistency rule:** the announce period must be finite, positive, and **strictly shorter than** the
+announced lease — otherwise peers would age this participant out *between its own announcements* and it
+would flap in and out of every peer's discovery set. Violating it yields `INCONSISTENT_POLICY`.
+
+```lisp
+;; announce every 250 ms, tell peers to prune us if silent for 5 s
+(dds.dcps:create-participant
+  :domain 0 :autonomous t
+  :qos (dds.qos:make-qos
+         :discovery-announce-period (dds.qos:make-qos-duration 0 250000000)
+         :discovery-lease-duration  (dds.qos:make-qos-duration 5 0)))
+```
+
 ## Examples
 
 All examples are adapted from passing tests: `run-qos-rxo-test` (in `src/dds-qos/qos.lisp`)

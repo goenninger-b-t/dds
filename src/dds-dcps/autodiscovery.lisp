@@ -14,8 +14,11 @@
 (defstruct* (auto-announcer (:constructor %make-auto-announcer))
   "The per-participant autonomous-discovery announcer (DDS 1.4 §2.2.2.2 / RTPS 2.5 §8.5 SPDP/SEDP): a
    background thread (THREAD) that, while RUNNING, drives one %spin-once cycle then waits on CV for
-   PERIOD-SECONDS (the announce cadence) or until stopped. LOCK guards RUNNING + the CV. Created + started
-   once on enable when the participant is autonomous; stopped + JOINED on delete-participant."
+   PERIOD-SECONDS (the announce cadence) or until stopped. LOCK guards RUNNING, PERIOD-SECONDS, and the CV.
+   Created + started once on enable when the participant is autonomous; stopped + JOINED on
+   delete-participant. PERIOD-SECONDS comes from the participant's DISCOVERY_CONFIG announce-period QoS
+   (default {1,0} = 1 s) and is CHANGEABLE: set_qos writes it under the lock and signals the CV, so a
+   waiting thread re-waits on the new cadence (%apply-discovery-cadence)."
   (lock (dds.pal:make-lock "auto-announcer") :type t)
   (cv (dds.pal:make-condvar) :type t)
   (thread nil :type t)
@@ -23,6 +26,47 @@
   (period-seconds 1.0d0 :type double-float))
 
 (declaim (ftype (function (auto-announcer domain-participant) t) %auto-announcer-loop))
+
+(defun* %participant-discovery-qos (p)
+    (function (domain-participant) dds.qos:qos)
+  "P's effective QoS as a dds.qos:qos — the DISCOVERY_CONFIG source (announce period + announced lease).
+   A participant created with no QoS reports the defaults ({1,0} period / {100,0} lease)."
+  (let ((q (entity-qos p)))
+    (if (typep q 'dds.qos:qos) q (dds.qos:make-qos))))
+
+(defun* %announce-period-seconds (p)
+    (function (domain-participant) double-float)
+  "P's DISCOVERY_CONFIG announce period in seconds (the announcer's SPDP/SEDP cadence). A non-positive or
+   INFINITE period is meaningless for a cadence, so it falls back to the {1,0} default — the QoS consistency
+   validator rejects such a QoS up front (INCONSISTENT_POLICY); this is the belt-and-braces floor for a
+   participant whose QoS was never routed through set_qos."
+  (let ((s (dds.qos:duration->seconds
+            (dds.qos:qos-discovery-announce-period (%participant-discovery-qos p)))))
+    (if (and (plusp s) (< s most-positive-double-float)) s 1.0d0)))
+
+(defun* %apply-discovery-cadence (p)
+    (function (domain-participant) t)
+  "Apply P's DISCOVERY_CONFIG QoS (WP-DCPS-API-COMPLETION S7): push the announced leaseDuration onto the
+   disc-node (every subsequent SPDP announce carries it — PID_PARTICIPANT_LEASE_DURATION, RTPS 2.5
+   §8.5.3.3.2) and the announce period onto a RUNNING announcer, signalling its CV UNDER the lock so the
+   thread wakes and re-waits on the NEW cadence instead of finishing the old (possibly much longer) one.
+   Called at create-participant and again from set_qos — both policies are CHANGEABLE, so a live
+   re-configure takes effect on the next announce, not at the next restart."
+  (let* ((qos (%participant-discovery-qos p))
+         (lease (dds.qos:qos-discovery-lease-duration qos))
+         (node (dp-node p))
+         (a (dp-announcer p)))
+    (setf (dds.disc:disc-node-lease-duration-seconds node)
+          (if (dds.qos:duration-infinite-p lease)
+              #x7fffffff
+              (dds.qos:qos-duration-sec lease)))
+    (setf (dds.disc:disc-node-lease-duration-nanosec node)
+          (if (dds.qos:duration-infinite-p lease) 0 (dds.qos:qos-duration-nanosec lease)))
+    (when a
+      (dds.pal:with-lock ((auto-announcer-lock a))
+        (setf (auto-announcer-period-seconds a) (%announce-period-seconds p))
+        (dds.pal:condvar-signal (auto-announcer-cv a)))))
+  t)
 
 (defun* %start-auto-announcer (p)
     (function (domain-participant) t)
@@ -35,7 +79,7 @@
   (when (and (dp-autonomous-p p) (entity-enabled-p p) (null (dp-announcer p)))
     (dds.pal:with-lock ((dp-deadline-lock p))
       (unless (dp-announcer p)
-        (let ((a (%make-auto-announcer)))
+        (let ((a (%make-auto-announcer :period-seconds (%announce-period-seconds p))))
           (setf (auto-announcer-running a) t)
           (setf (auto-announcer-thread a)
                 (dds.pal:spawn (lambda () (%auto-announcer-loop a p)) :name "dds-autodiscovery"))

@@ -53,6 +53,23 @@
       #x7fffffff
       (floor (* fraction 1000000000) #x100000000)))
 
+(defun* duration-infinite-p (dur)
+    (function (qos-duration) boolean)
+  "T iff DUR is DURATION_INFINITE (sec 0x7fffffff; dds_rtf2_dcps.idl DURATION_INFINITE_SEC) — the
+   sentinel every duration-consuming path tests before converting to a real time value."
+  (>= (qos-duration-sec dur) #x7fffffff))
+
+(defun* duration->seconds (dur)
+    (function (qos-duration) double-float)
+  "DUR as a double-float count of SECONDS (sec + nanosec/1e9), for the control-plane paths that need a
+   real timeout (the discovery announce cadence, the participant lease). DURATION_INFINITE maps to
+   MOST-POSITIVE-DOUBLE-FLOAT (an effectively unreachable deadline), so a caller never has to special-case
+   the sentinel. NOT a hot-path function (no per-sample use)."
+  (if (duration-infinite-p dur)
+      most-positive-double-float
+      (+ (coerce (qos-duration-sec dur) 'double-float)
+         (/ (coerce (qos-duration-nanosec dur) 'double-float) 1.0d9))))
+
 ;;; ---- Ordinal ranks for the kind-ordered policies (offered >= requested) ----
 
 (defun* reliability-rank (k)
@@ -102,7 +119,26 @@
 
 (defstruct* (qos (:constructor make-qos) (:copier copy-qos))
   "The DDS QoS set: the RxO-relevant + commonly-held policies (the full 22+2 set is
-   filled in as the entity model lands). Slot defaults follow DDS 1.4 §2.2.3."
+   filled in as the entity model lands). Slot defaults follow DDS 1.4 §2.2.3.
+
+   DISCOVERY_CONFIG (DISCOVERY-ANNOUNCE-PERIOD + DISCOVERY-LEASE-DURATION) is a VENDOR EXTENSION —
+   DDS 1.4 standardizes no discovery-cadence policy, so this mirrors what every vendor supplies as an
+   extension. Both are PARTICIPANT-scoped (ignored on a Publisher/Subscriber/Topic/DataWriter/DataReader
+   QoS), have NO request/offered semantics (absent from qos-rxo-compatible), are never advertised in SEDP,
+   and are CHANGEABLE after enable (set_qos re-applies them live; they carry no OMG QosPolicyId_t, so an
+   inconsistency reports +qos-policy-id-invalid+ rather than an invented id).
+
+   DISCOVERY-ANNOUNCE-PERIOD is the cadence at which an AUTONOMOUS participant's background announcer
+   re-sends SPDP + SEDP and runs the lease/liveliness/autopurge sweeps. Default {1, 0} = 1 s: DELIBERATELY
+   more frequent than the RTPS 2.5 §9.6.2.4 default announcement rate (SPDPbuiltinParticipantWriter.
+   resendPeriod = {30, 0}), trading a little metatraffic for prompt discovery; a peer never requires a
+   FASTER cadence than the lease we announce, so announcing more often is always interop-safe.
+
+   DISCOVERY-LEASE-DURATION is the leaseDuration this participant ANNOUNCES in its SPDP
+   (PID_PARTICIPANT_LEASE_DURATION): how long a peer keeps us alive after our last announcement before
+   pruning us as stale (RTPS 2.5 §8.5.3.3.2). Default {100, 0} = the spec default (RTPS 2.5 Table 9.18).
+   It MUST exceed the announce period (else peers age us out between our own announcements) — enforced by
+   the DCPS consistency validator (INCONSISTENT_POLICY)."
   (reliability :best-effort :type (member :best-effort :reliable))
   (reliability-max-blocking (make-qos-duration 0 100000000) :type qos-duration) ; 100 ms
   (durability :volatile :type (member :volatile :transient-local :transient :persistent))
@@ -142,7 +178,10 @@
   (resource-max-instances -1 :type integer)
   (resource-max-samples-per-instance -1 :type integer)
   ;; TYPE_CONSISTENCY_ENFORCEMENT (XTypes, reader-only, not RxO; see FR-TYPE-4).
-  (type-consistency (make-type-consistency-enforcement) :type type-consistency-enforcement))
+  (type-consistency (make-type-consistency-enforcement) :type type-consistency-enforcement)
+  ;; DISCOVERY_CONFIG (VENDOR EXTENSION, participant-scoped, not RxO, not in SEDP) — see the struct docstring.
+  (discovery-announce-period (make-qos-duration 1 0) :type qos-duration)
+  (discovery-lease-duration (make-qos-duration 100 0) :type qos-duration))
 
 (defun* make-writer-qos (&rest args)
     (function (&rest t) qos)

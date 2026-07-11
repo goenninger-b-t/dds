@@ -14,12 +14,23 @@
 
 (defstruct* (assignability-options (:constructor make-assignability-options))
   "The four TypeConsistencyEnforcement fields that modulate is-assignable-from under
-   ALLOW_TYPE_COERCION (XTypes §7.6.3.4.1). Spec defaults: bounds ignored, member names
-   enforced, type widening permitted."
+   ALLOW_TYPE_COERCION (XTypes §7.6.3.4.1), plus IGNORE-KEY-BOUNDS. Spec defaults: bounds
+   ignored, member names enforced, type widening permitted, KEY bounds ENFORCED.
+
+   IGNORE-KEY-BOUNDS (default NIL = the spec rule) additionally relaxes the §7.2.4.4.8 KEY
+   sub-bound rule (key-member-bound-ok-p), which the spec's ignore_string_bounds /
+   ignore_sequence_bounds deliberately do NOT relax. It exists for ONE case: assessing a
+   type parsed from a peer's LEGACY PID_TYPE_OBJECT_LB, whose bounds are a code-generator
+   artifact rather than the peer's declared type — rtiddsgen silently bounds an unbounded
+   `string` at 255 (ADR 0009), so a peer whose IDL says `@key string color` announces a
+   255-bounded key. Enforcing the key sub-bound against that invented bound false-REJECTS a
+   peer using the very same type (ADR 0057). NOT settable from TYPE_CONSISTENCY_ENFORCEMENT
+   (it is not a DDS QoS field) — it is only ever set by the legacy-TypeObject gate rung."
   (ignore-sequence-bounds t :type boolean)
   (ignore-string-bounds t :type boolean)
   (ignore-member-names nil :type boolean)
-  (prevent-type-widening nil :type boolean))
+  (prevent-type-widening nil :type boolean)
+  (ignore-key-bounds nil :type boolean))
 
 
 (defun* default-assignability-options ()
@@ -242,7 +253,9 @@
    corresponding member; KeyErased member-type assignability; must_understand and key
    members present in both; key sub-bounds) then the FINAL/APPENDABLE/MUTABLE member-
    matching rules, plus prevent_type_widening. Members are matched by id; base-type members
-   are assumed already flattened (the spec's evaluation model)."
+   are assumed already flattened (the spec's evaluation model). OPTS' IGNORE-KEY-BOUNDS
+   (default NIL = the spec rule) skips the key sub-bound check — set ONLY when the source
+   type came from a lossy legacy TypeObject whose bounds are a generator artifact (ADR 0057)."
   (let ((m1s (minimal-struct-type-members s1))
         (m2s (minimal-struct-type-members s2))
         (ext (minimal-struct-type-extensibility s1)))
@@ -271,10 +284,11 @@
           (unless (and (member-by-id (minimal-struct-member-id m) m1s)
                        (member-by-id (minimal-struct-member-id m) m2s))
             (return-from result nil))))
-      (dolist (b m2s)
-        (when (minimal-struct-member-key-p b)
-          (let ((a (member-by-id (minimal-struct-member-id b) m1s)))
-            (when (and a (not (key-member-bound-ok-p a b))) (return-from result nil)))))
+      (unless (assignability-options-ignore-key-bounds opts)   ; a legacy TypeObject's bounds are generator artifacts, not the peer's type (ADR 0057)
+        (dolist (b m2s)
+          (when (minimal-struct-member-key-p b)
+            (let ((a (member-by-id (minimal-struct-member-id b) m1s)))
+              (when (and a (not (key-member-bound-ok-p a b))) (return-from result nil))))))
       (when (assignability-options-prevent-type-widening opts)
         (dolist (b m2s)
           (when (and (not (minimal-struct-member-optional-p b))

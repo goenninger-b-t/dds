@@ -12,6 +12,7 @@
     OFFERED/REQUESTED_INCOMPATIBLE_QOS and blocks endpoint matching.")
   (:export #:qos-duration #:make-qos-duration #:qos-duration-sec #:qos-duration-nanosec
            #:+duration-zero+ #:+duration-infinite+ #:duration<=
+           #:duration-infinite-p #:duration->seconds
            #:duration-nanosec->wire-fraction #:wire-fraction->duration-nanosec
            #:qos #:make-qos #:make-writer-qos #:make-reader-qos #:copy-qos
            #:qos-reliability #:qos-durability #:qos-deadline #:qos-latency-budget
@@ -26,6 +27,8 @@
            #:qos-resource-max-samples #:qos-resource-max-instances
            #:qos-resource-max-samples-per-instance
            #:qos-type-consistency
+           ;; DISCOVERY_CONFIG (vendor extension, participant-scoped; WP-DCPS-API-COMPLETION S7)
+           #:qos-discovery-announce-period #:qos-discovery-lease-duration
            ;; TYPE_CONSISTENCY_ENFORCEMENT policy (XTypes, reader-only; FR-TYPE-4)
            #:type-consistency-enforcement #:make-type-consistency-enforcement
            #:copy-type-consistency-enforcement

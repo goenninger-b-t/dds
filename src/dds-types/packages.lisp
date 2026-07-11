@@ -60,6 +60,7 @@
            #:assignability-options-ignore-string-bounds
            #:assignability-options-ignore-member-names
            #:assignability-options-prevent-type-widening
+           #:assignability-options-ignore-key-bounds
            #:default-assignability-options
            #:ti-assignable-from #:strongly-assignable-from #:struct-assignable-from
            #:ti-primitive-p #:ti-array-p

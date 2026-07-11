@@ -265,6 +265,7 @@
   (default-unicast-locators '() :type list)       ; list of LOCATOR (user traffic)
   (metatraffic-unicast-locators '() :type list)   ; list of LOCATOR (discovery)
   (lease-duration-seconds 100 :type (signed-byte 32))
+  (lease-duration-nanosec 0 :type (integer 0))   ; the leaseDuration Duration_t FRACTION field (§9.3.2.3), carried as nanosec
   (builtin-endpoint-set 0 :type (unsigned-byte 32))
   ;; PID_SHMEM_HOST_UUID (vendor 0x8040, ADR 0013): 8-octet same-host UUID; 0 = none/absent.
   (host-uuid 0 :type (unsigned-byte 64))
@@ -315,7 +316,8 @@
   ;; PID_PARTICIPANT_LEASE_DURATION: Duration_t {long seconds; unsigned long fraction;} (§9.3.2.3).
   (multiple-value-bind (c vec) (%make-scratch 8)
     (dds.core.buffer:put-u32 c (logand (spdp-data-lease-duration-seconds data) #xFFFFFFFF))
-    (dds.core.buffer:put-u32 c 0)
+    (dds.core.buffer:put-u32 c (dds.qos:duration-nanosec->wire-fraction   ; sub-second lease: sec/2^32 fraction, NOT a hardcoded 0
+                                (spdp-data-lease-duration-nanosec data)))
     (dds.rtps.message:write-parameter cursor dds.rtps.message:+pid-participant-lease-duration+ vec 0 8))
   ;; PID_BUILTIN_ENDPOINT_SET: BuiltinEndpointSet_t (u32) (§9.3.2.1 / §9.6.2.2).
   (multiple-value-bind (c vec) (%make-scratch 4)
@@ -363,9 +365,12 @@
                  (spdp-data-metatraffic-unicast-locators data))))))
     ((= pid dds.rtps.message:+pid-participant-lease-duration+)
      (when (>= len 8)
-       (let ((su (dds.core.buffer:get-u32 cursor)))
+       (let ((su (dds.core.buffer:get-u32 cursor))
+             (fr (dds.core.buffer:get-u32 cursor)))   ; the FRACTION must be read: dropping it truncates a sub-second lease to 0 = an instant false-prune
          (setf (spdp-data-lease-duration-seconds data)
-               (if (>= su #x80000000) (- su #x100000000) su)))))
+               (if (>= su #x80000000) (- su #x100000000) su))
+         (setf (spdp-data-lease-duration-nanosec data)
+               (dds.qos:wire-fraction->duration-nanosec fr)))))
     ((= pid dds.rtps.message:+pid-builtin-endpoint-set+)
      (when (>= len 4)
        (setf (spdp-data-builtin-endpoint-set data) (dds.core.buffer:get-u32 cursor))))
@@ -444,7 +449,8 @@
                                  :version-major 2 :version-minor 5 :vendor-id #x010F
                                  :default-unicast-locators (list du0 du1)
                                  :metatraffic-unicast-locators (list mt)
-                                 :lease-duration-seconds 30 :builtin-endpoint-set +builtin-endpoint-set-default+))
+                                 :lease-duration-seconds 30 :lease-duration-nanosec 500000000
+                                 :builtin-endpoint-set +builtin-endpoint-set-default+))
            (ob (dds.core.buffer:make-octet-buffer 512))
            (wc (dds.core.buffer:cursor ob :endianness :little)))
       (serialize-spdp-data wc data)
@@ -468,6 +474,9 @@
           (assert (= (locator-port (first mlocs)) 7410) () "metatraffic port mismatch")
           (assert (string= (locator-ipv4-string (first mlocs)) "127.0.0.1") () "metatraffic addr mismatch"))
         (assert (= (spdp-data-lease-duration-seconds back) 30) () "lease mismatch")
+        ;; §9.3.2.3 Duration_t: the FRACTION must survive the round trip (a dropped fraction reads a
+        ;; sub-second lease as 0 -> a live peer is pruned on the next sweep).
+        (assert (= (spdp-data-lease-duration-nanosec back) 500000000) () "lease fraction mismatch")
         (assert (= (spdp-data-builtin-endpoint-set back) +builtin-endpoint-set-default+) () "endpoint-set mismatch")
         (values t back)))))
 

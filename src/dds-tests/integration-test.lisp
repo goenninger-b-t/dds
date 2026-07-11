@@ -3557,6 +3557,238 @@
         (dds.dcps:delete-participant p2)))
     t))
 
+(defun* %autonomous-qos (period-seconds lease-seconds)
+    (function (real real) dds.qos:qos)
+  "A participant QoS whose DISCOVERY_CONFIG announces LEASE-SECONDS and announces every PERIOD-SECONDS
+   (WP-DCPS-API-COMPLETION S7). Both accept a fractional value (a sub-second cadence / lease rides the
+   Duration_t fraction, RTPS 2.5 §9.3.2.3)."
+  (flet ((dur (s) (multiple-value-bind (whole frac) (floor s)
+                    (dds.qos:make-qos-duration whole (round (* frac 1000000000))))))
+    (dds.qos:make-qos :discovery-announce-period (dur period-seconds)
+                      :discovery-lease-duration (dur lease-seconds))))
+
+(defun* %announcer-thread-count ()
+    (function () (integer 0))
+  "How many autonomous-announcer threads (dds.pal:spawn :name \"dds-autodiscovery\") are alive right now."
+  (count "dds-autodiscovery" (dds.pal:live-threads)
+         :key #'dds.pal:thread-name :test #'string=))
+
+(defun* run-dcps-discovery-cadence-test ()
+    (function () t)
+  "S7.T2 — the DISCOVERY_CONFIG vendor-extension QoS (announce period + announced leaseDuration) is
+   configurable and CHANGEABLE. (a) The defaults are the documented {1,0} / {100,0} (the latter = the RTPS
+   2.5 Table 9.18 PID_PARTICIPANT_LEASE_DURATION default, i.e. byte-identical to the pre-S7 hardcoded
+   announce). (b) A participant created with a custom cadence pushes BOTH the announced lease (onto the
+   disc-node, so every SPDP carries it) and the period (onto its announcer thread). (c) set_qos on an
+   ENABLED autonomous participant re-applies both LIVE — it is NOT rejected as an immutable policy, and the
+   running announcer picks up the new cadence. (d) A self-defeating cadence (period >= lease: peers would
+   age us out between our own announcements) is rejected with INCONSISTENT_POLICY."
+  (let ((defaults (dds.qos:make-qos)))
+    (%check :cadence-default-period
+            (and (= 1 (dds.qos:qos-duration-sec (dds.qos:qos-discovery-announce-period defaults)))
+                 (= 0 (dds.qos:qos-duration-nanosec (dds.qos:qos-discovery-announce-period defaults))))
+            "DISCOVERY_CONFIG announce period defaults to {1, 0}")
+    (%check :cadence-default-lease
+            (and (= 100 (dds.qos:qos-duration-sec (dds.qos:qos-discovery-lease-duration defaults)))
+                 (= 0 (dds.qos:qos-duration-nanosec (dds.qos:qos-discovery-lease-duration defaults))))
+            "DISCOVERY_CONFIG announced lease defaults to {100, 0} (RTPS 2.5 Table 9.18)"))
+  (let ((p (dds.dcps:create-participant :domain (test-domain) :autonomous t
+                                        :qos (%autonomous-qos 0.25d0 3))))
+    (unwind-protect
+         (let ((node (dds.dcps::dp-node p)))
+           (%check :cadence-node-lease
+                   (and (= 3 (dds.disc:disc-node-lease-duration-seconds node))
+                        (= 0 (dds.disc:disc-node-lease-duration-nanosec node)))
+                   "the configured leaseDuration reaches the disc-node (every SPDP announces it)")
+           (%check :cadence-announcer-period
+                   (let ((a (dds.dcps::dp-announcer p)))
+                     (and a (< (abs (- 0.25d0 (dds.dcps::auto-announcer-period-seconds a))) 1d-9)))
+                   "the configured announce period reaches the running announcer thread")
+           ;; (c) live re-configure on an ENABLED participant: sub-second lease too (the Duration_t fraction).
+           (%check :cadence-set-qos-live
+                   (eq :ok (dds.dcps:set-qos p (%autonomous-qos 0.05d0 1.5d0)))
+                   "set_qos re-configures DISCOVERY_CONFIG on an enabled participant (CHANGEABLE, not IMMUTABLE_POLICY)")
+           (%check :cadence-reapplied
+                   (let ((a (dds.dcps::dp-announcer p)))
+                     (and (= 1 (dds.disc:disc-node-lease-duration-seconds node))
+                          (= 500000000 (dds.disc:disc-node-lease-duration-nanosec node))
+                          a (< (abs (- 0.05d0 (dds.dcps::auto-announcer-period-seconds a))) 1d-9)))
+                   "set_qos applies the new lease (incl. the sub-second fraction) + period LIVE")
+           ;; (d) a period at or above the lease would flap us out of every peer's discovery set.
+           (%check :cadence-inconsistent
+                   (eq :inconsistent-policy (dds.dcps:set-qos p (%autonomous-qos 5 2)))
+                   "an announce period >= the announced lease is INCONSISTENT_POLICY"))
+      (dds.dcps:delete-participant p)))
+  t)
+
+(defun* run-dcps-autonomous-lifecycle-test ()
+    (function () t)
+  "S7.T3 — the autonomous announcer's THREAD LIFECYCLE is clean: repeated create/delete cycles leak no
+   threads. The announcer thread exists exactly while an autonomous participant is alive-and-enabled, and
+   delete-participant stops + JOINS it (the join is what makes the node teardown safe — the thread touches
+   the node's announce buffers). Also covers the create-DISABLED -> enable -> delete path (the announcer is
+   spawned by enable, not by create) and asserts a NON-autonomous participant never spawns one."
+  (let ((baseline (%announcer-thread-count)))
+    ;; 3 create/delete cycles: the announcer count must return to baseline every time (no leak).
+    (dotimes (i 3)
+      (let ((p (dds.dcps:create-participant :domain (test-domain) :autonomous t
+                                            :qos (%autonomous-qos 0.1d0 30))))
+        (%check :auto-thread-live
+                (= (1+ baseline) (%announcer-thread-count))
+                "an enabled AUTONOMOUS participant runs exactly one announcer thread")
+        (dds.dcps:delete-participant p))
+      (%check :auto-thread-joined
+              (= baseline (%announcer-thread-count))
+              "delete-participant stops + JOINS the announcer — the thread set returns to baseline"))
+    ;; A non-autonomous participant spawns no announcer at all (the default path is byte-identical).
+    (let ((p (dds.dcps:create-participant :domain (test-domain))))
+      (unwind-protect
+           (%check :auto-thread-none
+                   (and (null (dds.dcps::dp-announcer p))
+                        (= baseline (%announcer-thread-count)))
+                   "a NON-autonomous participant spawns no announcer thread")
+        (dds.dcps:delete-participant p)))
+    ;; create-DISABLED -> enable spawns it; delete joins it.
+    (let ((f (dds.dcps:get-participant-factory)))
+      (dds.dcps:set-participant-factory-autoenable f nil)
+      (unwind-protect
+           (let ((p (dds.dcps:create-participant :domain (test-domain) :autonomous t
+                                                 :qos (%autonomous-qos 0.1d0 30))))
+             (unwind-protect
+                  (progn
+                    (%check :auto-thread-disabled
+                            (and (null (dds.dcps::dp-announcer p))
+                                 (= baseline (%announcer-thread-count)))
+                            "a DISABLED autonomous participant has no announcer yet (it starts at enable)")
+                    (dds.dcps:enable p)
+                    (%check :auto-thread-on-enable
+                            (and (dds.dcps::dp-announcer p)
+                                 (= (1+ baseline) (%announcer-thread-count)))
+                            "enable() spawns the announcer thread")
+                    (dds.dcps:enable p)   ; idempotent: no second thread
+                    (%check :auto-thread-enable-idempotent
+                            (= (1+ baseline) (%announcer-thread-count))
+                            "a second enable() does not spawn a second announcer (idempotent)"))
+               (dds.dcps:delete-participant p))
+             (%check :auto-thread-final
+                     (= baseline (%announcer-thread-count))
+                     "no announcer thread survives delete-participant (create/enable/delete leaks nothing)"))
+        (dds.dcps:set-participant-factory-autoenable f t))))
+  t)
+
+(defun* run-dcps-autonomous-lease-expiry-test ()
+    (function () t)
+  "S7.T4 — a KILLED participant AGES OUT of a live peer, with no app-driven spin. P1 announces a SHORT
+   leaseDuration (DISCOVERY_CONFIG); P2 (autonomous) discovers and MATCHES it. P1 is then killed —
+   delete-participant closes its sockets and sends no SPDP dispose, so from P2's side it simply goes
+   SILENT, which is exactly the RTPS 2.5 §8.5.3.3.2 stale-entry case. P2's announcer-driven %lease-sweep
+   must then prune it OBSERVABLY: discovered-count and matched-count both fall back to 0 (and the reader's
+   SUBSCRIPTION_MATCHED current_count decrements), within the announced lease plus a few announce periods.
+   This is the end-to-end proof that the S7 announcer drives AGING, not just announcing."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p1 (dds.dcps:create-participant :domain (test-domain) :autonomous t
+                                          :qos (%autonomous-qos 0.1d0 1)))   ; a 1 s announced lease
+         (p2 (dds.dcps:create-participant :domain (test-domain) :autonomous t
+                                          :qos (%autonomous-qos 0.1d0 30))))
+    (unwind-protect
+         (let* ((t1 (dds.dcps:create-topic p1 "S7Lease" "shape-type" ts))
+                (t2 (dds.dcps:create-topic p2 "S7Lease" "shape-type" ts))
+                (pub (dds.dcps:create-publisher p1))
+                (sub (dds.dcps:create-subscriber p2))
+                (dr (dds.dcps:create-datareader sub t2)))
+           (dds.dcps:create-datawriter pub t1)
+           (loop repeat 400
+                 until (and (plusp (dds.dcps:matched-count p2)) (plusp (dds.dcps:discovered-count p2)))
+                 do (sleep 0.025))   ; NO spin: the announcer threads drive discovery
+           (%check :lease-matched
+                   (and (plusp (dds.dcps:matched-count p2)) (plusp (dds.dcps:discovered-count p2)))
+                   "P2 discovers + matches P1 with no app-driven spin")
+           (dds.dcps:delete-participant p1)   ; the KILL: P1 stops announcing (no dispose on the wire)
+           ;; P2's announcer (100 ms cadence) must prune P1 once its 1 s announced lease elapses.
+           (loop repeat 400
+                 until (and (zerop (dds.dcps:matched-count p2)) (zerop (dds.dcps:discovered-count p2)))
+                 do (sleep 0.025))
+           (%check :lease-aged-out
+                   (and (zerop (dds.dcps:discovered-count p2)) (zerop (dds.dcps:matched-count p2)))
+                   "the killed participant AGES OUT of the live peer (announcer-driven %lease-sweep)")
+           (%check :lease-unmatched-status
+                   (zerop (dds.dcps:subscription-matched-status-current-count
+                           (dds.dcps:get-subscription-matched-status dr)))
+                   "the lease expiry decrements SUBSCRIPTION_MATCHED current_count to 0"))
+      (dds.dcps:delete-participant p2)))
+  t)
+
+;; shape-type with shapesize retyped i32->i64: same names/ids/key, a GENUINELY different type (XTypes
+;; §7.2.4.4 Table 15 — a differing member kind is not assignable). The legacy-gate negative control.
+(dds.gen:define-dds-type shape-type-mismatch (:extensibility :final)
+  (color :string :key t)
+  (x :i32)
+  (y :i32)
+  (shapesize :i64))
+
+(defun* %tg-remote-endpoint (kind lb &optional (tag 0))
+    (function (symbol (simple-array (unsigned-byte 8) (*)) &optional (unsigned-byte 8))
+              dds.rtps.discovery:endpoint-data)
+  "A synthetic REMOTE endpoint on (Square, ShapeType) carrying LB as its PID_TYPE_OBJECT_LB and NO
+   PID_TYPE_INFORMATION — the shape of a stock Connext 7.3.1 SEDP announce (ADR 0009). KIND :reader or
+   :writer picks the GUID entityKind octet the gate reads for the assignability direction (RTPS 2.5 §9.3.1.2
+   Table 9.1: 0x04 = user reader with key, 0x02 = user writer with key). TAG further varies the GUID: the
+   gate records verdicts PER REMOTE GUID and replays them, so every case in a test needs its own GUID or it
+   would just read back the previous case's verdict."
+  (let ((guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 33)))
+    (setf (aref guid 15) (ecase kind (:reader #x04) (:writer #x02)))
+    (setf (aref guid 12) (ecase kind (:reader 7) (:writer 9)))
+    (setf (aref guid 13) tag)
+    (dds.rtps.discovery:make-endpoint-data
+     :guid guid :topic-name "Square" :type-name "ShapeType" :type-object-lb lb)))
+
+(defun* run-dcps-type-gate-legacy-reader-test ()
+    (function () t)
+  "REGRESSION (ADR 0057, found by the S7 live-interop gate): the FR-TYPE-4 type gate must NOT false-REJECT a
+   stock Connext DataReader. A legacy PID_TYPE_OBJECT_LB is a LOSSY encoding — rtiddsgen silently bounds an
+   unbounded `string` at 255 (ADR 0009 §Context.2), so Connext's captured C_Shape carries `color` as
+   Bound 255 where our identically-declared shape-type carries it UNBOUNDED. The gate used to assess a
+   remote READER under the XTypes §7.6.3.4.1 assumed DISALLOW_TYPE_COERCION, i.e. by struct EQUIVALENCE,
+   which compares that invented bound and returned :incompatible — blocking EVERY DCPS DataWriter from
+   matching EVERY stock vendor DataReader (live-confirmed: matched=0; clearing the gate hook -> matched=2).
+   Pinned to the LIVE captured Connext 7.3.1 C_Shape legacy TypeObject (docs/provenance.md 2026-06-11):
+   (a) it gates :compatible against our identically-declared type despite the artifact bound, in BOTH
+   directions; (b) against a GENUINELY different local type (shapesize retyped i32->i64) the SAME captured
+   LB still gates :incompatible — the fix ignores invented bounds, it does not disarm the gate."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (mismatch-ts (dds.types:find-type-support "shape-type-mismatch"))
+         (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "ShapeType" ts))
+                (pub (dds.dcps:create-publisher p))
+                (node (dds.dcps::dp-node p))
+                (local (dds.rtps.discovery:make-endpoint-data
+                        :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 1)
+                        :topic-name "Square" :type-name "ShapeType"))
+                ;; the SAME wire type name, bound to a structurally DIFFERENT local type
+                (local-bad (dds.rtps.discovery:make-endpoint-data
+                            :guid (make-array 16 :element-type '(unsigned-byte 8) :initial-element 2)
+                            :topic-name "SquareMismatch" :type-name "ShapeType")))
+           (dds.dcps:create-topic p "SquareMismatch" "ShapeType" mismatch-ts)
+           (dds.dcps:create-datawriter pub tp)
+           (%check :tg-legacy-reader-compatible
+                   (eq :compatible
+                       (dds.dcps::%participant-type-gate
+                        p node (%tg-remote-endpoint :reader (%connext-c-shape-lb)) local))
+                   "a stock Connext READER's legacy C_Shape TypeObject must gate :compatible against our identically-declared type (the rtiddsgen 255 key-string bound is an artifact, not a type difference)")
+           (%check :tg-legacy-writer-compatible
+                   (eq :compatible
+                       (dds.dcps::%participant-type-gate
+                        p node (%tg-remote-endpoint :writer (%connext-c-shape-lb)) local))
+                   "the same holds in the writer direction (the inbound leg that already worked stays working)")
+           (%check :tg-legacy-different-type-rejected
+                   (eq :incompatible
+                       (dds.dcps::%participant-type-gate
+                        p node (%tg-remote-endpoint :reader (%connext-c-shape-lb) 1) local-bad))
+                   "the SAME captured legacy LB against a genuinely DIFFERENT local type (shapesize i32->i64) must still gate :incompatible — bounds are ignored, the gate is not disarmed"))
+      (dds.dcps:delete-participant p)))
+  t)
+
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 

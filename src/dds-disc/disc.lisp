@@ -210,6 +210,11 @@
   (zc-armed-changes '() :type list)        ; WP-FLATDATA-LOAN-WRITE (R6, ADR 0042): changes born :armed with a pre-committed slot, pending their push pass — the leak-safety sweep registry (guarded by LOCK; drained by %zc-armed-sweep after each push pass / at stop-node)
   (zc-pin-count (dds.pal:make-atomic-cell) :type dds.pal:atomic-cell)   ; WP-ACKED-SLOT-PINNING (R6, ADR 0044): live count of currently-pinned slots (atomic; incremented at a granted pin in publish-sample, decremented in the HistoryCache zc-release-fn at the change-removal choke) — gates *zc-pin-budget*
   (zc-loan-capable nil :type t)            ; WP-FLATDATA-ZC-LOAN (FR-PF-3/4, R6, ADR 0017): DCPS set this iff the local reader is on a :flatdata topic AND ZC armed -> the receiver thread stores the UNRESOLVED ref (no copy/release; the slot stays loaned via the writer's refcount) and DCPS take-loaned/return-loan owns the slot lifetime. NIL (default) = today's resolve-copy-release. NOT cleared for ship — pending counsel (R6)
+  ;; WP-DCPS-API-COMPLETION S7: the leaseDuration this node ANNOUNCES in SPDP (PID_PARTICIPANT_LEASE_DURATION,
+  ;; RTPS 2.5 §8.5.3.3.2) — how long a peer keeps us alive after our last announcement. Spec default {100, 0}
+  ;; (Table 9.18); DCPS overrides it from the participant's DISCOVERY_CONFIG QoS. Read per announce (live-changeable).
+  (lease-duration-seconds 100 :type (signed-byte 32))
+  (lease-duration-nanosec 0 :type (integer 0))
   (batch-max-samples 1 :type (integer 1)) ; WP-BATCH size trigger: flush the accumulated batch every N publishes (1 = flush per write, no batching)
   (batch-pending 0 :type (integer 0))     ; samples accumulated since the last flush (a flush pacer; %push-data always sends all unsent)
   ;; WP-ASYNC: a background sender thread decoupling the push from write() (nil async-thread = synchronous, default)
@@ -893,8 +898,9 @@
                             (domain 0) (host "127.0.0.1") (port 0) (peers '()) multicast
                             (advertise-address "127.0.0.1") (batch-max-samples 1)
                             (capture-data-key-hash nil) (crypto-transform nil)
-                            (identity-token-octets nil) (on-stateless-message nil))
-    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1)) (:capture-data-key-hash t) (:crypto-transform t) (:identity-token-octets t) (:on-stateless-message t)) disc-node)
+                            (identity-token-octets nil) (on-stateless-message nil)
+                            (lease-duration-seconds 100) (lease-duration-nanosec 0))
+    (function (&key (:guid-prefix (simple-array (unsigned-byte 8) (12))) (:domain (integer 0)) (:host string) (:port (unsigned-byte 16)) (:peers list) (:multicast t) (:advertise-address string) (:batch-max-samples (integer 1)) (:capture-data-key-hash t) (:crypto-transform t) (:identity-token-octets t) (:on-stateless-message t) (:lease-duration-seconds (signed-byte 32)) (:lease-duration-nanosec (integer 0))) disc-node)
   "Open a metatraffic UDPv4 socket bound to HOST:PORT and build a discovery node.
    PEERS is a list of (host-string . port) the node announces SPDP to (FR-DISC-4).
    MULTICAST opens a second socket bound to the SPDP multicast port and joins the
@@ -911,6 +917,11 @@
    IDENTITY-TOKEN-OCTETS (§7.4.3.2): CDR-LE IdentityToken DataHolder octets from validate-local-identity
    + identity-token; when non-NIL the node advertises PID_IDENTITY_TOKEN + PSM endpoint-set bits in SPDP.
    NIL (default) = security OFF, byte-identical SPDP (no PID_IDENTITY_TOKEN, no PSM bits).
+   LEASE-DURATION-SECONDS / LEASE-DURATION-NANOSEC (WP-DCPS-API-COMPLETION S7, RTPS 2.5 §8.5.3.3.2): the
+   leaseDuration this node announces in SPDP (PID_PARTICIPANT_LEASE_DURATION) — how long a peer keeps this
+   participant alive after its last announcement before pruning it as stale. Default {100, 0} = the RTPS 2.5
+   Table 9.18 spec default (byte-identical to the pre-S7 hardcoded value). DCPS drives these from the
+   participant's DISCOVERY_CONFIG QoS; they are re-read on every announce, so set_qos re-applies live.
    ON-STATELESS-MESSAGE (Slice 2b-i, §7.4.3 / §8.7): function (node src-prefix envelope-octets) -> t
    invoked by the receiver thread when a PSM DATA arrives — delivered the RAW ParticipantGenericMessage
    envelope octets (§7.4.4); dds-disc stays crypto/format-agnostic and the consumer (the dds-dcps auth
@@ -926,6 +937,8 @@
            (node (%make-disc-node :guid-prefix guid-prefix :domain domain
                                   :advertise-address advertise-address
                                   :socket sock :transport tr :peers peers
+                                  :lease-duration-seconds lease-duration-seconds
+                                  :lease-duration-nanosec lease-duration-nanosec
                                   :batch-max-samples batch-max-samples
                                   :capture-data-key-hash (and capture-data-key-hash t)
                                   :crypto-transform crypto-transform
@@ -1045,7 +1058,8 @@
                                    (list loc))
      :metatraffic-unicast-locators (list loc)
      :host-uuid (if sm (disc-node-host-uuid node) 0)
-     :lease-duration-seconds 100
+     :lease-duration-seconds (disc-node-lease-duration-seconds node)
+     :lease-duration-nanosec (disc-node-lease-duration-nanosec node)
      :builtin-endpoint-set ep-set
      :identity-token-octets tok)))
 
@@ -1496,10 +1510,19 @@
   (get-internal-real-time))
 
 (defun* %lease-stale-p (last-seen lease-seconds now)
-    (function (integer integer (integer 0)) t)
+    (function (integer real (integer 0)) t)
   "T iff LAST-SEEN is older than LEASE-SECONDS before NOW — the SPDP HistoryCache
-   stale-entry test (RTPS 2.5 §8.5.3.3.2: not refreshed within its leaseDuration)."
+   stale-entry test (RTPS 2.5 §8.5.3.3.2: not refreshed within its leaseDuration).
+   LEASE-SECONDS is a REAL (a peer may announce a sub-second Duration_t fraction)."
   (> (- now last-seen) (* lease-seconds internal-time-units-per-second)))
+
+(defun* %spdp-lease-seconds (spdp)
+    (function (dds.rtps.discovery:spdp-data) real)
+  "A discovered peer's announced leaseDuration as SECONDS, whole + fractional (RTPS 2.5 §9.3.2.3
+   Duration_t {seconds, fraction}). The fraction is load-bearing: truncating it would read a peer's
+   sub-second lease as 0 and prune a perfectly live peer on the next sweep (a false REJECT)."
+  (+ (dds.rtps.discovery:spdp-data-lease-duration-seconds spdp)
+     (/ (dds.rtps.discovery:spdp-data-lease-duration-nanosec spdp) 1000000000)))
 
 (defun* %invalidate-shmem-dest (node prefix)
     (function (disc-node (simple-array (unsigned-byte 8) (12))) t)
@@ -1645,8 +1668,7 @@
       (let ((now (%lease-now)) (dead '()))
         (maphash (lambda (prefix spdp)
                    (let ((ls (gethash prefix (disc-node-participant-last-seen node))))
-                     (when (and ls (%lease-stale-p
-                                    ls (dds.rtps.discovery:spdp-data-lease-duration-seconds spdp) now))
+                     (when (and ls (%lease-stale-p ls (%spdp-lease-seconds spdp) now))
                        (push prefix dead))))
                  (disc-node-discovered node))
         (dolist (prefix dead)
