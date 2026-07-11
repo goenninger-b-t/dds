@@ -679,7 +679,8 @@
     (values base numbits bitmap)))
 
 (defun* reader-on-gap (reader writer-id gap-start base numbits bitmap)
-    (function (rtps-reader t integer integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*))) t)
+    (function (rtps-reader t integer integer (unsigned-byte 32) (simple-array (unsigned-byte 32) (*)))
+              (integer 0))
   "Mark GAPped SNs as irrelevant so they do not block the ack (RTPS 2.5 §8.3.7.4):
    the range [gapStart, base-1] plus the SNs listed in the bitmap. The contiguous range is LOWER-clamped
    to the proxy's first-sn (marking below the live window is pointless) and its iteration is HARD-capped at
@@ -687,16 +688,31 @@
    inbound HEARTBEATs, so NEITHER bounds the loop; the cap (independent of any wire value) is the
    resource-exhaustion guard against a 2^60-span CPU+memory DoS (NFR-SEC-POSTURE; RTPS 2.5 §8.3.7.4). A
    legitimately larger evicted run is recovered over subsequent GAP/HEARTBEAT rounds (firstSN compaction),
-   so the cap is loss-free. The bitmap loop is already bounded (numBits<=256, <=256 inserts)."
+   so the cap is loss-free. The bitmap loop is already bounded (numBits<=256, <=256 inserts).
+
+   Returns the count of NEWLY-lost samples (DDS 1.4 §2.2.4.1 SAMPLE_LOST): an SN that transitions from
+   never-seen (no marker) to :gap is a sample the writer declared permanently gone that the reader never
+   received (a KEEP_LAST overwrite / RESOURCE_LIMITS eviction, ADR 0019). An already-RECEIVED SN (marker T)
+   is PRESERVED (never clobbered to :gap, never counted — it was delivered) and an already-:gap SN is not
+   re-counted. Because this engine content-filters READER-SIDE (never emits writer-side filter GAPs), every
+   inbound GAP is a genuine purge/eviction, so the count is exact; the lower-clamp to first-sn keeps a
+   durability-skipped pre-match range (which is intentionally not-wanted, not lost) out of the tally. The
+   disc layer (%on-user-gap) fires SAMPLE_LOST with this count via the on-sample-lost hook."
   (let* ((proxy (get-writer-proxy reader writer-id))
          (received (writer-proxy-received proxy))
          (lo (max gap-start (writer-proxy-first-sn proxy)))         ; don't mark below the proxy window
-         (hi (min base (+ lo *max-gap-range*))))                    ; HARD cap — independent of wire last-sn
-    (loop for sn from lo below hi do (setf (gethash sn received) :gap))
-    (dotimes (i numbits)                                            ; bitmap is already bounded (numBits<=256)
-      (when (dds.rtps.message:seqnum-set-bit-p bitmap i)
-        (setf (gethash (+ base i) received) :gap)))
-    t))
+         (hi (min base (+ lo *max-gap-range*)))                     ; HARD cap — independent of wire last-sn
+         (lost 0))
+    (flet ((%mark-gap (sn)                                          ; :gap unless already RECEIVED; count a fresh loss
+             (let ((cur (gethash sn received)))
+               (unless (eq cur t)
+                 (unless (eq cur :gap) (incf lost))
+                 (setf (gethash sn received) :gap)))))
+      (loop for sn from lo below hi do (%mark-gap sn))
+      (dotimes (i numbits)                                          ; bitmap is already bounded (numBits<=256)
+        (when (dds.rtps.message:seqnum-set-bit-p bitmap i)
+          (%mark-gap (+ base i)))))
+    lost))
 
 (defun* reader-suppress-sn (reader writer-id sn)
     (function (rtps-reader t integer) t)

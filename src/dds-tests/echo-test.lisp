@@ -3874,6 +3874,8 @@
                  ("dcps-querycondition-sql"  . run-dcps-querycondition-sql-test)
                  ("dcps-inconsistent-topic"  . run-dcps-inconsistent-topic-test)
                  ("dcps-sample-rejected"     . run-dcps-sample-rejected-test)
+                 ("dcps-deadline-monitor"    . run-dcps-deadline-monitor-test)
+                 ("dcps-sample-lost"         . run-dcps-sample-lost-test)
                  ("dcps-builtin-topics"      . run-dcps-builtin-topics-test)
                  ("dcps-type-compat"         . run-dcps-type-compat-test)
                  ("dcps-large-frag"          . run-dcps-large-test)

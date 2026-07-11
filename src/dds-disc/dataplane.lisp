@@ -3093,8 +3093,12 @@
     (when (and base (disc-node-user-reader node) (%user-writer-entityid-p wid))
       (let ((routes (%reader-routes-for node (%source-guid src-prefix wid))))   ; WP-N-ENDPOINT-S2: the CANONICAL reader matched to this writer
         (when routes
-          (dds.rtps.reliable:reader-on-gap (cdr (first routes)) (%source-guid src-prefix wid)
-                                           gap-start base numbits bitmap)))))
+          (let ((lost (dds.rtps.reliable:reader-on-gap (cdr (first routes)) (%source-guid src-prefix wid)
+                                                       gap-start base numbits bitmap)))
+            ;; WP-DCPS-API-COMPLETION S4: a GAP that declares never-received SNs permanently gone raises
+            ;; SAMPLE_LOST on the matched DataReader(s) (DDS 1.4 §2.2.4.1); N=1 -> the canonical route's id.
+            (when (and (plusp lost) (disc-node-on-sample-lost node))
+              (dolist (rr routes) (funcall (disc-node-on-sample-lost node) (car rr) lost))))))))
   t)
 
 (defun* %on-user-acknack (node c flags src-prefix)

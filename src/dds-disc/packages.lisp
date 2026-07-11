@@ -21,7 +21,7 @@
            #:disc-node-on-participant-lost
            #:disc-node-on-liveliness-changed #:%liveliness-sweep
            #:disc-node-on-lifecycle-event
-           #:disc-node-on-incompatible-qos #:disc-node-on-sample
+           #:disc-node-on-incompatible-qos #:disc-node-on-sample #:disc-node-on-sample-lost
            #:disc-node-on-inconsistent-topic
            #:disc-node-type-gate #:resume-parked-matches #:disc-node-parked-count
            #:add-local-writer #:add-local-reader

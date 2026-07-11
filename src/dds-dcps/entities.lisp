@@ -53,7 +53,9 @@
    (access-state :initform nil :accessor dp-access-state)   ; DDS-Security 1.1 §8.4 AccessControl manager (access-control.lisp)
    (listener :initform nil :accessor dp-listener)            ; WP-DCPS-API-COMPLETION S3.T1: DomainParticipantListener (DDS 1.4 §2.2.4.1)
    (listener-mask :initform '() :accessor dp-listener-mask)
-   (listener-lock :initform (dds.pal:make-lock "dp-listener") :accessor dp-listener-lock))
+   (listener-lock :initform (dds.pal:make-lock "dp-listener") :accessor dp-listener-lock)
+   (deadline-monitor :initform nil :accessor dp-deadline-monitor)  ; WP-DCPS-API-COMPLETION S4: the lazily-started per-participant deadline monitor thread (deadline.lisp), NIL until the first finite DEADLINE arms a timer
+   (deadline-lock :initform (dds.pal:make-lock "dp-deadline") :accessor dp-deadline-lock))  ; WP-DCPS-API-COMPLETION S4: guards lazy deadline-monitor creation
   (:documentation "DDS DomainParticipant: owns a multicast disc-node for its domain and
    its contained entities. Holds N DataReaders + N DataWriters (on distinct topics) across its
    Subscribers/Publishers; the disc->DCPS status/listener hooks resolve the endpoint an event is
@@ -102,6 +104,8 @@
 
    (pub-matched :initform (make-publication-matched-status) :accessor dw-pub-matched)
    (off-incompat :initform (make-offered-incompatible-qos-status) :accessor dw-off-incompat)
+   (off-deadline :initform (make-offered-deadline-missed-status) :accessor dw-off-deadline) ; WP-DCPS-API-COMPLETION S4: OFFERED_DEADLINE_MISSED (DDS 1.4 §2.2.3.7)
+   (deadline-timers :initform nil :accessor dw-deadline-timers) ; WP-DCPS-API-COMPLETION S4: handle -> deadline-timer (nil until a finite offered DEADLINE arms one; NFR-MEM reuse-per-instance)
    (liv-lost :initform (make-liveliness-lost-status) :accessor dw-liv-lost)
    (last-assertion :initform (%lease-now) :accessor dw-last-assertion) ; last self-assertion stamp (DDS 1.4 §2.2.3.11)
    (alive :initform t :accessor dw-alive-p)                            ; LIVELINESS_LOST loss-transition flag
@@ -132,6 +136,9 @@
    (sub-matched :initform (make-subscription-matched-status) :accessor dr-sub-matched)
    (req-incompat :initform (make-requested-incompatible-qos-status) :accessor dr-req-incompat)
    (sample-rejected :initform (make-sample-rejected-status) :accessor dr-sample-rejected)
+   (req-deadline :initform (make-requested-deadline-missed-status) :accessor dr-req-deadline) ; WP-DCPS-API-COMPLETION S4: REQUESTED_DEADLINE_MISSED (DDS 1.4 §2.2.3.7)
+   (sample-lost :initform (make-sample-lost-status) :accessor dr-sample-lost) ; WP-DCPS-API-COMPLETION S4: SAMPLE_LOST (DDS 1.4 §2.2.4.1)
+   (deadline-timers :initform nil :accessor dr-deadline-timers) ; WP-DCPS-API-COMPLETION S4: handle -> deadline-timer (nil until a finite requested DEADLINE arms one; NFR-MEM reuse-per-instance)
    (liv-changed :initform (make-liveliness-changed-status) :accessor dr-liv-changed)
    (listener :initform nil :accessor dr-listener)
    (listener-mask :initform '() :accessor dr-listener-mask)
@@ -145,6 +152,14 @@
   (:documentation "DDS DataReader: receives typed samples on a Topic into a read/take
    cache with per-instance SampleInfo, carrying its SUBSCRIPTION_MATCHED,
    REQUESTED_INCOMPATIBLE_QOS and SAMPLE_REJECTED statuses, conditions and listener."))
+
+;; Defined in deadline.lisp (loaded after this file, WP-DCPS-API-COMPLETION S4); forward-declared
+;; so write-sample / %drain-one-sample (arm/rearm) and the delete/purge paths (disarm/stop) reach
+;; the deadline monitor without a compile-time undefined-function warning.
+(declaim (ftype (function (t t) t) %deadline-touch %deadline-disarm-instance))
+(declaim (ftype (function (data-writer t t) t) %deadline-touch-writer))
+(declaim (ftype (function (t) t) %deadline-disarm-endpoint))
+(declaim (ftype (function (domain-participant) t) %deadline-monitor-stop))
 
 ;; Defined in conditions.lisp (loaded after this file); forward-declared so the data-
 ;; arrival hook below can wake the reader's WaitSets without a compile-time warning.
@@ -691,6 +706,10 @@
                 (lambda () (%on-participant-sample p)))
           (setf (dds.disc:disc-node-on-inconsistent-topic node)
                 (lambda (topic-name) (%on-disc-inconsistent-topic p topic-name)))
+          (setf (dds.disc:disc-node-on-sample-lost node)   ; WP-DCPS-API-COMPLETION S4: reliable-GAP SAMPLE_LOST (DDS 1.4 §2.2.4.1) -> the matched DataReader
+                (lambda (rid n)
+                  (let ((dr (%participant-reader-by-entity-id p rid)))
+                    (when dr (%fire-sample-lost dr n)))))
           (%install-type-gate p)   ; FR-TYPE-4 assignability gate (type-gate.lisp)
           (when identity           ; DDS-Security §8.7 auth manager — only for a security-enabled participant
             ;; pass the configured signed Permissions octets so the handshake emits c.perm (§9.3.2.1, T6)
@@ -712,6 +731,7 @@
    ZC pool mapping — so no held refcount pins the writer's pool (no leak) and the final %zc-release runs while
    the views' SAP is still mapped (no use-after-free at teardown). A no-op for readers with no loans (the common
    case: ZC off / non-FlatData)."
+  (%deadline-monitor-stop p)   ; WP-DCPS-API-COMPLETION S4: stop + JOIN the deadline monitor thread BEFORE tearing the node down (no strand, no UAF)
   (dolist (dr (%participant-readers p)) (return-all-loans dr))
   (%factory-unregister-participant (get-participant-factory) p)   ; S2.T1: the free-fn is the factory delete_participant shim (DDS 1.4 §2.2.2.2.2)
   (dds.disc:stop-node (dp-node p))
@@ -1252,14 +1272,16 @@
    A DISABLED DataWriter refuses the write with +RETCODE-NOT-ENABLED+ (:not-enabled), the write outside
    the NOT_ENABLED-safe set on a disabled entity (DDS 1.4 §2.2.2.1.1.7, S2.T3)."
   (unless (entity-enabled-p dw) (return-from write-sample +retcode-not-enabled+))
-  (let ((node (dp-node (pub-participant (dw-publisher dw)))))
+  (let ((node (dp-node (pub-participant (dw-publisher dw))))
+        (kh (%write-key-hash dw sample)))   ; WP-DCPS-API-COMPLETION S4: reused for both publish + offered-deadline arm (no extra keyhash cons)
     (when (eq :timeout (dds.disc:publish-sample
                         node (%serialize-sample (topic-type-support (dw-topic dw)) sample
                                                 (%writer-tx-rep dw))
-                        (%write-key-hash dw sample) nil 0 nil
+                        kh nil 0 nil
                         (dw-entity-id dw)))   ; WP-N-ENDPOINT-S1: publish into THIS writer's own HistoryCache
       (return-from write-sample +retcode-timeout+))   ; full bounded cache, max_blocking_time elapsed
     (assert-liveliness dw)
+    (%deadline-touch-writer dw kh sample)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's offered DEADLINE (no-op + 0-alloc when DEADLINE is INFINITE; reuses the KEEP_LAST keyhash)
     +retcode-ok+))
 
 ;;;; ---- WP-FLATDATA-LOAN-WRITE zero-copy TX loan API (FR-PF-4, R6, ADR 0042) ----
@@ -1930,6 +1952,7 @@
                 :key (lambda (cs) (sample-info-instance-handle (cached-sample-info cs)))))
   (remhash handle (dr-instance-recs dr))
   (remhash handle (dr-instances dr))
+  (%deadline-disarm-instance dr handle)   ; WP-DCPS-API-COMPLETION S4: a purged instance no longer tracks a requested DEADLINE
   t)
 
 (defun* %autopurge-sweep (dr)
@@ -2055,6 +2078,47 @@
     (dotimes (i 8) (setf (aref h i) (ldb (byte 8 (* 8 i)) sn)))        ; low 8 = SN
     (dotimes (i 8 h) (setf (aref h (+ 8 i)) (ldb (byte 8 (* 8 i)) fold)))))  ; high 8 = GUID fold (de-alias)
 
+;;; ---- SAMPLE_LOST (DDS 1.4 §2.2.4.1, S4.T3) ----
+
+(defun* %fire-sample-lost (dr n)
+    (function (data-reader (integer 1)) t)
+  "Raise DR's SAMPLE_LOST by N samples through the ONE %notify-status chokepoint (DDS 1.4 §2.2.4.1,
+   dds_rtf2_dcps.idl §99-102): total_count += N (monotonic — samples that were never made available to
+   the reader), total_count_change += N; sets the status-changed bit + triggers the StatusCondition +
+   delivers on_sample_lost to the most-specific enabled listener up the hierarchy (S3). N is the batch
+   count (a GAP can declare several SNs gone at once; a best-effort skip counts the whole run)."
+  (%notify-status dr +status-sample-lost+ :sample-lost
+   (lambda ()
+     (let ((s (dr-sample-lost dr)))
+       (incf (sample-lost-status-total-count s) n)
+       (incf (sample-lost-status-total-count-change s) n)
+       (values t (copy-sample-lost-status s)
+               (lambda () (setf (sample-lost-status-total-count-change s) 0))))))
+  t)
+
+(defun* %reader-best-effort-p (dr)
+    (function (data-reader) boolean)
+  "T iff DR's RELIABILITY QoS is BEST_EFFORT (DDS 1.4 §2.2.3.14) — the mode with no retransmission, so a
+   gap in the delivered SN stream is a permanently-lost sample. A RELIABLE reader recovers a skipped SN by
+   NACK, so a drain-time skip is NOT loss there (its loss is detected only by an irrecoverable GAP)."
+  (let ((qos (entity-qos dr)))
+    (and (typep qos 'dds.qos:qos) (eq :best-effort (dds.qos:qos-reliability qos)))))
+
+(defun* %reader-advance-drained (dr sguid sn)
+    (function (data-reader t integer) t)
+  "Advance DR's per-source-writer delivered high-water for SGUID to SN (the exactly-once drain watermark,
+   §8.3.5.4), first raising SAMPLE_LOST for any best-effort SN-skip: when DR is BEST_EFFORT, a prior
+   watermark exists (the baseline sample already landed — pre-baseline SNs are never 'lost'), and SN jumps
+   past PRIOR+1, the (SN − PRIOR − 1) intervening SNs will never arrive (no retransmit) → fire SAMPLE_LOST
+   for them (DDS 1.4 §2.2.4.1). Pure reordering (a lower SN arriving late) never jumps forward, so it is
+   conservatively not counted (a false SAMPLE_LOST is the worse error). The single chokepoint every drain
+   path (plain / ZC-loan / secured-loan) advances the watermark through, so the detection is DRY + uniform."
+  (let ((prior (gethash sguid (dr-drained dr))))
+    (when (and prior (%reader-best-effort-p dr) (> sn (1+ prior)))
+      (%fire-sample-lost dr (- sn prior 1)))
+    (setf (gethash sguid (dr-drained dr)) (max sn (or prior 0))))
+  t)
+
 (defun* %drain-one-loan (dr ts key marker sn sguid)
     (function (data-reader t cons dds.disc:zc-loan-marker integer t) t)
   "WP-FLATDATA-ZC-LOAN (R6, ADR 0017; NOT cleared for ship — pending counsel): turn an UNRESOLVED ZC-LOAN-MARKER
@@ -2092,7 +2156,7 @@
                                      :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                      :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))))
     (when sguid                                                    ; advance the per-writer watermark (best-effort: ACKed, never retransmit)
-      (setf (gethash sguid (dr-drained dr)) (max sn (gethash sguid (dr-drained dr) 0)))))
+      (%reader-advance-drained dr sguid sn)))
   t)
 
 (defun* %drain-one-secured (dr node ts key loan sn sguid)
@@ -2134,7 +2198,7 @@
                                :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                :no-writers-generation-count (instance-rec-no-writers-gen-count rec)))))))
   (when sguid
-    (setf (gethash sguid (dr-drained dr)) (max sn (gethash sguid (dr-drained dr) 0))))
+    (%reader-advance-drained dr sguid sn))
   t)
 
 (defun* take-loaned (dr)
@@ -2296,6 +2360,7 @@
               (t
                 (let ((rec (%reader-revive-instance dr handle (dds.disc:node-sample-writer node key)))
                       (depth (%reader-keeplast-depth dr)))
+                  (%deadline-touch dr handle)   ; WP-DCPS-API-COMPLETION S4: (re)arm this instance's requested DEADLINE on delivery (no-op + 0-alloc when INFINITE)
                   (when depth (%reader-keeplast-drop-oldest dr handle depth))   ; KEEP_LAST per-instance drop (DDS 1.4 §2.2.3.18) before append
                   (setf (dr-cache dr)
                         (nconc (dr-cache dr)
@@ -2308,7 +2373,7 @@
                                              :disposed-generation-count (instance-rec-disposed-gen-count rec)
                                              :no-writers-generation-count (instance-rec-no-writers-gen-count rec))))))))))))))
     (when (and sguid advance)
-      (setf (gethash sguid (dr-drained dr)) (max sn (gethash sguid (dr-drained dr) 0)))))
+      (%reader-advance-drained dr sguid sn)))
   t)
 
 (defun* %drain (dr)
@@ -2962,6 +3027,39 @@
         (setf (liveliness-lost-status-total-count-change s) 0)
         (%clear-status-changed dw +status-liveliness-lost+)))))
 
+(defun* get-offered-deadline-missed-status (dw)
+    (function (data-writer) offered-deadline-missed-status)
+  "DataWriter::get_offered_deadline_missed_status — a snapshot; the read-communication-status reset
+   (DDS 1.4 §2.2.2.1.9, dds_rtf2_dcps.idl §131-135) resets total_count_change and clears the
+   OFFERED_DEADLINE_MISSED bit in the writer's status-changes bitmask."
+  (dds.pal:with-lock ((dw-status-lock dw))
+    (let ((s (dw-off-deadline dw)))
+      (prog1 (copy-offered-deadline-missed-status s)
+        (setf (offered-deadline-missed-status-total-count-change s) 0)
+        (%clear-status-changed dw +status-offered-deadline-missed+)))))
+
+(defun* get-requested-deadline-missed-status (dr)
+    (function (data-reader) requested-deadline-missed-status)
+  "DataReader::get_requested_deadline_missed_status — a snapshot; the read-communication-status
+   reset (DDS 1.4 §2.2.2.1.9, dds_rtf2_dcps.idl §137-141) resets total_count_change and clears the
+   REQUESTED_DEADLINE_MISSED bit in the reader's status-changes bitmask."
+  (dds.pal:with-lock ((dr-status-lock dr))
+    (let ((s (dr-req-deadline dr)))
+      (prog1 (copy-requested-deadline-missed-status s)
+        (setf (requested-deadline-missed-status-total-count-change s) 0)
+        (%clear-status-changed dr +status-requested-deadline-missed+)))))
+
+(defun* get-sample-lost-status (dr)
+    (function (data-reader) sample-lost-status)
+  "DataReader::get_sample_lost_status — a snapshot; the read-communication-status reset (DDS 1.4
+   §2.2.2.1.9, dds_rtf2_dcps.idl §99-102 / §1163) resets total_count_change and clears the SAMPLE_LOST
+   bit in the reader's status-changes bitmask (total_count stays monotonic)."
+  (dds.pal:with-lock ((dr-status-lock dr))
+    (let ((s (dr-sample-lost dr)))
+      (prog1 (copy-sample-lost-status s)
+        (setf (sample-lost-status-total-count-change s) 0)
+        (%clear-status-changed dr +status-sample-lost+)))))
+
 ;;; ---- set_listener / get_listener on all six entity kinds (DDS 1.4 §2.2.4.1, S3.T1) ----
 
 (defun* %entity-listener-lock (entity)
@@ -3094,6 +3192,7 @@
    from the Publisher, and mark it disabled. Node-scoped pools/threads (shared with sibling endpoints)
    are freed at delete_participant/stop-node, not here."
   (unless (member dw (pub-writers pub)) (return-from delete-datawriter +retcode-precondition-not-met+))
+  (%deadline-disarm-endpoint dw)   ; WP-DCPS-API-COMPLETION S4: drop this writer's offered-deadline timers from the monitor
   (discard-all-loans dw)
   (dds.disc:remove-local-writer (dp-node (pub-participant pub)) (dw-disc-endpoint dw) (dw-entity-id dw))
   (setf (pub-writers pub) (remove dw (pub-writers pub))
@@ -3110,6 +3209,7 @@
    still mapped — freed only at stop-node — so no use-after-free, and no held refcount pins a writer pool);
    (3) drop it from the Subscriber and mark it disabled."
   (unless (member dr (sub-readers sub)) (return-from delete-datareader +retcode-precondition-not-met+))
+  (%deadline-disarm-endpoint dr)   ; WP-DCPS-API-COMPLETION S4: drop this reader's requested-deadline timers from the monitor
   (dds.disc:remove-local-reader (dp-node (sub-participant sub)) (dr-disc-endpoint dr) (dr-entity-id dr))
   (return-all-loans dr)
   (setf (sub-readers sub) (remove dr (sub-readers sub))

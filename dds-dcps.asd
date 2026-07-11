@@ -12,6 +12,7 @@
                (:file "qos-validate")
                (:file "listeners")
                (:file "entities")
+               (:file "deadline")
                (:file "type-gate")
                (:file "auth-manager")
                (:file "crypto-manager")

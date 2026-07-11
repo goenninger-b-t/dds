@@ -3161,6 +3161,152 @@
       (dds.dcps:delete-participant p2))
     t))
 
+;;; WP-DCPS-API-COMPLETION S4 — deadline monitoring + SAMPLE_LOST (DDS 1.4 §2.2.3.7 /
+;;; §2.2.4.1): the three previously-dead statuses (OFFERED/REQUESTED_DEADLINE_MISSED,
+;;; SAMPLE_LOST) fire via a background deadline monitor thread + a reader-side lost-sample
+;;; detection site. Timing-based; generous margins keep them deterministic on both impls.
+
+(defun* run-dcps-deadline-monitor-test ()
+    (function () t)
+  "S4.T1 — the background deadline monitor (DDS 1.4 §2.2.3.7 DEADLINE). (a) A DataWriter with a
+   finite offered DEADLINE that writes an instance then stops fires OFFERED_DEADLINE_MISSED after
+   ~period. (b) A writer that keeps writing within its period does NOT (each write rearms the
+   per-instance timer). (c) A DataReader with a finite requested DEADLINE whose matched writer
+   stops writing fires REQUESTED_DEADLINE_MISSED. The monitor thread joins on delete-participant."
+  (let ((ts (dds.types:find-type-support "dcps-msg")))
+    ;; (a) offered deadline fires with no further write
+    (let ((p (dds.dcps:create-participant :domain (test-domain))))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "DlOffTopic" "dcps-msg" ts))
+                  (pub (dds.dcps:create-publisher p))
+                  (dw (dds.dcps:create-datawriter pub tp
+                        :qos (dds.qos:make-writer-qos :deadline (dds.qos:make-qos-duration 0 150000000)))))
+             (dds.dcps:write-sample dw (make-dcps-msg :id 1 :text "a"))   ; arm the offered deadline
+             (loop repeat 300
+                   until (plusp (dds.dcps:offered-deadline-missed-status-total-count
+                                 (dds.dcps:get-offered-deadline-missed-status dw)))
+                   do (sleep 0.02))
+             (%check :off-deadline-fires
+                     (plusp (dds.dcps:offered-deadline-missed-status-total-count
+                             (dds.dcps:get-offered-deadline-missed-status dw)))
+                     "OFFERED_DEADLINE_MISSED must fire after the deadline period with no write"))
+        (dds.dcps:delete-participant p)))
+    ;; (b) writing within the period prevents the miss (rearm on each write)
+    (let ((p (dds.dcps:create-participant :domain (test-domain))))
+      (unwind-protect
+           (let* ((tp (dds.dcps:create-topic p "DlKeepTopic" "dcps-msg" ts))
+                  (pub (dds.dcps:create-publisher p))
+                  (dw (dds.dcps:create-datawriter pub tp
+                        :qos (dds.qos:make-writer-qos :deadline (dds.qos:make-qos-duration 0 300000000)))))
+             (dotimes (i 12)   ; ~0.72s of writes, one every 60ms << 300ms period
+               (dds.dcps:write-sample dw (make-dcps-msg :id 1 :text "a"))
+               (sleep 0.06))
+             (%check :off-deadline-prevented
+                     (zerop (dds.dcps:offered-deadline-missed-status-total-count
+                             (dds.dcps:get-offered-deadline-missed-status dw)))
+                     "writing within the offered deadline period must prevent the miss"))
+        (dds.dcps:delete-participant p)))
+    ;; (c) requested deadline fires when the matched writer stops writing. The writer must OFFER a
+    ;; deadline <= the reader's REQUESTED deadline (RxO, DDS 1.4 §2.2.3.7), else the match is refused.
+    (let ((p1 (dds.dcps:create-participant :domain (test-domain)))
+          (p2 (dds.dcps:create-participant :domain (test-domain))))
+      (unwind-protect
+           (let* ((tw (dds.dcps:create-topic p1 "DlReqTopic" "dcps-msg" ts))
+                  (tr (dds.dcps:create-topic p2 "DlReqTopic" "dcps-msg" ts))
+                  (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                  (dw (dds.dcps:create-datawriter pub tw
+                        :qos (dds.qos:make-writer-qos :deadline (dds.qos:make-qos-duration 0 100000000))))
+                  (dr (dds.dcps:create-datareader sub tr
+                        :qos (dds.qos:make-reader-qos :reliability :reliable
+                                                      :deadline (dds.qos:make-qos-duration 0 200000000)))))
+             (loop repeat 200
+                   until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                   do (dds.dcps:spin p1) (dds.dcps:spin p2) (sleep 0.02))
+             (dds.dcps:write-sample dw (make-dcps-msg :id 7 :text "x"))
+             (loop repeat 150 until (plusp (dds.dcps:samples-available dr)) do (sleep 0.02))
+             (dds.dcps:read-samples dr)   ; drain -> arm the requested deadline for the instance
+             (loop repeat 300
+                   until (plusp (dds.dcps:requested-deadline-missed-status-total-count
+                                 (dds.dcps:get-requested-deadline-missed-status dr)))
+                   do (sleep 0.02))
+             (%check :req-deadline-fires
+                     (plusp (dds.dcps:requested-deadline-missed-status-total-count
+                             (dds.dcps:get-requested-deadline-missed-status dr)))
+                     "REQUESTED_DEADLINE_MISSED must fire when no sample arrives within the period"))
+        (dds.dcps:delete-participant p1)
+        (dds.dcps:delete-participant p2))))
+  t)
+
+(defun* run-dcps-sample-lost-test ()
+    (function () t)
+  "S4.T3 — SAMPLE_LOST (DDS 1.4 §2.2.4.1 / dds_rtf2_dcps.idl §99-102): a sample that will never be
+   made available to the DataReader. Two detection sites, deterministic (staged SNs, no lossy UDP):
+   (a)+(b) BEST-EFFORT SN-skip — a best-effort reader delivered SN 1 (baseline: pre-baseline SNs are
+   NOT lost) then SN 3 (SN 2 never arrives, no retransmit) fires SAMPLE_LOST total_count 1; the read
+   resets total_count_change + clears the bit while total_count stays monotonic. (c) irrecoverable-GAP
+   — the reliable engine's reader-on-gap over un-received SNs reports the newly-lost count (the writer
+   purged history the reader never got: a KEEP_LAST overwrite / RESOURCE_LIMITS eviction, RTPS 2.5
+   §8.3.7.4), never double-counts a re-GAP, and never counts an already-received SN. (d) the fire
+   path: %fire-sample-lost routes through the ONE %notify-status chokepoint (bitmask bit +
+   StatusCondition + on_sample_lost listener)."
+  (let ((ts (dds.types:find-type-support "shape-type"))
+        (p (dds.dcps:create-participant :domain (test-domain))))
+    (unwind-protect
+         (let* ((tp (dds.dcps:create-topic p "Square" "shape-type" ts))
+                (sub (dds.dcps:create-subscriber p))
+                (dr (dds.dcps:create-datareader sub tp
+                      :qos (dds.qos:make-reader-qos :reliability :best-effort)))
+                (node (dds.dcps::dp-node p))
+                (s1 (make-shape-type :color "BLUE" :x 1 :y 1 :shapesize 10))
+                (h1 (funcall (dds.types:type-support-key-hash ts) s1))
+                (b1 (dds.dcps::%serialize-sample ts s1))
+                (s3 (make-shape-type :color "RED" :x 3 :y 3 :shapesize 12))
+                (h3 (funcall (dds.types:type-support-key-hash ts) s3))
+                (b3 (dds.dcps::%serialize-sample ts s3))
+                (wid #x00000102))
+           ;; (b) baseline: the FIRST best-effort sample never counts pre-join SNs as lost.
+           (%stage-data-sn node 1 h1 b1 wid)
+           (dds.dcps::%drain dr)
+           (%check :sl-baseline
+                   (zerop (dds.dcps:sample-lost-status-total-count (dds.dcps:get-sample-lost-status dr)))
+                   "the first best-effort sample sets the baseline; no SAMPLE_LOST")
+           ;; (a) best-effort SN-skip: SN 3 after SN 1 -> SN 2 lost.
+           (%stage-data-sn node 3 h3 b3 wid)
+           (dds.dcps::%drain dr)
+           (let ((st (dds.dcps:get-sample-lost-status dr)))
+             (%check :sl-besteffort (= 1 (dds.dcps:sample-lost-status-total-count st))
+                     "a best-effort SN-skip (SN 2 never delivered) must fire SAMPLE_LOST total_count 1")
+             (%check :sl-change (= 1 (dds.dcps:sample-lost-status-total-count-change st))
+                     "total_count_change reflects the fire before the read-reset"))
+           (let ((st2 (dds.dcps:get-sample-lost-status dr)))
+             (%check :sl-reset (and (= 1 (dds.dcps:sample-lost-status-total-count st2))
+                                    (zerop (dds.dcps:sample-lost-status-total-count-change st2)))
+                     "total_count is monotonic; total_count_change reset to 0 on read"))
+           ;; (c) irrecoverable-GAP: reader-on-gap reports the newly-lost count (engine detection).
+           (let ((rr (dds.rtps.reliable:make-rtps-reader))
+                 (bm (make-array 1 :element-type '(unsigned-byte 32) :initial-element 0)))
+             (dds.rtps.reliable:reader-on-data rr 42 1 b1)          ; SN 1 received
+             (dds.rtps.reliable:reader-on-data rr 42 2 b1)          ; SN 2 received
+             (dds.rtps.reliable:reader-on-heartbeat rr 42 1 4)      ; available window [1,4]; SN 3,4 un-received
+             (%check :sl-gap-count (= 2 (dds.rtps.reliable:reader-on-gap rr 42 3 5 0 bm))
+                     "reader-on-gap over un-received SN 3,4 must report 2 newly-lost samples")
+             (%check :sl-gap-idempotent (zerop (dds.rtps.reliable:reader-on-gap rr 42 3 5 0 bm))
+                     "a re-GAP of already-gapped SNs reports 0 (no double count)")
+             (%check :sl-gap-received-kept (zerop (dds.rtps.reliable:reader-on-gap rr 42 1 3 0 bm))
+                     "a GAP over already-RECEIVED SN 1,2 counts 0 lost (they were delivered)"))
+           ;; (d) the fire path routes through %notify-status: the status bit is set, then read-cleared.
+           (dds.dcps::%fire-sample-lost dr 5)
+           (%check :sl-fire-total (= 6 (dds.dcps:sample-lost-status-total-count
+                                        (progn
+                                          (%check :sl-fire-bit
+                                                  (logtest (dds.dcps:get-status-changes dr)
+                                                           dds.dcps:+status-sample-lost+)
+                                                  "SAMPLE_LOST must set the status-changed bit before the read")
+                                          (dds.dcps:get-sample-lost-status dr))))
+                   "%fire-sample-lost n=5 accumulates total_count (1 best-effort + 5) = 6"))
+      (dds.dcps:delete-participant p))
+    t))
+
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 

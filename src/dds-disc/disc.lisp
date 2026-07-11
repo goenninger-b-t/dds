@@ -303,6 +303,7 @@
   (on-incompatible-qos nil :type (or null function))
   (on-inconsistent-topic nil :type (or null function))
   (on-sample nil :type (or null function))
+  (on-sample-lost nil :type (or null function)) ; DCPS-facing (S4): (reader-id n) after a reliable GAP declares n never-received SNs permanently gone (SAMPLE_LOST, DDS 1.4 §2.2.4.1)
   ;; Slice 2b-i: PSM receiver callback (DDS-Security 1.1 §7.4.3 / §8.7); NIL = PSM messages ignored.
   (on-stateless-message nil :type (or null function))
   ;; Slice 4 (T7): reliable ParticipantVolatileMessageSecure endpoint (DDS-Security 1.1 §7.4.5 / §9.5.3.1).

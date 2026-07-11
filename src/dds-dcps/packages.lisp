@@ -122,6 +122,8 @@
            #:liveliness-lost-status
            #:liveliness-lost-status-total-count #:liveliness-lost-status-total-count-change
            #:get-liveliness-lost-status #:assert-liveliness
+           #:get-offered-deadline-missed-status #:get-requested-deadline-missed-status
+           #:get-sample-lost-status
            ;; WP-DCPS-API-COMPLETION S0.T1: SAMPLE_LOST + OFFERED/REQUESTED_DEADLINE_MISSED
            #:sample-lost-status #:make-sample-lost-status #:copy-sample-lost-status
            #:sample-lost-status-total-count #:sample-lost-status-total-count-change
