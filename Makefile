@@ -25,6 +25,7 @@ SECONDS  ?= 20
 TYPENAME  ?= C_Shape
 LOCALTYPE ?= shape-type
 COUNT    ?= 0
+DEADLINE_MS ?= 1500
 KEYS     ?= 3
 DISPOSE_AFTER ?= 0
 LATSAMPLES  ?= 10000
@@ -140,6 +141,19 @@ large-sub:
 gated-sub:
 	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
 	        --eval '(uiop:symbol-call :dds.shapes :run-gated-subscriber :domain $(DOMAIN) :topic "$(TOPIC)" :type-name "$(TYPENAME)" :local-type "$(LOCALTYPE)" :seconds $(SECONDS) :advertise-address "$(ADVERTISE)" $(OWNERSHIP_ARGS))' \
+	        --eval '(uiop:quit 0)'
+
+# WP-DCPS-API-COMPLETION S4 live DEADLINE interop (DDS 1.4 §2.2.3.7; interop/deadline). DEADLINE_MS sets
+# the offered (pub) / requested (sub) period; COUNT = samples before the pub stops. The peer is the stock
+# Connext/Fast DDS shapes_sub (for deadline-pub) or a finite-offered-deadline shapes_pub (for deadline-sub).
+deadline-pub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-deadline-publisher :domain $(DOMAIN) :deadline-ms $(DEADLINE_MS) :count $(COUNT) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
+	        --eval '(uiop:quit 0)'
+
+deadline-sub:
+	$(SBCL) --eval '(asdf:load-system :dds-shapes)' \
+	        --eval '(uiop:symbol-call :dds.shapes :run-deadline-subscriber :domain $(DOMAIN) :deadline-ms $(DEADLINE_MS) :seconds $(SECONDS) :advertise-address "$(ADVERTISE)")' \
 	        --eval '(uiop:quit 0)'
 
 # Clean-room legacy-TypeObject capture: dump a peer's PID_TYPE_OBJECT_LB as a Lisp byte vector.

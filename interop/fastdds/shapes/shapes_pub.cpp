@@ -88,6 +88,14 @@ int main(int argc, char** argv)
         wqos.ownership().kind = EXCLUSIVE_OWNERSHIP_QOS;
         wqos.ownership_strength().value = std::atol(os);
     }
+    // DEADLINE_MS env (off by default): OFFER a finite DEADLINE (DDS 1.4 §2.2.3.7) so an interop reader
+    // requesting a >= that period matches by RxO and fires REQUESTED_DEADLINE_MISSED when this writer stops
+    // (WP-DCPS-API-COMPLETION S4 live leg).
+    if (const char* dl = std::getenv("DEADLINE_MS"))
+    {
+        const long ms = std::atol(dl);
+        wqos.deadline().period = Duration_t(static_cast<int32_t>(ms / 1000), static_cast<uint32_t>((ms % 1000) * 1000000));
+    }
     MatchListener listener;
     DataWriter* writer = publisher->create_datawriter(topic, wqos, &listener, StatusMask::all());
     if (writer == nullptr)

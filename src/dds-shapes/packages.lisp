@@ -25,6 +25,7 @@
            #:run-publisher #:run-subscriber #:run-spy
            #:run-large-publisher #:run-large-subscriber
            #:run-gated-subscriber
+           #:run-deadline-publisher #:run-deadline-subscriber
            #:run-corpus-capture-subscriber
            #:run-typelookup-probe
            #:run-nokey-publisher #:run-nokey-subscriber

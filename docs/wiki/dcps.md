@@ -312,7 +312,8 @@ no listener up the chain is enabled, the bit stays set and no callback fires. Re
 | `dds.dcps:on-subscription-matched` / `on-requested-incompatible-qos` / `on-sample-rejected` / `on-liveliness-changed` (`l reader status`) | DataReaderListener callbacks that fire in v1. `on-liveliness-changed` fires from the announce cadence when a matched remote writer's liveliness goes stale/fresh (RTPS 2.5 §8.4.13). |
 | `dds.dcps:on-publication-matched` / `on-offered-incompatible-qos` / `on-liveliness-lost` (`l writer status`) | DataWriterListener callbacks that fire in v1. `on-liveliness-lost` fires from the announce cadence (`spin`) when a local writer fails to assert its own liveliness within its offered lease (DDS 1.4 §2.2.3.11). |
 | `dds.dcps:on-inconsistent-topic` (`l topic status`) | TopicListener callback that fires in v1. |
-| `dds.dcps:on-requested-deadline-missed` / `on-sample-lost` (`l reader status`); `dds.dcps:on-offered-deadline-missed` (`l writer status`) | Defined for subclassing; **not yet fired** in v1 (the underlying statuses are deferred). |
+| `dds.dcps:on-requested-deadline-missed` / `on-sample-lost` (`l reader status`); `dds.dcps:on-offered-deadline-missed` (`l writer status`) | DataReader/DataWriterListener callbacks that fire in v1 (WP-DCPS-API-COMPLETION S4, DDS 1.4 §2.2.3.7 / §2.2.4.1). DEADLINE misses fire from a per-participant background monitor thread; SAMPLE_LOST fires on a best-effort SN-skip (drain) or an irrecoverable reliable GAP. |
+| `dds.dcps:get-offered-deadline-missed-status` (`writer`) / `get-requested-deadline-missed-status` / `get-sample-lost-status` (`reader`) | Snapshot getters for the three S4 statuses; each applies the §2.2.2.1.9 read-communication-status reset (zeroes `total_count_change`, clears the status-changed bit; `total_count` stays monotonic). |
 
 ### Advisory type-compatibility (ADR 0009)
 
@@ -735,11 +736,17 @@ the source as deferred or simplified — do not rely on them yet:
   fires **once per going-lost transition**; re-asserting transitions the writer back to alive
   (it never decrements `total_count`), and a later re-loss increments again. An infinite lease
   never goes lost.
-- **Some statuses are scaffolding only.** Only MATCHED, INCOMPATIBLE_QOS, INCONSISTENT_TOPIC,
-  SAMPLE_REJECTED, (reader-side) LIVELINESS_CHANGED, and (writer-side) LIVELINESS_LOST are
-  produced and surfaced. DEADLINE (`on_*_deadline_missed`) and SAMPLE_LOST (`on_sample_lost`)
-  have listener methods defined for subclassing but are **not fired**, and there are no
-  `get-*-status` accessors for them. `on-data-available` does fire (on new user data).
+- **All standard communication statuses fire (FR-DCPS-3).** MATCHED, INCOMPATIBLE_QOS,
+  INCONSISTENT_TOPIC, SAMPLE_REJECTED, LIVELINESS_CHANGED/LOST, DATA_AVAILABLE/ON_READERS, and —
+  since WP-DCPS-API-COMPLETION S4 — OFFERED/REQUESTED_DEADLINE_MISSED and SAMPLE_LOST are all
+  produced and surfaced, each with its `get-*-status` accessor and the §2.2.2.1.9 read-reset.
+  DEADLINE misses fire from a per-participant background monitor thread that arms a per-instance
+  timer on each write (offered) / received sample (requested) and fires when a period elapses with
+  no rearm (the default DURATION_INFINITE arms nothing — no thread, zero cost). SAMPLE_LOST fires
+  when a sample is permanently unavailable: a best-effort gap in the delivered SN stream, or an
+  irrecoverable reliable GAP (the writer purged history the reader never received — a KEEP_LAST
+  overwrite / RESOURCE_LIMITS eviction). A secure-undecryptable suppressed sample is not counted in
+  v1 (ADR 0031 governs that path).
 - **Content filtering is reader-side only.** A `ContentFilteredTopic` presents its related
   topic's name/type for SEDP matching and applies the filter in the reader's drain; the writer
   sends every sample. Writer-side filtering is a later increment.

@@ -909,6 +909,133 @@
             (dds.dcps:delete-participant p)))))
     t))
 
+(defun* %deadline-duration (ms)
+    (function ((integer 1)) t)
+  "A dds.qos:qos-duration of MS milliseconds — the offered/requested DEADLINE period for the S4 live
+   interop runners (DDS 1.4 §2.2.3.7)."
+  (dds.qos:make-qos-duration (floor ms 1000) (* (mod ms 1000) 1000000)))
+
+(defun* run-deadline-publisher (&key (domain 0) (deadline-ms 1500) (count 5) (rate 2) (seconds 25)
+                                     (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:deadline-ms (integer 1)) (:count (integer 1))
+                    (:rate (integer 1)) (:seconds (integer 0)) (:advertise-address string)) t)
+  "S4 live interop (DDS 1.4 §2.2.3.7): a DCPS DataWriter that OFFERS a finite DEADLINE of DEADLINE-MS,
+   publishes COUNT animated Square/ShapeType samples at RATE/s, then STOPS writing while keeping the
+   participant alive. A default foreign reader (Connext/Fast DDS shapes_sub, requested DURATION_INFINITE)
+   matches by RxO (offered period <= requested) and receives the COUNT samples; once we stop rearming,
+   our OFFERED_DEADLINE_MISSED climbs (the per-participant deadline monitor fires each elapsed period).
+   Prints the match transition + the periodic OFFERED_DEADLINE_MISSED total_count so a live run shows both
+   the interop delivery and the local miss firing."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address))
+         (tp (dds.dcps:create-topic p "Square" "ShapeType" ts))
+         (pub (dds.dcps:create-publisher p))
+         (dw (dds.dcps:create-datawriter pub tp
+               :qos (dds.qos:make-writer-qos :reliability :reliable
+                                             :deadline (%deadline-duration deadline-ms)))))
+    (format t "~&[deadline-pub] Square/ShapeType offered-deadline=~dms count=~d domain=~d.~%"
+            deadline-ms count domain)
+    (unwind-protect
+         (let ((x 50) (y 50) (dx 3) (dy 2) (start (get-internal-real-time)) (n 0) (last-matched 0)
+               (last-report 0) (stopped-at nil))
+           (loop
+             (dds.dcps:spin p)
+             (let ((ms (dds.dcps:matched-count p)))
+               (when (/= ms last-matched)
+                 (format t "~&[deadline-pub] MATCHED ~d -> ~d remote reader(s).~%" last-matched ms)
+                 (setf last-matched ms)))
+             (when (< n count)
+               (setf x (+ x dx) y (+ y dy))
+               (when (or (<= x 0) (>= x 240)) (setf dx (- dx)))
+               (when (or (<= y 0) (>= y 240)) (setf dy (- dy)))
+               (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x x :y y :shapesize 30))
+               (incf n)
+               (format t "~&[deadline-pub] wrote sample #~d (x=~d y=~d)~%" n x y)
+               (when (= n count)
+                 (setf stopped-at (get-internal-real-time))
+                 (format t "~&[deadline-pub] STOPPED writing after ~d samples — OFFERED_DEADLINE_MISSED must now climb.~%" count))
+               (sleep (/ 1.0 rate)))
+             (when stopped-at
+               (let* ((now (get-internal-real-time))
+                      (st (dds.dcps:get-offered-deadline-missed-status dw))
+                      (tc (dds.dcps:offered-deadline-missed-status-total-count st)))
+                 (when (> (- now last-report) (* internal-time-units-per-second 0.5))
+                   (setf last-report now)
+                   (format t "~&[deadline-pub] OFFERED_DEADLINE_MISSED total_count=~d~%" tc)))
+               (sleep 0.1))
+             (when (and (plusp seconds)
+                        (> (/ (- (get-internal-real-time) start) internal-time-units-per-second) seconds))
+               (return)))
+           (format t "~&[deadline-pub] stopped: matched=~d; OFFERED_DEADLINE_MISSED total_count=~d.~%"
+                   (dds.dcps:matched-count p)
+                   (dds.dcps:offered-deadline-missed-status-total-count
+                    (dds.dcps:get-offered-deadline-missed-status dw))))
+      (dds.dcps:delete-participant p))
+    t))
+
+(defun* run-deadline-subscriber (&key (domain 0) (deadline-ms 2000) (seconds 25)
+                                      (advertise-address "127.0.0.1"))
+    (function (&key (:domain (integer 0)) (:deadline-ms (integer 1)) (:seconds (integer 0))
+                    (:advertise-address string)) t)
+  "S4 live interop (DDS 1.4 §2.2.3.7 / §2.2.4.1): a DCPS DataReader that REQUESTS a finite DEADLINE of
+   DEADLINE-MS. It matches a foreign writer (Connext/Fast DDS) ONLY if that writer OFFERS a deadline <=
+   DEADLINE-MS (RxO) — so the peer must be configured with a finite offered deadline. On each received
+   sample the reader rearms its per-instance requested-deadline timer; when the peer goes silent past the
+   period, the per-participant deadline monitor fires REQUESTED_DEADLINE_MISSED. SAMPLE_LOST is also
+   reported (a reliable GAP for never-received SNs, or a best-effort skip). Prints the match transition,
+   samples, and the periodic REQUESTED_DEADLINE_MISSED + SAMPLE_LOST total_count so a live run shows the
+   cross-vendor DEADLINE RxO match AND our monitor reacting to the real remote peer's silence."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (fa (dds.types:type-support-field-accessors ts))
+         (p (dds.dcps:create-participant :domain domain :advertise-address advertise-address))
+         (tp (dds.dcps:create-topic p "Square" "ShapeType" ts))
+         (sub (dds.dcps:create-subscriber p))
+         (dr (dds.dcps:create-datareader sub tp
+               :qos (dds.qos:make-reader-qos :reliability :reliable
+                                             :deadline (%deadline-duration deadline-ms)))))
+    (format t "~&[deadline-sub] Square/ShapeType requested-deadline=~dms domain=~d (peer writer must offer <= ~dms).~%"
+            deadline-ms domain deadline-ms)
+    (flet ((field (s name) (funcall (cdr (assoc name fa :test #'string-equal)) s)))
+      (unwind-protect
+           (let ((seen 0) (start (get-internal-real-time)) (last-matched 0) (last-report 0))
+             (loop
+               (dds.dcps:spin p)
+               (dolist (cs (dds.dcps:take-samples dr))
+                 (let ((info (dds.dcps:cached-sample-info cs)))
+                   (when (dds.dcps:sample-info-valid-data info)
+                     (incf seen)
+                     (format t "~&[deadline-sub] sample #~d: color=~a x=~a y=~a~%"
+                             seen (field (dds.dcps:cached-sample-data cs) "color")
+                             (field (dds.dcps:cached-sample-data cs) "x")
+                             (field (dds.dcps:cached-sample-data cs) "y")))))
+               (let ((ms (dds.dcps:matched-count p)))
+                 (when (/= ms last-matched)
+                   (format t "~&[deadline-sub] MATCHED ~d -> ~d remote writer(s) (DEADLINE RxO compatible).~%"
+                           last-matched ms)
+                   (setf last-matched ms)))
+               (let ((now (get-internal-real-time)))
+                 (when (> (- now last-report) (* internal-time-units-per-second 0.5))
+                   (setf last-report now)
+                   (let ((rd (dds.dcps:get-requested-deadline-missed-status dr))
+                         (sl (dds.dcps:get-sample-lost-status dr)))
+                     (when (or (plusp (dds.dcps:requested-deadline-missed-status-total-count rd))
+                               (plusp (dds.dcps:sample-lost-status-total-count sl)))
+                       (format t "~&[deadline-sub] REQUESTED_DEADLINE_MISSED total_count=~d ; SAMPLE_LOST total_count=~d~%"
+                               (dds.dcps:requested-deadline-missed-status-total-count rd)
+                               (dds.dcps:sample-lost-status-total-count sl))))))
+               (when (and (plusp seconds)
+                          (> (/ (- (get-internal-real-time) start) internal-time-units-per-second) seconds))
+                 (return))
+               (sleep 0.05))
+             (format t "~&[deadline-sub] stopped: received ~d sample(s); matched=~d; REQUESTED_DEADLINE_MISSED total=~d; SAMPLE_LOST total=~d.~%"
+                     seen (dds.dcps:matched-count p)
+                     (dds.dcps:requested-deadline-missed-status-total-count
+                      (dds.dcps:get-requested-deadline-missed-status dr))
+                     (dds.dcps:sample-lost-status-total-count
+                      (dds.dcps:get-sample-lost-status dr))))
+        (dds.dcps:delete-participant p)))
+    t))
+
 (defun* run-corpus-capture-subscriber (&key (domain 0) (topic "Square") (type "ShapeType")
                                             (seconds 20))
     (function (&key (:domain (integer 0)) (:topic string) (:type string) (:seconds (integer 0)))
