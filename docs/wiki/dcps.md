@@ -6,9 +6,11 @@ CLOS entity model — `DomainParticipant`, `Publisher`/`Subscriber`, `Topic`,
 ([Discovery](discovery.md)). It is control-plane, so it is CLOS throughout; the *typed*
 `write`/`read`/`take` path reaches the monomorphic XCDR codec through the `type-support`
 vtable stored on the `Topic` (see [Type system](type-system.md)). One simplification holds in
-v1: **discovery is caller-driven** — you call `dds.dcps:spin` to drive each
-SPDP/SEDP announcement cycle (there is no background announcer yet). RxO QoS compatibility
-gates matching and delivery; see [QoS](qos.md).
+Discovery is **caller-driven by default** — you call `dds.dcps:spin` to drive each SPDP/SEDP
+announce + aging cycle — **or autonomous**: `create-participant :autonomous t` spawns a background
+announcer thread that drives it for you (no `spin` needed, WP-DCPS-API-COMPLETION S7, ADR 0056).
+Inbound discovery + delivery always ride the receiver thread. RxO QoS compatibility gates matching
+and delivery; see [QoS](qos.md).
 
 **Multiple DataWriters per participant (WP-N-ENDPOINT-S1, ADR 0048).** A participant may
 carry **N non-secured `DataWriter`s** on different topics — each gets a distinct `EntityId`
@@ -106,14 +108,14 @@ source docstrings (`src/dds-dcps/*.lisp`); the docstrings are the contract.
 
 | Symbol | Description |
 |---|---|
-| `dds.dcps:create-participant` (`&key domain qos advertise-address`) | Open the RTPS engine (a multicast disc-node) for `domain`, install the status hooks, start the receiver, return an enabled `domain-participant`. |
+| `dds.dcps:create-participant` (`&key domain qos advertise-address autonomous`) | Open the RTPS engine (a multicast disc-node) for `domain`, install the status hooks, start the receiver, return an enabled `domain-participant`. `:autonomous t` (S7, ADR 0056) starts a background announcer thread so discovery/matching/aging need no `spin`; it is stopped + joined on `delete-participant`. |
 | `dds.dcps:delete-participant` (`p`) | Delete the participant and its contained entities; stop the engine. |
 | `dds.dcps:create-publisher` (`p`) | Create an enabled `publisher` (DataWriter factory) in `p`. |
 | `dds.dcps:create-subscriber` (`p`) | Create an enabled `subscriber` (DataReader factory) in `p`. |
 | `dds.dcps:create-topic` (`p name type-name type-support`) | Bind a topic `name` + `type-name` to a registered `type-support` (the generated codec bundle). |
 | `dds.dcps:create-datawriter` (`pub topic &key qos`) | Register a local writer in the engine on the topic's name/type with `qos`. **N non-secured writers per participant** (WP-N-ENDPOINT-S1, ADR 0048): each gets a distinct `EntityId` + its own HistoryCache; a 2nd writer under a flow-controller is supported (Slice S1b — per-writer flow-state) and a 2nd secured writer is supported (Slice S3). The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. |
 | `dds.dcps:create-datareader` (`sub topic &key qos`) | Register a local reader (N readers per participant on **distinct** topics, each a distinct `EntityId`; WP-N-ENDPOINT-S2/S4). `topic` may be a `topic` or a `content-filtered-topic`. The endpoint kind (`WITH_KEY`/`NO_KEY`) is selected from the topic type's keyed-ness. N **loan-capable** (secured or ZC) readers on distinct topics are supported (S4 — each decodes under its own tier; the ZC marker demuxes per reader). Two or more **SAME-topic** readers are supported — NON-loan (Slice 2c-1 — route-add-all: both receive the writer's full stream, no cross-consumption) AND **loan-capable** (secured / ZC; Slice 2c-3 — the ADR-0017 refcount-per-reader UAF is closed via the demux-time `%zc-bump` by (ELIGIBLE−1), `ELIGIBLE` = the route members that will drain the marker (`SN > join-watermark`) so a frozen joiner is excluded — the joiner high-water freeze + the secured store-purge-defer + the §17.7 out-of-order-across-join leak fix, WP-DDS-ZC-REFCOUNT-LEAK). |
-| `dds.dcps:spin` (`p`) | Drive **one** discovery announcement cycle (SPDP + SEDP) for `p`. Caller-driven in v1. |
+| `dds.dcps:spin` (`p`) | Drive **one** discovery announce + aging cycle (SPDP + SEDP + lease/liveliness/autopurge) for `p` — the deterministic manual/test path. A **no-op** when `p` is `:autonomous` (the background announcer owns the announce buffers). |
 | `dds.dcps:discovered-count` (`p`) | Number of remote participants `p` has discovered. |
 | `dds.dcps:matched-count` (`p`) | Number of remote endpoints matched against `p`'s local endpoints. |
 | `dds.dcps:entity` / `domain-participant` / `publisher` / `subscriber` / `topic` / `data-writer` / `data-reader` | The CLOS entity classes (base `entity` carries QoS + the enabled flag). |

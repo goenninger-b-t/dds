@@ -55,7 +55,9 @@
    (listener-mask :initform '() :accessor dp-listener-mask)
    (listener-lock :initform (dds.pal:make-lock "dp-listener") :accessor dp-listener-lock)
    (deadline-monitor :initform nil :accessor dp-deadline-monitor)  ; WP-DCPS-API-COMPLETION S4: the lazily-started per-participant deadline monitor thread (deadline.lisp), NIL until the first finite DEADLINE arms a timer
-   (deadline-lock :initform (dds.pal:make-lock "dp-deadline") :accessor dp-deadline-lock))  ; WP-DCPS-API-COMPLETION S4: guards lazy deadline-monitor creation
+   (deadline-lock :initform (dds.pal:make-lock "dp-deadline") :accessor dp-deadline-lock)  ; WP-DCPS-API-COMPLETION S4: guards lazy deadline-monitor creation
+   (autonomous-p :initform nil :accessor dp-autonomous-p)   ; WP-DCPS-API-COMPLETION S7: autonomous-discovery mode (config-gated); T -> a background announcer drives SPDP/SEDP + aging, spin is a no-op
+   (announcer :initform nil :accessor dp-announcer))        ; WP-DCPS-API-COMPLETION S7: the auto-announcer thread (autodiscovery.lisp), started on enable when autonomous, stopped+JOINED on delete
   (:documentation "DDS DomainParticipant: owns a multicast disc-node for its domain and
    its contained entities. Holds N DataReaders + N DataWriters (on distinct topics) across its
    Subscribers/Publishers; the disc->DCPS status/listener hooks resolve the endpoint an event is
@@ -160,6 +162,9 @@
 (declaim (ftype (function (data-writer t t) t) %deadline-touch-writer))
 (declaim (ftype (function (t) t) %deadline-disarm-endpoint))
 (declaim (ftype (function (domain-participant) t) %deadline-monitor-stop))
+;; Defined in autodiscovery.lisp (loaded after this file, WP-DCPS-API-COMPLETION S7); forward-declared so
+;; create-participant/enable (start) and delete-participant (stop+join) reach the announcer clean.
+(declaim (ftype (function (domain-participant) t) %start-auto-announcer %stop-auto-announcer))
 
 ;; Defined in conditions.lisp (loaded after this file); forward-declared so the data-
 ;; arrival hook below can wake the reader's WaitSets without a compile-time warning.
@@ -636,10 +641,10 @@
     (find domain (dpf-participants factory) :key #'dp-domain :test #'=)))
 
 (defun* create-participant (&key (domain 0) (qos nil) (advertise-address "127.0.0.1") (peers nil)
-                                 (port 0)
+                                 (port 0) (autonomous nil)
                                  (identity nil) (permissions-ca nil) (governance nil) (permissions nil))
     (function (&key (:domain (integer 0)) (:qos t) (:advertise-address string) (:peers list)
-                    (:port (unsigned-byte 16))
+                    (:port (unsigned-byte 16)) (:autonomous t)
                     (:identity t)
                     (:permissions-ca (or (simple-array (unsigned-byte 8) (*)) null))
                     (:governance (or (simple-array (unsigned-byte 8) (*)) null))
@@ -718,8 +723,10 @@
           (when access-handle      ; DDS-Security §8.4 AccessControl manager — validated above, install the gate
             (%install-access-control p access-handle))
           (dds.disc:start-node node)
+          (setf (dp-autonomous-p p) autonomous)   ; WP-DCPS-API-COMPLETION S7: autonomous discovery mode
           (setf installed t)   ; construction complete; p owns the access-handle via dp-access-state
           (%factory-register-participant (get-participant-factory) p)   ; S2.T1: the free-fn is the factory shim (DDS 1.4 §2.2.2.2.2)
+          (%start-auto-announcer p)   ; S7: spawn the announcer if autonomous + enabled (idempotent; no-op otherwise)
           p)
       ;; Free the access-handle on a non-local exit ONLY if not yet installed (install transfers ownership).
       (when (and access-handle (not installed))
@@ -732,6 +739,7 @@
    ZC pool mapping — so no held refcount pins the writer's pool (no leak) and the final %zc-release runs while
    the views' SAP is still mapped (no use-after-free at teardown). A no-op for readers with no loans (the common
    case: ZC off / non-FlatData)."
+  (%stop-auto-announcer p)     ; WP-DCPS-API-COMPLETION S7: stop + JOIN the autonomous announcer thread BEFORE node teardown (no strand; it uses the node's announce buffers)
   (%deadline-monitor-stop p)   ; WP-DCPS-API-COMPLETION S4: stop + JOIN the deadline monitor thread BEFORE tearing the node down (no strand, no UAF)
   (dolist (dr (%participant-readers p)) (return-all-loans dr))
   (%factory-unregister-participant (get-participant-factory) p)   ; S2.T1: the free-fn is the factory delete_participant shim (DDS 1.4 §2.2.2.2.2)
@@ -759,15 +767,26 @@
   "Number of remote endpoints matched against P's local endpoints."
   (dds.disc:disc-node-matched-count (dp-node p)))
 
-(defun* spin (p)
+(defun* %spin-once (p)
     (function (domain-participant) (eql t))
-  "Drive one discovery announcement cycle (SPDP + SEDP) for P. Discovery is
-   caller-driven in v1 — an automatic background announcer with isolated send buffers
-   is a follow-up (the engine's announce buffers are not yet thread-isolated)."
+  "One discovery announce + sweep cycle for P (the spin body): SPDP announce (announce-participant) + SEDP
+   announce + lease/liveliness aging (announce-endpoints) + writer-side LIVELINESS_LOST + reader
+   READER_DATA_LIFECYCLE autopurge. Driven by spin (the deterministic manual/test path) AND by the S7
+   auto-announcer thread (autonomous mode). Uses the node's announce send buffers (tx-msg/tx-payload) —
+   ONE driver at a time (spin no-ops in autonomous mode)."
   (dds.disc:announce-participant (dp-node p))
   (dds.disc:announce-endpoints (dp-node p))
   (%writer-liveliness-sweep p)   ; writer-side LIVELINESS_LOST on the DCPS cadence (DDS 1.4 §2.2.3.11)
   (dolist (dr (%participant-readers p)) (%autopurge-sweep dr))   ; READER_DATA_LIFECYCLE autopurge (DDS 1.4 §2.2.3.22)
+  t)
+
+(defun* spin (p)
+    (function (domain-participant) (eql t))
+  "Drive one discovery announce + sweep cycle for P (SPDP + SEDP + aging) — the DETERMINISTIC manual/test
+   path (%spin-once). A NO-OP when P is in AUTONOMOUS mode (WP-DCPS-API-COMPLETION S7): the background
+   announcer thread owns the node's announce send buffers, so a concurrent spin would race them; an
+   autonomous participant discovers/matches/ages peers with no app-driven spin."
+  (unless (dp-autonomous-p p) (%spin-once p))
   t)
 
 ;;; ---- Publisher / Subscriber / Topic ----
@@ -1124,6 +1143,7 @@
   (unless (%entity-factory-parent-enabled-p entity)
     (return-from enable +retcode-precondition-not-met+))
   (setf (entity-enabled-p entity) t)
+  (when (typep entity 'domain-participant) (%start-auto-announcer entity))   ; WP-DCPS-API-COMPLETION S7: start the announcer now the participant is enabled (idempotent; no-op unless autonomous)
   +retcode-ok+)
 
 (defun* %child-created-enabled-p (parent)

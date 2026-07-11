@@ -3519,6 +3519,44 @@
         (dds.dcps:delete-participant p2)))
     t))
 
+(defun* run-dcps-autonomous-discovery-test ()
+    (function () t)
+  "S7.T1 — autonomous background discovery: two participants created with :autonomous t discover, MATCH,
+   and exchange data with NO app-driven spin (a background announcer thread per participant drives the
+   SPDP/SEDP announce + lease/liveliness aging that spin does manually; inbound discovery + delivery ride
+   the disc-node receiver thread). The announcer threads are stopped + JOINED on delete-participant (no
+   strand — proven by the clean unwind-protect teardown)."
+  (let* ((ts (dds.types:find-type-support "shape-type"))
+         (fa (dds.types:type-support-field-accessors ts))
+         (p1 (dds.dcps:create-participant :domain (test-domain) :autonomous t))
+         (p2 (dds.dcps:create-participant :domain (test-domain) :autonomous t)))
+    (flet ((color (s) (funcall (cdr (assoc "color" fa :test #'string-equal)) s)))
+      (unwind-protect
+           (let* ((tw (dds.dcps:create-topic p1 "S7Auto" "shape-type" ts))
+                  (tr (dds.dcps:create-topic p2 "S7Auto" "shape-type" ts))
+                  (pub (dds.dcps:create-publisher p1)) (sub (dds.dcps:create-subscriber p2))
+                  (dw (dds.dcps:create-datawriter pub tw))
+                  (dr (dds.dcps:create-datareader sub tr
+                        :qos (dds.qos:make-reader-qos :reliability :reliable))))
+             ;; NO spin anywhere — the announcer threads drive discovery.
+             (loop repeat 400
+                   until (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                   do (sleep 0.025))
+             (%check :auto-matched
+                     (and (plusp (dds.dcps:matched-count p1)) (plusp (dds.dcps:matched-count p2)))
+                     "two AUTONOMOUS participants MATCH with NO app-driven spin (background announcer)")
+             (dds.dcps:write-sample dw (make-shape-type :color "BLUE" :x 7 :y 8 :shapesize 12))
+             (let ((got nil))
+               (loop repeat 400 until got
+                     do (dolist (cs (dds.dcps:take-samples dr))   ; take drains the receiver-thread store; NO spin
+                          (setf got (dds.dcps:cached-sample-data cs)))
+                        (sleep 0.025))
+               (%check :auto-data (and got (string= "BLUE" (color got)))
+                       "an AUTONOMOUS reader receives the written sample with NO spin")))
+        (dds.dcps:delete-participant p1)
+        (dds.dcps:delete-participant p2)))
+    t))
+
 ;;; Builtin-topic readers (M3 #5, FR-DCPS-6): DCPSParticipant / DCPSPublication /
 ;;; DCPSSubscription / DCPSTopic surface the discovered participants + endpoints.
 

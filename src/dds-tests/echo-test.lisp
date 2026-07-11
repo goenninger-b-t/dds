@@ -3880,6 +3880,7 @@
                  ("dcps-instance-reads"      . run-dcps-instance-reads-test)
                  ("dcps-matched-entities"    . run-dcps-matched-entities-test)
                  ("dcps-timestamped-write"   . run-dcps-timestamped-write-test)
+                 ("dcps-autonomous-discovery" . run-dcps-autonomous-discovery-test)
                  ("dcps-builtin-topics"      . run-dcps-builtin-topics-test)
                  ("dcps-type-compat"         . run-dcps-type-compat-test)
                  ("dcps-large-frag"          . run-dcps-large-test)

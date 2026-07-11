@@ -13,6 +13,7 @@
                (:file "listeners")
                (:file "entities")
                (:file "deadline")
+               (:file "autodiscovery")
                (:file "type-gate")
                (:file "auth-manager")
                (:file "crypto-manager")
