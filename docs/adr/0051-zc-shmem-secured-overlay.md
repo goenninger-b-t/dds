@@ -154,12 +154,21 @@ loan-write TX site.
 
 ## Deferred follow-ons (recorded, NOT built here)
 
-1. **SIGN-only raw-ZC relaxation.** A SIGN tier authenticates but does not hide the payload — the payload is
-   visible on the wire, so plaintext-in-SHMEM is not a *new* exposure. The current gate blocks SIGN-only ZC
-   conservatively; relaxing it to **raw ZC (no overlay needed)** is a follow-on, out of this slice.
-2. **`-into-sap` direct-seal.** A future into-SAP AEAD FFI variant that seals the serialized payload
-   straight into the SHMEM slot would eliminate the one writer-side scratch→slot memcpy this slice retains.
-   It is a strict optimization and is subject to the Forward Requirement above.
+1. **SIGN-only raw-ZC relaxation. — CLOSED 2026-07-11 (ADR 0058), but NOT as written here.** The reasoning
+   below is **wrong** and is superseded: it argues only about *confidentiality* and silently drops
+   *integrity*. With raw ZC the RTPS signature covers only the 20-octet reference datagram, so the slot
+   payload would be **unauthenticated** — a co-resident process could tamper with it undetected, dropping the
+   one guarantee the SIGN tier exists to provide. ADR 0058 instead extends the **overlay** to SIGN: the
+   payload stays visible in the slot (as SIGN intends) and carries a GMAC `common_mac` the reader verifies
+   fail-closed. *(Original text, kept for provenance: "A SIGN tier authenticates but does not hide the
+   payload — the payload is visible on the wire, so plaintext-in-SHMEM is not a new exposure. The current
+   gate blocks SIGN-only ZC conservatively; relaxing it to raw ZC (no overlay needed) is a follow-on.")*
+2. **`-into-sap` direct-seal. — CLOSED 2026-07-11 (ADR 0058): DECLINED on measurement.** The scratch→slot
+   memcpy this would remove is only **2.6–4.5 %** of the overlay's send cost (the AEAD pass dominates it by
+   ~25×; `bench/report/2026-07-11-zc-overlay-into-sap.md`). A ~3 % gain on an opt-in edge path does not
+   justify forking the one sealing primitive every `data_protection` tier depends on onto a second,
+   SAP-writing code path, nor sealing into shared memory. Re-open if the AEAD ever stops dominating (see
+   ADR 0058 §3).
 3. **Multi-writer / per-endpoint overlay keying.** The overlay keys on the single per-writer EntityCrypto KM
    (N = 1 writer today). A multi-writer / per-endpoint overlay-keying generalization is a follow-on if the
    per-endpoint protection-kind model (ADR 0046) ever needs distinct overlay keys per user endpoint.

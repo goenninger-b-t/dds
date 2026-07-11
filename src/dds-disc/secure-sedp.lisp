@@ -1203,7 +1203,9 @@
      Part A (deterministic, portable): with an ENCRYPT EntityCrypto KM installed as the crypto-transform (and
        an EXPLICIT governance data_protection = NONE, so the change payload rides plain and the overlay is the
        thing that seals it), %zc-overlay-eligible-p is T; WITHOUT a KM it stays fail-closed NIL; a GMAC (SIGN)
-       payload key stays NIL (key-material-encrypt-p gates — a SIGN payload is not confidential, deferred).
+       payload key is ALSO eligible (ADR 0058 — the slot then holds the VISIBLE payload plus an authenticating
+       common_mac; raw ZC would have left it UNAUTHENTICATED, since the RTPS signature covers only the reference
+       datagram, silently dropping the integrity the SIGN tier exists to provide).
      Part B (SHMEM-gated live-segment): the sealed slot holds CIPHERTEXT — the plaintext marker is provably
        ABSENT from the entire pool segment (with a non-secured control whose plaintext IS present), and
        zc-sends advances (the overlay DID take ZC). Both impls (Clasp first; Part B skips cleanly on Clasp/macOS)."
@@ -1224,9 +1226,9 @@
              (assert (not (%zc-overlay-eligible-p node)) () "A: no KM installed -> NOT overlay-eligible (fail-closed)")
              (setf (disc-node-crypto-transform node) km)                   ; install the ENCRYPT EntityCrypto KM
              (assert (%zc-overlay-eligible-p node) () "A: ENCRYPT tier + ENCRYPT KM + data=NONE -> overlay-eligible")
-             (setf (disc-node-crypto-transform node)                       ; a GMAC (SIGN) payload key is NOT confidential
+             (setf (disc-node-crypto-transform node)                       ; ADR 0058: a GMAC (SIGN) payload key is now ELIGIBLE — the slot gets a VISIBLE but AUTHENTICATED payload (raw ZC would leave it unauthenticated: the RTPS signature covers only the reference datagram)
                    (dds.security:make-test-key-material :kind :sign))
-             (assert (not (%zc-overlay-eligible-p node)) () "A: a GMAC (SIGN) payload key -> NOT overlay-eligible (deferred)")
+             (assert (%zc-overlay-eligible-p node) () "A: a GMAC (SIGN) payload key -> overlay-eligible (ADR 0058; RED pre-0058: the encrypt-p gate rejected it)")
              (setf (disc-node-crypto-transform node) km)                   ; restore the ENCRYPT KM
              ;; OVER-SLOT payload: the ENCRYPT SecuredPayload (44+len+pad) would exceed a pool slot -> the overlay arm
              ;; must FAIL CLOSED to NIL (the sample takes the normal serialize path), never SIGNAL a buffer-overflow.

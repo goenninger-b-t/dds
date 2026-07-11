@@ -590,7 +590,7 @@ predicate and that `%zc-change-item` returns NIL under `rtps_protection` and und
 (where SHMEM is available) inspects the **live pool segment** and asserts the secured payload is provably **absent**
 while a non-secured control's marker **is** present (non-vacuous).
 
-### 3.8 Confidential Zero-Copy for an ENCRYPT-tier writer — the in-slot SecuredPayload overlay (ADR 0051)
+### 3.8 Zero-Copy for a wire-protected writer — the in-slot SecuredPayload overlay (ADR 0051, ADR 0058)
 
 §3.7 keeps a secured writer's plaintext out of SHMEM by **gating off** Zero-Copy for any writer whose
 `rtps_protection`/`metadata_protection` is non-NONE — correct, but such a writer then forfeits Zero-Copy on every
@@ -602,6 +602,22 @@ the same AES256-GCM key already minted at `cm-register-local-entity` and shipped
 recovers only an AES-GCM ciphertext+tag; the reader **decodes copy-on-read** and delivers the plaintext.  No new
 key, no new derivation, no new exchange, and **no new wire format** — the overlay bytes are the identical,
 byte-exact-tested §9.5.3.3 `SecuredPayload`.
+
+**The SIGN tier gets the overlay too (ADR 0058) — and it must, for *integrity*, not secrecy.** A
+`SIGN`-only wire-protected writer seals a **GMAC** `SecuredPayload` into the slot: the payload stays
+**visible** (exactly as the SIGN tier leaves it visible on the wire) and carries a `common_mac` the reader
+verifies **fail-closed**. It is tempting to give SIGN plain *raw* Zero-Copy instead — a SIGN payload is not
+confidential, so cleartext in SHMEM looks like no new exposure. **That reasoning is wrong, and we rejected
+it:** the RTPS signature covers only the 20-octet **reference datagram**, so a raw slot payload would be
+**unauthenticated** — a co-resident process could tamper with the sample and the reader would accept it,
+silently dropping the one guarantee SIGN exists to provide. The overlay costs one AEAD pass and keeps the
+slot's protection aligned with the governance tier:
+
+| governance (`data_protection` = NONE) | slot content | confidential | authenticated |
+|---|---|---|---|
+| `rtps`/`metadata` = **ENCRYPT** | ciphertext (GCM) | yes | yes |
+| `rtps`/`metadata` = **SIGN** | visible payload + `common_mac` (GMAC) | no — as SIGN intends | **yes** |
+| SIGN via *raw ZC* (rejected) | visible payload, bare | no | **no — a regression** |
 
 **How the reader knows the slot is an overlay.**  The 20-octet Zero-Copy reference datagram's spare `reserved`
 u32 is repurposed as an **overlay sentinel** (`dds.cdr:+zc-ref-overlay-secured+` = 1; 0 = raw, byte-identical to a

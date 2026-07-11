@@ -935,25 +935,30 @@
 
 (defun* %zc-overlay-eligible-p (node)
     (function (disc-node) boolean)
-  "WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): T iff a wire-protected writer may use Zero-Copy/SHMEM via the in-slot
-   data_protection SecuredPayload overlay instead of being gated off (%zc-payload-wire-protected-p). Requires: the
-   writer IS wire-protected (rtps/metadata_protection non-NONE — else it takes the raw ZC fast path, no overlay);
-   its data_protection is explicitly NONE (data=SIGN/ENCRYPT already puts a SecuredPayload in the slot via the
-   existing ungated path; :unset with a crypto-transform installed would be sealed at publish, so the change
-   payload is NOT known-plaintext -> not overlay-eligible); AND a usable ENCRYPT (AES256-GCM, confidentiality)
-   EntityCrypto KM resolves (%zc-overlay-km + key-material-encrypt-p). A SIGN-only payload key (GMAC) is NOT
-   eligible here (deferred — a SIGN payload is not confidential, so raw ZC would be a follow-on, ADR 0051).
+  "WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051; SIGN tier added by ADR 0058): T iff a wire-protected writer may use
+   Zero-Copy/SHMEM via the in-slot data_protection SecuredPayload overlay instead of being gated off
+   (%zc-payload-wire-protected-p). Requires: the writer IS wire-protected (rtps/metadata_protection non-NONE —
+   else it takes the raw ZC fast path, no overlay); its data_protection is explicitly NONE (data=SIGN/ENCRYPT
+   already puts a SecuredPayload in the slot via the existing ungated path; :unset with a crypto-transform
+   installed would be sealed at publish, so the change payload is NOT known-plaintext -> not overlay-eligible);
+   AND an EntityCrypto KM resolves (%zc-overlay-km).
+   BOTH AEAD tiers are eligible (ADR 0058). An ENCRYPT (AES256-GCM) KM seals CIPHERTEXT into the slot
+   (confidentiality + integrity). A SIGN (AES256-GMAC) KM seals a GMAC SecuredPayload — the payload stays
+   VISIBLE in the slot, exactly as the SIGN tier leaves it visible on the wire, and is AUTHENTICATED by the
+   common_mac the reader verifies fail-closed. The alternative once recorded in ADR 0051 (relax SIGN to RAW ZC,
+   no overlay) is REJECTED: the RTPS signature covers only the 20-octet reference datagram, so a raw slot
+   payload would be UNAUTHENTICATED — a co-resident process could tamper with the sample undetected, silently
+   dropping the very integrity guarantee the SIGN tier exists to provide. The overlay costs one seal and keeps it.
    Fail-closed: no KM -> NIL (stays gated off)."
   (and (%zc-payload-wire-protected-p node)
        (eq (disc-node-user-data-protection-kind node) :none)
-       (let ((km (%zc-overlay-km node)))
-         (and km (dds.security:key-material-encrypt-p km) t))))
+       (and (%zc-overlay-km node) t)))
 
 (defun* %ensure-zc-overlay-scratch (node)
     (function (disc-node) (or null dds.core.arena:buffer-pool))
   "WP-SECURITY-ZC-SHMEM-OVERLAY (ADR 0051): lazily carve NODE's overlay seal-scratch pool — static octet-buffers
-   each sized to hold a slot's worth of data_protection SecuredPayload (44 + slot-bytes + 3, the ENCRYPT-tier
-   upper bound: the 44-octet §9.5.3.3 header/tag framing + up to a slot of ciphertext + <=3 pad). Returns the
+   each sized to hold a slot's worth of data_protection SecuredPayload (44 + slot-bytes + 3 — the ENCRYPT framing,
+   which is the LARGER of the two tiers, so it also covers a SIGN/GMAC seal at 40 + align4(N); ADR 0058). Returns the
    pool, or NIL if the arena carve fails (caller then skips the overlay -> the writer stays gated off for that
    sample, fail-closed, never a GC fallback). Idempotent, double-checked under the dedicated overlay lock; the
    arena is stored only after the carve succeeds (teardown reachability); stop-node tears it down. Mirrors
@@ -1124,11 +1129,14 @@
    DISABLED fail-closed (returns NIL) — the datagram/submessage encryption those tiers apply lives OUTSIDE
    the pool, so a raw payload in shared memory would be readable by any co-resident participant; the sample
    instead takes the normal serialize -> %send-raw-buf (submessage+SRTPS wrap) path.
-   OVERLAY (WP-SECURITY-ZC-SHMEM-OVERLAY, ADR 0051): when the wire-protected writer is ENCRYPT-tier with an
-   ENCRYPT EntityCrypto KM and data_protection = NONE (%zc-overlay-eligible-p), the payload is instead SEALED as
-   a data_protection SecuredPayload into a pooled scratch and loaned into the slot (the slot holds ciphertext),
-   and the emitted ref carries +zc-ref-overlay-secured+ — so an ENCRYPT-tier writer regains Zero-Copy with no
-   cleartext in SHMEM. Fail-closed: no KM / no scratch / carve-fail -> NIL (the writer stays gated off).
+   OVERLAY (WP-SECURITY-ZC-SHMEM-OVERLAY, ADR 0051; SIGN tier added by ADR 0058): when a wire-protected writer has
+   data_protection = NONE and an EntityCrypto KM resolves (%zc-overlay-eligible-p), the payload is instead SEALED as
+   a data_protection SecuredPayload into a pooled scratch and loaned into the slot, and the emitted ref carries
+   +zc-ref-overlay-secured+ — so the writer regains Zero-Copy while the slot content keeps the protection its
+   governance tier promises: an ENCRYPT KM puts CIPHERTEXT in the slot (no cleartext in SHMEM), a SIGN (GMAC) KM
+   puts the VISIBLE payload plus an authenticating common_mac (the SIGN tier never promised confidentiality, but it
+   DOES promise integrity — and raw ZC would leave the slot payload unauthenticated, since the RTPS signature covers
+   only the reference datagram). Fail-closed: no KM / no scratch / carve-fail -> NIL (the writer stays gated off).
    WP-FLATDATA-LOAN-WRITE PRE-COMMITTED SLOT (FR-PF-4, R6, ADR 0042): a loan-written change carries the
    committed pool slot its sample already sits in (zc-state :armed). When the FULL eligibility above holds,
    the send site PREFERS that slot (%zc-armed-item, a one-shot claim) — the emitted ref bytes are EXACTLY
@@ -1162,15 +1170,17 @@
      ;; loan-written slot — %loan-write-data-protected-p blocks arming for :sign/:encrypt and :unset+ct — so the
      ;; fail-closed NIL branches below need no %zc-drop-armed (nothing to strand); a future change that lets a
      ;; secured writer arm a slot MUST revisit this (add the drop like the raw undersized arm / the t fallback).
-     (let ((len (dds.rtps.history:cache-change-payload-len change)))
+     (let* ((len (dds.rtps.history:cache-change-payload-len change))
+            (km  (%zc-overlay-km node)))
        ;; SIZE GATE (fail-closed, no exception-driven control flow): the raw arm caps only *zerocopy-min-payload-bytes*,
-       ;; but the ENCRYPT SecuredPayload (44 + len + <=3 pad) must ALSO fit a pool slot — else the seal would overflow
-       ;; the scratch buffer / never loan. Gate BEFORE the pool carve so the over-slot case is portable (returns NIL,
-       ;; no SHMEM touched) and the sample falls through to the normal serialize path.
-       (if (and (> len *zerocopy-min-payload-bytes*)
-                (<= (+ 44 len 3) +zerocopy-pool-slot-bytes+))
+       ;; but the sealed SecuredPayload must ALSO fit a pool slot — else the seal would overflow the scratch buffer /
+       ;; never loan. The bound is the EXACT per-tier sealed length (dds.security:secured-payload-length — ENCRYPT
+       ;; 44+N+pad, SIGN/GMAC 40+align4(N)), not a hardcoded ENCRYPT-only estimate. Gate BEFORE the pool carve so the
+       ;; over-slot case is portable (returns NIL, no SHMEM touched) and the sample falls through to serialize.
+       (if (and km
+                (> len *zerocopy-min-payload-bytes*)
+                (<= (dds.security:secured-payload-length km len) +zerocopy-pool-slot-bytes+))
            (let ((pl   (%ensure-change-payload node change))     ; data=NONE => pl is the exact plaintext, (length pl)==len
-                 (km   (%zc-overlay-km node))
                  (pool (%ensure-zc-overlay-scratch node)))
              (if (and pl km pool)
                  (let ((sb (dds.core.arena:pool-acquire pool)))

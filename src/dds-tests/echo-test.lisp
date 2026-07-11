@@ -4154,6 +4154,7 @@
                  ("security-mixed-kind-reject"   . run-security-mixed-kind-reject-test)
                  ("security-n-secured-writer"    . run-security-n-secured-writer-test)
                  ("zc-overlay-per-endpoint-km"   . run-zc-overlay-per-endpoint-km-test)
+                 ("zc-overlay-sign-tier"         . run-zc-overlay-sign-tier-test)
                  ("security-2secured-writer-harness" . run-security-2secured-writer-harness-test)
                  ("security-dn-match"             . run-security-dn-match-test)
                  ("security-crypto-manager"       . run-security-crypto-manager-test)

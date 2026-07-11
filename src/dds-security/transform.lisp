@@ -167,10 +167,30 @@
     (function (key-material) boolean)
   "T iff KM is the §9.5.3.3.1 AES256-GCM ENCRYPT tier {0,0,0,4} — the CONFIDENTIALITY sub-tier that HIDES the
    serialized payload as ciphertext (§9.5.3.3.4.4); NIL for AES256-GMAC {0,0,0,3}, the SIGN sub-tier that leaves
-   the payload VISIBLE (§9.5.3.3.4.3). The negation of %km-gmac-p (DRY). Consumed by the ZC/SHMEM in-slot overlay
-   eligibility gate (WP-SECURITY-ZC-SHMEM-OVERLAY, ADR 0051): only an ENCRYPT payload key makes the sealed slot
-   confidential. Zero-alloc (a 4-octet compare, no consing)."
+   the payload VISIBLE but AUTHENTICATED by a common_mac (§9.5.3.3.4.3). The negation of %km-gmac-p (DRY).
+   Zero-alloc (a 4-octet compare, no consing).
+   NOTE (ADR 0058): this is NOT the ZC/SHMEM overlay eligibility gate. It was, while the overlay served the
+   ENCRYPT tier only; the overlay now covers BOTH tiers (a SIGN writer seals a GMAC SecuredPayload into the
+   slot — visible payload, authenticated), so eligibility asks only whether a payload KM resolves at all."
   (not (%km-gmac-p km)))
+
+(defun* secured-payload-length (km plaintext-len)
+    (function (key-material (integer 0)) (integer 0))
+  "The EXACT octet length of the §9.5.3.3 SecuredPayload encode-serialized-payload-into will produce for a
+   PLAINTEXT-LEN-octet plaintext under KM — the same per-tier arithmetic as the encoder, in one place (DRY),
+   so a caller can size a buffer or gate on a capacity WITHOUT sealing first or hardcoding the framing:
+     SIGN / AES256-GMAC {0,0,0,3} (§9.5.3.3.4.3): header(20) ‖ plaintext ‖ 4-align pad ‖ common_mac(16) ‖
+       rsm_count(4)  =  40 + align4(N)  — no crypto_content length prefix (that is ENCRYPT-only).
+     ENCRYPT / AES256-GCM {0,0,0,4} (§9.5.3.3.4.4): header(20) ‖ crypto_content.length(4) ‖ ciphertext(N) ‖
+       common_mac(16) ‖ 4-align pad ‖ rsm_count(4)  =  44 + N + pad4(N).
+   Used by the Zero-Copy overlay send gate (ADR 0051/0058) to decide whether the sealed payload fits a pool
+   slot before it touches the pool — a fail-closed capacity check, not an estimate."
+  (let ((pad (mod (- plaintext-len) 4)))
+    (if (%km-gmac-p km)
+        (+ +secure-data-header-len+ plaintext-len pad
+           +common-mac-len+ +receiver-specific-macs-count-len+)
+        (+ +secure-data-header-len+ +crypto-content-length-len+ plaintext-len
+           +common-mac-len+ pad +receiver-specific-macs-count-len+))))
 
 (defun* %put-crypto-header-into (km vec)
     (function (key-material (simple-array (unsigned-byte 8) (*))) (eql t))

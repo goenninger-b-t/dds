@@ -86,7 +86,7 @@
    ;; Transform ops (§9.5.3.3.4.4/4.5) — allocating entries + the zero-alloc into-buffer codec core
    #:encode-serialized-payload
    #:decode-serialized-payload
-   #:encode-serialized-payload-into
+   #:encode-serialized-payload-into #:secured-payload-length
    #:decode-serialized-payload-into
    ;; Auth T1: PKI identity (§8.7 / §9.3) — DDS-Security 1.1 Authentication plugin
    #:+test-pki-root+

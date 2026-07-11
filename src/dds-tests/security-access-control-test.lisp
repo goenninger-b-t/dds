@@ -1509,6 +1509,73 @@
         (dds.dcps:delete-participant p))))
   t)
 
+(defun* run-zc-overlay-sign-tier-test ()
+    (function () t)
+  "ADR 0058 — the ZC/SHMEM in-slot overlay now serves the SIGN tier too, so a SIGN-only wire-protected writer
+   regains Zero-Copy instead of being gated off (ADR 0051 deferred follow-on 1, closed).
+   RED before: %zc-overlay-eligible-p demanded key-material-encrypt-p, so a SIGN (AES256-GMAC) EntityCrypto KM
+   was rejected and the writer stayed gated (no ZC at all).
+   The relaxation is to a SIGN OVERLAY, NOT to raw ZC (which is what ADR 0051 originally sketched): the RTPS
+   signature covers only the 20-octet reference datagram, so a RAW slot payload would be UNAUTHENTICATED — a
+   co-resident process could tamper with the sample undetected, dropping the integrity guarantee the SIGN tier
+   exists to provide. The GMAC SecuredPayload keeps the payload VISIBLE (as SIGN allows) and AUTHENTICATED.
+   Asserts: (a) a SIGN-tier writer's overlay km is GMAC (NOT encrypt) and IS overlay-eligible; (b) the sealed
+   SecuredPayload round-trips through the real §9.5.3.3 codec (visible payload, verified); (c) a TAMPERED sealed
+   slot is REJECTED fail-closed (the integrity the raw-ZC alternative would have silently lost); (d) the exact
+   sealed length the send gate uses (dds.security:secured-payload-length) matches what the encoder produces, for
+   BOTH tiers — the size gate can no longer under-count a slot."
+  (let ((gov (dds.security:make-governance
+              :discovery-protection-kind :none :liveliness-protection-kind :none
+              :rtps-protection-kind :none
+              ;; metadata (user-submessage) = SIGN drives the user endpoint's EntityCrypto to AES256-GMAC
+              ;; (%cm-entity-protection-kind: data=NONE falls back to the submessage tier) — THE gated SIGN case.
+              :topic-rules (list (dds.security:make-topic-rule
+                                  :topic-expr "Circle" :metadata-protection-kind :sign
+                                  :data-protection-kind :none))))   ; data=NONE -> the overlay is the ZC route
+        (p (dds.dcps:create-participant :domain (test-domain +td-collect+))))
+    (let ((node (dds.dcps::dp-node p)))
+      (unwind-protect
+           (progn
+             (setf (dds.dcps::dp-auth-state p)
+                   (dds.dcps::%make-auth-manager-state :identity (dds.security::%make-identity-handle)))
+             (dds.dcps::%install-access-control p (dds.security:make-access-handle :governance gov))
+             (dds.disc:add-local-writer node :topic "Circle" :type "ShapeType")
+             (dds.disc:enable-publisher node :history-kind :keep-all)
+             (let ((cm (dds.dcps::make-crypto-manager)))
+               (dolist (e (dds.dcps::%cm-local-token-entities node))
+                 (dds.dcps::cm-register-local-entity
+                  cm (car e) :kind (dds.dcps::%cm-entity-protection-kind node (car e))))
+               (setf (dds.disc::disc-node-crypto-transform node) (dds.dcps::cm-encode-keys cm))
+               (let ((km (dds.disc::%zc-overlay-km node)))
+                 (%check :zsign-km-is-gmac
+                         (and km (not (dds.security:key-material-encrypt-p km)))
+                         "a SIGN-tier wire-protected writer's overlay km is the AES256-GMAC (SIGN) key, not ENCRYPT")
+                 (%check :zsign-eligible
+                         (dds.disc::%zc-overlay-eligible-p node)
+                         "a SIGN-tier writer IS overlay-eligible (RED pre-ADR-0058: the encrypt-p gate rejected a GMAC km)")
+                 ;; (b)+(c): the sealed slot content round-trips, and a tampered one is rejected.
+                 (let* ((pt (let ((v (make-array 200 :element-type '(unsigned-byte 8))))
+                              (dotimes (i 200 v) (setf (aref v i) (mod i 251)))))
+                        (sb (dds.core.buffer:make-octet-buffer (+ 64 (length pt) 8)))
+                        (slen (dds.security:encode-serialized-payload-into sb km pt))
+                        (sealed (subseq (dds.core.buffer:octet-buffer-vec sb) 0 slen)))
+                   (%check :zsign-exact-length
+                           (= slen (dds.security:secured-payload-length km (length pt)))
+                           "secured-payload-length predicts the SIGN seal EXACTLY (the send-gate slot-capacity check cannot under-count)")
+                   (let ((back (dds.security:decode-serialized-payload km sealed)))
+                     (%check :zsign-roundtrip
+                             (and back (>= (length back) (length pt))
+                                  (equalp pt (subseq back 0 (length pt))))
+                             "the GMAC SecuredPayload sealed into the slot decodes back to the visible payload (verified)"))
+                   (let ((bad (copy-seq sealed)))
+                     (setf (aref bad (+ 20 5)) (logxor 255 (aref bad (+ 20 5))))   ; flip a payload byte inside the GMAC'd body
+                     (%check :zsign-tamper-rejected
+                             (null (dds.security:decode-serialized-payload km bad))
+                             "a TAMPERED sealed slot is REJECTED fail-closed — the integrity that raw ZC would have silently lost"))
+                   (dds.pal:free-static (dds.core.buffer:octet-buffer-vec sb))))))
+        (dds.dcps:delete-participant p))))
+  t)
+
 (defun* run-security-dn-match-test ()
     (function () t)
   "ADR-0036/0037 carry (DDS-Security 1.1 §9.4.1.3 subject-name binding; RFC2253 §2.1-2.4): the serialization-
